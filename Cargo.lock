@@ -13,24 +13,19 @@ name = "ec-core"
 version = "0.1.0"
 
 [[package]]
-name = "ec-dsp"
+name = "ec-h264"
 version = "0.1.0"
 dependencies = [
+ "ec-core",
+ "ec-h264-syntax",
  "wide",
 ]
 
 [[package]]
-name = "ec-riff"
+name = "ec-h264-syntax"
 version = "0.1.0"
 dependencies = [
  "ec-core",
-]
-
-[[package]]
-name = "hound"
-version = "3.5.1"
-dependencies = [
- "ec-riff",
 ]
 
 [[package]]

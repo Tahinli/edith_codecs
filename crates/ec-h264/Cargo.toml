@@ -1,0 +1,16 @@
+[package]
+name = "ec-h264"
+description = "H.264 software decoder (CAVLC intra loop, growing toward full)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ec-core = { workspace = true }
+ec-h264-syntax = { path = "../ec-h264-syntax", version = "0.1.0" }
+wide = { workspace = true }
+
+[dev-dependencies]
+# The conformance harness walks Annex B itself to drive push_nal.
+ec-h264-syntax = { path = "../ec-h264-syntax", version = "0.1.0" }
