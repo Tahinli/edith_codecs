@@ -6,7 +6,7 @@
 
 mod common;
 
-use common::test_frame;
+use common::{natural_frame, test_frame};
 use ec_core::frame::VideoFrame;
 use ec_h265::encoder::{EncodedPicture, Encoder, EncoderConfig, RateControl};
 use std::io::Write;
@@ -88,9 +88,13 @@ fn psnr(a: &[u8], b: &[u8]) -> f64 {
     }
 }
 
-fn encode(width: u32, height: u32, qp: i32) -> (VideoFrame, EncodedPicture) {
+/// Encode one picture; `ctb` of `None` takes the configured default.
+fn encode(width: u32, height: u32, qp: i32, ctb: Option<usize>) -> (VideoFrame, EncodedPicture) {
     let mut cfg = EncoderConfig::new(width, height);
     cfg.rate_control = RateControl::ConstantQp(qp);
+    if let Some(ctb) = ctb {
+        cfg.ctb_size = ctb;
+    }
     cfg.keep_recon = true;
     cfg.picture_hash = true;
     let encoder = Encoder::new(cfg).expect("encoder");
@@ -108,27 +112,77 @@ fn ffmpeg_decodes_bit_exactly_at_every_shape() {
     // 1920x1080 needs the conformance window on the bottom (1088 coded rows are
     // not used: 1080 is a multiple of 8, but 64x64 CTBs still overhang), 1916
     // needs it on the right, 130x66 exercises a partial CTB in both directions.
-    for &(w, h) in &[(64u32, 64u32), (130, 66), (1916, 1080), (352, 288)] {
-        let (source, coded) = encode(w, h, 27);
-        let path = write_au(&format!("shape-{w}x{h}"), &coded);
+    // Both tree sizes are coded: the default is 32, and 64 is still offered.
+    for &(w, h, ctb) in &[
+        (64u32, 64u32, None),
+        (130, 66, None),
+        (1916, 1080, None),
+        (352, 288, None),
+        (1916, 1080, Some(64)),
+        (130, 66, Some(64)),
+    ] {
+        let (source, coded) = encode(w, h, 27, ctb);
+        let name = format!(
+            "shape-{w}x{h}-ctb{}",
+            ctb.map_or("default".to_string(), |c| c.to_string())
+        );
+        let path = write_au(&name, &coded);
         let decoded = match ffmpeg_decode(&path) {
             Ok(bytes) => bytes,
-            Err(e) => panic!("{w}x{h}: ffmpeg failed: {e}"),
+            Err(e) => panic!("{name}: ffmpeg failed: {e}"),
         };
         let recon = planes_of(coded.recon.as_ref().expect("recon kept"));
         assert_eq!(
             decoded.len(),
             recon.len(),
-            "{w}x{h}: decoded {} bytes, reconstruction {} bytes",
+            "{name}: decoded {} bytes, reconstruction {} bytes",
             decoded.len(),
             recon.len()
         );
         let mismatches = decoded.iter().zip(&recon).filter(|(a, b)| a != b).count();
-        assert_eq!(mismatches, 0, "{w}x{h}: {mismatches} samples differ");
+        assert_eq!(mismatches, 0, "{name}: {mismatches} samples differ");
         // And the encode is worth something: PSNR against the source.
         let quality = psnr(&planes_of(&source), &recon);
-        assert!(quality > 30.0, "{w}x{h}: PSNR {quality:.2} dB at QP 27");
+        assert!(quality > 30.0, "{name}: PSNR {quality:.2} dB at QP 27");
     }
+}
+
+/// The 32x32 default buys wavefront rows (see `perf.rs`) by coding a shallower
+/// tree; that trade is only worth taking if the bits it costs are noise.
+#[test]
+fn the_default_tree_costs_almost_nothing_against_64() {
+    let source = natural_frame(1920, 1080, 0);
+    let mut coded = Vec::new();
+    for ctb in [32usize, 64] {
+        let mut cfg = EncoderConfig::new(1920, 1080);
+        cfg.rate_control = RateControl::ConstantQp(27);
+        cfg.ctb_size = ctb;
+        cfg.keep_recon = true;
+        let encoder = Encoder::new(cfg).expect("encoder");
+        let picture = encoder.encode_idr(&source).expect("encode");
+        let quality = psnr(
+            &planes_of(&source),
+            &planes_of(picture.recon.as_ref().unwrap()),
+        );
+        coded.push((picture.au.len(), quality));
+    }
+    let ((bits32, psnr32), (bits64, psnr64)) = (coded[0], coded[1]);
+    println!(
+        "1080p at QP 27: CTB 32 {bits32} bytes / {psnr32:.2} dB, CTB 64 {bits64} bytes / {psnr64:.2} dB \
+         ({:+.1}% bits, {:+.2} dB)",
+        (bits32 as f64 / bits64 as f64 - 1.0) * 100.0,
+        psnr32 - psnr64
+    );
+    assert!(
+        // Measured 1.0% on this fixture; the bound leaves room for the shape of
+        // the picture, not for a change of coding behaviour.
+        (bits32 as f64) < bits64 as f64 * 1.03,
+        "CTB 32 spent {bits32} bytes against 64's {bits64}"
+    );
+    assert!(
+        (psnr32 - psnr64).abs() < 0.1,
+        "CTB 32 landed {psnr32:.2} dB against 64's {psnr64:.2} dB"
+    );
 }
 
 #[test]
@@ -141,7 +195,7 @@ fn ffmpeg_verifies_the_decoded_picture_hash() {
         eprintln!("skipping: ffmpeg not installed");
         return;
     }
-    let (_, coded) = encode(352, 288, 30);
+    let (_, coded) = encode(352, 288, 30, None);
     let path = write_au("hash-352x288", &coded);
     let output = Command::new("ffmpeg")
         .args(["-v", "debug", "-err_detect", "crccheck", "-y", "-i"])
@@ -169,7 +223,7 @@ fn vaapi_hardware_decodes_the_stream() {
         eprintln!("skipping: no ffmpeg or no VA-API render node");
         return;
     }
-    let (_, coded) = encode(1920, 1080, 27);
+    let (_, coded) = encode(1920, 1080, 27, None);
     let path = write_au("vaapi-1080p", &coded);
     let output = Command::new("ffmpeg")
         .args([
@@ -203,7 +257,7 @@ fn vaapi_hardware_decodes_the_stream() {
 fn quality_rises_as_qp_falls() {
     let mut previous = 0.0;
     for &qp in &[40i32, 32, 27, 22] {
-        let (source, coded) = encode(256, 144, qp);
+        let (source, coded) = encode(256, 144, qp, None);
         let recon = planes_of(coded.recon.as_ref().expect("recon"));
         let quality = psnr(&planes_of(&source), &recon);
         assert!(
