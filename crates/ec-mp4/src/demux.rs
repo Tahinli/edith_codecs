@@ -23,17 +23,25 @@ const MOOF_LIMIT: u64 = 64 << 20;
 const SAMPLE_LIMIT: u64 = 256 << 20;
 
 /// One sample of one track, resolved: everything a packet needs but its bytes.
-#[derive(Debug, Clone, Copy)]
-struct Sample {
-    offset: u64,
-    size: u32,
-    duration: u32,
+///
+/// This *is* the index an mp4 carries of itself, so it is public: a caller that
+/// counts frames, builds a seek table or asks how many bytes a track spends
+/// reads it here rather than walking the file a second time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sample {
+    /// Byte offset in the file.
+    pub offset: u64,
+    /// Size in bytes.
+    pub size: u32,
+    /// How long it lasts, in track ticks.
+    pub duration: u32,
     /// Decode time in track ticks, edit list applied.
-    dts: i64,
+    pub dts: i64,
     /// Composition (presentation) time in track ticks, `ctts` and edit list
     /// applied.
-    cts: i64,
-    sync: bool,
+    pub cts: i64,
+    /// Whether a decoder may be started on it.
+    pub sync: bool,
 }
 
 /// One `trak`, as far as the packet loop cares about it.
@@ -47,6 +55,35 @@ struct Trak {
     samples: Vec<Sample>,
     cursor: usize,
     title: Option<String>,
+}
+
+/// What the container says about one track, whether or not this build has a
+/// [`CodecId`] for what is in it.
+///
+/// A track whose sample entry is unknown here has `stream: None` — its samples
+/// are never handed out as some other codec's — but it is still *listed*, with
+/// the four-character code that named it, so a caller can say what it is leaving
+/// out instead of pretending the file has fewer tracks than it has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackInfo {
+    /// `tkhd` track id, which is what the file itself names the track by.
+    pub track_id: u32,
+    /// What the `hdlr` says the track carries, [`None`] for a handler this does
+    /// not map (a chapter or a hint track).
+    pub media: Option<MediaType>,
+    /// Four-character code of the first `stsd` entry: `avc1`, `hvc1`, `mp4a`,
+    /// `ac-3`, `tx3g`, ... Zero where the track has no sample entry at all.
+    pub sample_entry: [u8; 4],
+    /// Index in [`Mp4Demuxer::streams`], or [`None`] for a track walked past.
+    pub stream: Option<u32>,
+    /// ISO 639-2 language from the `mdhd`, [`None`] for the `und` a muxer
+    /// writes when it was never told.
+    pub language: Option<String>,
+    /// `media_time` of the edit list's first real entry, in track ticks: where
+    /// the presentation starts inside the media, which for a sound track is its
+    /// encoder delay. [`None`] where the track carries no edit list, which is
+    /// not the same claim as an edit list stating zero.
+    pub media_time: Option<i64>,
 }
 
 /// `trex` defaults: what a fragment leaves unsaid.
@@ -69,8 +106,14 @@ pub struct Mp4Demuxer<R> {
     src: Src<R>,
     streams: Vec<StreamInfo>,
     traks: Vec<Trak>,
+    /// One per [`Mp4Demuxer::traks`], same order: what the container said about
+    /// the track, including the ones no stream was made for.
+    tracks: Vec<TrackInfo>,
     title: Option<String>,
     fragments: usize,
+    /// `mvhd` duration and timescale: how long the *movie* plays, which on a
+    /// file whose sound outlasts its picture is neither track's own length.
+    movie: (u64, u32),
 }
 
 impl<R: Read + Seek> Mp4Demuxer<R> {
@@ -106,8 +149,10 @@ impl<R: Read + Seek> Mp4Demuxer<R> {
             src,
             streams: Vec::new(),
             traks: Vec::new(),
+            tracks: Vec::new(),
             title: None,
             fragments: moofs.len(),
+            movie: (0, 0),
         };
         let trex = me.read_moov(&data)?;
         for (moof_at, body, stop) in moofs {
@@ -161,16 +206,59 @@ impl<R: Read + Seek> Mp4Demuxer<R> {
         self.fragments
     }
 
+    /// Every track the file declares, in file order — the order the `moov`
+    /// wrote them in, which is the order a caller may number them by and get
+    /// the same answer twice.
+    pub fn tracks(&self) -> &[TrackInfo] {
+        &self.tracks
+    }
+
+    /// How long the *movie* plays, out of the `mvhd`: one length spanning every
+    /// track, which is what a file's byte rate is measured over. [`None`] where
+    /// the header states none.
+    pub fn duration_secs(&self) -> Option<f64> {
+        let (duration, timescale) = self.movie;
+        (duration > 0 && timescale > 0).then(|| duration as f64 / f64::from(timescale))
+    }
+
+    /// Every sample of `stream`, in decode order: the index the file carries of
+    /// itself. Empty for a stream that does not exist.
+    pub fn samples(&self, stream: u32) -> &[Sample] {
+        self.traks
+            .iter()
+            .find(|t| t.stream == Some(stream))
+            .map_or(&[], |t| &t.samples[..])
+    }
+
+    /// One sample of one stream by its index in [`Mp4Demuxer::samples`], read
+    /// **without moving the packet cursor**: random access for a caller holding
+    /// an index of its own, beside the sequential [`Demuxer::next_packet`].
+    pub fn read_sample(&mut self, stream: u32, index: usize) -> Result<Packet> {
+        let Some(trak) = self.traks.iter().find(|t| t.stream == Some(stream)) else {
+            return Err(Error::corrupt(format!("mp4: no stream {stream} to read")));
+        };
+        let Some(sample) = trak.samples.get(index).copied() else {
+            return Err(Error::Eof);
+        };
+        let time_base = trak.time_base;
+        let data = self
+            .src
+            .read_vec(sample.offset, u64::from(sample.size), SAMPLE_LIMIT)?;
+        Ok(packet_of(stream, time_base, &sample, data))
+    }
+
     fn read_moov(&mut self, data: &[u8]) -> Result<Vec<Trex>> {
         let mut movie_timescale = 1_000u32;
         for child in Boxes::new(data) {
             let (kind, payload) = child?;
             if &kind == b"mvhd" {
                 let (version, _, rest) = full(payload)?;
-                movie_timescale = match version {
-                    0 => be32(rest, 8)?,
-                    _ => be32(rest, 16)?,
+                let (timescale, duration) = match version {
+                    0 => (be32(rest, 8)?, u64::from(be32(rest, 12)?)),
+                    _ => (be32(rest, 16)?, be64(rest, 20)?),
                 };
+                movie_timescale = timescale;
+                self.movie = (duration, timescale);
             }
         }
         let mut trex = Vec::new();
@@ -281,6 +369,11 @@ impl<R: Read + Seek> Mp4Demuxer<R> {
         // the first ctts delay, and reading that as a trim throws away real
         // pictures).
         let mut shift = 0i64;
+        let media_time = edit
+            .iter()
+            .flatten()
+            .map(|&(_, media_time, _)| media_time)
+            .find(|&t| t >= 0);
         if let Some(edits) = edit {
             let mut empty = 0i64;
             for (segment, media_time, _) in edits {
@@ -297,6 +390,7 @@ impl<R: Read + Seek> Mp4Demuxer<R> {
 
         let table = SampleTable::read(stbl, self.src.len)?;
         let samples = table.build(shift)?;
+        let track_language = language.clone();
         let stream = match table.entry {
             Some(entry) => {
                 let media = match entry.codec.media_type() {
@@ -329,6 +423,19 @@ impl<R: Read + Seek> Mp4Demuxer<R> {
             }
             None => None,
         };
+        self.tracks.push(TrackInfo {
+            track_id,
+            media: match &handler {
+                b"vide" => Some(MediaType::Video),
+                b"soun" => Some(MediaType::Audio),
+                b"sbtl" | b"subt" | b"text" => Some(MediaType::Subtitle),
+                _ => None,
+            },
+            sample_entry: table.entry_kind,
+            stream,
+            language: track_language,
+            media_time,
+        });
         self.traks.push(Trak {
             track_id,
             stream,
@@ -500,15 +607,7 @@ impl<R: Read + Seek + Send> Demuxer for Mp4Demuxer<R> {
         let data = self
             .src
             .read_vec(sample.offset, u64::from(sample.size), SAMPLE_LIMIT)?;
-        let mut packet = Packet::new(stream, time_base, data);
-        packet.pts = Some(sample.cts);
-        packet.dts = Some(sample.dts);
-        packet.duration = Some(i64::from(sample.duration));
-        packet.flags = PacketFlags {
-            keyframe: sample.sync,
-            ..PacketFlags::default()
-        };
-        Ok(packet)
+        Ok(packet_of(stream, time_base, &sample, data))
     }
 
     fn seek(&mut self, stream: u32, to: Timestamp, mode: SeekMode) -> Result<()> {
@@ -558,10 +657,26 @@ impl<R: Read + Seek + Send> Demuxer for Mp4Demuxer<R> {
     }
 }
 
+/// One resolved sample and its bytes as the packet a caller is handed.
+fn packet_of(stream: u32, time_base: TimeBase, sample: &Sample, data: Vec<u8>) -> Packet {
+    let mut packet = Packet::new(stream, time_base, data);
+    packet.pts = Some(sample.cts);
+    packet.dts = Some(sample.dts);
+    packet.duration = Some(i64::from(sample.duration));
+    packet.flags = PacketFlags {
+        keyframe: sample.sync,
+        ..PacketFlags::default()
+    };
+    packet
+}
+
 /// The five tables that turn a sample number into a byte range and an instant,
 /// plus the one sample entry describing what those bytes are.
 struct SampleTable<'a> {
     entry: Option<Entry>,
+    /// The first `stsd` entry's four-character code, kept whether or not this
+    /// build knows the codec behind it.
+    entry_kind: FourCc,
     stts: Vec<(u32, u32)>,
     ctts: Vec<(u32, i32)>,
     stss: Vec<u32>,
@@ -576,6 +691,7 @@ impl<'a> SampleTable<'a> {
     fn read(stbl: &'a [u8], file_len: u64) -> Result<SampleTable<'a>> {
         let mut me = SampleTable {
             entry: None,
+            entry_kind: [0; 4],
             stts: Vec::new(),
             ctts: Vec::new(),
             stss: Vec::new(),
@@ -594,6 +710,7 @@ impl<'a> SampleTable<'a> {
                     // thing any muxer writes.
                     if let Some(child) = Boxes::new(rest.get(4..).unwrap_or(&[])).next() {
                         let (kind, payload) = child?;
+                        me.entry_kind = kind;
                         me.entry = sample_entry(&kind, payload)?;
                     }
                 }
@@ -871,6 +988,10 @@ fn sample_entry(kind: &FourCc, payload: &[u8]) -> Result<Option<Entry>> {
         b".mp3" | b"ms\x00\x55" => (CodecId::Mp3, None),
         b"ac-3" => (CodecId::Ac3, config_bytes(config, b"dac3")),
         b"ec-3" => (CodecId::EAc3, config_bytes(config, b"dec3")),
+        // Named rather than dropped: see `codec_of` in ec-matroska. A track
+        // listed as unsupported beats a track that vanished.
+        b"mlpa" => (CodecId::TrueHd, None),
+        b"dtsc" | b"dtse" | b"dtsh" | b"dtsl" => (CodecId::Dts, None),
         b"alac" => (
             CodecId::Alac,
             // ALAC's magic cookie is taken with its box header, which is the
