@@ -34,6 +34,7 @@
 pub mod jpeg;
 pub mod png;
 mod upsample;
+pub mod webp;
 
 use ec_core::{PixelFormat, Plane, VideoFrame};
 
@@ -340,10 +341,7 @@ pub fn decode_with_limits(data: &[u8], limits: Limits) -> Result<Image> {
     match ImageFormat::guess(data) {
         Some(ImageFormat::Png) => png::decode(data, limits),
         Some(ImageFormat::Jpeg) => jpeg::decode(data, limits),
-        Some(ImageFormat::WebP) => Err(Error::unsupported(
-            "WebP",
-            "the WebP decoder is a later stage of this crate",
-        )),
+        Some(ImageFormat::WebP) => webp::decode(data, limits),
         None => Err(Error::unsupported(
             "image",
             "no PNG, JPEG or WebP signature at the start of the data",
@@ -356,10 +354,7 @@ pub fn info(data: &[u8]) -> Result<Info> {
     match ImageFormat::guess(data) {
         Some(ImageFormat::Png) => png::info(data),
         Some(ImageFormat::Jpeg) => jpeg::info(data),
-        Some(ImageFormat::WebP) => Err(Error::unsupported(
-            "WebP",
-            "the WebP decoder is a later stage of this crate",
-        )),
+        Some(ImageFormat::WebP) => webp::info(data),
         None => Err(Error::unsupported(
             "image",
             "no PNG, JPEG or WebP signature at the start of the data",

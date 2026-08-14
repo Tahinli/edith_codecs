@@ -102,7 +102,8 @@ fn a_matroska_pgs_block_decodes_the_way_the_replica_decodes_one() {
     // The whole canvas, transparent where the cue paints nothing.
     assert_eq!(rgba.len(), 4 * 2 * 4);
     assert_eq!(&rgba[0..4], &[0, 0, 0, 0]);
-    assert_eq!(&rgba[4..12], &[255, 255, 255, 255, 255, 255, 255, 255]);
+    // The palette's own white, `Y' = 235` (see `ec_pgs`'s `rgba`).
+    assert_eq!(&rgba[4..12], &[235, 235, 235, 255, 235, 235, 235, 255]);
 
     // The erase set after the composition must not be what gets decoded: the
     // loop above stops at the `END` that closes the showing set.

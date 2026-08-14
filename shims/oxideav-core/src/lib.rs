@@ -133,6 +133,72 @@ impl fmt::Display for CodecId {
     }
 }
 
+impl From<&str> for CodecId {
+    fn from(s: &str) -> CodecId {
+        CodecId(s.to_owned())
+    }
+}
+
+impl From<String> for CodecId {
+    fn from(s: String) -> CodecId {
+        CodecId(s)
+    }
+}
+
+/// How a codec is named by a container, so a demuxer can map what it read to a
+/// registration.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum CodecTag {
+    /// A four-character code, as mp4 sample entries and RIFF write it.
+    FourCc([u8; 4]),
+    /// An MPEG-4 `ObjectTypeIndication`.
+    Mp4ObjectType(u8),
+    /// A Matroska `CodecID` string.
+    Matroska(String),
+}
+
+impl CodecTag {
+    /// The four-character code `code`.
+    pub fn fourcc(code: &[u8; 4]) -> CodecTag {
+        CodecTag::FourCc(*code)
+    }
+
+    /// The MPEG-4 object type `oti`.
+    pub fn mp4_object_type(oti: u8) -> CodecTag {
+        CodecTag::Mp4ObjectType(oti)
+    }
+
+    /// The Matroska `CodecID` `id`.
+    pub fn matroska(id: impl Into<String>) -> CodecTag {
+        CodecTag::Matroska(id.into())
+    }
+}
+
+/// How samples are laid out in a video frame. Only the format the family's own
+/// encoders take and hand out is named; a caller that needs another adds it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum PixelFormat {
+    /// Planar 4:2:0 8-bit.
+    #[default]
+    Yuv420P,
+}
+
+/// A codec's string-keyed knobs, parsed by whichever codec declares them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CodecOptions(HashMap<String, String>);
+
+impl CodecOptions {
+    /// The value set for `key`, if any.
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).map(String::as_str)
+    }
+
+    /// Set `key` to `value`, replacing what was there.
+    pub fn set(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        self.0.insert(key.into(), value.into());
+    }
+}
+
 /// What kind of stream a set of parameters describes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum MediaType {
@@ -164,8 +230,12 @@ pub struct CodecParameters {
     pub width: Option<u32>,
     /// Coded height.
     pub height: Option<u32>,
+    /// How a video stream's samples are laid out.
+    pub pixel_format: Option<PixelFormat>,
     /// Codec setup bytes.
     pub extradata: Vec<u8>,
+    /// Codec-specific knobs, read by whichever codec declares them.
+    pub options: CodecOptions,
 }
 
 impl CodecParameters {
@@ -222,12 +292,13 @@ pub struct StreamInfo {
 }
 
 /// One decoded picture.
+///
+/// No dimensions: the incumbent states them on the stream's
+/// [`CodecParameters`] and puts only the row stride on the plane, and a codec
+/// crate outside this workspace writes the literal (`oxideav-h265`'s decoder
+/// does), so the field list is the incumbent's and not ours to improve.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct VideoFrame {
-    /// Width in pixels.
-    pub width: u32,
-    /// Height in pixels.
-    pub height: u32,
     /// Presentation time in the stream's time base.
     pub pts: Option<i64>,
     /// One plane per component group; packed formats have exactly one.
@@ -267,8 +338,6 @@ impl From<ec_core::Frame> for Frame {
     fn from(frame: ec_core::Frame) -> Frame {
         match frame {
             ec_core::Frame::Video(video) => Frame::Video(VideoFrame {
-                width: video.width,
-                height: video.height,
                 pts: video.pts.map(|t| t.ticks),
                 planes: video
                     .planes
@@ -299,6 +368,35 @@ pub trait Decoder: Send {
     /// Take one frame, or [`Error::NeedMore`] when the decoder wants another
     /// packet first.
     fn receive_frame(&mut self) -> Result<Frame>;
+
+    /// Signal end of input, so whatever is held back becomes available through
+    /// [`receive_frame`](Decoder::receive_frame) and then [`Error::Eof`].
+    ///
+    /// The default is for a decoder that holds nothing back — one packet in,
+    /// one frame out, which is what the AC-3 path is.
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// An encoder: frames in, packets out.
+pub trait Encoder: Send {
+    /// The codec this produces.
+    fn codec_id(&self) -> &CodecId;
+
+    /// Parameters describing the stream it produces, for the muxer.
+    fn output_params(&self) -> &CodecParameters;
+
+    /// Feed one uncompressed frame.
+    fn send_frame(&mut self, frame: &Frame) -> Result<()>;
+
+    /// Take one packet, or [`Error::NeedMore`] when the encoder wants another
+    /// frame first.
+    fn receive_packet(&mut self) -> Result<Packet>;
+
+    /// Signal end of input, so the lookahead drains into
+    /// [`receive_packet`](Encoder::receive_packet).
+    fn flush(&mut self) -> Result<()>;
 }
 
 /// A container writer.
@@ -319,6 +417,9 @@ pub trait Muxer: Send {
 /// How a codec crate hands out decoders.
 pub type DecoderFactory = fn(&CodecParameters) -> Result<Box<dyn Decoder>>;
 
+/// How a codec crate hands out encoders.
+pub type EncoderFactory = fn(&CodecParameters) -> Result<Box<dyn Encoder>>;
+
 /// One codec's registration.
 #[derive(Clone)]
 pub struct CodecInfo {
@@ -326,6 +427,10 @@ pub struct CodecInfo {
     pub id: CodecId,
     /// How to build a decoder for it.
     pub decoder_factory: Option<DecoderFactory>,
+    /// How to build an encoder for it.
+    pub encoder_factory: Option<EncoderFactory>,
+    /// The container-level names that mean this codec.
+    pub tags: Vec<CodecTag>,
 }
 
 impl CodecInfo {
@@ -334,12 +439,26 @@ impl CodecInfo {
         CodecInfo {
             id,
             decoder_factory: None,
+            encoder_factory: None,
+            tags: Vec::new(),
         }
     }
 
     /// The same registration, with a decoder.
     pub fn decoder(mut self, factory: DecoderFactory) -> CodecInfo {
         self.decoder_factory = Some(factory);
+        self
+    }
+
+    /// The same registration, with an encoder.
+    pub fn encoder(mut self, factory: EncoderFactory) -> CodecInfo {
+        self.encoder_factory = Some(factory);
+        self
+    }
+
+    /// The same registration, claiming `tags` on top of whatever it claimed.
+    pub fn tags(mut self, tags: impl IntoIterator<Item = CodecTag>) -> CodecInfo {
+        self.tags.extend(tags);
         self
     }
 }
@@ -380,6 +499,42 @@ impl CodecRegistry {
             .ok_or_else(|| Error::CodecNotFound(params.codec_id.0.clone()))?;
         factory(params)
     }
+}
+
+/// What a codec crate is handed to register itself into.
+///
+/// The incumbent's context carries four sub-registries; this one carries the
+/// codecs, because a container, source or filter crate registering into the
+/// replica's build does not exist.
+#[derive(Clone, Default)]
+pub struct RuntimeContext {
+    /// Decoder and encoder factories, by codec id.
+    pub codecs: CodecRegistry,
+}
+
+impl RuntimeContext {
+    /// An empty context.
+    pub fn new() -> RuntimeContext {
+        RuntimeContext::default()
+    }
+}
+
+/// Declare a codec crate's registration entry point, as the family's crates
+/// spell it: `oxideav_core::register!("h265", register);`.
+///
+/// The name is carried for documentation only, exactly as the incumbent does —
+/// what the generated `__oxideav_entry` runs is `$func`.
+#[macro_export]
+macro_rules! register {
+    ($name:literal, $func:path) => {
+        /// This crate's registration entry point, generated by
+        /// [`oxideav_core::register!`].
+        #[doc(hidden)]
+        pub fn __oxideav_entry(ctx: &mut $crate::RuntimeContext) {
+            let _ = $name;
+            $func(ctx);
+        }
+    };
 }
 
 /// A [`Decoder`] over one of the family's own, converting the frames on the way
@@ -460,7 +615,6 @@ mod tests {
         let Frame::Video(frame) = Frame::from(ec_core::Frame::Video(video)) else {
             panic!("a video frame stays a video frame");
         };
-        assert_eq!((frame.width, frame.height), (1, 1));
         assert_eq!(frame.planes[0].data, vec![1, 2, 3, 4]);
         assert_eq!(frame.planes[0].stride, 4);
 

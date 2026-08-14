@@ -71,10 +71,13 @@ mod tests {
         let Ok(Frame::Video(frame)) = decoder.receive_frame() else {
             panic!("a display set is a picture");
         };
-        assert_eq!((frame.width, frame.height), (4, 2));
+        // A 4x2 canvas: no dimensions on the frame, so the row stride and the
+        // byte count are what state them.
+        assert_eq!(frame.planes[0].stride, 4 * 4);
         let data = frame.planes.into_iter().next().unwrap().data;
         assert_eq!(data.len(), 4 * 2 * 4);
-        assert_eq!(&data[4..12], &[255, 255, 255, 255, 255, 255, 255, 255]);
+        // The palette's own white, `Y' = 235` (see `ec_pgs`'s `rgba`).
+        assert_eq!(&data[4..12], &[235, 235, 235, 255, 235, 235, 235, 255]);
         assert_eq!(&data[0..4], &[0, 0, 0, 0]);
     }
 }

@@ -386,17 +386,24 @@ pub fn make_decoder(_params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     Ok(Box::new(PgsDecoder::new()))
 }
 
-/// One palette entry: BT.601 limited-range Y'CbCr with straight alpha, the way
-/// a disc writes it, into RGBA.
+/// One palette entry: BT.601 Y'CbCr with straight alpha, the way a disc writes
+/// it, into RGBA.
+///
+/// The luma is taken at its own scale — `Y' = 235` comes out 235, not the 255
+/// an expansion of the 16..235 video range would give. That is not a reading of
+/// the Blu-ray spec but a measurement of what every player draws: ffmpeg's own
+/// `pgssub` decoder, burning `fixtures/subs/pgs-1080p.sup` over black, tops out
+/// at 235 (`scripts/pgs-white-level.sh`), and a subtitle that is brighter than
+/// the one the disc is mastered against is our bug, not the world's.
 fn rgba(y: u8, cr: u8, cb: u8, alpha: u8) -> [u8; 4] {
-    let y = 298 * (i32::from(y) - 16);
+    let y = i32::from(y) << 8;
     let cb = i32::from(cb) - 128;
     let cr = i32::from(cr) - 128;
     let clamp = |v: i32| ((v + 128) >> 8).clamp(0, 255) as u8;
     [
-        clamp(y + 409 * cr),
-        clamp(y - 100 * cb - 208 * cr),
-        clamp(y + 516 * cb),
+        clamp(y + 359 * cr),
+        clamp(y - 88 * cb - 183 * cr),
+        clamp(y + 454 * cb),
         alpha,
     ]
 }
@@ -515,10 +522,11 @@ mod tests {
         // Outside the object: nothing painted at all.
         assert_eq!(pixel(0, 0), [0, 0, 0, 0]);
         assert_eq!(pixel(1, 1), [0, 0, 0, 0]);
-        // Row 1 of the object is white, row 2 is black, both opaque.
-        assert_eq!(pixel(2, 1), [255, 255, 255, 255]);
-        assert_eq!(pixel(9, 1), [255, 255, 255, 255]);
-        assert_eq!(pixel(2, 2), [0, 0, 0, 255]);
+        // Row 1 of the object is white, row 2 is black, both opaque. White is
+        // the palette's own `Y' = 235`, black its `Y' = 16` — see [`rgba`].
+        assert_eq!(pixel(2, 1), [235, 235, 235, 255]);
+        assert_eq!(pixel(9, 1), [235, 235, 235, 255]);
+        assert_eq!(pixel(2, 2), [16, 16, 16, 255]);
         // Past the object's width again.
         assert_eq!(pixel(10, 1), [0, 0, 0, 0]);
         assert!(decoder.take_frame().is_none());
@@ -567,10 +575,12 @@ mod tests {
     }
 
     #[test]
-    fn palette_entries_are_bt601_limited_range() {
-        // Y=235 is white, Y=16 is black, and alpha rides through untouched.
-        assert_eq!(rgba(235, 128, 128, 255), [255, 255, 255, 255]);
-        assert_eq!(rgba(16, 128, 128, 128), [0, 0, 0, 128]);
+    fn palette_entries_convert_at_their_own_luma_scale() {
+        // A disc's white and black land where ffmpeg's PGS decoder puts them —
+        // 235 and 16, not an expansion to 255 and 0 — and alpha rides through
+        // untouched.
+        assert_eq!(rgba(235, 128, 128, 255), [235, 235, 235, 255]);
+        assert_eq!(rgba(16, 128, 128, 128), [16, 16, 16, 128]);
         // A red palette entry: Y=81, Cr=240, Cb=90 in BT.601.
         let red = rgba(81, 240, 90, 255);
         assert!(red[0] > 230 && red[1] < 30 && red[2] < 30, "{red:?}");
