@@ -1,0 +1,17 @@
+[package]
+name = "ec-image"
+description = "Still-image decoding: PNG, JPEG and WebP."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ec-core = { workspace = true }
+ec-inflate = { workspace = true }
+
+[dev-dependencies]
+# The incumbent, as a differential oracle only: every test decodes the same
+# bytes both ways and compares pixels. Running it is the point; nothing is
+# copied from it.
+image = "0.25.10"
