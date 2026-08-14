@@ -5,3 +5,7 @@ version = 4
 [[package]]
 name = "ec-core"
 version = "0.1.0"
+
+[[package]]
+name = "oracle"
+version = "0.1.0"

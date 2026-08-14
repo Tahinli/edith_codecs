@@ -1,0 +1,15 @@
+[package]
+name = "oracle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "oracle"
+path = "src/main.rs"
+
+# No dependencies on purpose: the oracle drives ffmpeg/ffprobe through std process
+# pipes so that comparison tooling can never leak into any ec-* crate's dep graph.
+[dependencies]
