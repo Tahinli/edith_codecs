@@ -232,6 +232,40 @@ impl Surface {
         check("vaGetImage", status)
     }
 
+    /// Copy an [`Image`] into the surface (`vaPutImage`).
+    ///
+    /// The upload path an encoder needs: fill a standalone image with source
+    /// pixels, then hand it to the driver, which detiles and converts on the
+    /// way in. The region is `(0, 0, width, height)` on both sides — scaling
+    /// during upload is a video-processing job, not an encoder's.
+    pub fn write_from(&self, image: &Image, width: u32, height: u32) -> Result<()> {
+        let (img_w, img_h) = image.size();
+        if width > img_w || height > img_h {
+            return Err(Error::Protocol(format!(
+                "vaPutImage region {width}x{height} exceeds image {img_w}x{img_h}"
+            )));
+        }
+        // SAFETY: valid display and surface id; `image.raw.image_id` is a live
+        // image on the same display, and the region is bounded above by both
+        // the image and the surface size (va.h:4860).
+        let status = unsafe {
+            sys::vaPutImage(
+                self.display.handle(),
+                self.id,
+                image.raw.image_id,
+                0,
+                0,
+                width,
+                height,
+                0,
+                0,
+                width,
+                height,
+            )
+        };
+        check("vaPutImage", status)
+    }
+
     /// The surface id, for FFI-level callers (`ec-hw` picture parameters).
     pub fn id(&self) -> sys::VASurfaceID {
         self.id

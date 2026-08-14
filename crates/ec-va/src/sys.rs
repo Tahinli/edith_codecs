@@ -98,6 +98,7 @@ pub const VAConfigAttribRTFormat: VAConfigAttribType = 0;
 pub const VAConfigAttribRateControl: VAConfigAttribType = 5;
 pub const VAConfigAttribDecSliceMode: VAConfigAttribType = 6;
 pub const VAConfigAttribEncPackedHeaders: VAConfigAttribType = 10;
+pub const VAConfigAttribEncMaxRefFrames: VAConfigAttribType = 13;
 
 // RT formats (`va.h:1073-1090`).
 pub const VA_RT_FORMAT_YUV420: u32 = 0x0000_0001;
@@ -148,6 +149,20 @@ pub const VAEncSliceParameterBufferType: VABufferType = 24;
 pub const VAEncPackedHeaderParameterBufferType: VABufferType = 25;
 pub const VAEncPackedHeaderDataBufferType: VABufferType = 26;
 pub const VAEncMiscParameterBufferType: VABufferType = 27;
+
+// Packed header bits an encoder may take over (`va.h:1199-1231`).
+pub const VA_ENC_PACKED_HEADER_NONE: u32 = 0x0000_0000;
+pub const VA_ENC_PACKED_HEADER_SEQUENCE: u32 = 0x0000_0001;
+pub const VA_ENC_PACKED_HEADER_PICTURE: u32 = 0x0000_0002;
+pub const VA_ENC_PACKED_HEADER_SLICE: u32 = 0x0000_0004;
+pub const VA_ENC_PACKED_HEADER_MISC: u32 = 0x0000_0008;
+pub const VA_ENC_PACKED_HEADER_RAW_DATA: u32 = 0x0000_0010;
+
+// Rate control modes (`va.h:1108-1164`).
+pub const VA_RC_NONE: u32 = 0x0000_0001;
+pub const VA_RC_CBR: u32 = 0x0000_0002;
+pub const VA_RC_VBR: u32 = 0x0000_0004;
+pub const VA_RC_CQP: u32 = 0x0000_0010;
 
 /// `vaCreateContext` flag: sequence contains only progressive frames (`va.h:1919`).
 pub const VA_PROGRESSIVE: c_int = 0x1;
@@ -480,6 +495,20 @@ unsafe extern "C" {
     ) -> VAStatus;
     /// `va.h:4888`. Zero-copy view of a surface, when the driver allows it.
     pub fn vaDeriveImage(dpy: VADisplay, surface: VASurfaceID, image: *mut VAImage) -> VAStatus;
+    /// `va.h:4860`. Copies an image into a surface — the encoder upload path.
+    pub fn vaPutImage(
+        dpy: VADisplay,
+        surface: VASurfaceID,
+        image: VAImageID,
+        src_x: c_int,
+        src_y: c_int,
+        src_width: c_uint,
+        src_height: c_uint,
+        dest_x: c_int,
+        dest_y: c_int,
+        dest_width: c_uint,
+        dest_height: c_uint,
+    ) -> VAStatus;
 }
 
 #[link(name = "va-drm")]
