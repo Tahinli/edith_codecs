@@ -512,6 +512,17 @@ impl Decoder {
                 sh.num_ref_idx_l1_active, sh.header_bits, &rbsp[..rbsp.len().min(6)]
             );
         }
+        if trace_enabled() && !sh.slice_type.is_intra() {
+            for x in 0..2 {
+                let l: Vec<(u32, i32)> = (0..lists[x].len())
+                    .filter_map(|i| lists[x].get(i))
+                    .map(|k| (self.dpb.frames[k].frame_num, self.dpb.frames[k].poc))
+                    .collect();
+                if !l.is_empty() {
+                    eprintln!("  RefPicList{x} (frame_num, poc): {l:?}");
+                }
+            }
+        }
         let intra_slice = sh.slice_type.is_intra();
         let b_slice = sh.slice_type == SliceType::B;
         if !intra_slice && ctx.lists[0].len() == 0 {
@@ -1475,12 +1486,19 @@ fn decode_inter_mb(
                     let by = (mb_y * 4 + py) as i32;
                     let inc = ref_idx_cond(pic, &mvc, bx - 1, by, list)
                         + 2 * ref_idx_cond(pic, &mvc, bx, by - 1, list);
-                    r.ref_idx(ctx.num_ref_idx[list] as u32 - 1, inc)? as i8
+                    let v = r.ref_idx(ctx.num_ref_idx[list] as u32 - 1, inc)? as i8;
+                    if trace_enabled() {
+                        eprintln!("  ref_idx part {part} list {list} inc {inc} = {v}");
+                    }
+                    v
                 };
                 motion.ref_idx[list][part] = idx;
-                // Publish it so the next partition's context can see it.
+                // Publish it over the whole macroblock partition — one
+                // reference index covers an entire 8x8, however it is further
+                // split — so the next partition's context (9.3.3.1.1.6) and
+                // the mvd contexts of 9.3.3.1.1.7 see it everywhere.
                 let (px, py) = part_origin(&shape, part, (0, 0));
-                let (pw, ph) = part_size(&shape, &motion, part);
+                let (pw, ph) = mb_part_size(&shape);
                 for dy in 0..ph {
                     for dx in 0..pw {
                         let bi = (mb_y * 4 + py + dy) * pic.mb_w * 4 + mb_x * 4 + px + dx;
@@ -1528,7 +1546,10 @@ fn decode_inter_mb(
                         };
                         let v = r.mvd(comp, inc)?;
                         if trace_enabled() {
-                            eprintln!("  mvd part {part} sp {sp} list {list} comp {comp} inc {inc} = {v}");
+                            eprintln!(
+                                "  mvd part {part} sp {sp} at ({px},{py}) list {list} comp {comp} \
+                                 absA {a} absB {bb} inc {inc} = {v}"
+                            );
                         }
                         mvd[comp] = i16::try_from(v)
                             .map_err(|_| Error::corrupt("mvd outside the level limits"))?;
@@ -1692,6 +1713,12 @@ fn sp_offset(shape: &MbShape, m: &MbMotion, part: usize, sp: usize) -> (usize, u
         (1, 2) => (sp, 0),
         _ => (sp % 2, sp / 2),
     }
+}
+
+/// Size of one *macroblock* partition in 4x4 blocks: always 8x8 for a
+/// macroblock that carries sub-macroblock types, however those split it.
+fn mb_part_size(shape: &MbShape) -> (usize, usize) {
+    if shape.sub { (2, 2) } else { (shape.w, shape.h) }
 }
 
 /// Size of one (sub-)macroblock partition in 4x4 blocks.
