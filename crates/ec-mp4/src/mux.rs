@@ -95,6 +95,28 @@ impl<W: Write + Seek> Mp4Muxer<W> {
         Ok(())
     }
 
+    /// Say what a video stream's samples mean after the stream was declared.
+    ///
+    /// The `colr` box is part of the sample entry and the sample entry is
+    /// written at [`Muxer::finish`], so this may be said any time before then —
+    /// which is what a caller that learns the source's colour space after it has
+    /// opened the file needs.
+    pub fn set_color(&mut self, stream: u32, color: ec_core::ColorInfo) -> Result<()> {
+        let track = self
+            .tracks
+            .get_mut(stream as usize)
+            .ok_or_else(|| Error::corrupt(format!("mp4: no stream {stream} to colour")))?;
+        match &mut track.info.params.media {
+            ec_core::MediaParameters::Video(video) => video.color = color,
+            _ => {
+                return Err(Error::corrupt(format!(
+                    "mp4: stream {stream} is not a video track"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Take the writer back once the file is finished.
     pub fn into_inner(self) -> W {
         self.w
@@ -320,12 +342,14 @@ impl<W: Write + Seek> Mp4Muxer<W> {
 }
 
 impl<W: Write + Seek + Send> Muxer for Mp4Muxer<W> {
+    /// Declare a stream — **at any point before [`Muxer::finish`]**, which is
+    /// more than the trait promises. Samples are written where they arrive and
+    /// the chunk table follows, so a track declared after the picture is
+    /// already in the `mdat` costs nothing: its `trak` is built at the end with
+    /// every other. That is what lets an export mix and encode its sound *while*
+    /// it writes the picture, and add its subtitles once the film's length is
+    /// known.
     fn add_stream(&mut self, info: StreamInfo) -> Result<u32> {
-        if self.started {
-            return Err(Error::corrupt(
-                "mp4: a stream added after the first packet was written",
-            ));
-        }
         let timescale = u32::try_from(info.time_base.den()).map_err(|_| {
             Error::corrupt(format!(
                 "mp4: a time base of 1/{} does not fit a 32-bit timescale",

@@ -47,7 +47,7 @@ mod demux;
 mod esds;
 mod mux;
 
-pub use demux::Mp4Demuxer;
+pub use demux::{Mp4Demuxer, Sample, TrackInfo};
 pub use esds::{Esds, object_type};
 pub use mux::Mp4Muxer;
 
