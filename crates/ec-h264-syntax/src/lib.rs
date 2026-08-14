@@ -20,7 +20,7 @@ pub mod pps;
 pub mod slice;
 pub mod sps;
 
-pub use nal::{AnnexBIter, NalHeader, NalUnitType, unescape_rbsp};
+pub use nal::{AnnexBIter, NalHeader, NalUnitType, escape_rbsp, unescape_rbsp};
 pub use pps::Pps;
 pub use slice::{
     DeblockControl, DecRefPicMarking, Mmco, PredWeightTable, RefPicListMod, SliceHeader, SliceType,
