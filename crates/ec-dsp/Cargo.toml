@@ -1,0 +1,10 @@
+[package]
+name = "ec-dsp"
+description = "Shared transforms for the edith_codecs family: FFT, DCT, MDCT and analysis windows."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+wide.workspace = true
