@@ -36,6 +36,11 @@ pub mod slice;
 pub mod vui;
 
 pub use nal::{AnnexBNal, NalHeader, NalUnitType, escape_rbsp, split_annex_b, unescape_rbsp};
-pub use ps::{ConformanceWindow, Pps, ProfileTierLevel, ShortTermRefPicSet, Sps, Vps};
-pub use slice::{ParsePositions, SliceHeader, SliceType, count_emulation_prevention_bytes};
+pub use ps::{
+    ConformanceWindow, MAX_ST_REF_PICS, Pps, ProfileTierLevel, ShortTermRefPicSet, Sps, Vps,
+};
+pub use slice::{
+    LongTermRef, ParsePositions, PredWeightTable, SliceHeader, SliceType, WeightEntry,
+    count_emulation_prevention_bytes,
+};
 pub use vui::{ColourDescription, VideoSignalType, VuiParameters};
