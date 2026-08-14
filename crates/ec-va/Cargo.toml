@@ -1,0 +1,12 @@
+[package]
+name = "ec-va"
+description = "Minimal hand-written libva (VA-API) FFI and a safe RAII/typestate layer over it."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+# No dependencies, by design: the whole point of this crate is that the FFI
+# surface is small enough to be read end to end (see src/sys.rs). It links the
+# system libva/libva-drm shared objects; nothing is generated at build time.
+[dependencies]
