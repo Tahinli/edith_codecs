@@ -451,6 +451,48 @@ fn seeks_land_at_or_before_the_target() {
     }
 }
 
+/// FLAC-in-Ogg: recognised, described and read to the end. No fixture ships in
+/// this mapping, so ffmpeg makes one from a fixture that does.
+#[test]
+fn reads_flac_in_ogg() {
+    let files = ogg_fixtures();
+    let Some(source) = files
+        .iter()
+        .find(|p| p.to_string_lossy().contains("vorbis-ogg-stereo-44100"))
+    else {
+        eprintln!("fixtures absent — skipping");
+        return;
+    };
+    let path = workdir("flac").join("flac-in.ogg");
+    let made = Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-i"])
+        .arg(source)
+        .args(["-c:a", "flac", "-f", "ogg"])
+        .arg(&path)
+        .status()
+        .expect("ffmpeg");
+    assert!(made.success(), "ffmpeg could not write FLAC-in-Ogg");
+
+    let (streams, packets, damaged) = demux_all(&path);
+    assert_eq!(damaged, 0);
+    assert_eq!(streams[0].params.codec, CodecId::Flac);
+    assert_eq!(
+        demuxer_mapping_rate(&streams[0]),
+        44_100,
+        "the rate comes out of STREAMINFO, not the file name"
+    );
+    assert_eq!(packets.len() as u64, ffprobe_packets(&path));
+    println!("flac-in-ogg: {} packets", packets.len());
+}
+
+/// The sample rate a stream description states.
+fn demuxer_mapping_rate(info: &StreamInfo) -> u32 {
+    match &info.params.media {
+        MediaParameters::Audio(audio) => audio.sample_rate,
+        _ => 0,
+    }
+}
+
 /// Payload sizes Ogg's own lacing has to work for, none of which the fixtures
 /// contain: a packet that is exactly a multiple of 255, one that fills more
 /// than one page's segment table, and an empty one.
