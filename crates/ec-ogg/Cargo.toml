@@ -1,0 +1,10 @@
+[package]
+name = "ec-ogg"
+description = "Ogg (RFC 3533) demuxer and muxer with the Vorbis, Opus (RFC 7845) and FLAC mappings."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ec-core.workspace = true

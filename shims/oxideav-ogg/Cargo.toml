@@ -1,0 +1,13 @@
+[package]
+name = "oxideav-ogg"
+description = "Compatibility shim: the oxideav-ogg mux surface edith consumes, over ec-ogg."
+version = "0.1.8"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+ec-core = { path = "../../crates/ec-core", version = "0.1.0" }
+ec-ogg = { path = "../../crates/ec-ogg", version = "0.1.0" }
+oxideav-core = { path = "../oxideav-core", version = "0.1.34" }
