@@ -31,7 +31,9 @@
 // what keeps the code readable against the text it comes from.
 #![allow(clippy::needless_range_loop)]
 
+pub mod jpeg;
 pub mod png;
+mod upsample;
 
 use ec_core::{PixelFormat, Plane, VideoFrame};
 
@@ -337,10 +339,7 @@ pub fn decode(data: &[u8]) -> Result<Image> {
 pub fn decode_with_limits(data: &[u8], limits: Limits) -> Result<Image> {
     match ImageFormat::guess(data) {
         Some(ImageFormat::Png) => png::decode(data, limits),
-        Some(ImageFormat::Jpeg) => Err(Error::unsupported(
-            "JPEG",
-            "the JPEG decoder is the next stage of this crate",
-        )),
+        Some(ImageFormat::Jpeg) => jpeg::decode(data, limits),
         Some(ImageFormat::WebP) => Err(Error::unsupported(
             "WebP",
             "the WebP decoder is a later stage of this crate",
@@ -356,10 +355,7 @@ pub fn decode_with_limits(data: &[u8], limits: Limits) -> Result<Image> {
 pub fn info(data: &[u8]) -> Result<Info> {
     match ImageFormat::guess(data) {
         Some(ImageFormat::Png) => png::info(data),
-        Some(ImageFormat::Jpeg) => Err(Error::unsupported(
-            "JPEG",
-            "the JPEG decoder is the next stage of this crate",
-        )),
+        Some(ImageFormat::Jpeg) => jpeg::info(data),
         Some(ImageFormat::WebP) => Err(Error::unsupported(
             "WebP",
             "the WebP decoder is a later stage of this crate",
