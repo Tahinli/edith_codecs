@@ -248,6 +248,21 @@ mod tests {
     }
 
     #[test]
+    fn vq4_is_the_printed_table_shifted_by_one() {
+        // The correction measured against a real stream (see VQ4's comment):
+        // index k selects the row Table E4.4 prints at k + 1, and index 31
+        // selects silence. Pinned here so the table cannot drift back.
+        use crate::aht_tables::VQ4;
+        assert_eq!(VQ4[31], [0; 6]);
+        assert_eq!(VQ4[29], [-83, 278, 323, 55, -154, 232]);
+        assert_eq!(VQ4[0], [6636, -4593, 14173, -17297, -16523, 864]);
+        // Every other table is used exactly as printed.
+        assert_eq!(vq_table(3).len(), 16);
+        assert_eq!(vq_table(4).len(), 32);
+        assert_eq!(vq_table(7).len(), 512);
+    }
+
+    #[test]
     fn gaq_gains_follow_table_e3_3() {
         assert_eq!(gain_of(1, 0), 1);
         assert_eq!(gain_of(1, 1), 2);

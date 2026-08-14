@@ -59,8 +59,9 @@ pub const VQ3: [[i16; 6]; 16] = [
     [-22003, -6476, 7974, 648, 2054, -331],
 ];
 
-/// VQ table for `hebap` 4 (Table E4.4).
-pub const VQ4: [[i16; 6]; 32] = [
+/// Table E4.4 exactly as the standard prints it. It is *not* the codebook:
+/// see [`VQ4`].
+const VQ4_PRINTED: [[i16; 6]; 32] = [
     [22787, 5568, -5658, -156, -506, -33],
     [6636, -4593, 14173, -17297, -16523, 864],
     [3658, 22540, 104, -1763, -84, 6],
@@ -94,6 +95,27 @@ pub const VQ4: [[i16; 6]; 32] = [
     [-83, 278, 323, 55, -154, 232],
     [7788, 1462, 18395, 15296, -15763, -1131],
 ];
+
+/// VQ table for `hebap` 4, corrected against a real stream.
+///
+/// Table E4.4's index column is offset by one against its value rows: the
+/// vector an encoder selects with index `k` is the row the document prints at
+/// `k + 1`, and index 31 selects the all-zero vector, which the table does not
+/// print at all. Measured against ffmpeg's decode of a Dolby Digital Plus
+/// stream — every one of the 32 indices occurs there, and with the printed
+/// mapping only `hebap == 4` bins diverge (0.63% of a channel's energy), while
+/// index 31 alone diverges by ten orders of magnitude. The other six tables
+/// need no such correction.
+pub const VQ4: [[i16; 6]; 32] = {
+    let mut t = [[0i16; 6]; 32];
+    let mut k = 0;
+    while k < 31 {
+        t[k] = VQ4_PRINTED[k + 1];
+        k += 1;
+    }
+    // t[31] stays the zero vector.
+    t
+};
 
 /// VQ table for `hebap` 5 (Table E4.5).
 pub const VQ5: [[i16; 6]; 128] = [
