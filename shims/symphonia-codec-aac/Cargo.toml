@@ -1,0 +1,12 @@
+[package]
+name = "symphonia-codec-aac"
+description = "Compatibility shim: the symphonia-codec-aac 0.6 surface edith consumes, served by ec-aac."
+version = "0.6.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Ahmet Kaan Gümüş"]
+publish = false
+
+[dependencies]
+ec-aac = { path = "../../crates/ec-aac", version = "0.1.0" }
+symphonia-core = { path = "../symphonia-core", version = "0.6.0" }

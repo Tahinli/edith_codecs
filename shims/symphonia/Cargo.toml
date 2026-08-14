@@ -1,0 +1,16 @@
+[package]
+name = "symphonia"
+description = "Compatibility shim: the symphonia 0.6 umbrella surface edith consumes, served by ec-probe."
+version = "0.6.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Ahmet Kaan Gümüş"]
+publish = false
+
+[dependencies]
+ec-core = { path = "../../crates/ec-core", version = "0.1.0" }
+ec-probe = { path = "../../crates/ec-probe", version = "0.1.0" }
+symphonia-core = { path = "../symphonia-core", version = "0.6.0" }
+
+[dev-dependencies]
+symphonia-codec-aac = { path = "../symphonia-codec-aac", version = "0.6.0" }

@@ -1,0 +1,11 @@
+[package]
+name = "symphonia-core"
+description = "Compatibility shim: the symphonia-core 0.6 surface edith consumes, over ec-core."
+version = "0.6.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Ahmet Kaan Gümüş"]
+publish = false
+
+[dependencies]
+ec-core = { path = "../../crates/ec-core", version = "0.1.0" }
