@@ -9,3 +9,6 @@ authors.workspace = true
 [dependencies]
 ec-core.workspace = true
 ec-dsp.workspace = true
+
+[dev-dependencies]
+ec-dsp.workspace = true

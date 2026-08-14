@@ -224,6 +224,13 @@ impl<'a> RangeDecoder<'a> {
         }
     }
 
+    /// Declares the rest of the frame consumed, so [`RangeDecoder::tell`]
+    /// reports the whole frame. CELT does this for a silent frame, whose
+    /// remaining bits carry nothing (RFC 6716, Section 4.3).
+    pub fn skip_to_end(&mut self) {
+        self.nbits_total = (self.buf.len() as u32) * 8 + ilog(self.rng);
+    }
+
     /// `ec_tell()`: a conservative upper bound on whole bits used so far.
     #[inline]
     pub fn tell(&self) -> u32 {
