@@ -82,7 +82,15 @@ const TMP_W: usize = 16 + 5;
 /// Luma quarter-sample interpolation (8.4.2.2.1) of a `w` x `h` partition whose
 /// full-sample origin is `(x, y)` and whose motion vector is `mv` in quarter
 /// samples. Writes `w` x `h` prediction samples into `out` at pitch `w`.
-pub(crate) fn mc_luma(r: &RefPlane<'_>, x: i32, y: i32, mv: [i16; 2], w: usize, h: usize, out: &mut [u8]) {
+pub(crate) fn mc_luma(
+    r: &RefPlane<'_>,
+    x: i32,
+    y: i32,
+    mv: [i16; 2],
+    w: usize,
+    h: usize,
+    out: &mut [u8],
+) {
     let (fx, fy) = ((mv[0] & 3) as usize, (mv[1] & 3) as usize);
     let xi = clamp_origin(x + (mv[0] as i32 >> 2), w, r.width, r.pad, 2, 3);
     let yi = clamp_origin(y + (mv[1] as i32 >> 2), h, r.height, r.pad, 2, 3);
@@ -149,8 +157,9 @@ pub(crate) fn mc_luma(r: &RefPlane<'_>, x: i32, y: i32, mv: [i16; 2], w: usize, 
     for row in 0..h {
         for col in 0..w {
             let i = row * w + col;
-            let g = |dx: i32, dy: i32| r.data[base + (row as i32 + dy) as usize * stride
-                + (col as i32 + dx) as usize];
+            let g = |dx: i32, dy: i32| {
+                r.data[base + (row as i32 + dy) as usize * stride + (col as i32 + dx) as usize]
+            };
             out[i] = match (fx, fy) {
                 // Table 8-12, quarter positions on the integer rows/columns.
                 (1, 0) => avg(g(0, 0), bb[i]),
@@ -185,12 +194,7 @@ pub(crate) fn mc_chroma(
     let yi = clamp_origin(y + (mv[1] as i32 >> 3), h, r.height, r.pad, 0, 1);
     let stride = r.stride;
     let base = r.at(xi, yi);
-    let (wa, wb, wc, wd) = (
-        (8 - fx) * (8 - fy),
-        fx * (8 - fy),
-        (8 - fx) * fy,
-        fx * fy,
-    );
+    let (wa, wb, wc, wd) = ((8 - fx) * (8 - fy), fx * (8 - fy), (8 - fx) * fy, fx * fy);
     for row in 0..h {
         let src = base + row * stride;
         for col in 0..w {
@@ -311,7 +315,14 @@ mod tests {
         (data, stride, origin)
     }
 
-    fn plane(data: &[u8], stride: usize, origin: usize, w: usize, h: usize, pad: usize) -> RefPlane<'_> {
+    fn plane(
+        data: &[u8],
+        stride: usize,
+        origin: usize,
+        w: usize,
+        h: usize,
+        pad: usize,
+    ) -> RefPlane<'_> {
         RefPlane {
             data,
             stride,
@@ -324,6 +335,7 @@ mod tests {
 
     /// The spec's clipped, per-sample definition of the same interpolation,
     /// written straight from Equations 8-239 to 8-261 with no padding tricks.
+    #[allow(clippy::too_many_arguments)]
     fn spec_luma(
         pic: &[u8],
         stride: usize,
@@ -396,15 +408,20 @@ mod tests {
         let r = plane(&data, stride, origin, w, h, pad);
         let mut ours = [0u8; 256];
         let mut theirs = [0u8; 256];
-        for &(px, py) in &[(8i32, 8i32), (0, 0), (32, 16), (-40, -40), (60, 44), (44, 4)] {
+        for &(px, py) in &[
+            (8i32, 8i32),
+            (0, 0),
+            (32, 16),
+            (-40, -40),
+            (60, 44),
+            (44, 4),
+        ] {
             for fy in 0..4i16 {
                 for fx in 0..4i16 {
                     for &(pw, ph) in &[(16usize, 16usize), (8, 4), (4, 8), (4, 4)] {
                         let mv = [fx - 20 * 4, fy + 12];
                         mc_luma(&r, px, py, mv, pw, ph, &mut ours);
-                        spec_luma(
-                            &data, stride, origin, w, h, px, py, mv, pw, ph, &mut theirs,
-                        );
+                        spec_luma(&data, stride, origin, w, h, px, py, mv, pw, ph, &mut theirs);
                         assert_eq!(
                             ours[..pw * ph],
                             theirs[..pw * ph],

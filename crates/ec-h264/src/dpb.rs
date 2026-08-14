@@ -96,7 +96,8 @@ impl Plane8 {
             let (src, dst) = (full, full - (y + 1) * stride);
             self.data.copy_within(src..src + stride, dst);
             let src = full + (h - 1) * stride;
-            self.data.copy_within(src..src + stride, src + (y + 1) * stride);
+            self.data
+                .copy_within(src..src + stride, src + (y + 1) * stride);
         }
     }
 }
@@ -633,6 +634,7 @@ impl Dpb {
 
     /// Build `RefPicList0` and `RefPicList1` for one slice: initialisation
     /// (8.2.4.2.1 / 8.2.4.2.3) followed by modification (8.2.4.3).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn build_ref_lists(
         &self,
         slice_type: SliceType,
@@ -704,7 +706,8 @@ impl Dpb {
                 lists[1].push(i);
             }
             // 8.2.4.2.3 step 3.
-            if lists[1].len > 1 && lists[1].entries[..lists[1].len] == lists[0].entries[..lists[0].len]
+            if lists[1].len > 1
+                && lists[1].entries[..lists[1].len] == lists[0].entries[..lists[0].len]
             {
                 lists[1].entries.swap(0, 1);
             }
@@ -938,7 +941,12 @@ impl Dpb {
     }
 
     /// Adaptive marking (clause 8.2.5.4).
-    fn apply_mmco(&mut self, pic: &mut Picture, m: &DecRefPicMarking, info: &PicInfo) -> Result<()> {
+    fn apply_mmco(
+        &mut self,
+        pic: &mut Picture,
+        m: &DecRefPicMarking,
+        info: &PicInfo,
+    ) -> Result<()> {
         let curr_pic_num = info.frame_num as i32;
         for op in &m.mmcos {
             match op.op {
@@ -1115,9 +1123,8 @@ mod tests {
     fn extend_borders_replicates_edges() {
         let mut p = plane(6, 5);
         p.extend_borders();
-        let at = |x: i32, y: i32| -> u8 {
-            p.data[(p.origin as i32 + y * p.stride as i32 + x) as usize]
-        };
+        let at =
+            |x: i32, y: i32| -> u8 { p.data[(p.origin as i32 + y * p.stride as i32 + x) as usize] };
         for y in -4..9i32 {
             for x in -4..10i32 {
                 let cx = x.clamp(0, 5) as usize;
@@ -1200,9 +1207,24 @@ mod tests {
     fn poc_type_2_is_twice_the_frame_number() {
         let sps = sps_for(2);
         let dpb = Dpb::default();
-        assert_eq!(dpb.picture_order_count(&sps, &info(0, 0, true, true)).unwrap().value, 0);
-        assert_eq!(dpb.picture_order_count(&sps, &info(3, 0, true, false)).unwrap().value, 6);
-        assert_eq!(dpb.picture_order_count(&sps, &info(3, 0, false, false)).unwrap().value, 5);
+        assert_eq!(
+            dpb.picture_order_count(&sps, &info(0, 0, true, true))
+                .unwrap()
+                .value,
+            0
+        );
+        assert_eq!(
+            dpb.picture_order_count(&sps, &info(3, 0, true, false))
+                .unwrap()
+                .value,
+            6
+        );
+        assert_eq!(
+            dpb.picture_order_count(&sps, &info(3, 0, false, false))
+                .unwrap()
+                .value,
+            5
+        );
     }
 
     /// Type 1 walks the offset_for_ref_frame cycle.
@@ -1211,9 +1233,24 @@ mod tests {
         let sps = sps_for(1);
         let dpb = Dpb::default();
         // One-entry cycle of +2: frame n has expectedPicOrderCnt 2n.
-        assert_eq!(dpb.picture_order_count(&sps, &info(0, 0, true, true)).unwrap().value, 0);
-        assert_eq!(dpb.picture_order_count(&sps, &info(1, 0, true, false)).unwrap().value, 2);
-        assert_eq!(dpb.picture_order_count(&sps, &info(4, 0, true, false)).unwrap().value, 8);
+        assert_eq!(
+            dpb.picture_order_count(&sps, &info(0, 0, true, true))
+                .unwrap()
+                .value,
+            0
+        );
+        assert_eq!(
+            dpb.picture_order_count(&sps, &info(1, 0, true, false))
+                .unwrap()
+                .value,
+            2
+        );
+        assert_eq!(
+            dpb.picture_order_count(&sps, &info(4, 0, true, false))
+                .unwrap()
+                .value,
+            8
+        );
     }
 
     fn push_ref(dpb: &mut Dpb, frame_num: u32, poc: i32, mark: Mark) {
@@ -1259,7 +1296,9 @@ mod tests {
             .build_ref_lists(SliceType::B, 6, 4, 256, 4, 4, (&[], &[]))
             .unwrap();
         let poc = |l: &RefList| -> Vec<i32> {
-            (0..l.len()).map(|i| dpb.frames[l.get(i).unwrap()].poc).collect()
+            (0..l.len())
+                .map(|i| dpb.frames[l.get(i).unwrap()].poc)
+                .collect()
         };
         assert_eq!(poc(&lists[0]), vec![4, 0, 8, 12]);
         assert_eq!(poc(&lists[1]), vec![8, 12, 4, 0]);
@@ -1277,8 +1316,12 @@ mod tests {
         let lists = dpb
             .build_ref_lists(SliceType::B, 10, 2, 256, 2, 2, (&[], &[]))
             .unwrap();
-        let l0: Vec<i32> = (0..2).map(|i| dpb.frames[lists[0].get(i).unwrap()].poc).collect();
-        let l1: Vec<i32> = (0..2).map(|i| dpb.frames[lists[1].get(i).unwrap()].poc).collect();
+        let l0: Vec<i32> = (0..2)
+            .map(|i| dpb.frames[lists[0].get(i).unwrap()].poc)
+            .collect();
+        let l1: Vec<i32> = (0..2)
+            .map(|i| dpb.frames[lists[1].get(i).unwrap()].poc)
+            .collect();
         assert_eq!(l0, vec![2, 0]);
         assert_eq!(l1, vec![0, 2], "identical lists swap");
     }

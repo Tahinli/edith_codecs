@@ -179,12 +179,9 @@ fn decode_all(bytes: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
     let mut dec = Decoder::new();
     let mut frames = Vec::new();
     for nal in ec_h264_syntax::AnnexBIter::new(bytes) {
-        match dec.push_nal(nal)? {
-            NalOutcome::PictureBoundary => {
-                dec.end_picture()?;
-                dec.push_nal(nal)?;
-            }
-            _ => {}
+        if dec.push_nal(nal)? == NalOutcome::PictureBoundary {
+            dec.end_picture()?;
+            dec.push_nal(nal)?;
         }
         while let Some(f) = dec.next_frame() {
             frames.push(frame_bytes(&f));
@@ -199,13 +196,8 @@ fn decode_all(bytes: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
 
 /// Every frame ffmpeg decodes from `stream`, as raw I420.
 fn ffmpeg_all_frames(stream: &Path, frame_len: usize) -> Option<Vec<Vec<u8>>> {
-    let mut cmd = Command::new("ffmpeg");
-    cmd.args(["-v", "error"]);
-    if std::env::var_os("EC_H264_NO_DEBLOCK").is_some() {
-        cmd.args(["-skip_loop_filter", "all"]);
-    }
-    let out = cmd
-        .arg("-i")
+    let out = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
         .arg(stream)
         .args(["-f", "rawvideo", "-pix_fmt", "yuv420p", "-"])
         .output()
@@ -268,8 +260,7 @@ fn compare_sequence(stream: &Path) -> Result<usize, String> {
     let bytes = std::fs::read(stream).map_err(|e| e.to_string())?;
     let ours = decode_all(&bytes).map_err(|e| format!("{e}"))?;
     let first = ours.first().ok_or("no frames decoded")?;
-    let theirs =
-        ffmpeg_all_frames(stream, first.len()).ok_or("ffmpeg cannot decode the stream")?;
+    let theirs = ffmpeg_all_frames(stream, first.len()).ok_or("ffmpeg cannot decode the stream")?;
     if ours.len() != theirs.len() {
         return Err(format!(
             "{} frames decoded, ffmpeg gave {}",
@@ -398,7 +389,7 @@ fn steady_state_decode_loop_zero_alloc() {
         };
         let bytes = std::fs::read(stream).unwrap();
         let mut dec = Decoder::new();
-        let mut drive = |dec: &mut Decoder, count: bool| -> usize {
+        let drive = |dec: &mut Decoder, count: bool| -> usize {
             let nals: Vec<&[u8]> = ec_h264_syntax::AnnexBIter::new(&bytes).collect();
             let mut frames = 0usize;
             for nal in &nals {
@@ -435,8 +426,14 @@ fn steady_state_decode_loop_zero_alloc() {
         ALLOCS.store(0, Ordering::SeqCst);
         let again = drive(&mut dec, true);
         let n = ALLOCS.load(Ordering::SeqCst);
-        assert_eq!(again, warm, "{name}: frame count changed on the second pass");
-        assert_eq!(n, 0, "{name}: steady-state slice decode allocated {n} times");
+        assert_eq!(
+            again, warm,
+            "{name}: frame count changed on the second pass"
+        );
+        assert_eq!(
+            n, 0,
+            "{name}: steady-state slice decode allocated {n} times"
+        );
     }
 
     // Sanity: the counter is alive — emitting a frame does allocate.
@@ -454,9 +451,13 @@ fn steady_state_decode_loop_zero_alloc() {
     );
 }
 
-/// Decode-rate measurement: ns per macroblock and Mpx/s over the first IDR,
-/// printed for the perf report. Run with `--nocapture` to see it. Uses the
-/// steady-state path (buffers warm) like a playback loop would.
+/// Decode-rate measurement: ns per macroblock and Mpx/s, printed for the perf
+/// report. Run with `--nocapture` to see it. Uses the steady-state path
+/// (buffers warm) like a playback loop would.
+///
+/// Both halves matter: the intra measurement is what the previous release
+/// reported, and the whole-sequence one is what playback actually costs, since
+/// a real stream is almost all inter pictures.
 #[test]
 fn ns_per_macroblock_measurement() {
     let base = vectors_dir();
@@ -499,6 +500,40 @@ fn ns_per_macroblock_measurement() {
         eprintln!(
             "PERF {name}: {w}x{h}, {mbs} MBs, {ns_per_mb:.0} ns/MB, {mpx_s:.1} Mpx/s \
              (intra IDR, single thread, deblock included, output copy excluded)"
+        );
+    }
+    perf_whole_sequence();
+}
+
+/// The same measurement over whole sequences, where inter prediction, the
+/// decoded picture buffer and output all count.
+fn perf_whole_sequence() {
+    let base = vectors_dir();
+    for name in ["BA_MW_D", "CABA3_SVA_B", "MR1_BT_A"] {
+        let Some(stream) = find_stream(&base.join(name)) else {
+            continue;
+        };
+        let bytes = std::fs::read(stream).unwrap();
+        let Ok(warm) = decode_all(&bytes) else {
+            continue;
+        };
+        if warm.is_empty() {
+            continue;
+        }
+        let frames = warm.len() as f64;
+        let start = std::time::Instant::now();
+        let iters = 5u32;
+        for _ in 0..iters {
+            let _ = decode_all(&bytes).expect("decode");
+        }
+        let elapsed = start.elapsed().as_secs_f64() / f64::from(iters);
+        // Every vector here is QCIF: 11 x 9 macroblocks.
+        let mbs = 99.0 * frames;
+        eprintln!(
+            "PERF {name}: {frames} frames, {:.0} ns/MB, {:.1} Mpx/s \
+             (full sequence, single thread, deblock and output copy included)",
+            elapsed * 1e9 / mbs,
+            176.0 * 144.0 * frames / elapsed / 1e6
         );
     }
 }
@@ -1027,89 +1062,6 @@ fn p_only_gop_matches_ffmpeg_every_frame() {
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
-/// Scratch driver kept out of the default run: decode a stream named by
-/// `EC_H264_DEBUG_STREAM` frame by frame and report the first mismatch.
-#[test]
-#[ignore]
-fn debug_named_stream() {
-    let Ok(path) = std::env::var("EC_H264_DEBUG_STREAM") else {
-        return;
-    };
-    let stream = PathBuf::from(path);
-    let bytes = std::fs::read(&stream).unwrap();
-    let mut dec = Decoder::new();
-    let mut pictures = 0usize;
-    for (i, nal) in ec_h264_syntax::AnnexBIter::new(&bytes).enumerate() {
-        let kind = nal[0] & 0x1F;
-        match dec.push_nal(nal) {
-            Ok(NalOutcome::PictureBoundary) => {
-                dec.end_picture().unwrap();
-                pictures += 1;
-                if let Err(e) = dec.push_nal(nal) {
-                    panic!("nal {i} (type {kind}) after {pictures} pictures: {e}");
-                }
-            }
-            Ok(_) => {}
-            Err(e) => panic!("nal {i} (type {kind}) after {pictures} pictures: {e}"),
-        }
-        while dec.next_frame().is_some() {}
-    }
-    dec.flush().unwrap();
-    eprintln!("decoded {pictures} pictures");
-    let ours = decode_all(&bytes).unwrap();
-    let theirs = match std::env::var("EC_H264_DEBUG_REF") {
-        Ok(p) => {
-            let raw = std::fs::read(p).unwrap();
-            raw.chunks_exact(ours[0].len()).map(<[u8]>::to_vec).collect()
-        }
-        Err(_) => ffmpeg_all_frames(&stream, ours[0].len()).unwrap(),
-    };
-    if std::env::var_os("EC_H264_DUMP").is_some() {
-        let w = 176usize;
-        for (label, f) in [("ref0", &ours[0]), ("ours1", &ours[1]), ("ff1", &theirs[1])] {
-            eprintln!("--- {label} MB(0,0) rows 0..4 ---");
-            for y in 0..4 {
-                let row: Vec<u8> = (0..16).map(|x| f[y * w + x]).collect();
-                eprintln!("{row:?}");
-            }
-        }
-    }
-    for (i, a) in ours.iter().enumerate().take(4) {
-        let best = theirs
-            .iter()
-            .enumerate()
-            .map(|(j, b)| (a.iter().zip(b).filter(|(x, y)| x != y).count(), j))
-            .min();
-        eprintln!("our frame {i} best matches reference {best:?}");
-    }
-    let w = 176usize;
-    let h = 144usize;
-    for (i, (a, b)) in ours.iter().zip(&theirs).enumerate() {
-        let diff = a.iter().zip(b).filter(|(x, y)| x != y).count();
-        if diff == 0 {
-            eprintln!("frame {i}: exact");
-            continue;
-        }
-        let mut mbs = std::collections::BTreeSet::new();
-        for (k, (x, y)) in a.iter().zip(b).enumerate().take(w * h) {
-            if x != y {
-                mbs.insert(((k / w) / 16 * (w / 16) + (k % w) / 16, ((k % w) / 16, (k / w) / 16)));
-            }
-        }
-        eprintln!("  first differing MBs: {:?}", mbs.iter().take(6).map(|m| m.1).collect::<Vec<_>>());
-        let max = a
-            .iter()
-            .zip(b)
-            .map(|(x, y)| (i32::from(*x) - i32::from(*y)).abs())
-            .max()
-            .unwrap_or(0);
-        eprintln!(
-            "frame {i}: {diff} bytes differ, max delta {max}, {} luma MBs",
-            mbs.len()
-        );
-    }
-}
-
 /// JVT conformance, every frame of every vector: our display-order output
 /// against the reference decoder YUV that ships with the vector.
 ///
@@ -1141,7 +1093,10 @@ fn jvt_full_sequence_bit_exact() {
             Ok(frames) => {
                 let len = frames[0].len();
                 let Some(ref_path) = find_ref_yuv(&dir) else {
-                    table.push_str(&format!("{name:<16} {:>3} frames, no reference YUV\n", frames.len()));
+                    table.push_str(&format!(
+                        "{name:<16} {:>3} frames, no reference YUV\n",
+                        frames.len()
+                    ));
                     continue;
                 };
                 let reference = std::fs::read(&ref_path).unwrap();
@@ -1159,18 +1114,27 @@ fn jvt_full_sequence_bit_exact() {
                 match bad {
                     None if frames.len() == want => {
                         passed += 1;
-                        table.push_str(&format!("{name:<16} {:>3}/{want:<3} frames bit-exact\n", frames.len()));
+                        table.push_str(&format!(
+                            "{name:<16} {:>3}/{want:<3} frames bit-exact\n",
+                            frames.len()
+                        ));
                     }
                     None => {
                         failed.push(format!(
                             "{name}: {} frames decoded, reference has {want}",
                             frames.len()
                         ));
-                        table.push_str(&format!("{name:<16} {:>3}/{want:<3} FRAME COUNT\n", frames.len()));
+                        table.push_str(&format!(
+                            "{name:<16} {:>3}/{want:<3} FRAME COUNT\n",
+                            frames.len()
+                        ));
                     }
                     Some((i, pos)) => {
                         failed.push(format!("{name}: frame {i} differs at byte {pos}"));
-                        table.push_str(&format!("{name:<16} {:>3}/{want:<3} MISMATCH frame {i}\n", frames.len()));
+                        table.push_str(&format!(
+                            "{name:<16} {:>3}/{want:<3} MISMATCH frame {i}\n",
+                            frames.len()
+                        ));
                     }
                 }
             }
@@ -1257,18 +1221,36 @@ fn b_pictures_match_ffmpeg_every_frame() {
     }
     let dir = scratch("b-gop");
     let cases: &[(&str, &[&str])] = &[
-        ("spatial", &["-x264-params", "bframes=3:b-adapt=0:direct=spatial:weightp=0"]),
-        ("temporal", &["-x264-params", "bframes=3:b-adapt=0:direct=temporal:weightp=0"]),
+        (
+            "spatial",
+            &[
+                "-x264-params",
+                "bframes=3:b-adapt=0:direct=spatial:weightp=0",
+            ],
+        ),
+        (
+            "temporal",
+            &[
+                "-x264-params",
+                "bframes=3:b-adapt=0:direct=temporal:weightp=0",
+            ],
+        ),
         // B pictures used as references, which makes the buffer hold pictures
         // that are neither the newest nor the oldest.
         (
             "pyramid",
-            &["-x264-params", "bframes=3:b-adapt=0:b-pyramid=normal:direct=spatial"],
+            &[
+                "-x264-params",
+                "bframes=3:b-adapt=0:b-pyramid=normal:direct=spatial",
+            ],
         ),
         // Weighted prediction on: explicit for P, implicit for B.
         (
             "weighted",
-            &["-x264-params", "bframes=3:b-adapt=0:weightp=2:weightb=1:direct=spatial"],
+            &[
+                "-x264-params",
+                "bframes=3:b-adapt=0:weightp=2:weightb=1:direct=spatial",
+            ],
         ),
     ];
     let mut failures = Vec::new();
@@ -1356,17 +1338,17 @@ fn output_is_display_order_and_the_reorder_is_real() {
             "decode-order frame {i} is not in the display-order output"
         );
     }
-    let moved = decode
-        .iter()
-        .zip(&display)
-        .filter(|(a, b)| a != b)
-        .count();
+    let moved = decode.iter().zip(&display).filter(|(a, b)| a != b).count();
     assert!(
         moved > 0,
         "decode order and display order are identical: the stream does not \
          reorder, so this test proves nothing"
     );
-    eprintln!("{} of {} frames move under reordering", moved, display.len());
+    eprintln!(
+        "{} of {} frames move under reordering",
+        moved,
+        display.len()
+    );
 }
 
 /// A gap in frame_num decodes instead of stalling (clause 8.2.5.2).
@@ -1475,7 +1457,10 @@ fn every_quantiser_with_motion_matches_ffmpeg() {
                 None => failures.push(format!("{tag}: ffmpeg cannot encode")),
             }
         }
-        assert!(checked >= 40, "too few {coder} quantisers exercised: {checked}");
+        assert!(
+            checked >= 40,
+            "too few {coder} quantisers exercised: {checked}"
+        );
         eprintln!("{coder}: {checked} quantisers bit-exact over a GOP with motion");
     }
     let _ = std::fs::remove_dir_all(&dir);
@@ -1498,12 +1483,20 @@ fn geometry_with_motion_matches_ffmpeg() {
         // Neighbour availability stops at every slice boundary, and a motion
         // vector predictor at one sees no partition across it.
         ("slices", "352x288", &["bframes=2:b-adapt=0:slices=4"]),
-        ("nodeblock", "352x288", &["bframes=2:b-adapt=0:no-deblock=1"]),
+        (
+            "nodeblock",
+            "352x288",
+            &["bframes=2:b-adapt=0:no-deblock=1"],
+        ),
         // One macroblock wide: every spatial neighbour is unavailable, which
         // is where the reference index of a missing partition matters most.
         ("tiny", "16x16", &["bframes=2:b-adapt=0"]),
         // Many references, so the list is long and reordering is real work.
-        ("manyref", "352x288", &["bframes=3:b-adapt=0:ref=5:b-pyramid=normal"]),
+        (
+            "manyref",
+            "352x288",
+            &["bframes=3:b-adapt=0:ref=5:b-pyramid=normal"],
+        ),
     ];
     let mut table = String::new();
     let mut failures = Vec::new();
@@ -1522,7 +1515,9 @@ fn geometry_with_motion_matches_ffmpeg() {
             let name = format!("{coder}-{tag}");
             match x264_encode_gop(&dir, &name, size, 10, &extra) {
                 Some(stream) => match compare_sequence(&stream) {
-                    Ok(n) => table.push_str(&format!("{name:<14} {size:<10} {n:>2} frames bit-exact\n")),
+                    Ok(n) => {
+                        table.push_str(&format!("{name:<14} {size:<10} {n:>2} frames bit-exact\n"))
+                    }
                     Err(e) => {
                         table.push_str(&format!("{name:<14} {size:<10} {e}\n"));
                         failures.push(format!("{name}: {e}"));
@@ -1754,7 +1749,8 @@ fn real_library_streams_match_ffmpeg() {
         eprintln!("SKIP: ffmpeg not on PATH");
         return;
     }
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/real-library-manifest.tsv");
+    let manifest =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/real-library-manifest.tsv");
     let Ok(text) = std::fs::read_to_string(&manifest) else {
         eprintln!("SKIP: {} missing", manifest.display());
         return;
@@ -1825,11 +1821,15 @@ fn real_library_streams_match_ffmpeg() {
             }
             Err(e) if e.contains("unsupported") => {
                 refused += 1;
-                table.push_str(&format!("{name:<40} {container:<12} {width:>5}px refused: {e}\n"));
+                table.push_str(&format!(
+                    "{name:<40} {container:<12} {width:>5}px refused: {e}\n"
+                ));
             }
             Err(e) => {
                 failures.push(format!("{name}: {e}"));
-                table.push_str(&format!("{name:<40} {container:<12} {width:>5}px ERROR {e}\n"));
+                table.push_str(&format!(
+                    "{name:<40} {container:<12} {width:>5}px ERROR {e}\n"
+                ));
             }
         }
     }
@@ -1840,5 +1840,109 @@ fn real_library_streams_match_ffmpeg() {
     assert!(
         decoded >= 3,
         "only {decoded} real files swept end to end; the sweep is the point"
+    );
+}
+
+/// The registry entry surface, driven the way a demuxer drives it: one access
+/// unit per packet, frames pulled with `receive_frame`.
+///
+/// This is where display order has to actually arrive. Everything above tests
+/// the NAL-level API; a player never touches that one, so a reordering decoder
+/// whose packet API still hands back decode order would look correct in every
+/// other test here and wrong on screen.
+#[test]
+fn packet_entry_surface_reorders_and_carries_timestamps() {
+    if !have_ffmpeg() {
+        eprintln!("SKIP: ffmpeg not on PATH");
+        return;
+    }
+    let dir = scratch("entry");
+    let extra = [
+        "-profile:v",
+        "main",
+        "-coder",
+        "ac",
+        "-qp",
+        "26",
+        "-x264-params",
+        "bframes=3:b-adapt=0:b-pyramid=normal",
+    ];
+    let stream = x264_encode_gop(&dir, "entry", "176x144", 16, &extra).expect("encode");
+    let data = std::fs::read(&stream).unwrap();
+    assert!(
+        slice_type_counts(&data)[2] > 0,
+        "the encoder produced no B slices"
+    );
+
+    // Split the stream into access units the way a demuxer would: a new one
+    // starts at each parameter set or first slice of a picture.
+    let units: Vec<Vec<u8>> = ec_h264_syntax::AnnexBIter::new(&data)
+        .map(<[u8]>::to_vec)
+        .collect();
+    let mut access_units: Vec<Vec<u8>> = Vec::new();
+    let mut current: Vec<u8> = Vec::new();
+    let mut current_has_slice = false;
+    for unit in &units {
+        let is_slice = matches!(unit[0] & 0x1F, 1 | 5);
+        if is_slice && current_has_slice {
+            access_units.push(std::mem::take(&mut current));
+            current_has_slice = false;
+        }
+        current_has_slice |= is_slice;
+        current.extend_from_slice(&[0, 0, 0, 1]);
+        current.extend_from_slice(unit);
+    }
+    if current_has_slice {
+        access_units.push(current);
+    }
+
+    let time_base = TimeBase::new(1, 25);
+    let mut decoder = H264Decoder::new(CodecParameters::new(CodecId::H264)).expect("decoder");
+    let mut out: Vec<(i64, Vec<u8>)> = Vec::new();
+    for (i, au) in access_units.iter().enumerate() {
+        let packet = Packet::new(0, time_base, au.clone()).with_pts(i as i64);
+        decoder.send_packet(&packet).expect("send_packet");
+        while let Ok(Frame::Video(f)) = decoder.receive_frame() {
+            out.push((f.pts.map(|t| t.ticks).unwrap_or(-1), frame_bytes(&f)));
+        }
+    }
+    decoder.flush().expect("flush");
+    while let Ok(Frame::Video(f)) = decoder.receive_frame() {
+        out.push((f.pts.map(|t| t.ticks).unwrap_or(-1), frame_bytes(&f)));
+    }
+
+    let expected = ffmpeg_all_frames(&stream, out[0].1.len()).expect("ffmpeg");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(out.len(), expected.len(), "frame count");
+    for (i, ((_, ours), theirs)) in out.iter().zip(&expected).enumerate() {
+        assert!(
+            first_diff(ours, theirs).is_none(),
+            "packet-path frame {i} differs from ffmpeg"
+        );
+    }
+    // Each packet was tagged with its own index in *decode* order, so the tag
+    // that comes back on a picture says which packet produced it. Decoding the
+    // same stream in decode order gives the pixels for each of those indices,
+    // and the two have to line up: that is the timestamp staying with its
+    // picture across the reordering, not merely arriving in some order.
+    let by_decode_order = decode_all_in_decode_order(&data).expect("decode order");
+    assert_eq!(by_decode_order.len(), out.len());
+    for (position, (tag, pixels)) in out.iter().enumerate() {
+        let tag = usize::try_from(*tag).expect("a tag was lost");
+        assert!(
+            first_diff(pixels, &by_decode_order[tag]).is_none(),
+            "output position {position} carries the timestamp of packet {tag}, \
+             but its pixels are a different picture"
+        );
+    }
+    let order: Vec<i64> = out.iter().map(|(pts, _)| *pts).collect();
+    assert_ne!(
+        order,
+        (0..order.len() as i64).collect::<Vec<_>>(),
+        "output order equals packet order, so no reordering happened"
+    );
+    eprintln!(
+        "packet entry surface: {} frames, packets emitted in order {order:?}",
+        out.len()
     );
 }

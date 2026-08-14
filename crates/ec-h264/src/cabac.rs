@@ -344,7 +344,11 @@ impl<'a> Cabac<'a> {
         if !self.decision(OFF_SUB_TYPE_P + 1) {
             return 1;
         }
-        if self.decision(OFF_SUB_TYPE_P + 2) { 2 } else { 3 }
+        if self.decision(OFF_SUB_TYPE_P + 2) {
+            2
+        } else {
+            3
+        }
     }
 
     /// sub_mb_type of a B macroblock (Table 9-38).
