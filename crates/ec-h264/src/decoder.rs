@@ -304,13 +304,15 @@ impl Decoder {
         self.cur.extend_borders();
         self.cur.complete = true;
         self.last_decoded = self.cur.id;
-        let sps = self.sps_map[self.cur.sps_id as usize]
-            .as_ref()
-            .ok_or_else(|| Error::corrupt("active SPS vanished"))?
-            .clone();
+        let sps_id = self.cur.sps_id as usize;
+        let sps = self.sps_map[sps_id]
+            .take()
+            .ok_or_else(|| Error::corrupt("active SPS vanished"))?;
         let pic = core::mem::take(&mut self.cur);
         let marking = self.has_marking.then_some(&self.cur_marking);
-        self.dpb.store(pic, &sps, &self.cur_info, marking)?;
+        let stored = self.dpb.store(pic, &sps, &self.cur_info, marking);
+        self.sps_map[sps_id] = Some(sps);
+        stored?;
         self.has_picture = false;
         self.pump_output(false)
     }
@@ -381,11 +383,8 @@ impl Decoder {
 
     /// Copy a stored picture out as a cropped I420 frame.
     fn picture_to_frame(&self, pic: &Picture) -> Result<VideoFrame> {
-        let sps = self.sps_map[pic.sps_id as usize]
-            .as_ref()
-            .ok_or_else(|| Error::corrupt("active SPS vanished"))?;
-        let (w, h) = (sps.width as usize, sps.height as usize);
-        let (cx, cy) = (sps.crop.0 as usize, sps.crop.2 as usize);
+        let (w, h) = (pic.out_size.0 as usize, pic.out_size.1 as usize);
+        let (cx, cy) = (pic.crop.0 as usize, pic.crop.1 as usize);
         let copy = |p: &Plane8, x0: usize, y0: usize, w: usize, h: usize| -> Plane {
             let mut out = vec![0u8; w * h];
             for row in 0..h {
@@ -400,14 +399,7 @@ impl Decoder {
             copy(&pic.cr, cx / 2, cy / 2, w.div_ceil(2), h.div_ceil(2)),
         ];
         let mut frame = VideoFrame::try_new(PixelFormat::I420, w as u32, h as u32, planes)?;
-        if let Some(vui) = &sps.vui {
-            frame.color.full_range = vui.video_full_range;
-            if let Some((p, t, m)) = vui.colour_description {
-                frame.color.primaries = p;
-                frame.color.transfer = t;
-                frame.color.matrix = m;
-            }
-        }
+        frame.color = pic.color;
         frame.pts = pic.pts;
         Ok(frame)
     }
@@ -433,11 +425,30 @@ impl Decoder {
 
         check_supported(sps, pps, slice_type_code)?;
         let sh = SliceHeader::parse(rbsp, header, sps, pps)?;
-        let sps = sps.clone();
-        let pps = pps.clone();
+        // Borrow the parameter sets out of their slots for the duration of the
+        // slice: cloning them per slice would allocate, and a decode loop that
+        // allocates per slice is the thing the whole layout is built to avoid.
+        let sps_slot = pps.sps_id as usize;
+        let sps = self.sps_map[sps_slot].take().expect("checked above");
+        let pps = self.pps_map[pps_id as usize].take().expect("checked above");
+        let outcome = self.decode_slice_data(&sps, &pps, &sh, header, rbsp, first_mb);
+        self.sps_map[sps_slot] = Some(sps);
+        self.pps_map[pps_id as usize] = Some(pps);
+        outcome
+    }
 
+    #[allow(clippy::too_many_arguments)]
+    fn decode_slice_data(
+        &mut self,
+        sps: &Sps,
+        pps: &Pps,
+        sh: &SliceHeader,
+        header: NalHeader,
+        rbsp: &[u8],
+        first_mb: u32,
+    ) -> Result<NalOutcome> {
         if !self.has_picture || self.cur.complete {
-            self.start_picture(&sps, &pps, &sh, header)?;
+            self.start_picture(sps, pps, sh, header)?;
         }
         if self.cur.sps_id != sps.id {
             return Err(Error::corrupt("SPS changed mid-picture"));
