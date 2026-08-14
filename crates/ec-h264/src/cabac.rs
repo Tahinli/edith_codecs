@@ -639,11 +639,13 @@ impl<'a> Cabac<'a> {
     }
 
     /// condTermFlagN for a DC block: bit `which` of the neighbour's DC
-    /// coded_block_flags, with I_PCM counting as coded and an unavailable
-    /// neighbour as set (the current macroblock is always intra here).
+    /// coded_block_flags, with I_PCM counting as coded. An unavailable
+    /// neighbour counts as set only for an intra macroblock (9.3.3.1.1.9) —
+    /// the chroma DC block of an inter macroblock at the picture edge reads
+    /// the opposite value.
     fn dc_cbf(&self, n: Option<MbInfo>, which: u8) -> usize {
         match n {
-            None => 1,
+            None => usize::from(self.cur_intra),
             Some(i) if i.flags & FLAG_PCM != 0 => 1,
             Some(i) => usize::from(i.dc_cbf & (1 << which) != 0),
         }

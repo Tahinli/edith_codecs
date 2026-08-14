@@ -146,13 +146,26 @@ pub(crate) const B_SUB: [SubShape; 13] = [
 ];
 
 /// Motion data of one neighbouring partition (8.4.1.3.2).
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct Nb {
     /// The partition exists and has been decoded (clause 6.4.11.7).
     pub avail: bool,
     pub mv: [i16; 2],
     /// -1 when the neighbour does not use this list, or is intra.
     pub ref_idx: i8,
+}
+
+impl Default for Nb {
+    /// An unavailable partition, which 8.4.1.3.2 gives reference index -1 —
+    /// *not* 0. A derived `Default` would make it look like a neighbour on
+    /// reference picture 0 and hand the median rules a phantom match.
+    fn default() -> Nb {
+        Nb {
+            avail: false,
+            mv: [0; 2],
+            ref_idx: -1,
+        }
+    }
 }
 
 /// Where the current macroblock's motion data is being written, and which of
