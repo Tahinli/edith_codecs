@@ -1,0 +1,16 @@
+[package]
+name = "oxideav-sub-image"
+description = "Compatibility shim: the oxideav-sub-image PGS surface edith consumes, over ec-pgs."
+version = "0.0.7"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+ec-pgs = { path = "../../crates/ec-pgs", version = "0.1.0" }
+oxideav-core = { path = "../oxideav-core", version = "0.1.34" }
+
+[dev-dependencies]
+oxideav-subtitle = { path = "../oxideav-subtitle", version = "0.1.2" }
+oxideav-ass = { path = "../oxideav-ass", version = "0.0.9" }

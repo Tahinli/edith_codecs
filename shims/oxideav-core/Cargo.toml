@@ -1,0 +1,11 @@
+[package]
+name = "oxideav-core"
+description = "Compatibility shim: the oxideav-core surface edith consumes, over ec-core."
+version = "0.1.34"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+ec-core.workspace = true
