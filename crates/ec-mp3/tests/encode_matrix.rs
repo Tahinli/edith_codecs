@@ -1,0 +1,223 @@
+//! Our encoder measured the only way a lossy one can be: encode, decode the
+//! result with ffmpeg, correlate against the samples that went in.
+//!
+//! The bar is the incumbent this crate replaces, `rusty_mp3` 0.6.1, measured on
+//! the same fixtures and the same metric (see `BAR`, and
+//! `scripts/mp3-incumbent-bar.md` for how those numbers were produced).
+//!
+//! Run the table:
+//!   cargo test -p ec-mp3 --release --test encode_matrix -- --nocapture
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use ec_mp3::{Mp3Encoder, Mp3EncoderConfig};
+
+/// Correlation `rusty_mp3` 0.6.1 reaches on this corpus, measured with this
+/// same alignment and metric (its own encoder, ffmpeg's decoder). The tone
+/// fixtures reach 1.0 on both encoders and so cannot separate them; the
+/// `mp3src-*` material — glide, broadband noise and a click every half second —
+/// is what does.
+const BAR: [(&str, [f64; 3]); 4] = [
+    ("mp3src-mono-44100", [0.99920, 0.99983, 0.99999]),
+    ("mp3src-stereo-44100", [0.99612, 0.99847, 0.99972]),
+    ("mp3src-mono-48000", [0.99867, 0.99972, 0.99998]),
+    ("mp3src-stereo-48000", [0.99461, 0.99787, 0.99956]),
+];
+const BITRATES: [u32; 3] = [128, 192, 320];
+
+/// The incumbent's number for this fixture and bitrate. Fixtures it was not
+/// measured on (the tones, which both encoders code perfectly) fall back to its
+/// worst result at that rate.
+fn bar_for(name: &str, kbps: u32) -> f64 {
+    let index = BITRATES.iter().position(|k| *k == kbps).unwrap_or(0);
+    for (fixture, values) in BAR {
+        if name.starts_with(fixture) {
+            return values[index];
+        }
+    }
+    BAR.iter()
+        .map(|(_, v)| v[index])
+        .fold(f64::INFINITY, f64::min)
+}
+
+fn fixtures() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures")
+}
+
+fn workdir(test: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("ec-mp3-{}-{test}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create work dir");
+    dir
+}
+
+/// Reads a WAV fixture as interleaved f32 plus its rate and channel count.
+fn read_wav(path: &Path) -> Option<(Vec<f32>, u32, usize)> {
+    let out = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args(["-f", "f32le", "-"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let samples = out
+        .stdout
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    let probe = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=channels,sample_rate",
+            "-of",
+            "default=noprint_wrappers=1",
+        ])
+        .arg(path)
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&probe.stdout);
+    let field = |key: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(key)?.strip_prefix('='))
+            .and_then(|v| v.trim().parse::<u32>().ok())
+    };
+    Some((samples, field("sample_rate")?, field("channels")? as usize))
+}
+
+fn correlation(a: &[f32], b: &[f32]) -> f64 {
+    let n = a.len().min(b.len());
+    let (mut ab, mut aa, mut bb) = (0.0f64, 0.0f64, 0.0f64);
+    for i in 0..n {
+        let (x, y) = (a[i] as f64, b[i] as f64);
+        ab += x * y;
+        aa += x * x;
+        bb += y * y;
+    }
+    if aa == 0.0 || bb == 0.0 {
+        return 0.0;
+    }
+    ab / (aa * bb).sqrt()
+}
+
+/// Best correlation over the encoder delay, which no MP3 encoder avoids.
+fn aligned(got: &[f32], want: &[f32], channels: usize) -> (f64, usize) {
+    let mut best = (f64::MIN, 0usize);
+    let mut offset = 0;
+    while offset + channels < got.len() && offset <= 3000 * channels {
+        let n = (got.len() - offset).min(want.len());
+        let skip = 1152 * channels;
+        if n <= 2 * skip {
+            break;
+        }
+        let corr = correlation(
+            &got[offset + skip..offset + n - skip],
+            &want[skip..n - skip],
+        );
+        if corr > best.0 {
+            best = (corr, offset);
+        }
+        offset += channels;
+    }
+    best
+}
+
+fn encode(pcm: &[f32], rate: u32, channels: usize, kbps: u32) -> Vec<u8> {
+    let mut encoder = Mp3Encoder::new(Mp3EncoderConfig {
+        bitrate_kbps: kbps,
+        vbr_quality: None,
+    });
+    encoder
+        .push_pcm_f32(pcm, channels as u16, rate)
+        .expect("encoder accepts the fixture");
+    encoder.finish();
+    let mut out = Vec::new();
+    while let Ok(frame) = encoder.next_packet() {
+        out.extend_from_slice(&frame);
+    }
+    out
+}
+
+#[test]
+fn encodes_above_the_incumbent_bar() {
+    let dir = fixtures().join("audio");
+    let mut sources: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            let name = p.file_name().map(|n| n.to_string_lossy().to_string());
+            name.is_some_and(|n| n.starts_with("wav16-") || n.starts_with("mp3src-"))
+                && p.extension().is_some_and(|e| e == "wav")
+        })
+        .collect();
+    sources.sort();
+    sources.retain(|p| {
+        let name = p.file_name().unwrap().to_string_lossy().to_string();
+        name.contains("mono") || name.contains("stereo")
+    });
+    if sources.is_empty() {
+        eprintln!("no WAV fixtures: run scripts/gen-fixtures.sh");
+        return;
+    }
+    let work = workdir("encode");
+    println!(
+        "{:<30} {:>5} {:>6} {:>3} {:>9} {:>8} {:>9}",
+        "fixture", "kbps", "rate", "ch", "corr", "bar", "kbit/s"
+    );
+    let mut failures = Vec::new();
+    for source in &sources {
+        let Some((pcm, rate, channels)) = read_wav(source) else {
+            continue;
+        };
+        for kbps in BITRATES {
+            let bar = bar_for(&source.file_name().unwrap().to_string_lossy(), kbps);
+            let bytes = encode(&pcm, rate, channels, kbps);
+            let path = work.join(format!(
+                "{}-{kbps}.mp3",
+                source.file_stem().unwrap().to_string_lossy()
+            ));
+            std::fs::write(&path, &bytes).expect("write encoded file");
+            let out = Command::new("ffmpeg")
+                .args(["-v", "warning", "-i"])
+                .arg(&path)
+                .args(["-f", "f32le", "-"])
+                .output()
+                .expect("run ffmpeg");
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            if !stderr.is_empty() {
+                failures.push(format!("{}: ffmpeg said {stderr}", path.display()));
+            }
+            let decoded: Vec<f32> = out
+                .stdout
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+            let (corr, _offset) = aligned(&decoded, &pcm, channels);
+            let seconds = pcm.len() as f64 / (rate as f64 * channels as f64);
+            let measured = bytes.len() as f64 * 8.0 / seconds / 1000.0;
+            let name = source.file_name().unwrap().to_string_lossy();
+            println!(
+                "{name:<30} {kbps:>5} {rate:>6} {channels:>3} {corr:>9.5} {bar:>8.5} {measured:>9.1}"
+            );
+            // Matching counts as passing: at 320 kbit/s both encoders are
+            // within a part in 10^5 of the source and the difference between
+            // them is smaller than the metric resolves.
+            if corr < bar - 1e-5 {
+                failures.push(format!("{name} at {kbps} kbit/s: {corr:.5} < bar {bar:.5}"));
+            }
+            if (measured - kbps as f64).abs() > kbps as f64 * 0.05 {
+                failures.push(format!(
+                    "{name} at {kbps} kbit/s: wrote {measured:.1} kbit/s"
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}

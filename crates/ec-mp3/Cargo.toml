@@ -1,0 +1,11 @@
+[package]
+name = "ec-mp3"
+description = "MPEG-1/2/2.5 Layer III (MP3) decoder and encoder, built on the edith_codecs IR."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ec-core = { workspace = true }
+ec-dsp = { workspace = true }

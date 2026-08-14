@@ -1,0 +1,11 @@
+[package]
+name = "rusty_mp3"
+description = "Compatibility shim: the rusty_mp3 0.6.1 surface, implemented over ec-mp3."
+version = "0.6.1"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ec-mp3.workspace = true
+ec-core.workspace = true
