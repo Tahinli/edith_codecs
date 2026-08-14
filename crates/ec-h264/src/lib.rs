@@ -31,6 +31,8 @@
 #![forbid(unsafe_code)]
 
 mod bits;
+mod cabac;
+mod cabac_tables;
 mod cavlc;
 mod codec;
 mod deblock;

@@ -22,7 +22,9 @@ use ec_h264_syntax::{
 use crate::deblock::{
     chroma_qp, edge_params, filter_chroma_line, filter_luma_h_edge16, filter_luma_line,
 };
-use crate::entropy::{BlockCat, Entropy};
+use crate::entropy::{
+    BlockCat, Entropy, FLAG_CHROMA_PRED, FLAG_DECODED, FLAG_I16, FLAG_PCM, MbCtx, MbInfo,
+};
 use crate::pred::{Nbr4, PlaneWindow, add_residual_4x4, pred_4x4, pred_16x16, pred_chroma_8x8};
 use crate::tables::{BLK4_POS, CHROMA_QP};
 use crate::transform::{
@@ -121,17 +123,20 @@ struct Picture {
     i4_modes: Vec<u8>,
     /// QPY per macroblock (the prediction-chain value; PCM keeps the chain).
     mb_qp: Vec<u8>,
-    /// Bit 0: decoded, bit 1: I_PCM, bit 2: Intra_16x16.
+    /// `FLAG_*` bits per macroblock.
     mb_flags: Vec<u8>,
+    /// `CodedBlockPatternLuma | CodedBlockPatternChroma << 4` per macroblock,
+    /// read by CABAC context selection (9.3.3.1.1.4).
+    mb_cbp: Vec<u8>,
+    /// coded_block_flag of the DC blocks per macroblock: bit 0 luma, 1 Cb,
+    /// 2 Cr (9.3.3.1.1.9 with ctxBlockCat 0 and 3).
+    mb_dc_cbf: Vec<u8>,
     /// Owning slice index per macroblock, `NO_SLICE` when undecoded.
     mb_slice: Vec<u16>,
     slices: Vec<SliceParams>,
     decoded_mbs: usize,
     complete: bool,
 }
-
-const FLAG_DECODED: u8 = 1;
-const FLAG_PCM: u8 = 2;
 
 impl Picture {
     fn start(&mut self, sps: &Sps) {
@@ -151,6 +156,8 @@ impl Picture {
             self.i4_modes.resize(mb_w * mb_h * 16, 2);
             self.mb_qp.resize(mb_w * mb_h, 0);
             self.mb_flags.resize(mb_w * mb_h, 0);
+            self.mb_cbp.resize(mb_w * mb_h, 0);
+            self.mb_dc_cbf.resize(mb_w * mb_h, 0);
             self.mb_slice.resize(mb_w * mb_h, NO_SLICE);
         }
         // Per-MB metadata is rewritten by each decoded macroblock; only the
@@ -407,7 +414,11 @@ impl Decoder {
             cr_qp_offset: pps.second_chroma_qp_index_offset,
         });
 
-        let mut r = Entropy::cavlc(rbsp, sh.header_bits);
+        let mut r = if pps.entropy_coding_mode {
+            Entropy::cabac(rbsp, sh.header_bits, sh.slice_qp)?
+        } else {
+            Entropy::cavlc(rbsp, sh.header_bits)
+        };
 
         let mut ctx = SliceCtx {
             slice_id,
@@ -415,6 +426,7 @@ impl Decoder {
             cb_qp_offset: pps.chroma_qp_index_offset,
             cr_qp_offset: pps.second_chroma_qp_index_offset,
             transform_8x8_mode: pps.transform_8x8_mode,
+            qp_delta_inc: 0,
         };
         let mbs = self.pic.mb_w * self.pic.mb_h;
         let mut mb_addr = first_mb as usize;
@@ -439,13 +451,6 @@ impl Decoder {
 /// conformance suite proves each one against a stream that really uses the
 /// feature.
 fn check_supported(sps: &Sps, pps: &Pps, slice_type_code: u32) -> Result<()> {
-    if pps.entropy_coding_mode {
-        return Err(Error::unsupported(
-            "CABAC entropy coding",
-            "entropy_coding_mode_flag 1 needs the arithmetic decoder and the \
-             context models of clause 9.3; only CAVLC (9.2) is implemented",
-        ));
-    }
     if pps.num_slice_groups > 1 {
         return Err(Error::unsupported(
             "FMO slice groups",
@@ -507,6 +512,9 @@ struct SliceCtx {
     cb_qp_offset: i32,
     cr_qp_offset: i32,
     transform_8x8_mode: bool,
+    /// ctxIdxInc for the next macroblock's first mb_qp_delta bin: set when the
+    /// macroblock just decoded coded a non-zero mb_qp_delta (9.3.3.1.1.5).
+    qp_delta_inc: u8,
 }
 
 /// Neighbour-availability snapshot for one macroblock (left, top,
@@ -581,6 +589,16 @@ fn decode_macroblock(
         return Err(Error::corrupt("macroblock decoded twice"));
     }
     let nbr = mb_neighbors(pic, mb_x, mb_y, ctx.slice_id);
+    let info = |addr: usize| MbInfo {
+        flags: pic.mb_flags[addr],
+        cbp: pic.mb_cbp[addr],
+        dc_cbf: pic.mb_dc_cbf[addr],
+    };
+    r.begin_mb(&MbCtx {
+        a: nbr.a.then(|| info(mb_addr - 1)),
+        b: nbr.b.then(|| info(mb_addr - pic.mb_w)),
+        qp_delta_inc: ctx.qp_delta_inc,
+    });
     let w4 = pic.mb_w * 4;
     let w2 = pic.mb_w * 2;
     let (bx0, by0) = (mb_x * 4, mb_y * 4);
@@ -617,6 +635,9 @@ fn decode_macroblock(
         // the deblocker substitutes 0 via FLAG_PCM (spec 8.7.2).
         pic.mb_qp[mb_addr] = ctx.qp as u8;
         pic.mb_flags[mb_addr] = FLAG_DECODED | FLAG_PCM;
+        pic.mb_cbp[mb_addr] = 0x3F;
+        pic.mb_dc_cbf[mb_addr] = 0b111;
+        ctx.qp_delta_inc = 0;
         pic.mb_slice[mb_addr] = ctx.slice_id;
         pic.decoded_mbs += 1;
         return Ok(());
@@ -684,12 +705,21 @@ fn decode_macroblock(
     };
 
     // mb_qp_delta (7.4.5).
+    let mut qp_delta = 0;
     if cbp_luma != 0 || cbp_chroma != 0 || is_i16 {
-        let delta = r.mb_qp_delta()?;
-        ctx.qp = (ctx.qp + delta + 52) % 52;
+        qp_delta = r.mb_qp_delta()?;
+        ctx.qp = (ctx.qp + qp_delta + 52) % 52;
     }
+    ctx.qp_delta_inc = u8::from(qp_delta != 0);
     pic.mb_qp[mb_addr] = ctx.qp as u8;
-    pic.mb_flags[mb_addr] = FLAG_DECODED;
+    pic.mb_flags[mb_addr] = FLAG_DECODED
+        | if is_i16 { FLAG_I16 } else { 0 }
+        | if chroma_mode != 0 {
+            FLAG_CHROMA_PRED
+        } else {
+            0
+        };
+    pic.mb_cbp[mb_addr] = cbp_luma | (cbp_chroma << 4);
     pic.mb_slice[mb_addr] = ctx.slice_id;
     pic.decoded_mbs += 1;
     let qp_y = ctx.qp;
@@ -702,6 +732,7 @@ fn decode_macroblock(
     // AC) equals reconstruction dependency order, so each block reconstructs
     // the moment its levels are parsed: no per-MB coefficient arrays, and
     // empty blocks cost one coeff_token read plus a prediction write.
+    let mut dc_cbf = 0u8;
     let mut scan = [0i32; 16];
     let mut raster = [0i32; 16];
     let mut resid = [0i32; 16];
@@ -714,7 +745,8 @@ fn decode_macroblock(
         pred_16x16(i16_mode, &mut w, nbr.b, nbr.a);
         // Luma DC: un-zigzag over the 4x4 DC array, Hadamard + scale.
         let (na, nb) = luma_nz_pair(pic, &nbr, bx0, by0);
-        r.residual_block(&mut scan, BlockCat::LumaDc, na, nb)?;
+        let dc_tc = r.residual_block(&mut scan, BlockCat::LumaDc, na, nb)?;
+        dc_cbf |= u8::from(dc_tc != 0);
         unzigzag(&scan, &mut raster);
         luma_dc_transform(&mut raster, &ls[0], qp_y);
         let dc = raster;
@@ -798,7 +830,8 @@ fn decode_macroblock(
     let mut chroma_dc = [[0i32; 4]; 2];
     if cbp_chroma != 0 {
         for (comp, c) in chroma_dc.iter_mut().enumerate() {
-            r.residual_block(&mut scan, BlockCat::ChromaDc, None, None)?;
+            let tc = r.residual_block(&mut scan, BlockCat::ChromaDc(comp as u8), None, None)?;
+            dc_cbf |= u8::from(tc != 0) << (1 + comp);
             c.copy_from_slice(&scan[..4]);
             let (ls_c, qp_c) = if comp == 0 {
                 (&ls[1], qp_cb)
@@ -842,6 +875,7 @@ fn decode_macroblock(
             add_residual_4x4(&mut plane.data, plane.stride, origin, &resid);
         }
     }
+    pic.mb_dc_cbf[mb_addr] = dc_cbf;
     Ok(())
 }
 

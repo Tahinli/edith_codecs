@@ -19,7 +19,19 @@
 use ec_core::error::{Error, Result};
 
 use crate::bits::BitCursor;
+use crate::cabac::Cabac;
 use crate::tables::CBP_INTRA_420;
+
+/// Macroblock state bits (`Picture::mb_flags`, and `MbInfo::flags` for a
+/// neighbour). CABAC context selection reads all of them.
+/// The macroblock has been decoded in this picture.
+pub(crate) const FLAG_DECODED: u8 = 1;
+/// mb_type is I_PCM.
+pub(crate) const FLAG_PCM: u8 = 2;
+/// mb_type is one of the Intra_16x16 types.
+pub(crate) const FLAG_I16: u8 = 4;
+/// intra_chroma_pred_mode is not 0 (DC).
+pub(crate) const FLAG_CHROMA_PRED: u8 = 8;
 
 /// Residual block class (spec Table 9-42, the 4:2:0 subset this decoder codes).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -30,8 +42,8 @@ pub(crate) enum BlockCat {
     LumaAc,
     /// LumaLevel4x4, `ctxBlockCat` 2.
     Luma4x4,
-    /// ChromaDCLevel, `ctxBlockCat` 3.
-    ChromaDc,
+    /// ChromaDCLevel of component `iCbCr`, `ctxBlockCat` 3.
+    ChromaDc(u8),
     /// ChromaACLevel, `ctxBlockCat` 4.
     ChromaAc,
 }
@@ -42,20 +54,75 @@ impl BlockCat {
         match self {
             BlockCat::LumaDc | BlockCat::Luma4x4 => 16,
             BlockCat::LumaAc | BlockCat::ChromaAc => 15,
-            BlockCat::ChromaDc => 4,
+            BlockCat::ChromaDc(_) => 4,
+        }
+    }
+
+    /// `ctxBlockCat` (Table 9-42).
+    pub(crate) const fn ctx_block_cat(self) -> usize {
+        match self {
+            BlockCat::LumaDc => 0,
+            BlockCat::LumaAc => 1,
+            BlockCat::Luma4x4 => 2,
+            BlockCat::ChromaDc(_) => 3,
+            BlockCat::ChromaAc => 4,
         }
     }
 }
 
+/// What a context-adaptive reader needs to know about one neighbouring
+/// macroblock.
+#[derive(Clone, Copy)]
+pub(crate) struct MbInfo {
+    /// The `FLAG_*` bits above.
+    pub flags: u8,
+    /// `CodedBlockPatternLuma | CodedBlockPatternChroma << 4`.
+    pub cbp: u8,
+    /// coded_block_flag of the DC blocks: bit 0 luma, bit 1 Cb, bit 2 Cr.
+    pub dc_cbf: u8,
+}
+
+/// Neighbourhood of the macroblock about to be parsed: left (A) and above (B)
+/// per clause 6.4.11.1, `None` when outside the picture or in another slice.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct MbCtx {
+    pub a: Option<MbInfo>,
+    pub b: Option<MbInfo>,
+    /// ctxIdxInc for the first mb_qp_delta bin (clause 9.3.3.1.1.5), derived by
+    /// the caller from the previous macroblock in decoding order.
+    pub qp_delta_inc: u8,
+}
+
 /// The slice-data syntax reader.
+///
+/// The CABAC variant is much the larger of the two (it carries 402 context
+/// variables), and stays inline on purpose: one of these lives per slice on the
+/// stack, so boxing it would trade a compile-time size warning for a heap
+/// allocation in a decode loop that is otherwise allocation free.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Entropy<'a> {
     Cavlc(BitCursor<'a>),
+    Cabac(Cabac<'a>),
 }
 
 impl<'a> Entropy<'a> {
     /// A CAVLC reader over `rbsp`, positioned just past the slice header.
     pub(crate) fn cavlc(rbsp: &'a [u8], header_bits: u64) -> Entropy<'a> {
         Entropy::Cavlc(BitCursor::new(rbsp, header_bits))
+    }
+
+    /// A CABAC reader: consumes the `cabac_alignment_one_bit`s and initialises
+    /// the context variables and the arithmetic decoding engine (clause 9.3.1).
+    pub(crate) fn cabac(rbsp: &'a [u8], header_bits: u64, slice_qp: i32) -> Result<Entropy<'a>> {
+        Ok(Entropy::Cabac(Cabac::new(rbsp, header_bits, slice_qp)?))
+    }
+
+    /// Publish the neighbourhood of the macroblock about to be parsed.
+    #[inline]
+    pub(crate) fn begin_mb(&mut self, ctx: &MbCtx) {
+        if let Entropy::Cabac(c) = self {
+            c.begin_mb(ctx);
+        }
     }
 
     /// `mb_type` of an I slice: 0 (I_NxN), 1..24 (Intra_16x16), 25 (I_PCM).
@@ -68,6 +135,7 @@ impl<'a> Entropy<'a> {
                 }
                 Ok(t)
             }
+            Entropy::Cabac(c) => c.mb_type_i(),
         }
     }
 
@@ -75,6 +143,7 @@ impl<'a> Entropy<'a> {
     pub(crate) fn transform_size_8x8_flag(&mut self) -> Result<bool> {
         match self {
             Entropy::Cavlc(r) => r.read_bit(),
+            Entropy::Cabac(c) => c.transform_size_8x8_flag(),
         }
     }
 
@@ -90,6 +159,7 @@ impl<'a> Entropy<'a> {
                     Ok(Some(r.read_bits(3)? as u8))
                 }
             }
+            Entropy::Cabac(c) => c.intra4x4_pred_mode(),
         }
     }
 
@@ -103,6 +173,7 @@ impl<'a> Entropy<'a> {
                 }
                 Ok(m as u8)
             }
+            Entropy::Cabac(c) => c.intra_chroma_pred_mode(),
         }
     }
 
@@ -118,6 +189,7 @@ impl<'a> Entropy<'a> {
                     .ok_or_else(|| Error::corrupt("coded_block_pattern codeNum > 47"))?;
                 Ok((cbp & 15, cbp >> 4))
             }
+            Entropy::Cabac(c) => c.coded_block_pattern(),
         }
     }
 
@@ -125,6 +197,7 @@ impl<'a> Entropy<'a> {
     pub(crate) fn mb_qp_delta(&mut self) -> Result<i32> {
         let delta = match self {
             Entropy::Cavlc(r) => r.read_se()?,
+            Entropy::Cabac(c) => c.mb_qp_delta()?,
         };
         if !(-26..=25).contains(&delta) {
             return Err(Error::corrupt("mb_qp_delta outside [-26, 25]"));
@@ -149,7 +222,7 @@ impl<'a> Entropy<'a> {
     ) -> Result<u8> {
         match self {
             Entropy::Cavlc(r) => {
-                let nc = if cat == BlockCat::ChromaDc {
+                let nc = if matches!(cat, BlockCat::ChromaDc(_)) {
                     -1
                 } else {
                     match (na, nb) {
@@ -161,6 +234,7 @@ impl<'a> Entropy<'a> {
                 };
                 crate::cavlc::residual_block(r, coeff, cat.max_num_coeff(), nc)
             }
+            Entropy::Cabac(c) => c.residual_block(coeff, cat, na, nb),
         }
     }
 
@@ -173,6 +247,7 @@ impl<'a> Entropy<'a> {
                 r.align_to_byte();
                 r.read_bytes(384)
             }
+            Entropy::Cabac(c) => c.pcm_block(),
         }
     }
 
@@ -181,6 +256,7 @@ impl<'a> Entropy<'a> {
     pub(crate) fn more_macroblocks(&mut self) -> Result<bool> {
         match self {
             Entropy::Cavlc(r) => Ok(r.more_rbsp_data()),
+            Entropy::Cabac(c) => c.more_macroblocks(),
         }
     }
 }

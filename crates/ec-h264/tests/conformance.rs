@@ -624,10 +624,21 @@ fn refusals_name_a_feature_the_stream_really_uses() {
     let dir = scratch("refusals");
     // (tag, encoder arguments, the words the refusal must contain)
     let cases: &[(&str, &[&str], &str)] = &[
+        // Field or macroblock-adaptive frame/field coding: the neighbour
+        // derivation of 6.4.9 is not implemented, under either entropy coder.
         (
-            "cabac",
-            &["-profile:v", "main", "-qp", "26", "-x264-params", "cabac=1"],
-            "CABAC",
+            "interlaced",
+            &[
+                "-profile:v",
+                "main",
+                "-coder",
+                "ac",
+                "-qp",
+                "26",
+                "-x264-params",
+                "interlaced=1",
+            ],
+            "frame_mbs_only_flag 0",
         ),
         (
             "transform8x8",
