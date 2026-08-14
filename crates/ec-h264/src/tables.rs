@@ -468,6 +468,13 @@ pub const CBP_INTRA_420: [u8; 48] = [
     35, 37, 42, 44, 1, 2, 4, 8, 17, 18, 20, 24, 6, 9, 22, 25, 32, 33, 34, 36, 40, 38, 41,
 ];
 
+/// Table 9-4 (a), Inter column: codeNum -> coded_block_pattern for
+/// ChromaArrayType 1 or 2.
+pub const CBP_INTER_420: [u8; 48] = [
+    0, 16, 1, 2, 4, 8, 32, 3, 5, 10, 12, 15, 47, 7, 11, 13, 14, 6, 9, 31, 35, 37, 42, 44, 33, 34,
+    36, 40, 39, 43, 45, 46, 17, 18, 20, 24, 19, 21, 26, 28, 23, 27, 29, 30, 22, 25, 38, 41,
+];
+
 /// Table 9-4 (b), Intra column: codeNum -> coded_block_pattern for
 /// ChromaArrayType 0 or 3. Unused until monochrome / 4:4:4 decode lands;
 /// kept beside its sibling so the spec table lives in one place.
@@ -510,14 +517,19 @@ pub const BETA: [u8; 52] = [
 ];
 
 /// Table 8-17: tC0' by [bS - 1][indexA].
+///
+/// The bS 1 and 2 rows are unreachable from an intra-only decoder, so they went
+/// in transcribed but unexercised and both were wrong — a whole-row shift, the
+/// classic transcription defect. They are re-derived here from the printed
+/// table and now carry oracle coverage (inter edges reach every row).
 pub const TC0: [[u8; 52]; 3] = [
     [
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1,
-        1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 4, 4, 4, 5, 6, 6, 7, 8,
+        1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 4, 4, 4, 5, 6, 6, 7, 8, 9, 10, 11, 13,
     ],
     [
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-        1, 1, 2, 2, 2, 2, 3, 3, 3, 4, 4, 5, 5, 6, 7, 8, 8, 10, 11, 12, 13, 15,
+        1, 2, 2, 2, 2, 3, 3, 3, 4, 4, 5, 5, 6, 7, 8, 8, 10, 11, 12, 13, 15, 17,
     ],
     [
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2,

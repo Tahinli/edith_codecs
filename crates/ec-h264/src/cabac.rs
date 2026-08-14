@@ -1,10 +1,10 @@
 //! CABAC slice-data parsing (spec clause 9.3): arithmetic decoding engine,
 //! context variables, binarizations and context selection.
 //!
-//! Scope is what an I slice of a frame-coded 4:2:0 8-bit stream needs; every
+//! Scope is what a frame-coded 4:2:0 8-bit stream needs, I, P and B; every
 //! other tool the decoder refuses by name before reaching this module, so the
-//! contexts, block categories and initialisation columns that only P, B, field
-//! or 8x8-transform coding reads are absent rather than transcribed untested.
+//! contexts, block categories and initialisation columns that only field or
+//! 8x8-transform coding reads are absent rather than transcribed untested.
 //!
 //! The engine keeps codIRange and codIOffset in `u32` with the spec's exact
 //! integer steps — no probability floats, no shortcuts — and reads its bits
@@ -17,12 +17,15 @@ use ec_core::error::{Error, Result};
 
 use crate::bits::BitCursor;
 use crate::cabac_tables::{
-    INIT_60_69, INIT_70_275, INIT_399_401, INIT_MB_TYPE_I, RANGE_LPS, TRANS_LPS, TRANS_MPS,
+    INIT_11_59, INIT_60_69, INIT_70_275, INIT_399_401, INIT_MB_TYPE_I, RANGE_LPS, TRANS_LPS,
+    TRANS_MPS,
 };
-use crate::entropy::{BlockCat, FLAG_CHROMA_PRED, FLAG_I16, FLAG_PCM, MbCtx, MbInfo};
+use crate::entropy::{
+    BlockCat, FLAG_CHROMA_PRED, FLAG_DIRECT, FLAG_I16, FLAG_INTER, FLAG_PCM, MbCtx, MbInfo,
+};
 
 /// Highest ctxIdx this decoder can address, plus one (399..401 is the
-/// transform_size_8x8_flag block, the last range an I slice can reach).
+/// transform_size_8x8_flag block, the last range a frame-coded slice reaches).
 const NUM_CTX: usize = 402;
 
 /// ctxIdx 276 (end_of_slice_flag and the I_PCM bin of mb_type) is decoded by
@@ -36,6 +39,14 @@ const ABS_CAT_OFF: [usize; 5] = [0, 10, 20, 30, 39];
 
 /// ctxIdxOffset values of Table 9-34 used here.
 const OFF_MB_TYPE: usize = 3;
+const OFF_SKIP_P: usize = 11;
+const OFF_MB_TYPE_P: usize = 14;
+const OFF_SUB_TYPE_P: usize = 21;
+const OFF_SKIP_B: usize = 24;
+const OFF_MB_TYPE_B: usize = 27;
+const OFF_SUB_TYPE_B: usize = 36;
+const OFF_MVD: [usize; 2] = [40, 47];
+const OFF_REF_IDX: usize = 54;
 const OFF_QP_DELTA: usize = 60;
 const OFF_CHROMA_PRED: usize = 64;
 const OFF_PREV_I4: usize = 68;
@@ -47,6 +58,18 @@ const OFF_SIG: usize = 105;
 const OFF_LAST: usize = 166;
 const OFF_ABS: usize = 227;
 const OFF_TRANSFORM_8X8: usize = 399;
+
+/// The ctxIdx values the Intra_16x16 part of an mb_type bin string uses, in
+/// bin order: `[b0, CodedBlockPatternLuma, chroma bin 0, chroma bin 1,
+/// prediction mode bin 0, prediction mode bin 1]`.
+///
+/// Table 9-39 lists these per binIdx, but the chroma element is one or two bins
+/// long, which shifts the prediction-mode bins; resolving the table to fixed
+/// ctxIdx values here is what makes the two spellings (I slice at ctxIdxOffset
+/// 3, intra suffix at 17 or 32) one piece of code.
+const I_MB_TYPE_CTX: [usize; 6] = [3, 6, 7, 8, 9, 10];
+const I_SUFFIX_CTX_P: [usize; 6] = [17, 18, 19, 19, 20, 20];
+const I_SUFFIX_CTX_B: [usize; 6] = [32, 33, 34, 34, 35, 35];
 
 pub(crate) struct Cabac<'a> {
     r: BitCursor<'a>,
@@ -61,12 +84,23 @@ pub(crate) struct Cabac<'a> {
     /// CodedBlockPatternLuma bins decoded so far in this macroblock, for the
     /// within-macroblock neighbours of clause 9.3.3.1.1.4.
     cbp_luma_bins: u8,
+    /// The macroblock being parsed is intra coded, which flips the
+    /// coded_block_flag context of an unavailable neighbour (9.3.3.1.1.9).
+    cur_intra: bool,
 }
 
 impl<'a> Cabac<'a> {
     /// Start CABAC parsing at `header_bits`: `cabac_alignment_one_bit`s, then
     /// the context and engine initialisation of clause 9.3.1.
-    pub(crate) fn new(rbsp: &'a [u8], header_bits: u64, slice_qp: i32) -> Result<Cabac<'a>> {
+    ///
+    /// `init_column` selects the initialisation column: 0 for I and SI slices,
+    /// `cabac_init_idc + 1` otherwise.
+    pub(crate) fn new(
+        rbsp: &'a [u8],
+        header_bits: u64,
+        slice_qp: i32,
+        init_column: usize,
+    ) -> Result<Cabac<'a>> {
         let mut r = BitCursor::new(rbsp, header_bits);
         // cabac_alignment_one_bit (7.3.4): the stuffing bits are all 1, which
         // a corrupt-stream check would only duplicate; skipping to the byte
@@ -79,14 +113,15 @@ impl<'a> Cabac<'a> {
             state: [63 << 1; NUM_CTX],
             ctx: MbCtx::default(),
             cbp_luma_bins: 0,
+            cur_intra: true,
         };
-        c.init_contexts(slice_qp);
+        c.init_contexts(slice_qp, init_column.min(3));
         c.init_engine()?;
         Ok(c)
     }
 
     /// 9.3.1.1: pStateIdx and valMPS from the (m, n) table entries and SliceQPY.
-    fn init_contexts(&mut self, slice_qp: i32) {
+    fn init_contexts(&mut self, slice_qp: i32, column: usize) {
         let qp = slice_qp.clamp(0, 51);
         let set = |state: &mut [u8; NUM_CTX], idx: usize, (m, n): (i8, i8)| {
             let pre = (((i32::from(m) * qp) >> 4) + i32::from(n)).clamp(1, 126);
@@ -99,14 +134,17 @@ impl<'a> Cabac<'a> {
         for (i, &mn) in INIT_MB_TYPE_I.iter().enumerate() {
             set(&mut self.state, i, mn);
         }
+        for (i, &mn) in INIT_11_59.iter().enumerate() {
+            set(&mut self.state, 11 + i, mn[column]);
+        }
         for (i, &mn) in INIT_60_69.iter().enumerate() {
             set(&mut self.state, 60 + i, mn);
         }
         for (i, &mn) in INIT_70_275.iter().enumerate() {
-            set(&mut self.state, 70 + i, mn);
+            set(&mut self.state, 70 + i, mn[column]);
         }
         for (i, &mn) in INIT_399_401.iter().enumerate() {
-            set(&mut self.state, OFF_TRANSFORM_8X8 + i, mn);
+            set(&mut self.state, OFF_TRANSFORM_8X8 + i, mn[column]);
         }
     }
 
@@ -186,40 +224,191 @@ impl<'a> Cabac<'a> {
     pub(crate) fn begin_mb(&mut self, ctx: &MbCtx) {
         self.ctx = *ctx;
         self.cbp_luma_bins = 0;
+        self.cur_intra = true;
     }
 
-    /// 9.3.3.1.1.3: condTermFlagA + condTermFlagB for mb_type in an I slice,
-    /// where a neighbour counts unless it is I_NxN.
-    fn mb_type_inc(&self) -> usize {
+    /// Declare whether the macroblock being parsed is intra coded
+    /// (9.3.3.1.1.9 reads it for every coded_block_flag).
+    pub(crate) fn set_intra(&mut self, intra: bool) {
+        self.cur_intra = intra;
+    }
+
+    /// 9.3.3.1.1.3: condTermFlagA + condTermFlagB for mb_type. At ctxIdxOffset
+    /// 3 a neighbour counts unless it is I_NxN; at 27 (B slices) unless it is
+    /// B_Skip or B_Direct_16x16.
+    fn mb_type_inc(&self, offset: usize) -> usize {
         let cond = |n: Option<MbInfo>| match n {
             None => 0,
-            Some(i) => usize::from(i.flags & (FLAG_I16 | FLAG_PCM) != 0),
+            Some(i) if offset == OFF_MB_TYPE => usize::from(i.flags & (FLAG_I16 | FLAG_PCM) != 0),
+            Some(i) => usize::from(i.flags & FLAG_DIRECT == 0),
         };
         cond(self.ctx.a) + cond(self.ctx.b)
     }
 
     /// mb_type of an I slice (Table 9-36).
     pub(crate) fn mb_type_i(&mut self) -> Result<u32> {
-        if !self.decision(OFF_MB_TYPE + self.mb_type_inc()) {
+        let mut ctx = I_MB_TYPE_CTX;
+        ctx[0] = OFF_MB_TYPE + self.mb_type_inc(OFF_MB_TYPE);
+        self.mb_type_intra(&ctx)
+    }
+
+    /// The Intra part of an mb_type bin string (Table 9-36), whose `ctx` is
+    /// resolved by [`I_MB_TYPE_CTX`]. `ctx[0]` has already had its neighbour
+    /// increment applied where the offset uses one.
+    fn mb_type_intra(&mut self, ctx: &[usize; 6]) -> Result<u32> {
+        if !self.decision(ctx[0]) {
             return Ok(0); // I_NxN
         }
         if self.terminate() {
             return Ok(25); // I_PCM
         }
-        // b2: CodedBlockPatternLuma 0 or 15; b3 (+ b4): CodedBlockPatternChroma;
-        // last two bins: Intra_16x16PredMode. The two prediction-mode bins keep
-        // ctxIdx 9 and 10 either way (Table 9-39 row 3 with Table 9-41).
-        let cbp_luma = u32::from(self.decision(OFF_MB_TYPE + 3));
-        let chroma = if !self.decision(OFF_MB_TYPE + 4) {
+        let cbp_luma = u32::from(self.decision(ctx[1]));
+        let chroma = if !self.decision(ctx[2]) {
             0
-        } else if self.decision(OFF_MB_TYPE + 5) {
+        } else if self.decision(ctx[3]) {
             2
         } else {
             1
         };
-        let mode = u32::from(self.decision(OFF_MB_TYPE + 6)) * 2
-            + u32::from(self.decision(OFF_MB_TYPE + 7));
+        let mode = u32::from(self.decision(ctx[4])) * 2 + u32::from(self.decision(ctx[5]));
         Ok(1 + mode + chroma * 4 + cbp_luma * 12)
+    }
+
+    /// mb_skip_flag (9.3.3.1.1.1); `inc` is condTermFlagA + condTermFlagB.
+    pub(crate) fn mb_skip_flag(&mut self, b_slice: bool, inc: usize) -> bool {
+        let off = if b_slice { OFF_SKIP_B } else { OFF_SKIP_P };
+        self.decision(off + inc)
+    }
+
+    /// mb_type of a P or SP slice (Table 9-37): values 0..3, or 5 + the I-slice
+    /// mb_type for an intra macroblock.
+    pub(crate) fn mb_type_p(&mut self) -> Result<u32> {
+        if self.decision(OFF_MB_TYPE_P) {
+            return Ok(5 + self.mb_type_intra(&I_SUFFIX_CTX_P)?);
+        }
+        let b1 = self.decision(OFF_MB_TYPE_P + 1);
+        // Table 9-41: binIdx 2 takes ctxIdxInc 2 when b1 is not 1, else 3.
+        let b2 = self.decision(OFF_MB_TYPE_P + if b1 { 3 } else { 2 });
+        Ok(match (b1, b2) {
+            (false, false) => 0, // P_L0_16x16
+            (false, true) => 3,  // P_8x8
+            (true, true) => 1,   // P_L0_L0_16x8
+            (true, false) => 2,  // P_L0_L0_8x16
+        })
+    }
+
+    /// mb_type of a B slice (Table 9-37): values 0..22, or 23 + the I-slice
+    /// mb_type for an intra macroblock.
+    pub(crate) fn mb_type_b(&mut self) -> Result<u32> {
+        if !self.decision(OFF_MB_TYPE_B + self.mb_type_inc(OFF_MB_TYPE_B)) {
+            return Ok(0); // B_Direct_16x16
+        }
+        if !self.decision(OFF_MB_TYPE_B + 3) {
+            // "10x": B_L0_16x16 or B_L1_16x16. binIdx 2 with b1 == 0 takes 5.
+            return Ok(1 + u32::from(self.decision(OFF_MB_TYPE_B + 5)));
+        }
+        let tail = OFF_MB_TYPE_B + 5;
+        if !self.decision(OFF_MB_TYPE_B + 4) {
+            // "110" + three bins: 3..10.
+            let mut v = 0u32;
+            for _ in 0..3 {
+                v = v * 2 + u32::from(self.decision(tail));
+            }
+            return Ok(3 + v);
+        }
+        if !self.decision(tail) {
+            // "1110" + three bins: 12..19.
+            let mut v = 0u32;
+            for _ in 0..3 {
+                v = v * 2 + u32::from(self.decision(tail));
+            }
+            return Ok(12 + v);
+        }
+        if self.decision(tail) {
+            // "11111": B_L1_L0_8x16 or B_8x8.
+            return Ok(if self.decision(tail) { 22 } else { 11 });
+        }
+        if self.decision(tail) {
+            // "111101": the intra prefix.
+            return Ok(23 + self.mb_type_intra(&I_SUFFIX_CTX_B)?);
+        }
+        // "111100" + one bin: B_Bi_Bi_16x8 or B_Bi_Bi_8x16.
+        Ok(20 + u32::from(self.decision(tail)))
+    }
+
+    /// sub_mb_type of a P macroblock (Table 9-38).
+    pub(crate) fn sub_mb_type_p(&mut self) -> u32 {
+        if self.decision(OFF_SUB_TYPE_P) {
+            return 0;
+        }
+        if !self.decision(OFF_SUB_TYPE_P + 1) {
+            return 1;
+        }
+        if self.decision(OFF_SUB_TYPE_P + 2) { 2 } else { 3 }
+    }
+
+    /// sub_mb_type of a B macroblock (Table 9-38).
+    pub(crate) fn sub_mb_type_b(&mut self) -> u32 {
+        if !self.decision(OFF_SUB_TYPE_B) {
+            return 0; // B_Direct_8x8
+        }
+        let tail = OFF_SUB_TYPE_B + 3;
+        if !self.decision(OFF_SUB_TYPE_B + 1) {
+            return 1 + u32::from(self.decision(tail));
+        }
+        if !self.decision(OFF_SUB_TYPE_B + 2) {
+            let v = u32::from(self.decision(tail)) * 2 + u32::from(self.decision(tail));
+            return 3 + v;
+        }
+        if !self.decision(tail) {
+            let v = u32::from(self.decision(tail)) * 2 + u32::from(self.decision(tail));
+            return 7 + v;
+        }
+        11 + u32::from(self.decision(tail))
+    }
+
+    /// ref_idx_lX: unary, with the neighbour increment of 9.3.3.1.1.6 on the
+    /// first bin (Table 9-39 row 54).
+    pub(crate) fn ref_idx(&mut self, inc: usize) -> Result<u32> {
+        if !self.decision(OFF_REF_IDX + inc) {
+            return Ok(0);
+        }
+        if !self.decision(OFF_REF_IDX + 4) {
+            return Ok(1);
+        }
+        let mut v = 2u32;
+        while self.decision(OFF_REF_IDX + 5) {
+            v += 1;
+            if v > 32 {
+                return Err(Error::corrupt("ref_idx bin string too long"));
+            }
+        }
+        Ok(v)
+    }
+
+    /// mvd_lX component `comp` (0 horizontal, 1 vertical): UEG3 with
+    /// signedValFlag 1 and uCoff 9 (clause 9.3.2.3), `inc` from 9.3.3.1.1.7.
+    pub(crate) fn mvd(&mut self, comp: usize, inc: usize) -> Result<i32> {
+        let off = OFF_MVD[comp];
+        if !self.decision(off + inc) {
+            return Ok(0);
+        }
+        let mut prefix = 1u32;
+        // Table 9-39: binIdx 1..4 take 3..6, binIdx 5 and beyond take 6.
+        while prefix < 9 {
+            let ctx = off + (2 + prefix as usize).min(6);
+            if !self.decision(ctx) {
+                break;
+            }
+            prefix += 1;
+        }
+        let abs = if prefix < 9 {
+            prefix
+        } else {
+            9 + self.ueg_suffix(3)?
+        };
+        let value = i32::try_from(abs).map_err(|_| Error::corrupt("mvd out of range"))?;
+        Ok(if self.bypass() { -value } else { value })
     }
 
     /// transform_size_8x8_flag (9.3.3.1.1.10).
@@ -246,7 +435,9 @@ impl<'a> Cabac<'a> {
     pub(crate) fn intra_chroma_pred_mode(&mut self) -> Result<u8> {
         let cond = |n: Option<MbInfo>| match n {
             None => 0,
-            Some(i) => usize::from(i.flags & FLAG_PCM == 0 && i.flags & FLAG_CHROMA_PRED != 0),
+            Some(i) => usize::from(
+                i.flags & (FLAG_PCM | FLAG_INTER) == 0 && i.flags & FLAG_CHROMA_PRED != 0,
+            ),
         };
         let inc = cond(self.ctx.a) + cond(self.ctx.b);
         if !self.decision(OFF_CHROMA_PRED + inc) {
@@ -345,10 +536,14 @@ impl<'a> Cabac<'a> {
         let max = cat.max_num_coeff();
 
         // coded_block_flag (9.3.3.1.1.9). An unavailable neighbour counts as
-        // set, because every macroblock of an I slice is intra coded; the
-        // caller has already folded I_PCM (all coefficients present) into a
-        // non-zero count.
-        let cond = |n: Option<u8>| usize::from(n.is_none_or(|v| v != 0));
+        // set for an intra macroblock and clear for an inter one; the caller
+        // has already folded I_PCM (all coefficients present) and P_Skip /
+        // B_Skip (none) into the neighbouring counts.
+        let intra = self.cur_intra;
+        let cond = |n: Option<u8>| match n {
+            None => usize::from(intra),
+            Some(v) => usize::from(v != 0),
+        };
         let (a, b) = match cat {
             // The DC blocks' neighbours are per macroblock, not per 4x4 block.
             BlockCat::LumaDc => (self.dc_cbf(self.ctx.a, 0), self.dc_cbf(self.ctx.b, 0)),
@@ -408,7 +603,7 @@ impl<'a> Cabac<'a> {
             let abs_minus1 = if prefix < 14 {
                 prefix
             } else {
-                14 + self.ueg0_suffix()?
+                14 + self.ueg_suffix(0)?
             };
             let level = i64::from(abs_minus1) + 1;
             let level = if self.bypass() { -level } else { level };
@@ -424,9 +619,10 @@ impl<'a> Cabac<'a> {
         Ok(total)
     }
 
-    /// The bypass-coded 0th order Exp-Golomb suffix of a UEG0 bin string (9-6).
-    fn ueg0_suffix(&mut self) -> Result<u32> {
-        let mut k = 0u32;
+    /// The bypass-coded k-th order Exp-Golomb suffix of a UEGk bin string
+    /// (clause 9.3.2.3): k = 0 for coeff_abs_level_minus1, 3 for mvd.
+    fn ueg_suffix(&mut self, k0: u32) -> Result<u32> {
+        let mut k = k0;
         let mut value = 0u32;
         while self.bypass() {
             value += 1 << k;
@@ -532,7 +728,7 @@ mod tests {
     /// 9.3.1.1 worked through by hand for two entries.
     #[test]
     fn context_initialisation_matches_equation_9_5() {
-        let c = Cabac::new(&[0x55, 0, 0, 0, 0], 0, 26).unwrap();
+        let c = Cabac::new(&[0x55, 0, 0, 0, 0], 0, 26, 0).unwrap();
         // ctxIdx 0, (m, n) = (20, -15): preCtxState = ((20*26) >> 4) - 15 = 17,
         // so pStateIdx = 63 - 17 = 46 and valMPS = 0.
         assert_eq!(c.state[0], 46 << 1);
@@ -540,7 +736,7 @@ mod tests {
         assert_eq!(c.state[60], 22 << 1);
         // Clip3(1, 126, ...) at a low QP: ctxIdx 6, (m, n) = (-28, 127) at
         // QP 0 gives 127, clipped to 126 -> pStateIdx 62, valMPS 1.
-        let c = Cabac::new(&[0x55, 0, 0, 0, 0], 0, 0).unwrap();
+        let c = Cabac::new(&[0x55, 0, 0, 0, 0], 0, 0, 0).unwrap();
         assert_eq!(c.state[6], (62 << 1) | 1);
     }
 
@@ -551,7 +747,7 @@ mod tests {
         // Header ends mid byte: the alignment bits carry to the boundary, then
         // 0b1010_1010_1 is codIOffset.
         let data = [0xFF, 0b1010_1010, 0b1000_0000, 0, 0];
-        let c = Cabac::new(&data, 3, 30).unwrap();
+        let c = Cabac::new(&data, 3, 30, 0).unwrap();
         assert_eq!(c.range, 510);
         assert_eq!(c.offset, 0b1_0101_0101);
         assert!(c.state.iter().all(|&s| s >> 1 < 64));

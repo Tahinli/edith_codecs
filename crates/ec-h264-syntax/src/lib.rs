@@ -22,8 +22,11 @@ pub mod sps;
 
 pub use nal::{AnnexBIter, NalHeader, NalUnitType, unescape_rbsp};
 pub use pps::Pps;
-pub use slice::{DeblockControl, SliceHeader, SliceType};
-pub use sps::{Hrd, ScalingLists, Sps, Vui};
+pub use slice::{
+    DeblockControl, DecRefPicMarking, Mmco, PredWeightTable, RefPicListMod, SliceHeader,
+    SliceType, WeightEntry,
+};
+pub use sps::{BitstreamRestriction, Hrd, ScalingLists, Sps, Vui};
 
 /// True when there is at least one more RBSP syntax element before the
 /// `rbsp_stop_one_bit` (spec 7.2 `more_rbsp_data()`).

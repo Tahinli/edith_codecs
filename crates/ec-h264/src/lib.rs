@@ -1,9 +1,12 @@
 //! H.264 software decoder.
 //!
-//! Current scope: CAVLC-coded I slices (Intra_4x4, Intra_16x16, I_PCM) of
-//! 8-bit 4:2:0 progressive streams, with the full in-loop deblocking filter,
-//! decoded bit-exactly against the JVT conformance suite. Everything outside
-//! that scope returns a named [`Error::Unsupported`] — never wrong output.
+//! Current scope: I, P and B slices under both entropy coders (CAVLC and
+//! CABAC) of 8-bit 4:2:0 progressive streams — intra prediction, inter
+//! prediction with the full decoded picture buffer of clause 8.2, weighted
+//! prediction, and the in-loop deblocking filter — decoded bit-exactly against
+//! the JVT conformance suite. Frames come out in display order. Everything
+//! outside that scope returns a named [`Error::Unsupported`] — never wrong
+//! output.
 //!
 //! Implemented from Rec. ITU-T H.264 (V15, 08/2024) only; no third-party
 //! decoder source was consulted.
@@ -37,11 +40,14 @@ mod cavlc;
 mod codec;
 mod deblock;
 mod decoder;
+mod dpb;
 mod entropy;
+mod inter;
+mod mv;
 mod pred;
 mod tables;
 mod transform;
 
 pub use codec::H264Decoder;
-pub use decoder::{Decoder, NalOutcome};
+pub use decoder::{Decoder, NalOutcome, OutputOrder};
 pub use ec_core::error::{Error, Result};

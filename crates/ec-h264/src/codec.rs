@@ -17,7 +17,7 @@ use ec_core::registry::{CodecId, CodecParameters, MediaParameters};
 use ec_core::timebase::Timestamp;
 use ec_h264_syntax::AnnexBIter;
 
-use crate::decoder::{Decoder, NalOutcome};
+use crate::decoder::{Decoder, NalOutcome, OutputOrder};
 
 /// H.264 decoder behind the codec registry's packet/frame contract.
 pub struct H264Decoder {
@@ -27,7 +27,6 @@ pub struct H264Decoder {
     /// `None` means Annex B start codes.
     nal_length_size: Option<usize>,
     frames: VecDeque<Frame>,
-    pending_pts: Option<Timestamp>,
     end_of_stream: bool,
 }
 
@@ -50,7 +49,6 @@ impl H264Decoder {
             inner: Decoder::new(),
             nal_length_size: None,
             frames: VecDeque::new(),
-            pending_pts: None,
             end_of_stream: false,
         };
         // 7 bytes is the shortest record that can hold the fixed header plus a
@@ -62,6 +60,21 @@ impl H264Decoder {
             decoder.parse_avcc(&extradata)?;
         }
         Ok(decoder)
+    }
+
+    /// Choose the order frames come back in.
+    ///
+    /// The default is display order, which is the order a player presents
+    /// pictures in and the only correct one for a stream with B pictures. A
+    /// caller that does its own reordering — or that wants the lowest possible
+    /// latency and knows the stream never reorders — can ask for decode order.
+    pub fn set_output_order(&mut self, order: OutputOrder) {
+        self.inner.set_output_order(order);
+    }
+
+    /// The order frames come back in.
+    pub fn output_order(&self) -> OutputOrder {
+        self.inner.output_order()
     }
 
     /// Read an `avcC` record: the NAL length size and the in-band parameter
@@ -133,16 +146,21 @@ impl H264Decoder {
         Ok(())
     }
 
-    /// Emit the open picture, if there is one, as a frame.
+    /// Complete the open picture, if there is one, and drain whatever that
+    /// made ready for output.
     fn finish_picture(&mut self) -> Result<()> {
-        if !self.inner.picture_open() {
-            return Ok(());
+        if self.inner.picture_open() {
+            self.inner.end_picture()?;
         }
-        self.inner.end_picture()?;
-        let mut frame = self.inner.frame()?;
-        frame.pts = self.pending_pts.take();
-        self.frames.push_back(Frame::Video(frame));
+        self.drain();
         Ok(())
+    }
+
+    /// Move every frame the decoder has released into the output queue.
+    fn drain(&mut self) {
+        while let Some(frame) = self.inner.next_frame() {
+            self.frames.push_back(Frame::Video(frame));
+        }
     }
 
     /// Publish the active SPS geometry on `params`, the way a demuxer that
@@ -166,9 +184,13 @@ impl ec_core::registry::Decoder for H264Decoder {
 
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
         self.end_of_stream = false;
-        self.pending_pts = packet
-            .pts
-            .map(|ticks| Timestamp::new(ticks, packet.time_base));
+        // The timestamp belongs to the picture, not to the packet: display
+        // order hands pictures back in a different order than they arrive.
+        self.inner.set_next_pts(
+            packet
+                .pts
+                .map(|ticks| Timestamp::new(ticks, packet.time_base)),
+        );
         self.decode_packet_payload(&packet.data)?;
         // One packet is one access unit, so whatever picture it started is
         // complete once the packet is consumed.
@@ -184,7 +206,8 @@ impl ec_core::registry::Decoder for H264Decoder {
     }
 
     fn flush(&mut self) -> Result<()> {
-        self.finish_picture()?;
+        self.inner.flush()?;
+        self.drain();
         self.end_of_stream = true;
         Ok(())
     }
@@ -194,7 +217,6 @@ impl ec_core::registry::Decoder for H264Decoder {
         // state does not.
         self.inner.reset_pictures();
         self.frames.clear();
-        self.pending_pts = None;
         self.end_of_stream = false;
     }
 }

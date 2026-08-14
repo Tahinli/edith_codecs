@@ -20,7 +20,7 @@ use ec_core::error::{Error, Result};
 
 use crate::bits::BitCursor;
 use crate::cabac::Cabac;
-use crate::tables::CBP_INTRA_420;
+use crate::tables::{CBP_INTER_420, CBP_INTRA_420};
 
 /// Macroblock state bits (`Picture::mb_flags`, and `MbInfo::flags` for a
 /// neighbour). CABAC context selection reads all of them.
@@ -32,6 +32,12 @@ pub(crate) const FLAG_PCM: u8 = 2;
 pub(crate) const FLAG_I16: u8 = 4;
 /// intra_chroma_pred_mode is not 0 (DC).
 pub(crate) const FLAG_CHROMA_PRED: u8 = 8;
+/// The macroblock is inter coded.
+pub(crate) const FLAG_INTER: u8 = 16;
+/// mb_type is B_Skip or B_Direct_16x16 (9.3.3.1.1.3 at ctxIdxOffset 27).
+pub(crate) const FLAG_DIRECT: u8 = 32;
+/// mb_type is P_Skip or B_Skip (9.3.3.1.1.1).
+pub(crate) const FLAG_SKIP: u8 = 64;
 
 /// Residual block class (spec Table 9-42, the 4:2:0 subset this decoder codes).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -113,8 +119,136 @@ impl<'a> Entropy<'a> {
 
     /// A CABAC reader: consumes the `cabac_alignment_one_bit`s and initialises
     /// the context variables and the arithmetic decoding engine (clause 9.3.1).
-    pub(crate) fn cabac(rbsp: &'a [u8], header_bits: u64, slice_qp: i32) -> Result<Entropy<'a>> {
-        Ok(Entropy::Cabac(Cabac::new(rbsp, header_bits, slice_qp)?))
+    /// `init_column` is 0 for I and SI slices, `cabac_init_idc + 1` otherwise.
+    pub(crate) fn cabac(
+        rbsp: &'a [u8],
+        header_bits: u64,
+        slice_qp: i32,
+        init_column: usize,
+    ) -> Result<Entropy<'a>> {
+        Ok(Entropy::Cabac(Cabac::new(
+            rbsp,
+            header_bits,
+            slice_qp,
+            init_column,
+        )?))
+    }
+
+    /// True for the CABAC variant.
+    #[inline]
+    pub(crate) fn is_cabac(&self) -> bool {
+        matches!(self, Entropy::Cabac(_))
+    }
+
+    /// Declare whether the macroblock being parsed is intra coded, which
+    /// CABAC needs for the coded_block_flag contexts of 9.3.3.1.1.9.
+    #[inline]
+    pub(crate) fn set_intra(&mut self, intra: bool) {
+        if let Entropy::Cabac(c) = self {
+            c.set_intra(intra);
+        }
+    }
+
+    /// `mb_skip_run` (7.3.4), CAVLC only.
+    pub(crate) fn mb_skip_run(&mut self) -> Result<u32> {
+        match self {
+            Entropy::Cavlc(r) => r.read_ue(),
+            Entropy::Cabac(_) => Err(Error::corrupt("mb_skip_run in a CABAC slice")),
+        }
+    }
+
+    /// `mb_skip_flag` (7.3.4), CABAC only; `inc` is condTermFlagA +
+    /// condTermFlagB per 9.3.3.1.1.1.
+    pub(crate) fn mb_skip_flag(&mut self, b_slice: bool, inc: usize) -> Result<bool> {
+        match self {
+            Entropy::Cavlc(_) => Err(Error::corrupt("mb_skip_flag in a CAVLC slice")),
+            Entropy::Cabac(c) => Ok(c.mb_skip_flag(b_slice, inc)),
+        }
+    }
+
+    /// `mb_type` of a P or SP slice: 0..4, or 5 + the I-slice mb_type.
+    pub(crate) fn mb_type_p(&mut self) -> Result<u32> {
+        match self {
+            Entropy::Cavlc(r) => {
+                let t = r.read_ue()?;
+                if t > 30 {
+                    return Err(Error::corrupt("P-slice mb_type > 30"));
+                }
+                Ok(t)
+            }
+            Entropy::Cabac(c) => c.mb_type_p(),
+        }
+    }
+
+    /// `mb_type` of a B slice: 0..22, or 23 + the I-slice mb_type.
+    pub(crate) fn mb_type_b(&mut self) -> Result<u32> {
+        match self {
+            Entropy::Cavlc(r) => {
+                let t = r.read_ue()?;
+                if t > 48 {
+                    return Err(Error::corrupt("B-slice mb_type > 48"));
+                }
+                Ok(t)
+            }
+            Entropy::Cabac(c) => c.mb_type_b(),
+        }
+    }
+
+    /// `sub_mb_type[ ]` of a P (`b_slice` false) or B macroblock.
+    pub(crate) fn sub_mb_type(&mut self, b_slice: bool) -> Result<u32> {
+        let max = if b_slice { 12 } else { 3 };
+        match self {
+            Entropy::Cavlc(r) => {
+                let t = r.read_ue()?;
+                if t > max {
+                    return Err(Error::corrupt("sub_mb_type out of range"));
+                }
+                Ok(t)
+            }
+            Entropy::Cabac(c) => Ok(if b_slice {
+                c.sub_mb_type_b()
+            } else {
+                c.sub_mb_type_p()
+            }),
+        }
+    }
+
+    /// `ref_idx_lX` (7.3.5.1): te(v) over `0..=cmax` for CAVLC, unary with the
+    /// neighbour context of 9.3.3.1.1.6 for CABAC.
+    pub(crate) fn ref_idx(&mut self, cmax: u32, inc: usize) -> Result<u32> {
+        let v = match self {
+            // te(v), clause 9.1.1: a one-valued range is a single inverted bit.
+            Entropy::Cavlc(r) if cmax == 1 => u32::from(!r.read_bit()?),
+            Entropy::Cavlc(r) => r.read_ue()?,
+            Entropy::Cabac(c) => c.ref_idx(inc)?,
+        };
+        if v > cmax {
+            return Err(Error::corrupt("ref_idx beyond num_ref_idx_active"));
+        }
+        Ok(v)
+    }
+
+    /// One `mvd_lX` component (7.3.5.1), in quarter luma samples.
+    pub(crate) fn mvd(&mut self, comp: usize, inc: usize) -> Result<i32> {
+        match self {
+            Entropy::Cavlc(r) => r.read_se(),
+            Entropy::Cabac(c) => c.mvd(comp, inc),
+        }
+    }
+
+    /// `coded_block_pattern` of an inter macroblock, as
+    /// `(CodedBlockPatternLuma, CodedBlockPatternChroma)`.
+    pub(crate) fn coded_block_pattern_inter(&mut self) -> Result<(u8, u8)> {
+        match self {
+            Entropy::Cavlc(r) => {
+                let code = r.read_ue()? as usize;
+                let cbp = *CBP_INTER_420
+                    .get(code)
+                    .ok_or_else(|| Error::corrupt("coded_block_pattern codeNum > 47"))?;
+                Ok((cbp & 15, cbp >> 4))
+            }
+            Entropy::Cabac(c) => c.coded_block_pattern(),
+        }
     }
 
     /// Publish the neighbourhood of the macroblock about to be parsed.
