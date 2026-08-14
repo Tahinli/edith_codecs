@@ -1,0 +1,10 @@
+[package]
+name = "ec-h264-syntax"
+description = "H.264 (ITU-T Rec. H.264) bitstream syntax: NAL, SPS/PPS, slice headers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ec-core = { workspace = true }
