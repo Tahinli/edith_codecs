@@ -11,6 +11,8 @@
 //! branches per sample. The clamp bounds below are what makes that exact —
 //! see [`clamp_origin`].
 
+use wide::{i16x8, i16x16, i32x8};
+
 /// A reference picture plane for motion compensation.
 pub(crate) struct RefPlane<'a> {
     /// The whole padded plane.
@@ -50,19 +52,122 @@ fn clamp_origin(v: i32, size: usize, extent: usize, pad: usize, left: i32, right
     v.clamp(lo.min(hi), hi)
 }
 
-/// The 6-tap half-sample filter of Equations 8-241/8-242 over samples spaced
-/// `step` apart, centred between `p[0]` and `p[step]`.
+/// Sixteen samples as 16-bit lanes, zero past the end of the plane.
+///
+/// A partition is at most 16 samples wide, so one vector covers a whole row and
+/// the lanes past `w` are simply never stored. Every index the interpolator
+/// reaches is inside the replicated border (see [`clamp_origin`]), so the zero
+/// fill is reachable only by those discarded lanes.
 #[inline]
-fn tap6(data: &[u8], at: usize, step: usize) -> i32 {
-    let s = |k: isize| i32::from(data[(at as isize + k * step as isize) as usize]);
-    s(-2) - 5 * s(-1) + 20 * s(0) + 20 * s(1) - 5 * s(2) + s(3)
+fn load16(data: &[u8], at: usize) -> i16x16 {
+    let mut a = [0i16; 16];
+    // The fixed-length slice is what makes this one widening load: a zip
+    // against an open-ended slice leaves the trip count unknown and the
+    // compiler emits a byte loop instead.
+    match data.get(at..at + 16) {
+        Some(row) => {
+            for (o, &b) in a.iter_mut().zip(row) {
+                *o = i16::from(b);
+            }
+        }
+        None => {
+            for (o, &b) in a.iter_mut().zip(&data[at..]) {
+                *o = i16::from(b);
+            }
+        }
+    }
+    i16x16::from(a)
 }
 
-/// The same over already-filtered intermediate values (Equations 8-245/8-246).
+/// The same over eight lanes, for chroma blocks (at most eight wide).
 #[inline]
-fn tap6_i32(v: &[i32], at: usize, step: usize) -> i32 {
-    let s = |k: isize| v[(at as isize + k * step as isize) as usize];
-    s(-2) - 5 * s(-1) + 20 * s(0) + 20 * s(1) - 5 * s(2) + s(3)
+fn load8(data: &[u8], at: usize) -> i16x8 {
+    let mut a = [0i16; 8];
+    match data.get(at..at + 8) {
+        Some(row) => {
+            for (o, &b) in a.iter_mut().zip(row) {
+                *o = i16::from(b);
+            }
+        }
+        None => {
+            for (o, &b) in a.iter_mut().zip(&data[at..]) {
+                *o = i16::from(b);
+            }
+        }
+    }
+    i16x8::from(a)
+}
+
+/// The 6-tap half-sample filter of Equations 8-241/8-242 over sixteen
+/// neighbouring positions at once, the taps spaced `step` apart.
+///
+/// The unrounded result of Equation 8-241 spans -2550..10710, so 16-bit lanes
+/// hold it exactly and one row of a partition is one vector.
+#[inline]
+fn tap6_16(data: &[u8], at: usize, step: usize) -> i16x16 {
+    let l = |k: isize| load16(data, (at as isize + k * step as isize) as usize);
+    let five = i16x16::splat(5);
+    let twenty = i16x16::splat(20);
+    l(-2) - five * l(-1) + twenty * l(0) + twenty * l(1) - five * l(2) + l(3)
+}
+
+/// `Clip1Y( ( v + 16 ) >> 5 )` over a row, storing the first `dst.len()` lanes.
+#[inline]
+fn store_half(dst: &mut [u8], v: i16x16) {
+    let c = ((v + i16x16::splat(16)) >> 5u32)
+        .max(i16x16::ZERO)
+        .min(i16x16::splat(255));
+    for (o, &s) in dst.iter_mut().zip(c.as_array()) {
+        *o = s as u8;
+    }
+}
+
+/// Eight intermediate values as 32-bit lanes, zero past the end.
+#[inline]
+fn load_inter8(v: &[i16], at: usize) -> i32x8 {
+    let mut a = [0i32; 8];
+    for (o, &s) in a.iter_mut().zip(&v[at..]) {
+        *o = i32::from(s);
+    }
+    i32x8::from(a)
+}
+
+/// The 6-tap filter over already-filtered intermediate values (Equation
+/// 8-246), eight columns at a time. Those sums reach 449820, so this pass is
+/// 32-bit where the first one was 16-bit.
+#[inline]
+fn tap6_inter8(v: &[i16], at: usize, step: usize) -> i32x8 {
+    let l = |k: isize| load_inter8(v, (at as isize + k * step as isize) as usize);
+    let five = i32x8::splat(5);
+    let twenty = i32x8::splat(20);
+    l(-2) - five * l(-1) + twenty * l(0) + twenty * l(1) - five * l(2) + l(3)
+}
+
+/// `Clip1Y( ( v + 512 ) >> 10 )` over eight lanes.
+#[inline]
+fn store_centre(dst: &mut [u8], v: i32x8) {
+    let c = ((v + i32x8::splat(512)) >> 10u32)
+        .max(i32x8::ZERO)
+        .min(i32x8::splat(255));
+    for (o, &s) in dst.iter_mut().zip(c.as_array()) {
+        *o = s as u8;
+    }
+}
+
+/// The rounded average of Equation 8-247 over `n` samples, sixteen at a time.
+#[inline]
+fn avg_rows(out: &mut [u8], a: &[u8], b: &[u8], n: usize) {
+    let mut i = 0;
+    while i + 16 <= n {
+        let v = (load16(a, i) + load16(b, i) + i16x16::ONE) >> 1u32;
+        for (o, &s) in out[i..i + 16].iter_mut().zip(v.as_array()) {
+            *o = s as u8;
+        }
+        i += 16;
+    }
+    for k in i..n {
+        out[k] = avg(a[k], b[k]);
+    }
 }
 
 #[inline]
@@ -118,9 +223,7 @@ pub(crate) fn mc_luma(
         let row0 = yi + if fy == 3 { 1 } else { 0 };
         for row in 0..h {
             let src = r.at(xi, row0 + row as i32);
-            for col in 0..w {
-                bb[row * w + col] = clip8((tap6(r.data, src + col, 1) + 16) >> 5);
-            }
+            store_half(&mut bb[row * w..row * w + w], tap6_16(r.data, src, 1));
         }
     }
     let mut hh = [0u8; 16 * 17];
@@ -129,9 +232,7 @@ pub(crate) fn mc_luma(
         let col0 = xi + if fx == 3 { 1 } else { 0 };
         for row in 0..h {
             let src = r.at(col0, yi + row as i32);
-            for col in 0..w {
-                hh[row * w + col] = clip8((tap6(r.data, src + col, stride) + 16) >> 5);
-            }
+            store_half(&mut hh[row * w..row * w + w], tap6_16(r.data, src, stride));
         }
     }
     let mut jj = [0u8; 16 * 16];
@@ -139,43 +240,51 @@ pub(crate) fn mc_luma(
         // Equation 8-246: filter horizontally into intermediates, then
         // vertically over those. The horizontal pass needs two rows above and
         // three below the partition.
-        let mut inter = [0i32; TMP_W * (16 + 5)];
+        let mut inter = [0i16; TMP_W * (16 + 5)];
         for row in 0..h + 5 {
             let src = r.at(xi, yi + row as i32 - 2);
-            for col in 0..w {
-                inter[row * TMP_W + col] = tap6(r.data, src + col, 1);
+            let v = tap6_16(r.data, src, 1);
+            let base = row * TMP_W;
+            for (o, &t) in inter[base..base + w].iter_mut().zip(v.as_array()) {
+                *o = t;
             }
         }
         for row in 0..h {
-            for col in 0..w {
-                let v = tap6_i32(&inter, (row + 2) * TMP_W + col, TMP_W);
-                jj[row * w + col] = clip8((v + 512) >> 10);
+            for col in (0..w).step_by(8) {
+                let v = tap6_inter8(&inter, (row + 2) * TMP_W + col, TMP_W);
+                let n = (w - col).min(8);
+                store_centre(&mut jj[row * w + col..row * w + col + n], v);
             }
         }
     }
 
-    for row in 0..h {
-        for col in 0..w {
-            let i = row * w + col;
-            let g = |dx: i32, dy: i32| {
-                r.data[base + (row as i32 + dy) as usize * stride + (col as i32 + dx) as usize]
+    // Table 8-12: each quarter position is one of the half-sample arrays, or
+    // the average of two of them. Resolving it once per partition rather than
+    // once per sample is what keeps the copy loops straight.
+    let n = w * h;
+    match (fx, fy) {
+        (2, 0) => out[..n].copy_from_slice(&bb[..n]),
+        (0, 2) => out[..n].copy_from_slice(&hh[..n]),
+        (2, 2) => out[..n].copy_from_slice(&jj[..n]),
+        (2, 1) | (2, 3) => avg_rows(out, &bb, &jj, n),
+        (1, 2) | (3, 2) => avg_rows(out, &hh, &jj, n),
+        (1, 0) | (3, 0) | (0, 1) | (0, 3) => {
+            // Averaged with an integer sample one row or column over.
+            let (dx, dy) = match (fx, fy) {
+                (3, 0) => (1, 0),
+                (0, 3) => (0, 1),
+                _ => (0, 0),
             };
-            out[i] = match (fx, fy) {
-                // Table 8-12, quarter positions on the integer rows/columns.
-                (1, 0) => avg(g(0, 0), bb[i]),
-                (2, 0) => bb[i],
-                (3, 0) => avg(g(1, 0), bb[i]),
-                (0, 1) => avg(g(0, 0), hh[i]),
-                (0, 2) => hh[i],
-                (0, 3) => avg(g(0, 1), hh[i]),
-                // Centre column / row: mix with the centre sample j.
-                (2, 1) | (2, 3) => avg(bb[i], jj[i]),
-                (1, 2) | (3, 2) => avg(hh[i], jj[i]),
-                (2, 2) => jj[i],
-                // Diagonal quarter positions: the two nearest half samples.
-                _ => avg(bb[i], hh[i]),
-            };
+            let half: &[u8] = if fy == 0 { &bb } else { &hh };
+            for row in 0..h {
+                let src = base + (row + dy) * stride + dx;
+                for col in 0..w {
+                    out[row * w + col] = avg(r.data[src + col], half[row * w + col]);
+                }
+            }
         }
+        // Diagonal quarter positions: the two nearest half samples.
+        _ => avg_rows(out, &bb, &hh, n),
     }
 }
 
@@ -189,20 +298,29 @@ pub(crate) fn mc_chroma(
     h: usize,
     out: &mut [u8],
 ) {
-    let (fx, fy) = ((mv[0] & 7) as i32, (mv[1] & 7) as i32);
+    let (fx, fy) = ((mv[0] & 7) as i16, (mv[1] & 7) as i16);
     let xi = clamp_origin(x + (mv[0] as i32 >> 3), w, r.width, r.pad, 0, 1);
     let yi = clamp_origin(y + (mv[1] as i32 >> 3), h, r.height, r.pad, 0, 1);
     let stride = r.stride;
     let base = r.at(xi, yi);
-    let (wa, wb, wc, wd) = ((8 - fx) * (8 - fy), fx * (8 - fy), (8 - fx) * fy, fx * fy);
+    // The four weights sum to 64, so the weighted sum of Equation 8-270 never
+    // exceeds 64 * 255 and the whole bilinear fits in 16-bit lanes. A chroma
+    // block is at most eight samples wide, which is one vector per row.
+    let wa = i16x8::splat((8 - fx) * (8 - fy));
+    let wb = i16x8::splat(fx * (8 - fy));
+    let wc = i16x8::splat((8 - fx) * fy);
+    let wd = i16x8::splat(fx * fy);
+    let round = i16x8::splat(32);
     for row in 0..h {
         let src = base + row * stride;
-        for col in 0..w {
-            let a = i32::from(r.data[src + col]);
-            let b = i32::from(r.data[src + col + 1]);
-            let c = i32::from(r.data[src + col + stride]);
-            let d = i32::from(r.data[src + col + stride + 1]);
-            out[row * w + col] = ((wa * a + wb * b + wc * c + wd * d + 32) >> 6) as u8;
+        let v = (load8(r.data, src) * wa
+            + load8(r.data, src + 1) * wb
+            + load8(r.data, src + stride) * wc
+            + load8(r.data, src + stride + 1) * wd
+            + round)
+            >> 6u32;
+        for (o, &s) in out[row * w..row * w + w].iter_mut().zip(v.as_array()) {
+            *o = s as u8;
         }
     }
 }
@@ -249,11 +367,7 @@ pub(crate) fn combine(
         match (use0, use1) {
             (true, false) => out[..n].copy_from_slice(&p0[..n]),
             (false, true) => out[..n].copy_from_slice(&p1[..n]),
-            _ => {
-                for i in 0..n {
-                    out[i] = avg(p0[i], p1[i]);
-                }
-            }
+            _ => avg_rows(out, p0, p1, n),
         }
         return;
     }
