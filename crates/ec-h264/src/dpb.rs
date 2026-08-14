@@ -227,6 +227,8 @@ impl Picture {
         self.output = false;
         self.non_existing = false;
         self.long_term_frame_idx = 0;
+        self.frame_num_wrap = 0;
+        self.pic_num = 0;
     }
 
     /// Replicate every plane's borders once the picture is fully reconstructed.
@@ -812,6 +814,14 @@ impl Dpb {
         let has_mmco5 = marking.is_some_and(|m| m.mmcos.iter().any(|c| c.op == 5));
         pic.output = true;
         pic.complete = true;
+        // Clause 8.2.4.1 against this picture's frame_num, which is what both
+        // the sliding window (8.2.5.3) and the MMCO picture numbers (8.2.5.4)
+        // compare. An intra slice never built a reference list, so this is the
+        // only place the numbering is guaranteed to be current — and the
+        // picture being stored has no FrameNumWrap of its own until now.
+        self.number_short_term(info.frame_num, sps);
+        pic.frame_num_wrap = pic.frame_num as i32;
+        pic.pic_num = pic.frame_num as i32;
 
         if info.is_idr {
             let no_output = marking.is_some_and(|m| m.no_output_of_prior_pics);
