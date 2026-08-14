@@ -1,6 +1,7 @@
 //! Codec identities, stream descriptions and the four trait contracts every
 //! container and codec crate in the family implements.
 
+use crate::color::ContentLight;
 use crate::error::Result;
 use crate::frame::{ChannelLayout, ColorInfo, Frame, PixelFormat, SampleFormat};
 use crate::packet::{Buf, Packet};
@@ -116,7 +117,7 @@ impl CodecId {
 }
 
 /// Video half of [`CodecParameters`].
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct VideoParameters {
     /// Coded width in pixels.
     pub width: u32,
@@ -131,6 +132,10 @@ pub struct VideoParameters {
     pub sample_aspect_ratio: Option<TimeBase>,
     /// H.273 colour description.
     pub color: ColorInfo,
+    /// How bright the grade says this stream gets: MaxCLL/MaxFALL and the
+    /// mastering display, when the container or an HDR SEI stated them. All
+    /// [`None`] for SDR, which is what a tone map falls back on.
+    pub light: ContentLight,
 }
 
 /// Audio half of [`CodecParameters`].
@@ -158,7 +163,7 @@ impl Default for AudioParameters {
 }
 
 /// Per-media-type parameters.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum MediaParameters {
     /// Video stream parameters.
     Video(VideoParameters),
@@ -170,7 +175,7 @@ pub enum MediaParameters {
 }
 
 /// Everything a decoder needs before it sees its first packet.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CodecParameters {
     /// Which codec.
     pub codec: CodecId,
@@ -214,7 +219,7 @@ impl CodecParameters {
 }
 
 /// One stream of a container, as a demuxer reports it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct StreamInfo {
     /// Index matching [`Packet::stream`].
     pub index: u32,

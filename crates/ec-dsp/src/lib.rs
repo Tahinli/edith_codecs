@@ -26,11 +26,16 @@
 //!   codec convention (`2/N` on the inverse) and reconstructs exactly under
 //!   overlap-add with any Princen-Bradley window from [`window`].
 //!
+//! [`remap`] sits beside them for the same reason: it is the pixel arithmetic an
+//! encode does when a clip's YUV matrix is not the one the output declares, and
+//! it belongs with the transforms rather than in a container crate.
+//!
 //! Hot loops are vectorised with the `wide` crate through [`Real`]; the scalar
 //! and SIMD paths are the same expressions over the same data layout, so
 //! neither can drift from the other in correctness.
 //!
-//! No unsafe, no allocation on the transform path, no other dependencies.
+//! No unsafe, no allocation on the transform path, and no dependencies beyond
+//! `wide` and the family IR.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -38,11 +43,13 @@
 pub mod dct;
 pub mod fft;
 pub mod mdct;
+pub mod remap;
 pub mod window;
 
 pub use dct::{Dct, Dct4};
 pub use fft::{Complex, Fft, RealFft};
 pub use mdct::Mdct;
+pub use remap::remap;
 pub use window::Window;
 
 use core::fmt::Debug;

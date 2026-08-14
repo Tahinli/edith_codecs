@@ -7,4 +7,6 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+# For the colour matrices `remap` converts between; no other IR is used here.
+ec-core.workspace = true
 wide.workspace = true

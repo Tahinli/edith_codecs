@@ -5,7 +5,8 @@
 //! turns one into the other, [`CodecParameters`] describing a stream before its
 //! first packet, and a rational [`TimeBase`] that keeps `24000/1001` exact from
 //! the container to the muxer. [`bitio`] holds the one bit reader/writer pair
-//! the parsers share.
+//! the parsers share, and [`color`] the H.273 meaning behind [`ColorInfo`]'s raw
+//! code points — including the HDR mastering/content-light a tone map needs.
 //!
 //! Contracts worth knowing before implementing against this crate:
 //!
@@ -24,6 +25,7 @@
 #![warn(missing_docs)]
 
 pub mod bitio;
+pub mod color;
 pub mod error;
 pub mod frame;
 pub mod packet;
@@ -31,6 +33,10 @@ pub mod registry;
 pub mod timebase;
 
 pub use bitio::{BitReader, BitReaderLsb, BitWriter, BitWriterLsb};
+pub use color::{
+    ColorDescription, ContentLight, Matrix, Primaries, Tags, Transfer, bitstream_tags,
+    hevc_sei_light,
+};
 pub use error::{Error, Result};
 pub use frame::{
     AudioFrame, ChannelLayout, ChannelPosition, ColorInfo, Frame, PixelFormat, Plane, SampleFormat,
