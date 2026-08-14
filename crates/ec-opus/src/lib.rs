@@ -27,11 +27,13 @@
 #![warn(missing_docs)]
 
 pub mod celt;
+pub mod multistream;
 pub mod packet;
 pub mod range;
 pub mod silk;
 
 pub use celt::CeltDecoder;
+pub use multistream::MultistreamDecoder;
 pub use packet::{Bandwidth, Mode, Packet, Toc};
 pub use range::RangeDecoder;
 pub use silk::SilkDecoder;
@@ -53,6 +55,10 @@ pub struct Decoder {
     silk: SilkDecoder,
     /// The CELT overlap window, reused for redundancy cross-fades.
     celt_window: Vec<f32>,
+    /// Per-frame scratch, allocated once: the SILK layer's output and the
+    /// redundancy frame.
+    silk_pcm: Vec<i16>,
+    redundant: Vec<f32>,
     prev_mode: Option<Mode>,
     prev_redundancy: bool,
     range_final: u32,
@@ -88,6 +94,8 @@ impl Decoder {
             celt: CeltDecoder::new(channels, downsample),
             silk: SilkDecoder::new(sample_rate, channels),
             celt_window: celt::overlap_window(),
+            silk_pcm: vec![0; 5760 * channels],
+            redundant: vec![0.0; 240 * channels],
             prev_mode: None,
             prev_redundancy: false,
             range_final: 0,
@@ -197,7 +205,9 @@ impl Decoder {
         let f2_5 = 120 / self.downsample;
 
         // --- SILK layer -----------------------------------------------------
-        let mut silk_pcm = vec![0i16; frame_out * self.channels];
+        let mut silk_pcm = core::mem::take(&mut self.silk_pcm);
+        silk_pcm.clear();
+        silk_pcm.resize(frame_out * self.channels, 0);
         if mode != Mode::Celt {
             if self.prev_mode == Some(Mode::Celt) {
                 self.silk.reset();
@@ -267,7 +277,9 @@ impl Decoder {
 
         let end_band = toc.bandwidth().celt_end_band();
         let start_band = if mode == Mode::Celt { 0 } else { 17 };
-        let mut redundant = vec![0.0f32; f5 * self.channels];
+        let mut redundant = core::mem::take(&mut self.redundant);
+        redundant.clear();
+        redundant.resize(f5 * self.channels, 0.0);
 
         // A redundancy frame that precedes the main one is decoded first.
         let mut redundant_rng = 0u32;
@@ -355,6 +367,8 @@ impl Decoder {
 
         self.prev_mode = Some(mode);
         self.prev_redundancy = redundancy && !celt_to_silk;
+        self.silk_pcm = silk_pcm;
+        self.redundant = redundant;
         Ok(dec.range() ^ redundant_rng)
     }
 }

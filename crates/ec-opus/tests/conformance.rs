@@ -375,3 +375,351 @@ fn rfc6716_test_vectors() {
         println!("{line}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Real files: the Ogg-Opus fixtures, against ffmpeg
+// ---------------------------------------------------------------------------
+
+use ec_opus::MultistreamDecoder;
+use std::process::Command;
+
+/// Splits an Ogg stream into packets (RFC 3533): a page header, a segment
+/// table, and packets that end on any segment shorter than 255 bytes.
+fn ogg_packets(data: &[u8]) -> Vec<Vec<u8>> {
+    let mut packets = Vec::new();
+    let mut partial: Vec<u8> = Vec::new();
+    let mut i = 0;
+    while i + 27 <= data.len() {
+        assert_eq!(&data[i..i + 4], b"OggS", "not an Ogg page at {i}");
+        let nsegs = data[i + 26] as usize;
+        let table = &data[i + 27..i + 27 + nsegs];
+        let mut body = i + 27 + nsegs;
+        for &len in table {
+            let len = len as usize;
+            partial.extend_from_slice(&data[body..body + len]);
+            body += len;
+            if len < 255 {
+                packets.push(core::mem::take(&mut partial));
+            }
+        }
+        i = body;
+    }
+    packets
+}
+
+/// The RFC 7845 identification header: channel count, pre-skip and the
+/// multistream layout.
+struct OpusHead {
+    channels: usize,
+    pre_skip: usize,
+    streams: usize,
+    coupled: usize,
+    mapping: Vec<u8>,
+}
+
+fn parse_opus_head(p: &[u8]) -> OpusHead {
+    assert_eq!(&p[..8], b"OpusHead");
+    let channels = p[9] as usize;
+    let pre_skip = u16::from_le_bytes([p[10], p[11]]) as usize;
+    let family = p[18];
+    if family == 0 {
+        OpusHead {
+            channels,
+            pre_skip,
+            streams: 1,
+            coupled: channels - 1,
+            mapping: (0..channels as u8).collect(),
+        }
+    } else {
+        OpusHead {
+            channels,
+            pre_skip,
+            streams: p[19] as usize,
+            coupled: p[20] as usize,
+            mapping: p[21..21 + channels].to_vec(),
+        }
+    }
+}
+
+fn fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/audio")
+        .join(name)
+}
+
+/// ffmpeg's decode of the same file, interleaved `f32` in ffmpeg's channel
+/// order, with the pre-skip already removed.
+///
+/// The decoder is forced to `libopus` — the reference implementation. ffmpeg's
+/// own native Opus decoder is a third implementation and deviates from libopus
+/// by as much as 0.97 correlation on this very fixture's coupled surround
+/// streams, so it makes a poor oracle.
+fn ffmpeg_decode(path: &Path, channels: usize) -> Option<Vec<f32>> {
+    let out = Command::new("ffmpeg")
+        .args(["-v", "error", "-c:a", "libopus", "-i"])
+        .arg(path)
+        .args([
+            "-f",
+            "f32le",
+            "-ar",
+            "48000",
+            "-ac",
+            &channels.to_string(),
+            "-",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(
+        out.stdout
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+    )
+}
+
+/// Decodes an Ogg-Opus file with the multistream decoder, pre-skip removed.
+fn decode_ogg(path: &Path) -> (Vec<f32>, usize) {
+    let data = fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let packets = ogg_packets(&data);
+    let head = parse_opus_head(&packets[0]);
+    let mut dec = MultistreamDecoder::with_rate(48000, head.streams, head.coupled, &head.mapping);
+    let mut pcm = Vec::new();
+    for p in packets.iter().skip(2) {
+        if p.is_empty() {
+            continue;
+        }
+        let frame = dec.decode_packet(p).expect("decode");
+        pcm.extend_from_slice(&frame);
+    }
+    pcm.drain(..head.pre_skip * head.channels);
+    (pcm, head.channels)
+}
+
+fn correlation(a: &[f32], b: &[f32]) -> f64 {
+    let n = a.len().min(b.len());
+    let (mut sxy, mut sxx, mut syy) = (0.0f64, 0.0f64, 0.0f64);
+    for i in 0..n {
+        sxy += a[i] as f64 * b[i] as f64;
+        sxx += (a[i] as f64).powi(2);
+        syy += (b[i] as f64).powi(2);
+    }
+    if sxx == 0.0 || syy == 0.0 {
+        return if sxx == syy { 1.0 } else { 0.0 };
+    }
+    sxy / (sxx * syy).sqrt()
+}
+
+/// Power at `freq` in a channel, by the Goertzel algorithm.
+fn tone_power(x: &[f32], channels: usize, ch: usize, freq: f64) -> f64 {
+    let n = x.len() / channels;
+    let w = 2.0 * std::f64::consts::PI * freq / 48000.0;
+    let coeff = 2.0 * w.cos();
+    let (mut s1, mut s2) = (0.0f64, 0.0f64);
+    for i in 0..n {
+        let s = x[i * channels + ch] as f64 + coeff * s1 - s2;
+        s2 = s1;
+        s1 = s;
+    }
+    (s1 * s1 + s2 * s2 - coeff * s1 * s2) / (n * n) as f64
+}
+
+#[test]
+fn ogg_opus_fixtures_match_ffmpeg() {
+    // Mapping family 1 puts 5.1 in Vorbis order; ffmpeg hands its own order
+    // back, so the comparison permutes one into the other.
+    const VORBIS_TO_FFMPEG_5_1: [usize; 6] = [0, 2, 1, 4, 5, 3];
+    for (name, channels) in [
+        ("opus-ogg-mono-48000.opus", 1usize),
+        ("opus-ogg-stereo-48000.opus", 2),
+        ("opus-ogg-5.1-48000.opus", 6),
+    ] {
+        let path = fixture(name);
+        if !path.exists() {
+            eprintln!("{name}: missing, skipped (run scripts/gen-fixtures.sh)");
+            continue;
+        }
+        let Some(reference) = ffmpeg_decode(&path, channels) else {
+            eprintln!("{name}: ffmpeg unavailable, skipped");
+            continue;
+        };
+        let (mine, ch) = decode_ogg(&path);
+        assert_eq!(ch, channels, "{name}: channel count");
+        let mut worst = 1.0f64;
+        let n = (reference.len() / channels).min(mine.len() / channels);
+        assert!(n > 48000, "{name}: only {n} samples decoded");
+        for c in 0..channels {
+            let their_c = if channels == 6 {
+                VORBIS_TO_FFMPEG_5_1[c]
+            } else {
+                c
+            };
+            let a: Vec<f32> = (0..n).map(|i| mine[i * channels + c]).collect();
+            let b: Vec<f32> = (0..n).map(|i| reference[i * channels + their_c]).collect();
+            let corr = correlation(&a, &b);
+            println!("{name}: channel {c} correlation {corr:.5}");
+            worst = worst.min(corr);
+        }
+        assert!(
+            worst >= 0.99,
+            "{name}: worst channel correlation {worst:.5}"
+        );
+    }
+}
+
+#[test]
+fn five_one_channels_land_in_the_right_places() {
+    // The fixture carries one distinct sine per channel, so a channel-order
+    // bug shows up as a channel playing the wrong tone. The tones themselves
+    // come from the reference decode rather than from an assumption about how
+    // ffmpeg laid the fixture out; what is asserted is that this decoder's
+    // Vorbis-order output is the reference's 5.1-order output permuted.
+    const VORBIS_TO_FFMPEG_5_1: [usize; 6] = [0, 2, 1, 4, 5, 3];
+    const TONES: [f64; 6] = [220.0, 440.0, 660.0, 55.0, 880.0, 1320.0];
+    let path = fixture("opus-ogg-5.1-48000.opus");
+    if !path.exists() {
+        eprintln!("5.1 fixture missing, skipped");
+        return;
+    }
+    let Some(reference) = ffmpeg_decode(&path, 6) else {
+        eprintln!("ffmpeg unavailable, skipped");
+        return;
+    };
+    let (pcm, channels) = decode_ogg(&path);
+    assert_eq!(channels, 6);
+    let dominant = |x: &[f32], ch: usize| -> usize {
+        let mut best = (0usize, 0.0f64);
+        for (t, &f) in TONES.iter().enumerate() {
+            let p = tone_power(x, 6, ch, f);
+            if p > best.1 {
+                best = (t, p);
+            }
+        }
+        best.0
+    };
+    let mut seen = [false; 6];
+    for (c, &their) in VORBIS_TO_FFMPEG_5_1.iter().enumerate() {
+        let want = dominant(&reference, their);
+        let got = dominant(&pcm, c);
+        println!(
+            "channel {c}: {} Hz (reference channel {their} carries {} Hz)",
+            TONES[got], TONES[want]
+        );
+        assert_eq!(got, want, "channel {c} carries the wrong tone");
+        assert!(!seen[got], "tone {} Hz appears on two channels", TONES[got]);
+        seen[got] = true;
+    }
+}
+
+#[test]
+fn decode_speed() {
+    if cfg!(debug_assertions) {
+        eprintln!("decode speed is only meaningful in release; skipped");
+        return;
+    }
+    for (name, channels) in [
+        ("opus-ogg-stereo-48000.opus", 2usize),
+        ("opus-ogg-5.1-48000.opus", 6),
+    ] {
+        let path = fixture(name);
+        if !path.exists() {
+            continue;
+        }
+        let data = fs::read(&path).unwrap();
+        let packets = ogg_packets(&data);
+        let head = parse_opus_head(&packets[0]);
+        let audio: Vec<&Vec<u8>> = packets.iter().skip(2).filter(|p| !p.is_empty()).collect();
+        let mut dec =
+            MultistreamDecoder::with_rate(48000, head.streams, head.coupled, &head.mapping);
+        let mut out = vec![0.0f32; 5760 * channels];
+        // Warm up, then measure enough passes to cover several seconds of audio.
+        let mut samples = 0usize;
+        for p in &audio {
+            samples += dec.decode_float(p, &mut out).unwrap();
+        }
+        let passes = 20;
+        let start = std::time::Instant::now();
+        for _ in 0..passes {
+            dec.reset();
+            for p in &audio {
+                dec.decode_float(p, &mut out).unwrap();
+            }
+        }
+        let elapsed = start.elapsed().as_secs_f64();
+        let audio_secs = (samples * passes) as f64 / 48000.0;
+        let realtime = audio_secs / elapsed;
+        println!(
+            "{name}: {realtime:.0}x realtime ({channels} channels, {audio_secs:.1} s in {elapsed:.3} s)"
+        );
+        let floor = if channels == 6 { 104.0 } else { 135.0 };
+        assert!(
+            realtime >= floor,
+            "{name}: {realtime:.0}x realtime is below the {floor}x floor"
+        );
+    }
+
+    // The fixtures are sine tones, which are cheap; testvector01 is real music
+    // at a high rate and is the honest stereo number.
+    let path = vectors_dir().join("testvector01.bit");
+    if path.exists() {
+        let packets = read_vector(&path);
+        let mut dec = Decoder::new(48000, 2).unwrap();
+        let mut out = vec![0.0f32; 5760 * 2];
+        let mut samples = 0usize;
+        let start = std::time::Instant::now();
+        for p in &packets {
+            samples += dec.decode_float(&p.payload, &mut out).unwrap();
+        }
+        let elapsed = start.elapsed().as_secs_f64();
+        let realtime = samples as f64 / 48000.0 / elapsed;
+        println!("testvector01 (stereo music): {realtime:.0}x realtime");
+        assert!(realtime >= 135.0, "stereo music decodes at {realtime:.0}x");
+    }
+}
+
+#[test]
+#[ignore]
+fn real_library_sweep() {
+    // Files named on the command line (EC_OPUS_FILES=a.opus:b.opus), decoded
+    // and compared against libopus channel by channel, with the decode speed.
+    let files = std::env::var("EC_OPUS_FILES").unwrap_or_default();
+    for f in files.split(':').filter(|s| !s.is_empty()) {
+        let path = PathBuf::from(f);
+        let (pcm, channels) = decode_ogg(&path);
+        let reference = ffmpeg_decode(&path, channels).expect("libopus");
+        let n = (reference.len() / channels).min(pcm.len() / channels);
+        let mut worst = 1.0f64;
+        for c in 0..channels {
+            let a: Vec<f32> = (0..n).map(|i| pcm[i * channels + c]).collect();
+            let b: Vec<f32> = (0..n).map(|i| reference[i * channels + c]).collect();
+            let corr = correlation(&a, &b);
+            worst = worst.min(corr);
+            println!("{f}: channel {c} correlation {corr:.5}");
+        }
+        // Speed on the same file.
+        let data = fs::read(&path).unwrap();
+        let packets = ogg_packets(&data);
+        let head = parse_opus_head(&packets[0]);
+        let audio: Vec<&Vec<u8>> = packets.iter().skip(2).filter(|p| !p.is_empty()).collect();
+        let mut dec =
+            MultistreamDecoder::with_rate(48000, head.streams, head.coupled, &head.mapping);
+        let mut out = vec![0.0f32; 5760 * channels];
+        let mut samples = 0usize;
+        for p in &audio {
+            samples += dec.decode_float(p, &mut out).unwrap();
+        }
+        dec.reset();
+        let start = std::time::Instant::now();
+        for p in &audio {
+            dec.decode_float(p, &mut out).unwrap();
+        }
+        let elapsed = start.elapsed().as_secs_f64();
+        println!(
+            "{f}: {channels} ch, {:.1} s audio, {:.0}x realtime, worst channel {worst:.5}",
+            samples as f64 / 48000.0,
+            samples as f64 / 48000.0 / elapsed
+        );
+    }
+}

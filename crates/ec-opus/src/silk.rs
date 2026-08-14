@@ -159,7 +159,6 @@ fn sqrt_approx(x: i32) -> i32 {
     smlawb(y, y, smulbb(213, frac))
 }
 
-
 fn log2lin(log_q7: i32) -> i32 {
     if log_q7 < 0 {
         return 0;
@@ -393,6 +392,8 @@ pub struct SilkDecoder {
     channels_api: usize,
     api_rate: u32,
     prev_decode_only_middle: bool,
+    /// Resampler output for one channel, allocated once.
+    resample_tmp: Vec<i16>,
 }
 
 impl SilkDecoder {
@@ -405,6 +406,7 @@ impl SilkDecoder {
             channels_api,
             api_rate,
             prev_decode_only_middle: false,
+            resample_tmp: vec![0; 5760],
         }
     }
 
@@ -582,7 +584,9 @@ impl SilkDecoder {
         self.prev_decode_only_middle = decode_only_middle;
 
         let out_len = n_samples_dec * self.api_rate as usize / (self.channels[0].fs_khz * 1000);
-        let mut tmp = vec![0i16; out_len];
+        let mut tmp = core::mem::take(&mut self.resample_tmp);
+        tmp.clear();
+        tmp.resize(out_len, 0);
         let chans = self.channels_api.min(channels_internal);
         for n in 0..chans {
             let src: &[i16] = if n == 0 { &mid[1..] } else { &side[1..] };
@@ -596,6 +600,7 @@ impl SilkDecoder {
                 out[..out_len].copy_from_slice(&tmp[..out_len]);
             }
         }
+        self.resample_tmp = tmp;
         // A mono stream fed to a stereo output is duplicated.
         if self.channels_api == 2 && channels_internal == 1 {
             for i in 0..out_len {
@@ -1476,6 +1481,8 @@ struct Resampler {
     /// FIR history.
     s_fir: [i16; 8],
     delay_buf: DelayBuf,
+    /// Upsampler scratch, allocated once.
+    fir_buf: Vec<i16>,
     /// Down-sampling coefficients, when the output rate is the lower one.
     down: Option<DownFir>,
 }
@@ -1572,24 +1579,21 @@ impl Resampler {
         let mut head = [0i16; 48];
         head[..self.input_delay].copy_from_slice(&self.delay_buf[..self.input_delay]);
         head[self.input_delay..self.fs_in_khz].copy_from_slice(&input[..n_first]);
-        let head = &head[..self.fs_in_khz];
+        let n_head = self.fs_in_khz;
         let rest = &input[n_first..n_first + (in_len - self.fs_in_khz)];
         let split = self.fs_out_khz;
         let rest_out = (in_len - self.fs_in_khz) * self.fs_out_khz / self.fs_in_khz;
         if self.fs_in_khz == self.fs_out_khz {
-            out[..self.fs_in_khz].copy_from_slice(head);
+            out[..n_head].copy_from_slice(&head[..n_head]);
             out[split..split + rest_out].copy_from_slice(rest);
         } else if self.down.is_some() {
-            let head = head.to_vec();
-            self.down_fir(&mut out[..split], &head);
+            self.down_fir(&mut out[..split], &head[..n_head]);
             self.down_fir(&mut out[split..split + rest_out], rest);
         } else if self.fs_out_khz == 2 * self.fs_in_khz {
-            let head = head.to_vec();
-            self.up2_hq(&mut out[..split], &head);
+            self.up2_hq(&mut out[..split], &head[..n_head]);
             self.up2_hq(&mut out[split..split + rest_out], rest);
         } else {
-            let head = head.to_vec();
-            self.iir_fir(&mut out[..split], &head);
+            self.iir_fir(&mut out[..split], &head[..n_head]);
             self.iir_fir(&mut out[split..split + rest_out], rest);
         }
         self.delay_buf[..self.input_delay]
@@ -1634,7 +1638,9 @@ impl Resampler {
     fn iir_fir(&mut self, out: &mut [i16], input: &[i16]) {
         let mut written = 0usize;
         let mut pos = 0usize;
-        let mut buf = vec![0i16; 2 * self.batch_size + 8];
+        let mut buf = core::mem::take(&mut self.fir_buf);
+        buf.clear();
+        buf.resize(2 * self.batch_size + 8, 0);
         buf[..8].copy_from_slice(&self.s_fir);
         let mut n_samples_in = 0;
         while pos < input.len() {
@@ -1697,6 +1703,7 @@ impl Resampler {
         }
         self.s_fir
             .copy_from_slice(&buf[2 * n_samples_in..2 * n_samples_in + 8]);
+        self.fir_buf = buf;
     }
 
     /// `silk_resampler_private_down_FIR`, for output rates below the internal

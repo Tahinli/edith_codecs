@@ -306,9 +306,6 @@ struct Fft15 {
     /// `exp(2 pi i * k1 * n2 / n)` twiddles, split.
     tw_re: Vec<f32>,
     tw_im: Vec<f32>,
-    /// 15-point DFT twiddles.
-    w15_re: [f32; 15],
-    w15_im: [f32; 15],
     scratch_re: Vec<f32>,
     scratch_im: Vec<f32>,
 }
@@ -326,20 +323,11 @@ impl Fft15 {
                 tw_im[k1 * l + n2] = a.sin() as f32;
             }
         }
-        let mut w15_re = [0.0f32; 15];
-        let mut w15_im = [0.0f32; 15];
-        for (j, (re, im)) in w15_re.iter_mut().zip(w15_im.iter_mut()).enumerate() {
-            let a = 2.0 * core::f64::consts::PI * j as f64 / 15.0;
-            *re = a.cos() as f32;
-            *im = a.sin() as f32;
-        }
         Fft15 {
             n,
             sub: Fft::new(l),
             tw_re,
             tw_im,
-            w15_re,
-            w15_im,
             scratch_re: vec![0.0; n],
             scratch_im: vec![0.0; n],
         }
@@ -350,7 +338,7 @@ impl Fft15 {
         let n = self.n;
         let l = n / 15;
         debug_assert_eq!(re.len(), n);
-        // Stage 1: 15-point DFTs over n1, input stride L.
+        // Stage 1: 15-point DFTs over n1 at stride L, twiddled on the way out.
         for n2 in 0..l {
             let mut xr = [0.0f32; 15];
             let mut xi = [0.0f32; 15];
@@ -358,21 +346,14 @@ impl Fft15 {
                 xr[n1] = re[l * n1 + n2];
                 xi[n1] = im[l * n1 + n2];
             }
+            let (yr, yi) = dft15(&xr, &xi);
             for k1 in 0..15 {
-                let (mut sr, mut si) = (0.0f32, 0.0f32);
-                for n1 in 0..15 {
-                    let w = (k1 * n1) % 15;
-                    let (wr, wi) = (self.w15_re[w], self.w15_im[w]);
-                    sr += xr[n1] * wr - xi[n1] * wi;
-                    si += xr[n1] * wi + xi[n1] * wr;
-                }
-                // Stage 2 twiddle, folded in here to avoid another pass.
                 let (tr, ti) = (self.tw_re[k1 * l + n2], self.tw_im[k1 * l + n2]);
-                self.scratch_re[k1 * l + n2] = sr * tr - si * ti;
-                self.scratch_im[k1 * l + n2] = sr * ti + si * tr;
+                self.scratch_re[k1 * l + n2] = yr[k1] * tr - yi[k1] * ti;
+                self.scratch_im[k1 * l + n2] = yr[k1] * ti + yi[k1] * tr;
             }
         }
-        // Stage 3: L-point transforms, one per k1, written out at stride 15.
+        // Stage 2: L-point transforms, one per k1, written out at stride 15.
         for k1 in 0..15 {
             let rr = &mut self.scratch_re[k1 * l..(k1 + 1) * l];
             let ii = &mut self.scratch_im[k1 * l..(k1 + 1) * l];
@@ -385,6 +366,88 @@ impl Fft15 {
             }
         }
     }
+}
+
+/// A 15-point DFT as 5 radix-3 stages then 3 radix-5 stages (Cooley-Tukey on
+/// 15 = 3*5), which costs about a third of the direct evaluation.
+#[inline]
+fn dft15(xr: &[f32; 15], xi: &[f32; 15]) -> ([f32; 15], [f32; 15]) {
+    // exp(+2 pi i / 3) and the two fifth-root cosines/sines.
+    const C3: f32 = -0.5;
+    const S3: f32 = 0.866_025_4;
+    const C5_1: f32 = 0.309_017;
+    const S5_1: f32 = 0.951_056_5;
+    const C5_2: f32 = -0.809_017;
+    const S5_2: f32 = 0.587_785_25;
+    // exp(+2 pi i * (n2*k1) / 15) for n2 in 0..5, k1 in 0..3.
+    const TW_RE: [[f32; 3]; 5] = [
+        [1.0, 1.0, 1.0],
+        [1.0, 0.913_545_5, 0.669_130_6],
+        [1.0, 0.669_130_6, -0.104_528_46],
+        [1.0, 0.309_017, -0.809_017],
+        [1.0, -0.104_528_46, -0.978_147_6],
+    ];
+    const TW_IM: [[f32; 3]; 5] = [
+        [0.0, 0.0, 0.0],
+        [0.0, 0.406_736_65, 0.743_144_8],
+        [0.0, 0.743_144_8, 0.994_521_9],
+        [0.0, 0.951_056_5, 0.587_785_25],
+        [0.0, 0.994_521_9, -0.207_911_69],
+    ];
+    // Radix-3 over n1 (stride 5), one per n2.
+    let mut ar = [[0.0f32; 3]; 5];
+    let mut ai = [[0.0f32; 3]; 5];
+    for n2 in 0..5 {
+        let (r0, i0) = (xr[n2], xi[n2]);
+        let (r1, i1) = (xr[5 + n2], xi[5 + n2]);
+        let (r2, i2) = (xr[10 + n2], xi[10 + n2]);
+        let (sr, si) = (r1 + r2, i1 + i2);
+        let (dr, di) = (r1 - r2, i1 - i2);
+        ar[n2][0] = r0 + sr;
+        ai[n2][0] = i0 + si;
+        let (tr, ti) = (r0 + C3 * sr, i0 + C3 * si);
+        // Multiplying (dr, di) by i gives (-di, dr).
+        ar[n2][1] = tr - S3 * di;
+        ai[n2][1] = ti + S3 * dr;
+        ar[n2][2] = tr + S3 * di;
+        ai[n2][2] = ti - S3 * dr;
+        // Twiddle by exp(+2 pi i n2 k1 / 15).
+        for k1 in 1..3 {
+            let (tr, ti) = (TW_RE[n2][k1], TW_IM[n2][k1]);
+            let (r, i) = (ar[n2][k1], ai[n2][k1]);
+            ar[n2][k1] = r * tr - i * ti;
+            ai[n2][k1] = r * ti + i * tr;
+        }
+    }
+    // Radix-5 over n2, one per k1; output index is k1 + 3*k2.
+    let mut yr = [0.0f32; 15];
+    let mut yi = [0.0f32; 15];
+    for k1 in 0..3 {
+        let (r0, i0) = (ar[0][k1], ai[0][k1]);
+        let (r1, i1) = (ar[1][k1], ai[1][k1]);
+        let (r2, i2) = (ar[2][k1], ai[2][k1]);
+        let (r3, i3) = (ar[3][k1], ai[3][k1]);
+        let (r4, i4) = (ar[4][k1], ai[4][k1]);
+        let (s1r, s1i) = (r1 + r4, i1 + i4);
+        let (d1r, d1i) = (r1 - r4, i1 - i4);
+        let (s2r, s2i) = (r2 + r3, i2 + i3);
+        let (d2r, d2i) = (r2 - r3, i2 - i3);
+        yr[k1] = r0 + s1r + s2r;
+        yi[k1] = i0 + s1i + s2i;
+        let (m1r, m1i) = (r0 + C5_1 * s1r + C5_2 * s2r, i0 + C5_1 * s1i + C5_2 * s2i);
+        let (n1r, n1i) = (S5_1 * d1r + S5_2 * d2r, S5_1 * d1i + S5_2 * d2i);
+        let (m2r, m2i) = (r0 + C5_2 * s1r + C5_1 * s2r, i0 + C5_2 * s1i + C5_1 * s2i);
+        let (n2r, n2i) = (S5_2 * d1r - S5_1 * d2r, S5_2 * d1i - S5_1 * d2i);
+        yr[k1 + 3] = m1r - n1i;
+        yi[k1 + 3] = m1i + n1r;
+        yr[k1 + 12] = m1r + n1i;
+        yi[k1 + 12] = m1i - n1r;
+        yr[k1 + 6] = m2r - n2i;
+        yi[k1 + 6] = m2i + n2r;
+        yr[k1 + 9] = m2r + n2i;
+        yi[k1 + 9] = m2i - n2r;
+    }
+    (yr, yi)
 }
 
 /// One inverse-MDCT plan: spectrum length `l = 15 * 2^k`, window `2*l`.
@@ -654,6 +717,7 @@ pub struct CeltDecoder {
     freq: Vec<f32>,
     norm: Vec<f32>,
     lowband_scratch: Vec<f32>,
+    hadamard_tmp: Vec<f32>,
     band_e: Vec<f32>,
     pulses: [i32; NB_BANDS],
     fine_quant: [i32; NB_BANDS],
@@ -695,6 +759,7 @@ impl CeltDecoder {
             freq: vec![0.0; 2 * max_n],
             norm: vec![0.0; 2 * max_n],
             lowband_scratch: vec![0.0; max_n],
+            hadamard_tmp: vec![0.0; max_n],
             band_e: vec![0.0; 2 * NB_BANDS],
             pulses: [0; NB_BANDS],
             fine_quant: [0; NB_BANDS],
@@ -1711,17 +1776,23 @@ impl CeltDecoder {
             if b0 > 1 {
                 deinterleave_hadamard(
                     &mut self.x[x..x + n],
+                    &mut self.hadamard_tmp,
                     n_b >> recombine,
                     b0 << recombine,
                     long_blocks,
                 );
-                if let Some(l) = self.lowband_mut(lowband) {
-                    deinterleave_hadamard(
-                        &mut l[..n],
-                        n_b >> recombine,
-                        b0 << recombine,
-                        long_blocks,
-                    );
+                if lowband != Lowband::None {
+                    let mut tmp = core::mem::take(&mut self.hadamard_tmp);
+                    if let Some(l) = self.lowband_mut(lowband) {
+                        deinterleave_hadamard(
+                            &mut l[..n],
+                            tmp.as_mut_slice(),
+                            n_b >> recombine,
+                            b0 << recombine,
+                            long_blocks,
+                        );
+                    }
+                    self.hadamard_tmp = tmp;
                 }
             }
         }
@@ -2026,6 +2097,7 @@ impl CeltDecoder {
             if b0 > 1 {
                 interleave_hadamard(
                     &mut self.x[x..x + n0],
+                    &mut self.hadamard_tmp,
                     n_b >> recombine,
                     b0 << recombine,
                     long_blocks,
@@ -2403,9 +2475,9 @@ fn haar1(x: &mut [f32], n0: usize, stride: usize) {
     }
 }
 
-fn deinterleave_hadamard(x: &mut [f32], n0: usize, stride: usize, hadamard: bool) {
+fn deinterleave_hadamard(x: &mut [f32], tmp: &mut [f32], n0: usize, stride: usize, hadamard: bool) {
     let n = n0 * stride;
-    let mut tmp = vec![0.0f32; n];
+    let tmp = &mut tmp[..n];
     if hadamard {
         let order = &ORDERY[stride - 2..];
         for i in 0..stride {
@@ -2420,12 +2492,12 @@ fn deinterleave_hadamard(x: &mut [f32], n0: usize, stride: usize, hadamard: bool
             }
         }
     }
-    x[..n].copy_from_slice(&tmp);
+    x[..n].copy_from_slice(tmp);
 }
 
-fn interleave_hadamard(x: &mut [f32], n0: usize, stride: usize, hadamard: bool) {
+fn interleave_hadamard(x: &mut [f32], tmp: &mut [f32], n0: usize, stride: usize, hadamard: bool) {
     let n = n0 * stride;
-    let mut tmp = vec![0.0f32; n];
+    let tmp = &mut tmp[..n];
     if hadamard {
         let order = &ORDERY[stride - 2..];
         for i in 0..stride {
@@ -2440,7 +2512,7 @@ fn interleave_hadamard(x: &mut [f32], n0: usize, stride: usize, hadamard: bool) 
             }
         }
     }
-    x[..n].copy_from_slice(&tmp);
+    x[..n].copy_from_slice(tmp);
 }
 
 /// Scales a vector to `gain` in the L2 sense.
