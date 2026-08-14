@@ -1169,8 +1169,9 @@ fn decode_macroblock(
         r,
         ctx,
         mb_addr,
-        &intra_nbr,
+        &nbr,
         MbFinish {
+            pred_nbr: intra_nbr,
             is_i16,
             i16_mode,
             cbp_luma,
@@ -1185,6 +1186,12 @@ fn decode_macroblock(
 
 /// Everything the shared residual path needs after prediction is decided.
 struct MbFinish {
+    /// Neighbour availability for *prediction*, which honours
+    /// constrained_intra_pred_flag. The residual contexts use the plain
+    /// availability instead — clause 9.2.1 and 9.3.3.1.1.9 only exclude an
+    /// inter neighbour there when slice data partitioning is in use, and this
+    /// decoder refuses partitioned slices outright.
+    pred_nbr: MbNeighbors,
     is_i16: bool,
     i16_mode: u8,
     cbp_luma: u8,
@@ -1255,7 +1262,7 @@ fn finish_macroblock(
             stride: pic.y.stride,
             origin: pic.y.origin + (mb_y * 16) * pic.y.stride + mb_x * 16,
         };
-        pred_16x16(m.i16_mode, &mut w, nbr.b, nbr.a);
+        pred_16x16(m.i16_mode, &mut w, m.pred_nbr.b, m.pred_nbr.a);
         // Luma DC: un-zigzag over the 4x4 DC array, Hadamard + scale.
         let (na, nb) = luma_nz_pair(pic, nbr, bx0, by0);
         let dc_tc = r.residual_block(&mut scan, BlockCat::LumaDc, na, nb)?;
@@ -1305,7 +1312,7 @@ fn finish_macroblock(
             let origin = pic.y.at(x, y);
             let stride = pic.y.stride;
             if m.intra {
-                let n = gather_nbr4(pic, nbr, blk, x, y);
+                let n = gather_nbr4(pic, &m.pred_nbr, blk, x, y);
                 let mut p = [0u8; 16];
                 pred_4x4(m.modes[blk], &n, &mut p);
                 if tc == 0 {
@@ -1348,7 +1355,7 @@ fn finish_macroblock(
                 stride: plane.stride,
                 origin: plane.origin + (mb_y * 8) * plane.stride + mb_x * 8,
             };
-            pred_chroma_8x8(m.chroma_mode, &mut w, nbr.b, nbr.a);
+            pred_chroma_8x8(m.chroma_mode, &mut w, m.pred_nbr.b, m.pred_nbr.a);
         }
     }
     let mut chroma_dc = [[0i32; 4]; 2];
@@ -1674,6 +1681,7 @@ fn decode_inter_mb(
         mb_addr,
         &nbr,
         MbFinish {
+            pred_nbr: nbr,
             is_i16: false,
             i16_mode: 0,
             cbp_luma,
