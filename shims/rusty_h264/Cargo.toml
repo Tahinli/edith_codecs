@@ -1,0 +1,12 @@
+[package]
+name = "rusty_h264"
+description = "Compatibility shim: the rusty_h264 0.9.1 surface edith consumes, served by ec-h264."
+version = "0.9.1"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Ahmet Kaan Gümüş"]
+publish = false
+
+[dependencies]
+ec-h264 = { workspace = true }
+ec-h264-syntax = { workspace = true }
