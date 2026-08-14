@@ -98,11 +98,22 @@ fn load8(data: &[u8], at: usize) -> i16x8 {
     i16x8::from(a)
 }
 
-/// The 6-tap half-sample filter of Equations 8-241/8-242 over sixteen
-/// neighbouring positions at once, the taps spaced `step` apart.
+/// The same 6-tap filter over eight neighbouring positions.
 ///
-/// The unrounded result of Equation 8-241 spans -2550..10710, so 16-bit lanes
-/// hold it exactly and one row of a partition is one vector.
+/// Eight lanes is one SSE2 register, which is the widest vector this crate can
+/// assume without a target feature it is not allowed to require. A partition
+/// narrower than sixteen samples therefore costs half or a quarter as much
+/// here as it does in the sixteen-lane form, where the surplus lanes are
+/// computed and then discarded.
+#[inline]
+fn tap6_8(data: &[u8], at: usize, step: usize) -> i16x8 {
+    let l = |k: isize| load8(data, (at as isize + k * step as isize) as usize);
+    let five = i16x8::splat(5);
+    let twenty = i16x8::splat(20);
+    l(-2) - five * l(-1) + twenty * l(0) + twenty * l(1) - five * l(2) + l(3)
+}
+
+/// The same filter over sixteen positions, for a full-width partition.
 #[inline]
 fn tap6_16(data: &[u8], at: usize, step: usize) -> i16x16 {
     let l = |k: isize| load16(data, (at as isize + k * step as isize) as usize);
@@ -113,12 +124,57 @@ fn tap6_16(data: &[u8], at: usize, step: usize) -> i16x16 {
 
 /// `Clip1Y( ( v + 16 ) >> 5 )` over a row, storing the first `dst.len()` lanes.
 #[inline]
-fn store_half(dst: &mut [u8], v: i16x16) {
+fn store_half8(dst: &mut [u8], v: i16x8) {
+    let c = ((v + i16x8::splat(16)) >> 5u32)
+        .max(i16x8::ZERO)
+        .min(i16x8::splat(255));
+    for (o, &s) in dst.iter_mut().zip(c.as_array()) {
+        *o = s as u8;
+    }
+}
+
+/// The same over sixteen lanes.
+#[inline]
+fn store_half16(dst: &mut [u8], v: i16x16) {
     let c = ((v + i16x16::splat(16)) >> 5u32)
         .max(i16x16::ZERO)
         .min(i16x16::splat(255));
     for (o, &s) in dst.iter_mut().zip(c.as_array()) {
         *o = s as u8;
+    }
+}
+
+/// One 6-tap half-sample pass over a `w` x `h` block whose top-left sample is
+/// `base`, into a `w`-pitch buffer. `step` is the tap spacing: 1 for the
+/// horizontal filter, the plane stride for the vertical one.
+///
+/// A partition is 16, 8 or 4 samples wide, so the narrow widths take a single
+/// eight-lane vector rather than a sixteen-lane one whose upper half is
+/// discarded.
+#[inline]
+fn half_block(
+    dst: &mut [u8],
+    data: &[u8],
+    base: usize,
+    stride: usize,
+    step: usize,
+    w: usize,
+    h: usize,
+) {
+    if w == 16 {
+        for row in 0..h {
+            store_half16(
+                &mut dst[row * 16..row * 16 + 16],
+                tap6_16(data, base + row * stride, step),
+            );
+        }
+    } else {
+        for row in 0..h {
+            store_half8(
+                &mut dst[row * w..row * w + w],
+                tap6_8(data, base + row * stride, step),
+            );
+        }
     }
 }
 
@@ -170,6 +226,33 @@ fn avg_rows(out: &mut [u8], a: &[u8], b: &[u8], n: usize) {
     }
 }
 
+/// The same average, written into a destination of pitch `os` from two
+/// `w`-pitch sources.
+#[inline]
+fn avg_rows_to(out: &mut [u8], os: usize, a: &[u8], b: &[u8], w: usize, h: usize) {
+    if os == w {
+        avg_rows(out, a, b, w * h);
+        return;
+    }
+    for row in 0..h {
+        avg_rows(
+            &mut out[row * os..row * os + w],
+            &a[row * w..],
+            &b[row * w..],
+            w,
+        );
+    }
+}
+
+/// Copy `w` x `h` samples from a `w`-pitch source into an `os`-pitch
+/// destination.
+#[inline]
+fn copy_rows(out: &mut [u8], os: usize, src: &[u8], w: usize, h: usize) {
+    for row in 0..h {
+        out[row * os..row * os + w].copy_from_slice(&src[row * w..row * w + w]);
+    }
+}
+
 #[inline]
 fn clip8(v: i32) -> u8 {
     v.clamp(0, 255) as u8
@@ -184,9 +267,27 @@ fn avg(a: u8, b: u8) -> u8 {
 /// plus the five taps of the horizontal filter.
 const TMP_W: usize = 16 + 5;
 
+/// Index of the top-left sample of a whole-sample block, clamped exactly as
+/// [`mc_luma`] clamps it.
+///
+/// A motion search spends most of its time on whole-sample positions, where
+/// prediction is a copy; this lets it read the reference plane in place
+/// instead of copying every candidate into a buffer first.
+#[inline]
+pub(crate) fn integer_origin(r: &RefPlane<'_>, x: i32, y: i32, w: usize, h: usize) -> usize {
+    let xi = clamp_origin(x, w, r.width, r.pad, 2, 3);
+    let yi = clamp_origin(y, h, r.height, r.pad, 2, 3);
+    r.at(xi, yi)
+}
+
 /// Luma quarter-sample interpolation (8.4.2.2.1) of a `w` x `h` partition whose
 /// full-sample origin is `(x, y)` and whose motion vector is `mv` in quarter
-/// samples. Writes `w` x `h` prediction samples into `out` at pitch `w`.
+/// samples. Writes `w` x `h` prediction samples into `out` at pitch `os`.
+///
+/// The pitch is a parameter so that the single-list, default-weight case —
+/// which is most of a P slice — interpolates straight into the picture instead
+/// of into a temporary that is then copied there.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn mc_luma(
     r: &RefPlane<'_>,
     x: i32,
@@ -194,6 +295,7 @@ pub(crate) fn mc_luma(
     mv: [i16; 2],
     w: usize,
     h: usize,
+    os: usize,
     out: &mut [u8],
 ) {
     let (fx, fy) = ((mv[0] & 3) as usize, (mv[1] & 3) as usize);
@@ -206,7 +308,7 @@ pub(crate) fn mc_luma(
     if fx == 0 && fy == 0 {
         for row in 0..h {
             let src = base + row * stride;
-            out[row * w..row * w + w].copy_from_slice(&r.data[src..src + w]);
+            out[row * os..row * os + w].copy_from_slice(&r.data[src..src + w]);
         }
         return;
     }
@@ -221,19 +323,13 @@ pub(crate) fn mc_luma(
     if need_b {
         // "s" is the same filter one row down, so row fy>>1 selects b or s.
         let row0 = yi + if fy == 3 { 1 } else { 0 };
-        for row in 0..h {
-            let src = r.at(xi, row0 + row as i32);
-            store_half(&mut bb[row * w..row * w + w], tap6_16(r.data, src, 1));
-        }
+        half_block(&mut bb, r.data, r.at(xi, row0), stride, 1, w, h);
     }
     let mut hh = [0u8; 16 * 17];
     if need_h {
         // "m" is the same filter one column right, so column fx>>1 selects h or m.
         let col0 = xi + if fx == 3 { 1 } else { 0 };
-        for row in 0..h {
-            let src = r.at(col0, yi + row as i32);
-            store_half(&mut hh[row * w..row * w + w], tap6_16(r.data, src, stride));
-        }
+        half_block(&mut hh, r.data, r.at(col0, yi), stride, stride, w, h);
     }
     let mut jj = [0u8; 16 * 16];
     if need_j {
@@ -243,10 +339,15 @@ pub(crate) fn mc_luma(
         let mut inter = [0i16; TMP_W * (16 + 5)];
         for row in 0..h + 5 {
             let src = r.at(xi, yi + row as i32 - 2);
-            let v = tap6_16(r.data, src, 1);
             let base = row * TMP_W;
-            for (o, &t) in inter[base..base + w].iter_mut().zip(v.as_array()) {
-                *o = t;
+            if w == 16 {
+                let v = tap6_16(r.data, src, 1);
+                inter[base..base + 16].copy_from_slice(v.as_array());
+            } else {
+                let v = tap6_8(r.data, src, 1);
+                for (o, &t) in inter[base..base + w].iter_mut().zip(v.as_array()) {
+                    *o = t;
+                }
             }
         }
         for row in 0..h {
@@ -261,13 +362,12 @@ pub(crate) fn mc_luma(
     // Table 8-12: each quarter position is one of the half-sample arrays, or
     // the average of two of them. Resolving it once per partition rather than
     // once per sample is what keeps the copy loops straight.
-    let n = w * h;
     match (fx, fy) {
-        (2, 0) => out[..n].copy_from_slice(&bb[..n]),
-        (0, 2) => out[..n].copy_from_slice(&hh[..n]),
-        (2, 2) => out[..n].copy_from_slice(&jj[..n]),
-        (2, 1) | (2, 3) => avg_rows(out, &bb, &jj, n),
-        (1, 2) | (3, 2) => avg_rows(out, &hh, &jj, n),
+        (2, 0) => copy_rows(out, os, &bb, w, h),
+        (0, 2) => copy_rows(out, os, &hh, w, h),
+        (2, 2) => copy_rows(out, os, &jj, w, h),
+        (2, 1) | (2, 3) => avg_rows_to(out, os, &bb, &jj, w, h),
+        (1, 2) | (3, 2) => avg_rows_to(out, os, &hh, &jj, w, h),
         (1, 0) | (3, 0) | (0, 1) | (0, 3) => {
             // Averaged with an integer sample one row or column over.
             let (dx, dy) = match (fx, fy) {
@@ -278,17 +378,54 @@ pub(crate) fn mc_luma(
             let half: &[u8] = if fy == 0 { &bb } else { &hh };
             for row in 0..h {
                 let src = base + (row + dy) * stride + dx;
+                let s = &r.data[src..src + w];
+                let hl = &half[row * w..row * w + w];
+                let dst = &mut out[row * os..row * os + w];
                 for col in 0..w {
-                    out[row * w + col] = avg(r.data[src + col], half[row * w + col]);
+                    dst[col] = avg(s[col], hl[col]);
                 }
             }
         }
         // Diagonal quarter positions: the two nearest half samples.
-        _ => avg_rows(out, &bb, &hh, n),
+        _ => avg_rows_to(out, os, &bb, &hh, w, h),
+    }
+}
+
+/// Equation 8-270 over a block of statically known width.
+///
+/// The width is a const parameter because a chroma block is 2, 4 or 8 samples
+/// wide and the 2x2 case dominates real streams: with `W` known the row slices
+/// have constant length, which drops the bounds checks and lets the smallest
+/// blocks compile to a handful of scalar multiplies instead of a vector setup
+/// whose lanes are then thrown away.
+#[inline]
+fn chroma_rows<const W: usize>(
+    data: &[u8],
+    base: usize,
+    stride: usize,
+    h: usize,
+    wt: [u16; 4],
+    os: usize,
+    out: &mut [u8],
+) {
+    for row in 0..h {
+        let src = base + row * stride;
+        let p = &data[src..src + W + 1];
+        let q = &data[src + stride..src + stride + W + 1];
+        let dst = &mut out[row * os..row * os + W];
+        for c in 0..W {
+            let v = u16::from(p[c]) * wt[0]
+                + u16::from(p[c + 1]) * wt[1]
+                + u16::from(q[c]) * wt[2]
+                + u16::from(q[c + 1]) * wt[3]
+                + 32;
+            dst[c] = (v >> 6) as u8;
+        }
     }
 }
 
 /// Chroma eighth-sample interpolation (Equation 8-270) of a `w` x `h` block.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn mc_chroma(
     r: &RefPlane<'_>,
     x: i32,
@@ -296,32 +433,32 @@ pub(crate) fn mc_chroma(
     mv: [i16; 2],
     w: usize,
     h: usize,
+    os: usize,
     out: &mut [u8],
 ) {
-    let (fx, fy) = ((mv[0] & 7) as i16, (mv[1] & 7) as i16);
+    let (fx, fy) = ((mv[0] & 7) as u16, (mv[1] & 7) as u16);
     let xi = clamp_origin(x + (mv[0] as i32 >> 3), w, r.width, r.pad, 0, 1);
     let yi = clamp_origin(y + (mv[1] as i32 >> 3), h, r.height, r.pad, 0, 1);
     let stride = r.stride;
     let base = r.at(xi, yi);
-    // The four weights sum to 64, so the weighted sum of Equation 8-270 never
-    // exceeds 64 * 255 and the whole bilinear fits in 16-bit lanes. A chroma
-    // block is at most eight samples wide, which is one vector per row.
-    let wa = i16x8::splat((8 - fx) * (8 - fy));
-    let wb = i16x8::splat(fx * (8 - fy));
-    let wc = i16x8::splat((8 - fx) * fy);
-    let wd = i16x8::splat(fx * fy);
-    let round = i16x8::splat(32);
-    for row in 0..h {
-        let src = base + row * stride;
-        let v = (load8(r.data, src) * wa
-            + load8(r.data, src + 1) * wb
-            + load8(r.data, src + stride) * wc
-            + load8(r.data, src + stride + 1) * wd
-            + round)
-            >> 6u32;
-        for (o, &s) in out[row * w..row * w + w].iter_mut().zip(v.as_array()) {
-            *o = s as u8;
+
+    // Full sample: a straight copy. A zero motion vector is the most common
+    // vector in real content, and it lands here.
+    if fx == 0 && fy == 0 {
+        for row in 0..h {
+            let src = base + row * stride;
+            out[row * os..row * os + w].copy_from_slice(&r.data[src..src + w]);
         }
+        return;
+    }
+
+    // The four weights sum to 64, so the weighted sum of Equation 8-270 never
+    // exceeds 64 * 255 and the whole bilinear fits in 16-bit lanes.
+    let wt = [(8 - fx) * (8 - fy), fx * (8 - fy), (8 - fx) * fy, fx * fy];
+    match w {
+        2 => chroma_rows::<2>(r.data, base, stride, h, wt, os, out),
+        4 => chroma_rows::<4>(r.data, base, stride, h, wt, os, out),
+        _ => chroma_rows::<8>(r.data, base, stride, h, wt, os, out),
     }
 }
 
@@ -345,7 +482,9 @@ impl Weights {
         o: [0, 0],
     };
 
-    fn is_default(&self) -> bool {
+    /// True when 8.4.2.3.1 applies, so a single-list prediction is its own
+    /// final prediction and needs no combining pass at all.
+    pub(crate) fn is_default(&self) -> bool {
         *self == Weights::DEFAULT
     }
 }
@@ -353,6 +492,11 @@ impl Weights {
 /// Combine the list predictions of one partition into the final prediction
 /// (spec 8.4.2.3). `p0`/`p1` hold `n` samples each; the entry for a list that
 /// is not used is ignored.
+///
+/// The result is contiguous rather than written at the picture's pitch: the
+/// bi-predictive average is the one case where the samples of several rows are
+/// adjacent, and vectors that span the row boundary measured 6 to 9 per cent
+/// fewer instructions on 1080p than a per-row average at picture pitch.
 pub(crate) fn combine(
     out: &mut [u8],
     p0: &[u8],
@@ -534,7 +678,7 @@ mod tests {
                 for fx in 0..4i16 {
                     for &(pw, ph) in &[(16usize, 16usize), (8, 4), (4, 8), (4, 4)] {
                         let mv = [fx - 20 * 4, fy + 12];
-                        mc_luma(&r, px, py, mv, pw, ph, &mut ours);
+                        mc_luma(&r, px, py, mv, pw, ph, pw, &mut ours);
                         spec_luma(&data, stride, origin, w, h, px, py, mv, pw, ph, &mut theirs);
                         assert_eq!(
                             ours[..pw * ph],
@@ -557,7 +701,7 @@ mod tests {
             for fy in 0..8i16 {
                 for fx in 0..8i16 {
                     let mv = [fx, fy];
-                    mc_chroma(&r, px, py, mv, 8, 8, &mut ours);
+                    mc_chroma(&r, px, py, mv, 8, 8, 8, &mut ours);
                     for row in 0..8i32 {
                         for col in 0..8i32 {
                             let s = |dx: i32, dy: i32| -> i32 {

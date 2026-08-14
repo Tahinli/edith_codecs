@@ -886,14 +886,14 @@ impl SliceCtx {
 /// filter of 8.3.2.2.1, which changes its end taps when the corner sample is
 /// missing.
 #[derive(Clone, Copy)]
-struct MbNeighbors {
-    a: bool,
-    b: bool,
-    c: bool,
-    d: bool,
+pub(crate) struct MbNeighbors {
+    pub a: bool,
+    pub b: bool,
+    pub c: bool,
+    pub d: bool,
 }
 
-fn mb_neighbors(pic: &Picture, mb_x: usize, mb_y: usize, slice_id: u16) -> MbNeighbors {
+pub(crate) fn mb_neighbors(pic: &Picture, mb_x: usize, mb_y: usize, slice_id: u16) -> MbNeighbors {
     let w = pic.mb_w;
     let addr = mb_y * w + mb_x;
     let same = |a: usize| pic.mb_slice[a] == slice_id;
@@ -923,7 +923,12 @@ fn intra_neighbors(pic: &Picture, mb_x: usize, mb_y: usize, n: MbNeighbors) -> M
 /// global block coords `(bx, by)`, `None` when that neighbour is unavailable
 /// (clause 6.4.11.4 plus the availability rules of 6.4.8).
 #[inline]
-fn luma_nz_pair(pic: &Picture, n: &MbNeighbors, bx: usize, by: usize) -> (Option<u8>, Option<u8>) {
+pub(crate) fn luma_nz_pair(
+    pic: &Picture,
+    n: &MbNeighbors,
+    bx: usize,
+    by: usize,
+) -> (Option<u8>, Option<u8>) {
     let w4 = pic.mb_w * 4;
     let left_avail = if bx.is_multiple_of(4) { n.a } else { true };
     let top_avail = if by.is_multiple_of(4) { n.b } else { true };
@@ -935,7 +940,7 @@ fn luma_nz_pair(pic: &Picture, n: &MbNeighbors, bx: usize, by: usize) -> (Option
 
 /// The same for a chroma AC 4x4 block at global chroma block coords.
 #[inline]
-fn chroma_nz_pair(
+pub(crate) fn chroma_nz_pair(
     pic: &Picture,
     n: &MbNeighbors,
     comp: usize,
@@ -2083,6 +2088,12 @@ fn compensate(
     let y0 = (mb_y * 16 + py * 4) as i32;
     let (w, h) = (pw * 4, ph * 4);
 
+    let wt = ctx.weights_for(refs, 0, ref_idx[0], ref_idx[1], use0, use1);
+    // 8.4.2.3.1 over one list is the identity, so the interpolation of that one
+    // list IS the prediction: it is written straight into the picture at the
+    // picture's own pitch, rather than into a temporary that is combined into a
+    // second temporary and copied a third time.
+    let direct = wt.is_default() && (use0 != use1);
     let mut part = [[0u8; 256]; 2];
     for list in 0..2 {
         if ref_idx[list] < 0 {
@@ -2099,17 +2110,33 @@ fn compensate(
             height: rp.y.height,
             pad: rp.y.pad,
         };
-        mc_luma(&plane, x0, y0, mv[list], w, h, &mut part[list]);
+        if direct {
+            let stride = pic.y.stride;
+            let origin = pic.y.at(x0 as usize, y0 as usize);
+            mc_luma(
+                &plane,
+                x0,
+                y0,
+                mv[list],
+                w,
+                h,
+                stride,
+                &mut pic.y.data[origin..],
+            );
+        } else {
+            mc_luma(&plane, x0, y0, mv[list], w, h, w, &mut part[list]);
+        }
     }
-    let wt = ctx.weights_for(refs, 0, ref_idx[0], ref_idx[1], use0, use1);
-    let mut out = [0u8; 256];
-    let (p0, p1) = part.split_at(1);
-    combine(&mut out, &p0[0], &p1[0], use0, use1, &wt, w * h);
-    let stride = pic.y.stride;
-    let origin = pic.y.at(x0 as usize, y0 as usize);
-    for row in 0..h {
-        let dst = origin + row * stride;
-        pic.y.data[dst..dst + w].copy_from_slice(&out[row * w..row * w + w]);
+    if !direct {
+        let mut out = [0u8; 256];
+        let (p0, p1) = part.split_at(1);
+        combine(&mut out, &p0[0], &p1[0], use0, use1, &wt, w * h);
+        let stride = pic.y.stride;
+        let origin = pic.y.at(x0 as usize, y0 as usize);
+        for row in 0..h {
+            let dst = origin + row * stride;
+            pic.y.data[dst..dst + w].copy_from_slice(&out[row * w..row * w + w]);
+        }
     }
 
     // Chroma (8.4.1.4): for 4:2:0 frame coding the chroma vector is the luma
@@ -2117,6 +2144,8 @@ fn compensate(
     let (cw, ch) = (w / 2, h / 2);
     let (cx0, cy0) = (x0 / 2, y0 / 2);
     for comp in 0..2 {
+        let wt = ctx.weights_for(refs, comp + 1, ref_idx[0], ref_idx[1], use0, use1);
+        let direct = wt.is_default() && (use0 != use1);
         let mut cpart = [[0u8; 64]; 2];
         for list in 0..2 {
             if ref_idx[list] < 0 {
@@ -2134,18 +2163,35 @@ fn compensate(
                 height: src.height,
                 pad: src.pad,
             };
-            mc_chroma(&plane, cx0, cy0, mv[list], cw, ch, &mut cpart[list]);
+            if direct {
+                let dst = if comp == 0 { &mut pic.cb } else { &mut pic.cr };
+                let stride = dst.stride;
+                let origin = dst.at(cx0 as usize, cy0 as usize);
+                mc_chroma(
+                    &plane,
+                    cx0,
+                    cy0,
+                    mv[list],
+                    cw,
+                    ch,
+                    stride,
+                    &mut dst.data[origin..],
+                );
+            } else {
+                mc_chroma(&plane, cx0, cy0, mv[list], cw, ch, cw, &mut cpart[list]);
+            }
         }
-        let wt = ctx.weights_for(refs, comp + 1, ref_idx[0], ref_idx[1], use0, use1);
-        let mut cout = [0u8; 64];
-        let (c0, c1) = cpart.split_at(1);
-        combine(&mut cout, &c0[0], &c1[0], use0, use1, &wt, cw * ch);
-        let plane = if comp == 0 { &mut pic.cb } else { &mut pic.cr };
-        let stride = plane.stride;
-        let origin = plane.at(cx0 as usize, cy0 as usize);
-        for row in 0..ch {
-            let dst = origin + row * stride;
-            plane.data[dst..dst + cw].copy_from_slice(&cout[row * cw..row * cw + cw]);
+        if !direct {
+            let mut cout = [0u8; 64];
+            let (c0, c1) = cpart.split_at(1);
+            combine(&mut cout, &c0[0], &c1[0], use0, use1, &wt, cw * ch);
+            let plane = if comp == 0 { &mut pic.cb } else { &mut pic.cr };
+            let stride = plane.stride;
+            let origin = plane.at(cx0 as usize, cy0 as usize);
+            for row in 0..ch {
+                let dst = origin + row * stride;
+                plane.data[dst..dst + cw].copy_from_slice(&cout[row * cw..row * cw + cw]);
+            }
         }
     }
     Ok(())
@@ -2153,7 +2199,13 @@ fn compensate(
 
 /// Gather the 13 neighbour samples of a luma 4x4 block (spec 8.3.1.2),
 /// including the top-right substitution rule.
-fn gather_nbr4(pic: &Picture, nbr: &MbNeighbors, blk: usize, x: usize, y: usize) -> Nbr4 {
+pub(crate) fn gather_nbr4(
+    pic: &Picture,
+    nbr: &MbNeighbors,
+    blk: usize,
+    x: usize,
+    y: usize,
+) -> Nbr4 {
     let (dx, dy) = BLK4_POS[blk];
     let stride = pic.y.stride;
     let o = pic.y.at(x, y);
@@ -2239,7 +2291,7 @@ fn gather_nbr8(pic: &Picture, nbr: &MbNeighbors, blk8: usize, x: usize, y: usize
 // index the plane as well as the strength arrays; iterating the arrays would
 // hide which geometry each one names.
 #[allow(clippy::needless_range_loop)]
-fn deblock_picture(pic: &mut Picture) {
+pub(crate) fn deblock_picture(pic: &mut Picture) {
     let mb_w = pic.mb_w;
     for mb_y in 0..pic.mb_h {
         for mb_x in 0..mb_w {
@@ -2272,15 +2324,42 @@ fn deblock_picture(pic: &mut Picture) {
                 |e: usize| e.is_multiple_of(2) || pic.mb_flags[addr] & FLAG_TRANS8X8 == 0;
 
             // Boundary strengths, per 4-sample segment of each edge (8.7.2.1).
+            //
+            // Both sides of an internal edge live in this macroblock, so the
+            // whole 8.7.2.1 ladder is decided once for all 24 of them: an intra
+            // macroblock gives 3 everywhere, and an inter macroblock with no
+            // luma coefficients and one motion vector over the whole 16x16
+            // gives 0 everywhere. Only the two macroblock edges then need the
+            // per-segment derivation.
             let mut bs_v = [[0u8; 4]; 4];
             let mut bs_h = [[0u8; 4]; 4];
-            for e in 0..4 {
-                for k in 0..4 {
-                    if e > 0 || filter_left {
-                        bs_v[e][k] = boundary_strength(pic, mb_x, mb_y, e, k, true);
+            let cur_intra = pic.mb_flags[addr] & FLAG_INTER == 0;
+            let internal_uniform = if cur_intra {
+                Some(3)
+            } else if pic.mb_cbp[addr] == 0 && uniform_motion(pic, mb_x, mb_y) {
+                Some(0)
+            } else {
+                None
+            };
+            for k in 0..4 {
+                if filter_left {
+                    bs_v[0][k] = boundary_strength(pic, mb_x, mb_y, 0, k, true);
+                }
+                if filter_top {
+                    bs_h[0][k] = boundary_strength(pic, mb_x, mb_y, 0, k, false);
+                }
+            }
+            for e in 1..4 {
+                match internal_uniform {
+                    Some(bs) => {
+                        bs_v[e] = [bs; 4];
+                        bs_h[e] = [bs; 4];
                     }
-                    if e > 0 || filter_top {
-                        bs_h[e][k] = boundary_strength(pic, mb_x, mb_y, e, k, false);
+                    None => {
+                        for k in 0..4 {
+                            bs_v[e][k] = boundary_strength(pic, mb_x, mb_y, e, k, true);
+                            bs_h[e][k] = boundary_strength(pic, mb_x, mb_y, e, k, false);
+                        }
                     }
                 }
             }
@@ -2439,6 +2518,19 @@ fn deblock_picture(pic: &mut Picture) {
             }
         }
     }
+}
+
+/// True when every 4x4 block of this macroblock predicts from the same
+/// pictures with the same motion, so no internal edge can reach the motion
+/// clauses of 8.7.2.1.
+fn uniform_motion(pic: &Picture, mb_x: usize, mb_y: usize) -> bool {
+    let w4 = pic.mb_w * 4;
+    let first = mb_y * 4 * w4 + mb_x * 4;
+    let (mv, id) = (pic.mv[first], pic.ref_id[first]);
+    (0..4).all(|by| {
+        let row = first + by * w4;
+        (0..4).all(|bx| pic.mv[row + bx] == mv && pic.ref_id[row + bx] == id)
+    })
 }
 
 /// Boundary strength of one 4-sample luma edge segment (clause 8.7.2.1).
