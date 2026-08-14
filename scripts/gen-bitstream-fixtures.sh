@@ -54,6 +54,20 @@ for src in "$FIXTURES"/video/*vp9*.mp4 "$FIXTURES"/video/*av1*.mp4; do
     run "$OUT/${base%.*}.ivf" -i "$src" -map 0:v:0 -c:v copy -f ivf
 done
 
+# (a2) H.264/HEVC elementary streams in Annex B form, for the hardware decoder:
+# a stateless decoder is fed NAL units, and the mp4 fixtures carry them
+# length-prefixed. `-bsf` puts the start codes and the in-band parameter sets back.
+for src in "$FIXTURES"/video/*h264*.mp4; do
+    [ -e "$src" ] || continue
+    base=$(basename "$src")
+    run "$OUT/${base%.*}.264" -i "$src" -map 0:v:0 -c:v copy -bsf:v h264_mp4toannexb -f h264
+done
+for src in "$FIXTURES"/video/*hevc*.mp4; do
+    [ -e "$src" ] || continue
+    base=$(basename "$src")
+    run "$OUT/${base%.*}.265" -i "$src" -map 0:v:0 -c:v copy -bsf:v hevc_mp4toannexb -f hevc
+done
+
 # (b) branch coverage the container set does not have.
 SYN="-f lavfi -i testsrc2=size=320x240:rate=30:duration=2"
 
@@ -96,6 +110,16 @@ run "$OUT/av1-monochrome.ivf" $SYN -c:v libaom-av1 -pix_fmt gray \
     -cpu-used 8 -b:v 300k -f ivf
 run "$OUT/av1-tiles-1280.ivf" -f lavfi -i testsrc2=size=1280x720:rate=30:duration=1 \
     -c:v libaom-av1 -pix_fmt yuv420p -tiles 2x2 -cpu-used 8 -b:v 1M -f ivf
+# H.264 with B frames and an open GOP: reordering, so the decoder's output order
+# is exercised rather than assumed, plus 4 reference frames for the DPB.
+# shellcheck disable=SC2086
+run "$OUT/h264-bframes-320.264" $SYN -c:v libx264 -pix_fmt yuv420p -bf 3 -refs 4 \
+    -g 30 -b:v 500k -f h264
+# HEVC with B frames, for the same reason on the reference-picture-set side.
+# shellcheck disable=SC2086
+run "$OUT/hevc-bframes-320.265" $SYN -c:v libx265 -pix_fmt yuv420p \
+    -x265-params "bframes=3:ref=3:keyint=30:log-level=none" -b:v 500k -f hevc
+
 # AV1 with a hidden ALTREF: forward keyframe + show_existing_frame headers.
 # shellcheck disable=SC2086
 run "$OUT/av1-altref.ivf" $SYN -c:v libaom-av1 -pix_fmt yuv420p \
