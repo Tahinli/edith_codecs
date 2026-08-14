@@ -76,6 +76,11 @@ impl RateControl {
         qp = qp.clamp(self.last_qp[kind] - down, self.last_qp[kind] + up);
         // Leaky bucket: 1.5 QP per picture of debt, capped.
         qp += (self.buffer / (self.base.max(1.0) * 4.0) * 2.0).clamp(-2.0, 2.0);
+        // The quantiser floor is a measured choice, not a spec limit: below QP 10
+        // this encoder spends large numbers of bits on differences a viewer
+        // cannot see, and on static content it spends them re-coding pictures
+        // that were already right. Asking for a bitrate that QP 10 cannot fill
+        // therefore returns a smaller file rather than a wasteful one.
         qp.round().clamp(10.0, 51.0) as i32
     }
 
