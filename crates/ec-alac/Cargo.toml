@@ -1,0 +1,13 @@
+[package]
+name = "ec-alac"
+description = "Apple Lossless (ALAC) decoder: magic cookie, adaptive-Golomb residuals, LPC predictor, 16 and 24 bit."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ec-core = { workspace = true }
+
+[dev-dependencies]
+ec-mp4 = { workspace = true }
