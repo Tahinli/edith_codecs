@@ -544,6 +544,11 @@ impl CeltEncoder {
         // (Measured on speech: at 256 kbps stereo the sensitive threshold is
         // worth 11 points of opus_compare, at 64 kbps it costs 50.)
         let threshold = if bits_per_sample < 0.9 {
+            // Short blocks buy pre-echo control and pay coding gain, and below
+            // a bit a sample this encoder loses more than it saves: measured on
+            // his library, 2ch 64 kbps scored -619 with this gate and -891
+            // without, and 2ch 256 kbps (where the gate never fires) gained 11
+            // points from the sensitive threshold below.
             f32::INFINITY
         } else {
             (24.0 - 8.0 * bits_per_sample).max(3.0)
@@ -1952,7 +1957,25 @@ fn coarse_energy(
             let k = i + ch * NB_BANDS;
             let old_v = old[k].max(-9.0);
             let pred = coef * old_v + *prev;
-            let want = ((band_log_e[k] - pred).round() as i32).clamp(-24, 24);
+            let mut want = ((band_log_e[k] - pred).round() as i32).clamp(-24, 24);
+            // Leave the bands above this one three bits each. A frame whose
+            // energy collapses wants a large negative step in every band and
+            // the Laplace model charges dearly for those, so without a reserve
+            // the coarse energy can eat the frame and leave the bands above it
+            // on the one-bit path, whose "keep the prediction" energy is then
+            // far too loud. A guard, not a gain: measured neutral on speech and
+            // on music across 16..510 kbps, which is what a guard should be.
+            let reserved = 3 * c as i32 * (end - i) as i32;
+            let bits_left = budget - tell - reserved;
+            if i != start && bits_left < 30 {
+                if bits_left < 24 {
+                    want = want.min(1);
+                }
+                if bits_left < 16 {
+                    want = want.max(-1);
+                }
+            }
+            let want = want;
             let qi = if budget - tell >= 15 {
                 let pi = 2 * i.min(20);
                 laplace_encode(

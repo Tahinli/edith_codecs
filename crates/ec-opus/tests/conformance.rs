@@ -949,7 +949,7 @@ fn encoder_rate_quality_matrix() {
     };
     let mono = to_mono(&stereo);
     let dir = tmp_dir();
-// The whole range the format allows, not the range that happens to work:
+    // The whole range the format allows, not the range that happens to work:
     // 16 kbps is where the incumbent's mono was broken and 510 kbps is one
     // byte under the RFC's per-frame ceiling. (ffmpeg's libopus refuses
     // anything above 256 kbps, hence the NaN in its column up there.)
