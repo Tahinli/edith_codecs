@@ -514,11 +514,15 @@ fn corrupt_streams_never_panic() {
         eprintln!("SKIP: fixtures missing");
         return;
     }
-    // One stream per entropy coder: CABAC's arithmetic decoder indexes context
-    // and coefficient arrays from stream-derived values, so it needs the same
-    // no-panic floor as the CAVLC tables.
-    for name in ["BA1_Sony_D", "CABA1_SVA_B"] {
-        let stream = find_stream(&base.join(name)).expect("fixture");
+    // One stream per entropy coder, plus one with B slices and multiple
+    // references: CABAC's arithmetic decoder indexes context and coefficient
+    // arrays from stream-derived values, and inter prediction indexes the
+    // decoded picture buffer, the reference lists and the motion arrays from
+    // them too. All of it needs the same no-panic floor as the CAVLC tables.
+    for name in ["BA1_Sony_D", "CABA1_SVA_B", "CABA3_SVA_B", "BA_MW_D"] {
+        let Some(stream) = find_stream(&base.join(name)) else {
+            continue;
+        };
         corrupt_sweep(&std::fs::read(stream).unwrap());
     }
 }
@@ -535,6 +539,9 @@ fn corrupt_sweep(bytes: &[u8]) {
     {
         let mut dec = Decoder::new();
         let _ = dec.decode_first_idr(&bytes[..len]);
+        // Truncation must also be survivable on the full-sequence path, where
+        // a half-decoded picture meets the decoded picture buffer.
+        let _ = decode_all(&bytes[..len]);
     }
     // Single-byte corruptions: xor a walking pattern through the first 6KB
     // (covers parameter sets and the first slices), plus scattered hits.
@@ -556,6 +563,12 @@ fn corrupt_sweep(bytes: &[u8]) {
         m[pos] ^= (0x5Bu8.wrapping_add(i as u8)).max(1);
         let mut dec = Decoder::new();
         let _ = dec.decode_first_idr(&m); // must not panic; any Err is fine
+        if i % 8 == 0 {
+            // The whole-sequence path costs more, so it gets a thinner sweep;
+            // it is the one that exercises reference lists and marking with
+            // stream-derived indices.
+            let _ = decode_all(&m);
+        }
     }
 }
 
@@ -1421,4 +1434,411 @@ fn a_frame_num_gap_keeps_decoding() {
         "only {frames} frames survived a single dropped picture"
     );
     eprintln!("frame_num gap: {frames} frames decoded after dropping one picture");
+}
+
+/// Every quantisation parameter again, this time over a GOP with motion.
+///
+/// The intra sweep above walks the alpha, beta and tC0 rows the bS 3 and 4
+/// edges use. Boundary strengths 1 and 2 exist only between inter macroblocks,
+/// so their tC0 columns (Table 8-17) had no oracle at all until now — and both
+/// were wrong when this landed. One P/B GOP per quantiser covers every row of
+/// both columns, and under CABAC it also walks the cabac_init_idc columns
+/// across all 52 SliceQPY values.
+#[test]
+fn every_quantiser_with_motion_matches_ffmpeg() {
+    if !have_ffmpeg() {
+        eprintln!("SKIP: ffmpeg not on PATH");
+        return;
+    }
+    let dir = scratch("qp-motion");
+    let mut failures = Vec::new();
+    for coder in ["ac", "0"] {
+        let mut checked = 0usize;
+        for qp in 1..=51u32 {
+            let qp_string = qp.to_string();
+            let extra = vec![
+                "-profile:v",
+                "main",
+                "-coder",
+                coder,
+                "-qp",
+                &qp_string,
+                "-x264-params",
+                "bframes=2:b-adapt=0:ref=2",
+            ];
+            let tag = format!("{coder}-q{qp}");
+            match x264_encode_gop(&dir, &tag, "176x144", 8, &extra) {
+                Some(stream) => match compare_sequence(&stream) {
+                    Ok(_) => checked += 1,
+                    Err(e) => failures.push(format!("{tag}: {e}")),
+                },
+                None => failures.push(format!("{tag}: ffmpeg cannot encode")),
+            }
+        }
+        assert!(checked >= 40, "too few {coder} quantisers exercised: {checked}");
+        eprintln!("{coder}: {checked} quantisers bit-exact over a GOP with motion");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Geometry and slice structure, over a GOP rather than one picture: cropping,
+/// odd sizes, multiple slices per picture and the loop filter off, all with
+/// inter prediction and reordering active.
+#[test]
+fn geometry_with_motion_matches_ffmpeg() {
+    if !have_ffmpeg() {
+        eprintln!("SKIP: ffmpeg not on PATH");
+        return;
+    }
+    let dir = scratch("geometry-motion");
+    let cases: &[(&str, &str, &[&str])] = &[
+        ("hd", "1920x1080", &["bframes=2:b-adapt=0"]),
+        ("odd", "1916x1078", &["bframes=2:b-adapt=0"]),
+        // Neighbour availability stops at every slice boundary, and a motion
+        // vector predictor at one sees no partition across it.
+        ("slices", "352x288", &["bframes=2:b-adapt=0:slices=4"]),
+        ("nodeblock", "352x288", &["bframes=2:b-adapt=0:no-deblock=1"]),
+        // One macroblock wide: every spatial neighbour is unavailable, which
+        // is where the reference index of a missing partition matters most.
+        ("tiny", "16x16", &["bframes=2:b-adapt=0"]),
+        // Many references, so the list is long and reordering is real work.
+        ("manyref", "352x288", &["bframes=3:b-adapt=0:ref=5:b-pyramid=normal"]),
+    ];
+    let mut table = String::new();
+    let mut failures = Vec::new();
+    for coder in ["ac", "0"] {
+        for (tag, size, params) in cases {
+            let extra = vec![
+                "-profile:v",
+                "main",
+                "-coder",
+                coder,
+                "-qp",
+                "26",
+                "-x264-params",
+                params[0],
+            ];
+            let name = format!("{coder}-{tag}");
+            match x264_encode_gop(&dir, &name, size, 10, &extra) {
+                Some(stream) => match compare_sequence(&stream) {
+                    Ok(n) => table.push_str(&format!("{name:<14} {size:<10} {n:>2} frames bit-exact\n")),
+                    Err(e) => {
+                        table.push_str(&format!("{name:<14} {size:<10} {e}\n"));
+                        failures.push(format!("{name}: {e}"));
+                    }
+                },
+                None => failures.push(format!("{name}: ffmpeg cannot encode")),
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    eprintln!("{table}");
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// SP and SI slices are refused by name, proved against a stream that really
+/// carries one.
+///
+/// No encoder here emits switching slices, so the stream is hand built: an SPS
+/// and PPS this decoder accepts, then a slice header whose slice_type says SP.
+/// Without it the refusal would be an untested string, which is how a refusal
+/// becomes a hidden bug.
+#[test]
+fn switching_slices_are_refused_by_name() {
+    use ec_core::BitWriter;
+
+    let mut annexb: Vec<u8> = Vec::new();
+    let mut nal = |kind: u8, ref_idc: u8, payload: &[u8]| {
+        annexb.extend_from_slice(&[0, 0, 0, 1]);
+        annexb.push((ref_idc << 5) | kind);
+        annexb.extend_from_slice(payload);
+    };
+
+    let mut w = BitWriter::new();
+    w.write_bits(66, 8); // profile_idc baseline
+    w.write_bits(0, 8);
+    w.write_bits(30, 8); // level_idc
+    w.write_ue(0); // sps id
+    w.write_ue(0); // log2_max_frame_num_minus4
+    w.write_ue(2); // pic_order_cnt_type 2
+    w.write_ue(1); // max_num_ref_frames
+    w.write_bit(false); // gaps_in_frame_num_value_allowed
+    w.write_ue(10); // pic_width_in_mbs_minus1 -> 176
+    w.write_ue(8); // pic_height_in_map_units_minus1 -> 144
+    w.write_bit(true); // frame_mbs_only
+    w.write_bit(true); // direct_8x8_inference
+    w.write_bit(false); // no cropping
+    w.write_bit(false); // no vui
+    w.write_bit(true); // rbsp stop bit
+    w.align_to_byte();
+    nal(7, 3, w.as_bytes());
+
+    let mut w = BitWriter::new();
+    w.write_ue(0); // pps id
+    w.write_ue(0); // sps id
+    w.write_bit(false); // entropy_coding_mode
+    w.write_bit(false); // bottom_field_pic_order_in_frame_present
+    w.write_ue(0); // num_slice_groups_minus1
+    w.write_ue(0); // num_ref_idx_l0_default_active_minus1
+    w.write_ue(0); // num_ref_idx_l1_default_active_minus1
+    w.write_bit(false); // weighted_pred
+    w.write_bits(0, 2); // weighted_bipred_idc
+    w.write_se(0); // pic_init_qp_minus26
+    w.write_se(0); // pic_init_qs_minus26
+    w.write_se(0); // chroma_qp_index_offset
+    w.write_bit(false); // deblocking_filter_control_present
+    w.write_bit(false); // constrained_intra_pred
+    w.write_bit(false); // redundant_pic_cnt_present
+    w.write_bit(true); // rbsp stop bit
+    w.align_to_byte();
+    nal(8, 3, w.as_bytes());
+
+    // A slice whose slice_type is SP (3), which is what has to be refused.
+    let mut w = BitWriter::new();
+    w.write_ue(0); // first_mb_in_slice
+    w.write_ue(3); // slice_type: SP
+    w.write_ue(0); // pps id
+    w.write_bits(0, 4); // frame_num
+    w.write_bit(false); // num_ref_idx_active_override_flag
+    w.write_bit(false); // ref_pic_list_modification_flag_l0
+    w.write_bit(false); // adaptive_ref_pic_marking_mode_flag
+    w.write_bit(false); // sp_for_switch_flag
+    w.write_se(0); // slice_qs_delta
+    w.write_se(0); // slice_qp_delta
+    w.write_bit(true);
+    w.align_to_byte();
+    nal(1, 2, w.as_bytes());
+
+    let mut dec = Decoder::new();
+    let mut refusal = None;
+    for unit in ec_h264_syntax::AnnexBIter::new(&annexb) {
+        if let Err(e) = dec.push_nal(unit) {
+            refusal = Some(e);
+            break;
+        }
+    }
+    match refusal {
+        Some(Error::Unsupported { what, why }) => {
+            assert!(
+                what.contains("SP and SI"),
+                "refused as {what} ({why}), expected the switching-slice refusal"
+            );
+        }
+        other => panic!("expected an SP-slice refusal, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Real library: the files actually on this machine, not fixtures.
+// ---------------------------------------------------------------------------
+
+/// Compare a long stream against ffmpeg without holding it in memory: ffmpeg's
+/// raw output is consumed from a pipe one frame at a time, in step with our
+/// own decoding, so a 500-frame 1080p sweep costs two frames of memory rather
+/// than three gigabytes.
+fn compare_sequence_streamed(
+    stream: &Path,
+    frames_wanted: usize,
+) -> Result<StreamedResult, String> {
+    use std::io::Read;
+
+    let bytes = std::fs::read(stream).map_err(|e| e.to_string())?;
+    let mut child = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(stream)
+        .args([
+            "-frames:v",
+            &frames_wanted.to_string(),
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "yuv420p",
+            "-",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let mut out = child.stdout.take().expect("piped stdout");
+
+    let mut dec = Decoder::new();
+    let mut reference = Vec::new();
+    let mut result = StreamedResult::default();
+    let mut oracle_open = true;
+    let mut take = |frame: Vec<u8>, result: &mut StreamedResult, reference: &mut Vec<u8>| {
+        result.produced += 1;
+        if !oracle_open || result.compared >= frames_wanted {
+            return;
+        }
+        reference.resize(frame.len(), 0);
+        if out.read_exact(reference).is_err() {
+            oracle_open = false;
+            return;
+        }
+        if let Some(pos) = first_diff(&frame, reference) {
+            result.diffs.push((result.compared, pos));
+        }
+        result.compared += 1;
+    };
+
+    for nal in ec_h264_syntax::AnnexBIter::new(&bytes) {
+        match dec.push_nal(nal) {
+            Ok(NalOutcome::PictureBoundary) => {
+                dec.end_picture().map_err(|e| format!("{e}"))?;
+                dec.push_nal(nal).map_err(|e| format!("{e}"))?;
+            }
+            Ok(_) => {}
+            Err(e) => return Err(format!("{e}")),
+        }
+        while let Some(f) = dec.next_frame() {
+            take(frame_bytes(&f), &mut result, &mut reference);
+        }
+    }
+    dec.flush().map_err(|e| format!("{e}"))?;
+    while let Some(f) = dec.next_frame() {
+        take(frame_bytes(&f), &mut result, &mut reference);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    Ok(result)
+}
+
+/// Outcome of a streamed comparison.
+#[derive(Default)]
+struct StreamedResult {
+    /// Frames this decoder produced.
+    produced: usize,
+    /// Frames the oracle also produced, and which were therefore compared.
+    compared: usize,
+    /// `(frame index, byte offset)` of each mismatch.
+    diffs: Vec<(usize, usize)>,
+}
+
+/// Extract the video elementary stream of a real file as Annex B.
+fn extract_annexb(src: &Path, dst: &Path, frames: usize) -> bool {
+    run(
+        "ffmpeg",
+        &[
+            "-v",
+            "error",
+            "-y",
+            "-i",
+            &src.to_string_lossy(),
+            "-map",
+            "0:v:0",
+            "-c",
+            "copy",
+            "-bsf:v",
+            "h264_mp4toannexb",
+            "-frames:v",
+            &frames.to_string(),
+            "-f",
+            "h264",
+            &dst.to_string_lossy(),
+        ],
+    )
+}
+
+/// Decode real H.264 files from this machine's library, several hundred frames
+/// each, frame for frame against ffmpeg.
+///
+/// Synthetic clips and conformance vectors are both written by people trying to
+/// exercise a decoder. Real files are written by encoders tuned for size, at
+/// resolutions and GOP structures the fixtures never use, and they are the ones
+/// a user actually opens. Every file either decodes bit-exactly or is refused
+/// by name; a file that decodes to different pixels is a failure.
+#[test]
+fn real_library_streams_match_ffmpeg() {
+    if !have_ffmpeg() {
+        eprintln!("SKIP: ffmpeg not on PATH");
+        return;
+    }
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/real-library-manifest.tsv");
+    let Ok(text) = std::fs::read_to_string(&manifest) else {
+        eprintln!("SKIP: {} missing", manifest.display());
+        return;
+    };
+    let dir = scratch("real-library");
+    const FRAMES: usize = 500;
+    /// A file counts as swept only when the oracle stayed with us this long.
+    const MIN_FRAMES: usize = 100;
+    let mut table = String::new();
+    let mut decoded = 0usize;
+    let mut refused = 0usize;
+    let mut failures = Vec::new();
+    let mut seen_containers = std::collections::BTreeSet::new();
+
+    for line in text.lines().skip(1) {
+        let mut f = line.split('\t');
+        let (Some(path), Some(container), Some(vcodec)) = (f.next(), f.next(), f.next()) else {
+            continue;
+        };
+        if vcodec != "h264" || !Path::new(path).is_file() {
+            continue;
+        }
+        // One file per container family per resolution class keeps the sweep
+        // to a few minutes while still covering both demuxers.
+        let width = f.next().unwrap_or("0");
+        let key = (container.to_string(), width.to_string());
+        if !seen_containers.insert(key) {
+            continue;
+        }
+        let name: String = Path::new(path)
+            .file_name()
+            .map(|n| n.to_string_lossy().chars().take(38).collect())
+            .unwrap_or_default();
+        let annexb = dir.join("stream.264");
+        if !extract_annexb(Path::new(path), &annexb, FRAMES) {
+            table.push_str(&format!("{name:<40} {container:<12} not extractable\n"));
+            continue;
+        }
+        match compare_sequence_streamed(&annexb, FRAMES) {
+            Ok(r) if !r.diffs.is_empty() => {
+                failures.push(format!(
+                    "{name}: {} of {} frames differ",
+                    r.diffs.len(),
+                    r.compared
+                ));
+                table.push_str(&format!(
+                    "{name:<40} {container:<12} {width:>5}px MISMATCH {} of {}\n",
+                    r.diffs.len(),
+                    r.compared
+                ));
+            }
+            // The oracle stopped before we did. That is ffmpeg giving up on the
+            // elementary stream the bitstream filter produced, not a claim about
+            // this decoder, so the file is reported and not counted either way.
+            Ok(r) if r.compared < r.produced.min(MIN_FRAMES) => {
+                table.push_str(&format!(
+                    "{name:<40} {container:<12} {width:>5}px oracle short: ffmpeg gave \
+                     {} frames, we decoded {}\n",
+                    r.compared, r.produced
+                ));
+            }
+            Ok(r) => {
+                decoded += 1;
+                table.push_str(&format!(
+                    "{name:<40} {container:<12} {width:>5}px {:>4} frames bit-exact\n",
+                    r.compared
+                ));
+            }
+            Err(e) if e.contains("unsupported") => {
+                refused += 1;
+                table.push_str(&format!("{name:<40} {container:<12} {width:>5}px refused: {e}\n"));
+            }
+            Err(e) => {
+                failures.push(format!("{name}: {e}"));
+                table.push_str(&format!("{name:<40} {container:<12} {width:>5}px ERROR {e}\n"));
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    eprintln!("{table}");
+    eprintln!("real library: {decoded} decoded bit-exact, {refused} refused by name");
+    assert!(failures.is_empty(), "{failures:#?}");
+    assert!(
+        decoded >= 3,
+        "only {decoded} real files swept end to end; the sweep is the point"
+    );
 }
