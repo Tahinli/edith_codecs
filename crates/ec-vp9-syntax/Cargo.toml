@@ -1,0 +1,10 @@
+[package]
+name = "ec-vp9-syntax"
+description = "VP9 uncompressed frame header and superframe index parsing, for stateless hardware decode."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ec-core.workspace = true

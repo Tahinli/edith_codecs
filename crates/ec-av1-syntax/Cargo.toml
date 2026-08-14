@@ -1,0 +1,10 @@
+[package]
+name = "ec-av1-syntax"
+description = "AV1 OBU framing, sequence header and frame header parsing, for stateless hardware decode."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ec-core.workspace = true

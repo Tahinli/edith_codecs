@@ -9,11 +9,13 @@ license = "MIT OR Apache-2.0"
 authors = ["Ahmet Kaan Gümüş"]
 
 [workspace.dependencies]
+ec-av1-syntax = { path = "crates/ec-av1-syntax", version = "0.1.0" }
 ec-core = { path = "crates/ec-core", version = "0.1.0" }
 ec-dsp = { path = "crates/ec-dsp", version = "0.1.0" }
 ec-inflate = { path = "crates/ec-inflate", version = "0.1.0" }
 ec-matroska = { path = "crates/ec-matroska", version = "0.1.0" }
 ec-riff = { path = "crates/ec-riff", version = "0.1.0" }
+ec-vp9-syntax = { path = "crates/ec-vp9-syntax", version = "0.1.0" }
 # Portable SIMD without asm or build-time tooling (family rule: pure Rust only).
 wide = "1.5"
 
