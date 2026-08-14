@@ -1011,7 +1011,7 @@ fn libopus_decodes_our_packets_across_the_rate_table() {
         let pcm = test_signal(channels, 2.0);
         let total = pcm.len() / channels;
         let mut table = Vec::new();
-        for kbps in [32u32, 64, 96, 128, 160, 165, 192, 256, 320, 510] {
+        for kbps in [16u32, 32, 64, 96, 128, 160, 165, 192, 256, 320, 510] {
             let mut enc = Encoder::new(48000, channels).unwrap();
             enc.set_bitrate(kbps * 1000);
             let packets = encode_packets(&mut enc, &pcm, channels);
@@ -1043,7 +1043,16 @@ fn libopus_decodes_our_packets_across_the_rate_table() {
                 "{channels} ch {kbps:>3} kbps: worst corr {worst:.4}, opus_compare {quality:.1}"
             ));
             let floor = match kbps {
-                0..=39 => 0.6,
+                // 16 kbps fullband CELT is the honest bottom of the range:
+                // reported, held to "clearly the same signal", not to hi-fi.
+                0..=19 => {
+                    if channels == 1 {
+                        0.6
+                    } else {
+                        0.35
+                    }
+                }
+                20..=39 => 0.6,
                 40..=95 => 0.8,
                 _ => 0.9,
             };

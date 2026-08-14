@@ -1870,8 +1870,7 @@ impl CeltEncoder {
             let mut best_den = 0.0f32;
             let mut j0 = 0usize;
             if n >= 16 {
-                #[allow(deprecated)]
-                use wide::{CmpGt, f32x8};
+                use wide::f32x8;
                 let chunks = n / 8;
                 let xy_v = f32x8::splat(xy);
                 let yy_v = f32x8::splat(yy);
@@ -1887,9 +1886,15 @@ impl CeltEncoder {
                     let ryy = yy_v + f32x8::from(ya);
                     let rxy2 = rxy * rxy;
                     let mask = (bd * rxy2).simd_gt(ryy * bn);
-                    bn = mask.blend(rxy2, bn);
-                    bd = mask.blend(ryy, bd);
-                    bc = mask.blend(f32x8::splat(c as f32), bc);
+                    // wide 1.5 deprecates `blend` in favour of a split that
+                    // does not exist yet in this release; the mask here is a
+                    // true lane mask, which is exactly blend's contract.
+                    #[allow(deprecated)]
+                    {
+                        bn = mask.blend(rxy2, bn);
+                        bd = mask.blend(ryy, bd);
+                        bc = mask.blend(f32x8::splat(c as f32), bc);
+                    }
                 }
                 let bn_a: [f32; 8] = bn.into();
                 let bd_a: [f32; 8] = bd.into();
