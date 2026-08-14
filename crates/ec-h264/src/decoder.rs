@@ -175,6 +175,9 @@ pub struct Decoder {
     /// Scaling factors for intra Y/Cb/Cr 4x4 lists of the active PPS/SPS.
     ls: [LevelScale4x4; 3],
     active_pps: Option<u32>,
+    /// `seq_parameter_set_id` of the most recently stored SPS, so a container
+    /// entry path can publish the picture size before the first slice.
+    last_sps: Option<u8>,
 }
 
 /// What [`Decoder::push_nal`] did with a NAL unit.
@@ -212,7 +215,16 @@ impl Decoder {
                 LevelScale4x4::new(&[16; 16]),
             ],
             active_pps: None,
+            last_sps: None,
         }
+    }
+
+    /// Cropped picture size of the most recently stored SPS, `None` until one
+    /// arrives. Lets a container entry path fill in stream parameters from an
+    /// `avcC` record without decoding a picture first.
+    pub fn picture_size(&self) -> Option<(u32, u32)> {
+        let sps = self.sps_map[self.last_sps? as usize].as_ref()?;
+        Some((sps.width, sps.height))
     }
 
     /// Decode the first IDR picture of an Annex B stream and return it.
@@ -245,8 +257,9 @@ impl Decoder {
                 let sps = Sps::parse(&rbsp);
                 self.rbsp = rbsp;
                 let sps = sps?;
-                let id = sps.id as usize;
-                self.sps_map[id] = Some(sps);
+                let id = sps.id;
+                self.sps_map[id as usize] = Some(sps);
+                self.last_sps = Some(id);
                 Ok(NalOutcome::ParameterSet)
             }
             NalUnitType::Pps => {
@@ -266,9 +279,13 @@ impl Decoder {
                 self.rbsp = rbsp;
                 r
             }
-            NalUnitType::SliceDataA | NalUnitType::SliceDataB | NalUnitType::SliceDataC => Err(
-                Error::unsupported("slice data partitioning", "NAL types 2..4 not implemented"),
-            ),
+            NalUnitType::SliceDataA | NalUnitType::SliceDataB | NalUnitType::SliceDataC => {
+                Err(Error::unsupported(
+                    "slice data partitioning",
+                    "nal_unit_type 2 to 4 carry a slice in three NAL units that \
+                     clause 7.4.1 reassembles by slice_id; not implemented",
+                ))
+            }
             _ => Ok(NalOutcome::Skipped),
         }
     }
@@ -323,6 +340,13 @@ impl Decoder {
         self.has_picture && !self.pic.complete
     }
 
+    /// Drop picture state after a seek. Parameter sets survive, because the
+    /// container does not resend them at every seek point.
+    pub fn reset_pictures(&mut self) {
+        self.has_picture = false;
+        self.pic.complete = false;
+    }
+
     fn decode_slice_rbsp(&mut self, header: NalHeader, rbsp: &[u8]) -> Result<NalOutcome> {
         // Peek first_mb / slice_type / pps_id to select parameter sets.
         let mut peek = BitReader::new(rbsp);
@@ -347,7 +371,8 @@ impl Decoder {
         if sh.slice_type != SliceType::I {
             return Err(Error::unsupported(
                 "non-I slice",
-                "P/B/SP/SI slices arrive with inter prediction (S18c)",
+                "P/B/SP/SI slices need inter prediction and a decoded picture \
+                 buffer (clause 8.4); only intra slices are decoded",
             ));
         }
 
@@ -409,30 +434,42 @@ impl Decoder {
 }
 
 /// Reject unsupported streams with named reasons before touching pixels.
+///
+/// Every `why` here names the syntax element that fired and the machinery it
+/// would need: a refusal is a capability statement about this binary, and the
+/// conformance suite proves each one against a stream that really uses the
+/// feature.
 fn check_supported(sps: &Sps, pps: &Pps, slice_type_code: u32) -> Result<()> {
     if pps.entropy_coding_mode {
         return Err(Error::unsupported(
             "CABAC entropy coding",
-            "only CAVLC is implemented (S18b)",
+            "entropy_coding_mode_flag 1 needs the arithmetic decoder and the \
+             context models of clause 9.3; only CAVLC (9.2) is implemented",
         ));
     }
     if pps.num_slice_groups > 1 {
         return Err(Error::unsupported(
             "FMO slice groups",
-            "num_slice_groups > 1 not implemented",
+            "num_slice_groups_minus1 > 0 needs the macroblock-to-slice-group \
+             map of clause 8.2.2; only one slice group per picture is decoded",
         ));
     }
     if sps.chroma_format_idc != 1 {
         return Err(Error::unsupported(
             "chroma format",
-            format!("chroma_format_idc {} (only 4:2:0)", sps.chroma_format_idc),
+            format!(
+                "chroma_format_idc {} needs its own chroma prediction, scan and \
+                 DC transform; only 4:2:0 (ChromaArrayType 1) is decoded",
+                sps.chroma_format_idc
+            ),
         ));
     }
     if sps.bit_depth_luma != 8 || sps.bit_depth_chroma != 8 {
         return Err(Error::unsupported(
             "bit depth",
             format!(
-                "{}-bit luma / {}-bit chroma (only 8-bit)",
+                "{}-bit luma / {}-bit chroma needs 16-bit sample planes and the \
+                 widened transform clip of clause 8.5; only 8-bit is decoded",
                 sps.bit_depth_luma, sps.bit_depth_chroma
             ),
         ));
@@ -440,19 +477,22 @@ fn check_supported(sps: &Sps, pps: &Pps, slice_type_code: u32) -> Result<()> {
     if !sps.frame_mbs_only {
         return Err(Error::unsupported(
             "interlaced coding",
-            "field pictures / MBAFF not implemented",
+            "frame_mbs_only_flag 0 admits field pictures and MBAFF, whose \
+             neighbour derivation (6.4.9) and field deblocking are not implemented",
         ));
     }
     if sps.separate_colour_plane {
         return Err(Error::unsupported(
             "separate colour planes",
-            "4:4:4 separate planes not implemented",
+            "separate_colour_plane_flag 1 codes 4:4:4 as three monochrome \
+             planes with their own slice headers; not implemented",
         ));
     }
     if sps.transform_bypass {
         return Err(Error::unsupported(
             "transform bypass",
-            "qpprime_y_zero_transform_bypass not implemented",
+            "qpprime_y_zero_transform_bypass_flag 1 makes QP'Y 0 lossless, \
+             bypassing the transform and scaling of 8.5 entirely; not implemented",
         ));
     }
     if slice_type_code > 9 {
@@ -619,7 +659,8 @@ fn decode_macroblock(
     if !is_i16 && ctx.transform_8x8_mode && r.read_bit()? {
         return Err(Error::unsupported(
             "8x8 transform",
-            "transform_size_8x8_flag not implemented",
+            "transform_size_8x8_flag 1 selects the 8x8 intra prediction of \
+             clause 8.3.2 and the 8x8 transform of 8.5.13; not implemented",
         ));
     }
 

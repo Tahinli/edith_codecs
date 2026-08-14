@@ -43,7 +43,13 @@ fn read_coeff_token(r: &mut BitCursor<'_>, nc: i32) -> Result<(u8, u8)> {
         0..=1 => COEFF_TOKEN_NC0,
         2..=3 => COEFF_TOKEN_NC2,
         4..=7 => COEFF_TOKEN_NC4,
-        _ => return Err(Error::unsupported("CAVLC nC = -2", "4:2:2 chroma DC")),
+        _ => {
+            return Err(Error::unsupported(
+                "CAVLC nC = -2",
+                "nC -2 is the 4:2:2 chroma DC coeff_token table (9.2.1); only \
+                 4:2:0 chroma DC (nC -1) is decoded",
+            ));
+        }
     };
     let peek = r.peek16();
     for &(len, code, tc, t1) in table {

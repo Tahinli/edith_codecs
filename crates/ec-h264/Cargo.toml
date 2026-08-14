@@ -8,9 +8,9 @@ authors.workspace = true
 
 [dependencies]
 ec-core = { workspace = true }
-ec-h264-syntax = { path = "../ec-h264-syntax", version = "0.1.0" }
+ec-h264-syntax = { workspace = true }
 wide = { workspace = true }
 
 [dev-dependencies]
 # The conformance harness walks Annex B itself to drive push_nal.
-ec-h264-syntax = { path = "../ec-h264-syntax", version = "0.1.0" }
+ec-h264-syntax = { workspace = true }
