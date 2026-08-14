@@ -257,30 +257,36 @@ fn steady_state_decode_loop_zero_alloc() {
         eprintln!("SKIP: fixtures missing");
         return;
     }
-    let stream = find_stream(&base.join("BA1_Sony_D")).expect("BA1_Sony_D fixture");
-    let bytes = std::fs::read(stream).unwrap();
+    // One stream per entropy coder: the CABAC reader carries its 402 context
+    // variables inline for exactly this reason.
     let mut dec = Decoder::new();
-    // Warm-up: full first picture, growing every reusable buffer.
-    let _ = dec.decode_first_idr(&bytes).expect("warm-up decode");
+    for name in ["BA1_Sony_D", "CABA1_SVA_B"] {
+        let stream = find_stream(&base.join(name)).expect("fixture");
+        let bytes = std::fs::read(stream).unwrap();
+        // Warm-up: full first picture, growing every reusable buffer.
+        let _ = dec.decode_first_idr(&bytes).expect("warm-up decode");
 
-    // Steady state: same IDR slices again, counted.
-    let nals: Vec<&[u8]> = ec_h264_syntax::AnnexBIter::new(&bytes).collect();
-    ALLOCS.store(0, Ordering::SeqCst);
-    COUNTING_HERE.with(|c| c.set(true));
-    let mut decoded = false;
-    for nal in &nals {
-        match dec.push_nal(nal) {
-            Ok(ec_h264::NalOutcome::PictureBoundary) => break,
-            Ok(ec_h264::NalOutcome::SliceDecoded) => decoded = true,
-            Ok(_) => {}
-            Err(e) => panic!("steady-state push failed: {e}"),
+        // Steady state: same IDR slices again, counted.
+        let nals: Vec<&[u8]> = ec_h264_syntax::AnnexBIter::new(&bytes).collect();
+        ALLOCS.store(0, Ordering::SeqCst);
+        COUNTING_HERE.with(|c| c.set(true));
+        let mut decoded = false;
+        for nal in &nals {
+            match dec.push_nal(nal) {
+                Ok(ec_h264::NalOutcome::PictureBoundary) => break,
+                Ok(ec_h264::NalOutcome::SliceDecoded) => decoded = true,
+                Ok(_) => {}
+                Err(e) => panic!("steady-state push failed: {e}"),
+            }
         }
+        dec.end_picture().expect("end_picture");
+        COUNTING_HERE.with(|c| c.set(false));
+        assert!(decoded, "no slice decoded in steady-state pass of {name}");
+        let n = ALLOCS.load(Ordering::SeqCst);
+        assert_eq!(n, 0, "{name}: steady-state decode loop allocated {n} times");
     }
-    dec.end_picture().expect("end_picture");
-    COUNTING_HERE.with(|c| c.set(false));
-    assert!(decoded, "no slice decoded in steady-state pass");
-    let n = ALLOCS.load(Ordering::SeqCst);
-    assert_eq!(n, 0, "steady-state decode loop allocated {n} times");
+    let bytes = std::fs::read(find_stream(&base.join("BA1_Sony_D")).unwrap()).unwrap();
+    let _ = dec.decode_first_idr(&bytes).expect("decode");
 
     // Sanity: the counter is alive — frame emission does allocate.
     ALLOCS.store(0, Ordering::SeqCst);
@@ -304,7 +310,13 @@ fn ns_per_macroblock_measurement() {
         eprintln!("SKIP: fixtures missing");
         return;
     }
-    for name in ["BA1_Sony_D", "CI_MW_D", "NL1_Sony_D"] {
+    for name in [
+        "BA1_Sony_D",
+        "CI_MW_D",
+        "NL1_Sony_D",
+        "CABA1_SVA_B",
+        "CABA3_SVA_B",
+    ] {
         let Some(stream) = find_stream(&base.join(name)) else {
             continue;
         };
@@ -348,8 +360,19 @@ fn corrupt_streams_never_panic() {
         eprintln!("SKIP: fixtures missing");
         return;
     }
-    let stream = find_stream(&base.join("BA1_Sony_D")).expect("BA1_Sony_D fixture");
-    let bytes = std::fs::read(stream).unwrap();
+    // One stream per entropy coder: CABAC's arithmetic decoder indexes context
+    // and coefficient arrays from stream-derived values, so it needs the same
+    // no-panic floor as the CAVLC tables.
+    for name in ["BA1_Sony_D", "CABA1_SVA_B"] {
+        let stream = find_stream(&base.join(name)).expect("fixture");
+        corrupt_sweep(&std::fs::read(stream).unwrap());
+    }
+}
+
+/// Truncate and bit-flip `bytes` many ways; every decode must return, error or
+/// succeed, and never panic.
+fn corrupt_sweep(bytes: &[u8]) {
+    let bytes = bytes.to_vec();
 
     // Truncations at prefix lengths spanning SPS/PPS/slice-header/slice-data.
     for len in (0..bytes.len().min(4096))
@@ -474,12 +497,23 @@ fn round_trip(dir: &Path, tag: &str, size: &str, extra: &[&str]) -> Result<usize
         .count())
 }
 
-/// Every quantisation parameter, bit-exact against ffmpeg.
+/// The two entropy coders, as ffmpeg encoder arguments. Baseline forces CAVLC;
+/// Main with `-coder ac` selects CABAC. Neither profile admits the 8x8
+/// transform, so both stay inside this release's scope.
+const ENTROPY_MODES: [(&str, &[&str]); 2] = [
+    ("cavlc", &["-profile:v", "baseline"]),
+    ("cabac", &["-profile:v", "main", "-coder", "ac"]),
+];
+
+/// Every quantisation parameter, bit-exact against ffmpeg, under both entropy
+/// coders.
 ///
 /// The deblocking filter's alpha, beta and tC0 tables (8-16 and 8-17) are
 /// indexed by QP; the conformance vectors touch only a few of their 52 rows,
 /// and a whole wrong column there passes the vectors (it did, once). One
-/// all-intra Baseline picture per QP covers every row.
+/// all-intra picture per QP covers every row. Under CABAC the same sweep walks
+/// the context initialisation of clause 9.3.1.1 across all 52 SliceQPY values,
+/// which the fixed-QP conformance vectors barely touch.
 #[test]
 fn every_quantiser_matches_ffmpeg() {
     if !have_ffmpeg() {
@@ -487,22 +521,27 @@ fn every_quantiser_matches_ffmpeg() {
         return;
     }
     let dir = scratch("qp-sweep");
-    let mut checked = 0usize;
     let mut failures = Vec::new();
-    for qp in 1..=51u32 {
-        // Baseline is CAVLC, 4:2:0, no 8x8 transform and no scaling matrices:
-        // exactly this release's scope, with the loop filter on.
-        let extra = ["-profile:v", "baseline", "-qp", &qp.to_string() as &str];
-        match round_trip(&dir, &format!("q{qp}"), "176x144", &extra) {
-            Ok(0) => checked += 1,
-            Ok(n) => failures.push(format!("qp {qp}: {n} bytes differ")),
-            Err(e) => failures.push(e),
+    for (mode, profile) in ENTROPY_MODES {
+        let mut checked = 0usize;
+        for qp in 1..=51u32 {
+            let mut extra = profile.to_vec();
+            let qp_string = qp.to_string();
+            extra.extend(["-qp", &qp_string]);
+            match round_trip(&dir, &format!("{mode}-q{qp}"), "176x144", &extra) {
+                Ok(0) => checked += 1,
+                Ok(n) => failures.push(format!("{mode} qp {qp}: {n} bytes differ")),
+                Err(e) => failures.push(e),
+            }
         }
+        assert!(
+            checked >= 40,
+            "too few {mode} quantisers exercised: {checked}"
+        );
+        eprintln!("{mode}: {checked} quantisers bit-exact against ffmpeg");
     }
     let _ = std::fs::remove_dir_all(&dir);
     assert!(failures.is_empty(), "{failures:#?}");
-    assert!(checked >= 40, "too few quantisers exercised: {checked}");
-    eprintln!("{checked} quantisers bit-exact against ffmpeg");
 }
 
 /// Geometry and slice structure: cropping, odd sizes, multiple slices, the
@@ -517,63 +556,48 @@ fn geometry_and_slice_structure_match_ffmpeg() {
     let dir = scratch("geometry");
     let cases: &[(&str, &str, &[&str])] = &[
         // 1080 lines are coded as 68 macroblock rows and cropped back to 1080.
-        ("hd", "1920x1080", &["-profile:v", "baseline", "-qp", "26"]),
+        ("hd", "1920x1080", &["-qp", "26"]),
         // A width that is not a multiple of 16 crops horizontally as well.
-        ("odd", "1916x1080", &["-profile:v", "baseline", "-qp", "26"]),
-        // Four slices: neighbour availability stops at every slice boundary.
+        ("odd", "1916x1080", &["-qp", "26"]),
+        // Four slices: neighbour availability stops at every slice boundary,
+        // and under CABAC every slice re-initialises its own contexts.
         (
             "slices",
             "352x288",
-            &[
-                "-profile:v",
-                "baseline",
-                "-qp",
-                "24",
-                "-x264-params",
-                "slices=4",
-            ],
+            &["-qp", "24", "-x264-params", "slices=4"],
         ),
         // No loop filter at all.
         (
             "nodeblock",
             "352x288",
-            &[
-                "-profile:v",
-                "baseline",
-                "-qp",
-                "30",
-                "-x264-params",
-                "no-deblock=1",
-            ],
+            &["-qp", "30", "-x264-params", "no-deblock=1"],
         ),
         // A non-zero chroma QP offset moves the chroma deblock thresholds.
         (
             "chromaqp",
             "352x288",
-            &[
-                "-profile:v",
-                "baseline",
-                "-qp",
-                "30",
-                "-x264-params",
-                "chroma_qp_offset=6",
-            ],
+            &["-qp", "30", "-x264-params", "chroma_qp_offset=6"],
         ),
         // One macroblock wide: every neighbour is unavailable.
-        ("tiny", "16x16", &["-profile:v", "baseline", "-qp", "20"]),
+        ("tiny", "16x16", &["-qp", "20"]),
     ];
     let mut table = String::new();
     let mut failures = Vec::new();
-    for (tag, size, extra) in cases {
-        match round_trip(&dir, tag, size, extra) {
-            Ok(0) => table.push_str(&format!("{tag:<10} {size:<10} bit-exact\n")),
-            Ok(n) => {
-                table.push_str(&format!("{tag:<10} {size:<10} MISMATCH {n} bytes\n"));
-                failures.push(format!("{tag}: {n} bytes differ"));
-            }
-            Err(e) => {
-                table.push_str(&format!("{tag:<10} {size:<10} {e}\n"));
-                failures.push(e);
+    for (mode, profile) in ENTROPY_MODES {
+        for (tag, size, case) in cases {
+            let mut extra = profile.to_vec();
+            extra.extend_from_slice(case);
+            let tag = format!("{mode}-{tag}");
+            match round_trip(&dir, &tag, size, &extra) {
+                Ok(0) => table.push_str(&format!("{tag:<16} {size:<10} bit-exact\n")),
+                Ok(n) => {
+                    table.push_str(&format!("{tag:<16} {size:<10} MISMATCH {n} bytes\n"));
+                    failures.push(format!("{tag}: {n} bytes differ"));
+                }
+                Err(e) => {
+                    table.push_str(&format!("{tag:<16} {size:<10} {e}\n"));
+                    failures.push(e);
+                }
             }
         }
     }
@@ -652,6 +676,22 @@ fn refusals_name_a_feature_the_stream_really_uses() {
             ],
             "8x8 transform",
         ),
+        // The 8x8 transform is refused under CABAC too, where the flag is a
+        // context-coded bin rather than a raw one.
+        (
+            "transform8x8-cabac",
+            &[
+                "-profile:v",
+                "high",
+                "-qp",
+                "26",
+                "-coder",
+                "ac",
+                "-x264-params",
+                "8x8dct=1",
+            ],
+            "8x8 transform",
+        ),
         (
             "yuv422",
             &[
@@ -709,6 +749,86 @@ fn refusals_name_a_feature_the_stream_really_uses() {
     eprintln!("{table}");
     assert!(failures.is_empty(), "{failures:#?}");
     assert!(proved >= 2, "too few refusals proved against real streams");
+}
+
+/// Inter slices are refused by name under CABAC as well as CAVLC: the
+/// arithmetic decoder landing does not imply P and B macroblock parsing, and a
+/// stream whose first picture decodes must not silently produce wrong pixels
+/// for its second.
+#[test]
+fn inter_slices_under_cabac_are_refused_by_name() {
+    if !have_ffmpeg() {
+        eprintln!("SKIP: ffmpeg not on PATH");
+        return;
+    }
+    let dir = scratch("inter-cabac");
+    let stream = dir.join("gop.264");
+    let ok = run(
+        "ffmpeg",
+        &[
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=176x144:rate=25:duration=1",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            "libx264",
+            "-frames:v",
+            "6",
+            "-profile:v",
+            "main",
+            "-coder",
+            "ac",
+            "-qp",
+            "26",
+            "-f",
+            "h264",
+            &stream.to_string_lossy(),
+        ],
+    );
+    assert!(ok, "ffmpeg cannot encode a CABAC GOP");
+    let bytes = std::fs::read(&stream).unwrap();
+
+    // The first (IDR) picture decodes; the first P slice must refuse by name.
+    let mut dec = Decoder::new();
+    let first = dec.decode_first_idr(&bytes).expect("CABAC IDR decodes");
+    assert_eq!((first.width, first.height), (176, 144));
+
+    let mut refusal = None;
+    let mut pictures = 1;
+    for nal in ec_h264_syntax::AnnexBIter::new(&bytes) {
+        match dec.push_nal(nal) {
+            Ok(ec_h264::NalOutcome::PictureBoundary) => {
+                dec.end_picture().expect("end_picture");
+                pictures += 1;
+                if let Err(e) = dec.push_nal(nal) {
+                    refusal = Some(e);
+                    break;
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                refusal = Some(e);
+                break;
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    match refusal {
+        Some(Error::Unsupported { what, why }) => {
+            assert!(
+                what.contains("non-I slice") || why.contains("P/B"),
+                "refused as {what} ({why}), expected the inter-slice refusal"
+            );
+            eprintln!("CABAC GOP: {pictures} intra picture(s) decoded, then refused: {what}");
+        }
+        other => panic!("expected an inter-slice refusal, got {other:?}"),
+    }
 }
 
 /// The `avcC` entry path: parameter sets out of band and NAL units length
