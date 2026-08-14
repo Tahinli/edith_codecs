@@ -305,9 +305,9 @@ impl std::fmt::Debug for Frame {
 
 /// Deinterleave an NV12 chroma plane into I420 U and V planes.
 ///
-/// Parity with `cros-codecs`' `image_processing::nv12_to_i420`, which is what
-/// edith calls today; kept as a free function because the conversion is also
-/// what an encoder input path needs, in reverse.
+/// The same conversion the software path in edith expects on the way out of a
+/// hardware frame; kept as a free function because an encoder's input path
+/// needs it in reverse.
 pub fn nv12_to_i420(
     y_plane: &[u8],
     y_pitch: usize,
