@@ -45,9 +45,11 @@
 mod boxes;
 mod demux;
 mod esds;
+mod mux;
 
 pub use demux::Mp4Demuxer;
 pub use esds::{Esds, object_type};
+pub use mux::Mp4Muxer;
 
 /// True when `head` looks like an ISOBMFF file: the second word of its first box
 /// is one of the types an mp4 or a `.mov` starts with.
