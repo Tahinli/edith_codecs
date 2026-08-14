@@ -234,6 +234,55 @@ pub fn filter_luma_h_edge16(data: &mut [u8], q0_row: usize, stride: usize, e: &E
     store_row16(data, q0_row + 2 * stride, out[5]);
 }
 
+/// Filter a whole horizontal chroma edge (eight samples wide) in one pass.
+///
+/// The four rows around a horizontal edge are contiguous, so the eight lines of
+/// the edge are eight lanes of one vector instead of eight scalar calls. Bit-
+/// identical to [`filter_chroma_line`] per lane.
+pub fn filter_chroma_h_edge8(data: &mut [u8], q0_row: usize, stride: usize, e: &EdgeParams) {
+    use wide::i16x8;
+    let load = |at: usize| -> i16x8 {
+        let mut a = [0i16; 8];
+        for (o, &b) in a.iter_mut().zip(&data[at..at + 8]) {
+            *o = i16::from(b);
+        }
+        i16x8::from(a)
+    };
+    let p1 = load(q0_row - 2 * stride);
+    let p0 = load(q0_row - stride);
+    let q0 = load(q0_row);
+    let q1 = load(q0_row + stride);
+    let alpha = i16x8::splat(e.alpha as i16);
+    let beta = i16x8::splat(e.beta as i16);
+    let filter = (p0 - q0).abs().simd_lt(alpha)
+        & (p1 - p0).abs().simd_lt(beta)
+        & (q1 - q0).abs().simd_lt(beta);
+    if !filter.any() {
+        return;
+    }
+    let two = i16x8::splat(2);
+    let (p0n, q0n) = if e.bs < 4 {
+        let tc = i16x8::splat((e.tc0 + 1) as i16);
+        let delta = ((((q0 - p0) << 2u32) + (p1 - q1) + i16x8::splat(4)) >> 3u32)
+            .max(-tc)
+            .min(tc);
+        (p0 + delta, q0 - delta)
+    } else {
+        (
+            ((p1 << 1u32) + p0 + q1 + two) >> 2u32,
+            ((q1 << 1u32) + q0 + p1 + two) >> 2u32,
+        )
+    };
+    let clip = |v: i16x8| v.max(i16x8::ZERO).min(i16x8::splat(255));
+    let store = |data: &mut [u8], at: usize, v: i16x8| {
+        for (o, &s) in data[at..at + 8].iter_mut().zip(clip(v).as_array()) {
+            *o = s as u8;
+        }
+    };
+    store(data, q0_row - stride, filter.select(p0n, p0));
+    store(data, q0_row, filter.select(q0n, q0));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

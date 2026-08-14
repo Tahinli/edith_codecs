@@ -213,16 +213,12 @@ fn store_centre(dst: &mut [u8], v: i32x8) {
 /// The rounded average of Equation 8-247 over `n` samples, sixteen at a time.
 #[inline]
 fn avg_rows(out: &mut [u8], a: &[u8], b: &[u8], n: usize) {
-    let mut i = 0;
-    while i + 16 <= n {
-        let v = (load16(a, i) + load16(b, i) + i16x16::ONE) >> 1u32;
-        for (o, &s) in out[i..i + 16].iter_mut().zip(v.as_array()) {
-            *o = s as u8;
-        }
-        i += 16;
-    }
-    for k in i..n {
-        out[k] = avg(a[k], b[k]);
+    // Written as a plain loop over equal-length slices: this is the rounded
+    // byte average, which the compiler turns into one `pavgb` per sixteen
+    // samples — half the work of widening to 16-bit lanes and narrowing back.
+    let (out, a, b) = (&mut out[..n], &a[..n], &b[..n]);
+    for i in 0..n {
+        out[i] = avg(a[i], b[i]);
     }
 }
 

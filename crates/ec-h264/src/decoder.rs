@@ -30,7 +30,8 @@ use ec_h264_syntax::{
 };
 
 use crate::deblock::{
-    chroma_qp, edge_params, filter_chroma_line, filter_luma_h_edge16, filter_luma_line,
+    chroma_qp, edge_params, filter_chroma_h_edge8, filter_chroma_line, filter_luma_h_edge16,
+    filter_luma_line,
 };
 use crate::dpb::{
     BLK_DIRECT, BLK_INTRA, BLK_SKIP, Dpb, Mark, NO_SLICE, PicInfo, Picture, Plane8, RefList,
@@ -382,10 +383,13 @@ impl Decoder {
         let (w, h) = (pic.out_size.0 as usize, pic.out_size.1 as usize);
         let (cx, cy) = (pic.crop.0 as usize, pic.crop.1 as usize);
         let copy = |p: &Plane8, x0: usize, y0: usize, w: usize, h: usize| -> Plane {
-            let mut out = vec![0u8; w * h];
+            // Grown row by row rather than allocated zeroed: every byte is
+            // about to be overwritten, and at 1080p the fill it avoids is
+            // three megabytes per frame.
+            let mut out = Vec::with_capacity(w * h);
             for row in 0..h {
                 let src = p.at(x0, y0 + row);
-                out[row * w..(row + 1) * w].copy_from_slice(&p.data[src..src + w]);
+                out.extend_from_slice(&p.data[src..src + w]);
             }
             Plane::new(out, w)
         };
@@ -1930,12 +1934,39 @@ fn direct_quadrant(
         }
         compensate(pic, refs, ctx, mb_x, mb_y, qx, qy, 2, 2, mv, ref_idx)
     } else {
+        // Each 4x4 block derives its own motion, but they usually come out
+        // equal: interpolation is position-invariant, so one 8x8 compensation
+        // of the shared vector produces the same samples as four 4x4 ones and
+        // pays the per-partition setup once instead of four times.
+        let mut motion = [([[0i16; 2]; 2], [0i8; 2]); 4];
         for dy in 0..2 {
             for dx in 0..2 {
                 let (px, py) = (qx + dx, qy + dy);
                 let (mv, ref_idx, ref_id) = direct_block(pic, refs, ctx, mvc, (px, py))?;
                 write_block(pic, mvc, px, py, mv, ref_idx, ref_id, flags);
-                compensate(pic, refs, ctx, mb_x, mb_y, px, py, 1, 1, mv, ref_idx)?;
+                motion[dy * 2 + dx] = (mv, ref_idx);
+            }
+        }
+        if motion.iter().all(|m| *m == motion[0]) {
+            let (mv, ref_idx) = motion[0];
+            return compensate(pic, refs, ctx, mb_x, mb_y, qx, qy, 2, 2, mv, ref_idx);
+        }
+        for dy in 0..2 {
+            for dx in 0..2 {
+                let (mv, ref_idx) = motion[dy * 2 + dx];
+                compensate(
+                    pic,
+                    refs,
+                    ctx,
+                    mb_x,
+                    mb_y,
+                    qx + dx,
+                    qy + dy,
+                    1,
+                    1,
+                    mv,
+                    ref_idx,
+                )?;
             }
         }
         Ok(())
@@ -2094,45 +2125,48 @@ fn compensate(
     // picture's own pitch, rather than into a temporary that is combined into a
     // second temporary and copied a third time.
     let direct = wt.is_default() && (use0 != use1);
-    let mut part = [[0u8; 256]; 2];
-    for list in 0..2 {
-        if ref_idx[list] < 0 {
-            continue;
-        }
+    let luma_ref = |list: usize| -> Result<RefPlane<'_>> {
         let rp = ctx.reference(refs, list, ref_idx[list]).ok_or_else(|| {
             Error::corrupt("reference index names a picture the buffer does not hold")
         })?;
-        let plane = RefPlane {
+        Ok(RefPlane {
             data: &rp.y.data,
             stride: rp.y.stride,
             origin: rp.y.origin,
             width: rp.y.width,
             height: rp.y.height,
             pad: rp.y.pad,
-        };
-        if direct {
-            let stride = pic.y.stride;
-            let origin = pic.y.at(x0 as usize, y0 as usize);
-            mc_luma(
-                &plane,
-                x0,
-                y0,
-                mv[list],
-                w,
-                h,
-                stride,
-                &mut pic.y.data[origin..],
-            );
-        } else {
+        })
+    };
+    let stride = pic.y.stride;
+    let origin = pic.y.at(x0 as usize, y0 as usize);
+    if direct {
+        // No scratch buffer is declared on this path at all: the scratch is
+        // zeroed on entry, and most partitions of a P slice come through here.
+        let list = usize::from(!use0);
+        let plane = luma_ref(list)?;
+        mc_luma(
+            &plane,
+            x0,
+            y0,
+            mv[list],
+            w,
+            h,
+            stride,
+            &mut pic.y.data[origin..],
+        );
+    } else {
+        let mut part = [[0u8; 256]; 2];
+        for list in 0..2 {
+            if ref_idx[list] < 0 {
+                continue;
+            }
+            let plane = luma_ref(list)?;
             mc_luma(&plane, x0, y0, mv[list], w, h, w, &mut part[list]);
         }
-    }
-    if !direct {
         let mut out = [0u8; 256];
         let (p0, p1) = part.split_at(1);
         combine(&mut out, &p0[0], &p1[0], use0, use1, &wt, w * h);
-        let stride = pic.y.stride;
-        let origin = pic.y.at(x0 as usize, y0 as usize);
         for row in 0..h {
             let dst = origin + row * stride;
             pic.y.data[dst..dst + w].copy_from_slice(&out[row * w..row * w + w]);
@@ -2146,51 +2180,51 @@ fn compensate(
     for comp in 0..2 {
         let wt = ctx.weights_for(refs, comp + 1, ref_idx[0], ref_idx[1], use0, use1);
         let direct = wt.is_default() && (use0 != use1);
-        let mut cpart = [[0u8; 64]; 2];
-        for list in 0..2 {
-            if ref_idx[list] < 0 {
-                continue;
-            }
+        let chroma_ref = |list: usize| -> RefPlane<'_> {
             let rp = ctx
                 .reference(refs, list, ref_idx[list])
                 .expect("checked above");
             let src = if comp == 0 { &rp.cb } else { &rp.cr };
-            let plane = RefPlane {
+            RefPlane {
                 data: &src.data,
                 stride: src.stride,
                 origin: src.origin,
                 width: src.width,
                 height: src.height,
                 pad: src.pad,
-            };
-            if direct {
-                let dst = if comp == 0 { &mut pic.cb } else { &mut pic.cr };
-                let stride = dst.stride;
-                let origin = dst.at(cx0 as usize, cy0 as usize);
-                mc_chroma(
-                    &plane,
-                    cx0,
-                    cy0,
-                    mv[list],
-                    cw,
-                    ch,
-                    stride,
-                    &mut dst.data[origin..],
-                );
-            } else {
+            }
+        };
+        let plane_out = if comp == 0 { &mut pic.cb } else { &mut pic.cr };
+        let stride = plane_out.stride;
+        let origin = plane_out.at(cx0 as usize, cy0 as usize);
+        if direct {
+            let list = usize::from(!use0);
+            let plane = chroma_ref(list);
+            mc_chroma(
+                &plane,
+                cx0,
+                cy0,
+                mv[list],
+                cw,
+                ch,
+                stride,
+                &mut plane_out.data[origin..],
+            );
+        } else {
+            let mut cpart = [[0u8; 64]; 2];
+            for list in 0..2 {
+                if ref_idx[list] < 0 {
+                    continue;
+                }
+                let plane = chroma_ref(list);
                 mc_chroma(&plane, cx0, cy0, mv[list], cw, ch, cw, &mut cpart[list]);
             }
-        }
-        if !direct {
             let mut cout = [0u8; 64];
             let (c0, c1) = cpart.split_at(1);
             combine(&mut cout, &c0[0], &c1[0], use0, use1, &wt, cw * ch);
-            let plane = if comp == 0 { &mut pic.cb } else { &mut pic.cr };
-            let stride = plane.stride;
-            let origin = plane.at(cx0 as usize, cy0 as usize);
             for row in 0..ch {
                 let dst = origin + row * stride;
-                plane.data[dst..dst + cw].copy_from_slice(&cout[row * cw..row * cw + cw]);
+                plane_out.data[dst..dst + cw].copy_from_slice(&cout[row * cw..row * cw + cw]);
             }
         }
     }
@@ -2498,6 +2532,25 @@ pub(crate) fn deblock_picture(pic: &mut Picture) {
                     }
                     let cq_p = if e == 0 { cqp(addr - mb_w) } else { cq_q };
                     let qp_avg = (cq_p + cq_q + 1) >> 1;
+                    let bs = bs_h[e * 2];
+                    if bs[0] == bs[1] && bs[1] == bs[2] && bs[2] == bs[3] {
+                        if bs[0] == 0 {
+                            continue;
+                        }
+                        let params = edge_params(qp_avg, sp.alpha_offset, sp.beta_offset, bs[0]);
+                        if params.alpha == 0 || params.beta == 0 {
+                            continue;
+                        }
+                        // The four rows around the edge are contiguous, so the
+                        // whole eight-sample edge filters in one pass.
+                        filter_chroma_h_edge8(
+                            &mut plane.data,
+                            base + e * 4 * stride,
+                            stride,
+                            &params,
+                        );
+                        continue;
+                    }
                     for k in 0..8 {
                         let bs = bs_h[e * 2][k / 2];
                         if bs == 0 {
