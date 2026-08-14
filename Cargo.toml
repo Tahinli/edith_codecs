@@ -9,10 +9,13 @@ license = "MIT OR Apache-2.0"
 authors = ["Ahmet Kaan Gümüş"]
 
 [workspace.dependencies]
+ec-aac = { path = "crates/ec-aac", version = "0.1.0" }
 ec-ac3 = { path = "crates/ec-ac3", version = "0.1.0" }
+ec-alac = { path = "crates/ec-alac", version = "0.1.0" }
 ec-av1-syntax = { path = "crates/ec-av1-syntax", version = "0.1.0" }
 ec-core = { path = "crates/ec-core", version = "0.1.0" }
 ec-dsp = { path = "crates/ec-dsp", version = "0.1.0" }
+ec-flac = { path = "crates/ec-flac", version = "0.1.0" }
 ec-h264-syntax = { path = "crates/ec-h264-syntax", version = "0.1.0" }
 ec-h265-syntax = { path = "crates/ec-h265-syntax", version = "0.1.0" }
 ec-image = { path = "crates/ec-image", version = "0.1.0" }
@@ -20,7 +23,11 @@ ec-inflate = { path = "crates/ec-inflate", version = "0.1.0" }
 ec-matroska = { path = "crates/ec-matroska", version = "0.1.0" }
 ec-mp3 = { path = "crates/ec-mp3", version = "0.1.0" }
 ec-mp4 = { path = "crates/ec-mp4", version = "0.1.0" }
+ec-ogg = { path = "crates/ec-ogg", version = "0.1.0" }
+ec-opus = { path = "crates/ec-opus", version = "0.1.0" }
+ec-probe = { path = "crates/ec-probe", version = "0.1.0" }
 ec-riff = { path = "crates/ec-riff", version = "0.1.0" }
+ec-vorbis = { path = "crates/ec-vorbis", version = "0.1.0" }
 ec-vp9-syntax = { path = "crates/ec-vp9-syntax", version = "0.1.0" }
 # Portable SIMD without asm or build-time tooling (family rule: pure Rust only).
 wide = "1.5"
