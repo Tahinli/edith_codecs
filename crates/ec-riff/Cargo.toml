@@ -1,0 +1,10 @@
+[package]
+name = "ec-riff"
+description = "RIFF/WAVE reader and writer: integer and float PCM, mono through 7.1, WAVE_FORMAT_EXTENSIBLE."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ec-core.workspace = true

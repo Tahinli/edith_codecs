@@ -20,6 +20,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ec-riff"
+version = "0.1.0"
+dependencies = [
+ "ec-core",
+]
+
+[[package]]
+name = "hound"
+version = "3.5.1"
+dependencies = [
+ "ec-riff",
+]
+
+[[package]]
 name = "oracle"
 version = "0.1.0"
 
