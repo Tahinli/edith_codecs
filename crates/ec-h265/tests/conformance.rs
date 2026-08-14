@@ -231,3 +231,57 @@ fn threads_do_not_change_the_bitstream() {
     let b = many.encode_idr(&frame).unwrap();
     assert_eq!(a.au, b.au, "wavefront changed the bitstream");
 }
+
+#[test]
+fn a_bit_target_lands_near_its_target() {
+    // The model picks a QP from bits-per-pixel; a picture that comes out more
+    // than a quarter off is coded once more at a corrected QP. What is asserted
+    // is the contract that mode offers — near the target, monotonic in it — not
+    // a bitrate to the byte, which no single-picture encoder can promise.
+    let mut previous = 0usize;
+    for target in [400_000u64, 1_200_000, 3_000_000] {
+        let mut cfg = EncoderConfig::new(640, 360);
+        cfg.rate_control = RateControl::TargetBits(target);
+        let encoder = Encoder::new(cfg).expect("encoder");
+        let frame = test_frame(640, 360, 5);
+        let coded = encoder.encode_idr(&frame).expect("encode");
+        let bits = coded.au.len() * 8;
+        assert!(
+            bits > previous,
+            "target {target}: {bits} bits did not grow with the target"
+        );
+        previous = bits;
+        let ratio = bits as f64 / target as f64;
+        assert!(
+            (0.4..2.5).contains(&ratio),
+            "target {target}: got {bits} bits (x{ratio:.2}) at QP {}",
+            coded.qp
+        );
+    }
+}
+
+#[test]
+fn the_batch_helper_codes_every_picture_as_its_own_access_unit() {
+    let cfg = EncoderConfig::new(128, 96);
+    let encoder = Encoder::new(cfg).expect("encoder");
+    let frames: Vec<VideoFrame> = (0..3).map(|i| test_frame(128, 96, i * 11)).collect();
+    let coded = encoder.encode_batch(frames.iter()).expect("batch encode");
+    assert_eq!(coded.len(), 3);
+    for picture in &coded {
+        // Every access unit stands alone: parameter sets, then an IDR slice.
+        let nals = ec_h265_syntax::split_annex_b(&picture.au);
+        let types: Vec<_> = nals.iter().map(|n| n.header.nal_type).collect();
+        assert_eq!(
+            &types[..4],
+            &[
+                ec_h265_syntax::NalUnitType::Vps,
+                ec_h265_syntax::NalUnitType::Sps,
+                ec_h265_syntax::NalUnitType::Pps,
+                ec_h265_syntax::NalUnitType::IdrWRadl,
+            ],
+            "access unit is not self-contained"
+        );
+    }
+    // Different pictures, different bitstreams.
+    assert_ne!(coded[0].au, coded[1].au);
+}
