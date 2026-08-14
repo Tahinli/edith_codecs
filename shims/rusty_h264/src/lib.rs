@@ -113,17 +113,37 @@ impl Decoder {
     /// Decode one access unit (Annex B, one coded picture), returning the
     /// picture it completed if any.
     pub fn decode(&mut self, au: &[u8]) -> Result<Option<YuvFrame>, Error> {
-        for nal in ec_h264_syntax::AnnexBIter::new(au) {
-            if self.inner.push_nal(nal)? == NalOutcome::PictureBoundary {
-                // Two pictures in one access unit: close the first one.
-                self.inner.end_picture()?;
-                self.inner.push_nal(nal)?;
-            }
-        }
+        self.feed(au)?;
         if self.inner.picture_open() {
             self.inner.end_picture()?;
         }
         Ok(self.take())
+    }
+
+    /// Decode a whole Annex B stream at once, returning every picture in it —
+    /// what a test that holds an encoder's output in memory asks for, where
+    /// [`Decoder::decode`] serves a demuxer handing over one unit at a time.
+    pub fn decode_stream(&mut self, stream: &[u8]) -> Result<Vec<YuvFrame>, Error> {
+        let mut out = Vec::new();
+        self.feed(stream)?;
+        // The tail: whatever the last picture and the reordering delay hold.
+        self.inner.flush()?;
+        while let Some(frame) = self.take() {
+            out.push(frame);
+        }
+        Ok(out)
+    }
+
+    /// Push every NAL in `bytes`, closing a picture wherever one ends.
+    fn feed(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        for nal in ec_h264_syntax::AnnexBIter::new(bytes) {
+            if self.inner.push_nal(nal)? == NalOutcome::PictureBoundary {
+                // The next picture starts here: close the one before it.
+                self.inner.end_picture()?;
+                self.inner.push_nal(nal)?;
+            }
+        }
+        Ok(())
     }
 
     /// Collect a picture the reordering delay is still holding, at end of
@@ -290,6 +310,12 @@ mod tests {
                 / (w * h) as f64;
             assert!(mse < 25.0, "picture {t}: mean squared error {mse:.1}");
         }
+
+        // And the same units as one stream, which is how a test that kept the
+        // encoder's output in a `Vec` decodes it back.
+        let whole: Vec<u8> = units.concat();
+        let frames = Decoder::new().decode_stream(&whole).expect("decode stream");
+        assert_eq!(frames.len(), units.len(), "one picture per access unit");
     }
 
     /// A frame whose geometry does not match the encoder is refused by name.
