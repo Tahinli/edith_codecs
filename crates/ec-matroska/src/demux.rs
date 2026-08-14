@@ -355,6 +355,18 @@ impl<R: Read + Seek> MatroskaDemuxer<R> {
         self.time_base
     }
 
+    /// The `TrackNumber` a stream index came from.
+    ///
+    /// Stream indices are this crate's own numbering; the `TrackNumber` is the
+    /// file's, and it is what a caller naming one language of a dual-audio
+    /// remux is holding.
+    pub fn track_number(&self, stream: u32) -> Option<u64> {
+        self.tracks
+            .iter()
+            .find(|t| t.stream == Some(stream))
+            .map(|t| t.number)
+    }
+
     /// The next cluster into [`MatroskaDemuxer::queue`]; `false` at the end of
     /// the segment. `at` comes back holding the offset of the cluster read.
     fn load_cluster(&mut self, at: &mut u64) -> Result<bool> {
@@ -945,6 +957,10 @@ pub(crate) fn codec_of(id: &str, bit_depth: u32) -> Option<CodecId> {
         "A_VORBIS" => CodecId::Vorbis,
         "A_AC3" => CodecId::Ac3,
         "A_EAC3" => CodecId::EAc3,
+        // Named rather than dropped: nothing here decodes them, and a track a
+        // player lists as unsupported is a better answer than a silent one.
+        "A_TRUEHD" | "A_MLP" => CodecId::TrueHd,
+        id if id.starts_with("A_DTS") => CodecId::Dts,
         "A_FLAC" => CodecId::Flac,
         "A_ALAC" => CodecId::Alac,
         "S_TEXT/UTF8" => CodecId::Srt,

@@ -38,6 +38,10 @@ pub enum CodecId {
     Ac3,
     /// Dolby Digital Plus (E-AC-3).
     EAc3,
+    /// Dolby TrueHD (MLP), including the Atmos substream.
+    TrueHd,
+    /// DTS and its extensions (DTS-HD, DTS:X).
+    Dts,
     /// Apple Lossless.
     Alac,
     /// Xiph FLAC.
@@ -78,8 +82,8 @@ impl CodecId {
         use CodecId::*;
         match self {
             H264 | H265 | Vp8 | Vp9 | Av1 => MediaType::Video,
-            Aac | Ac3 | EAc3 | Alac | Flac | Mp3 | Opus | Vorbis | PcmU8 | PcmS16Le | PcmS16Be
-            | PcmS24Le | PcmS32Le | PcmF32Le => MediaType::Audio,
+            Aac | Ac3 | EAc3 | TrueHd | Dts | Alac | Flac | Mp3 | Opus | Vorbis | PcmU8
+            | PcmS16Le | PcmS16Be | PcmS24Le | PcmS32Le | PcmF32Le => MediaType::Audio,
             Srt | WebVtt | Ass | Pgs | Tx3g => MediaType::Subtitle,
         }
     }
@@ -96,6 +100,8 @@ impl CodecId {
             Aac => "aac",
             Ac3 => "ac3",
             EAc3 => "eac3",
+            TrueHd => "truehd",
+            Dts => "dts",
             Alac => "alac",
             Flac => "flac",
             Mp3 => "mp3",
@@ -363,6 +369,8 @@ mod tests {
             CodecId::Aac,
             CodecId::Ac3,
             CodecId::EAc3,
+            CodecId::TrueHd,
+            CodecId::Dts,
             CodecId::Alac,
             CodecId::Flac,
             CodecId::Mp3,
@@ -380,7 +388,7 @@ mod tests {
             CodecId::Pgs,
             CodecId::Tx3g,
         ];
-        assert_eq!(all.len(), 24);
+        assert_eq!(all.len(), 26);
         let mut names: Vec<&str> = all.iter().map(|c| c.name()).collect();
         names.sort_unstable();
         names.dedup();
