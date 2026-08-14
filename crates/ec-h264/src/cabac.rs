@@ -30,37 +30,37 @@ use crate::entropy::{
 /// coeff_abs_level_minus1 of the 8x8 luma category, the last range a
 /// frame-coded 4:2:0 slice reaches; 436 and up are the field-coded and 4:4:4
 /// categories this decoder refuses by name).
-const NUM_CTX: usize = 436;
+pub(crate) const NUM_CTX: usize = 436;
 
 /// ctxIdx 276 (end_of_slice_flag and the I_PCM bin of mb_type) is decoded by
 /// DecodeTerminate and has no adapting state.
 const CTX_TERMINATE: usize = 276;
 
 /// Table 9-40, `ctxIdxBlockCatOffset` for the five 4:2:0 block categories.
-const CBF_CAT_OFF: [usize; 5] = [0, 4, 8, 12, 16];
-const SIG_CAT_OFF: [usize; 5] = [0, 15, 29, 44, 47];
-const ABS_CAT_OFF: [usize; 5] = [0, 10, 20, 30, 39];
+pub(crate) const CBF_CAT_OFF: [usize; 5] = [0, 4, 8, 12, 16];
+pub(crate) const SIG_CAT_OFF: [usize; 5] = [0, 15, 29, 44, 47];
+pub(crate) const ABS_CAT_OFF: [usize; 5] = [0, 10, 20, 30, 39];
 
 /// ctxIdxOffset values of Table 9-34 used here.
-const OFF_MB_TYPE: usize = 3;
-const OFF_SKIP_P: usize = 11;
-const OFF_MB_TYPE_P: usize = 14;
+pub(crate) const OFF_MB_TYPE: usize = 3;
+pub(crate) const OFF_SKIP_P: usize = 11;
+pub(crate) const OFF_MB_TYPE_P: usize = 14;
 const OFF_SUB_TYPE_P: usize = 21;
 const OFF_SKIP_B: usize = 24;
 const OFF_MB_TYPE_B: usize = 27;
 const OFF_SUB_TYPE_B: usize = 36;
-const OFF_MVD: [usize; 2] = [40, 47];
+pub(crate) const OFF_MVD: [usize; 2] = [40, 47];
 const OFF_REF_IDX: usize = 54;
-const OFF_QP_DELTA: usize = 60;
-const OFF_CHROMA_PRED: usize = 64;
-const OFF_PREV_I4: usize = 68;
-const OFF_REM_I4: usize = 69;
-const OFF_CBP_LUMA: usize = 73;
-const OFF_CBP_CHROMA: usize = 77;
-const OFF_CBF: usize = 85;
-const OFF_SIG: usize = 105;
-const OFF_LAST: usize = 166;
-const OFF_ABS: usize = 227;
+pub(crate) const OFF_QP_DELTA: usize = 60;
+pub(crate) const OFF_CHROMA_PRED: usize = 64;
+pub(crate) const OFF_PREV_I4: usize = 68;
+pub(crate) const OFF_REM_I4: usize = 69;
+pub(crate) const OFF_CBP_LUMA: usize = 73;
+pub(crate) const OFF_CBP_CHROMA: usize = 77;
+pub(crate) const OFF_CBF: usize = 85;
+pub(crate) const OFF_SIG: usize = 105;
+pub(crate) const OFF_LAST: usize = 166;
+pub(crate) const OFF_ABS: usize = 227;
 const OFF_TRANSFORM_8X8: usize = 399;
 /// significant_coeff_flag / last_significant_coeff_flag / coeff_abs_level_minus1
 /// of ctxBlockCat 5 (frame coded), Table 9-34.
@@ -76,8 +76,8 @@ const OFF_ABS_8X8: usize = 426;
 /// long, which shifts the prediction-mode bins; resolving the table to fixed
 /// ctxIdx values here is what makes the two spellings (I slice at ctxIdxOffset
 /// 3, intra suffix at 17 or 32) one piece of code.
-const I_MB_TYPE_CTX: [usize; 6] = [3, 6, 7, 8, 9, 10];
-const I_SUFFIX_CTX_P: [usize; 6] = [17, 18, 19, 19, 20, 20];
+pub(crate) const I_MB_TYPE_CTX: [usize; 6] = [3, 6, 7, 8, 9, 10];
+pub(crate) const I_SUFFIX_CTX_P: [usize; 6] = [17, 18, 19, 19, 20, 20];
 const I_SUFFIX_CTX_B: [usize; 6] = [32, 33, 34, 34, 35, 35];
 
 pub(crate) struct Cabac<'a> {
@@ -124,40 +124,9 @@ impl<'a> Cabac<'a> {
             cbp_luma_bins: 0,
             cur_intra: true,
         };
-        c.init_contexts(slice_qp, init_column.min(3));
+        c.state = init_contexts(slice_qp, init_column.min(3));
         c.init_engine()?;
         Ok(c)
-    }
-
-    /// 9.3.1.1: pStateIdx and valMPS from the (m, n) table entries and SliceQPY.
-    fn init_contexts(&mut self, slice_qp: i32, column: usize) {
-        let qp = slice_qp.clamp(0, 51);
-        let set = |state: &mut [u8; NUM_CTX], idx: usize, (m, n): (i8, i8)| {
-            let pre = (((i32::from(m) * qp) >> 4) + i32::from(n)).clamp(1, 126);
-            state[idx] = if pre <= 63 {
-                ((63 - pre) as u8) << 1
-            } else {
-                (((pre - 64) as u8) << 1) | 1
-            };
-        };
-        for (i, &mn) in INIT_MB_TYPE_I.iter().enumerate() {
-            set(&mut self.state, i, mn);
-        }
-        for (i, &mn) in INIT_11_59.iter().enumerate() {
-            set(&mut self.state, 11 + i, mn[column]);
-        }
-        for (i, &mn) in INIT_60_69.iter().enumerate() {
-            set(&mut self.state, 60 + i, mn);
-        }
-        for (i, &mn) in INIT_70_275.iter().enumerate() {
-            set(&mut self.state, 70 + i, mn[column]);
-        }
-        for (i, &mn) in INIT_399_401.iter().enumerate() {
-            set(&mut self.state, OFF_TRANSFORM_8X8 + i, mn[column]);
-        }
-        for (i, &mn) in INIT_402_435.iter().enumerate() {
-            set(&mut self.state, OFF_SIG_8X8 + i, mn[column]);
-        }
     }
 
     /// 9.3.1.2: codIRange = 510, codIOffset = read_bits(9).
@@ -716,6 +685,18 @@ impl<'a> Cabac<'a> {
         Ok(bytes)
     }
 
+    /// The raw engine, for the encoder's round-trip test.
+    #[cfg(test)]
+    pub(crate) fn decision_for_test(&mut self, ctx_idx: usize) -> bool {
+        self.decision(ctx_idx)
+    }
+
+    /// The raw bypass engine, for the encoder's round-trip test.
+    #[cfg(test)]
+    pub(crate) fn bypass_for_test(&mut self) -> bool {
+        self.bypass()
+    }
+
     /// end_of_slice_flag (ctxIdx 276, DecodeTerminate).
     pub(crate) fn more_macroblocks(&mut self) -> Result<bool> {
         debug_assert_eq!(CTX_TERMINATE, 276);
@@ -723,9 +704,44 @@ impl<'a> Cabac<'a> {
     }
 }
 
+/// 9.3.1.1: pStateIdx and valMPS of every context from the (m, n) table
+/// entries and SliceQPY. Shared with the encoder, which has to start from the
+/// same state or the two arithmetic coders diverge on the first bin.
+pub(crate) fn init_contexts(slice_qp: i32, column: usize) -> [u8; NUM_CTX] {
+    let qp = slice_qp.clamp(0, 51);
+    let mut state = [63u8 << 1; NUM_CTX];
+    let mut set = |idx: usize, (m, n): (i8, i8)| {
+        let pre = (((i32::from(m) * qp) >> 4) + i32::from(n)).clamp(1, 126);
+        state[idx] = if pre <= 63 {
+            ((63 - pre) as u8) << 1
+        } else {
+            (((pre - 64) as u8) << 1) | 1
+        };
+    };
+    for (i, &mn) in INIT_MB_TYPE_I.iter().enumerate() {
+        set(i, mn);
+    }
+    for (i, &mn) in INIT_11_59.iter().enumerate() {
+        set(11 + i, mn[column]);
+    }
+    for (i, &mn) in INIT_60_69.iter().enumerate() {
+        set(60 + i, mn);
+    }
+    for (i, &mn) in INIT_70_275.iter().enumerate() {
+        set(70 + i, mn[column]);
+    }
+    for (i, &mn) in INIT_399_401.iter().enumerate() {
+        set(OFF_TRANSFORM_8X8 + i, mn[column]);
+    }
+    for (i, &mn) in INIT_402_435.iter().enumerate() {
+        set(OFF_SIG_8X8 + i, mn[column]);
+    }
+    state
+}
+
 /// ctxIdxInc for mb_qp_delta bin `k` (Table 9-39 row 60).
 #[inline]
-fn qp_delta_inc(k: i32, first: usize) -> usize {
+pub(crate) fn qp_delta_inc(k: i32, first: usize) -> usize {
     match k {
         0 => first,
         1 => 2,
@@ -736,7 +752,7 @@ fn qp_delta_inc(k: i32, first: usize) -> usize {
 /// ctxIdxInc for significant_coeff_flag / last_significant_coeff_flag at
 /// scanning position `i` (9.3.3.1.3, frame coded, no 8x8 categories).
 #[inline]
-fn sig_inc(cat: BlockCat, i: usize) -> usize {
+pub(crate) fn sig_inc(cat: BlockCat, i: usize) -> usize {
     match cat {
         // ChromaDC with ChromaArrayType 1: Min( levelListIdx / NumC8x8, 2 ).
         BlockCat::ChromaDc(_) => i.min(2),

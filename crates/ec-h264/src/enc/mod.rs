@@ -20,6 +20,8 @@
 //! once over the whole picture, across slice boundaries exactly as a decoder
 //! runs it. No `unsafe`, no shared mutable state at all.
 
+mod cabac_enc;
+mod entropy;
 mod headers;
 mod mb;
 mod quant;
@@ -35,6 +37,7 @@ use crate::decoder::deblock_picture;
 use crate::dpb::{Picture, SliceParams as DeblockParams};
 use crate::transform::LevelScale4x4;
 
+use entropy::EncEntropy;
 use headers::{SeqParams, SliceParams, write_pps, write_slice_header, write_sps};
 use mb::{MbEnc, Source, encode_mb};
 use rc::RateControl;
@@ -59,6 +62,10 @@ pub struct EncoderConfig {
     pub bframes: u32,
     /// Speed/quality rung.
     pub preset: Preset,
+    /// Entropy coder: CABAC (Main profile) or CAVLC (Baseline). CABAC costs
+    /// roughly 12% fewer bits at the same reconstruction, which is why it is
+    /// the default; CAVLC is there for a decoder that cannot do better.
+    pub cabac: bool,
     /// Worker threads, which is also the number of slices per picture; 0 means
     /// as many as the machine has.
     pub threads: usize,
@@ -77,6 +84,7 @@ impl EncoderConfig {
             gop_size: 250,
             bframes: 0,
             preset: Preset::Fast,
+            cabac: true,
             threads: 0,
             qp: 26,
         }
@@ -184,10 +192,11 @@ impl Encoder {
             mb_h,
             timing,
             bitrate: cfg.bitrate,
+            cabac: cfg.cabac,
         };
         let sps_rbsp = write_sps(&seq);
         let sps = Sps::parse(&sps_rbsp)?;
-        let pps_rbsp = write_pps();
+        let pps_rbsp = write_pps(cfg.cabac);
         let threads = if cfg.threads == 0 {
             std::thread::available_parallelism().map_or(1, |n| n.get())
         } else {
@@ -311,6 +320,7 @@ impl Encoder {
                             first_mb: (row0 * mb_w) as u32,
                             rows: (row0, row1),
                             qp,
+                            cabac: cfg.cabac,
                             frame_num,
                             idr,
                             idr_pic_id,
@@ -434,6 +444,7 @@ struct BandJob<'a> {
     /// Macroblock rows `[start, end)`.
     rows: (usize, usize),
     qp: i32,
+    cabac: bool,
     frame_num: u32,
     idr: bool,
     idr_pic_id: u32,
@@ -453,8 +464,16 @@ fn code_band(pic: &mut Picture, job: BandJob<'_>) -> Vec<u8> {
             idr: job.idr,
             idr_pic_id: job.idr_pic_id,
             qp: job.qp,
+            cabac: job.cabac,
         },
     );
+    // CABAC starts on a byte boundary after cabac_alignment_one_bit (7.3.4).
+    let mut w = if job.cabac {
+        // cabac_init_idc 0 is the initialisation column this encoder writes.
+        EncEntropy::cabac(w, job.qp, usize::from(job.slice_type != SliceType::I))
+    } else {
+        EncEntropy::cavlc(w)
+    };
     let header_bits = w.bit_len();
     let mut e = MbEnc {
         src: job.src,
@@ -465,8 +484,10 @@ fn code_band(pic: &mut Picture, job: BandJob<'_>) -> Vec<u8> {
         target_qp: job.qp,
         lambda: lambda_for(job.qp),
         preset: job.cfg.preset,
-        skip_run: 0,
         ls: LevelScale4x4::new(&[16; 16]),
+        mb_ctx: crate::entropy::MbCtx::default(),
+        skip_inc: 0,
+        qp_delta_inc: 0,
     };
     let rows = job.rows.1 - job.rows.0;
     for (n, mb_y) in (job.rows.0..job.rows.1).enumerate() {
@@ -480,17 +501,13 @@ fn code_band(pic: &mut Picture, job: BandJob<'_>) -> Vec<u8> {
             e.lambda = lambda_for(e.target_qp);
         }
         for mb_x in 0..mb_w {
-            encode_mb(pic, &mut e, &mut w, mb_y * mb_w + mb_x);
+            let addr = mb_y * mb_w + mb_x;
+            encode_mb(pic, &mut e, &mut w, addr);
+            // end_of_slice_flag, which CABAC codes after every macroblock.
+            w.end_of_slice(mb_y + 1 == job.rows.1 && mb_x + 1 == mb_w);
         }
     }
-    if job.slice_type == SliceType::P && e.skip_run > 0 {
-        // A slice that ends in skipped macroblocks says so with a final
-        // mb_skip_run; writing one when nothing was skipped would instead tell
-        // the decoder another macroblock follows (7.3.4).
-        w.write_ue(e.skip_run);
-    }
-    headers::trailing(&mut w);
-    w.into_bytes()
+    w.finish(job.slice_type == SliceType::P)
 }
 
 /// Lagrangian multiplier for mode decision in the SATD domain.

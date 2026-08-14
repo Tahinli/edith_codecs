@@ -24,6 +24,8 @@ pub(crate) struct SeqParams {
     pub timing: (u32, u32),
     /// Bits per second the level has to carry.
     pub bitrate: u32,
+    /// CABAC, which Baseline does not allow: the sequence is then Main.
+    pub cabac: bool,
 }
 
 /// `log2_max_frame_num`, fixed: 8 bits of frame_num wrap far beyond the one
@@ -69,8 +71,10 @@ fn level_idc(p: &SeqParams) -> u8 {
 /// ASO, no redundant slices, no interlace) that either profile forbids.
 pub(crate) fn write_sps(p: &SeqParams) -> Vec<u8> {
     let mut w = BitWriter::with_capacity(32);
-    w.write_bits(66, 8); // profile_idc: Baseline
-    w.write_bits(0b1100_0000, 8); // constraint_set0_flag, constraint_set1_flag
+    // Main when CABAC is in force (Baseline has no CABAC), Baseline otherwise;
+    // constraint_set1_flag says the stream also obeys the Main constraints.
+    w.write_bits(if p.cabac { 77 } else { 66 }, 8);
+    w.write_bits(if p.cabac { 0b0100_0000 } else { 0b1100_0000 }, 8);
     w.write_bits(u32::from(level_idc(p)), 8);
     w.write_ue(0); // seq_parameter_set_id
     w.write_ue(LOG2_MAX_FRAME_NUM - 4);
@@ -110,11 +114,11 @@ pub(crate) fn write_sps(p: &SeqParams) -> Vec<u8> {
 }
 
 /// Write the picture parameter set RBSP (7.3.2.2).
-pub(crate) fn write_pps() -> Vec<u8> {
+pub(crate) fn write_pps(cabac: bool) -> Vec<u8> {
     let mut w = BitWriter::with_capacity(8);
     w.write_ue(0); // pic_parameter_set_id
     w.write_ue(0); // seq_parameter_set_id
-    w.write_bit(false); // entropy_coding_mode_flag: CAVLC
+    w.write_bit(cabac); // entropy_coding_mode_flag
     w.write_bit(false); // bottom_field_pic_order_in_frame_present_flag
     w.write_ue(0); // num_slice_groups_minus1
     w.write_ue(0); // num_ref_idx_l0_default_active_minus1
@@ -141,6 +145,8 @@ pub(crate) struct SliceParams {
     /// `idr_pic_id`, alternating between consecutive IDR pictures.
     pub idr_pic_id: u32,
     pub qp: i32,
+    /// CABAC is in force, so a P slice carries cabac_init_idc.
+    pub cabac: bool,
 }
 
 /// Write a slice header (7.3.3) into `w`; slice data follows immediately.
@@ -166,6 +172,9 @@ pub(crate) fn write_slice_header(w: &mut BitWriter, s: &SliceParams) {
     } else {
         w.write_bit(false); // adaptive_ref_pic_marking_mode_flag: sliding window
     }
+    if s.cabac && s.slice_type != SliceType::I {
+        w.write_ue(0); // cabac_init_idc
+    }
     w.write_se(s.qp - 26); // slice_qp_delta, pic_init_qp_minus26 being 0
     // deblocking_filter_control_present_flag is 0: the filter is on, offsets 0.
 }
@@ -189,15 +198,23 @@ mod tests {
             mb_h: height.div_ceil(16),
             timing: (1000, 60000),
             bitrate: 8_000_000,
+            cabac: true,
         }
     }
 
     /// The parameter sets this encoder writes are the ones the decoder's own
-    /// parser reads back, geometry, cropping and all.
+    /// parser reads back, geometry, cropping, profile and entropy coder alike.
     #[test]
     fn parameter_sets_parse_back() {
-        for (w, h) in [(1920, 1080), (640, 480), (854, 482), (16, 16)] {
-            let p = params(w, h);
+        for (w, h, cabac) in [
+            (1920, 1080, true),
+            (1920, 1080, false),
+            (640, 480, true),
+            (854, 482, false),
+            (16, 16, true),
+        ] {
+            let mut p = params(w, h);
+            p.cabac = cabac;
             let sps = Sps::parse(&write_sps(&p)).expect("SPS parses");
             assert_eq!((sps.width, sps.height), (w, h), "{w}x{h} crop");
             assert_eq!(sps.mb_width, p.mb_w);
@@ -207,8 +224,9 @@ mod tests {
             assert!(sps.frame_mbs_only);
             let vui = sps.vui.as_ref().expect("VUI present");
             assert_eq!(vui.timing_info, Some((1000, 60000, true)));
-            let pps = Pps::parse(&write_pps(), |_| Some(&sps)).expect("PPS parses");
-            assert!(!pps.entropy_coding_mode);
+            assert_eq!(sps.profile_idc, if cabac { 77 } else { 66 });
+            let pps = Pps::parse(&write_pps(cabac), |_| Some(&sps)).expect("PPS parses");
+            assert_eq!(pps.entropy_coding_mode, cabac);
             assert_eq!(pps.pic_init_qp, 26);
         }
     }
@@ -228,7 +246,7 @@ mod tests {
     fn slice_header_parses_back() {
         let p = params(320, 240);
         let sps = Sps::parse(&write_sps(&p)).unwrap();
-        let pps = Pps::parse(&write_pps(), |_| Some(&sps)).unwrap();
+        let pps = Pps::parse(&write_pps(true), |_| Some(&sps)).unwrap();
         for (idr, slice_type, first_mb, qp) in [
             (true, SliceType::I, 0u32, 30i32),
             (false, SliceType::P, 40, 18),
@@ -243,6 +261,7 @@ mod tests {
                     idr,
                     idr_pic_id: 1,
                     qp,
+                    cabac: true,
                 },
             );
             trailing(&mut w);
