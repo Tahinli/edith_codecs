@@ -32,6 +32,7 @@ pub const TRACK_NUMBER: u32 = 0xD7;
 pub const TRACK_UID: u32 = 0x73C5;
 pub const TRACK_TYPE: u32 = 0x83;
 pub const FLAG_LACING: u32 = 0x9C;
+pub const FLAG_DEFAULT: u32 = 0x88;
 pub const CODEC_ID: u32 = 0x86;
 pub const CODEC_PRIVATE: u32 = 0x63A2;
 pub const CODEC_DELAY: u32 = 0x56AA;

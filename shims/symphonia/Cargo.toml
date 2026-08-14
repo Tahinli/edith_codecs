@@ -14,3 +14,23 @@ symphonia-core = { path = "../symphonia-core", version = "0.6.0" }
 
 [dev-dependencies]
 symphonia-codec-aac = { path = "../symphonia-codec-aac", version = "0.6.0" }
+
+# The incumbent's feature names, every one of them a no-op: a caller selects
+# codecs and containers there, and here `ec_probe` serves all of them
+# unconditionally. They are declared because a feature list is part of the
+# surface a `[patch.crates-io]` entry has to answer — a consumer naming
+# `features = ["mkv"]` fails to resolve otherwise, which is not a difference
+# worth making it edit its manifest for.
+[features]
+aac = []
+alac = []
+flac = []
+id3v1 = []
+id3v2 = []
+isomp4 = []
+mkv = []
+mp3 = []
+ogg = []
+pcm = []
+vorbis = []
+wav = []

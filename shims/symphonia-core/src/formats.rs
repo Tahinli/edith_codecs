@@ -30,6 +30,11 @@ pub struct Track {
     pub num_frames: Option<u64>,
     /// First timestamp.
     pub start_ts: u64,
+    /// Samples the decoder emits before the first audible one -- an MP3's LAME
+    /// encoder delay, an Opus stream's pre-skip. **Not** dropped by the reader:
+    /// [`num_frames`](Self::num_frames) counts them, so a caller that wants the
+    /// audible stream skips them and takes `num_frames - delay` samples.
+    pub delay: Option<u64>,
     /// Codec and setup data.
     pub codec_params: Option<CodecParameters>,
     /// ISO 639 language tag, when the container carries one.

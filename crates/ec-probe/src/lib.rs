@@ -47,6 +47,10 @@ pub use tags::Tags;
 const HEAD: usize = 64 << 10;
 /// Packets a seek may look past to find one of the stream it was asked about.
 const SEEK_LOOKAHEAD: usize = 64;
+/// Samples of synthesis delay every Layer III decoder carries, on top of
+/// whatever delay the encoder wrote into the LAME tag. The number is the format
+/// 's, not this implementation's: a LAME tag is written to be read with it.
+const MP3_DECODER_DELAY: u32 = 529;
 
 /// A container (or the lack of one) this crate can open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -297,12 +301,21 @@ impl Reader {
         self.inner.streams()
     }
 
-    /// The first stream of `kind`, which is what a caller that just wants "the
-    /// audio" means.
+    /// The stream of `kind` a caller that just wants "the audio" means: the one
+    /// the container flagged ([`StreamInfo::default`]), and the first of that
+    /// kind where nothing is flagged.
+    ///
+    /// The flag comes first because it is the whole answer to which language a
+    /// dual-audio remux opens in -- a muxer that put the French track second
+    /// and marked it default meant the French one, and file order would play
+    /// the other.
     pub fn default_stream(&self, kind: MediaType) -> Option<&StreamInfo> {
-        self.streams()
-            .iter()
-            .find(|s| s.params.codec.media_type() == kind)
+        let of_kind = || {
+            self.streams()
+                .iter()
+                .filter(move |s| s.params.codec.media_type() == kind)
+        };
+        of_kind().find(|s| s.default).or_else(|| of_kind().next())
     }
 
     /// The container's own id for a stream: a Matroska `TrackNumber`, which is
@@ -326,10 +339,17 @@ impl Reader {
     }
 
     /// The longest stream's duration, when any stream states or implies one.
+    ///
+    /// What a player would play: [`StreamInfo::initial_padding`] is off it,
+    /// because an MP3's encoder delay is silence the file carries and nobody
+    /// hears.
     pub fn duration(&self) -> Option<Timestamp> {
         self.streams()
             .iter()
-            .filter_map(|s| s.duration.map(|d| Timestamp::new(d, s.time_base)))
+            .filter_map(|s| {
+                s.duration
+                    .map(|d| Timestamp::new(d - i64::from(s.initial_padding), s.time_base))
+            })
             .max_by(|a, b| {
                 a.as_secs_f64()
                     .partial_cmp(&b.as_secs_f64())
@@ -527,11 +547,22 @@ fn open_mp3<R: Read + Seek + Send + 'static>(mut src: R, head: &[u8], end: u64) 
         // ffmpeg and this reader start after it.
         start += header.frame_len().unwrap_or(0) as u64;
     }
-    let total = match xing {
-        Some(frames) => Some(frames * per_frame),
-        None => header
-            .frame_len()
-            .and_then(|len| (len > 0).then(|| (audio_end - start) / len as u64 * per_frame)),
+    // Gapless, as the LAME tag states it: a decoder emits the encoder delay
+    // plus its own 529 samples of Layer III synthesis delay before the first
+    // sample that was ever recorded, and the file runs `padding` samples past
+    // the last one. Both are silence a player must not play, and a file with no
+    // tag has neither — its frames are all there is to go on.
+    let (padding, total) = match &xing {
+        Some(x) => (
+            x.delay + MP3_DECODER_DELAY,
+            Some(x.frames * per_frame - u64::from(x.padding.saturating_sub(MP3_DECODER_DELAY))),
+        ),
+        None => (
+            0,
+            header
+                .frame_len()
+                .and_then(|len| (len > 0).then(|| (audio_end - start) / len as u64 * per_frame)),
+        ),
     };
     let demuxer = raw::RawDemuxer::new(
         src,
@@ -541,7 +572,8 @@ fn open_mp3<R: Read + Seek + Send + 'static>(mut src: R, head: &[u8], end: u64) 
         audio_end,
         total,
         None,
-    )?;
+    )?
+    .with_initial_padding(padding);
     Ok(Reader::wrap(Format::Mp3, Box::new(demuxer), tags, vec![0]))
 }
 
@@ -622,7 +654,7 @@ fn id3v1_len<R: Read + Seek>(src: &mut R, end: u64) -> Result<u64> {
 }
 
 /// The frame count a Xing/Info header states, when the first frame carries one.
-fn xing_frames(frame: &[u8], header: &ec_mp3::FrameHeader) -> Option<u64> {
+fn xing_frames(frame: &[u8], header: &ec_mp3::FrameHeader) -> Option<Xing> {
     let at = 4 + usize::from(header.crc) * 2 + header.side_info_len();
     let tag = frame.get(at..at + 8)?;
     if &tag[..4] != b"Xing" && &tag[..4] != b"Info" {
@@ -633,7 +665,37 @@ fn xing_frames(frame: &[u8], header: &ec_mp3::FrameHeader) -> Option<u64> {
         return None;
     }
     let n = frame.get(at + 8..at + 12)?;
-    Some(u64::from(u32::from_be_bytes([n[0], n[1], n[2], n[3]])))
+    let frames = u64::from(u32::from_be_bytes([n[0], n[1], n[2], n[3]]));
+    // The LAME extension sits behind whichever optional fields the flags
+    // claimed -- frame count, byte count, the 100-byte seek table, quality --
+    // and states the two trims 21 bytes into itself, twelve bits each.
+    let mut lame = at + 12;
+    lame += usize::from(flags & 2 != 0) * 4;
+    lame += usize::from(flags & 4 != 0) * 100;
+    lame += usize::from(flags & 8 != 0) * 4;
+    let (delay, padding) = match frame.get(lame + 21..lame + 24) {
+        Some(&[a, b, c]) => (
+            u32::from(a) << 4 | u32::from(b) >> 4,
+            (u32::from(b) & 0xF) << 8 | u32::from(c),
+        ),
+        _ => (0, 0),
+    };
+    Some(Xing {
+        frames,
+        delay,
+        padding,
+    })
+}
+
+/// What an MP3's Xing/Info header states: how long the file is, and the two
+/// silences the encoder had to add to make whole frames of it.
+struct Xing {
+    /// Audio frames in the file, the header frame itself excluded.
+    frames: u64,
+    /// Encoder delay: samples of silence in front of the first real one.
+    delay: u32,
+    /// Encoder padding: samples of silence after the last real one.
+    padding: u32,
 }
 
 #[cfg(test)]

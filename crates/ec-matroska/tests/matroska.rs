@@ -200,6 +200,49 @@ fn remux(src: &Path, dst: &Path) -> usize {
     packets
 }
 
+/// Seeking each stream of `path` to its own first packet lands on that packet.
+fn a_seek_to_the_beginning_lands_on_the_first_packet(path: &Path) {
+    let mut demuxer =
+        MatroskaDemuxer::new(BufReader::new(File::open(path).expect("opens"))).expect("demuxes");
+    let streams = demuxer.streams().to_vec();
+    for stream in &streams {
+        let mut first = None;
+        loop {
+            match demuxer.next_packet() {
+                Ok(packet) if packet.stream == stream.index => {
+                    first = packet.pts;
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        let Some(first) = first else { continue };
+        demuxer
+            .seek(
+                stream.index,
+                Timestamp::new(first, stream.time_base),
+                SeekMode::SyncBefore,
+            )
+            .expect("seeks to the beginning");
+        loop {
+            let packet = demuxer.next_packet().expect("a packet after the seek");
+            if packet.stream != stream.index {
+                continue;
+            }
+            assert_eq!(
+                packet.pts,
+                Some(first),
+                "{}: stream {} restarts at {:?}, not at its first packet {first}",
+                path.display(),
+                stream.index,
+                packet.pts,
+            );
+            break;
+        }
+    }
+}
+
 /// Every `SeekHead` entry of `path` resolves to an element of the id it names.
 ///
 /// `SeekPosition` is stated from the start of the `Segment`'s payload, and a
@@ -300,6 +343,13 @@ fn every_fixture_remuxes_into_a_file_ffprobe_and_ffmpeg_agree_with() {
         // reader (symphonia's) follows the pointer into the middle of a cluster
         // and refuses the file outright. Checked by resolving every entry.
         seek_head_points_at_what_it_names(&dst);
+
+        // ...and a seek to the beginning really goes there. Our own muxer cues
+        // the *video* track only, and one of its cue clusters can start after
+        // the first audio block does, so a seek that trusted the nearest cue
+        // began past the sound: 20 ms of an export, a whole cluster of a film,
+        // missing from the start of every playback that seeked to zero.
+        a_seek_to_the_beginning_lands_on_the_first_packet(&dst);
 
         // ...and it decodes, which is the only claim a field compare cannot make.
         let decode = Command::new("ffmpeg")
@@ -572,4 +622,92 @@ fn real_library_spot_sweep() {
         ));
     }
     println!("{}", table.join("\n"));
+}
+
+/// A file whose *first* cluster holds only sound: seeking its audio track to
+/// the beginning lands on that block, not on the first cue.
+///
+/// This muxer opens a new cluster at every video keyframe and cues the video
+/// track alone, so an audio block written before the first keyframe ends up in
+/// a cluster the cue table never names. A seek that started at the nearest cue
+/// began *past* that block -- a whole cluster of sound gone from the start of
+/// playback, which is the class of defect this crate exists not to have.
+#[test]
+fn the_first_cluster_is_reachable_when_no_cue_names_it() {
+    let src = matroska_fixtures()
+        .into_iter()
+        .find(|p| {
+            MatroskaDemuxer::new(BufReader::new(File::open(p).unwrap()))
+                .map(|d| {
+                    d.streams()
+                        .iter()
+                        .filter(|s| {
+                            matches!(
+                                s.params.codec.media_type(),
+                                ec_core::registry::MediaType::Audio
+                                    | ec_core::registry::MediaType::Video
+                            )
+                        })
+                        .count()
+                        > 1
+                })
+                .unwrap_or(false)
+        })
+        .expect("a fixture with both picture and sound");
+
+    let mut demuxer =
+        MatroskaDemuxer::new(BufReader::new(File::open(&src).expect("opens"))).expect("demuxes");
+    let streams = demuxer.streams().to_vec();
+    let audio = streams
+        .iter()
+        .find(|s| s.params.codec.media_type() == ec_core::registry::MediaType::Audio)
+        .expect("an audio stream")
+        .index;
+    let mut packets = Vec::new();
+    while let Ok(packet) = demuxer.next_packet() {
+        packets.push(packet);
+        if packets.len() > 400 {
+            break;
+        }
+    }
+    // The one block that has to lead: an audio block, in front of every
+    // keyframe, so the cluster it opens is one no cue can name.
+    let first_audio = packets
+        .iter()
+        .position(|p| p.stream == audio)
+        .expect("an audio packet");
+    let lead = packets.remove(first_audio);
+    let want = lead.pts;
+    packets.insert(0, lead);
+
+    let dst = work().join("cue-blind-first-cluster.mkv");
+    let mut muxer = MatroskaMuxer::new(File::create(&dst).expect("output"));
+    for stream in &streams {
+        muxer.add_stream(stream.clone()).expect("stream declared");
+    }
+    for packet in &packets {
+        muxer.write_packet(packet).expect("packet written");
+    }
+    muxer.finish().expect("finished");
+
+    let mut back =
+        MatroskaDemuxer::new(BufReader::new(File::open(&dst).expect("opens"))).expect("demuxes");
+    back.seek(
+        audio,
+        Timestamp::new(want.unwrap_or(0), streams[audio as usize].time_base),
+        SeekMode::SyncBefore,
+    )
+    .expect("seeks to the beginning");
+    loop {
+        let packet = back.next_packet().expect("a packet after the seek");
+        if packet.stream != audio {
+            continue;
+        }
+        assert_eq!(
+            packet.pts, want,
+            "the audio restarts at {:?} and not at its first block {want:?}",
+            packet.pts
+        );
+        break;
+    }
 }

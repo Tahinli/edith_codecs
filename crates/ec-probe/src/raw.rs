@@ -104,6 +104,13 @@ impl<R: Read + Seek> RawDemuxer<R> {
         })
     }
 
+    /// State that this stream opens with `samples` a decoder emits before the
+    /// first audible one ([`StreamInfo::initial_padding`]).
+    pub(crate) fn with_initial_padding(mut self, samples: u32) -> RawDemuxer<R> {
+        self.streams[0].initial_padding = samples;
+        self
+    }
+
     /// Samples in a typical frame of this format, for the tail of an estimate.
     fn frame_samples(&self) -> u64 {
         match self.kind {
