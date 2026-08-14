@@ -1,6 +1,6 @@
-//! H.264 software decoder.
+//! H.264 software decoder and encoder.
 //!
-//! Current scope: I, P and B slices under both entropy coders (CAVLC and
+//! Decoder scope: I, P and B slices under both entropy coders (CAVLC and
 //! CABAC) of 8-bit 4:2:0 progressive streams — intra prediction, inter
 //! prediction with the full decoded picture buffer of clause 8.2, weighted
 //! prediction, and the in-loop deblocking filter — decoded bit-exactly against
@@ -41,6 +41,7 @@ mod codec;
 mod deblock;
 mod decoder;
 mod dpb;
+mod enc;
 mod entropy;
 mod inter;
 mod mv;
@@ -51,3 +52,4 @@ mod transform;
 pub use codec::H264Decoder;
 pub use decoder::{Decoder, NalOutcome, OutputOrder};
 pub use ec_core::error::{Error, Result};
+pub use enc::{EncodedPicture, Encoder, EncoderConfig, PictureView, Preset};
