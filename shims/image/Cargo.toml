@@ -1,0 +1,11 @@
+[package]
+name = "image"
+description = "Compatibility shim: the image surface edith's engine consumes, served by ec-image."
+version = "0.25.10"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+ec-image = { path = "../../crates/ec-image", version = "0.1.0" }
