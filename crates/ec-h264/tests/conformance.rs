@@ -1946,3 +1946,46 @@ fn packet_entry_surface_reorders_and_carries_timestamps() {
         out.len()
     );
 }
+
+/// Spatial direct prediction whose co-located picture is itself a B picture.
+///
+/// With a B pyramid the picture at RefPicList1[0] of the first B in a run is a
+/// coded B picture, so its blocks are bi-predicted and carry two reference
+/// indices. colZeroFlag (8.4.1.2.2) reads refIdxCol — the index of the list
+/// 8.4.1.2.1 selected — and a decoder that instead accepts "either index is 0"
+/// zeroes motion vectors that must keep their prediction. Several references
+/// are what makes the two readings differ at all, so this needs `-refs`.
+#[test]
+fn spatial_direct_over_a_b_reference_matches_ffmpeg() {
+    if !have_ffmpeg() {
+        eprintln!("SKIP: ffmpeg not on PATH");
+        return;
+    }
+    let dir = scratch("direct-bref");
+    let mut failures = Vec::new();
+    for (tag, coder) in [("cabac", "ac"), ("cavlc", "0")] {
+        let extra = [
+            "-profile:v",
+            "high",
+            "-coder",
+            coder,
+            "-qp",
+            "24",
+            "-bf",
+            "3",
+            "-refs",
+            "4",
+            "-x264-params",
+            "b-adapt=0:b-pyramid=normal:direct=spatial:8x8dct=1",
+        ];
+        match x264_encode_gop(&dir, tag, "352x288", 40, &extra) {
+            None => failures.push(format!("{tag}: ffmpeg cannot encode")),
+            Some(stream) => match compare_sequence(&stream) {
+                Ok(n) => eprintln!("b-pyramid direct {tag}: {n} frames bit-exact"),
+                Err(e) => failures.push(format!("{tag}: {e}")),
+            },
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(failures.is_empty(), "{failures:#?}");
+}
