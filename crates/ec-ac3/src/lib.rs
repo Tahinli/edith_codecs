@@ -24,19 +24,19 @@
 //!   it down or off.
 //! - **Dialogue normalisation is surfaced, never applied.** §7.6 puts
 //!   `dialnorm` in the volume control, which is not in this crate.
-//! - **Dither is on by default** (§7.3.4) but its sequence is
-//!   implementation-defined, so two conformant decoders differ by exactly that
-//!   noise; [`Options::dither`] turns it off when a comparison needs to
+//! - **The noise this format asks for is on by default**: dither for zero-bit
+//!   mantissas (§7.3.4) and the spectral extension blend (§E3.6.4.2.4). Neither
+//!   sequence is specified, so two conformant decoders differ by exactly that
+//!   noise; [`Options::dither`] turns both off when a comparison needs to
 //!   isolate everything else.
 //!
 //! Annex E coverage: the adaptive hybrid transform (with its vector and
 //! gain-adaptive quantizers) and spectral extension are decoded; enhanced
 //! coupling and dependent substreams above 5.1 are refused by name rather than
-//! decoded wrongly. On a real Dolby Digital Plus stream that uses AHT and
-//! spectral extension the output tracks ffmpeg's to a per-channel correlation
-//! of 0.994 rather than the 0.9999 the rest of the format reaches — the
-//! remaining difference is in the AHT quantizer detail and the two decoders'
-//! independent noise sources.
+//! decoded wrongly. On a real Dolby Digital Plus stream that uses both, the
+//! coded bins land within 0.01% of ffmpeg's energy and the whole channel within
+//! 0.999 correlation once the two decoders' independent noise is taken out of
+//! the comparison ([`Options::dither`]).
 //!
 //! No unsafe, no allocation on the block path beyond the output buffer, and no
 //! dependencies beyond the family IR and DSP crates.

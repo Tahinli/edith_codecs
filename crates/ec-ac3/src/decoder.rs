@@ -38,13 +38,16 @@ pub struct Options {
     pub drc_scale: f32,
     /// Channel folding, off by default.
     pub downmix: Downmix,
-    /// Substitute pseudo-random noise for zero-bit mantissas (§7.3.4), which
-    /// is what the standard asks a decoder to do and what this defaults to.
+    /// Generate the pseudo-random noise the format asks for: dither in place
+    /// of zero-bit mantissas (§7.3.4) and the blend that fills the spectral
+    /// extension band (§E3.6.4.2.4). On by default, because both are what the
+    /// standard asks a decoder to do.
     ///
-    /// The sequence itself is implementation-defined ("any reasonably random
-    /// sequence"), so two conformant decoders differ by exactly this noise;
-    /// turning it off is how a comparison against another decoder isolates
-    /// everything else.
+    /// Neither sequence is specified — §7.3.4 says "any reasonably random
+    /// sequence" and §E3.6.4.2.4 just names a zero-mean unit-variance source —
+    /// so two conformant decoders differ by exactly this noise and nothing
+    /// else. Turning it off is how a comparison against another decoder
+    /// isolates everything that *is* specified.
     pub dither: bool,
 }
 
