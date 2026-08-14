@@ -7,7 +7,7 @@ use std::ops::Range;
 use ec_core::{
     AudioParameters, Buf, ChannelLayout, CodecId, CodecParameters, ColorInfo, ContentLight,
     Demuxer, Error, MediaParameters, MediaType, Packet, PacketFlags, Result, Rounding, SeekMode,
-    StreamInfo, TimeBase, Timestamp, VideoParameters,
+    StreamInfo, TimeBase, Timestamp, VideoParameters, color::Tags,
 };
 
 use crate::ebml::{self, Elements};
@@ -82,6 +82,9 @@ struct Track {
     codec_id: String,
     /// `TrackName` — "Japanese 5.1", "Signs" — empty where the file has none.
     name: String,
+    /// What this track's `Colour` element *stated*, tier by tier — empty for a
+    /// track that carries none and for one that is not a picture.
+    color_tags: Tags,
     /// What `TrackType` said, for the tracks with no `stream` of their own:
     /// "MPEG-2 *video* nothing here decodes" is an answer, "no video track" is
     /// not.
@@ -418,6 +421,21 @@ impl<R: Read + Seek> MatroskaDemuxer<R> {
             .filter(|t| t.stream.is_none())
             .map(|t| (t.number, t.codec_id.as_str(), t.media))
             .collect()
+    }
+
+    /// What `stream`'s `Colour` element **stated** about its colour, field by
+    /// field: [`None`] wherever the element said nothing.
+    ///
+    /// Not the same answer as [`VideoParameters::color`], and the difference is
+    /// the reason this exists. A [`ColorInfo`] has to fill in a `full_range`
+    /// flag whether or not the file carried one, so a `Colour` element with no
+    /// `Range` child — which is most of them — reads there as a *declaration*
+    /// of limited range and shadows a bitstream VUI that said full: a
+    /// full-range picture displayed as limited, which is a washed-out one.
+    /// [`Tags`] can say nothing, so that is what an absent `Range` comes back
+    /// as.
+    pub fn color_tags(&self, stream: u32) -> Tags {
+        self.track(stream).map_or(Tags::default(), |t| t.color_tags)
     }
 
     /// Whether this track's frames arrive as the encoder wrote them — no
@@ -1072,6 +1090,9 @@ fn parse_tracks(
         let mut name = String::new();
         let (mut default_duration, mut unpack) = (None, Unpack::None);
         let (mut width, mut height, mut color) = (0u32, 0u32, ColorInfo::default());
+        // The `Range` element's own code -- 0 for an element that never stated
+        // one, which is not the same claim as "limited" and must not become it.
+        let mut range_code = 0u64;
         let mut display = (0u64, 0u64);
         let mut light = ContentLight::default();
         let (mut rate, mut channels, mut bits) = (0f64, 0u64, 0u64);
@@ -1107,7 +1128,9 @@ fn parse_tracks(
                             // mean, in the same H.273 code points the bitstream
                             // uses. An element the file leaves out stays
                             // "unspecified" and falls to the tier below.
-                            ebml::COLOUR => parse_colour(buf, leaf, &mut color, &mut light),
+                            ebml::COLOUR => {
+                                parse_colour(buf, leaf, &mut color, &mut light, &mut range_code)
+                            }
                             _ => {}
                         }
                     }
@@ -1194,6 +1217,11 @@ fn parse_tracks(
             stream,
             codec_id: codec,
             name,
+            color_tags: Tags::from_codes(
+                u64::from(color.matrix),
+                u64::from(color.transfer),
+                range_code,
+            ),
             media,
             unpack,
             default_duration: step,
@@ -1202,16 +1230,28 @@ fn parse_tracks(
     (streams, tracks)
 }
 
-fn parse_colour(buf: &[u8], range: Range<usize>, color: &mut ColorInfo, light: &mut ContentLight) {
-    let start = range.start;
-    for (id, child) in Elements::new(&buf[range]) {
+fn parse_colour(
+    buf: &[u8],
+    at: Range<usize>,
+    color: &mut ColorInfo,
+    light: &mut ContentLight,
+    range: &mut u64,
+) {
+    let start = at.start;
+    for (id, child) in Elements::new(&buf[at]) {
         let child = start + child.start..start + child.end;
         match id {
             ebml::MATRIX_COEFFICIENTS => color.matrix = ebml::uint_of(&buf[child]) as u8,
             ebml::TRANSFER_CHARACTERISTICS => color.transfer = ebml::uint_of(&buf[child]) as u8,
             ebml::PRIMARIES => color.primaries = ebml::uint_of(&buf[child]) as u8,
-            // Matroska says the range as a code, not a flag: 1 limited, 2 full.
-            ebml::RANGE => color.full_range = ebml::uint_of(&buf[child]) == 2,
+            // Matroska says the range as a code, not a flag: 0 unspecified,
+            // 1 limited, 2 full. The code is kept as well as the flag: an
+            // element that stated nothing is not an element that stated
+            // "limited" ([`MatroskaDemuxer::color_tags`]).
+            ebml::RANGE => {
+                *range = ebml::uint_of(&buf[child]);
+                color.full_range = *range == 2;
+            }
             ebml::MAX_CLL => light.max_cll = nits(ebml::uint_of(&buf[child]) as f64),
             ebml::MAX_FALL => light.max_fall = nits(ebml::uint_of(&buf[child]) as f64),
             ebml::MASTERING_METADATA => {
@@ -1574,6 +1614,51 @@ mod tests {
         assert_eq!(language_of("jpn", "x-private"), "jpn");
         assert_eq!(language_of("", ""), "und");
         assert_eq!(language_of("", "fil"), "fil");
+    }
+
+    /// **An absent `Range` states nothing**, and must not be read as a
+    /// declaration of limited range.
+    ///
+    /// [`ColorInfo`] has to answer `full_range` either way, so the tier a host
+    /// resolves colour with comes off [`MatroskaDemuxer::color_tags`] instead:
+    /// there an untagged track says nothing and lets the bitstream's own VUI
+    /// answer, where reading the `ColorInfo` would shadow a full-range stream
+    /// and display it washed out. Same shape as ec-mp4's `nclc` box.
+    #[test]
+    fn a_colour_element_with_no_range_child_declares_no_range() {
+        let colour = |range: Option<u64>| {
+            let mut tags = Vec::new();
+            uint(&mut tags, ebml::MATRIX_COEFFICIENTS, 1);
+            uint(&mut tags, ebml::TRANSFER_CHARACTERISTICS, 1);
+            uint(&mut tags, ebml::PRIMARIES, 1);
+            if let Some(range) = range {
+                uint(&mut tags, ebml::RANGE, range);
+            }
+            let mut video = Vec::new();
+            uint(&mut video, ebml::PIXEL_WIDTH, 64);
+            uint(&mut video, ebml::PIXEL_HEIGHT, 64);
+            elem(&mut video, ebml::COLOUR, &tags);
+            let mut entry = track(1, 1, "V_AV1", None);
+            elem(&mut entry, ebml::VIDEO, &video);
+            let mut tracks = Vec::new();
+            elem(&mut tracks, ebml::TRACK_ENTRY, &entry);
+            let (streams, parsed) =
+                parse_tracks(&tracks, 1_000_000, TimeBase::new(1, 1_000), None);
+            let info = streams[0].params.video().expect("a picture").clone();
+            (info, parsed[0].color_tags)
+        };
+
+        let (info, tags) = colour(None);
+        assert_eq!(
+            tags.full_range, None,
+            "a Colour element with no Range child states no range"
+        );
+        assert!(!info.color.full_range, "the ColorInfo still has to answer one");
+        assert_eq!(tags.matrix, Some(ec_core::color::Matrix::Bt709));
+
+        assert_eq!(colour(Some(1)).1.full_range, Some(false), "1 is limited");
+        assert_eq!(colour(Some(2)).1.full_range, Some(true), "2 is full");
+        assert!(colour(Some(2)).0.color.full_range);
     }
 
     #[test]
