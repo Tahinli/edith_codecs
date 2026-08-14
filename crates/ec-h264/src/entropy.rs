@@ -38,6 +38,9 @@ pub(crate) const FLAG_INTER: u8 = 16;
 pub(crate) const FLAG_DIRECT: u8 = 32;
 /// mb_type is P_Skip or B_Skip (9.3.3.1.1.1).
 pub(crate) const FLAG_SKIP: u8 = 64;
+/// transform_size_8x8_flag is 1: the luma residual is four 8x8 transform
+/// blocks, and an Intra_NxN macroblock predicts in 8x8 blocks (8.3.2).
+pub(crate) const FLAG_TRANS8X8: u8 = 128;
 
 /// Residual block class (spec Table 9-42, the 4:2:0 subset this decoder codes).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -101,7 +104,7 @@ pub(crate) struct MbCtx {
 
 /// The slice-data syntax reader.
 ///
-/// The CABAC variant is much the larger of the two (it carries 402 context
+/// The CABAC variant is much the larger of the two (it carries 436 context
 /// variables), and stays inline on purpose: one of these lives per slice on the
 /// stack, so boxing it would trade a compile-time size warning for a heap
 /// allocation in a decode loop that is otherwise allocation free.
@@ -369,6 +372,17 @@ impl<'a> Entropy<'a> {
                 crate::cavlc::residual_block(r, coeff, cat.max_num_coeff(), nc)
             }
             Entropy::Cabac(c) => c.residual_block(coeff, cat, na, nb),
+        }
+    }
+
+    /// Decode one 8x8 luma residual block into `coeff[0..64]` in scan order,
+    /// returning the number of non-zero coefficients. CABAC only: a CAVLC 8x8
+    /// block is coded as four interleaved 4x4 blocks (7.3.5.3.1), which the
+    /// caller reads through [`Entropy::residual_block`].
+    pub(crate) fn residual_block_8x8(&mut self, coeff: &mut [i32; 64]) -> Result<u8> {
+        match self {
+            Entropy::Cavlc(_) => Err(Error::corrupt("8x8 residual block read from a CAVLC slice")),
+            Entropy::Cabac(c) => c.residual_block_8x8(coeff),
         }
     }
 

@@ -1,10 +1,11 @@
 //! CABAC slice-data parsing (spec clause 9.3): arithmetic decoding engine,
 //! context variables, binarizations and context selection.
 //!
-//! Scope is what a frame-coded 4:2:0 8-bit stream needs, I, P and B; every
-//! other tool the decoder refuses by name before reaching this module, so the
-//! contexts, block categories and initialisation columns that only field or
-//! 8x8-transform coding reads are absent rather than transcribed untested.
+//! Scope is what a frame-coded 4:2:0 8-bit stream needs, I, P and B, with or
+//! without the High-profile 8x8 transform; every other tool the decoder refuses
+//! by name before reaching this module, so the contexts, block categories and
+//! initialisation columns that only field or 4:4:4 coding reads are absent
+//! rather than transcribed untested.
 //!
 //! The engine keeps codIRange and codIOffset in `u32` with the spec's exact
 //! integer steps — no probability floats, no shortcuts — and reads its bits
@@ -17,16 +18,19 @@ use ec_core::error::{Error, Result};
 
 use crate::bits::BitCursor;
 use crate::cabac_tables::{
-    INIT_11_59, INIT_60_69, INIT_70_275, INIT_399_401, INIT_MB_TYPE_I, RANGE_LPS, TRANS_LPS,
-    TRANS_MPS,
+    INIT_11_59, INIT_60_69, INIT_70_275, INIT_399_401, INIT_402_435, INIT_MB_TYPE_I, LAST_8X8,
+    RANGE_LPS, SIG_8X8_FRAME, TRANS_LPS, TRANS_MPS,
 };
 use crate::entropy::{
-    BlockCat, FLAG_CHROMA_PRED, FLAG_DIRECT, FLAG_I16, FLAG_INTER, FLAG_PCM, MbCtx, MbInfo,
+    BlockCat, FLAG_CHROMA_PRED, FLAG_DIRECT, FLAG_I16, FLAG_INTER, FLAG_PCM, FLAG_TRANS8X8, MbCtx,
+    MbInfo,
 };
 
-/// Highest ctxIdx this decoder can address, plus one (399..401 is the
-/// transform_size_8x8_flag block, the last range a frame-coded slice reaches).
-const NUM_CTX: usize = 402;
+/// Highest ctxIdx this decoder can address, plus one (426..435 is
+/// coeff_abs_level_minus1 of the 8x8 luma category, the last range a
+/// frame-coded 4:2:0 slice reaches; 436 and up are the field-coded and 4:4:4
+/// categories this decoder refuses by name).
+const NUM_CTX: usize = 436;
 
 /// ctxIdx 276 (end_of_slice_flag and the I_PCM bin of mb_type) is decoded by
 /// DecodeTerminate and has no adapting state.
@@ -58,6 +62,11 @@ const OFF_SIG: usize = 105;
 const OFF_LAST: usize = 166;
 const OFF_ABS: usize = 227;
 const OFF_TRANSFORM_8X8: usize = 399;
+/// significant_coeff_flag / last_significant_coeff_flag / coeff_abs_level_minus1
+/// of ctxBlockCat 5 (frame coded), Table 9-34.
+const OFF_SIG_8X8: usize = 402;
+const OFF_LAST_8X8: usize = 417;
+const OFF_ABS_8X8: usize = 426;
 
 /// The ctxIdx values the Intra_16x16 part of an mb_type bin string uses, in
 /// bin order: `[b0, CodedBlockPatternLuma, chroma bin 0, chroma bin 1,
@@ -145,6 +154,9 @@ impl<'a> Cabac<'a> {
         }
         for (i, &mn) in INIT_399_401.iter().enumerate() {
             set(&mut self.state, OFF_TRANSFORM_8X8 + i, mn[column]);
+        }
+        for (i, &mn) in INIT_402_435.iter().enumerate() {
+            set(&mut self.state, OFF_SIG_8X8 + i, mn[column]);
         }
     }
 
@@ -415,11 +427,15 @@ impl<'a> Cabac<'a> {
         Ok(if self.bypass() { -value } else { value })
     }
 
-    /// transform_size_8x8_flag (9.3.3.1.1.10).
+    /// transform_size_8x8_flag (9.3.3.1.1.10): a neighbour counts when it is
+    /// available and carried the flag itself.
     pub(crate) fn transform_size_8x8_flag(&mut self) -> Result<bool> {
-        // No neighbour can carry the flag: a macroblock that set it is refused
-        // before its state is ever stored, so ctxIdxInc is always 0 here.
-        Ok(self.decision(OFF_TRANSFORM_8X8))
+        let cond = |n: Option<MbInfo>| match n {
+            None => 0,
+            Some(i) => usize::from(i.flags & FLAG_TRANS8X8 != 0),
+        };
+        let inc = cond(self.ctx.a) + cond(self.ctx.b);
+        Ok(self.decision(OFF_TRANSFORM_8X8 + inc))
     }
 
     /// prev_intra4x4_pred_mode_flag, then rem_intra4x4_pred_mode as FL cMax=7
@@ -580,8 +596,44 @@ impl<'a> Cabac<'a> {
         }
         sig[num - 1] = true;
 
-        // Levels, highest scanning position first (9.3.3.1.3 counters).
-        let abs_base = OFF_ABS + ABS_CAT_OFF[cat_i];
+        self.decode_levels(coeff, &sig, num, OFF_ABS + ABS_CAT_OFF[cat_i], cat_i == 3)
+    }
+
+    /// residual_block_cabac for a luma 8x8 block (ctxBlockCat 5).
+    ///
+    /// There is no coded_block_flag here: with ChromaArrayType other than 3,
+    /// 7.3.5.3.3 sends the flag only when maxNumCoeff differs from 64, so the
+    /// coded_block_pattern bit that selected this block is the whole signal and
+    /// the flag is inferred to be 1.
+    pub(crate) fn residual_block_8x8(&mut self, coeff: &mut [i32; 64]) -> Result<u8> {
+        *coeff = [0; 64];
+        let mut sig = [false; 64];
+        let mut num = 64;
+        let mut i = 0;
+        while i + 1 < num {
+            if self.decision(OFF_SIG_8X8 + usize::from(SIG_8X8_FRAME[i])) {
+                sig[i] = true;
+                if self.decision(OFF_LAST_8X8 + usize::from(LAST_8X8[i])) {
+                    num = i + 1;
+                }
+            }
+            i += 1;
+        }
+        sig[num - 1] = true;
+        self.decode_levels(coeff, &sig, num, OFF_ABS_8X8, false)
+    }
+
+    /// coeff_abs_level_minus1 and coeff_sign_flag over a decoded significance
+    /// map, highest scanning position first (9.3.3.1.3 counters). Returns the
+    /// number of levels written.
+    fn decode_levels(
+        &mut self,
+        coeff: &mut [i32],
+        sig: &[bool],
+        num: usize,
+        abs_base: usize,
+        chroma_dc: bool,
+    ) -> Result<u8> {
         let mut num_eq1 = 0u32;
         let mut num_gt1 = 0u32;
         let mut total = 0u8;
@@ -594,7 +646,7 @@ impl<'a> Cabac<'a> {
             } else {
                 4.min(1 + num_eq1) as usize
             };
-            let inc1 = 5 + (4 - u32::from(cat_i == 3)).min(num_gt1) as usize;
+            let inc1 = 5 + (4 - u32::from(chroma_dc)).min(num_gt1) as usize;
             // Prefix: TU with cMax = uCoff = 14.
             let mut prefix = 0u32;
             while prefix < 14 {

@@ -3,15 +3,16 @@
 //! The initialisation values of Tables 9-12 to 9-21 for every ctxIdx a
 //! frame-coded 4:2:0 slice can reach: 0..10 (I-slice mb_type), 11..59 (the
 //! inter elements: mb_skip_flag, P and B mb_type and sub_mb_type, mvd,
-//! ref_idx), 60..69 (shared by all slice types), 70..275 and 399..401.
+//! ref_idx), 60..69 (shared by all slice types), 70..275, 399..401 (the
+//! transform size flag) and 402..435 (the frame-coded 8x8 luma residual).
 //!
 //! Where a ctxIdx has cabac_init_idc columns they are stored as
 //! `[I/SI, idc 0, idc 1, idc 2]` and [`crate::cabac::Cabac`] selects the column
 //! once per slice. ctxIdx 11..53 are never read by an I slice; their I column
 //! repeats the idc-0 values so the arrays stay rectangular.
 //!
-//! Absent on purpose: the field-coded significance contexts (277..398) and the
-//! 8x8 transform categories (402..1023) — both tools are refused by name, so
+//! Absent on purpose: the field-coded significance contexts (277..398, 436..459)
+//! and the 4:4:4 categories (460..1023) — both tools are refused by name, so
 //! transcribing their numbers would ship values no oracle here exercises.
 
 /// Table 9-12, ctxIdx 0..10: mb_type in I slices.
@@ -308,6 +309,61 @@ pub(crate) const INIT_70_275: [[(i8, i8); 4]; 206] = [
     [(-12, 86), (-3, 70), (-5, 73), (-13, 86)],
     [(-13, 90), (-6, 79), (-1, 70), (-9, 83)],
     [(-14, 97), (-8, 85), (-4, 78), (-10, 87)],
+];
+
+/// Table 9-24, ctxIdx 402..435: the frame-coded 8x8 luma residual contexts
+/// (significant_coeff_flag 402..416, last_significant_coeff_flag 417..425,
+/// coeff_abs_level_minus1 426..435), all four initialisation columns.
+pub(crate) const INIT_402_435: [[(i8, i8); 4]; 34] = [
+    [(-17, 120), (-4, 79), (-5, 85), (-3, 78)],
+    [(-20, 112), (-7, 71), (-6, 81), (-8, 74)],
+    [(-18, 114), (-5, 69), (-10, 77), (-9, 72)],
+    [(-11, 85), (-9, 70), (-7, 81), (-10, 72)],
+    [(-15, 92), (-8, 66), (-17, 80), (-18, 75)],
+    [(-14, 89), (-10, 68), (-18, 73), (-12, 71)],
+    [(-26, 71), (-19, 73), (-4, 74), (-11, 63)],
+    [(-15, 81), (-12, 69), (-10, 83), (-5, 70)],
+    [(-14, 80), (-16, 70), (-9, 71), (-17, 75)],
+    [(0, 68), (-15, 67), (-9, 67), (-14, 72)],
+    [(-14, 70), (-20, 62), (-1, 61), (-16, 67)],
+    [(-24, 56), (-19, 70), (-8, 66), (-8, 53)],
+    [(-23, 68), (-16, 66), (-14, 66), (-14, 59)],
+    [(-24, 50), (-22, 65), (0, 59), (-9, 52)],
+    [(-11, 74), (-20, 63), (2, 59), (-11, 68)],
+    [(23, -13), (9, -2), (17, -10), (9, -2)],
+    [(26, -13), (26, -9), (32, -13), (30, -10)],
+    [(40, -15), (33, -9), (42, -9), (31, -4)],
+    [(49, -14), (39, -7), (49, -5), (33, -1)],
+    [(44, 3), (41, -2), (53, 0), (33, 7)],
+    [(45, 6), (45, 3), (64, 3), (31, 12)],
+    [(44, 34), (49, 9), (68, 10), (37, 23)],
+    [(33, 54), (45, 27), (66, 27), (31, 38)],
+    [(19, 82), (36, 59), (47, 57), (20, 64)],
+    [(-3, 75), (-6, 66), (-5, 71), (-9, 71)],
+    [(-1, 23), (-7, 35), (0, 24), (-7, 37)],
+    [(1, 34), (-7, 42), (-1, 36), (-8, 44)],
+    [(1, 43), (-8, 45), (-2, 42), (-11, 49)],
+    [(0, 54), (-5, 48), (-2, 52), (-10, 56)],
+    [(-2, 55), (-12, 56), (-9, 57), (-12, 59)],
+    [(0, 61), (-6, 60), (-6, 63), (-8, 63)],
+    [(1, 64), (-5, 62), (-4, 65), (-9, 67)],
+    [(0, 68), (-8, 66), (-4, 67), (-6, 68)],
+    [(-9, 92), (-8, 76), (-7, 82), (-10, 79)],
+];
+
+/// Table 9-43, frame-coded column: ctxIdxInc of significant_coeff_flag for
+/// ctxBlockCat 5, indexed by levelListIdx 0..62.
+pub(crate) const SIG_8X8_FRAME: [u8; 63] = [
+    0, 1, 2, 3, 4, 5, 5, 4, 4, 3, 3, 4, 4, 4, 5, 5, 4, 4, 4, 4, 3, 3, 6, 7, 7, 7, 8, 9, 10, 9, 8,
+    7, 7, 6, 11, 12, 13, 11, 6, 7, 8, 9, 14, 10, 9, 8, 6, 11, 12, 13, 11, 6, 9, 14, 10, 9, 11, 12,
+    13, 11, 14, 10, 12,
+];
+
+/// Table 9-43, last column: ctxIdxInc of last_significant_coeff_flag for
+/// ctxBlockCat 5, indexed by levelListIdx 0..62.
+pub(crate) const LAST_8X8: [u8; 63] = [
+    0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+    3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7, 8, 8, 8,
 ];
 
 /// Table 9-16, ctxIdx 399..401: transform_size_8x8_flag.

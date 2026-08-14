@@ -38,18 +38,22 @@ use crate::dpb::{
 };
 use crate::entropy::{
     BlockCat, Entropy, FLAG_CHROMA_PRED, FLAG_DECODED, FLAG_DIRECT, FLAG_I16, FLAG_INTER, FLAG_PCM,
-    FLAG_SKIP, MbCtx, MbInfo,
+    FLAG_SKIP, FLAG_TRANS8X8, MbCtx, MbInfo,
 };
 use crate::inter::{RefPlane, Weights, combine, mc_chroma, mc_luma};
 use crate::mv::{
     B_SHAPES, B_SUB, MbShape, MvCtx, P_SHAPES, P_SUB, Pred, SubShape, min_positive, neighbour_mvd,
     predict_mv, ref_idx_cond, write_block, write_intra_mb, write_mvd,
 };
-use crate::pred::{Nbr4, PlaneWindow, add_residual_4x4, pred_4x4, pred_16x16, pred_chroma_8x8};
+use crate::pred::{
+    Nbr4, Nbr8, PlaneWindow, add_residual_4x4, add_residual_8x8, filter_nbr8, pred_4x4, pred_8x8,
+    pred_16x16, pred_chroma_8x8,
+};
 use crate::tables::{BLK4_POS, CHROMA_QP};
 use crate::transform::{
-    LevelScale4x4, chroma_dc_transform_420, dequant_4x4, inverse_transform_4x4, luma_dc_transform,
-    unzigzag, unzigzag_ac15,
+    LevelScale4x4, LevelScale8x8, chroma_dc_transform_420, dequant_4x4, dequant_8x8,
+    inverse_transform_4x4, inverse_transform_8x8, luma_dc_transform, unzigzag, unzigzag_8x8,
+    unzigzag_ac15,
 };
 
 /// Where a 4x4 block's top-right neighbour samples come from, per
@@ -110,6 +114,9 @@ pub struct Decoder {
     has_picture: bool,
     /// Scaling factors of the active PPS/SPS, `[intra, inter][Y, Cb, Cr]`.
     ls: [[LevelScale4x4; 3]; 2],
+    /// The same for the 8x8 luma transform, `[intra, inter]` (4:2:0 has no 8x8
+    /// chroma transform).
+    ls8: [LevelScale8x8; 2],
     active_pps: Option<u32>,
     /// `seq_parameter_set_id` of the most recently stored SPS, so a container
     /// entry path can publish the picture size before the first slice.
@@ -174,6 +181,7 @@ impl Decoder {
             dpb: Dpb::default(),
             has_picture: false,
             ls: flat_scaling(),
+            ls8: [LevelScale8x8::new(&[16; 64]), LevelScale8x8::new(&[16; 64])],
             active_pps: None,
             last_sps: None,
             cur_info: PicInfo {
@@ -526,6 +534,7 @@ impl Decoder {
                             &mut self.cur,
                             &self.dpb.frames,
                             &self.ls,
+                            &self.ls8,
                             &mut r,
                             &mut ctx,
                             mb_addr,
@@ -543,6 +552,7 @@ impl Decoder {
                             &mut self.cur,
                             &self.dpb.frames,
                             &self.ls,
+                            &self.ls8,
                             &mut r,
                             &mut ctx,
                             mb_addr,
@@ -566,6 +576,7 @@ impl Decoder {
                     &mut self.cur,
                     &self.dpb.frames,
                     &self.ls,
+                    &self.ls8,
                     &mut r,
                     &mut ctx,
                     mb_addr,
@@ -678,6 +689,11 @@ impl Decoder {
                     LevelScale4x4::new(weights[1][2]),
                 ],
             ];
+            let w8 = match lists {
+                Some(l) => [&l.list_8x8[0], &l.list_8x8[1]],
+                None => [&[16u8; 64]; 2],
+            };
+            self.ls8 = [LevelScale8x8::new(w8[0]), LevelScale8x8::new(w8[1])];
             self.active_pps = Some(pps.id);
         }
         Ok(())
@@ -865,12 +881,16 @@ impl SliceCtx {
     }
 }
 
-/// Neighbour-availability snapshot for one macroblock (left, top, top-right).
+/// Neighbour-availability snapshot for one macroblock (left, top, top-right,
+/// top-left). The top-left neighbour is only read by the Intra_8x8 reference
+/// filter of 8.3.2.2.1, which changes its end taps when the corner sample is
+/// missing.
 #[derive(Clone, Copy)]
 struct MbNeighbors {
     a: bool,
     b: bool,
     c: bool,
+    d: bool,
 }
 
 fn mb_neighbors(pic: &Picture, mb_x: usize, mb_y: usize, slice_id: u16) -> MbNeighbors {
@@ -881,6 +901,7 @@ fn mb_neighbors(pic: &Picture, mb_x: usize, mb_y: usize, slice_id: u16) -> MbNei
         a: mb_x > 0 && same(addr - 1),
         b: mb_y > 0 && same(addr - w),
         c: mb_y > 0 && mb_x + 1 < w && same(addr - w + 1),
+        d: mb_y > 0 && mb_x > 0 && same(addr - w - 1),
     }
 }
 
@@ -894,6 +915,7 @@ fn intra_neighbors(pic: &Picture, mb_x: usize, mb_y: usize, n: MbNeighbors) -> M
         a: n.a && intra(addr - 1),
         b: n.b && intra(addr - w),
         c: n.c && intra(addr - w + 1),
+        d: n.d && intra(addr - w - 1),
     }
 }
 
@@ -950,6 +972,7 @@ fn decode_macroblock(
     pic: &mut Picture,
     refs: &[Picture],
     ls: &[[LevelScale4x4; 3]; 2],
+    ls8: &[LevelScale8x8; 2],
     r: &mut Entropy<'_>,
     ctx: &mut SliceCtx,
     mb_addr: usize,
@@ -1023,7 +1046,9 @@ fn decode_macroblock(
     };
     r.set_intra(intra_type.is_some());
     if let Some(shape) = shape {
-        return decode_inter_mb(pic, refs, ls, r, ctx, mb_addr, shape, skipped, mb_type, nbr);
+        return decode_inter_mb(
+            pic, refs, ls, ls8, r, ctx, mb_addr, shape, skipped, mb_type, nbr,
+        );
     }
     let mb_type = intra_type.expect("an intra macroblock type");
     write_intra_mb(pic, mb_x, mb_y);
@@ -1082,18 +1107,45 @@ fn decode_macroblock(
         (0, 0, 0) // read below via me(v)
     };
 
-    // I_NxN transform size flag (High profile only).
-    if !is_i16 && ctx.transform_8x8_mode && r.transform_size_8x8_flag()? {
-        return Err(Error::unsupported(
-            "8x8 transform",
-            "transform_size_8x8_flag 1 selects the 8x8 intra prediction of \
-             clause 8.3.2 and the 8x8 transform of 8.5.13; not implemented",
-        ));
-    }
+    // I_NxN transform size flag (7.3.5, High profile only): it selects
+    // Intra_8x8 prediction and the 8x8 transform for this macroblock.
+    let trans8x8 = !is_i16 && ctx.transform_8x8_mode && r.transform_size_8x8_flag()?;
 
-    // mb_pred (7.3.5.1): intra 4x4 modes, then chroma mode.
+    // mb_pred (7.3.5.1): intra 4x4 or 8x8 modes, then chroma mode.
     let mut modes = [2u8; 16];
-    if !is_i16 {
+    let mut modes8 = [2u8; 4];
+    if trans8x8 {
+        // Intra_8x8: four modes, predicted by 8.3.2.1 from the neighbouring
+        // block modes. Every 4x4 slot of an 8x8 block carries its mode, which
+        // is exactly what 8.3.1.1 and 8.3.2.1 read back from a neighbour
+        // whichever size that neighbour used.
+        for blk8 in 0..4 {
+            let (bx, by) = (bx0 + (blk8 % 2) * 2, by0 + (blk8 / 2) * 2);
+            let left_avail = if blk8.is_multiple_of(2) {
+                intra_nbr.a
+            } else {
+                true
+            };
+            let top_avail = if blk8 < 2 { intra_nbr.b } else { true };
+            let pred = if left_avail && top_avail {
+                let ma = pic.i4_modes[by * w4 + bx - 1];
+                let mb = pic.i4_modes[(by - 1) * w4 + bx];
+                ma.min(mb)
+            } else {
+                2
+            };
+            let mode = match r.intra4x4_pred_mode()? {
+                None => pred,
+                Some(rem) if rem < pred => rem,
+                Some(rem) => rem + 1,
+            };
+            modes8[blk8] = mode;
+            for dy in 0..2 {
+                let base = (by + dy) * w4 + bx;
+                pic.i4_modes[base..base + 2].fill(mode);
+            }
+        }
+    } else if !is_i16 {
         for blk in 0..16 {
             let (dx, dy) = BLK4_POS[blk];
             let (bx, by) = (bx0 + dx as usize, by0 + dy as usize);
@@ -1134,6 +1186,7 @@ fn decode_macroblock(
     finish_macroblock(
         pic,
         &ls[0],
+        &ls8[0],
         r,
         ctx,
         mb_addr,
@@ -1145,9 +1198,11 @@ fn decode_macroblock(
             cbp_luma,
             cbp_chroma,
             modes,
+            modes8,
+            trans8x8,
             chroma_mode,
             intra: true,
-            flags: if is_i16 { FLAG_I16 } else { 0 },
+            flags: if is_i16 { FLAG_I16 } else { 0 } | if trans8x8 { FLAG_TRANS8X8 } else { 0 },
         },
     )
 }
@@ -1165,6 +1220,10 @@ struct MbFinish {
     cbp_luma: u8,
     cbp_chroma: u8,
     modes: [u8; 16],
+    /// Intra8x8PredMode per 8x8 block, when `trans8x8` and `intra`.
+    modes8: [u8; 4],
+    /// transform_size_8x8_flag: the luma residual is four 8x8 transform blocks.
+    trans8x8: bool,
     chroma_mode: u8,
     intra: bool,
     flags: u8,
@@ -1183,6 +1242,7 @@ struct MbFinish {
 fn finish_macroblock(
     pic: &mut Picture,
     ls: &[LevelScale4x4; 3],
+    ls8: &LevelScale8x8,
     r: &mut Entropy<'_>,
     ctx: &mut SliceCtx,
     mb_addr: usize,
@@ -1264,6 +1324,69 @@ fn finish_macroblock(
                 .y
                 .at(mb_x * 16 + dx as usize * 4, mb_y * 16 + dy as usize * 4);
             add_residual_4x4(&mut pic.y.data, pic.y.stride, origin, &resid);
+        }
+    } else if m.trans8x8 {
+        // 8x8 transform (8.5.13): predict, parse and reconstruct one 8x8 block
+        // at a time, because an Intra_8x8 block predicts from the reconstructed
+        // samples of the blocks before it.
+        let mut scan8 = [0i32; 64];
+        let mut raster8 = [0i32; 64];
+        let mut resid8 = [0i32; 64];
+        for blk8 in 0..4 {
+            let (x, y) = (mb_x * 16 + (blk8 % 2) * 8, mb_y * 16 + (blk8 / 2) * 8);
+            let (bx, by) = (bx0 + (blk8 % 2) * 2, by0 + (blk8 / 2) * 2);
+            let origin = pic.y.at(x, y);
+            let stride = pic.y.stride;
+            if m.intra {
+                let n = filter_nbr8(&gather_nbr8(pic, &m.pred_nbr, blk8, x, y));
+                let mut p = [0u8; 64];
+                pred_8x8(m.modes8[blk8], &n, &mut p);
+                for ry in 0..8 {
+                    let row = origin + ry * stride;
+                    pic.y.data[row..row + 8].copy_from_slice(&p[ry * 8..ry * 8 + 8]);
+                }
+            }
+            if cbp_luma & (1 << blk8) == 0 {
+                for dy in 0..2 {
+                    let base = (by + dy) * w4 + bx;
+                    pic.nz_y[base..base + 2].fill(0);
+                }
+                continue;
+            }
+            let tc = if r.is_cabac() {
+                // ctxBlockCat 5: one 64-coefficient block, and every 4x4 slot
+                // of it reports the block's own count to the neighbours
+                // (9.3.3.1.1.9 resolves them to the 8x8 transform block).
+                let tc = r.residual_block_8x8(&mut scan8)?;
+                for dy in 0..2 {
+                    let base = (by + dy) * w4 + bx;
+                    pic.nz_y[base..base + 2].fill(tc.min(16));
+                }
+                tc
+            } else {
+                // CAVLC codes the same 64 coefficients as four interleaved 4x4
+                // blocks (7.3.5.3.1), each with its own nC neighbourhood.
+                let mut tc = 0u8;
+                for i4 in 0..4 {
+                    let (dx, dy) = BLK4_POS[blk8 * 4 + i4];
+                    let (sx, sy) = (bx0 + dx as usize, by0 + dy as usize);
+                    let (na, nb) = luma_nz_pair(pic, nbr, sx, sy);
+                    let n = r.residual_block(&mut scan, BlockCat::Luma4x4, na, nb)?;
+                    pic.nz_y[sy * w4 + sx] = n;
+                    tc += n;
+                    for i in 0..16 {
+                        scan8[4 * i + i4] = scan[i];
+                    }
+                }
+                tc
+            };
+            if tc == 0 {
+                continue;
+            }
+            unzigzag_8x8(&scan8, &mut raster8);
+            dequant_8x8(&mut raster8, ls8, qp_y);
+            inverse_transform_8x8(&raster8, &mut resid8);
+            add_residual_8x8(&mut pic.y.data, stride, origin, &resid8);
         }
     } else {
         for blk in 0..16 {
@@ -1388,6 +1511,7 @@ fn decode_inter_mb(
     pic: &mut Picture,
     refs: &[Picture],
     ls: &[[LevelScale4x4; 3]; 2],
+    ls8: &[LevelScale8x8; 2],
     r: &mut Entropy<'_>,
     ctx: &mut SliceCtx,
     mb_addr: usize,
@@ -1611,10 +1735,28 @@ fn decode_inter_mb(
         pic.i4_modes[base..base + 4].fill(2);
     }
     let (cbp_luma, cbp_chroma) = r.coded_block_pattern_inter()?;
+    // transform_size_8x8_flag (7.3.5): only when every 8x8 of this macroblock
+    // is predicted as a whole, because an 8x8 transform block may not straddle
+    // two motion partitions.
+    let no_sub_lt_8x8 = !shape.sub
+        || (0..4).all(|p| {
+            let s = motion.sub[p];
+            if s.pred == Pred::Direct {
+                ctx.direct_8x8_inference
+            } else {
+                s.parts == 1
+            }
+        });
+    let trans8x8 = cbp_luma != 0
+        && ctx.transform_8x8_mode
+        && no_sub_lt_8x8
+        && (!direct_mb || ctx.direct_8x8_inference)
+        && r.transform_size_8x8_flag()?;
     // The inter scaling lists (Table 7-2 lists 3..5) govern an inter residual.
     finish_macroblock(
         pic,
         &ls[1],
+        &ls8[1],
         r,
         ctx,
         mb_addr,
@@ -1626,9 +1768,12 @@ fn decode_inter_mb(
             cbp_luma,
             cbp_chroma,
             modes: [2; 16],
+            modes8: [2; 4],
+            trans8x8,
             chroma_mode: 0,
             intra: false,
-            flags: if b && mb_type == 0 { FLAG_DIRECT } else { 0 },
+            flags: if b && mb_type == 0 { FLAG_DIRECT } else { 0 }
+                | if trans8x8 { FLAG_TRANS8X8 } else { 0 },
         },
     )
 }
@@ -2042,6 +2187,52 @@ fn gather_nbr4(pic: &Picture, nbr: &MbNeighbors, blk: usize, x: usize, y: usize)
     }
 }
 
+/// Gather the 25 neighbour samples of an Intra_8x8 luma block (spec 8.3.2.2),
+/// including the top-right substitution rule, unfiltered.
+///
+/// `blk8` is luma8x8BlkIdx: block 1 reaches the above-right macroblock for its
+/// top-right run, block 2 finds it inside this macroblock, and block 3 has none
+/// (the samples right of it are not decoded yet).
+fn gather_nbr8(pic: &Picture, nbr: &MbNeighbors, blk8: usize, x: usize, y: usize) -> Nbr8 {
+    let stride = pic.y.stride;
+    let o = pic.y.at(x, y);
+    let data = &pic.y.data;
+    let have_top = if blk8 < 2 { nbr.b } else { true };
+    let have_left = if blk8.is_multiple_of(2) { nbr.a } else { true };
+    let have_tr = match blk8 {
+        0 => nbr.b,
+        1 => nbr.c,
+        2 => true,
+        _ => false,
+    };
+    let have_tl = match blk8 {
+        0 => nbr.d,
+        1 => nbr.b,
+        2 => nbr.a,
+        _ => true,
+    };
+    let mut top = [0u8; 16];
+    top[..8].copy_from_slice(&data[o - stride..o - stride + 8]);
+    if have_tr {
+        top[8..].copy_from_slice(&data[o - stride + 8..o - stride + 16]);
+    } else {
+        let t7 = top[7];
+        top[8..].fill(t7);
+    }
+    let mut left = [0u8; 8];
+    for (i, l) in left.iter_mut().enumerate() {
+        *l = data[o + i * stride - 1];
+    }
+    Nbr8 {
+        top,
+        left,
+        top_left: data[o - stride - 1],
+        have_top,
+        have_left,
+        have_tl,
+    }
+}
+
 /// Whole-picture deblocking (spec 8.7): macroblocks in raster order, all
 /// vertical edges then all horizontal edges per macroblock, then chroma.
 // `e` and `j` are edge and segment positions inside the macroblock, used to
@@ -2074,6 +2265,11 @@ fn deblock_picture(pic: &mut Picture) {
                 }
             };
             let qp_q = qp_of(addr);
+            // 8.7: an 8x8-transform macroblock has no transform edge at luma
+            // 4 or 12, so those internal edges are not filtered. Chroma is
+            // unaffected for 4:2:0 (its internal edge sits on luma edge 8).
+            let internal =
+                |e: usize| e.is_multiple_of(2) || pic.mb_flags[addr] & FLAG_TRANS8X8 == 0;
 
             // Boundary strengths, per 4-sample segment of each edge (8.7.2.1).
             let mut bs_v = [[0u8; 4]; 4];
@@ -2096,6 +2292,9 @@ fn deblock_picture(pic: &mut Picture) {
                 // Vertical edges (filter across columns), left to right.
                 for e in 0..4 {
                     if e == 0 && !filter_left {
+                        continue;
+                    }
+                    if !internal(e) {
                         continue;
                     }
                     let qp_p = if e == 0 { qp_of(addr - 1) } else { qp_q };
@@ -2126,6 +2325,9 @@ fn deblock_picture(pic: &mut Picture) {
                 // Horizontal edges, top to bottom.
                 for e in 0..4 {
                     if e == 0 && !filter_top {
+                        continue;
+                    }
+                    if !internal(e) {
                         continue;
                     }
                     let qp_p = if e == 0 { qp_of(addr - mb_w) } else { qp_q };
@@ -2271,7 +2473,20 @@ fn boundary_strength(
     if intra {
         return if mb_edge { 4 } else { 3 };
     }
-    if pic.nz_y[p] != 0 || pic.nz_y[q] != 0 {
+    // "the transform block containing the sample has non-zero levels": for an
+    // 8x8-transform macroblock that is the whole 8x8, whose four 4x4 slots
+    // carry per-slot counts under CAVLC (7.3.5.3.1 splits it into four blocks).
+    let coded = |mb: usize, bx: usize, by: usize| -> bool {
+        if pic.mb_flags[mb] & FLAG_TRANS8X8 == 0 {
+            return pic.nz_y[by * w4 + bx] != 0;
+        }
+        let (ox, oy) = (bx & !1, by & !1);
+        pic.nz_y[oy * w4 + ox] != 0
+            || pic.nz_y[oy * w4 + ox + 1] != 0
+            || pic.nz_y[(oy + 1) * w4 + ox] != 0
+            || pic.nz_y[(oy + 1) * w4 + ox + 1] != 0
+    };
+    if coded(p_mb, pbx, pby) || coded(q_mb, qbx, qby) {
         return 2;
     }
     let (pr, qr) = (pic.ref_id[p], pic.ref_id[q]);

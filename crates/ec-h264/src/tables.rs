@@ -503,6 +503,17 @@ pub const NORM_ADJUST_4X4: [[u16; 3]; 6] = [
 /// (i % 2, j % 2) == (0,0) -> 0, (1,1) -> 1, else 2 (Equation 8-314).
 pub const NORM_ADJUST_CLASS_4X4: [u8; 16] = [0, 2, 0, 2, 2, 1, 2, 1, 0, 2, 0, 2, 2, 1, 2, 1];
 
+/// Equation 8-318: normAdjust8x8 v matrix, rows m = qP % 6, columns the six
+/// position classes of Equation 8-317.
+pub const NORM_ADJUST_8X8: [[u16; 6]; 6] = [
+    [20, 18, 32, 19, 25, 24],
+    [22, 19, 35, 21, 28, 26],
+    [26, 23, 42, 24, 33, 31],
+    [28, 25, 45, 26, 35, 33],
+    [32, 28, 51, 30, 40, 38],
+    [36, 32, 58, 34, 46, 43],
+];
+
 /// Table 8-16: alpha' by indexA.
 pub const ALPHA: [u8; 52] = [
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 4, 5, 6, 7, 8, 9, 10, 12, 13, 15, 17, 20,
@@ -539,6 +550,10 @@ pub const TC0: [[u8; 52]; 3] = [
 
 /// 4x4 zig-zag scan: scan position -> raster index (Table 8-13, frame scan).
 pub const ZIGZAG_4X4: [u8; 16] = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15];
+
+/// 8x8 zig-zag scan: scan position -> raster index (Table 8-14, frame scan).
+/// Shared with the scaling-list parser, which reads the same scan.
+pub use ec_h264_syntax::sps::ZIGZAG_8X8;
 
 /// luma4x4BlkIdx -> (x, y) position in 4-sample units within the macroblock
 /// (spec 6.4.3 inverse 4x4 luma block scan).
