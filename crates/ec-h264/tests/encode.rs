@@ -129,12 +129,18 @@ fn reconstruction_matches_the_decoder() {
     for (w, h) in [(176, 144), (208, 122), (64, 48)] {
         let mut clip = Clip::new(w, h);
         for qp in [12, 24, 33, 44] {
-            for (threads, preset) in [(1usize, Preset::Fast), (4, Preset::Balanced)] {
+            for (threads, preset, cabac) in [
+                (1usize, Preset::Fast, true),
+                (4, Preset::Balanced, true),
+                (1, Preset::Fast, false),
+                (3, Preset::Balanced, false),
+            ] {
                 let mut cfg = EncoderConfig::new(w as u32, h as u32);
                 cfg.qp = qp;
                 cfg.gop_size = 5;
                 cfg.threads = threads;
                 cfg.preset = preset;
+                cfg.cabac = cabac;
                 let mut enc = Encoder::new(cfg).expect("encoder");
                 let mut stream = Vec::new();
                 let mut recons = Vec::new();
@@ -337,8 +343,10 @@ fn ffmpeg_decodes_bit_exactly() {
     }
     for (w, h) in [(176, 144), (322, 242)] {
         for qp in [10, 20, 28, 37, 47] {
+            let cavlc = qp % 2 == 0; // both entropy coders across the sweep
             let (stream, recons) = encode_clip(w, h, 6, |cfg| {
                 cfg.qp = qp;
+                cfg.cabac = !cavlc;
             });
             let decoded = ffmpeg_decode(&stream, w, h, &[]).expect("ffmpeg decodes our stream");
             assert_eq!(decoded.len(), recons.len(), "{w}x{h} qp {qp}: frame count");
