@@ -456,3 +456,461 @@ fn encoder_output_decodes_in_ffmpeg_without_warnings() {
         }
     }
 }
+
+/// The derived tables have to be complete prefix codes, and that is checkable
+/// without any oracle: a Kraft sum of exactly 1 with the entry count the
+/// standard prescribes leaves no room for a transcription slip.
+#[test]
+fn every_codebook_is_a_complete_prefix_code() {
+    let expected = [81usize, 81, 81, 81, 81, 81, 64, 64, 169, 169, 289];
+    for (i, cb) in ec_aac::tables::CODEBOOKS.iter().enumerate() {
+        assert_eq!(
+            cb.codes.len(),
+            expected[i],
+            "codebook {} entry count",
+            i + 1
+        );
+        let kraft: f64 = cb
+            .codes
+            .iter()
+            .map(|(l, _)| 2f64.powi(-i32::from(*l)))
+            .sum();
+        assert!(
+            (kraft - 1.0).abs() < 1e-12,
+            "codebook {} Kraft sum {kraft}",
+            i + 1
+        );
+        assert_prefix_free(cb.codes, &format!("codebook {}", i + 1));
+    }
+    let sf = ec_aac::tables::SCALEFACTOR_CODES;
+    assert_eq!(sf.len(), 121, "scalefactor codebook entry count");
+    let kraft: f64 = sf.iter().map(|(l, _)| 2f64.powi(-i32::from(*l))).sum();
+    assert!((kraft - 1.0).abs() < 1e-12, "scalefactor Kraft sum {kraft}");
+    assert_prefix_free(sf, "scalefactor codebook");
+}
+
+fn assert_prefix_free(codes: &[(u8, u32)], what: &str) {
+    for (i, &(li, ci)) in codes.iter().enumerate() {
+        for &(lj, cj) in codes.iter().skip(i + 1) {
+            let short = li.min(lj);
+            if (ci >> (li - short)) == (cj >> (lj - short)) {
+                panic!("{what}: {ci:b}/{li} and {cj:b}/{lj} share a prefix");
+            }
+        }
+    }
+}
+
+/// Band tables must be monotone and land exactly on the window length.
+#[test]
+fn band_tables_span_the_window() {
+    for (i, swb) in ec_aac::tables::SWB_LONG.iter().enumerate() {
+        assert_eq!(swb[0], 0, "long index {i}");
+        assert_eq!(*swb.last().unwrap(), 1024, "long index {i}");
+        assert!(swb.windows(2).all(|w| w[0] < w[1]), "long index {i}");
+    }
+    for (i, swb) in ec_aac::tables::SWB_SHORT.iter().enumerate() {
+        assert_eq!(swb[0], 0, "short index {i}");
+        assert_eq!(*swb.last().unwrap(), 128, "short index {i}");
+        assert!(swb.windows(2).all(|w| w[0] < w[1]), "short index {i}");
+    }
+}
+
+/// The AudioSpecificConfig this crate writes is byte-identical to the one the
+/// reference muxer puts in an `esds`, which is what "ffmpeg accepts our ASC"
+/// means in practice.
+#[test]
+fn asc_matches_the_one_ffmpeg_writes() {
+    if !have_ffmpeg() {
+        eprintln!("SKIP: ffmpeg not on PATH");
+        return;
+    }
+    let tmp = std::env::temp_dir().join("ec-aac-esds");
+    std::fs::create_dir_all(&tmp).expect("temp dir");
+    for (channels, rate) in [(1u16, 48_000u32), (2, 48_000), (2, 44_100), (6, 48_000)] {
+        let pcm = tone_pcm(rate, usize::from(channels), 0.4);
+        let adts = encode_to_adts(&pcm, channels, rate, 128);
+        let src = tmp.join(format!("asc-{channels}-{rate}.aac"));
+        std::fs::write(&src, &adts).expect("write");
+        let mp4 = tmp.join(format!("asc-{channels}-{rate}.mp4"));
+        let out = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-i"])
+            .arg(&src)
+            .args(["-c:a", "copy"])
+            .arg(&mp4)
+            .output()
+            .expect("ffmpeg runs");
+        assert!(
+            out.status.success(),
+            "remux of our ADTS failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let theirs = esds_asc(&std::fs::read(&mp4).expect("read mp4"))
+            .expect("the muxer wrote a DecoderSpecificInfo");
+        let ours = ec_aac::audio_specific_config_bytes(rate, channels);
+        assert_eq!(
+            ours, theirs,
+            "{channels}ch/{rate}Hz ASC differs from the reference muxer's"
+        );
+        // And it parses back to the parameters it went in with.
+        let cfg = ec_aac::parse_audio_specific_config(&ours).expect("asc parses");
+        assert_eq!((cfg.sample_rate, cfg.channels), (rate, channels));
+    }
+}
+
+/// The DecoderSpecificInfo payload of the first `esds` box: tag 0x05 inside the
+/// DecoderConfigDescriptor, with the usual 7-bit length encoding.
+fn esds_asc(mp4: &[u8]) -> Option<Vec<u8>> {
+    let at = mp4.windows(4).position(|w| w == b"esds")?;
+    let mut i = at + 4;
+    while i < mp4.len() {
+        if mp4[i] == 0x05 {
+            let mut j = i + 1;
+            let mut len = 0usize;
+            loop {
+                let b = *mp4.get(j)?;
+                len = (len << 7) | usize::from(b & 0x7F);
+                j += 1;
+                if b & 0x80 == 0 {
+                    break;
+                }
+            }
+            return mp4.get(j..j + len).map(<[u8]>::to_vec);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// AAC tracks from the machine's own library, not just generated fixtures: the
+/// elementary stream is copied out to ADTS and decoded both ways.
+#[test]
+fn real_library_tracks_match_ffmpeg() {
+    if !have_ffmpeg() {
+        eprintln!("SKIP: ffmpeg not on PATH");
+        return;
+    }
+    let manifest = fixtures().join("real-library-manifest.tsv");
+    let Ok(text) = std::fs::read_to_string(&manifest) else {
+        eprintln!("SKIP: no real-library manifest; run scripts/scan-real-library.sh");
+        return;
+    };
+    let tmp = std::env::temp_dir().join("ec-aac-real");
+    std::fs::create_dir_all(&tmp).expect("temp dir");
+    let mut stereo = 0;
+    let mut wide = 0;
+    let mut checked = 0;
+    for line in text.lines().skip(1) {
+        if stereo >= 3 && wide >= 2 {
+            break;
+        }
+        let path = line.split('\t').next().unwrap_or_default();
+        if path.is_empty() || !line.to_lowercase().contains("aac") {
+            continue;
+        }
+        let file = Path::new(path);
+        if !file.exists() {
+            continue;
+        }
+        let Some((index, channels, profile)) = aac_stream(file) else {
+            continue;
+        };
+        // HE-AAC is reported, not decoded: see `sbr_is_reported_not_silently_upsampled`.
+        if profile.contains("HE-AAC") {
+            continue;
+        }
+        if channels <= 2 {
+            if stereo >= 3 {
+                continue;
+            }
+            stereo += 1;
+        } else {
+            if wide >= 2 {
+                continue;
+            }
+            wide += 1;
+        }
+        let adts = tmp.join(format!("real-{checked}.aac"));
+        let out = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-t", "20", "-i"])
+            .arg(file)
+            .args(["-map", &format!("0:{index}"), "-c:a", "copy", "-f", "adts"])
+            .arg(&adts)
+            .output()
+            .expect("ffmpeg runs");
+        if !out.status.success() {
+            eprintln!("SKIP {path}: stream copy failed");
+            continue;
+        }
+        let corr = compare(&adts);
+        let worst = corr.iter().copied().fold(f64::MAX, f64::min);
+        println!(
+            "real {channels}ch {profile} worst {worst:.6} -- {}",
+            file.file_name().unwrap_or_default().to_string_lossy()
+        );
+        for (ch, c) in corr.iter().enumerate() {
+            assert!(
+                *c >= 0.999,
+                "channel {ch} correlation {c:.6} < 0.999 for {path}"
+            );
+        }
+        checked += 1;
+    }
+    assert!(
+        checked >= 3,
+        "wanted at least three library tracks, swept {checked}"
+    );
+    assert!(wide >= 1, "no multichannel AAC track was swept");
+}
+
+/// The first AAC audio stream of a file: `(stream index, channels, profile)`.
+fn aac_stream(path: &Path) -> Option<(usize, usize, String)> {
+    let out = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "a",
+            "-show_entries",
+            "stream=index,codec_name,channels,profile",
+            "-of",
+            "default=noprint_wrappers=1",
+        ])
+        .arg(path)
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (mut index, mut channels, mut codec, mut profile) =
+        (None, None, String::new(), String::new());
+    for line in text.lines() {
+        let (key, value) = line.split_once('=')?;
+        match key {
+            "index" => {
+                if codec == "aac" {
+                    return Some((index?, channels?, profile));
+                }
+                index = value.parse().ok();
+                codec.clear();
+                profile.clear();
+            }
+            "codec_name" => codec = value.to_string(),
+            "channels" => channels = value.parse().ok(),
+            "profile" => profile = value.to_string(),
+            _ => {}
+        }
+    }
+    if codec == "aac" {
+        return Some((index?, channels?, profile));
+    }
+    None
+}
+
+/// Decode speed on 5.1, the shape a film soundtrack has.
+#[test]
+fn five_one_decodes_faster_than_realtime() {
+    let path = fixtures().join("audio/aac-adts-5.1-48000.aac");
+    if !path.exists() {
+        eprintln!("SKIP: 5.1 fixture missing");
+        return;
+    }
+    let data = std::fs::read(&path).expect("fixture readable");
+    let rounds = 8;
+    let start = std::time::Instant::now();
+    let mut frames = 0usize;
+    let mut rate = 48_000u32;
+    for _ in 0..rounds {
+        let mut decoder = AacDecoder::new();
+        let mut at = 0usize;
+        frames = 0;
+        while at + 7 <= data.len() {
+            let header = ec_aac::parse_adts(&data[at..]).expect("adts header");
+            let end = (at + header.frame_length).min(data.len());
+            let block = decoder.decode(&data[at..end], None).expect("decodes");
+            rate = block.sample_rate;
+            frames += block.frames();
+            at = end;
+        }
+    }
+    let audio = (frames * rounds) as f64 / f64::from(rate);
+    let factor = audio / start.elapsed().as_secs_f64();
+    println!(
+        "5.1 decode: {factor:.0}x realtime ({} build)",
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        }
+    );
+    if !cfg!(debug_assertions) {
+        assert!(
+            factor >= 40.0,
+            "5.1 decode {factor:.0}x realtime is under 40x"
+        );
+    }
+}
+
+/// The one HE-AAC track in this machine's library, decoded to its AAC-LC core.
+/// The claim under test is the honest one: the core comes out, at the core
+/// rate, matching what a reference decoder makes of the same core band.
+#[test]
+fn he_aac_library_track_decodes_to_its_core() {
+    if !have_ffmpeg() {
+        eprintln!("SKIP: ffmpeg not on PATH");
+        return;
+    }
+    let manifest = fixtures().join("real-library-manifest.tsv");
+    let Ok(text) = std::fs::read_to_string(&manifest) else {
+        eprintln!("SKIP: no real-library manifest");
+        return;
+    };
+    let tmp = std::env::temp_dir().join("ec-aac-he");
+    std::fs::create_dir_all(&tmp).expect("temp dir");
+    for line in text.lines().skip(1) {
+        let path = line.split('\t').next().unwrap_or_default();
+        let file = Path::new(path);
+        if path.is_empty() || !file.exists() {
+            continue;
+        }
+        let Some((index, _, profile)) = aac_stream_matching(file, "HE-AAC") else {
+            continue;
+        };
+        let _ = profile;
+        let adts = tmp.join("he.aac");
+        let out = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-t", "10", "-i"])
+            .arg(file)
+            .args(["-map", &format!("0:{index}"), "-c:a", "copy", "-f", "adts"])
+            .arg(&adts)
+            .output()
+            .expect("ffmpeg runs");
+        if !out.status.success() {
+            continue;
+        }
+        let (ours, rate) = our_decode(&adts);
+        assert!(!ours.is_empty(), "the HE-AAC core decoded to nothing");
+        // The reference decode carries SBR, so it runs at twice this rate;
+        // resampling it down to the core rate low-passes exactly the band the
+        // core carries, which is the part we are claiming to reproduce.
+        let core = tmp.join("he-core.f32");
+        let out = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-i"])
+            .arg(&adts)
+            .args(["-ar", &rate.to_string(), "-f", "f32le"])
+            .arg(&core)
+            .output()
+            .expect("ffmpeg runs");
+        assert!(
+            out.status.success(),
+            "reference decode of the HE-AAC track failed"
+        );
+        let theirs = deinterleave(
+            &bytes_to_f32(&std::fs::read(&core).expect("read")),
+            ours.len(),
+        );
+        // Sample-by-sample comparison would need the reference resampler's own
+        // delay; the claim here is about *content*, so it is checked on the
+        // long-term band energies, which no delay moves.
+        let corr: Vec<f64> = ours
+            .iter()
+            .zip(&theirs)
+            .map(|(a, b)| pearson(&band_energies(a, rate), &band_energies(b, rate)))
+            .collect();
+        let worst = corr.iter().copied().fold(f64::MAX, f64::min);
+        println!("HE-AAC core at {rate} Hz: band-energy match, worst channel {worst:.4} {corr:?}");
+        assert!(
+            worst >= 0.95,
+            "the AAC-LC core of an HE-AAC track should carry the reference's \
+             core band; worst channel {worst:.4}"
+        );
+        return;
+    }
+    eprintln!("SKIP: no HE-AAC track in the library manifest");
+}
+
+/// Pearson correlation with no minimum length: for short feature vectors.
+fn pearson(a: &[f32], b: &[f32]) -> f64 {
+    let n = a.len().min(b.len());
+    let ma = a[..n].iter().map(|v| f64::from(*v)).sum::<f64>() / n as f64;
+    let mb = b[..n].iter().map(|v| f64::from(*v)).sum::<f64>() / n as f64;
+    let (mut num, mut da, mut db) = (0.0, 0.0, 0.0);
+    for i in 0..n {
+        let (x, y) = (f64::from(a[i]) - ma, f64::from(b[i]) - mb);
+        num += x * y;
+        da += x * x;
+        db += y * y;
+    }
+    if da == 0.0 || db == 0.0 {
+        return 1.0;
+    }
+    num / (da * db).sqrt()
+}
+
+/// Long-term energy in 32 logarithmic bands: a spectral fingerprint that a
+/// resampler's delay cannot shift.
+fn band_energies(samples: &[f32], rate: u32) -> Vec<f32> {
+    let bands = 32usize;
+    let mut out = vec![0.0f64; bands];
+    let n = 1024usize;
+    let mut blocks = 0usize;
+    for chunk in samples.chunks_exact(n).take(400) {
+        blocks += 1;
+        for (b, slot) in out.iter_mut().enumerate() {
+            // Geometric spacing from 100 Hz to the Nyquist limit.
+            let lo = 100.0 * (f64::from(rate) / 2.0 / 100.0).powf(b as f64 / bands as f64);
+            let hi = 100.0 * (f64::from(rate) / 2.0 / 100.0).powf((b + 1) as f64 / bands as f64);
+            let (mut re, mut im) = (0.0f64, 0.0f64);
+            let f = (lo * hi).sqrt();
+            let w = 2.0 * std::f64::consts::PI * f / f64::from(rate);
+            for (i, &v) in chunk.iter().enumerate() {
+                re += f64::from(v) * (w * i as f64).cos();
+                im += f64::from(v) * (w * i as f64).sin();
+            }
+            *slot += (re * re + im * im).sqrt();
+        }
+    }
+    out.iter()
+        .map(|v| ((v / blocks.max(1) as f64) + 1e-9).ln() as f32)
+        .collect()
+}
+
+fn aac_stream_matching(path: &Path, want: &str) -> Option<(usize, usize, String)> {
+    let out = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "a",
+            "-show_entries",
+            "stream=index,codec_name,channels,profile",
+            "-of",
+            "default=noprint_wrappers=1",
+        ])
+        .arg(path)
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut index = None;
+    let mut channels = None;
+    let mut codec = String::new();
+    let mut profile = String::new();
+    for line in text.lines() {
+        let (key, value) = line.split_once('=')?;
+        match key {
+            "index" => {
+                if codec == "aac" && profile.contains(want) {
+                    return Some((index?, channels?, profile));
+                }
+                index = value.parse().ok();
+                codec.clear();
+                profile.clear();
+            }
+            "codec_name" => codec = value.to_string(),
+            "channels" => channels = value.parse().ok(),
+            "profile" => profile = value.to_string(),
+            _ => {}
+        }
+    }
+    if codec == "aac" && profile.contains(want) {
+        return Some((index?, channels?, profile));
+    }
+    None
+}
