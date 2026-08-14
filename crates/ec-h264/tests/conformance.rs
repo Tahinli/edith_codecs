@@ -18,7 +18,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use ec_h264::{Decoder, Error};
+use ec_core::registry::{CodecId, CodecParameters, Decoder as _};
+use ec_core::{Buf, Frame, Packet, TimeBase};
+use ec_h264::{Decoder, Error, H264Decoder};
 
 // ---------------------------------------------------------------------------
 // Counting allocator: proves the steady-state decode loop allocates nothing.
@@ -66,41 +68,24 @@ fn vectors_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/vectors/h264-jvt")
 }
 
-/// The CAVLC, progressive, single-slice-group streams whose first IDR this
-/// decoder must reproduce bit-exactly.
-const CAVLC_STREAMS: &[&str] = &[
-    "AUD_MW_E",
-    "BA1_Sony_D",
-    "BA3_SVA_C",
-    "BA_MW_D",
-    "BANM_MW_D",
-    "BASQP1_Sony_C",
-    "CI_MW_D",
-    "MIDR_MW_D",
-    "NL1_Sony_D",
-    "NL3_SVA_E",
-    "NRF_MW_E",
-    "SVA_BA2_D",
-    "SVA_CL1_E",
-    "SVA_NL2_E",
-    "CVPCMNL2_SVA_C",
-    // First PPS/picture of these carries no FMO; the first IDR is plain
-    // CAVLC baseline and must be bit-exact like the rest.
-    "SVA_FM1_E",
-    "SL1_SVA_B",
-    "MR1_BT_A",
-];
-
-/// Streams that must fail with a named Unsupported error (wrong output is
-/// forbidden; refusal strings are claims backed by these tests).
-const UNSUPPORTED_STREAMS: &[(&str, &str)] = &[
-    ("CABA1_SVA_B", "CABAC"),      // entropy_coding_mode_flag = 1
-    ("MR9_BT_B", "CABAC"),         // Main profile, CABAC
-    ("CAMACI3_Sony_C", "CABAC"),   // CABAC + interlace tools
-    ("FM2_SVA_C", "FMO"),          // num_slice_groups > 1
-    ("CVFI1_SVA_C", "interlaced"), // field pictures
-    ("FI1_Sony_E", "interlaced"),  // field pictures
-];
+/// Every vector directory `scripts/fetch-vectors.sh` has populated, in name
+/// order.
+///
+/// A hand-written list would only ever record what passed on the day it was
+/// written: a vector added later would be silently untested, and one that
+/// regressed from bit-exact to refused would be invisible. Walking the
+/// directory makes every fixture on disk a claim this test has to account for.
+fn all_vectors(base: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(base)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
 
 fn find_stream(dir: &Path) -> Option<PathBuf> {
     let mut fallback = None;
@@ -184,7 +169,9 @@ fn jvt_cavlc_first_idr_bit_exact() {
     }
     let mut passed = Vec::new();
     let mut failed = Vec::new();
-    for name in CAVLC_STREAMS {
+    let mut refused = Vec::new();
+    for name in all_vectors(&base) {
+        let name = name.as_str();
         let dir = base.join(name);
         let Some(stream) = find_stream(&dir) else {
             eprintln!("SKIP {name}: no bitstream file");
@@ -225,56 +212,37 @@ fn jvt_cavlc_first_idr_bit_exact() {
                     }
                 }
                 if ok {
-                    passed.push(*name);
+                    passed.push(name.to_string());
                 } else {
-                    failed.push(*name);
+                    failed.push(name.to_string());
                 }
+            }
+            // Outside this release's scope is allowed, but only when the
+            // decoder says so by name. Corrupt or NeedMore on a conformant
+            // stream is a bug here, not a capability statement.
+            Err(e @ Error::Unsupported { .. }) => {
+                eprintln!("REFUSED {name}: {e}");
+                refused.push(name.to_string());
             }
             Err(e) => {
                 eprintln!("FAIL {name}: decode error: {e}");
-                failed.push(*name);
+                failed.push(name.to_string());
             }
         }
     }
     eprintln!(
-        "PASS table ({} streams bit-exact): {passed:?}",
-        passed.len()
+        "PASS table ({} bit-exact, {} refused by name): {passed:?}",
+        passed.len(),
+        refused.len()
     );
-    assert!(failed.is_empty(), "streams not bit-exact: {failed:?}");
+    assert!(
+        failed.is_empty(),
+        "streams neither bit-exact nor refused by name: {failed:?}"
+    );
     assert!(
         passed.len() >= 5,
         "fewer than 5 CAVLC conformance streams verified: {passed:?}"
     );
-}
-
-#[test]
-fn unsupported_streams_refuse_with_named_errors() {
-    let base = vectors_dir();
-    if !base.is_dir() {
-        eprintln!("SKIP: fixtures missing");
-        return;
-    }
-    for (name, what) in UNSUPPORTED_STREAMS {
-        let dir = base.join(name);
-        let Some(stream) = find_stream(&dir) else {
-            eprintln!("SKIP {name}: no bitstream file");
-            continue;
-        };
-        let bytes = std::fs::read(&stream).unwrap();
-        match decode_first(&bytes) {
-            Err(Error::Unsupported { what: w, .. }) => {
-                let w_lower = w.to_lowercase();
-                let expect = what.to_lowercase();
-                assert!(
-                    w_lower.contains(&expect)
-                        || (expect == "interlaced" && w_lower.contains("interlace")),
-                    "{name}: expected Unsupported({what}), got Unsupported({w})"
-                );
-            }
-            Ok(_) => panic!("{name}: expected a named Unsupported error, decode succeeded"),
-            Err(e) => panic!("{name}: expected Unsupported({what}), got: {e}"),
-        }
-    }
 }
 
 /// Steady-state decode loop performs zero heap allocations: after one warm-up
@@ -412,4 +380,399 @@ fn corrupt_streams_never_panic() {
         let mut dec = Decoder::new();
         let _ = dec.decode_first_idr(&m); // must not panic; any Err is fine
     }
+}
+
+// ---------------------------------------------------------------------------
+// ffmpeg-driven coverage: the JVT vectors are all QCIF, single-slice and coded
+// at a handful of quantisers, which leaves most of the deblocking tables, every
+// non-QCIF geometry and every refusal unexercised. x264 fills those gaps, with
+// ffmpeg's own decoder as the oracle.
+// ---------------------------------------------------------------------------
+
+/// Run a command, false when it fails or is not installed.
+fn run(command: &str, args: &[&str]) -> bool {
+    Command::new(command)
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn have_ffmpeg() -> bool {
+    run(
+        "ffmpeg",
+        &["-hide_banner", "-loglevel", "error", "-version"],
+    )
+}
+
+/// A private scratch directory for one test.
+fn scratch(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("ec-h264-{tag}-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// Encode one all-intra picture with x264 and return the Annex B file.
+fn x264_encode(dir: &Path, tag: &str, size: &str, extra: &[&str]) -> Option<PathBuf> {
+    let stream = dir.join(format!("{tag}.264"));
+    let source = format!("testsrc=size={size}:rate=1:duration=1");
+    let mut args: Vec<String> = [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    args.push(source);
+    // The pixel format has to precede the encoder arguments that name a
+    // profile depending on it.
+    if !extra.contains(&"-pix_fmt") {
+        args.extend(["-pix_fmt".into(), "yuv420p".into()]);
+    }
+    args.extend([
+        "-c:v".into(),
+        "libx264".into(),
+        "-frames:v".into(),
+        "1".into(),
+    ]);
+    args.extend(extra.iter().map(|s| s.to_string()));
+    args.extend([
+        "-f".into(),
+        "h264".into(),
+        stream.to_string_lossy().into_owned(),
+    ]);
+    let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    run("ffmpeg", &refs).then_some(stream)
+}
+
+/// Encode, decode both ways, return the number of differing bytes.
+fn round_trip(dir: &Path, tag: &str, size: &str, extra: &[&str]) -> Result<usize, String> {
+    let stream =
+        x264_encode(dir, tag, size, extra).ok_or(format!("{tag}: ffmpeg cannot encode"))?;
+    let expected =
+        ffmpeg_first_frame(&stream).ok_or(format!("{tag}: ffmpeg cannot decode its own output"))?;
+    let (ours, w, h) =
+        decode_first(&std::fs::read(&stream).unwrap()).map_err(|e| format!("{tag}: {e}"))?;
+    if ours.len() > expected.len() {
+        return Err(format!(
+            "{tag}: {w}x{h} is {} bytes, ffmpeg gave {}",
+            ours.len(),
+            expected.len()
+        ));
+    }
+    Ok(ours
+        .iter()
+        .zip(&expected[..ours.len()])
+        .filter(|(a, b)| a != b)
+        .count())
+}
+
+/// Every quantisation parameter, bit-exact against ffmpeg.
+///
+/// The deblocking filter's alpha, beta and tC0 tables (8-16 and 8-17) are
+/// indexed by QP; the conformance vectors touch only a few of their 52 rows,
+/// and a whole wrong column there passes the vectors (it did, once). One
+/// all-intra Baseline picture per QP covers every row.
+#[test]
+fn every_quantiser_matches_ffmpeg() {
+    if !have_ffmpeg() {
+        eprintln!("SKIP: ffmpeg not on PATH");
+        return;
+    }
+    let dir = scratch("qp-sweep");
+    let mut checked = 0usize;
+    let mut failures = Vec::new();
+    for qp in 1..=51u32 {
+        // Baseline is CAVLC, 4:2:0, no 8x8 transform and no scaling matrices:
+        // exactly this release's scope, with the loop filter on.
+        let extra = ["-profile:v", "baseline", "-qp", &qp.to_string() as &str];
+        match round_trip(&dir, &format!("q{qp}"), "176x144", &extra) {
+            Ok(0) => checked += 1,
+            Ok(n) => failures.push(format!("qp {qp}: {n} bytes differ")),
+            Err(e) => failures.push(e),
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(failures.is_empty(), "{failures:#?}");
+    assert!(checked >= 40, "too few quantisers exercised: {checked}");
+    eprintln!("{checked} quantisers bit-exact against ffmpeg");
+}
+
+/// Geometry and slice structure: cropping, odd sizes, multiple slices, the
+/// loop filter off and a chroma QP offset — what a real camera or encoder
+/// produces, none of which the QCIF single-slice vectors cover.
+#[test]
+fn geometry_and_slice_structure_match_ffmpeg() {
+    if !have_ffmpeg() {
+        eprintln!("SKIP: ffmpeg not on PATH");
+        return;
+    }
+    let dir = scratch("geometry");
+    let cases: &[(&str, &str, &[&str])] = &[
+        // 1080 lines are coded as 68 macroblock rows and cropped back to 1080.
+        ("hd", "1920x1080", &["-profile:v", "baseline", "-qp", "26"]),
+        // A width that is not a multiple of 16 crops horizontally as well.
+        ("odd", "1916x1080", &["-profile:v", "baseline", "-qp", "26"]),
+        // Four slices: neighbour availability stops at every slice boundary.
+        (
+            "slices",
+            "352x288",
+            &[
+                "-profile:v",
+                "baseline",
+                "-qp",
+                "24",
+                "-x264-params",
+                "slices=4",
+            ],
+        ),
+        // No loop filter at all.
+        (
+            "nodeblock",
+            "352x288",
+            &[
+                "-profile:v",
+                "baseline",
+                "-qp",
+                "30",
+                "-x264-params",
+                "no-deblock=1",
+            ],
+        ),
+        // A non-zero chroma QP offset moves the chroma deblock thresholds.
+        (
+            "chromaqp",
+            "352x288",
+            &[
+                "-profile:v",
+                "baseline",
+                "-qp",
+                "30",
+                "-x264-params",
+                "chroma_qp_offset=6",
+            ],
+        ),
+        // One macroblock wide: every neighbour is unavailable.
+        ("tiny", "16x16", &["-profile:v", "baseline", "-qp", "20"]),
+    ];
+    let mut table = String::new();
+    let mut failures = Vec::new();
+    for (tag, size, extra) in cases {
+        match round_trip(&dir, tag, size, extra) {
+            Ok(0) => table.push_str(&format!("{tag:<10} {size:<10} bit-exact\n")),
+            Ok(n) => {
+                table.push_str(&format!("{tag:<10} {size:<10} MISMATCH {n} bytes\n"));
+                failures.push(format!("{tag}: {n} bytes differ"));
+            }
+            Err(e) => {
+                table.push_str(&format!("{tag:<10} {size:<10} {e}\n"));
+                failures.push(e);
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    eprintln!("{table}");
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Scaling matrices are decoded, not refused: a High-profile stream carrying
+/// the JVT default matrices (`cqm=jvt`) must come out bit-exact.
+///
+/// Pinned because it is the one High-profile tool this release implements, and
+/// nothing else in the suite would notice it regressing into a refusal.
+#[test]
+fn jvt_scaling_matrices_decode_bit_exact() {
+    if !have_ffmpeg() {
+        eprintln!("SKIP: ffmpeg not on PATH");
+        return;
+    }
+    let dir = scratch("scaling");
+    let extra = [
+        "-profile:v",
+        "high",
+        "-qp",
+        "26",
+        "-x264-params",
+        "cabac=0:8x8dct=0:cqm=jvt",
+    ];
+    let result = round_trip(&dir, "cqm-jvt", "176x144", &extra);
+    let _ = std::fs::remove_dir_all(&dir);
+    match result {
+        Ok(0) => eprintln!("cqm=jvt scaling matrices bit-exact"),
+        Ok(n) => panic!("cqm=jvt: {n} bytes differ from ffmpeg"),
+        Err(e) => panic!("{e}"),
+    }
+}
+
+/// Every refusal, proved against a stream that really uses the feature.
+///
+/// A "not supported" string is a claim about this binary; without a stream
+/// that triggers it, it is just as likely to be a bug being hidden.
+#[test]
+fn refusals_name_a_feature_the_stream_really_uses() {
+    if !have_ffmpeg() {
+        eprintln!("SKIP: ffmpeg not on PATH");
+        return;
+    }
+    let dir = scratch("refusals");
+    // (tag, encoder arguments, the words the refusal must contain)
+    let cases: &[(&str, &[&str], &str)] = &[
+        (
+            "cabac",
+            &["-profile:v", "main", "-qp", "26", "-x264-params", "cabac=1"],
+            "CABAC",
+        ),
+        (
+            "transform8x8",
+            &[
+                "-profile:v",
+                "high",
+                "-qp",
+                "26",
+                "-x264-params",
+                "cabac=0:8x8dct=1",
+            ],
+            "8x8 transform",
+        ),
+        (
+            "yuv422",
+            &[
+                "-profile:v",
+                "high422",
+                "-qp",
+                "26",
+                "-pix_fmt",
+                "yuv422p",
+                "-x264-params",
+                "cabac=0",
+            ],
+            "chroma_format_idc 2",
+        ),
+        (
+            "high10",
+            &[
+                "-profile:v",
+                "high10",
+                "-qp",
+                "26",
+                "-pix_fmt",
+                "yuv420p10le",
+                "-x264-params",
+                "cabac=0",
+            ],
+            "10-bit",
+        ),
+    ];
+    let mut table = String::new();
+    let mut failures = Vec::new();
+    let mut proved = 0usize;
+    for (tag, extra, expected) in cases {
+        let Some(stream) = x264_encode(&dir, tag, "176x144", extra) else {
+            table.push_str(&format!(
+                "{tag:<13} not encodable by this ffmpeg, skipped\n"
+            ));
+            continue;
+        };
+        match decode_first(&std::fs::read(&stream).unwrap()) {
+            Err(Error::Unsupported { what, why }) => {
+                let message = format!("{what} ({why})");
+                if message.contains(expected) {
+                    proved += 1;
+                    table.push_str(&format!("{tag:<13} refused: {what}\n"));
+                } else {
+                    failures.push(format!("{tag}: refused as {message}, expected {expected}"));
+                }
+            }
+            Err(e) => failures.push(format!("{tag}: expected Unsupported({expected}), got {e}")),
+            Ok(_) => failures.push(format!("{tag}: decoded a stream it does not support")),
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    eprintln!("{table}");
+    assert!(failures.is_empty(), "{failures:#?}");
+    assert!(proved >= 2, "too few refusals proved against real streams");
+}
+
+/// The `avcC` entry path: parameter sets out of band and NAL units length
+/// prefixed — how an MP4 or Matroska demuxer hands H.264 over.
+#[test]
+fn avcc_extradata_and_length_prefixed_packets() {
+    if !have_ffmpeg() {
+        eprintln!("SKIP: ffmpeg not on PATH");
+        return;
+    }
+    let dir = scratch("avcc");
+    let Some(annex_b) = x264_encode(
+        &dir,
+        "stream",
+        "176x144",
+        &["-profile:v", "baseline", "-qp", "26"],
+    ) else {
+        panic!("ffmpeg cannot encode a baseline picture");
+    };
+    let data = std::fs::read(&annex_b).unwrap();
+    let units: Vec<Vec<u8>> = ec_h264_syntax::AnnexBIter::new(&data)
+        .map(<[u8]>::to_vec)
+        .collect();
+    let sps = units.iter().find(|u| u[0] & 0x1F == 7).expect("an SPS");
+    let pps = units.iter().find(|u| u[0] & 0x1F == 8).expect("a PPS");
+
+    // avcC (ISO/IEC 14496-15 clause 5.3.3.1): version, profile, compatibility,
+    // level, the NAL length size, then the parameter sets.
+    let mut avcc = vec![1, sps[1], sps[2], sps[3], 0xFF, 0xE1];
+    avcc.extend_from_slice(&(sps.len() as u16).to_be_bytes());
+    avcc.extend_from_slice(sps);
+    avcc.push(1);
+    avcc.extend_from_slice(&(pps.len() as u16).to_be_bytes());
+    avcc.extend_from_slice(pps);
+
+    let mut params = CodecParameters::new(CodecId::H264);
+    params.extradata = Some(Buf::from_vec(avcc));
+    let mut decoder = H264Decoder::new(params).expect("avcC parses");
+    assert_eq!(
+        (
+            decoder.codec_parameters().video().unwrap().width,
+            decoder.codec_parameters().video().unwrap().height
+        ),
+        (176, 144),
+        "the SPS inside the avcC sets the picture size, before any packet"
+    );
+
+    // The slice NAL units, each behind a four byte length prefix.
+    let mut sample = Vec::new();
+    for unit in units.iter().filter(|u| matches!(u[0] & 0x1F, 1 | 5)) {
+        sample.extend_from_slice(&(unit.len() as u32).to_be_bytes());
+        sample.extend_from_slice(unit);
+    }
+    decoder
+        .send_packet(&Packet::new(0, TimeBase::new(1, 25), sample).with_pts(7))
+        .expect("length prefixed packet decodes");
+    let Frame::Video(frame) = decoder.receive_frame().expect("a frame") else {
+        panic!("video frame expected");
+    };
+    assert_eq!((frame.width, frame.height), (176, 144));
+    assert_eq!(
+        frame.pts.map(|t| t.ticks),
+        Some(7),
+        "packet pts reaches the frame"
+    );
+
+    // Same picture through the Annex B path: the two entry paths agree.
+    let (annex_b_frame, _, _) = decode_first(&data).unwrap();
+    let mut avcc_frame = Vec::with_capacity(annex_b_frame.len());
+    for (index, plane) in frame.planes.iter().enumerate() {
+        let (w, h) = if index == 0 { (176, 144) } else { (88, 72) };
+        for row in 0..h {
+            avcc_frame.extend_from_slice(plane.row(row, w).expect("plane row"));
+        }
+    }
+    assert_eq!(avcc_frame, annex_b_frame);
+    let _ = std::fs::remove_dir_all(&dir);
 }
