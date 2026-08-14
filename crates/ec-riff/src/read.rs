@@ -175,6 +175,7 @@ fn parse_fmt<R: Read>(r: &mut R, size: u64) -> Result<WavSpec> {
     let mut tag = u16::from_le_bytes([f[0], f[1]]);
     let channels = u16::from_le_bytes([f[2], f[3]]);
     let sample_rate = u32::from_le_bytes([f[4], f[5], f[6], f[7]]);
+    let block_align = u16::from_le_bytes([f[12], f[13]]);
     let bits_per_sample = u16::from_le_bytes([f[14], f[15]]);
     let mut rest = size - 16;
 
@@ -203,6 +204,14 @@ fn parse_fmt<R: Read>(r: &mut R, size: u64) -> Result<WavSpec> {
             ));
         }
     };
+    // A depth that is not a whole number of bytes (12-bit, 20-bit) is
+    // ill-formed for these tags, not merely unimplemented: nothing in the
+    // header says how the odd bits sit in their container.
+    if bits_per_sample % 8 != 0 {
+        return Err(Error::corrupt(format!(
+            "WAVE fmt: {bits_per_sample} bits per sample is not a multiple of eight"
+        )));
+    }
     let spec = WavSpec {
         channels,
         sample_rate,
@@ -210,5 +219,14 @@ fn parse_fmt<R: Read>(r: &mut R, size: u64) -> Result<WavSpec> {
         sample_format,
     };
     spec.validate()?;
+    // The stride the file declares must be the stride the depth implies —
+    // otherwise every frame after the first is read from the wrong offset.
+    // Padded containers (8-bit samples in 2-byte slots) live here.
+    if usize::from(block_align) != spec.block_align() {
+        return Err(Error::unsupported(
+            format!("a WAVE block align of {block_align} for {channels}x{bits_per_sample}-bit"),
+            "ec-riff reads samples packed at their declared depth, without container padding",
+        ));
+    }
     Ok(spec)
 }

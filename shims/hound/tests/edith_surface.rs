@@ -85,6 +85,81 @@ fn edith_read_wav_round_trips() {
     ));
 }
 
+/// A `data` chunk that ends before its header said is hound's `IoError`
+/// (`UnexpectedEof`), never a short read the caller mistakes for the whole file.
+#[test]
+fn truncated_data_chunk_errors() {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"));
+    std::fs::create_dir_all(dir).unwrap();
+    let path = dir.join("truncated.wav");
+    let samples: Vec<i32> = (0..1024).map(|i| (i * 17) % 4096).collect();
+    write_wav(&path, &samples, 2, 48000).unwrap();
+
+    // Half the samples away, the header still promising all of them.
+    let bytes = std::fs::read(&path).unwrap();
+    std::fs::write(&path, &bytes[..bytes.len() - 1024]).unwrap();
+
+    let mut r = hound::WavReader::open(&path).unwrap();
+    let first = r.samples::<i16>().next();
+    assert!(
+        matches!(&first, Some(Err(hound::Error::IoError(e))) if e.kind() == std::io::ErrorKind::UnexpectedEof),
+        "expected UnexpectedEof, got {first:?}"
+    );
+}
+
+/// A minimal PCM WAVE header with `block_align` and `bits_per_sample` stated
+/// independently, so a padded container can be handed to the reader.
+fn wav_bytes(channels: u16, bits: u16, block_align: u16, data: &[u8]) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(b"RIFF");
+    v.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+    v.extend_from_slice(b"WAVEfmt ");
+    v.extend_from_slice(&16u32.to_le_bytes());
+    v.extend_from_slice(&1u16.to_le_bytes()); // WAVE_FORMAT_PCM
+    v.extend_from_slice(&channels.to_le_bytes());
+    v.extend_from_slice(&48000u32.to_le_bytes());
+    v.extend_from_slice(&(48000 * u32::from(block_align)).to_le_bytes());
+    v.extend_from_slice(&block_align.to_le_bytes());
+    v.extend_from_slice(&bits.to_le_bytes());
+    v.extend_from_slice(b"data");
+    v.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    v.extend_from_slice(data);
+    v
+}
+
+/// The header pair the reader must not paper over: a container wider than the
+/// depth (hound: `Unsupported`) and a depth that is not whole bytes (hound:
+/// `FormatError`). Reading either as if it were packed would silently double
+/// the sample count and halve the duration.
+#[test]
+fn container_width_and_odd_depths_are_refused() {
+    let padded = wav_bytes(1, 8, 2, &[0x80, 0x00, 0x90, 0x00]);
+    assert!(
+        matches!(
+            hound::WavReader::new(std::io::Cursor::new(padded)),
+            Err(hound::Error::Unsupported)
+        ),
+        "8-bit samples in a 2-byte container must be refused"
+    );
+
+    for bits in [12u16, 20] {
+        let odd = wav_bytes(1, bits, bits.div_ceil(8), &[0; 8]);
+        assert!(
+            matches!(
+                hound::WavReader::new(std::io::Cursor::new(odd)),
+                Err(hound::Error::FormatError(_))
+            ),
+            "{bits}-bit must be a FormatError"
+        );
+    }
+
+    // The well-formed shape of the same helper still opens, so the refusals
+    // above are about the fields under test and not about the fixture.
+    let ok = wav_bytes(2, 16, 4, &[0; 16]);
+    let r = hound::WavReader::new(std::io::Cursor::new(ok)).expect("a packed 16-bit stereo header");
+    assert_eq!(r.spec().bits_per_sample, 16);
+}
+
 #[test]
 fn errors_carry_the_incumbent_variants() {
     let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"));

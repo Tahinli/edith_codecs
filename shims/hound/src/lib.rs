@@ -8,10 +8,20 @@
 //! — because a shim that grows a surface nobody calls is a second
 //! implementation to keep honest.
 //!
-//! Behaviour differences from the incumbent, all in the strict direction:
-//! files with more than two channels or more than 16 bits get a
+//! Behaviour differences from the incumbent. Writing is stricter only: files
+//! with more than two channels or more than 16 bits get a
 //! `WAVE_FORMAT_EXTENSIBLE` header (hound writes one only above 16 bits), and
-//! a `fact` chunk goes with it.
+//! a `fact` chunk goes with it. Reading diverges in shape, not in verdict —
+//! the refusals are hound's, the reporting is not:
+//!
+//! * [`WavReader::samples`] reads the `data` chunk whole before yielding, so a
+//!   file that ends early yields one [`Error::IoError`] and nothing else,
+//!   where hound yields the samples it did read and then the `UnexpectedEof`.
+//!   [`Error::TooWide`] and [`Error::InvalidSampleFormat`] are single-item for
+//!   the same reason; hound repeats them per sample.
+//! * `bits_per_sample` outside 8/16/24/32 is [`Error::FormatError`] when it is
+//!   not a whole number of bytes and [`Error::Unsupported`] otherwise, which
+//!   splits hound's refusals along the same line but not with its wording.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -275,23 +285,47 @@ impl<R: Read> WavReader<R> {
     pub fn samples<S: Sample>(&mut self) -> WavSamples<S> {
         let spec = self.inner.spec();
         let float_file = spec.sample_format == ec_riff::SampleType::Float;
+        // What the `data` header promised. `ec-riff` stops at the end of the
+        // file without complaint; hound hands the caller the `UnexpectedEof`,
+        // so the promise is compared against what arrived.
+        let promised = self
+            .inner
+            .duration()
+            .map(|frames| frames as usize * usize::from(spec.channels));
         let items = if float_file != S::FLOAT {
             vec![Err(Error::InvalidSampleFormat)]
         } else if spec.bits_per_sample > S::BITS {
             vec![Err(Error::TooWide)]
         } else if float_file {
             match self.inner.read_all_f32() {
-                Ok(v) => v.into_iter().map(|s| Ok(S::from_f32(s))).collect(),
+                Ok(v) => match short_read(v.len(), promised) {
+                    Some(e) => vec![Err(e)],
+                    None => v.into_iter().map(|s| Ok(S::from_f32(s))).collect(),
+                },
                 Err(e) => vec![Err(map(e, Error::FormatError("truncated WAVE data")))],
             }
         } else {
             match self.inner.read_all_i32() {
-                Ok(v) => v.into_iter().map(|s| Ok(S::from_i32(s))).collect(),
+                Ok(v) => match short_read(v.len(), promised) {
+                    Some(e) => vec![Err(e)],
+                    None => v.into_iter().map(|s| Ok(S::from_i32(s))).collect(),
+                },
                 Err(e) => vec![Err(map(e, Error::FormatError("truncated WAVE data")))],
             }
         };
         WavSamples(items.into_iter())
     }
+}
+
+/// The `UnexpectedEof` hound reports when the `data` chunk ends before the
+/// length its header declares, or `None` when the file kept its promise (or
+/// made none: a streamed placeholder size leaves the file itself the bound).
+fn short_read(got: usize, promised: Option<usize>) -> Option<Error> {
+    let want = promised.filter(|&n| got < n)?;
+    Some(Error::IoError(io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        format!("WAVE data chunk ends after {got} of {want} samples"),
+    )))
 }
 
 /// The iterator [`WavReader::samples`] returns.
