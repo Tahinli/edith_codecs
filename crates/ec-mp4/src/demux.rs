@@ -5,7 +5,7 @@ use std::io::{Read, Seek};
 use ec_core::{
     AudioParameters, Buf, ChannelLayout, CodecId, CodecParameters, ColorInfo, Demuxer, Error,
     MediaParameters, MediaType, Packet, PacketFlags, Result, Rounding, SeekMode, StreamInfo,
-    TimeBase, Timestamp, VideoParameters, color,
+    TimeBase, Timestamp, VideoParameters, color, color::Tags,
 };
 
 use crate::boxes::{Boxes, FourCc, Src, be16, be32, be64, full};
@@ -47,6 +47,9 @@ pub struct Sample {
 /// One `trak`, as far as the packet loop cares about it.
 struct Trak {
     track_id: u32,
+    /// What this track's `colr` box stated, tier by tier — empty for a track
+    /// with no such box and for one that is not a picture.
+    color_tags: Tags,
     /// Index in [`Mp4Demuxer::streams`], or [`None`] for a track whose sample
     /// entry this build has no [`CodecId`] for — its samples are walked past,
     /// never handed out as some other codec's.
@@ -221,6 +224,22 @@ impl<R: Read + Seek> Mp4Demuxer<R> {
         (duration > 0 && timescale > 0).then(|| duration as f64 / f64::from(timescale))
     }
 
+    /// What `stream`'s `colr` box **stated** about its colour, field by field:
+    /// [`None`] wherever the box said nothing.
+    ///
+    /// Not the same answer as [`VideoParameters::color`], and the difference is
+    /// the reason this exists. A `ColorInfo` has to fill in a `full_range` flag
+    /// whether or not the file carried one, so a QuickTime `nclc` box — ten
+    /// bytes, no range byte — reads there as a *declaration* of limited range
+    /// and shadows a bitstream that said full. Here it is a matrix and a
+    /// transfer and no range at all, which is what the file says.
+    pub fn color_tags(&self, stream: u32) -> Tags {
+        self.traks
+            .iter()
+            .find(|t| t.stream == Some(stream))
+            .map_or(Tags::default(), |t| t.color_tags)
+    }
+
     /// Every sample of `stream`, in decode order: the index the file carries of
     /// itself. Empty for a stream that does not exist.
     pub fn samples(&self, stream: u32) -> &[Sample] {
@@ -391,6 +410,10 @@ impl<R: Read + Seek> Mp4Demuxer<R> {
         let table = SampleTable::read(stbl, self.src.len)?;
         let samples = table.build(shift)?;
         let track_language = language.clone();
+        let color_tags = table
+            .entry
+            .as_ref()
+            .map_or(Tags::default(), |e| e.color_tags);
         let stream = match table.entry {
             Some(entry) => {
                 let media = match entry.codec.media_type() {
@@ -438,6 +461,7 @@ impl<R: Read + Seek> Mp4Demuxer<R> {
         });
         self.traks.push(Trak {
             track_id,
+            color_tags,
             stream,
             time_base,
             samples,
@@ -879,6 +903,9 @@ struct Entry {
     extradata: Option<Buf>,
     video: Option<VideoParameters>,
     audio: Option<AudioParameters>,
+    /// What the `colr` box *stated*, which is not what
+    /// [`VideoParameters::color`] answers: see [`colr`].
+    color_tags: Tags,
 }
 
 /// What one `stsd` entry says its samples are, or [`None`] for a codec this
@@ -894,13 +921,15 @@ fn sample_entry(kind: &FourCc, payload: &[u8]) -> Result<Option<Entry>> {
             ..VideoParameters::default()
         };
         let mut extradata = None;
+        let mut color_tags = Tags::default();
         for child in Boxes::new(payload.get(78..).unwrap_or(&[])) {
             let (kind, body) = child?;
             if &kind == config {
                 extradata = Some(Buf::copy_from_slice(body));
             } else if &kind == b"colr" {
-                if let Some(info) = colr(body) {
+                if let Some((info, tags)) = colr(body) {
                     video.color = info;
+                    color_tags = tags;
                 }
             } else if &kind == b"mdcv" {
                 video.light = color::mdcv(body).over(video.light);
@@ -916,10 +945,12 @@ fn sample_entry(kind: &FourCc, payload: &[u8]) -> Result<Option<Entry>> {
             extradata,
             video: Some(video),
             audio: None,
+            color_tags,
         }));
     }
     if kind == b"tx3g" {
         return Ok(Some(Entry {
+            color_tags: Tags::default(),
             codec: CodecId::Tx3g,
             // The sample entry past its 8-byte header: the justification,
             // background colour and default style a renderer needs, which is
@@ -1021,6 +1052,7 @@ fn sample_entry(kind: &FourCc, payload: &[u8]) -> Result<Option<Entry>> {
         extradata,
         video: None,
         audio: Some(audio),
+        color_tags: Tags::default(),
     }))
 }
 
@@ -1069,18 +1101,42 @@ fn video_codec(kind: &FourCc) -> Option<(CodecId, &'static FourCc)> {
 }
 
 /// A `ColourInformationBox`: the H.273 triplet, when it is the `nclx`/`nclc`
-/// kind rather than an ICC profile.
-fn colr(body: &[u8]) -> Option<ColorInfo> {
+/// kind rather than an ICC profile — as the raw triplet *and* as the tags that
+/// triplet really states.
+///
+/// The two are not the same claim, and the difference is a whole box: an `nclx`
+/// carries a range bit and a QuickTime `nclc` is ten bytes that stop before it.
+/// [`ColorInfo`] has to answer `full_range` either way, so a caller reading only
+/// that would take an `nclc` for a declaration of limited range and shadow a
+/// bitstream that said full. [`Tags`] can say *nothing*, so that is what an
+/// `nclc` — and an `nclx` truncated before its range byte — comes back as.
+fn colr(body: &[u8]) -> Option<(ColorInfo, Tags)> {
     let kind = body.get(..4)?;
     if kind != b"nclx" && kind != b"nclc" {
         return None;
     }
-    Some(ColorInfo {
-        primaries: be16(body, 4).ok()?.min(255) as u8,
-        transfer: be16(body, 6).ok()?.min(255) as u8,
-        matrix: be16(body, 8).ok()?.min(255) as u8,
-        full_range: body.get(10).is_some_and(|b| b & 0x80 != 0),
-    })
+    let (primaries, transfer, matrix) = (
+        be16(body, 4).ok()?,
+        be16(body, 6).ok()?,
+        be16(body, 8).ok()?,
+    );
+    // The Matroska `Range` coding [`Tags::from_codes`] takes: 0 says nothing,
+    // 1 limited, 2 full. A plain `video_full_range_flag` is `1 + flag`, and a
+    // box that never stated one is the 0.
+    let range = match kind == b"nclx" {
+        true => body.get(10).map_or(0, |b| 1 + u64::from(b >> 7)),
+        false => 0,
+    };
+    let info = ColorInfo {
+        primaries: primaries.min(255) as u8,
+        transfer: transfer.min(255) as u8,
+        matrix: matrix.min(255) as u8,
+        full_range: range == 2,
+    };
+    Some((
+        info,
+        Tags::from_codes(u64::from(matrix), u64::from(transfer), range),
+    ))
 }
 
 /// Frames per second off the sample table, as the rational it is.
@@ -1243,13 +1299,17 @@ mod tests {
 
     #[test]
     fn a_colr_box_is_the_h273_triplet() {
-        let mut body = b"nclx".to_vec();
-        body.extend_from_slice(&9u16.to_be_bytes());
-        body.extend_from_slice(&16u16.to_be_bytes());
-        body.extend_from_slice(&9u16.to_be_bytes());
-        body.push(0x80);
+        let triplet = |kind: &[u8; 4]| {
+            let mut body = kind.to_vec();
+            body.extend_from_slice(&9u16.to_be_bytes());
+            body.extend_from_slice(&16u16.to_be_bytes());
+            body.extend_from_slice(&9u16.to_be_bytes());
+            body
+        };
+        let mut full = triplet(b"nclx");
+        full.push(0x80);
         assert_eq!(
-            colr(&body),
+            colr(&full).map(|(info, _)| info),
             Some(ColorInfo {
                 primaries: 9,
                 transfer: 16,
@@ -1257,7 +1317,40 @@ mod tests {
                 full_range: true
             })
         );
+        assert_eq!(
+            colr(&full).map(|(_, tags)| tags.full_range),
+            Some(Some(true))
+        );
+        let mut limited = triplet(b"nclx");
+        limited.push(0x00);
+        assert_eq!(
+            colr(&limited).map(|(_, tags)| tags.full_range),
+            Some(Some(false)),
+            "an nclx that says limited is a claim, and stands"
+        );
         assert_eq!(colr(b"prof\0\0"), None, "an ICC profile is not a triplet");
+    }
+
+    /// The box that has no range byte to read: QuickTime's `nclc`, and an `nclx`
+    /// truncated before its own last byte. Both state a matrix and a transfer
+    /// and **nothing** about range -- a fabricated `limited` here shadows a
+    /// bitstream that said full, and that is a green picture on screen.
+    #[test]
+    fn an_nclc_states_no_range_at_all() {
+        let mut body = b"nclc".to_vec();
+        body.extend_from_slice(&1u16.to_be_bytes());
+        body.extend_from_slice(&1u16.to_be_bytes());
+        body.extend_from_slice(&1u16.to_be_bytes());
+        assert_eq!(body.len(), 10, "an nclc payload stops at ten bytes");
+        let (info, tags) = colr(&body).expect("nclc is a triplet");
+        assert_eq!((info.primaries, info.transfer, info.matrix), (1, 1, 1));
+        assert_eq!(tags.matrix, Some(color::Matrix::Bt709));
+        assert_eq!(tags.transfer, Some(color::Transfer::Sdr));
+        assert_eq!(tags.full_range, None, "an nclc box states no range");
+        // ...and the same box with an nclx name but no range byte written.
+        let mut short = b"nclx".to_vec();
+        short.extend_from_slice(&body[4..]);
+        assert_eq!(colr(&short).expect("still a triplet").1.full_range, None);
     }
 
     #[test]
