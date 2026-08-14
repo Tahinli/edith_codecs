@@ -313,6 +313,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ec-hw"
+version = "0.1.0"
+dependencies = [
+ "ec-av1-syntax",
+ "ec-core",
+ "ec-h264-syntax",
+ "ec-h265-syntax",
+ "ec-va",
+ "ec-vp9-syntax",
+]
+
+[[package]]
 name = "ec-image"
 version = "0.1.0"
 dependencies = [

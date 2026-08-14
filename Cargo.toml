@@ -18,7 +18,9 @@ ec-dsp = { path = "crates/ec-dsp", version = "0.1.0" }
 ec-flac = { path = "crates/ec-flac", version = "0.1.0" }
 ec-h264 = { path = "crates/ec-h264", version = "0.1.0" }
 ec-h264-syntax = { path = "crates/ec-h264-syntax", version = "0.1.0" }
+ec-h265 = { path = "crates/ec-h265", version = "0.1.0" }
 ec-h265-syntax = { path = "crates/ec-h265-syntax", version = "0.1.0" }
+ec-hw = { path = "crates/ec-hw", version = "0.1.0" }
 ec-image = { path = "crates/ec-image", version = "0.1.0" }
 ec-inflate = { path = "crates/ec-inflate", version = "0.1.0" }
 ec-matroska = { path = "crates/ec-matroska", version = "0.1.0" }
@@ -28,6 +30,7 @@ ec-ogg = { path = "crates/ec-ogg", version = "0.1.0" }
 ec-opus = { path = "crates/ec-opus", version = "0.1.0" }
 ec-probe = { path = "crates/ec-probe", version = "0.1.0" }
 ec-riff = { path = "crates/ec-riff", version = "0.1.0" }
+ec-va = { path = "crates/ec-va", version = "0.1.0" }
 ec-vorbis = { path = "crates/ec-vorbis", version = "0.1.0" }
 ec-vp9-syntax = { path = "crates/ec-vp9-syntax", version = "0.1.0" }
 # Portable SIMD without asm or build-time tooling (family rule: pure Rust only).
