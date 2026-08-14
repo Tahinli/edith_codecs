@@ -1,0 +1,11 @@
+[package]
+name = "miniz_oxide"
+description = "Compatibility shim: the miniz_oxide surface edith consumes, served by ec-inflate."
+version = "0.8.9"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+ec-inflate = { path = "../../crates/ec-inflate", version = "0.1.0" }
