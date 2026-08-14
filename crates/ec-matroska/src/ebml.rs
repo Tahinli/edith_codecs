@@ -37,6 +37,7 @@ pub const CODEC_PRIVATE: u32 = 0x63A2;
 pub const CODEC_DELAY: u32 = 0x56AA;
 pub const SEEK_PRE_ROLL: u32 = 0x56BB;
 pub const DEFAULT_DURATION: u32 = 0x23E383;
+pub const TRACK_NAME: u32 = 0x536E;
 pub const TRACK_LANGUAGE: u32 = 0x22B59C;
 pub const TRACK_LANGUAGE_BCP47: u32 = 0x22B59D;
 
