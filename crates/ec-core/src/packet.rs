@@ -184,6 +184,19 @@ impl Packet {
         }
     }
 
+    /// Set the presentation timestamp, for the callers that build a packet in
+    /// one expression.
+    pub fn with_pts(mut self, pts: i64) -> Packet {
+        self.pts = Some(pts);
+        self
+    }
+
+    /// Set the duration in `time_base` ticks.
+    pub fn with_duration(mut self, duration: i64) -> Packet {
+        self.duration = Some(duration);
+        self
+    }
+
     /// `pts + duration`, when both are known.
     pub fn end_pts(&self) -> Option<i64> {
         self.pts?.checked_add(self.duration?)
@@ -225,8 +238,7 @@ mod tests {
         let mut p = Packet::new(0, tb, vec![0xff; 4]);
         assert!(!p.is_keyframe());
         assert_eq!(p.end_pts(), None);
-        p.pts = Some(1024);
-        p.duration = Some(1024);
+        p = p.with_pts(1024).with_duration(1024);
         p.flags.keyframe = true;
         p.side_data
             .push(SideData::CodecConfig(Buf::copy_from_slice(&[0x12, 0x10])));
