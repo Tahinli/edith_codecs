@@ -1,8 +1,9 @@
 //! Matroska (`.mkv`, `.mka`, `.mks`, `.mk3d`) and WebM, both directions.
 //!
-//! [`MatroskaDemuxer`] reads a container into [`ec_core::Packet`]s through the
-//! [`ec_core::Demuxer`] contract, so nothing above it knows which container it
-//! is holding.
+//! [`MatroskaDemuxer`] reads a container into [`ec_core::Packet`]s and
+//! [`MatroskaMuxer`] writes them back out; both speak the [`ec_core::Demuxer`]
+//! and [`ec_core::Muxer`] contracts, so nothing above them knows which container
+//! it is holding.
 //!
 //! Contracts worth knowing before implementing against this crate:
 //!
@@ -35,8 +36,10 @@
 
 mod demux;
 mod ebml;
+mod mux;
 
 pub use demux::MatroskaDemuxer;
+pub use mux::{MAX_TRACKS, MUX_TIME_BASE, MatroskaMuxer};
 
 /// True when `head` starts with an EBML header, which is what a Matroska or
 /// WebM file begins with and what a probe needs to see to hand a file here.
