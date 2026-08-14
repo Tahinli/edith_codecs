@@ -1,0 +1,11 @@
+[package]
+name = "ec-opus"
+description = "Opus decoder (RFC 6716): SILK, CELT, hybrid and multistream, built on the edith_codecs IR."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ec-core.workspace = true
+ec-dsp.workspace = true
