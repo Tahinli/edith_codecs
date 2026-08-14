@@ -867,34 +867,6 @@ fn refusals_name_a_feature_the_stream_really_uses() {
             "frame_mbs_only_flag 0",
         ),
         (
-            "transform8x8",
-            &[
-                "-profile:v",
-                "high",
-                "-qp",
-                "26",
-                "-x264-params",
-                "cabac=0:8x8dct=1",
-            ],
-            "8x8 transform",
-        ),
-        // The 8x8 transform is refused under CABAC too, where the flag is a
-        // context-coded bin rather than a raw one.
-        (
-            "transform8x8-cabac",
-            &[
-                "-profile:v",
-                "high",
-                "-qp",
-                "26",
-                "-coder",
-                "ac",
-                "-x264-params",
-                "8x8dct=1",
-            ],
-            "8x8 transform",
-        ),
-        (
             "yuv422",
             &[
                 "-profile:v",
@@ -1735,6 +1707,94 @@ fn extract_annexb(src: &Path, dst: &Path, frames: usize) -> bool {
     )
 }
 
+/// The same comparison, but demuxed from the container by [`ec_mp4`] instead
+/// of extracted to Annex B by ffmpeg's bitstream filter.
+///
+/// Some real MP4s produce an elementary stream that ffmpeg itself then decodes
+/// only three frames of, silently. That is a property of the extraction, not of
+/// the file: reading the sample table directly and handing the `avcC` and the
+/// length-prefixed samples to the packet entry surface leaves the oracle able to
+/// decode the original file, so the comparison is real again.
+fn compare_container_streamed(
+    source: &Path,
+    frames_wanted: usize,
+) -> Result<StreamedResult, String> {
+    use ec_core::registry::{Decoder as _, Demuxer as _};
+    use std::io::Read;
+
+    let file = std::fs::File::open(source).map_err(|e| e.to_string())?;
+    let mut demux = ec_mp4::Mp4Demuxer::new(std::io::BufReader::new(file))
+        .map_err(|e| format!("ec-mp4 open: {e}"))?;
+    let (stream_index, params) = demux
+        .streams()
+        .iter()
+        .find(|s| s.params.codec == ec_core::registry::CodecId::H264)
+        .map(|s| (s.index, s.params.clone()))
+        .ok_or("no H.264 track")?;
+    let mut dec = ec_h264::H264Decoder::new(params).map_err(|e| format!("{e}"))?;
+
+    let mut child = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(source)
+        .args([
+            "-map",
+            "0:v:0",
+            "-frames:v",
+            &frames_wanted.to_string(),
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "yuv420p",
+            "-",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let mut out = child.stdout.take().expect("piped stdout");
+
+    let mut reference = Vec::new();
+    let mut result = StreamedResult::default();
+    let mut oracle_open = true;
+    let mut take = |frame: Vec<u8>, result: &mut StreamedResult, reference: &mut Vec<u8>| {
+        result.produced += 1;
+        if !oracle_open || result.compared >= frames_wanted {
+            return;
+        }
+        reference.resize(frame.len(), 0);
+        if out.read_exact(reference).is_err() {
+            oracle_open = false;
+            return;
+        }
+        if let Some(pos) = first_diff(&frame, reference) {
+            result.diffs.push((result.compared, pos));
+        }
+        result.compared += 1;
+    };
+    let mut drain =
+        |dec: &mut ec_h264::H264Decoder, result: &mut StreamedResult, reference: &mut Vec<u8>| {
+            while let Ok(ec_core::frame::Frame::Video(f)) = dec.receive_frame() {
+                take(frame_bytes(&f), result, reference);
+            }
+        };
+    while result.produced < frames_wanted {
+        let packet = match demux.next_packet() {
+            Ok(p) => p,
+            Err(_) => break,
+        };
+        if packet.stream != stream_index {
+            continue;
+        }
+        dec.send_packet(&packet).map_err(|e| format!("{e}"))?;
+        drain(&mut dec, &mut result, &mut reference);
+    }
+    dec.flush().map_err(|e| format!("{e}"))?;
+    drain(&mut dec, &mut result, &mut reference);
+    let _ = child.kill();
+    let _ = child.wait();
+    Ok(result)
+}
+
 /// Decode real H.264 files from this machine's library, several hundred frames
 /// each, frame for frame against ffmpeg.
 ///
@@ -1802,15 +1862,47 @@ fn real_library_streams_match_ffmpeg() {
                     r.compared
                 ));
             }
-            // The oracle stopped before we did. That is ffmpeg giving up on the
-            // elementary stream the bitstream filter produced, not a claim about
-            // this decoder, so the file is reported and not counted either way.
+            // The oracle stopped before we did: ffmpeg gave up on the elementary
+            // stream its own bitstream filter produced. That is a property of
+            // the extraction, so the file is re-run straight out of the
+            // container, where the oracle can read the original samples.
             Ok(r) if r.compared < r.produced.min(MIN_FRAMES) => {
-                table.push_str(&format!(
-                    "{name:<40} {container:<12} {width:>5}px oracle short: ffmpeg gave \
-                     {} frames, we decoded {}\n",
-                    r.compared, r.produced
-                ));
+                match compare_container_streamed(Path::new(path), FRAMES) {
+                    Ok(c) if !c.diffs.is_empty() => {
+                        failures.push(format!(
+                            "{name} (container demux): {} of {} frames differ",
+                            c.diffs.len(),
+                            c.compared
+                        ));
+                        table.push_str(&format!(
+                            "{name:<40} {container:<12} {width:>5}px MISMATCH {} of {} \
+                             (container demux)\n",
+                            c.diffs.len(),
+                            c.compared
+                        ));
+                    }
+                    Ok(c) if c.compared >= MIN_FRAMES => {
+                        decoded += 1;
+                        table.push_str(&format!(
+                            "{name:<40} {container:<12} {width:>5}px {:>4} frames bit-exact \
+                             (container demux)\n",
+                            c.compared
+                        ));
+                    }
+                    Ok(c) => {
+                        table.push_str(&format!(
+                            "{name:<40} {container:<12} {width:>5}px oracle short both ways: \
+                             ffmpeg gave {} frames, we decoded {}\n",
+                            c.compared, c.produced
+                        ));
+                    }
+                    Err(e) => {
+                        table.push_str(&format!(
+                            "{name:<40} {container:<12} {width:>5}px oracle short, container \
+                             demux failed: {e}\n"
+                        ));
+                    }
+                }
             }
             Ok(r) => {
                 decoded += 1;
@@ -1982,6 +2074,170 @@ fn spatial_direct_over_a_b_reference_matches_ffmpeg() {
             None => failures.push(format!("{tag}: ffmpeg cannot encode")),
             Some(stream) => match compare_sequence(&stream) {
                 Ok(n) => eprintln!("b-pyramid direct {tag}: {n} frames bit-exact"),
+                Err(e) => failures.push(format!("{tag}: {e}")),
+            },
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// True when the stream's picture parameter set enables the 8x8 transform.
+///
+/// Without this the sweep below would silently prove nothing: an encoder that
+/// quietly dropped back to 4x4 would pass every comparison while never coding
+/// a single transform_size_8x8_flag.
+fn pps_enables_8x8(stream: &Path) -> bool {
+    let bytes = std::fs::read(stream).unwrap_or_default();
+    let mut rbsp = Vec::new();
+    let mut sps = None;
+    for nal in ec_h264_syntax::AnnexBIter::new(&bytes) {
+        let Some((&header, payload)) = nal.split_first() else {
+            continue;
+        };
+        let Ok(h) = ec_h264_syntax::NalHeader::parse(header) else {
+            continue;
+        };
+        ec_h264_syntax::unescape_rbsp(payload, &mut rbsp);
+        match h.unit_type {
+            ec_h264_syntax::NalUnitType::Sps => sps = ec_h264_syntax::Sps::parse(&rbsp).ok(),
+            ec_h264_syntax::NalUnitType::Pps => {
+                if let Ok(p) = ec_h264_syntax::Pps::parse(&rbsp, |_| sps.as_ref()) {
+                    return p.transform_8x8_mode;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// The High-profile 8x8 transform, which every real-world encoder turns on by
+/// default: transform_size_8x8_flag, Intra_8x8 prediction with its reference
+/// filter (8.3.2), the 8x8 residual under both entropy coders and the 8x8
+/// inverse transform of 8.5.13.
+///
+/// The quantiser sweep matters twice over here: the 8x8 dequant ladder of
+/// 8.5.13.1 has its own rounding branch at QP 36, and under CABAC the whole
+/// ctxIdx 402..435 initialisation is a function of SliceQPY.
+#[test]
+fn high_profile_8x8_matches_ffmpeg() {
+    if !have_ffmpeg() {
+        eprintln!("SKIP: ffmpeg not on PATH");
+        return;
+    }
+    let dir = scratch("high8x8");
+    let mut failures = Vec::new();
+    // High profile with the 8x8 transform forced on, in both entropy coders.
+    let modes: [(&str, &[&str]); 2] = [
+        ("cabac", &["-profile:v", "high", "-coder", "ac"]),
+        ("cavlc", &["-profile:v", "high", "-coder", "0"]),
+    ];
+    for (mode, profile) in modes {
+        let mut checked = 0usize;
+        for qp in 1..=51u32 {
+            let mut extra = profile.to_vec();
+            let qp_string = qp.to_string();
+            extra.extend(["-qp", &qp_string, "-x264-params", "8x8dct=1:i8x8=1"]);
+            let tag = format!("i8-{mode}-q{qp}");
+            match round_trip(&dir, &tag, "176x144", &extra) {
+                Ok(0) => {
+                    assert!(
+                        pps_enables_8x8(&dir.join(format!("{tag}.264"))),
+                        "{tag}: encoder did not enable the 8x8 transform"
+                    );
+                    checked += 1;
+                }
+                Ok(n) => failures.push(format!("intra {mode} qp {qp}: {n} bytes differ")),
+                Err(e) => failures.push(e),
+            }
+        }
+        assert!(
+            checked >= 40,
+            "too few {mode} quantisers exercised: {checked}"
+        );
+        eprintln!("8x8 intra {mode}: {checked} quantisers bit-exact against ffmpeg");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// The same transform in inter macroblocks: P and B partitions carry the flag
+/// only when no 8x8 is split further (7.3.5), the residual rides the inter
+/// scaling list, and the deblocker must leave the internal 4-sample edges of an
+/// 8x8 macroblock alone (8.7).
+#[test]
+fn high_profile_8x8_inter_sequences_match_ffmpeg() {
+    if !have_ffmpeg() {
+        eprintln!("SKIP: ffmpeg not on PATH");
+        return;
+    }
+    let dir = scratch("high8x8-seq");
+    let mut failures = Vec::new();
+    let cases: &[(&str, &[&str])] = &[
+        (
+            "p-cabac",
+            &["-profile:v", "high", "-coder", "ac", "-bf", "0"],
+        ),
+        (
+            "p-cavlc",
+            &["-profile:v", "high", "-coder", "0", "-bf", "0"],
+        ),
+        (
+            "b-cabac",
+            &[
+                "-profile:v",
+                "high",
+                "-coder",
+                "ac",
+                "-bf",
+                "2",
+                "-x264-params",
+                "b-adapt=0",
+            ],
+        ),
+        (
+            "b-cavlc",
+            &[
+                "-profile:v",
+                "high",
+                "-coder",
+                "0",
+                "-bf",
+                "2",
+                "-x264-params",
+                "b-adapt=0",
+            ],
+        ),
+        // Sub-8x8 partitions: every macroblock that splits below 8x8 must not
+        // carry the flag, and the neighbouring context has to agree.
+        (
+            "subpart",
+            &[
+                "-profile:v",
+                "high",
+                "-coder",
+                "ac",
+                "-bf",
+                "0",
+                "-x264-params",
+                "partitions=all:8x8dct=1",
+            ],
+        ),
+    ];
+    for (tag, extra) in cases {
+        let mut args = extra.to_vec();
+        args.extend(["-qp", "26"]);
+        match x264_encode_gop(&dir, tag, "176x144", 12, &args) {
+            None => failures.push(format!("{tag}: ffmpeg cannot encode")),
+            Some(stream) => match compare_sequence(&stream) {
+                Ok(n) => {
+                    assert!(
+                        pps_enables_8x8(&stream),
+                        "{tag}: encoder did not enable the 8x8 transform"
+                    );
+                    eprintln!("8x8 {tag}: {n} frames bit-exact");
+                }
                 Err(e) => failures.push(format!("{tag}: {e}")),
             },
         }

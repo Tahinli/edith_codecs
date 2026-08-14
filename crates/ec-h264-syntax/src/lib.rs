@@ -23,8 +23,8 @@ pub mod sps;
 pub use nal::{AnnexBIter, NalHeader, NalUnitType, unescape_rbsp};
 pub use pps::Pps;
 pub use slice::{
-    DeblockControl, DecRefPicMarking, Mmco, PredWeightTable, RefPicListMod, SliceHeader,
-    SliceType, WeightEntry,
+    DeblockControl, DecRefPicMarking, Mmco, PredWeightTable, RefPicListMod, SliceHeader, SliceType,
+    WeightEntry,
 };
 pub use sps::{BitstreamRestriction, Hrd, ScalingLists, Sps, Vui};
 

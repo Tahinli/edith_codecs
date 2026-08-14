@@ -163,6 +163,216 @@ pub fn pred_4x4(mode: u8, n: &Nbr4, out: &mut [u8; 16]) {
     }
 }
 
+/// Neighbour samples of an 8x8 luma block (spec 8.3.2.2's 25 samples), already
+/// low-pass filtered by [`filter_nbr8`]. `top[8..16]` carries the top-right
+/// substitution rule.
+#[derive(Debug, Clone, Copy)]
+pub struct Nbr8 {
+    /// p'[0..15, -1].
+    pub top: [u8; 16],
+    /// p'[-1, 0..7].
+    pub left: [u8; 8],
+    /// p'[-1, -1].
+    pub top_left: u8,
+    /// p[x, -1] available.
+    pub have_top: bool,
+    /// p[-1, y] available.
+    pub have_left: bool,
+    /// p[-1, -1] available. Its own neighbour (the above-left macroblock for
+    /// block 0), not the conjunction of the two runs.
+    pub have_tl: bool,
+}
+
+/// Reference sample filtering for Intra_8x8 prediction (spec 8.3.2.2.1).
+///
+/// Input is the unfiltered neighbourhood; each of the three runs (top row,
+/// corner, left column) is filtered only when it is wholly available, exactly
+/// as the clause states, so an edge block keeps the raw samples the prediction
+/// modes it is allowed to signal actually read.
+pub fn filter_nbr8(n: &Nbr8) -> Nbr8 {
+    let mut out = *n;
+    let have_tl = n.have_tl;
+    if n.have_top {
+        let t = |i: usize| i32::from(n.top[i]);
+        out.top[0] = if have_tl {
+            ((i32::from(n.top_left) + 2 * t(0) + t(1) + 2) >> 2) as u8
+        } else {
+            ((3 * t(0) + t(1) + 2) >> 2) as u8
+        };
+        for x in 1..15 {
+            out.top[x] = ((t(x - 1) + 2 * t(x) + t(x + 1) + 2) >> 2) as u8;
+        }
+        out.top[15] = ((t(14) + 3 * t(15) + 2) >> 2) as u8;
+    }
+    if have_tl {
+        // 8-82 to 8-84: which taps the corner takes depends on which of its two
+        // adjacent samples exist.
+        let (tl, t0, l0) = (
+            i32::from(n.top_left),
+            i32::from(n.top[0]),
+            i32::from(n.left[0]),
+        );
+        out.top_left = match (n.have_top, n.have_left) {
+            (true, true) => ((t0 + 2 * tl + l0 + 2) >> 2) as u8,
+            (true, false) => ((3 * tl + t0 + 2) >> 2) as u8,
+            (false, true) => ((3 * tl + l0 + 2) >> 2) as u8,
+            (false, false) => n.top_left,
+        };
+    }
+    if n.have_left {
+        let l = |i: usize| i32::from(n.left[i]);
+        out.left[0] = if have_tl {
+            ((i32::from(n.top_left) + 2 * l(0) + l(1) + 2) >> 2) as u8
+        } else {
+            ((3 * l(0) + l(1) + 2) >> 2) as u8
+        };
+        for y in 1..7 {
+            out.left[y] = ((l(y - 1) + 2 * l(y) + l(y + 1) + 2) >> 2) as u8;
+        }
+        out.left[7] = ((l(6) + 3 * l(7) + 2) >> 2) as u8;
+    }
+    out
+}
+
+/// Predict an 8x8 luma block (spec 8.3.2.2.2 - 8.3.2.2.10) into `out` in raster
+/// order. `n` must already be filtered by [`filter_nbr8`].
+// x and y are sample coordinates that also index the neighbour runs; the
+// clause's index arithmetic is what the loops spell out.
+#[allow(clippy::needless_range_loop)]
+pub fn pred_8x8(mode: u8, n: &Nbr8, out: &mut [u8; 64]) {
+    let t = |x: i32| i32::from(n.top[x as usize]);
+    let l = |y: i32| i32::from(n.left[y as usize]);
+    let tl = i32::from(n.top_left);
+    // Index -1 of either run is the corner sample.
+    let te = |i: i32| if i < 0 { tl } else { t(i) };
+    let le = |i: i32| if i < 0 { tl } else { l(i) };
+    match mode {
+        // Vertical (8-89).
+        0 => {
+            for y in 0..8 {
+                out[y * 8..y * 8 + 8].copy_from_slice(&n.top[..8]);
+            }
+        }
+        // Horizontal (8-90).
+        1 => {
+            for y in 0..8 {
+                out[y * 8..y * 8 + 8].fill(n.left[y]);
+            }
+        }
+        // DC (8-91..8-94).
+        2 => {
+            let sum_t: i32 = (0..8).map(t).sum();
+            let sum_l: i32 = (0..8).map(l).sum();
+            let v = match (n.have_top, n.have_left) {
+                (true, true) => (sum_t + sum_l + 8) >> 4,
+                (true, false) => (sum_t + 4) >> 3,
+                (false, true) => (sum_l + 4) >> 3,
+                (false, false) => 128,
+            };
+            out.fill(v as u8);
+        }
+        // Diagonal down-left (8-95, 8-96).
+        3 => {
+            for y in 0..8i32 {
+                for x in 0..8i32 {
+                    let v = if x == 7 && y == 7 {
+                        (t(14) + 3 * t(15) + 2) >> 2
+                    } else {
+                        (t(x + y) + 2 * t(x + y + 1) + t(x + y + 2) + 2) >> 2
+                    };
+                    out[(y * 8 + x) as usize] = v as u8;
+                }
+            }
+        }
+        // Diagonal down-right (8-97..8-99).
+        4 => {
+            for y in 0..8i32 {
+                for x in 0..8i32 {
+                    let v = if x > y {
+                        (te(x - y - 2) + 2 * te(x - y - 1) + t(x - y) + 2) >> 2
+                    } else if x < y {
+                        (le(y - x - 2) + 2 * le(y - x - 1) + l(y - x) + 2) >> 2
+                    } else {
+                        (t(0) + 2 * tl + l(0) + 2) >> 2
+                    };
+                    out[(y * 8 + x) as usize] = v as u8;
+                }
+            }
+        }
+        // Vertical-right (8-100..8-103).
+        5 => {
+            for y in 0..8i32 {
+                for x in 0..8i32 {
+                    let z = 2 * x - y;
+                    let i = x - (y >> 1);
+                    let v = if z >= 0 && z % 2 == 0 {
+                        (te(i - 1) + te(i) + 1) >> 1
+                    } else if z >= 0 {
+                        (te(i - 2) + 2 * te(i - 1) + te(i) + 2) >> 2
+                    } else if z == -1 {
+                        (l(0) + 2 * tl + t(0) + 2) >> 2
+                    } else {
+                        (l(y - 2 * x - 1) + 2 * l(y - 2 * x - 2) + le(y - 2 * x - 3) + 2) >> 2
+                    };
+                    out[(y * 8 + x) as usize] = v as u8;
+                }
+            }
+        }
+        // Horizontal-down (8-104..8-107).
+        6 => {
+            for y in 0..8i32 {
+                for x in 0..8i32 {
+                    let z = 2 * y - x;
+                    let i = y - (x >> 1);
+                    let v = if z >= 0 && z % 2 == 0 {
+                        (le(i - 1) + le(i) + 1) >> 1
+                    } else if z >= 0 {
+                        (le(i - 2) + 2 * le(i - 1) + le(i) + 2) >> 2
+                    } else if z == -1 {
+                        (l(0) + 2 * tl + t(0) + 2) >> 2
+                    } else {
+                        (t(x - 2 * y - 1) + 2 * t(x - 2 * y - 2) + te(x - 2 * y - 3) + 2) >> 2
+                    };
+                    out[(y * 8 + x) as usize] = v as u8;
+                }
+            }
+        }
+        // Vertical-left (8-108, 8-109).
+        7 => {
+            for y in 0..8i32 {
+                for x in 0..8i32 {
+                    let i = x + (y >> 1);
+                    let v = if y % 2 == 0 {
+                        (t(i) + t(i + 1) + 1) >> 1
+                    } else {
+                        (t(i) + 2 * t(i + 1) + t(i + 2) + 2) >> 2
+                    };
+                    out[(y * 8 + x) as usize] = v as u8;
+                }
+            }
+        }
+        // Horizontal-up (8-110..8-113).
+        _ => {
+            for y in 0..8i32 {
+                for x in 0..8i32 {
+                    let z = x + 2 * y;
+                    let i = y + (x >> 1);
+                    let v = if z < 13 && z % 2 == 0 {
+                        (l(i) + l(i + 1) + 1) >> 1
+                    } else if z < 13 {
+                        (l(i) + 2 * l(i + 1) + l(i + 2) + 2) >> 2
+                    } else if z == 13 {
+                        (l(6) + 3 * l(7) + 2) >> 2
+                    } else {
+                        l(7)
+                    };
+                    out[(y * 8 + x) as usize] = v as u8;
+                }
+            }
+        }
+    }
+}
+
 /// A borrowed window into a picture plane for whole-MB prediction: `data`
 /// spans the plane, `stride` its pitch, `origin` the index of this MB's
 /// top-left sample.
@@ -324,9 +534,102 @@ pub fn add_residual_4x4(data: &mut [u8], stride: usize, origin: usize, r: &[i32;
     }
 }
 
+/// Add an 8x8 residual to the plane with clamping (spec 8.5.13 / picture
+/// construction).
+#[inline]
+pub fn add_residual_8x8(data: &mut [u8], stride: usize, origin: usize, r: &[i32; 64]) {
+    for y in 0..8 {
+        let row = origin + y * stride;
+        for x in 0..8 {
+            let p = i32::from(data[row + x]) + r[y * 8 + x];
+            data[row + x] = p.clamp(0, 255) as u8;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A constant neighbourhood survives the reference filter and every 8x8
+    /// mode reproduces it: the filters are normalised (1+2+1)/4 and the modes
+    /// are weighted averages of the same samples.
+    #[test]
+    fn constant_neighbourhood_is_a_fixed_point() {
+        let n = Nbr8 {
+            top: [77; 16],
+            left: [77; 8],
+            top_left: 77,
+            have_top: true,
+            have_left: true,
+            have_tl: true,
+        };
+        let f = filter_nbr8(&n);
+        assert_eq!(f.top, [77; 16]);
+        assert_eq!(f.left, [77; 8]);
+        assert_eq!(f.top_left, 77);
+        for mode in 0..9u8 {
+            let mut out = [0u8; 64];
+            pred_8x8(mode, &f, &mut out);
+            assert!(out.iter().all(|&v| v == 77), "mode {mode}: {out:?}");
+        }
+    }
+
+    /// The reference filter of 8.3.2.2.1 with the corner unavailable uses the
+    /// 3:1 end taps, and never runs over a run that is not wholly available.
+    #[test]
+    fn reference_filter_edges() {
+        let mut top = [0u8; 16];
+        for (x, t) in top.iter_mut().enumerate() {
+            *t = (x * 4) as u8;
+        }
+        let n = Nbr8 {
+            top,
+            left: [100; 8],
+            top_left: 9,
+            have_top: true,
+            have_left: false,
+            have_tl: false,
+        };
+        let f = filter_nbr8(&n);
+        // No left run: p'[0, -1] takes 8-79, and the left column is untouched.
+        // 8-79 with p[0, -1] = 0 and p[1, -1] = 4.
+        assert_eq!(f.top[0], ((4 + 2) >> 2) as u8);
+        // 8-80 over p[0..2, -1] = 0, 4, 8.
+        assert_eq!(f.top[1], ((2 * 4 + 8 + 2) >> 2) as u8);
+        assert_eq!(f.top[15], ((56 + 3 * 60 + 2) >> 2) as u8);
+        assert_eq!(f.left, [100; 8]);
+        assert_eq!(f.top_left, 9);
+        // DC with no left run averages the top run alone (8-93).
+        let mut out = [0u8; 64];
+        pred_8x8(2, &f, &mut out);
+        let sum: i32 = (0..8).map(|i| i32::from(f.top[i])).sum();
+        assert!(out.iter().all(|&v| i32::from(v) == (sum + 4) >> 3));
+    }
+
+    /// Vertical and horizontal 8x8 copy the filtered runs.
+    #[test]
+    fn vertical_horizontal_8x8() {
+        let mut top = [0u8; 16];
+        for (x, t) in top.iter_mut().enumerate() {
+            *t = (x * 3) as u8;
+        }
+        let n = Nbr8 {
+            top,
+            left: [1, 2, 3, 4, 5, 6, 7, 8],
+            top_left: 0,
+            have_top: true,
+            have_left: true,
+            have_tl: true,
+        };
+        let mut out = [0u8; 64];
+        pred_8x8(0, &n, &mut out);
+        assert_eq!(&out[..8], &n.top[..8]);
+        assert_eq!(&out[56..], &n.top[..8]);
+        pred_8x8(1, &n, &mut out);
+        assert_eq!(out[0], 1);
+        assert_eq!(out[63], 8);
+    }
 
     #[test]
     fn dc_4x4_fallbacks() {

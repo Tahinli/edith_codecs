@@ -1,6 +1,8 @@
-//! Inverse transforms and scaling (spec 8.5.9 - 8.5.12).
+//! Inverse transforms and scaling (spec 8.5.9 - 8.5.13).
 
-use crate::tables::{NORM_ADJUST_4X4, NORM_ADJUST_CLASS_4X4, ZIGZAG_4X4};
+use crate::tables::{
+    NORM_ADJUST_4X4, NORM_ADJUST_8X8, NORM_ADJUST_CLASS_4X4, ZIGZAG_4X4, ZIGZAG_8X8,
+};
 
 /// Per-QP scaling factors for one 4x4 weight list: `LevelScale4x4(m, i, j) =
 /// weightScale(i, j) * normAdjust4x4(m, i, j)` (Equation 8-313), in raster
@@ -46,6 +48,139 @@ pub fn dequant_4x4(block: &mut [i32; 16], ls: &LevelScale4x4, qp: i32, skip_dc: 
         let round = 1i32 << (3 - shift);
         for i in start..16 {
             block[i] = (block[i] * scale[i] + round) >> sh;
+        }
+    }
+}
+
+/// Per-QP scaling factors for one 8x8 weight list: `LevelScale8x8(m, i, j) =
+/// weightScale8x8(i, j) * normAdjust8x8(m, i, j)` (Equation 8-316), in raster
+/// order, for m = qP % 6.
+#[derive(Debug, Clone)]
+pub struct LevelScale8x8 {
+    /// `[m][raster]`.
+    pub scale: [[i32; 64]; 6],
+}
+
+/// `normAdjust8x8` position class of raster position `(i, j)` (Equation 8-317),
+/// where `i` is the row and `j` the column.
+const fn norm_class_8x8(i: usize, j: usize) -> usize {
+    let (i4, j4, i2, j2) = (i % 4, j % 4, i % 2, j % 2);
+    if i4 == 0 && j4 == 0 {
+        0
+    } else if i2 == 1 && j2 == 1 {
+        1
+    } else if i4 == 2 && j4 == 2 {
+        2
+    } else if (i4 == 0 && j2 == 1) || (i2 == 1 && j4 == 0) {
+        3
+    } else if (i4 == 0 && j4 == 2) || (i4 == 2 && j4 == 0) {
+        4
+    } else {
+        5
+    }
+}
+
+impl LevelScale8x8 {
+    /// Build from a raster-order 8x8 weight list (flat 16s when no scaling
+    /// matrix is in force).
+    pub fn new(weight: &[u8; 64]) -> LevelScale8x8 {
+        let mut scale = [[0i32; 64]; 6];
+        for (m, row) in scale.iter_mut().enumerate() {
+            for (idx, s) in row.iter_mut().enumerate() {
+                let class = norm_class_8x8(idx / 8, idx % 8);
+                *s = i32::from(weight[idx]) * i32::from(NORM_ADJUST_8X8[m][class]);
+            }
+        }
+        LevelScale8x8 { scale }
+    }
+}
+
+/// Scale an 8x8 luma block in place (spec 8.5.13.1), raster order.
+#[inline]
+pub fn dequant_8x8(block: &mut [i32; 64], ls: &LevelScale8x8, qp: i32) {
+    let scale = &ls.scale[(qp % 6) as usize];
+    if qp >= 36 {
+        let sh = (qp / 6 - 6) as u32;
+        for i in 0..64 {
+            block[i] = (block[i] * scale[i]) << sh;
+        }
+    } else {
+        let sh = (6 - qp / 6) as u32;
+        let round = 1i32 << (5 - qp / 6);
+        for i in 0..64 {
+            block[i] = (block[i] * scale[i] + round) >> sh;
+        }
+    }
+}
+
+/// Place scan-order coefficients of an 8x8 block into raster order using the
+/// 8x8 zig-zag (Table 8-14).
+#[inline]
+pub fn unzigzag_8x8(scan: &[i32; 64], out: &mut [i32; 64]) {
+    for (s, &raster) in ZIGZAG_8X8.iter().enumerate() {
+        out[raster as usize] = scan[s];
+    }
+}
+
+/// One pass of the 8x8 inverse core transform (Equations 8-358 to 8-381) over
+/// eight values.
+#[inline]
+fn idct8_1d(d: [i32; 8]) -> [i32; 8] {
+    let e = [
+        d[0] + d[4],
+        -d[3] + d[5] - d[7] - (d[7] >> 1),
+        d[0] - d[4],
+        d[1] + d[7] - d[3] - (d[3] >> 1),
+        (d[2] >> 1) - d[6],
+        -d[1] + d[7] + d[5] + (d[5] >> 1),
+        d[2] + (d[6] >> 1),
+        d[3] + d[5] + d[1] + (d[1] >> 1),
+    ];
+    let f = [
+        e[0] + e[6],
+        e[1] + (e[7] >> 2),
+        e[2] + e[4],
+        e[3] + (e[5] >> 2),
+        e[2] - e[4],
+        (e[3] >> 2) - e[5],
+        e[0] - e[6],
+        e[7] - (e[1] >> 2),
+    ];
+    [
+        f[0] + f[7],
+        f[2] + f[5],
+        f[4] + f[3],
+        f[6] + f[1],
+        f[6] - f[1],
+        f[4] - f[3],
+        f[2] - f[5],
+        f[0] - f[7],
+    ]
+}
+
+/// Inverse 8x8 core transform (spec 8.5.13.2): raster-order input `d`, output
+/// residuals `r` including the final `(x + 32) >> 6`.
+pub fn inverse_transform_8x8(d: &[i32; 64], r: &mut [i32; 64]) {
+    let mut g = [0i32; 64];
+    for i in 0..8 {
+        let o = i * 8;
+        let row: [i32; 8] = d[o..o + 8].try_into().expect("eight coefficients");
+        g[o..o + 8].copy_from_slice(&idct8_1d(row));
+    }
+    for j in 0..8 {
+        let col = [
+            g[j],
+            g[8 + j],
+            g[16 + j],
+            g[24 + j],
+            g[32 + j],
+            g[40 + j],
+            g[48 + j],
+            g[56 + j],
+        ];
+        let m = idct8_1d(col);
+        for (i, &v) in m.iter().enumerate() {
+            r[i * 8 + j] = (v + 32) >> 6;
         }
     }
 }
