@@ -1,12 +1,12 @@
-//! `hound` 3.5.1's WAV-writing surface, over [`ec_riff`].
+//! `hound` 3.5.1's WAV surface, over [`ec_riff`].
 //!
 //! This crate exists to be swapped in by `[patch.crates-io]`: it carries the
 //! incumbent's name and version so a consumer's `use hound::…` compiles
 //! unchanged. Only what edith consumes is here — `WavWriter::create`,
-//! `write_sample`, `finalize`, [`WavSpec`], [`SampleFormat`] and an [`Error`]
-//! with the incumbent's variants — because a shim that grows a surface nobody
-//! calls is a second implementation to keep honest. Reading is `ec-riff`'s
-//! [`ec_riff::WavReader`]; the shim does not wrap it.
+//! `write_sample`, `finalize`, `WavReader::open`, `spec`, `samples`,
+//! [`WavSpec`], [`SampleFormat`] and an [`Error`] with the incumbent's variants
+//! — because a shim that grows a surface nobody calls is a second
+//! implementation to keep honest.
 //!
 //! Behaviour differences from the incumbent, all in the strict direction:
 //! files with more than two channels or more than 16 bits get a
@@ -18,10 +18,47 @@
 
 use std::fmt;
 use std::fs::File;
-use std::io::{self, BufWriter, Seek, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, Write};
 use std::path::Path;
 
-pub use ec_riff::Sample;
+/// A sample type a [`WavWriter`] accepts and a [`WavReader`] yields.
+///
+/// The write half is [`ec_riff::Sample`]; the two constructors and the width
+/// are what reading adds, and they are what makes hound's `TooWide` and
+/// `InvalidSampleFormat` decidable before a single sample is converted.
+pub trait Sample: ec_riff::Sample {
+    /// Bits this type carries. A file deeper than this is [`Error::TooWide`].
+    const BITS: u16;
+    /// Narrow the reader's integer carrier. Called for integer files only.
+    fn from_i32(v: i32) -> Self;
+    /// Take the reader's float carrier. Called for float files only.
+    fn from_f32(v: f32) -> Self;
+}
+
+macro_rules! int_sample {
+    ($($t:ty => $bits:expr),*) => {$(
+        impl Sample for $t {
+            const BITS: u16 = $bits;
+            fn from_i32(v: i32) -> Self {
+                v as $t
+            }
+            fn from_f32(v: f32) -> Self {
+                v as $t
+            }
+        }
+    )*};
+}
+int_sample!(i8 => 8, i16 => 16, i32 => 32);
+
+impl Sample for f32 {
+    const BITS: u16 = 32;
+    fn from_i32(v: i32) -> Self {
+        v as f32
+    }
+    fn from_f32(v: f32) -> Self {
+        v
+    }
+}
 
 /// Whether samples are stored as floats or integers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -188,5 +225,86 @@ impl<W: Write + Seek> WavWriter<W> {
             .finalize()
             .map(|_| ())
             .map_err(|e| map(e, Error::UnfinishedSample))
+    }
+}
+
+/// Reads a WAVE file's header, then its samples.
+pub struct WavReader<R: Read> {
+    inner: ec_riff::WavReader<R>,
+}
+
+impl WavReader<BufReader<File>> {
+    /// Open `path` and parse its header.
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        WavReader::new(BufReader::new(File::open(path)?))
+    }
+}
+
+impl<R: Read> WavReader<R> {
+    /// Parse the header of an already-open stream.
+    pub fn new(reader: R) -> Result<Self> {
+        ec_riff::WavReader::new(reader)
+            .map(|inner| WavReader { inner })
+            .map_err(|e| map(e, Error::FormatError("not a WAVE file this reader accepts")))
+    }
+
+    /// The `fmt ` chunk as parsed.
+    pub fn spec(&self) -> WavSpec {
+        let s = self.inner.spec();
+        WavSpec {
+            channels: s.channels,
+            sample_rate: s.sample_rate,
+            bits_per_sample: s.bits_per_sample,
+            sample_format: match s.sample_format {
+                ec_riff::SampleType::Float => SampleFormat::Float,
+                ec_riff::SampleType::Int => SampleFormat::Int,
+            },
+        }
+    }
+
+    /// Every sample, interleaved in channel order, as the incumbent's fallible
+    /// iterator: a file whose format or depth `S` cannot carry yields one
+    /// [`Error::InvalidSampleFormat`] or [`Error::TooWide`] rather than a
+    /// converted value, which is where hound puts the same refusals.
+    ///
+    /// corner-cut: `ec-riff` reads the `data` chunk whole, so this buffers the
+    /// file where hound streams it — ~10 MB per minute of 48 kHz stereo, fine
+    /// for the export round-trips edith checks and wrong for an hour of audio.
+    /// Upgrade path is a streaming `read_samples` on `ec_riff::WavReader`,
+    /// which this then forwards to unchanged.
+    pub fn samples<S: Sample>(&mut self) -> WavSamples<S> {
+        let spec = self.inner.spec();
+        let float_file = spec.sample_format == ec_riff::SampleType::Float;
+        let items = if float_file != S::FLOAT {
+            vec![Err(Error::InvalidSampleFormat)]
+        } else if spec.bits_per_sample > S::BITS {
+            vec![Err(Error::TooWide)]
+        } else if float_file {
+            match self.inner.read_all_f32() {
+                Ok(v) => v.into_iter().map(|s| Ok(S::from_f32(s))).collect(),
+                Err(e) => vec![Err(map(e, Error::FormatError("truncated WAVE data")))],
+            }
+        } else {
+            match self.inner.read_all_i32() {
+                Ok(v) => v.into_iter().map(|s| Ok(S::from_i32(s))).collect(),
+                Err(e) => vec![Err(map(e, Error::FormatError("truncated WAVE data")))],
+            }
+        };
+        WavSamples(items.into_iter())
+    }
+}
+
+/// The iterator [`WavReader::samples`] returns.
+pub struct WavSamples<S>(std::vec::IntoIter<Result<S>>);
+
+impl<S> Iterator for WavSamples<S> {
+    type Item = Result<S>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
     }
 }

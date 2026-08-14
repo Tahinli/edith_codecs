@@ -48,6 +48,43 @@ fn edith_write_wav_round_trips() {
     }
 }
 
+/// The read half edith's tests make: `WavReader::open`, `spec()`, and
+/// `samples::<i16>()` collected — plus the two refusals hound answers with
+/// when the requested type cannot carry the file.
+#[test]
+fn edith_read_wav_round_trips() {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"));
+    std::fs::create_dir_all(dir).unwrap();
+    let path = dir.join("read-back.wav");
+    let samples: Vec<i32> = (0..2048).map(|i| ((i * 733) % 65536) - 32768).collect();
+    write_wav(&path, &samples, 2, 48000).unwrap();
+
+    let mut r = hound::WavReader::open(&path).unwrap();
+    let spec = r.spec();
+    assert_eq!(spec.channels, 2);
+    assert_eq!(spec.sample_rate, 48000);
+    assert_eq!(spec.bits_per_sample, 16);
+    assert_eq!(spec.sample_format, hound::SampleFormat::Int);
+    let read: Vec<i32> = r
+        .samples::<i16>()
+        .map(|s| i32::from(s.expect("a sample")))
+        .collect();
+    assert_eq!(read, samples);
+
+    // An integer file read as floats, and a 16-bit file read as 8: the two
+    // refusals, not silent conversions.
+    let mut r = hound::WavReader::open(&path).unwrap();
+    assert!(matches!(
+        r.samples::<f32>().next(),
+        Some(Err(hound::Error::InvalidSampleFormat))
+    ));
+    let mut r = hound::WavReader::open(&path).unwrap();
+    assert!(matches!(
+        r.samples::<i8>().next(),
+        Some(Err(hound::Error::TooWide))
+    ));
+}
+
 #[test]
 fn errors_carry_the_incumbent_variants() {
     let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"));
