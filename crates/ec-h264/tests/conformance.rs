@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use ec_core::registry::{CodecId, CodecParameters, Decoder as _};
 use ec_core::{Buf, Frame, Packet, TimeBase};
-use ec_h264::{Decoder, Error, H264Decoder};
+use ec_h264::{Decoder, Error, H264Decoder, NalOutcome};
 
 // ---------------------------------------------------------------------------
 // Counting allocator: proves the steady-state decode loop allocates nothing.
@@ -155,6 +155,137 @@ fn decode_first(stream_bytes: &[u8]) -> Result<(Vec<u8>, usize, usize), Error> {
 
 fn first_diff(a: &[u8], b: &[u8]) -> Option<usize> {
     a.iter().zip(b).position(|(x, y)| x != y)
+}
+
+/// Pack a decoded frame as contiguous I420 bytes.
+fn frame_bytes(frame: &ec_core::frame::VideoFrame) -> Vec<u8> {
+    let (w, h) = (frame.width as usize, frame.height as usize);
+    let mut out = Vec::with_capacity(w * h * 3 / 2);
+    let dims = [
+        (w, h),
+        (w.div_ceil(2), h.div_ceil(2)),
+        (w.div_ceil(2), h.div_ceil(2)),
+    ];
+    for (plane, (pw, ph)) in frame.planes.iter().zip(dims) {
+        for y in 0..ph {
+            out.extend_from_slice(plane.row(y, pw).expect("plane row"));
+        }
+    }
+    out
+}
+
+/// Decode a whole Annex B stream, returning every frame in display order.
+fn decode_all(bytes: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
+    let mut dec = Decoder::new();
+    let mut frames = Vec::new();
+    for nal in ec_h264_syntax::AnnexBIter::new(bytes) {
+        match dec.push_nal(nal)? {
+            NalOutcome::PictureBoundary => {
+                dec.end_picture()?;
+                dec.push_nal(nal)?;
+            }
+            _ => {}
+        }
+        while let Some(f) = dec.next_frame() {
+            frames.push(frame_bytes(&f));
+        }
+    }
+    dec.flush()?;
+    while let Some(f) = dec.next_frame() {
+        frames.push(frame_bytes(&f));
+    }
+    Ok(frames)
+}
+
+/// Every frame ffmpeg decodes from `stream`, as raw I420.
+fn ffmpeg_all_frames(stream: &Path, frame_len: usize) -> Option<Vec<Vec<u8>>> {
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-v", "error"]);
+    if std::env::var_os("EC_H264_NO_DEBLOCK").is_some() {
+        cmd.args(["-skip_loop_filter", "all"]);
+    }
+    let out = cmd
+        .arg("-i")
+        .arg(stream)
+        .args(["-f", "rawvideo", "-pix_fmt", "yuv420p", "-"])
+        .output()
+        .ok()?;
+    if !out.status.success() || out.stdout.is_empty() {
+        return None;
+    }
+    Some(
+        out.stdout
+            .chunks_exact(frame_len)
+            .map(<[u8]>::to_vec)
+            .collect(),
+    )
+}
+
+/// Encode a multi-frame clip with x264 and return the Annex B file.
+fn x264_encode_gop(
+    dir: &Path,
+    tag: &str,
+    size: &str,
+    frames: u32,
+    extra: &[&str],
+) -> Option<PathBuf> {
+    let stream = dir.join(format!("{tag}.264"));
+    let source = format!("testsrc=size={size}:rate=25:duration=4");
+    let mut args: Vec<String> = [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    args.push(source);
+    if !extra.contains(&"-pix_fmt") {
+        args.extend(["-pix_fmt".into(), "yuv420p".into()]);
+    }
+    args.extend([
+        "-c:v".into(),
+        "libx264".into(),
+        "-frames:v".into(),
+        frames.to_string(),
+    ]);
+    args.extend(extra.iter().map(|s| s.to_string()));
+    args.extend([
+        "-f".into(),
+        "h264".into(),
+        stream.to_string_lossy().into_owned(),
+    ]);
+    let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    run("ffmpeg", &refs).then_some(stream)
+}
+
+/// Decode `stream` both ways and report the first frame that differs.
+fn compare_sequence(stream: &Path) -> Result<usize, String> {
+    let bytes = std::fs::read(stream).map_err(|e| e.to_string())?;
+    let ours = decode_all(&bytes).map_err(|e| format!("{e}"))?;
+    let first = ours.first().ok_or("no frames decoded")?;
+    let theirs =
+        ffmpeg_all_frames(stream, first.len()).ok_or("ffmpeg cannot decode the stream")?;
+    if ours.len() != theirs.len() {
+        return Err(format!(
+            "{} frames decoded, ffmpeg gave {}",
+            ours.len(),
+            theirs.len()
+        ));
+    }
+    for (i, (a, b)) in ours.iter().zip(&theirs).enumerate() {
+        if let Some(pos) = first_diff(a, b) {
+            return Err(format!(
+                "frame {i} differs at byte {pos}: ours {} ffmpeg {}",
+                a[pos], b[pos]
+            ));
+        }
+    }
+    Ok(ours.len())
 }
 
 #[test]
@@ -906,4 +1037,202 @@ fn avcc_extradata_and_length_prefixed_packets() {
     }
     assert_eq!(avcc_frame, annex_b_frame);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// Inter prediction, the decoded picture buffer and display order.
+// ---------------------------------------------------------------------------
+
+/// A P-only GOP, every frame bit-exact against ffmpeg, under both entropy
+/// coders. This is the narrowest thing that exercises motion compensation, the
+/// reference list, sliding-window marking and the inter boundary strengths at
+/// once, so it is the first test to look at when any of them regress.
+#[test]
+fn p_only_gop_matches_ffmpeg_every_frame() {
+    if !have_ffmpeg() {
+        eprintln!("SKIP: ffmpeg not on PATH");
+        return;
+    }
+    let dir = scratch("p-gop");
+    let mut failures = Vec::new();
+    for (mode, profile) in ENTROPY_MODES {
+        let mut extra = profile.to_vec();
+        extra.extend(["-qp", "26", "-x264-params", "bframes=0:weightp=0:ref=1"]);
+        let tag = format!("{mode}-p");
+        match x264_encode_gop(&dir, &tag, "176x144", 12, &extra) {
+            Some(stream) => match compare_sequence(&stream) {
+                Ok(n) => eprintln!("{tag}: {n} frames bit-exact"),
+                Err(e) => failures.push(format!("{tag}: {e}")),
+            },
+            None => failures.push(format!("{tag}: ffmpeg cannot encode")),
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Scratch driver kept out of the default run: decode a stream named by
+/// `EC_H264_DEBUG_STREAM` frame by frame and report the first mismatch.
+#[test]
+#[ignore]
+fn debug_named_stream() {
+    let Ok(path) = std::env::var("EC_H264_DEBUG_STREAM") else {
+        return;
+    };
+    let stream = PathBuf::from(path);
+    let bytes = std::fs::read(&stream).unwrap();
+    let mut dec = Decoder::new();
+    let mut pictures = 0usize;
+    for (i, nal) in ec_h264_syntax::AnnexBIter::new(&bytes).enumerate() {
+        let kind = nal[0] & 0x1F;
+        match dec.push_nal(nal) {
+            Ok(NalOutcome::PictureBoundary) => {
+                dec.end_picture().unwrap();
+                pictures += 1;
+                if let Err(e) = dec.push_nal(nal) {
+                    panic!("nal {i} (type {kind}) after {pictures} pictures: {e}");
+                }
+            }
+            Ok(_) => {}
+            Err(e) => panic!("nal {i} (type {kind}) after {pictures} pictures: {e}"),
+        }
+        while dec.next_frame().is_some() {}
+    }
+    dec.flush().unwrap();
+    eprintln!("decoded {pictures} pictures");
+    let ours = decode_all(&bytes).unwrap();
+    let theirs = match std::env::var("EC_H264_DEBUG_REF") {
+        Ok(p) => {
+            let raw = std::fs::read(p).unwrap();
+            raw.chunks_exact(ours[0].len()).map(<[u8]>::to_vec).collect()
+        }
+        Err(_) => ffmpeg_all_frames(&stream, ours[0].len()).unwrap(),
+    };
+    if std::env::var_os("EC_H264_DUMP").is_some() {
+        let w = 176usize;
+        for (label, f) in [("ref0", &ours[0]), ("ours1", &ours[1]), ("ff1", &theirs[1])] {
+            eprintln!("--- {label} MB(0,0) rows 0..4 ---");
+            for y in 0..4 {
+                let row: Vec<u8> = (0..16).map(|x| f[y * w + x]).collect();
+                eprintln!("{row:?}");
+            }
+        }
+    }
+    for (i, a) in ours.iter().enumerate().take(4) {
+        let best = theirs
+            .iter()
+            .enumerate()
+            .map(|(j, b)| (a.iter().zip(b).filter(|(x, y)| x != y).count(), j))
+            .min();
+        eprintln!("our frame {i} best matches reference {best:?}");
+    }
+    let w = 176usize;
+    let h = 144usize;
+    for (i, (a, b)) in ours.iter().zip(&theirs).enumerate() {
+        let diff = a.iter().zip(b).filter(|(x, y)| x != y).count();
+        if diff == 0 {
+            eprintln!("frame {i}: exact");
+            continue;
+        }
+        let mut mbs = std::collections::BTreeSet::new();
+        for (k, (x, y)) in a.iter().zip(b).enumerate().take(w * h) {
+            if x != y {
+                mbs.insert(((k / w) / 16 * (w / 16) + (k % w) / 16, ((k % w) / 16, (k / w) / 16)));
+            }
+        }
+        eprintln!("  first differing MBs: {:?}", mbs.iter().take(6).map(|m| m.1).collect::<Vec<_>>());
+        let max = a
+            .iter()
+            .zip(b)
+            .map(|(x, y)| (i32::from(*x) - i32::from(*y)).abs())
+            .max()
+            .unwrap_or(0);
+        eprintln!(
+            "frame {i}: {diff} bytes differ, max delta {max}, {} luma MBs",
+            mbs.len()
+        );
+    }
+}
+
+/// JVT conformance, every frame of every vector: our display-order output
+/// against the reference decoder YUV that ships with the vector.
+///
+/// The first-IDR test above proves intra reconstruction; this one is what
+/// proves inter prediction, the decoded picture buffer and output order,
+/// because a single wrong motion vector or a reference marked at the wrong
+/// moment shows up as a mismatch in some later frame, not the first.
+#[test]
+fn jvt_full_sequence_bit_exact() {
+    let base = vectors_dir();
+    if !base.is_dir() {
+        eprintln!("SKIP: {} missing", base.display());
+        return;
+    }
+    let mut table = String::new();
+    let mut passed = 0usize;
+    let mut refused = Vec::new();
+    let mut failed = Vec::new();
+    for name in all_vectors(&base) {
+        let dir = base.join(&name);
+        let Some(stream) = find_stream(&dir) else {
+            continue;
+        };
+        let bytes = std::fs::read(&stream).unwrap();
+        match decode_all(&bytes) {
+            Ok(frames) if frames.is_empty() => {
+                failed.push(format!("{name}: decoded no frames"));
+            }
+            Ok(frames) => {
+                let len = frames[0].len();
+                let Some(ref_path) = find_ref_yuv(&dir) else {
+                    table.push_str(&format!("{name:<16} {:>3} frames, no reference YUV\n", frames.len()));
+                    continue;
+                };
+                let reference = std::fs::read(&ref_path).unwrap();
+                let want = reference.len() / len;
+                let mut bad = None;
+                for (i, f) in frames.iter().enumerate() {
+                    let Some(chunk) = reference.get(i * len..(i + 1) * len) else {
+                        break;
+                    };
+                    if let Some(pos) = first_diff(f, chunk) {
+                        bad = Some((i, pos));
+                        break;
+                    }
+                }
+                match bad {
+                    None if frames.len() == want => {
+                        passed += 1;
+                        table.push_str(&format!("{name:<16} {:>3}/{want:<3} frames bit-exact\n", frames.len()));
+                    }
+                    None => {
+                        failed.push(format!(
+                            "{name}: {} frames decoded, reference has {want}",
+                            frames.len()
+                        ));
+                        table.push_str(&format!("{name:<16} {:>3}/{want:<3} FRAME COUNT\n", frames.len()));
+                    }
+                    Some((i, pos)) => {
+                        failed.push(format!("{name}: frame {i} differs at byte {pos}"));
+                        table.push_str(&format!("{name:<16} {:>3}/{want:<3} MISMATCH frame {i}\n", frames.len()));
+                    }
+                }
+            }
+            Err(e @ Error::Unsupported { .. }) => {
+                refused.push(name.clone());
+                table.push_str(&format!("{name:<16} refused: {e}\n"));
+            }
+            Err(e) => {
+                failed.push(format!("{name}: {e}"));
+                table.push_str(&format!("{name:<16} ERROR {e}\n"));
+            }
+        }
+    }
+    eprintln!("{table}");
+    eprintln!(
+        "full-sequence: {passed} bit-exact, {} refused by name, {} failed",
+        refused.len(),
+        failed.len()
+    );
+    assert!(failed.is_empty(), "{failed:#?}");
 }

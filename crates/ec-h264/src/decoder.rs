@@ -52,6 +52,18 @@ use crate::transform::{
     unzigzag, unzigzag_ac15,
 };
 
+/// Debug tracing gates, resolved once: reading the environment per macroblock
+/// would allocate, which the zero-allocation test would (rightly) catch.
+fn trace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("EC_H264_TRACE").is_some())
+}
+
+fn no_deblock() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("EC_H264_NO_DEBLOCK").is_some())
+}
+
 /// Where a 4x4 block's top-right neighbour samples come from, per
 /// luma4x4BlkIdx (derivation of 6.4.12 + the 8.3.1.2 blkIdx 3/11 rule).
 #[derive(Clone, Copy, PartialEq)]
@@ -492,6 +504,14 @@ impl Decoder {
             weights: sh.pred_weight_table.clone(),
             poc: self.cur.poc,
         };
+        if trace_enabled() {
+            eprintln!(
+                "SLICE type {:?} qp {} cabac_init_idc {} l0 {} l1 {} first_mb {first_mb} \
+                 header_bits {} bytes {:02x?}",
+                sh.slice_type, sh.slice_qp, sh.cabac_init_idc, sh.num_ref_idx_l0_active,
+                sh.num_ref_idx_l1_active, sh.header_bits, &rbsp[..rbsp.len().min(6)]
+            );
+        }
         let intra_slice = sh.slice_type.is_intra();
         let b_slice = sh.slice_type == SliceType::B;
         if !intra_slice && ctx.lists[0].len() == 0 {
@@ -1014,6 +1034,12 @@ fn decode_macroblock(
         (None, Some(mb_type))
     };
     r.set_intra(intra_type.is_some());
+    if trace_enabled() {
+        eprintln!(
+            "MB {mb_addr} ({mb_x},{mb_y}) type {} skipped {skipped} qp {}",
+            mb_type as i64, ctx.qp
+        );
+    }
 
     if let Some(shape) = shape {
         return decode_inter_mb(
@@ -1413,6 +1439,9 @@ fn decode_inter_mb(
     if shape.sub && !skipped {
         for part in 0..4 {
             let t = r.sub_mb_type(b)? as usize;
+            if trace_enabled() {
+                eprintln!("  sub_mb_type[{part}] = {t}");
+            }
             motion.sub[part] = if b { B_SUB[t] } else { P_SUB[t] };
             if motion.sub[part].pred == Pred::Direct {
                 for k in 0..4 {
@@ -1498,6 +1527,9 @@ fn decode_inter_mb(
                             0
                         };
                         let v = r.mvd(comp, inc)?;
+                        if trace_enabled() {
+                            eprintln!("  mvd part {part} sp {sp} list {list} comp {comp} inc {inc} = {v}");
+                        }
                         mvd[comp] = i16::try_from(v)
                             .map_err(|_| Error::corrupt("mvd outside the level limits"))?;
                     }
@@ -1547,6 +1579,12 @@ fn decode_inter_mb(
                     // partition width inside an 8x8.
                     let n = mvc.neighbours(pic, px, py, pw, list);
                     let mvp = predict_mv(&n, idx, shape.w, shape.h, part);
+                    if trace_enabled() {
+                        eprintln!(
+                            "    nb A {:?} B {:?} C {:?} shape {}x{} part {part} mvp {mvp:?} written {:#06x}",
+                            n[0], n[1], n[2], shape.w, shape.h, mvc.written
+                        );
+                    }
                     let d = motion.mvd[list][py * 4 + px];
                     mv[list] = [mvp[0].wrapping_add(d[0]), mvp[1].wrapping_add(d[1])];
                     ref_idx[list] = idx;
@@ -1554,6 +1592,12 @@ fn decode_inter_mb(
                         .reference(refs, list, idx)
                         .map(|p| p.id)
                         .unwrap_or(-1);
+                }
+                if trace_enabled() {
+                    eprintln!(
+                        "  MV part {part} sp {sp} at ({px},{py}) {pw}x{ph} mv {:?} ref {:?}",
+                        mv[0], ref_idx
+                    );
                 }
                 for dy in 0..ph {
                     for dx in 0..pw {
@@ -1597,6 +1641,9 @@ fn decode_inter_mb(
         pic.i4_modes[base..base + 4].fill(2);
     }
     let (cbp_luma, cbp_chroma) = r.coded_block_pattern_inter()?;
+    if trace_enabled() {
+        eprintln!("  cbp {cbp_luma:#x}/{cbp_chroma}");
+    }
     // The inter scaling lists (Table 7-2 lists 3..5) govern an inter residual.
     finish_macroblock(
         pic,
@@ -2019,6 +2066,9 @@ fn gather_nbr4(pic: &Picture, nbr: &MbNeighbors, blk: usize, x: usize, y: usize)
 /// Whole-picture deblocking (spec 8.7): macroblocks in raster order, all
 /// vertical edges then all horizontal edges per macroblock, then chroma.
 fn deblock_picture(pic: &mut Picture) {
+    if no_deblock() {
+        return;
+    }
     let mb_w = pic.mb_w;
     for mb_y in 0..pic.mb_h {
         for mb_x in 0..mb_w {
