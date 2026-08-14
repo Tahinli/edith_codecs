@@ -110,6 +110,49 @@ for spec in "${AUDIO_CODECS[@]}"; do
     done
 done
 
+# ------------------------------------------------- probe/ALAC extras --------
+# 24-bit ALAC: the only path where the low bytes of a sample ride uncompressed
+# beside the residuals, which 16-bit fixtures never exercise.
+for lspec in "stereo|2" "5.1|6"; do
+    IFS='|' read -r lname nch <<<"$lspec"
+    build_audio_in "$nch" 48000
+    gen "$FIXTURES/audio/alac24-mp4-${lname}-48000.m4a" \
+        "${AIN[@]}" "${AMAP[@]}" -c:a alac -sample_fmt s32p -ar 48000
+done
+
+# Matroska-carried audio: what the probe hands to the Matroska reader rather
+# than parsing itself. One per codec family that has a Matroska mapping.
+for spec in "aac|-c:a aac -b:a 160k" "flac|-c:a flac" "opus|-c:a libopus -b:a 160k"; do
+    IFS='|' read -r cname cargs <<<"$spec"
+    read -r -a CARGS <<<"$cargs"
+    build_audio_in 2 48000
+    gen "$FIXTURES/audio/${cname}-mka-stereo-48000.mka" \
+        "${AIN[@]}" "${AMAP[@]}" "${CARGS[@]}" -ar 48000
+done
+# A film-shaped Matroska: picture and sound in one file, which is how a probe
+# meets one in the real library.
+build_audio_in 2 48000
+gen "$FIXTURES/audio/av-h264-aac-stereo-48000.mkv" \
+    "${AIN[@]}" -f lavfi -i "testsrc2=size=320x240:rate=24:duration=$DUR_A" \
+    "${AMAP[@]}" -map 2:v -c:v libx264 -preset ultrafast -c:a aac -b:a 160k
+
+# Cover art: an mjpeg "video" stream that is a still picture, in the two
+# containers that carry one. A probe that lists it as a video track is broken.
+if [ -s "$FIXTURES/stills/baseline-420.jpg" ]; then
+    build_audio_in 2 44100
+    gen "$FIXTURES/audio/cover-mp3-stereo-44100.mp3" \
+        "${AIN[@]}" -i "$FIXTURES/stills/baseline-420.jpg" \
+        "${AMAP[@]}" -map 2:v -c:a libmp3lame -b:a 192k -c:v copy \
+        -id3v2_version 3 -metadata title="A Tone" -metadata artist="edith_codecs" \
+        -metadata:s:v title="Album cover" -metadata:s:v comment="Cover (front)" \
+        -disposition:v attached_pic
+    gen "$FIXTURES/audio/cover-mp4-stereo-44100.m4a" \
+        "${AIN[@]}" -i "$FIXTURES/stills/baseline-420.jpg" \
+        "${AMAP[@]}" -map 2:v -c:a aac -b:a 160k -c:v copy \
+        -metadata title="A Tone" -metadata artist="edith_codecs" \
+        -disposition:v attached_pic
+fi
+
 # ---------------------------------------------------------------- video -----
 # name|encoder|extra args|pix_fmts (comma-separated)
 VIDEO_CODECS=(

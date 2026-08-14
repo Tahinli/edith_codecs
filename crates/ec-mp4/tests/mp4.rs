@@ -62,6 +62,27 @@ fn probe_field(path: &Path, entries: &str) -> Vec<String> {
         .collect()
 }
 
+/// Streams ffprobe reports that are cover art rather than a video track: a
+/// still picture in a `trak`, which this crate deliberately does not list (a
+/// player that shows an album cover as a video stream is the bug).
+fn attached_pictures(path: &Path) -> Vec<bool> {
+    probe_field(path, "stream_disposition=attached_pic")
+        .iter()
+        .map(|v| v.trim() == "1")
+        .collect()
+}
+
+/// `fields` with the cover-art streams dropped, so the oracle lists what this
+/// crate claims to list.
+fn without_cover_art(fields: Vec<String>, cover: &[bool]) -> Vec<String> {
+    fields
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| !cover.get(*i).copied().unwrap_or(false))
+        .map(|(_, f)| f)
+        .collect()
+}
+
 /// The fields a remux must not change.
 fn probe(path: &Path) -> String {
     probe_field(
@@ -169,10 +190,11 @@ fn every_fixture_demuxes_into_the_streams_ffprobe_reports() {
     let mut table = Vec::new();
     for path in &files {
         let demuxer = open(path);
-        let names = probe_field(path, "stream=codec_name");
-        let widths = probe_field(path, "stream=width");
-        let rates = probe_field(path, "stream=r_frame_rate");
-        let avg_rates = probe_field(path, "stream=avg_frame_rate");
+        let cover = attached_pictures(path);
+        let names = without_cover_art(probe_field(path, "stream=codec_name"), &cover);
+        let widths = without_cover_art(probe_field(path, "stream=width"), &cover);
+        let rates = without_cover_art(probe_field(path, "stream=r_frame_rate"), &cover);
+        let avg_rates = without_cover_art(probe_field(path, "stream=avg_frame_rate"), &cover);
         assert_eq!(
             demuxer.streams().len(),
             names.len(),
@@ -240,6 +262,12 @@ fn every_fixture_demuxes_into_the_streams_ffprobe_reports() {
 fn every_fixture_remuxes_into_a_file_ffprobe_and_ffmpeg_agree_with() {
     let mut table = Vec::new();
     for src in &mp4_fixtures() {
+        // Cover art is read (as no stream at all) but not written: this crate
+        // carries no `covr`/attached-picture writer, so a remux of one would
+        // field-compare against a stream that was never claimed.
+        if attached_pictures(src).iter().any(|&c| c) {
+            continue;
+        }
         let dst = work().join(format!(
             "remux-{}",
             src.file_name().unwrap().to_string_lossy()
