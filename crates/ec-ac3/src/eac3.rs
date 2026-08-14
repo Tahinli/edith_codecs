@@ -854,8 +854,14 @@ fn parse_block(
                 core.cplband[sbnd] = core.ncplbnd - 1;
             }
         } else {
+            // §E1.4, the `!cplinu[blk]` branch: switching coupling off also
+            // rearms the "first block of the run" state, so a frame that turns
+            // coupling on again later sends its coordinates and leak values
+            // unconditionally rather than behind a presence bit.
             core.chincpl = [false; 5];
             core.phsflginu = false;
+            core.first_cplco = [true; 5];
+            core.first_cplleak = true;
         }
     }
     core.cplinu = frm.cplinu[blk];
@@ -964,7 +970,15 @@ fn parse_block(
         let absexp = r.read_bits(4)? as u8;
         core.exps[ch][0] = absexp;
         let ngrps = core.expstr[ch].fbw_groups(core.endmant[ch]);
-        exps::decode(r, core.expstr[ch], ngrps, absexp, 1, &mut core.exps[ch])?;
+        exps::decode(r, core.expstr[ch], ngrps, absexp, 1, &mut core.exps[ch]).map_err(
+            |e| match e {
+                Error::Corrupt { context } => Error::corrupt(format!(
+                    "{context} (block {blk}, channel {ch}, {:?}, endmant {}, spx {}, cpl {})",
+                    core.expstr[ch], core.endmant[ch], core.chinspx[ch], core.chincpl[ch]
+                )),
+                other => other,
+            },
+        )?;
         let _gainrng = r.read_bits(2)?;
     }
     if core.lfeon && core.expstr[LFE] != Strategy::Reuse {
@@ -1182,7 +1196,14 @@ fn spectral_extension(core: &mut Core, ch: usize) {
             if spxmant >= COEFFS {
                 break;
             }
-            let noise = core.spx_noise.unit_variance();
+            // §E3.6.4.2.4's noise(): a zero-mean unit-variance source the
+            // standard leaves to the implementation, so it is switched by the
+            // same option as §7.3.4's dither.
+            let noise = if core.dither_on {
+                core.spx_noise.unit_variance()
+            } else {
+                0.0
+            };
             core.coeffs[ch][spxmant] = (core.coeffs[ch][spxmant] * sscale + noise * nscale) * coord;
             spxmant += 1;
         }
