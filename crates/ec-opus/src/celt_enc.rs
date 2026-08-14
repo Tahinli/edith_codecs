@@ -278,11 +278,13 @@ struct EncBand {
     lm: i32,
 }
 
-/// A CELT-layer encoder for one elementary Opus stream (mono or stereo),
-/// fullband at 48 kHz.
+/// A CELT-layer encoder for one elementary Opus stream (mono or stereo).
+/// CELT itself always runs at 48 kHz; slower input is zero-stuffed up to it.
 #[derive(Clone, Debug)]
 pub struct CeltEncoder {
     channels: usize,
+    /// 48000 / input rate, 1 for native 48 kHz input.
+    upsample: usize,
     window: Vec<f32>,
     plans: Vec<MdctPlan>,
     /// Preemphasised history, `channels * OVERLAP`.
@@ -321,12 +323,14 @@ pub struct CeltEncoder {
 }
 
 impl CeltEncoder {
-    /// An encoder for `channels` channels (1 or 2) at 48 kHz.
-    pub fn new(channels: usize) -> CeltEncoder {
+    /// An encoder for `channels` channels (1 or 2) fed at `48000/upsample` Hz.
+    pub fn new(channels: usize, upsample: usize) -> CeltEncoder {
         assert!((1..=2).contains(&channels));
+        assert!(upsample >= 1);
         let max_n = SHORT_MDCT * 8;
         CeltEncoder {
             channels,
+            upsample,
             window: celt::overlap_window(),
             plans: (0..4).map(|lm| MdctPlan::new(SHORT_MDCT << lm)).collect(),
             in_mem: vec![0.0; channels * OVERLAP],
@@ -382,8 +386,10 @@ impl CeltEncoder {
     }
 
     /// Encodes one frame of interleaved `f32` (`frame_size` samples per
-    /// channel at 48 kHz, `frame_size` one of 120/240/480/960) into `enc`,
-    /// which must have been `reset` to the frame's byte budget. With
+    /// channel at 48 kHz, one of 120/240/480/960 — of which
+    /// `frame_size/upsample` are read from `pcm`) into `enc`, which must have
+    /// been `reset` to the frame's byte budget. `end` bounds the coded bands,
+    /// which is how the caller limits the coded bandwidth. With
     /// `vbr_rate_bps` set, the frame may be shrunk below that budget
     /// (constrained VBR); the return value is the final frame size in bytes.
     pub fn encode(
@@ -391,6 +397,7 @@ impl CeltEncoder {
         enc: &mut RangeEncoder,
         pcm: &[f32],
         frame_size: usize,
+        end: usize,
         vbr_rate_bps: u32,
     ) -> Result<usize> {
         let lm: usize = match frame_size {
@@ -408,14 +415,14 @@ impl CeltEncoder {
         let m = 1usize << lm;
         let n = frame_size;
         let c = self.channels;
-        if pcm.len() < n * c {
+        let in_n = n / self.upsample;
+        if pcm.len() < in_n * c {
             return Err(Error::corrupt(format!(
-                "celt encode: {} samples for a {}-channel {frame_size}-sample frame",
-                pcm.len(),
-                c
+                "celt encode: {} samples for a {c}-channel {in_n}-sample frame",
+                pcm.len()
             )));
         }
-        let (start, end) = (0usize, NB_BANDS);
+        let (start, end) = (0usize, end.clamp(1, NB_BANDS));
 
         let mut nb_compressed = enc.storage();
         let mut nb_available = nb_compressed as i32;
@@ -451,8 +458,18 @@ impl CeltEncoder {
             self.in_buf[base..base + OVERLAP]
                 .copy_from_slice(&self.in_mem[ch * OVERLAP..(ch + 1) * OVERLAP]);
             let mut mem = self.preemph_mem[ch];
+            let up = self.upsample;
             for i in 0..n {
-                let mut x = pcm[i * c + ch] * SIG_SCALE;
+                // Zero-stuffing to 48 kHz: the images above the input's own
+                // Nyquist are never coded (the caller caps `end`) and the
+                // decoder's decimation drops them.
+                let mut x = if up == 1 {
+                    pcm[i * c + ch] * SIG_SCALE
+                } else if i.is_multiple_of(up) {
+                    pcm[(i / up) * c + ch] * SIG_SCALE * up as f32
+                } else {
+                    0.0
+                };
                 if !x.is_finite() {
                     x = 0.0;
                 }

@@ -13,7 +13,7 @@
 
 use ec_core::{Error, Result};
 
-use crate::encoder::Encoder;
+use crate::encoder::{Application, Encoder};
 
 /// A multichannel Opus encoder, mono through 255 channels.
 #[derive(Debug)]
@@ -36,6 +36,7 @@ impl MultistreamEncoder {
         streams: usize,
         coupled: usize,
         mapping: &[u8],
+        application: Application,
     ) -> Result<MultistreamEncoder> {
         if streams == 0 || streams > 255 || coupled > streams {
             return Err(Error::corrupt(format!(
@@ -57,7 +58,7 @@ impl MultistreamEncoder {
         let mut encoders = Vec::with_capacity(streams);
         for s in 0..streams {
             let ch = if s < coupled { 2 } else { 1 };
-            encoders.push(Encoder::new(sample_rate, ch)?);
+            encoders.push(Encoder::new(sample_rate, ch, application)?);
         }
         Ok(MultistreamEncoder {
             streams: encoders,
@@ -68,10 +69,35 @@ impl MultistreamEncoder {
         })
     }
 
+    /// The RFC 7845 Section 5.1.1.2 default layout for `channels` channels
+    /// (1 to 8), which for 5.1 is four streams, two coupled, in Vorbis channel
+    /// order (FL, FC, FR, BL, BR, LFE) — see [`crate::ogg::default_mapping`]
+    /// for the permutation a film-order caller applies on the way in.
+    pub fn surround(
+        sample_rate: u32,
+        channels: usize,
+        application: Application,
+    ) -> Result<MultistreamEncoder> {
+        let (_family, streams, coupled, table) =
+            crate::ogg::default_mapping(channels).ok_or_else(|| {
+                Error::unsupported(
+                    format!("{channels}-channel Opus stream"),
+                    "RFC 7845 maps 1 to 8 channels",
+                )
+            })?;
+        MultistreamEncoder::new(
+            sample_rate,
+            streams as usize,
+            coupled as usize,
+            &table,
+            application,
+        )
+    }
+
     /// The RFC 7845 mapping-family-1 layout for 5.1: four streams, two
     /// coupled, Vorbis channel order (FL, FC, FR, BL, BR, LFE).
     pub fn surround_5_1(sample_rate: u32) -> Result<MultistreamEncoder> {
-        MultistreamEncoder::new(sample_rate, 4, 2, &[0, 4, 1, 2, 3, 5])
+        MultistreamEncoder::surround(sample_rate, 6, Application::Audio)
     }
 
     /// Input channels per frame.

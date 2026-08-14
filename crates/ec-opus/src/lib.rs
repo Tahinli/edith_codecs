@@ -66,13 +66,14 @@ pub mod celt_enc;
 pub mod encoder;
 pub mod multistream;
 pub mod multistream_enc;
+pub mod ogg;
 pub mod packet;
 pub mod range;
 pub mod silk;
 
 pub use celt::CeltDecoder;
 pub use celt_enc::CeltEncoder;
-pub use encoder::Encoder;
+pub use encoder::{Application, Encoder};
 pub use multistream::MultistreamDecoder;
 pub use multistream_enc::MultistreamEncoder;
 pub use packet::{Bandwidth, Mode, Packet, Toc};
