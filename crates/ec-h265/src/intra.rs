@@ -71,7 +71,7 @@ const INV_ANGLE: [i32; 35] = [
 pub fn substitute(refs: &mut Refs, avail: &Availability, n: usize, bit_depth: u32) {
     let span = 2 * n;
     if avail.is_empty(n) {
-        let mid = (1u8 << (bit_depth - 1)) as u8;
+        let mid = 1u8 << (bit_depth - 1);
         refs.corner = mid;
         refs.top[..span].fill(mid);
         refs.left[..span].fill(mid);
@@ -122,7 +122,9 @@ fn filter_flag(mode: u8, n: usize, is_luma: bool) -> bool {
     if !is_luma || mode == 1 || n == 4 {
         return false;
     }
-    let min_dist = (i32::from(mode) - 26).abs().min((i32::from(mode) - 10).abs());
+    let min_dist = (i32::from(mode) - 26)
+        .abs()
+        .min((i32::from(mode) - 10).abs());
     let threshold = match n {
         8 => 7,
         16 => 1,
@@ -155,7 +157,8 @@ pub fn filter_refs(refs: &Refs, mode: u8, n: usize, is_luma: bool, strong_smooth
         let bottom_left = i32::from(refs.left[63]);
         let top_right = i32::from(refs.top[63]);
         for y in 0..63 {
-            out.left[y] = (((63 - y as i32) * corner + (y as i32 + 1) * bottom_left + 32) >> 6) as u8;
+            out.left[y] =
+                (((63 - y as i32) * corner + (y as i32 + 1) * bottom_left + 32) >> 6) as u8;
         }
         out.left[63] = refs.left[63];
         for x in 0..63 {
@@ -164,8 +167,9 @@ pub fn filter_refs(refs: &Refs, mode: u8, n: usize, is_luma: bool, strong_smooth
         out.top[63] = refs.top[63];
         return out;
     }
-    out.corner = ((u32::from(refs.left[0]) + 2 * u32::from(refs.corner) + u32::from(refs.top[0]) + 2)
-        >> 2) as u8;
+    out.corner =
+        ((u32::from(refs.left[0]) + 2 * u32::from(refs.corner) + u32::from(refs.top[0]) + 2) >> 2)
+            as u8;
     for y in 0..span - 1 {
         let below = u32::from(refs.left[y + 1]);
         let here = u32::from(refs.left[y]);
@@ -237,8 +241,8 @@ fn predict_dc(refs: &Refs, n: usize, is_luma: bool, out: &mut [u8]) {
     }
     if is_luma && n < 32 {
         out[0] = ((i32::from(refs.left[0]) + 2 * dc + i32::from(refs.top[0]) + 2) >> 2) as u8;
-        for x in 1..n {
-            out[x] = ((i32::from(refs.top[x]) + 3 * dc + 2) >> 2) as u8;
+        for (x, sample) in out[1..n].iter_mut().enumerate() {
+            *sample = ((i32::from(refs.top[x + 1]) + 3 * dc + 2) >> 2) as u8;
         }
         for y in 1..n {
             out[y * n] = ((i32::from(refs.left[y]) + 3 * dc + 2) >> 2) as u8;
@@ -305,10 +309,10 @@ fn predict_angular(refs: &Refs, mode: u8, n: usize, is_luma: bool, out: &mut [u8
                 out[y * n] = value.clamp(0, 255) as u8;
             }
         } else if mode == 10 {
-            for x in 0..n {
+            for (x, sample) in out[..n].iter_mut().enumerate() {
                 let value = i32::from(refs.left[0])
                     + ((i32::from(refs.top[x]) - i32::from(refs.corner)) >> 1);
-                out[x] = value.clamp(0, 255) as u8;
+                *sample = value.clamp(0, 255) as u8;
             }
         }
     }

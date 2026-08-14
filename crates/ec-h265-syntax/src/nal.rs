@@ -279,7 +279,10 @@ mod tests {
             assert_eq!(NalHeader::parse(&bytes).unwrap(), h);
         }
         // An IDR slice header is the well-known 0x26 0x01.
-        assert_eq!(NalHeader::new(NalUnitType::IdrWRadl).to_bytes(), [0x26, 0x01]);
+        assert_eq!(
+            NalHeader::new(NalUnitType::IdrWRadl).to_bytes(),
+            [0x26, 0x01]
+        );
         assert_eq!(NalHeader::new(NalUnitType::Vps).to_bytes(), [0x40, 0x01]);
         assert!(NalHeader::parse(&[0x80, 0x01]).is_err());
         assert!(NalHeader::parse(&[0x26, 0x00]).is_err());
@@ -314,7 +317,12 @@ mod tests {
     #[test]
     fn annex_b_split_finds_units() {
         let mut stream = Vec::new();
-        write_annex_b(&mut stream, NalHeader::new(NalUnitType::Vps), &[1, 2, 3], true);
+        write_annex_b(
+            &mut stream,
+            NalHeader::new(NalUnitType::Vps),
+            &[1, 2, 3],
+            true,
+        );
         write_annex_b(
             &mut stream,
             NalHeader::new(NalUnitType::IdrWRadl),

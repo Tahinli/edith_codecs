@@ -280,7 +280,14 @@ mod tests {
         // made here.
         for height in [1080, 2160] {
             let cd = ColourDescription::from_color(ColorDescription::output(height));
-            assert_eq!((cd.colour_primaries, cd.transfer_characteristics, cd.matrix_coeffs), (1, 1, 1));
+            assert_eq!(
+                (
+                    cd.colour_primaries,
+                    cd.transfer_characteristics,
+                    cd.matrix_coeffs
+                ),
+                (1, 1, 1)
+            );
         }
         let cd = ColourDescription::from_color(ColorDescription::output(480));
         assert_eq!((cd.colour_primaries, cd.matrix_coeffs), (6, 6));

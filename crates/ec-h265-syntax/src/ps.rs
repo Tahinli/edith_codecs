@@ -212,7 +212,11 @@ impl Vps {
         r.read_bits(16)?;
         let ptl = ProfileTierLevel::parse(&mut r, max_sub_layers_minus1)?;
         let ordering_info = r.read_bit()?;
-        let first = if ordering_info { 0 } else { max_sub_layers_minus1 };
+        let first = if ordering_info {
+            0
+        } else {
+            max_sub_layers_minus1
+        };
         let mut max_dec_pic_buffering_minus1 = 0;
         let mut max_num_reorder_pics = 0;
         for _ in first..=max_sub_layers_minus1 {
@@ -444,8 +448,17 @@ impl Sps {
         };
         let pic_width_in_luma_samples = r.read_ue()?;
         let pic_height_in_luma_samples = r.read_ue()?;
-        if pic_width_in_luma_samples == 0 || pic_height_in_luma_samples == 0 {
-            return Err(Error::corrupt("HEVC SPS: zero picture dimension"));
+        // A dimension is a bit width elsewhere (slice_segment_address is
+        // Ceil(Log2(PicSizeInCtbsY)) bits), so an absurd one is refused here
+        // rather than turned into an absurd shift there.
+        if pic_width_in_luma_samples == 0
+            || pic_height_in_luma_samples == 0
+            || pic_width_in_luma_samples > 65_536
+            || pic_height_in_luma_samples > 65_536
+        {
+            return Err(Error::corrupt(format!(
+                "HEVC SPS: picture size {pic_width_in_luma_samples}x{pic_height_in_luma_samples}"
+            )));
         }
         let mut conf_win = ConformanceWindow::default();
         if r.read_bit()? {
@@ -462,8 +475,17 @@ impl Sps {
             return Err(Error::corrupt("HEVC SPS: bit depth out of range"));
         }
         let log2_max_poc_lsb_minus4 = r.read_ue()?;
+        if log2_max_poc_lsb_minus4 > 12 {
+            return Err(Error::corrupt(format!(
+                "HEVC SPS: log2_max_pic_order_cnt_lsb_minus4 = {log2_max_poc_lsb_minus4}"
+            )));
+        }
         let ordering_info = r.read_bit()?;
-        let first = if ordering_info { 0 } else { max_sub_layers_minus1 };
+        let first = if ordering_info {
+            0
+        } else {
+            max_sub_layers_minus1
+        };
         let mut max_dec_pic_buffering_minus1 = 0;
         let mut max_num_reorder_pics = 0;
         for _ in first..=max_sub_layers_minus1 {
@@ -510,6 +532,11 @@ impl Sps {
         let mut num_long_term_ref_pics_sps = 0;
         if long_term_ref_pics_present {
             num_long_term_ref_pics_sps = r.read_ue()?;
+            if num_long_term_ref_pics_sps > 32 {
+                return Err(Error::corrupt(format!(
+                    "HEVC SPS: num_long_term_ref_pics_sps = {num_long_term_ref_pics_sps}"
+                )));
+            }
             for _ in 0..num_long_term_ref_pics_sps {
                 r.read_bits(log2_max_poc_lsb_minus4 + 4)?;
                 r.read_bit()?;

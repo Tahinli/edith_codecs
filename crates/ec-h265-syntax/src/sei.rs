@@ -57,8 +57,7 @@ pub fn hdr_metadata_rbsp(light: ContentLight) -> Option<Vec<u8>> {
         // the luminance pair), so BT.2020's are written: they are what an HDR
         // grade is approved on, and a decoder that reads them gets a true answer
         // rather than zeros.
-        const BT2020_PRIMARIES: [(u16, u16); 3] =
-            [(8500, 39_850), (6550, 2300), (35_400, 14_600)];
+        const BT2020_PRIMARIES: [(u16, u16); 3] = [(8500, 39_850), (6550, 2300), (35_400, 14_600)];
         const D65: (u16, u16) = (15_635, 16_450);
         for (x, y) in BT2020_PRIMARIES {
             payload.extend_from_slice(&x.to_be_bytes());

@@ -68,7 +68,7 @@ const DST_MATRIX: [[i32; 4]; 4] = [
 fn m32(row: usize, col: usize) -> i32 {
     if col < 16 {
         TRANS_MATRIX_HALF[row][col]
-    } else if row % 2 == 0 {
+    } else if row.is_multiple_of(2) {
         TRANS_MATRIX_HALF[row][31 - col]
     } else {
         -TRANS_MATRIX_HALF[row][31 - col]
@@ -128,17 +128,21 @@ fn forward_1d(n: usize, src: &[i32], dst: &mut [i32]) {
     let stride = 32 / n;
     let mut sums = [0i32; 16];
     let mut diffs = [0i32; 16];
-    for x in 0..half {
-        sums[x] = src[x] + src[n - 1 - x];
-        diffs[x] = src[x] - src[n - 1 - x];
+    for (x, (sum, diff)) in sums[..half]
+        .iter_mut()
+        .zip(diffs[..half].iter_mut())
+        .enumerate()
+    {
+        *sum = src[x] + src[n - 1 - x];
+        *diff = src[x] - src[n - 1 - x];
     }
     let mut even = [0i32; 16];
     forward_1d(half, &sums[..half], &mut even[..half]);
     for j in 0..half {
         dst[2 * j] = even[j];
         let mut odd = 0i32;
-        for x in 0..half {
-            odd += m32((2 * j + 1) * stride, x) * diffs[x];
+        for (x, &diff) in diffs[..half].iter().enumerate() {
+            odd += m32((2 * j + 1) * stride, x) * diff;
         }
         dst[2 * j + 1] = odd;
     }
@@ -221,8 +225,18 @@ pub fn inverse_transform(scaled: &[i32], residual: &mut [i32], n: usize, dst_typ
     let mut out = [0i32; 32];
     // Stage 1: every column, i.e. along the vertical frequency index.
     for k in 0..n {
+        let mut any = false;
         for y in 0..n {
             col[y] = scaled[y * n + k];
+            any |= col[y] != 0;
+        }
+        if !any {
+            // A column of zeros transforms to zeros; most columns of a coded
+            // block are zeros, which is what quantisation is for.
+            for y in 0..n {
+                e[y * n + k] = 0;
+            }
+            continue;
         }
         if dst_type {
             let mut src4 = [0i32; 4];
@@ -344,7 +358,9 @@ mod tests {
             let stride = 32 / n;
             let norm: i32 = (0..n).map(|x| m32(0, x) * m32(0, x)).sum();
             for a in 0..n {
-                let self_dot: i32 = (0..n).map(|x| m32(a * stride, x) * m32(a * stride, x)).sum();
+                let self_dot: i32 = (0..n)
+                    .map(|x| m32(a * stride, x) * m32(a * stride, x))
+                    .sum();
                 // 64^2 * n is exact for the DC row; the others are within the
                 // rounding the integer matrix carries.
                 assert!(
@@ -366,7 +382,10 @@ mod tests {
         for k in 0..6 {
             let product = QUANT_SCALE[k] as i64 * LEVEL_SCALE[k] as i64;
             assert!((product - (1 << 20)).abs() < 64, "k={k}: {product}");
-            assert_eq!(QUANT_SCALE[k], ((1 << 20) as f64 / LEVEL_SCALE[k] as f64).round() as i32);
+            assert_eq!(
+                QUANT_SCALE[k],
+                ((1 << 20) as f64 / LEVEL_SCALE[k] as f64).round() as i32
+            );
         }
     }
 
@@ -410,9 +429,8 @@ mod tests {
                 if dst && n != 4 {
                     continue;
                 }
-                let residual: Vec<i32> = (0..n * n)
-                    .map(|i| (((i * 37) % 61) as i32) - 30)
-                    .collect();
+                let residual: Vec<i32> =
+                    (0..n * n).map(|i| (((i * 37) % 61) as i32) - 30).collect();
                 let out = round_trip(&residual, n, 4, dst);
                 let worst = residual
                     .iter()

@@ -144,6 +144,8 @@ pub struct CtuEncoder<'a> {
     strong_smoothing: bool,
     /// How many of the 35 modes get a full rate-distortion trial.
     candidates: usize,
+    /// `log2` of the smallest coding unit the search will produce.
+    min_cb_log2: u32,
     /// Intra mode per 4x4 block of the band; 255 = not coded yet.
     modes: Vec<u8>,
     /// Coding depth per 4x4 block of the band.
@@ -170,6 +172,7 @@ impl<'a> CtuEncoder<'a> {
         qp: i32,
         strong_smoothing: bool,
         candidates: usize,
+        min_cb_log2: u32,
     ) -> CtuEncoder<'a> {
         let band_rows = (height - band_y0).min(ctb_size);
         CtuEncoder {
@@ -186,6 +189,7 @@ impl<'a> CtuEncoder<'a> {
             lambda_satd: lambda_for(qp).sqrt(),
             strong_smoothing,
             candidates: candidates.clamp(1, 35),
+            min_cb_log2: min_cb_log2.clamp(MIN_CB_LOG2, 5),
             modes: vec![255; (width / 4) * (ctb_size / 4)],
             depths: vec![0; (width / 4) * (ctb_size / 4)],
             coded: [false; 256],
@@ -327,6 +331,16 @@ impl<'a> CtuEncoder<'a> {
             + usize::from(
                 self.available(x as isize, y as isize - 1) && self.depth_at(x, y - 1) > depth,
             );
+        if log2 <= self.min_cb_log2 {
+            // The search stops here, but the sequence still allows a split, so
+            // the flag is written: skipping it because *this* encoder will not
+            // split is exactly the kind of "the decoder knows what I meant"
+            // assumption that desynchronises a bitstream.
+            let before = enc.bit_count();
+            enc.encode_bin(split_ctx, 0);
+            return self.lambda * (enc.bit_count() - before) as f64
+                + self.code_cu(x, y, log2, depth, enc);
+        }
         if log2 > 5 {
             // 64x64 coding units are not searched; the decision starts at 32x32.
             let before = enc.bit_count();
@@ -569,9 +583,9 @@ impl<'a> CtuEncoder<'a> {
     fn region_ssd(&self, x: usize, y: usize, n: usize) -> f64 {
         let mut ssd = 0i64;
         for yy in y..y + n {
-            let src_row = &self.src.y[yy * self.width..yy * self.width + self.width];
-            for xx in x..x + n {
-                let d = i64::from(src_row[xx]) - i64::from(self.rec_y(xx, yy));
+            let src_row = &self.src.y[yy * self.width + x..yy * self.width + x + n];
+            for (offset, &sample) in src_row.iter().enumerate() {
+                let d = i64::from(sample) - i64::from(self.rec_y(x + offset, yy));
                 ssd += d * d;
             }
         }
@@ -705,8 +719,8 @@ impl<'a> CtuEncoder<'a> {
             self.strong_smoothing,
             &mut self.scratch.pred,
         );
-        for i in 0..n * n {
-            self.scratch.residual[i] = i32::from(source[i]) - i32::from(self.scratch.pred[i]);
+        for (i, &sample) in source[..n * n].iter().enumerate() {
+            self.scratch.residual[i] = i32::from(sample) - i32::from(self.scratch.pred[i]);
         }
         let dst = uses_dst(n, true);
         forward_transform(&self.scratch.residual, &mut self.scratch.coeffs, n, dst);
@@ -719,11 +733,11 @@ impl<'a> CtuEncoder<'a> {
             self.scratch.residual[..n * n].fill(0);
         }
         let mut ssd = 0i64;
-        for i in 0..n * n {
+        for (i, &sample) in source[..n * n].iter().enumerate() {
             let value =
                 (i32::from(self.scratch.pred[i]) + self.scratch.residual[i]).clamp(0, 255) as u8;
             self.scratch.recon[i] = value;
-            let d = i64::from(source[i]) - i64::from(value);
+            let d = i64::from(sample) - i64::from(value);
             ssd += d * d;
         }
         (ssd as f64, cbf)
@@ -753,10 +767,20 @@ impl<'a> CtuEncoder<'a> {
             }
         }
         forward_transform(&self.scratch.residual, &mut self.scratch.coeffs, cn, false);
-        let nonzero = quantize(&self.scratch.coeffs, &mut self.scratch.levels, cn, self.qp_c);
+        let nonzero = quantize(
+            &self.scratch.coeffs,
+            &mut self.scratch.levels,
+            cn,
+            self.qp_c,
+        );
         let cbf = nonzero > 0;
         if cbf {
-            dequantize(&self.scratch.levels, &mut self.scratch.scaled, cn, self.qp_c);
+            dequantize(
+                &self.scratch.levels,
+                &mut self.scratch.scaled,
+                cn,
+                self.qp_c,
+            );
             inverse_transform(&self.scratch.scaled, &mut self.scratch.residual, cn, false);
         } else {
             self.scratch.residual[..cn * cn].fill(0);
@@ -847,12 +871,7 @@ fn satd(source: &[u8], pred: &[u8], n: usize) -> u32 {
                 b[3] = s2 - s3;
             }
             for col in 0..4 {
-                let (a, b2, c, d) = (
-                    block[col],
-                    block[4 + col],
-                    block[8 + col],
-                    block[12 + col],
-                );
+                let (a, b2, c, d) = (block[col], block[4 + col], block[8 + col], block[12 + col]);
                 let (s0, s1, s2, s3) = (a + c, b2 + d, a - c, b2 - d);
                 total += (s0 + s1).unsigned_abs();
                 total += (s0 - s1).unsigned_abs();
@@ -861,7 +880,7 @@ fn satd(source: &[u8], pred: &[u8], n: usize) -> u32 {
             }
         }
     }
-    (total + 1) / 2
+    total.div_ceil(2)
 }
 
 /// A snapshot type alias so callers do not need the cabac module for rollback.

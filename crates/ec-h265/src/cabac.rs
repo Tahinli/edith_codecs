@@ -434,8 +434,8 @@ mod tests {
             assert!(TRANS_IDX_MPS[s] < 64 && TRANS_IDX_LPS[s] < 64);
             // rangeTabLps shrinks as the state gets more certain.
             if s > 0 {
-                for q in 0..4 {
-                    assert!(RANGE_TAB_LPS[s][q] <= RANGE_TAB_LPS[s - 1][q]);
+                for (q, &value) in RANGE_TAB_LPS[s].iter().enumerate() {
+                    assert!(value <= RANGE_TAB_LPS[s - 1][q]);
                 }
             }
         }

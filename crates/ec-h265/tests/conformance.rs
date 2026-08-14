@@ -123,16 +123,51 @@ fn ffmpeg_decodes_bit_exactly_at_every_shape() {
             decoded.len(),
             recon.len()
         );
-        let mismatches = decoded
-            .iter()
-            .zip(&recon)
-            .filter(|(a, b)| a != b)
-            .count();
+        let mismatches = decoded.iter().zip(&recon).filter(|(a, b)| a != b).count();
         assert_eq!(mismatches, 0, "{w}x{h}: {mismatches} samples differ");
         // And the encode is worth something: PSNR against the source.
         let quality = psnr(&planes_of(&source), &recon);
         assert!(quality > 30.0, "{w}x{h}: PSNR {quality:.2} dB at QP 27");
     }
+}
+
+#[test]
+fn vaapi_hardware_decodes_the_stream() {
+    // The other half of "it decodes": a GPU decoder is a different
+    // implementation with different tolerances, and it is what edith's HEVC
+    // path actually uses. Skipped where there is no render node.
+    if !have_ffmpeg() || !Path::new("/dev/dri/renderD128").exists() {
+        eprintln!("skipping: no ffmpeg or no VA-API render node");
+        return;
+    }
+    let (_, coded) = encode(1920, 1080, 27);
+    let path = write_au("vaapi-1080p", &coded);
+    let output = Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-hwaccel",
+            "vaapi",
+            "-hwaccel_device",
+            "/dev/dri/renderD128",
+            "-i",
+        ])
+        .arg(&path)
+        .args(["-f", "null", "-"])
+        .output()
+        .expect("run ffmpeg");
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    if stderr.contains("Failed to initialise VAAPI")
+        || stderr.contains("No VA display found")
+        || stderr.contains("Device creation failed")
+    {
+        eprintln!("skipping: VA-API unavailable here ({})", stderr.trim());
+        return;
+    }
+    assert!(
+        output.status.success() && stderr.trim().is_empty(),
+        "VA-API decode failed: {stderr}"
+    );
 }
 
 #[test]
@@ -148,7 +183,10 @@ fn quality_rises_as_qp_falls() {
         );
         previous = quality;
     }
-    assert!(previous > 40.0, "QP 22 should clear 40 dB, got {previous:.2}");
+    assert!(
+        previous > 40.0,
+        "QP 22 should clear 40 dB, got {previous:.2}"
+    );
 }
 
 #[test]

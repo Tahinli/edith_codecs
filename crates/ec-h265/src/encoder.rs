@@ -61,8 +61,15 @@ pub struct EncoderConfig {
     pub threads: usize,
     /// Coding tree block size, 64 (default) or 32.
     pub ctb_size: usize,
-    /// How many of the 35 intra modes get a full rate-distortion trial.
+    /// How many of the 35 intra modes get a full rate-distortion trial, on top
+    /// of the most probable mode, which always gets one.
     pub rdo_candidates: usize,
+    /// Smallest coding unit the search will produce, 8 or 16. Sixteen is a
+    /// *coarser* search that is not always faster: on real pictures the 8x8
+    /// blocks pay for their search in residual bits (measured: -27% bits and
+    /// +1.5 dB at QP 22 on a 1080p camera frame, at the same wall time), which
+    /// is why 8 is the default.
+    pub min_cu_size: usize,
     /// What the samples mean, written into the VUI.
     pub video_signal_type: Option<VideoSignalType>,
     /// Sample aspect ratio.
@@ -87,6 +94,7 @@ impl EncoderConfig {
             threads: 0,
             ctb_size: 64,
             rdo_candidates: 2,
+            min_cu_size: 8,
             video_signal_type: None,
             sample_aspect_ratio: None,
             timing: None,
@@ -339,7 +347,13 @@ impl Encoder {
         let (w, h) = (self.cfg.width as usize, self.cfg.height as usize);
         let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
         let (coded_w, coded_h) = (self.coded_width, self.coded_height);
-        let plane = |src: &[u8], stride: usize, width: usize, height: usize, out_w: usize, out_h: usize| -> Result<Vec<u8>> {
+        let plane = |src: &[u8],
+                     stride: usize,
+                     width: usize,
+                     height: usize,
+                     out_w: usize,
+                     out_h: usize|
+         -> Result<Vec<u8>> {
             if stride < width || src.len() < (height - 1) * stride + width {
                 return Err(Error::corrupt(
                     "HEVC encode: source plane shorter than its stated size".to_string(),
@@ -375,7 +389,7 @@ impl Encoder {
         let mut rec_cr = vec![0u8; width / 2 * height / 2];
 
         let boundaries: Vec<RowBoundary> = (0..rows).map(|_| RowBoundary::new(width)).collect();
-        let progress: Vec<AtomicUsize> = (0..rows).map(|_| AtomicUsize::new(0)).collect();
+        let progress: Vec<Progress> = (0..rows).map(|_| Progress(AtomicUsize::new(0))).collect();
         let wpp_contexts: Vec<Mutex<Option<Contexts>>> =
             (0..rows).map(|_| Mutex::new(None)).collect();
         let substreams: Vec<Mutex<Vec<u8>>> = (0..rows).map(|_| Mutex::new(Vec::new())).collect();
@@ -388,7 +402,7 @@ impl Encoder {
         // Round-robin: worker t owns rows t, t + threads, ... Each row's
         // predecessor therefore belongs to another worker that is never waiting
         // on it, so the wavefront cannot deadlock.
-        let mut per_worker: Vec<Vec<(usize, &mut [u8], &mut [u8], &mut [u8])>> =
+        let mut per_worker: Vec<Vec<RowAssignment<'_>>> =
             (0..threads).map(|_| Vec::new()).collect();
         for row in (0..rows).rev() {
             let y = bands_y.pop().expect("one band per row");
@@ -450,6 +464,7 @@ impl Encoder {
                             slice_qp,
                             true,
                             self.cfg.rdo_candidates,
+                            self.cfg.min_cu_size.max(8).trailing_zeros(),
                         );
                         for col in 0..cols {
                             if row > 0 {
@@ -463,7 +478,7 @@ impl Encoder {
                                     *slot = Some(enc.contexts.clone());
                                 }
                             }
-                            progress[row].store(col + 1, Ordering::Release);
+                            progress[row].0.store(col + 1, Ordering::Release);
                             let last_in_picture = row + 1 == rows && col + 1 == cols;
                             enc.encode_terminate(u32::from(last_in_picture));
                             if !last_in_picture && col + 1 == cols {
@@ -545,12 +560,7 @@ impl Encoder {
         for stream in substreams {
             rbsp.extend_from_slice(stream);
         }
-        write_annex_b(
-            &mut au,
-            NalHeader::new(NalUnitType::IdrWRadl),
-            &rbsp,
-            true,
-        );
+        write_annex_b(&mut au, NalHeader::new(NalUnitType::IdrWRadl), &rbsp, true);
 
         if self.cfg.picture_hash {
             let (w, h) = (self.coded_width, self.coded_height);
@@ -584,18 +594,35 @@ impl Encoder {
     }
 }
 
-/// Spin then yield until a row's progress counter reaches `target`.
-fn wait_for(counter: &AtomicUsize, target: usize) {
+/// A progress counter on its own cache line.
+///
+/// Twelve workers polling twelve counters packed eight to a line spend their
+/// time invalidating each other's caches instead of coding; the padding is the
+/// difference between a wavefront and a contention benchmark.
+#[repr(align(64))]
+struct Progress(AtomicUsize);
+
+/// Spin, then yield, then sleep until a row's progress counter reaches `target`.
+///
+/// A worker that spins hard is a worker holding a core the wavefront needs
+/// somewhere else, so the wait backs off to a sleep at roughly the granularity
+/// of one coding tree block.
+fn wait_for(counter: &Progress, target: usize) {
     let mut spins = 0u32;
-    while counter.load(Ordering::Acquire) < target {
-        if spins < 64 {
+    while counter.0.load(Ordering::Acquire) < target {
+        if spins < 128 {
             std::hint::spin_loop();
-            spins += 1;
-        } else {
+        } else if spins < 256 {
             std::thread::yield_now();
+        } else {
+            std::thread::sleep(std::time::Duration::from_micros(50));
         }
+        spins += 1;
     }
 }
+
+/// One CTB row handed to a worker: its index and its band of each plane.
+type RowAssignment<'a> = (usize, &'a mut [u8], &'a mut [u8], &'a mut [u8]);
 
 struct PaddedSource {
     y: Vec<u8>,

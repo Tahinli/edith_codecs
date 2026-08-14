@@ -8,7 +8,13 @@ use std::sync::LazyLock;
 /// Built once rather than typed in — the diagonal scan is four lines of the
 /// spec's own pseudo-code, and generating it cannot go wrong the way a
 /// transcribed 64-entry table can.
-static SCANS: LazyLock<[[Vec<(u8, u8)>; 3]; 4]> = LazyLock::new(|| {
+/// One scan order: the `(x, y)` of every position, in scan sequence.
+type Scan = Vec<(u8, u8)>;
+
+/// Scans for block sizes 4..32 and the three scan indices.
+type ScanTable = [[Scan; 3]; 4];
+
+static SCANS: LazyLock<ScanTable> = LazyLock::new(|| {
     std::array::from_fn(|log2_size| {
         let size = 1usize << log2_size;
         std::array::from_fn(|scan_idx| match scan_idx {
@@ -41,6 +47,32 @@ static SCANS: LazyLock<[[Vec<(u8, u8)>; 3]; 4]> = LazyLock::new(|| {
                 }
                 out
             }
+        })
+    })
+});
+
+/// `POSITIONS[log2 - 2][scanIdx][y * n + x]` = that coefficient's place in the
+/// full scan of the block, sub-block major.
+///
+/// One table turns "where does the scan end" from a walk over every sub-block
+/// into a single pass over the levels, which matters because the residual coder
+/// runs once per rate-distortion trial.
+static POSITIONS: LazyLock<[[Vec<u16>; 3]; 4]> = LazyLock::new(|| {
+    std::array::from_fn(|size_idx| {
+        let log2 = size_idx as u32 + 2;
+        let n = 1usize << log2;
+        std::array::from_fn(|scan_idx| {
+            let sub_scan = &SCANS[size_idx][scan_idx];
+            let pos_scan = &SCANS[2][scan_idx];
+            let mut table = vec![0u16; n * n];
+            for (i, &(xs, ys)) in sub_scan.iter().enumerate() {
+                for (p, &(xp, yp)) in pos_scan.iter().enumerate() {
+                    let xc = xs as usize * 4 + xp as usize;
+                    let yc = ys as usize * 4 + yp as usize;
+                    table[yc * n + xc] = (i * 16 + p) as u16;
+                }
+            }
+            table
         })
     })
 });
@@ -115,22 +147,22 @@ pub fn encode_residual(
     let pos_scan = scan(2, scan_idx);
     let chroma = c_idx > 0;
 
-    // The last significant coefficient in scan order.
-    let mut last_sub = 0usize;
-    let mut last_pos = 0usize;
-    'outer: for i in (0..sub_scan.len()).rev() {
-        let (xs, ys) = sub_scan[i];
-        for p in (0..16).rev() {
-            let (xp, yp) = pos_scan[p];
-            let xc = (xs as usize) * 4 + xp as usize;
-            let yc = (ys as usize) * 4 + yp as usize;
-            if levels[yc * n + xc] != 0 {
-                last_sub = i;
-                last_pos = p;
-                break 'outer;
+    // One pass over the levels finds both the end of the scan and which
+    // sub-blocks hold anything.
+    let positions = &POSITIONS[(log2_size - 2) as usize][scan_idx];
+    let mut csbf = [false; 64];
+    let mut last_full = 0i32;
+    for yc in 0..n {
+        let row = &levels[yc * n..yc * n + n];
+        for (xc, &level) in row.iter().enumerate() {
+            if level != 0 {
+                csbf[(yc >> 2) * sub_wide + (xc >> 2)] = true;
+                last_full = last_full.max(i32::from(positions[yc * n + xc]));
             }
         }
     }
+    let last_sub = (last_full / 16) as usize;
+    let last_pos = (last_full % 16) as usize;
     let (last_xs, last_ys) = sub_scan[last_sub];
     let (last_xp, last_yp) = pos_scan[last_pos];
     let mut last_x = (last_xs as u32) * 4 + last_xp as u32;
@@ -168,27 +200,9 @@ pub fn encode_residual(
         enc.encode_bypass_bits(last_y - base, y_suffix_bits);
     }
 
-    let mut csbf = [false; 64];
-    csbf[last_ys as usize * sub_wide + last_xs as usize] = true;
     // The DC sub-block is always coded (7.4.9.11 inference).
     let (dc_xs, dc_ys) = sub_scan[0];
     csbf[dc_ys as usize * sub_wide + dc_xs as usize] = true;
-    // Mark every sub-block that holds a level, so the neighbour contexts below
-    // see the same flags the decoder will.
-    for &(xs, ys) in sub_scan.iter().take(last_sub) {
-        let (xs, ys) = (xs as usize, ys as usize);
-        let mut any = false;
-        for row in 0..4 {
-            let base = (ys * 4 + row) * n + xs * 4;
-            if levels[base..base + 4].iter().any(|&v| v != 0) {
-                any = true;
-                break;
-            }
-        }
-        if any {
-            csbf[ys * sub_wide + xs] = true;
-        }
-    }
 
     let mut greater1_ctx = 1u32;
     for i in (0..=last_sub).rev() {
@@ -221,7 +235,11 @@ pub fn encode_residual(
         if i == last_sub {
             significant[last_pos] = true;
         }
-        let first = if i == last_sub { last_pos as i32 - 1 } else { 15 };
+        let first = if i == last_sub {
+            last_pos as i32 - 1
+        } else {
+            15
+        };
         let mut scan_pos = first;
         while scan_pos >= 0 {
             let p = scan_pos as usize;
@@ -300,8 +318,7 @@ pub fn encode_residual(
             enc.encode_bypass(u32::from(level < 0));
         }
         let mut rice = 0u32;
-        let mut num_sig = 0usize;
-        for &p in order {
+        for (num_sig, &p) in order.iter().enumerate() {
             let (xp, yp) = pos_scan[p];
             let level = levels[(ys * 4 + yp as usize) * n + xs * 4 + xp as usize].unsigned_abs();
             let coded_greater1 = num_sig < 8;
@@ -318,7 +335,6 @@ pub fn encode_residual(
                 encode_remaining(enc, remaining, rice);
                 rice = (rice + u32::from(level > (3 << rice))).min(4);
             }
-            num_sig += 1;
         }
     }
 }

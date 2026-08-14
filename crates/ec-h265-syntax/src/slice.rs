@@ -445,7 +445,10 @@ fn skip_pred_weight_table(r: &mut BitReader, h: &SliceHeader, sps: &Sps) -> Resu
         r.read_se()?; // delta_chroma_log2_weight_denom
     }
     let lists: &[u32] = if h.slice_type == SliceType::B {
-        &[h.num_ref_idx_l0_active_minus1, h.num_ref_idx_l1_active_minus1]
+        &[
+            h.num_ref_idx_l0_active_minus1,
+            h.num_ref_idx_l1_active_minus1,
+        ]
     } else {
         &[h.num_ref_idx_l0_active_minus1]
     };
