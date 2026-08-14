@@ -2,9 +2,9 @@
 name = "miniz_oxide"
 description = "Compatibility shim: the miniz_oxide surface edith consumes, served by ec-inflate."
 version = "0.8.9"
-edition.workspace = true
-license.workspace = true
-authors.workspace = true
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Ahmet Kaan Gümüş"]
 publish = false
 
 [dependencies]

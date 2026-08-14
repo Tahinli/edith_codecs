@@ -2,9 +2,9 @@
 name = "rusty_vorbis"
 description = "Compatibility shim: the rusty_vorbis 0.1.1 surface edith consumes, served by ec-vorbis."
 version = "0.1.1"
-edition.workspace = true
-license.workspace = true
-authors.workspace = true
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Ahmet Kaan Gümüş"]
 publish = false
 
 [dependencies]

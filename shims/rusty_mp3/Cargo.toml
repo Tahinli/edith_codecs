@@ -2,10 +2,10 @@
 name = "rusty_mp3"
 description = "Compatibility shim: the rusty_mp3 0.6.1 surface, implemented over ec-mp3."
 version = "0.6.1"
-edition.workspace = true
-license.workspace = true
-authors.workspace = true
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Ahmet Kaan Gümüş"]
 
 [dependencies]
-ec-mp3.workspace = true
-ec-core.workspace = true
+ec-mp3 = { path = "../../crates/ec-mp3", version = "0.1.0" }
+ec-core = { path = "../../crates/ec-core", version = "0.1.0" }

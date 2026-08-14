@@ -2,9 +2,9 @@
 name = "oxideav-ass"
 description = "Compatibility shim: the oxideav-ass surface edith consumes, over ec-ass."
 version = "0.0.9"
-edition.workspace = true
-license.workspace = true
-authors.workspace = true
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Ahmet Kaan Gümüş"]
 publish = false
 
 [dependencies]

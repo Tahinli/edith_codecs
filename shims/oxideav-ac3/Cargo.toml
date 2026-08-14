@@ -1,13 +1,13 @@
 [package]
-name = "oxideav-ogg"
-description = "Compatibility shim: the oxideav-ogg mux surface edith consumes, over ec-ogg."
-version = "0.1.8"
+name = "oxideav-ac3"
+description = "Compatibility shim: the oxideav-ac3 surface edith consumes, over ec-ac3."
+version = "0.0.10"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["Ahmet Kaan Gümüş"]
 publish = false
 
 [dependencies]
+ec-ac3 = { path = "../../crates/ec-ac3", version = "0.1.0" }
 ec-core = { path = "../../crates/ec-core", version = "0.1.0" }
-ec-ogg = { path = "../../crates/ec-ogg", version = "0.1.0" }
 oxideav-core = { path = "../oxideav-core", version = "0.1.34" }

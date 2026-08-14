@@ -2,9 +2,9 @@
 name = "oxideav-subtitle"
 description = "Compatibility shim: the oxideav-subtitle surface edith consumes, over ec-subs."
 version = "0.1.2"
-edition.workspace = true
-license.workspace = true
-authors.workspace = true
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Ahmet Kaan Gümüş"]
 publish = false
 
 [dependencies]

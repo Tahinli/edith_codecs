@@ -1,0 +1,11 @@
+[package]
+name = "rusty_aac"
+description = "Compatibility shim: the rusty_aac 0.5 surface edith consumes, served by ec-aac."
+version = "0.5.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Ahmet Kaan Gümüş"]
+publish = false
+
+[dependencies]
+ec-aac = { path = "../../crates/ec-aac", version = "0.1.0" }

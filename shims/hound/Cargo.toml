@@ -2,9 +2,9 @@
 name = "hound"
 description = "Compatibility shim: the hound 3.5.1 WAV-writing surface, implemented over ec-riff."
 version = "3.5.1"
-edition.workspace = true
-license.workspace = true
-authors.workspace = true
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Ahmet Kaan Gümüş"]
 
 [dependencies]
-ec-riff.workspace = true
+ec-riff = { path = "../../crates/ec-riff", version = "0.1.0" }
