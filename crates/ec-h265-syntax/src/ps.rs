@@ -305,6 +305,11 @@ pub struct Sps {
     pub sao_enabled: bool,
     /// `pcm_enabled_flag`.
     pub pcm_enabled: bool,
+    /// PCM sample depths and block sizes, present when `pcm_enabled`:
+    /// `(pcm_sample_bit_depth_luma_minus1, pcm_sample_bit_depth_chroma_minus1,
+    /// log2_min_pcm_luma_coding_block_size_minus3,
+    /// log2_diff_max_min_pcm_luma_coding_block_size, pcm_loop_filter_disabled_flag)`.
+    pub pcm: Option<(u32, u32, u32, u32, bool)>,
     /// `num_short_term_ref_pic_sets`.
     pub num_short_term_ref_pic_sets: u32,
     /// `long_term_ref_pics_present_flag`.
@@ -404,6 +409,13 @@ impl Sps {
         w.write_bit(self.amp_enabled);
         w.write_bit(self.sao_enabled);
         w.write_bit(self.pcm_enabled);
+        if let Some((luma, chroma, log2_min, log2_diff, filter_off)) = self.pcm {
+            w.write_bits(luma, 4);
+            w.write_bits(chroma, 4);
+            w.write_ue(log2_min);
+            w.write_ue(log2_diff);
+            w.write_bit(filter_off);
+        }
         w.write_ue(self.num_short_term_ref_pic_sets);
         w.write_bit(self.long_term_ref_pics_present);
         if self.long_term_ref_pics_present {
@@ -512,13 +524,17 @@ impl Sps {
         let amp_enabled = r.read_bit()?;
         let sao_enabled = r.read_bit()?;
         let pcm_enabled = r.read_bit()?;
-        if pcm_enabled {
-            r.read_bits(4)?; // pcm_sample_bit_depth_luma_minus1
-            r.read_bits(4)?; // pcm_sample_bit_depth_chroma_minus1
-            r.read_ue()?; // log2_min_pcm_luma_coding_block_size_minus3
-            r.read_ue()?; // log2_diff_max_min_pcm_luma_coding_block_size
-            r.read_bit()?; // pcm_loop_filter_disabled_flag
-        }
+        let pcm = if pcm_enabled {
+            Some((
+                r.read_bits(4)?,
+                r.read_bits(4)?,
+                r.read_ue()?,
+                r.read_ue()?,
+                r.read_bit()?,
+            ))
+        } else {
+            None
+        };
         let num_short_term_ref_pic_sets = r.read_ue()?;
         if num_short_term_ref_pic_sets > 64 {
             return Err(Error::corrupt("HEVC SPS: num_short_term_ref_pic_sets > 64"));
@@ -572,6 +588,7 @@ impl Sps {
             amp_enabled,
             sao_enabled,
             pcm_enabled,
+            pcm,
             num_short_term_ref_pic_sets,
             long_term_ref_pics_present,
             num_long_term_ref_pics_sps,
@@ -716,6 +733,11 @@ pub struct Pps {
     pub num_tile_rows_minus1: u32,
     /// `uniform_spacing_flag`.
     pub uniform_spacing: bool,
+    /// `column_width_minus1[]`, empty when the spacing is uniform (a decoder
+    /// derives the widths then, and so should a caller).
+    pub column_width_minus1: Vec<u32>,
+    /// `row_height_minus1[]`, empty when the spacing is uniform.
+    pub row_height_minus1: Vec<u32>,
     /// `loop_filter_across_tiles_enabled_flag`.
     pub loop_filter_across_tiles_enabled: bool,
     /// `pps_loop_filter_across_slices_enabled_flag`.
@@ -766,6 +788,8 @@ impl Default for Pps {
             num_tile_columns_minus1: 0,
             num_tile_rows_minus1: 0,
             uniform_spacing: true,
+            column_width_minus1: Vec::new(),
+            row_height_minus1: Vec::new(),
             loop_filter_across_tiles_enabled: true,
             loop_filter_across_slices_enabled: true,
             deblocking_filter_control_present: false,
@@ -812,6 +836,14 @@ impl Pps {
             w.write_ue(self.num_tile_columns_minus1);
             w.write_ue(self.num_tile_rows_minus1);
             w.write_bit(self.uniform_spacing);
+            if !self.uniform_spacing {
+                for &width in &self.column_width_minus1 {
+                    w.write_ue(width);
+                }
+                for &height in &self.row_height_minus1 {
+                    w.write_ue(height);
+                }
+            }
             w.write_bit(self.loop_filter_across_tiles_enabled);
         }
         w.write_bit(self.loop_filter_across_slices_enabled);
@@ -868,11 +900,16 @@ impl Pps {
             pps.num_tile_rows_minus1 = r.read_ue()?;
             pps.uniform_spacing = r.read_bit()?;
             if !pps.uniform_spacing {
+                if pps.num_tile_columns_minus1 > 20 || pps.num_tile_rows_minus1 > 22 {
+                    return Err(Error::corrupt("HEVC PPS: tile count beyond any level"));
+                }
                 for _ in 0..pps.num_tile_columns_minus1 {
-                    r.read_ue()?;
+                    let value = r.read_ue()?;
+                    pps.column_width_minus1.push(value);
                 }
                 for _ in 0..pps.num_tile_rows_minus1 {
-                    r.read_ue()?;
+                    let value = r.read_ue()?;
+                    pps.row_height_minus1.push(value);
                 }
             }
             pps.loop_filter_across_tiles_enabled = r.read_bit()?;
@@ -949,6 +986,7 @@ mod tests {
             amp_enabled: false,
             sao_enabled: false,
             pcm_enabled: false,
+            pcm: None,
             num_short_term_ref_pic_sets: 0,
             long_term_ref_pics_present: false,
             num_long_term_ref_pics_sps: 0,
@@ -998,6 +1036,32 @@ mod tests {
             ..Pps::default()
         };
         assert_eq!(Pps::parse(&pps.to_rbsp()).unwrap(), pps);
+
+        // The fields a hardware decoder needs but this family's own encoder
+        // never writes: explicit tile geometry and PCM.
+        let tiled = Pps {
+            tiles_enabled: true,
+            num_tile_columns_minus1: 2,
+            num_tile_rows_minus1: 1,
+            uniform_spacing: false,
+            column_width_minus1: vec![9, 19],
+            row_height_minus1: vec![7],
+            loop_filter_across_tiles_enabled: false,
+            cu_qp_delta_enabled: true,
+            diff_cu_qp_delta_depth: 2,
+            cb_qp_offset: -3,
+            cr_qp_offset: 4,
+            ..Pps::default()
+        };
+        assert_eq!(Pps::parse(&tiled.to_rbsp()).unwrap(), tiled);
+
+        let pcm = Sps {
+            pcm_enabled: true,
+            pcm: Some((7, 7, 0, 2, true)),
+            sao_enabled: true,
+            ..sample_sps()
+        };
+        assert_eq!(Sps::parse(&pcm.to_rbsp()).unwrap(), pcm);
     }
 
     #[test]

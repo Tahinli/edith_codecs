@@ -63,6 +63,7 @@ fn reference_sps() -> Sps {
         amp_enabled: false,
         sao_enabled: true,
         pcm_enabled: false,
+        pcm: None,
         num_short_term_ref_pic_sets: 0,
         long_term_ref_pics_present: false,
         num_long_term_ref_pics_sps: 0,

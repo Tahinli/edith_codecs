@@ -197,6 +197,7 @@ impl Encoder {
             // No in-loop filters: see `Encoder` docs and the PPS below.
             sao_enabled: false,
             pcm_enabled: false,
+            pcm: None,
             num_short_term_ref_pic_sets: 0,
             long_term_ref_pics_present: false,
             num_long_term_ref_pics_sps: 0,

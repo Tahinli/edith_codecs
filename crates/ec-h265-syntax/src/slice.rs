@@ -57,6 +57,9 @@ pub struct SliceHeader {
     pub pic_output_flag: bool,
     /// `slice_pic_order_cnt_lsb`; absent (0) on IDR pictures.
     pub poc_lsb: u32,
+    /// `colour_plane_id`, present only when the sequence codes its three
+    /// planes as separate pictures.
+    pub colour_plane_id: u8,
     /// `slice_sao_luma_flag`.
     pub sao_luma: bool,
     /// `slice_sao_chroma_flag`.
@@ -107,6 +110,7 @@ impl SliceHeader {
             slice_type: SliceType::I,
             pic_output_flag: true,
             poc_lsb: 0,
+            colour_plane_id: 0,
             sao_luma: false,
             sao_chroma: false,
             num_ref_idx_l0_active_minus1: 0,
@@ -244,7 +248,7 @@ impl SliceHeader {
                 h.pic_output_flag = r.read_bit()?;
             }
             if sps.separate_colour_plane {
-                r.read_bits(2)?; // colour_plane_id
+                h.colour_plane_id = r.read_bits(2)? as u8;
             }
             let mut st_rps = ShortTermRefPicSet::default();
             let mut num_long_term = 0;
@@ -437,6 +441,29 @@ impl ParsePositions {
     }
 }
 
+/// How many emulation prevention bytes a NAL unit payload carries.
+///
+/// `VASliceParameterBufferHEVC::slice_data_num_emu_prevn_bytes` wants this for
+/// the slice data a driver is handed, and a caller that has the escaped bytes
+/// should not have to unescape them twice to find out.
+pub fn count_emulation_prevention_bytes(escaped_payload: &[u8]) -> usize {
+    let mut zeros = 0usize;
+    let mut count = 0usize;
+    for &b in escaped_payload {
+        if zeros >= 2 && b == 3 {
+            count += 1;
+            zeros = 0;
+            continue;
+        }
+        if b == 0 {
+            zeros += 1;
+        } else {
+            zeros = 0;
+        }
+    }
+    count
+}
+
 /// Walk past a `pred_weight_table()` (7.3.6.3).
 fn skip_pred_weight_table(r: &mut BitReader, h: &SliceHeader, sps: &Sps) -> Result<()> {
     r.read_ue()?; // luma_log2_weight_denom
@@ -509,6 +536,7 @@ mod tests {
             amp_enabled: false,
             sao_enabled: false,
             pcm_enabled: false,
+            pcm: None,
             num_short_term_ref_pic_sets: 0,
             long_term_ref_pics_present: false,
             num_long_term_ref_pics_sps: 0,
@@ -540,6 +568,15 @@ mod tests {
         // No emulation prevention in this header, so the byte offset is the
         // NAL header plus the RBSP header bytes.
         assert_eq!(pos.slice_data_byte_offset(&rbsp), 2 + rbsp.len());
+    }
+
+    #[test]
+    fn emulation_prevention_bytes_are_counted() {
+        assert_eq!(count_emulation_prevention_bytes(&[0, 0, 3, 1, 0xff]), 1);
+        assert_eq!(count_emulation_prevention_bytes(&[0, 0, 3, 0, 0, 3, 2]), 2);
+        // A 3 that is not preceded by two zeros is payload, not an escape.
+        assert_eq!(count_emulation_prevention_bytes(&[0, 3, 3, 3]), 0);
+        assert_eq!(count_emulation_prevention_bytes(&[]), 0);
     }
 
     #[test]
