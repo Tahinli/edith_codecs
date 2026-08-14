@@ -19,13 +19,12 @@ use ec_h264_syntax::{
     AnnexBIter, NalHeader, NalUnitType, Pps, SliceHeader, SliceType, Sps, unescape_rbsp,
 };
 
-use crate::bits::BitCursor;
-use crate::cavlc::residual_block;
 use crate::deblock::{
     chroma_qp, edge_params, filter_chroma_line, filter_luma_h_edge16, filter_luma_line,
 };
+use crate::entropy::{BlockCat, Entropy};
 use crate::pred::{Nbr4, PlaneWindow, add_residual_4x4, pred_4x4, pred_16x16, pred_chroma_8x8};
-use crate::tables::{BLK4_POS, CBP_INTRA_420, CHROMA_QP};
+use crate::tables::{BLK4_POS, CHROMA_QP};
 use crate::transform::{
     LevelScale4x4, chroma_dc_transform_420, dequant_4x4, inverse_transform_4x4, luma_dc_transform,
     unzigzag, unzigzag_ac15,
@@ -408,7 +407,7 @@ impl Decoder {
             cr_qp_offset: pps.second_chroma_qp_index_offset,
         });
 
-        let mut r = BitCursor::new(rbsp, sh.header_bits);
+        let mut r = Entropy::cavlc(rbsp, sh.header_bits);
 
         let mut ctx = SliceCtx {
             slice_id,
@@ -424,7 +423,7 @@ impl Decoder {
                 return Err(Error::corrupt("macroblock address beyond the picture"));
             }
             decode_macroblock(&mut self.pic, &self.ls, &mut r, &mut ctx, mb_addr)?;
-            if !r.more_rbsp_data() {
+            if !r.more_macroblocks()? {
                 break;
             }
             mb_addr += 1;
@@ -531,53 +530,37 @@ fn mb_neighbors(pic: &Picture, mb_x: usize, mb_y: usize, slice_id: u16) -> MbNei
     }
 }
 
-/// nC for a luma 4x4 block at global block coords `(bx, by)` (spec 9.2.1).
+/// Non-zero counts of the left and above neighbours of the luma 4x4 block at
+/// global block coords `(bx, by)`, `None` when that neighbour is unavailable
+/// (clause 6.4.11.4 plus the availability rules of 6.4.8).
 #[inline]
-fn luma_nc(pic: &Picture, n: &MbNeighbors, bx: usize, by: usize) -> i32 {
+fn luma_nz_pair(pic: &Picture, n: &MbNeighbors, bx: usize, by: usize) -> (Option<u8>, Option<u8>) {
     let w4 = pic.mb_w * 4;
     let left_avail = if bx.is_multiple_of(4) { n.a } else { true };
     let top_avail = if by.is_multiple_of(4) { n.b } else { true };
-    let na = if left_avail && bx > 0 {
-        i32::from(pic.nz_y[by * w4 + bx - 1])
-    } else {
-        -1
-    };
-    let nb = if top_avail && by > 0 {
-        i32::from(pic.nz_y[(by - 1) * w4 + bx])
-    } else {
-        -1
-    };
-    match (na >= 0, nb >= 0) {
-        (true, true) => (na + nb + 1) >> 1,
-        (true, false) => na,
-        (false, true) => nb,
-        (false, false) => 0,
-    }
+    (
+        (left_avail && bx > 0).then(|| pic.nz_y[by * w4 + bx - 1]),
+        (top_avail && by > 0).then(|| pic.nz_y[(by - 1) * w4 + bx]),
+    )
 }
 
-/// nC for a chroma AC 4x4 block at global chroma block coords.
+/// The same for a chroma AC 4x4 block at global chroma block coords.
 #[inline]
-fn chroma_nc(pic: &Picture, n: &MbNeighbors, comp: usize, cx: usize, cy: usize) -> i32 {
+fn chroma_nz_pair(
+    pic: &Picture,
+    n: &MbNeighbors,
+    comp: usize,
+    cx: usize,
+    cy: usize,
+) -> (Option<u8>, Option<u8>) {
     let w2 = pic.mb_w * 2;
     let grid = &pic.nz_c[comp];
     let left_avail = if cx.is_multiple_of(2) { n.a } else { true };
     let top_avail = if cy.is_multiple_of(2) { n.b } else { true };
-    let na = if left_avail && cx > 0 {
-        i32::from(grid[cy * w2 + cx - 1])
-    } else {
-        -1
-    };
-    let nb = if top_avail && cy > 0 {
-        i32::from(grid[(cy - 1) * w2 + cx])
-    } else {
-        -1
-    };
-    match (na >= 0, nb >= 0) {
-        (true, true) => (na + nb + 1) >> 1,
-        (true, false) => na,
-        (false, true) => nb,
-        (false, false) => 0,
-    }
+    (
+        (left_avail && cx > 0).then(|| grid[cy * w2 + cx - 1]),
+        (top_avail && cy > 0).then(|| grid[(cy - 1) * w2 + cx]),
+    )
 }
 
 /// Decode one macroblock of an I slice (spec 7.3.5, 7.4.5) and reconstruct
@@ -588,7 +571,7 @@ fn chroma_nc(pic: &Picture, n: &MbNeighbors, comp: usize, cx: usize, cy: usize) 
 fn decode_macroblock(
     pic: &mut Picture,
     ls: &[LevelScale4x4; 3],
-    r: &mut BitCursor<'_>,
+    r: &mut Entropy<'_>,
     ctx: &mut SliceCtx,
     mb_addr: usize,
 ) -> Result<()> {
@@ -603,24 +586,20 @@ fn decode_macroblock(
     let (bx0, by0) = (mb_x * 4, mb_y * 4);
     let (cx0, cy0) = (mb_x * 2, mb_y * 2);
 
-    let mb_type = r.read_ue()?;
-    if mb_type > 25 {
-        return Err(Error::corrupt("I-slice mb_type > 25"));
-    }
+    let mb_type = r.mb_type_i()?;
 
     if mb_type == 25 {
         // I_PCM (7.3.5, 8.3.5): raw samples, byte aligned.
-        r.align_to_byte();
+        let pcm = r.pcm_block()?;
         for y in 0..16 {
-            let row = r.read_bytes(16)?;
             let dst = pic.y.at(mb_x * 16, mb_y * 16 + y);
-            pic.y.data[dst..dst + 16].copy_from_slice(row);
+            pic.y.data[dst..dst + 16].copy_from_slice(&pcm[y * 16..y * 16 + 16]);
         }
-        for plane in [&mut pic.cb, &mut pic.cr] {
+        for (c, plane) in [&mut pic.cb, &mut pic.cr].into_iter().enumerate() {
+            let base = 256 + c * 64;
             for y in 0..8 {
-                let row = r.read_bytes(8)?;
                 let dst = plane.at(mb_x * 8, mb_y * 8 + y);
-                plane.data[dst..dst + 8].copy_from_slice(row);
+                plane.data[dst..dst + 8].copy_from_slice(&pcm[base + y * 8..base + y * 8 + 8]);
             }
         }
         for dy in 0..4 {
@@ -656,7 +635,7 @@ fn decode_macroblock(
     };
 
     // I_NxN transform size flag (High profile only).
-    if !is_i16 && ctx.transform_8x8_mode && r.read_bit()? {
+    if !is_i16 && ctx.transform_8x8_mode && r.transform_size_8x8_flag()? {
         return Err(Error::unsupported(
             "8x8 transform",
             "transform_size_8x8_flag 1 selects the 8x8 intra prediction of \
@@ -681,11 +660,10 @@ fn decode_macroblock(
             } else {
                 2
             };
-            let mode = if r.read_bit()? {
-                pred
-            } else {
-                let rem = r.read_bits(3)? as u8;
-                if rem < pred { rem } else { rem + 1 }
+            let mode = match r.intra4x4_pred_mode()? {
+                None => pred,
+                Some(rem) if rem < pred => rem,
+                Some(rem) => rem + 1,
             };
             pic.i4_modes[by * w4 + bx] = mode;
             modes[blk] = mode;
@@ -696,30 +674,18 @@ fn decode_macroblock(
             pic.i4_modes[base..base + 4].fill(2);
         }
     }
-    let chroma_mode = r.read_ue()?;
-    if chroma_mode > 3 {
-        return Err(Error::corrupt("intra_chroma_pred_mode > 3"));
-    }
+    let chroma_mode = r.intra_chroma_pred_mode()?;
 
-    // coded_block_pattern me(v) for I_NxN (9.1.2, Table 9-4).
+    // coded_block_pattern for I_NxN; Intra_16x16 derives it from mb_type.
     let (cbp_luma, cbp_chroma) = if is_i16 {
         (cbp_luma, cbp_chroma)
     } else {
-        let code = r.read_ue()? as usize;
-        let cbp = if code < 48 {
-            CBP_INTRA_420[code]
-        } else {
-            return Err(Error::corrupt("coded_block_pattern codeNum > 47"));
-        };
-        (cbp & 15, cbp >> 4)
+        r.coded_block_pattern_intra()?
     };
 
     // mb_qp_delta (7.4.5).
     if cbp_luma != 0 || cbp_chroma != 0 || is_i16 {
-        let delta = r.read_se()?;
-        if !(-26..=25).contains(&delta) {
-            return Err(Error::corrupt("mb_qp_delta outside [-26, 25]"));
-        }
+        let delta = r.mb_qp_delta()?;
         ctx.qp = (ctx.qp + delta + 52) % 52;
     }
     pic.mb_qp[mb_addr] = ctx.qp as u8;
@@ -747,8 +713,8 @@ fn decode_macroblock(
         };
         pred_16x16(i16_mode, &mut w, nbr.b, nbr.a);
         // Luma DC: un-zigzag over the 4x4 DC array, Hadamard + scale.
-        let nc = luma_nc(pic, &nbr, bx0, by0);
-        residual_block(r, &mut scan, 16, nc)?;
+        let (na, nb) = luma_nz_pair(pic, &nbr, bx0, by0);
+        r.residual_block(&mut scan, BlockCat::LumaDc, na, nb)?;
         unzigzag(&scan, &mut raster);
         luma_dc_transform(&mut raster, &ls[0], qp_y);
         let dc = raster;
@@ -756,8 +722,8 @@ fn decode_macroblock(
             let (dx, dy) = BLK4_POS[blk];
             let (bx, by) = (bx0 + dx as usize, by0 + dy as usize);
             let tc = if cbp_luma != 0 {
-                let nc = luma_nc(pic, &nbr, bx, by);
-                residual_block(r, &mut scan, 15, nc)?
+                let (na, nb) = luma_nz_pair(pic, &nbr, bx, by);
+                r.residual_block(&mut scan, BlockCat::LumaAc, na, nb)?
             } else {
                 0
             };
@@ -784,8 +750,8 @@ fn decode_macroblock(
             let (dx, dy) = BLK4_POS[blk];
             let (bx, by) = (bx0 + dx as usize, by0 + dy as usize);
             let tc = if cbp_luma & (1 << (blk >> 2)) != 0 {
-                let nc = luma_nc(pic, &nbr, bx, by);
-                residual_block(r, &mut scan, 16, nc)?
+                let (na, nb) = luma_nz_pair(pic, &nbr, bx, by);
+                r.residual_block(&mut scan, BlockCat::Luma4x4, na, nb)?
             } else {
                 0
             };
@@ -827,12 +793,12 @@ fn decode_macroblock(
             stride: plane.stride,
             origin: plane.origin + (mb_y * 8) * plane.stride + mb_x * 8,
         };
-        pred_chroma_8x8(chroma_mode as u8, &mut w, nbr.b, nbr.a);
+        pred_chroma_8x8(chroma_mode, &mut w, nbr.b, nbr.a);
     }
     let mut chroma_dc = [[0i32; 4]; 2];
     if cbp_chroma != 0 {
         for (comp, c) in chroma_dc.iter_mut().enumerate() {
-            residual_block(r, &mut scan, 4, -1)?;
+            r.residual_block(&mut scan, BlockCat::ChromaDc, None, None)?;
             c.copy_from_slice(&scan[..4]);
             let (ls_c, qp_c) = if comp == 0 {
                 (&ls[1], qp_cb)
@@ -846,8 +812,8 @@ fn decode_macroblock(
         for blk in 0..4 {
             let (cx, cy) = (cx0 + (blk & 1), cy0 + (blk >> 1));
             let tc = if cbp_chroma == 2 {
-                let nc = chroma_nc(pic, &nbr, comp, cx, cy);
-                residual_block(r, &mut scan, 15, nc)?
+                let (na, nb) = chroma_nz_pair(pic, &nbr, comp, cx, cy);
+                r.residual_block(&mut scan, BlockCat::ChromaAc, na, nb)?
             } else {
                 0
             };

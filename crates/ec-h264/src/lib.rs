@@ -35,6 +35,7 @@ mod cavlc;
 mod codec;
 mod deblock;
 mod decoder;
+mod entropy;
 mod pred;
 mod tables;
 mod transform;
