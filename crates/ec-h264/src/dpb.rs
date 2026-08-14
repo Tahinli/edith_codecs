@@ -184,6 +184,14 @@ pub(crate) struct Picture {
     /// travels with the picture rather than with the packet, because display
     /// order reorders the two apart.
     pub pts: Option<ec_core::timebase::Timestamp>,
+    /// Cropped output size and the crop origin, in luma samples. A stored
+    /// picture describes its own output geometry so that emitting it needs no
+    /// lookup back into the parameter sets — which a later sequence may have
+    /// replaced by then.
+    pub out_size: (u32, u32),
+    pub crop: (u32, u32),
+    /// Colour description carried from the VUI.
+    pub color: ec_core::frame::ColorInfo,
 }
 
 impl Picture {
@@ -229,6 +237,17 @@ impl Picture {
         self.long_term_frame_idx = 0;
         self.frame_num_wrap = 0;
         self.pic_num = 0;
+        self.out_size = (sps.width, sps.height);
+        self.crop = (sps.crop.0, sps.crop.2);
+        self.color = ec_core::frame::ColorInfo::default();
+        if let Some(vui) = &sps.vui {
+            self.color.full_range = vui.video_full_range;
+            if let Some((p, t, m)) = vui.colour_description {
+                self.color.primaries = p;
+                self.color.transfer = t;
+                self.color.matrix = m;
+            }
+        }
     }
 
     /// Replicate every plane's borders once the picture is fully reconstructed.

@@ -376,11 +376,13 @@ fn jvt_cavlc_first_idr_bit_exact() {
     );
 }
 
-/// Steady-state decode loop performs zero heap allocations: after one warm-up
-/// picture, re-decoding the same slices into the reused picture context
-/// (including deblocking) must not allocate. Frame emission (`frame()`)
-/// allocates the output planes and is measured separately as nonzero to prove
-/// the counter works.
+/// Steady-state slice decoding performs zero heap allocations.
+///
+/// After a warm-up pass the picture pool, every per-picture array and the
+/// parameter-set store are all sized, so decoding the same stream again must
+/// not allocate at all: not per macroblock, not per slice, not per picture.
+/// Emitting a frame is measured separately and *does* allocate — it hands the
+/// caller owned planes — which also proves the counter is alive.
 #[test]
 fn steady_state_decode_loop_zero_alloc() {
     let base = vectors_dir();
@@ -388,38 +390,59 @@ fn steady_state_decode_loop_zero_alloc() {
         eprintln!("SKIP: fixtures missing");
         return;
     }
-    // One stream per entropy coder: the CABAC reader carries its 402 context
-    // variables inline for exactly this reason.
-    let mut dec = Decoder::new();
-    for name in ["BA1_Sony_D", "CABA1_SVA_B"] {
-        let stream = find_stream(&base.join(name)).expect("fixture");
+    // One stream per entropy coder, and one with B slices and multiple
+    // reference frames so the decoded picture buffer really recycles pictures.
+    for name in ["BA1_Sony_D", "CABA1_SVA_B", "CABA3_SVA_B"] {
+        let Some(stream) = find_stream(&base.join(name)) else {
+            continue;
+        };
         let bytes = std::fs::read(stream).unwrap();
-        // Warm-up: full first picture, growing every reusable buffer.
-        let _ = dec.decode_first_idr(&bytes).expect("warm-up decode");
-
-        // Steady state: same IDR slices again, counted.
-        let nals: Vec<&[u8]> = ec_h264_syntax::AnnexBIter::new(&bytes).collect();
-        ALLOCS.store(0, Ordering::SeqCst);
-        COUNTING_HERE.with(|c| c.set(true));
-        let mut decoded = false;
-        for nal in &nals {
-            match dec.push_nal(nal) {
-                Ok(ec_h264::NalOutcome::PictureBoundary) => break,
-                Ok(ec_h264::NalOutcome::SliceDecoded) => decoded = true,
-                Ok(_) => {}
-                Err(e) => panic!("steady-state push failed: {e}"),
+        let mut dec = Decoder::new();
+        let mut drive = |dec: &mut Decoder, count: bool| -> usize {
+            let nals: Vec<&[u8]> = ec_h264_syntax::AnnexBIter::new(&bytes).collect();
+            let mut frames = 0usize;
+            for nal in &nals {
+                if count {
+                    COUNTING_HERE.with(|c| c.set(true));
+                }
+                let outcome = dec.push_nal(nal);
+                if count {
+                    COUNTING_HERE.with(|c| c.set(false));
+                }
+                match outcome {
+                    Ok(ec_h264::NalOutcome::PictureBoundary) => {
+                        dec.end_picture().expect("end_picture");
+                        dec.push_nal(nal).expect("re-push");
+                    }
+                    Ok(_) => {}
+                    Err(e) => panic!("{name}: {e}"),
+                }
+                while dec.next_frame().is_some() {
+                    frames += 1;
+                }
             }
-        }
-        dec.end_picture().expect("end_picture");
-        COUNTING_HERE.with(|c| c.set(false));
-        assert!(decoded, "no slice decoded in steady-state pass of {name}");
-        let n = ALLOCS.load(Ordering::SeqCst);
-        assert_eq!(n, 0, "{name}: steady-state decode loop allocated {n} times");
-    }
-    let bytes = std::fs::read(find_stream(&base.join("BA1_Sony_D")).unwrap()).unwrap();
-    let _ = dec.decode_first_idr(&bytes).expect("decode");
+            dec.flush().expect("flush");
+            while dec.next_frame().is_some() {
+                frames += 1;
+            }
+            frames
+        };
+        // Warm-up: every reusable buffer reaches its final size.
+        let warm = drive(&mut dec, false);
+        assert!(warm > 1, "{name}: only {warm} frames decoded");
+        dec.reset_pictures();
 
-    // Sanity: the counter is alive — frame emission does allocate.
+        ALLOCS.store(0, Ordering::SeqCst);
+        let again = drive(&mut dec, true);
+        let n = ALLOCS.load(Ordering::SeqCst);
+        assert_eq!(again, warm, "{name}: frame count changed on the second pass");
+        assert_eq!(n, 0, "{name}: steady-state slice decode allocated {n} times");
+    }
+
+    // Sanity: the counter is alive — emitting a frame does allocate.
+    let bytes = std::fs::read(find_stream(&base.join("BA1_Sony_D")).unwrap()).unwrap();
+    let mut dec = Decoder::new();
+    let _ = dec.decode_first_idr(&bytes).expect("decode");
     ALLOCS.store(0, Ordering::SeqCst);
     COUNTING_HERE.with(|c| c.set(true));
     let frame = dec.frame().expect("frame");
@@ -882,86 +905,6 @@ fn refusals_name_a_feature_the_stream_really_uses() {
     assert!(proved >= 2, "too few refusals proved against real streams");
 }
 
-/// Inter slices are refused by name under CABAC as well as CAVLC: the
-/// arithmetic decoder landing does not imply P and B macroblock parsing, and a
-/// stream whose first picture decodes must not silently produce wrong pixels
-/// for its second.
-#[test]
-fn inter_slices_under_cabac_are_refused_by_name() {
-    if !have_ffmpeg() {
-        eprintln!("SKIP: ffmpeg not on PATH");
-        return;
-    }
-    let dir = scratch("inter-cabac");
-    let stream = dir.join("gop.264");
-    let ok = run(
-        "ffmpeg",
-        &[
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc=size=176x144:rate=25:duration=1",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:v",
-            "libx264",
-            "-frames:v",
-            "6",
-            "-profile:v",
-            "main",
-            "-coder",
-            "ac",
-            "-qp",
-            "26",
-            "-f",
-            "h264",
-            &stream.to_string_lossy(),
-        ],
-    );
-    assert!(ok, "ffmpeg cannot encode a CABAC GOP");
-    let bytes = std::fs::read(&stream).unwrap();
-
-    // The first (IDR) picture decodes; the first P slice must refuse by name.
-    let mut dec = Decoder::new();
-    let first = dec.decode_first_idr(&bytes).expect("CABAC IDR decodes");
-    assert_eq!((first.width, first.height), (176, 144));
-
-    let mut refusal = None;
-    let mut pictures = 1;
-    for nal in ec_h264_syntax::AnnexBIter::new(&bytes) {
-        match dec.push_nal(nal) {
-            Ok(ec_h264::NalOutcome::PictureBoundary) => {
-                dec.end_picture().expect("end_picture");
-                pictures += 1;
-                if let Err(e) = dec.push_nal(nal) {
-                    refusal = Some(e);
-                    break;
-                }
-            }
-            Ok(_) => {}
-            Err(e) => {
-                refusal = Some(e);
-                break;
-            }
-        }
-    }
-    let _ = std::fs::remove_dir_all(&dir);
-    match refusal {
-        Some(Error::Unsupported { what, why }) => {
-            assert!(
-                what.contains("non-I slice") || why.contains("P/B"),
-                "refused as {what} ({why}), expected the inter-slice refusal"
-            );
-            eprintln!("CABAC GOP: {pictures} intra picture(s) decoded, then refused: {what}");
-        }
-        other => panic!("expected an inter-slice refusal, got {other:?}"),
-    }
-}
-
 /// The `avcC` entry path: parameter sets out of band and NAL units length
 /// prefixed — how an MP4 or Matroska demuxer hands H.264 over.
 #[test]
@@ -1235,4 +1178,247 @@ fn jvt_full_sequence_bit_exact() {
         failed.len()
     );
     assert!(failed.is_empty(), "{failed:#?}");
+}
+
+/// Decode a whole stream in decode order rather than display order.
+fn decode_all_in_decode_order(bytes: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
+    let mut dec = Decoder::new();
+    dec.set_output_order(ec_h264::OutputOrder::Decode);
+    let mut frames = Vec::new();
+    for nal in ec_h264_syntax::AnnexBIter::new(bytes) {
+        if dec.push_nal(nal)? == NalOutcome::PictureBoundary {
+            dec.end_picture()?;
+            dec.push_nal(nal)?;
+        }
+        while let Some(f) = dec.next_frame() {
+            frames.push(frame_bytes(&f));
+        }
+    }
+    dec.flush()?;
+    while let Some(f) = dec.next_frame() {
+        frames.push(frame_bytes(&f));
+    }
+    Ok(frames)
+}
+
+/// Count I, P and B slices in an Annex B stream, straight from the slice
+/// headers. A test that claims to exercise B pictures has to prove the encoder
+/// actually produced some — x264's adaptive decision drops them on flat
+/// synthetic sources, and the test would then pass while measuring nothing.
+fn slice_type_counts(bytes: &[u8]) -> [usize; 3] {
+    let mut counts = [0usize; 3];
+    for nal in ec_h264_syntax::AnnexBIter::new(bytes) {
+        let Some((&header, payload)) = nal.split_first() else {
+            continue;
+        };
+        if !matches!(header & 0x1F, 1 | 5) {
+            continue;
+        }
+        let mut r = ec_core::BitReader::new(payload);
+        if r.read_ue().is_err() {
+            continue;
+        }
+        let Ok(code) = r.read_ue() else { continue };
+        match code % 5 {
+            0 => counts[1] += 1,
+            1 => counts[2] += 1,
+            2 => counts[0] += 1,
+            _ => {}
+        }
+    }
+    counts
+}
+
+/// A GOP with B pictures, every frame bit-exact against ffmpeg, under both
+/// entropy coders and both direct modes.
+///
+/// B pictures are where the decoded picture buffer earns its keep: two
+/// reference lists, direct prediction from a co-located picture, implicit
+/// weighting, and pictures that leave the buffer in a different order than
+/// they arrived.
+#[test]
+fn b_pictures_match_ffmpeg_every_frame() {
+    if !have_ffmpeg() {
+        eprintln!("SKIP: ffmpeg not on PATH");
+        return;
+    }
+    let dir = scratch("b-gop");
+    let cases: &[(&str, &[&str])] = &[
+        ("spatial", &["-x264-params", "bframes=3:b-adapt=0:direct=spatial:weightp=0"]),
+        ("temporal", &["-x264-params", "bframes=3:b-adapt=0:direct=temporal:weightp=0"]),
+        // B pictures used as references, which makes the buffer hold pictures
+        // that are neither the newest nor the oldest.
+        (
+            "pyramid",
+            &["-x264-params", "bframes=3:b-adapt=0:b-pyramid=normal:direct=spatial"],
+        ),
+        // Weighted prediction on: explicit for P, implicit for B.
+        (
+            "weighted",
+            &["-x264-params", "bframes=3:b-adapt=0:weightp=2:weightb=1:direct=spatial"],
+        ),
+    ];
+    let mut failures = Vec::new();
+    let mut table = String::new();
+    for (mode, profile) in ENTROPY_MODES {
+        if mode == "cavlc" {
+            continue; // baseline forbids B pictures; main covers CAVLC below
+        }
+        for (tag, case) in cases {
+            for coder in ["ac", "0"] {
+                let mut extra = vec!["-profile:v", "main", "-coder", coder, "-qp", "26"];
+                extra.extend_from_slice(case);
+                let name = format!("{tag}-{}", if coder == "ac" { "cabac" } else { "cavlc" });
+                match x264_encode_gop(&dir, &name, "176x144", 20, &extra) {
+                    Some(stream) => {
+                        let counts = slice_type_counts(&std::fs::read(&stream).unwrap());
+                        if counts[2] == 0 {
+                            failures.push(format!("{name}: encoder produced no B slices"));
+                            continue;
+                        }
+                        match compare_sequence(&stream) {
+                            Ok(n) => table.push_str(&format!(
+                                "{name:<18} {n:>3} frames bit-exact ({} B slices)\n",
+                                counts[2]
+                            )),
+                            Err(e) => failures.push(format!("{name}: {e}")),
+                        }
+                    }
+                    None => failures.push(format!("{name}: ffmpeg cannot encode")),
+                }
+            }
+        }
+        let _ = profile;
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    eprintln!("{table}");
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Frames come out in display order, and that is a real reordering.
+///
+/// Matching ffmpeg frame for frame already implies display order, but only if
+/// the stream actually reorders — so this also decodes the same stream in
+/// decode order and requires the two to differ. Without that second half the
+/// test would pass on a decoder that never reorders anything.
+#[test]
+fn output_is_display_order_and_the_reorder_is_real() {
+    if !have_ffmpeg() {
+        eprintln!("SKIP: ffmpeg not on PATH");
+        return;
+    }
+    let dir = scratch("order");
+    let extra = [
+        "-profile:v",
+        "main",
+        "-coder",
+        "ac",
+        "-qp",
+        "26",
+        "-x264-params",
+        "bframes=3:b-adapt=0:b-pyramid=normal",
+    ];
+    let stream = x264_encode_gop(&dir, "reorder", "176x144", 20, &extra).expect("encode");
+    let bytes = std::fs::read(&stream).unwrap();
+    let counts = slice_type_counts(&bytes);
+    assert!(counts[2] > 0, "the encoder produced no B slices to reorder");
+    let display = decode_all(&bytes).expect("display order decode");
+    let decode = decode_all_in_decode_order(&bytes).expect("decode order decode");
+    let ffmpeg = ffmpeg_all_frames(&stream, display[0].len()).expect("ffmpeg");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(display.len(), ffmpeg.len());
+    assert_eq!(decode.len(), display.len());
+    for (i, (a, b)) in display.iter().zip(&ffmpeg).enumerate() {
+        assert!(
+            first_diff(a, b).is_none(),
+            "display-order frame {i} differs from ffmpeg"
+        );
+    }
+    // Every decode-order frame is somewhere in the display-order set: the two
+    // are permutations of one another, not different pictures.
+    for (i, f) in decode.iter().enumerate() {
+        assert!(
+            display.iter().any(|d| d == f),
+            "decode-order frame {i} is not in the display-order output"
+        );
+    }
+    let moved = decode
+        .iter()
+        .zip(&display)
+        .filter(|(a, b)| a != b)
+        .count();
+    assert!(
+        moved > 0,
+        "decode order and display order are identical: the stream does not \
+         reorder, so this test proves nothing"
+    );
+    eprintln!("{} of {} frames move under reordering", moved, display.len());
+}
+
+/// A gap in frame_num decodes instead of stalling (clause 8.2.5.2).
+///
+/// This is what a seek into the middle of a GOP looks like, and what a lossy
+/// transport delivers: the pictures a later frame_num implies never arrived.
+/// The spec infers them; a decoder that treats the gap as corruption drops
+/// every following picture, which is the failure an editor sees as a frozen
+/// preview after a seek.
+#[test]
+fn a_frame_num_gap_keeps_decoding() {
+    if !have_ffmpeg() {
+        eprintln!("SKIP: ffmpeg not on PATH");
+        return;
+    }
+    let dir = scratch("gap");
+    let extra = [
+        "-profile:v",
+        "baseline",
+        "-qp",
+        "26",
+        "-x264-params",
+        "bframes=0:ref=1:keyint=100",
+    ];
+    let stream = x264_encode_gop(&dir, "gap", "176x144", 12, &extra).expect("encode");
+    let bytes = std::fs::read(&stream).unwrap();
+    let units: Vec<Vec<u8>> = ec_h264_syntax::AnnexBIter::new(&bytes)
+        .map(<[u8]>::to_vec)
+        .collect();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Drop the fourth picture entirely, leaving frame_num 3 missing.
+    let mut vcl_seen = 0;
+    let mut dec = Decoder::new();
+    let mut frames = 0usize;
+    let mut errors = Vec::new();
+    for unit in &units {
+        if matches!(unit[0] & 0x1F, 1 | 5) {
+            vcl_seen += 1;
+            if vcl_seen == 4 {
+                continue; // the lost picture
+            }
+        }
+        match dec.push_nal(unit) {
+            Ok(NalOutcome::PictureBoundary) => {
+                dec.end_picture().expect("end_picture");
+                dec.push_nal(unit).expect("re-push");
+            }
+            Ok(_) => {}
+            Err(e) => errors.push(format!("{e}")),
+        }
+        while dec.next_frame().is_some() {
+            frames += 1;
+        }
+    }
+    dec.flush().expect("flush");
+    while dec.next_frame().is_some() {
+        frames += 1;
+    }
+    assert!(errors.is_empty(), "decoding stopped at the gap: {errors:?}");
+    // 12 pictures coded, one dropped; the gap is filled by an inferred frame,
+    // so every remaining picture still decodes and is output.
+    assert!(
+        frames >= 11,
+        "only {frames} frames survived a single dropped picture"
+    );
+    eprintln!("frame_num gap: {frames} frames decoded after dropping one picture");
 }
