@@ -1,0 +1,17 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "shims/*", "tools/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Ahmet Kaan Gümüş"]
+
+[workspace.dependencies]
+ec-core = { path = "crates/ec-core", version = "0.1.0" }
+# Portable SIMD without asm or build-time tooling (family rule: pure Rust only).
+wide = "1.5"
+
+[profile.release]
+opt-level = 3

@@ -1,0 +1,9 @@
+[package]
+name = "ec-core"
+description = "Media IR shared by the edith_codecs family: packets, frames, rational time, bit I/O, codec contracts."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
