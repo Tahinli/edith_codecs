@@ -723,3 +723,48 @@ fn real_library_sweep() {
         );
     }
 }
+
+/// Malformed input must come back as an error, never a panic: the decoders
+/// index tables with values the bitstream chooses, so this throws well-formed
+/// TOC bytes at random payloads to make sure every mode is actually entered.
+#[test]
+fn garbage_payloads_never_panic() {
+    let mut state = 0x12345678u32;
+    let mut rand = move || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state
+    };
+    let mut dec = Decoder::new(48000, 2).unwrap();
+    let mut ms = MultistreamDecoder::with_rate(48000, 4, 2, &[0, 4, 1, 2, 3, 5]);
+    let mut out = vec![0.0f32; 5760 * 6];
+    for config in 0..32u8 {
+        for stereo in 0..2u8 {
+            for code in 0..4u8 {
+                let toc = (config << 3) | (stereo << 2) | code;
+                for trial in 0..40 {
+                    let len = 2 + (rand() as usize % 400);
+                    let mut packet = vec![toc];
+                    for _ in 0..len {
+                        packet.push(rand() as u8);
+                    }
+                    if trial % 2 == 0 {
+                        dec.reset();
+                    }
+                    let _ = dec.decode_float(&packet, &mut out);
+                    let _ = ms.decode_float(&packet, &mut out);
+                }
+            }
+        }
+    }
+    // Truncations of a real packet, which exercise the mid-frame paths.
+    let path = vectors_dir().join("testvector10.bit");
+    if path.exists() {
+        for p in read_vector(&path).iter().take(200) {
+            for cut in 1..p.payload.len().min(64) {
+                let _ = dec.decode_float(&p.payload[..cut], &mut out);
+            }
+        }
+    }
+}

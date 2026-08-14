@@ -8,17 +8,24 @@
 //!
 //! Contracts worth knowing before implementing against this crate:
 //!
-//! - **The MDCT is the shared one.** CELT synthesis runs through
-//!   [`ec_dsp::Mdct`], never a direct-form DFT. An incumbent Opus decoder in
+//! - **The FFT is never optional.** CELT synthesis runs an `N/4`-point FFT
+//!   through [`ec_dsp`], never a direct-form DFT. An incumbent Opus decoder in
 //!   this product shipped its FFT behind a default-off feature and ran at 0.95x
 //!   realtime on 5.1; there is no such switch here, and no code path that could
-//!   answer to one.
-//! - **Malformed input is an error, never a panic.** Framing rules [R1]..[R7]
+//!   answer to one. (CELT's transform sizes are `15*2^k`, so [`ec_dsp::Mdct`]
+//!   itself — power-of-two only — cannot serve them; [`celt`] wraps
+//!   [`ec_dsp::Fft`] with one radix-3/radix-5 stage instead.)
+//! - **Malformed input is an error, never a panic.** Framing rules `[R1]`..`[R7]`
 //!   are checked in [`packet`], and the range decoder feeds zeros past the end
 //!   of a truncated frame exactly as Section 4.1.2.1 requires.
 //! - **Output is `f32`, interleaved, at the rate you asked for.** 48, 24, 16,
-//!   12 and 8 kHz are supported; SILK's internal rate is resampled up and the
-//!   sum of the two layers is resampled down once, at the end.
+//!   12 and 8 kHz are supported; SILK's internal rate is resampled up (by the
+//!   normative resampler in [`silk`]) and CELT decimates on the way out.
+//! - **There is no packet loss concealment.** A frame of one byte or none —
+//!   a dropped or DTX frame — decodes to silence, where the reference
+//!   extrapolates from the previous frame. This decoder is fed whole packets by
+//!   a container, never a gap, so the concealment would be dead weight; a
+//!   caller that needs it (an RTP receiver) has to add it.
 //!
 //! No unsafe, no allocation on the per-frame path beyond the decoder's own
 //! buffers, no dependencies outside the family.

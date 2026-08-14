@@ -1,7 +1,7 @@
 //! Opus packet framing: the TOC byte, codes 0-3, and the self-delimiting
 //! variant (RFC 6716, Section 3 and Appendix B).
 //!
-//! Every rule marked [R1]..[R7] in Section 3.4 is enforced here and reported as
+//! Every rule marked `[R1]`..`[R7]` in Section 3.4 is enforced here and reported as
 //! [`Error::Corrupt`] — a malformed packet is rejected at the framing layer, so
 //! nothing downstream ever sees a frame it cannot account for.
 //!
