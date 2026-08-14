@@ -132,6 +132,35 @@ fn ffmpeg_decodes_bit_exactly_at_every_shape() {
 }
 
 #[test]
+fn ffmpeg_verifies_the_decoded_picture_hash() {
+    // The MD5 SEI is the encoder's claim about its own reconstruction; ffmpeg's
+    // decoder checks that claim against what it decoded when asked to. This is
+    // the one oracle that does not depend on this crate being right about
+    // anything except the hash itself.
+    if !have_ffmpeg() {
+        eprintln!("skipping: ffmpeg not installed");
+        return;
+    }
+    let (_, coded) = encode(352, 288, 30);
+    let path = write_au("hash-352x288", &coded);
+    let output = Command::new("ffmpeg")
+        .args(["-v", "debug", "-err_detect", "crccheck", "-y", "-i"])
+        .arg(&path)
+        .args(["-f", "null", "-"])
+        .output()
+        .expect("run ffmpeg");
+    let log = String::from_utf8_lossy(&output.stderr).to_string();
+    let checks: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("Verifying checksum"))
+        .collect();
+    assert!(!checks.is_empty(), "ffmpeg checked no picture hash: {log}");
+    for line in checks {
+        assert_eq!(line.matches("correct").count(), 3, "hash mismatch: {line}");
+    }
+}
+
+#[test]
 fn vaapi_hardware_decodes_the_stream() {
     // The other half of "it decodes": a GPU decoder is a different
     // implementation with different tolerances, and it is what edith's HEVC
