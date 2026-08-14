@@ -42,8 +42,8 @@ use crate::entropy::{
 };
 use crate::inter::{RefPlane, Weights, combine, mc_chroma, mc_luma};
 use crate::mv::{
-    B_SHAPES, B_SUB, MbShape, MvCtx, P_SHAPES, P_SUB, Pred, SubShape, min_positive,
-    neighbour_mvd, predict_mv, ref_idx_cond, write_block, write_intra_mb, write_mvd,
+    B_SHAPES, B_SUB, MbShape, MvCtx, P_SHAPES, P_SUB, Pred, SubShape, min_positive, neighbour_mvd,
+    predict_mv, ref_idx_cond, write_block, write_intra_mb, write_mvd,
 };
 use crate::pred::{Nbr4, PlaneWindow, add_residual_4x4, pred_4x4, pred_16x16, pred_chroma_8x8};
 use crate::tables::{BLK4_POS, CHROMA_QP};
@@ -51,18 +51,6 @@ use crate::transform::{
     LevelScale4x4, chroma_dc_transform_420, dequant_4x4, inverse_transform_4x4, luma_dc_transform,
     unzigzag, unzigzag_ac15,
 };
-
-/// Debug tracing gates, resolved once: reading the environment per macroblock
-/// would allocate, which the zero-allocation test would (rightly) catch.
-fn trace_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("EC_H264_TRACE").is_some())
-}
-
-fn no_deblock() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("EC_H264_NO_DEBLOCK").is_some())
-}
 
 /// Where a 4x4 block's top-right neighbour samples come from, per
 /// luma4x4BlkIdx (derivation of 6.4.12 + the 8.3.1.2 blkIdx 3/11 rule).
@@ -471,7 +459,7 @@ impl Decoder {
         let lists = if sh.slice_type.is_intra() {
             [RefList::default(), RefList::default()]
         } else {
-            self.dpb.number_short_term(sh.frame_num, &sps);
+            self.dpb.number_short_term(sh.frame_num, sps);
             self.dpb.build_ref_lists(
                 sh.slice_type,
                 self.cur.poc,
@@ -515,25 +503,6 @@ impl Decoder {
             weights: sh.pred_weight_table.clone(),
             poc: self.cur.poc,
         };
-        if trace_enabled() {
-            eprintln!(
-                "SLICE type {:?} qp {} cabac_init_idc {} l0 {} l1 {} first_mb {first_mb} \
-                 header_bits {} bytes {:02x?}",
-                sh.slice_type, sh.slice_qp, sh.cabac_init_idc, sh.num_ref_idx_l0_active,
-                sh.num_ref_idx_l1_active, sh.header_bits, &rbsp[..rbsp.len().min(6)]
-            );
-        }
-        if trace_enabled() && !sh.slice_type.is_intra() {
-            for x in 0..2 {
-                let l: Vec<(u32, i32)> = (0..lists[x].len())
-                    .filter_map(|i| lists[x].get(i))
-                    .map(|k| (self.dpb.frames[k].frame_num, self.dpb.frames[k].poc))
-                    .collect();
-                if !l.is_empty() {
-                    eprintln!("  RefPicList{x} (frame_num, poc): {l:?}");
-                }
-            }
-        }
         let intra_slice = sh.slice_type.is_intra();
         let b_slice = sh.slice_type == SliceType::B;
         if !intra_slice && ctx.lists[0].len() == 0 {
@@ -635,9 +604,8 @@ impl Decoder {
         let mb_x = mb_addr % pic.mb_w;
         let mb_y = mb_addr / pic.mb_w;
         let nbr = mb_neighbors(pic, mb_x, mb_y, ctx.slice_id);
-        let cond = |avail: bool, addr: usize| {
-            usize::from(avail && pic.mb_flags[addr] & FLAG_SKIP == 0)
-        };
+        let cond =
+            |avail: bool, addr: usize| usize::from(avail && pic.mb_flags[addr] & FLAG_SKIP == 0);
         cond(nbr.a, mb_addr.wrapping_sub(1)) + cond(nbr.b, mb_addr.wrapping_sub(pic.mb_w))
     }
 
@@ -832,13 +800,11 @@ impl SliceCtx {
         use1: bool,
     ) -> Weights {
         let implicit = self.weighted_bipred_idc == 2 && self.is_b() && use0 && use1;
-        let explicit = (self.weighted_bipred_idc == 1 && self.is_b())
-            || (self.weighted_pred && !self.is_b());
+        let explicit =
+            (self.weighted_bipred_idc == 1 && self.is_b()) || (self.weighted_pred && !self.is_b());
         if implicit {
-            let (Some(p0), Some(p1)) = (
-                self.reference(refs, 0, r0),
-                self.reference(refs, 1, r1),
-            ) else {
+            let (Some(p0), Some(p1)) = (self.reference(refs, 0, r0), self.reference(refs, 1, r1))
+            else {
                 return Weights::DEFAULT;
             };
             let td = (p1.poc - p0.poc).clamp(-128, 127);
@@ -1056,17 +1022,8 @@ fn decode_macroblock(
         (None, Some(mb_type))
     };
     r.set_intra(intra_type.is_some());
-    if trace_enabled() {
-        eprintln!(
-            "MB {mb_addr} ({mb_x},{mb_y}) type {} skipped {skipped} qp {}",
-            mb_type as i64, ctx.qp
-        );
-    }
-
     if let Some(shape) = shape {
-        return decode_inter_mb(
-            pic, refs, ls, r, ctx, mb_addr, shape, skipped, mb_type, nbr,
-        );
+        return decode_inter_mb(pic, refs, ls, r, ctx, mb_addr, shape, skipped, mb_type, nbr);
     }
     let mb_type = intra_type.expect("an intra macroblock type");
     write_intra_mb(pic, mb_x, mb_y);
@@ -1424,7 +1381,9 @@ fn finish_macroblock(
 /// Decode an inter macroblock: sub-macroblock types, reference indices and
 /// motion vector differences (7.3.5.1, 7.3.5.2), then motion compensation
 /// (8.4.2) and the shared residual path.
-#[allow(clippy::too_many_arguments)]
+// `comp` indexes a motion vector component and selects its context offset at
+// the same time, which an iterator would obscure.
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 fn decode_inter_mb(
     pic: &mut Picture,
     refs: &[Picture],
@@ -1468,9 +1427,6 @@ fn decode_inter_mb(
     if shape.sub && !skipped {
         for part in 0..4 {
             let t = r.sub_mb_type(b)? as usize;
-            if trace_enabled() {
-                eprintln!("  sub_mb_type[{part}] = {t}");
-            }
             motion.sub[part] = if b { B_SUB[t] } else { P_SUB[t] };
             if motion.sub[part].pred == Pred::Direct {
                 for k in 0..4 {
@@ -1504,11 +1460,7 @@ fn decode_inter_mb(
                     let by = (mb_y * 4 + py) as i32;
                     let inc = ref_idx_cond(pic, &mvc, bx - 1, by, list)
                         + 2 * ref_idx_cond(pic, &mvc, bx, by - 1, list);
-                    let v = r.ref_idx(ctx.num_ref_idx[list] as u32 - 1, inc)? as i8;
-                    if trace_enabled() {
-                        eprintln!("  ref_idx part {part} list {list} inc {inc} = {v}");
-                    }
-                    v
+                    r.ref_idx(ctx.num_ref_idx[list] as u32 - 1, inc)? as i8
                 };
                 motion.ref_idx[list][part] = idx;
                 // Publish it over the whole macroblock partition — one
@@ -1563,12 +1515,6 @@ fn decode_inter_mb(
                             0
                         };
                         let v = r.mvd(comp, inc)?;
-                        if trace_enabled() {
-                            eprintln!(
-                                "  mvd part {part} sp {sp} at ({px},{py}) list {list} comp {comp} \
-                                 absA {a} absB {bb} inc {inc} = {v}"
-                            );
-                        }
                         mvd[comp] = i16::try_from(v)
                             .map_err(|_| Error::corrupt("mvd outside the level limits"))?;
                     }
@@ -1618,25 +1564,10 @@ fn decode_inter_mb(
                     // partition width inside an 8x8.
                     let n = mvc.neighbours(pic, px, py, pw, list);
                     let mvp = predict_mv(&n, idx, shape.w, shape.h, part);
-                    if trace_enabled() {
-                        eprintln!(
-                            "    nb A {:?} B {:?} C {:?} shape {}x{} part {part} mvp {mvp:?} written {:#06x}",
-                            n[0], n[1], n[2], shape.w, shape.h, mvc.written
-                        );
-                    }
                     let d = motion.mvd[list][py * 4 + px];
                     mv[list] = [mvp[0].wrapping_add(d[0]), mvp[1].wrapping_add(d[1])];
                     ref_idx[list] = idx;
-                    ref_id[list] = ctx
-                        .reference(refs, list, idx)
-                        .map(|p| p.id)
-                        .unwrap_or(-1);
-                }
-                if trace_enabled() {
-                    eprintln!(
-                        "  MV part {part} sp {sp} at ({px},{py}) {pw}x{ph} mv {:?} ref {:?}",
-                        mv[0], ref_idx
-                    );
+                    ref_id[list] = ctx.reference(refs, list, idx).map(|p| p.id).unwrap_or(-1);
                 }
                 for dy in 0..ph {
                     for dx in 0..pw {
@@ -1680,9 +1611,6 @@ fn decode_inter_mb(
         pic.i4_modes[base..base + 4].fill(2);
     }
     let (cbp_luma, cbp_chroma) = r.coded_block_pattern_inter()?;
-    if trace_enabled() {
-        eprintln!("  cbp {cbp_luma:#x}/{cbp_chroma}");
-    }
     // The inter scaling lists (Table 7-2 lists 3..5) govern an inter residual.
     finish_macroblock(
         pic,
@@ -1737,7 +1665,11 @@ fn sp_offset(shape: &MbShape, m: &MbMotion, part: usize, sp: usize) -> (usize, u
 /// Size of one *macroblock* partition in 4x4 blocks: always 8x8 for a
 /// macroblock that carries sub-macroblock types, however those split it.
 fn mb_part_size(shape: &MbShape) -> (usize, usize) {
-    if shape.sub { (2, 2) } else { (shape.w, shape.h) }
+    if shape.sub {
+        (2, 2)
+    } else {
+        (shape.w, shape.h)
+    }
 }
 
 /// Size of one (sub-)macroblock partition in 4x4 blocks.
@@ -1860,8 +1792,9 @@ fn direct_quadrant(
     }
 }
 
-/// Motion of one direct-mode 4x4 block: spatial (8.4.1.2.2) or temporal
-/// (8.4.1.2.3).
+/// Motion of one direct-mode 4x4 block: `(mvLX, refIdxLX, reference picture
+/// identity)`, spatial (8.4.1.2.2) or temporal (8.4.1.2.3).
+#[allow(clippy::type_complexity)]
 fn direct_block(
     pic: &Picture,
     refs: &[Picture],
@@ -1965,8 +1898,7 @@ fn direct_block(
 /// picture the co-located block referenced.
 fn map_col_to_list0(ctx: &SliceCtx, refs: &[Picture], col_ref_id: i32) -> i8 {
     for i in 0..ctx.lists[0].len() {
-        if ctx
-            .lists[0]
+        if ctx.lists[0]
             .get(i)
             .and_then(|k| refs.get(k))
             .is_some_and(|p| p.id == col_ref_id)
@@ -2111,10 +2043,11 @@ fn gather_nbr4(pic: &Picture, nbr: &MbNeighbors, blk: usize, x: usize, y: usize)
 
 /// Whole-picture deblocking (spec 8.7): macroblocks in raster order, all
 /// vertical edges then all horizontal edges per macroblock, then chroma.
+// `e` and `j` are edge and segment positions inside the macroblock, used to
+// index the plane as well as the strength arrays; iterating the arrays would
+// hide which geometry each one names.
+#[allow(clippy::needless_range_loop)]
 fn deblock_picture(pic: &mut Picture) {
-    if no_deblock() {
-        return;
-    }
     let mb_w = pic.mb_w;
     for mb_y in 0..pic.mb_h {
         for mb_x in 0..mb_w {
@@ -2208,7 +2141,12 @@ fn deblock_picture(pic: &mut Picture) {
                         }
                         // Eight rows around the edge are contiguous, so the
                         // whole 16-sample edge filters in one pass.
-                        filter_luma_h_edge16(&mut pic.y.data, base + e * 4 * stride, stride, &params);
+                        filter_luma_h_edge16(
+                            &mut pic.y.data,
+                            base + e * 4 * stride,
+                            stride,
+                            &params,
+                        );
                         continue;
                     }
                     for j in 0..4 {

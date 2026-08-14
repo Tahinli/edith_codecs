@@ -1,6 +1,6 @@
 [package]
 name = "ec-h264"
-description = "H.264 software decoder (CAVLC intra loop, growing toward full)"
+description = "H.264 software decoder: I, P and B slices, CAVLC and CABAC, 8-bit 4:2:0 progressive, display-order output"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

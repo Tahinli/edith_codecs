@@ -216,7 +216,14 @@ impl MvCtx {
     /// Neighbours A, B and C of a partition whose top-left 4x4 block is at
     /// macroblock-relative `(px, py)` and whose `predPartWidth` is `pw` blocks
     /// (clause 6.4.11.7, with the C-to-D substitution of 8-214).
-    pub(crate) fn neighbours(&self, pic: &Picture, px: usize, py: usize, pw: usize, list: usize) -> [Nb; 3] {
+    pub(crate) fn neighbours(
+        &self,
+        pic: &Picture,
+        px: usize,
+        py: usize,
+        pw: usize,
+        list: usize,
+    ) -> [Nb; 3] {
         let bx = (self.mb_x * 4 + px) as i32;
         let by = (self.mb_y * 4 + py) as i32;
         let a = self.at(pic, bx - 1, by, list);
@@ -239,7 +246,13 @@ fn median(a: i16, b: i16, c: i16) -> i16 {
 ///
 /// `part_w`/`part_h` are `MbPartWidth`/`MbPartHeight` in 4x4 blocks and only
 /// select those shortcuts; `part` is the macroblock partition index.
-pub(crate) fn predict_mv(n: &[Nb; 3], ref_idx: i8, part_w: usize, part_h: usize, part: usize) -> [i16; 2] {
+pub(crate) fn predict_mv(
+    n: &[Nb; 3],
+    ref_idx: i8,
+    part_w: usize,
+    part_h: usize,
+    part: usize,
+) -> [i16; 2] {
     let [a, mut b, mut c] = *n;
     match (part_w, part_h, part) {
         (4, 2, 0) if b.ref_idx == ref_idx => return b.mv,
@@ -318,7 +331,15 @@ pub(crate) fn write_intra_mb(pic: &mut Picture, mb_x: usize, mb_y: usize) {
 /// Record `Abs( mvd )` for one 4x4 block, saturated at the largest value the
 /// context thresholds of 9.3.3.1.1.7 can distinguish.
 #[inline]
-pub(crate) fn write_mvd(pic: &mut Picture, mb_x: usize, mb_y: usize, px: usize, py: usize, list: usize, mvd: [i16; 2]) {
+pub(crate) fn write_mvd(
+    pic: &mut Picture,
+    mb_x: usize,
+    mb_y: usize,
+    px: usize,
+    py: usize,
+    list: usize,
+    mvd: [i16; 2],
+) {
     let idx = (mb_y * 4 + py) * pic.mb_w * 4 + mb_x * 4 + px;
     let e = &mut pic.mvd_abs[idx];
     e[list * 2] = mvd[0].unsigned_abs().min(127) as u8;
@@ -379,11 +400,7 @@ mod tests {
     use super::*;
 
     fn nb(avail: bool, mv: [i16; 2], ref_idx: i8) -> Nb {
-        Nb {
-            avail,
-            mv,
-            ref_idx,
-        }
+        Nb { avail, mv, ref_idx }
     }
 
     /// With exactly one neighbour on the same reference picture, that
@@ -413,7 +430,11 @@ mod tests {
     /// median into A (8-207 to 8-210).
     #[test]
     fn unavailable_b_and_c_fall_back_to_a() {
-        let n = [nb(true, [6, -6], 3), nb(false, [0, 0], -1), nb(false, [0, 0], -1)];
+        let n = [
+            nb(true, [6, -6], 3),
+            nb(false, [0, 0], -1),
+            nb(false, [0, 0], -1),
+        ];
         assert_eq!(predict_mv(&n, 0, 4, 4, 0), [6, -6]);
         // With refIdx 3 the single-match rule fires first, same answer.
         assert_eq!(predict_mv(&n, 3, 4, 4, 0), [6, -6]);
@@ -449,6 +470,7 @@ mod tests {
         assert_eq!(B_SHAPES[0].pred[0], Pred::Direct);
         assert_eq!((B_SHAPES[3].parts, B_SHAPES[3].pred[0]), (1, Pred::Bi));
         // The 16x8 / 8x16 pairs alternate, starting at mb_type 4.
+        #[allow(clippy::needless_range_loop)]
         for t in 4..22 {
             let s = B_SHAPES[t];
             assert_eq!(s.parts, 2, "mb_type {t}");
