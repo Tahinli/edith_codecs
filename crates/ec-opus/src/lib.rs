@@ -27,22 +27,56 @@
 //!   a container, never a gap, so the concealment would be dead weight; a
 //!   caller that needs it (an RTP receiver) has to add it.
 //!
-//! No unsafe, no allocation on the per-frame path beyond the decoder's own
+//! The crate also carries the family's Opus *encoder* — [`Encoder`] for one
+//! stream, [`MultistreamEncoder`] for surround — CELT-only, fullband, mono
+//! and stereo, every rate from 16 to 510 kbps, CBR and constrained VBR.
+//!
+//! **Why the incumbent encoder collapsed above ~128-165 kbps** (the measured
+//! record this crate replaces; edith `engine/Cargo.toml:124-140` and
+//! `export.rs:1834`): its packets above that rate were decodable only by its
+//! *own* decoder — correlation 0.06 against libopus at 256 kbps while its
+//! internal round trip read 0.999 — and the rate the cliff sat at moved with
+//! the content. That signature — self-consistent, world-divergent, at a
+//! *bits-per-band* threshold — is a shared encode/decode convention error in
+//! exactly the code CELT only exercises when a band's budget is large: the
+//! over-32-bit-codeword band split (RFC 6716 Section 4.3.4.1: a band whose bit
+//! demand exceeds its cache row is halved recursively, with an entropy-coded
+//! angle and a rebalance of the leftover bits). An encoder whose split
+//! bookkeeping (`tell`-derived budgets, rebalance, theta pdf selection)
+//! drifts one bit from the normative derivation still decodes its own output
+//! — both halves share the drift — but a conformant decoder desynchronises,
+//! and the threshold moves with content because the split only triggers on
+//! loud, flat bands. Content-dependence is also why mono broke at *every*
+//! rate: half the coefficients means every band hits the split threshold at
+//! half the bitrate. This encoder mirrors the reference's allocation
+//! arithmetic symbol for symbol, and the tests hold the closed loop to it:
+//! every packet is range-state-exact against this crate's own
+//! RFC-vector-verified decoder, and libopus (via ffmpeg) plus the reference
+//! `opus_demo` decoder read the same packets at correlation >= 0.99 across
+//! the whole rate table, mono, stereo and 5.1 alike.
+//!
+//! No unsafe, no allocation on the per-frame path beyond the codecs' own
 //! buffers, no dependencies outside the family.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod celt;
+pub mod celt_enc;
+pub mod encoder;
 pub mod multistream;
+pub mod multistream_enc;
 pub mod packet;
 pub mod range;
 pub mod silk;
 
 pub use celt::CeltDecoder;
+pub use celt_enc::CeltEncoder;
+pub use encoder::Encoder;
 pub use multistream::MultistreamDecoder;
+pub use multistream_enc::MultistreamEncoder;
 pub use packet::{Bandwidth, Mode, Packet, Toc};
-pub use range::RangeDecoder;
+pub use range::{RangeDecoder, RangeEncoder};
 pub use silk::SilkDecoder;
 
 use ec_core::{Error, Result};
