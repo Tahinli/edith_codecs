@@ -441,6 +441,15 @@ impl<R: Read + Seek> Mp4Demuxer<R> {
                     start_time: None,
                     duration: (duration > 0).then_some(duration as i64),
                     language,
+                    // ISO-BMFF has no "play this one" flag: `tkhd` says whether
+                    // a track is enabled, not which of two languages was meant,
+                    // so file order is the whole answer here.
+                    default: false,
+                    // An mp4 states its encoder delay in the edit list, which is
+                    // read above as a pure shift of the whole track rather than
+                    // a trim: no sample is dropped, so none is announced as
+                    // padding either.
+                    initial_padding: 0,
                 });
                 Some(index)
             }

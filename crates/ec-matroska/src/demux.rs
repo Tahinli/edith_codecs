@@ -674,6 +674,13 @@ impl<R: Read + Seek> MatroskaDemuxer<R> {
     /// Where to start scanning for `target` on `track`: the last indexed
     /// cluster at or before it, and the first cluster of the file when nothing
     /// is indexed at all.
+    ///
+    /// A target *before* everything indexed starts at the first cluster and not
+    /// at the first index entry, because an index is allowed to begin late: our
+    /// own muxer cues the second cluster of an export first, and starting there
+    /// for a seek to zero swallowed the file's opening block whole -- 20 ms of
+    /// an Opus export, and 167 ms of a film whose clusters are a second each.
+    /// The first cluster is at or before every target there is.
     fn candidate(&self, track: u64, target: i64) -> u64 {
         // A cue naming this track is worth more than one naming another: only
         // the track's own cues promise a keyframe at that instant.
@@ -681,13 +688,18 @@ impl<R: Read + Seek> MatroskaDemuxer<R> {
         if !own.is_empty() {
             return match own.iter().rposition(|c| c.time <= target) {
                 Some(i) => own[i].cluster,
-                None => own[0].cluster,
+                None => self.first_cluster,
             };
         }
         if !self.cues.is_empty() {
+            // Another track's cue names the cluster *its* keyframe is in, which
+            // at the same instant can start later than ours does: an export
+            // whose first audio block sits in a cluster of its own has the
+            // video's `time: 0` cue pointing past it, and starting there loses
+            // that block. One entry further back is at or before our own packet.
             return match self.cues.iter().rposition(|c| c.time <= target) {
-                Some(i) => self.cues[i].cluster,
-                None => self.cues[0].cluster,
+                Some(i) if i > 0 => self.cues[i - 1].cluster,
+                _ => self.first_cluster,
             };
         }
         match self.clusters.iter().rposition(|(ts, _)| *ts <= target) {
@@ -1089,6 +1101,10 @@ fn parse_tracks(
         let (mut language, mut bcp47, mut private) = (String::new(), String::new(), None);
         let mut name = String::new();
         let (mut default_duration, mut unpack) = (None, Unpack::None);
+        // `FlagDefault`, and only where the file really wrote it: the element's
+        // absent value is 1, so every track of a file that states none would
+        // otherwise claim to be the default and none of them would mean it.
+        let mut flag_default = false;
         let (mut width, mut height, mut color) = (0u32, 0u32, ColorInfo::default());
         // The `Range` element's own code -- 0 for an element that never stated
         // one, which is not the same claim as "limited" and must not become it.
@@ -1111,6 +1127,7 @@ fn parse_tracks(
                 ebml::DEFAULT_DURATION => {
                     default_duration = Some(ebml::uint_of(&buf[child])).filter(|d| *d > 0)
                 }
+                ebml::FLAG_DEFAULT => flag_default = ebml::uint_of(&buf[child]) != 0,
                 ebml::CONTENT_ENCODINGS => unpack = content_encoding(buf, child),
                 ebml::VIDEO => {
                     let start = child.start;
@@ -1207,6 +1224,7 @@ fn parse_tracks(
                 info.duration = duration;
                 info.start_time = Some(0);
                 info.language = Some(language_of(&language, &bcp47));
+                info.default = flag_default;
                 streams.push(info);
                 Some(index)
             }

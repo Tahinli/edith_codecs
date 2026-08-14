@@ -35,6 +35,7 @@ impl ProbeReader {
                 time_base: Some(TimeBase::from(s.time_base)),
                 num_frames: s.duration.map(|d| d.max(0) as u64),
                 start_ts: s.start_time.unwrap_or(0).max(0) as u64,
+                delay: Some(u64::from(s.initial_padding)).filter(|d| *d > 0),
                 codec_params: Some(from_ec_parameters(&s.params)),
                 language: s.language.clone(),
             })
@@ -62,7 +63,16 @@ impl FormatReader for ProbeReader {
     }
 
     fn default_track(&self, kind: TrackType) -> Option<&Track> {
-        self.tracks.iter().find(|t| t.track_type == kind)
+        // The container's flagged track, not merely the first one of its kind:
+        // a dual-audio remux that marked its second track default opens in that
+        // language, which is what a caller asking for "the audio" means by it.
+        let media = match kind {
+            TrackType::Audio => MediaType::Audio,
+            TrackType::Video => MediaType::Video,
+            TrackType::Subtitle => MediaType::Subtitle,
+        };
+        let index = self.inner.default_stream(media)?.index;
+        self.tracks.get(index as usize)
     }
 
     fn seek(&mut self, mode: SeekMode, to: SeekTo) -> Result<SeekedTo> {

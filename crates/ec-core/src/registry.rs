@@ -239,10 +239,30 @@ pub struct StreamInfo {
     pub duration: Option<i64>,
     /// ISO 639-2 language tag, when the container carries one.
     pub language: Option<String>,
+    /// Samples the decoder emits before the first audible one: an MP3's LAME
+    /// encoder delay, an Opus stream's pre-skip. Zero where a stream has none.
+    ///
+    /// It is *not* subtracted from [`duration`](Self::duration), because a
+    /// caller counting decoded samples has to count these too before it can
+    /// drop them -- audible length is `duration - initial_padding`. Trailing
+    /// padding is not reported separately: `duration` already ends at the last
+    /// audible sample.
+    pub initial_padding: u32,
+    /// The container **explicitly** marked this stream as the one to play --
+    /// Matroska's `FlagDefault`, which is what names the language a dual-audio
+    /// remux opens in.
+    ///
+    /// Explicitly is the whole of it: `FlagDefault` is 1 when the element is
+    /// absent, so "flagged" and "eligible" are different questions and only the
+    /// first one picks a track. A file where nobody wrote the element has no
+    /// flagged stream at all, and its first stream of a kind is its default
+    /// ([`crate::registry`] callers, `ec_probe::Reader::default_stream`).
+    pub default: bool,
 }
 
 impl StreamInfo {
-    /// A stream with no timing hints and no language.
+    /// A stream with no timing hints, no language, no padding and no default
+    /// flag.
     pub fn new(index: u32, time_base: TimeBase, params: CodecParameters) -> StreamInfo {
         StreamInfo {
             index,
@@ -251,6 +271,8 @@ impl StreamInfo {
             start_time: None,
             duration: None,
             language: None,
+            initial_padding: 0,
+            default: false,
         }
     }
 }

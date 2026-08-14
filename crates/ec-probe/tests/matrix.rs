@@ -307,3 +307,69 @@ fn a_mislabelled_file_opens_as_what_it_is() {
     assert_eq!(reader.format(), Format::Flac);
     std::fs::remove_file(&liar).ok();
 }
+
+/// The head of a file, where two things are exact rather than approximate:
+/// what a gapless MP3's audible length is, and where a seek to zero lands.
+///
+/// Both were wrong at once. The LAME tag's encoder delay and padding went
+/// unread, so an `.mp3` claimed the silence around its sound as part of it and
+/// played 25 ms late against a `.flac` of the same tone; and a seek to zero
+/// started at the first *cue*, which in a file whose cues name only the video
+/// track sits past the first audio block — 20 ms of an export, a cluster of a
+/// film, gone from the start of every playback that seeked to the beginning.
+#[test]
+fn the_head_of_a_file_is_exact() {
+    let mut checked = 0;
+    for &(name, _, codec) in MATRIX {
+        let path = fixtures().join(name);
+        if !path.exists() {
+            continue;
+        }
+        let mut reader = Reader::open(&path).expect("open");
+        let audio = reader
+            .default_stream(MediaType::Audio)
+            .expect("audio")
+            .clone();
+        // Gapless: what the file states it holds, less the silence it states it
+        // padded with, is exactly what ffmpeg decodes out of it.
+        if codec == "mp3" {
+            let padding = u64::from(audio.initial_padding);
+            assert!(
+                padding > 0,
+                "{name}: no encoder delay read out of the LAME tag"
+            );
+            let stated = audio.duration.expect("an mp3 states its length") as u64;
+            let channels = audio.params.audio().unwrap().layout.channel_count();
+            assert_eq!(
+                stated - padding,
+                ffmpeg_frames(&path, channels),
+                "{name}: audible frames"
+            );
+        }
+        // A seek to the beginning lands on the file's own first packet, never
+        // past it. Asked for by that packet's own timestamp rather than by
+        // zero, because an mp4's first AAC packet is at -1024: its priming.
+        let first = loop {
+            let packet = reader.next_packet().expect("a first packet");
+            if packet.stream == audio.index {
+                break packet.pts.unwrap_or(0);
+            }
+        };
+        let landed = reader
+            .seek(
+                audio.index,
+                Timestamp::new(first, audio.time_base),
+                SeekMode::SyncBefore,
+            )
+            .unwrap_or_else(|e| panic!("{name}: seek to the beginning: {e}"));
+        assert_eq!(
+            landed.ticks, first,
+            "{name}: a seek to the beginning landed past the first packet"
+        );
+        checked += 1;
+    }
+    assert!(
+        checked > 0,
+        "no fixtures found — run scripts/gen-fixtures.sh"
+    );
+}
