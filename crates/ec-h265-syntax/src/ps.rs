@@ -312,10 +312,16 @@ pub struct Sps {
     pub pcm: Option<(u32, u32, u32, u32, bool)>,
     /// `num_short_term_ref_pic_sets`.
     pub num_short_term_ref_pic_sets: u32,
+    /// The sets themselves, in bitstream order: a slice header may name one by
+    /// index instead of carrying it, and a decoder then needs it from here.
+    pub short_term_ref_pic_sets: Vec<ShortTermRefPicSet>,
     /// `long_term_ref_pics_present_flag`.
     pub long_term_ref_pics_present: bool,
     /// `num_long_term_ref_pics_sps`.
     pub num_long_term_ref_pics_sps: u32,
+    /// `(lt_ref_pic_poc_lsb_sps, used_by_curr_pic_lt_sps_flag)` per SPS long
+    /// term picture, which a slice header names by index.
+    pub long_term_ref_pics_sps: Vec<(u32, bool)>,
     /// `sps_temporal_mvp_enabled_flag`.
     pub temporal_mvp_enabled: bool,
     /// `strong_intra_smoothing_enabled_flag`.
@@ -417,9 +423,16 @@ impl Sps {
             w.write_bit(filter_off);
         }
         w.write_ue(self.num_short_term_ref_pic_sets);
+        for (i, set) in self.short_term_ref_pic_sets.iter().enumerate() {
+            set.write(&mut w, i as u32);
+        }
         w.write_bit(self.long_term_ref_pics_present);
         if self.long_term_ref_pics_present {
             w.write_ue(self.num_long_term_ref_pics_sps);
+            for &(poc_lsb_lt, used_by_curr) in &self.long_term_ref_pics_sps {
+                w.write_bits(poc_lsb_lt, self.log2_max_poc_lsb_minus4 + 4);
+                w.write_bit(used_by_curr);
+            }
         }
         w.write_bit(self.temporal_mvp_enabled);
         w.write_bit(self.strong_intra_smoothing);
@@ -546,6 +559,7 @@ impl Sps {
         }
         let long_term_ref_pics_present = r.read_bit()?;
         let mut num_long_term_ref_pics_sps = 0;
+        let mut long_term_ref_pics_sps = Vec::new();
         if long_term_ref_pics_present {
             num_long_term_ref_pics_sps = r.read_ue()?;
             if num_long_term_ref_pics_sps > 32 {
@@ -554,8 +568,9 @@ impl Sps {
                 )));
             }
             for _ in 0..num_long_term_ref_pics_sps {
-                r.read_bits(log2_max_poc_lsb_minus4 + 4)?;
-                r.read_bit()?;
+                let poc_lsb_lt = r.read_bits(log2_max_poc_lsb_minus4 + 4)?;
+                let used_by_curr = r.read_bit()?;
+                long_term_ref_pics_sps.push((poc_lsb_lt, used_by_curr));
             }
         }
         let temporal_mvp_enabled = r.read_bit()?;
@@ -590,8 +605,10 @@ impl Sps {
             pcm_enabled,
             pcm,
             num_short_term_ref_pic_sets,
+            short_term_ref_pic_sets: sets,
             long_term_ref_pics_present,
             num_long_term_ref_pics_sps,
+            long_term_ref_pics_sps,
             temporal_mvp_enabled,
             strong_intra_smoothing,
             ptl,
@@ -600,12 +617,18 @@ impl Sps {
     }
 }
 
-/// One `st_ref_pic_set()` (7.3.7), kept only as far as re-parsing needs.
+/// Largest `st_ref_pic_set()` this crate carries in either direction; the spec
+/// caps `NumNegativePics` and `NumPositivePics` at `sps_max_dec_pic_buffering`,
+/// which itself cannot exceed 16.
+pub const MAX_ST_REF_PICS: usize = 16;
+
+/// One `st_ref_pic_set()` (7.3.7), with the POC deltas a decoder needs.
 ///
-/// The delta values themselves are a decoder's reference-list problem; what a
-/// *parser* has to get right is the number of pictures in each direction,
-/// because the next set's syntax depends on it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// A *stateless hardware* decoder is the reason the deltas are here: the driver
+/// is handed `RefPicSetStCurrBefore` / `StCurrAfter` as picture lists, so
+/// something has to turn `delta_poc_sX_minus1` into actual reference pictures,
+/// and that something is the caller of this crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ShortTermRefPicSet {
     /// `NumNegativePics`.
     pub num_negative: u32,
@@ -614,6 +637,28 @@ pub struct ShortTermRefPicSet {
     /// How many of them have `used_by_curr_pic` set — the count that feeds
     /// `NumPicTotalCurr`, which sizes the reference list modification syntax.
     pub num_used_by_curr: u32,
+    /// `DeltaPocS0[i]`, negative, in decreasing order (7-59).
+    pub delta_poc_s0: [i32; MAX_ST_REF_PICS],
+    /// `UsedByCurrPicS0[i]`.
+    pub used_s0: [bool; MAX_ST_REF_PICS],
+    /// `DeltaPocS1[i]`, positive, in increasing order (7-60).
+    pub delta_poc_s1: [i32; MAX_ST_REF_PICS],
+    /// `UsedByCurrPicS1[i]`.
+    pub used_s1: [bool; MAX_ST_REF_PICS],
+}
+
+impl Default for ShortTermRefPicSet {
+    fn default() -> ShortTermRefPicSet {
+        ShortTermRefPicSet {
+            num_negative: 0,
+            num_positive: 0,
+            num_used_by_curr: 0,
+            delta_poc_s0: [0; MAX_ST_REF_PICS],
+            used_s0: [false; MAX_ST_REF_PICS],
+            delta_poc_s1: [0; MAX_ST_REF_PICS],
+            used_s1: [false; MAX_ST_REF_PICS],
+        }
+    }
 }
 
 impl ShortTermRefPicSet {
@@ -636,46 +681,153 @@ impl ShortTermRefPicSet {
             let reference = *prev
                 .get(ref_idx as usize)
                 .ok_or_else(|| Error::corrupt("HEVC st_ref_pic_set: unknown reference set"))?;
-            r.read_bit()?; // delta_rps_sign
-            r.read_ue()?; // abs_delta_rps_minus1
-            let num_delta_pocs = reference.num_negative + reference.num_positive;
-            let mut kept = 0;
-            let mut used_by_curr = 0;
-            for _ in 0..=num_delta_pocs {
-                let used = r.read_bit()?;
-                if used {
-                    kept += 1;
-                    used_by_curr += 1;
-                } else if r.read_bit()? {
-                    kept += 1;
+            let delta_rps_sign = r.read_bit()?;
+            let abs_delta_rps_minus1 = r.read_ue()?;
+            let delta_rps = if delta_rps_sign {
+                -((abs_delta_rps_minus1 + 1) as i32)
+            } else {
+                (abs_delta_rps_minus1 + 1) as i32
+            };
+            let num_delta_pocs = (reference.num_negative + reference.num_positive) as usize;
+            if num_delta_pocs >= MAX_ST_REF_PICS * 2 {
+                return Err(Error::corrupt(
+                    "HEVC st_ref_pic_set: reference set too large",
+                ));
+            }
+            let mut used_by_curr = [false; MAX_ST_REF_PICS * 2 + 1];
+            let mut use_delta = [true; MAX_ST_REF_PICS * 2 + 1];
+            for j in 0..=num_delta_pocs {
+                used_by_curr[j] = r.read_bit()?;
+                if !used_by_curr[j] {
+                    use_delta[j] = r.read_bit()?;
                 }
             }
-            // Without reconstructing the POCs the split between negative and
-            // positive is not knowable; the total is, and that is what the
-            // syntax of any following set depends on.
-            Ok(ShortTermRefPicSet {
-                num_negative: kept,
-                num_positive: 0,
-                num_used_by_curr: used_by_curr,
-            })
+            Ok(reference.predict(delta_rps, &used_by_curr, &use_delta))
         } else {
             let num_negative = r.read_ue()?;
             let num_positive = r.read_ue()?;
-            if num_negative > 16 || num_positive > 16 {
+            if num_negative as usize > MAX_ST_REF_PICS || num_positive as usize > MAX_ST_REF_PICS {
                 return Err(Error::corrupt("HEVC st_ref_pic_set: too many pictures"));
             }
-            let mut num_used_by_curr = 0;
-            for _ in 0..num_negative + num_positive {
-                r.read_ue()?; // delta_poc_sX_minus1
-                if r.read_bit()? {
-                    num_used_by_curr += 1; // used_by_curr_pic_sX_flag
-                }
-            }
-            Ok(ShortTermRefPicSet {
+            let mut set = ShortTermRefPicSet {
                 num_negative,
                 num_positive,
-                num_used_by_curr,
-            })
+                ..ShortTermRefPicSet::default()
+            };
+            let mut poc = 0i32;
+            for i in 0..num_negative as usize {
+                let delta = r.read_ue()? as i32 + 1;
+                poc -= delta;
+                set.delta_poc_s0[i] = poc;
+                set.used_s0[i] = r.read_bit()?;
+                if set.used_s0[i] {
+                    set.num_used_by_curr += 1;
+                }
+            }
+            let mut poc = 0i32;
+            for i in 0..num_positive as usize {
+                let delta = r.read_ue()? as i32 + 1;
+                poc += delta;
+                set.delta_poc_s1[i] = poc;
+                set.used_s1[i] = r.read_bit()?;
+                if set.used_s1[i] {
+                    set.num_used_by_curr += 1;
+                }
+            }
+            Ok(set)
+        }
+    }
+
+    /// Derive a set predicted from this one (7-61, 7-62).
+    ///
+    /// The two loops per direction are the spec's, and their order is what puts
+    /// `DeltaPocS0` in decreasing and `DeltaPocS1` in increasing order without a
+    /// sort: entries derived from the *other* direction of the reference set
+    /// come first, then the reference picture itself, then the same direction.
+    fn predict(
+        &self,
+        delta_rps: i32,
+        used_by_curr: &[bool],
+        use_delta: &[bool],
+    ) -> ShortTermRefPicSet {
+        let mut out = ShortTermRefPicSet::default();
+        let neg = self.num_negative as usize;
+        let pos = self.num_positive as usize;
+        let num_delta_pocs = neg + pos;
+
+        let mut i = 0usize;
+        for j in (0..pos).rev() {
+            let d = self.delta_poc_s1[j] + delta_rps;
+            if d < 0 && use_delta[neg + j] && i < MAX_ST_REF_PICS {
+                out.delta_poc_s0[i] = d;
+                out.used_s0[i] = used_by_curr[neg + j];
+                i += 1;
+            }
+        }
+        if delta_rps < 0 && use_delta[num_delta_pocs] && i < MAX_ST_REF_PICS {
+            out.delta_poc_s0[i] = delta_rps;
+            out.used_s0[i] = used_by_curr[num_delta_pocs];
+            i += 1;
+        }
+        for j in 0..neg {
+            let d = self.delta_poc_s0[j] + delta_rps;
+            if d < 0 && use_delta[j] && i < MAX_ST_REF_PICS {
+                out.delta_poc_s0[i] = d;
+                out.used_s0[i] = used_by_curr[j];
+                i += 1;
+            }
+        }
+        out.num_negative = i as u32;
+
+        let mut i = 0usize;
+        for j in (0..neg).rev() {
+            let d = self.delta_poc_s0[j] + delta_rps;
+            if d > 0 && use_delta[j] && i < MAX_ST_REF_PICS {
+                out.delta_poc_s1[i] = d;
+                out.used_s1[i] = used_by_curr[j];
+                i += 1;
+            }
+        }
+        if delta_rps > 0 && use_delta[num_delta_pocs] && i < MAX_ST_REF_PICS {
+            out.delta_poc_s1[i] = delta_rps;
+            out.used_s1[i] = used_by_curr[num_delta_pocs];
+            i += 1;
+        }
+        for j in 0..pos {
+            let d = self.delta_poc_s1[j] + delta_rps;
+            if d > 0 && use_delta[neg + j] && i < MAX_ST_REF_PICS {
+                out.delta_poc_s1[i] = d;
+                out.used_s1[i] = used_by_curr[neg + j];
+                i += 1;
+            }
+        }
+        out.num_positive = i as u32;
+        out.num_used_by_curr = out.used_s0[..out.num_negative as usize]
+            .iter()
+            .chain(out.used_s1[..out.num_positive as usize].iter())
+            .filter(|&&u| u)
+            .count() as u32;
+        out
+    }
+
+    /// Write the set in its non-predicted form (7.3.7), which is always legal.
+    pub fn write(&self, w: &mut ec_core::BitWriter, idx: u32) {
+        if idx != 0 {
+            w.write_bit(false); // inter_ref_pic_set_prediction_flag
+        }
+        w.write_ue(self.num_negative);
+        w.write_ue(self.num_positive);
+        let mut prev = 0i32;
+        for i in 0..self.num_negative as usize {
+            w.write_ue((prev - self.delta_poc_s0[i] - 1).max(0) as u32);
+            prev = self.delta_poc_s0[i];
+            w.write_bit(self.used_s0[i]);
+        }
+        let mut prev = 0i32;
+        for i in 0..self.num_positive as usize {
+            w.write_ue((self.delta_poc_s1[i] - prev - 1).max(0) as u32);
+            prev = self.delta_poc_s1[i];
+            w.write_bit(self.used_s1[i]);
         }
     }
 }
@@ -988,8 +1140,10 @@ mod tests {
             pcm_enabled: false,
             pcm: None,
             num_short_term_ref_pic_sets: 0,
+            short_term_ref_pic_sets: Vec::new(),
             long_term_ref_pics_present: false,
             num_long_term_ref_pics_sps: 0,
+            long_term_ref_pics_sps: Vec::new(),
             temporal_mvp_enabled: false,
             strong_intra_smoothing: true,
             ptl: ProfileTierLevel::main(120),

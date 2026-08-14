@@ -37,6 +37,41 @@ impl SliceType {
     }
 }
 
+/// One long-term reference picture named by a slice header (7.3.6.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LongTermRef {
+    /// `PocLsbLt`: the low bits of the reference's picture order count.
+    pub poc_lsb_lt: u32,
+    /// `UsedByCurrPicLt`: whether the current picture may predict from it.
+    pub used_by_curr: bool,
+    /// `delta_poc_msb_present_flag`.
+    pub delta_poc_msb_present: bool,
+    /// `DeltaPocMsbCycleLt`, accumulated as equation 7-52 requires.
+    pub delta_poc_msb_cycle: u32,
+}
+
+/// One entry of a `pred_weight_table()` (7.3.6.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WeightEntry {
+    /// `(delta_luma_weight, luma_offset)`, absent when the flag was 0.
+    pub luma: Option<(i32, i32)>,
+    /// `(delta_chroma_weight, ChromaOffset)` per chroma component.
+    pub chroma: Option<[(i32, i32); 2]>,
+}
+
+/// A parsed `pred_weight_table()` (7.3.6.3).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PredWeightTable {
+    /// `luma_log2_weight_denom`.
+    pub luma_log2_weight_denom: u32,
+    /// `delta_chroma_log2_weight_denom`.
+    pub delta_chroma_log2_weight_denom: i32,
+    /// One entry per active list 0 reference.
+    pub l0: Vec<WeightEntry>,
+    /// One entry per active list 1 reference.
+    pub l1: Vec<WeightEntry>,
+}
+
 /// A slice segment header, as far as an intra encoder writes one and a
 /// stateless hardware decoder reads one.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,6 +131,22 @@ pub struct SliceHeader {
     pub loop_filter_across_slices_enabled: bool,
     /// Substream entry points: one per WPP CTB row (or tile) after the first.
     pub entry_point_offsets: Vec<u32>,
+    /// The short-term reference picture set in force, whether it came from the
+    /// SPS by index or was written out in this header.
+    ///
+    /// This and the three fields after it are what a *stateless hardware*
+    /// decoder needs and a software one derives on the fly: the driver is given
+    /// `RefPicSetStCurrBefore` / `StCurrAfter` / `LtCurr` as picture lists, so
+    /// the caller has to turn these deltas into reference pictures itself.
+    pub short_term_ref_pic_set: ShortTermRefPicSet,
+    /// True when the set above came from the SPS rather than this header.
+    pub short_term_ref_pic_set_sps_flag: bool,
+    /// The long-term reference pictures this slice names, in bitstream order.
+    pub long_term: Vec<LongTermRef>,
+    /// `list_entry_l0` / `list_entry_l1`; empty when the list is not modified.
+    pub list_entry: [Vec<u32>; 2],
+    /// `pred_weight_table()`, when the PPS turns weighted prediction on.
+    pub pred_weight_table: Option<PredWeightTable>,
 }
 
 impl SliceHeader {
@@ -129,6 +180,11 @@ impl SliceHeader {
             tc_offset_div2: 0,
             loop_filter_across_slices_enabled: pps.loop_filter_across_slices_enabled,
             entry_point_offsets: Vec::new(),
+            short_term_ref_pic_set: ShortTermRefPicSet::default(),
+            short_term_ref_pic_set_sps_flag: true,
+            long_term: Vec::new(),
+            list_entry: [Vec::new(), Vec::new()],
+            pred_weight_table: None,
         }
     }
 
@@ -138,6 +194,26 @@ impl SliceHeader {
     /// encoder codes its substreams first and builds the header afterwards —
     /// the offsets are not knowable any earlier.
     pub fn write(&self, w: &mut BitWriter, sps: &Sps, pps: &Pps, nal_type: NalUnitType) {
+        self.write_without_alignment(w, sps, pps, nal_type);
+        // byte_alignment(): a one bit then zeros.
+        w.write_bit(true);
+        w.align_to_byte();
+    }
+
+    /// The header without its closing `byte_alignment()`.
+    ///
+    /// A VA-API encoder wants exactly this: the driver is told how many bits of
+    /// header the application wrote and appends the alignment itself, so
+    /// including it here leaves the alignment bit sitting where the driver
+    /// expects slice data (measured on radeonsi: every P picture then decodes
+    /// as `alignment_bit_equal_to_one = 0`).
+    pub fn write_without_alignment(
+        &self,
+        w: &mut BitWriter,
+        sps: &Sps,
+        pps: &Pps,
+        nal_type: NalUnitType,
+    ) {
         w.write_bit(self.first_slice_segment_in_pic);
         if nal_type.is_irap() {
             w.write_bit(self.no_output_of_prior_pics);
@@ -159,11 +235,17 @@ impl SliceHeader {
             }
             if !nal_type.is_idr() {
                 w.write_bits(self.poc_lsb, sps.log2_max_poc_lsb_minus4 + 4);
-                // An intra encoder writes no reference picture sets at all; a
-                // non-IDR picture from this family does not exist yet.
-                w.write_bit(true); // short_term_ref_pic_set_sps_flag
-                if sps.num_short_term_ref_pic_sets > 1 {
-                    w.write_bits(0, ceil_log2(sps.num_short_term_ref_pic_sets));
+                w.write_bit(self.short_term_ref_pic_set_sps_flag);
+                if self.short_term_ref_pic_set_sps_flag {
+                    if sps.num_short_term_ref_pic_sets > 1 {
+                        w.write_bits(0, ceil_log2(sps.num_short_term_ref_pic_sets));
+                    }
+                } else {
+                    // Written out here, which is what a stream whose SPS carries
+                    // no sets must do — and what a hardware encoder's driver
+                    // does for its own single reference.
+                    self.short_term_ref_pic_set
+                        .write(w, sps.num_short_term_ref_pic_sets);
                 }
                 if sps.temporal_mvp_enabled {
                     w.write_bit(self.temporal_mvp_enabled);
@@ -210,9 +292,6 @@ impl SliceHeader {
                 }
             }
         }
-        // byte_alignment(): a one bit then zeros.
-        w.write_bit(true);
-        w.align_to_byte();
     }
 
     /// Parse a slice segment header out of an unescaped slice NAL payload.
@@ -250,20 +329,44 @@ impl SliceHeader {
             if sps.separate_colour_plane {
                 h.colour_plane_id = r.read_bits(2)? as u8;
             }
-            let mut st_rps = ShortTermRefPicSet::default();
             let mut num_long_term = 0;
             if !nal_type.is_idr() {
                 h.poc_lsb = r.read_bits(sps.log2_max_poc_lsb_minus4 + 4)?;
                 let from_sps = r.read_bit()?;
+                h.short_term_ref_pic_set_sps_flag = from_sps;
                 let before = r.bit_position();
                 if !from_sps {
-                    // The sets in the SPS are not kept, so an inter-set
-                    // predicted slice set cannot be resolved here.
-                    st_rps = ShortTermRefPicSet::parse(&mut r, 0, &[])?;
-                } else if sps.num_short_term_ref_pic_sets > 1 {
-                    r.read_bits(ceil_log2(sps.num_short_term_ref_pic_sets))?;
+                    // Written out here, possibly predicted from the SPS sets —
+                    // hence `num_short_term_ref_pic_sets` as this set's index
+                    // and the SPS sets as the prediction source (7.3.7).
+                    h.short_term_ref_pic_set = ShortTermRefPicSet::parse(
+                        &mut r,
+                        sps.num_short_term_ref_pic_sets,
+                        &sps.short_term_ref_pic_sets,
+                    )?;
+                } else {
+                    let idx = if sps.num_short_term_ref_pic_sets > 1 {
+                        r.read_bits(ceil_log2(sps.num_short_term_ref_pic_sets))?
+                    } else {
+                        0
+                    };
+                    h.short_term_ref_pic_set = sps
+                        .short_term_ref_pic_sets
+                        .get(idx as usize)
+                        .copied()
+                        .ok_or_else(|| {
+                            Error::corrupt(format!(
+                                "HEVC slice: short_term_ref_pic_set_idx {idx} is not in the SPS"
+                            ))
+                        })?;
                 }
-                pos.st_rps_bits = (r.bit_position() - before) as u32;
+                // Only a set written *in the header* costs the driver bits to
+                // skip; for an SPS-indexed one libva wants zero.
+                pos.st_rps_bits = if from_sps {
+                    0
+                } else {
+                    (r.bit_position() - before) as u32
+                };
                 if sps.long_term_ref_pics_present {
                     let num_long_term_sps = if sps.num_long_term_ref_pics_sps > 0 {
                         r.read_ue()?
@@ -271,21 +374,42 @@ impl SliceHeader {
                         0
                     };
                     let num_long_term_pics = r.read_ue()?;
+                    let mut prev_delta_msb = 0u32;
                     for i in 0..num_long_term_sps + num_long_term_pics {
+                        let mut entry = LongTermRef::default();
                         if i < num_long_term_sps {
-                            if sps.num_long_term_ref_pics_sps > 1 {
-                                r.read_bits(ceil_log2(sps.num_long_term_ref_pics_sps))?;
-                            }
-                            num_long_term += 1;
+                            let idx = if sps.num_long_term_ref_pics_sps > 1 {
+                                r.read_bits(ceil_log2(sps.num_long_term_ref_pics_sps))?
+                            } else {
+                                0
+                            };
+                            let (poc_lsb_lt, used) = sps
+                                .long_term_ref_pics_sps
+                                .get(idx as usize)
+                                .copied()
+                                .unwrap_or((0, false));
+                            entry.poc_lsb_lt = poc_lsb_lt;
+                            entry.used_by_curr = used;
                         } else {
-                            r.read_bits(sps.log2_max_poc_lsb_minus4 + 4)?; // poc_lsb_lt
-                            if r.read_bit()? {
-                                num_long_term += 1; // used_by_curr_pic_lt_flag
-                            }
+                            entry.poc_lsb_lt = r.read_bits(sps.log2_max_poc_lsb_minus4 + 4)?;
+                            entry.used_by_curr = r.read_bit()?;
                         }
-                        if r.read_bit()? {
-                            r.read_ue()?; // delta_poc_msb_cycle_lt
+                        if entry.used_by_curr {
+                            num_long_term += 1;
                         }
+                        entry.delta_poc_msb_present = r.read_bit()?;
+                        if entry.delta_poc_msb_present {
+                            // 7-52: coded as a delta against the previous entry,
+                            // except for the first of each kind.
+                            let delta = r.read_ue()?;
+                            entry.delta_poc_msb_cycle = if i == 0 || i == num_long_term_sps {
+                                delta
+                            } else {
+                                delta + prev_delta_msb
+                            };
+                            prev_delta_msb = entry.delta_poc_msb_cycle;
+                        }
+                        h.long_term.push(entry);
                     }
                 }
                 if sps.temporal_mvp_enabled {
@@ -307,17 +431,19 @@ impl SliceHeader {
                         h.num_ref_idx_l1_active_minus1 = r.read_ue()?;
                     }
                 }
-                let num_pic_total_curr = st_rps.num_used_by_curr + num_long_term;
+                let num_pic_total_curr = h.short_term_ref_pic_set.num_used_by_curr + num_long_term;
                 if pps.lists_modification_present && num_pic_total_curr > 1 {
                     let bits = ceil_log2(num_pic_total_curr);
                     if r.read_bit()? {
                         for _ in 0..=h.num_ref_idx_l0_active_minus1 {
-                            r.read_bits(bits)?;
+                            let entry = r.read_bits(bits)?;
+                            h.list_entry[0].push(entry);
                         }
                     }
                     if h.slice_type == SliceType::B && r.read_bit()? {
                         for _ in 0..=h.num_ref_idx_l1_active_minus1 {
-                            r.read_bits(bits)?;
+                            let entry = r.read_bits(bits)?;
+                            h.list_entry[1].push(entry);
                         }
                     }
                 }
@@ -340,7 +466,7 @@ impl SliceHeader {
                 if (pps.weighted_pred && h.slice_type == SliceType::P)
                     || (pps.weighted_bipred && h.slice_type == SliceType::B)
                 {
-                    skip_pred_weight_table(&mut r, &h, sps)?;
+                    h.pred_weight_table = Some(parse_pred_weight_table(&mut r, &h, sps)?);
                 }
                 h.five_minus_max_num_merge_cand = r.read_ue()?;
             }
@@ -464,13 +590,34 @@ pub fn count_emulation_prevention_bytes(escaped_payload: &[u8]) -> usize {
     count
 }
 
-/// Walk past a `pred_weight_table()` (7.3.6.3).
-fn skip_pred_weight_table(r: &mut BitReader, h: &SliceHeader, sps: &Sps) -> Result<()> {
-    r.read_ue()?; // luma_log2_weight_denom
+/// Parse a `pred_weight_table()` (7.3.6.3).
+///
+/// The chroma *offset* is derived, not coded: equation 7-56 turns
+/// `delta_chroma_offset_lX` into `ChromaOffsetLX` against the weight, and a
+/// decoder that forwards the raw delta to hardware shifts every weighted
+/// chroma sample.
+fn parse_pred_weight_table(
+    r: &mut BitReader,
+    h: &SliceHeader,
+    sps: &Sps,
+) -> Result<PredWeightTable> {
+    let mut table = PredWeightTable {
+        luma_log2_weight_denom: r.read_ue()?,
+        ..PredWeightTable::default()
+    };
     let chroma = sps.chroma_format_idc != 0;
     if chroma {
-        r.read_se()?; // delta_chroma_log2_weight_denom
+        table.delta_chroma_log2_weight_denom = r.read_se()?;
     }
+    let chroma_log2 = table.luma_log2_weight_denom as i32 + table.delta_chroma_log2_weight_denom;
+    if !(0..=7).contains(&chroma_log2) {
+        return Err(Error::corrupt(
+            "HEVC pred_weight_table: ChromaLog2WeightDenom out of range",
+        ));
+    }
+    // A fuzzed SPS can name any bit depth; the shift below has to survive it.
+    let half_range = 1i64 << (sps.bit_depth_chroma_minus8.min(8) + 7);
+
     let lists: &[u32] = if h.slice_type == SliceType::B {
         &[
             h.num_ref_idx_l0_active_minus1,
@@ -479,32 +626,50 @@ fn skip_pred_weight_table(r: &mut BitReader, h: &SliceHeader, sps: &Sps) -> Resu
     } else {
         &[h.num_ref_idx_l0_active_minus1]
     };
-    for &active_minus1 in lists {
-        let count = active_minus1 + 1;
-        let mut luma_flags = Vec::with_capacity(count as usize);
+    for (list, &active_minus1) in lists.iter().enumerate() {
+        let count = (active_minus1 + 1) as usize;
+        let mut luma_flags = Vec::with_capacity(count);
         for _ in 0..count {
             luma_flags.push(r.read_bit()?);
         }
-        let mut chroma_flags = Vec::with_capacity(count as usize);
+        let mut chroma_flags = vec![false; count];
         if chroma {
-            for _ in 0..count {
-                chroma_flags.push(r.read_bit()?);
+            for flag in chroma_flags.iter_mut() {
+                *flag = r.read_bit()?;
             }
         }
-        for i in 0..count as usize {
+        let mut entries = Vec::with_capacity(count);
+        for i in 0..count {
+            let mut entry = WeightEntry::default();
             if luma_flags[i] {
-                r.read_se()?; // delta_luma_weight
-                r.read_se()?; // luma_offset
+                let delta_weight = r.read_se()?;
+                let offset = r.read_se()?;
+                entry.luma = Some((delta_weight, offset));
             }
             if chroma && chroma_flags[i] {
-                for _ in 0..2 {
-                    r.read_se()?; // delta_chroma_weight
-                    r.read_se()?; // delta_chroma_offset
+                let mut pair = [(0i32, 0i32); 2];
+                for component in &mut pair {
+                    let delta_weight = r.read_se()?;
+                    let delta_offset = r.read_se()?;
+                    let weight = (1i64 << chroma_log2) + i64::from(delta_weight);
+                    // 7-56, in 64 bits because both terms come straight off the
+                    // wire and a corrupt stream must not overflow the derivation.
+                    let offset = (half_range + i64::from(delta_offset)
+                        - ((half_range * weight) >> chroma_log2))
+                        .clamp(-half_range, half_range - 1);
+                    *component = (delta_weight, offset as i32);
                 }
+                entry.chroma = Some(pair);
             }
+            entries.push(entry);
+        }
+        if list == 0 {
+            table.l0 = entries;
+        } else {
+            table.l1 = entries;
         }
     }
-    Ok(())
+    Ok(table)
 }
 
 #[cfg(test)]
@@ -538,8 +703,10 @@ mod tests {
             pcm_enabled: false,
             pcm: None,
             num_short_term_ref_pic_sets: 0,
+            short_term_ref_pic_sets: Vec::new(),
             long_term_ref_pics_present: false,
             num_long_term_ref_pics_sps: 0,
+            long_term_ref_pics_sps: Vec::new(),
             temporal_mvp_enabled: false,
             strong_intra_smoothing: true,
             ptl: ProfileTierLevel::main(120),
