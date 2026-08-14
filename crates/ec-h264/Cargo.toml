@@ -1,0 +1,11 @@
+[package]
+name = "ec-h264"
+description = "ITU-T H.264 software decoder."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ec-core.workspace = true
+ec-h264-syntax.workspace = true

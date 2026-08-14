@@ -7,5 +7,20 @@ name = "ec-core"
 version = "0.1.0"
 
 [[package]]
+name = "ec-h264"
+version = "0.1.0"
+dependencies = [
+ "ec-core",
+ "ec-h264-syntax",
+]
+
+[[package]]
+name = "ec-h264-syntax"
+version = "0.1.0"
+dependencies = [
+ "ec-core",
+]
+
+[[package]]
 name = "oracle"
 version = "0.1.0"
