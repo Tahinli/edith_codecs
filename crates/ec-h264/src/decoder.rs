@@ -1802,23 +1802,24 @@ fn direct_block(
     mvc: &MvCtx,
     at: (usize, usize),
 ) -> Result<([[i16; 2]; 2], [i8; 2], [i32; 2])> {
-    // The co-located block, in both modes.
+    // The co-located block, in both modes (8.4.1.2.1): its list 0 motion, or
+    // its list 1 motion when list 0 is unused. `col_ref_idx` is refIdxCol —
+    // an index into the co-located picture's own reference list, not ours.
     let col = ctx.lists[1].get(0).and_then(|i| refs.get(i));
-    let (col_ref_id, col_mv, col_list) = match col {
+    let (col_ref_id, col_mv, col_ref_idx) = match col {
         Some(c) => {
             let bx = mvc.mb_x * 4 + at.0;
             let by = mvc.mb_y * 4 + at.1;
             let idx = by * c.mb_w.max(1) * 4 + bx;
             if idx < c.ref_id.len() && c.blk[idx] & BLK_INTRA == 0 {
                 let list = usize::from(c.ref_id[idx][0] < 0);
-                (c.ref_id[idx][list], c.mv[idx][list], list)
+                (c.ref_id[idx][list], c.mv[idx][list], c.ref_idx[idx][list])
             } else {
-                (-1, [0i16; 2], 0)
+                (-1, [0i16; 2], -1)
             }
         }
-        None => (-1, [0i16; 2], 0),
+        None => (-1, [0i16; 2], -1),
     };
-    let _ = col_list;
 
     if ctx.direct_spatial {
         // Reference indices from the macroblock's own neighbours, once.
@@ -1833,16 +1834,16 @@ fn direct_block(
         if zero_prediction {
             ref_idx = [0, 0];
         }
-        // colZeroFlag: the co-located block sits still on a short-term picture.
+        // colZeroFlag (8.4.1.2.2): the co-located block sits still on a
+        // short-term picture, referencing that picture's own list entry 0. The
+        // index is the one belonging to the list 8.4.1.2.1 picked — reading
+        // "either list is 0" instead lets a bi-predicted co-located block whose
+        // list 1 index happens to be 0 zero a motion vector it must not, which
+        // only shows on a B picture used as the co-located one.
         let col_short = col.is_some_and(|c| c.mark == Mark::Short);
         let col_zero = col_short
             && col_ref_id >= 0
-            && col.is_some_and(|c| {
-                let bx = mvc.mb_x * 4 + at.0;
-                let by = mvc.mb_y * 4 + at.1;
-                let idx = by * c.mb_w.max(1) * 4 + bx;
-                idx < c.ref_idx.len() && (c.ref_idx[idx][0] == 0 || c.ref_idx[idx][1] == 0)
-            })
+            && col_ref_idx == 0
             && (-1..=1).contains(&col_mv[0])
             && (-1..=1).contains(&col_mv[1]);
         let mut mv = [[0i16; 2]; 2];
