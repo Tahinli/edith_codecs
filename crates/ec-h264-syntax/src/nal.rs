@@ -172,6 +172,28 @@ impl<'a> Iterator for AnnexBIter<'a> {
     }
 }
 
+/// Insert emulation prevention bytes into an RBSP (spec 7.4.1.1), the inverse
+/// of [`unescape_rbsp`]: a `00 00 00`, `00 00 01`, `00 00 02` or `00 00 03`
+/// run gets an `emulation_prevention_three_byte` before its last byte, and a
+/// payload ending in two zero bytes gets one appended.
+pub fn escape_rbsp(rbsp: &[u8], out: &mut Vec<u8>) {
+    let mut zeros = 0usize;
+    for &b in rbsp {
+        if zeros >= 2 && b <= 3 {
+            out.push(3);
+            zeros = 0;
+        }
+        out.push(b);
+        if b == 0 {
+            zeros += 1;
+        } else {
+            zeros = 0;
+        }
+    }
+    if zeros >= 2 {
+        out.push(3);
+    }
+}
 /// Strip emulation-prevention bytes (spec 7.4.1.1): every `00 00 03` becomes
 /// `00 00`. `nal` is the NAL payload **after** the header byte; the result is
 /// appended into `out`, which is cleared first and whose capacity is reused
