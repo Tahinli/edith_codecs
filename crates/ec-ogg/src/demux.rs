@@ -422,18 +422,18 @@ impl<R: Read + Seek + Send> Demuxer for OggDemuxer<R> {
         let mut hi = end;
         // Last page start whose granule is at or before the target, and the
         // first one at or after it — one bisection answers both.
-        let mut before = self.data_start;
-        let mut after = None;
+        let mut before: Option<(u64, i64)> = None;
+        let mut after: Option<(u64, i64)> = None;
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             match self.page_at_or_after(mid, serial)? {
                 Some((offset, granule)) if granule != page::NO_GRANULE && granule <= target => {
-                    before = offset;
+                    before = Some((offset, granule));
                     // Always make progress: the found page may start before mid.
                     lo = offset.max(mid) + 1;
                 }
                 Some((offset, granule)) if granule != page::NO_GRANULE => {
-                    after = Some(offset);
+                    after = Some((offset, granule));
                     hi = match offset > mid {
                         true => mid,
                         false => offset,
@@ -445,12 +445,39 @@ impl<R: Read + Seek + Send> Demuxer for OggDemuxer<R> {
                 None => hi = mid,
             }
         }
-        let landing = match mode {
-            SeekMode::SyncAfter => after.unwrap_or(before),
+        let found = match mode {
+            SeekMode::SyncAfter => after.or(before),
+            // No page ends at or before the target: it is inside the first one,
+            // and the stream's beginning is what "at or before" means there.
             _ => before,
         };
         self.reset_state();
-        self.inner.seek(SeekFrom::Start(landing))?;
+        let granule = match found {
+            // A granule is where a page *ends*, and a Vorbis or FLAC packet
+            // states no duration of its own — so reading from the page the
+            // bisection found would hand out its packets with no timestamp at
+            // all, and a seek could not say where it landed. The landing is the
+            // page *after* it, whose first sample is that page's granule.
+            Some((offset, granule)) => {
+                self.inner.seek(SeekFrom::Start(offset))?;
+                read_page(&mut self.inner)?;
+                granule
+            }
+            // Nothing indexed the target: the stream's own beginning is the
+            // only honest answer, and every packet of it is still to come.
+            None => {
+                self.inner.seek(SeekFrom::Start(self.data_start))?;
+                0
+            }
+        };
+        // Never resume inside the headers: they are not audio and must not be
+        // handed out as packets.
+        if self.inner.stream_position()? < self.data_start {
+            self.inner.seek(SeekFrom::Start(self.data_start))?;
+        }
+        let track = &mut self.tracks[index];
+        track.pos = granule;
+        track.pos_known = true;
         Ok(())
     }
 }
