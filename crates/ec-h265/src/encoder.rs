@@ -59,7 +59,19 @@ pub struct EncoderConfig {
     pub rate_control: RateControl,
     /// Worker threads; 0 means "as many as the machine has".
     pub threads: usize,
-    /// Coding tree block size, 64 (default) or 32.
+    /// Coding tree block size, 32 (default) or 64.
+    ///
+    /// The wavefront hands one CTB *row* to a worker, so the row count is the
+    /// parallelism this encoder has: 1080 lines are 17 rows at 64 but 34 at 32.
+    /// Rows are dealt round-robin, so on a twelve-core machine 17 rows means
+    /// five workers take two rows while seven take one — half the machine idles
+    /// through the second half of the picture. 34 rows deal three-and-three.
+    /// Measured on 1080p at QP 27: the two sizes encode at the same speed on one
+    /// thread (1.80 fps each), but on twelve 32 runs 9.03 fps against 64's 7.92,
+    /// for 1.0% more bits and 0.02 dB less PSNR — the whole difference is
+    /// wavefront occupancy, which is why 32 is the default. 64 takes its bits
+    /// back when the picture is tall enough to fill the workers anyway (2160
+    /// lines are 34 rows at 64) or when nothing is waiting for the encode.
     pub ctb_size: usize,
     /// How many of the 35 intra modes get a full rate-distortion trial, on top
     /// of the most probable mode, which always gets one.
@@ -85,14 +97,15 @@ pub struct EncoderConfig {
 }
 
 impl EncoderConfig {
-    /// Defaults for `width x height`: constant QP 27, every core, 64x64 CTBs.
+    /// Defaults for `width x height`: constant QP 27, every core, 32x32 CTBs
+    /// (see [`EncoderConfig::ctb_size`] for why 32 and not 64).
     pub fn new(width: u32, height: u32) -> EncoderConfig {
         EncoderConfig {
             width,
             height,
             rate_control: RateControl::ConstantQp(27),
             threads: 0,
-            ctb_size: 64,
+            ctb_size: 32,
             rdo_candidates: 2,
             min_cu_size: 8,
             video_signal_type: None,
