@@ -772,7 +772,7 @@ fn real_library_sweep() {
 // Encoder: self-consistency (range-exact against our own decoder)
 // ---------------------------------------------------------------------------
 
-use ec_opus::{Encoder, MultistreamEncoder};
+use ec_opus::{Application, Encoder, MultistreamEncoder};
 
 /// A deterministic music-like test signal: several detuned partials plus a
 /// swept component per channel, loud enough to exercise every band.
@@ -860,7 +860,7 @@ fn encoder_roundtrips_at_every_rate() {
     for channels in [1usize, 2] {
         let pcm = test_signal(channels, 2.0);
         for kbps in [32u32, 64, 96, 128, 160, 165, 192, 256, 320, 510] {
-            let mut enc = Encoder::new(48000, channels).unwrap();
+            let mut enc = Encoder::new(48000, channels, Application::Audio).unwrap();
             enc.set_bitrate(kbps * 1000);
             let (decoded, bytes) = roundtrip_own(&mut enc, &pcm, channels, 960);
             let corr = delayed_corr(&pcm, &decoded, channels);
@@ -881,14 +881,14 @@ fn encoder_roundtrips_at_every_rate() {
 fn encoder_frame_sizes_and_vbr() {
     let pcm = test_signal(2, 1.0);
     for frame in [120usize, 240, 480, 960] {
-        let mut enc = Encoder::new(48000, 2).unwrap();
+        let mut enc = Encoder::new(48000, 2, Application::Audio).unwrap();
         enc.set_bitrate(128_000);
         let (decoded, _) = roundtrip_own(&mut enc, &pcm, 2, frame);
         let corr = delayed_corr(&pcm, &decoded, 2);
         println!("frame {frame}: corr {corr:.4}");
         assert!(corr >= 0.85, "frame {frame}: correlation {corr:.4}");
     }
-    let mut enc = Encoder::new(48000, 2).unwrap();
+    let mut enc = Encoder::new(48000, 2, Application::Audio).unwrap();
     enc.set_bitrate(128_000);
     enc.set_vbr_constrained(true);
     let (decoded, bytes) = roundtrip_own(&mut enc, &pcm, 2, 960);
@@ -914,25 +914,13 @@ use ec_core::registry::{CodecId, CodecParameters, MediaParameters, Muxer, Stream
 use ec_core::{ChannelLayout, Packet as CorePacket, TimeBase};
 use ec_ogg::OggMuxer;
 
-/// The RFC 7845 identification header for this encoder: pre-skip 120, the
-/// CELT overlap delay.
+/// The RFC 7845 identification header for this encoder — built by the crate's
+/// own [`ec_opus::ogg`] helper, so a muxer and the encoder cannot disagree —
+/// with pre-skip 120, the CELT overlap delay.
 fn opus_head(channels: usize, layout: Option<(usize, usize, &[u8])>) -> Vec<u8> {
-    let mut h = Vec::from(*b"OpusHead");
-    h.push(1);
-    h.push(channels as u8);
-    h.extend_from_slice(&120u16.to_le_bytes());
-    h.extend_from_slice(&48000u32.to_le_bytes());
-    h.extend_from_slice(&0i16.to_le_bytes());
-    match layout {
-        None => h.push(0),
-        Some((streams, coupled, mapping)) => {
-            h.push(1);
-            h.push(streams as u8);
-            h.push(coupled as u8);
-            h.extend_from_slice(mapping);
-        }
-    }
-    h
+    let mapping =
+        layout.map(|(streams, coupled, table)| (1u8, streams as u8, coupled as u8, table));
+    ec_opus::ogg::opus_head(channels as u8, 120, 48000, 0, mapping)
 }
 
 /// Muxes 20 ms packets into an Ogg-Opus file whose final granule trims the
@@ -1012,7 +1000,7 @@ fn libopus_decodes_our_packets_across_the_rate_table() {
         let total = pcm.len() / channels;
         let mut table = Vec::new();
         for kbps in [16u32, 32, 64, 96, 128, 160, 165, 192, 256, 320, 510] {
-            let mut enc = Encoder::new(48000, channels).unwrap();
+            let mut enc = Encoder::new(48000, channels, Application::Audio).unwrap();
             enc.set_bitrate(kbps * 1000);
             let packets = encode_packets(&mut enc, &pcm, channels);
             let path = temp_path(&format!("{channels}ch-{kbps}k.opus"));
@@ -1134,7 +1122,7 @@ fn five_one_encode_end_to_end() {
 fn ogg_opus_round_trip_duration_is_exact() {
     let pcm = test_signal(2, 2.0);
     let total = pcm.len() / 2;
-    let mut enc = Encoder::new(48000, 2).unwrap();
+    let mut enc = Encoder::new(48000, 2, Application::Audio).unwrap();
     enc.set_bitrate(128_000);
     let packets = encode_packets(&mut enc, &pcm, 2);
     let path = temp_path("duration.opus");
@@ -1191,7 +1179,7 @@ fn opus_demo_decodes_our_bit_stream() {
         return;
     };
     let pcm = test_signal(2, 2.0);
-    let mut enc = Encoder::new(48000, 2).unwrap();
+    let mut enc = Encoder::new(48000, 2, Application::Audio).unwrap();
     enc.set_bitrate(256_000);
     let mut out = vec![0u8; 1500];
     let mut bit = Vec::new();
@@ -1252,7 +1240,7 @@ fn steady_state_encode_loop_zero_alloc() {
         v
     };
     // Stereo elementary encoder.
-    let mut enc = Encoder::new(48000, 2).unwrap();
+    let mut enc = Encoder::new(48000, 2, Application::Audio).unwrap();
     enc.set_bitrate(256_000);
     let mut out = vec![0u8; 1500];
     for block in pcm.chunks_exact(960 * 2) {
@@ -1302,7 +1290,7 @@ fn encode_speed() {
         ("stereo 510k", 2, 510, 50.0),
     ] {
         let pcm = test_signal(channels, secs);
-        let mut enc = Encoder::new(48000, channels).unwrap();
+        let mut enc = Encoder::new(48000, channels, Application::Audio).unwrap();
         enc.set_bitrate(kbps * 1000);
         let mut out = vec![0u8; 1500];
         // Warm up one pass, then measure.
