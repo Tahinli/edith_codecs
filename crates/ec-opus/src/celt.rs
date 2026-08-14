@@ -280,7 +280,7 @@ fn isqrt32(x: u32) -> u32 {
 }
 
 /// The CELT low-overlap window (Section 4.3.7), computed rather than tabulated.
-fn overlap_window() -> Vec<f32> {
+pub(crate) fn overlap_window() -> Vec<f32> {
     (0..OVERLAP)
         .map(|i| {
             let inner = (core::f64::consts::FRAC_PI_2 * (i as f64 + 0.5) / OVERLAP as f64).sin();

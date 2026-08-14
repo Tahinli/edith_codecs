@@ -316,12 +316,29 @@ fn read_i16(path: &Path) -> Vec<i16> {
         .collect()
 }
 
-/// The CELT-only vectors, which need no SILK layer.
-const CELT_VECTORS: [&str; 3] = ["testvector01", "testvector07", "testvector11"];
+/// Every vector in the RFC 6716 suite, in the order the RFC lists them.
+const VECTORS: [&str; 12] = [
+    "testvector01",
+    "testvector02",
+    "testvector03",
+    "testvector04",
+    "testvector05",
+    "testvector06",
+    "testvector07",
+    "testvector08",
+    "testvector09",
+    "testvector10",
+    "testvector11",
+    "testvector12",
+];
 
+/// The conformance test of RFC 6716 Section 6, both halves of it: the decoder's
+/// range coder state MUST match the reference on every packet, and the output
+/// MUST stay within the `opus_compare` threshold (quality >= 0).
 #[test]
-fn celt_vectors_match_the_reference_range_state() {
-    for name in CELT_VECTORS {
+fn rfc6716_test_vectors() {
+    let mut table = Vec::new();
+    for name in VECTORS {
         let path = vectors_dir().join(format!("{name}.bit"));
         if !path.exists() {
             eprintln!("{name}: missing, skipped (run scripts/fetch-vectors.sh)");
@@ -329,23 +346,32 @@ fn celt_vectors_match_the_reference_range_state() {
         }
         let packets = read_vector(&path);
         let (pcm, matched, decoded) = decode_vector(&packets);
-        println!(
-            "{name}: {matched}/{decoded} packets bit-exact, {} samples",
-            pcm.len() / 2
-        );
-        assert_eq!(
-            matched, decoded,
-            "{name}: range state diverged from the reference"
-        );
-
         let reference = read_i16(&vectors_dir().join(format!("{name}.dec")));
         let mine = to_i16(&pcm);
-        let n = reference.len().min(mine.len());
-        let q = opus_compare(&reference[..n], &mine[..n], 2);
-        println!("{name}: opus_compare quality {q:.1} %");
-        assert!(
-            q >= 0.0,
-            "{name}: opus_compare quality {q:.1} % (must be >= 0)"
+        assert_eq!(
+            reference.len(),
+            mine.len(),
+            "{name}: decoded {} samples, reference has {}",
+            mine.len() / 2,
+            reference.len() / 2
         );
+        let identical = reference.iter().zip(&mine).filter(|(a, b)| a == b).count();
+        let quality = opus_compare(&reference, &mine, 2);
+        table.push(format!(
+            "{name}: {matched}/{decoded} packets range-exact, \
+             {:.4} % samples identical, quality {quality:.2} %",
+            100.0 * identical as f64 / reference.len() as f64
+        ));
+        assert_eq!(
+            matched, decoded,
+            "{name}: range coder state diverged from the reference"
+        );
+        assert!(
+            quality >= 0.0,
+            "{name}: opus_compare quality {quality:.2} %"
+        );
+    }
+    for line in table {
+        println!("{line}");
     }
 }

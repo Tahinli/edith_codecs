@@ -224,6 +224,15 @@ impl<'a> RangeDecoder<'a> {
         }
     }
 
+    /// Shrinks the frame to `len` bytes, which is what the redundancy framing
+    /// does when it reserves the tail of a packet for a second CELT frame
+    /// (RFC 6716, Section 4.5.1). Bytes already read are unaffected.
+    pub fn shrink(&mut self, len: usize) {
+        if len <= self.buf.len() {
+            self.buf = &self.buf[..len];
+        }
+    }
+
     /// Declares the rest of the frame consumed, so [`RangeDecoder::tell`]
     /// reports the whole frame. CELT does this for a silent frame, whose
     /// remaining bits carry nothing (RFC 6716, Section 4.3).

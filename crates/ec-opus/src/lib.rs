@@ -29,10 +29,12 @@
 pub mod celt;
 pub mod packet;
 pub mod range;
+pub mod silk;
 
 pub use celt::CeltDecoder;
 pub use packet::{Bandwidth, Mode, Packet, Toc};
 pub use range::RangeDecoder;
+pub use silk::SilkDecoder;
 
 use ec_core::{Error, Result};
 
@@ -48,6 +50,9 @@ pub struct Decoder {
     channels: usize,
     downsample: usize,
     celt: CeltDecoder,
+    silk: SilkDecoder,
+    /// The CELT overlap window, reused for redundancy cross-fades.
+    celt_window: Vec<f32>,
     prev_mode: Option<Mode>,
     prev_redundancy: bool,
     range_final: u32,
@@ -81,6 +86,8 @@ impl Decoder {
             channels,
             downsample,
             celt: CeltDecoder::new(channels, downsample),
+            silk: SilkDecoder::new(sample_rate, channels),
+            celt_window: celt::overlap_window(),
             prev_mode: None,
             prev_redundancy: false,
             range_final: 0,
@@ -107,6 +114,7 @@ impl Decoder {
     /// Drops all inter-packet state; call after a seek.
     pub fn reset(&mut self) {
         self.celt.reset();
+        self.silk.reset();
         self.prev_mode = None;
         self.prev_redundancy = false;
         self.range_final = 0;
@@ -161,6 +169,11 @@ impl Decoder {
     }
 
     /// Decodes one Opus frame (one entropy-coded unit) of a packet.
+    ///
+    /// The three modes share this path: SILK fills the low band, CELT the high
+    /// one, and a hybrid frame is their sum. The order of everything read from
+    /// the range decoder here is normative — SILK, then the redundancy flags,
+    /// then CELT (RFC 6716, Sections 4.2, 4.5.1 and 4.3).
     fn decode_frame(
         &mut self,
         data: &[u8],
@@ -171,28 +184,199 @@ impl Decoder {
         let mode = toc.mode();
         let stream_channels = toc.channels();
         if data.len() <= 1 {
-            // DTX or a dropped frame: no PLC in this decoder, so emit silence.
+            // DTX or a dropped frame. There is no PLC here (the container
+            // layer feeds this decoder whole packets), so the frame is silent.
             out.fill(0.0);
+            self.prev_mode = None;
             return Ok(0);
         }
         let mut dec = RangeDecoder::new(data);
+        let mut len = data.len();
+        let frame_out = frame_48k / self.downsample;
+        let f5 = 240 / self.downsample;
+        let f2_5 = 120 / self.downsample;
 
+        // --- SILK layer -----------------------------------------------------
+        let mut silk_pcm = vec![0i16; frame_out * self.channels];
         if mode != Mode::Celt {
-            return Err(Error::unsupported(
-                "Opus SILK layer",
-                "only the CELT layer is implemented in this build",
-            ));
+            if self.prev_mode == Some(Mode::Celt) {
+                self.silk.reset();
+            }
+            let internal_rate = if mode == Mode::Hybrid {
+                16000
+            } else {
+                match toc.bandwidth() {
+                    Bandwidth::Narrow => 8000,
+                    Bandwidth::Medium => 12000,
+                    _ => 16000,
+                }
+            };
+            let payload_ms = (frame_48k / 48).max(10);
+            let mut done = 0usize;
+            let mut first = true;
+            while done < frame_out {
+                let n = self.silk.decode(
+                    &mut dec,
+                    &mut silk_pcm[done * self.channels..],
+                    payload_ms,
+                    internal_rate,
+                    stream_channels,
+                    first,
+                )?;
+                if n == 0 {
+                    break;
+                }
+                done += n;
+                first = false;
+            }
         }
 
-        // A mode switch invalidates the MDCT overlap and energy history.
-        if self.prev_mode.is_some_and(|p| p != mode) && !self.prev_redundancy {
-            self.celt.reset();
+        // --- Redundancy (Section 4.5.1) -------------------------------------
+        let mut redundancy = false;
+        let mut celt_to_silk = false;
+        let mut redundancy_bytes = 0usize;
+        if mode != Mode::Celt
+            && dec.tell() as usize + 17 + 20 * usize::from(mode == Mode::Hybrid) <= 8 * len
+        {
+            redundancy = if mode == Mode::Hybrid {
+                dec.dec_bit_logp(12)
+            } else {
+                true
+            };
+            if redundancy {
+                celt_to_silk = dec.dec_bit_logp(1);
+                redundancy_bytes = if mode == Mode::Hybrid {
+                    dec.dec_uint(256) as usize + 2
+                } else {
+                    len - ((dec.tell() as usize + 7) >> 3)
+                };
+                if redundancy_bytes > len {
+                    redundancy_bytes = 0;
+                    redundancy = false;
+                } else {
+                    len -= redundancy_bytes;
+                    if len * 8 < dec.tell() as usize {
+                        len = 0;
+                        redundancy_bytes = 0;
+                        redundancy = false;
+                    }
+                    dec.shrink(len);
+                }
+            }
         }
+
         let end_band = toc.bandwidth().celt_end_band();
-        self.celt
-            .decode(&mut dec, out, frame_48k, 0, end_band, stream_channels)?;
+        let start_band = if mode == Mode::Celt { 0 } else { 17 };
+        let mut redundant = vec![0.0f32; f5 * self.channels];
+
+        // A redundancy frame that precedes the main one is decoded first.
+        let mut redundant_rng = 0u32;
+        if redundancy && celt_to_silk {
+            let tail = &data[len..len + redundancy_bytes];
+            let mut rdec = RangeDecoder::new(tail);
+            self.celt
+                .decode(&mut rdec, &mut redundant, 240, 0, end_band, stream_channels)?;
+            redundant_rng = rdec.range();
+        }
+
+        // --- CELT layer -----------------------------------------------------
+        if mode != Mode::Silk {
+            // A mode switch invalidates the MDCT overlap and energy history.
+            if self.prev_mode.is_some_and(|p| p != mode) && !self.prev_redundancy {
+                self.celt.reset();
+            }
+            self.celt.decode(
+                &mut dec,
+                out,
+                frame_48k.min(960),
+                start_band,
+                end_band,
+                stream_channels,
+            )?;
+        } else {
+            out.fill(0.0);
+            // Fade the CELT layer out when leaving hybrid, as the reference
+            // does, by decoding one silent 2.5 ms frame.
+            if self.prev_mode == Some(Mode::Hybrid) && !(redundancy && celt_to_silk) {
+                let silence = [0xFFu8, 0xFF];
+                let mut sdec = RangeDecoder::new(&silence);
+                let mut tmp = vec![0.0f32; f2_5 * self.channels];
+                self.celt
+                    .decode(&mut sdec, &mut tmp, 120, 0, end_band, stream_channels)?;
+            }
+        }
+
+        // Sum the two layers.
+        if mode != Mode::Celt {
+            for (o, s) in out.iter_mut().zip(silk_pcm.iter()) {
+                *o += *s as f32 * (1.0 / 32768.0);
+            }
+        }
+
+        // A redundancy frame that follows the main one is cross-faded in.
+        if redundancy && !celt_to_silk {
+            self.celt.reset();
+            let tail = &data[len..len + redundancy_bytes];
+            let mut rdec = RangeDecoder::new(tail);
+            self.celt
+                .decode(&mut rdec, &mut redundant, 240, 0, end_band, stream_channels)?;
+            redundant_rng = rdec.range();
+            let base = (frame_out - f2_5) * self.channels;
+            smooth_fade(
+                &mut out[base..],
+                &redundant[f2_5 * self.channels..],
+                f2_5,
+                self.channels,
+                &self.celt_window,
+                self.downsample,
+            );
+        }
+        if redundancy && celt_to_silk {
+            for c in 0..self.channels {
+                for i in 0..f2_5 {
+                    out[self.channels * i + c] = redundant[self.channels * i + c];
+                }
+            }
+            // Then fade from the redundancy frame into the frame proper.
+            let split = f2_5 * self.channels;
+            for c in 0..self.channels {
+                for i in 0..f2_5 {
+                    let w = {
+                        let x = self.celt_window[i * self.downsample];
+                        x * x
+                    };
+                    let idx = split + i * self.channels + c;
+                    if idx < out.len() && idx < redundant.len() {
+                        out[idx] = w * out[idx] + (1.0 - w) * redundant[idx];
+                    }
+                }
+            }
+        }
+
         self.prev_mode = Some(mode);
-        self.prev_redundancy = false;
-        Ok(dec.range())
+        self.prev_redundancy = redundancy && !celt_to_silk;
+        Ok(dec.range() ^ redundant_rng)
+    }
+}
+
+/// Cross-fades `b` over `a` across `overlap` samples using the CELT window,
+/// the shape the reference uses for redundancy and mode transitions.
+fn smooth_fade(
+    a: &mut [f32],
+    b: &[f32],
+    overlap: usize,
+    channels: usize,
+    window: &[f32],
+    downsample: usize,
+) {
+    let inc = downsample;
+    for c in 0..channels {
+        for i in 0..overlap {
+            let w = window[i * inc] * window[i * inc];
+            let idx = i * channels + c;
+            if idx < a.len() && idx < b.len() {
+                a[idx] = w * b[idx] + (1.0 - w) * a[idx];
+            }
+        }
     }
 }
