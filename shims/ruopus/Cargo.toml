@@ -1,0 +1,22 @@
+[package]
+name = "ruopus"
+description = "Compatibility shim: the ruopus 0.1.2 surface edith consumes, served by ec-opus."
+version = "0.1.2"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+ec-opus = { path = "../../crates/ec-opus", version = "0.1.0" }
+
+# The incumbent's feature names, all no-ops here. A `[patch.crates-io]` consumer
+# that names a feature the patch lacks fails to *resolve*, so the swap needs
+# them declared even though nothing behind them is optional in this crate:
+# `spectrograms` bought the incumbent an FFT-backed MDCT (fifteen crates), and
+# `ec-opus` has that path unconditionally through `ec-dsp`.
+[features]
+default = ["std", "spectrograms"]
+std = []
+spectrograms = ["std"]
+libm = []
