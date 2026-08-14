@@ -8,7 +8,10 @@
 //!   reservoir across frames.
 //! - [`Mp3Decoder`], the [`ec_core::Decoder`] contract, for a container that
 //!   hands out one Layer III frame per packet.
-//! - [`Mp3Encoder`]: interleaved PCM in, CBR Layer III frames out.
+//! - [`Mp3Encoder`]: interleaved PCM in, CBR Layer III frames out, with a
+//!   Xing/Info header carrying the encoder delay and padding — so a decoder
+//!   that honours it hands back exactly the samples that went in, with no
+//!   leading or trailing silence.
 //!
 //! **Where the constants came from.** Layer III's Huffman code tables and its
 //! 512-tap polyphase window are normative data no formula produces. Rather

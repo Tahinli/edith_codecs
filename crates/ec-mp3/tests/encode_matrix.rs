@@ -199,7 +199,29 @@ fn encodes_above_the_incumbent_bar() {
                 .chunks_exact(4)
                 .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
                 .collect();
-            let (corr, _offset) = aligned(&decoded, &pcm, channels);
+            // With the Info tag's delay and padding honoured, ffmpeg hands
+            // back exactly the samples that went in: same count, no shift. That
+            // is the gapless claim, so the correlation is measured at lag zero
+            // rather than at whatever lag looks best.
+            if decoded.len() != pcm.len() {
+                failures.push(format!(
+                    "{}: decoded {} samples, pushed {}",
+                    source.file_name().unwrap().to_string_lossy(),
+                    decoded.len(),
+                    pcm.len()
+                ));
+            }
+            let corr = correlation(&decoded, &pcm);
+            // A periodic fixture correlates equally well a whole period out,
+            // so a tie is not a misalignment; only a shift that is genuinely
+            // better than lag zero is.
+            let (searched, offset) = aligned(&decoded, &pcm, channels);
+            if offset != 0 && searched > corr + 1e-4 {
+                failures.push(format!(
+                    "{}: lag {offset} correlates {searched:.6}, better than lag zero {corr:.6}",
+                    source.file_name().unwrap().to_string_lossy(),
+                ));
+            }
             let seconds = pcm.len() as f64 / (rate as f64 * channels as f64);
             let measured = bytes.len() as f64 * 8.0 / seconds / 1000.0;
             let name = source.file_name().unwrap().to_string_lossy();

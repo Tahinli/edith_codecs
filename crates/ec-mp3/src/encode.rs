@@ -20,7 +20,7 @@
 use crate::filterbank::{Analysis, alias_expand};
 use crate::header::{ChannelMode, FrameHeader, Version};
 use crate::huffman::{self, Table};
-use crate::tables::{MAX_QUANT, SLEN, long_starts, power43, short_starts, windows};
+use crate::tables::{MAX_QUANT, SLEN, long_starts, power43, short_starts, short_widths, windows};
 use ec_core::bitio::BitWriter;
 use ec_core::error::{Error, Result};
 use ec_dsp::{RealFft, Window};
@@ -101,6 +101,9 @@ pub struct Mp3Encode {
     history: Vec<[[f32; 32]; 18]>,
     /// Window type chosen for the granule we are holding back.
     pending: Vec<PendingGranule>,
+    /// The block type each channel's previous granule used. Window switching
+    /// is a sequence, and the sequence does not restart at a frame boundary.
+    previous_block: Vec<u8>,
     fft: RealFft<f32>,
     fft_window: Window<f32>,
     psy_history: Vec<Vec<f32>>,
@@ -161,6 +164,7 @@ impl Mp3Encode {
             slots: vec![Vec::new(); channels],
             history: vec![[[0.0; 32]; 18]; channels],
             pending: Vec::new(),
+            previous_block: vec![0; channels],
             fft: RealFft::new(1024),
             fft_window: Window::sine(1024),
             psy_history: vec![vec![0.0; 1024]; channels],
@@ -242,6 +246,7 @@ impl Mp3Encoder {
                 None => self.config.bitrate_kbps.max(8),
             };
             self.core = Some(Mp3Encode::new(sample_rate, usize::from(channels), bitrate)?);
+            self.pcm.resize(PRIMING * usize::from(channels.max(1)), 0.0);
         }
         self.pcm.extend_from_slice(interleaved);
         self.total_samples += (interleaved.len() / usize::from(channels.max(1))) as u64;
@@ -268,10 +273,11 @@ impl Mp3Encoder {
     pub fn finish(&mut self) {
         if let Some(core) = &self.core {
             let channels = core.channels;
-            // The filterbank runs fifteen slots behind, and the MDCT one
-            // granule behind that; feed silence so the last real samples come
-            // out the other end.
-            let tail = vec![0.0f32; channels * (576 * 2 + 480)];
+            // The filterbank runs fifteen slots behind, the MDCT one granule
+            // behind that, and block switching holds one more granule back to
+            // look ahead; feed silence so every real sample comes out the other
+            // end rather than being dropped with the pipeline.
+            let tail = vec![0.0f32; channels * (576 * 3 + 480)];
             self.pcm.extend_from_slice(&tail);
         }
         self.drain(true);
@@ -294,6 +300,7 @@ impl Mp3Encoder {
                 block.resize(need, 0.0);
                 core.encode_block(&block);
             }
+            core.flush_pending();
             core.flush_frames();
         }
         while let Some(frame) = core.ready.pop_front() {
@@ -307,7 +314,7 @@ impl Mp3Encoder {
         if !self.header_written && (self.finished || !self.frames.is_empty()) {
             self.header_written = true;
             if let Some(core) = &self.core {
-                return Ok(info_frame(core, self.total_samples));
+                return Ok(info_frame(core, self.total_samples, self.finished));
             }
         }
         match self.frames.pop_front() {
@@ -318,20 +325,102 @@ impl Mp3Encoder {
     }
 }
 
+/// Silence prepended to the first PCM the encoder is given.
+///
+/// The first MDCT block has no predecessor to overlap with, so the frame it
+/// produces cannot reconstruct — the transform's startup, not a coding loss.
+/// Priming with a frame of silence puts that region before the audio instead
+/// of on top of it, and the delay field below tells a decoder to drop it. It
+/// is what makes the first frame of a gapless decode as good as the rest;
+/// without it that frame correlates 0.67 against its input while every other
+/// frame is above 0.999.
+const PRIMING: usize = 1152;
+
+/// Samples of PCM this encoder's pipeline runs ahead of its output: the
+/// [`PRIMING`] silence, plus the analysis bank running fifteen slots behind
+/// its input and the MDCT one granule behind that, less what the decoder's
+/// synthesis gives back. Measured end to end (encode, decode,
+/// cross-correlate) as 1728 samples of lag, of which 529 is the decoder delay
+/// every LAME-tag consumer adds for itself.
+///
+/// `encoder_delay_is_what_the_tag_says` is that measurement as a test: change
+/// the pipeline and it fails rather than silently mis-stating the tag.
+pub(crate) const ENCODER_DELAY: u32 = PRIMING as u32 + 47;
+
+/// The decoder delay a LAME tag consumer adds to the encoder delay. Fixed by
+/// the tag's own convention, not by anything here, so nothing in the encoder
+/// spends it — `encoder_delay_is_what_the_tag_says` is what it is for.
+#[allow(dead_code)]
+const DECODER_DELAY: u32 = 529;
+
+/// The nine-byte encoder string in the LAME extension.
+///
+/// It says `LAME3.100` and not `ec-mp3` on purpose, and this is the one place
+/// this crate writes something it is not: ffmpeg (and every player that copied
+/// its parser) only reads the delay and padding fields when those first four
+/// bytes are `LAME`, `Lavc` or `Lavf`. Writing our own name there produces a
+/// tag that parses and is then ignored, which is worse than useless — the
+/// gapless information would be present and unusable. The rest of the
+/// extension is filled honestly or zeroed.
+const LAME_VERSION: &[u8; 9] = b"LAME3.100";
+
 /// The Xing/Info header frame every player expects first: a silent frame whose
 /// main data is the tag, so a decoder that does not know the tag still decodes
 /// a legal (silent) frame rather than choking.
-fn info_frame(core: &Mp3Encode, samples: u64) -> Vec<u8> {
+///
+/// Carries frame and byte counts and — the point of it — the encoder delay and
+/// padding, which is what lets a decoder hand back exactly the samples that
+/// went in. Those two are exact when the caller pushes all its PCM before
+/// pulling packets, which is the pattern the family's exporter uses; a caller
+/// that interleaves pushes and pulls gets the delay (a constant) right and the
+/// counts as of the first pull.
+fn info_frame(core: &Mp3Encode, samples: u64, complete: bool) -> Vec<u8> {
     let header = core.header();
     let frame_len = header.frame_len().unwrap_or(417);
     let mut out = vec![0u8; frame_len];
     out[..4].copy_from_slice(&header.to_bytes());
     let at = 4 + header.side_info_len();
-    let tag: &[u8] = b"Info";
-    out[at..at + 4].copy_from_slice(tag);
-    out[at + 4..at + 8].copy_from_slice(&1u32.to_be_bytes()); // frames field present
-    let frames = samples.div_ceil(header.samples_per_frame() as u64) as u32;
-    out[at + 8..at + 12].copy_from_slice(&frames.to_be_bytes());
+    let spf = header.samples_per_frame() as u64;
+    let (frames, padding) = if complete {
+        let frames = core.frames;
+        let coded = u64::from(frames) * spf;
+        let padding = coded.saturating_sub(samples + u64::from(ENCODER_DELAY));
+        (frames, padding.min(4095) as u32)
+    } else {
+        (0, 0)
+    };
+    let bytes = if complete {
+        (u64::from(frames) + 1) * frame_len as u64
+    } else {
+        0
+    };
+
+    let mut tag: Vec<u8> = Vec::with_capacity(64);
+    tag.extend_from_slice(b"Info"); // constant bitrate; "Xing" is the VBR name
+    tag.extend_from_slice(&3u32.to_be_bytes()); // frames and bytes present
+    tag.extend_from_slice(&frames.to_be_bytes());
+    tag.extend_from_slice(&(bytes.min(u64::from(u32::MAX)) as u32).to_be_bytes());
+    tag.extend_from_slice(LAME_VERSION);
+    tag.push(0); // tag revision and VBR method
+    tag.push(0); // lowpass in 100 Hz units, unstated
+    tag.extend_from_slice(&0u32.to_be_bytes()); // replay gain peak
+    tag.extend_from_slice(&0u16.to_be_bytes()); // radio replay gain
+    tag.extend_from_slice(&0u16.to_be_bytes()); // audiophile replay gain
+    tag.push(0); // encoding flags and ATH type
+    tag.push(core.bitrate_kbps.min(255) as u8);
+    let delay_padding = (ENCODER_DELAY << 12) | padding;
+    tag.extend_from_slice(&delay_padding.to_be_bytes()[1..]); // 12 bits each
+    tag.push(0); // misc
+    tag.push(0); // mp3gain
+    tag.extend_from_slice(&0u16.to_be_bytes()); // preset and surround info
+    tag.extend_from_slice(&0u32.to_be_bytes()); // music length
+    tag.extend_from_slice(&0u16.to_be_bytes()); // music CRC
+    tag.extend_from_slice(&0u16.to_be_bytes()); // tag CRC
+    // A frame too small to hold the whole tag keeps the fields that fit, in
+    // order, which is how the parsers read it anyway.
+    let room = frame_len - at;
+    let take = tag.len().min(room);
+    out[at..at + take].copy_from_slice(&tag[..take]);
     out
 }
 
@@ -451,28 +540,36 @@ impl Mp3Encode {
         let frame_len = header.frame_len().unwrap_or(0);
         let capacity = frame_len - 4 - header.side_info_len();
 
-        // Window types: a granule whose successor is much louder starts the
-        // switch, the loud one is short, and the one after stops it.
+        // Window types. A granule whose successor is much louder starts the
+        // switch, the loud one is short, and the one after stops it — and the
+        // sequence carries across frames, because a start window in the last
+        // granule of one frame demands a short block in the first granule of
+        // the next. Restarting it per frame is what leaves a start window
+        // facing a normal one, whose overlap does not reconstruct.
         let mut types = vec![0u8; granules * channels];
         for gr in 0..granules {
             for ch in 0..channels {
                 let index = gr * channels + ch;
-                let next = index + channels;
                 let here = self.pending[index].energy;
-                let there = self.pending.get(next).map_or(here, |g| g.energy);
-                if there > here * 8.0 + 1e-6 {
-                    types[index] = 1; // start
-                }
-            }
-        }
-        for gr in 0..granules {
-            for ch in 0..channels {
-                let index = gr * channels + ch;
-                if index >= channels && types[index - channels] == 1 {
-                    types[index] = 2; // short
-                } else if index >= 2 * channels && types[index - 2 * channels] == 2 {
-                    types[index] = 3; // stop
-                }
+                let next = self
+                    .pending
+                    .get(index + channels)
+                    .map_or(here, |g| g.energy);
+                // Digital silence is not a transient to protect: switching on
+                // the way out of it (the priming, or a cut in a timeline) costs
+                // the resolution a long block would have spent on the attack
+                // itself, and there is no pre-echo to hide when nothing
+                // precedes it.
+                let attack = here > 1e-9 && next > here * 8.0 + 1e-6;
+                let block = match self.previous_block[ch] {
+                    1 => 2,
+                    2 if attack => 2,
+                    2 => 3,
+                    _ if attack => 1,
+                    _ => 0,
+                };
+                types[index] = block;
+                self.previous_block[ch] = block;
             }
         }
 
@@ -591,6 +688,14 @@ impl Mp3Encode {
         }
     }
 
+    /// Encodes the granules still held back for block-switching lookahead.
+    fn flush_pending(&mut self) {
+        let per_frame = self.granules() * self.channels;
+        while self.pending.len() >= per_frame {
+            self.emit_frame();
+        }
+    }
+
     /// Writes out whatever frames are still queued, padding the stream so the
     /// last frame is complete.
     fn flush_frames(&mut self) {
@@ -692,9 +797,12 @@ fn quantise_granule(
     // Spending the bits matters as much as the threshold does — a granule that
     // stops early leaves the extra bitrate on the floor, which is what makes an
     // encoder's quality flat across 128 and 320 kbit/s.
+    // Short blocks carry twelve bands, long ones twenty-one.
+    let bands = if block_type == 2 { 12 } else { SFB_LONG };
+    let threshold = band_thresholds(threshold, block_type, sample_rate);
     for _round in 0..20 {
         let (granule, noise) = code_with(xr, block_type, target_bits, &scalefac, sample_rate);
-        let ratios: Vec<f64> = (0..SFB_LONG)
+        let ratios: Vec<f64> = (0..bands)
             .map(|b| f64::from(noise[b]) / f64::from(threshold[b]).max(1e-30))
             .collect();
         let score: f64 = ratios.iter().sum();
@@ -702,14 +810,13 @@ fn quantise_granule(
         if best.as_ref().is_none_or(|(_, s)| score < *s) {
             best = Some((granule, score));
         }
-        if block_type == 2 {
-            break; // short blocks carry no long scalefactors here
-        }
         if spent * 20 > target_bits * 19 {
             break; // the budget is spent; amplifying now only coarsens
         }
         // Amplify the bands that are worst against their threshold.
-        let mut order: Vec<usize> = (0..SFB_LONG).filter(|&b| scalefac[b] < 15).collect();
+        let mut order: Vec<usize> = (0..bands)
+            .filter(|&b| scalefac[b] < max_scalefac(b, block_type))
+            .collect();
         order.sort_by(|a, b| ratios[*b].total_cmp(&ratios[*a]));
         let over: Vec<usize> = order.iter().copied().filter(|&b| ratios[b] > 1.0).collect();
         let chosen: Vec<usize> = if over.is_empty() {
@@ -727,6 +834,66 @@ fn quantise_granule(
     best.expect("at least one round runs").0
 }
 
+/// Bitstream order for a short block's spectrum.
+///
+/// A short granule is coded band by band, window by window, line by line,
+/// while the spectrum the transform produces interleaves the three windows on
+/// every line — the decoder's reorder step. The encoder has to undo it before
+/// Huffman coding; writing spectral order instead costs exactly the same
+/// number of bits, lands exactly on `part2_3_length`, and hands the decoder a
+/// permuted granule, which comes back as noise.
+fn short_reorder(sample_rate: u32, spectral: &[i32]) -> Vec<i32> {
+    let widths = short_widths(sample_rate);
+    let starts = short_starts(sample_rate);
+    let mut out = Vec::with_capacity(576);
+    for sfb in 0..13 {
+        let (width, start) = (usize::from(widths[sfb]), usize::from(starts[sfb]));
+        for window in 0..3 {
+            for line in 0..width {
+                let position = (start + line) * 3 + window;
+                out.push(spectral.get(position).copied().unwrap_or(0));
+            }
+        }
+    }
+    out.resize(576, 0);
+    out
+}
+
+/// The largest scalefactor a band can actually carry.
+///
+/// `scalefac_compress` names two lengths, and the second partition's is at most
+/// three bits — so a band above the split cannot hold more than 7 however much
+/// the distortion loop would like to amplify it. Ignoring that ceiling is not a
+/// rounding error: the quantiser uses the value it wanted, no length can encode
+/// it, and the decoder reconstructs the band with a scalefactor of zero, which
+/// turns the granule into noise.
+fn max_scalefac(band: usize, block_type: u8) -> u8 {
+    let split = if block_type == 2 { 6 } else { 11 };
+    if band < split { 15 } else { 7 }
+}
+
+/// The masking model works in long bands; a short block's twelve bands are
+/// read off it at the same frequencies, so one model serves both.
+fn band_thresholds(threshold: &[f32], block_type: u8, sample_rate: u32) -> Vec<f32> {
+    if block_type != 2 {
+        return threshold.to_vec();
+    }
+    let long = long_starts(sample_rate);
+    let short = short_starts(sample_rate);
+    (0..12)
+        .map(|band| {
+            // A short band's lines sit at three times its index in the spectrum.
+            let line = usize::from(short[band]) * 3;
+            let long_band = (0..SFB_LONG)
+                .rev()
+                .find(|&b| line >= usize::from(long[b]))
+                .unwrap_or(0);
+            // Three windows share the band, so each carries a third of it.
+            threshold[long_band] / 3.0
+        })
+        .collect()
+}
+
 /// Quantises with a fixed scalefactor set, running the rate loop on
 /// `global_gain`, and reports the noise each band ends up with.
 fn code_with(
@@ -736,10 +903,11 @@ fn code_with(
     scalefac: &[u8; SFB_LONG],
     sample_rate: u32,
 ) -> (CodedGranule, [f32; SFB_LONG]) {
-    let (slen1, slen2, compress) = scalefac_compress(scalefac);
-    // The scalefactors come out of the same budget as the spectrum does.
+    let (slen1, slen2, compress) = scalefac_compress(scalefac, block_type);
+    // The scalefactors come out of the same budget as the spectrum does. A
+    // short block transmits six bands of each length, once per window.
     let scalefac_bits = if block_type == 2 {
-        0
+        (slen1 + slen2) * 18
     } else {
         slen1 * 11 + slen2 * 10
     };
@@ -759,13 +927,20 @@ fn code_with(
     // while the granule is too big for them. A line that saturates the coding
     // range is not "cheap", it is clipped, so that check comes first.
     let saturated = |ix: &[i32]| ix.iter().any(|v| v.abs() > 8191);
+    let for_coding = |ix: &[i32]| -> Vec<i32> {
+        if block_type == 2 {
+            short_reorder(sample_rate, ix)
+        } else {
+            ix.to_vec()
+        }
+    };
     quantise(xr, gain, scalefac, sample_rate, block_type, &mut ix);
-    coded = code_spectrum(&ix, block_type, sample_rate);
+    coded = code_spectrum(&for_coding(&ix), block_type, sample_rate);
     loop {
         if (saturated(&ix) || coded.0 > target_bits) && gain < 255 {
             gain += 1;
             quantise(xr, gain, scalefac, sample_rate, block_type, &mut ix);
-            coded = code_spectrum(&ix, block_type, sample_rate);
+            coded = code_spectrum(&for_coding(&ix), block_type, sample_rate);
             continue;
         }
         if saturated(&ix) || coded.0 > target_bits || gain == 0 {
@@ -775,7 +950,7 @@ fn code_with(
         // inside the coding range.
         let mut trial = ix.clone();
         quantise(xr, gain - 1, scalefac, sample_rate, block_type, &mut trial);
-        let trial_coded = code_spectrum(&trial, block_type, sample_rate);
+        let trial_coded = code_spectrum(&for_coding(&trial), block_type, sample_rate);
         if trial_coded.0 > target_bits || saturated(&trial) {
             break;
         }
@@ -793,27 +968,46 @@ fn code_with(
         for slot in ix.iter_mut().skip(limit) {
             *slot = 0;
         }
-        coded = code_spectrum(&ix, block_type, sample_rate);
+        coded = code_spectrum(&for_coding(&ix), block_type, sample_rate);
     }
     let (_, big_values, tables, region0, region1, count1_select, bits) = coded;
     let mut noise = [0.0f32; SFB_LONG];
-    let starts = long_starts(sample_rate);
     let power = power43();
-    for band in 0..SFB_LONG {
-        let (from, to) = (usize::from(starts[band]), usize::from(starts[band + 1]));
+    let residual = |i: usize, band: usize| -> f32 {
         let scale = band_gain(gain, scalefac[band], block_type);
-        let mut sum = 0.0f32;
-        for i in from..to.min(576) {
-            let magnitude = power[(ix[i].unsigned_abs() as usize).min(MAX_QUANT)] * scale;
-            let reconstructed = if ix[i] < 0 { -magnitude } else { magnitude };
-            sum += (xr[i] - reconstructed).powi(2);
+        let magnitude = power[(ix[i].unsigned_abs() as usize).min(MAX_QUANT)] * scale;
+        let reconstructed = if ix[i] < 0 { -magnitude } else { magnitude };
+        (xr[i] - reconstructed).powi(2)
+    };
+    if block_type == 2 {
+        for (i, _) in ix.iter().enumerate().take(576) {
+            let band = short_band(i, sample_rate);
+            noise[band.min(SFB_LONG - 1)] += residual(i, band);
         }
-        noise[band] = sum;
+    } else {
+        let starts = long_starts(sample_rate);
+        for band in 0..SFB_LONG {
+            let (from, to) = (usize::from(starts[band]), usize::from(starts[band + 1]));
+            let mut sum = 0.0f32;
+            for i in from..to.min(576) {
+                sum += residual(i, band);
+            }
+            noise[band] = sum;
+        }
     }
     let mut out = BitWriter::new();
-    for (band, value) in scalefac.iter().enumerate() {
-        let slen = if band < 11 { slen1 } else { slen2 };
-        if block_type != 2 {
+    if block_type == 2 {
+        // The decoder reads short scalefactors band-major, three windows at a
+        // time; ours are one per band, so each is written three times.
+        for (band, value) in scalefac.iter().enumerate().take(12) {
+            let slen = if band < 6 { slen1 } else { slen2 };
+            for _window in 0..3 {
+                out.write_bits(u32::from(*value), slen);
+            }
+        }
+    } else {
+        for (band, value) in scalefac.iter().enumerate() {
+            let slen = if band < 11 { slen1 } else { slen2 };
             out.write_bits(u32::from(*value), slen);
         }
     }
@@ -840,13 +1034,9 @@ fn code_with(
     (granule, noise)
 }
 
-fn band_gain(gain: i32, scalefac: u8, block_type: u8) -> f32 {
+fn band_gain(gain: i32, scalefac: u8, _block_type: u8) -> f32 {
     let base = (gain as f32 - 210.0) * 0.25;
-    if block_type == 2 {
-        base.exp2()
-    } else {
-        (base - 0.5 * f32::from(scalefac)).exp2()
-    }
+    (base - 0.5 * f32::from(scalefac)).exp2()
 }
 
 /// The spectrum as integers, per the decoder's requantisation read backwards.
@@ -858,6 +1048,22 @@ fn quantise(
     block_type: u8,
     ix: &mut [i32],
 ) {
+    let quantise_line = |xr: f32, scale: f32| -> i32 {
+        let value = (xr.abs() * scale).powf(0.75);
+        let magnitude = (value + 0.4054).min(MAX_QUANT as f32) as i32;
+        if xr < 0.0 { -magnitude } else { magnitude }
+    };
+    if block_type == 2 {
+        // Short blocks: twelve bands, each with its own scalefactor shared by
+        // the three windows. Without them the quantiser's noise is flat across
+        // the spectrum, which is what made a switched granule the worst-coded
+        // one in the stream.
+        for (i, slot) in ix.iter_mut().enumerate().take(576) {
+            let scale = 1.0 / band_gain(gain, scalefac[short_band(i, sample_rate)], block_type);
+            *slot = quantise_line(xr[i], scale);
+        }
+        return;
+    }
     let starts = long_starts(sample_rate);
     // 22 bands, not 21: the topmost band carries no transmitted scalefactor,
     // but it does carry audio — zeroing it low-passes the encoder at 16 kHz.
@@ -869,11 +1075,21 @@ fn quantise(
         let scalefac = if band < SFB_LONG { scalefac[band] } else { 0 };
         let scale = 1.0 / band_gain(gain, scalefac, block_type);
         for i in from..to {
-            let value = (xr[i].abs() * scale).powf(0.75);
-            let magnitude = (value + 0.4054).min(MAX_QUANT as f32) as i32;
-            ix[i] = if xr[i] < 0.0 { -magnitude } else { magnitude };
+            ix[i] = quantise_line(xr[i], scale);
         }
     }
+}
+
+/// The short scalefactor band a spectral line belongs to. Short-block spectra
+/// interleave the three windows line by line, so the line index divided by
+/// three is the frequency line the band table is indexed by.
+fn short_band(index: usize, sample_rate: u32) -> usize {
+    let line = index / 3;
+    let starts = short_starts(sample_rate);
+    (0..13)
+        .rev()
+        .find(|&band| line >= usize::from(starts[band]))
+        .unwrap_or(0)
 }
 
 /// Chooses the region split, the tables and the count1 boundary, and writes the
@@ -902,24 +1118,37 @@ fn code_spectrum(
     let big_end = count1_start;
 
     let starts = long_starts(sample_rate);
-    let short = block_type == 2;
-    // Region boundaries land on band edges. Splitting the big-value region in
-    // three roughly equal parts is what makes the three tables specialise;
-    // searching every legal split costs far more than it saves.
-    let (region0, region1, bounds) = if short {
-        let first = usize::from(short_starts(sample_rate)[3]) * 3;
-        (8u32, 12u32, [first.min(big_end), big_end, big_end])
-    } else {
-        let band_at = |target: usize| -> usize {
-            (0..21)
-                .min_by_key(|&b| usize::from(starts[b + 1]).abs_diff(target))
-                .unwrap_or(7)
-        };
-        let r0 = band_at(big_end / 3).min(15);
-        let r1 = band_at(big_end * 2 / 3).saturating_sub(r0 + 1).min(7);
-        let a = usize::from(starts[(r0 + 1).min(21)]).min(big_end);
-        let b = usize::from(starts[(r0 + r1 + 2).min(21)]).min(big_end);
-        (r0 as u32, r1 as u32, [a, b.max(a), big_end])
+    // Region boundaries land on band edges. A granule that switches windows
+    // does not transmit `region0_count`/`region1_count` at all — the decoder
+    // derives them (three short bands for a short block, eight long bands
+    // otherwise, with region 2 empty) — so the encoder has to use exactly
+    // those, not a split of its own. Choosing differently costs no bits and
+    // parses as different tables, which is a granule of noise wherever the
+    // window switches. Only a normal block gets to pick.
+    let (region0, region1, bounds) = match block_type {
+        2 => {
+            let first = usize::from(short_starts(sample_rate)[3]) * 3;
+            (8u32, 12u32, [first.min(big_end), big_end, big_end])
+        }
+        1 | 3 => {
+            let first = usize::from(starts[8]);
+            (7u32, 13u32, [first.min(big_end), big_end, big_end])
+        }
+        _ => {
+            // Splitting the big-value region in three roughly equal parts is
+            // what makes the three tables specialise; searching every legal
+            // split costs far more than it saves.
+            let band_at = |target: usize| -> usize {
+                (0..21)
+                    .min_by_key(|&b| usize::from(starts[b + 1]).abs_diff(target))
+                    .unwrap_or(7)
+            };
+            let r0 = band_at(big_end / 3).min(15);
+            let r1 = band_at(big_end * 2 / 3).saturating_sub(r0 + 1).min(7);
+            let a = usize::from(starts[(r0 + 1).min(21)]).min(big_end);
+            let b = usize::from(starts[(r0 + r1 + 2).min(21)]).min(big_end);
+            (r0 as u32, r1 as u32, [a, b.max(a), big_end])
+        }
     };
 
     let mut tables = [0u8; 3];
@@ -1030,17 +1259,26 @@ fn table_cost(ix: &[i32], from: usize, to: usize, table: Table) -> Option<u32> {
 }
 
 /// The `scalefac_compress` index whose two lengths hold these scalefactors.
-fn scalefac_compress(scalefac: &[u8; SFB_LONG]) -> (u32, u32, u32) {
+fn scalefac_compress(scalefac: &[u8; SFB_LONG], block_type: u8) -> (u32, u32, u32) {
     let bits_for = |slice: &[u8]| -> u32 {
         let max = slice.iter().copied().max().unwrap_or(0);
         (0..=4u32).find(|n| max < (1 << n)).unwrap_or(4)
     };
-    let need1 = bits_for(&scalefac[..11]);
-    let need2 = bits_for(&scalefac[11..]);
-    let mut best = (u32::MAX, 0u32, 0u32, 0u32);
+    // Long blocks split their bands 11/10, short blocks 6/6 per window.
+    let (first, second, cost1, cost2) = if block_type == 2 {
+        (&scalefac[..6], &scalefac[6..12], 18, 18)
+    } else {
+        (&scalefac[..11], &scalefac[11..], 11, 10)
+    };
+    // The table's longest pair is (4, 3), so a caller that respects
+    // `max_scalefac` always finds an entry; the clamp is what keeps a caller
+    // that does not from silently coding a granule the decoder cannot rebuild.
+    let need1 = bits_for(first).min(4);
+    let need2 = bits_for(second).min(3);
+    let mut best = (u32::MAX, 4u32, 3u32, 15u32);
     for (index, (slen1, slen2)) in SLEN.iter().enumerate() {
         if *slen1 >= need1 && *slen2 >= need2 {
-            let cost = slen1 * 11 + slen2 * 10;
+            let cost = slen1 * cost1 + slen2 * cost2;
             if cost < best.0 {
                 best = (cost, *slen1, *slen2, index as u32);
             }
@@ -1052,6 +1290,187 @@ fn scalefac_compress(scalefac: &[u8; SFB_LONG]) -> (u32, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The delay the Info tag states is the delay the pipeline has. Our own
+    /// decoder ignores the tag, so what it hands back is the untrimmed stream:
+    /// the content starts exactly `ENCODER_DELAY + DECODER_DELAY` samples in.
+    #[test]
+    fn encoder_delay_is_what_the_tag_says() {
+        for (rate, channels) in [(44100u32, 1usize), (48000, 2)] {
+            let n = 1152 * 8;
+            let pcm: Vec<f32> = (0..n * channels)
+                .map(|i| {
+                    let t = (i / channels) as f32;
+                    0.3 * (t * 0.11).sin() + 0.2 * (t * 0.7).cos()
+                })
+                .collect();
+            let mut encoder = Mp3Encoder::new(Mp3EncoderConfig {
+                bitrate_kbps: 320,
+                vbr_quality: None,
+            });
+            encoder
+                .push_pcm_f32(&pcm, channels as u16, rate)
+                .expect("encoder accepts this shape");
+            encoder.finish();
+            let mut bytes = Vec::new();
+            while let Ok(frame) = encoder.next_packet() {
+                bytes.extend_from_slice(&frame);
+            }
+            let mut reader = crate::Mp3Reader::new();
+            reader.push(&bytes);
+            let mut out: Vec<f32> = Vec::new();
+            for frame in reader.decode_all() {
+                out.extend_from_slice(&frame.samples);
+            }
+            let mut best = (f64::MIN, 0usize);
+            let window = 4096 * channels;
+            let mut lag = 0;
+            while lag + window * 2 < out.len() {
+                let (mut ab, mut aa, mut bb) = (0.0f64, 0.0f64, 0.0f64);
+                for i in 0..window {
+                    let (x, y) = (out[lag + window + i] as f64, pcm[window + i] as f64);
+                    ab += x * y;
+                    aa += x * x;
+                    bb += y * y;
+                }
+                let corr = ab / (aa * bb).sqrt().max(1e-30);
+                if corr > best.0 {
+                    best = (corr, lag / channels);
+                }
+                lag += channels;
+            }
+            assert!(best.0 > 0.999, "round trip correlation {:.6}", best.0);
+            assert_eq!(
+                best.1 as u32,
+                ENCODER_DELAY + DECODER_DELAY,
+                "measured lag at {rate} Hz, {channels} channels"
+            );
+        }
+    }
+
+    /// The whole window sequence — normal, start, short, stop, normal — has to
+    /// reconstruct, not just the long blocks. This runs the transform pair
+    /// directly, so a failure points at the windows rather than at the
+    /// quantiser.
+    #[test]
+    fn window_sequence_reconstructs() {
+        use crate::filterbank::Imdct;
+        let imdct = Imdct::default();
+        let types = [0u8, 0, 1, 2, 3, 0, 0];
+        let signal: Vec<f32> = (0..18 * (types.len() + 2))
+            .map(|i| ((i as f32) * 0.37).sin() + 0.3 * ((i as f32) * 1.7).cos())
+            .collect();
+        let mut output = vec![0.0f32; signal.len()];
+        let mut overlap = [0.0f32; 18];
+        for (granule, block_type) in types.iter().enumerate() {
+            let mut window = [0.0f32; 36];
+            for (i, slot) in window.iter_mut().enumerate() {
+                let index = granule * 18 + i;
+                if index < signal.len() {
+                    *slot = signal[index];
+                }
+            }
+            let mut spectrum = [0.0f32; 18];
+            if *block_type == 2 {
+                mdct_short(&window, &mut spectrum);
+            } else {
+                mdct_long(&window, *block_type, &mut spectrum);
+            }
+            let mut block = [0.0f32; 36];
+            if *block_type == 2 {
+                imdct.short(&spectrum, &mut block);
+            } else {
+                imdct.long(&spectrum, *block_type, &mut block);
+            }
+            for t in 0..18 {
+                let index = granule * 18 + t;
+                if index < output.len() {
+                    output[index] = block[t] + overlap[t];
+                }
+            }
+            overlap.copy_from_slice(&block[18..]);
+        }
+        // The first granule has no predecessor and the last no successor.
+        for (granule, block_type) in types.iter().enumerate().take(types.len() - 1).skip(1) {
+            let mut error = 0.0f64;
+            let mut energy = 0.0f64;
+            for i in granule * 18..(granule + 1) * 18 {
+                error += (output[i] - signal[i]).powi(2) as f64;
+                energy += (signal[i] * signal[i]) as f64;
+            }
+            let snr = 10.0 * (energy / error.max(1e-30)).log10();
+            assert!(
+                snr > 60.0,
+                "granule {granule} (block type {block_type}) reconstructs at {snr:.1} dB"
+            );
+        }
+    }
+
+    /// A granule that switches to short blocks must come back as itself.
+    ///
+    /// Short blocks are coded band-major with the three windows interleaved on
+    /// every line, which is not the order the transform produces them in. Miss
+    /// that permutation and the bit count still lands exactly on
+    /// `part2_3_length`, every fixture still decodes, and only the switched
+    /// granules come back as noise — so this test drives an attack that forces
+    /// the switch and checks the granules around it.
+    #[test]
+    fn switched_granules_reconstruct() {
+        let rate = 44100u32;
+        let n = 1152 * 12;
+        let attack = 1152 * 6;
+        let pcm: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32;
+                let tone = 0.5 * (t * 0.21).sin() + 0.3 * (t * 0.93).cos();
+                // Six frames of near-silence, then full level: an attack no
+                // block-switching encoder can ignore.
+                if i < attack { tone * 0.002 } else { tone }
+            })
+            .collect();
+        let mut encoder = Mp3Encoder::new(Mp3EncoderConfig {
+            bitrate_kbps: 320,
+            vbr_quality: None,
+        });
+        encoder
+            .push_pcm_f32(&pcm, 1, rate)
+            .expect("encoder accepts this");
+        encoder.finish();
+        let mut bytes = Vec::new();
+        while let Ok(frame) = encoder.next_packet() {
+            bytes.extend_from_slice(&frame);
+        }
+        let mut reader = crate::Mp3Reader::new();
+        reader.push(&bytes);
+        let mut out: Vec<f32> = Vec::new();
+        for frame in reader.decode_all() {
+            out.extend_from_slice(&frame.samples);
+        }
+        let lag = (ENCODER_DELAY + DECODER_DELAY) as usize;
+        // Every granule from the attack onward, where the switch happens.
+        let mut worst = (1.0f64, 0usize);
+        let mut granule = attack / 576;
+        while (granule + 1) * 576 + lag <= out.len() && (granule + 1) * 576 <= pcm.len() {
+            let (mut ab, mut aa, mut bb) = (0.0f64, 0.0f64, 0.0f64);
+            for i in granule * 576..(granule + 1) * 576 {
+                let (x, y) = (out[i + lag] as f64, pcm[i] as f64);
+                ab += x * y;
+                aa += x * x;
+                bb += y * y;
+            }
+            let corr = ab / (aa * bb).sqrt().max(1e-30);
+            if corr < worst.0 {
+                worst = (corr, granule);
+            }
+            granule += 1;
+        }
+        assert!(
+            worst.0 > 0.99,
+            "granule {} reconstructs at {:.4}",
+            worst.1,
+            worst.0
+        );
+    }
 
     #[test]
     fn bitrates_snap_to_legal_values() {
