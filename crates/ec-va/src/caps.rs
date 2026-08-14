@@ -157,6 +157,12 @@ pub struct CapEntry {
     pub entrypoint: Entrypoint,
     /// `VAConfigAttribRTFormat` bitmask (`VA_RT_FORMAT_*`).
     pub rt_formats: u32,
+    /// `VAConfigAttribEncPackedHeaders` bitmask (`VA_ENC_PACKED_HEADER_*`);
+    /// zero for a decode entrypoint. An encoder has to ask for these in its
+    /// config before the driver will use the headers it writes.
+    pub packed_headers: u32,
+    /// `VAConfigAttribRateControl` bitmask (`VA_RC_*`); zero for decode.
+    pub rate_control: u32,
     /// Surface geometry and pixel formats this config accepts, when the driver
     /// reports them. `None` if `vaQuerySurfaceAttributes` refused the config.
     pub surfaces: Option<SurfaceCaps>,
@@ -224,7 +230,8 @@ fn probe_entries(display: &Arc<Display>) -> Result<Vec<CapEntry>> {
     let mut entries = Vec::new();
     for profile in query_profiles(display)? {
         for entrypoint in query_entrypoints(display, profile)? {
-            let rt_formats = query_rt_formats(display, profile, entrypoint)?;
+            let [rt_formats, packed_headers, rate_control] =
+                query_attribs(display, profile, entrypoint)?;
             // Creating the config is also how the legal surface sizes are
             // discovered: `vaQuerySurfaceAttributes` needs a config id. A
             // driver may refuse a pair it just advertised (radeonsi does this
@@ -238,6 +245,8 @@ fn probe_entries(display: &Arc<Display>) -> Result<Vec<CapEntry>> {
                 profile,
                 entrypoint,
                 rt_formats,
+                packed_headers,
+                rate_control,
                 surfaces,
             });
         }
@@ -282,15 +291,27 @@ fn query_entrypoints(display: &Arc<Display>, profile: Profile) -> Result<Vec<Ent
     Ok(raw.into_iter().map(Entrypoint::from_raw).collect())
 }
 
-fn query_rt_formats(
+/// The three config attributes this family reads, in one round trip:
+/// RT format, packed headers, rate control modes.
+fn query_attribs(
     display: &Arc<Display>,
     profile: Profile,
     entrypoint: Entrypoint,
-) -> Result<u32> {
-    let mut attrs = [sys::VAConfigAttrib {
-        type_: sys::VAConfigAttribRTFormat,
-        value: 0,
-    }];
+) -> Result<[u32; 3]> {
+    let mut attrs = [
+        sys::VAConfigAttrib {
+            type_: sys::VAConfigAttribRTFormat,
+            value: 0,
+        },
+        sys::VAConfigAttrib {
+            type_: sys::VAConfigAttribEncPackedHeaders,
+            value: 0,
+        },
+        sys::VAConfigAttrib {
+            type_: sys::VAConfigAttribRateControl,
+            value: 0,
+        },
+    ];
     // SAFETY: `attrs` is a valid, initialized array of 1 VAConfigAttrib and the
     // length passed matches. vaGetConfigAttributes writes only `value`.
     let status = unsafe {
@@ -303,7 +324,10 @@ fn query_rt_formats(
         )
     };
     check("vaGetConfigAttributes", status)?;
-    Ok(attrs[0].value)
+    // VA_ATTRIB_NOT_SUPPORTED is 0xffffffff; a decode entrypoint answers that
+    // for the encode-only attributes, and "all bits set" is not a capability.
+    let value = |a: &sys::VAConfigAttrib| if a.value == u32::MAX { 0 } else { a.value };
+    Ok([value(&attrs[0]), value(&attrs[1]), value(&attrs[2])])
 }
 
 fn query_image_formats(display: &Arc<Display>) -> Result<Vec<u32>> {
