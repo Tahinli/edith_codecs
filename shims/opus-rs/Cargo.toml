@@ -1,0 +1,12 @@
+[package]
+name = "opus-rs"
+description = "Compatibility shim: the opus-rs 0.1.26 surface edith consumes, served by ec-opus."
+version = "0.1.26"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+ec-core = { path = "../../crates/ec-core", version = "0.1.0" }
+ec-opus = { path = "../../crates/ec-opus", version = "0.1.0" }

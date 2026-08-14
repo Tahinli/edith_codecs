@@ -12,3 +12,4 @@ ec-dsp.workspace = true
 
 [dev-dependencies]
 ec-dsp.workspace = true
+ec-ogg.workspace = true

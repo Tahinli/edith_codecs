@@ -29,41 +29,41 @@ use crate::range::RangeDecoder;
 /// Bands in the 48 kHz mode.
 pub const NB_BANDS: usize = 21;
 /// Band boundaries in units of 2.5 ms MDCT bins (Table 55).
-const E_BANDS: [usize; NB_BANDS + 1] = [
+pub(crate) const E_BANDS: [usize; NB_BANDS + 1] = [
     0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, 24, 28, 34, 40, 48, 60, 78, 100,
 ];
 /// MDCT bins in a 2.5 ms frame; the window overlap is the same length.
-const SHORT_MDCT: usize = 120;
+pub(crate) const SHORT_MDCT: usize = 120;
 /// Samples of overlap between consecutive frames.
-const OVERLAP: usize = 120;
+pub(crate) const OVERLAP: usize = 120;
 /// Longest post-filter period, and the history the comb filter needs.
 #[allow(dead_code)]
 const MAX_PERIOD: usize = 1024;
 /// Shortest post-filter period.
 const MIN_PERIOD: usize = 15;
 /// Synthesis history kept per channel.
-const DECODE_BUFFER: usize = 2048;
+pub(crate) const DECODE_BUFFER: usize = 2048;
 /// Allocation resolution: 1/8 bit.
-const BITRES: u32 = 3;
+pub(crate) const BITRES: u32 = 3;
 /// Most fine-energy bits a band can get.
-const MAX_FINE_BITS: i32 = 8;
-const FINE_OFFSET: i32 = 21;
-const QTHETA_OFFSET: i32 = 4;
-const QTHETA_OFFSET_TWOPHASE: i32 = 16;
+pub(crate) const MAX_FINE_BITS: i32 = 8;
+pub(crate) const FINE_OFFSET: i32 = 21;
+pub(crate) const QTHETA_OFFSET: i32 = 4;
+pub(crate) const QTHETA_OFFSET_TWOPHASE: i32 = 16;
 
 /// `logN400`: `log2(N)` per band in 1/8 bits, for the fine-energy offset.
-const LOG_N: [i32; NB_BANDS] = [
+pub(crate) const LOG_N: [i32; NB_BANDS] = [
     0, 0, 0, 0, 0, 0, 0, 0, 8, 8, 8, 8, 16, 16, 16, 21, 21, 24, 29, 34, 36,
 ];
 
 /// Mean energy per band, subtracted before quantisation (`eMeans`, in log2).
-const E_MEANS: [f32; NB_BANDS] = [
+pub(crate) const E_MEANS: [f32; NB_BANDS] = [
     6.4375, 6.25, 5.75, 5.3125, 5.0625, 4.8125, 4.5, 4.375, 4.875, 4.6875, 4.5625, 4.4375, 4.875,
     4.625, 4.3125, 4.5, 4.375, 4.625, 4.75, 4.4375, 3.75,
 ];
 
 /// Static allocation table (Table 57), `[quality][band]`, 1/32 bit per bin.
-const BAND_ALLOCATION: [[u8; NB_BANDS]; 11] = [
+pub(crate) const BAND_ALLOCATION: [[u8; NB_BANDS]; 11] = [
     [0; NB_BANDS],
     [
         90, 80, 75, 69, 63, 56, 49, 40, 34, 29, 20, 18, 10, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -100,7 +100,7 @@ const BAND_ALLOCATION: [[u8; NB_BANDS]; 11] = [
 ];
 
 /// Laplace parameters for coarse energy, `[LM][intra][2*band]` (`e_prob_model`).
-const E_PROB_MODEL: [[[u8; 42]; 2]; 4] = [
+pub(crate) const E_PROB_MODEL: [[[u8; 42]; 2]; 4] = [
     [
         [
             72, 127, 65, 129, 66, 128, 65, 128, 64, 128, 62, 128, 64, 128, 64, 128, 92, 78, 92, 79,
@@ -152,25 +152,25 @@ const E_PROB_MODEL: [[[u8; 42]; 2]; 4] = [
 ];
 
 /// Inter-frame prediction gain for coarse energy, per LM (`pred_coef`).
-const PRED_COEF: [f32; 4] = [
+pub(crate) const PRED_COEF: [f32; 4] = [
     29440.0 / 32768.0,
     26112.0 / 32768.0,
     21248.0 / 32768.0,
     16384.0 / 32768.0,
 ];
 /// Intra-frame (across bands) prediction gain, per LM (`beta_coef`).
-const BETA_COEF: [f32; 4] = [
+pub(crate) const BETA_COEF: [f32; 4] = [
     30147.0 / 32768.0,
     22282.0 / 32768.0,
     12124.0 / 32768.0,
     6554.0 / 32768.0,
 ];
 /// The same for an intra frame.
-const BETA_INTRA: f32 = 4915.0 / 32768.0;
+pub(crate) const BETA_INTRA: f32 = 4915.0 / 32768.0;
 
 /// TF resolution adjustment, `[LM][4*transient + 2*tf_select + tf_change]`
 /// (Tables 60-63).
-const TF_SELECT: [[i32; 8]; 4] = [
+pub(crate) const TF_SELECT: [[i32; 8]; 4] = [
     [0, -1, 0, -1, 0, -1, 0, -1],
     [0, -1, 0, -2, 1, 0, 1, -1],
     [0, -2, 0, -3, 2, 0, 1, -1],
@@ -178,12 +178,12 @@ const TF_SELECT: [[i32; 8]; 4] = [
 ];
 
 /// Conservative `log2` in 1/8 bits, used to reserve the intensity parameter.
-const LOG2_FRAC: [i32; 24] = [
+pub(crate) const LOG2_FRAC: [i32; 24] = [
     0, 8, 13, 16, 19, 21, 23, 24, 26, 27, 28, 29, 30, 31, 32, 32, 33, 34, 34, 35, 36, 36, 37, 37,
 ];
 
 /// Index into [`CACHE_BITS`] per `[LM+1][band]` (`cache_index50`).
-const CACHE_INDEX: [i16; 105] = [
+pub(crate) const CACHE_INDEX: [i16; 105] = [
     -1, -1, -1, -1, -1, -1, -1, -1, 0, 0, 0, 0, 41, 41, 41, 82, 82, 123, 164, 200, 222, 0, 0, 0, 0,
     0, 0, 0, 0, 41, 41, 41, 41, 123, 123, 123, 164, 164, 240, 266, 283, 295, 41, 41, 41, 41, 41,
     41, 41, 41, 123, 123, 123, 123, 240, 240, 240, 266, 266, 305, 318, 328, 336, 123, 123, 123,
@@ -193,7 +193,7 @@ const CACHE_INDEX: [i16; 105] = [
 ];
 
 /// Bits (minus one) to code `k` pulses in each band size (`cache_bits50`).
-const CACHE_BITS: [u8; 392] = [
+pub(crate) const CACHE_BITS: [u8; 392] = [
     40, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
     7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 40, 15, 23, 28, 31, 34, 36, 38, 39, 41, 42, 43, 44, 45, 46, 47,
     47, 49, 50, 51, 52, 53, 54, 55, 55, 57, 58, 59, 60, 61, 62, 63, 63, 65, 66, 67, 68, 69, 70, 71,
@@ -216,7 +216,7 @@ const CACHE_BITS: [u8; 392] = [
 ];
 
 /// Per-band allocation ceiling, `[2*LM + stereo][band]` (`cache_caps50`).
-const CACHE_CAPS: [u8; 168] = [
+pub(crate) const CACHE_CAPS: [u8; 168] = [
     224, 224, 224, 224, 224, 224, 224, 224, 160, 160, 160, 160, 185, 185, 185, 178, 178, 168, 134,
     61, 37, 224, 224, 224, 224, 224, 224, 224, 224, 240, 240, 240, 240, 207, 207, 207, 198, 198,
     183, 144, 66, 40, 160, 160, 160, 160, 160, 160, 160, 160, 185, 185, 185, 185, 193, 193, 193,
@@ -229,17 +229,17 @@ const CACHE_CAPS: [u8; 168] = [
 ];
 
 /// Hadamard interleave order for 2, 4, 8 and 16 blocks (`ordery_table`).
-const ORDERY: [usize; 30] = [
+pub(crate) const ORDERY: [usize; 30] = [
     1, 0, //
     3, 0, 2, 1, //
     7, 0, 4, 3, 6, 1, 5, 2, //
     15, 0, 8, 7, 12, 3, 11, 4, 14, 1, 9, 6, 13, 2, 10, 5,
 ];
 
-const TRIM_ICDF: [u8; 11] = [126, 124, 119, 109, 87, 41, 19, 9, 4, 2, 0];
-const SPREAD_ICDF: [u8; 4] = [25, 23, 2, 0];
-const TAPSET_ICDF: [u8; 3] = [2, 1, 0];
-const SMALL_ENERGY_ICDF: [u8; 3] = [2, 1, 0];
+pub(crate) const TRIM_ICDF: [u8; 11] = [126, 124, 119, 109, 87, 41, 19, 9, 4, 2, 0];
+pub(crate) const SPREAD_ICDF: [u8; 4] = [25, 23, 2, 0];
+pub(crate) const TAPSET_ICDF: [u8; 3] = [2, 1, 0];
+pub(crate) const SMALL_ENERGY_ICDF: [u8; 3] = [2, 1, 0];
 
 /// Post-filter tap sets (Section 4.3.7.1).
 const POSTFILTER_GAINS: [[f32; 3]; 3] = [
@@ -249,22 +249,22 @@ const POSTFILTER_GAINS: [[f32; 3]; 3] = [
 ];
 
 /// De-emphasis coefficient, `1/(1 - 0.85 z^-1)` at 48 kHz.
-const PREEMPH: f32 = 0.850_006_1;
+pub(crate) const PREEMPH: f32 = 0.850_006_1;
 /// Internal signal scale; the output is divided by this.
-const SIG_SCALE: f32 = 32768.0;
+pub(crate) const SIG_SCALE: f32 = 32768.0;
 
-const SPREAD_NONE: usize = 0;
-const SPREAD_NORMAL: usize = 2;
-const SPREAD_AGGRESSIVE: usize = 3;
+pub(crate) const SPREAD_NONE: usize = 0;
+pub(crate) const SPREAD_NORMAL: usize = 2;
+pub(crate) const SPREAD_AGGRESSIVE: usize = 3;
 
 /// `ilog(x)`: index of the highest set bit plus one.
 #[inline]
-fn ilog(x: u32) -> i32 {
+pub(crate) fn ilog(x: u32) -> i32 {
     (32 - x.leading_zeros()) as i32
 }
 
 /// Integer square root, `floor(sqrt(x))`.
-fn isqrt32(x: u32) -> u32 {
+pub(crate) fn isqrt32(x: u32) -> u32 {
     if x == 0 {
         return 0;
     }
@@ -299,19 +299,19 @@ pub(crate) fn overlap_window() -> Vec<f32> {
 /// decimation stage, so the whole transform stays `O(n log n)` without a
 /// mixed-radix kernel in the DSP crate.
 #[derive(Clone, Debug)]
-struct Fft15 {
-    n: usize,
+pub(crate) struct Fft15 {
+    pub(crate) n: usize,
     /// Sub-transform of length `n/15`.
-    sub: Fft<f32>,
+    pub(crate) sub: Fft<f32>,
     /// `exp(2 pi i * k1 * n2 / n)` twiddles, split.
-    tw_re: Vec<f32>,
-    tw_im: Vec<f32>,
-    scratch_re: Vec<f32>,
-    scratch_im: Vec<f32>,
+    pub(crate) tw_re: Vec<f32>,
+    pub(crate) tw_im: Vec<f32>,
+    pub(crate) scratch_re: Vec<f32>,
+    pub(crate) scratch_im: Vec<f32>,
 }
 
 impl Fft15 {
-    fn new(n: usize) -> Fft15 {
+    pub(crate) fn new(n: usize) -> Fft15 {
         assert!(n.is_multiple_of(15) && (n / 15).is_power_of_two());
         let l = n / 15;
         let mut tw_re = vec![0.0; n];
@@ -334,7 +334,7 @@ impl Fft15 {
     }
 
     /// Unscaled inverse transform: `X[k] = sum x[n] exp(+2 pi i n k / N)`.
-    fn inverse(&mut self, re: &mut [f32], im: &mut [f32]) {
+    pub(crate) fn inverse(&mut self, re: &mut [f32], im: &mut [f32]) {
         let n = self.n;
         let l = n / 15;
         debug_assert_eq!(re.len(), n);
@@ -452,7 +452,7 @@ fn dft15(xr: &[f32; 15], xi: &[f32; 15]) -> ([f32; 15], [f32; 15]) {
 
 /// One inverse-MDCT plan: spectrum length `l = 15 * 2^k`, window `2*l`.
 #[derive(Clone, Debug)]
-struct ImdctPlan {
+pub(crate) struct ImdctPlan {
     /// Spectrum length.
     l: usize,
     fft: Fft15,
@@ -465,7 +465,7 @@ struct ImdctPlan {
 }
 
 impl ImdctPlan {
-    fn new(l: usize) -> ImdctPlan {
+    pub(crate) fn new(l: usize) -> ImdctPlan {
         let n = 2 * l;
         let quarter = l / 2;
         let mut rot_re = vec![0.0; quarter];
@@ -491,7 +491,7 @@ impl ImdctPlan {
     ///
     /// The window is the low-overlap one: zero outside a `l + OVERLAP` span,
     /// which is why the output is that long and not `2*l`.
-    fn inverse(
+    pub(crate) fn inverse(
         &mut self,
         spectrum: &[f32],
         stride: usize,
@@ -561,7 +561,7 @@ impl ImdctPlan {
 ///
 /// `V(n,k) = U(n,k) + U(n,k+1)` with `U` obeying
 /// `u[n][k] = u[n-1][k] + u[n][k-1] + u[n-1][k-1]` (Section 4.3.4.2).
-fn pvq_urow(n: usize, k: usize, u: &mut [u32]) -> u32 {
+pub(crate) fn pvq_urow(n: usize, k: usize, u: &mut [u32]) -> u32 {
     u[0] = 0;
     u[1] = 1;
     for (j, slot) in u.iter_mut().enumerate().take(k + 2).skip(2) {
@@ -574,7 +574,7 @@ fn pvq_urow(n: usize, k: usize, u: &mut [u32]) -> u32 {
 }
 
 /// Steps a `U` row up one dimension in place.
-fn unext(u: &mut [u32], mut ui0: u32) {
+pub(crate) fn unext(u: &mut [u32], mut ui0: u32) {
     for j in 1..u.len() {
         let ui1 = u[j].wrapping_add(u[j - 1]).wrapping_add(ui0);
         u[j - 1] = ui0;
@@ -585,7 +585,7 @@ fn unext(u: &mut [u32], mut ui0: u32) {
 }
 
 /// Steps a `U` row down one dimension in place.
-fn uprev(u: &mut [u32], mut ui0: u32) {
+pub(crate) fn uprev(u: &mut [u32], mut ui0: u32) {
     for j in 1..u.len() {
         let ui1 = u[j].wrapping_sub(u[j - 1]).wrapping_sub(ui0);
         u[j - 1] = ui0;
@@ -596,7 +596,13 @@ fn uprev(u: &mut [u32], mut ui0: u32) {
 }
 
 /// Decodes one PVQ codeword of `k` pulses in `n` dimensions.
-fn decode_pulses(dec: &mut RangeDecoder, n: usize, k: usize, y: &mut [i32], u: &mut [u32]) {
+pub(crate) fn decode_pulses(
+    dec: &mut RangeDecoder,
+    n: usize,
+    k: usize,
+    y: &mut [i32],
+    u: &mut [u32],
+) {
     let v = pvq_urow(n, k, u);
     let mut i = dec.dec_uint(v.max(2));
     let mut k = k;
@@ -626,14 +632,14 @@ fn decode_pulses(dec: &mut RangeDecoder, n: usize, k: usize, y: &mut [i32], u: &
 /// Where a band's folding source lives: in the running normalised spectrum, or
 /// in the scratch copy taken before that spectrum is rewritten in place.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Lowband {
+pub(crate) enum Lowband {
     None,
     Norm(usize),
     Scratch(usize),
 }
 
 impl Lowband {
-    fn offset(self, n: usize) -> Lowband {
+    pub(crate) fn offset(self, n: usize) -> Lowband {
         match self {
             Lowband::None => Lowband::None,
             Lowband::Norm(l) => Lowband::Norm(l + n),
@@ -645,41 +651,41 @@ impl Lowband {
 /// Everything one band decode needs; a struct because the recursion changes
 /// only two or three fields at a time.
 #[derive(Clone, Copy, Debug)]
-struct BandArgs {
+pub(crate) struct BandArgs {
     /// Band index.
-    i: usize,
+    pub(crate) i: usize,
     /// Offset of the band in the coefficient buffer.
-    x: usize,
+    pub(crate) x: usize,
     /// Offset of the second channel, when this is a stereo band.
-    y: Option<usize>,
+    pub(crate) y: Option<usize>,
     /// Coefficients in the band.
-    n: usize,
+    pub(crate) n: usize,
     /// Bits allocated, in 1/8th bits.
-    b: i32,
-    spread: usize,
+    pub(crate) b: i32,
+    pub(crate) spread: usize,
     /// Short blocks the band is split over.
-    blocks: usize,
-    intensity: usize,
-    tf_change: i32,
-    lowband: Lowband,
+    pub(crate) blocks: usize,
+    pub(crate) intensity: usize,
+    pub(crate) tf_change: i32,
+    pub(crate) lowband: Lowband,
     /// Recursion depth of the split.
-    level: i32,
-    lm: i32,
+    pub(crate) level: i32,
+    pub(crate) lm: i32,
     /// Where to write the normalised band for later folding.
-    lowband_out: Option<usize>,
-    gain: f32,
+    pub(crate) lowband_out: Option<usize>,
+    pub(crate) gain: f32,
     /// Which blocks may be folded into, one bit each.
-    fill: u32,
+    pub(crate) fill: u32,
 }
 
 /// The folding PRNG (`celt_lcg_rand`).
 #[inline]
-fn celt_lcg_rand(seed: u32) -> u32 {
+pub(crate) fn celt_lcg_rand(seed: u32) -> u32 {
     seed.wrapping_mul(1664525).wrapping_add(1013904223)
 }
 
 /// Start of a band's pulse-cache row. `lm` is `-1` for a twice-split band.
-fn cache_index(band: usize, lm: i32) -> usize {
+pub(crate) fn cache_index(band: usize, lm: i32) -> usize {
     let row = (lm + 1) as usize;
     let idx = CACHE_INDEX[row * NB_BANDS + band];
     debug_assert!(idx >= 0, "no pulse cache for band {band} at LM {lm}");
@@ -1225,6 +1231,8 @@ impl CeltDecoder {
         }
     }
 
+    /// Decoder side of the shared allocation: the three coded decisions come
+    /// off the range decoder, everything else is [`compute_allocation`].
     #[allow(clippy::too_many_arguments)]
     fn compute_allocation(
         &mut self,
@@ -1239,295 +1247,27 @@ impl CeltDecoder {
         c: usize,
         lm: usize,
     ) -> usize {
-        let mut total = total.max(0);
-        let mut skip_start = start;
-        let skip_rsv = if total >= 1 << BITRES { 1 << BITRES } else { 0 };
-        total -= skip_rsv;
-        let mut intensity_rsv = 0;
-        let mut dual_stereo_rsv = 0;
-        if c == 2 {
-            intensity_rsv = LOG2_FRAC[end - start];
-            if intensity_rsv > total {
-                intensity_rsv = 0;
-            } else {
-                total -= intensity_rsv;
-                dual_stereo_rsv = if total >= 1 << BITRES { 1 << BITRES } else { 0 };
-                total -= dual_stereo_rsv;
-            }
-        }
-
-        let mut thresh = [0i32; NB_BANDS];
-        let mut trim_offset = [0i32; NB_BANDS];
-        for j in start..end {
-            let width = (E_BANDS[j + 1] - E_BANDS[j]) as i32;
-            thresh[j] = ((c as i32) << BITRES).max((((3 * width) << lm) << BITRES) >> 4);
-            trim_offset[j] = (c as i32
-                * width
-                * (alloc_trim - 5 - lm as i32)
-                * (end - j - 1) as i32
-                * (1 << (lm as u32 + BITRES)))
-                >> 6;
-            if (width << lm) == 1 {
-                trim_offset[j] -= (c as i32) << BITRES;
-            }
-        }
-
-        // Bisect the static allocation table for the highest quality that fits.
-        let mut lo = 1i32;
-        let mut hi = BAND_ALLOCATION.len() as i32 - 1;
-        while lo <= hi {
-            let mid = (lo + hi) >> 1;
-            let mut psum = 0;
-            let mut done = false;
-            for j in (start..end).rev() {
-                let width = (E_BANDS[j + 1] - E_BANDS[j]) as i32;
-                let mut bitsj =
-                    (c as i32 * width * BAND_ALLOCATION[mid as usize][j] as i32) << lm >> 2;
-                if bitsj > 0 {
-                    bitsj = 0.max(bitsj + trim_offset[j]);
-                }
-                bitsj += self.offsets[j];
-                if bitsj >= thresh[j] || done {
-                    done = true;
-                    psum += bitsj.min(self.caps[j]);
-                } else if bitsj >= (c as i32) << BITRES {
-                    psum += (c as i32) << BITRES;
-                }
-            }
-            if psum > total {
-                hi = mid - 1;
-            } else {
-                lo = mid + 1;
-            }
-        }
-        let hi = lo;
-        let lo = lo - 1;
-
-        let mut bits1 = [0i32; NB_BANDS];
-        let mut bits2 = [0i32; NB_BANDS];
-        for j in start..end {
-            let width = (E_BANDS[j + 1] - E_BANDS[j]) as i32;
-            let mut b1 = (c as i32 * width * BAND_ALLOCATION[lo as usize][j] as i32) << lm >> 2;
-            let mut b2 = if hi as usize >= BAND_ALLOCATION.len() {
-                self.caps[j]
-            } else {
-                (c as i32 * width * BAND_ALLOCATION[hi as usize][j] as i32) << lm >> 2
-            };
-            if b1 > 0 {
-                b1 = 0.max(b1 + trim_offset[j]);
-            }
-            if b2 > 0 {
-                b2 = 0.max(b2 + trim_offset[j]);
-            }
-            if lo > 0 {
-                b1 += self.offsets[j];
-            }
-            b2 += self.offsets[j];
-            if self.offsets[j] > 0 {
-                skip_start = j;
-            }
-            bits1[j] = b1;
-            bits2[j] = 0.max(b2 - b1);
-        }
-
-        self.interp_bits2pulses(
-            dec,
+        let mut coder = DecAlloc { dec };
+        let mut arrays = AllocArrays {
+            caps: &self.caps,
+            offsets: &self.offsets,
+            pulses: &mut self.pulses,
+            fine_quant: &mut self.fine_quant,
+            fine_priority: &mut self.fine_priority,
+        };
+        compute_allocation(
+            &mut coder,
+            &mut arrays,
             start,
             end,
-            skip_start,
-            &bits1,
-            &bits2,
-            &thresh,
+            alloc_trim,
+            intensity,
+            dual_stereo,
             total,
             balance,
-            skip_rsv,
-            intensity,
-            intensity_rsv,
-            dual_stereo,
-            dual_stereo_rsv,
             c,
             lm,
         )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn interp_bits2pulses(
-        &mut self,
-        dec: &mut RangeDecoder,
-        start: usize,
-        end: usize,
-        skip_start: usize,
-        bits1: &[i32; NB_BANDS],
-        bits2: &[i32; NB_BANDS],
-        thresh: &[i32; NB_BANDS],
-        mut total: i32,
-        balance_out: &mut i32,
-        skip_rsv: i32,
-        intensity: &mut usize,
-        mut intensity_rsv: i32,
-        dual_stereo: &mut bool,
-        mut dual_stereo_rsv: i32,
-        c: usize,
-        lm: usize,
-    ) -> usize {
-        const ALLOC_STEPS: u32 = 6;
-        let alloc_floor = (c as i32) << BITRES;
-        let stereo = c > 1;
-        let log_m = (lm as i32) << BITRES;
-
-        let mut lo = 0i32;
-        let mut hi = 1i32 << ALLOC_STEPS;
-        for _ in 0..ALLOC_STEPS {
-            let mid = (lo + hi) >> 1;
-            let mut psum = 0;
-            let mut done = false;
-            for j in (start..end).rev() {
-                let tmp = bits1[j] + ((mid * bits2[j]) >> ALLOC_STEPS);
-                if tmp >= thresh[j] || done {
-                    done = true;
-                    psum += tmp.min(self.caps[j]);
-                } else if tmp >= alloc_floor {
-                    psum += alloc_floor;
-                }
-            }
-            if psum > total {
-                hi = mid;
-            } else {
-                lo = mid;
-            }
-        }
-
-        let mut psum = 0;
-        let mut done = false;
-        let bits = &mut self.pulses;
-        for j in (start..end).rev() {
-            let mut tmp = bits1[j] + ((lo * bits2[j]) >> ALLOC_STEPS);
-            if tmp < thresh[j] && !done {
-                tmp = if tmp >= alloc_floor { alloc_floor } else { 0 };
-            } else {
-                done = true;
-            }
-            tmp = tmp.min(self.caps[j]);
-            bits[j] = tmp;
-            psum += tmp;
-        }
-
-        // Skip decoding, working back from the top band.
-        let mut coded_bands = end;
-        loop {
-            let j = coded_bands - 1;
-            if j <= skip_start {
-                total += skip_rsv;
-                break;
-            }
-            let mut left = total - psum;
-            let percoeff = left / (E_BANDS[coded_bands] - E_BANDS[start]) as i32;
-            left -= (E_BANDS[coded_bands] - E_BANDS[start]) as i32 * percoeff;
-            let rem = 0.max(left - (E_BANDS[j] - E_BANDS[start]) as i32);
-            let band_width = (E_BANDS[coded_bands] - E_BANDS[j]) as i32;
-            let mut band_bits = self.pulses[j] + percoeff * band_width + rem;
-            if band_bits >= thresh[j].max(alloc_floor + (1 << BITRES)) {
-                if dec.dec_bit_logp(1) {
-                    break;
-                }
-                psum += 1 << BITRES;
-                band_bits -= 1 << BITRES;
-            }
-            psum -= self.pulses[j] + intensity_rsv;
-            if intensity_rsv > 0 {
-                intensity_rsv = LOG2_FRAC[j - start];
-            }
-            psum += intensity_rsv;
-            if band_bits >= alloc_floor {
-                psum += alloc_floor;
-                self.pulses[j] = alloc_floor;
-            } else {
-                self.pulses[j] = 0;
-            }
-            coded_bands -= 1;
-        }
-
-        if intensity_rsv > 0 {
-            *intensity = start + dec.dec_uint((coded_bands + 1 - start) as u32) as usize;
-        } else {
-            *intensity = 0;
-        }
-        if *intensity <= start {
-            total += dual_stereo_rsv;
-            dual_stereo_rsv = 0;
-        }
-        *dual_stereo = if dual_stereo_rsv > 0 {
-            dec.dec_bit_logp(1)
-        } else {
-            false
-        };
-
-        // Hand out what is left, then split each band into shape and fine bits.
-        let mut left = total - psum;
-        let percoeff = left / (E_BANDS[coded_bands] - E_BANDS[start]) as i32;
-        left -= (E_BANDS[coded_bands] - E_BANDS[start]) as i32 * percoeff;
-        for j in start..coded_bands {
-            self.pulses[j] += percoeff * (E_BANDS[j + 1] - E_BANDS[j]) as i32;
-        }
-        for j in start..coded_bands {
-            let tmp = left.min((E_BANDS[j + 1] - E_BANDS[j]) as i32);
-            self.pulses[j] += tmp;
-            left -= tmp;
-        }
-
-        let mut balance = 0i32;
-        for j in start..coded_bands {
-            let n0 = (E_BANDS[j + 1] - E_BANDS[j]) as i32;
-            let n = n0 << lm;
-            self.pulses[j] += balance;
-            let mut excess;
-            if n > 1 {
-                excess = 0.max(self.pulses[j] - self.caps[j]);
-                self.pulses[j] -= excess;
-                let den =
-                    c as i32 * n + i32::from(c == 2 && n > 2 && !*dual_stereo && j < *intensity);
-                let nc_log_n = den * (LOG_N[j] + log_m);
-                let mut offset = (nc_log_n >> 1) - den * FINE_OFFSET;
-                if n == 2 {
-                    offset += den << BITRES >> 2;
-                }
-                if self.pulses[j] + offset < (den * 2) << BITRES {
-                    offset += nc_log_n >> 2;
-                } else if self.pulses[j] + offset < (den * 3) << BITRES {
-                    offset += nc_log_n >> 3;
-                }
-                let mut eb =
-                    0.max((self.pulses[j] + offset + (den << (BITRES - 1))) / (den << BITRES));
-                if c as i32 * eb > (self.pulses[j] >> BITRES) {
-                    eb = self.pulses[j] >> u32::from(stereo) >> BITRES;
-                }
-                eb = eb.min(MAX_FINE_BITS);
-                self.fine_quant[j] = eb;
-                self.fine_priority[j] = i32::from(eb * (den << BITRES) >= self.pulses[j] + offset);
-                self.pulses[j] -= (c as i32 * eb) << BITRES;
-            } else {
-                excess = 0.max(self.pulses[j] - ((c as i32) << BITRES));
-                self.pulses[j] -= excess;
-                self.fine_quant[j] = 0;
-                self.fine_priority[j] = 1;
-            }
-            if excess > 0 {
-                let extra_fine = (excess >> (u32::from(stereo) + BITRES))
-                    .min(MAX_FINE_BITS - self.fine_quant[j]);
-                self.fine_quant[j] += extra_fine;
-                let extra_bits = (extra_fine * c as i32) << BITRES;
-                self.fine_priority[j] = i32::from(extra_bits >= excess - balance);
-                excess -= extra_bits;
-            }
-            balance = excess;
-        }
-        *balance_out = balance;
-        for j in coded_bands..end {
-            self.fine_quant[j] = self.pulses[j] >> u32::from(stereo) >> BITRES;
-            self.pulses[j] = 0;
-            self.fine_priority[j] = i32::from(self.fine_quant[j] < 1);
-        }
-        coded_bands
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2344,8 +2084,371 @@ impl CeltDecoder {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Bit allocation, shared with the encoder
+// ---------------------------------------------------------------------------
+
+/// What the band-skip decision gets to look at.
+pub(crate) struct SkipCtx {
+    pub(crate) band: usize,
+    /// Bits the band would receive if it were coded, in 1/8th bits.
+    pub(crate) band_bits: i32,
+    /// Coefficients from this band up to the top coded one.
+    pub(crate) band_width: i32,
+    pub(crate) lm: usize,
+    pub(crate) start: usize,
+    pub(crate) coded_bands: usize,
+}
+
+/// The three decisions inside the allocation that are *coded*. Everything else
+/// in [`compute_allocation`] is derived identically on both sides, so encoder
+/// and decoder share the function itself: a divergence of one 1/8th bit here
+/// desynchronises every band that follows.
+pub(crate) trait AllocCoder {
+    /// `true` ends the skip loop, coding band `ctx.band` and everything below.
+    fn skip(&mut self, ctx: SkipCtx) -> bool;
+    /// The intensity-stereo threshold band relative to `start`, out of `ft`.
+    fn intensity(&mut self, ft: u32) -> u32;
+    /// Whether the two channels are coded independently.
+    fn dual_stereo(&mut self) -> bool;
+}
+
+/// The per-band arrays the allocation reads and fills.
+pub(crate) struct AllocArrays<'a> {
+    pub(crate) caps: &'a [i32; NB_BANDS],
+    pub(crate) offsets: &'a [i32; NB_BANDS],
+    pub(crate) pulses: &'a mut [i32; NB_BANDS],
+    pub(crate) fine_quant: &'a mut [i32; NB_BANDS],
+    pub(crate) fine_priority: &'a mut [i32; NB_BANDS],
+}
+
+/// Reads the three coded allocation decisions from the bitstream.
+struct DecAlloc<'a, 'b> {
+    dec: &'a mut RangeDecoder<'b>,
+}
+
+impl AllocCoder for DecAlloc<'_, '_> {
+    fn skip(&mut self, _ctx: SkipCtx) -> bool {
+        self.dec.dec_bit_logp(1)
+    }
+
+    fn intensity(&mut self, ft: u32) -> u32 {
+        self.dec.dec_uint(ft)
+    }
+
+    fn dual_stereo(&mut self) -> bool {
+        self.dec.dec_bit_logp(1)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_allocation(
+    coder: &mut impl AllocCoder,
+    a: &mut AllocArrays,
+    start: usize,
+    end: usize,
+    alloc_trim: i32,
+    intensity: &mut usize,
+    dual_stereo: &mut bool,
+    total: i32,
+    balance: &mut i32,
+    c: usize,
+    lm: usize,
+) -> usize {
+    let mut total = total.max(0);
+    let mut skip_start = start;
+    let skip_rsv = if total >= 1 << BITRES { 1 << BITRES } else { 0 };
+    total -= skip_rsv;
+    let mut intensity_rsv = 0;
+    let mut dual_stereo_rsv = 0;
+    if c == 2 {
+        intensity_rsv = LOG2_FRAC[end - start];
+        if intensity_rsv > total {
+            intensity_rsv = 0;
+        } else {
+            total -= intensity_rsv;
+            dual_stereo_rsv = if total >= 1 << BITRES { 1 << BITRES } else { 0 };
+            total -= dual_stereo_rsv;
+        }
+    }
+
+    let mut thresh = [0i32; NB_BANDS];
+    let mut trim_offset = [0i32; NB_BANDS];
+    for j in start..end {
+        let width = (E_BANDS[j + 1] - E_BANDS[j]) as i32;
+        thresh[j] = ((c as i32) << BITRES).max((((3 * width) << lm) << BITRES) >> 4);
+        trim_offset[j] = (c as i32
+            * width
+            * (alloc_trim - 5 - lm as i32)
+            * (end - j - 1) as i32
+            * (1 << (lm as u32 + BITRES)))
+            >> 6;
+        if (width << lm) == 1 {
+            trim_offset[j] -= (c as i32) << BITRES;
+        }
+    }
+
+    // Bisect the static allocation table for the highest quality that fits.
+    let mut lo = 1i32;
+    let mut hi = BAND_ALLOCATION.len() as i32 - 1;
+    while lo <= hi {
+        let mid = (lo + hi) >> 1;
+        let mut psum = 0;
+        let mut done = false;
+        for j in (start..end).rev() {
+            let width = (E_BANDS[j + 1] - E_BANDS[j]) as i32;
+            let mut bitsj = (c as i32 * width * BAND_ALLOCATION[mid as usize][j] as i32) << lm >> 2;
+            if bitsj > 0 {
+                bitsj = 0.max(bitsj + trim_offset[j]);
+            }
+            bitsj += a.offsets[j];
+            if bitsj >= thresh[j] || done {
+                done = true;
+                psum += bitsj.min(a.caps[j]);
+            } else if bitsj >= (c as i32) << BITRES {
+                psum += (c as i32) << BITRES;
+            }
+        }
+        if psum > total {
+            hi = mid - 1;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    let hi = lo;
+    let lo = lo - 1;
+
+    let mut bits1 = [0i32; NB_BANDS];
+    let mut bits2 = [0i32; NB_BANDS];
+    for j in start..end {
+        let width = (E_BANDS[j + 1] - E_BANDS[j]) as i32;
+        let mut b1 = (c as i32 * width * BAND_ALLOCATION[lo as usize][j] as i32) << lm >> 2;
+        let mut b2 = if hi as usize >= BAND_ALLOCATION.len() {
+            a.caps[j]
+        } else {
+            (c as i32 * width * BAND_ALLOCATION[hi as usize][j] as i32) << lm >> 2
+        };
+        if b1 > 0 {
+            b1 = 0.max(b1 + trim_offset[j]);
+        }
+        if b2 > 0 {
+            b2 = 0.max(b2 + trim_offset[j]);
+        }
+        if lo > 0 {
+            b1 += a.offsets[j];
+        }
+        b2 += a.offsets[j];
+        if a.offsets[j] > 0 {
+            skip_start = j;
+        }
+        bits1[j] = b1;
+        bits2[j] = 0.max(b2 - b1);
+    }
+
+    interp_bits2pulses(
+        coder,
+        a,
+        start,
+        end,
+        skip_start,
+        &bits1,
+        &bits2,
+        &thresh,
+        total,
+        balance,
+        skip_rsv,
+        intensity,
+        intensity_rsv,
+        dual_stereo,
+        dual_stereo_rsv,
+        c,
+        lm,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn interp_bits2pulses(
+    coder: &mut impl AllocCoder,
+    a: &mut AllocArrays,
+    start: usize,
+    end: usize,
+    skip_start: usize,
+    bits1: &[i32; NB_BANDS],
+    bits2: &[i32; NB_BANDS],
+    thresh: &[i32; NB_BANDS],
+    mut total: i32,
+    balance_out: &mut i32,
+    skip_rsv: i32,
+    intensity: &mut usize,
+    mut intensity_rsv: i32,
+    dual_stereo: &mut bool,
+    mut dual_stereo_rsv: i32,
+    c: usize,
+    lm: usize,
+) -> usize {
+    const ALLOC_STEPS: u32 = 6;
+    let alloc_floor = (c as i32) << BITRES;
+    let stereo = c > 1;
+    let log_m = (lm as i32) << BITRES;
+
+    let mut lo = 0i32;
+    let mut hi = 1i32 << ALLOC_STEPS;
+    for _ in 0..ALLOC_STEPS {
+        let mid = (lo + hi) >> 1;
+        let mut psum = 0;
+        let mut done = false;
+        for j in (start..end).rev() {
+            let tmp = bits1[j] + ((mid * bits2[j]) >> ALLOC_STEPS);
+            if tmp >= thresh[j] || done {
+                done = true;
+                psum += tmp.min(a.caps[j]);
+            } else if tmp >= alloc_floor {
+                psum += alloc_floor;
+            }
+        }
+        if psum > total {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+
+    let mut psum = 0;
+    let mut done = false;
+    let bits = &mut *a.pulses;
+    for j in (start..end).rev() {
+        let mut tmp = bits1[j] + ((lo * bits2[j]) >> ALLOC_STEPS);
+        if tmp < thresh[j] && !done {
+            tmp = if tmp >= alloc_floor { alloc_floor } else { 0 };
+        } else {
+            done = true;
+        }
+        tmp = tmp.min(a.caps[j]);
+        bits[j] = tmp;
+        psum += tmp;
+    }
+
+    // Skip decoding, working back from the top band.
+    let mut coded_bands = end;
+    loop {
+        let j = coded_bands - 1;
+        if j <= skip_start {
+            total += skip_rsv;
+            break;
+        }
+        let mut left = total - psum;
+        let percoeff = left / (E_BANDS[coded_bands] - E_BANDS[start]) as i32;
+        left -= (E_BANDS[coded_bands] - E_BANDS[start]) as i32 * percoeff;
+        let rem = 0.max(left - (E_BANDS[j] - E_BANDS[start]) as i32);
+        let band_width = (E_BANDS[coded_bands] - E_BANDS[j]) as i32;
+        let mut band_bits = a.pulses[j] + percoeff * band_width + rem;
+        if band_bits >= thresh[j].max(alloc_floor + (1 << BITRES)) {
+            if coder.skip(SkipCtx {
+                band: j,
+                band_bits,
+                band_width,
+                lm,
+                start,
+                coded_bands,
+            }) {
+                break;
+            }
+            psum += 1 << BITRES;
+            band_bits -= 1 << BITRES;
+        }
+        psum -= a.pulses[j] + intensity_rsv;
+        if intensity_rsv > 0 {
+            intensity_rsv = LOG2_FRAC[j - start];
+        }
+        psum += intensity_rsv;
+        if band_bits >= alloc_floor {
+            psum += alloc_floor;
+            a.pulses[j] = alloc_floor;
+        } else {
+            a.pulses[j] = 0;
+        }
+        coded_bands -= 1;
+    }
+
+    if intensity_rsv > 0 {
+        *intensity = start + coder.intensity((coded_bands + 1 - start) as u32) as usize;
+    } else {
+        *intensity = 0;
+    }
+    if *intensity <= start {
+        total += dual_stereo_rsv;
+        dual_stereo_rsv = 0;
+    }
+    *dual_stereo = dual_stereo_rsv > 0 && coder.dual_stereo();
+
+    // Hand out what is left, then split each band into shape and fine bits.
+    let mut left = total - psum;
+    let percoeff = left / (E_BANDS[coded_bands] - E_BANDS[start]) as i32;
+    left -= (E_BANDS[coded_bands] - E_BANDS[start]) as i32 * percoeff;
+    for j in start..coded_bands {
+        a.pulses[j] += percoeff * (E_BANDS[j + 1] - E_BANDS[j]) as i32;
+    }
+    for j in start..coded_bands {
+        let tmp = left.min((E_BANDS[j + 1] - E_BANDS[j]) as i32);
+        a.pulses[j] += tmp;
+        left -= tmp;
+    }
+
+    let mut balance = 0i32;
+    for j in start..coded_bands {
+        let n0 = (E_BANDS[j + 1] - E_BANDS[j]) as i32;
+        let n = n0 << lm;
+        a.pulses[j] += balance;
+        let mut excess;
+        if n > 1 {
+            excess = 0.max(a.pulses[j] - a.caps[j]);
+            a.pulses[j] -= excess;
+            let den = c as i32 * n + i32::from(c == 2 && n > 2 && !*dual_stereo && j < *intensity);
+            let nc_log_n = den * (LOG_N[j] + log_m);
+            let mut offset = (nc_log_n >> 1) - den * FINE_OFFSET;
+            if n == 2 {
+                offset += den << BITRES >> 2;
+            }
+            if a.pulses[j] + offset < (den * 2) << BITRES {
+                offset += nc_log_n >> 2;
+            } else if a.pulses[j] + offset < (den * 3) << BITRES {
+                offset += nc_log_n >> 3;
+            }
+            let mut eb = 0.max((a.pulses[j] + offset + (den << (BITRES - 1))) / (den << BITRES));
+            if c as i32 * eb > (a.pulses[j] >> BITRES) {
+                eb = a.pulses[j] >> u32::from(stereo) >> BITRES;
+            }
+            eb = eb.min(MAX_FINE_BITS);
+            a.fine_quant[j] = eb;
+            a.fine_priority[j] = i32::from(eb * (den << BITRES) >= a.pulses[j] + offset);
+            a.pulses[j] -= (c as i32 * eb) << BITRES;
+        } else {
+            excess = 0.max(a.pulses[j] - ((c as i32) << BITRES));
+            a.pulses[j] -= excess;
+            a.fine_quant[j] = 0;
+            a.fine_priority[j] = 1;
+        }
+        if excess > 0 {
+            let extra_fine =
+                (excess >> (u32::from(stereo) + BITRES)).min(MAX_FINE_BITS - a.fine_quant[j]);
+            a.fine_quant[j] += extra_fine;
+            let extra_bits = (extra_fine * c as i32) << BITRES;
+            a.fine_priority[j] = i32::from(extra_bits >= excess - balance);
+            excess -= extra_bits;
+        }
+        balance = excess;
+    }
+    *balance_out = balance;
+    for j in coded_bands..end {
+        a.fine_quant[j] = a.pulses[j] >> u32::from(stereo) >> BITRES;
+        a.pulses[j] = 0;
+        a.fine_priority[j] = i32::from(a.fine_quant[j] < 1);
+    }
+    coded_bands
+}
+
 /// `ec_laplace_decode()`: the coarse-energy prediction error.
-fn laplace_decode(dec: &mut RangeDecoder, fs0: u32, decay: i32) -> i32 {
+pub(crate) fn laplace_decode(dec: &mut RangeDecoder, fs0: u32, decay: i32) -> i32 {
     const MINP: u32 = 1;
     const NMIN: u32 = 16;
     let mut val = 0i32;
@@ -2380,7 +2483,7 @@ fn laplace_decode(dec: &mut RangeDecoder, fs0: u32, decay: i32) -> i32 {
 
 /// `bitexact_cos()`: a cosine that must round identically everywhere, because
 /// the bit allocation depends on it.
-fn bitexact_cos(x: i16) -> i16 {
+pub(crate) fn bitexact_cos(x: i16) -> i16 {
     let tmp = (4096 + (x as i32) * (x as i32)) >> 13;
     let mut x2 = tmp as i16;
     x2 = (32767 - x2 as i32
@@ -2391,11 +2494,11 @@ fn bitexact_cos(x: i16) -> i16 {
     1 + x2
 }
 
-fn frac_mul16(a: i16, b: i16) -> i32 {
+pub(crate) fn frac_mul16(a: i16, b: i16) -> i32 {
     (16384 + (a as i32) * (b as i32)) >> 15
 }
 
-fn bitexact_log2tan(isin: i32, icos: i32) -> i32 {
+pub(crate) fn bitexact_log2tan(isin: i32, icos: i32) -> i32 {
     let lc = ilog(icos as u32);
     let ls = ilog(isin as u32);
     let isin = (isin << (15 - ls)) as i16;
@@ -2404,7 +2507,7 @@ fn bitexact_log2tan(isin: i32, icos: i32) -> i32 {
         - frac_mul16(icos, (frac_mul16(icos, -2597) + 7932) as i16)
 }
 
-fn compute_qn(n: i32, b: i32, offset: i32, pulse_cap: i32, stereo: bool) -> i32 {
+pub(crate) fn compute_qn(n: i32, b: i32, offset: i32, pulse_cap: i32, stereo: bool) -> i32 {
     const EXP2_TABLE8: [i32; 8] = [16384, 17866, 19483, 21247, 23170, 25267, 27554, 30048];
     let mut n2 = 2 * n - 1;
     if stereo && n == 2 {
@@ -2420,7 +2523,7 @@ fn compute_qn(n: i32, b: i32, offset: i32, pulse_cap: i32, stereo: bool) -> i32 
     }
 }
 
-fn get_pulses(i: i32) -> i32 {
+pub(crate) fn get_pulses(i: i32) -> i32 {
     if i < 8 {
         i
     } else {
@@ -2428,7 +2531,7 @@ fn get_pulses(i: i32) -> i32 {
     }
 }
 
-fn bits2pulses(band: usize, lm: i32, bits: i32) -> i32 {
+pub(crate) fn bits2pulses(band: usize, lm: i32, bits: i32) -> i32 {
     let cache = &CACHE_BITS[cache_index(band, lm)..];
     let mut lo = 0i32;
     let mut hi = cache[0] as i32;
@@ -2453,7 +2556,7 @@ fn bits2pulses(band: usize, lm: i32, bits: i32) -> i32 {
     }
 }
 
-fn pulses2bits(band: usize, lm: i32, pulses: i32) -> i32 {
+pub(crate) fn pulses2bits(band: usize, lm: i32, pulses: i32) -> i32 {
     if pulses == 0 {
         return 0;
     }
@@ -2462,7 +2565,7 @@ fn pulses2bits(band: usize, lm: i32, pulses: i32) -> i32 {
 }
 
 /// One level of the Haar transform, used for the time/frequency changes.
-fn haar1(x: &mut [f32], n0: usize, stride: usize) {
+pub(crate) fn haar1(x: &mut [f32], n0: usize, stride: usize) {
     let n0 = n0 >> 1;
     const S: f32 = core::f32::consts::FRAC_1_SQRT_2;
     for i in 0..stride {
@@ -2475,7 +2578,13 @@ fn haar1(x: &mut [f32], n0: usize, stride: usize) {
     }
 }
 
-fn deinterleave_hadamard(x: &mut [f32], tmp: &mut [f32], n0: usize, stride: usize, hadamard: bool) {
+pub(crate) fn deinterleave_hadamard(
+    x: &mut [f32],
+    tmp: &mut [f32],
+    n0: usize,
+    stride: usize,
+    hadamard: bool,
+) {
     let n = n0 * stride;
     let tmp = &mut tmp[..n];
     if hadamard {
@@ -2495,7 +2604,13 @@ fn deinterleave_hadamard(x: &mut [f32], tmp: &mut [f32], n0: usize, stride: usiz
     x[..n].copy_from_slice(tmp);
 }
 
-fn interleave_hadamard(x: &mut [f32], tmp: &mut [f32], n0: usize, stride: usize, hadamard: bool) {
+pub(crate) fn interleave_hadamard(
+    x: &mut [f32],
+    tmp: &mut [f32],
+    n0: usize,
+    stride: usize,
+    hadamard: bool,
+) {
     let n = n0 * stride;
     let tmp = &mut tmp[..n];
     if hadamard {
@@ -2516,7 +2631,7 @@ fn interleave_hadamard(x: &mut [f32], tmp: &mut [f32], n0: usize, stride: usize,
 }
 
 /// Scales a vector to `gain` in the L2 sense.
-fn renormalise(x: &mut [f32], gain: f32) {
+pub(crate) fn renormalise(x: &mut [f32], gain: f32) {
     let mut e = 1e-15f32;
     for v in x.iter() {
         e += v * v;
@@ -2528,7 +2643,7 @@ fn renormalise(x: &mut [f32], gain: f32) {
 }
 
 /// Recombines the mid/side pair back into left/right (`stereo_merge`).
-fn stereo_merge(buf: &mut [f32], x: usize, y: usize, mid: f32, n: usize) {
+pub(crate) fn stereo_merge(buf: &mut [f32], x: usize, y: usize, mid: f32, n: usize) {
     let mut xp = 0.0f32;
     let mut side = 0.0f32;
     for j in 0..n {
@@ -2556,7 +2671,14 @@ fn stereo_merge(buf: &mut [f32], x: usize, y: usize, mid: f32, n: usize) {
 }
 
 /// The spreading rotation (Section 4.3.4.3), applied in the decode direction.
-fn exp_rotation(x: &mut [f32], len: usize, dir: i32, stride: usize, k: usize, spread: usize) {
+pub(crate) fn exp_rotation(
+    x: &mut [f32],
+    len: usize,
+    dir: i32,
+    stride: usize,
+    k: usize,
+    spread: usize,
+) {
     const SPREAD_FACTOR: [usize; 3] = [15, 10, 5];
     if 2 * k >= len || spread == SPREAD_NONE {
         return;
@@ -2605,6 +2727,29 @@ fn exp_rotation1(x: &mut [f32], len: usize, stride: usize, c: f32, s: f32) {
             x[i] = c * x1 - s * x2;
         }
     }
+}
+
+/// Test hooks: the encoder's unit tests check themselves against the decoder's
+/// own primitives rather than against a second transcription of them.
+#[cfg(test)]
+pub(crate) fn test_imdct_plan(l: usize) -> ImdctPlan {
+    ImdctPlan::new(l)
+}
+
+#[cfg(test)]
+pub(crate) fn test_decode_pulses(
+    dec: &mut RangeDecoder,
+    n: usize,
+    k: usize,
+    y: &mut [i32],
+    u: &mut [u32],
+) {
+    decode_pulses(dec, n, k, y, u)
+}
+
+#[cfg(test)]
+pub(crate) fn test_laplace_decode(dec: &mut RangeDecoder, fs0: u32, decay: i32) -> i32 {
+    laplace_decode(dec, fs0, decay)
 }
 
 #[cfg(test)]

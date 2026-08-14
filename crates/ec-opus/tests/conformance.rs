@@ -768,3 +768,400 @@ fn garbage_payloads_never_panic() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Encoder: the world decodes what we write
+// ---------------------------------------------------------------------------
+//
+// The oracle is libopus through ffmpeg, never our own decoder alone: an
+// encoder and a decoder that share a misreading round-trip perfectly and agree
+// with nothing else.
+
+use ec_core::{
+    Buf, CodecId, CodecParameters, MediaParameters, Muxer, Packet as CorePacket, StreamInfo,
+    TimeBase,
+};
+use ec_ogg::{OggMuxer, granule_side_data};
+use ec_opus::{Application, Encoder, MultistreamEncoder, ogg::default_mapping, ogg::opus_head};
+
+/// Real programme material to encode: the RFC vector's own decoded output,
+/// 48 kHz stereo. Sine fixtures flatter an encoder; this does not.
+fn source_pcm(seconds: f64) -> Option<Vec<f32>> {
+    let path = vectors_dir().join("testvector01.dec");
+    if !path.exists() {
+        return None;
+    }
+    let s = read_i16(&path);
+    let want = (seconds * 48000.0) as usize * 2;
+    Some(
+        s.iter()
+            .take(want)
+            .map(|&v| v as f32 * (1.0 / 32768.0))
+            .collect(),
+    )
+}
+
+/// Mono view of a stereo buffer (the left channel), so the mono row of the
+/// matrix is the same programme.
+fn to_mono(pcm: &[f32]) -> Vec<f32> {
+    pcm.chunks_exact(2).map(|c| c[0]).collect()
+}
+
+fn tmp_dir() -> PathBuf {
+    let d = std::env::temp_dir().join("ec-opus-enc");
+    fs::create_dir_all(&d).expect("temp dir");
+    d
+}
+
+/// Encodes `pcm` and writes an Ogg-Opus file, returning the packets' total
+/// bytes and the sample count.
+#[allow(clippy::too_many_arguments)]
+fn encode_ogg(
+    pcm: &[f32],
+    channels: usize,
+    bitrate: u32,
+    vbr: bool,
+    frame_48k: usize,
+    path: &Path,
+) -> (usize, usize, std::time::Duration) {
+    const PRE_SKIP: i64 = 120;
+    let samples = pcm.len() / channels;
+    let mut packets: Vec<Vec<u8>> = Vec::new();
+    let mut buf = vec![0u8; 8 * 1500];
+    let mut frame = vec![0.0f32; frame_48k * channels];
+    let started = std::time::Instant::now();
+    if channels <= 2 {
+        let mut e = Encoder::new(48000, channels, Application::Audio).expect("encoder");
+        e.set_bitrate(bitrate);
+        e.set_vbr(vbr);
+        let mut at = 0;
+        while at < samples {
+            let n = (samples - at).min(frame_48k);
+            frame.fill(0.0);
+            frame[..n * channels].copy_from_slice(&pcm[at * channels..(at + n) * channels]);
+            let len = e.encode_float(&frame, frame_48k, &mut buf).expect("encode");
+            packets.push(buf[..len].to_vec());
+            at += frame_48k;
+        }
+    } else {
+        let mut e = MultistreamEncoder::surround(48000, channels, Application::Audio)
+            .expect("multistream encoder");
+        e.set_bitrate(bitrate);
+        e.set_vbr(vbr);
+        let mut at = 0;
+        while at < samples {
+            let n = (samples - at).min(frame_48k);
+            frame.fill(0.0);
+            frame[..n * channels].copy_from_slice(&pcm[at * channels..(at + n) * channels]);
+            let len = e.encode_float(&frame, frame_48k, &mut buf).expect("encode");
+            packets.push(buf[..len].to_vec());
+            at += frame_48k;
+        }
+    }
+    let elapsed = started.elapsed();
+    let bytes: usize = packets.iter().map(|p| p.len()).sum();
+
+    // Ogg-Opus: pre-skip cancels the encoder's overlap delay, and the last
+    // granule trims the padding off the tail so the duration is exact.
+    let mapping = default_mapping(channels).expect("mapping");
+    let head = if channels <= 2 {
+        opus_head(channels as u8, PRE_SKIP as u16, 48000, 0, None)
+    } else {
+        opus_head(
+            channels as u8,
+            PRE_SKIP as u16,
+            48000,
+            0,
+            Some((mapping.0, mapping.1, mapping.2, &mapping.3)),
+        )
+    };
+    let mut params = CodecParameters::new(CodecId::Opus);
+    if let MediaParameters::Audio(audio) = &mut params.media {
+        audio.sample_rate = 48000;
+        audio.layout = match channels {
+            1 => ec_core::ChannelLayout::Mono,
+            2 => ec_core::ChannelLayout::Stereo,
+            6 => ec_core::ChannelLayout::Surround5_1,
+            _ => ec_core::ChannelLayout::Surround7_1,
+        };
+    }
+    params.extradata = Some(Buf::from_vec(head));
+    let time_base = TimeBase::from_rate(48000);
+    let file = fs::File::create(path).expect("create");
+    let mut muxer = OggMuxer::new(std::io::BufWriter::new(file));
+    muxer
+        .add_stream(StreamInfo::new(0, time_base, params))
+        .expect("add stream");
+    let end = samples as i64 + PRE_SKIP;
+    for (i, p) in packets.iter().enumerate() {
+        let granule = (((i + 1) * frame_48k) as i64).min(end);
+        let mut packet = CorePacket::new(0, time_base, p.clone());
+        packet.side_data.push(granule_side_data(granule));
+        muxer.write_packet(&packet).expect("write");
+    }
+    muxer.finish().expect("finish");
+    (bytes, samples, elapsed)
+}
+
+/// Decodes an Ogg-Opus file with our own decoder, pre-skip removed.
+fn our_decode_ogg(path: &Path) -> Vec<f32> {
+    decode_ogg(path).0
+}
+
+/// libopus encoding the same audio at the same setting, decoded back — the
+/// only reference an encoder can honestly be scored against. Returns `None`
+/// when ffmpeg cannot do it, so the test degrades to reporting our own number.
+fn libopus_encode_decode(
+    src: &[f32],
+    channels: usize,
+    bitrate: u32,
+    dir: &Path,
+) -> Option<Vec<f32>> {
+    use std::io::Write;
+    let raw: Vec<u8> = src.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let out = dir.join(format!("libopus-{channels}-{bitrate}.opus"));
+    let mut child = Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-f", "f32le", "-ar", "48000", "-ac"])
+        .arg(channels.to_string())
+        .args(["-i", "-", "-c:a", "libopus", "-b:a"])
+        .arg(bitrate.to_string())
+        .args(["-vbr", "constrained", "-application", "audio"])
+        .arg(&out)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    child.stdin.as_mut()?.write_all(&raw).ok()?;
+    if !child.wait().ok()?.success() {
+        return None;
+    }
+    ffmpeg_decode(&out, channels)
+}
+
+/// The rate x layout table the slice is judged on: every cell is decoded by
+/// libopus (through ffmpeg) and scored against the source, so a cell can only
+/// pass if the bitstream is real Opus.
+#[test]
+fn encoder_rate_quality_matrix() {
+    let Some(stereo) = source_pcm(12.0) else {
+        eprintln!("testvector01.dec missing, skipped (run scripts/fetch-vectors.sh)");
+        return;
+    };
+    let mono = to_mono(&stereo);
+    let dir = tmp_dir();
+// The whole range the format allows, not the range that happens to work:
+    // 16 kbps is where the incumbent's mono was broken and 510 kbps is one
+    // byte under the RFC's per-frame ceiling. (ffmpeg's libopus refuses
+    // anything above 256 kbps, hence the NaN in its column up there.)
+    let rates = [
+        16_000u32, 32_000, 64_000, 96_000, 128_000, 165_000, 192_000, 256_000, 320_000, 510_000,
+    ];
+    let mut rows = Vec::new();
+    let mut failures = Vec::new();
+    for &channels in &[1usize, 2] {
+        let src: &[f32] = if channels == 1 { &mono } else { &stereo };
+        for &rate in &rates {
+            let path = dir.join(format!("m{channels}-{rate}.opus"));
+            let (bytes, samples, took) = encode_ogg(src, channels, rate, true, 960, &path);
+            let kbps = bytes as f64 * 8.0 * 48000.0 / samples as f64 / 1000.0;
+            let Some(reference) = ffmpeg_decode(&path, channels) else {
+                eprintln!("ffmpeg/libopus unavailable, matrix skipped");
+                return;
+            };
+            let n = reference.len().min(src.len());
+            let corr = correlation(&reference[..n], &src[..n]);
+            let score = opus_compare(&to_i16(&src[..n]), &to_i16(&reference[..n]), channels);
+            // Our decoder must agree with libopus on the same bitstream.
+            let ours = our_decode_ogg(&path);
+            let n2 = ours.len().min(n);
+            let self_corr = correlation(&ours[..n2], &reference[..n2]);
+            let realtime = samples as f64 / 48000.0 / took.as_secs_f64();
+            // The same audio through libopus at the same setting: the number
+            // that says whether our score is good or merely a number.
+            let (ref_corr, ref_score) = match libopus_encode_decode(&src[..n], channels, rate, &dir)
+            {
+                Some(lib) => {
+                    let k = lib.len().min(n);
+                    (
+                        correlation(&lib[..k], &src[..k]),
+                        opus_compare(&to_i16(&src[..k]), &to_i16(&lib[..k]), channels),
+                    )
+                }
+                None => (f64::NAN, f64::NAN),
+            };
+            rows.push(format!(
+                "{:>2}ch {:>3}k -> {:6.1}k  corr {:.4} (libopus {:.4})  opus_compare {:7.2} \
+                 (libopus {:7.2})  vs-libopus {:.4}  {:5.1}x realtime",
+                channels,
+                rate / 1000,
+                kbps,
+                corr,
+                ref_corr,
+                score,
+                ref_score,
+                self_corr,
+                realtime
+            ));
+            if self_corr < 0.999 {
+                failures.push(format!(
+                    "{channels}ch {rate}: our decoder disagrees with libopus, corr {self_corr}"
+                ));
+            }
+            // Constrained VBR: overshooting the target is a defect, coming in
+            // under it on material with silence in it is the point of VBR.
+            let target = rate as f64 / 1000.0;
+            if kbps > 1.06 * target || kbps < 0.75 * target {
+                failures.push(format!("{channels}ch {rate}: actual rate {kbps:.1} kbps"));
+            }
+            // The MUSTs of the rubric's audio-opus section.
+            if channels == 2 && [96_000, 165_000, 256_000].contains(&rate) && corr < 0.9 {
+                failures.push(format!("stereo {rate}: correlation {corr:.4} < 0.9"));
+            }
+            if channels == 1 && rate >= 96_000 && corr < 0.9 {
+                failures.push(format!("mono {rate}: correlation {corr:.4} < 0.9"));
+            }
+        }
+    }
+    for r in &rows {
+        println!("{r}");
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Every frame size, through libopus.
+#[test]
+fn encoder_every_frame_size_decodes_in_libopus() {
+    let Some(stereo) = source_pcm(4.0) else {
+        return;
+    };
+    let dir = tmp_dir();
+    let mut failures = Vec::new();
+    for &frame in &[120usize, 240, 480, 960] {
+        for &vbr in &[false, true] {
+            let path = dir.join(format!("f{frame}-{vbr}.opus"));
+            let (_, samples, _) = encode_ogg(&stereo, 2, 128_000, vbr, frame, &path);
+            let Some(reference) = ffmpeg_decode(&path, 2) else {
+                eprintln!("ffmpeg unavailable, skipped");
+                return;
+            };
+            let n = reference.len().min(stereo.len());
+            let corr = correlation(&reference[..n], &stereo[..n]);
+            println!("{frame:>3} samples vbr={vbr}: corr {corr:.4}");
+            if corr < 0.9 {
+                failures.push(format!("frame {frame} vbr {vbr}: corr {corr:.4}"));
+            }
+            let _ = samples;
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// 5.1: encode the fixture's own decoded audio back to Opus, then check that
+/// both decoders agree with the source channel for channel — a routing error
+/// or a coupled-stream mix-up shows up as a low correlation on one channel.
+#[test]
+fn encoder_five_one_multistream() {
+    let path = fixture("opus-ogg-5.1-48000.opus");
+    if !path.exists() {
+        eprintln!("5.1 fixture missing, skipped");
+        return;
+    }
+    // The fixture decodes in mapping (Vorbis) order, which is the order the
+    // multistream encoder takes.
+    let (src, channels) = decode_ogg(&path);
+    assert_eq!(channels, 6);
+    let src: Vec<f32> = src.into_iter().take(6 * 48000 * 8).collect();
+    let out = tmp_dir().join("enc-5.1.opus");
+    let (bytes, samples, took) = encode_ogg(&src, 6, 384_000, true, 960, &out);
+    println!(
+        "5.1: {:.1} kbps, {:.1}x realtime",
+        bytes as f64 * 8.0 * 48000.0 / samples as f64 / 1000.0,
+        samples as f64 / 48000.0 / took.as_secs_f64()
+    );
+
+    // ffmpeg hands 5.1 back in its own order; the fixture is in Vorbis order.
+    const VORBIS_FROM_FFMPEG: [usize; 6] = [0, 2, 1, 4, 5, 3];
+    let Some(reference) = ffmpeg_decode(&out, 6) else {
+        eprintln!("ffmpeg unavailable, skipped");
+        return;
+    };
+    let ours = our_decode_ogg(&out);
+    let n = (reference.len() / 6).min(src.len() / 6).min(ours.len() / 6);
+    let mut failures = Vec::new();
+    for c in 0..6 {
+        let ff = VORBIS_FROM_FFMPEG[c];
+        let a: Vec<f32> = (0..n).map(|i| reference[i * 6 + ff]).collect();
+        let b: Vec<f32> = (0..n).map(|i| src[i * 6 + c]).collect();
+        let o: Vec<f32> = (0..n).map(|i| ours[i * 6 + c]).collect();
+        let corr = correlation(&a, &b);
+        let ours_corr = correlation(&o, &b);
+        println!("5.1 channel {c}: libopus corr {corr:.4}, ours {ours_corr:.4}");
+        if corr < 0.9 {
+            failures.push(format!("channel {c}: libopus corr {corr:.4}"));
+        }
+        if ours_corr < 0.9 {
+            failures.push(format!("channel {c}: our decoder corr {ours_corr:.4}"));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// The container half: ffprobe reads the file, its duration is the source's to
+/// the sample, and ffmpeg decodes it without a complaint.
+#[test]
+fn encoder_ogg_duration_is_exact() {
+    let Some(stereo) = source_pcm(5.0) else {
+        return;
+    };
+    let path = tmp_dir().join("duration.opus");
+    let (_, samples, _) = encode_ogg(&stereo, 2, 96_000, true, 960, &path);
+    let out = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+        ])
+        .arg(&path)
+        .output();
+    let Ok(out) = out else {
+        eprintln!("ffprobe unavailable, skipped");
+        return;
+    };
+    assert!(out.status.success(), "ffprobe rejected the file");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let duration: f64 = text.trim().parse().expect("duration");
+    let want = samples as f64 / 48000.0;
+    assert!(
+        (duration - want).abs() < 1e-6,
+        "duration {duration} vs {want}"
+    );
+}
+
+/// Encode speed, reported rather than gated: quality is the target here, but a
+/// number that nobody measures is a number that regresses.
+#[test]
+fn encode_speed() {
+    let Some(stereo) = source_pcm(20.0) else {
+        return;
+    };
+    let dir = tmp_dir();
+    for &(ch, rate) in &[(1usize, 96_000u32), (2, 128_000)] {
+        let src = if ch == 1 {
+            to_mono(&stereo)
+        } else {
+            stereo.clone()
+        };
+        let path = dir.join(format!("speed{ch}.opus"));
+        // Warm the caches, then measure.
+        let _ = encode_ogg(&src, ch, rate, true, 960, &path);
+        let (_, samples, took) = encode_ogg(&src, ch, rate, true, 960, &path);
+        println!(
+            "encode {ch}ch {} kbps: {:.1}x realtime",
+            rate / 1000,
+            samples as f64 / 48000.0 / took.as_secs_f64()
+        );
+    }
+}

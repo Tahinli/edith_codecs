@@ -34,15 +34,24 @@
 #![warn(missing_docs)]
 
 pub mod celt;
+pub mod celt_enc;
+pub mod encoder;
 pub mod multistream;
+pub mod multistream_enc;
+pub mod ogg;
 pub mod packet;
 pub mod range;
+pub mod range_enc;
 pub mod silk;
 
 pub use celt::CeltDecoder;
+pub use celt_enc::CeltEncoder;
+pub use encoder::{Application, Encoder};
 pub use multistream::MultistreamDecoder;
+pub use multistream_enc::MultistreamEncoder;
 pub use packet::{Bandwidth, Mode, Packet, Toc};
 pub use range::RangeDecoder;
+pub use range_enc::RangeEncoder;
 pub use silk::SilkDecoder;
 
 use ec_core::{Error, Result};
