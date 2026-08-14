@@ -1,0 +1,11 @@
+[package]
+name = "ec-h265"
+description = "Intra-only HEVC (H.265) encoder with wavefront-parallel encoding inside one call."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ec-core.workspace = true
+ec-h265-syntax.workspace = true
