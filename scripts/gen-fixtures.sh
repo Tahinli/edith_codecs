@@ -147,6 +147,12 @@ for spec in "${VIDEO_CODECS[@]}"; do
     done
     # One 4K sample per codec (8-bit, mp4, 23.976) — size/stride edge cases.
     gen_video "$vname" "$venc" "$vextra" yuv420p 23.976 24000/1001 3840x2160 2160p mp4
+    # 1916x1080: not a multiple of the macroblock/CTU size, so the decoder must
+    # honour the cropping rect / conformance window. The real library has BluRay
+    # remuxes at exactly this size, and every other fixture here is CTU-aligned.
+    case $vname in
+        h264 | hevc) gen_video "$vname" "$venc" "$vextra" yuv420p 23.976 24000/1001 1916x1080 1916x1080 mp4 ;;
+    esac
 done
 
 # -------------------------------------------------------------- summary -----
