@@ -158,11 +158,11 @@ impl Decoder {
 
 /// Frames waiting to be collected, oldest first.
 ///
-/// The queue is the frame-out design `cros-codecs` uses (a decode call produces
-/// events rather than returning a picture), minus the event fd: nothing in this
-/// family polls a decoder from an event loop, and adding a `eventfd(2)` here
-/// would mean a second FFI surface in a crate whose whole unsafe budget is
-/// meant to be libva.
+/// A decode call produces frames rather than returning one, because one access
+/// unit can complete none, one or several pictures. There is no event fd behind
+/// it: nothing in this family polls a decoder from an event loop, and adding an
+/// `eventfd(2)` would mean a second FFI surface in a crate whose whole unsafe
+/// budget is meant to be libva.
 #[derive(Debug, Default)]
 pub(crate) struct ReadyFrames {
     queue: VecDeque<Frame>,
@@ -179,6 +179,10 @@ impl ReadyFrames {
 
     pub(crate) fn clear(&mut self) {
         self.queue.clear();
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.queue.len()
     }
 }
 

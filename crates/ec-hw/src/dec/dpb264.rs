@@ -908,25 +908,23 @@ mod tests {
     fn poc_type_0_tracks_the_msb_across_a_wrap() {
         let sps = sps_for(0);
         let mut dpb = Dpb::default();
-        let poc = dpb
-            .picture_order_count(&sps, &info(0, 0, true, true))
-            .unwrap();
-        assert_eq!(poc.value, 0);
-        dpb.prev_poc_msb = poc.msb;
-        dpb.prev_poc_lsb = poc.lsb;
-
-        let poc = dpb
-            .picture_order_count(&sps, &info(1, 14, true, false))
-            .unwrap();
-        assert_eq!(poc.value, 14);
-        dpb.prev_poc_msb = poc.msb;
-        dpb.prev_poc_lsb = poc.lsb;
-
-        // lsb wraps 14 -> 2 with MaxPicOrderCntLsb 16: the msb must step up.
-        let poc = dpb
-            .picture_order_count(&sps, &info(2, 2, true, false))
-            .unwrap();
-        assert_eq!(poc.value, 18);
+        let mut expect = |info: PicInfo, want: i32| {
+            let poc = dpb.picture_order_count(&sps, &info).unwrap();
+            assert_eq!(poc.value, want, "{info:?}");
+            // What `store` does for a reference picture.
+            if info.is_reference {
+                dpb.prev_poc_msb = poc.msb;
+                dpb.prev_poc_lsb = poc.lsb;
+            }
+        };
+        // MaxPicOrderCntLsb is 16 here, so a step of more than 8 is read as a
+        // wrap rather than as a jump.
+        expect(info(0, 0, true, true), 0);
+        expect(info(1, 7, true, false), 7);
+        expect(info(2, 14, true, false), 14);
+        expect(info(3, 2, true, false), 18);
+        // And a small step back really is a step back.
+        expect(info(4, 15, true, false), 15);
     }
 
     #[test]

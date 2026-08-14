@@ -934,6 +934,11 @@ fn real_library_spot_check() {
         return;
     }
 
+    // 500 frames per file by default; a diagnostic run can ask for fewer.
+    let limit: usize = std::env::var("EC_HW_SWEEP_FRAMES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(500);
     let mut table = Vec::new();
     for (path, codec, ten_bit) in &wanted {
         let path = Path::new(path);
@@ -946,7 +951,7 @@ fn real_library_spot_check() {
         let mut worst = f64::INFINITY;
         let mut compared = 0usize;
         let mut failed: Option<String> = None;
-        let result = decode_stream(&mut decoder, *codec, &data, 500, |frame| {
+        let result = decode_stream(&mut decoder, *codec, &data, limit, |frame| {
             let (w, h) = frame.display_size;
             let reference = reference
                 .get_or_insert_with(|| Reference::open(path, w, h, *ten_bit).expect("ffmpeg runs"));
@@ -962,7 +967,11 @@ fn real_library_spot_check() {
                 failed = Some("frame size disagrees with ffmpeg".to_string());
                 return;
             }
-            worst = worst.min(psnr(&got, &want));
+            let db = psnr(&got, &want);
+            if std::env::var_os("EC_HW_DEBUG").is_some() {
+                eprintln!("  {} frame {compared}: {db:.1} dB", short(path));
+            }
+            worst = worst.min(db);
             compared += 1;
         });
         match result {

@@ -69,6 +69,8 @@ struct Current {
     poc: i32,
     timestamp: i64,
     is_reference: bool,
+    /// True when this picture may be `prevTid0Pic` for the next one (8.3.1).
+    is_tid0_anchor: bool,
     output: bool,
     rps: Rps,
     buffers: Vec<Buffer>,
@@ -142,7 +144,7 @@ impl HevcDecoder {
                     }
                 }
                 t if t.is_vcl() => {
-                    self.slice(t, nal.payload, timestamp)?;
+                    self.slice(t, nal.header.temporal_id, nal.payload, timestamp)?;
                 }
                 _ => {}
             }
@@ -176,7 +178,13 @@ impl HevcDecoder {
         self.session.as_ref().map(Session::info)
     }
 
-    fn slice(&mut self, nal_type: NalUnitType, payload: &[u8], timestamp: i64) -> Result<()> {
+    fn slice(
+        &mut self,
+        nal_type: NalUnitType,
+        temporal_id: u8,
+        payload: &[u8],
+        timestamp: i64,
+    ) -> Result<()> {
         let rbsp = unescape_rbsp(payload);
         // The header cannot be parsed without its PPS, and the PPS names the SPS.
         let pps_id = peek_pps_id(&rbsp, nal_type)?;
@@ -194,7 +202,7 @@ impl HevcDecoder {
 
         if sh.first_slice_segment_in_pic {
             self.finish_picture()?;
-            self.start_picture(&sps, &sh, nal_type, timestamp)?;
+            self.start_picture(&sps, &sh, nal_type, temporal_id, timestamp)?;
         }
         if self.current.is_none() {
             return Ok(());
@@ -243,6 +251,7 @@ impl HevcDecoder {
         sps: &Sps,
         sh: &SliceHeader,
         nal_type: NalUnitType,
+        temporal_id: u8,
         timestamp: i64,
     ) -> Result<()> {
         self.ensure_session(sps)?;
@@ -258,6 +267,22 @@ impl HevcDecoder {
             self.bump(true);
         }
 
+        if std::env::var_os("EC_HW_DEBUG").is_some() {
+            eprintln!(
+                "pic poc {poc} nal {:?} tid {temporal_id} lsb {} dpb {} ready {} (st {}/{} lt {}) free {}",
+                nal_type,
+                sh.poc_lsb,
+                self.dpb.len(),
+                self.ready.len(),
+                rps.st_curr_before.len(),
+                rps.st_curr_after.len(),
+                rps.lt_curr.len(),
+                self.session
+                    .as_ref()
+                    .map(|s| s.pool.available())
+                    .unwrap_or(0),
+            );
+        }
         let session = self
             .session
             .as_ref()
@@ -283,7 +308,19 @@ impl HevcDecoder {
             sps_id: sps.id,
             poc,
             timestamp,
-            is_reference: true,
+            // A "_N" picture (an even NAL type below 16) is a sub-layer
+            // non-reference: nothing in its own sub-layer may predict from it,
+            // and a decoder that stores it as a reference lets the next
+            // picture's reference picture set match the wrong picture by POC.
+            is_reference: is_reference_picture(nal_type),
+            // 8.3.1: `prevTid0Pic` is the previous picture with TemporalId 0
+            // that is neither RASL, RADL nor sub-layer non-reference. Taking
+            // the previous picture instead — which a stream with temporal
+            // sub-layers immediately punishes — puts the picture order count
+            // MSB one wrap out and hands the driver the wrong references.
+            is_tid0_anchor: temporal_id == 0
+                && is_reference_picture(nal_type)
+                && !is_leading_picture(nal_type),
             output: sh.pic_output_flag,
             rps,
             buffers: Vec::new(),
@@ -430,7 +467,7 @@ impl HevcDecoder {
         }
 
         if current.slices == 0 {
-            let pic_param = picture_parameters(sps, pps, sh, nal_type, current, &self.dpb);
+            let pic_param = picture_parameters(sps, pps, sh, pos, nal_type, current, &self.dpb);
             current
                 .buffers
                 .push(param_buffer(&session.context, &pic_param)?);
@@ -541,7 +578,9 @@ impl HevcDecoder {
             },
             output: current.output,
         });
-        self.prev_tid0_poc = current.poc;
+        if current.is_tid0_anchor {
+            self.prev_tid0_poc = current.poc;
+        }
         self.started = true;
         self.bump(false);
         Ok(())
@@ -582,6 +621,19 @@ impl HevcDecoder {
             self.dpb.retain(|p| p.stored());
         }
     }
+}
+
+/// True unless the NAL type says sub-layer non-reference (`_N`, an even type
+/// below 16).
+fn is_reference_picture(nal_type: NalUnitType) -> bool {
+    let code = nal_type.code();
+    code >= 16 || code % 2 == 1
+}
+
+/// RADL (6, 7) and RASL (8, 9): the leading pictures of an IRAP, which 8.3.1
+/// excludes from the picture order count prediction.
+fn is_leading_picture(nal_type: NalUnitType) -> bool {
+    (6..=9).contains(&nal_type.code())
 }
 
 /// `slice_pic_parameter_set_id`, readable without any parameter set.
@@ -641,10 +693,12 @@ fn reference_lists(sh: &SliceHeader, rps: &Rps) -> [Vec<usize>; 2] {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn picture_parameters(
     sps: &Sps,
     pps: &Pps,
     sh: &SliceHeader,
+    pos: &ParsePositions,
     nal_type: NalUnitType,
     current: &Current,
     dpb: &[StoredPicture],
@@ -681,10 +735,10 @@ fn picture_parameters(
         pps_beta_offset_div2: pps.beta_offset_div2 as i8,
         pps_tc_offset_div2: pps.tc_offset_div2 as i8,
         num_extra_slice_header_bits: pps.num_extra_slice_header_bits as u8,
-        // Zero when the slice took its set from the SPS, which is what the
-        // parser reports; the field exists so the driver can skip a set the
-        // header carried itself.
-        st_rps_bits: 0,
+        // The size of an `st_ref_pic_set()` the slice header carried itself,
+        // so the driver can skip it; zero when the slice named an SPS set,
+        // which is what the parser reports.
+        st_rps_bits: pos.st_rps_bits,
         ..PictureParameterBufferHEVC::default()
     };
 
