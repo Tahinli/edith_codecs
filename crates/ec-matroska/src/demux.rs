@@ -76,6 +76,16 @@ struct Track {
     /// Index in [`MatroskaDemuxer::streams`], or [`None`] for a track this
     /// build has no codec id for — its blocks are walked past, not refused.
     stream: Option<u32>,
+    /// The file's own `CodecID` string (`A_EAC3`, `S_HDMV/PGS`), which says
+    /// more than the [`CodecId`] it maps to: `A_AAC/MPEG4/LC/SBR` and `A_AAC`
+    /// are one codec and two container declarations.
+    codec_id: String,
+    /// `TrackName` — "Japanese 5.1", "Signs" — empty where the file has none.
+    name: String,
+    /// What `TrackType` said, for the tracks with no `stream` of their own:
+    /// "MPEG-2 *video* nothing here decodes" is an answer, "no video track" is
+    /// not.
+    media: Option<MediaType>,
     unpack: Unpack,
     /// `DefaultDuration` in timestamp-scale ticks: what a laced frame steps by
     /// and what a block with no `BlockDuration` lasts.
@@ -361,10 +371,69 @@ impl<R: Read + Seek> MatroskaDemuxer<R> {
     /// file's, and it is what a caller naming one language of a dual-audio
     /// remux is holding.
     pub fn track_number(&self, stream: u32) -> Option<u64> {
+        self.track(stream).map(|t| t.number)
+    }
+
+    /// The file's own `CodecID` for a stream (`A_EAC3`, `S_TEXT/ASS`).
+    ///
+    /// [`StreamInfo::params`] names the codec this build decodes it with; this
+    /// is what the container declared, which is what a remux copies and what a
+    /// refusal names.
+    pub fn track_codec_id(&self, stream: u32) -> Option<&str> {
+        self.track(stream).map(|t| t.codec_id.as_str())
+    }
+
+    /// `TrackName`, the title a muxer wrote beside the language ("Commentary",
+    /// "Signs"); [`None`] where the track has none.
+    pub fn track_title(&self, stream: u32) -> Option<&str> {
+        self.track(stream)
+            .map(|t| t.name.as_str())
+            .filter(|n| !n.is_empty())
+    }
+
+    /// Why this track's frames cannot be read back — a `ContentEncodings` this
+    /// crate cannot undo — in the words a caller refuses with; [`None`] for the
+    /// tracks it can.
+    ///
+    /// The same sentence [`Demuxer::next_packet`] raises when it reaches such a
+    /// frame. Asked *here*, a caller lists one unreadable subtitle track beside
+    /// the readable ones instead of discovering it a cluster later.
+    pub fn track_refusal(&self, stream: u32) -> Option<&str> {
+        match &self.track(stream)?.unpack {
+            Unpack::Refused(why) => Some(why),
+            _ => None,
+        }
+    }
+
+    /// `(TrackNumber, CodecID, TrackType)` of every `TrackEntry` this crate
+    /// hands no stream for — a codec it has no id for, walked past rather than
+    /// refused.
+    ///
+    /// What a *caller's* refusal is written from: a file whose only picture is
+    /// MPEG-2 has a video track, and telling its user it has none is a lie about
+    /// their file.
+    pub fn unread_tracks(&self) -> Vec<(u64, &str, Option<MediaType>)> {
         self.tracks
             .iter()
-            .find(|t| t.stream == Some(stream))
-            .map(|t| t.number)
+            .filter(|t| t.stream.is_none())
+            .map(|t| (t.number, t.codec_id.as_str(), t.media))
+            .collect()
+    }
+
+    /// Whether this track's frames arrive as the encoder wrote them — no
+    /// `ContentEncodings` over them at all.
+    ///
+    /// What a *remux* asks: a stripped or zlib-compressed frame is put back
+    /// together here, so it decodes, but the bytes handed over are then no
+    /// longer the ones the source file holds and copying them into another
+    /// container is not a copy.
+    pub fn track_is_plain(&self, stream: u32) -> bool {
+        self.track(stream)
+            .is_some_and(|t| t.unpack == Unpack::None)
+    }
+
+    fn track(&self, stream: u32) -> Option<&Track> {
+        self.tracks.iter().find(|t| t.stream == Some(stream))
     }
 
     /// The next cluster into [`MatroskaDemuxer::queue`]; `false` at the end of
@@ -1000,6 +1069,7 @@ fn parse_tracks(
         let start = range.start;
         let (mut number, mut kind, mut codec) = (0u64, 0u64, String::new());
         let (mut language, mut bcp47, mut private) = (String::new(), String::new(), None);
+        let mut name = String::new();
         let (mut default_duration, mut unpack) = (None, Unpack::None);
         let (mut width, mut height, mut color) = (0u32, 0u32, ColorInfo::default());
         let mut display = (0u64, 0u64);
@@ -1012,6 +1082,7 @@ fn parse_tracks(
                 ebml::TRACK_TYPE => kind = ebml::uint_of(&buf[child]),
                 ebml::CODEC_ID => codec = ebml::string_of(&buf[child]),
                 ebml::CODEC_PRIVATE => private = Some(Buf::copy_from_slice(&buf[child])),
+                ebml::TRACK_NAME => name = ebml::string_of(&buf[child]),
                 ebml::TRACK_LANGUAGE => language = ebml::string_of(&buf[child]),
                 // The spec's own precedence: a modern file states its languages
                 // in `LanguageBCP47` and leaves the legacy element out.
@@ -1121,6 +1192,9 @@ fn parse_tracks(
         tracks.push(Track {
             number,
             stream,
+            codec_id: codec,
+            name,
+            media,
             unpack,
             default_duration: step,
         });

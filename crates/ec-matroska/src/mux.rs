@@ -46,6 +46,10 @@ struct MuxTrack {
     time_base: TimeBase,
     /// Nanoseconds a frame lasts, where the stream stated a rate.
     frame_ns: Option<u64>,
+    /// `TrackName`, where a caller named the track.
+    title: String,
+    /// `CodecDelay` in nanoseconds, where a caller stated one.
+    delay_ns: Option<u64>,
 }
 
 /// One `CuePoint` waiting for [`Muxer::finish`].
@@ -121,6 +125,47 @@ impl<W: Write + Seek> MatroskaMuxer<W> {
         }
     }
 
+    /// Names a track: `TrackName`, the title a player's menu shows beside the
+    /// language ("Signs", "Commentary"). Must be set before the first packet,
+    /// which is when the `Tracks` element is written.
+    pub fn set_track_title(&mut self, stream: u32, title: &str) -> Result<()> {
+        let track = self
+            .tracks
+            .get_mut(stream as usize)
+            .ok_or_else(|| Error::corrupt(format!("Matroska: no stream {stream} to name")))?;
+        if self.pos > 0 {
+            return Err(Error::corrupt(
+                "Matroska: a track named after the first packet",
+            ));
+        }
+        track.title = title.to_string();
+        Ok(())
+    }
+
+    /// States a track's encoder delay: `CodecDelay`, nanoseconds of decoded
+    /// output a player throws away before the audible stream starts.
+    ///
+    /// Opus needs no call — its `OpusHead` states the pre-skip and that is read
+    /// straight off the extradata. AAC does: its delay is one access unit and
+    /// nothing in the bitstream or the container says so, so an mp4 reader drops
+    /// it by convention while Matroska has to be told. A track written without
+    /// it plays ~21 ms early against the picture.
+    ///
+    /// Must be set before the first packet, which is when `Tracks` is written.
+    pub fn set_track_delay(&mut self, stream: u32, delay_ns: u64) -> Result<()> {
+        if self.pos > 0 {
+            return Err(Error::corrupt(
+                "Matroska: a track delayed after the first packet",
+            ));
+        }
+        let track = self
+            .tracks
+            .get_mut(stream as usize)
+            .ok_or_else(|| Error::corrupt(format!("Matroska: no stream {stream} to delay")))?;
+        track.delay_ns = Some(delay_ns);
+        Ok(())
+    }
+
     fn write(&mut self, bytes: &[u8]) -> Result<()> {
         self.w.write_all(bytes)?;
         self.pos += bytes.len() as u64;
@@ -187,14 +232,15 @@ impl<W: Write + Seek> MatroskaMuxer<W> {
         self.tracks_at = head.len() as u64;
         let mut tracks = Vec::new();
         for (i, info) in self.streams.clone().iter().enumerate() {
-            let entry = self.track_entry(info, self.tracks[i].number)?;
+            let entry = self.track_entry(info, i)?;
             elem(&mut tracks, ebml::TRACK_ENTRY, &entry);
         }
         elem(&mut head, ebml::TRACKS, &tracks);
         self.write(&head)
     }
 
-    fn track_entry(&self, info: &StreamInfo, number: u64) -> Result<Vec<u8>> {
+    fn track_entry(&self, info: &StreamInfo, track: usize) -> Result<Vec<u8>> {
+        let number = self.tracks[track].number;
         let params = &info.params;
         let codec = matroska_codec_id(params.codec)?;
         if self.webm
@@ -227,6 +273,13 @@ impl<W: Write + Seek> MatroskaMuxer<W> {
             && !extradata.is_empty()
         {
             elem(&mut entry, ebml::CODEC_PRIVATE, extradata);
+        }
+        if !self.tracks[track].title.is_empty() {
+            elem(
+                &mut entry,
+                ebml::TRACK_NAME,
+                self.tracks[track].title.as_bytes(),
+            );
         }
         // A track that states no language is English by spec, so a track whose
         // source said nothing says `und` here rather than claiming a language.
@@ -320,7 +373,11 @@ impl<W: Write + Seek> MatroskaMuxer<W> {
                 // and a track written without it plays 6.5 ms early against the
                 // picture. The pre-roll is the 80 ms the spec asks a seek to
                 // decode and throw away.
-                if params.codec == CodecId::Opus
+                // A caller that stated the delay outright is believed first:
+                // AAC's is one access unit and nothing in the file says so.
+                if let Some(ns) = self.tracks[track].delay_ns {
+                    uint(&mut entry, ebml::CODEC_DELAY, ns);
+                } else if params.codec == CodecId::Opus
                     && let Some(head) = &params.extradata
                     && head.len() >= 12
                     && head.starts_with(b"OpusHead")
@@ -456,6 +513,8 @@ impl<W: Write + Seek + Send> Muxer for MatroskaMuxer<W> {
             media: info.params.codec.media_type(),
             time_base: info.time_base,
             frame_ns,
+            title: String::new(),
+            delay_ns: None,
         });
         let mut info = info;
         info.index = index;
@@ -512,8 +571,12 @@ impl<W: Write + Seek + Send> Muxer for MatroskaMuxer<W> {
         }
         self.flush()?;
 
-        // The index, in the order a seek reads it.
-        let cues_at = self.pos - self.segment_body;
+        // The index, in the order a seek reads it. Kept as a file offset like
+        // the other two: the `SeekHead` below is what makes them all relative,
+        // and a position taken off the segment twice points at the middle of a
+        // cluster — where a reader that follows it finds an element that cannot
+        // be there and gives up on the file.
+        let cues_at = self.pos;
         let mut cues = Vec::new();
         for cue in std::mem::take(&mut self.cues) {
             let mut positions = Vec::new();

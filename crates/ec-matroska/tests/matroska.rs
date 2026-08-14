@@ -200,6 +200,78 @@ fn remux(src: &Path, dst: &Path) -> usize {
     packets
 }
 
+/// Every `SeekHead` entry of `path` resolves to an element of the id it names.
+///
+/// `SeekPosition` is stated from the start of the `Segment`'s payload, and a
+/// position taken off that twice lands inside a cluster: the element id read
+/// there is whatever byte happened to be at the offset.
+fn seek_head_points_at_what_it_names(path: &Path) {
+    let bytes = std::fs::read(path).expect("the written file");
+    // Element headers, by hand: an id is a variable-length integer with its
+    // marker bit kept, a size is one with the marker stripped.
+    let elem = |at: usize| -> (u32, usize, u64) {
+        let len = (bytes[at].leading_zeros() + 1) as usize;
+        let id = bytes[at..at + len]
+            .iter()
+            .fold(0u32, |acc, &b| (acc << 8) | u32::from(b));
+        let szn = (bytes[at + len].leading_zeros() + 1) as usize;
+        let mut size = u64::from(bytes[at + len]) & (0xFFu64 >> szn);
+        for &b in &bytes[at + len + 1..at + len + szn] {
+            size = (size << 8) | u64::from(b);
+        }
+        (id, at + len + szn, size)
+    };
+    let (_, ebml_body, ebml_size) = elem(0);
+    let segment_at = ebml_body + ebml_size as usize;
+    let (id, segment_body, _) = elem(segment_at);
+    assert_eq!(id, 0x1853_8067, "{}: no Segment", path.display());
+    let (id, head_body, head_size) = elem(segment_body);
+    assert_eq!(id, 0x114D_9B74, "{}: no SeekHead", path.display());
+
+    let mut found = 0;
+    let mut at = head_body;
+    while at < head_body + head_size as usize {
+        let (id, body, size) = elem(at);
+        at = body + size as usize;
+        if id != 0x4DBB {
+            continue;
+        }
+        let (mut want, mut pos) = (None, None);
+        let mut child = body;
+        while child < at {
+            let (id, body, size) = elem(child);
+            child = body + size as usize;
+            match id {
+                0x53AB => {
+                    want = Some(
+                        bytes[body..body + size as usize]
+                            .iter()
+                            .fold(0u32, |acc, &b| (acc << 8) | u32::from(b)),
+                    );
+                }
+                0x53AC => {
+                    pos = Some(
+                        bytes[body..body + size as usize]
+                            .iter()
+                            .fold(0u64, |acc, &b| (acc << 8) | u64::from(b)),
+                    );
+                }
+                _ => {}
+            }
+        }
+        let (want, pos) = (want.expect("a SeekID"), pos.expect("a SeekPosition"));
+        let (id, ..) = elem(segment_body + pos as usize);
+        assert_eq!(
+            id,
+            want,
+            "{}: SeekHead names {want:#x} at {pos} and finds {id:#x}",
+            path.display()
+        );
+        found += 1;
+    }
+    assert!(found >= 3, "{}: {found} SeekHead entries", path.display());
+}
+
 #[test]
 fn every_fixture_remuxes_into_a_file_ffprobe_and_ffmpeg_agree_with() {
     let files = matroska_fixtures();
@@ -221,6 +293,13 @@ fn every_fixture_remuxes_into_a_file_ffprobe_and_ffmpeg_agree_with() {
             "{}: duration {d0} became {d1}",
             src.display()
         );
+
+        // ...and the `SeekHead` really names the elements it says it does. A
+        // demuxer that finds nothing there falls back to a walk and reads the
+        // file perfectly well, so nothing above this notices — while a stricter
+        // reader (symphonia's) follows the pointer into the middle of a cluster
+        // and refuses the file outright. Checked by resolving every entry.
+        seek_head_points_at_what_it_names(&dst);
 
         // ...and it decodes, which is the only claim a field compare cannot make.
         let decode = Command::new("ffmpeg")
