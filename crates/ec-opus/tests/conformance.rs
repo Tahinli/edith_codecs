@@ -9,6 +9,50 @@ use std::path::{Path, PathBuf};
 
 use ec_opus::Decoder;
 
+// ---------------------------------------------------------------------------
+// Counting allocator: proves the steady-state encode loop allocates nothing.
+// Lives in the test binary only — the shipped crate has no allocator games.
+// Same pattern as ec-h264's proof: only the thread that armed the counter is
+// counted, so parallel tests (and ffmpeg child plumbing) allocate freely.
+// ---------------------------------------------------------------------------
+
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+struct CountingAlloc;
+
+static ALLOCS: AtomicU64 = AtomicU64::new(0);
+
+std::thread_local! {
+    static COUNTING_HERE: Cell<bool> = const { Cell::new(false) };
+}
+
+fn counting_here() -> bool {
+    COUNTING_HERE.try_with(Cell::get).unwrap_or(false)
+}
+
+unsafe impl GlobalAlloc for CountingAlloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if counting_here() {
+            ALLOCS.fetch_add(1, Ordering::Relaxed);
+        }
+        unsafe { System.alloc(layout) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) }
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        if counting_here() {
+            ALLOCS.fetch_add(1, Ordering::Relaxed);
+        }
+        unsafe { System.realloc(ptr, layout, new_size) }
+    }
+}
+
+#[global_allocator]
+static A: CountingAlloc = CountingAlloc;
+
 /// One packet of an `opus_demo` test vector file.
 struct VectorPacket {
     payload: Vec<u8>,
@@ -722,6 +766,580 @@ fn real_library_sweep() {
             samples as f64 / 48000.0 / elapsed
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Encoder: self-consistency (range-exact against our own decoder)
+// ---------------------------------------------------------------------------
+
+use ec_opus::{Encoder, MultistreamEncoder};
+
+/// A deterministic music-like test signal: several detuned partials plus a
+/// swept component per channel, loud enough to exercise every band.
+fn test_signal(channels: usize, secs: f64) -> Vec<f32> {
+    let n = (48000.0 * secs) as usize;
+    let mut out = Vec::with_capacity(n * channels);
+    for i in 0..n {
+        let t = i as f64 / 48000.0;
+        for c in 0..channels {
+            let base = 220.0 * (c as f64 * 0.5 + 1.0);
+            let sweep = 400.0 + 3000.0 * (0.5 + 0.5 * (0.13 * t).sin());
+            let v = 0.35 * (std::f64::consts::TAU * base * t).sin()
+                + 0.2 * (std::f64::consts::TAU * base * 3.01 * t).sin()
+                + 0.12 * (std::f64::consts::TAU * sweep * t).sin()
+                + 0.08 * (std::f64::consts::TAU * 9000.0 * (1.0 + 0.02 * c as f64) * t).sin();
+            out.push(v as f32);
+        }
+    }
+    out
+}
+
+/// Encodes `pcm` in `frame`-sample packets and decodes each with our own
+/// decoder, asserting the range coder states agree packet for packet — the
+/// same bit-exact check the RFC vectors put on the decoder, now closing the
+/// loop over the encoder. Returns the decoded signal and total packet bytes.
+fn roundtrip_own(
+    enc: &mut Encoder,
+    pcm: &[f32],
+    channels: usize,
+    frame: usize,
+) -> (Vec<f32>, usize) {
+    let mut dec = Decoder::new(48000, channels).unwrap();
+    let mut out = vec![0u8; 1500];
+    let mut decoded = Vec::new();
+    let mut buf = vec![0.0f32; 5760 * channels];
+    let mut bytes = 0usize;
+    let mut padded = Vec::new();
+    for block in pcm.chunks(frame * channels) {
+        let block = if block.len() < frame * channels {
+            padded.clear();
+            padded.extend_from_slice(block);
+            padded.resize(frame * channels, 0.0);
+            &padded[..]
+        } else {
+            block
+        };
+        let len = enc.encode_float(block, frame, &mut out).expect("encode");
+        bytes += len;
+        let n = dec.decode_float(&out[..len], &mut buf).expect("decode");
+        assert_eq!(n, frame, "decoded frame size");
+        assert_eq!(
+            dec.final_range(),
+            enc.final_range(),
+            "range state diverged between encoder and decoder"
+        );
+        decoded.extend_from_slice(&buf[..n * channels]);
+    }
+    (decoded, bytes)
+}
+
+/// Worst-channel correlation against the source with the encoder's
+/// 120-sample delay removed.
+fn delayed_corr(source: &[f32], decoded: &[f32], channels: usize) -> f64 {
+    const DELAY: usize = 120;
+    let n = (decoded.len() / channels).saturating_sub(DELAY);
+    let n = n.min(source.len() / channels);
+    let mut worst = 1.0f64;
+    for c in 0..channels {
+        let a: Vec<f32> = (0..n).map(|i| source[i * channels + c]).collect();
+        let b: Vec<f32> = (0..n)
+            .map(|i| decoded[(i + DELAY) * channels + c])
+            .collect();
+        worst = worst.min(correlation(&a, &b));
+    }
+    worst
+}
+
+/// Every rate from the product's table, mono and stereo, 20 ms CBR: the
+/// encoder must be decodable by its own decoder range-exactly (asserted in
+/// the helper) and land close to the source. The cross-implementation checks
+/// against libopus live below — self-consistency alone proves nothing about
+/// the world (the incumbent's exact disease).
+#[test]
+fn encoder_roundtrips_at_every_rate() {
+    for channels in [1usize, 2] {
+        let pcm = test_signal(channels, 2.0);
+        for kbps in [32u32, 64, 96, 128, 160, 165, 192, 256, 320, 510] {
+            let mut enc = Encoder::new(48000, channels).unwrap();
+            enc.set_bitrate(kbps * 1000);
+            let (decoded, bytes) = roundtrip_own(&mut enc, &pcm, channels, 960);
+            let corr = delayed_corr(&pcm, &decoded, channels);
+            let rate = bytes as f64 * 8.0 / 2.0 / 1000.0;
+            println!("{channels} ch {kbps:>3} kbps: corr {corr:.4}, actual {rate:.1} kbps");
+            let floor = if kbps < 64 { 0.8 } else { 0.9 };
+            assert!(
+                corr >= floor,
+                "{channels} ch {kbps} kbps: correlation {corr:.4}"
+            );
+        }
+    }
+}
+
+/// All four CELT frame sizes survive the loop, and constrained VBR both
+/// stays decodable and lands near its target.
+#[test]
+fn encoder_frame_sizes_and_vbr() {
+    let pcm = test_signal(2, 1.0);
+    for frame in [120usize, 240, 480, 960] {
+        let mut enc = Encoder::new(48000, 2).unwrap();
+        enc.set_bitrate(128_000);
+        let (decoded, _) = roundtrip_own(&mut enc, &pcm, 2, frame);
+        let corr = delayed_corr(&pcm, &decoded, 2);
+        println!("frame {frame}: corr {corr:.4}");
+        assert!(corr >= 0.85, "frame {frame}: correlation {corr:.4}");
+    }
+    let mut enc = Encoder::new(48000, 2).unwrap();
+    enc.set_bitrate(128_000);
+    enc.set_vbr_constrained(true);
+    let (decoded, bytes) = roundtrip_own(&mut enc, &pcm, 2, 960);
+    let corr = delayed_corr(&pcm, &decoded, 2);
+    let rate = bytes as f64 * 8.0 / 1.0 / 1000.0;
+    println!("cvbr 128k: corr {corr:.4}, actual {rate:.1} kbps");
+    assert!(corr >= 0.9, "cvbr: correlation {corr:.4}");
+    assert!(
+        (90.0..=150.0).contains(&rate),
+        "cvbr at 128k landed on {rate:.1} kbps"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Encoder: the world must decode it. Self-consistency alone was the
+// incumbent's disease (correlation 0.06 against libopus at 256 kbps while
+// its own round trip passed), so every claim here runs through ffmpeg's
+// libopus — the reference implementation — via Ogg-Opus files this crate
+// muxed itself.
+// ---------------------------------------------------------------------------
+
+use ec_core::registry::{CodecId, CodecParameters, MediaParameters, Muxer, StreamInfo};
+use ec_core::{ChannelLayout, Packet as CorePacket, TimeBase};
+use ec_ogg::OggMuxer;
+
+/// The RFC 7845 identification header for this encoder: pre-skip 120, the
+/// CELT overlap delay.
+fn opus_head(channels: usize, layout: Option<(usize, usize, &[u8])>) -> Vec<u8> {
+    let mut h = Vec::from(*b"OpusHead");
+    h.push(1);
+    h.push(channels as u8);
+    h.extend_from_slice(&120u16.to_le_bytes());
+    h.extend_from_slice(&48000u32.to_le_bytes());
+    h.extend_from_slice(&0i16.to_le_bytes());
+    match layout {
+        None => h.push(0),
+        Some((streams, coupled, mapping)) => {
+            h.push(1);
+            h.push(streams as u8);
+            h.push(coupled as u8);
+            h.extend_from_slice(mapping);
+        }
+    }
+    h
+}
+
+/// Muxes 20 ms packets into an Ogg-Opus file whose final granule trims the
+/// stream to exactly `total_samples` — RFC 7845 end-trimming plus the
+/// pre-skip accounting.
+fn write_ogg_opus(
+    path: &Path,
+    packets: &[Vec<u8>],
+    head: Vec<u8>,
+    channels: usize,
+    total_samples: usize,
+) {
+    let file = std::io::BufWriter::new(fs::File::create(path).unwrap());
+    let mut mux = OggMuxer::new(file);
+    let tb = TimeBase::from_rate(48000);
+    let mut params = CodecParameters::new(CodecId::Opus);
+    params.extradata = Some(head.into());
+    if let MediaParameters::Audio(a) = &mut params.media {
+        a.sample_rate = 48000;
+        a.layout = ChannelLayout::from_count(channels);
+    }
+    mux.add_stream(StreamInfo::new(0, tb, params)).unwrap();
+    let mut pts = 0i64;
+    for (idx, p) in packets.iter().enumerate() {
+        let last = idx == packets.len() - 1;
+        let dur = if last {
+            total_samples as i64 + 120 - pts
+        } else {
+            960
+        };
+        let pkt = CorePacket::new(0, tb, p.clone())
+            .with_pts(pts)
+            .with_duration(dur);
+        mux.write_packet(&pkt).unwrap();
+        pts += 960;
+    }
+    mux.finish().unwrap();
+}
+
+/// Encodes `pcm` (plus one flush frame for the 120-sample delay) as 20 ms
+/// packets.
+fn encode_packets(enc: &mut Encoder, pcm: &[f32], channels: usize) -> Vec<Vec<u8>> {
+    let mut out = vec![0u8; 1500];
+    let mut packets = Vec::new();
+    let mut padded = Vec::new();
+    for block in pcm.chunks(960 * channels) {
+        let block = if block.len() < 960 * channels {
+            padded.clear();
+            padded.extend_from_slice(block);
+            padded.resize(960 * channels, 0.0);
+            &padded[..]
+        } else {
+            block
+        };
+        let len = enc.encode_float(block, 960, &mut out).expect("encode");
+        packets.push(out[..len].to_vec());
+    }
+    // One silent frame flushes the delay past the end trim.
+    let silence = vec![0.0f32; 960 * channels];
+    let len = enc.encode_float(&silence, 960, &mut out).expect("encode");
+    packets.push(out[..len].to_vec());
+    packets
+}
+
+fn temp_path(name: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("ec-opus-enc-{}-{name}", std::process::id()))
+}
+
+/// The full product rate table, mono and stereo, decoded by libopus: the
+/// worst-channel correlation and the opus_compare quality, per rate. The
+/// incumbent fails this file's 256 kbps row at correlation 0.06; the MUST
+/// bars here are correlation >= 0.9 at 96/165/256 kbps.
+#[test]
+fn libopus_decodes_our_packets_across_the_rate_table() {
+    for channels in [1usize, 2] {
+        let pcm = test_signal(channels, 2.0);
+        let total = pcm.len() / channels;
+        let mut table = Vec::new();
+        for kbps in [32u32, 64, 96, 128, 160, 165, 192, 256, 320, 510] {
+            let mut enc = Encoder::new(48000, channels).unwrap();
+            enc.set_bitrate(kbps * 1000);
+            let packets = encode_packets(&mut enc, &pcm, channels);
+            let path = temp_path(&format!("{channels}ch-{kbps}k.opus"));
+            write_ogg_opus(&path, &packets, opus_head(channels, None), channels, total);
+            let Some(reference) = ffmpeg_decode(&path, channels) else {
+                eprintln!("ffmpeg unavailable, skipped");
+                let _ = fs::remove_file(&path);
+                return;
+            };
+            let _ = fs::remove_file(&path);
+            let n = (reference.len() / channels).min(total);
+            assert!(
+                n >= total - 960,
+                "{channels} ch {kbps} kbps: libopus returned {n} of {total} samples"
+            );
+            let mut worst = 1.0f64;
+            for c in 0..channels {
+                let a: Vec<f32> = (0..n).map(|i| pcm[i * channels + c]).collect();
+                let b: Vec<f32> = (0..n).map(|i| reference[i * channels + c]).collect();
+                worst = worst.min(correlation(&a, &b));
+            }
+            let quality = opus_compare(
+                &to_i16(&pcm[..n * channels]),
+                &to_i16(&reference[..n * channels]),
+                channels,
+            );
+            table.push(format!(
+                "{channels} ch {kbps:>3} kbps: worst corr {worst:.4}, opus_compare {quality:.1}"
+            ));
+            let floor = match kbps {
+                0..=39 => 0.6,
+                40..=95 => 0.8,
+                _ => 0.9,
+            };
+            assert!(
+                worst >= floor,
+                "{channels} ch {kbps} kbps: libopus heard correlation {worst:.4} (floor {floor})"
+            );
+            if kbps >= 96 {
+                assert!(
+                    quality >= 0.0,
+                    "{channels} ch {kbps} kbps: opus_compare {quality:.1}"
+                );
+            }
+        }
+        for line in table {
+            println!("{line}");
+        }
+    }
+}
+
+/// 5.1 multistream: one distinct tone per channel, encoded with the
+/// mapping-family-1 layout and decoded by libopus — every channel must come
+/// back in its place (order-preserved) at correlation >= 0.9.
+#[test]
+fn five_one_encode_end_to_end() {
+    const VORBIS_TO_FFMPEG_5_1: [usize; 6] = [0, 2, 1, 4, 5, 3];
+    const TONES: [f64; 6] = [220.0, 440.0, 660.0, 55.0, 880.0, 1320.0];
+    let total = 96000usize;
+    // Vorbis order input, one tone per channel plus a quiet upper partial so
+    // every stream codes real content.
+    let mut pcm = Vec::with_capacity(total * 6);
+    for i in 0..total {
+        let t = i as f64 / 48000.0;
+        for f in TONES {
+            let v = 0.4 * (std::f64::consts::TAU * f * t).sin()
+                + 0.05 * (std::f64::consts::TAU * f * 7.03 * t).sin();
+            pcm.push(v as f32);
+        }
+    }
+    let mut enc = MultistreamEncoder::surround_5_1(48000).unwrap();
+    enc.set_bitrate(384_000);
+    let mut out = vec![0u8; 8 * 1500];
+    let mut packets = Vec::new();
+    for block in pcm.chunks_exact(960 * 6) {
+        let len = enc.encode_float(block, 960, &mut out).expect("encode");
+        packets.push(out[..len].to_vec());
+    }
+    let silence = vec![0.0f32; 960 * 6];
+    let len = enc.encode_float(&silence, 960, &mut out).expect("encode");
+    packets.push(out[..len].to_vec());
+    let (streams, coupled, mapping) = enc.layout();
+    let head = opus_head(6, Some((streams, coupled, mapping)));
+    let path = temp_path("5.1.opus");
+    write_ogg_opus(&path, &packets, head, 6, total);
+    let Some(reference) = ffmpeg_decode(&path, 6) else {
+        eprintln!("ffmpeg unavailable, skipped");
+        let _ = fs::remove_file(&path);
+        return;
+    };
+    let _ = fs::remove_file(&path);
+    let n = (reference.len() / 6).min(total);
+    assert!(n >= total - 960, "libopus returned {n} of {total} samples");
+    for (c, &their) in VORBIS_TO_FFMPEG_5_1.iter().enumerate() {
+        let a: Vec<f32> = (0..n).map(|i| pcm[i * 6 + c]).collect();
+        let b: Vec<f32> = (0..n).map(|i| reference[i * 6 + their]).collect();
+        let corr = correlation(&a, &b);
+        println!("5.1 channel {c} ({} Hz): corr {corr:.4}", TONES[c]);
+        assert!(
+            corr >= 0.9,
+            "5.1 channel {c} came back at correlation {corr:.4}"
+        );
+    }
+}
+
+/// The muxed file's duration must be exact: the final granule trims the
+/// flush frame so a 2.000 s input probes as 2.000 s, and the sample count
+/// libopus hands back is exactly the input length.
+#[test]
+fn ogg_opus_round_trip_duration_is_exact() {
+    let pcm = test_signal(2, 2.0);
+    let total = pcm.len() / 2;
+    let mut enc = Encoder::new(48000, 2).unwrap();
+    enc.set_bitrate(128_000);
+    let packets = encode_packets(&mut enc, &pcm, 2);
+    let path = temp_path("duration.opus");
+    write_ogg_opus(&path, &packets, opus_head(2, None), 2, total);
+    let probe = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=duration",
+            "-of",
+            "default=noprint_wrappers=1",
+        ])
+        .arg(&path)
+        .output();
+    if let Ok(p) = probe
+        && p.status.success()
+    {
+        let text = String::from_utf8_lossy(&p.stdout);
+        let dur: f64 = text
+            .trim()
+            .strip_prefix("duration=")
+            .unwrap_or("0")
+            .parse()
+            .unwrap_or(0.0);
+        // ffprobe reports Ogg-Opus durations *including* the pre-skip — its
+        // own 3.000 s encode probes as 3.0065 (312/48000 more). Ours carries
+        // a 120-sample pre-skip, so exact is 2.0025; the decoded sample
+        // count below is the pre-skip-free half of the claim.
+        let expected = (total as f64 + 120.0) / 48000.0;
+        assert!(
+            (dur - expected).abs() < 1e-6,
+            "ffprobe reports {dur} s, expected {expected} s (2.000 s + pre-skip)"
+        );
+    }
+    if let Some(decoded) = ffmpeg_decode(&path, 2) {
+        assert_eq!(
+            decoded.len() / 2,
+            total,
+            "libopus decoded {} samples of {total}",
+            decoded.len() / 2
+        );
+    }
+    let _ = fs::remove_file(&path);
+}
+
+/// Cross-check against the reference `opus_demo` decoder (RFC 6716
+/// Appendix A) over its own `.bit` format, when the binary is available:
+/// `EC_OPUS_DEMO=/path/to/opus_demo cargo test`.
+#[test]
+fn opus_demo_decodes_our_bit_stream() {
+    let Ok(demo) = std::env::var("EC_OPUS_DEMO") else {
+        eprintln!("EC_OPUS_DEMO unset, skipped");
+        return;
+    };
+    let pcm = test_signal(2, 2.0);
+    let mut enc = Encoder::new(48000, 2).unwrap();
+    enc.set_bitrate(256_000);
+    let mut out = vec![0u8; 1500];
+    let mut bit = Vec::new();
+    for block in pcm.chunks_exact(960 * 2) {
+        let len = enc.encode_float(block, 960, &mut out).expect("encode");
+        bit.extend_from_slice(&(len as u32).to_be_bytes());
+        bit.extend_from_slice(&enc.final_range().to_be_bytes());
+        bit.extend_from_slice(&out[..len]);
+    }
+    let bit_path = temp_path("demo.bit");
+    let pcm_path = temp_path("demo.pcm");
+    fs::write(&bit_path, &bit).unwrap();
+    let status = Command::new(&demo)
+        .arg("-d")
+        .arg("48000")
+        .arg("2")
+        .arg(&bit_path)
+        .arg(&pcm_path)
+        .status()
+        .expect("run opus_demo");
+    assert!(status.success(), "opus_demo refused our stream");
+    let decoded = read_i16(&pcm_path);
+    let _ = fs::remove_file(&bit_path);
+    let _ = fs::remove_file(&pcm_path);
+    // opus_demo does not apply pre-skip; compensate for the 120-sample delay.
+    let delay = 120usize;
+    let n = (decoded.len() / 2 - delay).min(pcm.len() / 2 - delay);
+    let mut worst = 1.0f64;
+    for c in 0..2 {
+        let a: Vec<f32> = (0..n).map(|i| pcm[i * 2 + c]).collect();
+        let b: Vec<f32> = (0..n)
+            .map(|i| decoded[(i + delay) * 2 + c] as f32 / 32768.0)
+            .collect();
+        worst = worst.min(correlation(&a, &b));
+    }
+    println!("opus_demo 256 kbps stereo: worst corr {worst:.4}");
+    assert!(
+        worst >= 0.9,
+        "reference decoder heard correlation {worst:.4}"
+    );
+}
+
+/// The steady-state encode loop allocates nothing: every buffer — MDCT
+/// scratch, PVQ vectors, the range coder's frame — is owned by the encoder
+/// and sized on the first frame (the decoder discipline, applied to the
+/// encoder).
+#[test]
+fn steady_state_encode_loop_zero_alloc() {
+    let pcm = test_signal(2, 0.5);
+    let pcm6 = {
+        let mono = test_signal(1, 0.5);
+        let mut v = Vec::with_capacity(mono.len() * 6);
+        for &s in &mono {
+            for c in 0..6 {
+                v.push(s * (1.0 + c as f32 * 0.01));
+            }
+        }
+        v
+    };
+    // Stereo elementary encoder.
+    let mut enc = Encoder::new(48000, 2).unwrap();
+    enc.set_bitrate(256_000);
+    let mut out = vec![0u8; 1500];
+    for block in pcm.chunks_exact(960 * 2) {
+        enc.encode_float(block, 960, &mut out).unwrap();
+    }
+    ALLOCS.store(0, Ordering::SeqCst);
+    COUNTING_HERE.with(|c| c.set(true));
+    for block in pcm.chunks_exact(960 * 2) {
+        enc.encode_float(block, 960, &mut out).unwrap();
+    }
+    COUNTING_HERE.with(|c| c.set(false));
+    let n = ALLOCS.load(Ordering::SeqCst);
+    assert_eq!(n, 0, "stereo encode allocated {n} times in steady state");
+
+    // 5.1 multistream.
+    let mut ms = MultistreamEncoder::surround_5_1(48000).unwrap();
+    ms.set_bitrate(384_000);
+    let mut out6 = vec![0u8; 8 * 1500];
+    for block in pcm6.chunks_exact(960 * 6) {
+        ms.encode_float(block, 960, &mut out6).unwrap();
+    }
+    ALLOCS.store(0, Ordering::SeqCst);
+    COUNTING_HERE.with(|c| c.set(true));
+    for block in pcm6.chunks_exact(960 * 6) {
+        ms.encode_float(block, 960, &mut out6).unwrap();
+    }
+    COUNTING_HERE.with(|c| c.set(false));
+    let n = ALLOCS.load(Ordering::SeqCst);
+    assert_eq!(n, 0, "5.1 encode allocated {n} times in steady state");
+}
+
+/// The throughput headline: encode speed in multiples of realtime, per
+/// configuration, at the product's rates. Floors are deliberately far under
+/// the measured numbers — they catch a regression class (an accidental
+/// O(n^2), a debug path left on), not machine variance.
+#[test]
+fn encode_speed() {
+    if cfg!(debug_assertions) {
+        eprintln!("encode speed is only meaningful in release; skipped");
+        return;
+    }
+    let secs = 4.0;
+    for (name, channels, kbps, floor) in [
+        ("mono 96k", 1usize, 96u32, 100.0f64),
+        ("stereo 128k", 2, 128, 70.0),
+        ("stereo 256k", 2, 256, 70.0),
+        ("stereo 510k", 2, 510, 50.0),
+    ] {
+        let pcm = test_signal(channels, secs);
+        let mut enc = Encoder::new(48000, channels).unwrap();
+        enc.set_bitrate(kbps * 1000);
+        let mut out = vec![0u8; 1500];
+        // Warm up one pass, then measure.
+        for block in pcm.chunks_exact(960 * channels) {
+            enc.encode_float(block, 960, &mut out).unwrap();
+        }
+        let passes = 4;
+        let start = std::time::Instant::now();
+        for _ in 0..passes {
+            for block in pcm.chunks_exact(960 * channels) {
+                enc.encode_float(block, 960, &mut out).unwrap();
+            }
+        }
+        let elapsed = start.elapsed().as_secs_f64();
+        let realtime = secs * passes as f64 / elapsed;
+        println!("{name}: {realtime:.0}x realtime");
+        assert!(
+            realtime >= floor,
+            "{name}: {realtime:.0}x is below {floor}x"
+        );
+    }
+    // 5.1 multistream.
+    let mono = test_signal(1, secs);
+    let mut pcm6 = Vec::with_capacity(mono.len() * 6);
+    for &s in &mono {
+        for c in 0..6 {
+            pcm6.push(s * (1.0 + c as f32 * 0.01));
+        }
+    }
+    let mut ms = MultistreamEncoder::surround_5_1(48000).unwrap();
+    ms.set_bitrate(384_000);
+    let mut out = vec![0u8; 8 * 1500];
+    for block in pcm6.chunks_exact(960 * 6) {
+        ms.encode_float(block, 960, &mut out).unwrap();
+    }
+    let passes = 4;
+    let start = std::time::Instant::now();
+    for _ in 0..passes {
+        for block in pcm6.chunks_exact(960 * 6) {
+            ms.encode_float(block, 960, &mut out).unwrap();
+        }
+    }
+    let elapsed = start.elapsed().as_secs_f64();
+    let realtime = secs * passes as f64 / elapsed;
+    println!("5.1 384k: {realtime:.0}x realtime");
+    assert!(realtime >= 25.0, "5.1: {realtime:.0}x is below 25x");
 }
 
 /// Malformed input must come back as an error, never a panic: the decoders
