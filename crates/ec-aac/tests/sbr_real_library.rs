@@ -1058,9 +1058,23 @@ fn sbr_real_library_matches_reference() {
             // the second half of the file instead of the first, so a
             // calibration candidate can be checked on two disjoint segments
             // rather than just the file's start.
+            //
+            // (Round-23) The split point MUST be the same absolute sample
+            // index on both sides, not each side's own `len() / 2`: `ours`
+            // is capped at MAX_SAMPLES while `theirs` (the reference) is
+            // decoded in full, so on a file longer than the cap `o_full` and
+            // `t_full` have different total lengths and an independent
+            // `len() / 2` on each picks DIFFERENT seconds of the file --
+            // Nikbinler is a 30s file capped to ours=22.7s, so the old code
+            // compared ours' 11.35s-22.7s against theirs' 15.0s-30.0s, a
+            // 3.6s-misaligned pair of unrelated passages that reads as a
+            // catastrophic collapse (~-0.01 corr) with no decode defect
+            // behind it. Splitting both sides at the shorter side's midpoint
+            // keeps the two halves pointed at the same audio.
             let (o, t): (&[f32], &[f32]) =
                 if std::env::var("EC_AAC_SBR_SWEEP_SEGMENT").as_deref() == Ok("1") {
-                    (&o_full[o_full.len() / 2..], &t_full[t_full.len() / 2..])
+                    let half = o_full.len().min(t_full.len()) / 2;
+                    (&o_full[half..], &t_full[half..])
                 } else {
                     (&o_full[..], &t_full[..])
                 };
@@ -1186,6 +1200,43 @@ fn sbr_real_library_matches_reference() {
                 println!("  ch{ch} DRIFT (window_idx, local_lag, |corr|):");
                 for (w, (l, cr)) in drift.iter().enumerate() {
                     println!("    w{w}: lag {l} corr {cr:.4}");
+                }
+            }
+            // (Round-23, Task 1/3) whole-file corr-vs-time timeline: the
+            // DRIFT diagnostic above caps at 20 windows (~1.85s) starting at
+            // the full-band lag offset near sample 0, so it never sees a
+            // collapse that only appears later in the file. This walks
+            // every 4096-sample window from that same start to EOF on BOTH
+            // sides, with its own local lag search per window, so a
+            // mid-file onset shows up as a specific window index/timestamp
+            // instead of being averaged away inside one giant WINDOW-sized
+            // correlation. The mean/min across every window is also the
+            // TRUE whole-file correlation number (`best_lag_correlation`
+            // above only ever measures one WINDOW=200_000-sample slice
+            // starting near the file's first quarter): unlike that one
+            // fixed-lag figure, this one is immune to a single global lag
+            // being slightly wrong for a later part of the file.
+            {
+                let avail = o.len().saturating_sub(oa).min(t.len().saturating_sub(ob));
+                let windows = avail / 4_096;
+                let timeline = windowed_lag_drift(o, t, oa, ob, windows);
+                if std::env::var("EC_AAC_SBR_TIMELINE").is_ok() {
+                    println!(
+                        "  ch{ch} TIMELINE ({windows} windows, {rate} Hz, window_idx@sec, local_lag, corr):"
+                    );
+                    for (w, (l, cr)) in timeline.iter().enumerate() {
+                        let t_sec = (oa + w * 4_096) as f64 / f64::from(rate);
+                        println!("    w{w}@{t_sec:.2}s: lag {l} corr {cr:.4}");
+                    }
+                }
+                if !timeline.is_empty() {
+                    let mean = timeline.iter().map(|(_, c)| c).sum::<f64>() / timeline.len() as f64;
+                    let min = timeline.iter().map(|(_, c)| *c).fold(f64::MAX, f64::min);
+                    println!(
+                        "  ch{ch} WHOLE-FILE windowed corr: mean {mean:.6} min {min:.6} over {} windows ({:.2}s)",
+                        timeline.len(),
+                        windows as f64 * 4_096.0 / f64::from(rate)
+                    );
                 }
             }
             if std::env::var("EC_AAC_SBR_RESIDUAL_DEBUG").is_ok() {
