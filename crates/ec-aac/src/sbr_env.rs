@@ -211,7 +211,15 @@ pub fn adjust(
     rng: &mut NoiseGen,
 ) {
     let kx = tables.kx as usize;
-    let limiter_max = LIMITER_FACTOR[usize::from(header.limiter_gains).min(3)];
+    // (Round-22 sweep instrumentation, zero cost unset) `EC_AAC_SBR_LIMITER_OFF`
+    // forces the "no limit" factor regardless of the transmitted
+    // `bs_limiter_gains`, to probe whether the limiter itself is clipping
+    // correlation on real content.
+    let limiter_max = if std::env::var("EC_AAC_SBR_LIMITER_OFF").is_ok() {
+        LIMITER_FACTOR[3]
+    } else {
+        LIMITER_FACTOR[usize::from(header.limiter_gains).min(3)]
+    };
     let track_fraction = noise_fraction_debug();
     // (Round-17, Task 1 corroboration) zeroes our injected noise so the
     // sweep's measured correlation can be checked against the
@@ -219,6 +227,12 @@ pub fn adjust(
     // touching the transmitted noise ENERGY bookkeeping above (only the
     // actual PCM addition is skipped).
     let zero_noise = std::env::var("EC_AAC_SBR_NOISE_ZERO").is_ok();
+    // (Round-22 sweep instrumentation, zero cost unset) `EC_AAC_SBR_GAIN_LERP`
+    // linearly interpolates each envelope's per-band gain toward the NEXT
+    // envelope's gain across the current envelope's time slots, instead of
+    // holding it flat -- probing whether our constant-per-cell gain shape
+    // (vs. the spec's smoother per-slot shape) is a live suspect.
+    let gain_lerp = std::env::var("EC_AAC_SBR_GAIN_LERP").is_ok();
 
     // Gain toward the transmitted envelope, per (envelope, band) cell,
     // limited relative to that cell's own noise floor.
@@ -314,6 +328,43 @@ pub fn adjust(
                 }
             }
         }
+        // (Round-22 sweep instrumentation) the next envelope's gains, only
+        // when `EC_AAC_SBR_GAIN_LERP` is set and the band layouts match --
+        // `hf` in the next envelope's time range is still untouched at this
+        // point (envelopes are processed and applied in time order), so
+        // this reads the same raw HF estimate the next iteration would.
+        let next_gains: Option<Vec<f64>> =
+            if gain_lerp && ei + 1 < env_energy.len() && ei + 2 < ch.t_env.len() {
+                let (t0n, t1n) = (ch.t_env[ei + 1], ch.t_env[ei + 2]);
+                let high_res_n = ch.freq_res.get(ei + 1).copied().unwrap_or(0) != 0;
+                let table_n: &[i64] = if high_res_n {
+                    &tables.f_high
+                } else {
+                    &tables.f_low
+                };
+                if table_n.len() == table.len() {
+                    let noise_row_n: Option<&Vec<f64>> = ch
+                        .t_noise
+                        .windows(2)
+                        .position(|w| t0n >= w[0] && t0n < w[1])
+                        .and_then(|ni| noise_energy.get(ni));
+                    Some(compute_gains_only(
+                        hf,
+                        tables,
+                        kx,
+                        table_n,
+                        t0n,
+                        t1n,
+                        &env_energy[ei + 1],
+                        noise_row_n,
+                        limiter_max,
+                    ))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
         // `bs_interpol_freq` (per-subband linear interpolation of these sfb
         // gains, Sec 4.6.18.7.6) was tried here: a centre-frequency lerp
         // between neighbouring sfbs' flat gain values, applied whenever
@@ -327,10 +378,12 @@ pub fn adjust(
         // support, ceiling ~0.999 full-band bar; needs the reference
         // decoder's exact per-subband gain-interpolation formula, not a
         // plausible reconstruction of it.
+        let span = (t1 - t0.max(0)).max(1) as f64;
         for b in 0..table.len().saturating_sub(1) {
             let lo = table[b] as usize;
             let hi = table[b + 1] as usize;
-            let gain = gains[b];
+            let base_gain = gains[b];
+            let end_gain = next_gains.as_ref().and_then(|ng| ng.get(b).copied());
             let namp = noise_amps[b];
             for band in lo..hi {
                 if band < kx || band - kx >= hf.len() {
@@ -338,6 +391,12 @@ pub fn adjust(
                 }
                 let row = &mut hf[band - kx];
                 for slot in t0.max(0) as usize..(t1.max(0) as usize).min(row.len()) {
+                    let gain = if let Some(end) = end_gain {
+                        let w = (slot as f64 - t0.max(0) as f64) / span;
+                        base_gain + (end - base_gain) * w.clamp(0.0, 1.0)
+                    } else {
+                        base_gain
+                    };
                     row[slot] = row[slot].scale(gain);
                     // Consume the RNG unconditionally (matches the pre-round-21
                     // stream shape) even under EC_AAC_SBR_NOISE_ZERO, which
@@ -392,6 +451,54 @@ pub fn adjust(
     // separate noise-grid pass did, consistently with the gain that was
     // computed for the same cell (previously the two were split across
     // unrelated unit scales; see the comment at `noise_div` above).
+}
+
+/// (Round-22 sweep instrumentation) The same gain math the main loop in
+/// [`adjust`] computes, minus the tracking/noise-amplitude side effects --
+/// used to look ahead at the NEXT envelope's gain for `EC_AAC_SBR_GAIN_LERP`.
+#[allow(clippy::too_many_arguments)]
+fn compute_gains_only(
+    hf: &[Vec<Complex<f64>>],
+    tables: &BandTables,
+    kx: usize,
+    table: &[i64],
+    t0: i64,
+    t1: i64,
+    env_row: &[f64],
+    noise_row: Option<&Vec<f64>>,
+    limiter_max: f64,
+) -> Vec<f64> {
+    let mut gains = Vec::with_capacity(table.len().saturating_sub(1));
+    for b in 0..table.len().saturating_sub(1) {
+        let lo = table[b] as usize;
+        let hi = table[b + 1] as usize;
+        let target = env_row.get(b).copied().unwrap_or(0.0);
+        let (mut sum, mut count) = (0.0f64, 0usize);
+        for band in lo..hi {
+            if band < kx || band - kx >= hf.len() {
+                continue;
+            }
+            let row = &hf[band - kx];
+            for slot in t0.max(0) as usize..(t1.max(0) as usize).min(row.len()) {
+                sum += row[slot].norm_sqr();
+                count += 1;
+            }
+        }
+        let current = if count > 0 { sum / count as f64 } else { 0.0 };
+        let q = noise_band_for(tables, lo);
+        let noise_div = noise_row
+            .and_then(|r| r.get(q).copied())
+            .unwrap_or(0.0)
+            .max(0.0);
+        let signal_target = target / (1.0 + noise_div);
+        let noise_here = target - signal_target;
+        let cur = current.max(1e-12);
+        let mut gain = (signal_target / cur).sqrt();
+        gain = gain.min(limiter_max * ((noise_here + cur) / cur).sqrt());
+        gain = gain.min(limiter_max * 64.0);
+        gains.push(gain);
+    }
+    gains
 }
 
 fn noise_band_for(tables: &BandTables, low_band: usize) -> usize {

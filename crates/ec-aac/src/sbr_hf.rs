@@ -107,16 +107,64 @@ impl ChirpState {
 
     /// Advances the state one frame given this frame's `bs_invf_mode` per
     /// noise band, returning the smoothed bw to use for HF generation.
+    ///
+    /// (Round-22 sweep instrumentation, zero cost unset) `EC_AAC_SBR_BW_SCALE`
+    /// scales `BW_TABLE`'s target globally (clamped below 1.0) before
+    /// smoothing, to probe whether the chirp/inverse-filter strength is
+    /// miscalibrated on real content. `EC_AAC_SBR_CHIRP_SMOOTH=none` skips
+    /// the attack/release smoothing entirely (target used immediately);
+    /// `=swap` swaps which curve (0.75/0.25 vs 0.90625/0.09375) applies to
+    /// rising vs falling bw, to probe whether the asymmetry is backwards.
     pub fn update(&mut self, invf_mode: &[u8]) -> &[f64] {
+        let scale = bw_scale_override();
+        let smooth = chirp_smooth_mode();
         for (slot, &mode) in self.bw.iter_mut().zip(invf_mode) {
-            let target = BW_TABLE[usize::from(mode).min(3)];
-            *slot = if target < *slot {
-                0.75 * target + 0.25 * *slot
-            } else {
-                0.90625 * *slot + 0.09375 * target
+            let target = (BW_TABLE[usize::from(mode).min(3)] * scale).min(0.999_999);
+            *slot = match smooth {
+                ChirpSmooth::None => target,
+                ChirpSmooth::Current => {
+                    if target < *slot {
+                        0.75 * target + 0.25 * *slot
+                    } else {
+                        0.90625 * *slot + 0.09375 * target
+                    }
+                }
+                ChirpSmooth::Swap => {
+                    if target < *slot {
+                        0.90625 * target + 0.09375 * *slot
+                    } else {
+                        0.75 * *slot + 0.25 * target
+                    }
+                }
             };
         }
         &self.bw
+    }
+}
+
+/// `EC_AAC_SBR_BW_SCALE` global multiplier on `BW_TABLE`, clamped below 1.0
+/// (a chirp target at or past 1.0 is an undamped all-pole resonance, not a
+/// meaningful "stronger" whitening). `1.0` (no-op) when unset or unparsable.
+fn bw_scale_override() -> f64 {
+    std::env::var("EC_AAC_SBR_BW_SCALE")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .map(|s| s.max(0.0))
+        .unwrap_or(1.0)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChirpSmooth {
+    None,
+    Current,
+    Swap,
+}
+
+fn chirp_smooth_mode() -> ChirpSmooth {
+    match std::env::var("EC_AAC_SBR_CHIRP_SMOOTH").as_deref() {
+        Ok("none") => ChirpSmooth::None,
+        Ok("swap") => ChirpSmooth::Swap,
+        _ => ChirpSmooth::Current,
     }
 }
 
