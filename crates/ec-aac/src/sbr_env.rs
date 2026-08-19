@@ -72,10 +72,7 @@ pub fn dequant_pair(e0_raw: i32, e1_raw: i32, amp_res: u8) -> (f64, f64) {
 
 /// Dequantizes one channel's envelopes and noise floors for one frame,
 /// de-mixing through [`dequant_pair`] when `coupling` makes `channels[1]`
-/// a balance channel against `channels[0]`. Noise floors dequantize
-/// independently per channel regardless of coupling (corner-cut: the
-/// balance codebook's noise ratio convention is unverified against a real
-/// coupled file, same ceiling as the envelope one above).
+/// a balance channel against `channels[0]`.
 pub fn dequantize_frame(
     header: &SbrHeader,
     channels: &[SbrChannel],
@@ -111,6 +108,12 @@ pub fn dequantize_frame(
             env.push(row.iter().map(|&v| dequant_env(v, amp_res)).collect());
         }
     }
+    // corner-cut: noise floors dequantize independently per channel
+    // regardless of coupling. A mirrored dequant_noise_pair() demix (see
+    // git history) was tried and measured ZERO effect on the real-file
+    // ch1 RMS blow-up (identical output to printed precision), so the
+    // energy dequantization below is the live suspect, not this; reverted
+    // rather than keeping an unverified formula with no measured benefit.
     let noise = c
         .q_q
         .iter()
