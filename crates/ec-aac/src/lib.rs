@@ -16,9 +16,11 @@
 //!
 //! AAC-LC (audio object type 2) is complete: all four window sequences, both
 //! window shapes, TNS, pulse data, M/S and intensity stereo, PNS, and SCE, CPE,
-//! LFE, DSE, PCE and FIL elements.  HE-AAC's SBR and Parametric Stereo are
-//! **not** implemented; a stream that signals them decodes to its AAC-LC core,
-//! at the core sample rate, and says so through [`AacDecoder::sbr_support`] and
+//! LFE, DSE, PCE and FIL elements.  HE-AAC v1 (SBR) is reconstructed: the core
+//! decodes, its low bands feed the SBR QMF/HF/envelope chain, and the output
+//! is at the extension rate.  Parametric Stereo is **not** implemented; a
+//! stream that signals it decodes to its AAC-LC core, at the core sample
+//! rate, and says so through [`AacDecoder::sbr_support`] and
 //! [`AacDecoder::output_sample_rate`] rather than silently claiming the
 //! extension rate.  See `sbr_is_reported_not_silently_upsampled` in the tests.
 
@@ -29,6 +31,7 @@ mod decode;
 mod encode;
 mod huffman;
 mod sbr_bands;
+mod sbr_chain;
 mod sbr_env;
 mod sbr_hf;
 mod sbr_payload;
@@ -55,8 +58,12 @@ use ec_core::BitReader;
 pub enum SbrSupport {
     /// The stream is plain AAC-LC: nothing is missing.
     NotSignalled,
-    /// SBR (and possibly PS) is signalled and is **not** reconstructed. The
-    /// AAC-LC core decodes, at the core rate, half the signalled bandwidth.
+    /// SBR is signalled and **is** reconstructed: the decoded audio spans
+    /// the full extension bandwidth at the extension sample rate.
+    V1,
+    /// SBR is signalled but not reconstructed (Parametric Stereo streams:
+    /// PS itself is still unimplemented). The AAC-LC core decodes, at the
+    /// core rate, half the signalled bandwidth.
     CoreOnly,
 }
 
@@ -121,6 +128,13 @@ impl AacDecoder {
         d.block.set_sf_index(cfg.sf_index);
         d.sample_rate = cfg.sample_rate;
         d.channels = cfg.channels;
+        // PS is not reconstructed; SBR is. Both still need the core
+        // decoded first, but only a plain-SBR (non-PS) stream gets the
+        // extension-rate QMF chain wired in.
+        if cfg.sbr_present && !cfg.ps_present {
+            let rate = cfg.extension_sample_rate.unwrap_or(cfg.sample_rate * 2);
+            d.block.set_sbr_rate(Some(rate));
+        }
         d.config = Some(cfg);
         d
     }
@@ -139,18 +153,21 @@ impl AacDecoder {
     /// Whether the stream asked for SBR, and what became of it.
     pub fn sbr_support(&self) -> SbrSupport {
         match &self.config {
-            Some(c) if c.sbr_present || c.ps_present => SbrSupport::CoreOnly,
+            Some(c) if c.ps_present => SbrSupport::CoreOnly,
+            Some(c) if c.sbr_present => SbrSupport::V1,
             _ => SbrSupport::NotSignalled,
         }
     }
 
-    /// The rate the samples this decoder hands back are actually at.
-    ///
-    /// For an HE-AAC stream this is the **core** rate, not the doubled rate the
-    /// configuration advertises: the SBR extension is not reconstructed, so
-    /// claiming its rate would be claiming bandwidth that is not there.
+    /// The rate the samples this decoder hands back are actually at: the
+    /// extension rate for a reconstructed (V1) HE-AAC stream, the core
+    /// rate for plain AAC-LC or an unreconstructed (PS) stream -- claiming
+    /// bandwidth that was not actually rebuilt would be a lie.
     pub fn output_sample_rate(&self) -> Option<u32> {
-        self.config.as_ref().map(|c| c.sample_rate)
+        self.config.as_ref().map(|c| match self.sbr_support() {
+            SbrSupport::V1 => c.extension_sample_rate.unwrap_or(c.sample_rate * 2),
+            _ => c.sample_rate,
+        })
     }
 
     /// Decodes one packet: a raw `raw_data_block`, or one or more ADTS frames.
@@ -187,7 +204,7 @@ impl AacDecoder {
         let channels = planes.len();
         if channels == 0 {
             return Ok(DecodedAudio {
-                sample_rate: self.sample_rate,
+                sample_rate: self.output_sample_rate().unwrap_or(self.sample_rate),
                 channels: self.channels,
                 samples: Vec::new(),
                 pts,
@@ -206,7 +223,7 @@ impl AacDecoder {
             }
         }
         Ok(DecodedAudio {
-            sample_rate: self.sample_rate,
+            sample_rate: self.output_sample_rate().unwrap_or(self.sample_rate),
             channels: channels as u16,
             samples,
             pts,

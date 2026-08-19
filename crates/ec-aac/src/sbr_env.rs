@@ -63,6 +63,55 @@ pub fn dequant_pair(e0_raw: i32, e1_raw: i32, amp_res: u8) -> (f64, f64) {
     (left, right)
 }
 
+/// Dequantizes one channel's envelopes and noise floors for one frame,
+/// de-mixing through [`dequant_pair`] when `coupling` makes `channels[1]`
+/// a balance channel against `channels[0]`. Noise floors dequantize
+/// independently per channel regardless of coupling (corner-cut: the
+/// balance codebook's noise ratio convention is unverified against a real
+/// coupled file, same ceiling as the envelope one above).
+pub fn dequantize_frame(
+    header: &SbrHeader,
+    channels: &[SbrChannel],
+    ch: usize,
+    coupling: bool,
+) -> (Vec<Vec<f64>>, Vec<Vec<f64>>) {
+    let c = &channels[ch];
+    // A single-envelope frame forces 1.5 dB resolution regardless of
+    // bs_amp_res, mirroring sbr_payload's own `amp_res_of`.
+    let amp_res = if c.e_q.len() == 1 { 0 } else { header.amp_res };
+    let mut env = Vec::with_capacity(c.e_q.len());
+    if coupling && channels.len() == 2 {
+        let (row0_src, row1_src, want_left) = if ch == 0 {
+            (0usize, 1usize, true)
+        } else {
+            (0usize, 1usize, false)
+        };
+        for i in 0..c.e_q.len() {
+            let row0 = channels[row0_src].e_q.get(i);
+            let row1 = channels[row1_src].e_q.get(i);
+            let len = c.e_q[i].len();
+            let mut r = Vec::with_capacity(len);
+            for b in 0..len {
+                let e0 = row0.and_then(|r| r.get(b)).copied().unwrap_or(0);
+                let e1 = row1.and_then(|r| r.get(b)).copied().unwrap_or(0);
+                let (left, right) = dequant_pair(e0, e1, amp_res);
+                r.push(if want_left { left } else { right });
+            }
+            env.push(r);
+        }
+    } else {
+        for row in &c.e_q {
+            env.push(row.iter().map(|&v| dequant_env(v, amp_res)).collect());
+        }
+    }
+    let noise = c
+        .q_q
+        .iter()
+        .map(|row| row.iter().map(|&v| dequant_noise(v)).collect())
+        .collect();
+    (env, noise)
+}
+
 /// A small deterministic PRNG for the injected noise floor -- the same
 /// generator shape `decode::Noise` uses, kept local so this module has no
 /// dependency on the core decoder's internals.

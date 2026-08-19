@@ -453,6 +453,7 @@ pub struct BlockDecoder {
     pub states: Vec<ChannelState>,
     noise: Noise,
     sf_index: u8,
+    sbr: Option<crate::sbr_chain::SbrChain>,
 }
 
 impl BlockDecoder {
@@ -463,11 +464,18 @@ impl BlockDecoder {
             states: Vec::new(),
             noise: Noise(0x1234_5678),
             sf_index,
+            sbr: None,
         }
     }
 
     pub fn set_sf_index(&mut self, sf_index: u8) {
         self.sf_index = sf_index;
+    }
+
+    /// Enables (or disables, passing `None`) SBR reconstruction at the
+    /// given extension (doubled) sample rate.
+    pub fn set_sbr_rate(&mut self, rate: Option<u32>) {
+        self.sbr = rate.map(crate::sbr_chain::SbrChain::new);
     }
 
     fn section_data(&self, r: &mut BitReader<'_>, ics: &IcsInfo) -> Result<Vec<Vec<u8>>> {
@@ -681,6 +689,10 @@ impl BlockDecoder {
     /// bitstream element order.
     pub fn raw_data_block(&mut self, r: &mut BitReader<'_>) -> Result<Vec<Vec<f32>>> {
         let mut out: Vec<Vec<f32>> = Vec::new();
+        // The element (tag, channel range, is_cpe) an immediately following
+        // FIL's SBR payload would apply to, per §4.5.1: a fill_element
+        // directly follows the element it decorates.
+        let mut pending: Option<(u8, usize, usize, bool)> = None;
         loop {
             if r.bits_remaining() < 3 {
                 break;
@@ -691,12 +703,15 @@ impl BlockDecoder {
                 // element this profile never emits and cannot be skipped
                 // blind, so it is refused rather than silently mis-parsed.
                 0 | 3 => {
-                    let _tag = r.read_bits(4)?;
+                    let tag = r.read_bits(4)? as u8;
+                    let start = out.len();
                     let mut ch = [self.channel_stream(r, None)?];
                     self.finish(&mut ch, None, &mut out);
+                    pending = Some((tag, start, 1, false));
                 }
                 1 => {
-                    let _tag = r.read_bits(4)?;
+                    let tag = r.read_bits(4)? as u8;
+                    let start = out.len();
                     let common = r.read_bit()?;
                     let (shared, mask) = if common {
                         let info = parse_ics_info(r, self.sf_index)?;
@@ -724,6 +739,7 @@ impl BlockDecoder {
                         self.channel_stream(r, shared.as_ref())?,
                     ];
                     self.finish(&mut pair, Some(&mask), &mut out);
+                    pending = Some((tag, start, 2, true));
                 }
                 2 => return Err(Error::unsupported("aac", "coupling channel element")),
                 4 => {
@@ -737,16 +753,46 @@ impl BlockDecoder {
                         r.align_to_byte();
                     }
                     r.skip_bits(count * 8)?;
+                    pending = None;
                 }
                 5 => {
                     crate::config::skip_program_config(r)?;
+                    pending = None;
                 }
                 6 => {
                     let mut count = r.read_bits(4)? as u64;
                     if count == 15 {
                         count += r.read_bits(8)? as u64 - 1;
                     }
-                    r.skip_bits(count * 8)?;
+                    let end_bit = r.bit_position() + count * 8;
+                    if let (Some(sbr), Some((tag, start, n, is_cpe))) =
+                        (self.sbr.as_mut(), pending.take())
+                    {
+                        // extension_payload(): bs_extension_type(4), then
+                        // (for SBR) an optional 10-bit CRC, then
+                        // sbr_extension_data() itself.
+                        if r.bits_remaining() >= 4 {
+                            let ext_type = r.peek_bits(4)?;
+                            if ext_type == 13 || ext_type == 14 {
+                                r.skip_bits(4)?;
+                                if ext_type == 14 && r.bits_remaining() >= 10 {
+                                    r.skip_bits(10)?; // bs_sbr_crc_bits
+                                }
+                                if let Some(data) = sbr.parse(r, tag, is_cpe) {
+                                    sbr.apply(tag, &data, &mut out[start..start + n]);
+                                }
+                            }
+                        }
+                    }
+                    // Resync to the FIL's declared byte boundary regardless
+                    // of how many bits SBR parsing above actually consumed:
+                    // a parse error or trailing padding must never desync
+                    // the elements that follow.
+                    let now = r.bit_position();
+                    if now < end_bit {
+                        r.skip_bits(end_bit - now)?;
+                    }
+                    pending = None;
                 }
                 _ => break,
             }

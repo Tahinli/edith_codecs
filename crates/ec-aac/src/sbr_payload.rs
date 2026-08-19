@@ -195,6 +195,11 @@ impl SbrParser {
         self.header.as_ref()
     }
 
+    /// The frequency band tables derived from the current header, if any.
+    pub fn tables(&self) -> Option<&BandTables> {
+        self.tables.as_ref()
+    }
+
     fn parse_grid(&self, r: &mut BitReader) -> Result<Grid> {
         let frame_class = r.read_bits(2)?;
         match frame_class {
