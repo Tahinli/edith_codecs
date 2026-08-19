@@ -28,6 +28,7 @@
 //! band's own transmitted noise floor that gain is allowed to reach
 //! (`bs_limiter_gains`), noise is mixed in at the transmitted floor, and
 //! flagged bands get an added tone.
+#![allow(clippy::needless_range_loop)]
 
 use crate::sbr_bands::BandTables;
 use crate::sbr_payload::{SbrChannel, SbrHeader};
@@ -182,7 +183,11 @@ pub fn adjust(
             break;
         }
         let high_res = ch.freq_res.get(ei).copied().unwrap_or(0) != 0;
-        let table = if high_res { &tables.f_high } else { &tables.f_low };
+        let table = if high_res {
+            &tables.f_high
+        } else {
+            &tables.f_low
+        };
         // The noise segment covering this envelope's time range (noise
         // borders are a coarser subset of the envelope borders sharing the
         // same start/end points).
@@ -213,7 +218,11 @@ pub fn adjust(
                 .and_then(|r| r.get(q).copied())
                 .unwrap_or(0.0)
                 .max(1e-12);
-            gain = gain.min((noise_here * limiter_max / current.max(1e-12)).sqrt().max(gain.min(limiter_max)));
+            gain = gain.min(
+                (noise_here * limiter_max / current.max(1e-12))
+                    .sqrt()
+                    .max(gain.min(limiter_max)),
+            );
             gain = gain.min(limiter_max * 64.0); // absolute ceiling: never amplify a silent cell to infinity
             for band in lo..hi {
                 if band < kx || band - kx >= hf.len() {
@@ -319,7 +328,15 @@ mod tests {
         let env_energy = vec![vec![target; tables.n_low]];
         let noise_energy = vec![vec![0.0f64; tables.n_q]];
         let mut rng = NoiseGen::new(1);
-        adjust(&mut hf, &tables, &header(1, 3), &ch, &env_energy, &noise_energy, &mut rng);
+        adjust(
+            &mut hf,
+            &tables,
+            &header(1, 3),
+            &ch,
+            &env_energy,
+            &noise_energy,
+            &mut rng,
+        );
 
         // Every low-res band's average energy should land close to target.
         for b in 0..tables.n_low {
@@ -368,7 +385,15 @@ mod tests {
         let env_energy = vec![vec![1.0e6f64; tables.n_low]];
         let noise_energy = vec![vec![1e-3f64; tables.n_q]];
         let mut rng = NoiseGen::new(1);
-        adjust(&mut hf, &tables, &header(1, 0), &ch, &env_energy, &noise_energy, &mut rng);
+        adjust(
+            &mut hf,
+            &tables,
+            &header(1, 0),
+            &ch,
+            &env_energy,
+            &noise_energy,
+            &mut rng,
+        );
         for band in 0..hf.len() {
             for slot in 0..slots {
                 assert!(
@@ -384,6 +409,9 @@ mod tests {
     fn coupled_balance_round_trips_at_a_centred_ratio() {
         let (l, r) = dequant_pair(10, 0, 1);
         let e0 = dequant_env(10, 1);
-        assert!((l - e0).abs() < 1e-9 && (r - e0).abs() < 1e-9, "{l} {r} vs {e0}");
+        assert!(
+            (l - e0).abs() < 1e-9 && (r - e0).abs() < 1e-9,
+            "{l} {r} vs {e0}"
+        );
     }
 }
