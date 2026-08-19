@@ -9,3 +9,12 @@ publish = false
 
 [dependencies]
 ec-image = { path = "../../crates/ec-image", version = "0.1.0" }
+
+# The format switches the incumbent gates its decoders behind. Every format this
+# shim serves is compiled unconditionally, so these select nothing -- they exist
+# because a consumer naming a feature the replacement lacks fails to *resolve*,
+# and edith's engine asks for exactly these three.
+[features]
+png = []
+jpeg = []
+webp = []
