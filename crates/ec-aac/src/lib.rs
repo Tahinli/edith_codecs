@@ -30,6 +30,8 @@ mod encode;
 mod huffman;
 mod sbr_bands;
 mod sbr_payload;
+// Consumed once the SBR decode chain lands; until then only its tests call it.
+#[allow(dead_code)]
 mod sbr_qmf;
 mod sbr_tables;
 pub mod tables;
