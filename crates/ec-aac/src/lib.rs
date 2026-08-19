@@ -48,6 +48,9 @@ pub use config::{
 pub use decode::{FRAME_LEN, WindowSequence};
 pub use ec_core::{Error, Result};
 pub use encode::{AacEncoder, AacEncoderConfig, EncodedPacket, WindowShape};
+/// Diagnostic only (round-20): per-(access-unit, channel) side-info rows
+/// logged during decode when `EC_AAC_SBR_SIDEINFO_DEBUG` is set.
+pub use sbr_chain::{SbrSideInfoRow, sbr_sideinfo_log};
 /// Diagnostic only (round-17 Task 1 conviction check): reads back the
 /// per-absolute-QMF-band transmitted signal/noise energy sums
 /// `EC_AAC_SBR_NOISE_FRACTION_DEBUG` accumulates during decode.

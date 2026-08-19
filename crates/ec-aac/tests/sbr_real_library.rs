@@ -650,6 +650,334 @@ struct Candidate {
     crossover_hz: f64,
 }
 
+/// Round-20 residual/side-info correlation. Builds a (frame x band) residual
+/// ENERGY grid at AU-aligned 2048-output-sample blocks -- a plain (2x) SBR
+/// stream reconstructs exactly one 2048-sample block per core access unit,
+/// so `n`-th block lines up 1:1 with `ec_aac::sbr_sideinfo_log()`'s `frame`
+/// counter -- then cross-tabulates that grid against every side-info feature
+/// the log carries. FFT is linear, so `FFT(o_block) - FFT(t_block) ==
+/// FFT(o_block - t_block)`: the residual's own per-bin energy is obtained
+/// directly from each side's spectrum without ever materializing a
+/// time-domain residual array. `band` is the same `rate/256`-wide index
+/// domain `per_band_correlation`/`tables.kx`/`f_high`/`f_noise` all already
+/// share (measured in round-14/round-16), so a side-info row's `f_high`/
+/// `f_noise` boundaries index straight into this grid's bins with no
+/// rescaling.
+fn residual_sideinfo_analysis(o: &[f32], t: &[f32], oa: usize, ob: usize, rate: u32, ch: usize) {
+    let rows: Vec<_> = ec_aac::sbr_sideinfo_log()
+        .into_iter()
+        .filter(|r| r.ch == ch)
+        .collect();
+    if rows.is_empty() {
+        eprintln!("  ch{ch} SIDEINFO: no rows logged (set EC_AAC_SBR_SIDEINFO_DEBUG too)");
+        return;
+    }
+    const FFT_LEN: usize = 2048;
+    let win = ec_dsp::Window::<f32>::sine(FFT_LEN);
+    let mut rfft = ec_dsp::RealFft::<f32>::new(FFT_LEN);
+    let bins = rfft.spectrum_len();
+    let mut o_spec = vec![ec_dsp::Complex::new(0.0f32, 0.0); bins];
+    let mut t_spec = vec![ec_dsp::Complex::new(0.0f32, 0.0); bins];
+
+    // Per-frame residual bin-energy vector (index = `band`, per-bin, not yet
+    // grouped) and, alongside it, a per-bin peakiness ratio (own-bin energy
+    // vs its 3-bin neighbourhood mean) used by the whiteness check.
+    let mut energy: std::collections::HashMap<usize, Vec<f64>> = std::collections::HashMap::new();
+    for row in &rows {
+        if energy.contains_key(&row.frame) {
+            continue;
+        }
+        let base_o = oa + row.frame * FFT_LEN;
+        let base_t = ob + row.frame * FFT_LEN;
+        if base_o + FFT_LEN > o.len() || base_t + FFT_LEN > t.len() {
+            continue;
+        }
+        let mut ob_win = o[base_o..base_o + FFT_LEN].to_vec();
+        let mut tb_win = t[base_t..base_t + FFT_LEN].to_vec();
+        win.apply(&mut ob_win);
+        win.apply(&mut tb_win);
+        rfft.forward(&ob_win, &mut o_spec);
+        rfft.forward(&tb_win, &mut t_spec);
+        let e: Vec<f64> = o_spec
+            .iter()
+            .zip(&t_spec)
+            .map(|(a, b)| f64::from((*a - *b).norm_sqr()))
+            .collect();
+        energy.insert(row.frame, e);
+    }
+    if energy.is_empty() {
+        eprintln!("  ch{ch} SIDEINFO: no frame overlapped the aligned window");
+        return;
+    }
+    // SBR-band-index units (`kx`/`k2`/`f_high`/`f_noise`) are `band_hz =
+    // rate/256` wide; FFT bins here are `bin_hz = rate/FFT_LEN` wide. The
+    // ratio `band_hz/bin_hz = FFT_LEN/256 = 8` is rate-independent, matching
+    // `per_band_correlation`'s own `lo = band*band_hz/bin_hz` conversion --
+    // one SBR band is exactly 8 of these FFT bins, never 1.
+    const BINS_PER_SBR_BAND: usize = FFT_LEN / 256;
+    let band_range = |lo: i64, hi: i64| -> (usize, usize) {
+        let lo = ((lo.max(0) as usize) * BINS_PER_SBR_BAND).min(bins);
+        let hi = (((hi.max(0) as usize) * BINS_PER_SBR_BAND).max(lo + 1)).min(bins);
+        (lo, hi)
+    };
+    let sum_range = |e: &[f64], lo: usize, hi: usize| -> f64 { e[lo..hi].iter().sum() };
+
+    // --- predictor 1: add_harmonic bands (and their immediate neighbours) ---
+    let (mut harm_sum, mut harm_n) = (0.0f64, 0usize);
+    let (mut noharm_sum, mut noharm_n) = (0.0f64, 0usize);
+    let (mut adj_sum, mut adj_n) = (0.0f64, 0usize);
+    for row in &rows {
+        let Some(e) = energy.get(&row.frame) else {
+            continue;
+        };
+        let Some(harm) = &row.add_harmonic else {
+            continue;
+        };
+        for (i, &flag) in harm.iter().enumerate() {
+            let (lo, hi) = match (row.f_high.get(i), row.f_high.get(i + 1)) {
+                (Some(&a), Some(&b)) => band_range(a, b),
+                _ => continue,
+            };
+            let s = sum_range(e, lo, hi);
+            let cells = (hi - lo).max(1);
+            if flag != 0 {
+                harm_sum += s / cells as f64;
+                harm_n += 1;
+            } else {
+                noharm_sum += s / cells as f64;
+                noharm_n += 1;
+            }
+            // adjacent band (off-by-one probe): the band one slot up.
+            if flag != 0
+                && let (Some(&a2), Some(&b2)) = (row.f_high.get(i + 1), row.f_high.get(i + 2))
+            {
+                let (lo2, hi2) = band_range(a2, b2);
+                adj_sum += sum_range(e, lo2, hi2) / (hi2 - lo2).max(1) as f64;
+                adj_n += 1;
+            }
+        }
+    }
+
+    // --- predictor 2: envelope time borders vs envelope interior ---
+    // Envelope borders are in `t_env` (pre-`RATE`-scale envelope time-slot
+    // units); one unit is `RATE(2) * SYNTHESIS_BANDS(64) = 128` output
+    // samples. Time-domain residual energy (broadband, not per-band) near
+    // (+/-64 samples) each INTERIOR border vs the envelope's own midpoint.
+    let (mut border_sum, mut border_n) = (0.0f64, 0usize);
+    let (mut mid_sum, mut mid_n) = (0.0f64, 0usize);
+    let sample_energy = |global: usize| -> Option<f64> {
+        let oi = oa + global;
+        let ti = ob + global;
+        if oi >= o.len() || ti >= t.len() {
+            return None;
+        }
+        let d = f64::from(o[oi]) - f64::from(t[ti]);
+        Some(d * d)
+    };
+    for row in &rows {
+        let frame_base = row.frame * FFT_LEN;
+        for w in row.t_env.windows(2) {
+            let (b0, b1) = (w[0] * 128, w[1] * 128);
+            if b1 <= b0 {
+                continue;
+            }
+            let mid = (b0 + b1) / 2;
+            for d in -64i64..=64 {
+                let s0 = b0 + d;
+                if s0 >= 0
+                    && let Some(v) = sample_energy(frame_base + s0 as usize)
+                {
+                    border_sum += v;
+                    border_n += 1;
+                }
+            }
+            for off in 0..(b1 - b0).min(256) {
+                let s = mid - (b1 - b0).min(256) / 2 + off;
+                if s >= 0
+                    && (s - mid).abs() > 64
+                    && let Some(v) = sample_energy(frame_base + s as usize)
+                {
+                    mid_sum += v;
+                    mid_n += 1;
+                }
+            }
+        }
+    }
+
+    // --- predictor 3: hold-state (apply_last) vs fresh-payload frames ---
+    let (mut hold_sum, mut hold_n) = (0.0f64, 0usize);
+    let (mut fresh_sum, mut fresh_n) = (0.0f64, 0usize);
+    for row in &rows {
+        let Some(e) = energy.get(&row.frame) else {
+            continue;
+        };
+        let total: f64 = e.iter().sum();
+        if row.source == "hold" {
+            hold_sum += total;
+            hold_n += 1;
+        } else {
+            fresh_sum += total;
+            fresh_n += 1;
+        }
+    }
+
+    // --- predictor 4: frame immediately after a coupling flip ---
+    let (mut flip_sum, mut flip_n) = (0.0f64, 0usize);
+    let (mut noflip_sum, mut noflip_n) = (0.0f64, 0usize);
+    let mut sorted = rows.clone();
+    sorted.sort_by_key(|r| r.frame);
+    for pair in sorted.windows(2) {
+        let (prev, cur) = (&pair[0], &pair[1]);
+        let Some(e) = energy.get(&cur.frame) else {
+            continue;
+        };
+        let total: f64 = e.iter().sum();
+        if cur.coupling != prev.coupling {
+            flip_sum += total;
+            flip_n += 1;
+        } else {
+            noflip_sum += total;
+            noflip_n += 1;
+        }
+    }
+
+    // --- predictor 5: residual scaling per invf_mode level, per noise band ---
+    let mut per_level = [(0.0f64, 0usize); 4];
+    for row in &rows {
+        let Some(e) = energy.get(&row.frame) else {
+            continue;
+        };
+        for (i, &mode) in row.invf_mode.iter().enumerate() {
+            let (lo, hi) = match (row.f_noise.get(i), row.f_noise.get(i + 1)) {
+                (Some(&a), Some(&b)) => band_range(a, b),
+                _ => continue,
+            };
+            let cells = (hi - lo).max(1);
+            let level = (mode as usize).min(3);
+            per_level[level].0 += sum_range(e, lo, hi) / cells as f64;
+            per_level[level].1 += 1;
+        }
+    }
+
+    // --- predictor 6: residual whiteness within HF bands (peakiness) ---
+    // mean(max-bin / mean-bin) over each HF band each frame -- near 1 reads
+    // noise-like, large reads tonal (one bin dominating the band).
+    let (mut peak_sum, mut peak_n) = (0.0f64, 0usize);
+    for row in &rows {
+        let Some(e) = energy.get(&row.frame) else {
+            continue;
+        };
+        let (lo, hi) = band_range(row.kx, row.k2);
+        for group_lo in (lo..hi.min(e.len())).step_by(4) {
+            let group_hi = (group_lo + 4).min(hi).min(e.len());
+            if group_hi <= group_lo {
+                continue;
+            }
+            let slice = &e[group_lo..group_hi];
+            let mean = slice.iter().sum::<f64>() / slice.len() as f64;
+            let max = slice.iter().cloned().fold(0.0f64, f64::max);
+            if mean > 0.0 {
+                peak_sum += max / mean;
+                peak_n += 1;
+            }
+        }
+    }
+
+    // Heat summary: the full (frame x band) grid collapsed to two profiles
+    // (mean over bands per 50-frame group; mean over frames per 8-band
+    // group) -- the full grid itself is `energy`, ~489 x ~90 cells, too
+    // large to print usefully every run.
+    let mut frame_keys: Vec<usize> = energy.keys().cloned().collect();
+    frame_keys.sort_unstable();
+    println!(
+        "  ch{ch} RESIDUAL HEAT temporal profile (50-frame groups, mean energy over all bands):"
+    );
+    for chunk in frame_keys.chunks(50) {
+        let (mut s, mut n) = (0.0f64, 0usize);
+        for &f in chunk {
+            if let Some(e) = energy.get(&f) {
+                s += e.iter().sum::<f64>();
+                n += e.len();
+            }
+        }
+        if n > 0 {
+            println!(
+                "    frames {}..{}: {:.6e}",
+                chunk[0],
+                chunk[chunk.len() - 1],
+                s / n as f64
+            );
+        }
+    }
+    // Nyquist bin: FFT_LEN/2 (the real bin at the Nyquist frequency, always
+    // present in an RFFT of an even-length transform) -- bins past it are
+    // this RFFT's own redundant/unused tail, never real spectrum.
+    let bin_hz = f64::from(rate) / FFT_LEN as f64;
+    let nyquist_bin = (FFT_LEN / 2 + 1).min(bins);
+    println!(
+        "  ch{ch} RESIDUAL HEAT spectral profile ({BINS_PER_SBR_BAND}-bin == 1 SBR-band groups, mean energy over all frames):"
+    );
+    for group_lo in (0..nyquist_bin).step_by(BINS_PER_SBR_BAND) {
+        let group_hi = (group_lo + BINS_PER_SBR_BAND).min(nyquist_bin);
+        let (mut s, mut n) = (0.0f64, 0usize);
+        for e in energy.values() {
+            for &v in &e[group_lo..group_hi] {
+                s += v;
+                n += 1;
+            }
+        }
+        if n > 0 {
+            println!(
+                "    {:>6.0}Hz..{:>6.0}Hz (band {}): {:.6e}",
+                group_lo as f64 * bin_hz,
+                group_hi as f64 * bin_hz,
+                group_lo / BINS_PER_SBR_BAND,
+                s / n as f64
+            );
+        }
+    }
+
+    let avg = |s: f64, n: usize| if n > 0 { s / n as f64 } else { f64::NAN };
+    println!(
+        "  ch{ch} RESIDUAL/SIDEINFO ranked predictors ({} frames, {} rows):",
+        energy.len(),
+        rows.len()
+    );
+    println!(
+        "    1. add_harmonic band mean energy: flagged={:.6e} (n={harm_n}) unflagged={:.6e} (n={noharm_n}) ratio={:.3} | adjacent(+1)-band-of-flagged={:.6e} (n={adj_n})",
+        avg(harm_sum, harm_n),
+        avg(noharm_sum, noharm_n),
+        avg(harm_sum, harm_n) / avg(noharm_sum, noharm_n).max(1e-300),
+        avg(adj_sum, adj_n)
+    );
+    println!(
+        "    2. envelope time-border (+/-64 smp) mean energy={:.6e} (n={border_n}) vs interior={:.6e} (n={mid_n}) ratio={:.3}",
+        avg(border_sum, border_n),
+        avg(mid_sum, mid_n),
+        avg(border_sum, border_n) / avg(mid_sum, mid_n).max(1e-300)
+    );
+    println!(
+        "    3. hold-state(apply_last) frame total energy={:.6e} (n={hold_n}) vs fresh-payload={:.6e} (n={fresh_n}) ratio={:.3}",
+        avg(hold_sum, hold_n),
+        avg(fresh_sum, fresh_n),
+        avg(hold_sum, hold_n) / avg(fresh_sum, fresh_n).max(1e-300)
+    );
+    println!(
+        "    4. frame-after-coupling-flip total energy={:.6e} (n={flip_n}) vs no-flip={:.6e} (n={noflip_n}) ratio={:.3}",
+        avg(flip_sum, flip_n),
+        avg(noflip_sum, noflip_n),
+        avg(flip_sum, flip_n) / avg(noflip_sum, noflip_n).max(1e-300)
+    );
+    println!("    5. invf_mode level -> mean per-band residual energy:");
+    for (level, (s, n)) in per_level.iter().enumerate() {
+        println!("       level {level}: {:.6e} (n={n})", avg(*s, *n));
+    }
+    println!(
+        "    6. HF residual peakiness (max/mean over 4-bin groups): {:.3} (n={peak_n}) [near 1 = noise-like, larger = tonal]",
+        avg(peak_sum, peak_n)
+    );
+}
+
 fn candidates() -> Vec<Candidate> {
     let home = std::env::var("HOME").unwrap_or_default();
     [
@@ -849,6 +1177,9 @@ fn sbr_real_library_matches_reference() {
                 for (w, (l, cr)) in drift.iter().enumerate() {
                     println!("    w{w}: lag {l} corr {cr:.4}");
                 }
+            }
+            if std::env::var("EC_AAC_SBR_RESIDUAL_DEBUG").is_ok() {
+                residual_sideinfo_analysis(o, t, oa, ob, rate, ch);
             }
             worst_full = worst_full.min(full);
             worst_low = worst_low.min(low);
