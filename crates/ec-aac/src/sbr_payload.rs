@@ -336,19 +336,31 @@ impl SbrParser {
         prev: &[i32],
     ) -> Result<Vec<i32>> {
         let book = env_book(dt, balance, amp_res);
+        let width = raw_env_width(balance, amp_res);
+        let cap = (1i32 << width) - 1;
         let mut row = vec![0i32; bands];
+        // Every cell here is a `bs_data_env` raw scalefactor, whose valid
+        // range is exactly the transmitted field's own bit width regardless
+        // of path (DT against last frame's state, or DF's within-row delta
+        // chain) -- clamped at construction, not just when carried to the
+        // NEXT frame's `last_env` (as it already was below): an unclamped
+        // intermediate here let one bad Huffman symbol (desync or a
+        // genuinely huge encoded delta) cascade through the rest of the row
+        // via `row[b-1] + delta`, producing a raw value in the hundreds
+        // whose dequantized (`2^v`) energy is 10+ orders of magnitude too
+        // large -- exactly the coupled CPE's second-channel envelope
+        // blowups measured on real HE-AAC files.
         if dt {
             for (b, slot) in row.iter_mut().enumerate() {
                 let delta = read_huffman(r, book)?;
                 let base = prev.get(b).copied().unwrap_or(0);
-                *slot = base + delta;
+                *slot = (base + delta).clamp(0, cap);
             }
         } else {
-            let width = raw_env_width(balance, amp_res);
-            row[0] = r.read_bits(width)? as i32;
+            row[0] = (r.read_bits(width)? as i32).clamp(0, cap);
             for b in 1..bands {
                 let delta = read_huffman(r, book)?;
-                row[b] = row[b - 1] + delta;
+                row[b] = (row[b - 1] + delta).clamp(0, cap);
             }
         }
         if std::env::var("EC_AAC_SBR_ENV_DEBUG").is_ok() {
@@ -368,18 +380,19 @@ impl SbrParser {
         prev: &[i32],
     ) -> Result<Vec<i32>> {
         let book = noise_book(dt, balance);
+        let cap = (1i32 << RAW_NOISE_WIDTH) - 1;
         let mut row = vec![0i32; bands];
         if dt {
             for (b, slot) in row.iter_mut().enumerate() {
                 let delta = read_huffman(r, book)?;
                 let base = prev.get(b).copied().unwrap_or(0);
-                *slot = base + delta;
+                *slot = (base + delta).clamp(0, cap);
             }
         } else {
-            row[0] = r.read_bits(RAW_NOISE_WIDTH)? as i32;
+            row[0] = (r.read_bits(RAW_NOISE_WIDTH)? as i32).clamp(0, cap);
             for b in 1..bands {
                 let delta = read_huffman(r, book)?;
-                row[b] = row[b - 1] + delta;
+                row[b] = (row[b - 1] + delta).clamp(0, cap);
             }
         }
         Ok(row)
