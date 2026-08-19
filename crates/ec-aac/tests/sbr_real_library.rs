@@ -460,6 +460,87 @@ fn per_band_correlation(o: &[f32], t: &[f32], rate: u32) -> Vec<(f64, f64, f64)>
     out
 }
 
+/// Per-band PCM-domain lag search (round-15 candidate-A discriminator):
+/// `per_band_correlation`'s magnitude series has one sample per 1024-sample
+/// STFT `HOP`, far coarser than a single QMF slot (64 samples) -- a stage
+/// delay of one or a few slots between our HF path and the reference's would
+/// vanish into that hop bucket instead of showing up as a lag. This instead
+/// bandpasses `o`/`t` to each HF QMF band (the same zero-phase RC
+/// `highpass`/`lowpass` primitives the crossover split already uses) and
+/// searches PCM-sample lag directly, coarse-then-refine like
+/// `best_lag_correlation`, so a consistent nonzero peak lag (especially a
+/// multiple of 64 samples) convicts a per-stage time-alignment bug; lags
+/// clustered at/near zero exonerate it in favour of a patch-map or
+/// gain-mapping bug instead. Bands below kx (already known clean from
+/// `per_band_correlation`) are skipped -- only HF bands (14..) are searched.
+fn per_band_lag_search(o: &[f32], t: &[f32], rate: u32) -> Vec<(f64, i64, f64)> {
+    const LAG_MAX: i64 = 1_024;
+    const COARSE_STEP: i64 = 8;
+    const COARSE: usize = 4_096;
+    const WIN: usize = 65_536;
+    let band_hz = f64::from(rate) / 256.0;
+    let num_bands = (f64::from(rate) / 2.0 / band_hz).ceil() as usize;
+    let n = o.len().min(t.len());
+    let start = n.saturating_sub(WIN + LAG_MAX as usize).min(n / 4);
+    let mut out = Vec::new();
+    for band in 14..num_bands {
+        let lo = (band as f64 * band_hz).max(1.0);
+        let hi = ((band + 1) as f64 * band_hz).min(f64::from(rate) / 2.0 - 1.0);
+        // A single-pole RC (the plain `highpass`/`lowpass` used for the
+        // crossover split) has too gentle a rolloff to isolate a ~172Hz-wide
+        // QMF band -- it leaks in the much stronger, well-correlated
+        // below-crossover energy, which was confirmed here as a smooth,
+        // frequency-monotonic false-high correlation with no matching cliff
+        // in `per_band_correlation`'s FFT-bin version of the same bands.
+        // `sharp_lowpass` (3x cascade, already used for the crossover-band
+        // debug check) plus its highpass complement sharpens the stopband
+        // enough that leakage from outside this one band stops dominating.
+        let sharp_highpass = |s: &[f32], cutoff: f64| -> Vec<f32> {
+            s.iter()
+                .zip(&sharp_lowpass(s, rate, cutoff))
+                .map(|(a, b)| a - b)
+                .collect::<Vec<f32>>()
+        };
+        let bp = |s: &[f32]| -> Vec<f32> { sharp_lowpass(&sharp_highpass(s, lo), rate, hi) };
+        let ob = bp(o);
+        let tb = bp(t);
+        let slice_at = |lag: i64, len: usize| -> Option<(usize, usize)> {
+            let (oa, ta) = if lag >= 0 {
+                (start, start + lag as usize)
+            } else {
+                (start + (-lag) as usize, start)
+            };
+            if oa + len > ob.len() || ta + len > tb.len() {
+                None
+            } else {
+                Some((oa, ta))
+            }
+        };
+        let mut coarse = (0i64, -1.0f64, 0.0f64);
+        let mut lag = -LAG_MAX;
+        while lag <= LAG_MAX {
+            if let Some((oa, ta)) = slice_at(lag, COARSE) {
+                let c = correlation(&ob[oa..oa + COARSE], &tb[ta..ta + COARSE]);
+                if c.abs() > coarse.1 {
+                    coarse = (lag, c.abs(), c);
+                }
+            }
+            lag += COARSE_STEP;
+        }
+        let mut best = coarse;
+        for lag in (coarse.0 - COARSE_STEP)..=(coarse.0 + COARSE_STEP) {
+            if let Some((oa, ta)) = slice_at(lag, WIN) {
+                let c = correlation(&ob[oa..oa + WIN], &tb[ta..ta + WIN]);
+                if c.abs() > best.1 {
+                    best = (lag, c.abs(), c);
+                }
+            }
+        }
+        out.push((band as f64 * band_hz, best.0, best.2));
+    }
+    out
+}
+
 /// A file discovered under the user's own media directories: its path, which
 /// AAC stream in it (0-based among AAC streams only) carries HE-AAC, and the
 /// core/SBR crossover an ffprobe/ASC inspection already pinned for it -- used
@@ -624,6 +705,11 @@ fn sbr_real_library_matches_reference() {
                 println!("  ch{ch} per-QMF-band |corr| (band_hz, |corr|, band_index):");
                 for (hz, corr, band) in &spectrum {
                     println!("    {hz:>6.0}Hz band{band:>3.0}: {corr:.4}");
+                }
+                let lags = per_band_lag_search(&o[oa..oa + n], &t[ob..ob + n], rate);
+                println!("  ch{ch} per-HF-band PCM lag search (band_hz, best_lag, |corr|):");
+                for (hz, lag, corr) in &lags {
+                    println!("    {hz:>6.0}Hz: lag {lag:>5} corr {corr:.4}");
                 }
             }
             println!(
