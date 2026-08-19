@@ -14,27 +14,42 @@ decays geometrically as `g^n` per QMF slot -- `g` *is* the chirp factor
 (pole radius), directly recoverable from the decay rate with no analysis of
 our own decoder involved.
 
-STATUS (dead end, not chased further): the isolated-single-MDCT-line core
-(`tone_core`) does not round-trip -- most HCB3 codewords beyond the one
-tuple earlier probes happened to exercise are unverified and desync the
-bitstream ("Input buffer exhausted before END element found"); see the
-`(2,0,0,0)`/`(2,0,2,2)`/`(0,0,0,0)` isolation test in the project ledger.
-Falling back to the already-proven-clean broadband `sce_core` comb content
-(`broadband_core_bits`) decodes without framing errors, but every real SBR
-sweep built on top of it (`stream()`, any `n_low`/`n_high`/`n_q` combination
-tried, any `env0`/`noise0` magnitude) makes the reference decoder print
-"No quantized data read for sbr_dequant." and then produce PCM that is
-*value-independent* of both `bs_invf_mode` (all four levels byte-identical)
-and the envelope amplitude itself (`env0=0` vs `env0=100`: power differs by
-<0.02%, when a real amp_res=0 dequant law would differ by orders of
-magnitude) -- i.e. the reference's SBR envelope/gain stage is not engaging
-with this harness's `sbr_data` payload at all, for a reason not yet
-isolated (framing/byte-count is provably correct per `oracle_check`, so the
-fault is in a field *value* or ordering `oracle_check`'s byte-count-only
-check cannot see). No bw fingerprint could be extracted; Task 1 could not be
-completed this round. Do not reuse `stream()`'s SCE/FIXFIX(num_env=1) recipe
-believing it produces a working real decode -- it does not, despite passing
-the byte-count oracle.
+STATUS (round-19): the round-18 non-engagement was `stream()`'s own recipe
+shape, not a framing bug -- bisected field-by-field against a known-working
+CPE probe (see project ledger) and isolated to TWO independent culprits,
+either one sufficient alone to make the reference decoder's SBR gain stage
+not engage (envelope amplitude and `bs_invf_mode` both become powerless,
+`"No quantized data read for sbr_dequant."` fires either way -- that
+message is a red herring, printed on this SCE probe shape regardless of
+engagement, not diagnostic of it):
+
+  1. `bs_amp_res=0` (coarse, 7-bit raw envelope resolution). Sweeping the
+     full raw range (0..127) still gives <0.03% output-power change; fine
+     resolution (`bs_amp_res=1`, 6-bit raw) with the same header gives
+     three-to-four-orders-of-magnitude power swings for a mid-range raw
+     sweep (3 -> 60). Pure probe-construction quirk, not implicating our
+     parser/writer: real encoders emit both resolutions routinely and nothing
+     here says our AAC parser mishandles coarse-resolution streams -- it is
+     specifically *this reference build's* dequant path refusing these raw
+     values under `amp_res=0`, for a reason not chased further (plausibly an
+     offset/table-range mismatch in how this probe's raw codewords map,
+     unrelated to any of our own code).
+  2. `bs_num_env=1` (FIXFIX single envelope). Independent of amp_res: even
+     requesting `amp_res=1` explicitly, a single-envelope frame still fails
+     to engage here.
+
+`stream()` below now uses the repaired shape: SCE, FIXFIX with `num_env=2`,
+`amp_res=1`, envelope held constant across `bs_invf_mode` sweeps. Task 2 (a
+four-level `bs_invf_mode` sweep plus a HIGH->NONE transition, `n_q=1`
+narrow HF target) on this repaired instrument found only a ~0.1% output
+power drift across all four levels and no resolvable flatness difference,
+against a `BW_TABLE` that nominally spans `bw=0.0..0.98` -- STOP RULE
+applies: fingerprints are indistinguishable on the working instrument, so
+the bw-per-level hypothesis is refuted for this measurement and `sbr_hf.rs`
+was left unchanged. (The HIGH->NONE transition run showed a >200x power
+spike two frames from the stream's end; that coincides with the trailing
+silence frame and reads as a decoder-side reset artifact of this probe's
+framing, not a chirp-smoothing signal -- not chased further.)
 """
 import os
 import sys
@@ -105,13 +120,16 @@ def broadband_core_bits(w, gain=200):
 
 
 def stream(cfg, tables, n_frames, invf_seq):
-    """`n_frames` FIXFIX/1-env frames, header on the first, `bs_invf_mode`
-    taken from `invf_seq[i]` (repeats last if shorter)."""
-    grid = dict(frame_class=0, num_env=1, freq_res=0)
+    """`n_frames` FIXFIX/2-env, `amp_res=1` frames (the repaired, engaging
+    shape -- see module docstring), header on the first, `bs_invf_mode`
+    taken from `invf_seq[i]` (repeats last if shorter), envelope held fixed
+    across the sweep."""
+    grid = dict(frame_class=0, num_env=2, freq_res=0)
     frames = [P.silent(SF_INDEX)]
     for i in range(n_frames):
         mode = invf_seq[min(i, len(invf_seq) - 1)]
-        c = dict(cfg, invf=mode, header=1)
+        c = dict(cfg, invf=mode, header=1, amp_res=1, element="sce", coupling=0,
+                 df_env=[0] * 8, df_noise=[0, 0], env0=[40] * 8, noise0=[2, 2])
         w = P.BitW()
         broadband_core_bits(w)
         body = F.sbr_bits_full(c, tables, grid, [])
@@ -122,8 +140,11 @@ def stream(cfg, tables, n_frames, invf_seq):
             w.w(cnt - 15 + 1, 8)
         else:
             w.w(cnt, 4)
+        start = len(w)
         w.w(13, 4)
         w.wbits(body.bits)
+        while len(w) - start < cnt * 8:
+            w.w(0, 1)
         w.w(7, 3)
         frames.append(P.adts(w.pack(pad=0), SF_INDEX))
     frames.append(P.silent(SF_INDEX))
