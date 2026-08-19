@@ -374,6 +374,92 @@ fn windowed_lag_drift(
     out
 }
 
+/// DIAGNOSTIC (round-14, Task 2): per-QMF-band correlation over the
+/// above-crossover region. No 64-band QMF Analysis exists standalone in this
+/// crate, so this substitutes an STFT: magnitude-per-bin time series (one
+/// value per hop) for `ours` and `theirs`, correlated bin by bin, then
+/// averaged over the bins a QMF band of width `rate/128` Hz covers. A patch
+/// boundary in `build_patches`' target ranges landing on a low-correlation
+/// block convicts patch construction; an even spread across all HF bands
+/// with the map otherwise right points at gain mapping instead.
+/// Pearson correlation with no minimum-length floor -- `correlation`'s
+/// 1024-sample floor exists for raw audio windows, not the much shorter
+/// per-bin magnitude series this diagnostic correlates.
+fn magnitude_series_correlation(a: &[f32], b: &[f32]) -> f64 {
+    let n = a.len().min(b.len());
+    if n < 2 {
+        return 0.0;
+    }
+    let (a, b) = (&a[..n], &b[..n]);
+    let ma = a.iter().map(|v| f64::from(*v)).sum::<f64>() / n as f64;
+    let mb = b.iter().map(|v| f64::from(*v)).sum::<f64>() / n as f64;
+    let ac: Vec<f32> = a.iter().map(|v| (f64::from(*v) - ma) as f32).collect();
+    let bc: Vec<f32> = b.iter().map(|v| (f64::from(*v) - mb) as f32).collect();
+    let num = dot(&ac, &bc);
+    let den = (dot(&ac, &ac) * dot(&bc, &bc)).sqrt();
+    if den == 0.0 { 0.0 } else { num / den }
+}
+
+fn per_band_correlation(o: &[f32], t: &[f32], rate: u32) -> Vec<(f64, f64, f64)> {
+    const FFT_LEN: usize = 2048;
+    const HOP: usize = 1024;
+    let win = ec_dsp::Window::<f32>::sine(FFT_LEN);
+    let mut rfft = ec_dsp::RealFft::<f32>::new(FFT_LEN);
+    let bins = rfft.spectrum_len();
+    let n = o.len().min(t.len());
+    let hops = if n >= FFT_LEN {
+        (n - FFT_LEN) / HOP + 1
+    } else {
+        0
+    };
+    let mut o_mag = vec![Vec::with_capacity(hops); bins];
+    let mut t_mag = vec![Vec::with_capacity(hops); bins];
+    let mut spectrum = vec![ec_dsp::Complex::new(0.0f32, 0.0); bins];
+    for (src, dst) in [(o, &mut o_mag), (t, &mut t_mag)] {
+        for h in 0..hops {
+            let mut block = src[h * HOP..h * HOP + FFT_LEN].to_vec();
+            win.apply(&mut block);
+            rfft.forward(&block, &mut spectrum);
+            for (b, c) in spectrum.iter().enumerate() {
+                dst[b].push(c.norm_sqr().sqrt());
+            }
+        }
+    }
+    // QMF band width is `core_rate/128` where `core_rate` is the core
+    // decoder's own sample rate -- half the SBR extension/output rate for a
+    // plain (2x) HE-AAC stream -- not `output_rate/128`: measured against
+    // this file's own kx=14 crossover, the correlation break lands exactly
+    // at 14*(rate/256) Hz (2412 Hz), not at 14*(rate/128).
+    let band_hz = f64::from(rate) / 256.0;
+    let bin_hz = f64::from(rate) / FFT_LEN as f64;
+    let num_bands = (f64::from(rate) / 2.0 / band_hz).ceil() as usize;
+    let mut out = Vec::with_capacity(num_bands);
+    for band in 0..num_bands {
+        let lo = (band as f64 * band_hz / bin_hz).floor() as usize;
+        let hi = (((band + 1) as f64 * band_hz / bin_hz).ceil() as usize).min(bins);
+        if lo >= hi {
+            continue;
+        }
+        let mut sum = 0.0f64;
+        let mut cnt = 0usize;
+        for b in lo..hi {
+            // `correlation`'s 1024-sample floor is sized for raw audio, not
+            // this per-bin magnitude series (one value per STFT hop, ~200
+            // long over the test window) -- use it anyway but on padded
+            // input so the floor doesn't zero every band out.
+            let c = magnitude_series_correlation(&o_mag[b], &t_mag[b]);
+            if c.is_finite() {
+                sum += c.abs();
+                cnt += 1;
+            }
+        }
+        if cnt > 0 {
+            out.push((band as f64 * band_hz, sum / cnt as f64, band as f64));
+        }
+    }
+    out
+}
+
 /// A file discovered under the user's own media directories: its path, which
 /// AAC stream in it (0-based among AAC streams only) carries HE-AAC, and the
 /// core/SBR crossover an ffprobe/ASC inspection already pinned for it -- used
@@ -533,6 +619,13 @@ fn sbr_real_library_matches_reference() {
             } else {
                 0.0
             };
+            if std::env::var("EC_AAC_SBR_BANDS").is_ok() && n >= 4_096 {
+                let spectrum = per_band_correlation(&o[oa..oa + n], &t[ob..ob + n], rate);
+                println!("  ch{ch} per-QMF-band |corr| (band_hz, |corr|, band_index):");
+                for (hz, corr, band) in &spectrum {
+                    println!("    {hz:>6.0}Hz band{band:>3.0}: {corr:.4}");
+                }
+            }
             println!(
                 "  ch{ch}: lag {lag}, full {full:.6}, below {:.0}Hz {low:.6}, above {:.0}Hz {high:.6}",
                 c.crossover_hz, c.crossover_hz
