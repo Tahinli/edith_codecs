@@ -25,17 +25,30 @@ RATE = T.SBR_RATE_FOR_SF[SF_INDEX]
 
 # --------------------------------------------------------------- grid writer
 
+def ptr_bits(num_env):
+    """`ceil(log2(num_env+1))`: width of `bs_pointer`, which ranges `0..=num_env`."""
+    n = 1
+    while (1 << n) < num_env + 1:
+        n += 1
+    return n
+
+
 def write_grid(s, grid_cfg):
     """Writes one `sbr_grid()`; returns `(num_env, freq_res_list)`.
 
     Field widths validated against the reference decoder's byte accounting in
     `gridcheck.py` (kept alongside this file): FIXVAR/VARFIX/VARVAR all use
-    `var_bord`(2 bits), `bs_num_rel`(2 bits), `bs_rel_bord`(2 bits, value
-    `2*n+2`) and one `bs_freq_res` bit per envelope, agreeing with the
-    reference parser's consumed byte count for every `num_rel` combination
-    whose total envelope count lands in `2..=5` (below or above that the
-    reference decoder takes a different, unmeasured path -- so the Rust
-    parser refuses those rather than guessing).
+    `var_bord`(2 bits), `bs_num_rel`(2 bits) and `bs_rel_bord`(2 bits, value
+    `2*n+2`), agreeing with the reference parser's consumed byte count for
+    every `num_rel` combination whose total envelope count lands in `2..=5`
+    (below or above that the reference decoder takes a different, unmeasured
+    path -- so the Rust parser refuses those rather than guessing). Between
+    the relative borders and `bs_freq_res` sits `bs_pointer`
+    (`ptr_bits(num_env)` bits) -- confirmed present by `sbrgrid_probe.py`
+    against a non-uniform freq_res list (a uniform one hides it entirely,
+    which is how earlier fixtures missed it). FIXVAR alone transmits
+    `bs_freq_res` in reverse time order (probed the same way); VARFIX/VARVAR
+    transmit it forward.
     """
     fc = grid_cfg["frame_class"]
     s.w(fc, 2)
@@ -52,8 +65,10 @@ def write_grid(s, grid_cfg):
         num_env = num_rel + 1
         for b in grid_cfg["rel_bord"]:
             s.w(b, 2)
+        s.w(grid_cfg.get("pointer", 0), ptr_bits(num_env))
         freq_res_list = grid_cfg["freq_res_list"]
-        for fr in freq_res_list:
+        wire = list(reversed(freq_res_list)) if fc == 1 else list(freq_res_list)
+        for fr in wire:
             s.w(fr, 1)
         return num_env, freq_res_list
     # VARVAR
@@ -68,6 +83,7 @@ def write_grid(s, grid_cfg):
         s.w(b, 2)
     for b in grid_cfg["rel_bord1"]:
         s.w(b, 2)
+    s.w(grid_cfg.get("pointer", 0), ptr_bits(num_env))
     freq_res_list = grid_cfg["freq_res_list"]
     for fr in freq_res_list:
         s.w(fr, 1)

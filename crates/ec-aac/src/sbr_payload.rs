@@ -77,20 +77,22 @@ struct Grid {
 }
 
 impl Grid {
-    fn new(num_env: usize, freq_res: Vec<u8>, t_env: Vec<i64>) -> Grid {
+    /// `pointer` is `bs_pointer` (0 for FIXFIX, which has no such field --
+    /// the spec's own `bs_pointer == 0` case: the middle noise border is
+    /// `num_env >> 1`). Per ISO/IEC 14496-3 §4.6.18.3.3: `bs_pointer == 0`
+    /// selects `num_env >> 1`, `== 1` selects the last envelope border
+    /// (`num_env - 1`), otherwise `bs_pointer - 1`.
+    fn new(num_env: usize, freq_res: Vec<u8>, t_env: Vec<i64>, pointer: usize) -> Grid {
         let num_noise = if num_env == 1 { 1 } else { 2 };
         let t_noise = if num_noise == 1 {
             vec![t_env[0], t_env[num_env]]
         } else {
-            let mid = (t_env[0] + t_env[num_env]) as f64 / 2.0;
-            let split = (1..num_env)
-                .min_by(|&a, &b| {
-                    let da = (t_env[a] as f64 - mid).abs();
-                    let db = (t_env[b] as f64 - mid).abs();
-                    da.partial_cmp(&db).unwrap()
-                })
-                .unwrap_or(1);
-            vec![t_env[0], t_env[split], t_env[num_env]]
+            let middle = match pointer {
+                0 => num_env >> 1,
+                1 => num_env - 1,
+                p => p - 1,
+            };
+            vec![t_env[0], t_env[middle], t_env[num_env]]
         };
         Grid {
             num_env,
@@ -99,6 +101,12 @@ impl Grid {
             t_noise,
         }
     }
+}
+
+/// Width of `bs_pointer`, which ranges `0..=num_env`: `ceil(log2(num_env+1))`
+/// bits, equivalently the bit-length of `num_env` itself.
+fn pointer_bits(num_env: usize) -> u32 {
+    (u32::BITS - (num_env as u32).leading_zeros()).max(1)
 }
 
 /// Per-channel state carried across frames, for delta-time (DT) envelope and
@@ -214,7 +222,7 @@ impl SbrParser {
                 let t_env: Vec<i64> = (0..=num_env)
                     .map(|i| (i as i64) * NUM_TIME_SLOTS / num_env as i64)
                     .collect();
-                Ok(Grid::new(num_env, vec![fr; num_env], t_env))
+                Ok(Grid::new(num_env, vec![fr; num_env], t_env, 0))
             }
             1 | 2 => {
                 // FIXVAR (1, trailing variable border) / VARFIX (2, leading variable border)
@@ -230,10 +238,22 @@ impl SbrParser {
                 for _ in 0..num_rel {
                     rel.push(2 * i64::from(r.read_bits(2)?) + 2);
                 }
-                let mut freq_res = Vec::with_capacity(num_env);
+                let pointer = r.read_bits(pointer_bits(num_env))? as usize;
+                // FIXVAR transmits bs_freq_res in reverse time order (the
+                // envelopes are numbered from the trailing variable border
+                // backwards); VARFIX transmits it forward. Confirmed against
+                // a reference decoder's own byte accounting on a non-uniform
+                // list, since a uniform one can't tell the orders apart
+                // (`scripts/aac-tables/sbrgrid_probe.py`).
+                let mut wire = Vec::with_capacity(num_env);
                 for _ in 0..num_env {
-                    freq_res.push(u8::from(r.read_bit()?));
+                    wire.push(u8::from(r.read_bit()?));
                 }
+                let freq_res = if frame_class == 1 {
+                    wire.into_iter().rev().collect()
+                } else {
+                    wire
+                };
                 let mut t = vec![0i64; num_env + 1];
                 if frame_class == 1 {
                     let trail = NUM_TIME_SLOTS + var_bord;
@@ -250,7 +270,7 @@ impl SbrParser {
                     }
                     t[num_env] = NUM_TIME_SLOTS;
                 }
-                Ok(Grid::new(num_env, freq_res, t))
+                Ok(Grid::new(num_env, freq_res, t, pointer))
             }
             _ => {
                 // VARVAR
@@ -270,6 +290,7 @@ impl SbrParser {
                 for _ in 0..num_rel1 {
                     rel1.push(2 * i64::from(r.read_bits(2)?) + 2);
                 }
+                let pointer = r.read_bits(pointer_bits(num_env))? as usize;
                 let mut freq_res = Vec::with_capacity(num_env);
                 for _ in 0..num_env {
                     freq_res.push(u8::from(r.read_bit()?));
@@ -289,7 +310,7 @@ impl SbrParser {
                 if t.windows(2).any(|w| w[0] >= w[1]) {
                     return Err(Error::corrupt("sbr: non-monotone envelope time borders"));
                 }
-                Ok(Grid::new(num_env, freq_res, t))
+                Ok(Grid::new(num_env, freq_res, t, pointer))
             }
         }
     }
@@ -504,8 +525,26 @@ impl SbrParser {
                 q_q.push(row);
             }
 
-            self.state[ch].last_env = e_q.last().cloned().unwrap_or_default();
-            self.state[ch].last_noise = q_q.last().cloned().unwrap_or_default();
+            // Containment, not the fix: a still-undiscovered desync could
+            // make a DT delta huge, and since a following frame's DT reads
+            // add onto this carried state, one corrupt cell would otherwise
+            // snowball unbounded across frames. Clamp to the raw field's own
+            // range (0..127 envelope, 0..31 noise) so corrupt input degrades
+            // that one cell instead of exploding the whole carried state.
+            self.state[ch].last_env = e_q
+                .last()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|v| v.clamp(0, (1 << raw_env_width(balance, amp_res)) - 1))
+                .collect();
+            self.state[ch].last_noise = q_q
+                .last()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|v| v.clamp(0, (1 << RAW_NOISE_WIDTH) - 1))
+                .collect();
 
             channels.push(SbrChannel {
                 t_env: grids[ch].t_env.clone(),
@@ -552,13 +591,13 @@ mod tests {
     // `_BITS` is the bit count the reference decoder's own accounting
     // measured for it, asserted below against `BitReader::bit_position()`.
     const FIXVAR_DF_BODY: &[u8] = &[
-        0x90, 0x31, 0xd8, 0xb2, 0xcc, 0x00, 0xbc, 0x78, 0xf0, 0x00, 0x00,
+        0x90, 0x31, 0xd8, 0xb2, 0xcc, 0x00, 0x2f, 0x1e, 0x3c, 0x00, 0x00,
     ];
-    const FIXVAR_DF_BITS: u64 = 82;
-    const VARFIX_DF_BODY: &[u8] = &[0x90, 0x31, 0xd8, 0xb5, 0x38, 0x0b, 0xc7, 0x80, 0x00];
-    const VARFIX_DF_BITS: u64 = 71;
-    const VARVAR_DF_BODY: &[u8] = &[0x90, 0x31, 0xd8, 0xb6, 0xa8, 0x00, 0xbc, 0x78, 0x00, 0x00];
-    const VARVAR_DF_BITS: u64 = 75;
+    const FIXVAR_DF_BITS: u64 = 84;
+    const VARFIX_DF_BODY: &[u8] = &[0x90, 0x31, 0xd8, 0xb5, 0x38, 0x02, 0xf1, 0xe0, 0x00, 0x00];
+    const VARFIX_DF_BITS: u64 = 73;
+    const VARVAR_DF_BODY: &[u8] = &[0x90, 0x31, 0xd8, 0xb6, 0xa8, 0x00, 0x2f, 0x1e, 0x00, 0x00];
+    const VARVAR_DF_BITS: u64 = 77;
     const FIXFIX_DT_BODY: &[u8] = &[0x90, 0x31, 0xd8, 0xb0, 0x95, 0x78, 0x00, 0x00];
     const FIXFIX_DT_BITS: u64 = 57;
     const CPE_UNCOUPLED_BODY: &[u8] = &[0x90, 0x31, 0xd8, 0xb0, 0x00, 0x05, 0x78, 0x07, 0x80, 0x00];
