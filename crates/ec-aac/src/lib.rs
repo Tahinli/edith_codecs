@@ -48,6 +48,10 @@ pub use config::{
 pub use decode::{FRAME_LEN, WindowSequence};
 pub use ec_core::{Error, Result};
 pub use encode::{AacEncoder, AacEncoderConfig, EncodedPacket, WindowShape};
+/// Diagnostic only (round-17 Task 1 conviction check): reads back the
+/// per-absolute-QMF-band transmitted signal/noise energy sums
+/// `EC_AAC_SBR_NOISE_FRACTION_DEBUG` accumulates during decode.
+pub use sbr_env::noise_fraction_table;
 pub use tables::SAMPLE_RATES;
 
 use decode::BlockDecoder;

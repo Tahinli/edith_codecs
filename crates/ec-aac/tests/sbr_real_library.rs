@@ -791,6 +791,31 @@ fn sbr_real_library_matches_reference() {
             } else {
                 0.0
             };
+            if ch == 0 && std::env::var("EC_AAC_SBR_NOISE_FRACTION_DEBUG").is_ok() {
+                // (Round-17, Task 1) the noise-energy-fraction ceiling
+                // hypothesis: predicted per-band correlation ceiling
+                // sqrt(1 - noise_energy/(signal_energy+noise_energy)),
+                // from OUR OWN transmitted (dequantized) envelope/noise
+                // split -- printed once per file so it can be eyeballed
+                // against per_band_lag_search's measured |corr| curve
+                // below. Real QMF band width in output Hz is
+                // `rate/128` (64-band synthesis over the output Nyquist).
+                let band_hz = f64::from(rate) / 128.0;
+                println!(
+                    "  NOISE-FRACTION ceiling prediction (band_hz, f_noise, predicted_ceiling):"
+                );
+                for (band, signal, noise) in ec_aac::noise_fraction_table() {
+                    if signal + noise <= 0.0 {
+                        continue;
+                    }
+                    let f = noise / (signal + noise);
+                    println!(
+                        "    {:>6.0}Hz band{band:>3}: signal {signal:.3e} noise {noise:.3e} f_noise {f:.6} ceiling {:.4}",
+                        band as f64 * band_hz,
+                        (1.0 - f).max(0.0).sqrt()
+                    );
+                }
+            }
             if std::env::var("EC_AAC_SBR_BANDS").is_ok() && n >= 4_096 {
                 let spectrum = per_band_correlation(&o[oa..oa + n], &t[ob..ob + n], rate);
                 println!("  ch{ch} per-QMF-band |corr| (band_hz, |corr|, band_index):");
