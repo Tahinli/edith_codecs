@@ -178,6 +178,12 @@ pub fn adjust(
             .windows(2)
             .position(|w| t0 >= w[0] && t0 < w[1])
             .and_then(|ni| noise_energy.get(ni));
+        // Per-sfb gain, computed first and applied afterward (as either a
+        // flat step per band, or -- Sec 4.6.18.7.6, `bs_interpol_freq` --
+        // linearly interpolated across subbands between sfb centre
+        // frequencies) so both application modes share the exact same gain
+        // values.
+        let mut gains = Vec::with_capacity(table.len().saturating_sub(1));
         for b in 0..table.len().saturating_sub(1) {
             let lo = table[b] as usize;
             let hi = table[b + 1] as usize;
@@ -200,12 +206,39 @@ pub fn adjust(
                 .and_then(|r| r.get(q).copied())
                 .unwrap_or(0.0)
                 .max(1e-12);
-            gain = gain.min(
-                (noise_here * limiter_max / current.max(1e-12))
-                    .sqrt()
-                    .max(gain.min(limiter_max)),
-            );
+            // Cap gain at `limiter_max` times the cell's own
+            // noise-plus-signal headroom over its raw HF estimate (Sec
+            // 4.6.18.7.5's `limGain * sqrt((Q_M+E_curr)/E_curr)` shape): a
+            // cell with no transmitted noise floor still gets the plain
+            // `limiter_max` ceiling (the `current` term alone gives
+            // `sqrt(current/current)=1`), while a cell whose noise floor
+            // dominates its raw estimate gets extra headroom proportional to
+            // that ratio. The previous `.max(gain.min(limiter_max))` here
+            // floored the cap at `min(gain, limiter_max)`, which is always
+            // >= the intended cap and so never actually restricted
+            // anything.
+            let cur = current.max(1e-12);
+            gain = gain.min(limiter_max * ((noise_here + cur) / cur).sqrt());
             gain = gain.min(limiter_max * 64.0); // absolute ceiling: never amplify a silent cell to infinity
+            gains.push(gain);
+        }
+        // `bs_interpol_freq` (per-subband linear interpolation of these sfb
+        // gains, Sec 4.6.18.7.6) was tried here: a centre-frequency lerp
+        // between neighbouring sfbs' flat gain values, applied whenever
+        // `header.interpol_freq != 0`. Measured effect on the real-file
+        // sweep was NEGATIVE (Nikbinler ch0 full-band 0.972756 -> 0.960561)
+        // -- the reference decoder's actual interpolation shape (weighting,
+        // node placement, or which quantity gets interpolated) differs from
+        // this naive lerp, so it was reverted rather than shipped as a
+        // regression; `header.interpol_freq`/`smoothing_mode` remain parsed
+        // but unapplied. corner-cut: real bs_interpol_freq/smoothing_mode
+        // support, ceiling ~0.999 full-band bar; needs the reference
+        // decoder's exact per-subband gain-interpolation formula, not a
+        // plausible reconstruction of it.
+        for b in 0..table.len().saturating_sub(1) {
+            let lo = table[b] as usize;
+            let hi = table[b + 1] as usize;
+            let gain = gains[b];
             for band in lo..hi {
                 if band < kx || band - kx >= hf.len() {
                     continue;
