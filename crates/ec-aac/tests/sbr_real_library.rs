@@ -482,13 +482,30 @@ fn sbr_real_library_matches_reference() {
             let n = WINDOW
                 .min(o.len().saturating_sub(oa))
                 .min(t.len().saturating_sub(ob));
-            let (o_low, t_low, low) = if n >= 1024 {
-                let ol = lowpass(&o[oa..oa + n], rate, c.crossover_hz);
-                let tl = lowpass(&t[ob..ob + n], rate, c.crossover_hz);
-                let lc = correlation(&ol, &tl);
-                (ol, tl, lc)
-            } else {
-                (Vec::new(), Vec::new(), 0.0)
+            // The below-crossover band gets its OWN lag search rather than
+            // reusing the full-band winning lag: a narrowband, slowly-varying
+            // low-passed signal has a correlation surface that stays broad
+            // and flat across many nearby lags, so a full-band search (whose
+            // winner is decided mostly by the higher-energy/higher-bandwidth
+            // content) can land on a lag that is a genuine local optimum for
+            // the whole signal yet a bad one for the low band alone -- on
+            // Nikbinler ch1, full-band lag 65 vs 64 differ by only 0.0015 in
+            // full-band correlation but by 0.88 in below-crossover
+            // correlation once the low band is measured at its own winning
+            // lag instead. Both bands are still re-anchored at the SAME
+            // `start` offset internally (see `best_lag_correlation`), so
+            // this is genuinely comparing the low band against itself, not
+            // drifting to an unrelated part of the file.
+            let low = {
+                let ol_full = lowpass(o, rate, c.crossover_hz);
+                let tl_full = lowpass(t, rate, c.crossover_hz);
+                let (low_lag, low_corr) = best_lag_correlation(&ol_full, &tl_full);
+                if low_lag != lag {
+                    eprintln!(
+                        "  ch{ch} below-crossover band's own best lag {low_lag} differs from full-band lag {lag}"
+                    );
+                }
+                low_corr
             };
             let high = if n >= 1024 {
                 let oh = highpass(&o[oa..oa + n], rate, c.crossover_hz);
@@ -501,7 +518,6 @@ fn sbr_real_library_matches_reference() {
                 "  ch{ch}: lag {lag}, full {full:.6}, below {:.0}Hz {low:.6}, above {:.0}Hz {high:.6}",
                 c.crossover_hz, c.crossover_hz
             );
-            let _ = (&o_low, &t_low);
             if std::env::var("EC_AAC_SBR_DRIFT").is_ok() && n >= 4_096 {
                 let windows = (n / 4_096).min(20);
                 let drift = windowed_lag_drift(o, t, oa, ob, windows);
