@@ -286,20 +286,33 @@ fn asc_round_trips_every_sample_rate() {
     assert_eq!(ec_aac::sf_index_for_rate(37_000), None);
 }
 
-/// A refusal is a claim: this one proves the SBR extension really is absent and
-/// that the decoder says so instead of quietly claiming the doubled rate.
+/// A refusal is a claim: this pins the current contract -- plain SBR (no
+/// Parametric Stereo) is reconstructed and reports the extension rate; a
+/// Parametric Stereo stream still falls back to its core (PS itself is a
+/// separate, unimplemented tool); plain AAC-LC reports nothing missing.
 #[test]
 fn sbr_is_reported_not_silently_upsampled() {
     // AOT 5 (SBR), core index 6 (24 kHz), stereo, extension index 3 (48 kHz),
     // then AOT 2 for the core: 00101 0110 0010 0011 00010.
     let asc = [0x2Bu8, 0x11, 0x88];
     let decoder = AacDecoder::with_config_bytes(&asc).expect("HE-AAC config parses");
-    assert_eq!(decoder.sbr_support(), ec_aac::SbrSupport::CoreOnly);
+    assert_eq!(decoder.sbr_support(), ec_aac::SbrSupport::V1);
     assert_eq!(
         decoder.output_sample_rate(),
-        Some(24_000),
-        "an HE-AAC stream must report the core rate it actually produces"
+        Some(48_000),
+        "a reconstructed HE-AAC stream must report the extension rate it now actually produces"
     );
+
+    // Same layout, AOT 29 (PS) instead of 5 (SBR): 11101 0110 0010 0011 00010.
+    let ps_asc = [0xEBu8, 0x11, 0x88];
+    let ps_decoder = AacDecoder::with_config_bytes(&ps_asc).expect("HE-AAC v2 config parses");
+    assert_eq!(ps_decoder.sbr_support(), ec_aac::SbrSupport::CoreOnly);
+    assert_eq!(
+        ps_decoder.output_sample_rate(),
+        Some(24_000),
+        "PS is still unreconstructed: must report the core rate it actually produces"
+    );
+
     let plain = AacDecoder::with_config_bytes(&ec_aac::audio_specific_config_bytes(48_000, 2))
         .expect("LC config parses");
     assert_eq!(plain.sbr_support(), ec_aac::SbrSupport::NotSignalled);
