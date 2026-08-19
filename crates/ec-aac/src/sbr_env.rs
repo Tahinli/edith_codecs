@@ -13,12 +13,18 @@
 //! second channel) carries a log-ratio rather than an absolute
 //! scalefactor; `dequant_pair` de-mixes it against channel 0's raw value
 //! into left/right energies that are equal (and sum to `2 * channel 0's
-//! energy`) when the ratio is centred, which is the symmetric convention
-//! this module uses in the absence of an exercised real-file fixture for
-//! it (corner-cut: exact reference offset unverified, ceiling = a
-//! panning-accuracy-only artifact on files whose SBR CPE actually
-//! couples, upgrade path = pin against a captured coupled real-file
-//! trace).
+//! energy`) when the ratio is centred. The ratio's exponent is
+//! `2 * alpha * balance_raw - 12`: pinned empirically (not from spec
+//! text) by writing coupled CPE payloads with known asymmetric
+//! `(channel 0 raw, balance raw)` pairs through a decodable HE-AAC
+//! stream, decoding both channels' PCM with the reference decoder, and
+//! fitting the left/right energy ratio against the balance raw value --
+//! done separately for `bs_amp_res=0` (offset 12 in raw units, one
+//! exponent step per raw unit) and `bs_amp_res=1` (offset 6, two
+//! exponent steps per raw unit); both collapse to the same
+//! `2*alpha*raw - 12` form (`scripts/aac-tables/sbrpayload_fixtures.py`
+//! carries no permanent copy of the probe -- the fit is recorded here
+//! and in the project ledger).
 //!
 //! # Gain, limiter, noise, sinusoids
 //!
@@ -58,7 +64,7 @@ pub fn dequant_noise(q_q: i32) -> f64 {
 /// `(left, right)` linear energies. See the module doc for the convention.
 pub fn dequant_pair(e0_raw: i32, e1_raw: i32, amp_res: u8) -> (f64, f64) {
     let e0 = dequant_env(e0_raw, amp_res);
-    let ratio = 2f64.powf(alpha(amp_res) * f64::from(e1_raw));
+    let ratio = 2f64.powf(2.0 * alpha(amp_res) * f64::from(e1_raw) - 12.0);
     let left = 2.0 * e0 * ratio / (1.0 + ratio);
     let right = 2.0 * e0 / (1.0 + ratio);
     (left, right)
@@ -413,11 +419,33 @@ mod tests {
 
     #[test]
     fn coupled_balance_round_trips_at_a_centred_ratio() {
-        let (l, r) = dequant_pair(10, 0, 1);
+        // The ratio's exponent is `2*alpha*balance_raw - 12` (pinned against
+        // a reference decoder, see the module doc): it's centred at
+        // balance_raw=6 for amp_res=1 (alpha=1) and balance_raw=12 for
+        // amp_res=0 (alpha=0.5).
+        let (l, r) = dequant_pair(10, 6, 1);
         let e0 = dequant_env(10, 1);
         assert!(
-            (l - e0).abs() < 1e-9 && (r - e0).abs() < 1e-9,
+            (l - e0).abs() < 1e-6 && (r - e0).abs() < 1e-6,
             "{l} {r} vs {e0}"
         );
+        let (l0, r0) = dequant_pair(10, 12, 0);
+        let e00 = dequant_env(10, 0);
+        assert!(
+            (l0 - e00).abs() < 1e-6 && (r0 - e00).abs() < 1e-6,
+            "{l0} {r0} vs {e00}"
+        );
+    }
+
+    #[test]
+    fn coupled_balance_shifts_energy_toward_the_channel_with_a_higher_raw_value() {
+        // Fit against the reference decoder's own PCM output (not spec
+        // text): as balance_raw grows past the centre, left grows toward
+        // `2*e0` and right shrinks toward 0, matching the measured PCM
+        // energy split for a real coupled CPE.
+        let (l_low, r_low) = dequant_pair(10, 0, 1);
+        let (l_high, r_high) = dequant_pair(10, 20, 1);
+        assert!(l_low < r_low, "{l_low} vs {r_low}");
+        assert!(l_high > r_high, "{l_high} vs {r_high}");
     }
 }
