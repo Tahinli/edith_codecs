@@ -29,7 +29,7 @@ const SF_OFFSET: i32 = 100;
 /// 2^16; the public API speaks the usual +/-1 float range. Checked against a
 /// reference decode in `adts_fixtures_match_ffmpeg_per_channel`, which compares
 /// amplitudes and not just shape.
-const OUTPUT_SCALE: f32 = 1.0 / 65536.0;
+pub(crate) const OUTPUT_SCALE: f32 = 1.0 / 65536.0;
 /// The longest TNS filter AAC-LC allows (long blocks; short blocks stop at 7).
 const TNS_MAX_ORDER_LONG: usize = 12;
 const TNS_MAX_ORDER_SHORT: usize = 7;

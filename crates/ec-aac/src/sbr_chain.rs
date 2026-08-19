@@ -11,6 +11,46 @@ use crate::sbr_qmf::{ANALYSIS_BANDS, Analysis, SYNTHESIS_BANDS, Synthesis};
 use ec_core::BitReader;
 use ec_dsp::Complex;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Debug: dumps parsed grid/header/e_q/q_q values for the first 20 frames
+/// per channel when `EC_AAC_SBR_DEBUG` is set (diagnostic only, gated).
+fn debug_dump(
+    header: &crate::sbr_payload::SbrHeader,
+    tables: &crate::sbr_bands::BandTables,
+    ch: &SbrChannel,
+    ch_idx: usize,
+) {
+    static COUNT: AtomicUsize = AtomicUsize::new(0);
+    let n = COUNT.fetch_add(1, Ordering::Relaxed);
+    if n >= 20 {
+        return;
+    }
+    eprintln!(
+        "SBRDBG frame {n} ch{ch_idx}: amp_res={} kx={} k2={} n_low={} n_high={} n_q={} t_env={:?} freq_res={:?} t_noise={:?}",
+        header.amp_res,
+        tables.kx,
+        tables.k2,
+        tables.n_low,
+        tables.n_high,
+        tables.n_q,
+        ch.t_env,
+        ch.freq_res,
+        ch.t_noise
+    );
+    for (i, row) in ch.e_q.iter().enumerate() {
+        let (mn, mx) = row
+            .iter()
+            .fold((i32::MAX, i32::MIN), |(mn, mx), &v| (mn.min(v), mx.max(v)));
+        eprintln!("  e_q[{i}] len={} min={mn} max={mx} row={row:?}", row.len());
+    }
+    for (i, row) in ch.q_q.iter().enumerate() {
+        let (mn, mx) = row
+            .iter()
+            .fold((i32::MAX, i32::MIN), |(mn, mx), &v| (mn.min(v), mx.max(v)));
+        eprintln!("  q_q[{i}] len={} min={mn} max={mx} row={row:?}", row.len());
+    }
+}
 
 /// Envelope-grid "time slots" (§4.6.18.4, `numTimeSlots = 16` for a
 /// 1024-sample core frame) are half as fine as the QMF slots SBR actually
@@ -107,6 +147,20 @@ impl SbrChain {
             for slot in 0..num_slots {
                 let mut chunk = [0f32; ANALYSIS_BANDS];
                 chunk.copy_from_slice(&plane[slot * ANALYSIS_BANDS..(slot + 1) * ANALYSIS_BANDS]);
+                // `plane` is already at the decoder's final output scale
+                // (`decode::OUTPUT_SCALE`, applied by the core filterbank),
+                // but the transmitted envelope/noise data is calibrated
+                // against the core's un-normalized internal PCM domain --
+                // undo that scale before analysis so the SBR gain match
+                // (raw QMF energy vs. the transmitted target) compares
+                // like against like, and reapply it once below after
+                // synthesis. Without this the gain step's `target/current`
+                // ratio is inflated by `1/OUTPUT_SCALE^2` in energy,
+                // exactly the multi-order-of-magnitude blowup this chain
+                // used to produce on every real HE-AAC file.
+                for s in &mut chunk {
+                    *s /= crate::decode::OUTPUT_SCALE;
+                }
                 let sub = state.analysis.process_slot(&chunk);
                 for b in 0..ANALYSIS_BANDS {
                     low_cur[b][slot] = sub[b];
@@ -115,6 +169,10 @@ impl SbrChain {
             }
 
             let sbr_ch = &data.channels[ch];
+            if std::env::var("EC_AAC_SBR_DEBUG").is_ok() {
+                eprintln!("SBRDBG coupling={}", data.coupling);
+                debug_dump(&header, &tables, sbr_ch, ch);
+            }
             let mut hf = sbr_hf::generate(
                 &low_cur,
                 &tables,
@@ -152,7 +210,10 @@ impl SbrChain {
                         v[b] = hf[b - kx][slot];
                     }
                 }
-                let pcm = state.synthesis.process_slot(&v);
+                let mut pcm = state.synthesis.process_slot(&v);
+                for s in &mut pcm {
+                    *s *= crate::decode::OUTPUT_SCALE;
+                }
                 out.extend_from_slice(&pcm);
             }
             *plane = out;

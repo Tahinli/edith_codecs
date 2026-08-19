@@ -127,21 +127,45 @@ fn theta(k: usize, n: usize, bands: usize, omega_step: f64) -> f64 {
     omega_step * (k as f64 + 0.5) * (n as f64 + bands as f64 / 2.0)
 }
 
-/// Precomputes `h[n] * cos(theta(k,n))` and `h[n] * sin(theta(k,n))` for every
-/// `(k, n)` pair, flattened `k`-major: the modulation matrix both banks
-/// multiply their sample window against.
-fn modulation_tables(h: &[f64], bands: usize, omega_step: f64) -> (Vec<f64>, Vec<f64>) {
+/// Precomputes `gain * h[n] * cos(theta(k,n))` and `gain * h[n] *
+/// sin(theta(k,n))` for every `(k, n)` pair, flattened `k`-major: the
+/// modulation matrix both banks multiply their sample window against.
+///
+/// `gain` is each bank's own analytic-tone normalization (see
+/// [`analytic_gain`]): without it a real input tone demodulates to half its
+/// own amplitude (the standard single-sideband factor of a cosine/sine
+/// modulated complex filter), and that same shortfall compounds across the
+/// analysis+synthesis pair -- discovered as a ~100x round-trip amplitude
+/// deficit (correlation-only checks never caught it, since normalized
+/// cross-correlation is scale-invariant) that fed straight into
+/// `sbr_env::adjust`'s `target/current` gain match and produced the SBR
+/// chain's real-file blowup.
+fn modulation_tables(h: &[f64], bands: usize, omega_step: f64, gain: f64) -> (Vec<f64>, Vec<f64>) {
     let len = h.len();
     let mut cos_tab = vec![0.0f64; bands * len];
     let mut sin_tab = vec![0.0f64; bands * len];
     for k in 0..bands {
         for n in 0..len {
             let th = theta(k, n, bands, omega_step);
-            cos_tab[k * len + n] = h[n] * th.cos();
-            sin_tab[k * len + n] = h[n] * th.sin();
+            cos_tab[k * len + n] = gain * h[n] * th.cos();
+            sin_tab[k * len + n] = gain * h[n] * th.sin();
         }
     }
     (cos_tab, sin_tab)
+}
+
+/// The per-bank analytic-tone gain correction: `2 / sum(h)`. A cosine/sine
+/// modulated filter bank demodulates a real input tone to half its
+/// amplitude times the prototype's own DC gain (`sum(h)`, ~1 for a properly
+/// normalized lowpass but not exactly, since the Kaiser window shaves a
+/// little energy off); multiplying the modulation table by this restores
+/// unity gain (a real tone of amplitude `A` in gives subband magnitude `A`
+/// out), which is what makes an analysis-alone reading physically
+/// comparable to the transmitted envelope target, and what makes a
+/// synthesis-alone reading turn a subband value back into the PCM amplitude
+/// it represents.
+fn analytic_gain(h: &[f64]) -> f64 {
+    2.0 / h.iter().sum::<f64>()
 }
 
 /// The 32-band complex analysis QMF bank: core PCM in, complex subband slots
@@ -158,7 +182,8 @@ impl Analysis {
     pub fn new() -> Analysis {
         let omega_step = std::f64::consts::PI / (2.0 * ANALYSIS_BANDS as f64);
         let h = prototype(PROTO_LEN, omega_step, KAISER_BETA);
-        let (cos_tab, sin_tab) = modulation_tables(&h, ANALYSIS_BANDS, omega_step);
+        let gain = analytic_gain(&h);
+        let (cos_tab, sin_tab) = modulation_tables(&h, ANALYSIS_BANDS, omega_step, gain);
         Analysis {
             hist: vec![0.0; PROTO_LEN],
             cos_tab,
@@ -213,7 +238,21 @@ impl Synthesis {
     pub fn new() -> Synthesis {
         let omega_step = std::f64::consts::PI / (2.0 * SYNTHESIS_BANDS as f64);
         let h = prototype(PROTO_LEN, omega_step, KAISER_BETA);
-        let (cos_tab, sin_tab) = modulation_tables(&h, SYNTHESIS_BANDS, omega_step);
+        // `analytic_gain` alone (the same per-tap normalization analysis
+        // uses) undershoots synthesis's own round-trip contribution: unlike
+        // analysis's single dot product over the whole prototype window,
+        // synthesis reconstructs each output sample from an overlap-add of
+        // `PROTO_LEN / SYNTHESIS_BANDS` (10) shifted copies of the
+        // prototype, and this design's windowed prototype does not sum its
+        // polyphase components to a flat constant (no Nyquist-M constraint
+        // was imposed when it was fit) -- so `SYNTH_TRIM` folds in that
+        // remaining overlap-add shortfall, found the same way the phase
+        // convention and `KAISER_BETA` were (searched against the
+        // round-trip amplitude ratio in `round_trip_reconstructs_the_passband`
+        // until it read ~1.0, not just high correlation).
+        const SYNTH_TRIM: f64 = 19.0673;
+        let gain = analytic_gain(&h) * SYNTH_TRIM;
+        let (cos_tab, sin_tab) = modulation_tables(&h, SYNTHESIS_BANDS, omega_step, gain);
         Synthesis {
             out_buf: vec![0.0; PROTO_LEN],
             cos_tab,
@@ -384,7 +423,23 @@ mod tests {
             }
         }
 
-        println!("measured filterbank delay: {best_lag} samples, correlation {best_corr:.6}");
+        // Correlation alone is scale-invariant and would happily pass a
+        // round trip that reconstructs the right shape at the wrong
+        // absolute amplitude (exactly what shipped before `analytic_gain`
+        // and `SYNTH_TRIM`: ~100x too quiet). The SBR gain match downstream
+        // depends on this bank pair being unity-gain, not just
+        // shape-correct, so check the amplitude too.
+        let start2 = (margin as i64 + best_lag) as usize;
+        let window = &out[start2..start2 + ideal_core.len()];
+        let rms = |s: &[f64]| (s.iter().map(|v| v * v).sum::<f64>() / s.len() as f64).sqrt();
+        let amp_ratio = rms(window) / rms(ideal_core);
+        println!(
+            "measured filterbank delay: {best_lag} samples, correlation {best_corr:.6}, amplitude ratio {amp_ratio:.6}"
+        );
+        assert!(
+            (0.98..=1.02).contains(&amp_ratio),
+            "round-trip amplitude ratio {amp_ratio} not within 2% of unity gain"
+        );
         assert!(
             best_corr >= 0.9999,
             "passband correlation {best_corr} below 0.9999 at lag {best_lag}"
@@ -433,6 +488,35 @@ mod tests {
         assert!(
             stopband_db <= -40.0,
             "one-subband-away leakage {stopband_db} dB above the -40 dB bound"
+        );
+    }
+
+    /// (d) Analysis alone must read a real tone's own amplitude back, not
+    /// half of it: the raw subband magnitude this bank produces is what
+    /// `sbr_env::adjust` compares directly against the transmitted envelope
+    /// target (`sbr_chain` never re-normalizes it), so any gain error here
+    /// is exactly the gain error the SBR chain's HF region reconstructs at.
+    #[test]
+    fn analysis_alone_reads_back_the_input_tones_own_amplitude() {
+        let k0 = 10usize;
+        let omega_step = std::f64::consts::PI / (2.0 * ANALYSIS_BANDS as f64);
+        let omega0 = (k0 as f64 + 0.5) * omega_step;
+        let amp = 1.0f64;
+        let x: Vec<f64> = (0..4000).map(|i| amp * (omega0 * i as f64).cos()).collect();
+        let mut analysis = Analysis::new();
+        let mut mags = Vec::new();
+        for slot in x.chunks_exact(ANALYSIS_BANDS) {
+            let mut chunk = [0f32; ANALYSIS_BANDS];
+            for (d, &s) in chunk.iter_mut().zip(slot) {
+                *d = s as f32;
+            }
+            mags.push(analysis.process_slot(&chunk)[k0].norm_sqr().sqrt());
+        }
+        let steady = &mags[mags.len() / 2..];
+        let avg_mag = steady.iter().sum::<f64>() / steady.len() as f64;
+        assert!(
+            (0.98..=1.02).contains(&avg_mag),
+            "band {k0}'s steady-state magnitude {avg_mag} for a unit-amplitude tone should read back ~1.0"
         );
     }
 
