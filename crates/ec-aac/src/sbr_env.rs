@@ -29,10 +29,14 @@
 //! # Gain, limiter, noise, sinusoids
 //!
 //! For every `(envelope, band)` cell this measures the HF estimate's own
-//! average energy over that time/frequency window and scales it toward
-//! the transmitted target; the limiter then caps how far above the
-//! band's own transmitted noise floor that gain is allowed to reach
-//! (`bs_limiter_gains`), noise is mixed in at the transmitted floor, and
+//! average energy over that time/frequency window; the cell's envelope
+//! target is split into a signal share and a noise share via the cell's
+//! `Q_div = dequant_noise(q_q)` ratio (`signal = target/(1+Q_div)`,
+//! `noise = target*Q_div/(1+Q_div)`, round-21 -- `Q_div` is a ratio
+//! relative to the envelope target, not a standalone absolute energy), the
+//! HF estimate is scaled toward the signal share, the limiter caps how far
+//! above the cell's own noise floor that gain is allowed to reach
+//! (`bs_limiter_gains`), the noise share is mixed in at that level, and
 //! flagged bands get an added tone.
 #![allow(clippy::needless_range_loop)]
 
@@ -55,7 +59,13 @@ pub fn dequant_env(e_q: i32, amp_res: u8) -> f64 {
     2f64.powf(alpha(amp_res) * f64::from(e_q))
 }
 
-/// Plain noise-floor dequantization.
+/// Plain noise-floor dequantization: `Q_div = 2^(NOISE_FLOOR_OFFSET-q_q)`, a
+/// ratio relative to the ENVELOPE energy of the same (time, band) cell, not
+/// an absolute energy on its own (round-21: `adjust` splits each cell's
+/// envelope target into `signal = target/(1+Q_div)` and
+/// `noise = target*Q_div/(1+Q_div)`; using this return value as a
+/// standalone absolute energy, as pre-round-21 code did, compares it
+/// against `dequant_env`'s unrelated unit scale).
 pub fn dequant_noise(q_q: i32) -> f64 {
     2f64.powf(NOISE_FLOOR_OFFSET - f64::from(q_q))
 }
@@ -236,6 +246,11 @@ pub fn adjust(
         // frequencies) so both application modes share the exact same gain
         // values.
         let mut gains = Vec::with_capacity(table.len().saturating_sub(1));
+        // (Round-21) Actual per-cell noise energy this envelope/band injects,
+        // parallel to `gains` -- filled below and consumed by the
+        // application loop that follows instead of the old separate
+        // noise-grid pass (see round-21 module doc note).
+        let mut noise_amps = Vec::with_capacity(table.len().saturating_sub(1));
         for b in 0..table.len().saturating_sub(1) {
             let lo = table[b] as usize;
             let hi = table[b + 1] as usize;
@@ -252,12 +267,27 @@ pub fn adjust(
                 }
             }
             let current = if count > 0 { sum / count as f64 } else { 0.0 };
-            let mut gain = (target / current.max(1e-12)).sqrt();
             let q = noise_band_for(tables, lo);
-            let noise_here = noise_row
+            // `dequant_noise` returns `Q_div = 2^(NOISE_FLOOR_OFFSET-q_q)`, a
+            // ratio relative to this cell's OWN envelope target -- not an
+            // absolute energy in the same units as `target` (round-21 Task
+            // 1/2: a reference-decoder q_q sweep at a FIXED envelope target
+            // showed total output power staying nearly flat as q_q swept its
+            // whole range, the signature of `target` being split
+            // `signal=target/(1+Q_div)`, `noise=target*Q_div/(1+Q_div)`
+            // rather than noise being added independently on top of the full
+            // target -- the previous code used `dequant_noise` as an
+            // absolute energy standalone, which for real content's near-1e-7
+            // apparent "fraction" (round-17) was actually comparing two
+            // energies in unrelated unit scales, not a genuinely near-zero
+            // noise contribution).
+            let noise_div = noise_row
                 .and_then(|r| r.get(q).copied())
                 .unwrap_or(0.0)
-                .max(1e-12);
+                .max(0.0);
+            let signal_target = target / (1.0 + noise_div);
+            let noise_here = target - signal_target; // = target*noise_div/(1+noise_div)
+            let mut gain = (signal_target / current.max(1e-12)).sqrt();
             // Cap gain at `limiter_max` times the cell's own
             // noise-plus-signal headroom over its raw HF estimate (Sec
             // 4.6.18.7.5's `limGain * sqrt((Q_M+E_curr)/E_curr)` shape): a
@@ -273,13 +303,14 @@ pub fn adjust(
             gain = gain.min(limiter_max * ((noise_here + cur) / cur).sqrt());
             gain = gain.min(limiter_max * 64.0); // absolute ceiling: never amplify a silent cell to infinity
             gains.push(gain);
+            noise_amps.push((noise_here / (hi - lo).max(1) as f64).sqrt());
             if track_fraction {
                 let slots = (t1.max(0) - t0.max(0)).max(0) as usize;
                 for band in lo..hi {
                     if band < kx {
                         continue;
                     }
-                    accumulate_noise_fraction(band, slots, target, 0.0);
+                    accumulate_noise_fraction(band, slots, signal_target, noise_here);
                 }
             }
         }
@@ -300,6 +331,7 @@ pub fn adjust(
             let lo = table[b] as usize;
             let hi = table[b + 1] as usize;
             let gain = gains[b];
+            let namp = noise_amps[b];
             for band in lo..hi {
                 if band < kx || band - kx >= hf.len() {
                     continue;
@@ -307,6 +339,11 @@ pub fn adjust(
                 let row = &mut hf[band - kx];
                 for slot in t0.max(0) as usize..(t1.max(0) as usize).min(row.len()) {
                     row[slot] = row[slot].scale(gain);
+                    // Consume the RNG unconditionally (matches the pre-round-21
+                    // stream shape) even under EC_AAC_SBR_NOISE_ZERO, which
+                    // only skips the PCM addition, not the bookkeeping.
+                    let n = rng.complex_unit().scale(namp);
+                    row[slot] = row[slot] + if zero_noise { Complex::ZERO } else { n };
                 }
             }
         }
@@ -347,45 +384,14 @@ pub fn adjust(
         }
     }
 
-    // Noise floor last: every target bin gets the transmitted floor for its
-    // noise-time-segment and noise-frequency-band, independent of the
-    // envelope grid (they are different, coarser grids over the same axes).
-    // This must run after the envelope-gain loop above -- gain is computed
-    // from the HF-signal-only estimate and must not also rescale the noise
-    // that lands on top of it (injecting noise first made the gain step
-    // measure signal+noise together and rescale both, which distorts the
-    // noise/signal split by however much noise dominates a given cell -- a
-    // content- and channel-dependent error, not a uniform scale bug).
-    for (ni, (t0, t1)) in ch.t_noise.windows(2).map(|w| (w[0], w[1])).enumerate() {
-        if ni >= noise_energy.len() {
-            break;
-        }
-        for q in 0..tables.n_q {
-            let lo = tables.f_noise[q] as usize;
-            let hi = tables.f_noise[q + 1] as usize;
-            let energy = noise_energy[ni].get(q).copied().unwrap_or(0.0);
-            let amp = (energy / (hi - lo).max(1) as f64).sqrt();
-            if track_fraction {
-                let slots = (t1.max(0) - t0.max(0)).max(0) as usize;
-                for band in lo..hi {
-                    if band < kx {
-                        continue;
-                    }
-                    accumulate_noise_fraction(band, slots, 0.0, amp * amp);
-                }
-            }
-            for band in lo..hi {
-                if band < kx || band - kx >= hf.len() {
-                    continue;
-                }
-                let row = &mut hf[band - kx];
-                for slot in t0.max(0) as usize..(t1.max(0) as usize).min(row.len()) {
-                    let n = rng.complex_unit().scale(amp);
-                    row[slot] = row[slot] + if zero_noise { Complex::ZERO } else { n };
-                }
-            }
-        }
-    }
+    // (Round-21) Noise is now injected inside the envelope-gain loop above,
+    // per (envelope, band) cell using each cell's own `signal_target`/
+    // `noise_here` split -- the noise grid is coarser than the envelope
+    // grid but every envelope cell resolves its own noise band via
+    // `noise_band_for`/`noise_row`, so this covers the same ground the old
+    // separate noise-grid pass did, consistently with the gain that was
+    // computed for the same cell (previously the two were split across
+    // unrelated unit scales; see the comment at `noise_div` above).
 }
 
 fn noise_band_for(tables: &BandTables, low_band: usize) -> usize {
@@ -499,7 +505,11 @@ mod tests {
             add_harmonic: None,
         };
         let env_energy = vec![vec![1.0e6f64; tables.n_low]];
-        let noise_energy = vec![vec![1e-3f64; tables.n_q]];
+        // (Round-21) noise_energy is now a Q_div ratio against the cell's
+        // own envelope target, not a standalone absolute energy -- zero
+        // keeps this test focused on the signal-gain limiter it names, not
+        // noise injection.
+        let noise_energy = vec![vec![0.0f64; tables.n_q]];
         let mut rng = NoiseGen::new(1);
         adjust(
             &mut hf,
