@@ -152,30 +152,6 @@ pub fn adjust(
     let kx = tables.kx as usize;
     let limiter_max = LIMITER_FACTOR[usize::from(header.limiter_gains).min(3)];
 
-    // Noise floor first: every target bin gets the transmitted floor for
-    // its noise-time-segment and noise-frequency-band, independent of the
-    // envelope grid (they are different, coarser grids over the same axes).
-    for (ni, (t0, t1)) in ch.t_noise.windows(2).map(|w| (w[0], w[1])).enumerate() {
-        if ni >= noise_energy.len() {
-            break;
-        }
-        for q in 0..tables.n_q {
-            let lo = tables.f_noise[q] as usize;
-            let hi = tables.f_noise[q + 1] as usize;
-            let energy = noise_energy[ni].get(q).copied().unwrap_or(0.0);
-            let amp = (energy / (hi - lo).max(1) as f64).sqrt();
-            for band in lo..hi {
-                if band < kx || band - kx >= hf.len() {
-                    continue;
-                }
-                let row = &mut hf[band - kx];
-                for slot in t0.max(0) as usize..(t1.max(0) as usize).min(row.len()) {
-                    row[slot] = row[slot] + rng.complex_unit().scale(amp);
-                }
-            }
-        }
-    }
-
     // Gain toward the transmitted envelope, per (envelope, band) cell,
     // limited relative to that cell's own noise floor.
     for (ei, (t0, t1)) in ch.t_env.windows(2).map(|w| (w[0], w[1])).enumerate() {
@@ -266,6 +242,36 @@ pub fn adjust(
                     for slot in t0.max(0) as usize..(t1.max(0) as usize).min(row.len()) {
                         row[slot] = row[slot] + Complex::new(amp, 0.0);
                     }
+                }
+            }
+        }
+    }
+
+    // Noise floor last: every target bin gets the transmitted floor for its
+    // noise-time-segment and noise-frequency-band, independent of the
+    // envelope grid (they are different, coarser grids over the same axes).
+    // This must run after the envelope-gain loop above -- gain is computed
+    // from the HF-signal-only estimate and must not also rescale the noise
+    // that lands on top of it (injecting noise first made the gain step
+    // measure signal+noise together and rescale both, which distorts the
+    // noise/signal split by however much noise dominates a given cell -- a
+    // content- and channel-dependent error, not a uniform scale bug).
+    for (ni, (t0, t1)) in ch.t_noise.windows(2).map(|w| (w[0], w[1])).enumerate() {
+        if ni >= noise_energy.len() {
+            break;
+        }
+        for q in 0..tables.n_q {
+            let lo = tables.f_noise[q] as usize;
+            let hi = tables.f_noise[q + 1] as usize;
+            let energy = noise_energy[ni].get(q).copied().unwrap_or(0.0);
+            let amp = (energy / (hi - lo).max(1) as f64).sqrt();
+            for band in lo..hi {
+                if band < kx || band - kx >= hf.len() {
+                    continue;
+                }
+                let row = &mut hf[band - kx];
+                for slot in t0.max(0) as usize..(t1.max(0) as usize).min(row.len()) {
+                    row[slot] = row[slot] + rng.complex_unit().scale(amp);
                 }
             }
         }

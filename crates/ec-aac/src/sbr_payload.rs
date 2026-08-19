@@ -320,6 +320,11 @@ impl SbrParser {
                 row[b] = row[b - 1] + delta;
             }
         }
+        if std::env::var("EC_AAC_SBR_ENV_DEBUG").is_ok() {
+            eprintln!(
+                "ENVDBG dt={dt} balance={balance} amp_res={amp_res} bands={bands} prev={prev:?} row={row:?}"
+            );
+        }
         Ok(row)
     }
 
