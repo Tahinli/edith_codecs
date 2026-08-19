@@ -512,13 +512,25 @@ impl SbrParser {
             }
         }
 
-        let mut channels = Vec::with_capacity(n_channels);
-        for ch in 0..n_channels {
+        // sbr_channel_pair_element's envelope/noise interleave depends on
+        // bs_coupling: the COUPLED form reads sbr_envelope(ch)/sbr_noise(ch)
+        // interleaved per channel (env0,noise0,env1,noise1), but the
+        // UNCOUPLED form reads two separate per-channel passes --
+        // sbr_envelope(ch=0), sbr_envelope(ch=1), sbr_noise(ch=0),
+        // sbr_noise(ch=1). Reading the uncoupled form interleaved (as a
+        // single per-channel loop) is order-invariant in total bit count (so
+        // a byte-accounting oracle can't see the mistake) but desyncs every
+        // field after the first channel's envelopes whenever the two
+        // channels' envelope (6/7-bit) and noise (5-bit) field counts
+        // differ, which round-11 pinned to ch1's second envelope.
+        let separated = is_cpe && !coupling && n_channels == 2;
+        let mut e_q_all: Vec<Vec<Vec<i32>>> = vec![Vec::new(); n_channels];
+        let mut q_q_all: Vec<Vec<Vec<i32>>> = vec![Vec::new(); n_channels];
+
+        let mut read_env = |this: &mut Self, r: &mut BitReader, ch: usize| -> Result<()> {
             let balance = is_cpe && coupling && ch == 1;
             let num_env = grids[ch].num_env;
-            let num_noise = if num_env == 1 { 1 } else { 2 };
             let amp_res = amp_res_of(header.amp_res, num_env);
-
             let mut e_q: Vec<Vec<i32>> = Vec::with_capacity(num_env);
             for i in 0..num_env {
                 let bands = if grids[ch].freq_res[i] != 0 {
@@ -530,23 +542,55 @@ impl SbrParser {
                 let prev: &[i32] = if i > 0 {
                     &e_q[i - 1]
                 } else {
-                    &self.state[ch].last_env
+                    &this.state[ch].last_env
                 };
-                let row = self.decode_envelope(r, bands, dt, balance, amp_res, prev)?;
+                let row = this.decode_envelope(r, bands, dt, balance, amp_res, prev)?;
                 e_q.push(row);
             }
-
+            e_q_all[ch] = e_q;
+            Ok(())
+        };
+        if separated {
+            for ch in 0..n_channels {
+                read_env(self, r, ch)?;
+            }
+        }
+        let mut read_noise = |this: &mut Self, r: &mut BitReader, ch: usize| -> Result<()> {
+            let balance = is_cpe && coupling && ch == 1;
+            let num_env = grids[ch].num_env;
+            let num_noise = if num_env == 1 { 1 } else { 2 };
             let mut q_q: Vec<Vec<i32>> = Vec::with_capacity(num_noise);
             for i in 0..num_noise {
                 let dt = df_noise[ch][i];
                 let prev: &[i32] = if i > 0 {
                     &q_q[i - 1]
                 } else {
-                    &self.state[ch].last_noise
+                    &this.state[ch].last_noise
                 };
-                let row = self.decode_noise(r, tables.n_q, dt, balance, prev)?;
+                let row = this.decode_noise(r, tables.n_q, dt, balance, prev)?;
                 q_q.push(row);
             }
+            q_q_all[ch] = q_q;
+            Ok(())
+        };
+        if separated {
+            for ch in 0..n_channels {
+                read_noise(self, r, ch)?;
+            }
+        } else {
+            for ch in 0..n_channels {
+                read_env(self, r, ch)?;
+                read_noise(self, r, ch)?;
+            }
+        }
+
+        let mut channels = Vec::with_capacity(n_channels);
+        for ch in 0..n_channels {
+            let balance = is_cpe && coupling && ch == 1;
+            let num_env = grids[ch].num_env;
+            let amp_res = amp_res_of(header.amp_res, num_env);
+            let e_q = e_q_all[ch].clone();
+            let q_q = q_q_all[ch].clone();
 
             // Containment, not the fix: a still-undiscovered desync could
             // make a DT delta huge, and since a following frame's DT reads
@@ -623,7 +667,7 @@ mod tests {
     const VARVAR_DF_BITS: u64 = 77;
     const FIXFIX_DT_BODY: &[u8] = &[0x90, 0x31, 0xd8, 0xb0, 0x95, 0x78, 0x00, 0x00];
     const FIXFIX_DT_BITS: u64 = 57;
-    const CPE_UNCOUPLED_BODY: &[u8] = &[0x90, 0x31, 0xd8, 0xb0, 0x00, 0x05, 0x78, 0x07, 0x80, 0x00];
+    const CPE_UNCOUPLED_BODY: &[u8] = &[0x90, 0x31, 0xd8, 0xb0, 0x00, 0x05, 0x78, 0xf0, 0x00, 0x00];
     const CPE_UNCOUPLED_BITS: u64 = 75;
     const EXTENSION_BODY: &[u8] = &[0x90, 0x31, 0xd8, 0xb0, 0x05, 0xe0, 0x11, 0x00];
     const EXTENSION_BITS: u64 = 64;
