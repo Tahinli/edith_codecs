@@ -891,8 +891,16 @@ def values_config(kind, sf_index=7):
     element = "cpe" if balance else "sce"
     if kind.endswith("_F"):
         if is_env:
-            over = dict(element=element, coupling=1, num_env=1, amp_res=amp_res,
-                        df_env=[0] * 8, df_noise=[0, 0], freq_res=1)
+            if amp_res:
+                # `amp_res_of` forces the 1.5 dB resolution whenever there is
+                # only one envelope, so a lone envelope can never carry the
+                # 3 dB book: a second envelope (T-coded, already closed) has
+                # to ride along to keep the resolution at 3 dB.
+                over = dict(element=element, coupling=1, num_env=2, amp_res=1,
+                            df_env=[0, 1] + [0] * 6, df_noise=[0, 0], freq_res=1)
+            else:
+                over = dict(element=element, coupling=1, num_env=1, amp_res=amp_res,
+                            df_env=[0] * 8, df_noise=[0, 0], freq_res=1)
             found = find_config(sf_index, over, n_high=2, n_q=1)
             key, width = ("env0b" if balance else "env0"), RAW_ENV[(1 if balance else 0, amp_res)]
         else:
@@ -945,17 +953,24 @@ def book_values(oracle, kind, cfg, tables, key, width, scale, books):
     seen = {}
     crashed = set()
     clean = set()
-    for (length, code, raw), (_n, err) in zip(meta, got):
+    for (length, code, raw), (v, t, w), (n, err) in zip(meta, cases, got):
         m = pat.search(err)
         if not m:
             # Not a range-check complaint: either a clean decode (only the
             # routine byte-count line) or the parser aborting the element for
             # an unrelated reason -- only the former licenses the "both ends
-            # valid" inference below, so the two are told apart here.
-            if "is not allocated" in err or "Invalid data found" in err:
-                crashed.add((length, code))
-            else:
+            # valid" inference below, so the two are told apart here. The
+            # "channel element 0.1 is not allocated" complaint fires on every
+            # mono probe regardless of whether the codeword itself was in
+            # range (the reference decoder treats HE-AAC mono as implicit
+            # stereo and always misses the second channel element), so it
+            # carries no information; the byte count the parser actually
+            # consumed against the full predicted frame length is the real
+            # discriminator -- an undershoot is a genuine early abort.
+            if n == predicted(v, t, w):
                 clean.add((length, code))
+            else:
+                crashed.add((length, code))
             continue
         val = int(m.group(1))
         if raw == 0:
