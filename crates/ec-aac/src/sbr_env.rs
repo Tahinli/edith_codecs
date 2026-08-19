@@ -144,6 +144,48 @@ impl NoiseGen {
 
 const LIMITER_FACTOR: [f64; 4] = [1.4125, 2.0, 4.0, 1.0e6]; // 1.5/3/6 dB, "no limit"
 
+/// (Round-17, Task 1 conviction check) Accumulates transmitted signal vs.
+/// noise energy per absolute QMF band across every [`adjust`] call in the
+/// process, weighted by how many QMF slots each contributes, when
+/// `EC_AAC_SBR_NOISE_FRACTION_DEBUG` is set. [`noise_fraction_table`] reads
+/// it back; both are no-ops (empty table) otherwise, so this costs nothing
+/// on the normal path.
+static NOISE_FRACTION_STATS: std::sync::OnceLock<std::sync::Mutex<Vec<(f64, f64)>>> =
+    std::sync::OnceLock::new();
+
+fn noise_fraction_debug() -> bool {
+    std::env::var("EC_AAC_SBR_NOISE_FRACTION_DEBUG").is_ok()
+}
+
+/// `(band, signal_energy_sum, noise_energy_sum)` for every band that
+/// accumulated anything, both sums slot-count-weighted.
+pub fn noise_fraction_table() -> Vec<(usize, f64, f64)> {
+    let Some(stats) = NOISE_FRACTION_STATS.get() else {
+        return Vec::new();
+    };
+    stats
+        .lock()
+        .unwrap()
+        .iter()
+        .enumerate()
+        .filter(|&(_, &(s, n))| s + n > 0.0)
+        .map(|(b, &(s, n))| (b, s, n))
+        .collect()
+}
+
+fn accumulate_noise_fraction(band: usize, slots: usize, signal: f64, noise: f64) {
+    if slots == 0 {
+        return;
+    }
+    let stats = NOISE_FRACTION_STATS.get_or_init(|| std::sync::Mutex::new(vec![(0.0, 0.0); 256]));
+    let mut g = stats.lock().unwrap();
+    if band >= g.len() {
+        g.resize(band + 1, (0.0, 0.0));
+    }
+    g[band].0 += signal * slots as f64;
+    g[band].1 += noise * slots as f64;
+}
+
 /// Applies envelope adjustment in place to `hf` (`[target band 0-based
 /// from kx][slot]`, as [`crate::sbr_hf::generate`] returns it): gain
 /// toward `env_energy`, the transmitted noise floor from `noise_energy`,
@@ -160,6 +202,13 @@ pub fn adjust(
 ) {
     let kx = tables.kx as usize;
     let limiter_max = LIMITER_FACTOR[usize::from(header.limiter_gains).min(3)];
+    let track_fraction = noise_fraction_debug();
+    // (Round-17, Task 1 corroboration) zeroes our injected noise so the
+    // sweep's measured correlation can be checked against the
+    // signal-only ceiling `noise_fraction_table` predicts, without
+    // touching the transmitted noise ENERGY bookkeeping above (only the
+    // actual PCM addition is skipped).
+    let zero_noise = std::env::var("EC_AAC_SBR_NOISE_ZERO").is_ok();
 
     // Gain toward the transmitted envelope, per (envelope, band) cell,
     // limited relative to that cell's own noise floor.
@@ -224,6 +273,15 @@ pub fn adjust(
             gain = gain.min(limiter_max * ((noise_here + cur) / cur).sqrt());
             gain = gain.min(limiter_max * 64.0); // absolute ceiling: never amplify a silent cell to infinity
             gains.push(gain);
+            if track_fraction {
+                let slots = (t1.max(0) - t0.max(0)).max(0) as usize;
+                for band in lo..hi {
+                    if band < kx {
+                        continue;
+                    }
+                    accumulate_noise_fraction(band, slots, target, 0.0);
+                }
+            }
         }
         // `bs_interpol_freq` (per-subband linear interpolation of these sfb
         // gains, Sec 4.6.18.7.6) was tried here: a centre-frequency lerp
@@ -307,13 +365,23 @@ pub fn adjust(
             let hi = tables.f_noise[q + 1] as usize;
             let energy = noise_energy[ni].get(q).copied().unwrap_or(0.0);
             let amp = (energy / (hi - lo).max(1) as f64).sqrt();
+            if track_fraction {
+                let slots = (t1.max(0) - t0.max(0)).max(0) as usize;
+                for band in lo..hi {
+                    if band < kx {
+                        continue;
+                    }
+                    accumulate_noise_fraction(band, slots, 0.0, amp * amp);
+                }
+            }
             for band in lo..hi {
                 if band < kx || band - kx >= hf.len() {
                     continue;
                 }
                 let row = &mut hf[band - kx];
                 for slot in t0.max(0) as usize..(t1.max(0) as usize).min(row.len()) {
-                    row[slot] = row[slot] + rng.complex_unit().scale(amp);
+                    let n = rng.complex_unit().scale(amp);
+                    row[slot] = row[slot] + if zero_noise { Complex::ZERO } else { n };
                 }
             }
         }
