@@ -663,7 +663,13 @@ BAD_VALUE = re.compile(r"is invalid|out of range|overflow|SBR reset failed")
 # survives both ends of its table (0 and 30 are the limits the tool enforces),
 # so both ends are tried and the probe it does not refuse is the one that
 # measured something.
-RAW_TRIES = [(0, 16), (30, 16), (0, 0), (30, 30)]
+# A balance value is checked doubled (a coupled channel's noise floor is the
+# base channel's combined with the ratio the balance value codes), so 16 -- the
+# middle of the raw field -- can already read as 32 and refuse on its own,
+# before the codeword under test ever contributes: the extra, smaller-magnitude
+# pairs are the fallback once that is observed (`exact_bits` requires a sane
+# 1..32 answer, not just an unrefused one).
+RAW_TRIES = [(0, 16), (30, 16), (0, 0), (30, 30), (8, 8), (0, 8), (8, 0)]
 
 
 def as_bits(length, code):
@@ -756,7 +762,7 @@ def exact_bits(oracle, cfg, tables, kind, word, books):
                 break
             top = 8 * n - 4 - base + (trailing if BAD_VALUE.search(err) else 0)
             lo, hi = max(lo, top - 7), min(hi, top)
-        if not bad and lo == hi:
+        if not bad and lo == hi and 1 <= lo <= 32:
             return lo
     return None
 
@@ -852,6 +858,223 @@ def stage_books(oracle, sf_index=7, only=None, books=None):
         out[kind] = books[kind] = codes
     return out
 
+
+# -------------------------------------------------------------- values stage
+
+# `env_facs_q`/`noise_facs_q` are the reference decoder's own accumulated
+# scalefactor: it prints the value it computed the instant that value leaves
+# the valid range, which is `raw + delta` for a plain codebook or, measured
+# below, `2 * (raw + delta)` for a balance one (the coupled channel's value is
+# reconstructed from double the coded ratio). Placing the codeword under test
+# at `raw = 0` and at the field's own maximum brackets every delta the ten
+# tables carry: a delta that overflows high is read straight off the
+# maximum-raw probe, a delta that overflows low wraps through the decoder's
+# own byte-sized accumulator and is read off the zero-raw probe once
+# unwrapped -- the write-up above is what pins the wrap width at 256 and the
+# scale at 1 or 2, not an assumption.
+VALUE_RE_CACHE = {}
+
+
+def value_re(field):
+    if field not in VALUE_RE_CACHE:
+        VALUE_RE_CACHE[field] = re.compile(rf"{field} (-?\d+) is invalid")
+    return VALUE_RE_CACHE[field]
+
+
+def values_config(kind, sf_index=7):
+    """A config in which `kind` carries exactly one codeword, plus the raw
+    field/width/scale that codeword's delta is read against."""
+    balance = kind.startswith("ENVB") or kind.startswith("NOISEB")
+    is_env = kind.startswith("ENV")
+    amp_res = 1 if "30" in kind else 0
+    scale = 2 if balance else 1
+    element = "cpe" if balance else "sce"
+    if kind.endswith("_F"):
+        if is_env:
+            over = dict(element=element, coupling=1, num_env=1, amp_res=amp_res,
+                        df_env=[0] * 8, df_noise=[0, 0], freq_res=1)
+            found = find_config(sf_index, over, n_high=2, n_q=1)
+            key, width = ("env0b" if balance else "env0"), RAW_ENV[(1 if balance else 0, amp_res)]
+        else:
+            over = dict(element=element, coupling=1, num_env=1, amp_res=0,
+                        df_env=[0] * 8, df_noise=[0, 0], freq_res=0)
+            found = find_config(sf_index, over, n_q=2)
+            key, width = ("noise0b" if balance else "noise0"), RAW_NOISE
+        if found is None:
+            return None
+        cfg, tables = found
+    else:
+        found = recipe_config(kind, sf_index)
+        if found is None:
+            return None
+        cfg, tables = found
+        if is_env:
+            key, width = ("env0b" if balance else "env0"), RAW_ENV[(1 if balance else 0, amp_res_of(cfg))]
+        else:
+            key, width = ("noise0b" if balance else "noise0"), RAW_NOISE
+    kinds, _ = plan(cfg, tables)
+    if kinds.count(kind) != 1:
+        return None
+    return cfg, tables, key, width, scale
+
+
+def book_values(oracle, kind, cfg, tables, key, width, scale, books):
+    """`{(length, code): delta}` for every codeword `stage_books` found."""
+    codes = sorted(books[kind])
+    raw_max = (1 << width) - 1
+    field = "env_facs_q" if kind.startswith("ENV") else "noise_facs_q"
+    pat = value_re(field)
+    cases, meta = [], []
+    for length, code in codes:
+        # The exact codeword, no trailing pad: `stage_books` already closed the
+        # length for every codeword here, so (unlike the length-search bisection,
+        # which pads because the length is what it is looking for) padding would
+        # only shift every field after this slot and desync the frame.
+        word = as_bits(length, code)
+        words = fill_words(cfg, tables, kind, word, books, extra=0)
+        if words is None:
+            continue
+        for raw in (0, raw_max):
+            v = dict(cfg)
+            arr = list(v[key])
+            arr[0] = raw
+            v[key] = arr
+            cases.append((v, tables, words))
+            meta.append((length, code, raw))
+    got = measure(oracle, cases)
+    seen = {}
+    crashed = set()
+    clean = set()
+    for (length, code, raw), (_n, err) in zip(meta, got):
+        m = pat.search(err)
+        if not m:
+            # Not a range-check complaint: either a clean decode (only the
+            # routine byte-count line) or the parser aborting the element for
+            # an unrelated reason -- only the former licenses the "both ends
+            # valid" inference below, so the two are told apart here.
+            if "is not allocated" in err or "Invalid data found" in err:
+                crashed.add((length, code))
+            else:
+                clean.add((length, code))
+            continue
+        val = int(m.group(1))
+        if raw == 0:
+            v = val % 256
+            if v > 128:
+                v -= 256
+            if v % scale:
+                continue
+            delta = v // scale
+        else:
+            if val % scale:
+                continue
+            delta = val // scale - raw
+        seen.setdefault((length, code), set()).add(delta)
+    values, gaps = {}, []
+    for length, code in codes:
+        vs = seen.get((length, code))
+        if not vs:
+            if (length, code) in clean and (length, code) not in crashed:
+                # Neither end complained and neither crashed either: the
+                # codeword's delta and the raw value it rides with both
+                # stayed inside `[0, raw_max]`, which only `delta = 0` can do
+                # at *both* ends of the field at once.
+                values[(length, code)] = 0
+            else:
+                gaps.append((length, code, "crashed" if (length, code) in crashed else "no signal"))
+            continue
+        if len(vs) > 1:
+            gaps.append((length, code, vs))
+            continue
+        values[(length, code)] = next(iter(vs))
+    return values, gaps
+
+
+def stage_values(oracle, books, sf_index=7):
+    """Assigns the delta value every codeword of every closed book carries."""
+    values = {}
+    for kind in KINDS:
+        if kind not in books:
+            print(f"  {kind}: no lengths, skipped")
+            continue
+        made = values_config(kind, sf_index)
+        if made is None:
+            print(f"  {kind}: no single-codeword configuration for values")
+            continue
+        cfg, tables, key, width, scale = made
+        vals, gaps = book_values(oracle, kind, cfg, tables, key, width, scale, books)
+        if gaps:
+            print(f"  {kind}: {len(gaps)}/{len(books[kind])} codewords unresolved: {gaps[:5]}")
+        if len(vals) == len(books[kind]):
+            values[kind] = vals
+            lo, hi = min(vals.values()), max(vals.values())
+            print(f"  {kind}: {len(vals)} values, range {lo}..{hi}")
+        else:
+            print(f"  {kind}: incomplete ({len(vals)}/{len(books[kind])}), not emitted")
+    return values
+
+
+def write_rust(books, values, path=None):
+    """Emits the closed, fully-valued books as `crates/ec-aac/src/sbr_tables.rs`."""
+    path = path or os.path.join(ROOT, "crates", "ec-aac", "src", "sbr_tables.rs")
+    ready = [k for k in KINDS if k in books and k in values and len(values[k]) == len(books[k])]
+    skipped = [k for k in KINDS if k not in ready]
+    lines = [
+        "//! SBR (HE-AAC v1) Huffman codebooks (ISO/IEC 14496-3 §4.6.18.3.6).",
+        "//!",
+        "//! Derived black box from a reference decoder's own bit accounting by",
+        "//! `scripts/aac-tables/sbrtables.py`: no source was consulted. The",
+        "//! decoder's \"Expected to read N SBR bytes actually read M\" complaint",
+        "//! reads codeword lengths off a controlled FIL payload, and its",
+        "//! `env_facs_q`/`noise_facs_q` range check reads the delta value each",
+        "//! codeword carries off the same payload. Every table here closed with",
+        "//! a Kraft sum of exactly 1 (asserted below).",
+        "#![allow(dead_code)]",
+        "",
+    ]
+    if skipped:
+        lines.append(f"// Not emitted (values incomplete or book did not close): {skipped}")
+        lines.append("")
+    for kind in ready:
+        codes = sorted(books[kind])
+        vals = values[kind]
+        lines.append(f"/// SBR Huffman book `{kind}`: (length, code, delta) by codeword.")
+        lines.append(f"pub(crate) static {kind}: [(u8, u32, i32); {len(codes)}] = [")
+        for length, code in codes:
+            lines.append(f"    ({length}, {code}, {vals[(length, code)]}),")
+        lines.append("];")
+        lines.append("")
+    lines.append("#[cfg(test)]")
+    lines.append("mod tests {")
+    lines.append("    use super::*;")
+    lines.append("")
+    lines.append("    fn kraft_is_one(codes: &[(u8, u32, i32)]) {")
+    lines.append("        let sum: f64 = codes.iter().map(|&(l, _, _)| 2f64.powi(-(l as i32))).sum();")
+    lines.append("        assert!((sum - 1.0).abs() < 1e-9, \"Kraft sum {sum}\");")
+    lines.append("    }")
+    lines.append("")
+    lines.append("    fn is_prefix_free(codes: &[(u8, u32, i32)]) {")
+    lines.append("        for (i, &(li, ci, _)) in codes.iter().enumerate() {")
+    lines.append("            for &(lj, cj, _) in codes.iter().skip(i + 1) {")
+    lines.append("                let (short, long) = if li <= lj { (li, lj) } else { (lj, li) };")
+    lines.append("                let (sc, lc) = if li <= lj { (ci, cj) } else { (cj, ci) };")
+    lines.append("                assert_ne!(sc, lc >> (long - short), \"{ci:?} prefixes {cj:?}\");")
+    lines.append("            }")
+    lines.append("        }")
+    lines.append("    }")
+    lines.append("")
+    for kind in ready:
+        lines.append("    #[test]")
+        lines.append(f"    fn {kind.lower()}_is_a_complete_prefix_code() {{")
+        lines.append(f"        kraft_is_one(&{kind});")
+        lines.append(f"        is_prefix_free(&{kind});")
+        lines.append("    }")
+        lines.append("")
+    lines.append("}")
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"wrote {path}: {len(ready)} books, {len(skipped)} skipped")
+    return ready, skipped
 
 
 # ---------------------------------------------------------------- raw widths
@@ -1120,6 +1343,21 @@ def stage_diag(oracle):
     print(f"diag: {total - disagree}/{total} headers agree on n_master")
 
 
+def run_books_to_fixpoint(oracle, sf_index=7):
+    """Repeats `stage_books` until no further kind closes, honoring the
+    dependency order `stage_books` itself discovers via its `missing` check."""
+    books = {}
+    remaining = set(KINDS)
+    while remaining:
+        made = stage_books(oracle, sf_index, only=remaining, books=books)
+        if not made:
+            break
+        remaining -= set(made)
+    if remaining:
+        print(f"books: did not close: {sorted(remaining)}")
+    return books
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--stage", default="sweep")
@@ -1131,6 +1369,16 @@ if __name__ == "__main__":
             stage_sweep(oracle)
         if args.stage == "diag":
             stage_diag(oracle)
+        if args.stage == "k0":
+            stage_k0(oracle)
+        if args.stage in ("widths", "all"):
+            stage_widths(oracle)
+        books = None
+        if args.stage in ("books", "values", "all"):
+            books = run_books_to_fixpoint(oracle)
+        if args.stage in ("values", "all"):
+            values = stage_values(oracle, books)
+            write_rust(books, values)
     finally:
         oracle.save()
         print(f"oracle: {oracle.runs} decoder runs, {oracle.hits} cache hits")
