@@ -27,7 +27,7 @@ fn debug_dump(
         return;
     }
     eprintln!(
-        "SBRDBG frame {n} ch{ch_idx}: amp_res={} kx={} k2={} n_low={} n_high={} n_q={} t_env={:?} freq_res={:?} t_noise={:?}",
+        "SBRDBG frame {n} ch{ch_idx}: amp_res={} kx={} k2={} n_low={} n_high={} n_q={} t_env={:?} freq_res={:?} t_noise={:?} f_high={:?} patches={:?}",
         header.amp_res,
         tables.kx,
         tables.k2,
@@ -36,7 +36,9 @@ fn debug_dump(
         tables.n_q,
         ch.t_env,
         ch.freq_res,
-        ch.t_noise
+        ch.t_noise,
+        tables.f_high,
+        crate::sbr_hf::build_patches(tables),
     );
     for (i, row) in ch.e_q.iter().enumerate() {
         let (mn, mx) = row
@@ -378,5 +380,84 @@ mod tests {
                 "ch{ch} junction delta {junction_delta} far exceeds steady-state delta {typical} -- AU-boundary discontinuity"
             );
         }
+    }
+
+    /// Round-13 stitching verdict (queue item 1): the QMF filterbank pair
+    /// underneath the low band (`0..kx`, `apply_data` copies
+    /// `raw[slot][0..kx]` straight from `Analysis` into `Synthesis`, no
+    /// envelope/HF touch) must give BIT-IDENTICAL output whether its
+    /// `process_slot` calls arrive chunked AU-by-AU (32 slots per call,
+    /// matching a real 1024-sample core frame) or as one continuous run --
+    /// `Analysis`/`Synthesis`'s own history/overlap-add state carries
+    /// between calls regardless of how the caller groups them, so the
+    /// SAME sample sequence fed either way must produce the SAME output.
+    /// (An earlier version of this test drove it through `SbrChain::apply`
+    /// with one AU-sized `SbrData` grid reused for a 10-AU-long "continuous"
+    /// call; that showed a large divergence, but the divergence was a test
+    /// bug, not a real one: `sbr_env::adjust`'s envelope gain is grid-scoped
+    /// to `ch.t_env`'s own 32-slot range, so a 320-slot call only gain-
+    /// adjusted its first AU's worth and left the other nine raw --
+    /// `apply_data` is inherently one-AU-per-call by design, so the
+    /// meaningful comparison is at the QMF layer these AU-sized calls sit
+    /// on top of, not by force-feeding it a multi-AU span it was never
+    /// meant to take in one call.)
+    #[test]
+    fn ten_aus_worth_of_qmf_slots_chained_per_au_are_bit_identical_to_one_continuous_pass() {
+        let mut rng = 0x02f6_e2b1_u64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            (rng >> 11) as f64 / (1u64 << 53) as f64 - 0.5
+        };
+        let all_samples: Vec<f32> = (0..10 * 1024).map(|_| next() as f32 * 0.3).collect();
+
+        // (a) Per-AU: a fresh 32-slot chunk fed to the SAME persistent
+        // Analysis/Synthesis pair per call, as `apply_data` drives it once
+        // per access unit.
+        let mut analysis_a = Analysis::new();
+        let mut synthesis_a = Synthesis::new();
+        let mut per_au_out: Vec<f32> = Vec::new();
+        for au in all_samples.chunks(1024) {
+            for slot in au.chunks_exact(ANALYSIS_BANDS) {
+                let mut chunk = [0f32; ANALYSIS_BANDS];
+                chunk.copy_from_slice(slot);
+                let sub = analysis_a.process_slot(&chunk);
+                let mut v = [Complex::ZERO; SYNTHESIS_BANDS];
+                v[0..ANALYSIS_BANDS].copy_from_slice(&sub);
+                per_au_out.extend(synthesis_a.process_slot(&v));
+            }
+        }
+
+        // (b) One continuous pass over the same samples, same bank pair,
+        // just not grouped into per-AU calls.
+        let mut analysis_b = Analysis::new();
+        let mut synthesis_b = Synthesis::new();
+        let mut continuous_out: Vec<f32> = Vec::new();
+        for slot in all_samples.chunks_exact(ANALYSIS_BANDS) {
+            let mut chunk = [0f32; ANALYSIS_BANDS];
+            chunk.copy_from_slice(slot);
+            let sub = analysis_b.process_slot(&chunk);
+            let mut v = [Complex::ZERO; SYNTHESIS_BANDS];
+            v[0..ANALYSIS_BANDS].copy_from_slice(&sub);
+            continuous_out.extend(synthesis_b.process_slot(&v));
+        }
+
+        assert_eq!(per_au_out.len(), continuous_out.len());
+        let mut max_diff = 0.0f32;
+        let mut diverging = 0usize;
+        for (a, b) in per_au_out.iter().zip(&continuous_out) {
+            let d = (a - b).abs();
+            if d != 0.0 {
+                diverging += 1;
+            }
+            max_diff = max_diff.max(d);
+        }
+        let total = per_au_out.len();
+        println!("stitching check: {diverging}/{total} samples differ, max abs diff {max_diff:e}");
+        assert!(
+            max_diff < 1e-5,
+            "per-AU chaining and one continuous pass diverge by {max_diff:e} -- a real QMF stitching bug"
+        );
     }
 }

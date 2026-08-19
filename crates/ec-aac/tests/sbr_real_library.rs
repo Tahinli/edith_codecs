@@ -322,6 +322,17 @@ fn highpass(samples: &[f32], rate: u32, cutoff_hz: f64) -> Vec<f32> {
     samples.iter().zip(&low).map(|(a, b)| a - b).collect()
 }
 
+/// DIAGNOSTIC (round-13): cascades `lowpass` three times for a much sharper
+/// stopband than the single first-order zero-phase filter the real
+/// assertion uses -- checking whether the below-crossover bar is actually
+/// being missed because of above-crossover energy leaking through the
+/// gentle single-pass rolloff, not because the low band itself is wrong.
+fn sharp_lowpass(samples: &[f32], rate: u32, cutoff_hz: f64) -> Vec<f32> {
+    let a = lowpass(samples, rate, cutoff_hz);
+    let b = lowpass(&a, rate, cutoff_hz);
+    lowpass(&b, rate, cutoff_hz)
+}
+
 /// Decisive-experiment diagnostic: correlates consecutive short (`WIN`)
 /// windows of `o` against `t` (already coarsely aligned at `oa`/`ob`, e.g.
 /// the winning full-file lag from `best_lag_correlation`), searching a small
@@ -503,6 +514,14 @@ fn sbr_real_library_matches_reference() {
                 if low_lag != lag {
                     eprintln!(
                         "  ch{ch} below-crossover band's own best lag {low_lag} differs from full-band lag {lag}"
+                    );
+                }
+                if std::env::var("EC_AAC_SBR_DRIFT").is_ok() {
+                    let ol_sharp = sharp_lowpass(o, rate, c.crossover_hz);
+                    let tl_sharp = sharp_lowpass(t, rate, c.crossover_hz);
+                    let (_, sharp_corr) = best_lag_correlation(&ol_sharp, &tl_sharp);
+                    println!(
+                        "  ch{ch} below-crossover SHARP (3x cascaded) filter: {sharp_corr:.6}"
                     );
                 }
                 low_corr
