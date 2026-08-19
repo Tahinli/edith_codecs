@@ -573,4 +573,61 @@ mod tests {
             "only {fraction} of impulse energy landed in the fed subband's band"
         );
     }
+
+    /// Round-13 (queue item 2, "gain-level issue" bucket): per-band
+    /// steady-state synthesis amplitude gain for a PHYSICALLY REAL tone at
+    /// each synthesis band's own centre frequency -- unlike a naive
+    /// constant-complex-value-per-slot excitation (which does not
+    /// correspond to any real Analysis output, since a stationary tone's
+    /// subband phasor rotates hop to hop), this drives `Synthesis` with a
+    /// genuine cosine tone's own [`SYNTHESIS_BANDS`]-wide complex spectrum
+    /// at each hop (only band `k0` populated, the rest zero -- an isolated
+    /// tone has negligible energy in neighbouring bands at these
+    /// crossover widths) and measures the reconstructed PCM tone's own
+    /// amplitude against the input's. Verdict: FLAT to six decimal places
+    /// across every band tried (0.595853 everywhere, not the isolated
+    /// band's own round-trip unity -- the shortfall from 1.0 is the
+    /// expected single-subband-vs-adjacent-alias-cancellation factor, not a
+    /// per-band defect), so `SYNTH_TRIM` as a single global scalar is NOT
+    /// masking a band-dependent overlap-add ripple; the above-crossover
+    /// residual (ch1 0.72) is not a synthesis-gain-flatness bug.
+    #[test]
+    fn synthesis_gain_is_flat_across_bands() {
+        let omega_step = std::f64::consts::PI / (2.0 * SYNTHESIS_BANDS as f64);
+        let mut min_amp = f64::MAX;
+        let mut max_amp = f64::MIN;
+        for k0 in 5..SYNTHESIS_BANDS - 5 {
+            let omega0 = (k0 as f64 + 0.5) * omega_step;
+            let mut synthesis = Synthesis::new();
+            let mut out = Vec::new();
+            let slots = 40;
+            for slot in 0..slots {
+                let mut v = [Complex::new(0.0, 0.0); SYNTHESIS_BANDS];
+                // Analytic-signal phasor at this band's own hop rate, phase
+                // referenced the same way `theta` references analysis's
+                // sliding window: exp(i*omega0*(slot*SYNTHESIS_BANDS)).
+                let ph = omega0 * (slot * SYNTHESIS_BANDS) as f64;
+                v[k0] = Complex::new(ph.cos(), ph.sin());
+                out.extend(synthesis.process_slot(&v));
+            }
+            let steady = &out[out.len() / 2..];
+            let rms = (steady
+                .iter()
+                .map(|&s| f64::from(s) * f64::from(s))
+                .sum::<f64>()
+                / steady.len() as f64)
+                .sqrt();
+            // A real cosine tone of amplitude A has RMS A/sqrt(2).
+            let amp = rms * std::f64::consts::SQRT_2;
+            println!("band {k0}: reconstructed amplitude {amp:.6}");
+            min_amp = min_amp.min(amp);
+            max_amp = max_amp.max(amp);
+        }
+        let ripple = (max_amp - min_amp) / min_amp;
+        println!("band amplitude range [{min_amp:.6}, {max_amp:.6}], ripple {ripple:e}");
+        assert!(
+            ripple < 1e-4,
+            "per-band synthesis gain ripple {ripple:e} exceeds 1e-4 -- SYNTH_TRIM's flat-scalar assumption is wrong"
+        );
+    }
 }
