@@ -1053,7 +1053,17 @@ fn sbr_real_library_matches_reference() {
                 correlation_at_lag(&ours[0], &ours[1], 0),
             );
         }
-        for (ch, (o, t)) in ours.iter().zip(&theirs).enumerate() {
+        for (ch, (o_full, t_full)) in ours.iter().zip(&theirs).enumerate() {
+            // (Round-22 stability check) EC_AAC_SBR_SWEEP_SEGMENT=1 measures
+            // the second half of the file instead of the first, so a
+            // calibration candidate can be checked on two disjoint segments
+            // rather than just the file's start.
+            let (o, t): (&[f32], &[f32]) =
+                if std::env::var("EC_AAC_SBR_SWEEP_SEGMENT").as_deref() == Ok("1") {
+                    (&o_full[o_full.len() / 2..], &t_full[t_full.len() / 2..])
+                } else {
+                    (&o_full[..], &t_full[..])
+                };
             let rms = |s: &[f32]| {
                 (s.iter().map(|v| f64::from(*v) * f64::from(*v)).sum::<f64>()
                     / s.len().max(1) as f64)
