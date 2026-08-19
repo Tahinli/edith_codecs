@@ -28,6 +28,7 @@ mod config;
 mod decode;
 mod encode;
 mod huffman;
+mod sbr_bands;
 mod sbr_tables;
 pub mod tables;
 
