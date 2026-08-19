@@ -158,6 +158,38 @@ pub fn lpc2(x: &[Complex<f64>]) -> (Complex<f64>, Complex<f64>) {
     (a1, a2)
 }
 
+/// Bounds an AR(2) predictor's coefficients so the resynthesis recursion
+/// this module runs (`y = residual + ca1*y[n-1] + ca2*y[n-2]`) cannot
+/// diverge.
+///
+/// `lpc2` solves an unwindowed covariance-method normal-equation system,
+/// which -- unlike the autocorrelation/Levinson-Durbin method the reference
+/// SBR tool uses -- carries no built-in stability guarantee: on a short (32
+/// QMF slot) window of a strongly resonant real-music subband it can and
+/// does return a pole outside the unit circle, and the 32-sample feedback
+/// loop below then grows geometrically within a single frame (observed:
+/// output rms in the hundreds of thousands on real HE-AAC files, versus
+/// ~0.2 for a working decode). `|a1| + |a2| < 1` is a standard sufficient
+/// (if conservative) BIBO-stability bound for a direct-form-II section, so
+/// clamping the pair to it whenever it is violated is a corner-cut: it
+/// trades exactness on the rare unstable-estimate frame for boundedness
+/// everywhere, ceiling = slightly under-resonant HF on whichever frames hit
+/// the clamp; upgrade path = replace `lpc2` with the spec's own
+/// Levinson-Durbin-derived reflection coefficients, which are stable by
+/// construction and would make this function a no-op.
+fn stabilize(coeffs: (Complex<f64>, Complex<f64>)) -> (Complex<f64>, Complex<f64>) {
+    let (a1, a2) = coeffs;
+    let mag = a1.norm_sqr().sqrt() + a2.norm_sqr().sqrt();
+    if mag > 0.999 && mag.is_finite() {
+        let s = 0.999 / mag;
+        (a1.scale(s), a2.scale(s))
+    } else if mag.is_finite() {
+        (a1, a2)
+    } else {
+        (Complex::ZERO, Complex::ZERO)
+    }
+}
+
 /// Per-source-subband history: the last two QMF slots, carried across
 /// `generate` calls so the LPC and whitening filter have continuity at
 /// frame boundaries instead of restarting cold every frame.
@@ -224,7 +256,7 @@ pub fn generate(
                     ext.push(Complex::ZERO);
                 }
                 ext.extend_from_slice(series);
-                lpc2(&ext)
+                stabilize(lpc2(&ext))
             };
             let g = bw[noise_band_of(target_band)];
             let ca1 = a1.scale(g);
