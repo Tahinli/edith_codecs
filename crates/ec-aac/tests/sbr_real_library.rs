@@ -219,17 +219,34 @@ fn best_lag_correlation(ours: &[f32], theirs: &[f32]) -> (i64, f64) {
             Some((oa, ob))
         }
     };
-    let mut coarse_best = (0i64, -1.0f64);
+    // The winning lag is the one that maximizes |correlation|, not signed
+    // correlation: a channel that is a pure phase/sign inversion of the
+    // reference reads strongly NEGATIVE at its true alignment lag, and a
+    // signed-max search rejects that lag for whatever unrelated lag gives a
+    // merely positive value -- reporting a real inversion as near-zero
+    // noise. `found` (not "best abs value >= 0", which every real
+    // correlation already satisfies) is what actually distinguishes "no
+    // in-bounds lag existed" from "the best in-bounds lag was negative" --
+    // an earlier version used `best.1 < 0.0` for that check, which treats
+    // every genuinely negative (inverted) result as "not found" and falls
+    // back to the COARSE, `COARSE`-sample-window-only candidate instead;
+    // that coarse window is short enough to spuriously correlate at 0.87 on
+    // real audio, so the fallback was silently replacing an honest,
+    // correctly-refined negative full-`WINDOW` result with a noise-driven
+    // positive one from a 20x-shorter slice. Carry the signed value through
+    // so callers can see the sign, not just |corr|.
+    let mut coarse_best = (0i64, -1.0f64, 0.0f64);
     for lag in -(LAG_MAX as i64)..=(LAG_MAX as i64) {
         let Some((oa, ob)) = slice_at(lag, COARSE) else {
             continue;
         };
         let c = correlation(&ours[oa..oa + COARSE], &theirs[ob..ob + COARSE]);
-        if c > coarse_best.1 {
-            coarse_best = (lag, c);
+        if c.abs() > coarse_best.1 {
+            coarse_best = (lag, c.abs(), c);
         }
     }
-    let mut best = (coarse_best.0, -1.0f64);
+    let mut best = (coarse_best.0, -1.0f64, 0.0f64);
+    let mut found = false;
     for lag in (coarse_best.0 - 8)..=(coarse_best.0 + 8) {
         let Some((oa, ob)) = slice_at(lag, WINDOW) else {
             continue;
@@ -239,14 +256,43 @@ fn best_lag_correlation(ours: &[f32], theirs: &[f32]) -> (i64, f64) {
             continue;
         }
         let c = correlation(&ours[oa..oa + n], &theirs[ob..ob + n]);
-        if c > best.1 {
-            best = (lag, c);
+        if c.abs() > best.1 {
+            best = (lag, c.abs(), c);
         }
+        found = true;
     }
-    if best.1 < 0.0 {
+    if !found {
         best = coarse_best;
     }
-    best
+    (best.0, best.2)
+}
+
+/// Signed correlation of `ours` against `theirs` at one fixed `lag`, full
+/// `WINDOW`-sized, anchored at the SAME `start` offset `best_lag_correlation`
+/// uses internally -- used to test a hypothesized sign inversion by reusing
+/// a KNOWN-good lag (and window) from a healthy channel instead of trusting
+/// the (signed, positive-biased) search above to relocate both for a
+/// channel that may be exactly inverted at that same lag. Anchoring must
+/// match `best_lag_correlation`'s `start`, not sample 0 -- the two windows
+/// otherwise cover different seconds of audio and are not comparable.
+fn correlation_at_lag(ours: &[f32], theirs: &[f32], lag: i64) -> f64 {
+    let start = ours
+        .len()
+        .min(theirs.len())
+        .saturating_sub(WINDOW)
+        .min(ours.len() / 4);
+    let (oa, ob) = if lag >= 0 {
+        (start, start + lag as usize)
+    } else {
+        (start + (-lag) as usize, start)
+    };
+    let n = WINDOW
+        .min(ours.len().saturating_sub(oa))
+        .min(theirs.len().saturating_sub(ob));
+    if n < 1024 {
+        return 0.0;
+    }
+    correlation(&ours[oa..oa + n], &theirs[ob..ob + n])
 }
 
 /// A first-order RC low-pass, run forward then backward to cancel its own
@@ -352,6 +398,23 @@ fn sbr_real_library_matches_reference() {
         }
         let theirs = ffmpeg_decode(&c.path, c.ffmpeg_stream, ours.len());
         println!("{} ({} ch, {} Hz):", c.path.display(), ours.len(), rate);
+        // Full cross-channel triangle at one fixed lag/window: both channels
+        // of one CPE are decoded frame-locked and so share the same
+        // start-of-stream offset, so ch0's own alignment lag is a valid
+        // anchor for every pair here, letting all five numbers be compared
+        // directly instead of each being independently (and, before the
+        // |corr|-max fix above, unreliably) re-searched.
+        if ours.len() >= 2 && theirs.len() >= 2 {
+            let (lag0, _) = best_lag_correlation(&ours[0], &theirs[0]);
+            println!(
+                "  TRIANGLE @ ch0's lag {lag0}: ours0*ref0={:.6} ours0*ref1={:.6} ours1*ref0={:.6} ours1*ref1={:.6} ours0*ours1={:.6}",
+                correlation_at_lag(&ours[0], &theirs[0], lag0),
+                correlation_at_lag(&ours[0], &theirs[1], lag0),
+                correlation_at_lag(&ours[1], &theirs[0], lag0),
+                correlation_at_lag(&ours[1], &theirs[1], lag0),
+                correlation_at_lag(&ours[0], &ours[1], 0),
+            );
+        }
         for (ch, (o, t)) in ours.iter().zip(&theirs).enumerate() {
             let rms = |s: &[f32]| {
                 (s.iter().map(|v| f64::from(*v) * f64::from(*v)).sum::<f64>()
