@@ -336,6 +336,9 @@ mod tests {
         let after_fall = chirp.update(&[0])[0];
         let fall_step = before - after_fall;
         let rise_step = after_rise; // started from 0.0
-        assert!(fall_step > rise_step * 0.5, "fall {fall_step} rise {rise_step}");
+        assert!(
+            fall_step > rise_step * 0.5,
+            "fall {fall_step} rise {rise_step}"
+        );
     }
 }
