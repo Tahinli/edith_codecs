@@ -440,21 +440,28 @@ fn per_band_correlation(o: &[f32], t: &[f32], rate: u32) -> Vec<(f64, f64, f64)>
         if lo >= hi {
             continue;
         }
-        let mut sum = 0.0f64;
-        let mut cnt = 0usize;
+        // round-16: correlating bin-by-bin then averaging the |corr| values
+        // was the bug -- a QMF band's bins share one slowly-varying envelope,
+        // but a tiny (sub-Hz) frequency offset between our filterbank and the
+        // reference's shifts energy between adjacent bins hop to hop, so each
+        // bin's OWN magnitude series decorrelates even though the band's
+        // total energy (what a QMF band's single subband signal actually
+        // carries) tracks the reference closely. Summing the bins' magnitudes
+        // into one band-energy series per side FIRST, then correlating that
+        // single pair, is robust to that intra-band leakage the way the
+        // per-bin version wasn't.
+        let hops_here = o_mag[lo].len().min(t_mag[lo].len());
+        let mut o_band = vec![0.0f32; hops_here];
+        let mut t_band = vec![0.0f32; hops_here];
         for b in lo..hi {
-            // `correlation`'s 1024-sample floor is sized for raw audio, not
-            // this per-bin magnitude series (one value per STFT hop, ~200
-            // long over the test window) -- use it anyway but on padded
-            // input so the floor doesn't zero every band out.
-            let c = magnitude_series_correlation(&o_mag[b], &t_mag[b]);
-            if c.is_finite() {
-                sum += c.abs();
-                cnt += 1;
+            for h in 0..hops_here {
+                o_band[h] += o_mag[b][h];
+                t_band[h] += t_mag[b][h];
             }
         }
-        if cnt > 0 {
-            out.push((band as f64 * band_hz, sum / cnt as f64, band as f64));
+        let c = magnitude_series_correlation(&o_band, &t_band);
+        if c.is_finite() {
+            out.push((band as f64 * band_hz, c.abs(), band as f64));
         }
     }
     out
@@ -537,6 +544,90 @@ fn per_band_lag_search(o: &[f32], t: &[f32], rate: u32) -> Vec<(f64, i64, f64)> 
             }
         }
         out.push((band as f64 * band_hz, best.0, best.2));
+    }
+    out
+}
+
+/// DIAGNOSTIC (round-16, Task 2): per-band phase offset and magnitude
+/// transfer between `o` and `t`, over the SAME aligned window
+/// `per_band_correlation` uses. Reuses the STFT-and-coherent-band-sum
+/// machinery `per_band_correlation` was just fixed to use (sum the complex
+/// spectrum, not just its magnitude, across a band's bins first, so a
+/// per-bin sub-band redistribution doesn't wash out a genuine per-band
+/// phase relationship) but keeps the complex value: the cross-spectrum
+/// `sum_h O_band(h) * conj(T_band(h))` accumulated over every hop gives one
+/// phasor per band whose angle is the (hop-weighted) phase offset between
+/// `o` and `t` in that band and whose radius, once normalized by each side's
+/// own energy, gives the magnitude transfer ratio.
+fn per_band_phase(o: &[f32], t: &[f32], rate: u32) -> Vec<(f64, f64, f64)> {
+    const FFT_LEN: usize = 2048;
+    const HOP: usize = 1024;
+    let win = ec_dsp::Window::<f32>::sine(FFT_LEN);
+    let mut rfft = ec_dsp::RealFft::<f32>::new(FFT_LEN);
+    let bins = rfft.spectrum_len();
+    let n = o.len().min(t.len());
+    let hops = if n >= FFT_LEN {
+        (n - FFT_LEN) / HOP + 1
+    } else {
+        0
+    };
+    let mut o_spec = vec![Vec::with_capacity(hops); bins];
+    let mut t_spec = vec![Vec::with_capacity(hops); bins];
+    let mut spectrum = vec![ec_dsp::Complex::new(0.0f32, 0.0); bins];
+    for (src, dst) in [(o, &mut o_spec), (t, &mut t_spec)] {
+        for h in 0..hops {
+            let mut block = src[h * HOP..h * HOP + FFT_LEN].to_vec();
+            win.apply(&mut block);
+            rfft.forward(&block, &mut spectrum);
+            for (b, c) in spectrum.iter().enumerate() {
+                dst[b].push(*c);
+            }
+        }
+    }
+    let band_hz = f64::from(rate) / 256.0;
+    let bin_hz = f64::from(rate) / FFT_LEN as f64;
+    let num_bands = (f64::from(rate) / 2.0 / band_hz).ceil() as usize;
+    let mut out = Vec::with_capacity(num_bands);
+    for band in 0..num_bands {
+        let lo = (band as f64 * band_hz / bin_hz).floor() as usize;
+        let hi = (((band + 1) as f64 * band_hz / bin_hz).ceil() as usize).min(bins);
+        if lo >= hi || hops == 0 {
+            continue;
+        }
+        // Cross-spectrum accumulated PER BIN over hops, THEN summed across
+        // the band's bins -- not the reverse. Complex-summing the band's
+        // bins together at each hop first (as an earlier version of this
+        // function did) mixes in `O_b * conj(T_b')` cross terms for every
+        // b != b' pair once the per-hop products are formed; two adjacent
+        // FFT bins carry unrelated instantaneous phase (they are different
+        // frequencies), so those cross terms are pure noise that swamped the
+        // real per-bin coherence and produced an incoherent, near-random
+        // phase reading across exactly the HF bands `per_band_lag_search`'s
+        // direct PCM correlation shows are highly correlated at lag 0/-1.
+        let mut cross_re = 0.0f64;
+        let mut cross_im = 0.0f64;
+        let mut o_energy = 0.0f64;
+        let mut t_energy = 0.0f64;
+        for b in lo..hi {
+            for h in 0..hops {
+                let ob = o_spec[b][h];
+                let tb = t_spec[b][h];
+                let cross = ob * tb.conj();
+                cross_re += f64::from(cross.re);
+                cross_im += f64::from(cross.im);
+                o_energy +=
+                    f64::from(ob.re) * f64::from(ob.re) + f64::from(ob.im) * f64::from(ob.im);
+                t_energy +=
+                    f64::from(tb.re) * f64::from(tb.re) + f64::from(tb.im) * f64::from(tb.im);
+            }
+        }
+        let phase = cross_im.atan2(cross_re);
+        let mag_ratio = if t_energy > 0.0 {
+            (o_energy / t_energy).sqrt()
+        } else {
+            0.0
+        };
+        out.push((band as f64 * band_hz, phase, mag_ratio));
     }
     out
 }
@@ -710,6 +801,16 @@ fn sbr_real_library_matches_reference() {
                 println!("  ch{ch} per-HF-band PCM lag search (band_hz, best_lag, |corr|):");
                 for (hz, lag, corr) in &lags {
                     println!("    {hz:>6.0}Hz: lag {lag:>5} corr {corr:.4}");
+                }
+                let phases = per_band_phase(&o[oa..oa + n], &t[ob..ob + n], rate);
+                println!(
+                    "  ch{ch} per-band cross-spectrum (band_hz, phase_deg, mag_ratio ours/theirs):"
+                );
+                for (hz, phase, ratio) in &phases {
+                    println!(
+                        "    {hz:>6.0}Hz: phase {:>7.2}deg ratio {ratio:.4}",
+                        phase.to_degrees()
+                    );
                 }
             }
             println!(
