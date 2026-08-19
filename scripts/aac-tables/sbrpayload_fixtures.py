@@ -152,10 +152,14 @@ def sbr_bits_full(cfg, tables, grid_cfg, words=()):
         for _ in channels:
             for _ in range(tables["n_q"]):
                 s.w(cfg["invf"], 2)
-    for idx, ch in enumerate(channels):
+    # sbr_channel_pair_element's envelope/noise interleave depends on
+    # bs_coupling: COUPLED reads sbr_envelope(ch)/sbr_noise(ch) interleaved
+    # per channel; UNCOUPLED reads two separate passes -- both channels'
+    # sbr_envelope(), then both channels' sbr_noise() (matches the Rust
+    # parser's `separated` split in sbr_payload.rs).
+    def write_env(idx, ch):
         balance = 1 if (cpe and coupling and ch == 1) else 0
         num_env = num_env_list[idx]
-        num_noise = 1 if num_env == 1 else 2
         freq_res_list = freq_res_lists[idx]
         amp_res_eff = 0 if num_env == 1 else cfg["amp_res"]
         for i in range(num_env):
@@ -168,6 +172,11 @@ def sbr_bits_full(cfg, tables, grid_cfg, words=()):
             else:
                 for _ in range(bands):
                     slot()
+
+    def write_noise(idx, ch):
+        balance = 1 if (cpe and coupling and ch == 1) else 0
+        num_env = num_env_list[idx]
+        num_noise = 1 if num_env == 1 else 2
         for i in range(num_noise):
             if cfg["df_noise"][i] == 0:
                 key = "noise0b" if balance else "noise0"
@@ -177,6 +186,17 @@ def sbr_bits_full(cfg, tables, grid_cfg, words=()):
             else:
                 for _ in range(tables["n_q"]):
                     slot()
+
+    separated = cpe and not coupling and len(channels) == 2
+    if separated:
+        for idx, ch in enumerate(channels):
+            write_env(idx, ch)
+        for idx, ch in enumerate(channels):
+            write_noise(idx, ch)
+    else:
+        for idx, ch in enumerate(channels):
+            write_env(idx, ch)
+            write_noise(idx, ch)
     for ch in channels:
         on = cfg.get("add_harmonic", [0, 0])[ch]
         s.w(1 if on else 0, 1)
