@@ -59,6 +59,58 @@ fn debug_dump(
 /// runs at (32 per frame): `RATE = 2` converts one to the other.
 const RATE: i64 = 2;
 
+/// Round-20 residual/side-info correlation: one row per (access unit,
+/// channel) `apply_data` actually ran, giving `sbr_real_library.rs`'s
+/// residual-energy grid a side-info table to correlate against without
+/// re-parsing debug text. `frame` is a single counter shared by every
+/// channel `apply_data` touches in one call, so it lines up 1:1 with the
+/// AU-aligned (2048 output samples/AU for a plain 2x stream) blocks the
+/// residual grid uses.
+#[derive(Clone, Debug)]
+pub struct SbrSideInfoRow {
+    pub frame: usize,
+    pub tag: u8,
+    pub ch: usize,
+    /// `"fresh"` for a frame `apply` reached (a real payload this AU),
+    /// `"hold"` for one `apply_last` reached (no fresh payload, reusing the
+    /// last parsed frame's data per §4.6.18).
+    pub source: &'static str,
+    pub coupling: bool,
+    pub amp_res: u8,
+    /// Band-index domain (same units `f_high`/`f_noise` and the residual
+    /// grid's FFT-bucket index share, per `per_band_correlation`'s
+    /// `band_hz = rate/256` measurement) the crossover and high-res/noise
+    /// band boundaries below live in.
+    pub kx: i64,
+    pub k2: i64,
+    pub f_high: Vec<i64>,
+    pub f_noise: Vec<i64>,
+    pub t_env: Vec<i64>,
+    pub freq_res: Vec<u8>,
+    pub invf_mode: Vec<u8>,
+    pub add_harmonic: Option<Vec<u8>>,
+    pub e_q_means: Vec<f64>,
+    pub q_q_means: Vec<f64>,
+}
+
+static SIDEINFO_LOG: std::sync::OnceLock<std::sync::Mutex<Vec<SbrSideInfoRow>>> =
+    std::sync::OnceLock::new();
+static SIDEINFO_FRAME: AtomicUsize = AtomicUsize::new(0);
+
+fn sideinfo_enabled() -> bool {
+    std::env::var("EC_AAC_SBR_SIDEINFO_DEBUG").is_ok()
+}
+
+/// Drains nothing -- returns a clone of every row logged so far this
+/// process, in call order. Empty unless `EC_AAC_SBR_SIDEINFO_DEBUG` was set
+/// before decoding.
+pub fn sbr_sideinfo_log() -> Vec<SbrSideInfoRow> {
+    let Some(log) = SIDEINFO_LOG.get() else {
+        return Vec::new();
+    };
+    log.lock().map(|l| l.clone()).unwrap_or_default()
+}
+
 /// Per-channel DSP state an SBR element's reconstruction carries across
 /// frames: the QMF filterbank pair, the HF generator's LPC history and
 /// chirp factors, and the noise-floor generator.
@@ -138,7 +190,7 @@ impl SbrChain {
         if let Some(elem) = self.elements.get_mut(&tag) {
             elem.last_data = Some(data.clone());
         }
-        self.apply_data(tag, data, planes);
+        self.apply_data(tag, data, planes, "fresh");
     }
 
     /// Re-runs the chain for `tag` using the last successfully parsed
@@ -150,10 +202,16 @@ impl SbrChain {
         let Some(data) = self.elements.get(&tag).and_then(|e| e.last_data.clone()) else {
             return;
         };
-        self.apply_data(tag, &data, planes);
+        self.apply_data(tag, &data, planes, "hold");
     }
 
-    fn apply_data(&mut self, tag: u8, data: &SbrData, planes: &mut [Vec<f32>]) {
+    fn apply_data(
+        &mut self,
+        tag: u8,
+        data: &SbrData,
+        planes: &mut [Vec<f32>],
+        source: &'static str,
+    ) {
         let Some(elem) = self.elements.get_mut(&tag) else {
             return;
         };
@@ -164,6 +222,12 @@ impl SbrChain {
             return;
         };
         let coupling = data.coupling;
+        let sideinfo_on = sideinfo_enabled();
+        let au_frame = if sideinfo_on {
+            SIDEINFO_FRAME.fetch_add(1, Ordering::Relaxed)
+        } else {
+            0
+        };
         for (ch, plane) in planes.iter_mut().enumerate() {
             if ch >= data.channels.len() || ch >= elem.channels.len() {
                 continue;
@@ -203,6 +267,41 @@ impl SbrChain {
             if std::env::var("EC_AAC_SBR_DEBUG").is_ok() {
                 eprintln!("SBRDBG coupling={}", data.coupling);
                 debug_dump(&header, &tables, sbr_ch, ch);
+            }
+            if sideinfo_on {
+                let mean = |rows: &[Vec<i32>]| -> Vec<f64> {
+                    rows.iter()
+                        .map(|r| {
+                            if r.is_empty() {
+                                0.0
+                            } else {
+                                r.iter().map(|&v| f64::from(v)).sum::<f64>() / r.len() as f64
+                            }
+                        })
+                        .collect()
+                };
+                let row = SbrSideInfoRow {
+                    frame: au_frame,
+                    tag,
+                    ch,
+                    source,
+                    coupling,
+                    amp_res: header.amp_res,
+                    kx: tables.kx,
+                    k2: tables.k2,
+                    f_high: tables.f_high.clone(),
+                    f_noise: tables.f_noise.clone(),
+                    t_env: sbr_ch.t_env.clone(),
+                    freq_res: sbr_ch.freq_res.clone(),
+                    invf_mode: sbr_ch.invf_mode.clone(),
+                    add_harmonic: sbr_ch.add_harmonic.clone(),
+                    e_q_means: mean(&sbr_ch.e_q),
+                    q_q_means: mean(&sbr_ch.q_q),
+                };
+                let log = SIDEINFO_LOG.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+                if let Ok(mut l) = log.lock() {
+                    l.push(row);
+                }
             }
             let mut hf = sbr_hf::generate(
                 &low_cur,
