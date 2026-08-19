@@ -29,6 +29,7 @@ mod decode;
 mod encode;
 mod huffman;
 mod sbr_bands;
+mod sbr_payload;
 mod sbr_tables;
 pub mod tables;
 
