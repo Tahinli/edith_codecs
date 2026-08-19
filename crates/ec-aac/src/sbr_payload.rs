@@ -208,6 +208,16 @@ impl SbrParser {
         self.tables.as_ref()
     }
 
+    /// Test-only seam: installs a header/tables pair without driving a real
+    /// bitstream, so `sbr_chain`'s own tests can exercise `SbrChain::apply`
+    /// on synthetic data (the fields this sets are otherwise only reachable
+    /// through a successful `parse()`).
+    #[cfg(test)]
+    pub(crate) fn set_for_test(&mut self, header: SbrHeader, tables: BandTables) {
+        self.header = Some(header);
+        self.tables = Some(tables);
+    }
+
     fn parse_grid(&self, r: &mut BitReader) -> Result<Grid> {
         let frame_class = r.read_bits(2)?;
         match frame_class {

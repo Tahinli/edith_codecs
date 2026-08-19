@@ -84,6 +84,15 @@ impl ChannelState {
 struct Element {
     parser: SbrParser,
     channels: Vec<ChannelState>,
+    /// The most recently parsed frame's envelope/noise/grid data, held so an
+    /// access unit whose FIL element carries no fresh SBR payload this frame
+    /// (an "unavailable" frame, §4.6.18: legal per spec and the decoder must
+    /// keep reconstructing at the doubled rate using the last known data,
+    /// not silently fall back to core-only output) can still be
+    /// SBR-reconstructed instead of leaving that one access unit's plane at
+    /// half length -- which otherwise permanently shifts every sample after
+    /// it out of alignment with a reference that stayed at full rate.
+    last_data: Option<SbrData>,
 }
 
 /// Every configured SBR element in a stream, keyed by
@@ -108,6 +117,7 @@ impl SbrChain {
         let elem = self.elements.entry(tag).or_insert_with(|| Element {
             parser: SbrParser::new(self.rate),
             channels: Vec::new(),
+            last_data: None,
         });
         let data = elem.parser.parse(r, is_cpe).ok()?;
         let n_q = elem.parser.tables().map(|t| t.n_q).unwrap_or(1);
@@ -123,6 +133,25 @@ impl SbrChain {
     /// SBR-reconstructed, double-rate PCM. A malformed/missing state is a
     /// silent no-op: `planes` is left at its core content.
     pub fn apply(&mut self, tag: u8, data: &SbrData, planes: &mut [Vec<f32>]) {
+        if let Some(elem) = self.elements.get_mut(&tag) {
+            elem.last_data = Some(data.clone());
+        }
+        self.apply_data(tag, data, planes);
+    }
+
+    /// Re-runs the chain for `tag` using the last successfully parsed
+    /// frame's SBR data, for an access unit whose own FIL element carried no
+    /// fresh payload this frame. A no-op (planes left at core content, same
+    /// as [`apply`]'s existing malformed/missing-state fallback) if no prior
+    /// frame ever parsed successfully for this element.
+    pub fn apply_last(&mut self, tag: u8, planes: &mut [Vec<f32>]) {
+        let Some(data) = self.elements.get(&tag).and_then(|e| e.last_data.clone()) else {
+            return;
+        };
+        self.apply_data(tag, &data, planes);
+    }
+
+    fn apply_data(&mut self, tag: u8, data: &SbrData, planes: &mut [Vec<f32>]) {
         let Some(elem) = self.elements.get_mut(&tag) else {
             return;
         };
@@ -217,6 +246,137 @@ impl SbrChain {
                 out.extend_from_slice(&pcm);
             }
             *plane = out;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sbr_bands::freq_tables;
+    use crate::sbr_payload::{SbrHeader, SbrParser};
+
+    fn tables() -> crate::sbr_bands::BandTables {
+        freq_tables(44100, 5, 3, 2, 1, 2, 2).unwrap()
+    }
+
+    fn header() -> SbrHeader {
+        SbrHeader {
+            amp_res: 1,
+            start_freq: 5,
+            stop_freq: 3,
+            xover_band: 2,
+            freq_scale: 2,
+            alter_scale: 1,
+            noise_bands: 2,
+            limiter_bands: 2,
+            limiter_gains: 3,
+            interpol_freq: 1,
+            smoothing_mode: 1,
+        }
+    }
+
+    fn one_channel(n_q: usize, n_low: usize) -> SbrChannel {
+        SbrChannel {
+            t_env: vec![0, 16],
+            freq_res: vec![0],
+            t_noise: vec![0, 16],
+            e_q: vec![vec![10i32; n_low]],
+            q_q: vec![vec![2i32; n_q]],
+            invf_mode: vec![0; n_q],
+            add_harmonic: None,
+        }
+    }
+
+    /// Two adjacent 1024-sample core AUs run through the same `SbrChain`
+    /// element (as `raw_data_block`'s per-AU calls do) must each double to
+    /// exactly `2 * ANALYSIS_BANDS * 32` samples with no gap or overlap at
+    /// the junction: the coverage hole that let a whole access unit's
+    /// doubling go missing (see `apply_last`) never showed up in the
+    /// synthetic continuous-stream QMF round trip, since that test never
+    /// crosses an AU boundary at all.
+    #[test]
+    fn two_adjacent_access_units_double_rate_with_no_junction_discontinuity() {
+        let t = tables();
+        let n_low = t.n_low;
+        let n_q = t.n_q;
+        let mut chain = SbrChain::new(44100);
+        let tag = 0u8;
+        chain.elements.insert(
+            tag,
+            Element {
+                parser: SbrParser::new(44100),
+                channels: vec![ChannelState::new(n_q, 1), ChannelState::new(n_q, 2)],
+                last_data: None,
+            },
+        );
+        chain
+            .elements
+            .get_mut(&tag)
+            .unwrap()
+            .parser
+            .set_for_test(header(), t.clone());
+
+        let data = SbrData {
+            coupling: false,
+            channels: vec![one_channel(n_q, n_low), one_channel(n_q, n_low)],
+        };
+
+        // A steady tone, not silence: silence round-trips trivially (every
+        // sample is already continuous at 0), which would hide exactly the
+        // discontinuity this test exists to catch.
+        let core_au = || -> Vec<f32> { (0..1024).map(|i| (i as f32 * 0.1).sin() * 0.2).collect() };
+        let mut planes = vec![core_au(), core_au()];
+        chain.apply(tag, &data, &mut planes);
+
+        let expected_len = 32 * SYNTHESIS_BANDS;
+        for (ch, plane) in planes.iter().enumerate() {
+            assert_eq!(
+                plane.len(),
+                expected_len,
+                "ch{ch} AU1 didn't double to {expected_len} samples"
+            );
+        }
+
+        // Second AU through the SAME chain/state, as consecutive AUs in one
+        // stream are: this is what exercises the QMF history/HF-chirp/noise
+        // generator continuity across the junction, not just each AU in
+        // isolation.
+        let mut planes2 = vec![core_au(), core_au()];
+        chain.apply(tag, &data, &mut planes2);
+        for (ch, plane) in planes2.iter().enumerate() {
+            assert_eq!(
+                plane.len(),
+                expected_len,
+                "ch{ch} AU2 didn't double to {expected_len} samples"
+            );
+        }
+
+        // Cumulative length across both AUs is exactly 2x2048, and the
+        // junction (last sample of AU1 next to the first of AU2) is not a
+        // discontinuity spike: a dropped/duplicated-AU bug (the one fixed by
+        // `apply_last`) either changes this total length or opens a silent
+        // gap, and a QMF history corruption at the boundary spikes the
+        // derivative right at the join far above the steady-state
+        // sample-to-sample delta the continuous tone otherwise has.
+        for ch in 0..2 {
+            let mut joined = planes[ch].clone();
+            joined.extend_from_slice(&planes2[ch]);
+            assert_eq!(joined.len(), 2 * expected_len);
+
+            let steady_delta = |s: &[f32]| -> f32 {
+                s.windows(2)
+                    .skip(expected_len / 2)
+                    .take(expected_len / 4)
+                    .map(|w| (w[1] - w[0]).abs())
+                    .fold(0.0f32, f32::max)
+            };
+            let typical = steady_delta(&joined);
+            let junction_delta = (joined[expected_len] - joined[expected_len - 1]).abs();
+            assert!(
+                junction_delta <= typical * 4.0 + 1e-6,
+                "ch{ch} junction delta {junction_delta} far exceeds steady-state delta {typical} -- AU-boundary discontinuity"
+            );
         }
     }
 }

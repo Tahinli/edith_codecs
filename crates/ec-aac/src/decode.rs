@@ -771,6 +771,7 @@ impl BlockDecoder {
                         // extension_payload(): bs_extension_type(4), then
                         // (for SBR) an optional 10-bit CRC, then
                         // sbr_extension_data() itself.
+                        let mut applied = false;
                         if r.bits_remaining() >= 4 {
                             let ext_type = r.peek_bits(4)?;
                             if ext_type == 13 || ext_type == 14 {
@@ -780,8 +781,17 @@ impl BlockDecoder {
                                 }
                                 if let Some(data) = sbr.parse(r, tag, is_cpe) {
                                     sbr.apply(tag, &data, &mut out[start..start + n]);
+                                    applied = true;
                                 }
                             }
+                        }
+                        if !applied {
+                            // No fresh SBR payload this frame (no SBR fill
+                            // element, or one whose extension_type wasn't
+                            // SBR, or a parse failure): §4.6.18 still
+                            // requires doubled-rate reconstruction, using
+                            // the last successfully parsed frame's data.
+                            sbr.apply_last(tag, &mut out[start..start + n]);
                         }
                     }
                     // Resync to the FIL's declared byte boundary regardless
@@ -794,7 +804,17 @@ impl BlockDecoder {
                     }
                     pending = None;
                 }
-                _ => break,
+                _ => {
+                    // The block ended with no FIL element ever following the
+                    // last SCE/CPE (no SBR fill at all this frame, not even
+                    // a non-SBR one) -- same "unavailable frame" case as the
+                    // no-fresh-payload branch in id 6 above, so fall back to
+                    // the last known SBR data the same way.
+                    if let (Some(sbr), Some((tag, start, n, _))) = (self.sbr.as_mut(), pending) {
+                        sbr.apply_last(tag, &mut out[start..start + n]);
+                    }
+                    break;
+                }
             }
         }
         r.align_to_byte();

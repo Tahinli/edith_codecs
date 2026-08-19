@@ -322,6 +322,47 @@ fn highpass(samples: &[f32], rate: u32, cutoff_hz: f64) -> Vec<f32> {
     samples.iter().zip(&low).map(|(a, b)| a - b).collect()
 }
 
+/// Decisive-experiment diagnostic: correlates consecutive short (`WIN`)
+/// windows of `o` against `t` (already coarsely aligned at `oa`/`ob`, e.g.
+/// the winning full-file lag from `best_lag_correlation`), searching a small
+/// local lag range per window. A per-frame continuity bug (dropped/duplicated
+/// samples at access-unit boundaries) shows up as the winning local lag
+/// DRIFTING linearly window to window; a bug that is not about concatenation
+/// (wrong band mapping, spectral corruption) shows up as a roughly constant
+/// lag with low/noisy correlation instead.
+fn windowed_lag_drift(
+    o: &[f32],
+    t: &[f32],
+    oa: usize,
+    ob: usize,
+    windows: usize,
+) -> Vec<(i64, f64)> {
+    const WIN: usize = 4_096;
+    const LOCAL_LAG: i64 = 2_000;
+    let mut out = Vec::with_capacity(windows);
+    for w in 0..windows {
+        let base_o = oa + w * WIN;
+        let base_t = ob + w * WIN;
+        let mut best = (0i64, -1.0f64, 0.0f64);
+        for lag in -LOCAL_LAG..=LOCAL_LAG {
+            let ao = base_o as i64 + lag;
+            if ao < 0 {
+                continue;
+            }
+            let ao = ao as usize;
+            if ao + WIN > o.len() || base_t + WIN > t.len() {
+                continue;
+            }
+            let c = correlation(&o[ao..ao + WIN], &t[base_t..base_t + WIN]);
+            if c.abs() > best.1 {
+                best = (lag, c.abs(), c);
+            }
+        }
+        out.push((best.0, best.2));
+    }
+    out
+}
+
 /// A file discovered under the user's own media directories: its path, which
 /// AAC stream in it (0-based among AAC streams only) carries HE-AAC, and the
 /// core/SBR crossover an ffprobe/ASC inspection already pinned for it -- used
@@ -461,6 +502,14 @@ fn sbr_real_library_matches_reference() {
                 c.crossover_hz, c.crossover_hz
             );
             let _ = (&o_low, &t_low);
+            if std::env::var("EC_AAC_SBR_DRIFT").is_ok() && n >= 4_096 {
+                let windows = (n / 4_096).min(20);
+                let drift = windowed_lag_drift(o, t, oa, ob, windows);
+                println!("  ch{ch} DRIFT (window_idx, local_lag, |corr|):");
+                for (w, (l, cr)) in drift.iter().enumerate() {
+                    println!("    w{w}: lag {l} corr {cr:.4}");
+                }
+            }
             worst_full = worst_full.min(full);
             worst_low = worst_low.min(low);
         }
