@@ -66,7 +66,13 @@ impl Reference {
         let child = Command::new("ffmpeg")
             .args(["-nostdin", "-v", "error", "-i"])
             .arg(path)
-            .args(["-map", "0:v:0", "-pix_fmt", pix, "-f", "rawvideo", "-"])
+            // `-fps_mode passthrough`: without it ffmpeg conforms its output to
+            // the container's nominal frame rate, duplicating or dropping
+            // pictures on a film whose real cadence differs — which shows up
+            // here as everything being one frame out from some point onward.
+            .args([
+                "-map", "0:v:0", "-fps_mode", "passthrough", "-pix_fmt", pix, "-f", "rawvideo", "-",
+            ])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
@@ -767,6 +773,19 @@ fn rss_kb() -> u64 {
 /// that unmaps on drop, and this is the test that says so out loud.
 #[test]
 fn long_decode_does_not_grow_the_resident_set() {
+    // VmRSS is a process-wide number and the harness runs every test in this
+    // binary as a thread of one process: a sibling allocating between the
+    // baseline and the end reading shows up here as a 200 MB "leak". The
+    // measurement therefore runs in a child process holding only this test.
+    if std::env::var_os("EC_HW_RSS_CHILD").is_none() {
+        let status = Command::new(std::env::current_exe().expect("test binary path"))
+            .args(["--exact", "long_decode_does_not_grow_the_resident_set"])
+            .env("EC_HW_RSS_CHILD", "1")
+            .status()
+            .expect("re-run this test in its own process");
+        assert!(status.success(), "isolated RSS run failed");
+        return;
+    }
     let Some(display) = display() else { return };
     let path = bitstreams().join("h264-1080p-23.976-8bit.264");
     if !path.exists() {
@@ -867,7 +886,10 @@ fn frames_export_as_dma_buf() {
 // ---------------------------------------------------------------------------
 
 /// Turn any container into an elementary stream ffmpeg and this crate agree on.
-fn elementary(path: &Path, codec: Codec) -> Option<Vec<u8>> {
+///
+/// `frames` bounds the extraction: piping a two-hour 4K film through memory to
+/// compare its first five hundred pictures is several gigabytes of nothing.
+fn elementary(path: &Path, codec: Codec, frames: usize) -> Option<Vec<u8>> {
     let args: &[&str] = match codec {
         Codec::H264 => &["-bsf:v", "h264_mp4toannexb", "-f", "h264"],
         Codec::H265 => &["-bsf:v", "hevc_mp4toannexb", "-f", "hevc"],
@@ -877,6 +899,9 @@ fn elementary(path: &Path, codec: Codec) -> Option<Vec<u8>> {
         .args(["-nostdin", "-v", "error", "-i"])
         .arg(path)
         .args(["-map", "0:v:0", "-c:v", "copy"])
+        // A few more coded pictures than frames wanted: reordering means the
+        // last few packets have not been shown yet.
+        .args(["-frames:v", &(frames + 16).to_string()])
         .args(args)
         .arg("-")
         .stderr(Stdio::null())
@@ -942,7 +967,7 @@ fn real_library_spot_check() {
     let mut table = Vec::new();
     for (path, codec, ten_bit) in &wanted {
         let path = Path::new(path);
-        let Some(data) = elementary(path, *codec) else {
+        let Some(data) = elementary(path, *codec, limit) else {
             table.push(format!("{:<52} SKIP (no elementary stream)", short(path)));
             continue;
         };
