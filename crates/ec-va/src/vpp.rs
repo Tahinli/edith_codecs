@@ -95,6 +95,55 @@ impl Vpp {
         Ok(surface)
     }
 
+    /// Convert `source` into `dest` like [`Vpp::convert`], but reading only
+    /// `source_region` of `source` and writing only `dest_region` of `dest` —
+    /// no scaling (both regions are the same size in every caller today),
+    /// just a placement: the pixels outside `dest_region` are left exactly as
+    /// `dest` already had them. This is how a visible picture smaller than
+    /// its block-aligned coded surface (e.g. a 2160-tall HEVC source, whose
+    /// coded height rounds to 2176) lands inside a differently-padded
+    /// destination without a resize.
+    pub fn convert_region(
+        &self,
+        source: &Arc<Surface>,
+        source_region: (u32, u32, u32, u32),
+        dest: Arc<Surface>,
+        dest_region: (u32, u32, u32, u32),
+    ) -> Result<Arc<Surface>> {
+        let sr = sys::VARectangle {
+            x: source_region.0 as i16,
+            y: source_region.1 as i16,
+            width: source_region.2 as u16,
+            height: source_region.3 as u16,
+        };
+        let dr = sys::VARectangle {
+            x: dest_region.0 as i16,
+            y: dest_region.1 as i16,
+            width: dest_region.2 as u16,
+            height: dest_region.3 as u16,
+        };
+        let param = sys::VAProcPipelineParameterBuffer {
+            surface: source.id(),
+            surface_region: &sr,
+            output_region: &dr,
+            ..Default::default()
+        };
+        // SAFETY: `surface_region`/`output_region` point at `sr`/`dr`, which
+        // outlive this call (built here, read only while `Buffer::from_param`
+        // constructs the driver buffer below); otherwise identical to
+        // `convert`'s safety argument.
+        let buffer = unsafe {
+            Buffer::from_param(&self.context, sys::VAProcPipelineParameterBufferType, &param)?
+        };
+        let surface = Picture::new(&self.context, dest)
+            .begin()?
+            .render(buffer)?
+            .end()?
+            .sync()?
+            .into_surface();
+        Ok(surface)
+    }
+
     fn context_id(&self) -> sys::VAContextID {
         // `Context` does not expose its raw id outside the crate; VPP needs
         // it for `vaQueryVideoProcFilters`, which has no typestate-protected
