@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use ec_core::color::{ColorDescription, ContentLight, Tags};
 use ec_h264_syntax::{
     AnnexBIter, DecRefPicMarking, NalHeader, NalUnitType, Pps, PredWeightTable, SliceHeader,
     SliceType, Sps, unescape_rbsp,
@@ -12,7 +13,7 @@ use ec_va::{Buffer, Display, sys};
 use super::dpb264::{Dpb, Mark, PicInfo, Picture, Poc, RefList};
 use super::{ReadyFrames, Session, StreamInfo};
 use crate::error::{Error, Result};
-use crate::frame::Frame;
+use crate::frame::{Colour, Frame};
 use crate::params::h264::{
     IQMatrixBufferH264, PICTURE_LONG_TERM_REFERENCE, PICTURE_SHORT_TERM_REFERENCE,
     PictureParameterBufferH264, SliceParameterBufferH264, VAPictureH264,
@@ -62,6 +63,8 @@ pub struct H264Decoder {
     /// predicts from something never decoded since the seek and must not
     /// reach the caller.
     recovery_poc: Option<i32>,
+    /// The most recent SPS's VUI colour tags, sticky across pictures.
+    colour_tags: Tags,
 }
 
 impl H264Decoder {
@@ -79,6 +82,7 @@ impl H264Decoder {
             rbsp: Vec::new(),
             gap_frames: 0,
             recovery_poc: None,
+            colour_tags: Tags::default(),
         }
     }
 
@@ -97,6 +101,7 @@ impl H264Decoder {
                     self.rbsp = rbsp;
                     let sps = sps?;
                     self.dpb.configure(&sps);
+                    self.colour_tags = vui_colour_tags(&sps);
                     let id = usize::from(sps.id);
                     self.sps_map[id] = Some(sps);
                 }
@@ -414,11 +419,45 @@ impl H264Decoder {
                 session.display_size,
                 session.coded_size,
                 session.bit_depth,
+                self.colour(),
             );
             self.ready.push(frame);
             self.dpb.released(idx);
         }
     }
+
+    /// This stream's colour metadata, once its first SPS has been seen. No SEI
+    /// here — H.264's mastering-display/content-light-level SEI is not parsed
+    /// by this family today, so this is VUI-only.
+    pub fn colour(&self) -> Option<Colour> {
+        let session = self.session.as_ref()?;
+        Some(Colour {
+            description: ColorDescription::resolve(
+                Tags::default(),
+                self.colour_tags,
+                session.display_size.1,
+            ),
+            light: ContentLight::default(),
+        })
+    }
+}
+
+/// An SPS's VUI `colour_description` and range flag, as [`Tags`] for
+/// [`ColorDescription::resolve`]. [`Tags::default()`] when the VUI has no
+/// `video_signal_type` at all.
+fn vui_colour_tags(sps: &Sps) -> Tags {
+    let Some(vui) = &sps.vui else {
+        return Tags::default();
+    };
+    if vui.video_format.is_none() {
+        return Tags::default();
+    }
+    let (_primaries, transfer, matrix) = vui.colour_description.unwrap_or((0, 0, 0));
+    Tags::from_codes(
+        u64::from(matrix),
+        u64::from(transfer),
+        if vui.video_full_range { 2 } else { 1 },
+    )
 }
 
 /// The `pic_parameter_set_id` of a slice header, which is the second syntax
