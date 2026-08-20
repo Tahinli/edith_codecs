@@ -326,6 +326,77 @@ fn best_lag_correlation_wide(ours: &[f32], theirs: &[f32], lag_max: i64) -> (i64
     (lag, corr)
 }
 
+/// The robust two-stage lag search `sbr441_family_sample_drift_probe` proved
+/// out (round-55/56): a plain coarse-stride search picks the SINGLE best
+/// `COARSE`-sample-window candidate, which on periodic/tonal real music
+/// content routinely aliases onto a wrong lag (this file family's ref-L-vs-
+/// ref-R self-check scored a coarse-search lag=-24 corr=0.213, worse than
+/// the true fixed-lag comparison's 0.873). Instead of trusting the single
+/// coarse winner, keep the top `K` coarse candidates and refine EACH with a
+/// full-resolution, narrow (+/-128) search restricted to the file's first
+/// 10 seconds (`sample_rate`-derived) -- periodic aliasing needs many
+/// seconds of a repeating pattern to fool a full-resolution window, so the
+/// candidate that is genuinely aligned wins there even when it wasn't the
+/// coarse pass's top pick. Returns `(lag, corr, at_edge)` for the winning
+/// refined candidate, `at_edge` inherited from that candidate's own coarse
+/// bucket (true if ITS coarse lag sat at the +/-`lag_max` search bound).
+fn robust_lag_topk(ours: &[f32], theirs: &[f32], lag_max: i64, rate: u32, k: usize) -> (i64, f64, bool) {
+    const COARSE: usize = 4_096;
+    let start = ours
+        .len()
+        .min(theirs.len())
+        .saturating_sub(WINDOW)
+        .min(ours.len() / 4);
+    let slice_at = |lag: i64, len: usize| -> Option<(usize, usize)> {
+        let (oa, ob) = if lag >= 0 {
+            (start, start + lag as usize)
+        } else {
+            (start + (-lag) as usize, start)
+        };
+        if oa + len > ours.len() || ob + len > theirs.len() {
+            None
+        } else {
+            Some((oa, ob))
+        }
+    };
+    let mut coarse: Vec<(i64, f64)> = Vec::new();
+    let mut lag = -lag_max;
+    while lag <= lag_max {
+        if let Some((oa, ob)) = slice_at(lag, COARSE) {
+            let c = correlation(&ours[oa..oa + COARSE], &theirs[ob..ob + COARSE]);
+            coarse.push((lag, c.abs()));
+        }
+        lag += SEARCH_STRIDE;
+    }
+    coarse.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let ten_s = 10 * rate.max(1) as usize;
+    let mut best: (i64, f64, bool) = (0, -2.0, false);
+    for &(cand_lag, _) in coarse.iter().take(k) {
+        let at_edge = cand_lag.abs() >= lag_max - SEARCH_STRIDE;
+        // `narrow_lag_at` computes `ob_i = oa0 + lag` directly (no sign
+        // split the way `slice_at` above does), so a fixed `oa0 = 0` goes
+        // negative -- and every lag in the whole +/-128 window skips --
+        // whenever `cand_lag` is negative enough (this file family's true
+        // lag is -4674). Shift the window's start so it stays anchored to
+        // "the first 10s of real content" while guaranteeing `ob_i >= 0`
+        // even at the most-negative lag in the +/-128 refine range.
+        let oa0 = (128 - cand_lag).max(0) as usize;
+        let refine_len = ten_s.min(ours.len().saturating_sub(oa0)).min(
+            theirs
+                .len()
+                .saturating_sub((oa0 as i64 + cand_lag).max(0) as usize),
+        );
+        if refine_len < 1024 {
+            continue;
+        }
+        let (rlag, rcorr) = narrow_lag_at(ours, theirs, oa0, refine_len, cand_lag, 128);
+        if rcorr > best.1 {
+            best = (rlag, rcorr, at_edge);
+        }
+    }
+    best
+}
+
 /// Signed correlation of `ours` against `theirs` at one fixed `lag`, full
 /// `WINDOW`-sized, anchored at the SAME `start` offset `best_lag_correlation`
 /// uses internally -- used to test a hypothesized sign inversion by reusing
@@ -2277,7 +2348,15 @@ fn synthetic_heaac_matrix() {
                 let theirs = ffmpeg_decode(&path, 0, ours.len());
                 let o = &ours[0];
                 let t = &theirs[0];
-                let (mut lag, mut full) = best_lag_correlation_wide(o, t, WIDE_LAG_MAX);
+                const TOPK: usize = 5;
+                let (mut lag, mut full, edge) =
+                    robust_lag_topk(o, t, WIDE_LAG_MAX, our_rate, TOPK);
+                assert!(
+                    !edge,
+                    "{}: {profile} row's refined winning lag {lag} sits at the \
+                     +/-{WIDE_LAG_MAX} search's own edge",
+                    path.display()
+                );
                 if profile == "LC" {
                     lc_lag = Some(lag);
                 }
@@ -2290,13 +2369,21 @@ fn synthetic_heaac_matrix() {
                 // channel swap that a fixed-lag check rules out). Derive
                 // ONE lag per stream from the summed (mono) signal instead,
                 // and reuse it for both channels -- more robust than
-                // trusting a single, possibly-periodic channel's own search.
+                // trusting a single, possibly-periodic channel's own search
+                // -- via the same top-K/refine-on-first-10s robust method.
                 if profile == "HE" && ours.len() >= 2 && theirs.len() >= 2 {
                     let mono_o: Vec<f32> =
                         ours[0].iter().zip(&ours[1]).map(|(a, b)| a + b).collect();
                     let mono_t: Vec<f32> =
                         theirs[0].iter().zip(&theirs[1]).map(|(a, b)| a + b).collect();
-                    let (mono_lag, _) = best_lag_correlation_wide(&mono_o, &mono_t, WIDE_LAG_MAX);
+                    let (mono_lag, _, mono_edge) =
+                        robust_lag_topk(&mono_o, &mono_t, WIDE_LAG_MAX, our_rate, TOPK);
+                    assert!(
+                        !mono_edge,
+                        "{}: HE row's mono-derived refined lag {mono_lag} sits at the \
+                         +/-{WIDE_LAG_MAX} search's own edge",
+                        path.display()
+                    );
                     lag = mono_lag;
                     full = correlation_at_lag(o, t, lag);
                 }
@@ -2309,10 +2396,16 @@ fn synthetic_heaac_matrix() {
                 } else {
                     f64::from(our_rate) * 0.25
                 };
-                let (_, below) = best_lag_correlation_wide(
+                // Same single robust `lag` the full/above bands use, not an
+                // independent search: a narrowband low-passed signal's
+                // correlation surface is broad and flat across nearby lags,
+                // which used to let an independent search here silently
+                // report a different (and unvalidated) alignment than the
+                // one everything else in the row is anchored at.
+                let below = correlation_at_lag(
                     &lowpass(o, our_rate, crossover_hz),
                     &lowpass(t, our_rate, crossover_hz),
-                    WIDE_LAG_MAX,
+                    lag,
                 );
                 // `above` re-slices at the FULL-band winning `lag` before
                 // splitting, same convention `sbr_real_library_matches_reference`
@@ -2418,6 +2511,33 @@ fn synthetic_heaac_matrix() {
                     core_rate_str,
                     our_rate,
                 );
+                // 44.1k-family HE rows: print per-second full-band corr at
+                // the row's own robust `lag` over 30s, so a content-
+                // dependent HF-reconstruction dip (real, not an alignment
+                // artifact -- `sbr441_family_sample_drift_probe` isolated
+                // one at t=13-27s on heaac_44100_48k.m4a) is visible per
+                // second instead of averaged away by the single `full`
+                // column above.
+                if profile == "HE" && rate == 44_100 {
+                    println!("  per-second full-band corr @ lag {lag} (t, corr):");
+                    let step = our_rate.max(1) as usize;
+                    for sec in 0..30usize {
+                        let oa0 = sec * step;
+                        if oa0 + step > o.len() {
+                            break;
+                        }
+                        let ob0 = oa0 as i64 + lag;
+                        if ob0 < 0 {
+                            continue;
+                        }
+                        let ob0 = ob0 as usize;
+                        if ob0 + step > t.len() {
+                            continue;
+                        }
+                        let c = correlation(&o[oa0..oa0 + step], &t[ob0..ob0 + step]);
+                        println!("    t={sec:>2}s corr={c:.6}");
+                    }
+                }
                 // Coordinator follow-up (4): on the two named rows, probe
                 // candidate total HE-vs-reference delays built from LC's own
                 // priming lag plus a guessed SBR-chain contribution, to see
