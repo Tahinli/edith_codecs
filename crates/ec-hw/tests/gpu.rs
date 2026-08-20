@@ -1032,3 +1032,93 @@ fn short(path: &Path) -> String {
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default()
 }
+
+/// A CRA GOP boundary stores its RASL leading pictures *after* the CRA in
+/// decode order, even though they display before it (they predict from
+/// pictures the CRA's own random-access point does not have). A decoder
+/// started fresh at that CRA — what a seek does — must therefore drop those
+/// RASL pictures per H.265 8.1.3's `NoRaslOutputFlag`, or its output shifts by
+/// however many RASL pictures the GOP has, handing back the wrong picture for
+/// every display index at or after the seek target.
+#[test]
+fn hevc_seek_matches_linear_mkv() {
+    let Some(display) = display() else { return };
+    let path = bitstreams().join("test_hevc.mkv");
+    let Some(data) = elementary(&path, Codec::H265, 45) else {
+        eprintln!("skipped: no test_hevc.mkv fixture");
+        return;
+    };
+    let units = split_access_units(&data, Codec::H265);
+
+    // Linear decode: every picture from the start, frame 30 kept for
+    // comparison (the file's second CRA, per `test_hevc.mkv`'s 30-picture
+    // GOPs).
+    const TARGET: usize = 30;
+    let mut decoder = Decoder::new(&display, Codec::H265).expect("decoder opens");
+    let mut linear_frame_30 = None;
+    let mut index = 0usize;
+    decode_stream(&mut decoder, Codec::H265, &data, 45, |frame| {
+        if index == TARGET {
+            linear_frame_30 = Some(frame.to_i420().expect("readback"));
+        }
+        index += 1;
+    })
+    .expect("linear decode");
+    let linear_frame_30 = linear_frame_30.expect("linear decode reached frame 30");
+
+    // Find the access unit whose first VCL NAL is the CRA at this GOP
+    // boundary, and feed the decoder from there on, exactly as a seek would:
+    // nothing from before it goes in.
+    let cra_at = units
+        .iter()
+        .position(|au| starts_with_cra(au))
+        .expect("a CRA access unit exists");
+
+    // A seek reuses the parameter sets a decoder already learned; a fresh one
+    // has none, so it is primed the same way `ec_hw::Decoder::reset` expects a
+    // caller to: decode the leading VPS/SPS/PPS (their IDR picture is thrown
+    // away) and reset picture state before feeding the seek target.
+    let mut seek_decoder = Decoder::new(&display, Codec::H265).expect("decoder opens");
+    seek_decoder.decode(units[0], 0).expect("prime parameter sets");
+    seek_decoder.reset();
+    let mut seeked_frame = None;
+    for (i, unit) in units[cra_at..].iter().enumerate() {
+        seek_decoder.decode(unit, i as i64).expect("seek decode");
+        if let Some(frame) = seek_decoder.next_frame() {
+            seeked_frame = Some(frame.to_i420().expect("readback"));
+            break;
+        }
+    }
+    if seeked_frame.is_none() {
+        seek_decoder.flush().expect("flush");
+        seeked_frame = seek_decoder
+            .next_frame()
+            .map(|f| f.to_i420().expect("readback"));
+    }
+    let seeked_frame = seeked_frame.expect("a frame came out after the seek");
+
+    assert_eq!(
+        seeked_frame, linear_frame_30,
+        "seeking to the CRA before frame 30 handed back a different picture \
+         than a linear decode of frame 30 — RASL pictures were not dropped"
+    );
+}
+
+/// True when an access unit's first VCL NAL is an HEVC CRA (`nal_type` 21).
+/// A CRA's access unit may open with its own VPS/SPS/PPS, so this skips past
+/// non-VCL NALs to the first one that carries a slice.
+fn starts_with_cra(au: &[u8]) -> bool {
+    let mut i = 0usize;
+    while i + 3 < au.len() {
+        if au[i] == 0 && au[i + 1] == 0 && au[i + 2] == 1 {
+            let t = (au[i + 3] >> 1) & 0x3f;
+            if t <= 31 {
+                return t == 21;
+            }
+            i += 3;
+            continue;
+        }
+        i += 1;
+    }
+    false
+}
