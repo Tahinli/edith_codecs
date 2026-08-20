@@ -3870,9 +3870,17 @@ fn boneknapper_multichannel_lc_matches_reference() {
 /// Coupled-CPE swap probe: the `heaac_44100_48k` fixture's SBR side info
 /// shows `coupling: true` on nearly every AU (Nikbinler/FMJ, both passing,
 /// show `coupling: false`) -- checks whether our decoded ch0 actually
-/// correlates better against the REFERENCE's R channel than its own L,
-/// which would mean `dequant_pair`'s left/right assignment in
-/// `sbr_env::dequantize_frame` is swapped for coupled CPEs.
+/// correlates better against the REFERENCE's R channel than its own L.
+/// RULED OUT as the cause (this round): `sbr_env::dequant_pair`'s
+/// `panOffset`/exponent formula had two real spec bugs (fixed, see its
+/// doc comment) but neither the fix nor `EC_AAC_SBR_HF_BYPASS=1` (which
+/// reduces SBR to a per-channel low-band QMF round trip with NO
+/// envelope/coupling/HF-generation code running at all) changes this
+/// probe's correlation numbers -- the swap survives with the entire
+/// `sbr_env`/`sbr_hf` machinery out of the picture, so it lives
+/// elsewhere (plane/channel threading in `sbr_chain::apply_data` or
+/// `decode.rs`'s per-AU channel assembly, or this test's own
+/// interleave-to-plane de-mux -- unexplored this round).
 #[test]
 fn coupled_cpe_channel_swap_probe() {
     if !have_ffmpeg() {
