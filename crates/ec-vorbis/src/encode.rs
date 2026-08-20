@@ -78,6 +78,12 @@ const CLASS_RANGE: [i32; CLASSES] = [0, 1, 4, 16, 127];
 /// the threshold and code as class 0 whatever the step — gains bins to spend
 /// bits on rather than a finer step nothing can represent.
 const HEADROOM_RANGE: f64 = 36.0;
+/// A short block's range: the full 42 dB. Its step is what sets the pre-echo
+/// left inside the block that carries an onset, and 6 dB of it is the
+/// difference between a leak twice the reference's and one under it.
+/// Anything the wider range cannot state (a pair's angle, a peak at a floor
+/// region's edge) is caught by the clamp refit in `encode_block`.
+const HEADROOM_RANGE_SHORT: f64 = 42.0;
 /// Samples per transient-detection tick — the short block's own hop, so a
 /// tick lines up with the finest time resolution the encoder has.
 const TICK: usize = BLOCK_SHORT / 4;
@@ -167,6 +173,8 @@ struct BlockConfig {
     partition: usize,
     floor: Floor1,
     ath: Vec<f64>,
+    /// Headroom the residue range lets this block size state.
+    range: f64,
 }
 
 /// Vorbis I encoder.
@@ -236,8 +244,20 @@ impl VorbisEncoder {
         let floor_book = design_floor_book();
         let class_book = design_class_book();
         let residue_books = design_residue_books();
-        let long = build_block_config(HALF_LONG, PARTITION_LONG, FLOOR_POINTS_LONG, &config);
-        let short = build_block_config(HALF_SHORT, PARTITION_SHORT, FLOOR_POINTS_SHORT, &config);
+        let long = build_block_config(
+            HALF_LONG,
+            PARTITION_LONG,
+            FLOOR_POINTS_LONG,
+            HEADROOM_RANGE,
+            &config,
+        );
+        let short = build_block_config(
+            HALF_SHORT,
+            PARTITION_SHORT,
+            FLOOR_POINTS_SHORT,
+            HEADROOM_RANGE_SHORT,
+            &config,
+        );
 
         let headers = write_headers(
             &config,
@@ -522,65 +542,119 @@ impl VorbisEncoder {
 
         // Floor per channel — one shared floor per coupled pair, so the two
         // normalised spectra are on the same scale and the angle channel is
-        // small where the pair agrees.
-        let mut curves: Vec<Vec<f32>> = vec![Vec::new(); channels];
-        let mut floor_values: Vec<Vec<i32>> = vec![Vec::new(); channels];
-        let mut coded = vec![false; channels];
-        for &(magnitude, angle) in &self.coupling {
-            let peaks = peaks_of(&bc.floor, half, &[&spectra[magnitude], &spectra[angle]]);
-            let (y, step2) = fit_floor(&bc.floor, &bc.ath, self.headroom, &peaks);
-            let mut curve = vec![0.0f32; half];
-            render_floor1(&bc.floor, &y, &step2, &mut curve);
-            curves[magnitude] = curve.clone();
-            curves[angle] = curve;
-            floor_values[magnitude] = y.clone();
-            floor_values[angle] = y;
-            coded[magnitude] = true;
-            coded[angle] = true;
-        }
-        for channel in 0..channels {
-            if coded[channel] {
-                continue;
-            }
-            let peaks = peaks_of(&bc.floor, half, &[&spectra[channel]]);
-            let (y, step2) = fit_floor(&bc.floor, &bc.ath, self.headroom, &peaks);
-            let mut curve = vec![0.0f32; half];
-            render_floor1(&bc.floor, &y, &step2, &mut curve);
-            curves[channel] = curve;
-            floor_values[channel] = y;
-        }
-
-        // Normalise, couple, quantise.
-        let mut quantised: Vec<Vec<i32>> = (0..channels)
-            .map(|channel| {
-                spectra[channel]
+        // small where the pair agrees. The floor is set per X point from the
+        // peak of the region that point owns, then drawn as straight lines
+        // between points: a peak at a region's edge can sit further under the
+        // curve than the range states and clamp. Such a block lifts the two
+        // points either side of every clamping bin by the excess and refits
+        // until nothing clamps, so the curve hugs the peaks the range is
+        // measured from.
+        let limit = CLASS_RANGE[CLASSES - 1];
+        let mut lift: Vec<Vec<f64>> = vec![vec![1.0; bc.floor.x_list.len()]; channels];
+        // Per X point, the span of bins whose curve it has a hand in.
+        let spans: Vec<(usize, usize)> = bc
+            .floor
+            .x_list
+            .iter()
+            .map(|&x| {
+                let below = bc
+                    .floor
+                    .x_list
                     .iter()
-                    .zip(curves[channel].iter())
-                    .map(|(&value, &floor)| match floor > 0.0 {
-                        true => value / floor,
-                        false => 0.0,
-                    })
-                    .map(|normalised| normalised.round() as i32)
-                    .collect::<Vec<i32>>()
+                    .filter(|&&o| o < x)
+                    .max()
+                    .map_or(0, |&o| o as usize);
+                let above = bc
+                    .floor
+                    .x_list
+                    .iter()
+                    .filter(|&&o| o > x)
+                    .min()
+                    .map_or(half, |&o| o as usize);
+                (below, above)
             })
             .collect();
-        for &(magnitude, angle) in &self.coupling {
-            let mut left = std::mem::take(&mut quantised[magnitude]);
-            let mut right = std::mem::take(&mut quantised[angle]);
-            for (l, r) in left.iter_mut().zip(right.iter_mut()) {
-                let (m, a) = couple(*l, *r);
-                *l = m;
-                *r = a;
+        let mut passes = 0;
+        let (floor_values, quantised) = loop {
+            let mut curves: Vec<Vec<f32>> = vec![Vec::new(); channels];
+            let mut floor_values: Vec<Vec<i32>> = vec![Vec::new(); channels];
+            let mut fit = |group: &[usize]| {
+                let group_spectra: Vec<&Vec<f32>> = group.iter().map(|&c| &spectra[c]).collect();
+                let mut peaks = peaks_of(&bc.floor, half, &group_spectra);
+                for &c in group {
+                    for (peak, &boost) in peaks.iter_mut().zip(&lift[c]) {
+                        *peak *= boost;
+                    }
+                }
+                let (y, step2) = fit_floor(&bc.floor, &bc.ath, self.headroom, bc.range, &peaks);
+                let mut curve = vec![0.0f32; half];
+                render_floor1(&bc.floor, &y, &step2, &mut curve);
+                for &c in group {
+                    curves[c] = curve.clone();
+                    floor_values[c] = y.clone();
+                }
+            };
+            let mut coded = vec![false; channels];
+            for &(magnitude, angle) in &self.coupling {
+                fit(&[magnitude, angle]);
+                coded[magnitude] = true;
+                coded[angle] = true;
             }
-            quantised[magnitude] = left;
-            quantised[angle] = right;
-        }
-        let limit = CLASS_RANGE[CLASSES - 1];
-        for channel in quantised.iter_mut() {
-            for value in channel.iter_mut() {
-                *value = (*value).clamp(-limit, limit);
+            for channel in (0..channels).filter(|&c| !coded[c]) {
+                fit(&[channel]);
             }
-        }
+
+            // Normalise, couple, quantise.
+            let mut quantised: Vec<Vec<i32>> = (0..channels)
+                .map(|channel| {
+                    spectra[channel]
+                        .iter()
+                        .zip(curves[channel].iter())
+                        .map(|(&value, &floor)| match floor > 0.0 {
+                            true => value / floor,
+                            false => 0.0,
+                        })
+                        .map(|normalised| normalised.round() as i32)
+                        .collect::<Vec<i32>>()
+                })
+                .collect();
+            for &(magnitude, angle) in &self.coupling {
+                let mut left = std::mem::take(&mut quantised[magnitude]);
+                let mut right = std::mem::take(&mut quantised[angle]);
+                for (l, r) in left.iter_mut().zip(right.iter_mut()) {
+                    let (m, a) = couple(*l, *r);
+                    *l = m;
+                    *r = a;
+                }
+                quantised[magnitude] = left;
+                quantised[angle] = right;
+            }
+            let mut clamps = false;
+            for (channel, values) in quantised.iter().enumerate() {
+                for (bin, &value) in values.iter().enumerate() {
+                    if value.abs() <= limit {
+                        continue;
+                    }
+                    clamps = true;
+                    let excess = f64::from(value.abs()) / f64::from(limit) * 1.05;
+                    for (point, &(below, above)) in spans.iter().enumerate() {
+                        if bin >= below && bin <= above {
+                            lift[channel][point] = lift[channel][point].max(excess);
+                        }
+                    }
+                }
+            }
+            passes += 1;
+            // Eight lifts is 8 x 6 dB past anything a 42 dB range can leave over.
+            if !clamps || passes == 8 {
+                for channel in quantised.iter_mut() {
+                    for value in channel.iter_mut() {
+                        *value = (*value).clamp(-limit, limit);
+                    }
+                }
+                break (floor_values, quantised);
+            }
+        };
 
         let mut out = BitsOut::new();
         out.bit(false);
@@ -658,7 +732,13 @@ fn peaks_of(floor: &Floor1, half: usize, spectra: &[&Vec<f32>]) -> Vec<f64> {
 /// loop's headroom, then hold the absolute threshold of hearing as a lower
 /// bound: below it the residue quantises to zero and costs a class-0
 /// partition.
-fn fit_floor(floor: &Floor1, ath: &[f64], headroom: f64, peaks: &[f64]) -> (Vec<i32>, Vec<bool>) {
+fn fit_floor(
+    floor: &Floor1,
+    ath: &[f64],
+    headroom: f64,
+    range: f64,
+    peaks: &[f64],
+) -> (Vec<i32>, Vec<bool>) {
     let mut db: Vec<f64> = peaks
         .iter()
         .map(|&peak| 20.0 * (peak.max(1e-9)).log10())
@@ -676,7 +756,7 @@ fn fit_floor(floor: &Floor1, ath: &[f64], headroom: f64, peaks: &[f64]) -> (Vec<
         .iter()
         .zip(ath.iter())
         .map(|(&level, &threshold)| {
-            (level - headroom.min(HEADROOM_RANGE)).max(threshold - (headroom - HEADROOM_RANGE).max(0.0))
+            (level - headroom.min(range)).max(threshold - (headroom - range).max(0.0))
         })
         .collect();
     let y: Vec<i32> = target
@@ -900,7 +980,13 @@ fn build_floor(half: usize, points: usize) -> Floor1 {
 }
 
 /// Build one block size's floor and ATH curve.
-fn build_block_config(half: usize, partition: usize, points: usize, config: &EncoderConfig) -> BlockConfig {
+fn build_block_config(
+    half: usize,
+    partition: usize,
+    points: usize,
+    range: f64,
+    config: &EncoderConfig,
+) -> BlockConfig {
     let floor = build_floor(half, points);
     let ath = floor
         .x_list
@@ -910,7 +996,7 @@ fn build_block_config(half: usize, partition: usize, points: usize, config: &Enc
             absolute_threshold(hz)
         })
         .collect();
-    BlockConfig { half, partition, floor, ath }
+    BlockConfig { half, partition, floor, ath, range }
 }
 
 /// Folded floor amplitudes: mostly small corrections, occasionally an escape
