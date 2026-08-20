@@ -36,27 +36,37 @@
 use crate::sbr_bands::BandTables;
 use ec_dsp::Complex;
 
-/// Compensates a QMF-bank convention gap `sbr_qmf`'s round-trip tuning never
-/// exercised: replaying a source band's raw complex series into a
-/// *different* synthesis band (exactly what patch copying does) lands the
-/// content at the wrong absolute frequency by exactly one synthesis-band
-/// width whenever `target_band - source_band` is odd, with the sign flipping
-/// every other odd step -- i.e. a period-4 pattern in `target - source`
-/// (even difference: no error; `+1 mod 4`: content lands one band flat;
-/// `+3 mod 4`: one band sharp). `sbr_qmf::Synthesis`'s modulation kernel
-/// centres band `k` at `(k+0.5) * pi/(2*SYNTHESIS_BANDS)` via a phase
-/// intercept that is itself `(k+0.5) * pi/4` -- exactly the odd-stacked
-/// cosine-modulated-bank convention the round-trip test tuned for
-/// same-band replay, where this intercept cancels against the receiving
-/// band's own reconstruction. For an odd `target - source` that intercept
-/// difference is an odd multiple of `pi/4`, which this design's finite,
-/// hop-discretised overlap-add can't represent without a full extra
-/// `pi/2 * (target - source)`-quarter snap; `generate` cancels it here by
-/// counter-rotating the patched series at the same quarter-turn rate before
-/// it reaches `Synthesis`, rather than reworking the tuned bank convention
-/// (which round-trip/gain-flatness tests already hold to a hard-won bound).
-/// Returns the signed number of `pi/2` quarter-turns per QMF slot to rotate
-/// the copied series by.
+/// Characterizes (but, as of round-37, is deliberately NOT applied to) a QMF
+/// bank convention gap `sbr_qmf`'s round-trip tuning never exercised:
+/// replaying a source band's raw complex series into a *different* synthesis
+/// band (exactly what patch copying does) lands the content at the "wrong"
+/// absolute frequency by exactly one synthesis-band width whenever
+/// `target_band - source_band` is odd, with the sign flipping every other
+/// odd step -- i.e. a period-4 pattern in `target - source` (even
+/// difference: no error; `+1 mod 4`: content lands one band flat; `+3 mod
+/// 4`: one band sharp). `sbr_qmf::Synthesis`'s modulation kernel centres
+/// band `k` at `(k+0.5) * pi/(2*SYNTHESIS_BANDS)` via a phase intercept that
+/// is itself `(k+0.5) * pi/4` -- exactly the odd-stacked cosine-modulated-
+/// bank convention the round-trip test tuned for same-band replay, where
+/// this intercept cancels against the receiving band's own reconstruction.
+///
+/// Round-35 had `generate` counter-rotate the patched series by this amount
+/// before it reaches `Synthesis`, and proved (in isolation, via a
+/// stationary-tone FFT probe through the actual production call site --
+/// `sbr_qmf::tests::patch_replay_through_generate_preserves_absolute_frequency_mapping`)
+/// that doing so restores textbook-coherent absolute-frequency placement.
+/// Round-36/37's real-file mechanical A/B (`EC_AAC_SBR_PARITY_SPLIT`)
+/// showed applying that correction REGRESSES odd-gap coherence against the
+/// reference decoder (ch0 0.1907->0.0714, ch1 0.2461->0.0741; a
+/// sign-flipped variant and a half-rate variant both regress it too, to
+/// 0.0757 and 0.1449 respectively on ch0) -- the reference apparently
+/// reproduces this same "wrong" convention itself, so leaving the raw copy
+/// unrotated is what actually matches it. This function is kept (and
+/// pinned by its own unit tests) purely to document that convention as
+/// intentional, not to be called from `generate`'s patch-copy site.
+/// Returns the signed number of `pi/2` quarter-turns per QMF slot that
+/// *would* need to be applied to restore frequency-pure placement.
+#[allow(dead_code)] // documentation of the characterized convention; tests call it
 pub(crate) fn band_shift_correction(target_band: usize, source_band: usize) -> i64 {
     match (target_band as i64 - source_band as i64).rem_euclid(4) {
         1 => 1,
@@ -328,11 +338,6 @@ fn stabilize(coeffs: (Complex<f64>, Complex<f64>)) -> (Complex<f64>, Complex<f64
 pub struct HfHistory {
     x: Vec<[Complex<f64>; 2]>,
     y: Vec<[Complex<f64>; 2]>,
-    /// Running QMF-slot counter mod 4, since stream start -- carries the
-    /// patch-band-shift phase correction's own period across frame calls
-    /// (see `band_shift_correction` in `generate`). Only the value mod 4
-    /// matters (the correction's period), so this never grows unbounded.
-    slot_phase: usize,
 }
 
 impl HfHistory {
@@ -340,7 +345,6 @@ impl HfHistory {
         HfHistory {
             x: vec![[Complex::ZERO; 2]; bands],
             y: vec![[Complex::ZERO; 2]; bands],
-            slot_phase: 0,
         }
     }
 }
@@ -408,24 +412,24 @@ pub fn generate(
             } else {
                 (Complex::ZERO, Complex::ZERO)
             };
-            let k = band_shift_correction(target_band, source_band);
             let dst = &mut out[target_band - kx];
             for (n, &x) in series.iter().enumerate() {
                 let residual = x - a1 * x_prev1 - a2 * x_prev2;
                 let y = residual + ca1 * y_prev1 + ca2 * y_prev2;
-                // The filter's own recursion continues on the unrotated
-                // `y` (its whitening state belongs to the source band, not
-                // the target placement); only what lands in `dst` -- the
-                // value `Synthesis` will actually see at `target_band` --
-                // gets the placement correction.
-                dst[n] = if k == 0 {
-                    y
-                } else {
-                    let t_mod4 = (history.slot_phase + n) % 4;
-                    let angle = k as f64 * std::f64::consts::FRAC_PI_2 * t_mod4 as f64;
-                    let rot = Complex::new(angle.cos(), angle.sin());
-                    Complex::new(y.re * rot.re - y.im * rot.im, y.re * rot.im + y.im * rot.re)
-                };
+                // Round-37 (Task 2): `band_shift_correction` is proven exact
+                // in isolation (a stationary tone replayed through this
+                // patch-copy site lands within a couple of FFT bins of its
+                // corrected absolute frequency -- see
+                // `sbr_qmf::tests::patch_replay_through_generate_preserves_absolute_frequency_mapping`)
+                // but a real-file mechanical A/B (round-36/37,
+                // `EC_AAC_SBR_PARITY_SPLIT`) shows applying it REGRESSES
+                // odd-gap coherence against the reference decoder (ch0
+                // 0.1907->0.0714, ch1 0.2461->0.0741; sign-flipped and
+                // half-rate variants both regress it too, 0.0757/0.1449 resp.
+                // on ch0). The reference apparently exhibits this bank's own
+                // "wrong" cross-band placement convention, so matching it is
+                // the bar: `dst` stays the plain, uncorrected copy.
+                dst[n] = y;
                 x_prev2 = x_prev1;
                 x_prev1 = x;
                 y_prev2 = y_prev1;
@@ -433,7 +437,6 @@ pub fn generate(
             }
         }
     }
-    history.slot_phase = (history.slot_phase + num_slots) % 4;
 
     // Every source subband's history advances regardless of whether a
     // patch used it this frame: the low-band QMF stream is continuous.
