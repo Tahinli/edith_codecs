@@ -26,6 +26,10 @@ pub(crate) struct SeqParams {
     pub bitrate: u32,
     /// CABAC, which Baseline does not allow: the sequence is then Main.
     pub cabac: bool,
+    /// 8x8 transform (High profile). Forces `profile_idc` 100 with no
+    /// constraint flags, and the High-profile SPS tail (7.3.2.1.1 subset:
+    /// 4:2:0 8-bit, no scaling matrices, no transform bypass).
+    pub transform_8x8: bool,
 }
 
 /// `log2_max_frame_num`, fixed: 8 bits of frame_num wrap far beyond the one
@@ -73,10 +77,23 @@ pub(crate) fn write_sps(p: &SeqParams) -> Vec<u8> {
     let mut w = BitWriter::with_capacity(32);
     // Main when CABAC is in force (Baseline has no CABAC), Baseline otherwise;
     // constraint_set1_flag says the stream also obeys the Main constraints.
-    w.write_bits(if p.cabac { 77 } else { 66 }, 8);
-    w.write_bits(if p.cabac { 0b0100_0000 } else { 0b1100_0000 }, 8);
+    // 8x8 transform needs High profile (100), which sets no constraint flags.
+    if p.transform_8x8 {
+        w.write_bits(100, 8);
+        w.write_bits(0, 8);
+    } else {
+        w.write_bits(if p.cabac { 77 } else { 66 }, 8);
+        w.write_bits(if p.cabac { 0b0100_0000 } else { 0b1100_0000 }, 8);
+    }
     w.write_bits(u32::from(level_idc(p)), 8);
     w.write_ue(0); // seq_parameter_set_id
+    if p.transform_8x8 {
+        w.write_ue(1); // chroma_format_idc: 4:2:0
+        w.write_ue(0); // bit_depth_luma_minus8
+        w.write_ue(0); // bit_depth_chroma_minus8
+        w.write_bit(false); // qpprime_y_zero_transform_bypass_flag
+        w.write_bit(false); // seq_scaling_matrix_present_flag
+    }
     w.write_ue(LOG2_MAX_FRAME_NUM - 4);
     w.write_ue(2); // pic_order_cnt_type 2: output order is decode order
     w.write_ue(1); // max_num_ref_frames
@@ -114,7 +131,7 @@ pub(crate) fn write_sps(p: &SeqParams) -> Vec<u8> {
 }
 
 /// Write the picture parameter set RBSP (7.3.2.2).
-pub(crate) fn write_pps(cabac: bool) -> Vec<u8> {
+pub(crate) fn write_pps(cabac: bool, transform_8x8: bool) -> Vec<u8> {
     let mut w = BitWriter::with_capacity(8);
     w.write_ue(0); // pic_parameter_set_id
     w.write_ue(0); // seq_parameter_set_id
@@ -131,6 +148,11 @@ pub(crate) fn write_pps(cabac: bool) -> Vec<u8> {
     w.write_bit(false); // deblocking_filter_control_present_flag
     w.write_bit(false); // constrained_intra_pred_flag
     w.write_bit(false); // redundant_pic_cnt_present_flag
+    if transform_8x8 {
+        w.write_bit(true); // transform_8x8_mode_flag
+        w.write_bit(false); // pic_scaling_matrix_present_flag
+        w.write_se(0); // second_chroma_qp_index_offset
+    }
     trailing(&mut w);
     w.into_bytes()
 }
@@ -199,6 +221,7 @@ mod tests {
             timing: (1000, 60000),
             bitrate: 8_000_000,
             cabac: true,
+            transform_8x8: false,
         }
     }
 
@@ -206,15 +229,18 @@ mod tests {
     /// parser reads back, geometry, cropping, profile and entropy coder alike.
     #[test]
     fn parameter_sets_parse_back() {
-        for (w, h, cabac) in [
-            (1920, 1080, true),
-            (1920, 1080, false),
-            (640, 480, true),
-            (854, 482, false),
-            (16, 16, true),
+        for (w, h, cabac, t8x8) in [
+            (1920, 1080, true, false),
+            (1920, 1080, false, false),
+            (640, 480, true, false),
+            (854, 482, false, false),
+            (16, 16, true, false),
+            (640, 480, true, true),
+            (640, 480, false, true),
         ] {
             let mut p = params(w, h);
             p.cabac = cabac;
+            p.transform_8x8 = t8x8;
             let sps = Sps::parse(&write_sps(&p)).expect("SPS parses");
             assert_eq!((sps.width, sps.height), (w, h), "{w}x{h} crop");
             assert_eq!(sps.mb_width, p.mb_w);
@@ -224,10 +250,25 @@ mod tests {
             assert!(sps.frame_mbs_only);
             let vui = sps.vui.as_ref().expect("VUI present");
             assert_eq!(vui.timing_info, Some((1000, 60000, true)));
-            assert_eq!(sps.profile_idc, if cabac { 77 } else { 66 });
-            let pps = Pps::parse(&write_pps(cabac), |_| Some(&sps)).expect("PPS parses");
+            assert_eq!(
+                sps.profile_idc,
+                if t8x8 {
+                    100
+                } else if cabac {
+                    77
+                } else {
+                    66
+                }
+            );
+            if t8x8 {
+                assert_eq!(sps.chroma_format_idc, 1);
+                assert_eq!(sps.bit_depth_luma, 8);
+            }
+            let pps =
+                Pps::parse(&write_pps(cabac, t8x8), |_| Some(&sps)).expect("PPS parses");
             assert_eq!(pps.entropy_coding_mode, cabac);
             assert_eq!(pps.pic_init_qp, 26);
+            assert_eq!(pps.transform_8x8_mode, t8x8);
         }
     }
 
@@ -246,7 +287,7 @@ mod tests {
     fn slice_header_parses_back() {
         let p = params(320, 240);
         let sps = Sps::parse(&write_sps(&p)).unwrap();
-        let pps = Pps::parse(&write_pps(true), |_| Some(&sps)).unwrap();
+        let pps = Pps::parse(&write_pps(true, false), |_| Some(&sps)).unwrap();
         for (idr, slice_type, first_mb, qp) in [
             (true, SliceType::I, 0u32, 30i32),
             (false, SliceType::P, 40, 18),
