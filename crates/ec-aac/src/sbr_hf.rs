@@ -36,6 +36,35 @@
 use crate::sbr_bands::BandTables;
 use ec_dsp::Complex;
 
+/// Compensates a QMF-bank convention gap `sbr_qmf`'s round-trip tuning never
+/// exercised: replaying a source band's raw complex series into a
+/// *different* synthesis band (exactly what patch copying does) lands the
+/// content at the wrong absolute frequency by exactly one synthesis-band
+/// width whenever `target_band - source_band` is odd, with the sign flipping
+/// every other odd step -- i.e. a period-4 pattern in `target - source`
+/// (even difference: no error; `+1 mod 4`: content lands one band flat;
+/// `+3 mod 4`: one band sharp). `sbr_qmf::Synthesis`'s modulation kernel
+/// centres band `k` at `(k+0.5) * pi/(2*SYNTHESIS_BANDS)` via a phase
+/// intercept that is itself `(k+0.5) * pi/4` -- exactly the odd-stacked
+/// cosine-modulated-bank convention the round-trip test tuned for
+/// same-band replay, where this intercept cancels against the receiving
+/// band's own reconstruction. For an odd `target - source` that intercept
+/// difference is an odd multiple of `pi/4`, which this design's finite,
+/// hop-discretised overlap-add can't represent without a full extra
+/// `pi/2 * (target - source)`-quarter snap; `generate` cancels it here by
+/// counter-rotating the patched series at the same quarter-turn rate before
+/// it reaches `Synthesis`, rather than reworking the tuned bank convention
+/// (which round-trip/gain-flatness tests already hold to a hard-won bound).
+/// Returns the signed number of `pi/2` quarter-turns per QMF slot to rotate
+/// the copied series by.
+pub(crate) fn band_shift_correction(target_band: usize, source_band: usize) -> i64 {
+    match (target_band as i64 - source_band as i64).rem_euclid(4) {
+        1 => 1,
+        3 => -1,
+        _ => 0,
+    }
+}
+
 /// One copy-up patch: `width` consecutive QMF bands starting at
 /// `source_start` are written to `target_start..target_start+width`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -299,6 +328,11 @@ fn stabilize(coeffs: (Complex<f64>, Complex<f64>)) -> (Complex<f64>, Complex<f64
 pub struct HfHistory {
     x: Vec<[Complex<f64>; 2]>,
     y: Vec<[Complex<f64>; 2]>,
+    /// Running QMF-slot counter mod 4, since stream start -- carries the
+    /// patch-band-shift phase correction's own period across frame calls
+    /// (see `band_shift_correction` in `generate`). Only the value mod 4
+    /// matters (the correction's period), so this never grows unbounded.
+    slot_phase: usize,
 }
 
 impl HfHistory {
@@ -306,6 +340,7 @@ impl HfHistory {
         HfHistory {
             x: vec![[Complex::ZERO; 2]; bands],
             y: vec![[Complex::ZERO; 2]; bands],
+            slot_phase: 0,
         }
     }
 }
@@ -373,11 +408,24 @@ pub fn generate(
             } else {
                 (Complex::ZERO, Complex::ZERO)
             };
+            let k = band_shift_correction(target_band, source_band);
             let dst = &mut out[target_band - kx];
             for (n, &x) in series.iter().enumerate() {
                 let residual = x - a1 * x_prev1 - a2 * x_prev2;
                 let y = residual + ca1 * y_prev1 + ca2 * y_prev2;
-                dst[n] = y;
+                // The filter's own recursion continues on the unrotated
+                // `y` (its whitening state belongs to the source band, not
+                // the target placement); only what lands in `dst` -- the
+                // value `Synthesis` will actually see at `target_band` --
+                // gets the placement correction.
+                dst[n] = if k == 0 {
+                    y
+                } else {
+                    let t_mod4 = (history.slot_phase + n) % 4;
+                    let angle = k as f64 * std::f64::consts::FRAC_PI_2 * t_mod4 as f64;
+                    let rot = Complex::new(angle.cos(), angle.sin());
+                    Complex::new(y.re * rot.re - y.im * rot.im, y.re * rot.im + y.im * rot.re)
+                };
                 x_prev2 = x_prev1;
                 x_prev1 = x;
                 y_prev2 = y_prev1;
@@ -385,6 +433,7 @@ pub fn generate(
             }
         }
     }
+    history.slot_phase = (history.slot_phase + num_slots) % 4;
 
     // Every source subband's history advances regardless of whether a
     // patch used it this frame: the low-band QMF stream is continuous.
