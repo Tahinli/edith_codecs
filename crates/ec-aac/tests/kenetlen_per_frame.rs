@@ -94,6 +94,17 @@ fn kenetlen_per_frame_scan() {
     // no lag search needed unless the two genuinely desync).
     let win = 1024usize;
     let mut first_bad: Option<usize> = None;
+    let mut bad_count = 0usize;
+    let mut pns_frames = 0usize;
+    for r in &rows {
+        if r.pns_bands > 0 {
+            pns_frames += 1;
+        }
+    }
+    eprintln!("frames with pns_bands>0: {pns_frames} / {}", rows.len());
+    let full_rms_o: f64 = (ours.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / ours.len() as f64).sqrt();
+    let full_rms_t: f64 = (theirs.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / theirs.len() as f64).sqrt();
+    eprintln!("full-file rms ours={full_rms_o:.6} ffmpeg={full_rms_t:.6}");
     for (i, &start) in frame_starts.iter().enumerate() {
         if start + win > ours.len() || start + win > theirs.len() {
             break;
@@ -107,10 +118,14 @@ fn kenetlen_per_frame_scan() {
         let db: f64 = b.iter().map(|y| f64::from(*y - mb).powi(2)).sum();
         let corr = if da * db == 0.0 { 1.0 } else { num / (da * db).sqrt() };
         if corr.abs() < 0.9 {
+            bad_count += 1;
             if first_bad.is_none() {
                 first_bad = Some(i);
             }
-            eprintln!("AU {i}: sample_start={start} corr={corr:.4} BAD");
+            let rms_o: f64 = (a.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / win as f64).sqrt();
+            let rms_t: f64 = (b.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / win as f64).sqrt();
+            let pns = rows.get(i).map(|r| r.pns_bands).unwrap_or(0);
+            eprintln!("AU {i}: sample_start={start} corr={corr:.4} rms_o={rms_o:.6} rms_t={rms_t:.6} pns_bands={pns} BAD");
         } else if i % 50 == 0 {
             eprintln!("AU {i}: sample_start={start} corr={corr:.4}");
         }
@@ -127,6 +142,22 @@ fn kenetlen_per_frame_scan() {
         eprintln!("  rms ours={rms_o:.6} ffmpeg={rms_t:.6}");
     }
 
+    eprintln!("total BAD (|corr|<0.9) AUs: {bad_count} / {}", frame_starts.len());
+    // Whole-window (first 10s @ 44.1k = 441000 samples) zero-lag Pearson,
+    // ours vs ffmpeg -- reproduces (or not) the engine sweep's 0.9840 figure
+    // from this decoder-level data alone.
+    let n = 441_000usize.min(ours.len()).min(theirs.len());
+    let (a, b) = (&ours[..n], &theirs[..n]);
+    let ma = a.iter().map(|v| f64::from(*v)).sum::<f64>() / n as f64;
+    let mb = b.iter().map(|v| f64::from(*v)).sum::<f64>() / n as f64;
+    let (mut num, mut da, mut db) = (0.0f64, 0.0f64, 0.0f64);
+    for (x, y) in a.iter().zip(b) {
+        let (x, y) = (f64::from(*x) - ma, f64::from(*y) - mb);
+        num += x * y;
+        da += x * x;
+        db += y * y;
+    }
+    eprintln!("whole-10s zero-lag Pearson (n={n}): {:.6}", num / (da * db).sqrt());
     if let Some(bad) = first_bad {
         eprintln!("=== first bad AU: {bad} ===");
         for i in bad.saturating_sub(2)..=bad + 2 {
