@@ -18,17 +18,26 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
+    // Round-32: built via the SAME write_audio_specific_config +
+    // with_config_bytes round trip `wrap_sbr` uses (AOT_SBR, core rate
+    // 22050 = ADTS sf_index 7's SAMPLE_RATES entry, extension 44100) so this
+    // path and the reference's wrap_sbr-wrapped mp4 read byte-identical ASC
+    // semantics -- the prior hand-built config (object_type=2/AAC-LC,
+    // sample_rate=44100 for what is actually the 22050 Hz *core*) diverged
+    // from wrap_sbr's ASC, which is why the sanity gate (ours vs
+    // build_patches) was failing independent of any patch-map bug.
     let mut decoder = if same_rate_sbr {
-        ec_aac::AacDecoder::with_config(ec_aac::AudioSpecificConfig {
-            object_type: 2,
-            sample_rate: 44100,
+        let asc = ec_aac::write_audio_specific_config(&ec_aac::AudioSpecificConfig {
+            object_type: ec_aac::AOT_SBR,
+            sample_rate: 22050,
             sf_index: 7,
             channels,
             channel_config: channels as u8,
             sbr_present: true,
             ps_present: false,
             extension_sample_rate: Some(44100),
-        })
+        });
+        ec_aac::AacDecoder::with_config_bytes(&asc).expect("asc parses")
     } else {
         ec_aac::AacDecoder::new()
     };
