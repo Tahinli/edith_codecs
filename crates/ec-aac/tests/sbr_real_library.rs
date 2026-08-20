@@ -4619,3 +4619,76 @@ fn sbr_hf_window_band_probe() {
         );
     }
 }
+
+/// Round-59 residual locator: per-2048-sample-window corr at lag 0 (worst
+/// windows, with the output frame index) plus a complex-STFT per-band
+/// correlation (Parseval: equals the time-domain corr restricted to that
+/// band, so it needs no calibration) with an ours-vs-ours self-check column.
+#[test]
+fn sbr_residual_locator() {
+    if !have_ffmpeg() {
+        return;
+    }
+    let home = std::env::var("HOME").unwrap();
+    let path = PathBuf::from(format!("{home}/Music/Yok - Nikbinler.mp4"));
+    if !path.exists() {
+        return;
+    }
+    let Some((ours, _, rate)) = our_decode(&path, 0) else { return };
+    let theirs = ffmpeg_decode(&path, 0, ours.len());
+    const W: usize = 2048;
+    const FFT_LEN: usize = 2048;
+    const HOP: usize = 1024;
+    let bins = FFT_LEN / 2 + 1;
+    let mut rfft = ec_dsp::RealFft::<f32>::new(FFT_LEN);
+    let win = ec_dsp::Window::<f32>::sine(FFT_LEN);
+    for ch in 0..ours.len() {
+        let n = ours[ch].len().min(theirs[ch].len());
+        let (o, t) = (&ours[ch][..n], &theirs[ch][..n]);
+        let mut wins: Vec<(f64, usize)> = (0..n / W)
+            .map(|w| (correlation(&o[w * W..(w + 1) * W], &t[w * W..(w + 1) * W]), w))
+            .collect();
+        wins.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        println!("ch{ch} worst windows (corr, frame): {:?}", &wins[..12]);
+        let hops = (n - FFT_LEN) / HOP + 1;
+        let mut spec = vec![ec_dsp::Complex::new(0.0f32, 0.0); bins];
+        let mut acc = vec![[0.0f64; 3]; bins]; // re(o*conj t), |o|^2, |t|^2
+        let mut os = vec![ec_dsp::Complex::new(0.0f32, 0.0); bins];
+        for h in 0..hops {
+            let mut b = o[h * HOP..h * HOP + FFT_LEN].to_vec();
+            win.apply(&mut b);
+            rfft.forward(&b, &mut spec);
+            os.copy_from_slice(&spec);
+            let mut b = t[h * HOP..h * HOP + FFT_LEN].to_vec();
+            win.apply(&mut b);
+            rfft.forward(&b, &mut spec);
+            for k in 0..bins {
+                let (a, c) = (os[k], spec[k]);
+                acc[k][0] += f64::from(a.re * c.re + a.im * c.im);
+                acc[k][1] += f64::from(a.norm_sqr());
+                acc[k][2] += f64::from(c.norm_sqr());
+            }
+        }
+        let hz = f64::from(rate) / FFT_LEN as f64;
+        let tot: f64 = acc.iter().map(|a| a[1] + a[2]).sum();
+        // group into 250 Hz bands up to 8 kHz, then 1 kHz
+        let mut edges: Vec<usize> = (0..=32).map(|i| ((i as f64 * 250.0) / hz) as usize).collect();
+        edges.extend((9..=22).map(|i| ((i as f64 * 1000.0) / hz) as usize));
+        for e in edges.windows(2) {
+            let (mut c, mut po, mut pt) = (0.0, 0.0, 0.0);
+            for k in e[0]..e[1].min(bins) {
+                c += acc[k][0];
+                po += acc[k][1];
+                pt += acc[k][2];
+            }
+            println!(
+                "ch{ch} {:5.0}-{:5.0} Hz corr {:.5} rms ours/ref {:.4} energy share {:.4}",
+                e[0] as f64 * hz,
+                e[1] as f64 * hz,
+                c / (po * pt).sqrt(),
+                (po / pt).sqrt(),
+                (po + pt) / tot
+            );
+        }
+    }
+}

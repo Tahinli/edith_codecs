@@ -64,6 +64,9 @@ pub struct SbrChannel {
     /// at the transient border, `-1` when the frame has none. Gates where
     /// added sinusoids begin and which envelope skips noise/smoothing.
     pub l_a: i64,
+    /// The frame's effective amp_res: `bs_amp_res`, except a FIXFIX frame
+    /// with a single envelope is forced to 0 (1.5 dB) -- §4.6.18.3.3.
+    pub amp_res: u8,
 }
 
 /// One `sbr_data()` frame: one channel for an SCE, two for a CPE.
@@ -84,6 +87,7 @@ struct Grid {
     t_env: Vec<i64>,
     t_noise: Vec<i64>,
     l_a: i64,
+    fixfix: bool,
 }
 
 impl Grid {
@@ -118,6 +122,7 @@ impl Grid {
             t_env,
             t_noise,
             l_a,
+            fixfix: frame_class == 0,
         }
     }
 }
@@ -180,9 +185,10 @@ fn raw_env_width(balance: bool, amp_res: u8) -> u32 {
 const RAW_NOISE_WIDTH: u32 = 5;
 
 /// A FIXFIX frame with a single envelope forces the 1.5 dB resolution
-/// regardless of `bs_amp_res` (measured by the table-derivation rig).
-fn amp_res_of(header_amp_res: u8, num_env: usize) -> u8 {
-    if num_env == 1 { 0 } else { header_amp_res }
+/// regardless of `bs_amp_res` (§4.6.18.3.3); a one-envelope VARFIX/FIXVAR
+/// frame keeps the header's value.
+fn amp_res_of(header_amp_res: u8, grid: &Grid) -> u8 {
+    if grid.fixfix && grid.num_env == 1 { 0 } else { header_amp_res }
 }
 
 /// Reads one Huffman codeword by walking bit-by-bit until it matches a table
@@ -549,7 +555,7 @@ impl SbrParser {
         let mut read_env = |this: &mut Self, r: &mut BitReader, ch: usize| -> Result<()> {
             let balance = is_cpe && coupling && ch == 1;
             let num_env = grids[ch].num_env;
-            let amp_res = amp_res_of(header.amp_res, num_env);
+            let amp_res = amp_res_of(header.amp_res, &grids[ch]);
             let mut e_q: Vec<Vec<i32>> = Vec::with_capacity(num_env);
             for i in 0..num_env {
                 let bands = if grids[ch].freq_res[i] != 0 {
@@ -607,7 +613,7 @@ impl SbrParser {
         for ch in 0..n_channels {
             let balance = is_cpe && coupling && ch == 1;
             let num_env = grids[ch].num_env;
-            let amp_res = amp_res_of(header.amp_res, num_env);
+            let amp_res = amp_res_of(header.amp_res, &grids[ch]);
             let e_q = e_q_all[ch].clone();
             let q_q = q_q_all[ch].clone();
 
@@ -643,6 +649,7 @@ impl SbrParser {
                 df_env: df_env[ch].iter().map(|&b| u8::from(b)).collect(),
                 df_noise: df_noise[ch].iter().map(|&b| u8::from(b)).collect(),
                 l_a: grids[ch].l_a,
+                amp_res,
             });
         }
 
