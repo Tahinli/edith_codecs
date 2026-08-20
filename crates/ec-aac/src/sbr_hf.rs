@@ -188,17 +188,11 @@ pub fn build_patches(tables: &BandTables) -> Vec<Patch> {
     patches
 }
 
-/// Builds the limiter band table (ISO/IEC 14496-3 §4.6.18.7.2): the union
-/// of the low-resolution envelope band borders (`tables.f_low`) and the
-/// patch target boundaries, thinned so no band is narrower than one
-/// limiter band's worth of octaves at the transmitted `bs_limiter_bands`
-/// density (`0` => a single band spanning the whole HF region; `1`/`2`/`3`
-/// => ~1/2/3 bands per octave, log2-spaced the same way [`f_master`]'s own
-/// band construction thins its candidate borders). The limiter's gain cap
-/// is applied per band on this table, aggregated over every cell it
-/// covers, so a content-empty target cell inherits its band's aggregate
-/// cap instead of amplifying numeric dust toward an unbounded per-cell
-/// ratio.
+/// Builds the limiter band table (ISO/IEC 14496-3 §4.6.18.7.2, Figure 4.33):
+/// the union of `f_low` and the patch borders, sorted, then thinned so two
+/// borders closer than `0.49/limBands` octaves collapse (`bs_limiter_bands`
+/// 1/2/3 => 1.2/2/3 bands per octave), keeping patch borders over
+/// envelope borders when one of the pair must go. `0` => one band.
 pub fn limiter_band_table(tables: &BandTables, patches: &[Patch], limiter_bands: u8) -> Vec<i64> {
     let kx = tables.kx;
     let k2 = tables.k2;
@@ -208,36 +202,31 @@ pub fn limiter_band_table(tables: &BandTables, patches: &[Patch], limiter_bands:
     if limiter_bands == 0 {
         return vec![kx, k2];
     }
-    let bands_per_octave = match limiter_bands {
-        1 => 1.0,
-        2 => 2.0,
-        _ => 3.0,
+    let warped = match limiter_bands {
+        1 => 2f64.powf(0.49 / 1.2),
+        2 => 2f64.powf(0.49 / 2.0),
+        _ => 2f64.powf(0.49 / 3.0),
     };
-    let mut borders: Vec<i64> = tables
-        .f_low
-        .iter()
-        .copied()
-        .chain(patches.iter().map(|p| p.target_start as i64))
-        .chain(std::iter::once(k2))
-        .chain(std::iter::once(kx))
-        .filter(|&b| b >= kx && b <= k2)
-        .collect();
-    borders.sort_unstable();
-    borders.dedup();
-    let mut out = vec![borders[0]];
-    for &b in &borders[1..] {
-        let last = *out.last().unwrap();
-        if b <= last {
-            continue;
-        }
-        let octaves = (b as f64 / last as f64).log2();
-        if octaves * bands_per_octave < 1.0 && b != k2 {
-            continue; // too narrow on its own: merges into the current band
-        }
-        out.push(b);
+    let mut patch_borders: Vec<i64> = vec![kx];
+    for p in patches {
+        patch_borders.push(patch_borders.last().unwrap() + p.width as i64);
     }
-    if *out.last().unwrap() != k2 {
-        out.push(k2);
+    let mut table: Vec<i64> = tables.f_low.clone();
+    table.extend(patch_borders.iter().skip(1).take(patches.len().saturating_sub(1)));
+    table.sort_unstable();
+    let is_patch = |b: i64| patch_borders.contains(&b);
+    let mut out: Vec<i64> = vec![table[0]];
+    for &b in &table[1..] {
+        let last = *out.last().unwrap();
+        if (b as f64) >= (last as f64) * warped {
+            out.push(b);
+        } else if b == last || !is_patch(b) {
+            // drop the incoming border
+        } else if !is_patch(last) {
+            *out.last_mut().unwrap() = b;
+        } else {
+            out.push(b);
+        }
     }
     out
 }
