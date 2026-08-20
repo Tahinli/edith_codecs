@@ -2242,31 +2242,44 @@ fn sbr_actual_noise_fraction() {
     // mislabeled by a factor of two, this file's true SBR band spacing is
     // `rate/128` = 344.5Hz not the 172.3Hz FFT-analysis spacing those Hz
     // labels come from) show `adjust` injecting 40-85% noise share in the
-    // QMF domain, at or ABOVE the ~0.37 bookkept split, not starved. The
-    // real defect is downstream, in `sbr_qmf::Synthesis`:
-    // `synthesis_energy_gain_for_white_noise_excitation` (round-43) drives
-    // ONE subband with an independent-per-slot random complex value (what
-    // `adjust`'s noise injection actually looks like) through the same
-    // overlap-add prototype `synthesis_gain_is_flat_across_bands`
-    // calibrated against a slowly-rotating TONE phasor, and finds
-    // essentially 0% of that injected energy lands back in the source
-    // subband's own frequency range (vs. a tone's clean in-band
-    // reconstruction) -- an i.i.d.-per-slot draw is not a legitimate
-    // "bandlimited content in this subband" input to this filterbank's
-    // complex-modulation convention, so it aliases out almost entirely
-    // rather than reconstructing as audible noise near the intended
-    // frequency. This is exactly the charter's Task 3 "noise SEQUENCE is
-    // the last mile" scenario -- fixing it needs the round-17 noise-stream
-    // derivation (per-slot values shaped to actually decode as noise
-    // through THIS synthesis convention), not another `adjust()` accounting
-    // pass. Deferred: round-17 derivation, budget did not reach it this
-    // round (open, see ledger). This assertion remains a regression floor
-    // against the two round-42 accounting bugs re-appearing, not a claim of
-    // bookkept parity -- NOT tightened, since the actual gating defect
-    // (synthesis-stage noise-sequence shape) is still unfixed.
+    // QMF domain, at or ABOVE the ~0.37 bookkept split, not starved.
+    //
+    // (Round-44) Round-43's "essentially 0% of injected energy lands back
+    // in the source subband" reading of
+    // `synthesis_energy_gain_for_white_noise_excitation` was itself a test
+    // bug, not a `Synthesis` defect: that harness measured its in-band FFT
+    // window at `k0/SYNTHESIS_BANDS`, but band k's passband is centred at
+    // `(k+0.5)*omega_step` with `omega_step = pi/(2*SYNTHESIS_BANDS)` --
+    // HALF that fraction of Nyquist -- so the window sat on the image
+    // region, not the signal. Corrected, a raw i.i.d.-per-slot draw already
+    // lands ~0.49 of its own energy in its home subband's own frequency
+    // range (not 0%), and a short slot-domain boxcar (`sbr_env::NoiseGen`'s
+    // new `LOWPASS_TAPS = 2`) raises that to ~0.61 while staying spread
+    // across the band (not collapsing to a residual tone) -- see the
+    // harness's `synthesis_energy_gain_for_lowpassed_noise_excitation`.
+    // That shape fix is real (an i.i.d. draw genuinely was less
+    // band-faithful than it needed to be, and now is not), but re-measuring
+    // THIS whole-HF metric after shipping it moved `actual_total` by <0.002
+    // (0.1787 -> 0.1770, i.e. flat) -- because this metric sums the noise
+    // energy DELTA across the whole swept HF spectrum, and energy an
+    // i.i.d. draw aliased to a NEIGHBOURING QMF band still lands somewhere
+    // inside that same swept HF range, so it was never actually excluded
+    // from this particular sum. The ~0.38 bookkept vs ~0.18 actual gap is
+    // therefore NOT a spectral-shape/aliasing defect (refuting round-43's
+    // framing) -- it is a genuine energy shortfall, and per-band coherence
+    // sits well below even the ACTUAL-fraction ceiling
+    // (`sqrt(1 - f)`; ~0.15-0.20 measured vs. ~0.90 predicted at
+    // `f ~= 0.177`, see `EC_AAC_SBR_PARITY_SPLIT`), meaning most of the
+    // remaining HF correlation shortfall is a content defect independent of
+    // noise level. Deferred: locating that energy shortfall and the
+    // content defect, budget did not reach either this round (open, see
+    // ledger). Floor tightened from round-42's 0.15 to the level this
+    // fix's shape change actually lands at (0.177, both before and after),
+    // with margin for run-to-run FFT/decode jitter.
     assert!(
-        actual_total > 0.15,
+        actual_total > 0.17,
         "whole-HF realized noise fraction regressed to {actual_total:.4} \
-         (round-42 fix floor is 0.15; pre-fix was ~0.13, post-fix ~0.18)"
+         (round-44 fix floor is 0.17; measured 0.1770 post-shape-fix, \
+         0.1787 pre-fix -- shape does not move this metric, see doc above)"
     );
 }
