@@ -4486,3 +4486,115 @@ fn sbr441_family_sample_drift_probe() {
         println!("-- apply_last (hold) calls during this file's decode: {holds} of {au_count} AUs");
     }
 }
+
+/// Round-56 charter probe: at the corr cliff `heaac_48000_64k.m4a` shows
+/// once the synthetic sweep content reaches the SBR HF register (good
+/// t=14s, bad t=18s/24s per the ledger lever), print per-band |X| (dB) and
+/// ours-minus-reference phase for 8 consecutive QMF slots at each of the
+/// three timestamps, reading both sides through
+/// [`ec_aac::sbr_qmf::HfAnalysis`] via the existing `qmf_domain_spec` third
+/// witness (ISO/IEC 14496-3 4.6.18.4 64-band analysis of each side's own
+/// final PCM, band unit = `rate/128` Hz -- exactly the patch table's own
+/// unit). Also prints the file's own patch table (ISO/IEC 14496-3
+/// 4.6.18.6.3 `build_patches`) and an `EC_AAC_SBR_HF_BYPASS` A/B so a
+/// "our HF actively hurts" vs "our HF is merely incomplete" verdict is
+/// readable straight from the printed corr numbers.
+#[test]
+fn sbr_hf_window_band_probe() {
+    if !have_ffmpeg() {
+        eprintln!("SKIP: ffmpeg not on PATH");
+        return;
+    }
+    let dir = std::env::var("EC_AAC_HEAAC_FIXTURES").unwrap_or_else(|_| {
+        format!("{}/../../.cache/heaac-fixtures", env!("CARGO_MANIFEST_DIR"))
+    });
+    let path = PathBuf::from(&dir).join("heaac_48000_64k.m4a");
+    if !path.exists() {
+        eprintln!("SKIP: {} absent", path.display());
+        return;
+    }
+    const LAG: i64 = -4673;
+
+    let Some((ours, out_rate, _au_count)) = our_decode_uncapped(&path, 0) else {
+        eprintln!("SKIP: our_decode_uncapped failed");
+        return;
+    };
+    let ref_l = ffmpeg_decode(&path, 0, 2).swap_remove(0);
+    let ch0 = &ours[0];
+
+    for t in [14usize, 18, 24] {
+        let oa0 = t * out_rate as usize;
+        if oa0 + out_rate as usize > ch0.len() {
+            continue;
+        }
+        let (lag, corr) = narrow_lag_at(ch0, &ref_l, oa0, out_rate as usize, LAG, 32);
+        let (wlag, wcorr) = narrow_lag_at(ch0, &ref_l, oa0, out_rate as usize, LAG, 8192);
+        println!(
+            "\n=== t={t}s narrow-lag corr={corr:.6} lag={lag} (wide +/-8192 search: lag={wlag} corr={wcorr:.6}) ==="
+        );
+        let ob0 = (oa0 as i64 + lag) as usize;
+        // 8 QMF slots (512 samples) starting at this second's aligned position.
+        const WIN: usize = 8 * 64;
+        if oa0 + WIN > ch0.len() || ob0 + WIN > ref_l.len() {
+            println!("  SKIP: window out of range");
+            continue;
+        }
+        let (o_spec, t_spec, _sim) = qmf_domain_spec(&ch0[oa0..oa0 + WIN], &ref_l[ob0..ob0 + WIN]);
+        for band in 14..48usize {
+            let mut mags_o = Vec::new();
+            let mut mags_t = Vec::new();
+            let mut dphase_deg = Vec::new();
+            for slot in 0..8 {
+                let o = o_spec[band][slot];
+                let r = t_spec[band][slot];
+                let mo = (o.re * o.re + o.im * o.im).sqrt();
+                let mr = (r.re * r.re + r.im * r.im).sqrt();
+                mags_o.push(20.0 * (mo.max(1e-12)).log10());
+                mags_t.push(20.0 * (mr.max(1e-12)).log10());
+                if mo > 1e-6 && mr > 1e-6 {
+                    let d = (o.im.atan2(o.re) - r.im.atan2(r.re)).to_degrees();
+                    let d = ((d + 180.0).rem_euclid(360.0)) - 180.0;
+                    dphase_deg.push(d);
+                } else {
+                    dphase_deg.push(f64::NAN);
+                }
+            }
+            let mean_o: f64 = mags_o.iter().sum::<f64>() / 8.0;
+            let mean_t: f64 = mags_t.iter().sum::<f64>() / 8.0;
+            println!(
+                "  band{band:>3}: |ours|dB mean={mean_o:>7.2} |ref|dB mean={mean_t:>7.2} dphase(deg)={:?}",
+                dphase_deg.iter().map(|d| format!("{d:.0}")).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    // HF-bypass A/B on the bad windows: does zeroing our HF raise or lower
+    // corr against the reference in [18s,19s) and [24s,25s)?
+    unsafe { std::env::set_var("EC_AAC_SBR_HF_BYPASS", "1") };
+    let bypass = our_decode_uncapped(&path, 0);
+    unsafe { std::env::remove_var("EC_AAC_SBR_HF_BYPASS") };
+    if let Some((bp, bp_rate, _)) = bypass {
+        let bch0 = &bp[0];
+        for t in [14usize, 18, 24] {
+            let oa0 = t * bp_rate as usize;
+            if oa0 + bp_rate as usize > bch0.len() {
+                continue;
+            }
+            let (lag, corr) = narrow_lag_at(bch0, &ref_l, oa0, bp_rate as usize, LAG, 32);
+            println!("  t={t}s HF_BYPASS corr={corr:.6} lag={lag}");
+        }
+    } else {
+        eprintln!("HF_BYPASS decode failed");
+    }
+
+    // Patch table (ISO/IEC 14496-3 4.6.18.6.3), sideinfo-derived.
+    unsafe { std::env::set_var("EC_AAC_SBR_SIDEINFO_DEBUG", "1") };
+    let _ = our_decode_uncapped(&path, 0);
+    unsafe { std::env::remove_var("EC_AAC_SBR_SIDEINFO_DEBUG") };
+    if let Some(row) = ec_aac::sbr_sideinfo_log().first() {
+        println!(
+            "\n-- patch table (first frame): kx={} k2={} patch widths={:?}",
+            row.kx, row.k2, row.patch_lengths
+        );
+    }
+}
