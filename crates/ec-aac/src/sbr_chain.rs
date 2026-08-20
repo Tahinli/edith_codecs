@@ -591,6 +591,7 @@ mod tests {
             df_env: vec![],
             df_noise: vec![],
             l_a: -1,
+            amp_res: 1,
         }
     }
 

@@ -45,26 +45,28 @@ pub fn dequant_noise(q_q: i32) -> f64 {
 
 /// De-mixes a coupled CPE's `(channel 0 raw, balance raw)` pair into
 /// `(env0, env1)` linear energies (ISO/IEC 14496-3 §4.6.18.7.2,
-/// `bs_coupling`): `Ecurr = dequant_env(e0_raw, amp_res)`,
-/// `ratio = 2^(pan - panOffset)` where `pan` is the RAW balance value and
-/// `panOffset` is 24 at `bs_amp_res=0` or 12 at `bs_amp_res=1`;
-/// `env0 = 2*Ecurr/(1+ratio)`, `env1 = 2*Ecurr*ratio/(1+ratio)`.
-/// `header_amp_res` governs `panOffset` regardless of the single-envelope
-/// override -- the two diverge on single-envelope coupled frames.
-pub fn dequant_pair(e0_raw: i32, pan_raw: i32, env_amp_res: u8, header_amp_res: u8) -> (f64, f64) {
-    let e_curr = dequant_env(e0_raw, env_amp_res);
-    let pan_offset = if header_amp_res != 0 { 12.0 } else { 24.0 };
-    let ratio = 2f64.powf(f64::from(pan_raw) - pan_offset);
-    let env0 = 2.0 * e_curr / (1.0 + ratio);
-    let env1 = 2.0 * e_curr * ratio / (1.0 + ratio);
-    (env0, env1)
+/// `bs_coupling`): `E = 2^(a*e0_raw + 7)`, `r = 2^(a*(panOffset - 2*pan))`
+/// with `a` = 1 (3 dB) or 0.5 (1.5 dB) and `panOffset` = 12 / 24 for the
+/// FRAME's amp_res (the FIXFIX single-envelope override included);
+/// `env0 = E/(1+r)`, `env1 = env0*r`. The balance channel's raw values
+/// (and its Huffman deltas) count in DOUBLE steps -- `bs_data_env` is one
+/// bit narrower than the level field -- so its centre is 6 (3 dB) / 12
+/// (1.5 dB) in raw units; measured on a real coupled stream, where 88% of
+/// the raw balance values sit exactly on that centre.
+pub fn dequant_pair(e0_raw: i32, pan_raw: i32, amp_res: u8) -> (f64, f64) {
+    let a = alpha(amp_res);
+    let pan_offset = if amp_res != 0 { 12.0 } else { 24.0 };
+    let ratio = 2f64.powf(a * (pan_offset - 2.0 * f64::from(pan_raw)));
+    let env0 = 2.0 * dequant_env(e0_raw, amp_res) / (1.0 + ratio);
+    (env0, env0 * ratio)
 }
 
 /// Coupled noise-floor pair (§4.6.18.7.2): `Q0 = 2^(NOISE_FLOOR_OFFSET - q0 + 1)
-/// / (1 + 2^(12 - q1))`, `Q1 = Q0 * 2^(12 - q1)`.
+/// / (1 + 2^(12 - 2*q1))`, `Q1 = Q0 * 2^(12 - 2*q1)` -- the raw balance
+/// value counts in double steps, as for the envelope.
 pub fn dequant_noise_pair(q0_raw: i32, pan_raw: i32) -> (f64, f64) {
     let temp1 = 2f64.powf(NOISE_FLOOR_OFFSET - f64::from(q0_raw) + 1.0);
-    let temp2 = 2f64.powf(12.0 - f64::from(pan_raw));
+    let temp2 = 2f64.powf(12.0 - 2.0 * f64::from(pan_raw));
     let q0 = temp1 / (1.0 + temp2);
     (q0, q0 * temp2)
 }
@@ -79,9 +81,7 @@ pub fn dequantize_frame(
     coupling: bool,
 ) -> (Vec<Vec<f64>>, Vec<Vec<f64>>) {
     let c = &channels[ch];
-    // A single-envelope frame forces 1.5 dB resolution regardless of
-    // bs_amp_res, mirroring sbr_payload's own `amp_res_of`.
-    let amp_res = if c.e_q.len() == 1 { 0 } else { header.amp_res };
+    let amp_res = c.amp_res;
     let coupled = coupling && channels.len() == 2;
     let pick = |pair: (f64, f64)| if ch == 0 { pair.0 } else { pair.1 };
     let env = if coupled {
@@ -91,7 +91,7 @@ pub fn dequantize_frame(
                     .map(|b| {
                         let e0 = channels[0].e_q.get(i).and_then(|r| r.get(b)).copied().unwrap_or(0);
                         let pan = channels[1].e_q.get(i).and_then(|r| r.get(b)).copied().unwrap_or(0);
-                        pick(dequant_pair(e0, pan, amp_res, header.amp_res))
+                        pick(dequant_pair(e0, pan, amp_res))
                     })
                     .collect()
             })
@@ -500,6 +500,7 @@ mod tests {
             df_env: vec![],
             df_noise: vec![],
             l_a: -1,
+            amp_res: 1,
         }
     }
 
@@ -555,21 +556,26 @@ mod tests {
 
     #[test]
     fn coupled_balance_round_trips_at_a_centred_ratio() {
-        let (e0, e1) = dequant_pair(10, 12, 1, 1);
+        let (e0, e1) = dequant_pair(10, 6, 1);
         let e0_plain = dequant_env(10, 1);
         assert!((e0 - e0_plain).abs() < 1e-6 && (e1 - e0_plain).abs() < 1e-6, "{e0} {e1} vs {e0_plain}");
-        let (e00, e10) = dequant_pair(10, 24, 0, 0);
+        let (e00, e10) = dequant_pair(10, 12, 0);
         let e00_plain = dequant_env(10, 0);
         assert!((e00 - e00_plain).abs() < 1e-6 && (e10 - e00_plain).abs() < 1e-6, "{e00} {e10} vs {e00_plain}");
-        let (q0, q1) = dequant_noise_pair(3, 12);
+        let (q0, q1) = dequant_noise_pair(3, 6);
         assert!((q0 - dequant_noise(3)).abs() < 1e-9 && (q1 - q0).abs() < 1e-9);
     }
 
     #[test]
-    fn coupled_balance_shifts_energy_toward_the_channel_with_a_higher_raw_value() {
-        let (e0_low, e1_low) = dequant_pair(10, 0, 1, 1);
-        let (e0_high, e1_high) = dequant_pair(10, 24, 1, 1);
-        assert!(e0_low > e1_low, "{e0_low} vs {e1_low}");
-        assert!(e0_high < e1_high, "{e0_high} vs {e1_high}");
+    fn coupled_balance_shifts_energy_toward_channel_0_with_a_higher_raw_value() {
+        let (e0_low, e1_low) = dequant_pair(10, 0, 1);
+        let (e0_high, e1_high) = dequant_pair(10, 12, 1);
+        assert!(e0_low < e1_low, "{e0_low} vs {e1_low}");
+        assert!(e0_high > e1_high, "{e0_high} vs {e1_high}");
+        // One raw balance step is two amp_res steps of ratio: 6 dB at
+        // amp_res 1, 3 dB at amp_res 0.
+        let (a0, a1) = dequant_pair(10, 5, 1);
+        let (b0, b1) = dequant_pair(10, 11, 0);
+        assert!((a1 / a0 - 4.0).abs() < 1e-9 && (b1 / b0 - 2.0).abs() < 1e-9, "{a0} {a1} {b0} {b1}");
     }
 }
