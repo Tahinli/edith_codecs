@@ -152,6 +152,12 @@ impl Context {
     pub fn size(&self) -> (u32, u32) {
         (self.width, self.height)
     }
+
+    /// The raw context id, for calls with no typestate-protected wrapper
+    /// (e.g. `vaQueryVideoProcFilters`).
+    pub(crate) fn raw_id(&self) -> sys::VAContextID {
+        self.id
+    }
 }
 
 impl std::fmt::Debug for Context {

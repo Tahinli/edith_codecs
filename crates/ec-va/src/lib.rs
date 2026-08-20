@@ -47,6 +47,7 @@ pub mod error;
 pub mod picture;
 pub mod surface;
 pub mod sys;
+pub mod vpp;
 
 pub use caps::{CapEntry, CapReport, Entrypoint, Profile, fourcc_str};
 pub use config::{Config, ConfigAttrib, SurfaceCaps};
@@ -58,6 +59,7 @@ pub use picture::{
 pub use surface::{
     Image, MappedImage, PrimeLayer, PrimeObject, PrimeSurface, Surface, SurfaceSpec,
 };
+pub use vpp::Vpp;
 
 /// Major libva version this crate's ABI transcription targets.
 pub const MIN_VA_MAJOR: i32 = 1;
