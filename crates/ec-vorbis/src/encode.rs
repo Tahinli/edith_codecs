@@ -71,6 +71,13 @@ const FLOOR_CLASS_DIM: usize = 4;
 const CLASSES: usize = 5;
 /// Largest quantised residue each class's book can state.
 const CLASS_RANGE: [i32; CLASSES] = [0, 1, 4, 16, 127];
+/// Headroom in dB the widest residue book can actually state: 20 log10 127
+/// is 42, but a coupled angle channel is a difference of two magnitudes, so a
+/// pair's step must leave half that range — 63, 36 dB. Past this the rate loop's extra headroom lowers the absolute-threshold
+/// bound instead, so sparse or quiet content — where most partitions sit under
+/// the threshold and code as class 0 whatever the step — gains bins to spend
+/// bits on rather than a finer step nothing can represent.
+const HEADROOM_RANGE: f64 = 36.0;
 /// Samples per transient-detection tick — the short block's own hop, so a
 /// tick lines up with the finest time resolution the encoder has.
 const TICK: usize = BLOCK_SHORT / 4;
@@ -600,7 +607,9 @@ impl VorbisEncoder {
     /// within a few blocks and is clamped either side so a transient cannot
     /// swing the whole file. The target itself scales with this block's own
     /// granule advance, so a short block (a small fraction of a long hop) is
-    /// judged against a proportionally small bit budget.
+    /// judged against a proportionally small bit budget. The ceiling is well
+    /// past [`HEADROOM_RANGE`]: beyond it headroom buys bins under the
+    /// threshold rather than step, which is what quiet content needs.
     fn update_rate(&mut self, bits: u64, half: usize, channels: usize, delta: i64) {
         if self.config.bitrate_bps <= 0 || delta <= 0 {
             return;
@@ -613,7 +622,7 @@ impl VorbisEncoder {
         // whole partition become class 0 for two bits. Without that a low target
         // cannot be reached at all — coding every coefficient with the shortest
         // codeword there is already costs about a bit each.
-        self.headroom = (self.headroom + step).clamp(-24.0, 36.0);
+        self.headroom = (self.headroom + step).clamp(-24.0, 84.0);
     }
 }
 
@@ -666,7 +675,9 @@ fn fit_floor(floor: &Floor1, ath: &[f64], headroom: f64, peaks: &[f64]) -> (Vec<
     let target: Vec<f64> = db
         .iter()
         .zip(ath.iter())
-        .map(|(&level, &threshold)| (level - headroom).max(threshold))
+        .map(|(&level, &threshold)| {
+            (level - headroom.min(HEADROOM_RANGE)).max(threshold - (headroom - HEADROOM_RANGE).max(0.0))
+        })
         .collect();
     let y: Vec<i32> = target
         .iter()
