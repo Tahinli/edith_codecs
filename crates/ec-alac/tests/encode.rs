@@ -50,6 +50,83 @@ fn round_trip(sample_rate: u32, channels: u8, bit_depth: u8, frame_length: u32, 
     assert_eq!(decoded, samples, "{channels}ch {bit_depth}bit round trip");
 }
 
+/// One bit field starting at bit `start` of `data`, MSB-first — enough to
+/// reach into a compressed mono frame's plan header (which starts at bit 39:
+/// 3 element-tag + 16 instance/reserved + 1 partial + 2 bytes_shifted + 1
+/// escape + 8 mix_bits + 8 mix_res) without pulling in the decoder's own
+/// private bit reader.
+fn bits_at(data: &[u8], start: usize, n: usize) -> u32 {
+    let mut v = 0u32;
+    for i in 0..n {
+        let pos = start + i;
+        v = (v << 1) | u32::from((data[pos / 8] >> (7 - pos % 8)) & 1);
+    }
+    v
+}
+
+#[test]
+fn twenty_four_bit_uses_byte_shift_when_cheaper() {
+    // Real 16-bit audio widened to 24 bits with random dither in the low
+    // byte: exactly the shape a 24-bit master of 16-bit source material has,
+    // and exactly what bytes_shifted exists for — the high bits alone
+    // predict well, but folded together with the dither's noise they do not.
+    let path = fixtures().join("wav16-stereo-48000.wav");
+    if !path.exists() {
+        eprintln!("fixtures/audio absent (gitignored) — skipping");
+        return;
+    }
+    let mut reader = ec_riff::WavReader::open(&path).expect("open wav");
+    let spec = reader.spec();
+    let mut rng = Rng(0xdead_beef);
+    let samples: Vec<i32> = reader
+        .read_all_i32()
+        .expect("pcm")
+        .into_iter()
+        .map(|s| (s << 8) | (rng.next() & 0xff) as i32)
+        .collect();
+    let channels = spec.channels as u8;
+
+    round_trip(spec.sample_rate, channels, 24, 4096, &samples);
+
+    let per_frame = 4096 * channels as usize;
+    let with_shift = AlacEncoder::new(spec.sample_rate, channels, 24, 4096).expect("encoder");
+    let with_bytes: usize = samples.chunks(per_frame).map(|c| with_shift.encode_frame(c).len()).sum();
+
+    // SAFETY: single-threaded test-only env toggle, restored before return.
+    unsafe { std::env::set_var("EC_ALAC_NO_SHIFT", "1") };
+    let without_shift = AlacEncoder::new(spec.sample_rate, channels, 24, 4096).expect("encoder");
+    let without_bytes: usize = samples.chunks(per_frame).map(|c| without_shift.encode_frame(c).len()).sum();
+    unsafe { std::env::remove_var("EC_ALAC_NO_SHIFT") };
+
+    eprintln!("24-bit shifted: {with_bytes} bytes, unshifted: {without_bytes} bytes");
+    assert!(
+        with_bytes < without_bytes,
+        "bytes_shifted split ({with_bytes}) should beat forcing bytes_shifted=0 ({without_bytes})"
+    );
+}
+
+#[test]
+fn mode_one_is_chosen_on_smooth_signal() {
+    // A pure ramp: its first difference is a near-constant, which mode 1's
+    // extra difference squeezes to near zero — cheaper than any order-0
+    // filter's residual stream, which stays at the ramp's own value.
+    let n = 4096usize;
+    let samples: Vec<i32> = (0..n as i32).map(|i| 100 + i * 3).collect();
+
+    unsafe { std::env::set_var("EC_ALAC_MODE1", "1") };
+    let enc = AlacEncoder::new(48_000, 1, 16, 4096).expect("encoder");
+    let packet = enc.encode_frame(&samples);
+    unsafe { std::env::remove_var("EC_ALAC_MODE1") };
+
+    let mode = bits_at(&packet, 39, 4);
+    assert_eq!(mode, 1, "mode 1 should win the cost comparison on a pure ramp");
+
+    let mut dec = AlacDecoder::new(*enc.cookie());
+    let shift = enc.cookie().container_shift();
+    let decoded: Vec<i32> = dec.decode(&packet).expect("decode").iter().map(|&s| s >> shift).collect();
+    assert_eq!(decoded, samples, "mode 1 round trip");
+}
+
 #[test]
 fn escape_frames_round_trip_random_data() {
     let mut rng = Rng(0x1234_5678);
@@ -183,3 +260,4 @@ fn muxed_stream_is_alac_at_the_right_rate_and_ffmpeg_agrees() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+

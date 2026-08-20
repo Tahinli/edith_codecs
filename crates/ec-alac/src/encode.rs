@@ -259,28 +259,67 @@ fn analyze(y: &[i32], order: usize, den_shift: u32) -> Vec<i32> {
     res
 }
 
-/// One channel's chosen filter: the order field to write, the residuals it
-/// produces, and its total cost in bits (16-bit plan header + coefficients
-/// + the Rice-coded residuals), for comparing against every other choice.
+/// One channel's chosen filter: the mode and order fields to write, the
+/// residuals it produces, and its total cost in bits (16-bit plan header +
+/// coefficients + the Rice-coded residuals), for comparing against every
+/// other choice.
 struct Candidate {
+    mode: u32,
     order: u32,
     res: Vec<i32>,
     bits: u64,
 }
 
+/// Whether [`best_candidate`] may pick mode 1 (decode.rs:510-529's
+/// double-difference pass): off by default. decode.rs, written from the
+/// published format description, parses and reconstructs it correctly (see
+/// `mode_one_is_chosen_on_smooth_signal` below, which forces this on to
+/// prove it), but real-world ALAC decoders reject any prediction type other
+/// than 0 outright — confirmed against this crate's own oracle test, which
+/// failed with an `unknown prediction type` decode error the one time this
+/// was left enabled. Kept as a knob rather than deleted so the capability
+/// stays reachable for a future stream that is known never to cross a
+/// third-party decoder, and so its cost math stays exercised by a real test.
+fn mode1_allowed() -> bool {
+    std::env::var_os("EC_ALAC_MODE1").is_some()
+}
+
 /// Cheapest of [`ORDER_CANDIDATES`] (plus the trivial order-0 "residuals are
-/// the samples" case) for one channel of true samples.
+/// the samples" case) for one channel of true samples, each order tried as
+/// mode 0 (the filter alone) and, when [`mode1_allowed`], also as mode 1: a
+/// first-order pre-difference ahead of the same filter. Mode 1's residuals
+/// are `analyze`'s inverse of that pass: run the filter forward as usual,
+/// then difference *that* result with the order-31 sentinel — decode.rs
+/// undoes it in the same order, integrating first and filtering second.
 fn best_candidate(cfg: &MagicCookie, y: &[i32], chan_bits: u32, pb_factor: u32) -> Candidate {
     let mut orders: Vec<usize> = vec![0];
     orders.extend(ORDER_CANDIDATES.iter().copied().filter(|&o| o < y.len()));
+    let mode1 = mode1_allowed();
     let mut best: Option<Candidate> = None;
     for order in orders {
         let res = analyze(y, order, 9);
         let mut cost = CostSink::default();
         rice_encode(&mut cost, cfg, pb_factor, &res, chan_bits);
         let bits = 16 + (order as u64) * 16 + cost.0;
+
+        if mode1 {
+            let res1 = analyze(&res, ORDER_DIFF, 0);
+            let mut cost1 = CostSink::default();
+            rice_encode(&mut cost1, cfg, pb_factor, &res1, chan_bits);
+            let bits1 = 16 + (order as u64) * 16 + cost1.0;
+            if best.as_ref().is_none_or(|b| bits1 < b.bits) {
+                best = Some(Candidate {
+                    mode: 1,
+                    order: order as u32,
+                    res: res1,
+                    bits: bits1,
+                });
+            }
+        }
+
         if best.as_ref().is_none_or(|b| bits < b.bits) {
             best = Some(Candidate {
+                mode: 0,
                 order: order as u32,
                 res,
                 bits,
@@ -288,6 +327,7 @@ fn best_candidate(cfg: &MagicCookie, y: &[i32], chan_bits: u32, pb_factor: u32) 
         }
     }
     best.unwrap_or(Candidate {
+        mode: 0,
         order: 0,
         res: y.to_vec(),
         bits: u64::MAX,
@@ -297,6 +337,7 @@ fn best_candidate(cfg: &MagicCookie, y: &[i32], chan_bits: u32, pb_factor: u32) 
 /// A channel's coded parameters and residuals, ready to write: the plan
 /// header fields plus [`Candidate::res`].
 struct ChannelPlan {
+    mode: u32,
     order: u32,
     pb_factor: u32,
     res: Vec<i32>,
@@ -306,7 +347,7 @@ const DEN_SHIFT: u32 = 9;
 const PB_FACTOR: u32 = 4;
 
 fn write_plan<S: BitSink>(sink: &mut S, plan: &ChannelPlan) {
-    sink.put(0, 4); // mode: always the single (non-difference-doubled) pass.
+    sink.put(plan.mode, 4);
     sink.put(DEN_SHIFT, 4);
     sink.put(PB_FACTOR, 3);
     sink.put(plan.order, 5);
@@ -326,41 +367,69 @@ fn write_element(cfg: &MagicCookie, w: &mut BitWriter, planes: &[Vec<i32>], samp
     let partial = samples != cfg.frame_length as usize;
     let raw_bits = u64::from(channels) * u64::from(bit_depth) * samples as u64;
 
+    // A 24-bit stream may additionally split each sample into a compressed
+    // high part and an uncompressed low byte ridden ahead of the residuals
+    // (decode.rs:485-490, :533-538) — bytes_shifted 1 — when that beats
+    // compressing the sample whole. Only 0 and 1 are ever tried: 3 is the
+    // format's escape sentinel (decode.rs:439), and a stream never carries
+    // more than one low byte's worth of headroom worth shifting off.
+    // EC_ALAC_NO_SHIFT forces bytes_shifted 0 even at 24 bits — a test-only
+    // knob so a test can measure both paths against the same source
+    // (`twenty_four_bit_uses_byte_shift_when_cheaper`), not a real-world
+    // interop concern like `mode1_allowed`'s.
+    let no_shift = std::env::var_os("EC_ALAC_NO_SHIFT").is_some();
+    let shift_candidates: &[u32] = if bit_depth == 24 && !no_shift { &[0, 1] } else { &[0] };
+
     let compressed = (samples >= 2).then(|| {
-        let chan_bits = bit_depth + channels - 1;
-        if pair {
-            let (l, r) = (&planes[0], &planes[1]);
-            let lc = best_candidate(cfg, l, chan_bits, PB_FACTOR);
-            let rc = best_candidate(cfg, r, chan_bits, PB_FACTOR);
-            let lr_bits = lc.bits + rc.bits;
+        shift_candidates
+            .iter()
+            .map(|&bytes_shifted| {
+                let shift_bits = bytes_shifted * 8;
+                let chan_bits = bit_depth - shift_bits + channels - 1;
+                let low_bits = u64::from(shift_bits) * u64::from(channels) * samples as u64;
+                let shifted: Vec<Vec<i32>> = planes
+                    .iter()
+                    .map(|p| p.iter().map(|&s| s >> shift_bits).collect())
+                    .collect();
 
-            // mix_bits = 1, mix_res = 1: v = l - r, u = r + (v >> 1).
-            let (mut u, mut v) = (vec![0i32; samples], vec![0i32; samples]);
-            for i in 0..samples {
-                v[i] = l[i] - r[i];
-                u[i] = r[i] + (v[i] >> 1);
-            }
-            let uc = best_candidate(cfg, &u, chan_bits, PB_FACTOR);
-            let vc = best_candidate(cfg, &v, chan_bits, PB_FACTOR);
-            let ms_bits = uc.bits + vc.bits;
+                let (mix_bits, mix_res, plans, bits) = if pair {
+                    let (l, r) = (&shifted[0], &shifted[1]);
+                    let lc = best_candidate(cfg, l, chan_bits, PB_FACTOR);
+                    let rc = best_candidate(cfg, r, chan_bits, PB_FACTOR);
+                    let lr_bits = lc.bits + rc.bits;
 
-            match ms_bits < lr_bits {
-                true => (1u32, 1i32, vec![plan_of(uc), plan_of(vc)], ms_bits),
-                false => (2u32, 0i32, vec![plan_of(lc), plan_of(rc)], lr_bits),
-            }
-        } else {
-            let c0 = best_candidate(cfg, &planes[0], chan_bits, PB_FACTOR);
-            let bits = c0.bits;
-            (0u32, 0i32, vec![plan_of(c0)], bits)
-        }
+                    // mix_bits = 1, mix_res = 1: v = l - r, u = r + (v >> 1).
+                    let (mut u, mut v) = (vec![0i32; samples], vec![0i32; samples]);
+                    for i in 0..samples {
+                        v[i] = l[i] - r[i];
+                        u[i] = r[i] + (v[i] >> 1);
+                    }
+                    let uc = best_candidate(cfg, &u, chan_bits, PB_FACTOR);
+                    let vc = best_candidate(cfg, &v, chan_bits, PB_FACTOR);
+                    let ms_bits = uc.bits + vc.bits;
+
+                    match ms_bits < lr_bits {
+                        true => (1u32, 1i32, vec![plan_of(uc), plan_of(vc)], ms_bits),
+                        false => (2u32, 0i32, vec![plan_of(lc), plan_of(rc)], lr_bits),
+                    }
+                } else {
+                    let c0 = best_candidate(cfg, &shifted[0], chan_bits, PB_FACTOR);
+                    let bits = c0.bits;
+                    (0u32, 0i32, vec![plan_of(c0)], bits)
+                };
+                (bytes_shifted, mix_bits, mix_res, plans, bits + low_bits)
+            })
+            .min_by_key(|&(_, _, _, _, bits)| bits)
+            .unwrap()
     });
 
     let use_compressed = compressed
         .as_ref()
-        .is_some_and(|(_, _, _, bits)| 16 + bits < raw_bits.max(1));
+        .is_some_and(|(_, _, _, _, bits)| 16 + bits < raw_bits.max(1));
+    let bytes_shifted = compressed.as_ref().map_or(0, |&(bs, ..)| bs);
 
     w.put(partial as u32, 1);
-    w.put(0, 2); // bytes_shifted: always 0 (corner-cut, see module docs).
+    w.put(if use_compressed { bytes_shifted } else { 0 }, 2);
     w.put(!use_compressed as u32, 1);
     if partial {
         w.put((samples as u32) >> 16, 16);
@@ -377,13 +446,25 @@ fn write_element(cfg: &MagicCookie, w: &mut BitWriter, planes: &[Vec<i32>], samp
             }
         }
         true => {
-            let (mix_bits, mix_res, plans, _) = compressed.unwrap();
+            let (bytes_shifted, mix_bits, mix_res, plans, _) = compressed.unwrap();
+            let shift_bits = bytes_shifted * 8;
             w.put(mix_bits, 8);
             w.put((mix_res as i8) as u8 as u32, 8);
             for plan in &plans {
                 write_plan(w, plan);
             }
-            let chan_bits = bit_depth + channels - 1;
+            // The low bytes ride ahead of the residuals, one `shift_bits`
+            // field per sample per channel, in the same i-outer/channel-inner
+            // order the escape path above uses — decode.rs reads them back
+            // in exactly that order (decode.rs:533-538).
+            if shift_bits > 0 {
+                for i in 0..samples {
+                    for plane in planes {
+                        w.put(plane[i] as u32 & mask(shift_bits), shift_bits);
+                    }
+                }
+            }
+            let chan_bits = bit_depth - shift_bits + channels - 1;
             for plan in &plans {
                 rice_encode(w, cfg, plan.pb_factor, &plan.res, chan_bits);
             }
@@ -393,6 +474,7 @@ fn write_element(cfg: &MagicCookie, w: &mut BitWriter, planes: &[Vec<i32>], samp
 
 fn plan_of(c: Candidate) -> ChannelPlan {
     ChannelPlan {
+        mode: c.mode,
         order: c.order,
         pb_factor: PB_FACTOR,
         res: c.res,
