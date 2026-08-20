@@ -658,6 +658,47 @@ fn ntsc_timing_survives_a_round_trip_exactly() {
     assert_eq!(keys, 4);
 }
 
+/// An AAC track's encoder priming round trips as an `edts/elst` media_time
+/// shift: the demuxer reports it back on [`Mp4Demuxer::tracks`] and every
+/// packet's timeline is shifted by exactly that much, never trimmed.
+#[test]
+fn aac_priming_round_trips_through_an_elst() {
+    let rate = TimeBase::from_rate(48_000);
+    let mut info = StreamInfo::new(0, rate, ec_core::CodecParameters::new(CodecId::Aac));
+    if let MediaParameters::Audio(a) = &mut info.params.media {
+        a.sample_rate = 48_000;
+        a.layout = ec_core::ChannelLayout::Stereo;
+    }
+    info.params.extradata = Some(Buf::copy_from_slice(&[0x11, 0x90])); // AAC-LC 48k stereo ASC
+
+    let mut muxer = Mp4Muxer::new(Cursor::new(Vec::new())).expect("muxer");
+    let stream = muxer.add_stream(info).expect("stream");
+    muxer.set_audio_delay(stream, 1024).expect("declare delay");
+    // ~1 s of AAC frames, one 1024-sample frame each, no explicit pts/dts: a
+    // constant-rate track lays out end to end.
+    for _ in 0..47i64 {
+        let mut packet = Packet::new(0, rate, vec![0u8; 8]);
+        packet.duration = Some(1024);
+        packet.flags.keyframe = true;
+        muxer.write_packet(&packet).expect("packet");
+    }
+    muxer.finish().expect("finish");
+    let file = muxer.into_inner().into_inner();
+
+    let mut demuxer = Mp4Demuxer::new(Cursor::new(file)).expect("reopens");
+    assert_eq!(
+        demuxer.tracks()[0].media_time,
+        Some(1024),
+        "the elst's media_time is the declared priming"
+    );
+    let first = demuxer.next_packet().expect("first packet");
+    assert_eq!(
+        first.pts,
+        Some(-1024),
+        "the demuxer applies the elst as a pure shift, never a trim"
+    );
+}
+
 /// The real library, end to end: every mp4-family file the manifest lists
 /// demuxes to EOF with the packet counts ffprobe counts.
 ///

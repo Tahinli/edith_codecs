@@ -38,6 +38,11 @@ struct Track {
     /// new one".
     chunk_end: u64,
     title: Option<String>,
+    /// An audio encoder's priming: samples it emits before the first audible
+    /// one (an AAC-LC encoder's 1024-sample delay), in this track's
+    /// timescale. Written the same way as a video track's reorder delay: an
+    /// `edts/elst` media_time shift, never a trim.
+    audio_delay: i64,
 }
 
 /// An MP4 writer over anything seekable.
@@ -114,6 +119,21 @@ impl<W: Write + Seek> Mp4Muxer<W> {
                 )));
             }
         }
+        Ok(())
+    }
+
+    /// Declare an audio track's encoder delay: `priming_samples` produced
+    /// before the first audible one, in the track's own sample rate (which is
+    /// its timescale, so this is a sample count with no conversion). Written
+    /// as an `edts/elst` media_time shift at [`Muxer::finish`] — the same
+    /// mechanism a reordered video track's `elst` uses, and the ISO
+    /// 14496-14 convention for AAC priming.
+    pub fn set_audio_delay(&mut self, stream: u32, priming_samples: u32) -> Result<()> {
+        let track = self
+            .tracks
+            .get_mut(stream as usize)
+            .ok_or_else(|| Error::corrupt(format!("mp4: no stream {stream} to delay")))?;
+        track.audio_delay = i64::from(priming_samples);
         Ok(())
     }
 
@@ -242,12 +262,13 @@ impl<W: Write + Seek> Mp4Muxer<W> {
         out.extend_from_slice(&(height << 16).to_be_bytes());
         close(out, tkhd);
 
-        // An `elst`, where the first picture is not the first *decoded* one: a
-        // reordered stream's earliest composition time is the reorder delay, and
-        // without an edit saying so every player starts the track that much
-        // late. This is where a demuxer's `media_time` comes from, and it is a
-        // shift, never a trim.
-        let priming = presentation_start(track);
+        // An `elst`, where the first picture is not the first *decoded* one, or
+        // an audio track's encoder primed samples ahead of the first audible
+        // one (`set_audio_delay`): a reordered stream's earliest composition
+        // time is the reorder delay, and without an edit saying so every
+        // player starts the track that much late. This is where a demuxer's
+        // `media_time` comes from, and it is a shift, never a trim.
+        let priming = presentation_start(track).max(track.audio_delay);
         if priming > 0 {
             let edts = open(out, b"edts");
             let elst = open(out, b"elst");
@@ -368,6 +389,7 @@ impl<W: Write + Seek + Send> Muxer for Mp4Muxer<W> {
             chunks: Vec::new(),
             chunk_end: u64::MAX,
             title: None,
+            audio_delay: 0,
         });
         Ok(index)
     }
