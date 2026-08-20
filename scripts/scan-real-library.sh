@@ -81,7 +81,7 @@ nerr=0
             "${vpix:--}" "${vbits:--}" "${acodecs:--}" "${duration:--}" \
             "$(stat -c %s -- "$f")"
         n=$((n + 1))
-    done < <(find "${DIRS[@]}" -type f \( "${find_args[@]}" \) -print0 2>/dev/null)
+    done < <(find "${DIRS[@]}" -type f \( "${find_args[@]}" \) ! -name "*.export*.mp4" -print0 2>/dev/null)
 } >"$tmp"
 
 mv -- "$tmp" "$OUT"
