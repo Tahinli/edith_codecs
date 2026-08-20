@@ -574,6 +574,207 @@ mod tests {
         );
     }
 
+    /// Peak-bin frequency (cycles/sample, in `0.0..0.5`) of a real signal's
+    /// dominant spectral line: FFT magnitude over the whole window, biggest
+    /// positive-frequency bin. `signal.len()` must be a power of two.
+    fn dominant_freq(signal: &[f64]) -> f64 {
+        let n = signal.len();
+        let mut fft = Fft::<f64>::new(n);
+        let mut spectrum: Vec<Complex<f64>> =
+            signal.iter().map(|&v| Complex::new(v, 0.0)).collect();
+        fft.forward(&mut spectrum);
+        let mut best_bin = 1usize;
+        let mut best_mag = -1.0f64;
+        for (k, c) in spectrum.iter().enumerate().take(n / 2).skip(1) {
+            let mag = c.norm_sqr();
+            if mag > best_mag {
+                best_mag = mag;
+                best_bin = k;
+            }
+        }
+        best_bin as f64 / n as f64
+    }
+
+    /// TASK 1(a) (round-35 SBR-HF-patch conviction): synthesis alone, band by
+    /// band and intra-band offset by intra-band offset. Feed synthesis band
+    /// `q` a phasor rotating slowly hop-to-hop (`exp(i*2*pi*delta*slot)`,
+    /// `delta` a fraction of the inter-band spacing) and read the output
+    /// spectrum's dominant line back: does it land at `centre(q) +
+    /// delta/SYNTHESIS_BANDS` or `centre(q) - delta/SYNTHESIS_BANDS`? Pins
+    /// that each band's own intra-band offset sense is self-consistent
+    /// (`+delta` and `-delta` read as mirror images of each other, not
+    /// independently flipped) -- a single band's own demodulation direction
+    /// has to be well-defined before cross-band placement (tested in
+    /// `patch_replay_preserves_absolute_frequency_mapping`, where the real
+    /// conviction for this round lives) means anything.
+    #[test]
+    fn synthesis_offset_sense_is_self_consistent_within_a_band() {
+        let omega_step = std::f64::consts::PI / (2.0 * SYNTHESIS_BANDS as f64);
+        let bands = [5usize, 14, 27, 42];
+        let deltas = [-0.3f64, 0.3];
+        let slots = 128;
+        let fft_len = 4096;
+        println!("q\tdelta\tmeasured_f\texpected(+delta sense)\texpected(-delta sense)\tsense");
+        for &q in &bands {
+            let centre = (q as f64 + 0.5) * omega_step / std::f64::consts::TAU;
+            let mut senses = Vec::new();
+            for &delta in &deltas {
+                let mut synthesis = Synthesis::new();
+                let mut out = Vec::with_capacity(slots * SYNTHESIS_BANDS);
+                for slot in 0..slots {
+                    let mut v = [Complex::new(0.0, 0.0); SYNTHESIS_BANDS];
+                    let ph = std::f64::consts::TAU * delta * slot as f64;
+                    v[q] = Complex::new(ph.cos(), ph.sin());
+                    out.extend(synthesis.process_slot(&v).iter().map(|&s| f64::from(s)));
+                }
+                let steady = &out[out.len() - fft_len..];
+                let f_measured = dominant_freq(steady);
+                let expected_plus = centre + delta / SYNTHESIS_BANDS as f64;
+                let expected_minus = centre - delta / SYNTHESIS_BANDS as f64;
+                let sense =
+                    if (f_measured - expected_plus).abs() < (f_measured - expected_minus).abs() {
+                        "+"
+                    } else {
+                        "-"
+                    };
+                println!(
+                    "{q}\t{delta:+.2}\t{f_measured:.6}\t{expected_plus:.6}\t{expected_minus:.6}\t{sense}"
+                );
+                senses.push(sense);
+            }
+            assert_eq!(
+                senses[0], senses[1],
+                "band {q}'s +delta and -delta offset senses disagree ({} vs {}) -- \
+                 the band's own demodulation direction is not self-consistent",
+                senses[0], senses[1]
+            );
+        }
+    }
+
+    /// TASK 1(b) (round-35 SBR-HF-patch conviction): the actual patch
+    /// operation -- analyze a real tone at a known offset from source band
+    /// `p`'s own centre via [`Analysis`], copy that complex series straight
+    /// into synthesis band `q` through the exact same per-slot placement
+    /// correction `sbr_hf::generate` applies at its patch-copy site
+    /// (`sbr_hf::band_shift_correction`, a quarter-turn-per-slot rotation
+    /// keyed on `(target - source) mod 4`), and check where the
+    /// reconstructed tone lands. Self-calibrating: band `q == p` is the
+    /// already-proven-correct round-trip case (its own measured frequency is
+    /// ground truth for "this tone, no shift"), so cross-band cases are
+    /// checked against `f_calib(p) + (q-p)/256` (`1/256` being
+    /// `SYNTHESIS_BANDS`'s own `omega_step/(2*pi)` band spacing) rather than
+    /// a hand-derived absolute constant.
+    ///
+    /// Without the correction (a bare copy, `sbr_hf`'s pre-fix behaviour)
+    /// this reads a clean, single-line, but WRONG frequency whenever
+    /// `q - p` is odd: exactly one full synthesis-band-width off, sign
+    /// alternating with `(q-p) mod 4` (`+1 mod 4` undershoots, `+3 mod 4`
+    /// overshoots) -- `Synthesis`'s odd-stacked modulation kernel centres
+    /// band `k` with a phase intercept of `(k+0.5)*pi/4` that only cancels
+    /// against a receiving band's own reconstruction when the source and
+    /// target band coincide (what `round_trip_reconstructs_the_passband`
+    /// exercises); for a genuinely different target band an odd `q-p` lands
+    /// that intercept difference on an odd multiple of `pi/4`, a phase this
+    /// design's finite hop-discretised overlap-add cannot represent without
+    /// snapping a full quarter-band. Even `q-p` lands on a multiple of
+    /// `pi/2` and was already exact.
+    #[test]
+    fn patch_replay_preserves_absolute_frequency_mapping() {
+        let omega_step_a = std::f64::consts::PI / (2.0 * ANALYSIS_BANDS as f64);
+        let omega_step_s = std::f64::consts::PI / (2.0 * SYNTHESIS_BANDS as f64);
+        let band_spacing_s = omega_step_s / std::f64::consts::TAU;
+        let slots = 128;
+        let core_samples = slots * ANALYSIS_BANDS;
+        let fft_len = 4096;
+
+        // `p` must be a valid *analysis* band (< `ANALYSIS_BANDS`, 32) --
+        // real patches only ever read a source band down there -- while `q`
+        // ranges the full synthesis span, both low and high, both parities,
+        // both odd and even `q - p`.
+        let pairs: [(usize, usize); 10] = [
+            (5, 14),
+            (14, 5),
+            (6, 27),
+            (27, 6),
+            (3, 42),
+            (9, 42),
+            (9, 20),
+            (20, 9),
+            (5, 13),
+            (6, 26),
+        ];
+        let deltas = [-0.3f64, 0.0, 0.3];
+
+        println!("p\tq\tdelta\tf_calib(p==p)\tf_measured\texpected\terr(bins)");
+        let mut worst_err_bins = 0.0f64;
+        for &(p, q) in &pairs {
+            let centre_p = (p as f64 + 0.5) * omega_step_a;
+            for &delta in &deltas {
+                let omega0 = centre_p + delta * omega_step_a;
+                let x: Vec<f64> = (0..core_samples)
+                    .map(|i| (omega0 * i as f64).cos())
+                    .collect();
+
+                let mut analysis = Analysis::new();
+                let mut sub_p = Vec::with_capacity(slots);
+                for chunk in x.chunks_exact(ANALYSIS_BANDS) {
+                    let mut c = [0f32; ANALYSIS_BANDS];
+                    for (d, &s) in c.iter_mut().zip(chunk) {
+                        *d = s as f32;
+                    }
+                    sub_p.push(analysis.process_slot(&c)[p]);
+                }
+
+                // Mirrors `sbr_hf::generate`'s patch-copy site exactly: a
+                // per-slot quarter-turn correction keyed on `(target -
+                // source) mod 4`, applied before the value reaches
+                // `Synthesis`.
+                let synth_at = |target: usize| -> f64 {
+                    let k = crate::sbr_hf::band_shift_correction(target, p);
+                    let mut synthesis = Synthesis::new();
+                    let mut out = Vec::with_capacity(slots * SYNTHESIS_BANDS);
+                    for (t, &s) in sub_p.iter().enumerate() {
+                        let s = if k == 0 {
+                            s
+                        } else {
+                            let angle = k as f64 * std::f64::consts::FRAC_PI_2 * (t % 4) as f64;
+                            let rot = Complex::new(angle.cos(), angle.sin());
+                            Complex::new(
+                                s.re * rot.re - s.im * rot.im,
+                                s.re * rot.im + s.im * rot.re,
+                            )
+                        };
+                        let mut v = [Complex::new(0.0, 0.0); SYNTHESIS_BANDS];
+                        v[target] = s;
+                        out.extend(synthesis.process_slot(&v).iter().map(|&s| f64::from(s)));
+                    }
+                    dominant_freq(&out[out.len() - fft_len..])
+                };
+
+                let f_calib = synth_at(p);
+                let f_measured = synth_at(q);
+                let expected = f_calib + (q as i64 - p as i64) as f64 * band_spacing_s;
+                let bin_width = 1.0 / fft_len as f64;
+                let err_bins = (f_measured - expected).abs() / bin_width;
+                worst_err_bins = f64::max(worst_err_bins, err_bins);
+                println!(
+                    "{p}\t{q}\t{delta:+.2}\t{f_calib:.6}\t{f_measured:.6}\t{expected:.6}\t{err_bins:.2}"
+                );
+            }
+        }
+
+        // With the patch-site correction applied, every case (odd AND even
+        // `q - p`) should land within a couple of FFT bins of the exact
+        // predicted absolute frequency -- the coherent-mapping bar the
+        // uncorrected bank could not clear (worst case there: 16 bins,
+        // exactly one synthesis band).
+        assert!(
+            worst_err_bins <= 3.0,
+            "worst corrected prediction error {worst_err_bins} bins exceeds 3 -- the patch-site \
+             placement correction does not restore a coherent absolute frequency mapping"
+        );
+    }
+
     /// Round-13 (queue item 2, "gain-level issue" bucket): per-band
     /// steady-state synthesis amplitude gain for a PHYSICALLY REAL tone at
     /// each synthesis band's own centre frequency -- unlike a naive
