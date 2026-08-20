@@ -105,6 +105,13 @@ pub struct MajorSyncInfo {
     pub format: MajorSyncFormat,
     /// The primary sample rate, decoded from `data[8]`'s high nibble.
     pub sample_rate: u32,
+    /// The raw 4-bit rate code (`& 7` is the `2^n` multiplier, which also
+    /// sizes the access unit: `40 << n` samples).
+    pub rate_code: u8,
+    /// The 8-channel presentation's 13-bit channel-assignment mask (bit 0 =
+    /// L/R, 1 = C, 2 = LFE, 3 = Ls/Rs, 6 = Lrs/Rrs; `0x4F` is standard 7.1);
+    /// 0 when the major sync is plain MLP, which has no such field.
+    pub ch8_assignment: u16,
 }
 
 /// A rate code's `44.1k*2^n` / `48k*2^n` value, or [`Error::Unsupported`] for
@@ -134,10 +141,23 @@ impl MajorSyncInfo {
             MAJOR_SYNC_MLP => MajorSyncFormat::Mlp,
             _ => return Err(Error::corrupt("TrueHD: no major sync word")),
         };
-        let sample_rate = sample_rate(data[4] >> 4)?;
+        // TrueHD: format_info starts with the rate code; MLP puts its two
+        // 4-bit word-length codes first and the rate codes one byte later.
+        let rate_code = match format {
+            MajorSyncFormat::TrueHd => data[4] >> 4,
+            MajorSyncFormat::Mlp => data[5] >> 4,
+        };
+        let sample_rate = sample_rate(rate_code)?;
+        // format_info's last 13 bits: data[6] low 5 bits + data[7].
+        let ch8_assignment = match format {
+            MajorSyncFormat::TrueHd => (u16::from(data[6] & 0x1F) << 8) | u16::from(data[7]),
+            MajorSyncFormat::Mlp => 0,
+        };
         Ok(MajorSyncInfo {
             format,
             sample_rate,
+            rate_code,
+            ch8_assignment,
         })
     }
 }
@@ -168,6 +188,9 @@ pub struct AccessUnitHeader {
     pub input_timing: u16,
     /// Present on roughly one access unit per video frame.
     pub major_sync: Option<MajorSyncInfo>,
+    /// Byte offset where the substream directory ends and substream 0's
+    /// coded data begins.
+    pub data_start: usize,
     /// One entry per substream, in stream order (`substreams.len()` is the
     /// substream count).
     pub substreams: Vec<SubstreamInfo>,
@@ -234,8 +257,20 @@ impl AccessUnitHeader {
             length,
             input_timing,
             major_sync,
+            data_start: pos,
             substreams,
         })
+    }
+
+    /// Byte span `(start, end)` of substream `i`'s coded data within the
+    /// access unit, from the directory's cumulative end pointers.
+    pub fn substream_span(&self, i: usize) -> (usize, usize) {
+        let start = if i == 0 {
+            self.data_start
+        } else {
+            self.data_start + usize::from(self.substreams[i - 1].end_offset_words) * 2
+        };
+        (start, self.data_start + usize::from(self.substreams[i].end_offset_words) * 2)
     }
 
     /// The channel layout Dolby's substream convention implies: substream 0
@@ -252,14 +287,20 @@ impl AccessUnitHeader {
     }
 }
 
-/// A TrueHD/MLP decoder for one stream.
-///
-/// Access-unit framing and major-sync/substream-directory parsing are fully
-/// implemented; substream decoding is not — see the crate-level docs for the
-/// scope this covers once it is.
+/// A TrueHD/MLP decoder for one stream: access units in, one interleaved
+/// S32 (24-bit left-justified) [`AudioFrame`] of the highest presentation
+/// out per access unit. See the crate-level docs for scope.
 #[derive(Debug)]
 pub struct TrueHdDecoder {
     params: CodecParameters,
+    core: crate::decode::Core,
+    pending: Option<AudioFrame>,
+}
+
+impl Default for TrueHdDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TrueHdDecoder {
@@ -269,25 +310,28 @@ impl TrueHdDecoder {
     pub fn new() -> TrueHdDecoder {
         TrueHdDecoder {
             params: CodecParameters::new(CodecId::TrueHd),
+            core: crate::decode::Core::new(),
+            pending: None,
         }
     }
 
-    /// One access unit in; parses its header and — TODO(H2): decode the
-    /// substreams (restart headers, FIR/IIR predictor filters, Huffman/LSB
-    /// residual entropy, channel matrixing, the lossless check) into PCM.
-    /// Until then this always answers [`Error::Unsupported`] once the header
-    /// itself parses cleanly, and any framing error before that.
+    /// The stream-side self-check tallies so far (restart CRC, parity,
+    /// lossless check); all stay zero on a clean decode.
+    pub fn check_stats(&self) -> crate::decode::CheckStats {
+        self.core.stats
+    }
+
+    /// One access unit in; one frame of the highest presentation out —
+    /// `None` until the first major sync and every substream's first
+    /// restart header have been seen.
     pub fn push(&mut self, data: &[u8]) -> Result<Option<AudioFrame>> {
         self.decode_access_unit(data)
     }
 
     /// See [`TrueHdDecoder::push`].
     pub fn decode_access_unit(&mut self, data: &[u8]) -> Result<Option<AudioFrame>> {
-        AccessUnitHeader::parse(data)?;
-        Err(Error::unsupported(
-            "TrueHD substream decode",
-            "substream decode pending",
-        ))
+        let header = AccessUnitHeader::parse(data)?;
+        self.core.decode(&header, data)
     }
 }
 
@@ -297,22 +341,27 @@ impl Decoder for TrueHdDecoder {
     }
 
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
-        self.decode_access_unit(&packet.data)?;
+        if let Some(mut frame) = self.decode_access_unit(&packet.data)? {
+            frame.pts = packet
+                .pts
+                .map(|ticks| ec_core::timebase::Timestamp::new(ticks, packet.time_base));
+            self.pending = Some(frame);
+        }
         Ok(())
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        // decode_access_unit never returns Ok, so send_packet never
-        // completes and this is unreachable in practice; NeedMore is the
-        // honest answer for "nothing queued" regardless.
-        Err(Error::NeedMore)
+        self.pending.take().map(Frame::Audio).ok_or(Error::NeedMore)
     }
 
     fn flush(&mut self) -> Result<()> {
         Ok(())
     }
 
-    fn reset(&mut self) {}
+    fn reset(&mut self) {
+        self.pending = None;
+        self.core.reset();
+    }
 }
 
 #[cfg(test)]
@@ -417,9 +466,15 @@ mod tests {
     }
 
     #[test]
-    fn decoder_names_substream_decode_as_pending() {
+    fn decoder_yields_nothing_before_a_major_sync() {
         let mut decoder = TrueHdDecoder::new();
-        let err = decoder.decode_access_unit(&stereo_au()).unwrap_err();
-        assert!(matches!(err, Error::Unsupported { .. }));
+        assert_eq!(decoder.decode_access_unit(&stereo_au()).unwrap(), None);
+    }
+
+    #[test]
+    fn substream_spans_follow_the_directory() {
+        let au = AccessUnitHeader::parse(&surround51_au()).unwrap();
+        assert_eq!(au.substream_span(0), (36, 38));
+        assert_eq!(au.substream_span(1), (38, 44));
     }
 }

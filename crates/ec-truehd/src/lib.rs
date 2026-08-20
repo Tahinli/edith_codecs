@@ -3,15 +3,18 @@
 //! Written from Dolby's public TrueHD/MLP documentation of the bitstream's
 //! *shape* — major sync, per-substream access-unit directory, FIR/IIR filter
 //! parameters, the Huffman/LSB entropy coder and matrixing — not from any
-//! third party's source. The syntax layer ([`sync`]) is parsed and verified
-//! against a real 7.1 Blu-ray remux; the substream *decode* itself
-//! ([`TrueHdDecoder::decode_access_unit`]) is not implemented yet.
+//! third party's source. The syntax layer ([`sync`]) and the lossless
+//! substream decode ([`decode`], reached through
+//! [`TrueHdDecoder::decode_access_unit`]) are both verified bit-exact
+//! against an external decoder on a real 7.1 Blu-ray remux (first 60 s,
+//! 23 040 000 of 23 040 000 samples) and on externally encoded MLP/TrueHD
+//! mono, stereo and 5.1 streams.
 //!
 //! Scope, stated once so a caller knows what to expect:
 //!
 //! - **In scope**: major sync detection and parsing (format id, sample rate,
 //!   channel presentations), the access-unit header's per-substream
-//!   directory (end pointers, checksum/parity), and — once implemented — the
+//!   directory (end pointers, checksum/parity), and the
 //!   three PCM-presentation substreams a real Blu-ray track carries: 2-ch,
 //!   6-ch (5.1) and 8-ch (7.1), each built from restart headers, FIR/IIR
 //!   predictor filters, Huffman/LSB residual entropy and the channel
@@ -33,7 +36,9 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod decode;
 pub mod sync;
 
 pub use ec_core::Error;
+pub use decode::CheckStats;
 pub use sync::{AccessUnitHeader, MajorSyncInfo, MajorSyncFormat, SubstreamInfo, TrueHdDecoder, frame_length};
