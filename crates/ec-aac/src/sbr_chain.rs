@@ -117,6 +117,20 @@ static SIDEINFO_LOG: std::sync::OnceLock<std::sync::Mutex<Vec<SbrSideInfoRow>>> 
     std::sync::OnceLock::new();
 static SIDEINFO_FRAME: AtomicUsize = AtomicUsize::new(0);
 
+/// Diagnostic-only counter: how many `apply_data` calls process-wide ran
+/// with `source == "hold"` (an AU whose FIL carried no fresh SBR payload,
+/// falling back to `apply_last`'s reuse of the last parsed frame). Read via
+/// [`hold_call_count`]; not gated by an env var since incrementing an atomic
+/// is unconditionally cheap, unlike the `EC_AAC_SBR_*_DEBUG` prints nearby.
+static HOLD_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+/// Total `apply_data` calls process-wide where the SBR payload was reused
+/// from a prior frame (`apply_last`) rather than freshly parsed this AU --
+/// diagnostic instrument for `sbr441_family_sample_drift_probe`.
+pub fn hold_call_count() -> usize {
+    HOLD_CALLS.load(Ordering::Relaxed)
+}
+
 fn sideinfo_enabled() -> bool {
     std::env::var("EC_AAC_SBR_SIDEINFO_DEBUG").is_ok()
 }
@@ -271,6 +285,9 @@ impl SbrChain {
         planes: &mut [Vec<f32>],
         source: &'static str,
     ) {
+        if source == "hold" {
+            HOLD_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
         let Some(elem) = self.elements.get_mut(&(tag, is_cpe)) else {
             return;
         };
