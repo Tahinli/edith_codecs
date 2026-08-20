@@ -246,6 +246,7 @@ version = "0.1.0"
 dependencies = [
  "ec-core",
  "ec-mp4",
+ "ec-riff",
 ]
 
 [[package]]

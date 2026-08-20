@@ -108,11 +108,16 @@ fn golomb(bits: &mut Bits<'_>, m: u32, k: u32, maxbits: u32) -> u32 {
     let stream = bits.peek32();
     let pre = (!stream).leading_zeros();
     if pre >= MAX_PREFIX {
-        bits.pos += (MAX_PREFIX + maxbits) as usize;
-        return match maxbits {
+        // The raw value can be up to 32 bits wide (a 24-bit stereo element
+        // codes 25), so it does not fit in the same 32-bit peek as the
+        // prefix: step past the prefix and peek again.
+        bits.pos += MAX_PREFIX as usize;
+        let raw = match maxbits {
             0 => 0,
-            n => (stream << MAX_PREFIX) >> (32 - n),
+            n => bits.peek32() >> (32 - n),
         };
+        bits.pos += maxbits as usize;
+        return raw;
     }
     bits.pos += pre as usize + 1;
     let mut result = pre * m;

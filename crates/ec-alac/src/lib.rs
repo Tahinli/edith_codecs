@@ -12,8 +12,8 @@
 //! container carries as extradata: the frame length, the bit depth and the
 //! three Golomb constants the residual coder adapts from.
 //!
-//! Decode only — edith never writes ALAC, so there is no encoder here and no
-//! pretending otherwise.
+//! - [`AlacEncoder`], the mirror image: frames in, coded packets out, for a
+//!   container that wants to write ALAC instead of read it.
 //!
 //! **Clean room.** Written from the published ALAC format description; Apple's
 //! decoder sources were not read. Samples are returned shifted into their PCM
@@ -24,6 +24,9 @@
 #![warn(missing_docs)]
 
 mod decode;
+mod encode;
+
+pub use encode::AlacEncoder;
 
 use ec_core::error::{Error, Result};
 use ec_core::frame::{AudioFrame, ChannelLayout, Frame, SampleFormat};
@@ -132,6 +135,36 @@ impl MagicCookie {
             true => SampleFormat::S16,
             false => SampleFormat::S32,
         }
+    }
+
+    /// The bare 24-byte `ALACSpecificConfig`, big-endian.
+    pub fn to_bytes(&self) -> [u8; 24] {
+        let mut b = [0u8; 24];
+        b[0..4].copy_from_slice(&self.frame_length.to_be_bytes());
+        b[4] = self.compatible_version;
+        b[5] = self.bit_depth;
+        b[6] = self.pb;
+        b[7] = self.mb;
+        b[8] = self.kb;
+        b[9] = self.channels;
+        b[10..12].copy_from_slice(&self.max_run.to_be_bytes());
+        b[12..16].copy_from_slice(&self.max_frame_bytes.to_be_bytes());
+        b[16..20].copy_from_slice(&self.avg_bit_rate.to_be_bytes());
+        b[20..24].copy_from_slice(&self.sample_rate.to_be_bytes());
+        b
+    }
+
+    /// The whole `alac` box a container's sample entry carries: a 12-byte
+    /// full-box header (size, `alac`, version/flags) in front of
+    /// [`MagicCookie::to_bytes`], which is the shape `ec_mp4`'s muxer expects
+    /// as a track's `extradata`.
+    pub fn extradata_box(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(36);
+        out.extend_from_slice(&36u32.to_be_bytes());
+        out.extend_from_slice(b"alac");
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(&self.to_bytes());
+        out
     }
 }
 
