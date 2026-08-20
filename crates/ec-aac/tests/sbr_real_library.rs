@@ -4141,3 +4141,228 @@ fn coupled_cpe_channel_swap_probe() {
         }
     }
 }
+
+/// Full decode of one container-native AAC stream, WITHOUT `our_decode`'s
+/// `MAX_SAMPLES` (~22.7s @44100) cap -- this probe needs the ~30s the
+/// per-1s lag-drift table walks, and the sample-count comparison below
+/// needs the true total the decoder produced, not a cap-truncated one.
+/// Bounded only by `extract_from`'s existing 1_500-AU read cap.
+fn our_decode_uncapped(path: &Path, stream_index: usize) -> Option<(Vec<Vec<f32>>, u32, usize)> {
+    let (asc, aus) = extract_aac_track(path, stream_index)?;
+    let mut decoder = AacDecoder::with_config_bytes(&asc).ok()?;
+    let rate = decoder.output_sample_rate().unwrap_or(0);
+    let mut planes: Vec<Vec<f32>> = Vec::new();
+    for au in &aus {
+        if let Ok(f) = decoder.decode(au, None) {
+            let ch = usize::from(f.channels);
+            if ch == 0 {
+                continue;
+            }
+            if planes.is_empty() {
+                planes = vec![Vec::new(); ch];
+            }
+            for (i, v) in f.samples.iter().enumerate() {
+                planes[i % ch].push(*v);
+            }
+        }
+    }
+    if planes.is_empty() {
+        return None;
+    }
+    Some((planes, rate, aus.len()))
+}
+
+/// Total sample count of an unbounded ffmpeg decode of one container-native
+/// AAC stream, interleaved-`f32` byte count / 4 -- i.e. `channels *
+/// per_channel_samples`, not capped at 30s the way `ffmpeg_decode` is.
+fn ffmpeg_total_interleaved_samples(path: &Path, absolute_stream: usize) -> u64 {
+    let out = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args([
+            "-map",
+            &format!("0:{absolute_stream}"),
+            "-f",
+            "f32le",
+            "-acodec",
+            "pcm_f32le",
+            "-",
+        ])
+        .output()
+        .expect("ffmpeg runs");
+    assert!(
+        out.status.success(),
+        "ffmpeg full decode failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.stdout.len() as u64 / 4
+}
+
+/// `ffprobe -show_entries stream=<entry>` on the file's first audio stream,
+/// trimmed. Used to cross-check the container's declared `sample_rate` and
+/// `duration` against what our decoder derives and what ffmpeg actually
+/// produces.
+fn ffprobe_field(path: &Path, entry: &str) -> String {
+    let out = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            &format!("stream={entry}"),
+            "-of",
+            "default=nw=1:nk=1",
+        ])
+        .arg(path)
+        .output()
+        .expect("ffprobe runs");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Narrow (`center +/- half`) fixed-window lag search anchored at ours-index
+/// `oa0`, `len` samples long -- immune to the periodic-content aliasing that
+/// makes `best_lag_correlation_ex`'s free ~100_000-wide coarse search
+/// unreliable on this file (see the ledger dead-end on ref-L-vs-ref-R
+/// itself mis-landing at lag=-24). `theirs`-index is `ours_index + lag`,
+/// the same convention `best_lag_correlation_ex::slice_at` uses.
+fn narrow_lag_at(
+    ours: &[f32],
+    theirs: &[f32],
+    oa0: usize,
+    len: usize,
+    center: i64,
+    half: i64,
+) -> (i64, f64) {
+    let mut best = (center, -2.0f64);
+    for lag in (center - half)..=(center + half) {
+        let ob_i = oa0 as i64 + lag;
+        if ob_i < 0 {
+            continue;
+        }
+        let (oa, ob) = (oa0, ob_i as usize);
+        if oa + len > ours.len() || ob + len > theirs.len() {
+            continue;
+        }
+        let c = correlation(&ours[oa..oa + len], &theirs[ob..ob + len]);
+        if c > best.1 {
+            best = (lag, c);
+        }
+    }
+    best
+}
+
+/// Round-55 charter probe: is the `heaac_44100_48k.m4a` (44.1k-family HE-AAC)
+/// lag-vs-time drift a sample-count mismatch between our decode and
+/// ffmpeg's reference (dropped/duplicated AU somewhere in the chain), or a
+/// rate-label bug (we call it 44100 but produce samples at another rate),
+/// or per-AU apply_last/hold fallbacks accumulating skew? Runs the same
+/// three measurements on one 48k-family HE-AAC fixture and on Nikbinler
+/// (real 44.1k HE-AAC) as controls that are known NOT to show the drift.
+#[test]
+fn sbr441_family_sample_drift_probe() {
+    if !have_ffmpeg() {
+        eprintln!("SKIP: ffmpeg not on PATH");
+        return;
+    }
+    let dir = std::env::var("EC_AAC_HEAAC_FIXTURES").unwrap_or_else(|_| {
+        format!("{}/../../.cache/heaac-fixtures", env!("CARGO_MANIFEST_DIR"))
+    });
+    let home = std::env::var("HOME").unwrap_or_default();
+    let cases: [(&str, PathBuf, i64); 3] = [
+        (
+            "heaac_44100_48k (FAIL family)",
+            PathBuf::from(&dir).join("heaac_44100_48k.m4a"),
+            -4674,
+        ),
+        (
+            "heaac_48000_48k (48k control)",
+            PathBuf::from(&dir).join("heaac_48000_48k.m4a"),
+            // corrected via this test's own wide free-search cross-check
+            // (below) -- 0 was a bad guess, true fixed lag is -4673, same
+            // as the failing family's.
+            -4673,
+        ),
+        (
+            "Nikbinler (44.1k control)",
+            PathBuf::from(format!("{home}/Music/Yok - Nikbinler.mp4")),
+            // corrected via this test's own wide free-search cross-check
+            // (below) -- -576 was this file's CORE-vs-FULL-chain delay
+            // from an earlier probe, not its full-chain-vs-ffmpeg-reference
+            // lag, which is +385.
+            385,
+        ),
+    ];
+    for (label, path, seed_lag) in cases {
+        println!("\n=== {label}: {} ===", path.display());
+        if !path.exists() {
+            eprintln!("SKIP {label}: {} absent", path.display());
+            continue;
+        }
+        let holds_before = ec_aac::hold_call_count();
+        let Some((ours, out_rate, au_count)) = our_decode_uncapped(&path, 0) else {
+            eprintln!("SKIP {label}: our_decode_uncapped failed");
+            continue;
+        };
+        // `ffmpeg_decode_pan_channel` caps at 10s (per its own charter,
+        // shared with `boneknapper_multichannel_lc_matches_reference`);
+        // this probe walks out to t=29s, so it needs `ffmpeg_decode`'s 30s
+        // cap instead -- planar channel 0 is L for every stereo case here.
+        let ref_l = ffmpeg_decode(&path, 0, 2).swap_remove(0);
+        let ch0 = &ours[0];
+        // Cross-check the hardcoded `seed_lag` guess with a free wide
+        // search before trusting the narrow window around it -- a wrong
+        // seed on a control file reads as near-zero correlation
+        // everywhere, indistinguishable from "no signal", not "no drift".
+        {
+            let (wlag, wcorr) = best_lag_correlation_wide(ch0, &ref_l, SEARCH_LAG_MAX);
+            println!("  (wide free-search cross-check: lag={wlag} corr={wcorr:.6})");
+        }
+
+        // (1) per-1s narrow lag search, +/-128 around the file's known
+        // (or, for the controls, assumed-near-zero) fixed lag.
+        println!("-- lag(t), narrow +/-128 window around seed lag {seed_lag} --");
+        let mut lag_points: Vec<(f64, f64)> = Vec::new();
+        let step = out_rate.max(1) as usize;
+        for t in 0..30usize {
+            let oa0 = t * step;
+            if oa0 + step > ch0.len() {
+                break;
+            }
+            let (lag, corr) = narrow_lag_at(ch0, &ref_l, oa0, step, seed_lag, 128);
+            println!("  t={t:>2}s lag={lag:>7} corr={corr:.6}");
+            lag_points.push((t as f64, lag as f64));
+        }
+        if lag_points.len() >= 2 {
+            let n = lag_points.len() as f64;
+            let sx: f64 = lag_points.iter().map(|(x, _)| x).sum();
+            let sy: f64 = lag_points.iter().map(|(_, y)| y).sum();
+            let sxy: f64 = lag_points.iter().map(|(x, y)| x * y).sum();
+            let sxx: f64 = lag_points.iter().map(|(x, _)| x * x).sum();
+            let slope = (n * sxy - sx * sy) / (n * sxx - sx * sx);
+            println!("  fitted slope = {slope:.4} samples/second");
+        }
+
+        // (2) total sample count per channel: ours vs ffmpeg vs ffprobe
+        // duration*rate vs AU-count*2048.
+        let our_total = ch0.len() as u64;
+        let ffmpeg_total = ffmpeg_total_interleaved_samples(&path, 0) / 2; // stereo
+        let ffprobe_duration: f64 = ffprobe_field(&path, "duration").parse().unwrap_or(0.0);
+        let ffprobe_rate: f64 = ffprobe_field(&path, "sample_rate").parse().unwrap_or(0.0);
+        let ffprobe_total = (ffprobe_duration * ffprobe_rate).round() as u64;
+        let au_implied_total = au_count as u64 * 2048;
+        println!(
+            "-- sample counts (per channel): ours={our_total} ffmpeg={ffmpeg_total} \
+             ffprobe(duration*rate)={ffprobe_total} au_count*2048={au_implied_total} \
+             (au_count={au_count}) our_decode_rate={out_rate} ffprobe_rate={ffprobe_rate} \
+             ratio(ours/ffmpeg)={:.6}",
+            our_total as f64 / ffmpeg_total.max(1) as f64
+        );
+
+        // (4) apply_last/hold fallback count for this file's own decode
+        // (process-wide counter, delta'd against this file's own before/
+        // after since the test loop shares one process).
+        let holds = ec_aac::hold_call_count() - holds_before;
+        println!("-- apply_last (hold) calls during this file's decode: {holds} of {au_count} AUs");
+    }
+}
