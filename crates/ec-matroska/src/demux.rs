@@ -1118,8 +1118,6 @@ pub(crate) fn codec_of(id: &str, bit_depth: u32) -> Option<CodecId> {
         "A_VORBIS" => CodecId::Vorbis,
         "A_AC3" => CodecId::Ac3,
         "A_EAC3" => CodecId::EAc3,
-        // Named rather than dropped: nothing here decodes them, and a track a
-        // player lists as unsupported is a better answer than a silent one.
         "A_TRUEHD" | "A_MLP" => CodecId::TrueHd,
         id if id.starts_with("A_DTS") => CodecId::Dts,
         "A_FLAC" => CodecId::Flac,
