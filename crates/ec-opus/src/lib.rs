@@ -71,6 +71,7 @@ pub mod packet;
 pub mod range;
 pub mod silk;
 pub(crate) mod silk_enc;
+pub mod silk_enc_write;
 
 pub use celt::CeltDecoder;
 pub use celt_enc::CeltEncoder;
@@ -80,6 +81,7 @@ pub use multistream_enc::MultistreamEncoder;
 pub use packet::{Bandwidth, Mode, Packet, Toc};
 pub use range::{RangeDecoder, RangeEncoder};
 pub use silk::SilkDecoder;
+pub use silk_enc_write::SilkEncoder;
 
 use ec_core::{Error, Result};
 
