@@ -361,6 +361,18 @@ pub fn lpc2(x: &[Complex<f64>]) -> (Complex<f64>, Complex<f64>) {
 fn stabilize(coeffs: (Complex<f64>, Complex<f64>)) -> (Complex<f64>, Complex<f64>) {
     let (a1, a2) = coeffs;
     let mag = a1.norm_sqr().sqrt() + a2.norm_sqr().sqrt();
+    // (Round-56) Tried tightening this bound to 0.9 on the theory that a
+    // pole at 0.999 gives ~1e6x power resonant gain (`~1/(1-r)^2`), which
+    // `EC_AAC_SBR_CELLDUMP` traces do show happening (`cur`, the raw
+    // pre-gain HF estimate, reaching 1e7-1e11 against a ~1e4 transmitted
+    // target on heaac_48000_64k.m4a's crossover-straddling sweep window,
+    // in the SAME limiter band as starved neighbor cells) -- measured
+    // ZERO effect on the t=18s/24s corr cliff (0.054601->0.054536,
+    // 0.058942->0.058797) or the `EC_AAC_SBR_HF_BYPASS` A/B, because
+    // `raw_gain = sqrt(target/cur)` cancels `cur` exactly for any
+    // non-capped cell regardless of this bound's value -- reverted, no
+    // measured benefit to justify the regression risk on frames that
+    // legitimately need resonance near this bound. Left at `0.999`.
     if mag > 0.999 && mag.is_finite() {
         let s = 0.999 / mag;
         (a1.scale(s), a2.scale(s))
