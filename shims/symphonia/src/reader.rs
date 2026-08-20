@@ -17,6 +17,11 @@ use ec_core::registry::MediaType;
 pub struct ProbeReader {
     inner: ec_probe::Reader,
     tracks: Vec<Track>,
+    /// Audio track ids still owed their terminal, empty-data packet once the
+    /// container itself has run out: `None` before that, then the queue,
+    /// draining to empty rather than back to `None` so a second real EOF read
+    /// hands out nothing more than once each.
+    eos_pending: Option<std::vec::IntoIter<u32>>,
 }
 
 impl ProbeReader {
@@ -40,7 +45,11 @@ impl ProbeReader {
                 language: s.language.clone(),
             })
             .collect();
-        ProbeReader { inner, tracks }
+        ProbeReader {
+            inner,
+            tracks,
+            eos_pending: None,
+        }
     }
 
     /// The stream index behind a track id.
@@ -106,17 +115,44 @@ impl FormatReader for ProbeReader {
     }
 
     fn next_packet(&mut self) -> Result<Option<Packet>> {
+        if let Some(pending) = &mut self.eos_pending {
+            // Empty data is the flush signal `EcAudioDecoder::decode` reads:
+            // a real packet is never zero bytes for any codec this family
+            // decodes.
+            return Ok(pending
+                .next()
+                .map(|id| Packet::new(id, Timestamp::new(0), Duration::new(0), &[])));
+        }
         match self.inner.next_packet() {
             Ok(packet) => {
                 let id = self.inner.native_id(packet.stream) as u32;
-                Ok(Some(Packet::new(
+                let granule = ec_ogg::granule_of(&packet);
+                let mut out = Packet::new(
                     id,
                     Timestamp::new(packet.pts.unwrap_or(0)),
                     Duration::new(packet.duration.unwrap_or(0).max(0) as u64),
                     &packet.data,
-                )))
+                );
+                out.granule = granule;
+                Ok(Some(out))
             }
-            Err(e) if e.is_eof() => Ok(None),
+            Err(e) if e.is_eof() => {
+                // The container itself is exhausted: give every audio track
+                // one last, empty packet so its decoder is told to flush the
+                // hop it has been holding back, then report real EOF.
+                let ids: Vec<u32> = self
+                    .tracks
+                    .iter()
+                    .filter(|t| t.track_type == TrackType::Audio)
+                    .map(|t| t.id)
+                    .collect();
+                let mut ids = ids.into_iter();
+                let first = ids
+                    .next()
+                    .map(|id| Packet::new(id, Timestamp::new(0), Duration::new(0), &[]));
+                self.eos_pending = Some(ids);
+                Ok(first)
+            }
             Err(e) => Err(e.into()),
         }
     }
@@ -144,15 +180,25 @@ impl EcAudioDecoder {
 
 impl AudioDecoder for EcAudioDecoder {
     fn decode(&mut self, packet: &Packet) -> Result<GenericAudioBufferRef<'_>> {
-        let rate = self.inner.sample_rate().max(1);
-        let mut ec = ec_core::Packet::new(
-            packet.track_id,
-            ec_core::TimeBase::from_rate(rate),
-            packet.data.as_ref(),
-        );
-        ec.pts = Some(packet.pts.value());
-        ec.duration = Some(packet.dur.value() as i64);
-        self.inner.decode(&ec, &mut self.out)?;
+        if packet.data.is_empty() {
+            // `ProbeReader::next_packet`'s terminal, empty packet: the file
+            // has run out, and this is the signal to release whatever the
+            // decoder was holding back rather than decode nothing.
+            self.inner.flush(&mut self.out)?;
+        } else {
+            let rate = self.inner.sample_rate().max(1);
+            let mut ec = ec_core::Packet::new(
+                packet.track_id,
+                ec_core::TimeBase::from_rate(rate),
+                packet.data.as_ref(),
+            );
+            ec.pts = Some(packet.pts.value());
+            ec.duration = Some(packet.dur.value() as i64);
+            if let Some(granule) = packet.granule {
+                ec.side_data.push(ec_ogg::granule_side_data(granule));
+            }
+            self.inner.decode(&ec, &mut self.out)?;
+        }
         Ok(GenericAudioBufferRef::new(
             &self.out,
             self.inner.channels().max(1),
