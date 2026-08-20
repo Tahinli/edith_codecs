@@ -2199,8 +2199,9 @@ fn synthetic_heaac_matrix() {
         std::env::set_var("EC_AAC_SBR_SIDEINFO_DEBUG", "1");
     }
     println!(
-        "{:>5} {:>6} {:>4} {:>4} {:>4}  {:>8} {:>8} {:>8} {:>6}  {:>11} {:>8}",
-        "rate", "kbps", "prof", "kx", "k2", "full", "below", "above", "lag", "ours_v_core", "ovc_lag"
+        "{:>5} {:>6} {:>4} {:>4} {:>4}  {:>8} {:>8} {:>8} {:>6}  {:>11} {:>8}  {:>10} {:>8}  {:>9} {:>9}",
+        "rate", "kbps", "prof", "kx", "k2", "full", "below", "above", "lag", "ours_v_core", "ovc_lag",
+        "core_v_ref", "cvr_lag", "core_rate", "full_rate"
     );
     // Wide enough that the WIDE_LAG_MAX==LC's own decoder priming delay
     // (2048) plus a full SBR-chain worth of extra delay (a few thousand
@@ -2286,14 +2287,43 @@ fn synthetic_heaac_matrix() {
                 } else {
                     None
                 };
+                // Coordinator follow-up 2: splits "our core decode of THIS
+                // fixture is wrong" (core_v_ref ~0) from "the SBR chain
+                // scrambles a good core" (core_v_ref >= ~0.99 while `below`
+                // above stays ~0/negative) -- OUR core-only decode (2x
+                // upsampled, same convention `ours_v_core` uses) against the
+                // REFERENCE decoder's own decode, below the crossover only,
+                // wide lag search since this is an independent alignment
+                // from `full`/`below`'s (core-only carries no SBR delay).
+                let (core_v_ref, core_rate_str) = if kx > 0 {
+                    match our_decode_core_only(&path, 0) {
+                        Some((core, core_rate)) => {
+                            let up: Vec<f32> = core[0].iter().flat_map(|&s| [s, s]).collect();
+                            let tl = lowpass(t, our_rate, crossover_hz);
+                            let ul = lowpass(&up, our_rate, crossover_hz);
+                            (Some(best_lag_correlation_wide(&ul, &tl, WIDE_LAG_MAX)), core_rate.to_string())
+                        }
+                        None => (None, "n/a".into()),
+                    }
+                } else {
+                    (None, "n/a".into())
+                };
                 println!(
-                    "{rate:>5} {br:>6} {profile:>4} {kx:>4} {k2:>4}  {full:>8.4} {below:>8.4} {above:>8.4} {lag:>6}  {:>11} {:>8}",
+                    "{rate:>5} {br:>6} {profile:>4} {kx:>4} {k2:>4}  {full:>8.4} {below:>8.4} {above:>8.4} {lag:>6}  {:>11} {:>8}  {:>10} {:>8}  {:>9} {:>9}",
                     ours_v_core
                         .map(|(_, c)| format!("{c:.4}"))
                         .unwrap_or_else(|| "n/a".into()),
                     ours_v_core
                         .map(|(l, _)| l.to_string())
-                        .unwrap_or_else(|| "n/a".into())
+                        .unwrap_or_else(|| "n/a".into()),
+                    core_v_ref
+                        .map(|(_, c)| format!("{c:.4}"))
+                        .unwrap_or_else(|| "n/a".into()),
+                    core_v_ref
+                        .map(|(l, _)| l.to_string())
+                        .unwrap_or_else(|| "n/a".into()),
+                    core_rate_str,
+                    our_rate,
                 );
                 // Coordinator follow-up (4): on the two named rows, probe
                 // candidate total HE-vs-reference delays built from LC's own
