@@ -134,16 +134,21 @@ def ref_decode(frames, tag):
     os.remove(mp4)
     return np.frombuffer(dec.stdout, dtype="<f4").astype(np.float64), dec.stderr.decode(errors="replace")
 BAND_HZ = RATE / 128  # QMF band width, both source and target index units
-# Round-30 fix: a source (low) QMF band is 32 core-MDCT bins wide (1024-bin
-# core MDCT / 32 core bands), not 16 -- every prior round's k = p*16 + offset
-# was reading the wrong bin for band p entirely, not just the wrong in-band
-# offset. Placed at the BAND CENTER (bin 16 of the 32), which lands exactly
-# on a 4-bin group boundary (16 % 4 == 0) so tone_core's grouping needs no
-# fractional-offset trick. A center tone's fractional position within its
-# 32-bin source band is 0.5; patches translate by whole band widths, so the
-# translated line keeps frac == 0.5 in its target band too (or 1-0.5 == 0.5
-# under mirroring -- indistinguishable at the center, which is fine, this
-# probe only needs the TARGET BAND INDEX, not direct/mirror discrimination).
+# Round-34 fix: round-30's "32 core-MDCT bins per QMF band" was itself wrong
+# by 2x. Empirically re-derived by dumping our own decoder's QMF analysis
+# stage (EC_AAC_SBR_QMFDUMP=1, crates/ec-aac/src/sbr_chain.rs) for k =
+# active_p*32+16 across several p: the dominant analysis band always read
+# back as 2p or 2p+1, never p -- a source (low) QMF band is 16 core-MDCT
+# bins wide (1024-bin core MDCT / 64, not / 32), confirmed by re-running the
+# same dump with k = active_p*16+8 and seeing the dominant band land exactly
+# on p for every probed value (0, 5, 13). Placed at the BAND CENTER (bin 8
+# of the 16), which lands on a 4-bin group boundary (8 % 4 == 0) so
+# tone_core's grouping needs no fractional-offset trick. A center tone's
+# fractional position within its 16-bin source band is 0.5; patches
+# translate by whole band widths, so the translated line keeps frac == 0.5
+# in its target band too (or 1-0.5 == 0.5 under mirroring -- indistinguishable
+# at the center, which is fine, this probe only needs the TARGET BAND INDEX,
+# not direct/mirror discrimination).
 D = 0.5  # fractional offset (of one band width) the probe tone is placed at
 NO_QUANT_WARNING = "No quantized data read for sbr_dequant."
 
@@ -204,9 +209,19 @@ def stream_one_band(cfg, tables, active_p, n_frames=24, invf_mode=0):
     healthy mid value, noise0 at the quiet end so noise floor cannot bury the
     line), core = one isolated tone at low QMF band `active_p`'s SECOND 4-bin
     group (offset `D` of a band width into the band, not the ambiguous
-    boundary bin), held fixed; invf NONE, no harmonics."""
+    boundary bin), held fixed; invf NONE, no harmonics.
+
+    Round-34: noise0's raw index runs the OPPOSITE direction from what this
+    docstring's "quiet end" phrase assumed -- `dequant_noise`
+    (`crates/ec-aac/src/sbr_env.rs`) is `2^(NOISE_FLOOR_OFFSET - q_q)`, so a
+    LOW raw index is the LOUD end (matches the spec's own noise-floor
+    dequantization direction) and `noise0=[2, 2]` was injecting a broadband
+    noise floor loud enough to swamp the QMF-domain energy of the probe's own
+    tone (confirmed via EC_AAC_SBR_QMFDUMP=1: post-adjust energy was flat
+    across every target band, not peaked at the patched ones). `[30, 30]` is
+    the genuinely quiet end."""
     swb = P.SWB_LONG[SF_INDEX]
-    k = active_p * 32 + 16
+    k = active_p * 16 + 8
     found = bin_to_sfb_group(k, swb)
     assert found is not None, f"band {active_p} bin {k} not in SWB_LONG[{SF_INDEX}]"
     sfb_idx, group_active = found
@@ -227,7 +242,7 @@ def stream_one_band(cfg, tables, active_p, n_frames=24, invf_mode=0):
     n_slots = 2 * (tables["n_low"] - 1) + 2 * (tables["n_q"] - 1)
     for _ in range(n_frames):
         c = dict(cfg, invf=invf_mode, header=1, amp_res=1, element="sce", coupling=0,
-                 df_env=[0] * 8, df_noise=[0, 0], env0=[40] * 8, noise0=[2, 2])
+                 df_env=[0] * 8, df_noise=[0, 0], env0=[40] * 8, noise0=[30, 30])
         w = P.BitW()
         C.tone_core(w, sfb_idx, group_active)
         body = F.sbr_bits_full(c, tables, grid, [zero_delta] * n_slots)

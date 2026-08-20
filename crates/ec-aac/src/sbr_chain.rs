@@ -101,6 +101,34 @@ fn sideinfo_enabled() -> bool {
     std::env::var("EC_AAC_SBR_SIDEINFO_DEBUG").is_ok()
 }
 
+/// Round-34 Task 1 diagnostic: per-AU per-QMF-band mean energy at a named
+/// pipeline stage, gated by `EC_AAC_SBR_QMFDUMP`. `start_band` is the
+/// absolute QMF band index `rows[0]` represents (`0` for the core analysis
+/// matrix, `kx` for the HF matrix), so every printed band index lines up
+/// with `build_patches`' target-band units without the reader having to
+/// offset anything by hand.
+fn qmfdump_enabled() -> bool {
+    std::env::var("EC_AAC_SBR_QMFDUMP").is_ok()
+}
+
+fn qmfdump_energies(stage: &str, start_band: usize, rows: &[Vec<Complex<f64>>]) {
+    let means: Vec<f64> = rows
+        .iter()
+        .map(|series| {
+            if series.is_empty() {
+                0.0
+            } else {
+                series
+                    .iter()
+                    .map(|c| c.re * c.re + c.im * c.im)
+                    .sum::<f64>()
+                    / series.len() as f64
+            }
+        })
+        .collect();
+    eprintln!("QMFDUMP stage={stage} start_band={start_band} means={means:?}");
+}
+
 /// Drains nothing -- returns a clone of every row logged so far this
 /// process, in call order. Empty unless `EC_AAC_SBR_SIDEINFO_DEBUG` was set
 /// before decoding.
@@ -303,6 +331,10 @@ impl SbrChain {
                     l.push(row);
                 }
             }
+            let qmfdump_on = qmfdump_enabled();
+            if qmfdump_on {
+                qmfdump_energies("analysis", 0, &low_cur);
+            }
             let mut hf = sbr_hf::generate(
                 &low_cur,
                 &tables,
@@ -310,6 +342,9 @@ impl SbrChain {
                 &mut state.chirp,
                 &mut state.hf_hist,
             );
+            if qmfdump_on {
+                qmfdump_energies("post_patch", tables.kx as usize, &hf);
+            }
             let (env_energy, noise_energy) =
                 sbr_env::dequantize_frame(&header, &data.channels, ch, coupling);
             // sbr_env::adjust works in QMF-slot units; the parsed borders
@@ -338,6 +373,9 @@ impl SbrChain {
                 &mut state.noise,
                 &limiter_table,
             );
+            if qmfdump_on {
+                qmfdump_energies("post_adjust", tables.kx as usize, &hf);
+            }
 
             let kx = (tables.kx as usize).min(ANALYSIS_BANDS);
             let k2 = (tables.k2 as usize).min(SYNTHESIS_BANDS);
