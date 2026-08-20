@@ -56,5 +56,5 @@ pub use enc::{
     CodedFrame, EncCodec, Encoder, EncoderConfig, FrameMetadata, RateControlMode, Tunings,
 };
 pub use error::{Error, Result};
-pub use frame::{Frame, I420, I420_16, i420_to_nv12, nv12_to_i420};
+pub use frame::{Colour, Frame, I420, I420_16, i420_to_nv12, nv12_to_i420};
 pub use pool::{PooledSurface, SurfacePool};
