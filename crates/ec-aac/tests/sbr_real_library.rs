@@ -1426,6 +1426,44 @@ fn sbr_real_library_matches_reference() {
                     );
                 }
             }
+            // (Round-36, Task 2) parity-split coherence: round-35 fixed the
+            // Synthesis phase-intercept bug only for ODD (target-source)
+            // patch gaps, at the patch-copy site. On header A (the real
+            // file's own header) that fix can only be SEEN in the odd-gap
+            // territory those patches cover (bands 28..42, from patches
+            // (3,28,11)/(0,39,3)/(13,42,1)); the even-gap patch (0,14,14)
+            // covers bands 14..27 and was already exact before round-35, so
+            // it is the control range the fix must NOT move. Reuses
+            // `bin_level_conviction`'s per-bin direct-coherence measurement
+            // over every HF band in [14, 43) (min_band=14, top_n wide enough
+            // to keep every band, not just the top-energy handful), then
+            // averages `direct` within each region separately.
+            if std::env::var("EC_AAC_SBR_PARITY_SPLIT").is_ok() && n >= 4_096 {
+                let band_hz = f64::from(rate) / 256.0;
+                let win = &o[oa..oa + n];
+                let twin = &t[ob..ob + n];
+                let rows = bin_level_conviction(win, twin, rate, 14, 29);
+                let mean_in = |lo: usize, hi: usize| {
+                    let vals: Vec<f64> = rows
+                        .iter()
+                        .filter(|(hz, ..)| {
+                            let band = (hz / band_hz).round() as usize;
+                            band >= lo && band < hi
+                        })
+                        .map(|(_, _, direct, ..)| *direct)
+                        .collect();
+                    if vals.is_empty() {
+                        (0.0, 0)
+                    } else {
+                        (vals.iter().sum::<f64>() / vals.len() as f64, vals.len())
+                    }
+                };
+                let (even_mean, even_n) = mean_in(14, 28);
+                let (odd_mean, odd_n) = mean_in(28, 43);
+                println!(
+                    "  ch{ch} PARITY-SPLIT direct-coherence mean: even-gap[14,28)={even_mean:.4} (n={even_n}) odd-gap[28,43)={odd_mean:.4} (n={odd_n})"
+                );
+            }
             println!(
                 "  ch{ch}: lag {lag}, full {full:.6}, below {:.0}Hz {low:.6}, above {:.0}Hz {high:.6}",
                 c.crossover_hz, c.crossover_hz
