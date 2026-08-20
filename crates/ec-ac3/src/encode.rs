@@ -507,9 +507,11 @@ impl Ac3Encoder {
     /// send; otherwise it reuses. Each run of
     /// blocks sharing one set codes the run's loudest magnitude per bin, so no
     /// block's mantissa is asked for more than its exponent's headroom. The
-    /// sending block uses D15 when block-switched, D45 for a run of 3+ blocks
-    /// (stationary), D25 otherwise. `conservative` forces one D45 set per channel for the
-    /// whole frame: the cheapest legal side information.
+    /// sending block uses D15 for the LFE channel, D25 when block-switched
+    /// (the short transform's interleaved halves make D15's per-bin cost too
+    /// high — see the D25-vs-D15 note below), D45 for a run of 3+ blocks
+    /// (stationary), D25 otherwise. `conservative` forces one D45 set per
+    /// channel for the whole frame: the cheapest legal side information.
     fn plan(&self, coeffs: &[Vec<[f32; COEFFS]>], blksw: &[Vec<bool>], endmant: &[usize], conservative: bool) -> Plan {
         let ideal: Vec<Vec<[u8; COEFFS]>> = coeffs
             .iter()
