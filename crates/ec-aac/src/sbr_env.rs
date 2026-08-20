@@ -173,13 +173,15 @@ fn noise_fraction_debug() -> bool {
     std::env::var("EC_AAC_SBR_NOISE_FRACTION").is_ok()
 }
 
-static NOISE_FRACTION: std::sync::OnceLock<std::sync::Mutex<Vec<(usize, f64, f64)>>> =
+static NOISE_FRACTION: std::sync::OnceLock<std::sync::Mutex<Vec<(usize, f64, f64, f64)>>> =
     std::sync::OnceLock::new();
 
 /// Diagnostic (`EC_AAC_SBR_NOISE_FRACTION`): per absolute QMF band,
-/// bookkept `(band, Σ signal energy·slots, Σ noise energy·slots)`.
-pub fn noise_fraction_table() -> Vec<(usize, f64, f64)> {
-    let mut out: Vec<(usize, f64, f64)> = NOISE_FRACTION
+/// bookkept `(band, Σ signal energy·slots, Σ noise energy·slots, Σ |Y|²
+/// post-adjust)` -- the last column against the first two's sum is the
+/// per-subband realised/target energy ratio.
+pub fn noise_fraction_table() -> Vec<(usize, f64, f64, f64)> {
+    let mut out: Vec<(usize, f64, f64, f64)> = NOISE_FRACTION
         .get()
         .and_then(|m| m.lock().ok())
         .map(|g| g.clone())
@@ -381,7 +383,7 @@ pub fn adjust(
                         row.1 += sig;
                         row.2 += noi;
                     } else {
-                        t.push((m + kx, sig, noi));
+                        t.push((m + kx, sig, noi, 0.0));
                     }
                 }
             }
@@ -454,6 +456,18 @@ pub fn adjust(
                 }
                 row[i] = y;
                 p_im = -p_im;
+            }
+            if track_fraction {
+                let tab = NOISE_FRACTION.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+                if let Ok(mut t) = tab.lock() {
+                    for m in 0..m_max {
+                        if let (Some(row), Some(y)) =
+                            (t.iter_mut().find(|r| r.0 == m + kx), hf[m].get(i))
+                        {
+                            row.3 += y.norm_sqr();
+                        }
+                    }
+                }
             }
             state.index_noise = (state.index_noise + m_max) & 0x1ff;
             state.index_sine = (state.index_sine + 1) & 3;
