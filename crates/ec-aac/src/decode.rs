@@ -707,7 +707,17 @@ impl BlockDecoder {
                     let start = out.len();
                     let mut ch = [self.channel_stream(r, None)?];
                     self.finish(&mut ch, None, &mut out);
-                    pending = Some((tag, start, 1, false));
+                    // §4.6.18.1: SBR is never applied to the LFE channel (no
+                    // FIL/SBR payload follows it), so it must not become a
+                    // pending SBR target -- otherwise a later fallback
+                    // (`apply_last`/no-FIL branch) could mistakenly stretch
+                    // the LFE plane to double rate using a *different*
+                    // element's held SBR data, corrupting it.
+                    pending = if id == 0 {
+                        Some((tag, start, 1, false))
+                    } else {
+                        None
+                    };
                 }
                 1 => {
                     let tag = r.read_bits(4)? as u8;
@@ -780,7 +790,7 @@ impl BlockDecoder {
                                     r.skip_bits(10)?; // bs_sbr_crc_bits
                                 }
                                 if let Some(data) = sbr.parse(r, tag, is_cpe) {
-                                    sbr.apply(tag, &data, &mut out[start..start + n]);
+                                    sbr.apply(tag, is_cpe, &data, &mut out[start..start + n]);
                                     applied = true;
                                 }
                             }
@@ -791,7 +801,7 @@ impl BlockDecoder {
                             // SBR, or a parse failure): §4.6.18 still
                             // requires doubled-rate reconstruction, using
                             // the last successfully parsed frame's data.
-                            sbr.apply_last(tag, &mut out[start..start + n]);
+                            sbr.apply_last(tag, is_cpe, &mut out[start..start + n]);
                         }
                     }
                     // Resync to the FIL's declared byte boundary regardless
@@ -810,8 +820,10 @@ impl BlockDecoder {
                     // a non-SBR one) -- same "unavailable frame" case as the
                     // no-fresh-payload branch in id 6 above, so fall back to
                     // the last known SBR data the same way.
-                    if let (Some(sbr), Some((tag, start, n, _))) = (self.sbr.as_mut(), pending) {
-                        sbr.apply_last(tag, &mut out[start..start + n]);
+                    if let (Some(sbr), Some((tag, start, n, is_cpe))) =
+                        (self.sbr.as_mut(), pending)
+                    {
+                        sbr.apply_last(tag, is_cpe, &mut out[start..start + n]);
                     }
                     break;
                 }

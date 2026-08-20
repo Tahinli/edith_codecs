@@ -202,7 +202,13 @@ struct Element {
 /// encoder in practice emits it).
 pub struct SbrChain {
     rate: u32,
-    elements: HashMap<u8, Element>,
+    // Keyed by (element_instance_tag, is_cpe): SCE/LFE and CPE instance
+    // tags are independent namespaces per §4.4 (an encoder may legally
+    // reuse tag 0 for both an SCE and a CPE in the same access unit), so
+    // a bare `u8` key aliased two distinct elements' QMF/HF/noise state
+    // together whenever that happened -- exactly the case in a 5.1
+    // stream (SCE + two CPEs).
+    elements: HashMap<(u8, bool), Element>,
 }
 
 impl SbrChain {
@@ -216,7 +222,7 @@ impl SbrChain {
     /// Parses one FIL element's `sbr_extension_data` (the reader
     /// positioned right past `bs_extension_type`) for element `tag`.
     pub fn parse(&mut self, r: &mut BitReader<'_>, tag: u8, is_cpe: bool) -> Option<SbrData> {
-        let elem = self.elements.entry(tag).or_insert_with(|| Element {
+        let elem = self.elements.entry((tag, is_cpe)).or_insert_with(|| Element {
             parser: SbrParser::new(self.rate),
             channels: Vec::new(),
             last_data: None,
@@ -234,11 +240,11 @@ impl SbrChain {
     /// PCM, one plane per channel), replacing each in place with its
     /// SBR-reconstructed, double-rate PCM. A malformed/missing state is a
     /// silent no-op: `planes` is left at its core content.
-    pub fn apply(&mut self, tag: u8, data: &SbrData, planes: &mut [Vec<f32>]) {
-        if let Some(elem) = self.elements.get_mut(&tag) {
+    pub fn apply(&mut self, tag: u8, is_cpe: bool, data: &SbrData, planes: &mut [Vec<f32>]) {
+        if let Some(elem) = self.elements.get_mut(&(tag, is_cpe)) {
             elem.last_data = Some(data.clone());
         }
-        self.apply_data(tag, data, planes, "fresh");
+        self.apply_data(tag, is_cpe, data, planes, "fresh");
     }
 
     /// Re-runs the chain for `tag` using the last successfully parsed
@@ -246,21 +252,26 @@ impl SbrChain {
     /// fresh payload this frame. A no-op (planes left at core content, same
     /// as [`apply`]'s existing malformed/missing-state fallback) if no prior
     /// frame ever parsed successfully for this element.
-    pub fn apply_last(&mut self, tag: u8, planes: &mut [Vec<f32>]) {
-        let Some(data) = self.elements.get(&tag).and_then(|e| e.last_data.clone()) else {
+    pub fn apply_last(&mut self, tag: u8, is_cpe: bool, planes: &mut [Vec<f32>]) {
+        let Some(data) = self
+            .elements
+            .get(&(tag, is_cpe))
+            .and_then(|e| e.last_data.clone())
+        else {
             return;
         };
-        self.apply_data(tag, &data, planes, "hold");
+        self.apply_data(tag, is_cpe, &data, planes, "hold");
     }
 
     fn apply_data(
         &mut self,
         tag: u8,
+        is_cpe: bool,
         data: &SbrData,
         planes: &mut [Vec<f32>],
         source: &'static str,
     ) {
-        let Some(elem) = self.elements.get_mut(&tag) else {
+        let Some(elem) = self.elements.get_mut(&(tag, is_cpe)) else {
             return;
         };
         let Some(tables) = elem.parser.tables().cloned() else {
@@ -490,7 +501,7 @@ mod tests {
         let mut chain = SbrChain::new(44100);
         let tag = 0u8;
         chain.elements.insert(
-            tag,
+            (tag, true),
             Element {
                 parser: SbrParser::new(44100),
                 channels: vec![ChannelState::new(n_q, 1), ChannelState::new(n_q, 2)],
@@ -499,7 +510,7 @@ mod tests {
         );
         chain
             .elements
-            .get_mut(&tag)
+            .get_mut(&(tag, true))
             .unwrap()
             .parser
             .set_for_test(header(), t.clone());
@@ -514,7 +525,7 @@ mod tests {
         // discontinuity this test exists to catch.
         let core_au = || -> Vec<f32> { (0..1024).map(|i| (i as f32 * 0.1).sin() * 0.2).collect() };
         let mut planes = vec![core_au(), core_au()];
-        chain.apply(tag, &data, &mut planes);
+        chain.apply(tag, true, &data, &mut planes);
 
         let expected_len = 32 * SYNTHESIS_BANDS;
         for (ch, plane) in planes.iter().enumerate() {
@@ -530,7 +541,7 @@ mod tests {
         // generator continuity across the junction, not just each AU in
         // isolation.
         let mut planes2 = vec![core_au(), core_au()];
-        chain.apply(tag, &data, &mut planes2);
+        chain.apply(tag, true, &data, &mut planes2);
         for (ch, plane) in planes2.iter().enumerate() {
             assert_eq!(
                 plane.len(),
@@ -565,6 +576,100 @@ mod tests {
                 "ch{ch} junction delta {junction_delta} far exceeds steady-state delta {typical} -- AU-boundary discontinuity"
             );
         }
+    }
+
+    /// §4.4: `element_instance_tag` is a namespace per element *type* --
+    /// an encoder may legally give an SCE and a CPE in the same access
+    /// unit the same tag value (this is exactly what a 5.1 stream with
+    /// SCE+CPE+CPE+LFE does). `SbrChain` used to key its per-element state
+    /// by the bare tag, so the CPE's `parse`/`apply` would silently reuse
+    /// (and corrupt) the SCE's parser/channel state. Keying by `(tag,
+    /// is_cpe)` must keep them fully independent: driving distinct tones
+    /// through an SCE and a same-tagged CPE must not bleed into each
+    /// other's output.
+    #[test]
+    fn an_sce_and_a_same_tagged_cpe_do_not_share_state() {
+        let t = tables();
+        let n_low = t.n_low;
+        let n_q = t.n_q;
+        let mut chain = SbrChain::new(44100);
+        let tag = 0u8;
+
+        for is_cpe in [false, true] {
+            let n_ch = if is_cpe { 2 } else { 1 };
+            chain.elements.insert(
+                (tag, is_cpe),
+                Element {
+                    parser: SbrParser::new(44100),
+                    channels: (0..n_ch)
+                        .map(|i| ChannelState::new(n_q, 10 + i as u32))
+                        .collect(),
+                    last_data: None,
+                },
+            );
+            chain
+                .elements
+                .get_mut(&(tag, is_cpe))
+                .unwrap()
+                .parser
+                .set_for_test(header(), t.clone());
+        }
+
+        let sce_data = SbrData {
+            coupling: false,
+            channels: vec![one_channel(n_q, n_low)],
+        };
+        let cpe_data = SbrData {
+            coupling: false,
+            channels: vec![one_channel(n_q, n_low), one_channel(n_q, n_low)],
+        };
+
+        let sce_tone = || -> Vec<f32> { (0..1024).map(|i| (i as f32 * 0.05).sin() * 0.2).collect() };
+        let cpe_tone = || -> Vec<f32> { (0..1024).map(|i| (i as f32 * 0.37).sin() * 0.2).collect() };
+
+        let mut sce_planes = vec![sce_tone()];
+        chain.apply(tag, false, &sce_data, &mut sce_planes);
+        let mut cpe_planes = vec![cpe_tone(), cpe_tone()];
+        chain.apply(tag, true, &cpe_data, &mut cpe_planes);
+
+        // If state aliased, the CPE call above would have run through (and
+        // mutated) the SCE's Analysis/Synthesis/chirp/noise state instead
+        // of its own -- re-running the SCE with the same input must give
+        // the SAME output as the first call, proving its state was never
+        // touched by the CPE call in between.
+        let mut sce_planes2 = vec![sce_tone()];
+        chain.apply(tag, false, &sce_data, &mut sce_planes2);
+
+        // A fresh, never-driven SCE-only chain gives the reference: one AU
+        // through tag/is_cpe=(0,false), nothing else touching its state.
+        let mut reference = SbrChain::new(44100);
+        reference.elements.insert(
+            (tag, false),
+            Element {
+                parser: SbrParser::new(44100),
+                channels: vec![ChannelState::new(n_q, 10)],
+                last_data: None,
+            },
+        );
+        reference
+            .elements
+            .get_mut(&(tag, false))
+            .unwrap()
+            .parser
+            .set_for_test(header(), t.clone());
+        let mut sce_ref1 = vec![sce_tone()];
+        reference.apply(tag, false, &sce_data, &mut sce_ref1);
+        let mut sce_ref2 = vec![sce_tone()];
+        reference.apply(tag, false, &sce_data, &mut sce_ref2);
+
+        assert_eq!(
+            sce_planes[0], sce_ref1[0],
+            "SCE tag 0's first call already diverges from an isolated reference"
+        );
+        assert_eq!(
+            sce_planes2[0], sce_ref2[0],
+            "SCE tag 0's state was mutated by the same-tagged CPE's apply() call in between"
+        );
     }
 
     /// Round-13 stitching verdict (queue item 1): the QMF filterbank pair
