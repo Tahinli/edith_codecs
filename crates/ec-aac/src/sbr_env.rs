@@ -476,8 +476,14 @@ pub fn adjust(
             .map(|j| limiter_max * (lim_e_orig[j] / lim_e_curr[j].max(1e-12)).sqrt())
             .collect();
         let mut lim_e_actual = vec![0.0f64; n_lim];
+        let mut lim_capped_count = vec![0usize; n_lim];
+        let mut lim_total_count = vec![0usize; n_lim];
         for b in 0..gains.len() {
             let j = cell_lim[b];
+            lim_total_count[j] += 1;
+            if gains[b] > lim_cap[j] + 1e-12 {
+                lim_capped_count[j] += 1;
+            }
             gains[b] = gains[b].min(lim_cap[j]);
             let lo = table[b] as usize;
             let hi = table[b + 1] as usize;
@@ -501,6 +507,31 @@ pub fn adjust(
                 }
             })
             .collect();
+        // (Round-57 audit, ISO/IEC 14496-3 4.6.18.7.5/.7.6) Per-limiter-band
+        // aggregate dump under `EC_AAC_SBR_CELLDUMP`: the exact quantities
+        // the spec's two equations operate on (E_orig,mapped/E_curr sums,
+        // G_max=limGain*sqrt(ratio), capped-cell count, G_boost), one line
+        // per limiter band per envelope, so the aggregate math can be
+        // checked directly rather than inferred from individual cells.
+        if !celldump.is_empty() {
+            for j in 0..n_lim {
+                eprintln!(
+                    "LIMDUMP ei={ei} band=[{},{}) limiter_bands={} j={j}/{n_lim} \
+                     E_orig_mapped={:.6e} E_curr={:.6e} G_max={:.6} capped_cells={}/{} \
+                     E_actual={:.6e} G_boost={:.6}",
+                    limiter_table.get(j).copied().unwrap_or(-1),
+                    limiter_table.get(j + 1).copied().unwrap_or(-1),
+                    header.limiter_bands,
+                    lim_e_orig[j],
+                    lim_e_curr[j],
+                    lim_cap[j],
+                    lim_capped_count[j],
+                    lim_total_count[j],
+                    lim_e_actual[j],
+                    lim_boost[j],
+                );
+            }
+        }
         for b in 0..gains.len() {
             let j = cell_lim[b];
             gains[b] *= lim_boost[j];

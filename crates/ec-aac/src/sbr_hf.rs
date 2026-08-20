@@ -306,36 +306,45 @@ fn chirp_smooth_mode() -> ChirpSmooth {
 /// a2*x[n-2]|^2` over `n = 2..x.len()`. Returns `(a1, a2)`; `(0, 0)` if `x`
 /// is too short or the system is singular (silence or a near-constant
 /// subband, both of which need no prediction).
+/// (Round-57) AR(2) coefficients via the Yule-Walker/autocorrelation
+/// method (`r(k) = sum_n x[n]*conj(x[n-k])`, Hermitian-Toeplitz `R`),
+/// replacing the previous unwindowed covariance-method normal-equation
+/// solve. The autocorrelation matrix is always positive semi-definite,
+/// which is what gives Levinson-Durbin-style AR fits their built-in
+/// BIBO-stability guarantee (poles inside or on the unit circle) -- the
+/// covariance method has no such guarantee and was measured producing
+/// resonant poles that blow `cur` (the raw HF estimate energy) up to
+/// 1e7-1e11 against a ~1e4 transmitted target on real content
+/// (heaac_48000_64k.m4a's crossover-straddling sweep window), which then
+/// poisons the WHOLE limiter band's aggregate `E_curr` (4.6.18.7.5) and
+/// crushes every other cell sharing that band's gain cap, not just the
+/// outlier cell itself (round-56's stabilize-bound tightening measured
+/// zero effect because `raw_gain=sqrt(target/cur)` cancels `cur` exactly
+/// for the outlier cell's OWN gain -- it never reaches the neighbors this
+/// aggregate-poisoning does).
 pub fn lpc2(x: &[Complex<f64>]) -> (Complex<f64>, Complex<f64>) {
     if x.len() < 3 {
         return (Complex::ZERO, Complex::ZERO);
     }
-    let mut r00 = Complex::ZERO; // <x1,x1>
-    let mut r01 = Complex::ZERO; // <x1,x2>
-    let mut r11 = Complex::ZERO; // <x2,x2>
-    let mut r0y = Complex::ZERO; // <x1,y>
-    let mut r1y = Complex::ZERO; // <x2,y>
-    for n in 2..x.len() {
-        let y = x[n];
-        let x1 = x[n - 1];
-        let x2 = x[n - 2];
-        r00 = r00 + x1.conj() * x1;
-        r01 = r01 + x1.conj() * x2;
-        r11 = r11 + x2.conj() * x2;
-        r0y = r0y + x1.conj() * y;
-        r1y = r1y + x2.conj() * y;
+    let mut r0 = 0.0f64;
+    let mut r1 = Complex::ZERO;
+    let mut r2 = Complex::ZERO;
+    for n in 0..x.len() {
+        r0 += x[n].norm_sqr();
+        if n >= 1 {
+            r1 = r1 + x[n] * x[n - 1].conj();
+        }
+        if n >= 2 {
+            r2 = r2 + x[n] * x[n - 2].conj();
+        }
     }
-    // R is Hermitian (r10 = conj(r01)): solve the 2x2 system directly
-    // rather than reusing r01 for both off-diagonal entries.
-    let r10 = r01.conj();
-    let det = r00 * r11 - r01 * r10;
-    let norm = det.norm_sqr();
-    if norm < 1e-20 {
+    // Yule-Walker: [[r0, conj(r1)], [r1, r0]] * [a1, a2]^T = [r1, r2]^T.
+    let det = r0 * r0 - r1.norm_sqr();
+    if det.abs() < 1e-20 {
         return (Complex::ZERO, Complex::ZERO);
     }
-    let inv_det = det.conj().scale(1.0 / norm);
-    let a1 = (r0y * r11 - r01 * r1y) * inv_det;
-    let a2 = (r00 * r1y - r10 * r0y) * inv_det;
+    let a1 = (r1.scale(r0) - r1.conj() * r2).scale(1.0 / det);
+    let a2 = (r2.scale(r0) - r1 * r1).scale(1.0 / det);
     (a1, a2)
 }
 
@@ -563,8 +572,15 @@ mod tests {
             x.push(v);
         }
         let (fa1, fa2) = lpc2(&x);
-        assert!((fa1 - a1).norm_sqr().sqrt() < 0.05, "a1 {fa1:?} vs {a1:?}");
-        assert!((fa2 - a2).norm_sqr().sqrt() < 0.05, "a2 {fa2:?} vs {a2:?}");
+        // (Round-57) Tolerance widened 0.05->0.2 for the Yule-Walker/
+        // autocorrelation-method swap: it trades some finite-window
+        // estimation bias (its Toeplitz-PSD structure is what makes the
+        // resulting AR(2) filter unconditionally stable, unlike the
+        // previous covariance-method solve) for a stability guarantee real
+        // content needs -- still recovers the synthetic poles to well
+        // within this looser bound.
+        assert!((fa1 - a1).norm_sqr().sqrt() < 0.2, "a1 {fa1:?} vs {a1:?}");
+        assert!((fa2 - a2).norm_sqr().sqrt() < 0.2, "a2 {fa2:?} vs {a2:?}");
     }
 
     #[test]
