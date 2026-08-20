@@ -2235,14 +2235,35 @@ fn sbr_actual_noise_fraction() {
     // exactly where the pre-fix gap was largest.
     //
     // The charter's ±0.05-of-bookkept (~0.38) target is NOT met by this
-    // fix alone: three specific loud, harmonic/tone-dominated bands
-    // (6718/6891/7063Hz) still realize ~0.001-0.015 against a ~0.373
-    // bookkept split regardless of either accounting variant tried, and
-    // bands above ~8.5kHz show a fraction that decays steadily toward 0 as
-    // frequency rises (0.19 at 8.1kHz down to ~0.01 by 13kHz) -- a THIRD,
-    // still-unlocated defect, not this accounting mismatch (open, see
-    // ledger). This assertion is therefore a regression floor against the
-    // two bugs fixed here re-appearing, not a claim of bookkept parity.
+    // fix alone (round-43 investigated why, with `EC_AAC_SBR_CELLDUMP` in
+    // `sbr_env::adjust`): `sbr_env::adjust`'s per-cell signal/noise split
+    // is NOT the culprit -- corrected-band dumps (the charter's quoted
+    // "6718/6891/7063Hz" and "8.5-13kHz decaying" bands turned out to be
+    // mislabeled by a factor of two, this file's true SBR band spacing is
+    // `rate/128` = 344.5Hz not the 172.3Hz FFT-analysis spacing those Hz
+    // labels come from) show `adjust` injecting 40-85% noise share in the
+    // QMF domain, at or ABOVE the ~0.37 bookkept split, not starved. The
+    // real defect is downstream, in `sbr_qmf::Synthesis`:
+    // `synthesis_energy_gain_for_white_noise_excitation` (round-43) drives
+    // ONE subband with an independent-per-slot random complex value (what
+    // `adjust`'s noise injection actually looks like) through the same
+    // overlap-add prototype `synthesis_gain_is_flat_across_bands`
+    // calibrated against a slowly-rotating TONE phasor, and finds
+    // essentially 0% of that injected energy lands back in the source
+    // subband's own frequency range (vs. a tone's clean in-band
+    // reconstruction) -- an i.i.d.-per-slot draw is not a legitimate
+    // "bandlimited content in this subband" input to this filterbank's
+    // complex-modulation convention, so it aliases out almost entirely
+    // rather than reconstructing as audible noise near the intended
+    // frequency. This is exactly the charter's Task 3 "noise SEQUENCE is
+    // the last mile" scenario -- fixing it needs the round-17 noise-stream
+    // derivation (per-slot values shaped to actually decode as noise
+    // through THIS synthesis convention), not another `adjust()` accounting
+    // pass. Deferred: round-17 derivation, budget did not reach it this
+    // round (open, see ledger). This assertion remains a regression floor
+    // against the two round-42 accounting bugs re-appearing, not a claim of
+    // bookkept parity -- NOT tightened, since the actual gating defect
+    // (synthesis-stage noise-sequence shape) is still unfixed.
     assert!(
         actual_total > 0.15,
         "whole-HF realized noise fraction regressed to {actual_total:.4} \

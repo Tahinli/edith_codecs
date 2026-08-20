@@ -936,4 +936,85 @@ mod tests {
             "per-band synthesis gain ripple {ripple:e} exceeds 1e-4 -- SYNTH_TRIM's flat-scalar assumption is wrong"
         );
     }
+
+    /// (Round-43, Task 1 conviction) The tone-excitation gain above
+    /// (0.595853 amplitude / ~0.355 energy) was calibrated with a single
+    /// SLOWLY ROTATING phasor -- narrowband within its own subband's
+    /// Nyquist. `sbr_env::adjust`'s injected noise instead draws an
+    /// INDEPENDENT complex value every slot (white across the subband's
+    /// full available bandwidth, uncorrelated slot to slot), a completely
+    /// different excitation shape through the SAME overlap-add prototype.
+    /// This measures that white-noise round-trip ENERGY gain the same way,
+    /// to check whether it matches the tone's ~0.355 or is substantially
+    /// lower (which would mean the `namp`/`SYNTH_TRIM` calibration, tuned
+    /// only against tones, silently starves broadband content specifically).
+    #[test]
+    fn synthesis_energy_gain_for_white_noise_excitation() {
+        fn xorshift(seed: u64) -> impl FnMut() -> f64 {
+            let mut state = seed | 1;
+            move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 11) as f64 / (1u64 << 53) as f64 - 0.5
+            }
+        }
+        let k0 = SYNTHESIS_BANDS / 2;
+        let slots = 20_000usize;
+        let mut rng = xorshift(0xdead_beef);
+        let mut synthesis = Synthesis::new();
+        let mut in_energy = 0.0f64;
+        let mut out_energy = 0.0f64;
+        let mut out = Vec::with_capacity(slots * SYNTHESIS_BANDS);
+        for _ in 0..slots {
+            let mut v = [Complex::new(0.0, 0.0); SYNTHESIS_BANDS];
+            let c = Complex::new(rng(), rng());
+            v[k0] = c;
+            in_energy += c.norm_sqr();
+            out.extend(synthesis.process_slot(&v));
+        }
+        // Steady state only (skip the filter's fill-up transient).
+        let steady = &out[out.len() / 2..];
+        for &s in steady {
+            out_energy += f64::from(s) * f64::from(s);
+        }
+        let steady_slots = steady.len() / SYNTHESIS_BANDS;
+        let steady_in_energy = in_energy * steady_slots as f64 / slots as f64;
+        let energy_gain = out_energy / steady_in_energy;
+        println!(
+            "white-noise round-trip energy gain (band {k0}): {energy_gain:.6} \
+             (tone reference from synthesis_gain_is_flat_across_bands: ~0.355)"
+        );
+
+        // Where did that energy actually land? A real PCM rate of
+        // SYNTHESIS_BANDS*fs_core; the source subband centre sits at
+        // (k0+0.5)/SYNTHESIS_BANDS of that rate's Nyquist. FFT the steady
+        // output and sum energy in-band vs out-of-band.
+        const FFT_LEN: usize = 2048;
+        let mut rfft = ec_dsp::RealFft::<f32>::new(FFT_LEN);
+        let bins = rfft.spectrum_len();
+        let mut spectrum = vec![ec_dsp::Complex::new(0.0f32, 0.0); bins];
+        let mut in_band = 0.0f64;
+        let mut total = 0.0f64;
+        let band_lo = (k0 as f64 / SYNTHESIS_BANDS as f64 * bins as f64) as usize;
+        let band_hi = ((k0 + 1) as f64 / SYNTHESIS_BANDS as f64 * bins as f64) as usize;
+        let win = ec_dsp::Window::<f32>::sine(FFT_LEN);
+        let hops = (steady.len() - FFT_LEN) / FFT_LEN;
+        for h in 0..hops {
+            let mut block = steady[h * FFT_LEN..h * FFT_LEN + FFT_LEN].to_vec();
+            win.apply(&mut block);
+            rfft.forward(&block, &mut spectrum);
+            for (i, c) in spectrum.iter().enumerate() {
+                let e = f64::from(c.norm_sqr());
+                total += e;
+                if i >= band_lo && i < band_hi {
+                    in_band += e;
+                }
+            }
+        }
+        println!(
+            "energy in source subband's own frequency range: {:.4} of total (bins [{band_lo},{band_hi}) of {bins})",
+            in_band / total
+        );
+    }
 }
