@@ -23,7 +23,7 @@ use ec_core::{BitReader, Error, Result};
 const NUM_TIME_SLOTS: i64 = 16;
 
 /// `sbr_header()` fields, held across frames: a stream need not repeat it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SbrHeader {
     pub amp_res: u8,
     pub start_freq: u8,
@@ -60,6 +60,10 @@ pub struct SbrChannel {
     pub df_env: Vec<u8>,
     /// `bs_df_noise` per noise floor, same convention as `df_env`.
     pub df_noise: Vec<u8>,
+    /// `l_A` (ISO/IEC 14496-3 §4.6.18.3.3): index of the envelope that starts
+    /// at the transient border, `-1` when the frame has none. Gates where
+    /// added sinusoids begin and which envelope skips noise/smoothing.
+    pub l_a: i64,
 }
 
 /// One `sbr_data()` frame: one channel for an SCE, two for a CPE.
@@ -79,31 +83,41 @@ struct Grid {
     freq_res: Vec<u8>,
     t_env: Vec<i64>,
     t_noise: Vec<i64>,
+    l_a: i64,
 }
 
 impl Grid {
-    /// `pointer` is `bs_pointer` (0 for FIXFIX, which has no such field --
-    /// the spec's own `bs_pointer == 0` case: the middle noise border is
-    /// `num_env >> 1`). Per ISO/IEC 14496-3 §4.6.18.3.3: `bs_pointer == 0`
-    /// selects `num_env >> 1`, `== 1` selects the last envelope border
-    /// (`num_env - 1`), otherwise `bs_pointer - 1`.
-    fn new(num_env: usize, freq_res: Vec<u8>, t_env: Vec<i64>, pointer: usize) -> Grid {
+    /// `pointer` is `bs_pointer` (0 for FIXFIX, which has no such field).
+    /// Middle noise border and `l_A` per ISO/IEC 14496-3 §4.6.18.3.3,
+    /// Tables 4.146/4.147 -- they depend on `frame_class` (0 FIXFIX,
+    /// 1 FIXVAR, 2 VARFIX, 3 VARVAR), not on `bs_pointer` alone.
+    fn new(num_env: usize, freq_res: Vec<u8>, t_env: Vec<i64>, pointer: usize, frame_class: u32) -> Grid {
         let num_noise = if num_env == 1 { 1 } else { 2 };
         let t_noise = if num_noise == 1 {
             vec![t_env[0], t_env[num_env]]
         } else {
-            let middle = match pointer {
+            let middle = match frame_class {
                 0 => num_env >> 1,
-                1 => num_env - 1,
-                p => p - 1,
+                1 | 3 => num_env - pointer.saturating_sub(1).max(1),
+                _ => match pointer {
+                    0 => 1,
+                    1 => num_env - 1,
+                    p => p - 1,
+                },
             };
-            vec![t_env[0], t_env[middle], t_env[num_env]]
+            vec![t_env[0], t_env[middle.min(num_env)], t_env[num_env]]
+        };
+        let l_a = match frame_class {
+            1 | 3 if pointer > 0 => num_env as i64 + 1 - pointer as i64,
+            2 if pointer > 1 => pointer as i64 - 1,
+            _ => -1,
         };
         Grid {
             num_env,
             freq_res,
             t_env,
             t_noise,
+            l_a,
         }
     }
 }
@@ -237,7 +251,7 @@ impl SbrParser {
                 let t_env: Vec<i64> = (0..=num_env)
                     .map(|i| (i as i64) * NUM_TIME_SLOTS / num_env as i64)
                     .collect();
-                Ok(Grid::new(num_env, vec![fr; num_env], t_env, 0))
+                Ok(Grid::new(num_env, vec![fr; num_env], t_env, 0, 0))
             }
             1 | 2 => {
                 // FIXVAR (1, trailing variable border) / VARFIX (2, leading variable border)
@@ -285,7 +299,7 @@ impl SbrParser {
                     }
                     t[num_env] = NUM_TIME_SLOTS;
                 }
-                Ok(Grid::new(num_env, freq_res, t, pointer))
+                Ok(Grid::new(num_env, freq_res, t, pointer, frame_class))
             }
             _ => {
                 // VARVAR
@@ -325,7 +339,7 @@ impl SbrParser {
                 if t.windows(2).any(|w| w[0] >= w[1]) {
                     return Err(Error::corrupt("sbr: non-monotone envelope time borders"));
                 }
-                Ok(Grid::new(num_env, freq_res, t, pointer))
+                Ok(Grid::new(num_env, freq_res, t, pointer, frame_class))
             }
         }
     }
@@ -628,6 +642,7 @@ impl SbrParser {
                 add_harmonic: None,
                 df_env: df_env[ch].iter().map(|&b| u8::from(b)).collect(),
                 df_noise: df_noise[ch].iter().map(|&b| u8::from(b)).collect(),
+                l_a: grids[ch].l_a,
             });
         }
 
