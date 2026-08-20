@@ -61,12 +61,12 @@ pub(crate) const OFF_CBF: usize = 85;
 pub(crate) const OFF_SIG: usize = 105;
 pub(crate) const OFF_LAST: usize = 166;
 pub(crate) const OFF_ABS: usize = 227;
-const OFF_TRANSFORM_8X8: usize = 399;
+pub(crate) const OFF_TRANSFORM_8X8: usize = 399;
 /// significant_coeff_flag / last_significant_coeff_flag / coeff_abs_level_minus1
 /// of ctxBlockCat 5 (frame coded), Table 9-34.
-const OFF_SIG_8X8: usize = 402;
-const OFF_LAST_8X8: usize = 417;
-const OFF_ABS_8X8: usize = 426;
+pub(crate) const OFF_SIG_8X8: usize = 402;
+pub(crate) const OFF_LAST_8X8: usize = 417;
+pub(crate) const OFF_ABS_8X8: usize = 426;
 
 /// The ctxIdx values the Intra_16x16 part of an mb_type bin string uses, in
 /// bin order: `[b0, CodedBlockPatternLuma, chroma bin 0, chroma bin 1,
