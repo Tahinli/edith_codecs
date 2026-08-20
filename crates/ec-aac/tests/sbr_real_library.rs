@@ -2167,7 +2167,18 @@ fn sbr_actual_noise_fraction() {
     // band, not just each side's own top few).
     let rows_on = bin_level_conviction(on, off, rate, MIN_BAND, TOP_N);
     let rows_off = bin_level_conviction(off, on, rate, MIN_BAND, TOP_N);
-    let band_hz = f64::from(rate) / 256.0;
+    // (Round-42, Task 2) This `band_hz` feeds the `band` used below to look
+    // up `bookkept` (`noise_fraction_table()`'s QMF band index, `tables.kx`
+    // .. `tables.k2`, width `rate/128` -- 64 QMF bands over the SBR
+    // Nyquist, per the NOISE-FRACTION-DEBUG dump above). It is NOT
+    // `bin_level_conviction`'s own internal FFT-band scale (`rate/256`,
+    // used correctly elsewhere in this file for THAT function's own rows).
+    // Using `rate/256` here silently doubled every looked-up `band` index,
+    // so every real band above roughly half of `k2` missed the table and
+    // read back a false 0.0 bookkept fraction -- a test-side lookup bug,
+    // not a decoder coverage gap (verified: `noise_fraction_table()` itself
+    // has nonzero entries for QMF bands up to `k2`).
+    let band_hz = f64::from(rate) / 128.0;
     println!(
         "  ACTUAL noise fraction (band_hz, energy_on, energy_off, actual_fraction, bookkept_fraction):"
     );
@@ -2211,5 +2222,30 @@ fn sbr_actual_noise_fraction() {
     println!(
         "  full-band corr: noise-on {corr_on:.6} noise-off {corr_off:.6} delta {:.6}",
         corr_off - corr_on
+    );
+
+    // (Round-42, Task 1/3 acceptance) Two real accounting bugs fixed this
+    // round pushed the realized whole-HF fraction 0.1325 -> 0.1787 (Nikbinler,
+    // this same measurement): the boost pass was conserving the cell's FULL
+    // envelope target against a signal-only realized sum (now conserves
+    // total-vs-total, matching the reference algorithm's known
+    // E_orig/E_curr+Q_M boost ratio), and `noise_amps` divided an
+    // already-per-sample `noise_here` by the cell's QMF-band width a SECOND
+    // time (removed) -- worse at wide high-frequency sfb cells, which is
+    // exactly where the pre-fix gap was largest.
+    //
+    // The charter's ±0.05-of-bookkept (~0.38) target is NOT met by this
+    // fix alone: three specific loud, harmonic/tone-dominated bands
+    // (6718/6891/7063Hz) still realize ~0.001-0.015 against a ~0.373
+    // bookkept split regardless of either accounting variant tried, and
+    // bands above ~8.5kHz show a fraction that decays steadily toward 0 as
+    // frequency rises (0.19 at 8.1kHz down to ~0.01 by 13kHz) -- a THIRD,
+    // still-unlocated defect, not this accounting mismatch (open, see
+    // ledger). This assertion is therefore a regression floor against the
+    // two bugs fixed here re-appearing, not a claim of bookkept parity.
+    assert!(
+        actual_total > 0.15,
+        "whole-HF realized noise fraction regressed to {actual_total:.4} \
+         (round-42 fix floor is 0.15; pre-fix was ~0.13, post-fix ~0.18)"
     );
 }

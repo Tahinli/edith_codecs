@@ -164,7 +164,8 @@ impl NoiseGen {
     fn complex_unit(&mut self) -> Complex<f64> {
         // (Round-41, Task 2) `next()` is uniform on [-0.5, 0.5) (Var = 1/12
         // per component), so a raw `(re, im)` pair has E[|z|^2] = 1/6, not
-        // 1 -- `adjust` scales this by `namp = sqrt(noise_here/width)`
+        // 1 -- `adjust` scales this by `namp = sqrt(noise_here)` (round-42:
+        // no `/width`, `noise_here` is already a per-sample average)
         // expecting E[|namp*z|^2] = noise_here, so without this correction
         // only ~1/6 of the transmitted noise split was ever actually
         // realized in the output. Measured directly (decode Nikbinler twice,
@@ -361,6 +362,17 @@ pub fn adjust(
             let raw_gain = (signal_target / cur).sqrt();
             let lim_idx = limiter_band_index(limiter_table, lo, hi).min(n_lim - 1);
             let width = (hi - lo).max(1) as f64;
+            // (Round-42, Task 1) `lim_e_orig` conserves the cell's FULL
+            // transmitted `target` (signal+noise), matching the limiter cap
+            // and boost pass to the TOTAL energy budget rather than the
+            // signal share alone -- `lim_e_actual` below is widened to
+            // match (adds `cell_noise_here` alongside the capped signal
+            // energy) so the boost's `lim_e_orig/lim_e_actual` ratio
+            // compares total-to-total. Measured signal-target-only variant
+            // (both sides restricted to `signal_target`) FIRST and it made
+            // the realized noise fraction anchor WORSE (0.1325 -> 0.1233
+            // whole-HF, moving further from the ~0.38 bookkept split) --
+            // this total-conserving variant is the one that holds.
             lim_e_orig[lim_idx] += target * width;
             lim_e_curr[lim_idx] += cur * width;
             cell_current.push(cur);
@@ -389,7 +401,13 @@ pub fn adjust(
             let lo = table[b] as usize;
             let hi = table[b + 1] as usize;
             let width = (hi - lo).max(1) as f64;
-            lim_e_actual[j] += cell_current[b] * gains[b] * gains[b] * width;
+            // Total realized energy this cell will carry: the capped
+            // signal gain applied to the raw HF estimate, PLUS the noise
+            // share `target` already budgeted for this cell (noise is
+            // injected independently of `gains`, at `noise_amps` below) --
+            // matches `lim_e_orig`'s total-target accounting above.
+            lim_e_actual[j] +=
+                cell_current[b] * gains[b] * gains[b] * width + cell_noise_here[b] * width;
         }
         let lim_boost: Vec<f64> = (0..n_lim)
             .map(|j| {
@@ -405,9 +423,19 @@ pub fn adjust(
         for b in 0..gains.len() {
             let j = cell_lim[b];
             gains[b] *= lim_boost[j];
-            let lo = table[b] as usize;
-            let hi = table[b + 1] as usize;
-            noise_amps.push((cell_noise_here[b] / (hi - lo).max(1) as f64).sqrt() * lim_boost[j]);
+            // (Round-42, Task 1 corollary) `cell_noise_here[b]` is already a
+            // PER-SAMPLE average energy (same units as `target`/`current` --
+            // see `raw_gain = sqrt(signal_target / cur)` just above, which
+            // treats both sides as per-sample averages without any width
+            // normalization). Dividing by the cell's QMF-band width here
+            // (as the pre-round-42 code did) additionally shrank the
+            // per-sample injected noise variance by `1/width`, on top of
+            // whatever the sample count already contributes when this same
+            // amplitude is applied once per (band, slot) below -- worse at
+            // wider high-frequency sfb cells, matching the measured
+            // realized-noise-fraction shortfall growing toward the top of
+            // the band in `EC_AAC_SBR_NOISE_ANCHOR`.
+            noise_amps.push(cell_noise_here[b].sqrt() * lim_boost[j]);
         }
         // (Round-22 sweep instrumentation) the next envelope's gains, only
         // when `EC_AAC_SBR_GAIN_LERP` is set and the band layouts match --
@@ -696,7 +724,7 @@ mod tests {
 
     /// (Round-41, Task 2) `NoiseGen::complex_unit`'s realized expected
     /// squared magnitude must be ~1.0 -- `adjust` scales it by
-    /// `namp = sqrt(noise_here/width)` expecting `E[|namp*z|^2] =
+    /// `namp = sqrt(noise_here)` expecting `E[|namp*z|^2] =
     /// noise_here`, so anything but ~1.0 here means the injected noise
     /// under- or over-realizes the transmitted split regardless of the
     /// limiter/boost interaction (measured separately, at the whole-decode
