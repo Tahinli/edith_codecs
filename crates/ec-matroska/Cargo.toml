@@ -9,3 +9,8 @@ authors.workspace = true
 [dependencies]
 ec-core.workspace = true
 ec-inflate.workspace = true
+
+[dev-dependencies]
+ec-mp4.workspace = true
+ec-aac.workspace = true
+ec-ac3.workspace = true
