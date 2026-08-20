@@ -570,16 +570,16 @@ fn onset_after_silence_has_no_pre_echo() {
     // last few hundred samples before it cannot hide behind a guard band, and
     // the peak is barred too.
     let amp = 0.7f64;
-    for rate in [44_100u32, 48_000] {
+    for (rate, layouts) in [(44_100u32, &[1usize, 2][..]), (48_000, &[1, 2, 6]), (96_000, &[6])] {
         let grid = 16 * 1024usize;
         let onsets = [0.3333f64, 0.5, 0.7321, 0.9137, 1.0]
             .into_iter()
             .map(|s| (s * f64::from(rate)) as usize)
             .chain([0usize, 37, 512, 1000, 1023].into_iter().map(|o| grid + o));
         for onset in onsets {
-            for channels in [1usize, 2] {
+            for &channels in layouts {
                 let tone_len = rate as usize;
-                let mut source = vec![vec![0.0f32; onset + tone_len + 11]; channels];
+                let mut source = vec![vec![0.0f32; onset + tone_len + 11 * channels]; channels];
                 for (c, plane) in source.iter_mut().enumerate() {
                     let hz = 1_000.0 + 370.0 * c as f64;
                     let start = onset + 11 * c;
