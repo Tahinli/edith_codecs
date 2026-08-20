@@ -20,7 +20,7 @@
 //! - **A track this cannot decode is listed, not hidden.** [`Reader::streams`]
 //!   reports every stream the container declares and
 //!   [`Reader::unsupported`] names the ones with no decoder *and why* — a
-//!   TrueHD track says "TrueHD", not silence. Cover art is not a video track
+//!   DTS track says "DTS", not silence. Cover art is not a video track
 //!   and never appears as one.
 
 #![forbid(unsafe_code)]

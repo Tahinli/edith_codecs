@@ -30,6 +30,7 @@ ec-ogg = { path = "crates/ec-ogg", version = "0.1.0" }
 ec-opus = { path = "crates/ec-opus", version = "0.1.0" }
 ec-probe = { path = "crates/ec-probe", version = "0.1.0" }
 ec-riff = { path = "crates/ec-riff", version = "0.1.0" }
+ec-truehd = { path = "crates/ec-truehd", version = "0.1.0" }
 ec-va = { path = "crates/ec-va", version = "0.1.0" }
 ec-vorbis = { path = "crates/ec-vorbis", version = "0.1.0" }
 ec-vp9-syntax = { path = "crates/ec-vp9-syntax", version = "0.1.0" }

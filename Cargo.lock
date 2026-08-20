@@ -408,6 +408,7 @@ dependencies = [
  "ec-ogg",
  "ec-opus",
  "ec-riff",
+ "ec-truehd",
  "ec-vorbis",
 ]
 
