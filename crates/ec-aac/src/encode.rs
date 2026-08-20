@@ -125,6 +125,14 @@ pub struct AacEncoder {
 }
 
 impl AacEncoder {
+    /// Samples this encoder emits before the first audible one: one MDCT
+    /// window's worth, always, because the very first frame has no previous
+    /// block to overlap-add against and is pure priming. A muxer writing this
+    /// track's `elst`/`CodecDelay` states it here.
+    pub fn encoder_delay(&self) -> usize {
+        1024
+    }
+
     pub fn new(config: AacEncoderConfig) -> AacEncoder {
         AacEncoder {
             config,
