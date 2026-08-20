@@ -2774,15 +2774,16 @@ fn sbr_real_library_matches_reference() {
                 println!(
                     "  NOISE-FRACTION ceiling prediction (band_hz, f_noise, predicted_ceiling):"
                 );
-                for (band, signal, noise) in ec_aac::noise_fraction_table() {
+                for (band, signal, noise, out) in ec_aac::noise_fraction_table() {
                     if signal + noise <= 0.0 {
                         continue;
                     }
                     let f = noise / (signal + noise);
                     println!(
-                        "    {:>6.0}Hz band{band:>3}: signal {signal:.3e} noise {noise:.3e} f_noise {f:.6} ceiling {:.4}",
+                        "    {:>6.0}Hz band{band:>3}: signal {signal:.3e} noise {noise:.3e} f_noise {f:.6} ceiling {:.4} realised/target {:.4}",
                         band as f64 * band_hz,
-                        (1.0 - f).max(0.0).sqrt()
+                        (1.0 - f).max(0.0).sqrt(),
+                        out / (signal + noise)
                     );
                 }
             }
@@ -3436,7 +3437,7 @@ fn sbr_actual_noise_fraction() {
         let book = bookkept
             .iter()
             .find(|(b, ..)| *b == band)
-            .map(|(_, s, n)| if s + n > 0.0 { n / (s + n) } else { 0.0 })
+            .map(|(_, s, n, _)| if s + n > 0.0 { n / (s + n) } else { 0.0 })
             .unwrap_or(0.0);
         println!(
             "    {hz:>6.0}Hz: on {e_on:.3e} off {e_off:.3e} actual {actual:.4} bookkept {book:.4}"
@@ -4630,7 +4631,11 @@ fn sbr_residual_locator() {
         return;
     }
     let home = std::env::var("HOME").unwrap();
-    let path = PathBuf::from(format!("{home}/Music/Yok - Nikbinler.mp4"));
+    // `EC_AAC_SBR_LOCATOR_FILE` points the same instrument at any other
+    // HE-AAC file (e.g. a mono, uncoupled, noise-only probe encode).
+    let path = std::env::var("EC_AAC_SBR_LOCATOR_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(format!("{home}/Music/Yok - Nikbinler.mp4")));
     if !path.exists() {
         return;
     }
@@ -4671,6 +4676,30 @@ fn sbr_residual_locator() {
         }
         let hz = f64::from(rate) / FFT_LEN as f64;
         let tot: f64 = acc.iter().map(|a| a[1] + a[2]).sum();
+        // With `EC_AAC_SBR_NOISE_FRACTION` set the decoder bookkeeps the
+        // dequantized target per QMF band; print it next to the reference's
+        // measured energy in the same band so a target-side (bitstream ->
+        // E_orig) tilt separates from an adjust/synthesis-side one.
+        if ch == 0 {
+            let band_hz = f64::from(rate) / 128.0;
+            for (band, sig, noi, out) in ec_aac::noise_fraction_table() {
+                let (lo, hi) = (
+                    (band as f64 * band_hz / hz) as usize,
+                    ((band + 1) as f64 * band_hz / hz) as usize,
+                );
+                let pt: f64 = (lo..hi.min(bins)).map(|k| acc[k][2]).sum();
+                let po: f64 = (lo..hi.min(bins)).map(|k| acc[k][1]).sum();
+                println!(
+                    "TARGET band {band:>2} {:>6.0}Hz target {:.3e} realised/target {:.4} ref_pcm {:.3e} ours_pcm {:.3e} target/ref_pcm {:.3e}",
+                    band as f64 * band_hz,
+                    sig + noi,
+                    out / (sig + noi),
+                    pt,
+                    po,
+                    (sig + noi) / pt
+                );
+            }
+        }
         // group into 250 Hz bands up to 8 kHz, then 1 kHz
         let mut edges: Vec<usize> = (0..=32).map(|i| ((i as f64 * 250.0) / hz) as usize).collect();
         edges.extend((9..=22).map(|i| ((i as f64 * 1000.0) / hz) as usize));
