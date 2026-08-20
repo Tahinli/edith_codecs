@@ -478,6 +478,51 @@ fn context_keeps_its_dependencies_alive() {
 }
 
 // --------------------------------------------------------------------------
+// VPP
+// --------------------------------------------------------------------------
+
+/// `vaQueryVideoProcFilters` on the real display: whatever this driver
+/// advertises, the call must succeed and return values `Vpp` can act on. Not
+/// a claim about which filters exist — radeonsi's list is print-only here —
+/// just that the query path works end to end.
+#[test]
+fn vpp_filters_probe() {
+    let _serial = serial();
+    let display = display();
+    let targets = Surface::create_pool(&display, &SurfaceSpec::nv12(1920, 1080), 1).expect("pool");
+    let vpp = ec_va::Vpp::new(&display, sys::VA_RT_FORMAT_YUV420, &targets).expect("vpp opens");
+    let filters = vpp.filters().expect("vaQueryVideoProcFilters");
+    println!("radeonsi VAProcFilterType list: {filters:?}");
+    println!(
+        "HighDynamicRangeToneMapping (8) advertised: {}",
+        filters.contains(&sys::VAProcFilterHighDynamicRangeToneMapping)
+    );
+}
+
+/// `Vpp::convert` end to end: a P010 source surface into an NV12 destination,
+/// no readback — the conversion `ec-hw`'s `encode_frame` relies on for a
+/// 10-bit source.
+#[test]
+fn vpp_converts_p010_to_nv12() {
+    let _serial = serial();
+    let display = display();
+    let src_spec = SurfaceSpec::p010(64, 64);
+    let source = Surface::create(&display, &src_spec).expect("p010 source surface");
+    let dest_targets = Surface::create_pool(&display, &SurfaceSpec::nv12(64, 64), 1).expect("pool");
+    let vpp = ec_va::Vpp::new(
+        &display,
+        sys::VA_RT_FORMAT_YUV420 | sys::VA_RT_FORMAT_YUV420_10,
+        &dest_targets,
+    )
+    .expect("vpp opens");
+    let dest = vpp
+        .convert(&source, Arc::clone(&dest_targets[0]))
+        .expect("convert");
+    assert_eq!(dest.id(), dest_targets[0].id());
+    assert!(display.is_valid());
+}
+
+// --------------------------------------------------------------------------
 // helpers
 // --------------------------------------------------------------------------
 
