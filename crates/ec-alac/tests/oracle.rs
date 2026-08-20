@@ -129,3 +129,46 @@ fn truncated_frames_are_refused_without_panicking() {
             .is_empty()
     );
 }
+
+/// A 24-bit tone with a dithered low byte, encoded by the reference encoder:
+/// its first residuals escape to raw 24-bit values — a Golomb shape none of
+/// the checked-in fixtures (16-bit, or 24-bit with a shifted low byte) carry.
+#[test]
+fn reference_encoded_24_bit_tone_decodes_bit_exactly() {
+    if Command::new("ffmpeg").arg("-version").output().is_err() {
+        eprintln!("ffmpeg absent — skipping");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("ec-alac-tone-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("tmp");
+    let raw = dir.join("tone.raw");
+    let m4a = dir.join("tone.m4a");
+    let mut seed = 0x0bad_cafeu32;
+    let pcm: Vec<u8> = (0..48_000 * 2)
+        .flat_map(|i| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            let s = ((2000.0 * (i as f64 / 64.0).sin()) as i32) << 8 | (seed & 0xff) as i32;
+            s.to_le_bytes()
+        })
+        .collect();
+    std::fs::write(&raw, &pcm).expect("raw");
+    let enc = Command::new("ffmpeg")
+        .args(["-nostdin", "-y", "-v", "error", "-f", "s32le", "-ar", "48000", "-ac", "2", "-i"])
+        .arg(&raw)
+        .args(["-c:a", "alac", "-sample_fmt", "s32p"])
+        .arg(&m4a)
+        .output()
+        .expect("ffmpeg");
+    assert!(enc.status.success(), "{}", String::from_utf8_lossy(&enc.stderr));
+
+    let (cookie, got) = decode(&m4a);
+    assert_eq!(cookie.bit_depth, 24);
+    let shift = cookie.container_shift();
+    let got: Vec<u8> = got.iter().flat_map(|&s| (s >> shift << 8).to_le_bytes()).collect();
+    let want = ffmpeg(&m4a, "s32le");
+    std::fs::remove_dir_all(&dir).ok();
+    assert_eq!(got.len(), want.len());
+    assert!(got == want, "reference-encoded 24-bit tone: our decode differs from the reference decode");
+}

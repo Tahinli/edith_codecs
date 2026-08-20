@@ -11,3 +11,4 @@ ec-core = { workspace = true }
 
 [dev-dependencies]
 ec-mp4 = { workspace = true }
+ec-riff = { workspace = true }
