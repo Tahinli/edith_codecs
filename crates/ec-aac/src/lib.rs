@@ -35,7 +35,7 @@ mod sbr_chain;
 mod sbr_env;
 mod sbr_hf;
 mod sbr_payload;
-mod sbr_qmf;
+pub mod sbr_qmf;
 mod sbr_tables;
 pub mod tables;
 

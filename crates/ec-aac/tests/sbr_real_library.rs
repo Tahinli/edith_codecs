@@ -1276,6 +1276,229 @@ fn hf_patch_simulator(o: &[f32], t: &[f32], rate: u32) -> (BandCoherenceTable, B
     (band_coherence(&t_spec), band_coherence(&o_spec))
 }
 
+/// (Round-46) The QMF-domain exact version of [`hf_patch_simulator`]: same
+/// plain-patch+gain model, same verified patch map, but read through the
+/// crate's own [`ec_aac::sbr_qmf::HfAnalysis`] (64-band, `rate/128`-wide
+/// bands -- exactly the patch map's own band unit) instead of an 8-bin-wide
+/// STFT approximation, closing the "too crude to reach a verdict" gap
+/// round-45's STFT simulator hit. Validated by
+/// `hf_analysis_self_consistency_control` in `sbr_qmf.rs` before use here
+/// (own-band plurality + self-coherence + round-trip control). Same
+/// per-(band, window) energy-rescale-then-coherence method as the STFT
+/// version, windowed over `WIN` consecutive QMF slots (`WIN * SYNTHESIS_BANDS
+/// = 1024` samples, matching the STFT version's hop) so the rescale has
+/// enough samples to estimate energy from, not so many that within-window
+/// phase drift is averaged away.
+const QMF_PATCHES: [(usize, usize, usize); 4] = [(0, 14, 14), (3, 28, 11), (0, 39, 3), (13, 42, 1)];
+
+/// Shared build step for the QMF-domain third-witness instruments: both
+/// PCMs read through [`ec_aac::sbr_qmf::HfAnalysis`], plus the plain
+/// patch-copy simulation of the reference's own low band, all in the
+/// `(band, slot)` domain. Returns `(ours, reference, sim)`.
+/// `[band][slot]` complex QMF-domain series.
+type QmfBandSlots = Vec<Vec<ec_dsp::Complex<f64>>>;
+
+fn qmf_domain_spec(o: &[f32], t: &[f32]) -> (QmfBandSlots, QmfBandSlots, QmfBandSlots) {
+    use ec_aac::sbr_qmf::{HfAnalysis, SYNTHESIS_BANDS};
+    let n = o.len().min(t.len());
+    let slots = n / SYNTHESIS_BANDS;
+    let analyze = |pcm: &[f32]| -> QmfBandSlots {
+        let mut ana = HfAnalysis::new();
+        let mut out: QmfBandSlots = (0..SYNTHESIS_BANDS)
+            .map(|_| Vec::with_capacity(slots))
+            .collect();
+        for s in 0..slots {
+            let mut chunk = [0.0f32; SYNTHESIS_BANDS];
+            chunk.copy_from_slice(&pcm[s * SYNTHESIS_BANDS..(s + 1) * SYNTHESIS_BANDS]);
+            let sub = ana.process_slot(&chunk);
+            for (b, c) in sub.iter().enumerate() {
+                out[b].push(*c);
+            }
+        }
+        out
+    };
+    let o_spec = analyze(o);
+    let t_spec = analyze(t);
+    // Plain patch copy: sim's target-band slot series is the reference's
+    // source-band slot series, unmodified.
+    let mut sim_spec = vec![vec![ec_dsp::Complex::new(0.0f64, 0.0); slots]; SYNTHESIS_BANDS];
+    for (src, tgt, width) in QMF_PATCHES {
+        for i in 0..width {
+            if src + i >= SYNTHESIS_BANDS || tgt + i >= SYNTHESIS_BANDS {
+                continue;
+            }
+            sim_spec[tgt + i] = t_spec[src + i].clone();
+        }
+    }
+    (o_spec, t_spec, sim_spec)
+}
+
+fn hf_patch_simulator_qmf(o: &[f32], t: &[f32]) -> (BandCoherenceTable, BandCoherenceTable) {
+    use ec_aac::sbr_qmf::SYNTHESIS_BANDS;
+    const WIN: usize = 16;
+    let (o_spec, t_spec, sim_spec) = qmf_domain_spec(o, t);
+    let slots = sim_spec.first().map(Vec::len).unwrap_or(0);
+    if slots < WIN {
+        return (Vec::new(), Vec::new());
+    }
+    let top_band = 43.min(SYNTHESIS_BANDS);
+    let windows = slots / WIN;
+    let band_coherence = |target: &[Vec<ec_dsp::Complex<f64>>]| -> Vec<(usize, f64)> {
+        (14..top_band)
+            .map(|band| {
+                let mut cross_re = 0.0f64;
+                let mut cross_im = 0.0f64;
+                let mut sim_e = 0.0f64;
+                let mut tgt_e = 0.0f64;
+                for w in 0..windows {
+                    let lo = w * WIN;
+                    let hi = lo + WIN;
+                    let se: f64 = sim_spec[band][lo..hi]
+                        .iter()
+                        .map(|c| c.re * c.re + c.im * c.im)
+                        .sum();
+                    let te: f64 = target[band][lo..hi]
+                        .iter()
+                        .map(|c| c.re * c.re + c.im * c.im)
+                        .sum();
+                    if se <= 1e-20 || te <= 0.0 {
+                        continue;
+                    }
+                    let scale = (te / se).sqrt();
+                    for i in lo..hi {
+                        let sc = sim_spec[band][i].scale(scale);
+                        let tc = target[band][i];
+                        let cross = sc * tc.conj();
+                        cross_re += cross.re;
+                        cross_im += cross.im;
+                        sim_e += sc.re * sc.re + sc.im * sc.im;
+                        tgt_e += tc.re * tc.re + tc.im * tc.im;
+                    }
+                }
+                let den = (sim_e * tgt_e).sqrt();
+                let coh = if den > 0.0 {
+                    (cross_re * cross_re + cross_im * cross_im).sqrt() / den
+                } else {
+                    0.0
+                };
+                (band, coh)
+            })
+            .collect()
+    };
+    (band_coherence(&t_spec), band_coherence(&o_spec))
+}
+
+/// (Round-46, Task 2) Per-band 2nd-order complex prediction transfer fit
+/// between the plain-copy sim series and the REFERENCE's own HF series for
+/// that band: `ref[l] ~= a0*sim[l] + a1*sim[l-1] + a2*sim[l-2]`, least
+/// squares over the whole file -- the same shape `sbr_hf::generate`'s own
+/// chirp filter has (`y = residual + ca1*y[n-1] + ca2*y[n-2]`, an IIR rather
+/// than this FIR, but both are order-2 linear reshapings of the same copied
+/// content), so the fitted taps are directly comparable in spirit to our own
+/// bandwidth-expanded LPC coefficients: near `(1,0,0)` means "reference is
+/// also just a plain copy here", taps with real weight on lag 1/2 mean a
+/// genuine order-2 transformation is present.
+#[allow(clippy::needless_range_loop)] // fixed 3x3 complex Gaussian elimination, index math throughout
+fn hf_patch_transfer_fit(
+    o: &[f32],
+    t: &[f32],
+    bands: &[usize],
+) -> Vec<(usize, [ec_dsp::Complex<f64>; 3])> {
+    let (_, t_spec, sim_spec) = qmf_domain_spec(o, t);
+    let mut results = Vec::new();
+    for &band in bands {
+        if band >= sim_spec.len() {
+            continue;
+        }
+        let sim_raw = &sim_spec[band];
+        let ref_raw = &t_spec[band];
+        let len = sim_raw.len().min(ref_raw.len());
+        if len < 8 {
+            continue;
+        }
+        // Normalize each series to unit RMS first: the raw QMF-domain
+        // amplitudes differ by orders of magnitude (sim carries no envelope
+        // gain, `ref` does), which would otherwise make every fitted
+        // coefficient collapse toward the gain ratio rather than the
+        // fraction-of-`ref`-explained-by-which-lag this fit is meant to
+        // read off.
+        let rms = |s: &[ec_dsp::Complex<f64>]| -> f64 {
+            (s[..len]
+                .iter()
+                .map(|c| c.re * c.re + c.im * c.im)
+                .sum::<f64>()
+                / len as f64)
+                .sqrt()
+                .max(1e-300)
+        };
+        let sim_scale = 1.0 / rms(sim_raw);
+        let ref_scale = 1.0 / rms(ref_raw);
+        let sim: Vec<ec_dsp::Complex<f64>> =
+            sim_raw[..len].iter().map(|c| c.scale(sim_scale)).collect();
+        let refb: Vec<ec_dsp::Complex<f64>> =
+            ref_raw[..len].iter().map(|c| c.scale(ref_scale)).collect();
+        let sim = &sim[..];
+        let refb = &refb[..];
+        // Complex 3x3 Hermitian normal equations: r[i][j] = sum sim[l-i] conj(sim[l-j]),
+        // p[i] = sum sim[l-i] conj(ref[l])... solved as R^T a = p with R real basis in
+        // complex arithmetic (Gaussian elimination with partial pivoting by magnitude).
+        let mut r = [[ec_dsp::Complex::new(0.0f64, 0.0); 3]; 3];
+        let mut p = [ec_dsp::Complex::new(0.0f64, 0.0); 3];
+        for l in 2..len {
+            let s = [sim[l], sim[l - 1], sim[l - 2]];
+            let y = refb[l];
+            for i in 0..3 {
+                p[i] = p[i] + s[i].conj() * y;
+                for j in 0..3 {
+                    r[i][j] = r[i][j] + s[i].conj() * s[j];
+                }
+            }
+        }
+        // Gaussian elimination on the augmented [r | p] system.
+        let mut aug = r;
+        let mut rhs = p;
+        for col in 0..3 {
+            let mut piv = col;
+            let mut best = aug[col][col].norm_sqr();
+            for row in (col + 1)..3 {
+                let m = aug[row][col].norm_sqr();
+                if m > best {
+                    best = m;
+                    piv = row;
+                }
+            }
+            if best < 1e-24 {
+                continue;
+            }
+            aug.swap(col, piv);
+            rhs.swap(col, piv);
+            let inv = aug[col][col].conj().scale(1.0 / best);
+            for row in (col + 1)..3 {
+                let f = aug[row][col] * inv;
+                for k in 0..3 {
+                    aug[row][k] = aug[row][k] - f * aug[col][k];
+                }
+                rhs[row] = rhs[row] - f * rhs[col];
+            }
+        }
+        let mut a = [ec_dsp::Complex::new(0.0f64, 0.0); 3];
+        for row in (0..3).rev() {
+            let mut acc = rhs[row];
+            for k in (row + 1)..3 {
+                acc = acc - aug[row][k] * a[k];
+            }
+            let d = aug[row][row];
+            a[row] = if d.norm_sqr() > 1e-24 {
+                acc * d.conj().scale(1.0 / d.norm_sqr())
+            } else {
+                ec_dsp::Complex::new(0.0, 0.0)
+            };
+        }
+        results.push((band, a));
+    }
+    results
+}
+
 /// A file discovered under the user's own media directories: its path, which
 /// AAC stream in it (0-based among AAC streams only) carries HE-AAC, and the
 /// core/SBR crossover an ffprobe/ASC inspection already pinned for it -- used
@@ -2025,6 +2248,56 @@ fn sbr_real_library_matches_reference() {
                     mean_in(&vs_ours, 14, 28),
                     mean_in(&vs_ours, 28, 43)
                 );
+            }
+            // (Round-46, Task 1) QMF-domain exact third witness -- see
+            // `hf_patch_simulator_qmf`'s doc comment.
+            if std::env::var("EC_AAC_SBR_QMF_WITNESS").is_ok() && n >= 4_096 {
+                let win = &o[oa..oa + n];
+                let twin = &t[ob..ob + n];
+                let (vs_ref, vs_ours) = hf_patch_simulator_qmf(win, twin);
+                let mean_in = |rows: &[(usize, f64)], lo: usize, hi: usize| {
+                    let vals: Vec<f64> = rows
+                        .iter()
+                        .filter(|(b, _)| *b >= lo && *b < hi)
+                        .map(|(_, c)| *c)
+                        .collect();
+                    if vals.is_empty() {
+                        0.0
+                    } else {
+                        vals.iter().sum::<f64>() / vals.len() as f64
+                    }
+                };
+                println!("  ch{ch} QMF-WITNESS sim-vs-REFERENCE per-band coherence (band, coh):");
+                for (b, coh) in &vs_ref {
+                    println!("    band{b:>3}: {coh:.4}");
+                }
+                println!(
+                    "  ch{ch} QMF-WITNESS sim-vs-REFERENCE mean: even-gap[14,28)={:.4} odd-gap[28,43)={:.4}",
+                    mean_in(&vs_ref, 14, 28),
+                    mean_in(&vs_ref, 28, 43)
+                );
+                println!("  ch{ch} QMF-WITNESS sim-vs-OURS per-band coherence (band, coh):");
+                for (b, coh) in &vs_ours {
+                    println!("    band{b:>3}: {coh:.4}");
+                }
+                println!(
+                    "  ch{ch} QMF-WITNESS sim-vs-OURS mean: even-gap[14,28)={:.4} odd-gap[28,43)={:.4}",
+                    mean_in(&vs_ours, 14, 28),
+                    mean_in(&vs_ours, 28, 43)
+                );
+                // (Round-46, Task 2) fitted sim-to-reference transfer, one
+                // representative band per patch plus a spread across the
+                // strong odd-gap patch (3,28,11) where the QMF witness shows
+                // sim-vs-reference clearing 0.5.
+                let fit_bands = [14, 18, 22, 26, 28, 30, 32, 34, 36, 38, 39, 42];
+                let fits = hf_patch_transfer_fit(win, twin, &fit_bands);
+                println!("  ch{ch} TASK2 FIT ref[l]~=a0*sim[l]+a1*sim[l-1]+a2*sim[l-2]:");
+                for (b, a) in &fits {
+                    println!(
+                        "    band{b:>3}: a0=({:>7.3},{:>7.3}) a1=({:>7.3},{:>7.3}) a2=({:>7.3},{:>7.3})",
+                        a[0].re, a[0].im, a[1].re, a[1].im, a[2].re, a[2].im
+                    );
+                }
             }
             println!(
                 "  ch{ch}: lag {lag}, full {full:.6}, below {:.0}Hz {low:.6}, above {:.0}Hz {high:.6}",

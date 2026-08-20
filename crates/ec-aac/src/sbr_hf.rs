@@ -400,6 +400,13 @@ pub fn generate(
                 stabilize(lpc2(&ext))
             };
             let g = bw[noise_band_of(target_band)];
+            // (Round-46, Task 2) `EC_AAC_SBR_BW_DUMP` -- one line per patched
+            // band per frame with the smoothed chirp bw actually applied,
+            // to compare against the QMF-domain fitted reference transfer
+            // (`hf_patch_transfer_fit` in the real-file test).
+            if std::env::var("EC_AAC_SBR_BW_DUMP").is_ok() {
+                eprintln!("BW_DUMP target_band={target_band} source_band={source_band} bw={g:.6}");
+            }
             let ca1 = a1.scale(g);
             let ca2 = a2.scale(g * g);
             let (mut y_prev1, mut y_prev2) = if source_band < history.y.len() {
