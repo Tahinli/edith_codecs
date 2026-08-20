@@ -270,52 +270,19 @@ struct Candidate {
     bits: u64,
 }
 
-/// Whether [`best_candidate`] may pick mode 1 (decode.rs:510-529's
-/// double-difference pass): off by default. decode.rs, written from the
-/// published format description, parses and reconstructs it correctly (see
-/// `mode_one_is_chosen_on_smooth_signal` below, which forces this on to
-/// prove it), but real-world ALAC decoders reject any prediction type other
-/// than 0 outright — confirmed against this crate's own oracle test, which
-/// failed with an `unknown prediction type` decode error the one time this
-/// was left enabled. Kept as a knob rather than deleted so the capability
-/// stays reachable for a future stream that is known never to cross a
-/// third-party decoder, and so its cost math stays exercised by a real test.
-fn mode1_allowed() -> bool {
-    std::env::var_os("EC_ALAC_MODE1").is_some()
-}
-
 /// Cheapest of [`ORDER_CANDIDATES`] (plus the trivial order-0 "residuals are
-/// the samples" case) for one channel of true samples, each order tried as
-/// mode 0 (the filter alone) and, when [`mode1_allowed`], also as mode 1: a
-/// first-order pre-difference ahead of the same filter. Mode 1's residuals
-/// are `analyze`'s inverse of that pass: run the filter forward as usual,
-/// then difference *that* result with the order-31 sentinel — decode.rs
-/// undoes it in the same order, integrating first and filtering second.
+/// the samples" case) for one channel of true samples, each as mode 0 — the
+/// only prediction type real-world decoders accept (decode.rs also undoes
+/// mode 1's extra difference pass, but nothing here emits it).
 fn best_candidate(cfg: &MagicCookie, y: &[i32], chan_bits: u32, pb_factor: u32) -> Candidate {
     let mut orders: Vec<usize> = vec![0];
     orders.extend(ORDER_CANDIDATES.iter().copied().filter(|&o| o < y.len()));
-    let mode1 = mode1_allowed();
     let mut best: Option<Candidate> = None;
     for order in orders {
         let res = analyze(y, order, 9);
         let mut cost = CostSink::default();
         rice_encode(&mut cost, cfg, pb_factor, &res, chan_bits);
         let bits = 16 + (order as u64) * 16 + cost.0;
-
-        if mode1 {
-            let res1 = analyze(&res, ORDER_DIFF, 0);
-            let mut cost1 = CostSink::default();
-            rice_encode(&mut cost1, cfg, pb_factor, &res1, chan_bits);
-            let bits1 = 16 + (order as u64) * 16 + cost1.0;
-            if best.as_ref().is_none_or(|b| bits1 < b.bits) {
-                best = Some(Candidate {
-                    mode: 1,
-                    order: order as u32,
-                    res: res1,
-                    bits: bits1,
-                });
-            }
-        }
 
         if best.as_ref().is_none_or(|b| bits < b.bits) {
             best = Some(Candidate {
@@ -359,7 +326,7 @@ fn write_plan<S: BitSink>(sink: &mut S, plan: &ChannelPlan) {
 /// One SCE (mono) or CPE (stereo) element, choosing per-element between raw
 /// (escape) and compressed, and for a pair, between direct L/R and a
 /// mid/side mix, whichever is smaller.
-fn write_element(cfg: &MagicCookie, w: &mut BitWriter, planes: &[Vec<i32>], samples: usize) {
+fn write_element(cfg: &MagicCookie, w: &mut BitWriter, planes: &[Vec<i32>], samples: usize, allow_shift: bool) {
     w.put(0, 16); // element instance tag + 12 reserved bits.
     let pair = planes.len() == 2;
     let channels = planes.len() as u32;
@@ -373,12 +340,7 @@ fn write_element(cfg: &MagicCookie, w: &mut BitWriter, planes: &[Vec<i32>], samp
     // compressing the sample whole. Only 0 and 1 are ever tried: 3 is the
     // format's escape sentinel (decode.rs:439), and a stream never carries
     // more than one low byte's worth of headroom worth shifting off.
-    // EC_ALAC_NO_SHIFT forces bytes_shifted 0 even at 24 bits — a test-only
-    // knob so a test can measure both paths against the same source
-    // (`twenty_four_bit_uses_byte_shift_when_cheaper`), not a real-world
-    // interop concern like `mode1_allowed`'s.
-    let no_shift = std::env::var_os("EC_ALAC_NO_SHIFT").is_some();
-    let shift_candidates: &[u32] = if bit_depth == 24 && !no_shift { &[0, 1] } else { &[0] };
+    let shift_candidates: &[u32] = if bit_depth == 24 && allow_shift { &[0, 1] } else { &[0] };
 
     let compressed = (samples >= 2).then(|| {
         shift_candidates
@@ -499,6 +461,7 @@ pub struct AlacEncoder {
     pending: Vec<i32>,
     packets: std::collections::VecDeque<Vec<u8>>,
     eof: bool,
+    allow_shift: bool,
 }
 
 impl AlacEncoder {
@@ -534,7 +497,16 @@ impl AlacEncoder {
             pending: Vec::new(),
             packets: std::collections::VecDeque::new(),
             eof: false,
+            allow_shift: true,
         })
+    }
+
+    /// Test-only: force bytes_shifted 0 even at 24 bits, so a test can
+    /// measure both paths against the same source. Both outputs decode the
+    /// same; this only trades size.
+    #[doc(hidden)]
+    pub fn set_byte_shift(&mut self, allow: bool) {
+        self.allow_shift = allow;
     }
 
     /// What this encoder states about the stream it writes.
@@ -557,7 +529,7 @@ impl AlacEncoder {
         }
         let mut w = BitWriter::default();
         w.put(if channels == 2 { ID_CPE } else { ID_SCE }, 3);
-        write_element(&self.cookie, &mut w, &planes, n);
+        write_element(&self.cookie, &mut w, &planes, n, self.allow_shift);
         w.put(ID_END, 3);
         w.finish()
     }
