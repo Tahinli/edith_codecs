@@ -261,6 +261,10 @@ impl Encoder {
             } else {
                 self.silk_nb.get_or_insert_with(|| SilkEncoder::new(false))
             };
+            // Keep SILK's own reservoir-based rate control tracking the
+            // Encoder's current target on every frame — cheap (an Option<u32>
+            // store) and catches set_bitrate calls made between frames.
+            enc.set_bitrate(self.bitrate);
             let n = enc.encode_frame(&stuffed, &mut self.silk_buf)?;
             self.final_range = enc.final_range();
             return Ok((self.silk_buf[0], &self.silk_buf[1..n]));
