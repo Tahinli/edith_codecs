@@ -1930,13 +1930,27 @@ fn our_decode_core_only(path: &Path, stream_index: usize) -> Option<(Vec<Vec<f32
     let core_rate = cfg.sample_rate;
     let mut decoder = AacDecoder::with_config(cfg);
     let mut planes: Vec<Vec<f32>> = Vec::new();
-    for au in &aus {
+    let dump = std::env::var("EC_AAC_SBR_PREQMF_DUMP").is_ok();
+    for (au_idx, au) in aus.iter().enumerate() {
         let Ok(frame) = decoder.decode(au, None) else {
             continue;
         };
         let ch = usize::from(frame.channels);
         if ch == 0 {
             continue;
+        }
+        if dump && au_idx < 40 {
+            for c in 0..ch {
+                let plane: Vec<f32> = frame.samples.iter().skip(c).step_by(ch).copied().collect();
+                let rms = (plane.iter().map(|v| f64::from(*v) * f64::from(*v)).sum::<f64>()
+                    / plane.len().max(1) as f64)
+                    .sqrt();
+                eprintln!(
+                    "COREAU n={au_idx} ch={c} len={} rms={rms:.6} first8={:?}",
+                    plane.len(),
+                    &plane[..8.min(plane.len())]
+                );
+            }
         }
         if planes.is_empty() {
             planes = vec![Vec::new(); ch];
@@ -3902,6 +3916,12 @@ fn coupled_cpe_channel_swap_probe() {
     assert_eq!(ours.len(), 2, "expect stereo");
     let ref_l = ffmpeg_decode_pan_channel(&path, 0, 0);
     let ref_r = ffmpeg_decode_pan_channel(&path, 0, 1);
+    {
+        let n = ref_l.len().min(ref_r.len()).min(WINDOW);
+        println!("ref L vs ref R (no lag): corr={:.6}", correlation(&ref_l[..n], &ref_r[..n]));
+        let (lag, corr) = best_lag_correlation_wide(&ref_l, &ref_r, SEARCH_LAG_MAX);
+        println!("ref L vs ref R (best lag search): lag={lag} corr={corr:.6}");
+    }
     for (och, ochan) in ours.iter().enumerate() {
         let (lag_l, corr_l) = best_lag_correlation_wide(ochan, &ref_l, SEARCH_LAG_MAX);
         let (lag_r, corr_r) = best_lag_correlation_wide(ochan, &ref_r, SEARCH_LAG_MAX);
@@ -3920,10 +3940,28 @@ fn coupled_cpe_channel_swap_probe() {
     core_cfg.extension_sample_rate = None;
     let mut core_dec = AacDecoder::with_config(core_cfg);
     let mut core_planes: Vec<Vec<f32>> = vec![Vec::new(), Vec::new()];
-    for au in &aus {
+    let dump = std::env::var("EC_AAC_SBR_PREQMF_DUMP").is_ok();
+    for (au_idx, au) in aus.iter().enumerate() {
         if let Ok(f) = core_dec.decode(au, None) {
             let ch = usize::from(f.channels);
             if ch == 2 {
+                if dump && au_idx < 20 {
+                    for c in 0..2 {
+                        let plane: Vec<f32> =
+                            f.samples.iter().skip(c).step_by(2).copied().collect();
+                        let rms = (plane
+                            .iter()
+                            .map(|v| f64::from(*v) * f64::from(*v))
+                            .sum::<f64>()
+                            / plane.len().max(1) as f64)
+                            .sqrt();
+                        eprintln!(
+                            "COREAU n={au_idx} ch={c} len={} rms={rms:.6} first8={:?}",
+                            plane.len(),
+                            &plane[..8.min(plane.len())]
+                        );
+                    }
+                }
                 for (i, v) in f.samples.iter().enumerate() {
                     core_planes[i % 2].push(*v);
                 }
@@ -3940,6 +3978,47 @@ fn coupled_cpe_channel_swap_probe() {
             let (lag, corr) = best_lag_correlation_wide(ochan, rplane, SEARCH_LAG_MAX);
             let name = if rch == 0 { "L" } else { "R" };
             println!("core ch{och} vs ref {name}: lag={lag} corr={corr:.6}");
+        }
+    }
+
+    // Isolated round trip: run `core_planes` (the CORE-ONLY decode, already
+    // shown correctly-directed above) through a bare, fresh
+    // Analysis(32)->zero-stuff-HF->Synthesis(64) pair -- no sbr_chain, no
+    // per-AU/per-tag HashMap element lookup, no envelope/HF/noise code at
+    // all -- to see whether the swap reproduces on the QMF math alone in a
+    // single continuous stream, isolating it from any per-AU state
+    // threading in `sbr_chain::apply_data`.
+    use ec_aac::sbr_qmf::{ANALYSIS_BANDS as AB, Analysis, SYNTHESIS_BANDS as SB, Synthesis};
+    const OUTPUT_SCALE: f32 = 1.0 / 65536.0;
+    for kx in [6usize, 12, 20] {
+        let mut iso_out: [Vec<f32>; 2] = [Vec::new(), Vec::new()];
+        for (c, chan) in core_planes.iter().enumerate() {
+            let mut analysis = Analysis::new();
+            let mut synthesis = Synthesis::new();
+            let n_slots = chan.len() / AB;
+            for slot in 0..n_slots {
+                let mut chunk = [0f32; 32];
+                chunk.copy_from_slice(&chan[slot * AB..(slot + 1) * AB]);
+                for s in &mut chunk {
+                    *s /= OUTPUT_SCALE;
+                }
+                let sub = analysis.process_slot(&chunk);
+                let mut v = [ec_dsp::Complex::new(0.0, 0.0); 64];
+                v[0..kx.min(AB)].copy_from_slice(&sub[0..kx.min(AB)]);
+                let mut pcm = synthesis.process_slot(&v);
+                for s in &mut pcm {
+                    *s *= OUTPUT_SCALE;
+                }
+                iso_out[c].extend_from_slice(&pcm);
+            }
+            let _ = SB;
+        }
+        for (och, ochan) in iso_out.iter().enumerate() {
+            for (rch, rplane) in [&ref_l, &ref_r].iter().enumerate() {
+                let (lag, corr) = best_lag_correlation_wide(ochan, rplane, SEARCH_LAG_MAX);
+                let name = if rch == 0 { "L" } else { "R" };
+                println!("iso kx={kx} ch{och} vs ref {name}: lag={lag} corr={corr:.6}");
+            }
         }
     }
 }
