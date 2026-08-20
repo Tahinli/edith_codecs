@@ -319,6 +319,15 @@ impl SbrChain {
                 t_noise: sbr_ch.t_noise.iter().map(|&t| t * RATE).collect(),
                 ..sbr_ch.clone()
             };
+            // Same deterministic `build_patches(&tables)` call `generate`
+            // makes internally -- cheap to recompute here so the limiter
+            // band table (patch boundaries + f_low, Sec 4.6.18.7.2) can be
+            // built without threading patches out of `generate`'s signature.
+            let limiter_table = sbr_hf::limiter_band_table(
+                &tables,
+                &sbr_hf::build_patches(&tables),
+                header.limiter_bands,
+            );
             sbr_env::adjust(
                 &mut hf,
                 &tables,
@@ -327,6 +336,7 @@ impl SbrChain {
                 &env_energy,
                 &noise_energy,
                 &mut state.noise,
+                &limiter_table,
             );
 
             let kx = (tables.kx as usize).min(ANALYSIS_BANDS);

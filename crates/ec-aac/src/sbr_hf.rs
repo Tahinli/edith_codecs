@@ -88,6 +88,60 @@ pub fn build_patches(tables: &BandTables) -> Vec<Patch> {
     patches
 }
 
+/// Builds the limiter band table (ISO/IEC 14496-3 §4.6.18.7.2): the union
+/// of the low-resolution envelope band borders (`tables.f_low`) and the
+/// patch target boundaries, thinned so no band is narrower than one
+/// limiter band's worth of octaves at the transmitted `bs_limiter_bands`
+/// density (`0` => a single band spanning the whole HF region; `1`/`2`/`3`
+/// => ~1/2/3 bands per octave, log2-spaced the same way [`f_master`]'s own
+/// band construction thins its candidate borders). The limiter's gain cap
+/// is applied per band on this table, aggregated over every cell it
+/// covers, so a content-empty target cell inherits its band's aggregate
+/// cap instead of amplifying numeric dust toward an unbounded per-cell
+/// ratio.
+pub fn limiter_band_table(tables: &BandTables, patches: &[Patch], limiter_bands: u8) -> Vec<i64> {
+    let kx = tables.kx;
+    let k2 = tables.k2;
+    if kx >= k2 {
+        return vec![kx, k2.max(kx)];
+    }
+    if limiter_bands == 0 {
+        return vec![kx, k2];
+    }
+    let bands_per_octave = match limiter_bands {
+        1 => 1.0,
+        2 => 2.0,
+        _ => 3.0,
+    };
+    let mut borders: Vec<i64> = tables
+        .f_low
+        .iter()
+        .copied()
+        .chain(patches.iter().map(|p| p.target_start as i64))
+        .chain(std::iter::once(k2))
+        .chain(std::iter::once(kx))
+        .filter(|&b| b >= kx && b <= k2)
+        .collect();
+    borders.sort_unstable();
+    borders.dedup();
+    let mut out = vec![borders[0]];
+    for &b in &borders[1..] {
+        let last = *out.last().unwrap();
+        if b <= last {
+            continue;
+        }
+        let octaves = (b as f64 / last as f64).log2();
+        if octaves * bands_per_octave < 1.0 && b != k2 {
+            continue; // too narrow on its own: merges into the current band
+        }
+        out.push(b);
+    }
+    if *out.last().unwrap() != k2 {
+        out.push(k2);
+    }
+    out
+}
+
 /// `bs_invf_mode` bandwidth-expansion targets (OFF, LOW, MID, HIGH), the
 /// four inverse-filtering strengths §4.6.18.6.2 defines.
 const BW_TABLE: [f64; 4] = [0.0, 0.6, 0.9, 0.98];
