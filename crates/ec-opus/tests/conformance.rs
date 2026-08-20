@@ -1110,7 +1110,7 @@ fn oracle_decodes_our_packets_across_the_rate_table() {
     for kbps in [8u32, 12, 16] {
         let mut enc = Encoder::new(48000, 1, Application::Voip).unwrap();
         enc.set_bitrate(kbps * 1000);
-        let pre_skip = enc.look_ahead() as u16;
+        let pre_skip = enc.look_ahead(960) as u16;
         let packets = encode_packets(&mut enc, &pcm, 1);
         let path = temp_path(&format!("silk-1ch-{kbps}k.opus"));
         write_ogg_opus(
@@ -1346,6 +1346,12 @@ fn steady_state_encode_loop_zero_alloc() {
     COUNTING_HERE.with(|c| c.set(false));
     let n = ALLOCS.load(Ordering::SeqCst);
     assert_eq!(n, 0, "5.1 encode allocated {n} times in steady state");
+
+    // Mono SILK (Voip, 12 kbps) is NOT asserted zero-alloc here: fixing
+    // `Encoder::zero_stuff_mono` to reuse a scratch buffer removed its
+    // per-frame Vec, but `SilkEncoder::encode_frame` itself (NLSF/LPC
+    // analysis, pitch search) allocates well beyond that one site — sweeping
+    // those is a separate, much larger effort than this defect's scope.
 }
 
 /// The throughput headline: encode speed in multiples of realtime, per
@@ -1770,7 +1776,7 @@ fn hybrid_layers_align() {
     eprintln!("hybrid click: LB peak +{plb}, HB peak +{phb}, look_ahead {}", {
         let mut e = enc.clone();
         e.set_bitrate(32_000);
-        e.look_ahead()
+        e.look_ahead(960)
     });
     assert!((plb - phb).abs() <= 2, "layers misaligned: LB +{plb} vs HB +{phb}");
     assert!((phb - 120).abs() <= 2, "HB peak +{phb}, look_ahead 120");

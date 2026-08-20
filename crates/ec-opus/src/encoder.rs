@@ -86,6 +86,9 @@ pub struct Encoder {
     silk_buf: [u8; MAX_FRAME_BYTES + 1],
     /// Hybrid: the last [`HYBRID_SILK_DELAY_48K`] samples of SILK-layer input.
     silk_delay: Vec<f32>,
+    /// Scratch space for the zero-stuffed SILK/hybrid input, sized once so
+    /// the steady-state loop doesn't allocate a `Vec` per frame.
+    silk_stuff: Vec<f32>,
 }
 
 impl Encoder {
@@ -129,6 +132,7 @@ impl Encoder {
             silk_wb: None,
             silk_buf: [0u8; MAX_FRAME_BYTES + 1],
             silk_delay: Vec::new(),
+            silk_stuff: Vec::new(),
         })
     }
 
@@ -150,24 +154,29 @@ impl Encoder {
         self.sample_rate
     }
 
-    /// Encoder delay in *input* samples: the decoded stream lags the input by
+    /// Encoder delay in *input* samples for a `frame_size`-sample (per
+    /// channel, native rate) frame: the decoded stream lags the input by
     /// this much, and an Ogg-Opus pre-skip of `look_ahead * 48000/rate`
     /// cancels it exactly. CELT: one MDCT overlap, 120 samples at 48 kHz.
-    /// SILK (mono, when the application/bitrate or an explicit
-    /// [`Encoder::set_mode`] select it): [`SILK_LOOK_AHEAD_48K_NB`] or
-    /// [`SILK_LOOK_AHEAD_48K_WB`], the analysis-plus-synthesis resampler
-    /// round trip, click-measured per bandwidth. Hybrid: CELT's 120, the
-    /// SILK layer being delayed to meet it ([`HYBRID_SILK_DELAY_48K`]).
-    pub fn look_ahead(&self) -> usize {
-        if self.channels == 1 {
-            if let Some(wideband) = self.wants_silk() {
-                let delay = if wideband {
-                    SILK_LOOK_AHEAD_48K_WB
-                } else {
-                    SILK_LOOK_AHEAD_48K_NB
-                };
-                return delay / self.upsample;
-            }
+    /// SILK (mono, 20 ms/960-sample-at-48k frames only, when the
+    /// application/bitrate or an explicit [`Encoder::set_mode`] select it —
+    /// the same [`Encoder::silk_choice`] predicate `encode_toc_and_payload`
+    /// dispatches on, so this always matches which layer actually codes the
+    /// frame): [`SILK_LOOK_AHEAD_48K_NB`] or [`SILK_LOOK_AHEAD_48K_WB`], the
+    /// analysis-plus-synthesis resampler round trip, click-measured per
+    /// bandwidth. Hybrid: CELT's 120, the SILK layer being delayed to meet
+    /// it ([`HYBRID_SILK_DELAY_48K`]). Any other frame size (or SILK/Hybrid's
+    /// mono, 20 ms requirement unmet) falls back to CELT here exactly as
+    /// `encode_toc_and_payload` does.
+    pub fn look_ahead(&self, frame_size: usize) -> usize {
+        let frame_48k = frame_size * self.upsample;
+        if let Some(wideband) = self.silk_choice(frame_48k) {
+            let delay = if wideband {
+                SILK_LOOK_AHEAD_48K_WB
+            } else {
+                SILK_LOOK_AHEAD_48K_NB
+            };
+            return delay / self.upsample;
         }
         120 / self.upsample
     }
@@ -290,17 +299,22 @@ impl Encoder {
     /// Zero-stuffs a mono, `frame_size`-sample native-rate frame up to
     /// `frame_size * upsample` samples at 48 kHz, the rate [`SilkEncoder`]
     /// takes — the same technique [`CeltEncoder::encode`] uses, scaled by
-    /// `upsample` so the passband gain survives the stuffing.
-    fn zero_stuff_mono(&self, pcm: &[f32], frame_size: usize) -> Vec<f32> {
-        let up = self.upsample;
-        if up == 1 {
-            return pcm[..frame_size].to_vec();
+    /// `upsample` so the passband gain survives the stuffing. Writes into
+    /// `out` (an `Encoder` scratch field, not a fresh `Vec` per call) rather
+    /// than returning one, so the caller doesn't allocate every frame; the
+    /// slots between the `upsample`-strided samples stay zero from one call
+    /// to the next once `out` first grows to size, so only the strided
+    /// samples themselves need rewriting.
+    fn zero_stuff_mono(pcm: &[f32], frame_size: usize, upsample: usize, out: &mut Vec<f32>) {
+        if upsample == 1 {
+            out.clear();
+            out.extend_from_slice(&pcm[..frame_size]);
+            return;
         }
-        let mut out = vec![0f32; frame_size * up];
+        out.resize(frame_size * upsample, 0.0);
         for i in 0..frame_size {
-            out[i * up] = pcm[i] * up as f32;
+            out[i * upsample] = pcm[i] * upsample as f32;
         }
-        out
     }
 
     /// Picks SILK or CELT for one frame and encodes it, returning the TOC
@@ -316,7 +330,7 @@ impl Encoder {
     ) -> Result<(u8, &[u8])> {
         let frame_48k = frame_size * self.upsample;
         if let Some(wideband) = self.silk_choice(frame_48k) {
-            let stuffed = self.zero_stuff_mono(pcm, frame_size);
+            Self::zero_stuff_mono(pcm, frame_size, self.upsample, &mut self.silk_stuff);
             let enc = if wideband {
                 self.silk_wb.get_or_insert_with(|| SilkEncoder::new(true))
             } else {
@@ -326,7 +340,7 @@ impl Encoder {
             // Encoder's current target on every frame — cheap (an Option<u32>
             // store) and catches set_bitrate calls made between frames.
             enc.set_bitrate(self.bitrate);
-            let n = enc.encode_frame(&stuffed, &mut self.silk_buf)?;
+            let n = enc.encode_frame(&self.silk_stuff, &mut self.silk_buf)?;
             self.final_range = enc.final_range();
             return Ok((self.silk_buf[0], &self.silk_buf[1..n]));
         }
@@ -492,13 +506,13 @@ impl Encoder {
                 "opus encode: output buffer smaller than the minimum hybrid packet",
             ));
         }
-        let stuffed = self.zero_stuff_mono(pcm, frame_size);
+        Self::zero_stuff_mono(pcm, frame_size, self.upsample, &mut self.silk_stuff);
         let d = HYBRID_SILK_DELAY_48K;
         self.silk_delay.resize(d, 0.0);
         let mut delayed = Vec::with_capacity(960);
         delayed.extend_from_slice(&self.silk_delay);
-        delayed.extend_from_slice(&stuffed[..960 - d]);
-        self.silk_delay.copy_from_slice(&stuffed[960 - d..]);
+        delayed.extend_from_slice(&self.silk_stuff[..960 - d]);
+        self.silk_delay.copy_from_slice(&self.silk_stuff[960 - d..]);
 
         self.range.reset(cap);
         let silk = self.silk_wb.get_or_insert_with(|| SilkEncoder::new(true));
@@ -586,6 +600,29 @@ mod tests {
         let mut e = Encoder::new(24000, 2, Application::Audio).unwrap();
         e.set_bitrate(256_000);
         assert_eq!(e.auto_bandwidth(), Bandwidth::SuperWide);
-        assert_eq!(e.look_ahead(), 60);
+        assert_eq!(e.look_ahead(960), 60);
+    }
+
+    /// `look_ahead` must use the same mono/20 ms-frame predicate dispatch
+    /// does (`silk_choice`/`hybrid_choice`), not just `wants_silk` — a
+    /// non-20 ms frame (or stereo) codes as CELT regardless of the
+    /// bitrate/application, so its look-ahead is CELT's 120, not SILK's.
+    #[test]
+    fn look_ahead_matches_the_frame_size_dispatch_actually_uses() {
+        let mut e = Encoder::new(48000, 1, Application::Voip).unwrap();
+        e.set_bitrate(8000);
+        assert_eq!(e.look_ahead(480), 120, "sub-20ms frame falls back to CELT");
+        assert_eq!(e.look_ahead(240), 120, "sub-20ms frame falls back to CELT");
+        assert_eq!(e.look_ahead(960), 58, "20ms NB SILK");
+
+        e.set_bitrate(16000);
+        assert_eq!(e.look_ahead(960), 50, "20ms WB SILK");
+
+        e.set_bitrate(32000);
+        assert_eq!(e.look_ahead(960), 120, "20ms hybrid, CELT's overlap");
+
+        let mut e = Encoder::new(48000, 2, Application::Voip).unwrap();
+        e.set_bitrate(8000);
+        assert_eq!(e.look_ahead(960), 120, "stereo never codes as SILK/Hybrid");
     }
 }

@@ -124,9 +124,12 @@ impl OpusEncoder {
 
     /// Samples of encoder delay, at the input rate: the decoded stream lags
     /// the input by this much, and an Ogg-Opus pre-skip of it (scaled to
-    /// 48 kHz) cancels the lag exactly.
+    /// 48 kHz) cancels the lag exactly. Reported for the canonical 20 ms
+    /// frame (SILK and Hybrid, which shift the delay, only run at 20 ms
+    /// anyway) — like the incumbent's `OPUS_GET_LOOKAHEAD`, which doesn't
+    /// take a frame size either.
     pub fn look_ahead(&self) -> usize {
-        self.inner.look_ahead()
+        self.inner.look_ahead(self.inner.sample_rate() as usize / 50)
     }
 
     /// The range coder state after the last packet — the RFC 6716 Section 6
