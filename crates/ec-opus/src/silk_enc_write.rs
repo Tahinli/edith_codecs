@@ -37,6 +37,7 @@ const LEVEL_ADJUST: f32 = 80.0 / 1024.0;
 const MAX_PULSE: i32 = 1023;
 
 /// A mono, 20 ms, NB or WB SILK encoder.
+#[derive(Clone, Debug)]
 pub struct SilkEncoder {
     fs_khz: usize,
     resampler: Resampler48,

@@ -875,6 +875,44 @@ fn encoder_roundtrips_at_every_rate() {
     }
 }
 
+/// The mode `Encoder` actually picks, read back from the packet's own TOC
+/// byte: Voip below 20 kbps mono selects SILK (NB at/under 10 kbps, WB
+/// above), Voip 20-40 kbps and Audio at any rate stay on CELT (Hybrid is
+/// unimplemented and Mode 20-40 kbps needs it, D4).
+#[test]
+fn encoder_mode_follows_application_and_bitrate() {
+    // `None` for the two CELT rows: any CELT config is correct there, the
+    // exact one is `auto_bandwidth`'s call, not mode selection's.
+    let cases = [
+        (Application::Voip, 8_000u32, Some(1u8)),
+        (Application::Voip, 16_000, Some(9)),
+        (Application::Audio, 64_000, None),
+        (Application::Voip, 32_000, None),
+    ];
+    for (app, bps, want_config) in cases {
+        let mut enc = Encoder::new(48000, 1, app).unwrap();
+        enc.set_bitrate(bps);
+        let pcm = vec![0.0f32; 960];
+        let mut out = vec![0u8; 1500];
+        let n = enc.encode_float(&pcm, 960, &mut out).unwrap();
+        let toc = ec_opus::Toc::new(out[0]);
+        match want_config {
+            Some(want) => assert_eq!(
+                toc.config, want,
+                "{app:?} at {bps} bps: TOC config {} (wanted {want})",
+                toc.config
+            ),
+            None => assert_eq!(
+                toc.mode(),
+                ec_opus::Mode::Celt,
+                "{app:?} at {bps} bps: TOC config {} is not CELT",
+                toc.config
+            ),
+        }
+        assert!(n > 1, "{app:?} at {bps} bps: empty packet");
+    }
+}
+
 /// All four CELT frame sizes survive the loop, and constrained VBR both
 /// stays decodable and lands near its target.
 #[test]
@@ -915,12 +953,13 @@ use ec_core::{ChannelLayout, Packet as CorePacket, TimeBase};
 use ec_ogg::OggMuxer;
 
 /// The RFC 7845 identification header for this encoder — built by the crate's
-/// own [`ec_opus::ogg`] helper, so a muxer and the encoder cannot disagree —
-/// with pre-skip 120, the CELT overlap delay.
-fn opus_head(channels: usize, layout: Option<(usize, usize, &[u8])>) -> Vec<u8> {
+/// own [`ec_opus::ogg`] helper, so a muxer and the encoder cannot disagree.
+/// `pre_skip` is the encoder's [`Encoder::look_ahead`]: 120, the CELT overlap
+/// delay, for every CELT call site; SILK's own (larger) delay for SILK.
+fn opus_head(channels: usize, pre_skip: u16, layout: Option<(usize, usize, &[u8])>) -> Vec<u8> {
     let mapping =
         layout.map(|(streams, coupled, table)| (1u8, streams as u8, coupled as u8, table));
-    ec_opus::ogg::opus_head(channels as u8, 120, 48000, 0, mapping)
+    ec_opus::ogg::opus_head(channels as u8, pre_skip, 48000, 0, mapping)
 }
 
 /// Muxes 20 ms packets into an Ogg-Opus file whose final granule trims the
@@ -932,6 +971,7 @@ fn write_ogg_opus(
     head: Vec<u8>,
     channels: usize,
     total_samples: usize,
+    pre_skip: i64,
 ) {
     let file = std::io::BufWriter::new(fs::File::create(path).unwrap());
     let mut mux = OggMuxer::new(file);
@@ -947,7 +987,7 @@ fn write_ogg_opus(
     for (idx, p) in packets.iter().enumerate() {
         let last = idx == packets.len() - 1;
         let dur = if last {
-            total_samples as i64 + 120 - pts
+            total_samples as i64 + pre_skip - pts
         } else {
             960
         };
@@ -994,7 +1034,7 @@ fn temp_path(name: &str) -> PathBuf {
 /// incumbent fails this file's 256 kbps row at correlation 0.06; the MUST
 /// bars here are correlation >= 0.9 at 96/165/256 kbps.
 #[test]
-fn libopus_decodes_our_packets_across_the_rate_table() {
+fn oracle_decodes_our_packets_across_the_rate_table() {
     for channels in [1usize, 2] {
         let pcm = test_signal(channels, 2.0);
         let total = pcm.len() / channels;
@@ -1004,7 +1044,7 @@ fn libopus_decodes_our_packets_across_the_rate_table() {
             enc.set_bitrate(kbps * 1000);
             let packets = encode_packets(&mut enc, &pcm, channels);
             let path = temp_path(&format!("{channels}ch-{kbps}k.opus"));
-            write_ogg_opus(&path, &packets, opus_head(channels, None), channels, total);
+            write_ogg_opus(&path, &packets, opus_head(channels, 120, None), channels, total, 120);
             let Some(reference) = ffmpeg_decode(&path, channels) else {
                 eprintln!("ffmpeg unavailable, skipped");
                 let _ = fs::remove_file(&path);
@@ -1059,6 +1099,38 @@ fn libopus_decodes_our_packets_across_the_rate_table() {
             println!("{line}");
         }
     }
+
+    // SILK, mono, the speech-rate corner: Voip application picks it
+    // automatically below 20 kbps (`Encoder::wants_silk`). 0.95 rather than
+    // the CELT floors above — SILK is a speech codec, this is a tone signal,
+    // not the pulse-coded content it's tuned for.
+    let pcm = test_signal(1, 2.0);
+    let total = pcm.len();
+    for kbps in [8u32, 12, 16] {
+        let mut enc = Encoder::new(48000, 1, Application::Voip).unwrap();
+        enc.set_bitrate(kbps * 1000);
+        let pre_skip = enc.look_ahead() as u16;
+        let packets = encode_packets(&mut enc, &pcm, 1);
+        let path = temp_path(&format!("silk-1ch-{kbps}k.opus"));
+        write_ogg_opus(
+            &path,
+            &packets,
+            opus_head(1, pre_skip, None),
+            1,
+            total,
+            pre_skip as i64,
+        );
+        let Some(reference) = ffmpeg_decode(&path, 1) else {
+            eprintln!("ffmpeg unavailable, skipped");
+            let _ = fs::remove_file(&path);
+            return;
+        };
+        let _ = fs::remove_file(&path);
+        let n = (reference.len()).min(total);
+        let corr = correlation(&pcm[..n], &reference[..n]);
+        println!("silk 1 ch {kbps:>3} kbps: corr {corr:.4}");
+        assert!(corr >= 0.95, "silk {kbps} kbps: correlation {corr:.4}");
+    }
 }
 
 /// 5.1 multistream: one distinct tone per channel, encoded with the
@@ -1092,9 +1164,9 @@ fn five_one_encode_end_to_end() {
     let len = enc.encode_float(&silence, 960, &mut out).expect("encode");
     packets.push(out[..len].to_vec());
     let (streams, coupled, mapping) = enc.layout();
-    let head = opus_head(6, Some((streams, coupled, mapping)));
+    let head = opus_head(6, 120, Some((streams, coupled, mapping)));
     let path = temp_path("5.1.opus");
-    write_ogg_opus(&path, &packets, head, 6, total);
+    write_ogg_opus(&path, &packets, head, 6, total, 120);
     let Some(reference) = ffmpeg_decode(&path, 6) else {
         eprintln!("ffmpeg unavailable, skipped");
         let _ = fs::remove_file(&path);
@@ -1126,7 +1198,7 @@ fn ogg_opus_round_trip_duration_is_exact() {
     enc.set_bitrate(128_000);
     let packets = encode_packets(&mut enc, &pcm, 2);
     let path = temp_path("duration.opus");
-    write_ogg_opus(&path, &packets, opus_head(2, None), 2, total);
+    write_ogg_opus(&path, &packets, opus_head(2, 120, None), 2, total, 120);
     let probe = Command::new("ffprobe")
         .args([
             "-v",
@@ -1535,7 +1607,7 @@ fn silk_mono_nb_wb_roundtrip() {
             // Reference oracle: the packets in an Ogg-Opus file decode cleanly.
             if Command::new("ffmpeg").arg("-version").output().is_ok() {
                 let path = temp_path(&format!("silk-{name}-{tag}.opus"));
-                write_ogg_opus(&path, &packets, opus_head(1, None), 1, pcm.len());
+                write_ogg_opus(&path, &packets, opus_head(1, 120, None), 1, pcm.len(), 120);
                 let out = Command::new("ffmpeg")
                     .args(["-v", "warning", "-c:a", "libopus", "-i"])
                     .arg(&path)
