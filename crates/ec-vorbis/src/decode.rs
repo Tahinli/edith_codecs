@@ -454,6 +454,41 @@ impl Decoder for VorbisDecoder {
     }
 
     fn flush(&mut self) -> Result<()> {
+        // §1.3.2: the terminal block's un-overlapped right half (everything
+        // past the last emitted centre) is still valid output up to the
+        // stream's final granule position; without this the decoder is
+        // always exactly one hop short at true EOS.
+        if self.centre.is_some() {
+            let count = self.lap[0].len();
+            if count > 0 {
+                let mut out = vec![Vec::new(); self.lap.len()];
+                for (channel, lap) in self.lap.iter_mut().enumerate() {
+                    out[self.to_ec[channel]] = std::mem::take(lap);
+                }
+                let data: Vec<Buf> = out
+                    .into_iter()
+                    .map(|channel| {
+                        let mut bytes = Vec::with_capacity(channel.len() * 4);
+                        for value in channel {
+                            bytes.extend_from_slice(&value.to_le_bytes());
+                        }
+                        Buf::from_vec(bytes)
+                    })
+                    .collect();
+                let mut frame = AudioFrame::try_new(
+                    SampleFormat::F32,
+                    true,
+                    self.layout.clone(),
+                    self.ident.rate,
+                    count,
+                    data,
+                )?;
+                let base = TimeBase::new(1, i64::from(self.ident.rate));
+                frame.pts = Some(Timestamp::new(self.position, base));
+                self.position += count as i64;
+                self.frames.push_back(Frame::Audio(frame));
+            }
+        }
         self.drained = true;
         Ok(())
     }
