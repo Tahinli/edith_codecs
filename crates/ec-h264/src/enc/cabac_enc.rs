@@ -20,12 +20,15 @@
 use ec_core::BitWriter;
 
 use crate::cabac::{
-    ABS_CAT_OFF, CBF_CAT_OFF, I_MB_TYPE_CTX, I_SUFFIX_CTX_P, NUM_CTX, OFF_ABS, OFF_CBF,
-    OFF_CBP_CHROMA, OFF_CBP_LUMA, OFF_CHROMA_PRED, OFF_LAST, OFF_MB_TYPE, OFF_MB_TYPE_P, OFF_MVD,
-    OFF_PREV_I4, OFF_QP_DELTA, OFF_REM_I4, OFF_SIG, OFF_SKIP_P, SIG_CAT_OFF, init_contexts,
-    qp_delta_inc, sig_inc,
+    ABS_CAT_OFF, CBF_CAT_OFF, I_MB_TYPE_CTX, I_SUFFIX_CTX_P, NUM_CTX, OFF_ABS, OFF_ABS_8X8,
+    OFF_CBF, OFF_CBP_CHROMA, OFF_CBP_LUMA, OFF_CHROMA_PRED, OFF_LAST, OFF_LAST_8X8, OFF_MB_TYPE,
+    OFF_MB_TYPE_P, OFF_MVD, OFF_PREV_I4, OFF_QP_DELTA, OFF_REM_I4, OFF_SIG, OFF_SIG_8X8,
+    OFF_SKIP_P, OFF_TRANSFORM_8X8, SIG_CAT_OFF, init_contexts, qp_delta_inc, sig_inc,
 };
-use crate::entropy::{BlockCat, FLAG_CHROMA_PRED, FLAG_I16, FLAG_INTER, FLAG_PCM, MbCtx, MbInfo};
+use crate::cabac_tables::{LAST_8X8, SIG_8X8_FRAME};
+use crate::entropy::{
+    BlockCat, FLAG_CHROMA_PRED, FLAG_I16, FLAG_INTER, FLAG_PCM, FLAG_TRANS8X8, MbCtx, MbInfo,
+};
 
 /// The arithmetic encoder of 9.3.4 plus the context state.
 pub(crate) struct CabacEnc {
@@ -385,6 +388,38 @@ impl CabacEnc {
         }
     }
 
+    /// transform_size_8x8_flag (9.3.3.1.1.10), mirroring the decoder's
+    /// neighbour condition: available and carrying the flag itself.
+    pub(crate) fn transform_size_8x8_flag(&mut self, flag: bool) {
+        let cond = |n: Option<MbInfo>| match n {
+            None => 0,
+            Some(i) => usize::from(i.flags & FLAG_TRANS8X8 != 0),
+        };
+        let inc = cond(self.ctx.a) + cond(self.ctx.b);
+        self.decision(OFF_TRANSFORM_8X8 + inc, flag);
+    }
+
+    /// One luma 8x8 residual block in 8x8 zigzag order (ctxBlockCat 5). No
+    /// coded_block_flag: for 4:2:0 the coded_block_pattern bit is the whole
+    /// signal (7.3.5.3.3), so an all-zero block must not reach here.
+    pub(crate) fn residual_block_8x8(&mut self, coeff: &[i32; 64]) -> u8 {
+        let last = (0..64)
+            .rev()
+            .find(|&i| coeff[i] != 0)
+            .expect("an 8x8 block with cbp set has a coefficient");
+        for i in 0..63 {
+            let significant = coeff[i] != 0;
+            self.decision(OFF_SIG_8X8 + usize::from(SIG_8X8_FRAME[i]), significant);
+            if significant {
+                self.decision(OFF_LAST_8X8 + usize::from(LAST_8X8[i]), i == last);
+                if i == last {
+                    break;
+                }
+            }
+        }
+        self.encode_levels(coeff, last, OFF_ABS_8X8, false)
+    }
+
     /// One residual block in scan order (7.3.5.3.3): coded_block_flag, the
     /// significance map, then the levels highest scanning position first.
     ///
@@ -397,6 +432,7 @@ impl CabacEnc {
         na: Option<u8>,
         nb: Option<u8>,
     ) -> u8 {
+        debug_assert!(cat != BlockCat::Luma8x8, "cat 5 goes through residual_block_8x8");
         let cat_i = cat.ctx_block_cat();
         let max = cat.max_num_coeff();
         let last = (0..max).rev().find(|&i| coeff[i] != 0);
@@ -436,9 +472,13 @@ impl CabacEnc {
             }
         }
 
-        // Levels, highest scanning position first (9.3.3.1.3 counters).
-        let abs_base = OFF_ABS + ABS_CAT_OFF[cat_i];
-        let chroma_dc = cat_i == 3;
+        self.encode_levels(coeff, last, OFF_ABS + ABS_CAT_OFF[cat_i], cat_i == 3)
+    }
+
+    /// coeff_abs_level_minus1 and coeff_sign_flag of `coeff[..=last]`, highest
+    /// scanning position first (9.3.3.1.3 counters). Returns the number of
+    /// levels written.
+    fn encode_levels(&mut self, coeff: &[i32], last: usize, abs_base: usize, chroma_dc: bool) -> u8 {
         let mut num_eq1 = 0u32;
         let mut num_gt1 = 0u32;
         let mut total = 0u8;
@@ -528,6 +568,61 @@ mod tests {
             };
             assert_eq!(got, bin, "bin {i}");
             assert!(dec.more_macroblocks().expect("terminate"), "bin {i} end");
+        }
+    }
+
+    /// transform_size_8x8_flag under every neighbour combination and ctxBlockCat
+    /// 5 blocks over a spread of densities and magnitudes all decode back
+    /// through the decoder's own syntax readers.
+    #[test]
+    fn cat5_blocks_and_transform_flag_round_trip() {
+        let mut state = 0x9E37_79B9u32;
+        let mut rand = move |m: u32| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state % m
+        };
+        let nbr = |t: bool| MbInfo {
+            flags: if t { FLAG_TRANS8X8 } else { 0 },
+            cbp: 0,
+            dc_cbf: 0,
+        };
+        let mut plan: Vec<(MbCtx, bool, [i32; 64])> = Vec::new();
+        for n in 0..300 {
+            let ctx = MbCtx {
+                a: [None, Some(nbr(false)), Some(nbr(true))][rand(3) as usize],
+                b: [None, Some(nbr(false)), Some(nbr(true))][rand(3) as usize],
+                qp_delta_inc: 0,
+            };
+            let mut c = [0i32; 64];
+            let density = [1, 3, 8, 20, 64][rand(5) as usize];
+            let mag = [1, 2, 5, 40, 3000][rand(5) as usize];
+            for _ in 0..density {
+                let v = rand(mag) as i32 + 1;
+                c[rand(64) as usize] = if rand(2) == 0 { v } else { -v };
+            }
+            c[if n % 7 == 0 { 63 } else { 0 }] = 1; // non-empty; exercise the last position
+            plan.push((ctx, rand(2) == 1, c));
+        }
+        let mut enc = CabacEnc::new(BitWriter::new(), 30, 0);
+        for (ctx, flag, c) in &plan {
+            enc.begin_mb(ctx);
+            enc.transform_size_8x8_flag(*flag);
+            let tc = enc.residual_block_8x8(c);
+            assert_eq!(usize::from(tc), c.iter().filter(|&&v| v != 0).count());
+            enc.not_end_of_slice();
+        }
+        let bytes = enc.finish().into_bytes();
+
+        let mut dec = Cabac::new(&bytes, 0, 30, 0).expect("decoder starts");
+        for (i, (ctx, flag, c)) in plan.iter().enumerate() {
+            dec.begin_mb(ctx);
+            assert_eq!(dec.transform_size_8x8_flag().expect("flag"), *flag, "flag {i}");
+            let mut got = [0i32; 64];
+            dec.residual_block_8x8(&mut got).expect("block");
+            assert_eq!(&got[..], &c[..], "block {i}");
+            assert!(dec.more_macroblocks().expect("terminate"), "block {i} end");
         }
     }
 }

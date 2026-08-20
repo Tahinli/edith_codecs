@@ -499,6 +499,7 @@ fn code_band(pic: &mut Picture, job: BandJob<'_>) -> Vec<u8> {
         target_qp: job.qp,
         lambda: lambda_for(job.qp),
         preset: job.cfg.preset,
+        transform_8x8: job.cfg.transform_8x8,
         ls: LevelScale4x4::new(&[16; 16]),
         mb_ctx: crate::entropy::MbCtx::default(),
         skip_inc: 0,

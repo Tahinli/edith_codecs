@@ -13,6 +13,12 @@ use crate::entropy::{BlockCat, MbCtx};
 use super::cabac_enc::CabacEnc;
 use super::vlc::{write_cbp, write_residual_block};
 
+/// CAVLC's 4x4 sub-block `j` of an 8x8 block in 8x8 zigzag order (7.3.5.3.1,
+/// 8.5.7): coefficient `i` of sub-block `j` is `c8[4 * i + j]`.
+pub(crate) fn sub_block_4x4(c8: &[i32; 64], j: usize) -> [i32; 16] {
+    std::array::from_fn(|i| c8[4 * i + j])
+}
+
 pub(crate) enum EncEntropy {
     Cavlc {
         w: BitWriter,
@@ -109,6 +115,16 @@ impl EncEntropy {
         }
     }
 
+    /// `transform_size_8x8_flag` (7.3.5), where the decoder reads it: after
+    /// mb_type for an Intra_NxN macroblock, after coded_block_pattern for an
+    /// eligible inter one.
+    pub(crate) fn transform_size_8x8_flag(&mut self, flag: bool) {
+        match self {
+            EncEntropy::Cavlc { w, .. } => w.write_bit(flag),
+            EncEntropy::Cabac(c) => c.transform_size_8x8_flag(flag),
+        }
+    }
+
     pub(crate) fn intra_chroma_pred_mode(&mut self, mode: u8) {
         match self {
             EncEntropy::Cavlc { w, .. } => w.write_ue(u32::from(mode)),
@@ -141,6 +157,11 @@ impl EncEntropy {
 
     /// One residual block in scan order; returns its non-zero count, which the
     /// caller records for the neighbours.
+    ///
+    /// `Luma8x8` (64 coefficients, 8x8 zigzag order) is CABAC only; the decoder
+    /// records its count in all four 4x4 slots. Under CAVLC the caller writes
+    /// the four [`sub_block_4x4`] blocks as `Luma4x4`, each with its own nC
+    /// and its own count (decoder.rs finish_macroblock, CAVLC branch).
     pub(crate) fn residual_block(
         &mut self,
         coeff: &[i32],
@@ -148,6 +169,12 @@ impl EncEntropy {
         na: Option<u8>,
         nb: Option<u8>,
     ) -> u8 {
+        if cat == BlockCat::Luma8x8 {
+            let EncEntropy::Cabac(c) = self else {
+                unreachable!("CAVLC codes an 8x8 block as four interleaved 4x4 blocks");
+            };
+            return c.residual_block_8x8(coeff.try_into().expect("64 coefficients"));
+        }
         match self {
             EncEntropy::Cavlc { w, .. } => {
                 let nc = if matches!(cat, BlockCat::ChromaDc(_)) {

@@ -71,6 +71,9 @@ pub(crate) struct MbEnc<'a> {
     /// Lagrangian multiplier in the SATD domain.
     pub lambda: i32,
     pub preset: Preset,
+    /// The PPS carries transform_8x8_mode_flag: transform_size_8x8_flag must
+    /// be written for every eligible macroblock (7.3.5).
+    pub transform_8x8: bool,
     pub ls: LevelScale4x4,
     /// Neighbourhood of the macroblock being written (CABAC).
     pub mb_ctx: MbCtx,
@@ -1157,6 +1160,10 @@ fn encode_intra_mb(
     let offset = if p_slice { 5 } else { 0 };
     w.mb_type(p_slice, intra_type + offset);
     if use_i4 {
+        if e.transform_8x8 {
+            // corner-cut: always 0 until Intra_8x8 prediction exists (E4).
+            w.transform_size_8x8_flag(false);
+        }
         for blk in 0..16 {
             let rem = if modes[blk] == pred_modes[blk] {
                 None
@@ -1473,6 +1480,11 @@ fn encode_inter_mb(
         }
     }
     w.coded_block_pattern(lv.cbp_luma, lv.cbp_chroma, false);
+    // Every shape this encoder emits is 8x8-aligned, so the decoder reads the
+    // flag whenever luma is coded. corner-cut: always 0 until E4 decides.
+    if lv.cbp_luma != 0 && e.transform_8x8 {
+        w.transform_size_8x8_flag(false);
+    }
     finish_mb(
         pic,
         e,
