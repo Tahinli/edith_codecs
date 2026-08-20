@@ -3583,3 +3583,169 @@ fn per_au_low_band_divergence() {
         eprintln!("SKIP synthetic 44100 48k: {} absent", failing.display());
     }
 }
+
+/// Coordinator follow-up: prints what `parse_audio_specific_config` actually
+/// returns for a candidate's real ASC bytes (object/rate/sf_index/
+/// sbr_present/extension_sample_rate), what `AacDecoder` reports back
+/// (`SbrSupport`, `output_sample_rate`) from those parsed fields, then
+/// re-decodes the SAME AU list through a HAND-BUILT explicit
+/// `AudioSpecificConfig` (object_type=5, known core/ext rates) instead of
+/// the parsed one -- if that jumps the correlations to ~1, the parsed
+/// config (or something object_type-conditioned at runtime) is the defect,
+/// not the SBR DSP chain itself. Also re-runs `full_chain_low_band_matches_
+/// own_core`'s FMJ probe with `WIDE_LAG_MAX` raised to 100_000.
+#[test]
+fn probe_explicit_config_and_wide_lag() {
+    if !have_ffmpeg() {
+        eprintln!("SKIP: ffmpeg not on PATH");
+        return;
+    }
+    fn decode_with(cfg: ec_aac::AudioSpecificConfig, aus: &[Vec<u8>]) -> (Vec<Vec<f32>>, u32) {
+        let rate = match (cfg.sbr_present, cfg.ps_present) {
+            (true, false) => cfg.extension_sample_rate.unwrap_or(cfg.sample_rate * 2),
+            _ => cfg.sample_rate,
+        };
+        let mut d = AacDecoder::with_config(cfg);
+        let mut planes: Vec<Vec<f32>> = Vec::new();
+        for au in aus {
+            let Ok(f) = d.decode(au, None) else { continue };
+            let ch = usize::from(f.channels);
+            if ch == 0 {
+                continue;
+            }
+            if planes.is_empty() {
+                planes = vec![Vec::new(); ch];
+            }
+            for (i, v) in f.samples.iter().enumerate() {
+                planes[i % ch].push(*v);
+            }
+            if planes[0].len() >= MAX_SAMPLES {
+                break;
+            }
+        }
+        (planes, rate)
+    }
+
+    for (label, path, aac_stream, ffmpeg_stream, core_sf_index, core_rate, ext_rate, channels) in [
+        (
+            "FMJ",
+            format!(
+                "{}/Downloads/Full Metal Jacket (1987) (1080p BluRay x265 HEVC 10bit HDR AAC 5.1 afm72)/Full Metal Jacket (1987) (1080p BluRay x265 HDR afm72).mkv",
+                std::env::var("HOME").unwrap_or_default()
+            ),
+            1usize,
+            3usize,
+            6u8,
+            24_000u32,
+            48_000u32,
+            2u16,
+        ),
+        (
+            "heaac_44100_48k",
+            format!(
+                "{}/../../.cache/heaac-fixtures/heaac_44100_48k.m4a",
+                env!("CARGO_MANIFEST_DIR")
+            ),
+            0,
+            0,
+            4,
+            44_100,
+            0, // filled below from parsed cfg's own extension_sample_rate
+            2,
+        ),
+    ] {
+        let path = PathBuf::from(path);
+        if !path.exists() {
+            eprintln!("SKIP {label}: {} absent", path.display());
+            continue;
+        }
+        let Some((asc, aus)) = extract_aac_track(&path, aac_stream) else {
+            eprintln!("SKIP {label}: extract failed");
+            continue;
+        };
+        let parsed = parse_audio_specific_config(&asc);
+        println!("{label}: asc={asc:02x?} parsed={parsed:?}");
+        let Ok(parsed_cfg) = parsed else {
+            eprintln!("SKIP {label}: parse failed");
+            continue;
+        };
+        let d = AacDecoder::with_config(parsed_cfg.clone());
+        println!(
+            "  runtime: sbr_support={:?} output_sample_rate={:?}",
+            d.sbr_support(),
+            d.output_sample_rate()
+        );
+
+        // Hand-built EXPLICIT config: object_type=5 (SBR), known core/ext
+        // rates, sbr_present forced true regardless of what the real ASC
+        // parsed to.
+        let ext = if ext_rate == 0 {
+            parsed_cfg.extension_sample_rate.unwrap_or(core_rate * 2)
+        } else {
+            ext_rate
+        };
+        let hand_cfg = ec_aac::AudioSpecificConfig {
+            object_type: ec_aac::AOT_SBR,
+            sample_rate: core_rate,
+            sf_index: core_sf_index,
+            channels,
+            channel_config: channels as u8,
+            sbr_present: true,
+            ps_present: false,
+            extension_sample_rate: Some(ext),
+        };
+        let (hand_planes, hand_rate) = decode_with(hand_cfg.clone(), &aus);
+        if hand_planes.is_empty() {
+            eprintln!("  hand-built config: no channels decoded");
+            continue;
+        }
+        // Own-core self-consistency (upsample+lowpass convention).
+        let core_cfg = ec_aac::AudioSpecificConfig {
+            sbr_present: false,
+            ps_present: false,
+            extension_sample_rate: None,
+            ..hand_cfg.clone()
+        };
+        let (core_planes, _) = decode_with(core_cfg, &aus);
+        if !core_planes.is_empty() {
+            let up: Vec<f32> = core_planes[0].iter().flat_map(|&s| [s, s]).collect();
+            let cutoff = f64::from(core_rate) * 0.4;
+            let ol = lowpass(&hand_planes[0], hand_rate, cutoff);
+            let ul = lowpass(&up, hand_rate, cutoff);
+            let (lag, corr) = best_lag_correlation_wide(&ol, &ul, 100_000);
+            println!(
+                "  hand-built explicit config: low-band vs own core: lag={lag} corr={corr:.6}"
+            );
+        }
+        let theirs = ffmpeg_decode(&path, ffmpeg_stream, hand_planes.len());
+        if let (Some(o), Some(t)) = (hand_planes.first(), theirs.first()) {
+            let (lag, corr) = best_lag_correlation_wide(o, t, 100_000);
+            println!("  hand-built explicit config: full-band vs reference: lag={lag} corr={corr:.6}");
+        }
+    }
+
+    // Probe B: FMJ's own (parsed) full-chain-vs-own-core lag search, widened
+    // to 100_000 (5x the existing WIDE_LAG_MAX=20_000 this file's other
+    // tests use) -- the coarse search in `full_chain_low_band_matches_own_
+    // core` landed right at that bound's edge (20005), so this checks
+    // whether FMJ's true delay simply lies further out.
+    let home = std::env::var("HOME").unwrap_or_default();
+    let fmj = PathBuf::from(format!(
+        "{home}/Downloads/Full Metal Jacket (1987) (1080p BluRay x265 HEVC 10bit HDR AAC 5.1 afm72)/Full Metal Jacket (1987) (1080p BluRay x265 HDR afm72).mkv"
+    ));
+    if fmj.exists() {
+        if let (Some((core, core_rate)), Some((full, sbr, full_rate))) = (
+            our_decode_core_only(&fmj, 1),
+            our_decode(&fmj, 1),
+        ) {
+            if sbr == ec_aac::SbrSupport::V1 {
+                let up: Vec<f32> = core[0].iter().flat_map(|&s| [s, s]).collect();
+                let cutoff = f64::from(core_rate) * 0.4;
+                let ol = lowpass(&full[0], full_rate, cutoff);
+                let ul = lowpass(&up, full_rate, cutoff);
+                let (lag, corr) = best_lag_correlation_wide(&ol, &ul, 100_000);
+                println!("FMJ WIDE_LAG_MAX=100_000: ch0 best lag={lag} corr={corr:.6}");
+            }
+        }
+    }
+}
