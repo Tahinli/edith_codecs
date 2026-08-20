@@ -25,16 +25,16 @@ use ec_core::Result;
 
 use crate::range::RangeDecoder;
 
-mod tables {
+pub(crate) mod tables {
     #![allow(clippy::all)]
     include!("silk_tables.rs");
 }
 
 use tables::*;
 
-const MAX_LPC_ORDER: usize = 16;
-const LTP_ORDER: usize = 5;
-const MAX_NB_SUBFR: usize = 4;
+pub(crate) const MAX_LPC_ORDER: usize = 16;
+pub(crate) const LTP_ORDER: usize = 5;
+pub(crate) const MAX_NB_SUBFR: usize = 4;
 const SUB_FRAME_LENGTH_MS: usize = 5;
 const LTP_MEM_LENGTH_MS: usize = 20;
 const MAX_FRAME_LENGTH: usize = 20 * 16;
@@ -44,12 +44,12 @@ const MIN_DELTA_GAIN_QUANT: i32 = -4;
 const MAX_DELTA_GAIN_QUANT: i32 = 36;
 const MIN_QGAIN_DB: i32 = 2;
 const MAX_QGAIN_DB: i32 = 88;
-const NLSF_QUANT_MAX_AMPLITUDE: i32 = 4;
+pub(crate) const NLSF_QUANT_MAX_AMPLITUDE: i32 = 4;
 const SHELL_LEN: usize = 16;
 const MAX_PULSES: i32 = 16;
 const N_RATE_LEVELS: usize = 10;
-const PE_MIN_LAG_MS: i32 = 2;
-const PE_MAX_LAG_MS: i32 = 18;
+pub(crate) const PE_MIN_LAG_MS: i32 = 2;
+pub(crate) const PE_MAX_LAG_MS: i32 = 18;
 const STEREO_INTERP_LEN_MS: usize = 8;
 const TYPE_VOICED: i32 = 2;
 const MAX_LPC_STABILIZE_ITERATIONS: usize = 16;
@@ -73,18 +73,18 @@ enum CondCoding {
 // ---------------------------------------------------------------------------
 
 #[inline]
-fn smulwb(a: i32, b: i32) -> i32 {
+pub(crate) fn smulwb(a: i32, b: i32) -> i32 {
     (((a >> 16) * (b as i16 as i32)) as i64 + ((((a & 0xFFFF) * (b as i16 as i32)) >> 16) as i64))
         as i32
 }
 
 #[inline]
-fn smlawb(a: i32, b: i32, c: i32) -> i32 {
+pub(crate) fn smlawb(a: i32, b: i32, c: i32) -> i32 {
     a.wrapping_add(smulwb(b, c))
 }
 
 #[inline]
-fn smulbb(a: i32, b: i32) -> i32 {
+pub(crate) fn smulbb(a: i32, b: i32) -> i32 {
     (a as i16 as i32).wrapping_mul(b as i16 as i32)
 }
 
@@ -94,7 +94,7 @@ fn smlabb(a: i32, b: i32, c: i32) -> i32 {
 }
 
 #[inline]
-fn rshift_round(a: i32, shift: u32) -> i32 {
+pub(crate) fn rshift_round(a: i32, shift: u32) -> i32 {
     if shift == 1 {
         (a >> 1) + (a & 1)
     } else {
@@ -149,7 +149,7 @@ fn clz_frac(x: i32) -> (i32, i32) {
     (lz, frac)
 }
 
-fn sqrt_approx(x: i32) -> i32 {
+pub(crate) fn sqrt_approx(x: i32) -> i32 {
     if x <= 0 {
         return 0;
     }
@@ -159,7 +159,7 @@ fn sqrt_approx(x: i32) -> i32 {
     smlawb(y, y, smulbb(213, frac))
 }
 
-fn log2lin(log_q7: i32) -> i32 {
+pub(crate) fn log2lin(log_q7: i32) -> i32 {
     if log_q7 < 0 {
         return 0;
     }
@@ -807,19 +807,19 @@ fn decode_signs(
 }
 
 /// The NLSF codebook for one bandwidth (Section 4.2.7.5).
-struct NlsfCodebook {
-    n_vectors: usize,
-    order: usize,
-    quant_step_size_q16: i32,
-    cb1_q8: &'static [u8],
-    cb1_icdf: &'static [u8],
-    pred_q8: &'static [u8],
-    ec_sel: &'static [u8],
-    ec_icdf: &'static [u8],
-    delta_min_q15: &'static [i16],
+pub(crate) struct NlsfCodebook {
+    pub(crate) n_vectors: usize,
+    pub(crate) order: usize,
+    pub(crate) quant_step_size_q16: i32,
+    pub(crate) cb1_q8: &'static [u8],
+    pub(crate) cb1_icdf: &'static [u8],
+    pub(crate) pred_q8: &'static [u8],
+    pub(crate) ec_sel: &'static [u8],
+    pub(crate) ec_icdf: &'static [u8],
+    pub(crate) delta_min_q15: &'static [i16],
 }
 
-fn nlsf_cb(wideband: bool) -> &'static NlsfCodebook {
+pub(crate) fn nlsf_cb(wideband: bool) -> &'static NlsfCodebook {
     static NB_MB: NlsfCodebook = NlsfCodebook {
         n_vectors: 32,
         order: 10,
@@ -847,7 +847,7 @@ fn nlsf_cb(wideband: bool) -> &'static NlsfCodebook {
 }
 
 /// `silk_NLSF_unpack`: per-coefficient entropy-table selectors and predictors.
-fn nlsf_unpack(cb: &NlsfCodebook, cb1_index: usize) -> ([i16; MAX_LPC_ORDER], [u8; MAX_LPC_ORDER]) {
+pub(crate) fn nlsf_unpack(cb: &NlsfCodebook, cb1_index: usize) -> ([i16; MAX_LPC_ORDER], [u8; MAX_LPC_ORDER]) {
     let mut ec_ix = [0i16; MAX_LPC_ORDER];
     let mut pred = [0u8; MAX_LPC_ORDER];
     let sel = &cb.ec_sel[cb1_index * cb.order / 2..];
@@ -862,7 +862,7 @@ fn nlsf_unpack(cb: &NlsfCodebook, cb1_index: usize) -> ([i16; MAX_LPC_ORDER], [u
 }
 
 /// `silk_NLSF_decode`: indices to normalised LSFs (Section 4.2.7.5.3).
-fn nlsf_decode(indices: &[i8], cb: &NlsfCodebook) -> [i16; MAX_LPC_ORDER] {
+pub(crate) fn nlsf_decode(indices: &[i8], cb: &NlsfCodebook) -> [i16; MAX_LPC_ORDER] {
     let mut nlsf_q15 = [0i16; MAX_LPC_ORDER];
     let base = indices[0] as usize * cb.order;
     for i in 0..cb.order {
@@ -895,7 +895,7 @@ fn nlsf_decode(indices: &[i8], cb: &NlsfCodebook) -> [i16; MAX_LPC_ORDER] {
 }
 
 /// `silk_NLSF_VQ_weights_laroia` (Section 4.2.7.5.3).
-fn nlsf_vq_weights_laroia(nlsf_q15: &[i16]) -> [i16; MAX_LPC_ORDER] {
+pub(crate) fn nlsf_vq_weights_laroia(nlsf_q15: &[i16]) -> [i16; MAX_LPC_ORDER] {
     let d = nlsf_q15.len();
     let mut w = [0i16; MAX_LPC_ORDER];
     let inv = |x: i32| (1i32 << 17) / x.max(1);
@@ -916,7 +916,7 @@ fn nlsf_vq_weights_laroia(nlsf_q15: &[i16]) -> [i16; MAX_LPC_ORDER] {
 }
 
 /// `silk_NLSF_stabilize` (Section 4.2.7.5.4): enforce the minimum spacing.
-fn nlsf_stabilize(nlsf_q15: &mut [i16], delta_min_q15: &[i16]) {
+pub(crate) fn nlsf_stabilize(nlsf_q15: &mut [i16], delta_min_q15: &[i16]) {
     let l = nlsf_q15.len();
     for _ in 0..20 {
         let mut min_diff = nlsf_q15[0] as i32 - delta_min_q15[0] as i32;
@@ -970,7 +970,7 @@ fn nlsf_stabilize(nlsf_q15: &mut [i16], delta_min_q15: &[i16]) {
 }
 
 /// `silk_NLSF2A` (Section 4.2.7.5.6): LSFs to LPC coefficients.
-fn nlsf2a(nlsf: &[i16], order: usize) -> [i16; MAX_LPC_ORDER] {
+pub(crate) fn nlsf2a(nlsf: &[i16], order: usize) -> [i16; MAX_LPC_ORDER] {
     const QA: u32 = 16;
     const ORDER16: [usize; 16] = [0, 15, 8, 7, 4, 11, 12, 3, 2, 13, 10, 5, 6, 9, 14, 1];
     const ORDER10: [usize; 10] = [0, 9, 6, 3, 4, 5, 8, 1, 2, 7];
@@ -1117,7 +1117,7 @@ fn mul32_frac_q(a: i32, b: i32, q: u32) -> i32 {
 }
 
 /// `silk_gains_dequant` (Section 4.2.7.4).
-fn gains_dequant(
+pub(crate) fn gains_dequant(
     indices: &[i8],
     prev_ind: &mut i32,
     conditional: bool,
@@ -1144,7 +1144,7 @@ fn gains_dequant(
 }
 
 /// `silk_decode_pitch` (Section 4.2.7.6.1).
-fn decode_pitch(
+pub(crate) fn decode_pitch(
     lag_index: i32,
     contour_index: i32,
     fs_khz: i32,
