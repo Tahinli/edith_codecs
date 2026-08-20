@@ -74,8 +74,17 @@ impl Mp3Decoder {
         })
     }
 
-    fn take(&mut self) {
-        while let Ok(frame) = self.reader.next_frame() {
+    // Drains every complete frame the reservoir will yield. `NeedMore`/`Eof`
+    // just mean "nothing left to take yet" and end the loop quietly; any
+    // other error (corrupt CRC, unsupported layer) is real and must reach
+    // the caller rather than vanish here.
+    fn take(&mut self) -> Result<()> {
+        loop {
+            let frame = match self.reader.next_frame() {
+                Ok(frame) => frame,
+                Err(e) if e.is_need_more() || e.is_eof() => return Ok(()),
+                Err(e) => return Err(e),
+            };
             if frame.samples.is_empty() {
                 continue;
             }
@@ -111,8 +120,7 @@ impl Decoder for Mp3Decoder {
 
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
         self.reader.push(packet.data.as_ref());
-        self.take();
-        Ok(())
+        self.take()
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
@@ -127,7 +135,7 @@ impl Decoder for Mp3Decoder {
     }
 
     fn flush(&mut self) -> Result<()> {
-        self.take();
+        self.take()?;
         self.drained = true;
         Ok(())
     }

@@ -59,6 +59,52 @@ impl WindowSequence {
     }
 }
 
+/// One `raw_data_block` element's coding-tool usage, gated by
+/// `EC_AAC_TOOL_SIDEINFO_DEBUG` -- mirrors `sbr_chain::SbrSideInfoRow`'s
+/// pattern for the LC core, so a real file's PNS/M-S/IS/TNS mix can be read
+/// back per AU without re-parsing debug text.
+#[derive(Clone, Debug)]
+pub struct ToolSideInfoRow {
+    pub au: usize,
+    pub tag: u8,
+    pub is_cpe: bool,
+    pub window_sequence: WindowSequence,
+    pub ms_bands: usize,
+    pub pns_bands: usize,
+    pub is_bands: usize,
+    pub tns_present: bool,
+}
+
+static TOOL_SIDEINFO_LOG: std::sync::OnceLock<std::sync::Mutex<Vec<ToolSideInfoRow>>> =
+    std::sync::OnceLock::new();
+static TOOL_SIDEINFO_AU: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn tool_sideinfo_enabled() -> bool {
+    std::env::var("EC_AAC_TOOL_SIDEINFO_DEBUG").is_ok()
+}
+
+fn log_tool_sideinfo(row: ToolSideInfoRow) {
+    let log = TOOL_SIDEINFO_LOG.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    if let Ok(mut l) = log.lock() {
+        l.push(row);
+    }
+}
+
+/// Bumps the shared AU counter once per `raw_data_block`, returning the value
+/// that call's rows should carry.
+fn next_tool_sideinfo_au() -> usize {
+    TOOL_SIDEINFO_AU.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Every row logged so far this process, in call order. Empty unless
+/// `EC_AAC_TOOL_SIDEINFO_DEBUG` was set before decoding.
+pub fn tool_sideinfo_log() -> Vec<ToolSideInfoRow> {
+    let Some(log) = TOOL_SIDEINFO_LOG.get() else {
+        return Vec::new();
+    };
+    log.lock().map(|l| l.clone()).unwrap_or_default()
+}
+
 /// `ics_info` (§4.4.2.1) plus the grouping it implies.
 #[derive(Clone, Debug)]
 pub struct IcsInfo {
@@ -657,6 +703,14 @@ impl BlockDecoder {
     /// Runs the stereo tools, TNS and the filterbank over one element's
     /// channels, appending each channel's PCM to `out`.
     fn finish(&mut self, chans: &mut [Ics], ms: Option<&MsMask>, out: &mut Vec<Vec<f32>>) {
+        // Noise substitution (§4.6.13) must fill its bands before M/S and
+        // intensity stereo run, so those tools combine the noise-filled
+        // coefficients like any other spectral data rather than the zeroes
+        // `dequantize` left behind for NOISE_HCB bands -- matching the
+        // decode order every reference decoder uses.
+        for ch in chans.iter_mut() {
+            fill_noise(ch, &mut self.noise);
+        }
         if let ([left, right], Some(mask)) = (&mut *chans, ms) {
             apply_ms(left, right, mask);
         }
@@ -664,7 +718,6 @@ impl BlockDecoder {
             apply_intensity(left, right, ms);
         }
         for ch in chans.iter_mut() {
-            fill_noise(ch, &mut self.noise);
             let windows = if ch.ics.window_sequence.is_short() {
                 8
             } else {
@@ -693,6 +746,8 @@ impl BlockDecoder {
         // FIL's SBR payload would apply to, per §4.5.1: a fill_element
         // directly follows the element it decorates.
         let mut pending: Option<(u8, usize, usize, bool)> = None;
+        let dump_tools = tool_sideinfo_enabled();
+        let au = if dump_tools { next_tool_sideinfo_au() } else { 0 };
         loop {
             if r.bits_remaining() < 3 {
                 break;
@@ -706,6 +761,9 @@ impl BlockDecoder {
                     let tag = r.read_bits(4)? as u8;
                     let start = out.len();
                     let mut ch = [self.channel_stream(r, None)?];
+                    if dump_tools {
+                        log_tool_sideinfo(tool_row(au, tag, false, &ch[0], None));
+                    }
                     self.finish(&mut ch, None, &mut out);
                     // §4.6.18.1: SBR is never applied to the LFE channel (no
                     // FIL/SBR payload follows it), so it must not become a
@@ -748,6 +806,9 @@ impl BlockDecoder {
                         self.channel_stream(r, shared.as_ref())?,
                         self.channel_stream(r, shared.as_ref())?,
                     ];
+                    if dump_tools {
+                        log_tool_sideinfo(tool_row(au, tag, true, &pair[0], Some(&mask)));
+                    }
                     self.finish(&mut pair, Some(&mask), &mut out);
                     pending = Some((tag, start, 2, true));
                 }
@@ -958,6 +1019,37 @@ fn apply_ms(left: &mut Ics, right: &mut Ics, mask: &MsMask) {
                 }
             }
         }
+    }
+}
+
+/// Builds one `EC_AAC_TOOL_SIDEINFO_DEBUG` row from an already-decoded `Ics`
+/// (any channel of a CPE, since PNS/IS/TNS presence is per-channel but the
+/// dump only needs whether the element used the tool at all).
+fn tool_row(au: usize, tag: u8, is_cpe: bool, ch: &Ics, mask: Option<&MsMask>) -> ToolSideInfoRow {
+    let mut ms_bands = 0;
+    let mut pns_bands = 0;
+    let mut is_bands = 0;
+    for g in 0..ch.ics.num_groups {
+        for sfb in 0..ch.ics.max_sfb {
+            if mask.is_some_and(|m| m.used(g, sfb)) {
+                ms_bands += 1;
+            }
+            match ch.cb[g][sfb] {
+                NOISE_HCB => pns_bands += 1,
+                INTENSITY_HCB | INTENSITY_HCB2 => is_bands += 1,
+                _ => {}
+            }
+        }
+    }
+    ToolSideInfoRow {
+        au,
+        tag,
+        is_cpe,
+        window_sequence: ch.ics.window_sequence,
+        ms_bands,
+        pns_bands,
+        is_bands,
+        tns_present: !ch.tns.filters.is_empty(),
     }
 }
 

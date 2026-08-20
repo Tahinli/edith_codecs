@@ -280,3 +280,68 @@ fn opus_has_a_decoder_in_the_registry() {
         "the refusal names the codec: {refusal}"
     );
 }
+
+/// Regression for `open: NeedMore` on a real mp3 whose ID3v2 header carries a
+/// large APIC cover-art picture and whose tail carries an ID3v1 `TAG` block:
+/// the probe must skip both rather than reading a bounded head short of the
+/// first mp3 frame sync, or getting confused reading a 128-byte tail as audio.
+/// Built out of a plain mp3 fixture wrapped in a synthetic 2 MB ID3v2 APIC
+/// header and an ID3v1 tail, so this needs no real file on disk.
+#[test]
+fn cover_art_and_id3v1_tail_do_not_stop_the_probe() {
+    let raw = std::fs::read(fixtures().join("mp3-stereo-48000.mp3")).expect("fixture mp3");
+    // A 2 MB ID3v2.3 tag: one oversized `APIC` frame of filler bytes. The
+    // probe only needs to skip past the tag's declared size, so the frame
+    // body's content does not matter.
+    let apic_body_len = 2_000_000usize;
+    let mut id3 = Vec::new();
+    id3.extend_from_slice(b"ID3");
+    id3.extend_from_slice(&[3, 0, 0]); // version 2.3.0, no flags
+    let frame_len = apic_body_len as u32;
+    let tag_size = 10 + apic_body_len as u32; // one frame header (10) + body
+    id3.extend_from_slice(&syncsafe(tag_size));
+    id3.extend_from_slice(b"APIC");
+    id3.extend_from_slice(&frame_len.to_be_bytes());
+    id3.extend_from_slice(&[0, 0]); // frame flags
+    id3.extend(std::iter::repeat_n(0u8, apic_body_len));
+
+    let mut id3v1 = vec![0u8; 128];
+    id3v1[0..3].copy_from_slice(b"TAG");
+
+    let mut bytes = id3;
+    bytes.extend_from_slice(&raw);
+    bytes.extend_from_slice(&id3v1);
+
+    let path = std::env::temp_dir().join("edith-cover-art-id3v1-tail.mp3");
+    std::fs::write(&path, &bytes).expect("write synthetic mp3");
+
+    let mut track = SymTrack::open(&path).expect("open past the ID3v2 APIC and ID3v1 tail");
+    assert_eq!(track.codec, "mp3");
+    let mut decoder = track.decoder();
+    let mut out = Vec::new();
+    let mut decoded_packets = 0;
+    while let Some(packet) = track.reader.next_packet().expect("demux") {
+        if packet.track_id != track.track_id {
+            continue;
+        }
+        decoder
+            .decode(&packet)
+            .expect("decode")
+            .copy_to_vec_interleaved::<f32>(&mut out);
+        decoded_packets += 1;
+    }
+    assert!(decoded_packets > 0, "no audio packets decoded");
+    assert!(!out.is_empty(), "no samples decoded");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// ID3v2's syncsafe integer: 4 bytes, 7 significant bits each (top bit clear),
+/// big-endian.
+fn syncsafe(mut n: u32) -> [u8; 4] {
+    let mut out = [0u8; 4];
+    for b in out.iter_mut().rev() {
+        *b = (n & 0x7f) as u8;
+        n >>= 7;
+    }
+    out
+}
