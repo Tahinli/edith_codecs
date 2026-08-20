@@ -3431,3 +3431,77 @@ fn sbr_header_feature_table() {
         );
     }
 }
+
+/// One channel of `path`'s given absolute stream, isolated with an ffmpeg
+/// `pan` filter rather than raw de-interleaving -- the charter's own witness
+/// rule (see `ffmpeg_decode`'s doc and the ledger's "never use -ac 1", which
+/// applies just as much to picking one of N channels as to downmixing).
+fn ffmpeg_decode_pan_channel(path: &Path, absolute_stream: usize, channel: usize) -> Vec<f32> {
+    let out = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args([
+            "-map",
+            &format!("0:{absolute_stream}"),
+            "-t",
+            "10",
+            "-af",
+            &format!("pan=1c|c0=c{channel}"),
+            "-f",
+            "f32le",
+            "-acodec",
+            "pcm_f32le",
+            "-",
+        ])
+        .output()
+        .expect("ffmpeg runs");
+    assert!(
+        out.status.success(),
+        "ffmpeg pan decode failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.stdout
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// The user's real 7.1 mp4 whose lone AAC track was once suspected (per the
+/// ledger) to need AAC Main/LTP (§4.6.6/§4.6.7) prediction support this
+/// decoder doesn't have. Re-checked here: its AudioSpecificConfig's
+/// `audioObjectType` is 2 (AAC-LC, confirmed both from the container's ASC
+/// bytes and from the ADTS `profile` field ffmpeg remuxes it to), and this
+/// decoder in fact reads its whole ~994s track -- 45000+ access units --
+/// with zero `Err` returns. No `predictor_data_present` refusal is reachable
+/// on this file; the capability gap the ledger recorded does not exist for
+/// it. This test is the standing proof: it decodes 10s of all 8 channels and
+/// checks each against ffmpeg's own decode, isolated per channel by `pan`
+/// (never `-ac 1`, which would remix rather than isolate).
+#[test]
+fn boneknapper_multichannel_lc_matches_reference() {
+    if !have_ffmpeg() {
+        eprintln!("SKIP: ffmpeg not on PATH");
+        return;
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    let path = PathBuf::from(format!(
+        "{home}/Downloads/Legend of the Boneknapper Dragon (2010) [1080p] {{7.1}}/Legend.of.the.Boneknapper.Dragon.BluRay.1080p.x264.7.1.HQ.Judas.mp4"
+    ));
+    if !path.exists() {
+        eprintln!("SKIP: {} not present", path.display());
+        return;
+    }
+    let Some((ours, _sbr, rate)) = our_decode(&path, 0) else {
+        panic!("Boneknapper AAC track failed to decode at all");
+    };
+    assert_eq!(ours.len(), 8, "expected 7.1 (8 channels)");
+    let want = (rate as usize) * 10; // 10s per the charter
+    for (ch, o) in ours.iter().enumerate() {
+        let o = &o[..o.len().min(want)];
+        let t = ffmpeg_decode_pan_channel(&path, 2, ch);
+        let t = &t[..t.len().min(want)];
+        let (lag, corr) = best_lag_correlation(o, t);
+        println!("Boneknapper ch{ch}: lag {lag}, corr {corr:.6}");
+        assert!(corr >= 0.999, "ch{ch} corr {corr:.6} < 0.999 (lag {lag})");
+    }
+}
