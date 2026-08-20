@@ -1333,17 +1333,26 @@ fn qmf_domain_spec(o: &[f32], t: &[f32]) -> (QmfBandSlots, QmfBandSlots, QmfBand
     (o_spec, t_spec, sim_spec)
 }
 
-fn hf_patch_simulator_qmf(o: &[f32], t: &[f32]) -> (BandCoherenceTable, BandCoherenceTable) {
+/// Returns `(sim-vs-reference, sim-vs-ours, ours-vs-reference)` -- the last
+/// pairing (round-48, Task 4a) is the ultimate content-match witness: how
+/// well our actual HF QMF content agrees with the reference's, with no
+/// simulator in between.
+fn hf_patch_simulator_qmf(
+    o: &[f32],
+    t: &[f32],
+) -> (BandCoherenceTable, BandCoherenceTable, BandCoherenceTable) {
     use ec_aac::sbr_qmf::SYNTHESIS_BANDS;
     const WIN: usize = 16;
     let (o_spec, t_spec, sim_spec) = qmf_domain_spec(o, t);
     let slots = sim_spec.first().map(Vec::len).unwrap_or(0);
     if slots < WIN {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new());
     }
     let top_band = 43.min(SYNTHESIS_BANDS);
     let windows = slots / WIN;
-    let band_coherence = |target: &[Vec<ec_dsp::Complex<f64>>]| -> Vec<(usize, f64)> {
+    let band_coherence = |source: &[Vec<ec_dsp::Complex<f64>>],
+                           target: &[Vec<ec_dsp::Complex<f64>>]|
+     -> Vec<(usize, f64)> {
         (14..top_band)
             .map(|band| {
                 let mut cross_re = 0.0f64;
@@ -1353,7 +1362,7 @@ fn hf_patch_simulator_qmf(o: &[f32], t: &[f32]) -> (BandCoherenceTable, BandCohe
                 for w in 0..windows {
                     let lo = w * WIN;
                     let hi = lo + WIN;
-                    let se: f64 = sim_spec[band][lo..hi]
+                    let se: f64 = source[band][lo..hi]
                         .iter()
                         .map(|c| c.re * c.re + c.im * c.im)
                         .sum();
@@ -1366,7 +1375,7 @@ fn hf_patch_simulator_qmf(o: &[f32], t: &[f32]) -> (BandCoherenceTable, BandCohe
                     }
                     let scale = (te / se).sqrt();
                     for i in lo..hi {
-                        let sc = sim_spec[band][i].scale(scale);
+                        let sc = source[band][i].scale(scale);
                         let tc = target[band][i];
                         let cross = sc * tc.conj();
                         cross_re += cross.re;
@@ -1385,7 +1394,11 @@ fn hf_patch_simulator_qmf(o: &[f32], t: &[f32]) -> (BandCoherenceTable, BandCohe
             })
             .collect()
     };
-    (band_coherence(&t_spec), band_coherence(&o_spec))
+    (
+        band_coherence(&sim_spec, &t_spec),
+        band_coherence(&sim_spec, &o_spec),
+        band_coherence(&o_spec, &t_spec),
+    )
 }
 
 /// (Round-46, Task 2) Per-band 2nd-order complex prediction transfer fit
@@ -1398,20 +1411,26 @@ fn hf_patch_simulator_qmf(o: &[f32], t: &[f32]) -> (BandCoherenceTable, BandCohe
 /// bandwidth-expanded LPC coefficients: near `(1,0,0)` means "reference is
 /// also just a plain copy here", taps with real weight on lag 1/2 mean a
 /// genuine order-2 transformation is present.
+/// `target_is_ours`: fit against our own decode (`o_spec`) instead of the
+/// reference's (`t_spec`) -- same `sim` (built from the reference's own low
+/// band either way), so the two calls' fitted taps are directly comparable:
+/// what transform sim would need to become ours vs. to become the reference.
 #[allow(clippy::needless_range_loop)] // fixed 3x3 complex Gaussian elimination, index math throughout
 fn hf_patch_transfer_fit(
     o: &[f32],
     t: &[f32],
     bands: &[usize],
+    target_is_ours: bool,
 ) -> Vec<(usize, [ec_dsp::Complex<f64>; 3])> {
-    let (_, t_spec, sim_spec) = qmf_domain_spec(o, t);
+    let (o_spec, t_spec, sim_spec) = qmf_domain_spec(o, t);
+    let target_spec = if target_is_ours { &o_spec } else { &t_spec };
     let mut results = Vec::new();
     for &band in bands {
         if band >= sim_spec.len() {
             continue;
         }
         let sim_raw = &sim_spec[band];
-        let ref_raw = &t_spec[band];
+        let ref_raw = &target_spec[band];
         let len = sim_raw.len().min(ref_raw.len());
         if len < 8 {
             continue;
@@ -2254,7 +2273,7 @@ fn sbr_real_library_matches_reference() {
             if std::env::var("EC_AAC_SBR_QMF_WITNESS").is_ok() && n >= 4_096 {
                 let win = &o[oa..oa + n];
                 let twin = &t[ob..ob + n];
-                let (vs_ref, vs_ours) = hf_patch_simulator_qmf(win, twin);
+                let (vs_ref, vs_ours, ours_vs_ref) = hf_patch_simulator_qmf(win, twin);
                 let mean_in = |rows: &[(usize, f64)], lo: usize, hi: usize| {
                     let vals: Vec<f64> = rows
                         .iter()
@@ -2285,14 +2304,37 @@ fn sbr_real_library_matches_reference() {
                     mean_in(&vs_ours, 14, 28),
                     mean_in(&vs_ours, 28, 43)
                 );
+                // (Round-48, Task 4a) the ultimate content-match witness:
+                // our HF QMF content directly against the reference's, no
+                // simulator step in between.
+                println!("  ch{ch} QMF-WITNESS ours-vs-REFERENCE per-band coherence (band, coh):");
+                for (b, coh) in &ours_vs_ref {
+                    println!("    band{b:>3}: {coh:.4}");
+                }
+                println!(
+                    "  ch{ch} QMF-WITNESS ours-vs-REFERENCE mean: even-gap[14,28)={:.4} odd-gap[28,43)={:.4}",
+                    mean_in(&ours_vs_ref, 14, 28),
+                    mean_in(&ours_vs_ref, 28, 43)
+                );
                 // (Round-46, Task 2) fitted sim-to-reference transfer, one
                 // representative band per patch plus a spread across the
                 // strong odd-gap patch (3,28,11) where the QMF witness shows
                 // sim-vs-reference clearing 0.5.
                 let fit_bands = [14, 18, 22, 26, 28, 30, 32, 34, 36, 38, 39, 42];
-                let fits = hf_patch_transfer_fit(win, twin, &fit_bands);
+                let fits_ref = hf_patch_transfer_fit(win, twin, &fit_bands, false);
                 println!("  ch{ch} TASK2 FIT ref[l]~=a0*sim[l]+a1*sim[l-1]+a2*sim[l-2]:");
-                for (b, a) in &fits {
+                for (b, a) in &fits_ref {
+                    println!(
+                        "    band{b:>3}: a0=({:>7.3},{:>7.3}) a1=({:>7.3},{:>7.3}) a2=({:>7.3},{:>7.3})",
+                        a[0].re, a[0].im, a[1].re, a[1].im, a[2].re, a[2].im
+                    );
+                }
+                // (Round-48, Task 2) same fit, target = ours: side by side
+                // with the above shows exactly what our transform does to
+                // the plain copy vs what the reference's does.
+                let fits_ours = hf_patch_transfer_fit(win, twin, &fit_bands, true);
+                println!("  ch{ch} TASK2 FIT ours[l]~=a0*sim[l]+a1*sim[l-1]+a2*sim[l-2]:");
+                for (b, a) in &fits_ours {
                     println!(
                         "    band{b:>3}: a0=({:>7.3},{:>7.3}) a1=({:>7.3},{:>7.3}) a2=({:>7.3},{:>7.3})",
                         a[0].re, a[0].im, a[1].re, a[1].im, a[2].re, a[2].im
