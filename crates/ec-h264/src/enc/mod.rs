@@ -71,6 +71,19 @@ pub struct EncoderConfig {
     pub threads: usize,
     /// Quantiser for constant-QP mode (`bitrate` zero).
     pub qp: i32,
+    /// 8x8 transform (High profile). Off by default.
+    ///
+    /// NOT SAFE TO SET YET: this only flips the SPS/PPS High-profile tail
+    /// (`profile_idc` 100, `transform_8x8_mode_flag`). Once the PPS carries
+    /// that flag, a conformant decoder unconditionally reads an extra
+    /// `transform_size_8x8_flag` per macroblock (7.3.5: every non-I16x16
+    /// intra macroblock, and every inter macroblock with a nonzero luma cbp —
+    /// see `decoder.rs:1151` and `:1789-1793`). Nothing in `enc::entropy` /
+    /// `enc::mb` writes that bit yet, so turning this on desyncs every real
+    /// stream (headers.rs's own tests only exercise the parameter sets, not a
+    /// full encode). Wiring that emission — and then the mode decision that
+    /// actually picks 8x8 blocks — is later work.
+    pub transform_8x8: bool,
 }
 
 impl EncoderConfig {
@@ -87,6 +100,7 @@ impl EncoderConfig {
             cabac: true,
             threads: 0,
             qp: 26,
+            transform_8x8: false,
         }
     }
 }
@@ -193,10 +207,11 @@ impl Encoder {
             timing,
             bitrate: cfg.bitrate,
             cabac: cfg.cabac,
+            transform_8x8: cfg.transform_8x8,
         };
         let sps_rbsp = write_sps(&seq);
         let sps = Sps::parse(&sps_rbsp)?;
-        let pps_rbsp = write_pps(cfg.cabac);
+        let pps_rbsp = write_pps(cfg.cabac, cfg.transform_8x8);
         let threads = if cfg.threads == 0 {
             std::thread::available_parallelism().map_or(1, |n| n.get())
         } else {
