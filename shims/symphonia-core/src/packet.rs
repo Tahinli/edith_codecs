@@ -13,6 +13,11 @@ pub struct Packet {
     pub dur: Duration,
     /// The coded bytes.
     pub data: Box<[u8]>,
+    /// The container's own end-of-packet position, in the track's time base,
+    /// when it states one — an Ogg page's granule above all, which is the
+    /// only way a Vorbis (or FLAC-in-Ogg) stream's true, un-rounded length
+    /// ever reaches the decoder: the codec's own bitstream never states it.
+    pub granule: Option<i64>,
 }
 
 impl Packet {
@@ -23,6 +28,7 @@ impl Packet {
             pts,
             dur,
             data: data.to_vec().into_boxed_slice(),
+            granule: None,
         }
     }
 

@@ -31,6 +31,37 @@ pub struct AudioDecoder {
     codec: CodecId,
     channels: usize,
     sample_rate: u32,
+    /// Raw interleaved frames the decoder has produced so far, before any
+    /// trim — the running clock the front-offset calculation below measures
+    /// against.
+    produced: i64,
+    /// Frames actually handed out to the caller so far.
+    emitted: i64,
+    /// `granule - produced` at the first packet whose granule is known: a
+    /// Vorbis stream's very first pages account for the encoder's pre-roll in
+    /// their granule, so this is the one-time head start (or catch-up) the
+    /// decoder's own count needed to line up with the container's.
+    ///
+    /// This is a front offset only. An *interior* page's granule marks where
+    /// the last packet completed *on that page* ends — not a ceiling every
+    /// later page's cumulative output must stay under, since packets can span
+    /// pages and pages can end mid-packet. Only the first granule (front) and
+    /// the last one (tail, at [`Self::flush`]) are trustworthy trim points.
+    trim_offset: Option<i64>,
+    /// The last granule [`Self::decode`] saw, carried into [`Self::flush`]
+    /// for the terminal packet's own trim: the flush call's packet (the
+    /// reader's synthetic end-of-stream marker) carries no granule of its own.
+    last_granule: Option<i64>,
+    /// The most recently decoded packet's own audio, held back one call
+    /// rather than handed to the caller straight away: Vorbis's terminal
+    /// packet routinely decodes real samples past the container's true final
+    /// granule (its own block reaches further than the stream actually
+    /// runs), and so does [`Self::flush`]'s un-overlapped tail on top of it.
+    /// Once a packet's audio has left this decoder there is nothing left to
+    /// trim it from, so the last packet's audio waits here — combined with
+    /// the flush tail — for [`Self::flush`] to cut both down to the file's
+    /// real length in one go.
+    held: Vec<f32>,
 }
 
 impl std::fmt::Debug for AudioDecoder {
@@ -109,6 +140,11 @@ impl AudioDecoder {
                 CodecId::Opus => 48_000,
                 _ => sample_rate,
             },
+            produced: 0,
+            emitted: 0,
+            trim_offset: None,
+            last_granule: None,
+            held: Vec::new(),
         })
     }
 
@@ -160,7 +196,103 @@ impl AudioDecoder {
             }
             Inner::Pcm(codec) => pcm(*codec, &packet.data, out),
         }
+        self.trim(ec_ogg::granule_of(packet), out);
+        // Only Vorbis holds real, un-overlapped state across a packet
+        // boundary that a stream-final granule can still need to reach into
+        // (see `held`'s own doc); every other codec here releases its audio
+        // the moment it is decoded, exactly as before, so a caller that never
+        // calls `flush` still gets every packet's worth back.
+        if matches!(self.inner, Inner::Vorbis(_)) {
+            std::mem::swap(&mut self.held, out);
+        }
+        self.emitted += out.len() as i64 / self.channels.max(1) as i64;
         Ok(())
+    }
+
+    /// The one-off front trim: only the very first packet this decoder ever
+    /// sees can carry a legitimate pre-roll offset (`granule` at real stream
+    /// position zero). Most containers' first *audio* packet carries no
+    /// granule at all — pages tend to end well into the block run — so once
+    /// any later packet is the first to reveal one, that granule is an
+    /// interior page mark, not a front offset: subtracting it from what has
+    /// already been decoded would blame ordinary block-to-block lag on a
+    /// pre-roll that was never there, and can trim away a whole packet's
+    /// worth of real audio. Every later packet passes through untouched — an
+    /// interior page's granule is not a per-page ceiling (see
+    /// [`Self::trim_offset`]); only [`Self::flush`]'s tail trim cuts again.
+    fn trim(&mut self, granule: Option<i64>, out: &mut Vec<f32>) {
+        let channels = self.channels.max(1) as i64;
+        let raw_frames = out.len() as i64 / channels;
+        if let Some(granule) = granule {
+            self.last_granule = Some(granule);
+            if self.trim_offset.is_none() {
+                if self.produced == 0 {
+                    let offset = (granule - raw_frames).max(0);
+                    self.trim_offset = Some(offset);
+                    if offset > 0 {
+                        let drop = (offset.min(raw_frames) * channels) as usize;
+                        out.drain(0..drop);
+                    }
+                } else {
+                    // Too late for a real front offset: this stream's first
+                    // audio packet already went by with no granule on it.
+                    self.trim_offset = Some(0);
+                }
+            }
+        }
+        self.produced += raw_frames;
+    }
+
+    /// Signal end of stream and take whatever the decoder was holding back.
+    ///
+    /// Every codec here that overlaps blocks (Vorbis above all: its terminal
+    /// block's un-overlapped right half is real audio up to the stream's
+    /// final granule, and is otherwise always exactly one hop short) needs
+    /// this told to it once the packets have run out, or the last hop never
+    /// comes out at all. `out` is cleared first, same as [`Self::decode`].
+    ///
+    /// [`Self::held`] (the last packet's own audio, never yet released) is
+    /// combined with whatever this call's own flush produces, and the pair
+    /// are cut down together to the stream's real final granule — the last
+    /// [`Self::decode`] call's packet is routinely the one this trim needs to
+    /// reach into, and once its audio had left this decoder that was no
+    /// longer possible.
+    pub fn flush(&mut self, out: &mut Vec<f32>) -> Result<()> {
+        out.clear();
+        match &mut self.inner {
+            Inner::Flac(d) => flush_drain(d.as_mut(), out)?,
+            Inner::Mp3(d) => flush_drain(d.as_mut(), out)?,
+            Inner::Vorbis(d) => flush_drain(d.as_mut(), out)?,
+            Inner::Ac3(d) => flush_drain(d.as_mut(), out)?,
+            // AAC, ALAC, Opus and PCM decode a packet at a time with nothing
+            // held back across the end of the file.
+            Inner::Aac(_) | Inner::Alac(_) | Inner::Opus(_) | Inner::Pcm(_) => {}
+        }
+        let channels = self.channels.max(1) as i64;
+        self.produced += out.len() as i64 / channels;
+        let mut combined = std::mem::take(&mut self.held);
+        combined.append(out);
+        self.trim_tail(&combined, out);
+        Ok(())
+    }
+
+    /// The terminal trim: the stream's last granule minus the front offset
+    /// is the file's true total frame count, so whatever `combined` (the
+    /// held-back last packet plus the flush tail) still has past that is
+    /// dropped rather than handed to the caller.
+    fn trim_tail(&mut self, combined: &[f32], out: &mut Vec<f32>) {
+        let channels = self.channels.max(1) as i64;
+        let raw_frames = combined.len() as i64 / channels;
+        let keep = match self.last_granule {
+            Some(granule) => {
+                let offset = self.trim_offset.unwrap_or(0);
+                let target = (granule - offset).max(0);
+                (target - self.emitted).clamp(0, raw_frames)
+            }
+            None => raw_frames,
+        };
+        out.extend_from_slice(&combined[..(keep * channels).max(0) as usize]);
+        self.emitted += keep;
     }
 
     /// Drop everything buffered from before a seek.
@@ -175,6 +307,11 @@ impl AudioDecoder {
             Inner::Opus(d) => d.reset(),
             Inner::Pcm(_) => {}
         }
+        self.held.clear();
+        self.produced = 0;
+        self.emitted = 0;
+        self.trim_offset = None;
+        self.last_granule = None;
     }
 }
 
@@ -219,6 +356,17 @@ fn is_pcm(codec: CodecId) -> bool {
 /// yields, converted to interleaved `f32`.
 fn drain(decoder: &mut dyn Decoder, packet: &Packet, out: &mut Vec<f32>) -> Result<()> {
     decoder.send_packet(packet)?;
+    drain_frames(decoder, out)
+}
+
+/// [`ec_core::Decoder::flush`], then every frame it releases because of it.
+fn flush_drain(decoder: &mut dyn Decoder, out: &mut Vec<f32>) -> Result<()> {
+    decoder.flush()?;
+    drain_frames(decoder, out)
+}
+
+/// Every frame currently ready, converted to interleaved `f32`.
+fn drain_frames(decoder: &mut dyn Decoder, out: &mut Vec<f32>) -> Result<()> {
     loop {
         match decoder.receive_frame() {
             Ok(Frame::Audio(frame)) => interleave(&frame, out),
