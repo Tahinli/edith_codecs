@@ -274,3 +274,67 @@ fn muxed_stream_is_alac_at_the_right_rate_and_ffmpeg_agrees() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+
+/// Encode through our encoder, decode through ours and (when installed) the
+/// reference decoder via a real m4a; both must hand back `samples` exactly.
+fn round_trip_both_decoders(channels: u8, samples: &[i32], allow_shift: bool, what: &str) {
+    let mut enc = AlacEncoder::new(48_000, channels, 24, 4096).expect("encoder");
+    enc.set_byte_shift(allow_shift);
+    let mut dec = AlacDecoder::new(*enc.cookie());
+    let shift = enc.cookie().container_shift();
+    let mut decoded = Vec::new();
+    for chunk in samples.chunks(4096 * channels as usize) {
+        decoded.extend(dec.decode(&enc.encode_frame(chunk)).expect("decode").iter().map(|&s| s >> shift));
+    }
+    assert_eq!(&decoded, samples, "{what}: {channels}ch 24-bit, shift={allow_shift}");
+
+    let (dir, out_path) = mux_to_m4a(&enc, channels as usize, 48_000, samples);
+    let got = ffmpeg_decode(&out_path, "s32le");
+    std::fs::remove_dir_all(&dir).ok();
+    let Some(got) = got else { return };
+    let want: Vec<u8> = samples.iter().flat_map(|&s| (s << 8).to_le_bytes()).collect();
+    assert!(got == want, "{what}: {channels}ch 24-bit, shift={allow_shift}: reference decode differs");
+}
+
+#[test]
+fn mono_24_bit_ramp_round_trips_bit_exactly() {
+    // A modular ramp whose wrap-around steps are wider than 2^23: the
+    // residual of that step needs 25 bits, one more than the 24-bit escape
+    // carries, so the encoder must wrap it the way the decoder does.
+    for n in [1015usize, 1016, 1024, 2048, 4096] {
+        let samples: Vec<i32> = (0..n).map(|i| ((i as i64 * 7919) % 8_000_000 - 4_000_000) as i32).collect();
+        for allow_shift in [true, false] {
+            round_trip_both_decoders(1, &samples, allow_shift, &format!("ramp n={n}"));
+        }
+    }
+}
+
+#[test]
+fn mono_24_bit_full_scale_alternating_round_trips() {
+    for n in [512usize, 4096] {
+        let samples: Vec<i32> = (0..n).map(|i| if i % 2 == 0 { 8_388_607 } else { -8_388_607 }).collect();
+        round_trip_both_decoders(1, &samples, true, &format!("alternating n={n}"));
+    }
+}
+
+#[test]
+fn fuzz_round_trips_bit_exactly() {
+    let mut rng = Rng(0x5eed_f00d);
+    for case in 0..200 {
+        let bit_depth = [16u8, 24][rng.next() as usize % 2];
+        let channels = [1u8, 2][rng.next() as usize % 2];
+        let n = 1 + rng.next() as usize % 4097;
+        let content = rng.next() % 4;
+        let full = (1i64 << (bit_depth - 1)) - 1;
+        let samples: Vec<i32> = (0..n * channels as usize)
+            .map(|i| match content {
+                0 => rng.range(bit_depth),
+                1 => ((i as i64 * 7919) % (2 * full) - full) as i32,
+                2 => if i % 2 == 0 { full as i32 } else { -full as i32 },
+                _ => (full as f64 * 0.9 * (i as f64 / 37.0).sin()) as i32,
+            })
+            .collect();
+        round_trip(48_000, channels, bit_depth, 4096, &samples);
+        eprintln!("case {case}: {bit_depth}bit {channels}ch n={n} content={content} ok");
+    }
+}

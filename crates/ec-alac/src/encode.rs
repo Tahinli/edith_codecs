@@ -115,6 +115,7 @@ fn golomb_write<S: BitSink>(sink: &mut S, n: u32, m: u32, k: u32, maxbits: u32) 
         sink.put(n, maxbits.max(1));
         return;
     }
+    debug_assert!(maxbits >= 32 || n >> maxbits == 0, "Golomb value {n} does not fit its {maxbits}-bit escape");
     let q = n / m;
     if q >= MAX_PREFIX {
         sink.put(u32::MAX, MAX_PREFIX);
@@ -193,16 +194,25 @@ fn rice_encode<S: BitSink>(sink: &mut S, cfg: &MagicCookie, pb_factor: u32, res:
 /// are never returned — the encoder always states an all-zero starting
 /// filter, so the decoder's own adaptation, run from the same zero start,
 /// retraces this pass exactly.
-fn analyze(y: &[i32], order: usize, den_shift: u32) -> Vec<i32> {
+///
+/// Every residual is wrapped to `chan_bits` exactly as `decode.rs`'s
+/// `predict` wraps its reconstruction (`clamp`, decode.rs:242): a difference
+/// of two in-range samples can need one bit more than the samples do, the
+/// Golomb escape carries only `chan_bits` of it, and the decoder's add then
+/// wraps the truncated value back to the right sample. Adapting on the
+/// unwrapped residual's sign would diverge from the decoder's walk.
+fn analyze(y: &[i32], order: usize, den_shift: u32, chan_bits: u32) -> Vec<i32> {
     let n = y.len();
     let mut res = vec![0i32; n];
     if n == 0 {
         return res;
     }
+    let chan_shift = 32 - chan_bits;
+    let wrap = |v: i32| ((v as u32) << chan_shift) as i32 >> chan_shift;
     res[0] = y[0];
     if order == ORDER_DIFF {
         for j in 1..n {
-            res[j] = y[j].wrapping_sub(y[j - 1]);
+            res[j] = wrap(y[j].wrapping_sub(y[j - 1]));
         }
         return res;
     }
@@ -216,7 +226,7 @@ fn analyze(y: &[i32], order: usize, den_shift: u32) -> Vec<i32> {
 
     let mut coefs = vec![0i32; order];
     for j in 1..=order {
-        res[j] = y[j].wrapping_sub(y[j - 1]);
+        res[j] = wrap(y[j].wrapping_sub(y[j - 1]));
     }
     let den_half = match den_shift {
         0 => 0,
@@ -229,7 +239,7 @@ fn analyze(y: &[i32], order: usize, den_shift: u32) -> Vec<i32> {
             sum = sum.wrapping_add(c.wrapping_mul(y[j - k].wrapping_sub(top)));
         }
         let predicted = top.wrapping_add(sum.wrapping_add(den_half) >> den_shift);
-        let del = y[j + 1].wrapping_sub(predicted);
+        let del = wrap(y[j + 1].wrapping_sub(predicted));
         res[j + 1] = del;
 
         let mut del0 = del;
@@ -279,7 +289,7 @@ fn best_candidate(cfg: &MagicCookie, y: &[i32], chan_bits: u32, pb_factor: u32) 
     orders.extend(ORDER_CANDIDATES.iter().copied().filter(|&o| o < y.len()));
     let mut best: Option<Candidate> = None;
     for order in orders {
-        let res = analyze(y, order, 9);
+        let res = analyze(y, order, 9, chan_bits);
         let mut cost = CostSink::default();
         rice_encode(&mut cost, cfg, pb_factor, &res, chan_bits);
         let bits = 16 + (order as u64) * 16 + cost.0;
@@ -469,6 +479,12 @@ impl AlacEncoder {
     /// `frame_length` is the samples-per-channel every full frame carries
     /// (Apple's own encoder writes 4096).
     pub fn new(sample_rate: u32, channels: u8, bit_depth: u8, frame_length: u32) -> Result<AlacEncoder> {
+        if !matches!(bit_depth, 16 | 24) {
+            return Err(Error::unsupported(
+                format!("ALAC encoding {bit_depth}-bit samples"),
+                "this encoder writes 16 and 24 bit only",
+            ));
+        }
         if !(1..=2).contains(&channels) {
             return Err(Error::unsupported(
                 format!("ALAC encoding {channels} channels"),
