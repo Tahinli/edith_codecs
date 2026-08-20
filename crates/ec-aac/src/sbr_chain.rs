@@ -383,9 +383,11 @@ impl SbrChain {
             for slot in 0..num_slots {
                 let mut v = [Complex::ZERO; SYNTHESIS_BANDS];
                 v[0..kx].copy_from_slice(&raw[slot][0..kx]);
-                for b in kx..k2 {
-                    if b - kx < hf.len() {
-                        v[b] = hf[b - kx][slot];
+                if std::env::var("EC_AAC_SBR_HF_BYPASS").is_err() {
+                    for b in kx..k2 {
+                        if b - kx < hf.len() {
+                            v[b] = hf[b - kx][slot];
+                        }
                     }
                 }
                 let mut pcm = state.synthesis.process_slot(&v);

@@ -11,7 +11,7 @@ use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use ec_aac::AacDecoder;
+use ec_aac::{AacDecoder, parse_audio_specific_config};
 use ec_core::{CodecId, Demuxer, Packet};
 use ec_matroska::MatroskaDemuxer;
 use ec_mp4::Mp4Demuxer;
@@ -1862,6 +1862,249 @@ fn residual_sideinfo_analysis(o: &[f32], t: &[f32], oa: usize, ob: usize, rate: 
         "    6. HF residual peakiness (max/mean over 4-bin groups): {:.3} (n={peak_n}) [near 1 = noise-like, larger = tonal]",
         avg(peak_sum, peak_n)
     );
+}
+
+/// Decodes one stream's core (AAC-LC) layer only, with SBR forced off at the
+/// `AudioSpecificConfig` level -- `sbr_present: false` never arms
+/// `BlockDecoder::sbr`, so `decode.rs`'s FIL-element branch never calls into
+/// `sbr_chain` at all and `out` (the raw core `channel_stream` decode) is
+/// handed back untouched, at the core rate. This isolates whether a
+/// real-file break lives in the LC core or in the SBR chain bolted onto it.
+fn our_decode_core_only(path: &Path, stream_index: usize) -> Option<(Vec<Vec<f32>>, u32)> {
+    let (asc, aus) = extract_aac_track(path, stream_index)?;
+    let mut cfg = parse_audio_specific_config(&asc).ok()?;
+    cfg.sbr_present = false;
+    cfg.ps_present = false;
+    cfg.extension_sample_rate = None;
+    let core_rate = cfg.sample_rate;
+    let mut decoder = AacDecoder::with_config(cfg);
+    let mut planes: Vec<Vec<f32>> = Vec::new();
+    for au in &aus {
+        let Ok(frame) = decoder.decode(au, None) else {
+            continue;
+        };
+        let ch = usize::from(frame.channels);
+        if ch == 0 {
+            continue;
+        }
+        if planes.is_empty() {
+            planes = vec![Vec::new(); ch];
+        }
+        for (i, v) in frame.samples.iter().enumerate() {
+            planes[i % ch].push(*v);
+        }
+        if planes[0].len() >= MAX_SAMPLES {
+            break;
+        }
+    }
+    if planes.is_empty() {
+        return None;
+    }
+    Some((planes, core_rate))
+}
+
+/// The reference decoder's decode of `absolute_stream`, resampled to
+/// `target_rate` -- used to compare against `our_decode_core_only`'s
+/// core-rate PCM directly instead of at the doubled SBR rate.
+fn ffmpeg_decode_at_rate(
+    path: &Path,
+    absolute_stream: usize,
+    channels: usize,
+    target_rate: u32,
+) -> Vec<Vec<f32>> {
+    let out = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args([
+            "-map",
+            &format!("0:{absolute_stream}"),
+            "-t",
+            "30",
+            "-ar",
+            &target_rate.to_string(),
+            "-f",
+            "f32le",
+            "-acodec",
+            "pcm_f32le",
+            "-",
+        ])
+        .output()
+        .expect("ffmpeg runs");
+    assert!(
+        out.status.success(),
+        "ffmpeg decode failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let samples: Vec<f32> = out
+        .stdout
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let mut planes = vec![Vec::with_capacity(samples.len() / channels.max(1)); channels];
+    for (i, &v) in samples.iter().enumerate() {
+        planes[i % channels].push(v);
+    }
+    planes
+}
+
+/// Root-cause triage (round-51): is a real file's SBR-chain break actually
+/// downstream of a broken LC core, or does the core decode cleanly and the
+/// break lives only in the SBR chain layered on top of it? Prints a
+/// core-rate correlation per channel; not asserted on, this is a diagnostic,
+/// not a regression gate (the asserted gate is
+/// `sbr_real_library_matches_reference`, which already covers the full-band
+/// SBR-reconstructed output).
+#[test]
+fn core_only_matches_reference() {
+    if !have_ffmpeg() {
+        eprintln!("SKIP: ffmpeg not on PATH");
+        return;
+    }
+    for c in &candidates() {
+        let Some((ours, core_rate)) = our_decode_core_only(&c.path, c.aac_stream) else {
+            eprintln!("SKIP {}: could not core-decode", c.path.display());
+            continue;
+        };
+        let theirs = ffmpeg_decode_at_rate(&c.path, c.ffmpeg_stream, ours.len(), core_rate);
+        println!(
+            "{} core-only ({} ch, {} Hz):",
+            c.path.display(),
+            ours.len(),
+            core_rate
+        );
+        for (ch, (o, t)) in ours.iter().zip(&theirs).enumerate() {
+            let (lag, corr) = best_lag_correlation(o, t);
+            println!("  ch{ch}: lag {lag}, corr {corr:.6}");
+        }
+    }
+}
+
+/// Round-51 triage: dumps `kx`/`k2` (the SBR crossover/top band) for the
+/// first several frames of every candidate, unconditionally (no ffmpeg
+/// needed) -- a wrong `kx` would corrupt bands BELOW the crossover too, not
+/// just the HF-generated ones, since `adjust()` gain-scales everything from
+/// `kx` up, and `kx` computed too low would pull real core content into
+/// that scaling.
+#[test]
+fn dump_sideinfo_kx() {
+    unsafe {
+        std::env::set_var("EC_AAC_SBR_SIDEINFO_DEBUG", "1");
+    }
+    for c in &candidates() {
+        let Some((asc, aus)) = extract_aac_track(&c.path, c.aac_stream) else {
+            continue;
+        };
+        let Ok(mut decoder) = AacDecoder::with_config_bytes(&asc) else {
+            continue;
+        };
+        let before = ec_aac::sbr_sideinfo_log().len();
+        for au in aus.iter().take(50) {
+            let _ = decoder.decode(au, None);
+        }
+        let rows = ec_aac::sbr_sideinfo_log();
+        println!("{}:", c.path.display());
+        for row in rows[before..].iter().filter(|r| r.ch == 0).take(6) {
+            println!(
+                "  frame={} source={} kx={} k2={} t_env={:?} f_high={:?}",
+                row.frame, row.source, row.kx, row.k2, row.t_env, row.f_high
+            );
+        }
+    }
+}
+
+/// Round-51 triage: FMJ's full-chain best-lag search (`LAG_MAX` = 4000)
+/// finds no usable alignment (|corr| ~0.02) even though the core-only
+/// decode matches almost exactly -- this widens the search far past
+/// `LAG_MAX` to see whether the true alignment just lies outside the normal
+/// bound (a large, rate-family-specific extra delay) rather than the SBR
+/// content itself being wrong.
+#[test]
+fn wide_lag_search_full_chain() {
+    if !have_ffmpeg() {
+        eprintln!("SKIP: ffmpeg not on PATH");
+        return;
+    }
+    for c in &candidates() {
+        let Some((ours, sbr, rate)) = our_decode(&c.path, c.aac_stream) else {
+            continue;
+        };
+        if sbr != ec_aac::SbrSupport::V1 {
+            continue;
+        }
+        let theirs = ffmpeg_decode(&c.path, c.ffmpeg_stream, ours.len());
+        let o = &ours[0];
+        let t = &theirs[0];
+        println!(
+            "{} ({} Hz): ours len={} theirs len={}",
+            c.path.display(),
+            rate,
+            o.len(),
+            t.len()
+        );
+        const COARSE: usize = 4096;
+        const WIDE_LAG_MAX: i64 = 200_000;
+        let mut best = (0i64, -1.0f64);
+        let mut lag = -WIDE_LAG_MAX;
+        while lag <= WIDE_LAG_MAX {
+            let (oa, ob) = if lag >= 0 {
+                (0usize, lag as usize)
+            } else {
+                ((-lag) as usize, 0usize)
+            };
+            if oa + COARSE <= o.len() && ob + COARSE <= t.len() {
+                let c = correlation(&o[oa..oa + COARSE], &t[ob..ob + COARSE]).abs();
+                if c > best.1 {
+                    best = (lag, c);
+                }
+            }
+            lag += 97; // odd stride so it doesn't alias against 2048-sample AU boundaries
+        }
+        println!("  widest coarse best: lag={} |corr|={:.4}", best.0, best.1);
+    }
+}
+
+/// Round-51 triage: compares OUR full-chain (SBR-reconstructed) output's
+/// low band directly against OUR OWN core-only decode of the same stream --
+/// no reference decoder involved. `v[0..kx]` in `sbr_chain.rs` is a literal
+/// copy of the same core analysis QMF data the core-only path also
+/// produces, so if the synthesis/gain-adjust stage is corrupting even that
+/// untouched region, this shows a real self-inconsistency with no external
+/// factor (alignment against a reference, different tool, etc.) to blame.
+#[test]
+fn full_chain_low_band_matches_own_core() {
+    for c in &candidates() {
+        let Some((core, core_rate)) = our_decode_core_only(&c.path, c.aac_stream) else {
+            continue;
+        };
+        let Some((full, sbr, full_rate)) = our_decode(&c.path, c.aac_stream) else {
+            continue;
+        };
+        if sbr != ec_aac::SbrSupport::V1 {
+            continue;
+        }
+        println!(
+            "{} (core {} Hz, full {} Hz):",
+            c.path.display(),
+            core_rate,
+            full_rate
+        );
+        for ch in 0..core.len().min(full.len()) {
+            // Naive nearest-neighbor 2x upsample of the core so it lines up
+            // sample-for-sample with the full-chain output's rate --
+            // crude, but a low-pass well below the core Nyquist erases the
+            // stairstep artifacts this introduces.
+            let up: Vec<f32> = core[ch].iter().flat_map(|&s| [s, s]).collect();
+            let cutoff = f64::from(core_rate) * 0.4;
+            let ol = lowpass(&full[ch], full_rate, cutoff);
+            let ul = lowpass(&up, full_rate, cutoff);
+            let (lag, corr) = best_lag_correlation(&ol, &ul);
+            println!("  ch{ch}: lag {lag}, corr {corr:.6}");
+            println!(
+                "  ch{ch} @ rate-independent QMF delay -897: corr {:.6}",
+                correlation_at_lag(&ol, &ul, -897)
+            );
+        }
+    }
 }
 
 fn candidates() -> Vec<Candidate> {
