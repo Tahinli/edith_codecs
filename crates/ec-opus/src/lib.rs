@@ -107,9 +107,19 @@ pub struct Decoder {
     prev_mode: Option<Mode>,
     prev_redundancy: bool,
     range_final: u32,
+    /// Test hook: drop the (CELT, SILK) layer's output before the sum.
+    debug_mute: (bool, bool),
 }
 
 impl Decoder {
+    /// Test hook, not for production use: silences the CELT and/or SILK
+    /// layer's contribution to the output (the decoder state still advances)
+    /// so a hybrid packet's two layers can be measured one at a time.
+    #[doc(hidden)]
+    pub fn debug_mute_layers(&mut self, celt: bool, silk: bool) {
+        self.debug_mute = (celt, silk);
+    }
+
     /// A decoder for `channels` channels at `sample_rate`, which must be one of
     /// 8000, 12000, 16000, 24000 or 48000 Hz.
     pub fn new(sample_rate: u32, channels: usize) -> Result<Decoder> {
@@ -144,6 +154,7 @@ impl Decoder {
             prev_mode: None,
             prev_redundancy: false,
             range_final: 0,
+            debug_mute: (false, false),
         })
     }
 
@@ -364,7 +375,10 @@ impl Decoder {
         }
 
         // Sum the two layers.
-        if mode != Mode::Celt {
+        if self.debug_mute.0 {
+            out.fill(0.0);
+        }
+        if mode != Mode::Celt && !self.debug_mute.1 {
             for (o, s) in out.iter_mut().zip(silk_pcm.iter()) {
                 *o += *s as f32 * (1.0 / 32768.0);
             }
