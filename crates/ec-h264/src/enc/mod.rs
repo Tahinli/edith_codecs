@@ -35,7 +35,8 @@ use ec_h264_syntax::{SliceType, Sps};
 
 use crate::decoder::deblock_picture;
 use crate::dpb::{Picture, SliceParams as DeblockParams};
-use crate::transform::LevelScale4x4;
+use crate::entropy::{FLAG_INTER, FLAG_TRANS8X8};
+use crate::transform::{LevelScale4x4, LevelScale8x8};
 
 use entropy::EncEntropy;
 use headers::{SeqParams, SliceParams, write_pps, write_slice_header, write_sps};
@@ -71,6 +72,19 @@ pub struct EncoderConfig {
     pub threads: usize,
     /// Quantiser for constant-QP mode (`bitrate` zero).
     pub qp: i32,
+    /// 8x8 transform (High profile). Off by default.
+    ///
+    /// NOT SAFE TO SET YET: this only flips the SPS/PPS High-profile tail
+    /// (`profile_idc` 100, `transform_8x8_mode_flag`). Once the PPS carries
+    /// that flag, a conformant decoder unconditionally reads an extra
+    /// `transform_size_8x8_flag` per macroblock (7.3.5: every non-I16x16
+    /// intra macroblock, and every inter macroblock with a nonzero luma cbp —
+    /// see `decoder.rs:1151` and `:1789-1793`). Nothing in `enc::entropy` /
+    /// `enc::mb` writes that bit yet, so turning this on desyncs every real
+    /// stream (headers.rs's own tests only exercise the parameter sets, not a
+    /// full encode). Wiring that emission — and then the mode decision that
+    /// actually picks 8x8 blocks — is later work.
+    pub transform_8x8: bool,
 }
 
 impl EncoderConfig {
@@ -87,6 +101,7 @@ impl EncoderConfig {
             cabac: true,
             threads: 0,
             qp: 26,
+            transform_8x8: false,
         }
     }
 }
@@ -125,6 +140,8 @@ pub struct Encoder {
     next_id: i32,
     /// True once a reference picture exists.
     have_reference: bool,
+    /// Macroblocks coded with transform_size_8x8_flag set: (intra, inter).
+    t8x8_mbs: (u64, u64),
 }
 
 /// A picture handed to the encoder: three planes, no padding assumptions.
@@ -193,10 +210,11 @@ impl Encoder {
             timing,
             bitrate: cfg.bitrate,
             cabac: cfg.cabac,
+            transform_8x8: cfg.transform_8x8,
         };
         let sps_rbsp = write_sps(&seq);
         let sps = Sps::parse(&sps_rbsp)?;
-        let pps_rbsp = write_pps(cfg.cabac);
+        let pps_rbsp = write_pps(cfg.cabac, cfg.transform_8x8);
         let threads = if cfg.threads == 0 {
             std::thread::available_parallelism().map_or(1, |n| n.get())
         } else {
@@ -227,11 +245,18 @@ impl Encoder {
             idr_pic_id: 0,
             next_id: 0,
             have_reference: false,
+            t8x8_mbs: (0, 0),
             cfg,
         })
     }
 
     /// The configuration in force.
+    /// Macroblocks coded so far with `transform_size_8x8_flag` set, as
+    /// `(intra, inter)`: the 8x8 transform's share of the stream.
+    pub fn transform_8x8_mbs(&self) -> (u64, u64) {
+        self.t8x8_mbs
+    }
+
     pub fn config(&self) -> &EncoderConfig {
         &self.cfg
     }
@@ -350,6 +375,15 @@ impl Encoder {
         }
         for (band, worker) in bands.iter().skip(1).zip(rest.iter()) {
             merge_band(master, worker, *band);
+        }
+        for &f in &master.mb_flags {
+            if f & FLAG_TRANS8X8 != 0 {
+                if f & FLAG_INTER != 0 {
+                    self.t8x8_mbs.1 += 1;
+                } else {
+                    self.t8x8_mbs.0 += 1;
+                }
+            }
         }
         deblock_picture(master);
         master.extend_borders();
@@ -484,7 +518,9 @@ fn code_band(pic: &mut Picture, job: BandJob<'_>) -> Vec<u8> {
         target_qp: job.qp,
         lambda: lambda_for(job.qp),
         preset: job.cfg.preset,
+        transform_8x8: job.cfg.transform_8x8,
         ls: LevelScale4x4::new(&[16; 16]),
+        ls8: LevelScale8x8::new(&[16; 64]),
         mb_ctx: crate::entropy::MbCtx::default(),
         skip_inc: 0,
         qp_delta_inc: 0,

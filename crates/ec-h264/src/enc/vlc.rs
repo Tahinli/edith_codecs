@@ -248,6 +248,49 @@ mod tests {
         }
     }
 
+    /// An 8x8 block written as four interleaved 4x4 blocks reads back through
+    /// the decoder's 4x4 path into the same 64 coefficients, with the
+    /// decoder's reassembly rule (`scan8[4 * i + i4] = scan[i]`).
+    #[test]
+    fn interleaved_8x8_round_trips() {
+        let mut state = 0xC0FF_EE00u32;
+        let mut rand = move |m: u32| {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            (state >> 16) % m
+        };
+        for _ in 0..200 {
+            let mut c8 = [0i32; 64];
+            for _ in 0..rand(64) {
+                let v = rand(70) as i32 + 1;
+                c8[rand(64) as usize] = if rand(2) == 0 { v } else { -v };
+            }
+            let mut w = BitWriter::new();
+            let mut tcs = [0u8; 4];
+            for j in 0..4 {
+                tcs[j] = write_residual_block(
+                    &mut w,
+                    &super::super::entropy::sub_block_4x4(&c8, j),
+                    16,
+                    j as i32 * 3,
+                );
+            }
+            w.write_bit(true);
+            w.align_to_byte();
+            let bytes = w.into_bytes();
+            let mut r = BitCursor::new(&bytes, 0);
+            let mut got = [0i32; 64];
+            for j in 0..4 {
+                let mut scan = [0i32; 16];
+                let tc = residual_block(&mut r, &mut scan, 16, j as i32 * 3).expect("decodes");
+                assert_eq!(tc, tcs[j]);
+                for i in 0..16 {
+                    got[4 * i + j] = scan[i];
+                }
+            }
+            assert_eq!(got, c8);
+        }
+    }
+
     /// Every block this writer emits decodes back to the same levels, over a
     /// spread that covers empty blocks, trailing ones, long runs, the
     /// suffix-length ladder and the escape codes.

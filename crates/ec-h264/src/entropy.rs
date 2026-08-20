@@ -55,6 +55,11 @@ pub(crate) enum BlockCat {
     ChromaDc(u8),
     /// ChromaACLevel, `ctxBlockCat` 4.
     ChromaAc,
+    /// LumaLevel8x8, `ctxBlockCat` 5: one 64-coefficient block under
+    /// transform_size_8x8_flag. CABAC codes it whole (no coded_block_flag for
+    /// 4:2:0); CAVLC never sees this category, it codes the block as four
+    /// interleaved `Luma4x4` blocks (7.3.5.3.1).
+    Luma8x8,
 }
 
 impl BlockCat {
@@ -64,6 +69,7 @@ impl BlockCat {
             BlockCat::LumaDc | BlockCat::Luma4x4 => 16,
             BlockCat::LumaAc | BlockCat::ChromaAc => 15,
             BlockCat::ChromaDc(_) => 4,
+            BlockCat::Luma8x8 => 64,
         }
     }
 
@@ -75,6 +81,7 @@ impl BlockCat {
             BlockCat::Luma4x4 => 2,
             BlockCat::ChromaDc(_) => 3,
             BlockCat::ChromaAc => 4,
+            BlockCat::Luma8x8 => 5,
         }
     }
 }
