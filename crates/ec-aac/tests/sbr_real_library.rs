@@ -2755,6 +2755,8 @@ fn sbr_real_library_matches_reference() {
             let high = if n >= 1024 {
                 let oh = highpass(&o[oa..oa + n], rate, c.crossover_hz);
                 let th = highpass(&t[ob..ob + n], rate, c.crossover_hz);
+                let rms = |v: &[f32]| (v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>() / v.len().max(1) as f64).sqrt();
+                println!("  ch{ch} above-crossover RMS ours/ref = {:.4}", rms(&oh) / rms(&th).max(1e-12));
                 correlation(&oh, &th)
             } else {
                 0.0
@@ -3004,6 +3006,25 @@ fn sbr_real_library_matches_reference() {
                 let win = &o[oa..oa + n];
                 let twin = &t[ob..ob + n];
                 let (vs_ref, vs_ours, ours_vs_ref) = hf_patch_simulator_qmf(win, twin);
+                // Per-QMF-band energy ratio and coherence, ours vs reference
+                // (the envelope-adjuster instrument: a level offset shows as
+                // a constant dB ratio, a gain-shape defect as per-band dB).
+                {
+                    let (o_spec, t_spec, _) = qmf_domain_spec(win, twin);
+                    println!("  ch{ch} QMF-BAND ours-vs-REFERENCE (band, ratio_dB, coherence):");
+                    for band in 0..o_spec.len().min(t_spec.len()).min(48) {
+                        let (mut eo, mut et, mut cr, mut ci) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+                        for (a, b) in o_spec[band].iter().zip(&t_spec[band]) {
+                            eo += a.norm_sqr();
+                            et += b.norm_sqr();
+                            let c = *a * b.conj();
+                            cr += c.re;
+                            ci += c.im;
+                        }
+                        let coh = (cr * cr + ci * ci).sqrt() / (eo * et).sqrt().max(1e-30);
+                        println!("    band{band:>3}: {:>7.2} dB  coh {coh:.4}", 10.0 * (eo / et.max(1e-30)).log10());
+                    }
+                }
                 let mean_in = |rows: &[(usize, f64)], lo: usize, hi: usize| {
                     let vals: Vec<f64> = rows
                         .iter()

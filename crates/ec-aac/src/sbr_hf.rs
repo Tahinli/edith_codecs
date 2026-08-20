@@ -124,45 +124,66 @@ pub struct Patch {
     pub width: usize,
 }
 
-/// Builds the patch list filling `[tables.kx, tables.k2)` from bands below
-/// `kx`, walking the source pointer down and wrapping it back to `kx` when
-/// exhausted. Deterministic: the same tables always produce the same patches.
+/// Patch construction, ISO/IEC 14496-3 §4.6.18.6.3 (Figure 4.31): source
+/// bands are read downward from `k0 = f_master[0]`, patches end on master
+/// borders, `goalSb = round(2048 kHz / fs)` bounds the first patch, and a
+/// trailing patch narrower than 3 bands is dropped.
 pub fn build_patches(tables: &BandTables) -> Vec<Patch> {
-    let kx = tables.kx as usize;
-    let k2 = tables.k2 as usize;
-    let f_high: Vec<usize> = tables.f_high.iter().map(|&b| b as usize).collect();
+    let kx = tables.kx;
+    let k2 = tables.k2;
+    let fm = &tables.f_master;
     let mut patches = Vec::new();
-    if kx == 0 || k2 <= kx {
+    if kx <= 0 || k2 <= kx || fm.len() < 2 {
         return patches;
     }
-    let mut msb = kx; // source read pointer, decreasing
-    let mut sb = kx; // target write pointer, increasing
-    while sb < k2 {
-        // Widest run of consecutive f_high intervals starting at `sb` whose
-        // total width still fits below the current source pointer.
-        let mut width = 0usize;
-        let mut probe = sb;
+    let k0 = fm[0];
+    let n_master = fm.len() - 1;
+    let goal_sb = ((1000i64 << 11) + i64::from(tables.rate >> 1)) / i64::from(tables.rate.max(1));
+    let mut k = if goal_sb < k2 {
+        fm.iter().position(|&b| b >= goal_sb).unwrap_or(n_master)
+    } else {
+        n_master
+    };
+    let (mut msb, mut usb) = (k0, kx);
+    let (mut last_k, mut last_msb) = (usize::MAX, i64::MIN);
+    let mut sb;
+    loop {
+        if k == last_k && msb == last_msb {
+            break; // construction failed; keep what we have
+        }
+        last_k = k;
+        last_msb = msb;
+        let mut odd = 0i64;
+        let mut i = k;
         loop {
-            let next_border = f_high.iter().find(|&&b| b > probe).copied();
-            let Some(border) = next_border else { break };
-            let iv = border - probe;
-            if width + iv > msb || border > k2 {
+            sb = fm[i];
+            odd = (sb + k0) & 1;
+            if i == 0 || sb <= k0 - 1 + msb - odd {
                 break;
             }
-            width += iv;
-            probe = border;
+            i -= 1;
         }
-        if width == 0 {
-            width = (k2 - sb).min(msb.max(1));
+        let width = (sb - usb).max(0);
+        if width > 0 {
+            patches.push(Patch {
+                source_start: (k0 - odd - width).max(0) as usize,
+                target_start: usb as usize,
+                width: width as usize,
+            });
+            usb = sb;
+            msb = sb;
+        } else {
+            msb = kx;
         }
-        let source_start = msb - width.min(msb);
-        patches.push(Patch {
-            source_start,
-            target_start: sb,
-            width,
-        });
-        sb += width;
-        msb = if source_start == 0 { kx } else { source_start };
+        if fm[k] - sb < 3 {
+            k = n_master;
+        }
+        if sb == k2 || patches.len() > 6 {
+            break;
+        }
+    }
+    if patches.len() > 1 && patches.last().is_some_and(|p| p.width < 3) {
+        patches.pop();
     }
     patches
 }
