@@ -36,6 +36,7 @@ mod sbr_env;
 mod sbr_hf;
 mod sbr_payload;
 pub mod sbr_qmf;
+mod sbr_qmf_window;
 mod sbr_tables;
 pub mod tables;
 
