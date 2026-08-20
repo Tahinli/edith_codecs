@@ -80,6 +80,8 @@ pub struct I420_16 {
     pub width: u32,
     /// Height in luma samples.
     pub height: u32,
+    /// Luma bit depth: always 10 for this format.
+    pub bit_depth: u8,
 }
 
 impl Frame {
@@ -214,6 +216,7 @@ impl Frame {
             v: vec![0; cw * ch],
             width: self.display_size.0,
             height: self.display_size.1,
+            bit_depth: 10,
         };
 
         self.with_planes(|mapped| {
@@ -433,5 +436,91 @@ mod tests {
         i420_to_nv12(&i420, &mut y2, y_pitch, &mut uv2, uv_pitch);
         let back = nv12_to_i420(&y2, y_pitch, &uv2, uv_pitch, w, h);
         assert_eq!(back, i420);
+    }
+
+    /// `to_i420_16` is the lossless 10-bit readback: samples that collapse
+    /// together under 8-bit truncation (`512 >> 2 == 513 >> 2 == 128`) must
+    /// survive distinctly. Skips when there is no VA device, the same gate the
+    /// live GPU tests use.
+    #[test]
+    fn p010_readback_preserves_ten_bits() {
+        let Ok(display) = ec_va::Display::open() else {
+            eprintln!("skipped: no VA display");
+            return;
+        };
+        let (w, h) = (4u32, 4u32);
+        let pool =
+            crate::pool::SurfacePool::new(&display, &ec_va::SurfaceSpec::p010(w, h), 1)
+                .expect("P010 surface pool");
+        let surface = pool.acquire().expect("surface from pool");
+
+        // Synthetic P010: 10-bit samples packed into the high bits of each
+        // u16, exactly how the decoder's P010 surfaces carry them. 512 and 513
+        // both truncate to 128 in 8-bit, so they prove the 16-bit path is not
+        // silently losing the low bits.
+        let y_samples = [512u16, 513, 1023, 5];
+        let mut image = Image::create(&display, VA_FOURCC_P010, w, h).expect("P010 upload image");
+        {
+            let mut mapped = image.map().expect("map upload image");
+            let y_pitch = mapped.pitch(0).expect("luma pitch") as usize;
+            let uv_pitch = mapped.pitch(1).expect("chroma pitch") as usize;
+            if let Some(dst) = mapped.plane_mut(0) {
+                for row in 0..h as usize {
+                    for col in 0..w as usize {
+                        let sample = y_samples[(row * w as usize + col) % y_samples.len()] << 6;
+                        let b = sample.to_le_bytes();
+                        let o = row * y_pitch + col * 2;
+                        dst[o] = b[0];
+                        dst[o + 1] = b[1];
+                    }
+                }
+            }
+            if let Some(dst) = mapped.plane_mut(1) {
+                let (u, v) = (512u16 << 6, 1023u16 << 6);
+                let ub = u.to_le_bytes();
+                let vb = v.to_le_bytes();
+                for row in 0..h as usize / 2 {
+                    for col in 0..w as usize / 2 {
+                        let o = row * uv_pitch + col * 4;
+                        dst[o] = ub[0];
+                        dst[o + 1] = ub[1];
+                        dst[o + 2] = vb[0];
+                        dst[o + 3] = vb[1];
+                    }
+                }
+            }
+        }
+        surface.write_from(&image, w, h).expect("P010 upload");
+
+        let frame = Frame::new(
+            surface,
+            Arc::new(Mutex::new(None)),
+            0,
+            (w, h),
+            (w, h),
+            10,
+            None,
+        );
+
+        let i16 = frame.to_i420_16().expect("to_i420_16");
+        let i8 = frame.to_i420().expect("to_i420");
+
+        assert_eq!(i16.width, w);
+        assert_eq!(i16.height, h);
+        assert_eq!(i16.bit_depth, 10);
+        let want_y: Vec<u16> = (0..w as usize * h as usize)
+            .map(|i| y_samples[i % y_samples.len()])
+            .collect();
+        assert_eq!(
+            i16.y, want_y,
+            "16-bit luma must preserve the 10-bit samples"
+        );
+        let want_y8: Vec<u8> = want_y.iter().map(|&s| (s >> 2) as u8).collect();
+        assert_eq!(i8.y, want_y8, "8-bit luma must be the >> 2 truncation");
+
+        assert_eq!(i16.u, vec![512u16; 4]);
+        assert_eq!(i16.v, vec![1023u16; 4]);
+        assert_eq!(i8.u, vec![128u8; 4]);
+        assert_eq!(i8.v, vec![255u8; 4]);
     }
 }
