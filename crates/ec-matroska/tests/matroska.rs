@@ -49,6 +49,42 @@ fn aac_priming_round_trips_through_codec_delay() {
     );
 }
 
+/// A TrueHD track written by this crate's own muxer reads back as TrueHD:
+/// `A_TRUEHD` round trips through demux -> mux -> demux with the packets
+/// intact.
+#[test]
+fn truehd_codec_id_round_trips_through_remux() {
+    let rate = TimeBase::from_rate(48_000);
+    let mut info = StreamInfo::new(0, rate, ec_core::CodecParameters::new(CodecId::TrueHd));
+    if let MediaParameters::Audio(a) = &mut info.params.media {
+        a.sample_rate = 48_000;
+        a.layout = ec_core::ChannelLayout::Surround7_1;
+    }
+
+    let src = work().join("truehd-source.mkv");
+    let mut muxer = MatroskaMuxer::new(File::create(&src).expect("output"));
+    let stream = muxer.add_stream(info).expect("stream declared");
+    for i in 0..5i64 {
+        let mut packet = Packet::new(stream, rate, vec![0xAAu8; 32]);
+        packet.pts = Some(i * 40);
+        packet.flags.keyframe = true;
+        muxer.write_packet(&packet).expect("packet written");
+    }
+    muxer.finish().expect("finished");
+
+    let dst = work().join("truehd-remuxed.mkv");
+    let packets = remux(&src, &dst);
+    assert_eq!(packets, 5, "every packet carried across the remux");
+
+    let demuxer =
+        MatroskaDemuxer::new(BufReader::new(File::open(&dst).expect("opens"))).expect("reopens");
+    assert_eq!(
+        demuxer.streams()[0].params.codec,
+        CodecId::TrueHd,
+        "A_TRUEHD survives demux -> mux -> demux"
+    );
+}
+
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures")
 }

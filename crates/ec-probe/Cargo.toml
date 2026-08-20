@@ -18,4 +18,5 @@ ec-mp4 = { workspace = true }
 ec-ogg = { workspace = true }
 ec-opus = { workspace = true }
 ec-riff = { workspace = true }
+ec-truehd = { workspace = true }
 ec-vorbis = { workspace = true }
