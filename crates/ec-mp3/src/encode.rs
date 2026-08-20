@@ -524,8 +524,20 @@ impl Mp3Encode {
         history[keep..].copy_from_slice(&mono[mono.len() - n..]);
     }
 
-    /// Allowed noise per long scalefactor band, from the masking model.
+    /// Allowed noise per long scalefactor band, from the masking model, in
+    /// the units `code_with` measures quantisation noise in (summed squared
+    /// MDCT lines), so noise / threshold is a noise-to-mask ratio.
+    ///
+    /// The FFT here is unnormalised: for input of mean-square power P, a
+    /// 1024-point transform of the sine-windowed block (sum of w^2 = N/2) has
+    /// per-bin power N/2 * P = 512 P. The analysis filterbank is unity gain
+    /// and splits P across 32 subbands (P/32 each), and `mdct_long` scales by
+    /// 1/9 with a 36-point sine window (sum of w^2 cos^2 = 9), so each of a
+    /// subband's 18 lines carries P/32 * 9/81 = P/288. A band of W lines
+    /// spans W * 512/576 FFT bins: FFT energy / MDCT energy =
+    /// (W * 8/9 * 512 P) / (W * P/288) = 2^17, the `FFT_TO_MDCT` below.
     fn psy_threshold(&mut self, ch: usize) -> Vec<f32> {
+        const FFT_TO_MDCT: f32 = 1.0 / 131072.0;
         let mut block: Vec<f32> = self.psy_history[ch].clone();
         self.fft_window.apply(&mut block);
         let mut spectrum = vec![ec_dsp::Complex::<f32>::ZERO; 513];
@@ -553,7 +565,7 @@ impl Mp3Encode {
                 1.0
             };
             let offset_db = 6.0 + 15.0 * (1.0 - flatness);
-            *slot = sum * 10f32.powf(-offset_db / 10.0);
+            *slot = sum * FFT_TO_MDCT * 10f32.powf(-offset_db / 10.0);
         }
         // Spreading: masking leaks upward strongly and downward weakly.
         let mut spread = energy.clone();
@@ -568,7 +580,7 @@ impl Mp3Encode {
         // Absolute threshold, coarse: hearing is least sensitive at the ends.
         for (band, slot) in spread.iter_mut().enumerate() {
             let rel = band as f32 / SFB_LONG as f32;
-            let floor = 1e-9 * (1.0 + 400.0 * (rel - 0.35).max(0.0).powi(2));
+            let floor = 1e-9 * FFT_TO_MDCT * (1.0 + 400.0 * (rel - 0.35).max(0.0).powi(2));
             *slot = slot.max(floor);
         }
         spread
@@ -903,12 +915,14 @@ fn mdct_short(input: &[f32; 36], out: &mut [f32]) {
 /// granule costs more bits); a lower quality raises it. 0.5 is neutral.
 fn quality_threshold(threshold: &[f32], quality: f32) -> Vec<f32> {
     let q = quality.clamp(0.0, 1.0);
-    // The psychoacoustic threshold is in the unnormalised FFT's power units,
-    // the quantisation noise in MDCT units, so the 0.5 point carries the unit
-    // gap plus the masking margin. corner-cut: -48 dB is the calibration that
-    // lands wav16-* VBR at its 192 kbit/s mean; a normalised threshold would
-    // make it a plain margin.
-    let db = (0.5 - q) * 24.0 - 48.0;
+    // The mapping: 24 dB of noise-to-mask margin across the quality range.
+    // Its centre sits 4 dB over the mask, because the model's mask is
+    // conservative (its flatness-derived offset lands 11-13 dB under white
+    // noise where 6 dB is the noise-like figure); 4 dB is what puts q = 0.5
+    // at `bitrate_for_quality(0.5)` on mp3src-stereo-48000 and two real
+    // stereo tracks (210-225 kbit/s, decoding above the CBR-192 bar; 5 dB
+    // gave 195-208 but slipped under that bar, 6 dB gave 170-189).
+    let db = (0.5 - q) * 24.0 + 4.0;
     let scale = 10f32.powf(db / 10.0);
     threshold.iter().map(|&t| t * scale).collect()
 }
@@ -952,11 +966,19 @@ fn quantise_granule(
         if spent * 20 > target_bits * 19 {
             break; // the budget is spent; amplifying now only coarsens
         }
-        let chosen: Vec<usize> = if over.is_empty() {
-            order.iter().copied().take(3).collect()
-        } else {
-            over
-        };
+        // Bands over their mask get the bits first, worst three per round so
+        // the rate loop re-fits `global_gain` around a small step; once every
+        // band is under its mask the spare bits go to the noisiest ones.
+        // corner-cut: the ISO outer loop keeps amplifying over-mask bands past
+        // the budget and lets the rate loop coarsen the rest; measured here it
+        // costs 12-36% RMS against the source (mp3src-stereo-48000, 128/192)
+        // for a model this coarse, and the encode_matrix bar is an RMS metric.
+        // Upgrade path: a finer model (ISO spreading function, tonality from
+        // phase prediction) before trusting the mask over the budget.
+        let chosen: Vec<usize> = if over.is_empty() { order } else { over }
+            .into_iter()
+            .take(3)
+            .collect();
         if chosen.is_empty() {
             break;
         }
@@ -1428,6 +1450,36 @@ mod tests {
     /// The delay the Info tag states is the delay the pipeline has. Our own
     /// decoder ignores the tag, so what it hands back is the untrimmed stream:
     /// the content starts exactly `ENCODER_DELAY + DECODER_DELAY` samples in.
+    /// The mask is stated in the quantiser's noise units: on white noise the
+    /// band energy of the MDCT sits the signal-to-mask offset (6 dB, plus
+    /// what the flatness estimate adds) above the threshold, not 2^17 away.
+    #[test]
+    fn masking_threshold_is_in_mdct_power_units() {
+        let mut core = Mp3Encode::new(48000, 1, 128, None).unwrap();
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut noise = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 40) as f32 / 8_388_608.0 - 1.0
+        };
+        for _ in 0..8 {
+            let pcm: Vec<f32> = (0..1152).map(|_| 0.25 * noise()).collect();
+            core.encode_block(&pcm);
+        }
+        let granule = core.pending.last().unwrap().clone();
+        let xr = core.mdct(0, &granule.subband, 0);
+        let starts = long_starts(48000);
+        let mut sum = 0.0f32;
+        for band in 3..16 {
+            let (from, to) = (usize::from(starts[band]), usize::from(starts[band + 1]));
+            let energy: f32 = xr[from..to].iter().map(|v| v * v).sum();
+            sum += 10.0 * (energy / granule.threshold[band]).log10();
+        }
+        let db = sum / 13.0;
+        assert!((6.0..=18.0).contains(&db), "signal sits {db:.1} dB over its mask");
+    }
+
     #[test]
     fn encoder_delay_is_what_the_tag_says() {
         for (rate, channels) in [(44100u32, 1usize), (48000, 2)] {
