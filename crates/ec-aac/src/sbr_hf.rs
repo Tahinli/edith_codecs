@@ -64,6 +64,24 @@ use ec_dsp::Complex;
 /// unrotated is what actually matches it. This function is kept (and
 /// pinned by its own unit tests) purely to document that convention as
 /// intentional, not to be called from `generate`'s patch-copy site.
+///
+/// Round-46 raised a re-trial candidate: `EC_AAC_SBR_PARITY_SPLIT` (an 8-bin
+/// STFT metric) had been suspected untrustworthy at this precision, and a
+/// QMF-exact fit of the reference decoder's own HF content on patch
+/// `(3,28,11)` (gap 25, `mod 4 == 1`) found a transfer with this function's
+/// quarter-turn phase signature. Round-47 re-applied the rotation at
+/// `generate`'s patch-copy site (env-gated, both signs) and re-judged with
+/// `EC_AAC_SBR_QMF_WITNESS`'s own QMF-domain coherence table instead of the
+/// STFT one -- the trustworthy instrument the re-trial was chartered to use.
+/// Both signs made sim-vs-ours coherence on patch `(3,28,11)` WORSE, not
+/// better (band28 0.2628 unrotated -> 0.0161 rotated -> 0.0282 flipped;
+/// band38 0.0669 -> 0.0694 -> 0.1068), moving further from the reference's
+/// 0.42-0.79 rather than toward it, refuting round-46's fit-based
+/// prediction under the very instrument that was supposed to vindicate it.
+/// (One sign did nudge whole-file full-band correlation up rather than
+/// round-36's dip, but that's moot once the witness itself disagrees.) The
+/// verdict stands as round-37 left it: `generate`'s patch-copy site keeps
+/// the plain, unrotated copy.
 /// Returns the signed number of `pi/2` quarter-turns per QMF slot that
 /// *would* need to be applied to restore frequency-pure placement.
 #[allow(dead_code)] // documentation of the characterized convention; tests call it
