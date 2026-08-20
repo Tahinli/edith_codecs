@@ -561,21 +561,31 @@ fn busy(channels: usize, rate: u32, samples: usize) -> Vec<Vec<f32>> {
 /// does.
 #[test]
 fn onset_after_silence_has_no_pre_echo() {
-    // Two onsets: one off the block grid (0.9137 s lands mid short block) and
-    // one on it. The gap is measured over the WHOLE silence up to the onset,
-    // so a leak in the last few hundred samples before it cannot hide behind a
-    // guard band, and the peak is barred too.
+    // Onsets swept by phase (fractions of a second, so they land anywhere
+    // relative to the long hop) and by offset from the long-hop grid itself,
+    // since the short run's placement is decided per hop. Stereo carries
+    // distinct content per channel — a different tone on the right, starting
+    // 11 samples later — so coupling cannot hide a per-channel leak. The gap
+    // is measured over the WHOLE silence up to the onset, so a leak in the
+    // last few hundred samples before it cannot hide behind a guard band, and
+    // the peak is barred too.
+    let amp = 0.7f64;
     for rate in [44_100u32, 48_000] {
-        for channels in [1usize, 2] {
-            for onset_s in [0.9137f64, 1.0] {
-                let onset = (onset_s * f64::from(rate)) as usize;
+        let grid = 16 * 1024usize;
+        let onsets = [0.3333f64, 0.5, 0.7321, 0.9137, 1.0]
+            .into_iter()
+            .map(|s| (s * f64::from(rate)) as usize)
+            .chain([0usize, 37, 512, 1000, 1023].into_iter().map(|o| grid + o));
+        for onset in onsets {
+            for channels in [1usize, 2] {
                 let tone_len = rate as usize;
-                let mut source = vec![vec![0.0f32; onset + tone_len]; channels];
-                for i in 0..tone_len {
-                    let t = i as f64 / f64::from(rate);
-                    let v = (0.7 * (2.0 * std::f64::consts::PI * 1_000.0 * t).sin()) as f32;
-                    for plane in &mut source {
-                        plane[onset + i] = v;
+                let mut source = vec![vec![0.0f32; onset + tone_len + 11]; channels];
+                for (c, plane) in source.iter_mut().enumerate() {
+                    let hz = 1_000.0 + 370.0 * c as f64;
+                    let start = onset + 11 * c;
+                    for i in 0..tone_len {
+                        let t = i as f64 / f64::from(rate);
+                        plane[start + i] = (amp * (2.0 * std::f64::consts::PI * hz * t).sin()) as f32;
                     }
                 }
                 let name = format!("onset-{rate}-{channels}ch-{onset}.ogg");
@@ -607,7 +617,7 @@ fn onset_after_silence_has_no_pre_echo() {
                             gap_rms <= 0.002 * tone_rms,
                             "{name}/{label} ch{c}: gap RMS {gap_rms:.6} vs tone RMS {tone_rms:.6}"
                         );
-                        assert!(peak <= 0.007, "{name}/{label} ch{c}: gap peak {peak:.4}");
+                        assert!(f64::from(peak) <= 0.01 * amp, "{name}/{label} ch{c}: gap peak {peak:.4}");
                     }
                 };
                 let (ours, _) = our_decode(&path);
