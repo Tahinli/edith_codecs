@@ -38,17 +38,21 @@
 //! raw copy (`X_high[l] = X_src[l] + bw*a1*X_src[l-1] + bw^2*a2*X_src[l-2]`).
 //! That version compiled, passed its own unit test, and is *closer* to a
 //! literal spec transcription -- but measured reproducibly WORSE on real
-//! content: full-band correlation against the reference decoder on
-//! Nikbinler dropped 0.972474->0.963863 (ch0) and 0.969785->0.961027 (ch1),
-//! same direction on below-crossover and whole-file windowed-mean
-//! correlation too (round-50 A/B, ledger-recorded). This module reverted to
-//! the all-pole structure documented above on that measurement, not on the
-//! spec reading: the bar this project holds itself to is matching the
-//! reference decoder's actual output, and a from-memory "more spec-literal"
-//! label does not outrank it. The feed-forward alternative and its
-//! discriminating unit test remain in history (commit 8bc305b) as the
-//! documented alternative, should some other change in this pipeline ever
-//! make it the better match.
+//! content, then (round-50) and again re-tried and re-lost (later round)
+//! after `sbr_qmf` became the normative ISO/IEC 14496-3 4.6.18.4/4.6.18.8.2
+//! bank rather than the earlier fitted Kaiser one -- so the QMF bank change
+//! was not the missing piece either. Full-band correlation against the
+//! reference decoder on Nikbinler: 0.986993/0.986238 (all-pole, ch0/ch1) vs
+//! 0.965566/0.965680 (feed-forward); FMJ: 0.997880/0.993373 (all-pole) vs
+//! 0.994118/0.983006 (feed-forward); synthetic 48k-family above-crossover
+//! band also regresses under feed-forward (e.g. 0.9882->0.9646 at 48k/48kbps).
+//! This module keeps the all-pole structure documented above on that
+//! measurement, not on the spec reading: the bar this project holds itself
+//! to is matching the reference decoder's actual output, and a from-memory
+//! "more spec-literal" label does not outrank it. The feed-forward
+//! alternative and its discriminating unit test remain in history (commit
+//! 8bc305b) as the documented alternative, should some other change in this
+//! pipeline ever make it the better match.
 
 use crate::sbr_bands::BandTables;
 use ec_dsp::Complex;
