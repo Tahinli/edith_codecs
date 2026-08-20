@@ -10,7 +10,7 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use ec_core::Demuxer;
+use ec_core::{Decoder, Demuxer, Frame};
 use ec_ogg::{OggDemuxer, granule_of};
 use ec_vorbis::{EncoderConfig, VorbisDecoder, VorbisEncoder};
 
@@ -415,6 +415,103 @@ fn encoded_streams_decode_cleanly_at_the_stated_length() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The `Decoder` trait's own EOS path — `send_packet`/`receive_frame` until
+/// exhausted, then `flush` — has to deliver the terminal block's last hop:
+/// without it, decode is always exactly one hop short of the encoded length.
+#[test]
+fn flush_delivers_the_terminal_hop() {
+    let rate = 48_000u32;
+    let hop = 1024usize;
+    // Not a multiple of the hop, so the tail block's un-overlapped half is
+    // the only place these trailing samples can come from.
+    let samples = rate as usize * 2 + 777;
+    let source = tones(2, rate, samples);
+    let path = encode_to_file(&source, rate, 128_000, "flush-tail.ogg");
+
+    let mut demuxer = OggDemuxer::open(File::open(&path).expect("open")).expect("ogg");
+    let stream = demuxer
+        .streams()
+        .iter()
+        .find(|s| s.params.codec == ec_core::CodecId::Vorbis)
+        .expect("a Vorbis stream")
+        .clone();
+    let extradata = stream.params.extradata.clone().expect("headers");
+    let mut decoder = VorbisDecoder::from_extradata(&extradata).expect("headers parse");
+
+    let mut planes: Vec<Vec<f32>> = Vec::new();
+    let mut offset: Option<i64> = None;
+    let mut last_granule = 0i64;
+    let mut produced = 0i64;
+    let push_frame = |frame: ec_core::AudioFrame, planes: &mut Vec<Vec<f32>>| {
+        if planes.is_empty() {
+            *planes = vec![Vec::new(); frame.channels()];
+        }
+        for (channel, plane) in planes.iter_mut().enumerate() {
+            let bytes = &frame.data[channel];
+            for chunk in bytes.chunks_exact(4).take(frame.samples) {
+                plane.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+            }
+        }
+        frame.samples as i64
+    };
+    loop {
+        let packet = match demuxer.next_packet() {
+            Ok(packet) => packet,
+            Err(e) if e.is_eof() => break,
+            Err(e) => panic!("demux: {e}"),
+        };
+        if packet.stream != stream.index {
+            continue;
+        }
+        decoder.send_packet(&packet).expect("send_packet");
+        loop {
+            match decoder.receive_frame() {
+                Ok(Frame::Audio(frame)) => produced += push_frame(frame, &mut planes),
+                Ok(Frame::Video(_)) => unreachable!("Vorbis decodes to audio only"),
+                Err(e) if e.is_need_more() => break,
+                Err(e) => panic!("receive_frame: {e}"),
+            }
+        }
+        if let Some(granule) = granule_of(&packet) {
+            if offset.is_none() {
+                offset = Some(granule - produced);
+            }
+            last_granule = granule;
+        }
+    }
+    decoder.flush().expect("flush");
+    loop {
+        match decoder.receive_frame() {
+            Ok(Frame::Audio(frame)) => {
+                let _ = push_frame(frame, &mut planes);
+            }
+            Ok(Frame::Video(_)) => unreachable!("Vorbis decodes to audio only"),
+            Err(e) if e.is_eof() => break,
+            Err(e) => panic!("receive_frame after flush: {e}"),
+        }
+    }
+    let offset = offset.unwrap_or(0);
+    let front = (-offset).max(0) as usize;
+    let end = (last_granule - offset).max(0) as usize;
+    for plane in &mut planes {
+        let end = end.min(plane.len());
+        let front = front.min(end);
+        *plane = plane[front..end].to_vec();
+    }
+
+    for (channel, plane) in planes.iter().enumerate() {
+        assert_eq!(
+            plane.len(),
+            samples,
+            "ch{channel}: expected exactly {samples} samples out"
+        );
+        let tail_ours = &plane[samples - (hop - 1)..];
+        let tail_source = &source[channel][samples - (hop - 1)..];
+        let corr = correlation(tail_ours, tail_source);
+        assert!(corr > 0.99, "ch{channel}: tail hop corr {corr:.4}");
+    }
 }
 
 #[test]
