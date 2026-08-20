@@ -388,8 +388,11 @@ impl CeltEncoder {
     /// Encodes one frame of interleaved `f32` (`frame_size` samples per
     /// channel at 48 kHz, one of 120/240/480/960 — of which
     /// `frame_size/upsample` are read from `pcm`) into `enc`, which must have
-    /// been `reset` to the frame's byte budget. `end` bounds the coded bands,
-    /// which is how the caller limits the coded bandwidth. With
+    /// been `reset` to the frame's byte budget. `start..end` bounds the coded
+    /// bands — `end` is how the caller limits the coded bandwidth, `start`
+    /// (0, or 17 under a hybrid packet's SILK layer) skips the low bands
+    /// exactly as the decoder's `start_band` does: no energy, no shapes, no
+    /// postfilter bit, allocation over the coded span only. With
     /// `vbr_rate_bps` set, the frame may be shrunk below that budget
     /// (constrained VBR); the return value is the final frame size in bytes.
     pub fn encode(
@@ -397,6 +400,7 @@ impl CeltEncoder {
         enc: &mut RangeEncoder,
         pcm: &[f32],
         frame_size: usize,
+        start: usize,
         end: usize,
         vbr_rate_bps: u32,
     ) -> Result<usize> {
@@ -422,7 +426,7 @@ impl CeltEncoder {
                 pcm.len()
             )));
         }
-        let (start, end) = (0usize, end.clamp(1, NB_BANDS));
+        let end = end.clamp(start + 1, NB_BANDS);
 
         let mut nb_compressed = enc.storage();
         let mut nb_available = nb_compressed as i32;
@@ -485,7 +489,13 @@ impl CeltEncoder {
         }
 
         // --- Silence flag (first symbol of the frame) -----------------------
-        enc.enc_bit_logp(silence, 15);
+        // Only exists when CELT opens the stream (decoder: `tell == 1`); under
+        // a hybrid packet's SILK layer the frame is never flagged silent.
+        if enc.tell() == 1 {
+            enc.enc_bit_logp(silence, 15);
+        } else {
+            silence = false;
+        }
         if silence {
             if vbr_rate > 0 {
                 nb_compressed = nb_compressed.min(2);
@@ -497,7 +507,8 @@ impl CeltEncoder {
         }
 
         // --- Postfilter: always off (throughput-first, = complexity < 5) ----
-        if enc.tell() as i32 + 16 <= total_bits {
+        // The flag exists only when band 0 is coded (decoder: `start == 0`).
+        if start == 0 && enc.tell() as i32 + 16 <= total_bits {
             enc.enc_bit_logp(false, 1);
         }
 
@@ -515,7 +526,8 @@ impl CeltEncoder {
         // --- Forward MDCTs, energies, normalisation -------------------------
         self.compute_mdcts(short_blocks, lm, n, c);
         for ch in 0..c {
-            for i in 0..end {
+            self.x[ch * n..ch * n + m * E_BANDS[start]].fill(0.0);
+            for i in start..end {
                 let mut sum = 1e-27f32;
                 for j in m * E_BANDS[i]..m * E_BANDS[i + 1] {
                     let v = self.freq[ch * n + j];
@@ -525,7 +537,7 @@ impl CeltEncoder {
                 self.band_log_e[i + ch * NB_BANDS] =
                     (self.band_e[i + ch * NB_BANDS] as f64).log2() as f32 - E_MEANS[i];
             }
-            for i in 0..end {
+            for i in start..end {
                 let g = 1.0 / (1e-27 + self.band_e[i + ch * NB_BANDS]);
                 for j in m * E_BANDS[i]..m * E_BANDS[i + 1] {
                     self.x[ch * n + j] = self.freq[ch * n + j] * g;
@@ -809,6 +821,13 @@ impl CeltEncoder {
         if c == 1 {
             for i in 0..NB_BANDS {
                 self.old_band_e[NB_BANDS + i] = self.old_band_e[i];
+            }
+        }
+        // Uncoded bands hold no energy history (the decoder clears them the
+        // same way), so a later start/end change predicts from the same state.
+        for ch in 0..2 {
+            for i in (0..start).chain(end..NB_BANDS) {
+                self.old_band_e[ch * NB_BANDS + i] = 0.0;
             }
         }
         if is_transient {

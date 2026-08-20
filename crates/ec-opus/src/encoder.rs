@@ -5,8 +5,10 @@
 //! needs. [`Encoder::set_mode`] (or the automatic choice in [`Mode`]'s
 //! default) picks CELT (TOC configs 16..31, every rate and frame size) or
 //! SILK (TOC configs 1/9, mono NB/WB 20 ms only — stereo SILK and SILK at
-//! other frame sizes fall back to CELT, documented at the fallback site).
-//! Hybrid is not implemented yet and also falls back to CELT.
+//! other frame sizes fall back to CELT, documented at the fallback site) or
+//! Hybrid (TOC configs 13/15, mono SWB/FB 20 ms: SILK at 16 kHz under CELT
+//! from band 17 up, one range-coded stream; stereo and other frame sizes
+//! fall back to CELT).
 //!
 //! Input below 48 kHz is zero-stuffed to CELT's or SILK's native rate and
 //! the coded bandwidth is capped at the input's own Nyquist, so the images
@@ -37,6 +39,13 @@ const MAX_FRAME_BYTES: usize = 1275;
 /// don't have to and don't match.
 const SILK_LOOK_AHEAD_48K_NB: usize = 58;
 const SILK_LOOK_AHEAD_48K_WB: usize = 50;
+/// How far the hybrid path delays the SILK layer's input so its output lines
+/// up with the CELT layer's at the decoder (which sums them as-is): CELT's
+/// overlap (120) minus SILK's WB round trip, click-measured through the
+/// decoder with one layer muted (`hybrid_layers_align` in conformance.rs).
+const HYBRID_SILK_DELAY_48K: usize = 120 - SILK_LOOK_AHEAD_48K_WB;
+/// Bytes the CELT layer of a hybrid packet always keeps, whatever SILK spent.
+const HYBRID_CELT_MIN_BYTES: usize = 8;
 
 /// What the caller is encoding. This encoder is CELT-only, so the setting
 /// biases the coded bandwidth rather than selecting a different layer.
@@ -75,6 +84,8 @@ pub struct Encoder {
     /// Scratch space for the SILK payload, sized once so the steady-state
     /// loop (`steady_state_encode_loop_zero_alloc`) doesn't allocate.
     silk_buf: [u8; MAX_FRAME_BYTES + 1],
+    /// Hybrid: the last [`HYBRID_SILK_DELAY_48K`] samples of SILK-layer input.
+    silk_delay: Vec<f32>,
 }
 
 impl Encoder {
@@ -117,13 +128,14 @@ impl Encoder {
             silk_nb: None,
             silk_wb: None,
             silk_buf: [0u8; MAX_FRAME_BYTES + 1],
+            silk_delay: Vec::new(),
         })
     }
 
-    /// Overrides the automatic SILK/CELT choice `wants_silk` would make from
-    /// the application and bitrate. [`Mode::Hybrid`] is unimplemented and
-    /// falls back to CELT (documented at the fallback site in
-    /// [`Encoder::silk_choice`]); pass `None` to restore the automatic pick.
+    /// Overrides the automatic SILK/Hybrid/CELT choice `wants_silk` and
+    /// `hybrid_choice` make from the application and bitrate; pass `None` to
+    /// restore the automatic pick. Requests this encoder cannot honour
+    /// (stereo SILK/Hybrid, frames other than 20 ms) fall back to CELT.
     pub fn set_mode(&mut self, mode: Option<Mode>) {
         self.mode = mode;
     }
@@ -144,7 +156,8 @@ impl Encoder {
     /// SILK (mono, when the application/bitrate or an explicit
     /// [`Encoder::set_mode`] select it): [`SILK_LOOK_AHEAD_48K_NB`] or
     /// [`SILK_LOOK_AHEAD_48K_WB`], the analysis-plus-synthesis resampler
-    /// round trip, click-measured per bandwidth.
+    /// round trip, click-measured per bandwidth. Hybrid: CELT's 120, the
+    /// SILK layer being delayed to meet it ([`HYBRID_SILK_DELAY_48K`]).
     pub fn look_ahead(&self) -> usize {
         if self.channels == 1 {
             if let Some(wideband) = self.wants_silk() {
@@ -195,12 +208,13 @@ impl Encoder {
         self.celt.reset();
         self.silk_nb = None;
         self.silk_wb = None;
+        self.silk_delay.clear();
         self.final_range = 0;
     }
 
     /// Whether the application/bitrate (or an explicit [`Encoder::set_mode`])
     /// call for SILK, and if so, wideband (else narrowband). `None` means
-    /// CELT (or Hybrid, unimplemented and mapped to CELT).
+    /// CELT or Hybrid (`hybrid_choice` tells those apart).
     fn wants_silk(&self) -> Option<bool> {
         match self.mode {
             Some(Mode::Celt) | Some(Mode::Hybrid) => None,
@@ -224,6 +238,53 @@ impl Encoder {
             return None;
         }
         Some(wideband)
+    }
+
+    /// Whether this frame goes out as a hybrid packet, and at which of the two
+    /// hybrid bandwidths. Automatic: VoIP from 20 kbps (where SILK alone
+    /// stops) to 40 kbps (where CELT alone is the better speech coder too),
+    /// at the bitrate's own bandwidth (SWB/FB; narrower requests are CELT's).
+    /// Mono 20 ms only — stereo Hybrid (which needs stereo SILK) and the
+    /// 10 ms hybrid configs are not implemented and fall back to CELT.
+    fn hybrid_choice(&self, frame_48k: usize) -> Option<Bandwidth> {
+        let wanted = match self.mode {
+            Some(Mode::Hybrid) => true,
+            Some(_) => false,
+            None => {
+                self.application == Application::Voip
+                    && (20_000..40_000).contains(&self.bitrate)
+            }
+        };
+        if !wanted || self.channels != 1 || frame_48k != 960 {
+            return None;
+        }
+        let bandwidth = self.bandwidth.unwrap_or_else(|| self.auto_bandwidth());
+        match bandwidth {
+            Bandwidth::SuperWide | Bandwidth::Full => Some(bandwidth),
+            // A forced Hybrid codes at least SWB; an automatic one that the
+            // bitrate would cap narrower is CELT's.
+            _ if self.mode == Some(Mode::Hybrid) => Some(Bandwidth::SuperWide),
+            _ => None,
+        }
+    }
+
+    /// The SILK layer's share of a mono hybrid packet's bitrate, the
+    /// reference's 20 ms table interpolated: the rest is CELT's.
+    fn hybrid_silk_rate(total: u32, bandwidth: Bandwidth) -> u32 {
+        const TABLE: [(u32, u32, u32); 7] = [
+            (0, 0, 0),
+            (12000, 10000, 11000),
+            (16000, 13500, 14500),
+            (20000, 16000, 17000),
+            (24000, 18000, 19000),
+            (32000, 22000, 24000),
+            (64000, 38000, 42000),
+        ];
+        let pick = |row: &(u32, u32, u32)| if bandwidth == Bandwidth::Full { row.2 } else { row.1 };
+        let total = total.min(64000);
+        let i = TABLE.iter().rposition(|r| r.0 <= total).unwrap().min(TABLE.len() - 2);
+        let (lo, hi) = (&TABLE[i], &TABLE[i + 1]);
+        pick(lo) + (pick(hi) - pick(lo)) * (total - lo.0) / (hi.0 - lo.0)
     }
 
     /// Zero-stuffs a mono, `frame_size`-sample native-rate frame up to
@@ -268,6 +329,11 @@ impl Encoder {
             let n = enc.encode_frame(&stuffed, &mut self.silk_buf)?;
             self.final_range = enc.final_range();
             return Ok((self.silk_buf[0], &self.silk_buf[1..n]));
+        }
+        if let Some(bandwidth) = self.hybrid_choice(frame_48k) {
+            let n = self.encode_hybrid(pcm, frame_size, bandwidth, cap)?;
+            let config = if bandwidth == Bandwidth::Full { 15u8 } else { 13 };
+            return Ok((config << 3, &self.range.data()[..n]));
         }
         let (toc, frame_48k, end) = self.toc(frame_size)?;
         let n = self.encode_frame(pcm, frame_48k, end, cap)?;
@@ -404,6 +470,64 @@ impl Encoder {
         Ok(1 + len_bytes + n)
     }
 
+    /// One hybrid frame (mono, 20 ms, `bandwidth` SWB or FB) into the
+    /// internal range coder, returning its byte length: the SILK layer's
+    /// symbols (WB, 16 kHz internal, fed the input delayed by
+    /// [`HYBRID_SILK_DELAY_48K`]), the no-redundancy flag under the decoder's
+    /// exact presence rule, then the CELT layer from band 17 in the same
+    /// coder. CBR: the packet is the bitrate's size unless SILK alone needs
+    /// more, in which case CELT keeps [`HYBRID_CELT_MIN_BYTES`] on top.
+    fn encode_hybrid(
+        &mut self,
+        pcm: &[f32],
+        frame_size: usize,
+        bandwidth: Bandwidth,
+        cap: usize,
+    ) -> Result<usize> {
+        let cap = cap.min(MAX_FRAME_BYTES);
+        let budget = ((self.bitrate as u64 * 960 + 4 * 48000) / (8 * 48000)) as usize;
+        let budget = budget.saturating_sub(1).clamp(2, cap);
+        if cap < HYBRID_CELT_MIN_BYTES + 2 {
+            return Err(Error::corrupt(
+                "opus encode: output buffer smaller than the minimum hybrid packet",
+            ));
+        }
+        let stuffed = self.zero_stuff_mono(pcm, frame_size);
+        let d = HYBRID_SILK_DELAY_48K;
+        self.silk_delay.resize(d, 0.0);
+        let mut delayed = Vec::with_capacity(960);
+        delayed.extend_from_slice(&self.silk_delay);
+        delayed.extend_from_slice(&stuffed[..960 - d]);
+        self.silk_delay.copy_from_slice(&stuffed[960 - d..]);
+
+        self.range.reset(cap);
+        let silk = self.silk_wb.get_or_insert_with(|| SilkEncoder::new(true));
+        silk.set_bitrate(Self::hybrid_silk_rate(self.bitrate, bandwidth));
+        silk.encode_hybrid(&delayed, &mut self.range)?;
+        let silk_bytes = (self.range.tell() as usize).div_ceil(8);
+        let budget = budget.max(silk_bytes + HYBRID_CELT_MIN_BYTES).min(cap);
+        self.range.shrink(budget);
+        // Redundancy flag: present under exactly the decoder's condition.
+        if self.range.tell() as usize + 17 + 20 <= 8 * budget {
+            self.range.enc_bit_logp(false, 12);
+        }
+        // CELT sees the same input as SILK: start band 17 alone keeps it off
+        // the low band (a one-pole ~6 kHz high-pass here measured identical
+        // full-band correlation, so there is none).
+        let n = self.celt.encode(
+            &mut self.range,
+            pcm,
+            960,
+            17,
+            bandwidth.celt_end_band(),
+            0,
+        )?;
+        self.final_range = self.range.range();
+        let payload = &self.range.data()[..n];
+        self.silk_wb.as_mut().unwrap().replay(payload)?;
+        Ok(n)
+    }
+
     /// Encodes the CELT frame into the internal range coder and returns its
     /// byte length. `frame_size` is in 48 kHz samples, `end` is the last coded
     /// band, and `cap` bounds the frame (the caller's buffer minus headers).
@@ -431,7 +555,7 @@ impl Encoder {
         self.range.reset(budget);
         let n = self
             .celt
-            .encode(&mut self.range, pcm, frame_size, end, vbr_rate)?;
+            .encode(&mut self.range, pcm, frame_size, 0, end, vbr_rate)?;
         self.final_range = self.range.range();
         Ok(n)
     }
