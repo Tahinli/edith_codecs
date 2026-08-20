@@ -18,6 +18,7 @@ enum Inner {
     Mp3(Box<ec_mp3::Mp3Decoder>),
     Vorbis(Box<ec_vorbis::VorbisDecoder>),
     Ac3(Box<ec_ac3::Ac3Decoder>),
+    TrueHd(Box<ec_truehd::TrueHdDecoder>),
     Aac(Box<ec_aac::AacDecoder>),
     Alac(Box<ec_alac::AlacDecoder>),
     Opus(Box<ec_opus::MultistreamDecoder>),
@@ -99,6 +100,7 @@ impl AudioDecoder {
                 Inner::Vorbis(Box::new(ec_vorbis::VorbisDecoder::new(&headers)?))
             }
             CodecId::Ac3 | CodecId::EAc3 => Inner::Ac3(Box::new(ec_ac3::Ac3Decoder::new())),
+            CodecId::TrueHd => Inner::TrueHd(Box::new(ec_truehd::TrueHdDecoder::new())),
             CodecId::Aac => {
                 let decoder = match extradata {
                     Some(asc) => ec_aac::AacDecoder::with_config_bytes(asc)?,
@@ -175,6 +177,7 @@ impl AudioDecoder {
             Inner::Mp3(d) => drain(d.as_mut(), packet, out)?,
             Inner::Vorbis(d) => drain(d.as_mut(), packet, out)?,
             Inner::Ac3(d) => drain(d.as_mut(), packet, out)?,
+            Inner::TrueHd(d) => drain(d.as_mut(), packet, out)?,
             Inner::Aac(d) => {
                 let audio = d.decode(&packet.data, packet.pts)?;
                 self.channels = usize::from(audio.channels).max(1);
@@ -264,6 +267,7 @@ impl AudioDecoder {
             Inner::Mp3(d) => flush_drain(d.as_mut(), out)?,
             Inner::Vorbis(d) => flush_drain(d.as_mut(), out)?,
             Inner::Ac3(d) => flush_drain(d.as_mut(), out)?,
+            Inner::TrueHd(d) => flush_drain(d.as_mut(), out)?,
             // AAC, ALAC, Opus and PCM decode a packet at a time with nothing
             // held back across the end of the file.
             Inner::Aac(_) | Inner::Alac(_) | Inner::Opus(_) | Inner::Pcm(_) => {}
@@ -302,6 +306,7 @@ impl AudioDecoder {
             Inner::Mp3(d) => d.reset(),
             Inner::Vorbis(d) => d.reset(),
             Inner::Ac3(d) => d.reset(),
+            Inner::TrueHd(d) => d.reset(),
             Inner::Aac(d) => **d = ec_aac::AacDecoder::new(),
             Inner::Alac(d) => d.reset(),
             Inner::Opus(d) => d.reset(),

@@ -409,6 +409,7 @@ dependencies = [
  "ec-ogg",
  "ec-opus",
  "ec-riff",
+ "ec-truehd",
  "ec-vorbis",
 ]
 
@@ -426,6 +427,14 @@ dependencies = [
  "ec-ass",
  "ec-core",
  "ec-pgs",
+]
+
+[[package]]
+name = "ec-truehd"
+version = "0.1.0"
+dependencies = [
+ "ec-core",
+ "ec-matroska",
 ]
 
 [[package]]

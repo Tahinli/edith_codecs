@@ -193,11 +193,10 @@ fn a_real_library_sweep() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// The TrueHD remux in his library: the track is *listed*, with a reason, and
-/// the AC-3 track beside it still decodes. A file whose sound is refused
-/// silently is the failure this exists to prevent.
+/// The TrueHD remux in his library: the track decodes through the unified
+/// reader, 7.1 at 48 kHz, with the AC-3 track beside it still decoding too.
 #[test]
-fn an_undecodable_track_is_named_not_hidden() {
+fn a_truehd_track_decodes() {
     let Some((path, ..)) = manifest()
         .into_iter()
         .find(|(p, _, acodecs, _)| acodecs.contains("truehd") && p.exists())
@@ -205,18 +204,19 @@ fn an_undecodable_track_is_named_not_hidden() {
         eprintln!("no TrueHD file in the manifest — skipping");
         return;
     };
-    let reader = Reader::open(&path).expect("open");
-    let unsupported = reader.unsupported();
-    let truehd = unsupported
+    let mut reader = Reader::open(&path).expect("open");
+    let truehd = reader
+        .streams()
         .iter()
-        .find(|u| u.codec.name() == "truehd")
-        .expect("the TrueHD track is listed as unsupported");
-    assert!(
-        truehd.reason.contains("truehd"),
-        "the reason names the codec: {}",
-        truehd.reason
-    );
-    // ...and the other track of the same file plays.
+        .find(|s| s.params.codec.name() == "truehd")
+        .cloned()
+        .expect("the TrueHD track is listed");
+    let decoder = reader.make_decoder(truehd.index).expect("truehd decoder");
+    assert_eq!(decoder.channels(), 8, "7.1 TrueHD is 8 channels");
+    assert_eq!(decoder.sample_rate(), 48_000);
+    let frames = decode_some(&mut reader, truehd.index, 1.0).expect("decode");
+    assert!(frames > 0, "no TrueHD audio came out");
+    // ...and the AC-3 track beside it still decodes.
     let decodable: Vec<_> = reader
         .streams()
         .iter()
@@ -225,14 +225,12 @@ fn an_undecodable_track_is_named_not_hidden() {
         .map(|s| s.params.codec.name())
         .collect();
     assert!(
-        !decodable.is_empty(),
-        "a file with a TrueHD track and an AC-3 one came out with nothing to play"
+        decodable.contains(&"ac3") || decodable.contains(&"truehd"),
+        "a file with a TrueHD track and an AC-3 one came out with nothing to play: {decodable:?}"
     );
     eprintln!(
-        "{}: {} listed unsupported ({}), decodable: {decodable:?}",
+        "{}: truehd decoded {frames} frames, tracks {decodable:?}",
         path.file_name().unwrap().to_string_lossy(),
-        truehd.codec.name(),
-        truehd.reason
     );
 }
 
