@@ -2262,10 +2262,26 @@ fn full_chain_low_band_matches_own_core() {
             // without exposing the well-behaved one to the wider bound's
             // noise floor.
             const WIDE_LAG_MAX: i64 = 20_000;
-            // `_ex` itself widens to `SEARCH_LAG_MAX` and asserts when the
-            // winner sits at the bound.
-            let (lag, corr, _) = best_lag_correlation_ex(&ol, &ul, WIDE_LAG_MAX);
+            // Top-K refinement, not the single coarse winner: FMJ's single
+            // coarse pick landed on an in-bounds noise peak (lag 18995,
+            // corr 0.10) while its true alignment scores >0.99 on refine.
+            // A winner at the bound widens once, then is asserted off it.
+            let (mut lag, mut corr, mut at_edge) =
+                robust_lag_topk(&ol, &ul, WIDE_LAG_MAX, core_rate, 8);
+            let mut bound = WIDE_LAG_MAX;
+            // A sub-bar winner inside the narrow bound is the same symptom
+            // (true peak outside the search), so it widens too.
+            if at_edge || corr < 0.99 {
+                bound = SEARCH_LAG_MAX;
+                (lag, corr, at_edge) = robust_lag_topk(&ol, &ul, SEARCH_LAG_MAX, core_rate, 8);
+            }
             println!("  ch{ch}: measured best lag {lag}, corr {corr:.6}");
+            assert!(
+                !at_edge,
+                "{} ch{ch}: winning lag {lag} sits at the +/-{bound} \
+                 search bound -- corr {corr:.6} is noise, not a measurement",
+                c.path.display()
+            );
             assert!(
                 corr >= 0.99,
                 "{} ch{ch}: full-chain low band vs our own core-only decode \
