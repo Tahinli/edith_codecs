@@ -1351,7 +1351,7 @@ fn hf_patch_simulator_qmf(
     let top_band = 43.min(SYNTHESIS_BANDS);
     let windows = slots / WIN;
     let band_coherence = |source: &[Vec<ec_dsp::Complex<f64>>],
-                           target: &[Vec<ec_dsp::Complex<f64>>]|
+                          target: &[Vec<ec_dsp::Complex<f64>>]|
      -> Vec<(usize, f64)> {
         (14..top_band)
             .map(|band| {
