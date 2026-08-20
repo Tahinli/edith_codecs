@@ -2107,6 +2107,125 @@ fn full_chain_low_band_matches_own_core() {
     }
 }
 
+/// Round-52: a controlled fixture matrix -- unlike Nikbinler/FMJ (one real
+/// file each, whose sample rate, bitrate and content all differ at once),
+/// every row here decodes the SAME synthesized source (three summed sine
+/// sweeps 100 Hz-18 kHz + seeded pink noise, per-channel phase offset),
+/// varying only sample rate (44100/48000) and bitrate (32k/48k/64k/96k,
+/// which sweeps the SBR crossover `kx`/`k2`), so a break tied to a rate
+/// FAMILY or to `kx` GEOMETRY shows as a pattern across the table instead
+/// of being confounded with one file's own content. `aac_low` control rows
+/// (no SBR at all) prove the harness itself -- container extraction,
+/// decode, correlation -- is sound before the HE-AAC rows next to them are
+/// trusted; those are the only asserted numbers here, everything else is
+/// instrumentation for the ledger, not a regression gate yet.
+///
+/// Env-gated on `EC_AAC_HEAAC_FIXTURES` (defaults to the same
+/// `<repo>/.cache/heaac-fixtures` `scripts/aac-tables/make-heaac-fixtures.sh`
+/// writes to) -- skips loudly, generates nothing itself, when that
+/// directory is absent.
+#[test]
+fn synthetic_heaac_matrix() {
+    if !have_ffmpeg() {
+        eprintln!("SKIP: ffmpeg not on PATH");
+        return;
+    }
+    let dir = std::env::var("EC_AAC_HEAAC_FIXTURES").unwrap_or_else(|_| {
+        format!("{}/../../.cache/heaac-fixtures", env!("CARGO_MANIFEST_DIR"))
+    });
+    let dir = PathBuf::from(dir);
+    if !dir.is_dir() {
+        eprintln!(
+            "SKIP: {} absent -- run scripts/aac-tables/make-heaac-fixtures.sh first",
+            dir.display()
+        );
+        return;
+    }
+    unsafe {
+        std::env::set_var("EC_AAC_SBR_SIDEINFO_DEBUG", "1");
+    }
+    println!(
+        "{:>5} {:>6} {:>4} {:>4} {:>4}  {:>8} {:>8} {:>8} {:>6}  {:>11}",
+        "rate", "kbps", "prof", "kx", "k2", "full", "below", "above", "lag", "ours_v_core"
+    );
+    for rate in [48_000u32, 44_100] {
+        for br in ["32k", "48k", "64k", "96k"] {
+            for (profile, prefix) in [("HE", "heaac"), ("LC", "lc")] {
+                let path = dir.join(format!("{prefix}_{rate}_{br}.m4a"));
+                if !path.exists() {
+                    eprintln!("SKIP {}: missing", path.display());
+                    continue;
+                }
+                let before = ec_aac::sbr_sideinfo_log().len();
+                let Some((ours, _sbr, our_rate)) = our_decode(&path, 0) else {
+                    eprintln!("SKIP {}: could not decode", path.display());
+                    continue;
+                };
+                let rows = ec_aac::sbr_sideinfo_log();
+                let (kx, k2) = rows[before..]
+                    .iter()
+                    .find(|r| r.ch == 0)
+                    .map(|r| (r.kx, r.k2))
+                    .unwrap_or((-1, -1));
+                let theirs = ffmpeg_decode(&path, 0, ours.len());
+                let o = &ours[0];
+                let t = &theirs[0];
+                let (lag, full) = best_lag_correlation(o, t);
+                // Crossover in Hz from the actual parsed kx (band width
+                // rate/128, same domain `sbr_chain.rs`'s own doc comment
+                // gives `kx`/`k2` in) when SBR engaged; a fixed quarter-Nyquist
+                // split for the LC controls, which carry no kx at all.
+                let crossover_hz = if kx > 0 {
+                    f64::from(our_rate) * (kx as f64) / 128.0
+                } else {
+                    f64::from(our_rate) * 0.25
+                };
+                let (_, below) =
+                    best_lag_correlation(&lowpass(o, our_rate, crossover_hz), &lowpass(t, our_rate, crossover_hz));
+                let n = WINDOW.min(o.len()).min(t.len());
+                let above = if n >= 1024 {
+                    correlation(
+                        &highpass(&o[..n], our_rate, crossover_hz),
+                        &highpass(&t[..n], our_rate, crossover_hz),
+                    )
+                } else {
+                    0.0
+                };
+                // Round-51's self-consistency probe (our full chain's low
+                // band vs our own core-only decode, 2x upsampled), run
+                // per-row so a rate/kx-specific self-inconsistency shows in
+                // the same table instead of needing a second pass.
+                let ours_v_core = if kx > 0 {
+                    our_decode_core_only(&path, 0).map(|(core, core_rate)| {
+                        let up: Vec<f32> = core[0].iter().flat_map(|&s| [s, s]).collect();
+                        let cutoff = f64::from(core_rate) * 0.4;
+                        let ol = lowpass(o, our_rate, cutoff);
+                        let ul = lowpass(&up, our_rate, cutoff);
+                        best_lag_correlation(&ol, &ul).1
+                    })
+                } else {
+                    None
+                };
+                println!(
+                    "{rate:>5} {br:>6} {profile:>4} {kx:>4} {k2:>4}  {full:>8.4} {below:>8.4} {above:>8.4} {lag:>6}  {:>11}",
+                    ours_v_core
+                        .map(|c| format!("{c:.4}"))
+                        .unwrap_or_else(|| "n/a".into())
+                );
+                if profile == "LC" {
+                    assert!(
+                        full >= 0.999,
+                        "{}: LC control full-band corr {full:.6} < 0.999 -- the \
+                         harness itself (extraction/decode/correlation) is broken, \
+                         not the SBR chain this fixture matrix is meant to isolate",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn candidates() -> Vec<Candidate> {
     let home = std::env::var("HOME").unwrap_or_default();
     [
