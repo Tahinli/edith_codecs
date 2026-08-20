@@ -36,30 +36,59 @@ reference's stderr for "No quantized data read for sbr_dequant." -- if
 present the run used a shape that leaves the SBR gain stage unengaged and the
 decode is not trustworthy.
 
-STATUS (round-29): the sanity gate still FAILS after two real fixes landed
-this round (see the ledger's round-29 facts): (1) `sbr_bits_full`'s `slot()`
-default (`T.FILL`, 24 raw zero bits) desyncs the bitstream whenever a
-multi-band delta run is used -- ENV30_F/NOISE_F's shortest codeword (the one
-"0" bits actually decode as) is only 1 bit, so 23 excess zero bits per slot
-leak into every field transmitted after it; `stream_one_band` now supplies
-exactly enough real 1-bit zero-delta codewords instead (fixed, confirmed via
-`EC_AAC_SBR_DEBUG`: `e_q[1]`/`q_q[1]` now read back the intended raw values,
-were silently zeroed before). (2) The tone's fractional-offset placement
-(`GROUP_OFFSET`) is unaffected by that fix. What remains OPEN: `k = active_p
-* 16` (the MDCT-bin-per-QMF-band assumption every prior round's readout used,
-inherited unchanged here) does not track the true source-band placement --
-calibration by sweeping raw bin `k` and reading which target band lights up
-shows a clean *32*-bin-per-band slope (not 16) locally, but with an offset
-that is NOT a fixed constant across headers (k=64 lands on `target == kx`
-for headers A and C, whose `patches[0]` happens to have `source_start == 0`,
-but for header B -- `xover_band=1`, whose `patches[0]` has `source_start ==
-2` -- k=64 *also* lands on `target == kx`, meaning it tracked `source_start`
-itself, not a fixed `p`). The low/source band index space is not a simple
-`p*N + offset` function of MDCT bin position; it needs deriving from the
-tables' own low-band structure rather than assumed, which this round did not
-reach. Sanity gate: DO NOT trust `measured(ref)` output below until this is
-resolved -- Task 2/3 (reading and acting on the reference's map) are blocked
-on it.
+STATUS (round-30): the bin-per-band placement math is now fixed -- a source
+QMF band is 1024/32 == 32 core-MDCT bins wide, not 16, so `stream_one_band`
+places its probe tone at `k = active_p * 32 + 16` (the band CENTER, which
+also lands exactly on a 4-bin group boundary, so no fractional-offset trick
+is needed; `D` is 0.5, not 0.25). That fix, however, could NOT be calibrated
+against the header-A anchor `(13, 42, 1)`, because a DEEPER, BLOCKING defect
+was found first: the reference decoder is not actually engaging its SBR
+upsampling path for ANY of these synthetic ADTS probe streams at all, for
+either `tone_core` or `broadband_core_bits` content, regardless of header
+shape (A's kx=14/k2=43 and the round-19 DEFAULT shape both affected
+identically) --
+
+  - `ffprobe` on a probe stream built by `stream_one_band`/`stream` reports
+    `codec_name=aac`, NO `profile=HE-AAC`, `sample_rate=22050` (the bare
+    core/ADTS-declared rate) -- vs. the real `~/Music/Yok - Nikbinler.mp4`
+    fixture (round-19's working baseline), which reports
+    `profile=HE-AAC sample_rate=44100`. Decoded PCM length for a 26-frame
+    probe is exactly `26 * 1024` samples, i.e. literally core-rate output,
+    never doubled -- this is not just a metadata-reporting quirk, the actual
+    decoded sample count proves SBR upsampling never ran.
+  - This is NOT visible from the `"No quantized data read for sbr_dequant."`
+    warning's raw occurrence count alone: it fires only ONCE across a
+    26-frame stream (24 of them real SBR frames with `header=1` every
+    frame) -- by the charter's own "once-or-twice = benign" heuristic this
+    reads as a clean, engaged run. It is NOT: an envelope-value sweep
+    (`env0` raw 3..63, `amp_res=1`) shows the power *inside* the
+    `[kx*BAND_HZ, k2*BAND_HZ)` window our own table math predicts is
+    completely FLAT (no order-of-magnitude movement -- fails the charter's
+    own engagement test outright), while a huge, smoothly env0-scaling
+    power increase (orders of magnitude, from ~18 to ~6e9) shows up OUTSIDE
+    that window, concentrated roughly 9-15 kHz and tailing out past 20 kHz
+    -- i.e. real envelope-driven energy exists, but not where our table
+    math says the SBR target band should be, AND it never causes the
+    decoder to report itself as HE-AAC/44100 the way the real file does.
+    The likely explanation: without an out-of-band MPEG-4 `AudioSpecificConfig`
+    (which the real `.mp4` fixture's container carries and our bare `.aac`
+    ADTS files do not), the reference decoder's *implicit* SBR detection
+    from frame 1's fill element is deciding "no SBR" once, on the very
+    first payload frame, and locks the whole stream's output rate to
+    core-only from then on even though later frames carry ostensibly valid
+    bits -- consistent with, and a generalization of, round-27's dead-end
+    (`tone_core` "does not round-trip" against the real header/grid shape),
+    now shown to affect `broadband_core_bits` identically, so it is a
+    property of the shared frame/extension-payload construction in
+    `stream()`/`stream_one_band()`, not of either core-spectrum writer.
+
+Sanity gate: DO NOT trust `measured(ref)` output below -- it is not reading
+genuine SBR-patched content at all, in either the old or new placement math.
+Task 2/3/4 (reading and acting on the reference's map) remain BLOCKED, now
+on getting the synthetic ADTS fixture writer to genuinely engage the
+reference's implicit SBR/HE-AAC upsampling path (matching the real file's
+`profile=HE-AAC sample_rate=44100`), not on the placement-math bug this
+round set out to fix.
 """
 import os
 import subprocess
@@ -79,8 +108,17 @@ SF_INDEX = 7
 RATE = 44100
 OUR_DECODER = os.path.expanduser("~/.cache/cargo-target-sbr/debug/examples/adts_to_pcm")
 BAND_HZ = RATE / 128  # QMF band width, both source and target index units
-D = 0.25  # fractional offset (of one band width) the probe tone is placed at
-GROUP_OFFSET = 4  # bins: 4/16 == D, the finest offset tone_core's grouping allows
+# Round-30 fix: a source (low) QMF band is 32 core-MDCT bins wide (1024-bin
+# core MDCT / 32 core bands), not 16 -- every prior round's k = p*16 + offset
+# was reading the wrong bin for band p entirely, not just the wrong in-band
+# offset. Placed at the BAND CENTER (bin 16 of the 32), which lands exactly
+# on a 4-bin group boundary (16 % 4 == 0) so tone_core's grouping needs no
+# fractional-offset trick. A center tone's fractional position within its
+# 32-bin source band is 0.5; patches translate by whole band widths, so the
+# translated line keeps frac == 0.5 in its target band too (or 1-0.5 == 0.5
+# under mirroring -- indistinguishable at the center, which is fine, this
+# probe only needs the TARGET BAND INDEX, not direct/mirror discrimination).
+D = 0.5  # fractional offset (of one band width) the probe tone is placed at
 NO_QUANT_WARNING = "No quantized data read for sbr_dequant."
 
 
@@ -142,7 +180,7 @@ def stream_one_band(cfg, tables, active_p, n_frames=24, invf_mode=0):
     group (offset `D` of a band width into the band, not the ambiguous
     boundary bin), held fixed; invf NONE, no harmonics."""
     swb = P.SWB_LONG[SF_INDEX]
-    k = active_p * 16 + GROUP_OFFSET
+    k = active_p * 32 + 16
     found = bin_to_sfb_group(k, swb)
     assert found is not None, f"band {active_p} bin {k} not in SWB_LONG[{SF_INDEX}]"
     sfb_idx, group_active = found
