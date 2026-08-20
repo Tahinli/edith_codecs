@@ -2245,3 +2245,134 @@ fn high_profile_8x8_inter_sequences_match_ffmpeg() {
     let _ = std::fs::remove_dir_all(&dir);
     assert!(failures.is_empty(), "{failures:#?}");
 }
+
+/// An open-GOP boundary's non-IDR I picture (`nal_unit_type` 1, not 5) is
+/// followed in decode order by leading B pictures that display *before* it
+/// but predict from the previous GOP. A decoder started fresh at that I
+/// picture — what a seek does — never decoded those previous-GOP references,
+/// so it must not hand back the leading B pictures at all (H.264's analogue
+/// of HEVC's RASL/`NoRaslOutputFlag` case): output must resume at the I
+/// picture itself, per D.2.8 absent a recovery_point SEI.
+#[test]
+fn h264_seek_matches_linear_open_gop() {
+    if !have_ffmpeg() {
+        eprintln!("SKIP: ffmpeg not on PATH");
+        return;
+    }
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/video/h264-open-gop.mp4");
+    if !src.is_file() {
+        eprintln!("SKIP: no fixtures/video/h264-open-gop.mp4 (run scripts/gen-fixtures.sh)");
+        return;
+    }
+    let dir = scratch("open-gop");
+    std::fs::create_dir_all(&dir).unwrap();
+    let annexb = dir.join("open-gop.264");
+    assert!(extract_annexb(&src, &annexb, 120), "ffmpeg extraction");
+    let data = std::fs::read(&annexb).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Split into access units the way a demuxer would: a new one starts at
+    // each slice NAL (type 1 or 5).
+    let units: Vec<Vec<u8>> = ec_h264_syntax::AnnexBIter::new(&data)
+        .map(<[u8]>::to_vec)
+        .collect();
+    let mut access_units: Vec<Vec<u8>> = Vec::new();
+    let mut current: Vec<u8> = Vec::new();
+    let mut current_has_slice = false;
+    for unit in &units {
+        let is_slice = matches!(unit[0] & 0x1F, 1 | 5);
+        if is_slice && current_has_slice {
+            access_units.push(std::mem::take(&mut current));
+            current_has_slice = false;
+        }
+        current_has_slice |= is_slice;
+        current.extend_from_slice(&[0, 0, 0, 1]);
+        current.extend_from_slice(unit);
+    }
+    if current_has_slice {
+        access_units.push(current);
+    }
+
+    // Linear decode: every picture from the start, display frame 30 kept for
+    // comparison (the fixture's second I picture, `keyint=30`).
+    const TARGET: usize = 30;
+    let mut dec = Decoder::new();
+    let mut linear_frame_30 = None;
+    let mut index = 0usize;
+    for nal in ec_h264_syntax::AnnexBIter::new(&data) {
+        if dec.push_nal(nal).expect("push_nal") == NalOutcome::PictureBoundary {
+            dec.end_picture().expect("end_picture");
+            dec.push_nal(nal).expect("re-push");
+        }
+        while let Some(f) = dec.next_frame() {
+            if index == TARGET {
+                linear_frame_30 = Some(frame_bytes(&f));
+            }
+            index += 1;
+        }
+    }
+    dec.flush().expect("flush");
+    while let Some(f) = dec.next_frame() {
+        if index == TARGET {
+            linear_frame_30 = Some(frame_bytes(&f));
+        }
+        index += 1;
+    }
+    let linear_frame_30 = linear_frame_30.expect("linear decode reached frame 30");
+
+    // Find the access unit whose first VCL NAL is a non-IDR I slice
+    // (`nal_unit_type` 1, `slice_type % 5 == 2`) — the open-GOP boundary.
+    let is_open_gop_i = |au: &[u8]| -> bool {
+        let Some((&header, payload)) = au.get(4).zip(au.get(5..)) else {
+            return false;
+        };
+        if header & 0x1F != 1 {
+            return false;
+        }
+        let mut r = ec_core::BitReader::new(payload);
+        if r.read_ue().is_err() {
+            return false;
+        }
+        matches!(r.read_ue(), Ok(code) if code % 5 == 2)
+    };
+    let cra_at = access_units
+        .iter()
+        .position(|au| is_open_gop_i(au))
+        .expect("an open-GOP I access unit exists");
+
+    // A seek reuses the parameter sets a decoder already learned; a fresh one
+    // is primed the way `Decoder::reset_pictures`'s doc comment expects: the
+    // leading IDR's parameter sets are decoded and its picture discarded.
+    let mut seek_dec = Decoder::new();
+    for nal in ec_h264_syntax::AnnexBIter::new(&access_units[0]) {
+        seek_dec.push_nal(nal).expect("prime parameter sets");
+    }
+    seek_dec.end_picture().expect("end priming IDR");
+    seek_dec.reset_pictures();
+
+    let mut seeked_frame = None;
+    'outer: for au in &access_units[cra_at..] {
+        for nal in ec_h264_syntax::AnnexBIter::new(au) {
+            if seek_dec.push_nal(nal).expect("seek decode") == NalOutcome::PictureBoundary {
+                seek_dec.end_picture().expect("end_picture");
+                seek_dec.push_nal(nal).expect("re-push");
+            }
+        }
+        if let Some(f) = seek_dec.next_frame() {
+            seeked_frame = Some(frame_bytes(&f));
+            break 'outer;
+        }
+    }
+    if seeked_frame.is_none() {
+        seek_dec.flush().expect("flush");
+        seeked_frame = seek_dec.next_frame().map(|f| frame_bytes(&f));
+    }
+    let seeked_frame = seeked_frame.expect("a frame came out after the seek");
+
+    assert_eq!(
+        seeked_frame, linear_frame_30,
+        "seeking to the open-GOP I before frame 30 handed back a different \
+         picture than a linear decode of frame 30 — leading pictures with \
+         missing references were not dropped"
+    );
+}

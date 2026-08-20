@@ -12,6 +12,7 @@
 
 use ec_core::BitWriter;
 
+use super::Colour;
 use crate::params::enc::{PACKED_HEADER_PICTURE, PACKED_HEADER_SEQUENCE, PACKED_HEADER_SLICE};
 
 /// A header ready to submit: escaped bytes plus its exact length in bits.
@@ -49,6 +50,7 @@ pub(super) struct H264Params {
     pub(super) num_units_in_tick: u32,
     pub(super) time_scale: u32,
     pub(super) pic_init_qp: u8,
+    pub(super) colour: Option<Colour>,
 }
 
 /// `log2_max_frame_num`, matching `seq_fields.log2_max_frame_num_minus4 = 0`.
@@ -87,7 +89,15 @@ pub(super) fn h264_sps(p: &H264Params) -> Packed {
     w.write_bit(true); // vui_parameters_present_flag
     w.write_bit(false); // aspect_ratio_info_present_flag
     w.write_bit(false); // overscan_info_present_flag
-    w.write_bit(false); // video_signal_type_present_flag
+    w.write_bit(p.colour.is_some()); // video_signal_type_present_flag
+    if let Some(colour) = p.colour {
+        w.write_bits(5, 3); // video_format: unspecified
+        w.write_bit(colour.full_range);
+        w.write_bit(true); // colour_description_present_flag
+        w.write_bits(u32::from(colour.primaries), 8);
+        w.write_bits(u32::from(colour.transfer), 8);
+        w.write_bits(u32::from(colour.matrix), 8);
+    }
     w.write_bit(false); // chroma_loc_info_present_flag
     w.write_bit(true); // timing_info_present_flag
     w.write_bits(p.num_units_in_tick, 32);
@@ -185,7 +195,7 @@ pub(super) mod hevc {
         SliceHeader, SliceType, Sps, Vps,
     };
 
-    use super::{Packed, nal};
+    use super::{Colour, Packed, nal};
     use crate::params::enc::{PACKED_HEADER_PICTURE, PACKED_HEADER_SEQUENCE, PACKED_HEADER_SLICE};
 
     /// Geometry and timing for the parameter sets.
@@ -198,6 +208,7 @@ pub(super) mod hevc {
         pub(in crate::enc) num_units_in_tick: u32,
         pub(in crate::enc) time_scale: u32,
         pub(in crate::enc) init_qp: u8,
+        pub(in crate::enc) colour: Option<Colour>,
     }
 
     /// The VPS, SPS and PPS, in that order.
@@ -254,6 +265,17 @@ pub(super) mod hevc {
             ptl,
             vui: Some(ec_h265_syntax::vui::VuiParameters {
                 timing: Some((p.num_units_in_tick, p.time_scale)),
+                video_signal_type: p.colour.map(|colour| {
+                    ec_h265_syntax::vui::VideoSignalType {
+                        video_format: 5, // unspecified
+                        video_full_range_flag: colour.full_range,
+                        colour_description: Some(ec_h265_syntax::vui::ColourDescription {
+                            colour_primaries: colour.primaries,
+                            transfer_characteristics: colour.transfer,
+                            matrix_coeffs: colour.matrix,
+                        }),
+                    }
+                }),
                 ..ec_h265_syntax::vui::VuiParameters::default()
             }),
         };

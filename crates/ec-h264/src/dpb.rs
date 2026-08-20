@@ -644,7 +644,8 @@ impl Dpb {
         num_l0: usize,
         num_l1: usize,
         mods: (&[RefPicListMod], &[RefPicListMod]),
-    ) -> Result<[RefList; 2]> {
+    ) -> Result<([RefList; 2], bool)> {
+        let mut padded = false;
         let mut lists = [RefList::default(), RefList::default()];
         // Short-term candidates, then long-term, both by index into `frames`.
         let mut short: [usize; MAX_STORED] = [0; MAX_STORED];
@@ -737,13 +738,16 @@ impl Dpb {
             // conformant stream fills it by modification; repeating entry 0
             // keeps every index in range meanwhile.
             let first = lists[x].entries[0];
+            if lists[x].len < wanted[x] {
+                padded = true;
+            }
             while lists[x].len < wanted[x] {
                 lists[x].push(usize::from(first));
             }
             lists[x].len = wanted[x];
             self.modify_list(&mut lists[x], mods[x], curr_pic_num, max_pic_num);
         }
-        Ok(lists)
+        Ok((lists, padded))
     }
 
     /// Reference picture list modification (clause 8.2.4.3), following the
@@ -826,15 +830,22 @@ impl Dpb {
     }
 
     /// Store a decoded picture and apply the reference marking of 8.2.5.
+    ///
+    /// `output_ok` is false for a picture that predicted from a reference
+    /// never decoded since the last `reset()` (a random-access leading
+    /// picture whose ref list build had to pad) — it still joins the DPB, as
+    /// a reference for later pictures and for `PicNum`/`FrameNumWrap`
+    /// bookkeeping, but the bumping process must never hand it to a caller.
     pub(crate) fn store(
         &mut self,
         mut pic: Picture,
         sps: &Sps,
         info: &PicInfo,
         marking: Option<&DecRefPicMarking>,
+        output_ok: bool,
     ) -> Result<()> {
         let has_mmco5 = marking.is_some_and(|m| m.mmcos.iter().any(|c| c.op == 5));
-        pic.output = true;
+        pic.output = output_ok;
         pic.complete = true;
         // Clause 8.2.4.1 against this picture's frame_num, which is what both
         // the sliding window (8.2.5.3) and the MMCO picture numbers (8.2.5.4)
@@ -1275,7 +1286,7 @@ mod tests {
         lt.long_term_frame_idx = 1;
         lt.pic_num = 1;
         dpb.frames.push(lt);
-        let lists = dpb
+        let (lists, _) = dpb
             .build_ref_lists(SliceType::P, 12, 6, 256, 4, 0, (&[], &[]))
             .unwrap();
         let nums: Vec<i32> = (0..lists[0].len())
@@ -1292,7 +1303,7 @@ mod tests {
         push_ref(&mut dpb, 1, 8, Mark::Short);
         push_ref(&mut dpb, 2, 4, Mark::Short);
         push_ref(&mut dpb, 3, 12, Mark::Short);
-        let lists = dpb
+        let (lists, _) = dpb
             .build_ref_lists(SliceType::B, 6, 4, 256, 4, 4, (&[], &[]))
             .unwrap();
         let poc = |l: &RefList| -> Vec<i32> {
@@ -1313,7 +1324,7 @@ mod tests {
         push_ref(&mut dpb, 1, 2, Mark::Short);
         // Both references precede the current picture, so initialisation gives
         // list 0 and list 1 the same descending-POC order.
-        let lists = dpb
+        let (lists, _) = dpb
             .build_ref_lists(SliceType::B, 10, 2, 256, 2, 2, (&[], &[]))
             .unwrap();
         let l0: Vec<i32> = (0..2)
@@ -1338,7 +1349,7 @@ mod tests {
             abs_diff_pic_num_minus1: 2,
             add: false,
         }];
-        let lists = dpb
+        let (lists, _) = dpb
             .build_ref_lists(SliceType::P, 12, 6, 256, 3, 0, (&mods, &[]))
             .unwrap();
         let nums: Vec<i32> = (0..3)

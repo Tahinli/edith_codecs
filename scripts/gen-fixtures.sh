@@ -198,6 +198,15 @@ for spec in "${VIDEO_CODECS[@]}"; do
     esac
 done
 
+# Open-GOP H.264: a non-IDR I picture (nal_unit_type 1, not 5) at a GOP
+# boundary, with B-pyramid pictures around it referencing across the
+# boundary. A decoder started fresh at that I (what a seek does) must not
+# hand back a picture whose references it never decoded — the H.264 sibling
+# of the HEVC RASL/NoRaslOutputFlag case.
+gen "$FIXTURES/video/h264-open-gop.mp4" \
+    -f lavfi -i "testsrc2=size=320x240:rate=30:duration=4" -pix_fmt yuv420p \
+    -c:v libx264 -x264-params "keyint=30:min-keyint=30:open-gop=1:bframes=3:b-pyramid=normal:scenecut=0"
+
 # -------------------------------------------------------------- summary -----
 printf '\n%s\n' "== fixtures: $FIXTURES =="
 printf '%-42s %10s  %s\n' FILE SIZE PROBE

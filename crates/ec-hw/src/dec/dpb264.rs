@@ -420,7 +420,8 @@ impl Dpb {
         num_l0: usize,
         num_l1: usize,
         mods: (&[RefPicListMod], &[RefPicListMod]),
-    ) -> Result<[RefList; 2]> {
+    ) -> Result<([RefList; 2], bool)> {
+        let mut padded = false;
         let mut lists = [RefList::default(), RefList::default()];
         let mut short: [usize; MAX_STORED] = [0; MAX_STORED];
         let mut n_short = 0usize;
@@ -505,13 +506,16 @@ impl Dpb {
                 )));
             }
             let first = lists[x].entries[0];
+            if lists[x].len < wanted[x] {
+                padded = true;
+            }
             while lists[x].len < wanted[x] {
                 lists[x].push(usize::from(first));
             }
             lists[x].len = wanted[x];
             self.modify_list(&mut lists[x], mods[x], curr_pic_num, max_pic_num);
         }
-        Ok(lists)
+        Ok((lists, padded))
     }
 
     /// Reference picture list modification (8.2.4.3), by the insert-and-compact
@@ -589,15 +593,21 @@ impl Dpb {
     }
 
     /// Store a decoded picture and apply the reference marking of 8.2.5.
+    ///
+    /// `output_ok` is false for a picture that predicted from a reference
+    /// never decoded since the last `reset()` (a random-access leading
+    /// picture whose ref list build had to pad) — it still joins the DPB as
+    /// a reference and for bookkeeping, but must never be handed to a caller.
     pub(crate) fn store(
         &mut self,
         mut pic: Picture,
         sps: &Sps,
         info: &PicInfo,
         marking: Option<&DecRefPicMarking>,
+        output_ok: bool,
     ) -> Result<()> {
         let has_mmco5 = marking.is_some_and(|m| m.mmcos.iter().any(|c| c.op == 5));
-        pic.output = true;
+        pic.output = output_ok;
         self.number_short_term(info.frame_num, sps);
         pic.frame_num_wrap = pic.frame_num as i32;
         pic.pic_num = pic.frame_num as i32;
