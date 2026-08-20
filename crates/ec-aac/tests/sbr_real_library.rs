@@ -305,6 +305,19 @@ fn best_lag_correlation_ex(ours: &[f32], theirs: &[f32], lag_max: i64) -> (i64, 
     if !found {
         best = coarse_best;
     }
+    // A winning lag at the search bound is not a measurement (the true
+    // alignment may lie outside it): widen once to `SEARCH_LAG_MAX`, and if
+    // it still sits at the edge fail here rather than hand any caller a
+    // noise-driven number (instrument-at-bound class).
+    if at_edge && lag_max < SEARCH_LAG_MAX {
+        return best_lag_correlation_ex(ours, theirs, SEARCH_LAG_MAX);
+    }
+    assert!(
+        !at_edge,
+        "winning lag {} sits at the +/-{lag_max} search bound -- the true \
+         alignment is outside the search, corr {:.6} is noise, not a measurement",
+        best.0, best.2
+    );
     (best.0, best.2, at_edge)
 }
 
@@ -2249,20 +2262,10 @@ fn full_chain_low_band_matches_own_core() {
             // without exposing the well-behaved one to the wider bound's
             // noise floor.
             const WIDE_LAG_MAX: i64 = 20_000;
-            let (mut lag, mut corr, mut at_edge) = best_lag_correlation_ex(&ol, &ul, WIDE_LAG_MAX);
-            let mut bound = WIDE_LAG_MAX;
-            if at_edge {
-                bound = SEARCH_LAG_MAX;
-                (lag, corr, at_edge) = best_lag_correlation_ex(&ol, &ul, SEARCH_LAG_MAX);
-            }
+            // `_ex` itself widens to `SEARCH_LAG_MAX` and asserts when the
+            // winner sits at the bound.
+            let (lag, corr, _) = best_lag_correlation_ex(&ol, &ul, WIDE_LAG_MAX);
             println!("  ch{ch}: measured best lag {lag}, corr {corr:.6}");
-            assert!(
-                !at_edge,
-                "{} ch{ch}: winning lag {lag} sits at the +/-{bound} \
-                 search bound -- the true alignment is outside the search, \
-                 corr {corr:.6} is noise, not a measurement",
-                c.path.display()
-            );
             assert!(
                 corr >= 0.99,
                 "{} ch{ch}: full-chain low band vs our own core-only decode \
@@ -3380,12 +3383,12 @@ fn sbr_actual_noise_fraction() {
     // invoke this test by name, not as part of a parallel `cargo test` run.
     unsafe {
         std::env::remove_var("EC_AAC_SBR_NOISE_ZERO");
-        std::env::set_var("EC_AAC_SBR_NOISE_FRACTION_DEBUG", "1");
+        std::env::set_var("EC_AAC_SBR_NOISE_FRACTION", "1");
     }
     let (ours_on, _, rate) = our_decode(&path, 0).expect("our_decode works (noise on)");
     let bookkept = ec_aac::noise_fraction_table();
     unsafe {
-        std::env::remove_var("EC_AAC_SBR_NOISE_FRACTION_DEBUG");
+        std::env::remove_var("EC_AAC_SBR_NOISE_FRACTION");
         std::env::set_var("EC_AAC_SBR_NOISE_ZERO", "1");
     }
     let (ours_off, _, _) = our_decode(&path, 0).expect("our_decode works (noise zeroed)");
