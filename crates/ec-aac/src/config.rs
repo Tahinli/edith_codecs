@@ -136,11 +136,25 @@ pub fn parse_audio_specific_config(data: &[u8]) -> Result<AudioSpecificConfig> {
 }
 
 /// Serialises the two-byte (plus SBR extension) AudioSpecificConfig.
+///
+/// `AOT_SBR`/`AOT_PS` are the *explicit* signalling form (§1.6.2.1's "SBR
+/// config"): a core `sf_index`/`channel_config`, then the extension
+/// (`SBR`-output) `sf_index` and an `extensionAudioObjectType` of AAC-LC
+/// before the GASpecificConfig that form always carries -- without those
+/// fields a decoder that trusts the object type (rather than only its
+/// bare-ADTS implicit per-frame detection) has no extension rate to read and
+/// never reports itself as HE-AAC.
 pub fn write_audio_specific_config(cfg: &AudioSpecificConfig) -> Vec<u8> {
     let mut w = BitWriter::new();
     w.write_bits(u32::from(cfg.object_type), 5);
     w.write_bits(u32::from(cfg.sf_index), 4);
     w.write_bits(u32::from(cfg.channel_config), 4);
+    if cfg.object_type == AOT_SBR || cfg.object_type == AOT_PS {
+        let ext_rate = cfg.extension_sample_rate.unwrap_or(cfg.sample_rate * 2);
+        let ext_sf_index = sf_index_for_rate(ext_rate).unwrap_or(3);
+        w.write_bits(u32::from(ext_sf_index), 4);
+        w.write_bits(u32::from(AOT_AAC_LC), 5); // extensionAudioObjectType
+    }
     w.write_bit(false); // frameLengthFlag: 1024 samples
     w.write_bit(false); // dependsOnCoreCoder
     w.write_bit(false); // extensionFlag
@@ -307,4 +321,34 @@ pub fn write_adts_header(header: &AdtsHeader) -> Vec<u8> {
     w.write_bits(0x7FF, 11); // buffer fullness: variable rate
     w.write_bits(u32::from(header.raw_blocks.saturating_sub(1)), 2);
     w.into_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An explicit-SBR AudioSpecificConfig (object type 5) round-trips its
+    /// core AND extension sample rate through `write`/`parse` -- the write
+    /// side that a bare-ADTS ASC needs so a decoder trusting the object type
+    /// (rather than implicit per-frame detection) reports HE-AAC at the
+    /// doubled rate.
+    #[test]
+    fn explicit_sbr_config_round_trips() {
+        let cfg = AudioSpecificConfig {
+            object_type: AOT_SBR,
+            sample_rate: 22050,
+            sf_index: sf_index_for_rate(22050).unwrap(),
+            channels: 1,
+            channel_config: 1,
+            sbr_present: true,
+            ps_present: false,
+            extension_sample_rate: Some(44100),
+        };
+        let bytes = write_audio_specific_config(&cfg);
+        let parsed = parse_audio_specific_config(&bytes).expect("parses");
+        assert!(parsed.sbr_present, "explicit SBR must round-trip as SBR");
+        assert_eq!(parsed.sample_rate, 22050);
+        assert_eq!(parsed.extension_sample_rate, Some(44100));
+        assert_eq!(parsed.channels, 1);
+    }
 }
