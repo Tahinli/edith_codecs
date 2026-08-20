@@ -271,6 +271,17 @@ pub fn adjust(
     // holding it flat -- probing whether our constant-per-cell gain shape
     // (vs. the spec's smoother per-slot shape) is a live suspect.
     let gain_lerp = std::env::var("EC_AAC_SBR_GAIN_LERP").is_ok();
+    // (Round-43, Task 1) `EC_AAC_SBR_CELLDUMP=band[,band...]` -- comma list
+    // of ABSOLUTE QMF band indices (same units as `kx`/`k2`/`f_high`,
+    // `band_hz = rate/128`, per round-42's fixed test-side mapping) -- dumps
+    // every (envelope, band) cell whose `[lo,hi)` range covers a listed
+    // band: target/signal_target/noise_here/measured cur/raw+capped gain/
+    // boost/namp/sinusoid amp, and the actually-injected noise energy that
+    // frame, to stderr.
+    let celldump: Vec<usize> = std::env::var("EC_AAC_SBR_CELLDUMP")
+        .ok()
+        .map(|s| s.split(',').filter_map(|t| t.trim().parse().ok()).collect())
+        .unwrap_or_default();
 
     // Gain toward the transmitted envelope, per (envelope, band) cell,
     // limited relative to that cell's own noise floor.
@@ -389,6 +400,14 @@ pub fn adjust(
                 }
             }
         }
+        // (Round-43, Task 1) `raw_gain` (pre-cap) is about to be overwritten
+        // in place inside `gains` below; keep an uncapped copy for the
+        // celldump so its "cap applied?" column can compare against it.
+        let raw_gains: Vec<f64> = if celldump.is_empty() {
+            Vec::new()
+        } else {
+            gains.clone()
+        };
         // Pass 2: per-limiter-band aggregate cap, then per-band boost
         // compensation so the band still meets its transmitted total.
         let lim_cap: Vec<f64> = (0..n_lim)
@@ -436,6 +455,64 @@ pub fn adjust(
             // realized-noise-fraction shortfall growing toward the top of
             // the band in `EC_AAC_SBR_NOISE_ANCHOR`.
             noise_amps.push(cell_noise_here[b].sqrt() * lim_boost[j]);
+        }
+        // (Round-43, Task 1) per-cell diagnostic dump for `EC_AAC_SBR_CELLDUMP`
+        // -- printed before the application loop below so it reflects the
+        // gain/noise-amplitude values that loop is about to use; the
+        // actually-injected sample energy (which depends on the RNG draws
+        // that loop consumes) is measured separately and printed right
+        // after it, tagged with the same `ei`/band range so the two lines
+        // pair up by eye.
+        if !celldump.is_empty() {
+            for b in 0..table.len().saturating_sub(1) {
+                let lo = table[b] as usize;
+                let hi = table[b + 1] as usize;
+                if !celldump.iter().any(|&cb| cb >= lo && cb < hi) {
+                    continue;
+                }
+                let target = env_energy[ei].get(b).copied().unwrap_or(0.0);
+                let noise_here = cell_noise_here[b];
+                let signal_target = target - noise_here;
+                let cur = cell_current[b];
+                let raw_gain = raw_gains[b];
+                let lim_idx = cell_lim[b];
+                let capped = raw_gain > lim_cap[lim_idx] + 1e-12;
+                let boost = lim_boost[lim_idx];
+                let namp = noise_amps[b];
+                // Harmonic flag/amp for any listed band this cell covers
+                // (checked against the high-res `f_high` grid the sinusoid
+                // block below uses, regardless of this cell's own
+                // resolution).
+                let mut harmonic = None;
+                if let Some(flags) = &ch.add_harmonic {
+                    for (hb, &on) in flags.iter().enumerate() {
+                        if on == 0 || hb + 1 >= tables.f_high.len() {
+                            continue;
+                        }
+                        let hlo = tables.f_high[hb] as usize;
+                        let hhi = tables.f_high[hb + 1] as usize;
+                        if celldump
+                            .iter()
+                            .any(|&cb| cb >= hlo && cb < hhi && cb >= lo && cb < hi)
+                        {
+                            let e = if high_res {
+                                env_energy[ei].get(hb).copied().unwrap_or(0.0)
+                            } else {
+                                target
+                            };
+                            let hboost = lim_boost
+                                [limiter_band_index(limiter_table, hlo, hhi).min(n_lim - 1)];
+                            harmonic = Some((2.0 * e).sqrt() * hboost);
+                        }
+                    }
+                }
+                eprintln!(
+                    "CELLDUMP ei={ei} band[{lo},{hi}) target={target:.6e} \
+                     signal_target={signal_target:.6e} noise_here={noise_here:.6e} \
+                     cur={cur:.6e} raw_gain={raw_gain:.6} capped={capped} boost={boost:.6} \
+                     namp={namp:.6} harmonic_amp={harmonic:?}"
+                );
+            }
         }
         // (Round-22 sweep instrumentation) the next envelope's gains, only
         // when `EC_AAC_SBR_GAIN_LERP` is set and the band layouts match --
@@ -488,6 +565,14 @@ pub fn adjust(
         // decoder's exact per-subband gain-interpolation formula, not a
         // plausible reconstruction of it.
         let span = (t1 - t0.max(0)).max(1) as f64;
+        // (Round-43, Task 1) actual injected-noise-sample energy for the
+        // celldump, summed per listed absolute band (the RNG draws it from
+        // are only realized inside this loop, unlike everything the print
+        // block above already knows).
+        let mut celldump_injected: std::collections::HashMap<usize, (f64, f64, usize)> =
+            std::collections::HashMap::new();
+        let mut celldump_post: std::collections::HashMap<usize, (f64, usize)> =
+            std::collections::HashMap::new();
         for b in 0..table.len().saturating_sub(1) {
             let lo = table[b] as usize;
             let hi = table[b + 1] as usize;
@@ -507,12 +592,49 @@ pub fn adjust(
                         base_gain
                     };
                     row[slot] = row[slot].scale(gain);
+                    if !celldump.is_empty() && celldump.contains(&band) {
+                        let e = celldump_injected.entry(band).or_insert((0.0, 0.0, 0));
+                        e.1 += row[slot].norm_sqr(); // signal alone, pre-noise
+                        e.2 += 1;
+                    }
                     // Consume the RNG unconditionally (matches the pre-round-21
                     // stream shape) even under EC_AAC_SBR_NOISE_ZERO, which
                     // only skips the PCM addition, not the bookkeeping.
                     let n = rng.complex_unit().scale(namp);
+                    if !celldump.is_empty() && celldump.contains(&band) {
+                        let e = celldump_injected.entry(band).or_insert((0.0, 0.0, 0));
+                        e.0 += n.norm_sqr();
+                    }
                     row[slot] = row[slot] + if zero_noise { Complex::ZERO } else { n };
+                    if !celldump.is_empty() && celldump.contains(&band) {
+                        celldump_post.entry(band).or_insert((0.0, 0)).0 += row[slot].norm_sqr();
+                        celldump_post.entry(band).or_insert((0.0, 0)).1 += 1;
+                    }
                 }
+            }
+        }
+        if !celldump.is_empty() {
+            for (&band, &(noise_sum, signal_sum, count)) in &celldump_injected {
+                let (post_sum, post_count) = celldump_post.get(&band).copied().unwrap_or((0.0, 0));
+                eprintln!(
+                    "CELLDUMP ei={ei} band={band} actually_injected_noise_energy={:.6e} \
+                     actual_signal_only_energy={:.6e} post_addition_energy={:.6e} (n={count})",
+                    if count > 0 {
+                        noise_sum / count as f64
+                    } else {
+                        0.0
+                    },
+                    if count > 0 {
+                        signal_sum / count as f64
+                    } else {
+                        0.0
+                    },
+                    if post_count > 0 {
+                        post_sum / post_count as f64
+                    } else {
+                        0.0
+                    },
+                );
             }
         }
 
