@@ -134,6 +134,7 @@ pub(super) fn parameters(
         num_units_in_tick: seq.num_units_in_tick,
         time_scale: seq.time_scale,
         pic_init_qp: pic.pic_init_qp,
+        colour: config.colour,
     };
     if keyframe {
         encoder.push_packed(&headers::h264_sps(&header_params), out)?;

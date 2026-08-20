@@ -657,6 +657,166 @@ fn our_encoder_and_our_decoder_agree() {
     }
 }
 
+/// A decoded surface goes straight into an encoder with no `to_i420`
+/// read-back, and what comes out is not measurably different from the
+/// CPU-path baseline (decode -> `to_i420` -> `encode`) of the same frames.
+///
+/// 1920x1080 is the size on purpose: H.264's 16-block and HEVC's 32-block
+/// rounding both land on the same 1920x1088 coded size for it, so the
+/// decoder's surfaces satisfy `encode_frame`'s coded-size check against
+/// either target codec without a second fixture.
+#[test]
+fn encode_frame_zero_copy_matches_the_cpu_path() {
+    let Some(display) = display() else { return };
+    let (width, height) = (1920u32, 1080u32);
+    let Some(path) = fixtures(".264")
+        .into_iter()
+        .find(|p| p.file_name().and_then(|n| n.to_str()) == Some("h264-1080p-23.976-8bit.264"))
+    else {
+        eprintln!("skipped: no h264-1080p fixture — run scripts/gen-bitstream-fixtures.sh");
+        return;
+    };
+    let data = std::fs::read(&path).expect("fixture is readable");
+    let frames = 10usize;
+
+    for (target, dec_codec) in [(EncCodec::H264, Codec::H264), (EncCodec::H265, Codec::H265)] {
+        let mut cfg = EncoderConfig::new(target, width, height);
+        cfg.gop_size = 30;
+        cfg.rate_control = RateControlMode::ConstantQp { qp: 22 };
+        let mut zero_copy = Encoder::new(&display, cfg).expect("zero-copy encoder opens");
+        let mut cpu_path = Encoder::new(&display, cfg).expect("cpu-path encoder opens");
+        let mut zc_stream = Vec::new();
+        let mut cpu_stream = Vec::new();
+        let mut count = 0i64;
+
+        let mut decoder = Decoder::new(&display, Codec::H264).expect("decoder opens");
+        decode_stream(&mut decoder, Codec::H264, &data, frames, |frame| {
+            let meta = FrameMetadata {
+                timestamp: count,
+                force_keyframe: false,
+            };
+            // The zero-copy path never reads the surface back to the CPU: the
+            // only `to_i420` call in this loop is the CPU-path baseline's.
+            let zc = zero_copy
+                .encode_frame(&frame, meta)
+                .expect("encode_frame (zero copy)");
+            zc_stream.extend_from_slice(&zc.data);
+            let i420 = frame.to_i420().expect("readback for the CPU-path baseline");
+            let cpu = cpu_path.encode(&i420, meta).expect("encode (CPU path)");
+            cpu_stream.extend_from_slice(&cpu.data);
+            count += 1;
+        })
+        .expect("decode");
+        assert_eq!(count as usize, frames, "{target:?}: decoded {count} of {frames}");
+
+        let ext = match target {
+            EncCodec::H264 => "264",
+            EncCodec::H265 => "265",
+            EncCodec::Av1 => unreachable!("AV1 is not in this test's target list"),
+        };
+        let dir = std::env::temp_dir().join("ec-hw-encode-frame-zero-copy");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        for (name, bytes) in [("zc", &zc_stream), ("cpu", &cpu_stream)] {
+            std::fs::write(dir.join(format!("{name}.{ext}")), bytes).expect("write bitstream");
+        }
+
+        let mut zc_decoder = Decoder::new(&display, dec_codec).expect("zc decoder opens");
+        let mut cpu_decoder = Decoder::new(&display, dec_codec).expect("cpu decoder opens");
+        let mut zc_frames = Vec::new();
+        let mut cpu_frames = Vec::new();
+        decode_stream(&mut zc_decoder, dec_codec, &zc_stream, frames, |f| {
+            zc_frames.push(Planes::from_8bit(&f.to_i420().expect("readback")))
+        })
+        .expect("decode zero-copy stream");
+        decode_stream(&mut cpu_decoder, dec_codec, &cpu_stream, frames, |f| {
+            cpu_frames.push(Planes::from_8bit(&f.to_i420().expect("readback")))
+        })
+        .expect("decode CPU-path stream");
+        assert_eq!(zc_frames.len(), frames, "{target:?}: zero-copy stream frame count");
+        assert_eq!(cpu_frames.len(), frames, "{target:?}: CPU-path stream frame count");
+
+        let worst = zc_frames
+            .iter()
+            .zip(&cpu_frames)
+            .map(|(a, b)| psnr(a, b))
+            .fold(f64::INFINITY, f64::min);
+        println!("{target:?} encode_frame vs CPU path: worst {worst:.1} dB");
+        assert!(worst >= 35.0, "{target:?}: worst {worst:.1} dB vs the CPU path");
+    }
+}
+
+/// `EncoderConfig::colour` reaches the VUI of both codecs' packed SPS: an
+/// export with a colour description survives ffprobe reading it back, and
+/// leaving it unset keeps today's behaviour (no `video_signal_type`,
+/// deterministically — two encodes of the same picture with no colour set
+/// come back byte for byte identical).
+#[test]
+fn colour_description_reaches_the_vui() {
+    let Some(display) = display() else { return };
+    let (width, height) = (640u32, 480u32);
+    let dir = std::env::temp_dir().join("ec-hw-colour-vui");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+
+    let encode_one = |colour: Option<(u8, u8, u8, bool)>, name: &str| -> (PathBuf, Vec<u8>) {
+        let mut cfg = EncoderConfig::new(EncCodec::H265, width, height);
+        cfg.rate_control = RateControlMode::ConstantQp { qp: 26 };
+        if let Some((primaries, transfer, matrix, full_range)) = colour {
+            cfg = cfg.colour(primaries, transfer, matrix, full_range);
+        }
+        let mut enc = Encoder::new(&display, cfg).expect("encoder opens");
+        let coded = enc
+            .encode(
+                &source_frame(width, height, 0),
+                FrameMetadata {
+                    timestamp: 0,
+                    force_keyframe: true,
+                },
+            )
+            .expect("encode");
+        let path = dir.join(name);
+        std::fs::write(&path, &coded.data).expect("write bitstream");
+        (path, coded.data)
+    };
+    let probe = |path: &Path| -> String {
+        let out = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=color_primaries,color_transfer,color_space",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(path)
+            .output()
+            .expect("ffprobe runs");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    // Pinned default case: no colour set, twice, must match exactly.
+    let (default_path, default_bytes) = encode_one(None, "default-a.265");
+    let (_, default_bytes2) = encode_one(None, "default-b.265");
+    assert_eq!(
+        default_bytes, default_bytes2,
+        "no colour set: two encodes of the same picture must be byte-identical"
+    );
+    let default_probe = probe(&default_path);
+    println!("no colour set: ffprobe sees `{default_probe}`");
+    assert!(
+        !default_probe.contains("bt2020"),
+        "no colour set should not read back as BT.2020: `{default_probe}`"
+    );
+
+    // BT.2020 / PQ / BT.2020 non-constant luminance (H.273 9/16/9).
+    let (bt2020_path, _) = encode_one(Some((9, 16, 9, false)), "bt2020.265");
+    // ffprobe's csv reorders these as color_space,color_transfer,color_primaries
+    // regardless of the -show_entries order given above.
+    let got = probe(&bt2020_path);
+    assert_eq!(got, "bt2020nc,smpte2084,bt2020", "ffprobe on the BT.2020 stream");
+}
+
 /// AV1 encoding is opt-in, and this test does not turn it on.
 ///
 /// It was probed once, live, at the driver's own minimum encode size
