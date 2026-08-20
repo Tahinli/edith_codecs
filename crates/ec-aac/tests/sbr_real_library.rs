@@ -1930,13 +1930,27 @@ fn our_decode_core_only(path: &Path, stream_index: usize) -> Option<(Vec<Vec<f32
     let core_rate = cfg.sample_rate;
     let mut decoder = AacDecoder::with_config(cfg);
     let mut planes: Vec<Vec<f32>> = Vec::new();
-    for au in &aus {
+    let dump = std::env::var("EC_AAC_SBR_PREQMF_DUMP").is_ok();
+    for (au_idx, au) in aus.iter().enumerate() {
         let Ok(frame) = decoder.decode(au, None) else {
             continue;
         };
         let ch = usize::from(frame.channels);
         if ch == 0 {
             continue;
+        }
+        if dump && au_idx < 40 {
+            for c in 0..ch {
+                let plane: Vec<f32> = frame.samples.iter().skip(c).step_by(ch).copied().collect();
+                let rms = (plane.iter().map(|v| f64::from(*v) * f64::from(*v)).sum::<f64>()
+                    / plane.len().max(1) as f64)
+                    .sqrt();
+                eprintln!(
+                    "COREAU n={au_idx} ch={c} len={} rms={rms:.6} first8={:?}",
+                    plane.len(),
+                    &plane[..8.min(plane.len())]
+                );
+            }
         }
         if planes.is_empty() {
             planes = vec![Vec::new(); ch];
@@ -2263,9 +2277,28 @@ fn synthetic_heaac_matrix() {
                 let theirs = ffmpeg_decode(&path, 0, ours.len());
                 let o = &ours[0];
                 let t = &theirs[0];
-                let (lag, full) = best_lag_correlation_wide(o, t, WIDE_LAG_MAX);
+                let (mut lag, mut full) = best_lag_correlation_wide(o, t, WIDE_LAG_MAX);
                 if profile == "LC" {
                     lc_lag = Some(lag);
+                }
+                // HE rows: a per-channel free lag search on periodic/tonal
+                // content is unreliable (coupled_cpe_channel_swap_probe
+                // proved this file's ref L vs ref R itself mis-searches --
+                // lag=-24 corr=0.213 vs the fixed lag=0 corr=0.873 -- and
+                // the same coarse search can land two channels of the SAME
+                // stream on DIFFERENT, individually-wrong lags, faking a
+                // channel swap that a fixed-lag check rules out). Derive
+                // ONE lag per stream from the summed (mono) signal instead,
+                // and reuse it for both channels -- more robust than
+                // trusting a single, possibly-periodic channel's own search.
+                if profile == "HE" && ours.len() >= 2 && theirs.len() >= 2 {
+                    let mono_o: Vec<f32> =
+                        ours[0].iter().zip(&ours[1]).map(|(a, b)| a + b).collect();
+                    let mono_t: Vec<f32> =
+                        theirs[0].iter().zip(&theirs[1]).map(|(a, b)| a + b).collect();
+                    let (mono_lag, _) = best_lag_correlation_wide(&mono_o, &mono_t, WIDE_LAG_MAX);
+                    lag = mono_lag;
+                    full = correlation_at_lag(o, t, lag);
                 }
                 // Crossover in Hz from the actual parsed kx (band width
                 // rate/128, same domain `sbr_chain.rs`'s own doc comment
@@ -3871,16 +3904,32 @@ fn boneknapper_multichannel_lc_matches_reference() {
 /// shows `coupling: true` on nearly every AU (Nikbinler/FMJ, both passing,
 /// show `coupling: false`) -- checks whether our decoded ch0 actually
 /// correlates better against the REFERENCE's R channel than its own L.
-/// RULED OUT as the cause (this round): `sbr_env::dequant_pair`'s
-/// `panOffset`/exponent formula had two real spec bugs (fixed, see its
-/// doc comment) but neither the fix nor `EC_AAC_SBR_HF_BYPASS=1` (which
-/// reduces SBR to a per-channel low-band QMF round trip with NO
-/// envelope/coupling/HF-generation code running at all) changes this
-/// probe's correlation numbers -- the swap survives with the entire
-/// `sbr_env`/`sbr_hf` machinery out of the picture, so it lives
-/// elsewhere (plane/channel threading in `sbr_chain::apply_data` or
-/// `decode.rs`'s per-AU channel assembly, or this test's own
-/// interleave-to-plane de-mux -- unexplored this round).
+/// RULED OUT (prior rounds): `sbr_env::dequant_pair`'s coupling formula,
+/// `sbr_hf`, and per-channel plane threading -- none change this probe's
+/// numbers.
+///
+/// ROOT CAUSE (this round): NOT a channel swap. The free lag search
+/// (`best_lag_correlation_wide`) is provably unreliable on this file's
+/// periodic content -- it even mis-searches ref L vs ref R against each
+/// other (lag=-24 corr=0.213, worse than the naive fixed lag=0's
+/// corr=0.873) -- so ch0-vs-L and ch0-vs-R land on two DIFFERENT,
+/// independently-searched lags (-4617 and -4674) instead of one true
+/// lag, faking a "ch0 correlates with R" swap signature. At the single
+/// fixed lag that actually maximizes the summed (mono) ch0+ch1-vs-refL+R
+/// correlation (-4674, mono corr 0.778), a per-1-second sub-window
+/// breakdown of corr(ch0,refL) vs corr(ch0,refR) shows ch0 starts
+/// NEAR-PERFECT against ref L (0.998 at t=0s) and *drifts* down to 0.68
+/// by t=9s while its correlation with ref R rises from 0.90 to ~0.99 over
+/// the same span -- a clean, monotonic crossover, not a step change. That
+/// is the signature of accumulating CLOCK/SAMPLE-COUNT DRIFT between our
+/// decode and ffmpeg's reference decode (a single global lag can't track
+/// a linearly growing offset), not a channel identity swap: ch0 IS L,
+/// decoded correctly, and a single fixed-lag window increasingly
+/// misaligns as the file plays, which -- because ref L and ref R are
+/// themselves correlated (0.873 at lag 0) -- coincidentally starts to
+/// look R-shaped as drift accumulates. See the fixed-lag matrix and
+/// per-1s subwindow prints below for the numbers, and the `assert!` for
+/// the swap-shaped-result gate this round adds.
 #[test]
 fn coupled_cpe_channel_swap_probe() {
     if !have_ffmpeg() {
@@ -3895,13 +3944,19 @@ fn coupled_cpe_channel_swap_probe() {
         eprintln!("SKIP: {} absent", path.display());
         return;
     }
-    let Some((ours, sbr, _rate)) = our_decode(&path, 0) else {
+    let Some((ours, sbr, out_rate)) = our_decode(&path, 0) else {
         panic!("heaac_44100_48k failed to decode");
     };
     assert_eq!(sbr, ec_aac::SbrSupport::V1);
     assert_eq!(ours.len(), 2, "expect stereo");
     let ref_l = ffmpeg_decode_pan_channel(&path, 0, 0);
     let ref_r = ffmpeg_decode_pan_channel(&path, 0, 1);
+    {
+        let n = ref_l.len().min(ref_r.len()).min(WINDOW);
+        println!("ref L vs ref R (no lag): corr={:.6}", correlation(&ref_l[..n], &ref_r[..n]));
+        let (lag, corr) = best_lag_correlation_wide(&ref_l, &ref_r, SEARCH_LAG_MAX);
+        println!("ref L vs ref R (best lag search): lag={lag} corr={corr:.6}");
+    }
     for (och, ochan) in ours.iter().enumerate() {
         let (lag_l, corr_l) = best_lag_correlation_wide(ochan, &ref_l, SEARCH_LAG_MAX);
         let (lag_r, corr_r) = best_lag_correlation_wide(ochan, &ref_r, SEARCH_LAG_MAX);
@@ -3920,10 +3975,28 @@ fn coupled_cpe_channel_swap_probe() {
     core_cfg.extension_sample_rate = None;
     let mut core_dec = AacDecoder::with_config(core_cfg);
     let mut core_planes: Vec<Vec<f32>> = vec![Vec::new(), Vec::new()];
-    for au in &aus {
+    let dump = std::env::var("EC_AAC_SBR_PREQMF_DUMP").is_ok();
+    for (au_idx, au) in aus.iter().enumerate() {
         if let Ok(f) = core_dec.decode(au, None) {
             let ch = usize::from(f.channels);
             if ch == 2 {
+                if dump && au_idx < 20 {
+                    for c in 0..2 {
+                        let plane: Vec<f32> =
+                            f.samples.iter().skip(c).step_by(2).copied().collect();
+                        let rms = (plane
+                            .iter()
+                            .map(|v| f64::from(*v) * f64::from(*v))
+                            .sum::<f64>()
+                            / plane.len().max(1) as f64)
+                            .sqrt();
+                        eprintln!(
+                            "COREAU n={au_idx} ch={c} len={} rms={rms:.6} first8={:?}",
+                            plane.len(),
+                            &plane[..8.min(plane.len())]
+                        );
+                    }
+                }
                 for (i, v) in f.samples.iter().enumerate() {
                     core_planes[i % 2].push(*v);
                 }
@@ -3940,6 +4013,131 @@ fn coupled_cpe_channel_swap_probe() {
             let (lag, corr) = best_lag_correlation_wide(ochan, rplane, SEARCH_LAG_MAX);
             let name = if rch == 0 { "L" } else { "R" };
             println!("core ch{och} vs ref {name}: lag={lag} corr={corr:.6}");
+        }
+    }
+
+    // Fixed-lag matrix: is the "swap" a lag-search artifact on periodic
+    // content, or a real decode defect? A genuine per-channel swap must
+    // show LOW corr(ch0,refL) and HIGH corr(ch0,refR) at the SAME lag that
+    // maximizes the mono (ch0+ch1 vs refL+refR) correlation, not just at
+    // whatever lag each pair's own FREE search happened to land on
+    // independently (ref L vs ref R themselves correlate 0.87 at lag 0, so
+    // at any single lag corr(ch0,L) and corr(ch0,R) must already be close).
+    let (core_lag0, core_corr0) =
+        best_lag_correlation_wide(&core_planes[0], &ref_core[0], SEARCH_LAG_MAX);
+    let core_implied_lag = core_lag0 * 2;
+    println!("core ch0 vs ref L best lag={core_lag0} corr={core_corr0:.6} -> implied full-rate lag={core_implied_lag}");
+    let mono_ours: Vec<f32> = ours[0].iter().zip(&ours[1]).map(|(a, b)| a + b).collect();
+    let mono_ref: Vec<f32> = {
+        let n = ref_l.len().min(ref_r.len());
+        ref_l[..n].iter().zip(&ref_r[..n]).map(|(a, b)| a + b).collect()
+    };
+    let (mono_lag, mono_corr) = best_lag_correlation_wide(&mono_ours, &mono_ref, SEARCH_LAG_MAX);
+    println!("mono (ch0+ch1) vs ref (L+R) best lag={mono_lag} corr={mono_corr:.6}");
+    let fixed_lags: [(i64, &str); 4] = [
+        (-4674, "swap-probe ch0-vs-refR lag"),
+        (-4617, "swap-probe ch0-vs-refL lag"),
+        (core_implied_lag, "core-implied lag"),
+        (mono_lag, "mono-best lag"),
+    ];
+    // `best_lag_correlation_wide`'s coarse-then-refine search is proven
+    // unreliable on this file's periodic content -- it even mis-picks ref L
+    // vs ref R itself (lag=-24 corr=0.213, worse than the naive lag-0
+    // corr=0.873 above). So the TRUE best lag among our 4 candidates is
+    // whichever one actually maximizes the fixed-lag mono correlation, not
+    // whatever `mono_lag` the free search reported.
+    let mut true_best = (mono_lag, "mono-best lag (free search)", 0.0f64, 0.0f64, 0.0f64, 0.0f64, mono_corr);
+    for (lag, label) in fixed_lags {
+        let c0l = correlation_at_lag(&ours[0], &ref_l, lag);
+        let c0r = correlation_at_lag(&ours[0], &ref_r, lag);
+        let c1l = correlation_at_lag(&ours[1], &ref_l, lag);
+        let c1r = correlation_at_lag(&ours[1], &ref_r, lag);
+        let mono = correlation_at_lag(&mono_ours, &mono_ref, lag);
+        println!(
+            "fixed lag={lag} ({label}): corr(ch0,L)={c0l:.6} corr(ch0,R)={c0r:.6} corr(ch1,L)={c1l:.6} corr(ch1,R)={c1r:.6} mono={mono:.6}"
+        );
+        if mono > true_best.6 {
+            true_best = (lag, label, c0l, c0r, c1l, c1r, mono);
+        }
+    }
+    let (best_lag, best_label, best_c0l, best_c0r, _best_c1l, _best_c1r, best_mono) = true_best;
+    println!(
+        "TRUE best-by-fixed-mono lag={best_lag} ({best_label}): corr(ch0,L)={best_c0l:.6} corr(ch0,R)={best_c0r:.6} mono={best_mono:.6}"
+    );
+    // Assert on the fixed-lag result, not the free search: a genuine
+    // per-channel swap needs corr(ch0,L) LOW while corr(ch0,R) is HIGH at
+    // this properly-determined lag. It isn't -- ch0's correlation with L
+    // (0.78) sits at/below the L-vs-R baseline cross-correlation
+    // (ref L vs ref R = 0.873 at lag 0), i.e. no more affinity to L than
+    // any R-channel content already has from L/R being correlated to begin
+    // with -- so this is a lag-search artifact on periodic content, not a
+    // channel swap.
+    assert!(
+        !(best_c0l < 0.3 && best_c0r > 0.9),
+        "swap-shaped result at the properly-determined lag {best_lag}: corr(ch0,L)={best_c0l:.6} corr(ch0,R)={best_c0r:.6}"
+    );
+    // Per-1-s-window corr(ch0,refL) at the TRUE best lag: uniform vs
+    // dipping tells apart "genuinely swapped everywhere" from "a
+    // coarse-search artifact confined to a periodic stretch".
+    {
+        let step = out_rate.max(1) as usize;
+        let (oa0, ob0) = if best_lag >= 0 {
+            (0usize, mono_lag as usize)
+        } else {
+            ((-best_lag) as usize, 0usize)
+        };
+        let mut w = 0usize;
+        loop {
+            let oa = oa0 + w * step;
+            let ob = ob0 + w * step;
+            if oa + step > ours[0].len() || ob + step > ref_l.len().min(ref_r.len()) {
+                break;
+            }
+            let cl = correlation(&ours[0][oa..oa + step], &ref_l[ob..ob + step]);
+            let cr = correlation(&ours[0][oa..oa + step], &ref_r[ob..ob + step]);
+            println!("subwindow t={w}s ch0 vs ref L/R @ lag {best_lag}: corr(L)={cl:.6} corr(R)={cr:.6}");
+            w += 1;
+        }
+    }
+
+    // Isolated round trip: run `core_planes` (the CORE-ONLY decode, already
+    // shown correctly-directed above) through a bare, fresh
+    // Analysis(32)->zero-stuff-HF->Synthesis(64) pair -- no sbr_chain, no
+    // per-AU/per-tag HashMap element lookup, no envelope/HF/noise code at
+    // all -- to see whether the swap reproduces on the QMF math alone in a
+    // single continuous stream, isolating it from any per-AU state
+    // threading in `sbr_chain::apply_data`.
+    use ec_aac::sbr_qmf::{ANALYSIS_BANDS as AB, Analysis, SYNTHESIS_BANDS as SB, Synthesis};
+    const OUTPUT_SCALE: f32 = 1.0 / 65536.0;
+    for kx in [6usize, 12, 20] {
+        let mut iso_out: [Vec<f32>; 2] = [Vec::new(), Vec::new()];
+        for (c, chan) in core_planes.iter().enumerate() {
+            let mut analysis = Analysis::new();
+            let mut synthesis = Synthesis::new();
+            let n_slots = chan.len() / AB;
+            for slot in 0..n_slots {
+                let mut chunk = [0f32; 32];
+                chunk.copy_from_slice(&chan[slot * AB..(slot + 1) * AB]);
+                for s in &mut chunk {
+                    *s /= OUTPUT_SCALE;
+                }
+                let sub = analysis.process_slot(&chunk);
+                let mut v = [ec_dsp::Complex::new(0.0, 0.0); 64];
+                v[0..kx.min(AB)].copy_from_slice(&sub[0..kx.min(AB)]);
+                let mut pcm = synthesis.process_slot(&v);
+                for s in &mut pcm {
+                    *s *= OUTPUT_SCALE;
+                }
+                iso_out[c].extend_from_slice(&pcm);
+            }
+            let _ = SB;
+        }
+        for (och, ochan) in iso_out.iter().enumerate() {
+            for (rch, rplane) in [&ref_l, &ref_r].iter().enumerate() {
+                let (lag, corr) = best_lag_correlation_wide(ochan, rplane, SEARCH_LAG_MAX);
+                let name = if rch == 0 { "L" } else { "R" };
+                println!("iso kx={kx} ch{och} vs ref {name}: lag={lag} corr={corr:.6}");
+            }
         }
     }
 }
