@@ -120,6 +120,24 @@ for lspec in "stereo|2" "5.1|6"; do
         "${AIN[@]}" "${AMAP[@]}" -c:a alac -sample_fmt s32p -ar 48000
 done
 
+# AAC coding-tool isolation: one fixture per §4.6 tool ffmpeg's native aac
+# encoder can force on its own (plus one with all four), so a decode
+# regression in any single tool pins to its own fixture rather than a mix.
+AAC_TOOL_VARIANTS=(
+    "pns|-aac_pns 1 -aac_is 0 -aac_ms 0 -aac_tns 0"
+    "is|-aac_pns 0 -aac_is 1 -aac_ms 0 -aac_tns 0"
+    "ms|-aac_pns 0 -aac_is 0 -aac_ms 1 -aac_tns 0"
+    "tns|-aac_pns 0 -aac_is 0 -aac_ms 0 -aac_tns 1"
+    "all|-aac_pns 1 -aac_is 1 -aac_ms 1 -aac_tns 1"
+)
+for spec in "${AAC_TOOL_VARIANTS[@]}"; do
+    IFS='|' read -r vname vargs <<<"$spec"
+    read -r -a VARGS <<<"$vargs"
+    build_audio_in 2 48000
+    gen "$FIXTURES/audio/aac-tool-${vname}-mp4-stereo-48000.m4a" \
+        "${AIN[@]}" "${AMAP[@]}" -c:a aac -b:a 160k "${VARGS[@]}" -ar 48000
+done
+
 # Matroska-carried audio: what the probe hands to the Matroska reader rather
 # than parsing itself. One per codec family that has a Matroska mapping.
 for spec in "aac|-c:a aac -b:a 160k" "flac|-c:a flac" "opus|-c:a libopus -b:a 160k"; do
