@@ -809,3 +809,51 @@ fn same_class_sweep(path: &str, wants: &[f64]) {
         );
     }
 }
+
+/// `ffprobe` reports MaxCLL 1230 / MaxFALL 419 for this real HDR10 film, but
+/// that reading comes from `[SIDE_DATA]` on the first *frame* (a
+/// `content_light_level_information` HEVC SEI message inside the bitstream),
+/// not from the container's own `Colour` element. This file's `Colour`
+/// element genuinely carries no `MaxCLL`/`MaxFALL`/`MasteringMetadata`
+/// children (checked with `ffprobe -show_entries stream=side_data_list`,
+/// which comes back empty) — so a demuxer-only reader is correct to return
+/// `None` here, and the consumer's brightness-metadata gap is downstream, in
+/// whether anything reads the HEVC SEI (`ec_core::color::hevc_sei_light`
+/// exists and round-trips in `ec-h265-syntax`, but nothing in this workspace
+/// calls it from a real decode path yet).
+#[test]
+#[ignore = "reads a real local file, not a CI fixture"]
+fn real_hdr_film_container_states_no_light_metadata() {
+    use ec_core::{Demuxer, MediaParameters};
+    use ec_matroska::MatroskaDemuxer;
+    let path = "/home/tahinli/Downloads/Project.Hail.Mary.2026.PROPER.HDR.2160p.WEB.h265-GRACE/Project.Hail.Mary.2026.PROPER.HDR.2160p.WEB.h265-GRACE.mkv";
+    if !std::path::Path::new(path).exists() {
+        eprintln!("skipped: film not present");
+        return;
+    }
+    let f = std::fs::File::open(path).expect("open");
+    let demux = MatroskaDemuxer::new(f).expect("demux opens");
+    let mut checked = false;
+    for s in demux.streams() {
+        if let MediaParameters::Video(v) = &s.params.media {
+            println!("color = {:?}", v.color);
+            println!("light = {:?}", v.light);
+            // BT.2020 non-constant luminance, PQ transfer, BT.2020 primaries —
+            // this much the Colour element does carry, and it must match
+            // ffprobe's color_space/color_primaries/color_transfer.
+            assert_eq!(v.color.matrix, 9, "expected bt2020nc");
+            assert_eq!(v.color.transfer, 16, "expected smpte2084 (PQ)");
+            assert_eq!(v.color.primaries, 9, "expected bt2020");
+            assert_eq!(
+                v.light,
+                ec_core::color::ContentLight::default(),
+                "the Colour element has no light metadata for this file — a \
+                 non-default reading here would mean either ffprobe or this \
+                 reader started finding it in the container and the doc \
+                 comment above is stale"
+            );
+            checked = true;
+        }
+    }
+    assert!(checked, "no video stream found");
+}
