@@ -154,6 +154,17 @@ impl Decoder {
             Inner::Av1(d) => d.stream_info(),
         }
     }
+
+    /// This stream's colour metadata, once a session exists. [`None`] for VP9
+    /// and AV1: neither's sequence header colour config is parsed by this
+    /// family yet.
+    pub fn colour(&self) -> Option<crate::frame::Colour> {
+        match &self.inner {
+            Inner::H264(d) => d.colour(),
+            Inner::H265(d) => d.colour(),
+            Inner::Vp9(_) | Inner::Av1(_) => None,
+        }
+    }
 }
 
 /// Frames waiting to be collected, oldest first.

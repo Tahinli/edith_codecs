@@ -97,6 +97,27 @@ pub struct EncoderConfig {
     pub quality: u32,
     /// Permit AV1 encoding. Without it, [`EncCodec::Av1`] is refused.
     pub allow_av1: bool,
+    /// The colour description to write into the VUI, or `None` to leave it
+    /// unsignalled (`video_signal_type_present_flag = 0`) as before.
+    pub colour: Option<Colour>,
+}
+
+/// H.265 E.2.1 / H.264 E.1.1 colour description code points for the VUI.
+///
+/// Carried verbatim into `colour_primaries`, `transfer_characteristics` and
+/// `matrix_coeffs` — this crate does not interpret them, so a caller wanting
+/// BT.2020/PQ passes `(9, 16, 9)`, BT.709 SDR `(1, 1, 1)`, and so on (H.273
+/// tables 2/3/4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Colour {
+    /// `colour_primaries`.
+    pub primaries: u8,
+    /// `transfer_characteristics`.
+    pub transfer: u8,
+    /// `matrix_coeffs`.
+    pub matrix: u8,
+    /// `video_full_range_flag`.
+    pub full_range: bool,
 }
 
 impl EncoderConfig {
@@ -112,7 +133,25 @@ impl EncoderConfig {
             rate_control: RateControlMode::ConstantBitrate,
             quality: 0,
             allow_av1: false,
+            colour: None,
         }
+    }
+
+    /// Set the VUI colour description; H.265 E.2.1 / H.264 E.1.1 code points.
+    pub fn colour(
+        mut self,
+        primaries: u8,
+        transfer: u8,
+        matrix: u8,
+        full_range: bool,
+    ) -> EncoderConfig {
+        self.colour = Some(Colour {
+            primaries,
+            transfer,
+            matrix,
+            full_range,
+        });
+        self
     }
 }
 
@@ -269,15 +308,65 @@ impl Encoder {
                 self.config.width, self.config.height, frame.width, frame.height
             )));
         }
-        let keyframe = meta.force_keyframe
-            || self.reference.is_none()
-            || self.gop_position >= self.config.gop_size.max(1);
-
         let input = self
             .pool
             .acquire()
             .ok_or_else(|| Error::config("encode: every surface is still in use"))?;
         self.upload(frame, &input)?;
+        self.encode_surface(Arc::clone(input.surface()), meta)
+    }
+
+    /// Encode a decoded frame's GPU surface directly: no `to_i420` read-back,
+    /// no re-upload, just the decoder's picture handed straight to the
+    /// encoder as its source. This is the path a decode-then-encode pipeline
+    /// (e.g. a transcode) wants — the alternative is a full frame through
+    /// system memory and back for no reason.
+    ///
+    /// Refused, rather than silently working around, when:
+    /// - `frame` was decoded on a different [`ec_va::Display`]: a surface id
+    ///   only means anything on the display that created it.
+    /// - `frame` is 10-bit (P010): every profile this crate encodes
+    ///   (`H264High`, `HEVCMain`) is 8-bit, so there is no lossless
+    ///   destination for the extra two bits — call [`Frame::to_i420`] and
+    ///   [`Encoder::encode`] if the truncation is acceptable.
+    /// - `frame`'s coded size does not match this encoder's: the surface
+    ///   formats have to agree for the driver to read one as the other with
+    ///   no VPP conversion pass, and this crate does not carry a VPP-free
+    ///   fallback for a mismatched size.
+    pub fn encode_frame(
+        &mut self,
+        frame: &crate::frame::Frame,
+        meta: FrameMetadata,
+    ) -> Result<CodedFrame> {
+        if frame.bit_depth != 8 {
+            return Err(Error::unsupported(
+                format!("encode_frame of a {}-bit source", frame.bit_depth),
+                "H264High and HEVCMain, the only profiles this crate encodes, are 8-bit; \
+                 decode to I420 with Frame::to_i420 and call Encoder::encode instead",
+            ));
+        }
+        if !Arc::ptr_eq(frame.surface().display(), self.context.display()) {
+            return Err(Error::config(
+                "encode_frame: the frame was decoded on a different Display than this encoder",
+            ));
+        }
+        if frame.coded_size != self.coded_size {
+            return Err(Error::config(format!(
+                "encode_frame: encoder surfaces are {}x{}, the frame's are {}x{}",
+                self.coded_size.0, self.coded_size.1, frame.coded_size.0, frame.coded_size.1
+            )));
+        }
+        self.encode_surface(Arc::clone(frame.surface()), meta)
+    }
+
+    /// Shared submission path for [`Encoder::encode`] and
+    /// [`Encoder::encode_frame`]: everything after the source surface is
+    /// settled.
+    fn encode_surface(&mut self, source: Arc<Surface>, meta: FrameMetadata) -> Result<CodedFrame> {
+        let keyframe = meta.force_keyframe
+            || self.reference.is_none()
+            || self.gop_position >= self.config.gop_size.max(1);
+
         let recon = self
             .pool
             .acquire()
@@ -298,7 +387,7 @@ impl Encoder {
         buffers.extend(self.rate_control_buffers()?);
         buffers.push(coded_buf);
 
-        let mut picture = Picture::new(&self.context, Arc::clone(input.surface()))
+        let mut picture = Picture::new(&self.context, source)
             .begin()?
             .render_all(buffers)?
             .end()?

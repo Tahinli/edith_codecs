@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use ec_core::color::{ColorDescription, ContentLight, Tags};
 use ec_h264_syntax::{
     AnnexBIter, DecRefPicMarking, NalHeader, NalUnitType, Pps, PredWeightTable, SliceHeader,
     SliceType, Sps, unescape_rbsp,
@@ -12,7 +13,7 @@ use ec_va::{Buffer, Display, sys};
 use super::dpb264::{Dpb, Mark, PicInfo, Picture, Poc, RefList};
 use super::{ReadyFrames, Session, StreamInfo};
 use crate::error::{Error, Result};
-use crate::frame::Frame;
+use crate::frame::{Colour, Frame};
 use crate::params::h264::{
     IQMatrixBufferH264, PICTURE_LONG_TERM_REFERENCE, PICTURE_SHORT_TERM_REFERENCE,
     PictureParameterBufferH264, SliceParameterBufferH264, VAPictureH264,
@@ -38,6 +39,8 @@ struct Current {
     /// Parameter and data buffers submitted so far.
     buffers: Vec<Buffer>,
     slices: usize,
+    /// Set if any slice's ref list build had to pad (see `H264Decoder::recovery_poc`).
+    ref_padded: bool,
 }
 
 /// A stateless H.264 decoder.
@@ -52,6 +55,16 @@ pub struct H264Decoder {
     /// Reusable unescape buffer; NAL payloads are rewritten into it in turn.
     rbsp: Vec<u8>,
     gap_frames: u64,
+    /// `PicOrderCnt` of the random-access point most recently established by
+    /// `reset()` — the first picture decoded after it. `None` before that
+    /// picture completes. Absent a recovery_point SEI (not parsed here),
+    /// D.2.8's recovery point defaults to this picture itself: anything with
+    /// a smaller POC that had to guess a reference (`Current::ref_padded`)
+    /// predicts from something never decoded since the seek and must not
+    /// reach the caller.
+    recovery_poc: Option<i32>,
+    /// The most recent SPS's VUI colour tags, sticky across pictures.
+    colour_tags: Tags,
 }
 
 impl H264Decoder {
@@ -68,6 +81,8 @@ impl H264Decoder {
             current: None,
             rbsp: Vec::new(),
             gap_frames: 0,
+            recovery_poc: None,
+            colour_tags: Tags::default(),
         }
     }
 
@@ -86,6 +101,7 @@ impl H264Decoder {
                     self.rbsp = rbsp;
                     let sps = sps?;
                     self.dpb.configure(&sps);
+                    self.colour_tags = vui_colour_tags(&sps);
                     let id = usize::from(sps.id);
                     self.sps_map[id] = Some(sps);
                 }
@@ -132,6 +148,7 @@ impl H264Decoder {
         self.dpb.clear();
         self.ready.clear();
         self.gap_frames = 0;
+        self.recovery_poc = None;
     }
 
     /// What the stream turned out to be, once its first SPS was seen.
@@ -268,6 +285,7 @@ impl H264Decoder {
             marking: sh.dec_ref_pic_marking.clone(),
             buffers: Vec::new(),
             slices: 0,
+            ref_padded: false,
         });
         Ok(())
     }
@@ -317,7 +335,7 @@ impl H264Decoder {
             [RefList::default(), RefList::default()]
         } else {
             self.dpb.number_short_term(sh.frame_num, sps);
-            self.dpb.build_ref_lists(
+            let (lists, padded) = self.dpb.build_ref_lists(
                 sh.slice_type,
                 current.poc.value,
                 sh.frame_num as i32,
@@ -325,7 +343,9 @@ impl H264Decoder {
                 sh.num_ref_idx_l0_active as usize,
                 sh.num_ref_idx_l1_active as usize,
                 (&sh.ref_pic_list_mod_l0, &sh.ref_pic_list_mod_l1),
-            )?
+            )?;
+            current.ref_padded |= padded;
+            lists
         };
 
         let slice_param = slice_parameters(sh, pps, nal, &lists, &self.dpb);
@@ -359,6 +379,10 @@ impl H264Decoder {
 
         session.submit(&current.surface, current.buffers)?;
 
+        // See `recovery_poc`'s doc comment.
+        let recovery_poc = *self.recovery_poc.get_or_insert(current.poc.value);
+        let output_ok = !(current.ref_padded && current.poc.value < recovery_poc);
+
         let picture = Picture {
             id: current.id,
             surface: Arc::clone(&current.surface),
@@ -376,7 +400,7 @@ impl H264Decoder {
             output: true,
         };
         self.dpb
-            .store(picture, &sps, &current.info, current.marking.as_ref())?;
+            .store(picture, &sps, &current.info, current.marking.as_ref(), output_ok)?;
         self.bump(false);
         Ok(())
     }
@@ -395,11 +419,45 @@ impl H264Decoder {
                 session.display_size,
                 session.coded_size,
                 session.bit_depth,
+                self.colour(),
             );
             self.ready.push(frame);
             self.dpb.released(idx);
         }
     }
+
+    /// This stream's colour metadata, once its first SPS has been seen. No SEI
+    /// here — H.264's mastering-display/content-light-level SEI is not parsed
+    /// by this family today, so this is VUI-only.
+    pub fn colour(&self) -> Option<Colour> {
+        let session = self.session.as_ref()?;
+        Some(Colour {
+            description: ColorDescription::resolve(
+                Tags::default(),
+                self.colour_tags,
+                session.display_size.1,
+            ),
+            light: ContentLight::default(),
+        })
+    }
+}
+
+/// An SPS's VUI `colour_description` and range flag, as [`Tags`] for
+/// [`ColorDescription::resolve`]. [`Tags::default()`] when the VUI has no
+/// `video_signal_type` at all.
+fn vui_colour_tags(sps: &Sps) -> Tags {
+    let Some(vui) = &sps.vui else {
+        return Tags::default();
+    };
+    if vui.video_format.is_none() {
+        return Tags::default();
+    }
+    let (_primaries, transfer, matrix) = vui.colour_description.unwrap_or((0, 0, 0));
+    Tags::from_codes(
+        u64::from(matrix),
+        u64::from(transfer),
+        if vui.video_full_range { 2 } else { 1 },
+    )
 }
 
 /// The `pic_parameter_set_id` of a slice header, which is the second syntax

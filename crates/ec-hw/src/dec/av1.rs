@@ -115,6 +115,7 @@ impl Av1Decoder {
             (header.render_width, header.render_height),
             session.coded_size,
             session.bit_depth,
+            None,
         ));
         // 7.21: showing a KEY frame again refreshes every reference slot with
         // it, which the reference *surfaces* have to follow too.
@@ -183,6 +184,7 @@ impl Av1Decoder {
                 (header.render_width, header.render_height),
                 session.coded_size,
                 session.bit_depth,
+                None,
             ));
         }
         Ok(())

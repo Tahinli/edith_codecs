@@ -134,6 +134,19 @@ pub struct Decoder {
     out: VecDeque<VideoFrame>,
     /// Presentation timestamp to attach to the next picture started.
     pending_pts: Option<Timestamp>,
+    /// `PicOrderCnt` of the random-access point most recently established by
+    /// [`Decoder::reset_pictures`] — the first picture decoded after it,
+    /// i.e. the I picture a seek landed on. `None` before that picture
+    /// completes. Absent a recovery_point SEI (not parsed here), D.2.8's
+    /// recovery point defaults to this picture itself: anything with a
+    /// smaller POC that had to guess a reference (see `cur_ref_padded`)
+    /// predicts from something never decoded since the seek and must not
+    /// reach the caller.
+    recovery_poc: Option<i32>,
+    /// Set while decoding the open picture if `build_ref_lists` had to pad a
+    /// reference list, i.e. this picture asked for a reference the DPB does
+    /// not have. Reset per picture in `start_picture`.
+    cur_ref_padded: bool,
 }
 
 /// What [`Decoder::push_nal`] did with a NAL unit.
@@ -199,6 +212,8 @@ impl Decoder {
             output_order: OutputOrder::default(),
             out: VecDeque::new(),
             pending_pts: None,
+            recovery_poc: None,
+            cur_ref_padded: false,
         }
     }
 
@@ -301,13 +316,18 @@ impl Decoder {
         self.cur.extend_borders();
         self.cur.complete = true;
         self.last_decoded = self.cur.id;
+        // The first picture completed after a reset is the random-access
+        // point the seek landed on; its own POC becomes the recovery
+        // threshold (see `recovery_poc`'s doc comment).
+        let recovery_poc = *self.recovery_poc.get_or_insert(self.cur.poc);
+        let output_ok = !(self.cur_ref_padded && self.cur.poc < recovery_poc);
         let sps_id = self.cur.sps_id as usize;
         let sps = self.sps_map[sps_id]
             .take()
             .ok_or_else(|| Error::corrupt("active SPS vanished"))?;
         let pic = core::mem::take(&mut self.cur);
         let marking = self.has_marking.then_some(&self.cur_marking);
-        let stored = self.dpb.store(pic, &sps, &self.cur_info, marking);
+        let stored = self.dpb.store(pic, &sps, &self.cur_info, marking, output_ok);
         self.sps_map[sps_id] = Some(sps);
         stored?;
         self.has_picture = false;
@@ -357,6 +377,7 @@ impl Decoder {
         self.out.clear();
         self.last_decoded = -1;
         self.pending_pts = None;
+        self.recovery_poc = None;
     }
 
     /// Move pictures out of the decoded picture buffer into the output queue.
@@ -472,7 +493,7 @@ impl Decoder {
             [RefList::default(), RefList::default()]
         } else {
             self.dpb.number_short_term(sh.frame_num, sps);
-            self.dpb.build_ref_lists(
+            let (lists, padded) = self.dpb.build_ref_lists(
                 sh.slice_type,
                 self.cur.poc,
                 sh.frame_num as i32,
@@ -480,7 +501,15 @@ impl Decoder {
                 sh.num_ref_idx_l0_active as usize,
                 sh.num_ref_idx_l1_active as usize,
                 (&sh.ref_pic_list_mod_l0, &sh.ref_pic_list_mod_l1),
-            )?
+            )?;
+            // A ref list shorter than requested was padded by repeating an
+            // available entry (8.2.4.2's unspecified tail) rather than the
+            // reference this slice actually asked for. Right after a seek's
+            // reset, that means the picture predicts from something never
+            // decoded since the random-access start; recorded here so
+            // `end_picture` can hold its output back (see `recovery_poc`).
+            self.cur_ref_padded |= padded;
+            lists
         };
 
         let mut r = if pps.entropy_coding_mode {
@@ -632,6 +661,7 @@ impl Decoder {
         sh: &SliceHeader,
         header: NalHeader,
     ) -> Result<()> {
+        self.cur_ref_padded = false;
         let info = PicInfo {
             is_idr: header.is_idr(),
             is_reference: header.ref_idc != 0,

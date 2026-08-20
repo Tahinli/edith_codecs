@@ -3,11 +3,26 @@
 
 use std::sync::{Arc, Mutex};
 
+use ec_core::color::{ColorDescription, ContentLight};
 use ec_va::sys::{VA_FOURCC_NV12, VA_FOURCC_P010};
 use ec_va::{Image, MappedImage, PrimeSurface, Surface};
 
 use crate::error::{Error, Result};
 use crate::pool::PooledSurface;
+
+/// A stream's colour metadata, resolved from its own headers: VUI tags for the
+/// primaries/transfer/matrix triplet, and — for HEVC — the two HDR prefix SEI
+/// messages for the peak the mastering grade and the content itself declared.
+/// No container tier here: ec-hw only ever sees the elementary stream, so a
+/// caller that also holds the container's tags resolves those over this.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Colour {
+    /// Matrix/transfer/range, resolved from the bitstream's own VUI.
+    pub description: ColorDescription,
+    /// HDR peak: MaxCLL/MaxFALL and the mastering display's luminance, when
+    /// the stream carried them (HEVC prefix SEI only).
+    pub light: ContentLight,
+}
 
 /// The readback image a decoder reuses across frames.
 ///
@@ -33,6 +48,8 @@ pub struct Frame {
     pub coded_size: (u32, u32),
     /// Luma bit depth: 8 for NV12 surfaces, 10 for P010.
     pub bit_depth: u8,
+    /// This stream's colour metadata, when the codec's decoder resolves one.
+    pub colour: Option<Colour>,
 }
 
 /// 8-bit planar 4:2:0, the currency edith's software path speaks.
@@ -73,6 +90,7 @@ impl Frame {
         display_size: (u32, u32),
         coded_size: (u32, u32),
         bit_depth: u8,
+        colour: Option<Colour>,
     ) -> Frame {
         Frame {
             surface,
@@ -81,12 +99,18 @@ impl Frame {
             display_size,
             coded_size,
             bit_depth,
+            colour,
         }
     }
 
     /// The surface this frame lives on.
     pub fn surface(&self) -> &Arc<Surface> {
         &self.surface
+    }
+
+    /// This frame's colour metadata, when the codec's decoder resolves one.
+    pub fn colour(&self) -> Option<Colour> {
+        self.colour
     }
 
     /// Export the surface as DRM PRIME file descriptors.
