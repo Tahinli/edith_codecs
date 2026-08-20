@@ -5,7 +5,9 @@
 use std::io::Write;
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: adts_to_pcm <file.aac>");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: adts_to_pcm <file.aac>");
     let data = std::fs::read(&path).expect("file readable");
     // Plain `AacDecoder::new()` never enables SBR (it only turns on from an
     // explicit AudioSpecificConfig's `sbr_present`, per `with_config`) --

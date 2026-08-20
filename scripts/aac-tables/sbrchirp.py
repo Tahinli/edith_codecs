@@ -87,6 +87,10 @@ def tone_core(w, sfb_idx, group_active, gain=200):
     w.w(3, 4)
     w.w(1, 5)
     w.w(P.HCB_SF[60][1], P.HCB_SF[60][0])  # scalefactor delta 0
+    w.w(0, 3)  # pulse/tns/gain-control absent -- MUST precede spectral_data()
+    # (round-28 fix: this write sat AFTER the spectral loop below, shifting
+    # every bit that followed and desyncing the reference decoder on every
+    # probed band -- byte-accounted against sce_core's proven field order.)
     ngroups = (swb[sfb_idx + 1] - swb[sfb_idx]) // 4
     for i in range(ngroups):
         quad = (2, 0, 0, 0) if i == group_active else (0, 0, 0, 0)
@@ -95,7 +99,6 @@ def tone_core(w, sfb_idx, group_active, gain=200):
         w.w(code, length)
         for _ in signs:
             w.w(0, 1)
-    w.w(0, 3)  # pulse/tns/gain-control absent
     return w
 
 
