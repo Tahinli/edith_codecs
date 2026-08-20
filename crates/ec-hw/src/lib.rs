@@ -18,6 +18,12 @@
 //! }
 //! # Ok::<(), ec_hw::Error>(())
 //! ```
+//! # Bit depth
+//!
+//! [`Frame::to_i420`] truncates a 10-bit (P010) surface to 8 bits, because a
+//! byte per sample is what the software path speaks. A 10-bit consumer must
+//! call [`Frame::to_i420_16`] instead — that is the lossless path that keeps
+//! all ten bits.
 //!
 //! # Shape
 //!
