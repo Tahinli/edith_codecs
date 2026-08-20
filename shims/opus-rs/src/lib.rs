@@ -15,10 +15,10 @@
 //! `complexity` is accepted for drop-in compatibility and ignored: this
 //! encoder has one (fast) analysis path, not a ladder.
 //!
-//! One behaviour is genuinely narrower and is stated rather than hidden: this
-//! encoder is **CELT-only**, so [`Application::Voip`] selects a narrower
-//! bandwidth at a given rate but not the SILK layer the name implies. Speech
-//! below about 32 kbps is where that costs the most.
+//! [`Application::Voip`] below 20 kbps, mono, 20 ms frames picks the SILK
+//! layer, as the reference does; every other combination stays CELT. Stereo
+//! SILK and SILK at other frame sizes fall back to CELT rather than
+//! silently approximating it.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -438,5 +438,20 @@ mod tests {
             assert!(e.encode(block, FRAME, &mut out).unwrap() > 8);
         }
         assert!(MultistreamEncoder::surround(48_000, 9, Application::Audio).is_err());
+    }
+
+    /// `Application::Voip` under 20 kbps, mono, 20 ms frames reaches the
+    /// SILK layer through this shim's existing surface — no new API, just
+    /// the application and bitrate the incumbent already exposed. TOC
+    /// configs 0..=11 are SILK (RFC 6716 Table 2).
+    #[test]
+    fn voip_below_20kbps_reaches_silk() {
+        let mut enc = OpusEncoder::new(48_000, 1, Application::Voip).unwrap();
+        enc.bitrate_bps = 12_000;
+        let pcm = tone(960, 1);
+        let mut out = vec![0u8; 1500];
+        let len = enc.encode(&pcm, 960, &mut out).unwrap();
+        assert!(len > 1);
+        assert!(out[0] >> 3 <= 11, "TOC config {} is not SILK", out[0] >> 3);
     }
 }
