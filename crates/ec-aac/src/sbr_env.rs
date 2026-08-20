@@ -34,10 +34,14 @@
 //! `Q_div = dequant_noise(q_q)` ratio (`signal = target/(1+Q_div)`,
 //! `noise = target*Q_div/(1+Q_div)`, round-21 -- `Q_div` is a ratio
 //! relative to the envelope target, not a standalone absolute energy), the
-//! HF estimate is scaled toward the signal share, the limiter caps how far
-//! above the cell's own noise floor that gain is allowed to reach
-//! (`bs_limiter_gains`), the noise share is mixed in at that level, and
-//! flagged bands get an added tone.
+//! HF estimate is scaled toward the signal share; the limiter then caps
+//! every cell's gain against its LIMITER BAND's aggregate headroom (Sec
+//! 4.6.18.7.2/.7.5, `bs_limiter_gains`, `crate::sbr_hf::limiter_band_table`)
+//! rather than each cell's own -- a content-empty cell has zero raw energy,
+//! so a per-cell cap is infinite exactly where it should bite; the
+//! aggregate cap and its gain-boost compensation (Sec 4.6.18.7.4) are
+//! applied to gains, injected noise and sinusoids alike. The noise share is
+//! mixed in at that level, and flagged bands get an added tone.
 #![allow(clippy::needless_range_loop)]
 
 use crate::sbr_bands::BandTables;
@@ -152,7 +156,17 @@ impl NoiseGen {
     }
 }
 
-const LIMITER_FACTOR: [f64; 4] = [1.4125, 2.0, 4.0, 1.0e6]; // 1.5/3/6 dB, "no limit"
+// (Round-33) Per-limiter-band aggregate gain factor, ISO/IEC 14496-3
+// §4.6.18.7.2's `bs_limiter_gains` table: -3/0/+3 dB, and index 3
+// ("no limiting") given a very large but finite ceiling so a limiter band
+// with zero measured HF energy still can't blow up to a literal infinity.
+const LIMITER_FACTOR: [f64; 4] = [0.707_945_78, 1.0, 1.412_537_5, 1.0e10];
+
+/// Gain-boost compensation ceiling (+4 dB, §4.6.18.7.4): after the
+/// per-limiter-band cap, a band whose achieved energy fell short of its
+/// transmitted envelope total is boosted back up, capped here so a band
+/// that was capped hard doesn't get fully "un-capped" by the boost step.
+const BOOST_MAX: f64 = 1.584_893_2;
 
 /// (Round-17, Task 1 conviction check) Accumulates transmitted signal vs.
 /// noise energy per absolute QMF band across every [`adjust`] call in the
@@ -209,8 +223,10 @@ pub fn adjust(
     env_energy: &[Vec<f64>],
     noise_energy: &[Vec<f64>],
     rng: &mut NoiseGen,
+    limiter_table: &[i64],
 ) {
     let kx = tables.kx as usize;
+    let n_lim = limiter_table.len().saturating_sub(1).max(1);
     // (Round-22 sweep instrumentation, zero cost unset) `EC_AAC_SBR_LIMITER_OFF`
     // forces the "no limit" factor regardless of the transmitted
     // `bs_limiter_gains`, to probe whether the limiter itself is clipping
@@ -259,12 +275,31 @@ pub fn adjust(
         // linearly interpolated across subbands between sfb centre
         // frequencies) so both application modes share the exact same gain
         // values.
+        //
+        // (Round-33) The limiter no longer caps each cell against its OWN
+        // near-zero raw HF estimate (that cap is infinite exactly where a
+        // patch left a target band content-empty, Sec 4.6.18.7.5's known
+        // failure mode for cell-local caps). Instead this is a two-pass
+        // per-LIMITER-BAND aggregate: pass 1 computes each cell's raw
+        // (uncapped) gain and accumulates that cell's transmitted/measured
+        // energy into its limiter band (`limiter_table`, built from
+        // f_low/patch borders in sbr_hf::limiter_band_table); pass 2 caps
+        // every cell in a limiter band at that band's AGGREGATE
+        // `sqrt(E_orig/E_curr)*limgain` ratio, so an empty cell inherits its
+        // band's cap rather than blowing up alone, then boosts the whole
+        // band back up (capped at `BOOST_MAX`) to still meet the band's
+        // transmitted total.
         let mut gains = Vec::with_capacity(table.len().saturating_sub(1));
         // (Round-21) Actual per-cell noise energy this envelope/band injects,
         // parallel to `gains` -- filled below and consumed by the
         // application loop that follows instead of the old separate
         // noise-grid pass (see round-21 module doc note).
         let mut noise_amps = Vec::with_capacity(table.len().saturating_sub(1));
+        let mut cell_current = Vec::with_capacity(table.len().saturating_sub(1));
+        let mut cell_noise_here = Vec::with_capacity(table.len().saturating_sub(1));
+        let mut cell_lim = Vec::with_capacity(table.len().saturating_sub(1));
+        let mut lim_e_orig = vec![0.0f64; n_lim];
+        let mut lim_e_curr = vec![0.0f64; n_lim];
         for b in 0..table.len().saturating_sub(1) {
             let lo = table[b] as usize;
             let hi = table[b + 1] as usize;
@@ -301,23 +336,16 @@ pub fn adjust(
                 .max(0.0);
             let signal_target = target / (1.0 + noise_div);
             let noise_here = target - signal_target; // = target*noise_div/(1+noise_div)
-            let mut gain = (signal_target / current.max(1e-12)).sqrt();
-            // Cap gain at `limiter_max` times the cell's own
-            // noise-plus-signal headroom over its raw HF estimate (Sec
-            // 4.6.18.7.5's `limGain * sqrt((Q_M+E_curr)/E_curr)` shape): a
-            // cell with no transmitted noise floor still gets the plain
-            // `limiter_max` ceiling (the `current` term alone gives
-            // `sqrt(current/current)=1`), while a cell whose noise floor
-            // dominates its raw estimate gets extra headroom proportional to
-            // that ratio. The previous `.max(gain.min(limiter_max))` here
-            // floored the cap at `min(gain, limiter_max)`, which is always
-            // >= the intended cap and so never actually restricted
-            // anything.
             let cur = current.max(1e-12);
-            gain = gain.min(limiter_max * ((noise_here + cur) / cur).sqrt());
-            gain = gain.min(limiter_max * 64.0); // absolute ceiling: never amplify a silent cell to infinity
-            gains.push(gain);
-            noise_amps.push((noise_here / (hi - lo).max(1) as f64).sqrt());
+            let raw_gain = (signal_target / cur).sqrt();
+            let lim_idx = limiter_band_index(limiter_table, lo, hi).min(n_lim - 1);
+            let width = (hi - lo).max(1) as f64;
+            lim_e_orig[lim_idx] += target * width;
+            lim_e_curr[lim_idx] += cur * width;
+            cell_current.push(cur);
+            cell_noise_here.push(noise_here);
+            cell_lim.push(lim_idx);
+            gains.push(raw_gain);
             if track_fraction {
                 let slots = (t1.max(0) - t0.max(0)).max(0) as usize;
                 for band in lo..hi {
@@ -327,6 +355,38 @@ pub fn adjust(
                     accumulate_noise_fraction(band, slots, signal_target, noise_here);
                 }
             }
+        }
+        // Pass 2: per-limiter-band aggregate cap, then per-band boost
+        // compensation so the band still meets its transmitted total.
+        let lim_cap: Vec<f64> = (0..n_lim)
+            .map(|j| limiter_max * (lim_e_orig[j] / lim_e_curr[j].max(1e-12)).sqrt())
+            .collect();
+        let mut lim_e_actual = vec![0.0f64; n_lim];
+        for b in 0..gains.len() {
+            let j = cell_lim[b];
+            gains[b] = gains[b].min(lim_cap[j]);
+            let lo = table[b] as usize;
+            let hi = table[b + 1] as usize;
+            let width = (hi - lo).max(1) as f64;
+            lim_e_actual[j] += cell_current[b] * gains[b] * gains[b] * width;
+        }
+        let lim_boost: Vec<f64> = (0..n_lim)
+            .map(|j| {
+                if lim_e_actual[j] > 1e-12 {
+                    (lim_e_orig[j] / lim_e_actual[j])
+                        .sqrt()
+                        .clamp(1.0, BOOST_MAX)
+                } else {
+                    1.0
+                }
+            })
+            .collect();
+        for b in 0..gains.len() {
+            let j = cell_lim[b];
+            gains[b] *= lim_boost[j];
+            let lo = table[b] as usize;
+            let hi = table[b + 1] as usize;
+            noise_amps.push((cell_noise_here[b] / (hi - lo).max(1) as f64).sqrt() * lim_boost[j]);
         }
         // (Round-22 sweep instrumentation) the next envelope's gains, only
         // when `EC_AAC_SBR_GAIN_LERP` is set and the band layouts match --
@@ -429,7 +489,8 @@ pub fn adjust(
                         .unwrap_or(0);
                     env_energy[ei].get(lb).copied().unwrap_or(0.0)
                 };
-                let amp = (2.0 * e).sqrt();
+                let boost = lim_boost[limiter_band_index(limiter_table, lo, hi).min(n_lim - 1)];
+                let amp = (2.0 * e).sqrt() * boost;
                 for band in lo..hi {
                     if band < kx || band - kx >= hf.len() {
                         continue;
@@ -501,6 +562,21 @@ fn compute_gains_only(
     gains
 }
 
+/// Finds which limiter band (from [`crate::sbr_hf::limiter_band_table`])
+/// a `[lo, hi)` QMF-band cell falls into, by its midpoint.
+fn limiter_band_index(limiter_table: &[i64], lo: usize, hi: usize) -> usize {
+    if limiter_table.len() < 2 {
+        return 0;
+    }
+    let mid = (lo + hi) as i64 / 2;
+    for j in 0..limiter_table.len() - 1 {
+        if mid < limiter_table[j + 1] {
+            return j;
+        }
+    }
+    limiter_table.len() - 2
+}
+
 fn noise_band_for(tables: &BandTables, low_band: usize) -> usize {
     let mut q = 0usize;
     for i in 0..tables.n_q {
@@ -515,6 +591,7 @@ fn noise_band_for(tables: &BandTables, low_band: usize) -> usize {
 mod tests {
     use super::*;
     use crate::sbr_bands::freq_tables;
+    use crate::sbr_hf::{build_patches, limiter_band_table};
     use crate::sbr_payload::SbrChannel;
 
     fn flat_tables() -> BandTables {
@@ -557,6 +634,8 @@ mod tests {
         let env_energy = vec![vec![target; tables.n_low]];
         let noise_energy = vec![vec![0.0f64; tables.n_q]];
         let mut rng = NoiseGen::new(1);
+        let lim_table =
+            limiter_band_table(&tables, &build_patches(&tables), header(1, 3).limiter_bands);
         adjust(
             &mut hf,
             &tables,
@@ -565,6 +644,7 @@ mod tests {
             &env_energy,
             &noise_energy,
             &mut rng,
+            &lim_table,
         );
 
         // Every low-res band's average energy should land close to target.
@@ -594,13 +674,24 @@ mod tests {
     }
 
     #[test]
-    fn limiter_caps_a_pathological_gain() {
+    fn limiter_stays_finite_on_a_uniformly_starved_band() {
+        // (Round-33 semantics change) A UNIFORMLY near-silent HF estimate
+        // against a huge uniform target is no longer expected to be capped
+        // down near the raw HF amplitude -- the aggregate cap and its
+        // gain-boost compensation are computed from the SAME population, so
+        // when every cell in a limiter band is equally starved (no
+        // disproportion for the limiter to actually correct), full recovery
+        // toward the transmitted target is the spec-correct outcome (boost
+        // undoes exactly what the cap took away, as long as the needed
+        // `1/limiter_max` stays under `BOOST_MAX`). What must NOT happen
+        // (the actual pre-fix bug) is a literal unbounded/non-finite blow-up
+        // -- this asserts finiteness and a generous bound around the target
+        // amplitude, not the old (now-wrong) "stays near the raw estimate"
+        // shape.
         let tables = flat_tables();
         let kx = tables.kx as usize;
         let k2 = tables.k2 as usize;
         let slots = 16usize;
-        // Near-silent HF estimate against a huge target energy: an
-        // unlimited gain would blow this up by many orders of magnitude.
         let mut hf = vec![vec![Complex::new(1e-9, 0.0); slots]; k2 - kx];
         let ch = SbrChannel {
             t_env: vec![0, 16],
@@ -618,6 +709,8 @@ mod tests {
         // noise injection.
         let noise_energy = vec![vec![0.0f64; tables.n_q]];
         let mut rng = NoiseGen::new(1);
+        let lim_table =
+            limiter_band_table(&tables, &build_patches(&tables), header(1, 0).limiter_bands);
         adjust(
             &mut hf,
             &tables,
@@ -626,13 +719,77 @@ mod tests {
             &env_energy,
             &noise_energy,
             &mut rng,
+            &lim_table,
         );
+        let target_amp = 1.0e6f64.sqrt(); // ~1000, the envelope's own amplitude scale
         for band in 0..hf.len() {
             for slot in 0..slots {
+                let amp = hf[band][slot].norm_sqr().sqrt();
                 assert!(
-                    hf[band][slot].norm_sqr().sqrt() < 1.0,
-                    "limiter failed to cap band {band} slot {slot}: {:?}",
+                    amp.is_finite() && amp < 10.0 * target_amp,
+                    "gain escaped to a non-finite/unbounded value at band {band} slot {slot}: {:?}",
                     hf[band][slot]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_content_empty_cell_inherits_its_limiter_bands_aggregate_cap() {
+        // (Round-33) One low-res band has real HF content, its neighbour is
+        // perfectly silent (current=0, the exact case a per-cell cap makes
+        // infinite -- round-33's convicted mechanism). Both fall in the
+        // same limiter_bands=0 (single aggregate band) table here, so the
+        // silent cell must be capped by the AGGREGATE ratio (dominated by
+        // the loud cell's huge current), not blown up on its own.
+        let tables = flat_tables();
+        let kx = tables.kx as usize;
+        let k2 = tables.k2 as usize;
+        let slots = 16usize;
+        let mut hf = vec![vec![Complex::new(0.1, 0.0); slots]; k2 - kx];
+        // Silence the top half of the HF region (the empty target cell).
+        let mid = hf.len() / 2;
+        for row in &mut hf[mid..] {
+            for c in row.iter_mut() {
+                *c = Complex::ZERO;
+            }
+        }
+        let ch = SbrChannel {
+            t_env: vec![0, 16],
+            freq_res: vec![0],
+            t_noise: vec![0, 16],
+            e_q: vec![vec![]],
+            q_q: vec![vec![]],
+            invf_mode: vec![],
+            add_harmonic: None,
+        };
+        let target = 4.0f64;
+        let env_energy = vec![vec![target; tables.n_low]];
+        let noise_energy = vec![vec![0.0f64; tables.n_q]];
+        let mut rng = NoiseGen::new(1);
+        let mut h = header(1, 1);
+        h.limiter_bands = 0; // single aggregate band spanning the whole HF region
+        let lim_table = limiter_band_table(&tables, &build_patches(&tables), h.limiter_bands);
+        assert_eq!(lim_table, vec![tables.kx, tables.k2]);
+        adjust(
+            &mut hf,
+            &tables,
+            &h,
+            &ch,
+            &env_energy,
+            &noise_energy,
+            &mut rng,
+            &lim_table,
+        );
+        // The previously-silent cells must stay bounded (not blown up to
+        // the old per-cell `limiter_max*64` absolute ceiling on a target of
+        // 4.0 -- they should land well under it, inheriting the band's
+        // aggregate cap instead).
+        for row in &hf[mid..] {
+            for c in row {
+                assert!(
+                    c.norm_sqr() < target * 4.0,
+                    "empty cell escaped its limiter band's aggregate cap: {c:?}"
                 );
             }
         }
