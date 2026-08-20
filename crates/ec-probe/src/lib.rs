@@ -347,8 +347,25 @@ impl Reader {
         self.streams()
             .iter()
             .filter_map(|s| {
-                s.duration
-                    .map(|d| Timestamp::new(d - i64::from(s.initial_padding), s.time_base))
+                s.duration.map(|d| {
+                    // `initial_padding` is a sample count, not a `time_base`
+                    // tick count — the two only coincide when the stream's
+                    // time base happens to be `1/sample_rate`, which a
+                    // container's own duration field usually is not.
+                    let padding_ticks = s
+                        .params
+                        .audio()
+                        .filter(|_| s.initial_padding > 0)
+                        .map(|a| {
+                            TimeBase::from_rate(a.sample_rate).rescale(
+                                i64::from(s.initial_padding),
+                                s.time_base,
+                                Rounding::Down,
+                            )
+                        })
+                        .unwrap_or(0);
+                    Timestamp::new(d - padding_ticks, s.time_base)
+                })
             })
             .max_by(|a, b| {
                 a.as_secs_f64()
@@ -717,6 +734,24 @@ mod tests {
             Some(Format::Adts)
         );
         assert_eq!(sniff(b"not a media file at all"), None);
+    }
+
+    /// `initial_padding` is a *sample* count while a stream's `duration` is in
+    /// `time_base` ticks -- for a Matroska file whose `TimestampScale` is not
+    /// `1/sample_rate` (the common case: ticks are milliseconds), subtracting
+    /// one from the other unconverted lopped a third off an AAC track's
+    /// stated length (3.021 s of `CodecDelay`-bearing audio reported as 1.997
+    /// s: `1024` samples read straight off as `1024` one-millisecond ticks).
+    #[test]
+    fn duration_converts_initial_padding_out_of_sample_units() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/audio/aac-mka-stereo-48000.mka");
+        if !path.exists() {
+            return; // fixtures are generated, not checked in
+        }
+        let reader = Reader::open(&path).unwrap();
+        let d = reader.duration().expect("a stated duration").as_secs_f64();
+        assert!((d - 3.0).abs() < 0.1, "duration {d}, want ~3.0s");
     }
 
     /// An `.aac` or `.mp3` that opens with a tag is still an `.aac` or `.mp3`.
