@@ -848,6 +848,8 @@ mod tests {
             q_q: vec![vec![]],
             invf_mode: vec![],
             add_harmonic: None,
+            df_env: vec![],
+            df_noise: vec![],
         };
         let target = 4.0f64;
         let env_energy = vec![vec![target; tables.n_low]];
@@ -940,6 +942,8 @@ mod tests {
             q_q: vec![vec![]],
             invf_mode: vec![],
             add_harmonic: None,
+            df_env: vec![],
+            df_noise: vec![],
         };
         let env_energy = vec![vec![1.0e6f64; tables.n_low]];
         // (Round-21) noise_energy is now a Q_div ratio against the cell's
@@ -1001,6 +1005,8 @@ mod tests {
             q_q: vec![vec![]],
             invf_mode: vec![],
             add_harmonic: None,
+            df_env: vec![],
+            df_noise: vec![],
         };
         let target = 4.0f64;
         let env_energy = vec![vec![target; tables.n_low]];
