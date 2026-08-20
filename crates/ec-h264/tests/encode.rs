@@ -126,14 +126,17 @@ fn psnr(a: &[u8], b: &[u8]) -> f64 {
 /// sample, over a QP sweep, both presets, single and multi threaded.
 #[test]
 fn reconstruction_matches_the_decoder() {
+    let mut t8x8_mbs = (0, 0);
     for (w, h) in [(176, 144), (208, 122), (64, 48)] {
         let mut clip = Clip::new(w, h);
         for qp in [12, 24, 33, 44] {
-            for (threads, preset, cabac) in [
-                (1usize, Preset::Fast, true),
-                (4, Preset::Balanced, true),
-                (1, Preset::Fast, false),
-                (3, Preset::Balanced, false),
+            for (threads, preset, cabac, t8x8) in [
+                (1usize, Preset::Fast, true, false),
+                (4, Preset::Balanced, true, false),
+                (1, Preset::Fast, false, false),
+                (3, Preset::Balanced, false, false),
+                (2, Preset::Balanced, true, true),
+                (2, Preset::Balanced, false, true),
             ] {
                 let mut cfg = EncoderConfig::new(w as u32, h as u32);
                 cfg.qp = qp;
@@ -141,6 +144,7 @@ fn reconstruction_matches_the_decoder() {
                 cfg.threads = threads;
                 cfg.preset = preset;
                 cfg.cabac = cabac;
+                cfg.transform_8x8 = t8x8;
                 let mut enc = Encoder::new(cfg).expect("encoder");
                 let mut stream = Vec::new();
                 let mut recons = Vec::new();
@@ -149,6 +153,11 @@ fn reconstruction_matches_the_decoder() {
                     let picture = enc.encode(&clip.view()).expect("encode");
                     stream.extend_from_slice(&picture.au);
                     recons.push(enc.reconstruction().expect("a reconstruction"));
+                }
+                if t8x8 {
+                    let (intra, inter) = enc.transform_8x8_mbs();
+                    t8x8_mbs.0 += intra;
+                    t8x8_mbs.1 += inter;
                 }
                 let decoded = decode_all(&stream);
                 assert_eq!(
@@ -173,6 +182,13 @@ fn reconstruction_matches_the_decoder() {
             }
         }
     }
+    // The flag-on streams above really carried 8x8 macroblocks of both kinds.
+    assert!(
+        t8x8_mbs.0 > 0 && t8x8_mbs.1 > 0,
+        "8x8 MBs across the sweep: intra {} inter {}",
+        t8x8_mbs.0,
+        t8x8_mbs.1
+    );
 }
 
 /// Quality tracks the quantiser, and a low QP is close to lossless: a stream
@@ -316,7 +332,7 @@ fn encode_clip(
     h: usize,
     frames: usize,
     configure: impl FnOnce(&mut EncoderConfig),
-) -> (Vec<u8>, Vec<Planes>) {
+) -> (Vec<u8>, Vec<Planes>, (u64, u64)) {
     let mut cfg = EncoderConfig::new(w as u32, h as u32);
     cfg.gop_size = 10;
     cfg.threads = 3;
@@ -330,7 +346,90 @@ fn encode_clip(
         stream.extend_from_slice(&enc.encode(&clip.view()).expect("encode").au);
         recons.push(enc.reconstruction().expect("reconstruction"));
     }
-    (stream, recons)
+    (stream, recons, enc.transform_8x8_mbs())
+}
+
+/// Flat gradients and glyph-like rectangles: the content the 8x8 transform
+/// exists for. A 10-frame clip with the flag on must beat the flag off by at
+/// least 0.3 dB at equal bits, or by 5% fewer bits at equal PSNR.
+#[test]
+fn eight_by_eight_gains_on_flat_and_text() {
+    let (w, h) = (320, 240);
+    let render = |t: usize, clip: &mut Clip| {
+        // A half-sample pan per frame: inter prediction has a residual to code.
+        let sx = |x: usize| x * 2 + t;
+        for y in 0..h {
+            for x in 0..w {
+                let (px, py) = (sx(x) as f64 / 2.0, y as f64);
+                // Curved shading: smooth but not a plane, so no 16x16 mode
+                // predicts it for free.
+                let shade = 70.0 + px * px / 900.0 + py * py / 700.0 - px * py / 1500.0;
+                // Gentle texture with a 20-sample period: residual energy that
+                // spans more than a 4x4 block, which is what the 8x8 transform
+                // is for.
+                let tri = |v: f64| ((v % 20.0) - 10.0).abs() - 5.0;
+                let shade = shade + tri(px) * tri(py) / 1.5;
+                // Glyph rows: 16x24 cells, stroke pattern hashed per cell.
+                let (cell, cx, cy) = (sx(x) / 32, (sx(x) / 2) % 16, y % 24);
+                let hash = (cell * 2654435761usize.wrapping_add(y / 24 * 40503)) >> 7;
+                let stem = (2..5).contains(&cx);
+                let bar = (10..13).contains(&cy) && cx < 12 && hash & 1 == 1;
+                let foot = cy >= 19 && (2..13).contains(&cx) && hash & 2 == 2;
+                let glyph = y > h / 3 && (3..22).contains(&cy) && (stem || bar || foot);
+                clip.y[y * w + x] = if glyph { 24 } else { shade.min(235.0) as u8 };
+            }
+        }
+        clip.u.fill(128);
+        clip.v.fill(128);
+    };
+    let run = |t8x8: bool, qp: i32| {
+        let mut cfg = EncoderConfig::new(w as u32, h as u32);
+        cfg.qp = qp;
+        cfg.gop_size = 10;
+        cfg.transform_8x8 = t8x8;
+        let mut enc = Encoder::new(cfg).expect("encoder");
+        let mut clip = Clip::new(w, h);
+        let (mut bits, mut sum_psnr) = (0usize, 0.0);
+        let mut share = 0.0;
+        for t in 0..10 {
+            render(t, &mut clip);
+            bits += enc.encode(&clip.view()).expect("encode").au.len() * 8;
+            let rec = enc.reconstruction().expect("reconstruction");
+            sum_psnr += psnr(&clip.y, &rec.0);
+        }
+        if t8x8 {
+            let (i, p) = enc.transform_8x8_mbs();
+            eprintln!("8x8 MBs: intra {i} inter {p}");
+            share = (i + p) as f64 / (10.0 * (w / 16 * h / 16) as f64);
+        }
+        (bits as f64, sum_psnr / 10.0, share)
+    };
+    // Interpolate the off curve at the on point's bits / PSNR.
+    let qp = 26;
+    let (bits_on, psnr_on, share) = run(true, qp);
+    let off: Vec<_> = [qp - 2, qp, qp + 2]
+        .iter()
+        .map(|&q| run(false, q))
+        .collect();
+    let (bits_off, psnr_off, _) = off[1];
+    // Local slopes of the off curve, from the neighbouring QPs.
+    let dpsnr_dbits = (off[0].1 - off[2].1) / (off[0].0 - off[2].0);
+    let psnr_off_at_on_bits = psnr_off + (bits_on - bits_off) * dpsnr_dbits;
+    let bits_off_at_on_psnr = bits_off + (psnr_on - psnr_off) / dpsnr_dbits;
+    let gain_db = psnr_on - psnr_off_at_on_bits;
+    let saving = 1.0 - bits_on / bits_off_at_on_psnr;
+    eprintln!(
+        "8x8 qp {qp}: on {bits_on:.0} bits {psnr_on:.2} dB, off {bits_off:.0} bits {psnr_off:.2} dB; \
+         gain at equal bits {gain_db:+.2} dB, saving at equal PSNR {:.1}%, 8x8 MB share {:.1}%",
+        saving * 100.0,
+        share * 100.0
+    );
+    assert!(share > 0.0, "no 8x8 macroblocks were coded");
+    assert!(
+        gain_db >= 0.3 || saving >= 0.05,
+        "8x8 gain {gain_db:+.2} dB / {:.1}% is below the bar",
+        saving * 100.0
+    );
 }
 
 /// ffmpeg's decode of our stream is our reconstruction, sample for sample,
@@ -341,13 +440,18 @@ fn ffmpeg_decodes_bit_exactly() {
         eprintln!("SKIP ffmpeg_decodes_bit_exactly: no ffmpeg on PATH");
         return;
     }
+    let mut t8x8_mbs = (0, 0);
     for (w, h) in [(176, 144), (322, 242)] {
         for qp in [10, 20, 28, 37, 47] {
             let cavlc = qp % 2 == 0; // both entropy coders across the sweep
-            let (stream, recons) = encode_clip(w, h, 6, |cfg| {
+            let t8x8 = qp % 3 == 1; // High-profile PPS with the per-MB flag
+            let (stream, recons, (intra, inter)) = encode_clip(w, h, 6, |cfg| {
                 cfg.qp = qp;
                 cfg.cabac = !cavlc;
+                cfg.transform_8x8 = t8x8;
             });
+            t8x8_mbs.0 += intra;
+            t8x8_mbs.1 += inter;
             let decoded = ffmpeg_decode(&stream, w, h, &[]).expect("ffmpeg decodes our stream");
             assert_eq!(decoded.len(), recons.len(), "{w}x{h} qp {qp}: frame count");
             for (i, (dec, rec)) in decoded.iter().zip(&recons).enumerate() {
@@ -357,6 +461,12 @@ fn ffmpeg_decodes_bit_exactly() {
             }
         }
     }
+    assert!(
+        t8x8_mbs.0 > 0 && t8x8_mbs.1 > 0,
+        "8x8 MBs across the sweep: intra {} inter {}",
+        t8x8_mbs.0,
+        t8x8_mbs.1
+    );
 }
 
 /// The same stream under constant bitrate, which is the mode edith exports in.
@@ -367,7 +477,7 @@ fn ffmpeg_decodes_a_cbr_stream_bit_exactly() {
         return;
     }
     let (w, h) = (352, 288);
-    let (stream, recons) = encode_clip(w, h, 12, |cfg| {
+    let (stream, recons, _) = encode_clip(w, h, 12, |cfg| {
         cfg.bitrate = 2_000_000;
         cfg.framerate = 25.0;
     });
@@ -393,9 +503,11 @@ fn vaapi_decodes_our_stream() {
         return;
     }
     let (w, h) = (352, 288);
-    let (stream, recons) = encode_clip(w, h, 6, |cfg| {
+    let (stream, recons, (intra, inter)) = encode_clip(w, h, 6, |cfg| {
         cfg.qp = 26;
+        cfg.transform_8x8 = true;
     });
+    assert!(intra + inter > 0, "no 8x8 macroblocks in the VA-API stream");
     let Some(decoded) = ffmpeg_decode(
         &stream,
         w,
