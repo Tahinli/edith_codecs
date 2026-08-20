@@ -191,6 +191,39 @@ fn amp_res_of(header_amp_res: u8, grid: &Grid) -> u8 {
     if grid.fixfix && grid.num_env == 1 { 0 } else { header_amp_res }
 }
 
+/// Delta-time base for an envelope whose frequency resolution differs from
+/// the envelope it is coded against (§4.6.18.3.3): a high-res band takes the
+/// low-res band containing it, a low-res band the high-res band starting at
+/// the same edge. Same resolution (or a degenerate table) passes through.
+/// Without this the top half of a high-res row coded against a low-res row
+/// read an out-of-range base of 0 -- a near-silent envelope -- and every
+/// low-res band read the high-res band of half its frequency.
+fn map_prev_env(prev: &[i32], tables: &BandTables, cur_high: bool) -> Vec<i32> {
+    let (n_low, n_high) = (tables.n_low, tables.n_high);
+    if n_low == n_high || prev.len() == if cur_high { n_high } else { n_low } {
+        return prev.to_vec();
+    }
+    let (f_low, f_high) = (&tables.f_low, &tables.f_high);
+    if cur_high {
+        (0..n_high)
+            .map(|j| {
+                let k = (0..n_low)
+                    .rev()
+                    .find(|&k| f_low[k] <= f_high[j])
+                    .unwrap_or(0);
+                prev.get(k).copied().unwrap_or(0)
+            })
+            .collect()
+    } else {
+        (0..n_low)
+            .map(|j| {
+                let k = (0..n_high).find(|&k| f_high[k] == f_low[j]).unwrap_or(0);
+                prev.get(k).copied().unwrap_or(0)
+            })
+            .collect()
+    }
+}
+
 /// Reads one Huffman codeword by walking bit-by-bit until it matches a table
 /// entry. Every book here is a complete prefix code (Kraft sum 1, checked in
 /// `sbr_tables`), so a well-formed stream always terminates; a codeword
@@ -569,7 +602,12 @@ impl SbrParser {
                 } else {
                     &this.state[ch].last_env
                 };
-                let row = this.decode_envelope(r, bands, dt, balance, amp_res, prev)?;
+                let prev = if dt {
+                    map_prev_env(prev, &tables, grids[ch].freq_res[i] != 0)
+                } else {
+                    Vec::new()
+                };
+                let row = this.decode_envelope(r, bands, dt, balance, amp_res, &prev)?;
                 e_q.push(row);
             }
             e_q_all[ch] = e_q;
