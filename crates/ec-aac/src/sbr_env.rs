@@ -139,15 +139,40 @@ pub fn dequantize_frame(
 /// A small deterministic PRNG for the injected noise floor -- the same
 /// generator shape `decode::Noise` uses, kept local so this module has no
 /// dependency on the core decoder's internals.
-pub struct NoiseGen(u32);
+pub struct NoiseGen {
+    lcg: u32,
+    // (Round-44, Task 1/2) The last `LOWPASS_TAPS - 1` raw (pre-scale) draws,
+    // oldest first -- `complex_unit` boxcar-averages the current draw against
+    // these before scaling, so consecutive calls (one QMF slot apart, same
+    // band -- see `adjust`'s band-outer/slot-inner loop) are correlated
+    // instead of independent.
+    history: std::collections::VecDeque<Complex<f64>>,
+}
+
+/// (Round-44, Task 1) `sbr_qmf::Synthesis`'s prototype passband is HALF the
+/// decimated slot-rate Nyquist a per-slot i.i.d. draw spans (see
+/// `sbr_qmf.rs`'s module doc and `synthesis_energy_gain_for_...` harness):
+/// an unfiltered draw already survives Synthesis' overlap-add reasonably
+/// (in-band fraction ~0.49 of a 20000-slot excitation, once the harness's own
+/// band-index math was corrected -- see round-44 ledger), but a short boxcar
+/// across consecutive slots pulls more of that draw's own spectral energy
+/// into the passband without collapsing it into a near-tone (a wider boxcar
+/// keeps raising in-band fraction but concentrates it into the passband's
+/// own DC edge, losing the noise-like spread across the band the acceptance
+/// bar requires -- taps=2 was the harness's best fraction/spread balance:
+/// 0.6083 in-band, quarter-bin energy spread [0.257,0.293,0.251,0.199]).
+const LOWPASS_TAPS: usize = 2;
 
 impl NoiseGen {
     pub fn new(seed: u32) -> NoiseGen {
-        NoiseGen(seed | 1)
+        NoiseGen {
+            lcg: seed | 1,
+            history: std::collections::VecDeque::with_capacity(LOWPASS_TAPS),
+        }
     }
 
     fn next(&mut self) -> f64 {
-        self.0 = self.0.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        self.lcg = self.lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
         // (Round-41, Task 2) `self.0 >> 8` keeps 24 bits (range [0, 2^24));
         // dividing by `1u32 << 23` (2^23, ONE bit too few) left a range of
         // [0, 2) before the `- 0.5`, i.e. actual output was uniform on
@@ -158,7 +183,7 @@ impl NoiseGen {
         // constant for its own divisor. Dividing by `1u32 << 24` instead
         // fixes the range to [0, 1) so `- 0.5` correctly centers it on
         // [-0.5, 0.5), mean 0.
-        f64::from(self.0 >> 8) / f64::from(1u32 << 24) - 0.5
+        f64::from(self.lcg >> 8) / f64::from(1u32 << 24) - 0.5
     }
 
     fn complex_unit(&mut self) -> Complex<f64> {
@@ -173,8 +198,31 @@ impl NoiseGen {
         // in `tests/sbr_real_library.rs`'s `sbr_actual_noise_fraction`):
         // bookkept split ~0.37-0.39, actual realized only ~0.10-0.30 in-band
         // (whole-HF-weighted ~0.095) before this fix.
+        //
+        // (Round-44, Task 2) The raw i.i.d. draw is boxcar-averaged over the
+        // last `LOWPASS_TAPS` calls (see the constant's own doc) before this
+        // scale: a boxcar of `taps` independent Uniform(-0.5,0.5) draws has
+        // per-component variance `(1/12)/taps`, `taps`-fold smaller than a
+        // single draw's, so the unit-energy scale grows by `sqrt(taps)` on
+        // top of the original `sqrt(6)` to still land at E[|z|^2] = 1 -- this
+        // is a SHAPE change (which spectral slice of the subband's own
+        // baseband the energy sits in), not an energy change; the boxcar's
+        // first `taps - 1` calls average fewer draws than nominal (history
+        // still filling), a startup transient too short to matter against a
+        // whole envelope segment's slot count.
         const UNIT_SCALE: f64 = 2.449_489_742_783_178; // sqrt(6)
-        Complex::new(self.next(), self.next()).scale(UNIT_SCALE)
+        let lowpass_scale: f64 = UNIT_SCALE * (LOWPASS_TAPS as f64).sqrt();
+        let raw = Complex::new(self.next(), self.next());
+        self.history.push_back(raw);
+        if self.history.len() > LOWPASS_TAPS {
+            self.history.pop_front();
+        }
+        let n = self.history.len() as f64;
+        let sum = self
+            .history
+            .iter()
+            .fold(Complex::new(0.0, 0.0), |a, &b| a + b);
+        sum.scale(lowpass_scale / n)
     }
 }
 

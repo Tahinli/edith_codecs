@@ -996,8 +996,14 @@ mod tests {
         let mut spectrum = vec![ec_dsp::Complex::new(0.0f32, 0.0); bins];
         let mut in_band = 0.0f64;
         let mut total = 0.0f64;
-        let band_lo = (k0 as f64 / SYNTHESIS_BANDS as f64 * bins as f64) as usize;
-        let band_hi = ((k0 + 1) as f64 / SYNTHESIS_BANDS as f64 * bins as f64) as usize;
+        // Band k's passband is centred at `(k+0.5)*omega_step` with
+        // half-width `omega_step` (the prototype's own lowpass cutoff, see
+        // the module doc), and `omega_step = pi/(2*SYNTHESIS_BANDS)` here --
+        // NOT `pi/SYNTHESIS_BANDS`. A frequency fraction of Nyquist (`pi`)
+        // is therefore `k/(2*SYNTHESIS_BANDS)` to `(k+1)/(2*SYNTHESIS_BANDS)`,
+        // half of what a naive `k/bands` split would give.
+        let band_lo = (k0 as f64 / (2.0 * SYNTHESIS_BANDS as f64) * bins as f64) as usize;
+        let band_hi = ((k0 + 1) as f64 / (2.0 * SYNTHESIS_BANDS as f64) * bins as f64) as usize;
         let win = ec_dsp::Window::<f32>::sine(FFT_LEN);
         let hops = (steady.len() - FFT_LEN) / FFT_LEN;
         for h in 0..hops {
@@ -1016,5 +1022,115 @@ mod tests {
             "energy in source subband's own frequency range: {:.4} of total (bins [{band_lo},{band_hi}) of {bins})",
             in_band / total
         );
+    }
+
+    /// (Round-44, Task 1, shape 1) The i.i.d.-per-slot draw above is white
+    /// across the SUBBAND'S OWN full baseband Nyquist (the hop rate), while
+    /// the prototype's own passband only covers a narrow slice of that range
+    /// (see the module doc: cutoff `omega_step = pi/(2*bands)`, vs. the
+    /// slot-domain signal's own Nyquist of `pi`). Slot-lowpassing the i.i.d.
+    /// draw (a short moving average across consecutive slots, independently
+    /// on real/imag, renormalized back to the same per-draw energy) should
+    /// concentrate its content inside that passband slice instead of
+    /// aliasing across the whole synthesis band. Swept tap count to find
+    /// where in-band fraction stops improving.
+    #[test]
+    fn synthesis_energy_gain_for_lowpassed_noise_excitation() {
+        fn xorshift(seed: u64) -> impl FnMut() -> f64 {
+            let mut state = seed | 1;
+            move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 11) as f64 / (1u64 << 53) as f64 - 0.5
+            }
+        }
+        let k0 = SYNTHESIS_BANDS / 2;
+        let slots = 20_000usize;
+
+        for taps in [2usize, 3, 4, 6, 8, 12, 16, 24, 32] {
+            let mut rng = xorshift(0xdead_beef);
+            let raw: Vec<Complex<f64>> = (0..slots).map(|_| Complex::new(rng(), rng())).collect();
+
+            // Moving-average lowpass across the slot index, then renormalize
+            // each output draw back to the raw draws' own mean energy so the
+            // comparison isolates the SHAPE change, not an energy change.
+            let raw_energy: f64 = raw.iter().map(|c| c.norm_sqr()).sum::<f64>() / slots as f64;
+            let mut lp = vec![Complex::new(0.0, 0.0); slots];
+            for (i, out) in lp.iter_mut().enumerate() {
+                let lo = i.saturating_sub(taps - 1);
+                let mut re = 0.0;
+                let mut im = 0.0;
+                let mut n = 0.0;
+                for c in &raw[lo..=i] {
+                    re += c.re;
+                    im += c.im;
+                    n += 1.0;
+                }
+                *out = Complex::new(re / n, im / n);
+            }
+            let lp_energy: f64 = lp.iter().map(|c| c.norm_sqr()).sum::<f64>() / slots as f64;
+            let scale = (raw_energy / lp_energy).sqrt();
+
+            let mut synthesis = Synthesis::new();
+            let mut in_energy = 0.0f64;
+            let mut out = Vec::with_capacity(slots * SYNTHESIS_BANDS);
+            for &c0 in &lp {
+                let c = c0.scale(scale);
+                let mut v = [Complex::new(0.0, 0.0); SYNTHESIS_BANDS];
+                v[k0] = c;
+                in_energy += c.norm_sqr();
+                out.extend(synthesis.process_slot(&v));
+            }
+            let steady = &out[out.len() / 2..];
+            let mut out_energy = 0.0f64;
+            for &s in steady {
+                out_energy += f64::from(s) * f64::from(s);
+            }
+            let steady_slots = steady.len() / SYNTHESIS_BANDS;
+            let steady_in_energy = in_energy * steady_slots as f64 / slots as f64;
+            let energy_gain = out_energy / steady_in_energy;
+
+            const FFT_LEN: usize = 2048;
+            let mut rfft = ec_dsp::RealFft::<f32>::new(FFT_LEN);
+            let bins = rfft.spectrum_len();
+            let mut spectrum = vec![ec_dsp::Complex::new(0.0f32, 0.0); bins];
+            let mut in_band = 0.0f64;
+            let mut total = 0.0f64;
+            let band_lo = (k0 as f64 / (2.0 * SYNTHESIS_BANDS as f64) * bins as f64) as usize;
+            let band_hi = ((k0 + 1) as f64 / (2.0 * SYNTHESIS_BANDS as f64) * bins as f64) as usize;
+            // Also bucket the in-band bins into quarters, to check the
+            // surviving content is spread across the band (noise-like), not
+            // piled into one edge (which would look more like a residual
+            // tone than usable noise).
+            let quarter = (band_hi - band_lo).max(4) / 4;
+            let mut quarters = [0.0f64; 4];
+            let win = ec_dsp::Window::<f32>::sine(FFT_LEN);
+            let hops = (steady.len() - FFT_LEN) / FFT_LEN;
+            for h in 0..hops {
+                let mut block = steady[h * FFT_LEN..h * FFT_LEN + FFT_LEN].to_vec();
+                win.apply(&mut block);
+                rfft.forward(&block, &mut spectrum);
+                for (i, c) in spectrum.iter().enumerate() {
+                    let e = f64::from(c.norm_sqr());
+                    total += e;
+                    if i >= band_lo && i < band_hi {
+                        in_band += e;
+                        let q = ((i - band_lo) / quarter.max(1)).min(3);
+                        quarters[q] += e;
+                    }
+                }
+            }
+            let qsum: f64 = quarters.iter().sum();
+            println!(
+                "taps={taps:2}: energy gain {energy_gain:.4}, in-band fraction {:.4}, \
+                 quarter spread [{:.3},{:.3},{:.3},{:.3}]",
+                in_band / total,
+                if qsum > 0.0 { quarters[0] / qsum } else { 0.0 },
+                if qsum > 0.0 { quarters[1] / qsum } else { 0.0 },
+                if qsum > 0.0 { quarters[2] / qsum } else { 0.0 },
+                if qsum > 0.0 { quarters[3] / qsum } else { 0.0 },
+            );
+        }
     }
 }
