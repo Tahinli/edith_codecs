@@ -69,7 +69,7 @@ pub mod encode;
 
 pub use decode::Syntax;
 pub use decoder::{Ac3Decoder, Downmix, FrameInfo, Options};
-pub use encode::{Ac3Encoder, EncoderConfig};
+pub use encode::{Ac3Encoder, EncodeStats, EncoderConfig};
 pub use ec_core::Error;
 
 /// Samples per channel one audio block produces.
