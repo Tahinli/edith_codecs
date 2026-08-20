@@ -10,8 +10,11 @@
 //!
 //! Contracts worth knowing before implementing against this crate:
 //!
-//! - **Decode only.** Nothing here encodes AC-3; the format is a decode-side
-//!   concern for this family.
+//! - **Encoding is a fixed-allocation skeleton so far.** [`Ac3Encoder`] writes
+//!   spec-valid syncframes — real MDCT, real bit allocation, real CRCs — but
+//!   with a constant exponent strategy and bit allocation curve rather than a
+//!   psychoacoustic search; see [`encode`] for exactly what is and is not
+//!   adaptive yet.
 //! - **Truncated input is [`Error::NeedMore`]**, a broken bit stream is
 //!   [`Error::Corrupt`], and a construct this build does not implement is
 //!   [`Error::Unsupported`] naming *what* and *why*. No input panics — the bit
@@ -62,9 +65,11 @@ pub mod transform;
 
 mod decode;
 mod decoder;
+pub mod encode;
 
 pub use decode::Syntax;
 pub use decoder::{Ac3Decoder, Downmix, FrameInfo, Options};
+pub use encode::{Ac3Encoder, EncoderConfig};
 pub use ec_core::Error;
 
 /// Samples per channel one audio block produces.
