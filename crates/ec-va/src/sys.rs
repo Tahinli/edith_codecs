@@ -149,6 +149,32 @@ pub const VAEncSliceParameterBufferType: VABufferType = 24;
 pub const VAEncPackedHeaderParameterBufferType: VABufferType = 25;
 pub const VAEncPackedHeaderDataBufferType: VABufferType = 26;
 pub const VAEncMiscParameterBufferType: VABufferType = 27;
+/// `va.h:2086`, the VPP pipeline parameter buffer.
+pub const VAProcPipelineParameterBufferType: VABufferType = 41;
+
+// VPP filter types (`va_vpp.h:238-258`); only `None` and the HDR tone-mapping
+// filter are used here, but the whole ordinal run is transcribed since a
+// caller matching `vaQueryVideoProcFilters` output needs every value to tell
+// "no filter" from "a filter this build has no constant for".
+pub type VAProcFilterType = i32;
+pub const VAProcFilterNone: VAProcFilterType = 0;
+pub const VAProcFilterNoiseReduction: VAProcFilterType = 1;
+pub const VAProcFilterDeinterlacing: VAProcFilterType = 2;
+pub const VAProcFilterSharpening: VAProcFilterType = 3;
+pub const VAProcFilterColorBalance: VAProcFilterType = 4;
+pub const VAProcFilterSkinToneEnhancement: VAProcFilterType = 5;
+pub const VAProcFilterTotalColorCorrection: VAProcFilterType = 6;
+pub const VAProcFilterHVSNoiseReduction: VAProcFilterType = 7;
+pub const VAProcFilterHighDynamicRangeToneMapping: VAProcFilterType = 8;
+pub const VAProcFilter3DLUT: VAProcFilterType = 9;
+/// Sizes a `vaQueryVideoProcFilters` output array; never returned by it.
+pub const VAProcFilterCount: VAProcFilterType = 10;
+
+/// `VAProcColorStandardType`, `va_vpp.h:306`. `0` ("None") is what this crate
+/// always passes: implicit colour handling, no explicit conversion request.
+pub type VAProcColorStandardType = i32;
+/// `VAProcMode`, `va_vpp.h:447`. `0` is the driver-chosen default pipeline.
+pub type VAProcMode = i32;
 
 // Packed header bits an encoder may take over (`va.h:1199-1231`).
 pub const VA_ENC_PACKED_HEADER_NONE: u32 = 0x0000_0000;
@@ -321,6 +347,66 @@ pub struct VARectangle {
     pub y: i16,
     pub width: u16,
     pub height: u16,
+}
+
+/// `VAProcColorProperties`, `va_vpp.h:683`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VAProcColorProperties {
+    pub chroma_sample_location: u8,
+    pub color_range: u8,
+    pub colour_primaries: u8,
+    pub transfer_characteristics: u8,
+    pub matrix_coefficients: u8,
+    pub reserved: [u8; 3],
+}
+
+/// `VAProcPipelineParameterBuffer`, `va_vpp.h:886`.
+///
+/// Every field this crate does not set goes to its zero/NULL default, which
+/// libva documents as "whole surface, no filters, driver-chosen colour
+/// handling" (va_vpp.h:899,920,956,976) — the plain conversion this crate
+/// asks for. `va_reserved` must stay zeroed (`VA_PADDING_LARGE` - 16 = 16
+/// `u32`s on a 64-bit target, the layout the struct trailer promises).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VAProcPipelineParameterBuffer {
+    pub surface: VASurfaceID,
+    pub surface_region: *const VARectangle,
+    pub surface_color_standard: VAProcColorStandardType,
+    pub output_region: *const VARectangle,
+    pub output_background_color: u32,
+    pub output_color_standard: VAProcColorStandardType,
+    pub pipeline_flags: u32,
+    pub filter_flags: u32,
+    pub filters: *mut VABufferID,
+    pub num_filters: u32,
+    pub forward_references: *mut VASurfaceID,
+    pub num_forward_references: u32,
+    pub backward_references: *mut VASurfaceID,
+    pub num_backward_references: u32,
+    pub rotation_state: u32,
+    pub blend_state: *const c_void,
+    pub mirror_state: u32,
+    pub additional_outputs: *mut VASurfaceID,
+    pub num_additional_outputs: u32,
+    pub input_surface_flag: u32,
+    pub output_surface_flag: u32,
+    pub input_color_properties: VAProcColorProperties,
+    pub output_color_properties: VAProcColorProperties,
+    pub processing_mode: VAProcMode,
+    pub output_hdr_metadata: *const c_void,
+    pub va_reserved: [u32; 16],
+}
+
+impl Default for VAProcPipelineParameterBuffer {
+    fn default() -> Self {
+        // SAFETY: every field is an integer, a struct of integers, or a
+        // pointer; the all-zero bit pattern is a valid (NULL / 0) value of
+        // each, matching the "whole surface, no extra filters" defaults the
+        // header documents.
+        unsafe { std::mem::zeroed() }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -509,6 +595,13 @@ unsafe extern "C" {
         dest_width: c_uint,
         dest_height: c_uint,
     ) -> VAStatus;
+    /// `va_vpp.h:1518`. Filters a VPP context's config supports.
+    pub fn vaQueryVideoProcFilters(
+        dpy: VADisplay,
+        context: VAContextID,
+        filters: *mut VAProcFilterType,
+        num_filters: *mut c_uint,
+    ) -> VAStatus;
 }
 
 #[link(name = "va-drm")]
@@ -579,6 +672,24 @@ const _: () = {
     assert!(offset_of!(VADRMPRIMESurfaceDescriptor, layers) == 84);
 
     assert!(size_of::<VARectangle>() == 8 && align_of::<VARectangle>() == 2);
+
+    assert!(
+        size_of::<VAProcColorProperties>() == 8 && align_of::<VAProcColorProperties>() == 1
+    );
+
+    // 64-bit `va_vpp.h:886`: 25 fields down to `output_hdr_metadata` (152
+    // bytes on this target) plus `va_reserved[VA_PADDING_LARGE - 16]` (16
+    // `u32`s, 64 bytes) = 224.
+    assert!(
+        size_of::<VAProcPipelineParameterBuffer>() == 224
+            && align_of::<VAProcPipelineParameterBuffer>() == 8
+    );
+    assert!(offset_of!(VAProcPipelineParameterBuffer, surface_region) == 8);
+    assert!(offset_of!(VAProcPipelineParameterBuffer, input_color_properties) == 132);
+    assert!(offset_of!(VAProcPipelineParameterBuffer, output_color_properties) == 140);
+    assert!(offset_of!(VAProcPipelineParameterBuffer, processing_mode) == 148);
+    assert!(offset_of!(VAProcPipelineParameterBuffer, output_hdr_metadata) == 152);
+    assert!(offset_of!(VAProcPipelineParameterBuffer, va_reserved) == 160);
 
     // Assumption 2: C `enum` and `unsigned int` are both 4 bytes here.
     assert!(size_of::<VAStatus>() == 4);
