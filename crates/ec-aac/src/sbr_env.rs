@@ -21,6 +21,14 @@ use crate::sbr_tables::SBR_NOISE;
 use ec_dsp::Complex;
 
 const NOISE_FLOOR_OFFSET: f64 = 6.0;
+/// corner-cut: this chain's analysis bank (`sbr_qmf::Analysis`, undone by
+/// its own `Synthesis`) carries twice the spec bank's subband amplitude, so
+/// the transmitted energies need x4 to compare against `|X_high|^2` here.
+/// Measured on the real-file per-QMF-band instrument (`EC_AAC_SBR_QMF_WITNESS`,
+/// `QMF-BAND` rows): a uniform -6 dB across every HF band with the low
+/// band at 0 dB before this factor. Ceiling: none functionally; the upgrade
+/// path is normalising `sbr_qmf` to the spec's gain and dropping this.
+const ENV_DOMAIN_SCALE: f64 = 4.0;
 
 /// Envelope amp-resolution exponent: `2.0` (`bs_amp_res=1`, 3 dB) or `1.0`
 /// (`bs_amp_res=0`, 1.5 dB) -- expressed as the multiplier on `e_q/2` so
@@ -30,13 +38,11 @@ fn alpha(amp_res: u8) -> f64 {
     if amp_res != 0 { 1.0 } else { 0.5 }
 }
 
-/// Plain (non-coupled) envelope dequantization: `E_Orig = 2^(E_Q * a)`.
-/// §4.6.18.7.2 carries an extra `* 64` here; it is a pure scale on the
-/// whole HF region (the gain `sqrt(E_orig/E_curr)` cancels our own QMF
-/// scale otherwise), and this chain's QMF domain is calibrated without it
-/// (see `sbr_chain`'s OUTPUT_SCALE handling).
+/// Plain (non-coupled) envelope dequantization: `E_Orig = 2^(E_Q * a) * 64`
+/// (§4.6.18.7.2), times `ENV_DOMAIN_SCALE` to land in this chain's QMF
+/// energy domain.
 pub fn dequant_env(e_q: i32, amp_res: u8) -> f64 {
-    2f64.powf(alpha(amp_res) * f64::from(e_q))
+    2f64.powf(alpha(amp_res) * f64::from(e_q)) * 64.0 * ENV_DOMAIN_SCALE
 }
 
 /// Plain noise-floor dequantization: `Q_Orig = 2^(NOISE_FLOOR_OFFSET - Q_Q)`,
