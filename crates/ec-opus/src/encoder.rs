@@ -1,29 +1,42 @@
-//! The Opus packet encoder: CELT-only, 8 to 48 kHz in.
+//! The Opus packet encoder: CELT and mono SILK, 8 to 48 kHz in.
 //!
 //! One [`Encoder`] produces ordinary code-0 Opus packets (RFC 6716 Section 3)
 //! or the self-delimited variant of Appendix B that the multistream framing
-//! needs. Every configuration this encoder emits is a CELT one (TOC configs
-//! 16..31), which is what music encoding uses at every rate the product asks
-//! for; there is no SILK and no hybrid path — a speech-optimised mode below
-//! 16 kbps is out of scope, not silently approximated.
+//! needs. [`Encoder::set_mode`] (or the automatic choice in [`Mode`]'s
+//! default) picks CELT (TOC configs 16..31, every rate and frame size) or
+//! SILK (TOC configs 1/9, mono NB/WB 20 ms only — stereo SILK and SILK at
+//! other frame sizes fall back to CELT, documented at the fallback site).
+//! Hybrid is not implemented yet and also falls back to CELT.
 //!
-//! Input below 48 kHz is zero-stuffed to CELT's native rate and the coded
-//! bandwidth is capped at the input's own Nyquist, so the images the stuffing
-//! puts there are never coded and the decoder's decimation drops them.
-//! [`Encoder::look_ahead`] reports the delay in *input* samples.
+//! Input below 48 kHz is zero-stuffed to CELT's or SILK's native rate and
+//! the coded bandwidth is capped at the input's own Nyquist, so the images
+//! the stuffing puts there are never coded and the decoder's decimation
+//! drops them. [`Encoder::look_ahead`] reports the delay in *input* samples.
 //!
 //! Rate control is CBR by default — every packet the same size, derived from
 //! the bitrate — or constrained VBR, the reference's reservoir scheme, when
-//! [`Encoder::set_vbr_constrained`] is on.
+//! [`Encoder::set_vbr_constrained`] is on. SILK packets are not yet budgeted
+//! against the target rate (D2b).
 
 use ec_core::{Error, Result};
 
 use crate::celt_enc::CeltEncoder;
-use crate::packet::Bandwidth;
+use crate::packet::{Bandwidth, Mode};
 use crate::range::RangeEncoder;
+use crate::silk_enc_write::SilkEncoder;
 
 /// Most bytes one Opus frame may occupy (RFC 6716 `[R2]`).
 const MAX_FRAME_BYTES: usize = 1275;
+
+/// SILK's round-trip algorithmic delay in 48 kHz samples: the analysis
+/// resampler (`SilkEncoder::delay_samples`) on the way in plus the decoder's
+/// own synthesis resampler on the way out. Click-measured, one impulse
+/// through `Encoder`/`Decoder` at each bandwidth, not derived from a
+/// formula — `Resampler`'s (decode-side) and `Resampler48`'s (encode-side)
+/// FIR lengths differ per bandwidth, so narrowband and wideband delays
+/// don't have to and don't match.
+const SILK_LOOK_AHEAD_48K_NB: usize = 58;
+const SILK_LOOK_AHEAD_48K_WB: usize = 50;
 
 /// What the caller is encoding. This encoder is CELT-only, so the setting
 /// biases the coded bandwidth rather than selecting a different layer.
@@ -52,6 +65,16 @@ pub struct Encoder {
     application: Application,
     bandwidth: Option<Bandwidth>,
     final_range: u32,
+    /// [`None`] picks SILK, CELT or (once D4 lands) Hybrid from the
+    /// application and bitrate; `Some` forces one.
+    mode: Option<Mode>,
+    /// Lazily created on first use so the mode can flip between packets
+    /// without paying for the unused layer's state.
+    silk_nb: Option<SilkEncoder>,
+    silk_wb: Option<SilkEncoder>,
+    /// Scratch space for the SILK payload, sized once so the steady-state
+    /// loop (`steady_state_encode_loop_zero_alloc`) doesn't allocate.
+    silk_buf: [u8; MAX_FRAME_BYTES + 1],
 }
 
 impl Encoder {
@@ -90,7 +113,19 @@ impl Encoder {
             application,
             bandwidth: None,
             final_range: 0,
+            mode: None,
+            silk_nb: None,
+            silk_wb: None,
+            silk_buf: [0u8; MAX_FRAME_BYTES + 1],
         })
+    }
+
+    /// Overrides the automatic SILK/CELT choice `wants_silk` would make from
+    /// the application and bitrate. [`Mode::Hybrid`] is unimplemented and
+    /// falls back to CELT (documented at the fallback site in
+    /// [`Encoder::silk_choice`]); pass `None` to restore the automatic pick.
+    pub fn set_mode(&mut self, mode: Option<Mode>) {
+        self.mode = mode;
     }
 
     /// Channels per frame of input.
@@ -105,8 +140,22 @@ impl Encoder {
 
     /// Encoder delay in *input* samples: the decoded stream lags the input by
     /// this much, and an Ogg-Opus pre-skip of `look_ahead * 48000/rate`
-    /// cancels it exactly. One MDCT overlap, 120 samples at 48 kHz.
+    /// cancels it exactly. CELT: one MDCT overlap, 120 samples at 48 kHz.
+    /// SILK (mono, when the application/bitrate or an explicit
+    /// [`Encoder::set_mode`] select it): [`SILK_LOOK_AHEAD_48K_NB`] or
+    /// [`SILK_LOOK_AHEAD_48K_WB`], the analysis-plus-synthesis resampler
+    /// round trip, click-measured per bandwidth.
     pub fn look_ahead(&self) -> usize {
+        if self.channels == 1 {
+            if let Some(wideband) = self.wants_silk() {
+                let delay = if wideband {
+                    SILK_LOOK_AHEAD_48K_WB
+                } else {
+                    SILK_LOOK_AHEAD_48K_NB
+                };
+                return delay / self.upsample;
+            }
+        }
         120 / self.upsample
     }
 
@@ -144,7 +193,81 @@ impl Encoder {
     /// Drops all inter-frame state; the next packet starts like the first.
     pub fn reset(&mut self) {
         self.celt.reset();
+        self.silk_nb = None;
+        self.silk_wb = None;
         self.final_range = 0;
+    }
+
+    /// Whether the application/bitrate (or an explicit [`Encoder::set_mode`])
+    /// call for SILK, and if so, wideband (else narrowband). `None` means
+    /// CELT (or Hybrid, unimplemented and mapped to CELT).
+    fn wants_silk(&self) -> Option<bool> {
+        match self.mode {
+            Some(Mode::Celt) | Some(Mode::Hybrid) => None,
+            Some(Mode::Silk) => Some(self.bitrate > 10_000),
+            None => {
+                if self.application == Application::Voip && self.bitrate < 20_000 {
+                    Some(self.bitrate > 10_000)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// `wants_silk` narrowed to what this encoder can actually code as SILK:
+    /// mono, 20 ms (960 samples at 48 kHz) frames only. Stereo SILK and SILK
+    /// at other frame sizes are D2b's work; both fall back to CELT here.
+    fn silk_choice(&self, frame_48k: usize) -> Option<bool> {
+        let wideband = self.wants_silk()?;
+        if self.channels != 1 || frame_48k != 960 {
+            return None;
+        }
+        Some(wideband)
+    }
+
+    /// Zero-stuffs a mono, `frame_size`-sample native-rate frame up to
+    /// `frame_size * upsample` samples at 48 kHz, the rate [`SilkEncoder`]
+    /// takes — the same technique [`CeltEncoder::encode`] uses, scaled by
+    /// `upsample` so the passband gain survives the stuffing.
+    fn zero_stuff_mono(&self, pcm: &[f32], frame_size: usize) -> Vec<f32> {
+        let up = self.upsample;
+        if up == 1 {
+            return pcm[..frame_size].to_vec();
+        }
+        let mut out = vec![0f32; frame_size * up];
+        for i in 0..frame_size {
+            out[i * up] = pcm[i] * up as f32;
+        }
+        out
+    }
+
+    /// Picks SILK or CELT for one frame and encodes it, returning the TOC
+    /// byte and the payload bytes (excluding TOC), borrowed from scratch
+    /// space owned by `self` — no allocation on the steady-state path.
+    /// `cap` bounds the CELT path only — SILK isn't budgeted against a byte
+    /// cap yet (D2b).
+    fn encode_toc_and_payload(
+        &mut self,
+        pcm: &[f32],
+        frame_size: usize,
+        cap: usize,
+    ) -> Result<(u8, &[u8])> {
+        let frame_48k = frame_size * self.upsample;
+        if let Some(wideband) = self.silk_choice(frame_48k) {
+            let stuffed = self.zero_stuff_mono(pcm, frame_size);
+            let enc = if wideband {
+                self.silk_wb.get_or_insert_with(|| SilkEncoder::new(true))
+            } else {
+                self.silk_nb.get_or_insert_with(|| SilkEncoder::new(false))
+            };
+            let n = enc.encode_frame(&stuffed, &mut self.silk_buf)?;
+            self.final_range = enc.final_range();
+            return Ok((self.silk_buf[0], &self.silk_buf[1..n]));
+        }
+        let (toc, frame_48k, end) = self.toc(frame_size)?;
+        let n = self.encode_frame(pcm, frame_48k, end, cap)?;
+        Ok((toc, &self.range.data()[..n]))
     }
 
     /// The TOC byte, the frame size in 48 kHz samples and the CELT end band
@@ -226,8 +349,8 @@ impl Encoder {
         frame_size: usize,
         out: &mut [u8],
     ) -> Result<usize> {
-        let (toc, frame_48k, end) = self.toc(frame_size)?;
-        let n = self.encode_frame(pcm, frame_48k, end, out.len().saturating_sub(1))?;
+        let (toc, payload) = self.encode_toc_and_payload(pcm, frame_size, out.len().saturating_sub(1))?;
+        let n = payload.len();
         if out.len() < 1 + n {
             return Err(Error::corrupt(format!(
                 "opus encode: packet needs {} bytes, buffer holds {}",
@@ -236,7 +359,7 @@ impl Encoder {
             )));
         }
         out[0] = toc;
-        out[1..1 + n].copy_from_slice(&self.range.data()[..n]);
+        out[1..1 + n].copy_from_slice(payload);
         Ok(1 + n)
     }
 
@@ -255,8 +378,8 @@ impl Encoder {
         frame_size: usize,
         out: &mut [u8],
     ) -> Result<usize> {
-        let (toc, frame_48k, end) = self.toc(frame_size)?;
-        let n = self.encode_frame(pcm, frame_48k, end, out.len().saturating_sub(3))?;
+        let (toc, payload) = self.encode_toc_and_payload(pcm, frame_size, out.len().saturating_sub(3))?;
+        let n = payload.len();
         let len_bytes = if n < 252 { 1 } else { 2 };
         if out.len() < 1 + len_bytes + n {
             return Err(Error::corrupt(format!(
@@ -273,7 +396,7 @@ impl Encoder {
             out[1] = b0 as u8;
             out[2] = ((n - b0) / 4) as u8;
         }
-        out[1 + len_bytes..1 + len_bytes + n].copy_from_slice(&self.range.data()[..n]);
+        out[1 + len_bytes..1 + len_bytes + n].copy_from_slice(payload);
         Ok(1 + len_bytes + n)
     }
 
