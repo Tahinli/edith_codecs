@@ -2383,7 +2383,14 @@ fn sbr_real_library_matches_reference() {
                 } else {
                     (0..windows)
                         .filter_map(|w| {
-                            let base_o = (oa as i64 + lag + (w * 4_096) as i64).try_into().ok()?;
+                            // `oa`/`ob` (computed above from `lag`) already encode the
+                            // alignment shift via their differing base offsets -- do NOT
+                            // add `lag` again here, that double-applies it and shifts
+                            // every window an extra `lag` samples out of alignment
+                            // (this collapsed the whole-file mean from ~0.96 to ~0.14
+                            // while leaving the single-WINDOW `full`/`low` numbers,
+                            // which don't go through this path, unaffected).
+                            let base_o = oa + w * 4_096;
                             let base_t = ob + w * 4_096;
                             if base_o + 4_096 > o.len() || base_t + 4_096 > t.len() {
                                 return None;
