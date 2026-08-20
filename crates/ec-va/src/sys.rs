@@ -673,6 +673,24 @@ const _: () = {
 
     assert!(size_of::<VARectangle>() == 8 && align_of::<VARectangle>() == 2);
 
+    assert!(
+        size_of::<VAProcColorProperties>() == 8 && align_of::<VAProcColorProperties>() == 1
+    );
+
+    // 64-bit `va_vpp.h:886`: 25 fields down to `output_hdr_metadata` (152
+    // bytes on this target) plus `va_reserved[VA_PADDING_LARGE - 16]` (16
+    // `u32`s, 64 bytes) = 224.
+    assert!(
+        size_of::<VAProcPipelineParameterBuffer>() == 224
+            && align_of::<VAProcPipelineParameterBuffer>() == 8
+    );
+    assert!(offset_of!(VAProcPipelineParameterBuffer, surface_region) == 8);
+    assert!(offset_of!(VAProcPipelineParameterBuffer, input_color_properties) == 132);
+    assert!(offset_of!(VAProcPipelineParameterBuffer, output_color_properties) == 140);
+    assert!(offset_of!(VAProcPipelineParameterBuffer, processing_mode) == 148);
+    assert!(offset_of!(VAProcPipelineParameterBuffer, output_hdr_metadata) == 152);
+    assert!(offset_of!(VAProcPipelineParameterBuffer, va_reserved) == 160);
+
     // Assumption 2: C `enum` and `unsigned int` are both 4 bytes here.
     assert!(size_of::<VAStatus>() == 4);
     assert!(size_of::<VAGenericID>() == 4);
