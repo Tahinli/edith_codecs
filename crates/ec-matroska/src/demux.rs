@@ -1174,12 +1174,18 @@ fn parse_tracks(
         let mut display = (0u64, 0u64);
         let mut light = ContentLight::default();
         let (mut rate, mut channels, mut bits) = (0f64, 0u64, 0u64);
+        // `CodecDelay`, nanoseconds: an AAC/Opus encoder's priming, the same
+        // samples-before-the-first-audible-one an mp4's `elst` or an mp3's LAME
+        // tag states — converted to a sample count once the track's own rate
+        // is known, below.
+        let mut delay_ns = 0u64;
         for (id, child) in Elements::new(&buf[range]) {
             let child = start + child.start..start + child.end;
             match id {
                 ebml::TRACK_NUMBER => number = ebml::uint_of(&buf[child]),
                 ebml::TRACK_TYPE => kind = ebml::uint_of(&buf[child]),
                 ebml::CODEC_ID => codec = ebml::string_of(&buf[child]),
+                ebml::CODEC_DELAY => delay_ns = ebml::uint_of(&buf[child]),
                 ebml::CODEC_PRIVATE => private = Some(Buf::copy_from_slice(&buf[child])),
                 ebml::TRACK_NAME => name = ebml::string_of(&buf[child]),
                 ebml::TRACK_LANGUAGE => language = ebml::string_of(&buf[child]),
@@ -1287,6 +1293,11 @@ fn parse_tracks(
                 info.start_time = Some(0);
                 info.language = Some(language_of(&language, &bcp47));
                 info.default = flag_default;
+                if media == MediaType::Audio && delay_ns > 0 {
+                    let sample_rate = u64::from(info.params.audio().map_or(8_000, |a| a.sample_rate));
+                    info.initial_padding =
+                        ((delay_ns * sample_rate + 500_000_000) / 1_000_000_000) as u32;
+                }
                 streams.push(info);
                 Some(index)
             }

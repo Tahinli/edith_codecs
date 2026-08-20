@@ -8,8 +8,46 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use ec_core::{Demuxer, Error, MediaType, Muxer, SeekMode, TimeBase, Timestamp};
+use ec_core::{
+    CodecId, Demuxer, Error, MediaParameters, MediaType, Muxer, Packet, SeekMode, StreamInfo,
+    TimeBase, Timestamp,
+};
 use ec_matroska::{MatroskaDemuxer, MatroskaMuxer};
+
+/// An AAC track's encoder priming round trips as `CodecDelay`: the demuxer
+/// converts the stated nanoseconds back to a sample count on
+/// [`ec_core::StreamInfo::initial_padding`] — the same field an mp3's LAME tag
+/// or an Opus pre-skip fills, since a Matroska `CodecDelay` names the identical
+/// thing (decode-but-don't-play priming), not a timeline shift.
+#[test]
+fn aac_priming_round_trips_through_codec_delay() {
+    let rate = TimeBase::from_rate(48_000);
+    let mut info = StreamInfo::new(0, rate, ec_core::CodecParameters::new(CodecId::Aac));
+    if let MediaParameters::Audio(a) = &mut info.params.media {
+        a.sample_rate = 48_000;
+        a.layout = ec_core::ChannelLayout::Stereo;
+    }
+    info.params.extradata = Some(ec_core::Buf::copy_from_slice(&[0x11, 0x90]));
+
+    let dst = work().join("aac-priming-round-trip.mkv");
+    let mut muxer = MatroskaMuxer::new(File::create(&dst).expect("output"));
+    let stream = muxer.add_stream(info).expect("stream declared");
+    muxer.set_track_delay(stream, 21_333_333).expect("declare delay"); // 1024/48000s
+    for _ in 0..10i64 {
+        let mut packet = Packet::new(0, rate, vec![0u8; 8]);
+        packet.duration = Some(1024);
+        packet.flags.keyframe = true;
+        muxer.write_packet(&packet).expect("packet written");
+    }
+    muxer.finish().expect("finished");
+
+    let demuxer =
+        MatroskaDemuxer::new(BufReader::new(File::open(&dst).expect("opens"))).expect("reopens");
+    assert_eq!(
+        demuxer.streams()[0].initial_padding, 1024,
+        "CodecDelay round trips to a sample count"
+    );
+}
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures")
@@ -987,7 +1025,6 @@ fn real_hdr_film_container_states_no_light_metadata() {
 
 use ec_ac3::Ac3Decoder;
 use ec_aac::AacDecoder;
-use ec_core::CodecId;
 
 /// Opens whichever container `path` actually is — both crates implement the
 /// same `Demuxer` trait, so the rest of the harness never has to know which.
