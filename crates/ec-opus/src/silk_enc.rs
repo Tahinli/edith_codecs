@@ -295,8 +295,10 @@ fn lpc_to_nlsf(lpc: &[f64], order: usize) -> [i16; MAX_LPC_ORDER] {
         let mut im = 0.0;
         for (k, &a) in lpc.iter().enumerate() {
             let kw = (k as f64 + 1.0) * w;
-            re += a * kw.cos();
-            im -= a * kw.sin();
+            // `lpc` is the predictor (`x[n] ~= sum a[k] x[n-k-1]`), so the
+            // analysis polynomial is A(z) = 1 - sum a[k] z^-(k+1).
+            re -= a * kw.cos();
+            im += a * kw.sin();
         }
         let half = m1 * w / 2.0;
         let (hs, hc) = half.sin_cos();
