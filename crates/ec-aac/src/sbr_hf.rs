@@ -102,12 +102,13 @@ use ec_dsp::Complex;
 /// Returns the signed number of `pi/2` quarter-turns per QMF slot that
 /// *would* need to be applied to restore frequency-pure placement.
 #[allow(dead_code)] // documentation of the characterized convention; tests call it
-pub(crate) fn band_shift_correction(target_band: usize, source_band: usize) -> i64 {
-    match (target_band as i64 - source_band as i64).rem_euclid(4) {
-        1 => 1,
-        3 => -1,
-        _ => 0,
-    }
+pub(crate) fn band_shift_correction(_target_band: usize, _source_band: usize) -> i64 {
+    // The fitted Kaiser bank's odd-stacked convention needed a per-slot
+    // quarter-turn correction here (see the doc above); the normative
+    // ISO/IEC 14496-3 4.6.18.4/4.6.18.8.2 QMF pair in `sbr_qmf` carries its
+    // own correct phase from the spec equations directly, so patching needs
+    // no extra rotation at this site.
+    0
 }
 
 /// One copy-up patch: `width` consecutive QMF bands starting at
