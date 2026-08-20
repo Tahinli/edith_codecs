@@ -2107,6 +2107,60 @@ fn full_chain_low_band_matches_own_core() {
     }
 }
 
+/// Follow-up to round-52: `best_lag_correlation`'s `LAG_MAX=4000` bound was
+/// landing HE-AAC winning lags right at its own edge (-3634..-3882) on the
+/// synthetic matrix -- this is the same shape `wide_lag_search_full_chain`
+/// diagnosed on FMJ. Mirrors that diagnostic's odd-stride coarse pass, but
+/// over a caller-supplied `lag_max` and followed by the same full-`WINDOW`
+/// refine `best_lag_correlation` does, so its result is directly comparable
+/// (not just a coarse `|corr|` estimate).
+fn best_lag_correlation_wide(ours: &[f32], theirs: &[f32], lag_max: i64) -> (i64, f64) {
+    const COARSE: usize = 4096;
+    let start = ours
+        .len()
+        .min(theirs.len())
+        .saturating_sub(WINDOW)
+        .min(ours.len() / 4);
+    let slice_at = |lag: i64, len: usize| -> Option<(usize, usize)> {
+        let (oa, ob) = if lag >= 0 {
+            (start, start + lag as usize)
+        } else {
+            (start + (-lag) as usize, start)
+        };
+        if oa + len > ours.len() || ob + len > theirs.len() {
+            None
+        } else {
+            Some((oa, ob))
+        }
+    };
+    let mut coarse_best = (0i64, -1.0f64);
+    let mut lag = -lag_max;
+    while lag <= lag_max {
+        if let Some((oa, ob)) = slice_at(lag, COARSE) {
+            let c = correlation(&ours[oa..oa + COARSE], &theirs[ob..ob + COARSE]).abs();
+            if c > coarse_best.1 {
+                coarse_best = (lag, c);
+            }
+        }
+        lag += 11; // odd stride so it doesn't alias against frame-length periodicity
+    }
+    let mut best = (coarse_best.0, -1.0f64, 0.0f64);
+    for lag in (coarse_best.0 - 16)..=(coarse_best.0 + 16) {
+        let Some((oa, ob)) = slice_at(lag, WINDOW) else {
+            continue;
+        };
+        let n = WINDOW.min(ours.len() - oa).min(theirs.len() - ob);
+        if n < 1024 {
+            continue;
+        }
+        let c = correlation(&ours[oa..oa + n], &theirs[ob..ob + n]);
+        if c.abs() > best.1 {
+            best = (lag, c.abs(), c);
+        }
+    }
+    (best.0, best.2)
+}
+
 /// Round-52: a controlled fixture matrix -- unlike Nikbinler/FMJ (one real
 /// file each, whose sample rate, bitrate and content all differ at once),
 /// every row here decodes the SAME synthesized source (three summed sine
@@ -2145,12 +2199,21 @@ fn synthetic_heaac_matrix() {
         std::env::set_var("EC_AAC_SBR_SIDEINFO_DEBUG", "1");
     }
     println!(
-        "{:>5} {:>6} {:>4} {:>4} {:>4}  {:>8} {:>8} {:>8} {:>6}  {:>11}",
-        "rate", "kbps", "prof", "kx", "k2", "full", "below", "above", "lag", "ours_v_core"
+        "{:>5} {:>6} {:>4} {:>4} {:>4}  {:>8} {:>8} {:>8} {:>6}  {:>11} {:>8}",
+        "rate", "kbps", "prof", "kx", "k2", "full", "below", "above", "lag", "ours_v_core", "ovc_lag"
     );
+    // Wide enough that the WIDE_LAG_MAX==LC's own decoder priming delay
+    // (2048) plus a full SBR-chain worth of extra delay (a few thousand
+    // samples at the doubled/full output rate) both land well inside it,
+    // not right at the edge the way the plain (LAG_MAX=4000) search did.
+    const WIDE_LAG_MAX: i64 = 20_000;
     for rate in [48_000u32, 44_100] {
         for br in ["32k", "48k", "64k", "96k"] {
-            for (profile, prefix) in [("HE", "heaac"), ("LC", "lc")] {
+            // LC first: its winning lag is the pure container/decoder
+            // priming delay with no SBR chain involved, and is reused below
+            // as the anchor for the HE row's own delay-candidate probe.
+            let mut lc_lag: Option<i64> = None;
+            for (profile, prefix) in [("LC", "lc"), ("HE", "heaac")] {
                 let path = dir.join(format!("{prefix}_{rate}_{br}.m4a"));
                 if !path.exists() {
                     eprintln!("SKIP {}: missing", path.display());
@@ -2170,7 +2233,10 @@ fn synthetic_heaac_matrix() {
                 let theirs = ffmpeg_decode(&path, 0, ours.len());
                 let o = &ours[0];
                 let t = &theirs[0];
-                let (lag, full) = best_lag_correlation(o, t);
+                let (lag, full) = best_lag_correlation_wide(o, t, WIDE_LAG_MAX);
+                if profile == "LC" {
+                    lc_lag = Some(lag);
+                }
                 // Crossover in Hz from the actual parsed kx (band width
                 // rate/128, same domain `sbr_chain.rs`'s own doc comment
                 // gives `kx`/`k2` in) when SBR engaged; a fixed quarter-Nyquist
@@ -2180,13 +2246,27 @@ fn synthetic_heaac_matrix() {
                 } else {
                     f64::from(our_rate) * 0.25
                 };
-                let (_, below) =
-                    best_lag_correlation(&lowpass(o, our_rate, crossover_hz), &lowpass(t, our_rate, crossover_hz));
-                let n = WINDOW.min(o.len()).min(t.len());
+                let (_, below) = best_lag_correlation_wide(
+                    &lowpass(o, our_rate, crossover_hz),
+                    &lowpass(t, our_rate, crossover_hz),
+                    WIDE_LAG_MAX,
+                );
+                // `above` re-slices at the FULL-band winning `lag` before
+                // splitting, same convention `sbr_real_library_matches_reference`
+                // uses -- round-52's first cut of this row measured `o[..n]`
+                // against `t[..n]` with no lag offset at all, which is only
+                // valid by accident at lag 0 and was silently wrong for
+                // every other winning lag in that table.
+                let (oa, ob) = if lag >= 0 {
+                    (0usize, lag as usize)
+                } else {
+                    ((-lag) as usize, 0usize)
+                };
+                let n = WINDOW.min(o.len().saturating_sub(oa)).min(t.len().saturating_sub(ob));
                 let above = if n >= 1024 {
                     correlation(
-                        &highpass(&o[..n], our_rate, crossover_hz),
-                        &highpass(&t[..n], our_rate, crossover_hz),
+                        &highpass(&o[oa..oa + n], our_rate, crossover_hz),
+                        &highpass(&t[ob..ob + n], our_rate, crossover_hz),
                     )
                 } else {
                     0.0
@@ -2201,17 +2281,44 @@ fn synthetic_heaac_matrix() {
                         let cutoff = f64::from(core_rate) * 0.4;
                         let ol = lowpass(o, our_rate, cutoff);
                         let ul = lowpass(&up, our_rate, cutoff);
-                        best_lag_correlation(&ol, &ul).1
+                        best_lag_correlation_wide(&ol, &ul, WIDE_LAG_MAX)
                     })
                 } else {
                     None
                 };
                 println!(
-                    "{rate:>5} {br:>6} {profile:>4} {kx:>4} {k2:>4}  {full:>8.4} {below:>8.4} {above:>8.4} {lag:>6}  {:>11}",
+                    "{rate:>5} {br:>6} {profile:>4} {kx:>4} {k2:>4}  {full:>8.4} {below:>8.4} {above:>8.4} {lag:>6}  {:>11} {:>8}",
                     ours_v_core
-                        .map(|c| format!("{c:.4}"))
+                        .map(|(_, c)| format!("{c:.4}"))
+                        .unwrap_or_else(|| "n/a".into()),
+                    ours_v_core
+                        .map(|(l, _)| l.to_string())
                         .unwrap_or_else(|| "n/a".into())
                 );
+                // Coordinator follow-up (4): on the two named rows, probe
+                // candidate total HE-vs-reference delays built from LC's own
+                // priming lag plus a guessed SBR-chain contribution, to see
+                // which (if any) actually lands near 1.0 -- and whether that
+                // offset is constant across the two rows.
+                if profile == "HE"
+                    && ((rate == 44_100 && br == "48k") || (rate == 48_000 && br == "64k"))
+                {
+                    let lc = lc_lag.unwrap_or(-2048);
+                    println!("  ch0 delay probe (LC lag {lc}):");
+                    for (label, extra) in [
+                        ("2990", 2990i64),
+                        ("3010", 3010),
+                        ("3020", 3020),
+                        ("1505x2", 1505 * 2),
+                        ("962x2", 962 * 2),
+                    ] {
+                        let candidate = (lc - 2048) + extra;
+                        println!(
+                            "    offset={label:>6} -> lag={candidate:>6}  corr={:.6}",
+                            correlation_at_lag(o, t, candidate)
+                        );
+                    }
+                }
                 if profile == "LC" {
                     assert!(
                         full >= 0.999,
