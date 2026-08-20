@@ -187,6 +187,49 @@ fn mp4_fixtures_match_ffmpeg_per_channel() {
     assert!(checked > 0, "no AAC-in-mp4 fixtures found");
 }
 
+/// One fixture per §4.6 coding tool ffmpeg's native encoder can force in
+/// isolation (plus one with all four together), pinning the PNS/M-S ordering
+/// bug found against real OBS screen recordings (repo ledger): PNS must fill
+/// its bands before M/S and intensity stereo combine them.
+#[test]
+fn aac_coding_tools_match_ffmpeg_in_isolation() {
+    if !have_ffmpeg() {
+        eprintln!("SKIP: ffmpeg not on PATH");
+        return;
+    }
+    let dir = fixtures().join("audio");
+    let tmp = std::env::temp_dir().join("ec-aac-tools-oracle");
+    std::fs::create_dir_all(&tmp).expect("temp dir");
+    let mut checked = 0;
+    for tool in ["pns", "is", "ms", "tns", "all"] {
+        let name = format!("aac-tool-{tool}-mp4-stereo-48000.m4a");
+        let path = dir.join(&name);
+        if !path.exists() {
+            eprintln!("SKIP {name}: fixture missing");
+            continue;
+        }
+        let adts = tmp.join(format!("{name}.aac"));
+        let out = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-i"])
+            .arg(&path)
+            .args(["-c:a", "copy", "-f", "adts"])
+            .arg(&adts)
+            .output()
+            .expect("ffmpeg runs");
+        assert!(out.status.success(), "remux failed for {name}");
+        let corr = compare(&adts);
+        println!("{name}: {corr:?}");
+        for (ch, c) in corr.iter().enumerate() {
+            assert!(
+                *c >= 0.999,
+                "{name} channel {ch} correlation {c:.6} < 0.999"
+            );
+        }
+        checked += 1;
+    }
+    assert!(checked > 0, "no AAC tool-isolation fixtures found");
+}
+
 /// The contract every downmix in this family folds: FL, FR, FC, LFE, BL, BR.
 /// Each channel carries its own tone, mapped explicitly onto the layout, so a
 /// wrong element order shows up as the wrong tone on the wrong channel.
