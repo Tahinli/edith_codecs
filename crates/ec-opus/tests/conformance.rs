@@ -1383,3 +1383,169 @@ fn garbage_payloads_never_panic() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// SILK encoder (mono, 20 ms, NB/WB)
+// ---------------------------------------------------------------------------
+
+use ec_opus::SilkEncoder;
+
+/// A 1 s speech-like signal at 48 kHz: 0.6 s of a pitch-modulated pulse train
+/// through a formant-ish AR(2) filter, then 0.4 s of filtered noise.
+fn speech_like() -> Vec<f32> {
+    let mut out = Vec::with_capacity(48000);
+    let (mut y1, mut y2) = (0f32, 0f32);
+    let mut phase = 0f64;
+    let mut s = 12345u32;
+    for i in 0..48000 {
+        let t = i as f64 / 48000.0;
+        let e = if t < 0.6 {
+            let f0 = 120.0 + 30.0 * (2.0 * std::f64::consts::PI * 2.0 * t).sin();
+            phase += f0 / 48000.0;
+            if phase >= 1.0 {
+                phase -= 1.0;
+                1.0
+            } else {
+                0.0
+            }
+        } else {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((s >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 0.3
+        };
+        // Resonance near 700 Hz, radius 0.97.
+        let (r, w) = (0.97f32, 2.0 * std::f32::consts::PI * 700.0 / 48000.0);
+        let y = e + 2.0 * r * w.cos() * y1 - r * r * y2;
+        y2 = y1;
+        y1 = y;
+        out.push(y * 0.03);
+    }
+    out
+}
+
+/// 16-bit PCM mono WAV at 48 kHz, as `f32`.
+fn read_wav_mono(path: &Path) -> Vec<f32> {
+    let d = fs::read(path).unwrap();
+    assert_eq!(u16::from_le_bytes([d[22], d[23]]), 1, "mono fixture");
+    assert_eq!(u32::from_le_bytes([d[24], d[25], d[26], d[27]]), 48000);
+    let mut pos = 12;
+    loop {
+        let id = &d[pos..pos + 4];
+        let len = u32::from_le_bytes([d[pos + 4], d[pos + 5], d[pos + 6], d[pos + 7]]) as usize;
+        if id == b"data" {
+            return d[pos + 8..pos + 8 + len]
+                .chunks_exact(2)
+                .map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0)
+                .collect();
+        }
+        pos += 8 + len + (len & 1);
+    }
+}
+
+/// Windowed-sinc low-pass at `cutoff_hz` (48 kHz input), zero-phase.
+fn lowpass(x: &[f32], cutoff_hz: f64) -> Vec<f32> {
+    let taps = 127usize;
+    let c = cutoff_hz / 48000.0;
+    let h: Vec<f64> = (0..taps)
+        .map(|i| {
+            let m = i as f64 - (taps - 1) as f64 / 2.0;
+            let sinc = if m == 0.0 { 2.0 * c } else { (2.0 * std::f64::consts::PI * c * m).sin() / (std::f64::consts::PI * m) };
+            sinc * (0.54 - 0.46 * (2.0 * std::f64::consts::PI * i as f64 / (taps - 1) as f64).cos())
+        })
+        .collect();
+    let half = (taps - 1) / 2;
+    (0..x.len())
+        .map(|n| {
+            h.iter()
+                .enumerate()
+                .map(|(k, &hk)| {
+                    let idx = n as isize + half as isize - k as isize;
+                    if idx >= 0 && (idx as usize) < x.len() { hk * x[idx as usize] as f64 } else { 0.0 }
+                })
+                .sum::<f64>() as f32
+        })
+        .collect()
+}
+
+/// Encodes `pcm` NB or WB, decodes each packet with our decoder asserting the
+/// range-coder invariant, returns (decoded 48 kHz, packets, voiced frames,
+/// encoder delay).
+fn silk_roundtrip(pcm: &[f32], wideband: bool) -> (Vec<f32>, Vec<Vec<u8>>, usize, usize) {
+    let mut enc = SilkEncoder::new(wideband);
+    let mut dec = Decoder::new(48000, 1).unwrap();
+    let mut out = vec![0u8; 1500];
+    let mut buf = vec![0f32; 5760];
+    let mut decoded = Vec::new();
+    let mut packets = Vec::new();
+    let mut padded = pcm.to_vec();
+    padded.resize(pcm.len().div_ceil(960) * 960 + 960, 0.0);
+    for block in padded.chunks(960) {
+        let len = enc.encode_frame(block, &mut out).expect("silk encode");
+        let n = dec.decode_float(&out[..len], &mut buf).expect("silk decode");
+        assert_eq!(n, 960);
+        assert_eq!(dec.final_range(), enc.final_range(), "range state diverged");
+        decoded.extend_from_slice(&buf[..n]);
+        packets.push(out[..len].to_vec());
+    }
+    (decoded, packets, enc.voiced_frames(), enc.delay_samples())
+}
+
+/// Correlation after aligning `decoded` to `reference` at the best lag in
+/// `[0, max_lag)`; the peak must be interior (a peak at the search bound is
+/// no measurement).
+fn aligned_corr(reference: &[f32], decoded: &[f32], max_lag: usize) -> (f64, usize) {
+    let (mut best, mut best_lag) = (-1.0f64, 0usize);
+    for lag in 0..max_lag {
+        let c = correlation(reference, &decoded[lag..]);
+        if c > best {
+            best = c;
+            best_lag = lag;
+        }
+    }
+    assert!(best_lag + 1 < max_lag, "alignment peak at the search bound");
+    (best, best_lag)
+}
+
+#[test]
+fn silk_mono_nb_wb_roundtrip() {
+    let wav = fixture("wav16-mono-48000.wav");
+    let mut sources = vec![("synthetic", speech_like())];
+    if wav.exists() {
+        let w = read_wav_mono(&wav);
+        sources.push(("wav16-mono-48000", w[..w.len().min(96000)].to_vec()));
+    }
+    for (name, pcm) in &sources {
+        for wideband in [false, true] {
+            let (decoded, packets, voiced, delay) = silk_roundtrip(pcm, wideband);
+            let band = if wideband { 7000.0 } else { 3500.0 };
+            let reference = lowpass(pcm, band);
+            let (corr, lag) = aligned_corr(&reference, &decoded, 2000);
+            let bytes: usize = packets.iter().map(Vec::len).sum();
+            let tag = if wideband { "WB" } else { "NB" };
+            eprintln!(
+                "silk {name} {tag}: corr {corr:.4} at lag {lag} (resampler delay {delay}), voiced {voiced}/{} frames, {} kbps",
+                packets.len(),
+                bytes * 8 / (packets.len() * 20)
+            );
+            assert!(corr >= 0.8, "{name} {tag}: corr {corr:.4}");
+            assert!(lag >= delay, "{name} {tag}: aligned before the documented delay");
+            if *name == "synthetic" {
+                assert!(voiced > 0, "{name} {tag}: no frame coded with LTP");
+            }
+
+            // Reference oracle: the packets in an Ogg-Opus file decode cleanly.
+            if Command::new("ffmpeg").arg("-version").output().is_ok() {
+                let path = temp_path(&format!("silk-{name}-{tag}.opus"));
+                write_ogg_opus(&path, &packets, opus_head(1, None), 1, pcm.len());
+                let out = Command::new("ffmpeg")
+                    .args(["-v", "warning", "-c:a", "libopus", "-i"])
+                    .arg(&path)
+                    .args(["-f", "null", "-"])
+                    .output()
+                    .unwrap();
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                assert!(out.status.success() && stderr.trim().is_empty(), "{name} {tag}: ffmpeg: {stderr}");
+                let _ = fs::remove_file(&path);
+            }
+        }
+    }
+}

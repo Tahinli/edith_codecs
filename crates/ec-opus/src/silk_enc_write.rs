@@ -13,6 +13,9 @@
 //! under the decoder's seed/offset convention). Noise shaping (NSQ), 10/40/60
 //! ms frames and stereo are subtask D2b.
 
+// Same idiom as silk.rs: index loops mirror the decoder's position arithmetic.
+#![allow(clippy::needless_range_loop)]
+
 use ec_core::Result;
 
 use crate::range::{RangeDecoder, RangeEncoder};
@@ -168,102 +171,112 @@ impl SilkEncoder {
             }
             acc
         };
-        // Codebook pick by min squared error, open loop (the frame's own
-        // residual stands in for the not-yet-quantised part of the history).
-        let mut per_index = 0usize;
-        let mut ltp_index = [0usize; MAX_NB_SUBFR];
-        if voiced {
-            let mut r_ol = r.clone();
-            r_ol[n..].copy_from_slice(&res);
-            let mut best_total = f32::INFINITY;
-            for (per, cbk) in [&LTP_GAIN_VQ_0[..], &LTP_GAIN_VQ_1[..], &LTP_GAIN_VQ_2[..]]
-                .iter()
-                .enumerate()
-            {
-                let mut total = 0f32;
-                let mut idx = [0usize; MAX_NB_SUBFR];
-                for k in 0..NB_SUBFR {
-                    let mut best = f32::INFINITY;
-                    for (v, b) in cbk.iter().enumerate() {
-                        let err: f32 = (0..sub)
-                            .map(|i| {
-                                let d = res[k * sub + i] - ltp_pred(&r_ol, b, k, i);
-                                d * d
-                            })
-                            .sum();
-                        if err < best {
-                            best = err;
-                            idx[k] = v;
-                        }
-                    }
-                    total += best;
-                }
-                if total < best_total {
-                    best_total = total;
-                    per_index = per;
-                    ltp_index = idx;
-                }
+        let codebook = |per: usize| -> &'static [[i8; 5]] {
+            match per {
+                0 => &LTP_GAIN_VQ_0,
+                1 => &LTP_GAIN_VQ_1,
+                _ => &LTP_GAIN_VQ_2,
             }
-        }
-        let cbk: &[[i8; 5]] = match per_index {
-            0 => &LTP_GAIN_VQ_0,
-            1 => &LTP_GAIN_VQ_1,
-            _ => &LTP_GAIN_VQ_2,
         };
-
-        // Gains: the open-loop excitation RMS per subframe, so pulses land
-        // around unit magnitude.
+        // Gains: the open-loop excitation RMS per subframe (LTP vector picked
+        // against the unquantised residual), so pulses land around unit
+        // magnitude.
         let mut targets = [0i32; MAX_NB_SUBFR];
-        for k in 0..NB_SUBFR {
+        {
             let mut r_ol = r.clone();
             r_ol[n..].copy_from_slice(&res);
-            let e: f32 = (0..sub)
-                .map(|i| {
-                    let p = if voiced { ltp_pred(&r_ol, &cbk[ltp_index[k]], k, i) } else { 0.0 };
-                    let d = res[k * sub + i] - p;
-                    d * d
-                })
-                .sum::<f32>()
-                / sub as f32;
-            targets[k] = ((e.sqrt() * 65536.0).round() as i64).clamp(1, i32::MAX as i64) as i32;
+            for k in 0..NB_SUBFR {
+                let e = if voiced {
+                    LTP_GAIN_VQ_2
+                        .iter()
+                        .map(|b| {
+                            (0..sub)
+                                .map(|i| {
+                                    let d = res[k * sub + i] - ltp_pred(&r_ol, b, k, i);
+                                    d * d
+                                })
+                                .sum::<f32>()
+                        })
+                        .fold(f32::INFINITY, f32::min)
+                } else {
+                    (0..sub).map(|i| res[k * sub + i].powi(2)).sum()
+                };
+                let rms = (e / sub as f32).sqrt();
+                targets[k] = ((rms * 65536.0).round() as i64).clamp(1, i32::MAX as i64) as i32;
+            }
         }
         let (gain_idx, gains_q16) =
             quantize_gains(&targets, &mut self.prev_gain_index, false, NB_SUBFR);
 
-        // Pulses: sequential, under the decoder's seed-driven sign flips.
+        // Excitation, closed loop: for each candidate LTP codebook, per
+        // subframe pick the vector that best predicts the residual from the
+        // *reconstructed* history (so quantisation noise fed back through the
+        // pitch loop is accounted for), then quantise the pulses sequentially
+        // under the decoder's seed-driven sign flips. Keep the codebook with
+        // the least reconstruction error.
         let seed_index = 0i32;
-        let mut seed = seed_index;
-        let mut pulses = vec![0i32; n];
-        for k in 0..NB_SUBFR {
-            let g = gains_q16[k] as f32 / 65536.0;
-            for i in 0..sub {
-                let idx = k * sub + i;
-                let pred = if voiced { ltp_pred(&r, &cbk[ltp_index[k]], k, i) } else { 0.0 };
-                let e = (res[idx] - pred) / g;
-                seed = silk_rand(seed);
-                let flip = seed < 0;
-                let target = if flip { -e } else { e };
-                let recon = |p: i32| -> f32 {
-                    let lvl = p as f32 - LEVEL_ADJUST * (p.signum() as f32);
-                    lvl + offset
-                };
-                let c = (target.round() as i32).clamp(-MAX_PULSE, MAX_PULSE);
-                let p = [c - 1, c, c + 1]
-                    .into_iter()
-                    .filter(|p| p.abs() <= MAX_PULSE)
-                    .min_by(|&a, &b| {
-                        (recon(a) - target)
-                            .abs()
-                            .partial_cmp(&(recon(b) - target).abs())
-                            .unwrap()
-                    })
-                    .unwrap();
-                pulses[idx] = p;
-                seed = seed.wrapping_add(p);
-                let exc = if flip { -recon(p) } else { recon(p) };
-                r[n + idx] = g * (exc + pred);
+        let run = |per: usize| -> ([usize; MAX_NB_SUBFR], Vec<i32>, Vec<f32>, f32) {
+            let cbk = codebook(per);
+            let mut r = r.clone();
+            let mut ltp_index = [0usize; MAX_NB_SUBFR];
+            let mut pulses = vec![0i32; n];
+            let mut seed = seed_index;
+            let mut err = 0f32;
+            for k in 0..NB_SUBFR {
+                if voiced {
+                    // In-subframe taps (lag shorter than the subframe) see the
+                    // unquantised residual as a stand-in.
+                    let mut r_ol = r.clone();
+                    r_ol[n + k * sub..n + (k + 1) * sub].copy_from_slice(&res[k * sub..(k + 1) * sub]);
+                    let mut best = f32::INFINITY;
+                    for (v, b) in cbk.iter().enumerate() {
+                        let e: f32 = (0..sub)
+                            .map(|i| (res[k * sub + i] - ltp_pred(&r_ol, b, k, i)).powi(2))
+                            .sum();
+                        if e < best {
+                            best = e;
+                            ltp_index[k] = v;
+                        }
+                    }
+                }
+                let g = gains_q16[k] as f32 / 65536.0;
+                for i in 0..sub {
+                    let idx = k * sub + i;
+                    let pred = if voiced { ltp_pred(&r, &cbk[ltp_index[k]], k, i) } else { 0.0 };
+                    let e = (res[idx] - pred) / g;
+                    seed = silk_rand(seed);
+                    let flip = seed < 0;
+                    let target = if flip { -e } else { e };
+                    let recon = |p: i32| -> f32 {
+                        let lvl = p as f32 - LEVEL_ADJUST * (p.signum() as f32);
+                        lvl + offset
+                    };
+                    let c = (target.round() as i32).clamp(-MAX_PULSE, MAX_PULSE);
+                    let p = [c - 1, c, c + 1]
+                        .into_iter()
+                        .filter(|p| p.abs() <= MAX_PULSE)
+                        .min_by(|&a, &b| {
+                            (recon(a) - target)
+                                .abs()
+                                .partial_cmp(&(recon(b) - target).abs())
+                                .unwrap()
+                        })
+                        .unwrap();
+                    pulses[idx] = p;
+                    seed = seed.wrapping_add(p);
+                    let exc = if flip { -recon(p) } else { recon(p) };
+                    r[n + idx] = g * exc + pred;
+                    err += (r[n + idx] - res[idx]).powi(2);
+                }
             }
-        }
+            (ltp_index, pulses, r, err)
+        };
+        let candidates: Vec<usize> = if voiced { vec![0, 1, 2] } else { vec![0] };
+        let (per_index, (ltp_index, pulses, _, _)) = candidates
+            .into_iter()
+            .map(|per| (per, run(per)))
+            .min_by(|a, b| a.1 .3.partial_cmp(&b.1 .3).unwrap())
+            .unwrap();
 
         // --- Bitstream, in decode()'s order. ---
         let enc = &mut self.range;
@@ -290,10 +303,10 @@ impl SilkEncoder {
         for i in 0..order {
             let q = nq.indices[i + 1] as i32;
             let icdf = &cb.ec_icdf[ec_ix[i] as usize..];
-            if q < -4 {
+            if q <= -4 {
                 enc.enc_icdf(0, icdf, 8);
                 enc.enc_icdf((-4 - q) as usize, &NLSF_EXT_ICDF, 8);
-            } else if q > 4 {
+            } else if q >= 4 {
                 enc.enc_icdf(8, icdf, 8);
                 enc.enc_icdf((q - 4) as usize, &NLSF_EXT_ICDF, 8);
             } else {
@@ -498,3 +511,4 @@ mod tests {
         }
     }
 }
+
