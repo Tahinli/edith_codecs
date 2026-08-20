@@ -18,7 +18,7 @@ use std::sync::Arc;
 use ec_va::caps::{Entrypoint, Profile};
 use ec_va::{
     Buffer, CapReport, Config, ConfigAttrib, Context, Display, Image, MappedBuffer, Picture,
-    Surface, SurfaceSpec, sys,
+    Surface, SurfaceSpec, Vpp, sys,
 };
 
 use crate::error::{Error, Result};
@@ -185,6 +185,15 @@ pub struct Encoder {
     profile: Profile,
     /// An upload image, reused across frames.
     upload: Option<Image>,
+    /// P010 -> NV12 GPU-resident conversion pipeline for [`Encoder::encode_frame`]
+    /// on a 10-bit source; built lazily, since most encoders never see one.
+    vpp: Option<Vpp>,
+    /// The small pool [`Encoder::vpp`] converts into, round-robined rather
+    /// than pool-acquired: each conversion is fully synced before this
+    /// encoder's own picture submission returns, so two surfaces are enough
+    /// to never hand out one still in flight.
+    vpp_surfaces: Vec<Arc<Surface>>,
+    vpp_next: usize,
 }
 
 impl Encoder {
@@ -286,6 +295,9 @@ impl Encoder {
             tunings_dirty: true,
             profile,
             upload: None,
+            vpp: None,
+            vpp_surfaces: Vec::new(),
+            vpp_next: 0,
         })
     }
 
@@ -322,27 +334,38 @@ impl Encoder {
     /// (e.g. a transcode) wants — the alternative is a full frame through
     /// system memory and back for no reason.
     ///
+    /// A 10-bit (P010) source is also zero-copy through the driver's own
+    /// video-processing pipeline: [`Encoder`] keeps a small VPP-owned NV12
+    /// surface pool (built lazily, on the first 10-bit frame) and converts
+    /// into it on the GPU (`VAProfileNone`/`VAEntrypointVideoProc`) before
+    /// submitting exactly as for an 8-bit source — still no read-back to
+    /// system memory. Every profile this crate encodes (`H264High`,
+    /// `HEVCMain`) is itself 8-bit, so the low two bits are truncated the
+    /// same way [`Frame::to_i420`]'s CPU path truncates them (VPP's rounding
+    /// may differ by a code point; see `gpu.rs`'s PSNR comparison of the two
+    /// paths for the measured difference) — call [`Frame::to_i420_16`]
+    /// instead if the extra precision must survive encoding.
+    ///
     /// Refused, rather than silently working around, when:
     /// - `frame` was decoded on a different [`ec_va::Display`]: a surface id
     ///   only means anything on the display that created it.
-    /// - `frame` is 10-bit (P010): every profile this crate encodes
-    ///   (`H264High`, `HEVCMain`) is 8-bit, so there is no lossless
-    ///   destination for the extra two bits — call [`Frame::to_i420`] and
-    ///   [`Encoder::encode`] if the truncation is acceptable.
+    /// - `frame`'s bit depth is neither 8 nor 10: no profile this crate
+    ///   encodes, and no VPP conversion this crate builds, has a destination
+    ///   for a 12-bit source.
     /// - `frame`'s coded size does not match this encoder's: the surface
-    ///   formats have to agree for the driver to read one as the other with
-    ///   no VPP conversion pass, and this crate does not carry a VPP-free
-    ///   fallback for a mismatched size.
+    ///   formats have to agree for the driver to read one as the other, and
+    ///   the VPP conversion pass (when one runs) does not resize.
     pub fn encode_frame(
         &mut self,
         frame: &crate::frame::Frame,
         meta: FrameMetadata,
     ) -> Result<CodedFrame> {
-        if frame.bit_depth != 8 {
+        if frame.bit_depth != 8 && frame.bit_depth != 10 {
             return Err(Error::unsupported(
                 format!("encode_frame of a {}-bit source", frame.bit_depth),
-                "H264High and HEVCMain, the only profiles this crate encodes, are 8-bit; \
-                 decode to I420 with Frame::to_i420 and call Encoder::encode instead",
+                "H264High and HEVCMain, the only profiles this crate encodes, are 8-bit, and \
+                 the VPP conversion this crate builds only reads P010 (10-bit); decode to I420 \
+                 with Frame::to_i420 and call Encoder::encode instead",
             ));
         }
         if !Arc::ptr_eq(frame.surface().display(), self.context.display()) {
@@ -356,7 +379,37 @@ impl Encoder {
                 self.coded_size.0, self.coded_size.1, frame.coded_size.0, frame.coded_size.1
             )));
         }
-        self.encode_surface(Arc::clone(frame.surface()), meta)
+        let source = if frame.bit_depth == 10 {
+            self.nv12_from_p010(frame.surface())?
+        } else {
+            Arc::clone(frame.surface())
+        };
+        self.encode_surface(source, meta)
+    }
+
+    /// Convert a P010 surface into this encoder's coded size, in NV12, on the
+    /// GPU. Builds the VPP pipeline and its two-surface pool on first use.
+    fn nv12_from_p010(&mut self, source: &Arc<Surface>) -> Result<Arc<Surface>> {
+        if self.vpp.is_none() {
+            let spec = SurfaceSpec::nv12(self.coded_size.0, self.coded_size.1)
+                .with_usage_hint(sys::VA_SURFACE_ATTRIB_USAGE_HINT_ENCODER);
+            let display = self.context.display();
+            let surfaces = Surface::create_pool(display, &spec, 2)?;
+            let vpp = Vpp::new(
+                display,
+                sys::VA_RT_FORMAT_YUV420 | sys::VA_RT_FORMAT_YUV420_10,
+                &surfaces,
+            )?;
+            self.vpp_surfaces = surfaces;
+            self.vpp = Some(vpp);
+        }
+        let dest = Arc::clone(&self.vpp_surfaces[self.vpp_next]);
+        self.vpp_next = (self.vpp_next + 1) % self.vpp_surfaces.len();
+        Ok(self
+            .vpp
+            .as_ref()
+            .expect("just built above if it was None")
+            .convert(source, dest)?)
     }
 
     /// Shared submission path for [`Encoder::encode`] and
