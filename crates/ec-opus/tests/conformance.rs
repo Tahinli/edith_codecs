@@ -772,7 +772,7 @@ fn real_library_sweep() {
 // Encoder: self-consistency (range-exact against our own decoder)
 // ---------------------------------------------------------------------------
 
-use ec_opus::{Application, Encoder, MultistreamEncoder};
+use ec_opus::{Application, Bandwidth, Encoder, MultistreamEncoder};
 
 /// A deterministic music-like test signal: several detuned partials plus a
 /// swept component per channel, loud enough to exercise every band.
@@ -887,7 +887,8 @@ fn encoder_mode_follows_application_and_bitrate() {
         (Application::Voip, 8_000u32, Some(1u8)),
         (Application::Voip, 16_000, Some(9)),
         (Application::Audio, 64_000, None),
-        (Application::Voip, 32_000, None),
+        (Application::Voip, 32_000, Some(15)),
+        (Application::Voip, 48_000, None),
     ];
     for (app, bps, want_config) in cases {
         let mut enc = Encoder::new(48000, 1, app).unwrap();
@@ -1719,5 +1720,101 @@ fn silk_packets_track_encoder_bitrate() {
         eprintln!("encoder bitrate target {kbps_target}: {kbps:.2} kbps");
         let ratio = kbps / kbps_target as f64;
         assert!((0.8..=1.2).contains(&ratio), "target {kbps_target}: got {kbps:.2} kbps");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hybrid (SILK 16 kHz + CELT from band 17, one range-coded stream).
+
+/// Encodes mono `pcm` as hybrid packets at `bps` and decodes them with our
+/// decoder, `mute` = (celt, silk) layers dropped at the decoder; asserts
+/// range-state parity packet for packet. Returns (decoded, packets).
+fn hybrid_roundtrip(pcm: &[f32], bps: u32, bandwidth: Option<Bandwidth>, mute: (bool, bool)) -> (Vec<f32>, Vec<Vec<u8>>) {
+    let mut enc = Encoder::new(48000, 1, Application::Voip).unwrap();
+    enc.set_bitrate(bps);
+    enc.set_bandwidth(bandwidth);
+    let mut dec = Decoder::new(48000, 1).unwrap();
+    dec.debug_mute_layers(mute.0, mute.1);
+    let mut out = vec![0u8; 1500];
+    let mut buf = vec![0f32; 5760];
+    let (mut decoded, mut packets) = (Vec::new(), Vec::new());
+    let mut padded = pcm.to_vec();
+    padded.resize(pcm.len().div_ceil(960) * 960 + 960, 0.0);
+    for block in padded.chunks(960) {
+        let len = enc.encode_float(block, 960, &mut out).expect("hybrid encode");
+        let n = dec.decode_float(&out[..len], &mut buf).expect("hybrid decode");
+        assert_eq!(n, 960);
+        assert_eq!(dec.final_range(), enc.final_range(), "range state diverged");
+        decoded.extend_from_slice(&buf[..n]);
+        packets.push(out[..len].to_vec());
+    }
+    (decoded, packets)
+}
+
+/// The two layers of a hybrid packet reach the decoder's output at the same
+/// delay: a click's low-band-only and high-band-only peaks coincide at the
+/// encoder's documented look-ahead.
+#[test]
+fn hybrid_layers_align() {
+    let mut click = vec![0f32; 48000];
+    // Well inside the stream so both layers' predictors are running.
+    let at = 960 * 10 + 300;
+    click[at] = 0.9;
+    let peak = |x: &[f32]| {
+        x.iter().enumerate().max_by(|a, b| a.1.abs().partial_cmp(&b.1.abs()).unwrap()).unwrap().0
+    };
+    let (lb, _) = hybrid_roundtrip(&click, 32_000, None, (true, false));
+    let (hb, _) = hybrid_roundtrip(&click, 32_000, None, (false, true));
+    let enc = Encoder::new(48000, 1, Application::Voip).unwrap();
+    let (plb, phb) = (peak(&lb) as i64 - at as i64, peak(&hb) as i64 - at as i64);
+    eprintln!("hybrid click: LB peak +{plb}, HB peak +{phb}, look_ahead {}", {
+        let mut e = enc.clone();
+        e.set_bitrate(32_000);
+        e.look_ahead()
+    });
+    assert!((plb - phb).abs() <= 2, "layers misaligned: LB +{plb} vs HB +{phb}");
+    assert!((phb - 120).abs() <= 2, "HB peak +{phb}, look_ahead 120");
+}
+
+/// 20 ms FB hybrid at 32 kbps: decodes in our decoder range-exactly, tracks
+/// the input full-band and in the SILK layer's band alone, and the reference
+/// oracle decodes the packets to the same signal.
+#[test]
+fn hybrid_fb_roundtrip() {
+    for (name, pcm) in silk_sources() {
+        let (decoded, packets) = hybrid_roundtrip(&pcm, 32_000, None, (false, false));
+        let toc = ec_opus::Toc::new(packets[0][0]);
+        assert_eq!(toc.config, 15, "{name}: TOC config {}", toc.config);
+        let (corr, lag) = aligned_corr(&pcm, &decoded, 400);
+        let (lb_only, _) = hybrid_roundtrip(&pcm, 32_000, None, (true, false));
+        let lb_ref = lowpass(&pcm, 7000.0);
+        let (lb_corr, lb_lag) = aligned_corr(&lb_ref, &lb_only, 400);
+        let bytes: usize = packets.iter().map(Vec::len).sum();
+        let kbps = bytes as f64 * 8.0 / (packets.len() as f64 * 20.0);
+        eprintln!("hybrid FB {name}: corr {corr:.4} at lag {lag}, LB corr {lb_corr:.4} at lag {lb_lag}, {kbps:.1} kbps");
+        assert!(corr >= 0.95, "{name}: full-band corr {corr:.4}");
+        // +-3: the wav16 fixture is a pure tone, whose phase moves the peak.
+        assert!((117..=123).contains(&lag), "{name}: aligned at lag {lag}, not the documented 120");
+        assert!(lb_corr >= 0.9, "{name}: low-band corr {lb_corr:.4}");
+        assert!((28.0..=36.0).contains(&kbps), "{name}: {kbps:.1} kbps for a 32 kbps CBR target");
+        if let Some(oracle) = oracle_decode(&format!("hybrid-{name}"), &packets, pcm.len()) {
+            let n = oracle.len().min(decoded.len() - 120);
+            let c = correlation(&oracle[..n], &decoded[120..120 + n]);
+            eprintln!("hybrid FB {name}: oracle vs ours corr {c:.4}");
+            assert!(c >= 0.95, "{name}: oracle corr {c:.4}");
+        }
+    }
+    // SWB when asked for it, and the rest of the automatic hybrid range
+    // (SILK's share leaves CELT least at the bottom of it).
+    let speech = speech_like();
+    let (_, packets) = hybrid_roundtrip(&speech, 24_000, Some(Bandwidth::SuperWide), (false, false));
+    assert_eq!(ec_opus::Toc::new(packets[0][0]).config, 13);
+    for bps in [20_000u32, 24_000, 39_000] {
+        let (decoded, packets) = hybrid_roundtrip(&speech, bps, None, (false, false));
+        let (corr, _) = aligned_corr(&speech, &decoded, 400);
+        let kbps = packets.iter().map(Vec::len).sum::<usize>() as f64 * 8.0 / (packets.len() as f64 * 20.0);
+        eprintln!("hybrid {bps}: config {}, corr {corr:.4}, {kbps:.1} kbps", ec_opus::Toc::new(packets[0][0]).config);
+        assert!(corr >= 0.9, "hybrid at {bps}: corr {corr:.4}");
+        assert!(kbps <= bps as f64 / 1000.0 + 3.0, "hybrid at {bps}: {kbps:.1} kbps");
     }
 }

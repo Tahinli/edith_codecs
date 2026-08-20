@@ -49,6 +49,8 @@ pub struct SilkEncoder {
     range: RangeEncoder,
     prev_gain_index: i32,
     final_range: u32,
+    /// The mirror decoder's range state after the last replay.
+    mirror_range: u32,
     voiced_frames: usize,
     mirror_out: Vec<i16>,
     target_bps: Option<u32>,
@@ -88,6 +90,7 @@ impl SilkEncoder {
             range: RangeEncoder::new(),
             prev_gain_index: 10,
             final_range: 0,
+            mirror_range: 0,
             voiced_frames: 0,
             mirror_out: vec![0; 20 * 16],
             target_bps: None,
@@ -124,6 +127,51 @@ impl SilkEncoder {
     /// Encodes 960 mono 48 kHz samples as one code-0 packet in `out`,
     /// returning its length.
     pub fn encode_frame(&mut self, pcm48: &[f32], out: &mut [u8]) -> Result<usize> {
+        let Trial { bytes, range, .. } = self.encode_inner(pcm48, None)?;
+        let len = bytes.len();
+        self.final_range = range;
+        let toc = if self.fs_khz == 16 { 9u8 << 3 } else { 1u8 << 3 };
+        if out.len() < 1 + len {
+            return Err(ec_core::Error::corrupt(format!(
+                "silk encode: packet needs {} bytes, buffer holds {}",
+                1 + len,
+                out.len()
+            )));
+        }
+        out[0] = toc;
+        out[1..1 + len].copy_from_slice(&bytes);
+        self.replay(&out[1..1 + len])?;
+        debug_assert_eq!(self.mirror_range, self.final_range);
+        Ok(1 + len)
+    }
+
+    /// The SILK layer of a hybrid packet: codes 960 mono 48 kHz samples into
+    /// `enc`, the packet's shared range coder (SILK symbols first; the CELT
+    /// layer continues in the same coder), without finishing it. The caller
+    /// must [`SilkEncoder::replay`] the finished payload so this encoder's
+    /// decoder mirror advances.
+    pub fn encode_hybrid(&mut self, pcm48: &[f32], enc: &mut RangeEncoder) -> Result<()> {
+        self.encode_inner(pcm48, Some(enc)).map(|_| ())
+    }
+
+    /// Decodes `payload` (TOC stripped) through the mirror decoder so the next
+    /// frame predicts from the decoder's state; [`SilkEncoder::encode_frame`]
+    /// does this itself, [`SilkEncoder::encode_hybrid`] callers do it once
+    /// the packet is complete.
+    pub fn replay(&mut self, payload: &[u8]) -> Result<()> {
+        let fs = self.fs_khz;
+        let mut dec = RangeDecoder::new(payload);
+        self.mirror
+            .decode(&mut dec, &mut self.mirror_out, 20, fs as u32 * 1000, 1, true)?;
+        self.mirror_range = dec.range();
+        Ok(())
+    }
+
+    /// Analysis, closed-loop quantisation and rate control of one frame; the
+    /// returned trial's `bytes` are the standalone SILK payload (TOC
+    /// excluded). With `shared`, the chosen frame's symbols are also written
+    /// into that coder (the hybrid path).
+    fn encode_inner(&mut self, pcm48: &[f32], shared: Option<&mut RangeEncoder>) -> Result<Trial> {
         assert_eq!(pcm48.len(), 960, "SilkEncoder codes 20 ms mono frames");
         let fs = self.fs_khz;
         let order = if fs == 16 { MAX_LPC_ORDER } else { 10 };
@@ -345,26 +393,9 @@ impl SilkEncoder {
             Run { ltp_index, pulses, err, d, u, gq }
         };
 
-        // One full trial at a common gain offset (in quantiser steps): returns
-        // the coded packet body so the rate loop can read its exact size.
-        let candidates: Vec<usize> = if voiced { vec![0, 1, 2] } else { vec![0] };
-        let mut trial = |step: i32| -> Trial {
-            let scale = GAIN_STEP.powi(step);
-            let mut t = targets;
-            for v in t.iter_mut() {
-                *v = ((*v as f64 * scale as f64).round() as i64).clamp(1, i32::MAX as i64) as i32;
-            }
-            let mut prev_gain_index = self.prev_gain_index;
-            let (gain_idx, gains_q16) = quantize_gains(&t, &mut prev_gain_index, false, NB_SUBFR);
-            let (per_index, run) = candidates
-                .iter()
-                .map(|&per| (per, run(per, &gains_q16)))
-                .min_by(|a, b| a.1.err.partial_cmp(&b.1.err).unwrap())
-                .unwrap();
-
-            // --- Bitstream, in decode()'s order. ---
-            let enc = &mut self.range;
-            enc.reset(1275);
+        // Bitstream writer, in decode()'s order; shared by the sizing trials
+        // and the hybrid path's shared coder.
+        let write = |enc: &mut RangeEncoder, gain_idx: &[i8], per_index: usize, run: &Run| {
             enc.enc_bit_logp(vad_flag, 1); // VAD flag
             enc.enc_bit_logp(false, 1); // LBRR flag
             // Frame type.
@@ -421,10 +452,32 @@ impl SilkEncoder {
             }
             enc.enc_icdf(seed_index as usize, &UNIFORM4_ICDF, 8);
             encode_pulses(enc, &run.pulses, signal_type, quant_offset_type as i32);
+        };
+        // One full trial at a common gain offset (in quantiser steps): returns
+        // the coded packet body so the rate loop can read its exact size.
+        let candidates: Vec<usize> = if voiced { vec![0, 1, 2] } else { vec![0] };
+        let mut trial = |step: i32| -> Trial {
+            let scale = GAIN_STEP.powi(step);
+            let mut t = targets;
+            for v in t.iter_mut() {
+                *v = ((*v as f64 * scale as f64).round() as i64).clamp(1, i32::MAX as i64) as i32;
+            }
+            let mut prev_gain_index = self.prev_gain_index;
+            let (gain_idx, gains_q16) = quantize_gains(&t, &mut prev_gain_index, false, NB_SUBFR);
+            let (per_index, run) = candidates
+                .iter()
+                .map(|&per| (per, run(per, &gains_q16)))
+                .min_by(|a, b| a.1.err.partial_cmp(&b.1.err).unwrap())
+                .unwrap();
+
+            // --- Bitstream, in decode()'s order. ---
+            let enc = &mut self.range;
+            enc.reset(1275);
+            write(enc, &gain_idx, per_index, &run);
             enc.done();
             debug_assert!(!enc.error());
             let len = enc.range_bytes();
-            Trial { bytes: enc.data()[..len].to_vec(), range: enc.range(), prev_gain_index, run }
+            Trial { bytes: enc.data()[..len].to_vec(), range: enc.range(), prev_gain_index, gain_idx, per_index, run }
         };
 
         // Rate control: a common gain offset moves every subframe's pulse
@@ -458,32 +511,15 @@ impl SilkEncoder {
             }
             self.reservoir = (self.reservoir + frame_bits - b0).clamp(-RESERVOIR_FRAMES * frame_bits, RESERVOIR_FRAMES * frame_bits);
         }
-        let Trial { bytes, range, prev_gain_index, run } = best;
-        let len = bytes.len();
-        self.prev_gain_index = prev_gain_index;
-        self.voiced_frames += usize::from(voiced);
-        self.final_range = range;
-        self.shape_d.copy_from_slice(&run.d[n..]);
-        self.shape_u.copy_from_slice(&run.u[n..]);
-        self.shape_gq.copy_from_slice(&run.gq[n..]);
-
-        let toc = if wb { 9u8 << 3 } else { 1u8 << 3 };
-        if out.len() < 1 + len {
-            return Err(ec_core::Error::corrupt(format!(
-                "silk encode: packet needs {} bytes, buffer holds {}",
-                1 + len,
-                out.len()
-            )));
+        if let Some(enc) = shared {
+            write(enc, &best.gain_idx, best.per_index, &best.run);
         }
-        out[0] = toc;
-        out[1..1 + len].copy_from_slice(&bytes);
-
-        // Replay through the mirror so the next frame sees decoder state.
-        let mut dec = RangeDecoder::new(&out[1..1 + len]);
-        self.mirror
-            .decode(&mut dec, &mut self.mirror_out, 20, fs as u32 * 1000, 1, true)?;
-        debug_assert_eq!(dec.range(), self.final_range);
-        Ok(1 + len)
+        self.prev_gain_index = best.prev_gain_index;
+        self.voiced_frames += usize::from(voiced);
+        self.shape_d.copy_from_slice(&best.run.d[n..]);
+        self.shape_u.copy_from_slice(&best.run.u[n..]);
+        self.shape_gq.copy_from_slice(&best.run.gq[n..]);
+        Ok(best)
     }
 }
 
@@ -502,6 +538,8 @@ struct Trial {
     bytes: Vec<u8>,
     range: u32,
     prev_gain_index: i32,
+    gain_idx: [i8; MAX_NB_SUBFR],
+    per_index: usize,
     run: Run,
 }
 
