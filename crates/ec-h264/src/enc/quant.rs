@@ -152,8 +152,8 @@ pub(crate) fn forward_8x8(d: &[i32; 64]) -> [i64; 64] {
 /// precomputed shift because [`forward_8x8`]'s coefficients already carry
 /// far more headroom than a `<<15`-ish fixed point would give.
 #[inline]
-fn round_div(raw: i64, denom: i64, _intra: bool) -> i64 {
-    (raw + denom / 2) / denom
+fn round_div(raw: i64, denom: i64, intra: bool) -> i64 {
+    (raw + denom / if intra { 3 } else { 6 }) / denom
 }
 
 /// Quantise an 8x8 [`forward_8x8`] output into scan (zig-zag) order, undoing

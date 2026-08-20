@@ -1425,7 +1425,12 @@ fn estimate_luma_bits(lv: &Levels) -> i64 {
     if lv.trans8 {
         for blk8 in 0..4 {
             if lv.cbp_luma & (1 << blk8) != 0 {
-                bits += block_bits(&lv.luma8[blk8]);
+                // A level's position costs two more bits in a 64-coefficient
+                // significance map than in a 16-coefficient one; measured
+                // against the coded size on the text clip, without this the
+                // estimate undercharges Intra_8x8 by ~44 bits a macroblock.
+                let b = &lv.luma8[blk8];
+                bits += block_bits(b) + 2 * b.iter().filter(|&&l| l != 0).count() as i64;
             }
         }
         return bits;
