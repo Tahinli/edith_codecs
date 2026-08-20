@@ -775,6 +775,111 @@ mod tests {
         );
     }
 
+    /// Round-37 Task 1 audit: `patch_replay_preserves_absolute_frequency_mapping`
+    /// above re-derives the correction formula inline rather than calling
+    /// `sbr_hf::generate`, so it only ever proved the *formula* right, not
+    /// that `generate`'s own application of it was. Driving the actual
+    /// production path (a two-band `BandTables` built so
+    /// `sbr_hf::build_patches` emits exactly one patch with an odd
+    /// `target - source` gap: source 3..8, target 8..13, gap 5, `5 mod 4 ==
+    /// 1`) showed the production application WAS correct when it was
+    /// applied -- but round-36/37's real-file A/B then showed applying it
+    /// regresses reference-decoder coherence (see `sbr_hf::generate`'s own
+    /// doc comment at its patch-copy site). Round-37 reverted the
+    /// application, so this test now pins the opposite: `generate`'s raw,
+    /// UNROTATED patch replay lands the tone exactly where
+    /// `band_shift_correction` predicts the uncorrected bank convention
+    /// would put it (one synthesis-band-width off for this odd gap) -- i.e.
+    /// `generate` no longer calls `band_shift_correction` at all, and this
+    /// is the intentional (reference-matching) behaviour, not a residual bug.
+    #[test]
+    fn patch_replay_through_generate_matches_the_uncorrected_bank_convention() {
+        use crate::sbr_bands::BandTables;
+        use crate::sbr_hf::{ChirpState, HfHistory, generate};
+
+        let tables = BandTables {
+            n_master: 0,
+            n_high: 0,
+            n_low: 0,
+            n_q: 1,
+            f_high: vec![8, 13],
+            f_low: vec![8, 13],
+            f_noise: vec![8, 13],
+            kx: 8,
+            k2: 13,
+        };
+        let source_band = 3usize;
+        let target_band = 8usize; // build_patches' only patch: source 3..8 -> target 8..13, gap 5
+
+        let omega_step_a = std::f64::consts::PI / (2.0 * ANALYSIS_BANDS as f64);
+        let omega_step_s = std::f64::consts::PI / (2.0 * SYNTHESIS_BANDS as f64);
+        let band_spacing_s = omega_step_s / std::f64::consts::TAU;
+        let slots = 128;
+        let core_samples = slots * ANALYSIS_BANDS;
+        let fft_len = 4096;
+        let centre = (source_band as f64 + 0.5) * omega_step_a;
+
+        let analyse = |delta: f64| -> Vec<Complex<f64>> {
+            let omega0 = centre + delta * omega_step_a;
+            let x: Vec<f64> = (0..core_samples)
+                .map(|i| (omega0 * i as f64).cos())
+                .collect();
+            let mut analysis = Analysis::new();
+            let mut sub = Vec::with_capacity(slots);
+            for chunk in x.chunks_exact(ANALYSIS_BANDS) {
+                let mut c = [0f32; ANALYSIS_BANDS];
+                for (d, &s) in c.iter_mut().zip(chunk) {
+                    *d = s as f32;
+                }
+                sub.push(analysis.process_slot(&c)[source_band]);
+            }
+            sub
+        };
+        let synth_direct = |band: usize, sub: &[Complex<f64>]| -> f64 {
+            let mut synthesis = Synthesis::new();
+            let mut out = Vec::with_capacity(slots * SYNTHESIS_BANDS);
+            for &s in sub {
+                let mut v = [Complex::new(0.0, 0.0); SYNTHESIS_BANDS];
+                v[band] = s;
+                out.extend(synthesis.process_slot(&v).iter().map(|&s| f64::from(s)));
+            }
+            dominant_freq(&out[out.len() - fft_len..])
+        };
+
+        println!("delta\tf_calib\tf_measured\texpected\terr(bins)");
+        let mut worst_err_bins = 0.0f64;
+        for &delta in &[-0.3f64, 0.0, 0.3] {
+            let sub = analyse(delta);
+            let f_calib = synth_direct(source_band, &sub);
+
+            let mut low_cur = vec![vec![Complex::ZERO; slots]; ANALYSIS_BANDS];
+            low_cur[source_band] = sub;
+            let mut chirp = ChirpState::new(1);
+            let mut history = HfHistory::new(ANALYSIS_BANDS);
+            let hf = generate(&low_cur, &tables, &[0u8], &mut chirp, &mut history);
+            let row = &hf[target_band - tables.kx as usize];
+            let f_measured = synth_direct(target_band, row);
+
+            // Frequency-pure placement (what `band_shift_correction` would
+            // restore, were it applied) minus the one-band-width shift the
+            // uncorrected bank convention actually leaves in place.
+            let k = crate::sbr_hf::band_shift_correction(target_band, source_band);
+            let expected = f_calib
+                + (target_band as i64 - source_band as i64) as f64 * band_spacing_s
+                - k as f64 * band_spacing_s;
+            let bin_width = 1.0 / fft_len as f64;
+            let err_bins = (f_measured - expected).abs() / bin_width;
+            worst_err_bins = f64::max(worst_err_bins, err_bins);
+            println!("{delta:+.2}\t{f_calib:.6}\t{f_measured:.6}\t{expected:.6}\t{err_bins:.2}");
+        }
+        assert!(
+            worst_err_bins <= 3.0,
+            "worst production-path prediction error {worst_err_bins} bins exceeds 3 -- \
+             sbr_hf::generate's raw (uncorrected) patch replay no longer matches the \
+             uncorrected bank convention's own predicted placement"
+        );
+    }
+
     /// Round-13 (queue item 2, "gain-level issue" bucket): per-band
     /// steady-state synthesis amplitude gain for a PHYSICALLY REAL tone at
     /// each synthesis band's own centre frequency -- unlike a naive
