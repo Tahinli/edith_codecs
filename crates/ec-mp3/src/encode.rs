@@ -35,11 +35,11 @@ pub struct Mp3EncoderConfig {
     pub bitrate_kbps: u32,
     /// Quality on a 0..1 scale instead of a bitrate.
     ///
-    /// corner-cut: this picks a constant bitrate from the quality rather than
-    /// varying the rate per frame — the streams are legal and decode
-    /// everywhere, they just do not spend fewer bits on easy frames. Upgrade
-    /// path is a per-frame bitrate index chosen after the rate loop, which the
-    /// frame writer here already supports (it writes the header last).
+    /// Runs true variable bitrate: each frame's granules are quantised to the
+    /// masking threshold scaled by this quality (no fixed bit budget), and the
+    /// frame then picks the smallest legal bitrate that carries them; the
+    /// quality's mean lands near [`bitrate_for_quality`]. Easy frames cost
+    /// fewer bits, hard ones more.
     pub vbr_quality: Option<f32>,
 }
 
@@ -68,6 +68,9 @@ pub fn bitrate_for_quality(quality: f32) -> u32 {
     (96.0 + q * 224.0).round() as u32
 }
 
+/// The largest value the 12-bit `part2_3_length` side-info field can carry,
+/// and so the most bits one granule may be coded to.
+const PART2_3_MAX: u32 = (1 << 12) - 1;
 const SFB_LONG: usize = 21;
 
 /// One granule's worth of coded spectrum plus the side info describing it.
@@ -92,6 +95,9 @@ pub struct Mp3Encode {
     sample_rate: u32,
     channels: usize,
     bitrate_kbps: u32,
+    /// When set, frames are coded to a quality target and their bitrate is
+    /// chosen per frame; `bitrate_kbps` is then the floor, not the rate.
+    vbr_quality: Option<f32>,
     version: Version,
     mode: ChannelMode,
     analysis: Vec<Analysis>,
@@ -117,9 +123,14 @@ pub struct Mp3Encode {
     /// Frames whose header and side info are decided but whose payload is
     /// still being filled: the bit reservoir means a frame's payload carries
     /// the *next* frame's granule data, so emission runs one frame behind.
-    queued: std::collections::VecDeque<(Vec<u8>, Vec<u8>)>,
+    /// The third field is the frame's main-data capacity in bytes, which a
+    /// VBR frame chooses for itself.
+    queued: std::collections::VecDeque<(Vec<u8>, Vec<u8>, usize)>,
     ready: std::collections::VecDeque<Vec<u8>>,
     frames: u32,
+    /// Bytes of emitted audio frames (everything after the info header), for
+    /// the Xing header's byte count and average bitrate.
+    frame_bytes: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -132,7 +143,12 @@ struct PendingGranule {
 impl Mp3Encode {
     /// An encoder for this stream shape. Rates outside 8..48 kHz have no Layer
     /// III frame and are refused by name.
-    pub fn new(sample_rate: u32, channels: usize, bitrate_kbps: u32) -> Result<Mp3Encode> {
+    pub fn new(
+        sample_rate: u32,
+        channels: usize,
+        bitrate_kbps: u32,
+        vbr_quality: Option<f32>,
+    ) -> Result<Mp3Encode> {
         let version = match sample_rate {
             32000 | 44100 | 48000 => Version::Mpeg1,
             16000 | 22050 | 24000 => Version::Mpeg2,
@@ -154,6 +170,7 @@ impl Mp3Encode {
             sample_rate,
             channels,
             bitrate_kbps: snap_bitrate(version, bitrate_kbps),
+            vbr_quality,
             version,
             mode: if channels == 2 {
                 ChannelMode::JointStereo
@@ -175,16 +192,17 @@ impl Mp3Encode {
             queued: std::collections::VecDeque::new(),
             ready: std::collections::VecDeque::new(),
             frames: 0,
+            frame_bytes: 0,
         })
     }
 
-    /// The header every frame of this stream carries.
-    fn header(&self) -> FrameHeader {
+    /// The header every frame of this stream carries, at `bitrate_kbps`.
+    fn header(&self, bitrate_kbps: u32) -> FrameHeader {
         FrameHeader {
             version: self.version,
             layer: 3,
             crc: false,
-            bitrate_kbps: self.bitrate_kbps,
+            bitrate_kbps,
             sample_rate: self.sample_rate,
             padding: false,
             private: false,
@@ -198,7 +216,7 @@ impl Mp3Encode {
 
     /// Granules per frame for this stream.
     pub fn granules(&self) -> usize {
-        self.header().granules()
+        self.header(self.bitrate_kbps).granules()
     }
 
     /// Samples per channel one frame codes.
@@ -245,7 +263,12 @@ impl Mp3Encoder {
                 Some(q) => bitrate_for_quality(q),
                 None => self.config.bitrate_kbps.max(8),
             };
-            self.core = Some(Mp3Encode::new(sample_rate, usize::from(channels), bitrate)?);
+            self.core = Some(Mp3Encode::new(
+                sample_rate,
+                usize::from(channels),
+                bitrate,
+                self.config.vbr_quality,
+            )?);
             self.pcm.resize(PRIMING * usize::from(channels.max(1)), 0.0);
         }
         self.pcm.extend_from_slice(interleaved);
@@ -375,7 +398,8 @@ const LAME_VERSION: &[u8; 9] = b"LAME3.100";
 /// that interleaves pushes and pulls gets the delay (a constant) right and the
 /// counts as of the first pull.
 fn info_frame(core: &Mp3Encode, samples: u64, complete: bool) -> Vec<u8> {
-    let header = core.header();
+    let vbr = core.vbr_quality.is_some();
+    let header = core.header(core.bitrate_kbps);
     let frame_len = header.frame_len().unwrap_or(417);
     let mut out = vec![0u8; frame_len];
     out[..4].copy_from_slice(&header.to_bytes());
@@ -389,25 +413,42 @@ fn info_frame(core: &Mp3Encode, samples: u64, complete: bool) -> Vec<u8> {
     } else {
         (0, 0)
     };
+    // The header's byte count is the whole stream, info frame included.
+    // `frame_bytes` sums emitted audio-frame lengths; in CBR that is
+    // `frames * frame_len`, reducing to the old `(frames + 1) * frame_len`.
     let bytes = if complete {
-        (u64::from(frames) + 1) * frame_len as u64
+        core.frame_bytes + frame_len as u64
     } else {
         0
     };
+    // The LAME "bitrate" byte: a VBR stream reports its mean rate, a CBR one
+    // its constant rate.
+    let bitrate_byte = if vbr && complete && samples > 0 {
+        let seconds = samples as f64 / f64::from(core.sample_rate);
+        let kbps = bytes as f64 * 8.0 / seconds / 1000.0;
+        (kbps.round() as u32).min(255) as u8
+    } else {
+        core.bitrate_kbps.min(255) as u8
+    };
 
     let mut tag: Vec<u8> = Vec::with_capacity(64);
-    tag.extend_from_slice(b"Info"); // constant bitrate; "Xing" is the VBR name
+    if vbr {
+        tag.extend_from_slice(b"Xing");
+    } else {
+        tag.extend_from_slice(b"Info");
+    }
     tag.extend_from_slice(&3u32.to_be_bytes()); // frames and bytes present
     tag.extend_from_slice(&frames.to_be_bytes());
     tag.extend_from_slice(&(bytes.min(u64::from(u32::MAX)) as u32).to_be_bytes());
     tag.extend_from_slice(LAME_VERSION);
-    tag.push(0); // tag revision and VBR method
+    // Tag revision (0), VBR flag (0x10) and VBR method (3) when variable.
+    tag.push(if vbr { 0x70 } else { 0 });
     tag.push(0); // lowpass in 100 Hz units, unstated
     tag.extend_from_slice(&0u32.to_be_bytes()); // replay gain peak
     tag.extend_from_slice(&0u16.to_be_bytes()); // radio replay gain
     tag.extend_from_slice(&0u16.to_be_bytes()); // audiophile replay gain
     tag.push(0); // encoding flags and ATH type
-    tag.push(core.bitrate_kbps.min(255) as u8);
+    tag.push(bitrate_byte);
     let delay_padding = (ENCODER_DELAY << 12) | padding;
     tag.extend_from_slice(&delay_padding.to_be_bytes()[1..]); // 12 bits each
     tag.push(0); // misc
@@ -536,9 +577,7 @@ impl Mp3Encode {
     fn emit_frame(&mut self) {
         let channels = self.channels;
         let granules = self.granules();
-        let header = self.header();
-        let frame_len = header.frame_len().unwrap_or(0);
-        let capacity = frame_len - 4 - header.side_info_len();
+        let vbr = self.vbr_quality;
 
         // Window types. A granule whose successor is much louder starts the
         // switch, the loud one is short, and the one after stops it — and the
@@ -574,27 +613,102 @@ impl Mp3Encode {
         }
 
         let begin = self.assigned - self.used;
-        let budget_bits = (self.assigned + capacity - self.used) * 8;
-        let mut coded: Vec<CodedGranule> = Vec::with_capacity(granules * channels);
-        let share = budget_bits / (granules * channels).max(1);
+
+        // The MDCT and the quality-scaled masking threshold are shared by
+        // every bitrate candidate VBR tries below; compute them once.
+        let mut xrs: Vec<Vec<f32>> = Vec::with_capacity(granules * channels);
+        let mut thresholds: Vec<Vec<f32>> = Vec::with_capacity(granules * channels);
         for gr in 0..granules {
             for ch in 0..channels {
                 let index = gr * channels + ch;
                 let granule = self.pending[index].clone();
-                let xr = self.mdct(ch, &granule.subband, types[index]);
-                let spent: usize = coded.iter().map(|c| c.part2_3_length as usize).sum();
-                let left = budget_bits.saturating_sub(spent);
-                let target = share.min(left).min(4095);
-                coded.push(quantise_granule(
-                    &xr,
-                    types[index],
-                    target as u32,
-                    &granule.threshold,
-                    self.sample_rate,
-                ));
+                xrs.push(self.mdct(ch, &granule.subband, types[index]));
+                thresholds.push(match vbr {
+                    Some(quality) => quality_threshold(&granule.threshold, quality),
+                    None => granule.threshold,
+                });
             }
         }
         self.pending.drain(..granules * channels);
+
+        // Quantise the granules. CBR codes to a fixed frame budget. VBR tries
+        // legal bitrates, coding the whole frame's granules against each one's
+        // share with the same distortion loop CBR uses, and keeps the
+        // cheapest one whose mean noise-to-mask ratio sits under one.
+        let (coded, kbps): (Vec<CodedGranule>, u32) = match vbr {
+            Some(_) => {
+                let table: &[u32] = if self.version == Version::Mpeg1 {
+                    &BITRATES_V1
+                } else {
+                    &BITRATES_V2
+                };
+                // Codes the frame at one candidate and reports its mean
+                // noise-to-mask ratio; the ratio falls as the bitrate rises,
+                // so the cheapest candidate at or under 1.0 is found by
+                // bisection over the table (four codings, not fourteen).
+                let code_at = |candidate: u32| -> (Vec<CodedGranule>, f64) {
+                    let header = self.header(candidate);
+                    let capacity = header.frame_len().unwrap_or(0) - 4 - header.side_info_len();
+                    let share = ((capacity * 8) / (granules * channels).max(1))
+                        .min(PART2_3_MAX as usize) as u32;
+                    let mut frame_coded = Vec::with_capacity(granules * channels);
+                    let mut ratio = 0.0;
+                    for index in 0..granules * channels {
+                        let (granule, r) = quantise_granule(
+                            &xrs[index],
+                            types[index],
+                            share,
+                            &thresholds[index],
+                            self.sample_rate,
+                        );
+                        ratio += r / (granules * channels) as f64;
+                        frame_coded.push(granule);
+                    }
+                    (frame_coded, ratio)
+                };
+                let (mut lo, mut hi) = (0usize, table.len() - 1);
+                let mut best = code_at(table[hi]);
+                let mut best_kbps = table[hi];
+                while lo < hi {
+                    let mid = (lo + hi) / 2;
+                    let (coded, ratio) = code_at(table[mid]);
+                    if ratio <= 1.0 {
+                        best = (coded, ratio);
+                        best_kbps = table[mid];
+                        hi = mid;
+                    } else {
+                        lo = mid + 1;
+                    }
+                }
+                (best.0, best_kbps)
+            }
+            None => {
+                let header = self.header(self.bitrate_kbps);
+                let frame_len = header.frame_len().unwrap_or(0);
+                let capacity = frame_len - 4 - header.side_info_len();
+                let budget_bits = (self.assigned + capacity - self.used) * 8;
+                let share = budget_bits / (granules * channels).max(1);
+                let mut frame_coded = Vec::with_capacity(granules * channels);
+                for index in 0..granules * channels {
+                    let spent: usize = frame_coded.iter().map(|c: &CodedGranule| c.part2_3_length as usize).sum();
+                    let left = budget_bits.saturating_sub(spent);
+                    let target = share.min(left).min(4095);
+                    let (granule, _) = quantise_granule(
+                        &xrs[index],
+                        types[index],
+                        target as u32,
+                        &thresholds[index],
+                        self.sample_rate,
+                    );
+                    frame_coded.push(granule);
+                }
+                (frame_coded, self.bitrate_kbps)
+            }
+        };
+
+        let header = self.header(kbps);
+        let capacity = header.frame_len().unwrap_or(0) - 4 - header.side_info_len();
+        let side_info_len = header.side_info_len();
 
         // Assemble the frame: header, side info, and this frame's window on
         // the main-data stream.
@@ -645,7 +759,7 @@ impl Mp3Encode {
         }
         side.align_to_byte();
         let side_bytes = side.into_bytes();
-        debug_assert_eq!(side_bytes.len(), header.side_info_len());
+        debug_assert_eq!(side_bytes.len(), side_info_len);
 
         // Append the granule data to the stream at `used`, byte aligned.
         let mut main = BitWriter::new();
@@ -666,18 +780,22 @@ impl Mp3Encode {
         self.used += main_bytes.len();
 
         self.queued
-            .push_back((header.to_bytes().to_vec(), side_bytes));
+            .push_back((header.to_bytes().to_vec(), side_bytes, capacity));
         self.assigned += capacity;
         // A queued frame can only go out once real granule data covers its
         // whole payload; padding it early is what would strand the next
         // frame's `main_data_begin` in bytes that were already written.
-        while !self.queued.is_empty() && self.stream.len() >= self.written + capacity {
-            let (head, side) = self.queued.pop_front().expect("queue is not empty");
-            let mut frame = Vec::with_capacity(frame_len);
+        while let Some(&(_, _, front)) = self.queued.front() {
+            if self.stream.len() < self.written + front {
+                break;
+            }
+            let (head, side, cap) = self.queued.pop_front().expect("queue is not empty");
+            let mut frame = Vec::with_capacity(4 + side_info_len + cap);
             frame.extend_from_slice(&head);
             frame.extend_from_slice(&side);
-            frame.extend_from_slice(&self.stream[self.written..self.written + capacity]);
-            self.written += capacity;
+            frame.extend_from_slice(&self.stream[self.written..self.written + cap]);
+            self.written += cap;
+            self.frame_bytes += (4 + side_info_len + cap) as u64;
             self.ready.push_back(frame);
             self.frames += 1;
         }
@@ -699,18 +817,16 @@ impl Mp3Encode {
     /// Writes out whatever frames are still queued, padding the stream so the
     /// last frame is complete.
     fn flush_frames(&mut self) {
-        let header = self.header();
-        let frame_len = header.frame_len().unwrap_or(0);
-        let capacity = frame_len - 4 - header.side_info_len();
-        while let Some((head, side)) = self.queued.pop_front() {
+        while let Some((head, side, capacity)) = self.queued.pop_front() {
             if self.stream.len() < self.written + capacity {
                 self.stream.resize(self.written + capacity, 0);
             }
-            let mut frame = Vec::with_capacity(frame_len);
+            let mut frame = Vec::with_capacity(4 + side.len() + capacity);
             frame.extend_from_slice(&head);
             frame.extend_from_slice(&side);
             frame.extend_from_slice(&self.stream[self.written..self.written + capacity]);
             self.written += capacity;
+            self.frame_bytes += (4 + side.len() + capacity) as u64;
             self.ready.push_back(frame);
             self.frames += 1;
         }
@@ -782,6 +898,21 @@ fn mdct_short(input: &[f32; 36], out: &mut [f32]) {
     }
 }
 
+/// Scales the masking threshold by `vbr_quality`. A higher quality lowers the
+/// allowed noise (a smaller threshold, so more bands are amplified and the
+/// granule costs more bits); a lower quality raises it. 0.5 is neutral.
+fn quality_threshold(threshold: &[f32], quality: f32) -> Vec<f32> {
+    let q = quality.clamp(0.0, 1.0);
+    // The psychoacoustic threshold is in the unnormalised FFT's power units,
+    // the quantisation noise in MDCT units, so the 0.5 point carries the unit
+    // gap plus the masking margin. corner-cut: -48 dB is the calibration that
+    // lands wav16-* VBR at its 192 kbit/s mean; a normalised threshold would
+    // make it a plain margin.
+    let db = (0.5 - q) * 24.0 - 48.0;
+    let scale = 10f32.powf(db / 10.0);
+    threshold.iter().map(|&t| t * scale).collect()
+}
+
 /// Quantises one granule: the rate loop inside the distortion loop.
 fn quantise_granule(
     xr: &[f32],
@@ -789,9 +920,12 @@ fn quantise_granule(
     target_bits: u32,
     threshold: &[f32],
     sample_rate: u32,
-) -> CodedGranule {
+) -> (CodedGranule, f64) {
     let mut scalefac = [0u8; SFB_LONG];
-    let mut best: Option<(CodedGranule, f64)> = None;
+    // Score is the summed noise-to-mask ratio over the bands; a mean ratio
+    // of at most one is VBR's signal that this bitrate carried the granule
+    // cleanly (strict all-bands-under is vetoed by scalefactor-capped bands).
+    let mut best: Option<(CodedGranule, f64, usize)> = None;
     // The distortion loop. Two things end it: every band is under its masking
     // threshold *and* the bits are spent, or no band can be amplified further.
     // Spending the bits matters as much as the threshold does — a granule that
@@ -807,18 +941,17 @@ fn quantise_granule(
             .collect();
         let score: f64 = ratios.iter().sum();
         let spent = granule.part2_3_length;
-        if best.as_ref().is_none_or(|(_, s)| score < *s) {
-            best = Some((granule, score));
-        }
-        if spent * 20 > target_bits * 19 {
-            break; // the budget is spent; amplifying now only coarsens
-        }
-        // Amplify the bands that are worst against their threshold.
         let mut order: Vec<usize> = (0..bands)
             .filter(|&b| scalefac[b] < max_scalefac(b, block_type))
             .collect();
         order.sort_by(|a, b| ratios[*b].total_cmp(&ratios[*a]));
         let over: Vec<usize> = order.iter().copied().filter(|&b| ratios[b] > 1.0).collect();
+        if best.as_ref().is_none_or(|(_, s, _)| score < *s) {
+            best = Some((granule, score, bands));
+        }
+        if spent * 20 > target_bits * 19 {
+            break; // the budget is spent; amplifying now only coarsens
+        }
         let chosen: Vec<usize> = if over.is_empty() {
             order.iter().copied().take(3).collect()
         } else {
@@ -831,7 +964,8 @@ fn quantise_granule(
             scalefac[band] += 1;
         }
     }
-    best.expect("at least one round runs").0
+    let (granule, score, bands) = best.expect("at least one round runs");
+    (granule, score / bands as f64)
 }
 
 /// Bitstream order for a short block's spectrum.
@@ -1483,7 +1617,7 @@ mod tests {
 
     #[test]
     fn unsupported_rates_are_refused_by_name() {
-        let err = Mp3Encode::new(96000, 2, 128).unwrap_err();
+        let err = Mp3Encode::new(96000, 2, 128, None).unwrap_err();
         assert!(format!("{err}").contains("96000 Hz"), "{err}");
     }
 

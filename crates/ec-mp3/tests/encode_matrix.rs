@@ -143,6 +143,109 @@ fn encode(pcm: &[f32], rate: u32, channels: usize, kbps: u32) -> Vec<u8> {
     out
 }
 
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// VBR must not move CBR: the byte stream for CBR-192 of the stereo 48 kHz
+/// tone fixture, hashed on the encoder before VBR landed (9ac19d6).
+#[test]
+fn cbr_output_is_unchanged() {
+    let path = fixtures().join("audio/wav16-stereo-48000.wav");
+    let Some((pcm, rate, channels)) = read_wav(&path) else {
+        eprintln!("no WAV fixtures: run scripts/gen-fixtures.sh");
+        return;
+    };
+    let bytes = encode(&pcm, rate, channels, 192);
+    assert_eq!((bytes.len(), fnv1a(&bytes)), (73728, 0xab48da1954f88c48));
+}
+
+fn encode_vbr(pcm: &[f32], rate: u32, channels: usize, quality: f32) -> Vec<u8> {
+    let mut encoder = Mp3Encoder::new(Mp3EncoderConfig {
+        bitrate_kbps: 0,
+        vbr_quality: Some(quality),
+    });
+    encoder
+        .push_pcm_f32(pcm, channels as u16, rate)
+        .expect("encoder accepts the fixture");
+    encoder.finish();
+    let mut out = Vec::new();
+    while let Ok(frame) = encoder.next_packet() {
+        out.extend_from_slice(&frame);
+    }
+    out
+}
+
+/// Quality 0.5 asks for a 192 kbit/s mean; true VBR spends it unevenly across
+/// frames, decodes at least as well as the incumbent's CBR-192, and announces
+/// itself through a Xing tag ffprobe reads as VBR.
+#[test]
+fn vbr_frames_vary_their_bitrate_index() {
+    let name = "mp3src-stereo-48000";
+    let path = fixtures().join(format!("audio/{name}.wav"));
+    let Some((pcm, rate, channels)) = read_wav(&path) else {
+        eprintln!("no WAV fixtures: run scripts/gen-fixtures.sh");
+        return;
+    };
+    let bytes = encode_vbr(&pcm, rate, channels, 0.5);
+    // Walk the frame headers (MPEG-1, Layer III), skipping the Xing frame.
+    let table = [0u32, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320];
+    let mut indices = std::collections::BTreeSet::new();
+    let (mut pos, mut frames) = (0usize, 0usize);
+    while pos + 4 <= bytes.len() {
+        let h = &bytes[pos..pos + 4];
+        assert!(h[0] == 0xFF && (h[1] & 0xE0) == 0xE0, "sync lost at {pos}");
+        let index = usize::from(h[2] >> 4);
+        let kbps = table[index.min(14)] as usize;
+        assert!(kbps > 0, "free-format header at {pos}");
+        if frames > 0 {
+            indices.insert(index);
+        }
+        frames += 1;
+        pos += 144 * kbps * 1000 / rate as usize + usize::from((h[2] >> 1) & 1);
+    }
+    let seconds = pcm.len() as f64 / (rate as f64 * channels as f64);
+    let mean = bytes.len() as f64 * 8.0 / seconds / 1000.0;
+    let target = f64::from(ec_mp3::encode::bitrate_for_quality(0.5));
+    println!("vbr frames={frames} indices={indices:?} mean={mean:.1} kbit/s");
+    assert!(indices.len() >= 3, "only {indices:?}");
+    assert!((mean - target).abs() <= target * 0.25, "mean {mean:.1} vs {target}");
+
+    let work = workdir("vbr");
+    let file = work.join("vbr.mp3");
+    std::fs::write(&file, &bytes).unwrap();
+    let out = Command::new("ffmpeg")
+        .args(["-v", "warning", "-i"])
+        .arg(&file)
+        .args(["-f", "f32le", "-"])
+        .output()
+        .expect("run ffmpeg");
+    assert!(out.stderr.is_empty(), "ffmpeg: {}", String::from_utf8_lossy(&out.stderr));
+    let decoded: Vec<f32> = out
+        .stdout
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    let corr = correlation(&decoded, &pcm);
+    let bar = bar_for(name, 192);
+    println!("vbr corr={corr:.5} bar={bar:.5}");
+    assert!(corr >= bar, "corr {corr:.5} < bar {bar:.5}");
+    let probe = Command::new("ffprobe")
+        .args(["-v", "error", "-show_format"])
+        .arg(&file)
+        .output()
+        .expect("run ffprobe");
+    let probe = String::from_utf8_lossy(&probe.stdout);
+    // "Xing" (not "Info") plus the VBR-method byte after the 9-byte version.
+    assert!(&bytes[36..40] == b"Xing" && bytes[36 + 16 + 9] == 0x70, "no VBR-flagged Xing tag");
+    assert!(probe.contains("format_name=mp3"), "{probe}");
+}
+
 #[test]
 fn encodes_above_the_incumbent_bar() {
     let dir = fixtures().join("audio");
