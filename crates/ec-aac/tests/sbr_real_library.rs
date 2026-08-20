@@ -2097,11 +2097,21 @@ fn full_chain_low_band_matches_own_core() {
             let cutoff = f64::from(core_rate) * 0.4;
             let ol = lowpass(&full[ch], full_rate, cutoff);
             let ul = lowpass(&up, full_rate, cutoff);
-            let (lag, corr) = best_lag_correlation(&ol, &ul);
-            println!("  ch{ch}: lag {lag}, corr {corr:.6}");
-            println!(
-                "  ch{ch} @ rate-independent QMF delay -897: corr {:.6}",
-                correlation_at_lag(&ol, &ul, -897)
+            // Wide search, not the plain `best_lag_correlation`'s
+            // `LAG_MAX=4000` -- the QMF-chain delay this measures is not a
+            // fixed constant across files/rates (measured -576 on Nikbinler
+            // vs the stale -897 this test used to assert against), so the
+            // lag itself is part of what's measured here, not assumed.
+            const WIDE_LAG_MAX: i64 = 20_000;
+            let (lag, corr) = best_lag_correlation_wide(&ol, &ul, WIDE_LAG_MAX);
+            println!("  ch{ch}: measured best lag {lag}, corr {corr:.6}");
+            assert!(
+                corr >= 0.99,
+                "{} ch{ch}: full-chain low band vs our own core-only decode \
+                 corr {corr:.6} at measured lag {lag} < 0.99 -- the \
+                 synthesis/gain-adjust stage is corrupting even the untouched \
+                 low-band region copied straight from core analysis",
+                c.path.display()
             );
         }
     }
@@ -2273,35 +2283,66 @@ fn synthetic_heaac_matrix() {
                     0.0
                 };
                 // Round-51's self-consistency probe (our full chain's low
-                // band vs our own core-only decode, 2x upsampled), run
-                // per-row so a rate/kx-specific self-inconsistency shows in
-                // the same table instead of needing a second pass.
+                // band vs our own core-only decode), run per-row so a
+                // rate/kx-specific self-inconsistency shows in the same
+                // table instead of needing a second pass.
+                //
+                // Fixed (this round): the original convention naively
+                // nearest-neighbor UPSAMPLED the core 2x and compared it
+                // against the full-rate signal, low-passed at
+                // `core_rate*0.4` -- that stairstep-and-lowpass round trip
+                // is lossy enough on its own to sink a genuinely-correct
+                // pair's correlation (measured flat ~-0.12 here even on
+                // rows whose `full`/`below` columns read 0.999+ against the
+                // real reference). `core_only_matches_reference` already
+                // proved a clean pattern for this exact comparison: stay in
+                // the CORE's own native rate (DECIMATE the full/reference
+                // signal down instead of upsampling the core up) and use a
+                // wide lag search there. `decimate` below is a lowpass
+                // (well under the core Nyquist) followed by a plain
+                // every-other-sample drop -- the inverse of the old
+                // `[s, s]` upsample, at the same information cost but
+                // without its stairstep artifact.
+                let decimate = |s: &[f32], from_rate: u32, to_rate: u32| -> Vec<f32> {
+                    let cutoff = f64::from(to_rate) * 0.45;
+                    lowpass(s, from_rate, cutoff)
+                        .iter()
+                        .step_by((from_rate / to_rate.max(1)).max(1) as usize)
+                        .copied()
+                        .collect()
+                };
+                let core_lag_max = WIDE_LAG_MAX / 2;
                 let ours_v_core = if kx > 0 {
                     our_decode_core_only(&path, 0).map(|(core, core_rate)| {
-                        let up: Vec<f32> = core[0].iter().flat_map(|&s| [s, s]).collect();
-                        let cutoff = f64::from(core_rate) * 0.4;
-                        let ol = lowpass(o, our_rate, cutoff);
-                        let ul = lowpass(&up, our_rate, cutoff);
-                        best_lag_correlation_wide(&ol, &ul, WIDE_LAG_MAX)
+                        let full_at_core_rate = decimate(o, our_rate, core_rate);
+                        best_lag_correlation_wide(&full_at_core_rate, &core[0], core_lag_max)
                     })
                 } else {
                     None
                 };
                 // Coordinator follow-up 2: splits "our core decode of THIS
                 // fixture is wrong" (core_v_ref ~0) from "the SBR chain
-                // scrambles a good core" (core_v_ref >= ~0.99 while `below`
-                // above stays ~0/negative) -- OUR core-only decode (2x
-                // upsampled, same convention `ours_v_core` uses) against the
-                // REFERENCE decoder's own decode, below the crossover only,
-                // wide lag search since this is an independent alignment
-                // from `full`/`below`'s (core-only carries no SBR delay).
+                // scrambles a good core" (core_v_ref >= ~0.99 while `below`/
+                // `above` stays ~0/negative) -- OUR core-only decode, same
+                // native-core-rate convention `ours_v_core` now uses, against
+                // the REFERENCE decoder's own decode resampled to that same
+                // core rate (`ffmpeg_decode_at_rate`, the same helper
+                // `core_only_matches_reference` already trusts) -- wide lag
+                // search since this is an independent alignment from
+                // `full`/`below`'s (core-only carries no SBR delay).
                 let (core_v_ref, core_rate_str) = if kx > 0 {
                     match our_decode_core_only(&path, 0) {
                         Some((core, core_rate)) => {
-                            let up: Vec<f32> = core[0].iter().flat_map(|&s| [s, s]).collect();
-                            let tl = lowpass(t, our_rate, crossover_hz);
-                            let ul = lowpass(&up, our_rate, crossover_hz);
-                            (Some(best_lag_correlation_wide(&ul, &tl, WIDE_LAG_MAX)), core_rate.to_string())
+                            let ref_at_core_rate =
+                                ffmpeg_decode_at_rate(&path, 0, core.len(), core_rate);
+                            (
+                                Some(best_lag_correlation_wide(
+                                    &core[0],
+                                    &ref_at_core_rate[0],
+                                    core_lag_max,
+                                )),
+                                core_rate.to_string(),
+                            )
                         }
                         None => (None, "n/a".into()),
                     }
@@ -3261,4 +3302,132 @@ fn sbr_actual_noise_fraction() {
          (round-44 fix floor is 0.17; measured 0.1770 post-shape-fix, \
          0.1787 pre-fix -- shape does not move this metric, see doc above)"
     );
+}
+
+/// Discriminator instrument: one row per stream of the SBR header/frame
+/// features actually parsed from its first ~20 `sbr_data()` frames, next to
+/// that stream's own pass/fail correlation vs the reference decoder --
+/// looking for which feature(s) separate the two known-PASS streams
+/// (Nikbinler, synthetic 48k HE) from the two known-FAIL families (FMJ,
+/// synthetic 44.1k HE). Gated on the real files / fixture directory being
+/// present, same as the tests it borrows machinery from; skips loudly,
+/// generates nothing.
+#[test]
+fn sbr_header_feature_table() {
+    if !have_ffmpeg() {
+        eprintln!("SKIP: ffmpeg not on PATH");
+        return;
+    }
+    struct Row {
+        label: String,
+        path: PathBuf,
+        aac_stream: usize,
+        ffmpeg_stream: usize,
+    }
+    let mut rows: Vec<Row> = candidates()
+        .into_iter()
+        .map(|c| Row {
+            label: c
+                .path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            path: c.path,
+            aac_stream: c.aac_stream,
+            ffmpeg_stream: c.ffmpeg_stream,
+        })
+        .collect();
+    let fixtures = std::env::var("EC_AAC_HEAAC_FIXTURES").unwrap_or_else(|_| {
+        format!("{}/../../.cache/heaac-fixtures", env!("CARGO_MANIFEST_DIR"))
+    });
+    let fixtures = PathBuf::from(fixtures);
+    if fixtures.is_dir() {
+        for rate in [48_000u32, 44_100] {
+            for br in ["32k", "48k", "64k", "96k"] {
+                let p = fixtures.join(format!("heaac_{rate}_{br}.m4a"));
+                if p.exists() {
+                    rows.push(Row {
+                        label: format!("synth-{rate}-{br}"),
+                        path: p,
+                        aac_stream: 0,
+                        ffmpeg_stream: 0,
+                    });
+                }
+            }
+        }
+    } else {
+        eprintln!(
+            "SKIP synthetic rows: {} absent -- run scripts/aac-tables/make-heaac-fixtures.sh first",
+            fixtures.display()
+        );
+    }
+    if rows.is_empty() {
+        eprintln!("SKIP: no real HE-AAC files and no synthetic fixtures found");
+        return;
+    }
+    unsafe {
+        std::env::set_var("EC_AAC_SBR_SIDEINFO_DEBUG", "1");
+    }
+    const WIDE_LAG_MAX: i64 = 20_000;
+    println!(
+        "{:<20} {:>6} {:>4} {:>4} {:>4} {:>4} {:>4}  {:>4} {:>4} {:>4} {:>4} {:>4}  {:>5} {:>10} {:>10}  {:>8} {:>8}  {:>10} {:>6}",
+        "stream", "rate", "kx", "k2", "xovr", "sfrq", "efrq", "fscl", "ascl", "nbnd", "lbnd", "lgn",
+        "ifrq", "smooth", "envs", "invf", "harm", "df%", "corr"
+    );
+    for r in &rows {
+        let before = ec_aac::sbr_sideinfo_log().len();
+        let Some((ours, sbr, our_rate)) = our_decode(&r.path, r.aac_stream) else {
+            eprintln!("SKIP {}: could not decode", r.label);
+            continue;
+        };
+        if sbr != ec_aac::SbrSupport::V1 {
+            eprintln!("SKIP {}: not SBR v1", r.label);
+            continue;
+        }
+        let log = ec_aac::sbr_sideinfo_log();
+        let frames: Vec<_> = log[before..].iter().filter(|row| row.ch == 0).take(20).collect();
+        if frames.is_empty() {
+            eprintln!("SKIP {}: no sideinfo rows captured", r.label);
+            continue;
+        }
+        let f0 = &frames[0];
+        let mut env_counts: std::collections::BTreeMap<usize, usize> = Default::default();
+        let mut invf_seen: std::collections::BTreeSet<u8> = Default::default();
+        let mut any_harmonic = false;
+        let mut df_total = 0usize;
+        let mut df_ones = 0usize;
+        for row in &frames {
+            *env_counts.entry(row.t_env.len().saturating_sub(1)).or_default() += 1;
+            invf_seen.extend(&row.invf_mode);
+            if row.add_harmonic.as_ref().is_some_and(|h| h.iter().any(|&v| v != 0)) {
+                any_harmonic = true;
+            }
+            df_total += row.df_env.len() + row.df_noise.len();
+            df_ones += row.df_env.iter().chain(&row.df_noise).filter(|&&b| b != 0).count();
+        }
+        let df_pct = if df_total > 0 {
+            100.0 * df_ones as f64 / df_total as f64
+        } else {
+            0.0
+        };
+        let envs_hist: String = env_counts
+            .iter()
+            .map(|(k, v)| format!("{k}x{v}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let invf_str: String = invf_seen.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("");
+        let theirs = ffmpeg_decode(&r.path, r.ffmpeg_stream, ours.len());
+        let (_, corr) = best_lag_correlation_wide(&ours[0], &theirs[0], WIDE_LAG_MAX);
+        println!(
+            "{:<20} {:>6} {:>4} {:>4} {:>4} {:>4} {:>4}  {:>4} {:>4} {:>4} {:>4} {:>4}  {:>5} {:>10} {:>10}  {:>8} {:>8}  {:>10.1} {:>6.3}",
+            r.label, our_rate, f0.kx, f0.k2, f0.xover_band, f0.start_freq, f0.stop_freq,
+            f0.freq_scale, f0.alter_scale, f0.noise_bands, f0.limiter_bands, f0.limiter_gains,
+            f0.interpol_freq, f0.smoothing_mode, envs_hist, invf_str,
+            any_harmonic, df_pct, corr
+        );
+        println!(
+            "  patches (frame0): {:?}",
+            f0.patch_lengths
+        );
+    }
 }

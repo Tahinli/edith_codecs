@@ -55,6 +55,11 @@ pub struct SbrChannel {
     pub invf_mode: Vec<u8>,
     /// `bs_add_harmonic` per high-resolution band, when the flag is set.
     pub add_harmonic: Option<Vec<u8>>,
+    /// `bs_df_env` per envelope: `1` selects delta-time coding over
+    /// delta-frequency (diagnostic only, not consumed by the DSP stage).
+    pub df_env: Vec<u8>,
+    /// `bs_df_noise` per noise floor, same convention as `df_env`.
+    pub df_noise: Vec<u8>,
 }
 
 /// One `sbr_data()` frame: one channel for an SCE, two for a CPE.
@@ -621,6 +626,8 @@ impl SbrParser {
                 q_q,
                 invf_mode: invf[ch].clone(),
                 add_harmonic: None,
+                df_env: df_env[ch].iter().map(|&b| u8::from(b)).collect(),
+                df_noise: df_noise[ch].iter().map(|&b| u8::from(b)).collect(),
             });
         }
 

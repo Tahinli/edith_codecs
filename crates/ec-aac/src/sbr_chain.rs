@@ -91,6 +91,26 @@ pub struct SbrSideInfoRow {
     pub add_harmonic: Option<Vec<u8>>,
     pub e_q_means: Vec<f64>,
     pub q_q_means: Vec<f64>,
+    /// Header fields held for the frame's duration (§4.6.18.3.2), added for
+    /// the FMJ-vs-Nikbinler feature-table hunt: `sbr_header()`'s own coding
+    /// choices, not per-envelope grid data.
+    pub freq_scale: u8,
+    pub alter_scale: u8,
+    pub noise_bands: u8,
+    pub limiter_bands: u8,
+    pub limiter_gains: u8,
+    pub interpol_freq: u8,
+    pub smoothing_mode: u8,
+    pub start_freq: u8,
+    pub stop_freq: u8,
+    pub xover_band: u8,
+    /// `t_noise.len() - 1`, i.e. `numNoiseFloors` this frame.
+    pub num_noise: usize,
+    /// One entry per HF patch, each the patch's band count (from
+    /// `sbr_hf::build_patches`), so patch geometry is visible per frame.
+    pub patch_lengths: Vec<usize>,
+    pub df_env: Vec<u8>,
+    pub df_noise: Vec<u8>,
 }
 
 static SIDEINFO_LOG: std::sync::OnceLock<std::sync::Mutex<Vec<SbrSideInfoRow>>> =
@@ -325,6 +345,20 @@ impl SbrChain {
                     add_harmonic: sbr_ch.add_harmonic.clone(),
                     e_q_means: mean(&sbr_ch.e_q),
                     q_q_means: mean(&sbr_ch.q_q),
+                    freq_scale: header.freq_scale,
+                    alter_scale: header.alter_scale,
+                    noise_bands: header.noise_bands,
+                    limiter_bands: header.limiter_bands,
+                    limiter_gains: header.limiter_gains,
+                    interpol_freq: header.interpol_freq,
+                    smoothing_mode: header.smoothing_mode,
+                    start_freq: header.start_freq,
+                    stop_freq: header.stop_freq,
+                    xover_band: header.xover_band,
+                    num_noise: sbr_ch.t_noise.len().saturating_sub(1),
+                    patch_lengths: sbr_hf::build_patches(&tables).iter().map(|p| p.width).collect(),
+                    df_env: sbr_ch.df_env.clone(),
+                    df_noise: sbr_ch.df_noise.clone(),
                 };
                 let log = SIDEINFO_LOG.get_or_init(|| std::sync::Mutex::new(Vec::new()));
                 if let Ok(mut l) = log.lock() {
@@ -436,6 +470,8 @@ mod tests {
             q_q: vec![vec![2i32; n_q]],
             invf_mode: vec![0; n_q],
             add_harmonic: None,
+            df_env: vec![],
+            df_noise: vec![],
         }
     }
 
