@@ -651,3 +651,72 @@ fn the_rate_loop_tracks_the_target_bitrate() {
         );
     }
 }
+
+/// Quiet and sparse content must reach the target too: with the floor bounded
+/// by the threshold of hearing, most partitions code as class 0 at any step,
+/// so the rate loop's extra headroom has to lower that bound to find bits to
+/// spend. The fixture is a sparse tone at -18 dBFS; the synthetic sources are
+/// the busy and tonal signals at -40 dBFS, the tones over a -90 dBFS noise
+/// floor (what any 16-bit source carries; a pure digital tone has nothing
+/// outside its own bins for any step to find). Noise is incompressible, so the
+/// quiet noise is held to the full-scale noise's own fidelity rather than a
+/// fixed bar.
+#[test]
+fn quiet_content_reaches_the_target_within_25pct() {
+    let rate = 48_000u32;
+    let samples = rate as usize * 3;
+    let fixture = ffmpeg_decode(&fixtures().join("audio/wav16-stereo-48000.wav"))
+        .expect("fixture decodes");
+    assert_eq!(fixture.1, rate);
+    let attenuate = |mut source: Vec<Vec<f32>>| {
+        for channel in source.iter_mut() {
+            for value in channel.iter_mut() {
+                *value *= 0.01;
+            }
+        }
+        source
+    };
+    let corr_at = |path: &Path, source: &[Vec<f32>]| {
+        let (decoded, _) = our_decode(path);
+        decoded
+            .iter()
+            .zip(source.iter())
+            .map(|(channel, original)| {
+                let n = channel.len().min(original.len());
+                correlation(&channel[..n], &original[..n])
+            })
+            .fold(1.0f64, f64::min)
+    };
+    let loud = busy(2, rate, samples);
+    let loud_corr = corr_at(&encode_to_file(&loud, rate, 128_000, "loud-128k.ogg"), &loud);
+    let quiet_noise = attenuate(loud);
+    let mut quiet_tones = attenuate(tones(2, rate, samples));
+    for (channel, noise) in quiet_tones.iter_mut().zip(busy(2, rate, samples)) {
+        for (value, n) in channel.iter_mut().zip(noise) {
+            *value += n * 0.0001;
+        }
+    }
+    let cases = [
+        ("fixture", &fixture.0, 0.99),
+        ("quiet-tones", &quiet_tones, 0.99),
+        ("quiet-noise", &quiet_noise, loud_corr - 0.02),
+    ];
+    for (name, source, bar) in cases {
+        let mut measured = Vec::new();
+        for target in [96_000i32, 128_000, 192_000] {
+            let path = encode_to_file(source, rate, target, &format!("{name}-{}k.ogg", target / 1000));
+            let bytes = std::fs::metadata(&path).expect("file").len();
+            let kbps = bytes as f64 * 8.0 * f64::from(rate) / source[0].len() as f64 / 1000.0;
+            let corr = corr_at(&path, source);
+            println!("{name}: target {} kbps -> {kbps:.0} kbps, corr {corr:.4}", target / 1000);
+            measured.push(kbps);
+            if target == 128_000 {
+                assert!(corr >= bar, "{name}: corr {corr:.4} under {bar:.4}");
+            }
+        }
+        assert!(measured[0] < measured[1] && measured[1] < measured[2], "{name}: {measured:?}");
+        for (kbps, target) in measured.iter().zip([96.0, 128.0, 192.0]) {
+            assert!((kbps - target).abs() / target < 0.25, "{name}: {kbps:.0} kbps for {target:.0}");
+        }
+    }
+}
