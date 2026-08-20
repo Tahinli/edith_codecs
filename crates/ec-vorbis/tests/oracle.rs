@@ -554,6 +554,72 @@ fn busy(channels: usize, rate: u32, samples: usize) -> Vec<Vec<f32>> {
         .collect()
 }
 
+/// A hard silence-to-full-scale onset must not leak into the long block
+/// before it: that block should now be coded with a short right window (or
+/// the onset itself carried by a short block), which windows the leak out
+/// instead of smearing it across ~46 ms the way an all-long-block encoder
+/// does.
+#[test]
+fn onset_after_silence_has_no_pre_echo() {
+    for rate in [44_100u32, 48_000] {
+        let silence = rate as usize;
+        let tone_len = rate as usize;
+        let mut left = vec![0.0f32; silence + tone_len];
+        let mut right = vec![0.0f32; silence + tone_len];
+        for i in 0..tone_len {
+            let t = i as f64 / f64::from(rate);
+            let v = (2.0 * std::f64::consts::PI * 1_000.0 * t).sin() as f32;
+            left[silence + i] = v;
+            right[silence + i] = v;
+        }
+        let source = vec![left, right];
+        let name = format!("onset-{rate}.ogg");
+        let path = encode_to_file(&source, rate, -1, &name);
+
+        // The reference oracle must decode the short-block stream cleanly:
+        // no warnings, let alone errors.
+        let warn = Command::new("ffmpeg")
+            .args(["-v", "warning", "-i"])
+            .arg(&path)
+            .args(["-f", "f32le", "-acodec", "pcm_f32le", "-"])
+            .output();
+        if let Ok(out) = warn {
+            assert!(
+                out.stderr.is_empty(),
+                "{name}: oracle decode warnings: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        let window = |plane: &[f32], rate: u32| -> f64 {
+            let lo = (0.90 * f64::from(rate)) as usize;
+            let hi = ((0.995 * f64::from(rate)) as usize).min(plane.len());
+            let lo = lo.min(hi);
+            rms(&plane[lo..hi])
+        };
+        let tone_rms = {
+            let lo = silence + rate as usize / 20;
+            let hi = (silence + tone_len).min(silence + tone_len);
+            rms(&source[0][lo..hi])
+        };
+
+        let (ours, _) = our_decode(&path);
+        let gap = window(&ours[0], rate);
+        assert!(
+            gap <= 0.002 * tone_rms,
+            "{name}: our decode gap RMS {gap:.6} vs tone RMS {tone_rms:.6}"
+        );
+
+        if let Some((theirs, _)) = ffmpeg_decode(&path) {
+            let gap = window(&theirs[0], rate);
+            assert!(
+                gap <= 0.002 * tone_rms,
+                "{name}: oracle decode gap RMS {gap:.6} vs tone RMS {tone_rms:.6}"
+            );
+        }
+    }
+}
+
 #[test]
 fn the_rate_loop_tracks_the_target_bitrate() {
     let rate = 48_000u32;
