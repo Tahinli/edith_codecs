@@ -352,9 +352,18 @@ impl Encoder {
     /// - `frame`'s bit depth is neither 8 nor 10: no profile this crate
     ///   encodes, and no VPP conversion this crate builds, has a destination
     ///   for a 12-bit source.
-    /// - `frame`'s coded size does not match this encoder's: the surface
-    ///   formats have to agree for the driver to read one as the other, and
-    ///   the VPP conversion pass (when one runs) does not resize.
+    ///
+    /// A `frame` whose coded size does not match this encoder's (a common
+    /// case: HEVC block-rounds to 32, so a 3840x2160 source's 2160 stays
+    /// unrounded while the encoder's coded height becomes 2176) is not
+    /// refused — it goes through the same VPP pool a 10-bit source uses,
+    /// placed by explicit region rather than a whole-surface convert: only
+    /// `frame.display_size` is read from the source and written into the
+    /// destination at `(0, 0)`, so the padding rows/columns beyond it are
+    /// never touched by the copy. Those padding pixels are still fed to the
+    /// encoder as part of the coded surface, so the pool is painted black
+    /// once, on creation, rather than left as whatever the driver's fresh
+    /// allocation happened to contain.
     pub fn encode_frame(
         &mut self,
         frame: &crate::frame::Frame,
@@ -373,28 +382,33 @@ impl Encoder {
                 "encode_frame: the frame was decoded on a different Display than this encoder",
             ));
         }
-        if frame.coded_size != self.coded_size {
-            return Err(Error::config(format!(
-                "encode_frame: encoder surfaces are {}x{}, the frame's are {}x{}",
-                self.coded_size.0, self.coded_size.1, frame.coded_size.0, frame.coded_size.1
-            )));
-        }
-        let source = if frame.bit_depth == 10 {
-            self.nv12_from_p010(frame.surface())?
+        let source = if frame.bit_depth == 10 || frame.coded_size != self.coded_size {
+            self.vpp_into_pool(frame.surface(), frame.display_size)?
         } else {
             Arc::clone(frame.surface())
         };
         self.encode_surface(source, meta)
     }
 
-    /// Convert a P010 surface into this encoder's coded size, in NV12, on the
-    /// GPU. Builds the VPP pipeline and its two-surface pool on first use.
-    fn nv12_from_p010(&mut self, source: &Arc<Surface>) -> Result<Arc<Surface>> {
+    /// Place a source surface's visible rect into this encoder's coded size,
+    /// in NV12, on the GPU: a whole-surface convert when the source is
+    /// already the encoder's coded size (the common 10-bit case), a region
+    /// copy/convert otherwise. Builds the VPP pipeline and its two-surface
+    /// pool on first use, painting the pool black so any padding beyond
+    /// `display_size` a region copy never touches is deterministic.
+    fn vpp_into_pool(
+        &mut self,
+        source: &Arc<Surface>,
+        display_size: (u32, u32),
+    ) -> Result<Arc<Surface>> {
         if self.vpp.is_none() {
             let spec = SurfaceSpec::nv12(self.coded_size.0, self.coded_size.1)
                 .with_usage_hint(sys::VA_SURFACE_ATTRIB_USAGE_HINT_ENCODER);
             let display = self.context.display();
             let surfaces = Surface::create_pool(display, &spec, 2)?;
+            for s in &surfaces {
+                Self::fill_black(s, self.coded_size)?;
+            }
             let vpp = Vpp::new(
                 display,
                 sys::VA_RT_FORMAT_YUV420 | sys::VA_RT_FORMAT_YUV420_10,
@@ -405,11 +419,32 @@ impl Encoder {
         }
         let dest = Arc::clone(&self.vpp_surfaces[self.vpp_next]);
         self.vpp_next = (self.vpp_next + 1) % self.vpp_surfaces.len();
-        Ok(self
-            .vpp
-            .as_ref()
-            .expect("just built above if it was None")
-            .convert(source, dest)?)
+        let vpp = self.vpp.as_ref().expect("just built above if it was None");
+        if display_size == self.coded_size {
+            Ok(vpp.convert(source, dest)?)
+        } else {
+            let rect = (0, 0, display_size.0, display_size.1);
+            Ok(vpp.convert_region(source, rect, dest, rect)?)
+        }
+    }
+
+    /// Paint an NV12 surface black (Y=16, chroma=128, TV-range neutral): the
+    /// one-time initialisation [`Encoder::vpp_into_pool`] gives its pool so a
+    /// region copy's untouched padding reads the same deterministic value on
+    /// every driver instead of whatever the fresh allocation contained.
+    fn fill_black(surface: &Arc<Surface>, size: (u32, u32)) -> Result<()> {
+        let mut image = Image::create(surface.display(), sys::VA_FOURCC_NV12, size.0, size.1)?;
+        {
+            let mut mapped = image.map()?;
+            if let Some(y) = mapped.plane_mut(0) {
+                y.fill(16);
+            }
+            if let Some(uv) = mapped.plane_mut(1) {
+                uv.fill(128);
+            }
+        }
+        surface.write_from(&image, size.0, size.1)?;
+        Ok(())
     }
 
     /// Shared submission path for [`Encoder::encode`] and

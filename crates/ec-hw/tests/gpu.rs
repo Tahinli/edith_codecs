@@ -1531,13 +1531,14 @@ fn encode_frame_accepts_p010_via_vpp() {
     };
 
     // This film's HEVC SPS `pic_height_in_luma_samples` is 2160, which is a
-    // multiple of the H.264 encode block size (16) but not the HEVC one
-    // (32, next_multiple_of gives 2176) — `encode_frame` refuses that
-    // mismatch by documented design ("frame's coded size does not match
-    // this encoder's ... the VPP conversion pass does not resize") rather
-    // than silently stretching the picture, so the HEVC target is expected
-    // to be *refused* here, not to round-trip; only H.264 gets the full
-    // encode/decode/PSNR comparison.
+    // multiple of the H.264 encode block size (16) but not the HEVC one (32,
+    // next_multiple_of gives 2176) — `encode_frame` no longer refuses that
+    // mismatch: it routes through the VPP pool by explicit region
+    // (`Encoder::vpp_into_pool`), so both targets get the full
+    // encode/decode/PSNR comparison, and the HEVC one additionally gets an
+    // `ffprobe` check that the visible size in the produced stream is still
+    // 3840x2160 (the encoder's own cropping, not a VPP resize).
+    let (mut w, mut h) = (0u32, 0u32);
     for (target, dec_codec) in [(EncCodec::H264, Codec::H264), (EncCodec::H265, Codec::H265)] {
         let mut decoder = Decoder::new(&display, Codec::H265).expect("decoder opens");
         let mut zc_stream = Vec::new();
@@ -1545,13 +1546,13 @@ fn encode_frame_accepts_p010_via_vpp() {
         let mut count = 0i64;
         let mut zero_copy: Option<Encoder> = None;
         let mut cpu_path: Option<Encoder> = None;
-        let mut refused = false;
+        let refused = false;
 
         decode_stream(&mut decoder, Codec::H265, &data, frames, |frame| {
             if refused {
                 return;
             }
-            let (w, h) = frame.display_size;
+            (w, h) = frame.display_size;
             let zero_copy = zero_copy.get_or_insert_with(|| {
                 let mut cfg = EncoderConfig::new(target, w, h);
                 cfg.gop_size = 30;
@@ -1568,22 +1569,10 @@ fn encode_frame_accepts_p010_via_vpp() {
                 timestamp: count,
                 force_keyframe: false,
             };
-            match zero_copy.encode_frame(&frame, meta) {
-                Ok(zc) => zc_stream.extend_from_slice(&zc.data),
-                Err(e) if target == EncCodec::H265 => {
-                    println!(
-                        "{target:?}: encode_frame refused as documented (block size vs SPS \
-                         pic height): {e}"
-                    );
-                    assert!(
-                        e.to_string().contains("encoder surfaces are"),
-                        "unexpected refusal reason: {e}"
-                    );
-                    refused = true;
-                    return;
-                }
-                Err(e) => panic!("encode_frame (zero copy, P010 via VPP): {e}"),
-            }
+            let zc = zero_copy
+                .encode_frame(&frame, meta)
+                .expect("encode_frame (zero copy, P010 via VPP, size mismatch routed through VPP)");
+            zc_stream.extend_from_slice(&zc.data);
             let i420 = frame.to_i420().expect("readback for the CPU-path baseline");
             let cpu = cpu_path.encode(&i420, meta).expect("encode (CPU path)");
             cpu_stream.extend_from_slice(&cpu.data);
@@ -1629,6 +1618,35 @@ fn encode_frame_accepts_p010_via_vpp() {
         println!("{target:?} encode_frame (P010 via VPP) vs CPU path: worst Y {worst_y:.1} dB, worst UV {worst_uv:.1} dB");
         assert!(worst_y >= 40.0, "{target:?}: worst Y {worst_y:.1} dB vs the CPU path");
         assert!(worst_uv >= 40.0, "{target:?}: worst UV {worst_uv:.1} dB vs the CPU path");
+
+        // The size-mismatch route (HEVC: 2160 visible vs 2176 coded) places
+        // the picture by VPP region rather than encoder cropping alone, so
+        // confirm the encoder's own SPS conformance window still reports the
+        // real 3840x2160 — not the padded 2176 the coded surface carries.
+        let dir = std::env::temp_dir().join(format!("ec-hw-vpp-region-{target:?}"));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join(match target {
+            EncCodec::H264 => "out.264",
+            EncCodec::H265 => "out.265",
+            EncCodec::Av1 => "out.obu",
+        });
+        std::fs::write(&path, &zc_stream).expect("write bitstream");
+        let probe = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(&path)
+            .output()
+            .expect("ffprobe runs");
+        let dims = String::from_utf8_lossy(&probe.stdout).trim().to_string();
+        assert_eq!(dims, format!("{w},{h}"), "{target:?}: ffprobe sees {dims}");
     }
 }
 
@@ -1637,12 +1655,10 @@ fn encode_frame_accepts_p010_via_vpp() {
 /// says whether the VPP conversion is cheap enough to keep the zero-copy path
 /// meaningfully faster than reading the frame back to system memory.
 ///
-/// Targets H.264: this film's HEVC SPS `pic_height_in_luma_samples` (2160)
-/// is not a multiple of this crate's HEVC encode block size (32), so
-/// `encode_frame` refuses the HEVC target on this file by documented design
-/// (see `encode_frame_accepts_p010_via_vpp`) — 2160 *is* a multiple of the
-/// H.264 block size (16), so H.264 is the target that actually exercises the
-/// zero-copy path on this real source.
+/// Both H.264 (coded size already matches this film's 2160 visible height,
+/// so the P010->NV12 convert is whole-surface) and HEVC (2160 is not a
+/// multiple of the 32-block HEVC coded size, so `encode_frame` also takes
+/// the VPP region-copy route — `Encoder::vpp_into_pool`) get a bench row.
 #[test]
 fn p010_zero_copy_encode_is_realtime() {
     let Some(display) = display() else { return };
@@ -1659,66 +1675,78 @@ fn p010_zero_copy_encode_is_realtime() {
     let units = split_access_units(&data, Codec::H265);
     assert!(units.len() > limit, "film clip too short for {limit} frames");
 
-    println!("{:<24} {:>10} {:>10} {:>10}", "stage", "median ms", "min ms", "max ms");
-    let mut zc_median = None;
-    let mut cpu_median = None;
-    for (name, zero_copy) in [("decode+encode_frame", true), ("decode+to_i420+encode", false)] {
-        let mut decoder = Decoder::new(&display, Codec::H265).expect("decoder opens");
-        let mut encoder: Option<Encoder> = None;
-        let mut durations: Vec<Duration> = Vec::new();
-        let mut count = 0i64;
-        'outer: for (i, unit) in units.iter().enumerate() {
-            decoder.decode(unit, i as i64).expect("decode");
-            while let Some(frame) = decoder.next_frame() {
-                let (w, h) = frame.display_size;
-                let encoder = encoder.get_or_insert_with(|| {
-                    let mut cfg = EncoderConfig::new(EncCodec::H264, w, h);
-                    cfg.gop_size = 30;
-                    cfg.rate_control = RateControlMode::ConstantQp { qp: 22 };
-                    Encoder::new(&display, cfg).expect("encoder opens")
-                });
-                let meta = FrameMetadata {
-                    timestamp: count,
-                    force_keyframe: false,
-                };
-                let t0 = Instant::now();
-                if zero_copy {
-                    encoder.encode_frame(&frame, meta).expect("encode_frame");
-                } else {
-                    let i420 = frame.to_i420().expect("readback");
-                    encoder.encode(&i420, meta).expect("encode");
-                }
-                durations.push(t0.elapsed());
-                count += 1;
-                if durations.len() >= limit {
-                    break 'outer;
+    println!("{:<28} {:>10} {:>10} {:>10}", "stage", "median ms", "min ms", "max ms");
+    // (target, zero-copy median ms, CPU-path median ms) rows, filled in order.
+    let mut rows: Vec<(EncCodec, f64, f64)> = Vec::new();
+    for target in [EncCodec::H264, EncCodec::H265] {
+        let mut zc_median = None;
+        let mut cpu_median = None;
+        for (label, zero_copy) in [("decode+encode_frame", true), ("decode+to_i420+encode", false)] {
+            let name = format!("{target:?} {label}");
+            let mut decoder = Decoder::new(&display, Codec::H265).expect("decoder opens");
+            let mut encoder: Option<Encoder> = None;
+            let mut durations: Vec<Duration> = Vec::new();
+            let mut count = 0i64;
+            'outer: for (i, unit) in units.iter().enumerate() {
+                decoder.decode(unit, i as i64).expect("decode");
+                while let Some(frame) = decoder.next_frame() {
+                    let (w, h) = frame.display_size;
+                    let encoder = encoder.get_or_insert_with(|| {
+                        let mut cfg = EncoderConfig::new(target, w, h);
+                        cfg.gop_size = 30;
+                        cfg.rate_control = RateControlMode::ConstantQp { qp: 22 };
+                        Encoder::new(&display, cfg).expect("encoder opens")
+                    });
+                    let meta = FrameMetadata {
+                        timestamp: count,
+                        force_keyframe: false,
+                    };
+                    let t0 = Instant::now();
+                    if zero_copy {
+                        encoder.encode_frame(&frame, meta).expect("encode_frame");
+                    } else {
+                        let i420 = frame.to_i420().expect("readback");
+                        encoder.encode(&i420, meta).expect("encode");
+                    }
+                    durations.push(t0.elapsed());
+                    count += 1;
+                    if durations.len() >= limit {
+                        break 'outer;
+                    }
                 }
             }
+            assert!(
+                durations.len() >= limit,
+                "{name}: only {} of {limit} frames encoded",
+                durations.len()
+            );
+            durations.sort();
+            let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+            let median = ms(durations[durations.len() / 2]);
+            let min = ms(durations[0]);
+            let max = ms(durations[durations.len() - 1]);
+            println!("{name:<28} {median:>10.2} {min:>10.2} {max:>10.2}");
+            if zero_copy {
+                zc_median = Some(median);
+            } else {
+                cpu_median = Some(median);
+            }
         }
-        assert!(
-            durations.len() >= limit,
-            "{name}: only {} of {limit} frames encoded",
-            durations.len()
-        );
-        durations.sort();
-        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
-        let median = ms(durations[durations.len() / 2]);
-        let min = ms(durations[0]);
-        let max = ms(durations[durations.len() - 1]);
-        println!("{name:<24} {median:>10.2} {min:>10.2} {max:>10.2}");
-        if zero_copy {
-            zc_median = Some(median);
-        } else {
-            cpu_median = Some(median);
-        }
+        rows.push((
+            target,
+            zc_median.expect("zero-copy phase ran"),
+            cpu_median.expect("CPU-path phase ran"),
+        ));
     }
-    let zc = zc_median.expect("zero-copy phase ran");
-    let cpu = cpu_median.expect("CPU-path phase ran");
-    println!("target: decode+encode_frame <= 20.00 ms/frame median; got {zc:.2} (CPU path {cpu:.2})");
-    assert!(
-        zc <= 20.0,
-        "decode+encode_frame median {zc:.2} ms/frame exceeds the 20 ms budget (CPU path: {cpu:.2} ms)"
-    );
+    for (target, zc, cpu) in rows {
+        println!(
+            "target: {target:?} decode+encode_frame <= 20.00 ms/frame median; got {zc:.2} (CPU path {cpu:.2})"
+        );
+        assert!(
+            zc <= 20.0,
+            "{target:?}: decode+encode_frame median {zc:.2} ms/frame exceeds the 20 ms budget (CPU path: {cpu:.2} ms)"
+        );
+    }
 }
 
 /// A CRA GOP boundary stores its RASL leading pictures *after* the CRA in
