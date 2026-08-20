@@ -1897,7 +1897,34 @@ fn sbr_real_library_matches_reference() {
             {
                 let avail = o.len().saturating_sub(oa).min(t.len().saturating_sub(ob));
                 let windows = avail / 4_096;
-                let timeline = windowed_lag_drift(o, t, oa, ob, windows);
+                // The full per-window LOCAL_LAG=+-2000 search inside
+                // `windowed_lag_drift` costs O(windows * 4001 * 4096) and runs
+                // ~4min/channel over a whole real-library file -- that walk
+                // is only needed when actually hunting for a drifting lag
+                // (EC_AAC_SBR_TIMELINE). By default this block instead reuses
+                // the already-established global `lag` with NO per-window
+                // search (O(windows * 4096)), which is cheap and still gives
+                // an honest whole-file windowed mean/min at that fixed lag.
+                let timeline: Vec<(i64, f64)> =
+                    if std::env::var("EC_AAC_SBR_TIMELINE").is_ok() {
+                        windowed_lag_drift(o, t, oa, ob, windows)
+                    } else {
+                        (0..windows)
+                            .filter_map(|w| {
+                                let base_o = (oa as i64 + lag + (w * 4_096) as i64)
+                                    .try_into()
+                                    .ok()?;
+                                let base_t = ob + w * 4_096;
+                                if base_o + 4_096 > o.len() || base_t + 4_096 > t.len() {
+                                    return None;
+                                }
+                                Some((
+                                    lag,
+                                    correlation(&o[base_o..base_o + 4_096], &t[base_t..base_t + 4_096]),
+                                ))
+                            })
+                            .collect()
+                    };
                 if std::env::var("EC_AAC_SBR_TIMELINE").is_ok() {
                     println!(
                         "  ch{ch} TIMELINE ({windows} windows, {rate} Hz, window_idx@sec, local_lag, corr):"
