@@ -11,12 +11,12 @@
 //!
 //! let display = ec_va::Display::open()?;
 //! let mut decoder = Decoder::new(&display, Codec::H264)?;
+//! # let annex_b_access_unit: &[u8] = &[];
 //! decoder.decode(annex_b_access_unit, 0)?;
 //! while let Some(frame) = decoder.next_frame() {
 //!     let planes = frame.to_i420()?;   // or frame.export_prime() for zero copy
 //! }
 //! # Ok::<(), ec_hw::Error>(())
-//! # fn annex_b_access_unit() -> &'static [u8] { &[] }
 //! ```
 //!
 //! # Shape
