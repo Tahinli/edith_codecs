@@ -1129,7 +1129,10 @@ fn oracle_decodes_our_packets_across_the_rate_table() {
         let n = (reference.len()).min(total);
         let corr = correlation(&pcm[..n], &reference[..n]);
         println!("silk 1 ch {kbps:>3} kbps: corr {corr:.4}");
-        assert!(corr >= 0.95, "silk {kbps} kbps: correlation {corr:.4}");
+        // With Encoder::set_bitrate now wired into SilkEncoder's reservoir,
+        // the rate loop genuinely starves the pulse-coded excitation on
+        // this tone signal at true speech rates (8/12/16 kbps).
+        assert!(corr >= 0.8, "silk {kbps} kbps: correlation {corr:.4}");
     }
 }
 
@@ -1631,7 +1634,7 @@ fn oracle_decode(name: &str, packets: &[Vec<u8>], samples: usize) -> Option<Vec<
         return None;
     }
     let path = temp_path(&format!("{name}.opus"));
-    write_ogg_opus(&path, packets, opus_head(1, None), 1, samples);
+    write_ogg_opus(&path, packets, opus_head(1, 120, None), 1, samples, 120);
     let out = Command::new("ffmpeg")
         .args(["-v", "warning", "-c:a", "libopus", "-i"])
         .arg(&path)
@@ -1698,5 +1701,23 @@ fn silk_rate_control_tracks_target() {
                 assert!((0.8..=1.2).contains(&ratio), "{name} {tag} target {kbps_target}: got {kbps:.2} kbps");
             }
         }
+    }
+}
+
+/// The public `Encoder` (Voip, mono) routes `set_bitrate` into the SILK
+/// path it dispatches to, same as `silk_rate_control_tracks_target` proves
+/// directly against `SilkEncoder`.
+#[test]
+fn silk_packets_track_encoder_bitrate() {
+    let pcm = test_signal(1, 2.0);
+    for kbps_target in [8u32, 12, 16] {
+        let mut enc = Encoder::new(48000, 1, Application::Voip).unwrap();
+        enc.set_bitrate(kbps_target * 1000);
+        let packets = encode_packets(&mut enc, &pcm, 1);
+        let bytes: usize = packets.iter().map(Vec::len).sum();
+        let kbps = bytes as f64 * 8.0 / (packets.len() as f64 * 20.0);
+        eprintln!("encoder bitrate target {kbps_target}: {kbps:.2} kbps");
+        let ratio = kbps / kbps_target as f64;
+        assert!((0.8..=1.2).contains(&ratio), "target {kbps_target}: got {kbps:.2} kbps");
     }
 }
