@@ -24,16 +24,31 @@
 //!
 //! For each *source* subband, a covariance-method order-2 LPC is fit to
 //! that subband's own QMF time series (two slots of carried-over history
-//! plus the current frame's slots), giving prediction coefficients `(a1,
-//! a2)` such that `x[l] ~= a1*x[l-1] + a2*x[l-2]`. Per §4.6.18.6, the copied
-//! series is then extended *feed-forward* by a bandwidth-expanded 2-tap FIR
-//! built from those same coefficients: `X_high[l] = X_src[l] + bw*a1*
-//! X_src[l-1] + bw^2*a2*X_src[l-2]`. This is the standard SBR "inverse
-//! filtering" trick: `bw` near 1 reinforces the subband's own resonance atop
-//! the raw copy (a strongly tonal patch), `bw` at 0 degenerates to the plain
-//! copy (no extra tap energy at all). `bw` itself comes from `bs_invf_mode`
-//! and is smoothed frame to frame with a fast-attack/slow-release curve so
-//! inverse-filter mode changes don't pop.
+//! plus the current frame's slots). The residual against those raw
+//! coefficients is then re-synthesised through a *bandwidth-expanded*
+//! all-pole filter -- coefficients scaled by `bw` and `bw^2` -- which is
+//! the standard SBR "inverse filtering" trick: `bw` near 1 leaves the
+//! subband's own resonance intact (a strongly tonal patch), `bw` near 0
+//! flattens it toward its whitened residual (a noise-like patch). `bw`
+//! itself comes from `bs_invf_mode` and is smoothed frame to frame with a
+//! fast-attack/slow-release curve so inverse-filter mode changes don't pop.
+//!
+//! Round-48 replaced this all-pole residual resynthesis with the spec's
+//! literal reading of §4.6.18.6, a feed-forward 2-tap FIR extension of the
+//! raw copy (`X_high[l] = X_src[l] + bw*a1*X_src[l-1] + bw^2*a2*X_src[l-2]`).
+//! That version compiled, passed its own unit test, and is *closer* to a
+//! literal spec transcription -- but measured reproducibly WORSE on real
+//! content: full-band correlation against the reference decoder on
+//! Nikbinler dropped 0.972474->0.963863 (ch0) and 0.969785->0.961027 (ch1),
+//! same direction on below-crossover and whole-file windowed-mean
+//! correlation too (round-50 A/B, ledger-recorded). This module reverted to
+//! the all-pole structure documented above on that measurement, not on the
+//! spec reading: the bar this project holds itself to is matching the
+//! reference decoder's actual output, and a from-memory "more spec-literal"
+//! label does not outrank it. The feed-forward alternative and its
+//! discriminating unit test remain in history (commit 8bc305b) as the
+//! documented alternative, should some other change in this pipeline ever
+//! make it the better match.
 
 use crate::sbr_bands::BandTables;
 use ec_dsp::Complex;
@@ -319,27 +334,25 @@ pub fn lpc2(x: &[Complex<f64>]) -> (Complex<f64>, Complex<f64>) {
     (a1, a2)
 }
 
-/// Bounds an AR(2) predictor's coefficients so the feed-forward FIR
-/// extension `generate` builds from them (`X_high[l] = X_src[l] +
-/// bw*a1*X_src[l-1] + bw^2*a2*X_src[l-2]`) cannot blow up the copied tap
-/// energy on a badly-conditioned fit.
+/// Bounds an AR(2) predictor's coefficients so the resynthesis recursion
+/// this module runs (`y = residual + ca1*y[n-1] + ca2*y[n-2]`) cannot
+/// diverge.
 ///
 /// `lpc2` solves an unwindowed covariance-method normal-equation system,
 /// which -- unlike the autocorrelation/Levinson-Durbin method the reference
 /// SBR tool uses -- carries no built-in stability guarantee: on a short (32
 /// QMF slot) window of a strongly resonant real-music subband it can and
-/// does return a pole outside the unit circle, driving the FIR taps to
-/// unreasonably large magnitude for what should be a bounded-gain
-/// extension (observed: output rms in the hundreds of thousands on real
-/// HE-AAC files, versus ~0.2 for a working decode, back when this fed an
-/// IIR recursion; the same unstable estimate still over-weights the taps
-/// here). `|a1| + |a2| < 1` is a standard sufficient (if conservative)
-/// bound, so clamping the pair to it whenever it is violated is a
-/// corner-cut: it trades exactness on the rare unstable-estimate frame for
-/// boundedness everywhere, ceiling = slightly under-resonant HF on
-/// whichever frames hit the clamp; upgrade path = replace `lpc2` with the
-/// spec's own Levinson-Durbin-derived reflection coefficients, which are
-/// stable by construction and would make this function a no-op.
+/// does return a pole outside the unit circle, and the 32-sample feedback
+/// loop below then grows geometrically within a single frame (observed:
+/// output rms in the hundreds of thousands on real HE-AAC files, versus
+/// ~0.2 for a working decode). `|a1| + |a2| < 1` is a standard sufficient
+/// (if conservative) BIBO-stability bound for a direct-form-II section, so
+/// clamping the pair to it whenever it is violated is a corner-cut: it
+/// trades exactness on the rare unstable-estimate frame for boundedness
+/// everywhere, ceiling = slightly under-resonant HF on whichever frames hit
+/// the clamp; upgrade path = replace `lpc2` with the spec's own
+/// Levinson-Durbin-derived reflection coefficients, which are stable by
+/// construction and would make this function a no-op.
 fn stabilize(coeffs: (Complex<f64>, Complex<f64>)) -> (Complex<f64>, Complex<f64>) {
     let (a1, a2) = coeffs;
     let mag = a1.norm_sqr().sqrt() + a2.norm_sqr().sqrt();
@@ -353,19 +366,20 @@ fn stabilize(coeffs: (Complex<f64>, Complex<f64>)) -> (Complex<f64>, Complex<f64
     }
 }
 
-/// Per-source-subband history: the last two QMF slots (`X_src[l-1]`,
-/// `X_src[l-2]`), carried across `generate` calls so the LPC fit and the
-/// feed-forward FIR extension both have continuity at frame boundaries
-/// instead of restarting cold every frame.
+/// Per-source-subband history: the last two QMF slots, carried across
+/// `generate` calls so the LPC and whitening filter have continuity at
+/// frame boundaries instead of restarting cold every frame.
 #[derive(Clone, Debug)]
 pub struct HfHistory {
     x: Vec<[Complex<f64>; 2]>,
+    y: Vec<[Complex<f64>; 2]>,
 }
 
 impl HfHistory {
     pub fn new(bands: usize) -> HfHistory {
         HfHistory {
             x: vec![[Complex::ZERO; 2]; bands],
+            y: vec![[Complex::ZERO; 2]; bands],
         }
     }
 }
@@ -428,18 +442,13 @@ pub fn generate(
             if std::env::var("EC_AAC_SBR_BW_DUMP").is_ok() {
                 eprintln!("BW_DUMP target_band={target_band} source_band={source_band} bw={g:.6}");
             }
-            // (Round-48, Task 3) §4.6.18.6 feed-forward extension: `X_high[l]
-            // = X_src[l] + bw*a1*X_src[l-1] + bw^2*a2*X_src[l-2]`. `a1`/`a2`
-            // are used directly (not negated): `lpc2` returns them in the
-            // "predicts forward" convention (`x[l] ~= a1*x[l-1] +
-            // a2*x[l-2]`, pinned by `lpc_recovers_the_poles_of_a_synthetic_
-            // ar2_process`), so applying them unnegated to the raw copy
-            // continues the source subband's own AR resonance into the
-            // patched band -- `bw` at 1 is maximally tonal, `bw` at 0
-            // degenerates the whole tap to zero, leaving the plain copy
-            // (see `feed_forward_extension_matches_bw_endpoints`).
             let ca1 = a1.scale(g);
             let ca2 = a2.scale(g * g);
+            let (mut y_prev1, mut y_prev2) = if source_band < history.y.len() {
+                (history.y[source_band][1], history.y[source_band][0])
+            } else {
+                (Complex::ZERO, Complex::ZERO)
+            };
             let (mut x_prev1, mut x_prev2) = if source_band < history.x.len() {
                 (history.x[source_band][1], history.x[source_band][0])
             } else {
@@ -447,6 +456,8 @@ pub fn generate(
             };
             let dst = &mut out[target_band - kx];
             for (n, &x) in series.iter().enumerate() {
+                let residual = x - a1 * x_prev1 - a2 * x_prev2;
+                let y = residual + ca1 * y_prev1 + ca2 * y_prev2;
                 // Round-37 (Task 2): `band_shift_correction` is proven exact
                 // in isolation (a stationary tone replayed through this
                 // patch-copy site lands within a couple of FFT bins of its
@@ -460,9 +471,11 @@ pub fn generate(
                 // on ch0). The reference apparently exhibits this bank's own
                 // "wrong" cross-band placement convention, so matching it is
                 // the bar: `dst` stays the plain, uncorrected copy.
-                dst[n] = x + ca1 * x_prev1 + ca2 * x_prev2;
+                dst[n] = y;
                 x_prev2 = x_prev1;
                 x_prev1 = x;
+                y_prev2 = y_prev1;
+                y_prev1 = y;
             }
         }
     }
@@ -475,6 +488,9 @@ pub fn generate(
         }
         let n = series.len();
         history.x[band] = [series[n - 2], series[n - 1]];
+        // y-history only meaningfully advances for bands a patch actually
+        // wrote; untouched bands hold their input as a neutral seed.
+        history.y[band] = [series[n - 2], series[n - 1]];
     }
 
     out
@@ -554,26 +570,35 @@ mod tests {
         );
     }
 
-    /// (Round-48, Task 3) Pins the feed-forward extension's sign convention
-    /// and `bw` endpoints against the spec-shaped formula (`generate`'s own
-    /// doc comment): `X_high[l] = X_src[l] + bw*a1*X_src[l-1] +
-    /// bw^2*a2*X_src[l-2]`, `a1`/`a2` used unnegated.
+    /// (Round-50) Pins the all-pole residual-resynthesis structure that
+    /// round-50's real-file A/B empirically favours over the feed-forward
+    /// FIR round-48 briefly shipped (see the module doc). Both structures
+    /// were implemented and measured against the reference decoder on real
+    /// content; this one matched closer, so it is the one pinned here --
+    /// the feed-forward alternative's own discriminating test
+    /// (`feed_forward_extension_matches_bw_endpoints`, commit 8bc305b) is
+    /// documented history, not dead code to resurrect casually.
     ///
-    /// Drives a *noiseless* AR(2) source (`x[n] = a1*x[n-1] + a2*x[n-2]`
-    /// exactly, `|a1|+|a2| = 0.9 < 0.999` so `stabilize` never clamps) through
-    /// two consecutive frames so the second frame's history/LPC fit is on
-    /// data that satisfies the recurrence exactly end to end. At `bw=0`
-    /// (`bs_invf_mode` OFF) the extension must degenerate to the plain copy.
-    /// At `bw` near 1 (`bs_invf_mode` HIGH, `BW_TABLE[3] = 0.98`), since the
-    /// noiseless source satisfies `a1*x[l-1] + a2*x[l-2] == x[l]` exactly,
-    /// the correct (unnegated) convention algebraically collapses to
-    /// `y[l] ~= (1 + bw) * x[l] ~= 1.98 * x[l]` -- strictly *more* tonal
-    /// (same phase, amplified), not attenuated or inverted the way the
-    /// negated convention would produce (`y[l] ~= (1 - bw) * x[l] ~= 0.02 *
-    /// x[l]`, nearly cancelling the signal). This directly discriminates the
-    /// two sign conventions, not just "some nonzero tap fired".
+    /// Drives the same noiseless AR(2) source as that alternative test
+    /// through two consecutive frames, `x[n] = a1*x[n-1] + a2*x[n-2]`
+    /// exactly, so `lpc2`'s fit recovers `(a1, a2)` closely enough that the
+    /// *residual* `x[l] - a1*x[l-1] - a2*x[l-2]` is near zero throughout.
+    /// That residual, not the raw copy, is what this structure resynthesises
+    /// through the bandwidth-expanded all-pole recursion `y[l] = residual +
+    /// ca1*y[l-1] + ca2*y[l-2]` -- the key structural difference from
+    /// feed-forward, which adds taps onto the copy instead of replacing it
+    /// with a filtered residual:
+    /// - `bw=0` (`bs_invf_mode` OFF): `ca1=ca2=0`, so `y = residual ~= 0` --
+    ///   the output collapses toward silence, NOT the exact plain copy
+    ///   feed-forward produces at this same setting.
+    /// - `bw~=0.98` (`bs_invf_mode` HIGH): `ca1,ca2` are close to the
+    ///   original `(a1,a2)` (scaled by `bw`, `bw^2`), so with residual~=0 the
+    ///   recursion nearly reproduces the source's own AR(2) resonance from
+    ///   history alone -- output tracks `x` closely in magnitude and phase,
+    ///   not the ~1.98x reinforcement feed-forward produces at the same
+    ///   setting.
     #[test]
-    fn feed_forward_extension_matches_bw_endpoints() {
+    fn all_pole_resynthesis_matches_bw_endpoints() {
         let tables = real_file_tables();
         let kx = tables.kx as usize;
         let a1 = 0.6f64;
@@ -594,22 +619,25 @@ mod tests {
         let invf_off = vec![0u8; tables.n_q];
         let invf_high = vec![3u8; tables.n_q];
 
-        // bw = 0: extension is an exact plain copy.
+        // bw = 0: residual resynthesis collapses toward silence, not a copy.
         let mut chirp0 = ChirpState::new(tables.n_q);
         let mut hist0 = HfHistory::new(kx);
         let _ = generate(&frame1, &tables, &invf_off, &mut chirp0, &mut hist0);
         let out0 = generate(&frame2, &tables, &invf_off, &mut chirp0, &mut hist0);
         let dst0 = &out0[14 - kx]; // target band 14, patch (0,14,14) offset 0
-        for (n, &y) in dst0.iter().enumerate() {
+        for (n, &y) in dst0.iter().enumerate().skip(4) {
             let expect = x[30 + n];
+            if expect.abs() < 1e-6 {
+                continue;
+            }
             assert!(
-                (y.re - expect).abs() < 1e-9 && y.im.abs() < 1e-9,
-                "bw=0 mismatch at n={n}: {y:?} vs {expect}"
+                y.re.abs() < 0.1 * expect.abs(),
+                "bw=0 residual should collapse toward silence at n={n}: {y:?} vs input {expect}"
             );
         }
 
-        // bw ~= 0.98: reinforces the source's own resonance, ~1.98x, same
-        // phase -- not the ~0.02x a negated convention would produce.
+        // bw ~= 0.98: residual~=0, so the recursion tracks the source's own
+        // resonance from history alone -- ratio near 1, not ~1.98.
         let mut chirp1 = ChirpState::new(tables.n_q);
         chirp1.bw = vec![0.0; tables.n_q]; // priming frame at bw=0
         let mut hist1 = HfHistory::new(kx);
@@ -617,8 +645,6 @@ mod tests {
         chirp1.bw = vec![0.98; tables.n_q]; // preload the exact target: `update` below is then a no-op
         let out1 = generate(&frame2, &tables, &invf_high, &mut chirp1, &mut hist1);
         let dst1 = &out1[14 - kx];
-        // Skip the first couple of slots (LPC fit needs the history to
-        // settle); check the steady-state ratio on the rest.
         for (n, &y) in dst1.iter().enumerate().skip(4) {
             let expect = x[30 + n];
             if expect.abs() < 1e-6 {
@@ -626,7 +652,7 @@ mod tests {
             }
             let ratio = y.re / expect;
             assert!(
-                (1.0..2.1).contains(&ratio),
+                (0.5..1.5).contains(&ratio),
                 "bw=0.98 ratio out of range at n={n}: ratio={ratio} y={y:?} x={expect}"
             );
             assert!(
