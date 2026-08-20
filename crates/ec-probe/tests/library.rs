@@ -259,3 +259,72 @@ fn ffprobe_audio_codecs(path: &Path) -> Vec<String> {
         .map(|l| l.trim().to_string())
         .collect()
 }
+
+/// Cover-art (`APIC`) ID3v2 tags shipped by real rippers/taggers put a whole
+/// image ahead of the first frame; opening must skip the tag by its own
+/// syncsafe size and never confuse the codec/window prefixes it hunts for
+/// sync in with that image's bytes. Matched against ffmpeg's own decode of
+/// the same first second, not just "it opened".
+#[test]
+fn a_cover_art_tagged_mp3_opens() {
+    let path = Path::new("/home/tahinli/Music/Her Nerdeysen.mp3");
+    if !path.exists() {
+        eprintln!("file not present, skipping");
+        return;
+    }
+    let mut reader = Reader::open(path).expect("open");
+    let audio = reader
+        .default_stream(MediaType::Audio)
+        .cloned()
+        .expect("audio stream");
+    let mut decoder = reader.make_decoder(audio.index).expect("decoder");
+    let rate = decoder.sample_rate();
+    let channels = decoder.channels().max(1) as u32;
+    // The raw decoder hands back every sample the bitstream carries,
+    // including the LAME/Xing encoder's lead-in; `initial_padding` (parsed
+    // from that header) is how many of them a player is meant to drop
+    // (ec-core registry.rs: "audible length is duration - initial_padding").
+    // ffmpeg does that trim itself before writing PCM, so match it here.
+    let lead_in = audio.initial_padding * channels;
+    let mut ours = Vec::new();
+    let mut scratch = Vec::new();
+    let mut n = 0;
+    while (ours.len() as u32) < rate + lead_in {
+        let packet = match reader.next_packet() {
+            Ok(p) => p,
+            Err(e) => panic!("next_packet after {n} packets, {} samples: {e}", ours.len()),
+        };
+        n += 1;
+        if packet.stream != audio.index {
+            continue;
+        }
+        decoder.decode(&packet, &mut scratch).expect("decode 1s");
+        ours.extend_from_slice(&scratch);
+    }
+    let ours = &ours[lead_in as usize..];
+    assert!(ours.len() as u32 >= rate / 2, "decoded too little audio");
+
+    let out = Command::new("ffmpeg")
+        .args(["-v", "error", "-t", "1", "-i"])
+        .arg(path)
+        .args(["-map", "0:a:0", "-f", "f32le", "-acodec", "pcm_f32le", "-"])
+        .output()
+        .expect("ffmpeg runs");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let theirs: Vec<f32> = out
+        .stdout
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+
+    let n = ours.len().min(theirs.len());
+    let (mut num, mut a2, mut b2) = (0.0f64, 0.0f64, 0.0f64);
+    for i in 0..n {
+        let (a, b) = (ours[i] as f64, theirs[i] as f64);
+        num += a * b;
+        a2 += a * a;
+        b2 += b * b;
+    }
+    let corr = num / (a2.sqrt() * b2.sqrt()).max(1e-12);
+    assert!(corr >= 0.999, "corr vs ffmpeg = {corr}");
+}
