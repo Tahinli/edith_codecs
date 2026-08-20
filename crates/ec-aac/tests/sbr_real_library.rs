@@ -173,11 +173,37 @@ fn our_decode(
     Some((planes, sbr, rate))
 }
 
-/// Search window and lag bound: keeps the lag search and the correlation sum
-/// both bounded, per the charter -- an unbounded version over a whole film's
-/// worth of samples was too slow to be an every-run test.
-const LAG_MAX: usize = 4_000;
+/// Search window bound: keeps the correlation sum bounded, per the charter
+/// -- an unbounded version over a whole film's worth of samples was too slow
+/// to be an every-run test.
 const WINDOW: usize = 200_000;
+
+/// Wide lag search bound for the specific gate proven to need it
+/// (`sbr_real_library_matches_reference`, ours-vs-reference across a real
+/// container's remux/priming delay). Measured (round-54 wide-lag probe,
+/// worktree sbr-per-au) FMJ's true full-chain delay vs the reference is
+/// ~22,913 samples @48kHz -- that gate's old `LAG_MAX=4_000` search clipped
+/// at its own edge and silently reported the edge's noise as the answer for
+/// 50+ rounds (class: "an alignment instrument whose result sits at its own
+/// search edge is invalid"). 100_000 covers that with 4x headroom and is
+/// already the bound round-53's own `WIDE_LAG_MAX=100_000` probe used to
+/// find it. NOT used as the default everywhere: a wider bound also widens
+/// the coarse pass's exposure to spurious short-slice noise peaks, so
+/// call sites whose true delay is known-small (container/decoder priming,
+/// ours-vs-own-core self-consistency) keep their original, narrower bound
+/// -- round-54 first tried blanket-widening every call site to this value
+/// and it flipped `full_chain_low_band_matches_own_core` and the LC control
+/// row of `synthetic_heaac_matrix` from a correct small-lag answer to a
+/// wrong, noise-driven distant one, still comfortably inside the bound
+/// (not `at_edge`) but wrong regardless.
+const SEARCH_LAG_MAX: i64 = 100_000;
+/// Original bound for the plain `best_lag_correlation` wrapper, used by the
+/// file's other (ours-vs-reference small-priming-delay, or ours-vs-ours)
+/// callers that were never shown to need more.
+const PLAIN_LAG_MAX: i64 = 4_000;
+/// Odd stride `best_lag_correlation_ex`'s coarse pass steps by, so it
+/// doesn't alias against frame-length periodicity.
+const SEARCH_STRIDE: i64 = 11;
 
 fn dot(a: &[f32], b: &[f32]) -> f64 {
     a.iter()
@@ -201,14 +227,19 @@ fn correlation(a: &[f32], b: &[f32]) -> f64 {
     if den == 0.0 { 0.0 } else { num / den }
 }
 
-/// Best correlation over a bounded lag search. Two passes keep the whole
-/// search O(reasonable) on a film-length file: a coarse pass over every lag
-/// but a short slice finds roughly where the alignment is, then one full-size
-/// correlation at that lag (and its immediate neighbours, in case the coarse
-/// slice picked a noisy lag) gives the reported number. The 8001-lag charter
-/// bound times the full `WINDOW` in one pass, tried first, took minutes on
-/// this box -- this is that ceiling brought back to milliseconds.
-fn best_lag_correlation(ours: &[f32], theirs: &[f32]) -> (i64, f64) {
+/// Best correlation over a bounded lag search, PLUS whether the winning lag
+/// sits at the search's own edge -- the single instrument every asserting
+/// test in this file now routes through (class fix, round-54: a search that
+/// silently clips at its bound and reports the edge's noise as "the
+/// answer" is not an instrument, it's a lie). Two passes keep the whole
+/// search O(reasonable) even at `SEARCH_LAG_MAX`-sized bounds on a
+/// film-length file: an odd-`SEARCH_STRIDE` coarse pass over a short slice
+/// finds roughly where the alignment is (the stride, not full 1-by-1
+/// stepping, is what keeps a `lag_max` in the tens of thousands cheap, and
+/// also avoids aliasing against frame-length periodicity), then one
+/// full-`WINDOW` correlation at that lag (and its immediate neighbours, in
+/// case the coarse slice picked a noisy lag) gives the reported number.
+fn best_lag_correlation_ex(ours: &[f32], theirs: &[f32], lag_max: i64) -> (i64, f64, bool) {
     const COARSE: usize = 4_096;
     let start = ours
         .len()
@@ -244,18 +275,20 @@ fn best_lag_correlation(ours: &[f32], theirs: &[f32]) -> (i64, f64) {
     // positive one from a 20x-shorter slice. Carry the signed value through
     // so callers can see the sign, not just |corr|.
     let mut coarse_best = (0i64, -1.0f64, 0.0f64);
-    for lag in -(LAG_MAX as i64)..=(LAG_MAX as i64) {
-        let Some((oa, ob)) = slice_at(lag, COARSE) else {
-            continue;
-        };
-        let c = correlation(&ours[oa..oa + COARSE], &theirs[ob..ob + COARSE]);
-        if c.abs() > coarse_best.1 {
-            coarse_best = (lag, c.abs(), c);
+    let mut lag = -lag_max;
+    while lag <= lag_max {
+        if let Some((oa, ob)) = slice_at(lag, COARSE) {
+            let c = correlation(&ours[oa..oa + COARSE], &theirs[ob..ob + COARSE]);
+            if c.abs() > coarse_best.1 {
+                coarse_best = (lag, c.abs(), c);
+            }
         }
+        lag += SEARCH_STRIDE;
     }
+    let at_edge = coarse_best.0.abs() >= lag_max - SEARCH_STRIDE;
     let mut best = (coarse_best.0, -1.0f64, 0.0f64);
     let mut found = false;
-    for lag in (coarse_best.0 - 8)..=(coarse_best.0 + 8) {
+    for lag in (coarse_best.0 - 2 * SEARCH_STRIDE)..=(coarse_best.0 + 2 * SEARCH_STRIDE) {
         let Some((oa, ob)) = slice_at(lag, WINDOW) else {
             continue;
         };
@@ -272,7 +305,25 @@ fn best_lag_correlation(ours: &[f32], theirs: &[f32]) -> (i64, f64) {
     if !found {
         best = coarse_best;
     }
-    (best.0, best.2)
+    (best.0, best.2, at_edge)
+}
+
+/// Thin wrapper over `best_lag_correlation_ex` at `PLAIN_LAG_MAX`, for the
+/// many non-asserting call sites that only want `(lag, corr)` and whose true
+/// delay was never shown to exceed the original 4_000 bound. The one gate
+/// proven to need the wide bound (`sbr_real_library_matches_reference`)
+/// calls `_ex` directly with `SEARCH_LAG_MAX` instead of going through this
+/// wrapper.
+fn best_lag_correlation(ours: &[f32], theirs: &[f32]) -> (i64, f64) {
+    let (lag, corr, _) = best_lag_correlation_ex(ours, theirs, PLAIN_LAG_MAX);
+    (lag, corr)
+}
+
+/// Thin wrapper over `best_lag_correlation_ex` at a caller-supplied bound,
+/// for non-asserting call sites (asserting ones use `_ex` directly).
+fn best_lag_correlation_wide(ours: &[f32], theirs: &[f32], lag_max: i64) -> (i64, f64) {
+    let (lag, corr, _) = best_lag_correlation_ex(ours, theirs, lag_max);
+    (lag, corr)
 }
 
 /// Signed correlation of `ours` against `theirs` at one fixed `lag`, full
@@ -2097,14 +2148,36 @@ fn full_chain_low_band_matches_own_core() {
             let cutoff = f64::from(core_rate) * 0.4;
             let ol = lowpass(&full[ch], full_rate, cutoff);
             let ul = lowpass(&up, full_rate, cutoff);
-            // Wide search, not the plain `best_lag_correlation`'s
-            // `LAG_MAX=4000` -- the QMF-chain delay this measures is not a
-            // fixed constant across files/rates (measured -576 on Nikbinler
-            // vs the stale -897 this test used to assert against), so the
-            // lag itself is part of what's measured here, not assumed.
+            // Escalating search: narrow (`WIDE_LAG_MAX`=20_000, the file's
+            // original bound) first, widen to `SEARCH_LAG_MAX` only if that
+            // narrow search hit its own edge (`at_edge`). A single shared
+            // wide bound was tried first (round-54) and, unconditionally
+            // widening this comparison, flipped Nikbinler from its correct
+            // small-lag answer (-576, corr 0.9967) to a wrong, noise-driven
+            // distant one (-912, corr -0.295) -- a genuinely low-quality
+            // low-passed signal's coarse correlation surface has enough
+            // stray peaks over a 100_000-wide range to beat a real but
+            // modest true peak. Escalating only when the narrow bound
+            // proves insufficient (FMJ's own core-vs-full delay lands AT
+            // the 20_000 edge, corr 0.217393 there, the same edge-noise
+            // class the reference-vs-ours gate had) gets both files right
+            // without exposing the well-behaved one to the wider bound's
+            // noise floor.
             const WIDE_LAG_MAX: i64 = 20_000;
-            let (lag, corr) = best_lag_correlation_wide(&ol, &ul, WIDE_LAG_MAX);
+            let (mut lag, mut corr, mut at_edge) = best_lag_correlation_ex(&ol, &ul, WIDE_LAG_MAX);
+            let mut bound = WIDE_LAG_MAX;
+            if at_edge {
+                bound = SEARCH_LAG_MAX;
+                (lag, corr, at_edge) = best_lag_correlation_ex(&ol, &ul, SEARCH_LAG_MAX);
+            }
             println!("  ch{ch}: measured best lag {lag}, corr {corr:.6}");
+            assert!(
+                !at_edge,
+                "{} ch{ch}: winning lag {lag} sits at the +/-{bound} \
+                 search bound -- the true alignment is outside the search, \
+                 corr {corr:.6} is noise, not a measurement",
+                c.path.display()
+            );
             assert!(
                 corr >= 0.99,
                 "{} ch{ch}: full-chain low band vs our own core-only decode \
@@ -2115,60 +2188,6 @@ fn full_chain_low_band_matches_own_core() {
             );
         }
     }
-}
-
-/// Follow-up to round-52: `best_lag_correlation`'s `LAG_MAX=4000` bound was
-/// landing HE-AAC winning lags right at its own edge (-3634..-3882) on the
-/// synthetic matrix -- this is the same shape `wide_lag_search_full_chain`
-/// diagnosed on FMJ. Mirrors that diagnostic's odd-stride coarse pass, but
-/// over a caller-supplied `lag_max` and followed by the same full-`WINDOW`
-/// refine `best_lag_correlation` does, so its result is directly comparable
-/// (not just a coarse `|corr|` estimate).
-fn best_lag_correlation_wide(ours: &[f32], theirs: &[f32], lag_max: i64) -> (i64, f64) {
-    const COARSE: usize = 4096;
-    let start = ours
-        .len()
-        .min(theirs.len())
-        .saturating_sub(WINDOW)
-        .min(ours.len() / 4);
-    let slice_at = |lag: i64, len: usize| -> Option<(usize, usize)> {
-        let (oa, ob) = if lag >= 0 {
-            (start, start + lag as usize)
-        } else {
-            (start + (-lag) as usize, start)
-        };
-        if oa + len > ours.len() || ob + len > theirs.len() {
-            None
-        } else {
-            Some((oa, ob))
-        }
-    };
-    let mut coarse_best = (0i64, -1.0f64);
-    let mut lag = -lag_max;
-    while lag <= lag_max {
-        if let Some((oa, ob)) = slice_at(lag, COARSE) {
-            let c = correlation(&ours[oa..oa + COARSE], &theirs[ob..ob + COARSE]).abs();
-            if c > coarse_best.1 {
-                coarse_best = (lag, c);
-            }
-        }
-        lag += 11; // odd stride so it doesn't alias against frame-length periodicity
-    }
-    let mut best = (coarse_best.0, -1.0f64, 0.0f64);
-    for lag in (coarse_best.0 - 16)..=(coarse_best.0 + 16) {
-        let Some((oa, ob)) = slice_at(lag, WINDOW) else {
-            continue;
-        };
-        let n = WINDOW.min(ours.len() - oa).min(theirs.len() - ob);
-        if n < 1024 {
-            continue;
-        }
-        let c = correlation(&ours[oa..oa + n], &theirs[ob..ob + n]);
-        if c.abs() > best.1 {
-            best = (lag, c.abs(), c);
-        }
-    }
-    (best.0, best.2)
 }
 
 /// Round-52: a controlled fixture matrix -- unlike Nikbinler/FMJ (one real
@@ -2448,6 +2467,7 @@ fn sbr_real_library_matches_reference() {
     let mut checked = 0;
     let mut worst_full = 1.0f64;
     let mut worst_low = 1.0f64;
+    let mut any_at_edge: Option<String> = None;
     for c in &list {
         let Some((ours, sbr, rate)) = our_decode(&c.path, c.aac_stream) else {
             eprintln!("SKIP {}: could not decode", c.path.display());
@@ -2518,7 +2538,15 @@ fn sbr_real_library_matches_reference() {
                 rms(t),
                 &t[..10.min(t.len())],
             );
-            let (lag, full) = best_lag_correlation(o, t);
+            let (lag, full, full_at_edge) = best_lag_correlation_ex(o, t, SEARCH_LAG_MAX);
+            if full_at_edge {
+                any_at_edge.get_or_insert_with(|| {
+                    format!(
+                        "{} ch{ch} full-band: winning lag {lag} at +/-{SEARCH_LAG_MAX} search edge",
+                        c.path.display()
+                    )
+                });
+            }
             // Re-slice both signals at the winning lag before splitting into
             // bands, so the band correlations are aligned too.
             let (oa, ob) = if lag >= 0 {
@@ -2546,7 +2574,16 @@ fn sbr_real_library_matches_reference() {
             let low = {
                 let ol_full = lowpass(o, rate, c.crossover_hz);
                 let tl_full = lowpass(t, rate, c.crossover_hz);
-                let (low_lag, low_corr) = best_lag_correlation(&ol_full, &tl_full);
+                let (low_lag, low_corr, low_at_edge) =
+                    best_lag_correlation_ex(&ol_full, &tl_full, SEARCH_LAG_MAX);
+                if low_at_edge {
+                    any_at_edge.get_or_insert_with(|| {
+                        format!(
+                            "{} ch{ch} below-crossover: winning lag {low_lag} at +/-{SEARCH_LAG_MAX} search edge",
+                            c.path.display()
+                        )
+                    });
+                }
                 if low_lag != lag {
                     eprintln!(
                         "  ch{ch} below-crossover band's own best lag {low_lag} differs from full-band lag {lag}"
@@ -2973,6 +3010,12 @@ fn sbr_real_library_matches_reference() {
         eprintln!("SKIP: no plain-SBR real files decoded");
         return;
     }
+    assert!(
+        any_at_edge.is_none(),
+        "lag search hit its bound: {} -- the reported correlations are noise \
+         at the search edge, not a measurement",
+        any_at_edge.unwrap_or_default()
+    );
     assert!(
         worst_full >= 0.999,
         "worst full-band correlation {worst_full:.6} < 0.999 bar"
