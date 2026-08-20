@@ -10,21 +10,20 @@
 //! with `alpha = 1.0` at `bs_amp_res = 1` (3 dB steps) and `0.5` at
 //! `bs_amp_res = 0` (1.5 dB steps); the noise floor is `2^(6 - q_q)`
 //! (`NOISE_FLOOR_OFFSET = 6`). A coupled CPE's balance channel (`e_q`'s
-//! second channel) carries a log-ratio rather than an absolute
+//! second channel) carries a log-ratio (`pan`) rather than an absolute
 //! scalefactor; `dequant_pair` de-mixes it against channel 0's raw value
-//! into left/right energies that are equal (and sum to `2 * channel 0's
-//! energy`) when the ratio is centred. The ratio's exponent is
-//! `2 * alpha * balance_raw - 12`: pinned empirically (not from spec
-//! text) by writing coupled CPE payloads with known asymmetric
-//! `(channel 0 raw, balance raw)` pairs through a decodable HE-AAC
-//! stream, decoding both channels' PCM with the reference decoder, and
-//! fitting the left/right energy ratio against the balance raw value --
-//! done separately for `bs_amp_res=0` (offset 12 in raw units, one
-//! exponent step per raw unit) and `bs_amp_res=1` (offset 6, two
-//! exponent steps per raw unit); both collapse to the same
-//! `2*alpha*raw - 12` form (`scripts/aac-tables/sbrpayload_fixtures.py`
-//! carries no permanent copy of the probe -- the fit is recorded here
-//! and in the project ledger).
+//! into `(env0, env1)` energies that are equal (and each equal to channel
+//! 0's plain energy) when the ratio is centred (ISO/IEC 14496-3
+//! §4.6.18.7.2): `ratio = 2^(pan - panOffset)`, `panOffset = 24` at
+//! `bs_amp_res=0` and `12` at `bs_amp_res=1`, `env0 = 2*Ecurr/(1+ratio)`,
+//! `env1 = 2*Ecurr*ratio/(1+ratio)`. A real coupled-CPE fixture
+//! (`heaac_44100_48k.m4a`, `coupled_cpe_channel_swap_probe`) settled this:
+//! its transmitted balance raw values cluster at 12 under `bs_amp_res=1`,
+//! matching a centred pan at `panOffset=12` exactly, and only this
+//! `ratio` shape (not the previous `2*alpha*raw - 12` exponent) plus
+//! keeping `env0`/`env1` on their own physical channel (not swapped
+//! into a `left`/`right` naming) reproduces the reference decoder's L/R
+//! assignment on that file.
 //!
 //! # Gain, limiter, noise, sinusoids
 //!
@@ -75,13 +74,33 @@ pub fn dequant_noise(q_q: i32) -> f64 {
 }
 
 /// De-mixes a coupled CPE's `(channel 0 raw, balance raw)` pair into
-/// `(left, right)` linear energies. See the module doc for the convention.
-pub fn dequant_pair(e0_raw: i32, e1_raw: i32, amp_res: u8) -> (f64, f64) {
-    let e0 = dequant_env(e0_raw, amp_res);
-    let ratio = 2f64.powf(2.0 * alpha(amp_res) * f64::from(e1_raw) - 12.0);
-    let left = 2.0 * e0 * ratio / (1.0 + ratio);
-    let right = 2.0 * e0 / (1.0 + ratio);
-    (left, right)
+/// `(env0, env1)` linear energies (ISO/IEC 14496-3 §4.6.18.7.2,
+/// `bs_coupling`): `Ecurr = dequant_env(e0_raw, amp_res)`,
+/// `ratio = 2^(pan - panOffset)` where `pan` is the RAW balance value
+/// (channels[1]'s `e_q`, not run through `alpha`/`amp_res` scaling) and
+/// `panOffset` is 24 at `bs_amp_res=0` (1.5 dB steps) or 12 at
+/// `bs_amp_res=1` (3 dB steps); `env0 = 2*Ecurr/(1+ratio)`,
+/// `env1 = 2*Ecurr*ratio/(1+ratio)`. The previous `2*alpha*raw - 12`
+/// exponent (doubling the step at `amp_res=1` and using the wrong offset
+/// at `amp_res=0`), combined with a `left`/`right` naming below that
+/// handed physical channel 0 the `env1` shape and channel 1 the `env0`
+/// shape, together produced a real-file coupled-CPE L/R swap
+/// (`coupled_cpe_channel_swap_probe`, ch0 correlated 0.98 against the
+/// REFERENCE's right channel, not its left). This stream's live balance
+/// raw values cluster at 12 (`amp_res=1`), matching a centred pan at
+/// `panOffset=12` exactly, confirming the offset direction empirically.
+/// `env_amp_res` scales `e0_raw` (forced to 0/1.5 dB on a single-envelope
+/// frame, mirroring `sbr_payload`'s own `amp_res_of`); `header_amp_res` is
+/// the SBR header's transmitted `bs_amp_res` field UNCONDITIONALLY, which
+/// governs `panOffset` regardless of the single-envelope override -- the
+/// two diverge on single-envelope coupled frames.
+pub fn dequant_pair(e0_raw: i32, pan_raw: i32, env_amp_res: u8, header_amp_res: u8) -> (f64, f64) {
+    let e_curr = dequant_env(e0_raw, env_amp_res);
+    let pan_offset = if header_amp_res != 0 { 12.0 } else { 24.0 };
+    let ratio = 2f64.powf(f64::from(pan_raw) - pan_offset);
+    let env0 = 2.0 * e_curr / (1.0 + ratio);
+    let env1 = 2.0 * e_curr * ratio / (1.0 + ratio);
+    (env0, env1)
 }
 
 /// Dequantizes one channel's envelopes and noise floors for one frame,
@@ -99,21 +118,16 @@ pub fn dequantize_frame(
     let amp_res = if c.e_q.len() == 1 { 0 } else { header.amp_res };
     let mut env = Vec::with_capacity(c.e_q.len());
     if coupling && channels.len() == 2 {
-        let (row0_src, row1_src, want_left) = if ch == 0 {
-            (0usize, 1usize, true)
-        } else {
-            (0usize, 1usize, false)
-        };
         for i in 0..c.e_q.len() {
-            let row0 = channels[row0_src].e_q.get(i);
-            let row1 = channels[row1_src].e_q.get(i);
+            let row0 = channels[0].e_q.get(i);
+            let row1 = channels[1].e_q.get(i);
             let len = c.e_q[i].len();
             let mut r = Vec::with_capacity(len);
             for b in 0..len {
                 let e0 = row0.and_then(|r| r.get(b)).copied().unwrap_or(0);
-                let e1 = row1.and_then(|r| r.get(b)).copied().unwrap_or(0);
-                let (left, right) = dequant_pair(e0, e1, amp_res);
-                r.push(if want_left { left } else { right });
+                let pan = row1.and_then(|r| r.get(b)).copied().unwrap_or(0);
+                let (env0, env1) = dequant_pair(e0, pan, amp_res, header.amp_res);
+                r.push(if ch == 0 { env0 } else { env1 });
             }
             env.push(r);
         }
@@ -1042,33 +1056,31 @@ mod tests {
 
     #[test]
     fn coupled_balance_round_trips_at_a_centred_ratio() {
-        // The ratio's exponent is `2*alpha*balance_raw - 12` (pinned against
-        // a reference decoder, see the module doc): it's centred at
-        // balance_raw=6 for amp_res=1 (alpha=1) and balance_raw=12 for
-        // amp_res=0 (alpha=0.5).
-        let (l, r) = dequant_pair(10, 6, 1);
-        let e0 = dequant_env(10, 1);
+        // The ratio's exponent is `pan_raw - panOffset` (ISO/IEC 14496-3
+        // §4.6.18.7.2, see the module doc): it's centred (ratio=1) at
+        // pan_raw=12 for amp_res=1 and pan_raw=24 for amp_res=0.
+        let (e0, e1) = dequant_pair(10, 12, 1, 1);
+        let e0_plain = dequant_env(10, 1);
         assert!(
-            (l - e0).abs() < 1e-6 && (r - e0).abs() < 1e-6,
-            "{l} {r} vs {e0}"
+            (e0 - e0_plain).abs() < 1e-6 && (e1 - e0_plain).abs() < 1e-6,
+            "{e0} {e1} vs {e0_plain}"
         );
-        let (l0, r0) = dequant_pair(10, 12, 0);
-        let e00 = dequant_env(10, 0);
+        let (e00, e10) = dequant_pair(10, 24, 0, 0);
+        let e00_plain = dequant_env(10, 0);
         assert!(
-            (l0 - e00).abs() < 1e-6 && (r0 - e00).abs() < 1e-6,
-            "{l0} {r0} vs {e00}"
+            (e00 - e00_plain).abs() < 1e-6 && (e10 - e00_plain).abs() < 1e-6,
+            "{e00} {e10} vs {e00_plain}"
         );
     }
 
     #[test]
     fn coupled_balance_shifts_energy_toward_the_channel_with_a_higher_raw_value() {
-        // Fit against the reference decoder's own PCM output (not spec
-        // text): as balance_raw grows past the centre, left grows toward
-        // `2*e0` and right shrinks toward 0, matching the measured PCM
-        // energy split for a real coupled CPE.
-        let (l_low, r_low) = dequant_pair(10, 0, 1);
-        let (l_high, r_high) = dequant_pair(10, 20, 1);
-        assert!(l_low < r_low, "{l_low} vs {r_low}");
-        assert!(l_high > r_high, "{l_high} vs {r_high}");
+        // §4.6.18.7.2: as the raw balance value grows past the centre
+        // (panOffset), env1 grows toward `2*Ecurr` and env0 shrinks toward
+        // 0 (env1's formula carries the `ratio` factor, env0's doesn't).
+        let (e0_low, e1_low) = dequant_pair(10, 0, 1, 1);
+        let (e0_high, e1_high) = dequant_pair(10, 24, 1, 1);
+        assert!(e0_low > e1_low, "{e0_low} vs {e1_low}");
+        assert!(e0_high < e1_high, "{e0_high} vs {e1_high}");
     }
 }
