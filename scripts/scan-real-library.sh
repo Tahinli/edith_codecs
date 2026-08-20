@@ -20,7 +20,7 @@ OUT=$FIXTURES/real-library-manifest.tsv
 command -v ffprobe >/dev/null || { echo "scan-real-library: ffprobe not found" >&2; exit 2; }
 
 DIRS=("$@")
-[ "${#DIRS[@]}" -eq 0 ] && DIRS=("$HOME/Videos" "$HOME/Downloads")
+[ "${#DIRS[@]}" -eq 0 ] && DIRS=("$HOME/Videos" "$HOME/Downloads" "$HOME/Music")
 
 EXTS=(mp4 m4v mov mkv webm avi flv ts m2ts mts wmv ogv
     mp3 m4a aac flac wav ogg oga opus wma ac3 eac3 alac aif aiff)
