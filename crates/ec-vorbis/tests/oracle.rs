@@ -561,61 +561,61 @@ fn busy(channels: usize, rate: u32, samples: usize) -> Vec<Vec<f32>> {
 /// does.
 #[test]
 fn onset_after_silence_has_no_pre_echo() {
+    // Two onsets: one off the block grid (0.9137 s lands mid short block) and
+    // one on it. The gap is measured over the WHOLE silence up to the onset,
+    // so a leak in the last few hundred samples before it cannot hide behind a
+    // guard band, and the peak is barred too.
     for rate in [44_100u32, 48_000] {
-        let silence = rate as usize;
-        let tone_len = rate as usize;
-        let mut left = vec![0.0f32; silence + tone_len];
-        let mut right = vec![0.0f32; silence + tone_len];
-        for i in 0..tone_len {
-            let t = i as f64 / f64::from(rate);
-            let v = (2.0 * std::f64::consts::PI * 1_000.0 * t).sin() as f32;
-            left[silence + i] = v;
-            right[silence + i] = v;
-        }
-        let source = vec![left, right];
-        let name = format!("onset-{rate}.ogg");
-        let path = encode_to_file(&source, rate, -1, &name);
+        for channels in [1usize, 2] {
+            for onset_s in [0.9137f64, 1.0] {
+                let onset = (onset_s * f64::from(rate)) as usize;
+                let tone_len = rate as usize;
+                let mut source = vec![vec![0.0f32; onset + tone_len]; channels];
+                for i in 0..tone_len {
+                    let t = i as f64 / f64::from(rate);
+                    let v = (0.7 * (2.0 * std::f64::consts::PI * 1_000.0 * t).sin()) as f32;
+                    for plane in &mut source {
+                        plane[onset + i] = v;
+                    }
+                }
+                let name = format!("onset-{rate}-{channels}ch-{onset}.ogg");
+                let path = encode_to_file(&source, rate, 128_000, &name);
 
-        // The reference oracle must decode the short-block stream cleanly:
-        // no warnings, let alone errors.
-        let warn = Command::new("ffmpeg")
-            .args(["-v", "warning", "-i"])
-            .arg(&path)
-            .args(["-f", "f32le", "-acodec", "pcm_f32le", "-"])
-            .output();
-        if let Ok(out) = warn {
-            assert!(
-                out.stderr.is_empty(),
-                "{name}: oracle decode warnings: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
+                // The reference oracle must decode the short-block stream
+                // cleanly: no warnings, let alone errors.
+                let warn = Command::new("ffmpeg")
+                    .args(["-v", "warning", "-i"])
+                    .arg(&path)
+                    .args(["-f", "f32le", "-acodec", "pcm_f32le", "-"])
+                    .output();
+                if let Ok(out) = warn {
+                    assert!(
+                        out.stderr.is_empty(),
+                        "{name}: oracle decode warnings: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                }
 
-        let window = |plane: &[f32], rate: u32| -> f64 {
-            let lo = (0.90 * f64::from(rate)) as usize;
-            let hi = ((0.995 * f64::from(rate)) as usize).min(plane.len());
-            let lo = lo.min(hi);
-            rms(&plane[lo..hi])
-        };
-        let tone_rms = {
-            let lo = silence + rate as usize / 20;
-            let hi = (silence + tone_len).min(silence + tone_len);
-            rms(&source[0][lo..hi])
-        };
-
-        let (ours, _) = our_decode(&path);
-        let gap = window(&ours[0], rate);
-        assert!(
-            gap <= 0.002 * tone_rms,
-            "{name}: our decode gap RMS {gap:.6} vs tone RMS {tone_rms:.6}"
-        );
-
-        if let Some((theirs, _)) = ffmpeg_decode(&path) {
-            let gap = window(&theirs[0], rate);
-            assert!(
-                gap <= 0.002 * tone_rms,
-                "{name}: oracle decode gap RMS {gap:.6} vs tone RMS {tone_rms:.6}"
-            );
+                let tone_rms = rms(&source[0][onset..]);
+                let check = |label: &str, planes: &[Vec<f32>]| {
+                    for (c, plane) in planes.iter().enumerate() {
+                        let gap = &plane[..onset.min(plane.len())];
+                        let gap_rms = rms(gap);
+                        let peak = gap.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+                        println!("{name}/{label} ch{c}: gap RMS {gap_rms:.6} peak {peak:.4}");
+                        assert!(
+                            gap_rms <= 0.002 * tone_rms,
+                            "{name}/{label} ch{c}: gap RMS {gap_rms:.6} vs tone RMS {tone_rms:.6}"
+                        );
+                        assert!(peak <= 0.007, "{name}/{label} ch{c}: gap peak {peak:.4}");
+                    }
+                };
+                let (ours, _) = our_decode(&path);
+                check("ours", &ours);
+                if let Some((theirs, _)) = ffmpeg_decode(&path) {
+                    check("oracle", &theirs);
+                }
+            }
         }
     }
 }
