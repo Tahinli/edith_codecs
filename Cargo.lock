@@ -347,8 +347,11 @@ dependencies = [
 name = "ec-matroska"
 version = "0.1.0"
 dependencies = [
+ "ec-aac",
+ "ec-ac3",
  "ec-core",
  "ec-inflate",
+ "ec-mp4",
 ]
 
 [[package]]
