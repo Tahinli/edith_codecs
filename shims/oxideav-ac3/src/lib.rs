@@ -23,6 +23,12 @@
 //!   [`CodecParameters::channels`] and `ec_ac3` takes a [`Downmix`] mode; the
 //!   factory translates. `Some(2)` is the A/52 §7.8 stereo fold the replica
 //!   asks for on anything wider than mono, `None` the stream's own layout.
+//!
+//! Encoding is not on the incumbent's own surface, so [`Ac3Encoder`] is
+//! shaped after this family's other software encoder shim instead —
+//! `rusty_aac::AacEncoder`'s `new`/`push_pcm_f32`/`next_packet`/
+//! `encoder_delay` — so an export path already wired to one SW audio
+//! encoder here can add this one the same way.
 
 #![forbid(unsafe_code)]
 
@@ -101,6 +107,49 @@ fn s16le(samples: &[u8]) -> Vec<u8> {
     out
 }
 
+/// How [`Ac3Encoder::new`] is configured.
+pub struct EncoderConfig {
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub bitrate_kbps: u32,
+}
+
+/// An AC-3 encoder: PCM in, syncframes out.
+pub struct Ac3Encoder(ec_ac3::Ac3Encoder);
+
+impl Ac3Encoder {
+    pub fn new(sample_rate: u32, channels: u16, bitrate_kbps: u32) -> Result<Ac3Encoder> {
+        Ok(Ac3Encoder(ec_ac3::Ac3Encoder::new(ec_ac3::EncoderConfig {
+            sample_rate,
+            channels,
+            bitrate_kbps,
+        })?))
+    }
+
+    /// Samples of priming delay before the first audible one; a muxer states
+    /// this on the track's edit list / codec delay.
+    pub fn encoder_delay(&self) -> usize {
+        self.0.encoder_delay()
+    }
+
+    /// Feeds interleaved `f32` PCM, family order (L, R, C, LFE, Ls, Rs).
+    pub fn push_pcm_f32(&mut self, interleaved: &[f32]) -> Result<()> {
+        Ok(self.0.push_pcm_f32(interleaved)?)
+    }
+
+    /// Ends the stream, padding and flushing the last frame.
+    pub fn finish(&mut self) {
+        self.0.finish();
+    }
+
+    /// The next encoded syncframe; [`oxideav_core::Error`] with the
+    /// underlying `Eof`/`NeedMore` distinction once drained after
+    /// [`Ac3Encoder::finish`] or before enough PCM has arrived.
+    pub fn next_packet(&mut self) -> Result<Vec<u8>> {
+        Ok(self.0.next_packet()?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,5 +174,78 @@ mod tests {
         assert!(registry.has_decoder(&CodecId::new("ac3")));
         assert!(registry.has_decoder(&CodecId::new("eac3")));
         assert!(!registry.has_decoder(&CodecId::new("truehd")));
+    }
+
+    /// One second of stereo through [`Ac3Encoder`], then back through this
+    /// shim's own decoder: after dropping the encoder's priming delay, the
+    /// two channels should still correlate almost perfectly with the source.
+    #[test]
+    fn encode_then_decode_round_trips() {
+        let sample_rate = 48000u32;
+        let seconds = 1.0f32;
+        let n = (sample_rate as f32 * seconds) as usize;
+        let mut pcm = vec![0.0f32; n * 2];
+        for i in 0..n {
+            let t = i as f32 / sample_rate as f32;
+            pcm[2 * i] = 0.4 * (2.0 * std::f32::consts::PI * 440.0 * t).sin();
+            pcm[2 * i + 1] = 0.4 * (2.0 * std::f32::consts::PI * 660.0 * t).sin();
+        }
+
+        let mut enc = Ac3Encoder::new(sample_rate, 2, 192).unwrap();
+        enc.push_pcm_f32(&pcm).unwrap();
+        enc.finish();
+        let mut bitstream = Vec::new();
+        loop {
+            match enc.next_packet() {
+                Ok(packet) => bitstream.extend_from_slice(&packet),
+                Err(_) => break,
+            }
+        }
+
+        let mut registry = CodecRegistry::new();
+        register_codecs(&mut registry);
+        let params = CodecParameters {
+            channels: Some(2),
+            ..CodecParameters::audio(CodecId::new("ac3"))
+        };
+        let mut dec = registry.first_decoder(&params).unwrap();
+
+        let mut decoded_s16: Vec<i16> = Vec::new();
+        let mut offset = 0;
+        while offset < bitstream.len() {
+            let len = ec_ac3::frame_size(&bitstream[offset..]).unwrap();
+            let packet = oxideav_core::Packet::new(
+                0,
+                oxideav_core::TimeBase::new(1, sample_rate.into()),
+                bitstream[offset..offset + len].to_vec(),
+            );
+            dec.send_packet(&packet).unwrap();
+            offset += len;
+            while let Ok(Frame::Audio(frame)) = dec.receive_frame() {
+                for plane in &frame.data {
+                    decoded_s16.extend(plane.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])));
+                }
+            }
+        }
+        let decoded: Vec<f32> = decoded_s16.iter().map(|&s| s as f32 / 32768.0).collect();
+
+        // Drop the encoder's priming delay (one block, both channels).
+        let delay = enc.encoder_delay() * 2;
+        let decoded = &decoded[delay.min(decoded.len())..];
+        let source = &pcm[..decoded.len().min(pcm.len())];
+        let decoded = &decoded[..source.len()];
+
+        let mean_s = source.iter().sum::<f32>() / source.len() as f32;
+        let mean_d = decoded.iter().sum::<f32>() / decoded.len() as f32;
+        let mut num = 0.0f64;
+        let (mut den_s, mut den_d) = (0.0f64, 0.0f64);
+        for (&s, &d) in source.iter().zip(decoded.iter()) {
+            let (s, d) = ((s - mean_s) as f64, (d - mean_d) as f64);
+            num += s * d;
+            den_s += s * s;
+            den_d += d * d;
+        }
+        let corr = num / (den_s.sqrt() * den_d.sqrt());
+        assert!(corr >= 0.99, "round-trip correlation too low: {corr}");
     }
 }
