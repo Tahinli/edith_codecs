@@ -98,6 +98,7 @@ impl Vp9Decoder {
                 (header.width, header.height),
                 session.coded_size,
                 session.bit_depth,
+                None,
             ));
             return Ok(());
         }
@@ -137,6 +138,7 @@ impl Vp9Decoder {
                 (header.width, header.height),
                 session.coded_size,
                 session.bit_depth,
+                None,
             ));
         }
         Ok(())
