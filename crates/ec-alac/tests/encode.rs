@@ -50,18 +50,47 @@ fn round_trip(sample_rate: u32, channels: u8, bit_depth: u8, frame_length: u32, 
     assert_eq!(decoded, samples, "{channels}ch {bit_depth}bit round trip");
 }
 
-/// One bit field starting at bit `start` of `data`, MSB-first — enough to
-/// reach into a compressed mono frame's plan header (which starts at bit 39:
-/// 3 element-tag + 16 instance/reserved + 1 partial + 2 bytes_shifted + 1
-/// escape + 8 mix_bits + 8 mix_res) without pulling in the decoder's own
-/// private bit reader.
-fn bits_at(data: &[u8], start: usize, n: usize) -> u32 {
-    let mut v = 0u32;
-    for i in 0..n {
-        let pos = start + i;
-        v = (v << 1) | u32::from((data[pos / 8] >> (7 - pos % 8)) & 1);
+/// Encode `samples` frame by frame through a real mp4 mux into a fresh temp
+/// file, returned with its directory (delete it when done).
+fn mux_to_m4a(enc: &AlacEncoder, channels: usize, sample_rate: u32, samples: &[i32]) -> (PathBuf, PathBuf) {
+    let mut mp4 = ec_mp4::Mp4Muxer::new(Cursor::new(Vec::new())).expect("muxer");
+    let time_base = TimeBase::new(1, i64::from(sample_rate));
+    let stream = mp4
+        .add_stream(StreamInfo::new(0, time_base, enc.codec_parameters().clone()))
+        .expect("add_stream");
+    let mut pts = 0i64;
+    for chunk in samples.chunks(4096 * channels) {
+        let n = chunk.len() / channels;
+        let data = enc.encode_frame(chunk);
+        let mut packet = Packet::new(stream, time_base, data).with_pts(pts);
+        packet.duration = Some(n as i64);
+        mp4.write_packet(&packet).expect("write_packet");
+        pts += n as i64;
     }
-    v
+    mp4.finish().expect("finish");
+    let bytes = mp4.into_inner().into_inner();
+    // Tests run in parallel in one process: a per-call serial keeps them out
+    // of each other's directories.
+    static SERIAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("ec-alac-mux-test-{}-{serial}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let out_path = dir.join("out.m4a");
+    std::fs::write(&out_path, &bytes).expect("write m4a");
+    (dir, out_path)
+}
+
+/// ffmpeg's decode of `path` in raw format `fmt`, or None when no oracle is
+/// installed.
+fn ffmpeg_decode(path: &Path, fmt: &str) -> Option<Vec<u8>> {
+    let decode = Command::new("ffmpeg")
+        .args(["-nostdin", "-v", "error", "-i"])
+        .arg(path)
+        .args(["-f", fmt, "-"])
+        .output()
+        .ok()?;
+    assert!(decode.status.success(), "{}", String::from_utf8_lossy(&decode.stderr));
+    Some(decode.stdout)
 }
 
 #[test]
@@ -92,11 +121,9 @@ fn twenty_four_bit_uses_byte_shift_when_cheaper() {
     let with_shift = AlacEncoder::new(spec.sample_rate, channels, 24, 4096).expect("encoder");
     let with_bytes: usize = samples.chunks(per_frame).map(|c| with_shift.encode_frame(c).len()).sum();
 
-    // SAFETY: single-threaded test-only env toggle, restored before return.
-    unsafe { std::env::set_var("EC_ALAC_NO_SHIFT", "1") };
-    let without_shift = AlacEncoder::new(spec.sample_rate, channels, 24, 4096).expect("encoder");
+    let mut without_shift = AlacEncoder::new(spec.sample_rate, channels, 24, 4096).expect("encoder");
+    without_shift.set_byte_shift(false);
     let without_bytes: usize = samples.chunks(per_frame).map(|c| without_shift.encode_frame(c).len()).sum();
-    unsafe { std::env::remove_var("EC_ALAC_NO_SHIFT") };
 
     eprintln!("24-bit shifted: {with_bytes} bytes, unshifted: {without_bytes} bytes");
     assert!(
@@ -106,25 +133,40 @@ fn twenty_four_bit_uses_byte_shift_when_cheaper() {
 }
 
 #[test]
-fn mode_one_is_chosen_on_smooth_signal() {
-    // A pure ramp: its first difference is a near-constant, which mode 1's
-    // extra difference squeezes to near zero — cheaper than any order-0
-    // filter's residual stream, which stays at the ramp's own value.
-    let n = 4096usize;
-    let samples: Vec<i32> = (0..n as i32).map(|i| 100 + i * 3).collect();
+fn twenty_four_bit_tonal_content_round_trips_bit_exactly() {
+    // A smooth tone's first residuals are far bigger than the coder's
+    // starting mean allows, so they go out as 24-bit raw escapes — the one
+    // Golomb shape random data (whole-frame escape) and 16-bit-derived 24-bit
+    // audio (bytes_shifted 1, 16 coded bits) never produce.
+    let mut rng = Rng(0x0bad_cafe);
+    let n = 4096 * 2 + 777;
+    for channels in [1u8, 2] {
+        let tone: Vec<i32> = (0..n * channels as usize)
+            .map(|i| (2000.0 * (i as f64 / 64.0).sin()) as i32)
+            .collect();
+        let wide: Vec<i32> = tone.iter().map(|&s| (s << 8) | (rng.next() & 0xff) as i32).collect();
+        for samples in [&tone, &wide] {
+            for allow_shift in [true, false] {
+                let mut enc = AlacEncoder::new(48_000, channels, 24, 4096).expect("encoder");
+                enc.set_byte_shift(allow_shift);
+                let mut dec = AlacDecoder::new(*enc.cookie());
+                let shift = enc.cookie().container_shift();
+                let mut decoded = Vec::new();
+                for chunk in samples.chunks(4096 * channels as usize) {
+                    decoded.extend(dec.decode(&enc.encode_frame(chunk)).expect("decode").iter().map(|&s| s >> shift));
+                }
+                assert_eq!(&decoded, samples, "{channels}ch 24-bit tone, shift={allow_shift}");
 
-    unsafe { std::env::set_var("EC_ALAC_MODE1", "1") };
-    let enc = AlacEncoder::new(48_000, 1, 16, 4096).expect("encoder");
-    let packet = enc.encode_frame(&samples);
-    unsafe { std::env::remove_var("EC_ALAC_MODE1") };
-
-    let mode = bits_at(&packet, 39, 4);
-    assert_eq!(mode, 1, "mode 1 should win the cost comparison on a pure ramp");
-
-    let mut dec = AlacDecoder::new(*enc.cookie());
-    let shift = enc.cookie().container_shift();
-    let decoded: Vec<i32> = dec.decode(&packet).expect("decode").iter().map(|&s| s >> shift).collect();
-    assert_eq!(decoded, samples, "mode 1 round trip");
+                // And the reference decoder agrees with what we wrote.
+                let (dir, out_path) = mux_to_m4a(&enc, channels as usize, 48_000, samples);
+                let got = ffmpeg_decode(&out_path, "s32le");
+                std::fs::remove_dir_all(&dir).ok();
+                let Some(got) = got else { continue };
+                let want: Vec<u8> = samples.iter().flat_map(|&s| (s << 8).to_le_bytes()).collect();
+                assert!(got == want, "{channels}ch 24-bit tone, shift={allow_shift}: reference decode differs");
+            }
+        }
+    }
 }
 
 #[test]
@@ -176,29 +218,7 @@ fn muxed_stream_is_alac_at_the_right_rate_and_ffmpeg_agrees() {
     let enc = AlacEncoder::new(spec.sample_rate, spec.channels as u8, spec.bits_per_sample as u8, 4096)
         .expect("encoder");
 
-    let mut mp4 = ec_mp4::Mp4Muxer::new(Cursor::new(Vec::new())).expect("muxer");
-    let time_base = TimeBase::new(1, i64::from(spec.sample_rate));
-    let stream = mp4
-        .add_stream(StreamInfo::new(0, time_base, enc.codec_parameters().clone()))
-        .expect("add_stream");
-
-    let per_frame = 4096 * spec.channels as usize;
-    let mut pts = 0i64;
-    for chunk in samples.chunks(per_frame) {
-        let n = chunk.len() / spec.channels as usize;
-        let data = enc.encode_frame(chunk);
-        let mut packet = Packet::new(stream, time_base, data).with_pts(pts);
-        packet.duration = Some(n as i64);
-        mp4.write_packet(&packet).expect("write_packet");
-        pts += n as i64;
-    }
-    mp4.finish().expect("finish");
-    let bytes = mp4.into_inner().into_inner();
-
-    let dir = std::env::temp_dir().join(format!("ec-alac-mux-test-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let out_path = dir.join("out.m4a");
-    std::fs::write(&out_path, &bytes).expect("write m4a");
+    let (dir, out_path) = mux_to_m4a(&enc, spec.channels as usize, spec.sample_rate, &samples);
 
     // Sanity without an oracle: our own demuxer/decoder reads it back
     // bit-exact against the source PCM.
@@ -243,16 +263,9 @@ fn muxed_stream_is_alac_at_the_right_rate_and_ffmpeg_agrees() {
     assert!(info.contains(&format!("sample_rate={}", spec.sample_rate)), "{info}");
     assert!(info.contains(&format!("channels={}", spec.channels)), "{info}");
 
-    let decode = Command::new("ffmpeg")
-        .args(["-nostdin", "-v", "error", "-i"])
-        .arg(&out_path)
-        .args(["-f", "s16le", "-"])
-        .output()
-        .expect("ffmpeg");
-    assert!(decode.status.success(), "{}", String::from_utf8_lossy(&decode.stderr));
+    let Some(stdout) = ffmpeg_decode(&out_path, "s16le") else { return };
     let want: Vec<i16> = samples.iter().map(|&s| s as i16).collect();
-    let got: Vec<i16> = decode
-        .stdout
+    let got: Vec<i16> = stdout
         .chunks_exact(2)
         .map(|c| i16::from_le_bytes([c[0], c[1]]))
         .collect();
