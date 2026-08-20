@@ -8,10 +8,12 @@
 //! use *is* the real decoder's state — there is no encoder-side model of the
 //! decoder that could drift.
 //!
-//! The excitation quantiser is deliberately simple (open-loop LPC residual,
-//! analysis-by-synthesis LTP codebook pick, nearest-level pulse rounding
-//! under the decoder's seed/offset convention). Noise shaping (NSQ), 10/40/60
-//! ms frames and stereo are subtask D2b.
+//! The excitation is coded by a noise-shaping quantiser: the decoder's
+//! output error is fed back through short-term (bandwidth-expanded LPC),
+//! harmonic and tilt shaping filters so the noise hides under the signal's
+//! own spectrum, and a gain-offset rate loop sizes each packet against
+//! [`SilkEncoder::set_bitrate`]. 10/40/60 ms frames and stereo are not
+//! written yet.
 
 // Same idiom as silk.rs: index loops mirror the decoder's position arithmetic.
 #![allow(clippy::needless_range_loop)]
@@ -48,7 +50,30 @@ pub struct SilkEncoder {
     final_range: u32,
     voiced_frames: usize,
     mirror_out: Vec<i16>,
+    target_bps: Option<u32>,
+    /// Bits the rate loop owes (+) or banked (-) against the target.
+    reservoir: f32,
+    /// Noise-shaping state: output error, its AR-filtered form, and the
+    /// shaped quantiser error, for the last frame.
+    shape_d: Vec<f32>,
+    shape_u: Vec<f32>,
+    shape_gq: Vec<f32>,
 }
+
+/// Noise-shaping constants: AR (denominator) and MA (numerator) bandwidth
+/// expansions of the LPC, harmonic comb depth, voiced spectral tilt, and the
+/// linear ratio of one gain-quantiser step (2^(1.365 dB / 6.02)).
+const SHAPE_AR: f32 = 0.96;
+const SHAPE_MA: f32 = 0.85;
+const SHAPE_HARMONIC: f32 = 0.3;
+const SHAPE_TILT: f32 = 0.1;
+const GAIN_STEP: f32 = 1.1702;
+/// Frames' worth of bits the rate loop may bank or borrow.
+const RESERVOIR_FRAMES: f32 = 4.0;
+/// Rate penalty per unit pulse magnitude in the quantiser's squared-error
+/// cost: a dead zone that lets the rate loop keep finer gains for the same
+/// bits (swept 0..2.5 on speech-like content; 1.5 maximised correlation).
+const PULSE_LAMBDA: f32 = 1.5;
 
 impl SilkEncoder {
     /// `wideband`: 16 kHz internal rate (TOC config 9), else 8 kHz (config 1).
@@ -64,6 +89,11 @@ impl SilkEncoder {
             final_range: 0,
             voiced_frames: 0,
             mirror_out: vec![0; 20 * 16],
+            target_bps: None,
+            reservoir: 0.0,
+            shape_d: vec![0.0; 20 * fs_khz],
+            shape_u: vec![0.0; 20 * fs_khz],
+            shape_gq: vec![0.0; 20 * fs_khz],
         }
     }
 
@@ -76,6 +106,12 @@ impl SilkEncoder {
     /// Frames so far coded with the long-term (pitch) predictor.
     pub fn voiced_frames(&self) -> usize {
         self.voiced_frames
+    }
+
+    /// Target bit rate in bits per second; `None` (the default) codes pulses
+    /// at unit excitation RMS with no rate loop.
+    pub fn set_bitrate(&mut self, bps: u32) {
+        self.target_bps = Some(bps);
     }
 
     /// Algorithmic delay in 48 kHz samples: the analysis resampler only
@@ -141,19 +177,6 @@ impl SilkEncoder {
         // Pitch / LTP.
         let pitch = estimate_pitch(&x, fs as i32, NB_SUBFR).filter(|p| p.voiced);
         let voiced = pitch.is_some();
-        let vad_flag = vad.active || voiced;
-        let signal_type: i32 = if !vad_flag { 0 } else if voiced { 2 } else { 1 };
-        let quant_offset_type = 0usize;
-        let offset = QUANTIZATION_OFFSETS_Q10[signal_type as usize >> 1][quant_offset_type] as f32
-            / 1024.0;
-
-        let ltp_scale_index = 0usize;
-        let ltp_scale = LTPSCALES_TABLE_Q14[ltp_scale_index] as f32 / 16384.0;
-        // `r`: LTP history in absolute sample units, past frame first (scaled
-        // by ltp_scale as the decoder scales its rebuilt history), then this
-        // frame's reconstructed residual as it is quantised.
-        let mut r: Vec<f32> = (-(n as isize)..0).map(|i| whiten(i) * ltp_scale).collect();
-        r.resize(2 * n, 0.0);
 
         let (lag_index, contour_index, pitch_l) = match &pitch {
             Some(p) => {
@@ -178,46 +201,85 @@ impl SilkEncoder {
                 _ => &LTP_GAIN_VQ_2,
             }
         };
-        // Gains: the open-loop excitation RMS per subframe (LTP vector picked
-        // against the unquantised residual), so pulses land around unit
-        // magnitude.
+
+        // Open-loop pass: the excitation RMS per subframe (best LTP vector
+        // against the unquantised residual) sets the gain targets; the tap sum
+        // of the best vector is the LTP gain that picks the scale index.
         let mut targets = [0i32; MAX_NB_SUBFR];
+        let mut ltp_gain = 0f32;
         {
-            let mut r_ol = r.clone();
-            r_ol[n..].copy_from_slice(&res);
+            let mut r_ol: Vec<f32> = (-(n as isize)..0).map(whiten).collect();
+            r_ol.extend_from_slice(&res);
             for k in 0..NB_SUBFR {
-                let e = if voiced {
+                let (e, gsum) = if voiced {
                     LTP_GAIN_VQ_2
                         .iter()
                         .map(|b| {
-                            (0..sub)
-                                .map(|i| {
-                                    let d = res[k * sub + i] - ltp_pred(&r_ol, b, k, i);
-                                    d * d
-                                })
-                                .sum::<f32>()
+                            let e = (0..sub)
+                                .map(|i| (res[k * sub + i] - ltp_pred(&r_ol, b, k, i)).powi(2))
+                                .sum::<f32>();
+                            (e, b.iter().map(|&v| v as f32 / 128.0).sum::<f32>())
                         })
-                        .fold(f32::INFINITY, f32::min)
+                        .fold((f32::INFINITY, 0.0), |a, b| if b.0 < a.0 { b } else { a })
                 } else {
-                    (0..sub).map(|i| res[k * sub + i].powi(2)).sum()
+                    ((0..sub).map(|i| res[k * sub + i].powi(2)).sum(), 0.0)
                 };
+                ltp_gain = ltp_gain.max(gsum);
                 let rms = (e / sub as f32).sqrt();
                 targets[k] = ((rms * 65536.0).round() as i64).clamp(1, i32::MAX as i64) as i32;
             }
         }
-        let (gain_idx, gains_q16) =
-            quantize_gains(&targets, &mut self.prev_gain_index, false, NB_SUBFR);
+        let vad_flag = vad.active || voiced;
+        let signal_type: i32 = if !vad_flag { 0 } else if voiced { 2 } else { 1 };
+        // Over-unity LTP gain: scale the previous frame's history down so
+        // quantisation error does not build up through the pitch loop.
+        let ltp_scale_index = if !voiced { 0 } else if ltp_gain > 1.25 { 2 } else if ltp_gain > 1.0 { 1 } else { 0 };
+        let ltp_scale = LTPSCALES_TABLE_Q14[ltp_scale_index] as f32 / 16384.0;
+        // Inactive or low-energy frames (and sparse voiced excitation) take the
+        // small quantisation offset; dense unvoiced excitation the large one.
+        let mean_rms = targets.iter().map(|&t| t as f32 / 65536.0).sum::<f32>() / NB_SUBFR as f32;
+        let quant_offset_type = usize::from(signal_type == 1 && mean_rms > 64.0);
+        let offset = QUANTIZATION_OFFSETS_Q10[signal_type as usize >> 1][quant_offset_type] as f32
+            / 1024.0;
 
-        // Excitation, closed loop: for each candidate LTP codebook, per
-        // subframe pick the vector that best predicts the residual from the
-        // *reconstructed* history (so quantisation noise fed back through the
-        // pitch loop is accounted for), then quantise the pulses sequentially
-        // under the decoder's seed-driven sign flips. Keep the codebook with
-        // the least reconstruction error.
+        // Noise shaping filters, from the bandwidth-expanded LPC: the output
+        // error d follows A(z/g2)(1 - tilt z^-1) / (A(z/g1)(1 - h z^-L)), i.e.
+        // the quantisation noise sits under the formants and, when voiced,
+        // under the harmonics, instead of being white at the decoder output.
+        let (g1, g2, tilt) = (SHAPE_AR, SHAPE_MA, if voiced { SHAPE_TILT } else { 0.0 });
+        let c: Vec<f32> = a.iter().enumerate().map(|(j, &aj)| aj * g1.powi(j as i32 + 1)).collect();
+        let b2: Vec<f32> = a.iter().enumerate().map(|(j, &aj)| aj * g2.powi(j as i32 + 1)).collect();
+        // (1 - B2(z))(1 - tilt z^-1) = 1 - NB(z).
+        let mut nb = vec![0f32; order + 1];
+        for j in 0..order {
+            nb[j] += b2[j];
+            nb[j + 1] -= tilt * b2[j];
+        }
+        nb[0] += tilt;
+        let harm = if voiced { SHAPE_HARMONIC * ltp_gain.clamp(0.0, 1.0) } else { 0.0 };
+
+        // `r`: LTP history in absolute sample units, past frame first (scaled
+        // by ltp_scale as the decoder scales its rebuilt history), then this
+        // frame's reconstructed residual as it is quantised.
+        let mut r: Vec<f32> = (-(n as isize)..0).map(|i| whiten(i) * ltp_scale).collect();
+        r.resize(2 * n, 0.0);
         let seed_index = 0i32;
-        let run = |per: usize| -> ([usize; MAX_NB_SUBFR], Vec<i32>, Vec<f32>, f32) {
+
+        // Noise-shaping quantiser, closed loop: per subframe pick the LTP
+        // vector that best predicts the residual from the *reconstructed*
+        // history, then quantise sample by sample with the shaped output error
+        // fed back into the target, under the decoder's seed-driven sign flips.
+        let run = |per: usize, gains_q16: &[i32; MAX_NB_SUBFR]| -> Run {
             let cbk = codebook(per);
             let mut r = r.clone();
+            let mut y = hist.clone();
+            y.resize(2 * n, 0.0);
+            let mut d = self.shape_d.clone();
+            d.resize(2 * n, 0.0);
+            let mut u = self.shape_u.clone();
+            u.resize(2 * n, 0.0);
+            let mut gq = self.shape_gq.clone();
+            gq.resize(2 * n, 0.0);
             let mut ltp_index = [0usize; MAX_NB_SUBFR];
             let mut pulses = vec![0i32; n];
             let mut seed = seed_index;
@@ -240,10 +302,18 @@ impl SilkEncoder {
                     }
                 }
                 let g = gains_q16[k] as f32 / 65536.0;
+                let lag = pitch_l[k] as usize;
                 for i in 0..sub {
                     let idx = k * sub + i;
+                    let p = n + idx;
+                    let lpc: f32 = a.iter().enumerate().map(|(j, &aj)| aj * y[p - 1 - j]).sum();
                     let pred = if voiced { ltp_pred(&r, &cbk[ltp_index[k]], k, i) } else { 0.0 };
-                    let e = (res[idx] - pred) / g;
+                    let mut s: f32 = c.iter().enumerate().map(|(j, &cj)| cj * d[p - 1 - j]).sum();
+                    s -= nb.iter().enumerate().map(|(j, &bj)| bj * gq[p - 1 - j]).sum::<f32>();
+                    if harm > 0.0 {
+                        s += harm * u[p - lag];
+                    }
+                    let e = (x[idx] - lpc - pred + s) / g;
                     seed = silk_rand(seed);
                     let flip = seed < 0;
                     let target = if flip { -e } else { e };
@@ -251,95 +321,150 @@ impl SilkEncoder {
                         let lvl = p as f32 - LEVEL_ADJUST * (p.signum() as f32);
                         lvl + offset
                     };
-                    let c = (target.round() as i32).clamp(-MAX_PULSE, MAX_PULSE);
-                    let p = [c - 1, c, c + 1]
+                    let c0 = (target.round() as i32).clamp(-MAX_PULSE, MAX_PULSE);
+                    let pl = [c0 - 1, c0, c0 + 1]
                         .into_iter()
                         .filter(|p| p.abs() <= MAX_PULSE)
                         .min_by(|&a, &b| {
-                            (recon(a) - target)
-                                .abs()
-                                .partial_cmp(&(recon(b) - target).abs())
-                                .unwrap()
+                            let cost = |p: i32| (recon(p) - target).powi(2) + PULSE_LAMBDA * p.abs() as f32;
+                            cost(a).partial_cmp(&cost(b)).unwrap()
                         })
                         .unwrap();
-                    pulses[idx] = p;
-                    seed = seed.wrapping_add(p);
-                    let exc = if flip { -recon(p) } else { recon(p) };
-                    r[n + idx] = g * exc + pred;
-                    err += (r[n + idx] - res[idx]).powi(2);
+                    pulses[idx] = pl;
+                    seed = seed.wrapping_add(pl);
+                    let exc = if flip { -recon(pl) } else { recon(pl) };
+                    r[p] = g * exc + pred;
+                    y[p] = r[p] + lpc;
+                    d[p] = y[p] - x[idx];
+                    gq[p] = d[p] - s;
+                    u[p] = d[p] - c.iter().enumerate().map(|(j, &cj)| cj * d[p - 1 - j]).sum::<f32>();
+                    err += d[p] * d[p];
                 }
             }
-            (ltp_index, pulses, r, err)
+            Run { ltp_index, pulses, err, d, u, gq }
         };
-        let candidates: Vec<usize> = if voiced { vec![0, 1, 2] } else { vec![0] };
-        let (per_index, (ltp_index, pulses, _, _)) = candidates
-            .into_iter()
-            .map(|per| (per, run(per)))
-            .min_by(|a, b| a.1 .3.partial_cmp(&b.1 .3).unwrap())
-            .unwrap();
 
-        // --- Bitstream, in decode()'s order. ---
-        let enc = &mut self.range;
-        enc.reset(1275);
-        enc.enc_bit_logp(vad_flag, 1); // VAD flag
-        enc.enc_bit_logp(false, 1); // LBRR flag
-        // Frame type.
-        if vad_flag {
-            enc.enc_icdf(((signal_type << 1) | quant_offset_type as i32) as usize - 2, &TYPE_OFFSET_VAD_ICDF, 8);
-        } else {
-            enc.enc_icdf(quant_offset_type, &TYPE_OFFSET_NO_VAD_ICDF, 8);
-        }
-        // Gains: one frame per packet, so always independently coded.
-        enc.enc_icdf((gain_idx[0] as usize) >> 3, &GAIN_ICDF[signal_type as usize], 8);
-        enc.enc_icdf((gain_idx[0] as usize) & 7, &UNIFORM8_ICDF, 8);
-        for k in 1..NB_SUBFR {
-            enc.enc_icdf(gain_idx[k] as usize, &DELTA_GAIN_ICDF, 8);
-        }
-        // NLSFs.
-        let cb = nlsf_cb(wb);
-        let stage1_icdf = &cb.cb1_icdf[(signal_type as usize >> 1) * cb.n_vectors..];
-        enc.enc_icdf(nq.indices[0] as usize, stage1_icdf, 8);
-        let (ec_ix, _) = crate::silk::nlsf_unpack(cb, nq.indices[0] as usize);
-        for i in 0..order {
-            let q = nq.indices[i + 1] as i32;
-            let icdf = &cb.ec_icdf[ec_ix[i] as usize..];
-            if q <= -4 {
-                enc.enc_icdf(0, icdf, 8);
-                enc.enc_icdf((-4 - q) as usize, &NLSF_EXT_ICDF, 8);
-            } else if q >= 4 {
-                enc.enc_icdf(8, icdf, 8);
-                enc.enc_icdf((q - 4) as usize, &NLSF_EXT_ICDF, 8);
+        // One full trial at a common gain offset (in quantiser steps): returns
+        // the coded packet body so the rate loop can read its exact size.
+        let candidates: Vec<usize> = if voiced { vec![0, 1, 2] } else { vec![0] };
+        let mut trial = |step: i32| -> Trial {
+            let scale = GAIN_STEP.powi(step);
+            let mut t = targets;
+            for v in t.iter_mut() {
+                *v = ((*v as f64 * scale as f64).round() as i64).clamp(1, i32::MAX as i64) as i32;
+            }
+            let mut prev_gain_index = self.prev_gain_index;
+            let (gain_idx, gains_q16) = quantize_gains(&t, &mut prev_gain_index, false, NB_SUBFR);
+            let (per_index, run) = candidates
+                .iter()
+                .map(|&per| (per, run(per, &gains_q16)))
+                .min_by(|a, b| a.1.err.partial_cmp(&b.1.err).unwrap())
+                .unwrap();
+
+            // --- Bitstream, in decode()'s order. ---
+            let enc = &mut self.range;
+            enc.reset(1275);
+            enc.enc_bit_logp(vad_flag, 1); // VAD flag
+            enc.enc_bit_logp(false, 1); // LBRR flag
+            // Frame type.
+            if vad_flag {
+                enc.enc_icdf(((signal_type << 1) | quant_offset_type as i32) as usize - 2, &TYPE_OFFSET_VAD_ICDF, 8);
             } else {
-                enc.enc_icdf((q + 4) as usize, icdf, 8);
+                enc.enc_icdf(quant_offset_type, &TYPE_OFFSET_NO_VAD_ICDF, 8);
             }
-        }
-        enc.enc_icdf(nq.interp_index as usize, &NLSF_INTERPOLATION_FACTOR_ICDF, 8);
-        // Pitch + LTP.
-        if voiced {
-            let half = fs as i32 >> 1;
-            enc.enc_icdf((lag_index / half) as usize, &PITCH_LAG_ICDF, 8);
-            let low_icdf: &[u8] = if wb { &UNIFORM8_ICDF } else { &UNIFORM4_ICDF };
-            enc.enc_icdf((lag_index % half) as usize, low_icdf, 8);
-            let contour_icdf: &[u8] = if wb { &PITCH_CONTOUR_ICDF } else { &PITCH_CONTOUR_NB_ICDF };
-            enc.enc_icdf(contour_index as usize, contour_icdf, 8);
-            enc.enc_icdf(per_index, &LTP_PER_INDEX_ICDF, 8);
-            let gain_icdf: &[u8] = match per_index {
-                0 => &LTP_GAIN_ICDF_0,
-                1 => &LTP_GAIN_ICDF_1,
-                _ => &LTP_GAIN_ICDF_2,
-            };
-            for k in 0..NB_SUBFR {
-                enc.enc_icdf(ltp_index[k], gain_icdf, 8);
+            // Gains: one frame per packet, so always independently coded.
+            enc.enc_icdf((gain_idx[0] as usize) >> 3, &GAIN_ICDF[signal_type as usize], 8);
+            enc.enc_icdf((gain_idx[0] as usize) & 7, &UNIFORM8_ICDF, 8);
+            for k in 1..NB_SUBFR {
+                enc.enc_icdf(gain_idx[k] as usize, &DELTA_GAIN_ICDF, 8);
             }
-            enc.enc_icdf(ltp_scale_index, &LTPSCALE_ICDF, 8);
-            self.voiced_frames += 1;
+            // NLSFs.
+            let cb = nlsf_cb(wb);
+            let stage1_icdf = &cb.cb1_icdf[(signal_type as usize >> 1) * cb.n_vectors..];
+            enc.enc_icdf(nq.indices[0] as usize, stage1_icdf, 8);
+            let (ec_ix, _) = crate::silk::nlsf_unpack(cb, nq.indices[0] as usize);
+            for i in 0..order {
+                let q = nq.indices[i + 1] as i32;
+                let icdf = &cb.ec_icdf[ec_ix[i] as usize..];
+                if q <= -4 {
+                    enc.enc_icdf(0, icdf, 8);
+                    enc.enc_icdf((-4 - q) as usize, &NLSF_EXT_ICDF, 8);
+                } else if q >= 4 {
+                    enc.enc_icdf(8, icdf, 8);
+                    enc.enc_icdf((q - 4) as usize, &NLSF_EXT_ICDF, 8);
+                } else {
+                    enc.enc_icdf((q + 4) as usize, icdf, 8);
+                }
+            }
+            enc.enc_icdf(nq.interp_index as usize, &NLSF_INTERPOLATION_FACTOR_ICDF, 8);
+            // Pitch + LTP. (One frame per packet: the decoder only takes the
+            // lag-delta code path for the 2nd+ frame of a packet, so the
+            // absolute lag is always coded here.)
+            if voiced {
+                let half = fs as i32 >> 1;
+                enc.enc_icdf((lag_index / half) as usize, &PITCH_LAG_ICDF, 8);
+                let low_icdf: &[u8] = if wb { &UNIFORM8_ICDF } else { &UNIFORM4_ICDF };
+                enc.enc_icdf((lag_index % half) as usize, low_icdf, 8);
+                let contour_icdf: &[u8] = if wb { &PITCH_CONTOUR_ICDF } else { &PITCH_CONTOUR_NB_ICDF };
+                enc.enc_icdf(contour_index as usize, contour_icdf, 8);
+                enc.enc_icdf(per_index, &LTP_PER_INDEX_ICDF, 8);
+                let gain_icdf: &[u8] = match per_index {
+                    0 => &LTP_GAIN_ICDF_0,
+                    1 => &LTP_GAIN_ICDF_1,
+                    _ => &LTP_GAIN_ICDF_2,
+                };
+                for k in 0..NB_SUBFR {
+                    enc.enc_icdf(run.ltp_index[k], gain_icdf, 8);
+                }
+                enc.enc_icdf(ltp_scale_index, &LTPSCALE_ICDF, 8);
+            }
+            enc.enc_icdf(seed_index as usize, &UNIFORM4_ICDF, 8);
+            encode_pulses(enc, &run.pulses, signal_type, quant_offset_type as i32);
+            enc.done();
+            debug_assert!(!enc.error());
+            let len = enc.range_bytes();
+            Trial { bytes: enc.data()[..len].to_vec(), range: enc.range(), prev_gain_index, run }
+        };
+
+        // Rate control: a common gain offset moves every subframe's pulse
+        // magnitudes together; the reservoir carries each packet's miss.
+        let mut best = trial(0);
+        if let Some(bps) = self.target_bps {
+            let frame_bits = bps as f32 * 0.02;
+            let target = frame_bits + self.reservoir.clamp(-frame_bits, frame_bits);
+            let bits_of = |t: &Trial| t.bytes.len() as f32 * 8.0;
+            let (mut s0, mut b0) = (0i32, bits_of(&best));
+            // Each quantiser step is ~0.227 bit per sample; a second trial
+            // corrects the slope from the first measurement.
+            let mut slope = 0.227 * n as f32;
+            for _ in 0..2 {
+                let step = s0 + ((b0 - target) / slope).round() as i32;
+                if step == s0 {
+                    break;
+                }
+                let t = trial(step);
+                let b1 = bits_of(&t);
+                if (b1 - target).abs() < (b0 - target).abs() {
+                    if b1 != b0 {
+                        slope = ((b1 - b0) / (step - s0) as f32).abs().max(1.0);
+                    }
+                    best = t;
+                    s0 = step;
+                    b0 = b1;
+                } else {
+                    break;
+                }
+            }
+            self.reservoir = (self.reservoir + frame_bits - b0).clamp(-RESERVOIR_FRAMES * frame_bits, RESERVOIR_FRAMES * frame_bits);
         }
-        enc.enc_icdf(seed_index as usize, &UNIFORM4_ICDF, 8);
-        encode_pulses(enc, &pulses, signal_type, quant_offset_type as i32);
-        enc.done();
-        debug_assert!(!enc.error());
-        let len = enc.range_bytes();
-        self.final_range = enc.range();
+        let Trial { bytes, range, prev_gain_index, run } = best;
+        let len = bytes.len();
+        self.prev_gain_index = prev_gain_index;
+        self.voiced_frames += usize::from(voiced);
+        self.final_range = range;
+        self.shape_d.copy_from_slice(&run.d[n..]);
+        self.shape_u.copy_from_slice(&run.u[n..]);
+        self.shape_gq.copy_from_slice(&run.gq[n..]);
 
         let toc = if wb { 9u8 << 3 } else { 1u8 << 3 };
         if out.len() < 1 + len {
@@ -350,7 +475,7 @@ impl SilkEncoder {
             )));
         }
         out[0] = toc;
-        out[1..1 + len].copy_from_slice(&enc.data()[..len]);
+        out[1..1 + len].copy_from_slice(&bytes);
 
         // Replay through the mirror so the next frame sees decoder state.
         let mut dec = RangeDecoder::new(&out[1..1 + len]);
@@ -360,6 +485,25 @@ impl SilkEncoder {
         Ok(1 + len)
     }
 }
+
+/// One closed-loop quantisation of a frame.
+struct Run {
+    ltp_index: [usize; MAX_NB_SUBFR],
+    pulses: Vec<i32>,
+    err: f32,
+    d: Vec<f32>,
+    u: Vec<f32>,
+    gq: Vec<f32>,
+}
+
+/// One coded candidate of a frame at a given gain offset.
+struct Trial {
+    bytes: Vec<u8>,
+    range: u32,
+    prev_gain_index: i32,
+    run: Run,
+}
+
 
 /// Bits an ICDF symbol costs, for choosing among equivalent codings.
 fn icdf_bits(k: usize, icdf: &[u8]) -> f32 {
