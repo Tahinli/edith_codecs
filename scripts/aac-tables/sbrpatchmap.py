@@ -107,6 +107,32 @@ import sbrtables as T  # noqa: E402
 SF_INDEX = 7
 RATE = 44100
 OUR_DECODER = os.path.expanduser("~/.cache/cargo-target-sbr/debug/examples/adts_to_pcm")
+# Round-32: field-by-field bisection (scripts/aac-tables/sbrbisect.py) proved
+# stream_one_band's bit construction ALREADY engages the reference's SBR
+# dequant once wrapped in an explicit-SBR ASC (env0 sweep moves in-band power
+# ~1e12x, warning fires once at stream head only, PCM length doubles) --
+# every flip tried (header, core content, delta words) engaged identically.
+# The round-30/31 "flat" reading was this module still calling `P.decode`
+# (bare ADTS, implicit per-frame detection) on the reference side while
+# `wrap_sbr` (round-31) sat unused; `ref_decode` below is the fix.
+WRAP_SBR = os.path.expanduser("~/.cache/cargo-target-sbr/debug/examples/wrap_sbr")
+
+
+def ref_decode(frames, tag):
+    assert os.path.exists(WRAP_SBR), f"build first: cargo build -p ec-aac --example wrap_sbr ({WRAP_SBR})"
+    raw = f"/tmp/sbrpatchmap-ref-{tag}.aac"
+    mp4 = f"/tmp/sbrpatchmap-ref-{tag}.mp4"
+    with open(raw, "wb") as f:
+        f.write(b"".join(frames))
+    r = subprocess.run([WRAP_SBR, raw, "22050", "44100", "1", mp4], capture_output=True)
+    assert r.returncode == 0, f"wrap_sbr failed: {r.stderr.decode()}"
+    dec = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", mp4, "-f", "f32le", "-ac", "1", "-"],
+        capture_output=True,
+    )
+    os.remove(raw)
+    os.remove(mp4)
+    return np.frombuffer(dec.stdout, dtype="<f4").astype(np.float64), dec.stderr.decode(errors="replace")
 BAND_HZ = RATE / 128  # QMF band width, both source and target index units
 # Round-30 fix: a source (low) QMF band is 32 core-MDCT bins wide (1024-bin
 # core MDCT / 32 core bands), not 16 -- every prior round's k = p*16 + offset
@@ -305,7 +331,7 @@ def run_header(label, start_freq, stop_freq, freq_scale, alter_scale, noise_band
     our_sane = True
     for p in range(kx):
         frames = stream_one_band(cfg, tables, p)
-        pcm_ref, err_ref = P.decode(frames, SF_INDEX, f"{label}-p{p}")
+        pcm_ref, err_ref = ref_decode(frames, f"{label}-p{p}")
         pcm_our, err_our = our_decode(frames, f"{label}-p{p}")
         if NO_QUANT_WARNING in err_ref:
             warnings_seen.append(p)
