@@ -15,24 +15,31 @@
 use ec_h264_syntax::SliceType;
 use wide::i16x16;
 
-use crate::decoder::{MbNeighbors, chroma_nz_pair, gather_nbr4, luma_nz_pair, mb_neighbors};
+use crate::decoder::{
+    MbNeighbors, chroma_nz_pair, gather_nbr4, gather_nbr8, luma_nz_pair, mb_neighbors,
+};
 use crate::dpb::{BLK_SKIP, Picture};
 use crate::entropy::{
-    BlockCat, FLAG_CHROMA_PRED, FLAG_DECODED, FLAG_I16, FLAG_INTER, FLAG_SKIP, MbCtx, MbInfo,
+    BlockCat, FLAG_CHROMA_PRED, FLAG_DECODED, FLAG_I16, FLAG_INTER, FLAG_SKIP, FLAG_TRANS8X8,
+    MbCtx, MbInfo,
 };
 use crate::inter::{RefPlane, integer_origin, mc_chroma, mc_luma};
 use crate::mv::{MvCtx, neighbour_mvd, predict_mv, write_block, write_intra_mb, write_mvd};
-use crate::pred::{PlaneWindow, add_residual_4x4, pred_4x4, pred_16x16, pred_chroma_8x8};
+use crate::pred::{
+    PlaneWindow, add_residual_4x4, add_residual_8x8, filter_nbr8, pred_4x4, pred_8x8, pred_16x16,
+    pred_chroma_8x8,
+};
 use crate::tables::{BLK4_POS, CHROMA_QP};
 use crate::transform::{
-    LevelScale4x4, chroma_dc_transform_420, dequant_4x4, inverse_transform_4x4, luma_dc_transform,
-    unzigzag, unzigzag_ac15,
+    LevelScale4x4, LevelScale8x8, chroma_dc_transform_420, dequant_4x4, dequant_8x8,
+    inverse_transform_4x4, inverse_transform_8x8, luma_dc_transform, unzigzag, unzigzag_8x8,
+    unzigzag_ac15,
 };
 
-use super::entropy::EncEntropy;
+use super::entropy::{EncEntropy, sub_block_4x4};
 use super::quant::{
-    forward_4x4, forward_hadamard_2x2, forward_hadamard_4x4, quant_4x4, quant_chroma_dc,
-    quant_luma_dc,
+    forward_4x4, forward_8x8, forward_hadamard_2x2, forward_hadamard_4x4, quant_4x4, quant_8x8,
+    quant_chroma_dc, quant_luma_dc,
 };
 
 /// Speed/quality ladder. Two rungs, because the two the incumbent exposed are
@@ -71,7 +78,11 @@ pub(crate) struct MbEnc<'a> {
     /// Lagrangian multiplier in the SATD domain.
     pub lambda: i32,
     pub preset: Preset,
+    /// The PPS carries transform_8x8_mode_flag: transform_size_8x8_flag must
+    /// be written for every eligible macroblock (7.3.5).
+    pub transform_8x8: bool,
     pub ls: LevelScale4x4,
+    pub ls8: LevelScale8x8,
     /// Neighbourhood of the macroblock being written (CABAC).
     pub mb_ctx: MbCtx,
     /// ctxIdxInc for this macroblock's mb_skip_flag.
@@ -82,12 +93,15 @@ pub(crate) struct MbEnc<'a> {
 }
 
 /// Quantised levels of one macroblock, scan order per block.
-#[derive(Default)]
 struct Levels {
     /// Luma AC/4x4 blocks in Z-order; only `[..15]` is used under Intra_16x16.
     luma: [[i32; 16]; 16],
     /// Non-zero count per luma block, Z-order.
     luma_nz: [u8; 16],
+    /// transform_size_8x8_flag: the luma residual is `luma8`, not `luma`.
+    trans8: bool,
+    /// Luma 8x8 blocks in 8x8 zig-zag order.
+    luma8: [[i32; 64]; 4],
     /// Intra_16x16 luma DC, scan order.
     dc: [i32; 16],
     /// Chroma DC per component.
@@ -97,6 +111,23 @@ struct Levels {
     chroma_nz: [[u8; 4]; 2],
     cbp_luma: u8,
     cbp_chroma: u8,
+}
+
+impl Default for Levels {
+    fn default() -> Levels {
+        Levels {
+            luma: [[0; 16]; 16],
+            luma_nz: [0; 16],
+            trans8: false,
+            luma8: [[0; 64]; 4],
+            dc: [0; 16],
+            chroma_dc: [[0; 16]; 2],
+            chroma: [[[0; 16]; 4]; 2],
+            chroma_nz: [[0; 4]; 2],
+            cbp_luma: 0,
+            cbp_chroma: 0,
+        }
+    }
 }
 
 /// 4x4 Hadamard sum of absolute transformed differences between the source at
@@ -662,10 +693,10 @@ const ZERO_BLOCK_LAMBDA: f64 = 0.4;
 
 /// The rate-distortion test behind the per-block zero decision: coding the
 /// block has to buy more squared error than its bits are worth.
-fn worth_coding(source: &[i32; 16], resid: &[i32; 16], levels: &[i32; 16], qp: i32) -> bool {
+fn worth_coding(source: &[i32], resid: &[i32], levels: &[i32], qp: i32) -> bool {
     let mut ssd_zero = 0i64;
     let mut ssd_coded = 0i64;
-    for i in 0..16 {
+    for i in 0..source.len() {
         let z = i64::from(source[i]);
         let c = i64::from(source[i] - resid[i]);
         ssd_zero += z * z;
@@ -1027,6 +1058,136 @@ fn code_intra_4x4(
     (modes, pred_modes)
 }
 
+/// Predicted Intra_8x8 mode of `blk8` (8.3.2.1): the decoder's rule, read
+/// from the 4x4 slots every size writes its mode into.
+fn predicted_mode8(pic: &Picture, nbr: &MbNeighbors, bx: usize, by: usize, blk8: usize) -> u8 {
+    let w4 = pic.mb_w * 4;
+    let left_avail = if blk8.is_multiple_of(2) { nbr.a } else { true };
+    let top_avail = if blk8 < 2 { nbr.b } else { true };
+    if left_avail && top_avail {
+        pic.i4_modes[by * w4 + bx - 1].min(pic.i4_modes[(by - 1) * w4 + bx])
+    } else {
+        2
+    }
+}
+
+/// Residual of one 8x8 luma block against the prediction already in the
+/// plane: forward transform, quantise, and — when anything survives —
+/// reconstruct with the decoder's own inverse. Returns the non-zero count.
+fn code_block_8x8(
+    pic: &mut Picture,
+    e: &MbEnc<'_>,
+    x: usize,
+    y: usize,
+    qp: i32,
+    intra: bool,
+    out: &mut [i32; 64],
+) -> u8 {
+    let stride = pic.y.stride;
+    let origin = pic.y.at(x, y);
+    let mut d = [0i32; 64];
+    for ry in 0..8 {
+        for rx in 0..8 {
+            d[ry * 8 + rx] = i32::from(e.src.y[(y + ry) * e.src.stride + x + rx])
+                - i32::from(pic.y.data[origin + ry * stride + rx]);
+        }
+    }
+    let nz = quant_8x8(&forward_8x8(&d), &e.ls8, qp, intra, out);
+    if nz == 0 {
+        return 0;
+    }
+    let mut raster = [0i32; 64];
+    unzigzag_8x8(out, &mut raster);
+    dequant_8x8(&mut raster, &e.ls8, qp);
+    let mut resid = [0i32; 64];
+    inverse_transform_8x8(&raster, &mut resid);
+    if !intra && !worth_coding(&d, &resid, out, qp) {
+        *out = [0; 64];
+        return 0;
+    }
+    add_residual_8x8(&mut pic.y.data, stride, origin, &resid);
+    nz
+}
+
+/// Code the luma of an Intra_8x8 macroblock, the 8x8 sibling of
+/// [`code_intra_4x4`]: neighbours are the decoder's filtered reference
+/// samples, and every 4x4 mode slot of a block carries its mode.
+fn code_intra_8x8(
+    pic: &mut Picture,
+    e: &MbEnc<'_>,
+    mb_x: usize,
+    mb_y: usize,
+    qp: i32,
+    nbr: &MbNeighbors,
+    lv: &mut Levels,
+) -> ([u8; 4], [u8; 4]) {
+    let w4 = pic.mb_w * 4;
+    let mut modes = [2u8; 4];
+    let mut pred_modes = [2u8; 4];
+    lv.trans8 = true;
+    for blk8 in 0..4 {
+        let (bx, by) = (mb_x * 4 + (blk8 % 2) * 2, mb_y * 4 + (blk8 / 2) * 2);
+        let (x, y) = (mb_x * 16 + (blk8 % 2) * 8, mb_y * 16 + (blk8 / 2) * 8);
+        let predicted = predicted_mode8(pic, nbr, bx, by, blk8);
+        pred_modes[blk8] = predicted;
+        let n = filter_nbr8(&gather_nbr8(pic, nbr, blk8, x, y));
+        let allowed = modes_allowed(n.have_top, n.have_left, n.have_tl);
+        let mut best = (i32::MAX, predicted.min(2));
+        let mut p = [0u8; 64];
+        for mode in 0..9u8 {
+            if !allowed[mode as usize] {
+                continue;
+            }
+            pred_8x8(mode, &n, &mut p);
+            let bits = if mode == predicted { 1 } else { 4 };
+            let mut c = e.lambda * bits;
+            for q in 0..4 {
+                let (ox, oy) = ((q % 2) * 4, (q / 2) * 4);
+                c += satd4(&e.src.y, e.src.stride, x + ox, y + oy, &p[oy * 8 + ox..], 8);
+            }
+            if c < best.0 {
+                best = (c, mode);
+            }
+        }
+        let mode = best.1;
+        modes[blk8] = mode;
+        for dy in 0..2 {
+            let base = (by + dy) * w4 + bx;
+            pic.i4_modes[base..base + 2].fill(mode);
+        }
+        pred_8x8(mode, &n, &mut p);
+        let stride = pic.y.stride;
+        let origin = pic.y.at(x, y);
+        for ry in 0..8 {
+            let row = origin + ry * stride;
+            pic.y.data[row..row + 8].copy_from_slice(&p[ry * 8..ry * 8 + 8]);
+        }
+        if code_block_8x8(pic, e, x, y, qp, true, &mut lv.luma8[blk8]) > 0 {
+            lv.cbp_luma |= 1 << blk8;
+        }
+    }
+    (modes, pred_modes)
+}
+
+/// The inter residual under the 8x8 transform, prediction already in the
+/// plane: the sibling of [`code_luma_4x4`].
+fn code_luma_8x8(
+    pic: &mut Picture,
+    e: &MbEnc<'_>,
+    mb_x: usize,
+    mb_y: usize,
+    qp: i32,
+    lv: &mut Levels,
+) {
+    lv.trans8 = true;
+    for blk8 in 0..4 {
+        let (x, y) = (mb_x * 16 + (blk8 % 2) * 8, mb_y * 16 + (blk8 / 2) * 8);
+        if code_block_8x8(pic, e, x, y, qp, false, &mut lv.luma8[blk8]) > 0 {
+            lv.cbp_luma |= 1 << blk8;
+        }
+    }
+}
+
 /// Squared error of the luma macroblock against the source.
 fn ssd_luma(pic: &Picture, e: &MbEnc<'_>, mb_x: usize, mb_y: usize) -> i64 {
     let stride = pic.y.stride;
@@ -1061,14 +1222,14 @@ fn restore_luma(pic: &mut Picture, mb_x: usize, mb_y: usize, src: &[u8; 256]) {
 
 /// Bits the luma residual and the mode signalling of an intra macroblock cost,
 /// to the accuracy the mode decision needs.
-fn intra_bits(lv: &Levels, i4: Option<(&[u8; 16], &[u8; 16])>) -> i64 {
+fn intra_bits(lv: &Levels, i4: Option<(&[u8], &[u8])>) -> i64 {
     let mut bits = estimate_luma_bits(lv);
     match i4 {
-        // Sixteen mode signals plus the coded_block_pattern the 16x16 form
-        // derives from its macroblock type instead.
+        // Sixteen (or four) mode signals plus the coded_block_pattern the
+        // 16x16 form derives from its macroblock type instead.
         Some((modes, pred)) => {
             bits += 6;
-            for blk in 0..16 {
+            for blk in 0..modes.len() {
                 bits += if modes[blk] == pred[blk] { 1 } else { 4 };
             }
         }
@@ -1102,7 +1263,10 @@ fn encode_intra_mb(
     let mut lv = Levels::default();
     let mut modes = [2u8; 16];
     let mut pred_modes = [2u8; 16];
+    let mut modes8 = [2u8; 4];
+    let mut pred_modes8 = [2u8; 4];
     let mut use_i4 = false;
+    let mut use_i8 = false;
 
     if cost.allow_i4 {
         let mut lv4 = Levels::default();
@@ -1117,12 +1281,37 @@ fn encode_intra_mb(
             modes4[blk] = pic.i4_modes[(by0 + dy as usize) * w4 + bx0 + dx as usize];
         }
 
+        // Intra_8x8 on the same terms, when the PPS allows it.
+        let mut lv8 = Levels::default();
+        let mut recon8 = [0u8; 256];
+        let cost8 = if e.transform_8x8 {
+            let (m8, p8) = code_intra_8x8(pic, e, mb_x, mb_y, qp, &nbr, &mut lv8);
+            modes8 = m8;
+            pred_modes8 = p8;
+            save_luma(pic, mb_x, mb_y, &mut recon8);
+            ssd_luma(pic, e, mb_x, mb_y) as f64
+                + lambda_ssd(qp) * intra_bits(&lv8, Some((&m8, &p8))) as f64
+        } else {
+            f64::INFINITY
+        };
+
         let mut lv16 = Levels::default();
         code_i16_luma(pic, e, mb_x, mb_y, qp, cost.i16_mode, &nbr, &mut lv16);
         let cost16 =
             ssd_luma(pic, e, mb_x, mb_y) as f64 + lambda_ssd(qp) * intra_bits(&lv16, None) as f64;
 
-        if cost4 <= cost16 {
+        if cost8 <= cost4 && cost8 <= cost16 {
+            use_i4 = true;
+            use_i8 = true;
+            restore_luma(pic, mb_x, mb_y, &recon8);
+            for blk8 in 0..4 {
+                for dy in 0..2 {
+                    let base = (by0 + (blk8 / 2) * 2 + dy) * w4 + bx0 + (blk8 % 2) * 2;
+                    pic.i4_modes[base..base + 2].fill(modes8[blk8]);
+                }
+            }
+            lv = lv8;
+        } else if cost4 <= cost16 {
             use_i4 = true;
             restore_luma(pic, mb_x, mb_y, &recon4);
             for blk in 0..16 {
@@ -1157,7 +1346,17 @@ fn encode_intra_mb(
     let offset = if p_slice { 5 } else { 0 };
     w.mb_type(p_slice, intra_type + offset);
     if use_i4 {
-        for blk in 0..16 {
+        if e.transform_8x8 {
+            w.transform_size_8x8_flag(use_i8);
+        }
+        // prev_intra8x8_pred_mode_flag / rem_intra8x8_pred_mode share the 4x4
+        // elements' binarisation and contexts (9.3.2.2, Table 9-34).
+        let (modes, pred_modes): (&[u8], &[u8]) = if use_i8 {
+            (&modes8, &pred_modes8)
+        } else {
+            (&modes, &pred_modes)
+        };
+        for blk in 0..modes.len() {
             let rem = if modes[blk] == pred_modes[blk] {
                 None
             } else if modes[blk] > pred_modes[blk] {
@@ -1223,6 +1422,19 @@ fn ssd_mb(pic: &Picture, e: &MbEnc<'_>, mb_x: usize, mb_y: usize) -> i64 {
 /// Rough bit cost of a macroblock's luma residual.
 fn estimate_luma_bits(lv: &Levels) -> i64 {
     let mut bits = 0;
+    if lv.trans8 {
+        for blk8 in 0..4 {
+            if lv.cbp_luma & (1 << blk8) != 0 {
+                // A level's position costs two more bits in a 64-coefficient
+                // significance map than in a 16-coefficient one; measured
+                // against the coded size on the text clip, without this the
+                // estimate undercharges Intra_8x8 by ~44 bits a macroblock.
+                let b = &lv.luma8[blk8];
+                bits += block_bits(b) + 2 * b.iter().filter(|&&l| l != 0).count() as i64;
+            }
+        }
+        return bits;
+    }
     for blk in 0..16 {
         if lv.cbp_luma & (1 << (blk >> 2)) != 0 {
             bits += block_bits(&lv.luma[blk]);
@@ -1249,12 +1461,7 @@ fn block_bits(b: &[i32]) -> i64 {
 /// Rough bit cost of a macroblock's residual, for the skip decision: a level
 /// costs its magnitude's exp-Golomb-ish width, a coded block its token.
 fn estimate_bits(lv: &Levels) -> i64 {
-    let mut bits = 10i64;
-    for blk in 0..16 {
-        if lv.cbp_luma & (1 << (blk >> 2)) != 0 {
-            bits += block_bits(&lv.luma[blk]);
-        }
-    }
+    let mut bits = 10 + estimate_luma_bits(lv);
     if lv.cbp_chroma != 0 {
         for comp in 0..2 {
             bits += block_bits(&lv.chroma_dc[comp][..4]);
@@ -1407,7 +1614,29 @@ fn encode_inter_mb(
     let may_skip = choice.prefer_skip;
     let ssd_skip = may_skip.then(|| ssd_mb(pic, e, mb_x, mb_y));
     let mut lv = Levels::default();
-    code_luma_4x4(pic, e, mb_x, mb_y, qp, false, &mut lv);
+    if e.transform_8x8 {
+        // Both transform sizes on the same prediction; the cheaper
+        // rate-distortion cost is coded.
+        let mut pred = [0u8; 256];
+        save_luma(pic, mb_x, mb_y, &mut pred);
+        code_luma_4x4(pic, e, mb_x, mb_y, qp, false, &mut lv);
+        let cost4 =
+            ssd_luma(pic, e, mb_x, mb_y) as f64 + lambda_ssd(qp) * estimate_luma_bits(&lv) as f64;
+        let mut recon4 = [0u8; 256];
+        save_luma(pic, mb_x, mb_y, &mut recon4);
+        restore_luma(pic, mb_x, mb_y, &pred);
+        let mut lv8 = Levels::default();
+        code_luma_8x8(pic, e, mb_x, mb_y, qp, &mut lv8);
+        let cost8 =
+            ssd_luma(pic, e, mb_x, mb_y) as f64 + lambda_ssd(qp) * estimate_luma_bits(&lv8) as f64;
+        if cost8 < cost4 {
+            lv = lv8;
+        } else {
+            restore_luma(pic, mb_x, mb_y, &recon4);
+        }
+    } else {
+        code_luma_4x4(pic, e, mb_x, mb_y, qp, false, &mut lv);
+    }
     code_chroma(pic, e, mb_x, mb_y, qp, false, &mut lv);
     let empty = lv.cbp_luma == 0 && lv.cbp_chroma == 0;
     let skip = match ssd_skip {
@@ -1473,6 +1702,11 @@ fn encode_inter_mb(
         }
     }
     w.coded_block_pattern(lv.cbp_luma, lv.cbp_chroma, false);
+    // Every shape this encoder emits is 8x8-aligned, so the decoder reads the
+    // flag whenever luma is coded.
+    if lv.cbp_luma != 0 && e.transform_8x8 {
+        w.transform_size_8x8_flag(lv.trans8);
+    }
     finish_mb(
         pic,
         e,
@@ -1533,6 +1767,12 @@ fn finish_mb(
     pic.mb_flags[mb_addr] = FLAG_DECODED
         | if m.is_i16 { FLAG_I16 } else { 0 }
         | if m.intra { 0 } else { FLAG_INTER }
+        // The flag only reaches the stream when the decoder reads it (7.3.5).
+        | if lv.trans8 && (m.intra || lv.cbp_luma != 0) {
+            FLAG_TRANS8X8
+        } else {
+            0
+        }
         | if m.intra && m.chroma_mode != 0 {
             FLAG_CHROMA_PRED
         } else {
@@ -1549,7 +1789,38 @@ fn finish_mb(
         let tc = w.residual_block(&lv.dc, BlockCat::LumaDc, na, nb);
         dc_cbf |= u8::from(tc != 0);
     }
+    if lv.trans8 {
+        // The decoder's 8x8 branch: CABAC codes one cat-5 block and reports
+        // its count in every 4x4 slot; CAVLC codes four interleaved 4x4
+        // blocks, each with its own nC and count.
+        for blk8 in 0..4 {
+            let (bx, by) = (bx0 + (blk8 % 2) * 2, by0 + (blk8 / 2) * 2);
+            if lv.cbp_luma & (1 << blk8) == 0 {
+                for dy in 0..2 {
+                    let base = (by + dy) * w4 + bx;
+                    pic.nz_y[base..base + 2].fill(0);
+                }
+            } else if w.is_cabac() {
+                let tc = w.residual_block(&lv.luma8[blk8], BlockCat::Luma8x8, None, None);
+                for dy in 0..2 {
+                    let base = (by + dy) * w4 + bx;
+                    pic.nz_y[base..base + 2].fill(tc.min(16));
+                }
+            } else {
+                for i4 in 0..4 {
+                    let (dx, dy) = BLK4_POS[blk8 * 4 + i4];
+                    let (sx, sy) = (bx0 + dx as usize, by0 + dy as usize);
+                    let (na, nb) = luma_nz_pair(pic, nbr, sx, sy);
+                    let sub = sub_block_4x4(&lv.luma8[blk8], i4);
+                    pic.nz_y[sy * w4 + sx] = w.residual_block(&sub, BlockCat::Luma4x4, na, nb);
+                }
+            }
+        }
+    }
     for blk in 0..16 {
+        if lv.trans8 {
+            break;
+        }
         let (dx, dy) = BLK4_POS[blk];
         let (bx, by) = (bx0 + dx as usize, by0 + dy as usize);
         let group = 1 << (blk >> 2);
