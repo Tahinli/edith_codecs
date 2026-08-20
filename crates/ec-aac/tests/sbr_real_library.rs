@@ -1156,6 +1156,126 @@ fn hf_complex_ratio_trajectory(
     out
 }
 
+/// Round-45, Task 3 THIRD WITNESS. Every prior round compared OURS against
+/// the REFERENCE directly -- a pairwise measurement that can never say which
+/// side is wrong when they disagree. This builds a reference-free model: a
+/// pure "plain patch-copy + per-band energy match" reconstruction of HF
+/// content from the REFERENCE's own LOW band (the one piece of ground truth
+/// both decoders start from and our own low-band round-trip already measures
+/// as near-identity), using the verified patch map
+/// `[(0,14,14),(3,28,11),(0,39,3),(13,42,1)]` and this file's own established
+/// `band_hz = rate/256`, `BINS_PER_SBR_BAND = FFT_LEN/256 = 8` convention
+/// (round-14/16; NOT the `rate/128` scale the naive spec reading suggests --
+/// that value indexes the QMF/hybrid analysis grid, not this STFT-bin grid,
+/// and using it here would be the "trap" that bit round-42 elsewhere in this
+/// file. The patch map's own band numbers (14/28/39/42/43) only make sense
+/// under the `/256` convention already used everywhere else in this file that
+/// touches the patch map -- confirmed by construction, not re-derived here).
+///
+/// For each HF band in `[14, 43)` and each STFT hop, the simulated bins are
+/// the REFERENCE's low-band bins at the patch-mapped source position, then
+/// RESCALED per (band, hop) to match the comparison side's own energy in
+/// that band/hop -- two separate rescalings, "sim-normalized-to-ours" and
+/// "sim-normalized-to-reference" -- so the only thing left for the
+/// coherence measure to see is phase/content structure, not a gain
+/// difference (the gain question is already closed by prior rounds). Returns
+/// `(band, coherence)` pairs for sim-vs-reference and sim-vs-ours.
+type BandCoherenceTable = Vec<(usize, f64)>;
+
+fn hf_patch_simulator(o: &[f32], t: &[f32], rate: u32) -> (BandCoherenceTable, BandCoherenceTable) {
+    const FFT_LEN: usize = 2048;
+    const HOP: usize = 1024;
+    const BINS_PER_SBR_BAND: usize = FFT_LEN / 256;
+    const PATCHES: [(usize, usize, usize); 4] = [(0, 14, 14), (3, 28, 11), (0, 39, 3), (13, 42, 1)];
+    let _ = rate; // band Hz not needed here; caller converts band index itself.
+    let win = ec_dsp::Window::<f32>::sine(FFT_LEN);
+    let mut rfft = ec_dsp::RealFft::<f32>::new(FFT_LEN);
+    let bins = rfft.spectrum_len();
+    let n = o.len().min(t.len());
+    let hops = if n >= FFT_LEN {
+        (n - FFT_LEN) / HOP + 1
+    } else {
+        0
+    };
+    if hops == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let mut o_spec = vec![Vec::with_capacity(hops); bins];
+    let mut t_spec = vec![Vec::with_capacity(hops); bins];
+    let mut spectrum = vec![ec_dsp::Complex::new(0.0f32, 0.0); bins];
+    for (src, dst) in [(o, &mut o_spec), (t, &mut t_spec)] {
+        for h in 0..hops {
+            let mut block = src[h * HOP..h * HOP + FFT_LEN].to_vec();
+            win.apply(&mut block);
+            rfft.forward(&block, &mut spectrum);
+            for (b, c) in spectrum.iter().enumerate() {
+                dst[b].push(*c);
+            }
+        }
+    }
+    // Plain patch copy: sim's target bins, per hop, are the reference's
+    // source bins, unmodified (no phase adjustment) -- modelling exactly the
+    // "plain patch+gain" hypothesis the charter names.
+    let mut sim_spec = vec![vec![ec_dsp::Complex::new(0.0f32, 0.0); hops]; bins];
+    for (src, tgt, width) in PATCHES {
+        let src_lo = src * BINS_PER_SBR_BAND;
+        let tgt_lo = tgt * BINS_PER_SBR_BAND;
+        let len = width * BINS_PER_SBR_BAND;
+        for i in 0..len {
+            if src_lo + i >= bins || tgt_lo + i >= bins {
+                continue;
+            }
+            for h in 0..hops {
+                sim_spec[tgt_lo + i][h] = t_spec[src_lo + i][h];
+            }
+        }
+    }
+    let num_bands = bins / BINS_PER_SBR_BAND;
+    let top_band = 43.min(num_bands);
+    // Per (band, hop) rescale of `sim` to match `target`'s energy in that
+    // band/hop, then the same magnitude-of-summed-cross-spectrum coherence
+    // measure every prior round's `coh` helper uses (already scale-invariant
+    // to a CONSTANT gain across hops; this rescale additionally removes a
+    // gain that varies hop-to-hop, isolating phase/content agreement).
+    let band_coherence = |target: &[Vec<ec_dsp::Complex<f32>>]| -> Vec<(usize, f64)> {
+        (14..top_band)
+            .map(|band| {
+                let lo = band * BINS_PER_SBR_BAND;
+                let hi = (lo + BINS_PER_SBR_BAND).min(bins);
+                let mut cross_re = 0.0f64;
+                let mut cross_im = 0.0f64;
+                let mut sim_e = 0.0f64;
+                let mut tgt_e = 0.0f64;
+                for h in 0..hops {
+                    let se: f64 = (lo..hi).map(|b| f64::from(sim_spec[b][h].norm_sqr())).sum();
+                    let te: f64 = (lo..hi).map(|b| f64::from(target[b][h].norm_sqr())).sum();
+                    if se <= 1e-20 || te <= 0.0 {
+                        continue;
+                    }
+                    let scale = (te / se).sqrt() as f32;
+                    for b in lo..hi {
+                        let sc = sim_spec[b][h].scale(scale);
+                        let tc = target[b][h];
+                        let cross = sc * tc.conj();
+                        cross_re += f64::from(cross.re);
+                        cross_im += f64::from(cross.im);
+                        sim_e += f64::from(sc.norm_sqr());
+                        tgt_e += f64::from(tc.norm_sqr());
+                    }
+                }
+                let den = (sim_e * tgt_e).sqrt();
+                let coh = if den > 0.0 {
+                    (cross_re * cross_re + cross_im * cross_im).sqrt() / den
+                } else {
+                    0.0
+                };
+                (band, coh)
+            })
+            .collect()
+    };
+    (band_coherence(&t_spec), band_coherence(&o_spec))
+}
+
 /// A file discovered under the user's own media directories: its path, which
 /// AAC stream in it (0-based among AAC streams only) carries HE-AAC, and the
 /// core/SBR crossover an ffprobe/ASC inspection already pinned for it -- used
@@ -1867,6 +1987,44 @@ fn sbr_real_library_matches_reference() {
                         }
                     }
                 }
+            }
+            // (Round-45, Task 3) THIRD WITNESS: a reference-free plain
+            // patch+gain simulator built from the reference's own low band --
+            // see `hf_patch_simulator`'s doc comment.
+            if std::env::var("EC_AAC_SBR_SIMULATOR").is_ok() && n >= 4_096 {
+                let win = &o[oa..oa + n];
+                let twin = &t[ob..ob + n];
+                let (vs_ref, vs_ours) = hf_patch_simulator(win, twin, rate);
+                let mean_in = |rows: &[(usize, f64)], lo: usize, hi: usize| {
+                    let vals: Vec<f64> = rows
+                        .iter()
+                        .filter(|(b, _)| *b >= lo && *b < hi)
+                        .map(|(_, c)| *c)
+                        .collect();
+                    if vals.is_empty() {
+                        0.0
+                    } else {
+                        vals.iter().sum::<f64>() / vals.len() as f64
+                    }
+                };
+                println!("  ch{ch} SIMULATOR sim-vs-REFERENCE per-band coherence (band, coh):");
+                for (b, coh) in &vs_ref {
+                    println!("    band{b:>3}: {coh:.4}");
+                }
+                println!(
+                    "  ch{ch} SIMULATOR sim-vs-REFERENCE mean: even-gap[14,28)={:.4} odd-gap[28,43)={:.4}",
+                    mean_in(&vs_ref, 14, 28),
+                    mean_in(&vs_ref, 28, 43)
+                );
+                println!("  ch{ch} SIMULATOR sim-vs-OURS per-band coherence (band, coh):");
+                for (b, coh) in &vs_ours {
+                    println!("    band{b:>3}: {coh:.4}");
+                }
+                println!(
+                    "  ch{ch} SIMULATOR sim-vs-OURS mean: even-gap[14,28)={:.4} odd-gap[28,43)={:.4}",
+                    mean_in(&vs_ours, 14, 28),
+                    mean_in(&vs_ours, 28, 43)
+                );
             }
             println!(
                 "  ch{ch}: lag {lag}, full {full:.6}, below {:.0}Hz {low:.6}, above {:.0}Hz {high:.6}",
