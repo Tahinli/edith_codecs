@@ -1240,7 +1240,9 @@ name = "symphonia"
 version = "0.6.0"
 dependencies = [
  "ec-core",
+ "ec-ogg",
  "ec-probe",
+ "ec-vorbis",
  "symphonia-codec-aac",
  "symphonia-core",
 ]

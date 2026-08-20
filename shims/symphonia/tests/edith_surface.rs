@@ -320,6 +320,7 @@ fn cover_art_and_id3v1_tail_do_not_stop_the_probe() {
     let mut decoder = track.decoder();
     let mut out = Vec::new();
     let mut decoded_packets = 0;
+    let mut total_samples = 0;
     while let Some(packet) = track.reader.next_packet().expect("demux") {
         if packet.track_id != track.track_id {
             continue;
@@ -328,11 +329,133 @@ fn cover_art_and_id3v1_tail_do_not_stop_the_probe() {
             .decode(&packet)
             .expect("decode")
             .copy_to_vec_interleaved::<f32>(&mut out);
+        // The reader's terminal, empty flush packet legitimately decodes to
+        // nothing for mp3 (nothing is held back across EOS), and it is always
+        // the last one seen — `out` alone, checked only after the loop, would
+        // read that packet's empty result rather than the file's real audio.
+        total_samples += out.len();
         decoded_packets += 1;
     }
     assert!(decoded_packets > 0, "no audio packets decoded");
-    assert!(!out.is_empty(), "no samples decoded");
+    assert!(total_samples > 0, "no samples decoded");
     let _ = std::fs::remove_file(&path);
+}
+
+/// Write `source` (one `Vec<f32>` per channel, all the same length) as an Ogg
+/// Vorbis file through `ec_vorbis`/`ec_ogg` — the same two crates
+/// `edith_replica::export::write_ogg` writes through — at scratch/`name`.
+fn encode_ogg(source: &[Vec<f32>], rate: u32, path: &Path) {
+    use ec_core::{
+        AudioParameters, Buf, ChannelLayout, CodecId, CodecParameters, MediaParameters, Muxer,
+        Packet, StreamInfo, TimeBase,
+    };
+    use ec_vorbis::{EncoderConfig, VorbisEncoder};
+
+    let channels = source.len() as u16;
+    let mut encoder = VorbisEncoder::new(EncoderConfig {
+        sample_rate: rate,
+        channels,
+        bitrate_bps: 128_000,
+        quality: 0.6,
+    })
+    .expect("vorbis encoder");
+    let borrowed: Vec<&[f32]> = source.iter().map(|c| &c[..]).collect();
+    encoder.push_planar(&borrowed).expect("push");
+    encoder.finish();
+    let mut packets = Vec::new();
+    loop {
+        match encoder.next_packet() {
+            Ok(p) => packets.push((p.data, p.granule)),
+            Err(e) if e.is_eof() => break,
+            Err(e) => panic!("encode: {e}"),
+        }
+    }
+    eprintln!(
+        "encode_ogg: {} packets, last granule {}",
+        packets.len(),
+        packets.last().map_or(0, |(_, g)| *g)
+    );
+
+    let base = TimeBase::new(1, i64::from(rate));
+    let mut params = CodecParameters::new(CodecId::Vorbis);
+    params.media = MediaParameters::Audio(AudioParameters {
+        sample_rate: rate,
+        layout: ChannelLayout::from_count(usize::from(channels)),
+        format: None,
+        bits_per_sample: None,
+    });
+    params.extradata = Some(Buf::from_vec(encoder.extradata()));
+    let file = File::create(path).expect("create");
+    let mut muxer = ec_ogg::OggMuxer::new(file);
+    muxer
+        .add_stream(StreamInfo::new(0, base, params))
+        .expect("add stream");
+    muxer.write_headers().expect("headers");
+    for (data, granule) in &packets {
+        let mut packet = Packet::new(0, base, data.clone());
+        packet.side_data.push(ec_ogg::granule_side_data(*granule));
+        muxer.write_packet(&packet).expect("packet");
+    }
+    muxer.finish().expect("finish");
+}
+
+/// The engine's own read door (`SymTrack` above, mirroring
+/// `edith_replica::engine::audio::run_sym`): open, decode every packet to
+/// EOF, count frames. This is what the export tests' `decode()` helper
+/// measures against.
+fn decode_all(path: &Path) -> u64 {
+    let mut track = SymTrack::open(path).expect("track");
+    let mut decoder = track.decoder();
+    let mut out = Vec::new();
+    let mut frames = 0u64;
+    let mut n = 0;
+    while let Some(packet) = track.reader.next_packet().expect("demux") {
+        if packet.track_id != track.track_id {
+            continue;
+        }
+        let before = frames;
+        decoder
+            .decode(&packet)
+            .expect("decode")
+            .copy_to_vec_interleaved::<f32>(&mut out);
+        frames += (out.len() / usize::from(track.channels)) as u64;
+        n += 1;
+        eprintln!(
+            "packet {n}: {} bytes in, {} frames out (running {frames})",
+            packet.data.len(),
+            frames - before
+        );
+    }
+    frames
+}
+
+/// The exact shape of `audio_export::exports_the_timeline_as_an_ogg_vorbis`
+/// and `a_mono_timeline_exports_as_dual_mono_ogg` in `edith_replica`: write N
+/// samples through the family's own Ogg Vorbis encoder, read them back
+/// through this shim exactly as the engine's `SymTrack`/`run_sym` do, and the
+/// count must come back to N — the terminal hop `VorbisDecoder::flush`
+/// delivers has to actually reach the reader at EOS.
+#[test]
+fn ogg_vorbis_round_trip_reads_back_every_sample_written() {
+    let rate = 44_100u32;
+    for (name, channels, n) in [
+        ("surface-mono-44100.ogg", 2usize, 44_100usize),
+        ("surface-stereo-264600.ogg", 2, 264_600),
+    ] {
+        let source: Vec<Vec<f32>> = (0..channels)
+            .map(|_| {
+                (0..n)
+                    .map(|i| 0.2 * (i as f32 * 0.05).sin())
+                    .collect::<Vec<f32>>()
+            })
+            .collect();
+        let path = std::env::temp_dir().join(format!("edith-surface-{}-{name}", std::process::id()));
+        encode_ogg(&source, rate, &path);
+        let frames = decode_all(&path);
+        eprintln!("{name}: wrote {n} frames, read back {frames}");
+        assert_eq!(frames, n as u64, "{name}: round trip sample count");
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 /// ID3v2's syncsafe integer: 4 bytes, 7 significant bits each (top bit clear),
