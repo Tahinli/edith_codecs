@@ -12,6 +12,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use ec_hw::{
     Codec, Decoder, EncCodec, Encoder, EncoderConfig, Frame, FrameMetadata, I420, RateControlMode,
@@ -71,7 +72,15 @@ impl Reference {
             // pictures on a film whose real cadence differs — which shows up
             // here as everything being one frame out from some point onward.
             .args([
-                "-map", "0:v:0", "-fps_mode", "passthrough", "-pix_fmt", pix, "-f", "rawvideo", "-",
+                "-map",
+                "0:v:0",
+                "-fps_mode",
+                "passthrough",
+                "-pix_fmt",
+                pix,
+                "-f",
+                "rawvideo",
+                "-",
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -657,6 +666,183 @@ fn our_encoder_and_our_decoder_agree() {
     }
 }
 
+/// A decoded surface goes straight into an encoder with no `to_i420`
+/// read-back, and what comes out is not measurably different from the
+/// CPU-path baseline (decode -> `to_i420` -> `encode`) of the same frames.
+///
+/// 1920x1080 is the size on purpose: H.264's 16-block and HEVC's 32-block
+/// rounding both land on the same 1920x1088 coded size for it, so the
+/// decoder's surfaces satisfy `encode_frame`'s coded-size check against
+/// either target codec without a second fixture.
+#[test]
+fn encode_frame_zero_copy_matches_the_cpu_path() {
+    let Some(display) = display() else { return };
+    let (width, height) = (1920u32, 1080u32);
+    let Some(path) = fixtures(".264")
+        .into_iter()
+        .find(|p| p.file_name().and_then(|n| n.to_str()) == Some("h264-1080p-23.976-8bit.264"))
+    else {
+        eprintln!("skipped: no h264-1080p fixture — run scripts/gen-bitstream-fixtures.sh");
+        return;
+    };
+    let data = std::fs::read(&path).expect("fixture is readable");
+    let frames = 10usize;
+
+    for (target, dec_codec) in [(EncCodec::H264, Codec::H264), (EncCodec::H265, Codec::H265)] {
+        let mut cfg = EncoderConfig::new(target, width, height);
+        cfg.gop_size = 30;
+        cfg.rate_control = RateControlMode::ConstantQp { qp: 22 };
+        let mut zero_copy = Encoder::new(&display, cfg).expect("zero-copy encoder opens");
+        let mut cpu_path = Encoder::new(&display, cfg).expect("cpu-path encoder opens");
+        let mut zc_stream = Vec::new();
+        let mut cpu_stream = Vec::new();
+        let mut count = 0i64;
+
+        let mut decoder = Decoder::new(&display, Codec::H264).expect("decoder opens");
+        decode_stream(&mut decoder, Codec::H264, &data, frames, |frame| {
+            let meta = FrameMetadata {
+                timestamp: count,
+                force_keyframe: false,
+            };
+            // The zero-copy path never reads the surface back to the CPU: the
+            // only `to_i420` call in this loop is the CPU-path baseline's.
+            let zc = zero_copy
+                .encode_frame(&frame, meta)
+                .expect("encode_frame (zero copy)");
+            zc_stream.extend_from_slice(&zc.data);
+            let i420 = frame.to_i420().expect("readback for the CPU-path baseline");
+            let cpu = cpu_path.encode(&i420, meta).expect("encode (CPU path)");
+            cpu_stream.extend_from_slice(&cpu.data);
+            count += 1;
+        })
+        .expect("decode");
+        assert_eq!(
+            count as usize, frames,
+            "{target:?}: decoded {count} of {frames}"
+        );
+
+        let ext = match target {
+            EncCodec::H264 => "264",
+            EncCodec::H265 => "265",
+            EncCodec::Av1 => unreachable!("AV1 is not in this test's target list"),
+        };
+        let dir = std::env::temp_dir().join("ec-hw-encode-frame-zero-copy");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        for (name, bytes) in [("zc", &zc_stream), ("cpu", &cpu_stream)] {
+            std::fs::write(dir.join(format!("{name}.{ext}")), bytes).expect("write bitstream");
+        }
+
+        let mut zc_decoder = Decoder::new(&display, dec_codec).expect("zc decoder opens");
+        let mut cpu_decoder = Decoder::new(&display, dec_codec).expect("cpu decoder opens");
+        let mut zc_frames = Vec::new();
+        let mut cpu_frames = Vec::new();
+        decode_stream(&mut zc_decoder, dec_codec, &zc_stream, frames, |f| {
+            zc_frames.push(Planes::from_8bit(&f.to_i420().expect("readback")))
+        })
+        .expect("decode zero-copy stream");
+        decode_stream(&mut cpu_decoder, dec_codec, &cpu_stream, frames, |f| {
+            cpu_frames.push(Planes::from_8bit(&f.to_i420().expect("readback")))
+        })
+        .expect("decode CPU-path stream");
+        assert_eq!(
+            zc_frames.len(),
+            frames,
+            "{target:?}: zero-copy stream frame count"
+        );
+        assert_eq!(
+            cpu_frames.len(),
+            frames,
+            "{target:?}: CPU-path stream frame count"
+        );
+
+        let worst = zc_frames
+            .iter()
+            .zip(&cpu_frames)
+            .map(|(a, b)| psnr(a, b))
+            .fold(f64::INFINITY, f64::min);
+        println!("{target:?} encode_frame vs CPU path: worst {worst:.1} dB");
+        assert!(
+            worst >= 35.0,
+            "{target:?}: worst {worst:.1} dB vs the CPU path"
+        );
+    }
+}
+
+/// `EncoderConfig::colour` reaches the VUI of both codecs' packed SPS: an
+/// export with a colour description survives ffprobe reading it back, and
+/// leaving it unset keeps today's behaviour (no `video_signal_type`,
+/// deterministically — two encodes of the same picture with no colour set
+/// come back byte for byte identical).
+#[test]
+fn colour_description_reaches_the_vui() {
+    let Some(display) = display() else { return };
+    let (width, height) = (640u32, 480u32);
+    let dir = std::env::temp_dir().join("ec-hw-colour-vui");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+
+    let encode_one = |colour: Option<(u8, u8, u8, bool)>, name: &str| -> (PathBuf, Vec<u8>) {
+        let mut cfg = EncoderConfig::new(EncCodec::H265, width, height);
+        cfg.rate_control = RateControlMode::ConstantQp { qp: 26 };
+        if let Some((primaries, transfer, matrix, full_range)) = colour {
+            cfg = cfg.colour(primaries, transfer, matrix, full_range);
+        }
+        let mut enc = Encoder::new(&display, cfg).expect("encoder opens");
+        let coded = enc
+            .encode(
+                &source_frame(width, height, 0),
+                FrameMetadata {
+                    timestamp: 0,
+                    force_keyframe: true,
+                },
+            )
+            .expect("encode");
+        let path = dir.join(name);
+        std::fs::write(&path, &coded.data).expect("write bitstream");
+        (path, coded.data)
+    };
+    let probe = |path: &Path| -> String {
+        let out = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=color_primaries,color_transfer,color_space",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(path)
+            .output()
+            .expect("ffprobe runs");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    // Pinned default case: no colour set, twice, must match exactly.
+    let (default_path, default_bytes) = encode_one(None, "default-a.265");
+    let (_, default_bytes2) = encode_one(None, "default-b.265");
+    assert_eq!(
+        default_bytes, default_bytes2,
+        "no colour set: two encodes of the same picture must be byte-identical"
+    );
+    let default_probe = probe(&default_path);
+    println!("no colour set: ffprobe sees `{default_probe}`");
+    assert!(
+        !default_probe.contains("bt2020"),
+        "no colour set should not read back as BT.2020: `{default_probe}`"
+    );
+
+    // BT.2020 / PQ / BT.2020 non-constant luminance (H.273 9/16/9).
+    let (bt2020_path, _) = encode_one(Some((9, 16, 9, false)), "bt2020.265");
+    // ffprobe's csv reorders these as color_space,color_transfer,color_primaries
+    // regardless of the -show_entries order given above.
+    let got = probe(&bt2020_path);
+    assert_eq!(
+        got, "bt2020nc,smpte2084,bt2020",
+        "ffprobe on the BT.2020 stream"
+    );
+}
+
 /// AV1 encoding is opt-in, and this test does not turn it on.
 ///
 /// It was probed once, live, at the driver's own minimum encode size
@@ -1031,4 +1217,479 @@ fn short(path: &Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default()
+}
+
+/// PSNR of one plane, in dB (`f64::INFINITY` for an exact match).
+fn plane_psnr(a: &[u16], b: &[u16], peak: f64) -> f64 {
+    let n = a.len().min(b.len());
+    let mse: f64 = a[..n]
+        .iter()
+        .zip(&b[..n])
+        .map(|(&p, &q)| {
+            let d = f64::from(p) - f64::from(q);
+            d * d
+        })
+        .sum::<f64>()
+        / n as f64;
+    if mse == 0.0 {
+        f64::INFINITY
+    } else {
+        10.0 * (peak * peak / mse).log10()
+    }
+}
+
+/// P010 correctness on the real 4K HDR film, plane by plane.
+///
+/// `real_library_spot_check` already pins the whole-frame PSNR at >= 40 dB
+/// for a mix of files; this isolates Y from U/V on this specific 10-bit film,
+/// against both `yuv420p10le` (the lossless comparison) and `yuv420p` (the
+/// truncating `to_i420` path, which rounds ffmpeg's dithered 8-bit output
+/// against this crate's un-dithered right-shift -- a real but small gap, not
+/// a bug). A collapsed U/V PSNR here (a grey frame) would mean the chroma
+/// plane is being read at the wrong stride/offset; it is not, on this file.
+#[test]
+fn ten_bit_4k_chroma_is_not_grey() {
+    let Some(display) = display() else { return };
+    let path = Path::new(
+        "/home/tahinli/Downloads/Project.Hail.Mary.2026.PROPER.HDR.2160p.WEB.h265-GRACE\
+         /Project.Hail.Mary.2026.PROPER.HDR.2160p.WEB.h265-GRACE.mkv",
+    );
+    if !path.exists() {
+        eprintln!("skipped: film not present");
+        return;
+    }
+    let frames = 3usize;
+    let Some(data) = elementary(path, Codec::H265, frames) else {
+        eprintln!("skipped: no elementary stream");
+        return;
+    };
+    let mut decoder = Decoder::new(&display, Codec::H265).expect("decoder opens");
+    let mut ref10: Option<Reference> = None;
+    let mut ref8: Option<Reference> = None;
+    let mut compared = 0usize;
+    decode_stream(&mut decoder, Codec::H265, &data, frames, |frame| {
+        let (w, h) = frame.display_size;
+        let ref10 =
+            ref10.get_or_insert_with(|| Reference::open(path, w, h, true).expect("ffmpeg runs"));
+        let want10 = ref10.next(w, h).expect("ffmpeg has a frame");
+        let got16 = Planes::from_16bit(&frame.to_i420_16().expect("readback"));
+        let y_db = plane_psnr(&got16.y, &want10.y, 1023.0);
+        let uv_db = plane_psnr(
+            &[got16.u.as_slice(), got16.v.as_slice()].concat(),
+            &[want10.u.as_slice(), want10.v.as_slice()].concat(),
+            1023.0,
+        );
+        println!("frame {compared} to_i420_16 vs yuv420p10le: Y {y_db:.1} dB, UV {uv_db:.1} dB");
+        assert!(
+            y_db >= 50.0,
+            "frame {compared}: Y PSNR collapsed to {y_db:.1} dB"
+        );
+        assert!(
+            uv_db >= 50.0,
+            "frame {compared}: chroma PSNR collapsed to {uv_db:.1} dB (grey frame)"
+        );
+
+        let ref8 =
+            ref8.get_or_insert_with(|| Reference::open(path, w, h, false).expect("ffmpeg runs"));
+        let want8 = ref8.next(w, h).expect("ffmpeg has a frame");
+        let got8 = Planes::from_8bit(&frame.to_i420().expect("readback"));
+        let y_db8 = plane_psnr(&got8.y, &want8.y, 255.0);
+        let uv_db8 = plane_psnr(
+            &[got8.u.as_slice(), got8.v.as_slice()].concat(),
+            &[want8.u.as_slice(), want8.v.as_slice()].concat(),
+            255.0,
+        );
+        println!("frame {compared} to_i420 vs yuv420p: Y {y_db8:.1} dB, UV {uv_db8:.1} dB");
+        // ffmpeg dithers its 8-bit downconversion; this crate truncates. Both
+        // are legitimate 10-to-8 roundings, so the floor here is the
+        // dithering noise floor, not the lossless bound above.
+        assert!(
+            y_db8 >= 30.0,
+            "frame {compared}: 8-bit Y PSNR {y_db8:.1} dB"
+        );
+        assert!(
+            uv_db8 >= 30.0,
+            "frame {compared}: 8-bit chroma PSNR collapsed to {uv_db8:.1} dB (grey frame)"
+        );
+        compared += 1;
+    })
+    .expect("decode");
+    assert_eq!(compared, frames, "not all frames were compared");
+}
+
+/// The HEVC HDR peak (`content_light_level_information` and
+/// `mastering_display_colour_volume` prefix SEI), on the one real file that
+/// only carries it there: the Matroska `Colour` element itself has no MaxCLL/
+/// MaxFALL for this rip (verified separately against `ffprobe`), so a decoder
+/// that does not read the SEI reports none at all. Numbers match what
+/// `ffprobe -show_frames -read_intervals %+#1 -show_entries
+/// frame_side_data_list` reports for this file.
+#[test]
+fn hdr_film_light_level_sei_is_exposed() {
+    let Some(display) = display() else { return };
+    let path = Path::new(
+        "/home/tahinli/Downloads/Project.Hail.Mary.2026.PROPER.HDR.2160p.WEB.h265-GRACE\
+         /Project.Hail.Mary.2026.PROPER.HDR.2160p.WEB.h265-GRACE.mkv",
+    );
+    if !path.exists() {
+        eprintln!("skipped: film not present");
+        return;
+    }
+    let frames = 2usize;
+    let Some(data) = elementary(path, Codec::H265, frames) else {
+        eprintln!("skipped: no elementary stream");
+        return;
+    };
+    let mut decoder = Decoder::new(&display, Codec::H265).expect("decoder opens");
+    let mut seen = 0usize;
+    decode_stream(&mut decoder, Codec::H265, &data, frames, |frame| {
+        seen += 1;
+        let colour = frame
+            .colour()
+            .expect("HEVC decoder resolves colour metadata");
+        assert_eq!(
+            colour.description.codes(),
+            (9, 16, 9),
+            "primaries/transfer/matrix (BT.2020 / PQ / BT.2020 NCL)"
+        );
+        assert_eq!(colour.light.max_cll, Some(1230.0), "MaxCLL");
+        assert_eq!(colour.light.max_fall, Some(419.0), "MaxFALL");
+        assert!(
+            colour.light.mastering_max.is_some(),
+            "mastering display peak missing"
+        );
+    })
+    .expect("decode");
+    assert_eq!(seen, frames, "not all frames were compared");
+}
+
+/// An SDR H.264 stream, which carries no HDR SEI at all: `Frame::colour`
+/// either resolves from the VUI or answers [`None`], but never panics.
+#[test]
+fn sdr_h264_colour_never_panics() {
+    let Some(display) = display() else { return };
+    let paths = fixtures(".264");
+    if paths.is_empty() {
+        eprintln!("skipped: no H.264 fixtures generated");
+        return;
+    }
+    let path = &paths[0];
+    let Some(data) = std::fs::read(path).ok() else {
+        eprintln!("skipped: fixture unreadable");
+        return;
+    };
+    let mut decoder = Decoder::new(&display, Codec::H264).expect("decoder opens");
+    let mut seen = 0usize;
+    decode_stream(&mut decoder, Codec::H264, &data, 2, |frame| {
+        seen += 1;
+        // No SEI parsing on this codec: content light is always absent.
+        if let Some(colour) = frame.colour() {
+            assert_eq!(colour.light.max_cll, None);
+        }
+    })
+    .expect("decode");
+    assert!(seen > 0, "{}: nothing decoded", short(path));
+}
+
+/// Per-frame cost of the 4K 10-bit read-back path, isolated from decode
+/// submission itself.
+///
+/// The consumer's `hw_decode::the_hdr_film_renders_tone_mapped` measured
+/// 1352.5 ms/frame against a 39 ms (24 fps) budget on this film. Decode
+/// correctness on it is already pinned by `real_library_spot_check` (bit-exact
+/// against ffmpeg), so this isolates which stage of the frame path -- decode,
+/// 8-bit readback, 10-bit readback or DRM PRIME export -- the time goes to.
+#[test]
+fn ten_bit_4k_frame_path_is_realtime() {
+    let Some(display) = display() else { return };
+    let path = Path::new(
+        "/home/tahinli/Downloads/Project.Hail.Mary.2026.PROPER.HDR.2160p.WEB.h265-GRACE\
+         /Project.Hail.Mary.2026.PROPER.HDR.2160p.WEB.h265-GRACE.mkv",
+    );
+    if !path.exists() {
+        eprintln!("skipped: film not present");
+        return;
+    }
+    let limit = 120usize;
+    let Some(data) = elementary(path, Codec::H265, limit) else {
+        eprintln!("skipped: no elementary stream");
+        return;
+    };
+    let units = split_access_units(&data, Codec::H265);
+    assert!(
+        units.len() > limit,
+        "film clip too short for {limit} frames"
+    );
+
+    #[derive(Clone, Copy)]
+    enum Op {
+        DecodeOnly,
+        ToI420,
+        ToI420_16,
+        ExportPrime,
+    }
+    fn apply(op: Op, frame: Frame) {
+        match op {
+            Op::DecodeOnly => drop(frame),
+            Op::ToI420 => {
+                frame.to_i420().expect("readback");
+            }
+            Op::ToI420_16 => {
+                frame.to_i420_16().expect("readback");
+            }
+            Op::ExportPrime => {
+                frame.export_prime().expect("export");
+            }
+        }
+    }
+
+    println!(
+        "{:<22} {:>10} {:>10} {:>10}",
+        "stage", "median ms", "min ms", "max ms"
+    );
+    let mut got_to_i420_16 = None;
+    for (name, op) in [
+        ("decode-only", Op::DecodeOnly),
+        ("decode+to_i420", Op::ToI420),
+        ("decode+to_i420_16", Op::ToI420_16),
+        ("decode+export_prime", Op::ExportPrime),
+    ] {
+        let mut decoder = Decoder::new(&display, Codec::H265).expect("decoder opens");
+        let mut durations: Vec<Duration> = Vec::new();
+        // Hold a few frames before reading, as the resident-set test does:
+        // reading one frame per submission measures latency, not throughput,
+        // and lets decode run ahead of read-back the way a real player does.
+        let mut pending: Vec<Frame> = Vec::new();
+        let mut t_prev = Instant::now();
+        'outer: for (i, unit) in units.iter().enumerate() {
+            decoder.decode(unit, i as i64).expect("decode");
+            while let Some(frame) = decoder.next_frame() {
+                pending.push(frame);
+                if pending.len() < 4 {
+                    continue;
+                }
+                for frame in pending.drain(..) {
+                    apply(op, frame);
+                    let now = Instant::now();
+                    durations.push(now.duration_since(t_prev));
+                    t_prev = now;
+                }
+                if durations.len() >= limit {
+                    break 'outer;
+                }
+            }
+        }
+        decoder.flush().expect("flush");
+        while durations.len() < limit {
+            let Some(frame) = decoder.next_frame() else {
+                break;
+            };
+            apply(op, frame);
+            let now = Instant::now();
+            durations.push(now.duration_since(t_prev));
+            t_prev = now;
+        }
+        assert!(
+            durations.len() >= 24,
+            "{name}: only {} frames decoded",
+            durations.len()
+        );
+        durations.sort();
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        let median = ms(durations[durations.len() / 2]);
+        let min = ms(durations[0]);
+        let max = ms(durations[durations.len() - 1]);
+        println!("{name:<22} {median:>10.2} {min:>10.2} {max:>10.2}");
+        if name == "decode+to_i420_16" {
+            got_to_i420_16 = Some(median);
+        }
+    }
+    let got = got_to_i420_16.expect("to_i420_16 phase ran");
+    println!("target: decode+to_i420_16 <= 39.00 ms/frame median (24 fps budget); got {got:.2}");
+}
+
+/// A CRA GOP boundary stores its RASL leading pictures *after* the CRA in
+/// decode order, even though they display before it (they predict from
+/// pictures the CRA's own random-access point does not have). A decoder
+/// started fresh at that CRA — what a seek does — must therefore drop those
+/// RASL pictures per H.265 8.1.3's `NoRaslOutputFlag`, or its output shifts by
+/// however many RASL pictures the GOP has, handing back the wrong picture for
+/// every display index at or after the seek target.
+#[test]
+fn hevc_seek_matches_linear_mkv() {
+    let Some(display) = display() else { return };
+    let path = bitstreams().join("test_hevc.mkv");
+    let Some(data) = elementary(&path, Codec::H265, 45) else {
+        eprintln!("skipped: no test_hevc.mkv fixture");
+        return;
+    };
+    let units = split_access_units(&data, Codec::H265);
+
+    // Linear decode: every picture from the start, frame 30 kept for
+    // comparison (the file's second CRA, per `test_hevc.mkv`'s 30-picture
+    // GOPs).
+    const TARGET: usize = 30;
+    let mut decoder = Decoder::new(&display, Codec::H265).expect("decoder opens");
+    let mut linear_frame_30 = None;
+    let mut index = 0usize;
+    decode_stream(&mut decoder, Codec::H265, &data, 45, |frame| {
+        if index == TARGET {
+            linear_frame_30 = Some(frame.to_i420().expect("readback"));
+        }
+        index += 1;
+    })
+    .expect("linear decode");
+    let linear_frame_30 = linear_frame_30.expect("linear decode reached frame 30");
+
+    // Find the access unit whose first VCL NAL is the CRA at this GOP
+    // boundary, and feed the decoder from there on, exactly as a seek would:
+    // nothing from before it goes in.
+    let cra_at = units
+        .iter()
+        .position(|au| starts_with_cra(au))
+        .expect("a CRA access unit exists");
+
+    // A seek reuses the parameter sets a decoder already learned; a fresh one
+    // has none, so it is primed the same way `ec_hw::Decoder::reset` expects a
+    // caller to: decode the leading VPS/SPS/PPS (their IDR picture is thrown
+    // away) and reset picture state before feeding the seek target.
+    let mut seek_decoder = Decoder::new(&display, Codec::H265).expect("decoder opens");
+    seek_decoder
+        .decode(units[0], 0)
+        .expect("prime parameter sets");
+    seek_decoder.reset();
+    let mut seeked_frame = None;
+    for (i, unit) in units[cra_at..].iter().enumerate() {
+        seek_decoder.decode(unit, i as i64).expect("seek decode");
+        if let Some(frame) = seek_decoder.next_frame() {
+            seeked_frame = Some(frame.to_i420().expect("readback"));
+            break;
+        }
+    }
+    if seeked_frame.is_none() {
+        seek_decoder.flush().expect("flush");
+        seeked_frame = seek_decoder
+            .next_frame()
+            .map(|f| f.to_i420().expect("readback"));
+    }
+    let seeked_frame = seeked_frame.expect("a frame came out after the seek");
+
+    assert_eq!(
+        seeked_frame, linear_frame_30,
+        "seeking to the CRA before frame 30 handed back a different picture \
+         than a linear decode of frame 30 — RASL pictures were not dropped"
+    );
+}
+
+/// An H.264 open-GOP I picture is not an IDR: it is a plain I slice
+/// (`nal_unit_type` 1) whose predecessors in decode order can still hold
+/// references from before it, so leading pictures between it and the next
+/// IDR may predict from a picture never decoded since a fresh start there —
+/// exactly what a seek does. A decoder started at that I must drop those
+/// leading pictures per D.2.8's recovery point default, or its output shifts
+/// by however many leading pictures the GOP has.
+#[test]
+fn h264_seek_matches_linear_open_gop() {
+    let Some(display) = display() else { return };
+    let path = bitstreams().join("h264-open-gop.mp4");
+    let Some(data) = elementary(&path, Codec::H264, 60) else {
+        eprintln!("skipped: no h264-open-gop.mp4 fixture (run scripts/gen-fixtures.sh)");
+        return;
+    };
+    let units = split_access_units(&data, Codec::H264);
+
+    // Linear decode: every picture from the start, frame 30 kept for
+    // comparison (the fixture's second I picture, `keyint=30`).
+    const TARGET: usize = 30;
+    let mut decoder = Decoder::new(&display, Codec::H264).expect("decoder opens");
+    let mut linear_frame_30 = None;
+    let mut index = 0usize;
+    decode_stream(&mut decoder, Codec::H264, &data, 60, |frame| {
+        if index == TARGET {
+            linear_frame_30 = Some(frame.to_i420().expect("readback"));
+        }
+        index += 1;
+    })
+    .expect("linear decode");
+    let linear_frame_30 = linear_frame_30.expect("linear decode reached frame 30");
+
+    // Find the access unit whose first VCL NAL is the open-GOP I picture at
+    // this GOP boundary, and feed the decoder from there on, exactly as a
+    // seek would: nothing from before it goes in.
+    let open_gop_at = units
+        .iter()
+        .position(|au| is_open_gop_i(au))
+        .expect("an open-GOP I access unit exists");
+
+    // A seek reuses the parameter sets a decoder already learned; a fresh one
+    // has none, so it is primed the same way `ec_hw::Decoder::reset` expects a
+    // caller to: decode the leading IDR (its picture is thrown away) and
+    // reset picture state before feeding the seek target.
+    let mut seek_decoder = Decoder::new(&display, Codec::H264).expect("decoder opens");
+    seek_decoder.decode(units[0], 0).expect("prime parameter sets");
+    seek_decoder.reset();
+    let mut seeked_frame = None;
+    for (i, unit) in units[open_gop_at..].iter().enumerate() {
+        seek_decoder.decode(unit, i as i64).expect("seek decode");
+        if let Some(frame) = seek_decoder.next_frame() {
+            seeked_frame = Some(frame.to_i420().expect("readback"));
+            break;
+        }
+    }
+    if seeked_frame.is_none() {
+        seek_decoder.flush().expect("flush");
+        seeked_frame = seek_decoder
+            .next_frame()
+            .map(|f| f.to_i420().expect("readback"));
+    }
+    let seeked_frame = seeked_frame.expect("a frame came out after the seek");
+
+    assert_eq!(
+        seeked_frame, linear_frame_30,
+        "seeking to the open-GOP I before frame 30 handed back a different \
+         picture than a linear decode of frame 30 — leading pictures with \
+         missing references were not dropped"
+    );
+}
+
+/// True when an access unit's first VCL NAL is an H.264 open-GOP I slice
+/// (`nal_unit_type` 1, `slice_type % 5 == 2`), found by scanning for the
+/// access unit's first start code rather than assuming a fixed prefix length.
+fn is_open_gop_i(au: &[u8]) -> bool {
+    let mut i = 0usize;
+    while i + 3 < au.len() {
+        if au[i] != 0 || au[i + 1] != 0 || au[i + 2] != 1 {
+            i += 1;
+            continue;
+        }
+        let header = au[i + 3];
+        if header & 0x1f != 1 {
+            return false;
+        }
+        let mut r = ec_core::BitReader::new(&au[i + 4..]);
+        if r.read_ue().is_err() {
+            return false;
+        }
+        return matches!(r.read_ue(), Ok(code) if code % 5 == 2);
+    }
+    false
+}
+
+/// True when an access unit's first VCL NAL is an HEVC CRA (`nal_type` 21).
+/// A CRA's access unit may open with its own VPS/SPS/PPS, so this skips past
+/// non-VCL NALs to the first one that carries a slice.
+fn starts_with_cra(au: &[u8]) -> bool {
+    let mut i = 0usize;
+    while i + 3 < au.len() {
+        if au[i] == 0 && au[i + 1] == 0 && au[i + 2] == 1 {
+            let t = (au[i + 3] >> 1) & 0x3f;
+            if t <= 31 {
+                return t == 21;
+            }
+            i += 3;
+            continue;
+        }
+        i += 1;
+    }
+    false
 }

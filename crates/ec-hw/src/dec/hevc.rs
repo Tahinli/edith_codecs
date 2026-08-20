@@ -9,6 +9,7 @@
 
 use std::sync::Arc;
 
+use ec_core::color::{ColorDescription, ContentLight, Tags};
 use ec_h265_syntax::{
     NalUnitType, ParsePositions, Pps, SliceHeader, SliceType, Sps, Vps, split_annex_b,
     unescape_rbsp,
@@ -18,7 +19,7 @@ use ec_va::{Buffer, Display, sys};
 
 use super::{ReadyFrames, Session, StreamInfo};
 use crate::error::{Error, Result};
-use crate::frame::Frame;
+use crate::frame::{Colour, Frame};
 use crate::params::hevc::{
     IQMatrixBufferHEVC, PICTURE_INVALID, PICTURE_LONG_TERM_REFERENCE, PICTURE_RPS_LT_CURR,
     PICTURE_RPS_ST_CURR_AFTER, PICTURE_RPS_ST_CURR_BEFORE, PictureParameterBufferHEVC,
@@ -93,8 +94,18 @@ pub struct HevcDecoder {
     prev_tid0_poc: i32,
     /// Set once a picture has been decoded since the last reset.
     started: bool,
+    /// `NoRaslOutputFlag` (8.1.3) of the most recent IRAP: RASL pictures
+    /// associated with it must not be decoded or output when set, because
+    /// they predict from pictures before a random-access point this decoder
+    /// never saw.
+    no_rasl_output: bool,
     max_reorder: usize,
     max_dec_pic_buffering: usize,
+    /// The most recent SPS's VUI colour tags, sticky across pictures.
+    colour_tags: Tags,
+    /// The prefix SEI HDR peak seen so far, merged so a later access unit that
+    /// says nothing does not erase what an earlier IRAP declared.
+    colour_light: ContentLight,
 }
 
 impl HevcDecoder {
@@ -111,8 +122,11 @@ impl HevcDecoder {
             current: None,
             prev_tid0_poc: 0,
             started: false,
+            no_rasl_output: false,
             max_reorder: 1,
             max_dec_pic_buffering: 6,
+            colour_tags: Tags::default(),
+            colour_light: ContentLight::default(),
         }
     }
 
@@ -131,6 +145,7 @@ impl HevcDecoder {
                     let sps = Sps::parse(&nal.rbsp())?;
                     self.max_reorder = sps.max_num_reorder_pics as usize;
                     self.max_dec_pic_buffering = sps.max_dec_pic_buffering_minus1 as usize + 1;
+                    self.colour_tags = vui_colour_tags(&sps);
                     let id = sps.id as usize;
                     if id < self.sps_map.len() {
                         self.sps_map[id] = Some(sps);
@@ -149,8 +164,31 @@ impl HevcDecoder {
                 _ => {}
             }
         }
+        // The HDR SEI messages (mastering display, content light level) live
+        // outside the slice loop above and are read on the whole access unit:
+        // an encoder writes them once, ahead of the IRAP they describe, and
+        // they otherwise say nothing (`ContentLight::default()`), so a later
+        // access unit that carries neither never overwrites what an earlier
+        // one declared.
+        let light = ec_core::color::hevc_sei_light(data);
+        if light != ContentLight::default() {
+            self.colour_light = light.over(self.colour_light);
+        }
         self.finish_picture()?;
         Ok(())
+    }
+
+    /// This stream's colour metadata, once its first SPS has been seen.
+    pub fn colour(&self) -> Option<Colour> {
+        let session = self.session.as_ref()?;
+        Some(Colour {
+            description: ColorDescription::resolve(
+                Tags::default(),
+                self.colour_tags,
+                session.display_size.1,
+            ),
+            light: self.colour_light,
+        })
     }
 
     /// The next frame in output order.
@@ -171,6 +209,7 @@ impl HevcDecoder {
         self.ready.clear();
         self.prev_tid0_poc = 0;
         self.started = false;
+        self.no_rasl_output = false;
     }
 
     /// What the stream turned out to be.
@@ -202,7 +241,14 @@ impl HevcDecoder {
 
         if sh.first_slice_segment_in_pic {
             self.finish_picture()?;
-            self.start_picture(&sps, &sh, nal_type, temporal_id, timestamp)?;
+            // 8.1.3 / C.5.2.2: a RASL picture associated with an IRAP whose
+            // NoRaslOutputFlag is 1 predicts from pictures before that IRAP,
+            // which a mid-stream start never decoded. It is not output and
+            // is not guaranteed decodable, so it is dropped whole rather than
+            // handed to the driver.
+            if !(is_rasl_picture(nal_type) && self.no_rasl_output) {
+                self.start_picture(&sps, &sh, nal_type, temporal_id, timestamp)?;
+            }
         }
         if self.current.is_none() {
             return Ok(());
@@ -255,6 +301,13 @@ impl HevcDecoder {
         timestamp: i64,
     ) -> Result<()> {
         self.ensure_session(sps)?;
+
+        if nal_type.is_irap() {
+            // 8.1.3: 1 for an IDR, a BLA, or the first picture of a coded
+            // video sequence — which a mid-stream start's first IRAP always
+            // is, `self.started` still being false at that point.
+            self.no_rasl_output = nal_type.is_idr() || is_bla_picture(nal_type) || !self.started;
+        }
 
         let poc = self.picture_order_count(sps, sh, nal_type);
         // 8.3.2 runs before the picture is decoded and after its POC is known:
@@ -616,6 +669,7 @@ impl HevcDecoder {
                 session.display_size,
                 session.coded_size,
                 session.bit_depth,
+                self.colour(),
             ));
             self.dpb[idx].output = false;
             self.dpb.retain(|p| p.stored());
@@ -634,6 +688,42 @@ fn is_reference_picture(nal_type: NalUnitType) -> bool {
 /// excludes from the picture order count prediction.
 fn is_leading_picture(nal_type: NalUnitType) -> bool {
     (6..=9).contains(&nal_type.code())
+}
+
+/// An SPS's VUI `colour_description` and range flag, as [`Tags`] for
+/// [`ColorDescription::resolve`]. [`Tags::default()`] when the VUI has no
+/// `video_signal_type` at all.
+fn vui_colour_tags(sps: &Sps) -> Tags {
+    let Some(vst) = sps.vui.as_ref().and_then(|vui| vui.video_signal_type) else {
+        return Tags::default();
+    };
+    let (_primaries, transfer, matrix) = vst
+        .colour_description
+        .map(|cd| {
+            (
+                cd.colour_primaries,
+                cd.transfer_characteristics,
+                cd.matrix_coeffs,
+            )
+        })
+        .unwrap_or((0, 0, 0));
+    Tags::from_codes(
+        u64::from(matrix),
+        u64::from(transfer),
+        if vst.video_full_range_flag { 2 } else { 1 },
+    )
+}
+
+/// RASL_N and RASL_R (8, 9): leading pictures dropped whole when their IRAP's
+/// `NoRaslOutputFlag` is 1 (8.1.3).
+fn is_rasl_picture(nal_type: NalUnitType) -> bool {
+    matches!(nal_type.code(), 8 | 9)
+}
+
+/// BLA_W_LP, BLA_W_RADL and BLA_N_LP (16..=18): always `NoRaslOutputFlag` 1
+/// (8.1.3), a broken-link splice point that never has a decodable RASL.
+fn is_bla_picture(nal_type: NalUnitType) -> bool {
+    (16..=18).contains(&nal_type.code())
 }
 
 /// `slice_pic_parameter_set_id`, readable without any parameter set.

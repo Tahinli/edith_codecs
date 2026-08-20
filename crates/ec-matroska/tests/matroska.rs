@@ -8,7 +8,7 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use ec_core::{Demuxer, Error, Muxer, SeekMode, TimeBase, Timestamp};
+use ec_core::{Demuxer, Error, MediaType, Muxer, SeekMode, TimeBase, Timestamp};
 use ec_matroska::{MatroskaDemuxer, MatroskaMuxer};
 
 fn fixtures() -> PathBuf {
@@ -710,4 +710,150 @@ fn the_first_cluster_is_reachable_when_no_cue_names_it() {
         );
         break;
     }
+}
+
+
+/// Where our own demuxer's seek lands on a real 5.1 E-AC-3 Matroska, in
+/// *timestamp* -- split from decode, per the round's charter: this measures
+/// only [`MatroskaDemuxer::seek`] plus the first packet's `pts`, against what
+/// `ffprobe` reports for the same track near the same instant. If this lands
+/// exact, the +0.145 s the consumer measured is downstream of the demuxer
+/// (the AC-3 decoder or its frame-count bookkeeping in `engine`), not here.
+///
+/// Skipped, not failed, without the film: a claim about his library cannot be
+/// made by a machine that does not have it.
+#[test]
+fn seek_landing_on_his_eac3_film_matches_ffprobe() {
+    same_class_sweep(
+        "/home/tahinli/Downloads/Project.Hail.Mary.2026.PROPER.HDR.2160p.WEB.h265-GRACE/Project.Hail.Mary.2026.PROPER.HDR.2160p.WEB.h265-GRACE.mkv",
+        &[600.0, 610.0],
+    );
+    // Same-class sweep (round charter task 3): an Opus 5.1 Matroska, a codec
+    // that already goes through this crate's demuxer -- if this lands as
+    // tight as the E-AC-3 one, the demuxer's seek is not codec-specific and
+    // the +0.145 s the consumer measured on the E-AC-3 path is downstream of
+    // it either way.
+    same_class_sweep(
+        "/home/tahinli/Downloads/The.Hunger.Games.The.Ballad.Of.Songbirds.And.Snakes.2023.Bluray.2160p.AV1.HDR10.OPUS.7.1-UH.mkv",
+        &[600.0, 610.0],
+    );
+}
+
+/// Where our own demuxer's seek lands on `path`, in *timestamp* -- split from
+/// decode, per the round's charter: this measures only
+/// [`MatroskaDemuxer::seek`] plus the first packet's `pts`, against what
+/// `ffprobe` reports for the same track near the same instant.
+///
+/// Skipped, not failed, without the film: a claim about his library cannot be
+/// made by a machine that does not have it.
+fn same_class_sweep(path: &str, wants: &[f64]) {
+    let film = Path::new(path);
+    if !film.exists() {
+        eprintln!("skipped: {path} is not present");
+        return;
+    }
+    let mut demux =
+        MatroskaDemuxer::new(BufReader::new(File::open(film).expect("opens"))).expect("demuxes");
+    let audio = demux
+        .streams()
+        .iter()
+        .find(|s| s.params.codec.media_type() == MediaType::Audio)
+        .expect("the film has an audio stream")
+        .clone();
+
+    for &want in wants {
+        let target = Timestamp::new(
+            (want * audio.time_base.den() as f64 / audio.time_base.num() as f64).round() as i64,
+            audio.time_base,
+        );
+        demux
+            .seek(audio.index, target, SeekMode::SyncBefore)
+            .expect("seek");
+        let landed = loop {
+            let packet = demux.next_packet().expect("a packet after the seek");
+            if packet.stream == audio.index {
+                break packet.pts.expect("audio packet carries a pts");
+            }
+        };
+        let our_secs = landed as f64 * audio.time_base.num() as f64 / audio.time_base.den() as f64;
+
+        let ffprobe = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "a:0",
+                "-show_entries",
+                "packet=pts_time",
+                "-of",
+                "csv=p=0",
+                "-read_intervals",
+            ])
+            .arg(format!("{want}%+#1"))
+            .arg(film)
+            .output();
+        let Ok(ffprobe) = ffprobe else {
+            eprintln!("skipped ffprobe cross-check: ffprobe not runnable");
+            eprintln!("want {want}s, our demuxer landed at {our_secs:.3}s (pts {landed})");
+            continue;
+        };
+        let reference: f64 = String::from_utf8_lossy(&ffprobe.stdout)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .parse()
+            .unwrap_or(f64::NAN);
+        eprintln!(
+            "want {want}s: our demuxer landed {our_secs:.3}s (pts {landed}),              ffprobe's own packet at {reference:.3}s"
+        );
+    }
+}
+
+/// `ffprobe` reports MaxCLL 1230 / MaxFALL 419 for this real HDR10 film, but
+/// that reading comes from `[SIDE_DATA]` on the first *frame* (a
+/// `content_light_level_information` HEVC SEI message inside the bitstream),
+/// not from the container's own `Colour` element. This file's `Colour`
+/// element genuinely carries no `MaxCLL`/`MaxFALL`/`MasteringMetadata`
+/// children (checked with `ffprobe -show_entries stream=side_data_list`,
+/// which comes back empty) — so a demuxer-only reader is correct to return
+/// `None` here, and the consumer's brightness-metadata gap is downstream, in
+/// whether anything reads the HEVC SEI (`ec_core::color::hevc_sei_light`
+/// exists and round-trips in `ec-h265-syntax`, but nothing in this workspace
+/// calls it from a real decode path yet).
+#[test]
+#[ignore = "reads a real local file, not a CI fixture"]
+fn real_hdr_film_container_states_no_light_metadata() {
+    use ec_core::{Demuxer, MediaParameters};
+    use ec_matroska::MatroskaDemuxer;
+    let path = "/home/tahinli/Downloads/Project.Hail.Mary.2026.PROPER.HDR.2160p.WEB.h265-GRACE/Project.Hail.Mary.2026.PROPER.HDR.2160p.WEB.h265-GRACE.mkv";
+    if !std::path::Path::new(path).exists() {
+        eprintln!("skipped: film not present");
+        return;
+    }
+    let f = std::fs::File::open(path).expect("open");
+    let demux = MatroskaDemuxer::new(f).expect("demux opens");
+    let mut checked = false;
+    for s in demux.streams() {
+        if let MediaParameters::Video(v) = &s.params.media {
+            println!("color = {:?}", v.color);
+            println!("light = {:?}", v.light);
+            // BT.2020 non-constant luminance, PQ transfer, BT.2020 primaries —
+            // this much the Colour element does carry, and it must match
+            // ffprobe's color_space/color_primaries/color_transfer.
+            assert_eq!(v.color.matrix, 9, "expected bt2020nc");
+            assert_eq!(v.color.transfer, 16, "expected smpte2084 (PQ)");
+            assert_eq!(v.color.primaries, 9, "expected bt2020");
+            assert_eq!(
+                v.light,
+                ec_core::color::ContentLight::default(),
+                "the Colour element has no light metadata for this file — a \
+                 non-default reading here would mean either ffprobe or this \
+                 reader started finding it in the container and the doc \
+                 comment above is stale"
+            );
+            checked = true;
+        }
+    }
+    assert!(checked, "no video stream found");
 }
