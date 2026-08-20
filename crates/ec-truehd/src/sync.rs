@@ -218,12 +218,6 @@ impl AccessUnitHeader {
         let mut substreams = Vec::new();
         let mut pos = dir_start;
         loop {
-            if substreams.len() >= 4 {
-                return Err(Error::unsupported(
-                    "TrueHD 4th (object/16-channel) substream",
-                    "only the 2/6/8-channel PCM presentations are implemented",
-                ));
-            }
             let word = au
                 .get(pos..pos + 2)
                 .ok_or(Error::NeedMore)?;
@@ -243,6 +237,12 @@ impl AccessUnitHeader {
                 end_offset_words,
                 extra,
             });
+            if substreams.len() >= 4 {
+                return Err(Error::unsupported(
+                    "TrueHD 4th (object/16-channel) substream",
+                    "only the 2/6/8-channel PCM presentations are implemented",
+                ));
+            }
             if pos + usize::from(end_offset_words) * 2 == length {
                 break;
             }
@@ -463,6 +463,37 @@ mod tests {
         au.resize(20, 0);
         let err = AccessUnitHeader::parse(&au).unwrap_err();
         assert!(matches!(err, Error::Unsupported { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn a_well_formed_4_entry_directory_is_still_named_unsupported() {
+        // A 20-byte access unit whose directory has exactly 4 entries, the
+        // last of which lands squarely on the access unit's end (the
+        // well-formed object-audio shape, not a walk that overruns a
+        // malformed directory). This must be refused by name, not parsed as
+        // Ok(4) and only caught later in channel_layout().
+        let mut au = vec![0x00, 0x0A, 0x00, 0x00]; // length 10 words = 20 bytes
+        au.extend_from_slice(&[0x00, 0x01]); // substream 0: doesn't land on EOF yet
+        au.extend_from_slice(&[0x00, 0x01]); // substream 1: doesn't land on EOF yet
+        au.extend_from_slice(&[0x00, 0x01]); // substream 2: doesn't land on EOF yet
+        au.extend_from_slice(&[0x00, 0x04]); // substream 3: pos(12) + 4*2 == 20, lands on EOF
+        au.resize(20, 0);
+        let err = AccessUnitHeader::parse(&au).unwrap_err();
+        assert!(matches!(err, Error::Unsupported { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn a_well_formed_3_entry_directory_still_parses() {
+        // Control for the test above: the same shape one entry shorter, its
+        // last pointer landing on the access unit's end, must still parse.
+        let mut au = vec![0x00, 0x0A, 0x00, 0x00]; // length 10 words = 20 bytes
+        au.extend_from_slice(&[0x00, 0x01]); // substream 0: doesn't land on EOF yet
+        au.extend_from_slice(&[0x00, 0x01]); // substream 1: doesn't land on EOF yet
+        au.extend_from_slice(&[0x00, 0x05]); // substream 2: pos(10) + 5*2 == 20, lands on EOF
+        au.resize(20, 0);
+        let parsed = AccessUnitHeader::parse(&au).unwrap();
+        assert_eq!(parsed.substreams.len(), 3);
+        assert_eq!(parsed.channel_layout().unwrap(), ChannelLayout::Surround7_1);
     }
 
     #[test]
