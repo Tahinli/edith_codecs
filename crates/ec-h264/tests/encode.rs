@@ -129,11 +129,13 @@ fn reconstruction_matches_the_decoder() {
     for (w, h) in [(176, 144), (208, 122), (64, 48)] {
         let mut clip = Clip::new(w, h);
         for qp in [12, 24, 33, 44] {
-            for (threads, preset, cabac) in [
-                (1usize, Preset::Fast, true),
-                (4, Preset::Balanced, true),
-                (1, Preset::Fast, false),
-                (3, Preset::Balanced, false),
+            for (threads, preset, cabac, t8x8) in [
+                (1usize, Preset::Fast, true, false),
+                (4, Preset::Balanced, true, false),
+                (1, Preset::Fast, false, false),
+                (3, Preset::Balanced, false, false),
+                (2, Preset::Balanced, true, true),
+                (2, Preset::Balanced, false, true),
             ] {
                 let mut cfg = EncoderConfig::new(w as u32, h as u32);
                 cfg.qp = qp;
@@ -141,6 +143,7 @@ fn reconstruction_matches_the_decoder() {
                 cfg.threads = threads;
                 cfg.preset = preset;
                 cfg.cabac = cabac;
+                cfg.transform_8x8 = t8x8;
                 let mut enc = Encoder::new(cfg).expect("encoder");
                 let mut stream = Vec::new();
                 let mut recons = Vec::new();
@@ -344,9 +347,11 @@ fn ffmpeg_decodes_bit_exactly() {
     for (w, h) in [(176, 144), (322, 242)] {
         for qp in [10, 20, 28, 37, 47] {
             let cavlc = qp % 2 == 0; // both entropy coders across the sweep
+            let t8x8 = qp % 3 == 1; // High-profile PPS with the per-MB flag
             let (stream, recons) = encode_clip(w, h, 6, |cfg| {
                 cfg.qp = qp;
                 cfg.cabac = !cavlc;
+                cfg.transform_8x8 = t8x8;
             });
             let decoded = ffmpeg_decode(&stream, w, h, &[]).expect("ffmpeg decodes our stream");
             assert_eq!(decoded.len(), recons.len(), "{w}x{h} qp {qp}: frame count");
