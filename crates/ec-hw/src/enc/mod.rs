@@ -138,7 +138,13 @@ impl EncoderConfig {
     }
 
     /// Set the VUI colour description; H.265 E.2.1 / H.264 E.1.1 code points.
-    pub fn colour(mut self, primaries: u8, transfer: u8, matrix: u8, full_range: bool) -> EncoderConfig {
+    pub fn colour(
+        mut self,
+        primaries: u8,
+        transfer: u8,
+        matrix: u8,
+        full_range: bool,
+    ) -> EncoderConfig {
         self.colour = Some(Colour {
             primaries,
             transfer,
