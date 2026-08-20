@@ -1905,26 +1905,23 @@ fn sbr_real_library_matches_reference() {
                 // the already-established global `lag` with NO per-window
                 // search (O(windows * 4096)), which is cheap and still gives
                 // an honest whole-file windowed mean/min at that fixed lag.
-                let timeline: Vec<(i64, f64)> =
-                    if std::env::var("EC_AAC_SBR_TIMELINE").is_ok() {
-                        windowed_lag_drift(o, t, oa, ob, windows)
-                    } else {
-                        (0..windows)
-                            .filter_map(|w| {
-                                let base_o = (oa as i64 + lag + (w * 4_096) as i64)
-                                    .try_into()
-                                    .ok()?;
-                                let base_t = ob + w * 4_096;
-                                if base_o + 4_096 > o.len() || base_t + 4_096 > t.len() {
-                                    return None;
-                                }
-                                Some((
-                                    lag,
-                                    correlation(&o[base_o..base_o + 4_096], &t[base_t..base_t + 4_096]),
-                                ))
-                            })
-                            .collect()
-                    };
+                let timeline: Vec<(i64, f64)> = if std::env::var("EC_AAC_SBR_TIMELINE").is_ok() {
+                    windowed_lag_drift(o, t, oa, ob, windows)
+                } else {
+                    (0..windows)
+                        .filter_map(|w| {
+                            let base_o = (oa as i64 + lag + (w * 4_096) as i64).try_into().ok()?;
+                            let base_t = ob + w * 4_096;
+                            if base_o + 4_096 > o.len() || base_t + 4_096 > t.len() {
+                                return None;
+                            }
+                            Some((
+                                lag,
+                                correlation(&o[base_o..base_o + 4_096], &t[base_t..base_t + 4_096]),
+                            ))
+                        })
+                        .collect()
+                };
                 if std::env::var("EC_AAC_SBR_TIMELINE").is_ok() {
                     println!(
                         "  ch{ch} TIMELINE ({windows} windows, {rate} Hz, window_idx@sec, local_lag, corr):"
@@ -1963,5 +1960,256 @@ fn sbr_real_library_matches_reference() {
     assert!(
         worst_low >= 0.9999,
         "worst below-crossover correlation {worst_low:.6} < 0.9999 -- the core decode itself regressed"
+    );
+}
+
+/// Writes `aus` (raw access units, no ADTS framing) plus `asc` (their own
+/// AudioSpecificConfig bytes, unmodified) into a fresh mp4 at `out_path`, so
+/// the reference decoder can be pointed at container-native SBR content that
+/// is byte-identical to the original stream's access units -- the same
+/// `esds`-carries-an-explicit-SBR-config shape `examples/wrap_sbr.rs` proved
+/// on synthetic content in round-31, reused here on a REAL file's own AUs as
+/// the round-41 Task 1 remux control.
+fn write_remux(out_path: &Path, asc: &[u8], aus: &[Vec<u8>]) {
+    let cfg = ec_aac::parse_audio_specific_config(asc).expect("real file's own ASC parses");
+    let core_rate = cfg.sample_rate;
+    let time_base = ec_core::TimeBase::from_rate(core_rate);
+    let layout = if cfg.channels == 1 {
+        ec_core::ChannelLayout::Mono
+    } else {
+        ec_core::ChannelLayout::Stereo
+    };
+    let mut params = ec_core::CodecParameters::new(CodecId::Aac);
+    params.extradata = Some(asc.to_vec().into());
+    params.media = ec_core::MediaParameters::Audio(ec_core::AudioParameters {
+        sample_rate: core_rate,
+        layout,
+        format: None,
+        bits_per_sample: None,
+    });
+    let mut info = ec_core::StreamInfo::new(0, time_base, params);
+    info.default = true;
+    let out = File::create(out_path).expect("remux output creatable");
+    let mut muxer = ec_mp4::Mp4Muxer::new(out).expect("mp4 muxer opens");
+    use ec_core::Muxer as _;
+    muxer.add_stream(info).expect("stream declared");
+    for (i, au) in aus.iter().enumerate() {
+        let pts = i as i64 * 1024;
+        let packet = Packet::new(0, time_base, au.as_slice())
+            .with_pts(pts)
+            .with_duration(1024);
+        muxer.write_packet(&packet).expect("packet written");
+    }
+    muxer.finish().expect("finished");
+}
+
+/// Mean/min of `bin_level_conviction`'s `direct` column, printed as one
+/// summary line per control pair.
+fn report_conviction(label: &str, rows: &[(f64, f64, f64, f64, f64, f64)]) {
+    if rows.is_empty() {
+        println!("  {label}: no HF bands measured (window too short)");
+        return;
+    }
+    let vals: Vec<f64> = rows.iter().map(|(_, _, direct, ..)| *direct).collect();
+    let mean = vals.iter().sum::<f64>() / vals.len() as f64;
+    let min = vals.iter().cloned().fold(f64::MAX, f64::min);
+    println!(
+        "  {label}: direct-coherence mean {mean:.4} min {min:.4} over {} HF bands",
+        vals.len()
+    );
+    for (hz, _, direct, ..) in rows {
+        println!("    {hz:>6.0}Hz: direct {direct:.4}");
+    }
+}
+
+/// (Round-41, Task 1) Instrument anchor: before trusting `bin_level_conviction`'s
+/// low (~0.15-0.25) HF direct-coherence numbers on Nikbinler as evidence the
+/// HF content is genuinely different, confirm the measurement itself reads
+/// near 1.0 on pairs that are KNOWN to carry the same content. Three
+/// controls:
+///   A. ours vs ours, decoded independently twice -- a determinism check on
+///      our own decode AND the coherence arithmetic's floor.
+///   B. the reference's own PCM from the original file vs from a remux of
+///      the SAME access units/ASC through a fresh container -- near-1.0
+///      expected; anything else would implicate the remux path, not SBR.
+///   C. the reference's own PCM vs itself read 64 samples later (one QMF
+///      slot) -- sanity that `bin_level_conviction`'s STFT hop/window does
+///      not itself destroy coherence for equivalent content at a fixed
+///      sample offset, the same shape of offset the real `oa`/`ob` alignment
+///      applies above.
+/// If any control reads below ~0.9 on the HF bands, the instrument -- not
+/// the SBR chain -- is the story; every prior round's coherence number would
+/// need to be recalibrated against whatever this control actually measures.
+#[test]
+fn sbr_instrument_anchor_controls() {
+    if std::env::var("EC_AAC_SBR_INSTRUMENT_ANCHOR").is_err() {
+        eprintln!("SKIP: set EC_AAC_SBR_INSTRUMENT_ANCHOR=1 to run (round-41 Task 1)");
+        return;
+    }
+    if !have_ffmpeg() {
+        eprintln!("SKIP: ffmpeg not on PATH");
+        return;
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    let path = PathBuf::from(format!("{home}/Music/Yok - Nikbinler.mp4"));
+    if !path.exists() {
+        eprintln!("SKIP: {} not found", path.display());
+        return;
+    }
+    const MIN_BAND: usize = 14;
+    const TOP_N: usize = 128; // larger than any real band count -- keeps every HF band
+
+    // Control A: ours vs ours, decoded independently twice.
+    let (ours_a, _, rate) = our_decode(&path, 0).expect("our_decode works");
+    let (ours_b, _, _) = our_decode(&path, 0).expect("our_decode works (2nd pass)");
+    let n = ours_a[0].len().min(ours_b[0].len()).min(MAX_SAMPLES);
+    let rows = bin_level_conviction(&ours_a[0][..n], &ours_b[0][..n], rate, MIN_BAND, TOP_N);
+    report_conviction("A: ours-vs-ours (determinism)", &rows);
+
+    // Control B: reference PCM from the original file vs from a remux of the
+    // SAME access units/ASC.
+    let (asc, aus) = extract_aac_track(&path, 0).expect("track extracts");
+    let remux_path = std::env::temp_dir().join("ec_aac_sbr_instrument_anchor_remux.mp4");
+    write_remux(&remux_path, &asc, &aus);
+    let theirs_orig = ffmpeg_decode(&path, 0, 2);
+    let theirs_remux = ffmpeg_decode(&remux_path, 0, 2);
+    let _ = std::fs::remove_file(&remux_path);
+    let n = theirs_orig[0]
+        .len()
+        .min(theirs_remux[0].len())
+        .min(MAX_SAMPLES);
+    let (lag_b, _) = best_lag_correlation(&theirs_orig[0][..n], &theirs_remux[0][..n]);
+    let (oa, ob) = if lag_b >= 0 {
+        (0usize, lag_b as usize)
+    } else {
+        ((-lag_b) as usize, 0usize)
+    };
+    let win = n.saturating_sub(oa.max(ob));
+    let rows = bin_level_conviction(
+        &theirs_orig[0][oa..oa + win],
+        &theirs_remux[0][ob..ob + win],
+        rate,
+        MIN_BAND,
+        TOP_N,
+    );
+    report_conviction(
+        &format!("B: reference-vs-reference-through-remux (lag {lag_b})"),
+        &rows,
+    );
+
+    // Control C: reference PCM vs itself read 64 samples later (one QMF
+    // slot) -- both slices are the SAME underlying samples, just offset.
+    let t = &theirs_orig[0][..MAX_SAMPLES.min(theirs_orig[0].len())];
+    if t.len() > 64 {
+        let rows = bin_level_conviction(&t[64..], &t[..t.len() - 64], rate, MIN_BAND, TOP_N);
+        report_conviction("C: reference vs reference, 64-sample offset", &rows);
+    }
+}
+
+/// (Round-41, Task 2) Actual injected HF noise energy, measured as OUTPUT
+/// energy rather than trusted from either side of round-24's contradiction:
+/// `noise_fraction_table` bookkept a 0.37-0.39 noise share from the
+/// transmitted envelope/noise split, while separately zeroing the injected
+/// noise (`EC_AAC_SBR_NOISE_ZERO`, which only skips the PCM addition in
+/// `sbr_env::adjust`, not the bookkeeping) was found to change full-band
+/// correlation by <0.001 -- both cannot be true of the same signal. This
+/// decodes Nikbinler twice (noise on, then off) and reads the per-HF-band
+/// `bin_level_conviction` energy delta between them as the fraction noise
+/// ACTUALLY realizes in the output, independent of either prior claim.
+#[test]
+fn sbr_actual_noise_fraction() {
+    if std::env::var("EC_AAC_SBR_NOISE_ANCHOR").is_err() {
+        eprintln!("SKIP: set EC_AAC_SBR_NOISE_ANCHOR=1 to run (round-41 Task 2)");
+        return;
+    }
+    if !have_ffmpeg() {
+        eprintln!("SKIP: ffmpeg not on PATH");
+        return;
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    let path = PathBuf::from(format!("{home}/Music/Yok - Nikbinler.mp4"));
+    if !path.exists() {
+        eprintln!("SKIP: {} not found", path.display());
+        return;
+    }
+    const MIN_BAND: usize = 14;
+    const TOP_N: usize = 128;
+
+    // SAFETY: this test does not run concurrently with any other test that
+    // reads these two vars (both are `ec_aac`-internal SBR debug switches,
+    // not read by `sbr_real_library_matches_reference`'s own decode path
+    // except through this same `zero_noise`/`track_fraction` plumbing) --
+    // invoke this test by name, not as part of a parallel `cargo test` run.
+    unsafe {
+        std::env::remove_var("EC_AAC_SBR_NOISE_ZERO");
+        std::env::set_var("EC_AAC_SBR_NOISE_FRACTION_DEBUG", "1");
+    }
+    let (ours_on, _, rate) = our_decode(&path, 0).expect("our_decode works (noise on)");
+    let bookkept = ec_aac::noise_fraction_table();
+    unsafe {
+        std::env::remove_var("EC_AAC_SBR_NOISE_FRACTION_DEBUG");
+        std::env::set_var("EC_AAC_SBR_NOISE_ZERO", "1");
+    }
+    let (ours_off, _, _) = our_decode(&path, 0).expect("our_decode works (noise zeroed)");
+    unsafe {
+        std::env::remove_var("EC_AAC_SBR_NOISE_ZERO");
+    }
+
+    let theirs = ffmpeg_decode(&path, 0, ours_on.len());
+    let n = ours_on[0].len().min(ours_off[0].len()).min(MAX_SAMPLES);
+    let on = &ours_on[0][..n];
+    let off = &ours_off[0][..n];
+
+    // Per-band actual energy delta: `energy` in `bin_level_conviction`'s row
+    // is always the FIRST argument's own band energy, so swap argument order
+    // between the two calls to read both sides' energies at the SAME band
+    // set (TOP_N kept above any real band count so both calls select every
+    // band, not just each side's own top few).
+    let rows_on = bin_level_conviction(on, off, rate, MIN_BAND, TOP_N);
+    let rows_off = bin_level_conviction(off, on, rate, MIN_BAND, TOP_N);
+    let band_hz = f64::from(rate) / 256.0;
+    println!(
+        "  ACTUAL noise fraction (band_hz, energy_on, energy_off, actual_fraction, bookkept_fraction):"
+    );
+    let mut sum_on = 0.0f64;
+    let mut sum_delta = 0.0f64;
+    for (hz, e_on, ..) in &rows_on {
+        let e_off = rows_off
+            .iter()
+            .find(|(hz2, ..)| (hz2 - hz).abs() < 1.0)
+            .map(|(_, e, ..)| *e)
+            .unwrap_or(0.0);
+        let actual = if *e_on > 0.0 {
+            (e_on - e_off) / e_on
+        } else {
+            0.0
+        };
+        let band = (hz / band_hz).round() as usize;
+        let book = bookkept
+            .iter()
+            .find(|(b, ..)| *b == band)
+            .map(|(_, s, n)| if s + n > 0.0 { n / (s + n) } else { 0.0 })
+            .unwrap_or(0.0);
+        println!(
+            "    {hz:>6.0}Hz: on {e_on:.3e} off {e_off:.3e} actual {actual:.4} bookkept {book:.4}"
+        );
+        sum_on += e_on;
+        sum_delta += e_on - e_off;
+    }
+    let actual_total = if sum_on > 0.0 {
+        sum_delta / sum_on
+    } else {
+        0.0
+    };
+    println!("  ACTUAL whole-HF noise fraction: {actual_total:.4}");
+
+    // Corr re-verification: does zeroing the injected noise move full-band
+    // correlation against the reference, and by how much (round-24 claimed
+    // <0.001).
+    let (_, corr_on) = best_lag_correlation(on, &theirs[0][..theirs[0].len().min(MAX_SAMPLES)]);
+    let (_, corr_off) = best_lag_correlation(off, &theirs[0][..theirs[0].len().min(MAX_SAMPLES)]);
+    println!(
+        "  full-band corr: noise-on {corr_on:.6} noise-off {corr_off:.6} delta {:.6}",
+        corr_off - corr_on
     );
 }

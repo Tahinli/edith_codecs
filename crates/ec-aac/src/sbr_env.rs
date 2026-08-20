@@ -148,11 +148,32 @@ impl NoiseGen {
 
     fn next(&mut self) -> f64 {
         self.0 = self.0.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-        f64::from(self.0 >> 8) / f64::from(1u32 << 23) - 0.5
+        // (Round-41, Task 2) `self.0 >> 8` keeps 24 bits (range [0, 2^24));
+        // dividing by `1u32 << 23` (2^23, ONE bit too few) left a range of
+        // [0, 2) before the `- 0.5`, i.e. actual output was uniform on
+        // [-0.5, 1.5) with mean +0.5 -- a DC-biased "noise" source, not
+        // zero-mean. `decode::Noise::next` (same LCG constants) divides by
+        // the same `1 << 23` but subtracts `1.0`, which correctly centers
+        // ITS doubled [0,2) range; this generator subtracted the wrong
+        // constant for its own divisor. Dividing by `1u32 << 24` instead
+        // fixes the range to [0, 1) so `- 0.5` correctly centers it on
+        // [-0.5, 0.5), mean 0.
+        f64::from(self.0 >> 8) / f64::from(1u32 << 24) - 0.5
     }
 
     fn complex_unit(&mut self) -> Complex<f64> {
-        Complex::new(self.next(), self.next())
+        // (Round-41, Task 2) `next()` is uniform on [-0.5, 0.5) (Var = 1/12
+        // per component), so a raw `(re, im)` pair has E[|z|^2] = 1/6, not
+        // 1 -- `adjust` scales this by `namp = sqrt(noise_here/width)`
+        // expecting E[|namp*z|^2] = noise_here, so without this correction
+        // only ~1/6 of the transmitted noise split was ever actually
+        // realized in the output. Measured directly (decode Nikbinler twice,
+        // noise on vs `EC_AAC_SBR_NOISE_ZERO`, per-band output energy delta
+        // in `tests/sbr_real_library.rs`'s `sbr_actual_noise_fraction`):
+        // bookkept split ~0.37-0.39, actual realized only ~0.10-0.30 in-band
+        // (whole-HF-weighted ~0.095) before this fix.
+        const UNIT_SCALE: f64 = 2.449_489_742_783_178; // sqrt(6)
+        Complex::new(self.next(), self.next()).scale(UNIT_SCALE)
     }
 }
 
@@ -671,6 +692,26 @@ mod tests {
                 "band {b}: avg {avg} vs target {target}"
             );
         }
+    }
+
+    /// (Round-41, Task 2) `NoiseGen::complex_unit`'s realized expected
+    /// squared magnitude must be ~1.0 -- `adjust` scales it by
+    /// `namp = sqrt(noise_here/width)` expecting `E[|namp*z|^2] =
+    /// noise_here`, so anything but ~1.0 here means the injected noise
+    /// under- or over-realizes the transmitted split regardless of the
+    /// limiter/boost interaction (measured separately, at the whole-decode
+    /// level, in `tests/sbr_real_library.rs`'s `sbr_actual_noise_fraction`).
+    /// Before the `sqrt(6)` fix this read ~1/6.
+    #[test]
+    fn complex_unit_has_unit_expected_squared_magnitude() {
+        let mut rng = NoiseGen::new(1);
+        let n = 200_000;
+        let mean_sq: f64 =
+            (0..n).map(|_| rng.complex_unit().norm_sqr()).sum::<f64>() / f64::from(n);
+        assert!(
+            (mean_sq - 1.0).abs() < 0.02,
+            "E[|complex_unit()|^2] = {mean_sq}, expected ~1.0"
+        );
     }
 
     #[test]
