@@ -193,6 +193,10 @@ impl EncEntropy {
         }
     }
 
+    pub(crate) fn is_cabac(&self) -> bool {
+        matches!(self, EncEntropy::Cabac(_))
+    }
+
     /// `end_of_slice_flag` after a macroblock (CABAC only).
     pub(crate) fn end_of_slice(&mut self, last: bool) {
         if let (EncEntropy::Cabac(c), false) = (self, last) {

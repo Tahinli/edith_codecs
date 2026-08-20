@@ -267,7 +267,12 @@ mod tests {
             let mut w = BitWriter::new();
             let mut tcs = [0u8; 4];
             for j in 0..4 {
-                tcs[j] = write_residual_block(&mut w, &super::super::entropy::sub_block_4x4(&c8, j), 16, j as i32 * 3);
+                tcs[j] = write_residual_block(
+                    &mut w,
+                    &super::super::entropy::sub_block_4x4(&c8, j),
+                    16,
+                    j as i32 * 3,
+                );
             }
             w.write_bit(true);
             w.align_to_byte();
