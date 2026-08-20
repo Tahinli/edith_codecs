@@ -676,6 +676,7 @@ pub(crate) fn matroska_codec_id(codec: CodecId) -> Result<&'static str> {
         CodecId::Aac => "A_AAC",
         CodecId::Ac3 => "A_AC3",
         CodecId::EAc3 => "A_EAC3",
+        CodecId::TrueHd => "A_TRUEHD",
         CodecId::Alac => "A_ALAC",
         CodecId::Flac => "A_FLAC",
         CodecId::Mp3 => "A_MPEG/L3",
