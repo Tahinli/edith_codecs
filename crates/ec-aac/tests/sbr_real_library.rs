@@ -833,6 +833,114 @@ fn bin_level_conviction(
     out
 }
 
+/// Round-38, Task 1: sweeps a constant HF-only sample-domain lag `k*64`
+/// (`k` in -8..=8; one QMF synthesis slot = 64 output samples) applied ONLY
+/// to `o`'s STFT read position, holding `t` fixed at the globally-aligned
+/// `ob` offset -- the low band (which drives the global `lag` this window is
+/// already re-sliced to via `oa`/`ob`) is never touched by this probe. Per
+/// bin, coherence is the SAME "direct" measure `bin_level_conviction` uses
+/// (`|sum_h O(h)*conj(T(h))| / sqrt(sum_h|O(h)|^2 * sum_h|T(h)|^2)`), then
+/// averaged uniformly over every bin in every HF SBR band from `min_band`
+/// upward (both parity regions together, not just the top-energy handful) --
+/// a clear peak at k != 0 convicts a constant reference-vs-ours HF alignment
+/// offset of that many QMF slots; a flat or zero-peaked curve refutes it.
+fn hf_lag_sweep(
+    o: &[f32],
+    t: &[f32],
+    oa: usize,
+    ob: usize,
+    n: usize,
+    min_band: usize,
+) -> Vec<(i64, f64)> {
+    const FFT_LEN: usize = 2048;
+    const HOP: usize = 1024;
+    const BINS_PER_SBR_BAND: usize = FFT_LEN / 256;
+    const MAX_K: i64 = 8;
+    const SLOT: i64 = 64;
+    let win = ec_dsp::Window::<f32>::sine(FFT_LEN);
+    let probe_bins = ec_dsp::RealFft::<f32>::new(FFT_LEN).spectrum_len();
+    let num_bands = probe_bins / BINS_PER_SBR_BAND;
+    let lo_bin = min_band * BINS_PER_SBR_BAND;
+    let hi_bin = (num_bands * BINS_PER_SBR_BAND).min(probe_bins);
+    if lo_bin >= hi_bin {
+        return Vec::new();
+    }
+    let hops = if n >= FFT_LEN {
+        (n - FFT_LEN) / HOP + 1
+    } else {
+        0
+    };
+    if hops == 0 {
+        return Vec::new();
+    }
+    let spec_of = |s: &[f32], start: usize| -> Vec<Vec<ec_dsp::Complex<f32>>> {
+        let mut rfft = ec_dsp::RealFft::<f32>::new(FFT_LEN);
+        let mut spec = vec![Vec::with_capacity(hops); probe_bins];
+        let mut spectrum = vec![ec_dsp::Complex::new(0.0f32, 0.0); probe_bins];
+        for h in 0..hops {
+            let mut block = s[start + h * HOP..start + h * HOP + FFT_LEN].to_vec();
+            win.apply(&mut block);
+            rfft.forward(&block, &mut spectrum);
+            for (b, c) in spectrum.iter().enumerate() {
+                spec[b].push(*c);
+            }
+        }
+        spec
+    };
+    let mut out = Vec::with_capacity((2 * MAX_K + 1) as usize);
+    for k in -MAX_K..=MAX_K {
+        let shift = k * SLOT;
+        // Prefer shifting `o`'s read start (the literal ask), but `o` has no
+        // samples before its own decode origin -- when the global alignment
+        // already pins `oa` at (or near) 0, negative `k` has nowhere to read
+        // from on that side. `coh(o[x], t[y])` only depends on `x - y`, so
+        // shifting `t`'s read start the OPPOSITE direction instead
+        // (`ob - shift`) tests the exact same relative offset and `t` (the
+        // reference, decoded in full) always has the room. Only actually
+        // falls back for `o`-boundary-starved `k`; the un-shifted `t` path
+        // above is untouched for every `k` that fits within `o`.
+        let (o_start, t_start) = {
+            let os = oa as i64 + shift;
+            if os >= 0 && os as usize + n <= o.len() {
+                (os as usize, ob)
+            } else {
+                let ts = ob as i64 - shift;
+                if ts >= 0 && ts as usize + n <= t.len() {
+                    (oa, ts as usize)
+                } else {
+                    continue;
+                }
+            }
+        };
+        let o_spec = spec_of(o, o_start);
+        let t_spec = spec_of(t, t_start);
+        let mut sum = 0.0f64;
+        let mut count = 0usize;
+        for b in lo_bin..hi_bin {
+            let mut cross_re = 0.0f64;
+            let mut cross_im = 0.0f64;
+            let mut o_e = 0.0f64;
+            let mut t_e = 0.0f64;
+            for h in 0..hops {
+                let oc = o_spec[b][h];
+                let tc = t_spec[b][h];
+                let cross = oc * tc.conj();
+                cross_re += f64::from(cross.re);
+                cross_im += f64::from(cross.im);
+                o_e += f64::from(oc.norm_sqr());
+                t_e += f64::from(tc.norm_sqr());
+            }
+            let den = (o_e * t_e).sqrt();
+            if den > 0.0 {
+                sum += (cross_re * cross_re + cross_im * cross_im).sqrt() / den;
+                count += 1;
+            }
+        }
+        out.push((k, if count > 0 { sum / count as f64 } else { 0.0 }));
+    }
+    out
+}
+
 /// A file discovered under the user's own media directories: its path, which
 /// AAC stream in it (0-based among AAC streams only) carries HE-AAC, and the
 /// core/SBR crossover an ffprobe/ASC inspection already pinned for it -- used
@@ -1463,6 +1571,26 @@ fn sbr_real_library_matches_reference() {
                 println!(
                     "  ch{ch} PARITY-SPLIT direct-coherence mean: even-gap[14,28)={even_mean:.4} (n={even_n}) odd-gap[28,43)={odd_mean:.4} (n={odd_n})"
                 );
+            }
+            // (Round-38, Task 1) HF-only constant-lag sweep: see
+            // `hf_lag_sweep`'s doc comment. Reuses this window's already
+            // globally-aligned `oa`/`ob`/`n`; only `o`'s STFT read position is
+            // shifted, `n_slot`*64 samples at a time.
+            if std::env::var("EC_AAC_SBR_HF_LAG_SWEEP").is_ok() && n >= 4_096 {
+                let band_hz = f64::from(rate) / 256.0;
+                let min_band = (2_500.0 / band_hz).ceil() as usize;
+                let sweep = hf_lag_sweep(o, t, oa, ob, n, min_band);
+                println!(
+                    "  ch{ch} TASK1 HF-only lag sweep (k = QMF slots of 64 samples, mean direct HF-bin coherence):"
+                );
+                for (k, coh) in &sweep {
+                    println!("    k={k:>3}: coherence {coh:.4}");
+                }
+                if let Some((peak_k, peak_c)) =
+                    sweep.iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                {
+                    println!("  ch{ch} HF lag sweep peak: k={peak_k} coherence {peak_c:.4}");
+                }
             }
             println!(
                 "  ch{ch}: lag {lag}, full {full:.6}, below {:.0}Hz {low:.6}, above {:.0}Hz {high:.6}",
