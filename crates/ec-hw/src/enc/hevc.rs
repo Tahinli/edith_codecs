@@ -146,6 +146,7 @@ pub(super) fn parameters(
         num_units_in_tick: seq.vui_num_units_in_tick,
         time_scale: seq.vui_time_scale,
         init_qp: pic.pic_init_qp,
+        colour: config.colour,
     };
     let (vps, sps, pps) = hevc_headers::parameter_sets(&header_params);
     if keyframe {
