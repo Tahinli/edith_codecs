@@ -3431,3 +3431,155 @@ fn sbr_header_feature_table() {
         );
     }
 }
+
+/// Round (sbr-per-au): per-AU localization. Decodes the same AU list through
+/// (a) the core-only decoder and (b) the full SBR chain, tracks each AU's
+/// sample range in both output streams as it goes (so a per-AU decode
+/// failure on either side does not desync the mapping), aligns the two
+/// streams ONCE in the core's own native rate domain (same decimate
+/// convention `synthetic_heaac_matrix`'s `ours_v_core` row already trusts),
+/// then re-uses that single lag for every AU's own low-band correlation.
+/// Prints the first 5 AUs below 0.9 with that AU's SBR side-info (source/
+/// envelope count/freq_res/kx/k2) so a per-frame trigger (e.g. `hold`
+/// frames, a specific `freq_res`) shows up directly instead of needing a
+/// second pass. If the first divergent AU is 0, that is reported explicitly
+/// -- divergence from the very first AU means a per-stream setup mismatch,
+/// not a per-frame trigger.
+fn per_au_low_band_probe(label: &str, path: &Path, aac_stream: usize) {
+    let Some((asc, aus)) = extract_aac_track(path, aac_stream) else {
+        eprintln!("SKIP {label}: extract_aac_track failed");
+        return;
+    };
+    let Ok(full_cfg) = parse_audio_specific_config(&asc) else {
+        eprintln!("SKIP {label}: asc parse failed");
+        return;
+    };
+    if !full_cfg.sbr_present {
+        eprintln!("SKIP {label}: no SBR");
+        return;
+    }
+    let mut core_cfg = full_cfg.clone();
+    core_cfg.sbr_present = false;
+    core_cfg.ps_present = false;
+    core_cfg.extension_sample_rate = None;
+    let core_rate = core_cfg.sample_rate;
+    let mut core_dec = AacDecoder::with_config(core_cfg);
+    let mut full_dec = AacDecoder::with_config(full_cfg);
+    let full_rate = full_dec.output_sample_rate().unwrap_or(core_rate * 2);
+
+    struct AuInfo {
+        core_range: (usize, usize),
+        side: Option<ec_aac::SbrSideInfoRow>,
+    }
+    let mut core_ch0: Vec<f32> = Vec::new();
+    let mut full_ch0: Vec<f32> = Vec::new();
+    let mut aus_info: Vec<AuInfo> = Vec::new();
+    for au in aus.iter().take(1_500) {
+        let side_before = ec_aac::sbr_sideinfo_log().len();
+        let cs = core_ch0.len();
+        if let Ok(f) = core_dec.decode(au, None) {
+            let ch = usize::from(f.channels).max(1);
+            core_ch0.extend(f.samples.iter().step_by(ch).copied());
+        }
+        let ce = core_ch0.len();
+        if let Ok(f) = full_dec.decode(au, None) {
+            let ch = usize::from(f.channels).max(1);
+            full_ch0.extend(f.samples.iter().step_by(ch).copied());
+        }
+        let side = ec_aac::sbr_sideinfo_log()[side_before..]
+            .iter()
+            .find(|r| r.ch == 0)
+            .cloned();
+        aus_info.push(AuInfo {
+            core_range: (cs, ce),
+            side,
+        });
+        if full_ch0.len() > MAX_SAMPLES {
+            break;
+        }
+    }
+    if core_ch0.is_empty() || full_ch0.is_empty() {
+        eprintln!("SKIP {label}: empty decode (core {} full {})", core_ch0.len(), full_ch0.len());
+        return;
+    }
+
+    // Same convention `full_chain_low_band_matches_own_core` already
+    // validated (0.9967 on Nikbinler): naive nearest-neighbor 2x-upsample
+    // the core into the full-rate domain, low-pass both well under the core
+    // Nyquist. The decimate-into-core-rate convention `synthetic_heaac_matrix`
+    // uses for its own `ours_v_core` diagnostic column was tried first here
+    // and reads badly (~-0.19) even on Nikbinler, which is known-good --
+    // that column is evidently not a reliable self-consistency probe on its
+    // own, so this per-AU tool anchors on the convention independently
+    // proven correct instead.
+    let up: Vec<f32> = core_ch0.iter().flat_map(|&s| [s, s]).collect();
+    let cutoff = f64::from(core_rate) * 0.4;
+    let ol = lowpass(&full_ch0, full_rate, cutoff);
+    let ul = lowpass(&up, full_rate, cutoff);
+    const WIDE_LAG_MAX: i64 = 20_000;
+    let (lag, align_corr) = best_lag_correlation_wide(&ol, &ul, WIDE_LAG_MAX);
+    println!(
+        "{label}: core={core_rate}Hz full={full_rate}Hz global align (upsampled full-rate domain) lag={lag} corr={align_corr:.6}"
+    );
+
+    let mut shown = 0usize;
+    let mut first_divergent: Option<usize> = None;
+    for (i, info) in aus_info.iter().enumerate() {
+        let (cs, ce) = info.core_range;
+        if ce <= cs {
+            continue;
+        }
+        // core_range is in core-domain sample counts; the upsampled/lowpassed
+        // arrays are at full rate, so the AU's window there is 2x as wide.
+        let fs = cs * 2;
+        let fe = ce * 2;
+        let ds = match usize::try_from(fs as i64 + lag) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let de = ds + (fe - fs);
+        if de > ul.len() || fe > ol.len() {
+            break;
+        }
+        let c = correlation(&ol[fs..fe], &ul[ds..de]);
+        if c < 0.9 {
+            if first_divergent.is_none() {
+                first_divergent = Some(i);
+            }
+            if shown < 5 {
+                println!("  AU {i}: low-band corr={c:.6} side={:?}", info.side);
+                shown += 1;
+            }
+        }
+    }
+    match first_divergent {
+        Some(0) => println!(
+            "{label}: divergence starts at AU 0 -- per-STREAM setup mismatch, not a per-frame trigger"
+        ),
+        Some(i) => println!("{label}: first divergent AU = {i}"),
+        None => println!("{label}: no AU below 0.9 corr in the probed window"),
+    }
+}
+
+#[test]
+fn per_au_low_band_divergence() {
+    if !have_ffmpeg() {
+        eprintln!("SKIP: ffmpeg not on PATH");
+        return;
+    }
+    unsafe {
+        std::env::set_var("EC_AAC_SBR_SIDEINFO_DEBUG", "1");
+    }
+    for c in &candidates() {
+        per_au_low_band_probe(&c.path.display().to_string(), &c.path, c.aac_stream);
+    }
+    let dir = std::env::var("EC_AAC_HEAAC_FIXTURES").unwrap_or_else(|_| {
+        format!("{}/../../.cache/heaac-fixtures", env!("CARGO_MANIFEST_DIR"))
+    });
+    let failing = PathBuf::from(&dir).join("heaac_44100_48k.m4a");
+    if failing.exists() {
+        per_au_low_band_probe("synthetic 44100 48k (failing)", &failing, 0);
+    } else {
+        eprintln!("SKIP synthetic 44100 48k: {} absent", failing.display());
+    }
+}
