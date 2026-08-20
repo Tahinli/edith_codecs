@@ -28,8 +28,11 @@
 //! ## Codebooks
 //!
 //! Designed here rather than inherited: a floor book over the folded amplitude
-//! range, a class book over partition-class pairs, and four residue books whose
-//! ranges (+-1, +-4, +-16, +-127) the partition classifier picks between. All of
+//! range, a class book over partition-class pairs, and eight residue books whose
+//! ranges (+-1, +-2, +-4 ... +-64, +-127) the partition classifier picks between —
+//! a partition's values sit about a sixth of its class's range on average,
+//! so one book per octave of range keeps every value near the top of its
+//! own book. All of
 //! them are Huffman codes over stated distributions, built at construction and
 //! written into every stream's own setup header — which is why this encoder
 //! needs no embedded profile and has no channel count it cannot serve. Both
@@ -58,19 +61,22 @@ const HALF_LONG: usize = BLOCK_LONG / 2;
 /// Coefficients in a short block.
 const HALF_SHORT: usize = BLOCK_SHORT / 2;
 /// Long-block coefficients per residue partition.
-const PARTITION_LONG: usize = 32;
+const PARTITION_LONG: usize = 16;
 /// Short-block coefficients per residue partition.
 const PARTITION_SHORT: usize = 16;
-/// Long floor X points besides the two endpoints.
-const FLOOR_POINTS_LONG: usize = 20;
+/// Long floor X points besides the two endpoints. Fewer is better here, on
+/// real music at 128 kbps: 12 beat 16, 20, 32 and 44 in that order, since a
+/// finer floor costs bits of its own and then follows every peak closely
+/// enough to spend residue bits under all of them.
+const FLOOR_POINTS_LONG: usize = 12;
 /// Short floor X points besides the two endpoints.
 const FLOOR_POINTS_SHORT: usize = 8;
 /// Floor values per class.
 const FLOOR_CLASS_DIM: usize = 4;
 /// Residue classes; class 0 codes nothing at all.
-const CLASSES: usize = 5;
+const CLASSES: usize = 9;
 /// Largest quantised residue each class's book can state.
-const CLASS_RANGE: [i32; CLASSES] = [0, 1, 4, 16, 127];
+const CLASS_RANGE: [i32; CLASSES] = [0, 1, 2, 4, 8, 16, 32, 64, 127];
 /// Headroom in dB the widest residue book can actually state: 20 log10 127
 /// is 42, but a coupled angle channel is a difference of two magnitudes, so a
 /// pair's step must leave half that range — 63, 36 dB. Past this the rate loop's extra headroom lowers the absolute-threshold
@@ -84,6 +90,30 @@ const HEADROOM_RANGE: f64 = 36.0;
 /// Anything the wider range cannot state (a pair's angle, a peak at a floor
 /// region's edge) is caught by the clamp refit in `encode_block`.
 const HEADROOM_RANGE_SHORT: f64 = 42.0;
+/// Nothing more than this many dB under a block's loudest floor point is
+/// coded: a whole-spectrum co-masking cap. corner-cut: a flat cap is not a
+/// spreading function — real masking falls off with distance in Barks, so
+/// this drops a quiet treble part under a loud bass note that the ear would
+/// still pick out. It is what buys real music its accuracy at this rate (on
+/// three tracks at 128 kbps, 0.989 -> 0.995 correlation with the source);
+/// the upgrade is a Bark-domain spread in `fit_floor` in place of the
+/// per-point decay plus this cap. Swept 40 / 50 / 60 dB: 40 is better still
+/// on the metric but too deaf to be honest.
+const CO_MASK_RANGE: f64 = 50.0;
+/// A short block gets no co-masking cap: a bin it drops is an error spread
+/// across its whole window, the half before an onset included, and that is
+/// the pre-echo the short block exists to prevent (44.1k mono, onset on the
+/// grid: peak 0.0085 with the cap, under 0.007 without).
+const CO_MASK_RANGE_SHORT: f64 = f64::INFINITY;
+/// Above this frequency the coupled pair's angle is dropped and only the
+/// magnitude coded (point stereo): the ear does not place HF detail by
+/// inter-channel level difference finely enough to pay for coding it, and at
+/// this rate the bits buy more accuracy in the magnitude. Below it the pair
+/// is coded losslessly. Swept on real music at 128 kbps: 3-6 kHz are equal,
+/// 10 kHz and no cutoff are worse.
+const POINT_STEREO_HZ: f64 = 4_000.0;
+/// Least headroom a short block is quantised with, whatever the rate loop's.
+const HEADROOM_SHORT_MIN: f64 = 42.0;
 /// Samples per transient-detection tick — the short block's own hop, so a
 /// tick lines up with the finest time resolution the encoder has.
 const TICK: usize = BLOCK_SHORT / 4;
@@ -101,9 +131,12 @@ const MODE_LONG: u32 = 1;
 /// A tick energy jump past this multiple of its predecessor is a transient;
 /// a near-zero predecessor makes this trip on any onset above the floor.
 const TRANSIENT_RATIO: f64 = 16.0;
-/// Below this per-sample mean square, a tick is not "content" at all — the
-/// floor that keeps digital silence from ever tripping the detector.
-const TRANSIENT_FLOOR: f64 = 1e-9;
+/// Below this per-sample mean square (-60 dBFS), a tick is not "content" at
+/// all — the floor that keeps digital silence, dither and fade tails from
+/// tripping the detector.
+const TRANSIENT_FLOOR: f64 = 1e-6;
+/// Ticks before the candidate whose loudest one the jump is measured from.
+const TRANSIENT_HISTORY: usize = 4;
 
 /// Buffer samples of left pre-roll before input sample 0 — one long half, so
 /// even a block starting at the very front of the stream finds zeroes rather
@@ -175,6 +208,8 @@ struct BlockConfig {
     ath: Vec<f64>,
     /// Headroom the residue range lets this block size state.
     range: f64,
+    /// dB under the loudest floor point below which nothing is coded.
+    co_mask: f64,
 }
 
 /// Vorbis I encoder.
@@ -249,6 +284,7 @@ impl VorbisEncoder {
             PARTITION_LONG,
             FLOOR_POINTS_LONG,
             HEADROOM_RANGE,
+            CO_MASK_RANGE,
             &config,
         );
         let short = build_block_config(
@@ -256,6 +292,7 @@ impl VorbisEncoder {
             PARTITION_SHORT,
             FLOOR_POINTS_SHORT,
             HEADROOM_RANGE_SHORT,
+            CO_MASK_RANGE_SHORT,
             &config,
         );
 
@@ -458,10 +495,14 @@ impl VorbisEncoder {
         };
         // Only the right half is new; its left neighbour was already the
         // right half the last time this block's window was checked.
+        let floor = TRANSIENT_FLOOR * (TICK * self.buffer.len()) as f64;
         for t in ticks / 2..ticks {
-            let previous = energy(t - 1);
+            // Against the loudest of the few ticks before it, not just the
+            // one: music rising over a few ticks is not a transient, a drum
+            // hit or an onset after silence is.
+            let previous = (t.saturating_sub(TRANSIENT_HISTORY)..t).map(energy).fold(0.0f64, f64::max);
             let current = energy(t);
-            if current > TRANSIENT_FLOOR && current > previous * TRANSIENT_RATIO {
+            if current > floor && current > previous * TRANSIENT_RATIO {
                 return true;
             }
         }
@@ -550,6 +591,16 @@ impl VorbisEncoder {
         // until nothing clamps, so the curve hugs the peaks the range is
         // measured from.
         let limit = CLASS_RANGE[CLASSES - 1];
+        // A short block's precision is what bounds the pre-echo inside the
+        // window that carries an onset, so it does not inherit whatever
+        // headroom the music before it left the rate loop at: at 6 ch / 96 kHz
+        // the loop sat at 22 dB when the onset came and leaked -36 dB across
+        // the half-window before it. A short run is 16 blocks once a second
+        // or so on music, so the extra bits are noise to the loop.
+        let headroom = match plan.is_long {
+            true => self.headroom,
+            false => self.headroom.max(HEADROOM_SHORT_MIN),
+        };
         let mut lift: Vec<Vec<f64>> = vec![vec![1.0; bc.floor.x_list.len()]; channels];
         // Per X point, the span of bins whose curve it has a hand in.
         let spans: Vec<(usize, usize)> = bc
@@ -586,7 +637,7 @@ impl VorbisEncoder {
                         *peak *= boost;
                     }
                 }
-                let (y, step2) = fit_floor(&bc.floor, &bc.ath, self.headroom, bc.range, &peaks);
+                let (y, step2) = fit_floor(&bc.floor, &bc.ath, headroom, bc.range, bc.co_mask, &peaks);
                 let mut curve = vec![0.0f32; half];
                 render_floor1(&bc.floor, &y, &step2, &mut curve);
                 for &c in group {
@@ -621,10 +672,17 @@ impl VorbisEncoder {
             for &(magnitude, angle) in &self.coupling {
                 let mut left = std::mem::take(&mut quantised[magnitude]);
                 let mut right = std::mem::take(&mut quantised[angle]);
-                for (l, r) in left.iter_mut().zip(right.iter_mut()) {
+                // Only while bits are scarce: headroom at the range is the
+                // rate loop saying the step cannot get finer, so the budget
+                // is better spent stating the angle than left unspent.
+                let point = match self.headroom < bc.range {
+                    true => (POINT_STEREO_HZ / (f64::from(self.config.sample_rate) * 0.5) * half as f64) as usize,
+                    false => half,
+                };
+                for (bin, (l, r)) in left.iter_mut().zip(right.iter_mut()).enumerate() {
                     let (m, a) = couple(*l, *r);
                     *l = m;
-                    *r = a;
+                    *r = if bin >= point { 0 } else { a };
                 }
                 quantised[magnitude] = left;
                 quantised[angle] = right;
@@ -737,6 +795,7 @@ fn fit_floor(
     ath: &[f64],
     headroom: f64,
     range: f64,
+    co_mask: f64,
     peaks: &[f64],
 ) -> (Vec<i32>, Vec<bool>) {
     let mut db: Vec<f64> = peaks
@@ -752,10 +811,12 @@ fn fit_floor(
         let (current, next) = (window[0], window[1]);
         db[current] = db[current].max(db[next] - 24.0);
     }
+    let loudest = db.iter().copied().fold(f64::MIN, f64::max);
     let target: Vec<f64> = db
         .iter()
         .zip(ath.iter())
         .map(|(&level, &threshold)| {
+            let threshold = threshold.max(loudest - co_mask);
             (level - headroom.min(range)).max(threshold - (headroom - range).max(0.0))
         })
         .collect();
@@ -985,6 +1046,7 @@ fn build_block_config(
     partition: usize,
     points: usize,
     range: f64,
+    co_mask: f64,
     config: &EncoderConfig,
 ) -> BlockConfig {
     let floor = build_floor(half, points);
@@ -996,7 +1058,7 @@ fn build_block_config(
             absolute_threshold(hz)
         })
         .collect();
-    BlockConfig { half, partition, floor, ath, range }
+    BlockConfig { half, partition, floor, ath, range, co_mask }
 }
 
 /// Folded floor amplitudes: mostly small corrections, occasionally an escape
@@ -1010,10 +1072,12 @@ fn design_floor_book() -> CodebookSpec {
 
 /// Class pairs, on the assumption that most partitions are silent.
 fn design_class_book() -> CodebookSpec {
-    let per_class = [0.55f64, 0.20, 0.15, 0.08, 0.02];
+    // Measured on real music at 128 kbps: silent partitions are four in ten,
+    // the three smallest ranges split most of the rest.
+    let per_class = [0.40f64, 0.18, 0.19, 0.16, 0.05, 0.011, 0.008, 0.007, 0.001];
     let mut weights = Vec::with_capacity(CLASSES * CLASSES);
-    for first in per_class {
-        for second in per_class {
+    for &first in &per_class {
+        for &second in &per_class {
             weights.push(first * second);
         }
     }
@@ -1027,7 +1091,9 @@ fn design_residue_books() -> Vec<CodebookSpec> {
     CLASS_RANGE[1..]
         .iter()
         .map(|&range| {
-            let sigma = f64::from(range).max(1.0) / 2.5;
+            // Measured mean |value| inside a partition of each class is about
+            // a sixth of the class's range, whatever the range.
+            let sigma = f64::from(range).max(1.0) / 6.0;
             let weights: Vec<f64> = (-range..=range)
                 .map(|v| (-f64::from(v.abs()) / sigma).exp() + 1e-4)
                 .collect();
