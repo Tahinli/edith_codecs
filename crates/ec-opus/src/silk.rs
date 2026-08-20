@@ -221,7 +221,7 @@ fn lshift_sat32(a: i32, shift: i32) -> i32 {
 
 /// `silk_RAND`: the excitation sign PRNG.
 #[inline]
-fn silk_rand(seed: i32) -> i32 {
+pub(crate) fn silk_rand(seed: i32) -> i32 {
     (907633515i32).wrapping_add(seed.wrapping_mul(196314165))
 }
 
@@ -408,6 +408,16 @@ impl SilkDecoder {
             prev_decode_only_middle: false,
             resample_tmp: vec![0; 5760],
         }
+    }
+
+    /// The last 20 ms of decoded output of channel 0 at the internal rate:
+    /// the synthesis history `decode_core` whitens for its LTP state. The
+    /// encoder mirrors its own packets through a `SilkDecoder` and reads this
+    /// so its LTP search runs on exactly what the real decoder will predict
+    /// from.
+    pub(crate) fn history(&self) -> &[i16] {
+        let ch = &self.channels[0];
+        &ch.out_buf[..ch.ltp_mem_length]
     }
 
     /// Drops all inter-packet state.
