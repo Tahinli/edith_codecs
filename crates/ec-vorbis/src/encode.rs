@@ -457,6 +457,14 @@ impl VorbisEncoder {
             if buffer_start < 0 || self.buffer[0].len() < buffer_start as usize + n {
                 break;
             }
+            // A steady long block is typed by the hop *after* it; until that
+            // hop is buffered the plan just peeked was decided blind.
+            if !self.finished
+                && matches!(self.scheduler, Sched::Steady)
+                && self.buffer[0].len() < buffer_start as usize + n + BLOCK_LONG
+            {
+                break;
+            }
             let granule = match self.finished {
                 true => centre.min(self.fed),
                 false => centre,
@@ -933,11 +941,17 @@ fn design_residue_books() -> Vec<CodebookSpec> {
 }
 
 /// Absolute threshold of hearing in dBFS, full scale taken as 96 dB SPL.
+///
+/// Capped at -80 dBFS: the curve's own values at DC and above ~17 kHz
+/// (-13 / -10 dBFS) are not a quantiser step the rest of a block can live
+/// with — an onset inside a short block puts real energy in exactly those
+/// bins, and coding them that coarsely leaked -38 dB of pre-echo across the
+/// whole 256-sample window.
 fn absolute_threshold(hz: f64) -> f64 {
     let khz = (hz / 1000.0).clamp(0.02, 20.0);
     let spl =
         3.64 * khz.powf(-0.8) - 6.5 * (-0.6 * (khz - 3.3).powi(2)).exp() + 0.001 * khz.powi(4);
-    (spl - 96.0).clamp(-120.0, -10.0)
+    (spl - 96.0).clamp(-120.0, -80.0)
 }
 
 /// The three header packets, in order.
