@@ -113,6 +113,26 @@ fn probe(path: &Path, field: &str) -> String {
 }
 
 #[test]
+fn writes_an_ogg_44100_mono_widened_to_stereo() {
+    let path = scratch("write-ogg-44100-widened.ogg");
+    let rate = 44_100u32;
+    let frames = 44_100usize;
+    let mono = mix(1, rate, frames);
+    let widened: Vec<i16> = mono.iter().flat_map(|&s| [s, s]).collect();
+    write_ogg(&path, &widened, 2, rate);
+    let decode = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(&path)
+        .args(["-f", "f32le", "-"])
+        .output()
+        .expect("ffmpeg");
+    assert!(decode.stderr.is_empty(), "ffmpeg said {}", String::from_utf8_lossy(&decode.stderr));
+    println!("duration_ts={}", probe(&path, "duration_ts"));
+    let decoded = decode.stdout.len() / 4 / 2;
+    assert_eq!(decoded, frames, "decoded sample count");
+}
+
+#[test]
 fn writes_an_ogg_the_way_the_replica_would_without_its_corrections() {
     let rate = 48_000u32;
     // Deliberately not a whole number of blocks: the grid has to close over it

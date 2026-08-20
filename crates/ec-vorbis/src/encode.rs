@@ -1009,6 +1009,31 @@ mod tests {
     }
 
     #[test]
+    fn tail_granule_44100_mono() {
+        let mut enc = VorbisEncoder::new(EncoderConfig {
+            sample_rate: 44_100,
+            channels: 2,
+            bitrate_bps: -1,
+            quality: 0.85,
+        })
+        .unwrap();
+        let pcm = vec![0.1f32; 44_100 * 2];
+        enc.push_interleaved(&pcm).unwrap();
+        enc.finish();
+        let mut last = 0i64;
+        let mut n = 0;
+        loop {
+            match enc.next_packet() {
+                Ok(p) => { last = p.granule; n += 1; }
+                Err(Error::Eof) => break,
+                Err(e) => panic!("{e}"),
+            }
+        }
+        assert_eq!(n, 45, "packet count");
+        assert_eq!(last, 44_100, "last granule");
+    }
+
+    #[test]
     fn coupling_round_trips_every_sign_case() {
         for left in -8..=8i32 {
             for right in -8..=8i32 {
