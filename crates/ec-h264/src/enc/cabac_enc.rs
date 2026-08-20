@@ -432,7 +432,10 @@ impl CabacEnc {
         na: Option<u8>,
         nb: Option<u8>,
     ) -> u8 {
-        debug_assert!(cat != BlockCat::Luma8x8, "cat 5 goes through residual_block_8x8");
+        debug_assert!(
+            cat != BlockCat::Luma8x8,
+            "cat 5 goes through residual_block_8x8"
+        );
         let cat_i = cat.ctx_block_cat();
         let max = cat.max_num_coeff();
         let last = (0..max).rev().find(|&i| coeff[i] != 0);
@@ -478,7 +481,13 @@ impl CabacEnc {
     /// coeff_abs_level_minus1 and coeff_sign_flag of `coeff[..=last]`, highest
     /// scanning position first (9.3.3.1.3 counters). Returns the number of
     /// levels written.
-    fn encode_levels(&mut self, coeff: &[i32], last: usize, abs_base: usize, chroma_dc: bool) -> u8 {
+    fn encode_levels(
+        &mut self,
+        coeff: &[i32],
+        last: usize,
+        abs_base: usize,
+        chroma_dc: bool,
+    ) -> u8 {
         let mut num_eq1 = 0u32;
         let mut num_gt1 = 0u32;
         let mut total = 0u8;
@@ -618,7 +627,11 @@ mod tests {
         let mut dec = Cabac::new(&bytes, 0, 30, 0).expect("decoder starts");
         for (i, (ctx, flag, c)) in plan.iter().enumerate() {
             dec.begin_mb(ctx);
-            assert_eq!(dec.transform_size_8x8_flag().expect("flag"), *flag, "flag {i}");
+            assert_eq!(
+                dec.transform_size_8x8_flag().expect("flag"),
+                *flag,
+                "flag {i}"
+            );
             let mut got = [0i32; 64];
             dec.residual_block_8x8(&mut got).expect("block");
             assert_eq!(&got[..], &c[..], "block {i}");

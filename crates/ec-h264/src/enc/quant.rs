@@ -266,9 +266,7 @@ pub(crate) fn quant_chroma_dc(coef: &[i32; 4], qp: i32, intra: bool, out: &mut [
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transform::{
-        LevelScale8x8, dequant_8x8, inverse_transform_8x8, unzigzag_8x8,
-    };
+    use crate::transform::{LevelScale8x8, dequant_8x8, inverse_transform_8x8, unzigzag_8x8};
 
     fn ls8() -> LevelScale8x8 {
         LevelScale8x8::new(&[16; 64])
@@ -330,7 +328,12 @@ mod tests {
         let mut out = [0i32; 64];
         inverse_transform_8x8(&raster, &mut out);
         for i in 0..64 {
-            assert!((out[i] - src[i]).abs() <= 1, "i {i}: {} vs {}", out[i], src[i]);
+            assert!(
+                (out[i] - src[i]).abs() <= 1,
+                "i {i}: {} vs {}",
+                out[i],
+                src[i]
+            );
         }
     }
 

@@ -264,8 +264,7 @@ mod tests {
                 assert_eq!(sps.chroma_format_idc, 1);
                 assert_eq!(sps.bit_depth_luma, 8);
             }
-            let pps =
-                Pps::parse(&write_pps(cabac, t8x8), |_| Some(&sps)).expect("PPS parses");
+            let pps = Pps::parse(&write_pps(cabac, t8x8), |_| Some(&sps)).expect("PPS parses");
             assert_eq!(pps.entropy_coding_mode, cabac);
             assert_eq!(pps.pic_init_qp, 26);
             assert_eq!(pps.transform_8x8_mode, t8x8);
