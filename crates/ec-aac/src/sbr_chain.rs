@@ -295,6 +295,20 @@ impl SbrChain {
             if num_slots == 0 {
                 continue;
             }
+            if std::env::var("EC_AAC_SBR_PREQMF_DUMP").is_ok() {
+                static N: AtomicUsize = AtomicUsize::new(0);
+                let n = N.fetch_add(1, Ordering::Relaxed);
+                if n < 40 {
+                    let rms = (plane.iter().map(|v| f64::from(*v) * f64::from(*v)).sum::<f64>()
+                        / plane.len().max(1) as f64)
+                        .sqrt();
+                    eprintln!(
+                        "PREQMF n={n} tag={tag} ch={ch} len={} rms={rms:.6} first8={:?}",
+                        plane.len(),
+                        &plane[..8.min(plane.len())]
+                    );
+                }
+            }
             let state = &mut elem.channels[ch];
             let mut low_cur = vec![vec![Complex::ZERO; num_slots]; ANALYSIS_BANDS];
             let mut raw = Vec::with_capacity(num_slots);
@@ -440,6 +454,20 @@ impl SbrChain {
                     *s *= crate::decode::OUTPUT_SCALE;
                 }
                 out.extend_from_slice(&pcm);
+            }
+            if std::env::var("EC_AAC_SBR_PREQMF_DUMP").is_ok() {
+                static N: AtomicUsize = AtomicUsize::new(0);
+                let n = N.fetch_add(1, Ordering::Relaxed);
+                if n < 40 {
+                    let rms = (out.iter().map(|v| f64::from(*v) * f64::from(*v)).sum::<f64>()
+                        / out.len().max(1) as f64)
+                        .sqrt();
+                    eprintln!(
+                        "POSTQMF n={n} tag={tag} ch={ch} len={} rms={rms:.6} first8={:?}",
+                        out.len(),
+                        &out[..8.min(out.len())]
+                    );
+                }
             }
             *plane = out;
         }
