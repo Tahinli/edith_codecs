@@ -428,6 +428,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ec-truehd"
+version = "0.1.0"
+dependencies = [
+ "ec-core",
+ "ec-matroska",
+]
+
+[[package]]
 name = "ec-va"
 version = "0.1.0"
 

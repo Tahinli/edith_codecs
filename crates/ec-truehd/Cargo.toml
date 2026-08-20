@@ -1,0 +1,13 @@
+[package]
+name = "ec-truehd"
+description = "Dolby TrueHD / MLP access-unit and major-sync parsing for the edith_codecs family."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+ec-core = { workspace = true }
+
+[dev-dependencies]
+ec-matroska = { workspace = true }
