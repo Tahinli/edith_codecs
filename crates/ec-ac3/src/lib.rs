@@ -10,10 +10,13 @@
 //!
 //! Contracts worth knowing before implementing against this crate:
 //!
-//! - **Encoding is a fixed-allocation skeleton so far.** [`Ac3Encoder`] writes
-//!   spec-valid syncframes — real MDCT, real bit allocation, real CRCs — but
-//!   with a constant exponent strategy and bit allocation curve rather than a
-//!   psychoacoustic search; see [`encode`] for exactly what is and is not
+//! - **Encoding has no psychoacoustic model yet.** [`Ac3Encoder`] writes
+//!   spec-valid syncframes — real MDCT, per-block/channel transient-driven
+//!   block switching, an exponent planner (D15/D25/D45/reuse) and a
+//!   binary-searched SNR-offset rate loop that fills a frame to roughly
+//!   93-99.6% of its budget depending on content and bit rate — but the bit
+//!   allocation curve itself is the standard's masking model rather than a
+//!   perceptual search; see [`encode`] for exactly what is and is not
 //!   adaptive yet.
 //! - **Truncated input is [`Error::NeedMore`]**, a broken bit stream is
 //!   [`Error::Corrupt`], and a construct this build does not implement is
