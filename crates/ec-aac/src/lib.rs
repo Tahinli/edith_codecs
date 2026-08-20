@@ -46,7 +46,7 @@ pub use config::{
     parse_audio_specific_config, parse_program_config, sample_rate_for_index, sf_index_for_rate,
     write_adts_header, write_audio_specific_config,
 };
-pub use decode::{FRAME_LEN, WindowSequence};
+pub use decode::{FRAME_LEN, ToolSideInfoRow, WindowSequence, tool_sideinfo_log};
 pub use ec_core::{Error, Result};
 pub use encode::{AacEncoder, AacEncoderConfig, EncodedPacket, WindowShape};
 /// Diagnostic only (round-20): per-(access-unit, channel) side-info rows

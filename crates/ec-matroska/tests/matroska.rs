@@ -975,3 +975,317 @@ fn real_hdr_film_container_states_no_light_metadata() {
     }
     assert!(checked, "no video stream found");
 }
+
+// ===== mkv-vs-mp4 audio A/B (mkv-audio-timing) =====
+//
+// The consumer sweep found: same OBS recording's `.mkv` leg scores far below
+// its sibling `.mp4` leg on channel-0 correlation from t=0, and 5.1 AC-3/E-AC-3
+// tracks that are only ever carried in Matroska score near zero. These tests
+// isolate whether that is packet delivery out of `ec-matroska` (order,
+// duplication, pts) or the shared decoder crate, and which physical channel
+// our 5.1 decode calls "channel 0".
+
+use ec_ac3::Ac3Decoder;
+use ec_aac::AacDecoder;
+use ec_core::CodecId;
+
+/// Opens whichever container `path` actually is — both crates implement the
+/// same `Demuxer` trait, so the rest of the harness never has to know which.
+fn open_any(path: &Path) -> Box<dyn Demuxer> {
+    use std::io::Read;
+    let mut head = [0u8; 12];
+    File::open(path)
+        .expect("open")
+        .read_exact(&mut head)
+        .expect("read head");
+    if ec_mp4::is_mp4(&head) {
+        Box::new(ec_mp4::Mp4Demuxer::new(BufReader::new(File::open(path).expect("open"))).expect("mp4 opens"))
+    } else {
+        Box::new(MatroskaDemuxer::new(BufReader::new(File::open(path).expect("open"))).expect("mkv opens"))
+    }
+}
+
+/// The first stream of `codec`'s extradata plus its packets, `(pts, data)`,
+/// in the order the container's own demuxer hands them back — capped so a
+/// multi-gigabyte recording does not have to be decoded whole.
+fn audio_track(path: &Path, codec: CodecId) -> Option<(Option<Vec<u8>>, u32, Vec<(i64, Vec<u8>)>)> {
+    let mut d = open_any(path);
+    let s = d.streams().iter().find(|s| s.params.codec == codec)?;
+    let idx = s.index;
+    let extradata = s.params.extradata.as_ref().map(|b| b.to_vec());
+    let rate = s.params.audio()?.sample_rate;
+    let mut pkts = Vec::new();
+    loop {
+        match d.next_packet() {
+            Ok(p) if p.stream == idx => {
+                pkts.push((p.pts.unwrap_or(0), p.data.to_vec()));
+                if pkts.len() >= 2_000 {
+                    break;
+                }
+            }
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+    Some((extradata, rate, pkts))
+}
+
+/// Our AAC decode of a container's access units, interleaved-to-planar.
+fn decode_aac(extradata: &[u8], pkts: &[(i64, Vec<u8>)]) -> Vec<Vec<f32>> {
+    let mut decoder = AacDecoder::with_config_bytes(extradata).expect("AudioSpecificConfig parses");
+    let mut planes: Vec<Vec<f32>> = Vec::new();
+    for (_, au) in pkts {
+        let Ok(frame) = decoder.decode(au, None) else {
+            continue;
+        };
+        let ch = usize::from(frame.channels);
+        if ch == 0 {
+            continue;
+        }
+        if planes.is_empty() {
+            planes = vec![Vec::new(); ch];
+        }
+        for (i, v) in frame.samples.iter().enumerate() {
+            planes[i % ch].push(*v);
+        }
+    }
+    planes
+}
+
+/// Our AC-3/E-AC-3 decode of a container's frames, interleaved-to-planar.
+fn decode_ac3(pkts: &[(i64, Vec<u8>)]) -> Vec<Vec<f32>> {
+    let mut decoder = Ac3Decoder::new();
+    let mut planes: Vec<Vec<f32>> = Vec::new();
+    for (_, data) in pkts {
+        let Ok(frame) = decoder.decode_frame(data) else {
+            continue;
+        };
+        let ch = frame.channels();
+        if ch == 0 {
+            continue;
+        }
+        if planes.is_empty() {
+            planes = vec![Vec::new(); ch];
+        }
+        let samples: Vec<f32> = frame.data[0]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        for (i, v) in samples.iter().enumerate() {
+            planes[i % ch].push(*v);
+        }
+    }
+    planes
+}
+
+fn have_ffmpeg() -> bool {
+    Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// ffmpeg's decode of a file's first audio stream, planar by channel.
+fn ffmpeg_decode_planar(path: &Path, channels: usize) -> Vec<Vec<f32>> {
+    let out = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args([
+            "-map", "0:a:0", "-t", "20", "-f", "f32le", "-acodec", "pcm_f32le", "-",
+        ])
+        .output()
+        .expect("ffmpeg runs");
+    assert!(
+        out.status.success(),
+        "ffmpeg decode failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let samples: Vec<f32> = out
+        .stdout
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let mut planes = vec![Vec::with_capacity(samples.len() / channels.max(1)); channels];
+    for (i, v) in samples.iter().enumerate() {
+        planes[i % channels].push(*v);
+    }
+    planes
+}
+
+fn correlation(a: &[f32], b: &[f32]) -> f64 {
+    let n = a.len().min(b.len());
+    if n < 1024 {
+        return 0.0;
+    }
+    let (a, b) = (&a[..n], &b[..n]);
+    let ma = a.iter().map(|v| f64::from(*v)).sum::<f64>() / n as f64;
+    let mb = b.iter().map(|v| f64::from(*v)).sum::<f64>() / n as f64;
+    let (mut num, mut da, mut db) = (0.0f64, 0.0f64, 0.0f64);
+    for i in 0..n {
+        let (x, y) = (f64::from(a[i]) - ma, f64::from(b[i]) - mb);
+        num += x * y;
+        da += x * x;
+        db += y * y;
+    }
+    let den = (da * db).sqrt();
+    if den == 0.0 { 0.0 } else { num / den }
+}
+
+/// Best correlation over a bounded lag search from the start of both
+/// streams — the whole point here is t=0 alignment, so no whole-file window
+/// slide is needed, just enough lag to absorb container/codec delay.
+const LAG_MAX: i64 = 4_000;
+const WINDOW: usize = 100_000;
+
+fn best_lag_correlation(ours: &[f32], theirs: &[f32]) -> (i64, f64) {
+    let mut best_abs = -1.0f64;
+    let mut best = (0i64, 0.0f64);
+    for lag in -LAG_MAX..=LAG_MAX {
+        let (oa, ob) = if lag >= 0 { (0usize, lag as usize) } else { ((-lag) as usize, 0usize) };
+        let len = WINDOW.min(ours.len().saturating_sub(oa)).min(theirs.len().saturating_sub(ob));
+        if len < 1024 {
+            continue;
+        }
+        let c = correlation(&ours[oa..oa + len], &theirs[ob..ob + len]);
+        if c.abs() > best_abs {
+            best_abs = c.abs();
+            best = (lag, c);
+        }
+    }
+    best
+}
+
+/// mkv vs mp4: the same recording's AAC stream, decoded through each
+/// container's own demux path, ours-vs-ours and each vs ffmpeg. Isolates the
+/// consumer sweep's "same channel 0, same track, `.mkv` corr 0.06-0.34 but
+/// sibling `.mp4` 0.76-0.92" finding to this crate's packet delivery or to
+/// the shared AAC decoder.
+///
+/// Run with `cargo test -p ec-matroska --test matroska mkv_vs_mp4_aac_pipeline -- --ignored --nocapture`.
+#[test]
+#[ignore = "reads the real library, mkv-audio-timing A/B"]
+fn mkv_vs_mp4_aac_pipeline() {
+    if !have_ffmpeg() {
+        eprintln!("skipped: no ffmpeg");
+        return;
+    }
+    let obs = Path::new("/home/tahinli/Videos/OBS");
+    let stems = [
+        "2026-07-25 02-09-04",
+        "2026-08-17 01-57-17",
+        "2026-08-17 11-01-56",
+    ];
+    let mut any = false;
+    for stem in stems {
+        let mkv = obs.join(format!("{stem}.mkv"));
+        let mp4 = obs.join(format!("{stem}.mp4"));
+        if !mkv.exists() || !mp4.exists() {
+            continue;
+        }
+        any = true;
+        println!("=== {stem} ===");
+        let (mkv_asc, mkv_rate, mkv_pkts) = audio_track(&mkv, CodecId::Aac).expect("mkv aac track");
+        let (mp4_asc, mp4_rate, mp4_pkts) = audio_track(&mp4, CodecId::Aac).expect("mp4 aac track");
+        println!(
+            "mkv asc={:02x?} rate={mkv_rate} packets={} bytes={}",
+            mkv_asc,
+            mkv_pkts.len(),
+            mkv_pkts.iter().map(|(_, d)| d.len()).sum::<usize>()
+        );
+        println!(
+            "mp4 asc={:02x?} rate={mp4_rate} packets={} bytes={}",
+            mp4_asc,
+            mp4_pkts.len(),
+            mp4_pkts.iter().map(|(_, d)| d.len()).sum::<usize>()
+        );
+        println!(
+            "mkv first5 pts = {:?}",
+            mkv_pkts.iter().take(5).map(|(p, _)| *p).collect::<Vec<_>>()
+        );
+        println!(
+            "mp4 first5 pts = {:?}",
+            mp4_pkts.iter().take(5).map(|(p, _)| *p).collect::<Vec<_>>()
+        );
+        let (mut out_of_order, mut dup) = (0, 0);
+        for w in mkv_pkts.windows(2) {
+            if w[1].0 < w[0].0 {
+                out_of_order += 1;
+            }
+            if w[1].0 == w[0].0 {
+                dup += 1;
+            }
+        }
+        println!("mkv out_of_order={out_of_order} dup_pts={dup}");
+
+        let mkv_planes = decode_aac(mkv_asc.as_deref().unwrap_or(&[]), &mkv_pkts);
+        let mp4_planes = decode_aac(mp4_asc.as_deref().unwrap_or(&[]), &mp4_pkts);
+        assert!(
+            !mkv_planes.is_empty() && !mp4_planes.is_empty(),
+            "{stem}: decode produced no channels (mkv {} ch, mp4 {} ch)",
+            mkv_planes.len(),
+            mp4_planes.len()
+        );
+
+        let (lag, c_mm) = best_lag_correlation(&mkv_planes[0], &mp4_planes[0]);
+        let mkv_ff = ffmpeg_decode_planar(&mkv, mkv_planes.len());
+        let mp4_ff = ffmpeg_decode_planar(&mp4, mp4_planes.len());
+        let (_, c_mkv_ff) = best_lag_correlation(&mkv_planes[0], &mkv_ff[0]);
+        let (_, c_mp4_ff) = best_lag_correlation(&mp4_planes[0], &mp4_ff[0]);
+        println!(
+            "{stem}: mkv-vs-mp4(ours) corr={c_mm:.4} lag={lag}; mkv-vs-ffmpeg corr={c_mkv_ff:.4}; mp4-vs-ffmpeg corr={c_mp4_ff:.4}"
+        );
+    }
+    assert!(any, "no OBS mkv/mp4 pairs present");
+}
+
+/// The two mkv-only 5.1 real-library rows the consumer sweep flagged
+/// (E-AC-3 and AC-3): our decode of every channel against ffmpeg's channel
+/// 0, so a channel-order mismatch (mkv hands a different physical channel
+/// first than ffmpeg calls "channel 0") shows up as a non-zero-index best
+/// match instead of a flat near-zero across all of them.
+///
+/// Run with `cargo test -p ec-matroska --test matroska mkv_51_channel_order -- --ignored --nocapture`.
+#[test]
+#[ignore = "reads the real library, mkv-audio-timing A/B"]
+fn mkv_51_channel_order() {
+    if !have_ffmpeg() {
+        eprintln!("skipped: no ffmpeg");
+        return;
+    }
+    let files: [(&str, CodecId); 2] = [
+        (
+            "/home/tahinli/Downloads/www.UIndex.org    -    Boyhood 2014 1080p MAX WEB-DL DDP5 1 H 264-GPRS/Boyhood 2014 1080p MAX WEB-DL DDP5 1 H 264-GPRS.mkv",
+            CodecId::EAc3,
+        ),
+        (
+            "/home/tahinli/Downloads/www.UIndex.org    -    Dragons Gift of the Night Fury 2011 BluRay 1080p AC3 x264-CHD/Dragons Gift of the Night Fury 2011 BluRay 1080p AC3 x264-CHD.mkv",
+            CodecId::Ac3,
+        ),
+    ];
+    let mut any = false;
+    for (path, codec) in files {
+        let path = Path::new(path);
+        if !path.exists() {
+            eprintln!("skipped: {} absent", path.display());
+            continue;
+        }
+        any = true;
+        let (_, _rate, pkts) = audio_track(path, codec).expect("audio track");
+        println!(
+            "{}: first5 pts = {:?}",
+            path.file_name().unwrap().to_string_lossy(),
+            pkts.iter().take(5).map(|(p, _)| *p).collect::<Vec<_>>()
+        );
+        let planes = decode_ac3(&pkts);
+        assert!(!planes.is_empty(), "{}: no channels decoded", path.display());
+        let ffref = ffmpeg_decode_planar(path, planes.len());
+        for (i, ch) in planes.iter().enumerate() {
+            let (lag, c) = best_lag_correlation(ch, &ffref[0]);
+            println!(
+                "{}: our ch{i} vs ffmpeg ch0 corr={c:.4} lag={lag}",
+                path.file_name().unwrap().to_string_lossy()
+            );
+        }
+    }
+    assert!(any, "no 5.1 mkv fixtures present");
+}
