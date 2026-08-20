@@ -70,6 +70,7 @@ pub mod ogg;
 pub mod packet;
 pub mod range;
 pub mod silk;
+pub(crate) mod silk_enc;
 
 pub use celt::CeltDecoder;
 pub use celt_enc::CeltEncoder;
