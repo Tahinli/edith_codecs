@@ -949,6 +949,213 @@ fn hf_lag_sweep(
     out
 }
 
+/// Round-40, Task 1: fine spectral-BIN shift scan on patched HF content.
+/// `hf_lag_sweep` (round-38) only tested whole-QMF-slot SAMPLE-domain lags and
+/// round-26's `bin_level_conviction` shift columns only tested whole
+/// `BINS_PER_SBR_BAND` (8-bin) band shifts; neither ever tried a FEW-bin
+/// spectral offset, which is what a half-QMF-band (~4-bin, ~86Hz at this
+/// 2048-window scale) carrier convention mismatch on patched content would
+/// look like -- it would leave envelope/magnitude tracking (and therefore
+/// `hf_lag_sweep`'s k=0 peak) intact while destroying bin-level phase
+/// coherence via linear phase drift across the band. The audio itself is
+/// never shifted; only the bin INDEX used to pair `o` against `t` moves, by
+/// `b` in -7..=+7 (deliberately short of the 8-bin whole-band-shift case
+/// round-26 already ruled out). Reports mean direct coherence
+/// (`bin_level_conviction`'s same `|sum_h O(h)*conj(T(h))| /
+/// sqrt(sum|O|^2*sum|T|^2)` measure) separately over the even-gap [14,28) and
+/// odd-gap [28,43) SBR-band regions -- the offset, if real, could differ by
+/// patch parity given round-35/36's convention-fix history. A clear peak at
+/// `b != 0` (region-dependent sign allowed) convicts a constant sub-band
+/// frequency offset; a flat/0-peaked curve refutes it.
+fn hf_bin_shift_sweep(
+    o: &[f32],
+    t: &[f32],
+    _rate: u32,
+    region_lo_band: usize,
+    region_hi_band: usize,
+) -> Vec<(i64, f64)> {
+    const FFT_LEN: usize = 2048;
+    const HOP: usize = 1024;
+    const BINS_PER_SBR_BAND: usize = FFT_LEN / 256;
+    const MAX_B: i64 = 7;
+    let win = ec_dsp::Window::<f32>::sine(FFT_LEN);
+    let mut rfft = ec_dsp::RealFft::<f32>::new(FFT_LEN);
+    let bins = rfft.spectrum_len();
+    let n = o.len().min(t.len());
+    let hops = if n >= FFT_LEN {
+        (n - FFT_LEN) / HOP + 1
+    } else {
+        0
+    };
+    if hops == 0 {
+        return Vec::new();
+    }
+    let mut o_spec = vec![Vec::with_capacity(hops); bins];
+    let mut t_spec = vec![Vec::with_capacity(hops); bins];
+    let mut spectrum = vec![ec_dsp::Complex::new(0.0f32, 0.0); bins];
+    for (src, dst) in [(o, &mut o_spec), (t, &mut t_spec)] {
+        for h in 0..hops {
+            let mut block = src[h * HOP..h * HOP + FFT_LEN].to_vec();
+            win.apply(&mut block);
+            rfft.forward(&block, &mut spectrum);
+            for (b, c) in spectrum.iter().enumerate() {
+                dst[b].push(*c);
+            }
+        }
+    }
+    let lo_bin = region_lo_band * BINS_PER_SBR_BAND;
+    let hi_bin = (region_hi_band * BINS_PER_SBR_BAND).min(bins);
+    let coh = |ob: usize, tb: usize| -> f64 {
+        if ob >= bins || tb >= bins {
+            return 0.0;
+        }
+        let mut cross_re = 0.0f64;
+        let mut cross_im = 0.0f64;
+        let mut o_e = 0.0f64;
+        let mut t_e = 0.0f64;
+        for h in 0..hops {
+            let oc = o_spec[ob][h];
+            let tc = t_spec[tb][h];
+            let cross = oc * tc.conj();
+            cross_re += f64::from(cross.re);
+            cross_im += f64::from(cross.im);
+            o_e += f64::from(oc.norm_sqr());
+            t_e += f64::from(tc.norm_sqr());
+        }
+        let den = (o_e * t_e).sqrt();
+        if den > 0.0 {
+            (cross_re * cross_re + cross_im * cross_im).sqrt() / den
+        } else {
+            0.0
+        }
+    };
+    let mut out = Vec::with_capacity((2 * MAX_B + 1) as usize);
+    if lo_bin >= hi_bin {
+        return out;
+    }
+    for b in -MAX_B..=MAX_B {
+        let mut sum = 0.0f64;
+        let mut count = 0usize;
+        for i in lo_bin..hi_bin {
+            let oi = i as i64 + b;
+            if oi < 0 || oi as usize >= bins {
+                continue;
+            }
+            sum += coh(oi as usize, i);
+            count += 1;
+        }
+        out.push((b, if count > 0 { sum / count as f64 } else { 0.0 }));
+    }
+    out
+}
+
+/// Round-40, Task 2: per-STFT-frame complex-gain fingerprint. For the same
+/// top-energy HF bands `bin_level_conviction` picks (ranked by `o`'s own
+/// energy), takes each band's single dominant bin (highest total `|O(h)|^2`
+/// across hops) and reports the per-hop complex ratio `O(h)/T(h)` trajectory
+/// -- `(magnitude, phase_radians)` per STFT frame -- for that bin across
+/// every frame. Read afterward, not here: constant magnitude+phase is a pure
+/// gain (would predict HIGH coherence, contradicting the low bin-coherence
+/// measured elsewhere -- flags a measurement issue, not a real
+/// transformation); phase advancing at a roughly fixed per-frame rate is a
+/// genuine carrier frequency offset (the rate converts directly to Hz and
+/// cross-checks `hf_bin_shift_sweep`'s peak); phase jumping specifically at
+/// hop indices lining up with SBR envelope borders is a per-envelope
+/// gain/phase re-seed; anything else (magnitude and phase both wandering with
+/// no fixed rate) is genuinely uncorrelated content frame to frame.
+fn hf_complex_ratio_trajectory(
+    o: &[f32],
+    t: &[f32],
+    rate: u32,
+    min_band: usize,
+    top_n: usize,
+) -> Vec<(f64, Vec<(f64, f64)>)> {
+    const FFT_LEN: usize = 2048;
+    const HOP: usize = 1024;
+    const BINS_PER_SBR_BAND: usize = FFT_LEN / 256;
+    let win = ec_dsp::Window::<f32>::sine(FFT_LEN);
+    let mut rfft = ec_dsp::RealFft::<f32>::new(FFT_LEN);
+    let bins = rfft.spectrum_len();
+    let n = o.len().min(t.len());
+    let hops = if n >= FFT_LEN {
+        (n - FFT_LEN) / HOP + 1
+    } else {
+        0
+    };
+    if hops == 0 {
+        return Vec::new();
+    }
+    let mut o_spec = vec![Vec::with_capacity(hops); bins];
+    let mut t_spec = vec![Vec::with_capacity(hops); bins];
+    let mut spectrum = vec![ec_dsp::Complex::new(0.0f32, 0.0); bins];
+    for (src, dst) in [(o, &mut o_spec), (t, &mut t_spec)] {
+        for h in 0..hops {
+            let mut block = src[h * HOP..h * HOP + FFT_LEN].to_vec();
+            win.apply(&mut block);
+            rfft.forward(&block, &mut spectrum);
+            for (b, c) in spectrum.iter().enumerate() {
+                dst[b].push(*c);
+            }
+        }
+    }
+    let band_hz = f64::from(rate) / 256.0;
+    let num_bands = bins / BINS_PER_SBR_BAND;
+    if min_band >= num_bands {
+        return Vec::new();
+    }
+    let mut ranked: Vec<(usize, f64)> = (min_band..num_bands)
+        .map(|band| {
+            let lo = band * BINS_PER_SBR_BAND;
+            let hi = (lo + BINS_PER_SBR_BAND).min(bins);
+            let e: f64 = (lo..hi)
+                .flat_map(|b| o_spec[b].iter())
+                .map(|c| f64::from(c.norm_sqr()))
+                .sum();
+            (band, e)
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    let mut selected: Vec<usize> = ranked.into_iter().take(top_n).map(|(b, _)| b).collect();
+    selected.sort_unstable();
+
+    let mut out = Vec::with_capacity(selected.len());
+    for band in selected {
+        let lo = band * BINS_PER_SBR_BAND;
+        let hi = (lo + BINS_PER_SBR_BAND).min(bins);
+        if lo >= hi {
+            continue;
+        }
+        let dom = (lo..hi)
+            .max_by(|&a, &b| {
+                let ea: f64 = o_spec[a].iter().map(|c| f64::from(c.norm_sqr())).sum();
+                let eb: f64 = o_spec[b].iter().map(|c| f64::from(c.norm_sqr())).sum();
+                ea.partial_cmp(&eb).unwrap()
+            })
+            .unwrap();
+        // Complex division `O/T` done by hand (`ec_dsp::Complex` carries no
+        // `Div` impl -- it is a from-scratch minimal type, see fft.rs): `O *
+        // conj(T) / |T|^2`.
+        let traj: Vec<(f64, f64)> = (0..hops)
+            .map(|h| {
+                let oc = o_spec[dom][h];
+                let tc = t_spec[dom][h];
+                let t_e = f64::from(tc.norm_sqr());
+                if t_e > 1e-12 {
+                    let (or, oi) = (f64::from(oc.re), f64::from(oc.im));
+                    let (tr, ti) = (f64::from(tc.re), f64::from(tc.im));
+                    let rr = (or * tr + oi * ti) / t_e;
+                    let ri = (oi * tr - or * ti) / t_e;
+                    ((rr * rr + ri * ri).sqrt(), ri.atan2(rr))
+                } else {
+                    (0.0, 0.0)
+                }
+            })
+            .collect();
+        out.push((band as f64 * band_hz, traj));
+    }
+    out
+}
+
 /// A file discovered under the user's own media directories: its path, which
 /// AAC stream in it (0-based among AAC streams only) carries HE-AAC, and the
 /// core/SBR crossover an ffprobe/ASC inspection already pinned for it -- used
@@ -1598,6 +1805,67 @@ fn sbr_real_library_matches_reference() {
                     sweep.iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
                 {
                     println!("  ch{ch} HF lag sweep peak: k={peak_k} coherence {peak_c:.4}");
+                }
+            }
+            // (Round-40, Task 1) fine spectral-bin shift scan -- see
+            // `hf_bin_shift_sweep`'s doc comment.
+            if std::env::var("EC_AAC_SBR_BIN_SHIFT").is_ok() && n >= 4_096 {
+                let win = &o[oa..oa + n];
+                let twin = &t[ob..ob + n];
+                for (region_name, lo, hi) in
+                    [("even-gap[14,28)", 14, 28), ("odd-gap[28,43)", 28, 43)]
+                {
+                    let sweep = hf_bin_shift_sweep(win, twin, rate, lo, hi);
+                    println!(
+                        "  ch{ch} TASK1 BIN-SHIFT {region_name} (b = FFT bins, mean direct HF-bin coherence):"
+                    );
+                    for (b, coh) in &sweep {
+                        println!("    b={b:>3}: coherence {coh:.4}");
+                    }
+                    if let Some((peak_b, peak_c)) =
+                        sweep.iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                    {
+                        println!(
+                            "  ch{ch} {region_name} bin-shift peak: b={peak_b} coherence {peak_c:.4}"
+                        );
+                    }
+                }
+            }
+            // (Round-40, Task 2) complex-gain fingerprint -- see
+            // `hf_complex_ratio_trajectory`'s doc comment.
+            if std::env::var("EC_AAC_SBR_COMPLEX_GAIN").is_ok() && n >= 4_096 {
+                let band_hz = f64::from(rate) / 256.0;
+                let min_band = (2_500.0 / band_hz).ceil() as usize;
+                let win = &o[oa..oa + n];
+                let twin = &t[ob..ob + n];
+                for (hz, traj) in hf_complex_ratio_trajectory(win, twin, rate, min_band, 4) {
+                    println!(
+                        "  ch{ch} TASK2 COMPLEX-GAIN {hz:.0}Hz dominant-bin O/T trajectory (frame: mag, phase_deg, dphase_deg):"
+                    );
+                    let mut prev_phase: Option<f64> = None;
+                    for (h, (mag, phase)) in traj.iter().enumerate() {
+                        let dphase = prev_phase.map(|p| {
+                            let mut d = phase.to_degrees() - p;
+                            while d > 180.0 {
+                                d -= 360.0;
+                            }
+                            while d < -180.0 {
+                                d += 360.0;
+                            }
+                            d
+                        });
+                        prev_phase = Some(phase.to_degrees());
+                        match dphase {
+                            Some(d) => println!(
+                                "    frame{h:>3}: mag {mag:.4} phase {:>7.2}deg dphase {d:>7.2}deg",
+                                phase.to_degrees()
+                            ),
+                            None => println!(
+                                "    frame{h:>3}: mag {mag:.4} phase {:>7.2}deg dphase    n/a",
+                                phase.to_degrees()
+                            ),
+                        }
+                    }
                 }
             }
             println!(
