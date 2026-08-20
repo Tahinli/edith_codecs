@@ -1,5 +1,5 @@
 target/
-fixtures/
+fixtures
 __pycache__/
 scripts/aac-tables/sbr-cache.json
 .cache/
