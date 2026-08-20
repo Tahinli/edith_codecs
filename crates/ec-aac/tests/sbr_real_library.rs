@@ -3866,3 +3866,72 @@ fn boneknapper_multichannel_lc_matches_reference() {
         assert!(corr >= 0.999, "ch{ch} corr {corr:.6} < 0.999 (lag {lag})");
     }
 }
+
+/// Coupled-CPE swap probe: the `heaac_44100_48k` fixture's SBR side info
+/// shows `coupling: true` on nearly every AU (Nikbinler/FMJ, both passing,
+/// show `coupling: false`) -- checks whether our decoded ch0 actually
+/// correlates better against the REFERENCE's R channel than its own L,
+/// which would mean `dequant_pair`'s left/right assignment in
+/// `sbr_env::dequantize_frame` is swapped for coupled CPEs.
+#[test]
+fn coupled_cpe_channel_swap_probe() {
+    if !have_ffmpeg() {
+        eprintln!("SKIP: ffmpeg not on PATH");
+        return;
+    }
+    let dir = std::env::var("EC_AAC_HEAAC_FIXTURES").unwrap_or_else(|_| {
+        format!("{}/../../.cache/heaac-fixtures", env!("CARGO_MANIFEST_DIR"))
+    });
+    let path = PathBuf::from(&dir).join("heaac_44100_48k.m4a");
+    if !path.exists() {
+        eprintln!("SKIP: {} absent", path.display());
+        return;
+    }
+    let Some((ours, sbr, _rate)) = our_decode(&path, 0) else {
+        panic!("heaac_44100_48k failed to decode");
+    };
+    assert_eq!(sbr, ec_aac::SbrSupport::V1);
+    assert_eq!(ours.len(), 2, "expect stereo");
+    let ref_l = ffmpeg_decode_pan_channel(&path, 0, 0);
+    let ref_r = ffmpeg_decode_pan_channel(&path, 0, 1);
+    for (och, ochan) in ours.iter().enumerate() {
+        let (lag_l, corr_l) = best_lag_correlation_wide(ochan, &ref_l, SEARCH_LAG_MAX);
+        let (lag_r, corr_r) = best_lag_correlation_wide(ochan, &ref_r, SEARCH_LAG_MAX);
+        println!(
+            "ch{och}: vs ref L lag={lag_l} corr={corr_l:.6}; vs ref R lag={lag_r} corr={corr_r:.6}"
+        );
+    }
+
+    // Same probe on the CORE-ONLY decode (SBR disabled): if the swap
+    // already shows here, it's in the AAC-LC core's own CPE/M-S decode,
+    // not in the SBR coupling math.
+    let (asc, aus) = extract_aac_track(&path, 0).expect("extract");
+    let mut core_cfg = parse_audio_specific_config(&asc).expect("asc parses");
+    core_cfg.sbr_present = false;
+    core_cfg.ps_present = false;
+    core_cfg.extension_sample_rate = None;
+    let mut core_dec = AacDecoder::with_config(core_cfg);
+    let mut core_planes: Vec<Vec<f32>> = vec![Vec::new(), Vec::new()];
+    for au in &aus {
+        if let Ok(f) = core_dec.decode(au, None) {
+            let ch = usize::from(f.channels);
+            if ch == 2 {
+                for (i, v) in f.samples.iter().enumerate() {
+                    core_planes[i % 2].push(*v);
+                }
+            }
+        }
+        if core_planes[0].len() >= MAX_SAMPLES {
+            break;
+        }
+    }
+    let core_rate = core_dec.output_sample_rate().unwrap_or(22050);
+    let ref_core = ffmpeg_decode_at_rate(&path, 0, 2, core_rate);
+    for (och, ochan) in core_planes.iter().enumerate() {
+        for (rch, rplane) in ref_core.iter().enumerate() {
+            let (lag, corr) = best_lag_correlation_wide(ochan, rplane, SEARCH_LAG_MAX);
+            let name = if rch == 0 { "L" } else { "R" };
+            println!("core ch{och} vs ref {name}: lag={lag} corr={corr:.6}");
+        }
+    }
+}
