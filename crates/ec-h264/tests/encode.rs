@@ -153,6 +153,13 @@ fn reconstruction_matches_the_decoder() {
                     stream.extend_from_slice(&picture.au);
                     recons.push(enc.reconstruction().expect("a reconstruction"));
                 }
+                if t8x8 {
+                    let (intra, inter) = enc.transform_8x8_mbs();
+                    assert!(
+                        intra > 0 && inter > 0,
+                        "{w}x{h} qp {qp} cabac {cabac}: 8x8 MBs intra {intra} inter {inter}"
+                    );
+                }
                 let decoded = decode_all(&stream);
                 assert_eq!(
                     decoded.len(),
@@ -324,6 +331,7 @@ fn encode_clip(
     cfg.gop_size = 10;
     cfg.threads = 3;
     configure(&mut cfg);
+    let t8x8 = cfg.transform_8x8;
     let mut enc = Encoder::new(cfg).expect("encoder");
     let mut clip = Clip::new(w, h);
     let mut stream = Vec::new();
@@ -333,7 +341,76 @@ fn encode_clip(
         stream.extend_from_slice(&enc.encode(&clip.view()).expect("encode").au);
         recons.push(enc.reconstruction().expect("reconstruction"));
     }
+    if t8x8 {
+        let (intra, inter) = enc.transform_8x8_mbs();
+        assert!(intra > 0 && inter > 0, "8x8 MBs intra {intra} inter {inter}");
+    }
     (stream, recons)
+}
+
+/// Flat gradients and glyph-like rectangles: the content the 8x8 transform
+/// exists for. A 10-frame clip with the flag on must beat the flag off by at
+/// least 0.3 dB at equal bits, or by 5% fewer bits at equal PSNR.
+#[test]
+fn eight_by_eight_gains_on_flat_and_text() {
+    let (w, h) = (320, 240);
+    let render = |t: usize, clip: &mut Clip| {
+        for y in 0..h {
+            for x in 0..w {
+                let grad = (x * 3 / 4 + y / 2 + t) as u8 / 2 + 40;
+                // Glyph rows: 12x16 cells, a 2-sample stem and a bar.
+                let (cx, cy) = ((x + t) % 12, y % 16);
+                let glyph = y > h / 3 && cy >= 3 && cy < 13 && (cx < 2 || (cy == 8 && cx < 8));
+                clip.y[y * w + x] = if glyph { 20 } else { grad };
+            }
+        }
+        clip.u.fill(128);
+        clip.v.fill(128);
+    };
+    let run = |t8x8: bool, qp: i32| {
+        let mut cfg = EncoderConfig::new(w as u32, h as u32);
+        cfg.qp = qp;
+        cfg.gop_size = 10;
+        cfg.transform_8x8 = t8x8;
+        let mut enc = Encoder::new(cfg).expect("encoder");
+        let mut clip = Clip::new(w, h);
+        let (mut bits, mut sum_psnr) = (0usize, 0.0);
+        let mut share = 0.0;
+        for t in 0..10 {
+            render(t, &mut clip);
+            bits += enc.encode(&clip.view()).expect("encode").au.len() * 8;
+            let rec = enc.reconstruction().expect("reconstruction");
+            sum_psnr += psnr(&clip.y, &rec.0);
+        }
+        if t8x8 {
+            let (i, p) = enc.transform_8x8_mbs();
+            share = (i + p) as f64 / (10.0 * (w / 16 * h / 16) as f64);
+        }
+        (bits as f64, sum_psnr / 10.0, share)
+    };
+    // Interpolate the off curve at the on point's bits / PSNR.
+    let qp = 30;
+    let (bits_on, psnr_on, share) = run(true, qp);
+    let off: Vec<_> = [qp - 2, qp, qp + 2].iter().map(|&q| run(false, q)).collect();
+    let (bits_off, psnr_off, _) = off[1];
+    // Local slopes of the off curve, from the neighbouring QPs.
+    let dpsnr_dbits = (off[0].1 - off[2].1) / (off[0].0 - off[2].0);
+    let psnr_off_at_on_bits = psnr_off + (bits_on - bits_off) * dpsnr_dbits;
+    let bits_off_at_on_psnr = bits_off + (psnr_on - psnr_off) / dpsnr_dbits;
+    let gain_db = psnr_on - psnr_off_at_on_bits;
+    let saving = 1.0 - bits_on / bits_off_at_on_psnr;
+    eprintln!(
+        "8x8 qp {qp}: on {bits_on:.0} bits {psnr_on:.2} dB, off {bits_off:.0} bits {psnr_off:.2} dB; \
+         gain at equal bits {gain_db:+.2} dB, saving at equal PSNR {:.1}%, 8x8 MB share {:.1}%",
+        saving * 100.0,
+        share * 100.0
+    );
+    assert!(share > 0.0, "no 8x8 macroblocks were coded");
+    assert!(
+        gain_db >= 0.3 || saving >= 0.05,
+        "8x8 gain {gain_db:+.2} dB / {:.1}% is below the bar",
+        saving * 100.0
+    );
 }
 
 /// ffmpeg's decode of our stream is our reconstruction, sample for sample,
@@ -400,6 +477,7 @@ fn vaapi_decodes_our_stream() {
     let (w, h) = (352, 288);
     let (stream, recons) = encode_clip(w, h, 6, |cfg| {
         cfg.qp = 26;
+        cfg.transform_8x8 = true;
     });
     let Some(decoded) = ffmpeg_decode(
         &stream,

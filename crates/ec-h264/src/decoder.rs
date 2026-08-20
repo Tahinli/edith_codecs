@@ -327,7 +327,9 @@ impl Decoder {
             .ok_or_else(|| Error::corrupt("active SPS vanished"))?;
         let pic = core::mem::take(&mut self.cur);
         let marking = self.has_marking.then_some(&self.cur_marking);
-        let stored = self.dpb.store(pic, &sps, &self.cur_info, marking, output_ok);
+        let stored = self
+            .dpb
+            .store(pic, &sps, &self.cur_info, marking, output_ok);
         self.sps_map[sps_id] = Some(sps);
         stored?;
         self.has_picture = false;
@@ -2309,7 +2311,13 @@ pub(crate) fn gather_nbr4(
 /// `blk8` is luma8x8BlkIdx: block 1 reaches the above-right macroblock for its
 /// top-right run, block 2 finds it inside this macroblock, and block 3 has none
 /// (the samples right of it are not decoded yet).
-fn gather_nbr8(pic: &Picture, nbr: &MbNeighbors, blk8: usize, x: usize, y: usize) -> Nbr8 {
+pub(crate) fn gather_nbr8(
+    pic: &Picture,
+    nbr: &MbNeighbors,
+    blk8: usize,
+    x: usize,
+    y: usize,
+) -> Nbr8 {
     let stride = pic.y.stride;
     let o = pic.y.at(x, y);
     let data = &pic.y.data;
