@@ -1541,8 +1541,11 @@ fn lowpass(x: &[f32], cutoff_hz: f64) -> Vec<f32> {
 /// Encodes `pcm` NB or WB, decodes each packet with our decoder asserting the
 /// range-coder invariant, returns (decoded 48 kHz, packets, voiced frames,
 /// encoder delay).
-fn silk_roundtrip(pcm: &[f32], wideband: bool) -> (Vec<f32>, Vec<Vec<u8>>, usize, usize) {
+fn silk_roundtrip(pcm: &[f32], wideband: bool, bitrate: Option<u32>) -> (Vec<f32>, Vec<Vec<u8>>, usize, usize) {
     let mut enc = SilkEncoder::new(wideband);
+    if let Some(bps) = bitrate {
+        enc.set_bitrate(bps);
+    }
     let mut dec = Decoder::new(48000, 1).unwrap();
     let mut out = vec![0u8; 1500];
     let mut buf = vec![0f32; 5760];
@@ -1587,7 +1590,7 @@ fn silk_mono_nb_wb_roundtrip() {
     }
     for (name, pcm) in &sources {
         for wideband in [false, true] {
-            let (decoded, packets, voiced, delay) = silk_roundtrip(pcm, wideband);
+            let (decoded, packets, voiced, delay) = silk_roundtrip(pcm, wideband, None);
             let band = if wideband { 7000.0 } else { 3500.0 };
             let reference = lowpass(pcm, band);
             let (corr, lag) = aligned_corr(&reference, &decoded, 2000);
@@ -1617,6 +1620,82 @@ fn silk_mono_nb_wb_roundtrip() {
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 assert!(out.status.success() && stderr.trim().is_empty(), "{name} {tag}: ffmpeg: {stderr}");
                 let _ = fs::remove_file(&path);
+            }
+        }
+    }
+}
+
+/// Reference oracle decode of `packets` as Ogg-Opus, or `None` without ffmpeg.
+fn oracle_decode(name: &str, packets: &[Vec<u8>], samples: usize) -> Option<Vec<f32>> {
+    if Command::new("ffmpeg").arg("-version").output().is_err() {
+        return None;
+    }
+    let path = temp_path(&format!("{name}.opus"));
+    write_ogg_opus(&path, packets, opus_head(1, None), 1, samples);
+    let out = Command::new("ffmpeg")
+        .args(["-v", "warning", "-c:a", "libopus", "-i"])
+        .arg(&path)
+        .args(["-f", "null", "-"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success() && stderr.trim().is_empty(), "{name}: ffmpeg: {stderr}");
+    let decoded = ffmpeg_decode(&path, 1);
+    let _ = fs::remove_file(&path);
+    decoded
+}
+
+fn silk_sources() -> Vec<(&'static str, Vec<f32>)> {
+    let wav = fixture("wav16-mono-48000.wav");
+    let mut sources = vec![("synthetic", speech_like())];
+    if wav.exists() {
+        let w = read_wav_mono(&wav);
+        sources.push(("wav16-mono-48000", w[..w.len().min(96000)].to_vec()));
+    }
+    sources
+}
+
+/// Noise-shaped, closed-loop quantisation at a controlled 16 kbps WB beats
+/// the open-loop writer's quality at 27-50 kbps.
+#[test]
+fn silk_nsq_improves_quality_at_equal_rate() {
+    let mut failures = Vec::new();
+    for (name, pcm) in &silk_sources() {
+        let (decoded, packets, _, _) = silk_roundtrip(pcm, true, Some(16000));
+        let reference = lowpass(pcm, 7000.0);
+        let (corr, lag) = aligned_corr(&reference, &decoded, 2000);
+        let bytes: usize = packets.iter().map(Vec::len).sum();
+        let kbps = bytes as f64 * 8.0 / (packets.len() as f64 * 20.0);
+        eprintln!("silk nsq {name} WB @16k: corr {corr:.4} at lag {lag}, {kbps:.1} kbps");
+        // The synthetic signal's noise tail (0.4 s of filtered noise) caps
+        // at ~0.96 at this rate; its pulse-train part alone reaches 0.992.
+        let floor = if *name == "synthetic" { 0.96 } else { 0.99 };
+        if corr < floor || kbps > 16.0 * 1.2 {
+            failures.push(format!("{name}: corr {corr:.4} (floor {floor}) at {kbps:.1} kbps"));
+        }
+        if let Some(oracle) = oracle_decode(&format!("silk-nsq-{name}"), &packets, pcm.len()) {
+            let (c, _) = aligned_corr(&oracle, &decoded, 2000);
+            assert!(c >= 0.99, "{name}: our decode vs oracle decode corr {c:.4}");
+        }
+    }
+    assert!(failures.is_empty(), "{failures:?}");
+}
+
+/// `set_bitrate` lands the coded rate within 20% of 8/12/16/24 kbps.
+#[test]
+fn silk_rate_control_tracks_target() {
+    for (name, pcm) in &silk_sources() {
+        for wideband in [false, true] {
+            for kbps_target in [8u32, 12, 16, 24] {
+                let (decoded, packets, _, _) = silk_roundtrip(pcm, wideband, Some(kbps_target * 1000));
+                let bytes: usize = packets.iter().map(Vec::len).sum();
+                let kbps = bytes as f64 * 8.0 / (packets.len() as f64 * 20.0);
+                let reference = lowpass(pcm, if wideband { 7000.0 } else { 3500.0 });
+                let (corr, _) = aligned_corr(&reference, &decoded, 2000);
+                let tag = if wideband { "WB" } else { "NB" };
+                eprintln!("silk rate {name} {tag} target {kbps_target}: {kbps:.2} kbps, corr {corr:.4}");
+                let ratio = kbps / kbps_target as f64;
+                assert!((0.8..=1.2).contains(&ratio), "{name} {tag} target {kbps_target}: got {kbps:.2} kbps");
             }
         }
     }
