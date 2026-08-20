@@ -480,6 +480,24 @@ fn per_band_correlation(o: &[f32], t: &[f32], rate: u32) -> Vec<(f64, f64, f64)>
 /// clustered at/near zero exonerate it in favour of a patch-map or
 /// gain-mapping bug instead. Bands below kx (already known clean from
 /// `per_band_correlation`) are skipped -- only HF bands (14..) are searched.
+///
+/// CONVICTED (round-26, Task 1): `bandpass_offset_probe` correlated this same
+/// `sharp_lowpass`/`sharp_highpass` cascade's band-k output against the
+/// REFERENCE's band-(k+/-10) output for several HF `k` -- and the DOWNWARD
+/// offset (band k-10, closer to the strongly-correlated below-crossover
+/// content) read a HIGHER correlation than the nominal same-band pairing in
+/// every HF band tried (e.g. band 34: same 0.937 vs -10 0.966). A filter
+/// with real ~172Hz selectivity cannot produce that; a "sharp" 3x-cascaded
+/// single-pole RC (~18dB/oct) at a 9kHz center still passes a wide swath
+/// below its corner, so each "band k" reading here is really "everything up
+/// to and including band k" -- cumulative correlation, dominated by the
+/// genuinely-matching low band, which manufactures the smooth monotonic
+/// decline earlier rounds chased. The reported LAG values are still valid
+/// (a filter with no stopband selectivity still has a passband delay that
+/// tracks the true alignment), but the reported per-band |corr| AMPLITUDE
+/// here is NOT a trustworthy per-band figure -- use `per_band_phase`'s
+/// cross-spectrum magnitude ratio (or the bin-level `bin_level_conviction`)
+/// for that instead.
 fn per_band_lag_search(o: &[f32], t: &[f32], rate: u32) -> Vec<(f64, i64, f64)> {
     const LAG_MAX: i64 = 1_024;
     const COARSE_STEP: i64 = 8;
@@ -628,6 +646,189 @@ fn per_band_phase(o: &[f32], t: &[f32], rate: u32) -> Vec<(f64, f64, f64)> {
             0.0
         };
         out.push((band as f64 * band_hz, phase, mag_ratio));
+    }
+    out
+}
+
+/// Round-26, Task 1: convicts (or acquits) `per_band_lag_search`'s bandpass.
+/// Applies the SAME 3x-cascaded RC bandpass that diagnostic uses to `o` at
+/// band `band` and to `t` at band `band` (same-band control), `band+offset`
+/// and `band-offset`. A single-pole cascade's stopband is gentle enough that
+/// "band k" may really pass "everything below f_k" -- if so, `o`-band-k and
+/// `t`-band-(k+offset) still both carry the same dominant low-band leakage
+/// and read highly correlated even though their nominal passbands don't
+/// overlap at all, which convicts the filter, not the content. Below the SBR
+/// crossover, genuinely narrowband-matching content should decorrelate
+/// quickly as `offset` grows; a HF band that does NOT decorrelate at
+/// `offset` bands away is evidence the filter has no real selectivity there.
+fn bandpass_offset_probe(
+    o: &[f32],
+    t: &[f32],
+    rate: u32,
+    band: usize,
+    offset: i64,
+) -> (f64, f64, f64) {
+    let band_hz = f64::from(rate) / 256.0;
+    let bp_at = |s: &[f32], b: usize| -> Vec<f32> {
+        let lo = (b as f64 * band_hz).max(1.0);
+        let hi = ((b + 1) as f64 * band_hz).min(f64::from(rate) / 2.0 - 1.0);
+        let sharp_highpass = |s: &[f32], cutoff: f64| -> Vec<f32> {
+            s.iter()
+                .zip(&sharp_lowpass(s, rate, cutoff))
+                .map(|(a, b)| a - b)
+                .collect::<Vec<f32>>()
+        };
+        sharp_lowpass(&sharp_highpass(s, lo), rate, hi)
+    };
+    let ob = bp_at(o, band);
+    let same_corr = correlation(&ob, &bp_at(t, band));
+    let hi_band = band as i64 + offset;
+    let hi_corr = if hi_band >= 0 {
+        correlation(&ob, &bp_at(t, hi_band as usize))
+    } else {
+        0.0
+    };
+    let lo_band = band as i64 - offset;
+    let lo_corr = if lo_band >= 0 {
+        correlation(&ob, &bp_at(t, lo_band as usize))
+    } else {
+        0.0
+    };
+    (same_corr, hi_corr, lo_corr)
+}
+
+/// Round-26, Task 2: bin-level (no filter, no cross-band summing) comparison
+/// of `o` against `t` in the most energetic HF SBR bands at/above `min_band`,
+/// three ways: DIRECT (bin i vs bin i), MIRROR (bin i vs the band's bins in
+/// REVERSED order -- the signature of a QMF band-orientation/parity flip
+/// between our own-design synthesis and the reference's convention: energies
+/// right, direct corr ~0, phase random, exactly what round-14/16 observed),
+/// and SHIFT (the whole `BINS_PER_SBR_BAND`-bin band matched one band up or
+/// down -- the signature of a `build_patches` source-mapping offset).
+/// Coherence per bin pair is
+/// `|sum_h O(h)*conj(T(h))| / sqrt(sum_h|O(h)|^2 * sum_h|T(h)|^2)` (in
+/// [0,1]; 1 = perfectly phase+magnitude locked, ~0 = unrelated), accumulated
+/// over the SAME aligned hops `per_band_phase` uses, then averaged over the
+/// band's 8 bins. Bands are picked by OUR OWN energy (the "real" HF content),
+/// not the reference's, so a genuinely-silent HF band can't crowd out an
+/// energetic one just because it happens to sort first.
+fn bin_level_conviction(
+    o: &[f32],
+    t: &[f32],
+    rate: u32,
+    min_band: usize,
+    top_n: usize,
+) -> Vec<(f64, f64, f64, f64, f64, f64)> {
+    const FFT_LEN: usize = 2048;
+    const HOP: usize = 1024;
+    const BINS_PER_SBR_BAND: usize = FFT_LEN / 256;
+    let win = ec_dsp::Window::<f32>::sine(FFT_LEN);
+    let mut rfft = ec_dsp::RealFft::<f32>::new(FFT_LEN);
+    let bins = rfft.spectrum_len();
+    let n = o.len().min(t.len());
+    let hops = if n >= FFT_LEN {
+        (n - FFT_LEN) / HOP + 1
+    } else {
+        0
+    };
+    let mut o_spec = vec![Vec::with_capacity(hops); bins];
+    let mut t_spec = vec![Vec::with_capacity(hops); bins];
+    let mut spectrum = vec![ec_dsp::Complex::new(0.0f32, 0.0); bins];
+    for (src, dst) in [(o, &mut o_spec), (t, &mut t_spec)] {
+        for h in 0..hops {
+            let mut block = src[h * HOP..h * HOP + FFT_LEN].to_vec();
+            win.apply(&mut block);
+            rfft.forward(&block, &mut spectrum);
+            for (b, c) in spectrum.iter().enumerate() {
+                dst[b].push(*c);
+            }
+        }
+    }
+    if hops == 0 {
+        return Vec::new();
+    }
+    let band_hz = f64::from(rate) / 256.0;
+    let num_bands = bins / BINS_PER_SBR_BAND;
+    let coh = |ob: usize, tb: usize| -> f64 {
+        if ob >= bins || tb >= bins {
+            return 0.0;
+        }
+        let mut cross_re = 0.0f64;
+        let mut cross_im = 0.0f64;
+        let mut o_e = 0.0f64;
+        let mut t_e = 0.0f64;
+        for h in 0..hops {
+            let oc = o_spec[ob][h];
+            let tc = t_spec[tb][h];
+            let cross = oc * tc.conj();
+            cross_re += f64::from(cross.re);
+            cross_im += f64::from(cross.im);
+            o_e += f64::from(oc.norm_sqr());
+            t_e += f64::from(tc.norm_sqr());
+        }
+        let den = (o_e * t_e).sqrt();
+        if den > 0.0 {
+            (cross_re * cross_re + cross_im * cross_im).sqrt() / den
+        } else {
+            0.0
+        }
+    };
+    // Rank HF bands by OUR OWN energy, so the energetic-band handful is
+    // chosen by real content, not by whatever the reference happens to carry.
+    let mut ranked: Vec<(usize, f64)> = (min_band..num_bands)
+        .map(|band| {
+            let lo = band * BINS_PER_SBR_BAND;
+            let hi = (lo + BINS_PER_SBR_BAND).min(bins);
+            let e: f64 = (lo..hi)
+                .flat_map(|b| o_spec[b].iter())
+                .map(|c| f64::from(c.norm_sqr()))
+                .sum();
+            (band, e)
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    let mut selected: Vec<usize> = ranked.into_iter().take(top_n).map(|(b, _)| b).collect();
+    selected.sort_unstable();
+
+    let mut out = Vec::with_capacity(selected.len());
+    for band in selected {
+        let lo = band * BINS_PER_SBR_BAND;
+        let hi = (lo + BINS_PER_SBR_BAND).min(bins);
+        if lo >= hi {
+            continue;
+        }
+        let mut energy = 0.0f64;
+        let mut direct = 0.0f64;
+        let mut mirror = 0.0f64;
+        let mut shift_up = 0.0f64;
+        let mut shift_down = 0.0f64;
+        let count = (hi - lo) as f64;
+        // `i` feeds several derived indices (mirror/shift math below), not a
+        // plain element access -- an iterator/enumerate rewrite would be
+        // less readable here, not more.
+        #[allow(clippy::needless_range_loop)]
+        for i in lo..hi {
+            energy += o_spec[i]
+                .iter()
+                .map(|c| f64::from(c.norm_sqr()))
+                .sum::<f64>();
+            direct += coh(i, i);
+            mirror += coh(i, hi + lo - 1 - i);
+            shift_up += coh(i, i + BINS_PER_SBR_BAND);
+            shift_down += if i >= BINS_PER_SBR_BAND {
+                coh(i, i - BINS_PER_SBR_BAND)
+            } else {
+                0.0
+            };
+        }
+        out.push((
+            band as f64 * band_hz,
+            energy,
+            direct / count,
+            mirror / count,
+            shift_up / count,
+            shift_down / count,
+        ));
     }
     out
 }
@@ -1187,6 +1388,41 @@ fn sbr_real_library_matches_reference() {
                     println!(
                         "    {hz:>6.0}Hz: phase {:>7.2}deg ratio {ratio:.4}",
                         phase.to_degrees()
+                    );
+                }
+            }
+            if std::env::var("EC_AAC_SBR_HF_CONVICTION").is_ok() && n >= 4_096 {
+                let band_hz = f64::from(rate) / 256.0;
+                let kx = (c.crossover_hz / band_hz).round() as usize;
+                let win = &o[oa..oa + n];
+                let twin = &t[ob..ob + n];
+                println!(
+                    "  ch{ch} TASK1 bandpass-selectivity probe (band_hz, same-band corr, +offset corr, -offset corr):"
+                );
+                for hf_band in [kx + 5, kx + 15, kx + 25] {
+                    let (same, hi_c, lo_c) = bandpass_offset_probe(win, twin, rate, hf_band, 10);
+                    println!(
+                        "    HF band{hf_band:>3} ({:.0}Hz) offset=10: same {same:.4} +10band {hi_c:.4} -10band {lo_c:.4}",
+                        hf_band as f64 * band_hz
+                    );
+                }
+                if kx > 6 {
+                    let lf_band = kx.saturating_sub(6);
+                    let (same, hi_c, lo_c) = bandpass_offset_probe(win, twin, rate, lf_band, 3);
+                    println!(
+                        "    LF CONTROL band{lf_band:>3} ({:.0}Hz) offset=3: same {same:.4} +3band {hi_c:.4} -3band {lo_c:.4}",
+                        lf_band as f64 * band_hz
+                    );
+                }
+                println!(
+                    "  ch{ch} TASK2 bin-level conviction (band_hz, ours-energy, direct, mirror, shift+1band, shift-1band):"
+                );
+                let min_band = (2_500.0 / band_hz).ceil() as usize;
+                for (hz, energy, direct, mirror, shift_up, shift_down) in
+                    bin_level_conviction(win, twin, rate, min_band, 6)
+                {
+                    println!(
+                        "    {hz:>6.0}Hz: energy {energy:.3e} direct {direct:.4} mirror {mirror:.4} shift+1 {shift_up:.4} shift-1 {shift_down:.4}"
                     );
                 }
             }
