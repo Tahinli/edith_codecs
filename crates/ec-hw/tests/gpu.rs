@@ -1508,6 +1508,219 @@ fn ten_bit_4k_frame_path_is_realtime() {
     println!("target: decode+to_i420_16 <= 39.00 ms/frame median (24 fps budget); got {got:.2}");
 }
 
+const HAIL_MARY: &str = "/home/tahinli/Downloads/Project.Hail.Mary.2026.PROPER.HDR.2160p.WEB.h265-GRACE\
+     /Project.Hail.Mary.2026.PROPER.HDR.2160p.WEB.h265-GRACE.mkv";
+
+/// `Encoder::encode_frame` of a 10-bit (P010) source, through the VPP
+/// NV12 conversion, against the CPU path (`to_i420` + `encode`) — the same
+/// shape as `encode_frame_zero_copy_matches_the_cpu_path`, but for a real
+/// P010 4K HDR source instead of a synthetic 8-bit one, and comparing Y and
+/// UV PSNR separately rather than the combined figure.
+#[test]
+fn encode_frame_accepts_p010_via_vpp() {
+    let Some(display) = display() else { return };
+    let path = Path::new(HAIL_MARY);
+    if !path.exists() {
+        eprintln!("skipped: film not present");
+        return;
+    }
+    let frames = 10usize;
+    let Some(data) = elementary(path, Codec::H265, frames) else {
+        eprintln!("skipped: no elementary stream");
+        return;
+    };
+
+    // This film's HEVC SPS `pic_height_in_luma_samples` is 2160, which is a
+    // multiple of the H.264 encode block size (16) but not the HEVC one
+    // (32, next_multiple_of gives 2176) — `encode_frame` refuses that
+    // mismatch by documented design ("frame's coded size does not match
+    // this encoder's ... the VPP conversion pass does not resize") rather
+    // than silently stretching the picture, so the HEVC target is expected
+    // to be *refused* here, not to round-trip; only H.264 gets the full
+    // encode/decode/PSNR comparison.
+    for (target, dec_codec) in [(EncCodec::H264, Codec::H264), (EncCodec::H265, Codec::H265)] {
+        let mut decoder = Decoder::new(&display, Codec::H265).expect("decoder opens");
+        let mut zc_stream = Vec::new();
+        let mut cpu_stream = Vec::new();
+        let mut count = 0i64;
+        let mut zero_copy: Option<Encoder> = None;
+        let mut cpu_path: Option<Encoder> = None;
+        let mut refused = false;
+
+        decode_stream(&mut decoder, Codec::H265, &data, frames, |frame| {
+            if refused {
+                return;
+            }
+            let (w, h) = frame.display_size;
+            let zero_copy = zero_copy.get_or_insert_with(|| {
+                let mut cfg = EncoderConfig::new(target, w, h);
+                cfg.gop_size = 30;
+                cfg.rate_control = RateControlMode::ConstantQp { qp: 22 };
+                Encoder::new(&display, cfg).expect("zero-copy encoder opens")
+            });
+            let cpu_path = cpu_path.get_or_insert_with(|| {
+                let mut cfg = EncoderConfig::new(target, w, h);
+                cfg.gop_size = 30;
+                cfg.rate_control = RateControlMode::ConstantQp { qp: 22 };
+                Encoder::new(&display, cfg).expect("cpu-path encoder opens")
+            });
+            let meta = FrameMetadata {
+                timestamp: count,
+                force_keyframe: false,
+            };
+            match zero_copy.encode_frame(&frame, meta) {
+                Ok(zc) => zc_stream.extend_from_slice(&zc.data),
+                Err(e) if target == EncCodec::H265 => {
+                    println!(
+                        "{target:?}: encode_frame refused as documented (block size vs SPS \
+                         pic height): {e}"
+                    );
+                    assert!(
+                        e.to_string().contains("encoder surfaces are"),
+                        "unexpected refusal reason: {e}"
+                    );
+                    refused = true;
+                    return;
+                }
+                Err(e) => panic!("encode_frame (zero copy, P010 via VPP): {e}"),
+            }
+            let i420 = frame.to_i420().expect("readback for the CPU-path baseline");
+            let cpu = cpu_path.encode(&i420, meta).expect("encode (CPU path)");
+            cpu_stream.extend_from_slice(&cpu.data);
+            count += 1;
+        })
+        .expect("decode");
+        if refused {
+            continue;
+        }
+        assert_eq!(
+            count as usize, frames,
+            "{target:?}: decoded {count} of {frames}"
+        );
+
+        let mut zc_decoder = Decoder::new(&display, dec_codec).expect("zc decoder opens");
+        let mut cpu_decoder = Decoder::new(&display, dec_codec).expect("cpu decoder opens");
+        let mut zc_frames = Vec::new();
+        let mut cpu_frames = Vec::new();
+        decode_stream(&mut zc_decoder, dec_codec, &zc_stream, frames, |f| {
+            zc_frames.push(f.to_i420().expect("readback"))
+        })
+        .expect("decode zero-copy stream");
+        decode_stream(&mut cpu_decoder, dec_codec, &cpu_stream, frames, |f| {
+            cpu_frames.push(f.to_i420().expect("readback"))
+        })
+        .expect("decode CPU-path stream");
+        assert_eq!(zc_frames.len(), frames, "{target:?}: zero-copy frame count");
+        assert_eq!(cpu_frames.len(), frames, "{target:?}: CPU-path frame count");
+
+        let widen = |v: &[u8]| -> Vec<u16> { v.iter().map(|&s| u16::from(s)).collect() };
+        let mut worst_y = f64::INFINITY;
+        let mut worst_uv = f64::INFINITY;
+        for (a, b) in zc_frames.iter().zip(&cpu_frames) {
+            let y_db = plane_psnr(&widen(&a.y), &widen(&b.y), 255.0);
+            let uv_db = plane_psnr(
+                &[widen(&a.u), widen(&a.v)].concat(),
+                &[widen(&b.u), widen(&b.v)].concat(),
+                255.0,
+            );
+            worst_y = worst_y.min(y_db);
+            worst_uv = worst_uv.min(uv_db);
+        }
+        println!("{target:?} encode_frame (P010 via VPP) vs CPU path: worst Y {worst_y:.1} dB, worst UV {worst_uv:.1} dB");
+        assert!(worst_y >= 40.0, "{target:?}: worst Y {worst_y:.1} dB vs the CPU path");
+        assert!(worst_uv >= 40.0, "{target:?}: worst UV {worst_uv:.1} dB vs the CPU path");
+    }
+}
+
+/// Median ms/frame at 3840x2160 for `decode+encode_frame` (P010 zero-copy,
+/// through VPP) against `decode+to_i420+encode` (CPU path) — the number that
+/// says whether the VPP conversion is cheap enough to keep the zero-copy path
+/// meaningfully faster than reading the frame back to system memory.
+///
+/// Targets H.264: this film's HEVC SPS `pic_height_in_luma_samples` (2160)
+/// is not a multiple of this crate's HEVC encode block size (32), so
+/// `encode_frame` refuses the HEVC target on this file by documented design
+/// (see `encode_frame_accepts_p010_via_vpp`) — 2160 *is* a multiple of the
+/// H.264 block size (16), so H.264 is the target that actually exercises the
+/// zero-copy path on this real source.
+#[test]
+fn p010_zero_copy_encode_is_realtime() {
+    let Some(display) = display() else { return };
+    let path = Path::new(HAIL_MARY);
+    if !path.exists() {
+        eprintln!("skipped: film not present");
+        return;
+    }
+    let limit = 60usize;
+    let Some(data) = elementary(path, Codec::H265, limit) else {
+        eprintln!("skipped: no elementary stream");
+        return;
+    };
+    let units = split_access_units(&data, Codec::H265);
+    assert!(units.len() > limit, "film clip too short for {limit} frames");
+
+    println!("{:<24} {:>10} {:>10} {:>10}", "stage", "median ms", "min ms", "max ms");
+    let mut zc_median = None;
+    let mut cpu_median = None;
+    for (name, zero_copy) in [("decode+encode_frame", true), ("decode+to_i420+encode", false)] {
+        let mut decoder = Decoder::new(&display, Codec::H265).expect("decoder opens");
+        let mut encoder: Option<Encoder> = None;
+        let mut durations: Vec<Duration> = Vec::new();
+        let mut count = 0i64;
+        'outer: for (i, unit) in units.iter().enumerate() {
+            decoder.decode(unit, i as i64).expect("decode");
+            while let Some(frame) = decoder.next_frame() {
+                let (w, h) = frame.display_size;
+                let encoder = encoder.get_or_insert_with(|| {
+                    let mut cfg = EncoderConfig::new(EncCodec::H264, w, h);
+                    cfg.gop_size = 30;
+                    cfg.rate_control = RateControlMode::ConstantQp { qp: 22 };
+                    Encoder::new(&display, cfg).expect("encoder opens")
+                });
+                let meta = FrameMetadata {
+                    timestamp: count,
+                    force_keyframe: false,
+                };
+                let t0 = Instant::now();
+                if zero_copy {
+                    encoder.encode_frame(&frame, meta).expect("encode_frame");
+                } else {
+                    let i420 = frame.to_i420().expect("readback");
+                    encoder.encode(&i420, meta).expect("encode");
+                }
+                durations.push(t0.elapsed());
+                count += 1;
+                if durations.len() >= limit {
+                    break 'outer;
+                }
+            }
+        }
+        assert!(
+            durations.len() >= limit,
+            "{name}: only {} of {limit} frames encoded",
+            durations.len()
+        );
+        durations.sort();
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        let median = ms(durations[durations.len() / 2]);
+        let min = ms(durations[0]);
+        let max = ms(durations[durations.len() - 1]);
+        println!("{name:<24} {median:>10.2} {min:>10.2} {max:>10.2}");
+        if zero_copy {
+            zc_median = Some(median);
+        } else {
+            cpu_median = Some(median);
+        }
+    }
+    let zc = zc_median.expect("zero-copy phase ran");
+    let cpu = cpu_median.expect("CPU-path phase ran");
+    println!("target: decode+encode_frame <= 20.00 ms/frame median; got {zc:.2} (CPU path {cpu:.2})");
+    assert!(
+        zc <= 20.0,
+        "decode+encode_frame median {zc:.2} ms/frame exceeds the 20 ms budget (CPU path: {cpu:.2} ms)"
+    );
+}
+
 /// A CRA GOP boundary stores its RASL leading pictures *after* the CRA in
 /// decode order, even though they display before it (they predict from
 /// pictures the CRA's own random-access point does not have). A decoder
