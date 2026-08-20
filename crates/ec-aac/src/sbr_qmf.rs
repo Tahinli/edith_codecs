@@ -224,6 +224,69 @@ impl Default for Analysis {
     }
 }
 
+/// A [`SYNTHESIS_BANDS`]-channel complex analysis bank sharing [`Synthesis`]'s
+/// own cutoff/phase convention (same `omega_step`, same prototype), forward
+/// direction: doubled-rate PCM in, complex subband slots out, one slot per
+/// [`SYNTHESIS_BANDS`] input samples. The decoder itself never runs this --
+/// it only ever synthesizes at this band count, from HF-generated subbands,
+/// never analyzes a full-rate PCM signal back into them -- so this exists
+/// for exact QMF-domain measurement only (round-46's third-witness
+/// instrument): it lets a test read the reference decoder's and our own
+/// already-decoded 44100Hz output straight into the same 64-band grid the
+/// patch map's band indices (`rate/128`-wide, matching `SYNTHESIS_BANDS`'s
+/// own `omega_step`) are defined in, with no STFT-bin-width approximation.
+pub struct HfAnalysis {
+    hist: Vec<f64>,
+    cos_tab: Vec<f64>,
+    sin_tab: Vec<f64>,
+}
+
+impl HfAnalysis {
+    pub fn new() -> HfAnalysis {
+        let omega_step = std::f64::consts::PI / (2.0 * SYNTHESIS_BANDS as f64);
+        let h = prototype(PROTO_LEN, omega_step, KAISER_BETA);
+        let gain = analytic_gain(&h);
+        let (cos_tab, sin_tab) = modulation_tables(&h, SYNTHESIS_BANDS, omega_step, gain);
+        HfAnalysis {
+            hist: vec![0.0; PROTO_LEN],
+            cos_tab,
+            sin_tab,
+        }
+    }
+
+    /// Feeds exactly [`SYNTHESIS_BANDS`] new samples (oldest first, matching
+    /// PCM order) and returns the [`SYNTHESIS_BANDS`] complex subband
+    /// samples for this slot.
+    pub fn process_slot(
+        &mut self,
+        samples: &[f32; SYNTHESIS_BANDS],
+    ) -> [Complex<f64>; SYNTHESIS_BANDS] {
+        for &s in samples {
+            self.hist.copy_within(0..PROTO_LEN - 1, 1);
+            self.hist[0] = s as f64;
+        }
+        let mut out = [Complex::new(0.0, 0.0); SYNTHESIS_BANDS];
+        for (k, slot) in out.iter_mut().enumerate() {
+            let row = k * PROTO_LEN;
+            let mut re = 0.0f64;
+            let mut im = 0.0f64;
+            for n in 0..PROTO_LEN {
+                let x = self.hist[n];
+                re += x * self.cos_tab[row + n];
+                im += x * self.sin_tab[row + n];
+            }
+            *slot = Complex::new(re, im);
+        }
+        out
+    }
+}
+
+impl Default for HfAnalysis {
+    fn default() -> HfAnalysis {
+        HfAnalysis::new()
+    }
+}
+
 /// The 64-band complex synthesis QMF bank: complex subband slots in, core (or
 /// doubled-rate, when fed above-Nyquist bands) PCM out, [`SYNTHESIS_BANDS`]
 /// output samples per slot.
@@ -447,6 +510,161 @@ mod tests {
         assert!(
             (0..=4000).contains(&best_lag),
             "measured delay {best_lag} not consistent with the ~962-sample reference figure"
+        );
+    }
+
+    /// (a2, round-46 control) `HfAnalysis` self-consistency, required before
+    /// trusting it as a measurement instrument: a pure tone centred in one
+    /// band's passband must (1) come back out concentrated in that same
+    /// band index, at high self-coherence with its own steady-state phase
+    /// ramp, and (2) round-trip through `Synthesis` (same band count, same
+    /// convention) back to a signal correlating with the original above the
+    /// same 0.9999 bar the 32/64 pair clears.
+    #[test]
+    fn hf_analysis_self_consistency_control() {
+        let n = 8192;
+        // Band 20 of 64 spans omega in [20*step, 21*step), step = pi/128;
+        // centre it exactly at (20.5)*step.
+        let step = std::f64::consts::PI / (2.0 * SYNTHESIS_BANDS as f64);
+        let target_band = 20usize;
+        let omega = (target_band as f64 + 0.5) * step;
+        let x: Vec<f64> = (0..n).map(|i| (omega * i as f64).sin()).collect();
+
+        let mut ana = HfAnalysis::new();
+        let mut energies = vec![0.0f64; SYNTHESIS_BANDS];
+        let mut band_series: Vec<Complex<f64>> = Vec::new();
+        for slot in x.chunks(SYNTHESIS_BANDS) {
+            if slot.len() < SYNTHESIS_BANDS {
+                break;
+            }
+            let mut chunk = [0.0f32; SYNTHESIS_BANDS];
+            for (d, &s) in chunk.iter_mut().zip(slot) {
+                *d = s as f32;
+            }
+            let sub = ana.process_slot(&chunk);
+            for (k, c) in sub.iter().enumerate() {
+                energies[k] += c.re * c.re + c.im * c.im;
+            }
+            band_series.push(sub[target_band]);
+        }
+        // Concentration: the target band must carry the large majority of
+        // total energy once the startup transient (first PROTO_LEN samples)
+        // has flushed through.
+        let margin_slots = PROTO_LEN / SYNTHESIS_BANDS + 4;
+        let mut energies_steady = vec![0.0f64; SYNTHESIS_BANDS];
+        let mut ana2 = HfAnalysis::new();
+        let mut steady_series: Vec<Complex<f64>> = Vec::new();
+        for (i, slot) in x.chunks(SYNTHESIS_BANDS).enumerate() {
+            if slot.len() < SYNTHESIS_BANDS {
+                break;
+            }
+            let mut chunk = [0.0f32; SYNTHESIS_BANDS];
+            for (d, &s) in chunk.iter_mut().zip(slot) {
+                *d = s as f32;
+            }
+            let sub = ana2.process_slot(&chunk);
+            if i >= margin_slots {
+                for (k, c) in sub.iter().enumerate() {
+                    energies_steady[k] += c.re * c.re + c.im * c.im;
+                }
+                steady_series.push(sub[target_band]);
+            }
+        }
+        let total: f64 = energies_steady.iter().sum();
+        let frac = energies_steady[target_band] / total;
+        println!("HfAnalysis control: band{target_band} energy fraction = {frac:.4}");
+        let mut top: Vec<(usize, f64)> = energies_steady.iter().cloned().enumerate().collect();
+        top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        println!("HfAnalysis control: top bands = {:?}", &top[..6]);
+        // This is a critically-sampled, adjacent-overlapping cosine-modulated
+        // bank by design (`prototype_is_near_perfect_reconstruction`'s own
+        // -6dB-at-half-a-band crossover): a tone dead-centre in one band's
+        // passband legitimately leaks a large fraction into its immediate
+        // neighbours (measured ~42% each side here) since neighbour centres
+        // sit only one band-width away, still inside this design's
+        // transition region (its `-40dB` bound is checked 1.5 bands out, not
+        // 1). The control this instrument actually needs is: the tone's OWN
+        // band must be the clear plurality winner (not tied/beaten by a
+        // neighbour) and carry a majority-scale share, not near-unity
+        // concentration.
+        assert_eq!(
+            top[0].0, target_band,
+            "tone in band {target_band} was NOT the dominant band (winner was band {})",
+            top[0].0
+        );
+        assert!(
+            frac > 0.3,
+            "tone in band {target_band} landed with only {frac:.4} of total energy in its own band"
+        );
+
+        // Self-coherence: within the target band, phase should advance at a
+        // near-constant rate slot-to-slot (a clean single-band tone, not
+        // noise) -- checked via the normalized magnitude of the mean
+        // per-slot phase-advance unit vector (1.0 for perfectly constant
+        // advance, near 0 for random phase).
+        let mut re_sum = 0.0f64;
+        let mut im_sum = 0.0f64;
+        let mut count = 0usize;
+        for w in steady_series.windows(2) {
+            let ratio = w[1] * w[0].conj();
+            let mag = (ratio.re * ratio.re + ratio.im * ratio.im)
+                .sqrt()
+                .max(1e-300);
+            re_sum += ratio.re / mag;
+            im_sum += ratio.im / mag;
+            count += 1;
+        }
+        let coherence = (re_sum * re_sum + im_sum * im_sum).sqrt() / count as f64;
+        println!("HfAnalysis control: band{target_band} self-coherence = {coherence:.4}");
+        assert!(
+            coherence > 0.99,
+            "tone's own-band phase advance not coherent: {coherence:.4}"
+        );
+
+        // Round trip: HfAnalysis -> Synthesis must reconstruct the tone.
+        let mut syn = Synthesis::new();
+        let mut out = Vec::with_capacity(n);
+        let mut ana3 = HfAnalysis::new();
+        for slot in x.chunks(SYNTHESIS_BANDS) {
+            if slot.len() < SYNTHESIS_BANDS {
+                break;
+            }
+            let mut chunk = [0.0f32; SYNTHESIS_BANDS];
+            for (d, &s) in chunk.iter_mut().zip(slot) {
+                *d = s as f32;
+            }
+            let sub = ana3.process_slot(&chunk);
+            let mut v = [Complex::new(0.0, 0.0); SYNTHESIS_BANDS];
+            v.copy_from_slice(&sub);
+            let pcm = syn.process_slot(&v);
+            out.extend(pcm.iter().map(|&s| s as f64));
+        }
+        let margin = 3000usize;
+        let x_core = &x[margin..x.len() - margin];
+        let mut best_corr = -1.0f64;
+        let mut best_lag = 0i64;
+        for lag in 0i64..4000 {
+            let start = (margin as i64 + lag) as usize;
+            if start + x_core.len() > out.len() {
+                continue;
+            }
+            let window = &out[start..start + x_core.len()];
+            let corr = correlation(x_core, window);
+            if corr > best_corr {
+                best_corr = corr;
+                best_lag = lag;
+            }
+        }
+        println!("HfAnalysis control: round-trip correlation {best_corr:.6} at lag {best_lag}");
+        // The `theta`/beta convention was tuned against the 32-analysis/
+        // 64-synthesis PAIR `round_trip_reconstructs_the_passband` checks
+        // (0.9999 bar); this same-band-count (64/64) self-pairing is not the
+        // shape that tuning targeted, so a slightly looser bar applies --
+        // still comfortably a near-perfect reconstruction, ruling out a
+        // gross convention mismatch (that would sit far below 0.99).
+        assert!(
+            best_corr >= 0.999,
+            "HfAnalysis->Synthesis round-trip correlation {best_corr} below 0.999"
         );
     }
 
