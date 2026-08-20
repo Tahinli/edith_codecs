@@ -354,12 +354,12 @@ mod tests {
     use crate::sbr_bands::freq_tables;
 
     fn real_file_tables() -> BandTables {
-        // The rig's own header params for ~/Music/Yok - Nikbinler.mp4's SBR
-        // element (44100 Hz extension rate, core-Nyquist crossover ~5 kHz):
-        // freq_scale=2, alter_scale=1, noise_bands=2, start/stop/xover taken
-        // from the mid-range defaults `EXTRA1_DEFAULTS` documents when a
-        // stream omits bs_header_extra_1/2.
-        freq_tables(44100, 5, 3, 2, 1, 2, 2).expect("valid header for the real file's rate")
+        // The real file's actual SBR header, read straight off the
+        // bitstream (round-27/28: start_freq=5 stop_freq=8 xover_band=0
+        // freq_scale=2 alter_scale=1 noise_bands=2 -> kx=14 k2=43 n_q=3;
+        // the previous stop_freq=3/xover_band=2 guess gave a smaller,
+        // wrong kx=16 k2=29 header).
+        freq_tables(44100, 5, 8, 2, 1, 0, 2).expect("valid header for the real file's rate")
     }
 
     #[test]
