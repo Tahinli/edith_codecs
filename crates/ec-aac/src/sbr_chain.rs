@@ -527,7 +527,10 @@ impl SbrChain {
                 }
                 let mut pcm = state.synthesis.process_slot(&v);
                 for s in &mut pcm {
-                    *s *= crate::decode::OUTPUT_SCALE;
+                    // The spec 32-analysis/64-synthesis pair (4.6.18.4.1 +
+                    // 4.6.18.8.2, literal equations) reads back at half the
+                    // core's amplitude; the 2x is the upsampler's gain.
+                    *s *= 2.0 * crate::decode::OUTPUT_SCALE;
                 }
                 out.extend_from_slice(&pcm);
             }
