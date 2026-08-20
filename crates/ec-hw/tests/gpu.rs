@@ -1469,6 +1469,100 @@ fn hevc_seek_matches_linear_mkv() {
     );
 }
 
+/// An H.264 open-GOP I picture is not an IDR: it is a plain I slice
+/// (`nal_unit_type` 1) whose predecessors in decode order can still hold
+/// references from before it, so leading pictures between it and the next
+/// IDR may predict from a picture never decoded since a fresh start there —
+/// exactly what a seek does. A decoder started at that I must drop those
+/// leading pictures per D.2.8's recovery point default, or its output shifts
+/// by however many leading pictures the GOP has.
+#[test]
+fn h264_seek_matches_linear_open_gop() {
+    let Some(display) = display() else { return };
+    let path = bitstreams().join("h264-open-gop.mp4");
+    let Some(data) = elementary(&path, Codec::H264, 60) else {
+        eprintln!("skipped: no h264-open-gop.mp4 fixture (run scripts/gen-fixtures.sh)");
+        return;
+    };
+    let units = split_access_units(&data, Codec::H264);
+
+    // Linear decode: every picture from the start, frame 30 kept for
+    // comparison (the fixture's second I picture, `keyint=30`).
+    const TARGET: usize = 30;
+    let mut decoder = Decoder::new(&display, Codec::H264).expect("decoder opens");
+    let mut linear_frame_30 = None;
+    let mut index = 0usize;
+    decode_stream(&mut decoder, Codec::H264, &data, 60, |frame| {
+        if index == TARGET {
+            linear_frame_30 = Some(frame.to_i420().expect("readback"));
+        }
+        index += 1;
+    })
+    .expect("linear decode");
+    let linear_frame_30 = linear_frame_30.expect("linear decode reached frame 30");
+
+    // Find the access unit whose first VCL NAL is the open-GOP I picture at
+    // this GOP boundary, and feed the decoder from there on, exactly as a
+    // seek would: nothing from before it goes in.
+    let open_gop_at = units
+        .iter()
+        .position(|au| is_open_gop_i(au))
+        .expect("an open-GOP I access unit exists");
+
+    // A seek reuses the parameter sets a decoder already learned; a fresh one
+    // has none, so it is primed the same way `ec_hw::Decoder::reset` expects a
+    // caller to: decode the leading IDR (its picture is thrown away) and
+    // reset picture state before feeding the seek target.
+    let mut seek_decoder = Decoder::new(&display, Codec::H264).expect("decoder opens");
+    seek_decoder.decode(units[0], 0).expect("prime parameter sets");
+    seek_decoder.reset();
+    let mut seeked_frame = None;
+    for (i, unit) in units[open_gop_at..].iter().enumerate() {
+        seek_decoder.decode(unit, i as i64).expect("seek decode");
+        if let Some(frame) = seek_decoder.next_frame() {
+            seeked_frame = Some(frame.to_i420().expect("readback"));
+            break;
+        }
+    }
+    if seeked_frame.is_none() {
+        seek_decoder.flush().expect("flush");
+        seeked_frame = seek_decoder
+            .next_frame()
+            .map(|f| f.to_i420().expect("readback"));
+    }
+    let seeked_frame = seeked_frame.expect("a frame came out after the seek");
+
+    assert_eq!(
+        seeked_frame, linear_frame_30,
+        "seeking to the open-GOP I before frame 30 handed back a different \
+         picture than a linear decode of frame 30 — leading pictures with \
+         missing references were not dropped"
+    );
+}
+
+/// True when an access unit's first VCL NAL is an H.264 open-GOP I slice
+/// (`nal_unit_type` 1, `slice_type % 5 == 2`), found by scanning for the
+/// access unit's first start code rather than assuming a fixed prefix length.
+fn is_open_gop_i(au: &[u8]) -> bool {
+    let mut i = 0usize;
+    while i + 3 < au.len() {
+        if au[i] != 0 || au[i + 1] != 0 || au[i + 2] != 1 {
+            i += 1;
+            continue;
+        }
+        let header = au[i + 3];
+        if header & 0x1f != 1 {
+            return false;
+        }
+        let mut r = ec_core::BitReader::new(&au[i + 4..]);
+        if r.read_ue().is_err() {
+            return false;
+        }
+        return matches!(r.read_ue(), Ok(code) if code % 5 == 2);
+    }
+    false
+}
+
 /// True when an access unit's first VCL NAL is an HEVC CRA (`nal_type` 21).
 /// A CRA's access unit may open with its own VPS/SPS/PPS, so this skips past
 /// non-VCL NALs to the first one that carries a slice.
