@@ -120,6 +120,10 @@ pub struct MatroskaDemuxer<R> {
     /// `TimestampScale`, in nanoseconds, as the time base every timestamp in
     /// this file is in.
     time_base: TimeBase,
+    /// `TimestampScale` itself, in nanoseconds: `time_base` is this reduced
+    /// against a billion, so a codec-derived duration (itself in nanoseconds)
+    /// has to divide by this, not by `time_base.num()`.
+    scale_ns: u64,
     doc_type: String,
     streams: Vec<StreamInfo>,
     tracks: Vec<Track>,
@@ -344,6 +348,7 @@ impl<R: Read + Seek> MatroskaDemuxer<R> {
             src,
             segment,
             time_base,
+            scale_ns,
             doc_type,
             streams,
             tracks,
@@ -598,15 +603,35 @@ impl<R: Read + Seek> MatroskaDemuxer<R> {
             return Ok(());
         };
         let key = group_key.unwrap_or(head.flags & 0x80 != 0);
-        let step = self.tracks[track].default_duration;
-        let duration = duration.or(step);
+        let default_step = self.tracks[track].default_duration;
+        let duration = duration.or(default_step);
+        let frames = head.frames.len() as i64;
+        // `DefaultDuration` absent: a `BlockDuration` the file did write is
+        // its next-best statement of the per-frame step, split evenly across
+        // the lace.
+        let split_step = duration.filter(|_| frames > 1).map(|d| d / frames);
+        let codec_id = self.tracks[track].codec_id.as_str();
+        let sample_rate = self.streams[stream as usize]
+            .params
+            .audio()
+            .map(|a| a.sample_rate);
         let ts = cluster_ts + i64::from(head.rel);
-        for (i, frame) in head.frames.iter().enumerate() {
-            // A lace writes one timestamp for all its frames; each one starts a
-            // `DefaultDuration` after the one before it, which is the only
-            // statement the file makes about where they sit.
-            let pts = ts + step.unwrap_or(0) * i as i64;
+        let mut offset = 0i64;
+        for frame in head.frames.iter() {
+            // A lace writes one timestamp for all its frames; each one starts
+            // a step after the one before it, which is the only statement the
+            // file makes about where they sit.
+            let pts = ts + offset;
             let data = self.tracks[track].unpack.frame(buf, frame.clone())?;
+            // Neither the file's `DefaultDuration` nor its `BlockDuration`
+            // said how long a frame lasts: the codec's own bytes are the last
+            // place left to ask, so a lace landed on mid-scan still steps by
+            // the true frame length instead of collapsing onto the base pts.
+            let step = default_step
+                .or(split_step)
+                .or_else(|| codec_frame_ticks(codec_id, &data, self.scale_ns, sample_rate))
+                .unwrap_or(0);
+            offset += step;
             self.queue.push_back(Packet {
                 stream,
                 time_base: self.time_base,
@@ -707,6 +732,43 @@ impl<R: Read + Seek> MatroskaDemuxer<R> {
             None => self.first_cluster,
         }
     }
+}
+
+/// A laced frame's own duration, in `time_base` (`scale_ns`-per-tick) ticks,
+/// for the codecs whose bitstream states it — the last place left to ask once
+/// a file has written neither `DefaultDuration` nor a usable `BlockDuration`.
+fn codec_frame_ticks(codec_id: &str, data: &[u8], scale_ns: u64, sample_rate: Option<u32>) -> Option<i64> {
+    let ns = match codec_id {
+        "A_OPUS" => opus_packet_duration_ns(data)?,
+        // AAC's core is always a 1024-sample frame (SBR's are 1024 of the
+        // *halved* base rate the container states, which comes out the same).
+        "A_AAC" => {
+            let rate = sample_rate.filter(|r| *r > 0)? as u64;
+            1024 * 1_000_000_000 / rate
+        }
+        _ => return None,
+    };
+    Some(((ns / scale_ns.max(1)) as i64).max(1))
+}
+
+/// An Opus packet's own duration (RFC 6716 §3.1), read off its TOC byte and,
+/// for a VBR/CBR frame count byte (`c == 3`), the frame count it states.
+fn opus_packet_duration_ns(data: &[u8]) -> Option<u64> {
+    let toc = *data.first()?;
+    let config = toc >> 3;
+    // Tenths of a millisecond, so the 2.5 ms CELT frame stays exact.
+    let frame_ms_x10: u64 = match config {
+        0..=11 => [100, 200, 400, 600][(config % 4) as usize],
+        12..=15 => [100, 200][(config % 2) as usize],
+        16..=31 => [25, 50, 100, 200][(config % 4) as usize],
+        _ => return None,
+    };
+    let frames = match toc & 0x3 {
+        0 => 1,
+        1 | 2 => 2,
+        _ => (*data.get(1)? & 0x3f) as u64,
+    };
+    Some(frame_ms_x10 * frames * 100_000)
 }
 
 impl<R: Read + Seek + Send> Demuxer for MatroskaDemuxer<R> {
