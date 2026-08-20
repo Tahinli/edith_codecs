@@ -133,11 +133,19 @@ fn our_decode(
     let rate = decoder.output_sample_rate().unwrap_or(0);
     let mut planes: Vec<Vec<f32>> = Vec::new();
     let mut failed = 0;
-    for au in &aus {
+    let debug_failures = std::env::var("EC_AAC_SBR_AU_FAIL_DEBUG").as_deref() == Ok("1");
+    for (au_idx, au) in aus.iter().enumerate() {
         let frame = match decoder.decode(au, None) {
             Ok(f) => f,
-            Err(_) => {
+            Err(e) => {
                 failed += 1;
+                if debug_failures {
+                    let head: Vec<u8> = au.iter().take(16).copied().collect();
+                    eprintln!(
+                        "  AU {au_idx} FAILED len={} err={e:?} head={head:02x?}",
+                        au.len()
+                    );
+                }
                 continue;
             }
         };
