@@ -634,3 +634,131 @@ fn caller_supplied_headers_win_over_extradata() {
     assert_eq!(packet.pts, Some(0));
     assert!(demuxer.next_packet().unwrap_err().is_eof());
 }
+
+fn vorbis_params(rate: u32) -> CodecParameters {
+    let mut ident = vec![1u8];
+    ident.extend_from_slice(b"vorbis");
+    ident.extend_from_slice(&0u32.to_le_bytes());
+    ident.push(2);
+    ident.extend_from_slice(&rate.to_le_bytes());
+    ident.resize(30, 0);
+    let mut params = CodecParameters::new(CodecId::Vorbis);
+    params.extradata = Some(Buf::from_vec(
+        ec_ogg::xiph_lace(&[&ident, &[3u8], &[5u8]]).unwrap(),
+    ));
+    params
+}
+
+fn opus_params(pre_skip: u16) -> CodecParameters {
+    let mut head = Vec::from(*b"OpusHead");
+    head.extend_from_slice(&[1, 2]);
+    head.extend_from_slice(&pre_skip.to_le_bytes());
+    head.extend_from_slice(&48_000u32.to_le_bytes());
+    head.resize(19, 0);
+    let mut params = CodecParameters::new(CodecId::Opus);
+    params.extradata = Some(Buf::from_vec(head));
+    params
+}
+
+fn flac_headers(rate: u32) -> [Vec<u8>; 2] {
+    let mut head = vec![0u8; 51];
+    head[0] = 0x7f;
+    head[1..5].copy_from_slice(b"FLAC");
+    head[7..9].copy_from_slice(&1u16.to_be_bytes());
+    head[9..13].copy_from_slice(b"fLaC");
+    let si = &mut head[17..51];
+    si[10] = (rate >> 12) as u8;
+    si[11] = (rate >> 4) as u8;
+    si[12] = ((rate & 0x0f) as u8) << 4 | (1 << 1);
+    ([head, vec![0x84, 0, 0, 0]])
+}
+
+fn mux_seek_case(
+    codec: CodecId,
+    time_base: TimeBase,
+    headers: &[Vec<u8>],
+    granules: &[i64],
+    packets: &[Vec<u8>],
+) -> Vec<u8> {
+    let mut muxer = OggMuxer::new(Cursor::new(Vec::new()));
+    let mut params = CodecParameters::new(codec);
+    if headers.is_empty() {
+        params = match codec {
+            CodecId::Vorbis => vorbis_params(time_base.den() as u32),
+            CodecId::Opus => opus_params(granules[0] as u16),
+            _ => params,
+        };
+    }
+    muxer
+        .add_stream(StreamInfo::new(0, time_base, params))
+        .unwrap();
+    for header in headers {
+        let mut packet = Packet::new(0, time_base, header.clone());
+        packet.flags = PacketFlags {
+            header: true,
+            ..PacketFlags::default()
+        };
+        muxer.write_packet(&packet).unwrap();
+    }
+    for (packet, granule) in packets.iter().zip(granules) {
+        let mut packet = Packet::new(0, time_base, packet.clone());
+        packet.side_data.push(granule_side_data(*granule));
+        muxer.write_packet(&packet).unwrap();
+    }
+    muxer.finish().unwrap();
+    muxer.into_inner().into_inner()
+}
+
+#[test]
+fn seek_to_first_data_granule_replays_the_first_packet() {
+    let cases = [
+        (
+            CodecId::Vorbis,
+            TimeBase::from_rate(48_000),
+            Vec::new(),
+            vec![0, 1024],
+            vec![b"first-vorbis".to_vec(), b"second-vorbis".to_vec()],
+        ),
+        (
+            CodecId::Opus,
+            TimeBase::from_rate(48_000),
+            Vec::new(),
+            vec![312, 1272],
+            vec![
+                vec![(31 << 3) as u8, 0, 0, 0],
+                vec![(31 << 3) as u8, 1, 2, 3],
+            ],
+        ),
+        (
+            CodecId::Flac,
+            TimeBase::from_rate(48_000),
+            flac_headers(48_000).to_vec(),
+            vec![1024, 2048],
+            vec![b"first-flac".to_vec(), b"second-flac".to_vec()],
+        ),
+    ];
+
+    for (codec, time_base, headers, granules, packets) in cases {
+        let bytes = mux_seek_case(codec, time_base, &headers, &granules, &packets);
+        let mut fresh = OggDemuxer::open(Cursor::new(bytes.clone())).unwrap();
+        let first = fresh.next_packet().unwrap();
+
+        let mut seeked = OggDemuxer::open(Cursor::new(bytes)).unwrap();
+        seeked
+            .seek(
+                0,
+                Timestamp::new(granules[0], time_base),
+                SeekMode::SyncBefore,
+            )
+            .unwrap();
+        let after_seek = seeked.next_packet().unwrap();
+
+        assert_eq!(after_seek.data, first.data, "{codec:?}: first packet data");
+        assert_eq!(
+            granule_of(&after_seek),
+            granule_of(&first),
+            "{codec:?}: first packet granule"
+        );
+        assert_eq!(after_seek.pts, first.pts, "{codec:?}: first packet pts");
+    }
+}
