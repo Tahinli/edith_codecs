@@ -414,7 +414,7 @@ fn every_fixture_remuxes_into_a_file_ffprobe_and_ffmpeg_agree_with() {
         // ...and the `SeekHead` really names the elements it says it does. A
         // demuxer that finds nothing there falls back to a walk and reads the
         // file perfectly well, so nothing above this notices — while a stricter
-        // reader (symphonia's) follows the pointer into the middle of a cluster
+        // reader (the incumbent's) follows the pointer into the middle of a cluster
         // and refuses the file outright. Checked by resolving every entry.
         seek_head_points_at_what_it_names(&dst);
 
