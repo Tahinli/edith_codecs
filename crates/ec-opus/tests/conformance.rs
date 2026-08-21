@@ -772,7 +772,7 @@ fn real_library_sweep() {
 // Encoder: self-consistency (range-exact against our own decoder)
 // ---------------------------------------------------------------------------
 
-use ec_opus::{Application, Bandwidth, Encoder, MultistreamEncoder};
+use ec_opus::{Application, Bandwidth, Encoder, Mode, MultistreamEncoder, Packet};
 
 /// A deterministic music-like test signal: several detuned partials plus a
 /// swept component per channel, loud enough to exercise every band.
@@ -875,52 +875,357 @@ fn encoder_roundtrips_at_every_rate() {
     }
 }
 
-/// The mode `Encoder` actually picks, read back from the packet's own TOC
-/// byte: Voip below 20 kbps mono selects SILK (NB at/under 10 kbps, WB
-/// above), Voip 20-40 kbps and Audio at any rate stay on CELT (Hybrid is
-/// unimplemented and Mode 20-40 kbps needs it, D4).
 #[test]
-fn encoder_mode_follows_application_and_bitrate() {
-    // `None` for the two CELT rows: any CELT config is correct there, the
-    // exact one is `auto_bandwidth`'s call, not mode selection's.
-    let cases = [
-        (Application::Voip, 8_000u32, Some(1u8)),
-        (Application::Voip, 16_000, Some(9)),
-        (Application::Audio, 64_000, None),
-        (Application::Voip, 32_000, Some(15)),
-        (Application::Voip, 48_000, None),
-    ];
-    for (app, bps, want_config) in cases {
-        let mut enc = Encoder::new(48000, 1, app).unwrap();
-        enc.set_bitrate(bps);
-        let pcm = vec![0.0f32; 960];
-        let mut out = vec![0u8; 1500];
-        let n = enc.encode_float(&pcm, 960, &mut out).unwrap();
-        let toc = ec_opus::Toc::new(out[0]);
-        match want_config {
-            Some(want) => assert_eq!(
-                toc.config, want,
-                "{app:?} at {bps} bps: TOC config {} (wanted {want})",
-                toc.config
-            ),
-            None => assert_eq!(
-                toc.mode(),
-                ec_opus::Mode::Celt,
-                "{app:?} at {bps} bps: TOC config {} is not CELT",
-                toc.config
-            ),
-        }
-        assert!(n > 1, "{app:?} at {bps} bps: empty packet");
+fn encoder_mode_follows_application_bitrate_channels_and_frame_size() {
+    #[derive(Clone, Copy, Debug)]
+    struct Case {
+        app: Application,
+        channels: usize,
+        bps: u32,
+        frame: usize,
+        mode_request: Option<Mode>,
+        bandwidth_request: Option<Bandwidth>,
+        mode: Mode,
+        bandwidth: Bandwidth,
+        config: u8,
+        code: u8,
+        frames: usize,
     }
 
-    let mut enc = Encoder::new(48000, 1, Application::Voip).unwrap();
-    enc.set_mode(Some(ec_opus::Mode::Silk));
-    enc.set_bandwidth(Some(Bandwidth::Medium));
-    let pcm = vec![0.0f32; 480];
-    let mut out = vec![0u8; 1500];
-    let n = enc.encode_float(&pcm, 480, &mut out).unwrap();
-    assert_eq!(ec_opus::Toc::new(out[0]).config, 4, "forced 10 ms MB SILK");
-    assert!(n > 1, "forced 10 ms MB SILK empty packet");
+    let cases = [
+        Case {
+            app: Application::Voip,
+            channels: 1,
+            bps: 8_000,
+            frame: 480,
+            mode_request: None,
+            bandwidth_request: None,
+            mode: Mode::Silk,
+            bandwidth: Bandwidth::Narrow,
+            config: 0,
+            code: 0,
+            frames: 1,
+        },
+        Case {
+            app: Application::Voip,
+            channels: 1,
+            bps: 12_000,
+            frame: 960,
+            mode_request: None,
+            bandwidth_request: None,
+            mode: Mode::Silk,
+            bandwidth: Bandwidth::Narrow,
+            config: 1,
+            code: 0,
+            frames: 1,
+        },
+        Case {
+            app: Application::Voip,
+            channels: 1,
+            bps: 13_000,
+            frame: 960,
+            mode_request: None,
+            bandwidth_request: None,
+            mode: Mode::Silk,
+            bandwidth: Bandwidth::Medium,
+            config: 5,
+            code: 0,
+            frames: 1,
+        },
+        Case {
+            app: Application::Voip,
+            channels: 1,
+            bps: 16_000,
+            frame: 960,
+            mode_request: None,
+            bandwidth_request: None,
+            mode: Mode::Silk,
+            bandwidth: Bandwidth::Medium,
+            config: 5,
+            code: 0,
+            frames: 1,
+        },
+        Case {
+            app: Application::Voip,
+            channels: 1,
+            bps: 19_000,
+            frame: 960,
+            mode_request: None,
+            bandwidth_request: None,
+            mode: Mode::Silk,
+            bandwidth: Bandwidth::Wide,
+            config: 9,
+            code: 0,
+            frames: 1,
+        },
+        Case {
+            app: Application::Voip,
+            channels: 1,
+            bps: 20_000,
+            frame: 960,
+            mode_request: None,
+            bandwidth_request: None,
+            mode: Mode::Hybrid,
+            bandwidth: Bandwidth::SuperWide,
+            config: 13,
+            code: 0,
+            frames: 1,
+        },
+        Case {
+            app: Application::Voip,
+            channels: 1,
+            bps: 39_000,
+            frame: 960,
+            mode_request: None,
+            bandwidth_request: None,
+            mode: Mode::Hybrid,
+            bandwidth: Bandwidth::Full,
+            config: 15,
+            code: 0,
+            frames: 1,
+        },
+        Case {
+            app: Application::Voip,
+            channels: 1,
+            bps: 40_000,
+            frame: 960,
+            mode_request: None,
+            bandwidth_request: None,
+            mode: Mode::Celt,
+            bandwidth: Bandwidth::Full,
+            config: 31,
+            code: 0,
+            frames: 1,
+        },
+        Case {
+            app: Application::Audio,
+            channels: 1,
+            bps: 16_000,
+            frame: 960,
+            mode_request: None,
+            bandwidth_request: None,
+            mode: Mode::Celt,
+            bandwidth: Bandwidth::SuperWide,
+            config: 27,
+            code: 0,
+            frames: 1,
+        },
+        Case {
+            app: Application::Audio,
+            channels: 1,
+            bps: 64_000,
+            frame: 960,
+            mode_request: None,
+            bandwidth_request: None,
+            mode: Mode::Celt,
+            bandwidth: Bandwidth::Full,
+            config: 31,
+            code: 0,
+            frames: 1,
+        },
+        Case {
+            app: Application::LowDelay,
+            channels: 1,
+            bps: 16_000,
+            frame: 960,
+            mode_request: None,
+            bandwidth_request: None,
+            mode: Mode::Celt,
+            bandwidth: Bandwidth::SuperWide,
+            config: 27,
+            code: 0,
+            frames: 1,
+        },
+        Case {
+            app: Application::Voip,
+            channels: 2,
+            bps: 16_000,
+            frame: 960,
+            mode_request: None,
+            bandwidth_request: None,
+            mode: Mode::Silk,
+            bandwidth: Bandwidth::Narrow,
+            config: 1,
+            code: 0,
+            frames: 1,
+        },
+        Case {
+            app: Application::Voip,
+            channels: 2,
+            bps: 24_000,
+            frame: 960,
+            mode_request: None,
+            bandwidth_request: None,
+            mode: Mode::Silk,
+            bandwidth: Bandwidth::Narrow,
+            config: 1,
+            code: 0,
+            frames: 1,
+        },
+        Case {
+            app: Application::Voip,
+            channels: 2,
+            bps: 32_000,
+            frame: 960,
+            mode_request: None,
+            bandwidth_request: None,
+            mode: Mode::Silk,
+            bandwidth: Bandwidth::Medium,
+            config: 5,
+            code: 0,
+            frames: 1,
+        },
+        Case {
+            app: Application::Voip,
+            channels: 2,
+            bps: 38_000,
+            frame: 960,
+            mode_request: None,
+            bandwidth_request: None,
+            mode: Mode::Silk,
+            bandwidth: Bandwidth::Wide,
+            config: 9,
+            code: 0,
+            frames: 1,
+        },
+        Case {
+            app: Application::Voip,
+            channels: 2,
+            bps: 40_000,
+            frame: 960,
+            mode_request: None,
+            bandwidth_request: None,
+            mode: Mode::Hybrid,
+            bandwidth: Bandwidth::SuperWide,
+            config: 13,
+            code: 0,
+            frames: 1,
+        },
+        Case {
+            app: Application::Voip,
+            channels: 2,
+            bps: 78_000,
+            frame: 960,
+            mode_request: None,
+            bandwidth_request: None,
+            mode: Mode::Hybrid,
+            bandwidth: Bandwidth::Full,
+            config: 15,
+            code: 0,
+            frames: 1,
+        },
+        Case {
+            app: Application::Voip,
+            channels: 2,
+            bps: 80_000,
+            frame: 960,
+            mode_request: None,
+            bandwidth_request: None,
+            mode: Mode::Celt,
+            bandwidth: Bandwidth::Full,
+            config: 31,
+            code: 0,
+            frames: 1,
+        },
+        Case {
+            app: Application::Voip,
+            channels: 2,
+            bps: 32_000,
+            frame: 480,
+            mode_request: None,
+            bandwidth_request: None,
+            mode: Mode::Silk,
+            bandwidth: Bandwidth::Medium,
+            config: 4,
+            code: 0,
+            frames: 1,
+        },
+        Case {
+            app: Application::Voip,
+            channels: 2,
+            bps: 32_000,
+            frame: 1920,
+            mode_request: None,
+            bandwidth_request: None,
+            mode: Mode::Silk,
+            bandwidth: Bandwidth::Medium,
+            config: 5,
+            code: 3,
+            frames: 2,
+        },
+        Case {
+            app: Application::Voip,
+            channels: 2,
+            bps: 32_000,
+            frame: 2880,
+            mode_request: None,
+            bandwidth_request: None,
+            mode: Mode::Silk,
+            bandwidth: Bandwidth::Medium,
+            config: 5,
+            code: 3,
+            frames: 3,
+        },
+        Case {
+            app: Application::Voip,
+            channels: 1,
+            bps: 16_000,
+            frame: 1920,
+            mode_request: None,
+            bandwidth_request: None,
+            mode: Mode::Silk,
+            bandwidth: Bandwidth::Medium,
+            config: 6,
+            code: 0,
+            frames: 1,
+        },
+        Case {
+            app: Application::Voip,
+            channels: 1,
+            bps: 19_000,
+            frame: 2880,
+            mode_request: None,
+            bandwidth_request: None,
+            mode: Mode::Silk,
+            bandwidth: Bandwidth::Wide,
+            config: 11,
+            code: 0,
+            frames: 1,
+        },
+        Case {
+            app: Application::Audio,
+            channels: 1,
+            bps: 64_000,
+            frame: 480,
+            mode_request: Some(Mode::Silk),
+            bandwidth_request: Some(Bandwidth::Medium),
+            mode: Mode::Silk,
+            bandwidth: Bandwidth::Medium,
+            config: 4,
+            code: 0,
+            frames: 1,
+        },
+    ];
+
+    for case in cases {
+        let mut enc = Encoder::new(48000, case.channels, case.app).unwrap();
+        enc.set_bitrate(case.bps);
+        enc.set_mode(case.mode_request);
+        enc.set_bandwidth(case.bandwidth_request);
+        let pcm = vec![0.0f32; case.frame * case.channels];
+        let mut out = vec![0u8; 4096];
+        let n = enc.encode_float(&pcm, case.frame, &mut out).unwrap();
+        let packet = Packet::parse(&out[..n], false).unwrap();
+        let toc = packet.toc;
+        assert_eq!(toc.mode(), case.mode, "{case:?}");
+        assert_eq!(toc.bandwidth(), case.bandwidth, "{case:?}");
+        assert_eq!(toc.config, case.config, "{case:?}");
+        assert_eq!(toc.code, case.code, "{case:?}");
+        assert_eq!(toc.stereo, case.channels == 2, "{case:?}");
+        assert_eq!(packet.frames.len(), case.frames, "{case:?}");
+        assert_eq!(packet.samples_48k(), case.frame, "{case:?}");
+        assert!(n > 1, "{case:?}: empty packet");
+    }
 }
 
 /// All four CELT frame sizes survive the loop, and constrained VBR both
@@ -972,9 +1277,9 @@ fn opus_head(channels: usize, pre_skip: u16, layout: Option<(usize, usize, &[u8]
     ec_opus::ogg::opus_head(channels as u8, pre_skip, 48000, 0, mapping)
 }
 
-/// Muxes 20 ms packets into an Ogg-Opus file whose final granule trims the
-/// stream to exactly `total_samples` — RFC 7845 end-trimming plus the
-/// pre-skip accounting.
+/// Muxes packets into an Ogg-Opus file whose final granule trims the stream
+/// to exactly `total_samples` — RFC 7845 end-trimming plus the pre-skip
+/// accounting.
 fn write_ogg_opus(
     path: &Path,
     packets: &[Vec<u8>],
@@ -996,16 +1301,17 @@ fn write_ogg_opus(
     let mut pts = 0i64;
     for (idx, p) in packets.iter().enumerate() {
         let last = idx == packets.len() - 1;
+        let packet_dur = ec_opus::Packet::parse(p, false).unwrap().samples_48k() as i64;
         let dur = if last {
             total_samples as i64 + pre_skip - pts
         } else {
-            960
+            packet_dur
         };
         let pkt = CorePacket::new(0, tb, p.clone())
             .with_pts(pts)
             .with_duration(dur);
         mux.write_packet(&pkt).unwrap();
-        pts += 960;
+        pts += packet_dur;
     }
     mux.finish().unwrap();
 }
@@ -1036,7 +1342,14 @@ fn encode_packets(enc: &mut Encoder, pcm: &[f32], channels: usize) -> Vec<Vec<u8
 }
 
 fn temp_path(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("ec-opus-enc-{}-{name}", std::process::id()))
+    let root = std::env::var_os("EC_OPUS_SCRATCH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = std::env::var_os("HOME").expect("HOME set for encoder scratch");
+            PathBuf::from(home).join(".cache/silk2")
+        });
+    fs::create_dir_all(&root).unwrap();
+    root.join(format!("ec-opus-enc-{}-{name}", std::process::id()))
 }
 
 /// The full product rate table, mono and stereo, decoded by libopus: the
@@ -1706,11 +2019,11 @@ fn silk_mono_nb_wb_roundtrip() {
 #[test]
 fn silk_mediumband_and_10ms_roundtrip() {
     let pcm = speech_like();
-    for (tag, fs_khz, frame_ms, config, cutoff, bps) in [
-        ("NB10", 8usize, 10usize, 0u8, 3500.0, 12_000u32),
-        ("MB10", 12, 10, 4, 5500.0, 16_000),
-        ("WB10", 16, 10, 8, 7000.0, 20_000),
-        ("MB20", 12, 20, 5, 5500.0, 16_000),
+    for (tag, fs_khz, frame_ms, config, cutoff, bps, floor) in [
+        ("NB10", 8usize, 10usize, 0u8, 3500.0, 12_000u32, 0.89f64),
+        ("MB10", 12, 10, 4, 5500.0, 16_000, 0.91),
+        ("WB10", 16, 10, 8, 7000.0, 20_000, 0.93),
+        ("MB20", 12, 20, 5, 5500.0, 16_000, 0.95),
     ] {
         let enc = match fs_khz {
             8 => SilkEncoder::new(false),
@@ -1727,7 +2040,7 @@ fn silk_mediumband_and_10ms_roundtrip() {
             "silk {tag}: corr {corr:.4} at lag {lag}, voiced {voiced}/{} frames, {kbps:.2} kbps",
             packets.len()
         );
-        assert!(corr >= 0.75, "{tag}: corr {corr:.4}");
+        assert!(corr >= floor, "{tag}: corr {corr:.4}");
         assert!(
             frame_ms == 10 || voiced > 0,
             "{tag}: no frame coded with LTP"
@@ -1739,6 +2052,207 @@ fn silk_mediumband_and_10ms_roundtrip() {
     }
 }
 
+#[test]
+fn silk_multiframe_packets_roundtrip() {
+    let full = speech_like();
+    let pcm = &full[..46_080];
+    for (tag, enc, frame_ms, config, cutoff, bps, floor) in [
+        (
+            "NB40",
+            SilkEncoder::new(false),
+            40usize,
+            2u8,
+            3500.0,
+            16_000u32,
+            0.9329f64,
+        ),
+        (
+            "MB40",
+            SilkEncoder::new_mediumband(),
+            40,
+            6,
+            5500.0,
+            20_000,
+            0.94,
+        ),
+        ("WB40", SilkEncoder::new(true), 40, 10, 7000.0, 24_000, 0.95),
+        ("WB60", SilkEncoder::new(true), 60, 11, 7000.0, 24_000, 0.93),
+    ] {
+        let (decoded, packets, voiced) = silk_roundtrip_ms(enc, pcm, frame_ms, Some(bps));
+        let toc = ec_opus::Toc::new(packets[0][0]);
+        assert_eq!(toc.config, config, "{tag}: wrong TOC config");
+        assert_eq!(toc.code, 0, "{tag}: multiframe SILK uses one Opus frame");
+        let reference = lowpass(pcm, cutoff);
+        let (corr, lag) = aligned_corr(&reference, &decoded, 2500);
+        let bytes: usize = packets.iter().map(Vec::len).sum();
+        let kbps = bytes as f64 * 8.0 / (packets.len() as f64 * frame_ms as f64);
+        eprintln!(
+            "silk {tag}: corr {corr:.4} at lag {lag}, voiced {voiced}/{} frames, {kbps:.2} kbps",
+            packets.len()
+        );
+        assert!(corr >= floor, "{tag}: corr {corr:.4} below {floor:.4}");
+        assert!(voiced > 0, "{tag}: no frame coded with LTP");
+        if let Some(oracle) = oracle_decode(&format!("silk-{tag}"), &packets, pcm.len()) {
+            let (c, _) = aligned_corr(&oracle, &decoded, 2500);
+            assert!(
+                c >= 0.99,
+                "{tag}: internal decode vs external decode corr {c:.4}"
+            );
+        }
+        if Command::new("gst-launch-1.0")
+            .arg("--version")
+            .output()
+            .is_ok()
+        {
+            let path = temp_path(&format!("silk-{tag}-gst.opus"));
+            write_ogg_opus(&path, &packets, opus_head(1, 120, None), 1, pcm.len(), 120);
+            let location = format!("location={}", path.display());
+            let out = Command::new("gst-launch-1.0")
+                .args([
+                    "-q", "filesrc", &location, "!", "oggdemux", "!", "opusdec", "!", "fakesink",
+                ])
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "{tag}: gst decode: {stderr}");
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
+fn stereo_speech_pair() -> Vec<f32> {
+    let left = speech_like();
+    let mut out = Vec::with_capacity(left.len() * 2);
+    for (i, &l) in left.iter().enumerate() {
+        let t = i as f64 / 48000.0;
+        let r = 0.78 * l + 0.12 * (std::f64::consts::TAU * 310.0 * t).sin() as f32;
+        out.push(l);
+        out.push(r);
+    }
+    out
+}
+
+fn aligned_channel_corr(reference: &[f32], decoded: &[f32], channels: usize, ch: usize) -> f64 {
+    let b: Vec<f32> = decoded.chunks_exact(channels).map(|f| f[ch]).collect();
+    aligned_corr(reference, &b, 2000).0
+}
+
+#[test]
+fn silk_stereo_speech_roundtrip() {
+    let pcm = stereo_speech_pair();
+    let total = pcm.len() / 2;
+    for (tag, bandwidth, per_channel_bps, cutoff, frame, config, code, frames) in [
+        (
+            "NB20",
+            Bandwidth::Narrow,
+            16_000u32,
+            3500.0,
+            960usize,
+            1u8,
+            0u8,
+            1usize,
+        ),
+        ("MB20", Bandwidth::Medium, 20_000, 5500.0, 960, 5, 0, 1),
+        ("WB20", Bandwidth::Wide, 24_000, 7000.0, 960, 9, 0, 1),
+        ("NB40", Bandwidth::Narrow, 16_000, 3500.0, 1920, 1, 3, 2),
+        ("MB40", Bandwidth::Medium, 20_000, 5500.0, 1920, 5, 3, 2),
+        ("WB60", Bandwidth::Wide, 24_000, 7000.0, 2880, 9, 3, 3),
+    ] {
+        let frame_ms = frame / 48;
+        let mono_frame_ms = frame_ms.min(20);
+        let mut mono_floor = [0.0f64; 2];
+        for ch in 0..2 {
+            let mono: Vec<f32> = pcm.chunks_exact(2).map(|f| f[ch]).collect();
+            let silk = match bandwidth {
+                Bandwidth::Narrow => SilkEncoder::new(false),
+                Bandwidth::Medium => SilkEncoder::new_mediumband(),
+                _ => SilkEncoder::new(true),
+            };
+            let reference = lowpass(&mono, cutoff);
+            let (decoded, _, _) =
+                silk_roundtrip_ms(silk, &mono, mono_frame_ms, Some(per_channel_bps));
+            mono_floor[ch] = aligned_corr(&reference, &decoded, 2000).0;
+        }
+        let mut enc = Encoder::new(48000, 2, Application::Voip).unwrap();
+        enc.set_mode(Some(ec_opus::Mode::Silk));
+        enc.set_bandwidth(Some(bandwidth));
+        enc.set_bitrate(per_channel_bps * 2);
+        let mut dec = Decoder::new(48000, 2).unwrap();
+        let mut out = vec![0u8; 4096];
+        let mut buf = vec![0.0f32; 5760 * 2];
+        let mut decoded = Vec::new();
+        let mut packets = Vec::new();
+        let mut padded = pcm.clone();
+        padded.resize(pcm.len().div_ceil(frame * 2) * frame * 2 + frame * 2, 0.0);
+        for block in padded.chunks(frame * 2) {
+            let len = enc.encode_float(block, frame, &mut out).expect("encode");
+            let packet = Packet::parse(&out[..len], false).unwrap();
+            let toc = packet.toc;
+            assert_eq!(toc.config, config, "{tag}: wrong TOC config");
+            assert_eq!(toc.code, code, "{tag}: wrong TOC code");
+            assert_eq!(packet.frames.len(), frames, "{tag}: frame count");
+            assert_eq!(packet.samples_48k(), frame, "{tag}: packet samples");
+            assert!(toc.stereo, "{tag}: SILK TOC is not stereo");
+            let n = dec.decode_float(&out[..len], &mut buf).expect("decode");
+            assert_eq!(n, frame, "{tag}: decoded frame size");
+            assert_eq!(dec.final_range(), enc.final_range(), "{tag}: range state");
+            decoded.extend_from_slice(&buf[..n * 2]);
+            packets.push(out[..len].to_vec());
+        }
+        let bytes: usize = packets.iter().map(Vec::len).sum();
+        let kbps = bytes as f64 * 8.0 / (packets.len() as f64 * frame_ms as f64);
+        for ch in 0..2 {
+            let source: Vec<f32> = pcm.chunks_exact(2).map(|f| f[ch]).collect();
+            let reference = lowpass(&source, cutoff);
+            let corr = aligned_channel_corr(&reference, &decoded, 2, ch);
+            eprintln!(
+                "silk stereo {tag} ch{ch}: corr {corr:.4}, mono {:.4}, {kbps:.2} kbps",
+                mono_floor[ch]
+            );
+            assert!(
+                corr + 0.01 >= mono_floor[ch],
+                "{tag} ch{ch}: stereo corr {corr:.4} trails mono {:.4}",
+                mono_floor[ch]
+            );
+        }
+        if Command::new("ffmpeg").arg("-version").output().is_ok() {
+            let path = temp_path(&format!("silk-stereo-{tag}.opus"));
+            write_ogg_opus(
+                &path,
+                &packets,
+                opus_head(2, enc.look_ahead(frame) as u16, None),
+                2,
+                total,
+                enc.look_ahead(frame) as i64,
+            );
+            let out = Command::new("ffmpeg")
+                .args(["-v", "warning", "-c:a", "libopus", "-i"])
+                .arg(&path)
+                .args(["-f", "null", "-"])
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "{tag}: ffmpeg decode: {stderr}");
+            if Command::new("gst-launch-1.0")
+                .arg("--version")
+                .output()
+                .is_ok()
+            {
+                let location = format!("location={}", path.display());
+                let out = Command::new("gst-launch-1.0")
+                    .args([
+                        "-q", "filesrc", &location, "!", "oggdemux", "!", "opusdec", "!",
+                        "fakesink",
+                    ])
+                    .output()
+                    .unwrap();
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                assert!(out.status.success(), "{tag}: gst decode: {stderr}");
+            }
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
 #[test]
 fn silk_compares_to_celt_on_speech_at_speech_rates() {
     let pcm = speech_like();
@@ -1775,8 +2289,8 @@ fn silk_compares_to_celt_on_speech_at_speech_rates() {
         );
         assert!(silk_corr >= 0.95, "{tag}: SILK corr {silk_corr:.4}");
         assert!(
-            silk_corr + 0.01 >= celt_corr,
-            "{tag}: SILK {silk_corr:.4} trails CELT {celt_corr:.4} by >0.01"
+            silk_corr >= celt_corr,
+            "{tag}: SILK {silk_corr:.4} trails CELT {celt_corr:.4}"
         );
     }
 }
@@ -2018,4 +2532,127 @@ fn hybrid_fb_roundtrip() {
             "hybrid at {bps}: {kbps:.1} kbps"
         );
     }
+}
+
+fn hybrid_roundtrip_shape(
+    pcm: &[f32],
+    channels: usize,
+    frame: usize,
+    bps: u32,
+    bandwidth: Option<Bandwidth>,
+) -> (Vec<f32>, Vec<Vec<u8>>) {
+    let mut enc = Encoder::new(48000, channels, Application::Voip).unwrap();
+    enc.set_bitrate(bps);
+    enc.set_bandwidth(bandwidth);
+    let mut dec = Decoder::new(48000, channels).unwrap();
+    let mut out = vec![0u8; 1500];
+    let mut buf = vec![0f32; 5760 * channels];
+    let (mut decoded, mut packets) = (Vec::new(), Vec::new());
+    let mut padded = pcm.to_vec();
+    padded.resize(
+        pcm.len().div_ceil(frame * channels) * frame * channels + frame * channels,
+        0.0,
+    );
+    for block in padded.chunks(frame * channels) {
+        let len = enc
+            .encode_float(block, frame, &mut out)
+            .expect("hybrid encode");
+        let n = dec
+            .decode_float(&out[..len], &mut buf)
+            .expect("hybrid decode");
+        assert_eq!(n, frame);
+        assert_eq!(dec.final_range(), enc.final_range(), "range state diverged");
+        decoded.extend_from_slice(&buf[..n * channels]);
+        packets.push(out[..len].to_vec());
+    }
+    (decoded, packets)
+}
+
+#[test]
+fn hybrid_shapes_roundtrip() {
+    for (tag, channels, frame, bps, bandwidth, config, floor) in [
+        (
+            "mono-swb10",
+            1usize,
+            480usize,
+            24_000u32,
+            Bandwidth::SuperWide,
+            12u8,
+            0.75f64,
+        ),
+        ("mono-fb10", 1, 480, 32_000, Bandwidth::Full, 14, 0.75),
+        (
+            "stereo-swb20",
+            2,
+            960,
+            48_000,
+            Bandwidth::SuperWide,
+            13,
+            0.75,
+        ),
+        ("stereo-fb20", 2, 960, 64_000, Bandwidth::Full, 15, 0.75),
+        ("stereo-fb10", 2, 480, 64_000, Bandwidth::Full, 14, 0.70),
+    ] {
+        let pcm = if channels == 1 {
+            speech_like()
+        } else {
+            stereo_speech_pair()
+        };
+        let (decoded, packets) =
+            hybrid_roundtrip_shape(&pcm, channels, frame, bps, Some(bandwidth));
+        let toc = ec_opus::Toc::new(packets[0][0]);
+        assert_eq!(toc.config, config, "{tag}: TOC config {}", toc.config);
+        assert_eq!(toc.stereo, channels == 2, "{tag}: TOC stereo flag");
+        let mut worst = 1.0f64;
+        for ch in 0..channels {
+            let source: Vec<f32> = pcm.chunks_exact(channels).map(|f| f[ch]).collect();
+            let got: Vec<f32> = decoded.chunks_exact(channels).map(|f| f[ch]).collect();
+            let (corr, lag) = aligned_corr(&source, &got, 400);
+            worst = worst.min(corr);
+            eprintln!("hybrid {tag} ch{ch}: corr {corr:.4} at lag {lag}");
+        }
+        assert!(worst >= floor, "{tag}: worst corr {worst:.4}");
+        let total = pcm.len() / channels;
+        let path = temp_path(&format!("hybrid-{tag}.opus"));
+        write_ogg_opus(
+            &path,
+            &packets,
+            opus_head(channels, 120, None),
+            channels,
+            total,
+            120,
+        );
+        if Command::new("ffmpeg").arg("-version").output().is_ok() {
+            let out = Command::new("ffmpeg")
+                .args(["-v", "warning", "-c:a", "libopus", "-i"])
+                .arg(&path)
+                .args(["-f", "null", "-"])
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "{tag}: ffmpeg decode: {stderr}");
+        }
+        if Command::new("gst-launch-1.0")
+            .arg("--version")
+            .output()
+            .is_ok()
+        {
+            let location = format!("location={}", path.display());
+            let out = Command::new("gst-launch-1.0")
+                .args([
+                    "-q", "filesrc", &location, "!", "oggdemux", "!", "opusdec", "!", "fakesink",
+                ])
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "{tag}: gst decode: {stderr}");
+        }
+        let _ = fs::remove_file(&path);
+    }
+
+    let speech = stereo_speech_pair();
+    let (_, packets) = hybrid_roundtrip_shape(&speech, 2, 960, 64_000, None);
+    let toc = ec_opus::Toc::new(packets[0][0]);
+    assert_eq!(toc.mode(), ec_opus::Mode::Hybrid);
+    assert!(toc.stereo);
 }
