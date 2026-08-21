@@ -4,9 +4,9 @@
 //! ## What the analysis actually is
 //!
 //! Per block, per channel: an MDCT, a peak magnitude per floor point, a
-//! spreading function over those points (a one-pole decay up and down the
-//! spectrum, which is the cheap stand-in for a masking curve), an absolute
-//! threshold of hearing under it, and a headroom the rate loop moves. The floor
+//! spreading function over those points, a Bark-domain near-band masker under
+//! it, an absolute threshold of hearing under that, and a headroom the rate
+//! loop moves. The floor
 //! that comes out is the quantiser step: the residue is the spectrum divided by
 //! the floor and rounded, so headroom in dB *is* precision in bits. That is
 //! psychoacoustics-lite and it is stated as such — there is no tonality
@@ -46,7 +46,7 @@ use ec_core::{
 use ec_dsp::Mdct;
 
 use crate::bits::{BitsOut, float32_pack};
-use crate::codebook::{CodebookSpec, ilog};
+use crate::codebook::{CodebookSpec, ilog, lookup1_values};
 use crate::decode::channel_map;
 use crate::floor::render_floor1;
 use crate::setup::Floor1;
@@ -77,6 +77,11 @@ const FLOOR_CLASS_DIM: usize = 4;
 const CLASSES: usize = 9;
 /// Largest quantised residue each class's book can state.
 const CLASS_RANGE: [i32; CLASSES] = [0, 1, 2, 4, 8, 16, 32, 64, 127];
+/// Residue codebook dimensions by class; class 0 codes no residue.
+const RESIDUE_BOOK_DIM: [usize; CLASSES] = [0, 4, 2, 2, 1, 1, 1, 1, 1];
+/// The vector books save packet bits but add setup and make the rate loop spend
+/// harder; this keeps the realised rate at the caller's target.
+const RATE_TARGET_SCALE: f64 = 0.99;
 /// Headroom in dB the widest residue book can actually state: 20 log10 127
 /// is 42, but a coupled angle channel is a difference of two magnitudes, so a
 /// pair's step must leave half that range — 63, 36 dB. Past this the rate loop's extra headroom lowers the absolute-threshold
@@ -91,14 +96,11 @@ const HEADROOM_RANGE: f64 = 36.0;
 /// region's edge) is caught by the clamp refit in `encode_block`.
 const HEADROOM_RANGE_SHORT: f64 = 42.0;
 /// Nothing more than this many dB under a block's loudest floor point is
-/// coded: a whole-spectrum co-masking cap. corner-cut: a flat cap is not a
-/// spreading function — real masking falls off with distance in Barks, so
-/// this drops a quiet treble part under a loud bass note that the ear would
-/// still pick out. It is what buys real music its accuracy at this rate (on
-/// three tracks at 128 kbps, 0.989 -> 0.995 correlation with the source);
-/// the upgrade is a Bark-domain spread in `fit_floor` in place of the
-/// per-point decay plus this cap. Swept 40 / 50 / 60 dB: 40 is better still
-/// on the metric but too deaf to be honest.
+/// coded: a whole-spectrum co-masking cap after local spreading. The Bark
+/// curve keeps nearby bands honest; this cap only stops very quiet distant
+/// bins from spending bits below the noise floor at these rates. Swept on
+/// three tracks at 128 kbps: 50 dB kept the accuracy win without inflating the
+/// files.
 const CO_MASK_RANGE: f64 = 50.0;
 /// A short block gets no co-masking cap: a bin it drops is an error spread
 /// across its whole window, the half before an onset included, and that is
@@ -200,12 +202,13 @@ enum Sched {
     TransitionIn,
 }
 
-/// A block size's own floor, codebook-sharing residue geometry and ATH.
+/// A block size's own floor, codebook-sharing residue geometry and masking data.
 struct BlockConfig {
     half: usize,
     partition: usize,
     floor: Floor1,
     ath: Vec<f64>,
+    bark: Vec<f64>,
     /// Headroom the residue range lets this block size state.
     range: f64,
     /// dB under the loudest floor point below which nothing is coded.
@@ -502,7 +505,9 @@ impl VorbisEncoder {
             // Against the loudest of the few ticks before it, not just the
             // one: music rising over a few ticks is not a transient, a drum
             // hit or an onset after silence is.
-            let previous = (t.saturating_sub(TRANSIENT_HISTORY)..t).map(energy).fold(0.0f64, f64::max);
+            let previous = (t.saturating_sub(TRANSIENT_HISTORY)..t)
+                .map(energy)
+                .fold(0.0f64, f64::max);
             let current = energy(t);
             if current > floor && current > previous * TRANSIENT_RATIO {
                 return true;
@@ -519,7 +524,11 @@ impl VorbisEncoder {
                 break;
             }
             let plan = self.peek_plan();
-            let n = if plan.is_long { BLOCK_LONG } else { BLOCK_SHORT };
+            let n = if plan.is_long {
+                BLOCK_LONG
+            } else {
+                BLOCK_SHORT
+            };
             let half = if plan.is_long { HALF_LONG } else { HALF_SHORT };
             let centre = self.centre + (self.prev_n + n) as i64 / 4;
             let window_start = centre - (n / 2) as i64;
@@ -562,7 +571,11 @@ impl VorbisEncoder {
         plan: BlockPlan,
         channels: usize,
     ) -> Vec<u8> {
-        let bc = if plan.is_long { &self.long } else { &self.short };
+        let bc = if plan.is_long {
+            &self.long
+        } else {
+            &self.short
+        };
         let partition = bc.partition;
         let scale = 2.0 / half as f32;
         let window = self
@@ -575,7 +588,11 @@ impl VorbisEncoder {
         for channel in 0..channels {
             block.copy_from_slice(&self.buffer[channel][start..start + n]);
             let mut coefficients = vec![0.0f32; half];
-            let mdct = if plan.is_long { &mut self.mdct_long } else { &mut self.mdct_short };
+            let mdct = if plan.is_long {
+                &mut self.mdct_long
+            } else {
+                &mut self.mdct_short
+            };
             mdct.forward_windowed(&block, &window, &mut coefficients);
             for value in coefficients.iter_mut() {
                 *value *= scale;
@@ -639,7 +656,9 @@ impl VorbisEncoder {
                         *peak *= boost;
                     }
                 }
-                let (y, step2) = fit_floor(&bc.floor, &bc.ath, headroom, bc.range, bc.co_mask, &peaks);
+                let (y, step2) = fit_floor(
+                    &bc.floor, &bc.ath, &bc.bark, headroom, bc.range, bc.co_mask, &peaks,
+                );
                 let mut curve = vec![0.0f32; half];
                 render_floor1(&bc.floor, &y, &step2, &mut curve);
                 for &c in group {
@@ -678,7 +697,10 @@ impl VorbisEncoder {
                 // rate loop saying the step cannot get finer, so the budget
                 // is better spent stating the angle than left unspent.
                 let point = match self.headroom < bc.range {
-                    true => (POINT_STEREO_HZ / (f64::from(self.config.sample_rate) * 0.5) * half as f64) as usize,
+                    true => {
+                        (POINT_STEREO_HZ / (f64::from(self.config.sample_rate) * 0.5) * half as f64)
+                            as usize
+                    }
                     false => half,
                 };
                 for (bin, (l, r)) in left.iter_mut().zip(right.iter_mut()).enumerate() {
@@ -727,7 +749,14 @@ impl VorbisEncoder {
         for values in floor_values.iter().take(channels) {
             write_floor(&mut out, &bc.floor, &self.floor_book, values);
         }
-        write_residue(&mut out, &quantised, half, partition, &self.class_book, &self.residue_books);
+        write_residue(
+            &mut out,
+            &quantised,
+            half,
+            partition,
+            &self.class_book,
+            &self.residue_books,
+        );
         let bits = out.len();
         let delta = (self.centre + (self.prev_n + n) as i64 / 4) - self.centre;
         self.update_rate(bits, half, channels, delta);
@@ -748,7 +777,8 @@ impl VorbisEncoder {
         if self.config.bitrate_bps <= 0 || delta <= 0 {
             return;
         }
-        let target = f64::from(self.config.bitrate_bps) * delta as f64 / f64::from(self.config.sample_rate);
+        let target = f64::from(self.config.bitrate_bps) * RATE_TARGET_SCALE * delta as f64
+            / f64::from(self.config.sample_rate);
         let coefficients = (half * channels) as f64;
         let step = ((target - bits as f64) / (coefficients / 6.0)).clamp(-2.0, 2.0);
         // Negative headroom is not a mistake: it puts the floor *above* the
@@ -788,33 +818,49 @@ fn peaks_of(floor: &Floor1, half: usize, spectra: &[&Vec<f32>]) -> Vec<f64> {
 
 /// Turn peak magnitudes into coded floor amplitudes.
 ///
-/// Spread first (a masker covers its neighbours), then subtract the rate
-/// loop's headroom, then hold the absolute threshold of hearing as a lower
-/// bound: below it the residue quantises to zero and costs a class-0
-/// partition.
+/// Spread first (a masker covers its neighbours, with an extra Bark-local
+/// near-band pass), then subtract the rate loop's headroom, then hold the
+/// absolute threshold of hearing as a lower bound: below it the residue
+/// quantises to zero and costs a class-0 partition.
 fn fit_floor(
     floor: &Floor1,
     ath: &[f64],
+    bark: &[f64],
     headroom: f64,
     range: f64,
     co_mask: f64,
     peaks: &[f64],
 ) -> (Vec<i32>, Vec<bool>) {
-    let mut db: Vec<f64> = peaks
+    let db: Vec<f64> = peaks
         .iter()
         .map(|&peak| 20.0 * (peak.max(1e-9)).log10())
         .collect();
+    let mut spread = db.clone();
     let order = &floor.sorted;
     for window in order.windows(2) {
         let (previous, current) = (window[0], window[1]);
-        db[current] = db[current].max(db[previous] - 12.0);
+        spread[current] = spread[current].max(spread[previous] - 12.0);
     }
     for window in order.windows(2).rev() {
         let (current, next) = (window[0], window[1]);
-        db[current] = db[current].max(db[next] - 24.0);
+        spread[current] = spread[current].max(spread[next] - 24.0);
+    }
+    for (source, &level) in db.iter().enumerate() {
+        for (target, masked) in spread.iter_mut().enumerate() {
+            let distance = (bark[target] - bark[source]).abs();
+            if distance > 0.25 {
+                continue;
+            }
+            let slope = if bark[target] >= bark[source] {
+                48.0
+            } else {
+                80.0
+            };
+            *masked = (*masked).max(level - slope * distance);
+        }
     }
     let loudest = db.iter().copied().fold(f64::MIN, f64::max);
-    let target: Vec<f64> = db
+    let target: Vec<f64> = spread
         .iter()
         .zip(ath.iter())
         .map(|(&level, &threshold)| {
@@ -923,13 +969,27 @@ fn write_residue(
             if class > 0 {
                 let book = &residue_books[class - 1];
                 let range = CLASS_RANGE[class];
-                for &value in &interleaved[p * partition..(p + 1) * partition] {
-                    book.write(out, (value.clamp(-range, range) + range) as usize);
+                for chunk in interleaved[p * partition..(p + 1) * partition].chunks(book.dimensions)
+                {
+                    book.write(out, residue_entry(chunk, range, book.dimensions));
                 }
             }
             p += 1;
         }
     }
+}
+
+/// Entry number for an exact vector value in one residue book.
+fn residue_entry(values: &[i32], range: i32, dimensions: usize) -> usize {
+    let base = (2 * range + 1) as usize;
+    let mut entry = 0usize;
+    let mut multiplier = 1usize;
+    for i in 0..dimensions {
+        let value = values.get(i).copied().unwrap_or(0).clamp(-range, range);
+        entry += (value + range) as usize * multiplier;
+        multiplier *= base;
+    }
+    entry
 }
 
 /// Forward square-polar coupling (§9.4.2 run backwards).
@@ -1042,7 +1102,7 @@ fn build_floor(half: usize, points: usize) -> Floor1 {
     }
 }
 
-/// Build one block size's floor and ATH curve.
+/// Build one block size's floor, ATH curve and Bark positions.
 fn build_block_config(
     half: usize,
     partition: usize,
@@ -1052,15 +1112,22 @@ fn build_block_config(
     config: &EncoderConfig,
 ) -> BlockConfig {
     let floor = build_floor(half, points);
-    let ath = floor
+    let hz: Vec<f64> = floor
         .x_list
         .iter()
-        .map(|&x| {
-            let hz = f64::from(config.sample_rate) * 0.5 * f64::from(x) / half as f64;
-            absolute_threshold(hz)
-        })
+        .map(|&x| f64::from(config.sample_rate) * 0.5 * f64::from(x) / half as f64)
         .collect();
-    BlockConfig { half, partition, floor, ath, range, co_mask }
+    let ath = hz.iter().map(|&hz| absolute_threshold(hz)).collect();
+    let bark = hz.iter().map(|&hz| bark(hz)).collect();
+    BlockConfig {
+        half,
+        partition,
+        floor,
+        ath,
+        bark,
+        range,
+        co_mask,
+    }
 }
 
 /// Folded floor amplitudes: mostly small corrections, occasionally an escape
@@ -1088,19 +1155,46 @@ fn design_class_book() -> CodebookSpec {
     spec
 }
 
-/// One book per non-silent class, Laplacian over its own range.
+/// One book per non-silent class. Small ranges use vector entries because
+/// non-zero partitions still contain many zero coefficients; wider ranges stay
+/// scalar to keep setup overhead below the bits they can save.
 fn design_residue_books() -> Vec<CodebookSpec> {
     CLASS_RANGE[1..]
         .iter()
-        .map(|&range| {
-            // Measured mean |value| inside a partition of each class is about
-            // a sixth of the class's range, whatever the range.
-            let sigma = f64::from(range).max(1.0) / 6.0;
-            let weights: Vec<f64> = (-range..=range)
-                .map(|v| (-f64::from(v.abs()) / sigma).exp() + 1e-4)
-                .collect();
-            let values: Vec<f32> = (-range..=range).map(|v| v as f32).collect();
-            CodebookSpec::huffman(&weights, values)
+        .enumerate()
+        .map(|(offset, &range)| {
+            let class = offset + 1;
+            let dimensions = RESIDUE_BOOK_DIM[class];
+            let base = (2 * range + 1) as usize;
+            let entries = base.pow(dimensions as u32);
+            let sigma = f64::from(range).max(1.0);
+            let mut weights = Vec::with_capacity(entries);
+            let mut values = Vec::with_capacity(entries * dimensions);
+            for entry in 0..entries {
+                let mut nonzero = 0usize;
+                let mut weight = 1.0f64;
+                for position in 0..dimensions {
+                    let div = base.pow(position as u32);
+                    let value = (entry / div % base) as i32 - range;
+                    values.push(value as f32);
+                    if value == 0 {
+                        weight *= 0.60;
+                    } else {
+                        nonzero += 1;
+                        weight *= 0.40 * (-f64::from(value.abs()) / sigma).exp();
+                    }
+                }
+                let sparse = match nonzero {
+                    0 => 4.0,
+                    1 => 2.0,
+                    2 => 0.8,
+                    _ => 0.25,
+                };
+                weights.push(weight * sparse + 1e-8);
+            }
+            let mut spec = CodebookSpec::huffman(&weights, values);
+            spec.dimensions = dimensions;
+            spec
         })
         .collect()
 }
@@ -1117,6 +1211,12 @@ fn absolute_threshold(hz: f64) -> f64 {
     let spl =
         3.64 * khz.powf(-0.8) - 6.5 * (-0.6 * (khz - 3.3).powi(2)).exp() + 0.001 * khz.powi(4);
     (spl - 96.0).clamp(-120.0, -80.0)
+}
+
+/// Frequency in Barks, using the same compact psychoacoustic scale for every
+/// sample rate.
+fn bark(hz: f64) -> f64 {
+    13.0 * (0.00076 * hz).atan() + 3.5 * ((hz / 7500.0) * (hz / 7500.0)).atan()
 }
 
 struct HeaderSetup<'a> {
@@ -1249,8 +1349,8 @@ fn write_headers(config: &EncoderConfig, channels: usize, setup: HeaderSetup<'_>
     vec![ident, comment, setup]
 }
 
-/// One codebook in setup-header form: flat lengths, and a scalar lookup when
-/// the book carries values.
+/// One codebook in setup-header form: flat lengths and, when present, a type-1
+/// lookup table carrying the scalar alphabet used by entry digits.
 fn write_codebook(out: &mut BitsOut, book: &CodebookSpec) {
     out.write(0x0056_4342, 24);
     out.write(book.dimensions as u32, 16);
@@ -1264,17 +1364,21 @@ fn write_codebook(out: &mut BitsOut, book: &CodebookSpec) {
         out.write(0, 4);
         return;
     }
-    // Lookup type 1 with one dimension: the entry number *is* the index, so
-    // `minimum + i * delta` states every value in `ilog(entries)` bits each.
     out.write(1, 4);
-    let minimum = book.values[0];
+    let minimum = book.values.iter().copied().fold(f32::INFINITY, f32::min);
+    let maximum = book
+        .values
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max);
     out.write(float32_pack(minimum), 32);
     out.write(float32_pack(1.0), 32);
-    let value_bits = ilog(book.entries() as u32 - 1).max(1);
+    let lookup_values = lookup1_values(book.entries(), book.dimensions);
+    let value_bits = ilog((maximum - minimum).round() as u32).max(1);
     out.write(value_bits - 1, 4);
     out.write(0, 1);
-    for i in 0..book.entries() {
-        out.write(i as u32, value_bits);
+    for value in 0..lookup_values {
+        out.write(value as u32, value_bits);
     }
 }
 
@@ -1395,6 +1499,28 @@ mod tests {
     }
 
     #[test]
+    fn vector_residue_books_address_exact_values() {
+        let books = design_residue_books();
+        assert_eq!(
+            books.iter().map(|b| b.dimensions).collect::<Vec<_>>(),
+            vec![4, 2, 2, 1, 1, 1, 1, 1]
+        );
+        for (class, book) in books.iter().enumerate().take(3) {
+            let range = CLASS_RANGE[class + 1];
+            let vector: Vec<i32> = (0..book.dimensions)
+                .map(|i| if i % 2 == 0 { range } else { -range })
+                .collect();
+            let entry = residue_entry(&vector, range, book.dimensions);
+            let start = entry * book.dimensions;
+            let decoded: Vec<i32> = book.values[start..start + book.dimensions]
+                .iter()
+                .map(|&v| v as i32)
+                .collect();
+            assert_eq!(decoded, vector);
+        }
+    }
+
+    #[test]
     fn tail_granule_44100_mono() {
         let mut enc = VorbisEncoder::new(EncoderConfig {
             sample_rate: 44_100,
@@ -1410,7 +1536,10 @@ mod tests {
         let mut n = 0;
         loop {
             match enc.next_packet() {
-                Ok(p) => { last = p.granule; n += 1; }
+                Ok(p) => {
+                    last = p.granule;
+                    n += 1;
+                }
                 Err(Error::Eof) => break,
                 Err(e) => panic!("{e}"),
             }
