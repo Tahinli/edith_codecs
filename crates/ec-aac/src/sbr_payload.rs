@@ -23,7 +23,7 @@ use ec_core::{BitReader, Error, Result};
 const NUM_TIME_SLOTS: i64 = 16;
 
 /// `sbr_header()` fields, held across frames: a stream need not repeat it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SbrHeader {
     pub amp_res: u8,
     pub start_freq: u8,
@@ -60,6 +60,13 @@ pub struct SbrChannel {
     pub df_env: Vec<u8>,
     /// `bs_df_noise` per noise floor, same convention as `df_env`.
     pub df_noise: Vec<u8>,
+    /// `l_A` (ISO/IEC 14496-3 §4.6.18.3.3): index of the envelope that starts
+    /// at the transient border, `-1` when the frame has none. Gates where
+    /// added sinusoids begin and which envelope skips noise/smoothing.
+    pub l_a: i64,
+    /// The frame's effective amp_res: `bs_amp_res`, except a FIXFIX frame
+    /// with a single envelope is forced to 0 (1.5 dB) -- §4.6.18.3.3.
+    pub amp_res: u8,
 }
 
 /// One `sbr_data()` frame: one channel for an SCE, two for a CPE.
@@ -79,31 +86,43 @@ struct Grid {
     freq_res: Vec<u8>,
     t_env: Vec<i64>,
     t_noise: Vec<i64>,
+    l_a: i64,
+    fixfix: bool,
 }
 
 impl Grid {
-    /// `pointer` is `bs_pointer` (0 for FIXFIX, which has no such field --
-    /// the spec's own `bs_pointer == 0` case: the middle noise border is
-    /// `num_env >> 1`). Per ISO/IEC 14496-3 §4.6.18.3.3: `bs_pointer == 0`
-    /// selects `num_env >> 1`, `== 1` selects the last envelope border
-    /// (`num_env - 1`), otherwise `bs_pointer - 1`.
-    fn new(num_env: usize, freq_res: Vec<u8>, t_env: Vec<i64>, pointer: usize) -> Grid {
+    /// `pointer` is `bs_pointer` (0 for FIXFIX, which has no such field).
+    /// Middle noise border and `l_A` per ISO/IEC 14496-3 §4.6.18.3.3,
+    /// Tables 4.146/4.147 -- they depend on `frame_class` (0 FIXFIX,
+    /// 1 FIXVAR, 2 VARFIX, 3 VARVAR), not on `bs_pointer` alone.
+    fn new(num_env: usize, freq_res: Vec<u8>, t_env: Vec<i64>, pointer: usize, frame_class: u32) -> Grid {
         let num_noise = if num_env == 1 { 1 } else { 2 };
         let t_noise = if num_noise == 1 {
             vec![t_env[0], t_env[num_env]]
         } else {
-            let middle = match pointer {
+            let middle = match frame_class {
                 0 => num_env >> 1,
-                1 => num_env - 1,
-                p => p - 1,
+                1 | 3 => num_env - pointer.saturating_sub(1).max(1),
+                _ => match pointer {
+                    0 => 1,
+                    1 => num_env - 1,
+                    p => p - 1,
+                },
             };
-            vec![t_env[0], t_env[middle], t_env[num_env]]
+            vec![t_env[0], t_env[middle.min(num_env)], t_env[num_env]]
+        };
+        let l_a = match frame_class {
+            1 | 3 if pointer > 0 => num_env as i64 + 1 - pointer as i64,
+            2 if pointer > 1 => pointer as i64 - 1,
+            _ => -1,
         };
         Grid {
             num_env,
             freq_res,
             t_env,
             t_noise,
+            l_a,
+            fixfix: frame_class == 0,
         }
     }
 }
@@ -166,9 +185,43 @@ fn raw_env_width(balance: bool, amp_res: u8) -> u32 {
 const RAW_NOISE_WIDTH: u32 = 5;
 
 /// A FIXFIX frame with a single envelope forces the 1.5 dB resolution
-/// regardless of `bs_amp_res` (measured by the table-derivation rig).
-fn amp_res_of(header_amp_res: u8, num_env: usize) -> u8 {
-    if num_env == 1 { 0 } else { header_amp_res }
+/// regardless of `bs_amp_res` (§4.6.18.3.3); a one-envelope VARFIX/FIXVAR
+/// frame keeps the header's value.
+fn amp_res_of(header_amp_res: u8, grid: &Grid) -> u8 {
+    if grid.fixfix && grid.num_env == 1 { 0 } else { header_amp_res }
+}
+
+/// Delta-time base for an envelope whose frequency resolution differs from
+/// the envelope it is coded against (§4.6.18.3.3): a high-res band takes the
+/// low-res band containing it, a low-res band the high-res band starting at
+/// the same edge. Same resolution (or a degenerate table) passes through.
+/// Without this the top half of a high-res row coded against a low-res row
+/// read an out-of-range base of 0 -- a near-silent envelope -- and every
+/// low-res band read the high-res band of half its frequency.
+fn map_prev_env(prev: &[i32], tables: &BandTables, cur_high: bool) -> Vec<i32> {
+    let (n_low, n_high) = (tables.n_low, tables.n_high);
+    if n_low == n_high || prev.len() == if cur_high { n_high } else { n_low } {
+        return prev.to_vec();
+    }
+    let (f_low, f_high) = (&tables.f_low, &tables.f_high);
+    if cur_high {
+        (0..n_high)
+            .map(|j| {
+                let k = (0..n_low)
+                    .rev()
+                    .find(|&k| f_low[k] <= f_high[j])
+                    .unwrap_or(0);
+                prev.get(k).copied().unwrap_or(0)
+            })
+            .collect()
+    } else {
+        (0..n_low)
+            .map(|j| {
+                let k = (0..n_high).find(|&k| f_high[k] == f_low[j]).unwrap_or(0);
+                prev.get(k).copied().unwrap_or(0)
+            })
+            .collect()
+    }
 }
 
 /// Reads one Huffman codeword by walking bit-by-bit until it matches a table
@@ -237,7 +290,7 @@ impl SbrParser {
                 let t_env: Vec<i64> = (0..=num_env)
                     .map(|i| (i as i64) * NUM_TIME_SLOTS / num_env as i64)
                     .collect();
-                Ok(Grid::new(num_env, vec![fr; num_env], t_env, 0))
+                Ok(Grid::new(num_env, vec![fr; num_env], t_env, 0, 0))
             }
             1 | 2 => {
                 // FIXVAR (1, trailing variable border) / VARFIX (2, leading variable border)
@@ -285,7 +338,7 @@ impl SbrParser {
                     }
                     t[num_env] = NUM_TIME_SLOTS;
                 }
-                Ok(Grid::new(num_env, freq_res, t, pointer))
+                Ok(Grid::new(num_env, freq_res, t, pointer, frame_class))
             }
             _ => {
                 // VARVAR
@@ -325,7 +378,7 @@ impl SbrParser {
                 if t.windows(2).any(|w| w[0] >= w[1]) {
                     return Err(Error::corrupt("sbr: non-monotone envelope time borders"));
                 }
-                Ok(Grid::new(num_env, freq_res, t, pointer))
+                Ok(Grid::new(num_env, freq_res, t, pointer, frame_class))
             }
         }
     }
@@ -535,7 +588,7 @@ impl SbrParser {
         let mut read_env = |this: &mut Self, r: &mut BitReader, ch: usize| -> Result<()> {
             let balance = is_cpe && coupling && ch == 1;
             let num_env = grids[ch].num_env;
-            let amp_res = amp_res_of(header.amp_res, num_env);
+            let amp_res = amp_res_of(header.amp_res, &grids[ch]);
             let mut e_q: Vec<Vec<i32>> = Vec::with_capacity(num_env);
             for i in 0..num_env {
                 let bands = if grids[ch].freq_res[i] != 0 {
@@ -549,7 +602,12 @@ impl SbrParser {
                 } else {
                     &this.state[ch].last_env
                 };
-                let row = this.decode_envelope(r, bands, dt, balance, amp_res, prev)?;
+                let prev = if dt {
+                    map_prev_env(prev, &tables, grids[ch].freq_res[i] != 0)
+                } else {
+                    Vec::new()
+                };
+                let row = this.decode_envelope(r, bands, dt, balance, amp_res, &prev)?;
                 e_q.push(row);
             }
             e_q_all[ch] = e_q;
@@ -593,7 +651,7 @@ impl SbrParser {
         for ch in 0..n_channels {
             let balance = is_cpe && coupling && ch == 1;
             let num_env = grids[ch].num_env;
-            let amp_res = amp_res_of(header.amp_res, num_env);
+            let amp_res = amp_res_of(header.amp_res, &grids[ch]);
             let e_q = e_q_all[ch].clone();
             let q_q = q_q_all[ch].clone();
 
@@ -628,6 +686,8 @@ impl SbrParser {
                 add_harmonic: None,
                 df_env: df_env[ch].iter().map(|&b| u8::from(b)).collect(),
                 df_noise: df_noise[ch].iter().map(|&b| u8::from(b)).collect(),
+                l_a: grids[ch].l_a,
+                amp_res,
             });
         }
 

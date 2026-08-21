@@ -124,60 +124,75 @@ pub struct Patch {
     pub width: usize,
 }
 
-/// Builds the patch list filling `[tables.kx, tables.k2)` from bands below
-/// `kx`, walking the source pointer down and wrapping it back to `kx` when
-/// exhausted. Deterministic: the same tables always produce the same patches.
+/// Patch construction, ISO/IEC 14496-3 §4.6.18.6.3 (Figure 4.31): source
+/// bands are read downward from `k0 = f_master[0]`, patches end on master
+/// borders, `goalSb = round(2048 kHz / fs)` bounds the first patch, and a
+/// trailing patch narrower than 3 bands is dropped.
 pub fn build_patches(tables: &BandTables) -> Vec<Patch> {
-    let kx = tables.kx as usize;
-    let k2 = tables.k2 as usize;
-    let f_high: Vec<usize> = tables.f_high.iter().map(|&b| b as usize).collect();
+    let kx = tables.kx;
+    let k2 = tables.k2;
+    let fm = &tables.f_master;
     let mut patches = Vec::new();
-    if kx == 0 || k2 <= kx {
+    if kx <= 0 || k2 <= kx || fm.len() < 2 {
         return patches;
     }
-    let mut msb = kx; // source read pointer, decreasing
-    let mut sb = kx; // target write pointer, increasing
-    while sb < k2 {
-        // Widest run of consecutive f_high intervals starting at `sb` whose
-        // total width still fits below the current source pointer.
-        let mut width = 0usize;
-        let mut probe = sb;
+    let k0 = fm[0];
+    let n_master = fm.len() - 1;
+    let goal_sb = ((1000i64 << 11) + i64::from(tables.rate >> 1)) / i64::from(tables.rate.max(1));
+    let mut k = if goal_sb < k2 {
+        fm.iter().position(|&b| b >= goal_sb).unwrap_or(n_master)
+    } else {
+        n_master
+    };
+    let (mut msb, mut usb) = (k0, kx);
+    let (mut last_k, mut last_msb) = (usize::MAX, i64::MIN);
+    let mut sb;
+    loop {
+        if k == last_k && msb == last_msb {
+            break; // construction failed; keep what we have
+        }
+        last_k = k;
+        last_msb = msb;
+        let mut odd = 0i64;
+        let mut i = k;
         loop {
-            let next_border = f_high.iter().find(|&&b| b > probe).copied();
-            let Some(border) = next_border else { break };
-            let iv = border - probe;
-            if width + iv > msb || border > k2 {
+            sb = fm[i];
+            odd = (sb + k0) & 1;
+            if i == 0 || sb <= k0 - 1 + msb - odd {
                 break;
             }
-            width += iv;
-            probe = border;
+            i -= 1;
         }
-        if width == 0 {
-            width = (k2 - sb).min(msb.max(1));
+        let width = (sb - usb).max(0);
+        if width > 0 {
+            patches.push(Patch {
+                source_start: (k0 - odd - width).max(0) as usize,
+                target_start: usb as usize,
+                width: width as usize,
+            });
+            usb = sb;
+            msb = sb;
+        } else {
+            msb = kx;
         }
-        let source_start = msb - width.min(msb);
-        patches.push(Patch {
-            source_start,
-            target_start: sb,
-            width,
-        });
-        sb += width;
-        msb = if source_start == 0 { kx } else { source_start };
+        if fm[k] - sb < 3 {
+            k = n_master;
+        }
+        if sb == k2 || patches.len() > 6 {
+            break;
+        }
+    }
+    if patches.len() > 1 && patches.last().is_some_and(|p| p.width < 3) {
+        patches.pop();
     }
     patches
 }
 
-/// Builds the limiter band table (ISO/IEC 14496-3 §4.6.18.7.2): the union
-/// of the low-resolution envelope band borders (`tables.f_low`) and the
-/// patch target boundaries, thinned so no band is narrower than one
-/// limiter band's worth of octaves at the transmitted `bs_limiter_bands`
-/// density (`0` => a single band spanning the whole HF region; `1`/`2`/`3`
-/// => ~1/2/3 bands per octave, log2-spaced the same way [`f_master`]'s own
-/// band construction thins its candidate borders). The limiter's gain cap
-/// is applied per band on this table, aggregated over every cell it
-/// covers, so a content-empty target cell inherits its band's aggregate
-/// cap instead of amplifying numeric dust toward an unbounded per-cell
-/// ratio.
+/// Builds the limiter band table (ISO/IEC 14496-3 §4.6.18.7.2, Figure 4.33):
+/// the union of `f_low` and the patch borders, sorted, then thinned so two
+/// borders closer than `0.49/limBands` octaves collapse (`bs_limiter_bands`
+/// 1/2/3 => 1.2/2/3 bands per octave), keeping patch borders over
+/// envelope borders when one of the pair must go. `0` => one band.
 pub fn limiter_band_table(tables: &BandTables, patches: &[Patch], limiter_bands: u8) -> Vec<i64> {
     let kx = tables.kx;
     let k2 = tables.k2;
@@ -187,43 +202,50 @@ pub fn limiter_band_table(tables: &BandTables, patches: &[Patch], limiter_bands:
     if limiter_bands == 0 {
         return vec![kx, k2];
     }
-    let bands_per_octave = match limiter_bands {
-        1 => 1.0,
-        2 => 2.0,
-        _ => 3.0,
+    let warped = match limiter_bands {
+        1 => 2f64.powf(0.49 / 1.2),
+        2 => 2f64.powf(0.49 / 2.0),
+        _ => 2f64.powf(0.49 / 3.0),
     };
-    let mut borders: Vec<i64> = tables
-        .f_low
-        .iter()
-        .copied()
-        .chain(patches.iter().map(|p| p.target_start as i64))
-        .chain(std::iter::once(k2))
-        .chain(std::iter::once(kx))
-        .filter(|&b| b >= kx && b <= k2)
-        .collect();
-    borders.sort_unstable();
-    borders.dedup();
-    let mut out = vec![borders[0]];
-    for &b in &borders[1..] {
-        let last = *out.last().unwrap();
-        if b <= last {
-            continue;
-        }
-        let octaves = (b as f64 / last as f64).log2();
-        if octaves * bands_per_octave < 1.0 && b != k2 {
-            continue; // too narrow on its own: merges into the current band
-        }
-        out.push(b);
+    let mut patch_borders: Vec<i64> = vec![kx];
+    for p in patches {
+        patch_borders.push(patch_borders.last().unwrap() + p.width as i64);
     }
-    if *out.last().unwrap() != k2 {
-        out.push(k2);
+    let mut table: Vec<i64> = tables.f_low.clone();
+    table.extend(patch_borders.iter().skip(1).take(patches.len().saturating_sub(1)));
+    table.sort_unstable();
+    let is_patch = |b: i64| patch_borders.contains(&b);
+    let mut out: Vec<i64> = vec![table[0]];
+    for &b in &table[1..] {
+        let last = *out.last().unwrap();
+        if (b as f64) >= (last as f64) * warped {
+            out.push(b);
+        } else if b == last || !is_patch(b) {
+            // drop the incoming border
+        } else if !is_patch(last) {
+            *out.last_mut().unwrap() = b;
+        } else {
+            out.push(b);
+        }
     }
     out
 }
 
-/// `bs_invf_mode` bandwidth-expansion targets (OFF, LOW, MID, HIGH), the
-/// four inverse-filtering strengths §4.6.18.6.2 defines.
-const BW_TABLE: [f64; 4] = [0.0, 0.6, 0.9, 0.98];
+/// `bs_invf_mode` chirp targets per ISO 14496-3 4.6.18.6.3 (Table 4.163):
+/// the target depends on the current AND previous frame's mode --
+/// OFF is 0.0 except 0.6 when falling from LOW; LOW is 0.75 except 0.6
+/// when rising from OFF; MID 0.9; HIGH 0.98. The previous flat table
+/// (`[0, 0.6, 0.9, 0.98]`) under-whitened every steady-state LOW band.
+fn bw_target(mode: u8, prev_mode: u8) -> f64 {
+    match (mode, prev_mode) {
+        (0, 1) => 0.6,
+        (0, _) => 0.0,
+        (1, 0) => 0.6,
+        (1, _) => 0.75,
+        (2, _) => 0.9,
+        _ => 0.98,
+    }
+}
 
 /// Per-noise-band chirp factor state, smoothed frame to frame with a
 /// fast-attack (toward a *lower* bw, i.e. more whitening) / slow-release
@@ -231,18 +253,22 @@ const BW_TABLE: [f64; 4] = [0.0, 0.6, 0.9, 0.98];
 #[derive(Clone, Debug)]
 pub struct ChirpState {
     bw: Vec<f64>,
+    prev_mode: Vec<u8>,
 }
 
 impl ChirpState {
     pub fn new(n_q: usize) -> ChirpState {
-        ChirpState { bw: vec![0.0; n_q] }
+        ChirpState {
+            bw: vec![0.0; n_q],
+            prev_mode: vec![0; n_q],
+        }
     }
 
     /// Advances the state one frame given this frame's `bs_invf_mode` per
     /// noise band, returning the smoothed bw to use for HF generation.
     ///
     /// (Round-22 sweep instrumentation, zero cost unset) `EC_AAC_SBR_BW_SCALE`
-    /// scales `BW_TABLE`'s target globally (clamped below 1.0) before
+    /// scales the chirp target globally (clamped below 1.0) before
     /// smoothing, to probe whether the chirp/inverse-filter strength is
     /// miscalibrated on real content. `EC_AAC_SBR_CHIRP_SMOOTH=none` skips
     /// the attack/release smoothing entirely (target used immediately);
@@ -251,15 +277,20 @@ impl ChirpState {
     pub fn update(&mut self, invf_mode: &[u8]) -> &[f64] {
         let scale = bw_scale_override();
         let smooth = chirp_smooth_mode();
-        for (slot, &mode) in self.bw.iter_mut().zip(invf_mode) {
-            let target = (BW_TABLE[usize::from(mode).min(3)] * scale).min(0.999_999);
+        for ((slot, prev), &mode) in self.bw.iter_mut().zip(&mut self.prev_mode).zip(invf_mode) {
+            let target = (bw_target(mode, *prev) * scale).min(0.999_999);
+            *prev = mode;
             *slot = match smooth {
                 ChirpSmooth::None => target,
                 ChirpSmooth::Current => {
+                    // 4.6.18.6.3 bwArray smoothing: both branches weight the
+                    // NEW value (0.75 falling, 0.90625 rising). The rising
+                    // branch previously had the operands swapped (0.09375
+                    // of the new value), making every rise ~10x too slow.
                     if target < *slot {
                         0.75 * target + 0.25 * *slot
                     } else {
-                        0.90625 * *slot + 0.09375 * target
+                        0.90625 * target + 0.09375 * *slot
                     }
                 }
                 ChirpSmooth::Swap => {
@@ -270,12 +301,16 @@ impl ChirpState {
                     }
                 }
             };
+            // 4.6.18.6.3: a smoothed bw under 0.015 is forced to zero.
+            if *slot < 0.015 {
+                *slot = 0.0;
+            }
         }
         &self.bw
     }
 }
 
-/// `EC_AAC_SBR_BW_SCALE` global multiplier on `BW_TABLE`, clamped below 1.0
+/// `EC_AAC_SBR_BW_SCALE` global multiplier on the chirp target, clamped below 1.0
 /// (a chirp target at or past 1.0 is an undamped all-pole resonance, not a
 /// meaningful "stronger" whitening). `1.0` (no-op) when unset or unparsable.
 fn bw_scale_override() -> f64 {
@@ -301,95 +336,45 @@ fn chirp_smooth_mode() -> ChirpSmooth {
     }
 }
 
-/// Order-2 covariance-method LPC over `x` (index 0 is the oldest sample):
-/// solves the 2x2 normal equations minimizing `sum |x[n] - a1*x[n-1] -
-/// a2*x[n-2]|^2` over `n = 2..x.len()`. Returns `(a1, a2)`; `(0, 0)` if `x`
-/// is too short or the system is singular (silence or a near-constant
-/// subband, both of which need no prediction).
-/// (Round-57) AR(2) coefficients via the Yule-Walker/autocorrelation
-/// method (`r(k) = sum_n x[n]*conj(x[n-k])`, Hermitian-Toeplitz `R`),
-/// replacing the previous unwindowed covariance-method normal-equation
-/// solve. The autocorrelation matrix is always positive semi-definite,
-/// which is what gives Levinson-Durbin-style AR fits their built-in
-/// BIBO-stability guarantee (poles inside or on the unit circle) -- the
-/// covariance method has no such guarantee and was measured producing
-/// resonant poles that blow `cur` (the raw HF estimate energy) up to
-/// 1e7-1e11 against a ~1e4 transmitted target on real content
-/// (heaac_48000_64k.m4a's crossover-straddling sweep window), which then
-/// poisons the WHOLE limiter band's aggregate `E_curr` (4.6.18.7.5) and
-/// crushes every other cell sharing that band's gain cap, not just the
-/// outlier cell itself (round-56's stabilize-bound tightening measured
-/// zero effect because `raw_gain=sqrt(target/cur)` cancels `cur` exactly
-/// for the outlier cell's OWN gain -- it never reaches the neighbors this
-/// aggregate-poisoning does).
+/// Order-2 linear-prediction coefficients per ISO 14496-3 4.6.18.6.2
+/// (covariance method, `phi(i,j) = sum_n x[n-i]*conj(x[n-j])` over
+/// `n = 2..x.len()`, index 0 of `x` is the oldest slot). Returns the spec's
+/// `(alpha0, alpha1)` -- the PREDICTION-ERROR filter taps, i.e. the
+/// negated predictor coefficients: for `x[n] = a1*x[n-1] + a2*x[n-2] + e`
+/// this yields `(-a1, -a2)`, so `x + alpha0*x[n-1] + alpha1*x[n-2]`
+/// whitens. `(0, 0)` on degenerate input or when either |alpha| >= 4
+/// (spec guard). Witness: scratch `alpha/witness.py` (numpy) recovers a
+/// synthetic complex AR(2) with this sign convention and whitens at bw=1.
 pub fn lpc2(x: &[Complex<f64>]) -> (Complex<f64>, Complex<f64>) {
     if x.len() < 3 {
         return (Complex::ZERO, Complex::ZERO);
     }
-    let mut r0 = 0.0f64;
-    let mut r1 = Complex::ZERO;
-    let mut r2 = Complex::ZERO;
-    for n in 0..x.len() {
-        r0 += x[n].norm_sqr();
-        if n >= 1 {
-            r1 = r1 + x[n] * x[n - 1].conj();
-        }
-        if n >= 2 {
-            r2 = r2 + x[n] * x[n - 2].conj();
-        }
-    }
-    // Yule-Walker: [[r0, conj(r1)], [r1, r0]] * [a1, a2]^T = [r1, r2]^T.
-    let det = r0 * r0 - r1.norm_sqr();
-    if det.abs() < 1e-20 {
+    let phi = |i: usize, j: usize| -> Complex<f64> {
+        (2..x.len()).fold(Complex::ZERO, |acc, n| acc + x[n - i] * x[n - j].conj())
+    };
+    let p11 = phi(1, 1).re;
+    let p22 = phi(2, 2).re;
+    let p01 = phi(0, 1);
+    let p02 = phi(0, 2);
+    let p12 = phi(1, 2);
+    const EPS: f64 = 1e-6;
+    let d = p22 * p11 - p12.norm_sqr() / (1.0 + EPS);
+    let alpha1 = if d.abs() < 1e-30 {
+        Complex::ZERO
+    } else {
+        (p01 * p12 - p02.scale(p11)).scale(1.0 / d)
+    };
+    let alpha0 = if p11.abs() < 1e-30 {
+        Complex::ZERO
+    } else {
+        (p01 + alpha1 * p12.conj()).scale(-1.0 / p11)
+    };
+    let m0 = alpha0.norm_sqr();
+    let m1 = alpha1.norm_sqr();
+    if !(m0 < 16.0 && m1 < 16.0) {
         return (Complex::ZERO, Complex::ZERO);
     }
-    let a1 = (r1.scale(r0) - r1.conj() * r2).scale(1.0 / det);
-    let a2 = (r2.scale(r0) - r1 * r1).scale(1.0 / det);
-    (a1, a2)
-}
-
-/// Bounds an AR(2) predictor's coefficients so the resynthesis recursion
-/// this module runs (`y = residual + ca1*y[n-1] + ca2*y[n-2]`) cannot
-/// diverge.
-///
-/// `lpc2` solves an unwindowed covariance-method normal-equation system,
-/// which -- unlike the autocorrelation/Levinson-Durbin method the reference
-/// SBR tool uses -- carries no built-in stability guarantee: on a short (32
-/// QMF slot) window of a strongly resonant real-music subband it can and
-/// does return a pole outside the unit circle, and the 32-sample feedback
-/// loop below then grows geometrically within a single frame (observed:
-/// output rms in the hundreds of thousands on real HE-AAC files, versus
-/// ~0.2 for a working decode). `|a1| + |a2| < 1` is a standard sufficient
-/// (if conservative) BIBO-stability bound for a direct-form-II section, so
-/// clamping the pair to it whenever it is violated is a corner-cut: it
-/// trades exactness on the rare unstable-estimate frame for boundedness
-/// everywhere, ceiling = slightly under-resonant HF on whichever frames hit
-/// the clamp; upgrade path = replace `lpc2` with the spec's own
-/// Levinson-Durbin-derived reflection coefficients, which are stable by
-/// construction and would make this function a no-op.
-fn stabilize(coeffs: (Complex<f64>, Complex<f64>)) -> (Complex<f64>, Complex<f64>) {
-    let (a1, a2) = coeffs;
-    let mag = a1.norm_sqr().sqrt() + a2.norm_sqr().sqrt();
-    // (Round-56) Tried tightening this bound to 0.9 on the theory that a
-    // pole at 0.999 gives ~1e6x power resonant gain (`~1/(1-r)^2`), which
-    // `EC_AAC_SBR_CELLDUMP` traces do show happening (`cur`, the raw
-    // pre-gain HF estimate, reaching 1e7-1e11 against a ~1e4 transmitted
-    // target on heaac_48000_64k.m4a's crossover-straddling sweep window,
-    // in the SAME limiter band as starved neighbor cells) -- measured
-    // ZERO effect on the t=18s/24s corr cliff (0.054601->0.054536,
-    // 0.058942->0.058797) or the `EC_AAC_SBR_HF_BYPASS` A/B, because
-    // `raw_gain = sqrt(target/cur)` cancels `cur` exactly for any
-    // non-capped cell regardless of this bound's value -- reverted, no
-    // measured benefit to justify the regression risk on frames that
-    // legitimately need resonance near this bound. Left at `0.999`.
-    if mag > 0.999 && mag.is_finite() {
-        let s = 0.999 / mag;
-        (a1.scale(s), a2.scale(s))
-    } else if mag.is_finite() {
-        (a1, a2)
-    } else {
-        (Complex::ZERO, Complex::ZERO)
-    }
+    (alpha0, alpha1)
 }
 
 /// Per-source-subband history: the last two QMF slots, carried across
@@ -397,15 +382,18 @@ fn stabilize(coeffs: (Complex<f64>, Complex<f64>)) -> (Complex<f64>, Complex<f64
 /// frame boundaries instead of restarting cold every frame.
 #[derive(Clone, Debug)]
 pub struct HfHistory {
-    x: Vec<[Complex<f64>; 2]>,
-    y: Vec<[Complex<f64>; 2]>,
+    /// Last `HIST` slots per source band (4.6.18.6.2's covariance window
+    /// spans the frame plus the 6 overlap slots before it; the filter
+    /// itself only taps the last two).
+    x: Vec<[Complex<f64>; HIST]>,
 }
+
+const HIST: usize = 6;
 
 impl HfHistory {
     pub fn new(bands: usize) -> HfHistory {
         HfHistory {
-            x: vec![[Complex::ZERO; 2]; bands],
-            y: vec![[Complex::ZERO; 2]; bands],
+            x: vec![[Complex::ZERO; HIST]; bands],
         }
     }
 }
@@ -448,17 +436,15 @@ pub fn generate(
                 continue;
             }
             let series = &low_cur[source_band];
-            let (a1, a2) = {
-                let mut ext = Vec::with_capacity(num_slots + 2);
+            let (alpha0, alpha1) = {
+                let mut ext = Vec::with_capacity(num_slots + HIST);
                 if source_band < history.x.len() {
-                    ext.push(history.x[source_band][0]);
-                    ext.push(history.x[source_band][1]);
+                    ext.extend_from_slice(&history.x[source_band]);
                 } else {
-                    ext.push(Complex::ZERO);
-                    ext.push(Complex::ZERO);
+                    ext.resize(HIST, Complex::ZERO);
                 }
                 ext.extend_from_slice(series);
-                stabilize(lpc2(&ext))
+                lpc2(&ext)
             };
             let g = bw[noise_band_of(target_band)];
             // (Round-46, Task 2) `EC_AAC_SBR_BW_DUMP` -- one line per patched
@@ -468,40 +454,35 @@ pub fn generate(
             if std::env::var("EC_AAC_SBR_BW_DUMP").is_ok() {
                 eprintln!("BW_DUMP target_band={target_band} source_band={source_band} bw={g:.6}");
             }
-            let ca1 = a1.scale(g);
-            let ca2 = a2.scale(g * g);
-            let (mut y_prev1, mut y_prev2) = if source_band < history.y.len() {
-                (history.y[source_band][1], history.y[source_band][0])
-            } else {
-                (Complex::ZERO, Complex::ZERO)
-            };
+            // 4.6.18.6.3 feed-forward: X_high = X_low + bw*alpha0*X_low[l-1]
+            // + bw^2*alpha1*X_low[l-2]. bw=0 is a plain copy, bw->1 is the
+            // full inverse (whitening) filter. The all-pole recursion this
+            // replaced (`y = residual + bw*a1*y[l-1] + bw^2*a2*y[l-2]`) had
+            // that mapping INVERTED (bw=0 whitened fully, bw=0.98 ~ copy),
+            // and the earlier feed-forward attempt (8bc305b) used the
+            // predictor sign (+a) instead of the spec's prediction-error
+            // sign (-a), which reinforces the resonance instead of
+            // cancelling it -- hence it measured worse than the inverted
+            // all-pole form.
+            let c1 = alpha0.scale(g);
+            let c2 = alpha1.scale(g * g);
             let (mut x_prev1, mut x_prev2) = if source_band < history.x.len() {
-                (history.x[source_band][1], history.x[source_band][0])
+                (
+                    history.x[source_band][HIST - 1],
+                    history.x[source_band][HIST - 2],
+                )
             } else {
                 (Complex::ZERO, Complex::ZERO)
             };
             let dst = &mut out[target_band - kx];
             for (n, &x) in series.iter().enumerate() {
-                let residual = x - a1 * x_prev1 - a2 * x_prev2;
-                let y = residual + ca1 * y_prev1 + ca2 * y_prev2;
                 // Round-37 (Task 2): `band_shift_correction` is proven exact
-                // in isolation (a stationary tone replayed through this
-                // patch-copy site lands within a couple of FFT bins of its
-                // corrected absolute frequency -- see
-                // `sbr_qmf::tests::patch_replay_through_generate_preserves_absolute_frequency_mapping`)
-                // but a real-file mechanical A/B (round-36/37,
-                // `EC_AAC_SBR_PARITY_SPLIT`) shows applying it REGRESSES
-                // odd-gap coherence against the reference decoder (ch0
-                // 0.1907->0.0714, ch1 0.2461->0.0741; sign-flipped and
-                // half-rate variants both regress it too, 0.0757/0.1449 resp.
-                // on ch0). The reference apparently exhibits this bank's own
-                // "wrong" cross-band placement convention, so matching it is
-                // the bar: `dst` stays the plain, uncorrected copy.
-                dst[n] = y;
+                // in isolation but a real-file A/B (`EC_AAC_SBR_PARITY_SPLIT`)
+                // shows applying it REGRESSES odd-gap coherence against the
+                // reference; `dst` stays the uncorrected band placement.
+                dst[n] = x + c1 * x_prev1 + c2 * x_prev2;
                 x_prev2 = x_prev1;
                 x_prev1 = x;
-                y_prev2 = y_prev1;
-                y_prev1 = y;
             }
         }
     }
@@ -509,14 +490,12 @@ pub fn generate(
     // Every source subband's history advances regardless of whether a
     // patch used it this frame: the low-band QMF stream is continuous.
     for (band, series) in low_cur.iter().enumerate() {
-        if band >= history.x.len() || series.len() < 2 {
+        if band >= history.x.len() {
             continue;
         }
-        let n = series.len();
-        history.x[band] = [series[n - 2], series[n - 1]];
-        // y-history only meaningfully advances for bands a patch actually
-        // wrote; untouched bands hold their input as a neutral seed.
-        history.y[band] = [series[n - 2], series[n - 1]];
+        let h = &mut history.x[band];
+        let keep: Vec<Complex<f64>> = h.iter().copied().chain(series.iter().copied()).collect();
+        h.copy_from_slice(&keep[keep.len() - HIST..]);
     }
 
     out
@@ -579,8 +558,15 @@ mod tests {
         // previous covariance-method solve) for a stability guarantee real
         // content needs -- still recovers the synthetic poles to well
         // within this looser bound.
-        assert!((fa1 - a1).norm_sqr().sqrt() < 0.2, "a1 {fa1:?} vs {a1:?}");
-        assert!((fa2 - a2).norm_sqr().sqrt() < 0.2, "a2 {fa2:?} vs {a2:?}");
+        // spec alpha = negated predictor coefficients
+        assert!(
+            (fa1 + a1).norm_sqr().sqrt() < 0.2,
+            "alpha0 {fa1:?} vs {a1:?}"
+        );
+        assert!(
+            (fa2 + a2).norm_sqr().sqrt() < 0.2,
+            "alpha1 {fa2:?} vs {a2:?}"
+        );
     }
 
     #[test]
@@ -589,7 +575,7 @@ mod tests {
         // Jump from OFF straight to HIGH: attack (rising bw) is the slow
         // (0.90625/0.09375) branch here since target > current.
         let after_rise = chirp.update(&[3])[0];
-        assert!(after_rise > 0.0 && after_rise < BW_TABLE[3]);
+        assert!(after_rise > 0.0 && after_rise < 0.98);
         // Now drop back to OFF: release (falling bw) is the fast
         // (0.75/0.25) branch, so it should move further in one step than
         // the rise did.
@@ -603,35 +589,8 @@ mod tests {
         );
     }
 
-    /// (Round-50) Pins the all-pole residual-resynthesis structure that
-    /// round-50's real-file A/B empirically favours over the feed-forward
-    /// FIR round-48 briefly shipped (see the module doc). Both structures
-    /// were implemented and measured against the reference decoder on real
-    /// content; this one matched closer, so it is the one pinned here --
-    /// the feed-forward alternative's own discriminating test
-    /// (`feed_forward_extension_matches_bw_endpoints`, commit 8bc305b) is
-    /// documented history, not dead code to resurrect casually.
-    ///
-    /// Drives the same noiseless AR(2) source as that alternative test
-    /// through two consecutive frames, `x[n] = a1*x[n-1] + a2*x[n-2]`
-    /// exactly, so `lpc2`'s fit recovers `(a1, a2)` closely enough that the
-    /// *residual* `x[l] - a1*x[l-1] - a2*x[l-2]` is near zero throughout.
-    /// That residual, not the raw copy, is what this structure resynthesises
-    /// through the bandwidth-expanded all-pole recursion `y[l] = residual +
-    /// ca1*y[l-1] + ca2*y[l-2]` -- the key structural difference from
-    /// feed-forward, which adds taps onto the copy instead of replacing it
-    /// with a filtered residual:
-    /// - `bw=0` (`bs_invf_mode` OFF): `ca1=ca2=0`, so `y = residual ~= 0` --
-    ///   the output collapses toward silence, NOT the exact plain copy
-    ///   feed-forward produces at this same setting.
-    /// - `bw~=0.98` (`bs_invf_mode` HIGH): `ca1,ca2` are close to the
-    ///   original `(a1,a2)` (scaled by `bw`, `bw^2`), so with residual~=0 the
-    ///   recursion nearly reproduces the source's own AR(2) resonance from
-    ///   history alone -- output tracks `x` closely in magnitude and phase,
-    ///   not the ~1.98x reinforcement feed-forward produces at the same
-    ///   setting.
     #[test]
-    fn all_pole_resynthesis_matches_bw_endpoints() {
+    fn feed_forward_matches_bw_endpoints() {
         let tables = real_file_tables();
         let kx = tables.kx as usize;
         let a1 = 0.6f64;
@@ -652,7 +611,7 @@ mod tests {
         let invf_off = vec![0u8; tables.n_q];
         let invf_high = vec![3u8; tables.n_q];
 
-        // bw = 0: residual resynthesis collapses toward silence, not a copy.
+        // bw = 0: exact plain copy (4.6.18.6.3 with both taps zeroed).
         let mut chirp0 = ChirpState::new(tables.n_q);
         let mut hist0 = HfHistory::new(kx);
         let _ = generate(&frame1, &tables, &invf_off, &mut chirp0, &mut hist0);
@@ -664,13 +623,13 @@ mod tests {
                 continue;
             }
             assert!(
-                y.re.abs() < 0.1 * expect.abs(),
-                "bw=0 residual should collapse toward silence at n={n}: {y:?} vs input {expect}"
+                (y - Complex::new(expect, 0.0)).norm_sqr().sqrt() < 1e-9 * expect.abs().max(1.0),
+                "bw=0 must copy at n={n}: {y:?} vs input {expect}"
             );
         }
 
-        // bw ~= 0.98: residual~=0, so the recursion tracks the source's own
-        // resonance from history alone -- ratio near 1, not ~1.98.
+        // bw ~= 0.98: near-full inverse filter of a noiseless AR(2) -> the
+        // output is close to the (zero) prediction residual, far below x.
         let mut chirp1 = ChirpState::new(tables.n_q);
         chirp1.bw = vec![0.0; tables.n_q]; // priming frame at bw=0
         let mut hist1 = HfHistory::new(kx);
@@ -683,14 +642,9 @@ mod tests {
             if expect.abs() < 1e-6 {
                 continue;
             }
-            let ratio = y.re / expect;
             assert!(
-                (0.5..1.5).contains(&ratio),
-                "bw=0.98 ratio out of range at n={n}: ratio={ratio} y={y:?} x={expect}"
-            );
-            assert!(
-                y.im.abs() < 0.05 * expect.abs().max(1e-6),
-                "unexpected imaginary part at n={n}: {y:?}"
+                y.norm_sqr().sqrt() < 0.15 * expect.abs(),
+                "bw=0.98 should whiten at n={n}: y={y:?} x={expect}"
             );
         }
     }
