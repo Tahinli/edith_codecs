@@ -1037,7 +1037,14 @@ fn encode_packets(enc: &mut Encoder, pcm: &[f32], channels: usize) -> Vec<Vec<u8
 }
 
 fn temp_path(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("ec-opus-enc-{}-{name}", std::process::id()))
+    let root = std::env::var_os("EC_OPUS_SCRATCH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = std::env::var_os("HOME").expect("HOME set for encoder scratch");
+            PathBuf::from(home).join(".cache/silk2")
+        });
+    fs::create_dir_all(&root).unwrap();
+    root.join(format!("ec-opus-enc-{}-{name}", std::process::id()))
 }
 
 /// The full product rate table, mono and stereo, decoded by libopus: the
@@ -1799,6 +1806,123 @@ fn silk_multiframe_packets_roundtrip() {
     }
 }
 
+fn stereo_speech_pair() -> Vec<f32> {
+    let left = speech_like();
+    let mut out = Vec::with_capacity(left.len() * 2);
+    for (i, &l) in left.iter().enumerate() {
+        let t = i as f64 / 48000.0;
+        let r = 0.78 * l + 0.12 * (std::f64::consts::TAU * 310.0 * t).sin() as f32;
+        out.push(l);
+        out.push(r);
+    }
+    out
+}
+
+fn aligned_channel_corr(reference: &[f32], decoded: &[f32], channels: usize, ch: usize) -> f64 {
+    let b: Vec<f32> = decoded.chunks_exact(channels).map(|f| f[ch]).collect();
+    aligned_corr(reference, &b, 2000).0
+}
+
+#[test]
+fn silk_stereo_speech_roundtrip() {
+    let pcm = stereo_speech_pair();
+    let total = pcm.len() / 2;
+    for (tag, bandwidth, per_channel_bps, cutoff, config) in [
+        ("NB20", Bandwidth::Narrow, 16_000u32, 3500.0, 1u8),
+        ("MB20", Bandwidth::Medium, 20_000, 5500.0, 5),
+        ("WB20", Bandwidth::Wide, 24_000, 7000.0, 9),
+    ] {
+        let frame = if tag.ends_with("10") { 480 } else { 960 };
+        let frame_ms = frame / 48;
+        let mut mono_floor = [0.0f64; 2];
+        for ch in 0..2 {
+            let mono: Vec<f32> = pcm.chunks_exact(2).map(|f| f[ch]).collect();
+            let silk = match bandwidth {
+                Bandwidth::Narrow => SilkEncoder::new(false),
+                Bandwidth::Medium => SilkEncoder::new_mediumband(),
+                _ => SilkEncoder::new(true),
+            };
+            let reference = lowpass(&mono, cutoff);
+            let (decoded, _, _) = silk_roundtrip_ms(silk, &mono, frame_ms, Some(per_channel_bps));
+            mono_floor[ch] = aligned_corr(&reference, &decoded, 2000).0;
+        }
+
+        let mut enc = Encoder::new(48000, 2, Application::Voip).unwrap();
+        enc.set_mode(Some(ec_opus::Mode::Silk));
+        enc.set_bandwidth(Some(bandwidth));
+        enc.set_bitrate(per_channel_bps * 2);
+        let mut dec = Decoder::new(48000, 2).unwrap();
+        let mut out = vec![0u8; 1500];
+        let mut buf = vec![0.0f32; 5760 * 2];
+        let mut decoded = Vec::new();
+        let mut packets = Vec::new();
+        let mut padded = pcm.clone();
+        padded.resize(pcm.len().div_ceil(frame * 2) * frame * 2 + frame * 2, 0.0);
+        for block in padded.chunks(frame * 2) {
+            let len = enc.encode_float(block, frame, &mut out).expect("encode");
+            let toc = ec_opus::Toc::new(out[0]);
+            assert_eq!(toc.config, config, "{tag}: wrong TOC config");
+            assert!(toc.stereo, "{tag}: SILK TOC is not stereo");
+            let n = dec.decode_float(&out[..len], &mut buf).expect("decode");
+            assert_eq!(n, frame, "{tag}: decoded frame size");
+            assert_eq!(dec.final_range(), enc.final_range(), "{tag}: range state");
+            decoded.extend_from_slice(&buf[..n * 2]);
+            packets.push(out[..len].to_vec());
+        }
+        let bytes: usize = packets.iter().map(Vec::len).sum();
+        let kbps = bytes as f64 * 8.0 / (packets.len() as f64 * frame_ms as f64);
+        for ch in 0..2 {
+            let source: Vec<f32> = pcm.chunks_exact(2).map(|f| f[ch]).collect();
+            let reference = lowpass(&source, cutoff);
+            let corr = aligned_channel_corr(&reference, &decoded, 2, ch);
+            eprintln!(
+                "silk stereo {tag} ch{ch}: corr {corr:.4}, mono {:.4}, {kbps:.2} kbps",
+                mono_floor[ch]
+            );
+            assert!(
+                corr + 0.01 >= mono_floor[ch],
+                "{tag} ch{ch}: stereo corr {corr:.4} trails mono {:.4}",
+                mono_floor[ch]
+            );
+        }
+        if Command::new("ffmpeg").arg("-version").output().is_ok() {
+            let path = temp_path(&format!("silk-stereo-{tag}.opus"));
+            write_ogg_opus(
+                &path,
+                &packets,
+                opus_head(2, enc.look_ahead(frame) as u16, None),
+                2,
+                total,
+                enc.look_ahead(frame) as i64,
+            );
+            let out = Command::new("ffmpeg")
+                .args(["-v", "warning", "-c:a", "libopus", "-i"])
+                .arg(&path)
+                .args(["-f", "null", "-"])
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "{tag}: ffmpeg decode: {stderr}");
+            if Command::new("gst-launch-1.0")
+                .arg("--version")
+                .output()
+                .is_ok()
+            {
+                let location = format!("location={}", path.display());
+                let out = Command::new("gst-launch-1.0")
+                    .args([
+                        "-q", "filesrc", &location, "!", "oggdemux", "!", "opusdec", "!",
+                        "fakesink",
+                    ])
+                    .output()
+                    .unwrap();
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                assert!(out.status.success(), "{tag}: gst decode: {stderr}");
+            }
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
 #[test]
 fn silk_compares_to_celt_on_speech_at_speech_rates() {
     let pcm = speech_like();
