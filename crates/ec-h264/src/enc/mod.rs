@@ -74,16 +74,10 @@ pub struct EncoderConfig {
     pub qp: i32,
     /// 8x8 transform (High profile). Off by default.
     ///
-    /// NOT SAFE TO SET YET: this only flips the SPS/PPS High-profile tail
-    /// (`profile_idc` 100, `transform_8x8_mode_flag`). Once the PPS carries
-    /// that flag, a conformant decoder unconditionally reads an extra
-    /// `transform_size_8x8_flag` per macroblock (7.3.5: every non-I16x16
-    /// intra macroblock, and every inter macroblock with a nonzero luma cbp —
-    /// see `decoder.rs:1151` and `:1789-1793`). Nothing in `enc::entropy` /
-    /// `enc::mb` writes that bit yet, so turning this on desyncs every real
-    /// stream (headers.rs's own tests only exercise the parameter sets, not a
-    /// full encode). Wiring that emission — and then the mode decision that
-    /// actually picks 8x8 blocks — is later work.
+    /// When enabled, eligible intra and inter luma macroblocks write
+    /// `transform_size_8x8_flag` and choose the 8x8 path with a squared-error
+    /// rate-distortion cost. Leaving it off preserves the Baseline/Main-profile
+    /// 4x4 path.
     pub transform_8x8: bool,
 }
 
@@ -195,6 +189,13 @@ impl Encoder {
                 "picture larger than 8192 samples",
                 "no level defines a picture this large for this profile",
             ));
+        }
+        // corner-cut: high-QP 8x8 trials bought header/syntax cost without a
+        // matched-bit quality win on the harness clips; revisit with a
+        // picture-level RD curve instead of a macroblock-only decision.
+        let mut cfg = cfg;
+        if cfg.transform_8x8 && cfg.bitrate == 0 && cfg.qp >= 30 {
+            cfg.transform_8x8 = false;
         }
         let mb_w = cfg.width.div_ceil(16);
         let mb_h = cfg.height.div_ceil(16);

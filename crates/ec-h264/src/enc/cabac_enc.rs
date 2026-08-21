@@ -30,6 +30,7 @@ use crate::entropy::{
     BlockCat, FLAG_CHROMA_PRED, FLAG_I16, FLAG_INTER, FLAG_PCM, FLAG_TRANS8X8, MbCtx, MbInfo,
 };
 
+#[derive(Clone)]
 /// The arithmetic encoder of 9.3.4 plus the context state.
 pub(crate) struct CabacEnc {
     w: BitWriter,
