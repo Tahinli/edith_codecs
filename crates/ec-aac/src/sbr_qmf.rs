@@ -2,27 +2,18 @@
 //! analysis, folded to a shared core) and 4.6.18.8.2 (64-band synthesis)
 //! polyphase machinery HE-AAC's spectral band replication is built on.
 //!
-//! # Bank sharing and the 32-band bridge
+//! # Banks
 //!
-//! The spec defines two analysis banks (32-band, 4.6.18.4.1, and 64-band,
-//! 4.6.18.4) and two synthesis banks (64-band, 4.6.18.8.2, and a downsampled
-//! 32-band variant, 4.6.18.8.3). A numpy round-trip campaign (see
-//! `scripts/aac-tables/qmf_check.py` and the ledger, round "sbr-hunt") found
-//! the 64-band analysis/synthesis pair self-consistent to `corr=0.999999`
-//! against the literal spec equations, but the 32-band analysis and 32-band
-//! downsampled synthesis equations, and the 32-into-64 zero-padding bridge
-//! the SBR core signal actually needs, never cleared 0.7 correlation under
-//! the same exact-equation reading. Zero-stuffing the 32 core samples to 64
-//! (`x64[2m] = 2*x32[m]`, odd samples 0) and running them through the
-//! VERIFIED 64-band analysis, keeping bands `0..32` and dropping the
-//! zero-stuffing image that lands in bands `32..64`, reached `corr=0.9994`
-//! against an ideal band-limited 2x upsample -- short of the 0.9999 numpy
-//! target but a real, spec-traceable near-PR bank, not a fitted
-//! approximation. [`Analysis`] and [`HfAnalysis`] therefore share one
-//! [`QmfAnalysis64`] core: the difference between them is only whether the
-//! caller has 32 core samples (zero-stuffed by [`Analysis`]) or 64
-//! already-doubled-rate samples ([`HfAnalysis`], used only for measurement).
-//! [`Synthesis`] is the 64-band bank directly, unmodified for either caller.
+//! [`Analysis`] is the 32-band core analysis (4.6.18.4.1: `c[2n]` taps over
+//! 320 samples, 64-point modulation), [`Synthesis`] the 64-band bank
+//! (4.6.18.8.2) and [`HfAnalysis`] a 64-band analysis used only by the
+//! measurement instruments. The numpy round-trip campaign
+//! (`scripts/aac-tables/qmf_check.py`, ledger round "sbr-hunt") verified the
+//! 64-band pair to `corr=0.999999` against the literal equations; its
+//! 32-band attempt used full-rate taps and a conjugated carrier, which is
+//! why it "never cleared 0.7" and the bank shipped for a while as a
+//! zero-stuffed 64-band bridge instead (see [`Analysis`] for the per-band
+//! phase that bridge imposed on the HF patches).
 //!
 //! The Kaiser-windowed fitted bank this file used to build at construction
 //! time (`prototype`/`theta`/`modulation_tables`/`analytic_gain`, tuned by a
@@ -39,11 +30,6 @@ pub const PROTO_LEN: usize = 640;
 pub const ANALYSIS_BANDS: usize = 32;
 /// Synthesis channel count (twice the core's, spanning the doubled band).
 pub const SYNTHESIS_BANDS: usize = 64;
-
-/// Zero-stuffing gain the 32-into-64 bridge needs to read back unity
-/// amplitude (numpy-measured: `gain=2.0` gives `amp_ratio ~ 0.999`, `gain=1`
-/// halves it -- the standard zero-stuffing compensation for a 2x upsample).
-const ZERO_STUFF_GAIN: f64 = 2.0;
 
 /// The shared ISO/IEC 14496-3 4.6.18.4 64-band analysis core: `PROTO_LEN`
 /// real history samples in (newest inserted last, matching PCM order),
@@ -106,20 +92,50 @@ impl QmfAnalysis64 {
     }
 }
 
-/// The 32-band bridge: core PCM in (32 samples/slot), complex subband slots
-/// out (32/slot), via zero-stuffing into the verified 64-band core and
-/// keeping the low half (see the module doc for why this replaces a native
-/// 32-band analysis).
+/// ISO/IEC 14496-3 4.6.18.4.1 32-band analysis: core PCM in (32
+/// samples/slot), 32 complex subbands out, the decimated prototype `c[2n]`
+/// over a 320-sample history and carrier `exp(j*pi/64*(k+0.5)*(2n-0.5))`
+/// (see `new` for the -0.5).
+///
+/// Replaces the zero-stuffed 64-band bridge: numpy
+/// (`scripts/aac-tables/qmf_check.py` lineage) shows the bridge equals the
+/// literal `(2n-1)` bank times `2 * exp(j*pi/64*(k+0.5)*1.5)` per band --
+/// a 1.5-sample (at the doubled rate) delay plus 2x gain. Harmless for the
+/// low band (the synthesis undoes both), but the HF generator copies band
+/// `p`'s subband signal into band `k`, where a per-band phase becomes a
+/// constant carrier error against the reference.
 pub struct Analysis {
-    core: QmfAnalysis64,
+    hist: [f64; PROTO_LEN / 2],
+    cos_tab: Vec<f64>,
+    sin_tab: Vec<f64>,
 }
 
 impl Analysis {
     /// A fresh bank with an all-zero history (the usual filter startup
     /// transient applies to its first ~`PROTO_LEN` output samples).
     pub fn new() -> Analysis {
+        let mut cos_tab = vec![0.0f64; ANALYSIS_BANDS * 64];
+        let mut sin_tab = vec![0.0f64; ANALYSIS_BANDS * 64];
+        for k in 0..ANALYSIS_BANDS {
+            for n in 0..64 {
+                // Carrier offset -0.5, not the text's -1: measured against the
+                // reference decoder's PCM (real-file test, probe sweep over
+                // -1/-0.5/0/+0.5 on both banks) the reference's low band
+                // sits exactly half an output sample EARLIER than the
+                // literal (2n-1) bank and, unlike a synthesis-side shift,
+                // that half sample is carried by the HF copies too
+                // (above-5 kHz corr 0.9997 vs 0.9995 synthesis-side, 0.984
+                // literal). Equivalent to a 64-band analysis of the core
+                // zero-stuffed at the ODD phase.
+                let theta = std::f64::consts::PI / 64.0 * (k as f64 + 0.5) * (2.0 * n as f64 - 0.5);
+                cos_tab[k * 64 + n] = theta.cos();
+                sin_tab[k * 64 + n] = theta.sin();
+            }
+        }
         Analysis {
-            core: QmfAnalysis64::new(),
+            hist: [0.0; PROTO_LEN / 2],
+            cos_tab,
+            sin_tab,
         }
     }
 
@@ -130,13 +146,26 @@ impl Analysis {
         &mut self,
         samples: &[f32; ANALYSIS_BANDS],
     ) -> [Complex<f64>; ANALYSIS_BANDS] {
-        let mut x64 = [0.0f64; SYNTHESIS_BANDS];
-        for (m, &s) in samples.iter().enumerate() {
-            x64[2 * m] = ZERO_STUFF_GAIN * s as f64;
+        const LEN: usize = PROTO_LEN / 2;
+        for &s in samples {
+            self.hist.copy_within(0..LEN - 1, 1);
+            self.hist[0] = s as f64;
         }
-        let full = self.core.process_slot(&x64);
+        // Z[n] = x[n]*c[2n], n=0..319; u[n] = sum_{j=0}^{4} Z[n+64j], n=0..63
+        let mut u = [0.0f64; 64];
+        for (n, uu) in u.iter_mut().enumerate() {
+            *uu = (0..5).map(|j| self.hist[n + 64 * j] * QMF_WINDOW[2 * (n + 64 * j)]).sum();
+        }
         let mut out = [Complex::new(0.0, 0.0); ANALYSIS_BANDS];
-        out.copy_from_slice(&full[0..ANALYSIS_BANDS]);
+        for (k, slot) in out.iter_mut().enumerate() {
+            let row = k * 64;
+            let (mut re, mut im) = (0.0f64, 0.0f64);
+            for n in 0..64 {
+                re += u[n] * self.cos_tab[row + n];
+                im += u[n] * self.sin_tab[row + n];
+            }
+            *slot = Complex::new(re, im);
+        }
         out
     }
 }
@@ -315,11 +344,18 @@ mod tests {
         fft.forward(&mut spectrum);
 
         let mut padded = vec![Complex::new(0.0, 0.0); 2 * n];
+        // The 32-analysis/64-synthesis pair reads back at half amplitude
+        // and 1 output sample later than the zero-stuffed bridge did; fold
+        // both into the ground truth.
+        let delay = |m: f64| {
+            let ph = -2.0 * std::f64::consts::PI * m / (2 * n) as f64;
+            Complex::new(ph.cos(), ph.sin())
+        };
         for k in 0..n / 2 {
-            padded[k] = spectrum[k].scale(2.0);
+            padded[k] = spectrum[k].scale(2.0) * delay(k as f64);
         }
         for k in n / 2..n {
-            padded[2 * n - n + k] = spectrum[k].scale(2.0);
+            padded[2 * n - n + k] = spectrum[k].scale(2.0) * delay(k as f64 - n as f64);
         }
         let mut fft2 = Fft::<f64>::new(2 * n);
         fft2.inverse(&mut padded);
@@ -411,8 +447,8 @@ mod tests {
             "measured filterbank delay: {best_lag} samples, correlation {best_corr:.6}, amplitude ratio {amp_ratio:.6}"
         );
         assert!(
-            (0.98..=1.02).contains(&amp_ratio),
-            "round-trip amplitude ratio {amp_ratio} not within 2% of unity gain"
+            (0.49..=0.51).contains(&amp_ratio),
+            "round-trip amplitude ratio {amp_ratio} not within 2% of the spec pair's 0.5 (sbr_chain restores the 2x)"
         );
         assert!(
             best_corr >= 0.9999,

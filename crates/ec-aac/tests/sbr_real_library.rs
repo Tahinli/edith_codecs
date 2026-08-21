@@ -305,6 +305,19 @@ fn best_lag_correlation_ex(ours: &[f32], theirs: &[f32], lag_max: i64) -> (i64, 
     if !found {
         best = coarse_best;
     }
+    // A winning lag at the search bound is not a measurement (the true
+    // alignment may lie outside it): widen once to `SEARCH_LAG_MAX`, and if
+    // it still sits at the edge fail here rather than hand any caller a
+    // noise-driven number (instrument-at-bound class).
+    if at_edge && lag_max < SEARCH_LAG_MAX {
+        return best_lag_correlation_ex(ours, theirs, SEARCH_LAG_MAX);
+    }
+    assert!(
+        !at_edge,
+        "winning lag {} sits at the +/-{lag_max} search bound -- the true \
+         alignment is outside the search, corr {:.6} is noise, not a measurement",
+        best.0, best.2
+    );
     (best.0, best.2, at_edge)
 }
 
@@ -2249,18 +2262,24 @@ fn full_chain_low_band_matches_own_core() {
             // without exposing the well-behaved one to the wider bound's
             // noise floor.
             const WIDE_LAG_MAX: i64 = 20_000;
-            let (mut lag, mut corr, mut at_edge) = best_lag_correlation_ex(&ol, &ul, WIDE_LAG_MAX);
+            // Top-K refinement, not the single coarse winner: FMJ's single
+            // coarse pick landed on an in-bounds noise peak (lag 18995,
+            // corr 0.10) while its true alignment scores >0.99 on refine.
+            // A winner at the bound widens once, then is asserted off it.
+            let (mut lag, mut corr, mut at_edge) =
+                robust_lag_topk(&ol, &ul, WIDE_LAG_MAX, core_rate, 8);
             let mut bound = WIDE_LAG_MAX;
-            if at_edge {
+            // A sub-bar winner inside the narrow bound is the same symptom
+            // (true peak outside the search), so it widens too.
+            if at_edge || corr < 0.99 {
                 bound = SEARCH_LAG_MAX;
-                (lag, corr, at_edge) = best_lag_correlation_ex(&ol, &ul, SEARCH_LAG_MAX);
+                (lag, corr, at_edge) = robust_lag_topk(&ol, &ul, SEARCH_LAG_MAX, core_rate, 8);
             }
             println!("  ch{ch}: measured best lag {lag}, corr {corr:.6}");
             assert!(
                 !at_edge,
                 "{} ch{ch}: winning lag {lag} sits at the +/-{bound} \
-                 search bound -- the true alignment is outside the search, \
-                 corr {corr:.6} is noise, not a measurement",
+                 search bound -- corr {corr:.6} is noise, not a measurement",
                 c.path.display()
             );
             assert!(
@@ -2755,6 +2774,8 @@ fn sbr_real_library_matches_reference() {
             let high = if n >= 1024 {
                 let oh = highpass(&o[oa..oa + n], rate, c.crossover_hz);
                 let th = highpass(&t[ob..ob + n], rate, c.crossover_hz);
+                let rms = |v: &[f32]| (v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>() / v.len().max(1) as f64).sqrt();
+                println!("  ch{ch} above-crossover RMS ours/ref = {:.4}", rms(&oh) / rms(&th).max(1e-12));
                 correlation(&oh, &th)
             } else {
                 0.0
@@ -2772,15 +2793,16 @@ fn sbr_real_library_matches_reference() {
                 println!(
                     "  NOISE-FRACTION ceiling prediction (band_hz, f_noise, predicted_ceiling):"
                 );
-                for (band, signal, noise) in ec_aac::noise_fraction_table() {
+                for (band, signal, noise, out) in ec_aac::noise_fraction_table() {
                     if signal + noise <= 0.0 {
                         continue;
                     }
                     let f = noise / (signal + noise);
                     println!(
-                        "    {:>6.0}Hz band{band:>3}: signal {signal:.3e} noise {noise:.3e} f_noise {f:.6} ceiling {:.4}",
+                        "    {:>6.0}Hz band{band:>3}: signal {signal:.3e} noise {noise:.3e} f_noise {f:.6} ceiling {:.4} realised/target {:.4}",
                         band as f64 * band_hz,
-                        (1.0 - f).max(0.0).sqrt()
+                        (1.0 - f).max(0.0).sqrt(),
+                        out / (signal + noise)
                     );
                 }
             }
@@ -3004,6 +3026,25 @@ fn sbr_real_library_matches_reference() {
                 let win = &o[oa..oa + n];
                 let twin = &t[ob..ob + n];
                 let (vs_ref, vs_ours, ours_vs_ref) = hf_patch_simulator_qmf(win, twin);
+                // Per-QMF-band energy ratio and coherence, ours vs reference
+                // (the envelope-adjuster instrument: a level offset shows as
+                // a constant dB ratio, a gain-shape defect as per-band dB).
+                {
+                    let (o_spec, t_spec, _) = qmf_domain_spec(win, twin);
+                    println!("  ch{ch} QMF-BAND ours-vs-REFERENCE (band, ratio_dB, coherence):");
+                    for band in 0..o_spec.len().min(t_spec.len()).min(48) {
+                        let (mut eo, mut et, mut cr, mut ci) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+                        for (a, b) in o_spec[band].iter().zip(&t_spec[band]) {
+                            eo += a.norm_sqr();
+                            et += b.norm_sqr();
+                            let c = *a * b.conj();
+                            cr += c.re;
+                            ci += c.im;
+                        }
+                        let coh = (cr * cr + ci * ci).sqrt() / (eo * et).sqrt().max(1e-30);
+                        println!("    band{band:>3}: {:>7.2} dB  coh {coh:.4}", 10.0 * (eo / et.max(1e-30)).log10());
+                    }
+                }
                 let mean_in = |rows: &[(usize, f64)], lo: usize, hi: usize| {
                     let vals: Vec<f64> = rows
                         .iter()
@@ -3358,12 +3399,12 @@ fn sbr_actual_noise_fraction() {
     // invoke this test by name, not as part of a parallel `cargo test` run.
     unsafe {
         std::env::remove_var("EC_AAC_SBR_NOISE_ZERO");
-        std::env::set_var("EC_AAC_SBR_NOISE_FRACTION_DEBUG", "1");
+        std::env::set_var("EC_AAC_SBR_NOISE_FRACTION", "1");
     }
     let (ours_on, _, rate) = our_decode(&path, 0).expect("our_decode works (noise on)");
     let bookkept = ec_aac::noise_fraction_table();
     unsafe {
-        std::env::remove_var("EC_AAC_SBR_NOISE_FRACTION_DEBUG");
+        std::env::remove_var("EC_AAC_SBR_NOISE_FRACTION");
         std::env::set_var("EC_AAC_SBR_NOISE_ZERO", "1");
     }
     let (ours_off, _, _) = our_decode(&path, 0).expect("our_decode works (noise zeroed)");
@@ -3415,7 +3456,7 @@ fn sbr_actual_noise_fraction() {
         let book = bookkept
             .iter()
             .find(|(b, ..)| *b == band)
-            .map(|(_, s, n)| if s + n > 0.0 { n / (s + n) } else { 0.0 })
+            .map(|(_, s, n, _)| if s + n > 0.0 { n / (s + n) } else { 0.0 })
             .unwrap_or(0.0);
         println!(
             "    {hz:>6.0}Hz: on {e_on:.3e} off {e_off:.3e} actual {actual:.4} bookkept {book:.4}"
@@ -4596,5 +4637,106 @@ fn sbr_hf_window_band_probe() {
             "\n-- patch table (first frame): kx={} k2={} patch widths={:?}",
             row.kx, row.k2, row.patch_lengths
         );
+    }
+}
+
+/// Round-59 residual locator: per-2048-sample-window corr at lag 0 (worst
+/// windows, with the output frame index) plus a complex-STFT per-band
+/// correlation (Parseval: equals the time-domain corr restricted to that
+/// band, so it needs no calibration) with an ours-vs-ours self-check column.
+#[test]
+fn sbr_residual_locator() {
+    if !have_ffmpeg() {
+        return;
+    }
+    let home = std::env::var("HOME").unwrap();
+    // `EC_AAC_SBR_LOCATOR_FILE` points the same instrument at any other
+    // HE-AAC file (e.g. a mono, uncoupled, noise-only probe encode).
+    let path = std::env::var("EC_AAC_SBR_LOCATOR_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(format!("{home}/Music/Yok - Nikbinler.mp4")));
+    if !path.exists() {
+        return;
+    }
+    let Some((ours, _, rate)) = our_decode(&path, 0) else { return };
+    let theirs = ffmpeg_decode(&path, 0, ours.len());
+    const W: usize = 2048;
+    const FFT_LEN: usize = 2048;
+    const HOP: usize = 1024;
+    let bins = FFT_LEN / 2 + 1;
+    let mut rfft = ec_dsp::RealFft::<f32>::new(FFT_LEN);
+    let win = ec_dsp::Window::<f32>::sine(FFT_LEN);
+    for ch in 0..ours.len() {
+        let n = ours[ch].len().min(theirs[ch].len());
+        let (o, t) = (&ours[ch][..n], &theirs[ch][..n]);
+        let mut wins: Vec<(f64, usize)> = (0..n / W)
+            .map(|w| (correlation(&o[w * W..(w + 1) * W], &t[w * W..(w + 1) * W]), w))
+            .collect();
+        wins.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        println!("ch{ch} worst windows (corr, frame): {:?}", &wins[..12]);
+        let hops = (n - FFT_LEN) / HOP + 1;
+        let mut spec = vec![ec_dsp::Complex::new(0.0f32, 0.0); bins];
+        let mut acc = vec![[0.0f64; 3]; bins]; // re(o*conj t), |o|^2, |t|^2
+        let mut os = vec![ec_dsp::Complex::new(0.0f32, 0.0); bins];
+        for h in 0..hops {
+            let mut b = o[h * HOP..h * HOP + FFT_LEN].to_vec();
+            win.apply(&mut b);
+            rfft.forward(&b, &mut spec);
+            os.copy_from_slice(&spec);
+            let mut b = t[h * HOP..h * HOP + FFT_LEN].to_vec();
+            win.apply(&mut b);
+            rfft.forward(&b, &mut spec);
+            for k in 0..bins {
+                let (a, c) = (os[k], spec[k]);
+                acc[k][0] += f64::from(a.re * c.re + a.im * c.im);
+                acc[k][1] += f64::from(a.norm_sqr());
+                acc[k][2] += f64::from(c.norm_sqr());
+            }
+        }
+        let hz = f64::from(rate) / FFT_LEN as f64;
+        let tot: f64 = acc.iter().map(|a| a[1] + a[2]).sum();
+        // With `EC_AAC_SBR_NOISE_FRACTION` set the decoder bookkeeps the
+        // dequantized target per QMF band; print it next to the reference's
+        // measured energy in the same band so a target-side (bitstream ->
+        // E_orig) tilt separates from an adjust/synthesis-side one.
+        if ch == 0 {
+            let band_hz = f64::from(rate) / 128.0;
+            for (band, sig, noi, out) in ec_aac::noise_fraction_table() {
+                let (lo, hi) = (
+                    (band as f64 * band_hz / hz) as usize,
+                    ((band + 1) as f64 * band_hz / hz) as usize,
+                );
+                let pt: f64 = (lo..hi.min(bins)).map(|k| acc[k][2]).sum();
+                let po: f64 = (lo..hi.min(bins)).map(|k| acc[k][1]).sum();
+                println!(
+                    "TARGET band {band:>2} {:>6.0}Hz target {:.3e} realised/target {:.4} ref_pcm {:.3e} ours_pcm {:.3e} target/ref_pcm {:.3e}",
+                    band as f64 * band_hz,
+                    sig + noi,
+                    out / (sig + noi),
+                    pt,
+                    po,
+                    (sig + noi) / pt
+                );
+            }
+        }
+        // group into 250 Hz bands up to 8 kHz, then 1 kHz
+        let mut edges: Vec<usize> = (0..=32).map(|i| ((i as f64 * 250.0) / hz) as usize).collect();
+        edges.extend((9..=22).map(|i| ((i as f64 * 1000.0) / hz) as usize));
+        for e in edges.windows(2) {
+            let (mut c, mut po, mut pt) = (0.0, 0.0, 0.0);
+            for k in e[0]..e[1].min(bins) {
+                c += acc[k][0];
+                po += acc[k][1];
+                pt += acc[k][2];
+            }
+            println!(
+                "ch{ch} {:5.0}-{:5.0} Hz corr {:.5} rms ours/ref {:.4} energy share {:.4}",
+                e[0] as f64 * hz,
+                e[1] as f64 * hz,
+                c / (po * pt).sqrt(),
+                (po / pt).sqrt(),
+                (po + pt) / tot
+            );
+        }
     }
 }

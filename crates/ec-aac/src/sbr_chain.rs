@@ -4,7 +4,7 @@
 //! PCM through 32-band analysis, generate and adjust the HF region, and
 //! resynthesize through the 64-band bank to double-rate PCM in place.
 
-use crate::sbr_env::{self, NoiseGen};
+use crate::sbr_env::{self, AdjustState};
 use crate::sbr_hf::{self, ChirpState, HfHistory};
 use crate::sbr_payload::{SbrChannel, SbrData, SbrParser};
 use crate::sbr_qmf::{ANALYSIS_BANDS, Analysis, SYNTHESIS_BANDS, Synthesis};
@@ -181,17 +181,32 @@ struct ChannelState {
     synthesis: Synthesis,
     hf_hist: HfHistory,
     chirp: ChirpState,
-    noise: NoiseGen,
+    adj: AdjustState,
+    /// §4.6.18.7.6 `tHFAdj`/overlap buffers: the SBR output lags the raw
+    /// analysis by `HF_ADJ` slots, so the previous frame's last `HF_ADJ`
+    /// raw low-band and raw HF slots are kept, plus the already-adjusted HF
+    /// slots past the frame end that a variable-border envelope produced
+    /// (`Y` of slots `32..2*t_E(L_E)`), which lead the next frame's output.
+    low_tail: Vec<[Complex<f64>; ANALYSIS_BANDS]>,
+    hf_tail: Vec<Vec<Complex<f64>>>,
+    y_carry: Vec<Vec<Complex<f64>>>,
 }
 
+/// Slots by which the HF adjuster's envelope grid lags the raw QMF frame
+/// (`tHFAdj` + the 6-slot overlap, §4.6.18.7.6 / Figure 4.32).
+const HF_ADJ: usize = 6;
+
 impl ChannelState {
-    fn new(n_q: usize, seed: u32) -> ChannelState {
+    fn new(n_q: usize, _seed: u32) -> ChannelState {
         ChannelState {
             analysis: Analysis::new(),
             synthesis: Synthesis::new(),
             hf_hist: HfHistory::new(ANALYSIS_BANDS),
             chirp: ChirpState::new(n_q.max(1)),
-            noise: NoiseGen::new(seed),
+            adj: AdjustState::new(),
+            low_tail: vec![[Complex::ZERO; ANALYSIS_BANDS]; HF_ADJ],
+            hf_tail: Vec::new(),
+            y_carry: Vec::new(),
         }
     }
 }
@@ -209,6 +224,8 @@ struct Element {
     /// half length -- which otherwise permanently shifts every sample after
     /// it out of alignment with a reference that stayed at full rate.
     last_data: Option<SbrData>,
+    /// Header of the previous applied frame: a change is the spec's reset.
+    last_header: Option<crate::sbr_payload::SbrHeader>,
 }
 
 /// Every configured SBR element in a stream, keyed by
@@ -240,6 +257,7 @@ impl SbrChain {
             parser: SbrParser::new(self.rate),
             channels: Vec::new(),
             last_data: None,
+            last_header: None,
         });
         let data = elem.parser.parse(r, is_cpe).ok()?;
         let n_q = elem.parser.tables().map(|t| t.n_q).unwrap_or(1);
@@ -294,6 +312,8 @@ impl SbrChain {
         let Some(tables) = elem.parser.tables().cloned() else {
             return;
         };
+        let reset = elem.last_header.as_ref() != elem.parser.header();
+        elem.last_header = elem.parser.header().cloned();
         let Some(header) = elem.parser.header().cloned() else {
             return;
         };
@@ -411,7 +431,7 @@ impl SbrChain {
             if qmfdump_on {
                 qmfdump_energies("analysis", 0, &low_cur);
             }
-            let mut hf = sbr_hf::generate(
+            let hf = sbr_hf::generate(
                 &low_cur,
                 &tables,
                 &sbr_ch.invf_mode,
@@ -430,25 +450,64 @@ impl SbrChain {
                 t_noise: sbr_ch.t_noise.iter().map(|&t| t * RATE).collect(),
                 ..sbr_ch.clone()
             };
-            // Same deterministic `build_patches(&tables)` call `generate`
-            // makes internally -- cheap to recompute here so the limiter
-            // band table (patch boundaries + f_low, Sec 4.6.18.7.2) can be
-            // built without threading patches out of `generate`'s signature.
             let limiter_table = sbr_hf::limiter_band_table(
                 &tables,
                 &sbr_hf::build_patches(&tables),
                 header.limiter_bands,
             );
+            // Envelope slot i is raw slot i - HF_ADJ: prepend the previous
+            // frame's raw HF tail so the grid (up to 2*t_E(L_E) <= 38) lines
+            // up with the content it was measured on (§4.6.18.7.6).
+            let m_max = hf.len();
+            if state.hf_tail.len() != m_max || reset {
+                state.hf_tail = vec![vec![Complex::ZERO; HF_ADJ]; m_max];
+                state.y_carry.clear();
+            }
+            let mut xh: Vec<Vec<Complex<f64>>> = (0..m_max)
+                .map(|m| {
+                    let mut v = state.hf_tail[m].clone();
+                    v.extend_from_slice(&hf[m]);
+                    v
+                })
+                .collect();
+            for m in 0..m_max {
+                state.hf_tail[m] = hf[m][num_slots.saturating_sub(HF_ADJ)..].to_vec();
+            }
             sbr_env::adjust(
-                &mut hf,
+                &mut xh,
                 &tables,
                 &header,
                 &scaled,
                 &env_energy,
                 &noise_energy,
-                &mut state.noise,
                 &limiter_table,
+                &mut state.adj,
+                reset,
             );
+            // Output slot i: low band from the delayed raw analysis, HF from
+            // the previous frame's carried-over adjusted slots first, then
+            // this frame's; slots past the frame end are carried forward.
+            let i_temp = state.y_carry.first().map(Vec::len).unwrap_or(0).min(num_slots);
+            let t_end = (scaled.t_env.last().copied().unwrap_or(0).max(0) as usize).min(xh[0].len());
+            let mut hf: Vec<Vec<Complex<f64>>> = vec![vec![Complex::ZERO; num_slots]; m_max];
+            for m in 0..m_max {
+                for i in 0..i_temp {
+                    hf[m][i] = state.y_carry[m][i];
+                }
+                for i in i_temp..num_slots {
+                    hf[m][i] = xh[m][i];
+                }
+            }
+            state.y_carry = (0..m_max)
+                .map(|m| xh[m][num_slots.min(t_end)..t_end].to_vec())
+                .collect();
+            let raw: Vec<[Complex<f64>; ANALYSIS_BANDS]> = {
+                let mut d = state.low_tail.clone();
+                d.extend_from_slice(&raw);
+                state.low_tail = d[d.len() - HF_ADJ..].to_vec();
+                d.truncate(num_slots);
+                d
+            };
             if qmfdump_on {
                 qmfdump_energies("post_adjust", tables.kx as usize, &hf);
             }
@@ -468,7 +527,10 @@ impl SbrChain {
                 }
                 let mut pcm = state.synthesis.process_slot(&v);
                 for s in &mut pcm {
-                    *s *= crate::decode::OUTPUT_SCALE;
+                    // The spec 32-analysis/64-synthesis pair (4.6.18.4.1 +
+                    // 4.6.18.8.2, literal equations) reads back at half the
+                    // core's amplitude; the 2x is the upsampler's gain.
+                    *s *= 2.0 * crate::decode::OUTPUT_SCALE;
                 }
                 out.extend_from_slice(&pcm);
             }
@@ -528,6 +590,8 @@ mod tests {
             add_harmonic: None,
             df_env: vec![],
             df_noise: vec![],
+            l_a: -1,
+            amp_res: 1,
         }
     }
 
@@ -551,6 +615,7 @@ mod tests {
                 parser: SbrParser::new(44100),
                 channels: vec![ChannelState::new(n_q, 1), ChannelState::new(n_q, 2)],
                 last_data: None,
+            last_header: None,
             },
         );
         chain
@@ -650,6 +715,7 @@ mod tests {
                         .map(|i| ChannelState::new(n_q, 10 + i as u32))
                         .collect(),
                     last_data: None,
+            last_header: None,
                 },
             );
             chain
@@ -694,6 +760,7 @@ mod tests {
                 parser: SbrParser::new(44100),
                 channels: vec![ChannelState::new(n_q, 10)],
                 last_data: None,
+            last_header: None,
             },
         );
         reference
