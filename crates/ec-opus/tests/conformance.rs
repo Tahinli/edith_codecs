@@ -912,6 +912,15 @@ fn encoder_mode_follows_application_and_bitrate() {
         }
         assert!(n > 1, "{app:?} at {bps} bps: empty packet");
     }
+
+    let mut enc = Encoder::new(48000, 1, Application::Voip).unwrap();
+    enc.set_mode(Some(ec_opus::Mode::Silk));
+    enc.set_bandwidth(Some(Bandwidth::Medium));
+    let pcm = vec![0.0f32; 480];
+    let mut out = vec![0u8; 1500];
+    let n = enc.encode_float(&pcm, 480, &mut out).unwrap();
+    assert_eq!(ec_opus::Toc::new(out[0]).config, 4, "forced 10 ms MB SILK");
+    assert!(n > 1, "forced 10 ms MB SILK empty packet");
 }
 
 /// All four CELT frame sizes survive the loop, and constrained VBR both
@@ -1045,7 +1054,14 @@ fn oracle_decodes_our_packets_across_the_rate_table() {
             enc.set_bitrate(kbps * 1000);
             let packets = encode_packets(&mut enc, &pcm, channels);
             let path = temp_path(&format!("{channels}ch-{kbps}k.opus"));
-            write_ogg_opus(&path, &packets, opus_head(channels, 120, None), channels, total, 120);
+            write_ogg_opus(
+                &path,
+                &packets,
+                opus_head(channels, 120, None),
+                channels,
+                total,
+                120,
+            );
             let Some(reference) = ffmpeg_decode(&path, channels) else {
                 eprintln!("ffmpeg unavailable, skipped");
                 let _ = fs::remove_file(&path);
@@ -1530,7 +1546,11 @@ fn lowpass(x: &[f32], cutoff_hz: f64) -> Vec<f32> {
     let h: Vec<f64> = (0..taps)
         .map(|i| {
             let m = i as f64 - (taps - 1) as f64 / 2.0;
-            let sinc = if m == 0.0 { 2.0 * c } else { (2.0 * std::f64::consts::PI * c * m).sin() / (std::f64::consts::PI * m) };
+            let sinc = if m == 0.0 {
+                2.0 * c
+            } else {
+                (2.0 * std::f64::consts::PI * c * m).sin() / (std::f64::consts::PI * m)
+            };
             sinc * (0.54 - 0.46 * (2.0 * std::f64::consts::PI * i as f64 / (taps - 1) as f64).cos())
         })
         .collect();
@@ -1541,7 +1561,11 @@ fn lowpass(x: &[f32], cutoff_hz: f64) -> Vec<f32> {
                 .enumerate()
                 .map(|(k, &hk)| {
                     let idx = n as isize + half as isize - k as isize;
-                    if idx >= 0 && (idx as usize) < x.len() { hk * x[idx as usize] as f64 } else { 0.0 }
+                    if idx >= 0 && (idx as usize) < x.len() {
+                        hk * x[idx as usize] as f64
+                    } else {
+                        0.0
+                    }
                 })
                 .sum::<f64>() as f32
         })
@@ -1551,7 +1575,11 @@ fn lowpass(x: &[f32], cutoff_hz: f64) -> Vec<f32> {
 /// Encodes `pcm` NB or WB, decodes each packet with our decoder asserting the
 /// range-coder invariant, returns (decoded 48 kHz, packets, voiced frames,
 /// encoder delay).
-fn silk_roundtrip(pcm: &[f32], wideband: bool, bitrate: Option<u32>) -> (Vec<f32>, Vec<Vec<u8>>, usize, usize) {
+fn silk_roundtrip(
+    pcm: &[f32],
+    wideband: bool,
+    bitrate: Option<u32>,
+) -> (Vec<f32>, Vec<Vec<u8>>, usize, usize) {
     let mut enc = SilkEncoder::new(wideband);
     if let Some(bps) = bitrate {
         enc.set_bitrate(bps);
@@ -1565,13 +1593,47 @@ fn silk_roundtrip(pcm: &[f32], wideband: bool, bitrate: Option<u32>) -> (Vec<f32
     padded.resize(pcm.len().div_ceil(960) * 960 + 960, 0.0);
     for block in padded.chunks(960) {
         let len = enc.encode_frame(block, &mut out).expect("silk encode");
-        let n = dec.decode_float(&out[..len], &mut buf).expect("silk decode");
+        let n = dec
+            .decode_float(&out[..len], &mut buf)
+            .expect("silk decode");
         assert_eq!(n, 960);
         assert_eq!(dec.final_range(), enc.final_range(), "range state diverged");
         decoded.extend_from_slice(&buf[..n]);
         packets.push(out[..len].to_vec());
     }
     (decoded, packets, enc.voiced_frames(), enc.delay_samples())
+}
+
+fn silk_roundtrip_ms(
+    mut enc: SilkEncoder,
+    pcm: &[f32],
+    frame_ms: usize,
+    bitrate: Option<u32>,
+) -> (Vec<f32>, Vec<Vec<u8>>, usize) {
+    if let Some(bps) = bitrate {
+        enc.set_bitrate(bps);
+    }
+    let frame = 48 * frame_ms;
+    let mut dec = Decoder::new(48000, 1).unwrap();
+    let mut out = vec![0u8; 1500];
+    let mut buf = vec![0f32; 5760];
+    let mut decoded = Vec::new();
+    let mut packets = Vec::new();
+    let mut padded = pcm.to_vec();
+    padded.resize(pcm.len().div_ceil(frame) * frame + frame, 0.0);
+    for block in padded.chunks(frame) {
+        let len = enc
+            .encode_frame_ms(block, &mut out, frame_ms)
+            .expect("silk encode");
+        let n = dec
+            .decode_float(&out[..len], &mut buf)
+            .expect("silk decode");
+        assert_eq!(n, frame);
+        assert_eq!(dec.final_range(), enc.final_range(), "range state diverged");
+        decoded.extend_from_slice(&buf[..n]);
+        packets.push(out[..len].to_vec());
+    }
+    (decoded, packets, enc.voiced_frames())
 }
 
 /// Correlation after aligning `decoded` to `reference` at the best lag in
@@ -1612,7 +1674,10 @@ fn silk_mono_nb_wb_roundtrip() {
                 bytes * 8 / (packets.len() * 20)
             );
             assert!(corr >= 0.8, "{name} {tag}: corr {corr:.4}");
-            assert!(lag >= delay, "{name} {tag}: aligned before the documented delay");
+            assert!(
+                lag >= delay,
+                "{name} {tag}: aligned before the documented delay"
+            );
             if *name == "synthetic" {
                 assert!(voiced > 0, "{name} {tag}: no frame coded with LTP");
             }
@@ -1628,10 +1693,91 @@ fn silk_mono_nb_wb_roundtrip() {
                     .output()
                     .unwrap();
                 let stderr = String::from_utf8_lossy(&out.stderr);
-                assert!(out.status.success() && stderr.trim().is_empty(), "{name} {tag}: ffmpeg: {stderr}");
+                assert!(
+                    out.status.success() && stderr.trim().is_empty(),
+                    "{name} {tag}: ffmpeg: {stderr}"
+                );
                 let _ = fs::remove_file(&path);
             }
         }
+    }
+}
+
+#[test]
+fn silk_mediumband_and_10ms_roundtrip() {
+    let pcm = speech_like();
+    for (tag, fs_khz, frame_ms, config, cutoff, bps) in [
+        ("NB10", 8usize, 10usize, 0u8, 3500.0, 12_000u32),
+        ("MB10", 12, 10, 4, 5500.0, 16_000),
+        ("WB10", 16, 10, 8, 7000.0, 20_000),
+        ("MB20", 12, 20, 5, 5500.0, 16_000),
+    ] {
+        let enc = match fs_khz {
+            8 => SilkEncoder::new(false),
+            12 => SilkEncoder::new_mediumband(),
+            _ => SilkEncoder::new(true),
+        };
+        let (decoded, packets, voiced) = silk_roundtrip_ms(enc, &pcm, frame_ms, Some(bps));
+        assert_eq!(packets[0][0] >> 3, config, "{tag}: wrong TOC config");
+        let reference = lowpass(&pcm, cutoff);
+        let (corr, lag) = aligned_corr(&reference, &decoded, 2000);
+        let bytes: usize = packets.iter().map(Vec::len).sum();
+        let kbps = bytes as f64 * 8.0 / (packets.len() as f64 * frame_ms as f64);
+        eprintln!(
+            "silk {tag}: corr {corr:.4} at lag {lag}, voiced {voiced}/{} frames, {kbps:.2} kbps",
+            packets.len()
+        );
+        assert!(corr >= 0.75, "{tag}: corr {corr:.4}");
+        assert!(
+            frame_ms == 10 || voiced > 0,
+            "{tag}: no frame coded with LTP"
+        );
+        if let Some(oracle) = oracle_decode(&format!("silk-{tag}"), &packets, pcm.len()) {
+            let (c, _) = aligned_corr(&oracle, &decoded, 2000);
+            assert!(c >= 0.99, "{tag}: our decode vs oracle decode corr {c:.4}");
+        }
+    }
+}
+
+#[test]
+fn silk_compares_to_celt_on_speech_at_speech_rates() {
+    let pcm = speech_like();
+    for (tag, silk, bandwidth, bps, cutoff) in [
+        (
+            "NB16",
+            SilkEncoder::new(false),
+            Bandwidth::Narrow,
+            16_000u32,
+            3500.0,
+        ),
+        (
+            "WB24",
+            SilkEncoder::new(true),
+            Bandwidth::Wide,
+            24_000u32,
+            7000.0,
+        ),
+    ] {
+        let reference = lowpass(&pcm, cutoff);
+        let (silk_decoded, silk_packets, _) = silk_roundtrip_ms(silk, &pcm, 20, Some(bps));
+        let (silk_corr, silk_lag) = aligned_corr(&reference, &silk_decoded, 2000);
+        let mut celt = Encoder::new(48000, 1, Application::Audio).unwrap();
+        celt.set_mode(Some(ec_opus::Mode::Celt));
+        celt.set_bandwidth(Some(bandwidth));
+        celt.set_bitrate(bps);
+        let (celt_decoded, celt_bytes) = roundtrip_own(&mut celt, &pcm, 1, 960);
+        let (celt_corr, celt_lag) = aligned_corr(&reference, &celt_decoded, 2000);
+        let silk_bytes: usize = silk_packets.iter().map(Vec::len).sum();
+        let silk_kbps = silk_bytes as f64 * 8.0 / (silk_packets.len() as f64 * 20.0);
+        let celt_kbps = celt_bytes as f64 * 8.0 / 1000.0;
+        eprintln!(
+            "speech {tag}: SILK corr {silk_corr:.4} lag {silk_lag} {silk_kbps:.2} kbps; CELT corr {celt_corr:.4} lag {celt_lag} {celt_kbps:.2} kbps"
+        );
+        assert!(silk_corr >= 0.95, "{tag}: SILK corr {silk_corr:.4}");
+        assert!(
+            silk_corr + 0.01 >= celt_corr,
+            "{tag}: SILK {silk_corr:.4} trails CELT {celt_corr:.4} by >0.01"
+        );
     }
 }
 
@@ -1649,7 +1795,10 @@ fn oracle_decode(name: &str, packets: &[Vec<u8>], samples: usize) -> Option<Vec<
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success() && stderr.trim().is_empty(), "{name}: ffmpeg: {stderr}");
+    assert!(
+        out.status.success() && stderr.trim().is_empty(),
+        "{name}: ffmpeg: {stderr}"
+    );
     let decoded = ffmpeg_decode(&path, 1);
     let _ = fs::remove_file(&path);
     decoded
@@ -1681,7 +1830,9 @@ fn silk_nsq_improves_quality_at_equal_rate() {
         // at ~0.96 at this rate; its pulse-train part alone reaches 0.992.
         let floor = if *name == "synthetic" { 0.96 } else { 0.99 };
         if corr < floor || kbps > 16.0 * 1.2 {
-            failures.push(format!("{name}: corr {corr:.4} (floor {floor}) at {kbps:.1} kbps"));
+            failures.push(format!(
+                "{name}: corr {corr:.4} (floor {floor}) at {kbps:.1} kbps"
+            ));
         }
         if let Some(oracle) = oracle_decode(&format!("silk-nsq-{name}"), &packets, pcm.len()) {
             let (c, _) = aligned_corr(&oracle, &decoded, 2000);
@@ -1697,15 +1848,21 @@ fn silk_rate_control_tracks_target() {
     for (name, pcm) in &silk_sources() {
         for wideband in [false, true] {
             for kbps_target in [8u32, 12, 16, 24] {
-                let (decoded, packets, _, _) = silk_roundtrip(pcm, wideband, Some(kbps_target * 1000));
+                let (decoded, packets, _, _) =
+                    silk_roundtrip(pcm, wideband, Some(kbps_target * 1000));
                 let bytes: usize = packets.iter().map(Vec::len).sum();
                 let kbps = bytes as f64 * 8.0 / (packets.len() as f64 * 20.0);
                 let reference = lowpass(pcm, if wideband { 7000.0 } else { 3500.0 });
                 let (corr, _) = aligned_corr(&reference, &decoded, 2000);
                 let tag = if wideband { "WB" } else { "NB" };
-                eprintln!("silk rate {name} {tag} target {kbps_target}: {kbps:.2} kbps, corr {corr:.4}");
+                eprintln!(
+                    "silk rate {name} {tag} target {kbps_target}: {kbps:.2} kbps, corr {corr:.4}"
+                );
                 let ratio = kbps / kbps_target as f64;
-                assert!((0.8..=1.2).contains(&ratio), "{name} {tag} target {kbps_target}: got {kbps:.2} kbps");
+                assert!(
+                    (0.8..=1.2).contains(&ratio),
+                    "{name} {tag} target {kbps_target}: got {kbps:.2} kbps"
+                );
             }
         }
     }
@@ -1725,7 +1882,10 @@ fn silk_packets_track_encoder_bitrate() {
         let kbps = bytes as f64 * 8.0 / (packets.len() as f64 * 20.0);
         eprintln!("encoder bitrate target {kbps_target}: {kbps:.2} kbps");
         let ratio = kbps / kbps_target as f64;
-        assert!((0.8..=1.2).contains(&ratio), "target {kbps_target}: got {kbps:.2} kbps");
+        assert!(
+            (0.8..=1.2).contains(&ratio),
+            "target {kbps_target}: got {kbps:.2} kbps"
+        );
     }
 }
 
@@ -1735,7 +1895,12 @@ fn silk_packets_track_encoder_bitrate() {
 /// Encodes mono `pcm` as hybrid packets at `bps` and decodes them with our
 /// decoder, `mute` = (celt, silk) layers dropped at the decoder; asserts
 /// range-state parity packet for packet. Returns (decoded, packets).
-fn hybrid_roundtrip(pcm: &[f32], bps: u32, bandwidth: Option<Bandwidth>, mute: (bool, bool)) -> (Vec<f32>, Vec<Vec<u8>>) {
+fn hybrid_roundtrip(
+    pcm: &[f32],
+    bps: u32,
+    bandwidth: Option<Bandwidth>,
+    mute: (bool, bool),
+) -> (Vec<f32>, Vec<Vec<u8>>) {
     let mut enc = Encoder::new(48000, 1, Application::Voip).unwrap();
     enc.set_bitrate(bps);
     enc.set_bandwidth(bandwidth);
@@ -1747,8 +1912,12 @@ fn hybrid_roundtrip(pcm: &[f32], bps: u32, bandwidth: Option<Bandwidth>, mute: (
     let mut padded = pcm.to_vec();
     padded.resize(pcm.len().div_ceil(960) * 960 + 960, 0.0);
     for block in padded.chunks(960) {
-        let len = enc.encode_float(block, 960, &mut out).expect("hybrid encode");
-        let n = dec.decode_float(&out[..len], &mut buf).expect("hybrid decode");
+        let len = enc
+            .encode_float(block, 960, &mut out)
+            .expect("hybrid encode");
+        let n = dec
+            .decode_float(&out[..len], &mut buf)
+            .expect("hybrid decode");
         assert_eq!(n, 960);
         assert_eq!(dec.final_range(), enc.final_range(), "range state diverged");
         decoded.extend_from_slice(&buf[..n]);
@@ -1767,18 +1936,28 @@ fn hybrid_layers_align() {
     let at = 960 * 10 + 300;
     click[at] = 0.9;
     let peak = |x: &[f32]| {
-        x.iter().enumerate().max_by(|a, b| a.1.abs().partial_cmp(&b.1.abs()).unwrap()).unwrap().0
+        x.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.abs().partial_cmp(&b.1.abs()).unwrap())
+            .unwrap()
+            .0
     };
     let (lb, _) = hybrid_roundtrip(&click, 32_000, None, (true, false));
     let (hb, _) = hybrid_roundtrip(&click, 32_000, None, (false, true));
     let enc = Encoder::new(48000, 1, Application::Voip).unwrap();
     let (plb, phb) = (peak(&lb) as i64 - at as i64, peak(&hb) as i64 - at as i64);
-    eprintln!("hybrid click: LB peak +{plb}, HB peak +{phb}, look_ahead {}", {
-        let mut e = enc.clone();
-        e.set_bitrate(32_000);
-        e.look_ahead(960)
-    });
-    assert!((plb - phb).abs() <= 2, "layers misaligned: LB +{plb} vs HB +{phb}");
+    eprintln!(
+        "hybrid click: LB peak +{plb}, HB peak +{phb}, look_ahead {}",
+        {
+            let mut e = enc.clone();
+            e.set_bitrate(32_000);
+            e.look_ahead(960)
+        }
+    );
+    assert!(
+        (plb - phb).abs() <= 2,
+        "layers misaligned: LB +{plb} vs HB +{phb}"
+    );
     assert!((phb - 120).abs() <= 2, "HB peak +{phb}, look_ahead 120");
 }
 
@@ -1797,12 +1976,20 @@ fn hybrid_fb_roundtrip() {
         let (lb_corr, lb_lag) = aligned_corr(&lb_ref, &lb_only, 400);
         let bytes: usize = packets.iter().map(Vec::len).sum();
         let kbps = bytes as f64 * 8.0 / (packets.len() as f64 * 20.0);
-        eprintln!("hybrid FB {name}: corr {corr:.4} at lag {lag}, LB corr {lb_corr:.4} at lag {lb_lag}, {kbps:.1} kbps");
+        eprintln!(
+            "hybrid FB {name}: corr {corr:.4} at lag {lag}, LB corr {lb_corr:.4} at lag {lb_lag}, {kbps:.1} kbps"
+        );
         assert!(corr >= 0.95, "{name}: full-band corr {corr:.4}");
         // +-3: the wav16 fixture is a pure tone, whose phase moves the peak.
-        assert!((117..=123).contains(&lag), "{name}: aligned at lag {lag}, not the documented 120");
+        assert!(
+            (117..=123).contains(&lag),
+            "{name}: aligned at lag {lag}, not the documented 120"
+        );
         assert!(lb_corr >= 0.9, "{name}: low-band corr {lb_corr:.4}");
-        assert!((28.0..=36.0).contains(&kbps), "{name}: {kbps:.1} kbps for a 32 kbps CBR target");
+        assert!(
+            (28.0..=36.0).contains(&kbps),
+            "{name}: {kbps:.1} kbps for a 32 kbps CBR target"
+        );
         if let Some(oracle) = oracle_decode(&format!("hybrid-{name}"), &packets, pcm.len()) {
             let n = oracle.len().min(decoded.len() - 120);
             let c = correlation(&oracle[..n], &decoded[120..120 + n]);
@@ -1813,14 +2000,22 @@ fn hybrid_fb_roundtrip() {
     // SWB when asked for it, and the rest of the automatic hybrid range
     // (SILK's share leaves CELT least at the bottom of it).
     let speech = speech_like();
-    let (_, packets) = hybrid_roundtrip(&speech, 24_000, Some(Bandwidth::SuperWide), (false, false));
+    let (_, packets) =
+        hybrid_roundtrip(&speech, 24_000, Some(Bandwidth::SuperWide), (false, false));
     assert_eq!(ec_opus::Toc::new(packets[0][0]).config, 13);
     for bps in [20_000u32, 24_000, 39_000] {
         let (decoded, packets) = hybrid_roundtrip(&speech, bps, None, (false, false));
         let (corr, _) = aligned_corr(&speech, &decoded, 400);
-        let kbps = packets.iter().map(Vec::len).sum::<usize>() as f64 * 8.0 / (packets.len() as f64 * 20.0);
-        eprintln!("hybrid {bps}: config {}, corr {corr:.4}, {kbps:.1} kbps", ec_opus::Toc::new(packets[0][0]).config);
+        let kbps = packets.iter().map(Vec::len).sum::<usize>() as f64 * 8.0
+            / (packets.len() as f64 * 20.0);
+        eprintln!(
+            "hybrid {bps}: config {}, corr {corr:.4}, {kbps:.1} kbps",
+            ec_opus::Toc::new(packets[0][0]).config
+        );
         assert!(corr >= 0.9, "hybrid at {bps}: corr {corr:.4}");
-        assert!(kbps <= bps as f64 / 1000.0 + 3.0, "hybrid at {bps}: {kbps:.1} kbps");
+        assert!(
+            kbps <= bps as f64 / 1000.0 + 3.0,
+            "hybrid at {bps}: {kbps:.1} kbps"
+        );
     }
 }
