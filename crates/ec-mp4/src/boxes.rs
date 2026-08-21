@@ -179,9 +179,10 @@ impl<R: Read + Seek> Src<R> {
         Ok(out)
     }
 
-    /// The header of the box at `at`: its type, where its body starts and where
-    /// it ends. `None` once `at` reaches `end`.
-    pub fn header_at(&mut self, at: u64, end: u64) -> Result<Option<(FourCc, u64, u64)>> {
+    /// The header of the box at `at`: its type, where its body starts, where
+    /// the readable bytes end, and whether the stated size fits inside `end`.
+    /// `None` once `at` reaches `end` or a final header is cut off by EOF.
+    pub fn header_at(&mut self, at: u64, end: u64) -> Result<Option<(FourCc, u64, u64, bool)>> {
         if at.saturating_add(8) > end {
             return Ok(None);
         }
@@ -196,7 +197,7 @@ impl<R: Read + Seek> Src<R> {
         let mut head_len = 8u64;
         if size == 1 {
             if got < 16 {
-                return Err(Error::corrupt("mp4: 64-bit box size past the end of file"));
+                return Ok(None);
             }
             size = u64::from_be_bytes(head[8..16].try_into().unwrap());
             head_len = 16;
@@ -209,9 +210,11 @@ impl<R: Read + Seek> Src<R> {
                 "mp4: box '{name}' is {size} bytes, shorter than its own header"
             )));
         }
-        let body = at + head_len;
-        let stop = at.saturating_add(size).min(end);
-        Ok(Some((kind, body, stop)))
+        let body = at.saturating_add(head_len);
+        let full_stop = at.saturating_add(size);
+        let complete = full_stop <= end;
+        let stop = full_stop.min(end);
+        Ok(Some((kind, body, stop, complete)))
     }
 }
 
