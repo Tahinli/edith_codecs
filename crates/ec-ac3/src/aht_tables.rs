@@ -101,7 +101,7 @@ const VQ4_PRINTED: [[i16; 6]; 32] = [
 /// Table E4.4's index column is offset by one against its value rows: the
 /// vector an encoder selects with index `k` is the row the document prints at
 /// `k + 1`, and index 31 selects the all-zero vector, which the table does not
-/// print at all. Measured against ffmpeg's decode of a Dolby Digital Plus
+/// print at all. Measured against the oracle's decode of a Dolby Digital Plus
 /// stream — every one of the 32 indices occurs there, and with the printed
 /// mapping only `hebap == 4` bins diverge (0.63% of a channel's energy), while
 /// index 31 alone diverges by ten orders of magnitude. The other six tables

@@ -150,7 +150,7 @@ pub(crate) fn read_channel(
 fn idct6(x: &[f32; AHT_BLOCKS]) -> [f32; AHT_BLOCKS] {
     // cos(j(2m+1)pi/12) for j, m in 0..6, with the 1/sqrt(2) weight on j = 0
     // folded in. The leading factor is sqrt(2), not the 2 the standard's
-    // printed equation shows: measured against ffmpeg's decode of a real DDP
+    // printed equation shows: measured against the oracle's decode of a real DDP
     // stream, a factor of 2 makes every AHT channel exactly sqrt(2) too loud
     // (per-frame RMS ratio 1.4142 across 3 649 frames). The radical is lost in
     // the published equation's typesetting.

@@ -83,7 +83,7 @@ pub mod audio {
         pub const CODEC_ID_FLAC: AudioCodecId = AudioCodecId(0x1003);
         /// MPEG-1/2 Layer III.
         pub const CODEC_ID_MP3: AudioCodecId = AudioCodecId(0x1004);
-        /// Apple Lossless.
+        /// ALAC.
         pub const CODEC_ID_ALAC: AudioCodecId = AudioCodecId(0x1005);
         /// Dolby AC-3.
         pub const CODEC_ID_AC3: AudioCodecId = AudioCodecId(0x1006);

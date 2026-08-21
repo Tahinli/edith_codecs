@@ -1,4 +1,4 @@
-//! Apple Lossless (ALAC) decoding for the edith_codecs family.
+//! ALAC (ALAC) decoding for the edith_codecs family.
 //!
 //! Two ways in:
 //!
@@ -15,9 +15,9 @@
 //! - [`AlacEncoder`], the mirror image: frames in, coded packets out, for a
 //!   container that wants to write ALAC instead of read it.
 //!
-//! **Clean room.** Written from the published ALAC format description; Apple's
+//! **Clean room.** Written from the published ALAC format description; the reference
 //! decoder sources were not read. Samples are returned shifted into their PCM
-//! container the way ffmpeg's decoder returns them (16-bit as `s16`, 24-bit as
+//! container the way the oracle's decoder returns them (16-bit as `s16`, 24-bit as
 //! `s32` with the low 8 bits zero), so raw output compares byte for byte.
 
 #![forbid(unsafe_code)]
@@ -38,7 +38,7 @@ use ec_core::registry::{AudioParameters, CodecId, CodecParameters, Decoder, Medi
 /// in Matroska.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MagicCookie {
-    /// Samples per channel in a full frame (4096 from Apple's encoder). A
+    /// Samples per channel in a full frame (4096 from the reference encoder). A
     /// stream's last frame states its own shorter length.
     pub frame_length: u32,
     /// Bitstream version the file is compatible with; 0 is the only one.
@@ -68,7 +68,7 @@ impl MagicCookie {
     ///
     /// Accepts the three shapes those bytes arrive in: the bare 24-byte config,
     /// the config behind a four-byte version/flags word, and the whole `alac`
-    /// box with its size and type in front (which is what ffmpeg and this
+    /// box with its size and type in front (which is what the oracle and this
     /// family's own mp4 demuxer hand over).
     pub fn parse(data: &[u8]) -> Result<MagicCookie> {
         let at = match data {
@@ -314,7 +314,7 @@ pub fn codec_parameters(cookie: &MagicCookie) -> CodecParameters {
 mod tests {
     use super::*;
 
-    /// ffmpeg's 36-byte `alac` box, a bare 24-byte config and the 28-byte form
+    /// the oracle's 36-byte `alac` box, a bare 24-byte config and the 28-byte form
     /// in between all describe the same stream.
     #[test]
     fn a_magic_cookie_is_read_in_every_shape_a_container_states_it() {

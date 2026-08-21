@@ -650,7 +650,6 @@ impl SbrParser {
         let mut channels = Vec::with_capacity(n_channels);
         for ch in 0..n_channels {
             let balance = is_cpe && coupling && ch == 1;
-            let num_env = grids[ch].num_env;
             let amp_res = amp_res_of(header.amp_res, &grids[ch]);
             let e_q = e_q_all[ch].clone();
             let q_q = q_q_all[ch].clone();

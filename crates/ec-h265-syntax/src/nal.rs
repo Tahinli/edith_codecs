@@ -198,7 +198,7 @@ pub fn unescape_rbsp(payload: &[u8]) -> Vec<u8> {
 /// Append one Annex-B NAL unit: start code, header, escaped RBSP.
 ///
 /// The four-byte start code is used for parameter sets and the first slice of a
-/// picture, three bytes elsewhere — the same shape ffmpeg writes, and what a
+/// picture, three bytes elsewhere — the same shape the oracle writes, and what a
 /// caller splitting an access unit back apart expects.
 pub fn write_annex_b(out: &mut Vec<u8>, header: NalHeader, rbsp: &[u8], long_start_code: bool) {
     if long_start_code {

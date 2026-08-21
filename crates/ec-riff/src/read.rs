@@ -125,7 +125,7 @@ impl<R: Read> WavReader<R> {
     /// Read every sample as `f32`, interleaved.
     ///
     /// Float files pass through untouched; integer files are normalised by
-    /// `2^(bits-1)` — the same scaling ffmpeg's `pcm_f32le` conversion applies,
+    /// `2^(bits-1)` — the same scaling the oracle's `pcm_f32le` conversion applies,
     /// so the two outputs are comparable sample for sample.
     pub fn read_all_f32(&mut self) -> Result<Vec<f32>> {
         if self.spec.sample_format == SampleType::Float {

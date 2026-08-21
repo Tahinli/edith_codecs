@@ -48,8 +48,8 @@ const HEAD: usize = 64 << 10;
 /// Packets a seek may look past to find one of the stream it was asked about.
 const SEEK_LOOKAHEAD: usize = 64;
 /// Samples of synthesis delay every Layer III decoder carries, on top of
-/// whatever delay the encoder wrote into the LAME tag. The number is the format
-/// 's, not this implementation's: a LAME tag is written to be read with it.
+/// whatever delay the encoder wrote into the gapless tag. The number is the format
+/// 's, not this implementation's: a gapless tag is written to be read with it.
 const MP3_DECODER_DELAY: u32 = 529;
 
 /// A container (or the lack of one) this crate can open.
@@ -554,17 +554,17 @@ fn open_mp3<R: Read + Seek + Send + 'static>(mut src: R, head: &[u8], end: u64) 
     let mut start = start + at as u64;
     let audio_end = end.saturating_sub(id3v1_len(&mut src, end)?);
     // A Xing/Info header states the frame count exactly; without one the
-    // duration is the bitrate estimate ffmpeg also falls back to, which is
+    // duration is the bitrate estimate the oracle also falls back to, which is
     // right for CBR and approximate for VBR.
     let per_frame = header.samples_per_frame() as u64;
     let xing = xing_frames(&window[at..], &header);
     if xing.is_some() {
         // The Xing frame carries no audio — it is a header wearing a frame's
         // clothes, and a decoder handed it emits a granule of silence. Both
-        // ffmpeg and this reader start after it.
+        // the oracle and this reader start after it.
         start += header.frame_len().unwrap_or(0) as u64;
     }
-    // Gapless, as the LAME tag states it: a decoder emits the encoder delay
+    // Gapless, as the gapless tag states it: a decoder emits the encoder delay
     // plus its own 529 samples of Layer III synthesis delay before the first
     // sample that was ever recorded, and the file runs `padding` samples past
     // the last one. Both are silence a player must not play, and a file with no
@@ -607,7 +607,7 @@ fn open_adts<R: Read + Seek + Send + 'static>(mut src: R, head: &[u8], end: u64)
     let audio_end = end.saturating_sub(id3v1_len(&mut src, end)?);
     // ADTS states no duration anywhere: every frame is 1024 samples, so the
     // file's size over its *average* frame is the estimate — the same one
-    // ffmpeg prints "estimating duration from bitrate" about. Averaged rather
+    // the oracle prints "estimating duration from bitrate" about. Averaged rather
     // than taken off the first frame, which on a real encode is nothing like
     // the mean (a 3-second fixture came out 5 seconds long that way).
     let (mut sum, mut count, mut walk) = (0u64, 0u64, at);
@@ -683,14 +683,14 @@ fn xing_frames(frame: &[u8], header: &ec_mp3::FrameHeader) -> Option<Xing> {
     }
     let n = frame.get(at + 8..at + 12)?;
     let frames = u64::from(u32::from_be_bytes([n[0], n[1], n[2], n[3]]));
-    // The LAME extension sits behind whichever optional fields the flags
+    // The gapless extension sits behind whichever optional fields the flags
     // claimed -- frame count, byte count, the 100-byte seek table, quality --
     // and states the two trims 21 bytes into itself, twelve bits each.
-    let mut lame = at + 12;
-    lame += usize::from(flags & 2 != 0) * 4;
-    lame += usize::from(flags & 4 != 0) * 100;
-    lame += usize::from(flags & 8 != 0) * 4;
-    let (delay, padding) = match frame.get(lame + 21..lame + 24) {
+    let mut extension_at = at + 12;
+    extension_at += usize::from(flags & 2 != 0) * 4;
+    extension_at += usize::from(flags & 4 != 0) * 100;
+    extension_at += usize::from(flags & 8 != 0) * 4;
+    let (delay, padding) = match frame.get(extension_at + 21..extension_at + 24) {
         Some(&[a, b, c]) => (
             u32::from(a) << 4 | u32::from(b) >> 4,
             (u32::from(b) & 0xF) << 8 | u32::from(c),
