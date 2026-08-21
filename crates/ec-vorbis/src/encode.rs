@@ -81,7 +81,7 @@ const CLASS_RANGE: [i32; CLASSES] = [0, 1, 2, 4, 8, 16, 32, 64, 127];
 const RESIDUE_BOOK_DIM: [usize; CLASSES] = [0, 4, 2, 2, 1, 1, 1, 1, 1];
 /// The vector books save packet bits but add setup and make the rate loop spend
 /// harder; this keeps the realised rate at the caller's target.
-const RATE_TARGET_SCALE: f64 = 0.96;
+const RATE_TARGET_SCALE: f64 = 0.97;
 /// Headroom in dB the widest residue book can actually state: 20 log10 127
 /// is 42, but a coupled angle channel is a difference of two magnitudes, so a
 /// pair's step must leave half that range — 63, 36 dB. Past this the rate loop's extra headroom lowers the absolute-threshold
@@ -106,6 +106,9 @@ const CO_MASK_RANGE: f64 = 50.0;
 /// rate/quality knob: raising the curve zeroes masked coefficients earlier,
 /// while peaks still ride as residue above it.
 const MASKING_OFFSET_DB: f64 = 9.0;
+/// All-zero partition guard: if the masked band still has a bin within this
+/// fraction of the floor, keep that bin as one sign-only residue sample.
+const NOISE_NORMALISE_MIN_RATIO: f32 = 0.5;
 /// A short block gets no co-masking cap: a bin it drops is an error spread
 /// across its whole window, the half before an onset included, and that is
 /// the pre-echo the short block exists to prevent (44.1k mono, onset on the
@@ -699,6 +702,30 @@ impl VorbisEncoder {
                         .collect::<Vec<i32>>()
                 })
                 .collect();
+            for channel in 0..channels {
+                for (band, values) in quantised[channel].chunks_mut(partition).enumerate() {
+                    if values.iter().any(|&value| value != 0) {
+                        continue;
+                    }
+                    let start = band * partition;
+                    let end = (start + values.len()).min(half);
+                    let mut peak = (NOISE_NORMALISE_MIN_RATIO, 0usize, 0i32);
+                    for bin in start..end {
+                        let floor = curves[channel][bin];
+                        if floor <= 0.0 {
+                            continue;
+                        }
+                        let value = spectra[channel][bin];
+                        let ratio = value.abs() / floor;
+                        if ratio > peak.0 {
+                            peak = (ratio, bin - start, value.signum() as i32);
+                        }
+                    }
+                    if peak.2 != 0 {
+                        values[peak.1] = peak.2;
+                    }
+                }
+            }
             for &(magnitude, angle) in &self.coupling {
                 let mut left = std::mem::take(&mut quantised[magnitude]);
                 let mut right = std::mem::take(&mut quantised[angle]);
