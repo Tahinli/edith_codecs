@@ -379,6 +379,7 @@ fn avi_idx1_seek_lands_on_indexed_audio_chunk() {
     let avi = avi_seek_fixture(false);
     let mut reader = AviReader::new(Cursor::new(&avi)).expect("AVI opens");
     assert!(reader.has_index());
+    assert_eq!(reader.indexed_point(0, 1, true).unwrap().time, 1);
     assert_eq!(reader.seek_to_stream_time(0, 2, false).unwrap(), 1);
     assert_eq!(reader.next_packet().unwrap().data, [2, 2]);
     assert_eq!(reader.seek_to_stream_time(0, 2, true).unwrap(), 3);
