@@ -671,6 +671,7 @@ struct AviDemuxer<R> {
     stream_numbers: Vec<u32>,
     samples: Vec<u64>,
     pending: VecDeque<Packet>,
+    carry: Vec<Vec<u8>>,
 }
 
 impl<R: Read + Seek> AviDemuxer<R> {
@@ -716,12 +717,14 @@ impl<R: Read + Seek> AviDemuxer<R> {
             ));
         }
         let samples = vec![0; streams.len()];
+        let carry = vec![Vec::new(); streams.len()];
         Ok(AviDemuxer {
             reader,
             streams,
             stream_numbers,
             samples,
             pending: VecDeque::new(),
+            carry,
         })
     }
 
@@ -731,28 +734,8 @@ impl<R: Read + Seek> AviDemuxer<R> {
         };
         let codec = self.streams[stream].params.codec;
         match codec {
-            CodecId::Ac3 | CodecId::EAc3 => {
-                let mut at = 0usize;
-                while at + 6 <= chunk.data.len() {
-                    if chunk.data[at] != 0x0b || chunk.data[at + 1] != 0x77 {
-                        at += 1;
-                        continue;
-                    }
-                    let size = match ec_ac3::frame_size(&chunk.data[at..]) {
-                        Ok(size) if at + size <= chunk.data.len() => size,
-                        Ok(_) | Err(Error::NeedMore) => break,
-                        Err(_) => {
-                            at += 1;
-                            continue;
-                        }
-                    };
-                    self.push_packet(
-                        stream,
-                        Buf::copy_from_slice(&chunk.data[at..at + size]),
-                        1536,
-                    );
-                    at += size;
-                }
+            CodecId::Ac3 | CodecId::EAc3 | CodecId::Mp3 | CodecId::Aac => {
+                self.queue_elementary_chunk(stream, chunk.data, codec)
             }
             _ => {
                 let frames = match codec {
@@ -767,8 +750,33 @@ impl<R: Read + Seek> AviDemuxer<R> {
                     _ => 0,
                 };
                 self.push_packet(stream, Buf::from_vec(chunk.data), frames);
+                Ok(())
             }
         }
+    }
+
+    fn queue_elementary_chunk(
+        &mut self,
+        stream: usize,
+        chunk: Vec<u8>,
+        codec: CodecId,
+    ) -> Result<()> {
+        let mut data = std::mem::take(&mut self.carry[stream]);
+        data.extend_from_slice(&chunk);
+        let mut at = 0usize;
+        while at < data.len() {
+            match avi_elementary_frame(codec, &data[at..]) {
+                Ok(Some((size, frames))) if at + size <= data.len() => {
+                    self.push_packet(stream, Buf::copy_from_slice(&data[at..at + size]), frames);
+                    at += size;
+                }
+                Ok(Some(_)) => break,
+                Ok(None) => at += 1,
+                Err(e) if e.is_need_more() => break,
+                Err(_) => at += 1,
+            }
+        }
+        self.carry[stream].extend_from_slice(&data[at..]);
         Ok(())
     }
 
@@ -785,6 +793,48 @@ impl<R: Read + Seek> AviDemuxer<R> {
             ..PacketFlags::default()
         };
         self.pending.push_back(packet);
+    }
+}
+fn avi_elementary_frame(codec: CodecId, data: &[u8]) -> Result<Option<(usize, u64)>> {
+    match codec {
+        CodecId::Ac3 | CodecId::EAc3 => {
+            if data.len() < 2 {
+                return Err(Error::NeedMore);
+            }
+            if data[0] != 0x0b || data[1] != 0x77 {
+                return Ok(None);
+            }
+            ec_ac3::frame_size(data).map(|size| Some((size, 1536)))
+        }
+        CodecId::Mp3 => {
+            if data.len() < 2 {
+                return Err(Error::NeedMore);
+            }
+            if data[0] != 0xff || data[1] & 0xe0 != 0xe0 {
+                return Ok(None);
+            }
+            let header = ec_mp3::FrameHeader::parse(data)?;
+            if header.layer != 3 {
+                return Ok(None);
+            }
+            Ok(header
+                .frame_len()
+                .map(|size| (size, header.samples_per_frame() as u64)))
+        }
+        CodecId::Aac => {
+            if data.len() < 2 {
+                return Err(Error::NeedMore);
+            }
+            if !ec_aac::is_adts(data) {
+                return Ok(None);
+            }
+            let header = ec_aac::parse_adts(data)?;
+            Ok(Some((
+                header.frame_length,
+                (u64::from(header.raw_blocks) + 1) * ec_aac::FRAME_LEN as u64,
+            )))
+        }
+        _ => Ok(None),
     }
 }
 

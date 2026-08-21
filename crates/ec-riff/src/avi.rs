@@ -124,23 +124,84 @@ impl<R: Read + Seek> AviReader<R> {
                 return Err(Error::Eof);
             }
             self.pos = next;
+            if &id == b"LIST" {
+                if size >= 4 {
+                    let mut kind = [0u8; 4];
+                    if read_some(&mut self.inner, &mut kind)? < 4 {
+                        self.pos = self.movi_end;
+                        return Err(Error::Eof);
+                    }
+                    if &kind == b"rec " {
+                        self.queue_packets_in(data + 4, data + size)?;
+                        if let Some(packet) = self.pending.pop_front() {
+                            return Ok(packet);
+                        }
+                    }
+                }
+                continue;
+            }
             let Some(stream) = stream_number(&id).filter(|_| &id[2..4] == b"wb") else {
                 continue;
             };
             if !self.streams.iter().any(|s| s.index == stream) {
                 continue;
             }
-            let mut data_buf = vec![0u8; size as usize];
-            if read_some(&mut self.inner, &mut data_buf)? < data_buf.len() {
-                self.pos = self.movi_end;
-                return Err(Error::Eof);
-            }
+            let data_buf = self.read_packet_body(data, size)?;
             return Ok(AviPacket {
                 stream,
                 data: data_buf,
             });
         }
         Err(Error::Eof)
+    }
+
+    fn queue_packets_in(&mut self, start: u64, end: u64) -> Result<()> {
+        let mut pos = start;
+        while pos + 8 <= end {
+            self.inner.seek(SeekFrom::Start(pos))?;
+            let mut chunk = [0u8; 8];
+            if read_some(&mut self.inner, &mut chunk)? < 8 {
+                break;
+            }
+            let id = [chunk[0], chunk[1], chunk[2], chunk[3]];
+            let size = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]) as u64;
+            let data = pos + 8;
+            let next = data.saturating_add(size).saturating_add(size & 1);
+            if next > end {
+                break;
+            }
+            if &id == b"LIST" {
+                if size >= 4 {
+                    let mut kind = [0u8; 4];
+                    if read_some(&mut self.inner, &mut kind)? < 4 {
+                        break;
+                    }
+                    if &kind == b"rec " {
+                        self.queue_packets_in(data + 4, data + size)?;
+                    }
+                }
+            } else if let Some(stream) = stream_number(&id).filter(|_| &id[2..4] == b"wb")
+                && self.streams.iter().any(|s| s.index == stream)
+            {
+                let data_buf = self.read_packet_body(data, size)?;
+                self.pending.push_back(AviPacket {
+                    stream,
+                    data: data_buf,
+                });
+            }
+            pos = next;
+        }
+        Ok(())
+    }
+
+    fn read_packet_body(&mut self, data: u64, size: u64) -> Result<Vec<u8>> {
+        let mut data_buf = vec![0u8; size as usize];
+        self.inner.seek(SeekFrom::Start(data))?;
+        if read_some(&mut self.inner, &mut data_buf)? < data_buf.len() {
+            self.pos = self.movi_end;
+            return Err(Error::Eof);
+        }
+        Ok(data_buf)
     }
 }
 
