@@ -316,7 +316,7 @@ fn ogg_timing_matches_reference_decoder() {
         let shim_tone = tone_rms(&shim, rate);
         let probe_tone = tone_rms(&probe, rate);
         let reference_tone = tone_rms(&reference, rate);
-        let gap_bound = reference_tone * 0.01;
+        let gap_bound = reference_tone * 0.001;
         let shim_onset = first_tone_onset(&shim, rate);
         let probe_onset = first_tone_onset(&probe, rate);
         let reference_onset = first_tone_onset(&reference, rate);
@@ -333,15 +333,15 @@ fn ogg_timing_matches_reference_decoder() {
         assert_eq!(probe.len(), reference.len(), "{rate}: probe length");
         assert!(
             shim_gap <= gap_bound,
-            "{rate}: shim gap RMS {shim_gap:.8} exceeds 40 dB-down absolute bound {gap_bound:.8}; tone RMS {shim_tone:.8}"
+            "{rate}: shim gap RMS {shim_gap:.8} exceeds 60 dB-down absolute bound {gap_bound:.8}; tone RMS {shim_tone:.8}"
         );
         assert!(
             probe_gap <= gap_bound,
-            "{rate}: probe gap RMS {probe_gap:.8} exceeds 40 dB-down absolute bound {gap_bound:.8}; tone RMS {probe_tone:.8}"
+            "{rate}: probe gap RMS {probe_gap:.8} exceeds 60 dB-down absolute bound {gap_bound:.8}; tone RMS {probe_tone:.8}"
         );
         assert!(
             reference_gap <= gap_bound,
-            "{rate}: reference gap RMS {reference_gap:.8} exceeds 40 dB-down absolute bound {gap_bound:.8}; tone RMS {reference_tone:.8}"
+            "{rate}: reference gap RMS {reference_gap:.8} exceeds 60 dB-down absolute bound {gap_bound:.8}; tone RMS {reference_tone:.8}"
         );
         assert!(
             shim_onset.abs_diff(probe_onset) <= 1,
