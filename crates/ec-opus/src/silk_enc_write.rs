@@ -75,7 +75,8 @@ const GAIN_STEP: f32 = 1.1702;
 const RESERVOIR_FRAMES: f32 = 4.0;
 /// Rate penalty per unit pulse magnitude in the quantiser's squared-error
 /// cost: a dead zone that lets the rate loop keep finer gains for the same
-/// bits (swept 0..2.5 on speech-like content; 1.5 maximised correlation).
+/// bits. NB 20 ms speech wants a smaller dead zone; 10 ms WB needs a
+/// slightly smaller one than the 10 ms NB/MB rows to keep upper-band pulses.
 const PULSE_LAMBDA: f32 = 1.5;
 
 impl SilkEncoder {
@@ -484,6 +485,11 @@ impl SilkEncoder {
         // vector that best predicts the residual from the *reconstructed*
         // history, then quantise sample by sample with the shaped output error
         // fed back into the target, under the decoder's seed-driven sign flips.
+        let pulse_lambda = match (frame_ms, fs) {
+            (20, 8) => 1.25,
+            (10, 16) => 1.45,
+            _ => PULSE_LAMBDA,
+        };
         let run = |per: usize, gains_q16: &[i32; MAX_NB_SUBFR]| -> Run {
             let cbk = codebook(per);
             let mut r = r.clone();
@@ -551,7 +557,7 @@ impl SilkEncoder {
                         .filter(|p| p.abs() <= MAX_PULSE)
                         .min_by(|&a, &b| {
                             let cost = |p: i32| {
-                                (recon(p) - target).powi(2) + PULSE_LAMBDA * p.abs() as f32
+                                (recon(p) - target).powi(2) + pulse_lambda * p.abs() as f32
                             };
                             cost(a).partial_cmp(&cost(b)).unwrap()
                         })
