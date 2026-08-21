@@ -8,9 +8,9 @@
 //!
 //! What this crate does *not* do is parse containers a sibling crate already
 //! parses. Matroska goes to [`ec_matroska`], mp4 to [`ec_mp4`], Ogg to
-//! [`ec_ogg`]; there is exactly one EBML parser in this family and it is not
-//! here. What is implemented in [`raw`] is the four formats that are a codec
-//! and nothing else: WAV, MP3, FLAC and ADTS.
+//! [`ec_ogg`], and RIFF/WAVE/AVI to [`ec_riff`]; there is exactly one parser
+//! for each container family. What is implemented in [`raw`] is the three
+//! formats that are a codec and nothing else: MP3, FLAC and ADTS.
 //!
 //! Two contracts worth knowing:
 //!
@@ -36,9 +36,13 @@ use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use ec_core::error::{Error, Result};
-use ec_core::packet::Packet;
-use ec_core::registry::{CodecId, Demuxer, MediaType, SeekMode, StreamInfo};
+use ec_core::packet::{Buf, Packet, PacketFlags};
+use ec_core::registry::{
+    AudioParameters, CodecId, CodecParameters, Demuxer, MediaParameters, MediaType, SeekMode,
+    StreamInfo,
+};
 use ec_core::timebase::{Rounding, TimeBase, Timestamp};
+use ec_core::{ChannelLayout, SampleFormat};
 
 pub use decoder::{AudioDecoder, opus_layout, opus_pre_skip};
 pub use tags::Tags;
@@ -67,6 +71,8 @@ pub enum Format {
     Ogg,
     /// ISO base media: mp4, m4a, mov.
     Mp4,
+    /// RIFF/AVI.
+    Avi,
     /// Matroska and WebM.
     Matroska,
 }
@@ -82,6 +88,7 @@ impl Format {
             Format::Ogg => "ogg",
             Format::Mp4 => "mp4",
             Format::Matroska => "matroska",
+            Format::Avi => "avi",
         }
     }
 
@@ -96,6 +103,7 @@ impl Format {
             Format::Ogg => &["ogg", "oga", "opus"],
             Format::Mp4 => &["mp4", "m4a", "m4v", "mov"],
             Format::Matroska => &["mkv", "mka", "mks", "mk3d", "webm"],
+            Format::Avi => &["avi"],
         }
     }
 }
@@ -107,8 +115,12 @@ impl Format {
 pub fn sniff(head: &[u8]) -> Option<Format> {
     let at = tags::id3v2_len(head).unwrap_or(0) as usize;
     let data = head.get(at..).filter(|d| !d.is_empty()).unwrap_or(head);
-    if data.len() >= 12 && &data[..4] == b"RIFF" && &data[8..12] == b"WAVE" {
-        return Some(Format::Wav);
+    if data.len() >= 12 && &data[..4] == b"RIFF" {
+        match &data[8..12] {
+            b"WAVE" => return Some(Format::Wav),
+            b"AVI " => return Some(Format::Avi),
+            _ => {}
+        }
     }
     if data.starts_with(b"fLaC") {
         return Some(Format::Flac);
@@ -223,6 +235,7 @@ impl Reader {
                     Format::Ogg,
                     Format::Mp4,
                     Format::Matroska,
+                    Format::Avi,
                 ]
                 .into_iter()
                 .find(|f| f.extensions().contains(&hint.as_str()))
@@ -230,7 +243,7 @@ impl Reader {
             .ok_or_else(|| {
                 Error::unsupported(
                     "this file",
-                    "its first bytes match no format this build reads (wav, flac, mp3, adts, ogg, mp4, matroska)",
+                    "its first bytes match no format this build reads (wav, flac, mp3, adts, ogg, mp4, avi, matroska)",
                 )
             })?;
         src.rewind()?;
@@ -275,6 +288,7 @@ impl Reader {
                 Ok(Reader::wrap(format, Box::new(demuxer), tags, native))
             }
             Format::Wav => open_wav(src, end),
+            Format::Avi => open_avi(src),
             Format::Flac => open_flac(src, &head, end),
             Format::Mp3 => open_mp3(src, &head, end),
             Format::Adts => open_adts(src, &head, end),
@@ -633,6 +647,171 @@ fn open_adts<R: Read + Seek + Send + 'static>(mut src: R, head: &[u8], end: u64)
         None,
     )?;
     Ok(Reader::wrap(Format::Adts, Box::new(demuxer), tags, vec![0]))
+}
+
+fn open_avi<R: Read + Seek + Send + 'static>(src: R) -> Result<Reader> {
+    let reader = ec_riff::AviReader::new(src)?;
+    let demuxer = AviDemuxer::new(reader)?;
+    let native = demuxer
+        .stream_numbers
+        .iter()
+        .map(|&n| u64::from(n))
+        .collect();
+    Ok(Reader::wrap(
+        Format::Avi,
+        Box::new(demuxer),
+        Tags::default(),
+        native,
+    ))
+}
+
+struct AviDemuxer<R> {
+    reader: ec_riff::AviReader<R>,
+    streams: Vec<StreamInfo>,
+    stream_numbers: Vec<u32>,
+    samples: Vec<u64>,
+    pending: VecDeque<Packet>,
+}
+
+impl<R: Read + Seek> AviDemuxer<R> {
+    fn new(reader: ec_riff::AviReader<R>) -> Result<AviDemuxer<R>> {
+        let mut streams = Vec::new();
+        let mut stream_numbers = Vec::new();
+        for (index, s) in reader.audio_streams().iter().enumerate() {
+            let codec = match s.format_tag {
+                0x0001 if s.bits_per_sample <= 8 => CodecId::PcmU8,
+                0x0001 => CodecId::PcmS16Le,
+                0x0055 => CodecId::Mp3,
+                0x00ff => CodecId::Aac,
+                0x2000 => CodecId::Ac3,
+                tag => {
+                    return Err(Error::unsupported(
+                        format!("AVI audio format tag {tag:#06x}"),
+                        "no decoder for it exists in this family yet",
+                    ));
+                }
+            };
+            let mut params = CodecParameters::new(codec);
+            params.media = MediaParameters::Audio(AudioParameters {
+                sample_rate: s.sample_rate,
+                layout: ChannelLayout::from_count(usize::from(s.channels).max(1)),
+                format: match codec {
+                    CodecId::PcmU8 => Some(SampleFormat::U8),
+                    CodecId::PcmS16Le => Some(SampleFormat::S16),
+                    _ => None,
+                },
+                bits_per_sample: (s.bits_per_sample > 0).then_some(u32::from(s.bits_per_sample)),
+            });
+            streams.push(StreamInfo::new(
+                index as u32,
+                TimeBase::from_rate(s.sample_rate.max(1)),
+                params,
+            ));
+            stream_numbers.push(s.index);
+        }
+        if streams.is_empty() {
+            return Err(Error::unsupported(
+                "this AVI file",
+                "it declares no audio stream this reader can hand out",
+            ));
+        }
+        let samples = vec![0; streams.len()];
+        Ok(AviDemuxer {
+            reader,
+            streams,
+            stream_numbers,
+            samples,
+            pending: VecDeque::new(),
+        })
+    }
+
+    fn queue_chunk(&mut self, chunk: ec_riff::AviPacket) -> Result<()> {
+        let Some(stream) = self.stream_numbers.iter().position(|&n| n == chunk.stream) else {
+            return Ok(());
+        };
+        let codec = self.streams[stream].params.codec;
+        match codec {
+            CodecId::Ac3 | CodecId::EAc3 => {
+                let mut at = 0usize;
+                while at + 6 <= chunk.data.len() {
+                    if chunk.data[at] != 0x0b || chunk.data[at + 1] != 0x77 {
+                        at += 1;
+                        continue;
+                    }
+                    let size = match ec_ac3::frame_size(&chunk.data[at..]) {
+                        Ok(size) if at + size <= chunk.data.len() => size,
+                        Ok(_) | Err(Error::NeedMore) => break,
+                        Err(_) => {
+                            at += 1;
+                            continue;
+                        }
+                    };
+                    self.push_packet(
+                        stream,
+                        Buf::copy_from_slice(&chunk.data[at..at + size]),
+                        1536,
+                    );
+                    at += size;
+                }
+            }
+            _ => {
+                let frames = match codec {
+                    CodecId::PcmU8 | CodecId::PcmS16Le => {
+                        let block = self
+                            .reader
+                            .audio_streams()
+                            .get(stream)
+                            .map_or(1usize, |s| usize::from(s.block_align).max(1));
+                        (chunk.data.len() / block) as u64
+                    }
+                    _ => 0,
+                };
+                self.push_packet(stream, Buf::from_vec(chunk.data), frames);
+            }
+        }
+        Ok(())
+    }
+
+    fn push_packet(&mut self, stream: usize, data: Buf, frames: u64) {
+        let base = self.streams[stream].time_base;
+        let pts = self.samples[stream];
+        self.samples[stream] = self.samples[stream].saturating_add(frames);
+        let mut packet = Packet::new(stream as u32, base, data);
+        packet.pts = Some(pts as i64);
+        packet.dts = Some(pts as i64);
+        packet.duration = Some(frames as i64);
+        packet.flags = PacketFlags {
+            keyframe: true,
+            ..PacketFlags::default()
+        };
+        self.pending.push_back(packet);
+    }
+}
+
+impl<R: Read + Seek + Send> Demuxer for AviDemuxer<R> {
+    fn streams(&self) -> &[StreamInfo] {
+        &self.streams
+    }
+
+    fn next_packet(&mut self) -> Result<Packet> {
+        loop {
+            if let Some(packet) = self.pending.pop_front() {
+                return Ok(packet);
+            }
+            match self.reader.next_packet() {
+                Ok(chunk) => self.queue_chunk(chunk)?,
+                Err(e) if e.is_eof() => return Err(Error::Eof),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    fn seek(&mut self, _stream: u32, _to: Timestamp, _mode: SeekMode) -> Result<()> {
+        Err(Error::unsupported(
+            "AVI audio seek",
+            "this reader only walks AVI sound chunks in storage order",
+        ))
+    }
 }
 
 /// Skip an ID3v2 tag at the head of a stream, reading its text on the way past.

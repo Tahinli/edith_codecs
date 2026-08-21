@@ -1,4 +1,4 @@
-//! RIFF/WAVE: the container edith writes PCM into and reads PCM back from.
+//! RIFF/WAVE and AVI audio chunk reading.
 //!
 //! [`WavWriter`] streams samples as they arrive and patches the RIFF, `data`
 //! and `fact` sizes in [`WavWriter::finalize`] — a dropped writer therefore
@@ -16,8 +16,8 @@
 //! declares.
 //!
 //! Not covered: RF64/BW64 (>4 GiB), ADPCM and other compressed WAVE tags,
-//! 64-bit float. Each is [`Error::Unsupported`] naming itself, never a silent
-//! misread.
+//! 64-bit float, AVI video frames, and non-audio AVI chunks. Each unsupported
+//! WAVE tag is [`Error::Unsupported`] naming itself, never a silent misread.
 //!
 //! The crate stands alone — [`WavSpec`] is its own type — but converts into the
 //! family IR on request: [`WavSpec::sample_format`] and [`WavSpec::layout`].
@@ -25,9 +25,11 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod avi;
 mod read;
 mod write;
 
+pub use avi::{AviAudioStream, AviPacket, AviReader};
 pub use ec_core::{Error, Result};
 pub use read::WavReader;
 pub use write::{Sample, WavWriter};
