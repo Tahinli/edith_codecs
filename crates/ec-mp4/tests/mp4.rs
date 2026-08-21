@@ -32,6 +32,18 @@ fn open(path: &Path) -> Mp4Demuxer<BufReader<File>> {
     .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
+#[test]
+fn riff_avi_is_not_reported_as_a_truncated_mp4() {
+    let err = match Mp4Demuxer::new(Cursor::new(b"RIFF\x10\0\0\0AVI ".to_vec())) {
+        Ok(_) => panic!("RIFF/AVI opened as mp4"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err, Error::Unsupported { .. }),
+        "wrong-container open error: {err}"
+    );
+}
+
 /// What ffprobe calls each of our codec ids.
 fn ffmpeg_name(codec: CodecId) -> &'static str {
     match codec {
@@ -607,6 +619,54 @@ fn a_truncated_file_is_need_more() {
     );
     assert!(Mp4Demuxer::new(Cursor::new(Vec::new())).is_err());
     assert!(Mp4Demuxer::new(Cursor::new(b"not an mp4 at all".to_vec())).is_err());
+}
+
+#[test]
+fn truncated_prefixes_are_need_more_or_eof() {
+    let mut paths = vec![fixtures().join("audio/aac-mp4-stereo-48000.mp4")];
+    let real = PathBuf::from("/home/tahinli/Downloads/linkedin-video (11).mp4");
+    if real.exists() {
+        paths.push(real);
+    }
+
+    for path in paths {
+        let data = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let mut table = Vec::new();
+        for i in 1..=64usize {
+            let cut = data.len() * i / 64;
+            let (class, packets) = mp4_prefix_class(&data[..cut]);
+            table.push(format!("{i:02},{cut},{class},{packets}"));
+            assert!(
+                matches!(class, "NeedMore" | "Open+Eof"),
+                "{}\nidx,cut,class,packets\n{}",
+                path.display(),
+                table.join("\n")
+            );
+        }
+        println!(
+            "{}\nidx,cut,class,packets\n{}",
+            path.display(),
+            table.join("\n")
+        );
+    }
+}
+
+fn mp4_prefix_class(data: &[u8]) -> (&'static str, u64) {
+    let mut demuxer = match Mp4Demuxer::new(Cursor::new(data.to_vec())) {
+        Ok(demuxer) => demuxer,
+        Err(Error::NeedMore) => return ("NeedMore", 0),
+        Err(Error::Corrupt { .. }) => return ("Corrupt", 0),
+        Err(e) => panic!("unexpected mp4 prefix error: {e}"),
+    };
+    let mut packets = 0;
+    loop {
+        match demuxer.next_packet() {
+            Ok(_) => packets += 1,
+            Err(Error::Eof) => return ("Open+Eof", packets),
+            Err(Error::NeedMore | Error::Corrupt { .. }) => return ("Corrupt", packets),
+            Err(e) => panic!("unexpected mp4 packet error: {e}"),
+        }
+    }
 }
 
 /// A muxer round trip in memory, with the timing checked at the tick: the file
