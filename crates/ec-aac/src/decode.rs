@@ -488,7 +488,7 @@ pub struct Noise(u32);
 impl Noise {
     fn next(&mut self) -> f32 {
         self.0 = self.0.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-        (self.0 >> 8) as f32 / (1 << 23) as f32 - 1.0
+        i32::from_ne_bytes(self.0.to_ne_bytes()) as f32
     }
 }
 
@@ -508,7 +508,7 @@ impl BlockDecoder {
             books: Books::new(),
             bank: FilterBank::new(),
             states: Vec::new(),
-            noise: Noise(0x1234_5678),
+            noise: Noise(0x1f2e_3d4c),
             sf_index,
             sbr: None,
         }
