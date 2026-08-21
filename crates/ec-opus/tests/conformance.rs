@@ -877,8 +877,8 @@ fn encoder_roundtrips_at_every_rate() {
 
 /// The mode `Encoder` actually picks, read back from the packet's own TOC
 /// byte: Voip below 20 kbps mono selects SILK (NB at/under 10 kbps, WB
-/// above), Voip 20-40 kbps and Audio at any rate stay on CELT (Hybrid is
-/// unimplemented and Mode 20-40 kbps needs it, D4).
+/// above), Voip 20-40 kbps mono selects Hybrid, and Audio at any rate stays
+/// on CELT.
 #[test]
 fn encoder_mode_follows_application_and_bitrate() {
     // `None` for the two CELT rows: any CELT config is correct there, the
@@ -2202,4 +2202,127 @@ fn hybrid_fb_roundtrip() {
             "hybrid at {bps}: {kbps:.1} kbps"
         );
     }
+}
+
+fn hybrid_roundtrip_shape(
+    pcm: &[f32],
+    channels: usize,
+    frame: usize,
+    bps: u32,
+    bandwidth: Option<Bandwidth>,
+) -> (Vec<f32>, Vec<Vec<u8>>) {
+    let mut enc = Encoder::new(48000, channels, Application::Voip).unwrap();
+    enc.set_bitrate(bps);
+    enc.set_bandwidth(bandwidth);
+    let mut dec = Decoder::new(48000, channels).unwrap();
+    let mut out = vec![0u8; 1500];
+    let mut buf = vec![0f32; 5760 * channels];
+    let (mut decoded, mut packets) = (Vec::new(), Vec::new());
+    let mut padded = pcm.to_vec();
+    padded.resize(
+        pcm.len().div_ceil(frame * channels) * frame * channels + frame * channels,
+        0.0,
+    );
+    for block in padded.chunks(frame * channels) {
+        let len = enc
+            .encode_float(block, frame, &mut out)
+            .expect("hybrid encode");
+        let n = dec
+            .decode_float(&out[..len], &mut buf)
+            .expect("hybrid decode");
+        assert_eq!(n, frame);
+        assert_eq!(dec.final_range(), enc.final_range(), "range state diverged");
+        decoded.extend_from_slice(&buf[..n * channels]);
+        packets.push(out[..len].to_vec());
+    }
+    (decoded, packets)
+}
+
+#[test]
+fn hybrid_shapes_roundtrip() {
+    for (tag, channels, frame, bps, bandwidth, config, floor) in [
+        (
+            "mono-swb10",
+            1usize,
+            480usize,
+            24_000u32,
+            Bandwidth::SuperWide,
+            12u8,
+            0.75f64,
+        ),
+        ("mono-fb10", 1, 480, 32_000, Bandwidth::Full, 14, 0.75),
+        (
+            "stereo-swb20",
+            2,
+            960,
+            48_000,
+            Bandwidth::SuperWide,
+            13,
+            0.75,
+        ),
+        ("stereo-fb20", 2, 960, 64_000, Bandwidth::Full, 15, 0.75),
+        ("stereo-fb10", 2, 480, 64_000, Bandwidth::Full, 14, 0.70),
+    ] {
+        let pcm = if channels == 1 {
+            speech_like()
+        } else {
+            stereo_speech_pair()
+        };
+        let (decoded, packets) =
+            hybrid_roundtrip_shape(&pcm, channels, frame, bps, Some(bandwidth));
+        let toc = ec_opus::Toc::new(packets[0][0]);
+        assert_eq!(toc.config, config, "{tag}: TOC config {}", toc.config);
+        assert_eq!(toc.stereo, channels == 2, "{tag}: TOC stereo flag");
+        let mut worst = 1.0f64;
+        for ch in 0..channels {
+            let source: Vec<f32> = pcm.chunks_exact(channels).map(|f| f[ch]).collect();
+            let got: Vec<f32> = decoded.chunks_exact(channels).map(|f| f[ch]).collect();
+            let (corr, lag) = aligned_corr(&source, &got, 400);
+            worst = worst.min(corr);
+            eprintln!("hybrid {tag} ch{ch}: corr {corr:.4} at lag {lag}");
+        }
+        assert!(worst >= floor, "{tag}: worst corr {worst:.4}");
+        let total = pcm.len() / channels;
+        let path = temp_path(&format!("hybrid-{tag}.opus"));
+        write_ogg_opus(
+            &path,
+            &packets,
+            opus_head(channels, 120, None),
+            channels,
+            total,
+            120,
+        );
+        if Command::new("ffmpeg").arg("-version").output().is_ok() {
+            let out = Command::new("ffmpeg")
+                .args(["-v", "warning", "-c:a", "libopus", "-i"])
+                .arg(&path)
+                .args(["-f", "null", "-"])
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "{tag}: ffmpeg decode: {stderr}");
+        }
+        if Command::new("gst-launch-1.0")
+            .arg("--version")
+            .output()
+            .is_ok()
+        {
+            let location = format!("location={}", path.display());
+            let out = Command::new("gst-launch-1.0")
+                .args([
+                    "-q", "filesrc", &location, "!", "oggdemux", "!", "opusdec", "!", "fakesink",
+                ])
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "{tag}: gst decode: {stderr}");
+        }
+        let _ = fs::remove_file(&path);
+    }
+
+    let speech = stereo_speech_pair();
+    let (_, packets) = hybrid_roundtrip_shape(&speech, 2, 960, 64_000, None);
+    let toc = ec_opus::Toc::new(packets[0][0]);
+    assert_eq!(toc.mode(), ec_opus::Mode::Hybrid);
+    assert!(toc.stereo);
 }
