@@ -139,7 +139,7 @@ const MODE_SHORT: u32 = 0;
 const MODE_LONG: u32 = 1;
 /// A tick energy jump past this multiple of its predecessor is a transient;
 /// a near-zero predecessor makes this trip on any onset above the floor.
-const TRANSIENT_RATIO: f64 = 16.0;
+const TRANSIENT_RATIO: f64 = 14.0;
 /// Below this per-sample mean square (-60 dBFS), a tick is not "content" at
 /// all — the floor that keeps digital silence, dither and fade tails from
 /// tripping the detector.
