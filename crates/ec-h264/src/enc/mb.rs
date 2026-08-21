@@ -31,15 +31,18 @@ use crate::pred::{
 };
 use crate::tables::{BLK4_POS, CHROMA_QP};
 use crate::transform::{
-    LevelScale4x4, LevelScale8x8, chroma_dc_transform_420, dequant_4x4, dequant_8x8,
-    inverse_transform_4x4, inverse_transform_8x8, luma_dc_transform, unzigzag, unzigzag_8x8,
-    unzigzag_ac15,
+    chroma_dc_transform_420, dequant_4x4, dequant_8x8, inverse_transform_4x4,
+    inverse_transform_8x8, luma_dc_transform, unzigzag, unzigzag_8x8, unzigzag_ac15, LevelScale4x4,
+    LevelScale8x8,
 };
 
-use super::entropy::{EncEntropy, sub_block_4x4};
 use super::quant::{
     forward_4x4, forward_8x8, forward_hadamard_2x2, forward_hadamard_4x4, quant_4x4, quant_8x8,
     quant_chroma_dc, quant_luma_dc,
+};
+use super::{
+    entropy::{sub_block_4x4, EncEntropy},
+    lambda_ssd,
 };
 
 /// Speed/quality ladder. Two rungs, because the two the incumbent exposed are
@@ -75,8 +78,8 @@ pub(crate) struct MbEnc<'a> {
     pub qp: i32,
     /// What rate control wants this macroblock coded at.
     pub target_qp: i32,
-    /// Lagrangian multiplier in the SATD domain.
-    pub lambda: i32,
+    /// Lagrangian multiplier for SATD and motion-vector costs.
+    pub lambda_motion: f64,
     pub preset: Preset,
     /// The PPS carries transform_8x8_mode_flag: transform_size_8x8_flag must
     /// be written for every eligible macroblock (7.3.5).
@@ -93,6 +96,7 @@ pub(crate) struct MbEnc<'a> {
 }
 
 /// Quantised levels of one macroblock, scan order per block.
+#[derive(Clone)]
 struct Levels {
     /// Luma AC/4x4 blocks in Z-order; only `[..15]` is used under Intra_16x16.
     luma: [[i32; 16]; 16],
@@ -276,6 +280,11 @@ fn modes_allowed(have_top: bool, have_left: bool, have_tl: bool) -> [bool; 9] {
     ]
 }
 
+#[inline]
+fn motion_rate(e: &MbEnc<'_>, bits: f64) -> i32 {
+    (e.lambda_motion * bits).round() as i32
+}
+
 /// Code one macroblock: decide its mode, reconstruct it into `pic` and write
 /// its syntax into `w`.
 pub(crate) fn encode_mb(pic: &mut Picture, e: &mut MbEnc<'_>, w: &mut EncEntropy, mb_addr: usize) {
@@ -323,7 +332,7 @@ pub(crate) fn encode_mb(pic: &mut Picture, e: &mut MbEnc<'_>, w: &mut EncEntropy
     let intra_cost = intra_pre_cost(pic, e, &nbr, mb_x, mb_y);
     let go_intra = match &inter {
         None => true,
-        Some(i) => intra_cost.best() + e.lambda * 8 < i.cost,
+        Some(i) => intra_cost.best() + motion_rate(e, 8.0) < i.cost,
     };
 
     if go_intra {
@@ -502,9 +511,11 @@ fn choose_inter(pic: &Picture, e: &MbEnc<'_>, mb_x: usize, mb_y: usize) -> Inter
         // which is what a search can afford; the winner is re-costed on SATD
         // because the intra candidates are SATD and the two scales differ.
         let mut cost_of = |mv: [i16; 2], satd: bool| -> i32 {
-            let bits = e.lambda
-                * (se_bits(i32::from(mv[0] - mvp[0])) + se_bits(i32::from(mv[1] - mvp[1])))
-                / 2;
+            let bits = motion_rate(
+                e,
+                f64::from(se_bits(i32::from(mv[0] - mvp[0])) + se_bits(i32::from(mv[1] - mvp[1])))
+                    / 2.0,
+            );
             if !satd && mv[0] & 3 == 0 && mv[1] & 3 == 0 {
                 let o = integer_origin(
                     &plane,
@@ -592,7 +603,7 @@ fn choose_inter(pic: &Picture, e: &MbEnc<'_>, mb_x: usize, mb_y: usize) -> Inter
     let skip_cost = {
         let mut buf = [0u8; 256];
         mc_luma(&plane, sx as i32, sy as i32, skip_mv, 16, 16, 16, &mut buf);
-        satd_block(&e.src.y, sw, sx, sy, &buf, 16, 0, 16, 16) - e.lambda * 4
+        satd_block(&e.src.y, sw, sx, sy, &buf, 16, 0, 16, 16) - motion_rate(e, 4.0)
     };
 
     let mut best = (PShape::Whole, [mv16, mv16], cost16);
@@ -607,7 +618,7 @@ fn choose_inter(pic: &Picture, e: &MbEnc<'_>, mb_x: usize, mb_y: usize) -> Inter
     // time. That is a Balanced trade, not a Fast one.
     if e.preset == Preset::Balanced && cost16 > 16 * 16 {
         for shape in [PShape::Horizontal, PShape::Vertical] {
-            let mut total = e.lambda * 6; // the partition's own signalling
+            let mut total = motion_rate(e, 6.0); // the partition's own signalling
             let mut mvs = [[0i16; 2]; 2];
             for part in 0..2 {
                 let ((bx, by), (w, h)) = shape.geometry(part);
@@ -671,7 +682,7 @@ fn code_luma_4x4(
         // half of rate-distortion optimised quantisation, and the half that
         // pays. Intra blocks are left alone: their reconstruction is what the
         // next block in the macroblock predicts from.
-        if !intra && !worth_coding(&source, &resid, &lv.luma[blk], qp) {
+        if !intra && !worth_coding(&source, &resid, &lv.luma[blk], zero_block_lambda(e, qp)) {
             lv.luma[blk] = [0; 16];
             lv.luma_nz[blk] = 0;
             continue;
@@ -691,9 +702,17 @@ fn code_luma_4x4(
 /// without costing camera content.
 const ZERO_BLOCK_LAMBDA: f64 = 0.4;
 
+fn zero_block_lambda(e: &MbEnc<'_>, qp: i32) -> f64 {
+    if e.transform_8x8 {
+        lambda_ssd(qp)
+    } else {
+        ZERO_BLOCK_LAMBDA * lambda_ssd(qp)
+    }
+}
+
 /// The rate-distortion test behind the per-block zero decision: coding the
 /// block has to buy more squared error than its bits are worth.
-fn worth_coding(source: &[i32], resid: &[i32], levels: &[i32], qp: i32) -> bool {
+fn worth_coding(source: &[i32], resid: &[i32], levels: &[i32], lambda: f64) -> bool {
     let mut ssd_zero = 0i64;
     let mut ssd_coded = 0i64;
     for i in 0..source.len() {
@@ -702,8 +721,7 @@ fn worth_coding(source: &[i32], resid: &[i32], levels: &[i32], qp: i32) -> bool 
         ssd_zero += z * z;
         ssd_coded += c * c;
     }
-    ssd_coded as f64 + ZERO_BLOCK_LAMBDA * lambda_ssd(qp) * (block_bits(levels) as f64)
-        < ssd_zero as f64
+    ssd_coded as f64 + lambda * (block_bits(levels) as f64) < ssd_zero as f64
 }
 
 /// Predict and code the luma of an Intra_16x16 macroblock.
@@ -847,7 +865,7 @@ fn code_chroma(
                 dequant_4x4(&mut raster, &e.ls, qp_c, true);
                 let mut resid = [0i32; 16];
                 inverse_transform_4x4(&raster, &mut resid);
-                if !worth_coding(&source, &resid, &ac[comp][blk], qp_c) {
+                if !worth_coding(&source, &resid, &ac[comp][blk], zero_block_lambda(e, qp_c)) {
                     ac[comp][blk] = [0; 16];
                     nz = 0;
                 }
@@ -1019,7 +1037,7 @@ fn code_intra_4x4(
             }
             pred_4x4(mode, &n, &mut p);
             let bits = if mode == predicted { 1 } else { 4 };
-            let c = satd4(&e.src.y, e.src.stride, x, y, &p, 4) + e.lambda * bits;
+            let c = satd4(&e.src.y, e.src.stride, x, y, &p, 4) + motion_rate(e, f64::from(bits));
             if c < best.0 {
                 best = (c, mode);
             }
@@ -1101,7 +1119,7 @@ fn code_block_8x8(
     dequant_8x8(&mut raster, &e.ls8, qp);
     let mut resid = [0i32; 64];
     inverse_transform_8x8(&raster, &mut resid);
-    if !intra && !worth_coding(&d, &resid, out, qp) {
+    if !intra && !worth_coding(&d, &resid, out, zero_block_lambda(e, qp)) {
         *out = [0; 64];
         return 0;
     }
@@ -1140,7 +1158,7 @@ fn code_intra_8x8(
             }
             pred_8x8(mode, &n, &mut p);
             let bits = if mode == predicted { 1 } else { 4 };
-            let mut c = e.lambda * bits;
+            let mut c = motion_rate(e, f64::from(bits));
             for q in 0..4 {
                 let (ox, oy) = ((q % 2) * 4, (q / 2) * 4);
                 c += satd4(&e.src.y, e.src.stride, x + ox, y + oy, &p[oy * 8 + ox..], 8);
@@ -1220,13 +1238,9 @@ fn restore_luma(pic: &mut Picture, mb_x: usize, mb_y: usize, src: &[u8; 256]) {
     }
 }
 
-/// Bits the luma residual and the mode signalling of an intra macroblock cost,
-/// to the accuracy the mode decision needs.
-fn intra_bits(lv: &Levels, i4: Option<(&[u8], &[u8])>) -> i64 {
+fn rough_intra_bits(lv: &Levels, i4: Option<(&[u8], &[u8])>) -> i64 {
     let mut bits = estimate_luma_bits(lv);
     match i4 {
-        // Sixteen (or four) mode signals plus the coded_block_pattern the
-        // 16x16 form derives from its macroblock type instead.
         Some((modes, pred)) => {
             bits += 6;
             for blk in 0..modes.len() {
@@ -1334,8 +1348,70 @@ fn write_luma_for_cost(
         }
     }
 }
+fn cost_chroma_nz_pair(
+    pic: &Picture,
+    nbr: &MbNeighbors,
+    local: &[[u8; 4]; 2],
+    comp: usize,
+    cx0: usize,
+    cy0: usize,
+    cx: usize,
+    cy: usize,
+) -> (Option<u8>, Option<u8>) {
+    let w2 = pic.mb_w * 2;
+    let left_avail = if cx.is_multiple_of(2) { nbr.a } else { true };
+    let top_avail = if cy.is_multiple_of(2) { nbr.b } else { true };
+    let left = (left_avail && cx > 0).then(|| {
+        if cx > cx0 {
+            local[comp][(cy - cy0) * 2 + (cx - cx0 - 1)]
+        } else {
+            pic.nz_c[comp][cy * w2 + cx - 1]
+        }
+    });
+    let top = (top_avail && cy > 0).then(|| {
+        if cy > cy0 {
+            local[comp][(cy - cy0 - 1) * 2 + (cx - cx0)]
+        } else {
+            pic.nz_c[comp][(cy - 1) * w2 + cx]
+        }
+    });
+    (left, top)
+}
 
-fn intra_luma_bits(
+fn write_chroma_for_cost(
+    pic: &Picture,
+    nbr: &MbNeighbors,
+    w: &mut EncEntropy,
+    mb_x: usize,
+    mb_y: usize,
+    lv: &Levels,
+) {
+    if lv.cbp_chroma != 0 {
+        for comp in 0..2 {
+            w.residual_block(
+                &lv.chroma_dc[comp][..4],
+                BlockCat::ChromaDc(comp as u8),
+                None,
+                None,
+            );
+        }
+    }
+    if lv.cbp_chroma != 2 {
+        return;
+    }
+    let (cx0, cy0) = (mb_x * 2, mb_y * 2);
+    let mut nz = [[0u8; 4]; 2];
+    for comp in 0..2 {
+        for blk in 0..4 {
+            let (cx, cy) = (cx0 + (blk & 1), cy0 + (blk >> 1));
+            let (na, nb) = cost_chroma_nz_pair(pic, nbr, &nz, comp, cx0, cy0, cx, cy);
+            nz[comp][blk] =
+                w.residual_block(&lv.chroma[comp][blk][..15], BlockCat::ChromaAc, na, nb);
+        }
+    }
+}
+
+fn intra_mb_bits(
     pic: &Picture,
     e: &MbEnc<'_>,
     w: &EncEntropy,
@@ -1344,6 +1420,7 @@ fn intra_luma_bits(
     lv: &Levels,
     i4: Option<(&[u8], &[u8])>,
     i16_mode: u8,
+    chroma_mode: u8,
 ) -> i64 {
     let use_i4 = i4.is_some();
     let p_slice = e.slice_type == SliceType::P;
@@ -1351,7 +1428,9 @@ fn intra_luma_bits(
     let intra_type = if use_i4 {
         0
     } else {
-        1 + u32::from(i16_mode) + if lv.cbp_luma != 0 { 12 } else { 0 }
+        1 + u32::from(i16_mode)
+            + 4 * u32::from(lv.cbp_chroma)
+            + if lv.cbp_luma != 0 { 12 } else { 0 }
     };
     entropy_bits(w, |cw| {
         cw.begin_mb(&e.mb_ctx);
@@ -1372,18 +1451,23 @@ fn intra_luma_bits(
                 };
                 cw.intra4x4_pred_mode(rem);
             }
-            cw.coded_block_pattern(lv.cbp_luma, 0, true);
         }
-        if !use_i4 || lv.cbp_luma != 0 {
+        cw.intra_chroma_pred_mode(chroma_mode);
+        if use_i4 {
+            cw.coded_block_pattern(lv.cbp_luma, lv.cbp_chroma, true);
+        }
+        let coded = lv.cbp_luma != 0 || lv.cbp_chroma != 0 || !use_i4;
+        if coded {
             cw.mb_qp_delta(e.target_qp - e.qp);
         }
         let mb_x = mb_addr % pic.mb_w;
         let mb_y = mb_addr / pic.mb_w;
         write_luma_for_cost(pic, nbr, cw, mb_x, mb_y, lv, !use_i4);
+        write_chroma_for_cost(pic, nbr, cw, mb_x, mb_y, lv);
     })
 }
 
-fn inter_luma_bits(
+fn inter_mb_bits(
     pic: &Picture,
     e: &MbEnc<'_>,
     w: &EncEntropy,
@@ -1404,15 +1488,16 @@ fn inter_luma_bits(
                 cw.mvd(comp, inc[part][comp], i32::from(mvd[part][comp]));
             }
         }
-        cw.coded_block_pattern(lv.cbp_luma, 0, false);
+        cw.coded_block_pattern(lv.cbp_luma, lv.cbp_chroma, false);
         if lv.cbp_luma != 0 && e.transform_8x8 {
             cw.transform_size_8x8_flag(lv.trans8);
         }
-        if lv.cbp_luma != 0 {
+        if lv.cbp_luma != 0 || lv.cbp_chroma != 0 {
             cw.mb_qp_delta(e.target_qp - e.qp);
             let mb_x = mb_addr % pic.mb_w;
             let mb_y = mb_addr / pic.mb_w;
             write_luma_for_cost(pic, nbr, cw, mb_x, mb_y, lv, false);
+            write_chroma_for_cost(pic, nbr, cw, mb_x, mb_y, lv);
         }
     })
 }
@@ -1439,20 +1524,22 @@ fn encode_intra_mb(
     let (bx0, by0) = (mb_x * 4, mb_y * 4);
     let qp = e.target_qp;
     write_intra_mb(pic, mb_x, mb_y);
-    let mut lv = Levels::default();
+    let mut lv: Levels;
     let mut modes = [2u8; 16];
     let mut pred_modes = [2u8; 16];
     let mut modes8 = [2u8; 4];
     let mut pred_modes8 = [2u8; 4];
     let mut use_i4 = false;
+    let chroma_mode = choose_chroma_mode(pic, e, &nbr, mb_x, mb_y);
+    let mut chroma_lv = Levels::default();
+    code_chroma(pic, e, mb_x, mb_y, qp, true, &mut chroma_lv);
     let mut use_i8 = false;
 
     if cost.allow_i4 {
-        let mut lv4 = Levels::default();
+        let mut lv4 = chroma_lv.clone();
         let (m4, p4) = code_intra_4x4(pic, e, mb_x, mb_y, qp, &nbr, &mut lv4);
-        let allow_t8 = e.transform_8x8 && qp < 30;
         let cost4 = if e.transform_8x8 {
-            let bits = intra_luma_bits(
+            let bits = intra_mb_bits(
                 pic,
                 e,
                 w,
@@ -1461,11 +1548,12 @@ fn encode_intra_mb(
                 &lv4,
                 Some((&m4, &p4)),
                 cost.i16_mode,
+                chroma_mode,
             );
-            ssd_luma(pic, e, mb_x, mb_y) as f64 + rd_lambda(qp) * bits as f64
+            ssd_mb(pic, e, mb_x, mb_y) as f64 + lambda_ssd(qp) * bits as f64
         } else {
             ssd_luma(pic, e, mb_x, mb_y) as f64
-                + lambda_ssd(qp) * intra_bits(&lv4, Some((&m4, &p4))) as f64
+                + lambda_ssd(qp) * rough_intra_bits(&lv4, Some((&m4, &p4))) as f64
         };
         let mut recon4 = [0u8; 256];
         save_luma(pic, mb_x, mb_y, &mut recon4);
@@ -1476,14 +1564,14 @@ fn encode_intra_mb(
         }
 
         // Intra_8x8 on the same terms, when the PPS allows it.
-        let mut lv8 = Levels::default();
+        let mut lv8 = chroma_lv.clone();
         let mut recon8 = [0u8; 256];
-        let cost8 = if allow_t8 {
+        let cost8 = if e.transform_8x8 {
             let (m8, p8) = code_intra_8x8(pic, e, mb_x, mb_y, qp, &nbr, &mut lv8);
             modes8 = m8;
             pred_modes8 = p8;
             save_luma(pic, mb_x, mb_y, &mut recon8);
-            let bits = intra_luma_bits(
+            let bits = intra_mb_bits(
                 pic,
                 e,
                 w,
@@ -1492,19 +1580,31 @@ fn encode_intra_mb(
                 &lv8,
                 Some((&m8, &p8)),
                 cost.i16_mode,
+                chroma_mode,
             );
-            ssd_luma(pic, e, mb_x, mb_y) as f64 + rd_lambda(qp) * bits as f64
+            ssd_mb(pic, e, mb_x, mb_y) as f64 + lambda_ssd(qp) * bits as f64
         } else {
             f64::INFINITY
         };
 
-        let mut lv16 = Levels::default();
+        let mut lv16 = chroma_lv;
         code_i16_luma(pic, e, mb_x, mb_y, qp, cost.i16_mode, &nbr, &mut lv16);
         let cost16 = if e.transform_8x8 {
-            let bits = intra_luma_bits(pic, e, w, mb_addr, &nbr, &lv16, None, cost.i16_mode);
-            ssd_luma(pic, e, mb_x, mb_y) as f64 + rd_lambda(qp) * bits as f64
+            let bits = intra_mb_bits(
+                pic,
+                e,
+                w,
+                mb_addr,
+                &nbr,
+                &lv16,
+                None,
+                cost.i16_mode,
+                chroma_mode,
+            );
+            ssd_mb(pic, e, mb_x, mb_y) as f64 + lambda_ssd(qp) * bits as f64
         } else {
-            ssd_luma(pic, e, mb_x, mb_y) as f64 + lambda_ssd(qp) * intra_bits(&lv16, None) as f64
+            ssd_luma(pic, e, mb_x, mb_y) as f64
+                + lambda_ssd(qp) * rough_intra_bits(&lv16, None) as f64
         };
 
         if cost8 <= cost4 && cost8 <= cost16 {
@@ -1532,11 +1632,9 @@ fn encode_intra_mb(
             lv = lv16;
         }
     } else {
+        lv = chroma_lv;
         code_i16_luma(pic, e, mb_x, mb_y, qp, cost.i16_mode, &nbr, &mut lv);
     }
-
-    let chroma_mode = choose_chroma_mode(pic, e, &nbr, mb_x, mb_y);
-    code_chroma(pic, e, mb_x, mb_y, qp, true, &mut lv);
 
     // ---- syntax ----
     w.begin_mb(&e.mb_ctx);
@@ -1662,7 +1760,11 @@ fn block_bits(b: &[i32]) -> i64 {
             n += 2 * (64 - u64::from(l.unsigned_abs()).leading_zeros() as i64) + 1;
         }
     }
-    if n > 0 { n + 6 } else { 2 }
+    if n > 0 {
+        n + 6
+    } else {
+        2
+    }
 }
 
 /// Rough bit cost of a macroblock's residual, for the skip decision: a level
@@ -1680,17 +1782,6 @@ fn estimate_bits(lv: &Levels) -> i64 {
         }
     }
     bits
-}
-
-/// Lagrangian multiplier in the squared-error domain, paired with
-/// [`super::lambda_for`] in the SATD one.
-fn lambda_ssd(qp: i32) -> f64 {
-    0.85 * ((f64::from(qp) - 12.0) / 3.0).exp2()
-}
-
-fn rd_lambda(qp: i32) -> f64 {
-    let scale = if qp <= 22 { 1.0 } else { 0.25 };
-    lambda_ssd(qp) * scale
 }
 
 /// Motion-compensate one partition into the picture planes.
@@ -1825,38 +1916,45 @@ fn encode_inter_mb(
     // quantisation churn costs bits every picture and improves nothing.
     let may_skip = choice.prefer_skip;
     let ssd_skip = may_skip.then(|| ssd_mb(pic, e, mb_x, mb_y));
-    let mut lv = Levels::default();
-    if e.transform_8x8 && qp < 30 {
+    let mut chroma_lv = Levels::default();
+    code_chroma(pic, e, mb_x, mb_y, qp, false, &mut chroma_lv);
+    let mut lv = chroma_lv.clone();
+    if e.transform_8x8 {
         // Both transform sizes on the same prediction; the cheaper
         // rate-distortion cost is coded.
         let mut pred = [0u8; 256];
         save_luma(pic, mb_x, mb_y, &mut pred);
-        code_luma_4x4(pic, e, mb_x, mb_y, qp, false, &mut lv);
-        let bits4 = inter_luma_bits(pic, e, w, mb_addr, &nbr, shape, &mvd, &inc, &lv);
-        let cost4 = ssd_luma(pic, e, mb_x, mb_y) as f64 + rd_lambda(qp) * bits4 as f64;
+        let mut lv4 = chroma_lv.clone();
+        code_luma_4x4(pic, e, mb_x, mb_y, qp, false, &mut lv4);
+        let bits4 = inter_mb_bits(pic, e, w, mb_addr, &nbr, shape, &mvd, &inc, &lv4);
+        let cost4 = ssd_mb(pic, e, mb_x, mb_y) as f64 + lambda_ssd(qp) * bits4 as f64;
         let mut recon4 = [0u8; 256];
         save_luma(pic, mb_x, mb_y, &mut recon4);
         restore_luma(pic, mb_x, mb_y, &pred);
-        let mut lv8 = Levels::default();
+        let mut lv8 = chroma_lv;
         code_luma_8x8(pic, e, mb_x, mb_y, qp, &mut lv8);
-        let bits8 = inter_luma_bits(pic, e, w, mb_addr, &nbr, shape, &mvd, &inc, &lv8);
-        let cost8 = ssd_luma(pic, e, mb_x, mb_y) as f64 + rd_lambda(qp) * bits8 as f64;
+        let bits8 = inter_mb_bits(pic, e, w, mb_addr, &nbr, shape, &mvd, &inc, &lv8);
+        let cost8 = ssd_mb(pic, e, mb_x, mb_y) as f64 + lambda_ssd(qp) * bits8 as f64;
         if cost8 < cost4 {
             lv = lv8;
         } else {
+            lv = lv4;
             restore_luma(pic, mb_x, mb_y, &recon4);
         }
     } else {
         code_luma_4x4(pic, e, mb_x, mb_y, qp, false, &mut lv);
     }
-    code_chroma(pic, e, mb_x, mb_y, qp, false, &mut lv);
     let empty = lv.cbp_luma == 0 && lv.cbp_chroma == 0;
     let skip = match ssd_skip {
         None => false,
         Some(_) if empty => true,
         Some(ssd_skip) => {
-            let coded =
-                ssd_mb(pic, e, mb_x, mb_y) as f64 + lambda_ssd(qp) * estimate_bits(&lv) as f64;
+            let coded = if e.transform_8x8 {
+                let bits = inter_mb_bits(pic, e, w, mb_addr, &nbr, shape, &mvd, &inc, &lv);
+                ssd_mb(pic, e, mb_x, mb_y) as f64 + lambda_ssd(qp) * bits as f64
+            } else {
+                ssd_mb(pic, e, mb_x, mb_y) as f64 + lambda_ssd(qp) * estimate_bits(&lv) as f64
+            };
             if ssd_skip as f64 <= coded {
                 // Put the prediction back: the residual has been added to it.
                 compensate_part(pic, reference, mb_x, mb_y, (0, 0), (16, 16), choice.skip_mv);

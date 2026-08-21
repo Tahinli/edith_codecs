@@ -122,6 +122,66 @@ fn psnr(a: &[u8], b: &[u8]) -> f64 {
     }
 }
 
+fn cubic_fit(xs: [f64; 4], ys: [f64; 4]) -> [f64; 4] {
+    let mut a = [[0.0; 5]; 4];
+    for i in 0..4 {
+        a[i] = [1.0, xs[i], xs[i] * xs[i], xs[i] * xs[i] * xs[i], ys[i]];
+    }
+    for col in 0..4 {
+        let mut pivot = col;
+        for row in col + 1..4 {
+            if a[row][col].abs() > a[pivot][col].abs() {
+                pivot = row;
+            }
+        }
+        a.swap(col, pivot);
+        let div = a[col][col];
+        assert!(div.abs() > 1e-12, "singular BD-PSNR fit");
+        for j in col..5 {
+            a[col][j] /= div;
+        }
+        for row in 0..4 {
+            if row == col {
+                continue;
+            }
+            let f = a[row][col];
+            for j in col..5 {
+                a[row][j] -= f * a[col][j];
+            }
+        }
+    }
+    [a[0][4], a[1][4], a[2][4], a[3][4]]
+}
+
+fn cubic_integral(c: [f64; 4], x: f64) -> f64 {
+    c[0] * x + c[1] * x * x / 2.0 + c[2] * x * x * x / 3.0 + c[3] * x * x * x * x / 4.0
+}
+
+fn bd_psnr_delta(candidate: &[(f64, f64)], anchor: &[(f64, f64)]) -> f64 {
+    let xs_candidate = std::array::from_fn(|i| candidate[i].0.ln());
+    let ys_candidate = std::array::from_fn(|i| candidate[i].1);
+    let xs_anchor = std::array::from_fn(|i| anchor[i].0.ln());
+    let ys_anchor = std::array::from_fn(|i| anchor[i].1);
+    let lo = xs_candidate
+        .iter()
+        .copied()
+        .fold(f64::INFINITY, f64::min)
+        .max(xs_anchor.iter().copied().fold(f64::INFINITY, f64::min));
+    let hi = xs_candidate
+        .iter()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max)
+        .min(xs_anchor.iter().copied().fold(f64::NEG_INFINITY, f64::max));
+    assert!(hi > lo, "BD-PSNR curves do not overlap in bitrate");
+    let c_candidate = cubic_fit(xs_candidate, ys_candidate);
+    let c_anchor = cubic_fit(xs_anchor, ys_anchor);
+    (cubic_integral(c_candidate, hi)
+        - cubic_integral(c_candidate, lo)
+        - cubic_integral(c_anchor, hi)
+        + cubic_integral(c_anchor, lo))
+        / (hi - lo)
+}
+
 /// The encoder's reconstruction and a decode of its bitstream agree sample for
 /// sample, over a QP sweep, both presets, single and multi threaded.
 #[test]
@@ -404,31 +464,23 @@ fn eight_by_eight_gains_on_flat_and_text() {
         }
         (bits as f64, sum_psnr / 10.0, share)
     };
-    // Interpolate the off curve at the on point's bits / PSNR.
-    let qp = 26;
-    let (bits_on, psnr_on, share) = run(true, qp);
-    let off: Vec<_> = [qp - 2, qp, qp + 2]
-        .iter()
-        .map(|&q| run(false, q))
-        .collect();
-    let (bits_off, psnr_off, _) = off[1];
-    // Local slopes of the off curve, from the neighbouring QPs.
-    let dpsnr_dbits = (off[0].1 - off[2].1) / (off[0].0 - off[2].0);
-    let psnr_off_at_on_bits = psnr_off + (bits_on - bits_off) * dpsnr_dbits;
-    let bits_off_at_on_psnr = bits_off + (psnr_on - psnr_off) / dpsnr_dbits;
-    let gain_db = psnr_on - psnr_off_at_on_bits;
-    let saving = 1.0 - bits_on / bits_off_at_on_psnr;
+    let qps = [22, 26, 30, 34];
+    let on: Vec<_> = qps.iter().map(|&q| run(true, q)).collect();
+    let off: Vec<_> = qps.iter().map(|&q| run(false, q)).collect();
+    let on_curve: Vec<_> = on.iter().map(|&(bits, psnr, _)| (bits, psnr)).collect();
+    let off_curve: Vec<_> = off.iter().map(|&(bits, psnr, _)| (bits, psnr)).collect();
+    let bd = bd_psnr_delta(&on_curve, &off_curve);
+    let share = on.iter().map(|&(_, _, share)| share).sum::<f64>() / on.len() as f64;
+    const OLD_FLAG_ON_BD_PSNR_DB: f64 = 0.255_347;
     eprintln!(
-        "8x8 qp {qp}: on {bits_on:.0} bits {psnr_on:.2} dB, off {bits_off:.0} bits {psnr_off:.2} dB; \
-         gain at equal bits {gain_db:+.2} dB, saving at equal PSNR {:.1}%, 8x8 MB share {:.1}%",
-        saving * 100.0,
+        "8x8 BD-PSNR over q22/26/30/34: {bd:+.3} dB, average 8x8 MB share {:.1}%",
         share * 100.0
     );
     assert!(share > 0.0, "no 8x8 macroblocks were coded");
+    assert!(bd >= 0.0, "8x8 BD-PSNR {bd:+.3} dB is below flag-off");
     assert!(
-        gain_db >= 0.05 || saving >= 0.05,
-        "8x8 gain {gain_db:+.2} dB / {:.1}% is below the bar",
-        saving * 100.0
+        bd + 0.02 >= OLD_FLAG_ON_BD_PSNR_DB,
+        "8x8 BD-PSNR {bd:+.3} dB regressed more than 0.02 dB from the old flag-on gate"
     );
 }
 

@@ -28,8 +28,8 @@ mod quant;
 mod rc;
 mod vlc;
 
-use ec_core::BitWriter;
 use ec_core::error::{Error, Result};
+use ec_core::BitWriter;
 use ec_h264_syntax::nal::{NalUnitType, escape_rbsp};
 use ec_h264_syntax::{SliceType, Sps};
 
@@ -189,13 +189,6 @@ impl Encoder {
                 "picture larger than 8192 samples",
                 "no level defines a picture this large for this profile",
             ));
-        }
-        // corner-cut: high-QP 8x8 trials bought header/syntax cost without a
-        // matched-bit quality win on the harness clips; revisit with a
-        // picture-level RD curve instead of a macroblock-only decision.
-        let mut cfg = cfg;
-        if cfg.transform_8x8 && cfg.bitrate == 0 && cfg.qp >= 30 {
-            cfg.transform_8x8 = false;
         }
         let mb_w = cfg.width.div_ceil(16);
         let mb_h = cfg.height.div_ceil(16);
@@ -517,7 +510,7 @@ fn code_band(pic: &mut Picture, job: BandJob<'_>) -> Vec<u8> {
         slice_id: job.slice_id,
         qp: job.qp,
         target_qp: job.qp,
-        lambda: lambda_for(job.qp),
+        lambda_motion: lambda_for(job.qp, job.cfg.transform_8x8),
         preset: job.cfg.preset,
         transform_8x8: job.cfg.transform_8x8,
         ls: LevelScale4x4::new(&[16; 16]),
@@ -535,7 +528,7 @@ fn code_band(pic: &mut Picture, job: BandJob<'_>) -> Vec<u8> {
             let expected = job.band_target * n as f64 / rows as f64;
             let delta = job.rc.row_delta(spent, expected);
             e.target_qp = (job.qp + delta).clamp(10, 51);
-            e.lambda = lambda_for(e.target_qp);
+            e.lambda_motion = lambda_for(e.target_qp, job.cfg.transform_8x8);
         }
         for mb_x in 0..mb_w {
             let addr = mb_y * mb_w + mb_x;
@@ -547,10 +540,19 @@ fn code_band(pic: &mut Picture, job: BandJob<'_>) -> Vec<u8> {
     w.finish(job.slice_type == SliceType::P)
 }
 
-/// Lagrangian multiplier for mode decision in the SATD domain.
-fn lambda_for(qp: i32) -> i32 {
-    // 2^((qp - 12) / 6), the usual ladder, floored at 1.
-    (((f64::from(qp) - 12.0) / 6.0).exp2().round() as i32).max(1)
+/// Standard Lagrangian multiplier in the squared-error domain.
+pub(crate) fn lambda_ssd(qp: i32) -> f64 {
+    0.85 * ((f64::from(qp) - 12.0) / 3.0).exp2()
+}
+
+/// Lagrangian multiplier for SATD and motion-vector costs.
+fn lambda_for(qp: i32, transform_8x8: bool) -> f64 {
+    if transform_8x8 {
+        lambda_ssd(qp).sqrt()
+    } else {
+        // The established 4x4 path stays byte-stable when the feature is off.
+        (((f64::from(qp) - 12.0) / 6.0).exp2().round()).max(1.0)
+    }
 }
 
 /// Split `mb_h` macroblock rows into at most `n` contiguous bands.
