@@ -4,7 +4,7 @@
 //! was opened with.
 
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Cursor};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -783,6 +783,43 @@ fn the_first_cluster_is_reachable_when_no_cue_names_it() {
             packet.pts
         );
         break;
+    }
+}
+
+#[test]
+fn truncated_prefixes_are_eof_not_corrupt() {
+    let path = fixtures().join("audio/av-h264-aac-stereo-48000.mkv");
+    let data = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let mut table = Vec::new();
+    for i in 1..=64usize {
+        let cut = data.len() * i / 64;
+        let (class, packets) = matroska_prefix_class(&data[..cut]);
+        table.push(format!("{i:02},{cut},{class},{packets}"));
+        assert!(
+            matches!(class, "NeedMore" | "Open+Eof"),
+            "{}\nidx,cut,class,packets\n{}",
+            path.display(),
+            table.join("\n")
+        );
+    }
+    println!("{}\nidx,cut,class,packets\n{}", path.display(), table.join("\n"));
+}
+
+fn matroska_prefix_class(data: &[u8]) -> (&'static str, u64) {
+    let mut demuxer = match MatroskaDemuxer::new(Cursor::new(data.to_vec())) {
+        Ok(demuxer) => demuxer,
+        Err(Error::NeedMore) => return ("NeedMore", 0),
+        Err(Error::Corrupt { .. }) => return ("Corrupt", 0),
+        Err(e) => panic!("unexpected Matroska prefix error: {e}"),
+    };
+    let mut packets = 0;
+    loop {
+        match demuxer.next_packet() {
+            Ok(_) => packets += 1,
+            Err(Error::Eof) => return ("Open+Eof", packets),
+            Err(Error::NeedMore | Error::Corrupt { .. }) => return ("Corrupt", packets),
+            Err(e) => panic!("unexpected Matroska packet error: {e}"),
+        }
     }
 }
 

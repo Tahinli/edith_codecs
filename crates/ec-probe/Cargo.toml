@@ -1,6 +1,6 @@
 [package]
 name = "ec-probe"
-description = "Format detection and one unified audio reader: WAV/MP3/FLAC/ADTS in-crate, Ogg/mp4/Matroska delegated to their own crates."
+description = "Format detection and one unified audio reader: WAV/AVI/MP3/FLAC/ADTS in-crate, Ogg/mp4/Matroska delegated to their own crates."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -61,6 +61,56 @@ fn decode_some(reader: &mut Reader, stream: u32, secs: f64) -> Result<u64, Strin
     Ok(frames)
 }
 
+fn decode_stream_to_eof(
+    reader: &mut Reader,
+    stream: u32,
+    collect: bool,
+) -> Result<(u64, u64, Vec<f32>), String> {
+    let mut decoder = reader.make_decoder(stream).map_err(|e| e.to_string())?;
+    let mut scratch = Vec::new();
+    let mut pcm = Vec::new();
+    let mut packets = 0u64;
+    let mut frames = 0u64;
+    loop {
+        let packet = match reader.next_packet() {
+            Ok(p) => p,
+            Err(e) if e.is_eof() => break,
+            Err(e) => return Err(format!("demux: {e}")),
+        };
+        if packet.stream != stream {
+            continue;
+        }
+        decoder
+            .decode(&packet, &mut scratch)
+            .map_err(|e| format!("decode: {e}"))?;
+        packets += 1;
+        frames += (scratch.len() / decoder.channels().max(1)) as u64;
+        if collect {
+            pcm.extend_from_slice(&scratch);
+        }
+    }
+    decoder
+        .flush(&mut scratch)
+        .map_err(|e| format!("flush: {e}"))?;
+    frames += (scratch.len() / decoder.channels().max(1)) as u64;
+    if collect {
+        pcm.extend_from_slice(&scratch);
+    }
+    Ok((packets, frames, pcm))
+}
+
+fn corr(a: &[f32], b: &[f32]) -> f64 {
+    let n = a.len().min(b.len());
+    let (mut num, mut a2, mut b2) = (0.0f64, 0.0f64, 0.0f64);
+    for i in 0..n {
+        let (x, y) = (a[i] as f64, b[i] as f64);
+        num += x * y;
+        a2 += x * x;
+        b2 += y * y;
+    }
+    num / (a2.sqrt() * b2.sqrt()).max(1e-12)
+}
+
 /// Ten files with sound, standalone audio first, then Matroska — opened,
 /// decoded and seeked, with a per-file row in the report.
 #[test]
@@ -197,6 +247,82 @@ fn a_real_library_sweep() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+#[test]
+fn avi_audio_chunks_end_cleanly_on_real_files() {
+    let files = [
+        "/home/tahinli/Downloads/Little.Woman.2019.DVDScr.XVID.AC3.HQ.Hive-CM8/Little.Woman.2019.DVDScr.XVID.AC3.HQ.Hive-CM8.avi",
+        "/home/tahinli/Downloads/Little.Woman.2019.DVDScr.XVID.AC3.HQ.Hive-CM8/sample.avi",
+    ];
+    let mut present = 0;
+    for path in files {
+        let path = Path::new(path);
+        if !path.exists() {
+            continue;
+        }
+        present += 1;
+        let mut reader = Reader::open(path).expect("AVI opens");
+        let audio = reader
+            .default_stream(MediaType::Audio)
+            .expect("AVI audio stream")
+            .index;
+        let (packets, frames, _) =
+            decode_stream_to_eof(&mut reader, audio, false).unwrap_or_else(|e| {
+                panic!("{}: {e}", path.display());
+            });
+        eprintln!(
+            "{}: open ok, packets {packets}, decode-to-EOF {frames} frames",
+            path.display()
+        );
+        assert!(packets > 0, "{}: no audio packets", path.display());
+        assert!(frames > 0, "{}: no decoded audio", path.display());
+    }
+    assert!(present > 0, "AVI files absent");
+}
+
+#[test]
+fn avi_ac3_matches_reference_decoder_on_real_sample() {
+    let path = Path::new(
+        "/home/tahinli/Downloads/Little.Woman.2019.DVDScr.XVID.AC3.HQ.Hive-CM8/sample.avi",
+    );
+    if !path.exists() {
+        eprintln!("file not present, skipping");
+        return;
+    }
+
+    let mut reader = Reader::open(path).expect("AVI opens");
+    let audio = reader
+        .default_stream(MediaType::Audio)
+        .expect("AVI audio stream")
+        .index;
+    let (packets, frames, ours) =
+        decode_stream_to_eof(&mut reader, audio, true).expect("AVI decodes to EOF");
+    assert!(packets > 0, "no packets");
+    assert!(frames > 0, "no decoded frames");
+
+    let out = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args(["-map", "0:a:0", "-f", "f32le", "-acodec", "pcm_f32le", "-"])
+        .output()
+        .expect("reference decoder runs");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let theirs: Vec<f32> = out
+        .stdout
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    let score = corr(&ours, &theirs);
+    eprintln!(
+        "{}: open ok, packets {packets}, decode-to-EOF {frames} frames, corr {score:.6}",
+        path.display()
+    );
+    assert!(score > 0.999, "corr vs reference decoder = {score}");
+}
+
 /// The TrueHD remux in his library: the track decodes through the unified
 /// reader, 7.1 at 48 kHz, with the AC-3 track beside it still decoding too.
 #[test]
@@ -312,7 +438,11 @@ fn a_cover_art_tagged_mp3_opens() {
         .args(["-map", "0:a:0", "-f", "f32le", "-acodec", "pcm_f32le", "-"])
         .output()
         .expect("ffmpeg runs");
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let theirs: Vec<f32> = out
         .stdout
         .chunks_exact(4)

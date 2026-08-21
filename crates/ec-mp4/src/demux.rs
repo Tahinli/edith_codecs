@@ -123,6 +123,14 @@ impl<R: Read + Seek> Mp4Demuxer<R> {
     /// Read the movie header of `r` and build its sample tables.
     pub fn new(r: R) -> Result<Mp4Demuxer<R>> {
         let mut src = Src::new(r)?;
+        let mut head = [0u8; 12];
+        let got = src.read_upto(0, &mut head)?;
+        if got >= 8 && !crate::is_mp4(&head[..got]) {
+            return Err(Error::unsupported(
+                "this file",
+                "it is not an mp4 or QuickTime container",
+            ));
+        }
         let end = src.len;
         let mut moov = None;
         let mut moofs = Vec::new();
@@ -130,10 +138,10 @@ impl<R: Read + Seek> Mp4Demuxer<R> {
         // The top level, box by box: the header of each is 8 bytes and the rest
         // is skipped by seeking, so opening a 12 GB film costs a handful of
         // reads.
-        while let Some((kind, body, stop)) = src.header_at(at, end)? {
+        while let Some((kind, body, stop, complete)) = src.header_at(at, end)? {
             match &kind {
-                b"moov" => moov = Some((body, stop)),
-                b"moof" => moofs.push((at, body, stop)),
+                b"moov" if complete => moov = Some((body, stop)),
+                b"moof" if complete => moofs.push((at, body, stop)),
                 _ => {}
             }
             if stop <= at {
@@ -141,12 +149,7 @@ impl<R: Read + Seek> Mp4Demuxer<R> {
             }
             at = stop;
         }
-        let (body, stop) = moov.ok_or_else(|| match moofs.is_empty() {
-            // A file that ends before its trailing moov is a truncated
-            // download, not a broken container.
-            true => Error::NeedMore,
-            false => Error::corrupt("mp4: fragments with no moov to describe them"),
-        })?;
+        let (body, stop) = moov.ok_or(Error::NeedMore)?;
         let data = src.read_vec(body, stop.saturating_sub(body), MOOV_LIMIT)?;
         let mut me = Mp4Demuxer {
             src,
@@ -260,9 +263,14 @@ impl<R: Read + Seek> Mp4Demuxer<R> {
             return Err(Error::Eof);
         };
         let time_base = trak.time_base;
-        let data = self
+        let data = match self
             .src
-            .read_vec(sample.offset, u64::from(sample.size), SAMPLE_LIMIT)?;
+            .read_vec(sample.offset, u64::from(sample.size), SAMPLE_LIMIT)
+        {
+            Ok(data) => data,
+            Err(e) if e.is_need_more() => return Err(Error::Eof),
+            Err(e) => return Err(e),
+        };
         Ok(packet_of(stream, time_base, &sample, data))
     }
 
@@ -637,9 +645,14 @@ impl<R: Read + Seek + Send> Demuxer for Mp4Demuxer<R> {
         trak.cursor += 1;
         let stream = trak.stream.unwrap_or(0);
         let time_base = trak.time_base;
-        let data = self
+        let data = match self
             .src
-            .read_vec(sample.offset, u64::from(sample.size), SAMPLE_LIMIT)?;
+            .read_vec(sample.offset, u64::from(sample.size), SAMPLE_LIMIT)
+        {
+            Ok(data) => data,
+            Err(e) if e.is_need_more() => return Err(Error::Eof),
+            Err(e) => return Err(e),
+        };
         Ok(packet_of(stream, time_base, &sample, data))
     }
 

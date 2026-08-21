@@ -7,7 +7,7 @@
 
 use std::io::Cursor;
 
-use ec_riff::{SampleType, WavReader, WavSpec, WavWriter};
+use ec_riff::{AviReader, Error, SampleType, WavReader, WavSpec, WavWriter};
 
 /// Deterministic samples in `bits`-bit range: a walking pattern that exercises
 /// both signs and the extremes of the depth.
@@ -194,6 +194,74 @@ fn truncated_and_placeholder_sizes_read_what_is_there() {
     let mut r = WavReader::new(Cursor::new(&stream[..])).unwrap();
     assert_eq!(r.duration(), None);
     assert_eq!(r.read_all_i32().unwrap(), samples);
+}
+
+#[test]
+fn avi_truncated_tail_is_end_of_stream() {
+    fn chunk(out: &mut Vec<u8>, id: &[u8; 4], body: &[u8]) {
+        out.extend_from_slice(id);
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        out.extend_from_slice(body);
+        if body.len() % 2 == 1 {
+            out.push(0);
+        }
+    }
+
+    fn list(out: &mut Vec<u8>, kind: &[u8; 4], body: &[u8]) {
+        out.extend_from_slice(b"LIST");
+        out.extend_from_slice(&((body.len() + 4) as u32).to_le_bytes());
+        out.extend_from_slice(kind);
+        out.extend_from_slice(body);
+        if body.len() % 2 == 1 {
+            out.push(0);
+        }
+    }
+
+    let mut strh = Vec::new();
+    strh.extend_from_slice(b"auds");
+    strh.extend_from_slice(&[0; 52]);
+    let mut strf = Vec::new();
+    strf.extend_from_slice(&0x2000u16.to_le_bytes());
+    strf.extend_from_slice(&2u16.to_le_bytes());
+    strf.extend_from_slice(&48_000u32.to_le_bytes());
+    strf.extend_from_slice(&0u32.to_le_bytes());
+    strf.extend_from_slice(&0u16.to_le_bytes());
+    strf.extend_from_slice(&0u16.to_le_bytes());
+    let mut strl = Vec::new();
+    chunk(&mut strl, b"strh", &strh);
+    chunk(&mut strl, b"strf", &strf);
+    let mut hdrl = Vec::new();
+    list(&mut hdrl, b"strl", &strl);
+    chunk(&mut hdrl, b"dmlh", &[0, 0, 0, 0]);
+
+    let mut rec = Vec::new();
+    chunk(&mut rec, b"00wb", &[1, 2, 3]);
+    let mut movi = Vec::new();
+    chunk(&mut movi, b"00wb", &[0x0b, 0x77, 0, 0]);
+    chunk(&mut movi, b"indx", &[0; 16]);
+    list(&mut movi, b"rec ", &rec);
+    movi.extend_from_slice(b"00");
+
+    let mut body = Vec::new();
+    list(&mut body, b"hdrl", &hdrl);
+    list(&mut body, b"movi", &movi);
+    let mut avi = Vec::new();
+    avi.extend_from_slice(b"RIFF");
+    avi.extend_from_slice(&((body.len() + 4) as u32).to_le_bytes());
+    avi.extend_from_slice(b"AVI ");
+    avi.extend_from_slice(&body);
+
+    let mut reader = AviReader::new(Cursor::new(&avi)).expect("AVI opens");
+    assert_eq!(reader.audio_streams()[0].format_tag, 0x2000);
+    assert_eq!(
+        reader.next_packet().expect("first packet").data,
+        [0x0b, 0x77, 0, 0]
+    );
+    assert_eq!(reader.next_packet().expect("nested packet").data, [1, 2, 3]);
+    let err = reader
+        .next_packet()
+        .expect_err("truncated tail ends the stream");
+    assert!(matches!(err, Error::Eof));
 }
 
 #[test]
