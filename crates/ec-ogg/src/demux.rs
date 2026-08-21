@@ -416,6 +416,9 @@ impl<R: Read + Seek + Send> Demuxer for OggDemuxer<R> {
             .ok_or_else(|| Error::corrupt(format!("Ogg seek: no stream {stream}")))?;
         let serial = self.tracks[index].serial;
         let target = to.rescale(info.time_base, ec_core::Rounding::Down).ticks;
+        let first_stream_page = self
+            .page_at_or_after(self.data_start, serial)?
+            .map(|(offset, _)| offset);
 
         let end = self.inner.seek(SeekFrom::End(0))?;
         let mut lo = self.data_start;
@@ -453,6 +456,13 @@ impl<R: Read + Seek + Send> Demuxer for OggDemuxer<R> {
         };
         self.reset_state();
         let granule = match found {
+            // The first data page is the stream head. Replaying it must behave
+            // exactly like a fresh open: its packet carries the head trim
+            // granule, and the packet's timestamp still starts at zero.
+            Some((offset, _)) if Some(offset) == first_stream_page => {
+                self.inner.seek(SeekFrom::Start(offset))?;
+                0
+            }
             // A granule is where a page *ends*, and a Vorbis or FLAC packet
             // states no duration of its own — so reading from the page the
             // bisection found would hand out its packets with no timestamp at
