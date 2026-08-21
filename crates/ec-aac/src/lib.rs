@@ -153,6 +153,11 @@ impl AacDecoder {
         Ok(AacDecoder::with_config(parse_audio_specific_config(data)?))
     }
 
+    /// Successful access units that used perceptual noise substitution.
+    pub fn pns_aus(&self) -> usize {
+        self.block.pns_aus()
+    }
+
     /// The configuration this decoder was built with, if any.
     pub fn config(&self) -> Option<&AudioSpecificConfig> {
         self.config.as_ref()
