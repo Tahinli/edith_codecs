@@ -30,19 +30,14 @@
 use ec_core::{Error, Result};
 
 use crate::celt::{
-    self, BITRES, E_BANDS, E_MEANS, E_PROB_MODEL, FINE_OFFSET, LOG_N, LOG2_FRAC, MAX_FINE_BITS,
-    NB_BANDS, OVERLAP, PREEMPH, QTHETA_OFFSET, QTHETA_OFFSET_TWOPHASE, SHORT_MDCT, SIG_SCALE,
-    SMALL_ENERGY_ICDF, SPREAD_ICDF, SPREAD_NORMAL, TF_SELECT, TRIM_ICDF,
+    self, BETA_COEF, BETA_INTRA, BITRES, CACHE_CAPS, E_BANDS, E_MEANS, E_PROB_MODEL, LOG_N,
+    MAX_FINE_BITS, NB_BANDS, OVERLAP, PRED_COEF, PREEMPH, QTHETA_OFFSET, QTHETA_OFFSET_TWOPHASE,
+    SHORT_MDCT, SIG_SCALE, SMALL_ENERGY_ICDF, SPREAD_ICDF, SPREAD_NORMAL, TF_SELECT, TRIM_ICDF,
+    bitexact_cos, bitexact_log2tan, bits2pulses, cache_index, compute_allocation_encode,
+    compute_qn, deinterleave_hadamard, exp_rotation, frac_mul16, get_pulses, haar1, pulses2bits,
+    unext,
 };
 use crate::range::RangeEncoder;
-
-/// `BAND_ALLOCATION` and friends live in the decoder module; local aliases
-/// keep the transcription below readable.
-use crate::celt::{
-    BAND_ALLOCATION, BETA_COEF, BETA_INTRA, CACHE_CAPS, PRED_COEF, bitexact_cos, bitexact_log2tan,
-    bits2pulses, cache_index, compute_qn, deinterleave_hadamard, exp_rotation, frac_mul16,
-    get_pulses, haar1, pulses2bits, unext,
-};
 
 const CACHE_BITS: &[u8] = &crate::celt::CACHE_BITS;
 
@@ -739,19 +734,27 @@ impl CeltEncoder {
             0
         };
         bits -= anti_collapse_rsv;
-        let mut balance = 0i32;
-        let coded_bands = self.compute_allocation(
+        let alloc = compute_allocation_encode(
             enc,
             start,
             end,
             alloc_trim,
-            &mut intensity,
-            &mut dual_stereo,
             bits,
-            &mut balance,
             c,
             lm,
+            &self.offsets,
+            &self.caps,
+            &mut self.pulses,
+            &mut self.fine_quant,
+            &mut self.fine_priority,
+            intensity,
+            dual_stereo,
+            self.last_coded_bands,
         );
+        let intensity = alloc.intensity;
+        let dual_stereo = alloc.dual_stereo;
+        let balance = alloc.balance;
+        let coded_bands = alloc.coded_bands;
         self.last_coded_bands = coded_bands;
 
         // --- Fine energy ----------------------------------------------------
@@ -1125,322 +1128,6 @@ impl CeltEncoder {
         for i in start..end {
             self.tf_res[i] = TF_SELECT[lm][4 * t + 2 * tf_select + self.tf_res[i] as usize];
         }
-    }
-
-    // -- Allocation (encode side of the decoder's implicit derivation) -------
-
-    #[allow(clippy::too_many_arguments)]
-    fn compute_allocation(
-        &mut self,
-        enc: &mut RangeEncoder,
-        start: usize,
-        end: usize,
-        alloc_trim: i32,
-        intensity: &mut usize,
-        dual_stereo: &mut bool,
-        total: i32,
-        balance: &mut i32,
-        c: usize,
-        lm: usize,
-    ) -> usize {
-        let mut total = total.max(0);
-        let mut skip_start = start;
-        let skip_rsv = if total >= 1 << BITRES { 1 << BITRES } else { 0 };
-        total -= skip_rsv;
-        let mut intensity_rsv = 0;
-        let mut dual_stereo_rsv = 0;
-        if c == 2 {
-            intensity_rsv = LOG2_FRAC[end - start];
-            if intensity_rsv > total {
-                intensity_rsv = 0;
-            } else {
-                total -= intensity_rsv;
-                dual_stereo_rsv = if total >= 1 << BITRES { 1 << BITRES } else { 0 };
-                total -= dual_stereo_rsv;
-            }
-        }
-
-        let mut thresh = [0i32; NB_BANDS];
-        let mut trim_offset = [0i32; NB_BANDS];
-        for j in start..end {
-            let width = (E_BANDS[j + 1] - E_BANDS[j]) as i32;
-            thresh[j] = ((c as i32) << BITRES).max((((3 * width) << lm) << BITRES) >> 4);
-            trim_offset[j] = (c as i32
-                * width
-                * (alloc_trim - 5 - lm as i32)
-                * (end - j - 1) as i32
-                * (1 << (lm as u32 + BITRES)))
-                >> 6;
-            if (width << lm) == 1 {
-                trim_offset[j] -= (c as i32) << BITRES;
-            }
-        }
-
-        let mut lo = 1i32;
-        let mut hi = BAND_ALLOCATION.len() as i32 - 1;
-        while lo <= hi {
-            let mid = (lo + hi) >> 1;
-            let mut psum = 0;
-            let mut done = false;
-            for j in (start..end).rev() {
-                let width = (E_BANDS[j + 1] - E_BANDS[j]) as i32;
-                let mut bitsj =
-                    (c as i32 * width * BAND_ALLOCATION[mid as usize][j] as i32) << lm >> 2;
-                if bitsj > 0 {
-                    bitsj = 0.max(bitsj + trim_offset[j]);
-                }
-                bitsj += self.offsets[j];
-                if bitsj >= thresh[j] || done {
-                    done = true;
-                    psum += bitsj.min(self.caps[j]);
-                } else if bitsj >= (c as i32) << BITRES {
-                    psum += (c as i32) << BITRES;
-                }
-            }
-            if psum > total {
-                hi = mid - 1;
-            } else {
-                lo = mid + 1;
-            }
-        }
-        let hi = lo;
-        let lo = lo - 1;
-
-        let mut bits1 = [0i32; NB_BANDS];
-        let mut bits2 = [0i32; NB_BANDS];
-        for j in start..end {
-            let width = (E_BANDS[j + 1] - E_BANDS[j]) as i32;
-            let mut b1 = (c as i32 * width * BAND_ALLOCATION[lo as usize][j] as i32) << lm >> 2;
-            let mut b2 = if hi as usize >= BAND_ALLOCATION.len() {
-                self.caps[j]
-            } else {
-                (c as i32 * width * BAND_ALLOCATION[hi as usize][j] as i32) << lm >> 2
-            };
-            if b1 > 0 {
-                b1 = 0.max(b1 + trim_offset[j]);
-            }
-            if b2 > 0 {
-                b2 = 0.max(b2 + trim_offset[j]);
-            }
-            if lo > 0 {
-                b1 += self.offsets[j];
-            }
-            b2 += self.offsets[j];
-            if self.offsets[j] > 0 {
-                skip_start = j;
-            }
-            bits1[j] = b1;
-            bits2[j] = 0.max(b2 - b1);
-        }
-
-        self.interp_bits2pulses(
-            enc,
-            start,
-            end,
-            skip_start,
-            &bits1,
-            &bits2,
-            &thresh,
-            total,
-            balance,
-            skip_rsv,
-            intensity,
-            intensity_rsv,
-            dual_stereo,
-            dual_stereo_rsv,
-            c,
-            lm,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn interp_bits2pulses(
-        &mut self,
-        enc: &mut RangeEncoder,
-        start: usize,
-        end: usize,
-        skip_start: usize,
-        bits1: &[i32; NB_BANDS],
-        bits2: &[i32; NB_BANDS],
-        thresh: &[i32; NB_BANDS],
-        mut total: i32,
-        balance_out: &mut i32,
-        skip_rsv: i32,
-        intensity: &mut usize,
-        mut intensity_rsv: i32,
-        dual_stereo: &mut bool,
-        mut dual_stereo_rsv: i32,
-        c: usize,
-        lm: usize,
-    ) -> usize {
-        const ALLOC_STEPS: u32 = 6;
-        let alloc_floor = (c as i32) << BITRES;
-        let stereo = c > 1;
-        let log_m = (lm as i32) << BITRES;
-        let prev = self.last_coded_bands;
-
-        let mut lo = 0i32;
-        let mut hi = 1i32 << ALLOC_STEPS;
-        for _ in 0..ALLOC_STEPS {
-            let mid = (lo + hi) >> 1;
-            let mut psum = 0;
-            let mut done = false;
-            for j in (start..end).rev() {
-                let tmp = bits1[j] + ((mid * bits2[j]) >> ALLOC_STEPS);
-                if tmp >= thresh[j] || done {
-                    done = true;
-                    psum += tmp.min(self.caps[j]);
-                } else if tmp >= alloc_floor {
-                    psum += alloc_floor;
-                }
-            }
-            if psum > total {
-                hi = mid;
-            } else {
-                lo = mid;
-            }
-        }
-
-        let mut psum = 0;
-        let mut done = false;
-        let bits = &mut self.pulses;
-        for j in (start..end).rev() {
-            let mut tmp = bits1[j] + ((lo * bits2[j]) >> ALLOC_STEPS);
-            if tmp < thresh[j] && !done {
-                tmp = if tmp >= alloc_floor { alloc_floor } else { 0 };
-            } else {
-                done = true;
-            }
-            tmp = tmp.min(self.caps[j]);
-            bits[j] = tmp;
-            psum += tmp;
-        }
-
-        let mut coded_bands = end;
-        loop {
-            let j = coded_bands - 1;
-            if j <= skip_start {
-                total += skip_rsv;
-                break;
-            }
-            let mut left = total - psum;
-            let percoeff = left / (E_BANDS[coded_bands] - E_BANDS[start]) as i32;
-            left -= (E_BANDS[coded_bands] - E_BANDS[start]) as i32 * percoeff;
-            let rem = 0.max(left - (E_BANDS[j] - E_BANDS[start]) as i32);
-            let band_width = (E_BANDS[coded_bands] - E_BANDS[j]) as i32;
-            let mut band_bits = self.pulses[j] + percoeff * band_width + rem;
-            if band_bits >= thresh[j].max(alloc_floor + (1 << BITRES)) {
-                // The one non-mandatory choice in the allocation: whether to
-                // stop skipping, with the reference's hysteresis on the band
-                // count of the previous frame.
-                let stay = band_bits
-                    > (((if j < prev { 7 } else { 9 }) * band_width) << lm << BITRES) >> 4;
-                enc.enc_bit_logp(stay, 1);
-                if stay {
-                    break;
-                }
-                psum += 1 << BITRES;
-                band_bits -= 1 << BITRES;
-            }
-            psum -= self.pulses[j] + intensity_rsv;
-            if intensity_rsv > 0 {
-                intensity_rsv = LOG2_FRAC[j - start];
-            }
-            psum += intensity_rsv;
-            if band_bits >= alloc_floor {
-                psum += alloc_floor;
-                self.pulses[j] = alloc_floor;
-            } else {
-                self.pulses[j] = 0;
-            }
-            coded_bands -= 1;
-        }
-
-        debug_assert!(coded_bands > start);
-        if intensity_rsv > 0 {
-            *intensity = (*intensity).min(coded_bands);
-            enc.enc_uint(
-                (*intensity - start) as u32,
-                (coded_bands + 1 - start) as u32,
-            );
-        } else {
-            *intensity = 0;
-        }
-        if *intensity <= start {
-            total += dual_stereo_rsv;
-            dual_stereo_rsv = 0;
-        }
-        if dual_stereo_rsv > 0 {
-            enc.enc_bit_logp(*dual_stereo, 1);
-        } else {
-            *dual_stereo = false;
-        }
-
-        let mut left = total - psum;
-        let percoeff = left / (E_BANDS[coded_bands] - E_BANDS[start]) as i32;
-        left -= (E_BANDS[coded_bands] - E_BANDS[start]) as i32 * percoeff;
-        for j in start..coded_bands {
-            self.pulses[j] += percoeff * (E_BANDS[j + 1] - E_BANDS[j]) as i32;
-        }
-        for j in start..coded_bands {
-            let tmp = left.min((E_BANDS[j + 1] - E_BANDS[j]) as i32);
-            self.pulses[j] += tmp;
-            left -= tmp;
-        }
-
-        let mut balance = 0i32;
-        for j in start..coded_bands {
-            let n0 = (E_BANDS[j + 1] - E_BANDS[j]) as i32;
-            let n = n0 << lm;
-            self.pulses[j] += balance;
-            let mut excess;
-            if n > 1 {
-                excess = 0.max(self.pulses[j] - self.caps[j]);
-                self.pulses[j] -= excess;
-                let den =
-                    c as i32 * n + i32::from(c == 2 && n > 2 && !*dual_stereo && j < *intensity);
-                let nc_log_n = den * (LOG_N[j] + log_m);
-                let mut offset = (nc_log_n >> 1) - den * FINE_OFFSET;
-                if n == 2 {
-                    offset += den << BITRES >> 2;
-                }
-                if self.pulses[j] + offset < (den * 2) << BITRES {
-                    offset += nc_log_n >> 2;
-                } else if self.pulses[j] + offset < (den * 3) << BITRES {
-                    offset += nc_log_n >> 3;
-                }
-                let mut eb =
-                    0.max((self.pulses[j] + offset + (den << (BITRES - 1))) / (den << BITRES));
-                if c as i32 * eb > (self.pulses[j] >> BITRES) {
-                    eb = self.pulses[j] >> u32::from(stereo) >> BITRES;
-                }
-                eb = eb.min(MAX_FINE_BITS);
-                self.fine_quant[j] = eb;
-                self.fine_priority[j] = i32::from(eb * (den << BITRES) >= self.pulses[j] + offset);
-                self.pulses[j] -= (c as i32 * eb) << BITRES;
-            } else {
-                excess = 0.max(self.pulses[j] - ((c as i32) << BITRES));
-                self.pulses[j] -= excess;
-                self.fine_quant[j] = 0;
-                self.fine_priority[j] = 1;
-            }
-            if excess > 0 {
-                let extra_fine = (excess >> (u32::from(stereo) + BITRES))
-                    .min(MAX_FINE_BITS - self.fine_quant[j]);
-                self.fine_quant[j] += extra_fine;
-                let extra_bits = (extra_fine * c as i32) << BITRES;
-                self.fine_priority[j] = i32::from(extra_bits >= excess - balance);
-                excess -= extra_bits;
-            }
-            balance = excess;
-        }
-        *balance_out = balance;
-        for j in coded_bands..end {
-            self.fine_quant[j] = self.pulses[j] >> u32::from(stereo) >> BITRES;
-            self.pulses[j] = 0;
-            self.fine_priority[j] = i32::from(self.fine_quant[j] < 1);
-        }
-        coded_bands
     }
 
     // -- Band shapes ---------------------------------------------------------
@@ -2106,6 +1793,113 @@ mod tests {
                         let mut dec = RangeDecoder::new(&data);
                         let got = crate::celt::laplace_decode(&mut dec, fs, decay);
                         assert_eq!(got, v, "lm={lm} intra={intra} band={band} val={val}");
+                    }
+                }
+            }
+        }
+    }
+
+    fn allocation_caps(lm: usize, c: usize) -> [i32; NB_BANDS] {
+        let mut caps = [0i32; NB_BANDS];
+        for i in 0..NB_BANDS {
+            let bw = (E_BANDS[i + 1] - E_BANDS[i]) << lm;
+            caps[i] =
+                ((CACHE_CAPS[NB_BANDS * (2 * lm + c - 1) + i] as i32 + 64) * c as i32 * bw as i32)
+                    >> 2;
+        }
+        caps
+    }
+
+    #[test]
+    fn allocation_encoder_and_decoder_match_on_grid() {
+        let frame_grid = [(0usize, 120usize), (1, 240), (2, 480), (3, 960)];
+        let bitrate_grid = [16_000i32, 24_000, 48_000, 96_000, 192_000];
+        let stereo_grid = [
+            (0usize, false),
+            (8, false),
+            (12, true),
+            (18, false),
+            (NB_BANDS, true),
+        ];
+
+        for &(lm, frame_size) in &frame_grid {
+            assert_eq!(SHORT_MDCT << lm, frame_size);
+            for &bitrate in &bitrate_grid {
+                for &c in &[1usize, 2] {
+                    let start = 0usize;
+                    let end = NB_BANDS;
+                    let caps = allocation_caps(lm, c);
+                    let mut offsets = [0i32; NB_BANDS];
+                    for i in start..end {
+                        if (i + lm + bitrate as usize / 8_000 + c).is_multiple_of(7) {
+                            let width = ((c * (E_BANDS[i + 1] - E_BANDS[i])) << lm) as i32;
+                            offsets[i] = (width << BITRES).min(caps[i] / 2).max(0);
+                        }
+                    }
+                    let total = ((bitrate * frame_size as i32 / 48_000) << BITRES).max(2 << BITRES);
+                    let trim = ((bitrate / 24_000) + lm as i32 + c as i32).rem_euclid(11);
+                    let prev = end.saturating_sub((bitrate as usize / 24_000 + lm + c) % 6);
+                    let stereo_cases: &[(usize, bool)] =
+                        if c == 2 { &stereo_grid } else { &[(0, false)] };
+
+                    for &(requested_intensity, requested_dual) in stereo_cases {
+                        let mut ep = [0i32; NB_BANDS];
+                        let mut ef = [0i32; NB_BANDS];
+                        let mut eprio = [0i32; NB_BANDS];
+                        let mut enc = RangeEncoder::new();
+                        enc.reset(64);
+                        let er = compute_allocation_encode(
+                            &mut enc,
+                            start,
+                            end,
+                            trim,
+                            total,
+                            c,
+                            lm,
+                            &offsets,
+                            &caps,
+                            &mut ep,
+                            &mut ef,
+                            &mut eprio,
+                            requested_intensity,
+                            requested_dual,
+                            prev,
+                        );
+                        let enc_tell = enc.tell_frac();
+                        enc.done();
+                        assert!(!enc.error());
+
+                        let data = enc.data().to_vec();
+                        let mut dp = [0i32; NB_BANDS];
+                        let mut df = [0i32; NB_BANDS];
+                        let mut dprio = [0i32; NB_BANDS];
+                        let mut dec = RangeDecoder::new(&data);
+                        let dr = celt::compute_allocation_decode(
+                            &mut dec, start, end, trim, total, c, lm, &offsets, &caps, &mut dp,
+                            &mut df, &mut dprio,
+                        );
+
+                        assert_eq!(dr, er, "lm={lm} bitrate={bitrate} c={c}");
+                        assert_eq!(
+                            dec.tell_frac(),
+                            enc_tell,
+                            "tell lm={lm} bitrate={bitrate} c={c}"
+                        );
+                        assert_eq!(
+                            &dp[start..end],
+                            &ep[start..end],
+                            "pulses lm={lm} bitrate={bitrate} c={c}"
+                        );
+                        assert_eq!(
+                            &df[start..end],
+                            &ef[start..end],
+                            "fine lm={lm} bitrate={bitrate} c={c}"
+                        );
+                        assert_eq!(
+                            &dprio[start..end],
+                            &eprio[start..end],
+                            "priority lm={lm} bitrate={bitrate} c={c}"
+                        );
                     }
                 }
             }
