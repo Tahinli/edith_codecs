@@ -28,19 +28,21 @@ mod quant;
 mod rc;
 mod vlc;
 
-use ec_core::BitWriter;
 use ec_core::error::{Error, Result};
-use ec_h264_syntax::nal::{NalUnitType, escape_rbsp};
+use ec_core::BitWriter;
+use ec_h264_syntax::nal::{escape_rbsp, NalUnitType};
 use ec_h264_syntax::{SliceType, Sps};
 
 use crate::decoder::deblock_picture;
 use crate::dpb::{Picture, SliceParams as DeblockParams};
 use crate::entropy::{FLAG_INTER, FLAG_TRANS8X8};
+#[cfg(feature = "rd-ablation")]
+use crate::entropy::FLAG_SKIP;
 use crate::transform::{LevelScale4x4, LevelScale8x8};
 
 use entropy::EncEntropy;
-use headers::{SeqParams, SliceParams, write_pps, write_slice_header, write_sps};
-use mb::{MbEnc, Source, encode_mb};
+use headers::{write_pps, write_slice_header, write_sps, SeqParams, SliceParams};
+use mb::{encode_mb, MbEnc, Source};
 use rc::RateControl;
 
 pub use mb::Preset;
@@ -74,17 +76,21 @@ pub struct EncoderConfig {
     pub qp: i32,
     /// 8x8 transform (High profile). Off by default.
     ///
-    /// NOT SAFE TO SET YET: this only flips the SPS/PPS High-profile tail
-    /// (`profile_idc` 100, `transform_8x8_mode_flag`). Once the PPS carries
-    /// that flag, a conformant decoder unconditionally reads an extra
-    /// `transform_size_8x8_flag` per macroblock (7.3.5: every non-I16x16
-    /// intra macroblock, and every inter macroblock with a nonzero luma cbp —
-    /// see `decoder.rs:1151` and `:1789-1793`). Nothing in `enc::entropy` /
-    /// `enc::mb` writes that bit yet, so turning this on desyncs every real
-    /// stream (headers.rs's own tests only exercise the parameter sets, not a
-    /// full encode). Wiring that emission — and then the mode decision that
-    /// actually picks 8x8 blocks — is later work.
+    /// When enabled, eligible intra and inter luma macroblocks write
+    /// `transform_size_8x8_flag` and choose the 8x8 path with a squared-error
+    /// rate-distortion cost. Leaving it off preserves the Baseline/Main-profile
+    /// 4x4 path.
     pub transform_8x8: bool,
+    #[cfg(feature = "rd-ablation")]
+    rd_lambda_standard: bool,
+    #[cfg(feature = "rd-ablation")]
+    rd_transform_8x8_intra: bool,
+    #[cfg(feature = "rd-ablation")]
+    rd_transform_8x8_inter: bool,
+    #[cfg(feature = "rd-ablation")]
+    rd_transform_8x8_roweven: bool,
+    #[cfg(feature = "rd-ablation")]
+    rd_transform_8x8_margin_bits: f64,
 }
 
 impl EncoderConfig {
@@ -102,6 +108,16 @@ impl EncoderConfig {
             threads: 0,
             qp: 26,
             transform_8x8: false,
+            #[cfg(feature = "rd-ablation")]
+            rd_lambda_standard: false,
+            #[cfg(feature = "rd-ablation")]
+            rd_transform_8x8_intra: false,
+            #[cfg(feature = "rd-ablation")]
+            rd_transform_8x8_inter: false,
+            #[cfg(feature = "rd-ablation")]
+            rd_transform_8x8_roweven: false,
+            #[cfg(feature = "rd-ablation")]
+            rd_transform_8x8_margin_bits: 0.0,
         }
     }
 }
@@ -176,6 +192,10 @@ impl<'a> PictureView<'a> {
 impl Encoder {
     /// Build an encoder for `cfg`, refusing what it cannot code.
     pub fn new(cfg: EncoderConfig) -> Result<Encoder> {
+        #[cfg(feature = "rd-ablation")]
+        let mut cfg = cfg;
+        #[cfg(feature = "rd-ablation")]
+        apply_rd_ablation(&mut cfg);
         if cfg.width < 16 || cfg.height < 16 {
             return Err(Error::unsupported(
                 "picture smaller than one macroblock",
@@ -385,7 +405,16 @@ impl Encoder {
                 }
             }
         }
+        // H5 measurement hook: the chosen candidate's trial SSD is the
+        // pre-deblock SSD of the macroblock in this picture (round 4 verified
+        // trial bits and SSD against the final picture), so capturing the
+        // per-macroblock SSD right before and right after the filter is the
+        // exact pre/post comparison with no hooks inside the RD trials.
+        #[cfg(feature = "rd-ablation")]
+        let rd_pre = rd_trace_capture(master, &self.src);
         deblock_picture(master);
+        #[cfg(feature = "rd-ablation")]
+        rd_trace_write(master, &self.src, self.frames, rd_pre);
         master.extend_borders();
         master.complete = true;
         std::mem::swap(master, &mut self.reference);
@@ -516,9 +545,14 @@ fn code_band(pic: &mut Picture, job: BandJob<'_>) -> Vec<u8> {
         slice_id: job.slice_id,
         qp: job.qp,
         target_qp: job.qp,
-        lambda: lambda_for(job.qp),
+        lambda: lambda_for(job.qp, rd_lambda_standard(job.cfg)),
+        t8x8_margin_bits: rd_transform_8x8_margin_bits(job.cfg),
         preset: job.cfg.preset,
+        lambda_standard: rd_lambda_standard(job.cfg),
         transform_8x8: job.cfg.transform_8x8,
+        transform_8x8_intra: rd_transform_8x8_intra(job.cfg),
+        transform_8x8_inter: rd_transform_8x8_inter(job.cfg),
+        transform_8x8_roweven: rd_transform_8x8_roweven(job.cfg),
         ls: LevelScale4x4::new(&[16; 16]),
         ls8: LevelScale8x8::new(&[16; 64]),
         mb_ctx: crate::entropy::MbCtx::default(),
@@ -534,7 +568,7 @@ fn code_band(pic: &mut Picture, job: BandJob<'_>) -> Vec<u8> {
             let expected = job.band_target * n as f64 / rows as f64;
             let delta = job.rc.row_delta(spent, expected);
             e.target_qp = (job.qp + delta).clamp(10, 51);
-            e.lambda = lambda_for(e.target_qp);
+            e.lambda = lambda_for(e.target_qp, rd_lambda_standard(job.cfg));
         }
         for mb_x in 0..mb_w {
             let addr = mb_y * mb_w + mb_x;
@@ -546,10 +580,174 @@ fn code_band(pic: &mut Picture, job: BandJob<'_>) -> Vec<u8> {
     w.finish(job.slice_type == SliceType::P)
 }
 
-/// Lagrangian multiplier for mode decision in the SATD domain.
-fn lambda_for(qp: i32) -> i32 {
-    // 2^((qp - 12) / 6), the usual ladder, floored at 1.
-    (((f64::from(qp) - 12.0) / 6.0).exp2().round() as i32).max(1)
+/// Standard Lagrangian multiplier in the squared-error domain.
+pub(crate) fn lambda_ssd(qp: i32) -> f64 {
+    0.85 * ((f64::from(qp) - 12.0) / 3.0).exp2()
+}
+
+/// Lagrangian multiplier. Production uses the established byte-stable ladder;
+/// the ablation feature can select the standard squared-error multiplier.
+fn lambda_for(qp: i32, standard: bool) -> f64 {
+    if standard {
+        lambda_ssd(qp)
+    } else {
+        (((f64::from(qp) - 12.0) / 6.0).exp2().round()).max(1.0)
+    }
+}
+
+#[cfg(feature = "rd-ablation")]
+fn apply_rd_ablation(cfg: &mut EncoderConfig) {
+    if let Ok(lambda) = std::env::var("EC_H264_RD_LAMBDA") {
+        cfg.rd_lambda_standard = match lambda.as_str() {
+            "ladder" => false,
+            "standard" => true,
+            _ => panic!("EC_H264_RD_LAMBDA must be ladder or standard"),
+        };
+    }
+    if let Ok(transform) = std::env::var("EC_H264_RD_T8X8") {
+        let (intra, inter, roweven) = match transform.as_str() {
+            "off" => (false, false, false),
+            "on" => (true, true, false),
+            "roweven" => (true, true, true),
+            "intra" => (true, false, false),
+            "inter" => (false, true, false),
+            _ => panic!("EC_H264_RD_T8X8 must be off, on, roweven, intra, or inter"),
+        };
+        cfg.rd_transform_8x8_intra = intra;
+        cfg.rd_transform_8x8_inter = inter;
+        cfg.rd_transform_8x8_roweven = roweven;
+        cfg.transform_8x8 = intra || inter;
+    } else if cfg.transform_8x8 {
+        cfg.rd_transform_8x8_intra = true;
+        cfg.rd_transform_8x8_inter = true;
+    }
+    if let Ok(margin) = std::env::var("EC_H264_RD_T8X8_MARGIN_BITS") {
+        cfg.rd_transform_8x8_margin_bits = margin
+            .parse()
+            .expect("EC_H264_RD_T8X8_MARGIN_BITS must be a number");
+    }
+}
+
+/// Luma and chroma SSD of every macroblock against the source, before the
+/// deblocking filter — the distortion the RD decision actually paid.
+#[cfg(feature = "rd-ablation")]
+fn rd_trace_capture(pic: &Picture, src: &Source) -> Option<Vec<(i64, i64)>> {
+    if std::env::var_os("EC_H264_RD_TRACE").is_none() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(pic.mb_w * pic.mb_h);
+    for mb_y in 0..pic.mb_h {
+        for mb_x in 0..pic.mb_w {
+            out.push(rd_trace_ssd(pic, src, mb_x, mb_y));
+        }
+    }
+    Some(out)
+}
+
+/// One line per macroblock: `frame addr intra trans8 skip qp pre_luma
+/// pre_chroma post_luma post_chroma`, appended to `$EC_H264_RD_TRACE`.
+#[cfg(feature = "rd-ablation")]
+fn rd_trace_write(pic: &Picture, src: &Source, frame: u64, pre: Option<Vec<(i64, i64)>>) {
+    use std::io::Write;
+    let Some(pre) = pre else { return };
+    let mut out = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+ .open(std::env::var_os("EC_H264_RD_TRACE").expect("checked in capture"))
+        .expect("open EC_H264_RD_TRACE");
+    for (addr, &(pre_luma, pre_chroma)) in pre.iter().enumerate() {
+        let (post_luma, post_chroma) = rd_trace_ssd(pic, src, addr % pic.mb_w, addr / pic.mb_w);
+        let f = pic.mb_flags[addr];
+        let _ = writeln!(
+            out,
+            "{frame} {addr} {} {} {} {} {pre_luma} {pre_chroma} {post_luma} {post_chroma}",
+            u8::from(f & FLAG_INTER == 0),
+            u8::from(f & FLAG_TRANS8X8 != 0),
+            u8::from(f & FLAG_SKIP != 0),
+            pic.mb_qp[addr]
+        );
+    }
+}
+
+/// Luma and chroma SSD of one macroblock against the source planes.
+#[cfg(feature = "rd-ablation")]
+fn rd_trace_ssd(pic: &Picture, src: &Source, mb_x: usize, mb_y: usize) -> (i64, i64) {
+    let mut luma = 0i64;
+    let stride = pic.y.stride;
+    let origin = pic.y.at(mb_x * 16, mb_y * 16);
+    for row in 0..16 {
+        let s = (mb_y * 16 + row) * src.stride + mb_x * 16;
+        for x in 0..16 {
+            let d = i64::from(src.y[s + x]) - i64::from(pic.y.data[origin + row * stride + x]);
+            luma += d * d;
+        }
+    }
+    let mut chroma = 0i64;
+    for (plane, source) in [(&pic.cb, &src.u), (&pic.cr, &src.v)] {
+        let stride = plane.stride;
+        let origin = plane.at(mb_x * 8, mb_y * 8);
+        for row in 0..8 {
+            let s = (mb_y * 8 + row) * src.c_stride + mb_x * 8;
+            for x in 0..8 {
+                let d = i64::from(source[s + x]) - i64::from(plane.data[origin + row * stride + x]);
+                chroma += d * d;
+            }
+        }
+    }
+    (luma, chroma)
+}
+
+#[cfg(feature = "rd-ablation")]
+fn rd_lambda_standard(cfg: &EncoderConfig) -> bool {
+    cfg.rd_lambda_standard
+}
+
+#[cfg(not(feature = "rd-ablation"))]
+fn rd_lambda_standard(cfg: &EncoderConfig) -> bool {
+    cfg.transform_8x8
+}
+
+#[cfg(feature = "rd-ablation")]
+fn rd_transform_8x8_intra(cfg: &EncoderConfig) -> bool {
+    cfg.rd_transform_8x8_intra
+}
+
+#[cfg(not(feature = "rd-ablation"))]
+fn rd_transform_8x8_intra(cfg: &EncoderConfig) -> bool {
+    cfg.transform_8x8
+}
+
+#[cfg(feature = "rd-ablation")]
+fn rd_transform_8x8_inter(cfg: &EncoderConfig) -> bool {
+    cfg.rd_transform_8x8_inter
+}
+
+#[cfg(not(feature = "rd-ablation"))]
+fn rd_transform_8x8_inter(cfg: &EncoderConfig) -> bool {
+    cfg.transform_8x8
+}
+
+#[cfg(feature = "rd-ablation")]
+fn rd_transform_8x8_roweven(cfg: &EncoderConfig) -> bool {
+    cfg.rd_transform_8x8_roweven
+}
+
+#[cfg(not(feature = "rd-ablation"))]
+fn rd_transform_8x8_roweven(_: &EncoderConfig) -> bool {
+    false
+}
+
+#[cfg(not(feature = "rd-ablation"))]
+const TRANSFORM_8X8_MARGIN_BITS: f64 = 0.0;
+
+#[cfg(feature = "rd-ablation")]
+fn rd_transform_8x8_margin_bits(cfg: &EncoderConfig) -> f64 {
+    cfg.rd_transform_8x8_margin_bits
+}
+
+#[cfg(not(feature = "rd-ablation"))]
+fn rd_transform_8x8_margin_bits(_: &EncoderConfig) -> f64 {
+    TRANSFORM_8X8_MARGIN_BITS
 }
 
 /// Split `mb_h` macroblock rows into at most `n` contiguous bands.
@@ -706,5 +904,15 @@ mod tests {
         };
         assert!(matches!(err, Error::Unsupported { .. }), "{err}");
         assert!(Encoder::new(EncoderConfig::new(640, 480)).is_ok());
+    }
+    #[test]
+    fn production_lambda_tracks_transform_mode() {
+        let mut cfg = EncoderConfig::new(640, 480);
+        assert_eq!(
+            lambda_for(26, rd_lambda_standard(&cfg)),
+            lambda_for(26, false)
+        );
+        cfg.transform_8x8 = true;
+        assert_eq!(lambda_for(26, rd_lambda_standard(&cfg)), lambda_ssd(26));
     }
 }
