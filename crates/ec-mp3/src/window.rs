@@ -1,7 +1,7 @@
 //! The Layer III polyphase window, measured from a reference decoder.
 //!
 //! `scripts/mp3-tables/` feeds frames whose spectrum it chooses through
-//! ffmpeg and least-squares fits the 512 window taps to the PCM that comes
+//! the oracle and least-squares fits the 512 window taps to the PCM that comes
 //! back; the fit residual is 1.6e-6 relative, i.e. the f32 noise floor of the
 //! decoder that was measured. The same taps serve the encoder's analysis
 //! filterbank (scaled by 1/32), which reconstructs to -85 dB -- the

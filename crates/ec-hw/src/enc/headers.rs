@@ -4,7 +4,7 @@
 //! This is not optional plumbing. radeonsi advertises
 //! `VA_ENC_PACKED_HEADER_SEQUENCE | PICTURE | SLICE` and then writes none of
 //! them itself: without these, the coded buffer comes back holding slice data
-//! with no parameter sets in front of it — a stream ffmpeg answers with
+//! with no parameter sets in front of it — a stream the oracle answers with
 //! "Invalid data found when processing input" (measured, 2026-08-14). Every
 //! field below therefore has to agree with the `VAEnc*ParameterBuffer` the
 //! driver was given, or the header describes a picture other than the one the

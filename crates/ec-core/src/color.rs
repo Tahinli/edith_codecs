@@ -11,7 +11,7 @@
 //! 2. the **bitstream**'s: an H.264 or HEVC SPS VUI `colour_description`, an AV1
 //!    sequence header `color_config`, which is what the *encoder* wrote and what
 //!    survives a container that dropped its tags,
-//! 3. the **resolution heuristic** ffmpeg and mpv both fall back to: a picture
+//! 3. the **resolution heuristic** the oracle and mpv both fall back to: a picture
 //!    720 lines or taller is BT.709, anything smaller is BT.601, limited range
 //!    either way.
 //!
@@ -126,7 +126,7 @@ impl ColorDescription {
     pub fn resolve(container: Tags, bitstream: Tags, height: u32) -> Self {
         let tags = container.over(bitstream);
         Self {
-            // The ffmpeg/mpv rule, and the reason it is a rule: an untagged
+            // The the oracle/mpv rule, and the reason it is a rule: an untagged
             // 1080p file is HD material and an untagged 480p one came off SD
             // material, and guessing the other way is a visible green/magenta
             // shift on faces.
@@ -163,7 +163,7 @@ impl ColorDescription {
     /// and mp4's `colr` both index, so one answer serves both muxers.
     pub fn codes(self) -> (u16, u16, u16) {
         // Primaries and the SDR curve travel with the matrix: a 709 file is
-        // 1/1/1 and an SD one 6/6/6 (SMPTE 170M), which is what ffmpeg writes
+        // 1/1/1 and an SD one 6/6/6 (SMPTE 170M), which is what the oracle writes
         // for each and what a player expects to see together.
         let (primaries, sdr_transfer, matrix) = match self.matrix {
             Matrix::Bt709 => (1, 1, 1),
@@ -291,7 +291,7 @@ impl ContentLight {
 ///
 /// The chromaticities are read past: what a tone map wants is the luminance
 /// pair, and the display's gamut is not something this family acts on. A zero
-/// luminance is "not stated", which is what ffmpeg writes when it has nothing —
+/// luminance is "not stated", which is what the oracle writes when it has nothing —
 /// believing it would tell a tone map the film peaks at black.
 pub fn mdcv(payload: &[u8]) -> ContentLight {
     let luminance = |at: usize| -> Option<f32> {
@@ -1226,7 +1226,7 @@ mod tests {
     }
 
     /// A High-profile SPS written by hand, because no encoder in this family
-    /// writes one with its scaling lists in the *sequence* parameter set (x264
+    /// writes one with its scaling lists in the *sequence* parameter set (the external encoder
     /// puts its quant matrices in the PPS). The lists are what makes this test
     /// worth having: read as if they were not there, the VUI lands
     /// mid-coefficient and the colour comes out as noise.

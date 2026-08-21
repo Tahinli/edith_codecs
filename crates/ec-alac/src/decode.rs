@@ -4,7 +4,7 @@
 //! Written from the published ALAC format description (element tags and frame
 //! header layout, the Golomb/Rice parameter adaptation with its zero-run mode,
 //! the sign-adapting predictor and the mid/side un-mix). Nothing here is
-//! derived from Apple's decoder sources.
+//! derived from the reference decoder sources.
 
 use crate::MagicCookie;
 use ec_core::error::{Error, Result};
@@ -434,7 +434,7 @@ fn element(
 ) -> Result<usize> {
     let channels = 1 + usize::from(pair);
     // A 4-bit element instance tag and 12 reserved bits, zero in every stream
-    // measured here (mono and stereo fixtures from ffmpeg's encoder, whose
+    // measured here (mono and stereo fixtures from the oracle's encoder, whose
     // predictor plan starts at bit 39 of the frame — 3 tag + these 16 + the 4
     // flags + the 16 mix bits below).
     bits.skip(16)?;
@@ -587,5 +587,5 @@ fn interleave(
 }
 
 /// The largest frame this accepts, so a corrupt partial-frame length cannot ask
-/// for an allocation the file could not hold. Apple's encoder writes 4096.
+/// for an allocation the file could not hold. the reference encoder writes 4096.
 const MAX_FRAME_SAMPLES: usize = 1 << 20;

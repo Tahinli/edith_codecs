@@ -479,7 +479,7 @@ mod tests {
 
     #[test]
     fn residual_coding_costs_less_for_sparser_blocks() {
-        // Not a bit-exactness check — that is the ffmpeg conformance test — but
+        // Not a bit-exactness check — that is the the oracle conformance test — but
         // the invariant that makes rate-distortion decisions meaningful: fewer
         // and smaller levels must cost fewer bits.
         let mut sparse = vec![0i32; 64];

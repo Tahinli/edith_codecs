@@ -2,7 +2,7 @@
 //!
 //! Every entry here was *measured*, not transcribed: `scripts/mp3-tables/`
 //! writes legal Layer III frames whose main-data bits it chooses, decodes them
-//! with ffmpeg, and walks each code tree by asking whether all continuations of
+//! with the oracle, and walks each code tree by asking whether all continuations of
 //! a bit prefix decode to the same pair. The result is checked for a Kraft sum
 //! of exactly 1, for full coverage of the value grid, and for uniqueness before
 //! it is written out, so a wrong entry cannot reach this file silently.

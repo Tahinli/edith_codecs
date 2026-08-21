@@ -42,7 +42,7 @@ pub enum CodecId {
     TrueHd,
     /// DTS and its extensions (DTS-HD, DTS:X).
     Dts,
-    /// Apple Lossless.
+    /// ALAC.
     Alac,
     /// Xiph FLAC.
     Flac,
@@ -239,7 +239,7 @@ pub struct StreamInfo {
     pub duration: Option<i64>,
     /// ISO 639-2 language tag, when the container carries one.
     pub language: Option<String>,
-    /// Samples the decoder emits before the first audible one: an MP3's LAME
+    /// Samples the decoder emits before the first audible one: an MP3's gapless
     /// encoder delay, an Opus stream's pre-skip. Zero where a stream has none.
     ///
     /// It is *not* subtracted from [`duration`](Self::duration), because a

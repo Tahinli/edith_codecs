@@ -231,7 +231,7 @@ pub(crate) fn from_vorbis_comment(data: &[u8]) -> Tags {
 mod tests {
     use super::*;
 
-    /// An ID3v2.3 tag of the shape ffmpeg writes, and the v1 block behind it.
+    /// An ID3v2.3 tag of the shape the oracle writes, and the v1 block behind it.
     #[test]
     fn id3_tags_are_read_in_both_versions() {
         let mut tag = b"ID3\x03\x00\x00".to_vec();
