@@ -266,8 +266,8 @@ mod tests {
             }
             let mut w = BitWriter::new();
             let mut tcs = [0u8; 4];
-            for j in 0..4 {
-                tcs[j] = write_residual_block(
+            for (j, tc) in tcs.iter_mut().enumerate() {
+                *tc = write_residual_block(
                     &mut w,
                     &super::super::entropy::sub_block_4x4(&c8, j),
                     16,

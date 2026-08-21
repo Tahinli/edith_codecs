@@ -464,8 +464,8 @@ fn quantize_stage2(
     // mean (silk.rs's nlsf_decode: weights come from the *stage-1* nlsf,
     // not the final decoded one, so this is not circular).
     let mut cb1_q15 = [0i16; MAX_LPC_ORDER];
-    for i in 0..order {
-        cb1_q15[i] = (cb.cb1_q8[cb1_index * order + i] as i16) << 7;
+    for (i, slot) in cb1_q15.iter_mut().enumerate().take(order) {
+        *slot = (cb.cb1_q8[cb1_index * order + i] as i16) << 7;
     }
     let w_qw = nlsf_vq_weights_laroia(&cb1_q15[..order]);
 
@@ -610,7 +610,7 @@ pub(crate) fn estimate_pitch(frame: &[f32], fs_khz: i32, nb_subfr: usize) -> Opt
     // Per-subframe lags: local search around the global lag.
     let sub_len = frame.len() / nb_subfr.max(1);
     let mut per_sub = [0i32; MAX_NB_SUBFR];
-    for k in 0..nb_subfr {
+    for (k, slot) in per_sub.iter_mut().enumerate().take(nb_subfr) {
         let start = k * sub_len;
         let end = (start + sub_len).min(frame.len());
         let sub = &frame[start..end];
@@ -625,7 +625,7 @@ pub(crate) fn estimate_pitch(frame: &[f32], fs_khz: i32, nb_subfr: usize) -> Opt
                 sk_lag = lag;
             }
         }
-        per_sub[k] = sk_lag as i32;
+        *slot = sk_lag as i32;
     }
 
     // Match the per-subframe lags against the decoder's contour tables.
@@ -660,7 +660,7 @@ pub(crate) fn estimate_pitch(frame: &[f32], fs_khz: i32, nb_subfr: usize) -> Opt
     let lag = best_lag as i32;
     let mut best_contour = 0usize;
     let mut best_contour_err = i64::MAX;
-    for col in 0..n_cols {
+    for (col, _) in table[0].iter().enumerate().take(n_cols) {
         let mut err = 0i64;
         for (k, per_sub_k) in per_sub.iter().enumerate().take(nb_subfr) {
             let predicted = lag + table[k][col] as i32;
@@ -773,8 +773,8 @@ mod tests {
         let order = 16;
         // A plausible ascending NLSF vector in Q15.
         let mut nlsf = [0i16; MAX_LPC_ORDER];
-        for i in 0..order {
-            nlsf[i] = ((i as i32 + 1) * 32768 / (order as i32 + 1)) as i16;
+        for (i, slot) in nlsf.iter_mut().enumerate().take(order) {
+            *slot = ((i as i32 + 1) * 32768 / (order as i32 + 1)) as i16;
         }
         let a_q12 = nlsf2a(&nlsf, order);
         let lpc: Vec<f64> = a_q12.iter().map(|&c| c as f64 / 4096.0).collect();
@@ -862,10 +862,10 @@ mod tests {
         let resp = |a: &[f64], order: usize, w: f64| -> f64 {
             let mut re = 1.0;
             let mut im = 0.0;
-            for k in 0..order {
+            for (k, &a_k) in a.iter().enumerate().take(order) {
                 let theta = -(k as f64 + 1.0) * w;
-                re += a[k] / 4096.0 * theta.cos();
-                im += a[k] / 4096.0 * theta.sin();
+                re += a_k / 4096.0 * theta.cos();
+                im += a_k / 4096.0 * theta.sin();
             }
             1.0 / (re * re + im * im).sqrt().max(1e-6)
         };

@@ -299,12 +299,14 @@ impl VorbisEncoder {
         let headers = write_headers(
             &config,
             channels,
-            &long,
-            &short,
-            &floor_book,
-            &class_book,
-            &residue_books,
-            &coupling,
+            HeaderSetup {
+                long: &long,
+                short: &short,
+                floor_book: &floor_book,
+                class_book: &class_book,
+                residue_books: &residue_books,
+                coupling: &coupling,
+            },
         );
         let params = CodecParameters {
             codec: CodecId::Vorbis,
@@ -1117,17 +1119,25 @@ fn absolute_threshold(hz: f64) -> f64 {
     (spl - 96.0).clamp(-120.0, -80.0)
 }
 
+struct HeaderSetup<'a> {
+    long: &'a BlockConfig,
+    short: &'a BlockConfig,
+    floor_book: &'a CodebookSpec,
+    class_book: &'a CodebookSpec,
+    residue_books: &'a [CodebookSpec],
+    coupling: &'a [(usize, usize)],
+}
+
 /// The three header packets, in order.
-fn write_headers(
-    config: &EncoderConfig,
-    channels: usize,
-    long: &BlockConfig,
-    short: &BlockConfig,
-    floor_book: &CodebookSpec,
-    class_book: &CodebookSpec,
-    residue_books: &[CodebookSpec],
-    coupling: &[(usize, usize)],
-) -> Vec<Vec<u8>> {
+fn write_headers(config: &EncoderConfig, channels: usize, setup: HeaderSetup<'_>) -> Vec<Vec<u8>> {
+    let HeaderSetup {
+        long,
+        short,
+        floor_book,
+        class_book,
+        residue_books,
+        coupling,
+    } = setup;
     let mut ident = vec![1u8];
     ident.extend_from_slice(b"vorbis");
     ident.extend_from_slice(&0u32.to_le_bytes());
