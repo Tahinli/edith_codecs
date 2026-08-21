@@ -1253,6 +1253,7 @@ dependencies = [
  "ec-ogg",
  "ec-probe",
  "ec-vorbis",
+ "rusty_vorbis",
  "symphonia-codec-aac",
  "symphonia-core",
 ]
