@@ -1,7 +1,7 @@
 //! Our encoder measured the only way a lossy one can be: encode, decode the
 //! result with ffmpeg, correlate against the samples that went in.
 //!
-//! The bar is the incumbent this crate replaces, `rusty_mp3` 0.6.1, measured on
+//! The bar is the incumbent MP3 encoder this crate replaces, 0.6.1, measured on
 //! the same fixtures and the same metric (see `BAR`, and
 //! `scripts/mp3-incumbent-bar.md` for how those numbers were produced).
 //!
@@ -13,7 +13,7 @@ use std::process::Command;
 
 use ec_mp3::{Mp3Encoder, Mp3EncoderConfig};
 
-/// Correlation `rusty_mp3` 0.6.1 reaches on this corpus, measured with this
+/// Correlation the incumbent MP3 encoder, 0.6.1, reaches on this corpus, measured with this
 /// same alignment and metric (its own encoder, ffmpeg's decoder). The tone
 /// fixtures reach 1.0 on both encoders and so cannot separate them; the
 /// `mp3src-*` material — glide, broadband noise and a click every half second —
