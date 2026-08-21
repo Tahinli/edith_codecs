@@ -156,6 +156,9 @@ gen "$FIXTURES/audio/av-h264-aac-stereo-48000.mkv" \
 
 # Cover art: an mjpeg "video" stream that is a still picture, in the two
 # containers that carry one. A probe that lists it as a video track is broken.
+if [ ! -s "$FIXTURES/stills/baseline-420.jpg" ] && [ -x "$ROOT/scripts/gen-still-fixtures.sh" ]; then
+    "$ROOT/scripts/gen-still-fixtures.sh"
+fi
 if [ -s "$FIXTURES/stills/baseline-420.jpg" ]; then
     build_audio_in 2 44100
     gen "$FIXTURES/audio/cover-mp3-stereo-44100.mp3" \
