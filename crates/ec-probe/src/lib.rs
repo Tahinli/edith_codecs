@@ -673,6 +673,7 @@ struct AviDemuxer<R> {
     pending: VecDeque<Packet>,
     carry: Vec<Vec<u8>>,
     sync_bias: Vec<u64>,
+    seek_anchor: Vec<Option<(u64, bool)>>,
 }
 
 impl<R: Read + Seek> AviDemuxer<R> {
@@ -723,6 +724,7 @@ impl<R: Read + Seek> AviDemuxer<R> {
         }
         let samples = vec![0; streams.len()];
         let carry = vec![Vec::new(); streams.len()];
+        let seek_anchor = vec![None; streams.len()];
         let sync_bias = avi_sync_biases(&mut reader, &streams, &stream_numbers)?;
         reader.rewind();
         Ok(AviDemuxer {
@@ -733,6 +735,7 @@ impl<R: Read + Seek> AviDemuxer<R> {
             pending: VecDeque::new(),
             carry,
             sync_bias,
+            seek_anchor,
         })
     }
 
@@ -801,6 +804,16 @@ impl<R: Read + Seek> AviDemuxer<R> {
                             }
                         }
                         skipped = 0;
+                    }
+                    if let Some((anchor, after)) = self.seek_anchor[stream].take() {
+                        let phase = self.sync_bias.get(stream).copied().unwrap_or(0);
+                        let relative = anchor.saturating_sub(phase);
+                        let steps = if after {
+                            relative.saturating_add(frames.saturating_sub(1)) / frames
+                        } else {
+                            relative / frames
+                        };
+                        self.samples[stream] = phase.saturating_add(steps.saturating_mul(frames));
                     }
                     self.push_packet(stream, Buf::copy_from_slice(&data[at..at + size]), frames);
                     at += size;
@@ -1011,6 +1024,10 @@ impl<R: Read + Seek + Send> Demuxer for AviDemuxer<R> {
         }
         self.samples[local] = avi_units_to_samples(avi_stream, landed_units)
             .saturating_sub(self.sync_bias.get(local).copied().unwrap_or(0));
+        self.seek_anchor[local] = Some((
+            avi_units_to_samples(avi_stream, seek_units),
+            matches!(mode, SeekMode::SyncAfter),
+        ));
         Ok(())
     }
 }

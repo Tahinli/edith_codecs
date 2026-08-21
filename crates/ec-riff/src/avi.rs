@@ -171,6 +171,11 @@ impl<R: Read + Seek> AviReader<R> {
         !self.index.is_empty()
     }
 
+    /// Number of indexed audio chunks available for seeking.
+    pub fn index_len(&self) -> usize {
+        self.index.len()
+    }
+
     /// Return to the first chunk in `movi`.
     pub fn rewind(&mut self) {
         self.pos = self.movi_start;

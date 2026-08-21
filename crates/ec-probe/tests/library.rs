@@ -168,6 +168,22 @@ fn hive_avi_files() -> Vec<PathBuf> {
     files
 }
 
+fn assert_avi_index_is_bounded(path: &Path) {
+    let file_size = std::fs::metadata(path).expect("AVI metadata").len();
+    let index_len = ec_riff::AviReader::new(File::open(path).expect("open AVI"))
+        .expect("AVI index builds")
+        .index_len();
+    assert!(
+        u64::try_from(index_len).expect("index count fits u64") <= file_size / 8,
+        "{}: index has {index_len} chunks for {file_size} bytes",
+        path.display()
+    );
+    eprintln!(
+        "{}: AVI index {index_len} chunks / {file_size} bytes",
+        path.display()
+    );
+}
+
 fn decode_stream_to_eof(
     reader: &mut Reader,
     stream: u32,
@@ -239,6 +255,7 @@ fn best_frame_corr(
 }
 
 fn assert_avi_seeks_match_reference(path: &Path) {
+    assert_avi_index_is_bounded(path);
     let bytes = Arc::new(AtomicU64::new(0));
     let src = CountedFile {
         inner: File::open(path).expect("open AVI"),
