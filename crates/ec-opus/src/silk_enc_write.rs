@@ -181,6 +181,7 @@ impl SilkEncoder {
                 None,
                 conditional,
                 prev_signal_type,
+                frames_per_packet == 1,
             )?;
             prev_signal_type = trial.signal_type;
             frames.push(trial);
@@ -238,7 +239,7 @@ impl SilkEncoder {
         enc: &mut RangeEncoder,
         frame_ms: usize,
     ) -> Result<()> {
-        let trial = self.encode_inner(pcm48, frame_ms, Some(enc), false, 0)?;
+        let trial = self.encode_inner(pcm48, frame_ms, Some(enc), false, 0, true)?;
         self.voiced_frames += usize::from(trial.voiced);
         Ok(())
     }
@@ -288,6 +289,7 @@ impl SilkEncoder {
         shared: Option<&mut RangeEncoder>,
         conditional: bool,
         prev_signal_type: i32,
+        single_frame_packet: bool,
     ) -> Result<Trial> {
         assert!(
             matches!(frame_ms, 10 | 20),
@@ -485,9 +487,9 @@ impl SilkEncoder {
         // vector that best predicts the residual from the *reconstructed*
         // history, then quantise sample by sample with the shaped output error
         // fed back into the target, under the decoder's seed-driven sign flips.
-        let pulse_lambda = match (frame_ms, fs) {
-            (20, 8) => 1.25,
-            (10, 16) => 1.45,
+        let pulse_lambda = match (single_frame_packet, frame_ms, fs) {
+            (true, 20, 8) => 1.25,
+            (_, 10, 16) => 1.45,
             _ => PULSE_LAMBDA,
         };
         let run = |per: usize, gains_q16: &[i32; MAX_NB_SUBFR]| -> Run {
@@ -786,8 +788,12 @@ impl SilkStereoEncoder {
             side.push(s);
             side_energy += s * s;
         }
-        let mid_trial = self.mid.encode_inner(&mid, frame_ms, None, false, 0)?;
-        let side_trial = self.side.encode_inner(&side, frame_ms, None, false, 0)?;
+        let mid_trial = self
+            .mid
+            .encode_inner(&mid, frame_ms, None, false, 0, true)?;
+        let side_trial = self
+            .side
+            .encode_inner(&side, frame_ms, None, false, 0, true)?;
         let mid_only = side_energy < 1.0e-10;
         write_stereo_packet_header(enc, &mid_trial, &side_trial, mid_only);
         write_stereo_zero_pred(enc);
@@ -842,8 +848,12 @@ impl SilkStereoEncoder {
             side.push(s);
             side_energy += s * s;
         }
-        let mid_trial = self.mid.encode_inner(&mid, frame_ms, None, false, 0)?;
-        let side_trial = self.side.encode_inner(&side, frame_ms, None, false, 0)?;
+        let mid_trial = self
+            .mid
+            .encode_inner(&mid, frame_ms, None, false, 0, true)?;
+        let side_trial = self
+            .side
+            .encode_inner(&side, frame_ms, None, false, 0, true)?;
         let mid_only = side_energy < 1.0e-10;
 
         self.range.reset(1275);
