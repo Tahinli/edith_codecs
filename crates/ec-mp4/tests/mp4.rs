@@ -32,6 +32,18 @@ fn open(path: &Path) -> Mp4Demuxer<BufReader<File>> {
     .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
+#[test]
+fn riff_avi_is_not_reported_as_a_truncated_mp4() {
+    let err = match Mp4Demuxer::new(Cursor::new(b"RIFF\x10\0\0\0AVI ".to_vec())) {
+        Ok(_) => panic!("RIFF/AVI opened as mp4"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err, Error::Unsupported { .. }),
+        "wrong-container open error: {err}"
+    );
+}
+
 /// What ffprobe calls each of our codec ids.
 fn ffmpeg_name(codec: CodecId) -> &'static str {
     match codec {

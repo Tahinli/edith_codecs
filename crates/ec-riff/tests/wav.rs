@@ -232,9 +232,14 @@ fn avi_truncated_tail_is_end_of_stream() {
     chunk(&mut strl, b"strf", &strf);
     let mut hdrl = Vec::new();
     list(&mut hdrl, b"strl", &strl);
+    chunk(&mut hdrl, b"dmlh", &[0, 0, 0, 0]);
 
+    let mut rec = Vec::new();
+    chunk(&mut rec, b"00wb", &[1, 2, 3]);
     let mut movi = Vec::new();
     chunk(&mut movi, b"00wb", &[0x0b, 0x77, 0, 0]);
+    chunk(&mut movi, b"indx", &[0; 16]);
+    list(&mut movi, b"rec ", &rec);
     movi.extend_from_slice(b"00");
 
     let mut body = Vec::new();
@@ -252,6 +257,7 @@ fn avi_truncated_tail_is_end_of_stream() {
         reader.next_packet().expect("first packet").data,
         [0x0b, 0x77, 0, 0]
     );
+    assert_eq!(reader.next_packet().expect("nested packet").data, [1, 2, 3]);
     let err = reader
         .next_packet()
         .expect_err("truncated tail ends the stream");

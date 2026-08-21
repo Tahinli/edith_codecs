@@ -123,6 +123,14 @@ impl<R: Read + Seek> Mp4Demuxer<R> {
     /// Read the movie header of `r` and build its sample tables.
     pub fn new(r: R) -> Result<Mp4Demuxer<R>> {
         let mut src = Src::new(r)?;
+        let mut head = [0u8; 12];
+        let got = src.read_upto(0, &mut head)?;
+        if got >= 8 && !crate::is_mp4(&head[..got]) {
+            return Err(Error::unsupported(
+                "this file",
+                "it is not an mp4 or QuickTime container",
+            ));
+        }
         let end = src.len;
         let mut moov = None;
         let mut moofs = Vec::new();
