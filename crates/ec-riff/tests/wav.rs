@@ -242,6 +242,9 @@ fn reads_every_wav_fixture() {
             continue;
         }
         let name = path.file_name().unwrap().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue;
+        }
         let mut r = WavReader::open(&path).unwrap_or_else(|e| panic!("{name}: {e}"));
         let spec = r.spec();
         // The generator names layout and rate in the file name; the header must agree.
