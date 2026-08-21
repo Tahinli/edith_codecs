@@ -6,9 +6,9 @@ use ec_core::{
     AudioParameters, Buf, ChannelLayout, CodecId, CodecParameters, Demuxer, MediaParameters, Muxer,
     Packet, StreamInfo, TimeBase,
 };
-use symphonia_core::codecs::audio::AudioDecoderOptions;
+use symphonia_core::codecs::audio::{AudioCodecParameters, AudioDecoderOptions};
 use symphonia_core::formats::probe::Hint;
-use symphonia_core::formats::{FormatOptions, FormatReader, TrackType};
+use symphonia_core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, TrackType};
 use symphonia_core::io::MediaSourceStream;
 use symphonia_core::meta::MetadataOptions;
 
@@ -95,7 +95,11 @@ fn ffmpeg_decode(path: &Path) -> Vec<f32> {
         .args(["-f", "f32le", "-acodec", "pcm_f32le", "-"])
         .output()
         .expect("ffmpeg");
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     out.stdout
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
@@ -124,7 +128,10 @@ fn probe_decode(path: &Path) -> Vec<f32> {
 }
 
 fn shim_reader(path: &Path) -> Box<dyn FormatReader> {
-    let mss = MediaSourceStream::new(Box::new(File::open(path).expect("open")), Default::default());
+    let mss = MediaSourceStream::new(
+        Box::new(File::open(path).expect("open")),
+        Default::default(),
+    );
     let mut hint = Hint::new();
     hint.with_extension("ogg");
     symphonia::default::get_probe()
@@ -137,16 +144,23 @@ fn shim_reader(path: &Path) -> Box<dyn FormatReader> {
         .expect("probe")
 }
 
-fn shim_decode(path: &Path) -> Vec<f32> {
-    let mut reader = shim_reader(path);
+fn audio_track(reader: &dyn FormatReader) -> (u32, AudioCodecParameters) {
     let track = reader.default_track(TrackType::Audio).expect("track");
     let track_id = track.id;
     let params = match track.codec_params.clone().expect("params") {
         symphonia_core::codecs::CodecParameters::Audio(params) => params,
         _ => panic!("audio params"),
     };
+    (track_id, params)
+}
+
+fn decode_from_reader(
+    reader: &mut dyn FormatReader,
+    track_id: u32,
+    params: &AudioCodecParameters,
+) -> Vec<f32> {
     let mut decoder = symphonia::default::get_codecs()
-        .make_audio_decoder(&params, &AudioDecoderOptions::default())
+        .make_audio_decoder(params, &AudioDecoderOptions::default())
         .expect("decoder");
     let mut out = Vec::new();
     let mut chunk = Vec::new();
@@ -163,12 +177,53 @@ fn shim_decode(path: &Path) -> Vec<f32> {
     out
 }
 
+fn packet_prefix(
+    reader: &mut dyn FormatReader,
+    track_id: u32,
+    n: usize,
+) -> Vec<(Vec<u8>, Option<i64>)> {
+    let mut out = Vec::new();
+    while out.len() < n {
+        let packet = reader
+            .next_packet()
+            .expect("packet")
+            .expect("enough packets");
+        if packet.track_id == track_id && !packet.data.is_empty() {
+            out.push((packet.data.as_ref().to_vec(), packet.granule));
+        }
+    }
+    out
+}
+
+fn seek_to_start(reader: &mut dyn FormatReader, track_id: u32) {
+    reader
+        .seek(
+            SeekMode::Accurate,
+            SeekTo::TimeStamp {
+                ts: symphonia_core::units::Timestamp::new(0),
+                track_id,
+            },
+        )
+        .expect("seek");
+}
+
+fn shim_decode(path: &Path) -> Vec<f32> {
+    let mut reader = shim_reader(path);
+    let (track_id, params) = audio_track(&*reader);
+    decode_from_reader(&mut *reader, track_id, &params)
+}
+
 fn gap_rms(samples: &[f32], rate: u32) -> f64 {
     let channels = usize::from(CHANNELS);
     let onset = ((rate / 2 + rate) as usize) * channels;
     let start = onset - ((rate / 20) as usize) * channels;
     let window = &samples[start..onset.min(samples.len())];
-    (window.iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>() / window.len() as f64).sqrt()
+    (window
+        .iter()
+        .map(|&v| f64::from(v) * f64::from(v))
+        .sum::<f64>()
+        / window.len() as f64)
+        .sqrt()
 }
 
 fn max_abs_after_first_packet(a: &[f32], b: &[f32]) -> f32 {
@@ -211,5 +266,71 @@ fn ogg_timing_matches_reference_decoder() {
         assert!(shim_max <= 1e-6, "{rate}: shim differs by {shim_max}");
         assert!(probe_max <= 1e-6, "{rate}: probe differs by {probe_max}");
         assert!(shim_gap < 1e-4, "{rate}: shim gap rms {shim_gap}");
+    }
+}
+
+#[test]
+fn seek_to_start_replays_fresh_packet_timing() {
+    for rate in [44_100, 48_000] {
+        let path = scratch(&format!("seek-start-{rate}.ogg"));
+        write_ogg(&path, &samples(rate), rate);
+
+        let mut fresh_reader = shim_reader(&path);
+        let (track_id, params) = audio_track(&*fresh_reader);
+        let fresh_packets = packet_prefix(&mut *fresh_reader, track_id, 8);
+
+        let mut seeked_reader = shim_reader(&path);
+        let (seeked_track, seeked_params) = audio_track(&*seeked_reader);
+        assert_eq!(seeked_track, track_id);
+        assert_eq!(seeked_params.sample_rate, params.sample_rate);
+        let _ = packet_prefix(&mut *seeked_reader, seeked_track, 5);
+        seek_to_start(&mut *seeked_reader, seeked_track);
+        let seeked_packets = packet_prefix(&mut *seeked_reader, seeked_track, 8);
+
+        eprintln!(
+            "rate={rate} fresh_first_granule={:?} seek_first_granule={:?}",
+            fresh_packets[0].1, seeked_packets[0].1
+        );
+        assert_eq!(
+            seeked_packets, fresh_packets,
+            "{rate}: packets after seek(0)"
+        );
+
+        let fresh_pcm = shim_decode(&path);
+        let mut decode_reader = shim_reader(&path);
+        let (decode_track, decode_params) = audio_track(&*decode_reader);
+        let _ = packet_prefix(&mut *decode_reader, decode_track, 5);
+        seek_to_start(&mut *decode_reader, decode_track);
+        let seeked_pcm = decode_from_reader(&mut *decode_reader, decode_track, &decode_params);
+        assert_eq!(seeked_pcm, fresh_pcm, "{rate}: decoded PCM after seek(0)");
+
+        let mut mid_reader = shim_reader(&path);
+        let (mid_track, mid_params) = audio_track(&*mid_reader);
+        let target = i64::from(rate);
+        let landed = mid_reader
+            .seek(
+                SeekMode::Accurate,
+                SeekTo::TimeStamp {
+                    ts: symphonia_core::units::Timestamp::new(target),
+                    track_id: mid_track,
+                },
+            )
+            .expect("mid seek")
+            .actual_ts
+            .value();
+        let mid_pcm = decode_from_reader(&mut *mid_reader, mid_track, &mid_params);
+        let channels = usize::from(CHANNELS);
+        let start = landed.max(0) as usize * channels;
+        let suffix = &fresh_pcm[start..];
+        let trim = mid_pcm.len().saturating_sub(suffix.len());
+        eprintln!(
+            "rate={rate} mid_landed={landed} mid_trim_frames={}",
+            trim / channels
+        );
+        assert!(
+            trim <= FIRST_PACKET_FRAMES * channels,
+            "{rate}: mid-stream trim too large: {} samples",
+            trim
+        );
     }
 }
