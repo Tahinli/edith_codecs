@@ -23,10 +23,14 @@ fn manifest() -> Vec<(PathBuf, String, String, f64)> {
         .filter_map(|line| {
             let f: Vec<&str> = line.split('\t').collect();
             let path = PathBuf::from(f.first()?);
+            let acodecs = f
+                .get(7)
+                .filter(|s| **s != "-")
+                .map_or_else(String::new, |s| (*s).to_string());
             Some((
                 path,
                 (*f.get(1)?).to_string(),
-                (*f.get(7)?).to_string(),
+                acodecs,
                 f.get(8)?.parse().unwrap_or(0.0),
             ))
         })

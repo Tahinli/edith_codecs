@@ -332,7 +332,7 @@ impl<W: Write + Send> Muxer for OggMuxer<W> {
         // The page is closed *before* the packet that would overflow it, never
         // after: that keeps at least one packet pending at all times, so the
         // end-of-stream flag rides a page that carries audio. A page whose only
-        // content is a zero-length packet is legal Ogg and ffmpeg reads it as a
+        // content is a zero-length packet is legal Ogg and the oracle reads it as a
         // packet — "Packet processing failed", a decode error in a file that is
         // otherwise perfect.
         let track = &self.tracks[index];

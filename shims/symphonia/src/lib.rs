@@ -87,7 +87,7 @@ const REGISTERED: &[(AudioCodecId, &str, &str)] = &[
     (CODEC_ID_VORBIS, "vorbis", "Vorbis"),
     (CODEC_ID_FLAC, "flac", "Free Lossless Audio Codec"),
     (CODEC_ID_MP3, "mp3", "MPEG-1/2 Audio Layer III"),
-    (CODEC_ID_ALAC, "alac", "Apple Lossless Audio Codec"),
+    (CODEC_ID_ALAC, "alac", "ALAC"),
     (CODEC_ID_AC3, "ac3", "Dolby Digital"),
     (CODEC_ID_EAC3, "eac3", "Dolby Digital Plus"),
     (CODEC_ID_PCM_U8, "pcm_u8", "PCM unsigned 8-bit"),

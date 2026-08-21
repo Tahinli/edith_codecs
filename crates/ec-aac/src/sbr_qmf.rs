@@ -82,9 +82,9 @@ impl QmfAnalysis64 {
             let row = k * 128;
             let mut re = 0.0f64;
             let mut im = 0.0f64;
-            for n in 0..128 {
-                re += u[n] * self.cos_tab[row + n];
-                im += u[n] * self.sin_tab[row + n];
+            for (n, &u_n) in u.iter().enumerate() {
+                re += u_n * self.cos_tab[row + n];
+                im += u_n * self.sin_tab[row + n];
             }
             *slot = Complex::new(re, im);
         }
@@ -160,9 +160,9 @@ impl Analysis {
         for (k, slot) in out.iter_mut().enumerate() {
             let row = k * 64;
             let (mut re, mut im) = (0.0f64, 0.0f64);
-            for n in 0..64 {
-                re += u[n] * self.cos_tab[row + n];
-                im += u[n] * self.sin_tab[row + n];
+            for (n, &u_n) in u.iter().enumerate() {
+                re += u_n * self.cos_tab[row + n];
+                im += u_n * self.sin_tab[row + n];
             }
             *slot = Complex::new(re, im);
         }
@@ -512,10 +512,6 @@ mod tests {
     /// checked against `f_calib(p) + (q-p)/256` (`1/256` being
     /// `SYNTHESIS_BANDS`'s own `omega_step/(2*pi)` band spacing) rather than
     /// a hand-derived absolute constant.
-    ///
-
-
-
     /// (Round-43, Task 1 conviction) The tone-excitation gain above
     /// (0.595853 amplitude / ~0.355 energy) was calibrated with a single
     /// SLOWLY ROTATING phasor -- narrowband within its own subband's

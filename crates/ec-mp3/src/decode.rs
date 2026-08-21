@@ -656,7 +656,7 @@ impl Mp3Decode {
     }
 }
 
-/// Turns a byte stream into frames: skips ID3v2 and the Xing/LAME/VBRI header
+/// Turns a byte stream into frames: skips ID3v2 and the Xing/gapless/VBRI header
 /// frame, resyncs over junk, and holds partial data until the rest arrives.
 #[derive(Debug, Default)]
 pub struct Mp3Reader {
