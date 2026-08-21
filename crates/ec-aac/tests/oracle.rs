@@ -52,6 +52,11 @@ fn deinterleave(samples: &[f32], channels: usize) -> Vec<Vec<f32>> {
 
 /// Our decode of an ADTS file, as planar-by-channel `f32`.
 fn our_decode(path: &Path) -> (Vec<Vec<f32>>, u32) {
+    let (planes, rate, _) = our_decode_with_pns(path);
+    (planes, rate)
+}
+
+fn our_decode_with_pns(path: &Path) -> (Vec<Vec<f32>>, u32, usize) {
     let data = std::fs::read(path).expect("fixture readable");
     let mut decoder = AacDecoder::new();
     let mut planes: Vec<Vec<f32>> = Vec::new();
@@ -71,7 +76,7 @@ fn our_decode(path: &Path) -> (Vec<Vec<f32>>, u32) {
         }
         at = end;
     }
-    (planes, rate)
+    (planes, rate, decoder.pns_aus())
 }
 
 /// Pearson correlation over the overlap of two channels.
@@ -218,6 +223,12 @@ fn aac_coding_tools_match_ffmpeg_in_isolation() {
             .expect("ffmpeg runs");
         assert!(out.status.success(), "remux failed for {name}");
         let corr = compare(&adts);
+        let pns = our_decode_with_pns(&adts).2;
+        assert_eq!(
+            pns > 0,
+            matches!(tool, "pns" | "all"),
+            "{name}: pns_aus={pns}"
+        );
         println!("{name}: {corr:?}");
         for (ch, c) in corr.iter().enumerate() {
             assert!(
