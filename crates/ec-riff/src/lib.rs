@@ -29,7 +29,7 @@ mod avi;
 mod read;
 mod write;
 
-pub use avi::{AviAudioStream, AviPacket, AviReader};
+pub use avi::{AviAudioStream, AviIndexPoint, AviPacket, AviReader};
 pub use ec_core::{Error, Result};
 pub use read::WavReader;
 pub use write::{Sample, WavWriter};
