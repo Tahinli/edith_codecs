@@ -1,0 +1,18 @@
+# Keep wall-clock performance assertions from sharing CPUs with other nextest jobs.
+# These tests are regression tripwires, not throughput benchmarks under load.
+
+[[profile.default.overrides]]
+filter = 'package(ec-opus) & (test(decode_speed) | test(encode_speed))'
+threads-required = "num-test-threads"
+
+[[profile.default.overrides]]
+filter = 'package(ec-aac) & test(five_one_decodes_faster_than_realtime)'
+threads-required = "num-test-threads"
+
+[[profile.default.overrides]]
+filter = 'package(ec-h265) & (test(intra_1080p_beats_the_incumbent_on_twelve_threads) | test(ctb_32_is_the_faster_tree_at_1080p))'
+threads-required = "num-test-threads"
+
+[[profile.default.overrides]]
+filter = 'package(ec-hw) & (test(ten_bit_4k_frame_path_is_realtime) | test(p010_zero_copy_encode_is_realtime))'
+threads-required = "num-test-threads"
