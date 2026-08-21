@@ -197,6 +197,38 @@ fn a_real_library_sweep() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+#[test]
+fn avi_audio_chunks_end_cleanly_on_real_files() {
+    let files = [
+        "/home/tahinli/Downloads/Little.Woman.2019.DVDScr.XVID.AC3.HQ.Hive-CM8/Little.Woman.2019.DVDScr.XVID.AC3.HQ.Hive-CM8.avi",
+        "/home/tahinli/Downloads/Little.Woman.2019.DVDScr.XVID.AC3.HQ.Hive-CM8/sample.avi",
+    ];
+    let mut present = 0;
+    for path in files {
+        let path = Path::new(path);
+        if !path.exists() {
+            continue;
+        }
+        present += 1;
+        let mut reader = Reader::open(path).expect("AVI opens");
+        let audio = reader
+            .default_stream(MediaType::Audio)
+            .expect("AVI audio stream")
+            .index;
+        let mut packets = 0;
+        loop {
+            match reader.next_packet() {
+                Ok(packet) if packet.stream == audio => packets += 1,
+                Ok(_) => {}
+                Err(e) if e.is_eof() => break,
+                Err(e) => panic!("{}: {e}", path.display()),
+            }
+        }
+        assert!(packets > 0, "{}: no audio packets", path.display());
+    }
+    assert!(present > 0, "AVI files absent");
+}
+
 /// The TrueHD remux in his library: the track decodes through the unified
 /// reader, 7.1 at 48 kHz, with the AC-3 track beside it still decoding too.
 #[test]
@@ -312,7 +344,11 @@ fn a_cover_art_tagged_mp3_opens() {
         .args(["-map", "0:a:0", "-f", "f32le", "-acodec", "pcm_f32le", "-"])
         .output()
         .expect("ffmpeg runs");
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let theirs: Vec<f32> = out
         .stdout
         .chunks_exact(4)
