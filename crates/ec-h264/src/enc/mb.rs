@@ -94,6 +94,9 @@ pub(crate) struct MbEnc<'a> {
     pub transform_8x8_intra: bool,
     /// Whether inter macroblocks may select 8x8.
     pub transform_8x8_inter: bool,
+    /// Whether the ablation restricts 8x8 eligibility to even macroblock
+    /// rows; odd rows then code exactly as they would with 8x8 disabled.
+    pub transform_8x8_roweven: bool,
     pub ls: LevelScale4x4,
     pub ls8: LevelScale8x8,
     /// Neighbourhood of the macroblock being written (CABAC).
@@ -103,6 +106,18 @@ pub(crate) struct MbEnc<'a> {
     /// `qp_delta_inc` of 9.3.3.1.1.5: whether the previous macroblock in this
     /// slice carried a non-zero mb_qp_delta.
     pub qp_delta_inc: u8,
+}
+
+impl MbEnc<'_> {
+    /// Intra 8x8 eligibility of macroblock row `mb_y`.
+    fn t8x8_intra(&self, mb_y: usize) -> bool {
+        self.transform_8x8_intra && (mb_y % 2 == 0 || !self.transform_8x8_roweven)
+    }
+
+    /// Inter 8x8 eligibility of macroblock row `mb_y`.
+    fn t8x8_inter(&self, mb_y: usize) -> bool {
+        self.transform_8x8_inter && (mb_y % 2 == 0 || !self.transform_8x8_roweven)
+    }
 }
 
 /// Quantised levels of one macroblock, scan order per block.
@@ -702,7 +717,7 @@ fn code_luma_4x4(
                 &source,
                 &resid,
                 &lv.luma[blk],
-                zero_block_lambda(e, qp, e.transform_8x8_inter),
+                zero_block_lambda(e, qp, e.t8x8_inter(mb_y)),
             )
         {
             lv.luma[blk] = [0; 16];
@@ -895,9 +910,9 @@ fn code_chroma(
                         e,
                         qp_c,
                         if intra {
-                            e.transform_8x8_intra
+                            e.t8x8_intra(mb_y)
                         } else {
-                            e.transform_8x8_inter
+                            e.t8x8_inter(mb_y)
                         },
                     ),
                 ) {
@@ -1580,7 +1595,7 @@ fn encode_intra_mb(
     if cost.allow_i4 {
         let mut lv4 = chroma_lv.clone();
         let (m4, p4) = code_intra_4x4(pic, e, mb_x, mb_y, qp, &nbr, &mut lv4);
-        let cost4 = if e.transform_8x8_intra {
+        let cost4 = if e.t8x8_intra(mb_y) {
             let bits = intra_mb_bits(
                 pic,
                 e,
@@ -1608,7 +1623,7 @@ fn encode_intra_mb(
         // Intra_8x8 on the same terms, when the PPS allows it.
         let mut lv8 = chroma_lv.clone();
         let mut recon8 = [0u8; 256];
-        let cost8 = if e.transform_8x8_intra {
+        let cost8 = if e.t8x8_intra(mb_y) {
             let (m8, p8) = code_intra_8x8(pic, e, mb_x, mb_y, qp, &nbr, &mut lv8);
             modes8 = m8;
             pred_modes8 = p8;
@@ -1631,7 +1646,7 @@ fn encode_intra_mb(
 
         let mut lv16 = chroma_lv;
         code_i16_luma(pic, e, mb_x, mb_y, qp, cost.i16_mode, &nbr, &mut lv16);
-        let cost16 = if e.transform_8x8_intra {
+        let cost16 = if e.t8x8_intra(mb_y) {
             let bits = intra_mb_bits(
                 pic,
                 e,
@@ -1963,7 +1978,7 @@ fn encode_inter_mb(
     let mut chroma_lv = Levels::default();
     code_chroma(pic, e, mb_x, mb_y, qp, false, &mut chroma_lv);
     let mut lv = chroma_lv.clone();
-    if e.transform_8x8_inter {
+    if e.t8x8_inter(mb_y) {
         // Both transform sizes on the same prediction; the cheaper
         // rate-distortion cost is coded.
         let mut pred = [0u8; 256];
@@ -1993,7 +2008,7 @@ fn encode_inter_mb(
         None => false,
         Some(_) if empty => true,
         Some(ssd_skip) => {
-            let coded = if e.transform_8x8_inter {
+            let coded = if e.t8x8_inter(mb_y) {
                 let bits = inter_mb_bits(pic, e, w, mb_addr, &nbr, shape, &mvd, &inc, &lv);
                 ssd_mb(pic, e, mb_x, mb_y) as f64 + e.lambda * bits as f64
             } else {

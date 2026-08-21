@@ -88,6 +88,8 @@ pub struct EncoderConfig {
     #[cfg(feature = "rd-ablation")]
     rd_transform_8x8_inter: bool,
     #[cfg(feature = "rd-ablation")]
+    rd_transform_8x8_roweven: bool,
+    #[cfg(feature = "rd-ablation")]
     rd_transform_8x8_margin_bits: f64,
 }
 
@@ -112,6 +114,8 @@ impl EncoderConfig {
             rd_transform_8x8_intra: false,
             #[cfg(feature = "rd-ablation")]
             rd_transform_8x8_inter: false,
+            #[cfg(feature = "rd-ablation")]
+            rd_transform_8x8_roweven: false,
             #[cfg(feature = "rd-ablation")]
             rd_transform_8x8_margin_bits: 0.0,
         }
@@ -548,6 +552,7 @@ fn code_band(pic: &mut Picture, job: BandJob<'_>) -> Vec<u8> {
         transform_8x8: job.cfg.transform_8x8,
         transform_8x8_intra: rd_transform_8x8_intra(job.cfg),
         transform_8x8_inter: rd_transform_8x8_inter(job.cfg),
+        transform_8x8_roweven: rd_transform_8x8_roweven(job.cfg),
         ls: LevelScale4x4::new(&[16; 16]),
         ls8: LevelScale8x8::new(&[16; 64]),
         mb_ctx: crate::entropy::MbCtx::default(),
@@ -600,15 +605,17 @@ fn apply_rd_ablation(cfg: &mut EncoderConfig) {
         };
     }
     if let Ok(transform) = std::env::var("EC_H264_RD_T8X8") {
-        let (intra, inter) = match transform.as_str() {
-            "off" => (false, false),
-            "on" => (true, true),
-            "intra" => (true, false),
-            "inter" => (false, true),
-            _ => panic!("EC_H264_RD_T8X8 must be off, on, intra, or inter"),
+        let (intra, inter, roweven) = match transform.as_str() {
+            "off" => (false, false, false),
+            "on" => (true, true, false),
+            "roweven" => (true, true, true),
+            "intra" => (true, false, false),
+            "inter" => (false, true, false),
+            _ => panic!("EC_H264_RD_T8X8 must be off, on, roweven, intra, or inter"),
         };
         cfg.rd_transform_8x8_intra = intra;
         cfg.rd_transform_8x8_inter = inter;
+        cfg.rd_transform_8x8_roweven = roweven;
         cfg.transform_8x8 = intra || inter;
     } else if cfg.transform_8x8 {
         cfg.rd_transform_8x8_intra = true;
@@ -718,6 +725,16 @@ fn rd_transform_8x8_inter(cfg: &EncoderConfig) -> bool {
 #[cfg(not(feature = "rd-ablation"))]
 fn rd_transform_8x8_inter(cfg: &EncoderConfig) -> bool {
     cfg.transform_8x8
+}
+
+#[cfg(feature = "rd-ablation")]
+fn rd_transform_8x8_roweven(cfg: &EncoderConfig) -> bool {
+    cfg.rd_transform_8x8_roweven
+}
+
+#[cfg(not(feature = "rd-ablation"))]
+fn rd_transform_8x8_roweven(_: &EncoderConfig) -> bool {
+    false
 }
 
 #[cfg(not(feature = "rd-ablation"))]
