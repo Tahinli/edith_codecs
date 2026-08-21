@@ -226,23 +226,26 @@ impl SilkEncoder {
         Ok(1 + len)
     }
 
-    /// The SILK layer of a hybrid packet: codes 960 mono 48 kHz samples into
+    /// The SILK layer of a hybrid packet: codes one mono 48 kHz frame into
     /// `enc`, the packet's shared range coder (SILK symbols first; the CELT
     /// layer continues in the same coder), without finishing it. The caller
-    /// must [`SilkEncoder::replay`] the finished payload so this encoder's
-    /// decoder mirror advances.
-    pub fn encode_hybrid(&mut self, pcm48: &[f32], enc: &mut RangeEncoder) -> Result<()> {
-        let trial = self.encode_inner(pcm48, 20, Some(enc), false, 0)?;
+    /// must [`SilkEncoder::replay_hybrid`] the finished payload so this
+    /// encoder's decoder mirror advances.
+    pub fn encode_hybrid_ms(
+        &mut self,
+        pcm48: &[f32],
+        enc: &mut RangeEncoder,
+        frame_ms: usize,
+    ) -> Result<()> {
+        let trial = self.encode_inner(pcm48, frame_ms, Some(enc), false, 0)?;
         self.voiced_frames += usize::from(trial.voiced);
         Ok(())
     }
 
-    /// Decodes `payload` (TOC stripped) through the mirror decoder so the next
-    /// frame predicts from the decoder's state; [`SilkEncoder::encode_frame`]
-    /// does this itself, [`SilkEncoder::encode_hybrid`] callers do it once
-    /// the packet is complete.
-    pub fn replay(&mut self, payload: &[u8]) -> Result<()> {
-        self.replay_ms(payload, 20)
+    /// Decodes a finished hybrid payload (TOC stripped) through the mirror
+    /// decoder so the next frame predicts from the decoder's state.
+    pub fn replay_hybrid(&mut self, payload: &[u8], frame_ms: usize) -> Result<()> {
+        self.replay_ms(payload, frame_ms)
     }
 
     fn replay_ms(&mut self, payload: &[u8], frame_ms: usize) -> Result<()> {
@@ -743,6 +746,63 @@ impl SilkStereoEncoder {
         self.mid.delay_samples()
     }
 
+    /// The SILK layer of a hybrid packet: codes one interleaved stereo 48 kHz
+    /// frame into the packet's shared range coder without finishing it.
+    pub fn encode_hybrid_ms(
+        &mut self,
+        pcm48: &[f32],
+        enc: &mut RangeEncoder,
+        frame_ms: usize,
+    ) -> Result<()> {
+        assert!(
+            matches!(frame_ms, 10 | 20),
+            "SilkStereoEncoder codes 10 or 20 ms stereo frames"
+        );
+        assert_eq!(
+            pcm48.len(),
+            2 * 48 * frame_ms,
+            "SilkStereoEncoder input is 48 kHz stereo"
+        );
+        if self.prev_mid_only {
+            self.side.reset_state();
+            if let Some(bps) = self.target_bps {
+                self.side.set_bitrate((bps / 2).max(500));
+            }
+        }
+        let samples = 48 * frame_ms;
+        let mut mid = Vec::with_capacity(samples);
+        let mut side = Vec::with_capacity(samples);
+        let mut side_energy = 0.0f32;
+        for lr in pcm48.chunks_exact(2) {
+            let m = 0.5 * (lr[0] + lr[1]);
+            let s = 0.5 * (lr[0] - lr[1]);
+            mid.push(m);
+            side.push(s);
+            side_energy += s * s;
+        }
+        let mid_trial = self.mid.encode_inner(&mid, frame_ms, None, false, 0)?;
+        let side_trial = self.side.encode_inner(&side, frame_ms, None, false, 0)?;
+        let mid_only = side_energy < 1.0e-10;
+        write_stereo_packet_header(enc, &mid_trial, &side_trial, mid_only);
+        write_stereo_zero_pred(enc);
+        if !side_trial.vad_flag {
+            enc.enc_icdf(usize::from(mid_only), &STEREO_ONLY_CODE_MID_ICDF, 8);
+        }
+        write_frame_data(enc, &mid_trial, false, 0);
+        if !mid_only {
+            write_frame_data(enc, &side_trial, false, 0);
+        }
+        self.mid.replay_ms(&mid_trial.bytes, frame_ms)?;
+        if mid_only {
+            self.side.reset_state();
+        } else {
+            self.side.replay_ms(&side_trial.bytes, frame_ms)?;
+        }
+        self.prev_mid_only = mid_only;
+        self.voiced_frames += usize::from(mid_trial.voiced || side_trial.voiced);
+        Ok(())
+    }
+
     /// Encodes one 10 or 20 ms interleaved stereo frame at 48 kHz.
     pub fn encode_frame_ms(
         &mut self,
@@ -821,6 +881,12 @@ impl SilkStereoEncoder {
         self.voiced_frames += usize::from(mid_trial.voiced || side_trial.voiced);
         debug_assert_eq!(self.mirror_range, self.final_range);
         Ok(1 + len)
+    }
+
+    /// Decodes a finished hybrid payload (TOC stripped) through the stereo
+    /// mirror so the range state can be checked against the packet encoder.
+    pub fn replay_hybrid(&mut self, payload: &[u8], frame_ms: usize) -> Result<()> {
+        self.replay_ms(payload, frame_ms)
     }
 
     fn replay_ms(&mut self, payload: &[u8], frame_ms: usize) -> Result<()> {

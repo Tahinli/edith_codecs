@@ -270,20 +270,19 @@ impl Encoder {
     }
 
     /// Whether this frame goes out as a hybrid packet, and at which of the two
-    /// hybrid bandwidths. Automatic: VoIP from 20 kbps (where SILK alone
-    /// stops) to 40 kbps (where CELT alone is the better speech coder too),
-    /// at the bitrate's own bandwidth (SWB/FB; narrower requests are CELT's).
-    /// Mono 20 ms only — stereo Hybrid (which needs stereo SILK) and the
-    /// 10 ms hybrid configs are not implemented and fall back to CELT.
+    /// hybrid bandwidths. Automatic: VoIP from 20 kbps per coded channel
+    /// (where SILK alone stops) to 40 kbps per coded channel (where CELT alone
+    /// is the better speech coder too), at the bitrate's own bandwidth
+    /// (SWB/FB; narrower requests are CELT's). Mono and stereo, 10 or 20 ms.
     fn hybrid_choice(&self, frame_48k: usize) -> Option<Bandwidth> {
+        let lo = 20_000 * self.channels as u32;
+        let hi = 40_000 * self.channels as u32;
         let wanted = match self.mode {
             Some(Mode::Hybrid) => true,
             Some(_) => false,
-            None => {
-                self.application == Application::Voip && (20_000..40_000).contains(&self.bitrate)
-            }
+            None => self.application == Application::Voip && (lo..hi).contains(&self.bitrate),
         };
-        if !wanted || self.channels != 1 || frame_48k != 960 {
+        if !wanted || !matches!(frame_48k, 480 | 960) {
             return None;
         }
         let bandwidth = self.bandwidth.unwrap_or_else(|| self.auto_bandwidth());
@@ -409,12 +408,13 @@ impl Encoder {
         }
         if let Some(bandwidth) = self.hybrid_choice(frame_48k) {
             let n = self.encode_hybrid(pcm, frame_size, bandwidth, cap)?;
-            let config = if bandwidth == Bandwidth::Full {
-                15u8
-            } else {
-                13
-            };
-            return Ok((config << 3, &self.range.data()[..n]));
+            let config = 12
+                + if bandwidth == Bandwidth::Full { 2u8 } else { 0 }
+                + if frame_48k == 960 { 1 } else { 0 };
+            return Ok((
+                (config << 3) | (u8::from(self.channels == 2) << 2),
+                &self.range.data()[..n],
+            ));
         }
         let (toc, frame_48k, end) = self.toc(frame_size)?;
         let n = self.encode_frame(pcm, frame_48k, end, cap)?;
@@ -553,9 +553,9 @@ impl Encoder {
         Ok(1 + len_bytes + n)
     }
 
-    /// One hybrid frame (mono, 20 ms, `bandwidth` SWB or FB) into the
-    /// internal range coder, returning its byte length: the SILK layer's
-    /// symbols (WB, 16 kHz internal, fed the input delayed by
+    /// One hybrid frame (10 or 20 ms, mono or stereo, `bandwidth` SWB or FB)
+    /// into the internal range coder, returning its byte length: the SILK
+    /// layer's symbols (WB, 16 kHz internal, fed the input delayed by
     /// [`HYBRID_SILK_DELAY_48K`]), the no-redundancy flag under the decoder's
     /// exact presence rule, then the CELT layer from band 17 in the same
     /// coder. CBR: the packet is the bitrate's size unless SILK alone needs
@@ -568,25 +568,46 @@ impl Encoder {
         cap: usize,
     ) -> Result<usize> {
         let cap = cap.min(MAX_FRAME_BYTES);
-        let budget = ((self.bitrate as u64 * 960 + 4 * 48000) / (8 * 48000)) as usize;
+        let frame_48k = frame_size * self.upsample;
+        let frame_ms = frame_48k / 48;
+        let budget =
+            ((self.bitrate as u64 * frame_48k as u64 + 4 * 48000) / (8 * 48000)) as usize;
         let budget = budget.saturating_sub(1).clamp(2, cap);
         if cap < HYBRID_CELT_MIN_BYTES + 2 {
             return Err(Error::corrupt(
                 "opus encode: output buffer smaller than the minimum hybrid packet",
             ));
         }
-        Self::zero_stuff_mono(pcm, frame_size, self.upsample, &mut self.silk_stuff);
-        let d = HYBRID_SILK_DELAY_48K;
-        self.silk_delay.resize(d, 0.0);
-        let mut delayed = Vec::with_capacity(960);
+        if self.channels == 2 {
+            Self::zero_stuff_stereo(pcm, frame_size, self.upsample, &mut self.silk_stuff);
+        } else {
+            Self::zero_stuff_mono(pcm, frame_size, self.upsample, &mut self.silk_stuff);
+        }
+        let d = HYBRID_SILK_DELAY_48K * self.channels;
+        if self.silk_delay.len() != d {
+            self.silk_delay.clear();
+            self.silk_delay.resize(d, 0.0);
+        }
+        let silk_len = frame_48k * self.channels;
+        let mut delayed = Vec::with_capacity(silk_len);
         delayed.extend_from_slice(&self.silk_delay);
-        delayed.extend_from_slice(&self.silk_stuff[..960 - d]);
-        self.silk_delay.copy_from_slice(&self.silk_stuff[960 - d..]);
+        delayed.extend_from_slice(&self.silk_stuff[..silk_len - d]);
+        self.silk_delay
+            .copy_from_slice(&self.silk_stuff[silk_len - d..silk_len]);
 
         self.range.reset(cap);
-        let silk = self.silk_wb.get_or_insert_with(|| SilkEncoder::new(true));
-        silk.set_bitrate(Self::hybrid_silk_rate(self.bitrate, bandwidth));
-        silk.encode_hybrid(&delayed, &mut self.range)?;
+        let silk_rate = Self::hybrid_silk_rate(self.bitrate, bandwidth);
+        if self.channels == 2 {
+            let silk = self
+                .silk_stereo_wb
+                .get_or_insert_with(|| SilkStereoEncoder::new(true));
+            silk.set_bitrate(silk_rate);
+            silk.encode_hybrid_ms(&delayed, &mut self.range, frame_ms)?;
+        } else {
+            let silk = self.silk_wb.get_or_insert_with(|| SilkEncoder::new(true));
+            silk.set_bitrate(silk_rate);
+            silk.encode_hybrid_ms(&delayed, &mut self.range, frame_ms)?;
+        }
         let silk_bytes = (self.range.tell() as usize).div_ceil(8);
         let budget = budget.max(silk_bytes + HYBRID_CELT_MIN_BYTES).min(cap);
         self.range.shrink(budget);
@@ -594,15 +615,27 @@ impl Encoder {
         if self.range.tell() as usize + 17 + 20 <= 8 * budget {
             self.range.enc_bit_logp(false, 12);
         }
-        // CELT sees the same input as SILK: start band 17 alone keeps it off
-        // the low band (a one-pole ~6 kHz high-pass here measured identical
-        // full-band correlation, so there is none).
-        let n = self
-            .celt
-            .encode(&mut self.range, pcm, 960, 17, bandwidth.celt_end_band(), 0)?;
+        let n = self.celt.encode(
+            &mut self.range,
+            pcm,
+            frame_48k,
+            17,
+            bandwidth.celt_end_band(),
+            0,
+        )?;
         self.final_range = self.range.range();
         let payload = &self.range.data()[..n];
-        self.silk_wb.as_mut().unwrap().replay(payload)?;
+        if self.channels == 2 {
+            self.silk_stereo_wb
+                .as_mut()
+                .unwrap()
+                .replay_hybrid(payload, frame_ms)?;
+        } else {
+            self.silk_wb
+                .as_mut()
+                .unwrap()
+                .replay_hybrid(payload, frame_ms)?;
+        }
         Ok(n)
     }
 
