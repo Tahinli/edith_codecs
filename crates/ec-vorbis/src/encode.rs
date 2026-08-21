@@ -617,15 +617,17 @@ impl VorbisEncoder {
         // until nothing clamps, so the curve hugs the peaks the range is
         // measured from.
         let limit = CLASS_RANGE[CLASSES - 1];
-        // A short block's precision is what bounds the pre-echo inside the
-        // window that carries an onset, so it does not inherit whatever
-        // headroom the music before it left the rate loop at: at 6 ch / 96 kHz
-        // the loop sat at 22 dB when the onset came and leaked -36 dB across
-        // the half-window before it. A short run is 16 blocks once a second
-        // or so on music, so the extra bits are noise to the loop.
-        let headroom = match plan.is_long {
+        // Blocks next to short windows bound pre-echo too: the transition-out
+        // long block still overlaps the samples just before the onset, so high
+        // bitrate transients get extra minimum precision.
+        let transient_headroom = if self.config.bitrate_bps >= 128_000 {
+            54.0
+        } else {
+            HEADROOM_SHORT_MIN
+        };
+        let headroom = match plan.is_long && plan.prev_long && plan.next_long {
             true => self.headroom,
-            false => self.headroom.max(HEADROOM_SHORT_MIN),
+            false => self.headroom.max(transient_headroom),
         };
         let mut lift: Vec<Vec<f64>> = vec![vec![1.0; bc.floor.x_list.len()]; channels];
         // Per X point, the span of bins whose curve it has a hand in.
@@ -652,6 +654,12 @@ impl VorbisEncoder {
             })
             .collect();
         let mut passes = 0;
+        let steady = plan.is_long && plan.prev_long && plan.next_long;
+        let masking_offset = if !steady && self.config.bitrate_bps >= 128_000 {
+            0.0
+        } else {
+            MASKING_OFFSET_DB
+        };
         let (floor_values, quantised) = loop {
             let mut curves: Vec<Vec<f32>> = vec![Vec::new(); channels];
             let mut floor_values: Vec<Vec<i32>> = vec![Vec::new(); channels];
@@ -664,7 +672,14 @@ impl VorbisEncoder {
                     }
                 }
                 let (y, step2) = fit_floor(
-                    &bc.floor, &bc.ath, &bc.bark, headroom, bc.range, bc.co_mask, &peaks,
+                    &bc.floor,
+                    &bc.ath,
+                    &bc.bark,
+                    headroom,
+                    bc.range,
+                    bc.co_mask,
+                    masking_offset,
+                    &peaks,
                 );
                 let mut curve = vec![0.0f32; half];
                 render_floor1(&bc.floor, &y, &step2, &mut curve);
@@ -874,6 +889,7 @@ fn fit_floor(
     headroom: f64,
     range: f64,
     co_mask: f64,
+    masking_offset: f64,
     peaks: &[f64],
 ) -> (Vec<i32>, Vec<bool>) {
     let db: Vec<f64> = peaks
@@ -910,7 +926,8 @@ fn fit_floor(
         .zip(ath.iter())
         .map(|(&level, &threshold)| {
             let threshold = threshold.max(loudest - co_mask);
-            (level - headroom.min(range) + MASKING_OFFSET_DB)
+            let offset = (masking_offset - (headroom - range).max(0.0)).max(0.0);
+            (level - headroom.min(range) + offset)
                 .max(threshold - (headroom - range).max(0.0))
         })
         .collect();
