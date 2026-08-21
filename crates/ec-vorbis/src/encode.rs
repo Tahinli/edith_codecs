@@ -10,19 +10,34 @@
 //! that comes out is the quantiser step: the residue is the spectrum divided by
 //! the floor and rounded, so headroom in dB *is* precision in bits. That is
 //! psychoacoustics-lite and it is stated as such — there is no tonality
-//! estimate, no temporal pre-echo control and no per-band bit allocation beyond
-//! what the floor implies.
+//! estimate beyond a two-mode block switch and no per-band bit allocation
+//! beyond what the floor implies.
+//!
+//! ## Block switching (§1.3.2 / §4.3)
+//!
+//! Two modes: a 256-sample short block and a 2048-sample long block. Steady
+//! content codes long blocks only. A transient — energy in a 128-sample tick
+//! jumping past its predecessor, which is also what an onset after digital
+//! silence looks like — swaps one pair of would-be long blocks for a
+//! long-with-short-right-window (the block that would otherwise carry the
+//! pre-echo), eight short blocks spanning the transient itself, and a
+//! long-with-short-left-window resuming steady state. The granule advance
+//! across that whole run is exactly two long hops, so the switch never moves
+//! the steady-state grid.
 //!
 //! ## Codebooks
 //!
 //! Designed here rather than inherited: a floor book over the folded amplitude
-//! range, a class book over partition-class pairs, and four residue books whose
-//! ranges (+-1, +-4, +-16, +-127) the partition classifier picks between. All of
+//! range, a class book over partition-class pairs, and eight residue books whose
+//! ranges (+-1, +-2, +-4 ... +-64, +-127) the partition classifier picks between —
+//! a partition's values sit about a sixth of its class's range on average,
+//! so one book per octave of range keeps every value near the top of its
+//! own book. All of
 //! them are Huffman codes over stated distributions, built at construction and
 //! written into every stream's own setup header — which is why this encoder
-//! needs no embedded profile and has no channel count it cannot serve.
-
-use std::collections::VecDeque;
+//! needs no embedded profile and has no channel count it cannot serve. Both
+//! block sizes share these books; only the floor's X grid and the residue's
+//! partition size are sized per block.
 
 use ec_core::{
     AudioParameters, Buf, CodecId, CodecParameters, Encoder, Error, Frame, MediaParameters, Packet,
@@ -35,29 +50,98 @@ use crate::codebook::{CodebookSpec, ilog};
 use crate::decode::channel_map;
 use crate::floor::render_floor1;
 use crate::setup::Floor1;
-use crate::window;
+use crate::window::Windows;
 
-/// Long block size; this encoder codes long blocks only.
-const BLOCK: usize = 2048;
-/// Samples between block centres.
-const HOP: usize = BLOCK / 2;
-/// Coefficients per block.
-const HALF: usize = BLOCK / 2;
-/// Coefficients per residue partition.
-const PARTITION: usize = 32;
-/// Floor X points besides the two endpoints.
-const FLOOR_POINTS: usize = 20;
+/// Long block size.
+const BLOCK_LONG: usize = 2048;
+/// Short block size.
+const BLOCK_SHORT: usize = 256;
+/// Coefficients in a long block.
+const HALF_LONG: usize = BLOCK_LONG / 2;
+/// Coefficients in a short block.
+const HALF_SHORT: usize = BLOCK_SHORT / 2;
+/// Long-block coefficients per residue partition.
+const PARTITION_LONG: usize = 16;
+/// Short-block coefficients per residue partition.
+const PARTITION_SHORT: usize = 16;
+/// Long floor X points besides the two endpoints. Fewer is better here, on
+/// real music at 128 kbps: 12 beat 16, 20, 32 and 44 in that order, since a
+/// finer floor costs bits of its own and then follows every peak closely
+/// enough to spend residue bits under all of them.
+const FLOOR_POINTS_LONG: usize = 12;
+/// Short floor X points besides the two endpoints.
+const FLOOR_POINTS_SHORT: usize = 8;
 /// Floor values per class.
 const FLOOR_CLASS_DIM: usize = 4;
 /// Residue classes; class 0 codes nothing at all.
-const CLASSES: usize = 5;
-/// Vorbis states spectral coefficients on the scale where a full-scale tone is
-/// a coefficient of about one, which is what lets the floor table (whose top is
-/// exactly 1.0) carry them. That is `2/N` times the unnormalised transform
-/// ec-dsp computes, `N` being the coefficient count.
-const VORBIS_MDCT_SCALE: f32 = 2.0 / HALF as f32;
+const CLASSES: usize = 9;
 /// Largest quantised residue each class's book can state.
-const CLASS_RANGE: [i32; CLASSES] = [0, 1, 4, 16, 127];
+const CLASS_RANGE: [i32; CLASSES] = [0, 1, 2, 4, 8, 16, 32, 64, 127];
+/// Headroom in dB the widest residue book can actually state: 20 log10 127
+/// is 42, but a coupled angle channel is a difference of two magnitudes, so a
+/// pair's step must leave half that range — 63, 36 dB. Past this the rate loop's extra headroom lowers the absolute-threshold
+/// bound instead, so sparse or quiet content — where most partitions sit under
+/// the threshold and code as class 0 whatever the step — gains bins to spend
+/// bits on rather than a finer step nothing can represent.
+const HEADROOM_RANGE: f64 = 36.0;
+/// A short block's range: the full 42 dB. Its step is what sets the pre-echo
+/// left inside the block that carries an onset, and 6 dB of it is the
+/// difference between a leak twice the reference's and one under it.
+/// Anything the wider range cannot state (a pair's angle, a peak at a floor
+/// region's edge) is caught by the clamp refit in `encode_block`.
+const HEADROOM_RANGE_SHORT: f64 = 42.0;
+/// Nothing more than this many dB under a block's loudest floor point is
+/// coded: a whole-spectrum co-masking cap. corner-cut: a flat cap is not a
+/// spreading function — real masking falls off with distance in Barks, so
+/// this drops a quiet treble part under a loud bass note that the ear would
+/// still pick out. It is what buys real music its accuracy at this rate (on
+/// three tracks at 128 kbps, 0.989 -> 0.995 correlation with the source);
+/// the upgrade is a Bark-domain spread in `fit_floor` in place of the
+/// per-point decay plus this cap. Swept 40 / 50 / 60 dB: 40 is better still
+/// on the metric but too deaf to be honest.
+const CO_MASK_RANGE: f64 = 50.0;
+/// A short block gets no co-masking cap: a bin it drops is an error spread
+/// across its whole window, the half before an onset included, and that is
+/// the pre-echo the short block exists to prevent (44.1k mono, onset on the
+/// grid: peak 0.0085 with the cap, under 0.007 without).
+const CO_MASK_RANGE_SHORT: f64 = f64::INFINITY;
+/// Above this frequency the coupled pair's angle is dropped and only the
+/// magnitude coded (point stereo): the ear does not place HF detail by
+/// inter-channel level difference finely enough to pay for coding it, and at
+/// this rate the bits buy more accuracy in the magnitude. Below it the pair
+/// is coded losslessly. Swept on real music at 128 kbps: 3-6 kHz are equal,
+/// 10 kHz and no cutoff are worse.
+const POINT_STEREO_HZ: f64 = 4_000.0;
+/// Least headroom a short block is quantised with, whatever the rate loop's.
+const HEADROOM_SHORT_MIN: f64 = 42.0;
+/// Samples per transient-detection tick — the short block's own hop, so a
+/// tick lines up with the finest time resolution the encoder has.
+const TICK: usize = BLOCK_SHORT / 4;
+/// Short blocks a detected transient inserts between the two transition long
+/// blocks. Detection looks one long hop ahead of the transition-out
+/// candidate, so the transient can land anywhere in that hop; the run is
+/// sized to three long hops' worth of short-hop resolution (any `8 + 8k`
+/// count keeps the steady-state grid aligned) so it comfortably straddles a
+/// transient found anywhere in the hop being watched, not just at its start.
+const SHORT_RUN: u8 = 16;
+/// Mode index the setup header and every packet agree the short mode is.
+const MODE_SHORT: u32 = 0;
+/// Mode index the setup header and every packet agree the long mode is.
+const MODE_LONG: u32 = 1;
+/// A tick energy jump past this multiple of its predecessor is a transient;
+/// a near-zero predecessor makes this trip on any onset above the floor.
+const TRANSIENT_RATIO: f64 = 16.0;
+/// Below this per-sample mean square (-60 dBFS), a tick is not "content" at
+/// all — the floor that keeps digital silence, dither and fade tails from
+/// tripping the detector.
+const TRANSIENT_FLOOR: f64 = 1e-6;
+/// Ticks before the candidate whose loudest one the jump is measured from.
+const TRANSIENT_HISTORY: usize = 4;
+
+/// Buffer samples of left pre-roll before input sample 0 — one long half, so
+/// even a block starting at the very front of the stream finds zeroes rather
+/// than reading off the front of the buffer.
+const PREROLL: usize = HALF_LONG;
 
 /// How the encoder is set up.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -95,6 +179,39 @@ pub struct EncodedPacket {
     pub samples: i64,
 }
 
+/// One block's shape: its mode and, for a long block, the window flags §4.3
+/// states beside it.
+#[derive(Debug, Clone, Copy)]
+struct BlockPlan {
+    is_long: bool,
+    prev_long: bool,
+    next_long: bool,
+}
+
+/// The block-switch scheduler's state between calls.
+#[derive(Debug, Clone, Copy)]
+enum Sched {
+    /// Long blocks, deciding fresh each time whether the next one is a
+    /// transient's transition-out.
+    Steady,
+    /// Short blocks left to emit, counting this call down to zero.
+    ShortRun(u8),
+    /// The long block that resumes steady state after a short run.
+    TransitionIn,
+}
+
+/// A block size's own floor, codebook-sharing residue geometry and ATH.
+struct BlockConfig {
+    half: usize,
+    partition: usize,
+    floor: Floor1,
+    ath: Vec<f64>,
+    /// Headroom the residue range lets this block size state.
+    range: f64,
+    /// dB under the loudest floor point below which nothing is coded.
+    co_mask: f64,
+}
+
 /// Vorbis I encoder.
 pub struct VorbisEncoder {
     config: EncoderConfig,
@@ -102,29 +219,36 @@ pub struct VorbisEncoder {
     /// `to_vorbis[ec channel] = vorbis channel`.
     to_vorbis: Vec<usize>,
     headers: Vec<Vec<u8>>,
-    floor: Floor1,
+    long: BlockConfig,
+    short: BlockConfig,
     floor_book: CodebookSpec,
     class_book: CodebookSpec,
     residue_books: Vec<CodebookSpec>,
-    /// Absolute threshold of hearing per floor point, in dBFS.
-    ath: Vec<f64>,
     /// Channel pairs coupled by the mapping; empty unless stereo.
     coupling: Vec<(usize, usize)>,
-    mdct: Mdct<f32>,
-    window: Vec<f32>,
-    /// Per Vorbis channel, input samples with the first block's left half of
-    /// zeroes already in front.
+    mdct_long: Mdct<f32>,
+    mdct_short: Mdct<f32>,
+    windows: Windows,
+    /// Per Vorbis channel, input samples with [`PREROLL`] zeroes already in
+    /// front.
     buffer: Vec<Vec<f32>>,
     /// Input samples taken from the caller.
     fed: i64,
     /// Blocks already emitted.
-    blocks: i64,
+    blocks_emitted: i64,
+    /// Centre of the block emitted last; the sentinel one long hop before
+    /// sample 0, so the first real centre falls out of the same recurrence
+    /// every later one uses.
+    centre: i64,
+    /// Blocksize of the block emitted last.
+    prev_n: usize,
     /// Granule of the packet emitted last.
     granule: i64,
+    scheduler: Sched,
     /// Headroom under the masking curve, in dB — the rate loop's variable.
     headroom: f64,
     finished: bool,
-    packets: VecDeque<EncodedPacket>,
+    packets: std::collections::VecDeque<EncodedPacket>,
 }
 
 impl VorbisEncoder {
@@ -152,23 +276,31 @@ impl VorbisEncoder {
             _ => Vec::new(),
         };
 
-        let floor = build_floor();
         let floor_book = design_floor_book();
         let class_book = design_class_book();
         let residue_books = design_residue_books();
-        let ath = floor
-            .x_list
-            .iter()
-            .map(|&x| {
-                let hz = f64::from(config.sample_rate) * 0.5 * f64::from(x) / HALF as f64;
-                absolute_threshold(hz)
-            })
-            .collect();
+        let long = build_block_config(
+            HALF_LONG,
+            PARTITION_LONG,
+            FLOOR_POINTS_LONG,
+            HEADROOM_RANGE,
+            CO_MASK_RANGE,
+            &config,
+        );
+        let short = build_block_config(
+            HALF_SHORT,
+            PARTITION_SHORT,
+            FLOOR_POINTS_SHORT,
+            HEADROOM_RANGE_SHORT,
+            CO_MASK_RANGE_SHORT,
+            &config,
+        );
 
         let headers = write_headers(
             &config,
             channels,
-            &floor,
+            &long,
+            &short,
             &floor_book,
             &class_book,
             &residue_books,
@@ -187,26 +319,28 @@ impl VorbisEncoder {
 
         let quality = f64::from(config.quality.clamp(0.0, 1.0));
         Ok(VorbisEncoder {
-            mdct: Mdct::new(BLOCK),
-            window: window::build(BLOCK, BLOCK, true, true),
-            // The first block is centred on input sample 0, so its left half is
-            // the only pre-roll there is and the caller never sees it.
-            buffer: vec![vec![0.0; HOP]; channels],
+            mdct_long: Mdct::new(BLOCK_LONG),
+            mdct_short: Mdct::new(BLOCK_SHORT),
+            windows: Windows::new(BLOCK_SHORT, BLOCK_LONG),
+            buffer: vec![vec![0.0; PREROLL]; channels],
             fed: 0,
-            blocks: 0,
+            blocks_emitted: 0,
+            centre: -(HALF_LONG as i64),
+            prev_n: BLOCK_LONG,
             granule: 0,
+            scheduler: Sched::Steady,
             headroom: 4.0 + 26.0 * quality,
             finished: false,
-            packets: VecDeque::new(),
+            packets: std::collections::VecDeque::new(),
             config,
             params,
             to_vorbis,
             headers,
-            floor,
+            long,
+            short,
             floor_book,
             class_book,
             residue_books,
-            ath,
             coupling,
         })
     }
@@ -273,10 +407,11 @@ impl VorbisEncoder {
             return;
         }
         self.finished = true;
-        // Enough blocks for every input sample to sit left of a block centre,
-        // and enough padding for that last block to be whole.
-        let last = ((self.fed + HOP as i64 - 1) / HOP as i64).max(1) as usize;
-        let needed = last * HOP + BLOCK;
+        // Generous padding: a long block's own half plus a whole short-run's
+        // worth of slack, so whatever the scheduler is doing when the input
+        // runs out still finds real (zero) samples rather than the buffer's
+        // edge.
+        let needed = PREROLL + self.fed.max(0) as usize + 2 * BLOCK_LONG;
         for channel in &mut self.buffer {
             if channel.len() < needed {
                 channel.resize(needed, 0.0);
@@ -294,285 +429,307 @@ impl VorbisEncoder {
         }
     }
 
+    /// Decide the next block's shape without committing the scheduler state;
+    /// used to check whether the data it needs is buffered yet.
+    fn peek_plan(&self) -> BlockPlan {
+        match self.scheduler {
+            Sched::Steady => BlockPlan {
+                is_long: true,
+                prev_long: true,
+                next_long: !self.transient_ahead(),
+            },
+            Sched::ShortRun(_) => BlockPlan {
+                is_long: false,
+                prev_long: true,
+                next_long: true,
+            },
+            Sched::TransitionIn => BlockPlan {
+                is_long: true,
+                prev_long: false,
+                next_long: true,
+            },
+        }
+    }
+
+    /// Advance the scheduler past the plan [`peek_plan`] just returned.
+    fn commit_plan(&mut self, plan: BlockPlan) {
+        self.scheduler = match self.scheduler {
+            Sched::Steady if !plan.next_long => Sched::ShortRun(SHORT_RUN),
+            Sched::Steady => Sched::Steady,
+            Sched::ShortRun(remaining) if remaining > 1 => Sched::ShortRun(remaining - 1),
+            Sched::ShortRun(_) => Sched::TransitionIn,
+            Sched::TransitionIn => Sched::Steady,
+        };
+    }
+
+    /// Whether the *next* steady long block's window carries a transient —
+    /// checked one hop ahead of the block being decided now, so the block
+    /// this call is about to type as transition-out still finishes its own
+    /// carried region (up to a short hop past its centre) safely before the
+    /// transient it is making room for. A tick's energy jumping past its
+    /// predecessor's is exactly what an onset after digital silence looks
+    /// like when the predecessor is zero.
+    fn transient_ahead(&self) -> bool {
+        // The very first block's "predecessor" is the encoder's own silent
+        // pre-roll, not a real signal boundary; nothing to detect there.
+        if self.centre == -(HALF_LONG as i64) {
+            return false;
+        }
+        let candidate_centre = self.centre + (self.prev_n + BLOCK_LONG) as i64 / 4;
+        let lookahead_centre = candidate_centre + BLOCK_LONG as i64 / 2;
+        let window_start = lookahead_centre - HALF_LONG as i64;
+        let buffer_start = window_start + PREROLL as i64;
+        if buffer_start < 0 || self.buffer[0].len() < (buffer_start as usize) + BLOCK_LONG {
+            return false;
+        }
+        let ticks = BLOCK_LONG / TICK;
+        let energy = |t: usize| -> f64 {
+            let start = buffer_start as usize + t * TICK;
+            let mut sum = 0.0f64;
+            for channel in &self.buffer {
+                for &s in &channel[start..start + TICK] {
+                    sum += f64::from(s) * f64::from(s);
+                }
+            }
+            sum
+        };
+        // Only the right half is new; its left neighbour was already the
+        // right half the last time this block's window was checked.
+        let floor = TRANSIENT_FLOOR * (TICK * self.buffer.len()) as f64;
+        for t in ticks / 2..ticks {
+            // Against the loudest of the few ticks before it, not just the
+            // one: music rising over a few ticks is not a transient, a drum
+            // hit or an onset after silence is.
+            let previous = (t.saturating_sub(TRANSIENT_HISTORY)..t).map(energy).fold(0.0f64, f64::max);
+            let current = energy(t);
+            if current > floor && current > previous * TRANSIENT_RATIO {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Encode every block the buffer now holds whole.
-    ///
-    /// Block `k` is centred on input sample `k * HOP`, and that centre is the
-    /// granule: the decoder's output reaches exactly there when the block's
-    /// window closes. The last block's granule is the input's own sample count
-    /// instead, which is what trims the grid's overshoot off the file.
     fn encode_ready(&mut self) {
         let channels = usize::from(self.config.channels);
         loop {
-            if self.finished && self.blocks > 0 && self.granule >= self.fed {
+            if self.finished && self.blocks_emitted > 0 && self.granule >= self.fed {
                 break;
             }
-            let start = self.blocks as usize * HOP;
-            if self.buffer[0].len() < start + BLOCK {
+            let plan = self.peek_plan();
+            let n = if plan.is_long { BLOCK_LONG } else { BLOCK_SHORT };
+            let half = if plan.is_long { HALF_LONG } else { HALF_SHORT };
+            let centre = self.centre + (self.prev_n + n) as i64 / 4;
+            let window_start = centre - (n / 2) as i64;
+            let buffer_start = window_start + PREROLL as i64;
+            if buffer_start < 0 || self.buffer[0].len() < buffer_start as usize + n {
                 break;
             }
-            let centre = self.blocks * HOP as i64;
+            // A steady long block is typed by the hop *after* it; until that
+            // hop is buffered the plan just peeked was decided blind.
+            if !self.finished
+                && matches!(self.scheduler, Sched::Steady)
+                && self.buffer[0].len() < buffer_start as usize + n + BLOCK_LONG
+            {
+                break;
+            }
             let granule = match self.finished {
                 true => centre.min(self.fed),
                 false => centre,
             };
-            let data = self.encode_block(start, channels);
+            let data = self.encode_block(buffer_start as usize, n, half, plan, channels);
             self.packets.push_back(EncodedPacket {
                 data,
                 granule,
                 samples: (granule - self.granule).max(0),
             });
             self.granule = granule;
-            self.blocks += 1;
+            self.centre = centre;
+            self.prev_n = n;
+            self.blocks_emitted += 1;
+            self.commit_plan(plan);
         }
     }
 
     /// One block: analyse, quantise, write.
-    fn encode_block(&mut self, start: usize, channels: usize) -> Vec<u8> {
+    fn encode_block(
+        &mut self,
+        start: usize,
+        n: usize,
+        half: usize,
+        plan: BlockPlan,
+        channels: usize,
+    ) -> Vec<u8> {
+        let bc = if plan.is_long { &self.long } else { &self.short };
+        let partition = bc.partition;
+        let scale = 2.0 / half as f32;
+        let window = self
+            .windows
+            .get(plan.is_long, plan.prev_long, plan.next_long)
+            .to_vec();
+
         let mut spectra: Vec<Vec<f32>> = Vec::with_capacity(channels);
-        let mut block = vec![0.0f32; BLOCK];
+        let mut block = vec![0.0f32; n];
         for channel in 0..channels {
-            block.copy_from_slice(&self.buffer[channel][start..start + BLOCK]);
-            let mut coefficients = vec![0.0f32; HALF];
-            self.mdct
-                .forward_windowed(&block, &self.window, &mut coefficients);
+            block.copy_from_slice(&self.buffer[channel][start..start + n]);
+            let mut coefficients = vec![0.0f32; half];
+            let mdct = if plan.is_long { &mut self.mdct_long } else { &mut self.mdct_short };
+            mdct.forward_windowed(&block, &window, &mut coefficients);
             for value in coefficients.iter_mut() {
-                *value *= VORBIS_MDCT_SCALE;
+                *value *= scale;
             }
             spectra.push(coefficients);
         }
 
         // Floor per channel — one shared floor per coupled pair, so the two
         // normalised spectra are on the same scale and the angle channel is
-        // small where the pair agrees.
-        let mut curves: Vec<Vec<f32>> = vec![Vec::new(); channels];
-        let mut floor_values: Vec<Vec<i32>> = vec![Vec::new(); channels];
-        let mut coded = vec![false; channels];
-        for &(magnitude, angle) in &self.coupling {
-            let peaks = self.peaks_of(&[&spectra[magnitude], &spectra[angle]]);
-            let (y, step2) = self.fit_floor(&peaks);
-            let mut curve = vec![0.0f32; HALF];
-            render_floor1(&self.floor, &y, &step2, &mut curve);
-            curves[magnitude] = curve.clone();
-            curves[angle] = curve;
-            floor_values[magnitude] = y.clone();
-            floor_values[angle] = y;
-            coded[magnitude] = true;
-            coded[angle] = true;
-        }
-        for channel in 0..channels {
-            if coded[channel] {
-                continue;
-            }
-            let peaks = self.peaks_of(&[&spectra[channel]]);
-            let (y, step2) = self.fit_floor(&peaks);
-            let mut curve = vec![0.0f32; HALF];
-            render_floor1(&self.floor, &y, &step2, &mut curve);
-            curves[channel] = curve;
-            floor_values[channel] = y;
-        }
-
-        // Normalise, couple, quantise.
-        let mut quantised: Vec<Vec<i32>> = (0..channels)
-            .map(|channel| {
-                spectra[channel]
+        // small where the pair agrees. The floor is set per X point from the
+        // peak of the region that point owns, then drawn as straight lines
+        // between points: a peak at a region's edge can sit further under the
+        // curve than the range states and clamp. Such a block lifts the two
+        // points either side of every clamping bin by the excess and refits
+        // until nothing clamps, so the curve hugs the peaks the range is
+        // measured from.
+        let limit = CLASS_RANGE[CLASSES - 1];
+        // A short block's precision is what bounds the pre-echo inside the
+        // window that carries an onset, so it does not inherit whatever
+        // headroom the music before it left the rate loop at: at 6 ch / 96 kHz
+        // the loop sat at 22 dB when the onset came and leaked -36 dB across
+        // the half-window before it. A short run is 16 blocks once a second
+        // or so on music, so the extra bits are noise to the loop.
+        let headroom = match plan.is_long {
+            true => self.headroom,
+            false => self.headroom.max(HEADROOM_SHORT_MIN),
+        };
+        let mut lift: Vec<Vec<f64>> = vec![vec![1.0; bc.floor.x_list.len()]; channels];
+        // Per X point, the span of bins whose curve it has a hand in.
+        let spans: Vec<(usize, usize)> = bc
+            .floor
+            .x_list
+            .iter()
+            .map(|&x| {
+                let below = bc
+                    .floor
+                    .x_list
                     .iter()
-                    .zip(curves[channel].iter())
-                    .map(|(&value, &floor)| match floor > 0.0 {
-                        true => value / floor,
-                        false => 0.0,
-                    })
-                    .map(|normalised| normalised.round() as i32)
-                    .collect::<Vec<i32>>()
+                    .filter(|&&o| o < x)
+                    .max()
+                    .map_or(0, |&o| o as usize);
+                let above = bc
+                    .floor
+                    .x_list
+                    .iter()
+                    .filter(|&&o| o > x)
+                    .min()
+                    .map_or(half, |&o| o as usize);
+                (below, above)
             })
             .collect();
-        for &(magnitude, angle) in &self.coupling {
-            // Taken out and put back so the pair can be walked in step; a
-            // coupling step never names one channel twice.
-            let mut left = std::mem::take(&mut quantised[magnitude]);
-            let mut right = std::mem::take(&mut quantised[angle]);
-            for (l, r) in left.iter_mut().zip(right.iter_mut()) {
-                let (m, a) = couple(*l, *r);
-                *l = m;
-                *r = a;
+        let mut passes = 0;
+        let (floor_values, quantised) = loop {
+            let mut curves: Vec<Vec<f32>> = vec![Vec::new(); channels];
+            let mut floor_values: Vec<Vec<i32>> = vec![Vec::new(); channels];
+            let mut fit = |group: &[usize]| {
+                let group_spectra: Vec<&Vec<f32>> = group.iter().map(|&c| &spectra[c]).collect();
+                let mut peaks = peaks_of(&bc.floor, half, &group_spectra);
+                for &c in group {
+                    for (peak, &boost) in peaks.iter_mut().zip(&lift[c]) {
+                        *peak *= boost;
+                    }
+                }
+                let (y, step2) = fit_floor(&bc.floor, &bc.ath, headroom, bc.range, bc.co_mask, &peaks);
+                let mut curve = vec![0.0f32; half];
+                render_floor1(&bc.floor, &y, &step2, &mut curve);
+                for &c in group {
+                    curves[c] = curve.clone();
+                    floor_values[c] = y.clone();
+                }
+            };
+            let mut coded = vec![false; channels];
+            for &(magnitude, angle) in &self.coupling {
+                fit(&[magnitude, angle]);
+                coded[magnitude] = true;
+                coded[angle] = true;
             }
-            quantised[magnitude] = left;
-            quantised[angle] = right;
-        }
-        let limit = CLASS_RANGE[CLASSES - 1];
-        for channel in quantised.iter_mut() {
-            for value in channel.iter_mut() {
-                *value = (*value).clamp(-limit, limit);
+            for channel in (0..channels).filter(|&c| !coded[c]) {
+                fit(&[channel]);
             }
-        }
+
+            // Normalise, couple, quantise.
+            let mut quantised: Vec<Vec<i32>> = (0..channels)
+                .map(|channel| {
+                    spectra[channel]
+                        .iter()
+                        .zip(curves[channel].iter())
+                        .map(|(&value, &floor)| match floor > 0.0 {
+                            true => value / floor,
+                            false => 0.0,
+                        })
+                        .map(|normalised| normalised.round() as i32)
+                        .collect::<Vec<i32>>()
+                })
+                .collect();
+            for &(magnitude, angle) in &self.coupling {
+                let mut left = std::mem::take(&mut quantised[magnitude]);
+                let mut right = std::mem::take(&mut quantised[angle]);
+                // Only while bits are scarce: headroom at the range is the
+                // rate loop saying the step cannot get finer, so the budget
+                // is better spent stating the angle than left unspent.
+                let point = match self.headroom < bc.range {
+                    true => (POINT_STEREO_HZ / (f64::from(self.config.sample_rate) * 0.5) * half as f64) as usize,
+                    false => half,
+                };
+                for (bin, (l, r)) in left.iter_mut().zip(right.iter_mut()).enumerate() {
+                    let (m, a) = couple(*l, *r);
+                    *l = m;
+                    *r = if bin >= point { 0 } else { a };
+                }
+                quantised[magnitude] = left;
+                quantised[angle] = right;
+            }
+            let mut clamps = false;
+            for (channel, values) in quantised.iter().enumerate() {
+                for (bin, &value) in values.iter().enumerate() {
+                    if value.abs() <= limit {
+                        continue;
+                    }
+                    clamps = true;
+                    let excess = f64::from(value.abs()) / f64::from(limit) * 1.05;
+                    for (point, &(below, above)) in spans.iter().enumerate() {
+                        if bin >= below && bin <= above {
+                            lift[channel][point] = lift[channel][point].max(excess);
+                        }
+                    }
+                }
+            }
+            passes += 1;
+            // Eight lifts is 8 x 6 dB past anything a 42 dB range can leave over.
+            if !clamps || passes == 8 {
+                for channel in quantised.iter_mut() {
+                    for value in channel.iter_mut() {
+                        *value = (*value).clamp(-limit, limit);
+                    }
+                }
+                break (floor_values, quantised);
+            }
+        };
 
         let mut out = BitsOut::new();
-        out.write(0, 1);
-        // One mode means `ilog(modes - 1)` is zero bits: there is nothing to
-        // state. The two window flags follow because the mode is a long block.
-        out.bit(true);
-        out.bit(true);
+        out.bit(false);
+        let mode = if plan.is_long { MODE_LONG } else { MODE_SHORT };
+        out.write(mode, 1);
+        if plan.is_long {
+            out.bit(plan.prev_long);
+            out.bit(plan.next_long);
+        }
         for values in floor_values.iter().take(channels) {
-            self.write_floor(&mut out, values);
+            write_floor(&mut out, &bc.floor, &self.floor_book, values);
         }
-        self.write_residue(&mut out, &quantised);
+        write_residue(&mut out, &quantised, half, partition, &self.class_book, &self.residue_books);
         let bits = out.len();
-        self.update_rate(bits, channels);
+        let delta = (self.centre + (self.prev_n + n) as i64 / 4) - self.centre;
+        self.update_rate(bits, half, channels, delta);
         out.finish()
-    }
-
-    /// Peak magnitude around each floor X point, over every channel given.
-    ///
-    /// Each point owns the coefficients halfway to its neighbours either side,
-    /// so the whole spectrum is covered exactly once and a peak between two
-    /// points still raises the floor that has to carry it.
-    fn peaks_of(&self, spectra: &[&Vec<f32>]) -> Vec<f64> {
-        let x = &self.floor.x_list;
-        x.iter()
-            .map(|&centre| {
-                let below = x.iter().filter(|&&o| o < centre).max().copied();
-                let above = x.iter().filter(|&&o| o > centre).min().copied();
-                let lo = below.map_or(0, |b| ((b + centre) / 2) as usize);
-                let hi = above.map_or(HALF, |a| ((a + centre) / 2) as usize + 1);
-                let lo = lo.min(HALF - 1);
-                let hi = hi.clamp(lo + 1, HALF);
-                let mut peak = 0.0f64;
-                for spectrum in spectra {
-                    for &value in &spectrum[lo..hi] {
-                        peak = peak.max(f64::from(value.abs()));
-                    }
-                }
-                peak
-            })
-            .collect()
-    }
-
-    /// Turn peak magnitudes into coded floor amplitudes.
-    ///
-    /// Spread first (a masker covers its neighbours), then subtract the rate
-    /// loop's headroom, then hold the absolute threshold of hearing as a lower
-    /// bound: below it the residue quantises to zero and costs a class-0
-    /// partition.
-    fn fit_floor(&self, peaks: &[f64]) -> (Vec<i32>, Vec<bool>) {
-        let mut db: Vec<f64> = peaks
-            .iter()
-            .map(|&peak| 20.0 * (peak.max(1e-9)).log10())
-            .collect();
-        // Frequency order, not coding order: spreading is a fact about the ear.
-        let order = &self.floor.sorted;
-        for window in order.windows(2) {
-            let (previous, current) = (window[0], window[1]);
-            db[current] = db[current].max(db[previous] - 12.0);
-        }
-        for window in order.windows(2).rev() {
-            let (current, next) = (window[0], window[1]);
-            db[current] = db[current].max(db[next] - 24.0);
-        }
-        let target: Vec<f64> = db
-            .iter()
-            .zip(self.ath.iter())
-            .map(|(&level, &threshold)| (level - self.headroom).max(threshold))
-            .collect();
-        let y: Vec<i32> = target
-            .iter()
-            .map(|&level| ((level / (140.0 / 256.0)).round() as i32 + 255).clamp(0, 255))
-            .collect();
-        self.fold_floor(&y)
-    }
-
-    /// Run the decoder's own amplitude synthesis forwards, so the curve the
-    /// encoder normalises against is the curve the decoder will draw.
-    fn fold_floor(&self, wanted: &[i32]) -> (Vec<i32>, Vec<bool>) {
-        let values = wanted.len();
-        let range = 256i32;
-        let mut final_y = vec![0i32; values];
-        let mut step2 = vec![false; values];
-        final_y[0] = wanted[0];
-        final_y[1] = wanted[1];
-        step2[0] = true;
-        step2[1] = true;
-        for i in 2..values {
-            let (low, high) = self.floor.neighbours[i];
-            let predicted = predict(
-                self.floor.x_list[low],
-                final_y[low],
-                self.floor.x_list[high],
-                final_y[high],
-                self.floor.x_list[i],
-            );
-            let value = fold(predicted, wanted[i], range);
-            if value != 0 {
-                step2[low] = true;
-                step2[high] = true;
-                step2[i] = true;
-            }
-            final_y[i] = wanted[i];
-        }
-        (final_y, step2)
-    }
-
-    /// Write one channel's floor: the two endpoints raw, the rest folded
-    /// against their neighbours and Huffman coded.
-    fn write_floor(&self, out: &mut BitsOut, y: &[i32]) {
-        out.bit(true);
-        out.write(y[0] as u32, 8);
-        out.write(y[1] as u32, 8);
-        for i in 2..y.len() {
-            let (low, high) = self.floor.neighbours[i];
-            let predicted = predict(
-                self.floor.x_list[low],
-                y[low],
-                self.floor.x_list[high],
-                y[high],
-                self.floor.x_list[i],
-            );
-            let value = fold(predicted, y[i], 256);
-            self.floor_book.write(out, value as usize);
-        }
-    }
-
-    /// Write the residue: one type-2 interleaved vector over every channel,
-    /// classified per partition and coded in one pass.
-    fn write_residue(&self, out: &mut BitsOut, quantised: &[Vec<i32>]) {
-        let channels = quantised.len();
-        let total = HALF * channels;
-        let mut interleaved = vec![0i32; total];
-        for (i, slot) in interleaved.iter_mut().enumerate() {
-            *slot = quantised[i % channels][i / channels];
-        }
-        let partitions = total / PARTITION;
-        let classes: Vec<usize> = (0..partitions)
-            .map(|partition| {
-                let slice = &interleaved[partition * PARTITION..(partition + 1) * PARTITION];
-                let peak = slice.iter().map(|v| v.abs()).max().unwrap_or(0);
-                CLASS_RANGE
-                    .iter()
-                    .position(|&range| peak <= range)
-                    .unwrap_or(CLASSES - 1)
-            })
-            .collect();
-        let per_word = self.class_book.dimensions;
-        let mut partition = 0usize;
-        while partition < partitions {
-            let mut word = 0usize;
-            for i in 0..per_word {
-                word = word * CLASSES + classes.get(partition + i).copied().unwrap_or(0);
-            }
-            self.class_book.write(out, word);
-            for _ in 0..per_word {
-                if partition >= partitions {
-                    break;
-                }
-                let class = classes[partition];
-                if class > 0 {
-                    let book = &self.residue_books[class - 1];
-                    let range = CLASS_RANGE[class];
-                    for &value in &interleaved[partition * PARTITION..(partition + 1) * PARTITION] {
-                        book.write(out, (value.clamp(-range, range) + range) as usize);
-                    }
-                }
-                partition += 1;
-            }
-        }
     }
 
     /// Move the headroom so the running bitrate meets the target.
@@ -580,21 +737,196 @@ impl VorbisEncoder {
     /// One dB of headroom is about one sixth of a bit per coefficient, so the
     /// step is the bit error divided by that — a proportional loop that settles
     /// within a few blocks and is clamped either side so a transient cannot
-    /// swing the whole file.
-    fn update_rate(&mut self, bits: u64, channels: usize) {
-        if self.config.bitrate_bps <= 0 {
+    /// swing the whole file. The target itself scales with this block's own
+    /// granule advance, so a short block (a small fraction of a long hop) is
+    /// judged against a proportionally small bit budget. The ceiling is well
+    /// past [`HEADROOM_RANGE`]: beyond it headroom buys bins under the
+    /// threshold rather than step, which is what quiet content needs.
+    fn update_rate(&mut self, bits: u64, half: usize, channels: usize, delta: i64) {
+        if self.config.bitrate_bps <= 0 || delta <= 0 {
             return;
         }
-        let target =
-            f64::from(self.config.bitrate_bps) * HOP as f64 / f64::from(self.config.sample_rate);
-        let coefficients = (HALF * channels) as f64;
+        let target = f64::from(self.config.bitrate_bps) * delta as f64 / f64::from(self.config.sample_rate);
+        let coefficients = (half * channels) as f64;
         let step = ((target - bits as f64) / (coefficients / 6.0)).clamp(-2.0, 2.0);
         // Negative headroom is not a mistake: it puts the floor *above* the
         // signal, which quantises the coefficients under it to zero and lets a
         // whole partition become class 0 for two bits. Without that a low target
         // cannot be reached at all — coding every coefficient with the shortest
         // codeword there is already costs about a bit each.
-        self.headroom = (self.headroom + step).clamp(-24.0, 36.0);
+        self.headroom = (self.headroom + step).clamp(-24.0, 84.0);
+    }
+}
+
+/// Peak magnitude around each floor X point, over every channel given.
+///
+/// Each point owns the coefficients halfway to its neighbours either side, so
+/// the whole spectrum is covered exactly once and a peak between two points
+/// still raises the floor that has to carry it.
+fn peaks_of(floor: &Floor1, half: usize, spectra: &[&Vec<f32>]) -> Vec<f64> {
+    let x = &floor.x_list;
+    x.iter()
+        .map(|&centre| {
+            let below = x.iter().filter(|&&o| o < centre).max().copied();
+            let above = x.iter().filter(|&&o| o > centre).min().copied();
+            let lo = below.map_or(0, |b| ((b + centre) / 2) as usize);
+            let hi = above.map_or(half, |a| ((a + centre) / 2) as usize + 1);
+            let lo = lo.min(half - 1);
+            let hi = hi.clamp(lo + 1, half);
+            let mut peak = 0.0f64;
+            for spectrum in spectra {
+                for &value in &spectrum[lo..hi] {
+                    peak = peak.max(f64::from(value.abs()));
+                }
+            }
+            peak
+        })
+        .collect()
+}
+
+/// Turn peak magnitudes into coded floor amplitudes.
+///
+/// Spread first (a masker covers its neighbours), then subtract the rate
+/// loop's headroom, then hold the absolute threshold of hearing as a lower
+/// bound: below it the residue quantises to zero and costs a class-0
+/// partition.
+fn fit_floor(
+    floor: &Floor1,
+    ath: &[f64],
+    headroom: f64,
+    range: f64,
+    co_mask: f64,
+    peaks: &[f64],
+) -> (Vec<i32>, Vec<bool>) {
+    let mut db: Vec<f64> = peaks
+        .iter()
+        .map(|&peak| 20.0 * (peak.max(1e-9)).log10())
+        .collect();
+    let order = &floor.sorted;
+    for window in order.windows(2) {
+        let (previous, current) = (window[0], window[1]);
+        db[current] = db[current].max(db[previous] - 12.0);
+    }
+    for window in order.windows(2).rev() {
+        let (current, next) = (window[0], window[1]);
+        db[current] = db[current].max(db[next] - 24.0);
+    }
+    let loudest = db.iter().copied().fold(f64::MIN, f64::max);
+    let target: Vec<f64> = db
+        .iter()
+        .zip(ath.iter())
+        .map(|(&level, &threshold)| {
+            let threshold = threshold.max(loudest - co_mask);
+            (level - headroom.min(range)).max(threshold - (headroom - range).max(0.0))
+        })
+        .collect();
+    let y: Vec<i32> = target
+        .iter()
+        .map(|&level| ((level / (140.0 / 256.0)).round() as i32 + 255).clamp(0, 255))
+        .collect();
+    fold_floor(floor, &y)
+}
+
+/// Run the decoder's own amplitude synthesis forwards, so the curve the
+/// encoder normalises against is the curve the decoder will draw.
+fn fold_floor(floor: &Floor1, wanted: &[i32]) -> (Vec<i32>, Vec<bool>) {
+    let values = wanted.len();
+    let range = 256i32;
+    let mut final_y = vec![0i32; values];
+    let mut step2 = vec![false; values];
+    final_y[0] = wanted[0];
+    final_y[1] = wanted[1];
+    step2[0] = true;
+    step2[1] = true;
+    for i in 2..values {
+        let (low, high) = floor.neighbours[i];
+        let predicted = predict(
+            floor.x_list[low],
+            final_y[low],
+            floor.x_list[high],
+            final_y[high],
+            floor.x_list[i],
+        );
+        let value = fold(predicted, wanted[i], range);
+        if value != 0 {
+            step2[low] = true;
+            step2[high] = true;
+            step2[i] = true;
+        }
+        final_y[i] = wanted[i];
+    }
+    (final_y, step2)
+}
+
+/// Write one channel's floor: the two endpoints raw, the rest folded against
+/// their neighbours and Huffman coded.
+fn write_floor(out: &mut BitsOut, floor: &Floor1, floor_book: &CodebookSpec, y: &[i32]) {
+    out.bit(true);
+    out.write(y[0] as u32, 8);
+    out.write(y[1] as u32, 8);
+    for i in 2..y.len() {
+        let (low, high) = floor.neighbours[i];
+        let predicted = predict(
+            floor.x_list[low],
+            y[low],
+            floor.x_list[high],
+            y[high],
+            floor.x_list[i],
+        );
+        let value = fold(predicted, y[i], 256);
+        floor_book.write(out, value as usize);
+    }
+}
+
+/// Write the residue: one type-2 interleaved vector over every channel,
+/// classified per partition and coded in one pass.
+fn write_residue(
+    out: &mut BitsOut,
+    quantised: &[Vec<i32>],
+    half: usize,
+    partition: usize,
+    class_book: &CodebookSpec,
+    residue_books: &[CodebookSpec],
+) {
+    let channels = quantised.len();
+    let total = half * channels;
+    let mut interleaved = vec![0i32; total];
+    for (i, slot) in interleaved.iter_mut().enumerate() {
+        *slot = quantised[i % channels][i / channels];
+    }
+    let partitions = total / partition;
+    let classes: Vec<usize> = (0..partitions)
+        .map(|p| {
+            let slice = &interleaved[p * partition..(p + 1) * partition];
+            let peak = slice.iter().map(|v| v.abs()).max().unwrap_or(0);
+            CLASS_RANGE
+                .iter()
+                .position(|&range| peak <= range)
+                .unwrap_or(CLASSES - 1)
+        })
+        .collect();
+    let per_word = class_book.dimensions;
+    let mut p = 0usize;
+    while p < partitions {
+        let mut word = 0usize;
+        for i in 0..per_word {
+            word = word * CLASSES + classes.get(p + i).copied().unwrap_or(0);
+        }
+        class_book.write(out, word);
+        for _ in 0..per_word {
+            if p >= partitions {
+                break;
+            }
+            let class = classes[p];
+            if class > 0 {
+                let book = &residue_books[class - 1];
+                let range = CLASS_RANGE[class];
+                for &value in &interleaved[p * partition..(p + 1) * partition] {
+                    book.write(out, (value.clamp(-range, range) + range) as usize);
+                }
+            }
+            p += 1;
+        }
     }
 }
 
@@ -646,21 +978,22 @@ fn fold(predicted: i32, wanted: i32, range: i32) -> i32 {
     }
 }
 
-/// The floor-1 configuration this encoder writes and renders against.
-fn build_floor() -> Floor1 {
-    let mut sorted_x: Vec<u32> = Vec::with_capacity(FLOOR_POINTS);
+/// The floor-1 configuration for one block size: `half` coefficients, `points`
+/// non-endpoint X values.
+fn build_floor(half: usize, points: usize) -> Floor1 {
+    let mut sorted_x: Vec<u32> = Vec::with_capacity(points);
     let mut last = 0u32;
-    for i in 0..FLOOR_POINTS {
-        let t = i as f64 / (FLOOR_POINTS - 1) as f64;
+    for i in 0..points {
+        let t = i as f64 / (points - 1) as f64;
         // Log spacing over the band, nudged to stay strictly increasing at the
         // bottom where the grid is finer than one coefficient.
-        let value = (1023f64).powf(t).round() as u32;
+        let value = ((half - 1) as f64).powf(t).round() as u32;
         last = value.max(last + 1);
-        sorted_x.push(last);
+        sorted_x.push(last.min(half as u32 - 1));
     }
     // Coding order: endpoints first, then repeated bisection, so every value is
     // predicted from the two coded values that bracket it most closely.
-    let mut x_list = vec![0u32, HALF as u32];
+    let mut x_list = vec![0u32, half as u32];
     let mut ranges = vec![(0usize, sorted_x.len())];
     while let Some((lo, hi)) = ranges.pop() {
         if lo >= hi {
@@ -707,6 +1040,27 @@ fn build_floor() -> Floor1 {
     }
 }
 
+/// Build one block size's floor and ATH curve.
+fn build_block_config(
+    half: usize,
+    partition: usize,
+    points: usize,
+    range: f64,
+    co_mask: f64,
+    config: &EncoderConfig,
+) -> BlockConfig {
+    let floor = build_floor(half, points);
+    let ath = floor
+        .x_list
+        .iter()
+        .map(|&x| {
+            let hz = f64::from(config.sample_rate) * 0.5 * f64::from(x) / half as f64;
+            absolute_threshold(hz)
+        })
+        .collect();
+    BlockConfig { half, partition, floor, ath, range, co_mask }
+}
+
 /// Folded floor amplitudes: mostly small corrections, occasionally an escape
 /// near the top of the range.
 fn design_floor_book() -> CodebookSpec {
@@ -718,10 +1072,12 @@ fn design_floor_book() -> CodebookSpec {
 
 /// Class pairs, on the assumption that most partitions are silent.
 fn design_class_book() -> CodebookSpec {
-    let per_class = [0.55f64, 0.20, 0.15, 0.08, 0.02];
+    // Measured on real music at 128 kbps: silent partitions are four in ten,
+    // the three smallest ranges split most of the rest.
+    let per_class = [0.40f64, 0.18, 0.19, 0.16, 0.05, 0.011, 0.008, 0.007, 0.001];
     let mut weights = Vec::with_capacity(CLASSES * CLASSES);
-    for first in per_class {
-        for second in per_class {
+    for &first in &per_class {
+        for &second in &per_class {
             weights.push(first * second);
         }
     }
@@ -735,7 +1091,9 @@ fn design_residue_books() -> Vec<CodebookSpec> {
     CLASS_RANGE[1..]
         .iter()
         .map(|&range| {
-            let sigma = f64::from(range).max(1.0) / 2.5;
+            // Measured mean |value| inside a partition of each class is about
+            // a sixth of the class's range, whatever the range.
+            let sigma = f64::from(range).max(1.0) / 6.0;
             let weights: Vec<f64> = (-range..=range)
                 .map(|v| (-f64::from(v.abs()) / sigma).exp() + 1e-4)
                 .collect();
@@ -746,18 +1104,25 @@ fn design_residue_books() -> Vec<CodebookSpec> {
 }
 
 /// Absolute threshold of hearing in dBFS, full scale taken as 96 dB SPL.
+///
+/// Capped at -80 dBFS: the curve's own values at DC and above ~17 kHz
+/// (-13 / -10 dBFS) are not a quantiser step the rest of a block can live
+/// with — an onset inside a short block puts real energy in exactly those
+/// bins, and coding them that coarsely leaked -38 dB of pre-echo across the
+/// whole 256-sample window.
 fn absolute_threshold(hz: f64) -> f64 {
     let khz = (hz / 1000.0).clamp(0.02, 20.0);
     let spl =
         3.64 * khz.powf(-0.8) - 6.5 * (-0.6 * (khz - 3.3).powi(2)).exp() + 0.001 * khz.powi(4);
-    (spl - 96.0).clamp(-120.0, -10.0)
+    (spl - 96.0).clamp(-120.0, -80.0)
 }
 
 /// The three header packets, in order.
 fn write_headers(
     config: &EncoderConfig,
     channels: usize,
-    floor: &Floor1,
+    long: &BlockConfig,
+    short: &BlockConfig,
     floor_book: &CodebookSpec,
     class_book: &CodebookSpec,
     residue_books: &[CodebookSpec],
@@ -772,7 +1137,7 @@ fn write_headers(
     ident.extend_from_slice(&config.bitrate_bps.max(0).to_le_bytes());
     ident.extend_from_slice(&0i32.to_le_bytes());
     let log2 = |n: usize| n.trailing_zeros() as u8;
-    ident.push(log2(BLOCK) | (log2(BLOCK) << 4));
+    ident.push(log2(BLOCK_SHORT) | (log2(BLOCK_LONG) << 4));
     ident.push(1);
 
     let mut comment = vec![3u8];
@@ -798,62 +1163,73 @@ fn write_headers(
     // One time-domain transform, stated as zero.
     out.write(0, 6);
     out.write(0, 16);
-    // One floor, type 1.
-    out.write(0, 6);
-    out.write(1, 16);
-    out.write(floor.partition_classes.len() as u32, 5);
-    for _ in &floor.partition_classes {
-        out.write(0, 4);
-    }
-    out.write(FLOOR_CLASS_DIM as u32 - 1, 3);
-    out.write(0, 2);
-    // Book number plus one; zero would mean "this subclass codes nothing".
-    out.write(1, 8);
-    out.write(0, 2);
-    let range_bits = ilog(HALF as u32) - 1;
-    out.write(range_bits, 4);
-    for &x in floor.x_list.iter().skip(2) {
-        out.write(x, range_bits);
-    }
-    // One residue, type 2, over every channel of the one submap.
-    out.write(0, 6);
-    out.write(2, 16);
-    out.write(0, 24);
-    out.write((HALF * channels) as u32, 24);
-    out.write(PARTITION as u32 - 1, 24);
-    out.write(CLASSES as u32 - 1, 6);
-    out.write(1, 8);
-    for class in 0..CLASSES {
-        // Class 0 codes nothing at all; the rest have one book in pass 0.
-        out.write(u32::from(class > 0), 3);
-        out.write(0, 1);
-    }
-    for class in 1..CLASSES {
-        out.write(class as u32 + 1, 8);
-    }
-    // One mapping, type 0.
-    out.write(0, 6);
-    out.write(0, 16);
-    out.write(0, 1);
-    match coupling.is_empty() {
-        true => out.write(0, 1),
-        false => {
-            out.write(1, 1);
-            out.write(coupling.len() as u32 - 1, 8);
-            let field = ilog(channels as u32 - 1);
-            for &(magnitude, angle) in coupling {
-                out.write(magnitude as u32, field);
-                out.write(angle as u32, field);
-            }
+    // Two floors, type 1: long first, then short.
+    out.write(1, 6);
+    for bc in [long, short] {
+        out.write(1, 16);
+        out.write(bc.floor.partition_classes.len() as u32, 5);
+        for _ in &bc.floor.partition_classes {
+            out.write(0, 4);
+        }
+        out.write(FLOOR_CLASS_DIM as u32 - 1, 3);
+        out.write(0, 2);
+        out.write(1, 8);
+        out.write(0, 2);
+        let range_bits = ilog(bc.half as u32) - 1;
+        out.write(range_bits, 4);
+        for &x in bc.floor.x_list.iter().skip(2) {
+            out.write(x, range_bits);
         }
     }
-    out.write(0, 2);
-    out.write(0, 8);
-    out.write(0, 8);
-    out.write(0, 8);
-    // One mode: a long block on mapping 0.
-    out.write(0, 6);
-    out.write(1, 1);
+    // Two residues, type 2: long first, then short, each over every channel of
+    // its own submap and sharing the class/residue books.
+    out.write(1, 6);
+    for bc in [long, short] {
+        out.write(2, 16);
+        out.write(0, 24);
+        out.write((bc.half * channels) as u32, 24);
+        out.write(bc.partition as u32 - 1, 24);
+        out.write(CLASSES as u32 - 1, 6);
+        out.write(1, 8);
+        for class in 0..CLASSES {
+            out.write(u32::from(class > 0), 3);
+            out.write(0, 1);
+        }
+        for class in 1..CLASSES {
+            out.write(class as u32 + 1, 8);
+        }
+    }
+    // Two mappings, type 0: mapping 0 is long (floor/residue 0), mapping 1 is
+    // short (floor/residue 1); both couple the same channels.
+    out.write(1, 6);
+    for (floor, residue) in [(0u32, 0u32), (1, 1)] {
+        out.write(0, 16);
+        out.write(0, 1);
+        match coupling.is_empty() {
+            true => out.write(0, 1),
+            false => {
+                out.write(1, 1);
+                out.write(coupling.len() as u32 - 1, 8);
+                let field = ilog(channels as u32 - 1);
+                for &(magnitude, angle) in coupling {
+                    out.write(magnitude as u32, field);
+                    out.write(angle as u32, field);
+                }
+            }
+        }
+        out.write(0, 2);
+        out.write(0, 8);
+        out.write(floor, 8);
+        out.write(residue, 8);
+    }
+    // Two modes: mode `MODE_SHORT` is a short block on mapping 1, mode
+    // `MODE_LONG` a long block on mapping 0.
+    out.write(1, 6);
+    out.bit(false);
+    out.write(0, 16);
+    out.write(0, 16);
+    out.write(1, 8);
+    out.bit(true);
     out.write(0, 16);
     out.write(0, 16);
     out.write(0, 8);
@@ -1047,5 +1423,80 @@ mod tests {
                 assert_eq!((back_l, back_r), (left, right), "{left},{right}");
             }
         }
+    }
+
+    /// A stationary tone never trips the transient detector: every packet
+    /// decodes to mode `MODE_LONG`.
+    #[test]
+    fn a_stationary_signal_uses_only_long_blocks() {
+        let mut enc = VorbisEncoder::new(EncoderConfig {
+            sample_rate: 48_000,
+            channels: 2,
+            bitrate_bps: -1,
+            quality: 0.6,
+        })
+        .unwrap();
+        let samples = 48_000usize;
+        let mut pcm = vec![0.0f32; samples * 2];
+        for i in 0..samples {
+            let t = i as f32 / 48_000.0;
+            let v = (2.0 * std::f32::consts::PI * 1_000.0 * t).sin() * 0.5;
+            pcm[2 * i] = v;
+            pcm[2 * i + 1] = v;
+        }
+        enc.push_interleaved(&pcm).unwrap();
+        enc.finish();
+        let mut modes = std::collections::HashSet::new();
+        loop {
+            match enc.next_packet() {
+                Ok(p) => {
+                    let mut bits = crate::bits::Bits::new(&p.data);
+                    assert!(!bits.bit());
+                    modes.insert(bits.read(1));
+                }
+                Err(Error::Eof) => break,
+                Err(e) => panic!("{e}"),
+            }
+        }
+        assert_eq!(modes, std::collections::HashSet::from([MODE_LONG]));
+    }
+
+    /// An onset after real silence trips the detector: some packet decodes to
+    /// mode `MODE_SHORT`.
+    #[test]
+    fn an_onset_after_silence_uses_short_blocks() {
+        let mut enc = VorbisEncoder::new(EncoderConfig {
+            sample_rate: 44_100,
+            channels: 2,
+            bitrate_bps: -1,
+            quality: 0.6,
+        })
+        .unwrap();
+        let silence = 44_100usize;
+        let tone = 4_410usize;
+        let mut pcm = vec![0.0f32; (silence + tone) * 2];
+        for i in 0..tone {
+            let t = i as f32 / 44_100.0;
+            let v = (2.0 * std::f32::consts::PI * 1_000.0 * t).sin();
+            pcm[2 * (silence + i)] = v;
+            pcm[2 * (silence + i) + 1] = v;
+        }
+        enc.push_interleaved(&pcm).unwrap();
+        enc.finish();
+        let mut saw_short = false;
+        loop {
+            match enc.next_packet() {
+                Ok(p) => {
+                    let mut bits = crate::bits::Bits::new(&p.data);
+                    assert!(!bits.bit());
+                    if bits.read(1) == MODE_SHORT {
+                        saw_short = true;
+                    }
+                }
+                Err(Error::Eof) => break,
+                Err(e) => panic!("{e}"),
+            }
+        }
+        assert!(saw_short, "no short block coded around the onset");
     }
 }
