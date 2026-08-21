@@ -554,6 +554,82 @@ fn busy(channels: usize, rate: u32, samples: usize) -> Vec<Vec<f32>> {
         .collect()
 }
 
+/// A hard silence-to-full-scale onset must not leak into the long block
+/// before it: that block should now be coded with a short right window (or
+/// the onset itself carried by a short block), which windows the leak out
+/// instead of smearing it across ~46 ms the way an all-long-block encoder
+/// does.
+#[test]
+fn onset_after_silence_has_no_pre_echo() {
+    // Onsets swept by phase (fractions of a second, so they land anywhere
+    // relative to the long hop) and by offset from the long-hop grid itself,
+    // since the short run's placement is decided per hop. Stereo carries
+    // distinct content per channel — a different tone on the right, starting
+    // 11 samples later — so coupling cannot hide a per-channel leak. The gap
+    // is measured over the WHOLE silence up to the onset, so a leak in the
+    // last few hundred samples before it cannot hide behind a guard band, and
+    // the peak is barred too.
+    let amp = 0.7f64;
+    for (rate, layouts) in [(44_100u32, &[1usize, 2][..]), (48_000, &[1, 2, 6]), (96_000, &[6])] {
+        let grid = 16 * 1024usize;
+        let onsets = [0.3333f64, 0.5, 0.7321, 0.9137, 1.0]
+            .into_iter()
+            .map(|s| (s * f64::from(rate)) as usize)
+            .chain([0usize, 37, 512, 1000, 1023].into_iter().map(|o| grid + o));
+        for onset in onsets {
+            for &channels in layouts {
+                let tone_len = rate as usize;
+                let mut source = vec![vec![0.0f32; onset + tone_len + 11 * channels]; channels];
+                for (c, plane) in source.iter_mut().enumerate() {
+                    let hz = 1_000.0 + 370.0 * c as f64;
+                    let start = onset + 11 * c;
+                    for i in 0..tone_len {
+                        let t = i as f64 / f64::from(rate);
+                        plane[start + i] = (amp * (2.0 * std::f64::consts::PI * hz * t).sin()) as f32;
+                    }
+                }
+                let name = format!("onset-{rate}-{channels}ch-{onset}.ogg");
+                let path = encode_to_file(&source, rate, 128_000, &name);
+
+                // The reference oracle must decode the short-block stream
+                // cleanly: no warnings, let alone errors.
+                let warn = Command::new("ffmpeg")
+                    .args(["-v", "warning", "-i"])
+                    .arg(&path)
+                    .args(["-f", "f32le", "-acodec", "pcm_f32le", "-"])
+                    .output();
+                if let Ok(out) = warn {
+                    assert!(
+                        out.stderr.is_empty(),
+                        "{name}: oracle decode warnings: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                }
+
+                let tone_rms = rms(&source[0][onset..]);
+                let check = |label: &str, planes: &[Vec<f32>]| {
+                    for (c, plane) in planes.iter().enumerate() {
+                        let gap = &plane[..onset.min(plane.len())];
+                        let gap_rms = rms(gap);
+                        let peak = gap.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+                        println!("{name}/{label} ch{c}: gap RMS {gap_rms:.6} peak {peak:.4}");
+                        assert!(
+                            gap_rms <= 0.002 * tone_rms,
+                            "{name}/{label} ch{c}: gap RMS {gap_rms:.6} vs tone RMS {tone_rms:.6}"
+                        );
+                        assert!(f64::from(peak) <= 0.01 * amp, "{name}/{label} ch{c}: gap peak {peak:.4}");
+                    }
+                };
+                let (ours, _) = our_decode(&path);
+                check("ours", &ours);
+                if let Some((theirs, _)) = ffmpeg_decode(&path) {
+                    check("oracle", &theirs);
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn the_rate_loop_tracks_the_target_bitrate() {
     let rate = 48_000u32;
@@ -583,5 +659,91 @@ fn the_rate_loop_tracks_the_target_bitrate() {
             (kbps - target).abs() / target < 0.25,
             "{kbps:.0} kbps for a {target:.0} kbps target"
         );
+    }
+}
+
+/// Quiet and sparse content must reach the target too: with the floor bounded
+/// by the threshold of hearing, most partitions code as class 0 at any step,
+/// so the rate loop's extra headroom has to lower that bound to find bits to
+/// spend. The fixture is a sparse tone at -18 dBFS; the synthetic sources are
+/// the busy and tonal signals at -40 dBFS, the tones over a -90 dBFS noise
+/// floor (what any 16-bit source carries; a pure digital tone has nothing
+/// outside its own bins for any step to find). Noise is incompressible, so the
+/// quiet noise is held to the full-scale noise's own fidelity rather than a
+/// fixed bar.
+///
+/// The rate loop's step search bottoms out at the +-127 step range (36 dB
+/// residue range + 12-point floor): once a quiet source's codable residue is
+/// exhausted, no finer step can spend more bits without a second (cascade)
+/// coding pass, which does not exist yet -- that cascade is the upgrade path.
+/// So the contract is: measured kbps lands within +-25% of target, OR the
+/// encode undershoots because there is nothing left to spend and the result
+/// is transparent (corr >= 0.999 against the source). The monotone-in-target
+/// spend check only applies where the case actually spends against target.
+#[test]
+fn quiet_content_reaches_the_target_or_is_transparent() {
+    let rate = 48_000u32;
+    let samples = rate as usize * 3;
+    let fixture = ffmpeg_decode(&fixtures().join("audio/wav16-stereo-48000.wav"))
+        .expect("fixture decodes");
+    assert_eq!(fixture.1, rate);
+    let attenuate = |mut source: Vec<Vec<f32>>| {
+        for channel in source.iter_mut() {
+            for value in channel.iter_mut() {
+                *value *= 0.01;
+            }
+        }
+        source
+    };
+    let corr_at = |path: &Path, source: &[Vec<f32>]| {
+        let (decoded, _) = our_decode(path);
+        decoded
+            .iter()
+            .zip(source.iter())
+            .map(|(channel, original)| {
+                let n = channel.len().min(original.len());
+                correlation(&channel[..n], &original[..n])
+            })
+            .fold(1.0f64, f64::min)
+    };
+    let loud = busy(2, rate, samples);
+    let loud_corr = corr_at(&encode_to_file(&loud, rate, 128_000, "loud-128k.ogg"), &loud);
+    let quiet_noise = attenuate(loud);
+    let mut quiet_tones = attenuate(tones(2, rate, samples));
+    for (channel, noise) in quiet_tones.iter_mut().zip(busy(2, rate, samples)) {
+        for (value, n) in channel.iter_mut().zip(noise) {
+            *value += n * 0.0001;
+        }
+    }
+    let cases = [
+        ("fixture", &fixture.0, 0.99),
+        ("quiet-tones", &quiet_tones, 0.99),
+        ("quiet-noise", &quiet_noise, loud_corr - 0.02),
+    ];
+    for (name, source, bar) in cases {
+        let mut measured = Vec::new();
+        let mut spent = Vec::new();
+        for target in [96_000i32, 128_000, 192_000] {
+            let path = encode_to_file(source, rate, target, &format!("{name}-{}k.ogg", target / 1000));
+            let bytes = std::fs::metadata(&path).expect("file").len();
+            let kbps = bytes as f64 * 8.0 * f64::from(rate) / source[0].len() as f64 / 1000.0;
+            let corr = corr_at(&path, source);
+            println!("{name}: target {} kbps -> {kbps:.0} kbps, corr {corr:.4}", target / 1000);
+            let target_kbps = f64::from(target) / 1000.0;
+            let within_25pct = (kbps - target_kbps).abs() / target_kbps < 0.25;
+            let transparent_undershoot = kbps < target_kbps && corr >= 0.999;
+            assert!(
+                within_25pct || transparent_undershoot,
+                "{name}: {kbps:.0} kbps for {target_kbps:.0} kbps target, corr {corr:.4}"
+            );
+            spent.push(within_25pct);
+            measured.push(kbps);
+            if target == 128_000 {
+                assert!(corr >= bar, "{name}: corr {corr:.4} under {bar:.4}");
+            }
+        }
+        if spent.iter().all(|&s| s) {
+            assert!(measured[0] < measured[1] && measured[1] < measured[2], "{name}: {measured:?}");
+        }
     }
 }
