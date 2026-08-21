@@ -5,10 +5,17 @@
 //! `scripts/scan-real-library.sh`). Files that have since moved are skipped and
 //! reported, never failed — the manifest is a snapshot of a moving library.
 
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
+use std::time::Instant;
 
-use ec_core::registry::{MediaType, SeekMode};
+use ec_core::registry::{CodecId, MediaType, SeekMode};
 use ec_core::timebase::{TimeBase, Timestamp};
 use ec_probe::Reader;
 
@@ -61,6 +68,160 @@ fn decode_some(reader: &mut Reader, stream: u32, secs: f64) -> Result<u64, Strin
     Ok(frames)
 }
 
+fn decode_window(reader: &mut Reader, stream: u32, secs: f64) -> Result<Vec<f32>, String> {
+    let mut decoder = reader.make_decoder(stream).map_err(|e| e.to_string())?;
+    let channels = decoder.channels().max(1);
+    let want = (secs * f64::from(decoder.sample_rate().max(1)) * channels as f64) as usize;
+    let mut scratch = Vec::new();
+    let mut pcm = Vec::new();
+    while pcm.len() < want {
+        let packet = match reader.next_packet() {
+            Ok(p) => p,
+            Err(e) if e.is_eof() => break,
+            Err(e) => return Err(format!("demux: {e}")),
+        };
+        if packet.stream != stream {
+            continue;
+        }
+        decoder
+            .decode(&packet, &mut scratch)
+            .map_err(|e| format!("decode: {e}"))?;
+        pcm.extend_from_slice(&scratch);
+    }
+    pcm.truncate(want);
+    Ok(pcm)
+}
+
+fn reference_seek_window(path: &Path, at: f64) -> Vec<f32> {
+    let out = Command::new("ffmpeg")
+        .args(["-v", "error", "-ss", &format!("{at:.6}"), "-i"])
+        .arg(path)
+        .args([
+            "-t",
+            "2",
+            "-map",
+            "0:a:0",
+            "-f",
+            "f32le",
+            "-acodec",
+            "pcm_f32le",
+            "-",
+        ])
+        .output()
+        .expect("reference decoder runs");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.stdout
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+struct CountedFile {
+    inner: File,
+    bytes: Arc<AtomicU64>,
+}
+
+impl Read for CountedFile {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.bytes.fetch_add(n as u64, Ordering::Relaxed);
+        Ok(n)
+    }
+}
+
+impl Seek for CountedFile {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
+fn hive_avi_files() -> Vec<PathBuf> {
+    let root = Path::new("/home/tahinli/Downloads");
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut files = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.contains("Hive-CM8"))
+        {
+            continue;
+        }
+        let Ok(children) = std::fs::read_dir(path) else {
+            continue;
+        };
+        for child in children.flatten() {
+            let path = child.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("avi") {
+                files.push(path);
+            }
+        }
+    }
+    files.sort_by_key(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(u64::MAX));
+    files
+}
+
+fn assert_avi_index_is_bounded(path: &Path) {
+    let file_size = std::fs::metadata(path).expect("AVI metadata").len();
+    let index_len = ec_riff::AviReader::new(File::open(path).expect("open AVI"))
+        .expect("AVI index builds")
+        .index_len();
+    assert!(
+        u64::try_from(index_len).expect("index count fits u64") <= file_size / 8,
+        "{}: index has {index_len} chunks for {file_size} bytes",
+        path.display()
+    );
+    eprintln!(
+        "{}: AVI index {index_len} chunks / {file_size} bytes",
+        path.display()
+    );
+}
+
+fn avi_indexed_point(path: &Path, target: u64, after: bool) -> (ec_riff::AviIndexPoint, f64) {
+    let reader = ec_riff::AviReader::new(File::open(path).expect("open AVI"))
+        .expect("AVI index builds");
+    let stream = *reader.audio_streams().first().expect("AVI audio stream");
+    let interval = f64::from(stream.length) * f64::from(stream.scale) / f64::from(stream.rate)
+        / reader.index_len() as f64;
+    (
+        reader
+            .indexed_point(stream.index, target, after)
+            .expect("AVI indexed point"),
+        interval,
+    )
+}
+
+fn samples_to_avi_units(
+    stream: ec_riff::AviAudioStream,
+    samples: u64,
+    round_up: bool,
+) -> u64 {
+    let denominator = u128::from(stream.scale) * u128::from(stream.sample_rate);
+    let numerator = u128::from(samples) * u128::from(stream.rate);
+    let units = if round_up {
+        numerator.saturating_add(denominator.saturating_sub(1)) / denominator
+    } else {
+        numerator / denominator
+    };
+    units.min(u128::from(u64::MAX)) as u64
+}
+
+fn avi_codec_preroll(codec: CodecId, rate: u32) -> f64 {
+    match codec {
+        CodecId::Mp3 => 1728.0 / f64::from(rate),
+        CodecId::Aac => 1024.0 / f64::from(rate),
+        _ => 0.0,
+    }
+}
+
+
 fn decode_stream_to_eof(
     reader: &mut Reader,
     stream: u32,
@@ -109,6 +270,184 @@ fn corr(a: &[f32], b: &[f32]) -> f64 {
         b2 += y * y;
     }
     num / (a2.sqrt() * b2.sqrt()).max(1e-12)
+}
+
+fn best_frame_corr(
+    ours: &[f32],
+    theirs: &[f32],
+    channels: usize,
+    frame_samples: usize,
+) -> (i32, f64) {
+    let frame = channels * frame_samples;
+    (-1..=1)
+        .map(|lag| {
+            let (ours, theirs) = if lag < 0 {
+                (ours, theirs.get(frame..).unwrap_or(&[]))
+            } else {
+                (ours.get(frame * lag as usize..).unwrap_or(&[]), theirs)
+            };
+            (lag, corr(ours, theirs))
+        })
+        .max_by(|(_, a), (_, b)| a.total_cmp(b))
+        .unwrap()
+}
+
+fn assert_avi_seeks_match_reference(path: &Path) {
+    assert_avi_index_is_bounded(path);
+    let bytes = Arc::new(AtomicU64::new(0));
+    let src = CountedFile {
+        inner: File::open(path).expect("open AVI"),
+        bytes: bytes.clone(),
+    };
+    let mut reader = Reader::new(src, Some("avi")).expect("AVI opens");
+    let audio = reader
+        .default_stream(MediaType::Audio)
+        .expect("AVI audio stream")
+        .clone();
+    let rate = audio.params.audio().unwrap().sample_rate.max(1);
+    let channels = audio.params.audio().unwrap().layout.channel_count().max(1);
+    let frame_samples = match audio.params.codec {
+        CodecId::Ac3 | CodecId::EAc3 => 1536,
+        CodecId::Mp3 => 1152,
+        _ => 1,
+    };
+    let avi_stream = *ec_riff::AviReader::new(File::open(path).expect("open AVI"))
+        .expect("AVI index builds")
+        .audio_streams()
+        .first()
+        .expect("AVI audio stream");
+    let duration = reader.duration().expect("AVI duration").as_secs_f64();
+    let codec_preroll = avi_codec_preroll(audio.params.codec, rate);
+    for fraction in [0.10, 0.50, 0.90] {
+        let target = duration * fraction;
+        let ticks = (target * f64::from(rate)) as i64;
+        for (mode, label) in [
+            (SeekMode::SyncBefore, "before"),
+            (SeekMode::SyncAfter, "after"),
+        ] {
+            let target_units = samples_to_avi_units(
+                avi_stream,
+                ticks.max(0) as u64,
+                matches!(mode, SeekMode::SyncAfter),
+            );
+            let (point, chunk_interval) =
+                avi_indexed_point(path, target_units, matches!(mode, SeekMode::SyncAfter));
+            let before = bytes.load(Ordering::Relaxed);
+            let started = Instant::now();
+            let landed = reader
+                .seek(
+                    audio.index,
+                    Timestamp::new(ticks, TimeBase::from_rate(rate)),
+                    mode,
+                )
+                .expect("AVI seek");
+            let elapsed = started.elapsed();
+            let read = bytes.load(Ordering::Relaxed) - before;
+            let at = landed.as_secs_f64();
+            eprintln!(
+                "{} @{:.0}% {label}: requested {target_units} units, idx1 entry {} offset {} unit {}, pre-roll 0 units 0 frames, first packet pts {}, target {target:.3}s landed {at:.3}s read {read} bytes seek {:?}",
+                path.display(),
+                fraction * 100.0,
+                point.index,
+                point.offset,
+                point.time,
+                landed.ticks,
+                elapsed,
+            );
+            assert!(
+                read < 8 * 1024 * 1024,
+                "{} @{fraction:.0}% {label}: seek read {read} bytes",
+                path.display()
+            );
+            if !cfg!(debug_assertions) {
+                assert!(
+                    elapsed.as_millis() < 200,
+                    "{} @{:.0}% {label}: seek took {:?}",
+                    path.display(),
+                    fraction * 100.0,
+                    elapsed
+                );
+            }
+            match mode {
+                SeekMode::SyncBefore => {
+                    assert!(
+                        at <= target,
+                        "{} @{fraction:.0}%: SyncBefore landed {at:.3}s after target {target:.3}s",
+                        path.display()
+                    );
+                    let bound = (2.0 * chunk_interval).max(codec_preroll);
+                    assert!(
+                        target - at <= bound,
+                        "{} @{fraction:.0}%: SyncBefore landed {:.3}s before target {target:.3}s (bound {bound:.3}s)",
+                        path.display(),
+                        target - at,
+                    );
+                    let ours =
+                        decode_window(&mut reader, audio.index, 2.0).expect("decode after seek");
+                    let theirs = reference_seek_window(path, at);
+                    let (lag, score) =
+                        best_frame_corr(&ours, &theirs, channels, frame_samples);
+                    assert!(
+                        score >= 0.999,
+                        "{} @{:.0}% {label}: target {target:.3}s landed {at:.3}s lag {lag} frames corr vs reference decoder = {score}",
+                        path.display(),
+                        fraction * 100.0,
+                    );
+                }
+                SeekMode::SyncAfter => {
+                    assert!(
+                        at >= target,
+                        "{} @{fraction:.0}%: SyncAfter landed {at:.3}s before target {target:.3}s",
+                        path.display()
+                    );
+                    assert!(
+                        at - target <= chunk_interval,
+                        "{} @{fraction:.0}%: SyncAfter landed {:.3}s after target {target:.3}s (chunk interval {chunk_interval:.3}s)",
+                        path.display(),
+                        at - target,
+                    );
+                }
+                SeekMode::Exact => unreachable!("oracle checks indexed seeks only"),
+            }
+        }
+    }
+}
+
+fn synthetic_mp3_avi() -> Option<PathBuf> {
+    if !Command::new("ffmpeg")
+        .args(["-version"])
+        .output()
+        .is_ok_and(|out| out.status.success())
+    {
+        eprintln!("reference encoder/decoder absent, skipping synthetic AVI");
+        return None;
+    }
+    let root = PathBuf::from(std::env::var_os("HOME").expect("HOME")).join(".cache/aviseek");
+    std::fs::create_dir_all(&root).expect("create scratch directory");
+    let path = root.join(format!("seek-oracle-{}.avi", std::process::id()));
+    let out = Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=997:sample_rate=48000:duration=30",
+            "-c:a",
+            "libmp3lame",
+            "-f",
+            "avi",
+            "-y",
+        ])
+        .arg(&path)
+        .output()
+        .expect("reference encoder runs");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Some(path)
 }
 
 /// Ten files with sound, standalone audio first, then Matroska — opened,
@@ -321,6 +660,27 @@ fn avi_ac3_matches_reference_decoder_on_real_sample() {
         path.display()
     );
     assert!(score > 0.999, "corr vs reference decoder = {score}");
+}
+
+#[test]
+fn avi_seek_matches_reference_decoder_on_real_files() {
+    let files = hive_avi_files();
+    if files.is_empty() {
+        eprintln!("AVI files absent, skipping");
+        return;
+    }
+    for path in files {
+        assert_avi_seeks_match_reference(&path);
+    }
+}
+
+#[test]
+fn avi_seek_matches_reference_decoder_on_synthetic_mp3() {
+    let Some(path) = synthetic_mp3_avi() else {
+        return;
+    };
+    assert_avi_seeks_match_reference(&path);
+    std::fs::remove_file(path).expect("remove synthetic AVI");
 }
 
 /// The TrueHD remux in his library: the track decodes through the unified
