@@ -672,10 +672,11 @@ struct AviDemuxer<R> {
     samples: Vec<u64>,
     pending: VecDeque<Packet>,
     carry: Vec<Vec<u8>>,
+    sync_bias: Vec<u64>,
 }
 
 impl<R: Read + Seek> AviDemuxer<R> {
-    fn new(reader: ec_riff::AviReader<R>) -> Result<AviDemuxer<R>> {
+    fn new(mut reader: ec_riff::AviReader<R>) -> Result<AviDemuxer<R>> {
         let mut streams = Vec::new();
         let mut stream_numbers = Vec::new();
         for (index, s) in reader.audio_streams().iter().enumerate() {
@@ -703,11 +704,15 @@ impl<R: Read + Seek> AviDemuxer<R> {
                 },
                 bits_per_sample: (s.bits_per_sample > 0).then_some(u32::from(s.bits_per_sample)),
             });
-            streams.push(StreamInfo::new(
+            let mut info = StreamInfo::new(
                 index as u32,
                 TimeBase::from_rate(s.sample_rate.max(1)),
                 params,
-            ));
+            );
+            if s.length > 0 {
+                info.duration = Some(avi_units_to_samples(*s, u64::from(s.length)) as i64);
+            }
+            streams.push(info);
             stream_numbers.push(s.index);
         }
         if streams.is_empty() {
@@ -718,6 +723,8 @@ impl<R: Read + Seek> AviDemuxer<R> {
         }
         let samples = vec![0; streams.len()];
         let carry = vec![Vec::new(); streams.len()];
+        let sync_bias = avi_sync_biases(&mut reader, &streams, &stream_numbers)?;
+        reader.rewind();
         Ok(AviDemuxer {
             reader,
             streams,
@@ -725,6 +732,7 @@ impl<R: Read + Seek> AviDemuxer<R> {
             samples,
             pending: VecDeque::new(),
             carry,
+            sync_bias,
         })
     }
 
@@ -761,19 +769,52 @@ impl<R: Read + Seek> AviDemuxer<R> {
         chunk: Vec<u8>,
         codec: CodecId,
     ) -> Result<()> {
+        let avi_stream = self
+            .stream_numbers
+            .get(stream)
+            .and_then(|n| self.reader.audio_streams().iter().find(|s| s.index == *n))
+            .copied();
         let mut data = std::mem::take(&mut self.carry[stream]);
         data.extend_from_slice(&chunk);
         let mut at = 0usize;
+        let mut skipped = 0usize;
         while at < data.len() {
             match avi_elementary_frame(codec, &data[at..]) {
                 Ok(Some((size, frames))) if at + size <= data.len() => {
+                    if skipped > 0
+                        && matches!(codec, CodecId::Ac3 | CodecId::EAc3)
+                        && ec_ac3::Ac3Decoder::new()
+                            .decode_frame(&data[at..at + size])
+                            .is_err()
+                    {
+                        at += 1;
+                        skipped += 1;
+                        continue;
+                    }
+                    if skipped > 0 {
+                        if let Some(s) = avi_stream {
+                            let skipped_samples = avi_units_to_samples(s, skipped as u64);
+                            let initial = self.sync_bias.get(stream).copied().unwrap_or(0);
+                            if self.samples[stream] != 0 || skipped_samples > initial {
+                                self.samples[stream] =
+                                    self.samples[stream].saturating_add(skipped_samples);
+                            }
+                        }
+                        skipped = 0;
+                    }
                     self.push_packet(stream, Buf::copy_from_slice(&data[at..at + size]), frames);
                     at += size;
                 }
                 Ok(Some(_)) => break,
-                Ok(None) => at += 1,
+                Ok(None) => {
+                    at += 1;
+                    skipped += 1;
+                }
                 Err(e) if e.is_need_more() => break,
-                Err(_) => at += 1,
+                Err(_) => {
+                    at += 1;
+                    skipped += 1;
+                }
             }
         }
         self.carry[stream].extend_from_slice(&data[at..]);
@@ -804,7 +845,13 @@ fn avi_elementary_frame(codec: CodecId, data: &[u8]) -> Result<Option<(usize, u6
             if data[0] != 0x0b || data[1] != 0x77 {
                 return Ok(None);
             }
-            ec_ac3::frame_size(data).map(|size| Some((size, 1536)))
+            ec_ac3::frame_size(data).map(|size| {
+                if data.len() >= size + 2 && data[size..size + 2] != [0x0b, 0x77] {
+                    None
+                } else {
+                    Some((size, 1536))
+                }
+            })
         }
         CodecId::Mp3 => {
             if data.len() < 2 {
@@ -838,6 +885,77 @@ fn avi_elementary_frame(codec: CodecId, data: &[u8]) -> Result<Option<(usize, u6
     }
 }
 
+fn avi_sync_biases<R: Read + Seek>(
+    reader: &mut ec_riff::AviReader<R>,
+    streams: &[StreamInfo],
+    stream_numbers: &[u32],
+) -> Result<Vec<u64>> {
+    let mut out = vec![0; streams.len()];
+    for (i, info) in streams.iter().enumerate() {
+        if !matches!(
+            info.params.codec,
+            CodecId::Ac3 | CodecId::EAc3 | CodecId::Mp3 | CodecId::Aac
+        ) {
+            continue;
+        }
+        let Some(&native) = stream_numbers.get(i) else {
+            continue;
+        };
+        let Some(avi_stream) = reader
+            .audio_streams()
+            .iter()
+            .find(|s| s.index == native)
+            .copied()
+        else {
+            continue;
+        };
+        reader.seek_to_stream_time(native, 0, false)?;
+        for _ in 0..16 {
+            let chunk = match reader.next_packet() {
+                Ok(chunk) => chunk,
+                Err(e) if e.is_eof() => break,
+                Err(e) => return Err(e),
+            };
+            if chunk.stream != native {
+                continue;
+            }
+            let skip = avi_elementary_leading_skip(info.params.codec, &chunk.data);
+            out[i] = avi_units_to_samples(avi_stream, skip as u64);
+            break;
+        }
+    }
+    Ok(out)
+}
+
+fn avi_elementary_leading_skip(codec: CodecId, data: &[u8]) -> usize {
+    for at in 0..data.len() {
+        match avi_elementary_frame(codec, &data[at..]) {
+            Ok(Some((size, _))) if at + size <= data.len() => return at,
+            Ok(Some(_)) | Err(Error::NeedMore) => return at,
+            Ok(None) | Err(_) => {}
+        }
+    }
+    0
+}
+
+fn samples_to_avi_units(stream: ec_riff::AviAudioStream, samples: u64) -> u64 {
+    let scale = u128::from(stream.scale.max(1));
+    let rate = u128::from(stream.rate.max(1));
+    let sample_rate = u128::from(stream.sample_rate.max(1));
+    let units = u128::from(samples).saturating_mul(rate) / (scale * sample_rate);
+    let units = units.min(u128::from(u64::MAX)) as u64;
+    match stream.length {
+        0 => units,
+        n => units.min(u64::from(n)),
+    }
+}
+fn avi_units_to_samples(stream: ec_riff::AviAudioStream, units: u64) -> u64 {
+    let n = u128::from(units)
+        .saturating_mul(u128::from(stream.scale.max(1)))
+        .saturating_mul(u128::from(stream.sample_rate.max(1)));
+    (n / u128::from(stream.rate.max(1))).min(u128::from(u64::MAX)) as u64
+}
+
 impl<R: Read + Seek + Send> Demuxer for AviDemuxer<R> {
     fn streams(&self) -> &[StreamInfo] {
         &self.streams
@@ -856,11 +974,44 @@ impl<R: Read + Seek + Send> Demuxer for AviDemuxer<R> {
         }
     }
 
-    fn seek(&mut self, _stream: u32, _to: Timestamp, _mode: SeekMode) -> Result<()> {
-        Err(Error::unsupported(
-            "AVI audio seek",
-            "this reader only walks AVI sound chunks in storage order",
-        ))
+    fn seek(&mut self, stream: u32, to: Timestamp, mode: SeekMode) -> Result<()> {
+        let local = self
+            .streams
+            .iter()
+            .position(|s| s.index == stream)
+            .ok_or_else(|| Error::corrupt(format!("no stream {stream} in this file")))?;
+        let avi_stream_no = self.stream_numbers[local];
+        let avi_stream = *self
+            .reader
+            .audio_streams()
+            .iter()
+            .find(|s| s.index == avi_stream_no)
+            .ok_or_else(|| Error::corrupt(format!("AVI: no audio stream {avi_stream_no}")))?;
+        let base = self.streams[local].time_base;
+        let target_samples = to.rescale(base, Rounding::Down).ticks.max(0) as u64;
+        let target_units = samples_to_avi_units(avi_stream, target_samples);
+        let seek_units = if matches!(
+            self.streams[local].params.codec,
+            CodecId::Ac3 | CodecId::EAc3 | CodecId::Mp3 | CodecId::Aac
+        ) {
+            target_units.saturating_sub(u64::from(
+                (avi_stream.rate / avi_stream.scale.max(1)).max(1),
+            ))
+        } else {
+            target_units
+        };
+        let landed_units = self.reader.seek_to_stream_time(
+            avi_stream_no,
+            seek_units,
+            matches!(mode, SeekMode::SyncAfter),
+        )?;
+        self.pending.clear();
+        for carry in &mut self.carry {
+            carry.clear();
+        }
+        self.samples[local] = avi_units_to_samples(avi_stream, landed_units)
+            .saturating_sub(self.sync_bias.get(local).copied().unwrap_or(0));
+        Ok(())
     }
 }
 
