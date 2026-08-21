@@ -8,10 +8,10 @@
 //! contract — because a shim that grows a surface nobody calls is a second
 //! implementation to keep honest.
 //!
-//! Behaviour differences from the incumbent, all stated: `vbr_quality` picks a
-//! constant bitrate rather than varying the rate per frame (see
-//! [`ec_mp3::encode::Mp3EncoderConfig`]), and the encoder writes the `Info`
-//! header frame first, as the incumbent does.
+//! Behaviour difference from the incumbent, stated: the encoder writes the
+//! `Xing`/`Info` header frame first, and `vbr_quality` runs true variable
+//! bitrate — per-frame bitrate indices chosen to carry the coded granules
+//! (see [`ec_mp3::encode::Mp3EncoderConfig`]).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
