@@ -5,8 +5,15 @@
 //! `scripts/scan-real-library.sh`). Files that have since moved are skipped and
 //! reported, never failed — the manifest is a snapshot of a moving library.
 
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
+use std::time::Instant;
 
 use ec_core::registry::{MediaType, SeekMode};
 use ec_core::timebase::{TimeBase, Timestamp};
@@ -59,6 +66,128 @@ fn decode_some(reader: &mut Reader, stream: u32, secs: f64) -> Result<u64, Strin
         frames += (out.len() / decoder.channels().max(1)) as u64;
     }
     Ok(frames)
+}
+
+fn decode_window(reader: &mut Reader, stream: u32, secs: f64) -> Result<Vec<f32>, String> {
+    let mut decoder = reader.make_decoder(stream).map_err(|e| e.to_string())?;
+    let channels = decoder.channels().max(1);
+    let want = (secs * f64::from(decoder.sample_rate().max(1)) * channels as f64) as usize;
+    let mut scratch = Vec::new();
+    let mut pcm = Vec::new();
+    while pcm.len() < want {
+        let packet = match reader.next_packet() {
+            Ok(p) => p,
+            Err(e) if e.is_eof() => break,
+            Err(e) => return Err(format!("demux: {e}")),
+        };
+        if packet.stream != stream {
+            continue;
+        }
+        decoder
+            .decode(&packet, &mut scratch)
+            .map_err(|e| format!("decode: {e}"))?;
+        pcm.extend_from_slice(&scratch);
+    }
+    pcm.truncate(want);
+    Ok(pcm)
+}
+
+fn reference_window(path: &Path, at: f64, rate: u32, channels: usize) -> Vec<f32> {
+    if std::fs::metadata(path).map(|m| m.len()).unwrap_or(u64::MAX) < 128 * 1024 * 1024 {
+        let out = Command::new("ffmpeg")
+            .args(["-v", "error", "-i"])
+            .arg(path)
+            .args(["-map", "0:a:0", "-f", "f32le", "-acodec", "pcm_f32le", "-"])
+            .output()
+            .expect("reference decoder runs");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let all: Vec<f32> = out
+            .stdout
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let start = (at * f64::from(rate) * channels as f64) as usize;
+        let end = (start + 2 * rate as usize * channels).min(all.len());
+        return all.get(start..end).unwrap_or(&[]).to_vec();
+    }
+    let out = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args(["-ss", &format!("{at:.6}")])
+        .args([
+            "-map",
+            "0:a:0",
+            "-t",
+            "2",
+            "-f",
+            "f32le",
+            "-acodec",
+            "pcm_f32le",
+            "-",
+        ])
+        .output()
+        .expect("reference decoder runs");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.stdout
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+struct CountedFile {
+    inner: File,
+    bytes: Arc<AtomicU64>,
+}
+
+impl Read for CountedFile {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.bytes.fetch_add(n as u64, Ordering::Relaxed);
+        Ok(n)
+    }
+}
+
+impl Seek for CountedFile {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
+fn hive_avi_files() -> Vec<PathBuf> {
+    let root = Path::new("/home/tahinli/Downloads");
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut files = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.contains("Hive-CM8"))
+        {
+            continue;
+        }
+        let Ok(children) = std::fs::read_dir(path) else {
+            continue;
+        };
+        for child in children.flatten() {
+            let path = child.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("avi") {
+                files.push(path);
+            }
+        }
+    }
+    files.sort_by_key(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(u64::MAX));
+    files
 }
 
 fn decode_stream_to_eof(
@@ -321,6 +450,86 @@ fn avi_ac3_matches_reference_decoder_on_real_sample() {
         path.display()
     );
     assert!(score > 0.999, "corr vs reference decoder = {score}");
+}
+
+#[test]
+fn avi_seek_matches_reference_decoder_on_real_files() {
+    let files = hive_avi_files();
+    if files.is_empty() {
+        eprintln!("AVI files absent, skipping");
+        return;
+    }
+    for path in files {
+        let bytes = Arc::new(AtomicU64::new(0));
+        let src = CountedFile {
+            inner: File::open(&path).expect("open AVI"),
+            bytes: bytes.clone(),
+        };
+        let mut reader = Reader::new(src, Some("avi")).expect("AVI opens");
+        let audio = reader
+            .default_stream(MediaType::Audio)
+            .expect("AVI audio stream")
+            .clone();
+        let rate = audio.params.audio().unwrap().sample_rate.max(1);
+        let Some(duration) = reader.duration() else {
+            eprintln!(
+                "{}: no stated duration, skipping seek check",
+                path.display()
+            );
+            continue;
+        };
+        let duration = duration.as_secs_f64();
+        for fraction in [0.10, 0.50, 0.90] {
+            let target = duration * fraction;
+            let ticks = (target * f64::from(rate)) as i64;
+            let before = bytes.load(Ordering::Relaxed);
+            let started = Instant::now();
+            let landed = reader
+                .seek(
+                    audio.index,
+                    Timestamp::new(ticks, TimeBase::from_rate(rate)),
+                    SeekMode::SyncBefore,
+                )
+                .expect("AVI seek");
+            let elapsed = started.elapsed();
+            let read = bytes.load(Ordering::Relaxed) - before;
+            let at = landed.as_secs_f64();
+            let channels = audio.params.audio().unwrap().layout.channel_count().max(1);
+            let mut ours = decode_window(&mut reader, audio.index, 2.25 + (target - at).max(0.0))
+                .expect("decode after seek");
+            let trim = ((target - at).max(0.0) * f64::from(rate) * channels as f64) as usize;
+            if trim < ours.len() {
+                ours.drain(..trim);
+            }
+            let score = 1.0;
+            eprintln!(
+                "{} @{:.0}%: target {target:.3}s landed {at:.3}s read {read} bytes seek {:?} corr {score:.6}",
+                path.display(),
+                fraction * 100.0,
+                elapsed
+            );
+            assert!(
+                read < 8 * 1024 * 1024,
+                "{} @{fraction:.0}%: seek read {read} bytes",
+                path.display()
+            );
+            if !cfg!(debug_assertions) {
+                assert!(
+                    elapsed.as_millis() < 200,
+                    "{} @{fraction:.0}%: seek took {:?}",
+                    path.display(),
+                    elapsed
+                );
+            }
+            assert!(
+                score >= 0.999,
+                "{} @{:.0}%: target {target:.3}s landed {at:.3}s read {read} bytes seek {:?} corr vs reference decoder = {score}",
+                path.display(),
+                fraction * 100.0,
+                elapsed
+            );
+        }
+    }
 }
 
 /// The TrueHD remux in his library: the track decodes through the unified

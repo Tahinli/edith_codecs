@@ -264,6 +264,136 @@ fn avi_truncated_tail_is_end_of_stream() {
     assert!(matches!(err, Error::Eof));
 }
 
+fn avi_chunk(out: &mut Vec<u8>, id: &[u8; 4], body: &[u8]) -> usize {
+    let at = out.len();
+    out.extend_from_slice(id);
+    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    out.extend_from_slice(body);
+    if body.len() % 2 == 1 {
+        out.push(0);
+    }
+    at
+}
+
+fn avi_list(out: &mut Vec<u8>, kind: &[u8; 4], body: &[u8]) -> usize {
+    let at = out.len();
+    out.extend_from_slice(b"LIST");
+    out.extend_from_slice(&((body.len() + 4) as u32).to_le_bytes());
+    out.extend_from_slice(kind);
+    out.extend_from_slice(body);
+    if body.len() % 2 == 1 {
+        out.push(0);
+    }
+    at
+}
+
+fn avi_seek_fixture(with_odml: bool) -> Vec<u8> {
+    let mut strh = vec![0; 56];
+    strh[0..4].copy_from_slice(b"auds");
+    strh[20..24].copy_from_slice(&1u32.to_le_bytes());
+    strh[24..28].copy_from_slice(&1u32.to_le_bytes());
+    strh[32..36].copy_from_slice(&6u32.to_le_bytes());
+    strh[44..48].copy_from_slice(&1u32.to_le_bytes());
+    let mut strf = Vec::new();
+    strf.extend_from_slice(&1u16.to_le_bytes());
+    strf.extend_from_slice(&1u16.to_le_bytes());
+    strf.extend_from_slice(&1u32.to_le_bytes());
+    strf.extend_from_slice(&1u32.to_le_bytes());
+    strf.extend_from_slice(&1u16.to_le_bytes());
+    strf.extend_from_slice(&8u16.to_le_bytes());
+    let mut strl = Vec::new();
+    avi_chunk(&mut strl, b"strh", &strh);
+    avi_chunk(&mut strl, b"strf", &strf);
+    if with_odml {
+        let mut super_index = vec![0; 40];
+        super_index[0..2].copy_from_slice(&4u16.to_le_bytes());
+        super_index[3] = 0;
+        super_index[4..8].copy_from_slice(&1u32.to_le_bytes());
+        super_index[8..12].copy_from_slice(b"00wb");
+        super_index[24..32].copy_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
+        super_index[32..36].copy_from_slice(&48u32.to_le_bytes());
+        avi_chunk(&mut strl, b"indx", &super_index);
+    }
+    let mut hdrl = Vec::new();
+    avi_list(&mut hdrl, b"strl", &strl);
+
+    let mut movi = Vec::new();
+    let first = avi_chunk(&mut movi, b"00wb", &[1]);
+    let second = avi_chunk(&mut movi, b"00wb", &[2, 2]);
+    let third = avi_chunk(&mut movi, b"00wb", &[3, 3, 3]);
+    let mut body = Vec::new();
+    avi_list(&mut body, b"hdrl", &hdrl);
+    let movi_list_at = body.len();
+    avi_list(&mut body, b"movi", &movi);
+    let movi_start = 12 + movi_list_at + 12;
+
+    if with_odml {
+        let mut std_index = vec![0; 24 + 3 * 8];
+        std_index[0..2].copy_from_slice(&2u16.to_le_bytes());
+        std_index[3] = 1;
+        std_index[4..8].copy_from_slice(&3u32.to_le_bytes());
+        std_index[8..12].copy_from_slice(b"00wb");
+        std_index[12..20].copy_from_slice(&(movi_start as u64).to_le_bytes());
+        for (i, (offset, size)) in [(first, 1u32), (second, 2), (third, 3)]
+            .into_iter()
+            .enumerate()
+        {
+            let at = 24 + i * 8;
+            std_index[at..at + 4].copy_from_slice(&(offset as u32).to_le_bytes());
+            std_index[at + 4..at + 8].copy_from_slice(&size.to_le_bytes());
+        }
+        avi_chunk(&mut body, b"ix00", &std_index);
+    } else {
+        let mut idx1 = Vec::new();
+        for (offset, size) in [(first, 1u32), (second, 2), (third, 3)] {
+            idx1.extend_from_slice(b"00wb");
+            idx1.extend_from_slice(&0x10u32.to_le_bytes());
+            idx1.extend_from_slice(&(offset as u32).to_le_bytes());
+            idx1.extend_from_slice(&size.to_le_bytes());
+        }
+        avi_chunk(&mut body, b"idx1", &idx1);
+    }
+
+    let mut avi = Vec::new();
+    avi.extend_from_slice(b"RIFF");
+    avi.extend_from_slice(&((body.len() + 4) as u32).to_le_bytes());
+    avi.extend_from_slice(b"AVI ");
+    avi.extend_from_slice(&body);
+    if with_odml {
+        let ix = avi
+            .windows(4)
+            .position(|w| w == b"ix00")
+            .expect("standard index exists") as u64;
+        let placeholder = 0x1122_3344_5566_7788u64.to_le_bytes();
+        let at = avi
+            .windows(8)
+            .position(|w| w == placeholder)
+            .expect("super index placeholder exists");
+        avi[at..at + 8].copy_from_slice(&ix.to_le_bytes());
+    }
+    avi
+}
+
+#[test]
+fn avi_idx1_seek_lands_on_indexed_audio_chunk() {
+    let avi = avi_seek_fixture(false);
+    let mut reader = AviReader::new(Cursor::new(&avi)).expect("AVI opens");
+    assert!(reader.has_index());
+    assert_eq!(reader.seek_to_stream_time(0, 2, false).unwrap(), 1);
+    assert_eq!(reader.next_packet().unwrap().data, [2, 2]);
+    assert_eq!(reader.seek_to_stream_time(0, 2, true).unwrap(), 3);
+    assert_eq!(reader.next_packet().unwrap().data, [3, 3, 3]);
+}
+
+#[test]
+fn avi_odml_seek_lands_on_indexed_audio_chunk() {
+    let avi = avi_seek_fixture(true);
+    let mut reader = AviReader::new(Cursor::new(&avi)).expect("AVI opens");
+    assert!(reader.has_index());
+    assert_eq!(reader.seek_to_stream_time(0, 3, false).unwrap(), 3);
+    assert_eq!(reader.next_packet().unwrap().data, [3, 3, 3]);
+}
+
 #[test]
 fn refusals_name_a_real_absence() {
     // Not RIFF at all.
