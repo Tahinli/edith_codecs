@@ -1,14 +1,13 @@
-//! The Opus packet encoder: CELT and mono SILK, 8 to 48 kHz in.
+//! The Opus packet encoder: CELT, SILK and hybrid, 8 to 48 kHz in.
 //!
 //! One [`Encoder`] produces ordinary code-0 Opus packets (RFC 6716 Section 3)
 //! or the self-delimited variant of Appendix B that the multistream framing
 //! needs. [`Encoder::set_mode`] (or the automatic choice in [`Mode`]'s
-//! default) picks CELT (TOC configs 16..31, every rate and frame size) or
-//! SILK (TOC configs 0/1/4/5/8/9, mono NB/MB/WB 10 or 20 ms only —
-//! stereo SILK and SILK at other frame sizes fall back to CELT, documented
-//! at the fallback site) or Hybrid (TOC configs 13/15, mono SWB/FB 20 ms:
-//! SILK at 16 kHz under CELT from band 17 up, one range-coded stream;
-//! stereo and other frame sizes fall back to CELT).
+//! default) picks CELT (TOC configs 16..31, every rate and frame size), SILK
+//! (TOC configs 0/1/4/5/8/9, mono or stereo NB/MB/WB 10 or 20 ms; mono also
+//! 40/60 ms through [`SilkEncoder`]), or Hybrid (TOC configs 13/15, mono
+//! SWB/FB 20 ms: SILK at 16 kHz under CELT from band 17 up, one range-coded
+//! stream; stereo and other frame sizes fall back to CELT).
 //!
 //! Input below 48 kHz is zero-stuffed to CELT's or SILK's native rate and
 //! the coded bandwidth is capped at the input's own Nyquist, so the images
@@ -25,7 +24,7 @@ use ec_core::{Error, Result};
 use crate::celt_enc::CeltEncoder;
 use crate::packet::{Bandwidth, Mode};
 use crate::range::RangeEncoder;
-use crate::silk_enc_write::SilkEncoder;
+use crate::silk_enc_write::{SilkEncoder, SilkStereoEncoder};
 
 /// Most bytes one Opus frame may occupy (RFC 6716 `[R2]`).
 const MAX_FRAME_BYTES: usize = 1275;
@@ -82,6 +81,9 @@ pub struct Encoder {
     silk_nb: Option<SilkEncoder>,
     silk_mb: Option<SilkEncoder>,
     silk_wb: Option<SilkEncoder>,
+    silk_stereo_nb: Option<SilkStereoEncoder>,
+    silk_stereo_mb: Option<SilkStereoEncoder>,
+    silk_stereo_wb: Option<SilkStereoEncoder>,
     /// Scratch space for the SILK payload, sized once so the steady-state
     /// loop (`steady_state_encode_loop_zero_alloc`) doesn't allocate.
     silk_buf: [u8; MAX_FRAME_BYTES + 1],
@@ -132,6 +134,9 @@ impl Encoder {
             silk_nb: None,
             silk_mb: None,
             silk_wb: None,
+            silk_stereo_nb: None,
+            silk_stereo_mb: None,
+            silk_stereo_wb: None,
             silk_buf: [0u8; MAX_FRAME_BYTES + 1],
             silk_delay: Vec::new(),
             silk_stuff: Vec::new(),
@@ -141,7 +146,7 @@ impl Encoder {
     /// Overrides the automatic SILK/Hybrid/CELT choice `wants_silk` and
     /// `hybrid_choice` make from the application and bitrate; pass `None` to
     /// restore the automatic pick. Requests this encoder cannot honour
-    /// (stereo SILK/Hybrid, SILK longer than 20 ms, or 10 ms Hybrid) fall back to CELT.
+    /// (SILK longer than 20 ms through this wrapper or 10 ms Hybrid) fall back to CELT.
     pub fn set_mode(&mut self, mode: Option<Mode>) {
         self.mode = mode;
     }
@@ -219,6 +224,9 @@ impl Encoder {
         self.silk_nb = None;
         self.silk_mb = None;
         self.silk_wb = None;
+        self.silk_stereo_nb = None;
+        self.silk_stereo_mb = None;
+        self.silk_stereo_wb = None;
         self.silk_delay.clear();
         self.final_range = 0;
     }
@@ -252,11 +260,10 @@ impl Encoder {
     }
 
     /// `wants_silk` narrowed to what this encoder can actually code as SILK:
-    /// mono, 10 or 20 ms (480 or 960 samples at 48 kHz) frames only. Stereo
-    /// SILK and longer SILK packets are future work; both fall back to CELT.
+    /// mono or stereo, 10 or 20 ms (480 or 960 samples at 48 kHz) frames.
     fn silk_choice(&self, frame_48k: usize) -> Option<usize> {
         let fs_khz = self.wants_silk()?;
-        if self.channels != 1 || !matches!(frame_48k, 480 | 960) {
+        if !matches!(frame_48k, 480 | 960) {
             return None;
         }
         Some(fs_khz)
@@ -339,6 +346,21 @@ impl Encoder {
         }
     }
 
+    fn zero_stuff_stereo(pcm: &[f32], frame_size: usize, upsample: usize, out: &mut Vec<f32>) {
+        if upsample == 1 {
+            out.clear();
+            out.extend_from_slice(&pcm[..2 * frame_size]);
+            return;
+        }
+        out.resize(2 * frame_size * upsample, 0.0);
+        out.fill(0.0);
+        for i in 0..frame_size {
+            let dst = 2 * i * upsample;
+            out[dst] = pcm[2 * i] * upsample as f32;
+            out[dst + 1] = pcm[2 * i + 1] * upsample as f32;
+        }
+    }
+
     /// Picks SILK or CELT for one frame and encodes it, returning the TOC
     /// byte and the payload bytes (excluding TOC), borrowed from scratch
     /// space owned by `self` — no allocation on the steady-state path.
@@ -352,6 +374,25 @@ impl Encoder {
     ) -> Result<(u8, &[u8])> {
         let frame_48k = frame_size * self.upsample;
         if let Some(fs_khz) = self.silk_choice(frame_48k) {
+            if self.channels == 2 {
+                Self::zero_stuff_stereo(pcm, frame_size, self.upsample, &mut self.silk_stuff);
+                let enc = match fs_khz {
+                    8 => self
+                        .silk_stereo_nb
+                        .get_or_insert_with(|| SilkStereoEncoder::new(false)),
+                    12 => self
+                        .silk_stereo_mb
+                        .get_or_insert_with(SilkStereoEncoder::new_mediumband),
+                    _ => self
+                        .silk_stereo_wb
+                        .get_or_insert_with(|| SilkStereoEncoder::new(true)),
+                };
+                enc.set_bitrate(self.bitrate);
+                let n =
+                    enc.encode_frame_ms(&self.silk_stuff, &mut self.silk_buf, frame_48k / 48)?;
+                self.final_range = enc.final_range();
+                return Ok((self.silk_buf[0], &self.silk_buf[1..n]));
+            }
             Self::zero_stuff_mono(pcm, frame_size, self.upsample, &mut self.silk_stuff);
             let enc = match fs_khz {
                 8 => self.silk_nb.get_or_insert_with(|| SilkEncoder::new(false)),

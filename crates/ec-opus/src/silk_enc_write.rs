@@ -1,5 +1,5 @@
 //! SILK payload writer (subtask D2a): turns the analysis in [`crate::silk_enc`]
-//! into a decodable mono SILK packet, NB (8 kHz), MB (12 kHz) or WB (16 kHz).
+//! into decodable SILK packets, NB (8 kHz), MB (12 kHz) or WB (16 kHz).
 //!
 //! Symbol order is exactly `silk::decode()`'s, and every decision is made
 //! against the decoder's own tables and reconstruction functions. The
@@ -12,7 +12,7 @@
 //! output error is fed back through short-term (bandwidth-expanded LPC),
 //! harmonic and tilt shaping filters so the noise hides under the signal's
 //! own spectrum, and a gain-offset rate loop sizes each packet against
-//! [`SilkEncoder::set_bitrate`]. Stereo is not written yet.
+//! [`SilkEncoder::set_bitrate`].
 
 // Same idiom as silk.rs: index loops mirror the decoder's position arithmetic.
 #![allow(clippy::needless_range_loop)]
@@ -38,7 +38,7 @@ const LEVEL_ADJUST: f32 = 80.0 / 1024.0;
 /// with 16 such pulses in one block.
 const MAX_PULSE: i32 = 1023;
 
-/// A mono, 10 or 20 ms, NB/MB/WB SILK encoder.
+/// A mono, 10/20/40/60 ms, NB/MB/WB SILK encoder.
 #[derive(Clone, Debug)]
 pub struct SilkEncoder {
     fs_khz: usize,
@@ -127,6 +127,10 @@ impl SilkEncoder {
         self.target_bps = Some(bps);
     }
 
+    fn reset_state(&mut self) {
+        *self = Self::with_fs_khz(self.fs_khz);
+    }
+
     /// Algorithmic delay in 48 kHz samples: the analysis resampler only
     /// (the decoder adds its own resampler delay on the way back up).
     pub fn delay_samples(&self) -> usize {
@@ -180,6 +184,9 @@ impl SilkEncoder {
             prev_signal_type = trial.signal_type;
             frames.push(trial);
         }
+        if frames.iter().any(|frame| frame.voiced) {
+            self.voiced_frames += 1;
+        }
         self.range.reset(1275);
         let refs: Vec<&Trial> = frames.iter().collect();
         write_packet_header(&mut self.range, &refs);
@@ -225,8 +232,9 @@ impl SilkEncoder {
     /// must [`SilkEncoder::replay`] the finished payload so this encoder's
     /// decoder mirror advances.
     pub fn encode_hybrid(&mut self, pcm48: &[f32], enc: &mut RangeEncoder) -> Result<()> {
-        self.encode_inner(pcm48, 20, Some(enc), false, 0)
-            .map(|_| ())
+        let trial = self.encode_inner(pcm48, 20, Some(enc), false, 0)?;
+        self.voiced_frames += usize::from(trial.voiced);
+        Ok(())
     }
 
     /// Decodes `payload` (TOC stripped) through the mirror decoder so the next
@@ -662,7 +670,6 @@ impl SilkEncoder {
             write_frame_data(enc, trial_ref, conditional, prev_signal_type);
         }
         self.prev_gain_index = best.prev_gain_index;
-        self.voiced_frames += usize::from(voiced);
         self.shape_d.copy_from_slice(&best.run.d[n..]);
         self.shape_u.copy_from_slice(&best.run.u[n..]);
         self.shape_gq.copy_from_slice(&best.run.gq[n..]);
@@ -670,6 +677,187 @@ impl SilkEncoder {
     }
 }
 
+/// A stereo, 10 or 20 ms, NB/MB/WB SILK encoder.
+#[derive(Clone, Debug)]
+pub struct SilkStereoEncoder {
+    fs_khz: usize,
+    mid: SilkEncoder,
+    side: SilkEncoder,
+    range: RangeEncoder,
+    mirror: SilkDecoder,
+    final_range: u32,
+    mirror_range: u32,
+    mirror_out: Vec<i16>,
+    target_bps: Option<u32>,
+    prev_mid_only: bool,
+    voiced_frames: usize,
+}
+
+impl SilkStereoEncoder {
+    /// Narrowband or wideband stereo encoder.
+    pub fn new(wideband: bool) -> SilkStereoEncoder {
+        Self::with_fs_khz(if wideband { 16 } else { 8 })
+    }
+
+    /// Mediumband stereo encoder.
+    pub fn new_mediumband() -> SilkStereoEncoder {
+        Self::with_fs_khz(12)
+    }
+
+    fn with_fs_khz(fs_khz: usize) -> SilkStereoEncoder {
+        SilkStereoEncoder {
+            fs_khz,
+            mid: SilkEncoder::with_fs_khz(fs_khz),
+            side: SilkEncoder::with_fs_khz(fs_khz),
+            range: RangeEncoder::new(),
+            mirror: SilkDecoder::new(fs_khz as u32 * 1000, 2),
+            final_range: 0,
+            mirror_range: 0,
+            mirror_out: vec![0; 2 * 20 * fs_khz],
+            target_bps: None,
+            prev_mid_only: false,
+            voiced_frames: 0,
+        }
+    }
+
+    /// The range coder state after the last packet.
+    pub fn final_range(&self) -> u32 {
+        self.final_range
+    }
+
+    /// Packets so far coded with a long-term predictor in either channel.
+    pub fn voiced_frames(&self) -> usize {
+        self.voiced_frames
+    }
+
+    /// Target bit rate in bits per second for the whole stereo packet.
+    pub fn set_bitrate(&mut self, bps: u32) {
+        self.target_bps = Some(bps);
+        let per_channel = (bps / 2).max(500);
+        self.mid.set_bitrate(per_channel);
+        self.side.set_bitrate(per_channel);
+    }
+
+    /// Algorithmic delay in 48 kHz samples.
+    pub fn delay_samples(&self) -> usize {
+        self.mid.delay_samples()
+    }
+
+    /// Encodes one 10 or 20 ms interleaved stereo frame at 48 kHz.
+    pub fn encode_frame_ms(
+        &mut self,
+        pcm48: &[f32],
+        out: &mut [u8],
+        frame_ms: usize,
+    ) -> Result<usize> {
+        assert!(
+            matches!(frame_ms, 10 | 20),
+            "SilkStereoEncoder codes 10 or 20 ms stereo frames"
+        );
+        assert_eq!(
+            pcm48.len(),
+            2 * 48 * frame_ms,
+            "SilkStereoEncoder input is 48 kHz stereo"
+        );
+        if self.prev_mid_only {
+            self.side.reset_state();
+            if let Some(bps) = self.target_bps {
+                self.side.set_bitrate((bps / 2).max(500));
+            }
+        }
+        let samples = 48 * frame_ms;
+        let mut mid = Vec::with_capacity(samples);
+        let mut side = Vec::with_capacity(samples);
+        let mut side_energy = 0.0f32;
+        for lr in pcm48.chunks_exact(2) {
+            let m = 0.5 * (lr[0] + lr[1]);
+            let s = 0.5 * (lr[0] - lr[1]);
+            mid.push(m);
+            side.push(s);
+            side_energy += s * s;
+        }
+        let mid_trial = self.mid.encode_inner(&mid, frame_ms, None, false, 0)?;
+        let side_trial = self.side.encode_inner(&side, frame_ms, None, false, 0)?;
+        let mid_only = side_energy < 1.0e-10;
+
+        self.range.reset(1275);
+        write_stereo_packet_header(&mut self.range, &mid_trial, &side_trial, mid_only);
+        write_stereo_zero_pred(&mut self.range);
+        if !side_trial.vad_flag {
+            self.range
+                .enc_icdf(usize::from(mid_only), &STEREO_ONLY_CODE_MID_ICDF, 8);
+        }
+        write_frame_data(&mut self.range, &mid_trial, false, 0);
+        if !mid_only {
+            write_frame_data(&mut self.range, &side_trial, false, 0);
+        }
+        self.range.done();
+        debug_assert!(!self.range.error());
+        let len = self.range.range_bytes();
+        self.final_range = self.range.range();
+        let duration = if frame_ms == 10 { 0u8 } else { 1 };
+        let base = match self.fs_khz {
+            8 => 0u8,
+            12 => 4,
+            _ => 8,
+        };
+        if out.len() < 1 + len {
+            return Err(ec_core::Error::corrupt(format!(
+                "silk stereo encode: packet needs {} bytes, buffer holds {}",
+                1 + len,
+                out.len()
+            )));
+        }
+        out[0] = ((base + duration) << 3) | 0x04;
+        out[1..1 + len].copy_from_slice(&self.range.data()[..len]);
+        self.replay_ms(&out[1..1 + len], frame_ms)?;
+        self.mid.replay_ms(&mid_trial.bytes, frame_ms)?;
+        if mid_only {
+            self.side.reset_state();
+        } else {
+            self.side.replay_ms(&side_trial.bytes, frame_ms)?;
+        }
+        self.prev_mid_only = mid_only;
+        self.voiced_frames += usize::from(mid_trial.voiced || side_trial.voiced);
+        debug_assert_eq!(self.mirror_range, self.final_range);
+        Ok(1 + len)
+    }
+
+    fn replay_ms(&mut self, payload: &[u8], frame_ms: usize) -> Result<()> {
+        let fs = self.fs_khz;
+        let mut dec = RangeDecoder::new(payload);
+        let total = 2 * frame_ms * fs;
+        if self.mirror_out.len() < total {
+            self.mirror_out.resize(total, 0);
+        }
+        let n = self.mirror.decode(
+            &mut dec,
+            &mut self.mirror_out[..total],
+            frame_ms,
+            fs as u32 * 1000,
+            2,
+            true,
+        )?;
+        debug_assert_eq!(n, frame_ms * fs);
+        self.mirror_range = dec.range();
+        Ok(())
+    }
+}
+
+fn write_stereo_packet_header(enc: &mut RangeEncoder, mid: &Trial, side: &Trial, mid_only: bool) {
+    enc.enc_bit_logp(mid.vad_flag, 1);
+    enc.enc_bit_logp(false, 1);
+    enc.enc_bit_logp(if mid_only { false } else { side.vad_flag }, 1);
+    enc.enc_bit_logp(false, 1);
+}
+
+fn write_stereo_zero_pred(enc: &mut RangeEncoder) {
+    enc.enc_icdf(12, &STEREO_PRED_JOINT_ICDF, 8);
+    enc.enc_icdf(1, &UNIFORM3_ICDF, 8);
+    enc.enc_icdf(2, &UNIFORM5_ICDF, 8);
+    enc.enc_icdf(1, &UNIFORM3_ICDF, 8);
+    enc.enc_icdf(2, &UNIFORM5_ICDF, 8);
+}
 /// One closed-loop quantisation of a frame.
 struct Run {
     ltp_index: [usize; MAX_NB_SUBFR],
