@@ -19,6 +19,7 @@ pub(crate) fn sub_block_4x4(c8: &[i32; 64], j: usize) -> [i32; 16] {
     std::array::from_fn(|i| c8[4 * i + j])
 }
 
+#[derive(Clone)]
 pub(crate) enum EncEntropy {
     Cavlc {
         w: BitWriter,
