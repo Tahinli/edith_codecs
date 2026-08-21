@@ -29,7 +29,7 @@ pub struct Display {
 // internal lock per display around every entry point used here, so a
 // `VADisplay` may be used from any thread and from several threads at once.
 // The `File` and `PathBuf` fields are themselves `Send + Sync`. This mirrors
-// what every VA-API consumer (ffmpeg, GStreamer, cros-libva) relies on.
+// what every VA-API consumer (the oracle, GStreamer, cros-libva) relies on.
 //
 // Note the narrower claim this crate actually needs: `&Display` is only ever
 // used to *call* libva, never to hand out interior pointers.
@@ -96,7 +96,7 @@ impl Display {
         if let Err(e) = check("vaInitialize", status) {
             // libva allocates display state inside vaGetDisplayDRM, so a failed
             // initialize still has to be terminated or that state leaks. This
-            // is what ffmpeg's vaapi_device_create does on its failure path.
+            // is what the oracle's vaapi_device_create does on its failure path.
             //
             // SAFETY: `handle` is still a valid (if uninitialized) VADisplay;
             // vaTerminate accepts exactly this state.

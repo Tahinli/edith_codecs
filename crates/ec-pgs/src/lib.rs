@@ -391,7 +391,7 @@ pub fn make_decoder(_params: &CodecParameters) -> Result<Box<dyn Decoder>> {
 ///
 /// The luma is taken at its own scale — `Y' = 235` comes out 235, not the 255
 /// an expansion of the 16..235 video range would give. That is not a reading of
-/// the Blu-ray spec but a measurement of what every player draws: ffmpeg's own
+/// the Blu-ray spec but a measurement of what every player draws: the oracle's own
 /// `pgssub` decoder, burning `fixtures/subs/pgs-1080p.sup` over black, tops out
 /// at 235 (`scripts/pgs-white-level.sh`), and a subtitle that is brighter than
 /// the one the disc is mastered against is our bug, not the world's.
@@ -576,7 +576,7 @@ mod tests {
 
     #[test]
     fn palette_entries_convert_at_their_own_luma_scale() {
-        // A disc's white and black land where ffmpeg's PGS decoder puts them —
+        // A disc's white and black land where the oracle's PGS decoder puts them —
         // 235 and 16, not an expansion to 255 and 0 — and alpha rides through
         // untouched.
         assert_eq!(rgba(235, 128, 128, 255), [235, 235, 235, 255]);

@@ -4,7 +4,7 @@
 //! `AlacDecoder::decode` expects.
 //!
 //! Written from the published ALAC format description, same as `decode.rs`.
-//! Nothing here is derived from Apple's encoder sources.
+//! Nothing here is derived from the reference encoder sources.
 
 use crate::MagicCookie;
 use ec_core::error::{Error, Result};
@@ -477,7 +477,7 @@ pub struct AlacEncoder {
 impl AlacEncoder {
     /// An encoder for a mono or stereo stream. `bit_depth` is 16 or 24;
     /// `frame_length` is the samples-per-channel every full frame carries
-    /// (Apple's own encoder writes 4096).
+    /// (the reference own encoder writes 4096).
     pub fn new(sample_rate: u32, channels: u8, bit_depth: u8, frame_length: u32) -> Result<AlacEncoder> {
         if !matches!(bit_depth, 16 | 24) {
             return Err(Error::unsupported(
