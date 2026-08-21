@@ -263,7 +263,7 @@ impl Encoder {
 
     /// The reconstruction of the last coded picture, cropped, as I420 planes.
     /// This is what a conformant decoder produces for that picture — the tests
-    /// compare it against this crate's decoder and against ffmpeg.
+    /// compare it against this crate's decoder and against the oracle.
     pub fn reconstruction(&self) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
         if !self.have_reference {
             return None;

@@ -34,7 +34,7 @@
 //! **Why the incumbent encoder collapsed above ~128-165 kbps** (the measured
 //! record this crate replaces; edith `engine/Cargo.toml:124-140` and
 //! `export.rs:1834`): its packets above that rate were decodable only by its
-//! *own* decoder — correlation 0.06 against libopus at 256 kbps while its
+//! *own* decoder — correlation 0.06 against the reference decoder at 256 kbps while its
 //! internal round trip read 0.999 — and the rate the cliff sat at moved with
 //! the content. That signature — self-consistent, world-divergent, at a
 //! *bits-per-band* threshold — is a shared encode/decode convention error in
@@ -51,7 +51,7 @@
 //! half the bitrate. This encoder mirrors the reference's allocation
 //! arithmetic symbol for symbol, and the tests hold the closed loop to it:
 //! every packet is range-state-exact against this crate's own
-//! RFC-vector-verified decoder, and libopus (via ffmpeg) plus the reference
+//! RFC-vector-verified decoder, and the reference decoder (via the oracle) plus the reference
 //! `opus_demo` decoder read the same packets at correlation >= 0.99 across
 //! the whole rate table, mono, stereo and 5.1 alike.
 //!

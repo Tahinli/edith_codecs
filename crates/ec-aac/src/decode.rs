@@ -27,7 +27,7 @@ const INTENSITY_HCB: u8 = 15;
 const SF_OFFSET: i32 = 100;
 /// The dequantiser works in the standard's own units, where full scale is
 /// 2^16; the public API speaks the usual +/-1 float range. Checked against a
-/// reference decode in `adts_fixtures_match_ffmpeg_per_channel`, which compares
+/// reference decode in `adts_fixtures_match_the oracle_per_channel`, which compares
 /// amplitudes and not just shape.
 pub(crate) const OUTPUT_SCALE: f32 = 1.0 / 65536.0;
 /// The longest TNS filter AAC-LC allows (long blocks; short blocks stop at 7).

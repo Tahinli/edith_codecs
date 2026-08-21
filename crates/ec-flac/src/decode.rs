@@ -181,7 +181,7 @@ impl Block {
     }
 
     /// The block interleaved into one buffer, samples shifted left so they fill
-    /// a 16- or 32-bit container the way ffmpeg and every mixer expect
+    /// a 16- or 32-bit container the way the oracle and every mixer expect
     /// (`s16` for depths up to 16, `s32` above).
     pub fn to_interleaved(&self, shift: u32) -> Vec<i32> {
         let channels = self.channels.len();
@@ -197,7 +197,7 @@ impl Block {
 }
 
 /// Bits the samples of a `bits_per_sample` stream are shifted left by to fill
-/// their PCM container — the convention ffmpeg's decoder uses, so raw output
+/// their PCM container — the convention the oracle's decoder uses, so raw output
 /// compares byte for byte.
 pub fn container_shift(bits_per_sample: u32) -> u32 {
     match bits_per_sample <= 16 {
@@ -484,7 +484,7 @@ impl DecodedStream {
 
     /// Interleaved samples shifted into their PCM container, as raw bytes:
     /// `s16le` for depths up to 16 bits, `s32le` above. This is exactly what
-    /// `ffmpeg -f s16le/-f s32le` writes for the same file.
+    /// `the oracle -f s16le/-f s32le` writes for the same file.
     pub fn to_pcm_bytes(&self) -> Vec<u8> {
         let shift = container_shift(self.bits_per_sample);
         let narrow = self.bits_per_sample <= 16;
@@ -673,7 +673,7 @@ fn decode_subframe(
     if bps > 32 {
         // Only a 32-bit stream that also decorrelates its stereo pair gets
         // here: its side channel needs 33 bits, which does not fit the i32
-        // sample planes this decoder (and ffmpeg's, and libFLAC's encoder)
+        // sample planes this decoder (and the oracle's, and the reference encoder's encoder)
         // works in. Named rather than mangled.
         return Err(Error::unsupported(
             "33-bit side subframe",
@@ -957,7 +957,7 @@ mod tests {
     }
 
     #[test]
-    fn container_shift_matches_ffmpeg_layout() {
+    fn container_shift_matches_reference_layout() {
         assert_eq!(container_shift(8), 8);
         assert_eq!(container_shift(12), 4);
         assert_eq!(container_shift(16), 0);

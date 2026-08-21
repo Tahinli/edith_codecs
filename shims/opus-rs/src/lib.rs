@@ -2,13 +2,13 @@
 //! [`ec_opus`].
 //!
 //! The incumbent this replaces encoded packets that only its own decoder read
-//! back above ~128-165 kbps (correlation 0.06 against libopus at 256 kbps on
+//! back above ~128-165 kbps (correlation 0.06 against the reference decoder at 256 kbps on
 //! the same signal that round-tripped internally at 0.999), and mono was
 //! broken at every rate. This shim serves the same three-call surface —
 //! `OpusEncoder::new(rate, channels, Application)`, the public `bitrate_bps`
 //! and `complexity` fields, `.encode(&pcm, frame_size, &mut out)` — from the
 //! `ec-opus` CELT encoder, which is range-exact against the family's
-//! RFC-vector-verified decoder and libopus-verified at every rate up to
+//! RFC-vector-verified decoder and the reference decoder-verified at every rate up to
 //! 510 kbps, mono and stereo alike. The measured envelope that capped the
 //! incumbent (`OPUS_MAX_KBPS = 128`) is obsolete behind this crate.
 //!
@@ -29,7 +29,7 @@ use std::fmt;
 /// setting on the coded bandwidth, not on a different coding layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Application {
-    /// Speech-optimised (SILK in libopus; served by CELT here).
+    /// Speech-optimised (SILK in the reference decoder; served by CELT here).
     Voip,
     /// Music and general audio.
     Audio,
