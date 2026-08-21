@@ -442,11 +442,12 @@ fn eight_by_eight_gains_on_flat_and_text() {
         clip.u.fill(128);
         clip.v.fill(128);
     };
-    let run = |t8x8: bool, qp: i32| {
+    let run = |t8x8: bool, qp: i32, cabac: bool| {
         let mut cfg = EncoderConfig::new(w as u32, h as u32);
         cfg.qp = qp;
         cfg.gop_size = 10;
         cfg.transform_8x8 = t8x8;
+        cfg.cabac = cabac;
         let mut enc = Encoder::new(cfg).expect("encoder");
         let mut clip = Clip::new(w, h);
         let (mut bits, mut sum_psnr) = (0usize, 0.0);
@@ -465,8 +466,8 @@ fn eight_by_eight_gains_on_flat_and_text() {
         (bits as f64, sum_psnr / 10.0, share)
     };
     let qps = [22, 26, 30, 34];
-    let on: Vec<_> = qps.iter().map(|&q| run(true, q)).collect();
-    let off: Vec<_> = qps.iter().map(|&q| run(false, q)).collect();
+    let on: Vec<_> = qps.iter().map(|&q| run(true, q, true)).collect();
+    let off: Vec<_> = qps.iter().map(|&q| run(false, q, true)).collect();
     let on_curve: Vec<_> = on.iter().map(|&(bits, psnr, _)| (bits, psnr)).collect();
     let off_curve: Vec<_> = off.iter().map(|&(bits, psnr, _)| (bits, psnr)).collect();
     let bd = bd_psnr_delta(&on_curve, &off_curve);

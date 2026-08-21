@@ -510,7 +510,7 @@ fn code_band(pic: &mut Picture, job: BandJob<'_>) -> Vec<u8> {
         slice_id: job.slice_id,
         qp: job.qp,
         target_qp: job.qp,
-        lambda_motion: lambda_for(job.qp, job.cfg.transform_8x8),
+        lambda: lambda_for(job.qp, job.cfg.transform_8x8),
         preset: job.cfg.preset,
         transform_8x8: job.cfg.transform_8x8,
         ls: LevelScale4x4::new(&[16; 16]),
@@ -528,7 +528,7 @@ fn code_band(pic: &mut Picture, job: BandJob<'_>) -> Vec<u8> {
             let expected = job.band_target * n as f64 / rows as f64;
             let delta = job.rc.row_delta(spent, expected);
             e.target_qp = (job.qp + delta).clamp(10, 51);
-            e.lambda_motion = lambda_for(e.target_qp, job.cfg.transform_8x8);
+            e.lambda = lambda_for(e.target_qp, job.cfg.transform_8x8);
         }
         for mb_x in 0..mb_w {
             let addr = mb_y * mb_w + mb_x;
@@ -545,10 +545,11 @@ pub(crate) fn lambda_ssd(qp: i32) -> f64 {
     0.85 * ((f64::from(qp) - 12.0) / 3.0).exp2()
 }
 
-/// Lagrangian multiplier for SATD and motion-vector costs.
+/// Lagrangian multiplier; the 8x8 path uses the standard squared-error
+/// multiplier, while the established 4x4 path keeps its byte-stable ladder.
 fn lambda_for(qp: i32, transform_8x8: bool) -> f64 {
     if transform_8x8 {
-        lambda_ssd(qp).sqrt()
+        lambda_ssd(qp)
     } else {
         // The established 4x4 path stays byte-stable when the feature is off.
         (((f64::from(qp) - 12.0) / 6.0).exp2().round()).max(1.0)

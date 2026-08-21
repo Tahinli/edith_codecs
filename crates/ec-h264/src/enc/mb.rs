@@ -78,8 +78,9 @@ pub(crate) struct MbEnc<'a> {
     pub qp: i32,
     /// What rate control wants this macroblock coded at.
     pub target_qp: i32,
-    /// Lagrangian multiplier for SATD and motion-vector costs.
-    pub lambda_motion: f64,
+    /// Lagrangian multiplier; it is in the squared-error domain when 8x8
+    /// transform decisions are enabled.
+    pub lambda: f64,
     pub preset: Preset,
     /// The PPS carries transform_8x8_mode_flag: transform_size_8x8_flag must
     /// be written for every eligible macroblock (7.3.5).
@@ -282,7 +283,12 @@ fn modes_allowed(have_top: bool, have_left: bool, have_tl: bool) -> [bool; 9] {
 
 #[inline]
 fn motion_rate(e: &MbEnc<'_>, bits: f64) -> i32 {
-    (e.lambda_motion * bits).round() as i32
+    let lambda = if e.transform_8x8 {
+        e.lambda.sqrt()
+    } else {
+        e.lambda
+    };
+    (lambda * bits).round() as i32
 }
 
 /// Code one macroblock: decide its mode, reconstruct it into `pic` and write
@@ -704,7 +710,7 @@ const ZERO_BLOCK_LAMBDA: f64 = 0.4;
 
 fn zero_block_lambda(e: &MbEnc<'_>, qp: i32) -> f64 {
     if e.transform_8x8 {
-        lambda_ssd(qp)
+        e.lambda
     } else {
         ZERO_BLOCK_LAMBDA * lambda_ssd(qp)
     }
@@ -1259,6 +1265,7 @@ fn entropy_bits(w: &EncEntropy, write: impl FnOnce(&mut EncEntropy)) -> i64 {
     (probe.bit_len() - before) as i64
 }
 
+
 fn cost_luma_nz_pair(
     pic: &Picture,
     nbr: &MbNeighbors,
@@ -1550,7 +1557,7 @@ fn encode_intra_mb(
                 cost.i16_mode,
                 chroma_mode,
             );
-            ssd_mb(pic, e, mb_x, mb_y) as f64 + lambda_ssd(qp) * bits as f64
+            ssd_mb(pic, e, mb_x, mb_y) as f64 + e.lambda * bits as f64
         } else {
             ssd_luma(pic, e, mb_x, mb_y) as f64
                 + lambda_ssd(qp) * rough_intra_bits(&lv4, Some((&m4, &p4))) as f64
@@ -1582,7 +1589,7 @@ fn encode_intra_mb(
                 cost.i16_mode,
                 chroma_mode,
             );
-            ssd_mb(pic, e, mb_x, mb_y) as f64 + lambda_ssd(qp) * bits as f64
+            ssd_mb(pic, e, mb_x, mb_y) as f64 + e.lambda * bits as f64
         } else {
             f64::INFINITY
         };
@@ -1601,7 +1608,7 @@ fn encode_intra_mb(
                 cost.i16_mode,
                 chroma_mode,
             );
-            ssd_mb(pic, e, mb_x, mb_y) as f64 + lambda_ssd(qp) * bits as f64
+            ssd_mb(pic, e, mb_x, mb_y) as f64 + e.lambda * bits as f64
         } else {
             ssd_luma(pic, e, mb_x, mb_y) as f64
                 + lambda_ssd(qp) * rough_intra_bits(&lv16, None) as f64
@@ -1635,6 +1642,7 @@ fn encode_intra_mb(
         lv = chroma_lv;
         code_i16_luma(pic, e, mb_x, mb_y, qp, cost.i16_mode, &nbr, &mut lv);
     }
+
 
     // ---- syntax ----
     w.begin_mb(&e.mb_ctx);
@@ -1690,6 +1698,7 @@ fn encode_intra_mb(
             qp,
         },
     );
+
 }
 
 /// Squared error of the whole macroblock against the source, luma and chroma:
@@ -1927,14 +1936,14 @@ fn encode_inter_mb(
         let mut lv4 = chroma_lv.clone();
         code_luma_4x4(pic, e, mb_x, mb_y, qp, false, &mut lv4);
         let bits4 = inter_mb_bits(pic, e, w, mb_addr, &nbr, shape, &mvd, &inc, &lv4);
-        let cost4 = ssd_mb(pic, e, mb_x, mb_y) as f64 + lambda_ssd(qp) * bits4 as f64;
+        let cost4 = ssd_mb(pic, e, mb_x, mb_y) as f64 + e.lambda * bits4 as f64;
         let mut recon4 = [0u8; 256];
         save_luma(pic, mb_x, mb_y, &mut recon4);
         restore_luma(pic, mb_x, mb_y, &pred);
         let mut lv8 = chroma_lv;
         code_luma_8x8(pic, e, mb_x, mb_y, qp, &mut lv8);
         let bits8 = inter_mb_bits(pic, e, w, mb_addr, &nbr, shape, &mvd, &inc, &lv8);
-        let cost8 = ssd_mb(pic, e, mb_x, mb_y) as f64 + lambda_ssd(qp) * bits8 as f64;
+        let cost8 = ssd_mb(pic, e, mb_x, mb_y) as f64 + e.lambda * bits8 as f64;
         if cost8 < cost4 {
             lv = lv8;
         } else {
@@ -1951,7 +1960,7 @@ fn encode_inter_mb(
         Some(ssd_skip) => {
             let coded = if e.transform_8x8 {
                 let bits = inter_mb_bits(pic, e, w, mb_addr, &nbr, shape, &mvd, &inc, &lv);
-                ssd_mb(pic, e, mb_x, mb_y) as f64 + lambda_ssd(qp) * bits as f64
+                ssd_mb(pic, e, mb_x, mb_y) as f64 + e.lambda * bits as f64
             } else {
                 ssd_mb(pic, e, mb_x, mb_y) as f64 + lambda_ssd(qp) * estimate_bits(&lv) as f64
             };
@@ -1999,6 +2008,7 @@ fn encode_inter_mb(
         let base = (mb_y * 4 + dy) * w4 + mb_x * 4;
         pic.i4_modes[base..base + 4].fill(2);
     }
+
 
     // ---- syntax ----
     w.begin_mb(&e.mb_ctx);
