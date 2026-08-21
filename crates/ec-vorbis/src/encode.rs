@@ -81,7 +81,7 @@ const CLASS_RANGE: [i32; CLASSES] = [0, 1, 2, 4, 8, 16, 32, 64, 127];
 const RESIDUE_BOOK_DIM: [usize; CLASSES] = [0, 4, 2, 2, 1, 1, 1, 1, 1];
 /// The vector books save packet bits but add setup and make the rate loop spend
 /// harder; this keeps the realised rate at the caller's target.
-const RATE_TARGET_SCALE: f64 = 0.99;
+const RATE_TARGET_SCALE: f64 = 0.97;
 /// Headroom in dB the widest residue book can actually state: 20 log10 127
 /// is 42, but a coupled angle channel is a difference of two magnitudes, so a
 /// pair's step must leave half that range — 63, 36 dB. Past this the rate loop's extra headroom lowers the absolute-threshold
@@ -102,6 +102,13 @@ const HEADROOM_RANGE_SHORT: f64 = 42.0;
 /// three tracks at 128 kbps: 50 dB kept the accuracy win without inflating the
 /// files.
 const CO_MASK_RANGE: f64 = 50.0;
+/// Extra dB above the spread threshold. This is the single long-block
+/// rate/quality knob: raising the curve zeroes masked coefficients earlier,
+/// while peaks still ride as residue above it.
+const MASKING_OFFSET_DB: f64 = 9.0;
+/// All-zero partition guard: if the masked band still has a bin within this
+/// fraction of the floor, keep that bin as one sign-only residue sample.
+const NOISE_NORMALISE_MIN_RATIO: f32 = 0.5;
 /// A short block gets no co-masking cap: a bin it drops is an error spread
 /// across its whole window, the half before an onset included, and that is
 /// the pre-echo the short block exists to prevent (44.1k mono, onset on the
@@ -132,7 +139,7 @@ const MODE_SHORT: u32 = 0;
 const MODE_LONG: u32 = 1;
 /// A tick energy jump past this multiple of its predecessor is a transient;
 /// a near-zero predecessor makes this trip on any onset above the floor.
-const TRANSIENT_RATIO: f64 = 16.0;
+const TRANSIENT_RATIO: f64 = 14.0;
 /// Below this per-sample mean square (-60 dBFS), a tick is not "content" at
 /// all — the floor that keeps digital silence, dither and fade tails from
 /// tripping the detector.
@@ -610,15 +617,17 @@ impl VorbisEncoder {
         // until nothing clamps, so the curve hugs the peaks the range is
         // measured from.
         let limit = CLASS_RANGE[CLASSES - 1];
-        // A short block's precision is what bounds the pre-echo inside the
-        // window that carries an onset, so it does not inherit whatever
-        // headroom the music before it left the rate loop at: at 6 ch / 96 kHz
-        // the loop sat at 22 dB when the onset came and leaked -36 dB across
-        // the half-window before it. A short run is 16 blocks once a second
-        // or so on music, so the extra bits are noise to the loop.
-        let headroom = match plan.is_long {
+        // Blocks next to short windows bound pre-echo too: the transition-out
+        // long block still overlaps the samples just before the onset, so high
+        // bitrate transients get extra minimum precision.
+        let transient_headroom = if self.config.bitrate_bps >= 128_000 {
+            54.0
+        } else {
+            HEADROOM_SHORT_MIN
+        };
+        let headroom = match plan.is_long && plan.prev_long && plan.next_long {
             true => self.headroom,
-            false => self.headroom.max(HEADROOM_SHORT_MIN),
+            false => self.headroom.max(transient_headroom),
         };
         let mut lift: Vec<Vec<f64>> = vec![vec![1.0; bc.floor.x_list.len()]; channels];
         // Per X point, the span of bins whose curve it has a hand in.
@@ -645,6 +654,12 @@ impl VorbisEncoder {
             })
             .collect();
         let mut passes = 0;
+        let steady = plan.is_long && plan.prev_long && plan.next_long;
+        let masking_offset = if !steady && self.config.bitrate_bps >= 128_000 {
+            0.0
+        } else {
+            MASKING_OFFSET_DB
+        };
         let (floor_values, quantised) = loop {
             let mut curves: Vec<Vec<f32>> = vec![Vec::new(); channels];
             let mut floor_values: Vec<Vec<i32>> = vec![Vec::new(); channels];
@@ -657,7 +672,14 @@ impl VorbisEncoder {
                     }
                 }
                 let (y, step2) = fit_floor(
-                    &bc.floor, &bc.ath, &bc.bark, headroom, bc.range, bc.co_mask, &peaks,
+                    &bc.floor,
+                    &bc.ath,
+                    &bc.bark,
+                    headroom,
+                    bc.range,
+                    bc.co_mask,
+                    masking_offset,
+                    &peaks,
                 );
                 let mut curve = vec![0.0f32; half];
                 render_floor1(&bc.floor, &y, &step2, &mut curve);
@@ -676,37 +698,75 @@ impl VorbisEncoder {
                 fit(&[channel]);
             }
 
-            // Normalise, couple, quantise.
+            // Normalise, couple, quantise. The floor is the masking threshold:
+            // bins that do not clear it are inaudible here and code as zero;
+            // bins that do clear it keep their full rounded residue, producing
+            // sparse small classes and larger tonal residues.
             let mut quantised: Vec<Vec<i32>> = (0..channels)
                 .map(|channel| {
                     spectra[channel]
                         .iter()
                         .zip(curves[channel].iter())
-                        .map(|(&value, &floor)| match floor > 0.0 {
-                            true => value / floor,
-                            false => 0.0,
+                        .map(|(&value, &floor)| {
+                            if floor <= 0.0 || value.abs() <= floor {
+                                0
+                            } else {
+                                (value / floor).round() as i32
+                            }
                         })
-                        .map(|normalised| normalised.round() as i32)
                         .collect::<Vec<i32>>()
                 })
                 .collect();
+            for channel in 0..channels {
+                for (band, values) in quantised[channel].chunks_mut(partition).enumerate() {
+                    if values.iter().any(|&value| value != 0) {
+                        continue;
+                    }
+                    let start = band * partition;
+                    let end = (start + values.len()).min(half);
+                    let mut peak = (NOISE_NORMALISE_MIN_RATIO, 0usize, 0i32);
+                    for bin in start..end {
+                        let floor = curves[channel][bin];
+                        if floor <= 0.0 {
+                            continue;
+                        }
+                        let value = spectra[channel][bin];
+                        let ratio = value.abs() / floor;
+                        if ratio > peak.0 {
+                            peak = (ratio, bin - start, value.signum() as i32);
+                        }
+                    }
+                    if peak.2 != 0 {
+                        values[peak.1] = peak.2;
+                    }
+                }
+            }
             for &(magnitude, angle) in &self.coupling {
                 let mut left = std::mem::take(&mut quantised[magnitude]);
                 let mut right = std::mem::take(&mut quantised[angle]);
-                // Only while bits are scarce: headroom at the range is the
-                // rate loop saying the step cannot get finer, so the budget
-                // is better spent stating the angle than left unspent.
+                let cutoff = if self.config.bitrate_bps >= 128_000 {
+                    6_000.0
+                } else {
+                    POINT_STEREO_HZ
+                };
                 let point = match self.headroom < bc.range {
-                    true => {
-                        (POINT_STEREO_HZ / (f64::from(self.config.sample_rate) * 0.5) * half as f64)
-                            as usize
-                    }
+                    true => (cutoff / (f64::from(self.config.sample_rate) * 0.5) * half as f64)
+                        as usize,
                     false => half,
                 };
                 for (bin, (l, r)) in left.iter_mut().zip(right.iter_mut()).enumerate() {
                     let (m, a) = couple(*l, *r);
                     *l = m;
-                    *r = if bin >= point { 0 } else { a };
+                    *r = if bin < point {
+                        a
+                    } else {
+                        let delta = (spectra[magnitude][bin] - spectra[angle][bin]).abs();
+                        if delta > curves[magnitude][bin].max(curves[angle][bin]) {
+                            a.signum()
+                        } else {
+                            0
+                        }
+                    };
                 }
                 quantised[magnitude] = left;
                 quantised[angle] = right;
@@ -829,6 +889,7 @@ fn fit_floor(
     headroom: f64,
     range: f64,
     co_mask: f64,
+    masking_offset: f64,
     peaks: &[f64],
 ) -> (Vec<i32>, Vec<bool>) {
     let db: Vec<f64> = peaks
@@ -865,7 +926,9 @@ fn fit_floor(
         .zip(ath.iter())
         .map(|(&level, &threshold)| {
             let threshold = threshold.max(loudest - co_mask);
-            (level - headroom.min(range)).max(threshold - (headroom - range).max(0.0))
+            let offset = (masking_offset - (headroom - range).max(0.0)).max(0.0);
+            (level - headroom.min(range) + offset)
+                .max(threshold - (headroom - range).max(0.0))
         })
         .collect();
     let y: Vec<i32> = target
