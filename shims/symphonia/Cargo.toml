@@ -16,6 +16,7 @@ symphonia-core = { path = "../symphonia-core", version = "0.6.0" }
 [dev-dependencies]
 symphonia-codec-aac = { path = "../symphonia-codec-aac", version = "0.6.0" }
 ec-vorbis = { path = "../../crates/ec-vorbis", version = "0.1.0" }
+rusty_vorbis = { path = "../rusty_vorbis", version = "0.1.1" }
 
 # The incumbent's feature names, every one of them a no-op: a caller selects
 # codecs and containers there, and here `ec_probe` serves all of them
