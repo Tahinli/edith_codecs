@@ -442,7 +442,7 @@ impl SbrChain {
                 qmfdump_energies("post_patch", tables.kx as usize, &hf);
             }
             let (env_energy, noise_energy) =
-                sbr_env::dequantize_frame(&header, &data.channels, ch, coupling);
+                sbr_env::dequantize_frame(&data.channels, ch, coupling);
             // sbr_env::adjust works in QMF-slot units; the parsed borders
             // are in the coarser envelope-time-slot units (see RATE above).
             let scaled = SbrChannel {
@@ -470,8 +470,8 @@ impl SbrChain {
                     v
                 })
                 .collect();
-            for m in 0..m_max {
-                state.hf_tail[m] = hf[m][num_slots.saturating_sub(HF_ADJ)..].to_vec();
+            for (m, band) in hf.iter().enumerate().take(m_max) {
+                state.hf_tail[m] = band[num_slots.saturating_sub(HF_ADJ)..].to_vec();
             }
             sbr_env::adjust(
                 &mut xh,
@@ -490,12 +490,12 @@ impl SbrChain {
             let i_temp = state.y_carry.first().map(Vec::len).unwrap_or(0).min(num_slots);
             let t_end = (scaled.t_env.last().copied().unwrap_or(0).max(0) as usize).min(xh[0].len());
             let mut hf: Vec<Vec<Complex<f64>>> = vec![vec![Complex::ZERO; num_slots]; m_max];
-            for m in 0..m_max {
-                for i in 0..i_temp {
-                    hf[m][i] = state.y_carry[m][i];
+            for (m, band) in hf.iter_mut().enumerate().take(m_max) {
+                for (i, slot) in band.iter_mut().enumerate().take(i_temp) {
+                    *slot = state.y_carry[m][i];
                 }
-                for i in i_temp..num_slots {
-                    hf[m][i] = xh[m][i];
+                for (i, slot) in band.iter_mut().enumerate().take(num_slots).skip(i_temp) {
+                    *slot = xh[m][i];
                 }
             }
             state.y_carry = (0..m_max)
