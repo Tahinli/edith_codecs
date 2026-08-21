@@ -36,6 +36,8 @@ use ec_h264_syntax::{SliceType, Sps};
 use crate::decoder::deblock_picture;
 use crate::dpb::{Picture, SliceParams as DeblockParams};
 use crate::entropy::{FLAG_INTER, FLAG_TRANS8X8};
+#[cfg(feature = "rd-ablation")]
+use crate::entropy::FLAG_SKIP;
 use crate::transform::{LevelScale4x4, LevelScale8x8};
 
 use entropy::EncEntropy;
@@ -399,7 +401,16 @@ impl Encoder {
                 }
             }
         }
+        // H5 measurement hook: the chosen candidate's trial SSD is the
+        // pre-deblock SSD of the macroblock in this picture (round 4 verified
+        // trial bits and SSD against the final picture), so capturing the
+        // per-macroblock SSD right before and right after the filter is the
+        // exact pre/post comparison with no hooks inside the RD trials.
+        #[cfg(feature = "rd-ablation")]
+        let rd_pre = rd_trace_capture(master, &self.src);
         deblock_picture(master);
+        #[cfg(feature = "rd-ablation")]
+        rd_trace_write(master, &self.src, self.frames, rd_pre);
         master.extend_borders();
         master.complete = true;
         std::mem::swap(master, &mut self.reference);
@@ -608,6 +619,75 @@ fn apply_rd_ablation(cfg: &mut EncoderConfig) {
             .parse()
             .expect("EC_H264_RD_T8X8_MARGIN_BITS must be a number");
     }
+}
+
+/// Luma and chroma SSD of every macroblock against the source, before the
+/// deblocking filter — the distortion the RD decision actually paid.
+#[cfg(feature = "rd-ablation")]
+fn rd_trace_capture(pic: &Picture, src: &Source) -> Option<Vec<(i64, i64)>> {
+    if std::env::var_os("EC_H264_RD_TRACE").is_none() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(pic.mb_w * pic.mb_h);
+    for mb_y in 0..pic.mb_h {
+        for mb_x in 0..pic.mb_w {
+            out.push(rd_trace_ssd(pic, src, mb_x, mb_y));
+        }
+    }
+    Some(out)
+}
+
+/// One line per macroblock: `frame addr intra trans8 skip qp pre_luma
+/// pre_chroma post_luma post_chroma`, appended to `$EC_H264_RD_TRACE`.
+#[cfg(feature = "rd-ablation")]
+fn rd_trace_write(pic: &Picture, src: &Source, frame: u64, pre: Option<Vec<(i64, i64)>>) {
+    use std::io::Write;
+    let Some(pre) = pre else { return };
+    let mut out = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+ .open(std::env::var_os("EC_H264_RD_TRACE").expect("checked in capture"))
+        .expect("open EC_H264_RD_TRACE");
+    for (addr, &(pre_luma, pre_chroma)) in pre.iter().enumerate() {
+        let (post_luma, post_chroma) = rd_trace_ssd(pic, src, addr % pic.mb_w, addr / pic.mb_w);
+        let f = pic.mb_flags[addr];
+        let _ = writeln!(
+            out,
+            "{frame} {addr} {} {} {} {} {pre_luma} {pre_chroma} {post_luma} {post_chroma}",
+            u8::from(f & FLAG_INTER == 0),
+            u8::from(f & FLAG_TRANS8X8 != 0),
+            u8::from(f & FLAG_SKIP != 0),
+            pic.mb_qp[addr]
+        );
+    }
+}
+
+/// Luma and chroma SSD of one macroblock against the source planes.
+#[cfg(feature = "rd-ablation")]
+fn rd_trace_ssd(pic: &Picture, src: &Source, mb_x: usize, mb_y: usize) -> (i64, i64) {
+    let mut luma = 0i64;
+    let stride = pic.y.stride;
+    let origin = pic.y.at(mb_x * 16, mb_y * 16);
+    for row in 0..16 {
+        let s = (mb_y * 16 + row) * src.stride + mb_x * 16;
+        for x in 0..16 {
+            let d = i64::from(src.y[s + x]) - i64::from(pic.y.data[origin + row * stride + x]);
+            luma += d * d;
+        }
+    }
+    let mut chroma = 0i64;
+    for (plane, source) in [(&pic.cb, &src.u), (&pic.cr, &src.v)] {
+        let stride = plane.stride;
+        let origin = plane.at(mb_x * 8, mb_y * 8);
+        for row in 0..8 {
+            let s = (mb_y * 8 + row) * src.c_stride + mb_x * 8;
+            for x in 0..8 {
+                let d = i64::from(source[s + x]) - i64::from(plane.data[origin + row * stride + x]);
+                chroma += d * d;
+            }
+        }
+    }
+    (luma, chroma)
 }
 
 #[cfg(feature = "rd-ablation")]
