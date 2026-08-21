@@ -972,9 +972,9 @@ fn opus_head(channels: usize, pre_skip: u16, layout: Option<(usize, usize, &[u8]
     ec_opus::ogg::opus_head(channels as u8, pre_skip, 48000, 0, mapping)
 }
 
-/// Muxes 20 ms packets into an Ogg-Opus file whose final granule trims the
-/// stream to exactly `total_samples` — RFC 7845 end-trimming plus the
-/// pre-skip accounting.
+/// Muxes packets into an Ogg-Opus file whose final granule trims the stream
+/// to exactly `total_samples` — RFC 7845 end-trimming plus the pre-skip
+/// accounting.
 fn write_ogg_opus(
     path: &Path,
     packets: &[Vec<u8>],
@@ -996,16 +996,17 @@ fn write_ogg_opus(
     let mut pts = 0i64;
     for (idx, p) in packets.iter().enumerate() {
         let last = idx == packets.len() - 1;
+        let packet_dur = ec_opus::Packet::parse(p, false).unwrap().samples_48k() as i64;
         let dur = if last {
             total_samples as i64 + pre_skip - pts
         } else {
-            960
+            packet_dur
         };
         let pkt = CorePacket::new(0, tb, p.clone())
             .with_pts(pts)
             .with_duration(dur);
         mux.write_packet(&pkt).unwrap();
-        pts += 960;
+        pts += packet_dur;
     }
     mux.finish().unwrap();
 }
@@ -1735,6 +1736,65 @@ fn silk_mediumband_and_10ms_roundtrip() {
         if let Some(oracle) = oracle_decode(&format!("silk-{tag}"), &packets, pcm.len()) {
             let (c, _) = aligned_corr(&oracle, &decoded, 2000);
             assert!(c >= 0.99, "{tag}: our decode vs oracle decode corr {c:.4}");
+        }
+    }
+}
+
+#[test]
+fn silk_multiframe_packets_roundtrip() {
+    let full = speech_like();
+    let pcm = &full[..46_080];
+    for (tag, enc, frame_ms, config, cutoff, bps) in [
+        (
+            "NB40",
+            SilkEncoder::new(false),
+            40usize,
+            2u8,
+            3500.0,
+            16_000u32,
+        ),
+        ("MB40", SilkEncoder::new_mediumband(), 40, 6, 5500.0, 20_000),
+        ("WB40", SilkEncoder::new(true), 40, 10, 7000.0, 24_000),
+        ("WB60", SilkEncoder::new(true), 60, 11, 7000.0, 24_000),
+    ] {
+        let (decoded, packets, voiced) = silk_roundtrip_ms(enc, pcm, frame_ms, Some(bps));
+        let toc = ec_opus::Toc::new(packets[0][0]);
+        assert_eq!(toc.config, config, "{tag}: wrong TOC config");
+        assert_eq!(toc.code, 0, "{tag}: multiframe SILK uses one Opus frame");
+        let reference = lowpass(pcm, cutoff);
+        let (corr, lag) = aligned_corr(&reference, &decoded, 2500);
+        let bytes: usize = packets.iter().map(Vec::len).sum();
+        let kbps = bytes as f64 * 8.0 / (packets.len() as f64 * frame_ms as f64);
+        eprintln!(
+            "silk {tag}: corr {corr:.4} at lag {lag}, voiced {voiced}/{} frames, {kbps:.2} kbps",
+            packets.len()
+        );
+        assert!(corr >= 0.70, "{tag}: corr {corr:.4}");
+        assert!(voiced > 0, "{tag}: no frame coded with LTP");
+        if let Some(oracle) = oracle_decode(&format!("silk-{tag}"), &packets, pcm.len()) {
+            let (c, _) = aligned_corr(&oracle, &decoded, 2500);
+            assert!(
+                c >= 0.99,
+                "{tag}: internal decode vs external decode corr {c:.4}"
+            );
+        }
+        if Command::new("gst-launch-1.0")
+            .arg("--version")
+            .output()
+            .is_ok()
+        {
+            let path = temp_path(&format!("silk-{tag}-gst.opus"));
+            write_ogg_opus(&path, &packets, opus_head(1, 120, None), 1, pcm.len(), 120);
+            let location = format!("location={}", path.display());
+            let out = Command::new("gst-launch-1.0")
+                .args([
+                    "-q", "filesrc", &location, "!", "oggdemux", "!", "opusdec", "!", "fakesink",
+                ])
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "{tag}: gst decode: {stderr}");
+            let _ = fs::remove_file(&path);
         }
     }
 }

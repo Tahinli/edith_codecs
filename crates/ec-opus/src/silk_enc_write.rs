@@ -12,8 +12,7 @@
 //! output error is fed back through short-term (bandwidth-expanded LPC),
 //! harmonic and tilt shaping filters so the noise hides under the signal's
 //! own spectrum, and a gain-offset rate loop sizes each packet against
-//! [`SilkEncoder::set_bitrate`]. 40/60 ms packets and stereo are not
-//! written yet.
+//! [`SilkEncoder::set_bitrate`]. Stereo is not written yet.
 
 // Same idiom as silk.rs: index loops mirror the decoder's position arithmetic.
 #![allow(clippy::needless_range_loop)]
@@ -27,7 +26,7 @@ use crate::silk::{
     nlsf2a, silk_rand,
 };
 use crate::silk_enc::{
-    Resampler48, Vad, estimate_pitch, lpc_analyze, quantize_gains, quantize_nlsf,
+    NlsfQuant, Resampler48, Vad, estimate_pitch, lpc_analyze, quantize_gains, quantize_nlsf,
 };
 
 const SHELL_LEN: usize = 16;
@@ -140,26 +139,65 @@ impl SilkEncoder {
         self.encode_frame_ms(pcm48, out, 20)
     }
 
-    /// Encodes 10 or 20 ms of mono 48 kHz samples as one code-0 packet in
-    /// `out`, returning its length.
+    /// Encodes 10, 20, 40 or 60 ms of mono 48 kHz samples as one code-0
+    /// packet in `out`, returning its length.
     pub fn encode_frame_ms(
         &mut self,
         pcm48: &[f32],
         out: &mut [u8],
         frame_ms: usize,
     ) -> Result<usize> {
-        let Trial { bytes, range, .. } = self.encode_inner(pcm48, frame_ms, None)?;
-        let len = bytes.len();
-        self.final_range = range;
-        let duration = match frame_ms {
-            10 => 0u8,
-            20 => 1,
+        let frames_per_packet = match frame_ms {
+            10 | 20 => 1usize,
+            40 => 2,
+            60 => 3,
             _ => {
                 return Err(ec_core::Error::unsupported(
                     format!("silk encode frame of {frame_ms} ms"),
-                    "SILK encoder writes 10 or 20 ms packets",
+                    "SILK encoder writes 10, 20, 40 or 60 ms packets",
                 ));
             }
+        };
+        assert_eq!(
+            pcm48.len(),
+            48 * frame_ms,
+            "SilkEncoder input is 48 kHz mono"
+        );
+        let mut frames = Vec::with_capacity(frames_per_packet);
+        let sub_ms = if frame_ms == 10 { 10 } else { 20 };
+        let mut prev_signal_type = 0;
+        for i in 0..frames_per_packet {
+            let from = i * sub_ms * 48;
+            let to = from + sub_ms * 48;
+            let conditional = i > 0;
+            let trial = self.encode_inner(
+                &pcm48[from..to],
+                sub_ms,
+                None,
+                conditional,
+                prev_signal_type,
+            )?;
+            prev_signal_type = trial.signal_type;
+            frames.push(trial);
+        }
+        self.range.reset(1275);
+        let refs: Vec<&Trial> = frames.iter().collect();
+        write_packet_header(&mut self.range, &refs);
+        prev_signal_type = 0;
+        for (i, frame) in frames.iter().enumerate() {
+            write_frame_data(&mut self.range, frame, i > 0, prev_signal_type);
+            prev_signal_type = frame.signal_type;
+        }
+        self.range.done();
+        debug_assert!(!self.range.error());
+        let len = self.range.range_bytes();
+        self.final_range = self.range.range();
+        let duration = match frame_ms {
+            10 => 0u8,
+            20 => 1,
+            40 => 2,
+            60 => 3,
+            _ => unreachable!(),
         };
         let base = match self.fs_khz {
             8 => 0u8,
@@ -175,7 +213,7 @@ impl SilkEncoder {
             )));
         }
         out[0] = toc;
-        out[1..1 + len].copy_from_slice(&bytes);
+        out[1..1 + len].copy_from_slice(&self.range.data()[..len]);
         self.replay_ms(&out[1..1 + len], frame_ms)?;
         debug_assert_eq!(self.mirror_range, self.final_range);
         Ok(1 + len)
@@ -187,7 +225,8 @@ impl SilkEncoder {
     /// must [`SilkEncoder::replay`] the finished payload so this encoder's
     /// decoder mirror advances.
     pub fn encode_hybrid(&mut self, pcm48: &[f32], enc: &mut RangeEncoder) -> Result<()> {
-        self.encode_inner(pcm48, 20, Some(enc)).map(|_| ())
+        self.encode_inner(pcm48, 20, Some(enc), false, 0)
+            .map(|_| ())
     }
 
     /// Decodes `payload` (TOC stripped) through the mirror decoder so the next
@@ -201,14 +240,27 @@ impl SilkEncoder {
     fn replay_ms(&mut self, payload: &[u8], frame_ms: usize) -> Result<()> {
         let fs = self.fs_khz;
         let mut dec = RangeDecoder::new(payload);
-        self.mirror.decode(
-            &mut dec,
-            &mut self.mirror_out,
-            frame_ms,
-            fs as u32 * 1000,
-            1,
-            true,
-        )?;
+        let total = frame_ms * fs;
+        if self.mirror_out.len() < total {
+            self.mirror_out.resize(total, 0);
+        }
+        let mut done = 0usize;
+        let mut first = true;
+        while done < total {
+            let n = self.mirror.decode(
+                &mut dec,
+                &mut self.mirror_out[done..],
+                frame_ms,
+                fs as u32 * 1000,
+                1,
+                first,
+            )?;
+            if n == 0 {
+                break;
+            }
+            done += n;
+            first = false;
+        }
         self.mirror_range = dec.range();
         Ok(())
     }
@@ -222,6 +274,8 @@ impl SilkEncoder {
         pcm48: &[f32],
         frame_ms: usize,
         shared: Option<&mut RangeEncoder>,
+        conditional: bool,
+        prev_signal_type: i32,
     ) -> Result<Trial> {
         assert!(
             matches!(frame_ms, 10 | 20),
@@ -516,85 +570,7 @@ impl SilkEncoder {
             }
         };
 
-        // Bitstream writer, in decode()'s order; shared by the sizing trials
-        // and the hybrid path's shared coder.
-        let write = |enc: &mut RangeEncoder, gain_idx: &[i8], per_index: usize, run: &Run| {
-            enc.enc_bit_logp(vad_flag, 1); // VAD flag
-            enc.enc_bit_logp(false, 1); // LBRR flag
-            // Frame type.
-            if vad_flag {
-                enc.enc_icdf(
-                    ((signal_type << 1) | quant_offset_type as i32) as usize - 2,
-                    &TYPE_OFFSET_VAD_ICDF,
-                    8,
-                );
-            } else {
-                enc.enc_icdf(quant_offset_type, &TYPE_OFFSET_NO_VAD_ICDF, 8);
-            }
-            // Gains: one frame per packet, so always independently coded.
-            enc.enc_icdf(
-                (gain_idx[0] as usize) >> 3,
-                &GAIN_ICDF[signal_type as usize],
-                8,
-            );
-            enc.enc_icdf((gain_idx[0] as usize) & 7, &UNIFORM8_ICDF, 8);
-            for k in 1..nb_subfr {
-                enc.enc_icdf(gain_idx[k] as usize, &DELTA_GAIN_ICDF, 8);
-            }
-            // NLSFs.
-            let cb = nlsf_cb(wb);
-            let stage1_icdf = &cb.cb1_icdf[(signal_type as usize >> 1) * cb.n_vectors..];
-            enc.enc_icdf(nq.indices[0] as usize, stage1_icdf, 8);
-            let (ec_ix, _) = crate::silk::nlsf_unpack(cb, nq.indices[0] as usize);
-            for i in 0..order {
-                let q = nq.indices[i + 1] as i32;
-                let icdf = &cb.ec_icdf[ec_ix[i] as usize..];
-                if q <= -4 {
-                    enc.enc_icdf(0, icdf, 8);
-                    enc.enc_icdf((-4 - q) as usize, &NLSF_EXT_ICDF, 8);
-                } else if q >= 4 {
-                    enc.enc_icdf(8, icdf, 8);
-                    enc.enc_icdf((q - 4) as usize, &NLSF_EXT_ICDF, 8);
-                } else {
-                    enc.enc_icdf((q + 4) as usize, icdf, 8);
-                }
-            }
-            if nb_subfr == MAX_NB_SUBFR {
-                enc.enc_icdf(nq.interp_index as usize, &NLSF_INTERPOLATION_FACTOR_ICDF, 8);
-            }
-            // Pitch + LTP. (One frame per packet: the decoder only takes the
-            // lag-delta code path for the 2nd+ frame of a packet, so the
-            // absolute lag is always coded here.)
-            if voiced {
-                let half = fs as i32 >> 1;
-                enc.enc_icdf((lag_index / half) as usize, &PITCH_LAG_ICDF, 8);
-                let low_icdf: &[u8] = match fs {
-                    16 => &UNIFORM8_ICDF,
-                    12 => &UNIFORM6_ICDF,
-                    _ => &UNIFORM4_ICDF,
-                };
-                enc.enc_icdf((lag_index % half) as usize, low_icdf, 8);
-                let contour_icdf: &[u8] = match (fs, nb_subfr) {
-                    (8, 4) => &PITCH_CONTOUR_NB_ICDF,
-                    (8, _) => &PITCH_CONTOUR_10_MS_NB_ICDF,
-                    (_, 4) => &PITCH_CONTOUR_ICDF,
-                    _ => &PITCH_CONTOUR_10_MS_ICDF,
-                };
-                enc.enc_icdf(contour_index as usize, contour_icdf, 8);
-                enc.enc_icdf(per_index, &LTP_PER_INDEX_ICDF, 8);
-                let gain_icdf: &[u8] = match per_index {
-                    0 => &LTP_GAIN_ICDF_0,
-                    1 => &LTP_GAIN_ICDF_1,
-                    _ => &LTP_GAIN_ICDF_2,
-                };
-                for k in 0..nb_subfr {
-                    enc.enc_icdf(run.ltp_index[k], gain_icdf, 8);
-                }
-                enc.enc_icdf(ltp_scale_index, &LTPSCALE_ICDF, 8);
-            }
-            enc.enc_icdf(seed_index as usize, &UNIFORM4_ICDF, 8);
-            encode_pulses(enc, &run.pulses, signal_type, quant_offset_type as i32);
-        };
+        let fs = self.fs_khz;
         // One full trial at a common gain offset (in quantiser steps): returns
         // the coded packet body so the rate loop can read its exact size.
         let candidates: Vec<usize> = if voiced { vec![0, 1, 2] } else { vec![0] };
@@ -605,28 +581,45 @@ impl SilkEncoder {
                 *v = ((*v as f64 * scale as f64).round() as i64).clamp(1, i32::MAX as i64) as i32;
             }
             let mut prev_gain_index = self.prev_gain_index;
-            let (gain_idx, gains_q16) = quantize_gains(&t, &mut prev_gain_index, false, nb_subfr);
+            let (gain_idx, gains_q16) =
+                quantize_gains(&t, &mut prev_gain_index, conditional, nb_subfr);
             let (per_index, run) = candidates
                 .iter()
                 .map(|&per| (per, run(per, &gains_q16)))
                 .min_by(|a, b| a.1.err.partial_cmp(&b.1.err).unwrap())
                 .unwrap();
 
-            // --- Bitstream, in decode()'s order. ---
-            let enc = &mut self.range;
-            enc.reset(1275);
-            write(enc, &gain_idx, per_index, &run);
-            enc.done();
-            debug_assert!(!enc.error());
-            let len = enc.range_bytes();
-            Trial {
-                bytes: enc.data()[..len].to_vec(),
-                range: enc.range(),
+            let mut trial = Trial {
+                bytes: Vec::new(),
+                range: 0,
                 prev_gain_index,
                 gain_idx,
                 per_index,
                 run,
-            }
+                vad_flag,
+                signal_type,
+                quant_offset_type,
+                wb,
+                order,
+                nb_subfr,
+                fs,
+                lag_index,
+                contour_index,
+                voiced,
+                ltp_scale_index,
+                nq: nq.clone(),
+                seed_index,
+            };
+            let enc = &mut self.range;
+            enc.reset(1275);
+            write_packet_header(enc, &[&trial]);
+            write_frame_data(enc, &trial, conditional, prev_signal_type);
+            enc.done();
+            debug_assert!(!enc.error());
+            let len = enc.range_bytes();
+            trial.bytes = enc.data()[..len].to_vec();
+            trial.range = enc.range();
+            trial
         };
 
         // Rate control: a common gain offset moves every subframe's pulse
@@ -664,7 +657,9 @@ impl SilkEncoder {
             );
         }
         if let Some(enc) = shared {
-            write(enc, &best.gain_idx, best.per_index, &best.run);
+            let trial_ref = &best;
+            write_packet_header(enc, &[trial_ref]);
+            write_frame_data(enc, trial_ref, conditional, prev_signal_type);
         }
         self.prev_gain_index = best.prev_gain_index;
         self.voiced_frames += usize::from(voiced);
@@ -685,7 +680,6 @@ struct Run {
     gq: Vec<f32>,
 }
 
-/// One coded candidate of a frame at a given gain offset.
 struct Trial {
     bytes: Vec<u8>,
     range: u32,
@@ -693,6 +687,119 @@ struct Trial {
     gain_idx: [i8; MAX_NB_SUBFR],
     per_index: usize,
     run: Run,
+    vad_flag: bool,
+    signal_type: i32,
+    quant_offset_type: usize,
+    wb: bool,
+    order: usize,
+    nb_subfr: usize,
+    fs: usize,
+    lag_index: i32,
+    contour_index: i32,
+    voiced: bool,
+    ltp_scale_index: usize,
+    nq: NlsfQuant,
+    seed_index: i32,
+}
+
+fn write_packet_header(enc: &mut RangeEncoder, frames: &[&Trial]) {
+    for frame in frames {
+        enc.enc_bit_logp(frame.vad_flag, 1);
+    }
+    enc.enc_bit_logp(false, 1);
+}
+
+fn write_frame_data(
+    enc: &mut RangeEncoder,
+    frame: &Trial,
+    conditional: bool,
+    prev_signal_type: i32,
+) {
+    if frame.vad_flag {
+        enc.enc_icdf(
+            ((frame.signal_type << 1) | frame.quant_offset_type as i32) as usize - 2,
+            &TYPE_OFFSET_VAD_ICDF,
+            8,
+        );
+    } else {
+        enc.enc_icdf(frame.quant_offset_type, &TYPE_OFFSET_NO_VAD_ICDF, 8);
+    }
+    if conditional {
+        enc.enc_icdf(frame.gain_idx[0] as usize, &DELTA_GAIN_ICDF, 8);
+    } else {
+        enc.enc_icdf(
+            (frame.gain_idx[0] as usize) >> 3,
+            &GAIN_ICDF[frame.signal_type as usize],
+            8,
+        );
+        enc.enc_icdf((frame.gain_idx[0] as usize) & 7, &UNIFORM8_ICDF, 8);
+    }
+    for k in 1..frame.nb_subfr {
+        enc.enc_icdf(frame.gain_idx[k] as usize, &DELTA_GAIN_ICDF, 8);
+    }
+    let cb = nlsf_cb(frame.wb);
+    let stage1_icdf = &cb.cb1_icdf[(frame.signal_type as usize >> 1) * cb.n_vectors..];
+    enc.enc_icdf(frame.nq.indices[0] as usize, stage1_icdf, 8);
+    let (ec_ix, _) = crate::silk::nlsf_unpack(cb, frame.nq.indices[0] as usize);
+    for i in 0..frame.order {
+        let q = frame.nq.indices[i + 1] as i32;
+        let icdf = &cb.ec_icdf[ec_ix[i] as usize..];
+        if q <= -4 {
+            enc.enc_icdf(0, icdf, 8);
+            enc.enc_icdf((-4 - q) as usize, &NLSF_EXT_ICDF, 8);
+        } else if q >= 4 {
+            enc.enc_icdf(8, icdf, 8);
+            enc.enc_icdf((q - 4) as usize, &NLSF_EXT_ICDF, 8);
+        } else {
+            enc.enc_icdf((q + 4) as usize, icdf, 8);
+        }
+    }
+    if frame.nb_subfr == MAX_NB_SUBFR {
+        enc.enc_icdf(
+            frame.nq.interp_index as usize,
+            &NLSF_INTERPOLATION_FACTOR_ICDF,
+            8,
+        );
+    }
+    if frame.voiced {
+        if conditional && prev_signal_type == 2 {
+            enc.enc_icdf(0, &PITCH_DELTA_ICDF, 8);
+        }
+        let half = frame.fs as i32 >> 1;
+        enc.enc_icdf((frame.lag_index / half) as usize, &PITCH_LAG_ICDF, 8);
+        let low_icdf: &[u8] = match frame.fs {
+            16 => &UNIFORM8_ICDF,
+            12 => &UNIFORM6_ICDF,
+            _ => &UNIFORM4_ICDF,
+        };
+        enc.enc_icdf((frame.lag_index % half) as usize, low_icdf, 8);
+        let contour_icdf: &[u8] = match (frame.fs, frame.nb_subfr) {
+            (8, 4) => &PITCH_CONTOUR_NB_ICDF,
+            (8, _) => &PITCH_CONTOUR_10_MS_NB_ICDF,
+            (_, 4) => &PITCH_CONTOUR_ICDF,
+            _ => &PITCH_CONTOUR_10_MS_ICDF,
+        };
+        enc.enc_icdf(frame.contour_index as usize, contour_icdf, 8);
+        enc.enc_icdf(frame.per_index, &LTP_PER_INDEX_ICDF, 8);
+        let gain_icdf: &[u8] = match frame.per_index {
+            0 => &LTP_GAIN_ICDF_0,
+            1 => &LTP_GAIN_ICDF_1,
+            _ => &LTP_GAIN_ICDF_2,
+        };
+        for k in 0..frame.nb_subfr {
+            enc.enc_icdf(frame.run.ltp_index[k], gain_icdf, 8);
+        }
+        if !conditional {
+            enc.enc_icdf(frame.ltp_scale_index, &LTPSCALE_ICDF, 8);
+        }
+    }
+    enc.enc_icdf(frame.seed_index as usize, &UNIFORM4_ICDF, 8);
+    encode_pulses(
+        enc,
+        &frame.run.pulses,
+        frame.signal_type,
+        frame.quant_offset_type as i32,
+    );
 }
 
 /// Bits an ICDF symbol costs, for choosing among equivalent codings.
