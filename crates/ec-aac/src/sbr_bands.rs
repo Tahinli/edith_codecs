@@ -180,6 +180,10 @@ pub struct BandTables {
     pub f_noise: Vec<i64>,
     pub kx: i64,
     pub k2: i64,
+    /// Master table borders (`k0 = f_master[0]`), needed by the patch builder.
+    pub f_master: Vec<i64>,
+    /// SBR (output) sample rate, the patch builder's `goalSb` input.
+    pub rate: u32,
 }
 
 /// `rate` is the SBR rate: twice the AAC-LC core's.
@@ -236,6 +240,8 @@ pub fn freq_tables(
         f_noise,
         kx,
         k2,
+        f_master: master.clone(),
+        rate,
     })
 }
 
