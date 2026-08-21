@@ -134,7 +134,7 @@ pub fn lacing(len: usize) -> impl Iterator<Item = u8> {
 /// carries them: two length prefixes in the 255-plus-remainder form, then the
 /// packets back to back, all behind a leading count of `2`.
 ///
-/// This is the shape ffmpeg calls "Xiph extradata" and the one Vorbis, Theora
+/// This is the shape the oracle calls "Xiph extradata" and the one Vorbis, Theora
 /// and Speex setup data travels in outside of Ogg. [`None`] when a header is
 /// too long to describe (the format has no escape beyond a 255 run) or when the
 /// packet count is not the two-prefixed-plus-one this layout can express.

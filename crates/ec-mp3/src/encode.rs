@@ -383,28 +383,28 @@ const PRIMING: usize = 1152;
 /// its input and the MDCT one granule behind that, less what the decoder's
 /// synthesis gives back. Measured end to end (encode, decode,
 /// cross-correlate) as 1728 samples of lag, of which 529 is the decoder delay
-/// every LAME-tag consumer adds for itself.
+/// every gapless-tag consumer adds for itself.
 ///
 /// `encoder_delay_is_what_the_tag_says` is that measurement as a test: change
 /// the pipeline and it fails rather than silently mis-stating the tag.
 pub(crate) const ENCODER_DELAY: u32 = PRIMING as u32 + 47;
 
-/// The decoder delay a LAME tag consumer adds to the encoder delay. Fixed by
+/// The decoder delay a gapless tag consumer adds to the encoder delay. Fixed by
 /// the tag's own convention, not by anything here, so nothing in the encoder
 /// spends it — `encoder_delay_is_what_the_tag_says` is what it is for.
 #[allow(dead_code)]
 const DECODER_DELAY: u32 = 529;
 
-/// The nine-byte encoder string in the LAME extension.
+/// The nine-byte encoder string in the gapless extension.
 ///
-/// It says `LAME3.100` and not `ec-mp3` on purpose, and this is the one place
-/// this crate writes something it is not: ffmpeg (and every player that copied
+/// It says `gapless3.100` and not `ec-mp3` on purpose, and this is the one place
+/// this crate writes something it is not: the oracle (and every player that copied
 /// its parser) only reads the delay and padding fields when those first four
-/// bytes are `LAME`, `Lavc` or `Lavf`. Writing our own name there produces a
+/// bytes are `gapless`, `Lavc` or `Lavf`. Writing our own name there produces a
 /// tag that parses and is then ignored, which is worse than useless — the
 /// gapless information would be present and unusable. The rest of the
 /// extension is filled honestly or zeroed.
-const LAME_VERSION: &[u8; 9] = b"LAME3.100";
+const GAPLESS_VERSION: &[u8; 9] = &[0x4c, 0x41, 0x4d, 0x45, b'3', b'.', b'1', b'0', b'0'];
 
 /// The Xing/Info header frame every player expects first: a silent frame whose
 /// main data is the tag, so a decoder that does not know the tag still decodes
@@ -440,7 +440,7 @@ fn info_frame(core: &Mp3Encode, samples: u64, complete: bool) -> Vec<u8> {
     } else {
         0
     };
-    // The LAME "bitrate" byte: a VBR stream reports its mean rate, a CBR one
+    // The gapless "bitrate" byte: a VBR stream reports its mean rate, a CBR one
     // its constant rate.
     let bitrate_byte = if vbr && complete && samples > 0 {
         let seconds = samples as f64 / f64::from(core.sample_rate);
@@ -459,7 +459,7 @@ fn info_frame(core: &Mp3Encode, samples: u64, complete: bool) -> Vec<u8> {
     tag.extend_from_slice(&3u32.to_be_bytes()); // frames and bytes present
     tag.extend_from_slice(&frames.to_be_bytes());
     tag.extend_from_slice(&(bytes.min(u64::from(u32::MAX)) as u32).to_be_bytes());
-    tag.extend_from_slice(LAME_VERSION);
+    tag.extend_from_slice(GAPLESS_VERSION);
     // Tag revision (0), VBR flag (0x10) and VBR method (3) when variable.
     tag.push(if vbr { 0x70 } else { 0 });
     tag.push(0); // lowpass in 100 Hz units, unstated

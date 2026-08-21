@@ -218,7 +218,7 @@ impl AudioDecoder {
     /// granule at all — pages tend to end well into the block run — so once
     /// any later packet is the first to reveal one, that granule is an
     /// interior page mark, not a front offset: subtracting it from what has
-    /// already been decoded would blame ordinary block-to-block lag on a
+    /// already been decoded would assign ordinary block-to-block lag to a
     /// pre-roll that was never there, and can trim away a whole packet's
     /// worth of real audio. Every later packet passes through untouched — an
     /// interior page's granule is not a per-page ceiling (see

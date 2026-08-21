@@ -4,7 +4,7 @@
 //! Three ways in, smallest first:
 //!
 //! - [`Mp3Reader`] over a byte stream: push bytes, take frames. It skips ID3v2
-//!   and the Xing/LAME/VBRI header frame, resyncs over junk, and keeps the bit
+//!   and the Xing/gapless/VBRI header frame, resyncs over junk, and keeps the bit
 //!   reservoir across frames.
 //! - [`Mp3Decoder`], the [`ec_core::Decoder`] contract, for a container that
 //!   hands out one Layer III frame per packet.
@@ -17,7 +17,7 @@
 //! 512-tap polyphase window are normative data no formula produces. Rather
 //! than copy them out of an existing implementation, `scripts/mp3-tables/`
 //! *measures* them: it writes legal frames whose main-data bits it chooses,
-//! decodes them with ffmpeg, and reads the answer back through a model of the
+//! decodes them with the oracle, and reads the answer back through a model of the
 //! decode chain. Every code tree is walked to a leaf, checked for a Kraft sum
 //! of exactly 1 and for complete, duplicate-free coverage of its value grid;
 //! the window is least-squares fitted to a residual of 1.6e-6. The measured

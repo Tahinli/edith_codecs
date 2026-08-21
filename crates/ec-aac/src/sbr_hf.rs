@@ -153,7 +153,7 @@ pub fn build_patches(tables: &BandTables) -> Vec<Patch> {
         }
         last_k = k;
         last_msb = msb;
-        let mut odd = 0i64;
+        let mut odd;
         let mut i = k;
         loop {
             sb = fm[i];

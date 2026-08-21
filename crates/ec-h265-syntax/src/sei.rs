@@ -47,7 +47,7 @@ fn sei_rbsp(messages: &[(u32, Vec<u8>)]) -> Vec<u8> {
 /// is nothing to say.
 ///
 /// Both messages are written whole or not at all: a `mastering_display_colour_volume`
-/// with a zero luminance pair is what ffmpeg writes when it knows nothing, and a
+/// with a zero luminance pair is what the oracle writes when it knows nothing, and a
 /// tone map that believes it maps the film to black.
 pub fn hdr_metadata_rbsp(light: ContentLight) -> Option<Vec<u8>> {
     let mut messages = Vec::new();

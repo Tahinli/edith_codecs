@@ -12,7 +12,7 @@
 //! Decoded samples keep their own bit depth in [`decode::Block`] and
 //! [`decode::DecodedStream`]; the PCM views ([`decode::DecodedStream::to_pcm_bytes`],
 //! [`FlacDecoder`]) shift them left into an `s16`/`s32` container the way
-//! ffmpeg and the family's mixer expect.
+//! the oracle and the family's mixer expect.
 //!
 //! Nothing here panics on malformed input: truncation is `NeedMore`, a broken
 //! stream is `Corrupt`, and both CRCs are checked on every frame.

@@ -40,7 +40,7 @@
 //! gain-adaptive quantizers) and spectral extension are decoded; enhanced
 //! coupling and dependent substreams above 5.1 are refused by name rather than
 //! decoded wrongly. On a real Dolby Digital Plus stream that uses both, the
-//! coded bins land within 0.01% of ffmpeg's energy and the whole channel within
+//! coded bins land within 0.01% of the oracle's energy and the whole channel within
 //! 0.999 correlation once the two decoders' independent noise is taken out of
 //! the comparison ([`Options::dither`]).
 //!

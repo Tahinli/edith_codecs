@@ -5,7 +5,7 @@
 //! conformant decoder produces. The forward path and the quantizer are the
 //! encoder's own choice; what makes them correct is that they invert the
 //! normative path — which is what [`tests::round_trip_recovers_flat_blocks`]
-//! and the ffmpeg conformance test in `tests/` check.
+//! and the the oracle conformance test in `tests/` check.
 //!
 //! One transcription safeguard is worth naming: only the first 16 columns of the
 //! 32x32 matrix are typed in. The rest follow from `M[m][31 - n] = (-1)^m M[m][n]`,
