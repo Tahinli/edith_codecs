@@ -729,20 +729,29 @@ impl VorbisEncoder {
             for &(magnitude, angle) in &self.coupling {
                 let mut left = std::mem::take(&mut quantised[magnitude]);
                 let mut right = std::mem::take(&mut quantised[angle]);
-                // Only while bits are scarce: headroom at the range is the
-                // rate loop saying the step cannot get finer, so the budget
-                // is better spent stating the angle than left unspent.
+                let cutoff = if self.config.bitrate_bps >= 128_000 {
+                    6_000.0
+                } else {
+                    POINT_STEREO_HZ
+                };
                 let point = match self.headroom < bc.range {
-                    true => {
-                        (POINT_STEREO_HZ / (f64::from(self.config.sample_rate) * 0.5) * half as f64)
-                            as usize
-                    }
+                    true => (cutoff / (f64::from(self.config.sample_rate) * 0.5) * half as f64)
+                        as usize,
                     false => half,
                 };
                 for (bin, (l, r)) in left.iter_mut().zip(right.iter_mut()).enumerate() {
                     let (m, a) = couple(*l, *r);
                     *l = m;
-                    *r = if bin >= point { 0 } else { a };
+                    *r = if bin < point {
+                        a
+                    } else {
+                        let delta = (spectra[magnitude][bin] - spectra[angle][bin]).abs();
+                        if delta > curves[magnitude][bin].max(curves[angle][bin]) {
+                            a.signum()
+                        } else {
+                            0
+                        }
+                    };
                 }
                 quantised[magnitude] = left;
                 quantised[angle] = right;
