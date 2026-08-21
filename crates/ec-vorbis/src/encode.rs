@@ -81,7 +81,7 @@ const CLASS_RANGE: [i32; CLASSES] = [0, 1, 2, 4, 8, 16, 32, 64, 127];
 const RESIDUE_BOOK_DIM: [usize; CLASSES] = [0, 4, 2, 2, 1, 1, 1, 1, 1];
 /// The vector books save packet bits but add setup and make the rate loop spend
 /// harder; this keeps the realised rate at the caller's target.
-const RATE_TARGET_SCALE: f64 = 0.99;
+const RATE_TARGET_SCALE: f64 = 0.96;
 /// Headroom in dB the widest residue book can actually state: 20 log10 127
 /// is 42, but a coupled angle channel is a difference of two magnitudes, so a
 /// pair's step must leave half that range — 63, 36 dB. Past this the rate loop's extra headroom lowers the absolute-threshold
@@ -102,6 +102,10 @@ const HEADROOM_RANGE_SHORT: f64 = 42.0;
 /// three tracks at 128 kbps: 50 dB kept the accuracy win without inflating the
 /// files.
 const CO_MASK_RANGE: f64 = 50.0;
+/// Extra dB above the spread threshold. This is the single long-block
+/// rate/quality knob: raising the curve zeroes masked coefficients earlier,
+/// while peaks still ride as residue above it.
+const MASKING_OFFSET_DB: f64 = 9.0;
 /// A short block gets no co-masking cap: a bin it drops is an error spread
 /// across its whole window, the half before an onset included, and that is
 /// the pre-echo the short block exists to prevent (44.1k mono, onset on the
@@ -676,17 +680,22 @@ impl VorbisEncoder {
                 fit(&[channel]);
             }
 
-            // Normalise, couple, quantise.
+            // Normalise, couple, quantise. The floor is the masking threshold:
+            // bins that do not clear it are inaudible here and code as zero;
+            // bins that do clear it keep their full rounded residue, producing
+            // sparse small classes and larger tonal residues.
             let mut quantised: Vec<Vec<i32>> = (0..channels)
                 .map(|channel| {
                     spectra[channel]
                         .iter()
                         .zip(curves[channel].iter())
-                        .map(|(&value, &floor)| match floor > 0.0 {
-                            true => value / floor,
-                            false => 0.0,
+                        .map(|(&value, &floor)| {
+                            if floor <= 0.0 || value.abs() <= floor {
+                                0
+                            } else {
+                                (value / floor).round() as i32
+                            }
                         })
-                        .map(|normalised| normalised.round() as i32)
                         .collect::<Vec<i32>>()
                 })
                 .collect();
@@ -865,7 +874,8 @@ fn fit_floor(
         .zip(ath.iter())
         .map(|(&level, &threshold)| {
             let threshold = threshold.max(loudest - co_mask);
-            (level - headroom.min(range)).max(threshold - (headroom - range).max(0.0))
+            (level - headroom.min(range) + MASKING_OFFSET_DB)
+                .max(threshold - (headroom - range).max(0.0))
         })
         .collect();
     let y: Vec<i32> = target
