@@ -6,6 +6,10 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+# Internal-only RD experiment switches, compiled only by the measurement harness.
+rd-ablation = []
+
 [dependencies]
 ec-core = { workspace = true }
 ec-h264-syntax = { workspace = true }

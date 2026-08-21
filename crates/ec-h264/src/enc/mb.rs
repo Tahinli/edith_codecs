@@ -16,18 +16,18 @@ use ec_h264_syntax::SliceType;
 use wide::i16x16;
 
 use crate::decoder::{
-    MbNeighbors, chroma_nz_pair, gather_nbr4, gather_nbr8, luma_nz_pair, mb_neighbors,
+    chroma_nz_pair, gather_nbr4, gather_nbr8, luma_nz_pair, mb_neighbors, MbNeighbors,
 };
-use crate::dpb::{BLK_SKIP, Picture};
+use crate::dpb::{Picture, BLK_SKIP};
 use crate::entropy::{
-    BlockCat, FLAG_CHROMA_PRED, FLAG_DECODED, FLAG_I16, FLAG_INTER, FLAG_SKIP, FLAG_TRANS8X8,
-    MbCtx, MbInfo,
+    BlockCat, MbCtx, MbInfo, FLAG_CHROMA_PRED, FLAG_DECODED, FLAG_I16, FLAG_INTER, FLAG_SKIP,
+    FLAG_TRANS8X8,
 };
-use crate::inter::{RefPlane, integer_origin, mc_chroma, mc_luma};
-use crate::mv::{MvCtx, neighbour_mvd, predict_mv, write_block, write_intra_mb, write_mvd};
+use crate::inter::{integer_origin, mc_chroma, mc_luma, RefPlane};
+use crate::mv::{neighbour_mvd, predict_mv, write_block, write_intra_mb, write_mvd, MvCtx};
 use crate::pred::{
-    PlaneWindow, add_residual_4x4, add_residual_8x8, filter_nbr8, pred_4x4, pred_8x8, pred_16x16,
-    pred_chroma_8x8,
+    add_residual_4x4, add_residual_8x8, filter_nbr8, pred_16x16, pred_4x4, pred_8x8,
+    pred_chroma_8x8, PlaneWindow,
 };
 use crate::tables::{BLK4_POS, CHROMA_QP};
 use crate::transform::{
@@ -81,10 +81,19 @@ pub(crate) struct MbEnc<'a> {
     /// Lagrangian multiplier; it is in the squared-error domain when 8x8
     /// transform decisions are enabled.
     pub lambda: f64,
+    /// Whether `lambda` is the standard squared-error multiplier.
+    pub lambda_standard: bool,
+    /// Extra rate saving an 8x8 trial must buy before it may replace 4x4.
+    pub t8x8_margin_bits: f64,
     pub preset: Preset,
     /// The PPS carries transform_8x8_mode_flag: transform_size_8x8_flag must
     /// be written for every eligible macroblock (7.3.5).
     pub transform_8x8: bool,
+    /// Whether intra macroblocks may select 8x8. The PPS can remain enabled
+    /// while an ablation measures the classes independently.
+    pub transform_8x8_intra: bool,
+    /// Whether inter macroblocks may select 8x8.
+    pub transform_8x8_inter: bool,
     pub ls: LevelScale4x4,
     pub ls8: LevelScale8x8,
     /// Neighbourhood of the macroblock being written (CABAC).
@@ -283,7 +292,7 @@ fn modes_allowed(have_top: bool, have_left: bool, have_tl: bool) -> [bool; 9] {
 
 #[inline]
 fn motion_rate(e: &MbEnc<'_>, bits: f64) -> i32 {
-    let lambda = if e.transform_8x8 {
+    let lambda = if e.lambda_standard {
         e.lambda.sqrt()
     } else {
         e.lambda
@@ -688,7 +697,14 @@ fn code_luma_4x4(
         // half of rate-distortion optimised quantisation, and the half that
         // pays. Intra blocks are left alone: their reconstruction is what the
         // next block in the macroblock predicts from.
-        if !intra && !worth_coding(&source, &resid, &lv.luma[blk], zero_block_lambda(e, qp)) {
+        if !intra
+            && !worth_coding(
+                &source,
+                &resid,
+                &lv.luma[blk],
+                zero_block_lambda(e, qp, e.transform_8x8_inter),
+            )
+        {
             lv.luma[blk] = [0; 16];
             lv.luma_nz[blk] = 0;
             continue;
@@ -708,8 +724,8 @@ fn code_luma_4x4(
 /// without costing camera content.
 const ZERO_BLOCK_LAMBDA: f64 = 0.4;
 
-fn zero_block_lambda(e: &MbEnc<'_>, qp: i32) -> f64 {
-    if e.transform_8x8 {
+fn zero_block_lambda(e: &MbEnc<'_>, qp: i32, transform_8x8: bool) -> f64 {
+    if transform_8x8 {
         e.lambda
     } else {
         ZERO_BLOCK_LAMBDA * lambda_ssd(qp)
@@ -871,7 +887,20 @@ fn code_chroma(
                 dequant_4x4(&mut raster, &e.ls, qp_c, true);
                 let mut resid = [0i32; 16];
                 inverse_transform_4x4(&raster, &mut resid);
-                if !worth_coding(&source, &resid, &ac[comp][blk], zero_block_lambda(e, qp_c)) {
+                if !worth_coding(
+                    &source,
+                    &resid,
+                    &ac[comp][blk],
+                    zero_block_lambda(
+                        e,
+                        qp_c,
+                        if intra {
+                            e.transform_8x8_intra
+                        } else {
+                            e.transform_8x8_inter
+                        },
+                    ),
+                ) {
                     ac[comp][blk] = [0; 16];
                     nz = 0;
                 }
@@ -1125,7 +1154,14 @@ fn code_block_8x8(
     dequant_8x8(&mut raster, &e.ls8, qp);
     let mut resid = [0i32; 64];
     inverse_transform_8x8(&raster, &mut resid);
-    if !intra && !worth_coding(&d, &resid, out, zero_block_lambda(e, qp)) {
+    if !intra
+        && !worth_coding(
+            &d,
+            &resid,
+            out,
+            zero_block_lambda(e, qp, e.transform_8x8_inter),
+        )
+    {
         *out = [0; 64];
         return 0;
     }
@@ -1264,7 +1300,6 @@ fn entropy_bits(w: &EncEntropy, write: impl FnOnce(&mut EncEntropy)) -> i64 {
     write(&mut probe);
     (probe.bit_len() - before) as i64
 }
-
 
 fn cost_luma_nz_pair(
     pic: &Picture,
@@ -1545,7 +1580,7 @@ fn encode_intra_mb(
     if cost.allow_i4 {
         let mut lv4 = chroma_lv.clone();
         let (m4, p4) = code_intra_4x4(pic, e, mb_x, mb_y, qp, &nbr, &mut lv4);
-        let cost4 = if e.transform_8x8 {
+        let cost4 = if e.transform_8x8_intra {
             let bits = intra_mb_bits(
                 pic,
                 e,
@@ -1573,7 +1608,7 @@ fn encode_intra_mb(
         // Intra_8x8 on the same terms, when the PPS allows it.
         let mut lv8 = chroma_lv.clone();
         let mut recon8 = [0u8; 256];
-        let cost8 = if e.transform_8x8 {
+        let cost8 = if e.transform_8x8_intra {
             let (m8, p8) = code_intra_8x8(pic, e, mb_x, mb_y, qp, &nbr, &mut lv8);
             modes8 = m8;
             pred_modes8 = p8;
@@ -1596,7 +1631,7 @@ fn encode_intra_mb(
 
         let mut lv16 = chroma_lv;
         code_i16_luma(pic, e, mb_x, mb_y, qp, cost.i16_mode, &nbr, &mut lv16);
-        let cost16 = if e.transform_8x8 {
+        let cost16 = if e.transform_8x8_intra {
             let bits = intra_mb_bits(
                 pic,
                 e,
@@ -1614,7 +1649,9 @@ fn encode_intra_mb(
                 + lambda_ssd(qp) * rough_intra_bits(&lv16, None) as f64
         };
 
-        if cost8 <= cost4 && cost8 <= cost16 {
+        if cost8 + e.lambda * e.t8x8_margin_bits <= cost4
+            && cost8 + e.lambda * e.t8x8_margin_bits <= cost16
+        {
             use_i4 = true;
             use_i8 = true;
             restore_luma(pic, mb_x, mb_y, &recon8);
@@ -1642,7 +1679,6 @@ fn encode_intra_mb(
         lv = chroma_lv;
         code_i16_luma(pic, e, mb_x, mb_y, qp, cost.i16_mode, &nbr, &mut lv);
     }
-
 
     // ---- syntax ----
     w.begin_mb(&e.mb_ctx);
@@ -1698,7 +1734,6 @@ fn encode_intra_mb(
             qp,
         },
     );
-
 }
 
 /// Squared error of the whole macroblock against the source, luma and chroma:
@@ -1928,7 +1963,7 @@ fn encode_inter_mb(
     let mut chroma_lv = Levels::default();
     code_chroma(pic, e, mb_x, mb_y, qp, false, &mut chroma_lv);
     let mut lv = chroma_lv.clone();
-    if e.transform_8x8 {
+    if e.transform_8x8_inter {
         // Both transform sizes on the same prediction; the cheaper
         // rate-distortion cost is coded.
         let mut pred = [0u8; 256];
@@ -1944,7 +1979,7 @@ fn encode_inter_mb(
         code_luma_8x8(pic, e, mb_x, mb_y, qp, &mut lv8);
         let bits8 = inter_mb_bits(pic, e, w, mb_addr, &nbr, shape, &mvd, &inc, &lv8);
         let cost8 = ssd_mb(pic, e, mb_x, mb_y) as f64 + e.lambda * bits8 as f64;
-        if cost8 < cost4 {
+        if cost8 + e.lambda * e.t8x8_margin_bits < cost4 {
             lv = lv8;
         } else {
             lv = lv4;
@@ -1958,7 +1993,7 @@ fn encode_inter_mb(
         None => false,
         Some(_) if empty => true,
         Some(ssd_skip) => {
-            let coded = if e.transform_8x8 {
+            let coded = if e.transform_8x8_inter {
                 let bits = inter_mb_bits(pic, e, w, mb_addr, &nbr, shape, &mvd, &inc, &lv);
                 ssd_mb(pic, e, mb_x, mb_y) as f64 + e.lambda * bits as f64
             } else {
@@ -2008,7 +2043,6 @@ fn encode_inter_mb(
         let base = (mb_y * 4 + dy) * w4 + mb_x * 4;
         pic.i4_modes[base..base + 4].fill(2);
     }
-
 
     // ---- syntax ----
     w.begin_mb(&e.mb_ctx);
