@@ -700,10 +700,10 @@ mod tests {
         assert_eq!(e.look_ahead(960), 60);
     }
 
-    /// `look_ahead` must use the same mono/10-or-20 ms-frame predicate
-    /// dispatch does (`silk_choice`/`hybrid_choice`), not just `wants_silk`:
-    /// 2.5/5 ms frames and stereo still code as CELT, while mono 10 ms
-    /// speech follows SILK.
+    /// `look_ahead` must use the same 10-or-20 ms-frame predicate dispatch
+    /// does (`silk_choice`/`hybrid_choice`), not just `wants_silk`: 2.5/5 ms
+    /// frames still code as CELT, while 10/20 ms speech follows SILK and
+    /// hybrid follows CELT's overlap.
     #[test]
     fn look_ahead_matches_the_frame_size_dispatch_actually_uses() {
         let mut e = Encoder::new(48000, 1, Application::Voip).unwrap();
@@ -720,6 +720,8 @@ mod tests {
 
         let mut e = Encoder::new(48000, 2, Application::Voip).unwrap();
         e.set_bitrate(8000);
-        assert_eq!(e.look_ahead(960), 120, "stereo never codes as SILK/Hybrid");
+        assert_eq!(e.look_ahead(960), 58, "stereo 20ms NB SILK");
+        e.set_bitrate(64_000);
+        assert_eq!(e.look_ahead(960), 120, "stereo 20ms hybrid");
     }
 }
