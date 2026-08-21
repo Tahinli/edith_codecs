@@ -1714,11 +1714,11 @@ fn silk_mono_nb_wb_roundtrip() {
 #[test]
 fn silk_mediumband_and_10ms_roundtrip() {
     let pcm = speech_like();
-    for (tag, fs_khz, frame_ms, config, cutoff, bps) in [
-        ("NB10", 8usize, 10usize, 0u8, 3500.0, 12_000u32),
-        ("MB10", 12, 10, 4, 5500.0, 16_000),
-        ("WB10", 16, 10, 8, 7000.0, 20_000),
-        ("MB20", 12, 20, 5, 5500.0, 16_000),
+    for (tag, fs_khz, frame_ms, config, cutoff, bps, floor) in [
+        ("NB10", 8usize, 10usize, 0u8, 3500.0, 12_000u32, 0.89f64),
+        ("MB10", 12, 10, 4, 5500.0, 16_000, 0.91),
+        ("WB10", 16, 10, 8, 7000.0, 20_000, 0.93),
+        ("MB20", 12, 20, 5, 5500.0, 16_000, 0.95),
     ] {
         let enc = match fs_khz {
             8 => SilkEncoder::new(false),
@@ -1735,7 +1735,7 @@ fn silk_mediumband_and_10ms_roundtrip() {
             "silk {tag}: corr {corr:.4} at lag {lag}, voiced {voiced}/{} frames, {kbps:.2} kbps",
             packets.len()
         );
-        assert!(corr >= 0.75, "{tag}: corr {corr:.4}");
+        assert!(corr >= floor, "{tag}: corr {corr:.4}");
         assert!(
             frame_ms == 10 || voiced > 0,
             "{tag}: no frame coded with LTP"
@@ -1846,7 +1846,6 @@ fn silk_stereo_speech_roundtrip() {
             let (decoded, _, _) = silk_roundtrip_ms(silk, &mono, frame_ms, Some(per_channel_bps));
             mono_floor[ch] = aligned_corr(&reference, &decoded, 2000).0;
         }
-
         let mut enc = Encoder::new(48000, 2, Application::Voip).unwrap();
         enc.set_mode(Some(ec_opus::Mode::Silk));
         enc.set_bandwidth(Some(bandwidth));
@@ -1959,8 +1958,8 @@ fn silk_compares_to_celt_on_speech_at_speech_rates() {
         );
         assert!(silk_corr >= 0.95, "{tag}: SILK corr {silk_corr:.4}");
         assert!(
-            silk_corr + 0.01 >= celt_corr,
-            "{tag}: SILK {silk_corr:.4} trails CELT {celt_corr:.4} by >0.01"
+            silk_corr >= celt_corr,
+            "{tag}: SILK {silk_corr:.4} trails CELT {celt_corr:.4}"
         );
     }
 }
