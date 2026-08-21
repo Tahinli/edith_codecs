@@ -184,6 +184,44 @@ fn assert_avi_index_is_bounded(path: &Path) {
     );
 }
 
+fn avi_indexed_point(path: &Path, target: u64, after: bool) -> (ec_riff::AviIndexPoint, f64) {
+    let reader = ec_riff::AviReader::new(File::open(path).expect("open AVI"))
+        .expect("AVI index builds");
+    let stream = *reader.audio_streams().first().expect("AVI audio stream");
+    let interval = f64::from(stream.length) * f64::from(stream.scale) / f64::from(stream.rate)
+        / reader.index_len() as f64;
+    (
+        reader
+            .indexed_point(stream.index, target, after)
+            .expect("AVI indexed point"),
+        interval,
+    )
+}
+
+fn samples_to_avi_units(
+    stream: ec_riff::AviAudioStream,
+    samples: u64,
+    round_up: bool,
+) -> u64 {
+    let denominator = u128::from(stream.scale) * u128::from(stream.sample_rate);
+    let numerator = u128::from(samples) * u128::from(stream.rate);
+    let units = if round_up {
+        numerator.saturating_add(denominator.saturating_sub(1)) / denominator
+    } else {
+        numerator / denominator
+    };
+    units.min(u128::from(u64::MAX)) as u64
+}
+
+fn avi_codec_preroll(codec: CodecId, rate: u32) -> f64 {
+    match codec {
+        CodecId::Mp3 => 1728.0 / f64::from(rate),
+        CodecId::Aac => 1024.0 / f64::from(rate),
+        _ => 0.0,
+    }
+}
+
+
 fn decode_stream_to_eof(
     reader: &mut Reader,
     stream: u32,
@@ -273,51 +311,105 @@ fn assert_avi_seeks_match_reference(path: &Path) {
         CodecId::Mp3 => 1152,
         _ => 1,
     };
+    let avi_stream = *ec_riff::AviReader::new(File::open(path).expect("open AVI"))
+        .expect("AVI index builds")
+        .audio_streams()
+        .first()
+        .expect("AVI audio stream");
     let duration = reader.duration().expect("AVI duration").as_secs_f64();
+    let codec_preroll = avi_codec_preroll(audio.params.codec, rate);
     for fraction in [0.10, 0.50, 0.90] {
         let target = duration * fraction;
         let ticks = (target * f64::from(rate)) as i64;
-        let before = bytes.load(Ordering::Relaxed);
-        let started = Instant::now();
-        let landed = reader
-            .seek(
-                audio.index,
-                Timestamp::new(ticks, TimeBase::from_rate(rate)),
-                SeekMode::SyncBefore,
-            )
-            .expect("AVI seek");
-        let elapsed = started.elapsed();
-        let read = bytes.load(Ordering::Relaxed) - before;
-        let at = landed.as_secs_f64();
-        let ours = decode_window(&mut reader, audio.index, 2.0).expect("decode after seek");
-        let theirs = reference_seek_window(path, at);
-        let (lag, score) = best_frame_corr(&ours, &theirs, channels, frame_samples);
-        eprintln!(
-            "{} @{:.0}%: target {target:.3}s landed {at:.3}s read {read} bytes seek {:?} lag {lag} frames corr {score:.6}",
-            path.display(),
-            fraction * 100.0,
-            elapsed
-        );
-        assert!(
-            read < 8 * 1024 * 1024,
-            "{} @{fraction:.0}%: seek read {read} bytes",
-            path.display()
-        );
-        if !cfg!(debug_assertions) {
-            assert!(
-                elapsed.as_millis() < 200,
-                "{} @{:.0}%: seek took {:?}",
+        for (mode, label) in [
+            (SeekMode::SyncBefore, "before"),
+            (SeekMode::SyncAfter, "after"),
+        ] {
+            let target_units = samples_to_avi_units(
+                avi_stream,
+                ticks.max(0) as u64,
+                matches!(mode, SeekMode::SyncAfter),
+            );
+            let (point, chunk_interval) =
+                avi_indexed_point(path, target_units, matches!(mode, SeekMode::SyncAfter));
+            let before = bytes.load(Ordering::Relaxed);
+            let started = Instant::now();
+            let landed = reader
+                .seek(
+                    audio.index,
+                    Timestamp::new(ticks, TimeBase::from_rate(rate)),
+                    mode,
+                )
+                .expect("AVI seek");
+            let elapsed = started.elapsed();
+            let read = bytes.load(Ordering::Relaxed) - before;
+            let at = landed.as_secs_f64();
+            eprintln!(
+                "{} @{:.0}% {label}: requested {target_units} units, idx1 entry {} offset {} unit {}, pre-roll 0 units 0 frames, first packet pts {}, target {target:.3}s landed {at:.3}s read {read} bytes seek {:?}",
                 path.display(),
                 fraction * 100.0,
-                elapsed
+                point.index,
+                point.offset,
+                point.time,
+                landed.ticks,
+                elapsed,
             );
+            assert!(
+                read < 8 * 1024 * 1024,
+                "{} @{fraction:.0}% {label}: seek read {read} bytes",
+                path.display()
+            );
+            if !cfg!(debug_assertions) {
+                assert!(
+                    elapsed.as_millis() < 200,
+                    "{} @{:.0}% {label}: seek took {:?}",
+                    path.display(),
+                    fraction * 100.0,
+                    elapsed
+                );
+            }
+            match mode {
+                SeekMode::SyncBefore => {
+                    assert!(
+                        at <= target,
+                        "{} @{fraction:.0}%: SyncBefore landed {at:.3}s after target {target:.3}s",
+                        path.display()
+                    );
+                    let bound = (2.0 * chunk_interval).max(codec_preroll);
+                    assert!(
+                        target - at <= bound,
+                        "{} @{fraction:.0}%: SyncBefore landed {:.3}s before target {target:.3}s (bound {bound:.3}s)",
+                        path.display(),
+                        target - at,
+                    );
+                    let ours =
+                        decode_window(&mut reader, audio.index, 2.0).expect("decode after seek");
+                    let theirs = reference_seek_window(path, at);
+                    let (lag, score) =
+                        best_frame_corr(&ours, &theirs, channels, frame_samples);
+                    assert!(
+                        score >= 0.999,
+                        "{} @{:.0}% {label}: target {target:.3}s landed {at:.3}s lag {lag} frames corr vs reference decoder = {score}",
+                        path.display(),
+                        fraction * 100.0,
+                    );
+                }
+                SeekMode::SyncAfter => {
+                    assert!(
+                        at >= target,
+                        "{} @{fraction:.0}%: SyncAfter landed {at:.3}s before target {target:.3}s",
+                        path.display()
+                    );
+                    assert!(
+                        at - target <= chunk_interval,
+                        "{} @{fraction:.0}%: SyncAfter landed {:.3}s after target {target:.3}s (chunk interval {chunk_interval:.3}s)",
+                        path.display(),
+                        at - target,
+                    );
+                }
+                SeekMode::Exact => unreachable!("oracle checks indexed seeks only"),
+            }
         }
-        assert!(
-            score >= 0.999,
-            "{} @{:.0}%: target {target:.3}s landed {at:.3}s lag {lag} frames corr vs reference decoder = {score}",
-            path.display(),
-            fraction * 100.0,
-        );
     }
 }
 

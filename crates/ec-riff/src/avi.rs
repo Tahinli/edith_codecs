@@ -58,6 +58,17 @@ struct AviSeekPoint {
     offset: u64,
     time: u64,
 }
+/// An indexed audio chunk selected for a seek.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AviIndexPoint {
+    /// This stream's zero-based index entry number.
+    pub index: usize,
+    /// File offset of the chunk header.
+    pub offset: u64,
+    /// Stream time units at the chunk's start.
+    pub time: u64,
+}
+
 
 #[derive(Debug, Clone, Copy)]
 struct OdmlRef {
@@ -185,7 +196,7 @@ impl<R: Read + Seek> AviReader<R> {
     /// Seek an audio stream by its `strh` time units and return the landing unit.
     pub fn seek_to_stream_time(&mut self, stream: u32, target: u64, after: bool) -> Result<u64> {
         self.pending.clear();
-        if let Some(point) = self.index_point(stream, target, after) {
+        if let Some(point) = self.seek_point(stream, target, after) {
             self.pos = point.offset;
             return Ok(point.time);
         }
@@ -212,23 +223,38 @@ impl<R: Read + Seek> AviReader<R> {
         Ok(target)
     }
 
-    fn index_point(&self, stream: u32, target: u64, after: bool) -> Option<AviSeekPoint> {
-        let points: Vec<_> = self
-            .index
-            .iter()
-            .filter(|p| p.stream == stream)
-            .copied()
-            .collect();
-        if points.is_empty() {
-            return None;
+    /// Return the indexed chunk this seek would select.
+    pub fn indexed_point(&self, stream: u32, target: u64, after: bool) -> Option<AviIndexPoint> {
+        let mut before = None;
+        let mut last = None;
+        for (index, point) in self.index.iter().filter(|point| point.stream == stream).enumerate() {
+            let point = AviIndexPoint {
+                index,
+                offset: point.offset,
+                time: point.time,
+            };
+            if after {
+                if point.time >= target {
+                    return Some(point);
+                }
+                last = Some(point);
+            } else if point.time <= target {
+                before = Some(point);
+            } else {
+                break;
+            }
         }
-        let found = points.partition_point(|p| p.time <= target);
-        let i = if after {
-            found.min(points.len().saturating_sub(1))
-        } else {
-            found.saturating_sub(1)
-        };
-        points.get(i).copied()
+        if after { last } else { before }
+    }
+
+
+    fn seek_point(&self, stream: u32, target: u64, after: bool) -> Option<AviSeekPoint> {
+        let point = self.indexed_point(stream, target, after)?;
+        Some(AviSeekPoint {
+            stream,
+            offset: point.offset,
+            time: point.time,
+        })
     }
 
     /// The next audio chunk, or [`Error::Eof`] at the end.
