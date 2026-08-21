@@ -71,6 +71,8 @@ pub fn bitrate_for_quality(quality: f32) -> u32 {
 /// The largest value the 12-bit `part2_3_length` side-info field can carry,
 /// and so the most bits one granule may be coded to.
 const PART2_3_MAX: u32 = (1 << 12) - 1;
+const ZERO_QUANT_THRESHOLD: f32 = 7.8504e-17;
+
 const SFB_LONG: usize = 21;
 
 /// One granule's worth of coded spectrum plus the side info describing it.
@@ -131,6 +133,10 @@ pub struct Mp3Encode {
     /// Bytes of emitted audio frames (everything after the info header), for
     /// the Xing header's byte count and average bitrate.
     frame_bytes: u64,
+    /// The legal-bitrate table index VBR's last frame settled on. Real audio
+    /// is smooth from one frame to the next, so the candidate search below
+    /// starts here instead of blind-bisecting the whole table every frame.
+    vbr_index: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -193,6 +199,19 @@ impl Mp3Encode {
             ready: std::collections::VecDeque::new(),
             frames: 0,
             frame_bytes: 0,
+            vbr_index: {
+                let table: &[u32] = if version == Version::Mpeg1 {
+                    &BITRATES_V1
+                } else {
+                    &BITRATES_V2
+                };
+                let target = vbr_quality.map_or(0, bitrate_for_quality);
+                table
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|&(_, &k)| k.abs_diff(target))
+                    .map_or(0, |(i, _)| i)
+            },
         })
     }
 
@@ -678,21 +697,41 @@ impl Mp3Encode {
                     }
                     (frame_coded, ratio)
                 };
-                let (mut lo, mut hi) = (0usize, table.len() - 1);
-                let mut best = code_at(table[hi]);
-                let mut best_kbps = table[hi];
-                while lo < hi {
-                    let mid = (lo + hi) / 2;
-                    let (coded, ratio) = code_at(table[mid]);
-                    if ratio <= 1.0 {
-                        best = (coded, ratio);
-                        best_kbps = table[mid];
-                        hi = mid;
-                    } else {
-                        lo = mid + 1;
+                // Real audio is smooth frame to frame, so try the last
+                // settled bitrate first and walk only as far as this frame
+                // needs. If the previous frame was already cheap, start at the
+                // legal floor instead of climbing down through the table again.
+                let mut index = if self.vbr_index <= 2 {
+                    0
+                } else {
+                    self.vbr_index.min(table.len() - 1)
+                };
+                let (coded, ratio) = code_at(table[index]);
+                let mut best = (coded, ratio);
+                let mut best_index = index;
+                if best.1 <= 1.0 {
+                    while best_index > 0 {
+                        let trial_index = best_index - 1;
+                        let trial = code_at(table[trial_index]);
+                        if trial.1 > 1.0 {
+                            break;
+                        }
+                        best = trial;
+                        best_index = trial_index;
+                    }
+                } else {
+                    while index + 1 < table.len() {
+                        index += 1;
+                        let trial = code_at(table[index]);
+                        best = trial;
+                        best_index = index;
+                        if best.1 <= 1.0 {
+                            break;
+                        }
                     }
                 }
-                (best.0, best_kbps)
+                self.vbr_index = best_index;
+                (best.0, table[best_index])
             }
             None => {
                 let header = self.header(self.bitrate_kbps);
@@ -702,7 +741,10 @@ impl Mp3Encode {
                 let share = budget_bits / (granules * channels).max(1);
                 let mut frame_coded = Vec::with_capacity(granules * channels);
                 for index in 0..granules * channels {
-                    let spent: usize = frame_coded.iter().map(|c: &CodedGranule| c.part2_3_length as usize).sum();
+                    let spent: usize = frame_coded
+                        .iter()
+                        .map(|c: &CodedGranule| c.part2_3_length as usize)
+                        .sum();
                     let left = budget_bits.saturating_sub(spent);
                     let target = share.min(left).min(4095);
                     let (granule, _) = quantise_granule(
@@ -912,17 +954,17 @@ fn mdct_short(input: &[f32; 36], out: &mut [f32]) {
 
 /// Scales the masking threshold by `vbr_quality`. A higher quality lowers the
 /// allowed noise (a smaller threshold, so more bands are amplified and the
-/// granule costs more bits); a lower quality raises it. 0.5 is neutral.
+/// granule costs more bits). The curve is calibrated on the fixture corpus and
+/// three 30-second music clips so the stream mean tracks
+/// [`bitrate_for_quality`] without letting q=0 collapse to speech-rate output.
 fn quality_threshold(threshold: &[f32], quality: f32) -> Vec<f32> {
     let q = quality.clamp(0.0, 1.0);
-    // The mapping: 24 dB of noise-to-mask margin across the quality range.
-    // Its centre sits 4 dB over the mask, because the model's mask is
-    // conservative (its flatness-derived offset lands 11-13 dB under white
-    // noise where 6 dB is the noise-like figure); 4 dB is what puts q = 0.5
-    // at `bitrate_for_quality(0.5)` on mp3src-stereo-48000 and two real
-    // stereo tracks (210-225 kbit/s, decoding above the CBR-192 bar; 5 dB
-    // gave 195-208 but slipped under that bar, 6 dB gave 170-189).
-    let db = (0.5 - q) * 24.0 + 4.0;
+    let db = if q <= 0.5 {
+        12.0 - 25.0 * q + 20.0 * q * q
+    } else {
+        let t = q - 0.5;
+        4.5 - 11.0 * t - 12.0 * t * t
+    };
     let scale = 10f32.powf(db / 10.0);
     threshold.iter().map(|&t| t * scale).collect()
 }
@@ -935,6 +977,24 @@ fn quantise_granule(
     threshold: &[f32],
     sample_rate: u32,
 ) -> (CodedGranule, f64) {
+    if xr.iter().all(|v| v.abs() <= ZERO_QUANT_THRESHOLD) {
+        return (
+            CodedGranule {
+                bits: Vec::new(),
+                part2_3_length: 0,
+                big_values: 0,
+                global_gain: 0,
+                scalefac_compress: 0,
+                block_type,
+                table_select: [0; 3],
+                region0_count: 0,
+                region1_count: 0,
+                scalefac_scale: false,
+                count1table_select: false,
+            },
+            0.0,
+        );
+    }
     let mut scalefac = [0u8; SFB_LONG];
     // Score is the summed noise-to-mask ratio over the bands; a mean ratio
     // of at most one is VBR's signal that this bitrate carried the granule
@@ -962,6 +1022,9 @@ fn quantise_granule(
         let over: Vec<usize> = order.iter().copied().filter(|&b| ratios[b] > 1.0).collect();
         if best.as_ref().is_none_or(|(_, s, _)| score < *s) {
             best = Some((granule, score, bands));
+        }
+        if score <= 0.0 {
+            break; // every band is already exactly at the mask; nothing left to buy
         }
         if spent * 20 > target_bits * 19 {
             break; // the budget is spent; amplifying now only coarsens
@@ -1092,27 +1155,39 @@ fn code_with(
     };
     quantise(xr, gain, scalefac, sample_rate, block_type, &mut ix);
     coded = code_spectrum(&for_coding(&ix), block_type, sample_rate);
-    loop {
-        if (saturated(&ix) || coded.0 > target_bits) && gain < 255 {
-            gain += 1;
-            quantise(xr, gain, scalefac, sample_rate, block_type, &mut ix);
-            coded = code_spectrum(&for_coding(&ix), block_type, sample_rate);
-            continue;
+    if peak <= 1e-20 {
+        // Below the smallest representable level: every line quantises to
+        // zero at any gain (the quantiser's scale multiplies zero either
+        // way), so the descending-gain search below — which steps one gain
+        // unit at a time — would walk all 210 units from 210 to 0 finding
+        // nothing changes, recoding an all-zero spectrum at every step. Skip
+        // straight to the quietest legal gain; `coded` above is already the
+        // right answer, because an all-zero spectrum's bit cost does not
+        // depend on gain.
+        gain = 0;
+    } else {
+        loop {
+            if (saturated(&ix) || coded.0 > target_bits) && gain < 255 {
+                gain += 1;
+                quantise(xr, gain, scalefac, sample_rate, block_type, &mut ix);
+                coded = code_spectrum(&for_coding(&ix), block_type, sample_rate);
+                continue;
+            }
+            if saturated(&ix) || coded.0 > target_bits || gain == 0 {
+                break;
+            }
+            // Try one step quieter; keep it only if it still fits and stays
+            // inside the coding range.
+            let mut trial = ix.clone();
+            quantise(xr, gain - 1, scalefac, sample_rate, block_type, &mut trial);
+            let trial_coded = code_spectrum(&for_coding(&trial), block_type, sample_rate);
+            if trial_coded.0 > target_bits || saturated(&trial) {
+                break;
+            }
+            gain -= 1;
+            ix = trial;
+            coded = trial_coded;
         }
-        if saturated(&ix) || coded.0 > target_bits || gain == 0 {
-            break;
-        }
-        // Try one step quieter; keep it only if it still fits and stays
-        // inside the coding range.
-        let mut trial = ix.clone();
-        quantise(xr, gain - 1, scalefac, sample_rate, block_type, &mut trial);
-        let trial_coded = code_spectrum(&for_coding(&trial), block_type, sample_rate);
-        if trial_coded.0 > target_bits || saturated(&trial) {
-            break;
-        }
-        gain -= 1;
-        ix = trial;
-        coded = trial_coded;
     }
     // Last resort: if even the quietest legal gain will not fit the bits we
     // were given, drop the top of the spectrum until it does. A granule that
@@ -1477,7 +1552,10 @@ mod tests {
             sum += 10.0 * (energy / granule.threshold[band]).log10();
         }
         let db = sum / 13.0;
-        assert!((6.0..=18.0).contains(&db), "signal sits {db:.1} dB over its mask");
+        assert!(
+            (6.0..=18.0).contains(&db),
+            "signal sits {db:.1} dB over its mask"
+        );
     }
 
     #[test]

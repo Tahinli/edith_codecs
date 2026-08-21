@@ -161,9 +161,12 @@ fn cbr_quality_holds_its_floor() {
     let decoded = decode(&file);
     assert_eq!(decoded.len(), pcm.len());
     let corr = correlation(&decoded, &pcm);
-    let (err, sig) = decoded.iter().zip(&pcm).fold((0.0f64, 0.0f64), |(e, s), (d, p)| {
-        (e + f64::from(d - p).powi(2), s + f64::from(*p).powi(2))
-    });
+    let (err, sig) = decoded
+        .iter()
+        .zip(&pcm)
+        .fold((0.0f64, 0.0f64), |(e, s), (d, p)| {
+            (e + f64::from(d - p).powi(2), s + f64::from(*p).powi(2))
+        });
     let rms = (err / sig).sqrt();
     println!("cbr192 corr={corr:.6} rms={:.4}%", rms * 100.0);
     assert!(corr >= 0.999_99, "corr {corr:.6}");
@@ -177,7 +180,11 @@ fn decode(file: &Path) -> Vec<f32> {
         .args(["-f", "f32le", "-"])
         .output()
         .expect("run ffmpeg");
-    assert!(out.stderr.is_empty(), "ffmpeg: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.stderr.is_empty(),
+        "ffmpeg: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     out.stdout
         .chunks_exact(4)
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
@@ -213,7 +220,9 @@ fn vbr_frames_vary_their_bitrate_index() {
     };
     let bytes = encode_vbr(&pcm, rate, channels, 0.5);
     // Walk the frame headers (MPEG-1, Layer III), skipping the Xing frame.
-    let table = [0u32, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320];
+    let table = [
+        0u32, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320,
+    ];
     let mut indices = std::collections::BTreeSet::new();
     let (mut pos, mut frames) = (0usize, 0usize);
     while pos + 4 <= bytes.len() {
@@ -233,7 +242,10 @@ fn vbr_frames_vary_their_bitrate_index() {
     let target = f64::from(ec_mp3::encode::bitrate_for_quality(0.5));
     println!("vbr frames={frames} indices={indices:?} mean={mean:.1} kbit/s");
     assert!(indices.len() >= 3, "only {indices:?}");
-    assert!((mean - target).abs() <= target * 0.25, "mean {mean:.1} vs {target}");
+    assert!(
+        (mean - target).abs() <= target * 0.25,
+        "mean {mean:.1} vs {target}"
+    );
 
     let work = workdir("vbr");
     let file = work.join("vbr.mp3");
@@ -244,7 +256,11 @@ fn vbr_frames_vary_their_bitrate_index() {
         .args(["-f", "f32le", "-"])
         .output()
         .expect("run ffmpeg");
-    assert!(out.stderr.is_empty(), "ffmpeg: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.stderr.is_empty(),
+        "ffmpeg: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let decoded: Vec<f32> = out
         .stdout
         .chunks_exact(4)
@@ -261,8 +277,39 @@ fn vbr_frames_vary_their_bitrate_index() {
         .expect("run ffprobe");
     let probe = String::from_utf8_lossy(&probe.stdout);
     // "Xing" (not "Info") plus the VBR-method byte after the 9-byte version.
-    assert!(&bytes[36..40] == b"Xing" && bytes[36 + 16 + 9] == 0x70, "no VBR-flagged Xing tag");
+    assert!(
+        &bytes[36..40] == b"Xing" && bytes[36 + 16 + 9] == 0x70,
+        "no VBR-flagged Xing tag"
+    );
     assert!(probe.contains("format_name=mp3"), "{probe}");
+}
+
+#[test]
+fn vbr_mean_bitrate_tracks_quality_on_music() {
+    let path = fixtures().join("audio/wav16-stereo-48000.wav");
+    let Some((pcm, rate, channels)) = read_wav(&path) else {
+        eprintln!("no WAV fixtures: run scripts/gen-fixtures.sh");
+        return;
+    };
+    let mut previous = 0.0;
+    for q in [0.25f32, 0.5, 0.75] {
+        let bytes = encode_vbr(&pcm, rate, channels, q);
+        let seconds = pcm.len() as f64 / (rate as f64 * channels as f64);
+        let mean = bytes.len() as f64 * 8.0 / seconds / 1000.0;
+        let target = f64::from(ec_mp3::encode::bitrate_for_quality(q));
+        let tolerance = if q <= 0.5 { 0.70 } else { 0.25 };
+        println!("q={q:.2} mean={mean:.1} target={target:.1}");
+        assert!(
+            mean > previous,
+            "q={q:.2} mean {mean:.1} did not rise above {previous:.1}"
+        );
+        assert!(
+            (mean - target).abs() <= target * tolerance,
+            "fixture is sparse/tonal, so q={q:.2} allows {:.0}%: mean {mean:.1} vs {target:.1}",
+            tolerance * 100.0,
+        );
+        previous = mean;
+    }
 }
 
 #[test]
