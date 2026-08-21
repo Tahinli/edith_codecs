@@ -500,6 +500,7 @@ pub struct BlockDecoder {
     noise: Noise,
     sf_index: u8,
     sbr: Option<crate::sbr_chain::SbrChain>,
+    pns_aus: usize,
 }
 
 impl BlockDecoder {
@@ -511,9 +512,13 @@ impl BlockDecoder {
             noise: Noise(0x1f2e_3d4c),
             sf_index,
             sbr: None,
+            pns_aus: 0,
         }
     }
 
+    pub fn pns_aus(&self) -> usize {
+        self.pns_aus
+    }
     pub fn set_sf_index(&mut self, sf_index: u8) {
         self.sf_index = sf_index;
     }
@@ -747,7 +752,12 @@ impl BlockDecoder {
         // directly follows the element it decorates.
         let mut pending: Option<(u8, usize, usize, bool)> = None;
         let dump_tools = tool_sideinfo_enabled();
-        let au = if dump_tools { next_tool_sideinfo_au() } else { 0 };
+        let au = if dump_tools {
+            next_tool_sideinfo_au()
+        } else {
+            0
+        };
+        let mut pns = false;
         loop {
             if r.bits_remaining() < 3 {
                 break;
@@ -761,6 +771,7 @@ impl BlockDecoder {
                     let tag = r.read_bits(4)? as u8;
                     let start = out.len();
                     let mut ch = [self.channel_stream(r, None)?];
+                    pns |= has_pns(&ch[0]);
                     if dump_tools {
                         log_tool_sideinfo(tool_row(au, tag, false, &ch[0], None));
                     }
@@ -806,6 +817,7 @@ impl BlockDecoder {
                         self.channel_stream(r, shared.as_ref())?,
                         self.channel_stream(r, shared.as_ref())?,
                     ];
+                    pns |= pair.iter().any(has_pns);
                     if dump_tools {
                         log_tool_sideinfo(tool_row(au, tag, true, &pair[0], Some(&mask)));
                     }
@@ -881,14 +893,16 @@ impl BlockDecoder {
                     // a non-SBR one) -- same "unavailable frame" case as the
                     // no-fresh-payload branch in id 6 above, so fall back to
                     // the last known SBR data the same way.
-                    if let (Some(sbr), Some((tag, start, n, is_cpe))) =
-                        (self.sbr.as_mut(), pending)
+                    if let (Some(sbr), Some((tag, start, n, is_cpe))) = (self.sbr.as_mut(), pending)
                     {
                         sbr.apply_last(tag, is_cpe, &mut out[start..start + n]);
                     }
                     break;
                 }
             }
+        }
+        if pns {
+            self.pns_aus += 1;
         }
         r.align_to_byte();
         Ok(out)
@@ -1025,6 +1039,12 @@ fn apply_ms(left: &mut Ics, right: &mut Ics, mask: &MsMask) {
 /// Builds one `EC_AAC_TOOL_SIDEINFO_DEBUG` row from an already-decoded `Ics`
 /// (any channel of a CPE, since PNS/IS/TNS presence is per-channel but the
 /// dump only needs whether the element used the tool at all).
+fn has_pns(ch: &Ics) -> bool {
+    ch.cb
+        .iter()
+        .any(|group| group.iter().any(|&codebook| codebook == NOISE_HCB))
+}
+
 fn tool_row(au: usize, tag: u8, is_cpe: bool, ch: &Ics, mask: Option<&MsMask>) -> ToolSideInfoRow {
     let mut ms_bands = 0;
     let mut pns_bands = 0;
