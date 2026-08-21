@@ -195,11 +195,8 @@ mod tests {
         enc.push_pcm_f32(&pcm).unwrap();
         enc.finish();
         let mut bitstream = Vec::new();
-        loop {
-            match enc.next_packet() {
-                Ok(packet) => bitstream.extend_from_slice(&packet),
-                Err(_) => break,
-            }
+        while let Ok(packet) = enc.next_packet() {
+            bitstream.extend_from_slice(&packet);
         }
 
         let mut registry = CodecRegistry::new();

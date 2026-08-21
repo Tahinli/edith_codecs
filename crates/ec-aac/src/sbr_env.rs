@@ -75,7 +75,6 @@ pub fn dequant_noise_pair(q0_raw: i32, pan_raw: i32) -> (f64, f64) {
 /// de-mixing through [`dequant_pair`]/[`dequant_noise_pair`] when
 /// `coupling` makes `channels[1]` a balance channel against `channels[0]`.
 pub fn dequantize_frame(
-    header: &SbrHeader,
     channels: &[SbrChannel],
     ch: usize,
     coupling: bool,
@@ -173,7 +172,9 @@ fn noise_fraction_debug() -> bool {
     std::env::var("EC_AAC_SBR_NOISE_FRACTION").is_ok()
 }
 
-static NOISE_FRACTION: std::sync::OnceLock<std::sync::Mutex<Vec<(usize, f64, f64, f64)>>> =
+type NoiseFractionRows = Vec<(usize, f64, f64, f64)>;
+
+static NOISE_FRACTION: std::sync::OnceLock<std::sync::Mutex<NoiseFractionRows>> =
     std::sync::OnceLock::new();
 
 /// Diagnostic (`EC_AAC_SBR_NOISE_FRACTION`): per absolute QMF band,
@@ -559,7 +560,7 @@ mod tests {
             let e: f64 = hf[m].iter().map(|c| c.norm_sqr()).sum::<f64>() / slots as f64;
             if m == mid {
                 // S_M^2 = E_orig/(1+Q) = 4, boost capped at 1.5849^2 at most.
-                assert!(e >= 4.0 - 1e-9 && e <= 4.0 * BOOST_MAX * BOOST_MAX + 1e-6, "mid {e}");
+                assert!((4.0 - 1e-9..=4.0 * BOOST_MAX * BOOST_MAX + 1e-6).contains(&e), "mid {e}");
                 // Phase walks 0,90,180,270 degrees per slot.
                 assert!((hf[m][0].re - hf[m][0].norm_sqr().sqrt()).abs() < 1e-9 && hf[m][1].re.abs() < 1e-9);
             } else {
