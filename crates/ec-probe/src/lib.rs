@@ -951,11 +951,17 @@ fn avi_elementary_leading_skip(codec: CodecId, data: &[u8]) -> usize {
     0
 }
 
-fn samples_to_avi_units(stream: ec_riff::AviAudioStream, samples: u64) -> u64 {
+fn samples_to_avi_units(stream: ec_riff::AviAudioStream, samples: u64, round_up: bool) -> u64 {
     let scale = u128::from(stream.scale.max(1));
     let rate = u128::from(stream.rate.max(1));
     let sample_rate = u128::from(stream.sample_rate.max(1));
-    let units = u128::from(samples).saturating_mul(rate) / (scale * sample_rate);
+    let denominator = scale * sample_rate;
+    let numerator = u128::from(samples).saturating_mul(rate);
+    let units = if round_up {
+        numerator.saturating_add(denominator.saturating_sub(1)) / denominator
+    } else {
+        numerator / denominator
+    };
     let units = units.min(u128::from(u64::MAX)) as u64;
     match stream.length {
         0 => units,
@@ -1002,17 +1008,11 @@ impl<R: Read + Seek + Send> Demuxer for AviDemuxer<R> {
             .ok_or_else(|| Error::corrupt(format!("AVI: no audio stream {avi_stream_no}")))?;
         let base = self.streams[local].time_base;
         let target_samples = to.rescale(base, Rounding::Down).ticks.max(0) as u64;
-        let target_units = samples_to_avi_units(avi_stream, target_samples);
-        let seek_units = if matches!(
-            self.streams[local].params.codec,
-            CodecId::Ac3 | CodecId::EAc3 | CodecId::Mp3 | CodecId::Aac
-        ) {
-            target_units.saturating_sub(u64::from(
-                (avi_stream.rate / avi_stream.scale.max(1)).max(1),
-            ))
-        } else {
-            target_units
-        };
+        let seek_units = samples_to_avi_units(
+            avi_stream,
+            target_samples,
+            matches!(mode, SeekMode::SyncAfter),
+        );
         let landed_units = self.reader.seek_to_stream_time(
             avi_stream_no,
             seek_units,
