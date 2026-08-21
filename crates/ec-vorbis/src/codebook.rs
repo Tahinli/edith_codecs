@@ -323,13 +323,13 @@ fn free_depth(slot: i32, nodes: &[Node]) -> u8 {
 /// and the packet writer both need: lengths to state, codewords to emit.
 #[derive(Debug, Clone)]
 pub struct CodebookSpec {
-    /// Values per entry; 1 for every book this encoder writes.
+    /// Values per entry.
     pub dimensions: usize,
     /// Codeword length per entry, all non-zero (no sparse books written).
     pub lengths: Vec<u8>,
     /// Codeword per entry, MSB-first in `lengths[i]` bits.
     pub codes: Vec<u32>,
-    /// Quantised value per entry when the book carries a lookup, empty for a
+    /// Quantised values per entry when the book carries a lookup, empty for a
     /// pure symbol book.
     pub values: Vec<f32>,
 }
