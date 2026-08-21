@@ -30,7 +30,7 @@ mod vlc;
 
 use ec_core::error::{Error, Result};
 use ec_core::BitWriter;
-use ec_h264_syntax::nal::{NalUnitType, escape_rbsp};
+use ec_h264_syntax::nal::{escape_rbsp, NalUnitType};
 use ec_h264_syntax::{SliceType, Sps};
 
 use crate::decoder::deblock_picture;
@@ -39,8 +39,8 @@ use crate::entropy::{FLAG_INTER, FLAG_TRANS8X8};
 use crate::transform::{LevelScale4x4, LevelScale8x8};
 
 use entropy::EncEntropy;
-use headers::{SeqParams, SliceParams, write_pps, write_slice_header, write_sps};
-use mb::{MbEnc, Source, encode_mb};
+use headers::{write_pps, write_slice_header, write_sps, SeqParams, SliceParams};
+use mb::{encode_mb, MbEnc, Source};
 use rc::RateControl;
 
 pub use mb::Preset;
@@ -79,6 +79,14 @@ pub struct EncoderConfig {
     /// rate-distortion cost. Leaving it off preserves the Baseline/Main-profile
     /// 4x4 path.
     pub transform_8x8: bool,
+    #[cfg(feature = "rd-ablation")]
+    rd_lambda_standard: bool,
+    #[cfg(feature = "rd-ablation")]
+    rd_transform_8x8_intra: bool,
+    #[cfg(feature = "rd-ablation")]
+    rd_transform_8x8_inter: bool,
+    #[cfg(feature = "rd-ablation")]
+    rd_transform_8x8_margin_bits: f64,
 }
 
 impl EncoderConfig {
@@ -96,6 +104,14 @@ impl EncoderConfig {
             threads: 0,
             qp: 26,
             transform_8x8: false,
+            #[cfg(feature = "rd-ablation")]
+            rd_lambda_standard: false,
+            #[cfg(feature = "rd-ablation")]
+            rd_transform_8x8_intra: false,
+            #[cfg(feature = "rd-ablation")]
+            rd_transform_8x8_inter: false,
+            #[cfg(feature = "rd-ablation")]
+            rd_transform_8x8_margin_bits: 0.0,
         }
     }
 }
@@ -170,6 +186,10 @@ impl<'a> PictureView<'a> {
 impl Encoder {
     /// Build an encoder for `cfg`, refusing what it cannot code.
     pub fn new(cfg: EncoderConfig) -> Result<Encoder> {
+        #[cfg(feature = "rd-ablation")]
+        let mut cfg = cfg;
+        #[cfg(feature = "rd-ablation")]
+        apply_rd_ablation(&mut cfg);
         if cfg.width < 16 || cfg.height < 16 {
             return Err(Error::unsupported(
                 "picture smaller than one macroblock",
@@ -510,9 +530,13 @@ fn code_band(pic: &mut Picture, job: BandJob<'_>) -> Vec<u8> {
         slice_id: job.slice_id,
         qp: job.qp,
         target_qp: job.qp,
-        lambda: lambda_for(job.qp, job.cfg.transform_8x8),
+        lambda: lambda_for(job.qp, rd_lambda_standard(job.cfg)),
+        t8x8_margin_bits: rd_transform_8x8_margin_bits(job.cfg),
         preset: job.cfg.preset,
+        lambda_standard: rd_lambda_standard(job.cfg),
         transform_8x8: job.cfg.transform_8x8,
+        transform_8x8_intra: rd_transform_8x8_intra(job.cfg),
+        transform_8x8_inter: rd_transform_8x8_inter(job.cfg),
         ls: LevelScale4x4::new(&[16; 16]),
         ls8: LevelScale8x8::new(&[16; 64]),
         mb_ctx: crate::entropy::MbCtx::default(),
@@ -528,7 +552,7 @@ fn code_band(pic: &mut Picture, job: BandJob<'_>) -> Vec<u8> {
             let expected = job.band_target * n as f64 / rows as f64;
             let delta = job.rc.row_delta(spent, expected);
             e.target_qp = (job.qp + delta).clamp(10, 51);
-            e.lambda = lambda_for(e.target_qp, job.cfg.transform_8x8);
+            e.lambda = lambda_for(e.target_qp, rd_lambda_standard(job.cfg));
         }
         for mb_x in 0..mb_w {
             let addr = mb_y * mb_w + mb_x;
@@ -545,15 +569,88 @@ pub(crate) fn lambda_ssd(qp: i32) -> f64 {
     0.85 * ((f64::from(qp) - 12.0) / 3.0).exp2()
 }
 
-/// Lagrangian multiplier; the 8x8 path uses the standard squared-error
-/// multiplier, while the established 4x4 path keeps its byte-stable ladder.
-fn lambda_for(qp: i32, transform_8x8: bool) -> f64 {
-    if transform_8x8 {
+/// Lagrangian multiplier. Production uses the established byte-stable ladder;
+/// the ablation feature can select the standard squared-error multiplier.
+fn lambda_for(qp: i32, standard: bool) -> f64 {
+    if standard {
         lambda_ssd(qp)
     } else {
-        // The established 4x4 path stays byte-stable when the feature is off.
         (((f64::from(qp) - 12.0) / 6.0).exp2().round()).max(1.0)
     }
+}
+
+#[cfg(feature = "rd-ablation")]
+fn apply_rd_ablation(cfg: &mut EncoderConfig) {
+    if let Ok(lambda) = std::env::var("EC_H264_RD_LAMBDA") {
+        cfg.rd_lambda_standard = match lambda.as_str() {
+            "ladder" => false,
+            "standard" => true,
+            _ => panic!("EC_H264_RD_LAMBDA must be ladder or standard"),
+        };
+    }
+    if let Ok(transform) = std::env::var("EC_H264_RD_T8X8") {
+        let (intra, inter) = match transform.as_str() {
+            "off" => (false, false),
+            "on" => (true, true),
+            "intra" => (true, false),
+            "inter" => (false, true),
+            _ => panic!("EC_H264_RD_T8X8 must be off, on, intra, or inter"),
+        };
+        cfg.rd_transform_8x8_intra = intra;
+        cfg.rd_transform_8x8_inter = inter;
+        cfg.transform_8x8 = intra || inter;
+    } else if cfg.transform_8x8 {
+        cfg.rd_transform_8x8_intra = true;
+        cfg.rd_transform_8x8_inter = true;
+    }
+    if let Ok(margin) = std::env::var("EC_H264_RD_T8X8_MARGIN_BITS") {
+        cfg.rd_transform_8x8_margin_bits = margin
+            .parse()
+            .expect("EC_H264_RD_T8X8_MARGIN_BITS must be a number");
+    }
+}
+
+#[cfg(feature = "rd-ablation")]
+fn rd_lambda_standard(cfg: &EncoderConfig) -> bool {
+    cfg.rd_lambda_standard
+}
+
+#[cfg(not(feature = "rd-ablation"))]
+fn rd_lambda_standard(cfg: &EncoderConfig) -> bool {
+    cfg.transform_8x8
+}
+
+#[cfg(feature = "rd-ablation")]
+fn rd_transform_8x8_intra(cfg: &EncoderConfig) -> bool {
+    cfg.rd_transform_8x8_intra
+}
+
+#[cfg(not(feature = "rd-ablation"))]
+fn rd_transform_8x8_intra(cfg: &EncoderConfig) -> bool {
+    cfg.transform_8x8
+}
+
+#[cfg(feature = "rd-ablation")]
+fn rd_transform_8x8_inter(cfg: &EncoderConfig) -> bool {
+    cfg.rd_transform_8x8_inter
+}
+
+#[cfg(not(feature = "rd-ablation"))]
+fn rd_transform_8x8_inter(cfg: &EncoderConfig) -> bool {
+    cfg.transform_8x8
+}
+
+#[cfg(not(feature = "rd-ablation"))]
+const TRANSFORM_8X8_MARGIN_BITS: f64 = 0.0;
+
+#[cfg(feature = "rd-ablation")]
+fn rd_transform_8x8_margin_bits(cfg: &EncoderConfig) -> f64 {
+    cfg.rd_transform_8x8_margin_bits
+}
+
+#[cfg(not(feature = "rd-ablation"))]
+fn rd_transform_8x8_margin_bits(_: &EncoderConfig) -> f64 {
+    TRANSFORM_8X8_MARGIN_BITS
 }
 
 /// Split `mb_h` macroblock rows into at most `n` contiguous bands.
@@ -710,5 +807,15 @@ mod tests {
         };
         assert!(matches!(err, Error::Unsupported { .. }), "{err}");
         assert!(Encoder::new(EncoderConfig::new(640, 480)).is_ok());
+    }
+    #[test]
+    fn production_lambda_tracks_transform_mode() {
+        let mut cfg = EncoderConfig::new(640, 480);
+        assert_eq!(
+            lambda_for(26, rd_lambda_standard(&cfg)),
+            lambda_for(26, false)
+        );
+        cfg.transform_8x8 = true;
+        assert_eq!(lambda_for(26, rd_lambda_standard(&cfg)), lambda_ssd(26));
     }
 }
