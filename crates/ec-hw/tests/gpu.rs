@@ -1934,3 +1934,97 @@ fn starts_with_cra(au: &[u8]) -> bool {
     }
     false
 }
+
+/// `ffmpeg -bsf:v trace_headers` over a bitstream, returning every
+/// `name = value` line it prints — the slice header fields the driver wrote.
+fn trace_headers(path: &Path, codec: &str) -> Vec<(String, i64)> {
+    let out = Command::new("ffmpeg")
+        .args(["-v", "trace", "-hide_banner", "-nostats", "-f", codec, "-i"])
+        .arg(path)
+        .args(["-c:v", "copy", "-bsf:v", "trace_headers", "-f", "null", "-"])
+        .output()
+        .expect("ffmpeg runs");
+    let text = String::from_utf8_lossy(&out.stderr);
+    text.lines()
+        .filter_map(|line| {
+            // "[trace_headers @ 0x...] 16 frame_num 0000 = 0"
+            let (lhs, value) = line.rsplit_once(" = ")?;
+            let mut words = lhs.split_whitespace().rev();
+            let _bits = words.next()?;
+            let name = words.next()?;
+            Some((name.to_string(), value.trim().parse().ok()?))
+        })
+        .collect()
+}
+
+/// Phone-class stateful decoders order output from `frame_num` and the POC
+/// fields, so a stream whose every slice says 0/0 judders there even though
+/// desktop decoders (which re-derive from decode order) play it cleanly.
+/// Encode a long P-run and read the fields back the way such a decoder does.
+fn slice_counters(codec: EncCodec, width: u32, height: u32, frames: u32) -> (PathBuf, Vec<(String, i64)>) {
+    let Some(display) = display() else { return (PathBuf::new(), Vec::new()) };
+    let mut config = EncoderConfig::new(codec, width, height);
+    config.gop_size = frames * 2;
+    config.framerate = (30, 1);
+    config.rate_control = RateControlMode::ConstantQp { qp: 30 };
+    let mut encoder = Encoder::new(&display, config).expect("encoder");
+    let mut out = Vec::new();
+    for t in 0..frames {
+        let coded = encoder
+            .encode(&source_frame(width, height, t), FrameMetadata { timestamp: i64::from(t), force_keyframe: false })
+            .expect("encode");
+        assert_eq!(coded.is_keyframe, t == 0, "one IDR then P-frames at {t}");
+        out.extend_from_slice(&coded.data);
+    }
+    let dir = std::env::temp_dir().join(format!("ec-hw-counters-{codec:?}"));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let (name, fmt) = match codec {
+        EncCodec::H264 => ("out.264", "h264"),
+        EncCodec::H265 => ("out.265", "hevc"),
+        EncCodec::Av1 => unreachable!(),
+    };
+    let path = dir.join(name);
+    std::fs::write(&path, &out).expect("write");
+    let fields = trace_headers(&path, fmt);
+    (path, fields)
+}
+
+fn values<'a>(fields: &'a [(String, i64)], name: &str) -> Vec<i64> {
+    fields.iter().filter(|(n, _)| n == name).map(|(_, v)| *v).collect()
+}
+
+#[test]
+fn h264_slice_headers_count_frames_for_stateful_decoders() {
+    let frames = 64u32;
+    let (path, fields) = slice_counters(EncCodec::H264, 640, 360, frames);
+    if fields.is_empty() {
+        return;
+    }
+    let frame_num = values(&fields, "frame_num");
+    assert_eq!(frame_num.len(), frames as usize, "one slice per picture in {}", path.display());
+    let log2_max = values(&fields, "log2_max_frame_num_minus4")[0] + 4;
+    let max_frame_num = 1i64 << log2_max;
+    let expected: Vec<i64> = (0..frames as i64).map(|n| n % max_frame_num).collect();
+    assert_eq!(frame_num, expected, "frame_num steps +1 mod {max_frame_num}");
+    // pic_order_cnt_type 2: POC = 2 * FrameNumOffset-adjusted frame_num, no lsb is
+    // written — the decoder's output order is the decode order by construction.
+    let poc_type = values(&fields, "pic_order_cnt_type");
+    assert!(!poc_type.is_empty() && poc_type.iter().all(|&t| t == 2), "POC type 2 in the SPS: {poc_type:?}");
+    assert!(values(&fields, "pic_order_cnt_lsb").is_empty(), "no POC lsb under type 2");
+    assert!(values(&fields, "level_idc").iter().all(|&l| l == 30), "640x360@30 is level 3.0");
+}
+
+#[test]
+fn hevc_slice_headers_count_pocs_for_stateful_decoders() {
+    let frames = 64u32;
+    let (path, fields) = slice_counters(EncCodec::H265, 640, 360, frames);
+    if fields.is_empty() {
+        return;
+    }
+    let lsb = values(&fields, "slice_pic_order_cnt_lsb");
+    assert_eq!(lsb.len(), frames as usize - 1, "every non-IDR slice carries a POC lsb in {}", path.display());
+    let log2_max = values(&fields, "log2_max_pic_order_cnt_lsb_minus4")[0] + 4;
+    let max_lsb = 1i64 << log2_max;
+    let expected: Vec<i64> = (1..frames as i64).map(|n| n % max_lsb).collect();
+    assert_eq!(lsb, expected, "POC lsb steps +1 mod {max_lsb}");
+}
