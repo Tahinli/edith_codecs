@@ -1,7 +1,7 @@
 //! The handful of tags a media library actually shows: title, artist, album,
 //! date and track number, out of ID3v1, ID3v2 and Vorbis comments.
 //!
-//! Deliberately small. edith reads no metadata at all today (its symphonia
+//! Deliberately small. edith reads no metadata at all today (its incumbent
 //! reader passes `MetadataOptions::default()` and never asks for the result),
 //! so this exists to keep the door open rather than to be complete: no cover
 //! art, no arbitrary user frames, and no mp4 `ilst` — an iTunes-tagged `.m4a`

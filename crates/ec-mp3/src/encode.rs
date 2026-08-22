@@ -27,7 +27,7 @@ use ec_dsp::{RealFft, Window};
 
 /// Encoder settings.
 ///
-/// The field names match the incumbent `rusty_mp3` shim's, because the replica
+/// The field names match the incumbent MP3 encoder shim's, because the replica
 /// swaps one for the other without touching call sites.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Mp3EncoderConfig {

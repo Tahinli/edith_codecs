@@ -1,6 +1,6 @@
 //! Round-trip, ceiling and malformed-input tests.
 //!
-//! flate2's default backend *is* miniz_oxide, so compressing here at every
+//! flate2's default backend *is* the incumbent DEFLATE encoder, so compressing here at every
 //! level exercises exactly the encoder whose output edith has to inflate; the
 //! comparison is against the original bytes, which is stricter than agreeing
 //! with another decoder.
