@@ -257,6 +257,9 @@ pub struct VorbisEncoder {
     scheduler: Sched,
     /// Headroom under the masking curve, in dB — the rate loop's variable.
     headroom: f64,
+    /// Bits the forced-precision blocks spent past their share, repaid by the
+    /// steady blocks that follow (see [`VorbisEncoder::update_rate`]).
+    reservoir_debt: f64,
     finished: bool,
     packets: std::collections::VecDeque<EncodedPacket>,
 }
@@ -342,6 +345,7 @@ impl VorbisEncoder {
             granule: 0,
             scheduler: Sched::Steady,
             headroom: 4.0 + 26.0 * quality,
+            reservoir_debt: 0.0,
             finished: false,
             packets: std::collections::VecDeque::new(),
             config,
@@ -819,7 +823,8 @@ impl VorbisEncoder {
         );
         let bits = out.len();
         let delta = (self.centre + (self.prev_n + n) as i64 / 4) - self.centre;
-        self.update_rate(bits, half, channels, delta);
+        let steady = plan.is_long && plan.prev_long && plan.next_long;
+        self.update_rate(bits, half, channels, delta, steady);
         out.finish()
     }
 
@@ -833,14 +838,29 @@ impl VorbisEncoder {
     /// judged against a proportionally small bit budget. The ceiling is well
     /// past [`HEADROOM_RANGE`]: beyond it headroom buys bins under the
     /// threshold rather than step, which is what quiet content needs.
-    fn update_rate(&mut self, bits: u64, half: usize, channels: usize, delta: i64) {
+    ///
+    /// Blocks next to a short window are quantised with a forced minimum
+    /// precision the loop cannot lower, so their overspend must not step the
+    /// headroom: a run of 16–32 short blocks at −2 dB each drove it to the
+    /// −24 dB floor, which put the floor above the signal and emitted ~10
+    /// silent long blocks (200 ms dropouts at −20 dBFS) after every
+    /// transient. Their excess goes into a reservoir debt instead, repaid by
+    /// the steady blocks that follow at no more than a quarter of each block's
+    /// share, so the rate still lands on target over about a second.
+    fn update_rate(&mut self, bits: u64, half: usize, channels: usize, delta: i64, steady: bool) {
         if self.config.bitrate_bps <= 0 || delta <= 0 {
             return;
         }
         let target = f64::from(self.config.bitrate_bps) * RATE_TARGET_SCALE * delta as f64
             / f64::from(self.config.sample_rate);
+        if !steady {
+            self.reservoir_debt += bits as f64 - target;
+            return;
+        }
+        let repay = self.reservoir_debt.clamp(-target * 0.25, target * 0.25);
+        self.reservoir_debt -= repay;
         let coefficients = (half * channels) as f64;
-        let step = ((target - bits as f64) / (coefficients / 6.0)).clamp(-2.0, 2.0);
+        let step = ((target - repay - bits as f64) / (coefficients / 6.0)).clamp(-2.0, 2.0);
         // Negative headroom is not a mistake: it puts the floor *above* the
         // signal, which quantises the coefficients under it to zero and lets a
         // whole partition become class 0 for two bits. Without that a low target
