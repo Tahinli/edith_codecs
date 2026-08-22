@@ -748,7 +748,246 @@ fn quiet_content_reaches_the_target_or_is_transparent() {
     }
 }
 
+/// Per-Bark-band quantised-residue histogram comparison: ours vs libvorbis
+/// reference.  We encode the source with our encoder (capturing residue), then
+/// encode the same source with libvorbis and decode that stream with our own
+/// decoder, capturing its decoded residue (after inverse coupling, before
+/// floor multiply — the same domain as the encoder's `quantised`).  The
+/// reference is libvorbis's own residue, so per-band divergence names where
+/// our psy spends differently from libvorbis.
+#[test]
+#[ignore = "slow: encodes 7 sources × 128k, needs ffmpeg/libvorbis"]
+fn residue_histogram_vs_reference() {
+    use std::io::Write;
 
+    let sources: &[(&str, &str)] = &[
+        ("nik", "~/Music/Yok - Nikbinler.mp4"),
+        ("zaur", "~/Music/Zaur Xan- Dusun Meni.mp3"),
+        ("her", "~/Music/Her Nerdeysen.mp3"),
+        ("naz", "~/Music/naz_aglama_ben_aglarim.mp4"),
+        ("sadie", "~/Music/sadie.wav"),
+        ("dl8a", "~/Downloads/8a3b6d1d19.mp3"),
+        ("hein", "~/Downloads/Sadie Sink Talks Her Little Known Singing Skills, Stranger Things 5 and Brendan Fraser.mp3"),
+    ];
+    let bitrate = 128_000i32;
+    let rate = 48_000u32;
+    let channels = 2u16;
+    // Limit to ~12 s for speed — enough blocks for a stable histogram.
+    let max_samples = rate as usize * 12;
+
+    let out_dir = scratch().join("vorbis7");
+    std::fs::create_dir_all(&out_dir).expect("out dir");
+    let mut report = String::new();
+    report.push_str("# Residue histogram: ours vs libvorbis reference\n\n");
+    report.push_str(&format!("Bitrate: {} kbps, {} Hz, {}ch, {} s max\n\n",
+        bitrate / 1000, rate, channels, max_samples / rate as usize));
+
+    for &(name, src_path) in sources {
+        let expanded = shellexpand(src_path);
+        let src = PathBuf::from(&expanded);
+        if !src.exists() {
+            report.push_str(&format!("## {name}: SKIP (file not found: {expanded})\n\n"));
+            continue;
+        }
+        // Decode source with ffmpeg, limit duration.
+        let Some((source_pcm, src_rate)) = ffmpeg_decode_limited(&src, rate, max_samples) else {
+            report.push_str(&format!("## {name}: SKIP (ffmpeg decode failed)\n\n"));
+            continue;
+        };
+        if source_pcm.len() < 2 || source_pcm[0].is_empty() {
+            report.push_str(&format!("## {name}: SKIP (empty decode)\n\n"));
+            continue;
+        }
+        // Resample to 48k if needed — ffmpeg_decode_limited already targets 48k.
+        let _ = src_rate;
+
+        // --- Ours: encode source with our encoder, capture residue, keep the ogg ---
+        let ours_ogg = out_dir.join(format!("ours-{name}-128k.ogg"));
+        let (ours_residue, ours_bytes) =
+            encode_and_capture(&source_pcm, rate, channels, bitrate, &ours_ogg);
+
+        // --- Sanity: decoding our own ogg with capture on must reproduce the
+        // encoder's capture band for band, or the two captures are not in the
+        // same domain and the table below means nothing. ---
+        let roundtrip = decode_capture(&ours_ogg);
+        let (sanity_ok, sanity_detail) = compare_captures(&ours_residue, &roundtrip, rate);
+
+        // --- Reference: encode with libvorbis, decode with OUR decoder, capture ---
+        let ref_ogg = out_dir.join(format!("ref-{name}-128k.ogg"));
+        let ref_status = Command::new("ffmpeg")
+            .args(["-y", "-v", "error", "-i"])
+            .arg(&src)
+            .args(["-t", &format!("{}", max_samples / rate as usize),
+                   "-ac", "2", "-ar", "48000",
+                   "-c:a", "libvorbis", "-b:a", "128k"])
+            .arg(&ref_ogg)
+            .status();
+        let ref_residue = match ref_status {
+            Ok(s) if s.success() => decode_capture(&ref_ogg),
+            _ => {
+                report.push_str(&format!("## {name}: libvorbis encode failed\n\n"));
+                continue;
+            }
+        };
+        let ref_bytes = std::fs::metadata(&ref_ogg).expect("ref ogg").len();
+
+        // --- Build per-Bark-band histograms ---
+        let bins = 6; // |q|: 0, 1, 2, 3-4, 5-8, 9+
+        let max_bark = 25;
+        let mut ours_hist = vec![vec![0u64; bins]; max_bark];
+        let mut ref_hist = vec![vec![0u64; bins]; max_bark];
+        for (half, quantised) in &ours_residue {
+            accumulate(quantised, *half, rate, &mut ours_hist, max_bark);
+        }
+        for (half, quantised) in &ref_residue {
+            accumulate(quantised, *half, rate, &mut ref_hist, max_bark);
+        }
+
+        report.push_str(&format!(
+            "## {name} — sanity {}: {} — ours {} B vs ref {} B ({:.2}x)\n\n",
+            if sanity_ok { "PASS" } else { "FAIL" },
+            sanity_detail,
+            ours_bytes,
+            ref_bytes,
+            ours_bytes as f64 / ref_bytes as f64
+        ));
+        report.push_str("| Bark | q=0 ours/ref | q=1 | q=2 | q=3-4 | q=5-8 | q=9+ | total ours/ref | spend ratio |\n");
+        report.push_str("|------|-------------|-----|-----|-------|-------|------|-----------------|-------------|\n");
+        for band in 0..max_bark {
+            let o = &ours_hist[band];
+            let r = &ref_hist[band];
+            let o_total: u64 = o.iter().sum();
+            let r_total: u64 = r.iter().sum();
+            if o_total == 0 && r_total == 0 {
+                continue;
+            }
+            // "Spend" = non-zero entries (bins 1..) — proxy for bits spent.
+            let o_spend: u64 = o[1..].iter().sum();
+            let r_spend: u64 = r[1..].iter().sum();
+            let ratio = if r_spend > 0 {
+                o_spend as f64 / r_spend as f64
+            } else { f64::INFINITY };
+            report.push_str(&format!(
+                "| {} | {}/{} | {}/{} | {}/{} | {}/{} | {}/{} | {}/{} | {}/{} | {:.2} |\n",
+                band, o[0], r[0], o[1], r[1], o[2], r[2], o[3], r[3], o[4], r[4], o[5], r[5],
+                o_total, r_total, ratio,
+            ));
+        }
+        report.push_str("\n");
+    }
+
+    let report_path = out_dir.join("histogram.txt");
+    let mut f = File::create(&report_path).expect("create report");
+    f.write_all(report.as_bytes()).expect("write report");
+    println!("Histogram report: {}", report_path.display());
+    // Also print to stdout for immediate viewing.
+    print!("{report}");
+}
+
+/// Encode PCM with our encoder, capturing per-block quantised residue, and mux
+/// the result to `out` so it can be decoded back (sanity check + rate).
+fn encode_and_capture(
+    source: &[Vec<f32>],
+    rate: u32,
+    channels: u16,
+    bitrate: i32,
+    out: &Path,
+) -> (Vec<(usize, Vec<Vec<i32>>)>, u64) {
+    let mut encoder = VorbisEncoder::new(EncoderConfig {
+        sample_rate: rate,
+        channels,
+        bitrate_bps: bitrate,
+        quality: 0.6,
+    })
+    .expect("encoder");
+    encoder.enable_residue_capture();
+    let borrowed: Vec<&[f32]> = source.iter().map(|c| &c[..]).collect();
+    encoder.push_planar(&borrowed).expect("push");
+    encoder.finish();
+    let mut packets = Vec::new();
+    loop {
+        match encoder.next_packet() {
+            Ok(packet) => packets.push((packet.data, packet.granule)),
+            Err(e) if e.is_eof() => break,
+            Err(e) => panic!("encode: {e}"),
+        }
+    }
+    mux(out, &encoder, &packets, rate, channels);
+    let bytes = std::fs::metadata(out).expect("muxed file").len();
+    (encoder.take_residue_capture(), bytes)
+}
+
+/// Decode with ours, capturing per-block residue (after inverse coupling,
+/// before floor multiply) — the decoder-side view of the same domain the
+/// encoder captures.
+fn decode_capture(path: &Path) -> Vec<(usize, Vec<Vec<i32>>)> {
+    let mut demuxer = OggDemuxer::open(File::open(path).expect("open")).expect("ogg");
+    let stream = demuxer
+        .streams()
+        .iter()
+        .find(|s| s.params.codec == ec_core::CodecId::Vorbis)
+        .expect("a Vorbis stream")
+        .clone();
+    let extradata = stream.params.extradata.clone().expect("headers");
+    let mut decoder = VorbisDecoder::from_extradata(&extradata).expect("headers parse");
+    decoder.enable_residue_capture();
+    loop {
+        let packet = match demuxer.next_packet() {
+            Ok(packet) => packet,
+            Err(e) if e.is_eof() => break,
+            Err(e) => panic!("demux {}: {e}", path.display()),
+        };
+        if packet.stream != stream.index {
+            continue;
+        }
+        // A packet the decoder cannot use is skipped, like in `our_decode`.
+        if decoder.decode_audio(&packet.data).is_err() {
+            continue;
+        }
+    }
+    decoder.take_residue_capture()
+}
+
+/// Bin two captures by Bark and compare every histogram cell.
+fn compare_captures(
+    a: &[(usize, Vec<Vec<i32>>)],
+    b: &[(usize, Vec<Vec<i32>>)],
+    rate: u32,
+) -> (bool, String) {
+    let bins = 6;
+    let max_bark = 25;
+    let mut ha = vec![vec![0u64; bins]; max_bark];
+    let mut hb = vec![vec![0u64; bins]; max_bark];
+    for (half, q) in a {
+        accumulate(q, *half, rate, &mut ha, max_bark);
+    }
+    for (half, q) in b {
+        accumulate(q, *half, rate, &mut hb, max_bark);
+    }
+    let mut diffs = Vec::new();
+    for band in 0..max_bark {
+        for bucket in 0..bins {
+            if ha[band][bucket] != hb[band][bucket] {
+                diffs.push(format!(
+                    "bark {band} q{bucket}: {} vs {}",
+                    ha[band][bucket], hb[band][bucket]
+                ));
+            }
+        }
+    }
+    if diffs.is_empty() {
+        (true, format!("identical histograms ({} vs {} blocks)", a.len(), b.len()))
+    } else {
+        (false, format!(
+            "{} vs {} blocks; first diffs: {}",
+            a.len(),
+            b.len(),
+            diffs.iter().take(5).cloned().collect::<Vec<_>>().join("; ")
+        ))
+    }
+}
+
+/// Decode with ffmpeg into planar f32, resampled to `rate`, limited to `max_samples`.
 fn ffmpeg_decode_limited(path: &Path, rate: u32, max_samples: usize) -> Option<(Vec<Vec<f32>>, u32)> {
     let out = Command::new("ffmpeg")
         .args(["-v", "error", "-i"])
@@ -777,8 +1016,36 @@ fn ffmpeg_decode_limited(path: &Path, rate: u32, max_samples: usize) -> Option<(
     Some((planes, rate))
 }
 
+/// Accumulate per-Bark-band |q| histograms from quantised residue.
+fn accumulate(
+    quantised: &[Vec<i32>],
+    half: usize,
+    rate: u32,
+    hist: &mut [Vec<u64>],
+    max_bark: usize,
+) {
+    for channel in quantised {
+        for (bin, &q) in channel.iter().enumerate() {
+            if bin >= half {
+                break;
+            }
+            let hz = bin as f64 * f64::from(rate) / (2.0 * half as f64);
+            let bark = VorbisEncoder::bark_hz(hz) as usize;
+            let band = bark.min(max_bark - 1);
+            let bucket = match q.abs() {
+                0 => 0,
+                1 => 1,
+                2 => 2,
+                3..=4 => 3,
+                5..=8 => 4,
+                _ => 5,
+            };
+            hist[band][bucket] += 1;
+        }
+    }
+}
 
-
+/// Expand `~` in a path string.
 fn shellexpand(path: &str) -> String {
     if let Some(rest) = path.strip_prefix("~/") {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/home".to_string());
