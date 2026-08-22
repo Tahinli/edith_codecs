@@ -781,6 +781,8 @@ fn residue_histogram_vs_reference() {
     report.push_str("# Residue histogram: ours vs libvorbis reference\n\n");
     report.push_str(&format!("Bitrate: {} kbps, {} Hz, {}ch, {} s max\n\n",
         bitrate / 1000, rate, channels, max_samples / rate as usize));
+    let mut total_ours_bytes = 0u64;
+    let mut total_ref_bytes = 0u64;
 
     for &(name, src_path) in sources {
         let expanded = shellexpand(src_path);
@@ -815,9 +817,12 @@ fn residue_histogram_vs_reference() {
         // --- Reference: encode with libvorbis, decode with OUR decoder, capture ---
         let ref_ogg = out_dir.join(format!("ref-{name}-128k.ogg"));
         let ref_status = Command::new("ffmpeg")
+            // `-vn`: with the video stream still attached (naz, h264+aac mp4)
+            // ffmpeg's libvorbis wrapper ignores -b:a and encodes at ~3.2x the
+            // target; audio-only input encodes at the requested rate.
             .args(["-y", "-v", "error", "-i"])
             .arg(&src)
-            .args(["-t", &format!("{}", max_samples / rate as usize),
+            .args(["-vn", "-t", &format!("{}", max_samples / rate as usize),
                    "-ac", "2", "-ar", "48000",
                    "-c:a", "libvorbis", "-b:a", "128k"])
             .arg(&ref_ogg)
@@ -830,6 +835,8 @@ fn residue_histogram_vs_reference() {
             }
         };
         let ref_bytes = std::fs::metadata(&ref_ogg).expect("ref ogg").len();
+        total_ours_bytes += ours_bytes;
+        total_ref_bytes += ref_bytes;
 
         // --- Build per-Bark-band histograms ---
         let bins = 6; // |q|: 0, 1, 2, 3-4, 5-8, 9+
@@ -873,10 +880,59 @@ fn residue_histogram_vs_reference() {
                 o_total, r_total, ratio,
             ));
         }
+
+        // Fraction table: per-band share of entries in each |q| class and the
+        // shape distance = sum |f_ours - f_ref| over the four classes
+        // (0 = identical spend shape; convergence target < 0.15 in Bark 3-22).
+        report.push_str("| Bark | f0 ours | f0 ref | f1 ours | f1 ref | f2 ours | f2 ref | f3+ ours | f3+ ref | dist |\n");
+        report.push_str("|------|---------|--------|---------|--------|---------|--------|----------|---------|------|\n");
+        let frac = |h: &[u64], total: u64| {
+            vec![
+                h[0] as f64 / total as f64,
+                h[1] as f64 / total as f64,
+                h[2] as f64 / total as f64,
+                (h[3] + h[4] + h[5]) as f64 / total as f64,
+            ]
+        };
+        let mut band_dist: Vec<(usize, f64)> = Vec::new();
+        for band in 0..max_bark {
+            let o_total: u64 = ours_hist[band].iter().sum();
+            let r_total: u64 = ref_hist[band].iter().sum();
+            if o_total == 0 || r_total == 0 {
+                continue;
+            }
+            let fo = frac(&ours_hist[band], o_total);
+            let fr = frac(&ref_hist[band], r_total);
+            let dist: f64 = fo.iter().zip(&fr).map(|(a, b)| (a - b).abs()).sum();
+            band_dist.push((band, dist));
+            report.push_str(&format!(
+                "| {} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} | {:.3} |\n",
+                band, fo[0], fr[0], fo[1], fr[1], fo[2], fr[2], fo[3], fr[3], dist,
+            ));
+        }
+        let in_scope: Vec<(usize, f64)> = band_dist
+            .iter()
+            .filter(|(b, _)| (3..=22).contains(b))
+            .cloned()
+            .collect();
+        if !in_scope.is_empty() {
+            let max_d = in_scope.iter().map(|(_, d)| *d).fold(f64::MIN, f64::max);
+            let over = in_scope.iter().filter(|(_, d)| *d >= 0.15).count();
+            report.push_str(&format!(
+                "\nshape Bark 3-22: max dist {max_d:.3}, bands >= 0.15: {over}/{} — {}\n",
+                in_scope.len(),
+                if over == 0 { "SHAPE PASS" } else { "shape fail" },
+            ));
+        }
         report.push_str("\n");
     }
 
-    let report_path = out_dir.join("histogram.txt");
+    report.push_str(&format!(
+        "\nTotal bytes: ours {total_ours_bytes} vs ref {total_ref_bytes} ({:.2}x)\n",
+        total_ours_bytes as f64 / total_ref_bytes as f64,
+    ));
+    let report_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../lanes/vorbis-psy-r1.histogram.txt");
     let mut f = File::create(&report_path).expect("create report");
     f.write_all(report.as_bytes()).expect("write report");
     println!("Histogram report: {}", report_path.display());
@@ -1061,7 +1117,7 @@ fn shellexpand(path: &str) -> String {
 /// unmanaged VBR, 10-30% under nominal on real music), bytes within ±3% of
 /// it and correlation-to-source within .005 of it. Both encodes decode
 /// through our decoder so the gap measures the encoders, not the decoders.
-/// Writes `lanes/vorbis-reservoir.sweep.txt`.
+/// Writes `lanes/vorbis-psy-r1.sweep.txt`.
 #[test]
 #[ignore = "slow: encodes 7 full sources × 2 rates, needs ffmpeg/libvorbis"]
 fn real_library_sweep_vs_reference() {
@@ -1134,7 +1190,7 @@ fn real_library_sweep_vs_reference() {
     }
     eprintln!("\n{table}");
     let _ = std::fs::write(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lanes/vorbis7-bisect.sweep.txt"),
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lanes/vorbis-psy-r1.sweep.txt"),
         &table,
     );
     assert!(failures.is_empty(), "sweep failures: {failures:?}");
