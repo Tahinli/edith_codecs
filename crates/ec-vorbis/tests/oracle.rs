@@ -811,8 +811,9 @@ fn residue_histogram_vs_reference() {
         // --- Sanity: decoding our own ogg with capture on must reproduce the
         // encoder's capture band for band, or the two captures are not in the
         // same domain and the table below means nothing. ---
-        let roundtrip = decode_capture(&ours_ogg);
+        let (roundtrip, ours_split) = decode_capture_with_bits(&ours_ogg);
         let (sanity_ok, sanity_detail) = compare_captures(&ours_residue, &roundtrip, rate);
+        let ours_bits = bit_split_summary(&ours_split, &roundtrip);
 
         // --- Reference: encode with libvorbis, decode with OUR decoder, capture ---
         let ref_ogg = out_dir.join(format!("ref-{name}-128k.ogg"));
@@ -827,8 +828,8 @@ fn residue_histogram_vs_reference() {
                    "-c:a", "libvorbis", "-b:a", "128k"])
             .arg(&ref_ogg)
             .status();
-        let ref_residue = match ref_status {
-            Ok(s) if s.success() => decode_capture(&ref_ogg),
+        let (ref_residue, ref_split) = match ref_status {
+            Ok(s) if s.success() => decode_capture_with_bits(&ref_ogg),
             _ => {
                 report.push_str(&format!("## {name}: libvorbis encode failed\n\n"));
                 continue;
@@ -858,6 +859,18 @@ fn residue_histogram_vs_reference() {
             ref_bytes,
             ours_bytes as f64 / ref_bytes as f64
         ));
+        let ref_bits = bit_split_summary(&ref_split, &ref_residue);
+        for (who, b) in [("ours", ours_bits), ("ref", ref_bits)] {
+            let (f, r, p, nz) = b;
+            report.push_str(&format!(
+                "bits {who}: floor {f} ({:.1}%), residue {r} ({:.1}%), other {}, packet {p}; non-zero {nz}, residue bits/non-zero {:.2}\n",
+                100.0 * f as f64 / p.max(1) as f64,
+                100.0 * r as f64 / p.max(1) as f64,
+                p.saturating_sub(f + r),
+                r as f64 / nz.max(1) as f64
+            ));
+        }
+        report.push('\n');
         report.push_str("| Bark | q=0 ours/ref | q=1 | q=2 | q=3-4 | q=5-8 | q=9+ | total ours/ref | spend ratio |\n");
         report.push_str("|------|-------------|-----|-----|-------|-------|------|-----------------|-------------|\n");
         for band in 0..max_bark {
@@ -977,6 +990,26 @@ fn encode_and_capture(
 /// before floor multiply) — the decoder-side view of the same domain the
 /// encoder captures.
 fn decode_capture(path: &Path) -> Vec<(usize, Vec<Vec<i32>>)> {
+    decode_capture_with_bits(path).0
+}
+
+/// Bit split summed over the stream: (floor bits, residue bits, packet bits,
+/// non-zero residue count) — bits per coded value is the coding-efficiency oracle.
+fn bit_split_summary(split: &[(u64, u64, u64)], residue: &[(usize, Vec<Vec<i32>>)]) -> (u64, u64, u64, u64) {
+    let (mut f, mut r, mut p) = (0u64, 0u64, 0u64);
+    for &(a, b, c) in split {
+        f += a;
+        r += b;
+        p += c;
+    }
+    let nz: u64 = residue
+        .iter()
+        .map(|(_, chs)| chs.iter().map(|c| c.iter().filter(|&&v| v != 0).count() as u64).sum::<u64>())
+        .sum();
+    (f, r, p, nz)
+}
+
+fn decode_capture_with_bits(path: &Path) -> (Vec<(usize, Vec<Vec<i32>>)>, Vec<(u64, u64, u64)>) {
     let mut demuxer = OggDemuxer::open(File::open(path).expect("open")).expect("ogg");
     let stream = demuxer
         .streams()
@@ -1001,7 +1034,9 @@ fn decode_capture(path: &Path) -> Vec<(usize, Vec<Vec<i32>>)> {
             continue;
         }
     }
-    decoder.take_residue_capture()
+    let residue = decoder.take_residue_capture();
+    let bits = decoder.take_bit_split();
+    (residue, bits)
 }
 
 /// Bin two captures by Bark and compare every histogram cell.
