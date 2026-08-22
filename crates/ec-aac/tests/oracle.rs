@@ -373,7 +373,7 @@ fn sbr_is_reported_not_silently_upsampled() {
 }
 
 /// The incumbent encoder's per-channel correlation on these exact fixtures,
-/// measured by running `rusty_aac` 0.5.0 as a black box through the same
+/// measured by running the incumbent AAC encoder, 0.5.0, as a black box through the same
 /// ffmpeg decode (2026-08-14). This is the bar the replacement has to clear.
 const INCUMBENT_BAR: &[(&str, usize, u32, f64)] = &[
     ("mono", 1, 96, 0.9846),

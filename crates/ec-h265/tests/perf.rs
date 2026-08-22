@@ -1,7 +1,7 @@
 //! The speed bar, measured the way the claim is made: one `encode_idr` call per
 //! picture, zero threads on the caller's side.
 //!
-//! The incumbent this replaces (`oxideav-h265`) has no threads at all inside its
+//! The incumbent H.265 encoder this replaces has no threads at all inside its
 //! encoder — edith fans whole access units out across twelve cores to reach 4.30
 //! fps at 1080p. The bar here is to beat that from *inside* one call, so the
 //! measurement below hands one picture at a time to one encoder.
