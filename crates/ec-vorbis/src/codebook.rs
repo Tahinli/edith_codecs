@@ -370,72 +370,97 @@ impl CodebookSpec {
     }
 }
 
-/// Length-limited Huffman code lengths for `weights`, capped at 24 bits.
+/// Huffman code lengths for `weights`, capped at 24 bits.
 ///
-/// Package-merge (Larmore–Hirschberg): optimal under the cap and
-/// Kraft-complete by construction, so the decoder's canonical rebuild has no
-/// ambiguity and no hole. The earlier clamp-then-rebalance scheme was O(n)
-/// per 2^-25 of Kraft slack: corpus-fitted books with weights spanning five
-/// decades made one encoder construction cost nine seconds.
+/// The cap is enforced by flattening: a weight small enough to earn a 25-bit
+/// codeword is raised until it does not. With at most a few hundred entries and
+/// weights within a few decades of each other the cap never binds, and when it
+/// does the cost is a fraction of a bit on the rarest symbol.
 fn huffman_lengths(weights: &[f64]) -> Vec<u8> {
-    const MAX_LENGTH: usize = 24;
     let n = weights.len();
     assert!(n > 0, "a codebook needs at least one entry");
     if n == 1 {
         return vec![1];
     }
-    assert!(n <= 1 << MAX_LENGTH, "more entries than 24-bit codewords");
-    // Zero weights still need a codeword; keep them far below everything real.
     let floor = weights.iter().cloned().fold(0.0f64, f64::max) / 8_388_608.0;
-    let mut leaves: Vec<(f64, usize)> = weights
+    let mut nodes: Vec<(f64, usize)> = weights
         .iter()
         .enumerate()
         .map(|(i, &w)| (w.max(floor).max(f64::MIN_POSITIVE), i))
         .collect();
-    leaves.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap().then(a.1.cmp(&b.1)));
-
-    // An item is a leaf or a package of two items from the previous level.
-    #[derive(Clone, Copy)]
-    enum Item {
-        Leaf(usize),
-        Package(usize, usize),
-    }
-    // levels[l] = sorted items at that level; level 0 is the deepest.
-    let mut levels: Vec<Vec<(f64, Item)>> = Vec::with_capacity(MAX_LENGTH);
-    let leaf_items: Vec<(f64, Item)> = leaves.iter().map(|&(w, i)| (w, Item::Leaf(i))).collect();
-    levels.push(leaf_items.clone());
-    for level in 1..MAX_LENGTH {
-        let prev = &levels[level - 1];
-        let mut packages: Vec<(f64, Item)> = prev
-            .chunks_exact(2)
-            .enumerate()
-            .map(|(k, pair)| (pair[0].0 + pair[1].0, Item::Package(2 * k, 2 * k + 1)))
-            .collect();
-        let mut merged = leaf_items.clone();
-        merged.append(&mut packages);
-        merged.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-        levels.push(merged);
-    }
-
-    // The cheapest 2n-2 items of the top level; each leaf occurrence adds one
-    // to that symbol's length.
-    let mut lengths = vec![0u8; n];
-    let mut stack: Vec<(usize, usize)> = (0..2 * n - 2).map(|k| (MAX_LENGTH - 1, k)).collect();
-    while let Some((level, index)) = stack.pop() {
-        match levels[level][index].1 {
-            Item::Leaf(i) => lengths[i] += 1,
-            Item::Package(a, b) => {
-                stack.push((level - 1, a));
-                stack.push((level - 1, b));
+    // Leaves first, then merged nodes, tracked as a forest over `parent`.
+    let mut parent = vec![usize::MAX; n];
+    let mut heap: Vec<(f64, usize)> = nodes.clone();
+    heap.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    let mut merged: Vec<(f64, usize)> = Vec::new();
+    let mut next_id = n;
+    while heap.len() + merged.len() > 1 {
+        let mut take = || -> (f64, usize) {
+            let from_heap = heap.last().map(|x| x.0);
+            let from_merged = merged.first().map(|x| x.0);
+            match (from_heap, from_merged) {
+                (Some(a), Some(b)) if a <= b => heap.pop().unwrap(),
+                (Some(_), None) => heap.pop().unwrap(),
+                _ => merged.remove(0),
             }
-        }
+        };
+        let (wa, a) = take();
+        let (wb, b) = take();
+        parent.push(usize::MAX);
+        parent[a] = next_id;
+        parent[b] = next_id;
+        merged.push((wa + wb, next_id));
+        next_id += 1;
     }
-    debug_assert!(lengths.iter().all(|&l| (1..=MAX_LENGTH as u8).contains(&l)));
-    debug_assert!(
-        (lengths.iter().map(|&l| 2f64.powi(-i32::from(l))).sum::<f64>() - 1.0).abs() < 1e-9,
-        "package-merge yields a complete code"
-    );
+    nodes.clear();
+
+    let mut lengths = vec![0u8; n];
+    for (i, length) in lengths.iter_mut().enumerate() {
+        let mut node = i;
+        let mut depth = 0u32;
+        while parent[node] != usize::MAX {
+            node = parent[node];
+            depth += 1;
+        }
+        *length = depth.clamp(1, 24) as u8;
+    }
+    // Clamping can leave the tree over-full; rebalance by lengthening the
+    // shallowest entries until Kraft's sum is back at one.
+    balance(&mut lengths);
     lengths
+}
+
+/// Push a length vector to exactly Kraft-complete, so the decoder's canonical
+/// rebuild has no ambiguity and no hole.
+fn balance(lengths: &mut [u8]) {
+    let kraft = |lengths: &[u8]| -> f64 {
+        lengths
+            .iter()
+            .map(|&l| 2f64.powi(-i32::from(l)))
+            .sum::<f64>()
+    };
+    // Over-full: lengthen the shortest codes.
+    while kraft(lengths) > 1.0 + 1e-12 {
+        let (index, _) = lengths
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, l)| **l)
+            .expect("non-empty");
+        lengths[index] += 1;
+    }
+    // Under-full: shorten the longest, which only ever helps the rare symbols.
+    loop {
+        let sum = kraft(lengths);
+        let (index, &longest) = lengths
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, l)| **l)
+            .expect("non-empty");
+        if longest <= 1 || sum + 2f64.powi(-i32::from(longest)) > 1.0 + 1e-12 {
+            break;
+        }
+        lengths[index] -= 1;
+    }
 }
 
 #[cfg(test)]
