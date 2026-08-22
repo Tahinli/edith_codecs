@@ -747,3 +747,128 @@ fn quiet_content_reaches_the_target_or_is_transparent() {
         }
     }
 }
+
+
+fn ffmpeg_decode_limited(path: &Path, rate: u32, max_samples: usize) -> Option<(Vec<Vec<f32>>, u32)> {
+    let out = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args(["-t", &format!("{}", max_samples / rate as usize),
+               "-ac", "2", "-ar", &rate.to_string(),
+               "-f", "f32le", "-acodec", "pcm_f32le", "-"])
+        .output()
+        .expect("ffmpeg runs");
+    if !out.stderr.is_empty() {
+        eprintln!("ffmpeg stderr: {}", String::from_utf8_lossy(&out.stderr));
+        return None;
+    }
+    let channels = 2usize;
+    let interleaved: Vec<f32> = out
+        .stdout
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    let n = interleaved.len() / channels;
+    let n = n.min(max_samples);
+    let mut planes = vec![Vec::with_capacity(n); channels];
+    for (i, value) in interleaved.into_iter().enumerate().take(n * channels) {
+        planes[i % channels].push(value);
+    }
+    Some((planes, rate))
+}
+
+
+
+fn shellexpand(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/") {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/home".to_string());
+        format!("{home}/{rest}")
+    } else {
+        path.to_string()
+    }
+}
+
+
+/// Full-file sweep over the user's library at the two managed rates: ours
+/// encoded at the size libvorbis actually produced (ffmpeg's -b:a is
+/// unmanaged VBR, 10-30% under nominal on real music), bytes within ±3% of
+/// it and correlation-to-source within .005 of it. Both encodes decode
+/// through our decoder so the gap measures the encoders, not the decoders.
+/// Writes `lanes/vorbis-reservoir.sweep.txt`.
+#[test]
+#[ignore = "slow: encodes 7 full sources × 2 rates, needs ffmpeg/libvorbis"]
+fn real_library_sweep_vs_reference() {
+    let sources: &[(&str, &str)] = &[
+        ("nik", "~/Music/Yok - Nikbinler.mp4"),
+        ("zaur", "~/Music/Zaur Xan- Dusun Meni.mp3"),
+        ("her", "~/Music/Her Nerdeysen.mp3"),
+        ("naz", "~/Music/naz_aglama_ben_aglarim.mp4"),
+        ("sadie", "~/Music/sadie.wav"),
+        ("dl8a", "~/Downloads/8a3b6d1d19.mp3"),
+        ("hein", "~/Downloads/Sadie Sink Talks Her Little Known Singing Skills, Stranger Things 5 and Brendan Fraser.mp3"),
+    ];
+    let rate = 48_000u32;
+    let max_samples = rate as usize * 600;
+    let out_dir = scratch().join("vorbis7-sweep");
+    std::fs::create_dir_all(&out_dir).expect("out dir");
+    let mut table = String::from("source  kbps   ours_kbps ref_kbps rate%   corr_ours corr_ref gap     verdict\n");
+    let mut failures = Vec::new();
+    let only = std::env::var("SWEEP_ONLY").ok();
+    for &(name, src_path) in sources {
+        if only.as_deref().is_some_and(|o| !o.split(',').any(|n| n == name)) {
+            continue;
+        }
+        let src = PathBuf::from(shellexpand(src_path));
+        if !src.exists() {
+            table.push_str(&format!("{name:<7} -      SKIP (missing)\n"));
+            continue;
+        }
+        let Some((source_pcm, _)) = ffmpeg_decode_limited(&src, rate, max_samples) else {
+            table.push_str(&format!("{name:<7} -      SKIP (decode)\n"));
+            continue;
+        };
+        let seconds = source_pcm[0].len() as f64 / f64::from(rate);
+        for &kbps in &[96i32, 128] {
+            // libvorbis under ffmpeg's -b:a runs unmanaged VBR and lands
+            // 10-30% under the nominal rate on real music, so ours is asked
+            // for the bytes it actually produced: quality at equal size.
+            let reference = out_dir.join(format!("ref-{name}-{kbps}k.ogg"));
+            let status = Command::new("ffmpeg")
+                .args(["-y", "-v", "error", "-i"])
+                .arg(&src)
+                .args(["-vn", "-t", "600", "-ac", "2", "-ar", "48000", "-c:a", "libvorbis", "-b:a", &format!("{kbps}k")])
+                .arg(&reference)
+                .status()
+                .expect("ffmpeg runs");
+            assert!(status.success(), "libvorbis encode of {name} at {kbps}k");
+            let bytes = |p: &Path| std::fs::metadata(p).expect("size").len() as f64;
+            let ref_kbps = bytes(&reference) * 8.0 / seconds / 1000.0;
+            let ours = encode_to_file(&source_pcm, rate, (ref_kbps * 1000.0).round() as i32, &format!("vorbis7-sweep/ours-{name}-{kbps}k.ogg"));
+            let ours_kbps = bytes(&ours) * 8.0 / seconds / 1000.0;
+            let rate_pct = (ours_kbps / ref_kbps - 1.0) * 100.0;
+            let corr_of = |p: &Path| -> f64 {
+                let (pcm, _) = our_decode(p);
+                let n = pcm[0].len().min(source_pcm[0].len());
+                (0..2).map(|c| correlation(&pcm[c][..n], &source_pcm[c][..n])).sum::<f64>() / 2.0
+            };
+            let corr_ours = corr_of(&ours);
+            let corr_ref = corr_of(&reference);
+            let gap = corr_ref - corr_ours;
+            let pass = rate_pct.abs() <= 3.0 && gap <= 0.005;
+            if !pass {
+                failures.push(format!("{name}@{kbps}k rate {rate_pct:+.2}% gap {gap:.4}"));
+            }
+            table.push_str(&format!(
+                "{name:<7} {kbps:<6} {ours_kbps:<9.1} {ref_kbps:<8.1} {rate_pct:+6.2} {corr_ours:<9.4} {corr_ref:<8.4} {gap:<7.4} {}\n",
+                if pass { "PASS" } else { "FAIL" }
+            ));
+            eprintln!("{}", table.lines().last().unwrap());
+        }
+    }
+    eprintln!("\n{table}");
+    let _ = std::fs::write(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lanes/vorbis7-bisect.sweep.txt"),
+        &table,
+    );
+    assert!(failures.is_empty(), "sweep failures: {failures:?}");
+}
