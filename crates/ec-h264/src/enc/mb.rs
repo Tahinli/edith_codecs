@@ -1055,6 +1055,10 @@ fn choose_chroma_mode(
 /// mode against the *reconstructed* neighbours and reconstruct it immediately,
 /// because the next block predicts from it. Returns the chosen modes and the
 /// modes they were predicted to be.
+/// How many SATD survivors the Intra_4x4 mode decision re-costs with real
+/// quantisation before choosing.
+const I4_RD_CANDIDATES: usize = 3;
+
 fn code_intra_4x4(
     pic: &mut Picture,
     e: &MbEnc<'_>,
@@ -1090,6 +1094,7 @@ fn code_intra_4x4(
         let allowed = modes_allowed(n.have_top, n.have_left, have_tl);
         let mut best = (i32::MAX, predicted.min(2));
         let mut p = [0u8; 16];
+        let mut ranked = [(i32::MAX, 2u8); 9];
         for mode in 0..9u8 {
             if !allowed[mode as usize] {
                 continue;
@@ -1097,11 +1102,70 @@ fn code_intra_4x4(
             pred_4x4(mode, &n, &mut p);
             let bits = if mode == predicted { 1 } else { 4 };
             let c = satd4(&e.src.y, e.src.stride, x, y, &p, 4) + motion_rate(e, f64::from(bits));
+            ranked[mode as usize] = (c, mode);
             if c < best.0 {
                 best = (c, mode);
             }
         }
-        let mode = best.1;
+        let mut mode = best.1;
+        // SATD ranks the modes; the survivors are re-costed with the
+        // quantisation actually in force, because a mode that predicts a
+        // little worse can quantise to far fewer levels. Measured against
+        // x264 with `bd_psnr_vs_x264` on a 3840x1608 film clip and a 2560x1440
+        // screen capture: +0.129 and +0.088 dB all-intra, +0.062 and +0.043 dB
+        // at GOP 10, for 3-4% encode time. Three survivors is where it
+        // saturates -- all nine landed within 0.002 dB of three, for 7% more
+        // encode time.
+        {
+            ranked.sort_unstable();
+            let keep = I4_RD_CANDIDATES;
+            // The same over-count [`ZERO_BLOCK_LAMBDA`] corrects for: with the
+            // full rate term this search loses 0.065 dB instead of gaining,
+            // and it loses more the more candidates it sees.
+            let lambda = ZERO_BLOCK_LAMBDA
+                * if e.lambda_standard {
+                    e.lambda
+                } else {
+                    lambda_ssd(qp)
+                };
+            let mut best_rd = f64::MAX;
+            for &(c, cand) in ranked.iter().take(keep) {
+                if c == i32::MAX {
+                    break;
+                }
+                pred_4x4(cand, &n, &mut p);
+                let mut d = [0i32; 16];
+                for ry in 0..4 {
+                    for rx in 0..4 {
+                        d[ry * 4 + rx] = i32::from(e.src.y[(y + ry) * e.src.stride + x + rx])
+                            - i32::from(p[ry * 4 + rx]);
+                    }
+                }
+                let src = d;
+                forward_4x4(&mut d);
+                let mut levels = [0i32; 16];
+                let nz = quant_4x4(&d, qp, true, false, &mut levels);
+                let mut resid = [0i32; 16];
+                if nz > 0 {
+                    let mut raster = [0i32; 16];
+                    unzigzag(&levels, &mut raster);
+                    dequant_4x4(&mut raster, &e.ls, qp, false);
+                    inverse_transform_4x4(&raster, &mut resid);
+                }
+                let mut ssd = 0i64;
+                for i in 0..16 {
+                    let err = i64::from(src[i] - resid[i]);
+                    ssd += err * err;
+                }
+                let mode_bits = if cand == predicted { 1 } else { 4 };
+                let bits = block_bits(&levels) + mode_bits;
+                let cost = ssd as f64 + lambda * bits as f64;
+                if cost < best_rd {
+                    best_rd = cost;
+                    mode = cand;
+                }
+            }
+        }
         modes[blk] = mode;
         pic.i4_modes[by * w4 + bx] = mode;
         // Prediction into the plane, then residual and reconstruction.
