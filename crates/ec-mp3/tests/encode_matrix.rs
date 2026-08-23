@@ -127,6 +127,42 @@ fn aligned(got: &[f32], want: &[f32], channels: usize) -> (f64, usize) {
     best
 }
 
+/// Worst short-window error energy, relative to the source, over the file.
+///
+/// Whole-file correlation cannot see pre-echo: quantisation noise smeared
+/// backwards across a 576-sample granule before an attack is a few
+/// milliseconds of audible hash inside a minute of otherwise clean signal, and
+/// integrating over the minute divides it away. Measured on this crate, going
+/// from one short block per 9196 granules to 526 of them moved whole-file
+/// correlation by 0.00004 -- in the wrong direction -- while changing exactly
+/// the thing short blocks exist to fix. So the sweep also reports the worst
+/// window: error energy over source energy, in dB, over 20 ms windows,
+/// which is the scale a transient's pre-echo lives on.
+fn worst_window_db(got: &[f32], want: &[f32], offset: usize, channels: usize) -> f64 {
+    let window = 20 * 44100 / 1000 * channels;
+    let skip = 1152 * channels;
+    let n = (got.len() - offset).min(want.len());
+    let mut worst = f64::MIN;
+    let mut start = skip;
+    while start + window + skip <= n {
+        let (mut err, mut sig) = (0.0f64, 0.0f64);
+        for i in start..start + window {
+            let d = f64::from(got[offset + i]) - f64::from(want[i]);
+            err += d * d;
+            sig += f64::from(want[i]) * f64::from(want[i]);
+        }
+        // A window with no signal in it has no pre-echo to hide, and its
+        // ratio would be meaningless; the -60 dBFS gate skips digital silence
+        // and the fade-ins around it.
+        if sig / window as f64 > 1e-6 {
+            let db = 10.0 * (err / sig.max(1e-30)).log10();
+            worst = worst.max(db);
+        }
+        start += window;
+    }
+    worst
+}
+
 fn encode(pcm: &[f32], rate: u32, channels: usize, kbps: u32) -> Vec<u8> {
     let mut encoder = Mp3Encoder::new(Mp3EncoderConfig {
         bitrate_kbps: kbps,
@@ -437,6 +473,16 @@ const LIBRARY: [(&str, &str); 7] = [
     ),
 ];
 
+/// How much worse than LAME a row's worst 20 ms window may be, in dB.
+///
+/// The floor is set from the measurement and the measurement is bad: hein at
+/// 192 kbit/s is 14.0 dB behind, and hein and sadie are the two spoken-word
+/// sources. LAME's worst window improves by 12 dB from 128 to 192 kbit/s on
+/// that file while ours improves by 5, which says our limit there is the
+/// masking model rather than the bitrate. That is the next round; the floor
+/// exists so it cannot quietly get worse first.
+const WORST_WINDOW_EXCESS_DB: f64 = 15.0;
+
 /// How far under LAME a row may sit before the sweep fails, in correlation.
 ///
 /// The first measurement (60 s of each source, 44.1 kHz stereo, CBR) put every
@@ -497,12 +543,27 @@ fn real_library_sweep_vs_lame() {
     let seconds = 60u32;
     let work = workdir("lame-sweep");
     println!(
-        "{:<7} {:>5} {:>9} {:>9} {:>8} {:>9} {:>9}",
-        "source", "kbps", "corr_ours", "corr_lame", "gap", "ours_kb", "lame_kb"
+        "{:<7} {:>5} {:>9} {:>9} {:>8} {:>8} {:>8} {:>8} {:>8}",
+        "source",
+        "kbps",
+        "corr_ours",
+        "corr_lame",
+        "gap",
+        "wworst_o",
+        "wworst_r",
+        "ours_kb",
+        "lame_kb"
     );
     let mut rows = 0;
     let mut failures = Vec::new();
+    // `EC_MP3_SWEEP_ONLY=zaur,dl8a` narrows the sweep to named sources, so a
+    // constant can be swept against the rows it moves without paying for the
+    // rows it does not.
+    let only = std::env::var("EC_MP3_SWEEP_ONLY").unwrap_or_default();
     for (name, src) in LIBRARY {
+        if !only.is_empty() && !only.split(',').any(|w| w.trim() == name) {
+            continue;
+        }
         let src = expand(src);
         if !src.exists() {
             println!("{name:<7} SKIP (missing)");
@@ -540,16 +601,19 @@ fn real_library_sweep_vs_lame() {
             assert!(status.success(), "libmp3lame encode of {name} at {kbps}k");
             // Both decoded by the same decoder and aligned the same way: an
             // encoder delay is not a quality difference.
-            let corr_of = |file: &Path| -> f64 {
+            let measure = |file: &Path| -> (f64, f64) {
                 let decoded = decode(file);
-                aligned(&decoded, &pcm, 2).0
+                let (corr, offset) = aligned(&decoded, &pcm, 2);
+                (corr, worst_window_db(&decoded, &pcm, offset, 2))
             };
-            let (ours_corr, lame_corr) = (corr_of(&ours_file), corr_of(&lame_file));
+            let ((ours_corr, ours_worst), (lame_corr, lame_worst)) =
+                (measure(&ours_file), measure(&lame_file));
             let kb =
                 |p: &Path| std::fs::metadata(p).expect("size").len() as f64 * 8.0 / secs / 1000.0;
             let gap = ours_corr - lame_corr;
             println!(
-                "{name:<7} {kbps:>5} {ours_corr:>9.5} {lame_corr:>9.5} {gap:>+8.5} {:>9.1} {:>9.1}",
+                "{name:<7} {kbps:>5} {ours_corr:>9.5} {lame_corr:>9.5} {gap:>+8.5} \
+                 {ours_worst:>+8.1} {lame_worst:>+8.1} {:>8.1} {:>8.1}",
                 kb(&ours_file),
                 kb(&lame_file)
             );
@@ -557,6 +621,12 @@ fn real_library_sweep_vs_lame() {
             if gap < LAME_CORR_FLOOR {
                 failures.push(format!(
                     "{name} at {kbps} kbit/s: {ours_corr:.5} against LAME's {lame_corr:.5}"
+                ));
+            }
+            if ours_worst - lame_worst > WORST_WINDOW_EXCESS_DB {
+                failures.push(format!(
+                    "{name} at {kbps} kbit/s: worst window {ours_worst:.1} dB \
+                     against LAME's {lame_worst:.1} dB"
                 ));
             }
         }
