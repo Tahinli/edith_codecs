@@ -19,7 +19,7 @@ use crate::deblock::{edge_params, filter_luma_h_edge16, filter_luma_line};
 use crate::decoder::{
     chroma_nz_pair, gather_nbr4, gather_nbr8, luma_nz_pair, mb_neighbors, MbNeighbors,
 };
-use crate::dpb::{Picture, BLK_SKIP};
+use crate::dpb::{Picture, Plane8, BLK_SKIP};
 use crate::entropy::{
     BlockCat, MbCtx, MbInfo, FLAG_CHROMA_PRED, FLAG_DECODED, FLAG_I16, FLAG_INTER, FLAG_SKIP,
     FLAG_TRANS8X8,
@@ -316,6 +316,128 @@ fn motion_rate(e: &MbEnc<'_>, bits: f64) -> i32 {
     (lambda * bits).round() as i32
 }
 
+
+/// Everything one macroblock's coding writes into the picture, kept so that a
+/// branch can be coded, measured and undone.
+struct MbState {
+    y: [u8; 256],
+    c: [[u8; 64]; 2],
+    nz_y: [u8; 16],
+    nz_c: [[u8; 4]; 2],
+    i4_modes: [u8; 16],
+    mv: [[[i16; 2]; 2]; 16],
+    ref_idx: [[i8; 2]; 16],
+    ref_id: [[i32; 2]; 16],
+    mvd_abs: [[u8; 4]; 16],
+    blk: [u8; 16],
+    mb_qp: u8,
+    mb_flags: u8,
+    mb_cbp: u8,
+    mb_dc_cbf: u8,
+    mb_slice: u16,
+    decoded_mbs: usize,
+    qp: i32,
+    qp_delta_inc: u8,
+}
+
+/// Copy `mb`'s samples out of `plane`, `n` by `n`.
+fn save_plane(plane: &Plane8, x0: usize, y0: usize, out: &mut [u8], n: usize) {
+    for row in 0..n {
+        let o = plane.at(x0, y0 + row);
+        out[row * n..(row + 1) * n].copy_from_slice(&plane.data[o..o + n]);
+    }
+}
+
+fn load_plane(plane: &mut Plane8, x0: usize, y0: usize, src: &[u8], n: usize) {
+    for row in 0..n {
+        let o = plane.at(x0, y0 + row);
+        plane.data[o..o + n].copy_from_slice(&src[row * n..(row + 1) * n]);
+    }
+}
+
+fn save_mb_state(pic: &Picture, e: &MbEnc<'_>, mb_addr: usize) -> MbState {
+    let (mb_x, mb_y) = (mb_addr % pic.mb_w, mb_addr / pic.mb_w);
+    let (w4, w2) = (pic.mb_w * 4, pic.mb_w * 2);
+    let mut st = MbState {
+        y: [0; 256],
+        c: [[0; 64]; 2],
+        nz_y: [0; 16],
+        nz_c: [[0; 4]; 2],
+        i4_modes: [0; 16],
+        mv: [[[0; 2]; 2]; 16],
+        ref_idx: [[0; 2]; 16],
+        ref_id: [[0; 2]; 16],
+        mvd_abs: [[0; 4]; 16],
+        blk: [0; 16],
+        mb_qp: pic.mb_qp[mb_addr],
+        mb_flags: pic.mb_flags[mb_addr],
+        mb_cbp: pic.mb_cbp[mb_addr],
+        mb_dc_cbf: pic.mb_dc_cbf[mb_addr],
+        mb_slice: pic.mb_slice[mb_addr],
+        decoded_mbs: pic.decoded_mbs,
+        qp: e.qp,
+        qp_delta_inc: e.qp_delta_inc,
+    };
+    save_plane(&pic.y, mb_x * 16, mb_y * 16, &mut st.y, 16);
+    save_plane(&pic.cb, mb_x * 8, mb_y * 8, &mut st.c[0], 8);
+    save_plane(&pic.cr, mb_x * 8, mb_y * 8, &mut st.c[1], 8);
+    for row in 0..4 {
+        let b = (mb_y * 4 + row) * w4 + mb_x * 4;
+        for col in 0..4 {
+            let (i, j) = (row * 4 + col, b + col);
+            st.nz_y[i] = pic.nz_y[j];
+            st.i4_modes[i] = pic.i4_modes[j];
+            st.mv[i] = pic.mv[j];
+            st.ref_idx[i] = pic.ref_idx[j];
+            st.ref_id[i] = pic.ref_id[j];
+            st.mvd_abs[i] = pic.mvd_abs[j];
+            st.blk[i] = pic.blk[j];
+        }
+    }
+    for comp in 0..2 {
+        for row in 0..2 {
+            let b = (mb_y * 2 + row) * w2 + mb_x * 2;
+            st.nz_c[comp][row * 2..row * 2 + 2].copy_from_slice(&pic.nz_c[comp][b..b + 2]);
+        }
+    }
+    st
+}
+
+fn load_mb_state(pic: &mut Picture, e: &mut MbEnc<'_>, mb_addr: usize, st: &MbState) {
+    let (mb_x, mb_y) = (mb_addr % pic.mb_w, mb_addr / pic.mb_w);
+    let (w4, w2) = (pic.mb_w * 4, pic.mb_w * 2);
+    load_plane(&mut pic.y, mb_x * 16, mb_y * 16, &st.y, 16);
+    load_plane(&mut pic.cb, mb_x * 8, mb_y * 8, &st.c[0], 8);
+    load_plane(&mut pic.cr, mb_x * 8, mb_y * 8, &st.c[1], 8);
+    for row in 0..4 {
+        let b = (mb_y * 4 + row) * w4 + mb_x * 4;
+        for col in 0..4 {
+            let (i, j) = (row * 4 + col, b + col);
+            pic.nz_y[j] = st.nz_y[i];
+            pic.i4_modes[j] = st.i4_modes[i];
+            pic.mv[j] = st.mv[i];
+            pic.ref_idx[j] = st.ref_idx[i];
+            pic.ref_id[j] = st.ref_id[i];
+            pic.mvd_abs[j] = st.mvd_abs[i];
+            pic.blk[j] = st.blk[i];
+        }
+    }
+    for comp in 0..2 {
+        for row in 0..2 {
+            let b = (mb_y * 2 + row) * w2 + mb_x * 2;
+            pic.nz_c[comp][b..b + 2].copy_from_slice(&st.nz_c[comp][row * 2..row * 2 + 2]);
+        }
+    }
+    pic.mb_qp[mb_addr] = st.mb_qp;
+    pic.mb_flags[mb_addr] = st.mb_flags;
+    pic.mb_cbp[mb_addr] = st.mb_cbp;
+    pic.mb_dc_cbf[mb_addr] = st.mb_dc_cbf;
+    pic.mb_slice[mb_addr] = st.mb_slice;
+    pic.decoded_mbs = st.decoded_mbs;
+    e.qp = st.qp;
+    e.qp_delta_inc = st.qp_delta_inc;
+}
+
 /// Code one macroblock: decide its mode, reconstruct it into `pic` and write
 /// its syntax into `w`.
 pub(crate) fn encode_mb(pic: &mut Picture, e: &mut MbEnc<'_>, w: &mut EncEntropy, mb_addr: usize) {
@@ -355,71 +477,74 @@ pub(crate) fn encode_mb(pic: &mut Picture, e: &mut MbEnc<'_>, w: &mut EncEntropy
         inter = Some(choose_inter(pic, e, mb_x, mb_y));
     }
 
-    // The intra side of the comparison carries what going intra signals: the
-    // inter side already pays for its motion vector, and an intra macroblock
-    // in a P picture pays for a macroblock type plus sixteen prediction modes
-    // that the SATD of its prediction says nothing about.
+    // Intra against inter is decided on real coded cost: both branches are
+    // coded, and the one with the smaller squared error plus lambda times its
+    // actual bits is kept. The prediction-domain comparison this replaced
+    // compared an intra SATD, discounted by a constant, against a coded inter
+    // cost, and paid for the intra side's signalling with a guessed twelve
+    // bits -- three approximations where the encoder can simply measure. On
+    // the library, BD-PSNR against x264 at GOP 10 over QP 22/26/30/34:
     //
-    // Swept on two clips of the library and the synthetic one, BD-PSNR against
-    // x264 at GOP 10 over QP 22/26/30/34:
+    //                        film 3840x1608   screen 2560x1440   synthetic
+    //     SATD and guess         -1.043            -1.064          -4.449
+    //     coded cost             -0.728            -0.500          -4.523
     //
-    //     bits    film 3840x1608   screen 2560x1440   synthetic
-    //        0        -1.521            -1.904          -5.718
-    //        4        -1.305            -1.290          -5.400
-    //        8        -1.223            -0.920          -5.290
-    //       12        -1.211            -0.733          -5.286
-    //       16        -1.267            -0.650          -5.262
-    //       32        -1.649            -0.586             --
+    // and the bit premium over x264 falls with it: on the screen capture from
+    // +34.4% to +17.2% at QP 22. The synthetic clip loses 0.074 dB; it is
+    // 352x288 of moving synthetic shapes and it prefers a heavier rate term
+    // (scaling lambda by 1.4 reads -4.310 there and -0.744/-0.477 on the two
+    // real clips), which is not a reason to put an unmeasured constant in
+    // front of the standard multiplier.
     //
-    // Screen capture keeps improving to 48 and film falls off after 16, so
-    // twelve is the overlap of the two flat parts rather than either optimum.
-    // A previous sweep of this same constant landed zero, on a measurement
-    // that sampled one picture a second: at that spacing nothing is
-    // predictable from the previous picture, P slices went 93% intra on film,
-    // and the penalty had nothing to suppress. The sampler now takes
-    // consecutive pictures.
-    //
-    // Skipping the intra trial when the inter cost is already low was measured
-    // and dropped: it cost 0.7 dB on screen capture and bought no measurable
-    // time.
+    // The second encode costs about two seconds on a run that took 28.8: each
+    // P macroblock is coded twice, and the loser's reconstruction and entropy
+    // writer are thrown away.
     let intra_cost = intra_pre_cost(pic, e, &nbr, mb_x, mb_y);
-    let go_intra = match &inter {
-        None => true,
-        Some(i) => intra_cost.best() + motion_rate(e, INTRA_MODE_BITS) < i.cost,
+    let Some(choice) = inter else {
+        encode_intra_mb(pic, e, w, mb_addr, nbr, intra_cost);
+        return;
     };
 
-    if go_intra {
-        encode_intra_mb(pic, e, w, mb_addr, nbr, intra_cost);
+    let lambda = if e.lambda_standard {
+        e.lambda
     } else {
-        let choice = inter.expect("a P macroblock has an inter choice");
-        encode_inter_mb(pic, e, w, mb_addr, nbr, choice);
+        lambda_ssd(e.qp)
+    };
+    let before = save_mb_state(pic, e, mb_addr);
+    let mut w_inter = w.clone();
+    let inter_bits = {
+        let start = w_inter.bit_len();
+        encode_inter_mb(pic, e, &mut w_inter, mb_addr, nbr, choice);
+        (w_inter.bit_len() - start) as f64
+    };
+    let inter_rd = ssd_mb(pic, e, mb_x, mb_y) as f64 + lambda * inter_bits;
+    let after_inter = save_mb_state(pic, e, mb_addr);
+    load_mb_state(pic, e, mb_addr, &before);
+
+    let mut w_intra = w.clone();
+    let intra_bits = {
+        let start = w_intra.bit_len();
+        encode_intra_mb(pic, e, &mut w_intra, mb_addr, nbr, intra_cost);
+        (w_intra.bit_len() - start) as f64
+    };
+    let intra_rd = ssd_mb(pic, e, mb_x, mb_y) as f64 + lambda * intra_bits;
+
+    if intra_rd < inter_rd {
+        *w = w_intra;
+    } else {
+        load_mb_state(pic, e, mb_addr, &after_inter);
+        *w = w_inter;
     }
 }
 
-/// The Intra_16x16 mode this macroblock would use, and what it would cost:
-/// the *inter or intra* decision needs a number before anything is coded, and
-/// this is the cheap one. Intra_16x16 against Intra_4x4 is decided later, on
-/// real rate and real distortion (see [`encode_intra_mb`]).
+/// The Intra_16x16 mode this macroblock would use. Intra_16x16 against
+/// Intra_4x4 is decided later, on real rate and real distortion (see
+/// [`encode_intra_mb`]).
 struct IntraCost {
     i16_mode: u8,
-    i16_cost: i32,
     /// True when Intra_4x4 may be used at all for this picture and preset.
     allow_i4: bool,
 }
-
-impl IntraCost {
-    fn best(&self) -> i32 {
-        // Intra_4x4 usually beats this when it is allowed; the margin below is
-        // what keeps a P macroblock from going intra on the 16x16 cost alone.
-        if self.allow_i4 {
-            self.i16_cost * 3 / 4
-        } else {
-            self.i16_cost
-        }
-    }
-}
-
-
 
 /// Best Intra_16x16 mode by SATD, leaving nothing behind in the plane that a
 /// later branch does not overwrite.
@@ -457,14 +582,14 @@ fn intra_pre_cost(
     }
     IntraCost {
         i16_mode: best.1,
-        i16_cost: best.0,
         // Intra_4x4 is tried in P pictures too, at every preset. Re-measured
-        // on consecutive pictures (BD-PSNR against x264, GOP 10, QP
-        // 22/26/30/34): restricting it to I pictures reads -1.989 dB on the
-        // film clip where allowing it everywhere reads -1.154, and the screen
-        // capture disagrees by a third of that in the other direction (-0.564
-        // against -0.696). The film margin is the larger of the two, so it
-        // stays on everywhere.
+        // once the intra-versus-inter decision became a real one (BD-PSNR
+        // against x264, GOP 10, QP 22/26/30/34): restricting it to I pictures
+        // reads -1.613 dB on the film clip and -0.508 on the screen capture,
+        // where allowing it everywhere reads -0.728 and -0.500. It stays on
+        // everywhere. Under the old prediction-domain decision the screen
+        // capture preferred the restriction by a third of a dB; coding both
+        // branches for real removed that disagreement.
         allow_i4: true,
     }
 }
@@ -477,10 +602,6 @@ fn intra_pre_cost(
 /// below a half and falls away above it.
 const MV_BITS_WEIGHT: f64 = 0.5;
 
-/// What going intra costs to signal in a P picture, in bits: the macroblock
-/// type and, when Intra_4x4 wins later, sixteen prediction modes. Swept at the
-/// decision site above.
-const INTRA_MODE_BITS: f64 = 12.0;
 
 /// How a P macroblock is partitioned, in the mb_type numbering of Table 7-13.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -534,7 +655,6 @@ struct InterChoice {
     mv: [[i16; 2]; 2],
     /// The P_Skip motion vector of 8.4.1.1.
     skip_mv: [i16; 2],
-    cost: i32,
     /// The skip candidate is at least as good as the searched one.
     prefer_skip: bool,
 }
@@ -731,7 +851,6 @@ fn choose_inter(pic: &Picture, e: &MbEnc<'_>, mb_x: usize, mb_y: usize) -> Inter
         shape: best.0,
         mv: best.1,
         skip_mv,
-        cost: best.2.min(skip_cost),
         prefer_skip: best.0 == PShape::Whole && skip_cost <= best.2,
     }
 }
