@@ -896,7 +896,7 @@ fn real_clip_t8x8_bd_psnr() {
 /// signal that the decision belongs on real coded cost rather than on a SATD
 /// comparison at all -- that is the next slice, not a reason to tune the
 /// threshold back toward this clip.
-const BD_PSNR_VS_X264_FLOOR: f64 = -4.6;
+const BD_PSNR_VS_X264_FLOOR: f64 = -4.5;
 
 fn have_x264() -> bool {
     std::process::Command::new("ffmpeg")
