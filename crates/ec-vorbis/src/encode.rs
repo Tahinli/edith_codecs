@@ -129,13 +129,12 @@ const HEADROOM_SHORT_MIN: f64 = 42.0;
 /// `TILT_HF_DB` (negative) trims step resolution above `TILT_HF_HI_HZ`,
 /// routing those bits to LF. The rate loop's global headroom rebalances the
 /// total. Tuned by lanes/vorbis-floor-r3.report.md (8-row sweep).
-const TILT_LF_DB: f64 = 6.0;
 const TILT_LF_LO_HZ: f64 = 1_100.0;
 const TILT_LF_HI_HZ: f64 = 2_000.0;
 const TILT_HF_DB: f64 = 0.0;
 const TILT_HF_LO_HZ: f64 = 4_000.0;
 const TILT_HF_HI_HZ: f64 = 6_000.0;
-
+const TILT_LF_DB: f64 = 12.0;
 /// Extra headroom (dB) for one floor post at `hz`: LF boost tapering to 0,
 /// plus an HF cut (negative) tapering in. Zero outside both bands.
 fn headroom_tilt(hz: f64) -> f64 {
