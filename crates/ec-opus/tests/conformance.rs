@@ -5275,9 +5275,10 @@ fn short_block_bits_vs_libopus() {
 }
 
 // ---------------------------------------------------------------------------
-// her@96 opus_compare error map (lane opus-her r1).
+// opus_compare error map, any gate source (lane opus-her r1, generalised r3).
 //
-// The gate's worst err_ratio row. This localises it: both encoders run through
+// Source/rate/tag come from EC_ERRMAP_SRC / EC_ERRMAP_KBPS / EC_ERRMAP_TAG
+// (default: her@96, the row this was first written for). This localises it: both encoders run through
 // the gate's exact path, opus_compare's per-2.5 ms hop ef² is bucketed into
 // 1 s windows, and the top-10 windows (by ours/ref window ratio and by ours
 // error share) are printed with our encoder flags plus both encoders' coded
@@ -5407,7 +5408,7 @@ fn err_map_vs_libopus() {
 
     let mut out = String::new();
     out.push_str(&format!(
-        "# her@{kbps_env}k error map: ref {ref_kbps:.1} ours {ours_kbps:.1} kbps, \
+        "# {tag}@{kbps_env}k error map: ref {ref_kbps:.1} ours {ours_kbps:.1} kbps, \
          err o={err_o:.3} r={err_r:.3} ratio {:.3}, {nwin} s windows\n",
         err_o / err_r
     ));
