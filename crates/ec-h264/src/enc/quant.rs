@@ -29,6 +29,16 @@ const MF: [[i32; 3]; 6] = [
 /// block at 1/6 — the classic asymmetry, which spends bits where prediction is
 /// weakest. Measured against 1/3 and 1/2 for the inter case on 1080p camera
 /// and screen-capture clips: 1/6 is level or ahead at matched bitrate.
+///
+/// Re-measured 2026-08-23 against x264 with `bd_psnr_vs_x264` on a 3840x1608
+/// clip, sweeping both numerators as sixty-fourths the way x264 spells
+/// `--deadzone-intra` / `--deadzone-inter`. The intra offset is the one that
+/// matters and ours is the better of the two: x264's 11/64 reads -1.667 dB
+/// all-intra where ours (21/64, i.e. 1/3) reads -0.745 dB, with the inter
+/// value making no difference to that. The inter offset is inert across the
+/// whole useful range -- 6/64, 16/64, 21/64 and 32/64 span -1.571 to
+/// -1.532 dB, a 0.04 dB spread, while the bit counts move by 0.8%. So the
+/// remaining distance to x264 is not in the dead zone.
 #[inline]
 fn round_offset(qbits: u32, intra: bool) -> i32 {
     (1i32 << qbits) / if intra { 3 } else { 6 }
