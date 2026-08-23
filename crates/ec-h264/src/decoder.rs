@@ -135,6 +135,7 @@ pub struct Decoder {
     out: VecDeque<VideoFrame>,
     /// Bits parsed so far, by syntax class (CABAC slices only).
     account: BitAccount,
+    shapes: MbShapes,
     /// Presentation timestamp to attach to the next picture started.
     pending_pts: Option<Timestamp>,
     /// `PicOrderCnt` of the random-access point most recently established by
@@ -215,6 +216,7 @@ impl Decoder {
             output_order: OutputOrder::default(),
             out: VecDeque::new(),
             account: BitAccount::default(),
+            shapes: MbShapes::default(),
             pending_pts: None,
             recovery_poc: None,
             cur_ref_padded: false,
@@ -252,6 +254,12 @@ impl Decoder {
     /// through one account.
     pub fn bit_account(&self) -> BitAccount {
         self.account
+    }
+
+    /// How many macroblocks of each shape this decoder has read, which is what
+    /// a stream's partitioning looks like from the outside.
+    pub fn mb_shapes(&self) -> MbShapes {
+        self.shapes
     }
 
     /// Decode the first IDR picture of an Annex B stream and return it.
@@ -538,6 +546,7 @@ impl Decoder {
         };
 
         let mut ctx = SliceCtx {
+            shapes: MbShapes::default(),
             slice_id,
             slice_type: sh.slice_type,
             qp: sh.slice_qp,
@@ -633,6 +642,7 @@ impl Decoder {
             more = r.more_macroblocks()?;
             mb_addr += 1;
         }
+        self.shapes.add(&ctx.shapes);
         if let Entropy::Cabac(c) = &r {
             self.account.add(&c.account());
         }
@@ -820,6 +830,39 @@ fn check_supported(sps: &Sps, pps: &Pps, slice_type_code: u32) -> Result<()> {
 }
 
 /// Mutable per-slice decode state.
+/// How many macroblocks of each shape a stream codes: the partitioning the
+/// encoder chose, counted from the outside.
+///
+/// P macroblocks only; a B macroblock's own shapes are not split out.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MbShapes {
+    pub skip: u64,
+    pub p16x16: u64,
+    pub p16x8: u64,
+    pub p8x16: u64,
+    /// P_8x8 and P_8x8ref0, whatever the sub_mb_types inside are.
+    pub p8x8: u64,
+    pub bidir: u64,
+    pub intra: u64,
+}
+
+impl MbShapes {
+    /// Add another count into this one.
+    pub fn add_public(&mut self, o: &MbShapes) {
+        self.add(o);
+    }
+
+    pub(crate) fn add(&mut self, o: &MbShapes) {
+        self.skip += o.skip;
+        self.p16x16 += o.p16x16;
+        self.p16x8 += o.p16x8;
+        self.p8x16 += o.p8x16;
+        self.p8x8 += o.p8x8;
+        self.bidir += o.bidir;
+        self.intra += o.intra;
+    }
+}
+
 struct SliceCtx {
     slice_id: u16,
     slice_type: SliceType,
@@ -841,6 +884,8 @@ struct SliceCtx {
     weights: Option<PredWeightTable>,
     /// `PicOrderCnt( CurrPic )`.
     poc: i32,
+    /// How many macroblocks of each shape this slice decoded.
+    shapes: MbShapes,
 }
 
 impl SliceCtx {
@@ -1080,6 +1125,22 @@ fn decode_macroblock(
     } else {
         r.mb_type_i()?
     };
+
+    if skipped {
+        ctx.shapes.skip += 1;
+    } else if ctx.slice_type == SliceType::P {
+        match mb_type {
+            0 => ctx.shapes.p16x16 += 1,
+            1 => ctx.shapes.p16x8 += 1,
+            2 => ctx.shapes.p8x16 += 1,
+            3 | 4 => ctx.shapes.p8x8 += 1,
+            _ => ctx.shapes.intra += 1,
+        }
+    } else if ctx.is_b() {
+        ctx.shapes.bidir += 1;
+    } else {
+        ctx.shapes.intra += 1;
+    }
 
     // Split the P/B numbering into an inter shape or an intra mb_type.
     let (shape, intra_type) = if skipped {
