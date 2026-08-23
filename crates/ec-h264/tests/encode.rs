@@ -762,10 +762,26 @@ fn clip_sources(path: &std::ffi::OsStr, want: usize) -> (usize, usize, Vec<Plane
         _ => panic!("the H.264 track carries no video parameters"),
     };
     let (w, h) = (video.width as usize, video.height as usize);
-    let stride = video
-        .frame_rate
-        .map_or(25, |r| (r.as_secs_f64().round() as usize).max(1));
+    // Consecutive pictures by default. This used to take one picture a second,
+    // which measured an encoder on content it never sees: at a second apart
+    // nothing is predictable from the previous picture, so P slices went 93%
+    // intra on film and the inter path was never really under test.
+    // `EC_H264_CLIP_STRIDE` restores a wider spacing (`fps` takes one a
+    // second) for the deliberately-uncorrelated case.
+    let stride = match std::env::var("EC_H264_CLIP_STRIDE").as_deref() {
+        Ok("fps") => video
+            .frame_rate
+            .map_or(25, |r| (r.as_secs_f64().round() as usize).max(1)),
+        Ok(n) => n.parse().unwrap_or(1usize).max(1),
+        Err(_) => 1,
+    };
     let mut dec = ec_h264::H264Decoder::new(params).expect("decoder");
+    // Pictures to pass over before sampling: the head of a film is titles and
+    // fades, which are not what a codec is measured on.
+    let skip: usize = std::env::var("EC_H264_CLIP_SKIP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     let mut sources: Vec<Planes> = Vec::new();
     let mut seen = 0usize;
     while sources.len() < want {
@@ -777,7 +793,7 @@ fn clip_sources(path: &std::ffi::OsStr, want: usize) -> (usize, usize, Vec<Plane
         }
         dec.send_packet(&packet).expect("decode");
         while let Ok(ec_core::frame::Frame::Video(f)) = dec.receive_frame() {
-            if sources.len() < want && seen % stride == 0 {
+            if seen >= skip && sources.len() < want && (seen - skip).is_multiple_of(stride) {
                 sources.push(planes_of(&f));
             }
             seen += 1;
@@ -790,7 +806,7 @@ fn clip_sources(path: &std::ffi::OsStr, want: usize) -> (usize, usize, Vec<Plane
         path.to_string_lossy()
     );
     eprintln!(
-        "{}: {}x{}, {} pictures 1 s apart (every {stride}th of {seen})",
+        "{}: {}x{}, {} pictures, every {stride}th of {seen}",
         path.to_string_lossy(),
         w,
         h,
@@ -880,7 +896,7 @@ fn real_clip_t8x8_bd_psnr() {
 /// signal that the decision belongs on real coded cost rather than on a SATD
 /// comparison at all -- that is the next slice, not a reason to tune the
 /// threshold back toward this clip.
-const BD_PSNR_VS_X264_FLOOR: f64 = -5.75;
+const BD_PSNR_VS_X264_FLOOR: f64 = -4.6;
 
 fn have_x264() -> bool {
     std::process::Command::new("ffmpeg")
@@ -956,15 +972,19 @@ fn x264_encode_qp(sources: &[Planes], w: usize, h: usize, qp: i32, gop: u32) -> 
 /// encoder's own reconstruction, so the two halves are read the same way.
 ///
 /// `EC_H264_GOP` sets the GOP of both encoders; 1 makes the comparison
-/// all-intra, which is how the gap was split: on a 3840x1608 clip from the
-/// library the intra-only distance is -0.749 dB (+2-4% bits) while the same
-/// clip at GOP 10 is -2.992 dB (+19% bits), so roughly two thirds of the
-/// distance is in P pictures, not in the intra path.
+/// all-intra, which splits the gap between the intra path and the P pictures.
 ///
 /// `EC_H264_PRESET_BALANCED` runs our half of the comparison at
 /// `Preset::Balanced` instead of the default `Preset::Fast`, which separates
-/// what search effort buys from what the coder itself costs: on the same
-/// library clip it moves -2.992 dB to -1.587 dB for 40% more encode time.
+/// what search effort buys from what the coder itself costs.
+///
+/// `EC_H264_CLIP_SKIP` passes over that many pictures before sampling (film
+/// heads are titles and fades), and `EC_H264_CLIP_STRIDE` widens the spacing
+/// between the sampled pictures; both default to consecutive pictures from the
+/// start of the file. The measurements quoted through this crate that predate
+/// those two knobs were taken one picture a second, where nothing is
+/// predictable from the previous picture -- they are not comparable with the
+/// numbers taken since.
 ///
 ///     cargo test --release -p ec-h264 --test encode bd_psnr_vs_x264 -- --nocapture
 ///     EC_H264_CLIP=<file> cargo test --release -p ec-h264 --test encode \
