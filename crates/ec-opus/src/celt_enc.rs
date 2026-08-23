@@ -11,12 +11,15 @@
 //!   which removes the most expensive analysis in the reference encoder (an
 //!   autocorrelation search over 1024 lags). Same choice the reference makes
 //!   below complexity 5.
-//! - **No time/frequency Viterbi.** Raw `tf_res` is `is_transient` in every
-//!   band (the reference's no-analysis default): with `tf_select = 0` the
-//!   tf table maps it to "no change", so long-block frames keep full
-//!   frequency resolution and transient frames keep their short blocks. (Raw
-//!   zeros in a transient frame would map to `+LM`, merging the short blocks
-//!   back into one long block and smearing pre-echo over the whole frame.)
+//! - **Time/frequency Viterbi ported but gated off.** `tf_analysis()` and the
+//!   libopus float-mode `transient_analysis()` (returning `tf_estimate`/
+//!   `tf_chan`) are ported from the reference; `const TF_ANALYSIS: bool`
+//!   gates the Viterbi search. It is `false`: the 2-row gate (sadie/hein @64k)
+//!   vs the no-analysis baseline showed both corr gaps grow and minsec drop,
+//!   so the search is disabled. With the flag off, `tf_res` falls back to the
+//!   reference's no-analysis default — raw `is_transient` per band, which under
+//!   `tf_select = 0` codes "no tf change" (long frames keep full frequency
+//!   resolution; transient frames keep their short blocks).
 //! - **Fixed spreading.** `SPREAD_NORMAL` every frame, coded explicitly.
 //! - **Single-pass coarse energy** with the reference's own delayed-intra
 //!   heuristic, not the two-pass encode-both-and-compare.
@@ -42,6 +45,16 @@ use crate::celt::{
 use crate::range::RangeEncoder;
 
 const CACHE_BITS: &[u8] = &crate::celt::CACHE_BITS;
+const INV_TABLE: [u8; 128] = [
+    255,255,156,110, 86, 70, 59, 51, 45, 40, 37, 33, 31, 28, 26, 25,
+     23, 22, 21, 20, 19, 18, 17, 16, 16, 15, 15, 14, 13, 13, 12, 12,
+     12, 12, 11, 11, 11, 10, 10, 10,  9,  9,  9,  9,  9,  9,  8,  8,
+      8,  8,  8,  7,  7,  7,  7,  7,  7,  6,  6,  6,  6,  6,  6,  6,
+      6,  6,  6,  6,  6,  6,  6,  6,  6,  5,  5,  5,  5,  5,  5,  5,
+      5,  5,  5,  5,  5,  4,  4,  4,  4,  4,  4,  4,  4,  4,  4,  4,
+      4,  4,  4,  4,  4,  4,  4,  4,  4,  4,  4,  4,  4,  4,  3,  3,
+      3,  3,  3,  3,  3,  3,  3,  3,  3,  3,  3,  3,  3,  3,  3,  2,
+];
 
 // ---------------------------------------------------------------------------
 // Forward MDCT
@@ -251,6 +264,16 @@ fn stereo_itheta(x: &[f32], y: &[f32], stereo: bool, n: usize) -> i32 {
     #[allow(clippy::approx_constant)]
     const TWO_OVER_PI: f64 = 0.63662;
     (0.5 + 16384.0 * TWO_OVER_PI * (side as f64).atan2(mid as f64)).floor() as i32
+}
+
+/// `l1_metric()` from the reference: L1 norm scaled by `(1 + LM*bias)`.
+/// In float mode `MAC16_32_Q15(c, a*b) = c + a*b`, so this is `L1*(1 + LM*bias)`.
+fn l1_metric(tmp: &[f32], n: usize, lm: usize, bias: f32) -> f32 {
+    let mut l1 = 0.0f32;
+    for i in 0..n {
+        l1 += tmp[i].abs();
+    }
+    l1 * (1.0 + lm as f32 * bias)
 }
 
 // ---------------------------------------------------------------------------
@@ -580,8 +603,13 @@ impl CeltEncoder {
         // --- Transient flag -------------------------------------------------
         let mut is_transient = false;
         let mut short_blocks = 0usize;
+        let mut tf_estimate = 0.0f32;
+        let mut tf_chan = 0usize;
         if lm > 0 && enc.tell() as i32 + 3 <= total_bits {
-            is_transient = self.transient_analysis(n + OVERLAP, c, stride);
+            let (ta, te, tc) = self.transient_analysis(n + OVERLAP, c, stride);
+            is_transient = ta;
+            tf_estimate = te;
+            tf_chan = tc;
             if is_transient {
                 short_blocks = m;
             }
@@ -610,11 +638,22 @@ impl CeltEncoder {
             }
         }
 
-        // --- tf_res: the reference's no-analysis default --------------------
-        // Raw `is_transient` per band + `tf_select = 0` codes "no tf change";
-        // raw zeros on a transient frame would code `+LM` (undo the shorts).
-        self.tf_res = [i32::from(is_transient); NB_BANDS];
-        let tf_select = 0usize;
+        // --- tf_res ---------------------------------------------------------
+        // `TF_ANALYSIS`: run the libopus Viterbi tf search when there are
+        // enough bits; otherwise fall back to the no-analysis default (raw
+        // `is_transient` per band codes "no tf change" under tf_select=0).
+        const TF_ANALYSIS: bool = false;
+        let tf_select = if TF_ANALYSIS && effective_bytes >= 15 * c as i32 {
+            let lambda = (80i32).max(20480 / effective_bytes + 2);
+            let mut importance = [0i32; NB_BANDS];
+            for i in start..end {
+                importance[i] = 13;
+            }
+            self.tf_analysis(end, is_transient, lambda, n, lm, tf_estimate, tf_chan, &importance)
+        } else {
+            self.tf_res = [i32::from(is_transient); NB_BANDS];
+            0usize
+        };
 
         // --- Coarse energy --------------------------------------------------
         let two_pass = false;
@@ -1017,72 +1056,80 @@ impl CeltEncoder {
     }
     // -- Analysis ------------------------------------------------------------
 
-    /// `transient_analysis()`: a high-passed peak-decay detector, straight
-    /// from the reference.
-    fn transient_analysis(&mut self, len: usize, c: usize, stride: usize) -> bool {
+    /// `transient_analysis()` — libopus float-mode algorithm.
+    /// Returns `(is_transient, tf_estimate, tf_chan)`.
+    fn transient_analysis(&mut self, len: usize, c: usize, stride: usize) -> (bool, f32, usize) {
         let tmp = &mut self.transient_tmp[..len];
-        if c == 1 {
-            tmp.copy_from_slice(&self.in_buf[..len]);
-        } else {
-            for (i, v) in tmp.iter_mut().enumerate() {
-                *v = self.in_buf[i] + self.in_buf[stride + i];
+        let len2 = len / 2;
+        let mut mask_metric: i32 = 0;
+        let mut tf_chan: usize = 0;
+
+        for ch in 0..c {
+            // Copy this channel's samples (C layout: in[i + c*len] = in_buf[ch*stride + i])
+            tmp.copy_from_slice(&self.in_buf[ch * stride..ch * stride + len]);
+
+            // High-pass filter: (1 - 2*z^-1 + z^-2) / (1 - z^-1 + .5*z^-2)
+            let mut mem0 = 0.0f32;
+            let mut mem1 = 0.0f32;
+            for v in tmp.iter_mut() {
+                let x = *v;
+                let y = mem0 + x;
+                mem0 = mem1 + y - 2.0 * x;
+                mem1 = x - 0.5 * y;
+                *v = y;
+            }
+            // First few samples are bad because we don't propagate the memory
+            for v in tmp.iter_mut().take(12) {
+                *v = 0.0;
+            }
+
+            // Forward pass: post-echo threshold (forward_decay = 0.0625)
+            let mut mean = 0.0f32;
+            let mut fm0 = 0.0f32;
+            for i in 0..len2 {
+                let x2 = tmp[2 * i] * tmp[2 * i] + tmp[2 * i + 1] * tmp[2 * i + 1];
+                mean += x2;
+                tmp[i] = fm0 + 0.0625 * (x2 - fm0);
+                fm0 = tmp[i];
+            }
+
+            // Backward pass: pre-echo threshold (backward_decay = 0.125)
+            let mut bm0 = 0.0f32;
+            let mut max_e = 0.0f32;
+            for i in (0..len2).rev() {
+                tmp[i] = bm0 + 0.125 * (tmp[i] - bm0);
+                bm0 = tmp[i];
+                max_e = max_e.max(bm0);
+            }
+
+            // Geometric mean of frame energy and half the max
+            mean = (mean * max_e * 0.5 * len2 as f32).sqrt();
+
+            // Inverse of the mean energy (float mode: SHL32/SHR32 are no-ops)
+            let norm = len2 as f32 / (1e-15 + mean);
+
+            // Harmonic mean discarding unreliable boundaries (1/4th of samples)
+            let mut unmask: i32 = 0;
+            let mut i = 12;
+            while i < len2 - 5 {
+                let id = ((64.0 * norm * (tmp[i] + 1e-15)).floor() as i32).clamp(0, 127) as usize;
+                unmask += INV_TABLE[id] as i32;
+                i += 4;
+            }
+            // Normalize: 1/4th sampling, factor of 6 in inv_table
+            unmask = 64 * unmask * 4 / (6 * (len2 as i32 - 17));
+            if unmask > mask_metric {
+                tf_chan = ch;
+                mask_metric = unmask;
             }
         }
-        let mut mem0 = 0.0f32;
-        let mut mem1 = 0.0f32;
-        for v in tmp.iter_mut() {
-            let x = *v;
-            let y = mem0 + x;
-            mem0 = mem1 + y - 2.0 * x;
-            mem1 = x - 0.5 * y;
-            *v = y;
-        }
-        for v in tmp.iter_mut().take(12) {
-            *v = 0.0;
-        }
-        let block = OVERLAP / 2;
-        let nbins = len / block;
-        let mut bins = [0.0f32; 20];
-        for (i, bin) in bins.iter_mut().enumerate().take(nbins) {
-            let mut max_abs = 0.0f32;
-            for j in 0..block {
-                max_abs = max_abs.max(tmp[i * block + j].abs());
-            }
-            *bin = max_abs;
-        }
-        let mut is_transient = false;
-        #[allow(clippy::needless_range_loop)]
-        for i in 0..nbins {
-            let t1 = 0.15 * bins[i];
-            let t2 = 0.4 * bins[i];
-            let t3 = 0.15 * bins[i];
-            let mut conseq = 0;
-            for &b in bins.iter().take(i) {
-                if b < t1 {
-                    conseq += 1;
-                }
-                if b < t2 {
-                    conseq += 1;
-                } else {
-                    conseq = 0;
-                }
-            }
-            if conseq >= 3 {
-                is_transient = true;
-            }
-            conseq = 0;
-            for &b in bins.iter().take(nbins).skip(i + 1) {
-                if b < t3 {
-                    conseq += 1;
-                } else {
-                    conseq = 0;
-                }
-            }
-            if conseq >= 7 {
-                is_transient = true;
-            }
-        }
-        is_transient
+
+        let is_transient = mask_metric > 200;
+        // tf_max and tf_estimate (float mode: all Q-shifts are no-ops)
+        let tf_max = ((27.0 * mask_metric as f32).sqrt() - 42.0).max(0.0);
+        let tf_estimate = (0.0069 * tf_max.min(163.0) - 0.139).max(0.0).sqrt();
+
+        (is_transient, tf_estimate, tf_chan)
     }
 
     fn compute_mdcts(&mut self, short_blocks: usize, lm: usize, n: usize, c: usize) {
@@ -1296,6 +1343,123 @@ impl CeltEncoder {
         for i in start..end {
             self.tf_res[i] = TF_SELECT[lm][4 * t + 2 * tf_select + self.tf_res[i] as usize];
         }
+    }
+
+    /// `tf_analysis()` — libopus Viterbi time/frequency search.
+    /// Writes `self.tf_res[0..len]` and returns `tf_select`.
+    #[allow(clippy::too_many_arguments)]
+    fn tf_analysis(
+        &mut self,
+        len: usize,
+        is_transient: bool,
+        lambda: i32,
+        n: usize,
+        lm: usize,
+        tf_estimate: f32,
+        tf_chan: usize,
+        importance: &[i32; NB_BANDS],
+    ) -> usize {
+        // bias = 0.04 * max(-0.25, 0.5 - tf_estimate)
+        let bias = 0.04 * (0.5 - tf_estimate).max(-0.25);
+        let t = usize::from(is_transient);
+
+        let mut metric = [0i32; NB_BANDS];
+        let mut path0 = [0i32; NB_BANDS];
+        let mut path1 = [0i32; NB_BANDS];
+        let mut tf_res = [0i32; NB_BANDS];
+
+        // Max band width for tmp/tmp_1 scratch
+        let max_band_w = ((E_BANDS[len] - E_BANDS[len - 1]) << lm).max(1);
+        let (tmp_s, tmp_1_s) = self.hadamard_tmp.split_at_mut(max_band_w);
+        let x = &self.x;
+
+        for i in 0..len {
+            let band_w = (E_BANDS[i + 1] - E_BANDS[i]) << lm;
+            let narrow = E_BANDS[i + 1] - E_BANDS[i] == 1;
+            let tmp = &mut tmp_s[..band_w];
+            let tmp_1 = &mut tmp_1_s[..band_w];
+
+            // Copy band coefficients: X[tf_chan*N0 + (eBands[i]<<LM)]
+            let offset = tf_chan * n + (E_BANDS[i] << lm);
+            tmp.copy_from_slice(&x[offset..offset + band_w]);
+
+            let mut best_level = 0i32;
+            let mut best_l1 = l1_metric(tmp, band_w, if is_transient { lm } else { 0 }, bias);
+
+            // Check the -1 case for transients
+            if is_transient && !narrow {
+                tmp_1.copy_from_slice(tmp);
+                haar1(tmp_1, band_w >> lm, 1 << lm);
+                let l1 = l1_metric(tmp_1, band_w, lm + 1, bias);
+                if l1 < best_l1 {
+                    best_l1 = l1;
+                    best_level = -1;
+                }
+            }
+
+            for k in 0..(lm + usize::from(!(is_transient || narrow))) {
+                let b = if is_transient { lm - k - 1 } else { k + 1 };
+                haar1(tmp, band_w >> k, 1 << k);
+                let l1 = l1_metric(tmp, band_w, b, bias);
+                if l1 < best_l1 {
+                    best_l1 = l1;
+                    best_level = (k as i32) + 1;
+                }
+            }
+
+            metric[i] = if is_transient { 2 * best_level } else { -2 * best_level };
+            if narrow && (metric[i] == 0 || metric[i] == -2 * lm as i32) {
+                metric[i] -= 1;
+            }
+        }
+
+        // Search for optimal tf resolution (tf_select)
+        let mut tf_select = 0usize;
+        let mut selcost = [0i32; 2];
+        for sel in 0..2 {
+            let mut cost0 = importance[0] * (metric[0] - 2 * TF_SELECT[lm][4 * t + 2 * sel]).abs();
+            let mut cost1 = importance[0] * (metric[0] - 2 * TF_SELECT[lm][4 * t + 2 * sel + 1]).abs()
+                + if is_transient { 0 } else { lambda };
+            for i in 1..len {
+                let curr0 = cost0.min(cost1 + lambda);
+                let curr1 = (cost0 + lambda).min(cost1);
+                cost0 = curr0 + importance[i] * (metric[i] - 2 * TF_SELECT[lm][4 * t + 2 * sel]).abs();
+                cost1 = curr1 + importance[i] * (metric[i] - 2 * TF_SELECT[lm][4 * t + 2 * sel + 1]).abs();
+            }
+            selcost[sel] = cost0.min(cost1);
+        }
+        if selcost[1] < selcost[0] && is_transient {
+            tf_select = 1;
+        }
+
+        // Final Viterbi forward pass
+        let mut cost0 = importance[0] * (metric[0] - 2 * TF_SELECT[lm][4 * t + 2 * tf_select]).abs();
+        let mut cost1 = importance[0] * (metric[0] - 2 * TF_SELECT[lm][4 * t + 2 * tf_select + 1]).abs()
+            + if is_transient { 0 } else { lambda };
+        for i in 1..len {
+            // curr0: best path to state 0
+            let from0 = cost0;
+            let from1 = cost1 + lambda;
+            let (curr0, p0) = if from0 < from1 { (from0, 0) } else { (from1, 1) };
+            path0[i] = p0;
+            // curr1: best path to state 1 (uses OLD cost0)
+            let from0 = cost0 + lambda;
+            let from1 = cost1;
+            let (curr1, p1) = if from0 < from1 { (from0, 0) } else { (from1, 1) };
+            path1[i] = p1;
+
+            cost0 = curr0 + importance[i] * (metric[i] - 2 * TF_SELECT[lm][4 * t + 2 * tf_select]).abs();
+            cost1 = curr1 + importance[i] * (metric[i] - 2 * TF_SELECT[lm][4 * t + 2 * tf_select + 1]).abs();
+        }
+
+        // Backward pass
+        tf_res[len - 1] = if cost0 < cost1 { 0 } else { 1 };
+        for i in (0..len - 1).rev() {
+            tf_res[i] = if tf_res[i + 1] == 1 { path1[i + 1] } else { path0[i + 1] };
+        }
+
+        self.tf_res = tf_res;
+        tf_select
     }
 
     // -- Band shapes ---------------------------------------------------------
