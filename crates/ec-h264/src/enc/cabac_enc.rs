@@ -393,21 +393,23 @@ impl CabacEnc {
     /// coded_block_flag: for 4:2:0 the coded_block_pattern bit is the whole
     /// signal (7.3.5.3.3), so an all-zero block must not reach here.
     pub(crate) fn residual_block_8x8(&mut self, coeff: &[i32; 64]) -> u8 {
-        let last = (0..64)
-            .rev()
-            .find(|&i| coeff[i] != 0)
-            .expect("an 8x8 block with cbp set has a coefficient");
-        for i in 0..63 {
-            let significant = coeff[i] != 0;
-            self.decision(OFF_SIG_8X8 + usize::from(SIG_8X8_FRAME[i]), significant);
-            if significant {
-                self.decision(OFF_LAST_8X8 + usize::from(LAST_8X8[i]), i == last);
-                if i == last {
-                    break;
-                }
-            }
+        residual_bins_8x8(self, coeff)
+    }
+
+    /// What [`Self::residual_block_8x8`] would spend on `coeff`, in 1/256ths
+    /// of a bit, against the context state as it stands. An all-zero block
+    /// costs nothing here: it is not coded at all, and the coded block pattern
+    /// that says so is priced by whoever writes it.
+    pub(crate) fn residual_block_8x8_cost(&self, coeff: &[i32; 64]) -> u32 {
+        if coeff.iter().all(|&c| c == 0) {
+            return 0;
         }
-        levels_bins(self, coeff, last, OFF_ABS_8X8, false)
+        let mut sink = CostSink {
+            state: self.state,
+            bits: 0,
+        };
+        residual_bins_8x8(&mut sink, coeff);
+        sink.bits
     }
 
     /// One residual block in scan order (7.3.5.3.3): coded_block_flag, the
@@ -550,6 +552,26 @@ impl BinSink for CostSink {
 
 /// coded_block_flag, the significance map and the levels of one residual block
 /// (7.3.5.3.3), against a caller-derived coded_block_flag context.
+/// The bins of one 8x8 luma residual block (7.3.5.3.3, cat 5): its own
+/// significance map and last-position contexts, then the levels.
+fn residual_bins_8x8<S: BinSink>(s: &mut S, coeff: &[i32; 64]) -> u8 {
+    let last = (0..64)
+        .rev()
+        .find(|&i| coeff[i] != 0)
+        .expect("an 8x8 block with cbp set has a coefficient");
+    for i in 0..63 {
+        let significant = coeff[i] != 0;
+        s.bin(OFF_SIG_8X8 + usize::from(SIG_8X8_FRAME[i]), significant);
+        if significant {
+            s.bin(OFF_LAST_8X8 + usize::from(LAST_8X8[i]), i == last);
+            if i == last {
+                break;
+            }
+        }
+    }
+    levels_bins(s, coeff, last, OFF_ABS_8X8, false)
+}
+
 fn residual_bins<S: BinSink>(s: &mut S, coeff: &[i32], cat: BlockCat, cbf_ctx: usize) -> u8 {
     let cat_i = cat.ctx_block_cat();
     let max = cat.max_num_coeff();
@@ -779,6 +801,45 @@ mod tests {
         }
         // Per block the arithmetic coder carries fractional bits across the
         // boundary, so the claim is on the total: within 1%.
+        let err = (predicted - spent).abs();
+        assert!(
+            err * 100 < spent,
+            "predicted {predicted}/256 bits, spent {spent}/256"
+        );
+    }
+
+    /// The same claim for the 8x8 block: `residual_block_8x8_cost` predicts
+    /// what `residual_block_8x8` spends, which is what the 8x8 quantisation
+    /// decision buys its levels with.
+    #[test]
+    fn residual_8x8_cost_predicts_the_bits_spent() {
+        let mut state = 0x0bad_f00du32;
+        let mut rand = move |m: u32| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state % m
+        };
+        let mut enc = CabacEnc::new(BitWriter::new(), 26, 0);
+        let (mut predicted, mut spent) = (0i64, 0i64);
+        for _ in 0..200 {
+            let mut coeff = [0i32; 64];
+            let nz = 1 + rand(20);
+            for _ in 0..nz {
+                let i = rand(64) as usize;
+                let mag = 1 + rand(6) as i32 * rand(4) as i32;
+                coeff[i] = if rand(2) == 0 { mag } else { -mag };
+            }
+            if coeff.iter().all(|&c| c == 0) {
+                coeff[0] = 1;
+            }
+            let cost = enc.residual_block_8x8_cost(&coeff);
+            let before = enc.bit_len() * 256 + u64::from(enc.range.leading_zeros());
+            enc.residual_block_8x8(&coeff);
+            let after = enc.bit_len() * 256 + u64::from(enc.range.leading_zeros());
+            predicted += i64::from(cost);
+            spent += after as i64 - before as i64;
+        }
         let err = (predicted - spent).abs();
         assert!(
             err * 100 < spent,

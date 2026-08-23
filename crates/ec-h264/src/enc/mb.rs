@@ -39,7 +39,7 @@ use crate::transform::{
 
 use super::quant::{
     forward_4x4, forward_8x8, forward_hadamard_2x2, forward_hadamard_4x4, quant_4x4,
-    quant_4x4_offset, quant_8x8, quant_chroma_dc, quant_luma_dc,
+    quant_4x4_offset, quant_8x8, quant_8x8_offset, quant_chroma_dc, quant_luma_dc,
 };
 use super::{
     entropy::{EncEntropy, sub_block_4x4},
@@ -987,6 +987,15 @@ const RDOQ_MAX_LEVEL: i32 = 2;
 /// back; what pays is only the pruning.
 const RDOQ_CHROMA_DEAD_ZONE: i32 = 6;
 
+/// The rounding the 8x8 luma path keeps under the search. It answers the way
+/// 4x4 luma did, not the way chroma did: measured as BD-PSNR of the opt-in
+/// `transform_8x8` flag against flag-off, which isolates this path because the
+/// flag-off curve does not run through it. Film 3840x1608 / screen capture
+/// 2560x1440, no search +0.535 / +0.042, 1/6 +0.551 / --, 1/3 +0.605 / +0.075,
+/// and the 1/2 kept here +0.619 / +0.067. The 8x8 blocks carry enough
+/// coefficients for the extra levels to pay for themselves, as 4x4 luma's do.
+const RDOQ8_DEAD_ZONE: i32 = 2;
+
 /// Rate-distortion quantisation of one inter luma block: each level is offered
 /// the two cheaper magnitudes below it, and takes one when the squared error it
 /// gives up costs less than the bits it saves.
@@ -1188,6 +1197,7 @@ fn code_luma_i16(
 }
 
 /// Chroma residual for both components (8.5.11 + the AC path).
+#[allow(clippy::too_many_arguments)]
 fn code_chroma(
     pic: &mut Picture,
     e: &MbEnc<'_>,
@@ -1574,9 +1584,11 @@ fn predicted_mode8(pic: &Picture, nbr: &MbNeighbors, bx: usize, by: usize, blk8:
 /// Residual of one 8x8 luma block against the prediction already in the
 /// plane: forward transform, quantise, and — when anything survives —
 /// reconstruct with the decoder's own inverse. Returns the non-zero count.
+#[allow(clippy::too_many_arguments)]
 fn code_block_8x8(
     pic: &mut Picture,
     e: &MbEnc<'_>,
+    w: &EncEntropy,
     x: usize,
     y: usize,
     qp: i32,
@@ -1592,16 +1604,29 @@ fn code_block_8x8(
                 - i32::from(pic.y.data[origin + ry * stride + rx]);
         }
     }
-    let nz = quant_8x8(&forward_8x8(&d), &e.ls8, qp, intra, out);
+    let rdoq = !intra && w.is_cabac();
+    let fwd = forward_8x8(&d);
+    let mut nz = if rdoq {
+        quant_8x8_offset(&fwd, &e.ls8, qp, RDOQ8_DEAD_ZONE, out)
+    } else {
+        quant_8x8(&fwd, &e.ls8, qp, intra, out)
+    };
     if nz == 0 {
         return 0;
+    }
+    if rdoq {
+        nz = rdoq_8x8(e, w, &d, out, qp);
+        if nz == 0 {
+            return 0;
+        }
     }
     let mut raster = [0i32; 64];
     unzigzag_8x8(out, &mut raster);
     dequant_8x8(&mut raster, &e.ls8, qp);
     let mut resid = [0i32; 64];
     inverse_transform_8x8(&raster, &mut resid);
-    if !intra
+    if !rdoq
+        && !intra
         && !worth_coding(
             &d,
             &resid,
@@ -1619,9 +1644,11 @@ fn code_block_8x8(
 /// Code the luma of an Intra_8x8 macroblock, the 8x8 sibling of
 /// [`code_intra_4x4`]: neighbours are the decoder's filtered reference
 /// samples, and every 4x4 mode slot of a block carries its mode.
+#[allow(clippy::too_many_arguments)]
 fn code_intra_8x8(
     pic: &mut Picture,
     e: &MbEnc<'_>,
+    w: &EncEntropy,
     mb_x: usize,
     mb_y: usize,
     qp: i32,
@@ -1669,7 +1696,7 @@ fn code_intra_8x8(
             let row = origin + ry * stride;
             pic.y.data[row..row + 8].copy_from_slice(&p[ry * 8..ry * 8 + 8]);
         }
-        if code_block_8x8(pic, e, x, y, qp, true, &mut lv.luma8[blk8]) > 0 {
+        if code_block_8x8(pic, e, w, x, y, qp, true, &mut lv.luma8[blk8]) > 0 {
             lv.cbp_luma |= 1 << blk8;
         }
     }
@@ -1681,6 +1708,7 @@ fn code_intra_8x8(
 fn code_luma_8x8(
     pic: &mut Picture,
     e: &MbEnc<'_>,
+    w: &EncEntropy,
     mb_x: usize,
     mb_y: usize,
     qp: i32,
@@ -1689,10 +1717,77 @@ fn code_luma_8x8(
     lv.trans8 = true;
     for blk8 in 0..4 {
         let (x, y) = (mb_x * 16 + (blk8 % 2) * 8, mb_y * 16 + (blk8 / 2) * 8);
-        if code_block_8x8(pic, e, x, y, qp, false, &mut lv.luma8[blk8]) > 0 {
+        if code_block_8x8(pic, e, w, x, y, qp, false, &mut lv.luma8[blk8]) > 0 {
             lv.cbp_luma |= 1 << blk8;
         }
     }
+}
+
+/// Squared error of coding `levels` as an 8x8 block, in its pixels.
+fn block_ssd_8x8(e: &MbEnc<'_>, source: &[i32; 64], levels: &[i32; 64], qp: i32) -> i64 {
+    let mut raster = [0i32; 64];
+    unzigzag_8x8(levels, &mut raster);
+    dequant_8x8(&mut raster, &e.ls8, qp);
+    let mut resid = [0i32; 64];
+    inverse_transform_8x8(&raster, &mut resid);
+    let mut ssd = 0i64;
+    for k in 0..64 {
+        let d = i64::from(source[k]) - i64::from(resid[k]);
+        ssd += d * d;
+    }
+    ssd
+}
+
+/// [`rdoq_4x4`] for the 8x8 transform: the same walk down the scan against the
+/// CABAC coder's own price, with the 8x8 block's own contexts.
+fn rdoq_8x8(
+    e: &MbEnc<'_>,
+    w: &EncEntropy,
+    source: &[i32; 64],
+    levels: &mut [i32; 64],
+    qp: i32,
+) -> u8 {
+    let Some(bits) = w.residual_block_8x8_cost(levels) else {
+        return levels.iter().filter(|&&l| l != 0).count() as u8;
+    };
+    let lambda = RDOQ_LAMBDA * lambda_ssd(qp) / 256.0;
+    let mut cost = block_ssd_8x8(e, source, levels, qp) as f64 + lambda * f64::from(bits);
+    for pos in (0..64).rev() {
+        let level = levels[pos];
+        if level == 0 {
+            continue;
+        }
+        let mag = level.abs();
+        if mag > RDOQ_MAX_LEVEL {
+            continue;
+        }
+        let mut tried = mag;
+        for candidate in [mag - 1, 0] {
+            if candidate == tried {
+                continue;
+            }
+            tried = candidate;
+            let keep = levels[pos];
+            levels[pos] = candidate * level.signum();
+            let bits = w
+                .residual_block_8x8_cost(levels)
+                .expect("CAVLC returned early");
+            let trial = block_ssd_8x8(e, source, levels, qp) as f64 + lambda * f64::from(bits);
+            if trial < cost {
+                cost = trial;
+            } else {
+                levels[pos] = keep;
+                break;
+            }
+        }
+    }
+    // The whole block against nothing, on the same exact price.
+    let ssd_zero: i64 = source.iter().map(|&c| i64::from(c) * i64::from(c)).sum();
+    if ssd_zero as f64 <= cost {
+        *levels = [0; 64];
+        return 0;
+    }
+    levels.iter().filter(|&&l| l != 0).count() as u8
 }
 
 /// Squared error of the luma macroblock against the source.
@@ -2057,7 +2152,7 @@ fn encode_intra_mb(
         let mut lv8 = chroma_lv.clone();
         let mut recon8 = [0u8; 256];
         let cost8 = if e.t8x8_intra(mb_y) {
-            let (m8, p8) = code_intra_8x8(pic, e, mb_x, mb_y, qp, &nbr, &mut lv8);
+            let (m8, p8) = code_intra_8x8(pic, e, w, mb_x, mb_y, qp, &nbr, &mut lv8);
             modes8 = m8;
             pred_modes8 = p8;
             save_luma(pic, mb_x, mb_y, &mut recon8);
@@ -2541,7 +2636,7 @@ fn encode_inter_mb(
         save_luma(pic, mb_x, mb_y, &mut recon4);
         restore_luma(pic, mb_x, mb_y, &pred);
         let mut lv8 = chroma_lv;
-        code_luma_8x8(pic, e, mb_x, mb_y, qp, &mut lv8);
+        code_luma_8x8(pic, e, w, mb_x, mb_y, qp, &mut lv8);
         let bits8 = inter_mb_bits(pic, e, w, mb_addr, &nbr, shape, &mvd, &inc, &lv8);
         let cost8 = ssd_mb(pic, e, mb_x, mb_y) as f64 + e.lambda * bits8 as f64;
         if cost8 + e.lambda * e.t8x8_margin_bits < cost4 {
