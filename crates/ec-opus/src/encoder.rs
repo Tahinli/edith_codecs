@@ -257,6 +257,16 @@ impl Encoder {
         self.celt.last_diag()
     }
 
+    /// Per-frame SILK diagnostics from the last SILK-encoded frame (mono).
+    /// Returns `None` if no mono SILK encoder has been initialised.
+    pub fn last_silk_diag(&self) -> Option<&crate::silk_enc_write::SilkFrameDiag> {
+        self.silk_mb
+            .as_ref()
+            .or(self.silk_wb.as_ref())
+            .or(self.silk_nb.as_ref())
+            .map(|s| s.last_diag())
+    }
+
     /// Drops all inter-frame state; the next packet starts like the first.
     pub fn reset(&mut self) {
         self.celt.reset();

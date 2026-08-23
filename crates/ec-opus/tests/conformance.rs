@@ -3594,6 +3594,751 @@ fn silk_library_gate_vs_libopus() {
 }
 
 // ---------------------------------------------------------------------------
+// Per-second SILK diagnostic: sadie@12k VoIP encoder decisions vs libopus.
+// Names the mechanism behind the 12k corr gap by per-second SILK frame facts.
+// Run:
+//   cargo test -p ec-opus --release --test conformance silk_silkq_persecond_diag -- --ignored --nocapture
+// Writes lanes/opus-silkq-r1.seconds.txt.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore]
+fn silk_silkq_persecond_diag() {
+    const SECS: f64 = 120.0;
+    const FRAME: usize = 960; // 20 ms at 48 kHz
+    const CHANNELS: usize = 1; // MONO
+    const MAX_LAG: usize = 2000;
+    const KBPS: u32 = 12;
+
+    let src = shellexpand("~/Music/sadie.wav");
+    assert!(src.exists(), "source missing: {}", src.display());
+    let source_pcm = ffmpeg_decode_pcm_mono(&src, SECS);
+    let source_frames = source_pcm.len() / CHANNELS;
+    assert!(source_frames > 48_000, "source too short");
+    let seconds = source_frames as f64 / 48000.0;
+
+    let lanes_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lanes");
+    fs::create_dir_all(&lanes_dir).unwrap();
+    let ref_ogg = temp_path("opus-silkq-r1-ref.opus");
+
+    // Reference: ffmpeg libopus mono voip VBR at 12k; realised rate from size.
+    ffmpeg_encode_libopus_mono_voip(&src, KBPS, &ref_ogg, SECS);
+    let ref_bytes = fs::metadata(&ref_ogg).map(|m| m.len() as usize).unwrap_or(0);
+    let ref_kbps = ref_bytes as f64 * 8.0 / seconds / 1000.0;
+    let ref_dec = ffmpeg_decode(&ref_ogg, CHANNELS).expect("ffmpeg libopus decode of ref");
+    let ref_trim: Vec<f32> = ref_dec.into_iter().take(source_frames * CHANNELS).collect();
+    let (_, ref_aligned) = align_to_source(&source_pcm, &ref_trim, CHANNELS, MAX_LAG);
+    let ref_ogg_bytes = fs::read(&ref_ogg).expect("read ref ogg");
+    let ref_payload: Vec<usize> = ogg_packets(&ref_ogg_bytes)
+        .into_iter()
+        .skip(2) // skip opus_head + opus_comment
+        .filter(|p| !p.is_empty())
+        .map(|p| p.len())
+        .collect();
+    let _ = fs::remove_file(&ref_ogg);
+
+    // Ours: ec-opus Voip at the reference's realised rate, collecting per-frame
+    // SILK diag. Bitrate matches the gate (ref_kbps*1000 rounded).
+    let mut enc = Encoder::new(48000, CHANNELS, Application::Voip).expect("encoder");
+    enc.set_bitrate((ref_kbps * 1000.0).round() as u32);
+    enc.set_vbr_constrained(true);
+    let mut dec = Decoder::new(48000, CHANNELS).unwrap();
+    let mut out = vec![0u8; 1500];
+    let mut buf = vec![0.0f32; 5760 * CHANNELS];
+    let mut padded = Vec::new();
+    let mut ours_dec = Vec::new();
+    let mut diags: Vec<ec_opus::SilkFrameDiag> = Vec::new();
+    let mut ours_bytes: Vec<usize> = Vec::new();
+
+    for block in source_pcm.chunks(FRAME * CHANNELS) {
+        let block = if block.len() < FRAME * CHANNELS {
+            padded.clear();
+            padded.extend_from_slice(block);
+            padded.resize(FRAME * CHANNELS, 0.0);
+            &padded[..]
+        } else {
+            block
+        };
+        let len = enc.encode_float(block, FRAME, &mut out).expect("encode");
+        let d = enc.last_silk_diag().cloned();
+        ours_bytes.push(len);
+        if let Some(d) = d { diags.push(d); }
+        let n = dec.decode_float(&out[..len], &mut buf).expect("decode");
+        ours_dec.extend_from_slice(&buf[..n * CHANNELS]);
+    }
+    let ours_trim: Vec<f32> = ours_dec.into_iter().take(source_frames * CHANNELS).collect();
+    let (_, ours_aligned) = align_to_source(&source_pcm, &ours_trim, CHANNELS, MAX_LAG);
+
+    // Per-second correlation ours vs ref against the full-band source (matches
+    // the gate's corr_bl for the 12k auto-mode row: no lowpass).
+    let n_frames = source_frames
+        .min(ours_aligned.len() / CHANNELS)
+        .min(ref_aligned.len() / CHANNELS);
+    let sec_samples = 48000usize;
+    let frames_per_sec = sec_samples / FRAME; // 50
+
+    let mut sec_rows: Vec<(usize, f64, f64, f64)> = Vec::new(); // (sec, corr_o, corr_r, gap)
+    let mut start = 0usize;
+    let mut sec_idx = 0usize;
+    while start + sec_samples <= n_frames {
+        let (mut sxy_o, mut sxx_o, mut syy_o) = (0.0f64, 0.0f64, 0.0f64);
+        let (mut sxy_r, mut sxx_r, mut syy_r) = (0.0f64, 0.0f64, 0.0f64);
+        for i in 0..sec_samples {
+            let s = source_pcm[start + i] as f64;
+            let o = ours_aligned[start + i] as f64;
+            let r = ref_aligned[start + i] as f64;
+            sxy_o += s * o; sxx_o += s * s; syy_o += o * o;
+            sxy_r += s * r; sxx_r += s * s; syy_r += r * r;
+        }
+        let co = if sxx_o > 0.0 && syy_o > 0.0 { sxy_o / (sxx_o * syy_o).sqrt() } else { 0.0 };
+        let cr = if sxx_r > 0.0 && syy_r > 0.0 { sxy_r / (sxx_r * syy_r).sqrt() } else { 0.0 };
+        sec_rows.push((sec_idx, co, cr, cr - co));
+        start += sec_samples;
+        sec_idx += 1;
+    }
+
+    let mut sorted = sec_rows.clone();
+    sorted.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap());
+
+    let mut out_str = String::new();
+    out_str.push_str("# sadie@12k SILK per-second diagnostic (r1)\n");
+    out_str.push_str("# mono, 120s cap, 20ms frames, VBR constrained, 48kHz, Application::Voip\n");
+    out_str.push_str(&format!("# total frames: ours={} ref={}\n", diags.len(), ref_payload.len()));
+    let avg_o: f64 = sec_rows.iter().map(|r| r.1).sum::<f64>() / sec_rows.len().max(1) as f64;
+    let avg_r: f64 = sec_rows.iter().map(|r| r.2).sum::<f64>() / sec_rows.len().max(1) as f64;
+    let gap_avg = avg_r - avg_o;
+    out_str.push_str(&format!(
+        "# avg corr: ours={:.4} ref={:.4} gap={:+.4}  ref_kbps={:.1} ours_kbps={:.1}\n\n",
+        avg_o, avg_r, gap_avg, ref_kbps,
+        ours_bytes.iter().map(|&b| b as f64).sum::<f64>() * 8.0 / seconds / 1000.0
+    ));
+
+    // Per-second summary table.
+    out_str.push_str("# sec\tcorr_o\tcorr_r\tgap\tgain_idx_mean\tvoiced_n\tnlsf_interp\tavg_B_o\tavg_B_r\tltp_gain_mean\tpitch_l_mean\n");
+    for &(s, co, cr, g) in &sec_rows {
+        let f0 = s * frames_per_sec;
+        let f1 = ((s + 1) * frames_per_sec).min(diags.len());
+        let sd = &diags[f0..f1.min(diags.len())];
+        let gain_mean: f64 = if !sd.is_empty() {
+            sd.iter().map(|d| d.gain_idx[0] as f64).sum::<f64>() / sd.len() as f64
+        } else { -1.0 };
+        let voiced_n = sd.iter().filter(|d| d.voiced).count();
+        let nlsf_int = if !sd.is_empty() {
+            sd.iter().map(|d| d.nlsf_interp).max().unwrap_or(0)
+        } else { 0 };
+        let avg_b_o: f64 = if !sd.is_empty() {
+            sd.iter().map(|d| d.bytes as f64).sum::<f64>() / sd.len() as f64
+        } else { 0.0 };
+        let ref_f0 = f0.min(ref_payload.len());
+        let ref_f1 = f1.min(ref_payload.len());
+        let avg_b_r: f64 = if ref_f1 > ref_f0 {
+            ref_payload[ref_f0..ref_f1].iter().map(|&b| b as f64).sum::<f64>()
+                / (ref_f1 - ref_f0) as f64
+        } else { 0.0 };
+        let ltp_mean: f64 = if !sd.is_empty() {
+            sd.iter().map(|d| d.ltp_gain as f64).sum::<f64>() / sd.len() as f64
+        } else { 0.0 };
+        let pitch_mean: f64 = if !sd.is_empty() {
+            sd.iter().filter(|d| d.voiced).map(|d| d.pitch_l[0] as f64).sum::<f64>()
+                / sd.iter().filter(|d| d.voiced).count().max(1) as f64
+        } else { 0.0 };
+        out_str.push_str(&format!(
+            "{}\t{:.4}\t{:.4}\t{:+.4}\t{:.1}\t{}\t{}\t{:.1}\t{:.1}\t{:.3}\t{:.1}\n",
+            s, co, cr, g, gain_mean, voiced_n, nlsf_int, avg_b_o, avg_b_r, ltp_mean, pitch_mean
+        ));
+    }
+
+    // Top 10 worst seconds by gap with per-frame SILK diag.
+    out_str.push_str("\n# --- 10 worst seconds by gap (per-frame SILK diag) ---\n");
+    out_str.push_str("# frame\tt_ms\tB_o\tB_r\tvoiced\tsig_type\tgain[0]\tlag_idx\tpitch_l\tnlsf_int\tltp_gain\tnb_subfr\n");
+    for &(s, _co, _cr, g) in sorted.iter().take(10) {
+        let f0 = s * frames_per_sec;
+        let f1 = ((s + 1) * frames_per_sec).min(diags.len());
+        out_str.push_str(&format!("# second {} gap={:+.4}\n", s, g));
+        for fi in f0..f1.min(diags.len()) {
+            let d = &diags[fi];
+            let b_ref = ref_payload.get(fi).copied().unwrap_or(0);
+            out_str.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\n",
+                fi, fi * 20, d.bytes, b_ref,
+                d.voiced as u8, d.signal_type, d.gain_idx[0], d.lag_index,
+                d.pitch_l[0], d.nlsf_interp, d.ltp_gain, d.nb_subfr
+            ));
+        }
+        out_str.push('\n');
+    }
+
+    // Global stats.
+    out_str.push_str("# --- global stats ---\n");
+    let voiced_count = diags.iter().filter(|d| d.voiced).count();
+    out_str.push_str(&format!("# voiced frames: {}/{}\n", voiced_count, diags.len()));
+    let gain_hist: Vec<(i8, usize)> = {
+        let mut h = std::collections::HashMap::new();
+        for d in &diags { *h.entry(d.gain_idx[0]).or_insert(0) += 1; }
+        let mut v: Vec<_> = h.into_iter().collect();
+        v.sort();
+        v
+    };
+    out_str.push_str(&format!("# gain_idx[0] histogram: {:?}\n", gain_hist));
+    let nlsf_hist: Vec<(i32, usize)> = {
+        let mut h = std::collections::HashMap::new();
+        for d in &diags { *h.entry(d.nlsf_interp).or_insert(0) += 1; }
+        let mut v: Vec<_> = h.into_iter().collect();
+        v.sort();
+        v
+    };
+    out_str.push_str(&format!("# nlsf_interp histogram: {:?}\n", nlsf_hist));
+    let avg_b_ours: f64 = diags.iter().map(|d| d.bytes as f64).sum::<f64>() / diags.len().max(1) as f64;
+    let avg_b_ref: f64 = ref_payload.iter().map(|&b| b as f64).sum::<f64>() / ref_payload.len().max(1) as f64;
+    out_str.push_str(&format!("# avg bytes/frame: ours={:.1} ref={:.1}\n", avg_b_ours, avg_b_ref));
+    let ltp_mean_all: f64 = diags.iter().map(|d| d.ltp_gain as f64).sum::<f64>() / diags.len().max(1) as f64;
+    out_str.push_str(&format!("# mean ltp_gain: {:.4}\n", ltp_mean_all));
+
+    let out_path = lanes_dir.join("opus-silkq-r1.seconds.txt");
+    fs::write(&out_path, out_str).unwrap();
+    println!("wrote {}", out_path.display());
+}
+
+// ---------------------------------------------------------------------------
+// ORACLE: decode both our packets and ffmpeg-libopus ref packets through our
+// own SilkDecoder, read back the per-frame `Indices`, and print side-by-side
+// for the worst seconds to name the divergence mechanism.
+// Run: SWEEP_ONLY=sadie cargo test -p ec-opus --release --test conformance \
+//      silk_silkq_oracle -- --ignored --nocapture
+// ---------------------------------------------------------------------------
+#[test]
+#[ignore]
+fn silk_silkq_oracle() {
+    const SECS: f64 = 120.0;
+    const FRAME: usize = 960; // 20 ms at 48 kHz
+    const CHANNELS: usize = 1;
+    const KBPS: u32 = 12;
+    const TARGET_SECS: &[usize] = &[3, 39, 51, 5, 1];
+
+    let src = shellexpand("~/Music/sadie.wav");
+    assert!(src.exists(), "source missing: {}", src.display());
+    let source_pcm = ffmpeg_decode_pcm_mono(&src, SECS);
+
+    let lanes_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lanes");
+    fs::create_dir_all(&lanes_dir).unwrap();
+    let ref_ogg = temp_path("opus-silkq-oracle-ref.opus");
+
+    // Reference: ffmpeg libopus mono voip at 12k.
+    ffmpeg_encode_libopus_mono_voip(&src, KBPS, &ref_ogg, SECS);
+    let ref_ogg_bytes = fs::read(&ref_ogg).expect("read ref ogg");
+    let ref_packets: Vec<Vec<u8>> = ogg_packets(&ref_ogg_bytes)
+        .into_iter()
+        .skip(2)
+        .filter(|p| !p.is_empty())
+        .collect();
+    let _ = fs::remove_file(&ref_ogg);
+
+    // Ours: ec-opus Voip at 12k.
+    let mut enc = Encoder::new(48000, CHANNELS, Application::Voip).expect("encoder");
+    enc.set_bitrate(KBPS * 1000);
+    enc.set_vbr_constrained(true);
+    let mut out = vec![0u8; 1500];
+    let mut ours_packets: Vec<Vec<u8>> = Vec::new();
+    let mut padded = Vec::new();
+    for block in source_pcm.chunks(FRAME * CHANNELS) {
+        let block = if block.len() < FRAME * CHANNELS {
+            padded.clear();
+            padded.extend_from_slice(block);
+            padded.resize(FRAME * CHANNELS, 0.0);
+            &padded[..]
+        } else {
+            block
+        };
+        let len = enc.encode_float(block, FRAME, &mut out).expect("encode");
+        ours_packets.push(out[..len].to_vec());
+    }
+
+
+    let ours_ix = collect_indices(&ours_packets);
+    let ref_ix = collect_indices(&ref_packets);
+
+    eprintln!("ours frames: {}  ref frames: {}", ours_ix.len(), ref_ix.len());
+
+    // Print side-by-side for target seconds (50 frames/sec at 20ms).
+    let frames_per_sec = 50usize;
+    let mut out_str = String::new();
+    out_str.push_str("# sadie@12k SILK oracle: ours vs ffmpeg-libopus indices (r1)\n");
+    out_str.push_str("# mono, 120s, 20ms frames, VBR constrained, 48kHz, Application::Voip\n");
+    out_str.push_str(&format!("# ours_frames={} ref_frames={}\n", ours_ix.len(), ref_ix.len()));
+    out_str.push_str("# sig: 0=unvoiced 2=voiced | per: LTP codebook | nlsf_i: 4=nointerp\n");
+    out_str.push_str("# gains/ltp are 4 subframe indices; lag/contour only for voiced\n\n");
+
+    for &sec in TARGET_SECS {
+        let start = sec * frames_per_sec;
+        let end = start + frames_per_sec;
+        out_str.push_str(&format!("=== second {} (frames {}–{}) ===\n", sec, start, end - 1));
+        out_str.push_str("frame  side sig qoff gains[4]        nlsf_i lag  cont per ltp[4]         ltpscl seed bytes\n");
+        for f in start..end {
+            let ours = ours_ix.get(f);
+            let refr = ref_ix.get(f);
+            if ours.is_none() && refr.is_none() {
+                continue;
+            }
+            for (side, item) in [("O", ours), ("R", refr)] {
+                match item {
+                    Some((ix, bytes)) => {
+                        let voiced = ix.signal_type == 2;
+                        let lag_str = if voiced {
+                            format!("{:4}", ix.lag_index)
+                        } else {
+                            "   -".to_string()
+                        };
+                        let cont_str = if voiced {
+                            format!("{:4}", ix.contour_index)
+                        } else {
+                            "   -".to_string()
+                        };
+                        let per_str = if voiced {
+                            format!("{}", ix.per_index)
+                        } else {
+                            "-".to_string()
+                        };
+                        let ltp_str = if voiced {
+                            format!("[{},{},{},{}]", ix.ltp_index[0], ix.ltp_index[1], ix.ltp_index[2], ix.ltp_index[3])
+                        } else {
+                            "[-,-,-,-]".to_string()
+                        };
+                        let ltpscl_str = if voiced {
+                            format!("{}", ix.ltp_scale_index)
+                        } else {
+                            "-".to_string()
+                        };
+                        out_str.push_str(&format!(
+                            "{:5}  {}   {:2}  {:2}  [{:2},{:2},{:2},{:2}]  {:2}    {} {}   {}   {}   {}    {:2}  {:3}\n",
+                            f, side, ix.signal_type, ix.quant_offset_type,
+                            ix.gains[0], ix.gains[1], ix.gains[2], ix.gains[3],
+                            ix.nlsf_interp_coef_q2,
+                            lag_str, cont_str, per_str, ltp_str, ltpscl_str,
+                            ix.seed, bytes,
+                        ));
+                    }
+                    None => {
+                        out_str.push_str(&format!("{:5}  {}   -- missing --\n", f, side));
+                    }
+                }
+            }
+        }
+        out_str.push('\n');
+    }
+
+    // Summarize divergence statistics across ALL frames.
+    let n = ours_ix.len().min(ref_ix.len());
+    let mut sig_mismatch = 0;
+    let mut qoff_mismatch = 0;
+    let mut gain_diff_sum = 0i64;
+    let mut nlsf_interp_diff = 0;
+    let mut ltp_per_mismatch = 0;
+    let mut ltp_idx_diff_sum = 0i64;
+    let mut voiced_both = 0;
+    let mut lag_diff_sum = 0i64;
+    let mut bytes_ours = 0u64;
+    let mut bytes_ref = 0u64;
+    for i in 0..n {
+        let (o, ob) = &ours_ix[i];
+        let (r, rb) = &ref_ix[i];
+        if o.signal_type != r.signal_type { sig_mismatch += 1; }
+        if o.quant_offset_type != r.quant_offset_type { qoff_mismatch += 1; }
+        for k in 0..4 { gain_diff_sum += (o.gains[k] as i64 - r.gains[k] as i64).abs(); }
+        if o.nlsf_interp_coef_q2 != r.nlsf_interp_coef_q2 { nlsf_interp_diff += 1; }
+        if o.signal_type == 2 && r.signal_type == 2 {
+            voiced_both += 1;
+            if o.per_index != r.per_index { ltp_per_mismatch += 1; }
+            for k in 0..4 { ltp_idx_diff_sum += (o.ltp_index[k] as i64 - r.ltp_index[k] as i64).abs(); }
+            lag_diff_sum += (o.lag_index as i64 - r.lag_index as i64).abs();
+        }
+        bytes_ours += *ob as u64;
+        bytes_ref += *rb as u64;
+    }
+    out_str.push_str("=== divergence summary (all frames) ===\n");
+    out_str.push_str(&format!("frames compared: {}\n", n));
+    out_str.push_str(&format!("signal_type mismatch: {} ({:.1}%)\n", sig_mismatch, 100.0 * sig_mismatch as f64 / n as f64));
+    out_str.push_str(&format!("quant_offset mismatch: {} ({:.1}%)\n", qoff_mismatch, 100.0 * qoff_mismatch as f64 / n as f64));
+    out_str.push_str(&format!("avg |gain diff| per subframe: {:.2}\n", gain_diff_sum as f64 / (n as f64 * 4.0)));
+    out_str.push_str(&format!("nlsf_interp mismatch: {} ({:.1}%)\n", nlsf_interp_diff, 100.0 * nlsf_interp_diff as f64 / n as f64));
+    out_str.push_str(&format!("voiced_both: {}\n", voiced_both));
+    out_str.push_str(&format!("  LTP per_index mismatch: {} ({:.1}%)\n", ltp_per_mismatch, 100.0 * ltp_per_mismatch as f64 / voiced_both.max(1) as f64));
+    out_str.push_str(&format!("  avg |ltp_index diff| per subframe: {:.2}\n", ltp_idx_diff_sum as f64 / (voiced_both.max(1) as f64 * 4.0)));
+    out_str.push_str(&format!("  avg |lag diff|: {:.2}\n", lag_diff_sum as f64 / voiced_both.max(1) as f64));
+    out_str.push_str(&format!("total bytes: ours={} ref={} ratio={:.3}\n", bytes_ours, bytes_ref, bytes_ours as f64 / bytes_ref.max(1) as f64));
+
+    let out_path = lanes_dir.join("opus-silkq-r1.oracle.txt");
+    fs::write(&out_path, &out_str).unwrap();
+    println!("wrote {}", out_path.display());
+    print!("{}", out_str);
+}
+
+/// Decode a SILK stream packet-by-packet through a fresh `SilkDecoder`,
+/// snapshotting each frame's coded indices — the oracle diagnostic's view of
+/// what the bitstream actually coded (our encoder's packets and a reference
+/// encoder's alike).
+fn collect_indices(packets: &[Vec<u8>]) -> Vec<(ec_opus::SilkDecIndices, usize)> {
+    let mut silk = ec_opus::SilkDecoder::new(16000, 1);
+    let mut results = Vec::new();
+    let mut silk_pcm = vec![0i16; 320]; // 20ms at 16kHz
+    for pkt in packets {
+        if pkt.len() <= 1 {
+            continue; // DTX / empty
+        }
+        let parsed = match ec_opus::Packet::parse(pkt, false) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let toc = parsed.toc;
+        let mode = toc.mode();
+        if mode == ec_opus::Mode::Celt {
+            continue;
+        }
+        let internal_rate = if mode == ec_opus::Mode::Hybrid {
+            16000
+        } else {
+            match toc.bandwidth() {
+                ec_opus::Bandwidth::Narrow => 8000,
+                ec_opus::Bandwidth::Medium => 12000,
+                _ => 16000,
+            }
+        };
+        let payload_ms = (toc.frame_size_48k() / 48).max(10);
+        let mut first = true;
+        for frame_data in &parsed.frames {
+            if frame_data.len() <= 1 {
+                first = false;
+                continue;
+            }
+            let mut dec = ec_opus::RangeDecoder::new(frame_data);
+            let _ = silk.decode(
+                &mut dec,
+                &mut silk_pcm,
+                payload_ms,
+                internal_rate,
+                1,
+                first,
+            );
+            let ix = silk.last_indices();
+            let bytes = frame_data.len();
+            results.push((ix, bytes));
+            first = false;
+        }
+    }
+    results
+}
+
+// ---------------------------------------------------------------------------
+// SILK 12k spectral divergence: WHERE the 12 kbps Voip err_ratio outlier
+// carries its error. Same machinery as spectral_divergence_vs_libopus, but
+// mono/Application::Voip/12 kbps on sadie.wav, both sides decoded through
+// ffmpeg libopus (gate symmetry), with the index oracle on the worst frames.
+// Run:
+//   cargo test -p ec-opus --release --test conformance \
+//     silk_spectral_divergence_12k -- --ignored --nocapture
+// Writes lanes/opus-silkq-r2.bands.txt.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore]
+fn silk_spectral_divergence_12k() {
+    const SECS: f64 = 120.0;
+    const FRAME: usize = 960; // 20 ms at 48 kHz
+    const CHANNELS: usize = 1;
+    const MAX_LAG: usize = 2000;
+    const KBPS: u32 = 12;
+
+    let src = shellexpand("~/Music/sadie.wav");
+    assert!(src.exists(), "source missing: {}", src.display());
+    let source_pcm = ffmpeg_decode_pcm_mono(&src, SECS);
+    let source_frames = source_pcm.len() / CHANNELS;
+    assert!(source_frames > 48_000, "source too short");
+    let seconds = source_frames as f64 / 48000.0;
+
+    let lanes_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lanes");
+    fs::create_dir_all(&lanes_dir).unwrap();
+    let ref_ogg = temp_path("opus-silkq-r2-ref.opus");
+    let ours_ogg = temp_path("opus-silkq-r2-ours.opus");
+
+    // Reference: ffmpeg libopus mono voip at 12k, decoded by ffmpeg libopus.
+    ffmpeg_encode_libopus_mono_voip(&src, KBPS, &ref_ogg, SECS);
+    let ref_bytes = fs::metadata(&ref_ogg).map(|m| m.len() as usize).unwrap_or(0);
+    let ref_kbps = ref_bytes as f64 * 8.0 / seconds / 1000.0;
+    let ref_dec = ffmpeg_decode(&ref_ogg, CHANNELS).expect("ffmpeg libopus decode of ref");
+    let ref_trim: Vec<f32> = ref_dec.into_iter().take(source_frames * CHANNELS).collect();
+    let (_, ref_aligned) = align_to_source(&source_pcm, &ref_trim, CHANNELS, MAX_LAG);
+    let ref_ogg_bytes = fs::read(&ref_ogg).expect("read ref ogg");
+    let ref_packets: Vec<Vec<u8>> = ogg_packets(&ref_ogg_bytes)
+        .into_iter()
+        .skip(2)
+        .filter(|p| !p.is_empty())
+        .collect();
+    let _ = fs::remove_file(&ref_ogg);
+
+    // Ours: ec-opus Voip at the reference's realised rate; our packets
+    // re-decoded through ffmpeg libopus so both sides cross the same decoder.
+    let mut enc = Encoder::new(48000, CHANNELS, Application::Voip).expect("encoder");
+    enc.set_bitrate((ref_kbps * 1000.0).round() as u32);
+    enc.set_vbr_constrained(true);
+    let pre_skip = enc.look_ahead(FRAME) as i64;
+    let mut out = vec![0u8; 1500];
+    let mut ours_packets: Vec<Vec<u8>> = Vec::new();
+    let mut padded = Vec::new();
+    for block in source_pcm.chunks(FRAME * CHANNELS) {
+        let block = if block.len() < FRAME * CHANNELS {
+            padded.clear();
+            padded.extend_from_slice(block);
+            padded.resize(FRAME * CHANNELS, 0.0);
+            &padded[..]
+        } else {
+            block
+        };
+        let len = enc.encode_float(block, FRAME, &mut out).expect("encode");
+        ours_packets.push(out[..len].to_vec());
+    }
+    write_ogg_opus(
+        &ours_ogg,
+        &ours_packets,
+        opus_head(CHANNELS, pre_skip as u16, None),
+        CHANNELS,
+        source_frames,
+        pre_skip,
+    );
+    let ours_bytes: usize = ours_packets.iter().map(|p| p.len()).sum();
+    let ours_kbps = ours_bytes as f64 * 8.0 / seconds / 1000.0;
+    let ours_dec = ffmpeg_decode(&ours_ogg, CHANNELS).expect("ffmpeg libopus decode of ours");
+    let _ = fs::remove_file(&ours_ogg);
+    let ours_trim: Vec<f32> = ours_dec.into_iter().take(source_frames * CHANNELS).collect();
+    let (_, ours_aligned) = align_to_source(&source_pcm, &ours_trim, CHANNELS, MAX_LAG);
+
+    // opus_compare totals, per-band eb², per-frame ef² — both vs the source.
+    let cmp_frames = source_frames
+        .min(ours_aligned.len() / CHANNELS)
+        .min(ref_aligned.len() / CHANNELS);
+    let take = |v: &[f32]| -> Vec<i16> { to_i16(&v[..cmp_frames * CHANNELS]) };
+    let s_i = take(&source_pcm);
+    let o_i = take(&ours_aligned);
+    let r_i = take(&ref_aligned);
+    let (err_o, eb2_o, ef2_o) = opus_compare_err_parts(&s_i, &o_i, CHANNELS);
+    let (err_r, eb2_r, ef2_r) = opus_compare_err_parts(&s_i, &r_i, CHANNELS);
+    let nframes = ef2_o.len();
+    assert_eq!(nframes, ef2_r.len(), "frame counts differ");
+
+    // Raw (unmasked) band energies: spectral shape + dominant-band lookup.
+    let as_f64 = |v: &[i16]| -> Vec<f64> { v.iter().map(|&x| x as f64).collect() };
+    let mut bands_s = Vec::new();
+    let mut bands_o = Vec::new();
+    let mut bands_r = Vec::new();
+    let mut scratch_ps = Vec::new();
+    band_energy(&as_f64(&s_i), CHANNELS, nframes, &mut Some(&mut bands_s), &mut scratch_ps);
+    band_energy(&as_f64(&o_i), CHANNELS, nframes, &mut Some(&mut bands_o), &mut scratch_ps);
+    band_energy(&as_f64(&r_i), CHANNELS, nframes, &mut Some(&mut bands_r), &mut scratch_ps);
+
+    // Oracle indices both sides; FFT frame xi -> 20 ms packet index.
+    let ours_ix = collect_indices(&ours_packets);
+    let ref_ix = collect_indices(&ref_packets);
+    let pkt_of = |xi: usize| xi * WIN_STEP / (FRAME * CHANNELS);
+
+    let mut report = String::new();
+    report.push_str("# sadie@12k SILK per-band divergence: ours vs ffmpeg-libopus (r2)\n");
+    report.push_str("# mono, 120s, 20ms frames, VBR constrained, 48kHz, Application::Voip\n");
+    report.push_str(&format!(
+        "# rates: ours {ours_kbps:.2} kbps, ref {ref_kbps:.2} kbps; \
+         err ours={err_o:.3} ref={err_r:.3} ratio={:.2}; nframes={nframes}\n",
+        err_o / err_r
+    ));
+
+    // (1) 21-band table: which bands carry the error.
+    let sum_o: f64 = eb2_o.iter().sum();
+    let sum_r: f64 = eb2_r.iter().sum();
+    report.push_str(
+        "# eb2 = band's mean share of the pre-squared frame error; \
+         dln = mean ln(E_test/E_src); band i ends at CELT_EBANDS[i+1]*240 Hz\n",
+    );
+    report.push_str("# band lo_hz hi_hz  dln_o  dln_r  eb2_o  eb2_r  ratio  share_o share_r\n");
+    for bi in 0..NBANDS {
+        let (mut dol, mut drl) = (0.0f64, 0.0f64);
+        for xi in 0..nframes {
+            let sl = bands_s[(xi * NBANDS + bi) * CHANNELS].ln();
+            dol += bands_o[(xi * NBANDS + bi) * CHANNELS].ln() - sl;
+            drl += bands_r[(xi * NBANDS + bi) * CHANNELS].ln() - sl;
+        }
+        dol /= nframes as f64;
+        drl /= nframes as f64;
+        let ratio = if eb2_r[bi] > 0.0 { eb2_o[bi] / eb2_r[bi] } else { f64::INFINITY };
+        report.push_str(&format!(
+            "{:5} {:5} {:6} {:+.3} {:+.3} {:.3e} {:.3e} {:>7} {:5.1}% {:5.1}%\n",
+            bi,
+            CELT_EBANDS[bi] * 240,
+            CELT_EBANDS[bi + 1] * 240,
+            dol,
+            drl,
+            eb2_o[bi],
+            eb2_r[bi],
+            ratio,
+            100.0 * eb2_o[bi] / sum_o,
+            100.0 * eb2_r[bi] / sum_r,
+        ));
+    }
+
+    // (2) top-15 frames by ef2(ours), with the dominant band and the oracle.
+    let mut by_ef2: Vec<usize> = (0..nframes).collect();
+    by_ef2.sort_by(|&a, &b| ef2_o[b].partial_cmp(&ef2_o[a]).unwrap());
+    report.push_str(
+        "\n# top-15 frames by ef2(ours) (ef2 = frame's squared opus_compare error); \
+         dom = argmax_b (lnE_o - lnE_s)^2, raw bands\n",
+    );
+    report.push_str(
+        "# t(s) fft pkt ef2_o ef2_r dom domband_hz | side sig qoff gains[4] nlsf_i lag cont per ltp[4] ltpscl seed bytes\n",
+    );
+    for &xi in by_ef2.iter().take(15) {
+        let pkt = pkt_of(xi);
+        let t = (xi * WIN_STEP) as f64 / 48000.0;
+        let (mut dom, mut dom_v) = (0usize, -1.0f64);
+        for bi in 0..NBANDS {
+            let sl = bands_s[(xi * NBANDS + bi) * CHANNELS].ln();
+            let d = bands_o[(xi * NBANDS + bi) * CHANNELS].ln() - sl;
+            if d * d > dom_v {
+                dom_v = d * d;
+                dom = bi;
+            }
+        }
+        report.push_str(&format!(
+            "{:7.3} {:5} {:4} {:.3e} {:.3e} {:2} {}-{}Hz\n",
+            t,
+            xi,
+            pkt,
+            ef2_o[xi],
+            ef2_r[xi],
+            dom,
+            CELT_EBANDS[dom] * 240,
+            CELT_EBANDS[dom + 1] * 240
+        ));
+        for (side, ixv) in [("  O", ours_ix.get(pkt)), ("  R", ref_ix.get(pkt))] {
+            match ixv {
+                Some((ix, bytes)) => {
+                    let voiced = ix.signal_type == 2;
+                    let opt = |v: String, on: bool| if on { v } else { "-".to_owned() };
+                    report.push_str(&format!(
+                        "      {side} sig={} qoff={} gains=[{},{},{},{}] nlsf_i={} lag={} cont={} per={} ltp=[{},{},{},{}] ltpscl={} seed={} bytes={}\n",
+                        ix.signal_type,
+                        ix.quant_offset_type,
+                        ix.gains[0],
+                        ix.gains[1],
+                        ix.gains[2],
+                        ix.gains[3],
+                        ix.nlsf_interp_coef_q2,
+                        opt(format!("{}", ix.lag_index), voiced),
+                        opt(format!("{}", ix.contour_index), voiced),
+                        opt(format!("{}", ix.per_index), voiced),
+                        opt(format!("{}", ix.ltp_index[0]), voiced),
+                        opt(format!("{}", ix.ltp_index[1]), voiced),
+                        opt(format!("{}", ix.ltp_index[2]), voiced),
+                        opt(format!("{}", ix.ltp_index[3]), voiced),
+                        opt(format!("{}", ix.ltp_scale_index), voiced),
+                        ix.seed,
+                        bytes
+                    ));
+                }
+                None => report.push_str(&format!("      {side} -- missing --\n")),
+            }
+        }
+    }
+
+    // (3) tail vs body: how much of the total error the worst frames carry,
+    // and whether the 11x ratio survives de-tailing (err = (Σef2/n)^(1/16)).
+    let tail = |ef2: &[f64]| -> (usize, f64, f64, usize, f64) {
+        let mut s = ef2.to_vec();
+        s.sort_by(|a, b| b.partial_cmp(a).unwrap());
+        let tot: f64 = s.iter().sum();
+        let k = (s.len() / 100).max(1);
+        let top1: f64 = s[..k].iter().sum();
+        let (mut half, mut acc) = (s.len(), 0.0);
+        for (i, v) in s.iter().enumerate() {
+            acc += v;
+            if acc >= 0.5 * tot {
+                half = i + 1;
+                break;
+            }
+        }
+        (k, top1 / tot, half as f64 / s.len() as f64, half, tot)
+    };
+    let root16 = |tot: f64, n: usize| tot.powf(1.0 / 16.0) / (n as f64).powf(1.0 / 16.0);
+    let (k, sh1_o, halff_o, half_o, _tot_o) = tail(&ef2_o);
+    let (_, sh1_r, halff_r, half_r, _tot_r) = tail(&ef2_r);
+    report.push_str(&format!(
+        "# tail: top-1% ({k} frames) carry {:.2}% of ours' Σef2 vs {:.2}% of ref's; \
+         50% of ours' err sits in the worst {half_o} frames ({:.2}%) \
+         vs ref's worst {half_r} ({:.2}%)\n",
+        100.0 * sh1_o, 100.0 * sh1_r, 100.0 * halff_o, 100.0 * halff_r
+    ));
+    // De-tailed: drop each side's worst 50 frames (of 24k FFT frames/pkt-mapped).
+    let clip50 = |ef2: &[f64]| -> f64 {
+        let mut s = ef2.to_vec();
+        s.sort_by(|a, b| b.partial_cmp(a).unwrap());
+        s[50..].iter().sum()
+    };
+    let err_o_clip = root16(clip50(&ef2_o), nframes);
+    let err_r_clip = root16(clip50(&ef2_r), nframes);
+    report.push_str(&format!(
+        "# de-tailed (worst 50 of {nframes} FFT frames dropped per side): \
+         err ours={err_o_clip:.3} ref={err_r_clip:.3} ratio={:.2} (was {err_o:.3}/{err_r:.3}/{:.2})\n",
+        err_o_clip / err_r_clip,
+        err_o / err_r
+    ));
+    // Burst signature: per 20 ms packet, does first-subframe gain >= 60 or a
+    // starved packet (<= 20 bytes) line up with the packet's mean ef2?
+    let mut pkt_ef2 = vec![0.0f64; ours_packets.len()];
+    let mut pkt_cnt = vec![0u32; ours_packets.len()];
+    for xi in 0..nframes {
+        let p = pkt_of(xi).min(pkt_ef2.len() - 1);
+        pkt_ef2[p] += ef2_o[xi];
+        pkt_cnt[p] += 1;
+    }
+    let mut g_hi = (0.0f64, 0usize); // (sum, count) packets with gains[0] >= 60
+    let mut g_lo = (0.0f64, 0usize);
+    let mut b_lo = (0.0f64, 0usize); // bytes <= 20
+    let mut b_hi = (0.0f64, 0usize);
+    for (i, (ix, bytes)) in ours_ix.iter().enumerate() {
+        if i >= pkt_ef2.len() {
+            break;
+        }
+        let mean = if pkt_cnt[i] > 0 { pkt_ef2[i] / pkt_cnt[i] as f64 } else { 0.0 };
+        if ix.gains[0] >= 60 {
+            g_hi.0 += mean;
+            g_hi.1 += 1;
+        } else {
+            g_lo.0 += mean;
+            g_lo.1 += 1;
+        }
+        if *bytes <= 20 {
+            b_lo.0 += mean;
+            b_lo.1 += 1;
+        } else {
+            b_hi.0 += mean;
+            b_hi.1 += 1;
+        }
+    }
+    report.push_str(&format!(
+        "# burst signature: packets with gains[0]>=60: {}/{}, mean ef2 {:.3e}; \
+         gains[0]<60: mean ef2 {:.3e} || packets <=20 bytes: {}/{}, mean ef2 {:.3e}; \
+         >20 bytes: mean ef2 {:.3e}\n",
+        g_hi.1,
+        g_hi.1 + g_lo.1,
+        if g_hi.1 > 0 { g_hi.0 / g_hi.1 as f64 } else { f64::NAN },
+        if g_lo.1 > 0 { g_lo.0 / g_lo.1 as f64 } else { f64::NAN },
+        b_lo.1,
+        b_lo.1 + b_hi.1,
+        if b_lo.1 > 0 { b_lo.0 / b_lo.1 as f64 } else { f64::NAN },
+        if b_hi.1 > 0 { b_hi.0 / b_hi.1 as f64 } else { f64::NAN },
+    ));
+
+    let out_path = lanes_dir.join("opus-silkq-r2.bands.txt");
+    fs::write(&out_path, &report).unwrap();
+    println!("wrote {}", out_path.display());
+    print!("{}", report);
+}
+
+// ---------------------------------------------------------------------------
 // Harness: feed identical raw PCM (.sw, s16le interleaved) to our opus_compare
 // so it can be checked against the C `opus_compare` tool on the SAME bytes.
 // Run: SW_REF=a.sw SW_TEST=b.sw SW_CH=2 cargo test -p ec-opus --release \

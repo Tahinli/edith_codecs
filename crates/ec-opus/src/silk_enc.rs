@@ -556,7 +556,19 @@ fn ncc(frame: &[f32], lag: usize) -> f32 {
 /// Coarse (4 kHz-equivalent decimated) search followed by a fine search at
 /// full rate, then a per-subframe refinement and contour-table lookup
 /// against the decoder's own `CB_LAGS_*` tables (`silk.rs:157-176`).
-pub(crate) fn estimate_pitch(frame: &[f32], fs_khz: i32, nb_subfr: usize) -> Option<PitchEstimate> {
+/// Voiced decision: libopus silk_find_pitch_lags starts from 0.6 (minus speech-activity,
+/// tilt and prev-type terms); value measured on real speech, lane opus-silkq r1.
+// Sweep 2026-08-23 (sadie 12k SILK-WB, corr/err_ratio): .35 -> .8081/11.4,
+// .45 -> .8127/26.3, .55 -> .8106/44.8, .65 -> .7987/12.3; err non-monotonic,
+// threshold is not the 12k mechanism. Kept at .35.
+const VOICED_THRESHOLD: f32 = 0.35;
+
+pub(crate) fn estimate_pitch(
+    frame: &[f32],
+    fs_khz: i32,
+    nb_subfr: usize,
+    prior_lag: Option<i32>,
+) -> Option<PitchEstimate> {
     let min_lag = (PE_MIN_LAG_MS * fs_khz) as usize;
     let max_lag = (PE_MAX_LAG_MS * fs_khz) as usize;
     if frame.len() <= max_lag {
@@ -595,8 +607,38 @@ pub(crate) fn estimate_pitch(frame: &[f32], fs_khz: i32, nb_subfr: usize) -> Opt
         .find(|&(_, &s)| s >= 0.85 * fine_best)
         .map(|(lag, _)| lag)
         .unwrap_or(fine_lo);
-    let best_score = fine_best;
-    let voiced = best_score > 0.35;
+    let mut best_score = fine_best;
+
+    // Pitch continuity (libopus `silk_P_estimation` reuses the prior frame's
+    // lag as a prior). The open-loop search can octave-error onto an integer
+    // multiple of the true period — seen as a 2-3.5x lag jump with LTP gain
+    // pinned at its floor — cratering that second's corr. When a prior lag is
+    // available and the open-loop result jumped away from it, re-search the
+    // fine window around the prior lag and keep it if its NCC is comparable.
+    // Measured harmful on real speech (sadie 12k SILK-WB: err_ratio 11.4 -> 26.2,
+    // lane opus-silkq r1); kept off.
+    const ENABLE_PITCH_CONTINUITY: bool = false;
+    let mut best_lag = best_lag;
+    if ENABLE_PITCH_CONTINUITY {
+        if let Some(pl) = prior_lag {
+            let pl = pl as usize;
+            if pl >= min_lag && pl <= max_lag && best_lag.abs_diff(pl) > dec {
+                let p_lo = pl.saturating_sub(dec).max(min_lag);
+                let p_hi = (pl + dec).min(max_lag);
+                let p_scores: Vec<f32> = (p_lo..=p_hi).map(|lag| ncc(frame, lag)).collect();
+                let p_best = p_scores.iter().cloned().fold(f32::MIN, f32::max);
+                if p_best >= 0.85 * best_score {
+                    best_lag = (p_lo..=p_hi)
+                        .zip(p_scores.iter())
+                        .find(|&(_, &s)| s >= 0.85 * p_best)
+                        .map(|(lag, _)| lag)
+                        .unwrap_or(pl);
+                    best_score = p_best;
+                }
+            }
+        }
+    }
+    let voiced = best_score > VOICED_THRESHOLD;
     if !voiced {
         return Some(PitchEstimate {
             voiced: false,
@@ -905,7 +947,7 @@ mod tests {
             let (idx, win) = w;
             frame[idx + 1] = 0.25 * win[0] + 0.5 * win[1] + 0.25 * win[2];
         }
-        let est = estimate_pitch(&frame, 16, 4).expect("long enough frame");
+        let est = estimate_pitch(&frame, 16, 4, None).expect("long enough frame");
         assert!(est.voiced, "pulse train should read as voiced");
         assert!(
             (est.lag as f32 - period).abs() <= 1.0,
@@ -920,7 +962,7 @@ mod tests {
                 ((rng_state >> 8) as f32 / 8_388_608.0) - 1.0
             })
             .collect();
-        let est_noise = estimate_pitch(&noise, 16, 4).expect("long enough frame");
+        let est_noise = estimate_pitch(&noise, 16, 4, None).expect("long enough frame");
         assert!(!est_noise.voiced, "white noise should read as unvoiced");
     }
 
