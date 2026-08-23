@@ -556,6 +556,13 @@ fn ncc(frame: &[f32], lag: usize) -> f32 {
 /// Coarse (4 kHz-equivalent decimated) search followed by a fine search at
 /// full rate, then a per-subframe refinement and contour-table lookup
 /// against the decoder's own `CB_LAGS_*` tables (`silk.rs:157-176`).
+/// Voiced decision: libopus silk_find_pitch_lags starts from 0.6 (minus speech-activity,
+/// tilt and prev-type terms); value measured on real speech, lane opus-silkq r1.
+// Sweep 2026-08-23 (sadie 12k SILK-WB, corr/err_ratio): .35 -> .8081/11.4,
+// .45 -> .8127/26.3, .55 -> .8106/44.8, .65 -> .7987/12.3; err non-monotonic,
+// threshold is not the 12k mechanism. Kept at .35.
+const VOICED_THRESHOLD: f32 = 0.35;
+
 pub(crate) fn estimate_pitch(
     frame: &[f32],
     fs_khz: i32,
@@ -631,7 +638,7 @@ pub(crate) fn estimate_pitch(
             }
         }
     }
-    let voiced = best_score > 0.35;
+    let voiced = best_score > VOICED_THRESHOLD;
     if !voiced {
         return Some(PitchEstimate {
             voiced: false,
