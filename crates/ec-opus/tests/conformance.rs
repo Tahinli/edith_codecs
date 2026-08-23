@@ -3233,6 +3233,7 @@ fn spectral_divergence_vs_libopus() {
     let all: &[(&str, &str)] = &[
         ("naz", "~/Music/naz_aglama_ben_aglarim.mp4"),
         ("dl8a", "~/Downloads/8a3b6d1d19.mp3"),
+        ("her", "~/Music/Her Nerdeysen.mp3"),
     ];
     let only: Vec<String> = std::env::var("SWEEP_ONLY")
         .unwrap_or_else(|_| "naz,dl8a".to_owned())
@@ -3515,7 +3516,9 @@ fn spectral_divergence_vs_libopus() {
         report.push_str(
             "# windows 12..=20: win +ms band lo-hi | lnE src/ours/ref, ch L then R\n",
         );
-        for xi in 12..=20 {
+        // WIN_CENTRE=<window index> recentres the dump on another window.
+        let wc: usize = std::env::var("WIN_CENTRE").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+        for xi in wc.saturating_sub(4)..=wc + 4 {
             if xi >= nframes {
                 break;
             }
@@ -3629,47 +3632,51 @@ fn celt_silence_then_attack_decodes_bounded() {
 #[ignore]
 fn naz_startup_hop_energies() {
     const CH: usize = 2;
-    let src = shellexpand("~/Music/naz_aglama_ben_aglarim.mp4");
+    // HOP_SRC / HOP_MS pick another source and window centre (diagnostic).
+    let src_s = std::env::var("HOP_SRC").unwrap_or_else(|_| "~/Music/naz_aglama_ben_aglarim.mp4".into());
+    let centre_ms: f64 = std::env::var("HOP_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(42.5);
+    let src = shellexpand(&src_s);
     if !src.exists() {
         return;
     }
-    let pcm = ffmpeg_decode_pcm(&src, 2.0);
+    let secs = (centre_ms / 1000.0 + 1.0).max(2.0);
+    let pcm = ffmpeg_decode_pcm(&src, secs);
     let scratch = std::env::temp_dir().join("ec-opus-naz-startup.opus");
-    ffmpeg_encode_libopus(&src, 96, &scratch, 2.0);
+    ffmpeg_encode_libopus(&src, 96, &scratch, secs);
     let (ref_dec, _) = decode_ogg(&scratch);
     let (lag_r, ref_al) = align_to_source(&pcm, &ref_dec, CH, 2000);
     let mut enc = Encoder::new(48000, CH, Application::Audio).unwrap();
     enc.set_bitrate(96_000);
     enc.set_vbr_constrained(true);
-    let (ours_dec, _) = roundtrip_own(&mut enc, &pcm, CH, 960);
+    let mut frames_diag = Vec::new();
+    let mut dec = Decoder::new(48000, CH).unwrap();
+    let mut out = vec![0u8; 1500];
+    let mut buf = vec![0f32; 5760 * CH];
+    let mut ours_dec = Vec::new();
+    for block in pcm.chunks_exact(960 * CH) {
+        let n = enc.encode_float(block, 960, &mut out).unwrap();
+        let m = dec.decode_float(&out[..n], &mut buf).unwrap();
+        ours_dec.extend_from_slice(&buf[..m * CH]);
+        let e = enc.last_celt_diag().clone();
+        let d = dec.last_celt_diag().clone();
+        frames_diag.push((n, e.is_transient, e.intra, d.tf_res.clone(), d.anti_collapse));
+    }
     let (lag_o, ours_al) = align_to_source(&pcm, &ours_dec, CH, 2000);
     let first = |v: &[f32]| v.iter().position(|x| x.abs() > 1e-4).map(|i| i / CH);
     println!("lag ref {lag_r} ours {lag_o}; first>1e-4: src {:?} ours {:?} ref {:?}", first(&pcm), first(&ours_al), first(&ref_al));
     let e = |v: &[f32], h: usize| -> f64 {
-        v[h * 120 * CH..((h + 1) * 120 * CH).min(v.len())].iter().map(|&x| (x as f64) * (x as f64)).sum()
+        let a = (h * 120 * CH).min(v.len());
+        let b = ((h + 1) * 120 * CH).min(v.len());
+        v[a..b].iter().map(|&x| (x as f64) * (x as f64)).sum()
     };
-    // Frame-2 flags of both streams through our decoder.
-    let data = fs::read(&scratch).unwrap();
-    let packets = ogg_packets(&data);
-    let mut rd = Decoder::new(48000, CH).unwrap();
-    let mut od = Decoder::new(48000, CH).unwrap();
-    let mut oe = Encoder::new(48000, CH, Application::Audio).unwrap();
-    oe.set_bitrate(96_000);
-    oe.set_vbr_constrained(true);
-    let mut buf = vec![0f32; 5760 * CH];
-    let mut out = vec![0u8; 1500];
-    for f in 0..4 {
-        rd.decode_float(&packets[2 + f], &mut buf).unwrap();
-        let r = rd.last_celt_diag().clone();
-        let n = oe.encode_float(&pcm[f * 960 * CH..(f + 1) * 960 * CH], 960, &mut out).unwrap();
-        od.decode_float(&out[..n], &mut buf).unwrap();
-        let o = od.last_celt_diag().clone();
-        let e = oe.last_celt_diag().clone();
-        println!("frame {f} REF bytes {} sil {} intra {} trans {} spread {} ac {} tf {:?}", packets[2 + f].len(), r.silence, r.intra, r.transient, r.spread, r.anti_collapse, r.tf_res);
-        println!("frame {f} OUR bytes {n} sil {} intra {} trans {} spread {} ac {} tf {:?} shorts {} pulses {:?}", o.silence, o.intra, o.transient, o.spread, o.anti_collapse, o.tf_res, e.short_blocks, e.pulses);
+    let hc = (centre_ms / 2.5) as usize;
+    for f in (hc / 8).saturating_sub(1)..=(hc / 8 + 1) {
+        if let Some((n, t, i, tf, ac)) = frames_diag.get(f) {
+            println!("frame {f} ({:.1} ms): bytes {n} trans {t} intra {i} ac {ac} tf {tf:?}", f as f64 * 20.0);
+        }
     }
     println!("hop(ms)\tsrc\tours\tref");
-    for h in 10..24 {
+    for h in hc.saturating_sub(8)..hc + 8 {
         println!("{:.1}\t{:.3e}\t{:.3e}\t{:.3e}", h as f64 * 2.5, e(&pcm, h), e(&ours_al, h), e(&ref_al, h));
     }
 }
