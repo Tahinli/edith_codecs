@@ -11,15 +11,12 @@
 //!   which removes the most expensive analysis in the reference encoder (an
 //!   autocorrelation search over 1024 lags). Same choice the reference makes
 //!   below complexity 5.
-//! - **Time/frequency Viterbi ported but gated off.** `tf_analysis()` and the
+//! - **Time/frequency Viterbi ported and enabled.** `tf_analysis()` and the
 //!   libopus float-mode `transient_analysis()` (returning `tf_estimate`/
 //!   `tf_chan`) are ported from the reference; `const TF_ANALYSIS: bool`
-//!   gates the Viterbi search. It is `false`: the 2-row gate (sadie/hein @64k)
-//!   vs the no-analysis baseline showed both corr gaps grow and minsec drop,
-//!   so the search is disabled. With the flag off, `tf_res` falls back to the
-//!   reference's no-analysis default — raw `is_transient` per band, which under
-//!   `tf_select = 0` codes "no tf change" (long frames keep full frequency
-//!   resolution; transient frames keep their short blocks).
+//!   gates the Viterbi search. It is `true`: `dynalloc_analysis()` computes
+//!   per-band `importance[]` and feeds it to the search, matching the
+//!   reference's analysis path.
 //! - **Fixed spreading.** `SPREAD_NORMAL` every frame, coded explicitly.
 //! - **Single-pass coarse energy** with the reference's own delayed-intra
 //!   heuristic, not the two-pass encode-both-and-compare.
@@ -686,6 +683,21 @@ impl CeltEncoder {
             }
         }
 
+        // --- Dynalloc analysis (offsets + spread_weight + importance) -----
+        self.offsets = [0; NB_BANDS];
+        let mut spread_weight = [0i32; NB_BANDS];
+        let mut importance = [0i32; NB_BANDS];
+        let max_depth = self.dynalloc_analysis(
+            start,
+            end,
+            c,
+            lm,
+            is_transient,
+            effective_bytes,
+            &mut spread_weight,
+            &mut importance,
+        );
+
         // --- tf_res ---------------------------------------------------------
         // `TF_ANALYSIS`: run the libopus Viterbi tf search when there are
         // enough bits; otherwise fall back to the no-analysis default (raw
@@ -693,10 +705,6 @@ impl CeltEncoder {
         const TF_ANALYSIS: bool = true;
         let tf_select = if TF_ANALYSIS && effective_bytes >= 15 * c as i32 {
             let lambda = (80i32).max(20480 / effective_bytes + 2);
-            let mut importance = [0i32; NB_BANDS];
-            for i in start..end {
-                importance[i] = 13;
-            }
             self.tf_analysis(end, is_transient, lambda, n, lm, tf_estimate, tf_chan, &importance)
         } else {
             self.tf_res = [i32::from(is_transient); NB_BANDS];
@@ -733,13 +741,6 @@ impl CeltEncoder {
 
         // --- tf encode ------------------------------------------------------
         self.tf_encode(enc, start, end, is_transient, lm, tf_select, nb_compressed);
-
-        // --- Dynalloc analysis (offsets + spread_weight) --------------------
-        self.offsets = [0; NB_BANDS];
-        let mut spread_weight = [0i32; NB_BANDS];
-        let max_depth = self.dynalloc_analysis(
-            start, end, c, lm, is_transient, effective_bytes, &mut spread_weight,
-        );
 
         // --- Spread decision (libopus celt_encoder.c:1933-1977) --------------
         // No LFE, no hybrid, no complexity field (treated as ≥ 3): the only
@@ -1167,7 +1168,8 @@ impl CeltEncoder {
     /// libopus `dynalloc_analysis`: per-band boost requests from a follower /
     /// median masking model over the long-window energies. Writes
     /// `self.offsets[i]` in boost units (the loop that codes them converts to
-    /// bits via the band's quanta).
+    /// bits via the band's quanta). Also computes `importance[]` for
+    /// `tf_analysis()` (libopus celt_encoder.c:1176-1189).
     fn dynalloc_analysis(
         &mut self,
         start: usize,
@@ -1177,6 +1179,7 @@ impl CeltEncoder {
         is_transient: bool,
         effective_bytes: i32,
         spread_weight: &mut [i32; NB_BANDS],
+        importance: &mut [i32; NB_BANDS],
     ) -> f32 {
         const LSB_DEPTH: f32 = 24.0;
         let mut noise_floor = [0.0f32; NB_BANDS];
@@ -1218,6 +1221,9 @@ impl CeltEncoder {
         }
         // Dynamic allocation can't make us bust the budget (libopus 1036-1037).
         if !(effective_bytes > 50 && lm >= 1) {
+            for i in start..end {
+                importance[i] = 13;
+            }
             return max_depth;
         }
         let median3 = |a: &[f32]| -> f32 {
@@ -1273,6 +1279,11 @@ impl CeltEncoder {
             for i in start..end {
                 follower[i] = (self.band_log_e[i] - follower[i]).max(0.0);
             }
+        }
+        // Importance for tf_analysis (libopus celt_encoder.c:1176-1189):
+        // 13 * 2^min(follower, 4), rounded to nearest integer.
+        for i in start..end {
+            importance[i] = (13.0 * (2.0_f32).powf(follower[i].min(4.0)) + 0.5).floor() as i32;
         }
         // Our VBR is always constrained: halve dynalloc on steady frames.
         if !is_transient {
