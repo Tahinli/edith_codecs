@@ -1110,6 +1110,7 @@ pub struct CeltDecDiag {
     pub silence: bool,
     /// Coarse energies used the intra-frame reset.
     pub intra: bool,
+    /// Short-block (transient) frame as coded.
     pub transient: bool,
     /// Packet bits the range decoder saw for this frame.
     pub total_bits: i32,
@@ -1121,6 +1122,22 @@ pub struct CeltDecDiag {
     pub spread: usize,
     /// Anti-collapse flag as coded.
     pub anti_collapse: bool,
+    /// Allocation trim index as coded (0..10).
+    pub alloc_trim: i32,
+    /// Per-band allocated pulses after `compute_allocation`.
+    pub pulses: Vec<i32>,
+    /// Per-band fine-energy precision bits.
+    pub fine_quant: Vec<i32>,
+    /// Stereo intensity band (bands >= this collapse to mono).
+    pub intensity: usize,
+    /// Dual-stereo flag as coded.
+    pub dual_stereo: bool,
+    /// Highest band actually allocated pulses (`codedBands`).
+    pub coded_bands: usize,
+    /// Bit balance left after allocation, in 1/8-bit units.
+    pub balance: i32,
+    /// Decoded dynalloc band boosts (1/8-bit units).
+    pub offsets: Vec<i32>,
 }
 
 /// A CELT layer decoder, one per Opus stream.
@@ -1218,6 +1235,14 @@ impl CeltDecoder {
                 tf_res: Vec::new(),
                 spread: 0,
                 anti_collapse: false,
+                alloc_trim: 0,
+                pulses: vec![0; NB_BANDS],
+                fine_quant: vec![0; NB_BANDS],
+                intensity: 0,
+                dual_stereo: false,
+                coded_bands: 0,
+                balance: 0,
+                offsets: vec![0; NB_BANDS],
             },
         }
     }
@@ -1566,6 +1591,14 @@ impl CeltDecoder {
             tf_res: self.tf_res.to_vec(),
             spread,
             anti_collapse: anti_collapse_on,
+            alloc_trim,
+            pulses: self.pulses.to_vec(),
+            fine_quant: self.fine_quant.to_vec(),
+            intensity,
+            dual_stereo,
+            coded_bands,
+            balance,
+            offsets: self.offsets.to_vec(),
         };
         self.rng = dec.range();
 

@@ -385,6 +385,8 @@ pub struct CeltEncoder {
     x: Vec<f32>,
     band_e: Vec<f32>,
     band_log_e: Vec<f32>,
+    /// Long-window log energies used by dynalloc (`bandLogE2`).
+    band_log_e2: Vec<f32>,
     error: Vec<f32>,
     transient_tmp: Vec<f32>,
     hadamard_tmp: Vec<f32>,
@@ -429,6 +431,7 @@ impl CeltEncoder {
             x: vec![0.0; channels * max_n],
             band_e: vec![0.0; 2 * NB_BANDS],
             band_log_e: vec![0.0; 2 * NB_BANDS],
+            band_log_e2: vec![0.0; 2 * NB_BANDS],
             error: vec![0.0; 2 * NB_BANDS],
             transient_tmp: vec![0.0; max_n + OVERLAP],
             hadamard_tmp: vec![0.0; max_n],
@@ -617,6 +620,22 @@ impl CeltEncoder {
         }
 
         // --- Forward MDCTs, energies, normalisation -------------------------
+        // dynalloc looks at long-window energies (`bandLogE2`): on transient
+        // frames that is a second MDCT pass, offset by LM/2 for the block size.
+        if short_blocks != 0 {
+            self.compute_mdcts(0, lm, n, c);
+            for ch in 0..c {
+                for i in start..end {
+                    let mut sum = 1e-27f32;
+                    for j in m * E_BANDS[i]..m * E_BANDS[i + 1] {
+                        let v = self.freq[ch * n + j];
+                        sum += v * v;
+                    }
+                    self.band_log_e2[i + ch * NB_BANDS] =
+                        (sum.sqrt() as f64).log2() as f32 - E_MEANS[i] + 0.5 * lm as f32;
+                }
+            }
+        }
         self.compute_mdcts(short_blocks, lm, n, c);
         for ch in 0..c {
             self.x[ch * n..ch * n + m * E_BANDS[start]].fill(0.0);
@@ -629,6 +648,9 @@ impl CeltEncoder {
                 self.band_e[i + ch * NB_BANDS] = sum.sqrt();
                 self.band_log_e[i + ch * NB_BANDS] =
                     (self.band_e[i + ch * NB_BANDS] as f64).log2() as f32 - E_MEANS[i];
+                if short_blocks == 0 {
+                    self.band_log_e2[i + ch * NB_BANDS] = self.band_log_e[i + ch * NB_BANDS];
+                }
             }
             for i in start..end {
                 let g = 1.0 / (1e-27 + self.band_e[i + ch * NB_BANDS]);
@@ -700,27 +722,7 @@ impl CeltEncoder {
         }
         self.offsets = [0; NB_BANDS];
         if effective_bytes > 50 && lm >= 1 {
-            let (t1, t2) = if lm <= 1 {
-                (3.0f32, 5.0f32)
-            } else {
-                (2.0, 4.0)
-            };
-            for i in start + 1..end - 1 {
-                let mut d2 =
-                    2.0 * self.band_log_e[i] - self.band_log_e[i - 1] - self.band_log_e[i + 1];
-                if c == 2 {
-                    d2 = 0.5
-                        * (d2 + 2.0 * self.band_log_e[i + NB_BANDS]
-                            - self.band_log_e[i - 1 + NB_BANDS]
-                            - self.band_log_e[i + 1 + NB_BANDS]);
-                }
-                if d2 > t1 {
-                    self.offsets[i] += 1;
-                }
-                if d2 > t2 {
-                    self.offsets[i] += 1;
-                }
-            }
+            self.dynalloc_analysis(start, end, c, lm, is_transient, effective_bytes);
         }
         let mut dynalloc_logp = 6u32;
         let total_bits_frac = total_bits << BITRES;
@@ -1130,6 +1132,118 @@ impl CeltEncoder {
         let tf_estimate = (0.0069 * tf_max.min(163.0) - 0.139).max(0.0).sqrt();
 
         (is_transient, tf_estimate, tf_chan)
+    }
+
+    /// libopus `dynalloc_analysis`: per-band boost requests from a follower /
+    /// median masking model over the long-window energies. Writes
+    /// `self.offsets[i]` in boost units (the loop that codes them converts to
+    /// bits via the band's quanta).
+    fn dynalloc_analysis(
+        &mut self,
+        start: usize,
+        end: usize,
+        c: usize,
+        lm: usize,
+        is_transient: bool,
+        effective_bytes: i32,
+    ) {
+        const LSB_DEPTH: f32 = 24.0;
+        let mut noise_floor = [0.0f32; NB_BANDS];
+        for i in 0..end {
+            noise_floor[i] = 0.0625 * LOG_N[i] as f32 + 0.5 + (9.0 - LSB_DEPTH) - E_MEANS[i]
+                + 0.0062 * ((i + 5) * (i + 5)) as f32;
+        }
+        let median3 = |a: &[f32]| -> f32 {
+            let (x, y, z) = (a[0], a[1], a[2]);
+            x.max(y).min(z).max(x.min(y))
+        };
+        let median5 = |a: &[f32]| -> f32 {
+            let mut v = [a[0], a[1], a[2], a[3], a[4]];
+            v.sort_by(|p, q| p.partial_cmp(q).unwrap());
+            v[2]
+        };
+        let mut follower = [0.0f32; 2 * NB_BANDS];
+        let mut last = 0usize;
+        for ch in 0..c {
+            let e2 = &self.band_log_e2[ch * NB_BANDS..ch * NB_BANDS + NB_BANDS];
+            let f = &mut follower[ch * NB_BANDS..ch * NB_BANDS + NB_BANDS];
+            f[0] = e2[0];
+            for i in 1..end {
+                // The last band at least .5 dB above its predecessor bounds
+                // the backward pass (band-limited signals).
+                if e2[i] > e2[i - 1] + 0.5 {
+                    last = i;
+                }
+                f[i] = (f[i - 1] + 1.5).min(e2[i]);
+            }
+            for i in (0..last).rev() {
+                f[i] = f[i].min((f[i + 1] + 2.0).min(e2[i]));
+            }
+            let offset = 1.0f32;
+            for i in 2..end.saturating_sub(2) {
+                f[i] = f[i].max(median5(&e2[i - 2..i + 3]) - offset);
+            }
+            let tmp = median3(&e2[0..3]) - offset;
+            f[0] = f[0].max(tmp);
+            f[1] = f[1].max(tmp);
+            let tmp = median3(&e2[end - 3..end]) - offset;
+            f[end - 2] = f[end - 2].max(tmp);
+            f[end - 1] = f[end - 1].max(tmp);
+            for i in 0..end {
+                f[i] = f[i].max(noise_floor[i]);
+            }
+        }
+        if c == 2 {
+            for i in start..end {
+                // 24 dB cross-talk between channels.
+                follower[NB_BANDS + i] = follower[NB_BANDS + i].max(follower[i] - 4.0);
+                follower[i] = follower[i].max(follower[NB_BANDS + i] - 4.0);
+                follower[i] = 0.5
+                    * ((self.band_log_e[i] - follower[i]).max(0.0)
+                        + (self.band_log_e[NB_BANDS + i] - follower[NB_BANDS + i]).max(0.0));
+            }
+        } else {
+            for i in start..end {
+                follower[i] = (self.band_log_e[i] - follower[i]).max(0.0);
+            }
+        }
+        // Our VBR is always constrained: halve dynalloc on steady frames.
+        if !is_transient {
+            for f in &mut follower[start..end] {
+                *f *= 0.5;
+            }
+        }
+        for i in start..end {
+            if i < 8 {
+                follower[i] *= 2.0;
+            }
+            if i >= 12 {
+                follower[i] *= 0.5;
+            }
+        }
+        let mut tot_boost = 0i32;
+        for i in start..end {
+            let f = follower[i].min(4.0);
+            let width = ((c * (E_BANDS[i + 1] - E_BANDS[i])) << lm) as i32;
+            let (boost, boost_bits) = if width < 6 {
+                let b = f as i32;
+                (b, (b * width) << BITRES)
+            } else if width > 48 {
+                let b = (f * 8.0) as i32;
+                (b, ((b * width) << BITRES) / 8)
+            } else {
+                let b = (f * width as f32 / 6.0) as i32;
+                (b, (b * 6) << BITRES)
+            };
+            // Constrained VBR, steady frame: dynalloc may take 2/3 of the bits.
+            if !is_transient && ((tot_boost + boost_bits) >> BITRES >> 3) > 2 * effective_bytes / 3 {
+                let cap = ((2 * effective_bytes / 3) << BITRES) << 3;
+                self.offsets[i] = cap - tot_boost;
+                break;
+            }
+            self.offsets[i] = boost;
+            tot_boost += boost_bits;
+        }
     }
 
     fn compute_mdcts(&mut self, short_blocks: usize, lm: usize, n: usize, c: usize) {
