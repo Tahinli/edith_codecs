@@ -17,32 +17,32 @@ use wide::i16x16;
 
 use crate::deblock::{edge_params, filter_luma_h_edge16, filter_luma_line};
 use crate::decoder::{
-    chroma_nz_pair, gather_nbr4, gather_nbr8, luma_nz_pair, mb_neighbors, MbNeighbors,
+    MbNeighbors, chroma_nz_pair, gather_nbr4, gather_nbr8, luma_nz_pair, mb_neighbors,
 };
-use crate::dpb::{Picture, Plane8, BLK_SKIP};
+use crate::dpb::{BLK_SKIP, Picture, Plane8};
 use crate::entropy::{
-    BlockCat, MbCtx, MbInfo, FLAG_CHROMA_PRED, FLAG_DECODED, FLAG_I16, FLAG_INTER, FLAG_SKIP,
-    FLAG_TRANS8X8,
+    BlockCat, FLAG_CHROMA_PRED, FLAG_DECODED, FLAG_I16, FLAG_INTER, FLAG_SKIP, FLAG_TRANS8X8,
+    MbCtx, MbInfo,
 };
-use crate::inter::{integer_origin, mc_chroma, mc_luma, RefPlane};
-use crate::mv::{neighbour_mvd, predict_mv, write_block, write_intra_mb, write_mvd, MvCtx};
+use crate::inter::{RefPlane, integer_origin, mc_chroma, mc_luma};
+use crate::mv::{MvCtx, neighbour_mvd, predict_mv, write_block, write_intra_mb, write_mvd};
 use crate::pred::{
-    add_residual_4x4, add_residual_8x8, filter_nbr8, pred_16x16, pred_4x4, pred_8x8,
-    pred_chroma_8x8, PlaneWindow,
+    PlaneWindow, add_residual_4x4, add_residual_8x8, filter_nbr8, pred_4x4, pred_8x8, pred_16x16,
+    pred_chroma_8x8,
 };
 use crate::tables::{BLK4_POS, CHROMA_QP};
 use crate::transform::{
-    chroma_dc_transform_420, dequant_4x4, dequant_8x8, inverse_transform_4x4,
-    inverse_transform_8x8, luma_dc_transform, unzigzag, unzigzag_8x8, unzigzag_ac15, LevelScale4x4,
-    LevelScale8x8,
+    LevelScale4x4, LevelScale8x8, chroma_dc_transform_420, dequant_4x4, dequant_8x8,
+    inverse_transform_4x4, inverse_transform_8x8, luma_dc_transform, unzigzag, unzigzag_8x8,
+    unzigzag_ac15,
 };
 
 use super::quant::{
-    forward_4x4, forward_8x8, forward_hadamard_2x2, forward_hadamard_4x4, quant_4x4, quant_8x8,
-    quant_chroma_dc, quant_luma_dc,
+    forward_4x4, forward_8x8, forward_hadamard_2x2, forward_hadamard_4x4, quant_4x4,
+    quant_4x4_offset, quant_8x8, quant_chroma_dc, quant_luma_dc,
 };
 use super::{
-    entropy::{sub_block_4x4, EncEntropy},
+    entropy::{EncEntropy, sub_block_4x4},
     lambda_ssd,
 };
 
@@ -315,7 +315,6 @@ fn motion_rate(e: &MbEnc<'_>, bits: f64) -> i32 {
     };
     (lambda * bits).round() as i32
 }
-
 
 /// Everything one macroblock's coding writes into the picture, kept so that a
 /// branch can be coded, measured and undone.
@@ -602,7 +601,6 @@ fn intra_pre_cost(
 /// below a half and falls away above it.
 const MV_BITS_WEIGHT: f64 = 0.5;
 
-
 /// How a P macroblock is partitioned, in the mb_type numbering of Table 7-13.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PShape {
@@ -857,9 +855,11 @@ fn choose_inter(pic: &Picture, e: &MbEnc<'_>, mb_x: usize, mb_y: usize) -> Inter
 
 /// Quantise and reconstruct the luma residual of a non-Intra_16x16 macroblock,
 /// prediction already in the plane.
+#[allow(clippy::too_many_arguments)]
 fn code_luma_4x4(
     pic: &mut Picture,
     e: &MbEnc<'_>,
+    w: &EncEntropy,
     mb_x: usize,
     mb_y: usize,
     qp: i32,
@@ -880,7 +880,15 @@ fn code_luma_4x4(
         }
         let source = d;
         forward_4x4(&mut d);
-        let nz = quant_4x4(&d, qp, intra, false, &mut lv.luma[blk]);
+        let rdoq = !intra && w.is_cabac();
+        let mut nz = if rdoq {
+            quant_4x4_offset(&d, qp, RDOQ_DEAD_ZONE, false, &mut lv.luma[blk])
+        } else {
+            quant_4x4(&d, qp, intra, false, &mut lv.luma[blk])
+        };
+        if rdoq && nz != 0 {
+            nz = rdoq_4x4(e, w, &source, &mut lv.luma[blk], qp);
+        }
         lv.luma_nz[blk] = nz;
         if nz == 0 {
             continue;
@@ -895,7 +903,8 @@ fn code_luma_4x4(
         // half of rate-distortion optimised quantisation, and the half that
         // pays. Intra blocks are left alone: their reconstruction is what the
         // next block in the macroblock predicts from.
-        if !intra
+        if !rdoq
+            && !intra
             && !worth_coding(
                 &source,
                 &resid,
@@ -910,6 +919,118 @@ fn code_luma_4x4(
         lv.cbp_luma |= 1 << (blk >> 2);
         add_residual_4x4(&mut pic.y.data, stride, origin, &resid);
     }
+}
+
+/// Squared error of coding `levels`, in the pixels the block reconstructs to.
+fn block_ssd(e: &MbEnc<'_>, source: &[i32; 16], levels: &[i32; 16], qp: i32) -> i64 {
+    let mut raster = [0i32; 16];
+    unzigzag(levels, &mut raster);
+    dequant_4x4(&mut raster, &e.ls, qp, false);
+    let mut resid = [0i32; 16];
+    inverse_transform_4x4(&raster, &mut resid);
+    let mut ssd = 0i64;
+    for i in 0..16 {
+        let d = i64::from(source[i] - resid[i]);
+        ssd += d * d;
+    }
+    ssd
+}
+
+/// How much of the mode-decision lambda rate-distortion quantisation uses.
+///
+/// The bits here are the coder's own, not an estimate, so there is no
+/// over-estimate to correct for and the scale starts at 1. Swept over 0.5,
+/// 1.0, 1.25, 1.5 and 2.0 against x264 on a 3840x1608 film clip and a
+/// 2560x1440 screen capture: the two disagree, film reading -0.607 dB at 0.5
+/// and -0.680 at 1.5 while screen capture reads -0.620 and -0.444, and 1.0 is
+/// the crossing point that costs neither (-0.628 and -0.471). Table in
+/// `lanes/h264x264-r2.report.md`.
+const RDOQ_LAMBDA: f64 = 1.0;
+
+/// The dead zone rate-distortion quantisation starts from, as a divisor of the
+/// quantiser step: 2 is round-to-nearest. The plain inter path uses 6, which
+/// has already thrown away the levels this search would weigh -- a search
+/// bounded by the heuristic it replaces measures the heuristic. This is the
+/// half of the change that pays: 1/6 -> 1/2 under the same search is worth
+/// 0.102 dB on the film clip and 0.301 on the synthetic gate. 1/3 and 1/4 read
+/// -0.647 and -0.677 dB where 1/2 reads -0.630.
+const RDOQ_DEAD_ZONE: i32 = 2;
+
+/// The largest level the search offers a smaller magnitude to. A big level is
+/// carrying real signal and never wins by shrinking; bounding the search is
+/// what keeps it free. Unbounded it tripled the synthetic clip's encode time
+/// (1.08 s -> 3.53 s) for the same BD-PSNR; at 2 the run is 1.09 s. Swept over
+/// 1, 2 and 3: -4.062/-0.623/-0.496, -4.073/-0.628/-0.471 and
+/// -4.065/-0.629/-0.477 dB on synthetic, film and screen capture.
+const RDOQ_MAX_LEVEL: i32 = 2;
+
+/// Rate-distortion quantisation of one inter luma block: each level is offered
+/// the two cheaper magnitudes below it, and takes one when the squared error it
+/// gives up costs less than the bits it saves.
+///
+/// The rate is the CABAC coder's own price for the whole block against the
+/// context state as it stands, so dropping a level is priced with the
+/// significance map that follows from it — which is where most of the saving
+/// is. Intra blocks stay out: their reconstruction is what the next block in
+/// the macroblock predicts from, so a level changed here would move a
+/// prediction the decision cannot see.
+fn rdoq_4x4(
+    e: &MbEnc<'_>,
+    w: &EncEntropy,
+    source: &[i32; 16],
+    levels: &mut [i32; 16],
+    qp: i32,
+) -> u8 {
+    let Some(bits) = w.residual_block_cost(levels, BlockCat::Luma4x4, Some(1), Some(1)) else {
+        return levels.iter().filter(|&&l| l != 0).count() as u8;
+    };
+    let lambda = RDOQ_LAMBDA * lambda_ssd(qp) / 256.0;
+    let mut cost = block_ssd(e, source, levels, qp) as f64 + lambda * f64::from(bits);
+    // Highest scanning position first: dropping the last significant level is
+    // what shortens the significance map, so it is tried while the levels
+    // above it are still gone.
+    for pos in (0..16).rev() {
+        let level = levels[pos];
+        if level == 0 {
+            continue;
+        }
+        let mag = level.abs();
+        if mag > RDOQ_MAX_LEVEL {
+            continue;
+        }
+        let mut tried = mag;
+        for candidate in [mag - 1, 0] {
+            if candidate == tried {
+                continue;
+            }
+            tried = candidate;
+            let keep = levels[pos];
+            levels[pos] = candidate * level.signum();
+            let Some(bits) = w.residual_block_cost(levels, BlockCat::Luma4x4, Some(1), Some(1))
+            else {
+                unreachable!("CAVLC returned early");
+            };
+            let trial = block_ssd(e, source, levels, qp) as f64 + lambda * f64::from(bits);
+            if trial < cost {
+                cost = trial;
+            } else {
+                levels[pos] = keep;
+            }
+        }
+    }
+    // And the block as a whole: zeroing it drops the coded_block_pattern bit as
+    // well as every level, which no single-coefficient step can see. This is
+    // the same decision `worth_coding` makes for the paths without an exact
+    // rate, made here with one.
+    let zero_bits = w
+        .residual_block_cost(&[0; 16], BlockCat::Luma4x4, Some(1), Some(1))
+        .expect("CABAC");
+    let ssd_zero: i64 = source.iter().map(|&c| i64::from(c) * i64::from(c)).sum();
+    if ssd_zero as f64 + lambda * f64::from(zero_bits) <= cost {
+        *levels = [0; 16];
+        return 0;
+    }
+    levels.iter().filter(|&&l| l != 0).count() as u8
 }
 
 /// How much of the mode-decision lambda the zero-block test uses.
@@ -2162,8 +2283,7 @@ fn ssd_mb_deblocked(
     for row in 0..16 {
         let src = (mb_y * 16 + row) * e.src.stride + mb_x * 16;
         for x in 0..16 {
-            let d =
-                i64::from(e.src.y[src + x]) - i64::from(scratch[(A + row) * S + A + x]);
+            let d = i64::from(e.src.y[src + x]) - i64::from(scratch[(A + row) * S + A + x]);
             sum += d * d;
         }
     }
@@ -2173,11 +2293,7 @@ fn ssd_mb_deblocked(
 /// Boundary strengths an intra candidate forces (8.7.2.1): 4 on its
 /// macroblock edges, 3 on the internal luma edges.
 fn intra_bs(edge: usize, _seg: usize, _vertical: bool) -> u8 {
-    if edge == 0 {
-        4
-    } else {
-        3
-    }
+    if edge == 0 { 4 } else { 3 }
 }
 
 /// Rough bit cost of a macroblock's luma residual.
@@ -2216,11 +2332,7 @@ fn block_bits(b: &[i32]) -> i64 {
             n += 2 * (64 - u64::from(l.unsigned_abs()).leading_zeros() as i64) + 1;
         }
     }
-    if n > 0 {
-        n + 6
-    } else {
-        2
-    }
+    if n > 0 { n + 6 } else { 2 }
 }
 
 /// Rough bit cost of a macroblock's residual, for the skip decision: a level
@@ -2381,7 +2493,7 @@ fn encode_inter_mb(
         let mut pred = [0u8; 256];
         save_luma(pic, mb_x, mb_y, &mut pred);
         let mut lv4 = chroma_lv.clone();
-        code_luma_4x4(pic, e, mb_x, mb_y, qp, false, &mut lv4);
+        code_luma_4x4(pic, e, w, mb_x, mb_y, qp, false, &mut lv4);
         let bits4 = inter_mb_bits(pic, e, w, mb_addr, &nbr, shape, &mvd, &inc, &lv4);
         let cost4 = ssd_mb(pic, e, mb_x, mb_y) as f64 + e.lambda * bits4 as f64;
         let mut recon4 = [0u8; 256];
@@ -2398,7 +2510,7 @@ fn encode_inter_mb(
             restore_luma(pic, mb_x, mb_y, &recon4);
         }
     } else {
-        code_luma_4x4(pic, e, mb_x, mb_y, qp, false, &mut lv);
+        code_luma_4x4(pic, e, w, mb_x, mb_y, qp, false, &mut lv);
     }
     let empty = lv.cbp_luma == 0 && lv.cbp_chroma == 0;
     let skip = match ssd_skip {

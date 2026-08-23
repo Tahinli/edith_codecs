@@ -214,9 +214,25 @@ pub(crate) fn quant_4x4(
     skip_dc: bool,
     out: &mut [i32; 16],
 ) -> u8 {
+    quant_4x4_offset(coef, qp, if intra { 3 } else { 6 }, skip_dc, out)
+}
+
+/// [`quant_4x4`] with the dead zone spelled out: the rounding offset is
+/// `1 / divisor` of a quantiser step.
+///
+/// Rate-distortion quantisation asks for a *smaller* dead zone than the plain
+/// path uses, because it walks levels down itself and cannot walk them up: a
+/// level the dead zone already dropped is not a candidate any more.
+pub(crate) fn quant_4x4_offset(
+    coef: &[i32; 16],
+    qp: i32,
+    divisor: i32,
+    skip_dc: bool,
+    out: &mut [i32; 16],
+) -> u8 {
     let m = (qp % 6) as usize;
     let qbits = 15 + (qp / 6) as u32;
-    let f = round_offset(qbits, intra);
+    let f = (1i32 << qbits) / divisor;
     let start = usize::from(skip_dc);
     let mut nz = 0;
     *out = [0; 16];
