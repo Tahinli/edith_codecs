@@ -803,13 +803,7 @@ impl Mp3Encode {
                         let (granule, r) = quantise_granule(
                             &xrs[index],
                             types[index],
-                            // The even split, not the demand split CBR
-                            // uses: VBR picks its bitrate by the noise-to-mask
-                            // ratio a candidate reaches, and that mapping is
-                            // calibrated to what an even split produces. Both
-                            // want to change together, against a VBR reference
-                            // gate that does not exist yet.
-                            ((capacity * 8) / count).min(PART2_3_MAX as usize) as u32,
+                            demand_share(capacity * 8, index),
                             &thresholds[index],
                             self.sample_rate,
                         );
@@ -1087,7 +1081,14 @@ fn quality_threshold(threshold: &[f32], quality: f32) -> Vec<f32> {
         let t = q - 0.5;
         4.5 - 11.0 * t - 12.0 * t * t
     };
-    let scale = 10f32.powf(db / 10.0);
+    // Recalibration, measured against `real_library_vbr_vs_lame`: splitting a
+    // frame by bit demand reaches the same masking bar for fewer bits, and the
+    // quality knob promises a mean rate rather than a bar, so the bar tightens
+    // to spend the saving instead of pocketing it. The slope is fitted to two
+    // points on the library -- 2 dB at quality 0.3 holds its promised 163
+    // kbit/s, and the rate moves about 9.5 kbit/s per decibel at quality 0.6.
+    let trim = 1.6 - 12.0 * q;
+    let scale = 10f32.powf((db + trim) / 10.0);
     threshold.iter().map(|&t| t * scale).collect()
 }
 
