@@ -106,11 +106,6 @@ const CO_MASK_RANGE: f64 = 50.0;
 /// rate/quality knob: raising the curve zeroes masked coefficients earlier,
 /// while peaks still ride as residue above it.
 const MASKING_OFFSET_DB: f64 = 9.0;
-/// dB added to the per-region geometric-mean floor level (E2, lane-vorbis-floor
-/// r2). 0 = pure envelope (E1, too low → clamp-lift saturation); the gap between
-/// mean dB and peak dB in a typical long-block region is 15–25 dB, so 12 sits
-/// halfway and keeps the loudest bin within the residue-book range.
-const ENVELOPE_MARGIN_DB: f64 = 6.0;
 /// All-zero partition guard: if the masked band still has a bin within this
 /// fraction of the floor, keep that bin as one sign-only residue sample.
 const NOISE_NORMALISE_MIN_RATIO: f32 = 0.5;
@@ -934,13 +929,6 @@ impl VorbisEncoder {
 /// Each point owns the coefficients halfway to its neighbours either side, so
 /// the whole spectrum is covered exactly once and a peak between two points
 /// still raises the floor that has to carry it.
-///
-/// E3 (lane-vorbis-floor r2): returns the per-region **RMS** of |bin| instead
-/// of the max.  RMS sits between the geometric mean (E1, dominated by
-/// noise-floor bins → too low) and the peak (baseline, follows only the
-/// loudest bin).  Tried because E1/E2 moved the gap (in the wrong direction):
-/// the trend k=0→6→12→peak was monotonically better, so RMS is expected to
-/// land above geomean but still below peak.
 fn peaks_of(floor: &Floor1, half: usize, spectra: &[&Vec<f32>]) -> Vec<f64> {
     let x = &floor.x_list;
     x.iter()
@@ -951,15 +939,13 @@ fn peaks_of(floor: &Floor1, half: usize, spectra: &[&Vec<f32>]) -> Vec<f64> {
             let hi = above.map_or(half, |a| ((a + centre) / 2) as usize + 1);
             let lo = lo.min(half - 1);
             let hi = hi.clamp(lo + 1, half);
-            let mut sum_sq = 0.0f64;
-            let mut count = 0usize;
+            let mut peak = 0.0f64;
             for spectrum in spectra {
                 for &value in &spectrum[lo..hi] {
-                    sum_sq += f64::from(value) * f64::from(value);
-                    count += 1;
+                    peak = peak.max(f64::from(value.abs()));
                 }
             }
-            (sum_sq / count as f64).sqrt()
+            peak
         })
         .collect()
 }
