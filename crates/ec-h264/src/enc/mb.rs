@@ -735,11 +735,15 @@ fn choose_inter(pic: &Picture, e: &MbEnc<'_>, mb_x: usize, mb_y: usize) -> Inter
                 best = (cand, c);
             }
         }
-        // A partition the prediction already fits within half a level a sample
-        // is not searched further: on real content most of them are, and the
-        // search is the encoder's hot loop.
-        let good_enough = (w * h / 2) as i32;
-        if best.1 > good_enough {
+        // Every partition is searched. This used to stop at a seed whose cost
+        // was already under half a level a sample, on the reasoning that the
+        // prediction fit and the search is the encoder's hot loop. Swept on
+        // consecutive pictures (BD-PSNR against x264, GOP 10) the threshold is
+        // monotonically harmful: 0/0.25/0.5/1.0 levels a sample read
+        // -0.586/-0.587/-0.593/-0.617 dB on the film clip and
+        // -0.466/-0.470/-0.468/-0.476 on the screen capture. A seed that fits
+        // is exactly where a little more refinement is cheap.
+        {
             let mut step = 4i16 * 4; // four whole samples, in quarter units
             while step >= 4 {
                 let mut improved = true;
@@ -828,6 +832,11 @@ fn choose_inter(pic: &Picture, e: &MbEnc<'_>, mb_x: usize, mb_y: usize) -> Inter
     // Measured: two more searches per macroblock buy 0.1-0.2 dB on screen
     // capture and nothing on camera content, for roughly twice the search
     // time. That is a Balanced trade, not a Fast one.
+    // The threshold is a floor that real content clears everywhere: swept at
+    // 0, 0.5, 1 and 2 levels a sample it moves neither clip's BD-PSNR by a
+    // thousandth of a decibel, so on these sources the halves are always
+    // searched. It stays as a guard for content flat enough to make the two
+    // extra searches pure cost.
     if e.preset == Preset::Balanced && cost16 > 16 * 16 {
         for shape in [PShape::Horizontal, PShape::Vertical] {
             let mut total = motion_rate(e, 6.0); // the partition's own signalling
