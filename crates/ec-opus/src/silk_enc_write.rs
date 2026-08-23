@@ -806,6 +806,11 @@ pub struct SilkStereoEncoder {
     mirror_range: u32,
     mirror_out: Vec<i16>,
     target_bps: Option<u32>,
+    /// libopus `smth_width_Q14`: smoothed stereo width. A fresh mono->stereo
+    /// transition starts it at 1.0 (`enc_API.c` line 191).
+    smth_width: f32,
+    /// libopus `width_prev_Q14 == 0`: the previous frame had zero width.
+    width_prev_zero: bool,
     prev_mid_only: bool,
     voiced_frames: usize,
 }
@@ -832,6 +837,8 @@ impl SilkStereoEncoder {
             mirror_range: 0,
             mirror_out: vec![0; 2 * 20 * fs_khz],
             target_bps: None,
+            smth_width: 1.0,
+            width_prev_zero: true,
             prev_mid_only: false,
             voiced_frames: 0,
         }
@@ -847,16 +854,68 @@ impl SilkStereoEncoder {
         self.voiced_frames
     }
 
-    /// Target bit rate in bits per second for the whole stereo packet.
+    /// Target bit rate in bits per second for the whole stereo packet. The
+    /// mid/side split is applied per frame by `stereo_rates`, mirroring
+    /// libopus `silk_stereo_LR_to_MS`.
     pub fn set_bitrate(&mut self, bps: u32) {
         self.target_bps = Some(bps);
-        // libopus (stereo_LR_to_MS) gives the side channel a fraction of
-        // the total that shrinks with its energy; a flat half starved the
-        // mid at 16 kbps stereo (libopus-heard corr .34 on the rate table).
-        let mid = (bps * 2 / 3).max(500);
-        let side = (bps - mid).max(500);
-        self.mid.set_bitrate(mid);
-        self.side.set_bitrate(side);
+    }
+
+    /// libopus `silk_stereo_LR_to_MS` rate split and panned-mono rule.
+    /// `frac` is the sqrt of the side/mid energy ratio, standing in for
+    /// libopus's LP/HP residual ratios. Simplifications: no LP/HP band split,
+    /// the width smoother runs at the full 0.01/frame coefficient (libopus
+    /// scales it by speech activity), and the silent-side taper is skipped
+    /// (a no-op for 20 ms frames). Width never enters the bitstream directly
+    /// (our packets carry zero stereo predictors); it acts only through
+    /// these rates and the mid-only flag.
+    fn stereo_rates(&mut self, frame_ms: usize, frac: f32) -> (u32, u32, bool) {
+        let bps = self.target_bps.expect("stereo rate split needs a target");
+        // Approximate bitrate spent coding the stereo parameters.
+        let total = bps
+            .saturating_sub(if frame_ms == 10 { 1200 } else { 600 })
+            .max(1);
+        let min_mid = 2000 + 600 * self.fs_khz as u32;
+        // 8 parts mid, 5 + 3*frac parts side; below the mid minimum the
+        // stereo width is reduced instead.
+        let mut mid = (8.0 * total as f32) / (13.0 + 3.0 * frac);
+        let mut width = if mid < min_mid as f32 {
+            mid = min_mid as f32;
+            let side = total as f32 - mid;
+            (4.0 * (2.0 * side - min_mid as f32)
+                / ((1.0 + 3.0 * frac) * min_mid as f32))
+                .clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        self.smth_width += (width - self.smth_width) * 0.01;
+        let mid_only = if self.width_prev_zero
+            && (8 * total < 13 * min_mid || frac * self.smth_width < 0.05)
+        {
+            // Panned mono: the previous frame already had zero width.
+            width = 0.0;
+            true
+        } else if !self.width_prev_zero
+            && (8 * total < 11 * min_mid || frac * self.smth_width < 0.02)
+        {
+            // Transition to zero width; the side is still coded this frame.
+            width = 0.0;
+            false
+        } else if self.smth_width > 0.95 {
+            width = 1.0;
+            false
+        } else {
+            width = self.smth_width;
+            false
+        };
+        self.width_prev_zero = width == 0.0;
+        if mid_only {
+            (total, 0, true)
+        } else {
+            // Keep at least 1 bps on the side (libopus tail).
+            let side = (total as f32 - mid).max(1.0);
+            ((total - side as u32).max(1), side as u32, false)
+        }
     }
 
     /// Algorithmic delay in 48 kHz samples.
@@ -883,45 +942,64 @@ impl SilkStereoEncoder {
         );
         if self.prev_mid_only {
             self.side.reset_state();
-            if let Some(bps) = self.target_bps {
-                self.side.set_bitrate((bps / 2).max(500));
-            }
         }
         let samples = 48 * frame_ms;
         let mut mid = Vec::with_capacity(samples);
         let mut side = Vec::with_capacity(samples);
+        let mut mid_energy = 0.0f32;
         let mut side_energy = 0.0f32;
         for lr in pcm48.chunks_exact(2) {
             let m = 0.5 * (lr[0] + lr[1]);
             let s = 0.5 * (lr[0] - lr[1]);
             mid.push(m);
             side.push(s);
+            mid_energy += m * m;
             side_energy += s * s;
         }
+        let frac = if mid_energy > 0.0 {
+            (side_energy / mid_energy).sqrt().min(1.0)
+        } else {
+            f32::from(side_energy > 0.0)
+        };
+        let mid_only = if self.target_bps.is_some() {
+            let (mid_bps, side_bps, mid_only) = self.stereo_rates(frame_ms, frac);
+            self.mid.set_bitrate(mid_bps.max(500));
+            if !mid_only {
+                self.side.set_bitrate(side_bps.max(500));
+            }
+            mid_only
+        } else {
+            side_energy < 1.0e-10
+        };
         let mid_trial = self
             .mid
             .encode_inner(&mid, frame_ms, None, false, 0, true)?;
-        let side_trial = self
-            .side
-            .encode_inner(&side, frame_ms, None, false, 0, true)?;
-        let mid_only = side_energy < 1.0e-10;
-        write_stereo_packet_header(enc, &mid_trial, &side_trial, mid_only);
+        let side_trial = if mid_only {
+            None
+        } else {
+            Some(
+                self.side
+                    .encode_inner(&side, frame_ms, None, false, 0, true)?,
+            )
+        };
+        let side_vad = side_trial.as_ref().map(|t| t.vad_flag).unwrap_or(false);
+        write_stereo_packet_header(enc, mid_trial.vad_flag, side_vad);
         write_stereo_zero_pred(enc);
-        if !side_trial.vad_flag {
+        if !side_vad {
             enc.enc_icdf(usize::from(mid_only), &STEREO_ONLY_CODE_MID_ICDF, 8);
         }
         write_frame_data(enc, &mid_trial, false, 0);
-        if !mid_only {
-            write_frame_data(enc, &side_trial, false, 0);
+        if let Some(trial) = &side_trial {
+            write_frame_data(enc, trial, false, 0);
         }
         self.mid.replay_ms(&mid_trial.bytes, frame_ms)?;
-        if mid_only {
-            self.side.reset_state();
-        } else {
-            self.side.replay_ms(&side_trial.bytes, frame_ms)?;
+        match &side_trial {
+            Some(trial) => self.side.replay_ms(&trial.bytes, frame_ms)?,
+            None => self.side.reset_state(),
         }
         self.prev_mid_only = mid_only;
-        self.voiced_frames += usize::from(mid_trial.voiced || side_trial.voiced);
+        self.voiced_frames +=
+            usize::from(mid_trial.voiced || side_trial.as_ref().is_some_and(|t| t.voiced));
         Ok(())
     }
 
@@ -943,39 +1021,61 @@ impl SilkStereoEncoder {
         );
         if self.prev_mid_only {
             self.side.reset_state();
-            if let Some(bps) = self.target_bps {
-                self.side.set_bitrate((bps / 2).max(500));
-            }
         }
         let samples = 48 * frame_ms;
         let mut mid = Vec::with_capacity(samples);
         let mut side = Vec::with_capacity(samples);
+        let mut mid_energy = 0.0f32;
         let mut side_energy = 0.0f32;
         for lr in pcm48.chunks_exact(2) {
             let m = 0.5 * (lr[0] + lr[1]);
             let s = 0.5 * (lr[0] - lr[1]);
             mid.push(m);
             side.push(s);
+            mid_energy += m * m;
             side_energy += s * s;
         }
+        let frac = if mid_energy > 0.0 {
+            (side_energy / mid_energy).sqrt().min(1.0)
+        } else {
+            f32::from(side_energy > 0.0)
+        };
+        let mid_only = if self.target_bps.is_some() {
+            let (mid_bps, side_bps, mid_only) = self.stereo_rates(frame_ms, frac);
+            self.mid.set_bitrate(mid_bps.max(500));
+            if !mid_only {
+                self.side.set_bitrate(side_bps.max(500));
+            }
+            mid_only
+        } else {
+            side_energy < 1.0e-10
+        };
         let mid_trial = self
             .mid
             .encode_inner(&mid, frame_ms, None, false, 0, true)?;
-        let side_trial = self
-            .side
-            .encode_inner(&side, frame_ms, None, false, 0, true)?;
-        let mid_only = side_energy < 1.0e-10;
+        let side_trial = if mid_only {
+            None
+        } else {
+            Some(
+                self.side
+                    .encode_inner(&side, frame_ms, None, false, 0, true)?,
+            )
+        };
 
         self.range.reset(1275);
-        write_stereo_packet_header(&mut self.range, &mid_trial, &side_trial, mid_only);
+        write_stereo_packet_header(
+            &mut self.range,
+            mid_trial.vad_flag,
+            side_trial.as_ref().map(|t| t.vad_flag).unwrap_or(false),
+        );
         write_stereo_zero_pred(&mut self.range);
-        if !side_trial.vad_flag {
+        if !side_trial.as_ref().map(|t| t.vad_flag).unwrap_or(false) {
             self.range
                 .enc_icdf(usize::from(mid_only), &STEREO_ONLY_CODE_MID_ICDF, 8);
         }
         write_frame_data(&mut self.range, &mid_trial, false, 0);
-        if !mid_only {
-            write_frame_data(&mut self.range, &side_trial, false, 0);
+        if let Some(trial) = &side_trial {
+            write_frame_data(&mut self.range, trial, false, 0);
         }
         self.range.done();
         debug_assert!(!self.range.error());
@@ -998,13 +1098,13 @@ impl SilkStereoEncoder {
         out[1..1 + len].copy_from_slice(&self.range.data()[..len]);
         self.replay_ms(&out[1..1 + len], frame_ms)?;
         self.mid.replay_ms(&mid_trial.bytes, frame_ms)?;
-        if mid_only {
-            self.side.reset_state();
-        } else {
-            self.side.replay_ms(&side_trial.bytes, frame_ms)?;
+        match &side_trial {
+            Some(trial) => self.side.replay_ms(&trial.bytes, frame_ms)?,
+            None => self.side.reset_state(),
         }
         self.prev_mid_only = mid_only;
-        self.voiced_frames += usize::from(mid_trial.voiced || side_trial.voiced);
+        self.voiced_frames +=
+            usize::from(mid_trial.voiced || side_trial.as_ref().is_some_and(|t| t.voiced));
         debug_assert_eq!(self.mirror_range, self.final_range);
         Ok(1 + len)
     }
@@ -1036,10 +1136,10 @@ impl SilkStereoEncoder {
     }
 }
 
-fn write_stereo_packet_header(enc: &mut RangeEncoder, mid: &Trial, side: &Trial, mid_only: bool) {
-    enc.enc_bit_logp(mid.vad_flag, 1);
+fn write_stereo_packet_header(enc: &mut RangeEncoder, mid_vad: bool, side_vad: bool) {
+    enc.enc_bit_logp(mid_vad, 1);
     enc.enc_bit_logp(false, 1);
-    enc.enc_bit_logp(if mid_only { false } else { side.vad_flag }, 1);
+    enc.enc_bit_logp(side_vad, 1);
     enc.enc_bit_logp(false, 1);
 }
 
