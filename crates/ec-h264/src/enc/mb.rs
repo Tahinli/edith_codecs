@@ -987,7 +987,21 @@ fn code_chroma(
     }
 }
 
-/// Pick the chroma prediction mode by SATD, leaving the winner in the planes.
+/// Pick the chroma prediction mode, leaving the winner in the planes.
+///
+/// SATD plus the mode's own signalling, not SAD: the transform is what the
+/// residual actually goes through, and the four modes cost between one and five
+/// bits to name. Measured with `bd_psnr_vs_x264` against x264 `-preset medium`,
+/// SAD-with-no-rate-term -> this, at no measurable encode time:
+///
+/// | clip | all-intra | GOP 10 |
+/// |---|---|---|
+/// | 3840x1608 film | -0.620 -> -0.535 dB | -1.495 -> -1.404 dB |
+/// | 2560x1440 screen capture | -0.231 -> -0.197 dB | -0.062 -> -0.033 dB |
+/// | 352x288 synthetic ramp | - | -5.297 -> -5.291 dB |
+///
+/// SATD alone accounts for about two thirds of that and the rate term the rest
+/// (film all-intra: -0.620 -> -0.568 -> -0.535 dB).
 fn choose_chroma_mode(
     pic: &mut Picture,
     e: &MbEnc<'_>,
@@ -1021,17 +1035,26 @@ fn choose_chroma_mode(
                 origin,
             };
             pred_chroma_8x8(mode, &mut win, nbr.b, nbr.a);
-            cost += sad(
+            cost += satd_block(
                 src,
                 e.src.c_stride,
                 mb_x * 8,
                 mb_y * 8,
-                &plane.data[origin..],
+                &plane.data,
                 stride,
+                origin,
                 8,
                 8,
             );
         }
+        // What signalling the mode costs: intra_chroma_pred_mode is ue(v), so
+        // DC is one bit and the plane mode five.
+        let bits = match mode {
+            0 => 1.0,
+            3 => 5.0,
+            _ => 3.0,
+        };
+        cost += motion_rate(e, bits);
         if cost < best.0 {
             best = (cost, mode);
         }
