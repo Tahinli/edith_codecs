@@ -3392,7 +3392,10 @@ fn report_conviction(label: &str, rows: &[(f64, f64, f64, f64, f64, f64)]) {
 #[test]
 fn sbr_instrument_anchor_controls() {
     if std::env::var("EC_AAC_SBR_INSTRUMENT_ANCHOR").is_err() {
-        eprintln!("SKIP: set EC_AAC_SBR_INSTRUMENT_ANCHOR=1 to run (round-41 Task 1)");
+        eprintln!(
+            "SKIP (round-41 Task 1): EC_AAC_SBR_INSTRUMENT_ANCHOR=1 cargo test -p ec-aac \
+             --release --test sbr_real_library sbr_instrument_anchor_controls -- --nocapture"
+        );
         return;
     }
     if !have_ffmpeg() {
@@ -3468,7 +3471,12 @@ fn sbr_instrument_anchor_controls() {
 #[test]
 fn sbr_actual_noise_fraction() {
     if std::env::var("EC_AAC_SBR_NOISE_ANCHOR").is_err() {
-        eprintln!("SKIP: set EC_AAC_SBR_NOISE_ANCHOR=1 to run (round-41 Task 2)");
+        eprintln!(
+            "SKIP (round-41 Task 2): EC_AAC_SBR_NOISE_ANCHOR=1 cargo test -p ec-aac \
+             --release --test sbr_real_library sbr_actual_noise_fraction -- \
+             --nocapture --test-threads=1 (env-gated because it sets process \
+             env vars mid-run, which is unsound alongside parallel tests)"
+        );
         return;
     }
     if !have_ffmpeg() {
@@ -3528,6 +3536,8 @@ fn sbr_actual_noise_fraction() {
     // not a decoder coverage gap (verified: `noise_fraction_table()` itself
     // has nonzero entries for QMF bands up to `k2`).
     let band_hz = f64::from(rate) / 128.0;
+    let kx_band = bookkept.iter().map(|(b, ..)| *b).min().unwrap_or(0);
+    println!("    (crossover: QMF band {kx_band}, {:.0} Hz -- rows below it are core-decoded and excluded from the total)", kx_band as f64 * band_hz);
     println!(
         "  ACTUAL noise fraction (band_hz, energy_on, energy_off, actual_fraction, bookkept_fraction):"
     );
@@ -3553,6 +3563,19 @@ fn sbr_actual_noise_fraction() {
         println!(
             "    {hz:>6.0}Hz: on {e_on:.3e} off {e_off:.3e} actual {actual:.4} bookkept {book:.4}"
         );
+        // HF ONLY (round-61): `MIN_BAND` (14, ~2412 Hz at 44.1k) sits BELOW
+        // this stream's crossover (~4500 Hz), so the row list opens with a
+        // dozen core-decoded bands that carry an order of magnitude more
+        // energy than the SBR-generated ones (6.4e4 vs ~5e3) and, by
+        // definition, zero injected noise. Summing them into a "whole-HF"
+        // ratio dilutes it toward zero -- that is how this metric read
+        // 0.0397 while every band above the crossover was realizing
+        // 0.15-0.27. The crossover comes from the bookkeeping table itself
+        // (its lowest QMF band IS `kx`), so it tracks the stream instead of
+        // a constant that a QMF-mapping change can invalidate.
+        if band < kx_band {
+            continue;
+        }
         sum_on += e_on;
         sum_delta += e_on - e_off;
     }
