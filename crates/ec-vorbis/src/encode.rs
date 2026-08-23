@@ -110,7 +110,7 @@ const MASKING_OFFSET_DB: f64 = 9.0;
 /// r2). 0 = pure envelope (E1, too low → clamp-lift saturation); the gap between
 /// mean dB and peak dB in a typical long-block region is 15–25 dB, so 12 sits
 /// halfway and keeps the loudest bin within the residue-book range.
-const ENVELOPE_MARGIN_DB: f64 = 12.0;
+const ENVELOPE_MARGIN_DB: f64 = 6.0;
 /// All-zero partition guard: if the masked band still has a bin within this
 /// fraction of the floor, keep that bin as one sign-only residue sample.
 const NOISE_NORMALISE_MIN_RATIO: f32 = 0.5;
