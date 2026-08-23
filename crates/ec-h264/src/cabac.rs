@@ -80,6 +80,49 @@ pub(crate) const I_MB_TYPE_CTX: [usize; 6] = [3, 6, 7, 8, 9, 10];
 pub(crate) const I_SUFFIX_CTX_P: [usize; 6] = [17, 18, 19, 19, 20, 20];
 const I_SUFFIX_CTX_B: [usize; 6] = [32, 33, 34, 34, 35, 35];
 
+/// Where a slice's bits went, in 1/256ths of a bit, by syntax class. The
+/// arithmetic decoder spends fractional bits per element, so the sub-bit
+/// resolution is the point: a class is charged the movement of
+/// `bit_position * 256 + log2(codIRange)` across its own reads. Both our
+/// streams and any other encoder's are parsed by this decoder, which is what
+/// makes the two accounts comparable.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct BitAccount {
+    pub skip: u64,
+    pub mb_type: u64,
+    pub mv: u64,
+    pub ref_idx: u64,
+    pub cbp_qp: u64,
+    pub intra_mode: u64,
+    pub residual_luma: u64,
+    pub residual_chroma: u64,
+}
+
+impl BitAccount {
+    /// Every class summed, in 1/256ths of a bit.
+    pub fn total(&self) -> u64 {
+        self.skip
+            + self.mb_type
+            + self.mv
+            + self.ref_idx
+            + self.cbp_qp
+            + self.intra_mode
+            + self.residual_luma
+            + self.residual_chroma
+    }
+
+    pub(crate) fn add(&mut self, other: &BitAccount) {
+        self.skip += other.skip;
+        self.mb_type += other.mb_type;
+        self.mv += other.mv;
+        self.ref_idx += other.ref_idx;
+        self.cbp_qp += other.cbp_qp;
+        self.intra_mode += other.intra_mode;
+        self.residual_luma += other.residual_luma;
+        self.residual_chroma += other.residual_chroma;
+    }
+}
+
 pub(crate) struct Cabac<'a> {
     r: BitCursor<'a>,
     /// codIRange (9.3.3.2).
@@ -96,6 +139,8 @@ pub(crate) struct Cabac<'a> {
     /// The macroblock being parsed is intra coded, which flips the
     /// coded_block_flag context of an unavailable neighbour (9.3.3.1.1.9).
     cur_intra: bool,
+    /// Bits spent so far, by syntax class.
+    account: BitAccount,
 }
 
 impl<'a> Cabac<'a> {
@@ -123,6 +168,7 @@ impl<'a> Cabac<'a> {
             ctx: MbCtx::default(),
             cbp_luma_bins: 0,
             cur_intra: true,
+            account: BitAccount::default(),
         };
         c.state = init_contexts(slice_qp, init_column.min(3));
         c.init_engine()?;
@@ -210,6 +256,124 @@ impl<'a> Cabac<'a> {
 
     /// Declare whether the macroblock being parsed is intra coded
     /// (9.3.3.1.1.9 reads it for every coded_block_flag).
+    /// The decoder's position in 1/256ths of a bit: the bits already read plus
+    /// what the arithmetic engine's interval says it is holding.
+    fn mark(&self) -> u64 {
+        self.r.bit_position() * 256 + u64::from(self.range.leading_zeros())
+    }
+
+    pub(crate) fn account(&self) -> BitAccount {
+        self.account
+    }
+
+    pub(crate) fn mb_type_i(&mut self) -> Result<u32> {
+        let m = self.mark();
+        let out = self.mb_type_i_inner();
+        self.account.mb_type += self.mark() - m;
+        out
+    }
+
+    pub(crate) fn mb_type_p(&mut self) -> Result<u32> {
+        let m = self.mark();
+        let out = self.mb_type_p_inner();
+        self.account.mb_type += self.mark() - m;
+        out
+    }
+
+    pub(crate) fn mb_type_b(&mut self) -> Result<u32> {
+        let m = self.mark();
+        let out = self.mb_type_b_inner();
+        self.account.mb_type += self.mark() - m;
+        out
+    }
+
+    pub(crate) fn sub_mb_type_p(&mut self) -> u32 {
+        let m = self.mark();
+        let out = self.sub_mb_type_p_inner();
+        self.account.mb_type += self.mark() - m;
+        out
+    }
+
+    pub(crate) fn sub_mb_type_b(&mut self) -> u32 {
+        let m = self.mark();
+        let out = self.sub_mb_type_b_inner();
+        self.account.mb_type += self.mark() - m;
+        out
+    }
+
+    pub(crate) fn mb_skip_flag(&mut self, b_slice: bool, inc: usize) -> bool {
+        let m = self.mark();
+        let out = self.mb_skip_flag_inner(b_slice, inc);
+        self.account.skip += self.mark() - m;
+        out
+    }
+
+    pub(crate) fn ref_idx(&mut self, inc: usize) -> Result<u32> {
+        let m = self.mark();
+        let out = self.ref_idx_inner(inc);
+        self.account.ref_idx += self.mark() - m;
+        out
+    }
+
+    pub(crate) fn mvd(&mut self, comp: usize, inc: usize) -> Result<i32> {
+        let m = self.mark();
+        let out = self.mvd_inner(comp, inc);
+        self.account.mv += self.mark() - m;
+        out
+    }
+
+    pub(crate) fn transform_size_8x8_flag(&mut self) -> Result<bool> {
+        let m = self.mark();
+        let out = self.transform_size_8x8_flag_inner();
+        self.account.cbp_qp += self.mark() - m;
+        out
+    }
+
+    pub(crate) fn coded_block_pattern(&mut self) -> Result<(u8, u8)> {
+        let m = self.mark();
+        let out = self.coded_block_pattern_inner();
+        self.account.cbp_qp += self.mark() - m;
+        out
+    }
+
+    pub(crate) fn mb_qp_delta(&mut self) -> Result<i32> {
+        let m = self.mark();
+        let out = self.mb_qp_delta_inner();
+        self.account.cbp_qp += self.mark() - m;
+        out
+    }
+
+    pub(crate) fn intra4x4_pred_mode(&mut self) -> Result<Option<u8>> {
+        let m = self.mark();
+        let out = self.intra4x4_pred_mode_inner();
+        self.account.intra_mode += self.mark() - m;
+        out
+    }
+
+    pub(crate) fn intra_chroma_pred_mode(&mut self) -> Result<u8> {
+        let m = self.mark();
+        let out = self.intra_chroma_pred_mode_inner();
+        self.account.intra_mode += self.mark() - m;
+        out
+    }
+
+    pub(crate) fn residual_block(
+        &mut self,
+        coeff: &mut [i32; 16],
+        cat: BlockCat,
+        na: Option<u8>,
+        nb: Option<u8>,
+    ) -> Result<u8> {
+        let m = self.mark();
+        let out = self.residual_block_inner(coeff, cat, na, nb);
+        let spent = self.mark() - m;
+        match cat {
+            BlockCat::ChromaDc(_) | BlockCat::ChromaAc => self.account.residual_chroma += spent,
+            _ => self.account.residual_luma += spent,
+        }
+        out
+    }
+
     pub(crate) fn set_intra(&mut self, intra: bool) {
         self.cur_intra = intra;
     }
@@ -227,7 +391,7 @@ impl<'a> Cabac<'a> {
     }
 
     /// mb_type of an I slice (Table 9-36).
-    pub(crate) fn mb_type_i(&mut self) -> Result<u32> {
+    fn mb_type_i_inner(&mut self) -> Result<u32> {
         let mut ctx = I_MB_TYPE_CTX;
         ctx[0] = OFF_MB_TYPE + self.mb_type_inc(OFF_MB_TYPE);
         self.mb_type_intra(&ctx)
@@ -256,14 +420,14 @@ impl<'a> Cabac<'a> {
     }
 
     /// mb_skip_flag (9.3.3.1.1.1); `inc` is condTermFlagA + condTermFlagB.
-    pub(crate) fn mb_skip_flag(&mut self, b_slice: bool, inc: usize) -> bool {
+    fn mb_skip_flag_inner(&mut self, b_slice: bool, inc: usize) -> bool {
         let off = if b_slice { OFF_SKIP_B } else { OFF_SKIP_P };
         self.decision(off + inc)
     }
 
     /// mb_type of a P or SP slice (Table 9-37): values 0..3, or 5 + the I-slice
     /// mb_type for an intra macroblock.
-    pub(crate) fn mb_type_p(&mut self) -> Result<u32> {
+    fn mb_type_p_inner(&mut self) -> Result<u32> {
         if self.decision(OFF_MB_TYPE_P) {
             return Ok(5 + self.mb_type_intra(&I_SUFFIX_CTX_P)?);
         }
@@ -280,7 +444,7 @@ impl<'a> Cabac<'a> {
 
     /// mb_type of a B slice (Table 9-37): values 0..22, or 23 + the I-slice
     /// mb_type for an intra macroblock.
-    pub(crate) fn mb_type_b(&mut self) -> Result<u32> {
+    fn mb_type_b_inner(&mut self) -> Result<u32> {
         if !self.decision(OFF_MB_TYPE_B + self.mb_type_inc(OFF_MB_TYPE_B)) {
             return Ok(0); // B_Direct_16x16
         }
@@ -318,7 +482,7 @@ impl<'a> Cabac<'a> {
     }
 
     /// sub_mb_type of a P macroblock (Table 9-38).
-    pub(crate) fn sub_mb_type_p(&mut self) -> u32 {
+    fn sub_mb_type_p_inner(&mut self) -> u32 {
         if self.decision(OFF_SUB_TYPE_P) {
             return 0;
         }
@@ -333,7 +497,7 @@ impl<'a> Cabac<'a> {
     }
 
     /// sub_mb_type of a B macroblock (Table 9-38).
-    pub(crate) fn sub_mb_type_b(&mut self) -> u32 {
+    fn sub_mb_type_b_inner(&mut self) -> u32 {
         if !self.decision(OFF_SUB_TYPE_B) {
             return 0; // B_Direct_8x8
         }
@@ -354,7 +518,7 @@ impl<'a> Cabac<'a> {
 
     /// ref_idx_lX: unary, with the neighbour increment of 9.3.3.1.1.6 on the
     /// first bin (Table 9-39 row 54).
-    pub(crate) fn ref_idx(&mut self, inc: usize) -> Result<u32> {
+    fn ref_idx_inner(&mut self, inc: usize) -> Result<u32> {
         if !self.decision(OFF_REF_IDX + inc) {
             return Ok(0);
         }
@@ -373,7 +537,7 @@ impl<'a> Cabac<'a> {
 
     /// mvd_lX component `comp` (0 horizontal, 1 vertical): UEG3 with
     /// signedValFlag 1 and uCoff 9 (clause 9.3.2.3), `inc` from 9.3.3.1.1.7.
-    pub(crate) fn mvd(&mut self, comp: usize, inc: usize) -> Result<i32> {
+    fn mvd_inner(&mut self, comp: usize, inc: usize) -> Result<i32> {
         let off = OFF_MVD[comp];
         if !self.decision(off + inc) {
             return Ok(0);
@@ -398,7 +562,7 @@ impl<'a> Cabac<'a> {
 
     /// transform_size_8x8_flag (9.3.3.1.1.10): a neighbour counts when it is
     /// available and carried the flag itself.
-    pub(crate) fn transform_size_8x8_flag(&mut self) -> Result<bool> {
+    fn transform_size_8x8_flag_inner(&mut self) -> Result<bool> {
         let cond = |n: Option<MbInfo>| match n {
             None => 0,
             Some(i) => usize::from(i.flags & FLAG_TRANS8X8 != 0),
@@ -409,7 +573,7 @@ impl<'a> Cabac<'a> {
 
     /// prev_intra4x4_pred_mode_flag, then rem_intra4x4_pred_mode as FL cMax=7
     /// with binIdx 0 the least significant bit.
-    pub(crate) fn intra4x4_pred_mode(&mut self) -> Result<Option<u8>> {
+    fn intra4x4_pred_mode_inner(&mut self) -> Result<Option<u8>> {
         if self.decision(OFF_PREV_I4) {
             return Ok(None);
         }
@@ -421,7 +585,7 @@ impl<'a> Cabac<'a> {
     }
 
     /// intra_chroma_pred_mode: TU cMax=3, ctxIdxInc from 9.3.3.1.1.8.
-    pub(crate) fn intra_chroma_pred_mode(&mut self) -> Result<u8> {
+    fn intra_chroma_pred_mode_inner(&mut self) -> Result<u8> {
         let cond = |n: Option<MbInfo>| match n {
             None => 0,
             Some(i) => usize::from(
@@ -444,7 +608,7 @@ impl<'a> Cabac<'a> {
 
     /// coded_block_pattern (9.3.2.6): FL cMax=15 luma prefix, TU cMax=2 chroma
     /// suffix, both with the neighbour contexts of 9.3.3.1.1.4.
-    pub(crate) fn coded_block_pattern(&mut self) -> Result<(u8, u8)> {
+    fn coded_block_pattern_inner(&mut self) -> Result<(u8, u8)> {
         for bin in 0..4u8 {
             // 6.4.11.2: the 8x8 block left of / above block `bin`, which for
             // blocks 1, 2 and 3 can be inside this macroblock.
@@ -501,7 +665,7 @@ impl<'a> Cabac<'a> {
     }
 
     /// mb_qp_delta: unary bin string of the Table 9-3 mapped value.
-    pub(crate) fn mb_qp_delta(&mut self) -> Result<i32> {
+    fn mb_qp_delta_inner(&mut self) -> Result<i32> {
         let mut k = 0i32;
         while self.decision(OFF_QP_DELTA + qp_delta_inc(k, usize::from(self.ctx.qp_delta_inc))) {
             k += 1;
@@ -513,7 +677,7 @@ impl<'a> Cabac<'a> {
     }
 
     /// residual_block_cabac (7.3.5.3.3) for one block, in scan order.
-    pub(crate) fn residual_block(
+    fn residual_block_inner(
         &mut self,
         coeff: &mut [i32; 16],
         cat: BlockCat,
@@ -575,6 +739,13 @@ impl<'a> Cabac<'a> {
     /// coded_block_pattern bit that selected this block is the whole signal and
     /// the flag is inferred to be 1.
     pub(crate) fn residual_block_8x8(&mut self, coeff: &mut [i32; 64]) -> Result<u8> {
+        let m = self.mark();
+        let out = self.residual_block_8x8_inner(coeff);
+        self.account.residual_luma += self.mark() - m;
+        out
+    }
+
+    fn residual_block_8x8_inner(&mut self, coeff: &mut [i32; 64]) -> Result<u8> {
         *coeff = [0; 64];
         let mut sig = [false; 64];
         let mut num = 64;
