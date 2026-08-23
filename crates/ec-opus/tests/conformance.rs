@@ -2887,6 +2887,205 @@ fn per_second_corr(source: &[f32], decoded: &[f32], channels: usize) -> (f64, u3
     (min_c, drops)
 }
 
+// ---------------------------------------------------------------------------
+// Per-second diagnostic: sadie@64k encoder decisions vs libopus correlation
+// ---------------------------------------------------------------------------
+//
+// Dumps per-second correlation (ours vs ref) with per-frame CeltFrameDiag to
+// lanes/opus-64-r1.seconds.txt.  Run with:
+//   cargo test -p ec-opus --release --test conformance sadie64_persecond_diag -- --ignored --nocapture
+
+#[test]
+#[ignore]
+fn sadie64_persecond_diag() {
+    const SECS: f64 = 120.0;
+    const FRAME: usize = 960; // 20 ms
+    const CHANNELS: usize = 2;
+    const MAX_LAG: usize = 2000;
+    const KBPS: u32 = 64;
+
+    let src = shellexpand("~/Music/sadie.wav");
+    assert!(src.exists(), "sadie.wav not found at {}", src.display());
+    let source_pcm = ffmpeg_decode_pcm(&src, SECS);
+    let source_frames = source_pcm.len() / CHANNELS;
+    let seconds = source_frames as f64 / 48000.0;
+
+    // Reference: ffmpeg libopus
+    let lanes_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lanes");
+    fs::create_dir_all(&lanes_dir).unwrap();
+    let scratch = lanes_dir.join("opus-64-r1.scratch.ogg");
+    ffmpeg_encode_libopus(&src, KBPS, &scratch, SECS);
+    let ref_packets = ogg_packets(&fs::read(&scratch).unwrap());
+    let ref_payload: Vec<usize> = ref_packets
+        .iter()
+        .skip(2) // skip opus_head + opus_comment
+        .filter(|p| !p.is_empty())
+        .map(|p| p.len())
+        .collect();
+    let (ref_dec, ref_ch) = decode_ogg(&scratch);
+    assert_eq!(ref_ch, CHANNELS);
+    let (_, ref_aligned) = align_to_source(&source_pcm, &ref_dec, CHANNELS, MAX_LAG);
+    let _ = fs::remove_file(&scratch);
+
+    // Ours: ec-opus encoder, collecting per-frame diag
+    let mut enc = Encoder::new(48000, CHANNELS, Application::Audio).expect("encoder");
+    enc.set_bitrate(KBPS * 1000);
+    enc.set_vbr_constrained(true);
+    let mut dec = Decoder::new(48000, CHANNELS).unwrap();
+    let mut out = vec![0u8; 1500];
+    let mut buf = vec![0.0f32; 5760 * CHANNELS];
+    let mut padded = Vec::new();
+    let mut ours_dec = Vec::new();
+    let mut diags: Vec<ec_opus::CeltFrameDiag> = Vec::new();
+    let mut ours_bytes: Vec<usize> = Vec::new();
+
+    for block in source_pcm.chunks(FRAME * CHANNELS) {
+        let block = if block.len() < FRAME * CHANNELS {
+            padded.clear();
+            padded.extend_from_slice(block);
+            padded.resize(FRAME * CHANNELS, 0.0);
+            &padded[..]
+        } else {
+            block
+        };
+        let len = enc.encode_float(block, FRAME, &mut out).expect("encode");
+        let d = enc.last_celt_diag().clone();
+        ours_bytes.push(len);
+        diags.push(d);
+        let n = dec.decode_float(&out[..len], &mut buf).expect("decode");
+        ours_dec.extend_from_slice(&buf[..n * CHANNELS]);
+    }
+    let (_, ours_aligned) = align_to_source(&source_pcm, &ours_dec, CHANNELS, MAX_LAG);
+
+    // Per-second correlation for both
+    let n_frames = (source_frames).min(ours_aligned.len() / CHANNELS).min(ref_aligned.len() / CHANNELS);
+    let sec_samples = 48000usize;
+    let frames_per_sec = sec_samples / FRAME; // 50
+
+    let mut sec_rows: Vec<(usize, f64, f64, f64)> = Vec::new(); // (sec, corr_ours, corr_ref, gap)
+    let mut start = 0usize;
+    let mut sec_idx = 0usize;
+    while start + sec_samples <= n_frames {
+        let mut acc_o = 0.0f64;
+        let mut acc_r = 0.0f64;
+        for ch in 0..CHANNELS {
+            let (mut sxy_o, mut sxx_o, mut syy_o) = (0.0f64, 0.0f64, 0.0f64);
+            let (mut sxy_r, mut sxx_r, mut syy_r) = (0.0f64, 0.0f64, 0.0f64);
+            for i in 0..sec_samples {
+                let s = source_pcm[(start + i) * CHANNELS + ch] as f64;
+                let o = ours_aligned[(start + i) * CHANNELS + ch] as f64;
+                let r = ref_aligned[(start + i) * CHANNELS + ch] as f64;
+                sxy_o += s * o; sxx_o += s * s; syy_o += o * o;
+                sxy_r += s * r; sxx_r += s * s; syy_r += r * r;
+            }
+            if sxx_o > 0.0 && syy_o > 0.0 { acc_o += sxy_o / (sxx_o * syy_o).sqrt(); }
+            if sxx_r > 0.0 && syy_r > 0.0 { acc_r += sxy_r / (sxx_r * syy_r).sqrt(); }
+        }
+        let co = acc_o / CHANNELS as f64;
+        let cr = acc_r / CHANNELS as f64;
+        sec_rows.push((sec_idx, co, cr, cr - co));
+        start += sec_samples;
+        sec_idx += 1;
+    }
+
+    // Sort by gap descending
+    let mut sorted = sec_rows.clone();
+    sorted.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap());
+
+    let mut out_str = String::new();
+    out_str.push_str("# sadie@64k per-second diagnostic (r1, current code)\n");
+    out_str.push_str("# 120s cap, 20ms frames, VBR constrained, 48kHz stereo\n");
+    out_str.push_str(&format!("# total frames: ours={} ref={}\n", diags.len(), ref_payload.len()));
+    let total_corr_o: f64 = sec_rows.iter().map(|r| r.1).sum::<f64>() / sec_rows.len() as f64;
+    let total_corr_r: f64 = sec_rows.iter().map(|r| r.2).sum::<f64>() / sec_rows.len() as f64;
+    out_str.push_str(&format!("# avg corr: ours={:.4} ref={:.4} gap={:+.4}\n\n", total_corr_o, total_corr_r, total_corr_r - total_corr_o));
+
+    // Per-second summary table
+    out_str.push_str("# sec\tcorr_ours\tcorr_ref\tgap\tavg_trim\tdual_n\tint_typ\tavg_B_ours\tavg_B_ref\ttf_chng_n\ttrans_n\n");
+    for &(s, co, cr, g) in &sec_rows {
+        let f0 = s * frames_per_sec;
+        let f1 = ((s + 1) * frames_per_sec).min(diags.len());
+        let sec_diags = &diags[f0..f1.min(diags.len())];
+        let avg_trim: f64 = if !sec_diags.is_empty() {
+            sec_diags.iter().map(|d| d.alloc_trim as f64).sum::<f64>() / sec_diags.len() as f64
+        } else { -1.0 };
+        let dual_n = sec_diags.iter().filter(|d| d.dual_stereo).count();
+        let int_typ = if !sec_diags.is_empty() {
+            sec_diags.iter().map(|d| d.intensity).max().unwrap_or(0)
+        } else { 0 };
+        let avg_b_o: f64 = if !sec_diags.is_empty() {
+            sec_diags.iter().map(|d| d.nb_compressed as f64).sum::<f64>() / sec_diags.len() as f64
+        } else { 0.0 };
+        let ref_f0 = f0.min(ref_payload.len());
+        let ref_f1 = f1.min(ref_payload.len());
+        let avg_b_r: f64 = if ref_f1 > ref_f0 {
+            ref_payload[ref_f0..ref_f1].iter().map(|&b| b as f64).sum::<f64>() / (ref_f1 - ref_f0) as f64
+        } else { 0.0 };
+        // tf_changed: count bands where tf_res != 0 (we don't have tf_res in diag,
+        // but is_transient tells us if short blocks were used)
+        let trans_n = sec_diags.iter().filter(|d| d.is_transient).count();
+        out_str.push_str(&format!(
+            "{}\t{:.4}\t{:.4}\t{:+.4}\t{:.1}\t{}\t{}\t{:.0}\t{:.0}\t-\t{}\n",
+            s, co, cr, g, avg_trim, dual_n, int_typ, avg_b_o, avg_b_r, trans_n
+        ));
+    }
+
+    // Top 10 worst seconds with per-frame diag
+    out_str.push_str("\n# --- 10 worst seconds by gap (per-frame diag) ---\n");
+    out_str.push_str("# frame\tt_ms\tB_ours\tB_ref\ttrans\tshort\tintra\tsil\tlm\tstart\tbands\tint\tdual\ttrim\treservoir\tpulses[0..5]\tfine[0..5]\n");
+    for &(s, _co, _cr, g) in sorted.iter().take(10) {
+        let f0 = s * frames_per_sec;
+        let f1 = ((s + 1) * frames_per_sec).min(diags.len());
+        out_str.push_str(&format!("# second {} gap={:+.4}\n", s, g));
+        for fi in f0..f1.min(diags.len()) {
+            let d = &diags[fi];
+            let b_ref = ref_payload.get(fi).copied().unwrap_or(0);
+            let p5: Vec<String> = (0..5).map(|i| format!("{}", d.pulses[i])).collect();
+            let f5: Vec<String> = (0..5).map(|i| format!("{}", d.fine_quant[i])).collect();
+            out_str.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                fi, fi * 20, d.nb_compressed, b_ref,
+                d.is_transient as u8, d.short_blocks, d.intra as u8, d.silence as u8,
+                d.lm, d.start, d.coded_bands, d.intensity, d.dual_stereo as u8,
+                d.alloc_trim, d.vbr_reservoir, p5.join(","), f5.join(",")
+            ));
+        }
+        out_str.push('\n');
+    }
+
+    // Global stats
+    out_str.push_str("# --- global stats ---\n");
+    let trim_hist: Vec<(i32, usize)> = {
+        let mut h = std::collections::HashMap::new();
+        for d in &diags { *h.entry(d.alloc_trim).or_insert(0) += 1; }
+        let mut v: Vec<_> = h.into_iter().collect();
+        v.sort();
+        v
+    };
+    out_str.push_str(&format!("# alloc_trim histogram: {:?}\n", trim_hist));
+    let dual_count = diags.iter().filter(|d| d.dual_stereo).count();
+    out_str.push_str(&format!("# dual_stereo frames: {}/{}\n", dual_count, diags.len()));
+    let trans_count = diags.iter().filter(|d| d.is_transient).count();
+    out_str.push_str(&format!("# transient frames: {}/{}\n", trans_count, diags.len()));
+    let intensity_hist: Vec<(usize, usize)> = {
+        let mut h = std::collections::HashMap::new();
+        for d in &diags { *h.entry(d.intensity).or_insert(0) += 1; }
+        let mut v: Vec<_> = h.into_iter().collect();
+        v.sort();
+        v
+    };
+    out_str.push_str(&format!("# intensity histogram: {:?}\n", intensity_hist));
+    let avg_b_ours: f64 = diags.iter().map(|d| d.nb_compressed as f64).sum::<f64>() / diags.len() as f64;
+    let avg_b_ref: f64 = ref_payload.iter().map(|&b| b as f64).sum::<f64>() / ref_payload.len() as f64;
+    out_str.push_str(&format!("# avg bytes/frame: ours={:.1} ref={:.1}\n", avg_b_ours, avg_b_ref));
+    let ours_kbps = ours_bytes.iter().map(|&b| b as f64).sum::<f64>() * 8.0 / seconds / 1000.0;
+    let ref_kbps = ref_payload.iter().map(|&b| b as f64).sum::<f64>() * 8.0 / seconds / 1000.0;
+    out_str.push_str(&format!("# realised kbps: ours={:.1} ref={:.1}\n", ours_kbps, ref_kbps));
+
+    let out_path = lanes_dir.join("opus-64-r1.seconds.txt");
+    fs::write(&out_path, out_str).unwrap();
+    println!("wrote {}", out_path.display());
+}
 #[test]
 #[ignore]
 fn encoder_library_gate_vs_libopus() {
