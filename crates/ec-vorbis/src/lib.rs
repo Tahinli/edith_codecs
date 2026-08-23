@@ -41,5 +41,5 @@ mod setup;
 mod window;
 
 pub use decode::{VorbisDecoder, channel_map};
-pub use encode::{EncoderConfig, VorbisEncoder};
+pub use encode::{BlockLog, EncoderConfig, VorbisEncoder};
 pub use setup::{Comments, Identification};
