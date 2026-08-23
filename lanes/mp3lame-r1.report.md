@@ -211,3 +211,68 @@ signal-to-mask offset `6.0 + 15.0 * (1.0 - flatness)` dB, the spreading leaks
 (0.0032 up, 0.1 down), and the absolute threshold's
 `1.0 + 400.0 * (rel - 0.35)^2` shape. Speech is exactly the material whose
 tonality a 1024-point flatness estimate gets wrong.
+
+## Round 4: the encoder declared joint stereo and wrote plain left/right
+
+Round 3 left the gap concentrated on the two spoken-word sources, and speech is
+where the two channels are nearly the same signal. Parsing both streams' frame
+headers found the reason: our `mode_extension` was hard-coded to zero on every
+frame while the header's channel mode said joint stereo. libmp3lame wrote
+mid/side on 2017 of ~2200 frames of the same audio. Our decoder already
+implemented mid/side correctly — only the encoder never asked for it, so a
+near-mono voice was coded twice, once in each channel, at half the bits each.
+
+The fix is three pieces: both channels of a frame now take the same window
+(adding a long block's lines to a short block's would smear one channel's
+transient into the other), the frame picks mid/side when the difference of the
+channels is quieter than their sum, and `mode_ext` is written per frame.
+Masking thresholds for a mid/side pair are held to whichever channel masked
+less, because an error in the side channel lands in both ears.
+
+Both metrics, all fourteen rows, round 3 → round 4:
+
+| source | kbps | corr gap | worst window (ours) |
+|---|---|---|---|
+| nik   | 128 | -0.00073 → **-0.00067** | -12.1 → -12.1 |
+| nik   | 192 | -0.00030 → **-0.00028** | -17.6 → -17.1 |
+| zaur  | 128 | -0.00103 → -0.00103 | -11.1 → **-11.3** |
+| zaur  | 192 | -0.00045 → **-0.00044** | -16.3 → -16.1 |
+| her   | 128 | +0.00142 → **+0.00154** | -9.9 → **-10.0** |
+| her   | 192 | +0.00021 → **+0.00025** | -14.4 → **-14.7** |
+| naz   | 128 | +0.00021 → **+0.00030** | -9.7 → **-10.2** |
+| naz   | 192 | -0.00002 → **+0.00001** | -15.1 → **-15.7** |
+| sadie | 128 | -0.00068 → **+0.00076** | -1.6 → **-9.2** |
+| sadie | 192 | -0.00040 → **+0.00001** | -6.2 → **-16.5** |
+| dl8a  | 128 | -0.00062 → **-0.00057** | -3.2 → **-3.8** |
+| dl8a  | 192 | -0.00040 → **-0.00037** | -8.3 → -8.1 |
+| hein  | 128 | -0.00087 → **+0.00029** | -0.1 → **-10.1** |
+| hein  | 192 | -0.00030 → **+0.00001** | -6.8 → **-16.1** |
+
+Five rows now beat libmp3lame outright where three did before, and the two
+spoken-word sources moved from the worst rows in the table to ties at 192
+kbit/s. hein at 192 went from 12.6 dB behind LAME's worst window to 3.3 dB;
+sadie at 128 is now 7 dB *ahead*. Both gate floors tightened onto the new worst
+rows: correlation -0.0015 → -0.0012 (zaur at 128), worst-window excess 13.5 →
+5.0 dB (dl8a at 192, a wide music mix, which is the case mid/side cannot help).
+
+The decision threshold itself was swept and is flat: 0.5, 1, 2 and "always"
+differ by 0.00001 in correlation on the two sources mid/side helps least, while
+"never" costs 0.0005. Real music is nowhere near the threshold, so it is a
+guard rather than a knob — and what it guards is now a test rather than an
+argument: `mid_side_follows_the_channel_correlation` encodes two channels
+carrying the same waveform and two carrying opposite ones, and asserts the
+decision goes each way.
+
+### What round 4 ruled out on the way
+
+Before the stereo defect surfaced, four candidates were measured and rejected:
+the masking offset and the absolute-threshold floor (bit-identical output
+across 1e-9…1e-13), reservoir starvation (encoding the worst passage in
+isolation gained 1.2 dB), and the distortion loop (amplifying scalefactors is a
+net loss in both noise-to-mask and raw-noise orderings). Instrumenting the
+loop's exit reasons explained why: **9498 of 9498 granules exit on the budget
+break, 9484 of them at round 0**. `code_with` already fills the frame budget, so
+the outer loop never runs — the encoder is a pure rate loop and the
+psychoacoustic model reaches the output only through the band ordering it never
+gets to use. That is the standing structural finding for this crate; the gain
+in this round came from a missing feature, not from the model.
