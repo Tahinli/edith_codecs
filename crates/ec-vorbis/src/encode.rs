@@ -228,6 +228,30 @@ struct BlockPlan {
     next_long: bool,
 }
 
+/// Per-block rate-loop snapshot, captured when `enable_block_log` is set.
+/// Used by the sweep to localise dropout seconds to their reservoir state.
+#[derive(Debug, Clone, Copy)]
+pub struct BlockLog {
+    /// Centre sample of the block (maps to seconds via `centre / sample_rate`).
+    pub centre: i64,
+    /// Block size in samples (2048 long, 256 short).
+    pub n: usize,
+    /// Whether this is a long (2048) block.
+    pub is_long: bool,
+    /// Whether this block is steady (long, surrounded by long blocks).
+    pub steady: bool,
+    /// Coded size of this block's packet in bits.
+    pub bits: u64,
+    /// Headroom (dB) actually applied to this block's floor fit.
+    pub headroom: f64,
+    /// `self.headroom` after `update_rate` adjusted it.
+    pub rate_headroom: f64,
+    /// `reservoir_debt` after `update_rate`.
+    pub reservoir: f64,
+    /// Bit target this block was judged against.
+    pub target: f64,
+}
+
 /// The block-switch scheduler's state between calls.
 #[derive(Debug, Clone, Copy)]
 enum Sched {
@@ -296,6 +320,10 @@ pub struct VorbisEncoder {
     /// Per-block captured quantised residue: (half, per-channel quantised).
     /// Populated only when `enable_residue_capture` is set.
     residue_capture: Vec<(usize, Vec<Vec<i32>>)>,
+    /// Per-block rate-loop snapshots; populated only when `enable_block_log`.
+    block_log: Vec<BlockLog>,
+    /// When true, `encode_block` records a [`BlockLog`] entry per block.
+    enable_block_log: bool,
     /// When true, `encode_block` copies each block's quantised residue into
     /// `residue_capture` for offline histogram analysis.
     enable_residue_capture: bool,
@@ -397,6 +425,8 @@ impl VorbisEncoder {
             coupling,
             residue_capture: Vec::new(),
             enable_residue_capture: false,
+            block_log: Vec::new(),
+            enable_block_log: false,
         })
     }
 
@@ -423,6 +453,16 @@ impl VorbisEncoder {
     /// Take the captured per-block quantised residue: each entry is `(half, per-channel quantised)`.
     pub fn take_residue_capture(&mut self) -> Vec<(usize, Vec<Vec<i32>>)> {
         std::mem::take(&mut self.residue_capture)
+    }
+
+    /// Enable per-block rate-loop capture for dropout diagnosis.
+    pub fn enable_block_log(&mut self) {
+        self.enable_block_log = true;
+    }
+
+    /// Take the captured per-block rate-loop snapshots.
+    pub fn take_block_log(&mut self) -> Vec<BlockLog> {
+        std::mem::take(&mut self.block_log)
     }
 
     /// Frequency in Barks for a given Hz — public so tests can bin by band.
@@ -924,7 +964,21 @@ impl VorbisEncoder {
         let bits = out.len();
         let delta = (self.centre + (self.prev_n + n) as i64 / 4) - self.centre;
         let steady = plan.is_long && plan.prev_long && plan.next_long;
-        self.update_rate(bits, half, channels, delta, steady);
+        let target = self.update_rate(bits, half, channels, delta, steady);
+        if self.enable_block_log {
+            let centre = self.centre + (self.prev_n + n) as i64 / 4;
+            self.block_log.push(BlockLog {
+                centre,
+                n,
+                is_long: plan.is_long,
+                steady,
+                bits,
+                headroom,
+                rate_headroom: self.headroom,
+                reservoir: self.reservoir_debt,
+                target,
+            });
+        }
         out.finish()
     }
 
@@ -947,16 +1001,16 @@ impl VorbisEncoder {
     /// transient. Their excess goes into a reservoir debt instead, repaid by
     /// the steady blocks that follow at no more than a quarter of each block's
     /// share, so the rate still lands on target over about a second.
-    fn update_rate(&mut self, bits: u64, half: usize, channels: usize, delta: i64, steady: bool) {
+    fn update_rate(&mut self, bits: u64, half: usize, channels: usize, delta: i64, steady: bool) -> f64 {
         if self.config.bitrate_bps <= 0 || delta <= 0 {
-            return;
+            return 0.0;
         }
         let scale = if self.config.bitrate_bps < 96_000 { 0.93 } else { RATE_TARGET_SCALE };
         let target = f64::from(self.config.bitrate_bps) * scale * delta as f64
             / f64::from(self.config.sample_rate);
         if !steady {
             self.reservoir_debt += bits as f64 - target;
-            return;
+            return target;
         }
         let repay = self.reservoir_debt.clamp(-target * 0.25, target * 0.25);
         self.reservoir_debt -= repay;
@@ -968,6 +1022,7 @@ impl VorbisEncoder {
         // cannot be reached at all — coding every coefficient with the shortest
         // codeword there is already costs about a bit each.
         self.headroom = (self.headroom + step).clamp(-24.0, 84.0);
+        target
     }
 }
 
