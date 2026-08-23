@@ -385,6 +385,11 @@ pub struct CeltEncoder {
     vbr_drift: i32,
     vbr_offset: i32,
     vbr_count: i32,
+    /// libopus `st->stereo_saving` — mid/side bit-saving estimate (Q8 in C,
+    /// plain f32 here), updated in `alloc_trim_analysis`.
+    stereo_saving: f32,
+    /// libopus `st->spec_avg` — temporal-VBR follower average, updated each frame.
+    spec_avg: f32,
     // Per-frame scratch, allocated once.
     in_buf: Vec<f32>,
     freq: Vec<f32>,
@@ -438,6 +443,8 @@ impl CeltEncoder {
             vbr_drift: 0,
             vbr_offset: 0,
             vbr_count: 0,
+            stereo_saving: 0.0,
+            spec_avg: 0.0,
             in_buf: vec![0.0; channels * (max_n + OVERLAP)],
             freq: vec![0.0; channels * max_n],
             x: vec![0.0; channels * max_n],
@@ -491,6 +498,8 @@ impl CeltEncoder {
         self.vbr_drift = 0;
         self.vbr_offset = 0;
         self.vbr_count = 0;
+        self.stereo_saving = 0.0;
+        self.spec_avg = 0.0;
     }
 
     /// Encodes one frame of interleaved `f32` (`frame_size` samples per
@@ -728,7 +737,7 @@ impl CeltEncoder {
         // --- Dynalloc analysis (offsets + spread_weight) --------------------
         self.offsets = [0; NB_BANDS];
         let mut spread_weight = [0i32; NB_BANDS];
-        self.dynalloc_analysis(
+        let max_depth = self.dynalloc_analysis(
             start, end, c, lm, is_transient, effective_bytes, &mut spread_weight,
         );
 
@@ -1144,7 +1153,7 @@ impl CeltEncoder {
         is_transient: bool,
         effective_bytes: i32,
         spread_weight: &mut [i32; NB_BANDS],
-    ) {
+    ) -> f32 {
         const LSB_DEPTH: f32 = 24.0;
         let mut noise_floor = [0.0f32; NB_BANDS];
         for i in 0..end {
@@ -1278,6 +1287,7 @@ impl CeltEncoder {
             self.offsets[i] = boost;
             tot_boost += boost_bits;
         }
+        max_depth
     }
 
     /// libopus `spreading_decision` (bands.c:479-570): classifies the current
