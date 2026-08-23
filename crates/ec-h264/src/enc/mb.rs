@@ -653,7 +653,12 @@ fn choose_inter(pic: &Picture, e: &MbEnc<'_>, mb_x: usize, mb_y: usize) -> Inter
     let skip_cost = {
         let mut buf = [0u8; 256];
         mc_luma(&plane, sx as i32, sy as i32, skip_mv, 16, 16, 16, &mut buf);
-        satd_block(&e.src.y, sw, sx, sy, &buf, 16, 0, 16, 16) - motion_rate(e, 4.0)
+        // P_Skip's rebate is the signalling it genuinely saves, and two bits is
+        // where the measurement is flat: 0 and 2 read -0.113 and -0.110 dB
+        // BD-PSNR against x264 on the film clip at GOP 10 where the four this
+        // used to claim reads -0.233 dB and eight reads -0.708 dB. The screen
+        // capture and the synthetic clip move by 0.01 dB across 0, 2 and 4.
+        satd_block(&e.src.y, sw, sx, sy, &buf, 16, 0, 16, 16) - motion_rate(e, 2.0)
     };
 
     let mut best = (PShape::Whole, [mv16, mv16], cost16);
