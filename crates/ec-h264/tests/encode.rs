@@ -821,11 +821,11 @@ fn real_clip_t8x8_bd_psnr() {
 // ---------------------------------------------------------------------------
 
 /// Floor for [`bd_psnr_vs_x264`] on the synthetic clip. Our encoder measured
-/// -2.442 dB against x264 there on 2026-08-23 (352x288, 24 pictures, both at
+/// -2.640 dB against x264 there on 2026-08-23 (352x288, 24 pictures, both at
 /// their own default effort: our `Preset::Fast`, x264's `-preset medium`).
 /// The floor is that number with room for platform noise, so the distance can
-/// shrink but not grow unnoticed; it is not a claim that -2.4 dB is fine.
-const BD_PSNR_VS_X264_FLOOR: f64 = -2.60;
+/// shrink but not grow unnoticed; it is not a claim that -2.6 dB is fine.
+const BD_PSNR_VS_X264_FLOOR: f64 = -2.80;
 
 fn have_x264() -> bool {
     std::process::Command::new("ffmpeg")
@@ -839,7 +839,7 @@ fn have_x264() -> bool {
 /// reference, no B pictures, the same GOP, and adaptive quantisation and psy
 /// off so both encoders spend bits by the same rule. Returns the Annex B
 /// stream.
-fn x264_encode_qp(sources: &[Planes], w: usize, h: usize, qp: i32) -> Option<Vec<u8>> {
+fn x264_encode_qp(sources: &[Planes], w: usize, h: usize, qp: i32, gop: u32) -> Option<Vec<u8>> {
     let dir = std::env::temp_dir().join(format!("ec-h264-x264-{}", std::process::id()));
     std::fs::create_dir_all(&dir).ok()?;
     let raw = dir.join(format!("in-q{qp}.yuv"));
@@ -859,8 +859,14 @@ fn x264_encode_qp(sources: &[Planes], w: usize, h: usize, qp: i32) -> Option<Vec
         .arg(&raw)
         .args(["-c:v", "libx264", "-preset", "medium"])
         .args(["-profile:v", "main", "-qp", &qp.to_string()])
-        .args(["-g", "10", "-bf", "0", "-refs", "1"])
-        .args(["-x264-params", "scenecut=0:aq-mode=0:psy=0:8x8dct=0"])
+        .args(["-g", &gop.to_string(), "-bf", "0", "-refs", "1"])
+        // ipratio/pbratio 1.0 matter: x264's constant-QP mode otherwise codes
+        // I pictures at a lower QP than the one asked for, which reads as a
+        // rate-quality win that is really a different quantiser.
+        .args([
+            "-x264-params",
+            "scenecut=0:aq-mode=0:psy=0:8x8dct=0:ipratio=1.0:pbratio=1.0:qcomp=1.0:chroma-qp-offset=0",
+        ])
         .args(["-f", "h264"])
         .arg(&out)
         .output()
@@ -880,9 +886,15 @@ fn x264_encode_qp(sources: &[Planes], w: usize, h: usize, qp: i32) -> Option<Vec
 /// rot behind an `#[ignore]`; point `EC_H264_CLIP` at a media file to measure
 /// the same thing on real content.
 ///
-/// Both curves are (bits, luma PSNR against the same source pictures). Ours
-/// uses the encoder's own reconstruction; x264's stream is decoded back with
-/// ffmpeg, so its PSNR is measured on what a decoder would actually show.
+/// Both curves are (bits, luma PSNR against the same source pictures), and
+/// both are measured on ffmpeg's decode of the stream rather than on an
+/// encoder's own reconstruction, so the two halves are read the same way.
+///
+/// `EC_H264_GOP` sets the GOP of both encoders; 1 makes the comparison
+/// all-intra, which is how the gap was split: on a 3840x1608 clip from the
+/// library the intra-only distance is -0.749 dB (+2-4% bits) while the same
+/// clip at GOP 10 is -2.992 dB (+19% bits), so roughly two thirds of the
+/// distance is in P pictures, not in the intra path.
 ///
 ///     cargo test --release -p ec-h264 --test encode bd_psnr_vs_x264 -- --nocapture
 ///     EC_H264_CLIP=<file> cargo test --release -p ec-h264 --test encode \
@@ -912,10 +924,14 @@ fn bd_psnr_vs_x264() {
         }
     };
 
+    let gop: u32 = std::env::var("EC_H264_GOP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
     let ours = |qp: i32| {
         let mut cfg = EncoderConfig::new(w as u32, h as u32);
         cfg.qp = qp;
-        cfg.gop_size = 10;
+        cfg.gop_size = gop;
         cfg.cabac = true;
         cfg.framerate = 1.0;
         cfg.threads = 0;
@@ -937,10 +953,8 @@ fn bd_psnr_vs_x264() {
             .zip(&decoded)
             .map(|((y, _, _), (dy, _, _))| psnr(y, dy))
             .sum();
-        let (decoded_psnr, recon_psnr) = (
-            sum / sources.len() as f64,
-            sum_recon / sources.len() as f64,
-        );
+        let (decoded_psnr, recon_psnr) =
+            (sum / sources.len() as f64, sum_recon / sources.len() as f64);
         assert!(
             (decoded_psnr - recon_psnr).abs() < 0.05,
             "qp {qp}: our reconstruction reads {recon_psnr:.2} dB but our own \
@@ -949,7 +963,7 @@ fn bd_psnr_vs_x264() {
         ((stream.len() * 8) as f64, decoded_psnr)
     };
     let x264 = |qp: i32| {
-        let stream = x264_encode_qp(&sources, w, h, qp).expect("x264 encodes");
+        let stream = x264_encode_qp(&sources, w, h, qp, gop).expect("x264 encodes");
         let decoded = ffmpeg_decode(&stream, w, h, &[]).expect("ffmpeg decodes x264's own stream");
         assert_eq!(
             decoded.len(),
@@ -984,7 +998,7 @@ fn bd_psnr_vs_x264() {
 
     // The floor is calibrated on the synthetic clip; a clip of the user's is a
     // measurement, not a gate, because its content is not pinned.
-    if std::env::var_os("EC_H264_CLIP").is_none() {
+    if std::env::var_os("EC_H264_CLIP").is_none() && gop == 10 {
         assert!(
             bd > BD_PSNR_VS_X264_FLOOR,
             "BD-PSNR against x264 fell to {bd:+.3} dB, past the \
