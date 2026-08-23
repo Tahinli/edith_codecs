@@ -476,22 +476,22 @@ const LIBRARY: [(&str, &str); 7] = [
 /// How much worse than LAME a row's worst 20 ms window may be, in dB.
 ///
 /// The floor is set from the measurement and the measurement is bad: hein at
-/// 192 kbit/s is 14.0 dB behind, and hein and sadie are the two spoken-word
+/// 192 kbit/s is 12.6 dB behind, and hein and sadie are the two spoken-word
 /// sources. LAME's worst window improves by 12 dB from 128 to 192 kbit/s on
 /// that file while ours improves by 5, which says our limit there is the
 /// masking model rather than the bitrate. That is the next round; the floor
-/// exists so it cannot quietly get worse first.
-const WORST_WINDOW_EXCESS_DB: f64 = 15.0;
+/// exists so it cannot quietly get worse first. Worst row: hein at 192 kbit/s,
+/// 12.6 dB behind.
+const WORST_WINDOW_EXCESS_DB: f64 = 13.5;
 
 /// How far under LAME a row may sit before the sweep fails, in correlation.
 ///
 /// The first measurement (60 s of each source, 44.1 kHz stereo, CBR) put every
-/// row between -0.00137 and +0.00115, with the worst two -- zaur and dl8a at
-/// 128 kbit/s -- on dense material where LAME's short-block switching earns
-/// its keep. The floor sits just under that worst row rather than at zero
-/// because two rows are already ahead of LAME and the spread is what a
-/// regression would have to widen.
-const LAME_CORR_FLOOR: f64 = -0.0020;
+/// row between -0.00103 and +0.00142, the worst being zaur at 128 kbit/s. The
+/// floor sits just under that worst row rather than at zero because three rows
+/// are already ahead of LAME and the spread is what a regression would have to
+/// widen.
+const LAME_CORR_FLOOR: f64 = -0.0015;
 
 fn expand(path: &str) -> PathBuf {
     PathBuf::from(match path.strip_prefix("~/") {

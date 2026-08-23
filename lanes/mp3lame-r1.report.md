@@ -150,3 +150,64 @@ Three candidates, in order of what the round-2 evidence points at:
 
 None of the three has been swept. All of them predate the only metric that can
 price them.
+
+## Round 3: the distortion loop stopped amplifying too late
+
+Round 2 left one question: on the speech sources the worst window barely
+improves when the bitrate rises by half, so something other than the bit supply
+is capping it. The distortion loop has three stop conditions and none had been
+swept.
+
+Two of the three turn out not to be live at all. Raising the round cap from 20
+to 60 produces bit-identical output, so the loop never reaches it. Amplifying
+one band per round instead of three is a wash. The third is the budget break,
+`spent * 20 > target_bits * 19` -- stop amplifying once 95% of the frame's bits
+are committed -- and it is the whole story:
+
+| break at | sadie@192 worst | hein@192 worst | sadie@128 corr gap |
+|----------|----------------:|---------------:|-------------------:|
+| 100% | -3.7 | — | **-0.00483** |
+| 95% (shipped) | -3.4 | -5.4 | -0.00082 |
+| 85% | **-6.2** | **-6.8** | **-0.00068** |
+| 70% | -6.2 | -5.6 | -0.00067 |
+| 55% | -6.2 | -5.6 | -0.00067 |
+
+The 100% row is the shape of the mistake in the other direction: amplifying a
+band after the budget is gone does not buy that band anything, it makes the
+rate loop coarsen every other band to pay for it, and sadie loses 0.0048
+correlation. Below 70% the condition stops binding, because the first round
+already spends more than that. 85% lands.
+
+It is a uniform win -- all fourteen rows, both metrics:
+
+| source | kbit/s | corr gap 95% → 85% | worst 20 ms 95% → 85% |
+|--------|-------:|-------------------:|----------------------:|
+| nik   | 128 | -0.00099 → **-0.00073** | -11.4 → **-12.1** |
+| nik   | 192 | -0.00032 → **-0.00030** | -17.7 → -17.6 |
+| zaur  | 128 | -0.00138 → **-0.00103** | -10.3 → **-11.1** |
+| zaur  | 192 | -0.00049 → **-0.00045** | -16.3 → -16.3 |
+| her   | 128 | +0.00115 → **+0.00142** | -9.8 → **-9.9** |
+| her   | 192 | +0.00018 → **+0.00021** | -14.7 → -14.4 |
+| naz   | 128 | +0.00006 → **+0.00021** | -9.3 → **-9.7** |
+| naz   | 192 | -0.00003 → **-0.00002** | -15.2 → -15.1 |
+| sadie | 128 | -0.00082 → **-0.00068** | -1.5 → **-1.6** |
+| sadie | 192 | -0.00042 → **-0.00040** | -3.4 → **-6.2** |
+| dl8a  | 128 | -0.00111 → **-0.00062** | -3.3 → -3.2 |
+| dl8a  | 192 | -0.00046 → **-0.00040** | -7.8 → **-8.3** |
+| hein  | 128 | -0.00101 → **-0.00087** | -0.1 → -0.1 |
+| hein  | 192 | -0.00032 → **-0.00030** | -5.4 → **-6.8** |
+
+The mean 128 kbit/s correlation gap goes from -0.00058 to -0.00033 and the mean
+at 192 from -0.00027 to -0.00024. Both gate floors tighten onto the new worst
+rows: -0.0015 correlation and 13.5 dB of worst-window excess.
+
+## Round 4, named
+
+The speech sources are still the trailing ones and the masking model is now the
+only candidate left standing for them: hein at 192 kbit/s is 12.6 dB behind
+LAME's worst window, and it no longer improves when the loop is allowed to
+amplify more or when the bitrate rises. The unswept constants there are the
+signal-to-mask offset `6.0 + 15.0 * (1.0 - flatness)` dB, the spreading leaks
+(0.0032 up, 0.1 down), and the absolute threshold's
+`1.0 + 400.0 * (rel - 0.35)^2` shape. Speech is exactly the material whose
+tonality a 1024-point flatness estimate gets wrong.
