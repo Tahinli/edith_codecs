@@ -2319,8 +2319,11 @@ fn silk_compares_to_celt_on_speech_at_speech_rates() {
             "speech {tag}: SILK corr {silk_corr:.4} lag {silk_lag} {silk_kbps:.2} kbps; CELT corr {celt_corr:.4} lag {celt_lag} {celt_kbps:.2} kbps"
         );
         assert!(silk_corr >= 0.95, "{tag}: SILK corr {silk_corr:.4}");
+        // SILK should not lose clearly to CELT at speech rates. CELT with
+        // short-block transients now edges SILK by ~0.002 at NB16 (synthetic
+        // speech); a larger gap means the SILK encoder regressed.
         assert!(
-            silk_corr >= celt_corr,
+            silk_corr >= celt_corr - 0.005,
             "{tag}: SILK {silk_corr:.4} trails CELT {celt_corr:.4}"
         );
     }
@@ -2499,8 +2502,11 @@ fn hybrid_layers_align() {
             e.look_ahead(960)
         }
     );
+    // A fullband CELT click lands at exactly +120 (`celt_click_peak_offset`);
+    // the band-limited HB layer's main lobe sits up to 2 samples early once
+    // transient frames keep their short blocks, and SILK lands at +121.
     assert!(
-        (plb - phb).abs() <= 2,
+        (plb - phb).abs() <= 3,
         "layers misaligned: LB +{plb} vs HB +{phb}"
     );
     assert!((phb - 120).abs() <= 2, "HB peak +{phb}, look_ahead 120");
@@ -3243,8 +3249,10 @@ fn spectral_divergence_vs_libopus() {
 
     let lanes_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lanes");
     fs::create_dir_all(&lanes_dir).unwrap();
-    let out_path = lanes_dir.join("opus-naz-r1.bands.txt");
+    let out_path = lanes_dir.join("opus-naz-r2.bands.txt");
+    let frames_path = lanes_dir.join("opus-naz-r2.frames.txt");
     let scratch = lanes_dir.join("opus-naz-r1.scratch.ogg");
+    let mut frames_all = String::new();
     let mut report = String::new();
 
     for (tag, src) in &sources {
@@ -3261,7 +3269,11 @@ fn spectral_divergence_vs_libopus() {
         ffmpeg_encode_libopus(src, KBPS, &scratch, SECS);
         let ref_bytes = fs::metadata(&scratch).map(|m| m.len() as usize).unwrap_or(0);
         let ref_kbps = ref_bytes as f64 * 8.0 / seconds / 1000.0;
-        let (ref_dec, ref_ch) = decode_ogg(&scratch);
+        let ref_pkts: Vec<Vec<u8>> = ogg_packets(&fs::read(&scratch).unwrap())
+            .into_iter()
+            .skip(2)
+            .collect();
+         let (ref_dec, ref_ch) = decode_ogg(&scratch);
         assert_eq!(ref_ch, CHANNELS, "{tag}: ref not stereo");
         let (_, ref_aligned) = align_to_source(&source_pcm, &ref_dec, CHANNELS, MAX_LAG);
 
@@ -3273,13 +3285,17 @@ fn spectral_divergence_vs_libopus() {
         let mut packet = vec![0u8; 1500];
         let mut dbuf = vec![0.0f32; 5760 * CHANNELS];
         let mut ours_dec = Vec::new();
-        let mut diags = Vec::new();
+        let mut first_pkts: Vec<Vec<u8>> = Vec::new();
+         let mut diags = Vec::new();
         let mut ours_bytes = 0usize;
         for block in source_pcm.chunks(FRAME * CHANNELS) {
             let mut padded = block.to_vec();
             padded.resize(FRAME * CHANNELS, 0.0);
             let len = enc.encode_float(&padded, FRAME, &mut packet).expect("encode");
-            ours_bytes += len;
+            if first_pkts.len() < 10 {
+                first_pkts.push(packet[..len].to_vec());
+            }
+             ours_bytes += len;
             let n = dec.decode_float(&packet[..len], &mut dbuf).expect("decode");
             ours_dec.extend_from_slice(&dbuf[..n * CHANNELS]);
             diags.push(enc.last_celt_diag().clone());
@@ -3493,6 +3509,63 @@ fn spectral_divergence_vs_libopus() {
                 d.nb_compressed
             ));
         }
+
+        // Per-window per-band ln-energies for the metric windows 12..=20
+        // (+120..+200 ms): the leak's shape, band by band.
+        report.push_str(
+            "# windows 12..=20: win +ms band lo-hi | lnE src/ours/ref, ch L then R\n",
+        );
+        for xi in 12..=20 {
+            if xi >= nframes {
+                break;
+            }
+            for bi in 0..NBANDS {
+                let e = |b: &Vec<f64>, ci: usize| b[(xi * NBANDS + bi) * CHANNELS + ci].ln();
+                let (sl, sr) = (e(&bands_s, 0), e(&bands_s, 1));
+                let (ol, or_) = (e(&bands_o, 0), e(&bands_o, 1));
+                let (rl, rr) = (e(&bands_r, 0), e(&bands_r, 1));
+                report.push_str(&format!(
+                    "w{xi} +{}ms b{bi} {}-{}Hz\t{:+8.2} {:+8.2} {:+8.2} | {:+8.2} {:+8.2} {:+8.2}\n",
+                    xi * WIN_STEP * 1000 / 48000,
+                    CELT_EBANDS[bi] * 240,
+                    CELT_EBANDS[bi + 1] * 240,
+                    sl,
+                    ol,
+                    rl,
+                    sr,
+                    or_,
+                    rr,
+                ));
+            }
+        }
+
+        // Decode the first 10 packets of each stream with our decoder: does
+        // the silence flag survive, and what energies does it leave behind?
+        frames_all.push_str(&format!(
+            "# {tag}: first 10 packets through our decoder; energies are log2 old_band_e\n"
+        ));
+        for (label, pkts) in [("ours", &first_pkts), ("ref", &ref_pkts)] {
+            let mut d = Decoder::new(48000, CHANNELS).unwrap();
+            let mut ob = vec![0.0f32; 5760 * CHANNELS];
+            for (i, p) in pkts.iter().take(10).enumerate() {
+                let _ = d.decode_float(p, &mut ob).expect("decode");
+                let g = d.last_celt_diag();
+                frames_all.push_str(&format!(
+                    "{label} {i} bytes={} toc={:#04x} sil{} intra{} trans{} bits{}\n",
+                    p.len(),
+                    p.first().copied().unwrap_or(0),
+                    g.silence as u8,
+                    g.intra as u8,
+                    g.transient as u8,
+                    g.total_bits,
+                ));
+                for (ch, name) in [(0usize, 'L'), (1usize, 'R')] {
+                    let band = &g.old_band_e[ch * ec_opus::celt::NB_BANDS..(ch + 1) * ec_opus::celt::NB_BANDS];
+                    let e: Vec<String> = band.iter().map(|v| format!("{v:+6.1}")).collect();
+                    frames_all.push_str(&format!("  {name} {}\n", e.join(" ")));
+                }
+            }
+        }
         println!(
             "{tag}@{KBPS}k: err o={err_o:.3} r={err_r:.3} ratio={:.2}",
             err_o / err_r
@@ -3504,5 +3577,118 @@ fn spectral_divergence_vs_libopus() {
         only.join(",")
     );
     fs::write(&out_path, header + &report).unwrap();
+    fs::write(&frames_path, &frames_all).unwrap();
     println!("wrote {}", out_path.display());
+}
+
+/// Startup leak repro (lane-opus-naz): the first frames of the naz source
+/// (digital silence then an attack) through the library gate's encoder
+/// settings and our decoder. Prints per-frame CELT facts; fails if the decode
+/// peak exceeds 4x the input peak in any frame.
+#[test]
+fn celt_silence_then_attack_decodes_bounded() {
+    let fs = 960usize;
+    let ch = 2usize;
+    let src = shellexpand("~/Music/naz_aglama_ben_aglarim.mp4");
+    if !src.exists() {
+        eprintln!("SKIP: missing {}", src.display());
+        return;
+    }
+    let pcm = ffmpeg_decode_pcm(&src, 1.0);
+    let mut enc = Encoder::new(48000, ch, Application::Audio).unwrap();
+    enc.set_bitrate(96_000);
+    enc.set_vbr_constrained(true);
+    let mut dec = Decoder::new(48000, ch).unwrap();
+    let mut bad = Vec::new();
+    for frame in 0..12 {
+        let slice = &pcm[frame * fs * ch..(frame + 1) * fs * ch];
+        let in_peak = slice.iter().fold(0f32, |a, &x| a.max(x.abs()));
+        let pcm_i16 = to_i16(slice);
+        let mut buf = [0u8; 1500];
+        let n = enc.encode(&pcm_i16, fs, &mut buf).unwrap();
+        let ed = enc.last_celt_diag().clone();
+        let mut out = vec![0f32; fs * ch];
+        let got = dec.decode_float(&buf[..n], &mut out).unwrap();
+        let d = dec.last_celt_diag().clone();
+        let peak = out[..got * ch].iter().fold(0f32, |a, &x| a.max(x.abs()));
+        let emax = d.old_band_e.iter().cloned().fold(f32::MIN, f32::max);
+        println!(
+            "frame {frame}: in_peak {in_peak:.5} bytes {n} enc(sil {} intra {} trans {}) dec(sil {} intra {} trans {} bits {}) bandE max {emax:.2} peak {peak:.5}",
+            ed.silence, ed.intra, ed.is_transient, d.silence, d.intra, d.transient, d.total_bits
+        );
+        if peak > 4.0 * in_peak.max(1e-4) {
+            bad.push(frame);
+        }
+    }
+    assert!(bad.is_empty(), "decode peak >4x input in frames {bad:?}");
+}
+
+/// Sample-level view of the naz startup: per-120-sample energy of source,
+/// ours (gate path) and libopus reference around the first attack.
+#[test]
+#[ignore]
+fn naz_startup_hop_energies() {
+    const CH: usize = 2;
+    let src = shellexpand("~/Music/naz_aglama_ben_aglarim.mp4");
+    if !src.exists() {
+        return;
+    }
+    let pcm = ffmpeg_decode_pcm(&src, 2.0);
+    let scratch = std::env::temp_dir().join("ec-opus-naz-startup.opus");
+    ffmpeg_encode_libopus(&src, 96, &scratch, 2.0);
+    let (ref_dec, _) = decode_ogg(&scratch);
+    let (lag_r, ref_al) = align_to_source(&pcm, &ref_dec, CH, 2000);
+    let mut enc = Encoder::new(48000, CH, Application::Audio).unwrap();
+    enc.set_bitrate(96_000);
+    enc.set_vbr_constrained(true);
+    let (ours_dec, _) = roundtrip_own(&mut enc, &pcm, CH, 960);
+    let (lag_o, ours_al) = align_to_source(&pcm, &ours_dec, CH, 2000);
+    let first = |v: &[f32]| v.iter().position(|x| x.abs() > 1e-4).map(|i| i / CH);
+    println!("lag ref {lag_r} ours {lag_o}; first>1e-4: src {:?} ours {:?} ref {:?}", first(&pcm), first(&ours_al), first(&ref_al));
+    let e = |v: &[f32], h: usize| -> f64 {
+        v[h * 120 * CH..((h + 1) * 120 * CH).min(v.len())].iter().map(|&x| (x as f64) * (x as f64)).sum()
+    };
+    // Frame-2 flags of both streams through our decoder.
+    let data = fs::read(&scratch).unwrap();
+    let packets = ogg_packets(&data);
+    let mut rd = Decoder::new(48000, CH).unwrap();
+    let mut od = Decoder::new(48000, CH).unwrap();
+    let mut oe = Encoder::new(48000, CH, Application::Audio).unwrap();
+    oe.set_bitrate(96_000);
+    oe.set_vbr_constrained(true);
+    let mut buf = vec![0f32; 5760 * CH];
+    let mut out = vec![0u8; 1500];
+    for f in 0..4 {
+        rd.decode_float(&packets[2 + f], &mut buf).unwrap();
+        let r = rd.last_celt_diag().clone();
+        let n = oe.encode_float(&pcm[f * 960 * CH..(f + 1) * 960 * CH], 960, &mut out).unwrap();
+        od.decode_float(&out[..n], &mut buf).unwrap();
+        let o = od.last_celt_diag().clone();
+        let e = oe.last_celt_diag().clone();
+        println!("frame {f} REF bytes {} sil {} intra {} trans {} spread {} ac {} tf {:?}", packets[2 + f].len(), r.silence, r.intra, r.transient, r.spread, r.anti_collapse, r.tf_res);
+        println!("frame {f} OUR bytes {n} sil {} intra {} trans {} spread {} ac {} tf {:?} shorts {} pulses {:?}", o.silence, o.intra, o.transient, o.spread, o.anti_collapse, o.tf_res, e.short_blocks, e.pulses);
+    }
+    println!("hop(ms)\tsrc\tours\tref");
+    for h in 10..24 {
+        println!("{:.1}\t{:.3e}\t{:.3e}\t{:.3e}", h as f64 * 2.5, e(&pcm, h), e(&ours_al, h), e(&ref_al, h));
+    }
+}
+
+/// Where a lone click lands after a CELT-only fullband roundtrip, relative to
+/// the encoder look-ahead (diagnostic for the hybrid alignment tolerance).
+#[test]
+#[ignore]
+fn celt_click_peak_offset() {
+    let mut click = vec![0f32; 48000];
+    let at = 960 * 10 + 300;
+    click[at] = 0.9;
+    for bps in [32_000u32, 64_000, 128_000] {
+        let mut enc = Encoder::new(48000, 1, Application::Audio).unwrap();
+        enc.set_mode(Some(ec_opus::Mode::Celt));
+        enc.set_bitrate(bps);
+        let (dec, _) = roundtrip_own(&mut enc, &click, 1, 960);
+        let p = dec.iter().enumerate().max_by(|a, b| a.1.abs().partial_cmp(&b.1.abs()).unwrap()).unwrap().0;
+        let d = enc.last_celt_diag().clone();
+        println!("celt click {bps}: peak +{} (lm {})", p as i64 - at as i64, d.lm);
+    }
 }
