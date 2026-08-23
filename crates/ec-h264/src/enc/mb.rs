@@ -887,7 +887,15 @@ fn code_luma_4x4(
             quant_4x4(&d, qp, intra, false, &mut lv.luma[blk])
         };
         if rdoq && nz != 0 {
-            nz = rdoq_4x4(e, w, &source, &mut lv.luma[blk], qp);
+            nz = rdoq_4x4(
+                e,
+                w,
+                &source,
+                &mut lv.luma[blk],
+                qp,
+                BlockCat::Luma4x4,
+                false,
+            );
         }
         lv.luma_nz[blk] = nz;
         if nz == 0 {
@@ -922,10 +930,14 @@ fn code_luma_4x4(
 }
 
 /// Squared error of coding `levels`, in the pixels the block reconstructs to.
-fn block_ssd(e: &MbEnc<'_>, source: &[i32; 16], levels: &[i32; 16], qp: i32) -> i64 {
+fn block_ssd(e: &MbEnc<'_>, source: &[i32; 16], levels: &[i32; 16], qp: i32, skip_dc: bool) -> i64 {
     let mut raster = [0i32; 16];
-    unzigzag(levels, &mut raster);
-    dequant_4x4(&mut raster, &e.ls, qp, false);
+    if skip_dc {
+        unzigzag_ac15(levels, &mut raster);
+    } else {
+        unzigzag(levels, &mut raster);
+    }
+    dequant_4x4(&mut raster, &e.ls, qp, skip_dc);
     let mut resid = [0i32; 16];
     inverse_transform_4x4(&raster, &mut resid);
     let mut ssd = 0i64;
@@ -964,6 +976,17 @@ const RDOQ_DEAD_ZONE: i32 = 2;
 /// -4.065/-0.629/-0.477 dB on synthetic, film and screen capture.
 const RDOQ_MAX_LEVEL: i32 = 2;
 
+/// The rounding the chroma AC path keeps under the search: the inter dead zone
+/// it already had. Luma wanted the wider 1/2 rounding once a search could take
+/// levels back down (`RDOQ_DEAD_ZONE`); chroma does not. Measured on the two
+/// clips at the settled luma constants, BD-PSNR against x264: 1/2 rounding
+/// -0.653 film / -0.482 screen capture, 1/4 -0.623 / -0.472, 1/3 -0.644 /
+/// -0.481, and the 1/6 kept here -0.593 / -0.468 -- against -0.628 / -0.471
+/// with no chroma search at all. Chroma AC is sparse enough at these
+/// quantisers that offering more levels costs more bits than the search takes
+/// back; what pays is only the pruning.
+const RDOQ_CHROMA_DEAD_ZONE: i32 = 6;
+
 /// Rate-distortion quantisation of one inter luma block: each level is offered
 /// the two cheaper magnitudes below it, and takes one when the squared error it
 /// gives up costs less than the bits it saves.
@@ -974,22 +997,25 @@ const RDOQ_MAX_LEVEL: i32 = 2;
 /// is. Intra blocks stay out: their reconstruction is what the next block in
 /// the macroblock predicts from, so a level changed here would move a
 /// prediction the decision cannot see.
+#[allow(clippy::too_many_arguments)]
 fn rdoq_4x4(
     e: &MbEnc<'_>,
     w: &EncEntropy,
     source: &[i32; 16],
     levels: &mut [i32; 16],
     qp: i32,
+    cat: BlockCat,
+    skip_dc: bool,
 ) -> u8 {
-    let Some(bits) = w.residual_block_cost(levels, BlockCat::Luma4x4, Some(1), Some(1)) else {
+    let Some(bits) = w.residual_block_cost(levels, cat, Some(1), Some(1)) else {
         return levels.iter().filter(|&&l| l != 0).count() as u8;
     };
     let lambda = RDOQ_LAMBDA * lambda_ssd(qp) / 256.0;
-    let mut cost = block_ssd(e, source, levels, qp) as f64 + lambda * f64::from(bits);
+    let mut cost = block_ssd(e, source, levels, qp, skip_dc) as f64 + lambda * f64::from(bits);
     // Highest scanning position first: dropping the last significant level is
     // what shortens the significance map, so it is tried while the levels
     // above it are still gone.
-    for pos in (0..16).rev() {
+    for pos in (0..cat.max_num_coeff()).rev() {
         let level = levels[pos];
         if level == 0 {
             continue;
@@ -1006,11 +1032,10 @@ fn rdoq_4x4(
             tried = candidate;
             let keep = levels[pos];
             levels[pos] = candidate * level.signum();
-            let Some(bits) = w.residual_block_cost(levels, BlockCat::Luma4x4, Some(1), Some(1))
-            else {
+            let Some(bits) = w.residual_block_cost(levels, cat, Some(1), Some(1)) else {
                 unreachable!("CAVLC returned early");
             };
-            let trial = block_ssd(e, source, levels, qp) as f64 + lambda * f64::from(bits);
+            let trial = block_ssd(e, source, levels, qp, skip_dc) as f64 + lambda * f64::from(bits);
             if trial < cost {
                 cost = trial;
             } else {
@@ -1023,7 +1048,7 @@ fn rdoq_4x4(
     // the same decision `worth_coding` makes for the paths without an exact
     // rate, made here with one.
     let zero_bits = w
-        .residual_block_cost(&[0; 16], BlockCat::Luma4x4, Some(1), Some(1))
+        .residual_block_cost(&[0; 16], cat, Some(1), Some(1))
         .expect("CABAC");
     let ssd_zero: i64 = source.iter().map(|&c| i64::from(c) * i64::from(c)).sum();
     if ssd_zero as f64 + lambda * f64::from(zero_bits) <= cost {
@@ -1166,6 +1191,7 @@ fn code_luma_i16(
 fn code_chroma(
     pic: &mut Picture,
     e: &MbEnc<'_>,
+    w: &EncEntropy,
     mb_x: usize,
     mb_y: usize,
     qp_y: i32,
@@ -1196,8 +1222,23 @@ fn code_chroma(
             let source = d;
             forward_4x4(&mut d);
             dc_lists[comp][blk] = d[0];
-            let mut nz = quant_4x4(&d, qp_c, intra, true, &mut ac[comp][blk]);
-            if nz > 0 {
+            let rdoq = !intra && w.is_cabac();
+            let mut nz = if rdoq {
+                quant_4x4_offset(&d, qp_c, RDOQ_CHROMA_DEAD_ZONE, true, &mut ac[comp][blk])
+            } else {
+                quant_4x4(&d, qp_c, intra, true, &mut ac[comp][blk])
+            };
+            if rdoq && nz > 0 {
+                nz = rdoq_4x4(
+                    e,
+                    w,
+                    &source,
+                    &mut ac[comp][blk],
+                    qp_c,
+                    BlockCat::ChromaAc,
+                    true,
+                );
+            } else if nz > 0 {
                 // The same zero decision as luma, against the AC part alone:
                 // the DC of this block travels through the 2x2 Hadamard and is
                 // decided with the other three.
@@ -1980,7 +2021,7 @@ fn encode_intra_mb(
     let mut use_i4 = false;
     let chroma_mode = choose_chroma_mode(pic, e, &nbr, mb_x, mb_y);
     let mut chroma_lv = Levels::default();
-    code_chroma(pic, e, mb_x, mb_y, qp, true, &mut chroma_lv);
+    code_chroma(pic, e, w, mb_x, mb_y, qp, true, &mut chroma_lv);
     let mut use_i8 = false;
 
     if cost.allow_i4 {
@@ -2485,7 +2526,7 @@ fn encode_inter_mb(
     let may_skip = choice.prefer_skip;
     let ssd_skip = may_skip.then(|| ssd_mb(pic, e, mb_x, mb_y));
     let mut chroma_lv = Levels::default();
-    code_chroma(pic, e, mb_x, mb_y, qp, false, &mut chroma_lv);
+    code_chroma(pic, e, w, mb_x, mb_y, qp, false, &mut chroma_lv);
     let mut lv = chroma_lv.clone();
     if e.t8x8_inter(mb_y) {
         // Both transform sizes on the same prediction; the cheaper
