@@ -12,7 +12,7 @@ use std::process::Command;
 
 use ec_core::{Decoder, Demuxer, Frame};
 use ec_ogg::{OggDemuxer, granule_of};
-use ec_vorbis::{EncoderConfig, VorbisDecoder, VorbisEncoder};
+use ec_vorbis::{BlockLog, EncoderConfig, VorbisDecoder, VorbisEncoder};
 
 fn fixtures() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures")
@@ -352,6 +352,39 @@ fn encode_to_file(source: &[Vec<f32>], rate: u32, bitrate: i32, name: &str) -> P
     let path = scratch().join(name);
     mux(&path, &encoder, &packets, rate, channels);
     path
+}
+
+/// Like [`encode_to_file`] but also returns the per-block rate-loop log.
+fn encode_to_file_with_log(
+    source: &[Vec<f32>],
+    rate: u32,
+    bitrate: i32,
+    name: &str,
+) -> (PathBuf, Vec<BlockLog>) {
+    let channels = source.len() as u16;
+    let mut encoder = VorbisEncoder::new(EncoderConfig {
+        sample_rate: rate,
+        channels,
+        bitrate_bps: bitrate,
+        quality: 0.6,
+    })
+    .expect("encoder");
+    encoder.enable_block_log();
+    let borrowed: Vec<&[f32]> = source.iter().map(|c| &c[..]).collect();
+    encoder.push_planar(&borrowed).expect("push");
+    encoder.finish();
+    let mut packets = Vec::new();
+    loop {
+        match encoder.next_packet() {
+            Ok(packet) => packets.push((packet.data, packet.granule)),
+            Err(e) if e.is_eof() => break,
+            Err(e) => panic!("encode: {e}"),
+        }
+    }
+    let log = encoder.take_block_log();
+    let path = scratch().join(name);
+    mux(&path, &encoder, &packets, rate, channels);
+    (path, log)
 }
 
 /// Duration ffprobe reports, in samples of the stream's own rate.
@@ -1172,6 +1205,8 @@ fn real_library_sweep_vs_reference() {
     let mut table = String::from("source  kbps   ours_kbps ref_kbps rate%   corr_ours corr_ref gap     minsec_o minsec_r drops verdict\n");
     let mut failures = Vec::new();
     let only = std::env::var("SWEEP_ONLY").ok();
+    let dump_drops = std::env::var("DROPS_DUMP").is_ok();
+    let mut drops = String::new();
     for &(name, src_path) in sources {
         if only.as_deref().is_some_and(|o| !o.split(',').any(|n| n == name)) {
             continue;
@@ -1201,7 +1236,7 @@ fn real_library_sweep_vs_reference() {
             assert!(status.success(), "libvorbis encode of {name} at {kbps}k");
             let bytes = |p: &Path| std::fs::metadata(p).expect("size").len() as f64;
             let ref_kbps = bytes(&reference) * 8.0 / seconds / 1000.0;
-            let ours = encode_to_file(&source_pcm, rate, (ref_kbps * 1000.0).round() as i32, &format!("vorbis7-sweep/ours-{name}-{kbps}k.ogg"));
+            let (ours, block_log) = encode_to_file_with_log(&source_pcm, rate, (ref_kbps * 1000.0).round() as i32, &format!("vorbis7-sweep/ours-{name}-{kbps}k.ogg"));
             let ours_kbps = bytes(&ours) * 8.0 / seconds / 1000.0;
             let rate_pct = (ours_kbps / ref_kbps - 1.0) * 100.0;
             // Whole-file corr plus a per-second trace: a dropout (the
@@ -1231,6 +1266,13 @@ fn real_library_sweep_vs_reference() {
                 .zip(&sec_ref)
                 .filter(|(o, r)| **o < 0.9 && **r >= 0.9)
                 .count();
+            let dropout_secs: Vec<usize> = sec_ours
+                .iter()
+                .zip(&sec_ref)
+                .enumerate()
+                .filter(|(_, (o, r))| **o < 0.9 && **r >= 0.9)
+                .map(|(s, _)| s)
+                .collect();
             let pass = rate_pct.abs() <= 3.0 && gap <= 0.005 && dropouts == 0;
             if !pass {
                 failures.push(format!("{name}@{kbps}k rate {rate_pct:+.2}% gap {gap:.4} dropouts {dropouts}"));
@@ -1240,9 +1282,46 @@ fn real_library_sweep_vs_reference() {
                 if pass { "PASS" } else { "FAIL" }
             ));
             eprintln!("{}", table.lines().last().unwrap());
+            if dump_drops {
+                drops.push_str(&format!(
+                    "\n=== {name}@{kbps}k  rate {rate_pct:+.2}%  gap {gap:.4}  dropouts {dropouts} ===\n"
+                ));
+                for &s in &dropout_secs {
+                    let lo = (s.saturating_sub(2)) as i64 * rate as i64;
+                    let hi = (s + 3) as i64 * rate as i64;
+                    drops.push_str(&format!(
+                        "  sec {s}: ours {:.3} ref {:.3}\n",
+                        sec_ours[s], sec_ref[s]
+                    ));
+                    drops.push_str("    idx  centre_s  n     kind  steady bits   headroom rate_hr reservoir target\n");
+                    for (i, b) in block_log.iter().enumerate() {
+                        if b.centre < lo || b.centre >= hi {
+                            continue;
+                        }
+                        drops.push_str(&format!(
+                            "    {i:<4} {:>8.2}  {:<5} {:<5} {:<6} {:<6} {:>8.1} {:>7.1} {:>9.1} {:>7.1}\n",
+                            b.centre as f64 / rate as f64,
+                            b.n,
+                            if b.is_long { "L" } else { "S" },
+                            b.steady,
+                            b.bits,
+                            b.headroom,
+                            b.rate_headroom,
+                            b.reservoir,
+                            b.target,
+                        ));
+                    }
+                }
+            }
         }
     }
     eprintln!("\n{table}");
+    if dump_drops {
+        let _ = std::fs::write(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lanes/vorbis-hf-r2.drops.txt"),
+            &drops,
+        );
+    }
     let _ = std::fs::write(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lanes/vorbis-psy-r1.sweep.txt"),
         &table,
