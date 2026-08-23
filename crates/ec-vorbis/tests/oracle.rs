@@ -1230,3 +1230,247 @@ fn real_library_sweep_vs_reference() {
     );
     assert!(failures.is_empty(), "sweep failures: {failures:?}");
 }
+
+/// In-place radix-2 FFT.  Only magnitudes and differences of identically
+/// transformed spectra are used, so the twiddle sign convention is irrelevant.
+fn fft(re: &mut [f64], im: &mut [f64]) {
+    let n = re.len();
+    assert!(n.is_power_of_two());
+    let bits = n.trailing_zeros();
+    for i in 0..n {
+        let j = ((i as u32).reverse_bits() >> (32 - bits)) as usize;
+        if j > i {
+            re.swap(i, j);
+            im.swap(i, j);
+        }
+    }
+    let mut len = 2;
+    while len <= n {
+        let half = len / 2;
+        let step = std::f64::consts::TAU / len as f64;
+        for start in (0..n).step_by(len) {
+            for k in 0..half {
+                let angle = step * k as f64;
+                let (wr, wi) = (angle.cos(), angle.sin());
+                let i = start + k;
+                let j = i + half;
+                let tr = re[j] * wr - im[j] * wi;
+                let ti = re[j] * wi + im[j] * wr;
+                re[j] = re[i] - tr;
+                im[j] = im[i] - ti;
+                re[i] += tr;
+                im[i] += ti;
+            }
+        }
+        len *= 2;
+    }
+}
+
+/// Per-Bark-band spectral error, ours vs libvorbis, both decoded through our
+/// decoder (so the gap measures encoders, not decoders): every 2048-sample
+/// Hann frame (hop 1024) of the 48 kHz source, band edges in Hz (25 edges →
+/// 24 bands), energies summed over frames and both channels.
+/// NSR = 10log10(Σ|X_sig−X_src|²/Σ|X_src|²), E = 10log10(Σ|X_sig|²/Σ|X_src|²).
+/// The same pass records the bit split of both streams (the decode-side
+/// capture `decode_capture_with_bits` provides), so the bits table covers the
+/// same rows without a second encode pass.  Writes
+/// `lanes/vorbis-psy-r1.bands.txt` and `lanes/vorbis-psy-r1.bits.txt`.
+#[test]
+#[ignore = "slow: encodes 7 full sources × 2 rates, needs ffmpeg/libvorbis"]
+fn band_error_vs_reference() {
+    use std::io::Write;
+
+    let sources: &[(&str, &str)] = &[
+        ("nik", "~/Music/Yok - Nikbinler.mp4"),
+        ("zaur", "~/Music/Zaur Xan- Dusun Meni.mp3"),
+        ("her", "~/Music/Her Nerdeysen.mp3"),
+        ("naz", "~/Music/naz_aglama_ben_aglarim.mp4"),
+        ("sadie", "~/Music/sadie.wav"),
+        ("dl8a", "~/Downloads/8a3b6d1d19.mp3"),
+        ("hein", "~/Downloads/Sadie Sink Talks Her Little Known Singing Skills, Stranger Things 5 and Brendan Fraser.mp3"),
+    ];
+    let rate = 48_000u32;
+    let max_samples = rate as usize * 600;
+    let out_dir = scratch().join("vorbis7-bands");
+    std::fs::create_dir_all(&out_dir).expect("out dir");
+
+    const FRAME: usize = 2048;
+    const HOP: usize = 1024;
+    const EDGES: [f64; 25] = [
+        100.0, 200.0, 300.0, 400.0, 510.0, 630.0, 770.0, 920.0, 1080.0, 1270.0, 1480.0, 1720.0,
+        2000.0, 2320.0, 2700.0, 3150.0, 3700.0, 4400.0, 5300.0, 6400.0, 7700.0, 9500.0, 12000.0,
+        15500.0, 24000.0,
+    ];
+    let band_of: Vec<Option<usize>> = (0..=FRAME / 2)
+        .map(|bin| {
+            let hz = bin as f64 * f64::from(rate) / FRAME as f64;
+            EDGES.windows(2).position(|w| hz >= w[0] && hz < w[1])
+        })
+        .collect();
+    let window: Vec<f64> = (0..FRAME)
+        .map(|i| 0.5 - 0.5 * (std::f64::consts::TAU * i as f64 / FRAME as f64).cos())
+        .collect();
+
+    let mut bands = String::from("# Band error: ours vs libvorbis, both via our decoder\n\n");
+    let mut bits = String::from("# Bit split over full sources, same rows as the band error\n\n");
+    let only = std::env::var("SWEEP_ONLY").ok();
+    for &(name, src_path) in sources {
+        if only.as_deref().is_some_and(|o| !o.split(',').any(|n| n == name)) {
+            continue;
+        }
+        let src = PathBuf::from(shellexpand(src_path));
+        if !src.exists() {
+            bands.push_str(&format!("## {name}: SKIP (missing)\n\n"));
+            continue;
+        }
+        let Some((source_pcm, _)) = ffmpeg_decode_limited(&src, rate, max_samples) else {
+            bands.push_str(&format!("## {name}: SKIP (decode)\n\n"));
+            continue;
+        };
+        let seconds = source_pcm[0].len() as f64 / f64::from(rate);
+        let bytes = |p: &Path| std::fs::metadata(p).expect("size").len() as f64;
+        for &kbps in &[96i32, 128] {
+            let t0 = std::time::Instant::now();
+            let reference = out_dir.join(format!("ref-{name}-{kbps}k.ogg"));
+            let status = Command::new("ffmpeg")
+                .args(["-y", "-v", "error", "-i"])
+                .arg(&src)
+                .args(["-vn", "-t", "600", "-ac", "2", "-ar", "48000", "-c:a", "libvorbis", "-b:a", &format!("{kbps}k")])
+                .arg(&reference)
+                .status()
+                .expect("ffmpeg runs");
+            assert!(status.success(), "libvorbis encode of {name} at {kbps}k");
+            let ref_kbps = bytes(&reference) * 8.0 / seconds / 1000.0;
+            // Ours at the size libvorbis actually produced, exactly as the sweep.
+            let ours = encode_to_file(
+                &source_pcm,
+                rate,
+                (ref_kbps * 1000.0).round() as i32,
+                &format!("vorbis7-bands/ours-{name}-{kbps}k.ogg"),
+            );
+            let ours_kbps = bytes(&ours) * 8.0 / seconds / 1000.0;
+
+            // PCM through our decoder for the band error; bit split from the
+            // same file's residue-domain capture (decode twice — the capture
+            // path returns no PCM).
+            let (ours_pcm, ours_split) = {
+                let (residue, split) = decode_capture_with_bits(&ours);
+                (our_decode(&ours).0, bit_split_summary(&split, &residue))
+            };
+            let (ref_pcm, ref_split) = {
+                let (residue, split) = decode_capture_with_bits(&reference);
+                (our_decode(&reference).0, bit_split_summary(&split, &residue))
+            };
+
+            // Bit-split block: (floor, residue, packet, non-zero) per stream.
+            let (of, ores, op, onz) = ours_split;
+            let (rf, rres, rp, rnz) = ref_split;
+            bits.push_str(&format!(
+                "## {name} @ {kbps}k (ours {ours_kbps:.1} vs ref {ref_kbps:.1} kbps)\n"
+            ));
+            for (who, f, r, p, nz) in [("ours", of, ores, op, onz), ("ref ", rf, rres, rp, rnz)] {
+                bits.push_str(&format!(
+                    "{who} floor {fb:>10.1}/s ({fpc:5.1}%)  residue {rb:>10.1}/s ({rpc:5.1}%)  other {ob:>8.1}/s  nz {nz:>10}  bits/nz {bnz:.2}\n",
+                    fb = f as f64 / seconds,
+                    fpc = 100.0 * f as f64 / p.max(1) as f64,
+                    rb = r as f64 / seconds,
+                    rpc = 100.0 * r as f64 / p.max(1) as f64,
+                    ob = p.saturating_sub(f + r) as f64 / seconds,
+                    bnz = r as f64 / nz.max(1) as f64,
+                ));
+            }
+            bits.push_str(&format!(
+                "ratio floor {:.3}  residue {:.3}  bits/nz {:.3}\n\n",
+                of as f64 / rf.max(1) as f64,
+                ores as f64 / rres.max(1) as f64,
+                (ores as f64 / onz.max(1) as f64) / (rres as f64 / rnz.max(1) as f64),
+            ));
+
+            // Band error: align to the source exactly as the sweep does —
+            // common length from sample 0 (pre-roll trim inside `our_decode`).
+            let n = source_pcm[0]
+                .len()
+                .min(ours_pcm[0].len())
+                .min(ref_pcm[0].len());
+            let nb = EDGES.len() - 1;
+            let (mut e_src, mut e_ours, mut e_ref) =
+                (vec![0f64; nb], vec![0f64; nb], vec![0f64; nb]);
+            let (mut err_ours, mut err_ref) = (vec![0f64; nb], vec![0f64; nb]);
+            let mut spec: Vec<(Vec<f64>, Vec<f64>)> =
+                (0..3).map(|_| (vec![0.0; FRAME], vec![0.0; FRAME])).collect();
+            let mut start = 0;
+            while start + FRAME <= n {
+                for ch in 0..2 {
+                    for (sig, pcm) in [&source_pcm, &ours_pcm, &ref_pcm].iter().enumerate() {
+                        let s = &mut spec[sig];
+                        for i in 0..FRAME {
+                            s.0[i] = f64::from(pcm[ch][start + i]) * window[i];
+                            s.1[i] = 0.0;
+                        }
+                        fft(&mut s.0, &mut s.1);
+                    }
+                    for k in 0..=FRAME / 2 {
+                        let Some(b) = band_of[k] else { continue };
+                        let (sr, si) = (spec[0].0[k], spec[0].1[k]);
+                        e_src[b] += sr * sr + si * si;
+                        let (ur, ui) = (spec[1].0[k], spec[1].1[k]);
+                        e_ours[b] += ur * ur + ui * ui;
+                        let (dr, di) = (ur - sr, ui - si);
+                        err_ours[b] += dr * dr + di * di;
+                        let (vr, vi) = (spec[2].0[k], spec[2].1[k]);
+                        e_ref[b] += vr * vr + vi * vi;
+                        let (er, ei) = (vr - sr, vi - si);
+                        err_ref[b] += er * er + ei * ei;
+                    }
+                }
+                start += HOP;
+            }
+            let db = |e: f64, s: f64| if s > 0.0 { 10.0 * (e / s).log10() } else { f64::NAN };
+            bands.push_str(&format!(
+                "## {name} @ {kbps}k (ours {ours_kbps:.1} vs ref {ref_kbps:.1} kbps)\n"
+            ));
+            bands.push_str("band      NSR_ours NSR_ref  dNSR   E_ours  E_ref\n");
+            for b in 0..nb {
+                if e_src[b] == 0.0 {
+                    continue; // no source energy: NSR/E undefined
+                }
+                let (nsr_o, nsr_r) = (db(err_ours[b], e_src[b]), db(err_ref[b], e_src[b]));
+                bands.push_str(&format!(
+                    "{:<8}  {:7.1} {:7.1} {:6.1} {:7.1} {:7.1}\n",
+                    format!("{}-{}", EDGES[b] as usize, EDGES[b + 1] as usize),
+                    nsr_o,
+                    nsr_r,
+                    nsr_o - nsr_r,
+                    db(e_ours[b], e_src[b]),
+                    db(e_ref[b], e_src[b]),
+                ));
+            }
+            let corr = |pcm: &[Vec<f32>]| {
+                (0..2)
+                    .map(|c| correlation(&pcm[c][..n], &source_pcm[c][..n]))
+                    .sum::<f64>()
+                    / 2.0
+            };
+            bands.push_str(&format!(
+                "broadband corr: ours {:.4} ref {:.4}\n\n",
+                corr(&ours_pcm),
+                corr(&ref_pcm),
+            ));
+            eprintln!(
+                "{name}@{kbps}k: ours {ours_kbps:.1} ref {ref_kbps:.1} kbps, {:.1} s",
+                t0.elapsed().as_secs_f32()
+            );
+        }
+    }
+    for (text, file) in [
+        (&bands, "vorbis-psy-r1.bands.txt"),
+        (&bits, "vorbis-psy-r1.bits.txt"),
+    ] {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../lanes")
+ .join(file);
+        let mut f = File::create(&path).expect("create report");
+        f.write_all(text.as_bytes()).expect("write report");
+        println!("{file}: {}", path.display());
+    }
+}
