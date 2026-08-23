@@ -1042,7 +1042,14 @@ fn quantise_granule(
         if score <= 0.0 {
             break; // every band is already exactly at the mask; nothing left to buy
         }
-        if spent * 20 > target_bits * 19 {
+        // Where to stop amplifying, as a fraction of the frame's budget. Swept
+        // against both gate metrics on all fourteen library rows: 85% beats
+        // the 95% this shipped with everywhere, and 100% is a disaster --
+        // sadie loses 0.0048 correlation, because amplifying a band once the
+        // budget is gone only makes the rate loop coarsen every other band to
+        // pay for it. Below 70% the test stops binding, since the first round
+        // already spends more than that.
+        if spent * 100 > target_bits * 85 {
             break; // the budget is spent; amplifying now only coarsens
         }
         // Bands over their mask get the bits first, worst three per round so
