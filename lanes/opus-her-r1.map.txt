@@ -1,0 +1,229 @@
+# her@96k error map: ref 101.5 ours 101.0 kbps, err o=1.093 r=1.039 ratio 1.052, 119 s windows
+# window time = first hop of the 1 s bucket; ratio = ours/ref window ef² sum
+# ratio table de-noised: windows with ours share < 1e-6·max excluded
+
+== TOP-10 WINDOWS BY ours/ref RATIO ==
+t=    0s: ours 2.829e0 ( 0.0% of ours) ref 9.296e-13 ( 0.0% of ref) ratio 3043617299726.8
+  worst hop 95.0 ms (frame 5) ours_ef2 2.829e0
+  OUR 5/4800: trans1 intra1 trim7 int19 cb20 dual0 | tf_sum  -1 tf8 [1, 1, 1, 1, 1, 1, 1, 1] sp2 ac0 bits2848 | ENC sb8 vbr12528
+  REF @4800: trans1 intra1 trim4 int19 cb21 dual0 | tf_sum -13 tf8 [1, 1, 1, 1, -1, -1, -1, -1] sp2 ac0 bits3496
+  Δlog2E L  +1.4  +1.0  +0.2  -0.5  -1.9  +0.4  +0.2  +1.1  +0.1  +0.4  -0.3  +0.2  +0.0  +0.0  +1.4  +1.6  +1.1  +0.6  +0.5  +0.2  +0.1
+           R  +1.2  +1.0  -0.2  +0.4  +0.9  +0.8  +0.1  +0.5  -0.0  +0.0  -0.1  +0.4  +0.0  +0.0  +1.0  +1.2  +1.2  +0.5  +0.4  +0.2  +0.2
+t=   88s: ours 1.851e5 (93.0% of ours) ref 5.256e-2 ( 0.0% of ref) ratio 3520788.0
+  worst hop 88277.5 ms (frame 4414) ours_ef2 1.798e5
+  OUR 4414/4237440: trans1 intra1 trim4 int19 cb20 dual0 | tf_sum +12 tf8 [0, 0, 0, 0, 3, 3, 3, 3] sp2 ac0 bits2016 | ENC sb8 vbr16128
+  REF @4237440: trans1 intra0 trim3 int19 cb21 dual1 | tf_sum -11 tf8 [1, 1, 1, 1, 1, -1, -1, -1] sp2 ac0 bits3536
+  Δlog2E L  +0.2  +0.5  -1.1  -0.6  -0.1  +0.3  -0.3  +0.8  -0.1  +0.7  +0.1  +0.1  +1.0  +0.7  +0.1  +0.9  +0.4  +0.9  +0.8  +1.4  +2.2
+           R  +0.2  +0.0  +0.1  -0.4  +0.1  +0.0  -0.0  +0.4  +2.1  +0.8  +0.5  +1.1  +0.7  +1.1  +1.2  +1.5  +0.5  +1.2  +1.1  +1.2  +1.1
+t=   76s: ours 3.869e3 ( 1.9% of ours) ref 5.330e-3 ( 0.0% of ref) ratio 725916.4
+  worst hop 76252.5 ms (frame 3812) ours_ef2 3.869e3
+  OUR 3812/3659520: trans1 intra1 trim6 int19 cb20 dual1 | tf_sum  +0 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac1 bits2120 | ENC sb8 vbr16160
+  REF @3659520: trans1 intra0 trim6 int19 cb20 dual0 | tf_sum +15 tf8 [3, 3, 3, 3, 3, 0, 0, 0] sp2 ac1 bits2544
+  Δlog2E L  +0.9  +3.0  +1.0  -0.0  -0.1  -0.5  +0.0  -0.7  -0.1  +0.1  +0.1  -0.4  -0.1  +0.1  +0.8  -0.2  +0.4  +0.2  +0.3  +0.4  +0.5
+           R  +1.0  +0.7  +0.5  -0.0  +0.2  -0.5  +0.4  -0.2  -0.2  -0.2  +0.4  +0.1  +0.4  -0.0  +0.1  +0.0  +0.6  +0.1  +0.5  +0.6  -0.1
+t=   83s: ours 4.209e3 ( 2.1% of ours) ref 3.216e-1 ( 0.0% of ref) ratio 13087.8
+  worst hop 83152.5 ms (frame 4157) ours_ef2 4.206e3
+  OUR 4157/3990720: trans1 intra1 trim5 int19 cb20 dual1 | tf_sum  -1 tf8 [1, 1, 1, 1, 1, 1, 1, 1] sp2 ac1 bits2496 | ENC sb8 vbr15856
+  REF @3990720: trans1 intra0 trim4 int19 cb21 dual0 | tf_sum  -1 tf8 [1, 1, 1, 1, 1, 1, 1, 1] sp2 ac1 bits2624
+  Δlog2E L  +0.3  -0.1  -1.1  +0.3  +0.2  +0.5  +0.4  +0.3  +0.1  +0.2  -0.5  -0.4  -0.3  -0.6  -0.2  -0.0  -0.2  -0.2  -0.1  -0.3  +0.4
+           R  +0.8  -1.0  -0.5  +0.6  -0.1  -0.1  -0.2  -0.3  +0.7  -0.7  -0.5  +0.1  +0.4  +0.0  +0.2  -0.2  -0.6  -0.1  -0.0  -0.0  -0.2
+t=   89s: ours 3.397e2 ( 0.2% of ours) ref 7.799e-2 ( 0.0% of ref) ratio 4355.7
+  worst hop 89685.0 ms (frame 4484) ours_ef2 2.448e2
+  OUR 4484/4304640: trans1 intra1 trim5 int19 cb20 dual0 | tf_sum  +0 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits2024 | ENC sb8 vbr16160
+  REF @4304640: trans1 intra0 trim4 int19 cb21 dual1 | tf_sum  -1 tf8 [1, 1, 1, 1, 1, 1, 1, 1] sp2 ac0 bits3760
+  Δlog2E L  +0.0  +0.2  -0.0  -0.1  +0.2  -0.1  +0.7  +0.7  +2.2  +2.8  +1.3  +2.0  +1.3  +2.7  +2.6  +2.2  +1.8  +2.8  +2.6  +2.6  +1.5
+           R  +0.2  -0.3  +0.3  -0.1  +0.1  +0.1  +2.0  +0.7  +1.2  +1.6  +1.6  +0.9  +0.6  +0.6  +0.4  +1.1  +0.9  +1.0  +0.6  +0.7  -0.3
+t=   80s: ours 2.138e3 ( 1.1% of ours) ref 4.332e1 ( 0.0% of ref) ratio 49.4
+  worst hop 80957.5 ms (frame 4048) ours_ef2 2.135e3
+  OUR 4048/3886080: trans1 intra1 trim4 int19 cb20 dual1 | tf_sum +15 tf8 [3, 3, 3, 3, 3, 0, 0, 0] sp2 ac1 bits2024 | ENC sb8 vbr16160
+  REF @3886080: trans1 intra0 trim2 int19 cb21 dual1 | tf_sum  +6 tf8 [3, 3, 0, 0, 0, 0, 0, 0] sp2 ac1 bits3792
+  Δlog2E L  +0.0  -0.4  -0.6  -0.5  -0.2  -0.4  +1.2  -0.3  +0.2  +0.6  +1.9  -0.0  +0.7  +0.4  +0.5  +0.9  +1.2  +0.8  +0.7  +0.6  +0.9
+           R  -0.1  +0.0  +0.3  -0.5  -0.0  -0.4  -0.1  -0.2  +0.4  +0.3  +0.4  +0.1  +0.5  +0.4  +0.3  +0.9  +0.1  +0.1  +0.5  +0.3  +0.3
+t=   60s: ours 3.594e0 ( 0.0% of ours) ref 1.033e-1 ( 0.0% of ref) ratio 34.8
+  worst hop 60280.0 ms (frame 3014) ours_ef2 2.316e0
+  OUR 3014/2893440: trans0 intra0 trim5 int19 cb20 dual1 | tf_sum -36 tf8 [-2, -2, -2, -2, -2, -2, -2, -2] sp2 ac0 bits1984 | ENC sb0 vbr-64448
+  REF @2893440: trans0 intra0 trim5 int19 cb20 dual0 | tf_sum -16 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits1784
+  Δlog2E L  -0.2  +0.4  +0.0  -0.4  +0.5  -0.4  -0.7  -0.3  +0.1  -0.0  -0.7  +0.3  +0.1  +0.9  +0.2  -0.0  +0.1  +0.2  -0.0  +0.2  +0.3
+           R  -1.0  +0.1  +0.3  -0.1  -0.1  +0.2  -0.1  -0.0  +0.1  -0.2  +0.0  -0.1  +0.1  +0.2  +0.3  +0.1  +0.1  +0.2  +0.1  -0.0  -0.1
+t=   66s: ours 1.463e1 ( 0.0% of ours) ref 4.368e-1 ( 0.0% of ref) ratio 33.5
+  worst hop 66315.0 ms (frame 3316) ours_ef2 7.755e0
+  OUR 3316/3183360: trans1 intra0 trim4 int19 cb20 dual0 | tf_sum +21 tf8 [1, 1, 1, 1, 1, 1, 1, 1] sp2 ac1 bits2024 | ENC sb8 vbr16160
+  REF @3183360: trans1 intra0 trim2 int19 cb21 dual0 | tf_sum +36 tf8 [3, 3, 3, 3, 3, 3, 3, 3] sp2 ac0 bits3160
+  Δlog2E L  +0.5  +0.3  -0.2  -0.0  -0.8  +0.1  +0.4  -0.7  -0.2  -0.1  -0.0  +0.6  +0.5  +0.6  +0.9  +0.8  +0.0  +0.1  -0.1  +0.0  +0.2
+           R  +0.5  +0.4  -0.2  -0.1  -0.4  +0.3  -1.5  +0.2  -0.5  +0.1  +0.3  -0.2  +0.1  -0.2  -0.2  +0.8  +0.4  +0.8  +0.6  +0.7  +0.4
+t=   90s: ours 2.848e3 ( 1.4% of ours) ref 1.078e2 ( 0.1% of ref) ratio 26.4
+  worst hop 90825.0 ms (frame 4541) ours_ef2 1.771e3
+  OUR 4541/4359360: trans1 intra1 trim5 int19 cb20 dual0 | tf_sum -11 tf8 [1, 1, 1, 1, 1, -1, -1, -1] sp2 ac0 bits2024 | ENC sb8 vbr16176
+  REF @4359360: trans1 intra0 trim3 int19 cb21 dual1 | tf_sum  +0 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits3000
+  Δlog2E L  +0.8  +0.8  +0.6  -0.2  +0.0  +2.0  +0.2  +0.6  +0.4  -0.0  -0.3  -0.1  +0.0  -0.2  +0.6  +0.1  +0.2  +0.0  +0.8  +0.5  +2.6
+           R  +0.9  +0.3  -0.1  +1.3  +0.1  +1.3  +0.7  +0.7  +0.6  +0.4  +0.8  -0.3  +0.4  -0.1  +0.8  +0.1  +0.4  +0.2  +0.3  +0.2  +0.6
+t=   82s: ours 3.432e-1 ( 0.0% of ours) ref 1.571e-2 ( 0.0% of ref) ratio 21.8
+  worst hop 82917.5 ms (frame 4146) ours_ef2 1.871e-1
+  OUR 4146/3980160: trans1 intra1 trim4 int19 cb20 dual0 | tf_sum +11 tf8 [1, 1, 1, 1, 1, 1, 1, 1] sp2 ac0 bits2016 | ENC sb8 vbr16128
+  REF @3980160: trans1 intra0 trim2 int19 cb21 dual1 | tf_sum +21 tf8 [1, 1, 1, 1, 1, 1, 1, 1] sp2 ac0 bits3200
+  Δlog2E L  +0.4  +0.2  +0.3  -0.2  -0.5  -0.4  +1.0  -0.1  +0.4  +0.3  +0.2  -0.2  +0.1  +0.1  +0.2  +0.3  +0.3  +0.3  +0.5  +0.4  +0.2
+           R  +0.5  -0.2  -0.2  +0.3  +0.5  -0.5  +0.7  +0.4  +0.3  +0.7  +0.2  +1.4  +0.0  +0.4  +0.5  +0.5  +0.9  +0.8  +0.6  +0.6  +0.8
+
+== TOP-10 WINDOWS BY ours ERROR SHARE ==
+t=   88s: ours 1.851e5 (93.0% of ours) ref 5.256e-2 ( 0.0% of ref) ratio 3520788.0
+  worst hop 88277.5 ms (frame 4414) ours_ef2 1.798e5
+  OUR 4414/4237440: trans1 intra1 trim4 int19 cb20 dual0 | tf_sum +12 tf8 [0, 0, 0, 0, 3, 3, 3, 3] sp2 ac0 bits2016 | ENC sb8 vbr16128
+  REF @4237440: trans1 intra0 trim3 int19 cb21 dual1 | tf_sum -11 tf8 [1, 1, 1, 1, 1, -1, -1, -1] sp2 ac0 bits3536
+  Δlog2E L  +0.2  +0.5  -1.1  -0.6  -0.1  +0.3  -0.3  +0.8  -0.1  +0.7  +0.1  +0.1  +1.0  +0.7  +0.1  +0.9  +0.4  +0.9  +0.8  +1.4  +2.2
+           R  +0.2  +0.0  +0.1  -0.4  +0.1  +0.0  -0.0  +0.4  +2.1  +0.8  +0.5  +1.1  +0.7  +1.1  +1.2  +1.5  +0.5  +1.2  +1.1  +1.2  +1.1
+t=   83s: ours 4.209e3 ( 2.1% of ours) ref 3.216e-1 ( 0.0% of ref) ratio 13087.8
+  worst hop 83152.5 ms (frame 4157) ours_ef2 4.206e3
+  OUR 4157/3990720: trans1 intra1 trim5 int19 cb20 dual1 | tf_sum  -1 tf8 [1, 1, 1, 1, 1, 1, 1, 1] sp2 ac1 bits2496 | ENC sb8 vbr15856
+  REF @3990720: trans1 intra0 trim4 int19 cb21 dual0 | tf_sum  -1 tf8 [1, 1, 1, 1, 1, 1, 1, 1] sp2 ac1 bits2624
+  Δlog2E L  +0.3  -0.1  -1.1  +0.3  +0.2  +0.5  +0.4  +0.3  +0.1  +0.2  -0.5  -0.4  -0.3  -0.6  -0.2  -0.0  -0.2  -0.2  -0.1  -0.3  +0.4
+           R  +0.8  -1.0  -0.5  +0.6  -0.1  -0.1  -0.2  -0.3  +0.7  -0.7  -0.5  +0.1  +0.4  +0.0  +0.2  -0.2  -0.6  -0.1  -0.0  -0.0  -0.2
+t=   76s: ours 3.869e3 ( 1.9% of ours) ref 5.330e-3 ( 0.0% of ref) ratio 725916.4
+  worst hop 76252.5 ms (frame 3812) ours_ef2 3.869e3
+  OUR 3812/3659520: trans1 intra1 trim6 int19 cb20 dual1 | tf_sum  +0 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac1 bits2120 | ENC sb8 vbr16160
+  REF @3659520: trans1 intra0 trim6 int19 cb20 dual0 | tf_sum +15 tf8 [3, 3, 3, 3, 3, 0, 0, 0] sp2 ac1 bits2544
+  Δlog2E L  +0.9  +3.0  +1.0  -0.0  -0.1  -0.5  +0.0  -0.7  -0.1  +0.1  +0.1  -0.4  -0.1  +0.1  +0.8  -0.2  +0.4  +0.2  +0.3  +0.4  +0.5
+           R  +1.0  +0.7  +0.5  -0.0  +0.2  -0.5  +0.4  -0.2  -0.2  -0.2  +0.4  +0.1  +0.4  -0.0  +0.1  +0.0  +0.6  +0.1  +0.5  +0.6  -0.1
+t=   90s: ours 2.848e3 ( 1.4% of ours) ref 1.078e2 ( 0.1% of ref) ratio 26.4
+  worst hop 90825.0 ms (frame 4541) ours_ef2 1.771e3
+  OUR 4541/4359360: trans1 intra1 trim5 int19 cb20 dual0 | tf_sum -11 tf8 [1, 1, 1, 1, 1, -1, -1, -1] sp2 ac0 bits2024 | ENC sb8 vbr16176
+  REF @4359360: trans1 intra0 trim3 int19 cb21 dual1 | tf_sum  +0 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits3000
+  Δlog2E L  +0.8  +0.8  +0.6  -0.2  +0.0  +2.0  +0.2  +0.6  +0.4  -0.0  -0.3  -0.1  +0.0  -0.2  +0.6  +0.1  +0.2  +0.0  +0.8  +0.5  +2.6
+           R  +0.9  +0.3  -0.1  +1.3  +0.1  +1.3  +0.7  +0.7  +0.6  +0.4  +0.8  -0.3  +0.4  -0.1  +0.8  +0.1  +0.4  +0.2  +0.3  +0.2  +0.6
+t=   80s: ours 2.138e3 ( 1.1% of ours) ref 4.332e1 ( 0.0% of ref) ratio 49.4
+  worst hop 80957.5 ms (frame 4048) ours_ef2 2.135e3
+  OUR 4048/3886080: trans1 intra1 trim4 int19 cb20 dual1 | tf_sum +15 tf8 [3, 3, 3, 3, 3, 0, 0, 0] sp2 ac1 bits2024 | ENC sb8 vbr16160
+  REF @3886080: trans1 intra0 trim2 int19 cb21 dual1 | tf_sum  +6 tf8 [3, 3, 0, 0, 0, 0, 0, 0] sp2 ac1 bits3792
+  Δlog2E L  +0.0  -0.4  -0.6  -0.5  -0.2  -0.4  +1.2  -0.3  +0.2  +0.6  +1.9  -0.0  +0.7  +0.4  +0.5  +0.9  +1.2  +0.8  +0.7  +0.6  +0.9
+           R  -0.1  +0.0  +0.3  -0.5  -0.0  -0.4  -0.1  -0.2  +0.4  +0.3  +0.4  +0.1  +0.5  +0.4  +0.3  +0.9  +0.1  +0.1  +0.5  +0.3  +0.3
+t=   87s: ours 3.778e2 ( 0.2% of ours) ref 2.406e3 ( 2.7% of ref) ratio 0.2
+  worst hop 87352.5 ms (frame 4367) ours_ef2 1.490e2
+  OUR 4367/4192320: trans1 intra0 trim5 int19 cb21 dual1 | tf_sum +18 tf8 [3, 3, 3, 3, 3, 3, 0, 0] sp2 ac1 bits3112 | ENC sb8 vbr15760
+  REF @4192320: trans1 intra0 trim4 int19 cb21 dual1 | tf_sum +12 tf8 [3, 3, 3, 3, 0, 0, 0, 0] sp2 ac1 bits3344
+  Δlog2E L  +1.2  +0.2  +0.3  +0.2  +0.2  -1.6  -1.0  -0.3  -0.6  -0.9  -0.5  +0.5  +0.8  -0.2  -0.0  +0.5  -0.6  +0.0  -0.6  -0.0  +0.4
+           R  +0.9  +0.7  +0.4  +0.2  -0.2  -0.5  -0.1  -0.3  +0.9  +1.5  +1.0  +2.6  +2.1  +1.5  +0.5  +1.6  +0.4  +1.9  +1.8  +0.7  +0.3
+t=   89s: ours 3.397e2 ( 0.2% of ours) ref 7.799e-2 ( 0.0% of ref) ratio 4355.7
+  worst hop 89685.0 ms (frame 4484) ours_ef2 2.448e2
+  OUR 4484/4304640: trans1 intra1 trim5 int19 cb20 dual0 | tf_sum  +0 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits2024 | ENC sb8 vbr16160
+  REF @4304640: trans1 intra0 trim4 int19 cb21 dual1 | tf_sum  -1 tf8 [1, 1, 1, 1, 1, 1, 1, 1] sp2 ac0 bits3760
+  Δlog2E L  +0.0  +0.2  -0.0  -0.1  +0.2  -0.1  +0.7  +0.7  +2.2  +2.8  +1.3  +2.0  +1.3  +2.7  +2.6  +2.2  +1.8  +2.8  +2.6  +2.6  +1.5
+           R  +0.2  -0.3  +0.3  -0.1  +0.1  +0.1  +2.0  +0.7  +1.2  +1.6  +1.6  +0.9  +0.6  +0.6  +0.4  +1.1  +0.9  +1.0  +0.6  +0.7  -0.3
+t=   81s: ours 1.321e2 ( 0.1% of ours) ref 2.777e4 (31.3% of ref) ratio 0.0
+  worst hop 81937.5 ms (frame 4097) ours_ef2 1.003e2
+  OUR 4097/3933120: trans1 intra1 trim4 int19 cb20 dual1 | tf_sum  +6 tf8 [3, 3, 0, 0, 0, 0, 0, 0] sp2 ac0 bits2024 | ENC sb8 vbr16176
+  REF @3933120: trans1 intra0 trim2 int19 cb21 dual1 | tf_sum  -9 tf8 [1, 1, 1, 1, 1, 1, -1, -1] sp2 ac0 bits3704
+  Δlog2E L  +0.8  -0.2  +0.5  +0.2  +0.1  +0.5  -1.6  +0.0  +0.6  -0.0  +0.8  +0.5  +0.1  +0.2  +0.3  +0.1  +0.5  +0.0  +0.2  +0.2  +0.3
+           R  +0.3  -0.0  +0.4  +0.4  +1.1  -0.1  +0.6  -0.0  -0.4  +0.0  -0.1  +0.3  -0.1  -0.0  -0.1  -0.1  +0.1  +0.2  +0.3  +0.3  -0.2
+t=   92s: ours 3.088e1 ( 0.0% of ours) ref 1.436e1 ( 0.0% of ref) ratio 2.2
+  worst hop 92500.0 ms (frame 4625) ours_ef2 2.543e1
+  OUR 4625/4440000: trans1 intra0 trim4 int19 cb20 dual1 | tf_sum +21 tf8 [3, 3, 3, 3, 3, 3, 3, 0] sp2 ac1 bits2440 | ENC sb8 vbr6064
+  REF @4440000: trans1 intra0 trim3 int19 cb20 dual1 | tf_sum +57 tf8 [3, 3, 3, 3, 3, 3, 3, 3] sp2 ac1 bits2448
+  Δlog2E L  -0.7  +1.3  +0.1  -0.4  +0.1  +0.4  +0.2  +1.1  -0.0  -0.9  +0.0  +0.3  +0.1  +0.1  +0.1  +0.3  -0.2  +0.1  +0.1  +0.2  +0.7
+           R  -0.6  -0.0  +0.3  -0.3  +0.4  +1.2  +0.9  +0.4  +0.2  -0.5  +0.4  -0.4  +0.5  +0.1  +0.5  +0.2  +0.1  +0.6  +0.3  +0.3  +0.2
+t=   93s: ours 2.976e1 ( 0.0% of ours) ref 1.068e1 ( 0.0% of ref) ratio 2.8
+  worst hop 93817.5 ms (frame 4691) ours_ef2 2.609e1
+  OUR 4691/4503360: trans1 intra1 trim4 int19 cb20 dual1 | tf_sum +24 tf8 [3, 3, 3, 3, 3, 3, 3, 3] sp2 ac1 bits2448 | ENC sb8 vbr12048
+  REF @4503360: trans1 intra0 trim2 int19 cb21 dual1 | tf_sum +12 tf8 [3, 3, 3, 3, 0, 0, 0, 0] sp2 ac1 bits2888
+  Δlog2E L  -0.2  +0.4  +0.3  +0.4  +0.1  +0.3  -0.2  +0.1  +0.2  -0.4  -0.2  +0.1  +0.0  +0.2  +0.6  +0.5  +0.3  +0.7  +0.1  +0.1  -0.6
+           R  +1.4  -0.8  +0.3  -0.5  -0.5  +0.2  -0.4  -0.0  +0.4  +0.0  +0.4  +0.3  +0.0  +0.2  -0.1  -0.1  +0.2  +0.2  +0.2  +0.2  -0.4
+
+== WORST WINDOW t=88..89s, ALL FRAMES (OUR | REF) ==
+f4400: OUR trans0 intra0 trim5 int19 cb20 dual0 | tf_sum  +0 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits1840 | ENC sb0 vbr7776
+     REF trans0 intra0 trim4 int19 cb20 dual1 | tf_sum -22 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits1720
+f4401: OUR trans0 intra0 trim5 int19 cb20 dual1 | tf_sum  +0 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits1832 | ENC sb0 vbr6256
+     REF trans0 intra0 trim5 int19 cb20 dual1 | tf_sum  +0 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits1808
+f4402: OUR trans0 intra0 trim5 int19 cb20 dual1 | tf_sum  +0 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits1832 | ENC sb0 vbr4736
+     REF trans0 intra0 trim5 int19 cb20 dual1 | tf_sum  +0 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits1768
+f4403: OUR trans0 intra0 trim5 int19 cb20 dual1 | tf_sum -12 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits1832 | ENC sb0 vbr3216
+     REF trans0 intra0 trim4 int19 cb20 dual1 | tf_sum -12 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits1760
+f4404: OUR trans0 intra0 trim5 int19 cb20 dual1 | tf_sum -38 tf8 [-2, -2, -2, -2, -2, -2, -2, -2] sp2 ac0 bits1840 | ENC sb0 vbr1760
+     REF trans0 intra0 trim4 int19 cb20 dual0 | tf_sum  +0 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits1744
+f4405: OUR trans0 intra0 trim5 int19 cb20 dual1 | tf_sum  +0 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits1824 | ENC sb0 vbr176
+     REF trans0 intra0 trim4 int19 cb20 dual1 | tf_sum  +0 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits1736
+f4406: OUR trans0 intra0 trim4 int19 cb20 dual0 | tf_sum -26 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits1880 | ENC sb0 vbr-960
+     REF trans0 intra0 trim4 int19 cb20 dual1 | tf_sum -30 tf8 [-2, -2, -2, -2, -2, -2, -2, -2] sp2 ac0 bits1768
+f4407: OUR trans0 intra0 trim4 int19 cb20 dual0 | tf_sum -14 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits1872 | ENC sb0 vbr-2160
+     REF trans0 intra0 trim4 int19 cb20 dual0 | tf_sum -32 tf8 [0, 0, 0, 0, 0, -2, -2, -2] sp2 ac0 bits1704
+f4408: OUR trans0 intra0 trim4 int19 cb20 dual0 | tf_sum  +0 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits1864 | ENC sb0 vbr-3424
+     REF trans0 intra0 trim4 int19 cb20 dual0 | tf_sum -30 tf8 [-2, -2, -2, -2, -2, -2, -2, -2] sp2 ac0 bits1696
+f4409: OUR trans0 intra0 trim4 int19 cb20 dual0 | tf_sum -20 tf8 [-2, -2, -2, -2, -2, -2, -2, -2] sp2 ac0 bits1880 | ENC sb0 vbr-4560
+     REF trans0 intra0 trim3 int19 cb20 dual0 | tf_sum -22 tf8 [0, 0, 0, 0, -2, -2, -2, -2] sp2 ac0 bits1688
+f4410: OUR trans1 intra0 trim5 int19 cb20 dual1 | tf_sum  +9 tf8 [1, 1, 1, 1, 1, 1, 1, 1] sp2 ac1 bits2464 | ENC sb8 vbr-1024
+     REF trans1 intra0 trim4 int19 cb20 dual1 | tf_sum +11 tf8 [1, 1, 1, 1, 1, 1, 1, 1] sp2 ac1 bits2528
+f4411: OUR trans1 intra0 trim4 int19 cb21 dual0 | tf_sum +21 tf8 [3, 3, 3, 3, 3, 3, 3, 0] sp2 ac1 bits2680 | ENC sb8 vbr4240
+     REF trans1 intra0 trim3 int19 cb21 dual1 | tf_sum +13 tf8 [1, 1, 1, 1, 1, 1, 1, 1] sp2 ac1 bits3376
+f4412: OUR trans1 intra0 trim5 int19 cb21 dual1 | tf_sum  -3 tf8 [1, 1, 1, 1, 1, 1, 1, 1] sp2 ac0 bits3024 | ENC sb8 vbr12256
+     REF trans1 intra0 trim3 int19 cb21 dual1 | tf_sum +21 tf8 [1, 1, 1, 1, 1, 1, 1, 1] sp2 ac0 bits3520
+f4413: OUR trans1 intra1 trim6 int19 cb20 dual1 | tf_sum +21 tf8 [1, 1, 1, 1, 1, 1, 1, 1] sp2 ac0 bits2512 | ENC sb8 vbr16176
+     REF trans1 intra0 trim4 int19 cb21 dual1 | tf_sum  +9 tf8 [1, 1, 1, 1, 1, 1, 1, 1] sp2 ac0 bits3304
+f4414: OUR trans1 intra1 trim4 int19 cb20 dual0 | tf_sum +12 tf8 [0, 0, 0, 0, 3, 3, 3, 3] sp2 ac0 bits2016 | ENC sb8 vbr16128
+     REF trans1 intra0 trim3 int19 cb21 dual1 | tf_sum -11 tf8 [1, 1, 1, 1, 1, -1, -1, -1] sp2 ac0 bits3536
+f4415: OUR trans1 intra1 trim3 int19 cb20 dual1 | tf_sum +18 tf8 [0, 0, 3, 3, 3, 3, 3, 3] sp2 ac0 bits2024 | ENC sb8 vbr16144
+     REF trans1 intra0 trim2 int19 cb21 dual0 | tf_sum  -5 tf8 [1, 1, 1, 1, 1, 1, 1, 1] sp2 ac0 bits3112
+f4416: OUR trans0 intra1 trim3 int19 cb20 dual0 | tf_sum  +0 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits1856 | ENC sb0 vbr14816
+     REF trans0 intra0 trim3 int19 cb20 dual0 | tf_sum -20 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits1736
+f4417: OUR trans0 intra1 trim4 int19 cb20 dual1 | tf_sum  +0 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits1840 | ENC sb0 vbr13360
+     REF trans0 intra0 trim3 int19 cb20 dual1 | tf_sum -10 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits1712
+f4418: OUR trans0 intra0 trim4 int19 cb20 dual1 | tf_sum -10 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits1872 | ENC sb0 vbr12160
+     REF trans0 intra0 trim3 int19 cb20 dual1 | tf_sum  -8 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits1776
+f4419: OUR trans1 intra0 trim3 int19 cb21 dual0 | tf_sum +21 tf8 [0, 0, 0, 0, 3, 3, 3, 3] sp2 ac1 bits2512 | ENC sb8 vbr16080
+     REF trans1 intra0 trim1 int19 cb21 dual0 | tf_sum  +9 tf8 [1, 1, 1, 1, 1, 1, 1, 1] sp2 ac1 bits3008
+f4420: OUR trans0 intra1 trim4 int19 cb20 dual0 | tf_sum -18 tf8 [0, 0, 0, 0, 0, 0, -2, -2] sp2 ac0 bits1872 | ENC sb0 vbr14880
+     REF trans0 intra0 trim3 int19 cb20 dual0 | tf_sum  +0 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits1680
+f4421: OUR trans0 intra1 trim4 int19 cb20 dual1 | tf_sum  +0 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits1856 | ENC sb0 vbr13552
+     REF trans0 intra0 trim3 int19 cb20 dual0 | tf_sum  +0 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits1736
+f4422: OUR trans0 intra0 trim4 int19 cb20 dual0 | tf_sum -32 tf8 [0, -2, -2, -2, -2, -2, -2, -2] sp2 ac0 bits1840 | ENC sb0 vbr12096
+     REF trans0 intra0 trim3 int19 cb20 dual0 | tf_sum  +0 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits1760
+f4423: OUR trans0 intra0 trim4 int19 cb20 dual1 | tf_sum  +0 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits1840 | ENC sb0 vbr10640
+     REF trans0 intra0 trim3 int19 cb20 dual1 | tf_sum  +0 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits1904
+f4424: OUR trans0 intra0 trim4 int19 cb20 dual1 | tf_sum -24 tf8 [-2, -2, -2, -2, -2, -2, -2, -2] sp2 ac0 bits1856 | ENC sb0 vbr9312
+     REF trans0 intra0 trim4 int19 cb20 dual0 | tf_sum  +0 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits1816
+f4425: OUR trans0 intra0 trim5 int19 cb20 dual0 | tf_sum -18 tf8 [-2, -2, -2, -2, -2, -2, -2, -2] sp2 ac0 bits1856 | ENC sb0 vbr7984
+     REF trans0 intra0 trim4 int19 cb20 dual1 | tf_sum  +0 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits1856
+f4426: OUR trans0 intra0 trim5 int19 cb20 dual1 | tf_sum -32 tf8 [0, 0, 0, 0, 0, -2, -2, -2] sp2 ac0 bits1832 | ENC sb0 vbr6464
+     REF trans0 intra0 trim4 int19 cb20 dual0 | tf_sum -32 tf8 [0, 0, 0, 0, 0, -2, -2, -2] sp2 ac0 bits1792
+f4427: OUR trans0 intra0 trim5 int19 cb20 dual1 | tf_sum  +0 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits1816 | ENC sb0 vbr4816
+     REF trans0 intra0 trim4 int19 cb20 dual1 | tf_sum -36 tf8 [0, 0, 0, -2, -2, -2, -2, -2] sp2 ac0 bits1768
+f4428: OUR trans0 intra0 trim4 int19 cb20 dual0 | tf_sum -32 tf8 [-2, -2, -2, -2, -2, -2, -2, -2] sp2 ac0 bits1840 | ENC sb0 vbr3360
+     REF trans0 intra0 trim4 int19 cb20 dual1 | tf_sum -42 tf8 [-2, -2, -2, -2, -2, -2, -2, -2] sp2 ac0 bits1728
+f4429: OUR trans0 intra0 trim5 int19 cb20 dual1 | tf_sum -14 tf8 [0, 0, 0, -2, -2, -2, -2, -2] sp2 ac0 bits1824 | ENC sb0 vbr1776
+     REF trans0 intra0 trim4 int19 cb20 dual1 | tf_sum  +0 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits1688
+f4430: OUR trans0 intra0 trim5 int19 cb20 dual0 | tf_sum -38 tf8 [0, 0, -2, -2, -2, -2, -2, -2] sp2 ac0 bits2112 | ENC sb0 vbr2496
+     REF trans0 intra0 trim4 int19 cb20 dual1 | tf_sum -36 tf8 [0, 0, 0, -2, -2, -2, -2, -2] sp2 ac0 bits1656
+f4431: OUR trans1 intra0 trim6 int19 cb20 dual0 | tf_sum +21 tf8 [1, 1, 1, 1, 1, 1, 1, 1] sp2 ac1 bits2784 | ENC sb8 vbr8592
+     REF trans1 intra0 trim4 int19 cb21 dual0 | tf_sum  -5 tf8 [1, 1, 1, 1, 1, 1, 1, 1] sp2 ac1 bits2608
+f4432: OUR trans1 intra1 trim6 int19 cb21 dual1 | tf_sum  -3 tf8 [1, 1, 1, 1, 1, 1, 1, 1] sp2 ac1 bits2968 | ENC sb8 vbr16160
+     REF trans1 intra0 trim4 int19 cb21 dual1 | tf_sum +21 tf8 [3, 3, 3, 3, 3, 3, 3, 0] sp2 ac1 bits3392
+f4433: OUR trans1 intra0 trim5 int19 cb20 dual0 | tf_sum +24 tf8 [3, 3, 3, 3, 3, 3, 3, 3] sp2 ac0 bits2024 | ENC sb8 vbr16176
+     REF trans1 intra0 trim4 int19 cb21 dual0 | tf_sum +27 tf8 [3, 3, 3, 3, 3, 3, 3, 3] sp2 ac0 bits2856
+f4434: OUR trans0 intra1 trim4 int19 cb20 dual1 | tf_sum  +0 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits1856 | ENC sb0 vbr14848
+     REF trans0 intra0 trim4 int19 cb20 dual0 | tf_sum  +0 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits1840
+f4435: OUR trans0 intra0 trim4 int19 cb20 dual1 | tf_sum  +0 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits1832 | ENC sb0 vbr13328
+     REF trans0 intra0 trim4 int19 cb20 dual1 | tf_sum -20 tf8 [0, -2, -2, -2, -2, -2, -2, -2] sp2 ac0 bits1840
+f4436: OUR trans0 intra0 trim4 int19 cb20 dual1 | tf_sum  +0 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits1808 | ENC sb0 vbr11616
+     REF trans0 intra0 trim3 int19 cb20 dual1 | tf_sum -22 tf8 [0, 0, 0, 0, 0, 0, 0, -2] sp2 ac0 bits1744
+f4437: OUR trans0 intra0 trim4 int19 cb20 dual1 | tf_sum -22 tf8 [0, 0, 0, -2, -2, -2, -2, -2] sp2 ac0 bits1856 | ENC sb0 vbr10288
+     REF trans0 intra0 trim4 int19 cb20 dual1 | tf_sum  +0 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits1744
+f4438: OUR trans0 intra0 trim4 int19 cb20 dual0 | tf_sum  +0 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits1848 | ENC sb0 vbr8896
+     REF trans0 intra0 trim4 int19 cb20 dual1 | tf_sum  +0 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits1816
+f4439: OUR trans1 intra0 trim5 int19 cb20 dual1 | tf_sum  +9 tf8 [3, 3, 3, 0, 0, 0, 0, 0] sp2 ac1 bits2688 | ENC sb8 vbr14224
+     REF trans1 intra0 trim3 int19 cb21 dual1 | tf_sum +15 tf8 [0, 0, 0, 0, 0, 0, 0, 3] sp2 ac1 bits2864
+f4440: OUR trans1 intra0 trim6 int19 cb20 dual1 | tf_sum +24 tf8 [3, 3, 3, 3, 3, 3, 3, 3] sp2 ac1 bits2264 | ENC sb8 vbr16160
+     REF trans1 intra0 trim4 int19 cb21 dual1 | tf_sum  +0 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac1 bits3688
+f4441: OUR trans0 intra1 trim6 int19 cb20 dual1 | tf_sum  +0 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits1848 | ENC sb0 vbr14768
+     REF trans0 intra0 trim7 int19 cb20 dual0 | tf_sum  +0 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits1800
+f4442: OUR trans1 intra1 trim5 int19 cb20 dual0 | tf_sum  -5 tf8 [1, 1, 1, 1, 1, 1, 1, 1] sp2 ac1 bits2192 | ENC sb8 vbr16128
+     REF trans1 intra0 trim6 int19 cb21 dual1 | tf_sum +15 tf8 [3, 3, 3, 3, 3, 0, 0, 0] sp2 ac1 bits3088
+f4443: OUR trans1 intra1 trim4 int19 cb20 dual0 | tf_sum  -5 tf8 [1, 1, 1, 1, 1, 1, 1, 1] sp2 ac1 bits2024 | ENC sb8 vbr16144
+     REF trans1 intra0 trim3 int19 cb21 dual1 | tf_sum +12 tf8 [3, 3, 3, 3, 0, 0, 0, 0] sp2 ac1 bits3160
+f4444: OUR trans0 intra1 trim4 int19 cb20 dual0 | tf_sum -42 tf8 [-2, -2, -2, -2, -2, -2, -2, -2] sp2 ac0 bits1872 | ENC sb0 vbr14944
+     REF trans0 intra0 trim3 int19 cb20 dual0 | tf_sum -12 tf8 [0, 0, 0, 0, 0, 0, 0, -2] sp2 ac0 bits1760
+f4445: OUR trans0 intra0 trim4 int19 cb20 dual0 | tf_sum  +0 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits1848 | ENC sb0 vbr13552
+     REF trans0 intra0 trim4 int19 cb20 dual0 | tf_sum -32 tf8 [-2, -2, -2, -2, -2, -2, -2, -2] sp2 ac0 bits1888
+f4446: OUR trans0 intra0 trim4 int19 cb20 dual0 | tf_sum  +0 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits1848 | ENC sb0 vbr12160
+     REF trans0 intra0 trim4 int19 cb20 dual0 | tf_sum  +0 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits1816
+f4447: OUR trans0 intra0 trim5 int19 cb20 dual1 | tf_sum -16 tf8 [0, 0, 0, 0, 0, 0, -2, -2] sp2 ac0 bits1848 | ENC sb0 vbr10768
+     REF trans0 intra0 trim4 int19 cb20 dual0 | tf_sum  +0 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits1840
+f4448: OUR trans0 intra0 trim5 int19 cb20 dual1 | tf_sum -42 tf8 [-2, -2, -2, -2, -2, -2, -2, -2] sp2 ac0 bits1848 | ENC sb0 vbr9376
+     REF trans0 intra0 trim4 int19 cb20 dual1 | tf_sum  +0 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits1904
+f4449: OUR trans0 intra0 trim5 int19 cb20 dual1 | tf_sum -20 tf8 [-2, -2, -2, -2, -2, -2, -2, -2] sp2 ac0 bits1824 | ENC sb0 vbr7792
+     REF trans0 intra0 trim5 int19 cb20 dual1 | tf_sum  +0 tf8 [0, 0, 0, 0, 0, 0, 0, 0] sp2 ac0 bits1856
