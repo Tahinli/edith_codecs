@@ -254,8 +254,9 @@ pub(crate) const PREEMPH: f32 = 0.850_006_1;
 pub(crate) const SIG_SCALE: f32 = 32768.0;
 
 pub(crate) const SPREAD_NONE: usize = 0;
+pub(crate) const SPREAD_LIGHT: usize = 1;
 pub(crate) const SPREAD_NORMAL: usize = 2;
-const SPREAD_AGGRESSIVE: usize = 3;
+pub(crate) const SPREAD_AGGRESSIVE: usize = 3;
 
 /// `ilog(x)`: index of the highest set bit plus one.
 #[inline]
