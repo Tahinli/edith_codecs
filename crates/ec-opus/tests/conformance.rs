@@ -3011,3 +3011,4 @@ fn encoder_library_gate_vs_libopus() {
     );
     println!("DROPOUT GATE: passed (no ours-only dropouts)");
 }
+
