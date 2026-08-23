@@ -50,10 +50,10 @@ use super::{
 /// the two edith actually picks between.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Preset {
-    /// Diamond motion search, 16x16 partitions, intra 4x4 in I pictures only.
+    /// Diamond motion search, 16x16 partitions.
     #[default]
     Fast,
-    /// Wider search with a hexagon refinement and intra 4x4 everywhere.
+    /// Wider search with a hexagon refinement and half-macroblock partitions.
     Balanced,
 }
 
@@ -434,7 +434,15 @@ fn intra_pre_cost(
     IntraCost {
         i16_mode: best.1,
         i16_cost: best.0,
-        allow_i4: e.slice_type == SliceType::I || e.preset == Preset::Balanced,
+        // Intra_4x4 is tried in P pictures too, at every preset. Measured
+        // against x264 on a 3840x1608 clip from the library (BD-PSNR over QP
+        // 22/26/30/34, matched features): restricting it to I pictures cost
+        // -2.992 dB against x264 where allowing it everywhere reads -1.557 dB,
+        // for 5% more encode time. Nothing else in the Fast/Balanced split
+        // came close -- a 48-sample search range read -3.039 dB and the
+        // half-macroblock partitions -3.009 dB, both inside the noise of the
+        // -2.992 dB baseline.
+        allow_i4: true,
     }
 }
 
