@@ -11,10 +11,12 @@
 //!   which removes the most expensive analysis in the reference encoder (an
 //!   autocorrelation search over 1024 lags). Same choice the reference makes
 //!   below complexity 5.
-//! - **No time/frequency Viterbi.** `tf_res` is all zeros: long-block frames
-//!   keep full frequency resolution, transient frames get the tf-table's
-//!   maximum time resolution — the two defaults the search almost always
-//!   lands on.
+//! - **No time/frequency Viterbi.** Raw `tf_res` is `is_transient` in every
+//!   band (the reference's no-analysis default): with `tf_select = 0` the
+//!   tf table maps it to "no change", so long-block frames keep full
+//!   frequency resolution and transient frames keep their short blocks. (Raw
+//!   zeros in a transient frame would map to `+LM`, merging the short blocks
+//!   back into one long block and smearing pre-echo over the whole frame.)
 //! - **Fixed spreading.** `SPREAD_NORMAL` every frame, coded explicitly.
 //! - **Single-pass coarse energy** with the reference's own delayed-intra
 //!   heuristic, not the two-pass encode-both-and-compare.
@@ -608,8 +610,10 @@ impl CeltEncoder {
             }
         }
 
-        // --- tf_res: all zeros (throughput-first) ---------------------------
-        self.tf_res = [0; NB_BANDS];
+        // --- tf_res: the reference's no-analysis default --------------------
+        // Raw `is_transient` per band + `tf_select = 0` codes "no tf change";
+        // raw zeros on a transient frame would code `+LM` (undo the shorts).
+        self.tf_res = [i32::from(is_transient); NB_BANDS];
         let tf_select = 0usize;
 
         // --- Coarse energy --------------------------------------------------

@@ -1103,6 +1103,26 @@ fn compute_allocation_shared(
     }
 }
 
+/// Facts about the last decoded frame, for diagnostics.
+#[derive(Clone, Debug)]
+pub struct CeltDecDiag {
+    /// The frame was coded as CELT digital silence.
+    pub silence: bool,
+    /// Coarse energies used the intra-frame reset.
+    pub intra: bool,
+    pub transient: bool,
+    /// Packet bits the range decoder saw for this frame.
+    pub total_bits: i32,
+    /// Decoded log2 band energies after fine bits, per channel (`2*NB_BANDS`).
+    pub old_band_e: Vec<f32>,
+    /// Time-frequency resolution change per band after `tf_select`.
+    pub tf_res: Vec<i32>,
+    /// Spreading decision as coded (0..3).
+    pub spread: usize,
+    /// Anti-collapse flag as coded.
+    pub anti_collapse: bool,
+}
+
 /// A CELT layer decoder, one per Opus stream.
 #[derive(Clone, Debug)]
 pub struct CeltDecoder {
@@ -1146,6 +1166,7 @@ pub struct CeltDecoder {
     iy: Vec<i32>,
     urow: Vec<u32>,
     mdct_buf: Vec<f32>,
+    diag: CeltDecDiag,
 }
 
 impl CeltDecoder {
@@ -1188,6 +1209,16 @@ impl CeltDecoder {
             iy: vec![0; max_n],
             urow: vec![0; 256],
             mdct_buf: vec![0.0; max_n + OVERLAP],
+            diag: CeltDecDiag {
+                silence: false,
+                intra: false,
+                transient: false,
+                total_bits: 0,
+                old_band_e: vec![0.0; 2 * NB_BANDS],
+                tf_res: Vec::new(),
+                spread: 0,
+                anti_collapse: false,
+            },
         }
     }
 
@@ -1212,6 +1243,11 @@ impl CeltDecoder {
     /// The range decoder state after the last frame — the test vectors' oracle.
     pub fn rng(&self) -> u32 {
         self.rng
+    }
+
+    /// Facts from the last decoded frame (diagnostic).
+    pub fn last_diag(&self) -> &CeltDecDiag {
+        &self.diag
     }
 
     /// Decodes one CELT frame.
@@ -1521,6 +1557,16 @@ impl CeltDecoder {
                 self.old_log_e2[ch * NB_BANDS + i] = -28.0;
             }
         }
+        self.diag = CeltDecDiag {
+            silence,
+            intra,
+            transient,
+            total_bits,
+            old_band_e: self.old_band_e.clone(),
+            tf_res: self.tf_res.to_vec(),
+            spread,
+            anti_collapse: anti_collapse_on,
+        };
         self.rng = dec.range();
 
         self.deemphasis(out, n, cc);
