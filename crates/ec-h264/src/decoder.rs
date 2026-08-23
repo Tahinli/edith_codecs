@@ -29,6 +29,7 @@ use ec_h264_syntax::{
     SliceType, Sps, WeightEntry, unescape_rbsp,
 };
 
+use crate::cabac::BitAccount;
 use crate::deblock::{
     chroma_qp, edge_params, filter_chroma_h_edge8, filter_chroma_line, filter_luma_h_edge16,
     filter_luma_line,
@@ -132,6 +133,8 @@ pub struct Decoder {
     last_decoded: i32,
     output_order: OutputOrder,
     out: VecDeque<VideoFrame>,
+    /// Bits parsed so far, by syntax class (CABAC slices only).
+    account: BitAccount,
     /// Presentation timestamp to attach to the next picture started.
     pending_pts: Option<Timestamp>,
     /// `PicOrderCnt` of the random-access point most recently established by
@@ -211,6 +214,7 @@ impl Decoder {
             last_decoded: -1,
             output_order: OutputOrder::default(),
             out: VecDeque::new(),
+            account: BitAccount::default(),
             pending_pts: None,
             recovery_poc: None,
             cur_ref_padded: false,
@@ -240,6 +244,14 @@ impl Decoder {
     pub fn picture_size(&self) -> Option<(u32, u32)> {
         let sps = self.sps_map[self.last_sps? as usize].as_ref()?;
         Some((sps.width, sps.height))
+    }
+
+    /// Where the bits of every CABAC slice parsed so far went, by syntax
+    /// class, in 1/256ths of a bit. Any conforming stream can be measured
+    /// this way, so an encoder's spending can be compared with another's
+    /// through one account.
+    pub fn bit_account(&self) -> BitAccount {
+        self.account
     }
 
     /// Decode the first IDR picture of an Annex B stream and return it.
@@ -620,6 +632,9 @@ impl Decoder {
             }
             more = r.more_macroblocks()?;
             mb_addr += 1;
+        }
+        if let Entropy::Cabac(c) = &r {
+            self.account.add(&c.account());
         }
         Ok(NalOutcome::SliceDecoded)
     }
@@ -2734,6 +2749,10 @@ fn boundary_strength(
     } else {
         (mb_x * 4 + seg, mb_y * 4 + edge)
     };
-    let (pbx, pby) = if vertical { (qbx - 1, qby) } else { (qbx, qby - 1) };
+    let (pbx, pby) = if vertical {
+        (qbx - 1, qby)
+    } else {
+        (qbx, qby - 1)
+    };
     bs_between(&bs_side(pic, pbx, pby), &bs_side(pic, qbx, qby), edge == 0)
 }

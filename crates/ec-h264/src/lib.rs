@@ -49,6 +49,7 @@ mod pred;
 mod tables;
 mod transform;
 
+pub use cabac::BitAccount;
 pub use codec::H264Decoder;
 pub use decoder::{Decoder, NalOutcome, OutputOrder};
 pub use ec_core::error::{Error, Result};

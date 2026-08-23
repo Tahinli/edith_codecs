@@ -1100,3 +1100,88 @@ fn bd_psnr_vs_x264() {
         );
     }
 }
+
+/// Where our bits go against where x264's go, class by class, on the same
+/// sources at the same QP. Both streams are parsed by this crate's decoder, so
+/// the two accounts are the same measurement; the BD-PSNR gate says how much
+/// we overspend, this says on what.
+///
+///     cargo test --release -p ec-h264 --test encode bit_account_vs_x264 -- --nocapture
+///     EC_H264_CLIP=<file> cargo test --release -p ec-h264 --test encode \
+///         bit_account_vs_x264 -- --nocapture
+#[test]
+fn bit_account_vs_x264() {
+    if !have_ffmpeg() || !have_x264() {
+        eprintln!("SKIP bit_account_vs_x264: no ffmpeg with libx264 on PATH");
+        return;
+    }
+    let (w, h, sources) = match std::env::var_os("EC_H264_CLIP") {
+        Some(path) => clip_sources(&path, 12),
+        None => {
+            let (w, h, frames) = (352, 288, 12);
+            let mut clip = Clip::new(w, h);
+            let mut sources = Vec::with_capacity(frames);
+            for t in 0..frames {
+                clip.render_smooth(t);
+                sources.push((clip.y.clone(), clip.u.clone(), clip.v.clone()));
+            }
+            eprintln!("synthetic clip: {w}x{h}, {frames} pictures");
+            (w, h, sources)
+        }
+    };
+    let gop: u32 = 10;
+    let account = |stream: &[u8]| {
+        let mut dec = Decoder::new();
+        dec.set_output_order(OutputOrder::Decode);
+        for nal in ec_h264_syntax::AnnexBIter::new(stream) {
+            if dec.push_nal(nal).expect("decoder accepts the NAL") == NalOutcome::PictureBoundary {
+                dec.end_picture().expect("end of picture");
+                dec.push_nal(nal).expect("decoder accepts the NAL");
+            }
+            while dec.next_frame().is_some() {}
+        }
+        dec.flush().expect("flush");
+        while dec.next_frame().is_some() {}
+        dec.bit_account()
+    };
+    for qp in [26, 34] {
+        let mut cfg = EncoderConfig::new(w as u32, h as u32);
+        cfg.qp = qp;
+        cfg.gop_size = gop;
+        cfg.cabac = true;
+        cfg.framerate = 1.0;
+        cfg.threads = 0;
+        let mut enc = Encoder::new(cfg).expect("encoder");
+        let mut ours = Vec::new();
+        for (y, u, v) in &sources {
+            let view = PictureView::i420(w as u32, h as u32, y, u, v);
+            ours.extend_from_slice(&enc.encode(&view).expect("encode").au);
+        }
+        let theirs = x264_encode_qp(&sources, w, h, qp, gop).expect("x264 encodes");
+        let (a, b) = (account(&ours), account(&theirs));
+        eprintln!(
+            "qp {qp}: {} pictures, ours {} bytes, x264 {} bytes",
+            sources.len(),
+            ours.len(),
+            theirs.len()
+        );
+        let row = |name: &str, ours: u64, theirs: u64| {
+            let (o, t) = (ours as f64 / 256.0, theirs as f64 / 256.0);
+            let delta = if t > 0.0 {
+                format!("{:+.1}%", (o - t) / t * 100.0)
+            } else {
+                "--".to_string()
+            };
+            eprintln!("  {name:<16} ours {o:>12.0} bits | x264 {t:>12.0} bits  {delta:>8}");
+        };
+        row("skip", a.skip, b.skip);
+        row("mb_type", a.mb_type, b.mb_type);
+        row("mv", a.mv, b.mv);
+        row("ref_idx", a.ref_idx, b.ref_idx);
+        row("cbp+qp", a.cbp_qp, b.cbp_qp);
+        row("intra modes", a.intra_mode, b.intra_mode);
+        row("residual luma", a.residual_luma, b.residual_luma);
+        row("residual chroma", a.residual_chroma, b.residual_chroma);
+        row("total accounted", a.total(), b.total());
+    }
+}
