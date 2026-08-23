@@ -3920,3 +3920,259 @@ fn celt_click_peak_offset() {
         println!("celt click {bps}: peak +{} (lm {})", p as i64 - at as i64, d.lm);
     }
 }
+
+/// Per-frame allocation diagnostics for SHORT-block (transient) frames at a
+/// fixed bitrate: decodes both our stream and libopus's with our decoder, then
+/// prints per-band mean pulses, fine_quant, alloc_trim, coded_bands, intensity,
+/// dual_stereo share, spread/tf histograms, total_bits — ours vs ref, split by
+/// the decoder's transient flag. Output: `lanes/opus-sb-r1.bits.txt`.
+#[test]
+#[ignore]
+fn short_block_bits_vs_libopus() {
+    const SECS: f64 = 120.0;
+    const FRAME: usize = 960;
+    const CHANNELS: usize = 2;
+    let kbps_env: u32 = std::env::var("SWEEP_KBPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64);
+    #[allow(non_snake_case)]
+    let KBPS: u32 = kbps_env;
+
+    let all: &[(&str, &str)] = &[
+        ("naz", "~/Music/naz_aglama_ben_aglarim.mp4"),
+        ("dl8a", "~/Downloads/8a3b6d1d19.mp3"),
+        ("her", "~/Music/Her Nerdeysen.mp3"),
+        ("sadie", "~/Music/sadie.wav"),
+        (
+            "hein",
+            "~/Downloads/Sadie Sink Talks Her Little Known Singing Skills, \
+             Stranger Things 5 and Brendan Fraser.mp3",
+        ),
+    ];
+    let only: Vec<String> = std::env::var("SWEEP_ONLY")
+        .unwrap_or_else(|_| "sadie,hein".to_owned())
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim().to_owned())
+        .collect();
+    let sources: Vec<(String, PathBuf)> = all
+        .iter()
+        .filter(|(tag, _)| only.iter().any(|o| o == tag))
+        .map(|(tag, p)| (tag.to_string(), shellexpand(p)))
+        .collect();
+    assert!(!sources.is_empty(), "SWEEP_ONLY matched no sources");
+
+    let lanes_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lanes");
+    fs::create_dir_all(&lanes_dir).unwrap();
+    let out_path = lanes_dir.join("opus-sb-r1.bits.txt");
+    let scratch = lanes_dir.join("opus-sb-r1.scratch.ogg");
+    let nb = ec_opus::celt::NB_BANDS;
+    let mut report = String::new();
+
+    for (tag, src) in &sources {
+        if !src.exists() {
+            eprintln!("SKIP {tag}: missing {}", src.display());
+            continue;
+        }
+        let source_pcm = ffmpeg_decode_pcm(src, SECS);
+        let seconds = source_pcm.len() as f64 / CHANNELS as f64 / 48000.0;
+
+        // Reference: ffmpeg libopus at KBPS, VBR.
+        ffmpeg_encode_libopus(src, KBPS, &scratch, SECS);
+        let ref_bytes = fs::metadata(&scratch).map(|m| m.len() as usize).unwrap_or(0);
+        let ref_kbps = ref_bytes as f64 * 8.0 / seconds / 1000.0;
+        let ref_pkts: Vec<Vec<u8>> = ogg_packets(&fs::read(&scratch).unwrap())
+            .into_iter()
+            .skip(2)
+            .collect();
+
+        // Decode ref packets with our decoder, capture per-frame CELT diag.
+        let mut ref_diags: Vec<ec_opus::celt::CeltDecDiag> = Vec::new();
+        {
+            let mut d = Decoder::new(48000, CHANNELS).unwrap();
+            let mut buf = vec![0.0f32; 5760 * CHANNELS];
+            for p in &ref_pkts {
+                if p.is_empty() {
+                    continue;
+                }
+                let toc = ec_opus::Toc::new(p[0]);
+                if d.decode_float(p, &mut buf).is_ok() && toc.mode() != Mode::Silk {
+                    ref_diags.push(d.last_celt_diag().clone());
+                }
+            }
+        }
+
+        // Ours at the reference's realised rate.
+        let mut enc = Encoder::new(48000, CHANNELS, Application::Audio).expect("encoder");
+        enc.set_bitrate((ref_kbps * 1000.0).round() as u32);
+        enc.set_vbr_constrained(true);
+        let mut dec = Decoder::new(48000, CHANNELS).unwrap();
+        let mut packet = vec![0u8; 1500];
+        let mut dbuf = vec![0.0f32; 5760 * CHANNELS];
+        let mut ours_diags: Vec<ec_opus::celt::CeltDecDiag> = Vec::new();
+        let mut ours_bytes = 0usize;
+        for block in source_pcm.chunks(FRAME * CHANNELS) {
+            let mut padded = block.to_vec();
+            padded.resize(FRAME * CHANNELS, 0.0);
+            let len = enc.encode_float(&padded, FRAME, &mut packet).expect("encode");
+            ours_bytes += len;
+            let toc = ec_opus::Toc::new(packet[0]);
+            if dec.decode_float(&packet[..len], &mut dbuf).is_ok() && toc.mode() != Mode::Silk {
+                ours_diags.push(dec.last_celt_diag().clone());
+            }
+        }
+        let ours_kbps = ours_bytes as f64 * 8.0 / seconds / 1000.0;
+
+        report.push_str(&format!(
+            "\n# source {tag} @{KBPS}k: ours {ours_kbps:.1} kbps, ref {ref_kbps:.1} kbps; \
+             ours_celt {} frames, ref_celt {} frames\n",
+            ours_diags.len(),
+            ref_diags.len()
+        ));
+
+        for (label, is_trans) in [("LONG", false), ("SHORT", true)] {
+            let ours_t: Vec<&ec_opus::celt::CeltDecDiag> =
+                ours_diags.iter().filter(|d| d.transient == is_trans).collect();
+            let ref_t: Vec<&ec_opus::celt::CeltDecDiag> =
+                ref_diags.iter().filter(|d| d.transient == is_trans).collect();
+            let on = ours_t.len();
+            let rn = ref_t.len();
+            if on == 0 && rn == 0 {
+                continue;
+            }
+            report.push_str(&format!("## {label}: ours {on} frames, ref {rn} frames\n"));
+
+            // Per-band mean pulses.
+            report.push_str("# mean pulses per band (ours / ref)\n");
+            report.push_str("# band_hz\tours\tref\tdiff\n");
+            for i in 0..nb {
+                let om: f64 =
+                    ours_t.iter().map(|d| d.pulses[i] as f64).sum::<f64>() / on.max(1) as f64;
+                let rm: f64 =
+                    ref_t.iter().map(|d| d.pulses[i] as f64).sum::<f64>() / rn.max(1) as f64;
+                report.push_str(&format!(
+                    "{}\t{:.1}\t{:.1}\t{:.1}\n",
+                    CELT_EBANDS[i] * 240,
+                    om,
+                    rm,
+                    om - rm
+                ));
+            }
+
+            // Per-band mean fine_quant.
+            report.push_str("# mean fine_quant per band (ours / ref)\n");
+            report.push_str("# band_hz\tours\tref\n");
+            for i in 0..nb {
+                let om: f64 =
+                    ours_t.iter().map(|d| d.fine_quant[i] as f64).sum::<f64>() / on.max(1) as f64;
+                let rm: f64 =
+                    ref_t.iter().map(|d| d.fine_quant[i] as f64).sum::<f64>() / rn.max(1) as f64;
+                report.push_str(&format!(
+                    "{}\t{:.2}\t{:.2}\n",
+                    CELT_EBANDS[i] * 240,
+                    om,
+                    rm
+                ));
+            }
+
+            // Aggregate stats.
+            let mean = |v: &[&ec_opus::celt::CeltDecDiag], f: &dyn Fn(&ec_opus::celt::CeltDecDiag) -> f64| -> f64 {
+                v.iter().map(|d| f(d)).sum::<f64>() / v.len().max(1) as f64
+            };
+            let mean_band_hz = |v: &[&ec_opus::celt::CeltDecDiag], f: &dyn Fn(&ec_opus::celt::CeltDecDiag) -> usize| -> f64 {
+                let m = v.iter().map(|d| f(d)).sum::<usize>() / v.len().max(1);
+                CELT_EBANDS[m] as f64 * 240.0
+            };
+            let dual_share = |v: &[&ec_opus::celt::CeltDecDiag]| -> f64 {
+                v.iter().filter(|d| d.dual_stereo).count() as f64 / v.len().max(1) as f64
+            };
+            let fmt_hist = |h: [usize; 4]| -> String {
+                h.iter()
+                    .map(|x| x.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let spread_hist = |v: &[&ec_opus::celt::CeltDecDiag]| -> [usize; 4] {
+                let mut h = [0usize; 4];
+                for d in v {
+                    h[d.spread.min(3)] += 1;
+                }
+                h
+            };
+            let tf_hist = |v: &[&ec_opus::celt::CeltDecDiag]| -> [usize; 4] {
+                let mut h = [0usize; 4];
+                for d in v {
+                    for &t in &d.tf_res {
+                        h[(t + 1).max(0).min(3) as usize] += 1;
+                    }
+                }
+                h
+            };
+
+            let trim_hist = |v: &[&ec_opus::celt::CeltDecDiag]| -> [usize; 11] {
+                let mut h = [0usize; 11];
+                for d in v {
+                    h[d.alloc_trim.clamp(0, 10) as usize] += 1;
+                }
+                h
+            };
+            report.push_str(&format!(
+                "# alloc_trim hist [0..10]: ours {:?} ref {:?}\n",
+                trim_hist(&ours_t),
+                trim_hist(&ref_t)
+            ));
+            report.push_str("# mean dynalloc boost per band (1/8 bit) ours / ref\n");
+            for b in 0..nb {
+                let mo = mean(&ours_t, &|d: &ec_opus::celt::CeltDecDiag| d.offsets[b] as f64);
+                let mr = mean(&ref_t, &|d: &ec_opus::celt::CeltDecDiag| d.offsets[b] as f64);
+                if mo != 0.0 || mr != 0.0 {
+                    report.push_str(&format!("{}\t{:.1}\t{:.1}\n", CELT_EBANDS[b] * 240, mo, mr));
+                }
+            }
+            report.push_str(&format!(
+                "# alloc_trim mean: ours {:.2} ref {:.2}\n",
+                mean(&ours_t, &|d: &ec_opus::celt::CeltDecDiag| d.alloc_trim as f64),
+                mean(&ref_t, &|d: &ec_opus::celt::CeltDecDiag| d.alloc_trim as f64),
+            ));
+            report.push_str(&format!(
+                "# coded_bands mean Hz: ours {:.0} ref {:.0}\n",
+                mean_band_hz(&ours_t, &|d: &ec_opus::celt::CeltDecDiag| d.coded_bands),
+                mean_band_hz(&ref_t, &|d: &ec_opus::celt::CeltDecDiag| d.coded_bands),
+            ));
+            report.push_str(&format!(
+                "# intensity mean Hz: ours {:.0} ref {:.0}\n",
+                mean_band_hz(&ours_t, &|d: &ec_opus::celt::CeltDecDiag| d.intensity),
+                mean_band_hz(&ref_t, &|d: &ec_opus::celt::CeltDecDiag| d.intensity),
+            ));
+            report.push_str(&format!(
+                "# dual_stereo share: ours {:.3} ref {:.3}\n",
+                dual_share(&ours_t),
+                dual_share(&ref_t),
+            ));
+            report.push_str(&format!(
+                "# total_bits mean: ours {:.0} ref {:.0}\n",
+                mean(&ours_t, &|d: &ec_opus::celt::CeltDecDiag| d.total_bits as f64),
+                mean(&ref_t, &|d: &ec_opus::celt::CeltDecDiag| d.total_bits as f64),
+            ));
+            report.push_str(&format!(
+                "# balance mean: ours {:.0} ref {:.0}\n",
+                mean(&ours_t, &|d: &ec_opus::celt::CeltDecDiag| d.balance as f64),
+                mean(&ref_t, &|d: &ec_opus::celt::CeltDecDiag| d.balance as f64),
+            ));
+            report.push_str(&format!(
+                "# spread hist [0..3]: ours [{}] ref [{}]\n",
+                fmt_hist(spread_hist(&ours_t)),
+                fmt_hist(spread_hist(&ref_t)),
+            ));
+            report.push_str(&format!(
+                "# tf_res hist [-1..2]: ours [{}] ref [{}]\n",
+                fmt_hist(tf_hist(&ours_t)),
+                fmt_hist(tf_hist(&ref_t)),
+            ));
+        }
+    }
+
+    fs::write(&out_path, &report).unwrap();
+    eprintln!("wrote {}", out_path.display());
+}
