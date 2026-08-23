@@ -907,6 +907,9 @@ fn encoder_roundtrips_at_every_rate() {
 }
 
 #[test]
+// Expectations are libopus 1.6's (opus_encoder.c mode_thresholds and the
+// voice/music bandwidth tables blended by voice_est) since lane opus-mode;
+// matched against ffmpeg libopus on real speech in lanes/opus-mode-r1.sweep.txt.
 fn encoder_mode_follows_application_bitrate_channels_and_frame_size() {
     #[derive(Clone, Copy, Debug)]
     struct Case {
@@ -945,8 +948,8 @@ fn encoder_mode_follows_application_bitrate_channels_and_frame_size() {
             mode_request: None,
             bandwidth_request: None,
             mode: Mode::Silk,
-            bandwidth: Bandwidth::Narrow,
-            config: 1,
+            bandwidth: Bandwidth::Wide,
+            config: 9,
             code: 0,
             frames: 1,
         },
@@ -954,32 +957,6 @@ fn encoder_mode_follows_application_bitrate_channels_and_frame_size() {
             app: Application::Voip,
             channels: 1,
             bps: 13_000,
-            frame: 960,
-            mode_request: None,
-            bandwidth_request: None,
-            mode: Mode::Silk,
-            bandwidth: Bandwidth::Medium,
-            config: 5,
-            code: 0,
-            frames: 1,
-        },
-        Case {
-            app: Application::Voip,
-            channels: 1,
-            bps: 16_000,
-            frame: 960,
-            mode_request: None,
-            bandwidth_request: None,
-            mode: Mode::Silk,
-            bandwidth: Bandwidth::Medium,
-            config: 5,
-            code: 0,
-            frames: 1,
-        },
-        Case {
-            app: Application::Voip,
-            channels: 1,
-            bps: 19_000,
             frame: 960,
             mode_request: None,
             bandwidth_request: None,
@@ -992,13 +969,39 @@ fn encoder_mode_follows_application_bitrate_channels_and_frame_size() {
         Case {
             app: Application::Voip,
             channels: 1,
+            bps: 16_000,
+            frame: 960,
+            mode_request: None,
+            bandwidth_request: None,
+            mode: Mode::Hybrid,
+            bandwidth: Bandwidth::Full,
+            config: 15,
+            code: 0,
+            frames: 1,
+        },
+        Case {
+            app: Application::Voip,
+            channels: 1,
+            bps: 19_000,
+            frame: 960,
+            mode_request: None,
+            bandwidth_request: None,
+            mode: Mode::Hybrid,
+            bandwidth: Bandwidth::Full,
+            config: 15,
+            code: 0,
+            frames: 1,
+        },
+        Case {
+            app: Application::Voip,
+            channels: 1,
             bps: 20_000,
             frame: 960,
             mode_request: None,
             bandwidth_request: None,
             mode: Mode::Hybrid,
-            bandwidth: Bandwidth::SuperWide,
-            config: 13,
+            bandwidth: Bandwidth::Full,
+            config: 15,
             code: 0,
             frames: 1,
         },
@@ -1022,9 +1025,9 @@ fn encoder_mode_follows_application_bitrate_channels_and_frame_size() {
             frame: 960,
             mode_request: None,
             bandwidth_request: None,
-            mode: Mode::Celt,
+            mode: Mode::Hybrid,
             bandwidth: Bandwidth::Full,
-            config: 31,
+            config: 15,
             code: 0,
             frames: 1,
         },
@@ -1035,9 +1038,9 @@ fn encoder_mode_follows_application_bitrate_channels_and_frame_size() {
             frame: 960,
             mode_request: None,
             bandwidth_request: None,
-            mode: Mode::Celt,
-            bandwidth: Bandwidth::SuperWide,
-            config: 27,
+            mode: Mode::Hybrid,
+            bandwidth: Bandwidth::Full,
+            config: 15,
             code: 0,
             frames: 1,
         },
@@ -1062,8 +1065,8 @@ fn encoder_mode_follows_application_bitrate_channels_and_frame_size() {
             mode_request: None,
             bandwidth_request: None,
             mode: Mode::Celt,
-            bandwidth: Bandwidth::SuperWide,
-            config: 27,
+            bandwidth: Bandwidth::Full,
+            config: 31,
             code: 0,
             frames: 1,
         },
@@ -1074,9 +1077,9 @@ fn encoder_mode_follows_application_bitrate_channels_and_frame_size() {
             frame: 960,
             mode_request: None,
             bandwidth_request: None,
-            mode: Mode::Silk,
-            bandwidth: Bandwidth::Narrow,
-            config: 1,
+            mode: Mode::Hybrid,
+            bandwidth: Bandwidth::Full,
+            config: 15,
             code: 0,
             frames: 1,
         },
@@ -1087,9 +1090,9 @@ fn encoder_mode_follows_application_bitrate_channels_and_frame_size() {
             frame: 960,
             mode_request: None,
             bandwidth_request: None,
-            mode: Mode::Silk,
-            bandwidth: Bandwidth::Narrow,
-            config: 1,
+            mode: Mode::Hybrid,
+            bandwidth: Bandwidth::Full,
+            config: 15,
             code: 0,
             frames: 1,
         },
@@ -1100,9 +1103,9 @@ fn encoder_mode_follows_application_bitrate_channels_and_frame_size() {
             frame: 960,
             mode_request: None,
             bandwidth_request: None,
-            mode: Mode::Silk,
-            bandwidth: Bandwidth::Medium,
-            config: 5,
+            mode: Mode::Hybrid,
+            bandwidth: Bandwidth::Full,
+            config: 15,
             code: 0,
             frames: 1,
         },
@@ -1113,9 +1116,9 @@ fn encoder_mode_follows_application_bitrate_channels_and_frame_size() {
             frame: 960,
             mode_request: None,
             bandwidth_request: None,
-            mode: Mode::Silk,
-            bandwidth: Bandwidth::Wide,
-            config: 9,
+            mode: Mode::Hybrid,
+            bandwidth: Bandwidth::Full,
+            config: 15,
             code: 0,
             frames: 1,
         },
@@ -1127,8 +1130,8 @@ fn encoder_mode_follows_application_bitrate_channels_and_frame_size() {
             mode_request: None,
             bandwidth_request: None,
             mode: Mode::Hybrid,
-            bandwidth: Bandwidth::SuperWide,
-            config: 13,
+            bandwidth: Bandwidth::Full,
+            config: 15,
             code: 0,
             frames: 1,
         },
@@ -1139,9 +1142,9 @@ fn encoder_mode_follows_application_bitrate_channels_and_frame_size() {
             frame: 960,
             mode_request: None,
             bandwidth_request: None,
-            mode: Mode::Hybrid,
+            mode: Mode::Celt,
             bandwidth: Bandwidth::Full,
-            config: 15,
+            config: 31,
             code: 0,
             frames: 1,
         },
@@ -1165,9 +1168,9 @@ fn encoder_mode_follows_application_bitrate_channels_and_frame_size() {
             frame: 480,
             mode_request: None,
             bandwidth_request: None,
-            mode: Mode::Silk,
-            bandwidth: Bandwidth::Medium,
-            config: 4,
+            mode: Mode::Hybrid,
+            bandwidth: Bandwidth::Full,
+            config: 14,
             code: 0,
             frames: 1,
         },
@@ -1179,8 +1182,8 @@ fn encoder_mode_follows_application_bitrate_channels_and_frame_size() {
             mode_request: None,
             bandwidth_request: None,
             mode: Mode::Silk,
-            bandwidth: Bandwidth::Medium,
-            config: 5,
+            bandwidth: Bandwidth::Wide,
+            config: 9,
             code: 3,
             frames: 2,
         },
@@ -1192,8 +1195,8 @@ fn encoder_mode_follows_application_bitrate_channels_and_frame_size() {
             mode_request: None,
             bandwidth_request: None,
             mode: Mode::Silk,
-            bandwidth: Bandwidth::Medium,
-            config: 5,
+            bandwidth: Bandwidth::Wide,
+            config: 9,
             code: 3,
             frames: 3,
         },
@@ -1205,8 +1208,8 @@ fn encoder_mode_follows_application_bitrate_channels_and_frame_size() {
             mode_request: None,
             bandwidth_request: None,
             mode: Mode::Silk,
-            bandwidth: Bandwidth::Medium,
-            config: 6,
+            bandwidth: Bandwidth::Wide,
+            config: 10,
             code: 0,
             frames: 1,
         },
@@ -3378,7 +3381,7 @@ fn silk_library_gate_vs_libopus() {
 
     let lanes_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lanes");
     fs::create_dir_all(&lanes_dir).unwrap();
-    let sweep_path = lanes_dir.join("opus-silk-r2.sweep.txt");
+    let sweep_path = lanes_dir.join("opus-mode-r1.sweep.txt");
     let ref_ogg = temp_path("opus-silk-r2-ref.opus");
     let ours_ogg = temp_path("opus-silk-r2-ours.opus");
 
@@ -3392,10 +3395,13 @@ fn silk_library_gate_vs_libopus() {
     // cutoff: NB 4 kHz, WB 8 kHz, hybrid-FB unfiltered (None) — compare each
     // encoder only against the band it can actually reproduce.
     let rows: &[(&str, u32, Option<Bandwidth>, Option<Mode>, Option<f64>)] = &[
-        ("12k-NB", 12, None, None, Some(4000.0)),
-        ("16k-NB", 16, Some(Bandwidth::Narrow), None, Some(4000.0)),
-        ("24k-WB", 24, Some(Bandwidth::Wide), Some(Mode::Silk), Some(8000.0)),
-        ("32k-Hyb", 32, None, None, None),
+        // All rows auto since lane opus-mode: the selector is libopus's, so
+        // the mode must match the reference's (asserted below) and the
+        // comparison is full-band (no lowpass).
+        ("12k", 12, None, None, None),
+        ("16k", 16, None, None, None),
+        ("24k", 24, None, None, None),
+        ("32k", 32, None, None, None),
     ];
 
     let mut out_rows: Vec<String> = Vec::new();
@@ -3444,6 +3450,10 @@ fn silk_library_gate_vs_libopus() {
             .encode_float(&source_pcm[..FRAME * CHANNELS], FRAME, &mut toc_buf)
             .expect("encode probe");
         let mode_label = toc_mode_label(toc_buf[0]);
+        assert_eq!(
+            ref_mode, mode_label,
+            "{tag}: mode mismatch ref={ref_mode} ours={mode_label} (MODE GATE)"
+        );
 
         // Own-decoder roundtrip (range-coder invariant) + packet capture.
         let (ours_own_dec, ours_packets, ours_bytes) =
