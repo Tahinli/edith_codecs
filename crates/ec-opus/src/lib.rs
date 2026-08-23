@@ -120,6 +120,11 @@ impl Decoder {
         self.debug_mute = (celt, silk);
     }
 
+    /// Facts from the last decoded frame's CELT layer (diagnostic).
+    pub fn last_celt_diag(&self) -> &crate::celt::CeltDecDiag {
+        self.celt.last_diag()
+    }
+
     /// A decoder for `channels` channels at `sample_rate`, which must be one of
     /// 8000, 12000, 16000, 24000 or 48000 Hz.
     pub fn new(sample_rate: u32, channels: usize) -> Result<Decoder> {
