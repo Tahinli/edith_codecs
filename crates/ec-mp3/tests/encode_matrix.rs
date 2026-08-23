@@ -412,3 +412,155 @@ fn encodes_above_the_incumbent_bar() {
     }
     assert!(failures.is_empty(), "{failures:#?}");
 }
+
+// ---------------------------------------------------------------------------
+// The live reference: LAME on the user's own library, at matched constant
+// bitrate. `encodes_above_the_incumbent_bar` measures against a frozen number
+// from the crate this one replaces; that number cannot notice LAME moving, and
+// the fixtures it covers are synthetic. This one encodes the same seconds of
+// the same file with both encoders at the same bitrate and correlates each
+// against the samples that went in.
+// ---------------------------------------------------------------------------
+
+/// Sources for [`real_library_sweep_vs_lame`], the same list the vorbis and
+/// opus library gates use.
+const LIBRARY: [(&str, &str); 7] = [
+    ("nik", "~/Music/Yok - Nikbinler.mp4"),
+    ("zaur", "~/Music/Zaur Xan- Dusun Meni.mp3"),
+    ("her", "~/Music/Her Nerdeysen.mp3"),
+    ("naz", "~/Music/naz_aglama_ben_aglarim.mp4"),
+    ("sadie", "~/Music/sadie.wav"),
+    ("dl8a", "~/Downloads/8a3b6d1d19.mp3"),
+    (
+        "hein",
+        "~/Downloads/Sadie Sink Talks Her Little Known Singing Skills, Stranger Things 5 and Brendan Fraser.mp3",
+    ),
+];
+
+/// How far under LAME a row may sit before the sweep fails, in correlation.
+///
+/// The first measurement (60 s of each source, 44.1 kHz stereo, CBR) put every
+/// row between -0.00137 and +0.00115, with the worst two -- zaur and dl8a at
+/// 128 kbit/s -- on dense material where LAME's short-block switching earns
+/// its keep. The floor sits just under that worst row rather than at zero
+/// because two rows are already ahead of LAME and the spread is what a
+/// regression would have to widen.
+const LAME_CORR_FLOOR: f64 = -0.0020;
+
+fn expand(path: &str) -> PathBuf {
+    PathBuf::from(match path.strip_prefix("~/") {
+        Some(rest) => format!(
+            "{}/{rest}",
+            std::env::var("HOME").unwrap_or_else(|_| "/home".into())
+        ),
+        None => path.to_string(),
+    })
+}
+
+/// Decodes `seconds` of a source to interleaved stereo f32 at 44.1 kHz.
+fn decode_source(path: &Path, seconds: u32) -> Option<Vec<f32>> {
+    let out = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args([
+            "-vn",
+            "-t",
+            &seconds.to_string(),
+            "-ac",
+            "2",
+            "-ar",
+            "44100",
+            "-f",
+            "f32le",
+            "-",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() || out.stdout.is_empty() {
+        return None;
+    }
+    Some(
+        out.stdout
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect(),
+    )
+}
+
+/// Ours against LAME on the user's library, at matched constant bitrate:
+///
+///     cargo test -p ec-mp3 --release --test encode_matrix \
+///         real_library_sweep_vs_lame -- --ignored --nocapture
+#[test]
+#[ignore = "needs the user's library and ffmpeg's libmp3lame"]
+fn real_library_sweep_vs_lame() {
+    let seconds = 60u32;
+    let work = workdir("lame-sweep");
+    println!(
+        "{:<7} {:>5} {:>9} {:>9} {:>8} {:>9} {:>9}",
+        "source", "kbps", "corr_ours", "corr_lame", "gap", "ours_kb", "lame_kb"
+    );
+    let mut rows = 0;
+    let mut failures = Vec::new();
+    for (name, src) in LIBRARY {
+        let src = expand(src);
+        if !src.exists() {
+            println!("{name:<7} SKIP (missing)");
+            continue;
+        }
+        let Some(pcm) = decode_source(&src, seconds) else {
+            println!("{name:<7} SKIP (decode)");
+            continue;
+        };
+        let secs = pcm.len() as f64 / (44100.0 * 2.0);
+        for kbps in [128u32, 192] {
+            let ours_bytes = encode(&pcm, 44100, 2, kbps);
+            let ours_file = work.join(format!("ours-{name}-{kbps}.mp3"));
+            std::fs::write(&ours_file, &ours_bytes).expect("write ours");
+            let lame_file = work.join(format!("lame-{name}-{kbps}.mp3"));
+            let status = Command::new("ffmpeg")
+                .args(["-y", "-v", "error", "-i"])
+                .arg(&src)
+                .args([
+                    "-vn",
+                    "-t",
+                    &seconds.to_string(),
+                    "-ac",
+                    "2",
+                    "-ar",
+                    "44100",
+                    "-c:a",
+                    "libmp3lame",
+                    "-b:a",
+                    &format!("{kbps}k"),
+                ])
+                .arg(&lame_file)
+                .status()
+                .expect("ffmpeg runs");
+            assert!(status.success(), "libmp3lame encode of {name} at {kbps}k");
+            // Both decoded by the same decoder and aligned the same way: an
+            // encoder delay is not a quality difference.
+            let corr_of = |file: &Path| -> f64 {
+                let decoded = decode(file);
+                aligned(&decoded, &pcm, 2).0
+            };
+            let (ours_corr, lame_corr) = (corr_of(&ours_file), corr_of(&lame_file));
+            let kb =
+                |p: &Path| std::fs::metadata(p).expect("size").len() as f64 * 8.0 / secs / 1000.0;
+            let gap = ours_corr - lame_corr;
+            println!(
+                "{name:<7} {kbps:>5} {ours_corr:>9.5} {lame_corr:>9.5} {gap:>+8.5} {:>9.1} {:>9.1}",
+                kb(&ours_file),
+                kb(&lame_file)
+            );
+            rows += 1;
+            if gap < LAME_CORR_FLOOR {
+                failures.push(format!(
+                    "{name} at {kbps} kbit/s: {ours_corr:.5} against LAME's {lame_corr:.5}"
+                ));
+            }
+        }
+    }
+    assert!(rows > 0, "no library sources were readable");
+    assert!(failures.is_empty(), "{failures:#?}");
+}
