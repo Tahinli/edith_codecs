@@ -375,18 +375,7 @@ impl CabacEnc {
 
     /// The bypass-coded k-th order Exp-Golomb suffix of a UEGk bin string.
     fn ueg_suffix(&mut self, value: u32, k0: u32) {
-        let mut k = k0;
-        let mut v = value;
-        while v >= 1 << k {
-            self.bypass(true);
-            v -= 1 << k;
-            k += 1;
-        }
-        self.bypass(false);
-        while k > 0 {
-            k -= 1;
-            self.bypass(v >> k & 1 != 0);
-        }
+        ueg_suffix_bins(self, value, k0);
     }
 
     /// transform_size_8x8_flag (9.3.3.1.1.10), mirroring the decoder's
@@ -418,7 +407,7 @@ impl CabacEnc {
                 }
             }
         }
-        self.encode_levels(coeff, last, OFF_ABS_8X8, false)
+        levels_bins(self, coeff, last, OFF_ABS_8X8, false)
     }
 
     /// One residual block in scan order (7.3.5.3.3): coded_block_flag, the
@@ -438,95 +427,52 @@ impl CabacEnc {
             "cat 5 goes through residual_block_8x8"
         );
         let cat_i = cat.ctx_block_cat();
-        let max = cat.max_num_coeff();
-        let last = (0..max).rev().find(|&i| coeff[i] != 0);
+        let (a, b) = self.cbf_neighbours(cat, na, nb);
+        residual_bins(self, coeff, cat, OFF_CBF + CBF_CAT_OFF[cat_i] + a + 2 * b)
+    }
 
+    /// The same bins [`Self::residual_block`] would write, costed against the
+    /// context state as it stands, in 1/256ths of a bit. Nothing is written and
+    /// no state moves: this is what a quantisation decision asks before it
+    /// commits.
+    pub(crate) fn residual_block_cost(
+        &self,
+        coeff: &[i32],
+        cat: BlockCat,
+        na: Option<u8>,
+        nb: Option<u8>,
+    ) -> u32 {
+        let cat_i = cat.ctx_block_cat();
+        let (a, b) = self.cbf_neighbours(cat, na, nb);
+        let mut sink = CostSink {
+            state: self.state,
+            bits: 0,
+        };
+        residual_bins(
+            &mut sink,
+            coeff,
+            cat,
+            OFF_CBF + CBF_CAT_OFF[cat_i] + a + 2 * b,
+        );
+        sink.bits
+    }
+
+    /// The coded_block_flag neighbour conditions (9.3.3.1.1.9), which the cost
+    /// path needs on exactly the terms the write path uses them.
+    fn cbf_neighbours(&self, cat: BlockCat, na: Option<u8>, nb: Option<u8>) -> (usize, usize) {
         let intra = self.cur_intra;
         let cond = |n: Option<u8>| match n {
             None => usize::from(intra),
             Some(v) => usize::from(v != 0),
         };
-        let (a, b) = match cat {
+        match cat {
             BlockCat::LumaDc => (self.dc_cbf(self.ctx.a, 0), self.dc_cbf(self.ctx.b, 0)),
             BlockCat::ChromaDc(c) => (
                 self.dc_cbf(self.ctx.a, 1 + c),
                 self.dc_cbf(self.ctx.b, 1 + c),
             ),
             _ => (cond(na), cond(nb)),
-        };
-        let Some(last) = last else {
-            self.decision(OFF_CBF + CBF_CAT_OFF[cat_i] + a + 2 * b, false);
-            return 0;
-        };
-        self.decision(OFF_CBF + CBF_CAT_OFF[cat_i] + a + 2 * b, true);
-
-        // Significance map. The decoder stops at the last significant position
-        // and infers the final coefficient, so nothing is written past `last`.
-        let sig_base = OFF_SIG + SIG_CAT_OFF[cat_i];
-        let last_base = OFF_LAST + SIG_CAT_OFF[cat_i];
-        for i in 0..max - 1 {
-            let inc = sig_inc(cat, i);
-            let significant = coeff[i] != 0;
-            self.decision(sig_base + inc, significant);
-            if significant {
-                self.decision(last_base + inc, i == last);
-                if i == last {
-                    break;
-                }
-            }
         }
-
-        self.encode_levels(coeff, last, OFF_ABS + ABS_CAT_OFF[cat_i], cat_i == 3)
-    }
-
-    /// coeff_abs_level_minus1 and coeff_sign_flag of `coeff[..=last]`, highest
-    /// scanning position first (9.3.3.1.3 counters). Returns the number of
-    /// levels written.
-    fn encode_levels(
-        &mut self,
-        coeff: &[i32],
-        last: usize,
-        abs_base: usize,
-        chroma_dc: bool,
-    ) -> u8 {
-        let mut num_eq1 = 0u32;
-        let mut num_gt1 = 0u32;
-        let mut total = 0u8;
-        for pos in (0..=last).rev() {
-            let level = coeff[pos];
-            if level == 0 {
-                continue;
-            }
-            let inc0 = if num_gt1 != 0 {
-                0
-            } else {
-                4.min(1 + num_eq1) as usize
-            };
-            let inc1 = 5 + (4 - u32::from(chroma_dc)).min(num_gt1) as usize;
-            let abs_minus1 = level.unsigned_abs() - 1;
-            let mut prefix = 0u32;
-            while prefix < 14 {
-                let ctx_idx = abs_base + if prefix == 0 { inc0 } else { inc1 };
-                if prefix < abs_minus1 {
-                    self.decision(ctx_idx, true);
-                    prefix += 1;
-                } else {
-                    self.decision(ctx_idx, false);
-                    break;
-                }
-            }
-            if abs_minus1 >= 14 {
-                self.ueg_suffix(abs_minus1 - 14, 0);
-            }
-            self.bypass(level < 0);
-            if abs_minus1 == 0 {
-                num_eq1 += 1;
-            } else {
-                num_gt1 += 1;
-            }
-            total += 1;
-        }
-        total
     }
 
     fn dc_cbf(&self, n: Option<MbInfo>, which: u8) -> usize {
@@ -536,6 +482,166 @@ impl CabacEnc {
             Some(i) => usize::from(i.dc_cbf & (1 << which) != 0),
         }
     }
+}
+
+/// Where a residual block's bins go: the arithmetic coder that writes them, or
+/// the counter that only prices them.
+///
+/// The two share one body so that a price can never drift from what the writer
+/// would spend — the whole value of an exact rate is that it is the same code.
+trait BinSink {
+    /// A context-coded bin (9.3.4.1).
+    fn bin(&mut self, ctx_idx: usize, bin: bool);
+    /// An equiprobable bin (9.3.4.3).
+    fn bypass_bin(&mut self, bin: bool);
+}
+
+impl BinSink for CabacEnc {
+    fn bin(&mut self, ctx_idx: usize, bin: bool) {
+        self.decision(ctx_idx, bin);
+    }
+    fn bypass_bin(&mut self, bin: bool) {
+        self.bypass(bin);
+    }
+}
+
+/// Bits, in 1/256ths, that a bin costs against each of the 64 probability
+/// states: `[2 * pStateIdx]` for a bin equal to the MPS, `+ 1` for the LPS.
+///
+/// The state's LPS probability is the one clause 9.3.3.2.1 is built from,
+/// p(sigma) = 0.5 * (0.01875 / 0.5)^(sigma / 63), so the entry is -log2 of it.
+/// State 0 costs a whole bit either way, state 63 costs 7/256 of one for the
+/// MPS: this spread is what makes an exact rate worth measuring at all.
+const BIN_COST: [u16; 128] = [
+    256, 256, 238, 275, 221, 294, 206, 314, 192, 333, 180, 352, 168, 371, 157, 391, 148, 410, 139,
+    429, 130, 448, 122, 468, 115, 487, 108, 506, 102, 525, 96, 545, 90, 564, 85, 583, 80, 602, 76,
+    622, 72, 641, 68, 660, 64, 679, 60, 699, 57, 718, 54, 737, 51, 756, 48, 776, 46, 795, 43, 814,
+    41, 833, 39, 853, 37, 872, 35, 891, 33, 910, 31, 930, 29, 949, 28, 968, 26, 987, 25, 1007, 24,
+    1026, 22, 1045, 21, 1064, 20, 1084, 19, 1103, 18, 1122, 17, 1141, 16, 1161, 15, 1180, 15, 1199,
+    14, 1218, 13, 1238, 12, 1257, 12, 1276, 11, 1295, 11, 1315, 10, 1334, 10, 1353, 9, 1372, 9,
+    1392, 8, 1411, 8, 1430, 7, 1449, 7, 1469,
+];
+
+/// A [`BinSink`] that prices bins instead of writing them, carrying its own
+/// copy of the context state so the adaptation inside the block is priced too.
+struct CostSink {
+    state: [u8; NUM_CTX],
+    /// 1/256ths of a bit.
+    bits: u32,
+}
+
+impl BinSink for CostSink {
+    fn bin(&mut self, ctx_idx: usize, bin: bool) {
+        let s = self.state[ctx_idx];
+        let p = usize::from(s >> 1);
+        let mps = s & 1 != 0;
+        self.bits += u32::from(BIN_COST[2 * p + usize::from(bin != mps)]);
+        self.state[ctx_idx] = if bin != mps {
+            let mps = if p == 0 { !mps } else { mps };
+            (crate::cabac_tables::TRANS_LPS[p] << 1) | u8::from(mps)
+        } else {
+            (crate::cabac_tables::TRANS_MPS[p] << 1) | u8::from(mps)
+        };
+    }
+    fn bypass_bin(&mut self, _bin: bool) {
+        self.bits += 256;
+    }
+}
+
+/// coded_block_flag, the significance map and the levels of one residual block
+/// (7.3.5.3.3), against a caller-derived coded_block_flag context.
+fn residual_bins<S: BinSink>(s: &mut S, coeff: &[i32], cat: BlockCat, cbf_ctx: usize) -> u8 {
+    let cat_i = cat.ctx_block_cat();
+    let max = cat.max_num_coeff();
+    let Some(last) = (0..max).rev().find(|&i| coeff[i] != 0) else {
+        s.bin(cbf_ctx, false);
+        return 0;
+    };
+    s.bin(cbf_ctx, true);
+
+    // Significance map. The decoder stops at the last significant position
+    // and infers the final coefficient, so nothing is written past `last`.
+    let sig_base = OFF_SIG + SIG_CAT_OFF[cat_i];
+    let last_base = OFF_LAST + SIG_CAT_OFF[cat_i];
+    for i in 0..max - 1 {
+        let inc = sig_inc(cat, i);
+        let significant = coeff[i] != 0;
+        s.bin(sig_base + inc, significant);
+        if significant {
+            s.bin(last_base + inc, i == last);
+            if i == last {
+                break;
+            }
+        }
+    }
+
+    levels_bins(s, coeff, last, OFF_ABS + ABS_CAT_OFF[cat_i], cat_i == 3)
+}
+
+/// The UEGk suffix of 9.3.2.3, all bypass bins.
+fn ueg_suffix_bins<S: BinSink>(s: &mut S, value: u32, k0: u32) {
+    let mut k = k0;
+    let mut v = value;
+    while v >= 1 << k {
+        s.bypass_bin(true);
+        v -= 1 << k;
+        k += 1;
+    }
+    s.bypass_bin(false);
+    while k > 0 {
+        k -= 1;
+        s.bypass_bin(v >> k & 1 != 0);
+    }
+}
+
+/// coeff_abs_level_minus1 and coeff_sign_flag of `coeff[..=last]`, highest
+/// scanning position first (9.3.3.1.3 counters). Returns the number of
+/// levels written.
+fn levels_bins<S: BinSink>(
+    s: &mut S,
+    coeff: &[i32],
+    last: usize,
+    abs_base: usize,
+    chroma_dc: bool,
+) -> u8 {
+    let mut num_eq1 = 0u32;
+    let mut num_gt1 = 0u32;
+    let mut total = 0u8;
+    for pos in (0..=last).rev() {
+        let level = coeff[pos];
+        if level == 0 {
+            continue;
+        }
+        let inc0 = if num_gt1 != 0 {
+            0
+        } else {
+            4.min(1 + num_eq1) as usize
+        };
+        let inc1 = 5 + (4 - u32::from(chroma_dc)).min(num_gt1) as usize;
+        let abs_minus1 = level.unsigned_abs() - 1;
+        let mut prefix = 0u32;
+        while prefix < 14 {
+            let ctx_idx = abs_base + if prefix == 0 { inc0 } else { inc1 };
+            if prefix < abs_minus1 {
+                s.bin(ctx_idx, true);
+                prefix += 1;
+            } else {
+                s.bin(ctx_idx, false);
+                break;
+            }
+        }
+        if abs_minus1 >= 14 {
+            ueg_suffix_bins(s, abs_minus1 - 14, 0);
+        }
+        s.bypass_bin(level < 0);
+        if abs_minus1 == 0 {
+            num_eq1 += 1;
+        } else {
+            num_gt1 += 1;
+        }
+        total += 1;
+    }
+    total
 }
 
 #[cfg(test)]
@@ -638,5 +744,45 @@ mod tests {
             assert_eq!(&got[..], &c[..], "block {i}");
             assert!(dec.more_macroblocks().expect("terminate"), "block {i} end");
         }
+    }
+    /// The price is the thing itself: `residual_block_cost` predicts what
+    /// `residual_block` then spends. A quantisation decision that trusts a
+    /// wrong price picks wrong levels, and the error would be invisible in the
+    /// stream — it only shows up as lost dB — so it is asserted here in
+    /// 1/256ths of a bit against the arithmetic coder's own output.
+    #[test]
+    fn residual_cost_predicts_the_bits_spent() {
+        let mut state = 0x1234_5678u32;
+        let mut rand = move |m: u32| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state % m
+        };
+        let mut enc = CabacEnc::new(BitWriter::new(), 26, 0);
+        let (mut predicted, mut spent) = (0i64, 0i64);
+        for _ in 0..400 {
+            let mut coeff = [0i32; 16];
+            let nz = rand(8);
+            for _ in 0..nz {
+                let i = rand(16) as usize;
+                let mag = 1 + rand(6) as i32 * rand(4) as i32;
+                coeff[i] = if rand(2) == 0 { mag } else { -mag };
+            }
+            let (na, nb) = (Some(rand(4) as u8), Some(rand(4) as u8));
+            let cost = enc.residual_block_cost(&coeff, BlockCat::Luma4x4, na, nb);
+            let before = enc.bit_len() * 256 + u64::from(enc.range.leading_zeros());
+            enc.residual_block(&coeff, BlockCat::Luma4x4, na, nb);
+            let after = enc.bit_len() * 256 + u64::from(enc.range.leading_zeros());
+            predicted += i64::from(cost);
+            spent += after as i64 - before as i64;
+        }
+        // Per block the arithmetic coder carries fractional bits across the
+        // boundary, so the claim is on the total: within 1%.
+        let err = (predicted - spent).abs();
+        assert!(
+            err * 100 < spent,
+            "predicted {predicted}/256 bits, spent {spent}/256"
+        );
     }
 }

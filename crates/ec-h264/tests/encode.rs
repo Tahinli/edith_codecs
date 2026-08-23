@@ -893,7 +893,11 @@ fn real_clip_t8x8_bd_psnr() {
 /// clip and 0.564 on the screen capture, and takes fewer bits at every QP
 /// while doing it. This clip prefers a heavier rate term in that decision
 /// (see the sweep in `enc/mb.rs`), which the two real clips do not.
-const BD_PSNR_VS_X264_FLOOR: f64 = -4.6;
+///
+/// It moved -4.523 -> -4.073 when inter luma levels started being chosen
+/// against the CABAC coder's own price for them (0.100 dB on the film clip,
+/// 0.029 on the screen capture).
+const BD_PSNR_VS_X264_FLOOR: f64 = -4.15;
 
 fn have_x264() -> bool {
     std::process::Command::new("ffmpeg")
