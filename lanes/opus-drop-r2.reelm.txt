@@ -1,0 +1,5 @@
+# ec-opus encoder vs ffmpeg libopus — encoders-only gate (r1)
+# both bitstreams decoded by ec-opus; 600s cap; VBR; 48kHz stereo
+# source	kbps	ours_kbps	ref_kbps	rate%	corr_ours	corr_ref	gap	Q_ours	Q_ref	err_ratio	minsec_ours	minsec_ref	drop_ours	drop_ref
+reelm	64	62.6	63.3	-1.1	0.9816	0.9859	+0.0043	-710.78	-392.46	2.682	0.9148	0.9100	0	0
+reelm	96	84.0	84.8	-1.0	0.9921	0.9920	-0.0001	-596.93	-231.16	3.604	0.9661	0.9511	0	0
