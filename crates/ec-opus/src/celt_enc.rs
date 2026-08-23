@@ -678,7 +678,7 @@ impl CeltEncoder {
         // `TF_ANALYSIS`: run the libopus Viterbi tf search when there are
         // enough bits; otherwise fall back to the no-analysis default (raw
         // `is_transient` per band codes "no tf change" under tf_select=0).
-        const TF_ANALYSIS: bool = false;
+        const TF_ANALYSIS: bool = true;
         let tf_select = if TF_ANALYSIS && effective_bytes >= 15 * c as i32 {
             let lambda = (80i32).max(20480 / effective_bytes + 2);
             let mut importance = [0i32; NB_BANDS];
