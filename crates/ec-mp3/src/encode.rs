@@ -630,7 +630,23 @@ impl Mp3Encode {
                 // the resolution a long block would have spent on the attack
                 // itself, and there is no pre-echo to hide when nothing
                 // precedes it.
-                let attack = here > 1e-9 && next > here * 8.0 + 1e-6;
+                // How much louder the next granule has to be to count as an
+                // attack. Swept against the worst 20 ms error-to-signal ratio
+                // on real music (`real_library_sweep_vs_lame`), because
+                // whole-file correlation cannot see pre-echo at all:
+                //
+                //     ratio   1.3    1.6    2      3      4      8
+                //     dl8a@128  -2.3   -3.3   -3.3   -3.3   -3.3   +1.1 dB
+                //     dl8a@192  -6.7   -6.7   -6.7   -7.8   -7.8   -4.2 dB
+                //
+                // Flat from 1.6 to 4 and then a cliff: at 8 a whole granule
+                // has to grow eightfold in total energy, which music does
+                // about once a minute -- one short granule in 9196, against
+                // libmp3lame's 88 over the same audio. Below 1.6 the extra
+                // short blocks start costing correlation without buying any
+                // more of the worst window back, so 4 sits at the cheap end
+                // of the flat part.
+                let attack = here > 1e-9 && next > here * 4.0 + 1e-6;
                 let block = match self.previous_block[ch] {
                     1 => 2,
                     2 if attack => 2,
