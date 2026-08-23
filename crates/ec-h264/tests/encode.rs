@@ -700,25 +700,13 @@ fn real_library_frames_encode_and_decode_exactly() {
     assert!(quality > 30.0, "luma PSNR {quality:.2} dB at 8 Mbit/s");
 }
 
-/// BD-PSNR of the opt-in `transform_8x8` flag against flag-off on one real
-/// clip from the library, full size, over a QP sweep: the number the synthetic
-/// gate above cannot give, because the synthetic clip is content the flag wins
-/// on. Prints the per-QP points, the BD-PSNR and the 8x8 macroblock share;
-/// asserts nothing, so a regressing clip fails a gate, not the test run.
-///
-///     EC_H264_CLIP=<file> cargo test --release -p ec-h264 --test encode \
-///         real_clip_t8x8_bd_psnr -- --ignored --nocapture
-#[test]
-#[ignore = "set EC_H264_CLIP to a media file of yours"]
-fn real_clip_t8x8_bd_psnr() {
+/// The first `want` pictures a second apart from one of the user's media
+/// files: demuxed by ec-mp4, decoded by this crate, every Nth frame with N the
+/// source frame rate. Returns the luma/chroma size and the pictures.
+fn clip_sources(path: &std::ffi::OsStr, want: usize) -> (usize, usize, Vec<Planes>) {
     use ec_core::registry::{Decoder as _, Demuxer as _};
 
-    let Some(path) = std::env::var_os("EC_H264_CLIP") else {
-        panic!("EC_H264_CLIP must name a media file");
-    };
-    // The first 30 pictures a second apart, demuxed by ec-mp4 and decoded by
-    // this crate: every Nth frame, N the source frame rate.
-    let file = std::fs::File::open(&path).expect("source opens");
+    let file = std::fs::File::open(path).expect("source opens");
     let mut demux =
         ec_mp4::Mp4Demuxer::new(std::io::BufReader::new(file)).expect("ec-mp4 opens the file");
     let (index, params) = demux
@@ -738,7 +726,7 @@ fn real_clip_t8x8_bd_psnr() {
     let mut dec = ec_h264::H264Decoder::new(params).expect("decoder");
     let mut sources: Vec<Planes> = Vec::new();
     let mut seen = 0usize;
-    while sources.len() < 30 {
+    while sources.len() < want {
         let Ok(packet) = demux.next_packet() else {
             break;
         };
@@ -747,7 +735,7 @@ fn real_clip_t8x8_bd_psnr() {
         }
         dec.send_packet(&packet).expect("decode");
         while let Ok(ec_core::frame::Frame::Video(f)) = dec.receive_frame() {
-            if sources.len() < 30 && seen % stride == 0 {
+            if sources.len() < want && seen % stride == 0 {
                 sources.push(planes_of(&f));
             }
             seen += 1;
@@ -766,6 +754,24 @@ fn real_clip_t8x8_bd_psnr() {
         h,
         sources.len()
     );
+    (w, h, sources)
+}
+
+/// BD-PSNR of the opt-in `transform_8x8` flag against flag-off on one real
+/// clip from the library, full size, over a QP sweep: the number the synthetic
+/// gate above cannot give, because the synthetic clip is content the flag wins
+/// on. Prints the per-QP points, the BD-PSNR and the 8x8 macroblock share;
+/// asserts nothing, so a regressing clip fails a gate, not the test run.
+///
+///     EC_H264_CLIP=<file> cargo test --release -p ec-h264 --test encode \
+///         real_clip_t8x8_bd_psnr -- --ignored --nocapture
+#[test]
+#[ignore = "set EC_H264_CLIP to a media file of yours"]
+fn real_clip_t8x8_bd_psnr() {
+    let Some(path) = std::env::var_os("EC_H264_CLIP") else {
+        panic!("EC_H264_CLIP must name a media file");
+    };
+    let (w, h, sources) = clip_sources(&path, 30);
 
     let run = |t8x8: bool, qp: i32| {
         let mut cfg = EncoderConfig::new(w as u32, h as u32);
@@ -806,4 +812,183 @@ fn real_clip_t8x8_bd_psnr() {
         "BD-PSNR flag-on vs flag-off over q22/26/30/34: {bd:+.3} dB, average 8x8 MB share {:.1}%",
         share * 100.0
     );
+}
+
+// ---------------------------------------------------------------------------
+// The encoder's rate-quality distance from x264: the survey's rank-1 gap,
+// because until this test existed the repo could measure our decoder against
+// every reference and our encoder against nothing but itself.
+// ---------------------------------------------------------------------------
+
+/// Floor for [`bd_psnr_vs_x264`] on the synthetic clip. Our encoder measured
+/// -2.442 dB against x264 there on 2026-08-23 (352x288, 24 pictures, both at
+/// their own default effort: our `Preset::Fast`, x264's `-preset medium`).
+/// The floor is that number with room for platform noise, so the distance can
+/// shrink but not grow unnoticed; it is not a claim that -2.4 dB is fine.
+const BD_PSNR_VS_X264_FLOOR: f64 = -2.60;
+
+fn have_x264() -> bool {
+    std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-hide_banner", "-encoders"])
+        .output()
+        .is_ok_and(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("libx264"))
+}
+
+/// Encode raw I420 pictures with x264 at constant QP, matched to what our
+/// encoder actually does: Main profile (CABAC, no 8x8 transform), one
+/// reference, no B pictures, the same GOP, and adaptive quantisation and psy
+/// off so both encoders spend bits by the same rule. Returns the Annex B
+/// stream.
+fn x264_encode_qp(sources: &[Planes], w: usize, h: usize, qp: i32) -> Option<Vec<u8>> {
+    let dir = std::env::temp_dir().join(format!("ec-h264-x264-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).ok()?;
+    let raw = dir.join(format!("in-q{qp}.yuv"));
+    let out = dir.join(format!("out-q{qp}.264"));
+    let mut buf = Vec::with_capacity(sources.len() * w * h * 3 / 2);
+    for (y, u, v) in sources {
+        buf.extend_from_slice(y);
+        buf.extend_from_slice(u);
+        buf.extend_from_slice(v);
+    }
+    std::fs::write(&raw, &buf).ok()?;
+    let status = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-y"])
+        .args(["-f", "rawvideo", "-pix_fmt", "yuv420p"])
+        .args(["-s", &format!("{w}x{h}"), "-r", "1"])
+        .arg("-i")
+        .arg(&raw)
+        .args(["-c:v", "libx264", "-preset", "medium"])
+        .args(["-profile:v", "main", "-qp", &qp.to_string()])
+        .args(["-g", "10", "-bf", "0", "-refs", "1"])
+        .args(["-x264-params", "scenecut=0:aq-mode=0:psy=0:8x8dct=0"])
+        .args(["-f", "h264"])
+        .arg(&out)
+        .output()
+        .ok()?;
+    let _ = std::fs::remove_file(&raw);
+    if !status.status.success() {
+        eprintln!("x264 failed: {}", String::from_utf8_lossy(&status.stderr));
+        return None;
+    }
+    let stream = std::fs::read(&out).ok()?;
+    let _ = std::fs::remove_file(&out);
+    Some(stream)
+}
+
+/// BD-PSNR of our encoder against x264 at matched features over QP
+/// 22/26/30/34. Runs on the synthetic clip by default, so the number cannot
+/// rot behind an `#[ignore]`; point `EC_H264_CLIP` at a media file to measure
+/// the same thing on real content.
+///
+/// Both curves are (bits, luma PSNR against the same source pictures). Ours
+/// uses the encoder's own reconstruction; x264's stream is decoded back with
+/// ffmpeg, so its PSNR is measured on what a decoder would actually show.
+///
+///     cargo test --release -p ec-h264 --test encode bd_psnr_vs_x264 -- --nocapture
+///     EC_H264_CLIP=<file> cargo test --release -p ec-h264 --test encode \
+///         bd_psnr_vs_x264 -- --nocapture
+#[test]
+fn bd_psnr_vs_x264() {
+    if !have_ffmpeg() || !have_x264() {
+        eprintln!(
+            "SKIP bd_psnr_vs_x264: no ffmpeg with libx264 on PATH. \
+             Install one, then: cargo test --release -p ec-h264 --test encode \
+             bd_psnr_vs_x264 -- --nocapture"
+        );
+        return;
+    }
+    let (w, h, sources) = match std::env::var_os("EC_H264_CLIP") {
+        Some(path) => clip_sources(&path, 24),
+        None => {
+            let (w, h, frames) = (352, 288, 24);
+            let mut clip = Clip::new(w, h);
+            let mut sources = Vec::with_capacity(frames);
+            for t in 0..frames {
+                clip.render(t);
+                sources.push((clip.y.clone(), clip.u.clone(), clip.v.clone()));
+            }
+            eprintln!("synthetic clip: {w}x{h}, {frames} pictures");
+            (w, h, sources)
+        }
+    };
+
+    let ours = |qp: i32| {
+        let mut cfg = EncoderConfig::new(w as u32, h as u32);
+        cfg.qp = qp;
+        cfg.gop_size = 10;
+        cfg.cabac = true;
+        cfg.framerate = 1.0;
+        cfg.threads = 0;
+        let mut enc = Encoder::new(cfg).expect("encoder");
+        let (mut stream, mut sum_recon) = (Vec::new(), 0.0);
+        for (y, u, v) in &sources {
+            let view = PictureView::i420(w as u32, h as u32, y, u, v);
+            stream.extend_from_slice(&enc.encode(&view).expect("encode").au);
+            sum_recon += psnr(y, &enc.reconstruction().expect("reconstruction").0);
+        }
+        // Measured the same way x264 is: on what a decoder shows, not on the
+        // encoder's own reconstruction. The two are printed together because a
+        // gap between them is a bug in one of the halves, not a rate-quality
+        // result.
+        let decoded = ffmpeg_decode(&stream, w, h, &[]).expect("ffmpeg decodes our stream");
+        assert_eq!(decoded.len(), sources.len(), "our encoder dropped pictures");
+        let sum: f64 = sources
+            .iter()
+            .zip(&decoded)
+            .map(|((y, _, _), (dy, _, _))| psnr(y, dy))
+            .sum();
+        let (decoded_psnr, recon_psnr) = (
+            sum / sources.len() as f64,
+            sum_recon / sources.len() as f64,
+        );
+        assert!(
+            (decoded_psnr - recon_psnr).abs() < 0.05,
+            "qp {qp}: our reconstruction reads {recon_psnr:.2} dB but our own \
+             stream decodes to {decoded_psnr:.2} dB"
+        );
+        ((stream.len() * 8) as f64, decoded_psnr)
+    };
+    let x264 = |qp: i32| {
+        let stream = x264_encode_qp(&sources, w, h, qp).expect("x264 encodes");
+        let decoded = ffmpeg_decode(&stream, w, h, &[]).expect("ffmpeg decodes x264's own stream");
+        assert_eq!(
+            decoded.len(),
+            sources.len(),
+            "x264 returned {} pictures for {} sources",
+            decoded.len(),
+            sources.len()
+        );
+        let sum: f64 = sources
+            .iter()
+            .zip(&decoded)
+            .map(|((y, _, _), (dy, _, _))| psnr(y, dy))
+            .sum();
+        ((stream.len() * 8) as f64, sum / sources.len() as f64)
+    };
+
+    let qps = [22, 26, 30, 34];
+    let mine: Vec<_> = qps.iter().map(|&q| ours(q)).collect();
+    let theirs: Vec<_> = qps.iter().map(|&q| x264(q)).collect();
+    for (i, &qp) in qps.iter().enumerate() {
+        let (ob, op) = mine[i];
+        let (xb, xp) = theirs[i];
+        eprintln!(
+            "qp {qp}: ours {ob:.0} bits {op:.2} dB | x264 {xb:.0} bits {xp:.2} dB \
+             ({:+.1}% bits, {:+.2} dB)",
+            (ob / xb - 1.0) * 100.0,
+            op - xp
+        );
+    }
+    let bd = bd_psnr_delta(&mine, &theirs);
+    eprintln!("BD-PSNR ours vs x264 over q22/26/30/34: {bd:+.3} dB");
+
+    // The floor is calibrated on the synthetic clip; a clip of the user's is a
+    // measurement, not a gate, because its content is not pinned.
+    if std::env::var_os("EC_H264_CLIP").is_none() {
+        assert!(
+            bd > BD_PSNR_VS_X264_FLOOR,
+            "BD-PSNR against x264 fell to {bd:+.3} dB, past the \
+             {BD_PSNR_VS_X264_FLOOR:+.3} dB floor"
+        );
+    }
 }
