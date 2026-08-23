@@ -58,6 +58,48 @@ impl Clip {
         }
     }
 
+    /// Frame `t` without the per-sample noise field: smooth gradients, a
+    /// band of sinusoidal texture and a box translating by whole and
+    /// sub-sample amounts. `render`'s noise is incompressible, which makes a
+    /// rate-quality comparison read mostly as how willing each encoder is to
+    /// throw residual away; this one is content where prediction matters, the
+    /// half a rate-quality comparison is about.
+    fn render_smooth(&mut self, t: usize) {
+        let (w, h) = (self.w, self.h);
+        let ft = t as f64;
+        for y in 0..h {
+            for x in 0..w {
+                let (fx, fy) = (x as f64, y as f64);
+                // A slow diagonal ramp that drifts by 1.5 samples a frame, so
+                // motion is not always on the sample grid.
+                let ramp = (fx + fy * 0.5 - ft * 1.5) * 0.35;
+                // A textured band, the part a search has to actually find.
+                let texture = if y > h / 3 && y < 2 * h / 3 {
+                    18.0 * ((fx * 0.19 + ft * 0.9).sin() + (fy * 0.11).cos())
+                } else {
+                    0.0
+                };
+                let box_x = ((ft * 2.7) as usize) % (w.saturating_sub(48).max(1));
+                let inside = x >= box_x && x < box_x + 48 && y >= h / 5 && y < h / 5 + 36;
+                let v = if inside {
+                    196.0 - texture * 0.5
+                } else {
+                    40.0 + (ramp % 90.0).abs() + texture
+                };
+                self.y[y * w + x] = v.clamp(0.0, 255.0) as u8;
+            }
+        }
+        for y in 0..h / 2 {
+            for x in 0..w / 2 {
+                let (fx, fy) = (x as f64, y as f64);
+                self.u[y * (w / 2) + x] =
+                    (118.0 + 12.0 * ((fx * 0.05 + ft * 0.3).sin())).clamp(0.0, 255.0) as u8;
+                self.v[y * (w / 2) + x] =
+                    (134.0 + 10.0 * ((fy * 0.04 - ft * 0.25).cos())).clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+
     fn view(&self) -> PictureView<'_> {
         PictureView::i420(self.w as u32, self.h as u32, &self.y, &self.u, &self.v)
     }
@@ -821,11 +863,12 @@ fn real_clip_t8x8_bd_psnr() {
 // ---------------------------------------------------------------------------
 
 /// Floor for [`bd_psnr_vs_x264`] on the synthetic clip. Our encoder measured
-/// -2.640 dB against x264 there on 2026-08-23 (352x288, 24 pictures, both at
-/// their own default effort: our `Preset::Fast`, x264's `-preset medium`).
-/// The floor is that number with room for platform noise, so the distance can
-/// shrink but not grow unnoticed; it is not a claim that -2.6 dB is fine.
-const BD_PSNR_VS_X264_FLOOR: f64 = -2.80;
+/// -5.202 dB against x264 there on 2026-08-23 (352x288, 24 pictures of
+/// `Clip::render_smooth`, both encoders at their own default effort: our
+/// `Preset::Fast`, x264's `-preset medium`). The floor is that number with
+/// room for platform noise, so the distance can shrink but not grow
+/// unnoticed; it is not a claim that -5.2 dB is fine.
+const BD_PSNR_VS_X264_FLOOR: f64 = -5.40;
 
 fn have_x264() -> bool {
     std::process::Command::new("ffmpeg")
@@ -896,6 +939,11 @@ fn x264_encode_qp(sources: &[Planes], w: usize, h: usize, qp: i32, gop: u32) -> 
 /// clip at GOP 10 is -2.992 dB (+19% bits), so roughly two thirds of the
 /// distance is in P pictures, not in the intra path.
 ///
+/// `EC_H264_PRESET_BALANCED` runs our half of the comparison at
+/// `Preset::Balanced` instead of the default `Preset::Fast`, which separates
+/// what search effort buys from what the coder itself costs: on the same
+/// library clip it moves -2.992 dB to -1.587 dB for 40% more encode time.
+///
 ///     cargo test --release -p ec-h264 --test encode bd_psnr_vs_x264 -- --nocapture
 ///     EC_H264_CLIP=<file> cargo test --release -p ec-h264 --test encode \
 ///         bd_psnr_vs_x264 -- --nocapture
@@ -916,7 +964,7 @@ fn bd_psnr_vs_x264() {
             let mut clip = Clip::new(w, h);
             let mut sources = Vec::with_capacity(frames);
             for t in 0..frames {
-                clip.render(t);
+                clip.render_smooth(t);
                 sources.push((clip.y.clone(), clip.u.clone(), clip.v.clone()));
             }
             eprintln!("synthetic clip: {w}x{h}, {frames} pictures");
@@ -932,6 +980,9 @@ fn bd_psnr_vs_x264() {
         let mut cfg = EncoderConfig::new(w as u32, h as u32);
         cfg.qp = qp;
         cfg.gop_size = gop;
+        if std::env::var_os("EC_H264_PRESET_BALANCED").is_some() {
+            cfg.preset = ec_h264::Preset::Balanced;
+        }
         cfg.cabac = true;
         cfg.framerate = 1.0;
         cfg.threads = 0;
