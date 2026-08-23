@@ -935,15 +935,14 @@ impl VorbisEncoder {
 /// the whole spectrum is covered exactly once and a peak between two points
 /// still raises the floor that has to carry it.
 ///
-/// E2 (lane-vorbis-floor r2): returns the per-region geometric mean of |bin|
-/// (≡ mean dB) **plus `ENVELOPE_MARGIN_DB`** — halfway between the pure
-/// envelope (E1, too low → clamp-lift saturation) and the peak (baseline,
-/// too high → sparse large q).  The margin lifts the floor enough that the
-/// loudest bins in each region stay within the residue-book range without the
-/// refit loop, while quieter bins still get a small non-zero q.
+/// E3 (lane-vorbis-floor r2): returns the per-region **RMS** of |bin| instead
+/// of the max.  RMS sits between the geometric mean (E1, dominated by
+/// noise-floor bins → too low) and the peak (baseline, follows only the
+/// loudest bin).  Tried because E1/E2 moved the gap (in the wrong direction):
+/// the trend k=0→6→12→peak was monotonically better, so RMS is expected to
+/// land above geomean but still below peak.
 fn peaks_of(floor: &Floor1, half: usize, spectra: &[&Vec<f32>]) -> Vec<f64> {
     let x = &floor.x_list;
-    let margin = 10.0_f64.powf(ENVELOPE_MARGIN_DB / 20.0);
     x.iter()
         .map(|&centre| {
             let below = x.iter().filter(|&&o| o < centre).max().copied();
@@ -952,15 +951,15 @@ fn peaks_of(floor: &Floor1, half: usize, spectra: &[&Vec<f32>]) -> Vec<f64> {
             let hi = above.map_or(half, |a| ((a + centre) / 2) as usize + 1);
             let lo = lo.min(half - 1);
             let hi = hi.clamp(lo + 1, half);
-            let mut sum_log = 0.0f64;
+            let mut sum_sq = 0.0f64;
             let mut count = 0usize;
             for spectrum in spectra {
                 for &value in &spectrum[lo..hi] {
-                    sum_log += f64::from(value.abs()).max(1e-9).ln();
+                    sum_sq += f64::from(value) * f64::from(value);
                     count += 1;
                 }
             }
-            (sum_log / count as f64).exp() * margin
+            (sum_sq / count as f64).sqrt()
         })
         .collect()
 }
