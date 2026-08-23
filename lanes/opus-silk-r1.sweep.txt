@@ -1,0 +1,8 @@
+# ec-opus SILK/speech-rate gate vs ffmpeg libopus (r1)
+# mono, 120s cap, VBR, 48kHz, Application::Voip; source sadie.wav
+12k-NB: mode=SILK-NB, ref 12.0 ours 12.4 kbps (+3.3%), corr o=0.8489 r=0.8181 gap=-0.0308, Q o=-821.15 r=-401.54, err_ratio 3.532, minsec o=0.2408 r=0.2079, drop o=67 r=69
+16k-NB: mode=SILK-NB, ref 16.4 ours 16.8 kbps (+2.4%), corr o=0.8665 r=0.8205 gap=-0.0460, Q o=-725.78 r=-416.74, err_ratio 2.573, minsec o=0.2420 r=0.2861, drop o=63 r=73
+24k-WB: mode=SILK-WB, ref 24.0 ours 24.4 kbps (+1.7%), corr o=0.9168 r=0.8409 gap=-0.0759, Q o=-861.98 r=-367.31, err_ratio 4.452, minsec o=0.5591 r=0.3300, drop o=40 r=71
+32k-Hyb: mode=Hybrid-FB, ref 31.8 ours 31.6 kbps (-0.5%), corr o=0.9279 r=0.8541 gap=-0.0738, Q o=-939.95 r=-434.68, err_ratio 4.343, minsec o=0.6284 r=0.3680, drop o=33 r=65
+RATE GATE: all rows within ±5%
+DROPOUT GATE: passed (no ours-only dropouts)

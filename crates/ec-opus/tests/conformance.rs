@@ -3240,6 +3240,233 @@ fn encoder_library_gate_vs_libopus() {
 }
 
 // ---------------------------------------------------------------------------
+// SILK / speech-rate library gate vs libopus (lane opus-silk r1).
+//
+// Source: ~/Music/sadie.wav (real interview speech) downmixed to MONO. Rows:
+// 12k NB, 16k NB, 24k WB (SILK), 32k hybrid. Ours via Encoder::new(48000, 1,
+// Application::Voip) with set_bitrate and set_bandwidth/set_mode as needed so
+// Voip really picks SILK/Hybrid — the mode each row took is printed from the
+// first packet's TOC config byte (RFC 6716 §3.1). Reference: ffmpeg libopus
+// -application voip -b:a <rate>, mono, VBR on. RATE GATE ±5%, DROPOUT GATE.
+// SIGN RULE (verbatim): gap = ref_corr - ours_corr; MORE NEGATIVE = OURS BETTER.
+// Run: cargo test -p ec-opus --release --test conformance \
+//      silk_library_gate_vs_libopus -- --ignored --nocapture
+// ---------------------------------------------------------------------------
+
+/// Mode label from a packet's TOC config byte (RFC 6716 §3.1): config = toc>>3.
+fn toc_mode_label(toc: u8) -> &'static str {
+    match toc >> 3 {
+        0..=3 => "SILK-NB",
+        4..=7 => "SILK-MB",
+        8..=11 => "SILK-WB",
+        12 | 13 => "Hybrid-SWB",
+        14 | 15 => "Hybrid-FB",
+        16..=31 => "CELT",
+        _ => "??",
+    }
+}
+
+// corner-cut: near-duplicate of ffmpeg_decode_pcm / ffmpeg_encode_libopus with
+// -ac 1 and -application voip. Parameterising the existing helpers would touch
+// the stereo gate's callsites; keep this lane self-contained. Ceiling: only the
+// SILK gate needs mono voip — merge when a second mono consumer appears.
+/// Decode any source into interleaved f32, 48 kHz, MONO, capped at `secs`.
+fn ffmpeg_decode_pcm_mono(path: &Path, secs: f64) -> Vec<f32> {
+    let out = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args([
+            "-vn", "-t", &format!("{secs}"), "-ac", "1", "-ar", "48000", "-f", "f32le",
+            "-acodec", "pcm_f32le", "-",
+        ])
+        .output()
+        .expect("ffmpeg runs");
+    assert!(
+        out.status.success(),
+        "ffmpeg mono decode failed for {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.stdout
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect()
+}
+
+/// Encode `src` to a mono Ogg/Opus file with ffmpeg libopus, VoIP application,
+/// at `kbps` (VBR on), capped at `secs`. Realised rate read back from file size.
+fn ffmpeg_encode_libopus_mono_voip(src: &Path, kbps: u32, out: &Path, secs: f64) {
+    let res = Command::new("ffmpeg")
+        .args(["-y", "-v", "error", "-i"])
+        .arg(src)
+        .args([
+            "-vn", "-t", &format!("{secs}"), "-ac", "1", "-ar", "48000", "-c:a", "libopus",
+            "-application", "voip", "-b:a", &format!("{kbps}k"), "-vbr", "on",
+        ])
+        .arg(out)
+        .output()
+        .expect("ffmpeg runs");
+    assert!(
+        res.status.success(),
+        "ffmpeg libopus mono voip encode failed at {kbps}k: {}",
+        String::from_utf8_lossy(&res.stderr)
+    );
+}
+
+#[test]
+#[ignore]
+fn silk_library_gate_vs_libopus() {
+    const SECS: f64 = 120.0; // 2 min cap
+    const FRAME: usize = 960; // 20 ms at 48 kHz
+    const CHANNELS: usize = 1; // MONO
+    const MAX_LAG: usize = 2000;
+
+    let src = shellexpand("~/Music/sadie.wav");
+    assert!(src.exists(), "source missing: {}", src.display());
+
+    let lanes_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lanes");
+    fs::create_dir_all(&lanes_dir).unwrap();
+    let sweep_path = lanes_dir.join("opus-silk-r1.sweep.txt");
+    let scratch = lanes_dir.join("opus-silk-r1.scratch.ogg");
+
+    // Source PCM: mono, 48 kHz.
+    let source_pcm = ffmpeg_decode_pcm_mono(&src, SECS);
+    let source_frames = source_pcm.len() / CHANNELS;
+    assert!(source_frames > 48_000, "source too short");
+    let seconds = source_frames as f64 / 48000.0;
+    let source_i16 = to_i16(&source_pcm);
+
+    // (label, kbps, forced bandwidth, forced mode). mode/bw chosen so Voip at
+    // these rates really codes SILK/Hybrid, not CELT (see wants_silk/
+    // hybrid_choice): 12k auto-NB, 16k forced-NB (auto would pick MB), 24k
+    // forced-Silk+Wide (auto would pick hybrid), 32k auto-hybrid.
+    let rows: &[(&str, u32, Option<Bandwidth>, Option<Mode>)] = &[
+        ("12k-NB", 12, None, None),
+        ("16k-NB", 16, Some(Bandwidth::Narrow), None),
+        ("24k-WB", 24, Some(Bandwidth::Wide), Some(Mode::Silk)),
+        ("32k-Hyb", 32, None, None),
+    ];
+
+    let mut out_rows: Vec<String> = Vec::new();
+    let mut rate_violations: Vec<String> = Vec::new();
+    let mut dropout_violations: Vec<String> = Vec::new();
+
+    for &(tag, kbps, bw, mode) in rows {
+        // Reference: ffmpeg libopus, mono, voip, VBR; realised rate from size.
+        ffmpeg_encode_libopus_mono_voip(&src, kbps, &scratch, SECS);
+        let ref_bytes = fs::metadata(&scratch).map(|m| m.len() as usize).unwrap_or(0);
+        let ref_kbps = ref_bytes as f64 * 8.0 / seconds / 1000.0;
+        let (ref_dec, ref_ch) = decode_ogg(&scratch);
+        assert_eq!(ref_ch, CHANNELS, "{tag}: ref not mono");
+        let (_, ref_aligned) = align_to_source(&source_pcm, &ref_dec, CHANNELS, MAX_LAG);
+
+        // Ours: ec-opus Voip at the reference's realised rate.
+        let mut enc = Encoder::new(48000, CHANNELS, Application::Voip).expect("encoder");
+        enc.set_bitrate((ref_kbps * 1000.0).round() as u32);
+        if let Some(b) = bw {
+            enc.set_bandwidth(Some(b));
+        }
+        if let Some(m) = mode {
+            enc.set_mode(Some(m));
+        }
+        enc.set_vbr_constrained(true);
+
+        // Probe which mode the encoder actually picked, from the first TOC byte.
+        let mut probe = enc.clone();
+        let mut toc_buf = [0u8; 1500];
+        probe
+            .encode_float(&source_pcm[..FRAME * CHANNELS], FRAME, &mut toc_buf)
+            .expect("encode probe");
+        let mode_label = toc_mode_label(toc_buf[0]);
+
+        let (ours_dec, ours_bytes) = roundtrip_own(&mut enc, &source_pcm, CHANNELS, FRAME);
+        let ours_kbps = ours_bytes as f64 * 8.0 / seconds / 1000.0;
+        let ours_trim: Vec<f32> = ours_dec.into_iter().take(source_frames * CHANNELS).collect();
+        let (_, ours_aligned) = align_to_source(&source_pcm, &ours_trim, CHANNELS, MAX_LAG);
+        let ours_i16 = to_i16(&ours_aligned);
+        let ref_i16 = to_i16(&ref_aligned);
+
+        let cmp_frames = (source_i16.len() / CHANNELS)
+            .min(ours_i16.len() / CHANNELS)
+            .min(ref_i16.len() / CHANNELS);
+        let trim = |v: &[i16]| -> Vec<i16> { v[..cmp_frames * CHANNELS].to_vec() };
+        let s_i = trim(&source_i16);
+        let o_i = trim(&ours_i16);
+        let r_i = trim(&ref_i16);
+        let q_ours = opus_compare(&s_i, &o_i, CHANNELS);
+        let q_ref = opus_compare(&s_i, &r_i, CHANNELS);
+        let err_ours = opus_compare_err(&s_i, &o_i, CHANNELS);
+        let err_ref = opus_compare_err(&s_i, &r_i, CHANNELS);
+        let err_ratio = if err_ref > 0.0 { err_ours / err_ref } else { f64::INFINITY };
+
+        let corr_ours = corr_interleaved(&source_pcm, &ours_aligned, CHANNELS);
+        let corr_ref = corr_interleaved(&source_pcm, &ref_aligned, CHANNELS);
+        let gap = corr_ref - corr_ours;
+        let (minsec_ours, drop_ours) = per_second_corr(&source_pcm, &ours_aligned, CHANNELS);
+        let (minsec_ref, drop_ref) = per_second_corr(&source_pcm, &ref_aligned, CHANNELS);
+        let rate_pct = (ours_kbps / ref_kbps - 1.0) * 100.0;
+
+        if rate_pct.abs() > 5.0 {
+            rate_violations.push(format!("{tag}: rate {rate_pct:+.1}% (|>5%)"));
+        }
+        if drop_ours > 0 && drop_ref == 0 {
+            dropout_violations.push(format!(
+                "{tag}: ours dropped {drop_ours}s below 0.9 corr, ref 0s"
+            ));
+        }
+        let row = format!(
+            "{tag}: mode={mode_label}, ref {ref_kbps:.1} ours {ours_kbps:.1} kbps ({rate_pct:+.1}%), \
+             corr o={corr_ours:.4} r={corr_ref:.4} gap={gap:+.4}, \
+             Q o={q_ours:.2} r={q_ref:.2}, err_ratio {err_ratio:.3}, \
+             minsec o={minsec_ours:.4} r={minsec_ref:.4}, drop o={drop_ours} r={drop_ref}"
+        );
+        println!("{row}");
+        out_rows.push(row);
+    }
+    let _ = fs::remove_file(&scratch);
+
+    // Rate gate: report violations, never panic.
+    let rate_gate = if rate_violations.is_empty() {
+        "RATE GATE: all rows within ±5%".to_string()
+    } else {
+        let mut s = "RATE GATE violations (|rate%| > 5):".to_string();
+        for v in &rate_violations {
+            s.push_str("\n  ");
+            s.push_str(v);
+        }
+        s
+    };
+    if rate_violations.is_empty() {
+        println!("{rate_gate}");
+    } else {
+        eprintln!("{rate_gate}");
+    }
+    // Dropout gate: hard fail — a second the reference kept must not drop out.
+    assert!(
+        dropout_violations.is_empty(),
+        "DROPOUT GATE failed (ours dropped seconds ref kept):\n  {}",
+        dropout_violations.join("\n  ")
+    );
+    let drop_gate = "DROPOUT GATE: passed (no ours-only dropouts)";
+    println!("{drop_gate}");
+
+    // Sweep file: raw rows + GATE lines (lane deliverable).
+    let mut table = String::new();
+    table.push_str("# ec-opus SILK/speech-rate gate vs ffmpeg libopus (r1)\n");
+    table.push_str("# mono, 120s cap, VBR, 48kHz, Application::Voip; source sadie.wav\n");
+    for r in &out_rows {
+        table.push_str(r);
+        table.push('\n');
+    }
+    table.push_str(&rate_gate);
+    table.push('\n');
+    table.push_str(drop_gate);
+    table.push('\n');
+    fs::write(&sweep_path, table).unwrap();
+    println!("wrote {}", sweep_path.display());
+}
+
+// ---------------------------------------------------------------------------
 // Harness: feed identical raw PCM (.sw, s16le interleaved) to our opus_compare
 // so it can be checked against the C `opus_compare` tool on the SAME bytes.
 // Run: SW_REF=a.sw SW_TEST=b.sw SW_CH=2 cargo test -p ec-opus --release \
