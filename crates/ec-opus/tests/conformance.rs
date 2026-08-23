@@ -3587,6 +3587,212 @@ fn silk_library_gate_vs_libopus() {
 }
 
 // ---------------------------------------------------------------------------
+// Per-second SILK diagnostic: sadie@12k VoIP encoder decisions vs libopus.
+// Names the mechanism behind the 12k corr gap by per-second SILK frame facts.
+// Run:
+//   cargo test -p ec-opus --release --test conformance silk_silkq_persecond_diag -- --ignored --nocapture
+// Writes lanes/opus-silkq-r1.seconds.txt.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore]
+fn silk_silkq_persecond_diag() {
+    const SECS: f64 = 120.0;
+    const FRAME: usize = 960; // 20 ms at 48 kHz
+    const CHANNELS: usize = 1; // MONO
+    const MAX_LAG: usize = 2000;
+    const KBPS: u32 = 12;
+
+    let src = shellexpand("~/Music/sadie.wav");
+    assert!(src.exists(), "source missing: {}", src.display());
+    let source_pcm = ffmpeg_decode_pcm_mono(&src, SECS);
+    let source_frames = source_pcm.len() / CHANNELS;
+    assert!(source_frames > 48_000, "source too short");
+    let seconds = source_frames as f64 / 48000.0;
+
+    let lanes_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lanes");
+    fs::create_dir_all(&lanes_dir).unwrap();
+    let ref_ogg = temp_path("opus-silkq-r1-ref.opus");
+
+    // Reference: ffmpeg libopus mono voip VBR at 12k; realised rate from size.
+    ffmpeg_encode_libopus_mono_voip(&src, KBPS, &ref_ogg, SECS);
+    let ref_bytes = fs::metadata(&ref_ogg).map(|m| m.len() as usize).unwrap_or(0);
+    let ref_kbps = ref_bytes as f64 * 8.0 / seconds / 1000.0;
+    let ref_dec = ffmpeg_decode(&ref_ogg, CHANNELS).expect("ffmpeg libopus decode of ref");
+    let ref_trim: Vec<f32> = ref_dec.into_iter().take(source_frames * CHANNELS).collect();
+    let (_, ref_aligned) = align_to_source(&source_pcm, &ref_trim, CHANNELS, MAX_LAG);
+    let ref_ogg_bytes = fs::read(&ref_ogg).expect("read ref ogg");
+    let ref_payload: Vec<usize> = ogg_packets(&ref_ogg_bytes)
+        .into_iter()
+        .skip(2) // skip opus_head + opus_comment
+        .filter(|p| !p.is_empty())
+        .map(|p| p.len())
+        .collect();
+    let _ = fs::remove_file(&ref_ogg);
+
+    // Ours: ec-opus Voip at the reference's realised rate, collecting per-frame
+    // SILK diag. Bitrate matches the gate (ref_kbps*1000 rounded).
+    let mut enc = Encoder::new(48000, CHANNELS, Application::Voip).expect("encoder");
+    enc.set_bitrate((ref_kbps * 1000.0).round() as u32);
+    enc.set_vbr_constrained(true);
+    let mut dec = Decoder::new(48000, CHANNELS).unwrap();
+    let mut out = vec![0u8; 1500];
+    let mut buf = vec![0.0f32; 5760 * CHANNELS];
+    let mut padded = Vec::new();
+    let mut ours_dec = Vec::new();
+    let mut diags: Vec<ec_opus::SilkFrameDiag> = Vec::new();
+    let mut ours_bytes: Vec<usize> = Vec::new();
+
+    for block in source_pcm.chunks(FRAME * CHANNELS) {
+        let block = if block.len() < FRAME * CHANNELS {
+            padded.clear();
+            padded.extend_from_slice(block);
+            padded.resize(FRAME * CHANNELS, 0.0);
+            &padded[..]
+        } else {
+            block
+        };
+        let len = enc.encode_float(block, FRAME, &mut out).expect("encode");
+        let d = enc.last_silk_diag().cloned();
+        ours_bytes.push(len);
+        if let Some(d) = d { diags.push(d); }
+        let n = dec.decode_float(&out[..len], &mut buf).expect("decode");
+        ours_dec.extend_from_slice(&buf[..n * CHANNELS]);
+    }
+    let ours_trim: Vec<f32> = ours_dec.into_iter().take(source_frames * CHANNELS).collect();
+    let (_, ours_aligned) = align_to_source(&source_pcm, &ours_trim, CHANNELS, MAX_LAG);
+
+    // Per-second correlation ours vs ref against the full-band source (matches
+    // the gate's corr_bl for the 12k auto-mode row: no lowpass).
+    let n_frames = source_frames
+        .min(ours_aligned.len() / CHANNELS)
+        .min(ref_aligned.len() / CHANNELS);
+    let sec_samples = 48000usize;
+    let frames_per_sec = sec_samples / FRAME; // 50
+
+    let mut sec_rows: Vec<(usize, f64, f64, f64)> = Vec::new(); // (sec, corr_o, corr_r, gap)
+    let mut start = 0usize;
+    let mut sec_idx = 0usize;
+    while start + sec_samples <= n_frames {
+        let (mut sxy_o, mut sxx_o, mut syy_o) = (0.0f64, 0.0f64, 0.0f64);
+        let (mut sxy_r, mut sxx_r, mut syy_r) = (0.0f64, 0.0f64, 0.0f64);
+        for i in 0..sec_samples {
+            let s = source_pcm[start + i] as f64;
+            let o = ours_aligned[start + i] as f64;
+            let r = ref_aligned[start + i] as f64;
+            sxy_o += s * o; sxx_o += s * s; syy_o += o * o;
+            sxy_r += s * r; sxx_r += s * s; syy_r += r * r;
+        }
+        let co = if sxx_o > 0.0 && syy_o > 0.0 { sxy_o / (sxx_o * syy_o).sqrt() } else { 0.0 };
+        let cr = if sxx_r > 0.0 && syy_r > 0.0 { sxy_r / (sxx_r * syy_r).sqrt() } else { 0.0 };
+        sec_rows.push((sec_idx, co, cr, cr - co));
+        start += sec_samples;
+        sec_idx += 1;
+    }
+
+    let mut sorted = sec_rows.clone();
+    sorted.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap());
+
+    let mut out_str = String::new();
+    out_str.push_str("# sadie@12k SILK per-second diagnostic (r1)\n");
+    out_str.push_str("# mono, 120s cap, 20ms frames, VBR constrained, 48kHz, Application::Voip\n");
+    out_str.push_str(&format!("# total frames: ours={} ref={}\n", diags.len(), ref_payload.len()));
+    let avg_o: f64 = sec_rows.iter().map(|r| r.1).sum::<f64>() / sec_rows.len().max(1) as f64;
+    let avg_r: f64 = sec_rows.iter().map(|r| r.2).sum::<f64>() / sec_rows.len().max(1) as f64;
+    let gap_avg = avg_r - avg_o;
+    out_str.push_str(&format!(
+        "# avg corr: ours={:.4} ref={:.4} gap={:+.4}  ref_kbps={:.1} ours_kbps={:.1}\n\n",
+        avg_o, avg_r, gap_avg, ref_kbps,
+        ours_bytes.iter().map(|&b| b as f64).sum::<f64>() * 8.0 / seconds / 1000.0
+    ));
+
+    // Per-second summary table.
+    out_str.push_str("# sec\tcorr_o\tcorr_r\tgap\tgain_idx_mean\tvoiced_n\tnlsf_interp\tavg_B_o\tavg_B_r\tltp_gain_mean\tpitch_l_mean\n");
+    for &(s, co, cr, g) in &sec_rows {
+        let f0 = s * frames_per_sec;
+        let f1 = ((s + 1) * frames_per_sec).min(diags.len());
+        let sd = &diags[f0..f1.min(diags.len())];
+        let gain_mean: f64 = if !sd.is_empty() {
+            sd.iter().map(|d| d.gain_idx[0] as f64).sum::<f64>() / sd.len() as f64
+        } else { -1.0 };
+        let voiced_n = sd.iter().filter(|d| d.voiced).count();
+        let nlsf_int = if !sd.is_empty() {
+            sd.iter().map(|d| d.nlsf_interp).max().unwrap_or(0)
+        } else { 0 };
+        let avg_b_o: f64 = if !sd.is_empty() {
+            sd.iter().map(|d| d.bytes as f64).sum::<f64>() / sd.len() as f64
+        } else { 0.0 };
+        let ref_f0 = f0.min(ref_payload.len());
+        let ref_f1 = f1.min(ref_payload.len());
+        let avg_b_r: f64 = if ref_f1 > ref_f0 {
+            ref_payload[ref_f0..ref_f1].iter().map(|&b| b as f64).sum::<f64>()
+                / (ref_f1 - ref_f0) as f64
+        } else { 0.0 };
+        let ltp_mean: f64 = if !sd.is_empty() {
+            sd.iter().map(|d| d.ltp_gain as f64).sum::<f64>() / sd.len() as f64
+        } else { 0.0 };
+        let pitch_mean: f64 = if !sd.is_empty() {
+            sd.iter().filter(|d| d.voiced).map(|d| d.pitch_l[0] as f64).sum::<f64>()
+                / sd.iter().filter(|d| d.voiced).count().max(1) as f64
+        } else { 0.0 };
+        out_str.push_str(&format!(
+            "{}\t{:.4}\t{:.4}\t{:+.4}\t{:.1}\t{}\t{}\t{:.1}\t{:.1}\t{:.3}\t{:.1}\n",
+            s, co, cr, g, gain_mean, voiced_n, nlsf_int, avg_b_o, avg_b_r, ltp_mean, pitch_mean
+        ));
+    }
+
+    // Top 10 worst seconds by gap with per-frame SILK diag.
+    out_str.push_str("\n# --- 10 worst seconds by gap (per-frame SILK diag) ---\n");
+    out_str.push_str("# frame\tt_ms\tB_o\tB_r\tvoiced\tsig_type\tgain[0]\tlag_idx\tpitch_l\tnlsf_int\tltp_gain\tnb_subfr\n");
+    for &(s, _co, _cr, g) in sorted.iter().take(10) {
+        let f0 = s * frames_per_sec;
+        let f1 = ((s + 1) * frames_per_sec).min(diags.len());
+        out_str.push_str(&format!("# second {} gap={:+.4}\n", s, g));
+        for fi in f0..f1.min(diags.len()) {
+            let d = &diags[fi];
+            let b_ref = ref_payload.get(fi).copied().unwrap_or(0);
+            out_str.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{}\n",
+                fi, fi * 20, d.bytes, b_ref,
+                d.voiced as u8, d.signal_type, d.gain_idx[0], d.lag_index,
+                d.pitch_l[0], d.nlsf_interp, d.ltp_gain, d.nb_subfr
+            ));
+        }
+        out_str.push('\n');
+    }
+
+    // Global stats.
+    out_str.push_str("# --- global stats ---\n");
+    let voiced_count = diags.iter().filter(|d| d.voiced).count();
+    out_str.push_str(&format!("# voiced frames: {}/{}\n", voiced_count, diags.len()));
+    let gain_hist: Vec<(i8, usize)> = {
+        let mut h = std::collections::HashMap::new();
+        for d in &diags { *h.entry(d.gain_idx[0]).or_insert(0) += 1; }
+        let mut v: Vec<_> = h.into_iter().collect();
+        v.sort();
+        v
+    };
+    out_str.push_str(&format!("# gain_idx[0] histogram: {:?}\n", gain_hist));
+    let nlsf_hist: Vec<(i32, usize)> = {
+        let mut h = std::collections::HashMap::new();
+        for d in &diags { *h.entry(d.nlsf_interp).or_insert(0) += 1; }
+        let mut v: Vec<_> = h.into_iter().collect();
+        v.sort();
+        v
+    };
+    out_str.push_str(&format!("# nlsf_interp histogram: {:?}\n", nlsf_hist));
+    let avg_b_ours: f64 = diags.iter().map(|d| d.bytes as f64).sum::<f64>() / diags.len().max(1) as f64;
+    let avg_b_ref: f64 = ref_payload.iter().map(|&b| b as f64).sum::<f64>() / ref_payload.len().max(1) as f64;
+    out_str.push_str(&format!("# avg bytes/frame: ours={:.1} ref={:.1}\n", avg_b_ours, avg_b_ref));
+    let ltp_mean_all: f64 = diags.iter().map(|d| d.ltp_gain as f64).sum::<f64>() / diags.len().max(1) as f64;
+    out_str.push_str(&format!("# mean ltp_gain: {:.4}\n", ltp_mean_all));
+
+    let out_path = lanes_dir.join("opus-silkq-r1.seconds.txt");
+    fs::write(&out_path, out_str).unwrap();
+    println!("wrote {}", out_path.display());
+}
+
+// ---------------------------------------------------------------------------
 // Harness: feed identical raw PCM (.sw, s16le interleaved) to our opus_compare
 // so it can be checked against the C `opus_compare` tool on the SAME bytes.
 // Run: SW_REF=a.sw SW_TEST=b.sw SW_CH=2 cargo test -p ec-opus --release \

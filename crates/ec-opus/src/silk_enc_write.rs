@@ -76,6 +76,7 @@ pub struct SilkEncoder {
     shape_d: Vec<f32>,
     shape_u: Vec<f32>,
     shape_gq: Vec<f32>,
+    prev_pitch_lag: i32,
     last_diag: SilkFrameDiag,
 }
 
@@ -118,6 +119,7 @@ impl SilkEncoder {
             final_range: 0,
             mirror_range: 0,
             voiced_frames: 0,
+            prev_pitch_lag: 0,
             mirror_out: vec![0; 20 * 16],
             target_bps: None,
             reservoir: 0.0,
@@ -382,7 +384,13 @@ impl SilkEncoder {
         let res: Vec<f32> = (0..n as isize).map(whiten).collect();
 
         // Pitch / LTP.
-        let pitch = estimate_pitch(&x, fs as i32, nb_subfr).filter(|p| p.voiced);
+        let prior = if self.prev_pitch_lag > 0 { Some(self.prev_pitch_lag) } else { None };
+        let pitch = estimate_pitch(&x, fs as i32, nb_subfr, prior).filter(|p| p.voiced);
+        if let Some(p) = &pitch {
+            self.prev_pitch_lag = p.lag;
+        } else {
+            self.prev_pitch_lag = 0;
+        }
         let voiced = pitch.is_some();
 
         let (lag_index, contour_index, pitch_l) = match &pitch {
