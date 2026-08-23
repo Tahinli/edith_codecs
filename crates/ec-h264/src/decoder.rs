@@ -2624,61 +2624,36 @@ fn uniform_motion(pic: &Picture, mb_x: usize, mb_y: usize) -> bool {
     })
 }
 
-/// Boundary strength of one 4-sample luma edge segment (clause 8.7.2.1).
-///
-/// `edge` 0..4 selects the vertical (`vertical`) or horizontal edge inside the
-/// macroblock, `seg` the 4-sample run along it. Edge 0 is the macroblock edge.
-fn boundary_strength(
-    pic: &Picture,
-    mb_x: usize,
-    mb_y: usize,
-    edge: usize,
-    seg: usize,
-    vertical: bool,
-) -> u8 {
-    let w4 = pic.mb_w * 4;
-    let (qbx, qby) = if vertical {
-        (mb_x * 4 + edge, mb_y * 4 + seg)
-    } else {
-        (mb_x * 4 + seg, mb_y * 4 + edge)
-    };
-    let (pbx, pby) = if vertical {
-        (qbx - 1, qby)
-    } else {
-        (qbx, qby - 1)
-    };
-    let q = qby * w4 + qbx;
-    let p = pby * w4 + pbx;
-    let mb_edge = edge == 0;
-    let q_mb = (qby / 4) * pic.mb_w + qbx / 4;
-    let p_mb = (pby / 4) * pic.mb_w + pbx / 4;
-    let intra = pic.mb_flags[q_mb] & FLAG_INTER == 0 || pic.mb_flags[p_mb] & FLAG_INTER == 0;
-    if intra {
+/// What clause 8.7.2.1 needs from the 4x4 block on one side of a luma edge.
+#[derive(Clone, Copy)]
+pub(crate) struct BsSide {
+    /// The containing macroblock is intra: strength 4 on macroblock edges and
+    /// 3 on internal ones, regardless of motion or levels.
+    pub(crate) intra: bool,
+    /// The transform block containing this sample has non-zero levels.
+    pub(crate) coded: bool,
+    /// MvLX of the block, `[list][component]`.
+    pub(crate) mv: [[i16; 2]; 2],
+    /// RefIdxLX of the block as list identities (`Picture::id`), -1 unused.
+    pub(crate) refs: [i32; 2],
+}
+
+/// Boundary strength between the 4x4 blocks on the two sides of a luma edge
+/// (clause 8.7.2.1). `mb_edge` selects the macroblock-edge strengths 4/3.
+pub(crate) fn bs_between(p: &BsSide, q: &BsSide, mb_edge: bool) -> u8 {
+    if p.intra || q.intra {
         return if mb_edge { 4 } else { 3 };
     }
-    // "the transform block containing the sample has non-zero levels": for an
-    // 8x8-transform macroblock that is the whole 8x8, whose four 4x4 slots
-    // carry per-slot counts under CAVLC (7.3.5.3.1 splits it into four blocks).
-    let coded = |mb: usize, bx: usize, by: usize| -> bool {
-        if pic.mb_flags[mb] & FLAG_TRANS8X8 == 0 {
-            return pic.nz_y[by * w4 + bx] != 0;
-        }
-        let (ox, oy) = (bx & !1, by & !1);
-        pic.nz_y[oy * w4 + ox] != 0
-            || pic.nz_y[oy * w4 + ox + 1] != 0
-            || pic.nz_y[(oy + 1) * w4 + ox] != 0
-            || pic.nz_y[(oy + 1) * w4 + ox + 1] != 0
-    };
-    if coded(p_mb, pbx, pby) || coded(q_mb, qbx, qby) {
+    if p.coded || q.coded {
         return 2;
     }
-    let (pr, qr) = (pic.ref_id[p], pic.ref_id[q]);
+    let (pr, qr) = (p.refs, q.refs);
     let pn = u8::from(pr[0] >= 0) + u8::from(pr[1] >= 0);
     let qn = u8::from(qr[0] >= 0) + u8::from(qr[1] >= 0);
     if pn != qn {
         return 1;
     }
-    let (pm, qm) = (pic.mv[p], pic.mv[q]);
+    let (pm, qm) = (p.mv, q.mv);
     let differs = |a: [i16; 2], b: [i16; 2]| {
         (i32::from(a[0]) - i32::from(b[0])).abs() >= 4
             || (i32::from(a[1]) - i32::from(b[1])).abs() >= 4
@@ -2711,4 +2686,54 @@ fn boundary_strength(
     let straight = !differs(pm[0], qm[0]) && !differs(pm[1], qm[1]);
     let crossed = !differs(pm[0], qm[1]) && !differs(pm[1], qm[0]);
     u8::from(!(straight || crossed))
+}
+
+/// One side of a luma edge from picture state: the decoder path, both sides
+/// final macroblocks. The encoder's inter trial uses this for the
+/// already-coded neighbour and builds its candidate side itself.
+pub(crate) fn bs_side(pic: &Picture, bx: usize, by: usize) -> BsSide {
+    let w4 = pic.mb_w * 4;
+    let mb = (by / 4) * pic.mb_w + bx / 4;
+    BsSide {
+        intra: pic.mb_flags[mb] & FLAG_INTER == 0,
+        coded: bs_coded(pic, mb, bx, by),
+        mv: pic.mv[by * w4 + bx],
+        refs: pic.ref_id[by * w4 + bx],
+    }
+}
+
+/// "The transform block containing the sample has non-zero levels": for an
+/// 8x8-transform macroblock that is the whole 8x8, whose four 4x4 slots
+/// carry per-slot counts under CAVLC (7.3.5.3.1 splits it into four blocks).
+fn bs_coded(pic: &Picture, mb: usize, bx: usize, by: usize) -> bool {
+    let w4 = pic.mb_w * 4;
+    if pic.mb_flags[mb] & FLAG_TRANS8X8 == 0 {
+        return pic.nz_y[by * w4 + bx] != 0;
+    }
+    let (ox, oy) = (bx & !1, by & !1);
+    pic.nz_y[oy * w4 + ox] != 0
+        || pic.nz_y[oy * w4 + ox + 1] != 0
+        || pic.nz_y[(oy + 1) * w4 + ox] != 0
+        || pic.nz_y[(oy + 1) * w4 + ox + 1] != 0
+}
+
+/// Boundary strength of one 4-sample luma edge segment (clause 8.7.2.1).
+///
+/// `edge` 0..4 selects the vertical (`vertical`) or horizontal edge inside the
+/// macroblock, `seg` the 4-sample run along it. Edge 0 is the macroblock edge.
+fn boundary_strength(
+    pic: &Picture,
+    mb_x: usize,
+    mb_y: usize,
+    edge: usize,
+    seg: usize,
+    vertical: bool,
+) -> u8 {
+    let (qbx, qby) = if vertical {
+        (mb_x * 4 + edge, mb_y * 4 + seg)
+    } else {
+        (mb_x * 4 + seg, mb_y * 4 + edge)
+    };
+    let (pbx, pby) = if vertical { (qbx - 1, qby) } else { (qbx, qby - 1) };
+    bs_between(&bs_side(pic, pbx, pby), &bs_side(pic, qbx, qby), edge == 0)
 }
