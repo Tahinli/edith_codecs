@@ -393,6 +393,8 @@ pub struct CeltEncoder {
     band_log_e: Vec<f32>,
     /// Long-window log energies used by dynalloc (`bandLogE2`).
     band_log_e2: Vec<f32>,
+    /// Previous intensity decision (hysteresis state, libopus `st->intensity`).
+    intensity: usize,
     error: Vec<f32>,
     transient_tmp: Vec<f32>,
     hadamard_tmp: Vec<f32>,
@@ -442,6 +444,7 @@ impl CeltEncoder {
             band_e: vec![0.0; 2 * NB_BANDS],
             band_log_e: vec![0.0; 2 * NB_BANDS],
             band_log_e2: vec![0.0; 2 * NB_BANDS],
+            intensity: 0,
             error: vec![0.0; 2 * NB_BANDS],
             transient_tmp: vec![0.0; max_n + OVERLAP],
             hadamard_tmp: vec![0.0; max_n],
@@ -797,24 +800,8 @@ impl CeltEncoder {
             // terms that need tonality/tf analysis this encoder does not run.
             let coded_bands = end - 1;
             let intensity_est = if c == 2 {
-                // Same thresholds as the stereo section below (16 at 64k stereo).
-                let effective_rate = 2 * (((8 * effective_bytes - 80) >> lm) as i32) / 5;
-                let i = if effective_rate < 35 {
-                    8usize
-                } else if effective_rate < 50 {
-                    12
-                } else if effective_rate < 68 {
-                    16
-                } else if effective_rate < 84 {
-                    18
-                } else if effective_rate < 102 {
-                    19
-                } else if effective_rate < 130 {
-                    20
-                } else {
-                    100
-                };
-                i.clamp(start, coded_bands)
+                self.intensity_decision(nb_compressed, c, lm, vbr_rate_bps);
+                self.intensity.clamp(start, coded_bands)
             } else {
                 0
             };
@@ -921,23 +908,8 @@ impl CeltEncoder {
             if lm != 0 {
                 dual_stereo = self.stereo_analysis(lm, n);
             }
-            let effective_rate = 2 * (((8 * effective_bytes - 80) >> lm) as i32) / 5;
-            intensity = if effective_rate < 35 {
-                8
-            } else if effective_rate < 50 {
-                12
-            } else if effective_rate < 68 {
-                16
-            } else if effective_rate < 84 {
-                18
-            } else if effective_rate < 102 {
-                19
-            } else if effective_rate < 130 {
-                20
-            } else {
-                100
-            };
-            intensity = intensity.clamp(start, end);
+            self.intensity_decision(nb_compressed, c, lm, vbr_rate_bps);
+            intensity = self.intensity.clamp(start, end);
         }
         let _ = &mut effective_bytes;
 
@@ -1458,6 +1430,23 @@ impl CeltEncoder {
             trim += 1;
         }
         trim.clamp(0, 10)
+    }
+
+    /// libopus `equiv_rate` + `hysteresis_decision()` for the intensity band:
+    /// the frame's bytes as a 20 ms-equivalent bitrate minus the per-frame
+    /// overhead, capped by the VBR target. Idempotent within a frame.
+    fn intensity_decision(&mut self, nb_compressed: usize, c: usize, lm: usize, vbr_rate_bps: u32) {
+        let overhead = (40 * c as i32 + 20) * ((400 >> lm) - 50);
+        let mut equiv_rate = ((nb_compressed as i32 * 8 * 50) << (3 - lm)) - overhead;
+        if vbr_rate_bps > 0 {
+            equiv_rate = equiv_rate.min(vbr_rate_bps as i32 - overhead);
+        }
+        self.intensity = hysteresis_decision(
+            equiv_rate as f32 / 1000.0,
+            &INTENSITY_THRESHOLDS,
+            &INTENSITY_HYSTERESIS,
+            self.intensity,
+        );
     }
 
     /// `stereo_analysis()`: L1 entropy model of L/R against M/S.
@@ -2497,4 +2486,31 @@ mod tests {
             }
         }
     }
+}
+
+const INTENSITY_THRESHOLDS: [f32; 21] = [
+    1., 2., 3., 4., 5., 6., 7., 8., 16., 24., 36., 44., 50., 56., 62., 67., 72., 79., 88., 106.,
+    134.,
+];
+const INTENSITY_HYSTERESIS: [f32; 21] =
+    [1., 1., 1., 1., 1., 1., 1., 2., 2., 2., 2., 2., 2., 2., 3., 3., 4., 5., 6., 8., 8.];
+
+/// libopus `hysteresis_decision()`: the largest `i` with `val >= thresholds[i]`,
+/// sticky around the previous decision by `hysteresis`.
+fn hysteresis_decision(val: f32, thresholds: &[f32], hysteresis: &[f32], prev: usize) -> usize {
+    let n = thresholds.len();
+    let mut i = 0;
+    while i < n {
+        if val < thresholds[i] {
+            break;
+        }
+        i += 1;
+    }
+    if i > prev && val < thresholds[prev] + hysteresis[prev] {
+        i = prev;
+    }
+    if i < prev && val > thresholds[prev - 1] - hysteresis[prev - 1] {
+        i = prev;
+    }
+    i
 }
