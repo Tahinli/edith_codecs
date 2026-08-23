@@ -102,6 +102,14 @@ impl EncEntropy {
         }
     }
 
+    /// One `sub_mb_type` of a P macroblock (Table 7-17).
+    pub(crate) fn sub_mb_type_p(&mut self, value: u32) {
+        match self {
+            EncEntropy::Cavlc { w, .. } => w.write_ue(value),
+            EncEntropy::Cabac(c) => c.sub_mb_type_p(value),
+        }
+    }
+
     /// One 4x4 intra prediction mode: `None` selects the predicted mode.
     pub(crate) fn intra4x4_pred_mode(&mut self, rem: Option<u8>) {
         match self {
