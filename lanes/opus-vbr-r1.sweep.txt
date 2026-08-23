@@ -1,0 +1,16 @@
+nik@64k: ref 69.2 ours 69.1 kbps (-0.1%), corr o=0.9887 r=0.9864 gap=-0.0024, Q o=-95.23 r=-154.78, err_ratio 0.708, minsec o=0.9766 r=0.9745, drop o=0 r=0
+nik@96k: ref 101.0 ours 100.9 kbps (-0.1%), corr o=0.9947 r=0.9940 gap=-0.0007, Q o=-29.53 r=-31.55, err_ratio 0.982, minsec o=0.9889 r=0.9888, drop o=0 r=0
+zaur@64k: ref 63.6 ours 63.6 kbps (-0.0%), corr o=0.9893 r=0.9866 gap=-0.0027, Q o=-202.82 r=-123.36, err_ratio 1.510, minsec o=0.9702 r=0.9686, drop o=0 r=0
+zaur@96k: ref 93.9 ours 93.4 kbps (-0.5%), corr o=0.9947 r=0.9937 gap=-0.0009, Q o=-114.74 r=-125.18, err_ratio 0.940, minsec o=0.9862 r=0.9854, drop o=0 r=0
+her@64k: ref 67.9 ours 67.7 kbps (-0.4%), corr o=0.9834 r=0.9794 gap=-0.0040, Q o=-365.68 r=-339.00, err_ratio 1.102, minsec o=0.9476 r=0.9406, drop o=0 r=0
+her@96k: ref 101.5 ours 101.0 kbps (-0.5%), corr o=0.9914 r=0.9902 gap=-0.0012, Q o=-202.16 r=-191.50, err_ratio 1.052, minsec o=0.9728 r=0.9728, drop o=0 r=0
+naz@64k: ref 71.3 ours 71.3 kbps (-0.0%), corr o=0.9908 r=0.9880 gap=-0.0029, Q o=-351.70 r=-128.39, err_ratio 2.697, minsec o=0.9720 r=0.9644, drop o=0 r=0
+naz@96k: ref 105.4 ours 105.3 kbps (-0.0%), corr o=0.9956 r=0.9948 gap=-0.0008, Q o=-301.83 r=-29.16, err_ratio 4.499, minsec o=0.9855 r=0.9804, drop o=0 r=0
+sadie@64k: ref 63.3 ours 63.1 kbps (-0.3%), corr o=0.9866 r=0.9859 gap=-0.0007, Q o=-266.99 r=-392.46, err_ratio 0.623, minsec o=0.9326 r=0.9100, drop o=0 r=0
+sadie@96k: ref 84.8 ours 84.7 kbps (-0.2%), corr o=0.9935 r=0.9920 gap=-0.0016, Q o=-145.55 r=-231.16, err_ratio 0.660, minsec o=0.9687 r=0.9511, drop o=0 r=0
+dl8a@64k: ref 65.8 ours 65.7 kbps (-0.1%), corr o=0.9889 r=0.9865 gap=-0.0025, Q o=-227.02 r=-378.84, err_ratio 0.551, minsec o=0.9787 r=0.9723, drop o=0 r=0
+dl8a@96k: ref 96.8 ours 96.5 kbps (-0.3%), corr o=0.9942 r=0.9934 gap=-0.0009, Q o=-177.72 r=-423.47, err_ratio 0.374, minsec o=0.9881 r=0.9864, drop o=0 r=0
+hein@64k: ref 64.9 ours 64.8 kbps (-0.2%), corr o=0.9888 r=0.9874 gap=-0.0014, Q o=-344.79 r=-388.31, err_ratio 0.855, minsec o=0.9324 r=0.9148, drop o=0 r=0
+hein@96k: ref 86.9 ours 86.8 kbps (-0.2%), corr o=0.9946 r=0.9930 gap=-0.0016, Q o=-117.88 r=-246.46, err_ratio 0.528, minsec o=0.9686 r=0.9499, drop o=0 r=0
+RATE GATE: all rows within ±5%
+DROPOUT GATE: passed (no ours-only dropouts)
