@@ -1,0 +1,10 @@
+# ec-opus encoder vs ffmpeg libopus — encoders-only gate, metric-validated subset (r1)
+# opus_compare_err validated byte-exact (<=1e-6 abs) against C opus_compare on all
+# 3 sources x {64,96}k (6/6). Both bitstreams decoded by ec-opus; 120s cap; VBR; 48kHz stereo.
+# source	kbps	ours_kbps	ref_kbps	rate%	corr_ours	corr_ref	gap	Q_ours	Q_ref	err_ratio	minsec_ours	minsec_ref	drop_ours	drop_ref
+naz	64	71.2	71.3	-0.2	0.9903	0.9880	-0.0023	-1056.61	-128.39	21.263	0.9694	0.9644	0	0
+naz	96	105.2	105.4	-0.2	0.9954	0.9948	-0.0006	-832.74	-29.16	23.640	0.9850	0.9804	0	0
+sadie	64	63.3	63.3	-0.1	0.9793	0.9859	+0.0067	-767.51	-392.46	3.145	0.8987	0.9100	1	0
+sadie	96	84.8	84.8	-0.0	0.9911	0.9920	+0.0009	-603.35	-231.16	3.674	0.9572	0.9511	0	0
+dl8a	64	65.7	65.8	-0.2	0.9880	0.9865	-0.0015	-598.74	-378.84	2.032	0.9757	0.9723	0	0
+dl8a	96	96.8	96.8	-0.0	0.9940	0.9934	-0.0007	-381.94	-423.47	0.866	0.9876	0.9864	0	0
