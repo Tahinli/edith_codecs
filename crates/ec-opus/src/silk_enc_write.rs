@@ -38,6 +38,21 @@ const LEVEL_ADJUST: f32 = 80.0 / 1024.0;
 /// with 16 such pulses in one block.
 const MAX_PULSE: i32 = 1023;
 
+/// Per-frame SILK diagnostics captured at the end of the last `encode_inner`
+/// call, for the speech-quality diagnostic lane.
+#[derive(Clone, Debug, Default)]
+pub struct SilkFrameDiag {
+    pub voiced: bool,
+    pub signal_type: i32,
+    pub gain_idx: [i8; MAX_NB_SUBFR],
+    pub nb_subfr: usize,
+    pub lag_index: i32,
+    pub pitch_l: [i32; MAX_NB_SUBFR],
+    pub nlsf_interp: i32,
+    pub bytes: usize,
+    pub ltp_gain: f32,
+}
+
 /// A mono, 10/20/40/60 ms, NB/MB/WB SILK encoder.
 #[derive(Clone, Debug)]
 pub struct SilkEncoder {
@@ -61,6 +76,7 @@ pub struct SilkEncoder {
     shape_d: Vec<f32>,
     shape_u: Vec<f32>,
     shape_gq: Vec<f32>,
+    last_diag: SilkFrameDiag,
 }
 
 /// Noise-shaping constants: AR (denominator) and MA (numerator) bandwidth
@@ -108,6 +124,7 @@ impl SilkEncoder {
             shape_d: vec![0.0; 20 * fs_khz],
             shape_u: vec![0.0; 20 * fs_khz],
             shape_gq: vec![0.0; 20 * fs_khz],
+            last_diag: SilkFrameDiag::default(),
         }
     }
 
@@ -120,6 +137,12 @@ impl SilkEncoder {
     /// Frames so far coded with the long-term (pitch) predictor.
     pub fn voiced_frames(&self) -> usize {
         self.voiced_frames
+    }
+
+    /// Per-frame diagnostics captured at the end of the last `encode_inner`
+    /// call.
+    pub fn last_diag(&self) -> &SilkFrameDiag {
+        &self.last_diag
     }
 
     /// Target bit rate in bits per second; `None` (the default) codes pulses
@@ -627,6 +650,7 @@ impl SilkEncoder {
                 voiced,
                 ltp_scale_index,
                 nq: nq.clone(),
+                ltp_gain,
                 seed_index,
             };
             let enc = &mut self.range;
@@ -684,6 +708,23 @@ impl SilkEncoder {
         self.shape_d.copy_from_slice(&best.run.d[n..]);
         self.shape_u.copy_from_slice(&best.run.u[n..]);
         self.shape_gq.copy_from_slice(&best.run.gq[n..]);
+        self.last_diag = SilkFrameDiag {
+            voiced: best.voiced,
+            signal_type: best.signal_type,
+            gain_idx: best.gain_idx,
+            nb_subfr: best.nb_subfr,
+            lag_index: best.lag_index,
+            pitch_l: {
+                let mut pl = [0i32; MAX_NB_SUBFR];
+                for (i, &v) in pitch_l.iter().enumerate().take(best.nb_subfr) {
+                    pl[i] = v;
+                }
+                pl
+            },
+            nlsf_interp: best.nq.interp_index,
+            bytes: best.bytes.len(),
+            ltp_gain: best.ltp_gain,
+        };
         Ok(best)
     }
 }
@@ -969,6 +1010,7 @@ struct Trial {
     voiced: bool,
     ltp_scale_index: usize,
     nq: NlsfQuant,
+    ltp_gain: f32,
     seed_index: i32,
 }
 
