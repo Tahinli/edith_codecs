@@ -1608,7 +1608,8 @@ fn encode_intra_mb(
                 cost.i16_mode,
                 chroma_mode,
             );
-            ssd_mb_deblocked(pic, e, mb_x, mb_y, &nbr, false) as f64 + e.lambda * bits as f64
+            ssd_mb_deblocked(pic, e, mb_x, mb_y, &nbr, false, intra_bs) as f64
+                + e.lambda * bits as f64
         } else {
             ssd_luma(pic, e, mb_x, mb_y) as f64
                 + lambda_ssd(qp) * rough_intra_bits(&lv4, Some((&m4, &p4))) as f64
@@ -1640,7 +1641,8 @@ fn encode_intra_mb(
                 cost.i16_mode,
                 chroma_mode,
             );
-            ssd_mb_deblocked(pic, e, mb_x, mb_y, &nbr, true) as f64 + e.lambda * bits as f64
+            ssd_mb_deblocked(pic, e, mb_x, mb_y, &nbr, true, intra_bs) as f64
+                + e.lambda * bits as f64
         } else {
             f64::INFINITY
         };
@@ -1659,7 +1661,8 @@ fn encode_intra_mb(
                 cost.i16_mode,
                 chroma_mode,
             );
-            ssd_mb_deblocked(pic, e, mb_x, mb_y, &nbr, false) as f64 + e.lambda * bits as f64
+            ssd_mb_deblocked(pic, e, mb_x, mb_y, &nbr, false, intra_bs) as f64
+                + e.lambda * bits as f64
         } else {
             ssd_luma(pic, e, mb_x, mb_y) as f64
                 + lambda_ssd(qp) * rough_intra_bits(&lv16, None) as f64
@@ -1785,22 +1788,24 @@ fn ssd_mb(pic: &Picture, e: &MbEnc<'_>, mb_x: usize, mb_y: usize) -> i64 {
 }
 
 /// [`ssd_mb`] with the luma half measured after the loop filter this
-/// macroblock's reconstruction will get. An intra macroblock forces bS 4 on
-/// its left and top macroblock edges (8.7.2.1) and bS 3 on the internal luma
-/// edges; a transform-8x8 macroblock has no transform edge at luma offsets 4
-/// and 12, so those stay unfiltered, exactly as the decoder's `internal`
-/// gate decides it. Neighbours share this slice's qp with the zero offsets
-/// the encoder writes, so every edge is parameterised by the trial qp alone.
-/// The right and bottom edges belong to macroblocks coded later and cannot
-/// be known here; the aprons are the pre-filter neighbour samples, which is
-/// everything that exists at decision time. The chroma half is left
-/// pre-filter: chroma never takes the 8x8 transform, so it cannot separate
-/// the candidates.
+/// macroblock's reconstruction will get. `bs(edge, seg, vertical)` is the
+/// boundary strength of one 4-sample edge segment — edge 0 the macroblock
+/// edge, edges 1..3 the internal edges at offsets 4/8/12 — as the decoder
+/// will derive it, so an intra candidate passes its forced 4/3 and an inter
+/// candidate its own coded/motion strengths. A transform-8x8 macroblock has
+/// no transform edge at luma offsets 4 and 12, so those stay unfiltered,
+/// exactly as the decoder's `internal` gate decides it. Neighbours share
+/// this slice's qp with the zero offsets the encoder writes, so every edge
+/// is parameterised by the trial qp alone. The right and bottom edges
+/// belong to macroblocks coded later and cannot be known here; the aprons
+/// are the pre-filter neighbour samples, which is everything that exists at
+/// decision time. The chroma half is left pre-filter: chroma never takes
+/// the 8x8 transform, so it cannot separate the candidates.
 ///
-/// The 8x8-vs-4x4 intra trial is judged by this and not by [`ssd_mb`]
-/// because the two candidates meet different edge sets under the same loop
-/// filter: a pre-filter SSD prices the 4x4 candidate as if its extra
-/// filtered edges cost nothing.
+/// The 8x8-vs-4x4 trials are judged by this and not by [`ssd_mb`] because the
+/// two candidates meet different edge sets under the same loop filter: a
+/// pre-filter SSD prices the 4x4 candidate as if its extra filtered edges
+/// cost nothing.
 fn ssd_mb_deblocked(
     pic: &Picture,
     e: &MbEnc<'_>,
@@ -1808,6 +1813,7 @@ fn ssd_mb_deblocked(
     mb_y: usize,
     nbr: &MbNeighbors,
     trans8: bool,
+    bs: impl Fn(usize, usize, bool) -> u8,
 ) -> i64 {
     // The macroblock at (A, A) plus 4-sample left and top aprons: a bS-4
     // edge reads p3 and rewrites p2 on its far side.
@@ -1836,30 +1842,52 @@ fn ssd_mb_deblocked(
         }
     }
     // Vertical edges left to right, then horizontal top to bottom, the order
-    // of 8.7.1: each edge filters what the earlier edges left behind.
+    // of 8.7.1: each edge filters what the earlier edges left behind. Each
+    // 4-sample segment carries its own strength, as in the decoder.
     let qp = e.target_qp;
-    let (e4, e3) = (edge_params(qp, 0, 0, 4), edge_params(qp, 0, 0, 3));
-    if nbr.a {
-        for row in 0..16 {
-            filter_luma_line(&mut scratch, (A + row) * S + A, 1, &e4);
-        }
-    }
-    for x in [4, 8, 12] {
-        if trans8 && x != 8 {
+    for edge in 0..4 {
+        let x = edge * 4;
+        if (edge == 0 && !nbr.a) || (trans8 && x != 0 && x != 8) {
             continue;
         }
-        for row in 0..16 {
-            filter_luma_line(&mut scratch, (A + row) * S + A + x, 1, &e3);
+        for seg in 0..4 {
+            let s = bs(edge, seg, true);
+            if s == 0 {
+                continue;
+            }
+            let ep = edge_params(qp, 0, 0, s);
+            for row in seg * 4..seg * 4 + 4 {
+                filter_luma_line(&mut scratch, (A + row) * S + A + x, 1, &ep);
+            }
         }
     }
-    if nbr.b {
-        filter_luma_h_edge16(&mut scratch, A * S + A, S, &e4);
-    }
-    for y in [4, 8, 12] {
-        if trans8 && y != 8 {
+    for edge in 0..4 {
+        let y = edge * 4;
+        if (edge == 0 && !nbr.b) || (trans8 && y != 0 && y != 8) {
             continue;
         }
-        filter_luma_h_edge16(&mut scratch, (A + y) * S + A, S, &e3);
+        let seg_bs = [
+            bs(edge, 0, false),
+            bs(edge, 1, false),
+            bs(edge, 2, false),
+            bs(edge, 3, false),
+        ];
+        if seg_bs[0] == seg_bs[1] && seg_bs[1] == seg_bs[2] && seg_bs[2] == seg_bs[3] {
+            if seg_bs[0] != 0 {
+                let ep = edge_params(qp, 0, 0, seg_bs[0]);
+                filter_luma_h_edge16(&mut scratch, (A + y) * S + A, S, &ep);
+            }
+            continue;
+        }
+        for seg in 0..4 {
+            if seg_bs[seg] == 0 {
+                continue;
+            }
+            let ep = edge_params(qp, 0, 0, seg_bs[seg]);
+            for col in seg * 4..seg * 4 + 4 {
+                filter_luma_line(&mut scratch, (A + y) * S + A + col, S, &ep);
+            }
+        }
     }
     let mut sum = ssd_mb(pic, e, mb_x, mb_y) - ssd_luma(pic, e, mb_x, mb_y);
     for row in 0..16 {
@@ -1871,6 +1899,16 @@ fn ssd_mb_deblocked(
         }
     }
     sum
+}
+
+/// Boundary strengths an intra candidate forces (8.7.2.1): 4 on its
+/// macroblock edges, 3 on the internal luma edges.
+fn intra_bs(edge: usize, _seg: usize, _vertical: bool) -> u8 {
+    if edge == 0 {
+        4
+    } else {
+        3
+    }
 }
 
 /// Rough bit cost of a macroblock's luma residual.
