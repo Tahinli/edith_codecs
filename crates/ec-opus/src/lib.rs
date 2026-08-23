@@ -74,7 +74,7 @@ pub(crate) mod silk_enc;
 pub mod silk_enc_write;
 
 pub use celt::CeltDecoder;
-pub use celt_enc::CeltEncoder;
+pub use celt_enc::CeltFrameDiag;
 pub use encoder::{Application, Encoder};
 pub use multistream::MultistreamDecoder;
 pub use multistream_enc::MultistreamEncoder;
