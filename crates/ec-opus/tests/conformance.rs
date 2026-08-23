@@ -237,8 +237,11 @@ fn band_energy(
     }
 }
 
-/// The `opus_compare` quality metric: >= 0 passes, 100 is identical output.
-fn opus_compare(reference: &[i16], test: &[i16], channels: usize) -> f64 {
+/// The raw `opus_compare` spectral error (before the quality mapping):
+/// 0 is identical output, growing with divergence. Used by the encoder gate
+/// to take an `err_ratio` of ours-vs-reference before the monotonic quality
+/// transform flattens the high-error tail.
+fn opus_compare_err(reference: &[i16], test: &[i16], channels: usize) -> f64 {
     assert_eq!(reference.len(), test.len(), "sample counts must match");
     let x: Vec<f64> = reference.iter().map(|&v| v as f64).collect();
     let y: Vec<f64> = test.iter().map(|&v| v as f64).collect();
@@ -343,6 +346,12 @@ fn opus_compare(reference: &[i16], test: &[i16], channels: usize) -> f64 {
         err += ef * ef;
     }
     err = (err / nframes as f64).powf(1.0 / 16.0);
+    err
+}
+
+/// The `opus_compare` quality metric: >= 0 passes, 100 is identical output.
+fn opus_compare(reference: &[i16], test: &[i16], channels: usize) -> f64 {
+    let err = opus_compare_err(reference, test, channels);
     100.0 * (1.0 - 0.5 * (1.0 + err).ln() / 1.13f64.ln())
 }
 
@@ -2655,4 +2664,350 @@ fn hybrid_shapes_roundtrip() {
     let toc = ec_opus::Toc::new(packets[0][0]);
     assert_eq!(toc.mode(), ec_opus::Mode::Hybrid);
     assert!(toc.stereo);
+}
+
+// ---------------------------------------------------------------------------
+// Encoder library gate vs ffmpeg libopus (encoders-only comparison)
+// ---------------------------------------------------------------------------
+//
+// Both the ec-opus encoder and ffmpeg's libopus encoder encode the same real
+// source PCM; BOTH bitstreams are decoded through ec-opus's own decoder, so
+// the gap isolates the encoders (the decoder is held constant). A 14-row sweep
+// (7 real sources × {64, 96} kbps) lands in `lanes/opus-gate-r1.sweep.txt`.
+// `#[ignore]`'d: it shells out to ffmpeg and walks a multi-gigabyte library.
+
+/// Expand a leading `~` to the home directory (the std `Path` API cannot).
+fn shellexpand(p: &str) -> PathBuf {
+    if let Some(rest) = p.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    PathBuf::from(p)
+}
+
+/// Decode any source into interleaved f32, 48 kHz, stereo, capped at `secs`.
+fn ffmpeg_decode_pcm(path: &Path, secs: f64) -> Vec<f32> {
+    let out = Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args([
+            "-vn",
+            "-t",
+            &format!("{secs}"),
+            "-ac",
+            "2",
+            "-ar",
+            "48000",
+            "-f",
+            "f32le",
+            "-acodec",
+            "pcm_f32le",
+            "-",
+        ])
+        .output()
+        .expect("ffmpeg runs");
+    assert!(
+        out.status.success(),
+        "ffmpeg source decode failed for {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out.stdout
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect()
+}
+
+/// Encode `src` to an Ogg/Opus file with ffmpeg's libopus at `kbps` (VBR on),
+/// capped at `secs`. The realised rate is read back from the output file size.
+fn ffmpeg_encode_libopus(src: &Path, kbps: u32, out: &Path, secs: f64) {
+    let res = Command::new("ffmpeg")
+        .args(["-y", "-v", "error", "-i"])
+        .arg(src)
+        .args([
+            "-vn",
+            "-t",
+            &format!("{secs}"),
+            "-ac",
+            "2",
+            "-ar",
+            "48000",
+            "-c:a",
+            "libopus",
+            "-b:a",
+            &format!("{kbps}k"),
+            "-vbr",
+            "on",
+        ])
+        .arg(out)
+        .output()
+        .expect("ffmpeg runs");
+    assert!(
+        res.status.success(),
+        "ffmpeg libopus encode failed for {} at {kbps}k: {}",
+        src.display(),
+        String::from_utf8_lossy(&res.stderr)
+    );
+}
+
+/// Lag-scan `decoded` against `source` over ±`max_lag` samples by mean-channel
+/// correlation, then emit a `source`-length aligned copy of `decoded`. The lag
+/// search runs on the first 10 s only (the task spec) — the encoder/decoder
+/// algorithmic delay is constant, so the peak found there holds for the whole
+/// file — and the correlation is computed inline without per-lag allocations.
+/// The delay lands the peak at a positive lag; the symmetric scan keeps the
+/// gate honest if a reference decoder shifts the other way.
+fn align_to_source(source: &[f32], decoded: &[f32], channels: usize, max_lag: usize) -> (i32, Vec<f32>) {
+    let sf = source.len() / channels;
+    let df = decoded.len() / channels;
+    let scan_frames = sf.min(df).min(48000 * 10);
+    let scan = max_lag.min(scan_frames);
+    let mut best = -1.0f64;
+    let mut best_lag = 0i32;
+    for lag in -(scan as i32)..=(scan as i32) {
+        let i0 = if lag < 0 { (-lag) as usize } else { 0 };
+        let j0 = if lag < 0 { 0 } else { lag as usize };
+        let len = scan_frames.saturating_sub(i0.max(j0));
+        if len < 4800 {
+            continue;
+        }
+        let mut cacc = 0.0f64;
+        for ch in 0..channels {
+            let (mut sxy, mut sxx, mut syy) = (0.0f64, 0.0f64, 0.0f64);
+            for i in 0..len {
+                let a = source[(i0 + i) * channels + ch] as f64;
+                let b = decoded[(j0 + i) * channels + ch] as f64;
+                sxy += a * b;
+                sxx += a * a;
+                syy += b * b;
+            }
+            if sxx > 0.0 && syy > 0.0 {
+                cacc += sxy / (sxx * syy).sqrt();
+            }
+        }
+        let c = cacc / channels as f64;
+        if c > best {
+            best = c;
+            best_lag = lag;
+        }
+    }
+    // Build a source-length aligned copy using the chosen lag.
+    let mut aligned = vec![0.0f32; sf * channels];
+    let i0 = if best_lag < 0 { (-best_lag) as usize } else { 0 };
+    let j0 = if best_lag < 0 { 0 } else { best_lag as usize };
+    let len = sf.saturating_sub(i0).min(df.saturating_sub(j0));
+    for i in 0..len {
+        for ch in 0..channels {
+            aligned[(i0 + i) * channels + ch] = decoded[(j0 + i) * channels + ch];
+        }
+    }
+    (best_lag, aligned)
+}
+
+/// Mean-channel normalized cross-correlation between two interleaved signals,
+/// computed inline (no per-channel Vec allocation).
+fn corr_interleaved(a: &[f32], b: &[f32], channels: usize) -> f64 {
+    let n = (a.len() / channels).min(b.len() / channels);
+    let mut acc = 0.0f64;
+    for ch in 0..channels {
+        let (mut sxy, mut sxx, mut syy) = (0.0f64, 0.0f64, 0.0f64);
+        for i in 0..n {
+            let av = a[i * channels + ch] as f64;
+            let bv = b[i * channels + ch] as f64;
+            sxy += av * bv;
+            sxx += av * av;
+            syy += bv * bv;
+        }
+        if sxx > 0.0 && syy > 0.0 {
+            acc += sxy / (sxx * syy).sqrt();
+        }
+    }
+    acc / channels as f64
+}
+
+/// Per-second correlation statistics: `(min_second_corr, seconds_below_0.9)`,
+/// computed inline without per-second Vec allocation.
+fn per_second_corr(source: &[f32], decoded: &[f32], channels: usize) -> (f64, u32) {
+    let n = (source.len() / channels).min(decoded.len() / channels);
+    let sec = 48000usize;
+    let mut min_c = 1.0f64;
+    let mut drops = 0u32;
+    let mut start = 0usize;
+    while start + sec <= n {
+        let mut acc = 0.0f64;
+        for ch in 0..channels {
+            let (mut sxy, mut sxx, mut syy) = (0.0f64, 0.0f64, 0.0f64);
+            for i in 0..sec {
+                let a = source[(start + i) * channels + ch] as f64;
+                let b = decoded[(start + i) * channels + ch] as f64;
+                sxy += a * b;
+                sxx += a * a;
+                syy += b * b;
+            }
+            if sxx > 0.0 && syy > 0.0 {
+                acc += sxy / (sxx * syy).sqrt();
+            }
+        }
+        let c = acc / channels as f64;
+        min_c = min_c.min(c);
+        if c < 0.9 {
+            drops += 1;
+        }
+        start += sec;
+    }
+    (min_c, drops)
+}
+
+#[test]
+#[ignore]
+fn encoder_library_gate_vs_libopus() {
+    const SECS: f64 = 120.0; // 2 min cap; full 600s made the 14-row sweep infeasible
+    const FRAME: usize = 960; // 20 ms at 48 kHz
+    const CHANNELS: usize = 2;
+    const MAX_LAG: usize = 2000;
+
+    let sources: &[(&str, &str)] = &[
+        ("nik", "~/Music/Yok - Nikbinler.mp4"),
+        ("zaur", "~/Music/Zaur Xan- Dusun Meni.mp3"),
+        ("her", "~/Music/Her Nerdeysen.mp3"),
+        ("naz", "~/Music/naz_aglama_ben_aglarim.mp4"),
+        ("sadie", "~/Music/sadie.wav"),
+        ("dl8a", "~/Downloads/8a3b6d1d19.mp3"),
+        ("hein", "~/Downloads/Sadie Sink Talks Her Little Known Singing Skills, Stranger Things 5 and Brendan Fraser.mp3"),
+    ];
+    let only: Vec<String> = std::env::var("SWEEP_ONLY")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim().to_owned())
+        .collect();
+    let sources: Vec<(String, PathBuf)> = sources
+        .iter()
+        .filter(|(tag, _)| only.is_empty() || only.iter().any(|o| o == tag))
+        .map(|(tag, p)| (tag.to_string(), shellexpand(p)))
+        .collect();
+    assert!(!sources.is_empty(), "SWEEP_ONLY matched no sources");
+
+    let lanes_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lanes");
+    fs::create_dir_all(&lanes_dir).unwrap();
+    let sweep_path = lanes_dir.join("opus-gate-r1.sweep.txt");
+    let scratch = lanes_dir.join("opus-gate-r1.scratch.ogg");
+
+    let mut rows: Vec<String> = Vec::new();
+    let mut rate_violations: Vec<String> = Vec::new();
+    let mut dropout_violations: Vec<String> = Vec::new();
+
+    for (tag, src) in &sources {
+        if !src.exists() {
+            eprintln!("SKIP {tag}: missing {}", src.display());
+            continue;
+        }
+        let source_pcm = ffmpeg_decode_pcm(src, SECS);
+        let source_frames = source_pcm.len() / CHANNELS;
+        assert!(source_frames > 48_000, "{tag}: source too short");
+        let seconds = source_frames as f64 / 48000.0;
+        let source_i16 = to_i16(&source_pcm);
+
+        for &kbps in &[64u32, 96u32] {
+            // Reference: ffmpeg libopus, VBR on, realised rate from file size.
+            ffmpeg_encode_libopus(src, kbps, &scratch, SECS);
+            let ref_bytes = fs::metadata(&scratch).map(|m| m.len() as usize).unwrap_or(0);
+            let ref_kbps = ref_bytes as f64 * 8.0 / seconds / 1000.0;
+            let (ref_dec, ref_ch) = decode_ogg(&scratch);
+            assert_eq!(ref_ch, CHANNELS, "{tag}@{kbps}: ref not stereo");
+            let (_, ref_aligned) = align_to_source(&source_pcm, &ref_dec, CHANNELS, MAX_LAG);
+
+            // Ours: ec-opus encoder at the reference's realised rate, decoded
+            // by our own decoder; payload bytes give the realised rate.
+            let mut enc =
+                Encoder::new(48000, CHANNELS, Application::Audio).expect("encoder");
+            enc.set_bitrate((ref_kbps * 1000.0).round() as u32);
+            enc.set_vbr_constrained(true);
+            let (ours_dec, ours_bytes) = roundtrip_own(&mut enc, &source_pcm, CHANNELS, FRAME);
+            let ours_kbps = ours_bytes as f64 * 8.0 / seconds / 1000.0;
+            // Drop the zero-padded tail of the final frame to match the source.
+            let ours_trim: Vec<f32> = ours_dec
+                .into_iter()
+                .take(source_frames * CHANNELS)
+                .collect();
+            let (_, ours_aligned) = align_to_source(&source_pcm, &ours_trim, CHANNELS, MAX_LAG);
+            let ours_i16 = to_i16(&ours_aligned);
+            let ref_i16 = to_i16(&ref_aligned);
+
+            // Equal-length i16 inputs for opus_compare (trim to common length).
+            let cmp_frames = (source_i16.len() / CHANNELS)
+                .min(ours_i16.len() / CHANNELS)
+                .min(ref_i16.len() / CHANNELS);
+            let trim = |v: &[i16]| -> Vec<i16> { v[..cmp_frames * CHANNELS].to_vec() };
+            let s_i = trim(&source_i16);
+            let o_i = trim(&ours_i16);
+            let r_i = trim(&ref_i16);
+            let q_ours = opus_compare(&s_i, &o_i, CHANNELS);
+            let q_ref = opus_compare(&s_i, &r_i, CHANNELS);
+            let err_ours = opus_compare_err(&s_i, &o_i, CHANNELS);
+            let err_ref = opus_compare_err(&s_i, &r_i, CHANNELS);
+            let err_ratio = if err_ref > 0.0 { err_ours / err_ref } else { f64::INFINITY };
+
+            let corr_ours = corr_interleaved(&source_pcm, &ours_aligned, CHANNELS);
+            let corr_ref = corr_interleaved(&source_pcm, &ref_aligned, CHANNELS);
+            let gap = corr_ref - corr_ours;
+            let (minsec_ours, drop_ours) = per_second_corr(&source_pcm, &ours_aligned, CHANNELS);
+            let (minsec_ref, drop_ref) = per_second_corr(&source_pcm, &ref_aligned, CHANNELS);
+            let rate_pct = (ours_kbps / ref_kbps - 1.0) * 100.0;
+
+            if rate_pct.abs() > 5.0 {
+                rate_violations.push(format!("{tag}@{kbps}k: rate {rate_pct:+.1}% (|>5%)"));
+            }
+            // Dropout gate: ours must not lose a second the reference kept.
+            if drop_ours > 0 && drop_ref == 0 {
+                dropout_violations.push(format!(
+                    "{tag}@{kbps}k: ours dropped {drop_ours}s below 0.9 corr, ref 0s"
+                ));
+            }
+
+            println!(
+                "{tag}@{kbps}k: ref {ref_kbps:.1} ours {ours_kbps:.1} kbps ({rate_pct:+.1}%), \
+                 corr o={corr_ours:.4} r={corr_ref:.4} gap={gap:+.4}, \
+                 Q o={q_ours:.2} r={q_ref:.2}, err_ratio {err_ratio:.3}, \
+                 minsec o={minsec_ours:.4} r={minsec_ref:.4}, drop o={drop_ours} r={drop_ref}"
+            );
+            rows.push(format!(
+                "{tag}\t{kbps}\t{ours_kbps:.1}\t{ref_kbps:.1}\t{rate_pct:+.1}\t\
+                 {corr_ours:.4}\t{corr_ref:.4}\t{gap:+.4}\t\
+                 {q_ours:.2}\t{q_ref:.2}\t{err_ratio:.3}\t\
+                 {minsec_ours:.4}\t{minsec_ref:.4}\t{drop_ours}\t{drop_ref}"
+            ));
+        }
+    }
+    let _ = fs::remove_file(&scratch);
+
+    let mut table = String::new();
+    table.push_str("# ec-opus encoder vs ffmpeg libopus — encoders-only gate (r1)\n");
+    table.push_str("# both bitstreams decoded by ec-opus; 600s cap; VBR; 48kHz stereo\n");
+    table.push_str("# source\tkbps\tours_kbps\tref_kbps\trate%\tcorr_ours\tcorr_ref\tgap\t\
+                    Q_ours\tQ_ref\terr_ratio\tminsec_ours\tminsec_ref\tdrop_ours\tdrop_ref\n");
+    for r in &rows {
+        table.push_str(r);
+        table.push('\n');
+    }
+    fs::write(&sweep_path, table).unwrap();
+    println!("wrote {}", sweep_path.display());
+
+    // Rate gate: report violations, never panic.
+    if !rate_violations.is_empty() {
+        eprintln!("RATE GATE violations (|rate%| > 5):");
+        for v in &rate_violations {
+            eprintln!("  {v}");
+        }
+    } else {
+        println!("RATE GATE: all rows within ±5%");
+    }
+    // Dropout gate: hard fail — a second the reference kept must not drop out.
+    assert!(
+        dropout_violations.is_empty(),
+        "DROPOUT GATE failed (ours dropped seconds ref kept):\n  {}",
+        dropout_violations.join("\n  ")
+    );
+    println!("DROPOUT GATE: passed (no ours-only dropouts)");
 }
