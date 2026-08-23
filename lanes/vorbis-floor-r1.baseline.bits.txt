@@ -1,0 +1,42 @@
+# Bit split over full sources, same rows as the band error
+
+## nik @ 96k (ours 84.0 vs ref 84.5 kbps)
+ours floor     9723.2/s ( 11.7%)  residue    72917.0/s ( 87.9%)  other    355.3/s  nz    2560721  bits/nz 5.42
+ref  floor    10286.2/s ( 12.3%)  residue    73047.7/s ( 87.3%)  other    388.4/s  nz    4760782  bits/nz 2.92
+ratio floor 0.945  residue 0.998  bits/nz 1.856
+
+## nik @ 128k (ours 115.5 vs ref 115.8 kbps)
+ours floor     9645.0/s (  8.5%)  residue   103989.2/s ( 91.2%)  other    353.9/s  nz    3814314  bits/nz 5.19
+ref  floor    10077.0/s (  8.8%)  residue   104124.4/s ( 90.9%)  other    389.7/s  nz    5632447  bits/nz 3.52
+ratio floor 0.957  residue 0.999  bits/nz 1.475
+
+## her @ 96k (ours 89.9 vs ref 89.9 kbps)
+ours floor     9524.9/s ( 10.7%)  residue    78889.0/s ( 88.9%)  other    354.8/s  nz    1787297  bits/nz 6.60
+ref  floor    10153.8/s ( 11.4%)  residue    78231.6/s ( 88.1%)  other    424.2/s  nz    3760403  bits/nz 3.11
+ratio floor 0.938  residue 1.008  bits/nz 2.122
+
+## her @ 128k (ours 123.5 vs ref 124.9 kbps)
+ours floor     9533.5/s (  7.8%)  residue   112062.4/s ( 91.9%)  other    352.8/s  nz    2722388  bits/nz 6.16
+ref  floor    10767.4/s (  8.7%)  residue   112414.2/s ( 90.9%)  other    440.5/s  nz    4510184  bits/nz 3.73
+ratio floor 0.885  residue 0.997  bits/nz 1.652
+
+## naz @ 96k (ours 85.4 vs ref 85.5 kbps)
+ours floor     9711.2/s ( 11.5%)  residue    74235.7/s ( 88.1%)  other    352.0/s  nz    1543184  bits/nz 6.13
+ref  floor    10298.1/s ( 12.2%)  residue    73899.0/s ( 87.4%)  other    385.7/s  nz    3052428  bits/nz 3.09
+ratio floor 0.943  residue 1.005  bits/nz 1.987
+
+## naz @ 128k (ours 121.3 vs ref 120.9 kbps)
+ours floor     9566.1/s (  8.0%)  residue   109816.9/s ( 91.7%)  other    355.4/s  nz    2371325  bits/nz 5.91
+ref  floor     9762.0/s (  8.2%)  residue   109419.2/s ( 91.5%)  other    383.9/s  nz    3707113  bits/nz 3.76
+ratio floor 0.980  residue 1.004  bits/nz 1.569
+
+## dl8a @ 96k (ours 86.9 vs ref 86.9 kbps)
+ours floor     9898.8/s ( 11.5%)  residue    75451.0/s ( 88.0%)  other    361.4/s  nz    1070509  bits/nz 5.22
+ref  floor    10220.4/s ( 11.9%)  residue    75065.3/s ( 87.6%)  other    450.2/s  nz    2007693  bits/nz 2.77
+ratio floor 0.969  residue 1.005  bits/nz 1.885
+
+## dl8a @ 128k (ours 118.7 vs ref 117.8 kbps)
+ours floor     9770.3/s (  8.3%)  residue   106984.6/s ( 91.3%)  other    362.3/s  nz    1586225  bits/nz 5.00
+ref  floor    10898.1/s (  9.4%)  residue   104859.0/s ( 90.2%)  other    461.9/s  nz    2355540  bits/nz 3.30
+ratio floor 0.897  residue 1.020  bits/nz 1.515
+
