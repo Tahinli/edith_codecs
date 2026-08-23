@@ -908,9 +908,19 @@ fn x264_encode_qp(sources: &[Planes], w: usize, h: usize, qp: i32, gop: u32) -> 
         // ipratio/pbratio 1.0 matter: x264's constant-QP mode otherwise codes
         // I pictures at a lower QP than the one asked for, which reads as a
         // rate-quality win that is really a different quantiser.
+        // EC_H264_X264_PARAMS appends to this list, which is how a single
+        // reference feature gets attributed: running the sweep again with
+        // `trellis=0` says how much of x264's lead is its rate-distortion
+        // quantisation rather than its prediction.
         .args([
             "-x264-params",
-            "scenecut=0:aq-mode=0:psy=0:8x8dct=0:ipratio=1.0:pbratio=1.0:qcomp=1.0:chroma-qp-offset=0",
+            &format!(
+                "scenecut=0:aq-mode=0:psy=0:8x8dct=0:ipratio=1.0:pbratio=1.0:qcomp=1.0:chroma-qp-offset=0{}",
+                match std::env::var("EC_H264_X264_PARAMS") {
+                    Ok(extra) if !extra.trim().is_empty() => format!(":{}", extra.trim()),
+                    _ => String::new(),
+                }
+            ),
         ])
         .args(["-f", "h264"])
         .arg(&out)
