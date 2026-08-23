@@ -23,7 +23,8 @@ use crate::cabac::{
     ABS_CAT_OFF, CBF_CAT_OFF, I_MB_TYPE_CTX, I_SUFFIX_CTX_P, NUM_CTX, OFF_ABS, OFF_ABS_8X8,
     OFF_CBF, OFF_CBP_CHROMA, OFF_CBP_LUMA, OFF_CHROMA_PRED, OFF_LAST, OFF_LAST_8X8, OFF_MB_TYPE,
     OFF_MB_TYPE_P, OFF_MVD, OFF_PREV_I4, OFF_QP_DELTA, OFF_REM_I4, OFF_SIG, OFF_SIG_8X8,
-    OFF_SKIP_P, OFF_TRANSFORM_8X8, SIG_CAT_OFF, init_contexts, qp_delta_inc, sig_inc,
+    OFF_SKIP_P, OFF_SUB_TYPE_P, OFF_TRANSFORM_8X8, SIG_CAT_OFF, init_contexts, qp_delta_inc,
+    sig_inc,
 };
 use crate::cabac_tables::{LAST_8X8, SIG_8X8_FRAME};
 use crate::entropy::{
@@ -231,6 +232,22 @@ impl CabacEnc {
         };
         self.decision(OFF_MB_TYPE_P + 1, b1);
         self.decision(OFF_MB_TYPE_P + if b1 { 3 } else { 2 }, b2);
+    }
+
+    /// `sub_mb_type` of a P macroblock (Table 9-38): the mirror of
+    /// [`crate::cabac::Cabac::sub_mb_type_p_inner`].
+    pub(crate) fn sub_mb_type_p(&mut self, value: u32) {
+        if value == 0 {
+            self.decision(OFF_SUB_TYPE_P, true); // P_L0_8x8
+            return;
+        }
+        self.decision(OFF_SUB_TYPE_P, false);
+        if value == 1 {
+            self.decision(OFF_SUB_TYPE_P + 1, false); // P_L0_8x4
+            return;
+        }
+        self.decision(OFF_SUB_TYPE_P + 1, true);
+        self.decision(OFF_SUB_TYPE_P + 2, value == 2); // P_L0_4x8 or P_L0_4x4
     }
 
     /// The Intra part of an mb_type bin string; `value` is the I-slice type.

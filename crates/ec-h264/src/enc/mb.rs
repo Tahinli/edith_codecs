@@ -601,6 +601,18 @@ fn intra_pre_cost(
 /// below a half and falls away above it.
 const MV_BITS_WEIGHT: f64 = 0.5;
 
+/// What the search charges P_8x8 for its own signalling, against the six bits
+/// a 16x8 or 8x16 is charged: an mb_type that is one bin longer plus four
+/// sub_mb_type bins, before the four predictors' own mvd.
+///
+/// Swept at `Preset::Balanced` -- the only preset that searches shapes at all
+/// -- on consecutive pictures against x264. Off, 6, 12 and 20 bits read
+/// -0.382/-0.379/-0.377/-0.378 dB BD-PSNR on the film clip and
+/// -0.369/-0.364/-0.353/-0.356 on the screen capture: both contents put the
+/// optimum at twelve, and quarters are worth 0.005 dB on camera content and
+/// 0.016 on screen capture.
+const QUAD_BITS: f64 = 12.0;
+
 /// How a P macroblock is partitioned, in the mb_type numbering of Table 7-13.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PShape {
@@ -610,6 +622,8 @@ enum PShape {
     Horizontal,
     /// P_L0_L0_8x16: a left and a right half.
     Vertical,
+    /// P_8x8 with four P_L0_8x8 sub-partitions: a quarter each.
+    Quad,
 }
 
 impl PShape {
@@ -619,11 +633,16 @@ impl PShape {
             PShape::Whole => 0,
             PShape::Horizontal => 1,
             PShape::Vertical => 2,
+            PShape::Quad => 3,
         }
     }
 
     fn parts(self) -> usize {
-        usize::from(self != PShape::Whole) + 1
+        match self {
+            PShape::Whole => 1,
+            PShape::Horizontal | PShape::Vertical => 2,
+            PShape::Quad => 4,
+        }
     }
 
     /// Partition `part`'s origin in 4x4 blocks and its size in luma samples.
@@ -632,6 +651,7 @@ impl PShape {
             PShape::Whole => ((0, 0), (16, 16)),
             PShape::Horizontal => ((0, part * 2), (16, 8)),
             PShape::Vertical => ((part * 2, 0), (8, 16)),
+            PShape::Quad => (((part % 2) * 2, (part / 2) * 2), (8, 8)),
         }
     }
 
@@ -642,6 +662,7 @@ impl PShape {
             PShape::Whole => (4, 4),
             PShape::Horizontal => (4, 2),
             PShape::Vertical => (2, 4),
+            PShape::Quad => (2, 2),
         }
     }
 }
@@ -650,7 +671,7 @@ impl PShape {
 struct InterChoice {
     shape: PShape,
     /// One motion vector per partition.
-    mv: [[i16; 2]; 2],
+    mv: [[i16; 2]; 4],
     /// The P_Skip motion vector of 8.4.1.1.
     skip_mv: [i16; 2],
     /// The skip candidate is at least as good as the searched one.
@@ -822,7 +843,7 @@ fn choose_inter(pic: &Picture, e: &MbEnc<'_>, mb_x: usize, mb_y: usize) -> Inter
         satd_block(&e.src.y, sw, sx, sy, &buf, 16, 0, 16, 16) - motion_rate(e, 2.0)
     };
 
-    let mut best = (PShape::Whole, [mv16, mv16], cost16);
+    let mut best = (PShape::Whole, [mv16; 4], cost16);
     // Halves, seeded with the whole-macroblock winner. The predictor used here
     // is the whole-macroblock one rather than each half's own: the real
     // predictors are derived in coding order when the choice is made, and this
@@ -838,10 +859,19 @@ fn choose_inter(pic: &Picture, e: &MbEnc<'_>, mb_x: usize, mb_y: usize) -> Inter
     // searched. It stays as a guard for content flat enough to make the two
     // extra searches pure cost.
     if e.preset == Preset::Balanced && cost16 > 16 * 16 {
-        for shape in [PShape::Horizontal, PShape::Vertical] {
-            let mut total = motion_rate(e, 6.0); // the partition's own signalling
-            let mut mvs = [[0i16; 2]; 2];
-            for part in 0..2 {
+        for shape in [PShape::Horizontal, PShape::Vertical, PShape::Quad] {
+            // What the shape itself costs to signal: its mb_type, plus one
+            // sub_mb_type per quarter when it is P_8x8.
+            let mut total = motion_rate(
+                e,
+                if shape == PShape::Quad {
+                    QUAD_BITS
+                } else {
+                    6.0
+                },
+            );
+            let mut mvs = [[0i16; 2]; 4];
+            for part in 0..shape.parts() {
                 let ((bx, by), (w, h)) = shape.geometry(part);
                 let seeds = [mv16, mvp, skip_mv, [0, 0]];
                 let (mv, cost) = search(bx * 4, by * 4, w, h, mvp, &seeds);
@@ -854,6 +884,39 @@ fn choose_inter(pic: &Picture, e: &MbEnc<'_>, mb_x: usize, mb_y: usize) -> Inter
         }
     }
 
+    // How often each shape actually wins. Behind an environment switch because
+    // it answers a question the rate gate cannot: a partition sweep that reads
+    // flat is either a flat knob or a path nothing enters, and only a count
+    // tells the two apart. It found the second -- at `Preset::Fast`, which is
+    // what the x264 comparison runs by default, no macroblock is ever split.
+    if std::env::var_os("EC_H264_SHAPE_STATS").is_some() {
+        static N: [std::sync::atomic::AtomicUsize; 4] = [
+            std::sync::atomic::AtomicUsize::new(0),
+            std::sync::atomic::AtomicUsize::new(0),
+            std::sync::atomic::AtomicUsize::new(0),
+            std::sync::atomic::AtomicUsize::new(0),
+        ];
+        let i = match best.0 {
+            PShape::Whole => 0,
+            PShape::Horizontal => 1,
+            PShape::Vertical => 2,
+            PShape::Quad => 3,
+        };
+        let v = N[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let tot: usize = N
+            .iter()
+            .map(|n| n.load(std::sync::atomic::Ordering::Relaxed))
+            .sum();
+        if tot.is_multiple_of(20000) {
+            eprintln!(
+                "SHAPES whole={} horiz={} vert={} quad={} (last {i} -> {v})",
+                N[0].load(std::sync::atomic::Ordering::Relaxed),
+                N[1].load(std::sync::atomic::Ordering::Relaxed),
+                N[2].load(std::sync::atomic::Ordering::Relaxed),
+                N[3].load(std::sync::atomic::Ordering::Relaxed),
+            );
+        }
+    }
     InterChoice {
         shape: best.0,
         mv: best.1,
@@ -2067,8 +2130,8 @@ fn inter_mb_bits(
     mb_addr: usize,
     nbr: &MbNeighbors,
     shape: PShape,
-    mvd: &[[i16; 2]; 2],
-    inc: &[[usize; 2]; 2],
+    mvd: &[[i16; 2]; 4],
+    inc: &[[usize; 2]; 4],
     lv: &Levels,
 ) -> i64 {
     entropy_bits(w, |cw| {
@@ -2076,6 +2139,11 @@ fn inter_mb_bits(
         cw.coded_mb(true, e.skip_inc);
         cw.set_intra(false);
         cw.mb_type(true, shape.mb_type());
+        if shape == PShape::Quad {
+            for _ in 0..4 {
+                cw.sub_mb_type_p(0); // P_L0_8x8
+            }
+        }
         for part in 0..shape.parts() {
             for comp in 0..2 {
                 cw.mvd(comp, inc[part][comp], i32::from(mvd[part][comp]));
@@ -2549,7 +2617,8 @@ fn compensate_part(
     }
 }
 
-/// Code a P macroblock: skip, one 16x16 partition, or two halves.
+/// Code a P macroblock: skip, one 16x16 partition, two halves or four
+/// quarters.
 fn encode_inter_mb(
     pic: &mut Picture,
     e: &mut MbEnc<'_>,
@@ -2579,8 +2648,8 @@ fn encode_inter_mb(
         written: 0,
     };
     let (part_w, part_h) = shape.part_blocks();
-    let mut mvd = [[0i16; 2]; 2];
-    let mut inc = [[0usize; 2]; 2];
+    let mut mvd = [[0i16; 2]; 4];
+    let mut inc = [[0usize; 2]; 4];
     for part in 0..shape.parts() {
         let ((bx, by), (pw, ph)) = shape.geometry(part);
         let mv = if choice.prefer_skip {
@@ -2718,6 +2787,11 @@ fn encode_inter_mb(
     w.coded_mb(true, e.skip_inc);
     w.set_intra(false);
     w.mb_type(true, shape.mb_type());
+    if shape == PShape::Quad {
+        for _ in 0..4 {
+            w.sub_mb_type_p(0); // P_L0_8x8
+        }
+    }
     // num_ref_idx_l0_active is 1, so ref_idx_l0 is not coded.
     for part in 0..shape.parts() {
         for comp in 0..2 {

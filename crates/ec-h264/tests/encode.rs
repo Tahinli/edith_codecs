@@ -1142,7 +1142,7 @@ fn bit_account_vs_x264() {
         }
         dec.flush().expect("flush");
         while dec.next_frame().is_some() {}
-        dec.bit_account()
+        (dec.bit_account(), dec.mb_shapes())
     };
     for qp in [26, 34] {
         let mut cfg = EncoderConfig::new(w as u32, h as u32);
@@ -1151,6 +1151,9 @@ fn bit_account_vs_x264() {
         cfg.cabac = true;
         cfg.framerate = 1.0;
         cfg.threads = 0;
+        if std::env::var_os("EC_H264_PRESET_BALANCED").is_some() {
+            cfg.preset = ec_h264::Preset::Balanced;
+        }
         let mut enc = Encoder::new(cfg).expect("encoder");
         let mut ours = Vec::new();
         for (y, u, v) in &sources {
@@ -1158,7 +1161,7 @@ fn bit_account_vs_x264() {
             ours.extend_from_slice(&enc.encode(&view).expect("encode").au);
         }
         let theirs = x264_encode_qp(&sources, w, h, qp, gop).expect("x264 encodes");
-        let (a, b) = (account(&ours), account(&theirs));
+        let ((a, sa), (b, sb)) = (account(&ours), account(&theirs));
         eprintln!(
             "qp {qp}: {} pictures, ours {} bytes, x264 {} bytes",
             sources.len(),
@@ -1183,5 +1186,63 @@ fn bit_account_vs_x264() {
         row("residual luma", a.residual_luma, b.residual_luma);
         row("residual chroma", a.residual_chroma, b.residual_chroma);
         row("total accounted", a.total(), b.total());
+        let mix = |n: &str, s: &ec_h264::MbShapes| {
+            eprintln!(
+                "  {n:<16} skip {} 16x16 {} 16x8 {} 8x16 {} 8x8 {} intra {}",
+                s.skip, s.p16x16, s.p16x8, s.p8x16, s.p8x8, s.intra
+            );
+        };
+        mix("shapes ours", &sa);
+        mix("shapes x264", &sb);
     }
+}
+
+/// The partitions only `Preset::Balanced` searches, decoded by ffmpeg.
+///
+/// The default preset codes every P macroblock as one 16x16 partition, so the
+/// bit-exactness sweeps above never put a 16x8, an 8x16 or a P_8x8 -- and so
+/// never a `sub_mb_type` -- in front of another decoder. This does.
+#[test]
+fn balanced_partitions_decode_bit_exactly() {
+    if !have_ffmpeg() {
+        eprintln!("SKIP balanced_partitions_decode_bit_exactly: no ffmpeg on PATH");
+        return;
+    }
+    let (w, h) = (176, 144);
+    let mut shapes = ec_h264::MbShapes::default();
+    for qp in [16, 26, 36] {
+        let cavlc = qp == 26; // both entropy coders write sub_mb_type
+        let (stream, recons, _) = encode_clip(w, h, 8, |cfg| {
+            cfg.qp = qp;
+            cfg.cabac = !cavlc;
+            cfg.preset = ec_h264::Preset::Balanced;
+        });
+        let decoded = ffmpeg_decode(&stream, w, h, &[]).expect("ffmpeg decodes our stream");
+        assert_eq!(decoded.len(), recons.len(), "qp {qp}: frame count");
+        for (i, (dec, rec)) in decoded.iter().zip(&recons).enumerate() {
+            assert_eq!(dec.0, rec.0, "qp {qp}: luma of frame {i}");
+            assert_eq!(dec.1, rec.1, "qp {qp}: Cb of frame {i}");
+            assert_eq!(dec.2, rec.2, "qp {qp}: Cr of frame {i}");
+        }
+        let mut dec = Decoder::new();
+        dec.set_output_order(OutputOrder::Decode);
+        for nal in ec_h264_syntax::AnnexBIter::new(&stream) {
+            if dec.push_nal(nal).expect("decoder accepts the NAL") == NalOutcome::PictureBoundary {
+                dec.end_picture().expect("end of picture");
+                dec.push_nal(nal).expect("decoder accepts the NAL");
+            }
+            while dec.next_frame().is_some() {}
+        }
+        dec.flush().expect("flush");
+        while dec.next_frame().is_some() {}
+        shapes.add_public(&dec.mb_shapes());
+    }
+    eprintln!(
+        "balanced shapes: skip {} 16x16 {} 16x8 {} 8x16 {} 8x8 {} intra {}",
+        shapes.skip, shapes.p16x16, shapes.p16x8, shapes.p8x16, shapes.p8x8, shapes.intra
+    );
+    assert!(
+        shapes.p16x8 + shapes.p8x16 > 0 && shapes.p8x8 > 0,
+        "the sweep has to code every shape, or it proves nothing about them"
+    );
 }
