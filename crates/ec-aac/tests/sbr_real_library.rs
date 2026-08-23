@@ -274,16 +274,22 @@ fn best_lag_correlation_ex(ours: &[f32], theirs: &[f32], lag_max: i64) -> (i64, 
     // correctly-refined negative full-`WINDOW` result with a noise-driven
     // positive one from a 20x-shorter slice. Carry the signed value through
     // so callers can see the sign, not just |corr|.
+    // Stride 1, not `SEARCH_STRIDE` (round-61): a real correlation peak
+    // between two decodes of the same audio is often ONE sample wide (on
+    // Nikbinler's core-only PCM: 0.9998 at lag 481, 0.94 at 479), so a
+    // strided grid samples only the noise floor around it and the "best
+    // coarse lag" it hands the refine pass is arbitrary. That is how a
+    // 0.9998 match printed as corr 0.408 at lag -52. Stride 1 over the
+    // narrow bound is ~33M multiply-adds; the wide bound is 25x that and
+    // only runs on escalation, so this is not worth a resolution trade.
     let mut coarse_best = (0i64, -1.0f64, 0.0f64);
-    let mut lag = -lag_max;
-    while lag <= lag_max {
+    for lag in -lag_max..=lag_max {
         if let Some((oa, ob)) = slice_at(lag, COARSE) {
             let c = correlation(&ours[oa..oa + COARSE], &theirs[ob..ob + COARSE]);
             if c.abs() > coarse_best.1 {
                 coarse_best = (lag, c.abs(), c);
             }
         }
-        lag += SEARCH_STRIDE;
     }
     let at_edge = coarse_best.0.abs() >= lag_max - SEARCH_STRIDE;
     let mut best = (coarse_best.0, -1.0f64, 0.0f64);
@@ -352,6 +358,70 @@ fn best_lag_correlation_wide(ours: &[f32], theirs: &[f32], lag_max: i64) -> (i64
 /// candidate that is genuinely aligned wins there even when it wasn't the
 /// coarse pass's top pick. Returns `(lag, corr, at_edge)` for the winning
 /// refined candidate, `at_edge` inherited from that candidate's own coarse
+/// Stride-1 lag search: correlates a `COARSE`-sized window at EVERY lag in
+/// `+/-lag_max`, then refines the winner with a full `WINDOW`.
+///
+/// `robust_lag_topk`'s coarse pass steps by `SEARCH_STRIDE` (11) and then
+/// refines only its top-K coarse scorers. That ranking is meaningless when
+/// the true peak is narrower than the stride: on Nikbinler's core-only PCM
+/// the correlation is 0.9998 at lag 481 and already 0.94 at 479, so no
+/// stride-11 grid point (the grid is 4 mod 11; 481 is 8 mod 11) scores
+/// anything but noise, the top-K is drawn from noise, and the search
+/// returned lag -52 corr 0.408 for a pair that is actually a 0.9998 match.
+/// FMJ, same instrument, same true lag 481, happened to land a noise-ranked
+/// candidate within the +/-128 refine window and read correctly -- the
+/// failure is luck-dependent, not file-dependent. Stride 1 over a 4_096
+/// window is ~33M multiply-adds at `PLAIN_LAG_MAX`, cheaper than the top-K
+/// refinement it replaces, so the resolution is simply not worth trading.
+fn exhaustive_lag_correlation(ours: &[f32], theirs: &[f32], lag_max: i64) -> (i64, f64, bool) {
+    const COARSE: usize = 4_096;
+    let start = ours
+        .len()
+        .min(theirs.len())
+        .saturating_sub(WINDOW)
+        .min(ours.len() / 4);
+    let slice_at = |lag: i64, len: usize| -> Option<(usize, usize)> {
+        let (oa, ob) = if lag >= 0 {
+            (start, start + lag as usize)
+        } else {
+            (start + (-lag) as usize, start)
+        };
+        if oa + len > ours.len() || ob + len > theirs.len() {
+            None
+        } else {
+            Some((oa, ob))
+        }
+    };
+    let mut best = (0i64, -1.0f64);
+    for lag in -lag_max..=lag_max {
+        if let Some((oa, ob)) = slice_at(lag, COARSE) {
+            let c = correlation(&ours[oa..oa + COARSE], &theirs[ob..ob + COARSE]).abs();
+            if c > best.1 {
+                best = (lag, c);
+            }
+        }
+    }
+    let at_edge = best.0.abs() >= lag_max - 1;
+    let mut refined = (best.0, -1.0f64);
+    for lag in (best.0 - 2)..=(best.0 + 2) {
+        let Some((oa, ob)) = slice_at(lag, WINDOW) else {
+            continue;
+        };
+        let n = WINDOW.min(ours.len() - oa).min(theirs.len() - ob);
+        if n < 1024 {
+            continue;
+        }
+        let c = correlation(&ours[oa..oa + n], &theirs[ob..ob + n]).abs();
+        if c > refined.1 {
+            refined = (lag, c);
+        }
+    }
+    if refined.1 < 0.0 {
+        refined = best;
+    }
+    (refined.0, refined.1, at_edge)
+}
+
 /// bucket (true if ITS coarse lag sat at the +/-`lag_max` search bound).
 fn robust_lag_topk(ours: &[f32], theirs: &[f32], lag_max: i64, rate: u32, k: usize) -> (i64, f64, bool) {
     const COARSE: usize = 4_096;
@@ -372,14 +442,15 @@ fn robust_lag_topk(ours: &[f32], theirs: &[f32], lag_max: i64, rate: u32, k: usi
             Some((oa, ob))
         }
     };
+    // Stride 1 (round-61), for the reason spelled out on
+    // `exhaustive_lag_correlation`: a strided grid can miss a 1-sample-wide
+    // peak entirely, and then the top-K is a ranking of noise.
     let mut coarse: Vec<(i64, f64)> = Vec::new();
-    let mut lag = -lag_max;
-    while lag <= lag_max {
+    for lag in -lag_max..=lag_max {
         if let Some((oa, ob)) = slice_at(lag, COARSE) {
             let c = correlation(&ours[oa..oa + COARSE], &theirs[ob..ob + COARSE]);
             coarse.push((lag, c.abs()));
         }
-        lag += SEARCH_STRIDE;
     }
     coarse.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     let ten_s = 10 * rate.max(1) as usize;
@@ -2103,6 +2174,19 @@ fn ffmpeg_decode_at_rate(
 /// not a regression gate (the asserted gate is
 /// `sbr_real_library_matches_reference`, which already covers the full-band
 /// SBR-reconstructed output).
+///
+/// Round-61: this printed corr 0.402349 for Nikbinler ch0 while that file's
+/// core is provably fine (the asserted reference gate scores its below-5kHz
+/// band 0.999988, and `full_chain_low_band_matches_own_core` scores this very
+/// core-only PCM 0.998 against our own full chain). The number was the
+/// instrument, not the codec: `robust_lag_topk`'s stride-11 coarse grid
+/// cannot see a 1-sample-wide correlation peak, so its top-K was ranked from
+/// noise. At the true lag -- 481, ffmpeg's resampler delay, the same lag FMJ
+/// reads -- these two signals correlate 0.999845. The search here is now
+/// stride-1 (`exhaustive_lag_correlation`), and both sides are low-passed at
+/// `0.9 * crossover` first, since only the reference side (ffmpeg's full SBR
+/// reconstruction, resampled down to the core rate) can hold anything above
+/// the crossover at all.
 #[test]
 fn core_only_matches_reference() {
     if !have_ffmpeg() {
@@ -2121,9 +2205,17 @@ fn core_only_matches_reference() {
             ours.len(),
             core_rate
         );
+        let cutoff = f64::from(c.crossover_hz) * 0.9;
         for (ch, (o, t)) in ours.iter().zip(&theirs).enumerate() {
-            let (lag, corr) = best_lag_correlation(o, t);
-            println!("  ch{ch}: lag {lag}, corr {corr:.6}");
+            let ol = lowpass(o, core_rate, cutoff);
+            let tl = lowpass(t, core_rate, cutoff);
+            let (mut lag, mut corr, mut at_edge) =
+                exhaustive_lag_correlation(&ol, &tl, PLAIN_LAG_MAX);
+            if at_edge {
+                (lag, corr, at_edge) = exhaustive_lag_correlation(&ol, &tl, SEARCH_LAG_MAX);
+            }
+            let edge = if at_edge { " (AT SEARCH BOUND -- noise, not a measurement)" } else { "" };
+            println!("  ch{ch}: below {cutoff:.0}Hz lag {lag}, corr {corr:.6}{edge}");
         }
     }
 }
