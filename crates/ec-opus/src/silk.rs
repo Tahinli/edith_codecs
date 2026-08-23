@@ -245,6 +245,25 @@ struct Indices {
     seed: i32,
 }
 
+/// Public snapshot of per-frame SILK parameters as decoded from the
+/// bitstream — used by the oracle diagnostic to compare our encoder's
+/// packets against ffmpeg-libopus's.
+#[derive(Clone, Debug, Default)]
+pub struct SilkDecIndices {
+    pub signal_type: i32,
+    pub quant_offset_type: i32,
+    pub gains: [i8; 4],
+    pub nlsf: [i8; 17],
+    pub nlsf_interp_coef_q2: i32,
+    pub lag_index: i32,
+    pub contour_index: i32,
+    pub per_index: usize,
+    pub ltp_index: [usize; 4],
+    pub ltp_scale_index: usize,
+    pub seed: i32,
+    pub frames_decoded: usize,
+}
+
 /// Everything `decode_parameters` produces for one frame.
 #[derive(Clone, Debug)]
 struct FrameCtrl {
@@ -418,6 +437,26 @@ impl SilkDecoder {
     pub(crate) fn history(&self) -> &[i16] {
         let ch = &self.channels[0];
         &ch.out_buf[..ch.ltp_mem_length]
+    }
+
+    /// Snapshot of the last decoded frame's index parameters for channel 0.
+    /// Used by the oracle diagnostic to inspect what the bitstream coded.
+    pub fn last_indices(&self) -> SilkDecIndices {
+        let ix = &self.channels[0].indices;
+        SilkDecIndices {
+            signal_type: ix.signal_type,
+            quant_offset_type: ix.quant_offset_type,
+            gains: ix.gains,
+            nlsf: ix.nlsf,
+            nlsf_interp_coef_q2: ix.nlsf_interp_coef_q2,
+            lag_index: ix.lag_index,
+            contour_index: ix.contour_index,
+            per_index: ix.per_index,
+            ltp_index: ix.ltp_index,
+            ltp_scale_index: ix.ltp_scale_index,
+            seed: ix.seed,
+            frames_decoded: self.channels[0].frames_decoded,
+        }
     }
 
     /// Drops all inter-packet state.

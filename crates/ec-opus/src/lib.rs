@@ -76,11 +76,12 @@ pub mod silk_enc_write;
 pub use celt::CeltDecoder;
 pub use celt_enc::CeltFrameDiag;
 pub use encoder::{Application, Encoder};
+pub use silk_enc_write::SilkFrameDiag;
 pub use multistream::MultistreamDecoder;
 pub use multistream_enc::MultistreamEncoder;
 pub use packet::{Bandwidth, Mode, Packet, Toc};
 pub use range::{RangeDecoder, RangeEncoder};
-pub use silk::SilkDecoder;
+pub use silk::{SilkDecIndices, SilkDecoder};
 pub use silk_enc_write::{SilkEncoder, SilkStereoEncoder};
 
 use ec_core::{Error, Result};
