@@ -878,25 +878,22 @@ fn real_clip_t8x8_bd_psnr() {
 // every reference and our encoder against nothing but itself.
 // ---------------------------------------------------------------------------
 
-/// Floor for [`bd_psnr_vs_x264`] on the synthetic clip. Our encoder measured
-/// -5.702 dB against x264 there on 2026-08-23 (352x288, 24 pictures of
+/// Floor for [`bd_psnr_vs_x264`] on the synthetic clip. Our encoder measures
+/// -4.523 dB against x264 there (352x288, 24 pictures of
 /// `Clip::render_smooth`, both encoders at their own default effort: our
 /// `Preset::Fast`, x264's `-preset medium`). The floor is that number with
 /// room for platform noise, so the distance can shrink but not grow
-/// unnoticed; it is not a claim that -5.7 dB is fine. On a 3840x1608 clip
-/// from the library the same measurement reads -0.233 dB and on a 2560x1440
-/// screen capture +0.068 dB, so this synthetic number is the pessimistic end
-/// of the range and not the typical one.
+/// unnoticed; it is not a claim that -4.5 dB is fine. On a 3840x1608 clip
+/// from the library the same measurement reads -0.728 dB and on a 2560x1440
+/// screen capture -0.500, so this synthetic number is the pessimistic end of
+/// the range and not the typical one.
 ///
-/// It moved -5.40 -> -5.75 when the intra-versus-inter penalty came off. That
-/// change is worth 1.17 dB on the film clip and takes fewer bits at every QP
-/// while doing it; here it spends 5% more bits for the same quality, because
-/// this clip's smooth ramps are what inter prediction is best at and any intra
-/// macroblock in a P picture is waste. The two contents disagreeing is the
-/// signal that the decision belongs on real coded cost rather than on a SATD
-/// comparison at all -- that is the next slice, not a reason to tune the
-/// threshold back toward this clip.
-const BD_PSNR_VS_X264_FLOOR: f64 = -4.5;
+/// It moved -4.449 -> -4.523 when the intra-versus-inter decision started
+/// coding both branches for real. That change is worth 0.315 dB on the film
+/// clip and 0.564 on the screen capture, and takes fewer bits at every QP
+/// while doing it. This clip prefers a heavier rate term in that decision
+/// (see the sweep in `enc/mb.rs`), which the two real clips do not.
+const BD_PSNR_VS_X264_FLOOR: f64 = -4.6;
 
 fn have_x264() -> bool {
     std::process::Command::new("ffmpeg")
