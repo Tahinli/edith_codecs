@@ -967,7 +967,12 @@ impl CeltEncoder {
         let dual_stereo = alloc.dual_stereo;
         let balance = alloc.balance;
         let coded_bands = alloc.coded_bands;
-        self.last_coded_bands = coded_bands;
+        // libopus: lastCodedBands follows codedBands by at most one band per frame.
+        self.last_coded_bands = if self.last_coded_bands != 0 {
+            coded_bands.clamp(self.last_coded_bands - 1, self.last_coded_bands + 1)
+        } else {
+            coded_bands
+        };
 
         // --- Fine energy ----------------------------------------------------
         for i in start..end {
