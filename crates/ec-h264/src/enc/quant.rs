@@ -162,10 +162,6 @@ pub(crate) fn forward_8x8(d: &[i32; 64]) -> [i64; 64] {
 /// precomputed shift because [`forward_8x8`]'s coefficients already carry
 /// far more headroom than a `<<15`-ish fixed point would give.
 #[inline]
-fn round_div(raw: i64, denom: i64, intra: bool) -> i64 {
-    (raw + denom / if intra { 3 } else { 6 }) / denom
-}
-
 /// Quantise an 8x8 [`forward_8x8`] output into scan (zig-zag) order, undoing
 /// both the `2_088_025` transform gain and the per-position [`LevelScale8x8`]
 /// / QP scale that [`crate::transform::dequant_8x8`] will re-apply.
@@ -174,6 +170,20 @@ pub(crate) fn quant_8x8(
     ls: &LevelScale8x8,
     qp: i32,
     intra: bool,
+    out: &mut [i32; 64],
+) -> u8 {
+    quant_8x8_offset(coef, ls, qp, if intra { 3 } else { 6 }, out)
+}
+
+/// [`quant_8x8`] with the rounding offset named outright: the level is
+/// `(raw + denom / divisor) / denom`, so a divisor of 2 rounds to nearest and
+/// 6 is the inter dead zone. A search that offers smaller magnitudes wants to
+/// pick this itself.
+pub(crate) fn quant_8x8_offset(
+    coef: &[i64; 64],
+    ls: &LevelScale8x8,
+    qp: i32,
+    divisor: i32,
     out: &mut [i32; 64],
 ) -> u8 {
     // 11560^2 / 64, see FWD8's doc comment.
@@ -193,7 +203,7 @@ pub(crate) fn quant_8x8(
         } else {
             (c.unsigned_abs() as i64, denom << -p)
         };
-        let level = round_div(num, denom, intra) as i32;
+        let level = ((num + denom / i64::from(divisor)) / denom) as i32;
         if level != 0 {
             nz += 1;
         }

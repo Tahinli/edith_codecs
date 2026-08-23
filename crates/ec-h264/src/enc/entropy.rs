@@ -197,6 +197,13 @@ impl EncEntropy {
     /// What [`Self::residual_block`] would spend on `coeff`, in 1/256ths of a
     /// bit, without writing it. `None` under CAVLC, whose cost a caller can
     /// only estimate.
+    pub(crate) fn residual_block_8x8_cost(&self, coeff: &[i32; 64]) -> Option<u32> {
+        match self {
+            EncEntropy::Cavlc { .. } => None,
+            EncEntropy::Cabac(c) => Some(c.residual_block_8x8_cost(coeff)),
+        }
+    }
+
     pub(crate) fn residual_block_cost(
         &self,
         coeff: &[i32],
