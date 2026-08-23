@@ -951,7 +951,8 @@ impl VorbisEncoder {
         if self.config.bitrate_bps <= 0 || delta <= 0 {
             return;
         }
-        let target = f64::from(self.config.bitrate_bps) * RATE_TARGET_SCALE * delta as f64
+        let scale = if self.config.bitrate_bps < 96_000 { 0.93 } else { RATE_TARGET_SCALE };
+        let target = f64::from(self.config.bitrate_bps) * scale * delta as f64
             / f64::from(self.config.sample_rate);
         if !steady {
             self.reservoir_debt += bits as f64 - target;
@@ -1053,7 +1054,8 @@ fn fit_floor(
         .enumerate()
         .map(|(i, (&level, &threshold))| {
             let h = headroom + tilt[i];
-            let threshold = threshold.max(loudest - co_mask);
+            let cm = if bark[i] > 19.0 { co_mask - 30.0 } else { co_mask };
+            let threshold = threshold.max(loudest - cm);
             let offset = (masking_offset - (h - range).max(0.0)).max(0.0);
             (level - h.min(range) + offset)
                 .max(threshold - (h - range).max(0.0))
