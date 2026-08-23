@@ -87,6 +87,10 @@ const SFB_LONG: usize = 21;
 /// is the loud channel (`mid_side_follows_the_channel_correlation`).
 const MS_ENERGY_RATIO: f64 = 1.0;
 
+/// How much of the frame budget follows each granule-channel's bit demand
+/// rather than being split evenly. Swept below.
+const DEMAND_SPLIT: f64 = 0.7;
+
 /// One granule's worth of coded spectrum plus the side info describing it.
 #[derive(Clone, Debug)]
 struct CodedGranule {
@@ -752,6 +756,29 @@ impl Mp3Encode {
             }
         }
 
+        // What each granule-channel asks for, as a share of the frame. The
+        // quantiser codes |xr|^(3/4), so the sum of that over a granule's
+        // lines is the shape of its bit demand: splitting the frame by it
+        // lets a quiet channel hand its bits to a loud one, which is what
+        // makes mid/side pay -- a side channel that is nearly silent no
+        // longer holds a quarter of the frame it cannot spend.
+        let count = (granules * channels).max(1);
+        let demand: Vec<f64> = xrs
+            .iter()
+            .map(|xr| xr.iter().map(|v| f64::from(v.abs()).powf(0.75)).sum())
+            .collect();
+        let demand_total: f64 = demand.iter().sum();
+        let demand_share = |budget: usize, index: usize| -> u32 {
+            let even = 1.0 / count as f64;
+            let asked = if demand_total > 0.0 {
+                demand[index] / demand_total
+            } else {
+                even
+            };
+            let part = (1.0 - DEMAND_SPLIT) * even + DEMAND_SPLIT * asked;
+            ((budget as f64 * part) as u32).min(PART2_3_MAX)
+        };
+
         // Quantise the granules. CBR codes to a fixed frame budget. VBR tries
         // legal bitrates, coding the whole frame's granules against each one's
         // share with the same distortion loop CBR uses, and keeps the
@@ -770,15 +797,19 @@ impl Mp3Encode {
                 let code_at = |candidate: u32| -> (Vec<CodedGranule>, f64) {
                     let header = self.header(candidate);
                     let capacity = header.frame_len().unwrap_or(0) - 4 - header.side_info_len();
-                    let share = ((capacity * 8) / (granules * channels).max(1))
-                        .min(PART2_3_MAX as usize) as u32;
                     let mut frame_coded = Vec::with_capacity(granules * channels);
                     let mut ratio = 0.0;
                     for index in 0..granules * channels {
                         let (granule, r) = quantise_granule(
                             &xrs[index],
                             types[index],
-                            share,
+                            // The even split, not the demand split CBR
+                            // uses: VBR picks its bitrate by the noise-to-mask
+                            // ratio a candidate reaches, and that mapping is
+                            // calibrated to what an even split produces. Both
+                            // want to change together, against a VBR reference
+                            // gate that does not exist yet.
+                            ((capacity * 8) / count).min(PART2_3_MAX as usize) as u32,
                             &thresholds[index],
                             self.sample_rate,
                         );
@@ -828,7 +859,6 @@ impl Mp3Encode {
                 let frame_len = header.frame_len().unwrap_or(0);
                 let capacity = frame_len - 4 - header.side_info_len();
                 let budget_bits = (self.assigned + capacity - self.used) * 8;
-                let share = budget_bits / (granules * channels).max(1);
                 let mut frame_coded = Vec::with_capacity(granules * channels);
                 for index in 0..granules * channels {
                     let spent: usize = frame_coded
@@ -836,7 +866,9 @@ impl Mp3Encode {
                         .map(|c: &CodedGranule| c.part2_3_length as usize)
                         .sum();
                     let left = budget_bits.saturating_sub(spent);
-                    let target = share.min(left).min(4095);
+                    let target = (demand_share(budget_bits, index) as usize)
+                        .min(left)
+                        .min(4095);
                     let (granule, _) = quantise_granule(
                         &xrs[index],
                         types[index],
