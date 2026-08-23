@@ -718,17 +718,20 @@ impl VorbisEncoder {
         } else {
             MASKING_OFFSET_DB
         };
-        // Per-post headroom tilt: LF boost, HF cut, long blocks only — the
-        // rate loop's global headroom rebalances the total bitrate.
-        let tilt: Vec<f64> = if plan.is_long {
+        // Per-post frequency, headroom tilt, and (for HF) the RMS-vs-peak
+        // choice: long blocks only — the rate loop's global headroom
+        // rebalances the total bitrate. Short blocks get a flat zero tilt and
+        // pure peak-hold (hz set to 0 so no post crosses the HF threshold).
+        let post_hz: Vec<f64> = if plan.is_long {
             bc.floor
                 .x_list
                 .iter()
-                .map(|&x| headroom_tilt(x as f64 * f64::from(self.config.sample_rate) / (2.0 * half as f64)))
+                .map(|&x| x as f64 * f64::from(self.config.sample_rate) / (2.0 * half as f64))
                 .collect()
         } else {
             vec![0.0; bc.floor.x_list.len()]
         };
+        let tilt: Vec<f64> = post_hz.iter().map(|&hz| headroom_tilt(hz)).collect();
         let (floor_values, quantised) = loop {
             let mut curves: Vec<Vec<f32>> = vec![Vec::new(); channels];
             let mut floor_values: Vec<Vec<i32>> = vec![Vec::new(); channels];
@@ -971,7 +974,11 @@ impl VorbisEncoder {
 ///
 /// Each point owns the coefficients halfway to its neighbours either side, so
 /// the whole spectrum is covered exactly once and a peak between two points
-/// still raises the floor that has to carry it.
+/// still raises the floor that has to carry it. Peak-hold is used at every
+/// frequency: per-region RMS was tried at HF (>6 kHz, r3 E3) but it lowers the
+/// floor estimate, promoting noise-like HF bins to residue and regressing
+/// correlation — peak-hold plus the HF headroom tilt zeros them instead, which
+/// matches the reference. See lanes/vorbis-floor-r3.report.md.
 fn peaks_of(floor: &Floor1, half: usize, spectra: &[&Vec<f32>]) -> Vec<f64> {
     let x = &floor.x_list;
     x.iter()
