@@ -1169,7 +1169,7 @@ fn real_library_sweep_vs_reference() {
     let max_samples = rate as usize * 600;
     let out_dir = scratch().join("vorbis7-sweep");
     std::fs::create_dir_all(&out_dir).expect("out dir");
-    let mut table = String::from("source  kbps   ours_kbps ref_kbps rate%   corr_ours corr_ref gap     verdict\n");
+    let mut table = String::from("source  kbps   ours_kbps ref_kbps rate%   corr_ours corr_ref gap     minsec_o minsec_r drops verdict\n");
     let mut failures = Vec::new();
     let only = std::env::var("SWEEP_ONLY").ok();
     for &(name, src_path) in sources {
@@ -1204,20 +1204,39 @@ fn real_library_sweep_vs_reference() {
             let ours = encode_to_file(&source_pcm, rate, (ref_kbps * 1000.0).round() as i32, &format!("vorbis7-sweep/ours-{name}-{kbps}k.ogg"));
             let ours_kbps = bytes(&ours) * 8.0 / seconds / 1000.0;
             let rate_pct = (ours_kbps / ref_kbps - 1.0) * 100.0;
-            let corr_of = |p: &Path| -> f64 {
+            // Whole-file corr plus a per-second trace: a dropout (the
+            // rate-loop windup class, 200 ms silences after transients) is
+            // invisible in the mean and bimodal per second, so it is gated
+            // as "seconds where ours is under 0.9 and the reference is not".
+            let corr_of = |p: &Path| -> (f64, Vec<f64>) {
                 let (pcm, _) = our_decode(p);
                 let n = pcm[0].len().min(source_pcm[0].len());
-                (0..2).map(|c| correlation(&pcm[c][..n], &source_pcm[c][..n])).sum::<f64>() / 2.0
+                let mean = (0..2).map(|c| correlation(&pcm[c][..n], &source_pcm[c][..n])).sum::<f64>() / 2.0;
+                let step = rate as usize;
+                let per_second = (0..n / step)
+                    .map(|s| {
+                        let r = s * step..(s + 1) * step;
+                        (0..2).map(|c| correlation(&pcm[c][r.clone()], &source_pcm[c][r.clone()])).sum::<f64>() / 2.0
+                    })
+                    .collect();
+                (mean, per_second)
             };
-            let corr_ours = corr_of(&ours);
-            let corr_ref = corr_of(&reference);
+            let (corr_ours, sec_ours) = corr_of(&ours);
+            let (corr_ref, sec_ref) = corr_of(&reference);
             let gap = corr_ref - corr_ours;
-            let pass = rate_pct.abs() <= 3.0 && gap <= 0.005;
+            let min_of = |v: &[f64]| v.iter().copied().fold(1.0f64, f64::min);
+            let (min_ours, min_ref) = (min_of(&sec_ours), min_of(&sec_ref));
+            let dropouts = sec_ours
+                .iter()
+                .zip(&sec_ref)
+                .filter(|(o, r)| **o < 0.9 && **r >= 0.9)
+                .count();
+            let pass = rate_pct.abs() <= 3.0 && gap <= 0.005 && dropouts == 0;
             if !pass {
-                failures.push(format!("{name}@{kbps}k rate {rate_pct:+.2}% gap {gap:.4}"));
+                failures.push(format!("{name}@{kbps}k rate {rate_pct:+.2}% gap {gap:.4} dropouts {dropouts}"));
             }
             table.push_str(&format!(
-                "{name:<7} {kbps:<6} {ours_kbps:<9.1} {ref_kbps:<8.1} {rate_pct:+6.2} {corr_ours:<9.4} {corr_ref:<8.4} {gap:<7.4} {}\n",
+                "{name:<7} {kbps:<6} {ours_kbps:<9.1} {ref_kbps:<8.1} {rate_pct:+6.2} {corr_ours:<9.4} {corr_ref:<8.4} {gap:<7.4} {min_ours:<8.3} {min_ref:<7.3} {dropouts:<5} {}\n",
                 if pass { "PASS" } else { "FAIL" }
             ));
             eprintln!("{}", table.lines().last().unwrap());
