@@ -355,15 +355,26 @@ pub(crate) fn encode_mb(pic: &mut Picture, e: &mut MbEnc<'_>, w: &mut EncEntropy
         inter = Some(choose_inter(pic, e, mb_x, mb_y));
     }
 
-    // Intra cost against the inter one: a P macroblock goes intra only when it
-    // is clearly cheaper, because an intra macroblock in a P picture also costs
-    // the next picture's prediction quality. Skipping the intra trial when the
-    // inter cost is already low was measured and dropped: it cost 0.7 dB on
-    // screen capture and bought no measurable time.
+    // Intra cost against the inter one, with no thumb on the scale. An eight-bit
+    // penalty used to be added to the intra side, on the theory that an intra
+    // macroblock in a P picture also costs the next picture's prediction
+    // quality. Measured, it costs the opposite: removing it is worth 1.17 dB
+    // BD-PSNR against x264 on a 3840x1608 film clip at GOP 10 (-1.404 ->
+    // -0.233 dB) and 0.10 dB on a 2560x1440 screen capture (-0.033 -> +0.068),
+    // and it is not a rate-quality trade -- at every one of QP 22/26/30/34 the
+    // unpenalised encoder is both smaller and 0.15-1.2 dB better, because the
+    // intra macroblocks it now places stop drift accumulating across the GOP.
+    // Penalties of 1, 2, 4 and 8 bits all measured worse and negative ones
+    // measured the same, so zero is the flat part of the curve, not a tuned
+    // value.
+    //
+    // Skipping the intra trial when the inter cost is already low was measured
+    // and dropped: it cost 0.7 dB on screen capture and bought no measurable
+    // time.
     let intra_cost = intra_pre_cost(pic, e, &nbr, mb_x, mb_y);
     let go_intra = match &inter {
         None => true,
-        Some(i) => intra_cost.best() + motion_rate(e, 8.0) < i.cost,
+        Some(i) => intra_cost.best() < i.cost,
     };
 
     if go_intra {
