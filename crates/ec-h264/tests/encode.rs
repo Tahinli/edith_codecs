@@ -699,3 +699,111 @@ fn real_library_frames_encode_and_decode_exactly() {
     );
     assert!(quality > 30.0, "luma PSNR {quality:.2} dB at 8 Mbit/s");
 }
+
+/// BD-PSNR of the opt-in `transform_8x8` flag against flag-off on one real
+/// clip from the library, full size, over a QP sweep: the number the synthetic
+/// gate above cannot give, because the synthetic clip is content the flag wins
+/// on. Prints the per-QP points, the BD-PSNR and the 8x8 macroblock share;
+/// asserts nothing, so a regressing clip fails a gate, not the test run.
+///
+///     EC_H264_CLIP=<file> cargo test --release -p ec-h264 --test encode \
+///         real_clip_t8x8_bd_psnr -- --ignored --nocapture
+#[test]
+#[ignore = "set EC_H264_CLIP to a media file of yours"]
+fn real_clip_t8x8_bd_psnr() {
+    use ec_core::registry::{Decoder as _, Demuxer as _};
+
+    let Some(path) = std::env::var_os("EC_H264_CLIP") else {
+        panic!("EC_H264_CLIP must name a media file");
+    };
+    // The first 30 pictures a second apart, demuxed by ec-mp4 and decoded by
+    // this crate: every Nth frame, N the source frame rate.
+    let file = std::fs::File::open(&path).expect("source opens");
+    let mut demux =
+        ec_mp4::Mp4Demuxer::new(std::io::BufReader::new(file)).expect("ec-mp4 opens the file");
+    let (index, params) = demux
+        .streams()
+        .iter()
+        .find(|s| s.params.codec == ec_core::registry::CodecId::H264)
+        .map(|s| (s.index, s.params.clone()))
+        .expect("an H.264 track");
+    let video = match &params.media {
+        ec_core::registry::MediaParameters::Video(v) => v,
+        _ => panic!("the H.264 track carries no video parameters"),
+    };
+    let (w, h) = (video.width as usize, video.height as usize);
+    let stride = video
+        .frame_rate
+        .map_or(25, |r| (r.as_secs_f64().round() as usize).max(1));
+    let mut dec = ec_h264::H264Decoder::new(params).expect("decoder");
+    let mut sources: Vec<Planes> = Vec::new();
+    let mut seen = 0usize;
+    while sources.len() < 30 {
+        let Ok(packet) = demux.next_packet() else {
+            break;
+        };
+        if packet.stream != index {
+            continue;
+        }
+        dec.send_packet(&packet).expect("decode");
+        while let Ok(ec_core::frame::Frame::Video(f)) = dec.receive_frame() {
+            if sources.len() < 30 && seen % stride == 0 {
+                sources.push(planes_of(&f));
+            }
+            seen += 1;
+        }
+    }
+    assert!(
+        sources.len() >= 10,
+        "only {} pictures decoded from {}",
+        sources.len(),
+        path.to_string_lossy()
+    );
+    eprintln!(
+        "{}: {}x{}, {} pictures 1 s apart (every {stride}th of {seen})",
+        path.to_string_lossy(),
+        w,
+        h,
+        sources.len()
+    );
+
+    let run = |t8x8: bool, qp: i32| {
+        let mut cfg = EncoderConfig::new(w as u32, h as u32);
+        cfg.qp = qp;
+        cfg.gop_size = 10;
+        cfg.cabac = true;
+        cfg.transform_8x8 = t8x8;
+        cfg.framerate = 1.0; // the kept pictures are a second apart
+        cfg.threads = 0;
+        let mut enc = Encoder::new(cfg).expect("encoder");
+        let (mut bits, mut sum_psnr) = (0usize, 0.0);
+        for (y, u, v) in &sources {
+            let view = PictureView::i420(w as u32, h as u32, y, u, v);
+            bits += enc.encode(&view).expect("encode").au.len() * 8;
+            let rec = enc.reconstruction().expect("reconstruction");
+            sum_psnr += psnr(y, &rec.0);
+        }
+        let (i8x8, p8x8) = enc.transform_8x8_mbs();
+        let share = (i8x8 + p8x8) as f64 / (sources.len() * (w / 16) * (h / 16)) as f64;
+        (bits as f64, sum_psnr / sources.len() as f64, share)
+    };
+    let qps = [22, 26, 30, 34];
+    let off: Vec<_> = qps.iter().map(|&q| run(false, q)).collect();
+    let on: Vec<_> = qps.iter().map(|&q| run(true, q)).collect();
+    for (i, &qp) in qps.iter().enumerate() {
+        let (ob, op, _) = off[i];
+        let (nb, np, share) = on[i];
+        eprintln!(
+            "qp {qp}: flag-off {ob:.0} bits {op:.2} dB | flag-on {nb:.0} bits {np:.2} dB, 8x8 share {:.1}%",
+            share * 100.0
+        );
+    }
+    let on_curve: Vec<_> = on.iter().map(|&(bits, psnr, _)| (bits, psnr)).collect();
+    let off_curve: Vec<_> = off.iter().map(|&(bits, psnr, _)| (bits, psnr)).collect();
+    let bd = bd_psnr_delta(&on_curve, &off_curve);
+    let share = on.iter().map(|&(_, _, s)| s).sum::<f64>() / on.len() as f64;
+    eprintln!(
+        "BD-PSNR flag-on vs flag-off over q22/26/30/34: {bd:+.3} dB, average 8x8 MB share {:.1}%",
+        share * 100.0
+    );
+}
