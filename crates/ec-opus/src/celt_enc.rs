@@ -273,6 +273,42 @@ struct EncBand {
     lm: i32,
 }
 
+/// Per-frame encoder diagnostics for the dropout investigation. Captured at
+/// the end of [`CeltEncoder::encode`]; read via [`CeltEncoder::last_diag`].
+#[derive(Clone, Debug, Default)]
+pub struct CeltFrameDiag {
+    /// Transient flag as coded into the bitstream.
+    pub is_transient: bool,
+    /// `short_blocks` (0 = long, else `m` short blocks).
+    pub short_blocks: usize,
+    /// Coarse-energy intra-frame reset was used.
+    pub intra: bool,
+    /// The whole frame was coded as silence.
+    pub silence: bool,
+    /// Frame-size exponent (`120 << lm`).
+    pub lm: usize,
+    /// First/last coded band indices.
+    pub start: usize,
+    /// Highest band actually allocated pulses.
+    pub coded_bands: usize,
+    /// Stereo intensity band (bands >= this collapse to mono).
+    pub intensity: usize,
+    /// Dual-stereo (no mid/side folding) flag.
+    pub dual_stereo: bool,
+    /// Allocation trim index (0..10).
+    pub alloc_trim: i32,
+    /// Constrained-VBR reservoir level after this frame, in 1/8-bit units.
+    pub vbr_reservoir: i32,
+    /// Final compressed payload of this frame, in bytes.
+    pub nb_compressed: usize,
+    /// Per-band log2 energy minus `E_MEANS`, both channels (ch0 then ch1).
+    pub band_log_e: [f32; 2 * NB_BANDS],
+    /// Per-band allocated pulses (ch0/ch1 share for intensity bands).
+    pub pulses: [i32; NB_BANDS],
+    /// Per-band fine-energy precision bits.
+    pub fine_quant: [i32; NB_BANDS],
+}
+
 /// A CELT-layer encoder for one elementary Opus stream (mono or stereo).
 /// CELT itself always runs at 48 kHz; slower input is zero-stuffed up to it.
 #[derive(Clone, Debug)]
@@ -315,6 +351,8 @@ pub struct CeltEncoder {
     pvq_y: Vec<f32>,
     pvq_sign: Vec<i32>,
     urow: Vec<u32>,
+    /// Per-frame diagnostics captured at the end of the last `encode` call.
+    last_diag: CeltFrameDiag,
 }
 
 impl CeltEncoder {
@@ -357,12 +395,20 @@ impl CeltEncoder {
             pvq_y: vec![0.0; max_n],
             pvq_sign: vec![0; max_n],
             urow: vec![0; 1280],
+            last_diag: CeltFrameDiag::default(),
         }
     }
 
     /// Channels this encoder codes.
     pub fn channels(&self) -> usize {
         self.channels
+    }
+
+    /// Diagnostics captured at the end of the most recent [`encode`] call.
+    ///
+    /// [`encode`]: CeltEncoder::encode
+    pub fn last_diag(&self) -> &CeltFrameDiag {
+        &self.last_diag
     }
 
     /// Drops all inter-frame state.
@@ -844,9 +890,28 @@ impl CeltEncoder {
         if enc.error() {
             return Err(Error::corrupt("celt encode: busted the frame budget"));
         }
+        // Capture per-frame diagnostics for the dropout investigation.
+        let mut band_log_e = [0.0f32; 2 * NB_BANDS];
+        band_log_e[..2 * NB_BANDS].copy_from_slice(&self.band_log_e);
+        self.last_diag = CeltFrameDiag {
+            is_transient,
+            short_blocks,
+            intra,
+            silence,
+            lm,
+            start,
+            coded_bands,
+            intensity,
+            dual_stereo,
+            alloc_trim,
+            vbr_reservoir: self.vbr_reservoir,
+            nb_compressed,
+            band_log_e,
+            pulses: self.pulses,
+            fine_quant: self.fine_quant,
+        };
         Ok(nb_compressed)
     }
-
     // -- Analysis ------------------------------------------------------------
 
     /// `transient_analysis()`: a high-passed peak-decay detector, straight

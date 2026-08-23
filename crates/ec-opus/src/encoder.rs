@@ -218,6 +218,16 @@ impl Encoder {
         self.final_range
     }
 
+    /// Per-frame CELT diagnostics from the most recent [`encode_float`] call.
+    /// Intended for the sadie@64k dropout investigation; the fields are only
+    /// meaningful when the last frame was coded as pure CELT (the path every
+    /// fullband Audio frame at 64 kbps stereo takes).
+    ///
+    /// [`encode_float`]: Encoder::encode_float
+    pub fn last_celt_diag(&self) -> &crate::celt_enc::CeltFrameDiag {
+        self.celt.last_diag()
+    }
+
     /// Drops all inter-frame state; the next packet starts like the first.
     pub fn reset(&mut self) {
         self.celt.reset();
