@@ -275,7 +275,7 @@ struct EncBand {
 
 /// Per-frame encoder diagnostics for the dropout investigation. Captured at
 /// the end of [`CeltEncoder::encode`]; read via [`CeltEncoder::last_diag`].
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct CeltFrameDiag {
     /// Transient flag as coded into the bitstream.
     pub is_transient: bool,
@@ -307,6 +307,28 @@ pub struct CeltFrameDiag {
     pub pulses: [i32; NB_BANDS],
     /// Per-band fine-energy precision bits.
     pub fine_quant: [i32; NB_BANDS],
+}
+
+impl Default for CeltFrameDiag {
+    fn default() -> Self {
+        Self {
+            is_transient: false,
+            short_blocks: 0,
+            intra: false,
+            silence: false,
+            lm: 0,
+            start: 0,
+            coded_bands: 0,
+            intensity: 0,
+            dual_stereo: false,
+            alloc_trim: 0,
+            vbr_reservoir: 0,
+            nb_compressed: 0,
+            band_log_e: [0.0; 2 * NB_BANDS],
+            pulses: [0; NB_BANDS],
+            fine_quant: [0; NB_BANDS],
+        }
+    }
 }
 
 /// A CELT-layer encoder for one elementary Opus stream (mono or stereo).
@@ -698,15 +720,86 @@ impl CeltEncoder {
         // --- Constrained VBR ------------------------------------------------
         if vbr_rate > 0 {
             let lm_diff = 3 - lm as i32;
-            let mut target =
+            let base_target =
                 vbr_rate + (self.vbr_offset >> lm_diff) - ((40 * c as i32 + 20) << BITRES);
-            // tf_sum is zero with tf analysis disabled, so only the transient
-            // boost of the reference's ladder applies.
+            let mut target = base_target;
+            // compute_vbr shaping (libopus celt_encoder.c:1605-1716), minus the
+            // terms that need tonality/tf analysis this encoder does not run.
+            let coded_bands = end - 1;
+            let intensity_est = if c == 2 {
+                // Same thresholds as the stereo section below (16 at 64k stereo).
+                let effective_rate = 2 * (((8 * effective_bytes - 80) >> lm) as i32) / 5;
+                let i = if effective_rate < 35 {
+                    8usize
+                } else if effective_rate < 50 {
+                    12
+                } else if effective_rate < 68 {
+                    16
+                } else if effective_rate < 84 {
+                    18
+                } else if effective_rate < 102 {
+                    19
+                } else if effective_rate < 130 {
+                    20
+                } else {
+                    100
+                };
+                i.clamp(start, coded_bands)
+            } else {
+                0
+            };
+            let coded_bins =
+                (E_BANDS[coded_bands] + if c == 2 { E_BANDS[intensity_est] } else { 0 }) << lm;
+            // Activity cut. libopus reads activity from tonality analysis; the
+            // peak-band level (dB, both channels) is a monotone stand-in:
+            // silence maps to ~0 (max cut), music to ~1 (no cut).
+            let mut peak = f32::NEG_INFINITY;
+            for ch in 0..c {
+                for i in start..end {
+                    let lvl = self.band_log_e[i + ch * NB_BANDS] + E_MEANS[i];
+                    if lvl > peak {
+                        peak = lvl;
+                    }
+                }
+            }
+            let activity = ((peak * 3.0103 - 5.0) / 20.0).clamp(0.0, 1.0);
+            if activity < 0.4 {
+                target -= (coded_bins as f32 * 8.0 * (0.4 - activity)) as i32;
+            }
+            // dynalloc boost minus its calibration average.
+            target += total_boost - (19 << lm);
+            // tf boost: transient frames take the fixed 7/4 stand-in; steady
+            // frames take the tf-bias at the music-average estimate 0.05
+            // (libopus: 2*(tf_estimate-0.044)*target).
             if short_blocks != 0 {
                 target = 7 * target / 4;
-            } else if m > 1 {
-                target -= (target + 14) / 28;
+            } else {
+                target += (0.012 * target as f32) as i32;
             }
+            // Spectral-floor cap (libopus floor_depth): binds only when every
+            // band sits close to the coding noise floor.
+            {
+                let bins = E_BANDS[NB_BANDS - 2] << lm;
+                let mut max_depth = -31.9f32 / 3.0103;
+                for ch in 0..c {
+                    for i in start..end {
+                        let noise_floor = LOG_N[i] as f32 / 385.3
+                            + 0.166
+                            - 4.983
+                            - E_MEANS[i] / 48.2
+                            + 0.00206 * (i + 5) as f32 * (i + 5) as f32;
+                        let depth = self.band_log_e[i + ch * NB_BANDS] + E_MEANS[i] - noise_floor;
+                        if depth > max_depth {
+                            max_depth = depth;
+                        }
+                    }
+                }
+                let floor_depth = ((c * bins) as f32 * 3.0103 * 8.0 * max_depth) as i32;
+                let floor_depth = floor_depth.max(target >> 2);
+                target = target.min(floor_depth);
+            }
+            // Never more than double the base rate.
+            target = target.min(2 * base_target);
             target += tell_frac;
             let min_allowed =
                 ((tell_frac + total_boost + (1 << (BITRES + 3)) - 1) >> (BITRES + 3)) + 2;
@@ -716,7 +809,6 @@ impl CeltEncoder {
             let mut delta = target - vbr_rate;
             target = nb_avail << (BITRES + 3);
             if silence {
-                nb_avail = 2;
                 delta = 0;
             }
             let alpha = if self.vbr_count < 970 {
@@ -731,12 +823,19 @@ impl CeltEncoder {
                     - self.vbr_offset as f32
                     - self.vbr_drift as f32)) as i32;
             self.vbr_offset = -self.vbr_drift;
+            // Bound banked credit at eight frames' worth of rate.
+            self.vbr_reservoir = self.vbr_reservoir.max(-8 * vbr_rate);
             if self.vbr_reservoir < 0 {
-                let adjust = (-self.vbr_reservoir) / (8 << BITRES);
+                // Release banked credit slowly (8 bytes per frame) so it stays
+                // available for transient boosts; libopus CVBR re-adds all of
+                // it to the next frame, which would defeat banking entirely.
+                let adjust = ((-self.vbr_reservoir) / (8 << BITRES)).min(8);
                 if !silence {
                     nb_avail += adjust;
+                    self.vbr_reservoir += adjust << (BITRES + 3);
+                } else {
+                    self.vbr_reservoir = 0;
                 }
-                self.vbr_reservoir = 0;
             }
             let shrunk = (nb_compressed as i32).min(nb_avail).max(2) as usize;
             if shrunk < nb_compressed {
