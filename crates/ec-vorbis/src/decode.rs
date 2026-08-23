@@ -47,6 +47,14 @@ pub struct VorbisDecoder {
     next_pts: Option<i64>,
     frames: VecDeque<Frame>,
     drained: bool,
+    /// Per-block captured decoded residue: (half, per-channel integer residue).
+    /// Populated only when `enable_residue_capture` is set.
+    residue_capture: Vec<(usize, Vec<Vec<i32>>)>,
+    /// Per-block bit split captured alongside: (floor bits, residue bits, packet bits).
+    bit_split: Vec<(u64, u64, u64)>,
+    /// When true, `decode_audio` copies each block's residue (after inverse
+    /// coupling, before floor multiply) into `residue_capture`.
+    enable_residue_capture: bool,
 }
 
 impl VorbisDecoder {
@@ -85,6 +93,9 @@ impl VorbisDecoder {
             next_pts: None,
             frames: VecDeque::new(),
             drained: false,
+            residue_capture: Vec::new(),
+            bit_split: Vec::new(),
+            enable_residue_capture: false,
             ident,
             comments,
             setup,
@@ -146,6 +157,8 @@ impl VorbisDecoder {
         }
 
         let mapping = &self.setup.mappings[mode.mapping];
+        let packet_bits = u64::from(data.len() as u64) * 8;
+        let before_floors = bits.remaining();
         let mut floors = Vec::with_capacity(channels);
         let mut no_residue = Vec::with_capacity(channels);
         for &submap in mapping.mux.iter().take(channels) {
@@ -160,6 +173,7 @@ impl VorbisDecoder {
             no_residue.push(state.is_unused());
             floors.push(state);
         }
+        let after_floors = bits.remaining();
         // A coupled pair shares its residue, so one live channel keeps both.
         for &(magnitude, angle) in &mapping.coupling {
             if !no_residue[magnitude] || !no_residue[angle] {
@@ -222,6 +236,20 @@ impl VorbisDecoder {
             }
             spectra[magnitude] = mags;
             spectra[angle] = angles;
+        }
+
+        if self.enable_residue_capture {
+            let after_residues = bits.remaining();
+            self.bit_split.push((
+                before_floors - after_floors,
+                after_floors - after_residues,
+                packet_bits,
+            ));
+            let captured: Vec<Vec<i32>> = spectra
+                .iter()
+                .map(|ch| ch.iter().map(|&v| v.round() as i32).collect())
+                .collect();
+            self.residue_capture.push((half, captured));
         }
 
         // Floor times residue, then out of the frequency domain.
@@ -320,8 +348,23 @@ impl VorbisDecoder {
         self.frames.clear();
         self.drained = false;
     }
-}
 
+    /// Enable per-block residue capture for offline histogram analysis.
+    pub fn enable_residue_capture(&mut self) {
+        self.enable_residue_capture = true;
+    }
+
+    /// Take the captured per-block residue: each entry is `(half, per-channel integer residue)`.
+    pub fn take_residue_capture(&mut self) -> Vec<(usize, Vec<Vec<i32>>)> {
+        std::mem::take(&mut self.residue_capture)
+    }
+
+    /// Take the per-block (floor bits, residue bits, packet bits) captured with the residue.
+    pub fn take_bit_split(&mut self) -> Vec<(u64, u64, u64)> {
+        std::mem::take(&mut self.bit_split)
+    }
+
+}
 /// Vorbis channel order (§4.3.9) mapped onto [`ChannelLayout`]'s order.
 ///
 /// Vorbis orders a 5.1 stream FL, FC, FR, BL, BR, LFE and a 7.1 stream FL, FC,

@@ -262,6 +262,12 @@ pub struct VorbisEncoder {
     reservoir_debt: f64,
     finished: bool,
     packets: std::collections::VecDeque<EncodedPacket>,
+    /// Per-block captured quantised residue: (half, per-channel quantised).
+    /// Populated only when `enable_residue_capture` is set.
+    residue_capture: Vec<(usize, Vec<Vec<i32>>)>,
+    /// When true, `encode_block` copies each block's quantised residue into
+    /// `residue_capture` for offline histogram analysis.
+    enable_residue_capture: bool,
 }
 
 impl VorbisEncoder {
@@ -358,6 +364,8 @@ impl VorbisEncoder {
             class_book,
             residue_books,
             coupling,
+            residue_capture: Vec::new(),
+            enable_residue_capture: false,
         })
     }
 
@@ -374,6 +382,21 @@ impl VorbisEncoder {
     /// Parameters describing the stream, `extradata` included.
     pub fn parameters(&self) -> &CodecParameters {
         &self.params
+    }
+
+    /// Enable per-block quantised-residue capture for offline histogram analysis.
+    pub fn enable_residue_capture(&mut self) {
+        self.enable_residue_capture = true;
+    }
+
+    /// Take the captured per-block quantised residue: each entry is `(half, per-channel quantised)`.
+    pub fn take_residue_capture(&mut self) -> Vec<(usize, Vec<Vec<i32>>)> {
+        std::mem::take(&mut self.residue_capture)
+    }
+
+    /// Frequency in Barks for a given Hz — public so tests can bin by band.
+    pub fn bark_hz(hz: f64) -> f64 {
+        bark(hz)
     }
 
     /// Push planar samples, one slice per channel in [`ec_core::ChannelLayout`] order.
@@ -801,6 +824,37 @@ impl VorbisEncoder {
                 break (floor_values, quantised);
             }
         };
+        if self.enable_residue_capture {
+            // The bitstream stores the coupled magnitude/angle form; the
+            // decoder inverse-couples before floor multiply.  Capture in that
+            // same per-channel domain so the histogram matches the decoder-
+            // side reference capture exactly (sanity: decoding our own .ogg
+            // reproduces these vectors).
+            // Main codes the full `half * channels` interleaved region (no
+            // HF truncation), so every bin below `half` is coded and the
+            // capture keeps the whole per-channel vector.
+            let coded = half;
+            let mut per_channel: Vec<Vec<i32>> = quantised
+                .iter()
+                .map(|ch| {
+                    let mut v = ch[..coded].to_vec();
+                    v.resize(half, 0);
+                    v
+                })
+                .collect();
+            for &(magnitude, angle) in &self.coupling {
+                let mut mags = std::mem::take(&mut per_channel[magnitude]);
+                let mut angs = std::mem::take(&mut per_channel[angle]);
+                for (m, a) in mags.iter_mut().zip(angs.iter_mut()) {
+                    let (l, r) = decouple(*m, *a);
+                    *m = l;
+                    *a = r;
+                }
+                per_channel[magnitude] = mags;
+                per_channel[angle] = angs;
+            }
+            self.residue_capture.push((half, per_channel));
+        }
 
         let mut out = BitsOut::new();
         out.bit(false);
@@ -1086,6 +1140,18 @@ fn couple(left: i32, right: i32) -> (i32, i32) {
             true => (left, right - left),
             false => (right, right - left),
         },
+    }
+}
+/// Inverse square-polar coupling on integer residue — the exact inverse of
+/// [`couple`] and the integer form of the decoder's §9.4.2 step.  Used only to
+/// bring the residue capture back to per-channel (magnitude/angle undone) so it
+/// matches the decoder-side capture domain.
+fn decouple(m: i32, a: i32) -> (i32, i32) {
+    match (m > 0, a > 0) {
+        (true, true) => (m, m - a),
+        (true, false) => (m + a, m),
+        (false, true) => (m, m + a),
+        (false, false) => (m - a, m),
     }
 }
 
