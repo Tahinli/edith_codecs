@@ -2984,7 +2984,7 @@ fn encoder_library_gate_vs_libopus() {
 
     let mut table = String::new();
     table.push_str("# ec-opus encoder vs ffmpeg libopus — encoders-only gate (r1)\n");
-    table.push_str("# both bitstreams decoded by ec-opus; 600s cap; VBR; 48kHz stereo\n");
+    table.push_str("# both bitstreams decoded by ec-opus; 120s cap; VBR; 48kHz stereo\n");
     table.push_str("# source\tkbps\tours_kbps\tref_kbps\trate%\tcorr_ours\tcorr_ref\tgap\t\
                     Q_ours\tQ_ref\terr_ratio\tminsec_ours\tminsec_ref\tdrop_ours\tdrop_ref\n");
     for r in &rows {
@@ -3010,4 +3010,169 @@ fn encoder_library_gate_vs_libopus() {
         dropout_violations.join("\n  ")
     );
     println!("DROPOUT GATE: passed (no ours-only dropouts)");
+}
+
+// ---------------------------------------------------------------------------
+// Harness: feed identical raw PCM (.sw, s16le interleaved) to our opus_compare
+// so it can be checked against the C `opus_compare` tool on the SAME bytes.
+// Run: SW_REF=a.sw SW_TEST=b.sw SW_CH=2 cargo test -p ec-opus --release \
+//      opus_compare_harness -- --ignored --nocapture
+// ---------------------------------------------------------------------------
+#[test]
+#[ignore]
+fn opus_compare_harness() {
+    let ref_path = std::env::var("SW_REF").expect("SW_REF");
+    let test_path = std::env::var("SW_TEST").expect("SW_TEST");
+    let channels: usize = std::env::var("SW_CH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2);
+    let x = read_i16(Path::new(&ref_path));
+    let y = read_i16(Path::new(&test_path));
+    assert_eq!(
+        x.len(),
+        y.len(),
+        "sample counts differ: {} ({} samples) vs {} ({} samples)",
+        ref_path,
+        x.len() / channels,
+        test_path,
+        y.len() / channels
+    );
+    let err = opus_compare_err(&x, &y, channels);
+    let q = opus_compare(&x, &y, channels);
+    println!("HARNESS err={err:.6} Q={q:.4} ch={channels} n={}", x.len() / channels);
+}
+
+// ---------------------------------------------------------------------------
+// Harness: read a source .sw, encode via ec-opus at SW_KBPS, decode, align,
+// write the aligned decoded pair to SW_OUT_SRC / SW_OUT_DEC (.sw s16le), and
+// print our opus_compare err/Q. The dumped .sw files can then be fed to the C
+// `opus_compare` tool on IDENTICAL bytes for a byte-exact cross-check.
+// Run: SW_SRC=in.sw SW_KBPS=96 SW_OUT_SRC=as.sw SW_OUT_DEC=ad.sw \
+//      cargo test -p ec-opus --release opus_compare_harness_ours -- --ignored --nocapture
+// ---------------------------------------------------------------------------
+#[test]
+#[ignore]
+fn opus_compare_harness_ours() {
+    let src_path = std::env::var("SW_SRC").expect("SW_SRC");
+    let kbps: u32 = std::env::var("SW_KBPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .expect("SW_KBPS");
+    let channels: usize = std::env::var("SW_CH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2);
+    let out_src = std::env::var("SW_OUT_SRC").expect("SW_OUT_SRC");
+    let out_dec = std::env::var("SW_OUT_DEC").expect("SW_OUT_DEC");
+
+    let src_i16 = read_i16(Path::new(&src_path));
+    let src_f32: Vec<f32> = src_i16.iter().map(|&v| v as f32 / 32768.0).collect();
+    let mut enc = Encoder::new(48000, channels, Application::Audio).expect("encoder");
+    enc.set_bitrate(kbps * 1000);
+    enc.set_vbr_constrained(true);
+    let (dec_f32, _bytes) = roundtrip_own(&mut enc, &src_f32, channels, 960);
+    let (lag, aligned) = align_to_source(&src_f32, &dec_f32, channels, 2000);
+    // Trim both to the common aligned length.
+    let n = (src_f32.len() / channels).min(aligned.len() / channels);
+    let mut s_i16 = vec![0i16; n * channels];
+    let mut d_i16 = vec![0i16; n * channels];
+    for i in 0..n {
+        for ch in 0..channels {
+            s_i16[i * channels + ch] =
+                (src_f32[i * channels + ch] * 32768.0).round().clamp(-32768.0, 32767.0) as i16;
+            d_i16[i * channels + ch] =
+                (aligned[i * channels + ch] * 32768.0).round().clamp(-32768.0, 32767.0) as i16;
+        }
+    }
+    fs::write(&out_src, bytemap(&s_i16)).unwrap();
+    fs::write(&out_dec, bytemap(&d_i16)).unwrap();
+    let err = opus_compare_err(&s_i16, &d_i16, channels);
+    let q = opus_compare(&s_i16, &d_i16, channels);
+    let c = corr_interleaved(&src_f32[..n * channels], &aligned, channels);
+    println!(
+        "HARNESS_OURS lag={lag} corr={c:.4} err={err:.6} Q={q:.4} kbps={kbps} n={n}"
+    );
+}
+
+fn bytemap(p: &[i16]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(p.len() * 2);
+    for &v in p {
+        b.extend_from_slice(&v.to_le_bytes());
+    }
+    b
+}
+
+/// Self-contained regression guard for `opus_compare_err` / `opus_compare`.
+///
+/// The pinned numbers below were cross-validated against the reference C
+/// `opus_compare` tool (built from `opus_compare.c`) on byte-identical raw
+/// PCM, so they encode the spectral error algorithm's expected output, not
+/// any particular codec. Two cases:
+///   * identical signals  -> C err=0.000000, Q=100.0 (exact)
+///   * mild perturbation   -> C err=4.444987, Q=-593.31 (exact to 6 dp)
+/// The perturbation case sits in the practical error range (same band as the
+/// real-audio validation pairs); the identical case pins the zero-error path
+/// with no floating-point tolerance. No audio files or external tools needed.
+#[test]
+fn opus_compare_err_pinned_against_c() {
+    const N: usize = 48000 * 4; // 4 s per channel
+    let t: Vec<f64> = (0..N).map(|i| i as f64 / 48000.0).collect();
+
+    let base = |c: usize| -> Vec<f64> {
+        let ph = 0.5 * c as f64;
+        let ph2 = 0.3 * c as f64;
+        t.iter()
+            .map(|&tt| {
+                0.3 * (2.0 * std::f64::consts::PI * 440.0 * tt).sin()
+                    + 0.2 * (2.0 * std::f64::consts::PI * 442.0 * tt + ph).sin()
+                    + 0.15 * (2.0 * std::f64::consts::PI * (800.0 + 200.0 * tt) * tt + ph2).sin()
+            })
+            .collect()
+    };
+    let to_i16s = |sig: &[f64]| -> Vec<i16> {
+        sig.iter()
+            .map(|&v| (v.clamp(-1.0, 1.0) * 32767.0) as i16)
+            .collect()
+    };
+    let stereo = |l: &[f64], r: &[f64]| -> Vec<i16> {
+        let mut o = Vec::with_capacity(N * 2);
+        let li = to_i16s(l);
+        let ri = to_i16s(r);
+        for i in 0..N {
+            o.push(li[i]);
+            o.push(ri[i]);
+        }
+        o
+    };
+
+    let b0 = base(0);
+    let b1 = base(1);
+
+    // Case 1: identical -> zero error, Q=100 (exact, no tolerance).
+    let a = stereo(&b0, &b1);
+    let err_id = opus_compare_err(&a, &a, 2);
+    let q_id = opus_compare(&a, &a, 2);
+    assert_eq!(err_id, 0.0, "identical signals must give err=0");
+    assert_eq!(q_id, 100.0, "identical signals must give Q=100");
+
+    // Case 2: mild perturbation (+0.5 dB on L, quiet 1500 Hz partial on L).
+    let gain = 10f64.powf(0.5 / 10.0);
+    let lp: Vec<f64> = t.iter()
+        .zip(b0.iter())
+        .map(|(&tt, &bv)| bv * gain + 0.02 * (2.0 * std::f64::consts::PI * 1500.0 * tt).sin())
+        .collect();
+    let b = stereo(&lp, &b1);
+    let err = opus_compare_err(&a, &b, 2);
+    let q = opus_compare(&a, &b, 2);
+    // Pinned to the C reference value (4.444987); tolerance absorbs libm
+    // transcendental rounding differences across toolchains.
+    assert!(
+        (err - 4.444987).abs() < 1e-3,
+        "pinned err drift: got {err:.6}, expected 4.444987 (C-validated)"
+    );
+    assert!(
+        (q - -593.31).abs() < 0.5,
+        "pinned Q drift: got {q:.4}, expected -593.31 (C-validated)"
+    );
 }

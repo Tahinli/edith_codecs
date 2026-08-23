@@ -1,0 +1,6 @@
+# C-cross-validation build/test artifacts — never committed.
+*.sw
+*.ogg
+opus_compare
+align_sw.py
+*_al
