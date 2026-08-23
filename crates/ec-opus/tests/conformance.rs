@@ -3427,11 +3427,16 @@ fn spectral_divergence_vs_libopus() {
     const FRAME: usize = 960;
     const CHANNELS: usize = 2;
     const MAX_LAG: usize = 2000;
-    const KBPS: u32 = 96;
+    let kbps_env: u32 = std::env::var("SWEEP_KBPS").ok().and_then(|v| v.parse().ok()).unwrap_or(96);
+    #[allow(non_snake_case)]
+    let KBPS: u32 = kbps_env;
 
     let all: &[(&str, &str)] = &[
         ("naz", "~/Music/naz_aglama_ben_aglarim.mp4"),
         ("dl8a", "~/Downloads/8a3b6d1d19.mp3"),
+        ("her", "~/Music/Her Nerdeysen.mp3"),
+        ("sadie", "~/Music/sadie.wav"),
+        ("hein", "~/Downloads/Sadie Sink Talks Her Little Known Singing Skills, Stranger Things 5 and Brendan Fraser.mp3"),
     ];
     let only: Vec<String> = std::env::var("SWEEP_ONLY")
         .unwrap_or_else(|_| "naz,dl8a".to_owned())
@@ -3500,6 +3505,24 @@ fn spectral_divergence_vs_libopus() {
             diags.push(enc.last_celt_diag().clone());
         }
         let ours_kbps = ours_bytes as f64 * 8.0 / seconds / 1000.0;
+        // Transient-frame counts as the decoder sees them: libopus vs ours.
+        let count_transients = |pkts: &[Vec<u8>]| -> (usize, usize) {
+            let mut d = Decoder::new(48000, CHANNELS).unwrap();
+            let mut buf = vec![0.0f32; 5760 * CHANNELS];
+            let mut t = 0usize;
+            for p in pkts {
+                if d.decode_float(p, &mut buf).is_ok() && d.last_celt_diag().transient {
+                    t += 1;
+                }
+            }
+            (t, pkts.len())
+        };
+        let (ref_tr, ref_n) = count_transients(&ref_pkts);
+        let ours_tr = diags.iter().filter(|d| d.is_transient).count();
+        eprintln!(
+            "{tag}@{KBPS}k transient frames: ours {ours_tr}/{} ref {ref_tr}/{ref_n}",
+            diags.len()
+        );
         let ours_trim: Vec<f32> = ours_dec.into_iter().take(source_frames * CHANNELS).collect();
         let (_, ours_aligned) = align_to_source(&source_pcm, &ours_trim, CHANNELS, MAX_LAG);
         let ours_i16 = to_i16(&ours_aligned);
