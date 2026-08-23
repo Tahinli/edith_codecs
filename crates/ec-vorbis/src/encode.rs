@@ -131,7 +131,7 @@ const HEADROOM_SHORT_MIN: f64 = 42.0;
 /// total. Tuned by lanes/vorbis-floor-r3.report.md (8-row sweep).
 const TILT_LF_LO_HZ: f64 = 1_100.0;
 const TILT_LF_HI_HZ: f64 = 2_000.0;
-const TILT_HF_DB: f64 = 0.0;
+const TILT_HF_DB: f64 = -3.0;
 const TILT_HF_LO_HZ: f64 = 4_000.0;
 const TILT_HF_HI_HZ: f64 = 6_000.0;
 const TILT_LF_DB: f64 = 12.0;
