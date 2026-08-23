@@ -123,6 +123,38 @@ const CO_MASK_RANGE_SHORT: f64 = f64::INFINITY;
 const POINT_STEREO_HZ: f64 = 4_000.0;
 /// Least headroom a short block is quantised with, whatever the rate loop's.
 const HEADROOM_SHORT_MIN: f64 = 42.0;
+/// Per-post headroom tilt (dB): extra headroom below `TILT_LF_LO_HZ` so the
+/// floor sits lower at low frequencies — finer step, more bits where the ear
+/// is sensitive and the reference spends. Tapers to 0 by `TILT_LF_HI_HZ`.
+/// `TILT_HF_DB` (negative) trims step resolution above `TILT_HF_HI_HZ`,
+/// routing those bits to LF. The rate loop's global headroom rebalances the
+/// total. Tuned by lanes/vorbis-floor-r3.report.md (8-row sweep).
+const TILT_LF_DB: f64 = 6.0;
+const TILT_LF_LO_HZ: f64 = 1_100.0;
+const TILT_LF_HI_HZ: f64 = 2_000.0;
+const TILT_HF_DB: f64 = 0.0;
+const TILT_HF_LO_HZ: f64 = 4_000.0;
+const TILT_HF_HI_HZ: f64 = 6_000.0;
+
+/// Extra headroom (dB) for one floor post at `hz`: LF boost tapering to 0,
+/// plus an HF cut (negative) tapering in. Zero outside both bands.
+fn headroom_tilt(hz: f64) -> f64 {
+    let lf = if hz <= TILT_LF_LO_HZ {
+        TILT_LF_DB
+    } else if hz < TILT_LF_HI_HZ {
+        TILT_LF_DB * (TILT_LF_HI_HZ - hz) / (TILT_LF_HI_HZ - TILT_LF_LO_HZ)
+    } else {
+        0.0
+    };
+    let hf = if hz <= TILT_HF_LO_HZ {
+        0.0
+    } else if hz < TILT_HF_HI_HZ {
+        TILT_HF_DB * (hz - TILT_HF_LO_HZ) / (TILT_HF_HI_HZ - TILT_HF_LO_HZ)
+    } else {
+        TILT_HF_DB
+    };
+    lf + hf
+}
 /// Samples per transient-detection tick — the short block's own hop, so a
 /// tick lines up with the finest time resolution the encoder has.
 const TICK: usize = BLOCK_SHORT / 4;
@@ -687,6 +719,17 @@ impl VorbisEncoder {
         } else {
             MASKING_OFFSET_DB
         };
+        // Per-post headroom tilt: LF boost, HF cut, long blocks only — the
+        // rate loop's global headroom rebalances the total bitrate.
+        let tilt: Vec<f64> = if plan.is_long {
+            bc.floor
+                .x_list
+                .iter()
+                .map(|&x| headroom_tilt(x as f64 * f64::from(self.config.sample_rate) / (2.0 * half as f64)))
+                .collect()
+        } else {
+            vec![0.0; bc.floor.x_list.len()]
+        };
         let (floor_values, quantised) = loop {
             let mut curves: Vec<Vec<f32>> = vec![Vec::new(); channels];
             let mut floor_values: Vec<Vec<i32>> = vec![Vec::new(); channels];
@@ -707,6 +750,7 @@ impl VorbisEncoder {
                     bc.co_mask,
                     masking_offset,
                     &peaks,
+                    &tilt,
                 );
                 let mut curve = vec![0.0f32; half];
                 render_floor1(&bc.floor, &y, &step2, &mut curve);
@@ -955,7 +999,8 @@ fn peaks_of(floor: &Floor1, half: usize, spectra: &[&Vec<f32>]) -> Vec<f64> {
 /// Spread first (a masker covers its neighbours, with an extra Bark-local
 /// near-band pass), then subtract the rate loop's headroom, then hold the
 /// absolute threshold of hearing as a lower bound: below it the residue
-/// quantises to zero and costs a class-0 partition.
+/// quantises to zero and costs a class-0 partition. `headroom` is tilted per
+/// post by [`headroom_tilt`]: more at LF for a finer step, less at HF.
 fn fit_floor(
     floor: &Floor1,
     ath: &[f64],
@@ -965,6 +1010,7 @@ fn fit_floor(
     co_mask: f64,
     masking_offset: f64,
     peaks: &[f64],
+    tilt: &[f64],
 ) -> (Vec<i32>, Vec<bool>) {
     let db: Vec<f64> = peaks
         .iter()
@@ -998,11 +1044,13 @@ fn fit_floor(
     let target: Vec<f64> = spread
         .iter()
         .zip(ath.iter())
-        .map(|(&level, &threshold)| {
+        .enumerate()
+        .map(|(i, (&level, &threshold))| {
+            let h = headroom + tilt[i];
             let threshold = threshold.max(loudest - co_mask);
-            let offset = (masking_offset - (headroom - range).max(0.0)).max(0.0);
-            (level - headroom.min(range) + offset)
-                .max(threshold - (headroom - range).max(0.0))
+            let offset = (masking_offset - (h - range).max(0.0)).max(0.0);
+            (level - h.min(range) + offset)
+                .max(threshold - (h - range).max(0.0))
         })
         .collect();
     let y: Vec<i32> = target
