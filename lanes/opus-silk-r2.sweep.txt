@@ -1,0 +1,10 @@
+# ec-opus SILK/speech-rate gate vs ffmpeg libopus (r2)
+# mono, 120s cap, VBR, 48kHz, Application::Voip; source sadie.wav
+# r2: symmetric ffmpeg-libopus decode (both sides), lag gate, band-limited ref, ref mode
+12k-NB: ref_mode=SILK-WB mode=SILK-NB, ref 12.0 ours 12.4 kbps (+3.3%), lag o=-1 r=-2, corr_bl o=0.9499 r=0.8809 gap=-0.0690, corr_fb o=0.8489 r=0.8181, corr_owndec o=0.9499, Q o=-821.88 r=-1925.90, err_ratio 0.061, minsec o=0.5164 r=0.2694, drop o=14 r=61
+16k-NB: ref_mode=Hybrid-FB mode=SILK-NB, ref 16.4 ours 16.8 kbps (+2.4%), lag o=-1 r=-1, corr_bl o=0.9697 r=0.8568 gap=-0.1129, corr_fb o=0.8665 r=0.8206, corr_owndec o=0.9697, Q o=-726.61 r=-1904.79, err_ratio 0.049, minsec o=0.5219 r=0.2967, drop o=11 r=69
+24k-WB: ref_mode=Hybrid-FB mode=SILK-WB, ref 24.0 ours 24.4 kbps (+1.7%), lag o=0 r=-1, corr_bl o=0.9483 r=0.8543 gap=-0.0940, corr_fb o=0.9168 r=0.8409, corr_owndec o=0.9483, Q o=-862.95 r=-1187.22, err_ratio 0.428, minsec o=0.6382 r=0.3396, drop o=23 r=67
+32k-Hyb: ref_mode=Hybrid-FB mode=Hybrid-FB, ref 31.8 ours 31.6 kbps (-0.5%), lag o=0 r=-1, corr_bl o=0.9279 r=0.8541 gap=-0.0738, corr_fb o=0.9279 r=0.8541, corr_owndec o=0.9279, Q o=-940.18 r=-434.68, err_ratio 4.346, minsec o=0.6283 r=0.3680, drop o=32 r=65
+RATE GATE: all rows within ±5%
+LAG GATE: passed (no lag at scan bound)
+DROPOUT GATE: passed (no ours-only dropouts)
