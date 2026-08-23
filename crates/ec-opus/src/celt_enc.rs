@@ -37,7 +37,8 @@ use ec_core::{Error, Result};
 use crate::celt::{
     self, BETA_COEF, BETA_INTRA, BITRES, CACHE_CAPS, E_BANDS, E_MEANS, E_PROB_MODEL, LOG_N,
     MAX_FINE_BITS, NB_BANDS, OVERLAP, PRED_COEF, PREEMPH, QTHETA_OFFSET, QTHETA_OFFSET_TWOPHASE,
-    SHORT_MDCT, SIG_SCALE, SMALL_ENERGY_ICDF, SPREAD_ICDF, SPREAD_NORMAL, TF_SELECT, TRIM_ICDF,
+    SHORT_MDCT, SIG_SCALE, SMALL_ENERGY_ICDF, SPREAD_AGGRESSIVE, SPREAD_ICDF, SPREAD_LIGHT,
+    SPREAD_NONE, SPREAD_NORMAL, TF_SELECT, TRIM_ICDF,
     bitexact_cos, bitexact_log2tan, bits2pulses, cache_index, compute_allocation_encode,
     compute_qn, deinterleave_hadamard, exp_rotation, frac_mul16, get_pulses, haar1, pulses2bits,
     unext,
@@ -372,6 +373,11 @@ pub struct CeltEncoder {
     old_band_e: Vec<f32>,
     delayed_intra: f32,
     consec_transient: u32,
+    // Spreading decision state (libopus celt_encoder.c:2534-2537).
+    spread_decision: usize,
+    tonal_average: i32,
+    hf_average: i32,
+    tapset_decision: i32,
     last_coded_bands: usize,
     force_intra: bool,
     // Constrained-VBR reservoir.
@@ -422,6 +428,10 @@ impl CeltEncoder {
             consec_transient: 0,
             last_coded_bands: 0,
             force_intra: true,
+            spread_decision: SPREAD_NORMAL,
+            tonal_average: 256,
+            hf_average: 0,
+            tapset_decision: 0,
             vbr_reservoir: 0,
             vbr_drift: 0,
             vbr_offset: 0,
@@ -470,6 +480,10 @@ impl CeltEncoder {
         self.consec_transient = 0;
         self.last_coded_bands = 0;
         self.force_intra = true;
+        self.spread_decision = SPREAD_NORMAL;
+        self.tonal_average = 256;
+        self.hf_average = 0;
+        self.tapset_decision = 0;
         self.vbr_reservoir = 0;
         self.vbr_drift = 0;
         self.vbr_offset = 0;
@@ -664,7 +678,7 @@ impl CeltEncoder {
         // `TF_ANALYSIS`: run the libopus Viterbi tf search when there are
         // enough bits; otherwise fall back to the no-analysis default (raw
         // `is_transient` per band codes "no tf change" under tf_select=0).
-        const TF_ANALYSIS: bool = false;
+        const TF_ANALYSIS: bool = true;
         let tf_select = if TF_ANALYSIS && effective_bytes >= 15 * c as i32 {
             let lambda = (80i32).max(20480 / effective_bytes + 2);
             let mut importance = [0i32; NB_BANDS];
@@ -708,21 +722,32 @@ impl CeltEncoder {
         // --- tf encode ------------------------------------------------------
         self.tf_encode(enc, start, end, is_transient, lm, tf_select, nb_compressed);
 
-        // --- Spread: fixed NORMAL -------------------------------------------
+        // --- Dynalloc analysis (offsets + spread_weight) --------------------
+        self.offsets = [0; NB_BANDS];
+        let mut spread_weight = [0i32; NB_BANDS];
+        self.dynalloc_analysis(
+            start, end, c, lm, is_transient, effective_bytes, &mut spread_weight,
+        );
+
+        // --- Spread decision (libopus celt_encoder.c:1933-1977) --------------
+        // No LFE, no hybrid, no complexity field (treated as ≥ 3): the only
+        // guards that apply are shortBlocks and nbAvailableBytes < 10*C.
         if enc.tell() as i32 + 4 <= total_bits {
-            enc.enc_icdf(SPREAD_NORMAL, &SPREAD_ICDF, 5);
+            if short_blocks != 0 || nb_available < 10 * c as i32 {
+                self.spread_decision = SPREAD_NORMAL;
+            } else {
+                self.spread_decision =
+                    self.spreading_decision(end, c, lm, &spread_weight);
+            }
+            enc.enc_icdf(self.spread_decision, &SPREAD_ICDF, 5);
         }
 
-        // --- Caps + dynalloc ------------------------------------------------
+        // --- Caps ------------------------------------------------------------
         for i in 0..NB_BANDS {
             let bw = (E_BANDS[i + 1] - E_BANDS[i]) << lm;
             self.caps[i] =
                 ((CACHE_CAPS[NB_BANDS * (2 * lm + c - 1) + i] as i32 + 64) * c as i32 * bw as i32)
                     >> 2;
-        }
-        self.offsets = [0; NB_BANDS];
-        if effective_bytes > 50 && lm >= 1 {
-            self.dynalloc_analysis(start, end, c, lm, is_transient, effective_bytes);
         }
         let mut dynalloc_logp = 6u32;
         let total_bits_frac = total_bits << BITRES;
@@ -969,7 +994,7 @@ impl CeltEncoder {
             start,
             end,
             short_blocks,
-            SPREAD_NORMAL,
+            self.spread_decision,
             dual_stereo,
             intensity,
             (nb_compressed as i32 * (8 << BITRES)) - anti_collapse_rsv,
@@ -1146,12 +1171,49 @@ impl CeltEncoder {
         lm: usize,
         is_transient: bool,
         effective_bytes: i32,
+        spread_weight: &mut [i32; NB_BANDS],
     ) {
         const LSB_DEPTH: f32 = 24.0;
         let mut noise_floor = [0.0f32; NB_BANDS];
         for i in 0..end {
             noise_floor[i] = 0.0625 * LOG_N[i] as f32 + 0.5 + (9.0 - LSB_DEPTH) - E_MEANS[i]
                 + 0.0062 * ((i + 5) * (i + 5)) as f32;
+        }
+        // maxDepth = max(bandLogE - noise_floor) across channels (libopus 995-999).
+        let mut max_depth = -31.9f32;
+        for ch in 0..c {
+            for i in 0..end {
+                max_depth = max_depth.max(self.band_log_e[ch * NB_BANDS + i] - noise_floor[i]);
+            }
+        }
+        // Simple masking model for spread_weight (libopus celt_encoder.c:1000-1035).
+        let mut mask = [0.0f32; NB_BANDS];
+        for i in 0..end {
+            mask[i] = self.band_log_e[i] - noise_floor[i];
+        }
+        if c == 2 {
+            for i in 0..end {
+                mask[i] = mask[i].max(self.band_log_e[NB_BANDS + i] - noise_floor[i]);
+            }
+        }
+        let mut sig = [0.0f32; NB_BANDS];
+        sig[..end].copy_from_slice(&mask[..end]);
+        for i in 1..end {
+            mask[i] = mask[i].max(mask[i - 1] - 2.0);
+        }
+        for i in (0..end - 1).rev() {
+            mask[i] = mask[i].max(mask[i + 1] - 3.0);
+        }
+        for i in 0..end {
+            // SMR: mask is never more than 12 below the peak and never below the
+            // noise floor.
+            let smr = sig[i] - 0.0_f32.max(max_depth - 12.0).max(mask[i]);
+            let shift = (5).min(0.max(-((smr + 0.5).floor() as i32)));
+            spread_weight[i] = 32 >> shift;
+        }
+        // Dynamic allocation can't make us bust the budget (libopus 1036-1037).
+        if !(effective_bytes > 50 && lm >= 1) {
+            return;
         }
         let median3 = |a: &[f32]| -> f32 {
             let (x, y, z) = (a[0], a[1], a[2]);
@@ -1243,6 +1305,90 @@ impl CeltEncoder {
             }
             self.offsets[i] = boost;
             tot_boost += boost_bits;
+        }
+    }
+
+    /// libopus `spreading_decision` (bands.c:479-570): classifies the current
+    /// frame's spectral shape as `SPREAD_NONE`/`SPREAD_LIGHT`/`SPREAD_NORMAL`/
+    /// `SPREAD_AGGRESSIVE` by counting how concentrated the normalized band
+    /// coefficients are, weighted by the masking-based `spread_weight` from
+    /// `dynalloc_analysis`. Maintains `tonal_average` (recursive averaging)
+    /// and applies hysteresis against the previous decision.
+    ///
+    /// `update_hf` is always false here (no pitch prefilter), so the
+    /// `hf_average`/`tapset_decision` state is carried but never updated —
+    /// matching libopus with `pf_on = false`.
+    fn spreading_decision(
+        &mut self,
+        end: usize,
+        c: usize,
+        lm: usize,
+        spread_weight: &[i32; NB_BANDS],
+    ) -> usize {
+        let m = 1usize << lm;
+        let n0 = SHORT_MDCT << lm; // = M * shortMdctSize
+        // Last band too narrow: nothing to spread.
+        if m * (E_BANDS[end] - E_BANDS[end - 1]) <= 8 {
+            return SPREAD_NONE;
+        }
+        let mut sum = 0i32;
+        let mut nb_bands = 0i32;
+        for ch in 0..c {
+            for i in 0..end {
+                let n = m * (E_BANDS[i + 1] - E_BANDS[i]);
+                if n <= 8 {
+                    continue;
+                }
+                let base = ch * n0 + m * E_BANDS[i];
+                let x = &self.x[base..base + n];
+                let mut tcount = [0i32; 3];
+                for j in 0..n {
+                    // Float-mode: x2N = x[j]^2 * N; thresholds are the literal
+                    // QCONST16 values (0.25, 0.0625, 0.015625).
+                    let x2n = x[j] * x[j] * n as f32;
+                    if x2n < 0.25 {
+                        tcount[0] += 1;
+                    }
+                    if x2n < 0.0625 {
+                        tcount[1] += 1;
+                    }
+                    if x2n < 0.015625 {
+                        tcount[2] += 1;
+                    }
+                }
+                // hf_sum accumulation is only used when update_hf is true
+                // (prefilter on), which never happens here. The branch is
+                // kept for structural fidelity but the result is unused.
+                let _hf_sum_contrib = if i > NB_BANDS - 4 {
+                    32 * (tcount[1] + tcount[0]) / n as i32
+                } else {
+                    0
+                };
+                let tmp = (2 * tcount[2] >= n as i32) as i32
+                    + (2 * tcount[1] >= n as i32) as i32
+                    + (2 * tcount[0] >= n as i32) as i32;
+                sum += tmp * spread_weight[i];
+                nb_bands += spread_weight[i];
+            }
+        }
+        if nb_bands == 0 {
+            return self.spread_decision;
+        }
+        let mut s = (sum << 8) / nb_bands;
+        // Recursive averaging.
+        s = (s + self.tonal_average) >> 1;
+        self.tonal_average = s;
+        // Hysteresis against the last decision.
+        let last = self.spread_decision as i32;
+        s = (3 * s + (((3 - last) << 7) + 64) + 2) >> 2;
+        if s < 80 {
+            SPREAD_AGGRESSIVE
+        } else if s < 256 {
+            SPREAD_NORMAL
+        } else if s < 384 {
+            SPREAD_LIGHT
+        } else {
+            SPREAD_NONE
         }
     }
 
