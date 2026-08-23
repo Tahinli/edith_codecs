@@ -331,3 +331,61 @@ kbit/s instead of 208 for the same noise-to-mask bar. That is plausibly the
 encoder getting more quality per bit, but nothing here measures VBR against a
 reference, so it is **deferred — unblocked by a VBR reference gate against
 `lame -V`**, which is the next round of this lane.
+
+## Round 6: VBR gets a reference gate, and loses to it
+
+Round 5 left the demand split out of the VBR arm because nothing could judge
+it. This round builds the judge: `real_library_vbr_vs_lame` encodes each source
+at quality 0.3 and 0.6, encodes **every rung of libmp3lame's VBR ladder**
+(V0..V9) on the same audio, and compares against the rung that actually spent
+what we spent.
+
+Picking the rung by its nominal rate does not work, and the first attempt did:
+libmp3lame's V6 is nominally 115 kbit/s but lands near 60 on speech, because it
+drops the rate hard on easy material. Matching on the nominal rate compared us
+against a rung spending half what we did and made a losing table look winning.
+
+Matched on the measured rate, the shipped VBR lost almost everywhere -- 11 of
+14 rows behind on correlation, and 5 to 8 dB behind on the worst 20 ms window
+while spending the same bits. Two changes fixed it:
+
+1. **The demand split, in the VBR arm too.** Same change round 5 made to CBR;
+   it took the table from 3 rows ahead to 10.
+2. **The quality bar recalibrated.** The knob's documented contract is a mean
+   *rate*, not a masking bar, so reaching the same bar for fewer bits has to be
+   spent rather than pocketed. `quality_threshold` now tightens by
+   `1.6 - 12 q` dB, fitted to two points on the library: quality 0.3 lands at
+   162 kbit/s against its promised 163, and quality 0.6 at 232 against 230.
+
+| source | q | corr gap | worst window ours / LAME | ours / LAME kbit/s | rung |
+|---|---|---|---|---|---|
+| nik   | 0.3 | +0.00046 | -11.2 / -14.0 | 170.6 / 169.6 | V2 |
+| nik   | 0.6 | +0.00019 | -18.5 / -19.7 | 238.1 / 224.7 | V0 |
+| zaur  | 0.3 | +0.00006 | -12.2 / -15.0 | 164.6 / 162.6 | V2 |
+| zaur  | 0.6 | +0.00012 | -21.3 / -20.2 | 232.7 / 210.0 | V0 |
+| her   | 0.3 | **-0.00042** | -12.5 / -14.7 | 221.6 / 224.9 | V0 |
+| her   | 0.6 | +0.00032 | -19.6 / -14.7 | 303.2 / 224.9 | V0 |
+| naz   | 0.3 | +0.00017 | -11.3 / -12.6 | 197.5 / 194.2 | V1 |
+| naz   | 0.6 | +0.00022 | -18.5 / -14.4 | 276.2 / 219.6 | V0 |
+| sadie | 0.3 | +0.00021 | -10.6 / -8.8 | 138.3 / 133.9 | V1 |
+| sadie | 0.6 | +0.00016 | -16.0 / -10.8 | 207.9 / 154.0 | V0 |
+| dl8a  | 0.3 | +0.00062 | -8.3 / -9.3 | 150.9 / 158.0 | V3 |
+| dl8a  | 0.6 | +0.00012 | -17.0 / -13.7 | 226.8 / 227.1 | V0 |
+| hein  | 0.3 | +0.00019 | -7.5 / -9.3 | 129.8 / 135.3 | V1 |
+| hein  | 0.6 | +0.00019 | -16.5 / -12.0 | 189.2 / 153.7 | V0 |
+
+Thirteen of fourteen rows are ahead. The floors: correlation -0.0005 (her at
+0.3, which is behind while spending 1.5% less), worst-window excess 3.5 dB (nik
+and zaur at 0.3, both 2.8 dB behind — the frames our VBR calls easy are where
+it still under-spends against a transient), and a rate ceiling of 8% of the
+matched rung, with V0 rows exempt because libmp3lame cannot spend more there
+and the premium would measure its ceiling rather than our appetite.
+
+The V0 rows are the standing weakness this gate cannot yet price: at quality
+0.6 on four sources we spend 20-35% more than libmp3lame's top rung and buy
+quality with it, and nothing here says whether that trade is the one a listener
+would pick. Sitting off the top of the reference ladder is the next round's
+problem.
+
+Closes the round 5 deferral: VBR now has a reference gate, and the split it was
+waiting on is in.

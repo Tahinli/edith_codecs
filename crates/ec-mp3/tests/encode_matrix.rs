@@ -701,3 +701,153 @@ fn mid_side_follows_the_channel_correlation() {
         }
     }
 }
+
+/// libmp3lame's VBR levels, encoded once per source so the level that
+/// actually spent what we spent can be picked by measurement. Nominal rates
+/// are no guide: on speech, V6 lands near 60 kbit/s rather than its nominal
+/// 115, because libmp3lame drops the rate hard on easy material.
+const LAME_V_LEVELS: [u32; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+
+/// How far under libmp3lame a VBR row may sit in correlation when it spent at
+/// least as many bits. Thirteen of the fourteen rows are ahead; the floor is
+/// set by her at quality 0.3, which is 0.00042 behind while spending 1.5%
+/// less.
+const VBR_CORR_FLOOR: f64 = -0.0005;
+
+/// How far behind libmp3lame's worst 20 ms window a VBR row may sit. Set by
+/// nik and zaur at quality 0.3, both 2.8 dB behind: the frames our VBR calls
+/// easy are where it still under-spends against a transient.
+const VBR_WORST_EXCESS_DB: f64 = 3.5;
+
+/// How much of libmp3lame's rate ours may spend at a matched quality. Rows
+/// where libmp3lame is already on its top rung (V0) are exempt: it cannot
+/// spend more there, so a premium measures its ceiling and not our appetite.
+const VBR_RATE_CEILING: f64 = 8.0;
+
+/// Our VBR against libmp3lame's, on the user's own library, at a matched rate.
+///
+/// CBR has had a reference gate since `real_library_sweep_vs_lame`; VBR has
+/// had none, which is why the demand-weighted frame split landed in the CBR
+/// arm only -- VBR's bitrate choice is calibrated to the noise-to-mask ratio
+/// the even split produces, and nothing could tell whether moving both was a
+/// gain or a loss.
+#[test]
+#[ignore = "needs the user's library and ffmpeg's libmp3lame"]
+fn real_library_vbr_vs_lame() {
+    let seconds = 60u32;
+    let work = workdir("lame-vbr");
+    println!(
+        "{:<7} {:>4} {:>9} {:>9} {:>8} {:>8} {:>8} {:>8} {:>8} {:>4}",
+        "source",
+        "q",
+        "corr_ours",
+        "corr_lame",
+        "gap",
+        "wworst_o",
+        "wworst_r",
+        "ours_kb",
+        "lame_kb",
+        "V"
+    );
+    let only = std::env::var("EC_MP3_SWEEP_ONLY").unwrap_or_default();
+    let mut rows = 0;
+    let mut failures = Vec::new();
+    for (name, src) in LIBRARY {
+        if !only.is_empty() && !only.split(',').any(|w| w.trim() == name) {
+            continue;
+        }
+        let src = expand(src);
+        if !src.exists() {
+            println!("{name:<7} SKIP (missing)");
+            continue;
+        }
+        let Some(pcm) = decode_source(&src, seconds) else {
+            println!("{name:<7} SKIP (decode)");
+            continue;
+        };
+        let secs = pcm.len() as f64 / (44100.0 * 2.0);
+        let kb = |p: &Path| std::fs::metadata(p).expect("size").len() as f64 * 8.0 / secs / 1000.0;
+        // Every rung of libmp3lame's VBR ladder, measured on this source.
+        let lame_ladder: Vec<(u32, PathBuf, f64)> = LAME_V_LEVELS
+            .iter()
+            .map(|&level| {
+                let file = work.join(format!("lame-{name}-v{level}.mp3"));
+                let status = Command::new("ffmpeg")
+                    .args(["-y", "-v", "error", "-i"])
+                    .arg(&src)
+                    .args([
+                        "-vn",
+                        "-t",
+                        &seconds.to_string(),
+                        "-ac",
+                        "2",
+                        "-ar",
+                        "44100",
+                        "-c:a",
+                        "libmp3lame",
+                        "-q:a",
+                        &level.to_string(),
+                    ])
+                    .arg(&file)
+                    .status()
+                    .expect("ffmpeg runs");
+                assert!(status.success(), "libmp3lame V{level} of {name}");
+                let rate = kb(&file);
+                (level, file, rate)
+            })
+            .collect();
+        for quality in [0.3f32, 0.6] {
+            let ours_bytes = encode_vbr(&pcm, 44100, 2, quality);
+            let ours_file = work.join(format!("ours-{name}-{quality}.mp3"));
+            std::fs::write(&ours_file, &ours_bytes).expect("write ours");
+            let ours_kb = kb(&ours_file);
+            // The level that actually spent what we spent.
+            let (level, lame_file) = lame_ladder
+                .iter()
+                .min_by(|a, b| {
+                    (a.2 - ours_kb)
+                        .abs()
+                        .partial_cmp(&(b.2 - ours_kb).abs())
+                        .expect("finite")
+                })
+                .map(|(v, f, _)| (*v, f.clone()))
+                .expect("a ladder rung");
+            let measure = |file: &Path| -> (f64, f64) {
+                let decoded = decode(file);
+                let (corr, offset) = aligned(&decoded, &pcm, 2);
+                (corr, worst_window_db(&decoded, &pcm, offset, 2))
+            };
+            let ((ours_corr, ours_worst), (lame_corr, lame_worst)) =
+                (measure(&ours_file), measure(&lame_file));
+            let lame_kb = kb(&lame_file);
+            let gap = ours_corr - lame_corr;
+            let premium = (ours_kb / lame_kb - 1.0) * 100.0;
+            println!(
+                "{name:<7} {quality:>4} {ours_corr:>9.5} {lame_corr:>9.5} {gap:>+8.5} \
+                 {ours_worst:>+8.1} {lame_worst:>+8.1} {ours_kb:>8.1} {lame_kb:>8.1} {level:>4}"
+            );
+            rows += 1;
+            // Being behind on quality is only a failure if we did not also
+            // spend less to get there; spending more is a failure on its own.
+            if gap < VBR_CORR_FLOOR && ours_kb >= lame_kb * 0.98 {
+                failures.push(format!(
+                    "{name} at q{quality}: {ours_corr:.5} against LAME's {lame_corr:.5} \
+                     at {ours_kb:.1} against {lame_kb:.1} kbit/s"
+                ));
+            }
+            if ours_worst - lame_worst > VBR_WORST_EXCESS_DB {
+                failures.push(format!(
+                    "{name} at q{quality}: worst window {ours_worst:.1} dB \
+                     against LAME's {lame_worst:.1} dB"
+                ));
+            }
+            if level > 0 && premium > VBR_RATE_CEILING {
+                failures.push(format!(
+                    "{name} at q{quality}: {premium:+.1}% of LAME's rate (V{level})"
+                ));
+            }
+        }
+    }
+    assert!(rows > 0, "no library sources were readable");
+    assert!(failures.is_empty(), "{failures:#?}");
+}
