@@ -485,19 +485,18 @@ const LIBRARY: [(&str, &str); 7] = [
 /// How much worse than LAME a row's worst 20 ms window may be, in dB.
 ///
 /// The gap was 12.6 dB when this floor went in, on the two spoken-word
-/// sources, and mid/side stereo closed it: the encoder declared joint stereo
-/// while writing plain left/right, so near-mono speech was coded twice. The
-/// worst row now is dl8a at 192 kbit/s, 4.1 dB behind on a wide music mix.
-const WORST_WINDOW_EXCESS_DB: f64 = 5.0;
+/// sources; mid/side stereo and the demand-weighted frame split closed it.
+/// Every row now beats libmp3lame's worst window except hein at 192 kbit/s,
+/// which sits 0.2 dB behind, so the floor is one decibel.
+const WORST_WINDOW_EXCESS_DB: f64 = 1.0;
 
 /// How far under LAME a row may sit before the sweep fails, in correlation.
 ///
-/// The first measurement (60 s of each source, 44.1 kHz stereo, CBR) put every
-/// row between -0.00103 and +0.00142, the worst being zaur at 128 kbit/s. The
-/// floor sits just under that worst row rather than at zero because three rows
-/// are already ahead of LAME and the spread is what a regression would have to
-/// widen.
-const LAME_CORR_FLOOR: f64 = -0.0012;
+/// The first measurement put every row between -0.00103 and +0.00142. All
+/// fourteen are now ahead of libmp3lame, the thinnest being hein at 192
+/// kbit/s at +0.00002, so the floor is zero: a row falling behind the
+/// reference at all is the regression.
+const LAME_CORR_FLOOR: f64 = 0.0;
 
 fn expand(path: &str) -> PathBuf {
     PathBuf::from(match path.strip_prefix("~/") {
