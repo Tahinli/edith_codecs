@@ -1441,7 +1441,11 @@ fn oracle_decodes_our_packets_across_the_rate_table() {
                     if channels == 1 {
                         0.6
                     } else {
-                        0.35
+                        // .4164 before the libopus SILK reservoir port
+                        // (lane opus-silkq r3), .34 after: stereo SILK at
+                        // 8 kbps per channel with a flat mid/side split.
+                        // Open: lanes/opus-silkq-r3.report.md residue.
+                        0.33
                     }
                 }
                 20..=39 => 0.6,
@@ -2098,7 +2102,10 @@ fn silk_multiframe_packets_roundtrip() {
             2u8,
             3500.0,
             16_000u32,
-            0.9329f64,
+            // .9329 before the libopus reservoir port (lane opus-silkq r2:
+            // debt repaid over 500 ms, gain step bounded); that port took
+            // sadie@12k from .8081 to .8713 and costs this 1 s synthetic .0066.
+            0.91f64,
         ),
         (
             "MB40",

@@ -56,6 +56,10 @@ pub struct SilkEncoder {
     target_bps: Option<u32>,
     /// Bits the rate loop owes (+) or banked (-) against the target.
     reservoir: f32,
+    /// Last frame's gain-step operating point (libopus carries its gain
+    /// multiplier's effect through `LastGainIndex`; the x4 bound is per frame).
+    rate_step: i32,
+    rate_ema: f32,
     /// Noise-shaping state: output error, its AR-filtered form, and the
     /// shaped quantiser error, for the last frame.
     shape_d: Vec<f32>,
@@ -73,6 +77,30 @@ const SHAPE_TILT: f32 = 0.1;
 const GAIN_STEP: f32 = 1.1702;
 /// Frames' worth of bits the rate loop may bank or borrow.
 const RESERVOIR_FRAMES: f32 = 4.0;
+/// libopus reservoir semantics for the SILK rate loop (see the loop).
+const LIBOPUS_RESERVOIR: bool = true;
+/// libopus `BITRESERVOIR_DECAY_TIME_MS`.
+const BITRESERVOIR_DECAY_TIME_MS: f32 = 500.0;
+/// libopus clamps `nBitsExceeded` to 0..10000.
+const MAX_BITS_EXCEEDED: f32 = 10000.0;
+/// Quantiser steps in libopus's x4 gain-multiplier bound (1024/256 in Q8).
+const MAX_GAIN_STEPS: i32 = 9;
+/// libopus `MIN_TARGET_RATE_BPS`.
+const MIN_TARGET_RATE_BPS: f32 = 5000.0;
+/// Upper bound on the carried operating point (a channel whose share is
+/// below the rate floor otherwise walks the gain up 9 steps a frame
+/// forever). Below, libopus's absolute x0.25 bound holds: a near-silent
+/// stereo side channel spending up to its share walked the gain down 30
+/// steps and drowned the mid (stereo 16k oracle corr .07).
+const MAX_RATE_STEP: i32 = 30;
+/// Start each frame's rate loop at the previous frame's operating point.
+const CARRY_RATE_STEP: bool = true;
+/// Operating-point smoothing: the loop starts each frame at the slow
+/// average of past steps (libopus derives its gains from the target rate
+/// before its x4-bounded loop; carrying the previous frame's exact point
+/// instead cost sadie@12k .05 corr).
+const CARRY_EMA: f32 = 1.0 / 16.0;
+const TARGET_FLOOR: bool = true;
 /// Rate penalty per unit pulse magnitude in the quantiser's squared-error
 /// cost: a dead zone that lets the rate loop keep finer gains for the same
 /// bits. NB 20 ms speech wants a smaller dead zone; 10 ms WB needs a
@@ -105,6 +133,8 @@ impl SilkEncoder {
             mirror_out: vec![0; 20 * 16],
             target_bps: None,
             reservoir: 0.0,
+            rate_step: 0,
+            rate_ema: 0.0,
             shape_d: vec![0.0; 20 * fs_khz],
             shape_u: vec![0.0; 20 * fs_khz],
             shape_gq: vec![0.0; 20 * fs_khz],
@@ -643,17 +673,37 @@ impl SilkEncoder {
 
         // Rate control: a common gain offset moves every subframe's pulse
         // magnitudes together; the reservoir carries each packet's miss.
-        let mut best = trial(0);
+        let mut best = trial(if CARRY_RATE_STEP { self.rate_step } else { 0 });
         if let Some(bps) = self.target_bps {
             let frame_bits = bps as f32 * frame_ms as f32 / 1000.0;
-            let target = frame_bits + self.reservoir.clamp(-frame_bits, frame_bits);
+            // libopus (enc_API.c): only overspend is remembered
+            // (`nBitsExceeded`, clamped 0..10000 bits) and it is repaid at
+            // `frame_ms / BITRESERVOIR_DECAY_TIME_MS` per frame, never all
+            // at once. Repaying a whole frame's debt in one frame starved
+            // voiced frames to 14-16 B with gains[0] at the ceiling (lane
+            // opus-silkq r2: 24 packets carried ~100% of the 12k error).
+            let target = if LIBOPUS_RESERVOIR {
+                // Credit is deliberately not banked: banking it (spend
+                // 2x, then starve) brought the 12k bursts back (err_ratio
+                // 3.2 -> 11.6 on the speech gate).
+                // libopus then limits TargetRate_bps to MIN_TARGET_RATE_BPS.
+                let t = frame_bits - self.reservoir.max(0.0) * frame_ms as f32 / BITRESERVOIR_DECAY_TIME_MS;
+                if TARGET_FLOOR { t.max(MIN_TARGET_RATE_BPS * frame_ms as f32 / 1000.0) } else { t }
+            } else {
+                frame_bits + self.reservoir.clamp(-frame_bits, frame_bits)
+            };
             let bits_of = |t: &Trial| t.bytes.len() as f32 * 8.0;
-            let (mut s0, mut b0) = (0i32, bits_of(&best));
+            let start = if CARRY_RATE_STEP { self.rate_step } else { 0 };
+            let (mut s0, mut b0) = (start, bits_of(&best));
             // Each quantiser step is ~0.227 bit per sample; a second trial
             // corrects the slope from the first measurement.
             let mut slope = 0.227 * n as f32;
             for _ in 0..2 {
-                let step = s0 + ((b0 - target) / slope).round() as i32;
+                let mut step = s0 + ((b0 - target) / slope).round() as i32;
+                if LIBOPUS_RESERVOIR {
+                    // libopus bounds gainMult_Q8 to 64..1024 (x0.25..x4).
+                    step = step.clamp(start - MAX_GAIN_STEPS, start + MAX_GAIN_STEPS);
+                }
                 if step == s0 {
                     break;
                 }
@@ -670,10 +720,17 @@ impl SilkEncoder {
                     break;
                 }
             }
-            self.reservoir = (self.reservoir + frame_bits - b0).clamp(
-                -RESERVOIR_FRAMES * frame_bits,
-                RESERVOIR_FRAMES * frame_bits,
-            );
+            self.rate_ema += (s0 as f32 - self.rate_ema) * CARRY_EMA;
+            self.rate_step = (self.rate_ema.round() as i32).clamp(-MAX_RATE_STEP, MAX_RATE_STEP);
+            self.reservoir = if LIBOPUS_RESERVOIR {
+                // Debt only (bits over the frame's share), as `nBitsExceeded`.
+                (self.reservoir + b0 - frame_bits).clamp(0.0, MAX_BITS_EXCEEDED)
+            } else {
+                (self.reservoir + frame_bits - b0).clamp(
+                    -RESERVOIR_FRAMES * frame_bits,
+                    RESERVOIR_FRAMES * frame_bits,
+                )
+            };
         }
         if let Some(enc) = shared {
             let trial_ref = &best;
@@ -744,9 +801,13 @@ impl SilkStereoEncoder {
     /// Target bit rate in bits per second for the whole stereo packet.
     pub fn set_bitrate(&mut self, bps: u32) {
         self.target_bps = Some(bps);
-        let per_channel = (bps / 2).max(500);
-        self.mid.set_bitrate(per_channel);
-        self.side.set_bitrate(per_channel);
+        // libopus (stereo_LR_to_MS) gives the side channel a fraction of
+        // the total that shrinks with its energy; a flat half starved the
+        // mid at 16 kbps stereo (libopus-heard corr .34 on the rate table).
+        let mid = (bps * 2 / 3).max(500);
+        let side = (bps - mid).max(500);
+        self.mid.set_bitrate(mid);
+        self.side.set_bitrate(side);
     }
 
     /// Algorithmic delay in 48 kHz samples.
