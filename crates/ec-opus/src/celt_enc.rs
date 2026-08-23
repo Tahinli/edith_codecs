@@ -791,6 +791,19 @@ impl CeltEncoder {
             self.offsets[i] = boost;
         }
 
+        // --- Intensity decision (libopus celt_encoder.c:2392-2407) -------
+        // Moved before alloc_trim so alloc_trim_analysis can use
+        // self.intensity in the stereo_saving minXC loop.
+        let overhead = (40 * c as i32 + 20) * ((400 >> lm) - 50);
+        let mut equiv_rate = ((nb_compressed as i32 * 8 * 50) << (3 - lm)) - overhead;
+        if vbr_rate_bps > 0 {
+            equiv_rate = equiv_rate.min(vbr_rate_bps as i32 - overhead);
+        }
+        if c == 2 {
+            self.intensity_decision(nb_compressed, c, lm, vbr_rate_bps);
+            self.intensity = self.intensity.clamp(start, end);
+        }
+
         // --- Allocation trim ------------------------------------------------
         let mut alloc_trim = 5i32;
         if tell_frac + (6 << BITRES) <= total_bits_frac - total_boost {
@@ -799,72 +812,76 @@ impl CeltEncoder {
             tell_frac = enc.tell_frac() as i32;
         }
 
+        // --- Temporal VBR (libopus celt_encoder.c:2187-2204) -------------
+        // lfe=0 so always computed. In float mode SHR32/SHL32/QCONST32 are
+        // identity, so follow/frame_avg/temporal_vbr are raw floats.
+        let temporal_vbr = {
+            let mut follow = -10.0f32;
+            let mut frame_avg = 0.0f32;
+            let offset = if short_blocks != 0 { 0.5 * lm as f32 } else { 0.0 };
+            for i in start..end {
+                follow = (follow - 1.0).max(self.band_log_e[i] - offset);
+                if c == 2 {
+                    follow = follow.max(self.band_log_e[i + NB_BANDS] - offset);
+                }
+                frame_avg += follow;
+            }
+            frame_avg /= (end - start) as f32;
+            let tvbr = (frame_avg - self.spec_avg).clamp(-1.5, 3.0);
+            self.spec_avg += 0.02 * tvbr;
+            tvbr
+        };
+
         // --- Constrained VBR ------------------------------------------------
         if vbr_rate > 0 {
             let lm_diff = 3 - lm as i32;
             let base_target =
                 vbr_rate + (self.vbr_offset >> lm_diff) - ((40 * c as i32 + 20) << BITRES);
             let mut target = base_target;
-            // compute_vbr shaping (libopus celt_encoder.c:1605-1716), minus the
-            // terms that need tonality/tf analysis this encoder does not run.
-            let coded_bands = end - 1;
-            let intensity_est = if c == 2 {
-                self.intensity_decision(nb_compressed, c, lm, vbr_rate_bps);
-                self.intensity.clamp(start, coded_bands)
+            // compute_vbr (libopus celt_encoder.c:1605-1716), float-mode.
+            // Skipped: activity, tonality, surround_mask (analysis->valid=
+            // false, has_surround_mask=0, pitch_change=0, lfe=0). The qext
+            // 2-pass transient compute_vbr (C:2546-2554) is inside
+            // #ifdef ENABLE_QEXT — this encoder has no qext.
+            let coded_bands = if self.last_coded_bands != 0 {
+                self.last_coded_bands
             } else {
-                0
+                NB_BANDS
             };
-            let coded_bins =
-                (E_BANDS[coded_bands] + if c == 2 { E_BANDS[intensity_est] } else { 0 }) << lm;
-            // Activity cut. libopus reads activity from tonality analysis; the
-            // peak-band level (dB, both channels) is a monotone stand-in:
-            // silence maps to ~0 (max cut), music to ~1 (no cut).
-            let mut peak = f32::NEG_INFINITY;
-            for ch in 0..c {
-                for i in start..end {
-                    let lvl = self.band_log_e[i + ch * NB_BANDS] + E_MEANS[i];
-                    if lvl > peak {
-                        peak = lvl;
-                    }
-                }
+            let mut coded_bins = E_BANDS[coded_bands] << lm;
+            if c == 2 {
+                coded_bins += E_BANDS[self.intensity.min(coded_bands)] << lm;
             }
-            let activity = ((peak * 3.0103 - 5.0) / 20.0).clamp(0.0, 1.0);
-            if activity < 0.4 {
-                target -= (coded_bins as f32 * 8.0 * (0.4 - activity)) as i32;
+            // Stereo savings (C:1636-1649)
+            if c == 2 {
+                let coded_stereo_bands = self.intensity.min(coded_bands);
+                let coded_stereo_dof =
+                    (E_BANDS[coded_stereo_bands] << lm) - coded_stereo_bands;
+                let max_frac = 0.8 * coded_stereo_dof as f32 / coded_bins as f32;
+                let ss = self.stereo_saving.min(1.0);
+                target -= (max_frac * target as f32)
+                    .min((ss - 0.1) * coded_stereo_dof as f32 * 8.0) as i32;
             }
-            // dynalloc boost minus its calibration average.
+            // dynalloc boost minus calibration average (C:1651)
             target += total_boost - (19 << lm);
-            // tf boost: transient frames take the fixed 7/4 stand-in; steady
-            // frames take the tf-bias at the music-average estimate 0.05
-            // (libopus: 2*(tf_estimate-0.044)*target).
-            if short_blocks != 0 {
-                target = 7 * target / 4;
-            } else {
-                target += (0.012 * target as f32) as i32;
-            }
-            // Spectral-floor cap (libopus floor_depth): binds only when every
-            // band sits close to the coding noise floor.
+            // TF boost (C:1653-1654): MULT16_32_Q15 is identity in float mode,
+            // SHL32(.., 1) is the x2: 2 * (tf_estimate - 0.044) * target.
+            target += (2.0 * (tf_estimate - 0.044) * target as f32) as i32;
+            // floor depth cap (C:1683-1695): SHR32/MULT16_32_Q15 are identity.
             {
                 let bins = E_BANDS[NB_BANDS - 2] << lm;
-                let mut max_depth = -31.9f32 / 3.0103;
-                for ch in 0..c {
-                    for i in start..end {
-                        let noise_floor = LOG_N[i] as f32 / 385.3
-                            + 0.166
-                            - 4.983
-                            - E_MEANS[i] / 48.2
-                            + 0.00206 * (i + 5) as f32 * (i + 5) as f32;
-                        let depth = self.band_log_e[i + ch * NB_BANDS] + E_MEANS[i] - noise_floor;
-                        if depth > max_depth {
-                            max_depth = depth;
-                        }
-                    }
-                }
-                let floor_depth = ((c * bins) as f32 * 3.0103 * 8.0 * max_depth) as i32;
+                let floor_depth = ((c * bins * 8) as f32 * max_depth) as i32;
                 let floor_depth = floor_depth.max(target >> 2);
                 target = target.min(floor_depth);
             }
-            // Never more than double the base rate.
+            // Constrained VBR (C:1699-1702)
+            target = base_target + (0.67 * (target - base_target) as f32) as i32;
+            // Temporal VBR (C:1704-1711)
+            if tf_estimate < 0.2 {
+                let amount = 0.0000031 * (96000 - equiv_rate).clamp(0, 32000) as f32;
+                target += (temporal_vbr * amount * target as f32) as i32;
+            }
+            // Never more than double the base rate (C:1714)
             target = target.min(2 * base_target);
             target += tell_frac;
             let min_allowed =
@@ -917,7 +934,6 @@ impl CeltEncoder {
             if lm != 0 {
                 dual_stereo = self.stereo_analysis(lm, n);
             }
-            self.intensity_decision(nb_compressed, c, lm, vbr_rate_bps);
             intensity = self.intensity.clamp(start, end);
         }
         let _ = &mut effective_bytes;
@@ -1194,7 +1210,7 @@ impl CeltEncoder {
         }
         // Dynamic allocation can't make us bust the budget (libopus 1036-1037).
         if !(effective_bytes > 50 && lm >= 1) {
-            return;
+            return max_depth;
         }
         let median3 = |a: &[f32]| -> f32 {
             let (x, y, z) = (a[0], a[1], a[2]);
@@ -1397,7 +1413,7 @@ impl CeltEncoder {
     }
 
     /// `alloc_trim_analysis()`: stereo correlation plus spectral tilt.
-    fn alloc_trim_analysis(&self, end: usize, lm: usize, c: usize, n0: usize) -> i32 {
+    fn alloc_trim_analysis(&mut self, end: usize, lm: usize, c: usize, n0: usize) -> i32 {
         let mut trim = 5i32;
         if c == 2 {
             let mut sum = 0.0f32;
@@ -1418,6 +1434,22 @@ impl CeltEncoder {
             } else if sum > 0.8 {
                 trim -= 1;
             }
+            // Stereo_saving: inter-channel correlation savings (libopus
+            // celt_encoder.c:897-920). In float mode all Q macros are
+            // identity; sum and per-band partial are raw inner products.
+            let sum_c = sum.abs().min(1.0);
+            let mut min_xc = sum_c;
+            for i in 8..self.intensity {
+                let mut partial = 0.0f32;
+                for j in (E_BANDS[i] << lm)..(E_BANDS[i + 1] << lm) {
+                    partial += self.x[j] * self.x[n0 + j];
+                }
+                min_xc = min_xc.min(partial.abs());
+            }
+            min_xc = min_xc.min(1.0);
+            let log_xc = (1.001 - sum_c * sum_c).log2();
+            let log_xc2 = (0.5 * log_xc).max((1.001 - min_xc * min_xc).log2());
+            self.stereo_saving = (self.stereo_saving + 0.25).min(-0.5 * log_xc2);
         }
         let mut diff = 0.0f32;
         for ch in 0..c {
