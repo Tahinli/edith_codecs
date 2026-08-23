@@ -3,13 +3,13 @@
 **Verdict: no fix. The charter's premise (her@96 err_ratio 10.126, target < 5) is
 superseded — `706596b` (lane-opus-64, transient_analysis port) already took her@96
 from 10.1 → 1.05 and her@64 from 4.65 → 1.10.** This lane delivers the requested
-error map (`lanes/opus-her-r1.map.txt`, test `her_err_map_96k`) and the certified
+error map (`lanes/opus-her-r1.map.txt`, test `err_map_vs_libopus` (was `her_err_map_96k`, renamed in r3)) and the certified
 current 14-row baseline. No `src` change: the gate target is met and a change would
 be tuning a passing row.
 
 ## What the map is
 
-`her_err_map_96k` (`#[ignore]`, `crates/ec-opus/tests/conformance.rs`, 30 s): the
+`err_map_vs_libopus` (was `her_err_map_96k`, renamed in r3) (`#[ignore]`, `crates/ec-opus/tests/conformance.rs`, 30 s): the
 gate's exact encode path for both encoders (ffmpeg libopus ref → realised ref_kbps
 → ours CVBR at that rate), `opus_compare_err_parts` per-2.5 ms-hop ef² bucketed
 into 1 s windows. Prints top-10 windows by ours/ref ratio and by ours share, with
@@ -66,6 +66,6 @@ Worst row is now **naz@96 at 4.499** — the next gate lane's premise.
 
 ## Files
 
-- `crates/ec-opus/tests/conformance.rs` — `her_err_map_96k` (commit 233d47e).
+- `crates/ec-opus/tests/conformance.rs` — `err_map_vs_libopus` (was `her_err_map_96k`, renamed in r3) (commit 233d47e).
 - `lanes/opus-her-r1.map.txt` — the map (commit 233d47e).
 - `lanes/` gate artifacts restored via `git checkout --` after the runs.

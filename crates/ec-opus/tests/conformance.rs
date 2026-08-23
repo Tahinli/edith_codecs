@@ -5283,31 +5283,37 @@ fn short_block_bits_vs_libopus() {
 // error share) are printed with our encoder flags plus both encoders' coded
 // decisions — libopus's packets decoded with our decoder, the naz-r2 method.
 // Frame mapping is in source-sample time (±1 frame of codec delay).
-// Output: lanes/opus-her-r1.map.txt. HER_KBPS overrides the rate (default 96).
+// Output: lanes/<EC_ERRMAP_TAG>.map.txt (default `opus-her-r1`). HER_KBPS (or
+// EC_ERRMAP_KBPS) overrides the rate, EC_ERRMAP_SRC the source file: the map is
+// the same analysis for any row of the library gate, not just her@96.
 // ---------------------------------------------------------------------------
 
 #[test]
 #[ignore]
-fn her_err_map_96k() {
+fn err_map_vs_libopus() {
     const SECS: f64 = 120.0;
     const FRAME: usize = 960;
     const CH: usize = 2;
     const HOP: usize = 120; // WIN_STEP: one opus_compare hop = 2.5 ms
     const HOPS_PER_WIN: usize = 48_000 / HOP; // 1 s window = 400 hops
-    let kbps_env: u32 = std::env::var("HER_KBPS")
+    let kbps_env: u32 = std::env::var("EC_ERRMAP_KBPS")
+        .or_else(|_| std::env::var("HER_KBPS"))
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(96);
+    let tag = std::env::var("EC_ERRMAP_TAG").unwrap_or_else(|_| "opus-her-r1".to_string());
 
-    let src = shellexpand("~/Music/Her Nerdeysen.mp3");
+    let src = shellexpand(
+        &std::env::var("EC_ERRMAP_SRC").unwrap_or_else(|_| "~/Music/Her Nerdeysen.mp3".to_string()),
+    );
     if !src.exists() {
         eprintln!("SKIP: missing {}", src.display());
         return;
     }
     let lanes_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lanes");
     fs::create_dir_all(&lanes_dir).unwrap();
-    let scratch = lanes_dir.join("opus-her-r1.scratch.ogg");
-    let out_path = lanes_dir.join("opus-her-r1.map.txt");
+    let scratch = lanes_dir.join(format!("{tag}.scratch.ogg"));
+    let out_path = lanes_dir.join(format!("{tag}.map.txt"));
 
     let source_pcm = ffmpeg_decode_pcm(&src, SECS);
     let source_frames = source_pcm.len() / CH;
