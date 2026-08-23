@@ -1441,11 +1441,9 @@ fn oracle_decodes_our_packets_across_the_rate_table() {
                     if channels == 1 {
                         0.6
                     } else {
-                        // .4164 before the libopus SILK reservoir port
-                        // (lane opus-silkq r3), .34 after: stereo SILK at
-                        // 8 kbps per channel with a flat mid/side split.
-                        // Open: lanes/opus-silkq-r3.report.md residue.
-                        0.33
+                        // Stereo SILK with the libopus LR_to_MS rate split
+                        // and panned-mono rule (lane opus-silkq r4): .4534.
+                        0.44
                     }
                 }
                 20..=39 => 0.6,
