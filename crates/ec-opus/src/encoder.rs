@@ -47,6 +47,21 @@ const SILK_LOOK_AHEAD_48K_WB: usize = 50;
 const HYBRID_SILK_DELAY_48K: usize = 120 - SILK_LOOK_AHEAD_48K_WB;
 /// Bytes the CELT layer of a hybrid packet always keeps, whatever SILK spent.
 const HYBRID_CELT_MIN_BYTES: usize = 8;
+/// libopus 1.6 bandwidth threshold tables (`opus_encoder.c:151`/`162`).
+/// Each pair is `(threshold, transition_width)` for one bandwidth boundary;
+/// voice and music, mono and stereo, are identical in 1.6.
+const MONO_VOICE_BW: [i32; 8] = [9000, 700, 9000, 700, 13500, 1000, 14000, 2000];
+const STEREO_VOICE_BW: [i32; 8] = [9000, 700, 9000, 700, 13500, 1000, 14000, 2000];
+const MONO_MUSIC_BW: [i32; 8] = [9000, 700, 9000, 700, 11000, 1000, 12000, 2000];
+const STEREO_MUSIC_BW: [i32; 8] = [9000, 700, 9000, 700, 11000, 1000, 12000, 2000];
+/// libopus `mode_thresholds` blended by `voice_est` (`opus_encoder.c:183`).
+/// With `stereo_width=0` (no analysis) the voice term is `[0][0]=64000` and
+/// the music base is `10000`; the gap (54000) is the ve² interpolation span.
+const MODE_THRESHOLD_VOICE: i32 = 64000;
+const MODE_THRESHOLD_MUSIC: i32 = 10000;
+/// Opus default encoder complexity (the `(90+complexity)/100` equiv-rate
+/// multiplier; loss=0 and complexity≥5 add no per-mode adjustment).
+const DEFAULT_COMPLEXITY: i32 = 9;
 
 /// What the caller is encoding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,6 +108,17 @@ pub struct Encoder {
     /// Scratch space for the zero-stuffed SILK/hybrid input, sized once so
     /// the steady-state loop doesn't allocate a `Vec` per frame.
     silk_stuff: Vec<f32>,
+}
+
+/// SILK's internal sample rate (kHz) for a target bandwidth: Narrow → 8,
+/// Medium → 12, Wide/SuperWide/Full → 16. SILK only runs at 8/12/16 kHz;
+/// for SuperWide/Full the top bands are CELT (Hybrid), so SILK itself is 16.
+fn silk_fs_khz(bw: Bandwidth) -> usize {
+    match bw {
+        Bandwidth::Narrow => 8,
+        Bandwidth::Medium => 12,
+        _ => 16,
+    }
 }
 
 impl Encoder {
@@ -242,32 +268,41 @@ impl Encoder {
     }
 
     /// Whether the application/bitrate (or an explicit [`Encoder::set_mode`])
-    /// call for SILK, and if so, which SILK internal sample rate in kHz.
+    /// calls for SILK, and if so, which SILK internal sample rate in kHz.
     /// `None` means CELT or Hybrid (`hybrid_choice` tells those apart).
-    fn wants_silk(&self) -> Option<usize> {
-        let forced = || match self.bandwidth.unwrap_or_else(|| self.auto_bandwidth()) {
-            Bandwidth::Narrow => 8,
-            Bandwidth::Medium => 12,
-            _ => 16,
-        };
+    ///
+    /// Ports libopus's mode decision: SILK when `equiv_rate` is below the
+    /// voice/music-blended mode threshold (`opus_encoder.c` ~1900), with the
+    /// bandwidth from the threshold walk. SILK only codes up to Wide; a
+    /// SuperWide/Full result is Hybrid (10/20 ms) or, for 40/60 ms frames
+    /// that Hybrid cannot carry, SILK capped at Wide.
+    fn wants_silk(&self, frame_48k: usize) -> Option<usize> {
         match self.mode {
             Some(Mode::Celt) | Some(Mode::Hybrid) => None,
-            Some(Mode::Silk) => Some(forced()),
+            Some(Mode::Silk) => {
+                let bw = self.bandwidth.unwrap_or_else(|| self.auto_bandwidth());
+                Some(silk_fs_khz(bw))
+            }
             None => {
-                if self.application == Application::Voip {
-                    let per_channel = self.bitrate / self.channels as u32;
-                    if per_channel < 20_000 {
-                        return Some(match self.bandwidth {
-                            Some(Bandwidth::Narrow) => 8,
-                            Some(Bandwidth::Medium) => 12,
-                            Some(_) => 16,
-                            None if per_channel <= 12_000 => 8,
-                            None if per_channel <= 16_000 => 12,
-                            None => 16,
-                        });
-                    }
+                let equiv = self.equiv_rate(frame_48k);
+                let ve = self.voice_est();
+                if !self.auto_silk(equiv, ve) {
+                    return None;
                 }
-                None
+                let bw = self.bandwidth.unwrap_or_else(|| self.auto_bandwidth_at(equiv, ve));
+                // 40/60 ms frames are SILK-only (Hybrid supports 10/20 ms):
+                // cap at Wide so a high equiv rate does not fall through to
+                // an impossible CELT 40/60 ms packet.
+                let bw = if matches!(frame_48k, 1920 | 2880) {
+                    bw.min(Bandwidth::Wide)
+                } else {
+                    bw
+                };
+                if bw > Bandwidth::Wide {
+                    None // Hybrid territory — see hybrid_choice
+                } else {
+                    Some(silk_fs_khz(bw))
+                }
             }
         }
     }
@@ -276,7 +311,7 @@ impl Encoder {
     /// mono 10/20/40/60 ms, stereo 10/20 ms directly, or stereo 40/60 ms as
     /// code-3 packets of 20 ms SILK frames.
     fn silk_choice(&self, frame_48k: usize) -> Option<usize> {
-        let fs_khz = self.wants_silk()?;
+        let fs_khz = self.wants_silk(frame_48k)?;
         if !matches!(frame_48k, 480 | 960 | 1920 | 2880) {
             return None;
         }
@@ -284,27 +319,27 @@ impl Encoder {
     }
 
     /// Whether this frame goes out as a hybrid packet, and at which of the two
-    /// hybrid bandwidths. Automatic: VoIP from 20 kbps per coded channel
-    /// (where SILK alone stops) to 40 kbps per coded channel (where CELT alone
-    /// is the better speech coder too), at the bitrate's own bandwidth
-    /// (SWB/FB; narrower requests are CELT's). Mono and stereo, 10 or 20 ms.
+    /// hybrid bandwidths. Automatic: Hybrid is SILK mode (equiv below the mode
+    /// threshold) whose bandwidth walk lands on SuperWide/Full — SILK alone
+    /// cannot code above Wide, so CELT carries the top bands. 10 or 20 ms
+    /// only (Hybrid has no 40/60 ms config). Forced Hybrid codes at least SWB.
     fn hybrid_choice(&self, frame_48k: usize) -> Option<Bandwidth> {
-        let per_channel = self.bitrate / self.channels as u32;
-        let wanted = match self.mode {
-            Some(Mode::Hybrid) => true,
-            Some(_) => false,
-            None => {
-                self.application == Application::Voip && (20_000..40_000).contains(&per_channel)
-            }
-        };
-        if !wanted || !matches!(frame_48k, 480 | 960) {
+        if matches!(self.mode, Some(Mode::Silk) | Some(Mode::Celt)) {
             return None;
         }
-        let bandwidth = self.bandwidth.unwrap_or_else(|| self.auto_bandwidth());
-        match bandwidth {
-            Bandwidth::SuperWide | Bandwidth::Full => Some(bandwidth),
-            // A forced Hybrid codes at least SWB; an automatic one that the
-            // bitrate would cap narrower is CELT's.
+        if !matches!(frame_48k, 480 | 960) {
+            return None;
+        }
+        let equiv = self.equiv_rate(frame_48k);
+        let ve = self.voice_est();
+        if self.mode.is_none() && !self.auto_silk(equiv, ve) {
+            return None;
+        }
+        let bw = self.bandwidth.unwrap_or_else(|| self.auto_bandwidth_at(equiv, ve));
+        match bw {
+            Bandwidth::SuperWide | Bandwidth::Full => Some(bw),
+            // A forced Hybrid with a narrow/medium/wide bandwidth still codes
+            // at least SWB — Hybrid has no narrower configuration.
             _ if self.mode == Some(Mode::Hybrid) => Some(Bandwidth::SuperWide),
             _ => None,
         }
@@ -531,7 +566,9 @@ impl Encoder {
                 ));
             }
         };
-        let bandwidth = self.bandwidth.unwrap_or_else(|| self.auto_bandwidth());
+        let bandwidth = self
+            .bandwidth
+            .unwrap_or_else(|| self.auto_bandwidth_at(self.equiv_rate(frame_48k), self.voice_est()));
         let bw_idx: u8 = match bandwidth {
             Bandwidth::Narrow => 0,
             // CELT has no mediumband configuration; the next one up covers it.
@@ -547,39 +584,92 @@ impl Encoder {
         ))
     }
 
-    /// Bandwidth from the bitrate: coding 20 kHz at 24 kbps spends bits on air.
-    ///
-    /// The thresholds are on the mono-equivalent rate — a coupled stereo stream
-    /// needs about 1.6x a mono one for the same per-channel quality — and VoIP
-    /// asks for one step narrower. The input's own Nyquist bounds the result:
-    /// coding above it would code the images the zero-stuffing put there.
+    /// Bandwidth from the bitrate — libopus's threshold walk, 20 ms default.
+    /// Kept for the forced-mode paths and unit tests; the dispatch functions
+    /// pass the actual frame's equiv rate to [`auto_bandwidth_at`].
     fn auto_bandwidth(&self) -> Bandwidth {
-        let equiv = if self.channels == 2 {
-            (self.bitrate as f32 * 0.62) as u32
+        self.auto_bandwidth_at(self.equiv_rate(960), self.voice_est())
+    }
+
+    /// The equivalent rate a frame is coded at, porting libopus
+    /// `compute_equiv_rate` (`opus_encoder.c:1021`): the bitrate, minus the
+    /// per-frame overhead for sub-20 ms frames, minus the CBR headroom, times
+    /// the complexity multiplier. Loss is 0 and complexity ≥ 5, so the
+    /// are both no-ops.
+    fn equiv_rate(&self, frame_48k: usize) -> i32 {
+        let frame_rate = 48000 / frame_48k as i32;
+        let mut equiv = self.bitrate as i32;
+        if frame_rate > 50 {
+            equiv -= (40 * self.channels as i32 + 20) * (frame_rate - 50);
+        }
+        if !self.vbr {
+            equiv -= equiv / 12;
+        }
+        equiv = equiv * (90 + DEFAULT_COMPLEXITY) / 100;
+        equiv
+    }
+
+    /// Voice activity estimate: VoIP → 115, Audio and LowDelay → 48
+    /// (`opus_encoder.c` `tonality_analysis` proxy — no analysis is modelled,
+    /// so the application alone decides).
+    fn voice_est(&self) -> i32 {
+        match self.application {
+            Application::Voip => 115,
+            _ => 48,
+        }
+    }
+
+    /// Whether the auto mode is SILK: `equiv` below the voice/music-blended
+    /// mode threshold (`opus_encoder.c` ~1900). LowDelay is always CELT.
+    /// VoIP gets the `+8000` hysteresis/voice bonus libopus applies.
+    fn auto_silk(&self, equiv: i32, ve: i32) -> bool {
+        if self.application == Application::LowDelay {
+            return false;
+        }
+        let threshold = MODE_THRESHOLD_MUSIC
+            + ((ve * ve * (MODE_THRESHOLD_VOICE - MODE_THRESHOLD_MUSIC)) >> 14);
+        let threshold = if self.application == Application::Voip {
+            threshold + 8000
         } else {
-            self.bitrate
+            threshold
         };
-        let equiv = if self.application == Application::Voip {
-            (equiv as f32 * 0.7) as u32
+        equiv < threshold
+    }
+
+    /// Bandwidth from the equivalent rate, porting libopus's `decide_bandwidth`
+    /// walk (`opus_encoder.c` ~1660). The voice and music threshold tables are
+    /// blended by `ve²`; the walk starts at Full and steps down until the equiv
+    /// rate sustains the current bandwidth. The input's own Nyquist clamps the
+    /// result — coding above it would code the images the zero-stuffing put
+    /// there.
+    fn auto_bandwidth_at(&self, equiv: i32, ve: i32) -> Bandwidth {
+        let (voice, music) = if self.channels == 2 {
+            (&STEREO_VOICE_BW, &STEREO_MUSIC_BW)
         } else {
-            equiv
+            (&MONO_VOICE_BW, &MONO_MUSIC_BW)
         };
+        let ve2 = ve * ve;
+        // Pair i is the boundary between bandwidth i and i+1:
+        //   0: NB↔MB, 1: MB↔WB, 2: WB↔SWB, 3: SWB↔FB.
+        let thresh = |i: usize| music[2 * i] + ((ve2 * (voice[2 * i] - music[2 * i])) >> 14);
+        const BWS: [Bandwidth; 5] = [
+            Bandwidth::Narrow,
+            Bandwidth::Medium,
+            Bandwidth::Wide,
+            Bandwidth::SuperWide,
+            Bandwidth::Full,
+        ];
+        let mut idx = 4; // Full
+        while idx > 0 && equiv < thresh(idx - 1) {
+            idx -= 1;
+        }
         let ceiling = match self.sample_rate {
             48000 => Bandwidth::Full,
             24000 => Bandwidth::SuperWide,
             16000 => Bandwidth::Wide,
             _ => Bandwidth::Narrow,
         };
-        let wanted = if equiv < 9000 {
-            Bandwidth::Narrow
-        } else if equiv < 13000 {
-            Bandwidth::Wide
-        } else if equiv < 20000 {
-            Bandwidth::SuperWide
-        } else {
-            Bandwidth::Full
-        };
-        wanted.min(ceiling)
+        BWS[idx].min(ceiling)
     }
 
     /// Encodes one frame — `frame_size` samples per channel of interleaved
@@ -773,16 +863,21 @@ mod tests {
         let mut e = Encoder::new(48000, 1, Application::Audio).unwrap();
         e.set_bitrate(64000);
         assert_eq!(e.auto_bandwidth(), Bandwidth::Full);
+        // libopus MONO_MUSIC_BW blended at voice_est=48 (analysis off):
+        // SWB<->FB boundary 12281, equiv(16k) = 14520 -> Full.
         e.set_bitrate(16000);
-        assert_eq!(e.auto_bandwidth(), Bandwidth::SuperWide);
+        assert_eq!(e.auto_bandwidth(), Bandwidth::Full);
         e.set_bitrate(10000);
         assert_eq!(e.auto_bandwidth(), Bandwidth::Wide);
+        // equiv(8k) = 7260 < 9000 (NB<->MB boundary) -> Narrow.
         e.set_bitrate(8000);
         assert_eq!(e.auto_bandwidth(), Bandwidth::Narrow);
-        // Speech asks for one step narrower at the same rate.
+        // VoIP (voice_est=127): SWB<->FB boundary 13616, so 16k speech is
+        // Full -> hybrid, matching libopus 1.6 on real speech
+        // (lanes/opus-silk-r2.sweep.txt: 16k-NB row, ref_mode=Hybrid-FB).
         let mut v = Encoder::new(48000, 1, Application::Voip).unwrap();
         v.set_bitrate(16000);
-        assert_eq!(v.auto_bandwidth(), Bandwidth::Wide);
+        assert_eq!(v.auto_bandwidth(), Bandwidth::Full);
         // The input's own Nyquist bounds it whatever the rate says.
         let mut e = Encoder::new(24000, 2, Application::Audio).unwrap();
         e.set_bitrate(256_000);
@@ -802,8 +897,9 @@ mod tests {
         assert_eq!(e.look_ahead(240), 120, "5ms frame falls back to CELT");
         assert_eq!(e.look_ahead(960), 58, "20ms NB SILK");
 
+        // 16k VoIP is hybrid-FB since the libopus threshold port (CELT overlap).
         e.set_bitrate(16000);
-        assert_eq!(e.look_ahead(960), 54, "20ms MB SILK");
+        assert_eq!(e.look_ahead(960), 120, "20ms hybrid FB");
 
         e.set_bitrate(32000);
         assert_eq!(e.look_ahead(960), 120, "20ms hybrid, CELT's overlap");
