@@ -929,6 +929,13 @@ impl VorbisEncoder {
 /// Each point owns the coefficients halfway to its neighbours either side, so
 /// the whole spectrum is covered exactly once and a peak between two points
 /// still raises the floor that has to carry it.
+///
+/// E1 (lane-vorbis-floor r2): returns the per-region **geometric mean** of
+/// |bin| (≡ mean of dB) instead of the max.  The max set the floor to the
+/// region's loudest bin; bins 20–40 dB under it quantised to zero, so we coded
+/// 45–57% as many non-zero residues as libvorbis at 1.5–2.1× bits each.  The
+/// geometric mean tracks the envelope: most bins sit near it and land at
+/// q ≈ 10^(headroom/20) ≈ ±3, matching libvorbis's dense ±1/±2.
 fn peaks_of(floor: &Floor1, half: usize, spectra: &[&Vec<f32>]) -> Vec<f64> {
     let x = &floor.x_list;
     x.iter()
@@ -939,13 +946,15 @@ fn peaks_of(floor: &Floor1, half: usize, spectra: &[&Vec<f32>]) -> Vec<f64> {
             let hi = above.map_or(half, |a| ((a + centre) / 2) as usize + 1);
             let lo = lo.min(half - 1);
             let hi = hi.clamp(lo + 1, half);
-            let mut peak = 0.0f64;
+            let mut sum_log = 0.0f64;
+            let mut count = 0usize;
             for spectrum in spectra {
                 for &value in &spectrum[lo..hi] {
-                    peak = peak.max(f64::from(value.abs()));
+                    sum_log += f64::from(value.abs()).max(1e-9).ln();
+                    count += 1;
                 }
             }
-            peak
+            (sum_log / count as f64).exp()
         })
         .collect()
 }
