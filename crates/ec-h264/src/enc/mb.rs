@@ -15,6 +15,7 @@
 use ec_h264_syntax::SliceType;
 use wide::i16x16;
 
+use crate::deblock::{edge_params, filter_luma_h_edge16, filter_luma_line};
 use crate::decoder::{
     chroma_nz_pair, gather_nbr4, gather_nbr8, luma_nz_pair, mb_neighbors, MbNeighbors,
 };
@@ -1607,7 +1608,7 @@ fn encode_intra_mb(
                 cost.i16_mode,
                 chroma_mode,
             );
-            ssd_mb(pic, e, mb_x, mb_y) as f64 + e.lambda * bits as f64
+            ssd_mb_deblocked(pic, e, mb_x, mb_y, &nbr, false) as f64 + e.lambda * bits as f64
         } else {
             ssd_luma(pic, e, mb_x, mb_y) as f64
                 + lambda_ssd(qp) * rough_intra_bits(&lv4, Some((&m4, &p4))) as f64
@@ -1639,7 +1640,7 @@ fn encode_intra_mb(
                 cost.i16_mode,
                 chroma_mode,
             );
-            ssd_mb(pic, e, mb_x, mb_y) as f64 + e.lambda * bits as f64
+            ssd_mb_deblocked(pic, e, mb_x, mb_y, &nbr, true) as f64 + e.lambda * bits as f64
         } else {
             f64::INFINITY
         };
@@ -1658,7 +1659,7 @@ fn encode_intra_mb(
                 cost.i16_mode,
                 chroma_mode,
             );
-            ssd_mb(pic, e, mb_x, mb_y) as f64 + e.lambda * bits as f64
+            ssd_mb_deblocked(pic, e, mb_x, mb_y, &nbr, false) as f64 + e.lambda * bits as f64
         } else {
             ssd_luma(pic, e, mb_x, mb_y) as f64
                 + lambda_ssd(qp) * rough_intra_bits(&lv16, None) as f64
@@ -1778,6 +1779,95 @@ fn ssd_mb(pic: &Picture, e: &MbEnc<'_>, mb_x: usize, mb_y: usize) -> i64 {
                 let d = i64::from(src[s + x]) - i64::from(plane.data[origin + row * stride + x]);
                 sum += d * d;
             }
+        }
+    }
+    sum
+}
+
+/// [`ssd_mb`] with the luma half measured after the loop filter this
+/// macroblock's reconstruction will get. An intra macroblock forces bS 4 on
+/// its left and top macroblock edges (8.7.2.1) and bS 3 on the internal luma
+/// edges; a transform-8x8 macroblock has no transform edge at luma offsets 4
+/// and 12, so those stay unfiltered, exactly as the decoder's `internal`
+/// gate decides it. Neighbours share this slice's qp with the zero offsets
+/// the encoder writes, so every edge is parameterised by the trial qp alone.
+/// The right and bottom edges belong to macroblocks coded later and cannot
+/// be known here; the aprons are the pre-filter neighbour samples, which is
+/// everything that exists at decision time. The chroma half is left
+/// pre-filter: chroma never takes the 8x8 transform, so it cannot separate
+/// the candidates.
+///
+/// The 8x8-vs-4x4 intra trial is judged by this and not by [`ssd_mb`]
+/// because the two candidates meet different edge sets under the same loop
+/// filter: a pre-filter SSD prices the 4x4 candidate as if its extra
+/// filtered edges cost nothing.
+fn ssd_mb_deblocked(
+    pic: &Picture,
+    e: &MbEnc<'_>,
+    mb_x: usize,
+    mb_y: usize,
+    nbr: &MbNeighbors,
+    trans8: bool,
+) -> i64 {
+    // The macroblock at (A, A) plus 4-sample left and top aprons: a bS-4
+    // edge reads p3 and rewrites p2 on its far side.
+    const A: usize = 4;
+    const S: usize = A + 16;
+    let mut scratch = [0u8; S * S];
+    let stride = pic.y.stride;
+    let origin = pic.y.at(mb_x * 16, mb_y * 16);
+    for row in 0..16 {
+        let src = origin + row * stride;
+        let dst = (A + row) * S + A;
+        scratch[dst..dst + 16].copy_from_slice(&pic.y.data[src..src + 16]);
+    }
+    if nbr.a {
+        for row in 0..16 {
+            let src = origin + row * stride - A;
+            let dst = (A + row) * S;
+            scratch[dst..dst + A].copy_from_slice(&pic.y.data[src..src + A]);
+        }
+    }
+    if nbr.b {
+        for row in 0..A {
+            let src = origin - (A - row) * stride;
+            let dst = row * S + A;
+            scratch[dst..dst + 16].copy_from_slice(&pic.y.data[src..src + 16]);
+        }
+    }
+    // Vertical edges left to right, then horizontal top to bottom, the order
+    // of 8.7.1: each edge filters what the earlier edges left behind.
+    let qp = e.target_qp;
+    let (e4, e3) = (edge_params(qp, 0, 0, 4), edge_params(qp, 0, 0, 3));
+    if nbr.a {
+        for row in 0..16 {
+            filter_luma_line(&mut scratch, (A + row) * S + A, 1, &e4);
+        }
+    }
+    for x in [4, 8, 12] {
+        if trans8 && x != 8 {
+            continue;
+        }
+        for row in 0..16 {
+            filter_luma_line(&mut scratch, (A + row) * S + A + x, 1, &e3);
+        }
+    }
+    if nbr.b {
+        filter_luma_h_edge16(&mut scratch, A * S + A, S, &e4);
+    }
+    for y in [4, 8, 12] {
+        if trans8 && y != 8 {
+            continue;
+        }
+        filter_luma_h_edge16(&mut scratch, (A + y) * S + A, S, &e3);
+    }
+    let mut sum = ssd_mb(pic, e, mb_x, mb_y) - ssd_luma(pic, e, mb_x, mb_y);
+    for row in 0..16 {
+        let src = (mb_y * 16 + row) * e.src.stride + mb_x * 16;
+        for x in 0..16 {
+            let d =
+                i64::from(e.src.y[src + x]) - i64::from(scratch[(A + row) * S + A + x]);
+            sum += d * d;
         }
     }
     sum
