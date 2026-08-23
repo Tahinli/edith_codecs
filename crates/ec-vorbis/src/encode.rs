@@ -80,13 +80,15 @@ const CLASS_RANGE: [i32; CLASSES] = [0, 1, 2, 4, 8, 16, 32, 64, 127];
 /// Residue codebook dimensions by class; class 0 codes no residue.
 const RESIDUE_BOOK_DIM: [usize; CLASSES] = [0, 4, 2, 2, 1, 1, 1, 1, 1];
 /// The vector books save packet bits but add setup and make the rate loop spend
-/// harder; this keeps the realised rate at the caller's target. Only for the
-/// low reference bitrates (sadie/hein, 79-91 kbps): there the oracle rate
-/// rides above the reference and the 3% trim is what holds it inside the ±3%
-/// gate (sadie@96 +2.74 with it). Every higher-bitrate oracle row realises
-/// BELOW its reference and loses mean corr under the trim (her@128: −5.2%
-/// rate, gap +.0016 vs the floor run), so those keep the full target.
+/// harder; this scale keeps the realised rate near the caller's target. Below
+/// 100 kbps the oracle rides above the reference and the 3% trim is what holds
+/// it inside the ±3% gate (sadie@96 +2.74 with it); at/above 100 kbps every row
+/// realised ~2-3% hot at scale 1.0 (dl8a@128 +3.50, naz@128 +2.98), so the
+/// high-rate trim is 0.98 — r1 sweep: all 128 k rows centre within ±1.6%, 14/14
+/// PASS (see lanes/vorbis-rate-r1.full.txt).
 const RATE_TARGET_SCALE: f64 = 0.97;
+/// Rate target scale at/above 100 kbps — see [`RATE_TARGET_SCALE`].
+const RATE_TARGET_SCALE_HI: f64 = 0.98;
 /// Headroom in dB the widest residue book can actually state: 20 log10 127
 /// is 42, but a coupled angle channel is a difference of two magnitudes, so a
 /// pair's step must leave half that range — 63, 36 dB. Past this the rate loop's extra headroom lowers the absolute-threshold
@@ -1035,7 +1037,7 @@ impl VorbisEncoder {
             return 0.0;
         }
         let scale = if self.config.bitrate_bps >= 100_000 {
-            1.0
+            RATE_TARGET_SCALE_HI
         } else {
             RATE_TARGET_SCALE
         };
