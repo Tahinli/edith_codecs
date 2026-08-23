@@ -5273,3 +5273,244 @@ fn short_block_bits_vs_libopus() {
     fs::write(&out_path, &report).unwrap();
     eprintln!("wrote {}", out_path.display());
 }
+
+// ---------------------------------------------------------------------------
+// her@96 opus_compare error map (lane opus-her r1).
+//
+// The gate's worst err_ratio row. This localises it: both encoders run through
+// the gate's exact path, opus_compare's per-2.5 ms hop ef² is bucketed into
+// 1 s windows, and the top-10 windows (by ours/ref window ratio and by ours
+// error share) are printed with our encoder flags plus both encoders' coded
+// decisions — libopus's packets decoded with our decoder, the naz-r2 method.
+// Frame mapping is in source-sample time (±1 frame of codec delay).
+// Output: lanes/opus-her-r1.map.txt. HER_KBPS overrides the rate (default 96).
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore]
+fn her_err_map_96k() {
+    const SECS: f64 = 120.0;
+    const FRAME: usize = 960;
+    const CH: usize = 2;
+    const HOP: usize = 120; // WIN_STEP: one opus_compare hop = 2.5 ms
+    const HOPS_PER_WIN: usize = 48_000 / HOP; // 1 s window = 400 hops
+    let kbps_env: u32 = std::env::var("HER_KBPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(96);
+
+    let src = shellexpand("~/Music/Her Nerdeysen.mp3");
+    if !src.exists() {
+        eprintln!("SKIP: missing {}", src.display());
+        return;
+    }
+    let lanes_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lanes");
+    fs::create_dir_all(&lanes_dir).unwrap();
+    let scratch = lanes_dir.join("opus-her-r1.scratch.ogg");
+    let out_path = lanes_dir.join("opus-her-r1.map.txt");
+
+    let source_pcm = ffmpeg_decode_pcm(&src, SECS);
+    let source_frames = source_pcm.len() / CH;
+    let seconds = source_frames as f64 / 48000.0;
+    let source_i16 = to_i16(&source_pcm);
+
+    // Reference: ffmpeg libopus, VBR — the gate's path.
+    ffmpeg_encode_libopus(&src, kbps_env, &scratch, SECS);
+    let ref_bytes = fs::metadata(&scratch).map(|m| m.len() as usize).unwrap_or(0);
+    let ref_kbps = ref_bytes as f64 * 8.0 / seconds / 1000.0;
+    let (ref_dec, ref_ch) = decode_ogg(&scratch);
+    assert_eq!(ref_ch, CH, "ref not stereo");
+    let (_, ref_aligned) = align_to_source(&source_pcm, &ref_dec, CH, 2000);
+
+    // Ref per-packet decoder diag, tagged with its first source sample.
+    struct FD {
+        sample: usize,
+        enc: Option<ec_opus::celt_enc::CeltFrameDiag>,
+        dec: ec_opus::celt::CeltDecDiag,
+    }
+    let ref_pkts: Vec<Vec<u8>> = ogg_packets(&fs::read(&scratch).unwrap())
+        .into_iter()
+        .skip(2)
+        .collect();
+    let mut ref_fd: Vec<FD> = Vec::new();
+    {
+        let mut d = Decoder::new(48000, CH).unwrap();
+        let mut buf = vec![0f32; 5760 * CH];
+        let mut at = 0usize;
+        for p in &ref_pkts {
+            if p.is_empty() {
+                continue;
+            }
+            let toc = ec_opus::Toc::new(p[0]);
+            let got = d.decode_float(p, &mut buf).unwrap_or(0);
+            if toc.mode() != Mode::Silk {
+                ref_fd.push(FD { sample: at, enc: None, dec: d.last_celt_diag().clone() });
+            }
+            at += got;
+        }
+    }
+
+    // Ours at the reference's realised rate (gate path), with per-frame diags.
+    let mut enc = Encoder::new(48000, CH, Application::Audio).expect("encoder");
+    enc.set_bitrate((ref_kbps * 1000.0).round() as u32);
+    enc.set_vbr_constrained(true);
+    let mut dec = Decoder::new(48000, CH).unwrap();
+    let mut pkt = vec![0u8; 1500];
+    let mut dbuf = vec![0f32; 5760 * CH];
+    let mut ours_dec = Vec::new();
+    let mut ours_bytes = 0usize;
+    let mut ours_fd: Vec<FD> = Vec::new();
+    for (fi, block) in source_pcm.chunks(FRAME * CH).enumerate() {
+        let mut padded = block.to_vec();
+        padded.resize(FRAME * CH, 0.0);
+        let n = enc.encode_float(&padded, FRAME, &mut pkt).unwrap();
+        ours_bytes += n;
+        let m = dec.decode_float(&pkt[..n], &mut dbuf).unwrap();
+        ours_dec.extend_from_slice(&dbuf[..m * CH]);
+        ours_fd.push(FD {
+            sample: fi * FRAME,
+            enc: Some(enc.last_celt_diag().clone()),
+            dec: dec.last_celt_diag().clone(),
+        });
+    }
+    let (_, ours_aligned) = align_to_source(&source_pcm, &ours_dec, CH, 2000);
+    let ours_i16 = to_i16(&ours_aligned);
+    let ref_i16 = to_i16(&ref_aligned);
+    let ours_kbps = ours_bytes as f64 * 8.0 / seconds / 1000.0;
+
+    // Per-hop ef² for both encoders (gate numerics).
+    let cmp_frames = (source_i16.len() / CH)
+        .min(ours_i16.len() / CH)
+        .min(ref_i16.len() / CH);
+    let trim = |v: &[i16]| -> Vec<i16> { v[..cmp_frames * CH].to_vec() };
+    let (err_o, _, hop_o) = opus_compare_err_parts(&trim(&source_i16), &trim(&ours_i16), CH);
+    let (err_r, _, hop_r) = opus_compare_err_parts(&trim(&source_i16), &trim(&ref_i16), CH);
+
+    // 1 s windows.
+    let nwin = hop_o.len() / HOPS_PER_WIN;
+    let sum = |h: &[f64], w: usize| h[w * HOPS_PER_WIN..(w + 1) * HOPS_PER_WIN].iter().sum::<f64>();
+    let tot_o: f64 = hop_o.iter().sum();
+    let tot_r: f64 = hop_r.iter().sum();
+    let mut wins: Vec<(usize, f64, f64, f64)> = (0..nwin)
+        .map(|w| (w, sum(&hop_o, w), sum(&hop_r, w), 0.0))
+        .collect();
+    for w in wins.iter_mut() {
+        w.3 = w.1 / w.2.max(f64::MIN_POSITIVE);
+    }
+    let max_share = wins.iter().map(|w| w.1).fold(0.0f64, f64::max);
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "# her@{kbps_env}k error map: ref {ref_kbps:.1} ours {ours_kbps:.1} kbps, \
+         err o={err_o:.3} r={err_r:.3} ratio {:.3}, {nwin} s windows\n",
+        err_o / err_r
+    ));
+    out.push_str("# window time = first hop of the 1 s bucket; ratio = ours/ref window ef² sum\n");
+    out.push_str("# ratio table de-noised: windows with ours share < 1e-6·max excluded\n");
+
+    let fmt_fd = |f: &FD| -> String {
+        let e = f.enc.as_ref();
+        format!(
+            "trans{} intra{} trim{} int{} cb{} dual{} | tf_sum {:+3} tf8 {:?} sp{} ac{} bits{}",
+            f.dec.transient as u8,
+            f.dec.intra as u8,
+            f.dec.alloc_trim,
+            f.dec.intensity,
+            f.dec.coded_bands,
+            f.dec.dual_stereo as u8,
+            f.dec.tf_res.iter().sum::<i32>(),
+            &f.dec.tf_res.iter().take(8).collect::<Vec<_>>(),
+            f.dec.spread,
+            f.dec.anti_collapse as u8,
+            f.dec.total_bits,
+        ) + &e.map(|e| format!(
+            " | ENC sb{} vbr{}", e.short_blocks, e.vbr_reservoir
+        )).unwrap_or_default()
+    };
+    let ref_at = |s: usize| -> Option<&FD> {
+        let i = ref_fd.partition_point(|f| f.sample <= s);
+        i.checked_sub(1).map(|i| &ref_fd[i])
+    };
+
+    for (label, order) in [
+        ("TOP-10 WINDOWS BY ours/ref RATIO", {
+            let mut v: Vec<usize> = (0..nwin)
+                .filter(|&w| wins[w].1 >= 1e-6 * max_share)
+                .collect();
+            v.sort_by(|&a, &b| wins[b].3.total_cmp(&wins[a].3));
+            v
+        }),
+        ("TOP-10 WINDOWS BY ours ERROR SHARE", {
+            let mut v: Vec<usize> = (0..nwin).collect();
+            v.sort_by(|&a, &b| wins[b].1.total_cmp(&wins[a].1));
+            v
+        }),
+    ] {
+        out.push_str(&format!("\n== {label} ==\n"));
+        for w in order.into_iter().take(10) {
+            let (wo, wr, ratio) = (wins[w].1, wins[w].2, wins[w].3);
+            out.push_str(&format!(
+                "t={:5.0}s: ours {:.3e} ({:4.1}% of ours) ref {:.3e} ({:4.1}% of ref) ratio {:.1}\n",
+                w as f64,
+                wo,
+                100.0 * wo / tot_o,
+                wr,
+                100.0 * wr / tot_r,
+                ratio,
+            ));
+            // Worst hop in the window: flags from both encoders.
+            let (hw, he) = (w * HOPS_PER_WIN, (w + 1) * HOPS_PER_WIN);
+            let hb = hop_o[hw..he]
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, v)| (hw + i, *v))
+                .unwrap();
+            let mid = hb.0 * HOP + 240; // centre sample of the hop
+            let fi = mid / FRAME;
+            out.push_str(&format!(
+                "  worst hop {:.1} ms (frame {fi}) ours_ef2 {:.3e}\n",
+                hb.0 as f64 * 2.5,
+                hb.1
+            ));
+            if let Some(f) = ours_fd.get(fi) {
+                out.push_str(&format!("  OUR {}/{}: {}\n", fi, f.sample, fmt_fd(f)));
+            }
+            if let Some(f) = ref_at(mid) {
+                out.push_str(&format!("  REF @{}: {}\n", f.sample, fmt_fd(f)));
+            }
+            if let (Some(o), Some(r)) = (ours_fd.get(fi), ref_at(mid)) {
+                let d0: Vec<String> = (0..ec_opus::celt::NB_BANDS)
+                    .map(|b| format!("{:+5.1}", o.dec.old_band_e[b] - r.dec.old_band_e[b]))
+                    .collect();
+                let d1: Vec<String> = (0..ec_opus::celt::NB_BANDS)
+                    .map(|b| {
+                        format!(
+                            "{:+5.1}",
+                            o.dec.old_band_e[ec_opus::celt::NB_BANDS + b]
+                                - r.dec.old_band_e[ec_opus::celt::NB_BANDS + b]
+                        )
+                    })
+                    .collect();
+                out.push_str(&format!("  Δlog2E L {}\n           R {}\n", d0.join(" "), d1.join(" ")));
+            }
+        }
+    }
+
+    // The single worst ours window, frame by frame: where do decisions diverge.
+    let worst = (0..nwin).max_by(|&a, &b| wins[a].1.total_cmp(&wins[b].1)).unwrap();
+    out.push_str(&format!(
+        "\n== WORST WINDOW t={}..{}s, ALL FRAMES (OUR | REF) ==\n",
+        worst,
+        worst + 1
+    ));
+    for fi in worst * 50..(worst + 1) * 50 {
+        let our = ours_fd.get(fi).map(&fmt_fd).unwrap_or_else(|| "-".into());
+        let rf = ref_at(fi * FRAME + 480).map(&fmt_fd).unwrap_or_else(|| "-".into());
+        out.push_str(&format!("f{fi}: OUR {our}\n     REF {rf}\n"));
+    }
+
+    fs::write(&out_path, &out).unwrap();
+    let _ = fs::remove_file(&scratch);
+    println!("wrote {}", out_path.display());
+}
