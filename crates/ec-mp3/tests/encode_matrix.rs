@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use ec_mp3::{Mp3Encoder, Mp3EncoderConfig};
+use ec_mp3::{FrameHeader, Mp3Encoder, Mp3EncoderConfig};
 
 /// Correlation the incumbent MP3 encoder, 0.6.1, reaches on this corpus, measured with this
 /// same alignment and metric (its own encoder, ffmpeg's decoder). The tone
@@ -156,7 +156,16 @@ fn worst_window_db(got: &[f32], want: &[f32], offset: usize, channels: usize) ->
         // and the fade-ins around it.
         if sig / window as f64 > 1e-6 {
             let db = 10.0 * (err / sig.max(1e-30)).log10();
-            worst = worst.max(db);
+            if db > worst {
+                worst = db;
+                if std::env::var_os("EC_MP3_WORST_WHERE").is_some() {
+                    eprintln!(
+                        "    worst so far {db:+.1} dB at {:.2} s, level {:.1} dBFS",
+                        start as f64 / (44100.0 * channels as f64),
+                        10.0 * (sig / window as f64).log10()
+                    );
+                }
+            }
         }
         start += window;
     }
@@ -475,14 +484,11 @@ const LIBRARY: [(&str, &str); 7] = [
 
 /// How much worse than LAME a row's worst 20 ms window may be, in dB.
 ///
-/// The floor is set from the measurement and the measurement is bad: hein at
-/// 192 kbit/s is 12.6 dB behind, and hein and sadie are the two spoken-word
-/// sources. LAME's worst window improves by 12 dB from 128 to 192 kbit/s on
-/// that file while ours improves by 5, which says our limit there is the
-/// masking model rather than the bitrate. That is the next round; the floor
-/// exists so it cannot quietly get worse first. Worst row: hein at 192 kbit/s,
-/// 12.6 dB behind.
-const WORST_WINDOW_EXCESS_DB: f64 = 13.5;
+/// The gap was 12.6 dB when this floor went in, on the two spoken-word
+/// sources, and mid/side stereo closed it: the encoder declared joint stereo
+/// while writing plain left/right, so near-mono speech was coded twice. The
+/// worst row now is dl8a at 192 kbit/s, 4.1 dB behind on a wide music mix.
+const WORST_WINDOW_EXCESS_DB: f64 = 5.0;
 
 /// How far under LAME a row may sit before the sweep fails, in correlation.
 ///
@@ -491,7 +497,7 @@ const WORST_WINDOW_EXCESS_DB: f64 = 13.5;
 /// floor sits just under that worst row rather than at zero because three rows
 /// are already ahead of LAME and the spread is what a regression would have to
 /// widen.
-const LAME_CORR_FLOOR: f64 = -0.0015;
+const LAME_CORR_FLOOR: f64 = -0.0012;
 
 fn expand(path: &str) -> PathBuf {
     PathBuf::from(match path.strip_prefix("~/") {
@@ -633,4 +639,66 @@ fn real_library_sweep_vs_lame() {
     }
     assert!(rows > 0, "no library sources were readable");
     assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// The `mode_extension` of every frame of a stream, in order.
+fn mode_exts(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at + 4 <= bytes.len() {
+        let Ok(header) = FrameHeader::parse(&bytes[at..]) else {
+            at += 1;
+            continue;
+        };
+        let Some(len) = header.frame_len() else { break };
+        out.push(header.mode_ext);
+        at += len;
+    }
+    out
+}
+
+/// Mid/side is chosen for the signal it helps and declined for the one it
+/// hurts. Two channels carrying the same waveform put everything in the sum
+/// and nothing in the difference, which is the case mid/side exists for; two
+/// carrying opposite waveforms are its worst case, where the difference is
+/// the loud channel and coding it as such would spend the frame's bits on the
+/// quiet one. Both roundtrip, because the decoder undoes whichever was
+/// written.
+#[test]
+fn mid_side_follows_the_channel_correlation() {
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    let mut noise = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed >> 40) as f32 / 8388608.0 - 0.5
+    };
+    let n = 44100;
+    let (mut same, mut opposed) = (Vec::with_capacity(n * 2), Vec::with_capacity(n * 2));
+    for i in 0..n {
+        // Band-limited enough to be codeable: a slow tone under the noise.
+        let tone = (i as f32 * 0.03).sin() * 0.4;
+        let v = tone + noise() * 0.05;
+        same.push(v);
+        same.push(v);
+        opposed.push(v);
+        opposed.push(-v);
+    }
+    for (label, pcm, want_ms) in [("same", same, true), ("opposed", opposed, false)] {
+        let bytes = encode(&pcm, 44100, 2, 128);
+        let exts = mode_exts(&bytes);
+        assert!(exts.len() > 20, "{label}: only {} frames", exts.len());
+        let ms = exts.iter().filter(|e| *e & 2 != 0).count();
+        // The first and last frames carry priming and a tail, so judge the body.
+        let body = exts.len() - 2;
+        if want_ms {
+            assert!(
+                ms >= body,
+                "{label}: only {ms} of {} frames are mid/side",
+                exts.len()
+            );
+        } else {
+            assert_eq!(ms, 0, "{label}: {ms} frames chose mid/side");
+        }
+    }
 }

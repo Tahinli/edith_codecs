@@ -75,6 +75,18 @@ const ZERO_QUANT_THRESHOLD: f32 = 7.8504e-17;
 
 const SFB_LONG: usize = 21;
 
+/// How much quieter the difference of the two channels has to be than their
+/// sum before the frame is coded as mid/side. One means "whenever the sum is
+/// the louder of the two", which is every correlated mix.
+///
+/// Swept on the two library sources mid/side helps least (`zaur`, `dl8a`,
+/// `real_library_sweep_vs_lame`): the correlation gap moves by 0.00001 across
+/// 0.5, 1, 2 and "always", and by 0.0005 between "always" and "never". Real
+/// music sits nowhere near this threshold, so it is a guard, not a tuning
+/// knob -- what it guards is the opposed-channel case, where the difference
+/// is the loud channel (`mid_side_follows_the_channel_correlation`).
+const MS_ENERGY_RATIO: f64 = 1.0;
+
 /// One granule's worth of coded spectrum plus the side info describing it.
 #[derive(Clone, Debug)]
 struct CodedGranule {
@@ -111,7 +123,10 @@ pub struct Mp3Encode {
     pending: Vec<PendingGranule>,
     /// The block type each channel's previous granule used. Window switching
     /// is a sequence, and the sequence does not restart at a frame boundary.
-    previous_block: Vec<u8>,
+    previous_block: u8,
+    /// The `mode_extension` bits of the frame being written: bit 1 is
+    /// mid/side stereo, decided per frame in `emit_frame`.
+    mode_ext: u8,
     fft: RealFft<f32>,
     fft_window: Window<f32>,
     psy_history: Vec<Vec<f32>>,
@@ -187,7 +202,8 @@ impl Mp3Encode {
             slots: vec![Vec::new(); channels],
             history: vec![[[0.0; 32]; 18]; channels],
             pending: Vec::new(),
-            previous_block: vec![0; channels],
+            previous_block: 0,
+            mode_ext: 0,
             fft: RealFft::new(1024),
             fft_window: Window::sine(1024),
             psy_history: vec![vec![0.0; 1024]; channels],
@@ -226,7 +242,7 @@ impl Mp3Encode {
             padding: false,
             private: false,
             mode: self.mode,
-            mode_ext: 0,
+            mode_ext: self.mode_ext,
             copyright: false,
             original: true,
             emphasis: 0,
@@ -616,15 +632,27 @@ impl Mp3Encode {
         // granule of one frame demands a short block in the first granule of
         // the next. Restarting it per frame is what leaves a start window
         // facing a normal one, whose overlap does not reconstruct.
+        //
+        // Both channels of a frame get the same window, because mid/side
+        // below adds and subtracts their spectra: lines from a long block and
+        // lines from a short one describe different time slices, so summing
+        // them would smear one channel's transient across the other's granule.
         let mut types = vec![0u8; granules * channels];
         for gr in 0..granules {
-            for ch in 0..channels {
-                let index = gr * channels + ch;
-                let here = self.pending[index].energy;
-                let next = self
-                    .pending
-                    .get(index + channels)
-                    .map_or(here, |g| g.energy);
+            {
+                let base = gr * channels;
+                let energy = |slot: usize| -> f32 {
+                    (0..channels)
+                        .filter_map(|ch| self.pending.get(slot + ch))
+                        .map(|g| g.energy)
+                        .sum()
+                };
+                let here = energy(base);
+                let next = if base + channels < self.pending.len() {
+                    energy(base + channels)
+                } else {
+                    here
+                };
                 // Digital silence is not a transient to protect: switching on
                 // the way out of it (the priming, or a cut in a timeline) costs
                 // the resolution a long block would have spent on the attack
@@ -647,15 +675,17 @@ impl Mp3Encode {
                 // more of the worst window back, so 4 sits at the cheap end
                 // of the flat part.
                 let attack = here > 1e-9 && next > here * 4.0 + 1e-6;
-                let block = match self.previous_block[ch] {
+                let block = match self.previous_block {
                     1 => 2,
                     2 if attack => 2,
                     2 => 3,
                     _ if attack => 1,
                     _ => 0,
                 };
-                types[index] = block;
-                self.previous_block[ch] = block;
+                for ch in 0..channels {
+                    types[base + ch] = block;
+                }
+                self.previous_block = block;
             }
         }
 
@@ -677,6 +707,50 @@ impl Mp3Encode {
             }
         }
         self.pending.drain(..granules * channels);
+
+        // Mid/side stereo. The two channels of real music are mostly the same
+        // signal, and coding their sum and difference puts nearly all of the
+        // energy in the sum, leaving the difference cheap enough to quantise
+        // finely at the same cost. It is applied to the MDCT lines and undone
+        // by the decoder, so it is exact -- the only judgement is whether the
+        // difference really is the small one, which it is not on a wide stereo
+        // mix, where L/R codes two independent signals better than a mid that
+        // is loud and a side that is nearly as loud.
+        self.mode_ext = 0;
+        if channels == 2 && self.mode == ChannelMode::JointStereo {
+            let (mut mid, mut side) = (0.0f64, 0.0f64);
+            for gr in 0..granules {
+                let (left, right) = (&xrs[gr * 2], &xrs[gr * 2 + 1]);
+                for (&l, &r) in left.iter().zip(right.iter()) {
+                    let (l, r) = (f64::from(l), f64::from(r));
+                    mid += (l + r) * (l + r);
+                    side += (l - r) * (l - r);
+                }
+            }
+            if side < mid * MS_ENERGY_RATIO {
+                self.mode_ext = 2;
+                const INV_SQRT2: f32 = std::f32::consts::FRAC_1_SQRT_2;
+                for gr in 0..granules {
+                    let (head, tail) = xrs.split_at_mut(gr * 2 + 1);
+                    let (left, right) = (&mut head[gr * 2], &mut tail[0]);
+                    for (l, r) in left.iter_mut().zip(right.iter_mut()) {
+                        let (a, b) = (*l, *r);
+                        *l = (a + b) * INV_SQRT2;
+                        *r = (a - b) * INV_SQRT2;
+                    }
+                    // Neither coded channel is one of the speakers any more,
+                    // so both are held to whichever channel masked less: an
+                    // error in the side channel lands in both ears.
+                    let (head, tail) = thresholds.split_at_mut(gr * 2 + 1);
+                    let (left, right) = (&mut head[gr * 2], &mut tail[0]);
+                    for (l, r) in left.iter_mut().zip(right.iter_mut()) {
+                        let floor = l.min(*r);
+                        *l = floor;
+                        *r = floor;
+                    }
+                }
+            }
+        }
 
         // Quantise the granules. CBR codes to a fixed frame budget. VBR tries
         // legal bitrates, coding the whole frame's granules against each one's
