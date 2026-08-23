@@ -3313,6 +3313,58 @@ fn ffmpeg_encode_libopus_mono_voip(src: &Path, kbps: u32, out: &Path, secs: f64)
     );
 }
 
+/// Same as [`roundtrip_own`] but also returns the encoded packets, so the SILK
+/// gate can re-decode them through ffmpeg (decoder-symmetric comparison).
+fn roundtrip_own_packets(
+    enc: &mut Encoder,
+    pcm: &[f32],
+    channels: usize,
+    frame: usize,
+) -> (Vec<f32>, Vec<Vec<u8>>, usize) {
+    let mut dec = Decoder::new(48000, channels).unwrap();
+    let mut out = vec![0u8; 1500];
+    let mut decoded = Vec::new();
+    let mut packets = Vec::new();
+    let mut buf = vec![0.0f32; 5760 * channels];
+    let mut bytes = 0usize;
+    let mut padded = Vec::new();
+    for block in pcm.chunks(frame * channels) {
+        let block = if block.len() < frame * channels {
+            padded.clear();
+            padded.extend_from_slice(block);
+            padded.resize(frame * channels, 0.0);
+            &padded[..]
+        } else {
+            block
+        };
+        let len = enc.encode_float(block, frame, &mut out).expect("encode");
+        bytes += len;
+        packets.push(out[..len].to_vec());
+        let n = dec.decode_float(&out[..len], &mut buf).expect("decode");
+        assert_eq!(n, frame, "decoded frame size");
+        assert_eq!(
+            dec.final_range(),
+            enc.final_range(),
+            "range state diverged between encoder and decoder"
+        );
+        decoded.extend_from_slice(&buf[..n * channels]);
+    }
+    (decoded, packets, bytes)
+}
+
+/// First audio packet's TOC byte from Ogg-Opus bytes (skips OpusHead/OpusTags).
+fn first_audio_toc(ogg: &[u8]) -> u8 {
+    for p in ogg_packets(ogg) {
+        if p.len() >= 8 && (&p[..8] == b"OpusHead" || &p[..8] == b"OpusTags") {
+            continue;
+        }
+        if !p.is_empty() {
+            return p[0];
+        }
+    }
+    0
+}
+
 #[test]
 #[ignore]
 fn silk_library_gate_vs_libopus() {
@@ -3326,39 +3378,52 @@ fn silk_library_gate_vs_libopus() {
 
     let lanes_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lanes");
     fs::create_dir_all(&lanes_dir).unwrap();
-    let sweep_path = lanes_dir.join("opus-silk-r1.sweep.txt");
-    let scratch = lanes_dir.join("opus-silk-r1.scratch.ogg");
+    let sweep_path = lanes_dir.join("opus-silk-r2.sweep.txt");
+    let ref_ogg = temp_path("opus-silk-r2-ref.opus");
+    let ours_ogg = temp_path("opus-silk-r2-ours.opus");
 
     // Source PCM: mono, 48 kHz.
     let source_pcm = ffmpeg_decode_pcm_mono(&src, SECS);
     let source_frames = source_pcm.len() / CHANNELS;
     assert!(source_frames > 48_000, "source too short");
     let seconds = source_frames as f64 / 48000.0;
-    let source_i16 = to_i16(&source_pcm);
 
-    // (label, kbps, forced bandwidth, forced mode). mode/bw chosen so Voip at
-    // these rates really codes SILK/Hybrid, not CELT (see wants_silk/
-    // hybrid_choice): 12k auto-NB, 16k forced-NB (auto would pick MB), 24k
-    // forced-Silk+Wide (auto would pick hybrid), 32k auto-hybrid.
-    let rows: &[(&str, u32, Option<Bandwidth>, Option<Mode>)] = &[
-        ("12k-NB", 12, None, None),
-        ("16k-NB", 16, Some(Bandwidth::Narrow), None),
-        ("24k-WB", 24, Some(Bandwidth::Wide), Some(Mode::Silk)),
-        ("32k-Hyb", 32, None, None),
+    // (label, kbps, forced bandwidth, forced mode, reference lowpass cutoff).
+    // cutoff: NB 4 kHz, WB 8 kHz, hybrid-FB unfiltered (None) — compare each
+    // encoder only against the band it can actually reproduce.
+    let rows: &[(&str, u32, Option<Bandwidth>, Option<Mode>, Option<f64>)] = &[
+        ("12k-NB", 12, None, None, Some(4000.0)),
+        ("16k-NB", 16, Some(Bandwidth::Narrow), None, Some(4000.0)),
+        ("24k-WB", 24, Some(Bandwidth::Wide), Some(Mode::Silk), Some(8000.0)),
+        ("32k-Hyb", 32, None, None, None),
     ];
 
     let mut out_rows: Vec<String> = Vec::new();
     let mut rate_violations: Vec<String> = Vec::new();
     let mut dropout_violations: Vec<String> = Vec::new();
+    let mut lag_violations: Vec<String> = Vec::new();
 
-    for &(tag, kbps, bw, mode) in rows {
+    for &(tag, kbps, bw, mode, cutoff) in rows {
+        // Band-limited reference source for this row's corr/opus_compare.
+        let ref_source: Vec<f32> = match cutoff {
+            Some(hz) => lowpass(&source_pcm, hz),
+            None => source_pcm.clone(),
+        };
+        let ref_source_i16 = to_i16(&ref_source);
+
         // Reference: ffmpeg libopus, mono, voip, VBR; realised rate from size.
-        ffmpeg_encode_libopus_mono_voip(&src, kbps, &scratch, SECS);
-        let ref_bytes = fs::metadata(&scratch).map(|m| m.len() as usize).unwrap_or(0);
+        ffmpeg_encode_libopus_mono_voip(&src, kbps, &ref_ogg, SECS);
+        let ref_bytes = fs::metadata(&ref_ogg).map(|m| m.len() as usize).unwrap_or(0);
         let ref_kbps = ref_bytes as f64 * 8.0 / seconds / 1000.0;
-        let (ref_dec, ref_ch) = decode_ogg(&scratch);
-        assert_eq!(ref_ch, CHANNELS, "{tag}: ref not mono");
-        let (_, ref_aligned) = align_to_source(&source_pcm, &ref_dec, CHANNELS, MAX_LAG);
+        // SYMMETRY: ref decoded through ffmpeg libopus (the reference decoder),
+        // NOT our own decoder — so both sides cross the same decoder. (r1 used
+        // decode_ogg, our own MultistreamDecoder, for the ref side.)
+        let ref_dec = ffmpeg_decode(&ref_ogg, CHANNELS).expect("ffmpeg libopus decode of ref");
+        let ref_trim: Vec<f32> = ref_dec.into_iter().take(source_frames * CHANNELS).collect();
+        let (lag_ref, ref_aligned) = align_to_source(&source_pcm, &ref_trim, CHANNELS, MAX_LAG);
+        // REF MODE: libopus's actual mode from its first audio packet TOC.
+        let ref_ogg_bytes = fs::read(&ref_ogg).expect("read ref ogg");
+        let ref_mode = toc_mode_label(first_audio_toc(&ref_ogg_bytes));
 
         // Ours: ec-opus Voip at the reference's realised rate.
         let mut enc = Encoder::new(48000, CHANNELS, Application::Voip).expect("encoder");
@@ -3370,6 +3435,7 @@ fn silk_library_gate_vs_libopus() {
             enc.set_mode(Some(m));
         }
         enc.set_vbr_constrained(true);
+        let pre_skip = enc.look_ahead(FRAME) as i64;
 
         // Probe which mode the encoder actually picked, from the first TOC byte.
         let mut probe = enc.clone();
@@ -3379,18 +3445,44 @@ fn silk_library_gate_vs_libopus() {
             .expect("encode probe");
         let mode_label = toc_mode_label(toc_buf[0]);
 
-        let (ours_dec, ours_bytes) = roundtrip_own(&mut enc, &source_pcm, CHANNELS, FRAME);
+        // Own-decoder roundtrip (range-coder invariant) + packet capture.
+        let (ours_own_dec, ours_packets, ours_bytes) =
+            roundtrip_own_packets(&mut enc, &source_pcm, CHANNELS, FRAME);
         let ours_kbps = ours_bytes as f64 * 8.0 / seconds / 1000.0;
+
+        // SYMMETRY: re-decode OUR packets through ffmpeg libopus too.
+        write_ogg_opus(
+            &ours_ogg,
+            &ours_packets,
+            opus_head(CHANNELS, pre_skip as u16, None),
+            CHANNELS,
+            source_frames,
+            pre_skip,
+        );
+        let ours_dec = ffmpeg_decode(&ours_ogg, CHANNELS).expect("ffmpeg libopus decode of ours");
         let ours_trim: Vec<f32> = ours_dec.into_iter().take(source_frames * CHANNELS).collect();
-        let (_, ours_aligned) = align_to_source(&source_pcm, &ours_trim, CHANNELS, MAX_LAG);
+        let (lag_ours, ours_aligned) = align_to_source(&source_pcm, &ours_trim, CHANNELS, MAX_LAG);
+
+        // Own-decoder aligned (extra column: decoder drift visibility).
+        let ours_own_trim: Vec<f32> =
+            ours_own_dec.into_iter().take(source_frames * CHANNELS).collect();
+        let (_, ours_own_aligned) = align_to_source(&source_pcm, &ours_own_trim, CHANNELS, MAX_LAG);
+
+        // LAG GATE: a lag at the scan bound is an invalid measurement, not a result.
+        if (lag_ours as i64).abs() >= MAX_LAG as i64 {
+            lag_violations.push(format!("{tag}: ours lag {lag_ours} hit scan bound {MAX_LAG}"));
+        }
+        if (lag_ref as i64).abs() >= MAX_LAG as i64 {
+            lag_violations.push(format!("{tag}: ref lag {lag_ref} hit scan bound {MAX_LAG}"));
+        }
+
         let ours_i16 = to_i16(&ours_aligned);
         let ref_i16 = to_i16(&ref_aligned);
-
-        let cmp_frames = (source_i16.len() / CHANNELS)
+        let cmp_frames = (ref_source_i16.len() / CHANNELS)
             .min(ours_i16.len() / CHANNELS)
             .min(ref_i16.len() / CHANNELS);
         let trim = |v: &[i16]| -> Vec<i16> { v[..cmp_frames * CHANNELS].to_vec() };
-        let s_i = trim(&source_i16);
+        let s_i = trim(&ref_source_i16);
         let o_i = trim(&ours_i16);
         let r_i = trim(&ref_i16);
         let q_ours = opus_compare(&s_i, &o_i, CHANNELS);
@@ -3399,11 +3491,15 @@ fn silk_library_gate_vs_libopus() {
         let err_ref = opus_compare_err(&s_i, &r_i, CHANNELS);
         let err_ratio = if err_ref > 0.0 { err_ours / err_ref } else { f64::INFINITY };
 
-        let corr_ours = corr_interleaved(&source_pcm, &ours_aligned, CHANNELS);
-        let corr_ref = corr_interleaved(&source_pcm, &ref_aligned, CHANNELS);
-        let gap = corr_ref - corr_ours;
-        let (minsec_ours, drop_ours) = per_second_corr(&source_pcm, &ours_aligned, CHANNELS);
-        let (minsec_ref, drop_ref) = per_second_corr(&source_pcm, &ref_aligned, CHANNELS);
+        // Primary corr: band-limited reference. Secondary: full-band source.
+        let corr_ours_bl = corr_interleaved(&ref_source, &ours_aligned, CHANNELS);
+        let corr_ref_bl = corr_interleaved(&ref_source, &ref_aligned, CHANNELS);
+        let gap = corr_ref_bl - corr_ours_bl; // SIGN RULE: more negative = ours better
+        let corr_ours_fb = corr_interleaved(&source_pcm, &ours_aligned, CHANNELS);
+        let corr_ref_fb = corr_interleaved(&source_pcm, &ref_aligned, CHANNELS);
+        let corr_ours_owndec = corr_interleaved(&ref_source, &ours_own_aligned, CHANNELS);
+        let (minsec_ours, drop_ours) = per_second_corr(&ref_source, &ours_aligned, CHANNELS);
+        let (minsec_ref, drop_ref) = per_second_corr(&ref_source, &ref_aligned, CHANNELS);
         let rate_pct = (ours_kbps / ref_kbps - 1.0) * 100.0;
 
         if rate_pct.abs() > 5.0 {
@@ -3415,15 +3511,18 @@ fn silk_library_gate_vs_libopus() {
             ));
         }
         let row = format!(
-            "{tag}: mode={mode_label}, ref {ref_kbps:.1} ours {ours_kbps:.1} kbps ({rate_pct:+.1}%), \
-             corr o={corr_ours:.4} r={corr_ref:.4} gap={gap:+.4}, \
+            "{tag}: ref_mode={ref_mode} mode={mode_label}, ref {ref_kbps:.1} ours {ours_kbps:.1} kbps ({rate_pct:+.1}%), \
+             lag o={lag_ours} r={lag_ref}, \
+             corr_bl o={corr_ours_bl:.4} r={corr_ref_bl:.4} gap={gap:+.4}, \
+             corr_fb o={corr_ours_fb:.4} r={corr_ref_fb:.4}, corr_owndec o={corr_ours_owndec:.4}, \
              Q o={q_ours:.2} r={q_ref:.2}, err_ratio {err_ratio:.3}, \
              minsec o={minsec_ours:.4} r={minsec_ref:.4}, drop o={drop_ours} r={drop_ref}"
         );
         println!("{row}");
         out_rows.push(row);
     }
-    let _ = fs::remove_file(&scratch);
+    let _ = fs::remove_file(&ref_ogg);
+    let _ = fs::remove_file(&ours_ogg);
 
     // Rate gate: report violations, never panic.
     let rate_gate = if rate_violations.is_empty() {
@@ -3441,6 +3540,14 @@ fn silk_library_gate_vs_libopus() {
     } else {
         eprintln!("{rate_gate}");
     }
+    // Lag gate: hard fail — a measurement at the scan bound is not a result.
+    assert!(
+        lag_violations.is_empty(),
+        "LAG GATE failed (lag at scan bound):\n  {}",
+        lag_violations.join("\n  ")
+    );
+    let lag_gate = "LAG GATE: passed (no lag at scan bound)";
+    println!("{lag_gate}");
     // Dropout gate: hard fail — a second the reference kept must not drop out.
     assert!(
         dropout_violations.is_empty(),
@@ -3452,13 +3559,16 @@ fn silk_library_gate_vs_libopus() {
 
     // Sweep file: raw rows + GATE lines (lane deliverable).
     let mut table = String::new();
-    table.push_str("# ec-opus SILK/speech-rate gate vs ffmpeg libopus (r1)\n");
+    table.push_str("# ec-opus SILK/speech-rate gate vs ffmpeg libopus (r2)\n");
     table.push_str("# mono, 120s cap, VBR, 48kHz, Application::Voip; source sadie.wav\n");
+    table.push_str("# r2: symmetric ffmpeg-libopus decode (both sides), lag gate, band-limited ref, ref mode\n");
     for r in &out_rows {
         table.push_str(r);
         table.push('\n');
     }
     table.push_str(&rate_gate);
+    table.push('\n');
+    table.push_str(lag_gate);
     table.push('\n');
     table.push_str(drop_gate);
     table.push('\n');
