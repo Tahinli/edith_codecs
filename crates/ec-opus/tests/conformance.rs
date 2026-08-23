@@ -242,12 +242,27 @@ fn band_energy(
 /// to take an `err_ratio` of ours-vs-reference before the monotonic quality
 /// transform flattens the high-error tail.
 fn opus_compare_err(reference: &[i16], test: &[i16], channels: usize) -> f64 {
+    opus_compare_err_parts(reference, test, channels).0
+}
+
+/// `opus_compare_err` with the intermediates the per-band divergence
+/// diagnostic needs: `(err, per-band mean eb², per-frame ef²)`. The per-band
+/// mean is each band's additive share of the pre-squared frame error
+/// `ef = mean(eb²)`; the numerics are the wrapped function's, unchanged
+/// (guarded by `opus_compare_err_pinned_against_c`).
+fn opus_compare_err_parts(
+    reference: &[i16],
+    test: &[i16],
+    channels: usize,
+) -> (f64, Vec<f64>, Vec<f64>) {
     assert_eq!(reference.len(), test.len(), "sample counts must match");
     let x: Vec<f64> = reference.iter().map(|&v| v as f64).collect();
     let y: Vec<f64> = test.iter().map(|&v| v as f64).collect();
     let xlength = x.len() / channels;
     assert!(xlength >= WIN_SIZE, "not enough samples to compare");
     let nframes = (xlength - WIN_SIZE + WIN_STEP) / WIN_STEP;
+    let mut band_eb2 = vec![0.0f64; NBANDS];
+    let mut frame_ef2 = Vec::with_capacity(nframes);
 
     let mut xb = Vec::new();
     let mut big_x = Vec::new();
@@ -339,14 +354,21 @@ fn opus_compare_err(reference: &[i16], test: &[i16], channels: usize) -> f64 {
                 }
             }
             eb /= ((BANDS[bi + 1] - BANDS[bi]) * channels) as f64;
-            ef += eb * eb;
+            let eb2 = eb * eb;
+            band_eb2[bi] += eb2;
+            ef += eb2;
         }
         ef /= NBANDS as f64;
         ef *= ef;
-        err += ef * ef;
+        let ef2 = ef * ef;
+        frame_ef2.push(ef2);
+        err += ef2;
     }
     err = (err / nframes as f64).powf(1.0 / 16.0);
-    err
+    for b in &mut band_eb2 {
+        *b /= nframes as f64;
+    }
+    (err, band_eb2, frame_ef2)
 }
 
 /// The `opus_compare` quality metric: >= 0 passes, 100 is identical output.
@@ -3175,4 +3197,312 @@ fn opus_compare_err_pinned_against_c() {
         (q - -593.31).abs() < 0.5,
         "pinned Q drift: got {q:.4}, expected -593.31 (C-validated)"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Spectral-divergence diagnostic: WHERE the 96 kbps err_ratio outlier loses
+// its error. Per opus_compare band: mean ln-energy error ours-vs-source and
+// ref-vs-source, plus the band's share of the frame error; per source: the
+// top-5 worst seconds with what the encoder did there (CeltFrameDiag).
+// Run: SWEEP_ONLY=naz,dl8a cargo test -p ec-opus --release \
+//      spectral_divergence_vs_libopus -- --ignored --nocapture
+// Writes lanes/opus-naz-r1.bands.txt.
+// ---------------------------------------------------------------------------
+
+/// libopus CELT band edges (copy of `celt.rs::E_BANDS`, which is pub(crate)):
+/// band `i` ends at `CELT_EBANDS[i] * 240` Hz at 48 kHz.
+const CELT_EBANDS: [usize; NBANDS + 1] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, 24, 28, 34, 40, 48, 60, 78, 100,
+];
+
+#[test]
+#[ignore]
+fn spectral_divergence_vs_libopus() {
+    const SECS: f64 = 120.0;
+    const FRAME: usize = 960;
+    const CHANNELS: usize = 2;
+    const MAX_LAG: usize = 2000;
+    const KBPS: u32 = 96;
+
+    let all: &[(&str, &str)] = &[
+        ("naz", "~/Music/naz_aglama_ben_aglarim.mp4"),
+        ("dl8a", "~/Downloads/8a3b6d1d19.mp3"),
+    ];
+    let only: Vec<String> = std::env::var("SWEEP_ONLY")
+        .unwrap_or_else(|_| "naz,dl8a".to_owned())
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim().to_owned())
+        .collect();
+    let sources: Vec<(String, PathBuf)> = all
+        .iter()
+        .filter(|(tag, _)| only.iter().any(|o| o == tag))
+        .map(|(tag, p)| (tag.to_string(), shellexpand(p)))
+        .collect();
+    assert!(!sources.is_empty(), "SWEEP_ONLY matched no sources");
+
+    let lanes_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lanes");
+    fs::create_dir_all(&lanes_dir).unwrap();
+    let out_path = lanes_dir.join("opus-naz-r1.bands.txt");
+    let scratch = lanes_dir.join("opus-naz-r1.scratch.ogg");
+    let mut report = String::new();
+
+    for (tag, src) in &sources {
+        if !src.exists() {
+            eprintln!("SKIP {tag}: missing {}", src.display());
+            continue;
+        }
+        let source_pcm = ffmpeg_decode_pcm(src, SECS);
+        let source_frames = source_pcm.len() / CHANNELS;
+        let seconds = source_frames as f64 / 48000.0;
+        let source_i16 = to_i16(&source_pcm);
+
+        // Reference: ffmpeg libopus at 96k, VBR, decoded by our decoder.
+        ffmpeg_encode_libopus(src, KBPS, &scratch, SECS);
+        let ref_bytes = fs::metadata(&scratch).map(|m| m.len() as usize).unwrap_or(0);
+        let ref_kbps = ref_bytes as f64 * 8.0 / seconds / 1000.0;
+        let (ref_dec, ref_ch) = decode_ogg(&scratch);
+        assert_eq!(ref_ch, CHANNELS, "{tag}: ref not stereo");
+        let (_, ref_aligned) = align_to_source(&source_pcm, &ref_dec, CHANNELS, MAX_LAG);
+
+        // Ours at the reference's realised rate, per-frame diag captured.
+        let mut enc = Encoder::new(48000, CHANNELS, Application::Audio).expect("encoder");
+        enc.set_bitrate((ref_kbps * 1000.0).round() as u32);
+        enc.set_vbr_constrained(true);
+        let mut dec = Decoder::new(48000, CHANNELS).unwrap();
+        let mut packet = vec![0u8; 1500];
+        let mut dbuf = vec![0.0f32; 5760 * CHANNELS];
+        let mut ours_dec = Vec::new();
+        let mut diags = Vec::new();
+        let mut ours_bytes = 0usize;
+        for block in source_pcm.chunks(FRAME * CHANNELS) {
+            let mut padded = block.to_vec();
+            padded.resize(FRAME * CHANNELS, 0.0);
+            let len = enc.encode_float(&padded, FRAME, &mut packet).expect("encode");
+            ours_bytes += len;
+            let n = dec.decode_float(&packet[..len], &mut dbuf).expect("decode");
+            ours_dec.extend_from_slice(&dbuf[..n * CHANNELS]);
+            diags.push(enc.last_celt_diag().clone());
+        }
+        let ours_kbps = ours_bytes as f64 * 8.0 / seconds / 1000.0;
+        let ours_trim: Vec<f32> = ours_dec.into_iter().take(source_frames * CHANNELS).collect();
+        let (_, ours_aligned) = align_to_source(&source_pcm, &ours_trim, CHANNELS, MAX_LAG);
+        let ours_i16 = to_i16(&ours_aligned);
+        let ref_i16 = to_i16(&ref_aligned);
+
+        let cmp_frames = (source_i16.len() / CHANNELS)
+            .min(ours_i16.len() / CHANNELS)
+            .min(ref_i16.len() / CHANNELS);
+        let trim = |v: &[i16]| -> Vec<i16> { v[..cmp_frames * CHANNELS].to_vec() };
+        let s_i = trim(&source_i16);
+        let o_i = trim(&ours_i16);
+        let r_i = trim(&ref_i16);
+
+        // Metric totals, per-band shares, per-frame errors.
+        let (err_o, eb2_o, ef2_o) = opus_compare_err_parts(&s_i, &o_i, CHANNELS);
+        let (err_r, eb2_r, ef2_r) = opus_compare_err_parts(&s_i, &r_i, CHANNELS);
+        let corr_o = corr_interleaved(&source_pcm, &ours_aligned, CHANNELS);
+        let corr_r = corr_interleaved(&source_pcm, &ref_aligned, CHANNELS);
+
+        // Raw per-band energies (no masking): spectral shape in the ln domain.
+        let nframes = (cmp_frames - WIN_SIZE + WIN_STEP) / WIN_STEP;
+        let as_f64 = |v: &[i16]| -> Vec<f64> { v.iter().map(|&x| x as f64).collect() };
+        let mut bands_s = Vec::new();
+        let mut bands_o = Vec::new();
+        let mut bands_r = Vec::new();
+        let mut scratch_ps = Vec::new();
+        band_energy(&as_f64(&s_i), CHANNELS, nframes, &mut Some(&mut bands_s), &mut scratch_ps);
+        band_energy(&as_f64(&o_i), CHANNELS, nframes, &mut Some(&mut bands_o), &mut scratch_ps);
+        band_energy(&as_f64(&r_i), CHANNELS, nframes, &mut Some(&mut bands_r), &mut scratch_ps);
+
+        report.push_str(&format!(
+            "\n# source {tag} @{KBPS}k: ours {ours_kbps:.1} kbps, ref {ref_kbps:.1} kbps; \
+             corr o={corr_o:.4} r={corr_r:.4}; err o={err_o:.3} r={err_r:.3} ratio={:.2}\n",
+            err_o / err_r
+        ));
+        report.push_str(
+            "# dln = mean ln(E_test/E_src) per channel (neg = energy missing); \
+             err = mean |dln|; eb2 = band's mean share of the pre-squared frame error\n",
+        );
+        report.push_str(
+            "# lo_hz\thi_hz\tdlnL_o\tdlnR_o\tdlnL_r\tdlnR_r\terrL_o\terrR_o\terrL_r\terrR_r\teb2_o\teb2_r\n",
+        );
+        for bi in 0..NBANDS {
+            let (mut dol, mut dor, mut drl, mut drr) = (0.0f64, 0.0, 0.0, 0.0);
+            let (mut aol, mut aor, mut arl, mut arr) = (0.0f64, 0.0, 0.0, 0.0);
+            for xi in 0..nframes {
+                let e = |b: &Vec<f64>, ci: usize| b[(xi * NBANDS + bi) * CHANNELS + ci].ln();
+                let (sl, sr) = (e(&bands_s, 0), e(&bands_s, 1));
+                let (o_l, o_r) = (e(&bands_o, 0) - sl, e(&bands_o, 1) - sr);
+                let (r_l, r_r) = (e(&bands_r, 0) - sl, e(&bands_r, 1) - sr);
+                dol += o_l;
+                dor += o_r;
+                drl += r_l;
+                drr += r_r;
+                aol += o_l.abs();
+                aor += o_r.abs();
+                arl += r_l.abs();
+                arr += r_r.abs();
+            }
+            let n = nframes as f64;
+            report.push_str(&format!(
+                "{}\t{}\t{:+.3}\t{:+.3}\t{:+.3}\t{:+.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3}\t{:.3e}\t{:.3e}\n",
+                BANDS[bi] * 100,
+                BANDS[bi + 1] * 100,
+                dol / n,
+                dor / n,
+                drl / n,
+                drr / n,
+                aol / n,
+                aor / n,
+                arl / n,
+                arr / n,
+                eb2_o[bi],
+                eb2_r[bi],
+            ));
+        }
+
+        // Top-5 worst seconds by ours per-frame error, with encoder behavior.
+        let mframes_per_sec = 48000 / WIN_STEP; // 400 metric frames per second
+        let eframes_per_sec = 48000 / FRAME; // 50 encoder frames per second
+        let nsecs = cmp_frames / 48000;
+        let mut sec_score: Vec<(usize, f64)> = (0..nsecs)
+            .map(|s| {
+                let (mut sum, mut cnt) = (0.0f64, 0usize);
+                for xi in s * mframes_per_sec..(s + 1) * mframes_per_sec {
+                    if xi < ef2_o.len() {
+                        sum += ef2_o[xi];
+                        cnt += 1;
+                    }
+                }
+                (s, sum / cnt.max(1) as f64)
+            })
+            .collect();
+        sec_score.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        report.push_str("# top-5 seconds by ours frame error (mean ef²) with encoder diag:\n");
+        report.push_str(
+            "# sec\tscore\ttrans\tcbb_min_hz\tcbb_mean_hz\tint_mean_hz\tdual\tintra\tbits/fr\n",
+        );
+        for &(s, score) in &sec_score[..nsecs.min(5)] {
+            let f0 = s * eframes_per_sec;
+            let f1 = ((s + 1) * eframes_per_sec).min(diags.len());
+            let fr = &diags[f0.min(f1)..f1];
+            let dn = fr.len();
+            if dn == 0 {
+                continue;
+            }
+            let transient = fr.iter().filter(|d| d.is_transient).count();
+            let dual = fr.iter().filter(|d| d.dual_stereo).count();
+            let intra = fr.iter().filter(|d| d.intra).count();
+            let cbb_min = fr.iter().map(|d| d.coded_bands).min().unwrap_or(0);
+            let cbb_mean =
+                fr.iter().map(|d| d.coded_bands).sum::<usize>() as f64 / dn as f64;
+            let int_mean = fr.iter().map(|d| d.intensity).sum::<usize>() as f64 / dn as f64;
+            let bits =
+                fr.iter().map(|d| d.nb_compressed).sum::<usize>() as f64 * 8.0 / dn as f64;
+            report.push_str(&format!(
+                "{}\t{:.3e}\t{}/{}\t{}\t{}\t{}\t{}/{}\t{}/{}\t{:.0}\n",
+                s,
+                score,
+                transient,
+                dn,
+                CELT_EBANDS[cbb_min] * 240,
+                CELT_EBANDS[cbb_mean as usize] * 240,
+                CELT_EBANDS[int_mean as usize] * 240,
+                dual,
+                dn,
+                intra,
+                dn,
+                bits,
+            ));
+        }
+
+        // Whole-file encoder summary for ours.
+        let dn = diags.len();
+        if dn > 0 {
+            let transient = diags.iter().filter(|d| d.is_transient).count();
+            let dual = diags.iter().filter(|d| d.dual_stereo).count();
+            let intra = diags.iter().filter(|d| d.intra).count();
+            let cbb_min = diags.iter().map(|d| d.coded_bands).min().unwrap_or(0);
+            let cbb_mean =
+                diags.iter().map(|d| d.coded_bands).sum::<usize>() as f64 / dn as f64;
+            let int_mean = diags.iter().map(|d| d.intensity).sum::<usize>() as f64 / dn as f64;
+            let bits =
+                diags.iter().map(|d| d.nb_compressed).sum::<usize>() as f64 * 8.0 / dn as f64;
+            report.push_str(&format!(
+                "# whole file: transient {}/{} dual {}/{} intra {}/{}; coded_bands min {} mean {} Hz; \
+                 intensity mean {} Hz; bits/frame {:.0}\n",
+                transient,
+                dn,
+                dual,
+                dn,
+                intra,
+                dn,
+                CELT_EBANDS[cbb_min] * 240,
+                CELT_EBANDS[cbb_mean as usize] * 240,
+                CELT_EBANDS[int_mean as usize] * 240,
+                bits,
+            ));
+        }
+
+        // Top-8 worst single metric windows (ours vs ref), with the encoder
+        // frame each window lands in.
+        let mut byf: Vec<(usize, f64)> = ef2_o.iter().cloned().enumerate().collect();
+        byf.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        report.push_str("# top-8 metric windows by ours ef²: offset_ms ours ref | enc frame diag\n");
+        for &(xi, v) in &byf[..byf.len().min(8)] {
+            let rv = if xi < ef2_r.len() { ef2_r[xi] } else { f64::NAN };
+            let ms = xi * WIN_STEP * 1000 / 48000;
+            let eidx = xi * WIN_STEP / FRAME;
+            let d = diags.get(eidx);
+            let ds = d.map(|d| {
+                format!(
+                    "{}:trans{},intra{},sil{},cbb{}Hz,int{}Hz,bt{}",
+                    eidx,
+                    d.is_transient as u8,
+                    d.intra as u8,
+                    d.silence as u8,
+                    CELT_EBANDS[d.coded_bands] * 240,
+                    CELT_EBANDS[d.intensity] * 240,
+                    d.nb_compressed
+                )
+            });
+            report.push_str(&format!(
+                "+{}ms\t{:.3e}\t{:.3e}\t{}\n",
+                ms,
+                v,
+                rv,
+                ds.as_deref().unwrap_or("-")
+            ));
+        }
+
+        // Startup behavior: first 10 encoder frames.
+        report.push_str(
+            "# first encoder frames: idx trans intra silence cbb_hz int_hz dual bytes\n",
+        );
+        for (i, d) in diags.iter().take(10).enumerate() {
+            report.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                i,
+                d.is_transient as u8,
+                d.intra as u8,
+                d.silence as u8,
+                CELT_EBANDS[d.coded_bands] * 240,
+                CELT_EBANDS[d.intensity] * 240,
+                d.dual_stereo as u8,
+                d.nb_compressed
+            ));
+        }
+        println!(
+            "{tag}@{KBPS}k: err o={err_o:.3} r={err_r:.3} ratio={:.2}",
+            err_o / err_r
+        );
+    }
+    let _ = fs::remove_file(&scratch);
+    let header = format!(
+        "# spectral divergence vs libopus @ {KBPS}k, {SECS:.0}s cap, sources {}\n",
+        only.join(",")
+    );
+    fs::write(&out_path, header + &report).unwrap();
+    println!("wrote {}", out_path.display());
 }
