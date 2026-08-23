@@ -106,6 +106,11 @@ const CO_MASK_RANGE: f64 = 50.0;
 /// rate/quality knob: raising the curve zeroes masked coefficients earlier,
 /// while peaks still ride as residue above it.
 const MASKING_OFFSET_DB: f64 = 9.0;
+/// dB added to the per-region geometric-mean floor level (E2, lane-vorbis-floor
+/// r2). 0 = pure envelope (E1, too low → clamp-lift saturation); the gap between
+/// mean dB and peak dB in a typical long-block region is 15–25 dB, so 12 sits
+/// halfway and keeps the loudest bin within the residue-book range.
+const ENVELOPE_MARGIN_DB: f64 = 12.0;
 /// All-zero partition guard: if the masked band still has a bin within this
 /// fraction of the floor, keep that bin as one sign-only residue sample.
 const NOISE_NORMALISE_MIN_RATIO: f32 = 0.5;
@@ -930,14 +935,15 @@ impl VorbisEncoder {
 /// the whole spectrum is covered exactly once and a peak between two points
 /// still raises the floor that has to carry it.
 ///
-/// E1 (lane-vorbis-floor r2): returns the per-region **geometric mean** of
-/// |bin| (≡ mean of dB) instead of the max.  The max set the floor to the
-/// region's loudest bin; bins 20–40 dB under it quantised to zero, so we coded
-/// 45–57% as many non-zero residues as libvorbis at 1.5–2.1× bits each.  The
-/// geometric mean tracks the envelope: most bins sit near it and land at
-/// q ≈ 10^(headroom/20) ≈ ±3, matching libvorbis's dense ±1/±2.
+/// E2 (lane-vorbis-floor r2): returns the per-region geometric mean of |bin|
+/// (≡ mean dB) **plus `ENVELOPE_MARGIN_DB`** — halfway between the pure
+/// envelope (E1, too low → clamp-lift saturation) and the peak (baseline,
+/// too high → sparse large q).  The margin lifts the floor enough that the
+/// loudest bins in each region stay within the residue-book range without the
+/// refit loop, while quieter bins still get a small non-zero q.
 fn peaks_of(floor: &Floor1, half: usize, spectra: &[&Vec<f32>]) -> Vec<f64> {
     let x = &floor.x_list;
+    let margin = 10.0_f64.powf(ENVELOPE_MARGIN_DB / 20.0);
     x.iter()
         .map(|&centre| {
             let below = x.iter().filter(|&&o| o < centre).max().copied();
@@ -954,7 +960,7 @@ fn peaks_of(floor: &Floor1, half: usize, spectra: &[&Vec<f32>]) -> Vec<f64> {
                     count += 1;
                 }
             }
-            (sum_log / count as f64).exp()
+            (sum_log / count as f64).exp() * margin
         })
         .collect()
 }
