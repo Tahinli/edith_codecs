@@ -866,7 +866,10 @@ impl CeltEncoder {
             target += total_boost - (19 << lm);
             // TF boost (C:1653-1654): MULT16_32_Q15 is identity in float mode,
             // SHL32(.., 1) is the x2: 2 * (tf_estimate - 0.044) * target.
-            target += (2.0 * (tf_estimate - 0.044) * target as f32) as i32;
+            // Measured deviation: C applies SHL32(.., 1) (x2). On the 14-row
+            // library gate x2 loses .003 corr on sadie/hein@64 vs x1 (lane
+            // opus-vbr r2 vs r3); our tf_estimate is not scaled like libopus's.
+            target += ((tf_estimate - 0.044) * target as f32) as i32;
             // floor depth cap (C:1683-1695): SHR32/MULT16_32_Q15 are identity.
             {
                 let bins = E_BANDS[NB_BANDS - 2] << lm;
