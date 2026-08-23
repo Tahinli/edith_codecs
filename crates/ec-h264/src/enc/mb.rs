@@ -355,18 +355,29 @@ pub(crate) fn encode_mb(pic: &mut Picture, e: &mut MbEnc<'_>, w: &mut EncEntropy
         inter = Some(choose_inter(pic, e, mb_x, mb_y));
     }
 
-    // Intra cost against the inter one, with no thumb on the scale. An eight-bit
-    // penalty used to be added to the intra side, on the theory that an intra
-    // macroblock in a P picture also costs the next picture's prediction
-    // quality. Measured, it costs the opposite: removing it is worth 1.17 dB
-    // BD-PSNR against x264 on a 3840x1608 film clip at GOP 10 (-1.404 ->
-    // -0.233 dB) and 0.10 dB on a 2560x1440 screen capture (-0.033 -> +0.068),
-    // and it is not a rate-quality trade -- at every one of QP 22/26/30/34 the
-    // unpenalised encoder is both smaller and 0.15-1.2 dB better, because the
-    // intra macroblocks it now places stop drift accumulating across the GOP.
-    // Penalties of 1, 2, 4 and 8 bits all measured worse and negative ones
-    // measured the same, so zero is the flat part of the curve, not a tuned
-    // value.
+    // The intra side of the comparison carries what going intra signals: the
+    // inter side already pays for its motion vector, and an intra macroblock
+    // in a P picture pays for a macroblock type plus sixteen prediction modes
+    // that the SATD of its prediction says nothing about.
+    //
+    // Swept on two clips of the library and the synthetic one, BD-PSNR against
+    // x264 at GOP 10 over QP 22/26/30/34:
+    //
+    //     bits    film 3840x1608   screen 2560x1440   synthetic
+    //        0        -1.521            -1.904          -5.718
+    //        4        -1.305            -1.290          -5.400
+    //        8        -1.223            -0.920          -5.290
+    //       12        -1.211            -0.733          -5.286
+    //       16        -1.267            -0.650          -5.262
+    //       32        -1.649            -0.586             --
+    //
+    // Screen capture keeps improving to 48 and film falls off after 16, so
+    // twelve is the overlap of the two flat parts rather than either optimum.
+    // A previous sweep of this same constant landed zero, on a measurement
+    // that sampled one picture a second: at that spacing nothing is
+    // predictable from the previous picture, P slices went 93% intra on film,
+    // and the penalty had nothing to suppress. The sampler now takes
+    // consecutive pictures.
     //
     // Skipping the intra trial when the inter cost is already low was measured
     // and dropped: it cost 0.7 dB on screen capture and bought no measurable
@@ -374,7 +385,7 @@ pub(crate) fn encode_mb(pic: &mut Picture, e: &mut MbEnc<'_>, w: &mut EncEntropy
     let intra_cost = intra_pre_cost(pic, e, &nbr, mb_x, mb_y);
     let go_intra = match &inter {
         None => true,
-        Some(i) => intra_cost.best() < i.cost,
+        Some(i) => intra_cost.best() + motion_rate(e, INTRA_MODE_BITS) < i.cost,
     };
 
     if go_intra {
@@ -407,6 +418,8 @@ impl IntraCost {
         }
     }
 }
+
+
 
 /// Best Intra_16x16 mode by SATD, leaving nothing behind in the plane that a
 /// later branch does not overwrite.
@@ -445,17 +458,21 @@ fn intra_pre_cost(
     IntraCost {
         i16_mode: best.1,
         i16_cost: best.0,
-        // Intra_4x4 is tried in P pictures too, at every preset. Measured
-        // against x264 on a 3840x1608 clip from the library (BD-PSNR over QP
-        // 22/26/30/34, matched features): restricting it to I pictures cost
-        // -2.992 dB against x264 where allowing it everywhere reads -1.557 dB,
-        // for 5% more encode time. Nothing else in the Fast/Balanced split
-        // came close -- a 48-sample search range read -3.039 dB and the
-        // half-macroblock partitions -3.009 dB, both inside the noise of the
-        // -2.992 dB baseline.
+        // Intra_4x4 is tried in P pictures too, at every preset. Re-measured
+        // on consecutive pictures (BD-PSNR against x264, GOP 10, QP
+        // 22/26/30/34): restricting it to I pictures reads -1.989 dB on the
+        // film clip where allowing it everywhere reads -1.154, and the screen
+        // capture disagrees by a third of that in the other direction (-0.564
+        // against -0.696). The film margin is the larger of the two, so it
+        // stays on everywhere.
         allow_i4: true,
     }
 }
+
+/// What going intra costs to signal in a P picture, in bits: the macroblock
+/// type and, when Intra_4x4 wins later, sixteen prediction modes. Swept at the
+/// decision site above.
+const INTRA_MODE_BITS: f64 = 12.0;
 
 /// How a P macroblock is partitioned, in the mb_type numbering of Table 7-13.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -618,6 +635,13 @@ fn choose_inter(pic: &Picture, e: &MbEnc<'_>, mb_x: usize, mb_y: usize) -> Inter
                 }
                 step /= 2;
             }
+            // Sub-sample refinement runs on SATD, not SAD: interpolation
+            // smooths, and a sum of absolute differences reads the smoothing
+            // as a better match where a transform-domain cost does not. Worth
+            // 0.06 dB BD-PSNR on the film clip and 0.04 dB on the screen
+            // capture. The whole-sample winner is re-costed in the same domain
+            // first so the two halves of the search compare.
+            best.1 = cost_of(best.0, true);
             for step in [2i16, 1] {
                 let mut improved = true;
                 while improved {
@@ -633,7 +657,7 @@ fn choose_inter(pic: &Picture, e: &MbEnc<'_>, mb_x: usize, mb_y: usize) -> Inter
                         (-step, step),
                     ] {
                         let cand = [best.0[0] + dx, best.0[1] + dy];
-                        let c = cost_of(cand, false);
+                        let c = cost_of(cand, true);
                         if c < best.1 {
                             best = (cand, c);
                             improved = true;
@@ -653,11 +677,16 @@ fn choose_inter(pic: &Picture, e: &MbEnc<'_>, mb_x: usize, mb_y: usize) -> Inter
     let skip_cost = {
         let mut buf = [0u8; 256];
         mc_luma(&plane, sx as i32, sy as i32, skip_mv, 16, 16, 16, &mut buf);
-        // P_Skip's rebate is the signalling it genuinely saves, and two bits is
-        // where the measurement is flat: 0 and 2 read -0.113 and -0.110 dB
-        // BD-PSNR against x264 on the film clip at GOP 10 where the four this
-        // used to claim reads -0.233 dB and eight reads -0.708 dB. The screen
-        // capture and the synthetic clip move by 0.01 dB across 0, 2 and 4.
+        // P_Skip's rebate is the signalling it genuinely saves. Re-measured on
+        // consecutive pictures: 0 and 2 read -1.102/-1.154 dB on the film clip
+        // and -0.741/-0.696 on the screen capture -- the two contents disagree
+        // by less than the step between them, so this is the flat part. Six
+        // costs 0.14 dB and twelve costs 0.42.
+        //
+        // The Intra_4x4 discount above was swept with it: 0.65/0.75/0.85/1.0
+        // read -1.216/-1.154/-1.182/-1.373 on film and -0.970/-0.696/-0.591/
+        // -0.562 on screen capture, so three quarters is film's optimum and
+        // inside screen capture's flat part.
         satd_block(&e.src.y, sw, sx, sy, &buf, 16, 0, 16, 16) - motion_rate(e, 2.0)
     };
 
