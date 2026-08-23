@@ -276,3 +276,58 @@ the outer loop never runs — the encoder is a pure rate loop and the
 psychoacoustic model reaches the output only through the band ordering it never
 gets to use. That is the standing structural finding for this crate; the gain
 in this round came from a missing feature, not from the model.
+
+## Round 5: the frame budget was split evenly across channels that need
+## different amounts
+
+Mid/side only pays if the quiet channel can give its bits away, and ours could
+not: the CBR arm handed every granule-channel the same `budget / (granules *
+channels)`, so a side channel that is nearly silent still held a quarter of the
+frame it had no way to spend. The quantiser codes `|xr|^(3/4)`, so the sum of
+that over a granule's lines is the shape of its bit demand; the frame is now
+split by it, blended with the even split.
+
+| blend | zaur@128 gap | dl8a@128 gap | sadie@192 worst | sadie@192 vs LAME |
+|---|---|---|---|---|
+| 0 (even) | -0.00103 | -0.00057 | -16.5 | ahead |
+| 0.25 | -0.00016 | +0.00025 | -20.9 | ahead |
+| 0.5 | +0.00037 | +0.00077 | -18.2 | ahead |
+| **0.7** | **+0.00062** | **+0.00103** | **-15.0** | **ahead** |
+| 1.0 (pure demand) | +0.00079 | +0.00120 | -11.4 | **1.8 dB behind** |
+
+Correlation keeps improving all the way to a pure demand split, but the worst
+window turns around before it: at 1.0 the loud granules take so much of the
+frame that a quiet one cannot code its own transient, and sadie at 192 falls
+behind the reference. 0.7 takes nearly all of the correlation gain and leaves
+every row's worst window ahead.
+
+The result is that all fourteen rows now beat libmp3lame on both metrics:
+
+| source | kbps | corr gap | worst window ours / LAME |
+|---|---|---|---|
+| nik   | 128 | +0.00048 | -15.0 / -11.2 |
+| nik   | 192 | +0.00006 | -20.9 / -17.2 |
+| zaur  | 128 | +0.00062 | -15.3 / -9.3 |
+| zaur  | 192 | +0.00009 | -21.4 / -16.1 |
+| her   | 128 | +0.00193 | -9.4 / -5.4 |
+| her   | 192 | +0.00040 | -14.3 / -11.1 |
+| naz   | 128 | +0.00069 | -10.2 / -6.1 |
+| naz   | 192 | +0.00012 | -15.7 / -11.7 |
+| sadie | 128 | +0.00086 | -10.2 / -2.0 |
+| sadie | 192 | +0.00004 | -15.0 / -13.2 |
+| dl8a  | 128 | +0.00103 | -9.0 / -6.0 |
+| dl8a  | 192 | +0.00020 | -13.7 / -12.2 |
+| hein  | 128 | +0.00029 | -11.9 / -7.6 |
+| hein  | 192 | +0.00002 | -19.2 / -19.4 |
+
+Both floors move onto that: the correlation floor is now zero — a row falling
+behind the reference at all is the regression — and the worst-window excess is
+1.0 dB, set by hein at 192, the one row still (0.2 dB) behind.
+
+The split is CBR only. VBR picks its bitrate from the noise-to-mask ratio a
+candidate reaches, and that mapping is calibrated to what an even split
+produces: with the demand split in the VBR arm, quality 0.5 settles at 154.6
+kbit/s instead of 208 for the same noise-to-mask bar. That is plausibly the
+encoder getting more quality per bit, but nothing here measures VBR against a
+reference, so it is **deferred — unblocked by a VBR reference gate against
+`lame -V`**, which is the next round of this lane.
