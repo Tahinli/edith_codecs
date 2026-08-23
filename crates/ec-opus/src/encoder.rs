@@ -46,7 +46,10 @@ const SILK_LOOK_AHEAD_48K_WB: usize = 50;
 /// decoder with one layer muted (`hybrid_layers_align` in conformance.rs).
 const HYBRID_SILK_DELAY_48K: usize = 120 - SILK_LOOK_AHEAD_48K_WB;
 /// Bytes the CELT layer of a hybrid packet always keeps, whatever SILK spent.
-const HYBRID_CELT_MIN_BYTES: usize = 8;
+/// Was 8: at 16 kbps SILK takes 37 of the 40-byte budget, so 8 expanded
+/// 5133/6001 packets (+12.9% rate on the speech gate); libopus leaves CELT
+/// a few bytes there.
+const HYBRID_CELT_MIN_BYTES: usize = 3;
 /// libopus 1.6 bandwidth threshold tables (`opus_encoder.c:151`/`162`).
 /// Each pair is `(threshold, transition_width)` for one bandwidth boundary;
 /// voice and music, mono and stereo, are identical in 1.6.
