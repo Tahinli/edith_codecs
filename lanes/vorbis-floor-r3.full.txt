@@ -13,3 +13,4 @@ dl8a    96     86.1      86.9      -0.96 0.9878    0.9916   0.0038  PASS
 dl8a    128    117.6     117.8     -0.12 0.9938    0.9957   0.0019  PASS
 hein    96     82.4      79.1      +4.26 0.9784    0.9869   0.0086  FAIL
 hein    128    91.1      90.7      +0.51 0.9856    0.9906   0.0050  PASS
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 10 filtered out; finished in 51.90s
