@@ -469,6 +469,14 @@ fn intra_pre_cost(
     }
 }
 
+/// How much of a motion vector's signalling the search pays for. Half, which
+/// is not the true rate: swept on consecutive pictures (BD-PSNR against x264,
+/// GOP 10), 0.25/0.5/1.0/2.0 read -1.074/-1.043/-1.225/-1.618 on the film clip
+/// and -0.676/-0.661/-0.795/-1.201 on the screen capture. Charging the whole
+/// rate is worse than charging half on both contents, and the curve is flat
+/// below a half and falls away above it.
+const MV_BITS_WEIGHT: f64 = 0.5;
+
 /// What going intra costs to signal in a P picture, in bits: the macroblock
 /// type and, when Intra_4x4 wins later, sixteen prediction modes. Swept at the
 /// decision site above.
@@ -581,7 +589,7 @@ fn choose_inter(pic: &Picture, e: &MbEnc<'_>, mb_x: usize, mb_y: usize) -> Inter
             let bits = motion_rate(
                 e,
                 f64::from(se_bits(i32::from(mv[0] - mvp[0])) + se_bits(i32::from(mv[1] - mvp[1])))
-                    / 2.0,
+                    * MV_BITS_WEIGHT,
             );
             if !satd && mv[0] & 3 == 0 && mv[1] & 3 == 0 {
                 let o = integer_origin(
