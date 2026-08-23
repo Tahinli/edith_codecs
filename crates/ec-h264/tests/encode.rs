@@ -863,14 +863,17 @@ fn real_clip_t8x8_bd_psnr() {
 // ---------------------------------------------------------------------------
 
 /// Floor for [`bd_psnr_vs_x264`] on the synthetic clip. Our encoder measured
-/// -5.140 dB against x264 there on 2026-08-23 (352x288, 24 pictures of
+/// -5.297 dB against x264 there on 2026-08-23 (352x288, 24 pictures of
 /// `Clip::render_smooth`, both encoders at their own default effort: our
 /// `Preset::Fast`, x264's `-preset medium`). The floor is that number with
 /// room for platform noise, so the distance can shrink but not grow
-/// unnoticed; it is not a claim that -5.1 dB is fine. On a 3840x1608 clip
-/// from the library the same measurement reads -1.557 dB, so this synthetic
-/// number is the pessimistic end of the range, not the typical one.
-const BD_PSNR_VS_X264_FLOOR: f64 = -5.25;
+/// unnoticed; it is not a claim that -5.3 dB is fine. On a 3840x1608 clip
+/// from the library the same measurement reads -1.495 dB and on a 2560x1440
+/// screen capture +0.216 dB, so this synthetic number is the pessimistic end
+/// of the range, not the typical one -- the Intra_4x4 RD refinement that
+/// gained on all four of those measurements cost 0.157 dB here, on a source
+/// whose smooth ramps quantise unlike anything in a real frame.
+const BD_PSNR_VS_X264_FLOOR: f64 = -5.40;
 
 fn have_x264() -> bool {
     std::process::Command::new("ffmpeg")
