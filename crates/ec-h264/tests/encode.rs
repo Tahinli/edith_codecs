@@ -514,7 +514,14 @@ fn eight_by_eight_gains_on_flat_and_text() {
     let off_curve: Vec<_> = off.iter().map(|&(bits, psnr, _)| (bits, psnr)).collect();
     let bd = bd_psnr_delta(&on_curve, &off_curve);
     let share = on.iter().map(|&(_, _, share)| share).sum::<f64>() / on.len() as f64;
-    const OLD_FLAG_ON_BD_PSNR_DB: f64 = 0.255_347;
+    // What the flag buys, not what the encoder is worth: both arms move when
+    // the paths under them change. It was re-pinned from 0.255 when the 4x4
+    // luma path gained its coded_block_pattern group test, which is in the
+    // flag-off arm and improved it -- the same change moves the absolute
+    // synthetic comparison against x264 from -4.060 to -3.969 dB, and the
+    // flag-on arm barely at all, because a transform_8x8 macroblock does not
+    // go through that path.
+    const OLD_FLAG_ON_BD_PSNR_DB: f64 = 0.230;
     eprintln!(
         "8x8 BD-PSNR over q22/26/30/34: {bd:+.3} dB, average 8x8 MB share {:.1}%",
         share * 100.0

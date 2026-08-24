@@ -995,6 +995,18 @@ fn code_luma_4x4(
     lv: &mut Levels,
 ) {
     let stride = pic.y.stride;
+    // An inter macroblock's blocks are reconstructed only after the whole
+    // macroblock has been quantised, because [`decimate_score`] can still take
+    // a block away. Intra blocks reconstruct as they go: the next block in the
+    // macroblock predicts from them.
+    let mut pending: [Option<[i32; 16]>; 16] = [None; 16];
+    // Per 8x8 group, what coding its blocks buys and what it costs, for the
+    // group-level test below. A block with no levels contributes nothing to
+    // either side: its source energy stays in the reconstruction whatever the
+    // group decides.
+    let mut ssd_zero = [0i64; 4];
+    let mut ssd_coded = [0i64; 4];
+    let mut rate = [0f64; 4];
     for blk in 0..16 {
         let (dx, dy) = BLK4_POS[blk];
         let (x, y) = (mb_x * 16 + dx as usize * 4, mb_y * 16 + dy as usize * 4);
@@ -1052,10 +1064,101 @@ fn code_luma_4x4(
             lv.luma_nz[blk] = 0;
             continue;
         }
+        if intra {
+            lv.cbp_luma |= 1 << (blk >> 2);
+            add_residual_4x4(&mut pic.y.data, stride, origin, &resid);
+        } else {
+            for i in 0..16 {
+                let z = i64::from(source[i]);
+                let c = i64::from(source[i] - resid[i]);
+                ssd_zero[blk >> 2] += z * z;
+                ssd_coded[blk >> 2] += c * c;
+            }
+            rate[blk >> 2] +=
+                match w.residual_block_cost(&lv.luma[blk], BlockCat::Luma4x4, Some(1), Some(1)) {
+                    // CABAC's own arithmetic cost for the levels, which is what
+                    // the group is really deciding about. It arrives in 256ths of
+                    // a bit.
+                    Some(bits) => f64::from(bits) / 256.0,
+                    None => block_bits(&lv.luma[blk]) as f64,
+                };
+            pending[blk] = Some(resid);
+        }
+    }
+    if intra {
+        return;
+    }
+    // A block that survives its own rate-distortion test can still be the last
+    // coefficient standing in its 8x8 group, and then it is paying a
+    // coded_block_pattern bit as well as its levels. x264 decides that with a
+    // count of how tightly the levels cluster at the front of the scan
+    // (`decimate`), thresholded at four per group; swept here, that count
+    // wants opposite settings on the two contents -- monotonically off on
+    // camera grain, monotonically harder on screen capture -- because it is a
+    // heuristic standing in for a rate-distortion test the encoder can just
+    // do. So do it: a group is coded only if its blocks buy more squared error
+    // than their levels plus the pattern bit are worth, at the same lambda the
+    // per-block test uses.
+    // With an exact rate the lambda needs no correction factor: the group test
+    // uses the mode decision's own lambda where the rate is CABAC's, and falls
+    // back to the per-block test's discounted one where it is an estimate.
+    let lambda = if w.is_cabac() {
+        GROUP_LAMBDA * lambda_ssd(qp)
+    } else {
+        zero_block_lambda(e, qp, e.t8x8_inter(mb_y))
+    };
+    for g in 0..4 {
+        if rate[g] == 0.0 {
+            continue;
+        }
+        if ssd_coded[g] as f64 + lambda * (rate[g] + CBP_BIT) < ssd_zero[g] as f64 {
+            continue;
+        }
+        for blk in g * 4..g * 4 + 4 {
+            lv.luma[blk] = [0; 16];
+            lv.luma_nz[blk] = 0;
+            pending[blk] = None;
+        }
+    }
+    for blk in 0..16 {
+        let Some(resid) = pending[blk] else { continue };
+        let (dx, dy) = BLK4_POS[blk];
+        let (x, y) = (mb_x * 16 + dx as usize * 4, mb_y * 16 + dy as usize * 4);
+        let origin = pic.y.at(x, y);
         lv.cbp_luma |= 1 << (blk >> 2);
         add_residual_4x4(&mut pic.y.data, stride, origin, &resid);
     }
 }
+
+/// What a group of four luma blocks pays in coded_block_pattern to be coded
+/// at all, in bits, on top of its own levels.
+///
+/// This charge and [`GROUP_LAMBDA`] move the group test along the same axis --
+/// both make dropping a group likelier -- so only one of them is worth tuning.
+/// Swept at 0, 6, 12 and 24 bits it reads -0.317/-0.335/-0.379/-0.472 dB on
+/// the film clip against -0.295/-0.212/-0.191/-0.185 on the screen capture:
+/// the same trade the lambda makes, at a worse exchange rate. It stays at a
+/// plausible six.
+const CBP_BIT: f64 = 6.0;
+
+/// How much of the mode-decision lambda the group test uses.
+///
+/// The 8x8 transform path was swept the same way and does not want this test
+/// at all: at 0, 0.3 and 0.6 the `transform_8x8` gate reads +0.620/+0.624/
+/// +0.608 dB on the film clip and +0.007/+0.007/+0.009 on the screen capture,
+/// all inside its noise. One 8x8 block is a whole coded_block_pattern group,
+/// so its own zero test already decides what this one would, and `rdoq_8x8`
+/// drops it outright when the levels do not survive.
+///
+/// Swept at 0.25, 0.5, 0.6, 0.75, 0.9, 1.0 and 2.0 on both real clips:
+/// -0.315/-0.314/-0.321/-0.335/-0.354/-0.372/-0.575 dB on the 3840x1608 film
+/// clip and -0.297/-0.267/-0.252/-0.212/-0.202/-0.193/-0.277 on the 2560x1440
+/// screen capture. Screen capture has an interior optimum around one -- which
+/// the same test on an estimated rate did not, it only ever wanted more -- and
+/// camera grain wants less, because a grain block that scores as noise is
+/// carrying signal the eye is measuring. Six tenths is the most the film clip
+/// takes without losing ground, and it is worth 0.06 dB on screen capture.
+const GROUP_LAMBDA: f64 = 0.6;
 
 /// Squared error of coding `levels`, in the pixels the block reconstructs to.
 fn block_ssd(e: &MbEnc<'_>, source: &[i32; 16], levels: &[i32; 16], qp: i32, skip_dc: bool) -> i64 {
