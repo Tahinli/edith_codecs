@@ -289,6 +289,7 @@ version = "0.1.0"
 dependencies = [
  "ec-core",
  "ec-h264-syntax",
+ "ec-matroska",
  "ec-mp4",
  "wide",
 ]
