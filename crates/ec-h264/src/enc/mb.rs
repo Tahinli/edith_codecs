@@ -1852,93 +1852,6 @@ fn code_chroma(
     }
 }
 
-/// Pick the chroma prediction mode, leaving the winner in the planes.
-///
-/// SATD plus the mode's own signalling, not SAD: the transform is what the
-/// residual actually goes through, and the four modes cost between one and five
-/// bits to name. Measured with `bd_psnr_vs_x264` against x264 `-preset medium`,
-/// SAD-with-no-rate-term -> this, at no measurable encode time:
-///
-/// | clip | all-intra | GOP 10 |
-/// |---|---|---|
-/// | 3840x1608 film | -0.620 -> -0.535 dB | -1.495 -> -1.404 dB |
-/// | 2560x1440 screen capture | -0.231 -> -0.197 dB | -0.062 -> -0.033 dB |
-/// | 352x288 synthetic ramp | - | -5.297 -> -5.291 dB |
-///
-/// SATD alone accounts for about two thirds of that and the rate term the rest
-/// (film all-intra: -0.620 -> -0.568 -> -0.535 dB).
-fn choose_chroma_mode(
-    pic: &mut Picture,
-    e: &MbEnc<'_>,
-    nbr: &MbNeighbors,
-    mb_x: usize,
-    mb_y: usize,
-) -> u8 {
-    let mut best = (i32::MAX, 0u8);
-    for mode in [0u8, 1, 2, 3] {
-        let ok = match mode {
-            1 => nbr.a,
-            2 => nbr.b,
-            3 => nbr.a && nbr.b && nbr.d,
-            _ => true,
-        };
-        if !ok {
-            continue;
-        }
-        let mut cost = 0;
-        for comp in 0..2 {
-            let (plane, src) = if comp == 0 {
-                (&mut pic.cb, &e.src.u)
-            } else {
-                (&mut pic.cr, &e.src.v)
-            };
-            let stride = plane.stride;
-            let origin = plane.at(mb_x * 8, mb_y * 8);
-            let mut win = PlaneWindow {
-                data: &mut plane.data,
-                stride,
-                origin,
-            };
-            pred_chroma_8x8(mode, &mut win, nbr.b, nbr.a);
-            cost += satd_block(
-                src,
-                e.src.c_stride,
-                mb_x * 8,
-                mb_y * 8,
-                &plane.data,
-                stride,
-                origin,
-                8,
-                8,
-            );
-        }
-        // What signalling the mode costs: intra_chroma_pred_mode is ue(v), so
-        // DC is one bit and the plane mode five.
-        let bits = match mode {
-            0 => 1.0,
-            3 => 5.0,
-            _ => 3.0,
-        };
-        cost += motion_rate(e, bits);
-        if cost < best.0 {
-            best = (cost, mode);
-        }
-    }
-    // Leave the chosen mode's prediction in place.
-    for comp in 0..2 {
-        let plane = if comp == 0 { &mut pic.cb } else { &mut pic.cr };
-        let stride = plane.stride;
-        let origin = plane.at(mb_x * 8, mb_y * 8);
-        let mut win = PlaneWindow {
-            data: &mut plane.data,
-            stride,
-            origin,
-        };
-        pred_chroma_8x8(best.1, &mut win, nbr.b, nbr.a);
-    }
-    best.1
-}
-
 /// Code the luma of an Intra_4x4 macroblock: per block, choose the prediction
 /// mode against the *reconstructed* neighbours and reconstruct it immediately,
 /// because the next block predicts from it. Returns the chosen modes and the
@@ -2638,9 +2551,8 @@ fn encode_intra_mb(
     let mut modes8 = [2u8; 4];
     let mut pred_modes8 = [2u8; 4];
     let mut use_i4 = false;
-    let chroma_mode = choose_chroma_mode(pic, e, &nbr, mb_x, mb_y);
     let mut chroma_lv = Levels::default();
-    code_chroma(pic, e, w, mb_x, mb_y, qp, true, &mut chroma_lv);
+    let chroma_mode = choose_chroma_mode_rd(pic, e, w, &nbr, mb_x, mb_y, qp, &mut chroma_lv);
     let mut use_i8 = false;
 
     if cost.allow_i4 {
@@ -3411,4 +3323,125 @@ fn finish_mb(
         }
     }
     pic.mb_dc_cbf[mb_addr] = dc_cbf;
+}
+
+/// Chroma prediction mode by rate-distortion: every available mode is coded
+/// through the real chroma path and scored on reconstructed SSD plus the bits
+/// its levels and its own name actually cost. The SATD-plus-mode-bits chooser
+/// this replaced picked the mode before the quantiser had a say, which reads
+/// as a chroma deficit at matched luma: measured with `bd_psnr_vs_x264`
+/// against x264 `-preset medium`, BD-PSNR-YUV, GOP 10, 24 pictures:
+///
+/// | clip | SATD | RD |
+/// |---|---|---|
+/// | 3840x1608 film | -0.500 dB | -0.443 dB |
+/// | 2560x1440 screen capture | -0.220 dB | -0.146 dB |
+/// | 2560x1440 screen capture, second scene | -0.571 dB | -0.538 dB |
+/// | 1080p phone clip | -1.122 dB | -1.084 dB |
+/// | 720p web clip | -0.606 dB | -0.572 dB |
+///
+/// Luma is unmoved (film -0.065 -> -0.070 dB) and the encode time does not
+/// change measurably: only intra macroblocks pay, and only four trials of the
+/// chroma path each.
+#[allow(clippy::too_many_arguments)]
+fn choose_chroma_mode_rd(
+    pic: &mut Picture,
+    e: &MbEnc<'_>,
+    w: &EncEntropy,
+    nbr: &MbNeighbors,
+    mb_x: usize,
+    mb_y: usize,
+    qp: i32,
+    out: &mut Levels,
+) -> u8 {
+    let qp_c = chroma_qp(qp, e.cqo);
+    let lambda = lambda_ssd(qp_c);
+    let mut best: Option<(f64, u8, Levels, [[u8; 64]; 2])> = None;
+    for mode in [0u8, 1, 2, 3] {
+        let ok = match mode {
+            1 => nbr.a,
+            2 => nbr.b,
+            3 => nbr.a && nbr.b && nbr.d,
+            _ => true,
+        };
+        if !ok {
+            continue;
+        }
+        for comp in 0..2 {
+            let plane = if comp == 0 { &mut pic.cb } else { &mut pic.cr };
+            let stride = plane.stride;
+            let origin = plane.at(mb_x * 8, mb_y * 8);
+            let mut win = PlaneWindow {
+                data: &mut plane.data,
+                stride,
+                origin,
+            };
+            pred_chroma_8x8(mode, &mut win, nbr.b, nbr.a);
+        }
+        let mut lv = Levels::default();
+        code_chroma(pic, e, w, mb_x, mb_y, qp, true, &mut lv);
+        let mut ssd = 0i64;
+        let mut recon = [[0u8; 64]; 2];
+        for comp in 0..2 {
+            let (plane, src) = if comp == 0 {
+                (&pic.cb, &e.src.u)
+            } else {
+                (&pic.cr, &e.src.v)
+            };
+            let origin = plane.at(mb_x * 8, mb_y * 8);
+            for ry in 0..8 {
+                for rx in 0..8 {
+                    let r = plane.data[origin + ry * plane.stride + rx];
+                    recon[comp][ry * 8 + rx] = r;
+                    let d = i64::from(src[(mb_y * 8 + ry) * e.src.c_stride + mb_x * 8 + rx])
+                        - i64::from(r);
+                    ssd += d * d;
+                }
+            }
+        }
+        let mut bits = match mode {
+            0 => 1.0,
+            3 => 5.0,
+            _ => 3.0,
+        };
+        for comp in 0..2 {
+            bits += match w.residual_block_cost(
+                &lv.chroma_dc[comp],
+                BlockCat::ChromaDc(comp as u8),
+                Some(1),
+                Some(1),
+            ) {
+                Some(b) => f64::from(b) / 256.0,
+                None => block_bits(&lv.chroma_dc[comp]) as f64,
+            };
+            for blk in 0..4 {
+                bits += match w.residual_block_cost(
+                    &lv.chroma[comp][blk],
+                    BlockCat::ChromaAc,
+                    Some(1),
+                    Some(1),
+                ) {
+                    Some(b) => f64::from(b) / 256.0,
+                    None => block_bits(&lv.chroma[comp][blk]) as f64,
+                };
+            }
+        }
+        let cost = ssd as f64 + lambda * bits;
+        if best.as_ref().is_none_or(|b| cost < b.0) {
+            best = Some((cost, mode, lv, recon));
+        }
+    }
+    let (_, mode, lv, recon) = best.expect("chroma DC prediction is always available");
+    for comp in 0..2 {
+        let plane = if comp == 0 { &mut pic.cb } else { &mut pic.cr };
+        let stride = plane.stride;
+        let origin = plane.at(mb_x * 8, mb_y * 8);
+        for ry in 0..8 {
+            for rx in 0..8 {
+                plane.data[origin + ry * stride + rx] = recon[comp][ry * 8 + rx];
+            }
+        }
+    }
+    *out = lv;
+    mode
 }
