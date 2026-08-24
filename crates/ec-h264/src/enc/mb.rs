@@ -471,7 +471,7 @@ pub(crate) fn encode_mb(pic: &mut Picture, e: &mut MbEnc<'_>, w: &mut EncEntropy
         }
     }
 
-    let mut inter: Option<InterChoice> = None;
+    let mut inter: Option<Vec<InterChoice>> = None;
     if e.slice_type == SliceType::P {
         inter = Some(choose_inter(pic, e, mb_x, mb_y));
     }
@@ -499,7 +499,7 @@ pub(crate) fn encode_mb(pic: &mut Picture, e: &mut MbEnc<'_>, w: &mut EncEntropy
     // P macroblock is coded twice, and the loser's reconstruction and entropy
     // writer are thrown away.
     let intra_cost = intra_pre_cost(pic, e, &nbr, mb_x, mb_y);
-    let Some(choice) = inter else {
+    let Some(choices) = inter else {
         encode_intra_mb(pic, e, w, mb_addr, nbr, intra_cost);
         return;
     };
@@ -510,14 +510,29 @@ pub(crate) fn encode_mb(pic: &mut Picture, e: &mut MbEnc<'_>, w: &mut EncEntropy
         lambda_ssd(e.qp)
     };
     let before = save_mb_state(pic, e, mb_addr);
-    let mut w_inter = w.clone();
-    let inter_bits = {
-        let start = w_inter.bit_len();
-        encode_inter_mb(pic, e, &mut w_inter, mb_addr, nbr, choice);
-        (w_inter.bit_len() - start) as f64
+    // The shape and the skip flag are ranked the same way intra and inter are:
+    // by coding each candidate and measuring it. The SATD total that ordered
+    // them inside the search is a prediction-domain estimate that never sees
+    // the residual it causes, which is exactly the step x264 takes between
+    // subme 4 and subme 6 -- the 0.29 dB the feature ladder localised there.
+    let rd_cands = if e.preset == Preset::Balanced {
+        choices.len().min(SHAPE_RD_CANDIDATES)
+    } else {
+        1
     };
-    let inter_rd = ssd_mb(pic, e, mb_x, mb_y) as f64 + lambda * inter_bits;
-    let after_inter = save_mb_state(pic, e, mb_addr);
+    let mut best_inter: Option<(f64, MbState, EncEntropy)> = None;
+    for &choice in &choices[..rd_cands.max(1)] {
+        load_mb_state(pic, e, mb_addr, &before);
+        let mut w_c = w.clone();
+        let start = w_c.bit_len();
+        encode_inter_mb(pic, e, &mut w_c, mb_addr, nbr, choice);
+        let bits = (w_c.bit_len() - start) as f64;
+        let rd = ssd_mb(pic, e, mb_x, mb_y) as f64 + lambda * bits;
+        if best_inter.as_ref().is_none_or(|b| rd < b.0) {
+            best_inter = Some((rd, save_mb_state(pic, e, mb_addr), w_c));
+        }
+    }
+    let (inter_rd, after_inter, w_inter) = best_inter.expect("at least one inter candidate");
     load_mb_state(pic, e, mb_addr, &before);
 
     let mut w_intra = w.clone();
@@ -742,7 +757,26 @@ impl PShape {
 /// half the bits it spends cost more than the chroma it buys.
 const CHROMA_ME_WEIGHT: f64 = 0.5;
 
+/// How many inter candidates the macroblock decision codes before choosing,
+/// most promising first. One is the SATD winner alone, which is what this used
+/// to do; five is every shape the search costed plus P_Skip. BD-PSNR-YUV
+/// against x264 at GOP 10 over QP 22/26/30/34, at `Preset::Balanced`:
+///
+/// ```text
+///                  film 3840x1608   screen 2560x1440
+///     1 candidate      -0.580            -0.474
+///     2                -0.521            -0.459
+///     3                -0.513            -0.447
+///     5                -0.504            -0.406
+/// ```
+///
+/// monotone in the count with no turnover, so the decision is taken at the
+/// full list. The SATD total that used to rank the shapes is a
+/// prediction-domain estimate that never sees the residual it causes.
+const SHAPE_RD_CANDIDATES: usize = 5;
+
 /// The inter decision for a P macroblock.
+#[derive(Clone, Copy)]
 struct InterChoice {
     shape: PShape,
     /// One motion vector per partition.
@@ -754,7 +788,7 @@ struct InterChoice {
 }
 
 /// Motion search plus the skip candidate.
-fn choose_inter(pic: &Picture, e: &MbEnc<'_>, mb_x: usize, mb_y: usize) -> InterChoice {
+fn choose_inter(pic: &Picture, e: &MbEnc<'_>, mb_x: usize, mb_y: usize) -> Vec<InterChoice> {
     let reference = e.reference.expect("a P slice has a reference");
     let ctx = MvCtx {
         mb_x,
@@ -976,6 +1010,9 @@ fn choose_inter(pic: &Picture, e: &MbEnc<'_>, mb_x: usize, mb_y: usize) -> Inter
     };
 
     let mut best = (PShape::Whole, [mv16; 4], cost16);
+    // Every shape the search costed, kept so the macroblock decision can rank
+    // them on coded cost instead of on this SATD total (see `encode_mb`).
+    let mut evaluated = vec![(PShape::Whole, [mv16; 4])];
     // Halves, seeded with the whole-macroblock winner. The predictor used here
     // is the whole-macroblock one rather than each half's own: the real
     // predictors are derived in coding order when the choice is made, and this
@@ -1035,6 +1072,7 @@ fn choose_inter(pic: &Picture, e: &MbEnc<'_>, mb_x: usize, mb_y: usize) -> Inter
                 mvs[part] = mv;
                 total += cost + chroma_satd(bx * 4, by * 4, w, h, mv);
             }
+            evaluated.push((shape, mvs));
             if total < best.2 {
                 best = (shape, mvs, total);
             }
@@ -1074,12 +1112,35 @@ fn choose_inter(pic: &Picture, e: &MbEnc<'_>, mb_x: usize, mb_y: usize) -> Inter
             );
         }
     }
-    InterChoice {
+    let winner = InterChoice {
         shape: best.0,
         mv: best.1,
         skip_mv,
         prefer_skip: best.0 == PShape::Whole && skip_cost <= best.2,
+    };
+    // The SATD winner first, then the shapes it beat, then the skip candidate
+    // when the winner is not already it. The caller codes as many of these as
+    // its preset allows and keeps the one with the smallest coded cost.
+    let mut cands = vec![winner];
+    for (shape, mv) in evaluated {
+        if shape != winner.shape || winner.prefer_skip {
+            cands.push(InterChoice {
+                shape,
+                mv,
+                skip_mv,
+                prefer_skip: false,
+            });
+        }
     }
+    if !winner.prefer_skip {
+        cands.push(InterChoice {
+            shape: PShape::Whole,
+            mv: [skip_mv; 4],
+            skip_mv,
+            prefer_skip: true,
+        });
+    }
+    cands
 }
 
 /// Quantise and reconstruct the luma residual of a non-Intra_16x16 macroblock,
