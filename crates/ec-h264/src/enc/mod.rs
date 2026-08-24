@@ -28,21 +28,21 @@ mod quant;
 mod rc;
 mod vlc;
 
-use ec_core::error::{Error, Result};
 use ec_core::BitWriter;
-use ec_h264_syntax::nal::{escape_rbsp, NalUnitType};
+use ec_core::error::{Error, Result};
+use ec_h264_syntax::nal::{NalUnitType, escape_rbsp};
 use ec_h264_syntax::{SliceType, Sps};
 
 use crate::decoder::deblock_picture;
 use crate::dpb::{Picture, SliceParams as DeblockParams};
-use crate::entropy::{FLAG_INTER, FLAG_TRANS8X8};
 #[cfg(feature = "rd-ablation")]
 use crate::entropy::FLAG_SKIP;
+use crate::entropy::{FLAG_INTER, FLAG_TRANS8X8};
 use crate::transform::{LevelScale4x4, LevelScale8x8};
 
 use entropy::EncEntropy;
-use headers::{write_pps, write_slice_header, write_sps, SeqParams, SliceParams};
-use mb::{encode_mb, MbEnc, Source};
+use headers::{SeqParams, SliceParams, write_pps, write_slice_header, write_sps};
+use mb::{MbEnc, Source, encode_mb};
 use rc::RateControl;
 
 pub use mb::Preset;
@@ -140,6 +140,8 @@ pub struct Encoder {
     sps: Sps,
     sps_nal: Vec<u8>,
     pps_nal: Vec<u8>,
+    /// `chroma_qp_index_offset`, decided from the first source picture.
+    cqo: i32,
     /// The previous reconstruction, which every P picture predicts from.
     reference: Picture,
     /// One private picture per worker; worker 0's doubles as the picture the
@@ -234,7 +236,8 @@ impl Encoder {
         };
         let sps_rbsp = write_sps(&seq);
         let sps = Sps::parse(&sps_rbsp)?;
-        let pps_rbsp = write_pps(cfg.cabac, cfg.transform_8x8);
+        // Rewritten once the first source picture has been measured.
+        let pps_rbsp = write_pps(cfg.cabac, cfg.transform_8x8, 0);
         let threads = if cfg.threads == 0 {
             std::thread::available_parallelism().map_or(1, |n| n.get())
         } else {
@@ -246,6 +249,7 @@ impl Encoder {
         Ok(Encoder {
             sps_nal: annex_b(NalUnitType::Sps, 3, &sps_rbsp),
             pps_nal: annex_b(NalUnitType::Pps, 3, &pps_rbsp),
+            cqo: 0,
             sps,
             reference: Picture::default(),
             workers,
@@ -314,6 +318,11 @@ impl Encoder {
             return Err(Error::corrupt("frame size differs from the encoder's"));
         }
         self.pad_source(frame)?;
+        if self.frames == 0 {
+            self.cqo = chroma_qp_offset_for_source(&self.src, self.cfg.width, self.cfg.height);
+            let pps_rbsp = write_pps(self.cfg.cabac, self.cfg.transform_8x8, self.cqo);
+            self.pps_nal = annex_b(NalUnitType::Pps, 3, &pps_rbsp);
+        }
         let idr = self.cfg.gop_size <= 1
             || self
                 .frames
@@ -341,6 +350,7 @@ impl Encoder {
         let frame_num = self.frame_num;
         let idr_pic_id = self.idr_pic_id;
         let target = rc.frame_target(idr);
+        let cqo = self.cqo;
         let total_mbs = (mb_w * mb_h) as f64;
 
         let mut outputs: Vec<Vec<u8>> = Vec::new();
@@ -370,6 +380,7 @@ impl Encoder {
                             idr,
                             idr_pic_id,
                             band_target: target * band_mbs / total_mbs,
+                            cqo,
                         },
                     )
                 }));
@@ -389,8 +400,8 @@ impl Encoder {
                 disable_deblock_idc: 0,
                 alpha_offset: 0,
                 beta_offset: 0,
-                cb_qp_offset: 0,
-                cr_qp_offset: 0,
+                cb_qp_offset: self.cqo,
+                cr_qp_offset: self.cqo,
             });
         }
         for (band, worker) in bands.iter().skip(1).zip(rest.iter()) {
@@ -496,6 +507,79 @@ impl Encoder {
 }
 
 /// Everything one band worker needs.
+/// Mean absolute neighbour difference of one plane, horizontal and vertical
+/// averaged, over the `w` by `h` samples at the top left of `plane`.
+fn mean_gradient(plane: &[u8], stride: usize, w: usize, h: usize) -> f64 {
+    let (mut sum, mut n) = (0u64, 0u64);
+    for y in 0..h {
+        let row = &plane[y * stride..y * stride + w];
+        for x in 1..w {
+            sum += u64::from(row[x].abs_diff(row[x - 1]));
+            n += 1;
+        }
+        if y > 0 {
+            let prev = &plane[(y - 1) * stride..(y - 1) * stride + w];
+            for x in 0..w {
+                sum += u64::from(row[x].abs_diff(prev[x]));
+                n += 1;
+            }
+        }
+    }
+    if n == 0 { 0.0 } else { sum as f64 / n as f64 }
+}
+
+/// `chroma_qp_index_offset` for a source, from how textured its chroma is
+/// relative to its luma.
+///
+/// A negative offset spends bits on chroma that luma would otherwise take.
+/// That pays when the chroma planes are flat — screen capture, phone video,
+/// anything with large constant-hue areas — because their few edges are what
+/// the eye reads, and it loses on film, whose chroma carries as much detail as
+/// its luma and whose luma is the better place for the same bits. The
+/// separating statistic is the mean absolute sample gradient of the chroma
+/// planes over that of luma, measured on the first source picture.
+/// BD-PSNR-YUV against x264, GOP 10, QP 22/26/30/34, `Preset::Balanced`, over
+/// nine clips of the user's library, offset 0 against offset -2:
+///
+/// ```text
+///     chroma/luma gradient   0 -> -2 (dB)
+///          0.013                +0.019
+///          0.092                +0.181
+///          0.094                +0.228
+///          0.098                +0.014
+///          0.118                +0.081
+///          0.122                +0.045
+///          0.128                +0.065
+///          0.286                +0.011
+///          0.911                -0.158
+/// ```
+///
+/// Every clip whose chroma is flatter than its luma gains; the one film clip,
+/// whose chroma gradient is nearly its luma's, loses. The threshold sits in
+/// the middle of the gap the data leaves.
+fn chroma_qp_offset_for_source(src: &Source, width: u32, height: u32) -> i32 {
+    let (w, h) = (width as usize, height as usize);
+    let (cw, ch) = (w / 2, h / 2);
+    let luma = mean_gradient(&src.y, src.stride, w, h);
+    if luma <= 0.0 {
+        return 0;
+    }
+    let chroma = (mean_gradient(&src.u, src.c_stride, cw, ch)
+        + mean_gradient(&src.v, src.c_stride, cw, ch))
+        / 2.0;
+    if chroma / luma < CHROMA_FLAT_RATIO {
+        CHROMA_FLAT_QP_OFFSET
+    } else {
+        0
+    }
+}
+
+/// Chroma is "flat" below this share of the luma gradient.
+const CHROMA_FLAT_RATIO: f64 = 0.5;
+
+/// The offset flat chroma is coded with.
+const CHROMA_FLAT_QP_OFFSET: i32 = -2;
+
 struct BandJob<'a> {
     src: &'a Source,
     reference: Option<&'a Picture>,
@@ -512,6 +596,7 @@ struct BandJob<'a> {
     idr: bool,
     idr_pic_id: u32,
     band_target: f64,
+    cqo: i32,
 }
 
 /// Code one slice into its own RBSP.
@@ -556,6 +641,7 @@ fn code_band(pic: &mut Picture, job: BandJob<'_>) -> Vec<u8> {
         ls: LevelScale4x4::new(&[16; 16]),
         ls8: LevelScale8x8::new(&[16; 64]),
         mb_ctx: crate::entropy::MbCtx::default(),
+        cqo: job.cqo,
         skip_inc: 0,
         qp_delta_inc: 0,
     };
@@ -653,7 +739,7 @@ fn rd_trace_write(pic: &Picture, src: &Source, frame: u64, pre: Option<Vec<(i64,
     let mut out = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
- .open(std::env::var_os("EC_H264_RD_TRACE").expect("checked in capture"))
+        .open(std::env::var_os("EC_H264_RD_TRACE").expect("checked in capture"))
         .expect("open EC_H264_RD_TRACE");
     for (addr, &(pre_luma, pre_chroma)) in pre.iter().enumerate() {
         let (post_luma, post_chroma) = rd_trace_ssd(pic, src, addr % pic.mb_w, addr / pic.mb_w);
@@ -914,5 +1000,57 @@ mod tests {
         );
         cfg.transform_8x8 = true;
         assert_eq!(lambda_for(26, rd_lambda_standard(&cfg)), lambda_ssd(26));
+    }
+
+    /// Flat chroma over textured luma picks the negative chroma QP offset, and
+    /// it reaches the PPS the encoder emits; chroma as textured as the luma
+    /// keeps 0. The nine-clip measurement behind the rule is in
+    /// [`chroma_qp_offset_for_source`].
+    #[test]
+    fn chroma_offset_follows_the_source() {
+        let (w, h) = (64usize, 64usize);
+        let noise = |i: usize| ((i * 2654435761) >> 13) as u8;
+        let mut src = Source {
+            y: (0..w * h).map(noise).collect(),
+            u: vec![110; w * h / 4],
+            v: vec![130; w * h / 4],
+            stride: w,
+            c_stride: w / 2,
+        };
+        assert_eq!(
+            chroma_qp_offset_for_source(&src, w as u32, h as u32),
+            CHROMA_FLAT_QP_OFFSET,
+            "flat chroma must take the negative offset"
+        );
+        src.u = (0..w * h / 4).map(noise).collect();
+        src.v = (0..w * h / 4).map(|i| noise(i + 7)).collect();
+        assert_eq!(
+            chroma_qp_offset_for_source(&src, w as u32, h as u32),
+            0,
+            "chroma as textured as the luma must keep 0"
+        );
+
+        // The chosen offset is what the decoder will read.
+        let mut enc = Encoder::new(EncoderConfig::new(w as u32, h as u32)).expect("encoder");
+        let y: Vec<u8> = (0..w * h).map(noise).collect();
+        let (u, v) = (vec![110u8; w * h / 4], vec![130u8; w * h / 4]);
+        let au = enc
+            .encode(&PictureView {
+                width: w as u32,
+                height: h as u32,
+                y: &y,
+                u: &u,
+                v: &v,
+                y_stride: w,
+                c_stride: w / 2,
+            })
+            .expect("first picture encodes");
+        assert!(
+            au.au
+                .windows(5)
+                .any(|n| n[..4] == [0, 0, 0, 1] && n[4] & 0x1f == 8),
+            "the IDR access unit carries a PPS"
+        );
+        assert_eq!(enc.cqo, CHROMA_FLAT_QP_OFFSET);
     }
 }

@@ -102,6 +102,9 @@ pub(crate) struct MbEnc<'a> {
     pub ls8: LevelScale8x8,
     /// Neighbourhood of the macroblock being written (CABAC).
     pub mb_ctx: MbCtx,
+    /// The picture's `chroma_qp_index_offset`, chosen from the source in
+    /// `Encoder::chroma_qp_offset_for_source`.
+    pub cqo: i32,
     /// ctxIdxInc for this macroblock's mb_skip_flag.
     pub skip_inc: usize,
     /// `qp_delta_inc` of 9.3.3.1.1.5: whether the previous macroblock in this
@@ -285,10 +288,10 @@ pub(crate) fn se_bits(v: i32) -> i32 {
     (32 - (k + 1).leading_zeros()) as i32 * 2 - 1
 }
 
-/// Chroma QP of a luma QP under a zero `chroma_qp_index_offset`.
+/// Chroma QP of a luma QP under the picture's `chroma_qp_index_offset`.
 #[inline]
-fn chroma_qp(qp: i32) -> i32 {
-    i32::from(CHROMA_QP[qp.clamp(0, 51) as usize])
+fn chroma_qp(qp: i32, cqo: i32) -> i32 {
+    i32::from(CHROMA_QP[(qp + cqo).clamp(0, 51) as usize])
 }
 
 /// Which intra 4x4 modes the available neighbours allow (8.3.1.2).
@@ -1614,7 +1617,7 @@ fn code_chroma(
     intra: bool,
     lv: &mut Levels,
 ) {
-    let qp_c = chroma_qp(qp_y);
+    let qp_c = chroma_qp(qp_y, e.cqo);
     let mut dc_lists = [[0i32; 4]; 2];
     let mut ac = [[[0i32; 16]; 4]; 2];
     let mut srcs = [[[0i32; 16]; 4]; 2];
