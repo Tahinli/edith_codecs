@@ -611,7 +611,23 @@ const MV_BITS_WEIGHT: f64 = 0.5;
 /// -0.369/-0.364/-0.353/-0.356 on the screen capture: both contents put the
 /// optimum at twelve, and quarters are worth 0.005 dB on camera content and
 /// 0.016 on screen capture.
+///
+/// Re-swept once each partition was searched against its own predictor rather
+/// than the macroblock's, because that changes what a split is worth: 6, 12
+/// and 20 read -0.342/-0.343/-0.346 dB on the film clip and
+/// -0.322/-0.314/-0.324 on the screen capture. Twelve survives the new path.
 const QUAD_BITS: f64 = 12.0;
+
+/// The same charge for a 16x8 or 8x16: one extra mb_type bin over P_16x16,
+/// with no sub_mb_type behind it.
+///
+/// Swept on the per-partition-predictor path at 3, 6 and 10 bits:
+/// -0.329/-0.343/-0.358 dB on the film clip and -0.310/-0.314/-0.326 on the
+/// screen capture. Both contents want the halves charged half of what the old
+/// whole-macroblock predictor made them look worth -- with each half searched
+/// against its own predictor its mvd is genuinely cheaper, so the search no
+/// longer has to be talked out of splitting.
+const HALF_BITS: f64 = 3.0;
 
 /// How a P macroblock is partitioned, in the mb_type numbering of Table 7-13.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -653,6 +669,21 @@ impl PShape {
             PShape::Vertical => ((part * 2, 0), (8, 16)),
             PShape::Quad => (((part % 2) * 2, (part / 2) * 2), (8, 8)),
         }
+    }
+
+    /// Which partition covers the 4x4 block at `(x, y)` in macroblock
+    /// coordinates, or `None` when the block is outside the macroblock.
+    fn part_of(self, x: i32, y: i32) -> Option<usize> {
+        if !(0..4).contains(&x) || !(0..4).contains(&y) {
+            return None;
+        }
+        let (x, y) = (x as usize, y as usize);
+        Some(match self {
+            PShape::Whole => 0,
+            PShape::Horizontal => y / 2,
+            PShape::Vertical => x / 2,
+            PShape::Quad => (y / 2) * 2 + x / 2,
+        })
     }
 
     /// `MbPartWidth`/`MbPartHeight` in 4x4 blocks, which select the
@@ -867,14 +898,39 @@ fn choose_inter(pic: &Picture, e: &MbEnc<'_>, mb_x: usize, mb_y: usize) -> Inter
                 if shape == PShape::Quad {
                     QUAD_BITS
                 } else {
-                    6.0
+                    HALF_BITS
                 },
             );
             let mut mvs = [[0i16; 2]; 4];
+            let (pw, ph) = shape.part_blocks();
             for part in 0..shape.parts() {
                 let ((bx, by), (w, h)) = shape.geometry(part);
-                let seeds = [mv16, mvp, skip_mv, [0, 0]];
-                let (mv, cost) = search(bx * 4, by * 4, w, h, mvp, &seeds);
+                // Each partition is searched against the predictor it will
+                // actually be coded with (8.4.1.3), not against the whole
+                // macroblock's: the partitions before it in this macroblock
+                // are already chosen, so the neighbourhood the predictor reads
+                // can be completed from `mvs`.
+                let mut n = ctx.neighbours(pic, bx, by, pw, 0);
+                let inside = |x: i32, y: i32, nb: &mut crate::mv::Nb| {
+                    if let Some(p) = shape.part_of(x, y).filter(|&p| p < part) {
+                        *nb = crate::mv::Nb {
+                            avail: true,
+                            mv: mvs[p],
+                            ref_idx: 0,
+                        };
+                    }
+                };
+                inside(bx as i32 - 1, by as i32, &mut n[0]);
+                inside(bx as i32, by as i32 - 1, &mut n[1]);
+                let cx = bx as i32 + pw as i32;
+                if shape.part_of(cx, by as i32 - 1).is_some() {
+                    inside(cx, by as i32 - 1, &mut n[2]);
+                } else if !n[2].avail {
+                    inside(bx as i32 - 1, by as i32 - 1, &mut n[2]);
+                }
+                let part_mvp = predict_mv(&n, 0, pw, ph, part);
+                let seeds = [mv16, part_mvp, mvp, skip_mv, [0, 0]];
+                let (mv, cost) = search(bx * 4, by * 4, w, h, part_mvp, &seeds);
                 mvs[part] = mv;
                 total += cost;
             }
