@@ -258,6 +258,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ec-av1"
+version = "0.1.0"
+dependencies = [
+ "ec-av1-syntax",
+ "ec-core",
+]
+
+[[package]]
 name = "ec-av1-syntax"
 version = "0.1.0"
 dependencies = [
