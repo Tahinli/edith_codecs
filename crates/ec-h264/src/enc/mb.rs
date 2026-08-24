@@ -1338,6 +1338,26 @@ const CBP_CHROMA_BIT: f64 = 16.0;
 /// takes without losing ground, and it is worth 0.06 dB on screen capture.
 const GROUP_LAMBDA: f64 = 0.6;
 
+/// How much of the squared-error lambda the chroma DC zero test uses.
+///
+/// BD-PSNR-YUV against x264 at GOP 10 over QP 22/26/30/34, `Preset::Balanced`,
+/// with the test off against a ladder of multipliers:
+///
+/// ```text
+///                       film     screen   phone    handheld
+///     off              -0.504    -0.227   -0.300    -0.886
+///     0.25             -0.506    -0.227
+///     0.5              -0.500    -0.220   -0.297    -0.884
+///     0.75             -0.500    -0.223
+///     1.0              -0.518    -0.246
+///     2.0              -0.708    -0.566
+/// ```
+///
+/// Zeroing on squared error alone (a multiplier of 0) never fires, so the rate
+/// term is the whole test; above the peak it throws away chroma the picture
+/// needs.
+const CHROMA_DC_LAMBDA: f64 = 0.5;
+
 /// Squared error of coding `levels`, in the pixels the block reconstructs to.
 fn block_ssd(e: &MbEnc<'_>, source: &[i32; 16], levels: &[i32; 16], qp: i32, skip_dc: bool) -> i64 {
     let mut raster = [0i32; 16];
@@ -1737,10 +1757,53 @@ fn code_chroma(
             any_ac = false;
         }
     }
+    // The chroma DC block had no zero test at all: whatever the quantiser
+    // produced was coded. Its four coefficients spread over all 64 samples of
+    // the component, and with only DC in the block the inverse transform gives
+    // every sample the same (dc + 32) >> 6, so the squared error zeroing costs
+    // is exact in one pass over the AC residual that is already reconstructed
+    // here.
     let mut any_dc = false;
     for comp in 0..2 {
         forward_hadamard_2x2(&mut dc_lists[comp]);
-        let nz = quant_chroma_dc(&dc_lists[comp], qp_c, intra, &mut lv.chroma_dc[comp]);
+        let mut nz = quant_chroma_dc(&dc_lists[comp], qp_c, intra, &mut lv.chroma_dc[comp]);
+        if nz > 0 {
+            let mut dc = [
+                lv.chroma_dc[comp][0],
+                lv.chroma_dc[comp][1],
+                lv.chroma_dc[comp][2],
+                lv.chroma_dc[comp][3],
+            ];
+            chroma_dc_transform_420(&mut dc, &e.ls, qp_c);
+            let mut delta = 0i64;
+            for blk in 0..4 {
+                let mut resid = [0i32; 16];
+                if any_ac && lv.chroma_nz[comp][blk] > 0 {
+                    let mut raster = [0i32; 16];
+                    unzigzag_ac15(&ac[comp][blk], &mut raster);
+                    dequant_4x4(&mut raster, &e.ls, qp_c, true);
+                    inverse_transform_4x4(&raster, &mut resid);
+                }
+                let c = i64::from((dc[blk] + 32) >> 6);
+                let err: i64 = (0..16)
+                    .map(|i| i64::from(srcs[comp][blk][i] - resid[i]))
+                    .sum();
+                delta += 16 * c * c - 2 * c * err;
+            }
+            let rate = match w.residual_block_cost(
+                &lv.chroma_dc[comp],
+                BlockCat::ChromaDc(comp as u8),
+                Some(1),
+                Some(1),
+            ) {
+                Some(bits) => f64::from(bits) / 256.0,
+                None => block_bits(&lv.chroma_dc[comp]) as f64,
+            };
+            if delta as f64 + CHROMA_DC_LAMBDA * lambda_ssd(qp_c) * rate >= 0.0 {
+                lv.chroma_dc[comp] = [0; 16];
+                nz = 0;
+            }
+        }
         if nz > 0 {
             any_dc = true;
         }
