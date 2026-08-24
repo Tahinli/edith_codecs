@@ -131,7 +131,7 @@ pub(crate) fn write_sps(p: &SeqParams) -> Vec<u8> {
 }
 
 /// Write the picture parameter set RBSP (7.3.2.2).
-pub(crate) fn write_pps(cabac: bool, transform_8x8: bool) -> Vec<u8> {
+pub(crate) fn write_pps(cabac: bool, transform_8x8: bool, cqo: i32) -> Vec<u8> {
     let mut w = BitWriter::with_capacity(8);
     w.write_ue(0); // pic_parameter_set_id
     w.write_ue(0); // seq_parameter_set_id
@@ -144,14 +144,14 @@ pub(crate) fn write_pps(cabac: bool, transform_8x8: bool) -> Vec<u8> {
     w.write_bits(0, 2); // weighted_bipred_idc
     w.write_se(0); // pic_init_qp_minus26
     w.write_se(0); // pic_init_qs_minus26
-    w.write_se(0); // chroma_qp_index_offset
+    w.write_se(cqo); // chroma_qp_index_offset
     w.write_bit(false); // deblocking_filter_control_present_flag
     w.write_bit(false); // constrained_intra_pred_flag
     w.write_bit(false); // redundant_pic_cnt_present_flag
     if transform_8x8 {
         w.write_bit(true); // transform_8x8_mode_flag
         w.write_bit(false); // pic_scaling_matrix_present_flag
-        w.write_se(0); // second_chroma_qp_index_offset
+        w.write_se(cqo); // second_chroma_qp_index_offset
     }
     trailing(&mut w);
     w.into_bytes()
@@ -264,10 +264,13 @@ mod tests {
                 assert_eq!(sps.chroma_format_idc, 1);
                 assert_eq!(sps.bit_depth_luma, 8);
             }
-            let pps = Pps::parse(&write_pps(cabac, t8x8), |_| Some(&sps)).expect("PPS parses");
+            let pps = Pps::parse(&write_pps(cabac, t8x8, -2), |_| Some(&sps)).expect("PPS parses");
             assert_eq!(pps.entropy_coding_mode, cabac);
             assert_eq!(pps.pic_init_qp, 26);
             assert_eq!(pps.transform_8x8_mode, t8x8);
+            assert_eq!(pps.chroma_qp_index_offset, -2);
+            // Absent, it is inferred equal to chroma_qp_index_offset (7.4.2.2).
+            assert_eq!(pps.second_chroma_qp_index_offset, -2);
         }
     }
 
@@ -286,7 +289,7 @@ mod tests {
     fn slice_header_parses_back() {
         let p = params(320, 240);
         let sps = Sps::parse(&write_sps(&p)).unwrap();
-        let pps = Pps::parse(&write_pps(true, false), |_| Some(&sps)).unwrap();
+        let pps = Pps::parse(&write_pps(true, false, 0), |_| Some(&sps)).unwrap();
         for (idr, slice_type, first_mb, qp) in [
             (true, SliceType::I, 0u32, 30i32),
             (false, SliceType::P, 40, 18),
