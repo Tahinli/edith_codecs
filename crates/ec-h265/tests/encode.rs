@@ -17,18 +17,25 @@ type Planes = (Vec<u8>, Vec<u8>, Vec<u8>);
 /// shrink but not grow unnoticed; it is not a claim that the number is fine.
 ///
 /// Measured +2.456 dB luma / +3.158 dB YUV on the recalibrated run (352x288,
-/// 24 pictures of `Clip::render_smooth`, ours at QP 16/20/24/28, x265 at QP
-/// 22/26/30/34, both sides decoded through ffmpeg, union-range BD-PSNR, 0%
-/// extrapolation both sides). Our encoder is leaner than x265 — it spends fewer
-/// bits at matched QP — so the QP ladders are offset to make the bitrate ranges
-/// overlap; at matched bitrate our PSNR is higher on this smooth synthetic clip.
+/// 24 pictures of `Clip::render_smooth`, x265 at QP 22/26/30/34, our ladder
+/// auto-shifted from a QP-26 probe to 16/20/24/28, both sides decoded through
+/// ffmpeg, union-range BD-PSNR, 0% extrapolation both sides). This is a
+/// smooth-gradient result: it does NOT hold on real content, where our
+/// encoder is no leaner than x265 at matched QP (the probe measures a shift of
+/// 0) and the aligned BD is negative. Real-clip numbers, 24 pictures after
+/// 1500, ladders auto-aligned to 22/26/30/34, 0% extrapolation both sides:
+///   • 3840x1608 film: -0.731 dB luma / -0.730 dB YUV
+///   • 1138x640 web clip: -0.603 dB luma / -0.632 dB YUV
+/// Those two are the real gap to close; the synthetic number only guards
+/// against regression on a clip whose content is pinned.
 ///
 /// Previous run measured -38.258 dB luma with both sides at QP 22/26/30/34;
-/// that number was meaningless — the curves did not overlap (50% extrapolation
-/// on our side) because x265's `-qp` was thought not to reach its rate control.
-/// In fact `-qp` and `rc=cqp:qp=N` produce identical output; the shallow
-/// rate-quality slope was genuine for this clip, and the fix was to offset the
-/// QP ladders, not to change x265's rate control.
+/// that number was meaningless because the two curves' bitrate ranges did not
+/// overlap (50% extrapolation on our side) — a fixed QP offset could not
+/// bridge encoders whose relative leanness varies with content. The shallow
+/// all-intra rate-quality slope is genuine content behaviour (x264 forced
+/// all-intra shows the same shape); the fix is to auto-align the ladders from
+/// a probe encode, not to change x265's rate control.
 const BD_PSNR_VS_X265_FLOOR: f64 = 2.306;
 
 /// A synthetic source with real structure: smooth gradients, a band of
@@ -202,13 +209,14 @@ fn cubic_integral(c: [f64; 4], x: f64) -> f64 {
 ///
 /// The h264 gate's encoders land in the same bitrate band at the same QP, so
 /// the intersection is non-empty and the standard Bjøntegaard cubic integral
-/// over it is well defined. Our h265 encoder is leaner than x265 at matched QP
-/// — it spends fewer bits — so our QP sweep is shifted below x265's to make
-/// the bitrate ranges overlap. The union range is kept (not clipped to the
-/// intersection) so the extrapolation share can be measured: if either curve
-/// is extrapolated over more than 20% of the range, the test fails with a
-/// named message instead of reporting a BD number that is a cubic guess, not
-/// a measurement. The extrapolation shares are returned alongside the number.
+/// over it is well defined. Our h265 encoder's bitrate at matched QP can be
+/// leaner or fatter than x265's depending on content, so the QP-ladder shift
+/// is measured from a probe encode, not fixed — the union range is kept (not
+/// clipped to the intersection) so the extrapolation share can be measured:
+/// if either curve is extrapolated over more than 20% of the range, the test
+/// fails with a named message instead of reporting a BD number that is a cubic
+/// guess, not a measurement. The extrapolation shares are returned alongside
+/// the number.
 ///
 /// Returns `(bd, cand_extrap, anc_extrap)` where the extrap shares are the
 /// fraction of the integration range that each curve's measured bitrate span
@@ -334,12 +342,12 @@ fn x265_encode_qp(sources: &[Planes], w: usize, h: usize, qp: i32) -> Option<Vec
     // plus the in-loop filters x265 adds and x264 does not have (no-sao,
     // no-deblock), plus RDOQ off (rdoq-level=0) so the quantiser spends bits
     // the same way ours does. The quantiser goes inside the param string as
-    // `rc=cqp:qp=N` because ffmpeg's `-qp` flag does not reach libx265's rate
-    // control — without `rc=cqp` x265 defaults to ABR and its bitrate barely
-    // moves across a 12-QP span. EC_H265_X265_PARAMS appends to attribute a
-    // single feature the same way EC_H264_X264_PARAMS does.
+    // `qp=N`; `-x265-params qp=22` and `-x265-params rc=cqp:qp=22` produce
+    // byte-identical streams, so the `rc=cqp:` prefix is unnecessary.
+    // EC_H265_X265_PARAMS appends to attribute a single feature the same way
+    // EC_H264_X264_PARAMS does.
     let params = format!(
-        "rc=cqp:qp={qp}:keyint=1:bframes=0:scenecut=0:rc-lookahead=0:no-sao:no-deblock:\
+        "qp={qp}:keyint=1:bframes=0:scenecut=0:rc-lookahead=0:no-sao:no-deblock:\
          aq-mode=0:psy-rd=0:psy-rdoq=0:rdoq-level=0:tu-intra-depth=1:ipratio=1.0:\
          pbratio=1.0:qcomp=1.0:chroma-qp-offset=0{}",
         match std::env::var("EC_H265_X265_PARAMS") {
@@ -369,12 +377,14 @@ fn x265_encode_qp(sources: &[Planes], w: usize, h: usize, qp: i32) -> Option<Vec
     stream
 }
 
-/// BD-PSNR of this encoder against x265 at matched features. Our encoder is
-/// leaner than x265 at every QP, so our sweep (16/20/24/28) is shifted below
-/// x265's (22/26/30/34) to make the bitrate ranges overlap and the cubic fit
-/// interpolate instead of extrapolate. Runs on the synthetic clip by default,
-/// so the number cannot rot behind an `#[ignore]`; point `EC_H265_CLIP` at a
-/// media file to measure the same thing on real content.
+/// BD-PSNR of this encoder against x265 at matched features. x265 is anchored
+/// at QP 22/26/30/34; our ladder is shifted by a QP delta measured from a
+/// probe encode at QP 26 (both sides), so the bitrate ranges overlap and the
+/// cubic fit interpolates instead of extrapolating — regardless of whether
+/// our encoder is leaner or fatter than x265 at matched QP on the content at
+/// hand. Runs on the synthetic clip by default, so the number cannot rot
+/// behind an `#[ignore]`; point `EC_H265_CLIP` at a media file to measure the
+/// same thing on real content.
 ///
 /// Both curves are (bits, luma PSNR against the same source pictures), and
 /// both are measured on ffmpeg's decode of the stream rather than on an
@@ -507,38 +517,110 @@ fn bd_psnr_vs_x265() {
         ((stream.len() * 8) as f64, sum / n, sum_yuv / n)
     };
 
-    // Our encoder is leaner than x265 at every QP — it spends fewer bits on
-    // the same content — so at matched QP our entire curve sits below x265's.
-    // Widening our sweep to lower QPs pushes our bitrate up into x265's range
-    // so the cubic fit interpolates instead of extrapolating. x265 stays at
-    // 22/26/30/34; ours drops to 16/20/24/28 to meet it.
-    let our_qps = [16, 20, 24, 28];
+    // x265 stays anchored at QP 22/26/30/34. Our ladder is shifted by a QP
+    // delta measured from a single probe encode, not a constant: both sides
+    // are encoded at QP 26, the bit ratio is converted to a QP shift (≈6 QP
+    // per factor of 2 in bits), and our four QPs run at 22/26/30/34 plus that
+    // shift. If the extrapolation share still exceeds 20% after measuring, the
+    // shift is re-estimated from the geometric-mean bit ratio of the two full
+    // curves and the ladder is rebuilt — at most 2 extra alignment rounds
+    // before the existing panic fires.
+    const EXTRAP_LIMIT: f64 = 0.20;
     let x265_qps = [22, 26, 30, 34];
-    let mine: Vec<_> = our_qps.iter().map(|&q| ours(q)).collect();
-    let theirs: Vec<_> = x265_qps.iter().map(|&q| x265(q)).collect();
-    for (i, &qp) in our_qps.iter().enumerate() {
-        let (ob, op, oy) = mine[i];
-        eprintln!("qp {qp}: ours {ob:.0} bits {op:.2} dB ({oy:.2} yuv)");
-    }
-    for (i, &qp) in x265_qps.iter().enumerate() {
-        let (xb, xp, xy) = theirs[i];
-        eprintln!("qp {qp}: x265 {xb:.0} bits {xp:.2} dB ({xy:.2} yuv)");
-    }
+    let probe_qp = 26;
+
+    // Probe both encoders at QP 26 to measure the bit ratio.
+    let probe_ours = ours(probe_qp);
+    let probe_x265 = x265(probe_qp);
+    let mut shift = (6.0 * (probe_ours.0 / probe_x265.0).log2()).round() as i32;
+    eprintln!(
+        "ladder shift {shift:+} (probe q{probe_qp}: ours {:.1} Mbit vs x265 {:.1} Mbit)",
+        probe_ours.0 / 1e6,
+        probe_x265.0 / 1e6,
+    );
+
     let curve = |v: &[(f64, f64, f64)], luma: bool| -> Vec<(f64, f64)> {
         v.iter()
             .map(|&(b, p, y)| (b, if luma { p } else { y }))
             .collect()
     };
-    let (bd, cand_extrap, anc_extrap) = bd_psnr_delta(&curve(&mine, true), &curve(&theirs, true));
-    let (bd_yuv, cand_extrap_yuv, anc_extrap_yuv) =
-        bd_psnr_delta(&curve(&mine, false), &curve(&theirs, false));
-    eprintln!("BD-PSNR ours (q16/20/24/28) vs x265 (q22/26/30/34): {bd:+.3} dB");
-    eprintln!("BD-PSNR-YUV ours (q16/20/24/28) vs x265 (q22/26/30/34): {bd_yuv:+.3} dB");
+
+    // x265 ladder is fixed; reuse the probe for its QP-26 point.
+    let theirs: Vec<(f64, f64, f64)> = x265_qps
+        .iter()
+        .map(|&q| if q == probe_qp { probe_x265 } else { x265(q) })
+        .collect();
+
+    let gm = |v: &[(f64, f64, f64)]| (v[0].0 * v[1].0 * v[2].0 * v[3].0).powf(0.25);
+    let qps_str = |qs: &[i32; 4]| {
+        qs.iter()
+            .map(|q| q.to_string())
+            .collect::<Vec<_>>()
+            .join("/")
+    };
+
+    #[allow(unused_assignments)]
+    let (
+        mut bd,
+        mut bd_yuv,
+        mut cand_extrap,
+        mut anc_extrap,
+        mut cand_extrap_yuv,
+        mut anc_extrap_yuv,
+    ) = (0.0_f64, 0.0, 0.0, 0.0, 0.0, 0.0);
+    let mut mine: Vec<(f64, f64, f64)>;
+    let mut our_qps: [i32; 4];
+
+    for round in 0..=2u32 {
+        our_qps = x265_qps.map(|q| (q + shift).clamp(1, 45));
+        mine = our_qps
+            .iter()
+            .map(|&q| if q == probe_qp { probe_ours } else { ours(q) })
+            .collect();
+        for (i, &qp) in our_qps.iter().enumerate() {
+            let (ob, op, oy) = mine[i];
+            eprintln!("qp {qp}: ours {ob:.0} bits {op:.2} dB ({oy:.2} yuv)");
+        }
+        for (i, &qp) in x265_qps.iter().enumerate() {
+            let (xb, xp, xy) = theirs[i];
+            eprintln!("qp {qp}: x265 {xb:.0} bits {xp:.2} dB ({xy:.2} yuv)");
+        }
+        (bd, cand_extrap, anc_extrap) = bd_psnr_delta(&curve(&mine, true), &curve(&theirs, true));
+        (bd_yuv, cand_extrap_yuv, anc_extrap_yuv) =
+            bd_psnr_delta(&curve(&mine, false), &curve(&theirs, false));
+        eprintln!(
+            "BD-PSNR ours (q{}) vs x265 (q{}): {bd:+.3} dB",
+            qps_str(&our_qps),
+            qps_str(&x265_qps),
+        );
+        eprintln!(
+            "BD-PSNR-YUV ours (q{}) vs x265 (q{}): {bd_yuv:+.3} dB",
+            qps_str(&our_qps),
+            qps_str(&x265_qps),
+        );
+        let aligned = cand_extrap <= EXTRAP_LIMIT
+            && anc_extrap <= EXTRAP_LIMIT
+            && cand_extrap_yuv <= EXTRAP_LIMIT
+            && anc_extrap_yuv <= EXTRAP_LIMIT;
+        if aligned || round == 2 {
+            break;
+        }
+        // Re-estimate the shift from the geometric-mean bit ratio of the two
+        // full curves, then rebuild the ladder.
+        let delta = (6.0 * (gm(&mine) / gm(&theirs)).log2()).round() as i32;
+        shift += delta;
+        eprintln!(
+            "alignment round {}: shift {delta:+} -> {shift:+} \
+             (gm ours {:.1} Mbit vs x265 {:.1} Mbit)",
+            round + 1,
+            gm(&mine) / 1e6,
+            gm(&theirs) / 1e6,
+        );
+    }
 
     // A BD number over a range where the two QP ladders do not overlap is not a
     // measurement — the cubic is extrapolating, not interpolating. Fail loudly
     // with the side that is out of range instead of reporting a meaningless gap.
-    const EXTRAP_LIMIT: f64 = 0.20;
     let out_of_range = |c: f64, a: f64| {
         let mut parts = Vec::new();
         if c > EXTRAP_LIMIT {
