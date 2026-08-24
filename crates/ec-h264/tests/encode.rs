@@ -670,7 +670,7 @@ fn vaapi_decodes_our_stream() {
 /// against the rate it was asked for.
 #[test]
 fn real_library_frames_encode_and_decode_exactly() {
-    use ec_core::registry::{Decoder as _, Demuxer as _};
+    use ec_core::registry::Decoder as _;
 
     if !have_ffmpeg() {
         eprintln!("SKIP real_library_frames: no ffmpeg on PATH");
@@ -707,15 +707,7 @@ fn real_library_frames_encode_and_decode_exactly() {
     };
 
     // Decode a handful of real pictures.
-    let file = std::fs::File::open(&path).expect("source opens");
-    let mut demux =
-        ec_mp4::Mp4Demuxer::new(std::io::BufReader::new(file)).expect("ec-mp4 opens the file");
-    let (index, params) = demux
-        .streams()
-        .iter()
-        .find(|s| s.params.codec == ec_core::registry::CodecId::H264)
-        .map(|s| (s.index, s.params.clone()))
-        .expect("an H.264 track");
+    let (params, mut demux, index) = open_h264_source(std::ffi::OsStr::new(&path));
     let mut dec = ec_h264::H264Decoder::new(params).expect("decoder");
     let mut sources: Vec<Planes> = Vec::new();
     while sources.len() < 12 {
@@ -778,21 +770,75 @@ fn real_library_frames_encode_and_decode_exactly() {
     assert!(quality > 30.0, "luma PSNR {quality:.2} dB at 8 Mbit/s");
 }
 
-/// The first `want` pictures a second apart from one of the user's media
-/// files: demuxed by ec-mp4, decoded by this crate, every Nth frame with N the
-/// source frame rate. Returns the luma/chroma size and the pictures.
-fn clip_sources(path: &std::ffi::OsStr, want: usize) -> (usize, usize, Vec<Planes>) {
-    use ec_core::registry::{Decoder as _, Demuxer as _};
+/// Opens `path` by probing its bytes — MP4 carries an `ftyp` box at offset 4,
+/// Matroska starts with EBML magic `1A 45 DF A3` — never by extension. Returns
+/// the first H.264 video track's codec parameters (whose `extradata` is the
+/// avcC or CodecPrivate) and a boxed demuxer plus the track's stream index.
+///
+/// A video track that is not H.264 (AV1, HEVC, …) is refused with a message
+/// naming the codec, never a panic inside the demuxer.
+fn open_h264_source(
+    path: &std::ffi::OsStr,
+) -> (
+    ec_core::registry::CodecParameters,
+    Box<dyn ec_core::registry::Demuxer>,
+    u32,
+) {
+    use std::io::{Read, Seek, SeekFrom};
 
     let file = std::fs::File::open(path).expect("source opens");
-    let mut demux =
-        ec_mp4::Mp4Demuxer::new(std::io::BufReader::new(file)).expect("ec-mp4 opens the file");
-    let (index, params) = demux
-        .streams()
+    let mut reader = std::io::BufReader::new(file);
+    // corner-cut: a 12-byte probe reads only the two magics this gate opens
+    // — 'ftyp' at 4 for MP4, EBML at 0 for Matroska. A third container this
+    // crate grows to support would need its own magic here; upgrade by
+    // extending the if-chain.
+    let mut head = [0u8; 12];
+    let n = reader.read(&mut head).expect("read container head");
+    reader.seek(SeekFrom::Start(0)).expect("rewind");
+
+    let demux: Box<dyn ec_core::registry::Demuxer> = if ec_matroska::is_matroska(&head[..n]) {
+        Box::new(ec_matroska::MatroskaDemuxer::new(reader).expect("ec-matroska opens the file"))
+    } else if n >= 8 && &head[4..8] == b"ftyp" {
+        Box::new(ec_mp4::Mp4Demuxer::new(reader).expect("ec-mp4 opens the file"))
+    } else {
+        panic!(
+            "{}: not an MP4 or Matroska container",
+            path.to_string_lossy()
+        )
+    };
+
+    let streams = demux.streams();
+    if let Some((params, index)) = streams
         .iter()
         .find(|s| s.params.codec == ec_core::registry::CodecId::H264)
-        .map(|s| (s.index, s.params.clone()))
-        .expect("an H.264 track");
+        .map(|s| (s.params.clone(), s.index))
+    {
+        return (params, demux, index);
+    }
+    // No H.264 track: name what the video track actually is, so an AV1 or
+    // HEVC file is refused clearly rather than panicking inside a find.
+    if let Some(codec) = streams
+        .iter()
+        .find(|s| matches!(s.params.media, ec_core::registry::MediaParameters::Video(_)))
+        .map(|s| s.params.codec)
+    {
+        panic!(
+            "{}: video track is {:?}, not H.264 — this gate measures H.264 only",
+            path.to_string_lossy(),
+            codec
+        );
+    }
+    panic!("{}: no video track found", path.to_string_lossy());
+}
+
+/// The first `want` pictures a second apart from one of the user's media
+/// files: demuxed by [`open_h264_source`] (MP4 or Matroska), decoded by this
+/// crate, every Nth frame with N the source frame rate. Returns the
+/// luma/chroma size and the pictures.
+fn clip_sources(path: &std::ffi::OsStr, want: usize) -> (usize, usize, Vec<Planes>) {
+    use ec_core::registry::Decoder as _;
+
+    let (params, mut demux, index) = open_h264_source(path);
     let video = match &params.media {
         ec_core::registry::MediaParameters::Video(v) => v,
         _ => panic!("the H.264 track carries no video parameters"),
