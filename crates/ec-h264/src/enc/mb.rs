@@ -601,6 +601,34 @@ fn intra_pre_cost(
 /// below a half and falls away above it.
 const MV_BITS_WEIGHT: f64 = 0.5;
 
+/// The offsets the whole-sample search steps through, in units of the current
+/// step size.
+///
+/// A square, not a cross. The cross this used to be could only walk along an
+/// axis, so a diagonally moving macroblock had to be reached in two steps
+/// through a point that was worse than both -- and a step search stops at the
+/// first point it cannot improve on. Adding the four diagonals is worth 0.032
+/// dB BD-PSNR-YUV on the film clip and 0.041 on the screen capture for twice
+/// the candidates in the whole-sample stage, which is the cheap stage: it reads
+/// the reference in place and never interpolates.
+///
+/// The step the walk starts from was swept with it, at 4, 8 and 16 whole
+/// samples: -0.580/-0.580/-0.593 dB on the film clip and -0.474/-0.493/-0.529
+/// on the screen capture. Four is screen capture's optimum and inside film's
+/// flat part -- a wider opening step is not a wider search here, it just lands
+/// the walk further from the seeds, which are already the answer most of the
+/// time.
+const ME_PATTERN: [(i16, i16); 8] = [
+    (1, 0),
+    (-1, 0),
+    (0, 1),
+    (0, -1),
+    (1, 1),
+    (-1, -1),
+    (1, -1),
+    (-1, 1),
+];
+
 /// What the search charges P_8x8 for its own signalling, against the six bits
 /// a 16x8 or 8x16 is charged: an mb_type that is one bin longer plus four
 /// sub_mb_type bins, before the four predictors' own mvd.
@@ -871,7 +899,8 @@ fn choose_inter(pic: &Picture, e: &MbEnc<'_>, mb_x: usize, mb_y: usize) -> Inter
                 let mut improved = true;
                 while improved {
                     improved = false;
-                    for (dx, dy) in [(step, 0), (-step, 0), (0, step), (0, -step)] {
+                    for (dx, dy) in ME_PATTERN {
+                        let (dx, dy) = (dx * step, dy * step);
                         let cand = [best.0[0] + dx, best.0[1] + dy];
                         if (cand[0] - mvp[0]).abs() > range * 4
                             || (cand[1] - mvp[1]).abs() > range * 4
