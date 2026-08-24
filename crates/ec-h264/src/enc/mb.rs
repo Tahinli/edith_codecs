@@ -698,6 +698,22 @@ impl PShape {
     }
 }
 
+/// How much the two chroma planes weigh against luma in the inter decision.
+///
+/// Swept at 0, 0.25, 0.5, 1 and 2, read on BD-PSNR-YUV because a luma-only
+/// metric cannot price a term whose whole purpose is chroma: the film clip
+/// reads -0.653/-0.622/-0.612/-0.615/-0.626 dB and the screen capture
+/// -0.517/-0.521/-0.515/-0.521/-0.546. A half is film's optimum and inside
+/// screen capture's flat part; zero reproduces the chroma-blind decision
+/// exactly, which is how the sweep proved the term was reaching the search.
+///
+/// It is worth 0.041 dB on the film clip and nothing on the screen capture --
+/// small enough to name what it rules out. Our chroma trails x264 by 0.5-0.9 dB
+/// per plane at every QP, and it is not because the vector was chosen without
+/// looking: weighting chroma up lifts chroma PSNR monotonically, and past a
+/// half the bits it spends cost more than the chroma it buys.
+const CHROMA_ME_WEIGHT: f64 = 0.5;
+
 /// The inter decision for a P macroblock.
 struct InterChoice {
     shape: PShape,
@@ -741,6 +757,60 @@ fn choose_inter(pic: &Picture, e: &MbEnc<'_>, mb_x: usize, mb_y: usize) -> Inter
     };
     let (sx, sy) = (mb_x * 16, mb_y * 16);
     let sw = e.src.stride;
+
+    // What the two chroma planes cost under a candidate vector, in the same
+    // SATD domain the luma search ranks in. The search itself cannot afford
+    // this -- it runs on SAD over a whole neighbourhood -- but the handful of
+    // candidates that survive to the shape decision can, and until they did,
+    // no decision in this encoder had ever looked at chroma: the vector, the
+    // shape and the skip flag were all chosen on luma alone and chroma was
+    // coded against whatever came out. Measured per plane against x264 that
+    // showed up as a uniform 0.5-0.9 dB chroma deficit at every QP while we
+    // spent more bits, which is a prediction that was never asked about.
+    let cplanes = [&reference.cb, &reference.cr];
+    let chroma_satd = |px: usize, py: usize, w: usize, h: usize, mv: [i16; 2]| -> i32 {
+        if CHROMA_ME_WEIGHT == 0.0 {
+            return 0;
+        }
+        let mut buf = [0u8; 64];
+        let mut sum = 0;
+        for comp in 0..2 {
+            let src = cplanes[comp];
+            let rp = RefPlane {
+                data: &src.data,
+                stride: src.stride,
+                origin: src.origin,
+                width: src.width,
+                height: src.height,
+                pad: src.pad,
+            };
+            let (cw, ch) = (w / 2, h / 2);
+            mc_chroma(
+                &rp,
+                (sx + px) as i32 / 2,
+                (sy + py) as i32 / 2,
+                mv,
+                cw,
+                ch,
+                cw,
+                &mut buf,
+            );
+            let plane = if comp == 0 { &e.src.u } else { &e.src.v };
+            sum += satd_block(
+                plane,
+                e.src.c_stride,
+                (sx + px) / 2,
+                (sy + py) / 2,
+                &buf,
+                cw,
+                0,
+                cw,
+                ch,
+            );
+        }
+        (f64::from(sum) * CHROMA_ME_WEIGHT) as i32
+    };
+
     let range = match e.preset {
         Preset::Fast => 16i16,
         Preset::Balanced => 48,
@@ -858,6 +928,7 @@ fn choose_inter(pic: &Picture, e: &MbEnc<'_>, mb_x: usize, mb_y: usize) -> Inter
 
     let seeds = [mvp, skip_mv, [0, 0], n[0].mv, n[1].mv, n[2].mv];
     let (mv16, cost16) = search(0, 0, 16, 16, mvp, &seeds);
+    let cost16 = cost16 + chroma_satd(0, 0, 16, 16, mv16);
     let skip_cost = {
         let mut buf = [0u8; 256];
         mc_luma(&plane, sx as i32, sy as i32, skip_mv, 16, 16, 16, &mut buf);
@@ -871,7 +942,8 @@ fn choose_inter(pic: &Picture, e: &MbEnc<'_>, mb_x: usize, mb_y: usize) -> Inter
         // read -1.216/-1.154/-1.182/-1.373 on film and -0.970/-0.696/-0.591/
         // -0.562 on screen capture, so three quarters is film's optimum and
         // inside screen capture's flat part.
-        satd_block(&e.src.y, sw, sx, sy, &buf, 16, 0, 16, 16) - motion_rate(e, 2.0)
+        satd_block(&e.src.y, sw, sx, sy, &buf, 16, 0, 16, 16) + chroma_satd(0, 0, 16, 16, skip_mv)
+            - motion_rate(e, 2.0)
     };
 
     let mut best = (PShape::Whole, [mv16; 4], cost16);
@@ -932,7 +1004,7 @@ fn choose_inter(pic: &Picture, e: &MbEnc<'_>, mb_x: usize, mb_y: usize) -> Inter
                 let seeds = [mv16, part_mvp, mvp, skip_mv, [0, 0]];
                 let (mv, cost) = search(bx * 4, by * 4, w, h, part_mvp, &seeds);
                 mvs[part] = mv;
-                total += cost;
+                total += cost + chroma_satd(bx * 4, by * 4, w, h, mv);
             }
             if total < best.2 {
                 best = (shape, mvs, total);
