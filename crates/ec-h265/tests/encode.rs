@@ -13,16 +13,23 @@ use ec_h265::encoder::{Encoder, EncoderConfig, RateControl};
 type Planes = (Vec<u8>, Vec<u8>, Vec<u8>);
 
 /// Floor for [`bd_psnr_vs_x265`] on the synthetic clip. Calibrated on the
-/// measured value with 0.15 dB of room for platform noise, so the distance can
+/// measured value with 0.15 dB of room for platform noise, so the advantage can
 /// shrink but not grow unnoticed; it is not a claim that the number is fine.
 ///
-/// Measured -38.258 dB luma / -31.656 dB YUV on the first run (352x288, 24
-/// pictures of `Clip::render_smooth`, QP 22/26/30/34, both sides decoded
-/// through ffmpeg, union-range BD-PSNR). The gap is wide because this encoder
-/// spends 40-70% fewer bits than x265 at every QP, so its curve sits below
-/// x265's and the cubic fit extrapolates; the union-range integral is the
-/// handoff's chosen convention for that case.
-const BD_PSNR_VS_X265_FLOOR: f64 = -38.41;
+/// Measured +2.456 dB luma / +3.158 dB YUV on the recalibrated run (352x288,
+/// 24 pictures of `Clip::render_smooth`, ours at QP 16/20/24/28, x265 at QP
+/// 22/26/30/34, both sides decoded through ffmpeg, union-range BD-PSNR, 0%
+/// extrapolation both sides). Our encoder is leaner than x265 — it spends fewer
+/// bits at matched QP — so the QP ladders are offset to make the bitrate ranges
+/// overlap; at matched bitrate our PSNR is higher on this smooth synthetic clip.
+///
+/// Previous run measured -38.258 dB luma with both sides at QP 22/26/30/34;
+/// that number was meaningless — the curves did not overlap (50% extrapolation
+/// on our side) because x265's `-qp` was thought not to reach its rate control.
+/// In fact `-qp` and `rc=cqp:qp=N` produce identical output; the shallow
+/// rate-quality slope was genuine for this clip, and the fix was to offset the
+/// QP ladders, not to change x265's rate control.
+const BD_PSNR_VS_X265_FLOOR: f64 = 2.306;
 
 /// A synthetic source with real structure: smooth gradients, a band of
 /// sinusoidal texture and a translating box, so prediction matters — the half
@@ -195,14 +202,18 @@ fn cubic_integral(c: [f64; 4], x: f64) -> f64 {
 ///
 /// The h264 gate's encoders land in the same bitrate band at the same QP, so
 /// the intersection is non-empty and the standard Bjøntegaard cubic integral
-/// over it is well defined. Our h265 encoder is leaner than x265 on the
-/// synthetic clip — it spends fewer bits at every QP — so its entire curve
-/// sits below x265's and the intersection is empty. Clipping to the
-/// intersection would leave no range to integrate over; expanding to the
-/// union lets the cubic fit extrapolate the curve that doesn't reach a given
-/// bitrate, which is the same polynomial either way. The extrapolation is
-/// reported alongside the number so a wild cubic can't pass silently.
-fn bd_psnr_delta(candidate: &[(f64, f64)], anchor: &[(f64, f64)]) -> f64 {
+/// over it is well defined. Our h265 encoder is leaner than x265 at matched QP
+/// — it spends fewer bits — so our QP sweep is shifted below x265's to make
+/// the bitrate ranges overlap. The union range is kept (not clipped to the
+/// intersection) so the extrapolation share can be measured: if either curve
+/// is extrapolated over more than 20% of the range, the test fails with a
+/// named message instead of reporting a BD number that is a cubic guess, not
+/// a measurement. The extrapolation shares are returned alongside the number.
+///
+/// Returns `(bd, cand_extrap, anc_extrap)` where the extrap shares are the
+/// fraction of the integration range that each curve's measured bitrate span
+/// does not cover (0 = fully measured, 1 = entirely extrapolated).
+fn bd_psnr_delta(candidate: &[(f64, f64)], anchor: &[(f64, f64)]) -> (f64, f64, f64) {
     let xs_candidate = std::array::from_fn(|i| candidate[i].0.ln());
     let ys_candidate = std::array::from_fn(|i| candidate[i].1);
     let xs_anchor = std::array::from_fn(|i| anchor[i].0.ln());
@@ -236,11 +247,12 @@ fn bd_psnr_delta(candidate: &[(f64, f64)], anchor: &[(f64, f64)]) -> f64 {
     eprintln!(
         "  cubic extrapolation: candidate {cand_extrap:.0}% anchor {anc_extrap:.0}% of measured range"
     );
-    (cubic_integral(c_candidate, hi)
+    let bd = (cubic_integral(c_candidate, hi)
         - cubic_integral(c_candidate, lo)
         - cubic_integral(c_anchor, hi)
         + cubic_integral(c_anchor, lo))
-        / (hi - lo)
+        / (hi - lo);
+    (bd, cand_extrap, anc_extrap)
 }
 
 fn have_ffmpeg() -> bool {
@@ -321,12 +333,15 @@ fn x265_encode_qp(sources: &[Planes], w: usize, h: usize, qp: i32) -> Option<Vec
     // names: psychovisual (psy-rd, psy-rdoq) and adaptive (aq-mode) tools off,
     // plus the in-loop filters x265 adds and x264 does not have (no-sao,
     // no-deblock), plus RDOQ off (rdoq-level=0) so the quantiser spends bits
-    // the same way ours does. EC_H265_X265_PARAMS appends to attribute a single
-    // feature the same way EC_H264_X264_PARAMS does.
+    // the same way ours does. The quantiser goes inside the param string as
+    // `rc=cqp:qp=N` because ffmpeg's `-qp` flag does not reach libx265's rate
+    // control — without `rc=cqp` x265 defaults to ABR and its bitrate barely
+    // moves across a 12-QP span. EC_H265_X265_PARAMS appends to attribute a
+    // single feature the same way EC_H264_X264_PARAMS does.
     let params = format!(
-        "keyint=1:bframes=0:scenecut=0:rc-lookahead=0:no-sao:no-deblock:aq-mode=0:\
-         psy-rd=0:psy-rdoq=0:rdoq-level=0:tu-intra-depth=1:ipratio=1.0:pbratio=1.0:\
-         qcomp=1.0:chroma-qp-offset=0{}",
+        "rc=cqp:qp={qp}:keyint=1:bframes=0:scenecut=0:rc-lookahead=0:no-sao:no-deblock:\
+         aq-mode=0:psy-rd=0:psy-rdoq=0:rdoq-level=0:tu-intra-depth=1:ipratio=1.0:\
+         pbratio=1.0:qcomp=1.0:chroma-qp-offset=0{}",
         match std::env::var("EC_H265_X265_PARAMS") {
             Ok(extra) if !extra.trim().trim_matches(':').is_empty() =>
                 format!(":{}", extra.trim().trim_matches(':')),
@@ -341,7 +356,6 @@ fn x265_encode_qp(sources: &[Planes], w: usize, h: usize, qp: i32) -> Option<Vec
         .arg(&raw)
         .args(["-c:v", "libx265", "-preset", "medium"])
         .args(["-x265-params", &params])
-        .args(["-qp", &qp.to_string()])
         .args(["-f", "hevc"])
         .arg(&out)
         .status()
@@ -350,13 +364,17 @@ fn x265_encode_qp(sources: &[Planes], w: usize, h: usize, qp: i32) -> Option<Vec
     if !status.success() {
         return None;
     }
-    std::fs::read(&out).ok()
+    let stream = std::fs::read(&out).ok();
+    let _ = std::fs::remove_file(&out);
+    stream
 }
 
-/// BD-PSNR of this encoder against x265 at matched features over QP
-/// 22/26/30/34. Runs on the synthetic clip by default, so the number cannot
-/// rot behind an `#[ignore]`; point `EC_H265_CLIP` at a media file to measure
-/// the same thing on real content.
+/// BD-PSNR of this encoder against x265 at matched features. Our encoder is
+/// leaner than x265 at every QP, so our sweep (16/20/24/28) is shifted below
+/// x265's (22/26/30/34) to make the bitrate ranges overlap and the cubic fit
+/// interpolate instead of extrapolate. Runs on the synthetic clip by default,
+/// so the number cannot rot behind an `#[ignore]`; point `EC_H265_CLIP` at a
+/// media file to measure the same thing on real content.
 ///
 /// Both curves are (bits, luma PSNR against the same source pictures), and
 /// both are measured on ffmpeg's decode of the stream rather than on an
@@ -489,29 +507,68 @@ fn bd_psnr_vs_x265() {
         ((stream.len() * 8) as f64, sum / n, sum_yuv / n)
     };
 
-    let qps = [22, 26, 30, 34];
-    let mine: Vec<_> = qps.iter().map(|&q| ours(q)).collect();
-    let theirs: Vec<_> = qps.iter().map(|&q| x265(q)).collect();
-    for (i, &qp) in qps.iter().enumerate() {
+    // Our encoder is leaner than x265 at every QP — it spends fewer bits on
+    // the same content — so at matched QP our entire curve sits below x265's.
+    // Widening our sweep to lower QPs pushes our bitrate up into x265's range
+    // so the cubic fit interpolates instead of extrapolating. x265 stays at
+    // 22/26/30/34; ours drops to 16/20/24/28 to meet it.
+    let our_qps = [16, 20, 24, 28];
+    let x265_qps = [22, 26, 30, 34];
+    let mine: Vec<_> = our_qps.iter().map(|&q| ours(q)).collect();
+    let theirs: Vec<_> = x265_qps.iter().map(|&q| x265(q)).collect();
+    for (i, &qp) in our_qps.iter().enumerate() {
         let (ob, op, oy) = mine[i];
+        eprintln!("qp {qp}: ours {ob:.0} bits {op:.2} dB ({oy:.2} yuv)");
+    }
+    for (i, &qp) in x265_qps.iter().enumerate() {
         let (xb, xp, xy) = theirs[i];
-        eprintln!(
-            "qp {qp}: ours {ob:.0} bits {op:.2} dB ({oy:.2} yuv) | x265 {xb:.0} bits {xp:.2} dB \
-             ({xy:.2} yuv) ({:+.1}% bits, {:+.2} dB, {:+.2} yuv)",
-            (ob / xb - 1.0) * 100.0,
-            op - xp,
-            oy - xy
-        );
+        eprintln!("qp {qp}: x265 {xb:.0} bits {xp:.2} dB ({xy:.2} yuv)");
     }
     let curve = |v: &[(f64, f64, f64)], luma: bool| -> Vec<(f64, f64)> {
         v.iter()
             .map(|&(b, p, y)| (b, if luma { p } else { y }))
             .collect()
     };
-    let bd = bd_psnr_delta(&curve(&mine, true), &curve(&theirs, true));
-    let bd_yuv = bd_psnr_delta(&curve(&mine, false), &curve(&theirs, false));
-    eprintln!("BD-PSNR ours vs x265 over q22/26/30/34: {bd:+.3} dB");
-    eprintln!("BD-PSNR-YUV ours vs x265 over q22/26/30/34: {bd_yuv:+.3} dB");
+    let (bd, cand_extrap, anc_extrap) = bd_psnr_delta(&curve(&mine, true), &curve(&theirs, true));
+    let (bd_yuv, cand_extrap_yuv, anc_extrap_yuv) =
+        bd_psnr_delta(&curve(&mine, false), &curve(&theirs, false));
+    eprintln!("BD-PSNR ours (q16/20/24/28) vs x265 (q22/26/30/34): {bd:+.3} dB");
+    eprintln!("BD-PSNR-YUV ours (q16/20/24/28) vs x265 (q22/26/30/34): {bd_yuv:+.3} dB");
+
+    // A BD number over a range where the two QP ladders do not overlap is not a
+    // measurement — the cubic is extrapolating, not interpolating. Fail loudly
+    // with the side that is out of range instead of reporting a meaningless gap.
+    const EXTRAP_LIMIT: f64 = 0.20;
+    let out_of_range = |c: f64, a: f64| {
+        let mut parts = Vec::new();
+        if c > EXTRAP_LIMIT {
+            parts.push(format!("ours {:.0}%", c * 100.0));
+        }
+        if a > EXTRAP_LIMIT {
+            parts.push(format!("x265 {:.0}%", a * 100.0));
+        }
+        parts
+    };
+    let luma_oor = out_of_range(cand_extrap, anc_extrap);
+    let yuv_oor = out_of_range(cand_extrap_yuv, anc_extrap_yuv);
+    if !luma_oor.is_empty() {
+        panic!(
+            "BD-PSNR luma: the two QP ladders do not overlap — {} of the \
+             integration range is extrapolated (limit {:.0}%); widen the QP \
+             sweep until the curves meet",
+            luma_oor.join(", "),
+            EXTRAP_LIMIT * 100.0
+        );
+    }
+    if !yuv_oor.is_empty() {
+        panic!(
+            "BD-PSNR-YUV: the two QP ladders do not overlap — {} of the \
+             integration range is extrapolated (limit {:.0}%); widen the QP \
+             sweep until the curves meet",
+            yuv_oor.join(", "),
+            EXTRAP_LIMIT * 100.0
+        );
+    }
 
     // The floor is calibrated on the synthetic clip; a clip of the user's is a
     // measurement, not a gate, because its content is not pinned.
