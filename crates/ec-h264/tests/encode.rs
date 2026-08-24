@@ -147,6 +147,35 @@ fn planes_of(frame: &ec_core::frame::VideoFrame) -> Planes {
     (y, u, v)
 }
 
+/// Mean squared error between two equal-length planes.
+fn plane_mse(a: &[u8], b: &[u8]) -> f64 {
+    a.iter()
+        .zip(b)
+        .map(|(&x, &y)| {
+            let d = f64::from(x) - f64::from(y);
+            d * d
+        })
+        .sum::<f64>()
+        / a.len() as f64
+}
+
+/// PSNR over all three planes, pooled by sample count the way x264 reports it:
+/// for 4:2:0 that weights luma 6 and each chroma plane 1. A luma-only number
+/// rewards an encoder for throwing chroma away — a chroma decision measured
+/// against it will always say "code less" — so any decision that can move
+/// chroma bits is read here instead.
+fn psnr_yuv(a: &(Vec<u8>, Vec<u8>, Vec<u8>), b: &(Vec<u8>, Vec<u8>, Vec<u8>)) -> f64 {
+    let (n_y, n_c) = (a.0.len() as f64, a.1.len() as f64);
+    let sse =
+        plane_mse(&a.0, &b.0) * n_y + plane_mse(&a.1, &b.1) * n_c + plane_mse(&a.2, &b.2) * n_c;
+    let mse = sse / (n_y + 2.0 * n_c);
+    if mse == 0.0 {
+        99.0
+    } else {
+        10.0 * (255.0 * 255.0 / mse).log10()
+    }
+}
+
 fn psnr(a: &[u8], b: &[u8]) -> f64 {
     let mse: f64 = a
         .iter()
@@ -1054,6 +1083,11 @@ fn bd_psnr_vs_x264() {
             .zip(&decoded)
             .map(|((y, _, _), (dy, _, _))| psnr(y, dy))
             .sum();
+        let sum_yuv: f64 = sources
+            .iter()
+            .zip(&decoded)
+            .map(|(s, d)| psnr_yuv(s, d))
+            .sum();
         let (decoded_psnr, recon_psnr) =
             (sum / sources.len() as f64, sum_recon / sources.len() as f64);
         assert!(
@@ -1061,7 +1095,11 @@ fn bd_psnr_vs_x264() {
             "qp {qp}: our reconstruction reads {recon_psnr:.2} dB but our own \
              stream decodes to {decoded_psnr:.2} dB"
         );
-        ((stream.len() * 8) as f64, decoded_psnr)
+        (
+            (stream.len() * 8) as f64,
+            decoded_psnr,
+            sum_yuv / sources.len() as f64,
+        )
     };
     let x264 = |qp: i32| {
         let stream = x264_encode_qp(&sources, w, h, qp, gop).expect("x264 encodes");
@@ -1078,24 +1116,38 @@ fn bd_psnr_vs_x264() {
             .zip(&decoded)
             .map(|((y, _, _), (dy, _, _))| psnr(y, dy))
             .sum();
-        ((stream.len() * 8) as f64, sum / sources.len() as f64)
+        let sum_yuv: f64 = sources
+            .iter()
+            .zip(&decoded)
+            .map(|(s, d)| psnr_yuv(s, d))
+            .sum();
+        let n = sources.len() as f64;
+        ((stream.len() * 8) as f64, sum / n, sum_yuv / n)
     };
 
     let qps = [22, 26, 30, 34];
     let mine: Vec<_> = qps.iter().map(|&q| ours(q)).collect();
     let theirs: Vec<_> = qps.iter().map(|&q| x264(q)).collect();
     for (i, &qp) in qps.iter().enumerate() {
-        let (ob, op) = mine[i];
-        let (xb, xp) = theirs[i];
+        let (ob, op, oy) = mine[i];
+        let (xb, xp, xy) = theirs[i];
         eprintln!(
-            "qp {qp}: ours {ob:.0} bits {op:.2} dB | x264 {xb:.0} bits {xp:.2} dB \
-             ({:+.1}% bits, {:+.2} dB)",
+            "qp {qp}: ours {ob:.0} bits {op:.2} dB ({oy:.2} yuv) | x264 {xb:.0} bits {xp:.2} dB \
+             ({xy:.2} yuv) ({:+.1}% bits, {:+.2} dB, {:+.2} yuv)",
             (ob / xb - 1.0) * 100.0,
-            op - xp
+            op - xp,
+            oy - xy
         );
     }
-    let bd = bd_psnr_delta(&mine, &theirs);
+    let curve = |v: &[(f64, f64, f64)], luma: bool| -> Vec<(f64, f64)> {
+        v.iter()
+            .map(|&(b, p, y)| (b, if luma { p } else { y }))
+            .collect()
+    };
+    let bd = bd_psnr_delta(&curve(&mine, true), &curve(&theirs, true));
+    let bd_yuv = bd_psnr_delta(&curve(&mine, false), &curve(&theirs, false));
     eprintln!("BD-PSNR ours vs x264 over q22/26/30/34: {bd:+.3} dB");
+    eprintln!("BD-PSNR-YUV ours vs x264 over q22/26/30/34: {bd_yuv:+.3} dB");
 
     // The floor is calibrated on the synthetic clip; a clip of the user's is a
     // measurement, not a gate, because its content is not pinned.
