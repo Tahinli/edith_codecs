@@ -1141,6 +1141,19 @@ fn code_luma_4x4(
 /// plausible six.
 const CBP_BIT: f64 = 6.0;
 
+/// What chroma pays to take its coded_block_pattern from one to two, in bits,
+/// on top of the levels: the pattern bins themselves plus a coded_block_flag
+/// for every AC block that then has to say it is empty.
+///
+/// Swept at 0, 4, 8, 16, 32 and 64 bits, read on the all-plane PSNR because a
+/// luma-only one cannot see what this decision spends: -0.688/-0.681/-0.659/
+/// -0.653/-0.670/-0.742 dB BD on the film clip and -0.537/-0.527/-0.530/
+/// -0.517/-0.524/-0.522 on the screen capture. Both turn over at sixteen. The
+/// same sweep read on luma alone climbs all the way to +0.079 dB at 64,
+/// because past the turn the test is buying luma bits by throwing chroma
+/// away -- which is exactly the trade an all-plane metric exists to catch.
+const CBP_CHROMA_BIT: f64 = 16.0;
+
 /// How much of the mode-decision lambda the group test uses.
 ///
 /// The 8x8 transform path was swept the same way and does not want this test
@@ -1442,6 +1455,7 @@ fn code_chroma(
     let qp_c = chroma_qp(qp_y);
     let mut dc_lists = [[0i32; 4]; 2];
     let mut ac = [[[0i32; 16]; 4]; 2];
+    let mut srcs = [[[0i32; 16]; 4]; 2];
     let mut any_ac = false;
     for comp in 0..2 {
         let (plane, src) = if comp == 0 {
@@ -1461,6 +1475,7 @@ fn code_chroma(
                 }
             }
             let source = d;
+            srcs[comp][blk] = d;
             forward_4x4(&mut d);
             dc_lists[comp][blk] = d[0];
             let rdoq = !intra && w.is_cabac();
@@ -1510,6 +1525,51 @@ fn code_chroma(
             if nz > 0 {
                 any_ac = true;
             }
+        }
+    }
+    // The chroma pattern is one decision for all eight AC blocks: a single
+    // surviving block takes coded_block_pattern from one to two, and every
+    // other block then has to code a coded_block_flag to say it is empty. So
+    // the same group test luma runs over four blocks runs here over all eight,
+    // against the same lambda.
+    if any_ac {
+        let (mut ssd_zero, mut ssd_coded, mut rate) = (0i64, 0i64, 0f64);
+        for comp in 0..2 {
+            for blk in 0..4 {
+                let source = &srcs[comp][blk];
+                let mut resid = [0i32; 16];
+                if lv.chroma_nz[comp][blk] > 0 {
+                    let mut raster = [0i32; 16];
+                    unzigzag_ac15(&ac[comp][blk], &mut raster);
+                    dequant_4x4(&mut raster, &e.ls, qp_c, true);
+                    inverse_transform_4x4(&raster, &mut resid);
+                    rate += match w.residual_block_cost(
+                        &ac[comp][blk],
+                        BlockCat::ChromaAc,
+                        Some(1),
+                        Some(1),
+                    ) {
+                        Some(bits) => f64::from(bits) / 256.0,
+                        None => block_bits(&ac[comp][blk]) as f64,
+                    };
+                }
+                for i in 0..16 {
+                    let z = i64::from(source[i]);
+                    let c = i64::from(source[i] - resid[i]);
+                    ssd_zero += z * z;
+                    ssd_coded += c * c;
+                }
+            }
+        }
+        let lambda = if w.is_cabac() {
+            GROUP_LAMBDA * lambda_ssd(qp_c)
+        } else {
+            zero_block_lambda(e, qp_c, false)
+        };
+        if ssd_coded as f64 + lambda * (rate + CBP_CHROMA_BIT) >= ssd_zero as f64 {
+            ac = [[[0; 16]; 4]; 2];
+            lv.chroma_nz = [[0; 4]; 2];
+            any_ac = false;
         }
     }
     let mut any_dc = false;
