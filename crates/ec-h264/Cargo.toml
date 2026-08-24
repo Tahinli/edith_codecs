@@ -21,3 +21,4 @@ ec-h264-syntax = { workspace = true }
 # ... and demuxes an MP4 directly where ffmpeg's own Annex B extraction of it
 # produces a stream ffmpeg then cannot decode.
 ec-mp4 = { workspace = true }
+ec-matroska = { workspace = true }
