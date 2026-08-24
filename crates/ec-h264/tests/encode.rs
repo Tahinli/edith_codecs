@@ -980,7 +980,13 @@ fn x264_encode_qp(sources: &[Planes], w: usize, h: usize, qp: i32, gop: u32) -> 
             &format!(
                 "scenecut=0:aq-mode=0:psy=0:8x8dct=0:ipratio=1.0:pbratio=1.0:qcomp=1.0:chroma-qp-offset=0{}",
                 match std::env::var("EC_H264_X264_PARAMS") {
-                    Ok(extra) if !extra.trim().is_empty() => format!(":{}", extra.trim()),
+                    // The value may or may not carry its own leading colon;
+                    // both spell the same thing. Passing it through would not:
+                    // ffmpeg drops the token after an empty one, so "::subme=1"
+                    // silently encodes at the preset's subme and the sweep
+                    // reads as "the feature does nothing".
+                    Ok(extra) if !extra.trim().trim_matches(':').is_empty() =>
+                        format!(":{}", extra.trim().trim_matches(':')),
                     _ => String::new(),
                 }
             ),
@@ -1088,6 +1094,23 @@ fn bd_psnr_vs_x264() {
             .zip(&decoded)
             .map(|(s, d)| psnr_yuv(s, d))
             .sum();
+        let (sum_u, sum_v) = (
+            sources
+                .iter()
+                .zip(&decoded)
+                .map(|(s, d)| psnr(&s.1, &d.1))
+                .sum::<f64>(),
+            sources
+                .iter()
+                .zip(&decoded)
+                .map(|(s, d)| psnr(&s.2, &d.2))
+                .sum::<f64>(),
+        );
+        eprintln!(
+            "    ours qp {qp}: u {:.2} dB v {:.2} dB",
+            sum_u / sources.len() as f64,
+            sum_v / sources.len() as f64
+        );
         let (decoded_psnr, recon_psnr) =
             (sum / sources.len() as f64, sum_recon / sources.len() as f64);
         assert!(
@@ -1122,6 +1145,21 @@ fn bd_psnr_vs_x264() {
             .map(|(s, d)| psnr_yuv(s, d))
             .sum();
         let n = sources.len() as f64;
+        eprintln!(
+            "    x264 qp {qp}: u {:.2} dB v {:.2} dB",
+            sources
+                .iter()
+                .zip(&decoded)
+                .map(|(s, d)| psnr(&s.1, &d.1))
+                .sum::<f64>()
+                / n,
+            sources
+                .iter()
+                .zip(&decoded)
+                .map(|(s, d)| psnr(&s.2, &d.2))
+                .sum::<f64>()
+                / n
+        );
         ((stream.len() * 8) as f64, sum / n, sum_yuv / n)
     };
 
