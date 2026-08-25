@@ -224,15 +224,15 @@ pub fn dc_key_frame_tile_levels(
                 dc_level,
                 dc_sign_ctx(above[c as usize], left),
                 &cdf::TXB_SKIP_LUMA_64,
-                &cdf::COEFF_BASE_EOB_LUMA_64,
+                &cdf::COEFF_BASE_EOB_LUMA_64_DC,
             );
 
             // Both chroma transform blocks are all-zero. Their planes carry no
             // coded coefficient anywhere in the frame, so the neighbour halves
             // of their context stay 0 and only the offset for a transform block
             // that covers its whole plane block is left: context 7.
-            enc.symbol_fixed(1, &cdf::TXB_SKIP_CHROMA_32);
-            enc.symbol_fixed(1, &cdf::TXB_SKIP_CHROMA_32);
+            enc.symbol_fixed(1, &cdf::TXB_SKIP_CHROMA_32_NONE);
+            enc.symbol_fixed(1, &cdf::TXB_SKIP_CHROMA_32_NONE);
 
             above[c as usize] = Some(negative);
             left = Some(negative);
@@ -278,6 +278,8 @@ pub fn split_dc_key_frame_tile(
             // it, and an uncoded one leaves it clear, so the context is just
             // which neighbours exist. The 32x32 blocks below read a bit their
             // own size leaves clear, so their context is 0 throughout.
+            // Every superblock here is split, so an existing neighbour always
+            // sets that bit.
             let ctx = 2 * usize::from(sb_c > 0) + usize::from(sb_r > 0);
             enc.symbol_fixed(PARTITION_SPLIT, &cdf::PARTITION_W64[ctx]);
 
@@ -412,6 +414,39 @@ const CHROMA_16: TxbCoding = TxbCoding {
     dc_sign: &cdf::DC_SIGN_CHROMA,
 };
 
+/// The luma all-zero flag of a 64x64 transform, whose one context is fixed the
+/// way [`TXB_SKIP_LUMA_32_CTX`] is.
+const TXB_SKIP_LUMA_64_CTX: [[u16; 3]; 1] = [cdf::TXB_SKIP_LUMA_64];
+
+/// The 64x64 luma transform of a whole superblock. Only its top-left 32x32
+/// carries coefficients, so it is scanned and its end-of-block position read
+/// as a 32x32 transform is; what it does not share with [`LUMA_32`] is every
+/// coefficient CDF, which is indexed by the transform size.
+const LUMA_64: TxbCoding = TxbCoding {
+    side: TX32,
+    txb_skip: &TXB_SKIP_LUMA_64_CTX,
+    eob_pt: &cdf::EOB_PT_1024_LUMA,
+    eob_extra: &cdf::EOB_EXTRA_LUMA_64,
+    base: &cdf::COEFF_BASE_LUMA_64,
+    base_eob: &cdf::COEFF_BASE_EOB_LUMA_64,
+    // The base-range tail is the one table a 64x64 transform does not have of
+    // its own: the index is clamped at the 32x32 size, so it reads that row.
+    br: &cdf::COEFF_BR_LUMA_32,
+    dc_sign: &cdf::DC_SIGN_LUMA,
+};
+
+/// The 32x32 transform of either chroma plane of that superblock at 4:2:0.
+const CHROMA_32: TxbCoding = TxbCoding {
+    side: TX32,
+    txb_skip: &cdf::TXB_SKIP_CHROMA_32,
+    eob_pt: &cdf::EOB_PT_1024_CHROMA,
+    eob_extra: &cdf::EOB_EXTRA_CHROMA_32,
+    base: &cdf::COEFF_BASE_CHROMA_32,
+    base_eob: &cdf::COEFF_BASE_EOB_CHROMA_32,
+    br: &cdf::COEFF_BR_CHROMA_32,
+    dc_sign: &cdf::DC_SIGN_CHROMA,
+};
+
 /// What one coded block leaves behind for the blocks that read it as a
 /// neighbour: whether it coded anything at all, and the sign of its DC.
 #[derive(Clone, Copy, Default)]
@@ -443,42 +478,66 @@ fn check_blocks(mi_cols: u32, mi_rows: u32) -> Result<()> {
     Ok(())
 }
 
-/// Writes the payload of a one-tile key frame in which every superblock is
-/// split into 32x32 DC-predicted blocks, each carrying the coefficients
-/// `blocks` gives it.
+/// The coefficients of one superblock: either one 64x64 block covering it, or
+/// the four 32x32 blocks it is split into.
 ///
-/// `blocks` gives one coefficient set per 32x32 block in raster order across
-/// the frame. The frame need not be a whole number of superblocks: a
-/// superblock at the right-hand or bottom edge may be half outside it, and the
-/// blocks that would sit in the half outside are not coded. Each set carries a 32x32 luma transform and the 16x16 transform of
-/// each chroma plane; an empty list writes an all-zero transform block. Unlike
-/// the DC writers, the coefficients may sit anywhere in their transform, so a
-/// block here is a picture rather than a flat grey: a single coefficient off
-/// the origin decodes to the basis function it selects.
+/// A superblock at the right-hand or bottom edge of the frame may be half
+/// outside it, and such a superblock cannot be left whole — the spec has no
+/// partition that keeps a block outside the frame — so it must be
+/// [`Split`](Superblock::Split), and carries only the quadrants that are
+/// inside, in raster order among themselves.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Superblock {
+    /// One 64x64 block, whose luma transform is 64x64 — of which only the
+    /// top-left 32x32 carries coefficients — and whose chroma transforms are
+    /// 32x32 each at 4:2:0.
+    Whole(BlockCoeffs),
+    /// The 32x32 blocks the superblock is split into, each with a 32x32 luma
+    /// transform and a 16x16 transform per chroma plane.
+    Split(Vec<BlockCoeffs>),
+}
+
+/// Writes the payload of a one-tile key frame built from `superblocks`, each
+/// either one 64x64 block or the 32x32 blocks it splits into.
+///
+/// `superblocks` gives one entry per superblock in raster order across the
+/// frame. Every block is DC-predicted unless its [`BlockCoeffs::mode`] says
+/// otherwise, and carries the coefficients its lists give; the coefficients
+/// may sit anywhere in their transform, so a block is a picture rather than a
+/// flat grey.
 ///
 /// # Errors
-/// Returns an error when the frame is not a whole number of 32x32 blocks,
-/// when `blocks` does not carry exactly one set per 32x32 block,
-/// when a coefficient sits outside its transform, repeats a position, carries
-/// a zero level or one wider than the base and base-range syntax reach, or
-/// when `base_q_idx` is outside the q-context band whose default CDFs this
-/// crate carries.
-pub fn split_coeff_key_frame_tile(
+/// Returns an error when the frame is not a whole number of 32x32 blocks, when
+/// `superblocks` does not carry exactly one entry per superblock or an entry
+/// does not carry one block per quadrant inside the frame, when a superblock
+/// that is half outside the frame is left whole, when a block names an intra
+/// mode a key frame does not code, when a coefficient sits outside its
+/// transform, repeats a position, carries a zero level or one wider than the
+/// Golomb tail reaches, or when `base_q_idx` is outside the q-context band
+/// whose default CDFs this crate carries.
+pub fn sb_coeff_key_frame_tile(
     mi_cols: u32,
     mi_rows: u32,
     base_q_idx: u8,
-    blocks: &[BlockCoeffs],
+    superblocks: &[Superblock],
 ) -> Result<Vec<u8>> {
     check_blocks(mi_cols, mi_rows)?;
     let (cols, rows) = (mi_cols / BLOCK_MI, mi_rows / BLOCK_MI);
     let (sb_cols, sb_rows) = (cols.div_ceil(2), rows.div_ceil(2));
-    if blocks.len() != (cols * rows) as usize {
+    if superblocks.len() != (sb_cols * sb_rows) as usize {
         return Err(Error::unsupported(
             "AV1 tile",
-            "a coefficient key frame needs one coefficient set per 32x32 block",
+            "a coefficient key frame needs one entry per superblock",
         ));
     }
-    if let Some(bad) = blocks.iter().find(|b| usize::from(b.mode) >= INTRA_MODES) {
+    let bad_mode = superblocks
+        .iter()
+        .flat_map(|sb| match sb {
+            Superblock::Whole(b) => std::slice::from_ref(b),
+            Superblock::Split(b) => b.as_slice(),
+        })
+        .find(|b| usize::from(b.mode) >= INTRA_MODES);
+    if let Some(bad) = bad_mode {
         return Err(Error::unsupported(
             "AV1 tile",
             format!(
@@ -494,24 +553,14 @@ pub fn split_coeff_key_frame_tile(
              base_q_idx must be 61..=120",
         ));
     }
-    // One level grid per plane of every block, in the plane order they are
-    // coded in: luma, then U, then V.
-    let grids = blocks
-        .iter()
-        .map(|b| {
-            Ok([
-                level_grid(&b.luma, TX32)?,
-                level_grid(&b.u, TX16)?,
-                level_grid(&b.v, TX16)?,
-            ])
-        })
-        .collect::<Result<Vec<_>>>()?;
 
-    let planes = [&LUMA_32, &CHROMA_16, &CHROMA_16];
+    let split_planes = [&LUMA_32, &CHROMA_16, &CHROMA_16];
+    let whole_planes = [&LUMA_64, &CHROMA_32, &CHROMA_32];
     let scans = [default_scan(TX32), default_scan(TX16)];
     // What the blocks above and to the left of the one being coded left
-    // behind, per plane. The left column is reset at every superblock row
-    // because a tile starts each row with no left neighbour.
+    // behind, per plane, one entry per 32x32 column and row. The left column
+    // is reset at every superblock row because a tile starts each row with no
+    // left neighbour.
     let mut above = vec![[Neighbour::default(); 3]; cols as usize];
     let mut left = vec![[Neighbour::default(); 3]; rows as usize];
     // The luma intra mode of those same neighbours, which picks the CDF the
@@ -519,13 +568,23 @@ pub fn split_coeff_key_frame_tile(
     // `DC_PRED`, which is what these start and are reset to.
     let mut above_mode = vec![DC_PRED; cols as usize];
     let mut left_mode = vec![DC_PRED; rows as usize];
+    // Whether those neighbours were split, which is what the superblock's
+    // partition symbol reads: the context is bit three of the neighbour's
+    // entry in the spec's partition-context table, and of the sizes a
+    // superblock can leave behind only a 32x32 block sets it. A neighbour
+    // outside the tile reads as an unsplit one, which is what these start and
+    // are reset to.
+    let mut above_split = vec![false; cols as usize];
+    let mut left_split = vec![false; rows as usize];
 
     let mut enc = SymbolEncoder::new();
     for sb_r in 0..sb_rows {
         left.iter_mut().for_each(|l| *l = Default::default());
         left_mode.iter_mut().for_each(|m| *m = DC_PRED);
+        left_split.iter_mut().for_each(|l| *l = false);
         for sb_c in 0..sb_cols {
-            let ctx = 2 * usize::from(sb_c > 0) + usize::from(sb_r > 0);
+            let (r0, c0) = (sb_r as usize * 2, sb_c as usize * 2);
+            let ctx = 2 * usize::from(left_split[r0]) + usize::from(above_split[c0]);
             // A superblock whose bottom or right half is outside the frame
             // cannot be left unsplit, so the decoder reads a flag instead of
             // the partition symbol — and reads nothing at all when both halves
@@ -534,71 +593,215 @@ pub fn split_coeff_key_frame_tile(
                 sb_c * SB_MI + SB_MI / 2 < mi_cols,
                 sb_r * SB_MI + SB_MI / 2 < mi_rows,
             );
-            match (has_cols, has_rows) {
-                (true, true) => enc.symbol_fixed(PARTITION_SPLIT, &cdf::PARTITION_W64[ctx]),
-                (true, false) => enc.symbol_fixed(1, &gather(&cdf::PARTITION_W64[ctx], VERT_ALIKE)),
-                (false, true) => enc.symbol_fixed(1, &gather(&cdf::PARTITION_W64[ctx], HORZ_ALIKE)),
-                (false, false) => {}
-            }
+            // The quadrants of this superblock that are inside the frame, as
+            // positions in the 32x32 block grid.
+            let quadrants: Vec<(usize, usize)> = (0..4)
+                .map(|q| (sb_r * 2 + q / 2, sb_c * 2 + q % 2))
+                .filter(|&(r, c)| r < rows && c < cols)
+                .map(|(r, c)| (r as usize, c as usize))
+                .collect();
 
-            for quadrant in 0..4 {
-                let (r, c) = (sb_r * 2 + quadrant / 2, sb_c * 2 + quadrant % 2);
-                if r >= rows || c >= cols {
-                    // The quadrant is outside the frame: the decoder never
-                    // walks into it.
-                    continue;
-                }
-                let (r, c) = (r as usize, c as usize);
-                let block = &grids[r * cols as usize + c];
-                let mode = usize::from(blocks[r * cols as usize + c].mode);
-
-                enc.symbol_fixed(PARTITION_NONE, &cdf::PARTITION_W32[0]);
-                enc.symbol_fixed(0, &cdf::SKIP[0]);
-                enc.symbol_fixed(
-                    mode,
-                    &cdf::KF_Y_MODE[INTRA_MODE_CTX[above_mode[c]]][INTRA_MODE_CTX[left_mode[r]]],
-                );
-                if (V_PRED..=D67_PRED).contains(&mode) {
-                    enc.symbol_fixed(ANGLE_DELTA_ZERO, &cdf::ANGLE_DELTA[mode - V_PRED]);
-                }
-                enc.symbol_fixed(DC_PRED, &cdf::UV_MODE_CFL[mode]);
-                above_mode[c] = mode;
-                left_mode[r] = mode;
-
-                for (plane, grid) in block.iter().enumerate() {
-                    let coding = planes[plane];
-                    // Luma's transform covers its whole block, which fixes the
-                    // all-zero flag's context at zero; a chroma transform reads
-                    // whether its neighbours coded anything, on top of the
-                    // offset the chroma tables start at.
-                    let skip_ctx = if plane == 0 {
-                        0
-                    } else {
-                        usize::from(above[c][plane].coded) + usize::from(left[r][plane].coded)
-                    };
-                    write_coeffs(
+            match &superblocks[(sb_r * sb_cols + sb_c) as usize] {
+                Superblock::Whole(block) => {
+                    if !has_cols || !has_rows {
+                        return Err(Error::unsupported(
+                            "AV1 tile",
+                            "a superblock that is half outside the frame cannot be left whole",
+                        ));
+                    }
+                    enc.symbol_fixed(PARTITION_NONE, &cdf::PARTITION_W64[ctx]);
+                    let mode = write_intra_mode(
                         &mut enc,
-                        coding,
-                        grid,
-                        &scans[usize::from(plane > 0)],
-                        skip_ctx,
-                        dc_sign_ctx(above[c][plane].dc, left[r][plane].dc),
+                        block,
+                        above_mode[c0],
+                        left_mode[r0],
+                        // A 64x64 block is too big to be offered chroma from
+                        // luma, so its chroma mode reads the table without it.
+                        &cdf::UV_MODE_NO_CFL[usize::from(block.mode)],
                     );
+                    let grids = [
+                        level_grid(&block.luma, TX32)?,
+                        level_grid(&block.u, TX32)?,
+                        level_grid(&block.v, TX32)?,
+                    ];
+                    write_block_planes(
+                        &mut enc,
+                        &whole_planes,
+                        &grids,
+                        &[&scans[0], &scans[0], &scans[0]],
+                        &above[c0],
+                        &left[r0],
+                    );
+                    // The block covers two columns and two rows of the 32x32
+                    // grid, so both of each read it as their neighbour.
+                    for (r, c) in quadrants {
+                        for plane in 0..3 {
+                            let state = neighbour_state(&grids[plane]);
+                            above[c][plane] = state;
+                            left[r][plane] = state;
+                        }
+                        above_mode[c] = mode;
+                        left_mode[r] = mode;
+                        above_split[c] = false;
+                        left_split[r] = false;
+                    }
                 }
-
-                for plane in 0..3 {
-                    let grid = &block[plane];
-                    let state = Neighbour {
-                        coded: grid.iter().any(|&l| l != 0),
-                        dc: (grid[0] != 0).then_some(grid[0] < 0),
-                    };
-                    above[c][plane] = state;
-                    left[r][plane] = state;
+                Superblock::Split(blocks) => {
+                    match (has_cols, has_rows) {
+                        (true, true) => enc.symbol_fixed(PARTITION_SPLIT, &cdf::PARTITION_W64[ctx]),
+                        (true, false) => {
+                            enc.symbol_fixed(1, &gather(&cdf::PARTITION_W64[ctx], VERT_ALIKE));
+                        }
+                        (false, true) => {
+                            enc.symbol_fixed(1, &gather(&cdf::PARTITION_W64[ctx], HORZ_ALIKE));
+                        }
+                        (false, false) => {}
+                    }
+                    if blocks.len() != quadrants.len() {
+                        return Err(Error::unsupported(
+                            "AV1 tile",
+                            "a split superblock needs one block per quadrant inside the frame",
+                        ));
+                    }
+                    for (block, (r, c)) in blocks.iter().zip(quadrants) {
+                        enc.symbol_fixed(PARTITION_NONE, &cdf::PARTITION_W32[0]);
+                        let mode = write_intra_mode(
+                            &mut enc,
+                            block,
+                            above_mode[c],
+                            left_mode[r],
+                            &cdf::UV_MODE_CFL[usize::from(block.mode)],
+                        );
+                        let grids = [
+                            level_grid(&block.luma, TX32)?,
+                            level_grid(&block.u, TX16)?,
+                            level_grid(&block.v, TX16)?,
+                        ];
+                        write_block_planes(
+                            &mut enc,
+                            &split_planes,
+                            &grids,
+                            &[&scans[0], &scans[1], &scans[1]],
+                            &above[c],
+                            &left[r],
+                        );
+                        for plane in 0..3 {
+                            let state = neighbour_state(&grids[plane]);
+                            above[c][plane] = state;
+                            left[r][plane] = state;
+                        }
+                        above_mode[c] = mode;
+                        left_mode[r] = mode;
+                        above_split[c] = true;
+                        left_split[r] = true;
+                    }
                 }
             }
         }
     }
     Ok(enc.finish())
+}
+
+/// Writes everything a key frame's block carries before its coefficients: the
+/// skip flag, its luma intra mode against the CDF its neighbours' modes pick,
+/// the angle a directional mode is steered by, and its chroma mode. Hands back
+/// the luma mode, which is what the blocks beside it read.
+fn write_intra_mode(
+    enc: &mut SymbolEncoder,
+    block: &BlockCoeffs,
+    above_mode: usize,
+    left_mode: usize,
+    uv_cdf: &[u16],
+) -> usize {
+    let mode = usize::from(block.mode);
+    enc.symbol_fixed(0, &cdf::SKIP[0]);
+    enc.symbol_fixed(
+        mode,
+        &cdf::KF_Y_MODE[INTRA_MODE_CTX[above_mode]][INTRA_MODE_CTX[left_mode]],
+    );
+    if (V_PRED..=D67_PRED).contains(&mode) {
+        enc.symbol_fixed(ANGLE_DELTA_ZERO, &cdf::ANGLE_DELTA[mode - V_PRED]);
+    }
+    enc.symbol_fixed(DC_PRED, uv_cdf);
+    mode
+}
+
+/// Writes the three transform blocks of one coded block, in the order a
+/// decoder reads them.
+fn write_block_planes(
+    enc: &mut SymbolEncoder,
+    planes: &[&TxbCoding; 3],
+    grids: &[Vec<i32>; 3],
+    scans: &[&Vec<u16>; 3],
+    above: &[Neighbour; 3],
+    left: &[Neighbour; 3],
+) {
+    for (plane, grid) in grids.iter().enumerate() {
+        // Luma's transform covers its whole block, which fixes the all-zero
+        // flag's context at zero; a chroma transform reads whether its
+        // neighbours coded anything, on top of the offset the chroma tables
+        // start at.
+        let skip_ctx = if plane == 0 {
+            0
+        } else {
+            usize::from(above[plane].coded) + usize::from(left[plane].coded)
+        };
+        write_coeffs(
+            enc,
+            planes[plane],
+            grid,
+            scans[plane],
+            skip_ctx,
+            dc_sign_ctx(above[plane].dc, left[plane].dc),
+        );
+    }
+}
+
+/// What a coded transform block leaves behind for the blocks that read it as a
+/// neighbour.
+fn neighbour_state(grid: &[i32]) -> Neighbour {
+    Neighbour {
+        coded: grid.iter().any(|&l| l != 0),
+        dc: (grid[0] != 0).then_some(grid[0] < 0),
+    }
+}
+
+/// Writes the payload of a one-tile key frame in which every superblock is
+/// split into 32x32 blocks, each carrying the coefficients `blocks` gives it.
+///
+/// `blocks` gives one coefficient set per 32x32 block in raster order across
+/// the frame. This is [`sb_coeff_key_frame_tile`] with every superblock split.
+///
+/// # Errors
+/// As [`sb_coeff_key_frame_tile`], with `blocks` sized for the 32x32 grid.
+pub fn split_coeff_key_frame_tile(
+    mi_cols: u32,
+    mi_rows: u32,
+    base_q_idx: u8,
+    blocks: &[BlockCoeffs],
+) -> Result<Vec<u8>> {
+    check_blocks(mi_cols, mi_rows)?;
+    let (cols, rows) = (mi_cols / BLOCK_MI, mi_rows / BLOCK_MI);
+    if blocks.len() != (cols * rows) as usize {
+        return Err(Error::unsupported(
+            "AV1 tile",
+            "a coefficient key frame needs one coefficient set per 32x32 block",
+        ));
+    }
+    let (sb_cols, sb_rows) = (cols.div_ceil(2), rows.div_ceil(2));
+    let superblocks: Vec<Superblock> = (0..sb_rows)
+        .flat_map(|sb_r| (0..sb_cols).map(move |sb_c| (sb_r, sb_c)))
+        .map(|(sb_r, sb_c)| {
+            Superblock::Split(
+                (0..4)
+                    .map(|q| (sb_r * 2 + q / 2, sb_c * 2 + q % 2))
+                    .filter(|&(r, c)| r < rows && c < cols)
+                    .map(|(r, c)| blocks[(r * cols + c) as usize].clone())
+                    .collect(),
+            )
+        })
+        .collect();
+    sb_coeff_key_frame_tile(mi_cols, mi_rows, base_q_idx, &superblocks)
 }
 
 /// Lays one plane's coefficient list out over its transform, rejecting the
@@ -1994,6 +2197,102 @@ mod tests {
     /// alternating, so a block written into the wrong place or a flag the
     /// decoder reads as a different number of bits shows up as a block with the
     /// other block's shape — or as a decode failure.
+    fn decode_luma_sb(width: usize, height: usize, sbs: &[Superblock]) -> Vec<Vec<u8>> {
+        let (seq, header) = frame_of(width as u32, height as u32);
+        let tile = sb_coeff_key_frame_tile(header.mi_cols, header.mi_rows, Q_IDX, sbs).unwrap();
+        let mut stream = temporal_delimiter();
+        stream.extend_from_slice(&sequence_header_obu(&seq).unwrap());
+        stream.extend_from_slice(&frame_obu(&seq, &header, &tile).unwrap());
+        let planes = ffmpeg_decode(&stream, width, height);
+        planes[..width * height]
+            .chunks_exact(width)
+            .map(<[u8]>::to_vec)
+            .collect()
+    }
+
+    /// A superblock left whole carries one 64x64 transform, whose lowest
+    /// horizontal basis function falls across the whole sixty-four samples in
+    /// one stroke. Were the same superblock split, each half would restart the
+    /// gradient at its own left edge and the picture would rise again in the
+    /// middle, so the walk across the row is what tells the two apart — and
+    /// the split superblock beside it proves the two partitions still agree on
+    /// where the next one begins.
+    #[test]
+    fn a_whole_superblock_covers_all_four_of_its_quadrants() {
+        if !have_ffmpeg() {
+            eprintln!("SKIP a_whole_superblock_covers_all_four_of_its_quadrants: no ffmpeg");
+            return;
+        }
+        let across = BlockCoeffs::from(vec![Coeff {
+            row: 0,
+            col: 1,
+            level: 20,
+        }]);
+        let down = BlockCoeffs::from(vec![Coeff {
+            row: 1,
+            col: 0,
+            level: 20,
+        }]);
+        let sbs = [
+            Superblock::Whole(across),
+            Superblock::Split(vec![down.clone(), down.clone(), down.clone(), down]),
+        ];
+        let rows = decode_luma_sb(128, 64, &sbs);
+
+        for (y, row) in rows.iter().enumerate() {
+            assert_eq!(
+                &row[..64],
+                &rows[0][..64],
+                "row {y} of the whole superblock repeats its first row"
+            );
+        }
+        let first = &rows[0][..64];
+        assert!(
+            first.windows(2).all(|w| w[0] >= w[1]),
+            "the whole superblock falls across its sixty-four samples without \
+             restarting: {first:?}"
+        );
+        assert!(
+            first[0] > first[63],
+            "the whole superblock falls from left to right, got {} then {}",
+            first[0],
+            first[63]
+        );
+        for block_row in 0..2 {
+            for block_col in 2..4 {
+                let block = block_at(&rows, block_row, block_col);
+                assert_falls_down(&block, &format!("quadrant ({block_row},{block_col})"));
+            }
+        }
+    }
+
+    /// A superblock half outside the frame has no partition that keeps a block
+    /// outside it, so it cannot be left whole.
+    #[test]
+    fn a_whole_superblock_at_the_frame_edge_is_refused() {
+        let block = BlockCoeffs::from(vec![Coeff {
+            row: 0,
+            col: 0,
+            level: 4,
+        }]);
+        let sbs = [
+            Superblock::Split(vec![
+                block.clone(),
+                block.clone(),
+                block.clone(),
+                block.clone(),
+            ]),
+            Superblock::Whole(block.clone()),
+        ];
+        // Ninety-six samples across is three 32x32 blocks, so the second
+        // superblock hangs half outside the frame.
+        let err = sb_coeff_key_frame_tile(24, 16, Q_IDX, &sbs).unwrap_err();
+        assert!(
+            format!("{err}").contains("half outside the frame"),
+            "got {err}"
+        );
+    }
+
     #[test]
     fn a_frame_that_is_not_a_whole_number_of_superblocks_codes_every_block() {
         if !have_ffmpeg() {
