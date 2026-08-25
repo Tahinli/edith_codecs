@@ -204,13 +204,13 @@ fn update_cdf(cdf: &mut [u16], symbol: usize) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// The decoding process of spec 8.2, written from the specification's
     /// pseudocode so that the roundtrip tests measure the encoder against the
     /// decoder AV1 defines rather than against the encoder's own arithmetic.
-    struct SymbolDecoder<'a> {
+    pub(crate) struct SymbolDecoder<'a> {
         data: &'a [u8],
         /// Next bit to read, as a bit offset into `data`.
         bit: usize,
@@ -223,7 +223,7 @@ mod tests {
 
     impl<'a> SymbolDecoder<'a> {
         /// `init_symbol` (spec 8.2.2).
-        fn new(data: &'a [u8]) -> SymbolDecoder<'a> {
+        pub(crate) fn new(data: &'a [u8]) -> SymbolDecoder<'a> {
             let mut d = SymbolDecoder {
                 data,
                 bit: 0,
@@ -285,7 +285,7 @@ mod tests {
             symbol
         }
 
-        fn literal(&mut self, bits: u32) -> u32 {
+        pub(crate) fn literal(&mut self, bits: u32) -> u32 {
             let mut v = 0;
             for _ in 0..bits {
                 v = (v << 1) | self.symbol_fixed(&EQUIPROBABLE) as u32;
