@@ -246,8 +246,8 @@ pub fn split_dc_key_frame_tile(
                     &cdf::TXB_SKIP_LUMA_32,
                     &cdf::COEFF_BASE_EOB_LUMA_32[0],
                 );
-                enc.symbol_fixed(1, &cdf::TXB_SKIP_CHROMA_16);
-                enc.symbol_fixed(1, &cdf::TXB_SKIP_CHROMA_16);
+                enc.symbol_fixed(1, &cdf::TXB_SKIP_CHROMA_16[0]);
+                enc.symbol_fixed(1, &cdf::TXB_SKIP_CHROMA_16[0]);
 
                 above[c as usize] = Some(negative);
                 left[r as usize] = Some(negative);
@@ -257,43 +257,128 @@ pub fn split_dc_key_frame_tile(
     Ok(enc.finish())
 }
 
-/// One quantised coefficient of a 32x32 luma transform block.
+/// One quantised coefficient of a transform block.
 ///
-/// `row` and `col` are its position in the transform, not in the picture: a
-/// coefficient at row 0 varies along the picture's width and one at column 0
-/// along its height, and the coefficient at the origin is the DC the block's
-/// average sample value rides on.
+/// `row` and `col` are its position in the transform it belongs to — 32x32 for
+/// luma, 16x16 for each chroma plane — not in the picture: a coefficient at
+/// row 0 varies along the picture's width and one at column 0 along its
+/// height, and the coefficient at the origin is the DC the block's average
+/// sample value rides on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Coeff {
-    /// The coefficient's row in the transform, 0..32.
+    /// The coefficient's row in the transform.
     pub row: u8,
-    /// The coefficient's column in the transform, 0..32.
+    /// The coefficient's column in the transform.
     pub col: u8,
     /// Its quantised level, which the base and base-range syntax carry for
     /// magnitudes up to [`MAX_LEVEL`].
     pub level: i32,
 }
 
+/// The coefficients of one coded block: a 32x32 luma transform and, at 4:2:0,
+/// the 16x16 transform each chroma plane covers the same area with.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BlockCoeffs {
+    /// The luma transform's coefficients.
+    pub luma: Vec<Coeff>,
+    /// The U plane's.
+    pub u: Vec<Coeff>,
+    /// The V plane's.
+    pub v: Vec<Coeff>,
+}
+
+impl From<Vec<Coeff>> for BlockCoeffs {
+    /// A block that codes luma only.
+    fn from(luma: Vec<Coeff>) -> Self {
+        Self {
+            luma,
+            ..Self::default()
+        }
+    }
+}
+
 /// Side of the luma transform the coefficient writer codes.
 const TX32: usize = 32;
-/// How many coefficients that transform holds.
-const TX32_AREA: usize = TX32 * TX32;
+/// Side of the chroma transform beside it at 4:2:0.
+const TX16: usize = 16;
+
+/// The shapes and default CDFs one plane's transform blocks are coded with.
+/// The two differ in every coefficient table because the CDFs are indexed by
+/// plane type and transform size, and in the end-of-block alphabet because a
+/// 16x16 transform has a quarter of the positions to point at.
+struct TxbCoding {
+    /// Side of the transform, in coefficients.
+    side: usize,
+    /// The all-zero flag, indexed by its own context.
+    txb_skip: &'static [[u16; 3]],
+    /// The end-of-block group, whose alphabet the transform size sets.
+    eob_pt: &'static [u16],
+    /// The top bit of the offset inside that group.
+    eob_extra: &'static [[u16; 3]; 9],
+    /// A coefficient's base level.
+    base: &'static [[u16; 5]; 42],
+    /// The base level of the last coefficient in the scan.
+    base_eob: &'static [[u16; 4]; 4],
+    /// The base-range tail above level two.
+    br: &'static [[u16; 5]; 21],
+    /// The sign of the DC.
+    dc_sign: &'static [[u16; 3]; 3],
+}
+
+/// The luma all-zero flag has one context here: the transform covers its whole
+/// block, which fixes it at zero.
+const TXB_SKIP_LUMA_32_CTX: [[u16; 3]; 1] = [cdf::TXB_SKIP_LUMA_32];
+
+/// The 32x32 luma transform of a 32x32 block.
+const LUMA_32: TxbCoding = TxbCoding {
+    side: TX32,
+    txb_skip: &TXB_SKIP_LUMA_32_CTX,
+    eob_pt: &cdf::EOB_PT_1024_LUMA,
+    eob_extra: &cdf::EOB_EXTRA_LUMA_32,
+    base: &cdf::COEFF_BASE_LUMA_32,
+    base_eob: &cdf::COEFF_BASE_EOB_LUMA_32,
+    br: &cdf::COEFF_BR_LUMA_32,
+    dc_sign: &cdf::DC_SIGN_LUMA,
+};
+
+/// The 16x16 transform of either chroma plane of that block at 4:2:0.
+const CHROMA_16: TxbCoding = TxbCoding {
+    side: TX16,
+    txb_skip: &cdf::TXB_SKIP_CHROMA_16,
+    eob_pt: &cdf::EOB_PT_256_CHROMA,
+    eob_extra: &cdf::EOB_EXTRA_CHROMA_16,
+    base: &cdf::COEFF_BASE_CHROMA_16,
+    base_eob: &cdf::COEFF_BASE_EOB_CHROMA_16,
+    br: &cdf::COEFF_BR_CHROMA_16,
+    dc_sign: &cdf::DC_SIGN_CHROMA,
+};
+
+/// What one coded block leaves behind for the blocks that read it as a
+/// neighbour: whether it coded anything at all, and the sign of its DC.
+#[derive(Clone, Copy, Default)]
+struct Neighbour {
+    /// Whether the plane's transform block carried a coefficient.
+    coded: bool,
+    /// The sign of its DC, absent when the DC itself is zero.
+    dc: Option<bool>,
+}
 
 /// Writes the payload of a one-tile key frame in which every superblock is
-/// split into four 32x32 DC-predicted blocks, each carrying the luma
-/// coefficients `blocks` gives it and no chroma residual.
+/// split into four 32x32 DC-predicted blocks, each carrying the coefficients
+/// `blocks` gives it.
 ///
-/// `blocks` gives one coefficient list per 32x32 block in raster order across
-/// the frame, so it is twice as wide and twice as tall as the superblock grid.
-/// An empty list writes an all-zero transform block. Unlike the DC writers,
-/// the coefficients may sit anywhere in the transform, so a block here is a
-/// picture rather than a flat grey: a single coefficient off the origin
-/// decodes to the basis function it selects.
+/// `blocks` gives one coefficient set per 32x32 block in raster order across
+/// the frame, so the grid is twice as wide and twice as tall as the superblock
+/// grid. Each set carries a 32x32 luma transform and the 16x16 transform of
+/// each chroma plane; an empty list writes an all-zero transform block. Unlike
+/// the DC writers, the coefficients may sit anywhere in their transform, so a
+/// block here is a picture rather than a flat grey: a single coefficient off
+/// the origin decodes to the basis function it selects.
 ///
 /// # Errors
 /// Returns an error when the frame is not a whole number of 64x64
-/// superblocks, when `blocks` does not carry exactly one list per 32x32 block,
-/// when a coefficient sits outside the transform, repeats a position, carries
+/// superblocks, when `blocks` does not carry exactly one set per 32x32 block,
+/// when a coefficient sits outside its transform, repeats a position, carries
 /// a zero level or one wider than the base and base-range syntax reach, or
 /// when `base_q_idx` is outside the q-context band whose default CDFs this
 /// crate carries.
@@ -301,7 +386,7 @@ pub fn split_coeff_key_frame_tile(
     mi_cols: u32,
     mi_rows: u32,
     base_q_idx: u8,
-    blocks: &[Vec<Coeff>],
+    blocks: &[BlockCoeffs],
 ) -> Result<Vec<u8>> {
     check_superblocks(mi_cols, mi_rows)?;
     let (sb_cols, sb_rows) = (mi_cols / SB_MI, mi_rows / SB_MI);
@@ -309,7 +394,7 @@ pub fn split_coeff_key_frame_tile(
     if blocks.len() != (cols * rows) as usize {
         return Err(Error::unsupported(
             "AV1 tile",
-            "a coefficient key frame needs one coefficient list per 32x32 block",
+            "a coefficient key frame needs one coefficient set per 32x32 block",
         ));
     }
     if !Q_CTX_2.contains(&base_q_idx) {
@@ -319,62 +404,89 @@ pub fn split_coeff_key_frame_tile(
              base_q_idx must be 61..=120",
         ));
     }
+    // One level grid per plane of every block, in the plane order they are
+    // coded in: luma, then U, then V.
     let grids = blocks
         .iter()
-        .map(|b| level_grid(b))
+        .map(|b| {
+            Ok([
+                level_grid(&b.luma, TX32)?,
+                level_grid(&b.u, TX16)?,
+                level_grid(&b.v, TX16)?,
+            ])
+        })
         .collect::<Result<Vec<_>>>()?;
 
-    let scan = default_scan_32();
-    // The sign of each coded block's DC, for the neighbours the DC sign
-    // context is read from. A block whose DC is zero casts no vote, however
-    // much its other coefficients carry.
-    let mut above: Vec<Option<bool>> = vec![None; cols as usize];
-    let mut left: Vec<Option<bool>> = vec![None; rows as usize];
+    let planes = [&LUMA_32, &CHROMA_16, &CHROMA_16];
+    let scans = [default_scan(TX32), default_scan(TX16)];
+    // What the blocks above and to the left of the one being coded left
+    // behind, per plane. The left column is reset at every superblock row
+    // because a tile starts each row with no left neighbour.
+    let mut above = vec![[Neighbour::default(); 3]; cols as usize];
+    let mut left = vec![[Neighbour::default(); 3]; rows as usize];
 
     let mut enc = SymbolEncoder::new();
     for sb_r in 0..sb_rows {
-        left.iter_mut().for_each(|l| *l = None);
+        left.iter_mut().for_each(|l| *l = Default::default());
         for sb_c in 0..sb_cols {
             let ctx = 2 * usize::from(sb_c > 0) + usize::from(sb_r > 0);
             enc.symbol_fixed(PARTITION_SPLIT, &cdf::PARTITION_W64[ctx]);
 
             for quadrant in 0..4 {
                 let (r, c) = (sb_r * 2 + quadrant / 2, sb_c * 2 + quadrant % 2);
-                let grid = &grids[(r * cols + c) as usize];
+                let (r, c) = (r as usize, c as usize);
+                let block = &grids[r * cols as usize + c];
 
                 enc.symbol_fixed(PARTITION_NONE, &cdf::PARTITION_W32[0]);
                 enc.symbol_fixed(0, &cdf::SKIP[0]);
                 enc.symbol_fixed(DC_PRED, &cdf::KF_Y_MODE[0][0]);
                 enc.symbol_fixed(DC_PRED, &cdf::UV_MODE_CFL_DC);
 
-                write_coeffs(
-                    &mut enc,
-                    grid,
-                    &scan,
-                    dc_sign_ctx(above[c as usize], left[r as usize]),
-                );
-                enc.symbol_fixed(1, &cdf::TXB_SKIP_CHROMA_16);
-                enc.symbol_fixed(1, &cdf::TXB_SKIP_CHROMA_16);
+                for (plane, grid) in block.iter().enumerate() {
+                    let coding = planes[plane];
+                    // Luma's transform covers its whole block, which fixes the
+                    // all-zero flag's context at zero; a chroma transform reads
+                    // whether its neighbours coded anything, on top of the
+                    // offset the chroma tables start at.
+                    let skip_ctx = if plane == 0 {
+                        0
+                    } else {
+                        usize::from(above[c][plane].coded) + usize::from(left[r][plane].coded)
+                    };
+                    write_coeffs(
+                        &mut enc,
+                        coding,
+                        grid,
+                        &scans[usize::from(plane > 0)],
+                        skip_ctx,
+                        dc_sign_ctx(above[c][plane].dc, left[r][plane].dc),
+                    );
+                }
 
-                let dc = grid[0];
-                let vote = (dc != 0).then_some(dc < 0);
-                above[c as usize] = vote;
-                left[r as usize] = vote;
+                for plane in 0..3 {
+                    let grid = &block[plane];
+                    let state = Neighbour {
+                        coded: grid.iter().any(|&l| l != 0),
+                        dc: (grid[0] != 0).then_some(grid[0] < 0),
+                    };
+                    above[c][plane] = state;
+                    left[r][plane] = state;
+                }
             }
         }
     }
     Ok(enc.finish())
 }
 
-/// Lays one block's coefficient list out over the transform, rejecting the
+/// Lays one plane's coefficient list out over its transform, rejecting the
 /// positions and levels the writer does not code.
-fn level_grid(coeffs: &[Coeff]) -> Result<Vec<i32>> {
-    let mut grid = vec![0i32; TX32_AREA];
+fn level_grid(coeffs: &[Coeff], side: usize) -> Result<Vec<i32>> {
+    let mut grid = vec![0i32; side * side];
     for coeff in coeffs {
-        if usize::from(coeff.row) >= TX32 || usize::from(coeff.col) >= TX32 {
+        if usize::from(coeff.row) >= side || usize::from(coeff.col) >= side {
             return Err(Error::unsupported(
                 "AV1 tile",
-                "a coefficient sits outside the 32x32 transform the writer codes",
+                "a coefficient sits outside the transform of its plane",
             ));
         }
         if coeff.level == 0 || coeff.level.abs() > MAX_LEVEL {
@@ -384,7 +496,7 @@ fn level_grid(coeffs: &[Coeff]) -> Result<Vec<i32>> {
                  wider levels need the Golomb tail",
             ));
         }
-        let pos = usize::from(coeff.row) * TX32 + usize::from(coeff.col);
+        let pos = usize::from(coeff.row) * side + usize::from(coeff.col);
         if grid[pos] != 0 {
             return Err(Error::unsupported(
                 "AV1 tile",
@@ -396,19 +508,19 @@ fn level_grid(coeffs: &[Coeff]) -> Result<Vec<i32>> {
     Ok(grid)
 }
 
-/// The default scan of a 32x32 transform (spec 8.4.2's `Default_Scan_32x32`),
+/// The default scan of a square transform (spec 8.4.2's `Default_Scan_NxN`),
 /// as raster positions in the order they are coded.
 ///
-/// The table is a rule rather than a thousand pinned numbers: the scan walks
+/// The table is a rule rather than hundreds of pinned numbers: the scan walks
 /// the anti-diagonals of the transform outwards from the origin, each diagonal
 /// from its top-right end on odd diagonals and from its bottom-left end on
 /// even ones.
-fn default_scan_32() -> Vec<u16> {
-    let mut scan = Vec::with_capacity(TX32_AREA);
-    for d in 0..(2 * TX32 - 1) {
-        let lo = d.saturating_sub(TX32 - 1);
-        let hi = d.min(TX32 - 1);
-        let diagonal = (lo..=hi).map(|row| (row * TX32 + (d - row)) as u16);
+fn default_scan(side: usize) -> Vec<u16> {
+    let mut scan = Vec::with_capacity(side * side);
+    for d in 0..(2 * side - 1) {
+        let lo = d.saturating_sub(side - 1);
+        let hi = d.min(side - 1);
+        let diagonal = (lo..=hi).map(|row| (row * side + (d - row)) as u16);
         if d % 2 == 0 {
             scan.extend(diagonal.rev());
         } else {
@@ -418,49 +530,54 @@ fn default_scan_32() -> Vec<u16> {
     scan
 }
 
-/// coeffs() for a luma transform block of any coefficients the base and
+/// coeffs() for one plane's transform block of any coefficients the base and
 /// base-range syntax reach (spec 5.11.39).
 ///
-/// The block is its own transform size, so the all-zero flag's context is 0;
-/// a 32x32 transform is DCT-only, so no transform type is coded; and the
-/// levels the contexts below are read from are the levels of coefficients
-/// later in the scan, which a decoder walking the scan backwards already has.
-fn write_coeffs(enc: &mut SymbolEncoder, grid: &[i32], scan: &[u16], sign_ctx: usize) {
+/// A 32x32 or 16x16 transform is DCT-only here, so no transform type is coded;
+/// and the levels the contexts below are read from are the levels of
+/// coefficients later in the scan, which a decoder walking the scan backwards
+/// already has.
+fn write_coeffs(
+    enc: &mut SymbolEncoder,
+    coding: &TxbCoding,
+    grid: &[i32],
+    scan: &[u16],
+    skip_ctx: usize,
+    sign_ctx: usize,
+) {
+    let side = coding.side;
     let eob = scan
         .iter()
         .rposition(|&pos| grid[pos as usize] != 0)
         .map_or(0, |i| i + 1);
-    enc.symbol_fixed(usize::from(eob == 0), &cdf::TXB_SKIP_LUMA_32);
+    enc.symbol_fixed(usize::from(eob == 0), &coding.txb_skip[skip_ctx]);
     if eob == 0 {
         return;
     }
 
-    write_eob(enc, eob);
+    write_eob(enc, coding, eob);
 
     for scan_idx in (0..eob).rev() {
         let pos = scan[scan_idx] as usize;
-        let (row, col) = (pos / TX32, pos % TX32);
+        let (row, col) = (pos / side, pos % side);
         let level = grid[pos].abs();
         if scan_idx == eob - 1 {
-            let ctx = eob_coeff_ctx(scan_idx);
+            let ctx = eob_coeff_ctx(scan_idx, side * side);
             enc.symbol_fixed(
                 (level.min(NUM_BASE_LEVELS + 1) - 1) as usize,
-                &cdf::COEFF_BASE_EOB_LUMA_32[ctx],
+                &coding.base_eob[ctx],
             );
         } else {
-            let ctx = base_ctx(grid, row, col);
-            enc.symbol_fixed(
-                level.min(NUM_BASE_LEVELS + 1) as usize,
-                &cdf::COEFF_BASE_LUMA_32[ctx],
-            );
+            let ctx = base_ctx(grid, side, row, col);
+            enc.symbol_fixed(level.min(NUM_BASE_LEVELS + 1) as usize, &coding.base[ctx]);
         }
         if level > NUM_BASE_LEVELS {
-            let ctx = br_ctx(grid, row, col);
+            let ctx = br_ctx(grid, side, row, col);
             let mut remaining = level - (NUM_BASE_LEVELS + 1);
             let mut sent = 0;
             while sent < COEFF_BASE_RANGE {
                 let k = remaining.min(BR_STEP);
-                enc.symbol_fixed(k as usize, &cdf::COEFF_BR_LUMA_32[ctx]);
+                enc.symbol_fixed(k as usize, &coding.br[ctx]);
                 if k < BR_STEP {
                     break;
                 }
@@ -478,7 +595,7 @@ fn write_coeffs(enc: &mut SymbolEncoder, grid: &[i32], scan: &[u16], sign_ctx: u
             continue;
         }
         if pos == 0 {
-            enc.symbol_fixed(usize::from(level < 0), &cdf::DC_SIGN_LUMA[sign_ctx]);
+            enc.symbol_fixed(usize::from(level < 0), &coding.dc_sign[sign_ctx]);
         } else {
             enc.literal(u32::from(level < 0), 1);
         }
@@ -488,7 +605,7 @@ fn write_coeffs(enc: &mut SymbolEncoder, grid: &[i32], scan: &[u16], sign_ctx: u
 /// The end-of-block position (spec 5.11.39): which group of scan positions the
 /// last coded coefficient falls in, then its offset inside that group — the
 /// offset's top bit from a CDF and the rest as raw bits.
-fn write_eob(enc: &mut SymbolEncoder, eob: usize) {
+fn write_eob(enc: &mut SymbolEncoder, coding: &TxbCoding, eob: usize) {
     /// `Eob_Group_Start` (spec 5.11.39): the first scan position each group of
     /// end-of-block positions covers, indexed by the group's own number.
     const GROUP_START: [usize; 12] = [0, 1, 2, 3, 5, 9, 17, 33, 65, 129, 257, 513];
@@ -499,15 +616,15 @@ fn write_eob(enc: &mut SymbolEncoder, eob: usize) {
         .iter()
         .rposition(|&start| start <= eob)
         .expect("the first group starts at zero");
-    // A 32x32 transform codes its end-of-block group out of the eleven the
-    // 1024-coefficient alphabet carries, numbered from one.
-    enc.symbol_fixed(group - 1, &cdf::EOB_PT_1024_LUMA);
+    // The groups are numbered from one, and how many of them the transform
+    // reaches is the size of its own end-of-block alphabet.
+    enc.symbol_fixed(group - 1, coding.eob_pt);
 
     let bits = OFFSET_BITS[group];
     if bits > 0 {
         let offset = (eob - GROUP_START[group]) as u32;
         let top = (offset >> (bits - 1)) & 1;
-        enc.symbol_fixed(top as usize, &cdf::EOB_EXTRA_LUMA_32[group - 3]);
+        enc.symbol_fixed(top as usize, &coding.eob_extra[group - 3]);
         if bits > 1 {
             enc.literal(offset & ((1 << (bits - 1)) - 1), bits - 1);
         }
@@ -516,11 +633,11 @@ fn write_eob(enc: &mut SymbolEncoder, eob: usize) {
 
 /// The context of the level of the last coded coefficient (spec 8.3.2): how
 /// far into the scan it sits, in quarters and eighths of the transform.
-fn eob_coeff_ctx(scan_idx: usize) -> usize {
+fn eob_coeff_ctx(scan_idx: usize, area: usize) -> usize {
     match scan_idx {
         0 => 0,
-        i if i <= TX32_AREA / 8 => 1,
-        i if i <= TX32_AREA / 4 => 2,
+        i if i <= area / 8 => 1,
+        i if i <= area / 4 => 2,
         _ => 3,
     }
 }
@@ -529,13 +646,13 @@ fn eob_coeff_ctx(scan_idx: usize) -> usize {
 /// five neighbours below and to the right of it — the ones a decoder walking
 /// the scan backwards already has — plus a term for where in the transform it
 /// sits. The DC reads context 0 whatever its neighbours carry.
-fn base_ctx(grid: &[i32], row: usize, col: usize) -> usize {
+fn base_ctx(grid: &[i32], side: usize, row: usize, col: usize) -> usize {
     if row == 0 && col == 0 {
         return 0;
     }
     let mag: i32 = [(1, 0), (0, 1), (1, 1), (2, 0), (0, 2)]
         .iter()
-        .map(|&(dr, dc)| neighbour(grid, row + dr, col + dc).abs().min(3))
+        .map(|&(dr, dc)| neighbour(grid, side, row + dr, col + dc).abs().min(3))
         .sum();
     let offset = cdf::NZ_MAP_CTX_OFFSET_32[row.min(4)][col.min(4)] as usize;
     (((mag + 1) >> 1).min(4) as usize) + offset
@@ -544,10 +661,10 @@ fn base_ctx(grid: &[i32], row: usize, col: usize) -> usize {
 /// The context of a coefficient's base-range tail (spec 8.3.2): the magnitudes
 /// of its three closest neighbours below and to the right, uncapped, and a
 /// term separating the DC, the corner of the transform, and the rest.
-fn br_ctx(grid: &[i32], row: usize, col: usize) -> usize {
+fn br_ctx(grid: &[i32], side: usize, row: usize, col: usize) -> usize {
     let mag: i32 = [(1, 0), (0, 1), (1, 1)]
         .iter()
-        .map(|&(dr, dc)| neighbour(grid, row + dr, col + dc).abs())
+        .map(|&(dr, dc)| neighbour(grid, side, row + dr, col + dc).abs())
         .sum();
     let mag = (((mag + 1) >> 1).min(6)) as usize;
     if row == 0 && col == 0 {
@@ -561,11 +678,11 @@ fn br_ctx(grid: &[i32], row: usize, col: usize) -> usize {
 
 /// A level at a position that may fall off the transform, where the levels a
 /// context reads are zero.
-fn neighbour(grid: &[i32], row: usize, col: usize) -> i32 {
-    if row >= TX32 || col >= TX32 {
+fn neighbour(grid: &[i32], side: usize, row: usize, col: usize) -> i32 {
+    if row >= side || col >= side {
         0
     } else {
-        grid[row * TX32 + col]
+        grid[row * side + col]
     }
 }
 
@@ -1126,6 +1243,26 @@ mod tests {
     /// Encodes a 64x64 key frame whose four 32x32 blocks carry `blocks` and
     /// hands back the luma plane as rows of samples.
     fn decode_coeff_quadrants(blocks: &[Vec<Coeff>]) -> Vec<Vec<u8>> {
+        let blocks: Vec<BlockCoeffs> = blocks.iter().cloned().map(BlockCoeffs::from).collect();
+        let [luma, u, v] = decode_coeff_planes(&blocks);
+        for (name, plane) in [("U", &u), ("V", &v)] {
+            for (y, row) in plane.iter().enumerate() {
+                for (x, &s) in row.iter().enumerate() {
+                    assert_eq!(
+                        s, 128,
+                        "{name} sample ({x},{y}): no block codes a chroma coefficient, and a \
+                         DC prediction with no coded neighbour is mid-grey"
+                    );
+                }
+            }
+        }
+        luma
+    }
+
+    /// Encodes a 64x64 key frame whose four 32x32 blocks carry `blocks` and
+    /// hands back its three planes as rows of samples: 64 rows of luma and, at
+    /// 4:2:0, 32 rows of each chroma plane.
+    fn decode_coeff_planes(blocks: &[BlockCoeffs]) -> [Vec<Vec<u8>>; 3] {
         let (seq, header) = frame_of(64, 64);
         let tile =
             split_coeff_key_frame_tile(header.mi_cols, header.mi_rows, Q_IDX, blocks).unwrap();
@@ -1134,14 +1271,12 @@ mod tests {
         stream.extend_from_slice(&frame_obu(&seq, &header, &tile).unwrap());
         let planes = ffmpeg_decode(&stream, 64, 64);
         let (luma, chroma) = planes.split_at(64 * 64);
-        for (i, &s) in chroma.iter().enumerate() {
-            assert_eq!(
-                s, 128,
-                "chroma sample {i}: no block codes a chroma coefficient, and a \
-                 DC prediction with no coded neighbour is mid-grey"
-            );
-        }
-        luma.chunks_exact(64).map(<[u8]>::to_vec).collect()
+        let (u, v) = chroma.split_at(32 * 32);
+        [
+            luma.chunks_exact(64).map(<[u8]>::to_vec).collect(),
+            u.chunks_exact(32).map(<[u8]>::to_vec).collect(),
+            v.chunks_exact(32).map(<[u8]>::to_vec).collect(),
+        ]
     }
 
     /// The top-left 32x32 block of a decoded frame, which is the only one whose
@@ -1384,16 +1519,169 @@ mod tests {
         }
     }
 
+    /// The top-left 16x16 block of a decoded chroma plane, which is the only
+    /// one whose prediction has no neighbour to lean on.
+    fn top_left_chroma(rows: &[Vec<u8>]) -> Vec<Vec<u8>> {
+        rows[..16].iter().map(|r| r[..16].to_vec()).collect()
+    }
+
+    /// The mean of a decoded block, which every basis function but the DC's
+    /// leaves at the block's prediction.
+    fn mean(block: &[Vec<u8>]) -> f64 {
+        let sum: i32 = block.iter().flatten().map(|&s| i32::from(s)).sum();
+        let count = block.iter().map(Vec::len).sum::<usize>() as f64;
+        f64::from(sum) / count
+    }
+
+    /// A chroma plane's coefficients ride their own transform, their own CDFs
+    /// and their own end-of-block alphabet, so a chroma basis function is the
+    /// gate on all three: U carries the coefficient that is flat down the block
+    /// and a half-cycle across it, V the one turned a quarter turn, and neither
+    /// may reach the other plane or luma.
+    #[test]
+    fn each_chroma_plane_codes_its_own_basis_function() {
+        if !have_ffmpeg() {
+            eprintln!("SKIP each_chroma_plane_codes_its_own_basis_function: no ffmpeg");
+            return;
+        }
+        let mut blocks = vec![BlockCoeffs::default(); 4];
+        blocks[0].u = vec![Coeff {
+            row: 0,
+            col: 1,
+            level: 12,
+        }];
+        blocks[0].v = vec![Coeff {
+            row: 1,
+            col: 0,
+            level: 12,
+        }];
+        let [luma, u, v] = decode_coeff_planes(&blocks);
+
+        for (y, row) in luma.iter().enumerate() {
+            for (x, &s) in row.iter().enumerate() {
+                assert_eq!(
+                    s, 128,
+                    "luma sample ({x},{y}): no block codes a luma coefficient, so the picture \
+                     stays at its mid-grey prediction"
+                );
+            }
+        }
+
+        let u_block = top_left_chroma(&u);
+        for (y, row) in u_block.iter().enumerate() {
+            assert_eq!(
+                row, &u_block[0],
+                "row {y} of a horizontal chroma basis function"
+            );
+        }
+        assert!(
+            u_block[0][0] > u_block[0][15],
+            "a positive coefficient leans the U block towards its left edge: {:?}",
+            u_block[0]
+        );
+
+        let v_block = top_left_chroma(&v);
+        for (x, &top) in v_block[0].iter().enumerate() {
+            assert_eq!(
+                top, v_block[0][0],
+                "column {x} of a vertical chroma basis function"
+            );
+            let column: Vec<u8> = v_block.iter().map(|r| r[x]).collect();
+            assert!(
+                column[0] > column[15],
+                "a positive coefficient leans the V column towards its top edge: {column:?}"
+            );
+        }
+
+        for (name, block) in [("U", &u_block), ("V", &v_block)] {
+            let mean = mean(block);
+            assert!(
+                (mean - 128.0).abs() <= 1.0,
+                "the {name} block carries no DC, so it averages to its mid-grey prediction, \
+                 got {mean}"
+            );
+        }
+    }
+
+    /// Every block coding chroma puts the chroma all-zero flag on the contexts
+    /// a coded neighbour above and to the left select, and the DC sign on the
+    /// contexts their signs select. A frame whose four blocks all carry chroma
+    /// DCs of mixed sign walks those contexts; the picture that comes back must
+    /// still lean the way each block's own DC asks.
+    #[test]
+    fn chroma_dc_signs_read_their_neighbours() {
+        if !have_ffmpeg() {
+            eprintln!("SKIP chroma_dc_signs_read_their_neighbours: no ffmpeg");
+            return;
+        }
+        let dc = |level| {
+            vec![Coeff {
+                row: 0,
+                col: 0,
+                level,
+            }]
+        };
+        let signs = [8, -8, -8, 8];
+        let blocks: Vec<BlockCoeffs> = signs
+            .iter()
+            .map(|&level| BlockCoeffs {
+                luma: Vec::new(),
+                u: dc(level),
+                v: dc(-level),
+            })
+            .collect();
+        let [luma, u, v] = decode_coeff_planes(&blocks);
+
+        for (y, row) in luma.iter().enumerate() {
+            for (x, &s) in row.iter().enumerate() {
+                assert_eq!(s, 128, "luma sample ({x},{y}) with no luma coefficient");
+            }
+        }
+
+        // A DC prediction leans on the neighbours a block has, so each block is
+        // measured against the prediction it was given rather than mid-grey:
+        // the only block with no neighbour is the first, and the rest are read
+        // as a step away from the block above them and to their left.
+        for (i, &level) in signs.iter().enumerate() {
+            let (r, c) = (i / 2, i % 2);
+            let block = |plane: &[Vec<u8>]| -> Vec<Vec<u8>> {
+                plane[r * 16..r * 16 + 16]
+                    .iter()
+                    .map(|row| row[c * 16..c * 16 + 16].to_vec())
+                    .collect()
+            };
+            for (name, plane, want) in [("U", &u, level), ("V", &v, -level)] {
+                let block = block(plane);
+                let mean = mean(&block);
+                for (y, row) in block.iter().enumerate() {
+                    assert_eq!(
+                        row.iter().collect::<std::collections::HashSet<_>>().len(),
+                        1,
+                        "row {y} of a DC-only {name} block is flat"
+                    );
+                }
+                if i == 0 {
+                    assert!(
+                        (want > 0) == (mean > 128.0),
+                        "{name} block {i} carries a DC of {want}, so it must lean off its \
+                         mid-grey prediction that way, got {mean}"
+                    );
+                }
+            }
+        }
+        assert_ne!(u, v, "the two chroma planes carry opposite DCs");
+    }
+
     /// The coefficient writer refuses what it cannot code rather than writing a
     /// stream a decoder walks off the end of.
     #[test]
     fn coefficients_the_writer_cannot_code_are_refused() {
-        let empty = || vec![Vec::new(), Vec::new(), Vec::new(), Vec::new()];
-        let cases: [(&str, Vec<Vec<Coeff>>); 5] = [
-            ("one list short", vec![Vec::new(), Vec::new(), Vec::new()]),
+        let empty = || vec![BlockCoeffs::default(); 4];
+        let cases: [(&str, Vec<BlockCoeffs>); 6] = [
+            ("one set short", vec![BlockCoeffs::default(); 3]),
             ("off the transform", {
                 let mut b = empty();
-                b[0] = vec![Coeff {
+                b[0].luma = vec![Coeff {
                     row: 32,
                     col: 0,
                     level: 1,
@@ -1402,7 +1690,7 @@ mod tests {
             }),
             ("a zero level", {
                 let mut b = empty();
-                b[1] = vec![Coeff {
+                b[1].luma = vec![Coeff {
                     row: 0,
                     col: 0,
                     level: 0,
@@ -1411,7 +1699,7 @@ mod tests {
             }),
             ("a level past the base-range tail", {
                 let mut b = empty();
-                b[2] = vec![Coeff {
+                b[2].luma = vec![Coeff {
                     row: 0,
                     col: 0,
                     level: 15,
@@ -1420,7 +1708,7 @@ mod tests {
             }),
             ("two coefficients at one position", {
                 let mut b = empty();
-                b[3] = vec![
+                b[3].luma = vec![
                     Coeff {
                         row: 4,
                         col: 4,
@@ -1432,6 +1720,15 @@ mod tests {
                         level: 2,
                     },
                 ];
+                b
+            }),
+            ("off the chroma transform", {
+                let mut b = empty();
+                b[0].u = vec![Coeff {
+                    row: 0,
+                    col: 16,
+                    level: 1,
+                }];
                 b
             }),
         ];
@@ -1454,29 +1751,35 @@ mod tests {
     /// a coefficient's context off the coefficients it has already decoded.
     #[test]
     fn the_default_scan_walks_every_position_outwards() {
-        let scan = default_scan_32();
-        assert_eq!(scan.len(), TX32_AREA);
-        let mut seen = vec![false; TX32_AREA];
-        for &pos in &scan {
-            assert!(!seen[pos as usize], "position {pos} is scanned twice");
-            seen[pos as usize] = true;
-        }
-        assert_eq!(scan[0], 0, "the scan starts at the DC");
+        for side in [TX16, TX32] {
+            let area = side * side;
+            let scan = default_scan(side);
+            assert_eq!(scan.len(), area);
+            let mut seen = vec![false; area];
+            for &pos in &scan {
+                assert!(
+                    !seen[pos as usize],
+                    "position {pos} is scanned twice in {side}x{side}"
+                );
+                seen[pos as usize] = true;
+            }
+            assert_eq!(scan[0], 0, "the scan starts at the DC");
 
-        let mut order = vec![0usize; TX32_AREA];
-        for (i, &pos) in scan.iter().enumerate() {
-            order[pos as usize] = i;
-        }
-        for row in 0..TX32 {
-            for col in 0..TX32 {
-                for (dr, dc) in [(1, 0), (0, 1), (1, 1), (2, 0), (0, 2)] {
-                    let (nr, nc) = (row + dr, col + dc);
-                    if nr < TX32 && nc < TX32 {
-                        assert!(
-                            order[nr * TX32 + nc] > order[row * TX32 + col],
-                            "({nr},{nc}) is a context neighbour of ({row},{col}), so it must be \
-                             scanned after it"
-                        );
+            let mut order = vec![0usize; area];
+            for (i, &pos) in scan.iter().enumerate() {
+                order[pos as usize] = i;
+            }
+            for row in 0..side {
+                for col in 0..side {
+                    for (dr, dc) in [(1, 0), (0, 1), (1, 1), (2, 0), (0, 2)] {
+                        let (nr, nc) = (row + dr, col + dc);
+                        if nr < side && nc < side {
+                            assert!(
+                                order[nr * side + nc] > order[row * side + col],
+                                "({nr},{nc}) is a context neighbour of ({row},{col}), so it must \
+                                 be scanned after it"
+                            );
+                        }
                     }
                 }
             }
