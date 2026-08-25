@@ -21,12 +21,13 @@ use ec_av1_syntax::{
 };
 use ec_core::{Error, Result};
 
+use crate::cdf;
 use crate::frame::frame_obu;
-use crate::intra::{DC_PRED, NON_DIRECTIONAL};
+use crate::intra::{D67_PRED, DC_PRED, KEY_FRAME_MODES, V_PRED};
 use crate::obu::temporal_delimiter;
 use crate::quant::ac_q;
 use crate::sequence::sequence_header_obu;
-use crate::tile::{BlockCoeffs, Coeff, Superblock, sb_coeff_key_frame_tile};
+use crate::tile::{BlockCoeffs, Coeff, INTRA_MODE_CTX, Superblock, sb_coeff_key_frame_tile};
 use crate::transform::{dequant_and_inverse, forward_and_quantize};
 
 /// The side of the luma blocks this encoder codes, in samples.
@@ -35,13 +36,14 @@ const BLOCK: usize = 32;
 /// How heavily the mode search weighs rate against squared error, in units of
 /// the quantizer's reconstruction step squared per bit.
 ///
-/// Swept over three clips and two synthetic pictures at 0, 0.05, 0.1, 0.2, 0.4
-/// and 0.8 (`probe_lambda`, and the table in the lane report): 0 leaves half the
-/// saving on the table on a picture that runs one way (-35.6% against -59.5% on
-/// stripes), and everything from 0.1 up gives a little back on screen capture
-/// (-10.7% against -11.5%) and on a hand-held clip. 0.05 is the best point on
-/// every clip measured.
-const LAMBDA_SCALE: f64 = 0.05;
+/// Swept twice over three of his clips and three synthetic pictures
+/// (`probe_lambda` and `probe_directional`, and the tables in the two lane
+/// reports). The first sweep, before the mode symbol was costed, put the best
+/// point at 0.05; costing it moved the point to 0.1, where the directional
+/// modes stop costing rate on the pictures that do not want them (+0.05% on
+/// screen capture against +0.19% at 0.05) without giving up any of what they
+/// save on the pictures that do (-53.0% on a diagonal).
+const LAMBDA_SCALE: f64 = 0.1;
 
 /// One 8-bit planar 4:2:0 picture.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -235,17 +237,26 @@ impl Plane<'_> {
     /// The reconstructed samples a block at `(x, y)` predicts from: the row
     /// above it, the column to its left and the sample between them, each
     /// missing where the block sits against an edge of the frame.
+    ///
+    /// `reach` says whether the samples above the block's right and below its
+    /// left are decoded, which is what a directional mode reads into; where
+    /// they are not, or where the frame ends first, the edge is shorter and
+    /// the predictor repeats its last sample, exactly as the decoder's clamp
+    /// to `aboveLimit` and `leftLimit` does (spec 7.11.2.2).
     fn edges(
         &self,
         x: usize,
         y: usize,
         side: usize,
+        reach: Reach,
     ) -> (Option<Vec<u8>>, Option<Vec<u8>>, Option<u8>) {
+        let across = (x + if reach.above_right { 2 * side } else { side }).min(self.width);
+        let down = (y + if reach.below_left { 2 * side } else { side }).min(self.height);
         let above =
-            (y > 0).then(|| self.reconstruction[(y - 1) * self.width + x..][..side].to_vec());
+            (y > 0).then(|| self.reconstruction[(y - 1) * self.width + x..][..across - x].to_vec());
         let left = (x > 0).then(|| {
-            (0..side)
-                .map(|i| self.reconstruction[(y + i) * self.width + x - 1])
+            (y..down)
+                .map(|row| self.reconstruction[row * self.width + x - 1])
                 .collect::<Vec<_>>()
         });
         let corner = (x > 0 && y > 0).then(|| self.reconstruction[(y - 1) * self.width + x - 1]);
@@ -255,16 +266,9 @@ impl Plane<'_> {
     /// Codes one block under one mode without committing it: hands back the
     /// levels, the block the decoder would reconstruct, the squared error
     /// against the source and an estimate of what the levels cost in bits.
-    fn trial(
-        &self,
-        x: usize,
-        y: usize,
-        side: usize,
-        mode: u8,
-        base_q_idx: u8,
-        deadzone: f64,
-    ) -> Trial {
-        let (above, left, corner) = self.edges(x, y, side);
+    fn trial(&self, at: At, mode: u8, base_q_idx: u8, deadzone: f64) -> Trial {
+        let At { x, y, side, reach } = at;
+        let (above, left, corner) = self.edges(x, y, side, reach);
         let mut prediction = vec![0u8; side * side];
         crate::intra::predict(
             mode,
@@ -323,33 +327,19 @@ impl Plane<'_> {
     }
 
     /// Codes one block under a fixed mode, committing it.
-    fn code_block(
-        &mut self,
-        x: usize,
-        y: usize,
-        side: usize,
-        mode: u8,
-        base_q_idx: u8,
-        deadzone: f64,
-    ) -> Vec<Coeff> {
-        let trial = self.trial(x, y, side, mode, base_q_idx, deadzone);
-        self.commit(x, y, side, &trial);
-        coeffs(&trial.levels, side)
+    fn code_block(&mut self, at: At, mode: u8, base_q_idx: u8, deadzone: f64) -> Vec<Coeff> {
+        let trial = self.trial(at, mode, base_q_idx, deadzone);
+        self.commit(at.x, at.y, at.side, &trial);
+        coeffs(&trial.levels, at.side)
     }
 
     /// Codes one block under every mode the search offers and commits the one
     /// whose squared error and estimated rate come out cheapest.
-    fn search_block(
-        &mut self,
-        x: usize,
-        y: usize,
-        side: usize,
-        search: &Search,
-    ) -> (Vec<Coeff>, u8) {
+    fn search_block(&mut self, at: At, search: &Search, mode_bits: &[f64; 13]) -> (Vec<Coeff>, u8) {
         let mut best: Option<(f64, u8, Trial)> = None;
         for &mode in search.modes {
-            let trial = self.trial(x, y, side, mode, search.base_q_idx, search.deadzone);
-            let cost = trial.sse + search.lambda * trial.bits;
+            let trial = self.trial(at, mode, search.base_q_idx, search.deadzone);
+            let cost = trial.sse + search.lambda * (trial.bits + mode_bits[usize::from(mode)]);
             if best
                 .as_ref()
                 .is_none_or(|(best_cost, _, _)| cost < *best_cost)
@@ -358,9 +348,87 @@ impl Plane<'_> {
             }
         }
         let (_, mode, trial) = best.expect("the search offers at least one mode");
-        self.commit(x, y, side, &trial);
-        (coeffs(&trial.levels, side), mode)
+        self.commit(at.x, at.y, at.side, &trial);
+        (coeffs(&trial.levels, at.side), mode)
     }
+}
+
+/// Where one block sits in its plane, and how far past its own edges its
+/// prediction may read.
+#[derive(Clone, Copy)]
+struct At {
+    x: usize,
+    y: usize,
+    side: usize,
+    reach: Reach,
+}
+
+/// Which of the samples past a block's own edges the decoder has decoded by
+/// the time it predicts the block, and so which a directional mode may read.
+///
+/// The decoder derives these from its `BlockDecoded` flags, which are cleared
+/// per superblock (`clear_block_decoded_flags`, spec 7.4): the row above the
+/// superblock counts as decoded out to the end of the *tile*, while the column
+/// to its left counts only as far as the superblock's own height, and every
+/// position inside the superblock starts undecoded. For the four 32x32
+/// quadrants of a 64x64 superblock that comes to: the samples above-right are
+/// decoded for all but the last quadrant -- the one whose above-right lies
+/// inside the superblock to the right, which raster order has not reached --
+/// and the samples below-left only for the first, the only one whose left
+/// column continues into the superblock beside it.
+#[derive(Clone, Copy)]
+struct Reach {
+    above_right: bool,
+    below_left: bool,
+}
+
+impl Reach {
+    /// The reach of the quadrant coded `quadrant`-th in a superblock, counting
+    /// in raster order among the four.
+    fn quadrant(quadrant: usize) -> Self {
+        Self {
+            above_right: quadrant != 3,
+            below_left: quadrant == 0,
+        }
+    }
+
+    /// Neither, which is all a mode that reads no further than its own edges
+    /// needs.
+    fn none() -> Self {
+        Self {
+            above_right: false,
+            below_left: false,
+        }
+    }
+}
+
+/// What one symbol costs against a CDF, in bits.
+fn symbol_bits(cdf: &[u16], symbol: usize) -> f64 {
+    let low = if symbol == 0 { 0 } else { cdf[symbol - 1] };
+    let probability = f64::from(cdf[symbol] - low) / 32768.0;
+    -probability.log2()
+}
+
+/// What the tile writer spends to say a block is coded in each of the thirteen
+/// modes, given the modes of the blocks above it and to its left: the luma mode
+/// symbol against the CDF those two neighbours pick, the angle delta a
+/// directional mode carries, and the chroma mode symbol, whose CDF the luma
+/// mode itself indexes.
+///
+/// Without this the search is blind to what a mode costs to name, which is not
+/// a rounding error: a directional mode on a picture that does not run that way
+/// is a rate loss the squared error never sees.
+fn mode_bits(above_mode: u8, left_mode: u8) -> [f64; 13] {
+    let luma = &cdf::KF_Y_MODE[INTRA_MODE_CTX[usize::from(above_mode)]]
+        [INTRA_MODE_CTX[usize::from(left_mode)]];
+    std::array::from_fn(|mode| {
+        let angle = if (usize::from(V_PRED)..=usize::from(D67_PRED)).contains(&mode) {
+            symbol_bits(&cdf::ANGLE_DELTA[mode - usize::from(V_PRED)], 3)
+        } else {
+            0.0
+        };
+        symbol_bits(luma, mode) + angle + symbol_bits(&cdf::UV_MODE_CFL[mode], usize::from(DC_PRED))
+    })
 }
 
 /// What the luma mode search picks between, and under what terms.
@@ -405,15 +473,16 @@ fn coeffs(levels: &[i32], side: usize) -> Vec<Coeff> {
 /// when its planes are not 4:2:0 of that size, or when the tile writer refuses
 /// the quantizer index.
 pub fn encode_key_frame(picture: &Picture, base_q_idx: u8, deadzone: f64) -> Result<Encoded> {
-    encode_key_frame_with_modes(picture, base_q_idx, deadzone, &NON_DIRECTIONAL)
+    encode_key_frame_with_modes(picture, base_q_idx, deadzone, &KEY_FRAME_MODES)
 }
 
 /// Encodes one picture as a key frame, choosing each block's luma mode from
 /// `modes` alone.
 ///
 /// This is what an ablation measures against: `&[DC_PRED]` is the encoder
-/// before the mode search, and [`NON_DIRECTIONAL`] is what
-/// [`encode_key_frame`] uses.
+/// before the mode search, [`crate::intra::NON_DIRECTIONAL`] is it before the
+/// directional modes, and [`KEY_FRAME_MODES`] is what [`encode_key_frame`]
+/// uses.
 ///
 /// # Errors
 /// The same as [`encode_key_frame`], and additionally when `modes` is empty or
@@ -431,7 +500,7 @@ pub fn encode_key_frame_with_modes(
             "a mode search needs at least one mode to choose from",
         ));
     }
-    if let Some(bad) = modes.iter().find(|m| !NON_DIRECTIONAL.contains(m)) {
+    if let Some(bad) = modes.iter().find(|m| !KEY_FRAME_MODES.contains(m)) {
         return Err(Error::unsupported(
             "AV1 encode",
             format!("intra mode {bad} is not one the encoder predicts"),
@@ -471,6 +540,12 @@ pub fn encode_key_frame_with_modes(
     };
 
     let (cols, rows) = (picture.width / BLOCK, picture.height / BLOCK);
+    // The luma mode of the block above and of the block to the left, which is
+    // what picks the CDF the next block's mode is coded against -- the same
+    // bookkeeping the tile writer keeps, so that the search is costing the
+    // symbol the writer will actually write.
+    let mut above_mode = vec![DC_PRED; cols];
+    let mut left_mode = vec![DC_PRED; rows];
     let (sb_cols, sb_rows) = (cols.div_ceil(2), rows.div_ceil(2));
     let mut superblocks = Vec::with_capacity(sb_cols * sb_rows);
     let mut modes = Vec::with_capacity(cols * rows);
@@ -486,13 +561,44 @@ pub fn encode_key_frame_with_modes(
                     continue;
                 }
                 let (x, y) = (col * BLOCK, row * BLOCK);
-                let (luma_coeffs, mode) = luma.search_block(x, y, BLOCK, &search);
+                let (luma_coeffs, mode) = luma.search_block(
+                    At {
+                        x,
+                        y,
+                        side: BLOCK,
+                        reach: Reach::quadrant(quadrant),
+                    },
+                    &search,
+                    &mode_bits(above_mode[col], left_mode[row]),
+                );
+                above_mode[col] = mode;
+                left_mode[row] = mode;
                 modes.push(mode);
                 blocks.push(BlockCoeffs {
                     // Chroma is predicted DC because that is the mode the tile
                     // writer codes for it.
-                    u: chroma[0].code_block(x / 2, y / 2, BLOCK / 2, DC_PRED, base_q_idx, deadzone),
-                    v: chroma[1].code_block(x / 2, y / 2, BLOCK / 2, DC_PRED, base_q_idx, deadzone),
+                    u: chroma[0].code_block(
+                        At {
+                            x: x / 2,
+                            y: y / 2,
+                            side: BLOCK / 2,
+                            reach: Reach::none(),
+                        },
+                        DC_PRED,
+                        base_q_idx,
+                        deadzone,
+                    ),
+                    v: chroma[1].code_block(
+                        At {
+                            x: x / 2,
+                            y: y / 2,
+                            side: BLOCK / 2,
+                            reach: Reach::none(),
+                        },
+                        DC_PRED,
+                        base_q_idx,
+                        deadzone,
+                    ),
                     luma: luma_coeffs,
                     mode,
                 });
@@ -523,7 +629,7 @@ pub fn encode_key_frame_with_modes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::intra::{H_PRED, V_PRED};
+    use crate::intra::{D45_PRED, D135_PRED, H_PRED, KEY_FRAME_MODES, NON_DIRECTIONAL, V_PRED};
     use std::io::Write;
     use std::process::{Command, Stdio};
 
@@ -718,6 +824,21 @@ mod tests {
         picture
     }
 
+    /// Where two planes first disagree, and by how much: a mismatch reported as
+    /// a position says which block and which sample of it went wrong, which a
+    /// pair of thousand-sample arrays does not.
+    fn first_difference(ours: &[u8], theirs: &[u8], width: usize) -> Option<String> {
+        let i = ours.iter().zip(theirs).position(|(a, b)| a != b)?;
+        let differ = ours.iter().zip(theirs).filter(|(a, b)| a != b).count();
+        Some(format!(
+            "{differ} samples differ, first at ({}, {}): ours {} theirs {}",
+            i % width,
+            i / width,
+            ours[i],
+            theirs[i]
+        ))
+    }
+
     /// Every mode the encoder offers has to predict what the decoder predicts,
     /// not just the ones a particular picture happens to choose: each is forced
     /// over a whole picture and the reconstruction gated against ffmpeg.
@@ -727,17 +848,30 @@ mod tests {
             eprintln!("SKIP every_mode_decodes_to_what_the_encoder_predicted: no ffmpeg");
             return;
         }
-        let picture = test_card(128, 96);
-        for mode in NON_DIRECTIONAL {
-            let encoded = encode_key_frame_with_modes(&picture, 100, 0.5, &[mode]).unwrap();
-            let decoded = ffmpeg_decode(&encoded.stream, 128, 96);
-            assert_eq!(decoded.y, encoded.reconstruction.y, "mode {mode}: luma");
-            assert_eq!(decoded.u, encoded.reconstruction.u, "mode {mode}: U");
-            assert_eq!(decoded.v, encoded.reconstruction.v, "mode {mode}: V");
-            assert!(
-                encoded.modes.iter().all(|&m| m == mode),
-                "mode {mode}: the encoder coded something else"
-            );
+        // 128 wide is a whole number of superblocks and 160 is not: the last
+        // superblock of a 160-wide row is half a one, whose blocks have no
+        // above-right samples inside the frame at all.
+        for (width, height) in [(128, 96), (160, 96)] {
+            let picture = test_card(width, height);
+            for mode in KEY_FRAME_MODES {
+                let encoded = encode_key_frame_with_modes(&picture, 100, 0.5, &[mode]).unwrap();
+                let decoded = ffmpeg_decode(&encoded.stream, width, height);
+                for (plane, ours, theirs, stride) in [
+                    ("luma", &encoded.reconstruction.y, &decoded.y, width),
+                    ("U", &encoded.reconstruction.u, &decoded.u, width / 2),
+                    ("V", &encoded.reconstruction.v, &decoded.v, width / 2),
+                ] {
+                    assert!(
+                        first_difference(ours, theirs, stride).is_none(),
+                        "{width}x{height} mode {mode}, {plane}: {}",
+                        first_difference(ours, theirs, stride).unwrap()
+                    );
+                }
+                assert!(
+                    encoded.modes.iter().all(|&m| m == mode),
+                    "mode {mode}: the encoder coded something else"
+                );
+            }
         }
     }
 
@@ -749,7 +883,13 @@ mod tests {
     fn the_search_picks_the_direction_the_picture_runs() {
         for (vertical, want) in [(true, V_PRED), (false, H_PRED)] {
             let picture = stripes(128, 96, vertical);
-            let encoded = encode_key_frame(&picture, 100, 0.5).unwrap();
+            // Only the pair, because on stripes a third mode predicts exactly
+            // what the right one of the pair does -- PAETH reads the corner and
+            // the left column, which a striped picture makes equal -- and the
+            // tie then goes to whichever is cheaper to name, which is not what
+            // this gate is about.
+            let encoded =
+                encode_key_frame_with_modes(&picture, 100, 0.5, &[V_PRED, H_PRED]).unwrap();
             // The first block of the picture has neither neighbour, so it
             // cannot tell the modes apart; every other one can.
             let picked = encoded.modes[1..].iter().filter(|&&m| m == want).count();
@@ -832,16 +972,145 @@ mod tests {
         }
     }
 
+    /// The pictures a sweep is measured over: two synthetic ones, plus a frame
+    /// from each clip named in `EC_AV1_CLIPS` as `path@skip`, colon separated.
+    fn sweep_pictures() -> Vec<(String, Picture)> {
+        let mut pictures = vec![
+            ("test card".to_string(), test_card(160, 96)),
+            ("stripes".to_string(), stripes(160, 96, true)),
+            ("diagonal".to_string(), diagonal(160, 96, true)),
+        ];
+        if let Ok(clips) = std::env::var("EC_AV1_CLIPS") {
+            for entry in clips.split(':').filter(|e| !e.is_empty()) {
+                let (path, skip) = entry.split_once('@').unwrap_or((entry, "0"));
+                let name = path.rsplit('/').next().unwrap_or(path).to_string();
+                pictures.push((name, clip_frame(path, skip, 640, 352)));
+            }
+        }
+        pictures
+    }
+
+    /// What the six directional modes are worth, per picture, at whatever
+    /// `LAMBDA_SCALE` currently is: the rate they save over the seven that read
+    /// no further, and how often the search picks one.
+    #[test]
+    #[ignore = "a sweep, not a gate"]
+    fn probe_directional() {
+        for (name, picture) in sweep_pictures() {
+            let dc = ladder(&picture, &[DC_PRED]);
+            let flat = ladder(&picture, &NON_DIRECTIONAL);
+            let all = ladder(&picture, &KEY_FRAME_MODES);
+            let encoded = encode_key_frame(&picture, 90, 0.5).unwrap();
+            let directional = encoded
+                .modes
+                .iter()
+                .filter(|&&m| (3..=8).contains(&m))
+                .count();
+            // A picture whose ladders sit at different fidelities altogether
+            // has no BD-rate to report -- see the flat-sample-window class.
+            let overlap = |a: &[(f64, f64)], b: &[(f64, f64)]| {
+                a[0].0.max(b[0].0) < a[a.len() - 1].0.min(b[b.len() - 1].0)
+            };
+            let against = |a: &[(f64, f64)], b: &[(f64, f64)]| {
+                if overlap(a, b) {
+                    format!("{:+.2}%", bd_rate(a, b) * 100.0)
+                } else {
+                    "no overlap".to_string()
+                }
+            };
+            println!(
+                "{name}: {} against the seven, {} against DC alone, {directional} of {} blocks directional",
+                against(&flat, &all),
+                against(&dc, &all),
+                encoded.modes.len(),
+            );
+        }
+    }
+
+    /// A picture whose stripes run along a diagonal, one way or the other.
+    /// This is to the directional modes what [`stripes`] is to the vertical and
+    /// horizontal pair: a predictor that walked the edge in the wrong direction
+    /// would answer the two pictures the same way round.
+    fn diagonal(width: usize, height: usize, down_right: bool) -> Picture {
+        let mut picture = Picture::grey(width, height);
+        for y in 0..height {
+            for x in 0..width {
+                let along = if down_right { x + height - y } else { x + y };
+                picture.y[y * width + x] = if (along / 6) % 2 == 0 { 40 } else { 210 };
+            }
+        }
+        picture
+    }
+
+    /// The mode picked by the most blocks of a picture, ignoring the first
+    /// block, which has no neighbours to tell the modes apart with.
+    fn favourite_mode(picture: &Picture) -> (u8, usize, usize) {
+        let encoded = encode_key_frame(picture, 100, 0.5).unwrap();
+        let blocks = &encoded.modes[1..];
+        let mut counts = [0usize; 13];
+        for &mode in blocks {
+            counts[usize::from(mode)] += 1;
+        }
+        let (mode, count) = counts
+            .iter()
+            .enumerate()
+            .max_by_key(|&(_, count)| *count)
+            .expect("thirteen modes");
+        (mode as u8, *count, blocks.len())
+    }
+
+    /// The search has to follow a diagonal the way it runs: stripes down and to
+    /// the right are cheapest predicted at 135 degrees, stripes down and to the
+    /// left at 45. A walk that stepped the wrong way along the edge, or read
+    /// the above row where it should read the left column, would swap these.
+    #[test]
+    fn the_search_picks_the_diagonal_the_picture_runs() {
+        for (down_right, want) in [(true, D135_PRED), (false, D45_PRED)] {
+            let picture = diagonal(160, 96, down_right);
+            let (mode, count, blocks) = favourite_mode(&picture);
+            assert_eq!(
+                mode, want,
+                "down_right={down_right}: {count} of {blocks} blocks picked mode {mode}"
+            );
+        }
+    }
+
+    /// What the directional modes are for: a picture that runs along a diagonal
+    /// costs far less to code with them than the seven that read only their own
+    /// edges can manage, and a picture that runs no particular way costs no
+    /// more. The second half is the one that bites: a mode set the search
+    /// cannot price is a mode set that loses rate on content that does not want
+    /// it, which is what costing the mode symbol is for.
+    #[test]
+    fn the_diagonals_beat_the_modes_that_read_no_further() {
+        for (name, picture, want) in [
+            ("down-right", diagonal(160, 96, true), -0.20),
+            ("down-left", diagonal(160, 96, false), -0.20),
+            ("test card", test_card(160, 96), 0.01),
+        ] {
+            let saved = bd_rate(
+                &ladder(&picture, &NON_DIRECTIONAL),
+                &ladder(&picture, &KEY_FRAME_MODES),
+            );
+            assert!(
+                saved < want,
+                "{name}: the directional modes saved {:.1}% of the rate, wanted better than {:.1}%",
+                saved * 100.0,
+                -want * 100.0
+            );
+        }
+    }
+
     /// A mode the encoder cannot predict must be refused rather than coded as
     /// something else, and a search with nothing to choose from likewise.
     #[test]
     fn a_mode_the_encoder_cannot_predict_is_refused() {
         let picture = test_card(64, 64);
-        let message = encode_key_frame_with_modes(&picture, 100, 0.5, &[3])
+        let message = encode_key_frame_with_modes(&picture, 100, 0.5, &[13])
             .unwrap_err()
             .to_string();
         assert!(
-            message.contains("intra mode 3"),
+            message.contains("intra mode 13"),
             "the refusal must name the mode, got {message}"
         );
         assert!(encode_key_frame_with_modes(&picture, 100, 0.5, &[]).is_err());
