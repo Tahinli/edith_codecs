@@ -7,7 +7,7 @@
 //! the comparison is at matched features, not at matched marketing.
 
 use ec_core::frame::VideoFrame;
-use ec_h265::encoder::{Encoder, EncoderConfig, RateControl};
+use ec_h265::encoder::{Encoder, EncoderConfig, RateControl, TransformSkip};
 
 /// One decoded picture: Y, Cb and Cr planes, cropped and tightly packed.
 type Planes = (Vec<u8>, Vec<u8>, Vec<u8>);
@@ -440,6 +440,13 @@ fn bd_psnr_vs_x265() {
         }
         if let Ok(v) = std::env::var("EC_H265_RDOQ") {
             cfg.rdoq = v != "0";
+        }
+        if let Ok(v) = std::env::var("EC_H265_TSKIP") {
+            cfg.transform_skip = if v != "0" {
+                TransformSkip::AlwaysFor4x4
+            } else {
+                TransformSkip::Off
+            };
         }
         if let Ok(v) = std::env::var("EC_H265_NXN") {
             cfg.intra_nxn = v != "0";

@@ -8,7 +8,7 @@ mod common;
 
 use common::{natural_frame, test_frame};
 use ec_core::frame::VideoFrame;
-use ec_h265::encoder::{EncodedPicture, Encoder, EncoderConfig, RateControl};
+use ec_h265::encoder::{EncodedPicture, Encoder, EncoderConfig, RateControl, TransformSkip};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -255,6 +255,57 @@ fn encode_sdh(width: u32, height: u32, qp: i32, sign_hiding: bool) -> (VideoFram
     (frame, coded)
 }
 
+/// The natural frame coded with transform skip on or off, everything else
+/// left at its default.
+fn encode_tskip(
+    width: u32,
+    height: u32,
+    qp: i32,
+    tskip: TransformSkip,
+) -> (VideoFrame, EncodedPicture) {
+    let mut cfg = EncoderConfig::new(width, height);
+    cfg.transform_skip = tskip;
+    cfg.rate_control = RateControl::ConstantQp(qp);
+    cfg.keep_recon = true;
+    cfg.picture_hash = true;
+    let encoder = Encoder::new(cfg).expect("encoder");
+    let frame = natural_frame(width, height, 0);
+    let coded = encoder.encode_idr(&frame).expect("encode");
+    (frame, coded)
+}
+
+/// Transform skip bypasses the integer transform on 4x4 TUs, coding residual
+/// samples directly with a fixed shift. The encoder and decoder agree only if
+/// the shift matches on both sides; the stream has to differ from the
+/// skip-off one, and ffmpeg's decode has to match the encoder's reconstruction
+/// sample for sample.
+#[test]
+fn transform_skip_decodes_bit_exactly() {
+    if !have_ffmpeg() {
+        eprintln!("skipping: ffmpeg not installed");
+        return;
+    }
+    for &(w, h) in &[(64u32, 64u32), (130, 66), (352, 288)] {
+        let (source, coded) = encode_tskip(w, h, 22, TransformSkip::AlwaysFor4x4);
+        let (_, plain) = encode_tskip(w, h, 22, TransformSkip::Off);
+        let name = format!("transform-skip-{w}x{h}");
+        assert_ne!(
+            coded.au, plain.au,
+            "{name}: no TU ever skipped, so this decode proves nothing"
+        );
+        let path = write_au(&name, &coded);
+        let decoded = match ffmpeg_decode(&path) {
+            Ok(bytes) => bytes,
+            Err(e) => panic!("{name}: ffmpeg failed: {e}"),
+        };
+        let recon = planes_of(coded.recon.as_ref().expect("recon kept"));
+        assert_eq!(decoded.len(), recon.len(), "{name}: size mismatch");
+        let mismatches = decoded.iter().zip(&recon).filter(|(a, b)| a != b).count();
+        assert_eq!(mismatches, 0, "{name}: {mismatches} samples differ");
+        let quality = psnr(&planes_of(&source), &recon);
+        assert!(quality > 30.0, "{name}: PSNR {quality:.2} dB at QP 22");
+    }
+}
 #[test]
 fn ffmpeg_decodes_bit_exactly_at_every_shape() {
     if !have_ffmpeg() {
