@@ -75,6 +75,24 @@ pub struct EncoderConfig {
     pub ctb_size: usize,
     /// How many of the 35 intra modes get a full rate-distortion trial, on top
     /// of the most probable mode, which always gets one.
+    ///
+    /// Swept against x265 at matched features on four real clips (BD-PSNR
+    /// luma / all-plane, wall time for the whole four-QP ladder):
+    ///
+    /// | k | film 3840x1608 | web 1138x640 | screen 2560x1440 | phone 1080p |
+    /// |---|----------------|-------------------|------------------|-------------|
+    /// | 1 | -0.840 / -0.815 38s | -0.728 / -0.733 8s | | |
+    /// | 2 | -0.731 / -0.730 40s | -0.603 / -0.632 9s | -2.521 / -2.420 29s | -0.435 / -0.444 11s |
+    /// | 3 | -0.703 / -0.709 43s | -0.556 / -0.596 10s | -2.493 / -2.402 31s | -0.401 / -0.416 11s |
+    /// | 4 | -0.693 / -0.705 46s | -0.530 / -0.574 10s | | |
+    /// | 5 | -0.685 / -0.703 49s | -0.507 / -0.556 11s | -2.465 / -2.360 35s | -0.366 / -0.387 13s |
+    /// | 8 | -0.684 / -0.710 59s | -0.471 / -0.525 14s | -2.453 / -2.368 41s | -0.340 / -0.361 16s |
+    ///
+    /// Every clip improves monotonically up to 5, which is why 5 is the
+    /// default. Eight buys nothing on the film clip (+0.001 luma, and its
+    /// all-plane figure goes *backwards*) for another 20% of wall time, so the
+    /// knee is where the default sits. `EC_H265_RDO_CANDIDATES` in the gate
+    /// test re-runs the sweep.
     pub rdo_candidates: usize,
     /// Smallest coding unit the search will produce, 8 or 16. Sixteen is a
     /// *coarser* search that is not always faster: on real pictures the 8x8
@@ -106,7 +124,7 @@ impl EncoderConfig {
             rate_control: RateControl::ConstantQp(27),
             threads: 0,
             ctb_size: 32,
-            rdo_candidates: 2,
+            rdo_candidates: 5,
             min_cu_size: 8,
             video_signal_type: None,
             sample_aspect_ratio: None,
