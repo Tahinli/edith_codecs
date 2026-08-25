@@ -244,7 +244,7 @@ pub fn split_dc_key_frame_tile(
                     dc_level,
                     dc_sign_ctx(above[c as usize], left[r as usize]),
                     &cdf::TXB_SKIP_LUMA_32,
-                    &cdf::COEFF_BASE_EOB_LUMA_32,
+                    &cdf::COEFF_BASE_EOB_LUMA_32[0],
                 );
                 enc.symbol_fixed(1, &cdf::TXB_SKIP_CHROMA_16);
                 enc.symbol_fixed(1, &cdf::TXB_SKIP_CHROMA_16);
@@ -255,6 +255,318 @@ pub fn split_dc_key_frame_tile(
         }
     }
     Ok(enc.finish())
+}
+
+/// One quantised coefficient of a 32x32 luma transform block.
+///
+/// `row` and `col` are its position in the transform, not in the picture: a
+/// coefficient at row 0 varies along the picture's width and one at column 0
+/// along its height, and the coefficient at the origin is the DC the block's
+/// average sample value rides on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Coeff {
+    /// The coefficient's row in the transform, 0..32.
+    pub row: u8,
+    /// The coefficient's column in the transform, 0..32.
+    pub col: u8,
+    /// Its quantised level, which the base and base-range syntax carry for
+    /// magnitudes up to [`MAX_LEVEL`].
+    pub level: i32,
+}
+
+/// Side of the luma transform the coefficient writer codes.
+const TX32: usize = 32;
+/// How many coefficients that transform holds.
+const TX32_AREA: usize = TX32 * TX32;
+
+/// Writes the payload of a one-tile key frame in which every superblock is
+/// split into four 32x32 DC-predicted blocks, each carrying the luma
+/// coefficients `blocks` gives it and no chroma residual.
+///
+/// `blocks` gives one coefficient list per 32x32 block in raster order across
+/// the frame, so it is twice as wide and twice as tall as the superblock grid.
+/// An empty list writes an all-zero transform block. Unlike the DC writers,
+/// the coefficients may sit anywhere in the transform, so a block here is a
+/// picture rather than a flat grey: a single coefficient off the origin
+/// decodes to the basis function it selects.
+///
+/// # Errors
+/// Returns an error when the frame is not a whole number of 64x64
+/// superblocks, when `blocks` does not carry exactly one list per 32x32 block,
+/// when a coefficient sits outside the transform, repeats a position, carries
+/// a zero level or one wider than the base and base-range syntax reach, or
+/// when `base_q_idx` is outside the q-context band whose default CDFs this
+/// crate carries.
+pub fn split_coeff_key_frame_tile(
+    mi_cols: u32,
+    mi_rows: u32,
+    base_q_idx: u8,
+    blocks: &[Vec<Coeff>],
+) -> Result<Vec<u8>> {
+    check_superblocks(mi_cols, mi_rows)?;
+    let (sb_cols, sb_rows) = (mi_cols / SB_MI, mi_rows / SB_MI);
+    let (cols, rows) = (sb_cols * 2, sb_rows * 2);
+    if blocks.len() != (cols * rows) as usize {
+        return Err(Error::unsupported(
+            "AV1 tile",
+            "a coefficient key frame needs one coefficient list per 32x32 block",
+        ));
+    }
+    if !Q_CTX_2.contains(&base_q_idx) {
+        return Err(Error::unsupported(
+            "AV1 tile",
+            "the coefficient CDFs of only one q context are known, so \
+             base_q_idx must be 61..=120",
+        ));
+    }
+    let grids = blocks
+        .iter()
+        .map(|b| level_grid(b))
+        .collect::<Result<Vec<_>>>()?;
+
+    let scan = default_scan_32();
+    // The sign of each coded block's DC, for the neighbours the DC sign
+    // context is read from. A block whose DC is zero casts no vote, however
+    // much its other coefficients carry.
+    let mut above: Vec<Option<bool>> = vec![None; cols as usize];
+    let mut left: Vec<Option<bool>> = vec![None; rows as usize];
+
+    let mut enc = SymbolEncoder::new();
+    for sb_r in 0..sb_rows {
+        left.iter_mut().for_each(|l| *l = None);
+        for sb_c in 0..sb_cols {
+            let ctx = 2 * usize::from(sb_c > 0) + usize::from(sb_r > 0);
+            enc.symbol_fixed(PARTITION_SPLIT, &cdf::PARTITION_W64[ctx]);
+
+            for quadrant in 0..4 {
+                let (r, c) = (sb_r * 2 + quadrant / 2, sb_c * 2 + quadrant % 2);
+                let grid = &grids[(r * cols + c) as usize];
+
+                enc.symbol_fixed(PARTITION_NONE, &cdf::PARTITION_W32[0]);
+                enc.symbol_fixed(0, &cdf::SKIP[0]);
+                enc.symbol_fixed(DC_PRED, &cdf::KF_Y_MODE[0][0]);
+                enc.symbol_fixed(DC_PRED, &cdf::UV_MODE_CFL_DC);
+
+                write_coeffs(
+                    &mut enc,
+                    grid,
+                    &scan,
+                    dc_sign_ctx(above[c as usize], left[r as usize]),
+                );
+                enc.symbol_fixed(1, &cdf::TXB_SKIP_CHROMA_16);
+                enc.symbol_fixed(1, &cdf::TXB_SKIP_CHROMA_16);
+
+                let dc = grid[0];
+                let vote = (dc != 0).then_some(dc < 0);
+                above[c as usize] = vote;
+                left[r as usize] = vote;
+            }
+        }
+    }
+    Ok(enc.finish())
+}
+
+/// Lays one block's coefficient list out over the transform, rejecting the
+/// positions and levels the writer does not code.
+fn level_grid(coeffs: &[Coeff]) -> Result<Vec<i32>> {
+    let mut grid = vec![0i32; TX32_AREA];
+    for coeff in coeffs {
+        if usize::from(coeff.row) >= TX32 || usize::from(coeff.col) >= TX32 {
+            return Err(Error::unsupported(
+                "AV1 tile",
+                "a coefficient sits outside the 32x32 transform the writer codes",
+            ));
+        }
+        if coeff.level == 0 || coeff.level.abs() > MAX_LEVEL {
+            return Err(Error::unsupported(
+                "AV1 tile",
+                "coefficients are written for levels -14..=14 without zero; \
+                 wider levels need the Golomb tail",
+            ));
+        }
+        let pos = usize::from(coeff.row) * TX32 + usize::from(coeff.col);
+        if grid[pos] != 0 {
+            return Err(Error::unsupported(
+                "AV1 tile",
+                "two coefficients of one block share a position",
+            ));
+        }
+        grid[pos] = coeff.level;
+    }
+    Ok(grid)
+}
+
+/// The default scan of a 32x32 transform (spec 8.4.2's `Default_Scan_32x32`),
+/// as raster positions in the order they are coded.
+///
+/// The table is a rule rather than a thousand pinned numbers: the scan walks
+/// the anti-diagonals of the transform outwards from the origin, each diagonal
+/// from its top-right end on odd diagonals and from its bottom-left end on
+/// even ones.
+fn default_scan_32() -> Vec<u16> {
+    let mut scan = Vec::with_capacity(TX32_AREA);
+    for d in 0..(2 * TX32 - 1) {
+        let lo = d.saturating_sub(TX32 - 1);
+        let hi = d.min(TX32 - 1);
+        let diagonal = (lo..=hi).map(|row| (row * TX32 + (d - row)) as u16);
+        if d % 2 == 0 {
+            scan.extend(diagonal.rev());
+        } else {
+            scan.extend(diagonal);
+        }
+    }
+    scan
+}
+
+/// coeffs() for a luma transform block of any coefficients the base and
+/// base-range syntax reach (spec 5.11.39).
+///
+/// The block is its own transform size, so the all-zero flag's context is 0;
+/// a 32x32 transform is DCT-only, so no transform type is coded; and the
+/// levels the contexts below are read from are the levels of coefficients
+/// later in the scan, which a decoder walking the scan backwards already has.
+fn write_coeffs(enc: &mut SymbolEncoder, grid: &[i32], scan: &[u16], sign_ctx: usize) {
+    let eob = scan
+        .iter()
+        .rposition(|&pos| grid[pos as usize] != 0)
+        .map_or(0, |i| i + 1);
+    enc.symbol_fixed(usize::from(eob == 0), &cdf::TXB_SKIP_LUMA_32);
+    if eob == 0 {
+        return;
+    }
+
+    write_eob(enc, eob);
+
+    for scan_idx in (0..eob).rev() {
+        let pos = scan[scan_idx] as usize;
+        let (row, col) = (pos / TX32, pos % TX32);
+        let level = grid[pos].abs();
+        if scan_idx == eob - 1 {
+            let ctx = eob_coeff_ctx(scan_idx);
+            enc.symbol_fixed(
+                (level.min(NUM_BASE_LEVELS + 1) - 1) as usize,
+                &cdf::COEFF_BASE_EOB_LUMA_32[ctx],
+            );
+        } else {
+            let ctx = base_ctx(grid, row, col);
+            enc.symbol_fixed(
+                level.min(NUM_BASE_LEVELS + 1) as usize,
+                &cdf::COEFF_BASE_LUMA_32[ctx],
+            );
+        }
+        if level > NUM_BASE_LEVELS {
+            let ctx = br_ctx(grid, row, col);
+            let mut remaining = level - (NUM_BASE_LEVELS + 1);
+            let mut sent = 0;
+            while sent < COEFF_BASE_RANGE {
+                let k = remaining.min(BR_STEP);
+                enc.symbol_fixed(k as usize, &cdf::COEFF_BR_LUMA_32[ctx]);
+                if k < BR_STEP {
+                    break;
+                }
+                remaining -= k;
+                sent += BR_STEP;
+            }
+        }
+    }
+
+    // The signs come after the levels, in scan order, the DC's from a CDF and
+    // the rest as raw bits (spec 5.11.39).
+    for &pos in &scan[..eob] {
+        let level = grid[pos as usize];
+        if level == 0 {
+            continue;
+        }
+        if pos == 0 {
+            enc.symbol_fixed(usize::from(level < 0), &cdf::DC_SIGN_LUMA[sign_ctx]);
+        } else {
+            enc.literal(u32::from(level < 0), 1);
+        }
+    }
+}
+
+/// The end-of-block position (spec 5.11.39): which group of scan positions the
+/// last coded coefficient falls in, then its offset inside that group — the
+/// offset's top bit from a CDF and the rest as raw bits.
+fn write_eob(enc: &mut SymbolEncoder, eob: usize) {
+    /// `Eob_Group_Start` (spec 5.11.39): the first scan position each group of
+    /// end-of-block positions covers, indexed by the group's own number.
+    const GROUP_START: [usize; 12] = [0, 1, 2, 3, 5, 9, 17, 33, 65, 129, 257, 513];
+    /// `Eob_Offset_Bits` (spec 5.11.39): how wide each group's offset is.
+    const OFFSET_BITS: [u32; 12] = [0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+
+    let group = GROUP_START
+        .iter()
+        .rposition(|&start| start <= eob)
+        .expect("the first group starts at zero");
+    // A 32x32 transform codes its end-of-block group out of the eleven the
+    // 1024-coefficient alphabet carries, numbered from one.
+    enc.symbol_fixed(group - 1, &cdf::EOB_PT_1024_LUMA);
+
+    let bits = OFFSET_BITS[group];
+    if bits > 0 {
+        let offset = (eob - GROUP_START[group]) as u32;
+        let top = (offset >> (bits - 1)) & 1;
+        enc.symbol_fixed(top as usize, &cdf::EOB_EXTRA_LUMA_32[group - 3]);
+        if bits > 1 {
+            enc.literal(offset & ((1 << (bits - 1)) - 1), bits - 1);
+        }
+    }
+}
+
+/// The context of the level of the last coded coefficient (spec 8.3.2): how
+/// far into the scan it sits, in quarters and eighths of the transform.
+fn eob_coeff_ctx(scan_idx: usize) -> usize {
+    match scan_idx {
+        0 => 0,
+        i if i <= TX32_AREA / 8 => 1,
+        i if i <= TX32_AREA / 4 => 2,
+        _ => 3,
+    }
+}
+
+/// The context of a coefficient's level (spec 8.3.2): the magnitudes of the
+/// five neighbours below and to the right of it — the ones a decoder walking
+/// the scan backwards already has — plus a term for where in the transform it
+/// sits. The DC reads context 0 whatever its neighbours carry.
+fn base_ctx(grid: &[i32], row: usize, col: usize) -> usize {
+    if row == 0 && col == 0 {
+        return 0;
+    }
+    let mag: i32 = [(1, 0), (0, 1), (1, 1), (2, 0), (0, 2)]
+        .iter()
+        .map(|&(dr, dc)| neighbour(grid, row + dr, col + dc).abs().min(3))
+        .sum();
+    let offset = cdf::NZ_MAP_CTX_OFFSET_32[row.min(4)][col.min(4)] as usize;
+    (((mag + 1) >> 1).min(4) as usize) + offset
+}
+
+/// The context of a coefficient's base-range tail (spec 8.3.2): the magnitudes
+/// of its three closest neighbours below and to the right, uncapped, and a
+/// term separating the DC, the corner of the transform, and the rest.
+fn br_ctx(grid: &[i32], row: usize, col: usize) -> usize {
+    let mag: i32 = [(1, 0), (0, 1), (1, 1)]
+        .iter()
+        .map(|&(dr, dc)| neighbour(grid, row + dr, col + dc).abs())
+        .sum();
+    let mag = (((mag + 1) >> 1).min(6)) as usize;
+    if row == 0 && col == 0 {
+        mag
+    } else if row < 2 && col < 2 {
+        mag + 7
+    } else {
+        mag + 14
+    }
+}
+
+/// A level at a position that may fall off the transform, where the levels a
+/// context reads are zero.
+fn neighbour(grid: &[i32], row: usize, col: usize) -> i32 {
+    if row >= TX32 || col >= TX32 {
+        0
+    } else {
+        grid[row * TX32 + col]
+    }
 }
 
 /// Shared by both DC writers: one level per block, none of them zero, and a
@@ -305,7 +617,7 @@ fn write_dc_coeffs(
         let mut sent = 0;
         while sent < COEFF_BASE_RANGE {
             let k = remaining.min(BR_STEP);
-            enc.symbol_fixed(k as usize, &cdf::COEFF_BR_LUMA);
+            enc.symbol_fixed(k as usize, &cdf::COEFF_BR_LUMA_32[0]);
             if k < BR_STEP {
                 break;
             }
@@ -809,5 +1121,365 @@ mod tests {
     fn partial_superblocks_are_refused() {
         assert!(flat_key_frame_tile(16, 20).is_err());
         assert!(flat_key_frame_tile(0, 16).is_err());
+    }
+
+    /// Encodes a 64x64 key frame whose four 32x32 blocks carry `blocks` and
+    /// hands back the luma plane as rows of samples.
+    fn decode_coeff_quadrants(blocks: &[Vec<Coeff>]) -> Vec<Vec<u8>> {
+        let (seq, header) = frame_of(64, 64);
+        let tile =
+            split_coeff_key_frame_tile(header.mi_cols, header.mi_rows, Q_IDX, blocks).unwrap();
+        let mut stream = temporal_delimiter();
+        stream.extend_from_slice(&sequence_header_obu(&seq).unwrap());
+        stream.extend_from_slice(&frame_obu(&seq, &header, &tile).unwrap());
+        let planes = ffmpeg_decode(&stream, 64, 64);
+        let (luma, chroma) = planes.split_at(64 * 64);
+        for (i, &s) in chroma.iter().enumerate() {
+            assert_eq!(
+                s, 128,
+                "chroma sample {i}: no block codes a chroma coefficient, and a \
+                 DC prediction with no coded neighbour is mid-grey"
+            );
+        }
+        luma.chunks_exact(64).map(<[u8]>::to_vec).collect()
+    }
+
+    /// The top-left 32x32 block of a decoded frame, which is the only one whose
+    /// prediction has no neighbour to lean on.
+    fn top_left_block(rows: &[Vec<u8>]) -> Vec<Vec<u8>> {
+        rows[..32].iter().map(|r| r[..32].to_vec()).collect()
+    }
+
+    /// A transform's basis functions all average to zero except the DC's, so a
+    /// block carrying no DC decodes to samples that average to its prediction —
+    /// mid-grey for the block with no neighbours. Rounding of the inverse
+    /// transform moves the average by less than a sample.
+    fn assert_mean_is_mid_grey(block: &[Vec<u8>]) {
+        let sum: i32 = block.iter().flatten().map(|&s| i32::from(s)).sum();
+        let mean = f64::from(sum) / (32.0 * 32.0);
+        assert!(
+            (mean - 128.0).abs() <= 1.0,
+            "a block with no DC coefficient averages to its mid-grey prediction, got {mean}"
+        );
+    }
+
+    /// A coefficient at row 0, column 1 selects the basis function that is flat
+    /// down the block and a half-cycle of a cosine across it. Nothing about
+    /// that shape is pinned here: every row of the block must be the same row,
+    /// the samples must fall from left to right and actually move, and the
+    /// block must still average to its prediction. A desync in the scan, the
+    /// end-of-block position or the level contexts breaks one of those.
+    #[test]
+    fn a_coefficient_off_the_origin_selects_its_own_basis_function() {
+        if !have_ffmpeg() {
+            eprintln!(
+                "SKIP a_coefficient_off_the_origin_selects_its_own_basis_function: no ffmpeg"
+            );
+            return;
+        }
+        let blocks = vec![
+            vec![Coeff {
+                row: 0,
+                col: 1,
+                level: 12,
+            }],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ];
+        let rows = decode_coeff_quadrants(&blocks);
+        let block = top_left_block(&rows);
+
+        for (y, row) in block.iter().enumerate() {
+            assert_eq!(row, &block[0], "row {y} of a horizontal basis function");
+        }
+        assert!(
+            block[0][0] > block[0][31],
+            "a positive coefficient leans the block towards its left edge: {:?}",
+            block[0]
+        );
+        for x in 1..32 {
+            assert!(
+                block[0][x] <= block[0][x - 1],
+                "the half-cycle falls from left to right, broke at column {x}: {:?}",
+                block[0]
+            );
+        }
+        assert_mean_is_mid_grey(&block);
+
+        // The same coefficient transposed selects the basis function that is
+        // flat across the block and a half-cycle down it.
+        let blocks = vec![
+            vec![Coeff {
+                row: 1,
+                col: 0,
+                level: 12,
+            }],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ];
+        let rows = decode_coeff_quadrants(&blocks);
+        let block = top_left_block(&rows);
+        for (y, row) in block.iter().enumerate() {
+            for (x, &s) in row.iter().enumerate() {
+                assert_eq!(s, row[0], "sample ({y},{x}) of a vertical basis function");
+            }
+        }
+        assert!(
+            block[0][0] > block[31][0],
+            "a positive coefficient leans the block up"
+        );
+        for y in 1..32 {
+            assert!(
+                block[y][0] <= block[y - 1][0],
+                "the half-cycle falls from top to bottom, broke at row {y}"
+            );
+        }
+        assert_mean_is_mid_grey(&block);
+    }
+
+    /// A coefficient late in the scan pushes the end-of-block position into a
+    /// group that carries an offset — the far corner of a 32x32 transform is
+    /// the last of the eleven groups, whose offset is nine bits wide, one of
+    /// them from a CDF and the rest raw. Every coefficient before it is coded
+    /// too, so this also walks the base and base-range contexts over a block
+    /// with neighbours that carry levels rather than zeros.
+    #[test]
+    fn a_coefficient_in_the_far_corner_reaches_the_last_end_of_block_group() {
+        if !have_ffmpeg() {
+            eprintln!("SKIP a_coefficient_in_the_far_corner_reaches_the_last_end_of_block_group");
+            return;
+        }
+        let block = vec![
+            Coeff {
+                row: 31,
+                col: 31,
+                level: 5,
+            },
+            Coeff {
+                row: 5,
+                col: 7,
+                level: -9,
+            },
+            Coeff {
+                row: 1,
+                col: 1,
+                level: 14,
+            },
+            Coeff {
+                row: 0,
+                col: 2,
+                level: -3,
+            },
+            Coeff {
+                row: 2,
+                col: 0,
+                level: 2,
+            },
+            Coeff {
+                row: 1,
+                col: 2,
+                level: -1,
+            },
+        ];
+        let rows = decode_coeff_quadrants(&[block, Vec::new(), Vec::new(), Vec::new()]);
+        let block = top_left_block(&rows);
+        assert_mean_is_mid_grey(&block);
+        assert!(
+            block.iter().flatten().any(|&s| s != block[0][0]),
+            "six coefficients do not decode to a flat block"
+        );
+        // The blocks that carry nothing are flat: their prediction is whatever
+        // their neighbours left, and they add no residual to it.
+        for (name, ys, xs) in [("top right", 0..32, 32..64), ("bottom left", 32..64, 0..32)] {
+            let first = rows[ys.start][xs.start];
+            for y in ys {
+                for x in xs.clone() {
+                    assert_eq!(rows[y][x], first, "the {name} block carries no coefficient");
+                }
+            }
+        }
+    }
+
+    /// Neighbouring blocks that each carry coefficients read their DC sign
+    /// context, their prediction and their own contexts off each other, so a
+    /// frame whose four blocks all carry mixed-sign coefficients exercises what
+    /// a single coded block cannot. The check is that it decodes at all — a
+    /// desync anywhere fails the decode or the frame size — and that the block
+    /// with no neighbours still averages to mid-grey.
+    #[test]
+    fn every_quadrant_carries_its_own_coefficients() {
+        if !have_ffmpeg() {
+            eprintln!("SKIP every_quadrant_carries_its_own_coefficients: no ffmpeg");
+            return;
+        }
+        let blocks = vec![
+            vec![
+                Coeff {
+                    row: 0,
+                    col: 1,
+                    level: 7,
+                },
+                Coeff {
+                    row: 3,
+                    col: 4,
+                    level: -14,
+                },
+            ],
+            vec![
+                Coeff {
+                    row: 0,
+                    col: 0,
+                    level: -6,
+                },
+                Coeff {
+                    row: 2,
+                    col: 2,
+                    level: 9,
+                },
+            ],
+            vec![
+                Coeff {
+                    row: 0,
+                    col: 0,
+                    level: 6,
+                },
+                Coeff {
+                    row: 1,
+                    col: 0,
+                    level: -2,
+                },
+                Coeff {
+                    row: 8,
+                    col: 9,
+                    level: 3,
+                },
+            ],
+            vec![
+                Coeff {
+                    row: 0,
+                    col: 0,
+                    level: 11,
+                },
+                Coeff {
+                    row: 16,
+                    col: 1,
+                    level: -4,
+                },
+            ],
+        ];
+        let rows = decode_coeff_quadrants(&blocks);
+        assert_mean_is_mid_grey(&top_left_block(&rows));
+        for (name, ys, xs) in [
+            ("top right", 0..32, 32..64),
+            ("bottom left", 32..64, 0..32),
+            ("bottom right", 32..64, 32..64),
+        ] {
+            let block: Vec<Vec<u8>> = rows[ys].iter().map(|r| r[xs.clone()].to_vec()).collect();
+            assert!(
+                block.iter().flatten().any(|&s| s != block[0][0]),
+                "the {name} block carries coefficients, so it is not flat"
+            );
+        }
+    }
+
+    /// The coefficient writer refuses what it cannot code rather than writing a
+    /// stream a decoder walks off the end of.
+    #[test]
+    fn coefficients_the_writer_cannot_code_are_refused() {
+        let empty = || vec![Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        let cases: [(&str, Vec<Vec<Coeff>>); 5] = [
+            ("one list short", vec![Vec::new(), Vec::new(), Vec::new()]),
+            ("off the transform", {
+                let mut b = empty();
+                b[0] = vec![Coeff {
+                    row: 32,
+                    col: 0,
+                    level: 1,
+                }];
+                b
+            }),
+            ("a zero level", {
+                let mut b = empty();
+                b[1] = vec![Coeff {
+                    row: 0,
+                    col: 0,
+                    level: 0,
+                }];
+                b
+            }),
+            ("a level past the base-range tail", {
+                let mut b = empty();
+                b[2] = vec![Coeff {
+                    row: 0,
+                    col: 0,
+                    level: 15,
+                }];
+                b
+            }),
+            ("two coefficients at one position", {
+                let mut b = empty();
+                b[3] = vec![
+                    Coeff {
+                        row: 4,
+                        col: 4,
+                        level: 1,
+                    },
+                    Coeff {
+                        row: 4,
+                        col: 4,
+                        level: 2,
+                    },
+                ];
+                b
+            }),
+        ];
+        for (name, blocks) in cases {
+            assert!(
+                split_coeff_key_frame_tile(16, 16, Q_IDX, &blocks).is_err(),
+                "{name} must be refused"
+            );
+        }
+        assert!(
+            split_coeff_key_frame_tile(16, 16, 200, &empty()).is_err(),
+            "a q index outside the band whose CDFs are known must be refused"
+        );
+    }
+
+    /// The default scan is written as the rule that generates it rather than a
+    /// thousand pinned numbers, so the rule is checked against what a scan must
+    /// be: every position exactly once, the origin first, and never a position
+    /// before one it sits diagonally behind — which is what lets a decoder read
+    /// a coefficient's context off the coefficients it has already decoded.
+    #[test]
+    fn the_default_scan_walks_every_position_outwards() {
+        let scan = default_scan_32();
+        assert_eq!(scan.len(), TX32_AREA);
+        let mut seen = vec![false; TX32_AREA];
+        for &pos in &scan {
+            assert!(!seen[pos as usize], "position {pos} is scanned twice");
+            seen[pos as usize] = true;
+        }
+        assert_eq!(scan[0], 0, "the scan starts at the DC");
+
+        let mut order = vec![0usize; TX32_AREA];
+        for (i, &pos) in scan.iter().enumerate() {
+            order[pos as usize] = i;
+        }
+        for row in 0..TX32 {
+            for col in 0..TX32 {
+                for (dr, dc) in [(1, 0), (0, 1), (1, 1), (2, 0), (0, 2)] {
+                    let (nr, nc) = (row + dr, col + dc);
+                    if nr < TX32 && nc < TX32 {
+                        assert!(
+                            order[nr * TX32 + nc] > order[row * TX32 + col],
+                            "({nr},{nc}) is a context neighbour of ({row},{col}), so it must be \
+                             scanned after it"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
