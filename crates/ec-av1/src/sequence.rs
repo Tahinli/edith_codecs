@@ -234,14 +234,14 @@ pub fn sequence_header_obu(s: &SequenceHeader) -> Result<Vec<u8>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use ec_av1_syntax::obu::{ObuHeader, read_leb128};
     use ec_av1_syntax::sequence::SequenceHeader;
     use ec_core::{BitReader, BitWriter};
 
     /// A realistic 1920x1080 8-bit 4:2:0 main-profile sequence header.
-    fn sample_1080p() -> SequenceHeader {
+    pub(crate) fn sample_1080p() -> SequenceHeader {
         SequenceHeader {
             seq_profile: 0,
             still_picture: false,
