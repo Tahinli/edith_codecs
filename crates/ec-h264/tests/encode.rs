@@ -913,7 +913,7 @@ fn clip_sources(path: &std::ffi::OsStr, want: usize) -> (usize, usize, Vec<Plane
     (w, h, sources)
 }
 
-/// BD-PSNR of the opt-in `transform_8x8` flag against flag-off on one real
+/// BD-PSNR of the `transform_8x8` flag (on by default) against flag-off on one real
 /// clip from the library, full size, over a QP sweep: the number the synthetic
 /// gate above cannot give, because the synthetic clip is content the flag wins
 /// on. Prints the per-QP points, the BD-PSNR and the 8x8 macroblock share;
