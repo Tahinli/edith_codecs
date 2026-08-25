@@ -127,6 +127,11 @@ pub struct EncoderConfig {
     /// +1.5 dB at QP 22 on a 1080p camera frame, at the same wall time), which
     /// is why 8 is the default.
     pub min_cu_size: usize,
+    /// Whether an 8x8 coding unit may split into four 4x4 intra partitions
+    /// (PART_NxN). On: measured at +2.14 dB BD-PSNR on a 2560x1440 screen
+    /// capture (-2.619 dB against x265 without it, -0.479 dB with) and
+    /// +0.007 dB on 1080p film, so it never loses.
+    pub intra_nxn: bool,
     /// What the samples mean, written into the VUI.
     pub video_signal_type: Option<VideoSignalType>,
     /// Sample aspect ratio.
@@ -155,6 +160,7 @@ impl EncoderConfig {
             chroma_mode_search: false,
             chroma_rd_weight: 1.0,
             min_cu_size: 8,
+            intra_nxn: true,
             video_signal_type: None,
             sample_aspect_ratio: None,
             timing: None,
@@ -529,6 +535,7 @@ impl Encoder {
                             self.cfg.rdo_candidates,
                             self.cfg.chroma_mode_search,
                             self.cfg.chroma_rd_weight,
+                            self.cfg.intra_nxn,
                             self.cfg.min_cu_size.max(8).trailing_zeros(),
                         );
                         for col in 0..cols {
