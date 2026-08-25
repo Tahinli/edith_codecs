@@ -451,6 +451,9 @@ fn bd_psnr_vs_x265() {
         if let Ok(v) = std::env::var("EC_H265_NXN") {
             cfg.intra_nxn = v != "0";
         }
+        if let Ok(v) = std::env::var("EC_H265_RQT") {
+            cfg.rqt = v != "0";
+        }
         if let Ok(k) = std::env::var("EC_H265_RDO_CANDIDATES") {
             cfg.rdo_candidates = k.parse().expect("EC_H265_RDO_CANDIDATES must be a number");
         }
