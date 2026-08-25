@@ -16,6 +16,8 @@ use crate::msac::SymbolEncoder;
 
 /// `PARTITION_NONE` (spec 6.10.4): the whole block, undivided.
 const PARTITION_NONE: usize = 0;
+/// `PARTITION_SPLIT` (spec 6.10.4): the block cut into four quadrants.
+const PARTITION_SPLIT: usize = 3;
 /// `DC_PRED` (spec 6.10.2), as both the luma and the chroma mode.
 const DC_PRED: usize = 0;
 /// Side of a superblock in 4x4 mode-info units when 128x128 superblocks are off.
@@ -141,10 +143,127 @@ pub fn dc_key_frame_tile_levels(
 ) -> Result<Vec<u8>> {
     check_superblocks(mi_cols, mi_rows)?;
     let (sb_cols, sb_rows) = (mi_cols / SB_MI, mi_rows / SB_MI);
-    if levels.len() != (sb_cols * sb_rows) as usize {
+    check_levels(levels, (sb_cols * sb_rows) as usize, base_q_idx)?;
+
+    // The sign of the DC each coded block left behind, for the two neighbours
+    // the sign context is read from: one row of them above, and the block to
+    // the left, which is dropped at the start of every superblock row the way a
+    // decoder clears its left context there.
+    let mut above: Vec<Option<bool>> = vec![None; sb_cols as usize];
+    let mut enc = SymbolEncoder::new();
+    for r in 0..sb_rows {
+        let mut left: Option<bool> = None;
+        for c in 0..sb_cols {
+            let dc_level = levels[(r * sb_cols + c) as usize];
+            let negative = dc_level < 0;
+
+            enc.symbol_fixed(PARTITION_NONE, &cdf::PARTITION_W64[0]);
+
+            // Nothing is skipped now, so every neighbour's skip flag is 0 and
+            // the skip context stays 0 across the frame.
+            enc.symbol_fixed(0, &cdf::SKIP[0]);
+            enc.symbol_fixed(DC_PRED, &cdf::KF_Y_MODE[0][0]);
+            enc.symbol_fixed(DC_PRED, &cdf::UV_MODE_NO_CFL[DC_PRED]);
+
+            write_dc_coeffs(
+                &mut enc,
+                dc_level,
+                dc_sign_ctx(above[c as usize], left),
+                &cdf::TXB_SKIP_LUMA_64,
+                &cdf::COEFF_BASE_EOB_LUMA_64,
+            );
+
+            // Both chroma transform blocks are all-zero. Their planes carry no
+            // coded coefficient anywhere in the frame, so the neighbour halves
+            // of their context stay 0 and only the offset for a transform block
+            // that covers its whole plane block is left: context 7.
+            enc.symbol_fixed(1, &cdf::TXB_SKIP_CHROMA_32);
+            enc.symbol_fixed(1, &cdf::TXB_SKIP_CHROMA_32);
+
+            above[c as usize] = Some(negative);
+            left = Some(negative);
+        }
+    }
+    Ok(enc.finish())
+}
+
+/// Writes the payload of a one-tile key frame in which every superblock is
+/// split into four 32x32 DC-predicted blocks, each carrying one luma DC
+/// coefficient and no chroma residual.
+///
+/// `levels` gives one level per 32x32 block in raster order across the frame,
+/// so the grid is twice as wide and twice as tall as the superblock grid. The
+/// blocks are coded in the z-order a superblock's split walks, but every
+/// block's neighbours above and to its left are coded before it either way, so
+/// the picture reads in raster order.
+///
+/// # Errors
+/// As [`dc_key_frame_tile_levels`], with `levels` sized for the 32x32 grid.
+pub fn split_dc_key_frame_tile(
+    mi_cols: u32,
+    mi_rows: u32,
+    base_q_idx: u8,
+    levels: &[i32],
+) -> Result<Vec<u8>> {
+    check_superblocks(mi_cols, mi_rows)?;
+    let (sb_cols, sb_rows) = (mi_cols / SB_MI, mi_rows / SB_MI);
+    let (cols, rows) = (sb_cols * 2, sb_rows * 2);
+    check_levels(levels, (cols * rows) as usize, base_q_idx)?;
+
+    let mut above: Vec<Option<bool>> = vec![None; cols as usize];
+    let mut left: Vec<Option<bool>> = vec![None; rows as usize];
+
+    let mut enc = SymbolEncoder::new();
+    for sb_r in 0..sb_rows {
+        // A decoder clears its left context at the start of every superblock
+        // row, and so does the partition context the 64x64 symbol reads.
+        left.iter_mut().for_each(|l| *l = None);
+        for sb_c in 0..sb_cols {
+            // The partition context of a 64x64 block reads the bit its
+            // neighbours' block size sets at this depth: a 32x32 neighbour sets
+            // it, and an uncoded one leaves it clear, so the context is just
+            // which neighbours exist. The 32x32 blocks below read a bit their
+            // own size leaves clear, so their context is 0 throughout.
+            let ctx = 2 * usize::from(sb_c > 0) + usize::from(sb_r > 0);
+            enc.symbol_fixed(PARTITION_SPLIT, &cdf::PARTITION_W64[ctx]);
+
+            for quadrant in 0..4 {
+                let (r, c) = (sb_r * 2 + quadrant / 2, sb_c * 2 + quadrant % 2);
+                let dc_level = levels[(r * cols + c) as usize];
+                let negative = dc_level < 0;
+
+                enc.symbol_fixed(PARTITION_NONE, &cdf::PARTITION_W32[0]);
+                enc.symbol_fixed(0, &cdf::SKIP[0]);
+                enc.symbol_fixed(DC_PRED, &cdf::KF_Y_MODE[0][0]);
+                // Chroma from luma is offered up to 32x32, so the block reads
+                // the wider table even though it does not take the mode.
+                enc.symbol_fixed(DC_PRED, &cdf::UV_MODE_CFL_DC);
+
+                write_dc_coeffs(
+                    &mut enc,
+                    dc_level,
+                    dc_sign_ctx(above[c as usize], left[r as usize]),
+                    &cdf::TXB_SKIP_LUMA_32,
+                    &cdf::COEFF_BASE_EOB_LUMA_32,
+                );
+                enc.symbol_fixed(1, &cdf::TXB_SKIP_CHROMA_16);
+                enc.symbol_fixed(1, &cdf::TXB_SKIP_CHROMA_16);
+
+                above[c as usize] = Some(negative);
+                left[r as usize] = Some(negative);
+            }
+        }
+    }
+    Ok(enc.finish())
+}
+
+/// Shared by both DC writers: one level per block, none of them zero, and a
+/// q index the coefficient CDFs are known for.
+fn check_levels(levels: &[i32], blocks: usize, base_q_idx: u8) -> Result<()> {
+    if levels.len() != blocks {
         return Err(Error::unsupported(
             "AV1 tile",
-            "a DC-only key frame needs one level per 64x64 superblock",
+            "a DC-only key frame needs one level per coded block",
         ));
     }
     if levels.iter().any(|&l| l == 0 || l.abs() > MAX_LEVEL) {
@@ -161,73 +280,41 @@ pub fn dc_key_frame_tile_levels(
              base_q_idx must be 61..=120",
         ));
     }
+    Ok(())
+}
 
-    // The sign of the DC each coded block left behind, for the two neighbours
-    // the sign context is read from: one row of them above, and the block to
-    // the left, which is dropped at the start of every superblock row the way a
-    // decoder clears its left context there.
-    let mut above: Vec<Option<bool>> = vec![None; sb_cols as usize];
-    let mut enc = SymbolEncoder::new();
-    for r in 0..sb_rows {
-        let mut left: Option<bool> = None;
-        for c in 0..sb_cols {
-            let dc_level = levels[(r * sb_cols + c) as usize];
-            let level = dc_level.abs();
-            let negative = dc_level < 0;
-
-            enc.symbol_fixed(PARTITION_NONE, &cdf::PARTITION_W64[0]);
-
-            // Nothing is skipped now, so every neighbour's skip flag is 0 and
-            // the skip context stays 0 across the frame.
-            enc.symbol_fixed(0, &cdf::SKIP[0]);
-            enc.symbol_fixed(DC_PRED, &cdf::KF_Y_MODE[0][0]);
-            enc.symbol_fixed(DC_PRED, &cdf::UV_MODE_NO_CFL[DC_PRED]);
-
-            // coeffs() for the luma plane (spec 5.11.39). The block size is the
-            // transform size, so the all-zero flag's context is 0; a 64x64
-            // transform codes only its top-left 32x32, which is the 1024-
-            // position end-of-block alphabet; an end-of-block of one is token 0
-            // with no extra bits; and a 64x64 transform's type set is DCT-only,
-            // so no transform type is coded either.
-            enc.symbol_fixed(0, &cdf::TXB_SKIP_LUMA_64);
-            enc.symbol_fixed(0, &cdf::EOB_PT_1024_LUMA);
-            enc.symbol_fixed(
-                (level.min(NUM_BASE_LEVELS + 1) - 1) as usize,
-                &cdf::COEFF_BASE_EOB_LUMA_64,
-            );
-            // The base-range tail. Every neighbour of the DC is zero, so its
-            // magnitude context is 0 throughout.
-            if level > NUM_BASE_LEVELS {
-                let mut remaining = level - (NUM_BASE_LEVELS + 1);
-                let mut sent = 0;
-                while sent < COEFF_BASE_RANGE {
-                    let k = remaining.min(BR_STEP);
-                    enc.symbol_fixed(k as usize, &cdf::COEFF_BR_LUMA);
-                    if k < BR_STEP {
-                        break;
-                    }
-                    remaining -= k;
-                    sent += BR_STEP;
-                }
+/// coeffs() for a luma transform block whose only coefficient is the DC (spec
+/// 5.11.39). The block size is the transform size, so the all-zero flag's
+/// context is 0; an end-of-block of one is token 0 of the position alphabet
+/// with no extra bits; the transform sizes here are all DCT-only, so no
+/// transform type is coded; and the DC's own neighbours are zero, so its
+/// magnitude contexts are 0 throughout.
+fn write_dc_coeffs(
+    enc: &mut SymbolEncoder,
+    dc_level: i32,
+    sign_ctx: usize,
+    txb_skip: &[u16],
+    base_eob: &[u16],
+) {
+    let level = dc_level.abs();
+    enc.symbol_fixed(0, txb_skip);
+    enc.symbol_fixed(0, &cdf::EOB_PT_1024_LUMA);
+    enc.symbol_fixed((level.min(NUM_BASE_LEVELS + 1) - 1) as usize, base_eob);
+    if level > NUM_BASE_LEVELS {
+        let mut remaining = level - (NUM_BASE_LEVELS + 1);
+        let mut sent = 0;
+        while sent < COEFF_BASE_RANGE {
+            let k = remaining.min(BR_STEP);
+            enc.symbol_fixed(k as usize, &cdf::COEFF_BR_LUMA);
+            if k < BR_STEP {
+                break;
             }
-            // The signs come after the levels, DC first (spec 5.11.39).
-            enc.symbol_fixed(
-                usize::from(negative),
-                &cdf::DC_SIGN_LUMA[dc_sign_ctx(above[c as usize], left)],
-            );
-
-            // Both chroma transform blocks are all-zero. Their planes carry no
-            // coded coefficient anywhere in the frame, so the neighbour halves
-            // of their context stay 0 and only the offset for a transform block
-            // that covers its whole plane block is left: context 7.
-            enc.symbol_fixed(1, &cdf::TXB_SKIP_CHROMA_32);
-            enc.symbol_fixed(1, &cdf::TXB_SKIP_CHROMA_32);
-
-            above[c as usize] = Some(negative);
-            left = Some(negative);
+            remaining -= k;
+            sent += BR_STEP;
         }
     }
-    Ok(enc.finish())
+    // The signs come after the levels, DC first (spec 5.11.39).
+    enc.symbol_fixed(usize::from(dc_level < 0), &cdf::DC_SIGN_LUMA[sign_ctx]);
 }
 
 /// `Dc_Sign_Contexts` (spec 8.3.2): every 4x4 unit above and left of the block
@@ -500,6 +587,17 @@ mod tests {
     /// hand back the decoded planes.
     fn decode_level_grid(levels: &[i32], sb_cols: u32, sb_rows: u32) -> Vec<u8> {
         let (w, h) = (64 * sb_cols, 64 * sb_rows);
+        let (seq, header) = frame_of(w, h);
+        let tile = dc_key_frame_tile_levels(header.mi_cols, header.mi_rows, Q_IDX, levels).unwrap();
+        let mut stream = temporal_delimiter();
+        stream.extend_from_slice(&sequence_header_obu(&seq).unwrap());
+        stream.extend_from_slice(&frame_obu(&seq, &header, &tile).unwrap());
+        ffmpeg_decode(&stream, w as usize, h as usize)
+    }
+
+    /// A sequence and key frame header for a `w` by `h` frame of whole
+    /// superblocks.
+    fn frame_of(w: u32, h: u32) -> (SequenceHeader, FrameHeader) {
         let mut seq = sequence_64();
         seq.max_frame_width = w;
         seq.max_frame_height = h;
@@ -509,16 +607,12 @@ mod tests {
         header.upscaled_width = w;
         header.render_width = w;
         header.render_height = h;
-        header.mi_cols = sb_cols * SB_MI;
-        header.mi_rows = sb_rows * SB_MI;
+        header.mi_cols = w / 4;
+        header.mi_rows = h / 4;
         header.tile_info.mi_col_starts = vec![0, header.mi_cols];
         header.tile_info.mi_row_starts = vec![0, header.mi_rows];
         header.quantization.base_q_idx = Q_IDX;
-        let tile = dc_key_frame_tile_levels(header.mi_cols, header.mi_rows, Q_IDX, levels).unwrap();
-        let mut stream = temporal_delimiter();
-        stream.extend_from_slice(&sequence_header_obu(&seq).unwrap());
-        stream.extend_from_slice(&frame_obu(&seq, &header, &tile).unwrap());
-        ffmpeg_decode(&stream, w as usize, h as usize)
+        (seq, header)
     }
 
     fn decoded_value(level: i32) -> u8 {
@@ -595,8 +689,109 @@ mod tests {
         }
     }
 
+    /// What a DC level adds to a 32x32 block's prediction at `base_q_idx` 100,
+    /// pinned from the decoder the way [`DECODED_AT_Q100`] is. A 32x32
+    /// transform spreads its DC over a quarter of the samples a 64x64 one
+    /// does, so the same level moves the picture further: level 14 is five
+    /// sample values here against three there.
+    const SPLIT_RESIDUAL_AT_Q100: [(i32, i32); 28] = [
+        (1, 0),
+        (2, 1),
+        (3, 1),
+        (4, 1),
+        (5, 2),
+        (6, 2),
+        (7, 3),
+        (8, 3),
+        (9, 3),
+        (10, 4),
+        (11, 4),
+        (12, 4),
+        (13, 5),
+        (14, 5),
+        (-1, 0),
+        (-2, -1),
+        (-3, -1),
+        (-4, -1),
+        (-5, -2),
+        (-6, -2),
+        (-7, -2),
+        (-8, -3),
+        (-9, -3),
+        (-10, -4),
+        (-11, -4),
+        (-12, -4),
+        (-13, -5),
+        (-14, -5),
+    ];
+
+    fn split_residual(level: i32) -> i32 {
+        SPLIT_RESIDUAL_AT_Q100
+            .iter()
+            .find(|&&(l, _)| l == level)
+            .map(|&(_, r)| r)
+            .expect("the level is in the pinned table")
+    }
+
+    /// Splitting a superblock puts three more syntax elements in front of every
+    /// block — the split partition itself, the 32x32 partition below it and a
+    /// chroma mode from the wider table CFL-capable blocks read — and moves the
+    /// coefficients onto the 32x32 CDFs. Getting any of them wrong desyncs the
+    /// arithmetic decoder, and the check is that all sixteen blocks still land
+    /// on the grey their own level and their neighbours ask for.
+    #[test]
+    fn a_split_superblock_decodes_each_quadrant_on_its_own_level() {
+        if !have_ffmpeg() {
+            eprintln!("SKIP a_split_superblock_decodes_each_quadrant_on_its_own_level: no ffmpeg");
+            return;
+        }
+        // Four by four 32x32 blocks over two by two superblocks, so the walk
+        // crosses superblock boundaries in both directions, and signs that
+        // alternate so the DC sign context lands on all three of its values.
+        let levels: [i32; 16] = [14, -3, 5, -5, -7, 7, -14, 3, 2, -2, 9, -9, -11, 11, -1, 1];
+        let planes = decode_split_grid(&levels, 2, 2);
+        let (luma, chroma) = planes.split_at(128 * 128);
+
+        let mut recon = [0i32; 16];
+        for (block, level) in levels.iter().enumerate() {
+            let (br, bc) = (block / 4, block % 4);
+            let above = (br > 0).then(|| recon[block - 4] as u8);
+            let left = (bc > 0).then(|| recon[block - 1] as u8);
+            let want =
+                (i32::from(dc_prediction(above, left)) + split_residual(*level)).clamp(0, 255);
+            recon[block] = want;
+            for y in 0..32 {
+                for x in 0..32 {
+                    let i = (br * 32 + y) * 128 + bc * 32 + x;
+                    assert_eq!(
+                        i32::from(luma[i]),
+                        want,
+                        "luma at ({x}, {y}) of the block carrying level {level} at row {br}, \
+                         column {bc}"
+                    );
+                }
+            }
+        }
+        for (i, &sample) in chroma.iter().enumerate() {
+            assert_eq!(sample, 128, "chroma sample {i}");
+        }
+    }
+
+    /// Encode a grid of 32x32 blocks, each carrying its own DC level.
+    fn decode_split_grid(levels: &[i32], sb_cols: u32, sb_rows: u32) -> Vec<u8> {
+        let (w, h) = (64 * sb_cols, 64 * sb_rows);
+        let (seq, header) = frame_of(w, h);
+        let tile = split_dc_key_frame_tile(header.mi_cols, header.mi_rows, Q_IDX, levels).unwrap();
+        let mut stream = temporal_delimiter();
+        stream.extend_from_slice(&sequence_header_obu(&seq).unwrap());
+        stream.extend_from_slice(&frame_obu(&seq, &header, &tile).unwrap());
+        ffmpeg_decode(&stream, w as usize, h as usize)
+    }
+
     #[test]
     fn a_level_grid_that_does_not_cover_the_frame_is_refused() {
+        assert!(split_dc_key_frame_tile(16, 16, 100, &[3, 3, 3]).is_err());
+        assert!(split_dc_key_frame_tile(16, 16, 100, &[3, 3, 3, 0]).is_err());
         assert!(dc_key_frame_tile_levels(32, 32, 100, &[3, 3]).is_err());
         assert!(dc_key_frame_tile_levels(32, 32, 100, &[3, 3, 3, 3, 3]).is_err());
         assert!(dc_key_frame_tile_levels(32, 32, 100, &[3, 3, 0, 3]).is_err());
