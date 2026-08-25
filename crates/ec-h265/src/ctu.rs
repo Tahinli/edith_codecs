@@ -172,6 +172,7 @@ pub struct CtuEncoder<'a> {
     /// Whether the levels get a rate-distortion search after quantisation.
     rdoq: bool,
     transform_skip: bool,
+    rqt: bool,
     /// The counting CABAC engine that search prices its trials with.
     rdoq_enc: CabacEncoder,
     /// `log2` of the smallest coding unit the search will produce.
@@ -208,6 +209,7 @@ impl<'a> CtuEncoder<'a> {
         sign_hiding: bool,
         rdoq: bool,
         transform_skip: bool,
+        rqt: bool,
         min_cb_log2: u32,
     ) -> CtuEncoder<'a> {
         let band_rows = (height - band_y0).min(ctb_size);
@@ -231,6 +233,7 @@ impl<'a> CtuEncoder<'a> {
             sign_hiding,
             rdoq,
             transform_skip,
+            rqt,
             rdoq_enc: CabacEncoder::counter(Contexts::new(qp)),
             min_cb_log2: min_cb_log2.clamp(MIN_CB_LOG2, 5),
             modes: vec![255; (width / 4) * (ctb_size / 4)],
@@ -662,7 +665,12 @@ impl<'a> CtuEncoder<'a> {
         enc: &mut CabacEncoder,
     ) -> f64 {
         let n = 1usize << log2;
-        let chroma_tskip = self.transform_skip && n == 8;
+        // Transform skip is a per-block flag the decoder reads for every 4x4
+        // residual once the picture parameter set enables it, so the decision
+        // has to travel by the block's own size, not the coding unit's: a
+        // transform tree splits chroma down to 4x4 from a 16x16 unit too.
+        // `code_chroma` and `encode_residual` each apply it only at 4x4.
+        let chroma_tskip = self.transform_skip;
         let before = enc.bit_count();
         if log2 == MIN_CB_LOG2 {
             // part_mode: PART_2Nx2N is the single bin 1.
@@ -683,6 +691,205 @@ impl<'a> CtuEncoder<'a> {
         let cb_cbf = self.code_chroma(x, y, n, chroma_mode, 1, chroma_tskip).1;
         let cr_cbf = self.code_chroma(x, y, n, chroma_mode, 2, chroma_tskip).1;
 
+        if self.rqt && log2 > 2 {
+            // A child transform tree signals its own chroma as long as its
+            // chroma blocks are still 4x4 or larger; only the 8x8 luma tree,
+            // whose children are 4x4, leaves chroma at the parent size and
+            // codes it with the last child (7.3.8.8).
+            let chroma_split = log2 > 3;
+            let nosplit_rec = self.save_region(x, y, n);
+            let parent_cb = self.scratch.cb_levels[..n * n / 4].to_vec();
+            let parent_cr = self.scratch.cr_levels[..n * n / 4].to_vec();
+            let start = enc.snapshot();
+            enc.set_counting(true);
+
+            let nb = enc.bit_count();
+            enc.encode_bin(ctx::SPLIT_TRANSFORM + (5 - log2) as usize, 0);
+            self.write_single_tu(
+                enc,
+                n,
+                log2,
+                mode,
+                chroma_mode,
+                chroma_tskip,
+                luma_cbf,
+                cb_cbf,
+                cr_cbf,
+            );
+            let nosplit_bits = enc.bit_count() - nb;
+            let nosplit_ssd = self.region_ssd(x, y, n);
+
+            enc.restore(&start);
+
+            let half = n / 2;
+            let offsets = [(0usize, 0usize), (half, 0), (0, half), (half, half)];
+            let mut child_levels = [[0i32; 256]; 4];
+            let mut child_cbf = [false; 4];
+            let mut child_cb = [[0i32; 64]; 4];
+            let mut child_cr = [[0i32; 64]; 4];
+            let mut child_cb_cbf = [false; 4];
+            let mut child_cr_cbf = [false; 4];
+            for (part, &(dx, dy)) in offsets.iter().enumerate() {
+                let (cx, cy) = (x + dx, y + dy);
+                let refs = self.luma_refs(cx, cy, half);
+                let mut source = std::mem::take(&mut self.scratch.source);
+                for row in 0..half {
+                    source[row * half..row * half + half].copy_from_slice(
+                        &self.src.y
+                            [(cy + row) * self.width + cx..(cy + row) * self.width + cx + half],
+                    );
+                }
+                let (_, cbf) = self.transform_luma(half, mode, &source, &refs);
+                child_levels[part][..half * half]
+                    .copy_from_slice(&self.scratch.levels[..half * half]);
+                child_cbf[part] = cbf;
+                for row in 0..half {
+                    for col in 0..half {
+                        self.write_rec_y(cx + col, cy + row, self.scratch.recon[row * half + col]);
+                    }
+                }
+                self.scratch.source = source;
+                // The next child predicts from this one, so its samples have
+                // to read as available now rather than when the whole coding
+                // unit is marked: a transform tree is walked in the same
+                // z-order by the decoder.
+                self.mark_coded(cx, cy, half, mode, depth);
+                if chroma_split {
+                    let q = half * half / 4;
+                    let (_, cbf) = self.code_chroma(cx, cy, half, chroma_mode, 1, chroma_tskip);
+                    child_cb_cbf[part] = cbf;
+                    child_cb[part][..q].copy_from_slice(&self.scratch.cb_levels[..q]);
+                    let (_, cbf) = self.code_chroma(cx, cy, half, chroma_mode, 2, chroma_tskip);
+                    child_cr_cbf[part] = cbf;
+                    child_cr[part][..q].copy_from_slice(&self.scratch.cr_levels[..q]);
+                }
+            }
+            // The parent's flag is the OR of the children's: a clear one at
+            // depth 0 tells the decoder to infer every child's as clear.
+            let split_cb_cbf = if chroma_split {
+                child_cb_cbf.iter().any(|&c| c)
+            } else {
+                cb_cbf
+            };
+            let split_cr_cbf = if chroma_split {
+                child_cr_cbf.iter().any(|&c| c)
+            } else {
+                cr_cbf
+            };
+
+            let sb = enc.bit_count();
+            enc.encode_bin(ctx::SPLIT_TRANSFORM + (5 - log2) as usize, 1);
+            self.write_split_tu(
+                enc,
+                n,
+                log2,
+                mode,
+                chroma_mode,
+                chroma_tskip,
+                chroma_split,
+                split_cb_cbf,
+                split_cr_cbf,
+                &child_cbf,
+                &child_levels,
+                &child_cb_cbf,
+                &child_cr_cbf,
+                &child_cb,
+                &child_cr,
+                &parent_cb,
+                &parent_cr,
+            );
+            let split_bits = enc.bit_count() - sb;
+            let split_rec = self.save_region(x, y, n);
+            let split_ssd = self.region_ssd(x, y, n);
+
+            enc.set_counting(false);
+            enc.restore(&start);
+
+            let nosplit_cost = nosplit_ssd + self.lambda * nosplit_bits as f64;
+            let split_cost = split_ssd + self.lambda * split_bits as f64;
+
+            if nosplit_cost <= split_cost {
+                self.load_region(x, y, n, &nosplit_rec);
+                // The children coded over the shared chroma scratch.
+                self.scratch.cb_levels[..n * n / 4].copy_from_slice(&parent_cb);
+                self.scratch.cr_levels[..n * n / 4].copy_from_slice(&parent_cr);
+                enc.encode_bin(ctx::SPLIT_TRANSFORM + (5 - log2) as usize, 0);
+                self.write_single_tu(
+                    enc,
+                    n,
+                    log2,
+                    mode,
+                    chroma_mode,
+                    chroma_tskip,
+                    luma_cbf,
+                    cb_cbf,
+                    cr_cbf,
+                );
+                self.last_cu_empty = !(luma_cbf || cb_cbf || cr_cbf);
+            } else {
+                self.load_region(x, y, n, &split_rec);
+                enc.encode_bin(ctx::SPLIT_TRANSFORM + (5 - log2) as usize, 1);
+                self.write_split_tu(
+                    enc,
+                    n,
+                    log2,
+                    mode,
+                    chroma_mode,
+                    chroma_tskip,
+                    chroma_split,
+                    split_cb_cbf,
+                    split_cr_cbf,
+                    &child_cbf,
+                    &child_levels,
+                    &child_cb_cbf,
+                    &child_cr_cbf,
+                    &child_cb,
+                    &child_cr,
+                    &parent_cb,
+                    &parent_cr,
+                );
+                self.last_cu_empty =
+                    !(child_cbf.iter().any(|&c| c) || split_cb_cbf || split_cr_cbf);
+            }
+
+            self.mark_coded(x, y, n, mode, depth);
+            let bits = enc.bit_count() - before;
+            return self.region_ssd(x, y, n) + self.lambda * bits as f64;
+        }
+
+        // No-RQT: single TU, no split_transform_flag written (inferred 0).
+        self.write_single_tu(
+            enc,
+            n,
+            log2,
+            mode,
+            chroma_mode,
+            chroma_tskip,
+            luma_cbf,
+            cb_cbf,
+            cr_cbf,
+        );
+        self.mark_coded(x, y, n, mode, depth);
+        self.last_cu_empty = !(luma_cbf || cb_cbf || cr_cbf);
+        let bits = enc.bit_count() - before;
+        self.region_ssd(x, y, n) + self.lambda * bits as f64
+    }
+
+    /// Write cbf flags + residual for one unsplit transform tree (no
+    /// `split_transform_flag`).
+    #[allow(clippy::too_many_arguments)]
+    fn write_single_tu(
+        &mut self,
+        enc: &mut CabacEncoder,
+        n: usize,
+        log2: u32,
+        mode: u8,
+        chroma_mode: u8,
+        chroma_tskip: bool,
+        luma_cbf: bool,
+        cb_cbf: bool,
+        cr_cbf: bool,
+    ) {
         enc.encode_bin(ctx::CBF_CHROMA, u32::from(cb_cbf));
         enc.encode_bin(ctx::CBF_CHROMA, u32::from(cr_cbf));
         enc.encode_bin(ctx::CBF_LUMA + 1, u32::from(luma_cbf));
@@ -727,11 +934,114 @@ impl<'a> CtuEncoder<'a> {
             );
             self.scratch.cr_levels = levels;
         }
+    }
 
-        self.mark_coded(x, y, n, mode, depth);
-        self.last_cu_empty = !(luma_cbf || cb_cbf || cr_cbf);
-        let bits = enc.bit_count() - before;
-        self.region_ssd(x, y, n) + self.lambda * bits as f64
+    /// Write cbf flags + residual for a split transform tree: chroma cbf first,
+    /// then four half-size luma children (CBF_LUMA ctx 0 for depth 1), chroma
+    /// residual on the last child.
+    /// Write the syntax of a split transform tree: the parent's chroma flags,
+    /// then four half-size children. A child carries its own chroma when the
+    /// chroma blocks stay 4x4 or larger, and reads the depth-one contexts for
+    /// both flags; below that the parent's chroma rides on the last child.
+    #[allow(clippy::too_many_arguments)]
+    fn write_split_tu(
+        &mut self,
+        enc: &mut CabacEncoder,
+        n: usize,
+        log2: u32,
+        mode: u8,
+        chroma_mode: u8,
+        chroma_tskip: bool,
+        chroma_split: bool,
+        cb_cbf: bool,
+        cr_cbf: bool,
+        child_cbf: &[bool; 4],
+        child_levels: &[[i32; 256]; 4],
+        child_cb_cbf: &[bool; 4],
+        child_cr_cbf: &[bool; 4],
+        child_cb: &[[i32; 64]; 4],
+        child_cr: &[[i32; 64]; 4],
+        parent_cb: &[i32],
+        parent_cr: &[i32],
+    ) {
+        let half = n / 2;
+        enc.encode_bin(ctx::CBF_CHROMA, u32::from(cb_cbf));
+        enc.encode_bin(ctx::CBF_CHROMA, u32::from(cr_cbf));
+        let luma_scan = intra::scan_index(mode, log2 - 1, true);
+        for part in 0..4usize {
+            if chroma_split {
+                if cb_cbf {
+                    enc.encode_bin(ctx::CBF_CHROMA + 1, u32::from(child_cb_cbf[part]));
+                }
+                if cr_cbf {
+                    enc.encode_bin(ctx::CBF_CHROMA + 1, u32::from(child_cr_cbf[part]));
+                }
+            }
+            enc.encode_bin(ctx::CBF_LUMA, u32::from(child_cbf[part]));
+            if child_cbf[part] {
+                encode_residual(
+                    enc,
+                    &child_levels[part][..half * half],
+                    log2 - 1,
+                    0,
+                    luma_scan,
+                    self.sign_hiding,
+                    self.transform_skip,
+                );
+            }
+            if chroma_split {
+                let (q, scan) = (
+                    half * half / 4,
+                    intra::scan_index(chroma_mode, log2 - 2, false),
+                );
+                if cb_cbf && child_cb_cbf[part] {
+                    encode_residual(
+                        enc,
+                        &child_cb[part][..q],
+                        log2 - 2,
+                        1,
+                        scan,
+                        self.sign_hiding,
+                        chroma_tskip,
+                    );
+                }
+                if cr_cbf && child_cr_cbf[part] {
+                    encode_residual(
+                        enc,
+                        &child_cr[part][..q],
+                        log2 - 2,
+                        2,
+                        scan,
+                        self.sign_hiding,
+                        chroma_tskip,
+                    );
+                }
+            } else if part == 3 {
+                let scan = intra::scan_index(chroma_mode, log2 - 1, false);
+                if cb_cbf {
+                    encode_residual(
+                        enc,
+                        &parent_cb[..n * n / 4],
+                        log2 - 1,
+                        1,
+                        scan,
+                        self.sign_hiding,
+                        chroma_tskip,
+                    );
+                }
+                if cr_cbf {
+                    encode_residual(
+                        enc,
+                        &parent_cr[..n * n / 4],
+                        log2 - 1,
+                        2,
+                        scan,
+                        self.sign_hiding,
+                        chroma_tskip,
+                    );
+                }
+            }
+        }
     }
 
     fn write_mode_syntax(&self, enc: &mut CabacEncoder, mode: u8, mpm: &[u8; 3]) {
