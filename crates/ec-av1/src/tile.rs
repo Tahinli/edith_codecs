@@ -2797,4 +2797,92 @@ mod tests {
             previous = Some(dc);
         }
     }
+
+    /// The encoder's own round trip, through a real bitstream.
+    ///
+    /// A picture is chosen, its residual against the DC prediction of 128 is
+    /// forward-transformed and quantized, the levels are written into a tile,
+    /// and ffmpeg decodes it. Two things have to hold: what comes back is
+    /// exactly what the encoder's own inverse said it would be — sample for
+    /// sample, which is what lets a rate-distortion loop trust its
+    /// reconstruction — and it is within a quantizer step of the picture that
+    /// was asked for, which is what makes the forward transform an encoder
+    /// rather than a scrambler.
+    #[test]
+    fn a_quantized_picture_decodes_to_what_the_encoder_reconstructed() {
+        if !have_ffmpeg() {
+            eprintln!(
+                "SKIP a_quantized_picture_decodes_to_what_the_encoder_reconstructed: no ffmpeg"
+            );
+            return;
+        }
+        // A gradient, a ripple and a corner patch: low frequencies, a mid one
+        // and an edge, none of them a basis function of the transform.
+        let mut residual = vec![0i32; 32 * 32];
+        for row in 0..32usize {
+            for col in 0..32usize {
+                let gradient = row as f64 * 2.0 - 32.0;
+                let ripple = 25.0
+                    * (col as f64 * std::f64::consts::PI / 6.0).sin()
+                    * (row as f64 * std::f64::consts::PI / 11.0).cos();
+                let patch = if row >= 24 && col >= 20 { -40.0 } else { 0.0 };
+                residual[row * 32 + col] = (gradient + ripple + patch).round() as i32;
+            }
+        }
+
+        let levels =
+            crate::transform::forward_and_quantize(&residual, 32, 8, i32::from(Q_IDX), 0.5);
+        assert!(
+            levels.iter().any(|&l| l != 0),
+            "the picture quantized away entirely"
+        );
+        let coded: Vec<Coeff> = levels
+            .iter()
+            .enumerate()
+            .filter(|&(_, &level)| level != 0)
+            .map(|(i, &level)| Coeff {
+                row: (i / 32) as u8,
+                col: (i % 32) as u8,
+                level,
+            })
+            .collect();
+
+        let rows = decode_luma_at(
+            64,
+            64,
+            &[
+                coded.into(),
+                BlockCoeffs::default(),
+                BlockCoeffs::default(),
+                BlockCoeffs::default(),
+            ],
+        );
+        let reconstruction =
+            crate::transform::dequant_and_inverse(&levels, 32, 8, i32::from(Q_IDX));
+
+        let mut squared = 0.0f64;
+        for row in 0..32 {
+            for col in 0..32 {
+                let want = (128 + reconstruction[row * 32 + col]).clamp(0, 255);
+                assert_eq!(
+                    i32::from(rows[row][col]),
+                    want,
+                    "sample ({row},{col}): the decoder and the encoder disagree"
+                );
+                let error = f64::from(rows[row][col]) - f64::from(128 + residual[row * 32 + col]);
+                squared += error * error;
+            }
+        }
+        let rmse = (squared / 1024.0).sqrt();
+        // A quantizer step is q/8 in residual units. Rounding to nearest
+        // spreads the error over a step, and a quarter of one is a bound this
+        // picture clears with room to spare (2.2 of 14 as written) while a
+        // forward transform that is merely energy-preserving does not: a
+        // transposed column pass measures 13.3 here.
+        let step = f64::from(crate::quant::ac_q(8, i32::from(Q_IDX))) / 8.0;
+        assert!(
+            rmse < step / 4.0,
+            "the decoded picture is {rmse} off, a step being {step}"
+        );
+    }
 }
