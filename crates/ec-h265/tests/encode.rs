@@ -429,6 +429,12 @@ fn bd_psnr_vs_x265() {
         cfg.threads = 0;
         // Ablation knob: how many SATD survivors reach the full rate-distortion
         // trial in the luma mode search. The shipped default is 5.
+        if let Ok(v) = std::env::var("EC_H265_CHROMA_RD") {
+            cfg.chroma_mode_search = v != "0";
+        }
+        if let Ok(w) = std::env::var("EC_H265_CHROMA_W") {
+            cfg.chroma_rd_weight = w.parse().expect("EC_H265_CHROMA_W must be a number");
+        }
         if let Ok(k) = std::env::var("EC_H265_RDO_CANDIDATES") {
             cfg.rdo_candidates = k.parse().expect("EC_H265_RDO_CANDIDATES must be a number");
         }
