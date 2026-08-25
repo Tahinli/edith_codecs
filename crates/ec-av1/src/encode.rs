@@ -36,14 +36,26 @@ const BLOCK: usize = 32;
 /// How heavily the mode search weighs rate against squared error, in units of
 /// the quantizer's reconstruction step squared per bit.
 ///
-/// Swept twice over three of his clips and three synthetic pictures
-/// (`probe_lambda` and `probe_directional`, and the tables in the two lane
-/// reports). The first sweep, before the mode symbol was costed, put the best
-/// point at 0.05; costing it moved the point to 0.1, where the directional
-/// modes stop costing rate on the pictures that do not want them (+0.05% on
-/// screen capture against +0.19% at 0.05) without giving up any of what they
-/// save on the pictures that do (-53.0% on a diagonal).
+/// Swept three times over his clips and three synthetic pictures
+/// (`probe_lambda`, `probe_directional` and `probe_ladder`, and the tables in
+/// the three lane reports). The first sweep, before the mode symbol was
+/// costed, put the best point at 0.05; costing it moved the point to 0.1. The
+/// third sweep, after the levels were costed through the writer's own CDFs
+/// too, left it there: against 0.2 the ladders are worth -1.19% against -0.98%
+/// on film and -0.20% against -0.14% on screen capture.
 const LAMBDA_SCALE: f64 = 0.1;
+
+/// [`LAMBDA_SCALE`], or whatever `EC_AV1_LAMBDA` names when the sweep that
+/// picks it is the thing running. A release build has no such knob.
+fn lambda_scale() -> f64 {
+    let swept = std::env::var("EC_AV1_LAMBDA")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok());
+    match swept {
+        Some(scale) if cfg!(test) => scale,
+        _ => LAMBDA_SCALE,
+    }
+}
 
 /// One 8-bit planar 4:2:0 picture.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -303,13 +315,25 @@ impl Plane<'_> {
                 sse += error * error;
             }
         }
-        // What a level costs is close enough to its magnitude's width plus a
-        // sign and a run, which is all the search needs to rank modes.
-        let bits: f64 = levels
-            .iter()
-            .filter(|&&level| level != 0)
-            .map(|&level| 2.0 + 2.0 * f64::from(level.unsigned_abs() + 1).log2())
-            .sum();
+        // What the levels cost is priced through the same CDFs the tile writer
+        // will code them with, so the search ranks modes by the bits they
+        // actually spend. Chroma blocks are not searched, so only the 32x32
+        // luma table is asked for.
+        let bits = if side != BLOCK {
+            0.0
+        } else if cfg!(test) && std::env::var_os("EC_AV1_ESTIMATE").is_some() {
+            // What the search used before it could price a block exactly: a
+            // level costs its magnitude's width plus a sign and a run. Kept
+            // reachable from the sweep so the two rate terms can be compared
+            // on one build.
+            levels
+                .iter()
+                .filter(|&&level| level != 0)
+                .map(|&level| 2.0 + 2.0 * f64::from(level.unsigned_abs() + 1).log2())
+                .sum()
+        } else {
+            crate::tile::luma_32_coeff_bits(&levels)
+        };
         Trial {
             levels,
             reconstruction,
@@ -535,7 +559,7 @@ pub fn encode_key_frame_with_modes(
     let search = Search {
         base_q_idx,
         deadzone,
-        lambda: LAMBDA_SCALE * step * step,
+        lambda: lambda_scale() * step * step,
         modes,
     };
 
@@ -806,6 +830,22 @@ mod tests {
                 10f64.powf(dc[1].1),
                 dc[1].0,
             );
+        }
+    }
+
+    /// Prints the whole mode-search ladder, so two builds of the search can be
+    /// compared against each other rather than each against its own baseline.
+    #[test]
+    #[ignore = "a sweep, not a gate"]
+    fn probe_ladder() {
+        for (name, picture) in sweep_pictures() {
+            let all = ladder(&picture, &KEY_FRAME_MODES);
+            let points = all
+                .iter()
+                .map(|&(db, log_bytes)| format!("{:.0}@{db:.3}", 10f64.powf(log_bytes)))
+                .collect::<Vec<_>>()
+                .join(" ");
+            println!("ladder {name}: {points}");
         }
     }
 
