@@ -2537,4 +2537,264 @@ mod tests {
             }
         }
     }
+
+    /// The whole point of the inverse transform living in the encoder is that
+    /// it predicts the decoder without asking one. The residual a DC-only
+    /// 64x64 transform produces has already been pinned from a real decoder in
+    /// [`DECODED_AT_Q100`], so that table is the gate: every level in it, both
+    /// signs, has to come back out of `dequant_and_inverse` exactly.
+    #[test]
+    fn the_inverse_transform_reproduces_the_pinned_whole_superblock_residuals() {
+        for (level, _) in DECODED_AT_Q100 {
+            let mut levels = vec![0i32; 64 * 64];
+            levels[0] = level;
+            let residual = crate::transform::dequant_and_inverse(&levels, 64, 8, i32::from(Q_IDX));
+            let want = dc_residual(level);
+            assert!(
+                residual.iter().all(|&r| r == want),
+                "level {level}: want a flat {want}, got {}..{} (first {})",
+                residual.iter().min().unwrap(),
+                residual.iter().max().unwrap(),
+                residual[0]
+            );
+        }
+    }
+
+    /// The same gate at the other transform size the encoder codes: a split
+    /// superblock's 32x32 blocks, whose residuals are pinned in
+    /// [`SPLIT_RESIDUAL_AT_Q100`]. The two sizes divide the dequantized
+    /// coefficient by different denominators, so a size-blind dequantizer
+    /// passes one table and fails the other.
+    #[test]
+    fn the_inverse_transform_reproduces_the_pinned_split_residuals() {
+        for (level, want) in SPLIT_RESIDUAL_AT_Q100 {
+            let mut levels = vec![0i32; 32 * 32];
+            levels[0] = level;
+            let residual = crate::transform::dequant_and_inverse(&levels, 32, 8, i32::from(Q_IDX));
+            assert!(
+                residual.iter().all(|&r| r == want),
+                "level {level}: want a flat {want}, got {}..{} (first {})",
+                residual.iter().min().unwrap(),
+                residual.iter().max().unwrap(),
+                residual[0]
+            );
+        }
+    }
+
+    /// A DC-only transform is flat, which is exactly the case that cannot tell
+    /// a transposed or mis-permuted butterfly network from a correct one. An AC
+    /// coefficient in the first row must vary along the row and stay constant
+    /// down each column, and the one in the first column the other way round;
+    /// a transposed network swaps the two.
+    #[test]
+    fn a_single_ac_coefficient_varies_along_its_own_axis() {
+        for side in [4, 8, 16, 32, 64] {
+            let mut horizontal = vec![0i32; side * side];
+            horizontal[1] = 100;
+            let h = crate::transform::dequant_and_inverse(&horizontal, side, 8, i32::from(Q_IDX));
+            let mut vertical = vec![0i32; side * side];
+            vertical[side] = 100;
+            let v = crate::transform::dequant_and_inverse(&vertical, side, 8, i32::from(Q_IDX));
+            for row in 0..side {
+                for col in 0..side {
+                    assert_eq!(
+                        h[row * side + col],
+                        h[col],
+                        "{side}: a first-row coefficient is constant down column {col}"
+                    );
+                    assert_eq!(
+                        v[row * side + col],
+                        v[row * side],
+                        "{side}: a first-column coefficient is constant along row {row}"
+                    );
+                }
+            }
+            // The two are each other's transpose. Only to within a rounding
+            // step: the spec rounds halves up rather than away from zero, so a
+            // basis function and its transpose can land a count apart where
+            // the row and column passes round opposite ways.
+            assert!(h[0] != h[side - 1], "{side}: the horizontal basis varies");
+            for row in 0..side {
+                for col in 0..side {
+                    let (a, b) = (h[row * side + col], v[col * side + row]);
+                    assert!(
+                        (a - b).abs() <= 1,
+                        "{side}: transpose at ({row},{col}): {a} vs {b}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Negating every level negates every residual, to within the one count
+    /// the spec's round-halves-up leaves behind. A dequantizer that rounded a
+    /// negative coefficient away from zero instead of toward it would shift a
+    /// whole basis function, not a count of it, so the bound is what makes
+    /// this a test rather than a restatement.
+    #[test]
+    fn negating_the_levels_negates_the_residual() {
+        for side in [32, 64] {
+            for level in [1, 2, 3, 5, 9, 14, 40, 100] {
+                let mut levels = vec![0i32; side * side];
+                levels[0] = level;
+                levels[1] = -level;
+                levels[side + 1] = level * 2;
+                let pos = crate::transform::dequant_and_inverse(&levels, side, 8, i32::from(Q_IDX));
+                let negated: Vec<i32> = levels.iter().map(|&l| -l).collect();
+                let neg =
+                    crate::transform::dequant_and_inverse(&negated, side, 8, i32::from(Q_IDX));
+                let worst = pos
+                    .iter()
+                    .zip(&neg)
+                    .map(|(&p, &n)| (p + n).abs())
+                    .max()
+                    .expect("the block is not empty");
+                assert!(worst <= 1, "side {side} level {level}: off by {worst}");
+            }
+        }
+    }
+
+    /// The pinned tables above are DC-only, and a flat residual cannot tell a
+    /// correct butterfly network from one that is merely correct at DC. This
+    /// is the same claim against a real decoder and with real AC content: the
+    /// top-left block of a key frame predicts a flat mid-grey with no
+    /// neighbours to read, so what ffmpeg shows there is exactly 128 plus the
+    /// residual the encoder's own inverse transform computes. Every sample has
+    /// to agree, not most of them.
+    #[test]
+    fn the_inverse_transform_predicts_what_ffmpeg_decodes_for_a_32x32_block() {
+        if !have_ffmpeg() {
+            eprintln!(
+                "SKIP the_inverse_transform_predicts_what_ffmpeg_decodes_for_a_32x32_block: no ffmpeg"
+            );
+            return;
+        }
+        // A DC, two low-frequency terms of each orientation, a diagonal and a
+        // far corner, with both signs among them.
+        let coeffs = [
+            (0u8, 0u8, 9i32),
+            (0, 1, -14),
+            (1, 0, 7),
+            (0, 3, 5),
+            (3, 0, -3),
+            (2, 2, 11),
+            (7, 5, -6),
+            (31, 31, 4),
+        ];
+        let block: BlockCoeffs = coeffs
+            .iter()
+            .map(|&(row, col, level)| Coeff { row, col, level })
+            .collect::<Vec<_>>()
+            .into();
+        let rows = decode_luma_at(
+            64,
+            64,
+            &[
+                block,
+                BlockCoeffs::default(),
+                BlockCoeffs::default(),
+                BlockCoeffs::default(),
+            ],
+        );
+
+        let mut levels = vec![0i32; 32 * 32];
+        for &(row, col, level) in &coeffs {
+            levels[usize::from(row) * 32 + usize::from(col)] = level;
+        }
+        let residual = crate::transform::dequant_and_inverse(&levels, 32, 8, i32::from(Q_IDX));
+        for row in 0..32 {
+            for col in 0..32 {
+                let want = (128 + residual[row * 32 + col]).clamp(0, 255);
+                assert_eq!(
+                    i32::from(rows[row][col]),
+                    want,
+                    "({row},{col}): ffmpeg decoded {} where the encoder predicted {want}",
+                    rows[row][col]
+                );
+            }
+        }
+        // The block is not flat, so the agreement is about the transform and
+        // not about a prediction both sides got trivially right.
+        let (lo, hi) = (
+            rows[..32].iter().flat_map(|r| &r[..32]).min().unwrap(),
+            rows[..32].iter().flat_map(|r| &r[..32]).max().unwrap(),
+        );
+        assert!(hi - lo > 4, "the block carries real detail, got {lo}..{hi}");
+    }
+
+    /// The same against the other transform size, the 64x64 one a whole
+    /// superblock carries. Only its top-left 32x32 can hold coefficients, and
+    /// the spec zeroes the rest before the row transform — a 64-point network
+    /// that read the missing half as anything else would disagree here.
+    #[test]
+    fn the_inverse_transform_predicts_what_ffmpeg_decodes_for_a_64x64_block() {
+        if !have_ffmpeg() {
+            eprintln!(
+                "SKIP the_inverse_transform_predicts_what_ffmpeg_decodes_for_a_64x64_block: no ffmpeg"
+            );
+            return;
+        }
+        let coeffs = [
+            (0u8, 0u8, 12i32),
+            (0, 2, -9),
+            (2, 0, 6),
+            (1, 1, -5),
+            (5, 9, 8),
+            (31, 0, -4),
+            (0, 31, 3),
+        ];
+        let block: BlockCoeffs = coeffs
+            .iter()
+            .map(|&(row, col, level)| Coeff { row, col, level })
+            .collect::<Vec<_>>()
+            .into();
+        let rows = decode_luma_sb(64, 64, &[Superblock::Whole(block)]);
+
+        let mut levels = vec![0i32; 64 * 64];
+        for &(row, col, level) in &coeffs {
+            levels[usize::from(row) * 64 + usize::from(col)] = level;
+        }
+        let residual = crate::transform::dequant_and_inverse(&levels, 64, 8, i32::from(Q_IDX));
+        for row in 0..64 {
+            for col in 0..64 {
+                let want = (128 + residual[row * 64 + col]).clamp(0, 255);
+                assert_eq!(
+                    i32::from(rows[row][col]),
+                    want,
+                    "({row},{col}): ffmpeg decoded {} where the encoder predicted {want}",
+                    rows[row][col]
+                );
+            }
+        }
+    }
+
+    /// The AV1 transforms are normalized so that a quantized level means the
+    /// same thing at every size: doubling the transform's side halves what a
+    /// DC level is worth, which is the job the per-size row shift and the
+    /// dequantizer's denominator split between them. The frame syntax only
+    /// codes 32x32 and 64x64 transforms, so this is what holds the four
+    /// smaller sizes' shifts to the spec's table — a shift wrong by one at any
+    /// size doubles or halves that size's step alone.
+    #[test]
+    fn a_dc_level_is_worth_half_as_much_each_time_the_transform_doubles() {
+        let mut previous: Option<i32> = None;
+        for side in [4usize, 8, 16, 32, 64] {
+            let mut levels = vec![0i32; side * side];
+            levels[0] = 100;
+            let residual =
+                crate::transform::dequant_and_inverse(&levels, side, 8, i32::from(Q_IDX));
+            let dc = residual[0];
+            assert!(
+                residual.iter().all(|&r| r == dc),
+                "side {side}: a DC coefficient reconstructs flat"
+            );
+            if let Some(previous) = previous {
+                assert!(
+                    (dc * 2 - previous).abs() <= 1,
+                    "side {side}: {dc} is not half of the previous size's {previous}"
+                );
+            }
+            previous = Some(dc);
+        }
+    }
 }
