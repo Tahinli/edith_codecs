@@ -1,9 +1,12 @@
 //! Intra prediction, the half of spec 7.11.2 a key frame needs.
 //!
-//! The seven modes here are the ones that read no further than the row above
-//! and the column to the left of the block: the eight directional modes reach
-//! past a block's own width into samples whose availability the decoder tracks
-//! in its own bookkeeping, and are not written yet.
+//! All thirteen key-frame intra modes: the seven that read no further than the
+//! row above and the column to the left of the block, and the six that steer
+//! along an angle and reach past the block's own width into the samples above
+//! its right and below its left. Whether those further samples are decoded is
+//! not this module's business -- the caller passes the samples it has, and the
+//! edge is extended by repeating the last one, which is what the decoder does
+//! with its own `BlockDecoded` bookkeeping (spec 7.11.2.2).
 
 /// The average of the neighbours (spec 7.11.2.5).
 pub const DC_PRED: u8 = 0;
@@ -19,8 +22,40 @@ pub const SMOOTH_V_PRED: u8 = 10;
 pub const SMOOTH_H_PRED: u8 = 11;
 /// Whichever of above, left and the corner is nearest their gradient.
 pub const PAETH_PRED: u8 = 12;
+/// Down-left along 45 degrees.
+pub const D45_PRED: u8 = 3;
+/// Down-right along 135 degrees.
+pub const D135_PRED: u8 = 4;
+/// Down-right, steeper: 113 degrees.
+pub const D113_PRED: u8 = 5;
+/// Down-right, shallower: 157 degrees.
+pub const D157_PRED: u8 = 6;
+/// Up-right along 203 degrees.
+pub const D203_PRED: u8 = 7;
+/// Down-left, steeper: 67 degrees.
+pub const D67_PRED: u8 = 8;
 
-/// The modes this module predicts, in the order a search should try them.
+/// Every mode a key frame's luma block can be coded with, in the order a
+/// search should try them: the cheap ones first, so an early one is likely to
+/// be the one that survives.
+pub const KEY_FRAME_MODES: [u8; 13] = [
+    DC_PRED,
+    V_PRED,
+    H_PRED,
+    SMOOTH_PRED,
+    SMOOTH_V_PRED,
+    SMOOTH_H_PRED,
+    PAETH_PRED,
+    D45_PRED,
+    D67_PRED,
+    D113_PRED,
+    D135_PRED,
+    D157_PRED,
+    D203_PRED,
+];
+
+/// The modes that read no further than the row above and the column to the
+/// left, in the order a search should try them.
 pub const NON_DIRECTIONAL: [u8; 7] = [
     DC_PRED,
     V_PRED,
@@ -51,26 +86,75 @@ fn round2(value: i32, shift: u32) -> i32 {
     (value + (1 << (shift - 1))) >> shift
 }
 
+/// `Dr_Intra_Derivative` (spec 9.3): how far along the edge one row of the
+/// block moves, in 64ths of a sample, for the angles a delta can reach.
+fn dr_intra_derivative(angle: u16) -> i32 {
+    match angle {
+        3 => 1023,
+        6 => 547,
+        9 => 372,
+        14 => 273,
+        17 => 215,
+        20 => 178,
+        23 => 151,
+        26 => 132,
+        29 => 116,
+        32 => 102,
+        36 => 90,
+        39 => 80,
+        42 => 71,
+        45 => 64,
+        48 => 57,
+        51 => 51,
+        54 => 45,
+        58 => 40,
+        61 => 35,
+        64 => 31,
+        67 => 27,
+        70 => 23,
+        73 => 19,
+        76 => 15,
+        81 => 11,
+        84 => 7,
+        87 => 3,
+        other => panic!("no derivative is tabulated for {other} degrees"),
+    }
+}
+
+/// `Mode_To_Angle` (spec 9.3), zero for the modes that have no angle.
+const MODE_TO_ANGLE: [u16; 13] = [0, 90, 180, 45, 135, 113, 157, 203, 67, 0, 0, 0, 0];
+
 /// The edges a block predicts from, as the decoder builds them (spec 7.11.2.2):
-/// a side that does not exist is filled from the side that does, and the corner
-/// falls back the same way.
+/// a side that does not exist is filled from the side that does, a side that
+/// runs out is extended by repeating its last sample, and the corner falls back
+/// the same way.
+///
+/// Both arrays hold the corner first, so the spec's index `-1` is index 0 here
+/// and they run out to the spec's `w + h - 1`.
 struct Edges {
     above: Vec<i32>,
     left: Vec<i32>,
-    corner: i32,
 }
 
 impl Edges {
     fn build(above: Option<&[u8]>, left: Option<&[u8]>, corner: Option<u8>, side: usize) -> Self {
+        // A directional mode reads out to w + h - 1 either way.
+        let want = side * 2;
+        let extend = |samples: &[u8]| {
+            let mut row: Vec<i32> = samples.iter().map(|&s| i32::from(s)).collect();
+            let last = *row.last().expect("an edge that exists has samples");
+            row.resize(want, last);
+            row
+        };
         let above_row = match (above, left) {
-            (Some(a), _) => a.iter().map(|&s| i32::from(s)).collect(),
-            (None, Some(l)) => vec![i32::from(l[0]); side],
-            (None, None) => vec![127; side],
+            (Some(a), _) => extend(a),
+            (None, Some(l)) => vec![i32::from(l[0]); want],
+            (None, None) => vec![127; want],
         };
         let left_col = match (left, above) {
-            (Some(l), _) => l.iter().map(|&s| i32::from(s)).collect(),
-            (None, Some(a)) => vec![i32::from(a[0]); side],
-            (None, None) => vec![129; side],
+            (Some(l), _) => extend(l),
+            (None, Some(a)) => vec![i32::from(a[0]); want],
+            (None, None) => vec![129; want],
         };
         let corner = match (corner, above, left) {
             (Some(c), Some(_), Some(_)) => i32::from(c),
@@ -78,20 +162,38 @@ impl Edges {
             (_, None, Some(l)) => i32::from(l[0]),
             (_, None, None) => 128,
         };
+        let with_corner = |edge: Vec<i32>| {
+            let mut v = Vec::with_capacity(want + 1);
+            v.push(corner);
+            v.extend(edge);
+            v
+        };
         Self {
-            above: above_row,
-            left: left_col,
-            corner,
+            above: with_corner(above_row),
+            left: with_corner(left_col),
         }
+    }
+
+    /// `AboveRow[i]`, where `i` may be the spec's `-1`.
+    fn above(&self, i: i32) -> i32 {
+        self.above[usize::try_from(i + 1).expect("an edge is read no further back than the corner")]
+    }
+
+    /// `LeftCol[i]`, where `i` may be the spec's `-1`.
+    fn left(&self, i: i32) -> i32 {
+        self.left[usize::try_from(i + 1).expect("an edge is read no further back than the corner")]
     }
 }
 
 /// Predicts one square block into `dst`, row-major and `side * side` long.
 ///
 /// `above` is the reconstructed row above the block and `left` its
-/// reconstructed left column, each `side` samples long, and `corner` the
-/// sample diagonally above-left; `None` where the block sits against an edge
-/// of the frame.
+/// reconstructed left column, each at least `side` samples long, and `corner`
+/// the sample diagonally above-left; `None` where the block sits against an
+/// edge of the frame. A directional mode reads out to `2 * side`: pass the
+/// samples above-right and below-left where the decoder has them decoded, and
+/// the edge is extended by repetition where it does not, which is what the
+/// decoder's own clamp to `aboveLimit` and `leftLimit` comes to.
 ///
 /// # Panics
 /// Panics on a mode this module does not predict, or when `dst` is not
@@ -106,32 +208,41 @@ pub fn predict(
 ) {
     assert_eq!(dst.len(), side * side, "the destination is the block");
     let edges = Edges::build(above, left, corner, side);
-    let (a, l) = (&edges.above, &edges.left);
+    let angle = MODE_TO_ANGLE[usize::from(mode)];
+    if matches!(
+        mode,
+        D45_PRED | D67_PRED | D113_PRED | D135_PRED | D157_PRED | D203_PRED
+    ) {
+        directional(angle, &edges, side, dst);
+        return;
+    }
     let weights = &SM_WEIGHTS[side..side * 2];
     for row in 0..side {
         for col in 0..side {
+            let (r, c) = (row as i32, col as i32);
+            let last = side as i32 - 1;
             let value = match mode {
-                DC_PRED => dc(above, left),
-                V_PRED => a[col],
-                H_PRED => l[row],
+                DC_PRED => dc(above, left, side),
+                V_PRED => edges.above(c),
+                H_PRED => edges.left(r),
                 SMOOTH_PRED => round2(
-                    i32::from(weights[row]) * a[col]
-                        + (256 - i32::from(weights[row])) * l[side - 1]
-                        + i32::from(weights[col]) * l[row]
-                        + (256 - i32::from(weights[col])) * a[side - 1],
+                    i32::from(weights[row]) * edges.above(c)
+                        + (256 - i32::from(weights[row])) * edges.left(last)
+                        + i32::from(weights[col]) * edges.left(r)
+                        + (256 - i32::from(weights[col])) * edges.above(last),
                     9,
                 ),
                 SMOOTH_V_PRED => round2(
-                    i32::from(weights[row]) * a[col]
-                        + (256 - i32::from(weights[row])) * l[side - 1],
+                    i32::from(weights[row]) * edges.above(c)
+                        + (256 - i32::from(weights[row])) * edges.left(last),
                     8,
                 ),
                 SMOOTH_H_PRED => round2(
-                    i32::from(weights[col]) * l[row]
-                        + (256 - i32::from(weights[col])) * a[side - 1],
+                    i32::from(weights[col]) * edges.left(r)
+                        + (256 - i32::from(weights[col])) * edges.above(last),
                     8,
                 ),
-                PAETH_PRED => paeth(a[col], l[row], edges.corner),
+                PAETH_PRED => paeth(edges.above(c), edges.left(r), edges.above(-1)),
                 other => panic!("intra mode {other} is not one this module predicts"),
             };
             dst[row * side + col] = value.clamp(0, 255) as u8;
@@ -139,8 +250,66 @@ pub fn predict(
     }
 }
 
+/// Directional intra prediction (spec 7.11.2.4), with the intra edge filter off
+/// -- which is what our sequence header says -- so nothing here upsamples.
+fn directional(angle: u16, edges: &Edges, side: usize, dst: &mut [u8]) {
+    let n = side as i32;
+    // The furthest sample the walk can reach, past which the edge is flat.
+    let max_base = n + n - 1;
+    let blend = |edge: &dyn Fn(i32) -> i32, base: i32, shift: i32| {
+        round2(edge(base) * (32 - shift) + edge(base + 1) * shift, 5)
+    };
+    let above = |i: i32| edges.above(i);
+    let left = |i: i32| edges.left(i);
+    for row in 0..n {
+        for col in 0..n {
+            let value = if angle < 90 {
+                let dx = dr_intra_derivative(angle);
+                let idx = (row + 1) * dx;
+                let base = (idx >> 6) + col;
+                let shift = (idx >> 1) & 0x1F;
+                if base < max_base {
+                    blend(&above, base, shift)
+                } else {
+                    above(max_base)
+                }
+            } else if angle > 180 {
+                let dy = dr_intra_derivative(270 - angle);
+                let idx = (col + 1) * dy;
+                let base = (idx >> 6) + row;
+                let shift = (idx >> 1) & 0x1F;
+                if base < max_base {
+                    blend(&left, base, shift)
+                } else {
+                    left(max_base)
+                }
+            } else {
+                // The two zones meet here: a ray that leaves through the row
+                // above is read there, and one that leaves through the column
+                // to the left is read there instead.
+                let dx = dr_intra_derivative(180 - angle);
+                let idx = (col << 6) - (row + 1) * dx;
+                let base = idx >> 6;
+                if base >= -1 {
+                    blend(&above, base, (idx >> 1) & 0x1F)
+                } else {
+                    let dy = dr_intra_derivative(angle - 90);
+                    let idx = (row << 6) - (col + 1) * dy;
+                    blend(&left, idx >> 6, (idx >> 1) & 0x1F)
+                }
+            };
+            dst[(row * n + col) as usize] = value.clamp(0, 255) as u8;
+        }
+    }
+}
+
 /// `dc_predict` (spec 7.11.2.5): the average of whichever neighbours exist.
-fn dc(above: Option<&[u8]>, left: Option<&[u8]>) -> i32 {
+///
+/// Only the block's own `side` samples of each edge count: what a directional
+/// mode reaches past them is no part of the average.
+fn dc(above: Option<&[u8]>, left: Option<&[u8]>, side: usize) -> i32 {
+    let above = above.map(|a| &a[..side.min(a.len())]);
+    let left = left.map(|l| &l[..side.min(l.len())]);
     let average = |samples: &[u8]| {
         let sum: u32 = samples.iter().map(|&s| u32::from(s)).sum();
         ((sum + (samples.len() as u32 >> 1)) / samples.len() as u32) as i32
