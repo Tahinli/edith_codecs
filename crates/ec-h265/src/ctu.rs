@@ -144,6 +144,10 @@ pub struct CtuEncoder<'a> {
     strong_smoothing: bool,
     /// How many of the 35 modes get a full rate-distortion trial.
     candidates: usize,
+    /// Whether the chroma mode is chosen by rate-distortion or always derived.
+    chroma_rd: bool,
+    /// Weight on chroma SSD in that decision, against luma's lambda.
+    chroma_rd_weight: f64,
     /// `log2` of the smallest coding unit the search will produce.
     min_cb_log2: u32,
     /// Intra mode per 4x4 block of the band; 255 = not coded yet.
@@ -172,6 +176,8 @@ impl<'a> CtuEncoder<'a> {
         qp: i32,
         strong_smoothing: bool,
         candidates: usize,
+        chroma_rd: bool,
+        chroma_rd_weight: f64,
         min_cb_log2: u32,
     ) -> CtuEncoder<'a> {
         let band_rows = (height - band_y0).min(ctb_size);
@@ -189,6 +195,8 @@ impl<'a> CtuEncoder<'a> {
             lambda_satd: lambda_for(qp).sqrt(),
             strong_smoothing,
             candidates: candidates.clamp(1, 35),
+            chroma_rd,
+            chroma_rd_weight,
             min_cb_log2: min_cb_log2.clamp(MIN_CB_LOG2, 5),
             modes: vec![255; (width / 4) * (ctb_size / 4)],
             depths: vec![0; (width / 4) * (ctb_size / 4)],
@@ -485,13 +493,17 @@ impl<'a> CtuEncoder<'a> {
         let mpm = self.mpm_at(x, y);
         let mode = self.choose_luma_mode(x, y, n, log2, &mpm, enc);
         self.write_mode_syntax(enc, mode, &mpm);
-        // intra_chroma_pred_mode = 4 (derived from luma): the single bin 0.
-        enc.encode_bin(ctx::INTRA_CHROMA_PRED_MODE, 0);
+        let (chroma_mode, chroma_idx) = if self.chroma_rd {
+            self.choose_chroma_mode(x, y, n, log2, mode, enc)
+        } else {
+            (mode, None)
+        };
+        self.write_chroma_mode_syntax(enc, chroma_idx);
 
         // Luma was reconstructed by the mode search; chroma is coded now.
         let luma_cbf = self.scratch.luma_levels[..n * n].iter().any(|&v| v != 0);
-        let cb_cbf = self.code_chroma(x, y, n, mode, 1);
-        let cr_cbf = self.code_chroma(x, y, n, mode, 2);
+        let cb_cbf = self.code_chroma(x, y, n, chroma_mode, 1).1;
+        let cr_cbf = self.code_chroma(x, y, n, chroma_mode, 2).1;
 
         enc.encode_bin(ctx::CBF_CHROMA, u32::from(cb_cbf));
         enc.encode_bin(ctx::CBF_CHROMA, u32::from(cr_cbf));
@@ -502,7 +514,7 @@ impl<'a> CtuEncoder<'a> {
             encode_residual(enc, &levels[..n * n], log2, 0, scan);
             self.scratch.luma_levels = levels;
         }
-        let chroma_scan = intra::scan_index(mode, log2 - 1, false);
+        let chroma_scan = intra::scan_index(chroma_mode, log2 - 1, false);
         if cb_cbf {
             let levels = std::mem::take(&mut self.scratch.cb_levels);
             encode_residual(enc, &levels[..n * n / 4], log2 - 1, 1, chroma_scan);
@@ -743,9 +755,16 @@ impl<'a> CtuEncoder<'a> {
         (ssd as f64, cbf)
     }
 
-    /// Code one chroma transform block in derived mode; returns its `cbf` and
-    /// leaves the levels in the matching scratch buffer.
-    fn code_chroma(&mut self, x: usize, y: usize, n: usize, luma_mode: u8, plane: usize) -> bool {
+    /// Code one chroma transform block in `pred_mode`; returns its `(SSD, cbf)`
+    /// and leaves the levels in the matching scratch buffer.
+    fn code_chroma(
+        &mut self,
+        x: usize,
+        y: usize,
+        n: usize,
+        pred_mode: u8,
+        plane: usize,
+    ) -> (f64, bool) {
         let cn = n / 2;
         let (cx, cy) = (x / 2, y / 2);
         let refs = self.chroma_refs(cx, cy, cn, plane);
@@ -753,7 +772,7 @@ impl<'a> CtuEncoder<'a> {
         let src = if plane == 1 { self.src.cb } else { self.src.cr };
         intra::predict(
             &refs,
-            luma_mode,
+            pred_mode,
             cn,
             false,
             self.strong_smoothing,
@@ -785,11 +804,14 @@ impl<'a> CtuEncoder<'a> {
         } else {
             self.scratch.residual[..cn * cn].fill(0);
         }
+        let mut ssd = 0i64;
         for row in 0..cn {
             for col in 0..cn {
                 let value = (i32::from(self.scratch.pred[row * cn + col])
                     + self.scratch.residual[row * cn + col])
                     .clamp(0, 255) as u8;
+                let d = i64::from(src[(cy + row) * cw + cx + col]) - i64::from(value);
+                ssd += d * d;
                 self.write_rec_c(cx + col, cy + row, plane, value);
             }
         }
@@ -799,7 +821,82 @@ impl<'a> CtuEncoder<'a> {
             &mut self.scratch.cr_levels
         };
         levels[..cn * cn].copy_from_slice(&self.scratch.levels[..cn * cn]);
-        cbf
+        (ssd as f64, cbf)
+    }
+
+    // ---- chroma mode decision --------------------------------------------
+
+    /// Write `intra_chroma_pred_mode`: the single bin 0 for the derived mode,
+    /// or bin 1 and two bypass bits picking one of the four explicit modes.
+    fn write_chroma_mode_syntax(&self, enc: &mut CabacEncoder, idx: Option<u32>) {
+        match idx {
+            None => enc.encode_bin(ctx::INTRA_CHROMA_PRED_MODE, 0),
+            Some(i) => {
+                enc.encode_bin(ctx::INTRA_CHROMA_PRED_MODE, 1);
+                enc.encode_bypass_bits(i, 2);
+            }
+        }
+    }
+
+    /// Pick the chroma prediction mode by rate-distortion over the five the
+    /// syntax allows: planar, vertical, horizontal and DC — each replaced by
+    /// angular 34 when it collides with the luma mode — plus the derived mode,
+    /// which is the luma mode itself and costs one bin instead of three.
+    ///
+    /// Returns the mode and the index to code, `None` meaning derived. Neither
+    /// the winner's reconstruction nor its levels survive the trial: the caller
+    /// codes the winner again for real.
+    fn choose_chroma_mode(
+        &mut self,
+        x: usize,
+        y: usize,
+        n: usize,
+        log2: u32,
+        luma_mode: u8,
+        enc: &mut CabacEncoder,
+    ) -> (u8, Option<u32>) {
+        let mut explicit = [0u8, 26, 10, 1];
+        for mode in explicit.iter_mut() {
+            if *mode == luma_mode {
+                *mode = 34;
+            }
+        }
+        let start = enc.snapshot();
+        enc.set_counting(true);
+        let mut best = (f64::MAX, luma_mode, None);
+        for (i, mode) in explicit
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(i, m)| (Some(i as u32), m))
+            .chain(std::iter::once((None, luma_mode)))
+        {
+            let bits_before = enc.bit_count();
+            self.write_chroma_mode_syntax(enc, i);
+            let (cb_ssd, cb_cbf) = self.code_chroma(x, y, n, mode, 1);
+            let (cr_ssd, cr_cbf) = self.code_chroma(x, y, n, mode, 2);
+            enc.encode_bin(ctx::CBF_CHROMA, u32::from(cb_cbf));
+            enc.encode_bin(ctx::CBF_CHROMA, u32::from(cr_cbf));
+            let scan = intra::scan_index(mode, log2 - 1, false);
+            if cb_cbf {
+                let levels = std::mem::take(&mut self.scratch.cb_levels);
+                encode_residual(enc, &levels[..n * n / 4], log2 - 1, 1, scan);
+                self.scratch.cb_levels = levels;
+            }
+            if cr_cbf {
+                let levels = std::mem::take(&mut self.scratch.cr_levels);
+                encode_residual(enc, &levels[..n * n / 4], log2 - 1, 2, scan);
+                self.scratch.cr_levels = levels;
+            }
+            let bits = enc.bit_count() - bits_before;
+            enc.restore(&start);
+            let cost = self.chroma_rd_weight * (cb_ssd + cr_ssd) + self.lambda * bits as f64;
+            if cost < best.0 {
+                best = (cost, mode, i);
+            }
+        }
+        enc.set_counting(false);
+        (best.1, best.2)
     }
 
     // ---- reference samples -----------------------------------------------
