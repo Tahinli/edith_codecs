@@ -196,3 +196,40 @@ pub const UV_MODE_NO_CFL: [[u16; 14]; 13] = [
         0,
     ],
 ];
+
+// The coefficient CDFs below are the q-context-2 tables (`base_q_idx` 61..=120,
+// spec 8.3.2's `Default_..._Cdf[2]`), which is the context the frames this
+// crate writes today sit in. The other three sets arrive with the rate control
+// that can leave that band.
+
+/// `Default_Txb_Skip_Cdf[2][4][0]` (spec 9.4): the all-zero flag of a 64x64
+/// luma transform block whose block size is the transform size, so its
+/// context is 0.
+pub const TXB_SKIP_LUMA_64: [u16; 3] = [28573, 32768, 0];
+
+/// `Default_Txb_Skip_Cdf[2][3][7]` (spec 9.4): the all-zero flag of a 32x32
+/// chroma transform block that covers its whole plane block with no coded
+/// neighbour, which is context 7.
+pub const TXB_SKIP_CHROMA_32: [u16; 3] = [5124, 32768, 0];
+
+/// `Default_Eob_Pt_1024_Cdf[2][0][0]` (spec 9.4): the end-of-block position
+/// token of a luma transform block with 1024 coded coefficient positions —
+/// what a 64x64 transform has, since only its top-left 32x32 is coded.
+pub const EOB_PT_1024_LUMA: [u16; 12] = [
+    2784, 3831, 7041, 10521, 14847, 18844, 23155, 26682, 29229, 31045, 32768, 0,
+];
+
+/// `Default_Coeff_Base_Eob_Cdf[2][4][0][0]` (spec 9.4): the level of the last
+/// coefficient of a 64x64 luma transform block, less one, when that
+/// coefficient is the DC.
+pub const COEFF_BASE_EOB_LUMA_64: [u16; 4] = [935, 3382, 32768, 0];
+
+/// `Default_Dc_Sign_Cdf[2][0]` (spec 9.4): the sign of a luma DC coefficient,
+/// indexed by whether the neighbouring blocks' DC signs lean negative (1),
+/// positive (2) or neither (0).
+pub const DC_SIGN_LUMA: [[u16; 3]; 3] = [[16000, 32768, 0], [13056, 32768, 0], [18816, 32768, 0]];
+
+/// `Default_Coeff_Br_Cdf[2][3][0][0]` (spec 9.4): a base-range increment of a
+/// coefficient whose neighbours are all zero, in a transform of 32x32 or
+/// larger (the table is shared from 32x32 up).
+pub const COEFF_BR_LUMA: [u16; 5] = [9040, 14786, 18360, 32768, 0];
