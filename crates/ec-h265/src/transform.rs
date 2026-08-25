@@ -293,6 +293,16 @@ pub fn quantize(coeffs: &[i32], levels: &mut [i32], n: usize, qp: i32) -> usize 
     nonzero
 }
 
+/// The unrounded level a coefficient would quantise to: the quantiser divides
+/// by a step, and this is that division carried out in full precision. Sign
+/// data hiding needs it to tell which coefficient is cheapest to nudge.
+pub fn ideal_level(coeff: i32, n: usize, qp: i32) -> f64 {
+    let log2n = n.trailing_zeros() as i32;
+    let qbits = 21 + qp / 6 - log2n;
+    let scale = QUANT_SCALE[(qp % 6) as usize] as f64;
+    (coeff.unsigned_abs() as f64 * scale) / (1u64 << qbits) as f64
+}
+
 /// Scale levels back into coefficients, exactly as clause 8.6.3 specifies.
 pub fn dequantize(levels: &[i32], scaled: &mut [i32], n: usize, qp: i32) {
     let log2n = n.trailing_zeros() as i32;

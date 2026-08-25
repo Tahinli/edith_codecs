@@ -435,6 +435,9 @@ fn bd_psnr_vs_x265() {
         if let Ok(w) = std::env::var("EC_H265_CHROMA_W") {
             cfg.chroma_rd_weight = w.parse().expect("EC_H265_CHROMA_W must be a number");
         }
+        if let Ok(v) = std::env::var("EC_H265_SDH") {
+            cfg.sign_hiding = v != "0";
+        }
         if let Ok(v) = std::env::var("EC_H265_NXN") {
             cfg.intra_nxn = v != "0";
         }
