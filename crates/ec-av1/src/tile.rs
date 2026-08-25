@@ -68,7 +68,12 @@ const COEFF_BASE_RANGE: i32 = 12;
 /// carries.
 const BR_STEP: i32 = 3;
 /// The largest level the base and base-range syntax carry between them.
-const MAX_LEVEL: i32 = NUM_BASE_LEVELS + COEFF_BASE_RANGE;
+/// Anything above it is written as a Golomb tail on top of this.
+const MAX_BR_LEVEL: i32 = NUM_BASE_LEVELS + COEFF_BASE_RANGE;
+/// The largest level this writer codes. The Golomb tail is a length in unary
+/// followed by that many bits, and the spec's decoder reads at most twenty of
+/// each, so a level a decoder cannot read back is refused rather than written.
+const MAX_LEVEL: i32 = MAX_BR_LEVEL + (1 << 19);
 /// The q-context band whose default CDFs [`crate::cdf`] carries.
 const Q_CTX_2: std::ops::RangeInclusive<u8> = 61..=120;
 
@@ -610,8 +615,9 @@ fn level_grid(coeffs: &[Coeff], side: usize) -> Result<Vec<i32>> {
         if coeff.level == 0 || coeff.level.abs() > MAX_LEVEL {
             return Err(Error::unsupported(
                 "AV1 tile",
-                "coefficients are written for levels -14..=14 without zero; \
-                 wider levels need the Golomb tail",
+                format!(
+                    "coefficients are written for levels -{MAX_LEVEL}..={MAX_LEVEL} without zero"
+                ),
             ));
         }
         let pos = usize::from(coeff.row) * side + usize::from(coeff.col);
@@ -717,6 +723,11 @@ fn write_coeffs(
         } else {
             enc.literal(u32::from(level < 0), 1);
         }
+        // A level the base and base-range syntax cannot reach carries the rest
+        // of itself here, after its own sign (spec 5.11.39).
+        if level.abs() > MAX_BR_LEVEL {
+            write_golomb(enc, (level.abs() - MAX_BR_LEVEL - 1) as u32);
+        }
     }
 }
 
@@ -746,6 +757,20 @@ fn write_eob(enc: &mut SymbolEncoder, coding: &TxbCoding, eob: usize) {
         if bits > 1 {
             enc.literal(offset & ((1 << (bits - 1)) - 1), bits - 1);
         }
+    }
+}
+
+/// Writes the remainder of a level the base and base-range syntax could not
+/// reach (spec 5.11.40): the value plus one, as its bit length in unary
+/// followed by the value's own bits, most significant first.
+pub(crate) fn write_golomb(enc: &mut SymbolEncoder, value: u32) {
+    let x = value + 1;
+    let length = 32 - x.leading_zeros();
+    for _ in 0..length - 1 {
+        enc.literal(0, 1);
+    }
+    for i in (0..length).rev() {
+        enc.literal((x >> i) & 1, 1);
     }
 }
 
@@ -813,7 +838,7 @@ fn check_levels(levels: &[i32], blocks: usize, base_q_idx: u8) -> Result<()> {
             "a DC-only key frame needs one level per coded block",
         ));
     }
-    if levels.iter().any(|&l| l == 0 || l.abs() > MAX_LEVEL) {
+    if levels.iter().any(|&l| l == 0 || l.abs() > MAX_BR_LEVEL) {
         return Err(Error::unsupported(
             "AV1 tile",
             "a DC-only key frame is written for levels -14..=14 without zero; \
@@ -1852,6 +1877,115 @@ mod tests {
         );
     }
 
+    /// The mean sample of a decoded block.
+    fn mean_of(block: &[Vec<u8>]) -> f64 {
+        let sum: i32 = block.iter().flatten().map(|&s| i32::from(s)).sum();
+        f64::from(sum) / (block.len() * block[0].len()) as f64
+    }
+
+    /// The top-left block of a frame whose only coefficient is a luma DC of
+    /// `level`.
+    fn decode_dc_level_block(level: i32) -> Vec<Vec<u8>> {
+        let blocks = vec![
+            vec![Coeff {
+                row: 0,
+                col: 0,
+                level,
+            }],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ];
+        top_left_block(&decode_coeff_quadrants(&blocks))
+    }
+
+    /// `read_golomb` (spec 5.11.40), written from the specification's
+    /// pseudocode, and the level its caller builds from it: a level above the
+    /// base-range tail is fifteen plus what the tail carries.
+    fn read_golomb_level(dec: &mut crate::msac::tests::SymbolDecoder) -> u32 {
+        let mut length = 0;
+        while dec.literal(1) == 0 {
+            length += 1;
+            assert!(
+                length < 20,
+                "the tail's length prefix runs past twenty bits"
+            );
+        }
+        let mut x = 1;
+        for _ in 0..length {
+            x = (x << 1) | dec.literal(1);
+        }
+        (MAX_BR_LEVEL + 1) as u32 + (x - 1)
+    }
+
+    /// The tail says how much of the level the base and base-range syntax could
+    /// not carry, and the spec's own reader must hand back the level that was
+    /// asked for — not one either side of it. A tail written a bit long, a bit
+    /// short, or against the wrong base fails this at the first level it
+    /// reaches.
+    #[test]
+    fn the_golomb_tail_reads_back_as_the_level_it_was_written_for() {
+        for level in (MAX_BR_LEVEL + 1..=MAX_BR_LEVEL + 300)
+            .chain([MAX_LEVEL - 1, MAX_LEVEL])
+            .map(|l| l as u32)
+        {
+            let mut enc = SymbolEncoder::new();
+            write_golomb(&mut enc, level - (MAX_BR_LEVEL + 1) as u32);
+            // The tail is raw bits, so it needs no padding beyond what the
+            // encoder's own flush writes.
+            let data = enc.finish();
+            let mut dec = crate::msac::tests::SymbolDecoder::new(&data);
+            assert_eq!(
+                read_golomb_level(&mut dec),
+                level,
+                "the tail of level {level}"
+            );
+        }
+    }
+
+    /// The base and base-range syntax reach level fourteen between them;
+    /// anything above that carries the rest of itself as a Golomb tail, written
+    /// after its own sign. A DC level moves the whole block off its mid-grey
+    /// prediction by an amount that grows with the level, so a run of levels
+    /// either side of the tail's threshold — spaced wide enough that the
+    /// quantiser separates them — must decode to a run of steadily
+    /// brighter blocks — and the negatives of the same levels to steadily
+    /// darker ones. A tail written with the wrong length, in the wrong place in
+    /// the syntax, or off by one desyncs the decoder outright.
+    #[test]
+    fn levels_above_the_base_range_tail_carry_a_golomb_tail() {
+        if !have_ffmpeg() {
+            eprintln!("SKIP levels_above_the_base_range_tail_carry_a_golomb_tail: no ffmpeg");
+            return;
+        }
+        let mut brighter = Vec::new();
+        let mut darker = Vec::new();
+        for level in [10, 14, 18, 31, 60, 400] {
+            brighter.push((level, mean_of(&decode_dc_level_block(level))));
+            darker.push((level, mean_of(&decode_dc_level_block(-level))));
+        }
+        for pair in brighter.windows(2) {
+            let [(low, dim), (high, bright)] = [pair[0], pair[1]];
+            assert!(
+                bright > dim,
+                "level {high} decodes brighter than level {low}, got {bright} against {dim}"
+            );
+        }
+        for pair in darker.windows(2) {
+            let [(low, bright), (high, dim)] = [pair[0], pair[1]];
+            assert!(
+                dim < bright,
+                "level -{high} decodes darker than level -{low}, got {dim} against {bright}"
+            );
+        }
+        let (_, mid) = brighter[0];
+        assert!(
+            mid > 128.0 && darker[0].1 < 128.0,
+            "a positive level brightens its block and a negative one darkens it, got {mid} and {}",
+            darker[0].1
+        );
+    }
+
     /// A frame need not be a whole number of superblocks. A 96x64 frame is a
     /// superblock and a half across: the second superblock has no right-hand
     /// half, so its partition is a gathered flag rather than the full symbol,
@@ -2016,12 +2150,12 @@ mod tests {
                 }];
                 b
             }),
-            ("a level past the base-range tail", {
+            ("a level past the Golomb tail's reach", {
                 let mut b = empty();
                 b[2].luma = vec![Coeff {
                     row: 0,
                     col: 0,
-                    level: 15,
+                    level: MAX_LEVEL + 1,
                 }];
                 b
             }),
