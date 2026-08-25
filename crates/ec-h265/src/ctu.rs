@@ -26,8 +26,8 @@ use crate::cabac::{CabacEncoder, CabacState, Contexts, ctx};
 use crate::intra::{self, Availability, Refs};
 use crate::residual::{self, encode_residual};
 use crate::transform::{
-    chroma_qp, dequantize, forward_transform, inverse_transform, quantize, quantize_offset,
-    uses_dst,
+    chroma_qp, dequantize, forward_transform, forward_transform_skip, inverse_transform,
+    inverse_transform_skip, quantize, quantize_offset, uses_dst,
 };
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -171,6 +171,7 @@ pub struct CtuEncoder<'a> {
     sign_hiding: bool,
     /// Whether the levels get a rate-distortion search after quantisation.
     rdoq: bool,
+    transform_skip: bool,
     /// The counting CABAC engine that search prices its trials with.
     rdoq_enc: CabacEncoder,
     /// `log2` of the smallest coding unit the search will produce.
@@ -206,6 +207,7 @@ impl<'a> CtuEncoder<'a> {
         intra_nxn: bool,
         sign_hiding: bool,
         rdoq: bool,
+        transform_skip: bool,
         min_cb_log2: u32,
     ) -> CtuEncoder<'a> {
         let band_rows = (height - band_y0).min(ctb_size);
@@ -228,6 +230,7 @@ impl<'a> CtuEncoder<'a> {
             intra_nxn,
             sign_hiding,
             rdoq,
+            transform_skip,
             rdoq_enc: CabacEncoder::counter(Contexts::new(qp)),
             min_cb_log2: min_cb_log2.clamp(MIN_CB_LOG2, 5),
             modes: vec![255; (width / 4) * (ctb_size / 4)],
@@ -582,13 +585,17 @@ impl<'a> CtuEncoder<'a> {
         // The chroma mode belongs to the coding unit and derives from the
         // first partition's luma mode (8.4.3).
         let (chroma_mode, chroma_idx) = if self.chroma_rd {
-            self.choose_chroma_mode(x, y, 8, MIN_CB_LOG2, modes[0], enc)
+            self.choose_chroma_mode(x, y, 8, MIN_CB_LOG2, modes[0], self.transform_skip, enc)
         } else {
             (modes[0], None)
         };
         self.write_chroma_mode_syntax(enc, chroma_idx);
-        let cb_cbf = self.code_chroma(x, y, 8, chroma_mode, 1).1;
-        let cr_cbf = self.code_chroma(x, y, 8, chroma_mode, 2).1;
+        let cb_cbf = self
+            .code_chroma(x, y, 8, chroma_mode, 1, self.transform_skip)
+            .1;
+        let cr_cbf = self
+            .code_chroma(x, y, 8, chroma_mode, 2, self.transform_skip)
+            .1;
 
         // transform_tree: the split at depth 0 is inferred from the partition
         // mode, so only the chroma flags are written there; every luma flag and
@@ -600,18 +607,42 @@ impl<'a> CtuEncoder<'a> {
             enc.encode_bin(ctx::CBF_LUMA, u32::from(cbfs[part]));
             if cbfs[part] {
                 let scan = intra::scan_index(modes[part], 2, true);
-                encode_residual(enc, &levels[part], 2, 0, scan, self.sign_hiding);
+                encode_residual(
+                    enc,
+                    &levels[part],
+                    2,
+                    0,
+                    scan,
+                    self.sign_hiding,
+                    self.transform_skip,
+                );
             }
             if part == 3 {
                 let chroma_scan = intra::scan_index(chroma_mode, 2, false);
                 if cb_cbf {
                     let l = std::mem::take(&mut self.scratch.cb_levels);
-                    encode_residual(enc, &l[..16], 2, 1, chroma_scan, self.sign_hiding);
+                    encode_residual(
+                        enc,
+                        &l[..16],
+                        2,
+                        1,
+                        chroma_scan,
+                        self.sign_hiding,
+                        self.transform_skip,
+                    );
                     self.scratch.cb_levels = l;
                 }
                 if cr_cbf {
                     let l = std::mem::take(&mut self.scratch.cr_levels);
-                    encode_residual(enc, &l[..16], 2, 2, chroma_scan, self.sign_hiding);
+                    encode_residual(
+                        enc,
+                        &l[..16],
+                        2,
+                        2,
+                        chroma_scan,
+                        self.sign_hiding,
+                        self.transform_skip,
+                    );
                     self.scratch.cr_levels = l;
                 }
             }
@@ -631,6 +662,7 @@ impl<'a> CtuEncoder<'a> {
         enc: &mut CabacEncoder,
     ) -> f64 {
         let n = 1usize << log2;
+        let chroma_tskip = self.transform_skip && n == 8;
         let before = enc.bit_count();
         if log2 == MIN_CB_LOG2 {
             // part_mode: PART_2Nx2N is the single bin 1.
@@ -640,7 +672,7 @@ impl<'a> CtuEncoder<'a> {
         let mode = self.choose_luma_mode(x, y, n, log2, &mpm, enc);
         self.write_mode_syntax(enc, mode, &mpm);
         let (chroma_mode, chroma_idx) = if self.chroma_rd {
-            self.choose_chroma_mode(x, y, n, log2, mode, enc)
+            self.choose_chroma_mode(x, y, n, log2, mode, chroma_tskip, enc)
         } else {
             (mode, None)
         };
@@ -648,8 +680,8 @@ impl<'a> CtuEncoder<'a> {
 
         // Luma was reconstructed by the mode search; chroma is coded now.
         let luma_cbf = self.scratch.luma_levels[..n * n].iter().any(|&v| v != 0);
-        let cb_cbf = self.code_chroma(x, y, n, chroma_mode, 1).1;
-        let cr_cbf = self.code_chroma(x, y, n, chroma_mode, 2).1;
+        let cb_cbf = self.code_chroma(x, y, n, chroma_mode, 1, chroma_tskip).1;
+        let cr_cbf = self.code_chroma(x, y, n, chroma_mode, 2, chroma_tskip).1;
 
         enc.encode_bin(ctx::CBF_CHROMA, u32::from(cb_cbf));
         enc.encode_bin(ctx::CBF_CHROMA, u32::from(cr_cbf));
@@ -657,7 +689,15 @@ impl<'a> CtuEncoder<'a> {
         if luma_cbf {
             let scan = intra::scan_index(mode, log2, true);
             let levels = std::mem::take(&mut self.scratch.luma_levels);
-            encode_residual(enc, &levels[..n * n], log2, 0, scan, self.sign_hiding);
+            encode_residual(
+                enc,
+                &levels[..n * n],
+                log2,
+                0,
+                scan,
+                self.sign_hiding,
+                self.transform_skip,
+            );
             self.scratch.luma_levels = levels;
         }
         let chroma_scan = intra::scan_index(chroma_mode, log2 - 1, false);
@@ -670,6 +710,7 @@ impl<'a> CtuEncoder<'a> {
                 1,
                 chroma_scan,
                 self.sign_hiding,
+                chroma_tskip,
             );
             self.scratch.cb_levels = levels;
         }
@@ -682,6 +723,7 @@ impl<'a> CtuEncoder<'a> {
                 2,
                 chroma_scan,
                 self.sign_hiding,
+                chroma_tskip,
             );
             self.scratch.cr_levels = levels;
         }
@@ -867,7 +909,15 @@ impl<'a> CtuEncoder<'a> {
             if cbf {
                 let scan = intra::scan_index(mode, log2, true);
                 let levels = std::mem::take(&mut self.scratch.levels);
-                encode_residual(enc, &levels[..n * n], log2, 0, scan, self.sign_hiding);
+                encode_residual(
+                    enc,
+                    &levels[..n * n],
+                    log2,
+                    0,
+                    scan,
+                    self.sign_hiding,
+                    self.transform_skip,
+                );
                 self.scratch.levels = levels;
             }
             let bits = enc.bit_count() - bits_before;
@@ -906,8 +956,13 @@ impl<'a> CtuEncoder<'a> {
         for (i, &sample) in source[..n * n].iter().enumerate() {
             self.scratch.residual[i] = i32::from(sample) - i32::from(self.scratch.pred[i]);
         }
+        let skip = self.transform_skip && n == 4;
         let dst = uses_dst(n, true);
-        forward_transform(&self.scratch.residual, &mut self.scratch.coeffs, n, dst);
+        if skip {
+            forward_transform_skip(&self.scratch.residual, &mut self.scratch.coeffs, n);
+        } else {
+            forward_transform(&self.scratch.residual, &mut self.scratch.coeffs, n, dst);
+        }
         let mut nonzero = if self.rdoq {
             quantize_offset(
                 &self.scratch.coeffs,
@@ -929,6 +984,7 @@ impl<'a> CtuEncoder<'a> {
                 intra::scan_index(mode, n.trailing_zeros(), true),
                 ctx::CBF_LUMA + 1,
                 self.lambda,
+                skip,
                 &mut self.rdoq_enc,
             );
         }
@@ -944,7 +1000,11 @@ impl<'a> CtuEncoder<'a> {
         let cbf = nonzero > 0;
         if cbf {
             dequantize(&self.scratch.levels, &mut self.scratch.scaled, n, self.qp);
-            inverse_transform(&self.scratch.scaled, &mut self.scratch.residual, n, dst);
+            if skip {
+                inverse_transform_skip(&self.scratch.scaled, &mut self.scratch.residual, n);
+            } else {
+                inverse_transform(&self.scratch.scaled, &mut self.scratch.residual, n, dst);
+            }
         } else {
             self.scratch.residual[..n * n].fill(0);
         }
@@ -968,6 +1028,7 @@ impl<'a> CtuEncoder<'a> {
         n: usize,
         pred_mode: u8,
         plane: usize,
+        skip: bool,
     ) -> (f64, bool) {
         let cn = n / 2;
         let (cx, cy) = (x / 2, y / 2);
@@ -989,7 +1050,11 @@ impl<'a> CtuEncoder<'a> {
                     s - i32::from(self.scratch.pred[row * cn + col]);
             }
         }
-        forward_transform(&self.scratch.residual, &mut self.scratch.coeffs, cn, false);
+        if skip && cn == 4 {
+            forward_transform_skip(&self.scratch.residual, &mut self.scratch.coeffs, cn);
+        } else {
+            forward_transform(&self.scratch.residual, &mut self.scratch.coeffs, cn, false);
+        }
         let mut nonzero = if self.rdoq {
             quantize_offset(
                 &self.scratch.coeffs,
@@ -1016,6 +1081,7 @@ impl<'a> CtuEncoder<'a> {
                 intra::scan_index(pred_mode, cn.trailing_zeros(), false),
                 ctx::CBF_CHROMA,
                 self.lambda,
+                skip && cn == 4,
                 &mut self.rdoq_enc,
             );
         }
@@ -1036,7 +1102,11 @@ impl<'a> CtuEncoder<'a> {
                 cn,
                 self.qp_c,
             );
-            inverse_transform(&self.scratch.scaled, &mut self.scratch.residual, cn, false);
+            if skip && cn == 4 {
+                inverse_transform_skip(&self.scratch.scaled, &mut self.scratch.residual, cn);
+            } else {
+                inverse_transform(&self.scratch.scaled, &mut self.scratch.residual, cn, false);
+            }
         } else {
             self.scratch.residual[..cn * cn].fill(0);
         }
@@ -1082,6 +1152,7 @@ impl<'a> CtuEncoder<'a> {
     /// Returns the mode and the index to code, `None` meaning derived. Neither
     /// the winner's reconstruction nor its levels survive the trial: the caller
     /// codes the winner again for real.
+    #[allow(clippy::too_many_arguments)]
     fn choose_chroma_mode(
         &mut self,
         x: usize,
@@ -1089,6 +1160,7 @@ impl<'a> CtuEncoder<'a> {
         n: usize,
         log2: u32,
         luma_mode: u8,
+        chroma_tskip: bool,
         enc: &mut CabacEncoder,
     ) -> (u8, Option<u32>) {
         let mut explicit = [0u8, 26, 10, 1];
@@ -1109,8 +1181,8 @@ impl<'a> CtuEncoder<'a> {
         {
             let bits_before = enc.bit_count();
             self.write_chroma_mode_syntax(enc, i);
-            let (cb_ssd, cb_cbf) = self.code_chroma(x, y, n, mode, 1);
-            let (cr_ssd, cr_cbf) = self.code_chroma(x, y, n, mode, 2);
+            let (cb_ssd, cb_cbf) = self.code_chroma(x, y, n, mode, 1, chroma_tskip);
+            let (cr_ssd, cr_cbf) = self.code_chroma(x, y, n, mode, 2, chroma_tskip);
             enc.encode_bin(ctx::CBF_CHROMA, u32::from(cb_cbf));
             enc.encode_bin(ctx::CBF_CHROMA, u32::from(cr_cbf));
             let scan = intra::scan_index(mode, log2 - 1, false);
@@ -1123,6 +1195,7 @@ impl<'a> CtuEncoder<'a> {
                     1,
                     scan,
                     self.sign_hiding,
+                    chroma_tskip,
                 );
                 self.scratch.cb_levels = levels;
             }
@@ -1135,6 +1208,7 @@ impl<'a> CtuEncoder<'a> {
                     2,
                     scan,
                     self.sign_hiding,
+                    chroma_tskip,
                 );
                 self.scratch.cr_levels = levels;
             }
