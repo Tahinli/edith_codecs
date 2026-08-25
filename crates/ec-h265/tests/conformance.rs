@@ -163,7 +163,50 @@ fn chroma_mode_search_decodes_bit_exactly() {
         let recon = planes_of(coded.recon.as_ref().expect("recon kept"));
         assert_eq!(decoded.len(), recon.len(), "{name}: size mismatch");
         let mismatches = decoded.iter().zip(&recon).filter(|(a, b)| a != b).count();
-        assert_eq!(mismatches, 0, "{name}: {mismatches} samples differ");
+        if mismatches != 0 {
+            // Which plane and where: a luma-only divergence is the transform
+            // tree, a chroma-only one is the flags that ride on it.
+            let luma = (w * h) as usize;
+            let chroma = luma / 4;
+            let first = decoded
+                .iter()
+                .zip(&recon)
+                .position(|(a, b)| a != b)
+                .unwrap();
+            let count = |range: std::ops::Range<usize>| {
+                decoded[range.clone()]
+                    .iter()
+                    .zip(&recon[range])
+                    .filter(|(a, b)| a != b)
+                    .count()
+            };
+            let mut map = String::new();
+            for by in (0..h as usize).step_by(16) {
+                for bx in (0..w as usize).step_by(16) {
+                    let mut c = 0;
+                    for row in by..by + 16 {
+                        for col in bx..bx + 16 {
+                            let i = row * w as usize + col;
+                            if decoded[i] != recon[i] {
+                                c += 1;
+                            }
+                        }
+                    }
+                    map.push_str(&format!("{c:4}"));
+                }
+                map.push('\n');
+            }
+            eprintln!("luma 16x16 mismatch map:\n{map}");
+            panic!(
+                "{name}: {mismatches} samples differ -- Y {}, Cb {}, Cr {}, first at {first} \
+                 ({}, {})",
+                count(0..luma),
+                count(luma..luma + chroma),
+                count(luma + chroma..luma + 2 * chroma),
+                first % w as usize,
+                first / w as usize,
+            );
+        }
         let quality = psnr(&planes_of(&source), &recon);
         assert!(quality > 30.0, "{name}: PSNR {quality:.2} dB at QP 27");
     }
@@ -197,7 +240,50 @@ fn intra_nxn_decodes_bit_exactly() {
         let recon = planes_of(coded.recon.as_ref().expect("recon kept"));
         assert_eq!(decoded.len(), recon.len(), "{name}: size mismatch");
         let mismatches = decoded.iter().zip(&recon).filter(|(a, b)| a != b).count();
-        assert_eq!(mismatches, 0, "{name}: {mismatches} samples differ");
+        if mismatches != 0 {
+            // Which plane and where: a luma-only divergence is the transform
+            // tree, a chroma-only one is the flags that ride on it.
+            let luma = (w * h) as usize;
+            let chroma = luma / 4;
+            let first = decoded
+                .iter()
+                .zip(&recon)
+                .position(|(a, b)| a != b)
+                .unwrap();
+            let count = |range: std::ops::Range<usize>| {
+                decoded[range.clone()]
+                    .iter()
+                    .zip(&recon[range])
+                    .filter(|(a, b)| a != b)
+                    .count()
+            };
+            let mut map = String::new();
+            for by in (0..h as usize).step_by(16) {
+                for bx in (0..w as usize).step_by(16) {
+                    let mut c = 0;
+                    for row in by..by + 16 {
+                        for col in bx..bx + 16 {
+                            let i = row * w as usize + col;
+                            if decoded[i] != recon[i] {
+                                c += 1;
+                            }
+                        }
+                    }
+                    map.push_str(&format!("{c:4}"));
+                }
+                map.push('\n');
+            }
+            eprintln!("luma 16x16 mismatch map:\n{map}");
+            panic!(
+                "{name}: {mismatches} samples differ -- Y {}, Cb {}, Cr {}, first at {first} \
+                 ({}, {})",
+                count(0..luma),
+                count(luma..luma + chroma),
+                count(luma + chroma..luma + 2 * chroma),
+                first % w as usize,
+                first / w as usize,
+            );
+        }
         let quality = psnr(&planes_of(&source), &recon);
         assert!(quality > 30.0, "{name}: PSNR {quality:.2} dB at QP 22");
     }
@@ -235,7 +321,50 @@ fn sign_hiding_decodes_bit_exactly() {
         let recon = planes_of(coded.recon.as_ref().expect("recon kept"));
         assert_eq!(decoded.len(), recon.len(), "{name}: size mismatch");
         let mismatches = decoded.iter().zip(&recon).filter(|(a, b)| a != b).count();
-        assert_eq!(mismatches, 0, "{name}: {mismatches} samples differ");
+        if mismatches != 0 {
+            // Which plane and where: a luma-only divergence is the transform
+            // tree, a chroma-only one is the flags that ride on it.
+            let luma = (w * h) as usize;
+            let chroma = luma / 4;
+            let first = decoded
+                .iter()
+                .zip(&recon)
+                .position(|(a, b)| a != b)
+                .unwrap();
+            let count = |range: std::ops::Range<usize>| {
+                decoded[range.clone()]
+                    .iter()
+                    .zip(&recon[range])
+                    .filter(|(a, b)| a != b)
+                    .count()
+            };
+            let mut map = String::new();
+            for by in (0..h as usize).step_by(16) {
+                for bx in (0..w as usize).step_by(16) {
+                    let mut c = 0;
+                    for row in by..by + 16 {
+                        for col in bx..bx + 16 {
+                            let i = row * w as usize + col;
+                            if decoded[i] != recon[i] {
+                                c += 1;
+                            }
+                        }
+                    }
+                    map.push_str(&format!("{c:4}"));
+                }
+                map.push('\n');
+            }
+            eprintln!("luma 16x16 mismatch map:\n{map}");
+            panic!(
+                "{name}: {mismatches} samples differ -- Y {}, Cb {}, Cr {}, first at {first} \
+                 ({}, {})",
+                count(0..luma),
+                count(luma..luma + chroma),
+                count(luma + chroma..luma + 2 * chroma),
+                first % w as usize,
+                first / w as usize,
+            );
+        }
         let quality = psnr(&planes_of(&source), &recon);
         assert!(quality > 30.0, "{name}: PSNR {quality:.2} dB at QP 22");
     }
@@ -301,7 +430,50 @@ fn transform_skip_decodes_bit_exactly() {
         let recon = planes_of(coded.recon.as_ref().expect("recon kept"));
         assert_eq!(decoded.len(), recon.len(), "{name}: size mismatch");
         let mismatches = decoded.iter().zip(&recon).filter(|(a, b)| a != b).count();
-        assert_eq!(mismatches, 0, "{name}: {mismatches} samples differ");
+        if mismatches != 0 {
+            // Which plane and where: a luma-only divergence is the transform
+            // tree, a chroma-only one is the flags that ride on it.
+            let luma = (w * h) as usize;
+            let chroma = luma / 4;
+            let first = decoded
+                .iter()
+                .zip(&recon)
+                .position(|(a, b)| a != b)
+                .unwrap();
+            let count = |range: std::ops::Range<usize>| {
+                decoded[range.clone()]
+                    .iter()
+                    .zip(&recon[range])
+                    .filter(|(a, b)| a != b)
+                    .count()
+            };
+            let mut map = String::new();
+            for by in (0..h as usize).step_by(16) {
+                for bx in (0..w as usize).step_by(16) {
+                    let mut c = 0;
+                    for row in by..by + 16 {
+                        for col in bx..bx + 16 {
+                            let i = row * w as usize + col;
+                            if decoded[i] != recon[i] {
+                                c += 1;
+                            }
+                        }
+                    }
+                    map.push_str(&format!("{c:4}"));
+                }
+                map.push('\n');
+            }
+            eprintln!("luma 16x16 mismatch map:\n{map}");
+            panic!(
+                "{name}: {mismatches} samples differ -- Y {}, Cb {}, Cr {}, first at {first} \
+                 ({}, {})",
+                count(0..luma),
+                count(luma..luma + chroma),
+                count(luma + chroma..luma + 2 * chroma),
+                first % w as usize,
+                first / w as usize,
+            );
+        }
         let quality = psnr(&planes_of(&source), &recon);
         assert!(quality > 30.0, "{name}: PSNR {quality:.2} dB at QP 22");
     }
@@ -343,7 +515,50 @@ fn ffmpeg_decodes_bit_exactly_at_every_shape() {
             recon.len()
         );
         let mismatches = decoded.iter().zip(&recon).filter(|(a, b)| a != b).count();
-        assert_eq!(mismatches, 0, "{name}: {mismatches} samples differ");
+        if mismatches != 0 {
+            // Which plane and where: a luma-only divergence is the transform
+            // tree, a chroma-only one is the flags that ride on it.
+            let luma = (w * h) as usize;
+            let chroma = luma / 4;
+            let first = decoded
+                .iter()
+                .zip(&recon)
+                .position(|(a, b)| a != b)
+                .unwrap();
+            let count = |range: std::ops::Range<usize>| {
+                decoded[range.clone()]
+                    .iter()
+                    .zip(&recon[range])
+                    .filter(|(a, b)| a != b)
+                    .count()
+            };
+            let mut map = String::new();
+            for by in (0..h as usize).step_by(16) {
+                for bx in (0..w as usize).step_by(16) {
+                    let mut c = 0;
+                    for row in by..by + 16 {
+                        for col in bx..bx + 16 {
+                            let i = row * w as usize + col;
+                            if decoded[i] != recon[i] {
+                                c += 1;
+                            }
+                        }
+                    }
+                    map.push_str(&format!("{c:4}"));
+                }
+                map.push('\n');
+            }
+            eprintln!("luma 16x16 mismatch map:\n{map}");
+            panic!(
+                "{name}: {mismatches} samples differ -- Y {}, Cb {}, Cr {}, first at {first} \
+                 ({}, {})",
+                count(0..luma),
+                count(luma..luma + chroma),
+                count(luma + chroma..luma + 2 * chroma),
+                first % w as usize,
+                first / w as usize,
+            );
+        }
         // And the encode is worth something: PSNR against the source.
         let quality = psnr(&planes_of(&source), &recon);
         assert!(quality > 30.0, "{name}: PSNR {quality:.2} dB at QP 27");
@@ -568,7 +783,50 @@ fn rdoq_decodes_bit_exactly() {
         let recon = planes_of(coded.recon.as_ref().expect("recon kept"));
         assert_eq!(decoded.len(), recon.len(), "{name}: size mismatch");
         let mismatches = decoded.iter().zip(&recon).filter(|(a, b)| a != b).count();
-        assert_eq!(mismatches, 0, "{name}: {mismatches} samples differ");
+        if mismatches != 0 {
+            // Which plane and where: a luma-only divergence is the transform
+            // tree, a chroma-only one is the flags that ride on it.
+            let luma = (w * h) as usize;
+            let chroma = luma / 4;
+            let first = decoded
+                .iter()
+                .zip(&recon)
+                .position(|(a, b)| a != b)
+                .unwrap();
+            let count = |range: std::ops::Range<usize>| {
+                decoded[range.clone()]
+                    .iter()
+                    .zip(&recon[range])
+                    .filter(|(a, b)| a != b)
+                    .count()
+            };
+            let mut map = String::new();
+            for by in (0..h as usize).step_by(16) {
+                for bx in (0..w as usize).step_by(16) {
+                    let mut c = 0;
+                    for row in by..by + 16 {
+                        for col in bx..bx + 16 {
+                            let i = row * w as usize + col;
+                            if decoded[i] != recon[i] {
+                                c += 1;
+                            }
+                        }
+                    }
+                    map.push_str(&format!("{c:4}"));
+                }
+                map.push('\n');
+            }
+            eprintln!("luma 16x16 mismatch map:\n{map}");
+            panic!(
+                "{name}: {mismatches} samples differ -- Y {}, Cb {}, Cr {}, first at {first} \
+                 ({}, {})",
+                count(0..luma),
+                count(luma..luma + chroma),
+                count(luma + chroma..luma + 2 * chroma),
+                first % w as usize,
+                first / w as usize,
+            );
+        }
         let quality = psnr(&planes_of(&source), &recon);
         assert!(quality > 28.0, "{name}: PSNR {quality:.2} dB at QP 27");
     }
@@ -579,6 +837,93 @@ fn rdoq_decodes_bit_exactly() {
 fn encode_rdoq(width: u32, height: u32, qp: i32, rdoq: bool) -> (VideoFrame, EncodedPicture) {
     let mut cfg = EncoderConfig::new(width, height);
     cfg.rdoq = rdoq;
+    cfg.rate_control = RateControl::ConstantQp(qp);
+    cfg.keep_recon = true;
+    cfg.picture_hash = true;
+    let encoder = Encoder::new(cfg).expect("encoder");
+    let frame = natural_frame(width, height, 0);
+    let coded = encoder.encode_idr(&frame).expect("encode");
+    (frame, coded)
+}
+
+/// RQT must produce a bitstream a conformant decoder reads back to the exact
+/// samples the encoder reconstructed.
+#[test]
+fn rqt_decodes_bit_exactly() {
+    if !have_ffmpeg() {
+        eprintln!("skipping: ffmpeg not installed");
+        return;
+    }
+    for &(w, h) in &[(64u32, 64u32), (130, 66), (352, 288)] {
+        let (source, coded) = encode_rqt(w, h, 27, true);
+        let (_, plain) = encode_rqt(w, h, 27, false);
+        let name = format!("rqt-{w}x{h}");
+        assert_ne!(
+            coded.au, plain.au,
+            "{name}: RQT changed no byte, so the split path is not running"
+        );
+        let path = write_au(&name, &coded);
+        let decoded = match ffmpeg_decode(&path) {
+            Ok(bytes) => bytes,
+            Err(e) => panic!("{name}: ffmpeg failed: {e}"),
+        };
+        let recon = planes_of(coded.recon.as_ref().expect("recon kept"));
+        assert_eq!(decoded.len(), recon.len(), "{name}: size mismatch");
+        let mismatches = decoded.iter().zip(&recon).filter(|(a, b)| a != b).count();
+        if mismatches != 0 {
+            // Which plane and where: a luma-only divergence is the transform
+            // tree, a chroma-only one is the flags that ride on it.
+            let luma = (w * h) as usize;
+            let chroma = luma / 4;
+            let first = decoded
+                .iter()
+                .zip(&recon)
+                .position(|(a, b)| a != b)
+                .unwrap();
+            let count = |range: std::ops::Range<usize>| {
+                decoded[range.clone()]
+                    .iter()
+                    .zip(&recon[range])
+                    .filter(|(a, b)| a != b)
+                    .count()
+            };
+            let mut map = String::new();
+            for by in (0..h as usize).step_by(16) {
+                for bx in (0..w as usize).step_by(16) {
+                    let mut c = 0;
+                    for row in by..by + 16 {
+                        for col in bx..bx + 16 {
+                            let i = row * w as usize + col;
+                            if decoded[i] != recon[i] {
+                                c += 1;
+                            }
+                        }
+                    }
+                    map.push_str(&format!("{c:4}"));
+                }
+                map.push('\n');
+            }
+            eprintln!("luma 16x16 mismatch map:\n{map}");
+            panic!(
+                "{name}: {mismatches} samples differ -- Y {}, Cb {}, Cr {}, first at {first} \
+                 ({}, {})",
+                count(0..luma),
+                count(luma..luma + chroma),
+                count(luma + chroma..luma + 2 * chroma),
+                first % w as usize,
+                first / w as usize,
+            );
+        }
+        let quality = psnr(&planes_of(&source), &recon);
+        assert!(quality > 28.0, "{name}: PSNR {quality:.2} dB at QP 27");
+    }
+}
+
+/// The natural frame coded with RQT on or off, everything else left at its
+/// default.
+fn encode_rqt(width: u32, height: u32, qp: i32, rqt: bool) -> (VideoFrame, EncodedPicture) {
+    let mut cfg = EncoderConfig::new(width, height);
+    cfg.rqt = rqt;
     cfg.rate_control = RateControl::ConstantQp(qp);
     cfg.keep_recon = true;
     cfg.picture_hash = true;
