@@ -167,6 +167,14 @@ pub struct EncoderConfig {
     pub rdoq: bool,
     /// Whether 4x4 TUs may skip the integer transform.
     pub transform_skip: TransformSkip,
+    /// Whether the transform tree may split once (rate-quantisation transform):
+    /// the luma TU of a 2Nx2N coding unit may be coded as four half-size
+    /// children when that costs less in `J = SSD + lambda * bits`.
+    ///
+    /// On by default: measured against x265 over the four-point ladder it is
+    /// worth +0.010 dB BD-PSNR on film and +0.080 dB on screen capture, which
+    /// is where our gap against x265 is (see `lanes/h265-rqt-r1.report.md`).
+    pub rqt: bool,
     /// What the samples mean, written into the VUI.
     pub video_signal_type: Option<VideoSignalType>,
     /// Sample aspect ratio.
@@ -199,6 +207,7 @@ impl EncoderConfig {
             sign_hiding: false,
             rdoq: true,
             transform_skip: TransformSkip::Off,
+            rqt: true,
             video_signal_type: None,
             sample_aspect_ratio: None,
             timing: None,
@@ -295,7 +304,7 @@ impl Encoder {
             log2_min_tb_size_minus2: 0,
             log2_diff_max_min_tb_size: 3,
             max_transform_hierarchy_depth_inter: 0,
-            max_transform_hierarchy_depth_intra: 0,
+            max_transform_hierarchy_depth_intra: if cfg.rqt { 1 } else { 0 },
             scaling_list_enabled: false,
             amp_enabled: false,
             // No in-loop filters: see `Encoder` docs and the PPS below.
@@ -579,6 +588,7 @@ impl Encoder {
                             self.cfg.sign_hiding,
                             self.cfg.rdoq,
                             self.cfg.transform_skip != TransformSkip::Off,
+                            self.cfg.rqt,
                             self.cfg.min_cu_size.max(8).trailing_zeros(),
                         );
                         for col in 0..cols {
