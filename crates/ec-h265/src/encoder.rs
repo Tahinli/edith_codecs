@@ -47,6 +47,16 @@ pub enum RateControl {
     TargetBits(u64),
 }
 
+/// Whether 4x4 transform units may skip the transform and code residual
+/// samples directly (`transform_skip_enabled_flag`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransformSkip {
+    /// No transform skip; every default stream is byte-identical.
+    Off,
+    /// Skip the transform on every 4x4 TU that has non-zero residual.
+    AlwaysFor4x4,
+}
+
 /// Encoder settings.
 #[derive(Debug, Clone)]
 pub struct EncoderConfig {
@@ -155,6 +165,8 @@ pub struct EncoderConfig {
     /// coder's own price for the whole block, so dropping a level is priced
     /// with the significance map and last position that follow from it.
     pub rdoq: bool,
+    /// Whether 4x4 TUs may skip the integer transform.
+    pub transform_skip: TransformSkip,
     /// What the samples mean, written into the VUI.
     pub video_signal_type: Option<VideoSignalType>,
     /// Sample aspect ratio.
@@ -186,6 +198,7 @@ impl EncoderConfig {
             intra_nxn: true,
             sign_hiding: false,
             rdoq: true,
+            transform_skip: TransformSkip::Off,
             video_signal_type: None,
             sample_aspect_ratio: None,
             timing: None,
@@ -315,6 +328,7 @@ impl Encoder {
             // that identity (and the picture-hash check that rides on it)
             // rather than a fraction of a dB.
             sign_data_hiding_enabled: cfg.sign_hiding,
+            transform_skip_enabled: cfg.transform_skip != TransformSkip::Off,
             deblocking_filter_control_present: true,
             deblocking_filter_disabled: true,
             loop_filter_across_slices_enabled: false,
@@ -564,6 +578,7 @@ impl Encoder {
                             self.cfg.intra_nxn,
                             self.cfg.sign_hiding,
                             self.cfg.rdoq,
+                            self.cfg.transform_skip != TransformSkip::Off,
                             self.cfg.min_cu_size.max(8).trailing_zeros(),
                         );
                         for col in 0..cols {
