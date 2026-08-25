@@ -167,11 +167,9 @@ pub fn dc_key_frame_tile_levels(
     // the left, which is dropped at the start of every superblock row the way a
     // decoder clears its left context there.
     let mut above: Vec<Option<bool>> = vec![None; sb_cols as usize];
-    let mut left: Option<bool> = None;
-
     let mut enc = SymbolEncoder::new();
     for r in 0..sb_rows {
-        left = None;
+        let mut left: Option<bool> = None;
         for c in 0..sb_cols {
             let dc_level = levels[(r * sb_cols + c) as usize];
             let level = dc_level.abs();
