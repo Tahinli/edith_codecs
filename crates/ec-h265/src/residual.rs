@@ -1,6 +1,7 @@
 //! `residual_coding()` (7.3.8.11) and the scan orders it walks (6.5.3 - 6.5.5).
 
 use crate::cabac::{CabacEncoder, ctx};
+use crate::transform::ideal_level;
 use std::sync::LazyLock;
 
 /// Scan orders: `SCANS[log2BlockSize][scanIdx][pos] = (x, y)`.
@@ -129,6 +130,71 @@ fn last_prefix(coord: u32) -> (u32, u32) {
     }
 }
 
+/// Make each sub-block's absolute levels carry the sign of its first
+/// significant coefficient, so that sign need not be coded (7.3.8.11, the
+/// `sign_data_hiding_enabled_flag` path). A sub-block qualifies when its first
+/// and last significant coefficients are more than three scan positions apart;
+/// where the parity is wrong, one level is nudged by one, the cheapest being
+/// whichever coefficient the quantiser rounded furthest in that direction.
+///
+/// This runs on the levels before they are dequantised, so the encoder's own
+/// reconstruction is built from what the decoder will read back.
+pub fn hide_signs(coeffs: &[i32], levels: &mut [i32], n: usize, qp: i32, scan_idx: usize) -> usize {
+    let log2_size = n.trailing_zeros();
+    let sub_scan = scan(log2_size - 2, scan_idx);
+    let pos_scan = scan(2, scan_idx);
+    for &(xs, ys) in sub_scan {
+        let (xs, ys) = (xs as usize, ys as usize);
+        let at = |p: usize| {
+            let (xp, yp) = pos_scan[p];
+            (ys * 4 + yp as usize) * n + xs * 4 + xp as usize
+        };
+        let Some(first) = (0..16).find(|&p| levels[at(p)] != 0) else {
+            continue;
+        };
+        let last = (0..16).rev().find(|&p| levels[at(p)] != 0).unwrap_or(first);
+        if last - first <= 3 {
+            continue;
+        }
+        let sum: i32 = (0..16).map(|p| levels[at(p)].abs()).sum();
+        let negative = levels[at(first)] < 0;
+        if (sum & 1 == 1) == negative {
+            continue;
+        }
+        // The parity is wrong. Changing any level by one fixes it; take the
+        // one whose rounding error the change reduces most (or grows least).
+        // Only levels that stay non-zero are considered, so no coefficient
+        // enters or leaves the block and the scan positions above still hold.
+        let mut best: Option<(f64, usize, i32)> = None;
+        for p in 0..16 {
+            let i = at(p);
+            let level = levels[i];
+            if level == 0 {
+                continue;
+            }
+            let magnitude = f64::from(level.abs());
+            let ideal = ideal_level(coeffs[i], n, qp);
+            // Distortion alone picks the coefficient: a rate bias favouring
+            // decrements (or increments) was swept through the clip gate at
+            // +-0.25 and +-0.5 units of squared level error per bit and lost
+            // in both directions, so there is none.
+            let mut consider = |cost: f64, delta: i32| {
+                if best.is_none_or(|(b, _, _)| cost < b) {
+                    best = Some((cost, i, delta));
+                }
+            };
+            consider(1.0 - 2.0 * (ideal - magnitude), 1);
+            if level.abs() > 1 {
+                consider(1.0 + 2.0 * (ideal - magnitude), -1);
+            }
+        }
+        if let Some((_, i, delta)) = best {
+            levels[i] += if levels[i] < 0 { -delta } else { delta };
+        }
+    }
+    levels[..n * n].iter().filter(|&&l| l != 0).count()
+}
+
 /// Encode one transform block's levels.
 ///
 /// `levels` is row-major `n x n` with `levels[y * n + x]`, `c_idx` is 0 for luma
@@ -140,6 +206,7 @@ pub fn encode_residual(
     log2_size: u32,
     c_idx: usize,
     scan_idx: usize,
+    sign_hiding: bool,
 ) {
     let n = 1usize << log2_size;
     let sub_wide = n >> 2;
@@ -310,9 +377,16 @@ pub fn encode_residual(
             enc.encode_bin(ctx::GREATER2 + inc as usize, u32::from(greater2));
         }
 
-        // Signs, then the remaining magnitudes. Sign data hiding is off, so
-        // every significant coefficient carries its own sign bit.
-        for &p in order {
+        // Signs, then the remaining magnitudes. With sign data hiding on and
+        // the significant coefficients of this sub-block more than three scan
+        // positions apart, the first one's sign is not coded at all: the
+        // decoder reads it off the parity of the sub-block's absolute levels,
+        // which `hide_signs` has already made match.
+        let hidden = sign_hiding && order[0] - order[order_len - 1] > 3;
+        for (k, &p) in order.iter().enumerate() {
+            if hidden && k == order_len - 1 {
+                continue;
+            }
             let (xp, yp) = pos_scan[p];
             let level = levels[(ys * 4 + yp as usize) * n + xs * 4 + xp as usize];
             enc.encode_bypass(u32::from(level < 0));
@@ -491,7 +565,7 @@ mod tests {
         let mut costs = Vec::new();
         for levels in [&sparse, &dense] {
             let mut enc = CabacEncoder::counter(Contexts::new(30));
-            encode_residual(&mut enc, levels, 3, 0, 0);
+            encode_residual(&mut enc, levels, 3, 0, 0, false);
             costs.push(enc.bit_count());
         }
         assert!(costs[0] < costs[1], "{costs:?}");
@@ -517,7 +591,7 @@ mod tests {
                         };
                     }
                     let mut enc = CabacEncoder::counter(Contexts::new(27));
-                    encode_residual(&mut enc, &levels, log2, c_idx, scan_idx);
+                    encode_residual(&mut enc, &levels, log2, c_idx, scan_idx, false);
                     assert!(enc.bit_count() > 0);
                 }
             }
