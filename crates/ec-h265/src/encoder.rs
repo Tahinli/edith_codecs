@@ -175,6 +175,19 @@ pub struct EncoderConfig {
     /// worth +0.010 dB BD-PSNR on film and +0.080 dB on screen capture, which
     /// is where our gap against x265 is (see `lanes/h265-rqt-r1.report.md`).
     pub rqt: bool,
+    /// Whether a 64x64 coding tree block may stay one coding unit instead of
+    /// always splitting to 32x32. Only reachable with `ctb_size` 64.
+    ///
+    /// A 64x64 intra coding unit still predicts and transforms in four 32x32
+    /// blocks -- 32x32 is HEVC's largest transform -- so what it buys is three
+    /// split flags and three mode signallings, and what it costs is one luma
+    /// direction for the whole 64x64. Measured in `lanes/h265-cu64-r1.report.md`.
+    ///
+    /// On by default: against x265 over the four-point ladder it is worth
+    /// +0.007 dB BD-PSNR on film and +0.098 dB on screen capture over always
+    /// splitting a 64x64 tree block, and the default `ctb_size` of 32 leaves
+    /// it unreachable anyway.
+    pub cu64: bool,
     /// What the samples mean, written into the VUI.
     pub video_signal_type: Option<VideoSignalType>,
     /// Sample aspect ratio.
@@ -208,6 +221,7 @@ impl EncoderConfig {
             rdoq: true,
             transform_skip: TransformSkip::Off,
             rqt: true,
+            cu64: true,
             video_signal_type: None,
             sample_aspect_ratio: None,
             timing: None,
@@ -589,6 +603,7 @@ impl Encoder {
                             self.cfg.rdoq,
                             self.cfg.transform_skip != TransformSkip::Off,
                             self.cfg.rqt,
+                            self.cfg.cu64,
                             self.cfg.min_cu_size.max(8).trailing_zeros(),
                         );
                         for col in 0..cols {
