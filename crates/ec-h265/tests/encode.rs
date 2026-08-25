@@ -16,7 +16,7 @@ type Planes = (Vec<u8>, Vec<u8>, Vec<u8>);
 /// measured value with 0.15 dB of room for platform noise, so the advantage can
 /// shrink but not grow unnoticed; it is not a claim that the number is fine.
 ///
-/// Measured +2.456 dB luma / +3.158 dB YUV on the recalibrated run (352x288,
+/// Measured +2.507 dB luma / +3.238 dB YUV at `rdo_candidates: 5` (352x288,
 /// 24 pictures of `Clip::render_smooth`, x265 at QP 22/26/30/34, our ladder
 /// auto-shifted from a QP-26 probe to 16/20/24/28, both sides decoded through
 /// ffmpeg, union-range BD-PSNR, 0% extrapolation both sides). This is a
@@ -24,8 +24,10 @@ type Planes = (Vec<u8>, Vec<u8>, Vec<u8>);
 /// encoder is no leaner than x265 at matched QP (the probe measures a shift of
 /// 0) and the aligned BD is negative. Real-clip numbers, 24 pictures after
 /// 1500, ladders auto-aligned to 22/26/30/34, 0% extrapolation both sides:
-///   • 3840x1608 film: -0.731 dB luma / -0.730 dB YUV
-///   • 1138x640 web clip: -0.603 dB luma / -0.632 dB YUV
+///   • 3840x1608 film: -0.685 dB luma / -0.703 dB YUV
+///   • 1138x640 web clip: -0.507 dB luma / -0.556 dB YUV
+///   • 2560x1440 screen capture: -2.465 dB luma / -2.360 dB YUV
+///   • 1080p phone clip: -0.366 dB luma / -0.387 dB YUV
 /// Those two are the real gap to close; the synthetic number only guards
 /// against regression on a clip whose content is pinned.
 ///
@@ -36,7 +38,7 @@ type Planes = (Vec<u8>, Vec<u8>, Vec<u8>);
 /// all-intra rate-quality slope is genuine content behaviour (x264 forced
 /// all-intra shows the same shape); the fix is to auto-align the ladders from
 /// a probe encode, not to change x265's rate control.
-const BD_PSNR_VS_X265_FLOOR: f64 = 2.306;
+const BD_PSNR_VS_X265_FLOOR: f64 = 2.357;
 
 /// A synthetic source with real structure: smooth gradients, a band of
 /// sinusoidal texture and a translating box, so prediction matters — the half
@@ -425,6 +427,11 @@ fn bd_psnr_vs_x265() {
         cfg.rate_control = RateControl::ConstantQp(qp);
         cfg.keep_recon = true;
         cfg.threads = 0;
+        // Ablation knob: how many SATD survivors reach the full rate-distortion
+        // trial in the luma mode search. The shipped default is 5.
+        if let Ok(k) = std::env::var("EC_H265_RDO_CANDIDATES") {
+            cfg.rdo_candidates = k.parse().expect("EC_H265_RDO_CANDIDATES must be a number");
+        }
         let enc = Encoder::new(cfg).expect("encoder");
         let (mut stream, mut sum_recon) = (Vec::new(), 0.0);
         for (y, u, v) in &sources {
