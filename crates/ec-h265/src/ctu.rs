@@ -24,7 +24,7 @@
 
 use crate::cabac::{CabacEncoder, CabacState, ctx};
 use crate::intra::{self, Availability, Refs};
-use crate::residual::encode_residual;
+use crate::residual::{self, encode_residual};
 use crate::transform::{
     chroma_qp, dequantize, forward_transform, inverse_transform, quantize, uses_dst,
 };
@@ -150,6 +150,7 @@ pub struct CtuEncoder<'a> {
     chroma_rd_weight: f64,
     /// Whether an 8x8 coding unit may split into four 4x4 intra partitions.
     intra_nxn: bool,
+    sign_hiding: bool,
     /// `log2` of the smallest coding unit the search will produce.
     min_cb_log2: u32,
     /// Intra mode per 4x4 block of the band; 255 = not coded yet.
@@ -181,6 +182,7 @@ impl<'a> CtuEncoder<'a> {
         chroma_rd: bool,
         chroma_rd_weight: f64,
         intra_nxn: bool,
+        sign_hiding: bool,
         min_cb_log2: u32,
     ) -> CtuEncoder<'a> {
         let band_rows = (height - band_y0).min(ctb_size);
@@ -201,6 +203,7 @@ impl<'a> CtuEncoder<'a> {
             chroma_rd,
             chroma_rd_weight,
             intra_nxn,
+            sign_hiding,
             min_cb_log2: min_cb_log2.clamp(MIN_CB_LOG2, 5),
             modes: vec![255; (width / 4) * (ctb_size / 4)],
             depths: vec![0; (width / 4) * (ctb_size / 4)],
@@ -572,18 +575,18 @@ impl<'a> CtuEncoder<'a> {
             enc.encode_bin(ctx::CBF_LUMA, u32::from(cbfs[part]));
             if cbfs[part] {
                 let scan = intra::scan_index(modes[part], 2, true);
-                encode_residual(enc, &levels[part], 2, 0, scan);
+                encode_residual(enc, &levels[part], 2, 0, scan, self.sign_hiding);
             }
             if part == 3 {
                 let chroma_scan = intra::scan_index(chroma_mode, 2, false);
                 if cb_cbf {
                     let l = std::mem::take(&mut self.scratch.cb_levels);
-                    encode_residual(enc, &l[..16], 2, 1, chroma_scan);
+                    encode_residual(enc, &l[..16], 2, 1, chroma_scan, self.sign_hiding);
                     self.scratch.cb_levels = l;
                 }
                 if cr_cbf {
                     let l = std::mem::take(&mut self.scratch.cr_levels);
-                    encode_residual(enc, &l[..16], 2, 2, chroma_scan);
+                    encode_residual(enc, &l[..16], 2, 2, chroma_scan, self.sign_hiding);
                     self.scratch.cr_levels = l;
                 }
             }
@@ -629,18 +632,32 @@ impl<'a> CtuEncoder<'a> {
         if luma_cbf {
             let scan = intra::scan_index(mode, log2, true);
             let levels = std::mem::take(&mut self.scratch.luma_levels);
-            encode_residual(enc, &levels[..n * n], log2, 0, scan);
+            encode_residual(enc, &levels[..n * n], log2, 0, scan, self.sign_hiding);
             self.scratch.luma_levels = levels;
         }
         let chroma_scan = intra::scan_index(chroma_mode, log2 - 1, false);
         if cb_cbf {
             let levels = std::mem::take(&mut self.scratch.cb_levels);
-            encode_residual(enc, &levels[..n * n / 4], log2 - 1, 1, chroma_scan);
+            encode_residual(
+                enc,
+                &levels[..n * n / 4],
+                log2 - 1,
+                1,
+                chroma_scan,
+                self.sign_hiding,
+            );
             self.scratch.cb_levels = levels;
         }
         if cr_cbf {
             let levels = std::mem::take(&mut self.scratch.cr_levels);
-            encode_residual(enc, &levels[..n * n / 4], log2 - 1, 2, chroma_scan);
+            encode_residual(
+                enc,
+                &levels[..n * n / 4],
+                log2 - 1,
+                2,
+                chroma_scan,
+                self.sign_hiding,
+            );
             self.scratch.cr_levels = levels;
         }
 
@@ -825,7 +842,7 @@ impl<'a> CtuEncoder<'a> {
             if cbf {
                 let scan = intra::scan_index(mode, log2, true);
                 let levels = std::mem::take(&mut self.scratch.levels);
-                encode_residual(enc, &levels[..n * n], log2, 0, scan);
+                encode_residual(enc, &levels[..n * n], log2, 0, scan, self.sign_hiding);
                 self.scratch.levels = levels;
             }
             let bits = enc.bit_count() - bits_before;
@@ -866,7 +883,16 @@ impl<'a> CtuEncoder<'a> {
         }
         let dst = uses_dst(n, true);
         forward_transform(&self.scratch.residual, &mut self.scratch.coeffs, n, dst);
-        let nonzero = quantize(&self.scratch.coeffs, &mut self.scratch.levels, n, self.qp);
+        let mut nonzero = quantize(&self.scratch.coeffs, &mut self.scratch.levels, n, self.qp);
+        if self.sign_hiding && nonzero > 0 {
+            nonzero = residual::hide_signs(
+                &self.scratch.coeffs,
+                &mut self.scratch.levels,
+                n,
+                self.qp,
+                intra::scan_index(mode, n.trailing_zeros(), true),
+            );
+        }
         let cbf = nonzero > 0;
         if cbf {
             dequantize(&self.scratch.levels, &mut self.scratch.scaled, n, self.qp);
@@ -916,12 +942,21 @@ impl<'a> CtuEncoder<'a> {
             }
         }
         forward_transform(&self.scratch.residual, &mut self.scratch.coeffs, cn, false);
-        let nonzero = quantize(
+        let mut nonzero = quantize(
             &self.scratch.coeffs,
             &mut self.scratch.levels,
             cn,
             self.qp_c,
         );
+        if self.sign_hiding && nonzero > 0 {
+            nonzero = residual::hide_signs(
+                &self.scratch.coeffs,
+                &mut self.scratch.levels,
+                cn,
+                self.qp_c,
+                intra::scan_index(pred_mode, cn.trailing_zeros(), false),
+            );
+        }
         let cbf = nonzero > 0;
         if cbf {
             dequantize(
@@ -1010,12 +1045,26 @@ impl<'a> CtuEncoder<'a> {
             let scan = intra::scan_index(mode, log2 - 1, false);
             if cb_cbf {
                 let levels = std::mem::take(&mut self.scratch.cb_levels);
-                encode_residual(enc, &levels[..n * n / 4], log2 - 1, 1, scan);
+                encode_residual(
+                    enc,
+                    &levels[..n * n / 4],
+                    log2 - 1,
+                    1,
+                    scan,
+                    self.sign_hiding,
+                );
                 self.scratch.cb_levels = levels;
             }
             if cr_cbf {
                 let levels = std::mem::take(&mut self.scratch.cr_levels);
-                encode_residual(enc, &levels[..n * n / 4], log2 - 1, 2, scan);
+                encode_residual(
+                    enc,
+                    &levels[..n * n / 4],
+                    log2 - 1,
+                    2,
+                    scan,
+                    self.sign_hiding,
+                );
                 self.scratch.cr_levels = levels;
             }
             let bits = enc.bit_count() - bits_before;

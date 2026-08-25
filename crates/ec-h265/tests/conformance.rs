@@ -203,6 +203,58 @@ fn intra_nxn_decodes_bit_exactly() {
     }
 }
 
+/// Sign data hiding drops one bypass bin per qualifying sub-block and pays for
+/// it by nudging a level, so the encoder and the decoder only agree if the
+/// parity the encoder wrote is the parity the decoder reads. The stream has to
+/// differ from the hiding-off one, and ffmpeg's decode has to match the
+/// encoder's reconstruction sample for sample.
+///
+/// Size is deliberately not asserted here: hiding is not optional per
+/// sub-block, so a single small picture can come out a few bytes longer when
+/// the nudges cost more than the signs saved. Whether it pays is what the
+/// `EC_H265_SDH` arm of the clip gate measures.
+#[test]
+fn sign_hiding_decodes_bit_exactly() {
+    if !have_ffmpeg() {
+        eprintln!("skipping: ffmpeg not installed");
+        return;
+    }
+    for &(w, h) in &[(64u32, 64u32), (130, 66), (352, 288)] {
+        let (source, coded) = encode_sdh(w, h, 22, true);
+        let (_, plain) = encode_sdh(w, h, 22, false);
+        let name = format!("sign-hiding-{w}x{h}");
+        assert_ne!(
+            coded.au, plain.au,
+            "{name}: no sub-block ever qualified, so this decode proves nothing"
+        );
+        let path = write_au(&name, &coded);
+        let decoded = match ffmpeg_decode(&path) {
+            Ok(bytes) => bytes,
+            Err(e) => panic!("{name}: ffmpeg failed: {e}"),
+        };
+        let recon = planes_of(coded.recon.as_ref().expect("recon kept"));
+        assert_eq!(decoded.len(), recon.len(), "{name}: size mismatch");
+        let mismatches = decoded.iter().zip(&recon).filter(|(a, b)| a != b).count();
+        assert_eq!(mismatches, 0, "{name}: {mismatches} samples differ");
+        let quality = psnr(&planes_of(&source), &recon);
+        assert!(quality > 30.0, "{name}: PSNR {quality:.2} dB at QP 22");
+    }
+}
+
+/// The natural frame coded with sign data hiding on or off, everything else
+/// left at its default.
+fn encode_sdh(width: u32, height: u32, qp: i32, sign_hiding: bool) -> (VideoFrame, EncodedPicture) {
+    let mut cfg = EncoderConfig::new(width, height);
+    cfg.sign_hiding = sign_hiding;
+    cfg.rate_control = RateControl::ConstantQp(qp);
+    cfg.keep_recon = true;
+    cfg.picture_hash = true;
+    let encoder = Encoder::new(cfg).expect("encoder");
+    let frame = natural_frame(width, height, 0);
+    let coded = encoder.encode_idr(&frame).expect("encode");
+    (frame, coded)
+}
+
 #[test]
 fn ffmpeg_decodes_bit_exactly_at_every_shape() {
     if !have_ffmpeg() {
