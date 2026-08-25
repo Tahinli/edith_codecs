@@ -233,3 +233,43 @@ pub const DC_SIGN_LUMA: [[u16; 3]; 3] = [[16000, 32768, 0], [13056, 32768, 0], [
 /// coefficient whose neighbours are all zero, in a transform of 32x32 or
 /// larger (the table is shared from 32x32 up).
 pub const COEFF_BR_LUMA: [u16; 5] = [9040, 14786, 18360, 32768, 0];
+
+/// `Default_Partition_W32_Cdf` (spec 9.4): the ten partition types of a
+/// 32x32 block, indexed by the context the blocks above and left give.
+pub const PARTITION_W32: [[u16; 11]; 4] = [
+    [
+        18462, 20920, 23124, 27647, 28227, 29049, 29519, 30178, 31544, 32768, 0,
+    ],
+    [
+        7689, 9060, 12056, 24992, 25660, 26182, 26951, 28041, 29052, 32768, 0,
+    ],
+    [
+        6015, 9009, 10062, 24544, 25409, 26545, 27071, 27526, 32047, 32768, 0,
+    ],
+    [
+        1394, 2208, 2796, 28614, 29061, 29466, 29840, 30185, 31899, 32768, 0,
+    ],
+];
+
+/// `Default_Uv_Mode_Cfl_Allowed_Cdf[0]` (spec 9.4): the fourteen chroma intra
+/// modes — the thirteen the CFL-free table has, plus chroma from luma — for a
+/// DC-predicted luma block. A block of 32x32 or smaller is offered CFL, so it
+/// reads this table where a 64x64 block reads [`UV_MODE_NO_CFL`].
+pub const UV_MODE_CFL_DC: [u16; 15] = [
+    10407, 11208, 12900, 13181, 13823, 14175, 14899, 15656, 15986, 20086, 20995, 22455, 24212,
+    32768, 0,
+];
+
+/// `Default_Txb_Skip_Cdf[2][3][0]` (spec 9.4): the all-zero flag of a 32x32
+/// luma transform block that covers its whole plane block, which is context 0.
+pub const TXB_SKIP_LUMA_32: [u16; 3] = [30669, 32768, 0];
+
+/// `Default_Txb_Skip_Cdf[2][2][7]` (spec 9.4): the all-zero flag of a 16x16
+/// chroma transform block that covers its whole plane block with no coded
+/// neighbour, which is context 7.
+pub const TXB_SKIP_CHROMA_16: [u16; 3] = [3648, 32768, 0];
+
+/// `Default_Coeff_Base_Eob_Cdf[2][3][0][0]` (spec 9.4): the level of the last
+/// coefficient of a 32x32 luma transform block, less one, when that
+/// coefficient is the DC.
+pub const COEFF_BASE_EOB_LUMA_32: [u16; 4] = [2809, 19301, 32768, 0];
