@@ -132,6 +132,18 @@ pub struct EncoderConfig {
     /// capture (-2.619 dB against x265 without it, -0.479 dB with) and
     /// +0.007 dB on 1080p film, so it never loses.
     pub intra_nxn: bool,
+
+    /// Whether a sub-block's first sign is hidden in the parity of its
+    /// absolute levels (`sign_data_hiding_enabled_flag`). Buys one bypass bin
+    /// per qualifying sub-block for a level nudged by one.
+    ///
+    /// Off: measured at -0.033 dB BD-PSNR on a 2560x1440 screen capture and
+    /// -0.043 dB on 1080p film. Hiding is not optional per sub-block, so every
+    /// qualifying one pays for the bin whether the nudge is cheap or not, and
+    /// with levels that come straight from the quantiser's rounding the nudges
+    /// cost more than the signs save. Worth re-measuring once RDOQ lands: that
+    /// is where the gain in other encoders comes from.
+    pub sign_hiding: bool,
     /// What the samples mean, written into the VUI.
     pub video_signal_type: Option<VideoSignalType>,
     /// Sample aspect ratio.
@@ -161,6 +173,7 @@ impl EncoderConfig {
             chroma_rd_weight: 1.0,
             min_cu_size: 8,
             intra_nxn: true,
+            sign_hiding: false,
             video_signal_type: None,
             sample_aspect_ratio: None,
             timing: None,
@@ -289,6 +302,7 @@ impl Encoder {
             // changing what either side predicts from. Turning them off buys
             // that identity (and the picture-hash check that rides on it)
             // rather than a fraction of a dB.
+            sign_data_hiding_enabled: cfg.sign_hiding,
             deblocking_filter_control_present: true,
             deblocking_filter_disabled: true,
             loop_filter_across_slices_enabled: false,
@@ -536,6 +550,7 @@ impl Encoder {
                             self.cfg.chroma_mode_search,
                             self.cfg.chroma_rd_weight,
                             self.cfg.intra_nxn,
+                            self.cfg.sign_hiding,
                             self.cfg.min_cu_size.max(8).trailing_zeros(),
                         );
                         for col in 0..cols {
