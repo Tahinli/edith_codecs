@@ -9,6 +9,8 @@
 //! It is the skeleton the block modes, transform sizes and coefficients hang
 //! off as they arrive.
 
+use std::sync::LazyLock;
+
 use ec_core::{Error, Result};
 
 use crate::cdf;
@@ -855,6 +857,29 @@ fn default_scan(side: usize) -> Vec<u16> {
         }
     }
     scan
+}
+
+/// What one 32x32 luma transform block's levels cost, in bits, priced through
+/// the very CDFs [`write_coeffs`] will write them with -- end-of-block
+/// position, base levels, base range, signs and the Golomb tail all included.
+///
+/// The mode search calls this before the block's neighbours exist, so the two
+/// neighbour-derived contexts (the block-skip context and the DC sign context)
+/// are taken as zero. Every other context inside the block is exact, because
+/// those are read from the block's own levels.
+///
+/// The encoder codes 32x32 luma only -- every superblock it emits is split --
+/// so one table is all the search needs; a second block size would need its
+/// own entry point rather than a size argument, because the table and the scan
+/// have to agree.
+pub(crate) fn luma_32_coeff_bits(grid: &[i32]) -> f64 {
+    /// Built once: the search prices thirteen modes for every block, and the
+    /// scan is the same table every time.
+    static SCAN: LazyLock<Vec<u16>> = LazyLock::new(|| default_scan(TX32));
+    let mut enc = SymbolEncoder::new();
+    enc.reset_bits();
+    write_coeffs(&mut enc, &LUMA_32, grid, &SCAN, 0, 0);
+    enc.bits()
 }
 
 /// coeffs() for one plane's transform block of any coefficients the base and
@@ -1781,6 +1806,73 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The price the mode search pays for a block's levels has to be the price
+    /// the writer charges for them, or the search is ranking modes by a
+    /// fiction. Both halves are asked for the same grids under the same
+    /// neutral contexts, and the priced bits are compared against the bytes
+    /// the writer really spends.
+    #[test]
+    fn the_priced_coefficient_bits_match_the_bytes_written() {
+        let scan = default_scan(TX32);
+        // Three grids that reach different parts of the syntax: a lone DC, a
+        // sparse spread of small levels with both signs, and levels past the
+        // base-range alphabet so the Golomb tail runs.
+        let mut grids = vec![vec![0i32; TX32 * TX32]; 3];
+        grids[0][0] = -7;
+        for (i, &pos) in scan.iter().enumerate().take(400) {
+            if i % 7 == 0 {
+                grids[1][pos as usize] = if i % 2 == 0 { 2 } else { -1 };
+            }
+        }
+        grids[2][0] = 40;
+        for (i, &pos) in scan.iter().enumerate().take(64) {
+            grids[2][pos as usize] += i as i32 % 23 - 11;
+        }
+
+        // A single block is too short for the coder's own flush to average
+        // out, so all three go through one encoder and one flush.
+        let mut enc = SymbolEncoder::new();
+        let mut priced = 0.0;
+        for grid in &grids {
+            write_coeffs(&mut enc, &LUMA_32, grid, &scan, 0, 0);
+            priced += luma_32_coeff_bits(grid);
+        }
+        let spent = enc.finish().len() as f64 * 8.0;
+        assert!(
+            (priced - spent).abs() / spent < 0.02,
+            "priced {priced} bits, wrote {spent}"
+        );
+    }
+
+    /// A rate term the search can read as constant is a rate term that ranks
+    /// nothing, so the price is checked to move the way the levels move: an
+    /// empty block is the cheapest thing there is, one coefficient costs more
+    /// than none, and both spreading the coefficients and growing them costs
+    /// more again.
+    #[test]
+    fn the_price_grows_with_the_levels() {
+        let grid = |f: &dyn Fn(&mut Vec<i32>)| {
+            let mut g = vec![0i32; TX32 * TX32];
+            f(&mut g);
+            luma_32_coeff_bits(&g)
+        };
+        let empty = grid(&|_| {});
+        let one = grid(&|g| g[0] = 1);
+        let bigger = grid(&|g| g[0] = 30);
+        let spread = grid(&|g| {
+            for i in 0..TX32 {
+                g[i * TX32 + i] = 1;
+            }
+        });
+        assert!(empty < one, "{empty} {one}");
+        assert!(one < bigger, "{one} {bigger}");
+        assert!(one < spread, "{one} {spread}");
+        // An empty block is one symbol -- an expensive one, because a block
+        // with no coefficients at all is the rarer of the two under the
+        // neutral context -- and nothing else.
+        assert!(empty < 6.0, "an empty block is one skip symbol, not {empty}");
     }
 
     /// Neighbouring blocks that each carry coefficients read their DC sign

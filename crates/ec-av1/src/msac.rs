@@ -46,6 +46,11 @@ pub struct SymbolEncoder {
     /// Flushed bytes before carry propagation: each entry can exceed `0xff` by
     /// the carry it owes the byte before it, which [`Self::finish`] adds in.
     precarry: Vec<u16>,
+    /// What every symbol written so far cost against the CDF it was written
+    /// with, in bits. The arithmetic coder spends `-log2(p)` on a symbol of
+    /// probability `p` to within the rounding of its interval, so this is what
+    /// a search may price a decision with without coding it twice.
+    bits: f64,
 }
 
 impl Default for SymbolEncoder {
@@ -63,7 +68,19 @@ impl SymbolEncoder {
             rng: 0x8000,
             cnt: -9,
             precarry: Vec::new(),
+            bits: 0.0,
         }
+    }
+
+    /// What the symbols written so far cost, in bits.
+    pub fn bits(&self) -> f64 {
+        self.bits
+    }
+
+    /// Forgets the cost accumulated so far, so that the next stretch of
+    /// symbols can be priced on its own.
+    pub fn reset_bits(&mut self) {
+        self.bits = 0.0;
     }
 
     /// Writes `symbol` against `cdf` and adapts `cdf` exactly as the decoder
@@ -107,6 +124,12 @@ impl SymbolEncoder {
             // Symbol 0 owns the top of the interval, so only its width moves.
             r - v
         };
+        // What this symbol really cost is how far it narrowed the interval,
+        // which is not quite its nominal probability: the coder works the
+        // range through an eight-bit multiply and hands every symbol above
+        // this one a floor of `EC_MIN_PROB`. Pricing the narrowing rather than
+        // the table entry is what makes the account match the bytes.
+        self.bits -= (f64::from(rng) / f64::from(r)).log2();
         self.normalize(low, rng);
     }
 
@@ -429,6 +452,32 @@ pub(crate) mod tests {
             };
             assert_eq!(got, want, "item {i} of kind {kind}");
         }
+    }
+
+    /// The bit account is what a search prices decisions with, so it has to
+    /// agree with what the coder actually spends: over a long enough string the
+    /// two are within the coder's own rounding, a fraction of a percent.
+    #[test]
+    fn the_bit_account_matches_the_bytes_written() {
+        let mut enc = SymbolEncoder::new();
+        let mut state: u32 = 0x1234_5678;
+        let mut next = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            state
+        };
+        // A skewed CDF, so that the account has something to be wrong about:
+        // an equiprobable string costs one bit a symbol however it is priced.
+        let skewed: [u16; 3] = [29000, 1 << 15, 0];
+        for _ in 0..20_000 {
+            let symbol = usize::from(next() % 100 < 12);
+            enc.symbol_fixed(symbol, &skewed);
+        }
+        let priced = enc.bits();
+        let spent = (enc.finish().len() * 8) as f64;
+        assert!(
+            (priced - spent).abs() / spent < 0.01,
+            "priced {priced:.0} bits, spent {spent:.0}"
+        );
     }
 
     #[test]
