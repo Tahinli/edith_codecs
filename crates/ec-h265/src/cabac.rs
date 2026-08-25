@@ -26,8 +26,10 @@ pub mod ctx {
     pub const CBF_LUMA: usize = SPLIT_TRANSFORM + 3;
     /// `cbf_cb` / `cbf_cr`, 4 contexts.
     pub const CBF_CHROMA: usize = CBF_LUMA + 2;
+    /// `transform_skip_flag`, 2 contexts (luma, chroma).
+    pub const TRANSFORM_SKIP: usize = CBF_CHROMA + 4;
     /// `last_sig_coeff_x_prefix`, 18 contexts.
-    pub const LAST_X: usize = CBF_CHROMA + 4;
+    pub const LAST_X: usize = TRANSFORM_SKIP + 2;
     /// `last_sig_coeff_y_prefix`, 18 contexts.
     pub const LAST_Y: usize = LAST_X + 18;
     /// `coded_sub_block_flag`, 4 contexts.
@@ -59,6 +61,8 @@ const INIT_VALUES: [u8; ctx::TOTAL] = [
     111, 141,
     // cbf_cb / cbf_cr (Table 9-22)
     94, 138, 182, 154,
+    // transform_skip_flag (Table 9-25)
+    139, 139,
     // last_sig_coeff_x_prefix (Table 9-26)
     110, 110, 124, 125, 140, 153, 125, 127, 140, 109, 111, 143, 127, 111, 79, 108, 123, 63,
     // last_sig_coeff_y_prefix (Table 9-27)

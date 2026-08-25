@@ -7,7 +7,7 @@
 //! the comparison is at matched features, not at matched marketing.
 
 use ec_core::frame::VideoFrame;
-use ec_h265::encoder::{Encoder, EncoderConfig, RateControl};
+use ec_h265::encoder::{Encoder, EncoderConfig, RateControl, TransformSkip};
 
 /// One decoded picture: Y, Cb and Cr planes, cropped and tightly packed.
 type Planes = (Vec<u8>, Vec<u8>, Vec<u8>);
@@ -441,6 +441,13 @@ fn bd_psnr_vs_x265() {
         if let Ok(v) = std::env::var("EC_H265_RDOQ") {
             cfg.rdoq = v != "0";
         }
+        if let Ok(v) = std::env::var("EC_H265_TSKIP") {
+            cfg.transform_skip = if v != "0" {
+                TransformSkip::AlwaysFor4x4
+            } else {
+                TransformSkip::Off
+            };
+        }
         if let Ok(v) = std::env::var("EC_H265_NXN") {
             cfg.intra_nxn = v != "0";
         }
@@ -755,11 +762,17 @@ fn clip_sources(path: &std::ffi::OsStr, want: usize) -> (usize, usize, Vec<Plane
         String::from_utf8_lossy(&dims.stderr)
     );
     let csv = String::from_utf8_lossy(&dims.stdout);
-    let (w, h) = csv
-        .trim()
-        .split_once(',')
-        .and_then(|(w, h)| Some((w.parse::<usize>().ok()?, h.parse::<usize>().ok()?)))
-        .expect("ffprobe returned dimensions");
+    // ffprobe prints one comma-separated line per stream, and recent builds
+    // end it with a trailing separator, so the fields are taken by position
+    // rather than by splitting the line in two.
+    let mut fields = csv.lines().next().unwrap_or_default().split(',');
+    let (w, h) = (|| {
+        Some((
+            fields.next()?.trim().parse::<usize>().ok()?,
+            fields.next()?.trim().parse::<usize>().ok()?,
+        ))
+    })()
+    .unwrap_or_else(|| panic!("ffprobe returned dimensions, got {csv:?}"));
     // Pictures to pass over before sampling: the head of a film is titles and
     // fades, which are not what a codec is measured on.
     let skip: usize = std::env::var("EC_H265_CLIP_SKIP")
