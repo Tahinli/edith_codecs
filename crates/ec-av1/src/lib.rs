@@ -16,6 +16,7 @@ pub mod bits;
 pub mod cdf;
 pub mod encode;
 pub mod frame;
+pub mod intra;
 pub mod msac;
 pub mod obu;
 pub mod quant;
