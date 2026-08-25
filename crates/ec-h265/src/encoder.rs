@@ -94,6 +94,33 @@ pub struct EncoderConfig {
     /// knee is where the default sits. `EC_H265_RDO_CANDIDATES` in the gate
     /// test re-runs the sweep.
     pub rdo_candidates: usize,
+    /// Whether the chroma prediction mode is chosen by rate-distortion over the
+    /// five modes the syntax allows, instead of always taking the derived mode.
+    ///
+    /// Off by default: measured against x265 on four real clips it is a wash,
+    /// and on screen capture it is a loss (BD-PSNR luma / all-plane, derived
+    /// mode -> search, `chroma_rd_weight: 1.0`):
+    ///
+    /// | clip | derived | search |
+    /// |------|---------|--------|
+    /// | 4K film | -0.685 / -0.703 | -0.757 / **-0.606** |
+    /// | 1138x640 web | -0.507 / -0.556 | -0.584 / **-0.505** |
+    /// | 1440p screen capture | **-2.465 / -2.360** | -2.617 / -2.460 |
+    /// | 1080p phone | -0.366 / **-0.387** | -0.477 / -0.384 |
+    ///
+    /// Luma falls on every clip because the extra chroma bits come out of the
+    /// same budget at a fixed QP; all-plane gains 0.10 dB and 0.05 dB on the two
+    /// camera clips, is flat on the third and loses 0.10 dB on the screen
+    /// capture, for 10-15% more encode time. The average is +0.01 dB all-plane,
+    /// which is not a default. [`EncoderConfig::chroma_rd_weight`] was swept at
+    /// 0.25/0.5/1.0/2.0 and did not change the shape of that table: the screen
+    /// capture loses at every weight, so the cause is not the lambda.
+    pub chroma_mode_search: bool,
+    /// Weight on chroma SSD in that decision, against the luma lambda. Swept
+    /// at 0.25/0.5/1.0/2.0 on three clips; 1.0 is the best of them everywhere
+    /// the search wins at all (4K film all-plane: -0.606 at 1.0 against -0.649
+    /// at 0.25, -0.619 at 0.5, -0.657 at 2.0).
+    pub chroma_rd_weight: f64,
     /// Smallest coding unit the search will produce, 8 or 16. Sixteen is a
     /// *coarser* search that is not always faster: on real pictures the 8x8
     /// blocks pay for their search in residual bits (measured: -27% bits and
@@ -125,6 +152,8 @@ impl EncoderConfig {
             threads: 0,
             ctb_size: 32,
             rdo_candidates: 5,
+            chroma_mode_search: false,
+            chroma_rd_weight: 1.0,
             min_cu_size: 8,
             video_signal_type: None,
             sample_aspect_ratio: None,
@@ -498,6 +527,8 @@ impl Encoder {
                             slice_qp,
                             true,
                             self.cfg.rdo_candidates,
+                            self.cfg.chroma_mode_search,
+                            self.cfg.chroma_rd_weight,
                             self.cfg.min_cu_size.max(8).trailing_zeros(),
                         );
                         for col in 0..cols {

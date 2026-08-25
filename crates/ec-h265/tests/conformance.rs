@@ -90,7 +90,18 @@ fn psnr(a: &[u8], b: &[u8]) -> f64 {
 
 /// Encode one picture; `ctb` of `None` takes the configured default.
 fn encode(width: u32, height: u32, qp: i32, ctb: Option<usize>) -> (VideoFrame, EncodedPicture) {
+    encode_with(width, height, qp, ctb, false)
+}
+
+fn encode_with(
+    width: u32,
+    height: u32,
+    qp: i32,
+    ctb: Option<usize>,
+    chroma_mode_search: bool,
+) -> (VideoFrame, EncodedPicture) {
     let mut cfg = EncoderConfig::new(width, height);
+    cfg.chroma_mode_search = chroma_mode_search;
     cfg.rate_control = RateControl::ConstantQp(qp);
     if let Some(ctb) = ctb {
         cfg.ctb_size = ctb;
@@ -101,6 +112,39 @@ fn encode(width: u32, height: u32, qp: i32, ctb: Option<usize>) -> (VideoFrame, 
     let frame = test_frame(width, height, 0);
     let coded = encoder.encode_idr(&frame).expect("encode");
     (frame, coded)
+}
+
+/// The chroma mode search is off by default (it loses on screen content, see
+/// `EncoderConfig::chroma_mode_search`), so the shapes above never code an
+/// `intra_chroma_pred_mode` other than the derived one. This exercises the four
+/// explicit modes: the stream has to differ from the derived-only one — proving
+/// the search actually fired — and still decode bit-exactly.
+#[test]
+fn chroma_mode_search_decodes_bit_exactly() {
+    if !have_ffmpeg() {
+        eprintln!("skipping: ffmpeg not installed");
+        return;
+    }
+    for &(w, h) in &[(64u32, 64u32), (130, 66), (352, 288)] {
+        let (source, coded) = encode_with(w, h, 27, None, true);
+        let (_, derived) = encode_with(w, h, 27, None, false);
+        let name = format!("chroma-rd-{w}x{h}");
+        assert_ne!(
+            coded.au, derived.au,
+            "{name}: the search never picked a mode other than the derived one, so this decode proves nothing"
+        );
+        let path = write_au(&name, &coded);
+        let decoded = match ffmpeg_decode(&path) {
+            Ok(bytes) => bytes,
+            Err(e) => panic!("{name}: ffmpeg failed: {e}"),
+        };
+        let recon = planes_of(coded.recon.as_ref().expect("recon kept"));
+        assert_eq!(decoded.len(), recon.len(), "{name}: size mismatch");
+        let mismatches = decoded.iter().zip(&recon).filter(|(a, b)| a != b).count();
+        assert_eq!(mismatches, 0, "{name}: {mismatches} samples differ");
+        let quality = psnr(&planes_of(&source), &recon);
+        assert!(quality > 30.0, "{name}: PSNR {quality:.2} dB at QP 27");
+    }
 }
 
 #[test]
