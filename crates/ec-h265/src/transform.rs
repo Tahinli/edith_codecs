@@ -277,10 +277,27 @@ pub fn inverse_transform(scaled: &[i32], residual: &mut [i32], n: usize, dst_typ
 /// encoder in this class uses: it costs a little distortion at the rounding
 /// boundary and buys back more in rate.
 pub fn quantize(coeffs: &[i32], levels: &mut [i32], n: usize, qp: i32) -> usize {
+    quantize_offset(coeffs, levels, n, qp, 3)
+}
+
+/// [`quantize`] with the rounding written out: `dead_zone` is the divisor of
+/// the quantiser step the rounding offset is, so 3 is the intra default and 2
+/// is round-to-nearest.
+///
+/// A rate-distortion search over the levels wants the wider rounding: a search
+/// that only ever takes levels down measures the rounding it started from, not
+/// its own decisions.
+pub fn quantize_offset(
+    coeffs: &[i32],
+    levels: &mut [i32],
+    n: usize,
+    qp: i32,
+    dead_zone: i64,
+) -> usize {
     let log2n = n.trailing_zeros() as i32;
     let qbits = 21 + qp / 6 - log2n;
     let scale = QUANT_SCALE[(qp % 6) as usize] as i64;
-    let offset = (1i64 << qbits) / 3;
+    let offset = (1i64 << qbits) / dead_zone;
     let mut nonzero = 0;
     for (i, &c) in coeffs[..n * n].iter().enumerate() {
         let magnitude = ((c.unsigned_abs() as i64 * scale + offset) >> qbits) as i32;
@@ -305,15 +322,35 @@ pub fn ideal_level(coeff: i32, n: usize, qp: i32) -> f64 {
 
 /// Scale levels back into coefficients, exactly as clause 8.6.3 specifies.
 pub fn dequantize(levels: &[i32], scaled: &mut [i32], n: usize, qp: i32) {
+    for (i, &level) in levels[..n * n].iter().enumerate() {
+        scaled[i] = dequant_level(level, n, qp);
+    }
+}
+
+/// One level scaled back to a coefficient, the per-coefficient half of
+/// [`dequantize`]. A rate-distortion search over the levels prices one
+/// coefficient at a time and has no use for the whole block.
+pub fn dequant_level(level: i32, n: usize, qp: i32) -> i32 {
     let log2n = n.trailing_zeros() as i32;
     let bd_shift = log2n + 3; // bitDepth + Log2(nTbS) + 10 - 15, 8-bit
     let round = 1i64 << (bd_shift - 1);
     let scale = (16 * LEVEL_SCALE[(qp % 6) as usize]) as i64;
     let shift = qp / 6;
-    for (i, &level) in levels[..n * n].iter().enumerate() {
-        let value = (((level as i64 * scale) << shift) + round) >> bd_shift;
-        scaled[i] = value.clamp(COEFF_MIN as i64, COEFF_MAX as i64) as i32;
-    }
+    let value = (((level as i64 * scale) << shift) + round) >> bd_shift;
+    value.clamp(COEFF_MIN as i64, COEFF_MAX as i64) as i32
+}
+
+/// What a squared error in the transform domain is worth as a squared error in
+/// the sample domain.
+///
+/// The forward transform's shifts leave the DC at 128 times the mean residual
+/// whatever the block size, where an orthonormal transform would leave it at
+/// `n` times; the transform is otherwise orthogonal, so coefficient error
+/// energy is `(128 / n)^2` times sample error energy and this undoes it. A
+/// rate-distortion search over the levels needs it to weigh transform-domain
+/// error against a lambda calibrated on samples.
+pub fn coeff_ssd_scale(n: usize) -> f64 {
+    (n * n) as f64 / (128.0 * 128.0)
 }
 
 /// The chroma QP a luma QP maps to for 4:2:0 (Table 8-10), before any offset.

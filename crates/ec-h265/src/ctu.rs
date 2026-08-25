@@ -22,13 +22,31 @@
 //! which this encoder spends on the wavefront that makes one `encode` call use
 //! every core instead.
 
-use crate::cabac::{CabacEncoder, CabacState, ctx};
+use crate::cabac::{CabacEncoder, CabacState, Contexts, ctx};
 use crate::intra::{self, Availability, Refs};
 use crate::residual::{self, encode_residual};
 use crate::transform::{
-    chroma_qp, dequantize, forward_transform, inverse_transform, quantize, uses_dst,
+    chroma_qp, dequantize, forward_transform, inverse_transform, quantize, quantize_offset,
+    uses_dst,
 };
 use std::sync::atomic::{AtomicU8, Ordering};
+
+/// The rounding the rate-distortion level search starts from, as a divisor of
+/// the quantiser step: 2 is round-to-nearest, against the 3 the plain path
+/// uses. A search that only takes levels down measures the rounding it was
+/// handed, so it gets the wider one. Swept on 1080p film at the settled
+/// lambda: 1/2 +0.360 dB BD-PSNR against x265, 1/3 +0.315, 1/4 +0.118.
+const RDOQ_DEAD_ZONE: i64 = 2;
+
+/// The same rounding for the chroma path, swept on its own because the sparser
+/// chroma of an intra picture answered differently in ec-h264.
+///
+/// Here it does not: coarser chroma rounding reads better and better on luma
+/// BD-PSNR (1/2 +0.360, 1/6 +0.525, 1/12 +0.568, 1/24 +0.585 dB) while the
+/// all-plane figure falls the whole way (+0.276, +0.231, +0.169, +0.128). That
+/// arm is chroma being starved to buy luma bits, which only a luma-only metric
+/// calls a gain, so chroma keeps luma's rounding.
+const RDOQ_DEAD_ZONE_C: i64 = 2;
 
 /// `log2` of the smallest coding block this encoder makes: 8x8.
 pub const MIN_CB_LOG2: u32 = 3;
@@ -151,6 +169,10 @@ pub struct CtuEncoder<'a> {
     /// Whether an 8x8 coding unit may split into four 4x4 intra partitions.
     intra_nxn: bool,
     sign_hiding: bool,
+    /// Whether the levels get a rate-distortion search after quantisation.
+    rdoq: bool,
+    /// The counting CABAC engine that search prices its trials with.
+    rdoq_enc: CabacEncoder,
     /// `log2` of the smallest coding unit the search will produce.
     min_cb_log2: u32,
     /// Intra mode per 4x4 block of the band; 255 = not coded yet.
@@ -183,6 +205,7 @@ impl<'a> CtuEncoder<'a> {
         chroma_rd_weight: f64,
         intra_nxn: bool,
         sign_hiding: bool,
+        rdoq: bool,
         min_cb_log2: u32,
     ) -> CtuEncoder<'a> {
         let band_rows = (height - band_y0).min(ctb_size);
@@ -204,6 +227,8 @@ impl<'a> CtuEncoder<'a> {
             chroma_rd_weight,
             intra_nxn,
             sign_hiding,
+            rdoq,
+            rdoq_enc: CabacEncoder::counter(Contexts::new(qp)),
             min_cb_log2: min_cb_log2.clamp(MIN_CB_LOG2, 5),
             modes: vec![255; (width / 4) * (ctb_size / 4)],
             depths: vec![0; (width / 4) * (ctb_size / 4)],
@@ -883,7 +908,30 @@ impl<'a> CtuEncoder<'a> {
         }
         let dst = uses_dst(n, true);
         forward_transform(&self.scratch.residual, &mut self.scratch.coeffs, n, dst);
-        let mut nonzero = quantize(&self.scratch.coeffs, &mut self.scratch.levels, n, self.qp);
+        let mut nonzero = if self.rdoq {
+            quantize_offset(
+                &self.scratch.coeffs,
+                &mut self.scratch.levels,
+                n,
+                self.qp,
+                RDOQ_DEAD_ZONE,
+            )
+        } else {
+            quantize(&self.scratch.coeffs, &mut self.scratch.levels, n, self.qp)
+        };
+        if self.rdoq && nonzero > 0 {
+            nonzero = residual::rdoq(
+                &self.scratch.coeffs,
+                &mut self.scratch.levels,
+                n,
+                self.qp,
+                0,
+                intra::scan_index(mode, n.trailing_zeros(), true),
+                ctx::CBF_LUMA + 1,
+                self.lambda,
+                &mut self.rdoq_enc,
+            );
+        }
         if self.sign_hiding && nonzero > 0 {
             nonzero = residual::hide_signs(
                 &self.scratch.coeffs,
@@ -942,12 +990,35 @@ impl<'a> CtuEncoder<'a> {
             }
         }
         forward_transform(&self.scratch.residual, &mut self.scratch.coeffs, cn, false);
-        let mut nonzero = quantize(
-            &self.scratch.coeffs,
-            &mut self.scratch.levels,
-            cn,
-            self.qp_c,
-        );
+        let mut nonzero = if self.rdoq {
+            quantize_offset(
+                &self.scratch.coeffs,
+                &mut self.scratch.levels,
+                cn,
+                self.qp_c,
+                RDOQ_DEAD_ZONE_C,
+            )
+        } else {
+            quantize(
+                &self.scratch.coeffs,
+                &mut self.scratch.levels,
+                cn,
+                self.qp_c,
+            )
+        };
+        if self.rdoq && nonzero > 0 {
+            nonzero = residual::rdoq(
+                &self.scratch.coeffs,
+                &mut self.scratch.levels,
+                cn,
+                self.qp_c,
+                plane,
+                intra::scan_index(pred_mode, cn.trailing_zeros(), false),
+                ctx::CBF_CHROMA,
+                self.lambda,
+                &mut self.rdoq_enc,
+            );
+        }
         if self.sign_hiding && nonzero > 0 {
             nonzero = residual::hide_signs(
                 &self.scratch.coeffs,

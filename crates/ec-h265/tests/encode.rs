@@ -438,6 +438,9 @@ fn bd_psnr_vs_x265() {
         if let Ok(v) = std::env::var("EC_H265_SDH") {
             cfg.sign_hiding = v != "0";
         }
+        if let Ok(v) = std::env::var("EC_H265_RDOQ") {
+            cfg.rdoq = v != "0";
+        }
         if let Ok(v) = std::env::var("EC_H265_NXN") {
             cfg.intra_nxn = v != "0";
         }
@@ -542,7 +545,9 @@ fn bd_psnr_vs_x265() {
     // per factor of 2 in bits), and our four QPs run at 22/26/30/34 plus that
     // shift. If the extrapolation share still exceeds 20% after measuring, the
     // shift is re-estimated from the geometric-mean bit ratio of the two full
-    // curves and the ladder is rebuilt — at most 2 extra alignment rounds
+    // curves and the ladder is rebuilt; once the rates match and the curves
+    // still do not meet, our ladder is drawn in towards its own centre until
+    // its bitrate range fits inside the anchor's — at most 8 alignment rounds
     // before the existing panic fires.
     const EXTRAP_LIMIT: f64 = 0.20;
     let x265_qps = [22, 26, 30, 34];
@@ -589,9 +594,17 @@ fn bd_psnr_vs_x265() {
     ) = (0.0_f64, 0.0, 0.0, 0.0, 0.0, 0.0);
     let mut mine: Vec<(f64, f64, f64)>;
     let mut our_qps: [i32; 4];
+    // How wide our QP ladder is against the anchor's, as a fraction of its
+    // spacing: one encoder can answer a QP step with far more bitrate than the
+    // other, and a BD number needs both curves over the same range.
+    let mut spread = 1.0_f64;
 
-    for round in 0..=2u32 {
-        our_qps = x265_qps.map(|q| (q + shift).clamp(1, 45));
+    for round in 0..=8u32 {
+        our_qps = x265_qps.map(|q| {
+            let centre = f64::from(probe_qp + shift);
+            let offset = f64::from(q - probe_qp) * spread;
+            ((centre + offset).round() as i32).clamp(1, 45)
+        });
         mine = our_qps
             .iter()
             .map(|&q| if q == probe_qp { probe_ours } else { ours(q) })
@@ -621,19 +634,33 @@ fn bd_psnr_vs_x265() {
             && anc_extrap <= EXTRAP_LIMIT
             && cand_extrap_yuv <= EXTRAP_LIMIT
             && anc_extrap_yuv <= EXTRAP_LIMIT;
-        if aligned || round == 2 {
+        if aligned || round == 8 {
             break;
         }
         // Re-estimate the shift from the geometric-mean bit ratio of the two
-        // full curves, then rebuild the ladder.
+        // full curves, then rebuild the ladder. A single-QP correction is
+        // ignored: it is within the rounding of the estimate and only makes the
+        // ladder oscillate between two neighbouring shifts.
         let delta = (6.0 * (gm(&mine) / gm(&theirs)).log2()).round() as i32;
-        shift += delta;
+        if delta.abs() > 1 {
+            shift += delta;
+            eprintln!(
+                "alignment round {}: shift {delta:+} -> {shift:+} \
+                 (gm ours {:.1} Mbit vs x265 {:.1} Mbit)",
+                round + 1,
+                gm(&mine) / 1e6,
+                gm(&theirs) / 1e6,
+            );
+            continue;
+        }
+        // The rates match and the curves still do not overlap, so our ladder
+        // spans a much wider bitrate range than the anchor's: their union is
+        // then mostly outside what x265 measured and the cubic through its four
+        // points extrapolates over most of it. Draw our ladder in.
+        spread *= 0.5;
         eprintln!(
-            "alignment round {}: shift {delta:+} -> {shift:+} \
-             (gm ours {:.1} Mbit vs x265 {:.1} Mbit)",
-            round + 1,
-            gm(&mine) / 1e6,
-            gm(&theirs) / 1e6,
+            "alignment round {}: ladder spread -> {spread:.2} of the anchor's",
+            round + 1
         );
     }
 
