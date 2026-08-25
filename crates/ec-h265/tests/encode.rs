@@ -740,11 +740,17 @@ fn clip_sources(path: &std::ffi::OsStr, want: usize) -> (usize, usize, Vec<Plane
         String::from_utf8_lossy(&dims.stderr)
     );
     let csv = String::from_utf8_lossy(&dims.stdout);
-    let (w, h) = csv
-        .trim()
-        .split_once(',')
-        .and_then(|(w, h)| Some((w.parse::<usize>().ok()?, h.parse::<usize>().ok()?)))
-        .expect("ffprobe returned dimensions");
+    // ffprobe prints one comma-separated line per stream, and recent builds
+    // end it with a trailing separator, so the fields are taken by position
+    // rather than by splitting the line in two.
+    let mut fields = csv.lines().next().unwrap_or_default().split(',');
+    let (w, h) = (|| {
+        Some((
+            fields.next()?.trim().parse::<usize>().ok()?,
+            fields.next()?.trim().parse::<usize>().ok()?,
+        ))
+    })()
+    .unwrap_or_else(|| panic!("ffprobe returned dimensions, got {csv:?}"));
     // Pictures to pass over before sampling: the head of a film is titles and
     // fades, which are not what a codec is measured on.
     let skip: usize = std::env::var("EC_H265_CLIP_SKIP")
