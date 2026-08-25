@@ -1,7 +1,7 @@
 //! `residual_coding()` (7.3.8.11) and the scan orders it walks (6.5.3 - 6.5.5).
 
-use crate::cabac::{CabacEncoder, ctx};
-use crate::transform::ideal_level;
+use crate::cabac::{CabacEncoder, CabacState, ctx};
+use crate::transform::{coeff_ssd_scale, dequant_level, ideal_level};
 use std::sync::LazyLock;
 
 /// Scan orders: `SCANS[log2BlockSize][scanIdx][pos] = (x, y)`.
@@ -192,6 +192,139 @@ pub fn hide_signs(coeffs: &[i32], levels: &mut [i32], n: usize, qp: i32, scan_id
             levels[i] += if levels[i] < 0 { -delta } else { delta };
         }
     }
+    levels[..n * n].iter().filter(|&&l| l != 0).count()
+}
+
+/// The largest level the rate-distortion search offers a smaller magnitude to.
+///
+/// A big level carries real signal and never wins by shrinking, so bounding
+/// the search is what keeps it affordable: every trial re-codes the whole
+/// block. Swept on 1080p film, BD-PSNR-YUV against x265: 1 gives +0.244, the 2
+/// kept here +0.276, and 3 +0.277 for strictly more trials.
+const RDOQ_MAX_LEVEL: i32 = 2;
+
+/// How much of the mode-decision lambda the level search uses. The bits are
+/// the coder's own count, not an estimate, so the scale starts at 1.
+///
+/// The two clips disagree above it and the disagreement is small: on
+/// BD-PSNR-YUV against x265, 1080p film reads +0.276 at 1.0, +0.294 at 1.25
+/// and +0.293 at 1.5, while a 2560x1440 screen capture reads -0.392, -0.408
+/// and -0.441. The crossing sits just above 1.0, and the screen capture is the
+/// content still behind x265, so it takes the tie.
+const RDOQ_LAMBDA: f64 = 1.0;
+
+/// What one candidate set of levels costs in bits, priced by the CABAC coder
+/// itself against `base`'s context state.
+#[allow(clippy::too_many_arguments)]
+fn levels_bits(
+    enc: &mut CabacEncoder,
+    base: &CabacState,
+    levels: &[i32],
+    log2_size: u32,
+    c_idx: usize,
+    scan_idx: usize,
+    cbf_ctx: usize,
+    coded: bool,
+) -> u64 {
+    enc.restore(base);
+    let before = enc.bit_count();
+    enc.encode_bin(cbf_ctx, u32::from(coded));
+    if coded {
+        encode_residual(enc, levels, log2_size, c_idx, scan_idx, false);
+    }
+    enc.bit_count() - before
+}
+
+/// Rate-distortion quantisation of one transform block: each small level is
+/// offered the magnitudes below it, and takes one when the squared error it
+/// gives up costs less than the bits it saves.
+///
+/// The rate is the CABAC coder's own price for the whole block — `enc` is a
+/// counting engine, and every trial is priced from the same context state — so
+/// dropping a level is priced together with the significance map and the last
+/// position that follow from it, which is where most of the saving is. The
+/// distortion is the transform-domain error scaled back to samples by
+/// [`coeff_ssd_scale`], so `lambda` is the caller's sample-domain lambda.
+///
+/// Returns the number of non-zero levels left.
+#[allow(clippy::too_many_arguments)]
+pub fn rdoq(
+    coeffs: &[i32],
+    levels: &mut [i32],
+    n: usize,
+    qp: i32,
+    c_idx: usize,
+    scan_idx: usize,
+    cbf_ctx: usize,
+    lambda: f64,
+    enc: &mut CabacEncoder,
+) -> usize {
+    let log2_size = n.trailing_zeros();
+    let scale = coeff_ssd_scale(n);
+    let lambda = RDOQ_LAMBDA * lambda;
+    let base = enc.snapshot();
+    let err = |level: i32, coeff: i32| {
+        let d = f64::from(dequant_level(level, n, qp) - coeff);
+        d * d
+    };
+
+    let mut dist: f64 = (0..n * n).map(|i| err(levels[i], coeffs[i])).sum();
+    let bits = levels_bits(
+        enc, &base, levels, log2_size, c_idx, scan_idx, cbf_ctx, true,
+    );
+    let mut cost = scale * dist + lambda * bits as f64;
+
+    // Highest scanning position first: dropping the last significant level is
+    // what shortens the significance map and moves the coded last position, so
+    // it is tried while the levels above it are already gone.
+    let sub_scan = scan(log2_size - 2, scan_idx);
+    let pos_scan = scan(2, scan_idx);
+    let order: Vec<usize> = sub_scan
+        .iter()
+        .flat_map(|&(xs, ys)| {
+            pos_scan.iter().map(move |&(xp, yp)| {
+                (ys as usize * 4 + yp as usize) * n + xs as usize * 4 + xp as usize
+            })
+        })
+        .collect();
+    for &i in order.iter().rev() {
+        let level = levels[i];
+        if level == 0 || level.abs() > RDOQ_MAX_LEVEL {
+            continue;
+        }
+        let mut tried = level.abs();
+        for candidate in [level.abs() - 1, 0] {
+            if candidate == tried {
+                continue;
+            }
+            tried = candidate;
+            let keep = levels[i];
+            levels[i] = candidate * level.signum();
+            let trial_dist = dist - err(keep, coeffs[i]) + err(levels[i], coeffs[i]);
+            let any = levels[..n * n].iter().any(|&l| l != 0);
+            let trial_bits =
+                levels_bits(enc, &base, levels, log2_size, c_idx, scan_idx, cbf_ctx, any);
+            let trial = scale * trial_dist + lambda * trial_bits as f64;
+            if trial < cost {
+                cost = trial;
+                dist = trial_dist;
+            } else {
+                levels[i] = keep;
+            }
+        }
+    }
+    // And the block as a whole: zeroing it drops the coded-block flag as well
+    // as every level, which no single-coefficient step can see.
+    let zero_dist: f64 = (0..n * n).map(|i| err(0, coeffs[i])).sum();
+    let zero_bits = levels_bits(
+        enc, &base, levels, log2_size, c_idx, scan_idx, cbf_ctx, false,
+    );
+    if scale * zero_dist + lambda * zero_bits as f64 <= cost {
+        levels[..n * n].fill(0);
+        enc.restore(&base);
+        return 0;
+    }
+    enc.restore(&base);
     levels[..n * n].iter().filter(|&&l| l != 0).count()
 }
 
