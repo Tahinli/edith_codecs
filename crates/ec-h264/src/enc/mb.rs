@@ -2098,38 +2098,25 @@ fn code_intra_8x8(
         pred_modes[blk8] = predicted;
         let n = filter_nbr8(&gather_nbr8(pic, nbr, blk8, x, y));
         let allowed = modes_allowed(n.have_top, n.have_left, n.have_tl);
-        let mut best = (i32::MAX, predicted.min(2));
         let mut p = [0u8; 64];
-        for mode in 0..9u8 {
-            if !allowed[mode as usize] {
-                continue;
+        {
+            let (mode, coded, recon) =
+                i8_mode_by_rd(pic, e, w, x, y, qp, &n, &allowed, predicted, &mut p);
+            let stride = pic.y.stride;
+            let origin = pic.y.at(x, y);
+            for ry in 0..8 {
+                let row = origin + ry * stride;
+                pic.y.data[row..row + 8].copy_from_slice(&recon[ry * 8..ry * 8 + 8]);
             }
-            pred_8x8(mode, &n, &mut p);
-            let bits = if mode == predicted { 1 } else { 4 };
-            let mut c = motion_rate(e, f64::from(bits));
-            for q in 0..4 {
-                let (ox, oy) = ((q % 2) * 4, (q / 2) * 4);
-                c += satd4(&e.src.y, e.src.stride, x + ox, y + oy, &p[oy * 8 + ox..], 8);
+            lv.luma8[blk8] = coded.0;
+            if coded.1 {
+                lv.cbp_luma |= 1 << blk8;
             }
-            if c < best.0 {
-                best = (c, mode);
+            modes[blk8] = mode;
+            for dy in 0..2 {
+                let base = (by + dy) * w4 + bx;
+                pic.i4_modes[base..base + 2].fill(mode);
             }
-        }
-        let mode = best.1;
-        modes[blk8] = mode;
-        for dy in 0..2 {
-            let base = (by + dy) * w4 + bx;
-            pic.i4_modes[base..base + 2].fill(mode);
-        }
-        pred_8x8(mode, &n, &mut p);
-        let stride = pic.y.stride;
-        let origin = pic.y.at(x, y);
-        for ry in 0..8 {
-            let row = origin + ry * stride;
-            pic.y.data[row..row + 8].copy_from_slice(&p[ry * 8..ry * 8 + 8]);
-        }
-        if code_block_8x8(pic, e, w, x, y, qp, true, &mut lv.luma8[blk8]) > 0 {
-            lv.cbp_luma |= 1 << blk8;
         }
     }
     (modes, pred_modes)
@@ -3444,4 +3431,76 @@ fn choose_chroma_mode_rd(
     }
     *out = lv;
     mode
+}
+
+/// The mode decision of [`code_intra_8x8`]: for every allowed mode, predict,
+/// code the 8x8 residual at the real QP and score `SSD + lambda * bits`, then
+/// keep the cheapest. The SATD chooser this replaced scored the prediction
+/// residual before the quantiser had a say, so it optimised a proxy.
+///
+/// Returns the winning mode, its coded levels with whether the block has any,
+/// and the reconstructed 8x8 to write back. Measured on BD-PSNR against x264
+/// with the 8x8 transform on, GOP 10, 24 consecutive pictures, luma / YUV:
+///   • 3840x1608 film:   +0.475 / -0.068  ->  +0.512 / -0.035
+///   • 1138x640 web:     +0.040 / -0.031  ->  +0.076 / +0.003
+///   • 854x480 web:      +0.070 / +0.047  ->  +0.132 / +0.108
+///   • 2560x1440 screen: -0.206 / -0.199  ->  -0.215 / -0.207
+/// Three clips of four gain; the screen capture loses 0.008 dB. Encode time
+/// moves from 12 s to 13 s on the 854x480 clip.
+#[allow(clippy::too_many_arguments)]
+fn i8_mode_by_rd(
+    pic: &mut Picture,
+    e: &MbEnc<'_>,
+    w: &EncEntropy,
+    x: usize,
+    y: usize,
+    qp: i32,
+    n: &crate::pred::Nbr8,
+    allowed: &[bool; 9],
+    predicted: u8,
+    p: &mut [u8; 64],
+) -> (u8, ([i32; 64], bool), [u8; 64]) {
+    let lambda = lambda_ssd(qp);
+    let stride = pic.y.stride;
+    let origin = pic.y.at(x, y);
+    let mut best: Option<(f64, u8, [i32; 64], bool, [u8; 64])> = None;
+    for mode in 0..9u8 {
+        if !allowed[mode as usize] {
+            continue;
+        }
+        pred_8x8(mode, n, p);
+        for ry in 0..8 {
+            let row = origin + ry * stride;
+            pic.y.data[row..row + 8].copy_from_slice(&p[ry * 8..ry * 8 + 8]);
+        }
+        let mut levels = [0i32; 64];
+        let nz = code_block_8x8(pic, e, w, x, y, qp, true, &mut levels);
+        let mut ssd = 0i64;
+        let mut recon = [0u8; 64];
+        for ry in 0..8 {
+            let row = origin + ry * stride;
+            for rx in 0..8 {
+                let r = pic.y.data[row + rx];
+                recon[ry * 8 + rx] = r;
+                let d = i64::from(e.src.y[(y + ry) * e.src.stride + x + rx]) - i64::from(r);
+                ssd += d * d;
+            }
+        }
+        let mut bits = if mode == predicted { 1.0 } else { 4.0 };
+        if nz > 0 {
+            // `Luma8x8` has no coded_block_flag of its own — the CBP carries it
+            // — so it needs the 8x8 cost path, not the cbf-indexed one.
+            bits += match w.residual_block_8x8_cost(&levels) {
+                Some(b) => f64::from(b) / 256.0,
+                None => block_bits(&levels) as f64,
+            };
+        }
+        let cost = ssd as f64 + lambda * bits;
+        if best.as_ref().is_none_or(|b| cost < b.0) {
+            best = Some((cost, mode, levels, nz > 0, recon));
+        }
+    }
+    let (_, mode, levels, coded, recon) =
+        best.expect("Intra_8x8 always has at least the DC mode available");
+    (mode, (levels, coded), recon)
 }
