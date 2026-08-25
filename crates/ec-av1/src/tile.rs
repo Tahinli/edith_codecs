@@ -18,6 +18,19 @@ use crate::msac::SymbolEncoder;
 const PARTITION_NONE: usize = 0;
 /// `PARTITION_SPLIT` (spec 6.10.4): the block cut into four quadrants.
 const PARTITION_SPLIT: usize = 3;
+
+/// The partition types whose probability mass the split-or-horizontal flag of
+/// a superblock hanging off the bottom of the frame gathers (spec 9.3,
+/// `partition_gather_vert_alike`): the flag says split, so everything vertical
+/// or split lands on it.
+const VERT_ALIKE: [usize; 6] = [2, PARTITION_SPLIT, 4, 6, 7, 9];
+
+/// The same for a superblock hanging off the right-hand edge
+/// (`partition_gather_horz_alike`).
+const HORZ_ALIKE: [usize; 6] = [1, PARTITION_SPLIT, 4, 5, 6, 8];
+
+/// Mode-info units across a 32x32 block.
+const BLOCK_MI: u32 = SB_MI / 2;
 /// `DC_PRED` (spec 6.10.2), as both the luma and the chroma mode.
 const DC_PRED: usize = 0;
 
@@ -61,6 +74,19 @@ const Q_CTX_2: std::ops::RangeInclusive<u8> = 61..=120;
 
 /// Both writers here code whole superblocks only: a partial one forces the
 /// partition syntax down the block tree, which they do not code yet.
+/// The probability the CDF gives one symbol on its own.
+fn element_prob(cdf: &[u16], element: usize) -> u16 {
+    cdf[element] - if element > 0 { cdf[element - 1] } else { 0 }
+}
+
+/// The two-symbol CDF a partial superblock's partition flag is coded with: the
+/// mass of the listed partition types becomes the probability of a split, and
+/// the rest is the one partition the frame edge still allows.
+fn gather(cdf: &[u16], elements: [usize; 6]) -> [u16; 3] {
+    let split: u16 = elements.iter().map(|&e| element_prob(cdf, e)).sum();
+    [32768 - split, 32768, 0]
+}
+
 fn check_superblocks(mi_cols: u32, mi_rows: u32) -> Result<()> {
     if mi_cols == 0
         || mi_rows == 0
@@ -391,21 +417,43 @@ struct Neighbour {
     dc: Option<bool>,
 }
 
+/// Rejects a frame the 32x32 block grid cannot tile.
+///
+/// The frame need not be a whole number of superblocks — a superblock at the
+/// right-hand or bottom edge may be half outside it — but every 32x32 block
+/// that is coded has to be wholly inside, because a block that hangs over the
+/// edge has to be coded as a rectangle this writer has no transform for.
+fn check_blocks(mi_cols: u32, mi_rows: u32) -> Result<()> {
+    if mi_cols == 0
+        || mi_rows == 0
+        || !mi_cols.is_multiple_of(BLOCK_MI)
+        || !mi_rows.is_multiple_of(BLOCK_MI)
+    {
+        return Err(Error::unsupported(
+            "AV1 tile",
+            "a coefficient key frame is written only for frames that are a \
+             whole number of 32x32 blocks",
+        ));
+    }
+    Ok(())
+}
+
 /// Writes the payload of a one-tile key frame in which every superblock is
-/// split into four 32x32 DC-predicted blocks, each carrying the coefficients
+/// split into 32x32 DC-predicted blocks, each carrying the coefficients
 /// `blocks` gives it.
 ///
 /// `blocks` gives one coefficient set per 32x32 block in raster order across
-/// the frame, so the grid is twice as wide and twice as tall as the superblock
-/// grid. Each set carries a 32x32 luma transform and the 16x16 transform of
+/// the frame. The frame need not be a whole number of superblocks: a
+/// superblock at the right-hand or bottom edge may be half outside it, and the
+/// blocks that would sit in the half outside are not coded. Each set carries a 32x32 luma transform and the 16x16 transform of
 /// each chroma plane; an empty list writes an all-zero transform block. Unlike
 /// the DC writers, the coefficients may sit anywhere in their transform, so a
 /// block here is a picture rather than a flat grey: a single coefficient off
 /// the origin decodes to the basis function it selects.
 ///
 /// # Errors
-/// Returns an error when the frame is not a whole number of 64x64
-/// superblocks, when `blocks` does not carry exactly one set per 32x32 block,
+/// Returns an error when the frame is not a whole number of 32x32 blocks,
+/// when `blocks` does not carry exactly one set per 32x32 block,
 /// when a coefficient sits outside its transform, repeats a position, carries
 /// a zero level or one wider than the base and base-range syntax reach, or
 /// when `base_q_idx` is outside the q-context band whose default CDFs this
@@ -416,9 +464,9 @@ pub fn split_coeff_key_frame_tile(
     base_q_idx: u8,
     blocks: &[BlockCoeffs],
 ) -> Result<Vec<u8>> {
-    check_superblocks(mi_cols, mi_rows)?;
-    let (sb_cols, sb_rows) = (mi_cols / SB_MI, mi_rows / SB_MI);
-    let (cols, rows) = (sb_cols * 2, sb_rows * 2);
+    check_blocks(mi_cols, mi_rows)?;
+    let (cols, rows) = (mi_cols / BLOCK_MI, mi_rows / BLOCK_MI);
+    let (sb_cols, sb_rows) = (cols.div_ceil(2), rows.div_ceil(2));
     if blocks.len() != (cols * rows) as usize {
         return Err(Error::unsupported(
             "AV1 tile",
@@ -473,10 +521,28 @@ pub fn split_coeff_key_frame_tile(
         left_mode.iter_mut().for_each(|m| *m = DC_PRED);
         for sb_c in 0..sb_cols {
             let ctx = 2 * usize::from(sb_c > 0) + usize::from(sb_r > 0);
-            enc.symbol_fixed(PARTITION_SPLIT, &cdf::PARTITION_W64[ctx]);
+            // A superblock whose bottom or right half is outside the frame
+            // cannot be left unsplit, so the decoder reads a flag instead of
+            // the partition symbol — and reads nothing at all when both halves
+            // are outside, where the split is the only partition left.
+            let (has_cols, has_rows) = (
+                sb_c * SB_MI + SB_MI / 2 < mi_cols,
+                sb_r * SB_MI + SB_MI / 2 < mi_rows,
+            );
+            match (has_cols, has_rows) {
+                (true, true) => enc.symbol_fixed(PARTITION_SPLIT, &cdf::PARTITION_W64[ctx]),
+                (true, false) => enc.symbol_fixed(1, &gather(&cdf::PARTITION_W64[ctx], VERT_ALIKE)),
+                (false, true) => enc.symbol_fixed(1, &gather(&cdf::PARTITION_W64[ctx], HORZ_ALIKE)),
+                (false, false) => {}
+            }
 
             for quadrant in 0..4 {
                 let (r, c) = (sb_r * 2 + quadrant / 2, sb_c * 2 + quadrant % 2);
+                if r >= rows || c >= cols {
+                    // The quadrant is outside the frame: the decoder never
+                    // walks into it.
+                    continue;
+                }
                 let (r, c) = (r as usize, c as usize);
                 let block = &grids[r * cols as usize + c];
                 let mode = usize::from(blocks[r * cols as usize + c].mode);
@@ -1733,6 +1799,112 @@ mod tests {
             .iter()
             .map(|r| r[block_col * 32..block_col * 32 + 32].to_vec())
             .collect()
+    }
+
+    /// Encodes a key frame of the given size, whose 32x32 blocks carry
+    /// `blocks` in raster order, and hands back its luma plane as rows of
+    /// samples.
+    fn decode_luma_at(width: usize, height: usize, blocks: &[BlockCoeffs]) -> Vec<Vec<u8>> {
+        let (seq, header) = frame_of(width as u32, height as u32);
+        let tile =
+            split_coeff_key_frame_tile(header.mi_cols, header.mi_rows, Q_IDX, blocks).unwrap();
+        let mut stream = temporal_delimiter();
+        stream.extend_from_slice(&sequence_header_obu(&seq).unwrap());
+        stream.extend_from_slice(&frame_obu(&seq, &header, &tile).unwrap());
+        let planes = ffmpeg_decode(&stream, width, height);
+        planes[..width * height]
+            .chunks_exact(width)
+            .map(<[u8]>::to_vec)
+            .collect()
+    }
+
+    /// Every row of a block is the same row, and that row falls from left to
+    /// right — the shape of a coefficient at row 0, column 1.
+    fn assert_falls_across(block: &[Vec<u8>], name: &str) {
+        for row in block {
+            assert_eq!(
+                row, &block[0],
+                "{name}: every row of the block is the same row"
+            );
+        }
+        assert!(
+            block[0][0] > block[0][31],
+            "{name}: the row falls from left to right, got {} then {}",
+            block[0][0],
+            block[0][31]
+        );
+    }
+
+    /// Every column of a block is constant across it and falls down it — the
+    /// shape of a coefficient at row 1, column 0.
+    fn assert_falls_down(block: &[Vec<u8>], name: &str) {
+        for (y, row) in block.iter().enumerate() {
+            assert!(
+                row.iter().all(|&s| s == row[0]),
+                "{name}: row {y} of the block is one constant"
+            );
+        }
+        assert!(
+            block[0][0] > block[31][0],
+            "{name}: the column falls down the block, got {} then {}",
+            block[0][0],
+            block[31][0]
+        );
+    }
+
+    /// A frame need not be a whole number of superblocks. A 96x64 frame is a
+    /// superblock and a half across: the second superblock has no right-hand
+    /// half, so its partition is a gathered flag rather than the full symbol,
+    /// and the two blocks that would sit in that half are never coded at all.
+    /// Each of the six blocks that do exist carries one of two basis functions,
+    /// alternating, so a block written into the wrong place or a flag the
+    /// decoder reads as a different number of bits shows up as a block with the
+    /// other block's shape — or as a decode failure.
+    #[test]
+    fn a_frame_that_is_not_a_whole_number_of_superblocks_codes_every_block() {
+        if !have_ffmpeg() {
+            eprintln!(
+                "SKIP a_frame_that_is_not_a_whole_number_of_superblocks_codes_every_block: no \
+                 ffmpeg"
+            );
+            return;
+        }
+        let blocks: Vec<BlockCoeffs> = (0..6)
+            .map(|i| {
+                let (row, col) = if i % 2 == 0 { (0, 1) } else { (1, 0) };
+                BlockCoeffs::from(vec![Coeff {
+                    row,
+                    col,
+                    level: 12,
+                }])
+            })
+            .collect();
+        let rows = decode_luma_at(96, 64, &blocks);
+        for block_row in 0..2 {
+            for block_col in 0..3 {
+                let name = format!("block ({block_row},{block_col})");
+                let block = block_at(&rows, block_row, block_col);
+                if (block_row * 3 + block_col) % 2 == 0 {
+                    assert_falls_across(&block, &name);
+                } else {
+                    assert_falls_down(&block, &name);
+                }
+            }
+        }
+    }
+
+    /// A frame whose blocks do not tile it is refused rather than written as a
+    /// stream a decoder walks off the end of.
+    #[test]
+    fn a_frame_that_is_not_a_whole_number_of_blocks_is_refused() {
+        let (_, header) = frame_of(80, 64);
+        let blocks = vec![BlockCoeffs::default(); 4];
+        let err = split_coeff_key_frame_tile(header.mi_cols, header.mi_rows, Q_IDX, &blocks)
+            .expect_err("80 is not a whole number of 32x32 blocks");
+        assert!(
+            format!("{err}").contains("32x32"),
+            "the refusal names the block size, got {err}"
+        );
     }
 
     /// A directional intra mode says where its prediction comes from, and with
