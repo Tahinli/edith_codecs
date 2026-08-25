@@ -565,6 +565,77 @@ fn ffmpeg_decodes_bit_exactly_at_every_shape() {
     }
 }
 
+/// A 64x64 coding unit predicts and transforms in four 32x32 blocks under one
+/// luma mode, with the transform split inferred rather than signalled
+/// (`log2TrafoSize > MaxTbLog2SizeY`, 7.4.9.8). That inference is the part a
+/// decoder disagrees with loudly, so it is gated against ffmpeg -- and the
+/// stream has to differ from the same encode with `cu64` off, or the test would
+/// pass without a single 64x64 coding unit ever being kept.
+#[test]
+fn cu64_decodes_bit_exactly() {
+    if !have_ffmpeg() {
+        eprintln!("skipping: ffmpeg not installed");
+        return;
+    }
+    // 130x66 is here for the partial coding tree blocks, not for the decision:
+    // at that size only two tree blocks are whole and the search keeps neither,
+    // so its stream is allowed to come out identical.
+    for &(w, h, qp, fires) in &[
+        (352u32, 288u32, 32i32, true),
+        (256, 256, 37, true),
+        (130, 66, 32, false),
+    ] {
+        let (source, off) = encode_cu64(w, h, qp, false);
+        let (_, on) = encode_cu64(w, h, qp, true);
+        let name = format!("cu64-{w}x{h}-qp{qp}");
+        if fires {
+            assert_ne!(off.au, on.au, "{name}: no 64x64 coding unit was ever kept");
+        }
+
+        let path = write_au(&name, &on);
+        let decoded = match ffmpeg_decode(&path) {
+            Ok(bytes) => bytes,
+            Err(e) => panic!("{name}: ffmpeg failed: {e}"),
+        };
+        let recon = planes_of(on.recon.as_ref().expect("recon kept"));
+        assert_eq!(decoded.len(), recon.len(), "{name}: size mismatch");
+        let mismatches = decoded.iter().zip(&recon).filter(|(a, b)| a != b).count();
+        if mismatches != 0 {
+            let first = decoded
+                .iter()
+                .zip(&recon)
+                .position(|(a, b)| a != b)
+                .unwrap();
+            let luma = (w * h) as usize;
+            panic!(
+                "{name}: {mismatches} samples differ, first at {first} ({}, {}), {} of them luma",
+                first % w as usize,
+                first / w as usize,
+                decoded[..luma]
+                    .iter()
+                    .zip(&recon[..luma])
+                    .filter(|(a, b)| a != b)
+                    .count(),
+            );
+        }
+        let quality = psnr(&planes_of(&source), &recon);
+        assert!(quality > 28.0, "{name}: PSNR {quality:.2} dB at QP {qp}");
+    }
+}
+
+fn encode_cu64(width: u32, height: u32, qp: i32, cu64: bool) -> (VideoFrame, EncodedPicture) {
+    let mut cfg = EncoderConfig::new(width, height);
+    cfg.ctb_size = 64;
+    cfg.cu64 = cu64;
+    cfg.rate_control = RateControl::ConstantQp(qp);
+    cfg.keep_recon = true;
+    cfg.picture_hash = true;
+    let encoder = Encoder::new(cfg).expect("encoder");
+    let frame = natural_frame(width, height, 0);
+    let coded = encoder.encode_idr(&frame).expect("encode");
+    (frame, coded)
+}
+
 /// The 32x32 default buys wavefront rows (see `perf.rs`) by coding a shallower
 /// tree; that trade is only worth taking if the bits it costs are noise.
 #[test]

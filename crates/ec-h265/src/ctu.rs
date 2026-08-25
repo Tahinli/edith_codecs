@@ -173,6 +173,9 @@ pub struct CtuEncoder<'a> {
     rdoq: bool,
     transform_skip: bool,
     rqt: bool,
+    /// Whether a 64x64 coding tree block may stay one coding unit rather than
+    /// always splitting to 32x32.
+    cu64: bool,
     /// The counting CABAC engine that search prices its trials with.
     rdoq_enc: CabacEncoder,
     /// `log2` of the smallest coding unit the search will produce.
@@ -210,6 +213,7 @@ impl<'a> CtuEncoder<'a> {
         rdoq: bool,
         transform_skip: bool,
         rqt: bool,
+        cu64: bool,
         min_cb_log2: u32,
     ) -> CtuEncoder<'a> {
         let band_rows = (height - band_y0).min(ctb_size);
@@ -234,6 +238,7 @@ impl<'a> CtuEncoder<'a> {
             rdoq,
             transform_skip,
             rqt,
+            cu64,
             rdoq_enc: CabacEncoder::counter(Contexts::new(qp)),
             min_cb_log2: min_cb_log2.clamp(MIN_CB_LOG2, 5),
             modes: vec![255; (width / 4) * (ctb_size / 4)],
@@ -387,7 +392,7 @@ impl<'a> CtuEncoder<'a> {
             return self.lambda * (enc.bit_count() - before) as f64
                 + self.code_cu(x, y, log2, depth, enc);
         }
-        if log2 > 5 {
+        if log2 > 5 && !self.cu64 {
             // 64x64 coding units are not searched; the decision starts at 32x32.
             let before = enc.bit_count();
             enc.encode_bin(split_ctx, 1);
@@ -656,6 +661,114 @@ impl<'a> CtuEncoder<'a> {
         self.region_ssd(x, y, 8) + self.lambda * bits as f64
     }
 
+    /// Code one 64x64 coding unit.
+    ///
+    /// HEVC's largest transform block is 32x32, so the transform tree of a
+    /// 64x64 coding unit is split without a `split_transform_flag` -- the
+    /// decoder infers the split from `log2TrafoSize > MaxTbLog2SizeY` (7.4.9.8)
+    /// -- and intra prediction runs per transform block, four 32x32 ones in
+    /// z-order, each predicting from the reconstruction of the ones before it.
+    /// The coding unit carries a single luma mode and a single chroma mode, so
+    /// what it saves over four 32x32 coding units is three split flags and
+    /// three mode signallings; what it gives up is three quarters of the
+    /// freedom to pick a direction.
+    ///
+    /// The mode search runs on the first quadrant: that is the only one whose
+    /// neighbours are settled before a mode is chosen, and it is what the
+    /// reference encoder does for the same reason.
+    fn code_cu_64(&mut self, x: usize, y: usize, depth: u8, enc: &mut CabacEncoder) -> f64 {
+        const N: usize = 64;
+        const HALF: usize = 32;
+        const LOG2: u32 = 6;
+        let chroma_tskip = self.transform_skip;
+        let before = enc.bit_count();
+
+        let mpm = self.mpm_at(x, y);
+        // Reconstructs the first quadrant under the mode it picks, leaving its
+        // levels in the luma scratch.
+        let mode = self.choose_luma_mode(x, y, HALF, LOG2 - 1, &mpm, enc);
+        self.write_mode_syntax(enc, mode, &mpm);
+        let (chroma_mode, chroma_idx) = if self.chroma_rd {
+            self.choose_chroma_mode(x, y, HALF, LOG2 - 1, mode, chroma_tskip, enc)
+        } else {
+            (mode, None)
+        };
+        self.write_chroma_mode_syntax(enc, chroma_idx);
+
+        let mut child_levels = [[0i32; 1024]; 4];
+        let mut child_cbf = [false; 4];
+        let mut child_cb = [[0i32; 256]; 4];
+        let mut child_cr = [[0i32; 256]; 4];
+        let mut child_cb_cbf = [false; 4];
+        let mut child_cr_cbf = [false; 4];
+        let offsets = [(0usize, 0usize), (HALF, 0), (0, HALF), (HALF, HALF)];
+        let q = HALF * HALF / 4;
+        for (part, &(dx, dy)) in offsets.iter().enumerate() {
+            let (cx, cy) = (x + dx, y + dy);
+            if part == 0 {
+                // Already coded by the mode search.
+                child_levels[0][..HALF * HALF]
+                    .copy_from_slice(&self.scratch.luma_levels[..HALF * HALF]);
+                child_cbf[0] = child_levels[0][..HALF * HALF].iter().any(|&v| v != 0);
+            } else {
+                let refs = self.luma_refs(cx, cy, HALF);
+                let mut source = std::mem::take(&mut self.scratch.source);
+                for row in 0..HALF {
+                    source[row * HALF..row * HALF + HALF].copy_from_slice(
+                        &self.src.y
+                            [(cy + row) * self.width + cx..(cy + row) * self.width + cx + HALF],
+                    );
+                }
+                let (_, cbf) = self.transform_luma(HALF, mode, &source, &refs);
+                self.scratch.source = source;
+                child_levels[part][..HALF * HALF]
+                    .copy_from_slice(&self.scratch.levels[..HALF * HALF]);
+                child_cbf[part] = cbf;
+                for row in 0..HALF {
+                    for col in 0..HALF {
+                        self.write_rec_y(cx + col, cy + row, self.scratch.recon[row * HALF + col]);
+                    }
+                }
+            }
+            // The next quadrant predicts from this one, so its samples have to
+            // read as available now: the decoder walks the tree in z-order too.
+            self.mark_coded(cx, cy, HALF, mode, depth);
+            let (_, cbf) = self.code_chroma(cx, cy, HALF, chroma_mode, 1, chroma_tskip);
+            child_cb_cbf[part] = cbf;
+            child_cb[part][..q].copy_from_slice(&self.scratch.cb_levels[..q]);
+            let (_, cbf) = self.code_chroma(cx, cy, HALF, chroma_mode, 2, chroma_tskip);
+            child_cr_cbf[part] = cbf;
+            child_cr[part][..q].copy_from_slice(&self.scratch.cr_levels[..q]);
+        }
+
+        // The parent's flag is the OR of the children's: a clear one at depth 0
+        // tells the decoder to infer every child's as clear.
+        let cb_cbf = child_cb_cbf.iter().any(|&c| c);
+        let cr_cbf = child_cr_cbf.iter().any(|&c| c);
+        self.write_split_tu(
+            enc,
+            N,
+            LOG2,
+            mode,
+            chroma_mode,
+            chroma_tskip,
+            true,
+            cb_cbf,
+            cr_cbf,
+            &child_cbf,
+            &child_levels,
+            &child_cb_cbf,
+            &child_cr_cbf,
+            &child_cb,
+            &child_cr,
+            &[],
+            &[],
+        );
+        self.last_cu_empty = !(child_cbf.iter().any(|&c| c) || cb_cbf || cr_cbf);
+        let bits = enc.bit_count() - before;
+        self.region_ssd(x, y, N) + self.lambda * bits as f64
+    }
+
     fn code_cu_2nx2n(
         &mut self,
         x: usize,
@@ -664,6 +777,9 @@ impl<'a> CtuEncoder<'a> {
         depth: u8,
         enc: &mut CabacEncoder,
     ) -> f64 {
+        if log2 > 5 {
+            return self.code_cu_64(x, y, depth, enc);
+        }
         let n = 1usize << log2;
         // Transform skip is a per-block flag the decoder reads for every 4x4
         // residual once the picture parameter set enables it, so the decision
@@ -723,10 +839,10 @@ impl<'a> CtuEncoder<'a> {
 
             let half = n / 2;
             let offsets = [(0usize, 0usize), (half, 0), (0, half), (half, half)];
-            let mut child_levels = [[0i32; 256]; 4];
+            let mut child_levels = [[0i32; 1024]; 4];
             let mut child_cbf = [false; 4];
-            let mut child_cb = [[0i32; 64]; 4];
-            let mut child_cr = [[0i32; 64]; 4];
+            let mut child_cb = [[0i32; 256]; 4];
+            let mut child_cr = [[0i32; 256]; 4];
             let mut child_cb_cbf = [false; 4];
             let mut child_cr_cbf = [false; 4];
             for (part, &(dx, dy)) in offsets.iter().enumerate() {
@@ -956,11 +1072,11 @@ impl<'a> CtuEncoder<'a> {
         cb_cbf: bool,
         cr_cbf: bool,
         child_cbf: &[bool; 4],
-        child_levels: &[[i32; 256]; 4],
+        child_levels: &[[i32; 1024]; 4],
         child_cb_cbf: &[bool; 4],
         child_cr_cbf: &[bool; 4],
-        child_cb: &[[i32; 64]; 4],
-        child_cr: &[[i32; 64]; 4],
+        child_cb: &[[i32; 256]; 4],
+        child_cr: &[[i32; 256]; 4],
         parent_cb: &[i32],
         parent_cr: &[i32],
     ) {
