@@ -51,7 +51,7 @@ const INTRA_MODES: usize = 13;
 
 /// `Intra_Mode_Context` (spec 9.3): the five-way class each intra mode puts
 /// its neighbours in when they pick the CDF for the next block's mode.
-const INTRA_MODE_CTX: [usize; INTRA_MODES] = [0, 1, 2, 3, 4, 4, 4, 4, 3, 0, 1, 2, 0];
+pub(crate) const INTRA_MODE_CTX: [usize; INTRA_MODES] = [0, 1, 2, 3, 4, 4, 4, 4, 3, 0, 1, 2, 0];
 
 /// The symbol an angle delta of zero codes as: the alphabet runs from -3 to
 /// +3, so `MAX_ANGLE_DELTA` is the middle of it.
