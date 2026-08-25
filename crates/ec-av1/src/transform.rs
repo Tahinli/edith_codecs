@@ -342,3 +342,367 @@ pub fn dequant_and_inverse(levels: &[i32], side: usize, bit_depth: u8, q_idx: i3
     let dq = crate::quant::dequant(levels, side, bit_depth, q_idx);
     inverse_transform_2d(&dq, side, bit_depth)
 }
+
+/// The orthonormal DCT-II basis row for output `u` of an `n`-point transform.
+///
+/// The decoder's network is this basis scaled by a constant the encoder has to
+/// undo, and nothing else: measuring the network's response to a unit
+/// coefficient at every size gives the same `1 / (8 * sqrt(2))` per unit of
+/// `dqDenom`, which is what [`forward_transform_2d`] divides out.
+fn dct_basis(n: usize) -> Vec<f64> {
+    let mut basis = vec![0.0f64; n * n];
+    let scale = (2.0 / n as f64).sqrt();
+    for u in 0..n {
+        let alpha = if u == 0 { 1.0 / 2.0f64.sqrt() } else { 1.0 };
+        for i in 0..n {
+            let angle = std::f64::consts::PI * (2.0 * i as f64 + 1.0) * u as f64 / (2.0 * n as f64);
+            basis[u * n + i] = alpha * scale * angle.cos();
+        }
+    }
+    basis
+}
+
+/// How much the decoder's inverse transform shrinks an orthonormal DCT.
+///
+/// Measured, not asserted: feeding a single dequantized coefficient through
+/// `inverse_transform_2d` reproduces the orthonormal basis function scaled by
+/// `dq_denom(side) / 8` at every size (see `the_inverse_network_is_an_orthonormal_dct_over_eight`).
+/// The dequantizer has already divided by `dq_denom`, so the two cancel and
+/// what an encoder owes a level is size-independent:
+/// `level = 8 * orthonormal(residual) / q`.
+///
+/// The spec fixes the decoder; the encoder is free in how it reaches the
+/// coefficients it sends, and this constant is the one thing the two ends have
+/// to agree on for a level to mean what the encoder thinks it means.
+const INVERSE_GAIN_RECIPROCAL: f64 = 8.0;
+
+/// The forward transform (encoder side, spec-free): the transpose of what the
+/// decoder's inverse does, so that `inverse_transform_2d` of the result
+/// reproduces `residual`.
+///
+/// AV1 specifies only the inverse transform. The encoder may reach its
+/// coefficients however it likes, and this reaches them the direct way — an
+/// orthonormal DCT-II in double precision, scaled to the decoder's fixed-point
+/// gain. It is deterministic, and its accuracy is measured against the
+/// decoder's own inverse rather than asserted.
+pub fn forward_transform_2d(residual: &[i32], side: usize) -> Vec<f64> {
+    assert_eq!(
+        residual.len(),
+        side * side,
+        "one residual sample per position"
+    );
+    let basis = dct_basis(side);
+    // Rows first, into a scratch of the same shape, then columns.
+    let mut rows = vec![0.0f64; side * side];
+    for i in 0..side {
+        for u in 0..side {
+            let mut sum = 0.0;
+            for j in 0..side {
+                sum += f64::from(residual[i * side + j]) * basis[u * side + j];
+            }
+            rows[i * side + u] = sum;
+        }
+    }
+    let mut out = vec![0.0f64; side * side];
+    for u in 0..side {
+        for v in 0..side {
+            let mut sum = 0.0;
+            for i in 0..side {
+                sum += rows[i * side + v] * basis[u * side + i];
+            }
+            out[u * side + v] = sum;
+        }
+    }
+    let scale = INVERSE_GAIN_RECIPROCAL;
+    for v in &mut out {
+        *v *= scale;
+    }
+    out
+}
+
+/// Quantize forward-transform coefficients into the levels the tile syntax
+/// carries.
+///
+/// `deadzone` is the fraction of a quantizer step a coefficient has to reach
+/// before it is coded at all, as a rounding offset: 0.5 rounds to nearest,
+/// smaller values pull coefficients toward zero, which is what buys the rate
+/// back on noisy content. A 64-point transform only carries its top-left
+/// 32x32, so everything outside that is dropped here rather than silently by
+/// the writer.
+pub fn quantize(coeffs: &[f64], side: usize, bit_depth: u8, q_idx: i32, deadzone: f64) -> Vec<i32> {
+    assert_eq!(coeffs.len(), side * side, "one coefficient per position");
+    let dc = f64::from(crate::quant::dc_q(bit_depth, q_idx));
+    let ac = f64::from(crate::quant::ac_q(bit_depth, q_idx));
+    let mut levels = vec![0i32; side * side];
+    for (i, &c) in coeffs.iter().enumerate() {
+        let (row, col) = (i / side, i % side);
+        if row >= 32 || col >= 32 {
+            continue;
+        }
+        let q = if i == 0 { dc } else { ac };
+        let scaled = c / q;
+        let magnitude = scaled.abs() + deadzone;
+        let level = if magnitude < 1.0 {
+            0
+        } else {
+            magnitude.floor().min(f64::from(i32::MAX)) as i32
+        };
+        levels[i] = if scaled < 0.0 { -level } else { level };
+    }
+    levels
+}
+
+/// Transform and quantize one block's residual, the encoder's half of the
+/// round trip [`dequant_and_inverse`] completes.
+pub fn forward_and_quantize(
+    residual: &[i32],
+    side: usize,
+    bit_depth: u8,
+    q_idx: i32,
+    deadzone: f64,
+) -> Vec<i32> {
+    let coeffs = forward_transform_2d(residual, side);
+    quantize(&coeffs, side, bit_depth, q_idx, deadzone)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The orthonormal DCT-II basis the forward transform is written against,
+    /// computed independently of `dct_basis` so a test is not checking a
+    /// function against itself.
+    fn reference_basis(n: usize) -> Vec<f64> {
+        let mut c = vec![0.0; n * n];
+        for u in 0..n {
+            let alpha = if u == 0 { (0.5f64).sqrt() } else { 1.0 };
+            for x in 0..n {
+                let angle =
+                    (2.0 * x as f64 + 1.0) * u as f64 * std::f64::consts::PI / (2.0 * n as f64);
+                c[u * n + x] = alpha * (2.0 / n as f64).sqrt() * angle.cos();
+            }
+        }
+        c
+    }
+
+    /// A deterministic pseudo-random residual in `-100..=100`.
+    fn noise(len: usize, seed: u64) -> Vec<i32> {
+        let mut state = seed;
+        (0..len)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                ((state >> 33) % 201) as i32 - 100
+            })
+            .collect()
+    }
+
+    fn rmse(a: &[i32], b: &[i32]) -> f64 {
+        let sum: f64 = a
+            .iter()
+            .zip(b)
+            .map(|(&x, &y)| f64::from(x - y) * f64::from(x - y))
+            .sum();
+        (sum / a.len() as f64).sqrt()
+    }
+
+    /// The one thing the encoder and the decoder have to agree on.
+    ///
+    /// The spec's inverse network is not documented as a scaled orthonormal
+    /// DCT, so this measures it: each dequantized coefficient, on its own,
+    /// comes back out as its orthonormal basis function scaled by
+    /// `dq_denom(side) / 8` — the same factor for every coefficient of a
+    /// size, which is what makes a single constant enough for the encoder.
+    /// The fit is checked as well as the scale, so an inverse that scaled
+    /// right but mixed positions apart could not pass.
+    #[test]
+    fn the_inverse_network_is_an_orthonormal_dct_over_eight() {
+        for &side in &[4usize, 8, 16, 32, 64] {
+            let basis = reference_basis(side);
+            for &(u, v) in &[(0usize, 0usize), (0, 1), (1, 0), (2, 3), (5, 7)] {
+                if u >= side || v >= side {
+                    continue;
+                }
+                let mut coeffs = vec![0i32; side * side];
+                coeffs[u * side + v] = 4096;
+                let got = inverse_transform_2d(&coeffs, side, 8);
+                let want: Vec<f64> = (0..side * side)
+                    .map(|i| 4096.0 * basis[u * side + i / side] * basis[v * side + i % side])
+                    .collect();
+                // Least-squares fit of one scale over the whole block.
+                let num: f64 = want.iter().zip(&got).map(|(w, &g)| w * f64::from(g)).sum();
+                let den: f64 = want.iter().map(|w| w * w).sum();
+                let k = num / den;
+                let expected = crate::quant::dq_denom(side) as f64 / 8.0;
+                assert!(
+                    (k - expected).abs() < 0.01 * expected,
+                    "{side}x{side} ({u},{v}): gain {k}, expected {expected}"
+                );
+                // And the block really is that basis function, not merely a
+                // block of the same energy: no sample off by more than one.
+                for (i, (w, &g)) in want.iter().zip(&got).enumerate() {
+                    let scaled = k * w;
+                    assert!(
+                        (scaled - f64::from(g)).abs() <= 1.0,
+                        "{side}x{side} ({u},{v}) sample {i}: {g} vs {scaled}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A fine quantizer costs almost nothing: forward, quantize, dequantize
+    /// and invert returns the residual to within a sample or two at every
+    /// transform size the spec's DCT covers.
+    ///
+    /// 64x64 is excluded here because it cannot carry a white-noise residual
+    /// at all — see
+    /// [`a_64x64_transform_keeps_what_fits_in_its_coded_quarter`].
+    #[test]
+    fn a_fine_quantizer_roundtrips_a_residual_almost_exactly() {
+        for &side in &[4usize, 8, 16, 32] {
+            let residual = noise(side * side, 12_345 + side as u64);
+            let levels = forward_and_quantize(&residual, side, 8, 10, 0.5);
+            let back = dequant_and_inverse(&levels, side, 8, 10);
+            let error = rmse(&back, &residual);
+            assert!(error < 1.0, "{side}x{side}: rmse {error}");
+        }
+    }
+
+    /// Error grows with the quantizer and with nothing else. A calibration
+    /// that is off by a constant factor shows up here as a floor that a finer
+    /// quantizer cannot get under — which is exactly what a wrong gain
+    /// constant produced while this was being written.
+    #[test]
+    fn the_roundtrip_error_is_the_quantizer_and_only_the_quantizer() {
+        for &side in &[4usize, 8, 16, 32] {
+            let residual = noise(side * side, 999 + side as u64);
+            let mut previous = 0.0;
+            for &q_idx in &[10i32, 60, 100, 180] {
+                let levels = forward_and_quantize(&residual, side, 8, q_idx, 0.5);
+                let back = dequant_and_inverse(&levels, side, 8, q_idx);
+                let error = rmse(&back, &residual);
+                assert!(
+                    error > previous,
+                    "{side}x{side} q {q_idx}: {error} <= {previous}"
+                );
+                // A quantizer step is q/8 in residual units, and rounding to
+                // nearest costs no more than half a step per coefficient.
+                let step = f64::from(crate::quant::ac_q(8, q_idx)) / 8.0;
+                assert!(
+                    error < step,
+                    "{side}x{side} q {q_idx}: rmse {error}, step {step}"
+                );
+                previous = error;
+            }
+        }
+    }
+
+    /// A 64x64 transform codes only its top-left 32x32 coefficients, so it
+    /// keeps everything below half the Nyquist rate in each direction and
+    /// drops the rest. A band-limited residual survives it; white noise loses
+    /// the three quarters of its energy that live outside the coded quarter,
+    /// and that loss is the transform's, not the quantizer's — it does not
+    /// move when the quantizer does.
+    #[test]
+    fn a_64x64_transform_keeps_what_fits_in_its_coded_quarter() {
+        let side = 64;
+        // Band-limited: built from basis functions inside the coded quarter.
+        let basis = reference_basis(side);
+        let mut smooth = vec![0.0f64; side * side];
+        for &(u, v, amplitude) in &[(0usize, 0usize, 900.0f64), (1, 2, 400.0), (9, 30, 250.0)] {
+            for i in 0..side * side {
+                smooth[i] += amplitude * basis[u * side + i / side] * basis[v * side + i % side];
+            }
+        }
+        let smooth: Vec<i32> = smooth.iter().map(|&s| s.round() as i32).collect();
+        let levels = forward_and_quantize(&smooth, side, 8, 10, 0.5);
+        let back = dequant_and_inverse(&levels, side, 8, 10);
+        let kept = rmse(&back, &smooth);
+        assert!(kept < 1.5, "band-limited 64x64: rmse {kept}");
+
+        let residual = noise(side * side, 4_242);
+        let mut errors = Vec::new();
+        for &q_idx in &[10i32, 180] {
+            let levels = forward_and_quantize(&residual, side, 8, q_idx, 0.5);
+            let back = dequant_and_inverse(&levels, side, 8, q_idx);
+            errors.push(rmse(&back, &residual));
+        }
+        // Three quarters of a white-noise block's energy is outside the coded
+        // quarter, so the error is sqrt(3/4) of the residual's own magnitude
+        // whatever the quantizer does.
+        let magnitude = rmse(&residual, &vec![0; side * side]);
+        for error in &errors {
+            let ratio = error / magnitude;
+            assert!(
+                (ratio - 0.75f64.sqrt()).abs() < 0.05,
+                "64x64 white noise: ratio {ratio}"
+            );
+        }
+        assert!(
+            (errors[1] - errors[0]).abs() < 0.05 * errors[0],
+            "64x64 white noise moved with the quantizer: {errors:?}"
+        );
+    }
+
+    /// The deadzone pulls coefficients toward zero: a wider one codes fewer
+    /// of them and costs more error, and rounding to nearest is the tightest
+    /// of them.
+    #[test]
+    fn a_wider_deadzone_codes_fewer_coefficients() {
+        let side = 16;
+        let residual = noise(side * side, 77);
+        let mut previous_nonzero = usize::MAX;
+        let mut previous_error = 0.0;
+        for &deadzone in &[0.5f64, 0.35, 0.2] {
+            let levels = forward_and_quantize(&residual, side, 8, 100, deadzone);
+            let back = dequant_and_inverse(&levels, side, 8, 100);
+            let nonzero = levels.iter().filter(|&&l| l != 0).count();
+            let error = rmse(&back, &residual);
+            assert!(
+                nonzero < previous_nonzero,
+                "deadzone {deadzone}: {nonzero} coefficients"
+            );
+            assert!(error > previous_error, "deadzone {deadzone}: rmse {error}");
+            previous_nonzero = nonzero;
+            previous_error = error;
+        }
+    }
+
+    /// Negating a residual negates its levels: the forward transform carries
+    /// no offset of its own.
+    #[test]
+    fn negating_the_residual_negates_every_level() {
+        for &side in &[4usize, 32] {
+            let residual = noise(side * side, 5_150 + side as u64);
+            let negated: Vec<i32> = residual.iter().map(|&r| -r).collect();
+            let levels = forward_and_quantize(&residual, side, 8, 100, 0.5);
+            let other = forward_and_quantize(&negated, side, 8, 100, 0.5);
+            for (i, (a, b)) in levels.iter().zip(&other).enumerate() {
+                assert_eq!(*a, -*b, "{side}x{side} coefficient {i}");
+            }
+        }
+    }
+
+    /// A flat residual is a DC level and nothing else, at the value the
+    /// dequantizer's own arithmetic asks for.
+    #[test]
+    fn a_flat_residual_is_a_dc_level_alone() {
+        for &side in &[4usize, 8, 16, 32, 64] {
+            let residual = vec![40i32; side * side];
+            let levels = forward_and_quantize(&residual, side, 8, 100, 0.5);
+            for (i, &level) in levels.iter().enumerate() {
+                if i == 0 {
+                    // level = 8 * (40 * side) / dc_q, the orthonormal DC of a
+                    // flat block being its value times the side.
+                    let want = (8.0 * 40.0 * side as f64 / f64::from(crate::quant::dc_q(8, 100)))
+                        .round() as i32;
+                    assert_eq!(level, want, "{side}x{side} DC");
+                } else {
+                    assert_eq!(level, 0, "{side}x{side} coefficient {i}");
+                }
+            }
+        }
+    }
+}
