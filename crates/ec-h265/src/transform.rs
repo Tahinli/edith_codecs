@@ -217,6 +217,9 @@ pub fn forward_transform(residual: &[i32], coeffs: &mut [i32], n: usize, dst_typ
     }
 }
 
+/// `bdShift` (8-299) at 8-bit: 20 - BitDepth.
+const BD_SHIFT: i32 = 12;
+
 /// Inverse transform of scaled coefficients into residual samples, exactly as
 /// clause 8.6.4 specifies including its intermediate clipping.
 pub fn inverse_transform(scaled: &[i32], residual: &mut [i32], n: usize, dst_type: bool) {
@@ -252,7 +255,6 @@ pub fn inverse_transform(scaled: &[i32], residual: &mut [i32], n: usize, dst_typ
         }
     }
     // Stage 2: every row, then the bit-depth shift (8-299).
-    const BD_SHIFT: i32 = 12; // 20 - bitDepth, 8-bit
     let round = 1 << (BD_SHIFT - 1);
     for y in 0..n {
         col[..n].copy_from_slice(&e[y * n..y * n + n]);
@@ -268,6 +270,32 @@ pub fn inverse_transform(scaled: &[i32], residual: &mut [i32], n: usize, dst_typ
         for x in 0..n {
             residual[y * n + x] = (out[x] + round) >> BD_SHIFT;
         }
+    }
+}
+
+/// Forward transform skip (8.6.2): no transform at all, the residual samples
+/// standing in for coefficients.
+///
+/// The decoder scales what it reads by `tsShift = 5 + Log2(nTbS)` and then
+/// takes the bit-depth shift of 20 - 8 off it again, so a coefficient has to
+/// carry the residual scaled by the difference for the round trip to return
+/// the sample it started from — a factor of 32 at 4x4, the same gain the
+/// integer transform leaves behind.
+pub fn forward_transform_skip(residual: &[i32], coeffs: &mut [i32], n: usize) {
+    let shift = BD_SHIFT - (5 + n.trailing_zeros() as i32);
+    for (i, &r) in residual[..n * n].iter().enumerate() {
+        coeffs[i] = r << shift;
+    }
+}
+
+/// Inverse transform skip (8.6.2): the scaled coefficient shifted up by
+/// `tsShift` and then down by the bit-depth shift, exactly as the decoder
+/// does it, so the encoder reconstructs the samples the decoder will.
+pub fn inverse_transform_skip(scaled: &[i32], residual: &mut [i32], n: usize) {
+    let ts_shift = 5 + n.trailing_zeros() as i32;
+    let round = 1i32 << (BD_SHIFT - 1);
+    for (i, &d) in scaled[..n * n].iter().enumerate() {
+        residual[i] = ((d.clamp(COEFF_MIN, COEFF_MAX) << ts_shift) + round) >> BD_SHIFT;
     }
 }
 
@@ -487,6 +515,23 @@ mod tests {
                     .unwrap();
                 assert!(worst <= 3, "n={n} dst={dst}: worst {worst}");
             }
+        }
+    }
+
+    /// Transform skip is only a pair of shifts, so the pair has to be exact:
+    /// what the encoder writes as a coefficient must come back as the residual
+    /// sample it started from, for every sample an 8-bit residual can hold.
+    #[test]
+    fn transform_skip_round_trips_every_residual_sample() {
+        let residual: Vec<i32> = (-255..=255).collect();
+        for chunk in residual.chunks(16) {
+            let mut block = [0i32; 16];
+            block[..chunk.len()].copy_from_slice(chunk);
+            let mut coeffs = [0i32; 16];
+            forward_transform_skip(&block, &mut coeffs, 4);
+            let mut back = [0i32; 16];
+            inverse_transform_skip(&coeffs, &mut back, 4);
+            assert_eq!(back, block, "transform skip is not its own inverse");
         }
     }
 

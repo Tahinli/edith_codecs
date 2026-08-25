@@ -225,12 +225,21 @@ fn levels_bits(
     scan_idx: usize,
     cbf_ctx: usize,
     coded: bool,
+    transform_skip: bool,
 ) -> u64 {
     enc.restore(base);
     let before = enc.bit_count();
     enc.encode_bin(cbf_ctx, u32::from(coded));
     if coded {
-        encode_residual(enc, levels, log2_size, c_idx, scan_idx, false);
+        encode_residual(
+            enc,
+            levels,
+            log2_size,
+            c_idx,
+            scan_idx,
+            false,
+            transform_skip,
+        );
     }
     enc.bit_count() - before
 }
@@ -257,6 +266,7 @@ pub fn rdoq(
     scan_idx: usize,
     cbf_ctx: usize,
     lambda: f64,
+    transform_skip: bool,
     enc: &mut CabacEncoder,
 ) -> usize {
     let log2_size = n.trailing_zeros();
@@ -270,7 +280,15 @@ pub fn rdoq(
 
     let mut dist: f64 = (0..n * n).map(|i| err(levels[i], coeffs[i])).sum();
     let bits = levels_bits(
-        enc, &base, levels, log2_size, c_idx, scan_idx, cbf_ctx, true,
+        enc,
+        &base,
+        levels,
+        log2_size,
+        c_idx,
+        scan_idx,
+        cbf_ctx,
+        true,
+        transform_skip,
     );
     let mut cost = scale * dist + lambda * bits as f64;
 
@@ -302,8 +320,17 @@ pub fn rdoq(
             levels[i] = candidate * level.signum();
             let trial_dist = dist - err(keep, coeffs[i]) + err(levels[i], coeffs[i]);
             let any = levels[..n * n].iter().any(|&l| l != 0);
-            let trial_bits =
-                levels_bits(enc, &base, levels, log2_size, c_idx, scan_idx, cbf_ctx, any);
+            let trial_bits = levels_bits(
+                enc,
+                &base,
+                levels,
+                log2_size,
+                c_idx,
+                scan_idx,
+                cbf_ctx,
+                any,
+                transform_skip,
+            );
             let trial = scale * trial_dist + lambda * trial_bits as f64;
             if trial < cost {
                 cost = trial;
@@ -317,7 +344,15 @@ pub fn rdoq(
     // as every level, which no single-coefficient step can see.
     let zero_dist: f64 = (0..n * n).map(|i| err(0, coeffs[i])).sum();
     let zero_bits = levels_bits(
-        enc, &base, levels, log2_size, c_idx, scan_idx, cbf_ctx, false,
+        enc,
+        &base,
+        levels,
+        log2_size,
+        c_idx,
+        scan_idx,
+        cbf_ctx,
+        false,
+        transform_skip,
     );
     if scale * zero_dist + lambda * zero_bits as f64 <= cost {
         levels[..n * n].fill(0);
@@ -340,7 +375,12 @@ pub fn encode_residual(
     c_idx: usize,
     scan_idx: usize,
     sign_hiding: bool,
+    transform_skip: bool,
 ) {
+    if transform_skip && log2_size == 2 {
+        let ctx_idx = ctx::TRANSFORM_SKIP + if c_idx == 0 { 0 } else { 1 };
+        enc.encode_bin(ctx_idx, 1);
+    }
     let n = 1usize << log2_size;
     let sub_wide = n >> 2;
     let sub_scan = scan(log2_size - 2, scan_idx);
@@ -698,7 +738,7 @@ mod tests {
         let mut costs = Vec::new();
         for levels in [&sparse, &dense] {
             let mut enc = CabacEncoder::counter(Contexts::new(30));
-            encode_residual(&mut enc, levels, 3, 0, 0, false);
+            encode_residual(&mut enc, levels, 3, 0, 0, false, false);
             costs.push(enc.bit_count());
         }
         assert!(costs[0] < costs[1], "{costs:?}");
@@ -724,7 +764,7 @@ mod tests {
                         };
                     }
                     let mut enc = CabacEncoder::counter(Contexts::new(27));
-                    encode_residual(&mut enc, &levels, log2, c_idx, scan_idx, false);
+                    encode_residual(&mut enc, &levels, log2, c_idx, scan_idx, false, false);
                     assert!(enc.bit_count() > 0);
                 }
             }
