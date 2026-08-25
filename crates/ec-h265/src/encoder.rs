@@ -144,6 +144,17 @@ pub struct EncoderConfig {
     /// cost more than the signs save. Worth re-measuring once RDOQ lands: that
     /// is where the gain in other encoders comes from.
     pub sign_hiding: bool,
+
+    /// Whether quantised levels get a rate-distortion search (RDOQ) that
+    /// offers each small level the magnitudes below it and takes one when the
+    /// squared error it gives up costs less than the bits it saves.
+    ///
+    /// On: worth +0.122 dB BD-PSNR on a 2560x1440 screen capture (-0.479 ->
+    /// -0.357 against x265) and +0.114 dB on 1080p film (+0.246 -> +0.360),
+    /// with the all-plane figures moving the same way. The rate is the CABAC
+    /// coder's own price for the whole block, so dropping a level is priced
+    /// with the significance map and last position that follow from it.
+    pub rdoq: bool,
     /// What the samples mean, written into the VUI.
     pub video_signal_type: Option<VideoSignalType>,
     /// Sample aspect ratio.
@@ -174,6 +185,7 @@ impl EncoderConfig {
             min_cu_size: 8,
             intra_nxn: true,
             sign_hiding: false,
+            rdoq: true,
             video_signal_type: None,
             sample_aspect_ratio: None,
             timing: None,
@@ -551,6 +563,7 @@ impl Encoder {
                             self.cfg.chroma_rd_weight,
                             self.cfg.intra_nxn,
                             self.cfg.sign_hiding,
+                            self.cfg.rdoq,
                             self.cfg.min_cu_size.max(8).trailing_zeros(),
                         );
                         for col in 0..cols {
