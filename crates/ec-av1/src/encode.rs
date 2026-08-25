@@ -1,11 +1,13 @@
 //! A key-frame picture encoder: a planar 4:2:0 picture in, an AV1 stream out.
 //!
-//! This is the layer that turns the pieces below it — DC intra prediction, the
-//! forward transform and quantizer of [`crate::transform`], and the tile writer
-//! of [`crate::tile`] — into something that takes a picture. Every block is
-//! DC-predicted and 32x32 (its chroma 16x16), which is the subset the tile
-//! writer codes; block sizes, transform types and mode decision are what a
-//! rate-distortion loop above this would choose between.
+//! This is the layer that turns the pieces below it — the intra predictors of
+//! [`crate::intra`], the forward transform and quantizer of
+//! [`crate::transform`], and the tile writer of [`crate::tile`] — into
+//! something that takes a picture. Every block is 32x32 (its chroma 16x16),
+//! which is the subset the tile writer codes, and each one picks its luma mode
+//! from the seven non-directional ones by rate-distortion; chroma is predicted
+//! DC, which is the mode the tile writer codes for it. Block sizes and
+//! transform types are what a loop above this would choose between.
 //!
 //! The encoder carries its own reconstruction, because prediction reads it: a
 //! block predicts from the reconstructed samples above and to its left, exactly
@@ -20,13 +22,26 @@ use ec_av1_syntax::{
 use ec_core::{Error, Result};
 
 use crate::frame::frame_obu;
+use crate::intra::{DC_PRED, NON_DIRECTIONAL};
 use crate::obu::temporal_delimiter;
+use crate::quant::ac_q;
 use crate::sequence::sequence_header_obu;
 use crate::tile::{BlockCoeffs, Coeff, Superblock, sb_coeff_key_frame_tile};
 use crate::transform::{dequant_and_inverse, forward_and_quantize};
 
 /// The side of the luma blocks this encoder codes, in samples.
 const BLOCK: usize = 32;
+
+/// How heavily the mode search weighs rate against squared error, in units of
+/// the quantizer's reconstruction step squared per bit.
+///
+/// Swept over three clips and two synthetic pictures at 0, 0.05, 0.1, 0.2, 0.4
+/// and 0.8 (`probe_lambda`, and the table in the lane report): 0 leaves half the
+/// saving on the table on a picture that runs one way (-35.6% against -59.5% on
+/// stripes), and everything from 0.1 up gives a little back on screen capture
+/// (-10.7% against -11.5%) and on a hand-held clip. 0.05 is the best point on
+/// every clip measured.
+const LAMBDA_SCALE: f64 = 0.05;
 
 /// One 8-bit planar 4:2:0 picture.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -87,6 +102,9 @@ pub struct Encoded {
     /// What a decoder will produce from `stream` — the encoder's own
     /// reconstruction, which its prediction was built on.
     pub reconstruction: Picture,
+    /// The luma intra mode each block was coded under, in the order the blocks
+    /// are coded — raster order among the quadrants of each superblock.
+    pub modes: Vec<u8>,
 }
 
 /// The sequence and frame headers a picture of this size is coded under: one
@@ -204,27 +222,6 @@ fn too_large() -> Error {
     )
 }
 
-/// `dc_predict` (spec 7.11.2): the average of the reconstructed row above and
-/// the reconstructed column to the left, of whichever of them exists.
-fn dc_predict(above: Option<&[u8]>, left: Option<&[u8]>) -> u8 {
-    match (above, left) {
-        (None, None) => 128,
-        (Some(a), None) => {
-            let sum: u32 = a.iter().map(|&s| u32::from(s)).sum();
-            ((sum + (a.len() as u32 >> 1)) / a.len() as u32) as u8
-        }
-        (None, Some(l)) => {
-            let sum: u32 = l.iter().map(|&s| u32::from(s)).sum();
-            ((sum + (l.len() as u32 >> 1)) / l.len() as u32) as u8
-        }
-        (Some(a), Some(l)) => {
-            let sum: u32 = a.iter().chain(l).map(|&s| u32::from(s)).sum();
-            let count = (a.len() + l.len()) as u32;
-            ((sum + (count >> 1)) / count) as u8
-        }
-    }
-}
-
 /// One plane of the picture being coded, and the reconstruction being built
 /// beside it.
 struct Plane<'a> {
@@ -235,51 +232,165 @@ struct Plane<'a> {
 }
 
 impl Plane<'_> {
-    /// Codes one block: predicts it from the reconstruction, transforms and
-    /// quantizes what is left, writes the reconstruction back and hands the
-    /// levels to the caller.
-    fn code_block(
-        &mut self,
+    /// The reconstructed samples a block at `(x, y)` predicts from: the row
+    /// above it, the column to its left and the sample between them, each
+    /// missing where the block sits against an edge of the frame.
+    fn edges(
+        &self,
         x: usize,
         y: usize,
         side: usize,
-        base_q_idx: u8,
-        deadzone: f64,
-    ) -> Vec<Coeff> {
-        let above = (y > 0).then(|| &self.reconstruction[(y - 1) * self.width + x..][..side]);
+    ) -> (Option<Vec<u8>>, Option<Vec<u8>>, Option<u8>) {
+        let above =
+            (y > 0).then(|| self.reconstruction[(y - 1) * self.width + x..][..side].to_vec());
         let left = (x > 0).then(|| {
             (0..side)
                 .map(|i| self.reconstruction[(y + i) * self.width + x - 1])
                 .collect::<Vec<_>>()
         });
-        let prediction = i32::from(dc_predict(above, left.as_deref()));
+        let corner = (x > 0 && y > 0).then(|| self.reconstruction[(y - 1) * self.width + x - 1]);
+        (above, left, corner)
+    }
+
+    /// Codes one block under one mode without committing it: hands back the
+    /// levels, the block the decoder would reconstruct, the squared error
+    /// against the source and an estimate of what the levels cost in bits.
+    fn trial(
+        &self,
+        x: usize,
+        y: usize,
+        side: usize,
+        mode: u8,
+        base_q_idx: u8,
+        deadzone: f64,
+    ) -> Trial {
+        let (above, left, corner) = self.edges(x, y, side);
+        let mut prediction = vec![0u8; side * side];
+        crate::intra::predict(
+            mode,
+            above.as_deref(),
+            left.as_deref(),
+            corner,
+            side,
+            &mut prediction,
+        );
 
         let mut residual = vec![0i32; side * side];
         for row in 0..side {
             for col in 0..side {
                 residual[row * side + col] =
-                    i32::from(self.source[(y + row) * self.width + x + col]) - prediction;
+                    i32::from(self.source[(y + row) * self.width + x + col])
+                        - i32::from(prediction[row * side + col]);
             }
         }
         let levels = forward_and_quantize(&residual, side, 8, i32::from(base_q_idx), deadzone);
         let coded = dequant_and_inverse(&levels, side, 8, i32::from(base_q_idx));
+
+        let mut reconstruction = vec![0u8; side * side];
+        let mut sse = 0.0;
         for row in 0..side {
             for col in 0..side {
-                self.reconstruction[(y + row) * self.width + x + col] =
-                    (prediction + coded[row * side + col]).clamp(0, 255) as u8;
+                let i = row * side + col;
+                let sample = (i32::from(prediction[i]) + coded[i]).clamp(0, 255) as u8;
+                reconstruction[i] = sample;
+                let error = f64::from(
+                    i32::from(self.source[(y + row) * self.width + x + col]) - i32::from(sample),
+                );
+                sse += error * error;
             }
         }
-        levels
+        // What a level costs is close enough to its magnitude's width plus a
+        // sign and a run, which is all the search needs to rank modes.
+        let bits: f64 = levels
             .iter()
-            .enumerate()
-            .filter(|&(_, &level)| level != 0)
-            .map(|(i, &level)| Coeff {
-                row: (i / side) as u8,
-                col: (i % side) as u8,
-                level,
-            })
-            .collect()
+            .filter(|&&level| level != 0)
+            .map(|&level| 2.0 + 2.0 * f64::from(level.unsigned_abs() + 1).log2())
+            .sum();
+        Trial {
+            levels,
+            reconstruction,
+            sse,
+            bits,
+        }
     }
+
+    /// Writes a trial's reconstruction back into the plane.
+    fn commit(&mut self, x: usize, y: usize, side: usize, trial: &Trial) {
+        for row in 0..side {
+            self.reconstruction[(y + row) * self.width + x..][..side]
+                .copy_from_slice(&trial.reconstruction[row * side..][..side]);
+        }
+    }
+
+    /// Codes one block under a fixed mode, committing it.
+    fn code_block(
+        &mut self,
+        x: usize,
+        y: usize,
+        side: usize,
+        mode: u8,
+        base_q_idx: u8,
+        deadzone: f64,
+    ) -> Vec<Coeff> {
+        let trial = self.trial(x, y, side, mode, base_q_idx, deadzone);
+        self.commit(x, y, side, &trial);
+        coeffs(&trial.levels, side)
+    }
+
+    /// Codes one block under every mode the search offers and commits the one
+    /// whose squared error and estimated rate come out cheapest.
+    fn search_block(
+        &mut self,
+        x: usize,
+        y: usize,
+        side: usize,
+        search: &Search,
+    ) -> (Vec<Coeff>, u8) {
+        let mut best: Option<(f64, u8, Trial)> = None;
+        for &mode in search.modes {
+            let trial = self.trial(x, y, side, mode, search.base_q_idx, search.deadzone);
+            let cost = trial.sse + search.lambda * trial.bits;
+            if best
+                .as_ref()
+                .is_none_or(|(best_cost, _, _)| cost < *best_cost)
+            {
+                best = Some((cost, mode, trial));
+            }
+        }
+        let (_, mode, trial) = best.expect("the search offers at least one mode");
+        self.commit(x, y, side, &trial);
+        (coeffs(&trial.levels, side), mode)
+    }
+}
+
+/// What the luma mode search picks between, and under what terms.
+struct Search<'a> {
+    base_q_idx: u8,
+    deadzone: f64,
+    lambda: f64,
+    modes: &'a [u8],
+}
+
+/// One mode's coding of one block, before it is committed.
+struct Trial {
+    levels: Vec<i32>,
+    reconstruction: Vec<u8>,
+    sse: f64,
+    bits: f64,
+}
+
+/// The non-zero levels of a block, as the tile writer takes them.
+fn coeffs(levels: &[i32], side: usize) -> Vec<Coeff> {
+    levels
+        .iter()
+        .enumerate()
+        .filter(|&(_, &level)| level != 0)
+        .map(|(i, &level)| Coeff {
+            row: (i / side) as u8,
+            col: (i % side) as u8,
+            level,
+        })
+        .collect()
 }
 
 /// Encodes one picture as a key frame.
@@ -294,7 +405,38 @@ impl Plane<'_> {
 /// when its planes are not 4:2:0 of that size, or when the tile writer refuses
 /// the quantizer index.
 pub fn encode_key_frame(picture: &Picture, base_q_idx: u8, deadzone: f64) -> Result<Encoded> {
+    encode_key_frame_with_modes(picture, base_q_idx, deadzone, &NON_DIRECTIONAL)
+}
+
+/// Encodes one picture as a key frame, choosing each block's luma mode from
+/// `modes` alone.
+///
+/// This is what an ablation measures against: `&[DC_PRED]` is the encoder
+/// before the mode search, and [`NON_DIRECTIONAL`] is what
+/// [`encode_key_frame`] uses.
+///
+/// # Errors
+/// The same as [`encode_key_frame`], and additionally when `modes` is empty or
+/// names a mode [`crate::intra::predict`] does not predict.
+pub fn encode_key_frame_with_modes(
+    picture: &Picture,
+    base_q_idx: u8,
+    deadzone: f64,
+    modes: &[u8],
+) -> Result<Encoded> {
     picture.check()?;
+    if modes.is_empty() {
+        return Err(Error::unsupported(
+            "AV1 encode",
+            "a mode search needs at least one mode to choose from",
+        ));
+    }
+    if let Some(bad) = modes.iter().find(|m| !NON_DIRECTIONAL.contains(m)) {
+        return Err(Error::unsupported(
+            "AV1 encode",
+            format!("intra mode {bad} is not one the encoder predicts"),
+        ));
+    }
     let (seq, header) = key_frame_headers(picture.width, picture.height, base_q_idx)?;
 
     let mut luma = Plane {
@@ -318,9 +460,20 @@ pub fn encode_key_frame(picture: &Picture, base_q_idx: u8, deadzone: f64) -> Res
         },
     ];
 
+    // The search trades a bit for the squared error it saves, in the units the
+    // reconstruction is measured in: one step of the quantizer, squared.
+    let step = f64::from(ac_q(8, i32::from(base_q_idx))) / 8.0;
+    let search = Search {
+        base_q_idx,
+        deadzone,
+        lambda: LAMBDA_SCALE * step * step,
+        modes,
+    };
+
     let (cols, rows) = (picture.width / BLOCK, picture.height / BLOCK);
     let (sb_cols, sb_rows) = (cols.div_ceil(2), rows.div_ceil(2));
     let mut superblocks = Vec::with_capacity(sb_cols * sb_rows);
+    let mut modes = Vec::with_capacity(cols * rows);
     for sb_row in 0..sb_rows {
         for sb_col in 0..sb_cols {
             // The quadrants of a superblock are coded in the order the decoder
@@ -333,11 +486,15 @@ pub fn encode_key_frame(picture: &Picture, base_q_idx: u8, deadzone: f64) -> Res
                     continue;
                 }
                 let (x, y) = (col * BLOCK, row * BLOCK);
+                let (luma_coeffs, mode) = luma.search_block(x, y, BLOCK, &search);
+                modes.push(mode);
                 blocks.push(BlockCoeffs {
-                    luma: luma.code_block(x, y, BLOCK, base_q_idx, deadzone),
-                    u: chroma[0].code_block(x / 2, y / 2, BLOCK / 2, base_q_idx, deadzone),
-                    v: chroma[1].code_block(x / 2, y / 2, BLOCK / 2, base_q_idx, deadzone),
-                    mode: 0,
+                    // Chroma is predicted DC because that is the mode the tile
+                    // writer codes for it.
+                    u: chroma[0].code_block(x / 2, y / 2, BLOCK / 2, DC_PRED, base_q_idx, deadzone),
+                    v: chroma[1].code_block(x / 2, y / 2, BLOCK / 2, DC_PRED, base_q_idx, deadzone),
+                    luma: luma_coeffs,
+                    mode,
                 });
             }
             superblocks.push(Superblock::Split(blocks));
@@ -352,6 +509,7 @@ pub fn encode_key_frame(picture: &Picture, base_q_idx: u8, deadzone: f64) -> Res
     let [u, v] = chroma;
     Ok(Encoded {
         stream,
+        modes,
         reconstruction: Picture {
             width: luma.width,
             height: luma.height,
@@ -365,6 +523,7 @@ pub fn encode_key_frame(picture: &Picture, base_q_idx: u8, deadzone: f64) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::intra::{H_PRED, V_PRED};
     use std::io::Write;
     use std::process::{Command, Stdio};
 
@@ -485,6 +644,209 @@ mod tests {
         }
     }
 
+    /// One frame of a real clip, scaled to a whole number of 32x32 blocks.
+    fn clip_frame(clip: &str, skip: &str, width: usize, height: usize) -> Picture {
+        let out = Command::new("ffmpeg")
+            .args(["-v", "error", "-ss", skip, "-i", clip, "-frames:v", "1"])
+            .args(["-vf", &format!("scale={width}:{height}")])
+            .args(["-f", "rawvideo", "-pix_fmt", "yuv420p", "-"])
+            .output()
+            .expect("ffmpeg failed to run");
+        assert!(
+            out.status.success(),
+            "ffmpeg: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let (luma, chroma) = (width * height, width * height / 4);
+        assert_eq!(
+            out.stdout.len(),
+            luma + 2 * chroma,
+            "expected one 4:2:0 frame"
+        );
+        Picture {
+            width,
+            height,
+            y: out.stdout[..luma].to_vec(),
+            u: out.stdout[luma..luma + chroma].to_vec(),
+            v: out.stdout[luma + chroma..].to_vec(),
+        }
+    }
+
+    /// Prints what the mode search saves over DC prediction alone, for the
+    /// synthetic pictures and for whatever clips `EC_AV1_CLIPS` names, so the
+    /// weight the search puts on rate can be swept.
+    #[test]
+    #[ignore = "a sweep, not a gate"]
+    fn probe_lambda() {
+        let mut pictures = vec![
+            ("test card".to_string(), test_card(160, 96)),
+            ("stripes".to_string(), stripes(160, 96, true)),
+        ];
+        if let Ok(clips) = std::env::var("EC_AV1_CLIPS") {
+            for entry in clips.split(':').filter(|e| !e.is_empty()) {
+                let (path, skip) = entry.split_once('@').unwrap_or((entry, "0"));
+                let name = path.rsplit('/').next().unwrap_or(path).to_string();
+                pictures.push((name, clip_frame(path, skip, 640, 352)));
+            }
+        }
+        for (name, picture) in pictures {
+            let dc = ladder(&picture, &[DC_PRED]);
+            let searched = ladder(&picture, &NON_DIRECTIONAL);
+            println!(
+                "{name}: {:+.1}% rate against DC alone, {:.0}B/{:.2}dB against {:.0}B/{:.2}dB at the middle point",
+                bd_rate(&dc, &searched) * 100.0,
+                10f64.powf(searched[1].1),
+                searched[1].0,
+                10f64.powf(dc[1].1),
+                dc[1].0,
+            );
+        }
+    }
+
+    /// A striped picture, running one way or the other. The stripes are what
+    /// separates a vertical predictor from a horizontal one: a mode search
+    /// reading a transposed edge would pick the wrong one of the pair, which no
+    /// symmetric picture would show.
+    fn stripes(width: usize, height: usize, vertical: bool) -> Picture {
+        let mut picture = Picture::grey(width, height);
+        for y in 0..height {
+            for x in 0..width {
+                let along = if vertical { x } else { y };
+                picture.y[y * width + x] = if (along / 4) % 2 == 0 { 40 } else { 210 };
+            }
+        }
+        picture
+    }
+
+    /// Every mode the encoder offers has to predict what the decoder predicts,
+    /// not just the ones a particular picture happens to choose: each is forced
+    /// over a whole picture and the reconstruction gated against ffmpeg.
+    #[test]
+    fn every_mode_decodes_to_what_the_encoder_predicted() {
+        if !have_ffmpeg() {
+            eprintln!("SKIP every_mode_decodes_to_what_the_encoder_predicted: no ffmpeg");
+            return;
+        }
+        let picture = test_card(128, 96);
+        for mode in NON_DIRECTIONAL {
+            let encoded = encode_key_frame_with_modes(&picture, 100, 0.5, &[mode]).unwrap();
+            let decoded = ffmpeg_decode(&encoded.stream, 128, 96);
+            assert_eq!(decoded.y, encoded.reconstruction.y, "mode {mode}: luma");
+            assert_eq!(decoded.u, encoded.reconstruction.u, "mode {mode}: U");
+            assert_eq!(decoded.v, encoded.reconstruction.v, "mode {mode}: V");
+            assert!(
+                encoded.modes.iter().all(|&m| m == mode),
+                "mode {mode}: the encoder coded something else"
+            );
+        }
+    }
+
+    /// The search has to follow the picture: vertical stripes are cheapest
+    /// predicted from the row above, horizontal ones from the column to the
+    /// left. Reading the edges the other way round would swap the two answers
+    /// while leaving every fidelity gate intact.
+    #[test]
+    fn the_search_picks_the_direction_the_picture_runs() {
+        for (vertical, want) in [(true, V_PRED), (false, H_PRED)] {
+            let picture = stripes(128, 96, vertical);
+            let encoded = encode_key_frame(&picture, 100, 0.5).unwrap();
+            // The first block of the picture has neither neighbour, so it
+            // cannot tell the modes apart; every other one can.
+            let picked = encoded.modes[1..].iter().filter(|&&m| m == want).count();
+            assert!(
+                picked * 2 > encoded.modes.len() - 1,
+                "vertical={vertical}: only {picked} of {} blocks picked mode {want}, modes {:?}",
+                encoded.modes.len() - 1,
+                encoded.modes
+            );
+        }
+    }
+
+    /// What the search is for: the same picture, at the same quantizer, coded
+    /// smaller and more faithfully than DC alone can manage.
+    /// Rate saved at matched fidelity, over a three-point ladder: the trapezoid
+    /// between the two rate-distortion curves in log-rate against PSNR, as a
+    /// fraction of the reference's rate. Negative means the second curve costs
+    /// less for the same picture.
+    fn bd_rate(reference: &[(f64, f64)], other: &[(f64, f64)]) -> f64 {
+        let low = reference[0].0.max(other[0].0);
+        let high = reference[reference.len() - 1]
+            .0
+            .min(other[other.len() - 1].0);
+        assert!(high > low, "the two ladders have to overlap in PSNR");
+        let log_rate_at = |curve: &[(f64, f64)], psnr: f64| {
+            let i = curve
+                .windows(2)
+                .position(|w| psnr >= w[0].0 && psnr <= w[1].0)
+                .unwrap_or(0);
+            let (x0, y0) = curve[i];
+            let (x1, y1) = curve[i + 1];
+            y0 + (y1 - y0) * (psnr - x0) / (x1 - x0)
+        };
+        let steps = 64;
+        let mut area = 0.0;
+        for step in 0..steps {
+            let psnr = low + (high - low) * (f64::from(step) + 0.5) / f64::from(steps);
+            area += log_rate_at(other, psnr) - log_rate_at(reference, psnr);
+        }
+        10f64.powf(area / f64::from(steps)) - 1.0
+    }
+
+    /// A ladder of (luma PSNR, log10 bytes) for one mode set, ordered by
+    /// fidelity.
+    fn ladder(picture: &Picture, modes: &[u8]) -> Vec<(f64, f64)> {
+        let mut points: Vec<(f64, f64)> = [110u8, 90, 70]
+            .iter()
+            .map(|&q| {
+                let encoded = encode_key_frame_with_modes(picture, q, 0.5, modes).unwrap();
+                (
+                    psnr(&encoded.reconstruction.y, picture.y.as_slice()),
+                    (encoded.stream.len() as f64).log10(),
+                )
+            })
+            .collect();
+        points.sort_by(|a, b| a.0.total_cmp(&b.0));
+        points
+    }
+
+    /// What the search is for: the same pictures cost less to code at the same
+    /// fidelity than DC prediction alone can manage. A picture that runs one
+    /// way saves far more than a busy one, which is the shape a working
+    /// directional pair has.
+    #[test]
+    fn the_search_beats_dc_alone() {
+        for (name, picture, want) in [
+            ("test card", test_card(160, 96), -0.05),
+            ("stripes", stripes(160, 96, true), -0.40),
+        ] {
+            let saved = bd_rate(
+                &ladder(&picture, &[DC_PRED]),
+                &ladder(&picture, &NON_DIRECTIONAL),
+            );
+            assert!(
+                saved < want,
+                "{name}: the search saved {:.1}% of the rate, wanted at least {:.1}%",
+                saved * 100.0,
+                -want * 100.0
+            );
+        }
+    }
+
+    /// A mode the encoder cannot predict must be refused rather than coded as
+    /// something else, and a search with nothing to choose from likewise.
+    #[test]
+    fn a_mode_the_encoder_cannot_predict_is_refused() {
+        let picture = test_card(64, 64);
+        let message = encode_key_frame_with_modes(&picture, 100, 0.5, &[3])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("intra mode 3"),
+            "the refusal must name the mode, got {message}"
+        );
+        assert!(encode_key_frame_with_modes(&picture, 100, 0.5, &[]).is_err());
+    }
+
     /// The picture that comes back is the picture that went in, to within the
     /// quantizer. A prediction that read the wrong neighbours, or a block
     /// written into the wrong place, would still decode to what the encoder
@@ -602,30 +964,7 @@ mod tests {
         // A 4:2:0 frame cropped to whole 32x32 blocks, in a size that keeps the
         // test quick while still spanning many superblocks.
         let (width, height) = (640usize, 352usize);
-        let out = Command::new("ffmpeg")
-            .args(["-v", "error", "-ss", &skip, "-i", &clip, "-frames:v", "1"])
-            .args(["-vf", &format!("scale={width}:{height}")])
-            .args(["-f", "rawvideo", "-pix_fmt", "yuv420p", "-"])
-            .output()
-            .expect("ffmpeg failed to run");
-        assert!(
-            out.status.success(),
-            "ffmpeg: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let (luma, chroma) = (width * height, width * height / 4);
-        assert_eq!(
-            out.stdout.len(),
-            luma + 2 * chroma,
-            "expected one 4:2:0 frame"
-        );
-        let picture = Picture {
-            width,
-            height,
-            y: out.stdout[..luma].to_vec(),
-            u: out.stdout[luma..luma + chroma].to_vec(),
-            v: out.stdout[luma + chroma..].to_vec(),
-        };
+        let picture = clip_frame(&clip, &skip, width, height);
 
         let encoded = encode_key_frame(&picture, 100, 0.5).unwrap();
         let decoded = ffmpeg_decode(&encoded.stream, width, height);
