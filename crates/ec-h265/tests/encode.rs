@@ -435,6 +435,9 @@ fn bd_psnr_vs_x265() {
         if let Ok(w) = std::env::var("EC_H265_CHROMA_W") {
             cfg.chroma_rd_weight = w.parse().expect("EC_H265_CHROMA_W must be a number");
         }
+        if let Ok(v) = std::env::var("EC_H265_NXN") {
+            cfg.intra_nxn = v != "0";
+        }
         if let Ok(k) = std::env::var("EC_H265_RDO_CANDIDATES") {
             cfg.rdo_candidates = k.parse().expect("EC_H265_RDO_CANDIDATES must be a number");
         }
@@ -705,10 +708,34 @@ fn clip_sources(path: &std::ffi::OsStr, want: usize) -> (usize, usize, Vec<Plane
         .split_once(',')
         .and_then(|(w, h)| Some((w.parse::<usize>().ok()?, h.parse::<usize>().ok()?)))
         .expect("ffprobe returned dimensions");
+    // Pictures to pass over before sampling: the head of a film is titles and
+    // fades, which are not what a codec is measured on.
+    let skip: usize = std::env::var("EC_H265_CLIP_SKIP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    // Trim on ffmpeg's side, not ours. Asking for the whole file and slicing
+    // afterwards buffers the entire decoded clip in memory: a 1080p feature is
+    // hundreds of gigabytes of raw I420, which the kernel answers with the OOM
+    // killer. `select` drops the skipped pictures inside ffmpeg and
+    // `-frames:v` stops the decode once `want` have come out, so what reaches
+    // this process is exactly `want` frames.
     let raw = std::process::Command::new("ffmpeg")
         .args(["-v", "error", "-i"])
         .arg(path)
-        .args(["-f", "rawvideo", "-pix_fmt", "yuv420p", "pipe:1"])
+        .args([
+            "-vf",
+            &format!("select=gte(n\\,{skip})"),
+            "-fps_mode",
+            "passthrough",
+            "-frames:v",
+            &want.to_string(),
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "yuv420p",
+            "pipe:1",
+        ])
         .output()
         .expect("ffmpeg raw extract");
     assert!(
@@ -719,18 +746,13 @@ fn clip_sources(path: &std::ffi::OsStr, want: usize) -> (usize, usize, Vec<Plane
     let frame = w * h * 3 / 2;
     assert!(
         raw.stdout.len().is_multiple_of(frame) && raw.stdout.len() / frame >= want,
-        "clip {} yielded {} bytes, need {want}x{frame}",
+        "clip {} yielded {} bytes after skipping {skip}, need {want}x{frame}",
         path.to_string_lossy(),
         raw.stdout.len()
     );
-    let skip: usize = std::env::var("EC_H265_CLIP_SKIP")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
     let sources: Vec<Planes> = raw
         .stdout
         .chunks(frame)
-        .skip(skip)
         .take(want)
         .map(|f| {
             let (y, rest) = f.split_at(w * h);
