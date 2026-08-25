@@ -259,11 +259,6 @@ pub const UV_MODE_CFL_DC: [u16; 15] = [
 /// luma transform block that covers its whole plane block, which is context 0.
 pub const TXB_SKIP_LUMA_32: [u16; 3] = [30669, 32768, 0];
 
-/// `Default_Txb_Skip_Cdf[2][2][7]` (spec 9.4): the all-zero flag of a 16x16
-/// chroma transform block that covers its whole plane block with no coded
-/// neighbour, which is context 7.
-pub const TXB_SKIP_CHROMA_16: [u16; 3] = [3648, 32768, 0];
-
 /// `Default_Coeff_Base_Cdf[2][3][0]` (spec 9.4): the level of a coefficient
 /// of a 32x32 luma transform block, capped at three, for each of the
 /// forty-two contexts its neighbours' magnitudes and its own position give.
@@ -371,3 +366,117 @@ pub const NZ_MAP_CTX_OFFSET_32: [[u8; 5]; 5] = [
     [6, 21, 21, 21, 21],
     [21, 21, 21, 21, 21],
 ];
+
+/// `Default_Txb_Skip_Cdf[2][2][7..10]` (spec 9.4): the all-zero flag of a
+/// 16x16 chroma transform block that covers its whole plane block, for the
+/// three contexts its coded neighbours give.
+pub const TXB_SKIP_CHROMA_16: [[u16; 3]; 3] =
+    [[3648, 32768, 0], [15690, 32768, 0], [26815, 32768, 0]];
+
+/// `Default_Coeff_Base_Cdf[2][2][1]` (spec 9.4): the level of a coefficient
+/// of a 16x16 chroma transform block, capped at three, for each of the
+/// forty-two contexts its neighbours and its position give.
+pub const COEFF_BASE_CHROMA_16: [[u16; 5]; 42] = [
+    [9185, 19694, 24688, 32768, 0],
+    [26081, 31985, 32621, 32768, 0],
+    [16015, 29000, 31787, 32768, 0],
+    [10542, 23690, 29206, 32768, 0],
+    [6732, 17945, 24677, 32768, 0],
+    [3916, 11039, 16722, 32768, 0],
+    [28224, 32566, 32744, 32768, 0],
+    [19100, 31138, 32485, 32768, 0],
+    [12528, 26620, 30879, 32768, 0],
+    [7741, 20277, 26885, 32768, 0],
+    [4566, 12845, 18990, 32768, 0],
+    [29933, 32593, 32718, 32768, 0],
+    [17670, 30333, 32155, 32768, 0],
+    [10385, 23600, 28909, 32768, 0],
+    [6243, 16236, 22407, 32768, 0],
+    [3976, 10389, 16017, 32768, 0],
+    [28377, 32561, 32738, 32768, 0],
+    [19366, 31175, 32482, 32768, 0],
+    [13327, 27175, 31094, 32768, 0],
+    [8258, 20769, 27143, 32768, 0],
+    [4703, 13198, 19527, 32768, 0],
+    [31086, 32706, 32748, 32768, 0],
+    [22853, 31902, 32583, 32768, 0],
+    [14759, 28186, 31419, 32768, 0],
+    [9284, 22382, 28348, 32768, 0],
+    [5585, 15192, 21868, 32768, 0],
+    [28291, 32652, 32746, 32768, 0],
+    [19849, 32107, 32571, 32768, 0],
+    [14834, 26818, 29214, 32768, 0],
+    [10306, 22594, 28672, 32768, 0],
+    [6615, 17384, 23384, 32768, 0],
+    [28947, 32604, 32745, 32768, 0],
+    [25625, 32289, 32646, 32768, 0],
+    [18758, 28672, 31403, 32768, 0],
+    [10017, 23430, 28523, 32768, 0],
+    [6862, 15269, 22131, 32768, 0],
+    [23933, 32509, 32739, 32768, 0],
+    [19927, 31495, 32631, 32768, 0],
+    [11903, 26023, 30621, 32768, 0],
+    [7026, 20094, 27252, 32768, 0],
+    [5998, 18106, 24437, 32768, 0],
+    [8192, 16384, 24576, 32768, 0],
+];
+
+/// `Default_Coeff_Br_Cdf[2][2][1]` (spec 9.4): a base-range increment in a
+/// 16x16 chroma transform block, for each of its twenty-one contexts.
+pub const COEFF_BR_CHROMA_16: [[u16; 5]; 21] = [
+    [13569, 19800, 23206, 32768, 0],
+    [13128, 19924, 23869, 32768, 0],
+    [8329, 14841, 19403, 32768, 0],
+    [6130, 10976, 15057, 32768, 0],
+    [4682, 8839, 12518, 32768, 0],
+    [3656, 7409, 10588, 32768, 0],
+    [2577, 5099, 7412, 32768, 0],
+    [22427, 28684, 30585, 32768, 0],
+    [20913, 27750, 30139, 32768, 0],
+    [15840, 24109, 27834, 32768, 0],
+    [12308, 20029, 24569, 32768, 0],
+    [10216, 16785, 21458, 32768, 0],
+    [8309, 14203, 19113, 32768, 0],
+    [6043, 11168, 15307, 32768, 0],
+    [23166, 28901, 30998, 32768, 0],
+    [21899, 28405, 30751, 32768, 0],
+    [18413, 26091, 29443, 32768, 0],
+    [15233, 23114, 27352, 32768, 0],
+    [12683, 20472, 25288, 32768, 0],
+    [10702, 18259, 23409, 32768, 0],
+    [8125, 14464, 19226, 32768, 0],
+];
+
+/// `Default_Coeff_Base_Eob_Cdf[2][2][1]` (spec 9.4): the level of the last
+/// coefficient of a 16x16 chroma transform block, less one, for each of the
+/// four contexts its position in the scan gives.
+pub const COEFF_BASE_EOB_CHROMA_16: [[u16; 4]; 4] = [
+    [25476, 30366, 32768, 0],
+    [32169, 32687, 32768, 0],
+    [32479, 32689, 32768, 0],
+    [31673, 32634, 32768, 0],
+];
+
+/// `Default_Eob_Extra_Cdf[2][2][1]` (spec 9.4): the top bit of the offset
+/// into an end-of-block position group of a 16x16 chroma transform block.
+pub const EOB_EXTRA_CHROMA_16: [[u16; 3]; 9] = [
+    [22041, 32768, 0],
+    [23434, 32768, 0],
+    [20001, 32768, 0],
+    [20554, 32768, 0],
+    [20951, 32768, 0],
+    [20145, 32768, 0],
+    [15562, 32768, 0],
+    [16384, 32768, 0],
+    [16384, 32768, 0],
+];
+
+/// `Default_Eob_Pt_256_Cdf[2][1][0]` (spec 9.4): the end-of-block group of a
+/// 256-coefficient chroma transform block with a two-dimensional transform.
+pub const EOB_PT_256_CHROMA: [u16; 10] = [
+    11514, 13794, 17480, 20754, 24361, 27378, 29492, 31277, 32768, 0,
+];
+
+/// `Default_Dc_Sign_Cdf[2][1]` (spec 9.4): the sign of a chroma DC
+/// coefficient, indexed the way [`DC_SIGN_LUMA`] is.
+pub const DC_SIGN_CHROMA: [[u16; 3]; 3] = [[15232, 32768, 0], [12928, 32768, 0], [17280, 32768, 0]];
