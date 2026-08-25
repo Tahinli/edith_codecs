@@ -14,5 +14,6 @@
 
 pub mod bits;
 pub mod frame;
+pub mod msac;
 pub mod obu;
 pub mod sequence;
