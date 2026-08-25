@@ -556,6 +556,19 @@ fn bd_psnr_vs_x265() {
     // Probe both encoders at QP 26 to measure the bit ratio.
     let probe_ours = ours(probe_qp);
     let probe_x265 = x265(probe_qp);
+    // A sample window with nothing in it (a film's black head, a fade) codes
+    // to a handful of bits and decodes back to the source exactly, so every
+    // point on both curves sits at the PSNR cap and the BD number is a flat
+    // +0.000 that looks like a measurement. Refuse it by name.
+    const FLAT_WINDOW_DB: f64 = 90.0;
+    assert!(
+        probe_x265.1 < FLAT_WINDOW_DB && probe_ours.1 < FLAT_WINDOW_DB,
+        "the sample window is flat — both encoders reach the PSNR cap on it \
+         (ours {:.2} dB, x265 {:.2} dB at qp {probe_qp}); this is a black head \
+         or a fade, not content: pass EC_H265_CLIP_SKIP to sample past it",
+        probe_ours.1,
+        probe_x265.1,
+    );
     let mut shift = (6.0 * (probe_ours.0 / probe_x265.0).log2()).round() as i32;
     eprintln!(
         "ladder shift {shift:+} (probe q{probe_qp}: ours {:.1} Mbit vs x265 {:.1} Mbit)",
@@ -605,6 +618,15 @@ fn bd_psnr_vs_x265() {
             let offset = f64::from(q - probe_qp) * spread;
             ((centre + offset).round() as i32).clamp(1, 45)
         });
+        let mut distinct = our_qps;
+        distinct.sort_unstable();
+        let collapsed = distinct.windows(2).any(|w| w[0] == w[1]);
+        assert!(
+            !collapsed,
+            "our QP ladder collapsed to {:?}: the shift has pushed it into the \
+             qp floor, so two points share an x and the cubic has no unique fit",
+            our_qps,
+        );
         mine = our_qps
             .iter()
             .map(|&q| if q == probe_qp { probe_ours } else { ours(q) })

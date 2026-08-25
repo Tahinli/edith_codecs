@@ -228,6 +228,21 @@ fn cubic_integral(c: [f64; 4], x: f64) -> f64 {
     c[0] * x + c[1] * x * x / 2.0 + c[2] * x * x * x / 3.0 + c[3] * x * x * x * x / 4.0
 }
 
+/// A sample window with nothing in it (a film's black head, a fade) codes to
+/// almost no bits and decodes back to the source exactly, so every point on
+/// both curves sits at the PSNR cap and the BD number is a flat +0.000 that
+/// reads like a measurement. Refuse such a window by name.
+fn refuse_flat_window(psnrs: impl IntoIterator<Item = f64>, skip_var: &str) {
+    const FLAT_WINDOW_DB: f64 = 90.0;
+    let ps: Vec<f64> = psnrs.into_iter().collect();
+    assert!(
+        ps.iter().any(|&p| p < FLAT_WINDOW_DB),
+        "the sample window is flat — every point reaches the PSNR cap ({ps:?}); \
+         this is a black head or a fade, not content: pass {skip_var} to sample \
+         past it"
+    );
+}
+
 fn bd_psnr_delta(candidate: &[(f64, f64)], anchor: &[(f64, f64)]) -> f64 {
     let xs_candidate = std::array::from_fn(|i| candidate[i].0.ln());
     let ys_candidate = std::array::from_fn(|i| candidate[i].1);
@@ -539,6 +554,7 @@ fn eight_by_eight_gains_on_flat_and_text() {
     let qps = [22, 26, 30, 34];
     let on: Vec<_> = qps.iter().map(|&q| run(true, q, true)).collect();
     let off: Vec<_> = qps.iter().map(|&q| run(false, q, true)).collect();
+    refuse_flat_window(off.iter().map(|&(_, p, _)| p), "EC_H264_CLIP_SKIP");
     let on_curve: Vec<_> = on.iter().map(|&(bits, psnr, _)| (bits, psnr)).collect();
     let off_curve: Vec<_> = off.iter().map(|&(bits, psnr, _)| (bits, psnr)).collect();
     let bd = bd_psnr_delta(&on_curve, &off_curve);
@@ -1223,6 +1239,7 @@ fn bd_psnr_vs_x264() {
             oy - xy
         );
     }
+    refuse_flat_window(theirs.iter().map(|&(_, p, _)| p), "EC_H264_CLIP_SKIP");
     let curve = |v: &[(f64, f64, f64)], luma: bool| -> Vec<(f64, f64)> {
         v.iter()
             .map(|&(b, p, y)| (b, if luma { p } else { y }))
