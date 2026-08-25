@@ -148,6 +148,8 @@ pub struct CtuEncoder<'a> {
     chroma_rd: bool,
     /// Weight on chroma SSD in that decision, against luma's lambda.
     chroma_rd_weight: f64,
+    /// Whether an 8x8 coding unit may split into four 4x4 intra partitions.
+    intra_nxn: bool,
     /// `log2` of the smallest coding unit the search will produce.
     min_cb_log2: u32,
     /// Intra mode per 4x4 block of the band; 255 = not coded yet.
@@ -178,6 +180,7 @@ impl<'a> CtuEncoder<'a> {
         candidates: usize,
         chroma_rd: bool,
         chroma_rd_weight: f64,
+        intra_nxn: bool,
         min_cb_log2: u32,
     ) -> CtuEncoder<'a> {
         let band_rows = (height - band_y0).min(ctb_size);
@@ -197,6 +200,7 @@ impl<'a> CtuEncoder<'a> {
             candidates: candidates.clamp(1, 35),
             chroma_rd,
             chroma_rd_weight,
+            intra_nxn,
             min_cb_log2: min_cb_log2.clamp(MIN_CB_LOG2, 5),
             modes: vec![255; (width / 4) * (ctb_size / 4)],
             depths: vec![0; (width / 4) * (ctb_size / 4)],
@@ -482,8 +486,122 @@ impl<'a> CtuEncoder<'a> {
     // ---- one coding unit -------------------------------------------------
 
     /// Code one coding unit, returning `SSD + lambda * bits` for it. The split
-    /// flag above it is the caller's to count.
+    /// flag above it is the caller's to count. At the smallest coding unit the
+    /// partition mode is a rate-distortion decision between one 8x8 block and
+    /// four 4x4 ones; everywhere else there is only PART_2Nx2N.
     fn code_cu(&mut self, x: usize, y: usize, log2: u32, depth: u8, enc: &mut CabacEncoder) -> f64 {
+        if log2 != MIN_CB_LOG2 || !self.intra_nxn {
+            return self.code_cu_2nx2n(x, y, log2, depth, enc);
+        }
+        let start = enc.snapshot();
+        let coded_before = self.coded;
+        let size = 1usize << log2;
+
+        let square_cost = self.code_cu_2nx2n(x, y, log2, depth, enc);
+        let square_state = enc.snapshot_since(&start);
+        let square_rec = self.save_region(x, y, size);
+        let square_meta = self.save_meta(x, y, size);
+        let square_empty = self.last_cu_empty;
+
+        enc.restore(&start);
+        self.coded = coded_before;
+        let nxn_cost = self.code_cu_nxn(x, y, depth, enc);
+
+        if square_cost <= nxn_cost {
+            enc.restore(&square_state);
+            self.load_region(x, y, size, &square_rec);
+            self.load_meta(x, y, size, &square_meta);
+            self.last_cu_empty = square_empty;
+            square_cost
+        } else {
+            nxn_cost
+        }
+    }
+
+    /// The four-4x4-partition form of the smallest coding unit: four luma
+    /// prediction units, each its own transform block, over one 4x4 chroma
+    /// block that keeps the coding unit's single chroma mode.
+    fn code_cu_nxn(&mut self, x: usize, y: usize, depth: u8, enc: &mut CabacEncoder) -> f64 {
+        let before = enc.bit_count();
+        // The mode search reconstructs each partition as it goes, because the
+        // next one predicts from it; the syntax is written afterwards in the
+        // order the decoder reads it.
+        let offsets = [(0usize, 0usize), (4, 0), (0, 4), (4, 4)];
+        let mut modes = [0u8; 4];
+        let mut mpms = [[0u8; 3]; 4];
+        let mut levels = [[0i32; 16]; 4];
+        let mut cbfs = [false; 4];
+        for (part, &(dx, dy)) in offsets.iter().enumerate() {
+            let (px, py) = (x + dx, y + dy);
+            let mpm = self.mpm_at(px, py);
+            let mode = self.choose_luma_mode(px, py, 4, 2, &mpm, enc);
+            levels[part].copy_from_slice(&self.scratch.luma_levels[..16]);
+            cbfs[part] = levels[part].iter().any(|&v| v != 0);
+            modes[part] = mode;
+            mpms[part] = mpm;
+            self.mark_coded(px, py, 4, mode, depth);
+        }
+
+        // part_mode: PART_NxN is the single bin 0.
+        enc.encode_bin(ctx::PART_MODE, 0);
+        for part in 0..4 {
+            self.write_mode_prev_flag(enc, modes[part], &mpms[part]);
+        }
+        for part in 0..4 {
+            self.write_mode_remainder(enc, modes[part], &mpms[part]);
+        }
+
+        // The chroma mode belongs to the coding unit and derives from the
+        // first partition's luma mode (8.4.3).
+        let (chroma_mode, chroma_idx) = if self.chroma_rd {
+            self.choose_chroma_mode(x, y, 8, MIN_CB_LOG2, modes[0], enc)
+        } else {
+            (modes[0], None)
+        };
+        self.write_chroma_mode_syntax(enc, chroma_idx);
+        let cb_cbf = self.code_chroma(x, y, 8, chroma_mode, 1).1;
+        let cr_cbf = self.code_chroma(x, y, 8, chroma_mode, 2).1;
+
+        // transform_tree: the split at depth 0 is inferred from the partition
+        // mode, so only the chroma flags are written there; every luma flag and
+        // residual belongs to a 4x4 child at depth 1, and the chroma residual
+        // rides along with the last of them (7.3.8.8, 7.3.8.10).
+        enc.encode_bin(ctx::CBF_CHROMA, u32::from(cb_cbf));
+        enc.encode_bin(ctx::CBF_CHROMA, u32::from(cr_cbf));
+        for part in 0..4 {
+            enc.encode_bin(ctx::CBF_LUMA, u32::from(cbfs[part]));
+            if cbfs[part] {
+                let scan = intra::scan_index(modes[part], 2, true);
+                encode_residual(enc, &levels[part], 2, 0, scan);
+            }
+            if part == 3 {
+                let chroma_scan = intra::scan_index(chroma_mode, 2, false);
+                if cb_cbf {
+                    let l = std::mem::take(&mut self.scratch.cb_levels);
+                    encode_residual(enc, &l[..16], 2, 1, chroma_scan);
+                    self.scratch.cb_levels = l;
+                }
+                if cr_cbf {
+                    let l = std::mem::take(&mut self.scratch.cr_levels);
+                    encode_residual(enc, &l[..16], 2, 2, chroma_scan);
+                    self.scratch.cr_levels = l;
+                }
+            }
+        }
+
+        self.last_cu_empty = !(cbfs.iter().any(|&c| c) || cb_cbf || cr_cbf);
+        let bits = enc.bit_count() - before;
+        self.region_ssd(x, y, 8) + self.lambda * bits as f64
+    }
+
+    fn code_cu_2nx2n(
+        &mut self,
+        x: usize,
+        y: usize,
+        log2: u32,
+        depth: u8,
+        enc: &mut CabacEncoder,
+    ) -> f64 {
         let n = 1usize << log2;
         let before = enc.bit_count();
         if log2 == MIN_CB_LOG2 {
@@ -533,9 +651,22 @@ impl<'a> CtuEncoder<'a> {
     }
 
     fn write_mode_syntax(&self, enc: &mut CabacEncoder, mode: u8, mpm: &[u8; 3]) {
+        self.write_mode_prev_flag(enc, mode, mpm);
+        self.write_mode_remainder(enc, mode, mpm);
+    }
+
+    /// `prev_intra_luma_pred_flag`. An NxN coding unit writes all four of these
+    /// before any of the remainders (7.3.8.5), which is why the two halves are
+    /// separate.
+    fn write_mode_prev_flag(&self, enc: &mut CabacEncoder, mode: u8, mpm: &[u8; 3]) {
+        let is_mpm = mpm.contains(&mode);
+        enc.encode_bin(ctx::PREV_INTRA_LUMA_PRED, u32::from(is_mpm));
+    }
+
+    /// `mpm_idx` or `rem_intra_luma_pred_mode`, whichever the flag promised.
+    fn write_mode_remainder(&self, enc: &mut CabacEncoder, mode: u8, mpm: &[u8; 3]) {
         match mpm.iter().position(|&m| m == mode) {
             Some(idx) => {
-                enc.encode_bin(ctx::PREV_INTRA_LUMA_PRED, 1);
                 // mpm_idx: truncated rice, cMax 2, all bypass.
                 if idx == 0 {
                     enc.encode_bypass(0);
@@ -545,7 +676,6 @@ impl<'a> CtuEncoder<'a> {
                 }
             }
             None => {
-                enc.encode_bin(ctx::PREV_INTRA_LUMA_PRED, 0);
                 let mut sorted = *mpm;
                 sorted.sort_unstable();
                 let mut rem = mode;
