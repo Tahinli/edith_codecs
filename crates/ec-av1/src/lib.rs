@@ -17,5 +17,7 @@ pub mod cdf;
 pub mod frame;
 pub mod msac;
 pub mod obu;
+pub mod quant;
 pub mod sequence;
 pub mod tile;
+pub mod transform;
