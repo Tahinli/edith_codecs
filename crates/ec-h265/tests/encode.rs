@@ -451,6 +451,12 @@ fn bd_psnr_vs_x265() {
         if let Ok(v) = std::env::var("EC_H265_NXN") {
             cfg.intra_nxn = v != "0";
         }
+        if let Ok(v) = std::env::var("EC_H265_CTB") {
+            cfg.ctb_size = v.parse().expect("EC_H265_CTB must be 32 or 64");
+        }
+        if let Ok(v) = std::env::var("EC_H265_CU64") {
+            cfg.cu64 = v != "0";
+        }
         if let Ok(v) = std::env::var("EC_H265_RQT") {
             cfg.rqt = v != "0";
         }
