@@ -20,6 +20,29 @@ const PARTITION_NONE: usize = 0;
 const PARTITION_SPLIT: usize = 3;
 /// `DC_PRED` (spec 6.10.2), as both the luma and the chroma mode.
 const DC_PRED: usize = 0;
+
+/// `V_PRED` (spec 6.10.2), the first of the eight directional intra modes and
+/// so the first mode that carries an angle delta.
+const V_PRED: usize = 1;
+
+/// `H_PRED`, which predicts every row from the column to the block's left.
+#[cfg(test)]
+const H_PRED: usize = 2;
+
+/// The last directional mode, `D67_PRED`.
+const D67_PRED: usize = 8;
+
+/// The number of intra modes a key frame's luma block chooses from,
+/// `INTRA_MODES` (spec 3).
+const INTRA_MODES: usize = 13;
+
+/// `Intra_Mode_Context` (spec 9.3): the five-way class each intra mode puts
+/// its neighbours in when they pick the CDF for the next block's mode.
+const INTRA_MODE_CTX: [usize; INTRA_MODES] = [0, 1, 2, 3, 4, 4, 4, 4, 3, 0, 1, 2, 0];
+
+/// The symbol an angle delta of zero codes as: the alphabet runs from -3 to
+/// +3, so `MAX_ANGLE_DELTA` is the middle of it.
+const ANGLE_DELTA_ZERO: usize = 3;
 /// Side of a superblock in 4x4 mode-info units when 128x128 superblocks are off.
 const SB_MI: u32 = 16;
 
@@ -237,7 +260,7 @@ pub fn split_dc_key_frame_tile(
                 enc.symbol_fixed(DC_PRED, &cdf::KF_Y_MODE[0][0]);
                 // Chroma from luma is offered up to 32x32, so the block reads
                 // the wider table even though it does not take the mode.
-                enc.symbol_fixed(DC_PRED, &cdf::UV_MODE_CFL_DC);
+                enc.symbol_fixed(DC_PRED, &cdf::UV_MODE_CFL[DC_PRED]);
 
                 write_dc_coeffs(
                     &mut enc,
@@ -285,6 +308,11 @@ pub struct BlockCoeffs {
     pub u: Vec<Coeff>,
     /// The V plane's.
     pub v: Vec<Coeff>,
+    /// The luma intra mode the block is predicted with, one of the thirteen
+    /// modes a key frame codes (`DC_PRED` is zero, which is what
+    /// [`Default`] and a plain coefficient list give). Chroma stays on
+    /// `DC_PRED`.
+    pub mode: u8,
 }
 
 impl From<Vec<Coeff>> for BlockCoeffs {
@@ -397,6 +425,15 @@ pub fn split_coeff_key_frame_tile(
             "a coefficient key frame needs one coefficient set per 32x32 block",
         ));
     }
+    if let Some(bad) = blocks.iter().find(|b| usize::from(b.mode) >= INTRA_MODES) {
+        return Err(Error::unsupported(
+            "AV1 tile",
+            format!(
+                "intra mode {} is not one of the thirteen a key frame codes",
+                bad.mode
+            ),
+        ));
+    }
     if !Q_CTX_2.contains(&base_q_idx) {
         return Err(Error::unsupported(
             "AV1 tile",
@@ -424,10 +461,16 @@ pub fn split_coeff_key_frame_tile(
     // because a tile starts each row with no left neighbour.
     let mut above = vec![[Neighbour::default(); 3]; cols as usize];
     let mut left = vec![[Neighbour::default(); 3]; rows as usize];
+    // The luma intra mode of those same neighbours, which picks the CDF the
+    // next block's mode is coded with. A block outside the tile reads as
+    // `DC_PRED`, which is what these start and are reset to.
+    let mut above_mode = vec![DC_PRED; cols as usize];
+    let mut left_mode = vec![DC_PRED; rows as usize];
 
     let mut enc = SymbolEncoder::new();
     for sb_r in 0..sb_rows {
         left.iter_mut().for_each(|l| *l = Default::default());
+        left_mode.iter_mut().for_each(|m| *m = DC_PRED);
         for sb_c in 0..sb_cols {
             let ctx = 2 * usize::from(sb_c > 0) + usize::from(sb_r > 0);
             enc.symbol_fixed(PARTITION_SPLIT, &cdf::PARTITION_W64[ctx]);
@@ -436,11 +479,20 @@ pub fn split_coeff_key_frame_tile(
                 let (r, c) = (sb_r * 2 + quadrant / 2, sb_c * 2 + quadrant % 2);
                 let (r, c) = (r as usize, c as usize);
                 let block = &grids[r * cols as usize + c];
+                let mode = usize::from(blocks[r * cols as usize + c].mode);
 
                 enc.symbol_fixed(PARTITION_NONE, &cdf::PARTITION_W32[0]);
                 enc.symbol_fixed(0, &cdf::SKIP[0]);
-                enc.symbol_fixed(DC_PRED, &cdf::KF_Y_MODE[0][0]);
-                enc.symbol_fixed(DC_PRED, &cdf::UV_MODE_CFL_DC);
+                enc.symbol_fixed(
+                    mode,
+                    &cdf::KF_Y_MODE[INTRA_MODE_CTX[above_mode[c]]][INTRA_MODE_CTX[left_mode[r]]],
+                );
+                if (V_PRED..=D67_PRED).contains(&mode) {
+                    enc.symbol_fixed(ANGLE_DELTA_ZERO, &cdf::ANGLE_DELTA[mode - V_PRED]);
+                }
+                enc.symbol_fixed(DC_PRED, &cdf::UV_MODE_CFL[mode]);
+                above_mode[c] = mode;
+                left_mode[r] = mode;
 
                 for (plane, grid) in block.iter().enumerate() {
                     let coding = planes[plane];
@@ -1628,6 +1680,7 @@ mod tests {
                 luma: Vec::new(),
                 u: dc(level),
                 v: dc(-level),
+                ..BlockCoeffs::default()
             })
             .collect();
         let [luma, u, v] = decode_coeff_planes(&blocks);
@@ -1674,6 +1727,100 @@ mod tests {
 
     /// The coefficient writer refuses what it cannot code rather than writing a
     /// stream a decoder walks off the end of.
+    /// The 32x32 block at the given block row and column of a decoded plane.
+    fn block_at(rows: &[Vec<u8>], block_row: usize, block_col: usize) -> Vec<Vec<u8>> {
+        rows[block_row * 32..block_row * 32 + 32]
+            .iter()
+            .map(|r| r[block_col * 32..block_col * 32 + 32].to_vec())
+            .collect()
+    }
+
+    /// A directional intra mode says where its prediction comes from, and with
+    /// no residual of its own a block must be exactly that prediction. The
+    /// top-left block is given a basis function that is flat across it and
+    /// falls down it; the block to its right is coded `H_PRED`, so every one of
+    /// its rows must be the constant its left neighbour's rightmost column
+    /// hands it, and the block below is coded `V_PRED`, so every one of its
+    /// columns must be the constant the row above it ends on — a single flat
+    /// value for the whole block. Nothing here pins the transform's shape or
+    /// the mode's CDF: a mode written with the wrong context, an angle delta
+    /// left out or a mode index off by one desyncs the symbol decoder and the
+    /// two empty blocks stop mirroring their neighbours.
+    #[test]
+    fn directional_modes_predict_from_the_neighbours_they_name() {
+        if !have_ffmpeg() {
+            eprintln!("SKIP directional_modes_predict_from_the_neighbours_they_name: no ffmpeg");
+            return;
+        }
+        let gradient = BlockCoeffs {
+            luma: vec![Coeff {
+                row: 1,
+                col: 0,
+                level: 12,
+            }],
+            ..BlockCoeffs::default()
+        };
+        let blocks = [
+            gradient,
+            BlockCoeffs {
+                mode: H_PRED as u8,
+                ..BlockCoeffs::default()
+            },
+            BlockCoeffs {
+                mode: V_PRED as u8,
+                ..BlockCoeffs::default()
+            },
+            BlockCoeffs::default(),
+        ];
+        let [luma, ..] = decode_coeff_planes(&blocks);
+
+        let source = block_at(&luma, 0, 0);
+        for (r, row) in source.iter().enumerate() {
+            assert!(
+                row.iter().all(|&s| s == row[0]),
+                "the basis function at row 1, column 0 is flat across the block, row {r} is not:                  {row:?}"
+            );
+        }
+        let profile: Vec<u8> = source.iter().map(|r| r[0]).collect();
+        assert!(
+            profile.windows(2).all(|w| w[0] >= w[1]) && profile[0] > profile[31],
+            "the block must fall from top to bottom, got {profile:?}"
+        );
+
+        let horizontal = block_at(&luma, 0, 1);
+        for (r, row) in horizontal.iter().enumerate() {
+            assert!(
+                row.iter().all(|&s| s == profile[r]),
+                "an H_PRED block repeats the column to its left, row {r} should be all {} but is                  {row:?}",
+                profile[r]
+            );
+        }
+
+        let vertical = block_at(&luma, 1, 0);
+        let bottom = profile[31];
+        assert!(
+            vertical.iter().flatten().all(|&s| s == bottom),
+            "a V_PRED block repeats the row above it, which is all {bottom} here, got rows \
+             {:?} and {:?}",
+            vertical[0],
+            vertical[31]
+        );
+    }
+
+    /// The mode index is checked before anything is written.
+    #[test]
+    fn an_intra_mode_outside_the_key_frame_set_is_refused() {
+        let mut blocks = vec![BlockCoeffs::default(); 4];
+        blocks[2].mode = INTRA_MODES as u8;
+        let message = split_coeff_key_frame_tile(16, 16, Q_IDX, &blocks)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("intra mode 13"),
+            "the refusal must name the mode, got {message}"
+        );
+    }
+
     #[test]
     fn coefficients_the_writer_cannot_code_are_refused() {
         let empty = || vec![BlockCoeffs::default(); 4];
