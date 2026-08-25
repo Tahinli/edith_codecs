@@ -90,7 +90,7 @@ fn psnr(a: &[u8], b: &[u8]) -> f64 {
 
 /// Encode one picture; `ctb` of `None` takes the configured default.
 fn encode(width: u32, height: u32, qp: i32, ctb: Option<usize>) -> (VideoFrame, EncodedPicture) {
-    encode_with(width, height, qp, ctb, false)
+    encode_with(width, height, qp, ctb, false, false)
 }
 
 fn encode_with(
@@ -99,9 +99,11 @@ fn encode_with(
     qp: i32,
     ctb: Option<usize>,
     chroma_mode_search: bool,
+    intra_nxn: bool,
 ) -> (VideoFrame, EncodedPicture) {
     let mut cfg = EncoderConfig::new(width, height);
     cfg.chroma_mode_search = chroma_mode_search;
+    cfg.intra_nxn = intra_nxn;
     cfg.rate_control = RateControl::ConstantQp(qp);
     if let Some(ctb) = ctb {
         cfg.ctb_size = ctb;
@@ -110,6 +112,26 @@ fn encode_with(
     cfg.picture_hash = true;
     let encoder = Encoder::new(cfg).expect("encoder");
     let frame = test_frame(width, height, 0);
+    let coded = encoder.encode_idr(&frame).expect("encode");
+    (frame, coded)
+}
+
+/// Same as `encode_with`, but on the grainy natural frame and with no chroma
+/// mode search — the synthetic test frame is flat enough that the quadtree
+/// never keeps an 8x8 coding unit, which is the only size PART_NxN applies to.
+fn encode_natural(
+    width: u32,
+    height: u32,
+    qp: i32,
+    intra_nxn: bool,
+) -> (VideoFrame, EncodedPicture) {
+    let mut cfg = EncoderConfig::new(width, height);
+    cfg.intra_nxn = intra_nxn;
+    cfg.rate_control = RateControl::ConstantQp(qp);
+    cfg.keep_recon = true;
+    cfg.picture_hash = true;
+    let encoder = Encoder::new(cfg).expect("encoder");
+    let frame = natural_frame(width, height, 0);
     let coded = encoder.encode_idr(&frame).expect("encode");
     (frame, coded)
 }
@@ -126,8 +148,8 @@ fn chroma_mode_search_decodes_bit_exactly() {
         return;
     }
     for &(w, h) in &[(64u32, 64u32), (130, 66), (352, 288)] {
-        let (source, coded) = encode_with(w, h, 27, None, true);
-        let (_, derived) = encode_with(w, h, 27, None, false);
+        let (source, coded) = encode_with(w, h, 27, None, true, false);
+        let (_, derived) = encode_with(w, h, 27, None, false, false);
         let name = format!("chroma-rd-{w}x{h}");
         assert_ne!(
             coded.au, derived.au,
@@ -144,6 +166,40 @@ fn chroma_mode_search_decodes_bit_exactly() {
         assert_eq!(mismatches, 0, "{name}: {mismatches} samples differ");
         let quality = psnr(&planes_of(&source), &recon);
         assert!(quality > 30.0, "{name}: PSNR {quality:.2} dB at QP 27");
+    }
+}
+
+/// PART_NxN is off by default, so nothing else here codes a four-partition
+/// coding unit. This does: the stream has to differ from the 2Nx2N-only one —
+/// proving the partition actually fired — and still decode bit-exactly, which
+/// is the only check that the inferred transform split, the four `cbf_luma`
+/// flags at transform depth 1 and the chroma residual riding on the last
+/// partition are all where the decoder looks for them.
+#[test]
+fn intra_nxn_decodes_bit_exactly() {
+    if !have_ffmpeg() {
+        eprintln!("skipping: ffmpeg not installed");
+        return;
+    }
+    for &(w, h) in &[(64u32, 64u32), (130, 66), (352, 288)] {
+        let (source, coded) = encode_natural(w, h, 22, true);
+        let (_, square) = encode_natural(w, h, 22, false);
+        let name = format!("intra-nxn-{w}x{h}");
+        assert_ne!(
+            coded.au, square.au,
+            "{name}: no coding unit ever chose PART_NxN, so this decode proves nothing"
+        );
+        let path = write_au(&name, &coded);
+        let decoded = match ffmpeg_decode(&path) {
+            Ok(bytes) => bytes,
+            Err(e) => panic!("{name}: ffmpeg failed: {e}"),
+        };
+        let recon = planes_of(coded.recon.as_ref().expect("recon kept"));
+        assert_eq!(decoded.len(), recon.len(), "{name}: size mismatch");
+        let mismatches = decoded.iter().zip(&recon).filter(|(a, b)| a != b).count();
+        assert_eq!(mismatches, 0, "{name}: {mismatches} samples differ");
+        let quality = psnr(&planes_of(&source), &recon);
+        assert!(quality > 30.0, "{name}: PSNR {quality:.2} dB at QP 22");
     }
 }
 
