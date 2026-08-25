@@ -12,6 +12,7 @@ authors = ["Ahmet Kaan Gümüş"]
 ec-aac = { path = "crates/ec-aac", version = "0.1.0" }
 ec-ac3 = { path = "crates/ec-ac3", version = "0.1.0" }
 ec-alac = { path = "crates/ec-alac", version = "0.1.0" }
+ec-av1 = { path = "crates/ec-av1", version = "0.1.0" }
 ec-av1-syntax = { path = "crates/ec-av1-syntax", version = "0.1.0" }
 ec-core = { path = "crates/ec-core", version = "0.1.0" }
 ec-dsp = { path = "crates/ec-dsp", version = "0.1.0" }
