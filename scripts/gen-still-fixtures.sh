@@ -92,6 +92,36 @@ ffmpeg -loglevel error -y -i "$out/source-flat.png" -c:v libwebp -lossless 1 \
 # writes this one: its output really does carry ANIM/ANMF chunks.
 magick -delay 10 "$out/source.png" "$out/source-flat.png" "$out/source-odd.png" \
     -loop 0 "$out/animated.webp"
+# A second animation whose frames carry alpha and ask for dispose-to-background:
+# the first one is opaque and disposes nothing, so it leaves the blending and
+# the disposal rectangle untested.  Lossless, so the frames are exact and the
+# only thing the comparison can catch is the compositing.
+magick "$out/source-alpha.png" -resize 96x72! "$out/anim-a.png"
+magick "$out/source-alpha.png" -resize 96x72! -channel A -evaluate multiply 0.5 \
+    +channel "$out/anim-b.png"
+magick "$out/source-flat.png" -resize 48x36! -background none -extent 96x72 \
+    "$out/anim-c.png"
+magick -dispose Background -delay 6 "$out/anim-a.png" -delay 9 "$out/anim-b.png" \
+    -delay 3 "$out/anim-c.png" -loop 0 -define webp:lossless=true \
+    "$out/anim-alpha.webp"
+rm -f "$out/anim-a.png" "$out/anim-b.png" "$out/anim-c.png"
+# libwebp's own composited frames, through Pillow, as the reference for that
+# animation: the `image` crate ignores the dispose-to-background flag, so it
+# cannot be the oracle for the frame that follows a disposal.
+if python3 -c "import PIL" 2>/dev/null; then
+    python3 - "$out" <<'PILLOW'
+import sys
+from PIL import Image
+
+out = sys.argv[1]
+animation = Image.open(f"{out}/anim-alpha.webp")
+for i in range(animation.n_frames):
+    animation.seek(i)
+    animation.convert("RGBA").save(f"{out}/anim-alpha-f{i}.png")
+PILLOW
+else
+    echo "skipped anim-alpha-f*.png: python3 Pillow is not installed" >&2
+fi
 
 # --- GIF: still, interlaced, transparent, odd-size, animated ---------------
 # GIF is palette-only, so every source is quantised first; the differential bar

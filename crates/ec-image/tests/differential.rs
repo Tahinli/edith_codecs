@@ -317,8 +317,8 @@ fn every_fixture_decodes() {
     for extension in ["png", "jpg", "webp"] {
         for path in corpus(extension) {
             let name = path.file_name().unwrap().to_string_lossy().to_string();
-            if name.contains("animated") {
-                continue; // refused by name; `an_animated_webp_is_refused_by_name` covers it
+            if name.contains("animated") || name.starts_with("anim-") {
+                continue; // an animation is not a still; the animation tests cover it
             }
             let bytes = std::fs::read(&path).unwrap();
             count += 1;
@@ -435,4 +435,108 @@ fn a_still_of_any_format_is_one_frame_of_animation() {
         frames[0].image.to_rgba8(),
         ec_image::decode(&bytes).unwrap().to_rgba8()
     );
+}
+
+#[test]
+fn an_animated_webp_composites_frame_for_frame_like_the_incumbent() {
+    one_animated_webp("animated.webp");
+}
+
+fn one_animated_webp(fixture: &str) {
+    use image::AnimationDecoder;
+
+    let path = fixtures().join(fixture);
+    let Ok(bytes) = std::fs::read(&path) else {
+        skip(fixture);
+        return;
+    };
+    assert!(
+        ec_image::webp::is_animated(&bytes),
+        "the fixture is not an animation"
+    );
+    let ours = ec_image::decode_animation(&bytes).expect("our animation decode");
+    let theirs: Vec<image::Frame> =
+        image::codecs::webp::WebPDecoder::new(std::io::Cursor::new(&bytes))
+            .expect("incumbent decoder")
+            .into_frames()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("incumbent frames");
+
+    assert_eq!(ours.len(), theirs.len(), "frame count");
+    assert!(ours.len() > 1, "the fixture is not an animation");
+    for (i, (ours, theirs)) in ours.iter().zip(&theirs).enumerate() {
+        let (num, den) = theirs.delay().numer_denom_ms();
+        let ours_ms = f64::from(ours.delay_num) * 1000.0 / f64::from(ours.delay_den);
+        let theirs_ms = f64::from(num) / f64::from(den);
+        assert!(
+            (ours_ms - theirs_ms).abs() < 0.5,
+            "frame {i}: {ours_ms} ms against the incumbent's {theirs_ms} ms"
+        );
+        assert_eq!(
+            (ours.image.width, ours.image.height),
+            theirs.buffer().dimensions(),
+            "frame {i} is not the whole canvas"
+        );
+        // The frames are lossy VP8, so the payload is only as exact as the two
+        // VP8 decoders agree; the bar here is on the compositing, which is
+        // exact arithmetic over whatever the payload decoded to.
+        let a = ours.image.to_rgba8();
+        let b = theirs.buffer().as_raw();
+        let max = a
+            .iter()
+            .zip(b)
+            .map(|(&x, &y)| x.abs_diff(y))
+            .max()
+            .unwrap_or(0);
+        let psnr = psnr(&a, b);
+        eprintln!("{fixture} frame {i}: {ours_ms:.0} ms, max delta {max}, {psnr:.1} dB");
+        assert!(
+            max <= 5 && psnr > 48.0,
+            "{fixture} frame {i}: max delta {max}, {psnr:.1} dB"
+        );
+    }
+}
+
+/// Alpha blending and dispose-to-background, against libwebp itself.
+///
+/// The `image` crate is not the oracle here: it ignores the ANMF
+/// dispose-to-background flag, so the frame after a disposal keeps pixels
+/// libwebp clears -- 6912 of 6912 pixels differ on this fixture, and libwebp
+/// agrees with us on every one. The goldens are libwebp's own composited
+/// frames, written by `scripts/gen-still-fixtures.sh`.
+#[test]
+fn webp_disposal_and_blending_match_libwebp() {
+    let path = fixtures().join("anim-alpha.webp");
+    let Ok(bytes) = std::fs::read(&path) else {
+        skip("anim-alpha.webp");
+        return;
+    };
+    let goldens: Vec<PathBuf> = (0..)
+        .map(|i| fixtures().join(format!("anim-alpha-f{i}.png")))
+        .take_while(|p| p.exists())
+        .collect();
+    if goldens.is_empty() {
+        skip("anim-alpha-f0.png (libwebp goldens; Pillow not installed?)");
+        return;
+    }
+
+    let ours = ec_image::decode_animation(&bytes).expect("our animation decode");
+    assert_eq!(ours.len(), goldens.len(), "frame count against libwebp");
+    for (i, (ours, golden)) in ours.iter().zip(&goldens).enumerate() {
+        let want = ec_image::open(golden).expect("golden");
+        assert_eq!(
+            (ours.image.width, ours.image.height),
+            (want.width, want.height),
+            "frame {i} is not the whole canvas"
+        );
+        assert_eq!(ours.image.to_rgba8(), want.to_rgba8(), "frame {i} samples");
+        eprintln!(
+            "frame {i}: {} ms, exact against libwebp",
+            f64::from(ours.delay_num) * 1000.0 / f64::from(ours.delay_den)
+        );
+    }
+    // The delays come from the same headers, but a player that gets them wrong
+    // plays the animation at the wrong speed however exact the pixels are.
+    let delays: Vec<u32> = ours.iter().map(|f| f.delay_num).collect();
+    assert_eq!(delays, vec![60, 90, 30], "per-frame durations in ms");
 }
