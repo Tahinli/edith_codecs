@@ -137,11 +137,45 @@ fn webp_lossless_survives_mutation() {
 }
 
 #[test]
+fn gif_survives_mutation() {
+    sweep("gif", "tiny.gif");
+}
+
+/// The animation path has its own frame loop, its own canvas and its own
+/// disposal state machine, none of which `decode` reaches past frame one.
+#[test]
+fn a_gif_animation_survives_mutation() {
+    let Ok(seed) = std::fs::read(fixtures().join("animated.gif")) else {
+        eprintln!("skipped: fixtures/stills not generated; run scripts/gen-still-fixtures.sh");
+        return;
+    };
+    let mut rng = Rng(0x2545_f491_4f6c_dd1d ^ 0x9e37);
+    let mut decoded = 0usize;
+    for round in 0..ROUNDS {
+        let head = if round % 2 == 0 { Some(48) } else { None };
+        let data = mutate(&mut rng, &seed, head);
+        if let Ok(frames) = ec_image::decode_animation(&data) {
+            decoded += 1;
+            for frame in &frames {
+                let image = &frame.image;
+                assert_eq!(
+                    image.to_rgba8().len(),
+                    (image.width as usize) * (image.height as usize) * 4,
+                    "gif-animation round {round}: buffer does not match the dimensions"
+                );
+            }
+        }
+    }
+    eprintln!("gif-animation: {ROUNDS} mutations, {decoded} still decoded");
+}
+
+#[test]
 fn arbitrary_bytes_behind_a_signature_are_refused_not_believed() {
-    let signatures: [&[u8]; 3] = [
+    let signatures: [&[u8]; 4] = [
         &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a],
         &[0xff, 0xd8, 0xff, 0xe0],
         b"RIFF\x40\x00\x00\x00WEBPVP8 ",
+        b"GIF89a",
     ];
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
     for signature in signatures {
