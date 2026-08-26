@@ -540,3 +540,93 @@ fn webp_disposal_and_blending_match_libwebp() {
     let delays: Vec<u32> = ours.iter().map(|f| f.delay_num).collect();
     assert_eq!(delays, vec![60, 90, 30], "per-frame durations in ms");
 }
+
+/// BMP is a lossless container of raw samples, so the only question is whether
+/// the two decoders read the same header the same way.
+#[test]
+fn bmp_decodes_pixel_exactly() {
+    let files = corpus("bmp");
+    if files.is_empty() && skip("bmp") {
+        return;
+    }
+    for path in files {
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        if name.starts_with("embedded-") || name == "os2v2.bmp" {
+            continue; // the incumbent refuses both; their own tests cover them
+        }
+        let data = std::fs::read(&path).unwrap();
+        let ours = ec_image::decode(&data).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let theirs = image::load_from_memory(&data).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(
+            (ours.width, ours.height),
+            theirs.dimensions(),
+            "{name}: dimensions differ"
+        );
+        let (max, corr) = compare(&ours.to_rgba8(), &theirs.to_rgba8().into_raw());
+        println!("{name:>16}  max {max}  corr {corr:.6}");
+        assert_eq!(max, 0, "{name}: samples differ from the incumbent");
+    }
+}
+
+/// `BI_PNG` and `BI_JPEG` are a BMP header wrapped around a whole file of
+/// another format. The incumbent refuses both, so the oracle is the incumbent
+/// decoding the *payload* directly: reading the wrapper must reach the same
+/// picture as reading what it wraps.
+#[test]
+fn a_bmp_wrapping_another_format_decodes_to_that_format() {
+    // The JPEG bar is the same 5 the plain JPEG comparison uses: the IDCT is
+    // implementation-defined, so the two decoders round differently.
+    for (fixture, bar) in [("embedded-png.bmp", 0u32), ("embedded-jpeg.bmp", 5)] {
+        let path = fixtures().join(fixture);
+        let Ok(data) = std::fs::read(&path) else {
+            if skip(fixture) {
+                return;
+            }
+            unreachable!()
+        };
+        // The payload starts where the file header says the pixels do.
+        let offset = u32::from_le_bytes([data[10], data[11], data[12], data[13]]) as usize;
+        let payload = &data[offset..];
+        let ours = ec_image::decode(&data).unwrap_or_else(|e| panic!("{fixture}: {e}"));
+        let theirs = image::load_from_memory(payload).unwrap();
+        assert_eq!(
+            (ours.width, ours.height),
+            theirs.dimensions(),
+            "{fixture}: dimensions differ"
+        );
+        let (max, corr) = compare(&ours.to_rgba8(), &theirs.to_rgba8().into_raw());
+        println!("{fixture:>20}  max {max}  corr {corr:.6}");
+        assert!(max <= bar, "{fixture}: max delta {max} over the bar {bar}");
+        assert_eq!(
+            ec_image::info(&data).unwrap().width,
+            theirs.dimensions().0,
+            "{fixture}: the header-only path disagrees with the pixels"
+        );
+    }
+}
+
+/// The 16-byte OS/2 v2 header, which the incumbent refuses outright
+/// ("Unknown bitmap header type (size=16)") and ffmpeg reads. The oracle is
+/// therefore the same picture in a header both decoders read: the two files
+/// carry identical rows, so the pixels must come out identical too.
+#[test]
+fn an_os2_v2_header_reads_as_the_same_picture() {
+    let short = fixtures().join("os2v2.bmp");
+    let long = fixtures().join("os2v1.bmp");
+    let (Ok(short), Ok(long)) = (std::fs::read(&short), std::fs::read(&long)) else {
+        skip("os2v2.bmp");
+        return;
+    };
+    assert!(
+        image::load_from_memory(&short).is_err(),
+        "the incumbent now reads a 16-byte header; this test's premise is stale"
+    );
+    let ours = ec_image::decode(&short).unwrap();
+    let reference = image::load_from_memory(&long).unwrap();
+    assert_eq!((ours.width, ours.height), reference.dimensions());
+    let (max, _) = compare(&ours.to_rgba8(), &reference.to_rgba8().into_raw());
+    assert_eq!(
+        max, 0,
+        "os2v2.bmp: samples differ from the same picture in a v1 header"
+    );
+}
