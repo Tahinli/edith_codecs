@@ -719,15 +719,14 @@ fn coeffs(levels: &[i32], side: usize) -> Vec<Coeff> {
 
 /// Encodes one picture as a key frame.
 ///
-/// `base_q_idx` is the frame's quantizer index, and has to sit in the band
-/// whose coefficient CDFs the tile writer carries (61..=120). `deadzone` is the
-/// quantizer's rounding offset: 0.5 rounds to nearest, and smaller values trade
-/// fidelity for rate.
+/// `base_q_idx` is the frame's quantizer index (0..=255); the tile writer
+/// picks its coefficient CDFs from one of four q contexts by that index.
+/// `deadzone` is the quantizer's rounding offset: 0.5 rounds to nearest, and
+/// smaller values trade fidelity for rate.
 ///
 /// # Errors
 /// Returns an error when the picture is not a whole number of 32x32 blocks,
-/// when its planes are not 4:2:0 of that size, or when the tile writer refuses
-/// the quantizer index.
+/// or when its planes are not 4:2:0 of that size.
 pub fn encode_key_frame(picture: &Picture, base_q_idx: u8, deadzone: f64) -> Result<Encoded> {
     encode_key_frame_with_modes(picture, base_q_idx, deadzone, &KEY_FRAME_MODES)
 }
@@ -910,7 +909,7 @@ fn encode_key_frame_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::intra::{D135_PRED, D45_PRED, H_PRED, KEY_FRAME_MODES, NON_DIRECTIONAL, V_PRED};
+    use crate::intra::{D45_PRED, D135_PRED, H_PRED, KEY_FRAME_MODES, NON_DIRECTIONAL, V_PRED};
     use std::io::Write;
     use std::process::{Command, Stdio};
 
@@ -1028,6 +1027,17 @@ mod tests {
             );
             assert_eq!(decoded.u, encoded.reconstruction.u, "{width}x{height}: U");
             assert_eq!(decoded.v, encoded.reconstruction.v, "{width}x{height}: V");
+        }
+        // One q index from each of the four coefficient-CDF contexts
+        // (0..=20, 21..=60, 61..=120, 121..=255), on a single frame size.
+        let (width, height) = (64usize, 64usize);
+        let picture = test_card(width, height);
+        for &q in &[15u8, 45, 100, 200] {
+            let encoded = encode_key_frame(&picture, q, 0.5).unwrap();
+            let decoded = ffmpeg_decode(&encoded.stream, width, height);
+            assert_eq!(decoded.y, encoded.reconstruction.y, "q={q}: luma");
+            assert_eq!(decoded.u, encoded.reconstruction.u, "q={q}: U");
+            assert_eq!(decoded.v, encoded.reconstruction.v, "q={q}: V");
         }
     }
 
@@ -1507,6 +1517,19 @@ mod tests {
             }
             previous = Some((encoded.stream.len(), quality));
         }
+
+        // Bytes must not jump up across a q-context boundary: a wrong CDF
+        // table for the far side would show up as a rate discontinuity here,
+        // even though a coarser quantizer always codes no more than a finer
+        // one on the same picture.
+        for &(lo, hi) in &[(20u8, 21u8), (60, 61), (120, 121)] {
+            let lo_bytes = encode_key_frame(&picture, lo, 0.5).unwrap().stream.len();
+            let hi_bytes = encode_key_frame(&picture, hi, 0.5).unwrap().stream.len();
+            assert!(
+                hi_bytes <= lo_bytes,
+                "q {lo}->{hi} crosses a context boundary: {lo_bytes} -> {hi_bytes} bytes"
+            );
+        }
     }
 
     /// A flat picture is a flat stream: every block predicts its neighbours'
@@ -1537,8 +1560,6 @@ mod tests {
         let mut short = Picture::grey(64, 64);
         short.u.truncate(10);
         assert!(encode_key_frame(&short, 100, 0.5).is_err());
-        // The tile writer carries the CDFs of one q context only.
-        assert!(encode_key_frame(&Picture::grey(64, 64), 40, 0.5).is_err());
     }
 
     /// A frame of real video, rather than a picture built to be easy.
