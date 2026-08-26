@@ -18,6 +18,7 @@ mod cdf_state;
 pub mod encode;
 pub mod frame;
 pub mod intra;
+pub mod mc;
 pub mod msac;
 pub mod obu;
 pub mod quant;
