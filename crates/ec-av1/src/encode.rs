@@ -45,7 +45,7 @@ const BLOCK: usize = 32;
 const SUB: usize = 16;
 
 /// The side of a superblock, which is what the partition tree starts from.
-const SUPERBLOCK: usize = 64;
+pub(crate) const SUPERBLOCK: usize = 64;
 
 /// How heavily the mode search weighs rate against squared error, in units of
 /// the quantizer's reconstruction step squared per bit.
@@ -77,7 +77,7 @@ const SPLIT_BLOCKS: bool = true;
 
 /// What [`encode_key_frame_with_modes`] codes with, which the sweep overrides
 /// by calling [`encode_key_frame_inner`] both ways.
-fn split_blocks() -> bool {
+pub(crate) fn split_blocks() -> bool {
     SPLIT_BLOCKS
 }
 
@@ -109,7 +109,7 @@ impl Picture {
         }
     }
 
-    fn check(&self) -> Result<()> {
+    pub(crate) fn check(&self) -> Result<()> {
         if self.width == 0
             || !self.width.is_multiple_of(BLOCK)
             || !self.height.is_multiple_of(BLOCK)
@@ -134,7 +134,7 @@ impl Picture {
     /// before it is padded to the block grid: even, nonzero dimensions (4:2:0
     /// needs a whole chroma sample per two luma ones) and one sample per
     /// position on each plane.
-    fn check_even(&self) -> Result<()> {
+    pub(crate) fn check_even(&self) -> Result<()> {
         if self.width == 0
             || self.height == 0
             || !self.width.is_multiple_of(2)
@@ -162,7 +162,7 @@ impl Picture {
     /// that). Identity (a plain clone, not a copy through the replication
     /// loop) when the picture is already that size — the multiple-of-32 (or
     /// -64) fast path is unchanged.
-    fn padded_to(&self, align: usize) -> Picture {
+    pub(crate) fn padded_to(&self, align: usize) -> Picture {
         let padded_width = self.width.next_multiple_of(align);
         let padded_height = self.height.next_multiple_of(align);
         if padded_width == self.width && padded_height == self.height {
@@ -231,7 +231,7 @@ fn crop_plane(source: &[u8], padded_width: usize, width: usize, height: usize) -
 /// region a decoder produces, which is the public contract for what a caller
 /// sees back — the padded planes the encoder coded against never leave this
 /// module. Identity when the reconstruction is already that size.
-fn crop_encoded(encoded: &Encoded, width: usize, height: usize) -> Encoded {
+pub(crate) fn crop_encoded(encoded: &Encoded, width: usize, height: usize) -> Encoded {
     let reconstruction = &encoded.reconstruction;
     let cropped = if reconstruction.width == width && reconstruction.height == height {
         reconstruction.clone()
@@ -294,6 +294,43 @@ pub fn key_frame_headers(
     height: usize,
     base_q_idx: u8,
 ) -> Result<(SequenceHeader, FrameHeader)> {
+    key_frame_headers_colour(width, height, base_q_idx, unspecified_color_config())
+}
+
+/// [`ColorConfig`] with every CICP field "unspecified" (H.273 value 2) and
+/// studio (limited) range: what this crate's sequence header carried before
+/// [`crate::encoder`]'s facade could configure it, and what
+/// [`key_frame_headers`] still asks for.
+fn unspecified_color_config() -> ColorConfig {
+    ColorConfig {
+        bit_depth: 8,
+        mono_chrome: false,
+        num_planes: 3,
+        color_primaries: 2,
+        transfer_characteristics: 2,
+        matrix_coefficients: 2,
+        color_range: false,
+        subsampling_x: 1,
+        subsampling_y: 1,
+        chroma_sample_position: ChromaSamplePosition::Unknown,
+        separate_uv_delta_q: false,
+    }
+}
+
+/// [`key_frame_headers`] with the sequence header's colour config named
+/// instead of hardcoded to "unspecified" -- spec 5.5.2's `color_primaries`,
+/// `transfer_characteristics`, `matrix_coefficients` and `color_range`,
+/// which is all a player picks a colour transform from and which
+/// [`crate::encoder::Colour`] is the facade's own name for.
+///
+/// # Errors
+/// The same as [`key_frame_headers`].
+pub(crate) fn key_frame_headers_colour(
+    width: usize,
+    height: usize,
+    base_q_idx: u8,
+    color_config: ColorConfig,
+) -> Result<(SequenceHeader, FrameHeader)> {
     let bits = |n: usize| -> Result<u32> {
         let n = u32::try_from(n).map_err(|_| too_large())?;
         if n == 0 || n > 1 << 16 {
@@ -323,19 +360,7 @@ pub fn key_frame_headers(
         enable_restoration: false,
         seq_force_screen_content_tools: 0,
         seq_force_integer_mv: 0,
-        color_config: ColorConfig {
-            bit_depth: 8,
-            mono_chrome: false,
-            num_planes: 3,
-            color_primaries: 2,
-            transfer_characteristics: 2,
-            matrix_coefficients: 2,
-            color_range: false,
-            subsampling_x: 1,
-            subsampling_y: 1,
-            chroma_sample_position: ChromaSamplePosition::Unknown,
-            separate_uv_delta_q: false,
-        },
+        color_config,
         still_picture: false,
         reduced_still_picture_header: false,
         timing_info: None,
@@ -988,6 +1013,7 @@ pub fn encode_key_frame_with_modes(
         modes,
         split_blocks(),
         (picture.width, picture.height),
+        unspecified_color_config(),
     )?;
     Ok(crop_encoded(&encoded, picture.width, picture.height))
 }
@@ -996,13 +1022,14 @@ pub fn encode_key_frame_with_modes(
 /// what the sweep that sets [`SPLIT_BLOCKS`] measures both ways. `picture` is
 /// already padded to a whole number of 32x32 blocks; `render` is the real
 /// (pre-pad) size the frame header tells a decoder to crop back to.
-fn encode_key_frame_inner(
+pub(crate) fn encode_key_frame_inner(
     picture: &Picture,
     base_q_idx: u8,
     deadzone: f64,
     modes: &[u8],
     split_blocks: bool,
     render: (usize, usize),
+    color_config: ColorConfig,
 ) -> Result<Encoded> {
     picture.check()?;
     if modes.is_empty() {
@@ -1017,7 +1044,8 @@ fn encode_key_frame_inner(
             format!("intra mode {bad} is not one the encoder predicts"),
         ));
     }
-    let (seq, mut header) = key_frame_headers(picture.width, picture.height, base_q_idx)?;
+    let (seq, mut header) =
+        key_frame_headers_colour(picture.width, picture.height, base_q_idx, color_config)?;
     header.render_width = render.0 as u32;
     header.render_height = render.1 as u32;
 
@@ -1638,7 +1666,7 @@ fn search_inter_block(
 /// Encodes one picture as an inter frame predicting from `reference`'s
 /// reconstruction, which the caller decoded (or, for the frame right after
 /// the key frame, is the key frame's own reconstruction).
-fn encode_inter_frame(
+pub(crate) fn encode_inter_frame(
     picture: &Picture,
     reference: &Picture,
     base_q_idx: u8,
@@ -1827,6 +1855,7 @@ pub fn encode_sequence(
         &KEY_FRAME_MODES,
         split_blocks(),
         render,
+        unspecified_color_config(),
     )?;
     let mut stream = key.stream.clone();
     let mut reference = key.reconstruction.clone();
@@ -2343,6 +2372,7 @@ mod tests {
                             &KEY_FRAME_MODES,
                             split,
                             (picture.width, picture.height),
+                            unspecified_color_config(),
                         )
                         .unwrap();
                         (
@@ -2362,6 +2392,7 @@ mod tests {
                 &KEY_FRAME_MODES,
                 true,
                 (picture.width, picture.height),
+                unspecified_color_config(),
             )
             .unwrap()
             .modes
