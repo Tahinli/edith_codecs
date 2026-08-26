@@ -20,6 +20,7 @@ pub mod frame;
 pub mod intra;
 pub mod mc;
 pub mod msac;
+pub mod mvstack;
 pub mod obu;
 pub mod quant;
 pub mod sequence;
