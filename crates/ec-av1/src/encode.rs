@@ -22,16 +22,27 @@ use ec_av1_syntax::{
 use ec_core::{Error, Result};
 
 use crate::cdf;
+use crate::cdf_state::TxbSet;
 use crate::frame::frame_obu;
 use crate::intra::{D67_PRED, DC_PRED, KEY_FRAME_MODES, V_PRED};
 use crate::obu::temporal_delimiter;
 use crate::quant::ac_q;
 use crate::sequence::sequence_header_obu;
-use crate::tile::{BlockCoeffs, Coeff, INTRA_MODE_CTX, Superblock, sb_coeff_key_frame_tile};
+use crate::tile::{
+    BlockCoeffs, Coeff, INTRA_MODE_CTX, Quadrant, Superblock, partition_bits,
+    sb_coeff_key_frame_tile,
+};
 use crate::transform::{dequant_and_inverse, forward_and_quantize};
 
-/// The side of the luma blocks this encoder codes, in samples.
+/// The side of the larger of the two luma blocks this encoder codes, in
+/// samples.
 const BLOCK: usize = 32;
+
+/// The side of the smaller one, which a 32x32 block may be split into four of.
+const SUB: usize = 16;
+
+/// The side of a superblock, which is what the partition tree starts from.
+const SUPERBLOCK: usize = 64;
 
 /// How heavily the mode search weighs rate against squared error, in units of
 /// the quantizer's reconstruction step squared per bit.
@@ -55,6 +66,16 @@ fn lambda_scale() -> f64 {
         Some(scale) if cfg!(test) => scale,
         _ => LAMBDA_SCALE,
     }
+}
+
+/// Whether a 32x32 block may be split into four 16x16 ones when the trial says
+/// four cost less. Set from the measurement in the lane report.
+const SPLIT_BLOCKS: bool = true;
+
+/// What [`encode_key_frame_with_modes`] codes with, which the sweep overrides
+/// by calling [`encode_key_frame_inner`] both ways.
+fn split_blocks() -> bool {
+    SPLIT_BLOCKS
 }
 
 /// One 8-bit planar 4:2:0 picture.
@@ -117,7 +138,8 @@ pub struct Encoded {
     /// reconstruction, which its prediction was built on.
     pub reconstruction: Picture,
     /// The luma intra mode each block was coded under, in the order the blocks
-    /// are coded — raster order among the quadrants of each superblock.
+    /// are coded — raster order among the quadrants of each superblock, and
+    /// among the four 16x16 blocks of a quadrant that was split.
     pub modes: Vec<u8>,
 }
 
@@ -284,7 +306,9 @@ impl Plane<'_> {
     /// levels, the block the decoder would reconstruct, the squared error
     /// against the source and an estimate of what the levels cost in bits.
     fn trial(&self, at: At, mode: u8, base_q_idx: u8, deadzone: f64) -> Trial {
-        let At { x, y, side, reach } = at;
+        let At {
+            x, y, side, reach, ..
+        } = at;
         let (above, left, corner) = self.edges(x, y, side, reach);
         let mut prediction = vec![0u8; side * side];
         crate::intra::predict(
@@ -321,12 +345,9 @@ impl Plane<'_> {
             }
         }
         // What the levels cost is priced through the same CDFs the tile writer
-        // will code them with, so the search ranks modes by the bits they
-        // actually spend. Chroma blocks are not searched, so only the 32x32
-        // luma table is asked for.
-        let bits = if side != BLOCK {
-            0.0
-        } else if cfg!(test) && std::env::var_os("EC_AV1_ESTIMATE").is_some() {
+        // will code them with, so the search ranks modes -- and the partition
+        // trial ranks trees -- by the bits they actually spend.
+        let bits = if cfg!(test) && std::env::var_os("EC_AV1_ESTIMATE").is_some() {
             // What the search used before it could price a block exactly: a
             // level costs its magnitude's width plus a sign and a run. Kept
             // reachable from the sweep so the two rate terms can be compared
@@ -337,7 +358,7 @@ impl Plane<'_> {
                 .map(|&level| 2.0 + 2.0 * f64::from(level.unsigned_abs() + 1).log2())
                 .sum()
         } else {
-            crate::tile::luma_32_coeff_bits(&levels)
+            crate::tile::coeff_bits(&levels, at.set)
         };
         Trial {
             levels,
@@ -355,16 +376,44 @@ impl Plane<'_> {
         }
     }
 
-    /// Codes one block under a fixed mode, committing it.
-    fn code_block(&mut self, at: At, mode: u8, base_q_idx: u8, deadzone: f64) -> Vec<Coeff> {
+    /// Codes one block under a fixed mode, committing it, and hands back what
+    /// it cost: its squared error and the bits its levels spend.
+    fn code_block(
+        &mut self,
+        at: At,
+        mode: u8,
+        base_q_idx: u8,
+        deadzone: f64,
+    ) -> (Vec<Coeff>, f64, f64) {
         let trial = self.trial(at, mode, base_q_idx, deadzone);
         self.commit(at.x, at.y, at.side, &trial);
-        coeffs(&trial.levels, at.side)
+        (coeffs(&trial.levels, at.side), trial.sse, trial.bits)
+    }
+
+    /// The reconstructed samples of one square, so that a partition trial can
+    /// be undone.
+    fn snapshot(&self, x: usize, y: usize, side: usize) -> Vec<u8> {
+        (y..y + side)
+            .flat_map(|row| self.reconstruction[row * self.width + x..][..side].to_vec())
+            .collect()
+    }
+
+    /// Puts a snapshot back.
+    fn restore(&mut self, x: usize, y: usize, side: usize, samples: &[u8]) {
+        for row in 0..side {
+            self.reconstruction[(y + row) * self.width + x..][..side]
+                .copy_from_slice(&samples[row * side..][..side]);
+        }
     }
 
     /// Codes one block under every mode the search offers and commits the one
     /// whose squared error and estimated rate come out cheapest.
-    fn search_block(&mut self, at: At, search: &Search, mode_bits: &[f64; 13]) -> (Vec<Coeff>, u8) {
+    fn search_block(
+        &mut self,
+        at: At,
+        search: &Search,
+        mode_bits: &[f64; 13],
+    ) -> (Vec<Coeff>, u8, f64) {
         let mut best: Option<(f64, u8, Trial)> = None;
         for &mode in search.modes {
             let trial = self.trial(at, mode, search.base_q_idx, search.deadzone);
@@ -376,9 +425,9 @@ impl Plane<'_> {
                 best = Some((cost, mode, trial));
             }
         }
-        let (_, mode, trial) = best.expect("the search offers at least one mode");
+        let (cost, mode, trial) = best.expect("the search offers at least one mode");
         self.commit(at.x, at.y, at.side, &trial);
-        (coeffs(&trial.levels, at.side), mode)
+        (coeffs(&trial.levels, at.side), mode, cost)
     }
 }
 
@@ -390,34 +439,44 @@ struct At {
     y: usize,
     side: usize,
     reach: Reach,
+    /// Which of the tile writer's coefficient tables this block's levels are
+    /// coded with, and so which the search prices them through.
+    set: TxbSet,
 }
 
 /// Which of the samples past a block's own edges the decoder has decoded by
 /// the time it predicts the block, and so which a directional mode may read.
 ///
 /// The decoder derives these from its `BlockDecoded` flags, which are cleared
-/// per superblock (`clear_block_decoded_flags`, spec 7.4): the row above the
-/// superblock counts as decoded out to the end of the *tile*, while the column
-/// to its left counts only as far as the superblock's own height, and every
-/// position inside the superblock starts undecoded. For the four 32x32
-/// quadrants of a 64x64 superblock that comes to: the samples above-right are
-/// decoded for all but the last quadrant -- the one whose above-right lies
-/// inside the superblock to the right, which raster order has not reached --
-/// and the samples below-left only for the first, the only one whose left
-/// column continues into the superblock beside it.
+/// per superblock (`clear_block_decoded_flags`, spec 7.4). Rather than carry
+/// that map, this reads the answer the same way libaom and rav1e do: for a
+/// block whose transform covers it whole, whether the samples above its right
+/// (or below its left) are decoded depends only on where the block sits inside
+/// its 64x64 superblock, which is a pinned table per block size.
 #[derive(Clone, Copy)]
 struct Reach {
     above_right: bool,
     below_left: bool,
 }
 
+/// `has_tr_16x16` / `has_tr_32x32` (`recon_intra.rs` in rav1e, `has_tr_*` in
+/// libaom): for a block that is neither in the superblock's top row nor its
+/// rightmost column, whether the block above and to its right is coded before
+/// it. Indexed by the block's position in the superblock, in blocks of its own
+/// size, as `row * (16 >> log2 mi width) + col`, bit by bit from the low end.
+const HAS_TOP_RIGHT: [&[u8]; 2] = [&[255, 85, 119, 85, 127, 85, 119, 85], &[95, 87]];
+
+/// `has_bl_16x16` / `has_bl_32x32`: the same, for the block below and to the
+/// left.
+const HAS_BOTTOM_LEFT: [&[u8]; 2] = [&[84, 16, 84, 0, 84, 16, 84, 0], &[4, 4]];
+
 impl Reach {
-    /// The reach of the quadrant coded `quadrant`-th in a superblock, counting
-    /// in raster order among the four.
-    fn quadrant(quadrant: usize) -> Self {
+    /// What a block of `side` samples at `(x, y)` may read past its own edges,
+    /// in a frame of `width` by `height`.
+    fn of(side: usize, x: usize, y: usize, width: usize, height: usize) -> Self {
         Self {
-            above_right: quadrant != 3,
-            below_left: quadrant == 0,
+            above_right: y > 0 && x + side < width && Self::top_right(side, x, y),
+            below_left: x > 0 && y + side < height && Self::bottom_left(side, x, y),
         }
     }
 
@@ -429,10 +488,60 @@ impl Reach {
             below_left: false,
         }
     }
+
+    /// `has_top_right` for a block whose transform covers it whole: the top
+    /// row of a superblock reads into the superblock above, which is decoded;
+    /// the rightmost column would read into the superblock to the right, which
+    /// is not; and everything between is the table's to answer.
+    fn top_right(side: usize, x: usize, y: usize) -> bool {
+        let (row, col, per_side) = Self::position(side, x, y);
+        if row == 0 {
+            return true;
+        }
+        if col + 1 == per_side {
+            return false;
+        }
+        Self::bit(HAS_TOP_RIGHT[Self::table(side)], row * per_side + col)
+    }
+
+    /// `has_bottom_left` for such a block: the leftmost column of a superblock
+    /// reads into the superblock to its left, which is decoded only as far
+    /// down as its own bottom; the bottom row would read into the superblock
+    /// below, which is not decoded at all; and the table answers the rest.
+    fn bottom_left(side: usize, x: usize, y: usize) -> bool {
+        let (row, col, per_side) = Self::position(side, x, y);
+        if col == 0 {
+            return row * side + side < SUPERBLOCK;
+        }
+        if row + 1 == per_side {
+            return false;
+        }
+        Self::bit(HAS_BOTTOM_LEFT[Self::table(side)], row * per_side + col)
+    }
+
+    /// Where a block sits inside its superblock, in blocks of its own size,
+    /// and how many of them a superblock is across.
+    fn position(side: usize, x: usize, y: usize) -> (usize, usize, usize) {
+        (
+            (y % SUPERBLOCK) / side,
+            (x % SUPERBLOCK) / side,
+            SUPERBLOCK / side,
+        )
+    }
+
+    /// Which of the two block sizes the encoder codes a table row is for.
+    fn table(side: usize) -> usize {
+        usize::from(side == BLOCK)
+    }
+
+    /// One bit of a table, counting from the low end of its first byte.
+    fn bit(table: &[u8], index: usize) -> bool {
+        (table[index / 8] >> (index % 8)) & 1 != 0
+    }
 }
 
 /// What one symbol costs against a CDF, in bits.
-fn symbol_bits(cdf: &[u16], symbol: usize) -> f64 {
+pub(crate) fn symbol_bits(cdf: &[u16], symbol: usize) -> f64 {
     let low = if symbol == 0 { 0 } else { cdf[symbol - 1] };
     let probability = f64::from(cdf[symbol] - low) / 32768.0;
     -probability.log2()
@@ -447,6 +556,86 @@ fn symbol_bits(cdf: &[u16], symbol: usize) -> f64 {
 /// Without this the search is blind to what a mode costs to name, which is not
 /// a rounding error: a directional mode on a picture that does not run that way
 /// is a rate loss the squared error never sees.
+/// Codes one square of the picture as a single block: searches the luma mode,
+/// codes both chroma planes DC, and hands back the block and what it cost --
+/// squared error plus lambda times the bits its symbols spend.
+fn code_square(
+    luma: &mut Plane,
+    chroma: &mut [Plane; 2],
+    (x, y): (usize, usize),
+    side: usize,
+    search: &Search,
+    mode_bits: &[f64; 13],
+) -> (BlockCoeffs, f64) {
+    let (luma_set, chroma_set) = if side == BLOCK {
+        (TxbSet::Luma32, TxbSet::Chroma16)
+    } else {
+        (TxbSet::Luma16, TxbSet::Chroma8)
+    };
+    let (luma_coeffs, mode, mut cost) = luma.search_block(
+        At {
+            x,
+            y,
+            side,
+            reach: Reach::of(side, x, y, luma.width, luma.height),
+            set: luma_set,
+        },
+        search,
+        mode_bits,
+    );
+    // Chroma is predicted DC because that is the mode the tile writer codes
+    // for it; what it costs still counts towards the partition decision.
+    let mut planes = [Vec::new(), Vec::new()];
+    for (plane, coeffs) in chroma.iter_mut().zip(&mut planes) {
+        let (levels, sse, bits) = plane.code_block(
+            At {
+                x: x / 2,
+                y: y / 2,
+                side: side / 2,
+                reach: Reach::none(),
+                set: chroma_set,
+            },
+            DC_PRED,
+            search.base_q_idx,
+            search.deadzone,
+        );
+        *coeffs = levels;
+        cost += sse + search.lambda * bits;
+    }
+    let [u, v] = planes;
+    (
+        BlockCoeffs {
+            u,
+            v,
+            luma: luma_coeffs,
+            mode,
+        },
+        cost,
+    )
+}
+
+/// The reconstructed samples one 32x32 square covers in all three planes, so
+/// that a partition trial can be undone.
+fn snapshot(luma: &Plane, chroma: &[Plane; 2], (x, y): (usize, usize)) -> [Vec<u8>; 3] {
+    [
+        luma.snapshot(x, y, BLOCK),
+        chroma[0].snapshot(x / 2, y / 2, BLOCK / 2),
+        chroma[1].snapshot(x / 2, y / 2, BLOCK / 2),
+    ]
+}
+
+/// Puts such a snapshot back.
+fn restore(
+    luma: &mut Plane,
+    chroma: &mut [Plane; 2],
+    (x, y): (usize, usize),
+    saved: &[Vec<u8>; 3],
+) {
+    luma.restore(x, y, BLOCK, &saved[0]);
+    chroma[0].restore(x / 2, y / 2, BLOCK / 2, &saved[1]);
+    chroma[1].restore(x / 2, y / 2, BLOCK / 2, &saved[2]);
+}
+
 fn mode_bits(above_mode: u8, left_mode: u8) -> [f64; 13] {
     let luma = &cdf::KF_Y_MODE[INTRA_MODE_CTX[usize::from(above_mode)]]
         [INTRA_MODE_CTX[usize::from(left_mode)]];
@@ -522,6 +711,18 @@ pub fn encode_key_frame_with_modes(
     deadzone: f64,
     modes: &[u8],
 ) -> Result<Encoded> {
+    encode_key_frame_inner(picture, base_q_idx, deadzone, modes, split_blocks())
+}
+
+/// [`encode_key_frame_with_modes`] with the partition decision forced, which is
+/// what the sweep that sets [`SPLIT_BLOCKS`] measures both ways.
+fn encode_key_frame_inner(
+    picture: &Picture,
+    base_q_idx: u8,
+    deadzone: f64,
+    modes: &[u8],
+    split_blocks: bool,
+) -> Result<Encoded> {
     picture.check()?;
     if modes.is_empty() {
         return Err(Error::unsupported(
@@ -573,8 +774,10 @@ pub fn encode_key_frame_with_modes(
     // what picks the CDF the next block's mode is coded against -- the same
     // bookkeeping the tile writer keeps, so that the search is costing the
     // symbol the writer will actually write.
-    let mut above_mode = vec![DC_PRED; cols];
-    let mut left_mode = vec![DC_PRED; rows];
+    // The bookkeeping is kept on the 16x16 grid the tile writer keeps it on,
+    // because a 32x32 block may be split into four 16x16 ones.
+    let mut above_mode = vec![DC_PRED; cols * 2];
+    let mut left_mode = vec![DC_PRED; rows * 2];
     let (sb_cols, sb_rows) = (cols.div_ceil(2), rows.div_ceil(2));
     let mut superblocks = Vec::with_capacity(sb_cols * sb_rows);
     let mut modes = Vec::with_capacity(cols * rows);
@@ -590,47 +793,58 @@ pub fn encode_key_frame_with_modes(
                     continue;
                 }
                 let (x, y) = (col * BLOCK, row * BLOCK);
-                let (luma_coeffs, mode) = luma.search_block(
-                    At {
-                        x,
-                        y,
-                        side: BLOCK,
-                        reach: Reach::quadrant(quadrant),
-                    },
+                let (c0, r0) = (col * 2, row * 2);
+                let base = snapshot(&luma, &chroma, (x, y));
+
+                // What the whole 32x32 costs, including the partition symbol
+                // that says it is not split.
+                let (whole, mut cost_whole) = code_square(
+                    &mut luma,
+                    &mut chroma,
+                    (x, y),
+                    BLOCK,
                     &search,
-                    &mode_bits(above_mode[col], left_mode[row]),
+                    &mode_bits(above_mode[c0], left_mode[r0]),
                 );
-                above_mode[col] = mode;
-                left_mode[row] = mode;
-                modes.push(mode);
-                blocks.push(BlockCoeffs {
-                    // Chroma is predicted DC because that is the mode the tile
-                    // writer codes for it.
-                    u: chroma[0].code_block(
-                        At {
-                            x: x / 2,
-                            y: y / 2,
-                            side: BLOCK / 2,
-                            reach: Reach::none(),
-                        },
-                        DC_PRED,
-                        base_q_idx,
-                        deadzone,
-                    ),
-                    v: chroma[1].code_block(
-                        At {
-                            x: x / 2,
-                            y: y / 2,
-                            side: BLOCK / 2,
-                            reach: Reach::none(),
-                        },
-                        DC_PRED,
-                        base_q_idx,
-                        deadzone,
-                    ),
-                    luma: luma_coeffs,
-                    mode,
-                });
+                cost_whole += search.lambda * partition_bits(BLOCK, false);
+                let after_whole = snapshot(&luma, &chroma, (x, y));
+
+                // What four 16x16 blocks cost instead, each searched against
+                // the reconstruction the ones before it left.
+                restore(&mut luma, &mut chroma, (x, y), &base);
+                let mut split = Vec::with_capacity(4);
+                let mut cost_split = search.lambda
+                    * (partition_bits(BLOCK, true) + 4.0 * partition_bits(SUB, false));
+                let mut split_modes = [DC_PRED; 4];
+                for (sub, sub_mode) in split_modes.iter_mut().enumerate() {
+                    let (sc, sr) = (c0 + sub % 2, r0 + sub / 2);
+                    let (block, cost) = code_square(
+                        &mut luma,
+                        &mut chroma,
+                        (x + (sub % 2) * SUB, y + (sub / 2) * SUB),
+                        SUB,
+                        &search,
+                        &mode_bits(above_mode[sc], left_mode[sr]),
+                    );
+                    cost_split += cost;
+                    *sub_mode = block.mode;
+                    above_mode[sc] = block.mode;
+                    left_mode[sr] = block.mode;
+                    split.push(block);
+                }
+
+                if split_blocks && cost_split < cost_whole {
+                    modes.extend_from_slice(&split_modes);
+                    blocks.push(Quadrant::Split(split));
+                } else {
+                    restore(&mut luma, &mut chroma, (x, y), &after_whole);
+                    for cell in 0..2 {
+                        above_mode[c0 + cell] = whole.mode;
+                        left_mode[r0 + cell] = whole.mode;
+                    }
+                    modes.push(whole.mode);
+                    blocks.push(Quadrant::Whole(whole));
+                }
             }
             superblocks.push(Superblock::Split(blocks));
         }
@@ -851,6 +1065,42 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(" ");
             println!("ladder {name}: {points}");
+        }
+    }
+
+    /// Splitting a 32x32 block into four 16x16 ones, measured both ways over
+    /// the sweep pictures and whatever clips `EC_AV1_CLIPS` names. This is what
+    /// sets [`SPLIT_BLOCKS`]; the table it prints is in the lane report.
+    #[test]
+    #[ignore = "a sweep, not a gate"]
+    fn probe_split() {
+        for (name, picture) in sweep_pictures() {
+            let ladder = |split: bool| {
+                let mut points: Vec<(f64, f64)> = [110u8, 90, 70]
+                    .iter()
+                    .map(|&q| {
+                        let encoded =
+                            encode_key_frame_inner(&picture, q, 0.5, &KEY_FRAME_MODES, split)
+                                .unwrap();
+                        (
+                            psnr(&encoded.reconstruction.y, picture.y.as_slice()),
+                            (encoded.stream.len() as f64).log10(),
+                        )
+                    })
+                    .collect();
+                points.sort_by(|a, b| a.0.total_cmp(&b.0));
+                points
+            };
+            let (whole, split) = (ladder(false), ladder(true));
+            let blocks = encode_key_frame_inner(&picture, 90, 0.5, &KEY_FRAME_MODES, true)
+                .unwrap()
+                .modes
+                .len();
+            let quadrants = (picture.width / BLOCK) * (picture.height / BLOCK);
+            println!(
+                "split {name}: {:+.2}% rate, {blocks} blocks for {quadrants} quadrants at q90",
+                bd_rate(&whole, &split) * 100.0
+            );
         }
     }
 
