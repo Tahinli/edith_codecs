@@ -199,7 +199,12 @@ pub fn key_frame_headers(
         frame_is_intra: true,
         show_frame: true,
         error_resilient_mode: true,
-        disable_cdf_update: true,
+        // The tile writer keeps the same CDF state the decoder does and
+        // updates it in the same order, so the frame lets the decoder adapt.
+        disable_cdf_update: false,
+        // Nothing reads the state this frame leaves behind: a key frame always
+        // starts from the defaults, and this encoder emits one frame.
+        disable_frame_end_update_cdf: true,
         force_integer_mv: true,
         refresh_frame_flags: 0xFF,
         primary_ref_frame: PRIMARY_REF_NONE,
