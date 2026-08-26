@@ -184,6 +184,9 @@ pub struct CtuEncoder<'a> {
     modes: Vec<u8>,
     /// Coding depth per 4x4 block of the band.
     depths: Vec<u8>,
+    /// `log2` of the transform block covering each 4x4 block of the band,
+    /// which is all the deblocking filter needs to find its edges.
+    tu_log2: Vec<u8>,
     /// Which 4x4 blocks of the *current* CTB are reconstructed.
     coded: [bool; 256],
     ctu_x: usize,
@@ -243,11 +246,18 @@ impl<'a> CtuEncoder<'a> {
             min_cb_log2: min_cb_log2.clamp(MIN_CB_LOG2, 5),
             modes: vec![255; (width / 4) * (ctb_size / 4)],
             depths: vec![0; (width / 4) * (ctb_size / 4)],
+            tu_log2: vec![2; (width / 4) * (ctb_size / 4)],
             coded: [false; 256],
             ctu_x: 0,
             last_cu_empty: false,
             scratch: Scratch::new(),
         }
+    }
+
+    /// `log2` of the transform block covering each 4x4 unit of this row's
+    /// band, in raster order across the whole picture width.
+    pub fn tu_log2_band(&self) -> &[u8] {
+        &self.tu_log2
     }
 
     /// Code one coding tree unit at CTB column `ctu_x`.
@@ -482,12 +492,13 @@ impl<'a> CtuEncoder<'a> {
 
     fn save_meta(&self, x: usize, y: usize, size: usize) -> Vec<u8> {
         let stride = self.width / 4;
-        let mut out = Vec::with_capacity(2 * (size / 4) * (size / 4));
+        let mut out = Vec::with_capacity(3 * (size / 4) * (size / 4));
         for by in (y..y + size).step_by(4) {
             for bx in (x..x + size).step_by(4) {
                 let idx = ((by - self.band_y0) / 4) * stride + bx / 4;
                 out.push(self.modes[idx]);
                 out.push(self.depths[idx]);
+                out.push(self.tu_log2[idx]);
             }
         }
         out
@@ -501,7 +512,8 @@ impl<'a> CtuEncoder<'a> {
                 let idx = ((by - self.band_y0) / 4) * stride + bx / 4;
                 self.modes[idx] = data[i];
                 self.depths[idx] = data[i + 1];
-                i += 2;
+                self.tu_log2[idx] = data[i + 2];
+                i += 3;
             }
         }
     }
@@ -579,6 +591,7 @@ impl<'a> CtuEncoder<'a> {
             modes[part] = mode;
             mpms[part] = mpm;
             self.mark_coded(px, py, 4, mode, depth);
+            self.mark_tu(px, py, 4);
         }
 
         // part_mode: PART_NxN is the single bin 0.
@@ -733,6 +746,7 @@ impl<'a> CtuEncoder<'a> {
             // The next quadrant predicts from this one, so its samples have to
             // read as available now: the decoder walks the tree in z-order too.
             self.mark_coded(cx, cy, HALF, mode, depth);
+            self.mark_tu(cx, cy, HALF);
             let (_, cbf) = self.code_chroma(cx, cy, HALF, chroma_mode, 1, chroma_tskip);
             child_cb_cbf[part] = cbf;
             child_cb[part][..q].copy_from_slice(&self.scratch.cb_levels[..q]);
@@ -870,6 +884,7 @@ impl<'a> CtuEncoder<'a> {
                 // unit is marked: a transform tree is walked in the same
                 // z-order by the decoder.
                 self.mark_coded(cx, cy, half, mode, depth);
+                self.mark_tu(cx, cy, half);
                 if chroma_split {
                     let q = half * half / 4;
                     let (_, cbf) = self.code_chroma(cx, cy, half, chroma_mode, 1, chroma_tskip);
@@ -941,6 +956,9 @@ impl<'a> CtuEncoder<'a> {
                     cb_cbf,
                     cr_cbf,
                 );
+                // The split trial recorded four child transform blocks; this
+                // unit keeps one, and the deblocking filter reads the map.
+                self.mark_tu(x, y, n);
                 self.last_cu_empty = !(luma_cbf || cb_cbf || cr_cbf);
             } else {
                 self.load_region(x, y, n, &split_rec);
@@ -986,6 +1004,7 @@ impl<'a> CtuEncoder<'a> {
             cr_cbf,
         );
         self.mark_coded(x, y, n, mode, depth);
+        self.mark_tu(x, y, n);
         self.last_cu_empty = !(luma_cbf || cb_cbf || cr_cbf);
         let bits = enc.bit_count() - before;
         self.region_ssd(x, y, n) + self.lambda * bits as f64
@@ -1215,6 +1234,19 @@ impl<'a> CtuEncoder<'a> {
             None
         };
         intra::mpm_list(left, above)
+    }
+
+    /// Record the transform block of side `n` at `(x, y)`, which is what the
+    /// deblocking filter reads its edges off. Marked at transform-tree *leaves*
+    /// only: a coding unit that split records four children, never itself.
+    fn mark_tu(&mut self, x: usize, y: usize, n: usize) {
+        let stride = self.width / 4;
+        let log2 = n.trailing_zeros() as u8;
+        for by in (y..y + n).step_by(4) {
+            for bx in (x..x + n).step_by(4) {
+                self.tu_log2[((by - self.band_y0) / 4) * stride + bx / 4] = log2;
+            }
+        }
     }
 
     fn mark_coded(&mut self, x: usize, y: usize, n: usize, mode: u8, depth: u8) {
