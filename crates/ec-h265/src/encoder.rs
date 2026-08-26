@@ -24,6 +24,7 @@
 //! whose parameter sets are elsewhere is not one.
 
 use crate::ctu::{CtuEncoder, RowBoundary, RowState, SourcePlanes};
+use crate::deblock::{TuMap, deblock};
 use ec_core::color::ContentLight;
 use ec_core::error::{Error, Result};
 use ec_core::frame::{PixelFormat, Plane, VideoFrame};
@@ -196,6 +197,12 @@ pub struct EncoderConfig {
     pub timing: Option<(u32, u32)>,
     /// HDR mastering metadata, written as prefix SEI.
     pub content_light: ContentLight,
+    /// Run the in-loop deblocking filter over the finished picture.
+    ///
+    /// An intra picture predicts from its unfiltered reconstruction, so this
+    /// changes only what a decoder shows -- and what the reconstruction and its
+    /// picture hash therefore have to say.
+    pub deblock: bool,
     /// Emit the decoded picture hash SEI (MD5 of the reconstruction).
     pub picture_hash: bool,
     /// Return the reconstruction alongside the bitstream.
@@ -226,6 +233,7 @@ impl EncoderConfig {
             sample_aspect_ratio: None,
             timing: None,
             content_light: ContentLight::default(),
+            deblock: true,
             picture_hash: false,
             keep_recon: false,
         }
@@ -343,17 +351,16 @@ impl Encoder {
             id: 0,
             sps_id: 0,
             entropy_coding_sync_enabled: true,
-            // Deblocking and SAO are both off, which is what makes the
-            // encoder's reconstruction bit-identical to a decoder's output: an
-            // intra-only stream predicts from its own reconstruction only, so
-            // an in-loop filter would change what a decoder shows without
-            // changing what either side predicts from. Turning them off buys
-            // that identity (and the picture-hash check that rides on it)
-            // rather than a fraction of a dB.
+            // SAO is off; deblocking follows `EncoderConfig::deblock`. An
+            // intra-only stream predicts from its own *unfiltered*
+            // reconstruction (8.4.4.2.1), so the deblocking filter changes
+            // neither side's prediction: running it over the finished picture
+            // here keeps the reconstruction bit-identical to a decoder's
+            // output, and the picture hash that rides on it honest.
             sign_data_hiding_enabled: cfg.sign_hiding,
             transform_skip_enabled: cfg.transform_skip != TransformSkip::Off,
             deblocking_filter_control_present: true,
-            deblocking_filter_disabled: true,
+            deblocking_filter_disabled: !cfg.deblock,
             loop_filter_across_slices_enabled: false,
             ..Pps::default()
         };
@@ -525,6 +532,9 @@ impl Encoder {
         let wpp_contexts: Vec<Mutex<Option<Contexts>>> =
             (0..rows).map(|_| Mutex::new(None)).collect();
         let substreams: Vec<Mutex<Vec<u8>>> = (0..rows).map(|_| Mutex::new(Vec::new())).collect();
+        // Each row publishes the transform-block sizes of its band, which the
+        // deblocking filter reads its edges off once the picture is whole.
+        let tu_bands: Vec<Mutex<Vec<u8>>> = (0..rows).map(|_| Mutex::new(Vec::new())).collect();
 
         // One band of the reconstruction per CTB row, handed out by index.
         let mut bands_y: Vec<&mut [u8]> = rec_y.chunks_mut(ctb * width).collect();
@@ -553,6 +563,7 @@ impl Encoder {
                 let progress = &progress;
                 let wpp_contexts = &wpp_contexts;
                 let substreams = &substreams;
+                let tu_bands = &tu_bands;
                 let src = &src;
                 scope.spawn(move || {
                     for (row, band_y, band_cb, band_cr) in worker_rows {
@@ -629,6 +640,9 @@ impl Encoder {
                         if let Ok(mut slot) = substreams[row].lock() {
                             *slot = enc.finish();
                         }
+                        if let Ok(mut slot) = tu_bands[row].lock() {
+                            *slot = coder.tu_log2_band().to_vec();
+                        }
                     }
                 });
             }
@@ -638,6 +652,25 @@ impl Encoder {
             .into_iter()
             .map(|m| m.into_inner().unwrap_or_default())
             .collect();
+        if self.cfg.deblock {
+            let mut tus = TuMap::new(width, height);
+            for (row, band) in tu_bands.into_iter().enumerate() {
+                let band = band.into_inner().unwrap_or_default();
+                let band_y0 = row * ctb;
+                let band_rows = (height - band_y0).min(ctb) / 4;
+                tus.absorb_band(band_y0, band_rows, &band);
+            }
+            deblock(
+                &mut rec_y,
+                &mut rec_cb,
+                &mut rec_cr,
+                width,
+                height,
+                qp,
+                &tus,
+            );
+        }
+
         let au = self.assemble_au(qp, &substreams, &rec_y, &rec_cb, &rec_cr);
         let recon = self
             .cfg
