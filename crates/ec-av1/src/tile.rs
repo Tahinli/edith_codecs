@@ -1130,6 +1130,7 @@ fn write_block_planes(
             scan,
             skip_ctx,
             dc_sign_ctx(around[plane].dc_vote),
+            Some(plane),
         );
         ec_rng_trace(|| {
             format!(
@@ -1279,7 +1280,7 @@ pub(crate) fn coeff_bits(grid: &[i32], set: TxbSet) -> f64 {
     };
     let mut enc = SymbolEncoder::new();
     enc.reset_bits();
-    write_coeffs(&mut enc, &mut coding, grid, scan, 0, 0);
+    write_coeffs(&mut enc, &mut coding, grid, scan, 0, 0, None);
     enc.bits()
 }
 
@@ -1312,6 +1313,7 @@ pub(crate) fn partition_bits(side: usize, split: bool) -> f64 {
 /// levels the contexts below are read from are the levels of
 /// coefficients later in the scan, which a decoder walking the scan backwards
 /// already has.
+#[allow(clippy::too_many_arguments)]
 fn write_coeffs(
     enc: &mut SymbolEncoder,
     coding: &mut TxbTables,
@@ -1319,13 +1321,26 @@ fn write_coeffs(
     scan: &[u16],
     skip_ctx: usize,
     sign_ctx: usize,
+    plane: Option<usize>,
 ) {
+    if let Some(plane) = plane {
+        ec_rng_trace(|| format!("EC_PLANE plane={plane} tell_before={}", enc.tell()));
+    }
     let side = coding.side;
     let eob = scan
         .iter()
         .rposition(|&pos| grid[pos as usize] != 0)
         .map_or(0, |i| i + 1);
     enc.symbol(usize::from(eob == 0), &mut coding.txb_skip[skip_ctx]);
+    if plane.is_some() {
+        ec_rng_trace(|| {
+            format!(
+                "EC_TXBSKIP ctx={skip_ctx} eob0={} tell={}",
+                usize::from(eob == 0),
+                enc.tell()
+            )
+        });
+    }
     if eob == 0 {
         return;
     }
@@ -1334,9 +1349,12 @@ fn write_coeffs(
     // uses DCT_DCT, which is index one of `Tx_Type_Intra_Inv_Set2`.
     if let Some(tx_type) = coding.tx_type.as_deref_mut() {
         enc.symbol(TX_TYPE_DCT_DCT_SET2, tx_type);
+        if plane.is_some() {
+            ec_rng_trace(|| format!("EC_TXTYPE tell={}", enc.tell()));
+        }
     }
 
-    write_eob(enc, coding, eob);
+    write_eob(enc, coding, eob, plane);
 
     for scan_idx in (0..eob).rev() {
         let pos = scan[scan_idx] as usize;
@@ -1344,16 +1362,29 @@ fn write_coeffs(
         let level = grid[pos].abs();
         if scan_idx == eob - 1 {
             let ctx = eob_coeff_ctx(scan_idx, side * side);
-            enc.symbol(
-                (level.min(NUM_BASE_LEVELS + 1) - 1) as usize,
-                &mut coding.base_eob[ctx],
-            );
+            let sym = (level.min(NUM_BASE_LEVELS + 1) - 1) as usize;
+            enc.symbol(sym, &mut coding.base_eob[ctx]);
+            if plane.is_some() {
+                ec_rng_trace(|| {
+                    format!(
+                        "EC_BASEEOB scan_idx={scan_idx} ctx={ctx} level={} tell={}",
+                        sym + 1,
+                        enc.tell()
+                    )
+                });
+            }
         } else {
             let ctx = base_ctx(grid, side, row, col);
-            enc.symbol(
-                level.min(NUM_BASE_LEVELS + 1) as usize,
-                &mut coding.base[ctx],
-            );
+            let sym = level.min(NUM_BASE_LEVELS + 1) as usize;
+            enc.symbol(sym, &mut coding.base[ctx]);
+            if plane.is_some() {
+                ec_rng_trace(|| {
+                    format!(
+                        "EC_BASE scan_idx={scan_idx} ctx={ctx} level={sym} tell={}",
+                        enc.tell()
+                    )
+                });
+            }
         }
         if level > NUM_BASE_LEVELS {
             let ctx = br_ctx(grid, side, row, col);
@@ -1362,6 +1393,14 @@ fn write_coeffs(
             while sent < COEFF_BASE_RANGE {
                 let k = remaining.min(BR_STEP);
                 enc.symbol(k as usize, &mut coding.br[ctx]);
+                if plane.is_some() {
+                    ec_rng_trace(|| {
+                        format!(
+                            "EC_BR scan_idx={scan_idx} ctx={ctx} k={k} tell={}",
+                            enc.tell()
+                        )
+                    });
+                }
                 if k < BR_STEP {
                     break;
                 }
@@ -1380,6 +1419,15 @@ fn write_coeffs(
         }
         if pos == 0 {
             enc.symbol(usize::from(level < 0), &mut coding.dc_sign[sign_ctx]);
+            if plane.is_some() {
+                ec_rng_trace(|| {
+                    format!(
+                        "EC_DCSIGN ctx={sign_ctx} neg={} tell={}",
+                        usize::from(level < 0),
+                        enc.tell()
+                    )
+                });
+            }
         } else {
             enc.literal(u32::from(level < 0), 1);
         }
@@ -1387,14 +1435,20 @@ fn write_coeffs(
         // of itself here, after its own sign (spec 5.11.39).
         if level.abs() > MAX_BR_LEVEL {
             write_golomb(enc, (level.abs() - MAX_BR_LEVEL - 1) as u32);
+            if plane.is_some() {
+                ec_rng_trace(|| format!("EC_GOLOMB tell={}", enc.tell()));
+            }
         }
+    }
+    if let Some(plane) = plane {
+        ec_rng_trace(|| format!("EC_PLANE plane={plane} eob={eob} tell_after={}", enc.tell()));
     }
 }
 
 /// The end-of-block position (spec 5.11.39): which group of scan positions the
 /// last coded coefficient falls in, then its offset inside that group — the
 /// offset's top bit from a CDF and the rest as raw bits.
-fn write_eob(enc: &mut SymbolEncoder, coding: &mut TxbTables, eob: usize) {
+fn write_eob(enc: &mut SymbolEncoder, coding: &mut TxbTables, eob: usize, plane: Option<usize>) {
     /// `Eob_Group_Start` (spec 5.11.39): the first scan position each group of
     /// end-of-block positions covers, indexed by the group's own number.
     const GROUP_START: [usize; 12] = [0, 1, 2, 3, 5, 9, 17, 33, 65, 129, 257, 513];
@@ -1408,14 +1462,34 @@ fn write_eob(enc: &mut SymbolEncoder, coding: &mut TxbTables, eob: usize) {
     // The groups are numbered from one, and how many of them the transform
     // reaches is the size of its own end-of-block alphabet.
     enc.symbol(group - 1, coding.eob_pt);
+    if let Some(plane) = plane {
+        ec_rng_trace(|| format!("EC_EOBPT plane={plane} eob_pt={group} tell={}", enc.tell()));
+    }
 
     let bits = OFFSET_BITS[group];
     if bits > 0 {
         let offset = (eob - GROUP_START[group]) as u32;
         let top = (offset >> (bits - 1)) & 1;
         enc.symbol(top as usize, &mut coding.eob_extra[group - 3]);
+        if let Some(plane) = plane {
+            ec_rng_trace(|| {
+                format!(
+                    "EC_EOBEXTRA plane={plane} eob_ctx={} top={top} tell={}",
+                    group - 3,
+                    enc.tell()
+                )
+            });
+        }
         if bits > 1 {
             enc.literal(offset & ((1 << (bits - 1)) - 1), bits - 1);
+            if let Some(plane) = plane {
+                ec_rng_trace(|| {
+                    format!(
+                        "EC_EOBBITS plane={plane} eob_extra={offset} tell={}",
+                        enc.tell()
+                    )
+                });
+            }
         }
     }
 }
@@ -2622,6 +2696,7 @@ mod tests {
                 &scan,
                 0,
                 0,
+                None,
             );
             priced += luma_32_coeff_bits(grid);
         }
