@@ -349,10 +349,17 @@ fn x265_encode_qp(sources: &[Planes], w: usize, h: usize, qp: i32) -> Option<Vec
     // EC_H265_X265_PARAMS appends to attribute a single feature the same way
     // EC_H264_X264_PARAMS does.
     let params = format!(
-        "qp={qp}:keyint=1:bframes=0:scenecut=0:rc-lookahead=0:no-sao:no-deblock:\
+        "qp={qp}:keyint=1:bframes=0:scenecut=0:rc-lookahead=0:no-sao:{deblock}\
          aq-mode=0:psy-rd=0:psy-rdoq=0:rdoq-level=0:tu-intra-depth=1:ipratio=1.0:\
-         pbratio=1.0:qcomp=1.0:chroma-qp-offset=0{}",
-        match std::env::var("EC_H265_X265_PARAMS") {
+         pbratio=1.0:qcomp=1.0:chroma-qp-offset=0{extra}",
+        // x265 deblocks by default; `no-deblock` matches an encoder that does
+        // not, and EC_H265_X265_DEBLOCK=1 drops it so both sides filter.
+        deblock = if std::env::var("EC_H265_X265_DEBLOCK").is_ok_and(|v| v != "0") {
+            ""
+        } else {
+            "no-deblock:"
+        },
+        extra = match std::env::var("EC_H265_X265_PARAMS") {
             Ok(extra) if !extra.trim().trim_matches(':').is_empty() =>
                 format!(":{}", extra.trim().trim_matches(':')),
             _ => String::new(),
@@ -456,6 +463,9 @@ fn bd_psnr_vs_x265() {
         }
         if let Ok(v) = std::env::var("EC_H265_CU64") {
             cfg.cu64 = v != "0";
+        }
+        if let Ok(v) = std::env::var("EC_H265_DEBLOCK") {
+            cfg.deblock = v != "0";
         }
         if let Ok(v) = std::env::var("EC_H265_RQT") {
             cfg.rqt = v != "0";
