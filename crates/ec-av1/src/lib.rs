@@ -19,6 +19,7 @@ pub mod encode;
 pub mod frame;
 pub mod intra;
 pub mod mc;
+pub mod motion;
 pub mod msac;
 pub mod mvstack;
 pub mod obu;
