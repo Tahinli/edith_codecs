@@ -1577,7 +1577,12 @@ pub fn sb_coeff_inter_frame_tile(
     let mut grid = MiGrid::new(mi_cols as usize, mi_rows as usize);
     let mut cdfs = Cdfs::new(q_ctx_of(base_q_idx));
     let mut enc = SymbolEncoder::new();
-    let split_planes = [TxbSet::Luma32, TxbSet::Chroma16, TxbSet::Chroma16];
+    // An `is_inter` block's 32x32 luma transform reads a different
+    // `tx_type` set than an intra block's (`get_tx_set`, spec 5.11.48; see
+    // `TxbSet::Luma32Inter`'s doc comment); chroma's transform type is
+    // derived from luma's, not coded, so it never differs between the two.
+    let intra_planes = [TxbSet::Luma32, TxbSet::Chroma16, TxbSet::Chroma16];
+    let inter_planes = [TxbSet::Luma32Inter, TxbSet::Chroma16, TxbSet::Chroma16];
     let scan32 = default_scan(TX32);
     let scan16 = default_scan(TX16);
     let zero_grids = [
@@ -1707,7 +1712,11 @@ pub fn sb_coeff_inter_frame_tile(
                     write_block_planes(
                         &mut enc,
                         &mut cdfs,
-                        &split_planes,
+                        if is_inter {
+                            &inter_planes
+                        } else {
+                            &intra_planes
+                        },
                         &grids,
                         &[&scan32, &scan16, &scan16],
                         &neighbours.around(at, BLOCK),
