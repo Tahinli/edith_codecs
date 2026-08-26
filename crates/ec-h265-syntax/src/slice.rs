@@ -430,6 +430,17 @@ impl SliceHeader {
                     if h.slice_type == SliceType::B {
                         h.num_ref_idx_l1_active_minus1 = r.read_ue()?;
                     }
+                    // 7.4.7.1: both fields are in range 0..=14. Past that is
+                    // a corrupt stream, not a bigger reference list -- and
+                    // pred_weight_table below sizes a Vec from this value, so
+                    // an unchecked ue(v) is a header-declared allocation an
+                    // attacker fully controls (up to 2^32 entries from a
+                    // handful of bits).
+                    if h.num_ref_idx_l0_active_minus1 > 14 || h.num_ref_idx_l1_active_minus1 > 14 {
+                        return Err(Error::corrupt(
+                            "HEVC slice header: num_ref_idx_lX_active_minus1 out of range",
+                        ));
+                    }
                 }
                 let num_pic_total_curr = h.short_term_ref_pic_set.num_used_by_curr + num_long_term;
                 if pps.lists_modification_present && num_pic_total_curr > 1 {
