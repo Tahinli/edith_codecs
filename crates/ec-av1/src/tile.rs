@@ -14,6 +14,7 @@ use std::sync::LazyLock;
 use ec_core::{Error, Result};
 
 use crate::cdf;
+use crate::cdf_state::{Cdfs, TxbSet, TxbTables};
 use crate::msac::SymbolEncoder;
 
 /// `PARTITION_NONE` (spec 6.10.4): the whole block, undivided.
@@ -365,90 +366,6 @@ const TX32: usize = 32;
 /// Side of the chroma transform beside it at 4:2:0.
 const TX16: usize = 16;
 
-/// The shapes and default CDFs one plane's transform blocks are coded with.
-/// The two differ in every coefficient table because the CDFs are indexed by
-/// plane type and transform size, and in the end-of-block alphabet because a
-/// 16x16 transform has a quarter of the positions to point at.
-struct TxbCoding {
-    /// Side of the transform, in coefficients.
-    side: usize,
-    /// The all-zero flag, indexed by its own context.
-    txb_skip: &'static [[u16; 3]],
-    /// The end-of-block group, whose alphabet the transform size sets.
-    eob_pt: &'static [u16],
-    /// The top bit of the offset inside that group.
-    eob_extra: &'static [[u16; 3]; 9],
-    /// A coefficient's base level.
-    base: &'static [[u16; 5]; 42],
-    /// The base level of the last coefficient in the scan.
-    base_eob: &'static [[u16; 4]; 4],
-    /// The base-range tail above level two.
-    br: &'static [[u16; 5]; 21],
-    /// The sign of the DC.
-    dc_sign: &'static [[u16; 3]; 3],
-}
-
-/// The luma all-zero flag has one context here: the transform covers its whole
-/// block, which fixes it at zero.
-const TXB_SKIP_LUMA_32_CTX: [[u16; 3]; 1] = [cdf::TXB_SKIP_LUMA_32];
-
-/// The 32x32 luma transform of a 32x32 block.
-const LUMA_32: TxbCoding = TxbCoding {
-    side: TX32,
-    txb_skip: &TXB_SKIP_LUMA_32_CTX,
-    eob_pt: &cdf::EOB_PT_1024_LUMA,
-    eob_extra: &cdf::EOB_EXTRA_LUMA_32,
-    base: &cdf::COEFF_BASE_LUMA_32,
-    base_eob: &cdf::COEFF_BASE_EOB_LUMA_32,
-    br: &cdf::COEFF_BR_LUMA_32,
-    dc_sign: &cdf::DC_SIGN_LUMA,
-};
-
-/// The 16x16 transform of either chroma plane of that block at 4:2:0.
-const CHROMA_16: TxbCoding = TxbCoding {
-    side: TX16,
-    txb_skip: &cdf::TXB_SKIP_CHROMA_16,
-    eob_pt: &cdf::EOB_PT_256_CHROMA,
-    eob_extra: &cdf::EOB_EXTRA_CHROMA_16,
-    base: &cdf::COEFF_BASE_CHROMA_16,
-    base_eob: &cdf::COEFF_BASE_EOB_CHROMA_16,
-    br: &cdf::COEFF_BR_CHROMA_16,
-    dc_sign: &cdf::DC_SIGN_CHROMA,
-};
-
-/// The luma all-zero flag of a 64x64 transform, whose one context is fixed the
-/// way [`TXB_SKIP_LUMA_32_CTX`] is.
-const TXB_SKIP_LUMA_64_CTX: [[u16; 3]; 1] = [cdf::TXB_SKIP_LUMA_64];
-
-/// The 64x64 luma transform of a whole superblock. Only its top-left 32x32
-/// carries coefficients, so it is scanned and its end-of-block position read
-/// as a 32x32 transform is; what it does not share with [`LUMA_32`] is every
-/// coefficient CDF, which is indexed by the transform size.
-const LUMA_64: TxbCoding = TxbCoding {
-    side: TX32,
-    txb_skip: &TXB_SKIP_LUMA_64_CTX,
-    eob_pt: &cdf::EOB_PT_1024_LUMA,
-    eob_extra: &cdf::EOB_EXTRA_LUMA_64,
-    base: &cdf::COEFF_BASE_LUMA_64,
-    base_eob: &cdf::COEFF_BASE_EOB_LUMA_64,
-    // The base-range tail is the one table a 64x64 transform does not have of
-    // its own: the index is clamped at the 32x32 size, so it reads that row.
-    br: &cdf::COEFF_BR_LUMA_32,
-    dc_sign: &cdf::DC_SIGN_LUMA,
-};
-
-/// The 32x32 transform of either chroma plane of that superblock at 4:2:0.
-const CHROMA_32: TxbCoding = TxbCoding {
-    side: TX32,
-    txb_skip: &cdf::TXB_SKIP_CHROMA_32,
-    eob_pt: &cdf::EOB_PT_1024_CHROMA,
-    eob_extra: &cdf::EOB_EXTRA_CHROMA_32,
-    base: &cdf::COEFF_BASE_CHROMA_32,
-    base_eob: &cdf::COEFF_BASE_EOB_CHROMA_32,
-    br: &cdf::COEFF_BR_CHROMA_32,
-    dc_sign: &cdf::DC_SIGN_CHROMA,
-};
-
 /// What one coded block leaves behind for the blocks that read it as a
 /// neighbour: whether it coded anything at all, and the sign of its DC.
 #[derive(Clone, Copy, Default)]
@@ -556,8 +473,8 @@ pub fn sb_coeff_key_frame_tile(
         ));
     }
 
-    let split_planes = [&LUMA_32, &CHROMA_16, &CHROMA_16];
-    let whole_planes = [&LUMA_64, &CHROMA_32, &CHROMA_32];
+    let split_planes = [TxbSet::Luma32, TxbSet::Chroma16, TxbSet::Chroma16];
+    let whole_planes = [TxbSet::Luma64, TxbSet::Chroma32, TxbSet::Chroma32];
     let scans = [default_scan(TX32), default_scan(TX16)];
     // What the blocks above and to the left of the one being coded left
     // behind, per plane, one entry per 32x32 column and row. The left column
@@ -579,6 +496,10 @@ pub fn sb_coeff_key_frame_tile(
     let mut above_split = vec![false; cols as usize];
     let mut left_split = vec![false; rows as usize];
 
+    // The tile adapts every non-literal CDF it writes, exactly as the decoder
+    // adapts the ones it reads, so the frame header leaves `disable_cdf_update`
+    // off.
+    let mut cdfs = Cdfs::new();
     let mut enc = SymbolEncoder::new();
     for sb_r in 0..sb_rows {
         left.iter_mut().for_each(|l| *l = Default::default());
@@ -611,15 +532,16 @@ pub fn sb_coeff_key_frame_tile(
                             "a superblock that is half outside the frame cannot be left whole",
                         ));
                     }
-                    enc.symbol_fixed(PARTITION_NONE, &cdf::PARTITION_W64[ctx]);
+                    enc.symbol(PARTITION_NONE, &mut cdfs.partition_w64[ctx]);
                     let mode = write_intra_mode(
                         &mut enc,
+                        &mut cdfs,
                         block,
                         above_mode[c0],
                         left_mode[r0],
                         // A 64x64 block is too big to be offered chroma from
                         // luma, so its chroma mode reads the table without it.
-                        &cdf::UV_MODE_NO_CFL[usize::from(block.mode)],
+                        false,
                     );
                     let grids = [
                         level_grid(&block.luma, TX32)?,
@@ -628,6 +550,7 @@ pub fn sb_coeff_key_frame_tile(
                     ];
                     write_block_planes(
                         &mut enc,
+                        &mut cdfs,
                         &whole_planes,
                         &grids,
                         &[&scans[0], &scans[0], &scans[0]],
@@ -650,12 +573,15 @@ pub fn sb_coeff_key_frame_tile(
                 }
                 Superblock::Split(blocks) => {
                     match (has_cols, has_rows) {
-                        (true, true) => enc.symbol_fixed(PARTITION_SPLIT, &cdf::PARTITION_W64[ctx]),
+                        (true, true) => enc.symbol(PARTITION_SPLIT, &mut cdfs.partition_w64[ctx]),
+                        // The gathered CDF an edge superblock reads is built
+                        // for the read and thrown away: the decoder never
+                        // stores it back, so nothing adapts here.
                         (true, false) => {
-                            enc.symbol_fixed(1, &gather(&cdf::PARTITION_W64[ctx], VERT_ALIKE));
+                            enc.symbol_fixed(1, &gather(&cdfs.partition_w64[ctx], VERT_ALIKE));
                         }
                         (false, true) => {
-                            enc.symbol_fixed(1, &gather(&cdf::PARTITION_W64[ctx], HORZ_ALIKE));
+                            enc.symbol_fixed(1, &gather(&cdfs.partition_w64[ctx], HORZ_ALIKE));
                         }
                         (false, false) => {}
                     }
@@ -666,13 +592,14 @@ pub fn sb_coeff_key_frame_tile(
                         ));
                     }
                     for (block, (r, c)) in blocks.iter().zip(quadrants) {
-                        enc.symbol_fixed(PARTITION_NONE, &cdf::PARTITION_W32[0]);
+                        enc.symbol(PARTITION_NONE, &mut cdfs.partition_w32[0]);
                         let mode = write_intra_mode(
                             &mut enc,
+                            &mut cdfs,
                             block,
                             above_mode[c],
                             left_mode[r],
-                            &cdf::UV_MODE_CFL[usize::from(block.mode)],
+                            true,
                         );
                         let grids = [
                             level_grid(&block.luma, TX32)?,
@@ -681,6 +608,7 @@ pub fn sb_coeff_key_frame_tile(
                         ];
                         write_block_planes(
                             &mut enc,
+                            &mut cdfs,
                             &split_planes,
                             &grids,
                             &[&scans[0], &scans[1], &scans[1]],
@@ -710,21 +638,28 @@ pub fn sb_coeff_key_frame_tile(
 /// the luma mode, which is what the blocks beside it read.
 fn write_intra_mode(
     enc: &mut SymbolEncoder,
+    cdfs: &mut Cdfs,
     block: &BlockCoeffs,
     above_mode: usize,
     left_mode: usize,
-    uv_cdf: &[u16],
+    cfl: bool,
 ) -> usize {
     let mode = usize::from(block.mode);
-    enc.symbol_fixed(0, &cdf::SKIP[0]);
-    enc.symbol_fixed(
+    enc.symbol(0, &mut cdfs.skip[0]);
+    enc.symbol(
         mode,
-        &cdf::KF_Y_MODE[INTRA_MODE_CTX[above_mode]][INTRA_MODE_CTX[left_mode]],
+        &mut cdfs.kf_y_mode[INTRA_MODE_CTX[above_mode]][INTRA_MODE_CTX[left_mode]],
     );
     if (V_PRED..=D67_PRED).contains(&mode) {
-        enc.symbol_fixed(ANGLE_DELTA_ZERO, &cdf::ANGLE_DELTA[mode - V_PRED]);
+        enc.symbol(ANGLE_DELTA_ZERO, &mut cdfs.angle_delta[mode - V_PRED]);
     }
-    enc.symbol_fixed(DC_PRED, uv_cdf);
+    // A block small enough to be offered chroma from luma reads the wider
+    // table even when it does not take the mode.
+    if cfl {
+        enc.symbol(DC_PRED, &mut cdfs.uv_mode_cfl[mode]);
+    } else {
+        enc.symbol(DC_PRED, &mut cdfs.uv_mode_no_cfl[mode]);
+    }
     mode
 }
 
@@ -732,7 +667,8 @@ fn write_intra_mode(
 /// decoder reads them.
 fn write_block_planes(
     enc: &mut SymbolEncoder,
-    planes: &[&TxbCoding; 3],
+    cdfs: &mut Cdfs,
+    planes: &[TxbSet; 3],
     grids: &[Vec<i32>; 3],
     scans: &[&Vec<u16>; 3],
     above: &[Neighbour; 3],
@@ -750,7 +686,7 @@ fn write_block_planes(
         };
         write_coeffs(
             enc,
-            planes[plane],
+            &mut cdfs.txb(planes[plane]),
             grid,
             scans[plane],
             skip_ctx,
@@ -878,7 +814,17 @@ pub(crate) fn luma_32_coeff_bits(grid: &[i32]) -> f64 {
     static SCAN: LazyLock<Vec<u16>> = LazyLock::new(|| default_scan(TX32));
     let mut enc = SymbolEncoder::new();
     enc.reset_bits();
-    write_coeffs(&mut enc, &LUMA_32, grid, &SCAN, 0, 0);
+    // The search runs before the tile is written, so the adapted state the
+    // block will really be coded against does not exist yet: the price is
+    // taken against the defaults every tile starts from.
+    write_coeffs(
+        &mut enc,
+        &mut Cdfs::new().txb(TxbSet::Luma32),
+        grid,
+        &SCAN,
+        0,
+        0,
+    );
     enc.bits()
 }
 
@@ -891,7 +837,7 @@ pub(crate) fn luma_32_coeff_bits(grid: &[i32]) -> f64 {
 /// already has.
 fn write_coeffs(
     enc: &mut SymbolEncoder,
-    coding: &TxbCoding,
+    coding: &mut TxbTables,
     grid: &[i32],
     scan: &[u16],
     skip_ctx: usize,
@@ -902,7 +848,7 @@ fn write_coeffs(
         .iter()
         .rposition(|&pos| grid[pos as usize] != 0)
         .map_or(0, |i| i + 1);
-    enc.symbol_fixed(usize::from(eob == 0), &coding.txb_skip[skip_ctx]);
+    enc.symbol(usize::from(eob == 0), &mut coding.txb_skip[skip_ctx]);
     if eob == 0 {
         return;
     }
@@ -915,13 +861,16 @@ fn write_coeffs(
         let level = grid[pos].abs();
         if scan_idx == eob - 1 {
             let ctx = eob_coeff_ctx(scan_idx, side * side);
-            enc.symbol_fixed(
+            enc.symbol(
                 (level.min(NUM_BASE_LEVELS + 1) - 1) as usize,
-                &coding.base_eob[ctx],
+                &mut coding.base_eob[ctx],
             );
         } else {
             let ctx = base_ctx(grid, side, row, col);
-            enc.symbol_fixed(level.min(NUM_BASE_LEVELS + 1) as usize, &coding.base[ctx]);
+            enc.symbol(
+                level.min(NUM_BASE_LEVELS + 1) as usize,
+                &mut coding.base[ctx],
+            );
         }
         if level > NUM_BASE_LEVELS {
             let ctx = br_ctx(grid, side, row, col);
@@ -929,7 +878,7 @@ fn write_coeffs(
             let mut sent = 0;
             while sent < COEFF_BASE_RANGE {
                 let k = remaining.min(BR_STEP);
-                enc.symbol_fixed(k as usize, &coding.br[ctx]);
+                enc.symbol(k as usize, &mut coding.br[ctx]);
                 if k < BR_STEP {
                     break;
                 }
@@ -947,7 +896,7 @@ fn write_coeffs(
             continue;
         }
         if pos == 0 {
-            enc.symbol_fixed(usize::from(level < 0), &coding.dc_sign[sign_ctx]);
+            enc.symbol(usize::from(level < 0), &mut coding.dc_sign[sign_ctx]);
         } else {
             enc.literal(u32::from(level < 0), 1);
         }
@@ -962,7 +911,7 @@ fn write_coeffs(
 /// The end-of-block position (spec 5.11.39): which group of scan positions the
 /// last coded coefficient falls in, then its offset inside that group — the
 /// offset's top bit from a CDF and the rest as raw bits.
-fn write_eob(enc: &mut SymbolEncoder, coding: &TxbCoding, eob: usize) {
+fn write_eob(enc: &mut SymbolEncoder, coding: &mut TxbTables, eob: usize) {
     /// `Eob_Group_Start` (spec 5.11.39): the first scan position each group of
     /// end-of-block positions covers, indexed by the group's own number.
     const GROUP_START: [usize; 12] = [0, 1, 2, 3, 5, 9, 17, 33, 65, 129, 257, 513];
@@ -975,13 +924,13 @@ fn write_eob(enc: &mut SymbolEncoder, coding: &TxbCoding, eob: usize) {
         .expect("the first group starts at zero");
     // The groups are numbered from one, and how many of them the transform
     // reaches is the size of its own end-of-block alphabet.
-    enc.symbol_fixed(group - 1, coding.eob_pt);
+    enc.symbol(group - 1, coding.eob_pt);
 
     let bits = OFFSET_BITS[group];
     if bits > 0 {
         let offset = (eob - GROUP_START[group]) as u32;
         let top = (offset >> (bits - 1)) & 1;
-        enc.symbol_fixed(top as usize, &coding.eob_extra[group - 3]);
+        enc.symbol(top as usize, &mut coding.eob_extra[group - 3]);
         if bits > 1 {
             enc.literal(offset & ((1 << (bits - 1)) - 1), bits - 1);
         }
@@ -1387,7 +1336,10 @@ mod tests {
     /// hand back the decoded planes.
     fn decode_level_grid(levels: &[i32], sb_cols: u32, sb_rows: u32) -> Vec<u8> {
         let (w, h) = (64 * sb_cols, 64 * sb_rows);
-        let (seq, header) = frame_of(w, h);
+        let (seq, mut header) = frame_of(w, h);
+        // The DC fixture writers code against the default CDFs and never
+        // update them, so their frames say so.
+        header.disable_cdf_update = true;
         let tile = dc_key_frame_tile_levels(header.mi_cols, header.mi_rows, Q_IDX, levels).unwrap();
         let mut stream = temporal_delimiter();
         stream.extend_from_slice(&sequence_header_obu(&seq).unwrap());
@@ -1402,6 +1354,8 @@ mod tests {
         seq.max_frame_width = w;
         seq.max_frame_height = h;
         let mut header = flat_key_frame();
+        // Every tile these headers carry is written by the adapting writer.
+        header.disable_cdf_update = false;
         header.frame_width = w;
         header.frame_height = h;
         header.upscaled_width = w;
@@ -1580,7 +1534,10 @@ mod tests {
     /// Encode a grid of 32x32 blocks, each carrying its own DC level.
     fn decode_split_grid(levels: &[i32], sb_cols: u32, sb_rows: u32) -> Vec<u8> {
         let (w, h) = (64 * sb_cols, 64 * sb_rows);
-        let (seq, header) = frame_of(w, h);
+        let (seq, mut header) = frame_of(w, h);
+        // The DC fixture writers code against the default CDFs and never
+        // update them, so their frames say so.
+        header.disable_cdf_update = true;
         let tile = split_dc_key_frame_tile(header.mi_cols, header.mi_rows, Q_IDX, levels).unwrap();
         let mut stream = temporal_delimiter();
         stream.extend_from_slice(&sequence_header_obu(&seq).unwrap());
@@ -1836,7 +1793,14 @@ mod tests {
         let mut enc = SymbolEncoder::new();
         let mut priced = 0.0;
         for grid in &grids {
-            write_coeffs(&mut enc, &LUMA_32, grid, &scan, 0, 0);
+            write_coeffs(
+                &mut enc,
+                &mut Cdfs::new().txb(TxbSet::Luma32),
+                grid,
+                &scan,
+                0,
+                0,
+            );
             priced += luma_32_coeff_bits(grid);
         }
         let spent = enc.finish().len() as f64 * 8.0;
@@ -1872,7 +1836,10 @@ mod tests {
         // An empty block is one symbol -- an expensive one, because a block
         // with no coefficients at all is the rarer of the two under the
         // neutral context -- and nothing else.
-        assert!(empty < 6.0, "an empty block is one skip symbol, not {empty}");
+        assert!(
+            empty < 6.0,
+            "an empty block is one skip symbol, not {empty}"
+        );
     }
 
     /// Neighbouring blocks that each carry coefficients read their DC sign
