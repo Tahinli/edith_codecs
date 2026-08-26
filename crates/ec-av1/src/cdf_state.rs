@@ -20,6 +20,10 @@ pub(crate) enum TxbSet {
     Luma32,
     /// The 64x64 luma transform of a whole superblock, scanned as a 32x32.
     Luma64,
+    /// The 16x16 luma transform of a 16x16 block.
+    Luma16,
+    /// The 8x8 transform of a chroma plane of a 16x16 block.
+    Chroma8,
     /// The 16x16 transform of a chroma plane of a 32x32 block.
     Chroma16,
     /// The 32x32 transform of a chroma plane of a whole superblock.
@@ -45,6 +49,8 @@ pub(crate) struct TxbTables<'a> {
     pub br: &'a mut [[u16; 5]; 21],
     /// The sign of the DC.
     pub dc_sign: &'a mut [[u16; 3]; 3],
+    /// The transform type, for the one size whose set holds more than one.
+    pub tx_type: Option<&'a mut [u16; 6]>,
 }
 
 /// Every table a key frame's tile writer adapts.
@@ -63,6 +69,32 @@ pub(crate) struct Cdfs {
     pub uv_mode_cfl: [[u16; 15]; 13],
     /// The angle a directional mode is nudged by.
     pub angle_delta: [[u16; 8]; 8],
+    /// The one-context all-zero flag of a 16x16 luma transform.
+    pub txb_skip_luma_16: [[u16; 3]; 1],
+    /// The all-zero flag of an 8x8 chroma transform.
+    pub txb_skip_chroma_8: [[u16; 3]; 3],
+    /// The end-of-block group of a 16x16 luma transform.
+    pub eob_pt_256_luma: [u16; 10],
+    /// The end-of-block group of an 8x8 chroma transform.
+    pub eob_pt_64_chroma: [u16; 8],
+    /// The end-of-block offset bit of a 16x16 luma transform.
+    pub eob_extra_luma_16: [[u16; 3]; 9],
+    /// The same, for an 8x8 chroma transform.
+    pub eob_extra_chroma_8: [[u16; 3]; 9],
+    /// The base level of a 16x16 luma coefficient.
+    pub base_luma_16: [[u16; 5]; 42],
+    /// The base level of an 8x8 chroma coefficient.
+    pub base_chroma_8: [[u16; 5]; 42],
+    /// The last coefficient's base level, for a 16x16 luma transform.
+    pub base_eob_luma_16: [[u16; 4]; 4],
+    /// The same, for an 8x8 chroma transform.
+    pub base_eob_chroma_8: [[u16; 4]; 4],
+    /// The base-range tail of a 16x16 luma coefficient.
+    pub br_luma_16: [[u16; 5]; 21],
+    /// The base-range tail of an 8x8 chroma coefficient.
+    pub br_chroma_8: [[u16; 5]; 21],
+    /// The partition symbol of a 16x16 block.
+    pub partition_w16: [[u16; 11]; 4],
     /// The one-context all-zero flag of a 32x32 luma transform.
     pub txb_skip_luma_32: [[u16; 3]; 1],
     /// The same, for a 64x64 luma transform.
@@ -110,6 +142,8 @@ pub(crate) struct Cdfs {
     pub br_chroma_32: [[u16; 5]; 21],
     /// The DC sign of a luma coefficient, shared by both luma sets.
     pub dc_sign_luma: [[u16; 3]; 3],
+    /// The transform type of a 16x16 intra luma transform, by luma mode.
+    pub intra_tx_type_16: [[u16; 6]; 13],
     /// The DC sign of a chroma coefficient, shared by both chroma sets.
     pub dc_sign_chroma: [[u16; 3]; 3],
 }
@@ -127,6 +161,19 @@ impl Cdfs {
             uv_mode_no_cfl: cdf::UV_MODE_NO_CFL,
             uv_mode_cfl: cdf::UV_MODE_CFL,
             angle_delta: cdf::ANGLE_DELTA,
+            txb_skip_luma_16: [cdf::TXB_SKIP_LUMA_16],
+            txb_skip_chroma_8: cdf::TXB_SKIP_CHROMA_8,
+            eob_pt_256_luma: cdf::EOB_PT_256_LUMA,
+            eob_pt_64_chroma: cdf::EOB_PT_64_CHROMA,
+            eob_extra_luma_16: cdf::EOB_EXTRA_LUMA_16,
+            eob_extra_chroma_8: cdf::EOB_EXTRA_CHROMA_8,
+            base_luma_16: cdf::COEFF_BASE_LUMA_16,
+            base_chroma_8: cdf::COEFF_BASE_CHROMA_8,
+            base_eob_luma_16: cdf::COEFF_BASE_EOB_LUMA_16,
+            base_eob_chroma_8: cdf::COEFF_BASE_EOB_CHROMA_8,
+            br_luma_16: cdf::COEFF_BR_LUMA_16,
+            br_chroma_8: cdf::COEFF_BR_CHROMA_8,
+            partition_w16: cdf::PARTITION_W16,
             txb_skip_luma_32: [cdf::TXB_SKIP_LUMA_32],
             txb_skip_luma_64: [cdf::TXB_SKIP_LUMA_64],
             txb_skip_chroma_16: cdf::TXB_SKIP_CHROMA_16,
@@ -150,12 +197,13 @@ impl Cdfs {
             br_chroma_16: cdf::COEFF_BR_CHROMA_16,
             br_chroma_32: cdf::COEFF_BR_CHROMA_32,
             dc_sign_luma: cdf::DC_SIGN_LUMA,
+            intra_tx_type_16: cdf::INTRA_TX_TYPE_SET2_16,
             dc_sign_chroma: cdf::DC_SIGN_CHROMA,
         }
     }
 
     /// The tables one table set is coded with, borrowed out of the state.
-    pub fn txb(&mut self, set: TxbSet) -> TxbTables<'_> {
+    pub fn txb(&mut self, set: TxbSet, mode: usize) -> TxbTables<'_> {
         match set {
             TxbSet::Luma32 => TxbTables {
                 side: 32,
@@ -166,6 +214,7 @@ impl Cdfs {
                 base_eob: &mut self.base_eob_luma_32,
                 br: &mut self.br_luma_32,
                 dc_sign: &mut self.dc_sign_luma,
+                tx_type: None,
             },
             TxbSet::Luma64 => TxbTables {
                 side: 32,
@@ -176,6 +225,29 @@ impl Cdfs {
                 base_eob: &mut self.base_eob_luma_64,
                 br: &mut self.br_luma_32,
                 dc_sign: &mut self.dc_sign_luma,
+                tx_type: None,
+            },
+            TxbSet::Luma16 => TxbTables {
+                side: 16,
+                txb_skip: &mut self.txb_skip_luma_16,
+                eob_pt: &mut self.eob_pt_256_luma,
+                eob_extra: &mut self.eob_extra_luma_16,
+                base: &mut self.base_luma_16,
+                base_eob: &mut self.base_eob_luma_16,
+                br: &mut self.br_luma_16,
+                dc_sign: &mut self.dc_sign_luma,
+                tx_type: Some(&mut self.intra_tx_type_16[mode]),
+            },
+            TxbSet::Chroma8 => TxbTables {
+                side: 8,
+                txb_skip: &mut self.txb_skip_chroma_8,
+                eob_pt: &mut self.eob_pt_64_chroma,
+                eob_extra: &mut self.eob_extra_chroma_8,
+                base: &mut self.base_chroma_8,
+                base_eob: &mut self.base_eob_chroma_8,
+                br: &mut self.br_chroma_8,
+                dc_sign: &mut self.dc_sign_chroma,
+                tx_type: None,
             },
             TxbSet::Chroma16 => TxbTables {
                 side: 16,
@@ -186,6 +258,7 @@ impl Cdfs {
                 base_eob: &mut self.base_eob_chroma_16,
                 br: &mut self.br_chroma_16,
                 dc_sign: &mut self.dc_sign_chroma,
+                tx_type: None,
             },
             TxbSet::Chroma32 => TxbTables {
                 side: 32,
@@ -196,6 +269,7 @@ impl Cdfs {
                 base_eob: &mut self.base_eob_chroma_32,
                 br: &mut self.br_chroma_32,
                 dc_sign: &mut self.dc_sign_chroma,
+                tx_type: None,
             },
         }
     }
@@ -212,8 +286,8 @@ mod tests {
     #[test]
     fn the_two_luma_sets_share_the_base_range_table() {
         let mut cdfs = Cdfs::new();
-        cdfs.txb(TxbSet::Luma64).br[0][0] = 1;
-        assert_eq!(cdfs.txb(TxbSet::Luma32).br[0][0], 1);
+        cdfs.txb(TxbSet::Luma64, 0).br[0][0] = 1;
+        assert_eq!(cdfs.txb(TxbSet::Luma32, 0).br[0][0], 1);
     }
 
     /// Both luma sets read one DC sign table, and both chroma sets another;
@@ -221,12 +295,12 @@ mod tests {
     #[test]
     fn the_sign_tables_are_shared_within_a_plane_type_and_not_across() {
         let mut cdfs = Cdfs::new();
-        cdfs.txb(TxbSet::Luma32).dc_sign[1][0] = 1;
-        cdfs.txb(TxbSet::Chroma16).dc_sign[2][0] = 2;
-        assert_eq!(cdfs.txb(TxbSet::Luma64).dc_sign[1][0], 1);
-        assert_eq!(cdfs.txb(TxbSet::Chroma32).dc_sign[2][0], 2);
-        assert_ne!(cdfs.txb(TxbSet::Chroma32).dc_sign[1][0], 1);
-        assert_ne!(cdfs.txb(TxbSet::Luma64).dc_sign[2][0], 2);
+        cdfs.txb(TxbSet::Luma32, 0).dc_sign[1][0] = 1;
+        cdfs.txb(TxbSet::Chroma16, 0).dc_sign[2][0] = 2;
+        assert_eq!(cdfs.txb(TxbSet::Luma64, 0).dc_sign[1][0], 1);
+        assert_eq!(cdfs.txb(TxbSet::Chroma32, 0).dc_sign[2][0], 2);
+        assert_ne!(cdfs.txb(TxbSet::Chroma32, 0).dc_sign[1][0], 1);
+        assert_ne!(cdfs.txb(TxbSet::Luma64, 0).dc_sign[2][0], 2);
     }
 
     /// The end-of-block table a 1024-position transform reads is shared by both
@@ -235,9 +309,9 @@ mod tests {
     #[test]
     fn the_luma_end_of_block_table_is_shared_and_chromas_is_not() {
         let mut cdfs = Cdfs::new();
-        cdfs.txb(TxbSet::Luma32).eob_pt[0] = 7;
-        assert_eq!(cdfs.txb(TxbSet::Luma64).eob_pt[0], 7);
-        assert_ne!(cdfs.txb(TxbSet::Chroma32).eob_pt[0], 7);
+        cdfs.txb(TxbSet::Luma32, 0).eob_pt[0] = 7;
+        assert_eq!(cdfs.txb(TxbSet::Luma64, 0).eob_pt[0], 7);
+        assert_ne!(cdfs.txb(TxbSet::Chroma32, 0).eob_pt[0], 7);
     }
 
     /// Every set starts from the spec's defaults, so a tile that adapts nothing
@@ -245,9 +319,12 @@ mod tests {
     #[test]
     fn the_state_starts_at_the_defaults() {
         let mut cdfs = Cdfs::new();
-        assert_eq!(cdfs.txb(TxbSet::Luma32).base[3], cdf::COEFF_BASE_LUMA_32[3]);
         assert_eq!(
-            cdfs.txb(TxbSet::Chroma16).eob_extra[2],
+            cdfs.txb(TxbSet::Luma32, 0).base[3],
+            cdf::COEFF_BASE_LUMA_32[3]
+        );
+        assert_eq!(
+            cdfs.txb(TxbSet::Chroma16, 0).eob_extra[2],
             cdf::EOB_EXTRA_CHROMA_16[2]
         );
         assert_eq!(cdfs.partition_w64[2], cdf::PARTITION_W64[2]);
