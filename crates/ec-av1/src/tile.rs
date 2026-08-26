@@ -18,6 +18,30 @@ use crate::cdf_state::{Cdfs, MvComponentCdfs, TxbSet, TxbTables};
 use crate::msac::SymbolEncoder;
 use crate::mvstack::{MiGrid, MiInfo, find_mv_stack, single_ref_ctx};
 
+/// round-4 av1-truesize debugging aid: prints `msg()` to stderr when the
+/// `EC_RNG` environment variable is set, mirroring the `EC_PART`/`EC_TOK`
+/// trace `/tmp/libaom-src`'s debug `aomdec` build already emits under the
+/// same variable, so the two traces line up symbol for symbol. Checked once
+/// per process, so unset (the default) costs one atomic load per call and no
+/// allocation. Only the real tile writer below calls this -- the mode/rate
+/// search's own trial encoders never do -- so the trace does not need the
+/// throwaway-encoder gating a whole-encoder trace would.
+fn ec_rng_trace(msg: impl FnOnce() -> String) {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2); // 2 = unknown, 1 = on, 0 = off
+    let on = match ON.load(Ordering::Relaxed) {
+        2 => {
+            let on = u8::from(std::env::var_os("EC_RNG").is_some());
+            ON.store(on, Ordering::Relaxed);
+            on
+        }
+        v => v,
+    };
+    if on == 1 {
+        eprintln!("{}", msg());
+    }
+}
+
 /// `PARTITION_NONE` (spec 6.10.4): the whole block, undivided.
 const PARTITION_NONE: usize = 0;
 /// `PARTITION_SPLIT` (spec 6.10.4): the block cut into four quadrants.
@@ -755,6 +779,15 @@ pub fn sb_coeff_key_frame_tile(
         for sb_c in 0..sb_cols {
             let at = (sb_r as usize * 4, sb_c as usize * 4);
             let ctx = neighbours.partition_ctx(at, SB);
+            ec_rng_trace(|| {
+                format!(
+                    "EC_PART mi_row={} mi_col={} bsize=12 ctx={} tell={}",
+                    at.0 * 4,
+                    at.1 * 4,
+                    ctx,
+                    enc.tell()
+                )
+            });
             // A superblock whose bottom or right half is outside the frame
             // cannot be left unsplit, so the decoder reads a flag instead of
             // the partition symbol — and reads nothing at all when both halves
@@ -799,6 +832,14 @@ pub fn sb_coeff_key_frame_tile(
                         // luma, so its chroma mode reads the table without it.
                         false,
                     );
+                    ec_rng_trace(|| {
+                        format!(
+                            "EC_TOK mi_row={} mi_col={} tell={}",
+                            at.0 * 4,
+                            at.1 * 4,
+                            enc.tell()
+                        )
+                    });
                 }
                 Superblock::Split(quadrants) => {
                     match (has_cols, has_rows) {
@@ -833,6 +874,15 @@ pub fn sb_coeff_key_frame_tile(
                             has_half(c as u32 * BLOCK_MI, BLOCK_MI, mi_cols),
                             has_half(r as u32 * BLOCK_MI, BLOCK_MI, mi_rows),
                         );
+                        ec_rng_trace(|| {
+                            format!(
+                                "EC_PART mi_row={} mi_col={} bsize=9 ctx={} tell={}",
+                                at.0 * 4,
+                                at.1 * 4,
+                                ctx,
+                                enc.tell()
+                            )
+                        });
                         match quadrant {
                             Quadrant::Whole(block) => {
                                 if !has_cols32 || !has_rows32 {
@@ -860,6 +910,14 @@ pub fn sb_coeff_key_frame_tile(
                                     [&scans[0], &scans[1], &scans[1]],
                                     true,
                                 );
+                                ec_rng_trace(|| {
+                                    format!(
+                                        "EC_TOK mi_row={} mi_col={} tell={}",
+                                        at.0 * 4,
+                                        at.1 * 4,
+                                        enc.tell()
+                                    )
+                                });
                             }
                             Quadrant::Split(blocks) => {
                                 // The 16x16 sub-blocks this quadrant's split
@@ -929,6 +987,15 @@ pub fn sb_coeff_key_frame_tile(
                                     }
                                     let at = (sr, sc);
                                     let ctx = neighbours.partition_ctx(at, SUB);
+                                    ec_rng_trace(|| {
+                                        format!(
+                                            "EC_PART mi_row={} mi_col={} bsize=6 ctx={} tell={}",
+                                            at.0 * 4,
+                                            at.1 * 4,
+                                            ctx,
+                                            enc.tell()
+                                        )
+                                    });
                                     enc.symbol(PARTITION_NONE, &mut cdfs.partition_w16[ctx]);
                                     let grids = [
                                         level_grid(&block.luma, TX16)?,
@@ -947,6 +1014,14 @@ pub fn sb_coeff_key_frame_tile(
                                         [&scans[1], &scans[2], &scans[2]],
                                         true,
                                     );
+                                    ec_rng_trace(|| {
+                                        format!(
+                                            "EC_TOK mi_row={} mi_col={} tell={}",
+                                            at.0 * 4,
+                                            at.1 * 4,
+                                            enc.tell()
+                                        )
+                                    });
                                 }
                             }
                         }
@@ -1056,6 +1131,13 @@ fn write_block_planes(
             skip_ctx,
             dc_sign_ctx(around[plane].dc_vote),
         );
+        ec_rng_trace(|| {
+            format!(
+                "EC_PLANE plane={plane} nz={} skip_ctx={skip_ctx} tell={}",
+                grid.iter().filter(|&&l| l != 0).count(),
+                enc.tell()
+            )
+        });
     }
 }
 
