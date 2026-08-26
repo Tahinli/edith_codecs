@@ -163,6 +163,53 @@ python3 "$(dirname "$0")/lib/gen-bmp-shapes.py" "$out" "$out/bmp-source.rgba" 64
 rm -f "$out/bmp-source.png" "$out/bmp-source-alpha.png" "$out/bmp-source.rgba" \
     "$out/bmp-source-alpha.rgba" "$out/bmp-embed.png" "$out/bmp-embed.jpg"
 
+# --- TIFF: both byte orders, four compressions, strips and tiles -----------
+# TIFF fixes almost nothing about its layout, so the corpus is a cross-product:
+# each compression, each sample depth, both byte orders, strips and tiles, and
+# both plane arrangements.  ImageMagick writes all of them.
+magick "$out/source.png" -resize 64x48! "$out/tiff-source.png"
+magick "$out/source-alpha.png" -resize 64x48! "$out/tiff-source-alpha.png"
+magick "$out/tiff-source.png" -depth 8 -compress None "$out/rgb8.tiff"
+magick "$out/tiff-source.png" -depth 8 -compress LZW "$out/rgb8-lzw.tiff"
+magick "$out/tiff-source.png" -depth 8 -compress RLE "$out/rgb8-packbits.tiff"
+magick "$out/tiff-source.png" -depth 8 -compress Zip "$out/rgb8-zip.tiff"
+# The horizontal-differencing predictor, which is what an encoder reaches for
+# when the compression is LZW or Deflate.
+magick "$out/tiff-source.png" -depth 8 -compress LZW -define tiff:predictor=2 \
+    "$out/rgb8-lzw-pred.tiff"
+magick "$out/tiff-source.png" -depth 8 -compress Zip -define tiff:predictor=2 \
+    "$out/rgb8-zip-pred.tiff"
+# Big-endian: the same picture with every field byte-swapped.
+magick "$out/tiff-source.png" -depth 8 -compress None -define tiff:endian=msb \
+    "$out/rgb8-be.tiff"
+# Tiles rather than strips, and planes rather than interleaved samples.
+magick "$out/tiff-source.png" -depth 8 -compress LZW \
+    -define tiff:tile-geometry=32x32 "$out/rgb8-tiled.tiff"
+magick "$out/tiff-source.png" -depth 8 -compress None -interlace Plane \
+    "$out/rgb8-planar.tiff"
+# Depths: bilevel, 4-bit palette, 8-bit grey, 16-bit grey and 16-bit colour.
+magick "$out/tiff-source.png" -monochrome -type bilevel -compress None \
+    "$out/bilevel.tiff"
+magick "$out/tiff-source.png" -colors 16 -type palette -depth 4 -compress None \
+    "$out/palette4.tiff"
+# The incumbent refuses a 4-bit palette outright, so ffmpeg -- which reads it --
+# writes the reference picture for that one fixture.
+ffmpeg -loglevel error -y -i "$out/palette4.tiff" "$out/palette4-golden.png"
+# -alpha off, or ImageMagick attaches an alpha channel to a grey picture that
+# has none, and a two-sample grey file is a shape the incumbent refuses.
+magick "$out/tiff-source.png" -colorspace gray -alpha off -depth 8 -compress None \
+    "$out/gray8.tiff"
+magick "$out/tiff-source.png" -colorspace gray -alpha off -depth 16 -compress None \
+    "$out/gray16.tiff"
+magick "$out/tiff-source.png" -depth 16 -compress Zip "$out/rgb16.tiff"
+# Alpha, which TIFF carries as a fourth sample plus an ExtraSamples tag: both
+# the straight and the premultiplied tagging, neither of which ImageMagick will
+# write on request.
+magick "$out/tiff-source-alpha.png" rgba:"$out/tiff-source-alpha.rgba"
+python3 "$(dirname "$0")/lib/gen-tiff-shapes.py" "$out" "$out/tiff-source-alpha.rgba" 64 48
+rm -f "$out/tiff-source.png" "$out/tiff-source-alpha.png" \
+    "$out/tiff-source-alpha.rgba"
+
 # Small versions of each format, for the fuzz sweep: ten thousand mutations
 # per format is only affordable on a picture that decodes in microseconds.
 magick "$out/source.png" -resize 32x24! "$out/tiny.png"
@@ -172,5 +219,6 @@ ffmpeg -loglevel error -y -i "$out/tiny.png" -c:v libwebp -lossless 0 -quality 7
 ffmpeg -loglevel error -y -i "$out/tiny.png" -c:v libwebp -lossless 1 "$out/tiny-lossless.webp"
 magick "$out/tiny.png" -colors 64 "$out/tiny.gif"
 magick "$out/tiny.png" -colors 64 -type palette -compress None BMP3:"$out/tiny.bmp"
+magick "$out/tiny.png" -depth 8 -compress LZW "$out/tiny.tiff"
 
 echo "wrote $(ls "$out" | wc -l) files to $out"

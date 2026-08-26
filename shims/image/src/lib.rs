@@ -392,6 +392,10 @@ fn format_of(data: &[u8]) -> Option<ImageFormat> {
         ec_image::ImageFormat::Bmp => Some(ImageFormat::Bmp),
         #[cfg(not(feature = "gpui"))]
         ec_image::ImageFormat::Bmp => None,
+        #[cfg(feature = "gpui")]
+        ec_image::ImageFormat::Tiff => Some(ImageFormat::Tiff),
+        #[cfg(not(feature = "gpui"))]
+        ec_image::ImageFormat::Tiff => None,
     }
 }
 
