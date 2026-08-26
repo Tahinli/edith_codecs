@@ -750,7 +750,8 @@ struct Reach {
 /// libaom): for a block that is neither in the superblock's top row nor its
 /// rightmost column, whether the block above and to its right is coded before
 /// it. Indexed by the block's position in the superblock, in blocks of its own
-/// size, as `row * (16 >> log2 mi width) + col`, bit by bit from the low end.
+/// size, as `row * (128 / side) + col` (`Reach::table_stride`) -- libaom's
+/// 128, not this crate's 64 superblock -- bit by bit from the low end.
 const HAS_TOP_RIGHT: [&[u8]; 2] = [&[255, 85, 119, 85, 127, 85, 119, 85], &[95, 87]];
 
 /// `has_bl_16x16` / `has_bl_32x32`: the same, for the block below and to the
@@ -788,7 +789,10 @@ impl Reach {
         if col + 1 == per_side {
             return false;
         }
-        Self::bit(HAS_TOP_RIGHT[Self::table(side)], row * per_side + col)
+        Self::bit(
+            HAS_TOP_RIGHT[Self::table(side)],
+            row * Self::table_stride(side) + col,
+        )
     }
 
     /// `has_bottom_left` for such a block: the leftmost column of a superblock
@@ -803,7 +807,10 @@ impl Reach {
         if row + 1 == per_side {
             return false;
         }
-        Self::bit(HAS_BOTTOM_LEFT[Self::table(side)], row * per_side + col)
+        Self::bit(
+            HAS_BOTTOM_LEFT[Self::table(side)],
+            row * Self::table_stride(side) + col,
+        )
     }
 
     /// Where a block sits inside its superblock, in blocks of its own size,
@@ -814,6 +821,18 @@ impl Reach {
             (x % SUPERBLOCK) / side,
             SUPERBLOCK / side,
         )
+    }
+
+    /// The row stride `HAS_TOP_RIGHT`/`HAS_BOTTOM_LEFT` index by: libaom pins
+    /// these tables to its compile-time maximum superblock (128, spec
+    /// `MAX_MIB_SIZE_LOG2` = 5 in 4-pixel units), not to whichever superblock
+    /// size an encode actually uses, so a block's row in the bit index steps
+    /// by 128 / `side` even though this crate only ever codes a 64
+    /// superblock -- using `per_side` (`SUPERBLOCK` / `side`, 64-relative)
+    /// here instead indexes the wrong bit for every block size but the one
+    /// where 64 and 128 give the same stride.
+    fn table_stride(side: usize) -> usize {
+        128 / side
     }
 
     /// Which of the two block sizes the encoder codes a table row is for.
@@ -2156,9 +2175,9 @@ mod tests {
             eprintln!("SKIP a_frame_round_trips_at_its_own_size: no ffmpeg");
             return;
         }
-        // 854x480 is deliberately not in this list -- it hits an open,
-        // content-dependent desync unrelated to padding wiring; see
-        // `open_defect_854x480_padded_key_frame_desyncs`.
+        // 854x480 is covered separately by
+        // `an_854x480_picture_round_trips_through_its_padding`, which its own
+        // doc comment explains was worth keeping as its own test.
         for &(width, height) in &[(1920usize, 1080usize), (640, 352), (1280, 720)] {
             let picture = test_card(width, height);
             let encoded = encode_key_frame(&picture, 100, 0.5).unwrap();
@@ -2187,23 +2206,25 @@ mod tests {
         }
     }
 
-    /// Reproduces an open defect this lane's sweep found: 854x480 (padded to
-    /// 864x480, an *edge-replication* padded key frame -- not a preexisting
-    /// bug, since 864x480 coded directly with no padding involved is
-    /// bit-exact) desyncs against ffmpeg's decode starting at luma (row 161,
-    /// col 369), well inside the real (non-padded) region, not at the
-    /// padding edge. 640x352, 1280x720, 854x480's own height (480, already
-    /// 32-aligned) and 1920x1080 all round-trip clean, and the padding/crop
-    /// plumbing itself is exercised bit-exact by
-    /// `a_frame_round_trips_at_its_own_size` and the 64x64-superblock
-    /// sequence case, so this looks like a content-triggered desync inside
-    /// the coefficient/intra coding this lane was told not to touch
-    /// (`tile.rs`), not a padding-wiring bug. Left `#[ignore]`d rather than
-    /// silently dropped from the charter's size list -- next lane should
-    /// start from the row/col this test prints.
+    /// 854x480 (padded to 864x480, an edge-replication padded key frame) used
+    /// to diverge from ffmpeg's decode at luma (row 161, col 369): a debug
+    /// `aomdec` trace of `has_top_right`/`has_bottom_left` at that exact
+    /// block (a 16x16 at mi (40, 88)) showed libaom indexing its pinned
+    /// `has_bl_16x16` table at bit 18 (`row * 8 + col`, row=2 col=2), while
+    /// `Reach::bottom_left` indexed the same table at bit 10 (`row * 4 +
+    /// col`) -- different bits of an 8-byte table, one true, one false. The
+    /// stride libaom indexes by is fixed at its compile-time maximum
+    /// superblock (128px, `MAX_MIB_SIZE_LOG2` = 5), not the actual superblock
+    /// size a stream uses, so the right stride for a 16x16 or 32x32 block is
+    /// `128 / side`, not `SUPERBLOCK / side` (64-relative) -- `Reach::of`'s
+    /// row/col position within the (correctly 64-relative) superblock stayed
+    /// right, only the table's own row stride was wrong. Fixed in
+    /// `Reach::table_stride`; not an arithmetic-coder desync (an
+    /// EC_RNG-per-symbol trace against the same debug decoder found the
+    /// bitstream byte-for-byte identical to libaom's across all 51188
+    /// symbols of this frame before this bug was found).
     #[test]
-    #[ignore = "open defect: content-dependent desync at 854x480 padded, not padding wiring -- see doc comment"]
-    fn open_defect_854x480_padded_key_frame_desyncs() {
+    fn an_854x480_picture_round_trips_through_its_padding() {
         if !have_ffmpeg() {
             return;
         }
@@ -2217,6 +2238,89 @@ mod tests {
         let decoded = ffmpeg_decode(&encoded.stream, padded_width, padded_height);
         let cropped = crop_picture(&decoded, width, height);
         assert_eq!(cropped.y, encoded.reconstruction.y, "854x480: luma");
+    }
+
+    /// `Reach::top_right`/`bottom_left` against a from-scratch transcription
+    /// of libaom's `has_top_right`/`has_bottom_left` (`av1/common/
+    /// reconintra.c`), for every 16x16 and 32x32 block position across three
+    /// superblocks square -- interior and every superblock edge (top row,
+    /// left column, right column, bottom row) both sizes reach. Written to
+    /// catch the class the `table_stride` bug was: an index stride silently
+    /// wrong for one block size while looking plausible for the other.
+    #[test]
+    fn reach_matches_libaom_has_top_right_and_has_bottom_left() {
+        // Transcribed from has_top_right/has_bottom_left's row_off==0,
+        // col_off==0 (whole-transform) path, with MAX_MIB_SIZE_LOG2 = 5 (a
+        // 128px reference grid) pinned as libaom pins it, independent of the
+        // 64px superblock this crate actually codes.
+        fn libaom_top_right(side: usize, x: usize, y: usize, width: usize, height: usize) -> bool {
+            if y == 0 || x + side >= width {
+                return false;
+            }
+            let (row, col, per_side) = (
+                (y % SUPERBLOCK) / side,
+                (x % SUPERBLOCK) / side,
+                SUPERBLOCK / side,
+            );
+            if row == 0 {
+                return true;
+            }
+            if col + 1 == per_side {
+                return false;
+            }
+            let stride = 128 / side;
+            let index = row * stride + col;
+            let table = if side == BLOCK {
+                [95u8, 87].to_vec()
+            } else {
+                vec![255, 85, 119, 85, 127, 85, 119, 85]
+            };
+            (table[index / 8] >> (index % 8)) & 1 != 0
+        }
+
+        fn libaom_bottom_left(side: usize, x: usize, y: usize, height: usize) -> bool {
+            if x == 0 || y + side >= height {
+                return false;
+            }
+            let (row, col, per_side) = (
+                (y % SUPERBLOCK) / side,
+                (x % SUPERBLOCK) / side,
+                SUPERBLOCK / side,
+            );
+            if col == 0 {
+                return row * side + side < SUPERBLOCK;
+            }
+            if row + 1 == per_side {
+                return false;
+            }
+            let stride = 128 / side;
+            let index = row * stride + col;
+            let table = if side == BLOCK {
+                [4u8, 4].to_vec()
+            } else {
+                vec![84, 16, 84, 0, 84, 16, 84, 0]
+            };
+            (table[index / 8] >> (index % 8)) & 1 != 0
+        }
+
+        let (width, height) = (SUPERBLOCK * 3, SUPERBLOCK * 3);
+        for side in [16usize, BLOCK] {
+            for y in (0..height).step_by(side) {
+                for x in (0..width).step_by(side) {
+                    let reach = Reach::of(side, x, y, width, height);
+                    assert_eq!(
+                        reach.above_right,
+                        libaom_top_right(side, x, y, width, height),
+                        "side={side} x={x} y={y}: above_right"
+                    );
+                    assert_eq!(
+                        reach.below_left,
+                        libaom_bottom_left(side, x, y, height),
+                        "side={side} x={x} y={y}: below_left"
+                    );
+                }
+            }
+        }
     }
 
     /// An odd width or height is refused by name, not by however the padder
