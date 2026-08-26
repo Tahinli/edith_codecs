@@ -12,29 +12,68 @@
 //! `newmv_count > 0` tests) and `av1_drl_ctx` (`mvref_common.h`), plus MV
 //! clamping (7.10.2.14, libaom's `clamp_mv_ref`).
 //!
-//! This module's scan is already reduced to the immediate row/col/top-right
-//! positions with no extended-offset scan (see below), which lets those
-//! context formulas collapse exactly rather than approximately: libaom's
-//! `ref_match_count` comes from the *same* row/col match counters as
-//! `nearest_match` once the extended scan is gone, so `ref_match_count ==
-//! nearest_match` always here, and every candidate this module finds is one
-//! of libaom's "nearest" ones, so the `REF_CAT_LEVEL` (640) bonus
-//! `av1_find_mv_stack` adds to nearest candidates before computing DRL
-//! context applies to all of them uniformly — which is why [`find_mv_stack`]
-//! always reports `drl_ctx == 0`: with the extended scan absent, no
-//! candidate here can ever be a "non-nearest" (sub-640) one for a pair
-//! comparison to distinguish. Likewise, the `GLOBALMV_OFFSET` bit of
-//! libaom's `mode_context` is set only inside
+//! This module's immediate row/col/top-right scan alone is *not* enough to
+//! get `RefMvContext` (`ref_mv_ctx`) right, even though it *is* enough for
+//! `NewMvContext`/`ZeroMvContext`. Ported straight from libaom's
+//! `av1_find_mv_stack` (`av1/common/mvref_common.c`, `setup_ref_mv_list`,
+//! ~line 480 on): after the immediate row (-1), col (-1) and top-right
+//! probes settle `nearest_match` (and `mode_context`'s `new_mv` bits, which
+//! depend on `nearest_match` alone), libaom runs one more probe *before*
+//! computing `ref_match_count` — `scan_blk_mbmi` at the diagonal top-left
+//! corner `(-1, -1)` — whose match folds into `row_match_count` (and hence
+//! can flip `ref_match_count`'s row term true) without ever touching the
+//! already-captured `nearest_match`. So `ref_match_count >= nearest_match`
+//! always, sometimes strictly greater, and `ref_mv_ctx` (the `REFMV_OFFSET`
+//! half of libaom's `mode_context` switch, mvref_common.c ~line 619-643)
+//! genuinely depends on both counts, not `nearest_match` alone — that
+//! collapse was the bug this module shipped with for several rounds (see
+//! the crate report). [`find_mv_stack`] now runs that corner probe and
+//! computes `ref_mv_ctx` from the true `(nearest_match, ref_match_count)`
+//! pair.
+//!
+//! The corner probe's own candidate is added to the stack too (matching
+//! libaom: a genuinely new MV there becomes a real, if low-weight, entry),
+//! but — like the reduced row/col/top-right scans — at this module's own
+//! `IMMEDIATE_WEIGHT` scale rather than libaom's real `len * max(2, inc)`
+//! (row/col) or `2 * mi_size_wide[BLOCK_8X8]` (corner/top-right) weights.
+//! That scale mismatch is harmless for every caller this module has: the
+//! only real caller (`tile.rs`) always asks for a fixed `bw4 == bh4 == 8`
+//! block, at which size libaom's row and col weights are *always tied*
+//! (both scan a full-width same-size neighbour) and its corner/top-right
+//! weight is *always* far below either — exactly the ordering
+//! `IMMEDIATE_WEIGHT` already reproduces, so sort order and the
+//! `REF_CAT_LEVEL`-vs-not DRL split (which only tests a threshold, not a
+//! magnitude) come out identical either way. A caller with mixed block
+//! sizes would need the real weight formula; none exists today.
+//!
+//! The corner probe's own match does *not* count toward the real
+//! `newmv_count` that feeds `new_mv_ctx` (libaom passes it a `dummy_newmv_count`
+//! there) — only row/col/top-right do.
+//!
+//! Also ported (from `av1_drl_ctx`, `mvref_common.h`): the `REF_CAT_LEVEL`
+//! (640) bonus applies only to the entries the row/col/top-right scan found
+//! (`nearest_refmv_count`), added to their stored weight *before* the corner
+//! probe can add a new, unboosted entry — so `drl_ctx` can now be non-zero
+//! when the corner probe contributes a genuinely new candidate.
+//!
+//! The `GLOBALMV_OFFSET` bit of libaom's `mode_context` is set only inside
 //! `cm->features.allow_ref_frame_mvs` (temporal MV projection), which this
 //! module never has (`use_ref_frame_mvs = 0`), so `zero_mv_ctx` is always 0
-//! here — again exact for the case this module covers, not a stand-in.
+//! here — exact for the case this module covers, not a stand-in.
 //!
 //! Deliberately reduced away (see the crate report, not reproduced bit-exact
 //! here): compound/multi-reference candidates, the temporal MV projection
-//! scan, and the `>1` row/col scans at offset 3 and their skip-by-block-size
-//! stepping (which is also why the "extra search" that pads a short stack to
-//! two entries, spec 7.10.2.12, is not implemented — this module's stack can
-//! be shorter than two candidates where libaom's never is).
+//! scan, the real (non-corner) `idx = 2..MVREF_ROW_COLS` extended row/col
+//! scan positions (libaom's own `processed_rows`/`processed_cols` bookkeeping
+//! means those never fire for this module's fixed 8-mi block geometry — the
+//! immediate-offset scan's coverage window already reaches as far as the
+//! extended offsets can, so nothing there is left unscanned), the
+//! single-reference "extension" pass that re-walks the same row/col
+//! neighbours through `process_single_ref_mv_candidate` (a no-op here: with
+//! only one reference frame ever in play, whatever it would add was already
+//! added by the row/col scan), and the "extra search" that pads a short
+//! stack to two entries (spec 7.10.2.12) — this module's stack can be
+//! shorter than two candidates where libaom's never is.
 
 /// One 4x4 `mi` unit's motion state, as the encode loop will have filled it
 /// in by the time it asks for a block's MV stack.
@@ -240,6 +279,34 @@ fn scan_top_right(
     false
 }
 
+/// The diagonal top-left corner probe (libaom `scan_blk_mbmi` at
+/// `row_offset = col_offset = -1`, mvref_common.c's "second outer area",
+/// called *after* `nearest_match` is already captured): the single unit
+/// diagonally above-left of the block. Its match folds into the row bucket
+/// too (see module doc) but must never move `nearest_match` itself or the
+/// real `newmv_count` — callers pass a throwaway counter for the latter.
+fn scan_corner(
+    grid: &MiGrid,
+    mi_row: usize,
+    mi_col: usize,
+    ref_frame: i8,
+    candidates: &mut Vec<StackEntry>,
+    newmv_count: &mut u32,
+) -> bool {
+    let (Some(row), Some(col)) = (mi_row.checked_sub(1), mi_col.checked_sub(1)) else {
+        return false;
+    };
+    if let Some(info) = grid.get(row, col)
+        && info.is_inter
+        && info.ref_frame == ref_frame
+    {
+        add_candidate(candidates, info.mv, IMMEDIATE_WEIGHT);
+        *newmv_count += u32::from(info.is_new_mv);
+        return true;
+    }
+    false
+}
+
 /// `MV_BORDER` (spec 7.10.2.14): 16 pixels of slack in 1/8-pel units, added
 /// on top of the block's own span before a candidate is clamped to the
 /// frame.
@@ -318,8 +385,38 @@ pub fn find_mv_stack(
         &mut newmv_count,
     );
 
+    // libaom's `row_match_count`/`col_match_count` (mvref_common.c) fold the
+    // top-right probe into the row side, so "found above" for context
+    // purposes means the row scan *or* the top-right one matched.
+    let row_matched = found_above || found_top_right;
+    let nearest_match = usize::from(row_matched) + usize::from(found_left);
+
+    // av1_find_mv_stack boosts only the entries the immediate scan found —
+    // exactly `candidates` at this point, before the corner probe (below)
+    // can add anything else (mvref_common.c ~line 544-545).
+    for entry in &mut candidates {
+        entry.weight += REF_CAT_LEVEL;
+    }
+
+    // The diagonal top-left corner probe (module doc): folds into the row
+    // side for `ref_match_count` without moving the already-captured
+    // `nearest_match`, and its own newmv-ness is a dummy count libaom
+    // discards (`&dummy_newmv_count` at the real call site).
+    let mut dummy_newmv_count = 0u32;
+    let corner_matched = scan_corner(
+        grid,
+        mi_row,
+        mi_col,
+        ref_frame,
+        &mut candidates,
+        &mut dummy_newmv_count,
+    );
+    let ref_match_count = usize::from(row_matched || corner_matched) + usize::from(found_left);
+
     // Highest weight first; a stable sort keeps scan order (above, left,
-    // top-right) among ties, matching spec 7.10.2.6.
+    // top-right, corner) among ties, matching spec 7.10.2.6. The corner
+    // probe's un-boosted entry (if new) always sorts after the boosted
+    // ones above, matching libaom's separate two-phase ranking.
     candidates.sort_by_key(|e| std::cmp::Reverse(e.weight));
     candidates.truncate(MAX_STACK_SIZE);
 
@@ -332,18 +429,10 @@ pub fn find_mv_stack(
         nearest_mv
     };
 
-    // libaom's `row_match_count`/`col_match_count` (mvref_common.c) fold the
-    // top-right probe into the row side, so "found above" for context
-    // purposes means the row scan *or* the top-right one matched.
-    let row_matched = found_above || found_top_right;
-    let nearest_match = usize::from(row_matched) + usize::from(found_left);
-
     // Exact port of the `mode_context[ref_frame]` switch (mvref_common.c
-    // ~line 619-643): with no extended-offset scan, `ref_match_count` here is
-    // always equal to `nearest_match` (both come from the same row/col match
-    // counters this module never advances further), so the `ref_match_count`
-    // branches of libaom's switch collapse into the constants below — see
-    // module doc.
+    // ~line 619-643). `new_mv_ctx` depends on `nearest_match` and the real
+    // `newmv_count` alone — libaom's switch never reads `ref_match_count`
+    // for those bits, so this half was already exact before this round.
     let new_mv_ctx = match nearest_match {
         0 => 0,
         1 => {
@@ -361,9 +450,22 @@ pub fn find_mv_stack(
             }
         }
     };
+    // `ref_mv_ctx` (the `REFMV_OFFSET` half of the same switch) genuinely
+    // depends on both counts — this is the part that was wrongly collapsed
+    // to `nearest_match` alone (see module doc / crate report).
     let ref_mv_ctx = match nearest_match {
-        0 => 0,
-        1 => 3,
+        0 => match ref_match_count {
+            0 => 0,
+            1 => 1,
+            _ => 2,
+        },
+        1 => {
+            if ref_match_count >= 2 {
+                4
+            } else {
+                3
+            }
+        }
         _ => 5,
     };
     // GLOBALMV_OFFSET is only ever set by temporal MV projection
@@ -371,13 +473,13 @@ pub fn find_mv_stack(
     // (see module doc) — exact, not a stand-in.
     let zero_mv_ctx = 0;
 
-    // av1_drl_ctx (mvref_common.h): every candidate here is one of libaom's
-    // "nearest" ones (see module doc), so each gets `REF_CAT_LEVEL` before
-    // the comparison, which is why this always lands on 0.
+    // av1_drl_ctx (mvref_common.h): weight was boosted in place above for
+    // the nearest entries only, so this now compares the real stored weight
+    // against the threshold directly, the way libaom does.
     let drl_ctx = candidates
         .windows(2)
         .map(|w| {
-            let (a, b) = (w[0].weight + REF_CAT_LEVEL, w[1].weight + REF_CAT_LEVEL);
+            let (a, b) = (w[0].weight, w[1].weight);
             if a >= REF_CAT_LEVEL && b >= REF_CAT_LEVEL {
                 0
             } else if a >= REF_CAT_LEVEL && b < REF_CAT_LEVEL {
@@ -443,8 +545,10 @@ mod tests {
 
         assert_eq!(stack.entries.len(), 1);
         assert_eq!(stack.entries[0].mv, mv);
-        // 2 above cells + 2 left cells + 1 top-right, each weight 2.
-        assert_eq!(stack.entries[0].weight, 10);
+        // 2 above cells + 2 left cells + 1 top-right, each weight 2, plus the
+        // REF_CAT_LEVEL boost av1_find_mv_stack applies to every entry the
+        // immediate row/col/top-right scan found (module doc).
+        assert_eq!(stack.entries[0].weight, 10 + REF_CAT_LEVEL);
         assert_eq!(stack.nearest_mv, mv);
         // Exact ctx (see module doc): both sides matched (nearest_match=2)
         // and no neighbour was coded NEWMV, which is libaom's
@@ -469,19 +573,22 @@ mod tests {
 
         let stack = find_mv_stack(&grid, 3, 3, 2, 3, 1, 8, 8);
 
+        // Both are entries the immediate scan found, so both get the
+        // REF_CAT_LEVEL boost (module doc) — their relative order is
+        // unaffected.
         assert_eq!(stack.entries.len(), 2);
         assert_eq!(
             stack.entries[0],
             StackEntry {
                 mv: left_mv,
-                weight: 6
+                weight: 6 + REF_CAT_LEVEL
             }
         );
         assert_eq!(
             stack.entries[1],
             StackEntry {
                 mv: above_mv,
-                weight: 4
+                weight: 4 + REF_CAT_LEVEL
             }
         );
         assert_eq!(stack.nearest_mv, left_mv);
@@ -571,6 +678,32 @@ mod tests {
         let stack = find_mv_stack(&grid, 2, 2, 1, 1, 1, 8, 8);
         assert_eq!(stack.new_mv_ctx, 2);
         assert_eq!(stack.ref_mv_ctx, 3);
+    }
+
+    #[test]
+    fn a_diagonal_corner_match_raises_ref_mv_ctx_past_nearest_match() {
+        // Block at (2, 2), 1x1 mi unit: only the col to the left matches
+        // (nearest_match == 1, so a pre-fix `ref_mv_ctx` collapse would say
+        // 3 regardless of anything else — this is the exact round-10 defect
+        // shape). The row above has no match of its own, but the diagonal
+        // top-left corner (1, 1) does; libaom folds that into the row side
+        // of `ref_match_count` (raising it to 2) without ever touching the
+        // already-captured `nearest_match`.
+        let mut grid = MiGrid::new(8, 8);
+        grid.set(2, 1, inter((4, 4)));
+        grid.set(1, 1, inter((8, 8)));
+
+        let stack = find_mv_stack(&grid, 2, 2, 1, 1, 1, 8, 8);
+
+        assert_eq!(stack.new_mv_ctx, 3); // depends on nearest_match alone: unchanged
+        assert_eq!(stack.ref_mv_ctx, 4); // nearest_match=1, ref_match_count=2
+        // The corner's distinct MV becomes its own low-weight stack entry,
+        // ranked behind the boosted nearest one — DRL context sees a real
+        // (non-nearest) second candidate for the first time.
+        assert_eq!(stack.entries.len(), 2);
+        assert_eq!(stack.entries[0].mv, (4, 4));
+        assert_eq!(stack.entries[1].mv, (8, 8));
+        assert_eq!(stack.drl_ctx, vec![1]);
     }
 
     #[test]
