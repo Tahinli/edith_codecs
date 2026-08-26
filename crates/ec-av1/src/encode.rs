@@ -646,6 +646,7 @@ fn code_square(
             v,
             luma: luma_coeffs,
             mode,
+            ..BlockCoeffs::default()
         },
         cost,
     )
@@ -909,7 +910,7 @@ fn encode_key_frame_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::intra::{D45_PRED, D135_PRED, H_PRED, KEY_FRAME_MODES, NON_DIRECTIONAL, V_PRED};
+    use crate::intra::{D135_PRED, D45_PRED, H_PRED, KEY_FRAME_MODES, NON_DIRECTIONAL, V_PRED};
     use std::io::Write;
     use std::process::{Command, Stdio};
 
