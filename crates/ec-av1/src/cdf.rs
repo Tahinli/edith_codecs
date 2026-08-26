@@ -957,3 +957,239 @@ pub const INTRA_TX_TYPE_SET2_16: [[u16; 6]; 13] = [
     [83, 5615, 12001, 17228, 32768, 0],
     [1968, 5556, 12023, 18547, 32768, 0],
 ];
+
+// The inter-frame tables below (spec 9.4) support the syntax an inter block
+// needs: whether it is coded as intra at all, which reference frame and
+// motion vector it takes when it is not. Compound reference and compound
+// prediction are not among them -- this encoder never sets
+// `reference_select`, so their CDFs are never read.
+
+/// `Default_Intra_Inter_Cdf` (spec 9.4): whether an inter frame's block is
+/// coded as intra, indexed by whether the block above and left are inter.
+pub const INTRA_INTER: [[u16; 3]; 4] = [
+    [806, 32768, 0],
+    [16662, 32768, 0],
+    [20186, 32768, 0],
+    [26538, 32768, 0],
+];
+
+/// `Default_Single_Ref_Cdf` (spec 9.4): the six binary decisions that narrow
+/// an inter block's single reference frame down from the seven it can name,
+/// indexed by the reference context of the blocks around it.
+pub const SINGLE_REF: [[[u16; 3]; 6]; 3] = [
+    [
+        [4897, 32768, 0],
+        [1555, 32768, 0],
+        [4236, 32768, 0],
+        [8650, 32768, 0],
+        [904, 32768, 0],
+        [1444, 32768, 0],
+    ],
+    [
+        [16973, 32768, 0],
+        [16751, 32768, 0],
+        [19647, 32768, 0],
+        [24773, 32768, 0],
+        [11014, 32768, 0],
+        [15087, 32768, 0],
+    ],
+    [
+        [29744, 32768, 0],
+        [30279, 32768, 0],
+        [31194, 32768, 0],
+        [31895, 32768, 0],
+        [26875, 32768, 0],
+        [30304, 32768, 0],
+    ],
+];
+
+/// `Default_Y_Mode_Cdf` (spec 9.4): the thirteen luma intra modes of an inter
+/// frame's intra block, indexed by the block's size group -- unlike a key
+/// frame's [`KF_Y_MODE`], which is indexed by the neighbours' modes instead.
+pub const Y_MODE: [[u16; 14]; 4] = [
+    [
+        22801, 23489, 24293, 24756, 25601, 26123, 26606, 27418, 27945, 29228, 29685, 30349, 32768,
+        0,
+    ],
+    [
+        18673, 19845, 22631, 23318, 23950, 24649, 25527, 27364, 28152, 29701, 29984, 30852, 32768,
+        0,
+    ],
+    [
+        19770, 20979, 23396, 23939, 24241, 24654, 25136, 27073, 27830, 29360, 29730, 30659, 32768,
+        0,
+    ],
+    [
+        20155, 21301, 22838, 23178, 23261, 23533, 23703, 24804, 25352, 26575, 27016, 28049, 32768,
+        0,
+    ],
+];
+
+/// `Default_New_Mv_Cdf` (spec 9.4): whether an inter block's motion vector is
+/// coded explicitly rather than taken from a neighbour, indexed by how many
+/// neighbours already chose a new vector.
+pub const NEW_MV: [[u16; 3]; 6] = [
+    [24035, 32768, 0],
+    [16630, 32768, 0],
+    [15339, 32768, 0],
+    [8386, 32768, 0],
+    [12222, 32768, 0],
+    [4676, 32768, 0],
+];
+
+/// `Default_Zero_Mv_Cdf` (spec 9.4): whether an inter block's motion vector is
+/// the zero vector, indexed by whether the block's global motion type is
+/// identity.
+pub const ZERO_MV: [[u16; 3]; 2] = [[2175, 32768, 0], [1054, 32768, 0]];
+
+/// `Default_Ref_Mv_Cdf` (spec 9.4): which of the block's reference motion
+/// vector candidates it takes, indexed by how many candidates are available.
+pub const REF_MV: [[u16; 3]; 6] = [
+    [23974, 32768, 0],
+    [24188, 32768, 0],
+    [17848, 32768, 0],
+    [28622, 32768, 0],
+    [24312, 32768, 0],
+    [19923, 32768, 0],
+];
+
+/// `Default_Drl_Mode_Cdf` (spec 9.4): the dynamic reference list index a
+/// block's motion vector prediction is drawn from, indexed by the list's
+/// context.
+pub const DRL_MODE: [[u16; 3]; 3] = [[13104, 32768, 0], [24560, 32768, 0], [18945, 32768, 0]];
+
+// The motion vector tables below (spec 9.4's `Default_Mv_*`) are the shared
+// defaults for both components of a vector: [`crate::cdf_state::Cdfs`] holds
+// one owned copy of each per component, seeded from the same constant here,
+// since the spec's default state does not distinguish them -- only adaptation
+// does, once a tile has coded a few vectors.
+
+/// `Default_Mv_Joint_Cdf` (spec 9.4): which of a motion vector's two
+/// components change at all.
+pub const MV_JOINT: [u16; 5] = [4096, 11264, 19328, 32768, 0];
+
+/// `Default_Mv_Class_Cdf` (spec 9.4): the magnitude class of one motion
+/// vector component.
+pub const MV_CLASS: [u16; 12] = [
+    28672, 30976, 31858, 32320, 32551, 32656, 32740, 32757, 32762, 32767, 32768, 0,
+];
+
+/// `Default_Mv_Class0_Bit_Cdf` (spec 9.4): the integer bit of a small-class
+/// motion vector's magnitude.
+pub const MV_CLASS0_BIT: [u16; 3] = [27648, 32768, 0];
+
+/// `Default_Mv_Class0_Fr_Cdf` (spec 9.4): the fractional part of a
+/// small-class motion vector's magnitude, indexed by its integer bit.
+pub const MV_CLASS0_FR: [[u16; 5]; 2] = [
+    [16384, 24576, 26624, 32768, 0],
+    [12288, 21248, 24128, 32768, 0],
+];
+
+/// `Default_Mv_Class0_Hp_Cdf` (spec 9.4): the half-pel bit of a small-class
+/// motion vector's magnitude.
+pub const MV_CLASS0_HP: [u16; 3] = [20480, 32768, 0];
+
+/// `Default_Mv_Bit_Cdf` (spec 9.4): one bit of a motion vector's integer
+/// magnitude above the small-class range, indexed by the bit's position.
+pub const MV_BIT: [[u16; 3]; 10] = [
+    [17408, 32768, 0],
+    [17920, 32768, 0],
+    [18944, 32768, 0],
+    [20480, 32768, 0],
+    [22528, 32768, 0],
+    [24576, 32768, 0],
+    [28672, 32768, 0],
+    [29952, 32768, 0],
+    [29952, 32768, 0],
+    [30720, 32768, 0],
+];
+
+/// `Default_Mv_Fr_Cdf` (spec 9.4): the fractional part of a motion vector's
+/// magnitude, outside the small-class range.
+pub const MV_FR: [u16; 5] = [8192, 17408, 21248, 32768, 0];
+
+/// `Default_Mv_Hp_Cdf` (spec 9.4): the half-pel bit of a motion vector's
+/// magnitude, outside the small-class range.
+pub const MV_HP: [u16; 3] = [16384, 32768, 0];
+
+/// `Default_Mv_Sign_Cdf` (spec 9.4): the sign of a motion vector component.
+pub const MV_SIGN: [u16; 3] = [16384, 32768, 0];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every row of a CDF table is non-decreasing and ends with the
+    /// alphabet's total (`32768`) followed by the adaptation counter (`0`),
+    /// which is the shape [`crate::msac`] expects to read.
+    fn assert_row_shape(row: &[u16]) {
+        assert_eq!(row[row.len() - 2], 32768, "row does not total 32768");
+        assert_eq!(row[row.len() - 1], 0, "row's adaptation counter is not 0");
+        for w in row[..row.len() - 1].windows(2) {
+            assert!(w[0] <= w[1], "row is not non-decreasing: {row:?}");
+        }
+    }
+
+    #[test]
+    fn inter_frame_tables_are_well_formed_cdfs() {
+        for row in INTRA_INTER {
+            assert_row_shape(&row);
+        }
+        for ctx in SINGLE_REF {
+            for row in ctx {
+                assert_row_shape(&row);
+            }
+        }
+        for row in Y_MODE {
+            assert_row_shape(&row);
+        }
+        for row in NEW_MV {
+            assert_row_shape(&row);
+        }
+        for row in ZERO_MV {
+            assert_row_shape(&row);
+        }
+        for row in REF_MV {
+            assert_row_shape(&row);
+        }
+        for row in DRL_MODE {
+            assert_row_shape(&row);
+        }
+        assert_row_shape(&MV_JOINT);
+        assert_row_shape(&MV_CLASS);
+        assert_row_shape(&MV_CLASS0_BIT);
+        for row in MV_CLASS0_FR {
+            assert_row_shape(&row);
+        }
+        assert_row_shape(&MV_CLASS0_HP);
+        for row in MV_BIT {
+            assert_row_shape(&row);
+        }
+        assert_row_shape(&MV_FR);
+        assert_row_shape(&MV_HP);
+        assert_row_shape(&MV_SIGN);
+    }
+
+    /// Each table's row length matches the spec's symbol count for that
+    /// syntax element: two entries (total, counter) plus one fewer than the
+    /// alphabet.
+    #[test]
+    fn inter_frame_tables_have_the_spec_alphabet_size() {
+        assert_eq!(INTRA_INTER[0].len(), 2 + 1); // binary
+        assert_eq!(SINGLE_REF[0][0].len(), 2 + 1); // binary
+        assert_eq!(Y_MODE[0].len(), 2 + 13 - 1); // 13 luma intra modes
+        assert_eq!(NEW_MV[0].len(), 2 + 1);
+        assert_eq!(ZERO_MV[0].len(), 2 + 1);
+        assert_eq!(REF_MV[0].len(), 2 + 1);
+        assert_eq!(DRL_MODE[0].len(), 2 + 1);
+        assert_eq!(MV_JOINT.len(), 2 + 3); // MV_JOINTS = 4
+        assert_eq!(MV_CLASS.len(), 2 + 10); // MV_CLASSES = 11
+        assert_eq!(MV_CLASS0_BIT.len(), 2 + 1);
+        assert_eq!(MV_CLASS0_FR[0].len(), 2 + 3); // 4-way fraction
+        assert_eq!(MV_CLASS0_HP.len(), 2 + 1);
+        assert_eq!(MV_BIT[0].len(), 2 + 1);
+        assert_eq!(MV_FR.len(), 2 + 3);
+        assert_eq!(MV_HP.len(), 2 + 1);
+        assert_eq!(MV_SIGN.len(), 2 + 1);
+    }
+}

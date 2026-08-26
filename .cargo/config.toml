@@ -1,0 +1,7 @@
+[target.x86_64-unknown-linux-gnu]
+# Wrap every test/bin run in scripts/memguard-runner.sh so a runaway
+# allocation gets killed inside its own cgroup instead of OOM-killing the
+# machine. Located via `git rev-parse --show-toplevel` from the invoker's cwd
+# (cargo does not resolve runner paths relative to this file, and an absolute
+# path would break other worktree checkouts of this repo).
+runner = ["bash", "-c", "root=$(git rev-parse --show-toplevel) && exec \"$root/scripts/memguard-runner.sh\" \"$@\"", "--"]
