@@ -1,18 +1,21 @@
-//! The frame header OBU (spec 5.9), for shown key frames.
+//! The frame header OBU (spec 5.9), for shown key and inter frames.
 //!
 //! Every writer here is the bit-exact inverse of the matching reader in
 //! [`ec_av1_syntax::frame`], and the tests prove it by parsing back what they
-//! wrote. The subset is the one a stateless hardware encoder needs: a key frame
-//! that is shown, in a sequence with no decoder model, no frame ids and no
-//! still-picture shortcut. Everything outside it is refused by name rather than
-//! written wrong — superres with a denominator other than 8, film grain
-//! synthesis, non-uniform tile spacing, and every non-key or hidden frame.
+//! wrote. The subset is the one a stateless hardware encoder needs: a key or
+//! inter frame that is shown, in a sequence with no decoder model, no frame
+//! ids and no still-picture shortcut. Everything outside it is refused by name
+//! rather than written wrong — superres with a denominator other than 8, film
+//! grain synthesis, non-uniform tile spacing, every hidden frame, short
+//! reference signalling, non-identity global motion, and compound reference
+//! selection (with the skip mode and warped motion it would gate).
 
 use ec_av1_syntax::obu::{ObuHeader, ObuType, tile_log2};
 use ec_av1_syntax::sequence::{SELECT_INTEGER_MV, SELECT_SCREEN_CONTENT_TOOLS, SequenceHeader};
 use ec_av1_syntax::{
-    FrameHeader, FrameType, MAX_SEGMENTS, MAX_TILE_AREA, MAX_TILE_COLS, MAX_TILE_ROWS,
-    MAX_TILE_WIDTH, PRIMARY_REF_NONE, RestorationType, SEG_LVL_MAX, TOTAL_REFS_PER_FRAME, TxMode,
+    FrameHeader, FrameType, InterpolationFilter, MAX_SEGMENTS, MAX_TILE_AREA, MAX_TILE_COLS,
+    MAX_TILE_ROWS, MAX_TILE_WIDTH, PRIMARY_REF_NONE, REFS_PER_FRAME, RestorationType, SEG_LVL_MAX,
+    TOTAL_REFS_PER_FRAME, TxMode, WarpModel,
 };
 use ec_core::{BitWriter, Error, Result};
 
@@ -295,14 +298,47 @@ fn write_lr_params(w: &mut BitWriter, seq: &SequenceHeader, h: &FrameHeader, all
     }
 }
 
-/// `uncompressed_header()` (spec 5.9.2) for a shown key frame.
-pub fn write_frame_header(w: &mut BitWriter, seq: &SequenceHeader, h: &FrameHeader) -> Result<()> {
-    if h.frame_type != FrameType::Key || !h.show_frame || h.show_existing_frame {
+/// `frame_size()` + `render_size()` (spec 5.9.5, 5.9.6), shared by the intra
+/// and inter paths: this writer never overrides the size mid-stream
+/// (`frame_size_with_refs`, spec 5.9.7, is not written).
+fn write_frame_size(w: &mut BitWriter, seq: &SequenceHeader, h: &FrameHeader) -> Result<()> {
+    if h.frame_size_override_flag {
+        w.write_bits(h.frame_width - 1, seq.frame_width_bits);
+        w.write_bits(h.frame_height - 1, seq.frame_height_bits);
+    }
+    if seq.enable_superres {
+        w.write_bit(h.use_superres);
+    }
+    if h.use_superres || h.superres_denom != 8 {
         return Err(Error::unsupported(
-            "AV1 frame header",
-            "only a shown key frame is written",
+            "AV1 superres",
+            "only a superres denominator of 8 (no scaling) is written",
         ));
     }
+    let render_differs = h.render_width != h.upscaled_width || h.render_height != h.frame_height;
+    w.write_bit(render_differs);
+    if render_differs {
+        w.write_bits(h.render_width - 1, 16);
+        w.write_bits(h.render_height - 1, 16);
+    }
+    Ok(())
+}
+
+/// `uncompressed_header()` (spec 5.9.2) for a shown key or inter frame: no
+/// decoder model, no frame ids, no still-picture shortcut, and (for an inter
+/// frame) short reference signalling, non-identity global motion, compound
+/// reference selection and warped motion are all refused rather than written.
+pub fn write_frame_header(w: &mut BitWriter, seq: &SequenceHeader, h: &FrameHeader) -> Result<()> {
+    if !matches!(h.frame_type, FrameType::Key | FrameType::Inter)
+        || !h.show_frame
+        || h.show_existing_frame
+    {
+        return Err(Error::unsupported(
+            "AV1 frame header",
+            "only a shown key or inter frame is written",
+        ));
+    }
+    let is_key = h.frame_type == FrameType::Key;
     if seq.reduced_still_picture_header {
         return Err(Error::unsupported(
             "AV1 frame header",
@@ -323,9 +359,14 @@ pub fn write_frame_header(w: &mut BitWriter, seq: &SequenceHeader, h: &FrameHead
     }
 
     w.write_bit(false); // show_existing_frame
-    w.write_bits(0, 2); // frame_type: KEY_FRAME
+    w.write_bits(if is_key { 0 } else { 1 }, 2); // frame_type
     w.write_bit(true); // show_frame
-    // showable_frame and error_resilient_mode are forced for a shown key frame.
+    // showable_frame is derived by the reader when show_frame is set, and not coded.
+    if is_key {
+        // error_resilient_mode is forced true for a shown key frame.
+    } else {
+        w.write_bit(h.error_resilient_mode);
+    }
 
     w.write_bit(h.disable_cdf_update);
     if seq.seq_force_screen_content_tools == SELECT_SCREEN_CONTENT_TOOLS {
@@ -342,34 +383,72 @@ pub fn write_frame_header(w: &mut BitWriter, seq: &SequenceHeader, h: &FrameHead
     }
     w.write_bit(h.frame_size_override_flag);
     w.write_bits(h.order_hint, seq.order_hint_bits);
-    // primary_ref_frame, buffer_removal_time, refresh_frame_flags and the
-    // ref_order_hint loop are all forced for a shown key frame.
 
-    if h.frame_size_override_flag {
-        w.write_bits(h.frame_width - 1, seq.frame_width_bits);
-        w.write_bits(h.frame_height - 1, seq.frame_height_bits);
+    if h.frame_is_intra || h.error_resilient_mode {
+        // primary_ref_frame is forced PRIMARY_REF_NONE and not coded.
+    } else {
+        w.write_bits(u32::from(h.primary_ref_frame), 3);
     }
-    if seq.enable_superres {
-        w.write_bit(h.use_superres);
+    // buffer_removal_time is not coded: decoder_model_info is refused above.
+
+    if is_key {
+        // refresh_frame_flags is forced to every slot for a shown key frame.
+    } else {
+        w.write_bits(u32::from(h.refresh_frame_flags), 8);
     }
-    if h.use_superres || h.superres_denom != 8 {
-        return Err(Error::unsupported(
-            "AV1 superres",
-            "only a superres denominator of 8 (no scaling) is written",
-        ));
+    if (!h.frame_is_intra || h.refresh_frame_flags != u8::MAX)
+        && h.error_resilient_mode
+        && seq.enable_order_hint
+    {
+        for hint in h.ref_order_hint {
+            w.write_bits(hint, seq.order_hint_bits);
+        }
     }
-    let render_differs = h.render_width != h.upscaled_width || h.render_height != h.frame_height;
-    w.write_bit(render_differs);
-    if render_differs {
-        w.write_bits(h.render_width - 1, 16);
-        w.write_bits(h.render_height - 1, 16);
+
+    if h.frame_is_intra {
+        write_frame_size(w, seq, h)?;
+        if h.allow_screen_content_tools && h.upscaled_width == h.frame_width {
+            w.write_bit(h.allow_intrabc);
+        }
+    } else {
+        w.write_bit(h.frame_refs_short_signaling);
+        if h.frame_refs_short_signaling {
+            return Err(Error::unsupported(
+                "AV1 frame header",
+                "short reference frame signalling is not written",
+            ));
+        }
+        for &idx in &h.ref_frame_idx[..REFS_PER_FRAME] {
+            w.write_bits(u32::from(idx), 3);
+        }
+        if h.frame_size_override_flag && !h.error_resilient_mode {
+            return Err(Error::unsupported(
+                "AV1 frame header",
+                "frame_size_with_refs is not written",
+            ));
+        }
+        write_frame_size(w, seq, h)?;
+
+        w.write_bit(h.allow_high_precision_mv); // force_integer_mv is false here
+        if h.interpolation_filter == InterpolationFilter::Switchable {
+            w.write_bit(true);
+        } else {
+            w.write_bit(false);
+            w.write_bits(h.interpolation_filter as u32, 2);
+        }
+        w.write_bit(h.is_motion_mode_switchable);
+        if h.error_resilient_mode || !seq.enable_ref_frame_mvs {
+            // use_ref_frame_mvs is forced false and not coded.
+        } else {
+            w.write_bit(h.use_ref_frame_mvs);
+        }
+        // OrderHints and RefFrameSignBias are derived from decoder state, not coded.
     }
-    if h.allow_screen_content_tools && h.upscaled_width == h.frame_width {
-        w.write_bit(h.allow_intrabc);
-    }
+
     if !h.disable_cdf_update {
         w.write_bit(h.disable_frame_end_update_cdf);
     }
+    // disable_frame_end_update_cdf is forced true when disable_cdf_update is set.
 
     write_tile_info(w, seq, h)?;
     write_quantization_params(w, seq, h);
@@ -402,8 +481,35 @@ pub fn write_frame_header(w: &mut BitWriter, seq: &SequenceHeader, h: &FrameHead
     } else {
         w.write_bit(h.tx_mode == TxMode::Select);
     }
-    // reference_select, skip mode and warped motion are all forced for intra.
+    if h.frame_is_intra {
+        // reference_select is forced false and not coded.
+    } else if h.reference_select {
+        return Err(Error::unsupported(
+            "AV1 frame header",
+            "reference_select (and the skip mode it gates) is not written",
+        ));
+    } else {
+        w.write_bit(false);
+        // skip_mode_present is forced false when reference_select is false
+        // (spec 5.9.22), and not coded.
+    }
+    if h.frame_is_intra || h.error_resilient_mode || !seq.enable_warped_motion {
+        // allow_warped_motion is forced false and not coded.
+    } else {
+        w.write_bit(h.allow_warped_motion);
+    }
     w.write_bit(h.reduced_tx_set);
+    if !h.frame_is_intra {
+        for warp in &h.global_motion[..REFS_PER_FRAME] {
+            if warp.model != WarpModel::Identity {
+                return Err(Error::unsupported(
+                    "AV1 global motion",
+                    "only the identity model is written",
+                ));
+            }
+            w.write_bit(false); // is_global
+        }
+    }
     // Global motion is the identity for intra and is not coded.
     if seq.film_grain_params_present {
         w.write_bit(h.film_grain.apply_grain);
@@ -624,9 +730,13 @@ mod tests {
     fn unsupported_frames_are_refused_by_name() {
         let seq = sample_1080p();
 
-        let mut inter = sample_key_frame();
-        inter.frame_type = FrameType::Inter;
-        assert!(frame_obu(&seq, &inter, &[0x00]).is_err());
+        let mut intra_only = sample_key_frame();
+        intra_only.frame_type = FrameType::IntraOnly;
+        assert!(frame_obu(&seq, &intra_only, &[0x00]).is_err());
+
+        let mut switch = sample_key_frame();
+        switch.frame_type = FrameType::Switch;
+        assert!(frame_obu(&seq, &switch, &[0x00]).is_err());
 
         let mut hidden = sample_key_frame();
         hidden.show_frame = false;
@@ -645,5 +755,56 @@ mod tests {
         let mut grain_frame = sample_key_frame();
         grain_frame.film_grain.apply_grain = true;
         assert!(frame_obu(&grainy, &grain_frame, &[0x00]).is_err());
+    }
+
+    /// A key frame followed by two inter frames, all referencing the single
+    /// slot the key frame filled: every field the parser hands back, parsed
+    /// through [`ec_av1_syntax::Av1Parser`]'s own `FrameState` threading, must
+    /// equal what was asked to be written, and the header must consume
+    /// exactly the bit count the writer produced (a shifted field would still
+    /// often parse to *some* value, but not to the same bit length).
+    #[test]
+    fn key_and_inter_frames_roundtrip() {
+        let (seq, key) = crate::encode::key_frame_headers(64, 64, 100).unwrap();
+        let (seq_again, inter1) = crate::encode::inter_frame_headers(64, 64, 100, 1, 0).unwrap();
+        assert_eq!(
+            seq, seq_again,
+            "an inter frame must reuse the sequence header verbatim"
+        );
+        let (_, inter2) = crate::encode::inter_frame_headers(64, 64, 100, 2, 0).unwrap();
+
+        let mut stream = sequence_header_obu(&seq).unwrap();
+        stream.extend_from_slice(&frame_obu(&seq, &key, &[0xAA]).unwrap());
+        stream.extend_from_slice(&frame_obu(&seq, &inter1, &[0xBB]).unwrap());
+        stream.extend_from_slice(&frame_obu(&seq, &inter2, &[0xCC]).unwrap());
+
+        let mut parser = Av1Parser::new();
+        let obus = parser.parse_temporal_unit(&stream).unwrap();
+        assert_eq!(obus.len(), 4);
+
+        for (obu, expected) in obus[1..].iter().zip([&key, &inter1, &inter2]) {
+            let ObuKind::Frame(parsed, _tiles) = &obu.kind else {
+                panic!("expected an OBU_FRAME, got {:?}", obu.kind);
+            };
+
+            let mut w = BitWriter::new();
+            write_frame_header(&mut w, &seq, expected).unwrap();
+            assert_eq!(
+                parsed.header_bits,
+                w.bit_len(),
+                "the header must consume exactly the bits it was written with"
+            );
+
+            // showable_frame, OrderHints, RefFrameSignBias and header_bits are
+            // all derived by the reader (spec 5.9.2, 7.8) rather than coded;
+            // the writer does not fill them in, so they are taken from the
+            // parse before the rest of the header is compared field by field.
+            let mut expected = expected.clone();
+            expected.showable_frame = parsed.showable_frame;
+            expected.order_hints = parsed.order_hints;
+            expected.ref_frame_sign_bias = parsed.ref_frame_sign_bias;
+            expected.header_bits = parsed.header_bits;
+            assert_eq!(**parsed, expected);
+        }
     }
 }
