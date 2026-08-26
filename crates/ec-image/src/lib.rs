@@ -1,4 +1,4 @@
-//! Still-image decoding: PNG, JPEG, WebP, GIF and BMP.
+//! Still-image decoding: PNG, JPEG, WebP, GIF, BMP and TIFF.
 //!
 //! One entry point — [`decode`] over bytes, [`open`] over a path — guesses the
 //! format from the leading bytes and hands back an [`Image`]: dimensions, a
@@ -35,6 +35,7 @@ pub mod bmp;
 pub mod gif;
 pub mod jpeg;
 pub mod png;
+pub mod tiff;
 mod upsample;
 pub mod webp;
 
@@ -57,6 +58,8 @@ pub enum ImageFormat {
     Gif,
     /// Windows BMP (device-independent bitmap).
     Bmp,
+    /// TIFF, the tag-directory format.
+    Tiff,
 }
 
 impl ImageFormat {
@@ -74,6 +77,15 @@ impl ImageFormat {
             Some(ImageFormat::Gif)
         } else if is_bmp(data) {
             Some(ImageFormat::Bmp)
+        } else if data.starts_with(b"II\x2a\x00")
+            || data.starts_with(b"MM\x00\x2a")
+            || data.starts_with(b"II\x2b\x00")
+            || data.starts_with(b"MM\x00\x2b")
+        {
+            // 42 is classic TIFF and 43 is BigTIFF; the second is recognised
+            // here so that the decoder can refuse it by name rather than
+            // leaving the file unidentified.
+            Some(ImageFormat::Tiff)
         } else {
             None
         }
@@ -87,6 +99,7 @@ impl ImageFormat {
             ImageFormat::WebP => "webp",
             ImageFormat::Gif => "gif",
             ImageFormat::Bmp => "bmp",
+            ImageFormat::Tiff => "tiff",
         }
     }
 }
@@ -373,9 +386,10 @@ pub fn decode_with_limits(data: &[u8], limits: Limits) -> Result<Image> {
         Some(ImageFormat::WebP) => webp::decode(data, limits),
         Some(ImageFormat::Gif) => gif::decode(data, limits),
         Some(ImageFormat::Bmp) => bmp::decode(data, limits),
+        Some(ImageFormat::Tiff) => tiff::decode(data, limits),
         None => Err(Error::unsupported(
             "image",
-            "no PNG, JPEG, WebP, GIF or BMP signature at the start of the data",
+            "no PNG, JPEG, WebP, GIF, BMP or TIFF signature at the start of the data",
         )),
     }
 }
@@ -388,9 +402,10 @@ pub fn info(data: &[u8]) -> Result<Info> {
         Some(ImageFormat::WebP) => webp::info(data),
         Some(ImageFormat::Gif) => gif::info(data),
         Some(ImageFormat::Bmp) => bmp::info(data),
+        Some(ImageFormat::Tiff) => tiff::info(data),
         None => Err(Error::unsupported(
             "image",
-            "no PNG, JPEG, WebP, GIF or BMP signature at the start of the data",
+            "no PNG, JPEG, WebP, GIF, BMP or TIFF signature at the start of the data",
         )),
     }
 }

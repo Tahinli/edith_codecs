@@ -630,3 +630,102 @@ fn an_os2_v2_header_reads_as_the_same_picture() {
         "os2v2.bmp: samples differ from the same picture in a v1 header"
     );
 }
+
+/// TIFF stores raw samples, so like BMP the only question is whether the two
+/// decoders read the same tags the same way. The corpus crosses every
+/// compression with both byte orders, strips against tiles, interleaved
+/// samples against planes, and five sample depths.
+#[test]
+fn tiff_decodes_pixel_exactly() {
+    let mut files = corpus("tiff");
+    files.extend(corpus("tif"));
+    files.sort();
+    if files.is_empty() && skip("tiff") {
+        return;
+    }
+    for path in files {
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        if name == "palette4.tiff" {
+            continue; // the incumbent refuses a 4-bit palette; its own test covers it
+        }
+        if name == "rgba8-assoc.tiff" {
+            continue; // the incumbent ignores ExtraSamples; its own test covers it
+        }
+        let data = std::fs::read(&path).unwrap();
+        let ours = ec_image::decode(&data).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let theirs = image::load_from_memory(&data).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(
+            (ours.width, ours.height),
+            theirs.dimensions(),
+            "{name}: dimensions differ"
+        );
+        let (max, corr) = compare(&ours.to_rgba8(), &theirs.to_rgba8().into_raw());
+        println!("{name:>20}  max {max}  corr {corr:.6}");
+        assert_eq!(max, 0, "{name}: samples differ from the incumbent");
+    }
+}
+
+/// TIFF tags its alpha as either straight (ExtraSamples 1) or associated
+/// (ExtraSamples 2, premultiplied). The incumbent hands back the file's raw
+/// samples either way, so it cannot arbitrate the premultiplied one; the two
+/// fixtures carry the same picture at alpha 0 or 255, where premultiplying is
+/// lossless, so the associated file must decode to the straight one exactly.
+#[test]
+fn an_associated_alpha_tiff_reads_unpremultiplied() {
+    let (Ok(assoc), Ok(straight)) = (
+        std::fs::read(fixtures().join("rgba8-assoc.tiff")),
+        std::fs::read(fixtures().join("rgba8.tiff")),
+    ) else {
+        skip("rgba8-assoc.tiff");
+        return;
+    };
+    let ours = ec_image::decode(&assoc).expect("rgba8-assoc.tiff");
+    let reference = ec_image::decode(&straight).expect("rgba8.tiff");
+    // Under a zero alpha the colour is gone for good -- premultiplying by zero
+    // is not invertible -- so those pixels are compared on their alpha alone.
+    let (ours, reference) = (ours.to_rgba8(), reference.to_rgba8());
+    for (i, (a, b)) in ours.chunks(4).zip(reference.chunks(4)).enumerate() {
+        assert_eq!(a[3], b[3], "rgba8-assoc.tiff: alpha differs at pixel {i}");
+        if b[3] != 0 {
+            assert_eq!(
+                a[..3],
+                b[..3],
+                "rgba8-assoc.tiff: the premultiplication was not undone at pixel {i}"
+            );
+        }
+    }
+
+    // The incumbent ignores the tag, so its two decodes differ: were that to
+    // change, this test would be comparing against nothing.
+    let a = image::load_from_memory(&assoc).expect("incumbent rgba8-assoc.tiff");
+    let b = image::load_from_memory(&straight).expect("incumbent rgba8.tiff");
+    assert_ne!(
+        a.to_rgba8().into_raw(),
+        b.to_rgba8().into_raw(),
+        "the incumbent now honours ExtraSamples; use it as the oracle instead"
+    );
+}
+
+/// A 4-bit palette, which the incumbent refuses ("Photometric interpretation
+/// RGBPalette with bits per sample [4] is unsupported") and ffmpeg reads. The
+/// oracle is therefore ffmpeg's own decode of the same file, written to a PNG
+/// when the corpus was generated.
+#[test]
+fn a_four_bit_tiff_palette_reads_as_ffmpeg_reads_it() {
+    let (Ok(narrow), Ok(wide)) = (
+        std::fs::read(fixtures().join("palette4.tiff")),
+        std::fs::read(fixtures().join("palette4-golden.png")),
+    ) else {
+        skip("palette4.tiff");
+        return;
+    };
+    assert!(
+        image::load_from_memory(&narrow).is_err(),
+        "the incumbent now reads a 4-bit palette; this test's premise is stale"
+    );
+    let ours = ec_image::decode(&narrow).unwrap();
+    let reference = image::load_from_memory(&wide).unwrap();
+    assert_eq!((ours.width, ours.height), reference.dimensions());
+    let (max, _) = compare(&ours.to_rgba8(), &reference.to_rgba8().into_raw());
+    assert_eq!(max, 0, "palette4.tiff: samples differ from the same palette at 8 bits");
+}
