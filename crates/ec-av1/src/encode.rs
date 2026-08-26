@@ -506,30 +506,34 @@ impl Plane<'_> {
         side: usize,
         reach: Reach,
     ) -> (Option<Vec<u8>>, Option<Vec<u8>>, Option<u8>) {
-        // A block's own edge (no `reach`) reads samples reconstructed as part
-        // of *some* legally-coded block, whole or not, even where that
-        // block's own extent straddles the true frame edge -- `has_half`
-        // (spec `hasRows`/`hasCols`) lets a whole block stand there, and its
-        // full extent gets a real transform, not a garbage tail, so this
-        // reads no further than the padded coding surface. Only a `reach`
-        // extension crosses into a block that may never be coded at all past
-        // the true edge, so only it clamps to the true bound (`mi_cols`/
-        // `mi_rows` * 4), replicating past it same as spec 7.11.2.2's
-        // `aboveLimit`/`leftLimit` clamp.
+        // Even a block's *own* edge is clamped to the true frame bound, not
+        // just a `reach` extension: libaom's `av1_predict_intra_block`
+        // (`av1/common/reconintra.c`) derives `xr`/`yd` -- the distance from
+        // this block's own right/bottom to the frame edge -- from
+        // `mb_to_right_edge`/`mb_to_bottom_edge`, which are built from
+        // `mi_cols`/`mi_rows` (the true, decodable extent), never from any
+        // padded coding surface. `n_top_px`/`n_left_px` (how many *real*
+        // samples the row/column above/left holds before the decoder starts
+        // repeating the last one, same clamp as spec 7.11.2.2's `aboveLimit`/
+        // `leftLimit`) is `min(side, xr + side)` even for a block whose own
+        // extent straddles that edge legally (`has_half`) -- the transform
+        // still covers the whole block, but prediction does not get to read
+        // real reconstructed pixels past the true edge for its own row/column,
+        // only for the padded tail it invents.
+        let own_across = x + side.min(self.true_width.saturating_sub(x));
         let across = if reach.above_right {
-            (x + 2 * side)
-                .min(self.width)
-                .min(self.true_width.max(x + side))
+            own_across + side.min(self.true_width.saturating_sub(own_across))
         } else {
-            (x + side).min(self.width)
-        };
+            own_across
+        }
+        .min(self.width);
+        let own_down = y + side.min(self.true_height.saturating_sub(y));
         let down = if reach.below_left {
-            (y + 2 * side)
-                .min(self.height)
-                .min(self.true_height.max(y + side))
+            own_down + side.min(self.true_height.saturating_sub(own_down))
         } else {
-            (y + side).min(self.height)
-        };
+            own_down
+        }
+        .min(self.height);
         // `across`/`down` can still fall at or below `x`/`y` for a sub-block
         // whose own origin already sits past the true edge -- only reachable
         // through a partition trial priced for comparison on a split this
