@@ -402,9 +402,17 @@ fn lzw(input: &[u8], hint: usize) -> Result<Vec<u8>> {
             }
             stack.push(walk as u8);
             *stack.last().unwrap()
-        } else if let Some(previous) = previous {
-            // The KwKwK case: the code being emitted is the one this step is
-            // about to define.
+        } else if code as usize == next {
+            // The KwKwK case: the code being emitted is exactly the one this
+            // step is about to define. A code greater than `next` is not a
+            // KwKwK case at all -- it names a dictionary entry that does not
+            // exist yet -- and accepting it here would let `previous` (set
+            // below to this out-of-range `code`) get written into a future
+            // `prefix` slot, breaking the invariant that every prefix chain
+            // strictly decreases and turning the walk above into a cycle
+            // that grows `stack` without bound.
+            let previous = previous
+                .ok_or_else(|| Error::corrupt("TIFF: an LZW stream opening with a new code"))?;
             let mut walk = previous;
             while walk >= 258 {
                 stack.push(suffix[walk as usize]);
@@ -415,7 +423,9 @@ fn lzw(input: &[u8], hint: usize) -> Result<Vec<u8>> {
             stack.insert(0, first);
             first
         } else {
-            return Err(Error::corrupt("TIFF: an LZW stream opening with a new code"));
+            // code as usize > next: a reference to a dictionary entry that
+            // does not exist yet, neither an ordinary code nor a valid KwKwK.
+            return Err(Error::corrupt("TIFF: an LZW code past the dictionary"));
         };
         out.extend(stack.iter().rev());
         if let Some(previous) = previous {
