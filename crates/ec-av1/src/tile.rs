@@ -16,7 +16,7 @@ use ec_core::{Error, Result};
 use crate::cdf;
 use crate::cdf_state::{Cdfs, MvComponentCdfs, TxbSet, TxbTables};
 use crate::msac::SymbolEncoder;
-use crate::mvstack::{find_mv_stack, single_ref_ctx, MiGrid, MiInfo};
+use crate::mvstack::{MiGrid, MiInfo, find_mv_stack, single_ref_ctx};
 
 /// `PARTITION_NONE` (spec 6.10.4): the whole block, undivided.
 const PARTITION_NONE: usize = 0;
@@ -81,8 +81,18 @@ const MAX_BR_LEVEL: i32 = NUM_BASE_LEVELS + COEFF_BASE_RANGE;
 /// followed by that many bits, and the spec's decoder reads at most twenty of
 /// each, so a level a decoder cannot read back is refused rather than written.
 const MAX_LEVEL: i32 = MAX_BR_LEVEL + (1 << 19);
-/// The q-context band whose default CDFs [`crate::cdf`] carries.
-const Q_CTX_2: std::ops::RangeInclusive<u8> = 61..=120;
+
+/// The coefficient q-context (spec 8.3.2's `Get_Qctx`, `Default_..._Cdf`'s
+/// leading index) a frame's `base_q_idx` picks its default CDFs from.
+/// [`crate::cdf`] carries all four, one constant set per context.
+fn q_ctx_of(base_q_idx: u8) -> usize {
+    match base_q_idx {
+        0..=20 => 0,
+        21..=60 => 1,
+        61..=120 => 2,
+        _ => 3,
+    }
+}
 
 /// Both writers here code whole superblocks only: a partial one forces the
 /// partition syntax down the block tree, which they do not code yet.
@@ -194,8 +204,7 @@ pub fn dc_key_frame_tile(
 /// Returns an error when the frame is not a whole number of 64x64 superblocks,
 /// when `levels` does not carry exactly one level per superblock, when a level
 /// is outside the range the base and base-range syntax carry (`-14..=14`
-/// without zero), or when `base_q_idx` is outside the q-context band whose
-/// default CDFs this crate carries.
+/// without zero).
 pub fn dc_key_frame_tile_levels(
     mi_cols: u32,
     mi_rows: u32,
@@ -204,7 +213,29 @@ pub fn dc_key_frame_tile_levels(
 ) -> Result<Vec<u8>> {
     check_superblocks(mi_cols, mi_rows)?;
     let (sb_cols, sb_rows) = (mi_cols / SB_MI, mi_rows / SB_MI);
-    check_levels(levels, (sb_cols * sb_rows) as usize, base_q_idx)?;
+    check_levels(levels, (sb_cols * sb_rows) as usize)?;
+    let q_ctx = q_ctx_of(base_q_idx);
+    let txb_skip_luma_64 = crate::cdf_state::pick(
+        q_ctx,
+        cdf::TXB_SKIP_LUMA_64_Q0,
+        cdf::TXB_SKIP_LUMA_64_Q1,
+        cdf::TXB_SKIP_LUMA_64,
+        cdf::TXB_SKIP_LUMA_64_Q3,
+    );
+    let base_eob_luma_64_dc = crate::cdf_state::pick(
+        q_ctx,
+        cdf::COEFF_BASE_EOB_LUMA_64_Q0[0],
+        cdf::COEFF_BASE_EOB_LUMA_64_Q1[0],
+        cdf::COEFF_BASE_EOB_LUMA_64[0],
+        cdf::COEFF_BASE_EOB_LUMA_64_Q3[0],
+    );
+    let txb_skip_chroma_32_none = crate::cdf_state::pick(
+        q_ctx,
+        cdf::TXB_SKIP_CHROMA_32_Q0[0],
+        cdf::TXB_SKIP_CHROMA_32_Q1[0],
+        cdf::TXB_SKIP_CHROMA_32[0],
+        cdf::TXB_SKIP_CHROMA_32_Q3[0],
+    );
 
     // The sign of the DC each coded block left behind, for the two neighbours
     // the sign context is read from: one row of them above, and the block to
@@ -230,16 +261,17 @@ pub fn dc_key_frame_tile_levels(
                 &mut enc,
                 dc_level,
                 dc_sign_ctx(dc_vote(above[c as usize]) + dc_vote(left)),
-                &cdf::TXB_SKIP_LUMA_64,
-                &cdf::COEFF_BASE_EOB_LUMA_64_DC,
+                q_ctx,
+                &txb_skip_luma_64,
+                &base_eob_luma_64_dc,
             );
 
             // Both chroma transform blocks are all-zero. Their planes carry no
             // coded coefficient anywhere in the frame, so the neighbour halves
             // of their context stay 0 and only the offset for a transform block
             // that covers its whole plane block is left: context 7.
-            enc.symbol_fixed(1, &cdf::TXB_SKIP_CHROMA_32_NONE);
-            enc.symbol_fixed(1, &cdf::TXB_SKIP_CHROMA_32_NONE);
+            enc.symbol_fixed(1, &txb_skip_chroma_32_none);
+            enc.symbol_fixed(1, &txb_skip_chroma_32_none);
 
             above[c as usize] = Some(negative);
             left = Some(negative);
@@ -269,7 +301,29 @@ pub fn split_dc_key_frame_tile(
     check_superblocks(mi_cols, mi_rows)?;
     let (sb_cols, sb_rows) = (mi_cols / SB_MI, mi_rows / SB_MI);
     let (cols, rows) = (sb_cols * 2, sb_rows * 2);
-    check_levels(levels, (cols * rows) as usize, base_q_idx)?;
+    check_levels(levels, (cols * rows) as usize)?;
+    let q_ctx = q_ctx_of(base_q_idx);
+    let txb_skip_luma_32 = crate::cdf_state::pick(
+        q_ctx,
+        cdf::TXB_SKIP_LUMA_32_Q0,
+        cdf::TXB_SKIP_LUMA_32_Q1,
+        cdf::TXB_SKIP_LUMA_32,
+        cdf::TXB_SKIP_LUMA_32_Q3,
+    );
+    let base_eob_luma_32 = crate::cdf_state::pick(
+        q_ctx,
+        cdf::COEFF_BASE_EOB_LUMA_32_Q0[0],
+        cdf::COEFF_BASE_EOB_LUMA_32_Q1[0],
+        cdf::COEFF_BASE_EOB_LUMA_32[0],
+        cdf::COEFF_BASE_EOB_LUMA_32_Q3[0],
+    );
+    let txb_skip_chroma_16_0 = crate::cdf_state::pick(
+        q_ctx,
+        cdf::TXB_SKIP_CHROMA_16_Q0[0],
+        cdf::TXB_SKIP_CHROMA_16_Q1[0],
+        cdf::TXB_SKIP_CHROMA_16[0],
+        cdf::TXB_SKIP_CHROMA_16_Q3[0],
+    );
 
     let mut above: Vec<Option<bool>> = vec![None; cols as usize];
     let mut left: Vec<Option<bool>> = vec![None; rows as usize];
@@ -306,11 +360,12 @@ pub fn split_dc_key_frame_tile(
                     &mut enc,
                     dc_level,
                     dc_sign_ctx(dc_vote(above[c as usize]) + dc_vote(left[r as usize])),
-                    &cdf::TXB_SKIP_LUMA_32,
-                    &cdf::COEFF_BASE_EOB_LUMA_32[0],
+                    q_ctx,
+                    &txb_skip_luma_32,
+                    &base_eob_luma_32,
                 );
-                enc.symbol_fixed(1, &cdf::TXB_SKIP_CHROMA_16[0]);
-                enc.symbol_fixed(1, &cdf::TXB_SKIP_CHROMA_16[0]);
+                enc.symbol_fixed(1, &txb_skip_chroma_16_0);
+                enc.symbol_fixed(1, &txb_skip_chroma_16_0);
 
                 above[c as usize] = Some(negative);
                 left[r as usize] = Some(negative);
@@ -622,8 +677,7 @@ impl Neighbours {
 /// that is half outside the frame is left whole, when a block names an intra
 /// mode a key frame does not code, when a coefficient sits outside its
 /// transform, repeats a position, carries a zero level or one wider than the
-/// Golomb tail reaches, or when `base_q_idx` is outside the q-context band
-/// whose default CDFs this crate carries.
+/// Golomb tail reaches.
 pub fn sb_coeff_key_frame_tile(
     mi_cols: u32,
     mi_rows: u32,
@@ -660,13 +714,6 @@ pub fn sb_coeff_key_frame_tile(
             ),
         ));
     }
-    if !Q_CTX_2.contains(&base_q_idx) {
-        return Err(Error::unsupported(
-            "AV1 tile",
-            "the coefficient CDFs of only one q context are known, so \
-             base_q_idx must be 61..=120",
-        ));
-    }
 
     let sub_planes = [TxbSet::Luma16, TxbSet::Chroma8, TxbSet::Chroma8];
     let split_planes = [TxbSet::Luma32, TxbSet::Chroma16, TxbSet::Chroma16];
@@ -680,7 +727,7 @@ pub fn sb_coeff_key_frame_tile(
     // The tile adapts every non-literal CDF it writes, exactly as the decoder
     // adapts the ones it reads, so the frame header leaves `disable_cdf_update`
     // off.
-    let mut cdfs = Cdfs::new();
+    let mut cdfs = Cdfs::new(q_ctx_of(base_q_idx));
     let mut enc = SymbolEncoder::new();
     for sb_r in 0..sb_rows {
         neighbours.start_row();
@@ -1046,7 +1093,7 @@ pub(crate) fn coeff_bits(grid: &[i32], set: TxbSet) -> f64 {
     /// and the scan is the same table every time.
     static SCANS: LazyLock<[Vec<u16>; 3]> =
         LazyLock::new(|| [default_scan(TX8), default_scan(TX16), default_scan(TX32)]);
-    let mut cdfs = Cdfs::new();
+    let mut cdfs = Cdfs::new(2);
     let mut coding = cdfs.txb(set, DC_PRED);
     let scan = match coding.side {
         TX8 => &SCANS[0],
@@ -1066,7 +1113,7 @@ pub(crate) fn coeff_bits(grid: &[i32], set: TxbSet) -> f64 {
 /// than it is — because the search that reads it runs before the tile knows
 /// what its neighbours will be.
 pub(crate) fn partition_bits(side: usize, split: bool) -> f64 {
-    let cdfs = Cdfs::new();
+    let cdfs = Cdfs::new(2);
     let cdf: &[u16] = match side {
         SB => &cdfs.partition_w64[0],
         BLOCK => &cdfs.partition_w32[0],
@@ -1265,9 +1312,8 @@ fn neighbour(grid: &[i32], side: usize, row: usize, col: usize) -> i32 {
     }
 }
 
-/// Shared by both DC writers: one level per block, none of them zero, and a
-/// q index the coefficient CDFs are known for.
-fn check_levels(levels: &[i32], blocks: usize, base_q_idx: u8) -> Result<()> {
+/// Shared by both DC writers: one level per block, none of them zero.
+fn check_levels(levels: &[i32], blocks: usize) -> Result<()> {
     if levels.len() != blocks {
         return Err(Error::unsupported(
             "AV1 tile",
@@ -1279,13 +1325,6 @@ fn check_levels(levels: &[i32], blocks: usize, base_q_idx: u8) -> Result<()> {
             "AV1 tile",
             "a DC-only key frame is written for levels -14..=14 without zero; \
              wider levels need the Golomb tail",
-        ));
-    }
-    if !Q_CTX_2.contains(&base_q_idx) {
-        return Err(Error::unsupported(
-            "AV1 tile",
-            "the coefficient CDFs of only one q context are known, so \
-             base_q_idx must be 61..=120",
         ));
     }
     Ok(())
@@ -1301,19 +1340,35 @@ fn write_dc_coeffs(
     enc: &mut SymbolEncoder,
     dc_level: i32,
     sign_ctx: usize,
+    q_ctx: usize,
     txb_skip: &[u16],
     base_eob: &[u16],
 ) {
+    use crate::cdf_state::pick;
     let level = dc_level.abs();
+    let eob_pt = pick(
+        q_ctx,
+        cdf::EOB_PT_1024_LUMA_Q0,
+        cdf::EOB_PT_1024_LUMA_Q1,
+        cdf::EOB_PT_1024_LUMA,
+        cdf::EOB_PT_1024_LUMA_Q3,
+    );
+    let br = pick(
+        q_ctx,
+        cdf::COEFF_BR_LUMA_32_Q0,
+        cdf::COEFF_BR_LUMA_32_Q1,
+        cdf::COEFF_BR_LUMA_32,
+        cdf::COEFF_BR_LUMA_32_Q3,
+    );
     enc.symbol_fixed(0, txb_skip);
-    enc.symbol_fixed(0, &cdf::EOB_PT_1024_LUMA);
+    enc.symbol_fixed(0, &eob_pt);
     enc.symbol_fixed((level.min(NUM_BASE_LEVELS + 1) - 1) as usize, base_eob);
     if level > NUM_BASE_LEVELS {
         let mut remaining = level - (NUM_BASE_LEVELS + 1);
         let mut sent = 0;
         while sent < COEFF_BASE_RANGE {
             let k = remaining.min(BR_STEP);
-            enc.symbol_fixed(k as usize, &cdf::COEFF_BR_LUMA_32[0]);
+            enc.symbol_fixed(k as usize, &br[0]);
             if k < BR_STEP {
                 break;
             }
@@ -1369,11 +1424,7 @@ fn intra_inter_ctx(has_above: bool, has_left: bool, above_inter: bool, left_inte
 /// `CLASS0_SIZE << (class + 2)` (spec 3), the magnitude an `MV_CLASS_n`
 /// component's own bits start counting from; class zero starts at zero.
 fn mv_class_base(class: usize) -> i32 {
-    if class == 0 {
-        0
-    } else {
-        2i32 << (class + 2)
-    }
+    if class == 0 { 0 } else { 2i32 << (class + 2) }
 }
 
 /// The class a pre-offset magnitude `z` (`|diff| - 1`) falls in — the inverse
@@ -1486,9 +1537,7 @@ fn write_mv(
 /// superblocks, when `blocks` does not carry exactly one entry per 32x32
 /// block, when an intra block names a mode a key frame does not code, when a
 /// coefficient sits outside its transform or is one the writer cannot code,
-/// when a `NEWMV` block's motion vector needs eighth-pel precision, or when
-/// `base_q_idx` is outside the q-context band whose default CDFs this crate
-/// carries.
+/// when a `NEWMV` block's motion vector needs eighth-pel precision.
 pub fn sb_coeff_inter_frame_tile(
     mi_cols: u32,
     mi_rows: u32,
@@ -1496,13 +1545,6 @@ pub fn sb_coeff_inter_frame_tile(
     blocks: &[BlockCoeffs],
 ) -> Result<Vec<u8>> {
     check_superblocks(mi_cols, mi_rows)?;
-    if !Q_CTX_2.contains(&base_q_idx) {
-        return Err(Error::unsupported(
-            "AV1 tile",
-            "the coefficient CDFs of only one q context are known, so \
-             base_q_idx must be 61..=120",
-        ));
-    }
     let (cols, rows) = (mi_cols / BLOCK_MI, mi_rows / BLOCK_MI);
     if blocks.len() != (cols * rows) as usize {
         return Err(Error::unsupported(
@@ -1533,7 +1575,7 @@ pub fn sb_coeff_inter_frame_tile(
     let (sb_cols, sb_rows) = (mi_cols / SB_MI, mi_rows / SB_MI);
     let mut neighbours = Neighbours::new(cols as usize * 2, rows as usize * 2);
     let mut grid = MiGrid::new(mi_cols as usize, mi_rows as usize);
-    let mut cdfs = Cdfs::new();
+    let mut cdfs = Cdfs::new(q_ctx_of(base_q_idx));
     let mut enc = SymbolEncoder::new();
     let split_planes = [TxbSet::Luma32, TxbSet::Chroma16, TxbSet::Chroma16];
     let scan32 = default_scan(TX32);
@@ -1688,8 +1730,8 @@ mod tests {
     use crate::sequence::sequence_header_obu;
     use ec_av1_syntax::sequence::SequenceHeader;
     use ec_av1_syntax::{
-        FrameHeader, FrameType, LoopFilterParams, QuantizationParams, TileInfo, TxMode,
-        PRIMARY_REF_NONE,
+        FrameHeader, FrameType, LoopFilterParams, PRIMARY_REF_NONE, QuantizationParams, TileInfo,
+        TxMode,
     };
     use std::io::Write;
     use std::process::{Command, Stdio};
@@ -2154,7 +2196,6 @@ mod tests {
         assert!(dc_key_frame_tile(16, 16, 100, 0).is_err());
         assert!(dc_key_frame_tile(16, 16, 100, 15).is_err());
         assert!(dc_key_frame_tile(16, 16, 100, -15).is_err());
-        assert!(dc_key_frame_tile(16, 16, 40, 3).is_err());
     }
 
     #[test]
@@ -2390,7 +2431,7 @@ mod tests {
         for grid in &grids {
             write_coeffs(
                 &mut enc,
-                &mut Cdfs::new().txb(TxbSet::Luma32, 0),
+                &mut Cdfs::new(2).txb(TxbSet::Luma32, 0),
                 grid,
                 &scan,
                 0,
@@ -3249,10 +3290,6 @@ mod tests {
                 "{name} must be refused"
             );
         }
-        assert!(
-            split_coeff_key_frame_tile(16, 16, 200, &empty()).is_err(),
-            "a q index outside the band whose CDFs are known must be refused"
-        );
     }
 
     /// The default scan is written as the rule that generates it rather than a
@@ -3734,11 +3771,7 @@ mod tests {
             (d << 3) | (fr << 1) | 1
         };
         let mag = mv_class_base(class) + local as i32 + 1;
-        if sign == 1 {
-            -mag
-        } else {
-            mag
-        }
+        if sign == 1 { -mag } else { mag }
     }
 
     /// Decodes one superblock a [`sb_coeff_inter_frame_tile`] payload wrote,
@@ -3764,7 +3797,7 @@ mod tests {
         wrong_y_mode: bool,
     ) -> (usize, Vec<DecodedBlock>) {
         let mut dec = crate::msac::tests::SymbolDecoder::new(data);
-        let mut cdfs = Cdfs::new();
+        let mut cdfs = Cdfs::new(2);
         let mut grid = MiGrid::new(mi_cols as usize, mi_rows as usize);
         let mut above_skip = [false; 2];
         let mut left_skip = [false; 2];
@@ -3977,7 +4010,7 @@ mod tests {
     /// that kept reading past it would be asserting on garbage.
     fn decode_first_block_mode(data: &[u8], wrong_y_mode: bool) -> usize {
         let mut dec = crate::msac::tests::SymbolDecoder::new(data);
-        let mut cdfs = Cdfs::new();
+        let mut cdfs = Cdfs::new(2);
         dec.symbol(&mut cdfs.partition_w64[0]);
         dec.symbol(&mut cdfs.partition_w32[0]);
         dec.symbol(&mut cdfs.skip[0]);
