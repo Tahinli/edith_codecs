@@ -35,6 +35,16 @@ const HORZ_ALIKE: [usize; 6] = [1, PARTITION_SPLIT, 4, 5, 6, 8];
 
 /// Mode-info units across a 32x32 block.
 const BLOCK_MI: u32 = SB_MI / 2;
+
+/// The number of 32x32 block columns/rows a frame whose *true* (unpadded)
+/// size gives `mi_cols`/`mi_rows` is coded over: every block whose mi origin
+/// (`col * BLOCK_MI`) is inside the true bound is coded, so this is a
+/// ceiling, not the exact division a block-aligned frame would give. Shared
+/// by the tile writer's own iteration and by [`crate::encode`]'s block/
+/// superblock generation, which must agree with it exactly.
+pub(crate) fn block_grid(mi_cols: u32, mi_rows: u32) -> (u32, u32) {
+    (mi_cols.div_ceil(BLOCK_MI), mi_rows.div_ceil(BLOCK_MI))
+}
 /// `DC_PRED` (spec 6.10.2), as both the luma and the chroma mode.
 const DC_PRED: usize = 0;
 
@@ -479,22 +489,18 @@ struct Neighbour {
     dc: Option<bool>,
 }
 
-/// Rejects a frame the 32x32 block grid cannot tile.
+/// Rejects a frame with no mode-info grid at all.
 ///
-/// The frame need not be a whole number of superblocks — a superblock at the
-/// right-hand or bottom edge may be half outside it — but every 32x32 block
-/// that is coded has to be wholly inside, because a block that hangs over the
-/// edge has to be coded as a rectangle this writer has no transform for.
+/// `mi_cols`/`mi_rows` are the frame's *true* (unpadded) size in 4x4 units
+/// (spec `compute_image_size`), not necessarily a multiple of the 32x32 block
+/// grid: a block whose origin sits at or past this bound is not coded (spec's
+/// `decode_partition` never visits it), and one that straddles the bound is
+/// coded whole, its samples coming from the padded planes.
 fn check_blocks(mi_cols: u32, mi_rows: u32) -> Result<()> {
-    if mi_cols == 0
-        || mi_rows == 0
-        || !mi_cols.is_multiple_of(BLOCK_MI)
-        || !mi_rows.is_multiple_of(BLOCK_MI)
-    {
+    if mi_cols == 0 || mi_rows == 0 {
         return Err(Error::unsupported(
             "AV1 tile",
-            "a coefficient key frame is written only for frames that are a \
-             whole number of 32x32 blocks",
+            "a coefficient key frame needs a nonzero mode-info grid",
         ));
     }
     Ok(())
@@ -685,7 +691,7 @@ pub fn sb_coeff_key_frame_tile(
     superblocks: &[Superblock],
 ) -> Result<Vec<u8>> {
     check_blocks(mi_cols, mi_rows)?;
-    let (cols, rows) = (mi_cols / BLOCK_MI, mi_rows / BLOCK_MI);
+    let (cols, rows) = block_grid(mi_cols, mi_rows);
     let (sb_cols, sb_rows) = (cols.div_ceil(2), rows.div_ceil(2));
     if superblocks.len() != (sb_cols * sb_rows) as usize {
         return Err(Error::unsupported(
@@ -988,7 +994,7 @@ pub fn split_coeff_key_frame_tile(
     blocks: &[BlockCoeffs],
 ) -> Result<Vec<u8>> {
     check_blocks(mi_cols, mi_rows)?;
-    let (cols, rows) = (mi_cols / BLOCK_MI, mi_rows / BLOCK_MI);
+    let (cols, rows) = block_grid(mi_cols, mi_rows);
     if blocks.len() != (cols * rows) as usize {
         return Err(Error::unsupported(
             "AV1 tile",
