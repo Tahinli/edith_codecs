@@ -1176,8 +1176,11 @@ fn mc_trial(
 /// intra mode [`Search::modes`] offers (predicted exactly as a key frame's
 /// block is), `NEARESTMV`, and `NEWMV` searched from `reference` by
 /// [`motion::search`] and seeded by `stack.pred_mv` — both inter candidates
-/// coded `skip: true`; see the corner-cut comment where they build their
-/// [`Trial`]s.
+/// coding a real residual (`skip: false`) whenever one prices out cheaper
+/// than the all-skip candidate, now that `sb_coeff_inter_frame_tile`'s
+/// missing inter `tx_type` symbol (the desync this function's candidates
+/// used to route around; see `crate::cdf_state::TxbSet::Luma32Inter`) is
+/// fixed.
 ///
 /// The symbol costs this ranks candidates by use fixed contexts (0) for
 /// `skip`, `intra_inter` and `single_ref` — the tile writer's actual
@@ -1289,19 +1292,9 @@ fn search_inter_block(
             + symbol_bits(&cdf::ZERO_MV[stack.zero_mv_ctx], 1) // not zero
             + symbol_bits(&cdf::REF_MV[stack.ref_mv_ctx], 0); // NEARESTMV
 
-    // corner-cut: every inter candidate below codes `skip: true` -- no
-    // residual -- even where a coded residual would cost less. A coded
-    // residual on an `is_inter` block (`skip: false`) desyncs
-    // `sb_coeff_inter_frame_tile`'s output past what dav1d will accept
-    // ("Invalid data found when processing input"), isolated by a minimal
-    // repro (`EC_AV1_DEBUG_ONLY_SKIP` in this lane's history): an intra-only
-    // inter frame decodes clean, an all-skip inter frame decodes clean, but
-    // one `NEARESTMV` block coded with any residual breaks the stream even
-    // at `mv == (0, 0)`. That is inside `sb_coeff_inter_frame_tile`
-    // (`crate::tile`), which this lane's charter forbids editing — ceiling:
-    // an inter frame never codes a residual until that tile-writer defect is
-    // found and fixed; ping-pong candidate is `NEARESTMV`/`NEWMV` "coded"
-    // above.
+    // The NEARESTMV candidate: `skip` is decided below from whether its
+    // trial actually found a nonzero level, once its residual is priced
+    // against the same CDFs the tile writer codes it with.
     {
         let mv = stack.nearest_mv;
         let luma_trial = mc_trial(
@@ -1314,7 +1307,7 @@ fn search_inter_block(
             ref_luma.0,
             ref_luma.1,
             ref_luma.2,
-            true,
+            false,
             search.base_q_idx,
             search.deadzone,
             luma_set,
@@ -1329,7 +1322,7 @@ fn search_inter_block(
             ref_u.0,
             ref_u.1,
             ref_u.2,
-            true,
+            false,
             search.base_q_idx,
             search.deadzone,
             chroma_set,
@@ -1344,23 +1337,34 @@ fn search_inter_block(
             ref_v.0,
             ref_v.1,
             ref_v.2,
-            true,
+            false,
             search.base_q_idx,
             search.deadzone,
             chroma_set,
         );
+        let skip = luma_trial.levels.iter().all(|&l| l == 0)
+            && u.levels.iter().all(|&l| l == 0)
+            && v.levels.iter().all(|&l| l == 0);
         let cost = luma_trial.sse
             + u.sse
             + v.sse
             + search.lambda
-                * (skip_bits(true) + intra_inter_bits(true) + single_ref_bits + mode_bits_inter);
+                * (skip_bits(skip)
+                    + intra_inter_bits(true)
+                    + single_ref_bits
+                    + mode_bits_inter
+                    + if skip {
+                        0.0
+                    } else {
+                        luma_trial.bits + u.bits + v.bits
+                    });
         consider(Candidate {
             cost,
             luma: luma_trial,
             u,
             v,
             mode: DC_PRED,
-            skip: true,
+            skip,
             inter: Some(InterInfo {
                 mode: InterMode::NearestMv,
                 mv,
@@ -1393,7 +1397,7 @@ fn search_inter_block(
             ref_luma.0,
             ref_luma.1,
             ref_luma.2,
-            true,
+            false,
             search.base_q_idx,
             search.deadzone,
             luma_set,
@@ -1408,7 +1412,7 @@ fn search_inter_block(
             ref_u.0,
             ref_u.1,
             ref_u.2,
-            true,
+            false,
             search.base_q_idx,
             search.deadzone,
             chroma_set,
@@ -1423,7 +1427,7 @@ fn search_inter_block(
             ref_v.0,
             ref_v.1,
             ref_v.2,
-            true,
+            false,
             search.base_q_idx,
             search.deadzone,
             chroma_set,
@@ -1433,23 +1437,31 @@ fn search_inter_block(
         } else {
             0.0
         };
+        let skip = luma_trial.levels.iter().all(|&l| l == 0)
+            && u.levels.iter().all(|&l| l == 0)
+            && v.levels.iter().all(|&l| l == 0);
         let cost = luma_trial.sse
             + u.sse
             + v.sse
             + search.lambda
-                * (skip_bits(true)
+                * (skip_bits(skip)
                     + intra_inter_bits(true)
                     + single_ref_bits
                     + symbol_bits(&cdf::NEW_MV[stack.new_mv_ctx], 0)
                     + drl_bits
-                    + mv_bits);
+                    + mv_bits
+                    + if skip {
+                        0.0
+                    } else {
+                        luma_trial.bits + u.bits + v.bits
+                    });
         consider(Candidate {
             cost,
             luma: luma_trial,
             u,
             v,
             mode: DC_PRED,
-            skip: true,
+            skip,
             inter: Some(InterInfo {
                 mode: InterMode::NewMv,
                 mv,
@@ -1791,6 +1803,74 @@ mod tests {
             assert_eq!(decoded.u, encoded.reconstruction.u, "q={q}: U");
             assert_eq!(decoded.v, encoded.reconstruction.v, "q={q}: V");
         }
+    }
+
+    /// The minimal repro that isolated the inter-residual desync: a key frame
+    /// followed by one inter frame whose single superblock carries one
+    /// `NEARESTMV` block (`mv == (0, 0)`) with exactly one nonzero luma
+    /// coefficient, its three sibling blocks all `skip: true`. Before the
+    /// `is_inter` transform-block fix this broke ffmpeg/dav1d ("Invalid data
+    /// found when processing input") even though every symbol either block
+    /// codes is otherwise proven (all-skip inter blocks decode clean, and the
+    /// same coefficient syntax decodes clean on every intra key-frame gate).
+    #[test]
+    fn a_nearestmv_block_with_one_nonzero_coefficient_decodes_clean() {
+        if !have_ffmpeg() {
+            eprintln!(
+                "SKIP a_nearestmv_block_with_one_nonzero_coefficient_decodes_clean: no ffmpeg"
+            );
+            return;
+        }
+        let (width, height) = (64usize, 64usize);
+        let picture = Picture::grey(width, height);
+        let key = encode_key_frame(&picture, 100, 0.5).unwrap();
+
+        let (seq, _) = key_frame_headers(width, height, 100).unwrap();
+        let (_, inter_header) = inter_frame_headers(width, height, 100, 1, 0).unwrap();
+
+        let residual_block = BlockCoeffs {
+            luma: vec![Coeff {
+                row: 0,
+                col: 0,
+                level: 4,
+            }],
+            u: Vec::new(),
+            v: Vec::new(),
+            mode: 0,
+            skip: false,
+            inter: Some(InterInfo {
+                mode: InterMode::NearestMv,
+                mv: (0, 0),
+            }),
+        };
+        let skipped_block = BlockCoeffs {
+            skip: true,
+            inter: Some(InterInfo {
+                mode: InterMode::NearestMv,
+                mv: (0, 0),
+            }),
+            ..BlockCoeffs::default()
+        };
+        let blocks = vec![
+            residual_block,
+            skipped_block.clone(),
+            skipped_block.clone(),
+            skipped_block,
+        ];
+        let tile =
+            sb_coeff_inter_frame_tile(inter_header.mi_cols, inter_header.mi_rows, 100, &blocks)
+                .unwrap();
+
+        // `key.stream` is already a temporal delimiter, the sequence header
+        // and the key frame's own OBU (`encode_key_frame` built it from the
+        // same `key_frame_headers(width, height, 100)` this test calls), so
+        // the inter frame's OBU is appended straight onto it rather than
+        // re-deriving the key frame's tile bytes.
+        let mut stream = key.stream.clone();
+        stream.extend_from_slice(&temporal_delimiter());
+        stream.extend_from_slice(&frame_obu(&seq, &inter_header, &tile).unwrap());
+
+        ffmpeg_decode_sequence(&stream, width, height, 2);
     }
 
     /// One frame of a real clip, scaled to a whole number of 32x32 blocks.

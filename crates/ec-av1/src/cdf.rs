@@ -939,9 +939,12 @@ pub const PARTITION_W16: [[u16; 11]; 4] = [
 /// The transform type of a 16x16 intra luma transform, as an index into the
 /// spec's `Tx_Type_Intra_Inv_Set2`, indexed by the block's luma mode.
 ///
-/// A 16x16 transform is the only size this writer codes whose transform-type
-/// set holds more than one type, so it is the only one that codes the symbol:
-/// 32x32 and 64x64 are DCT-only by spec 5.11.40's `get_tx_set`.
+/// A 16x16 intra transform is the only size this writer's intra path codes
+/// whose transform-type set holds more than one type: 32x32 and 64x64 are
+/// DCT-only for an *intra* block by spec 5.11.48's `get_tx_set` (its
+/// `txSzSqrUp == TX_32X32` case returns `TX_SET_DCTONLY` only in the
+/// `!is_inter` branch). An `is_inter` 32x32 transform takes the other branch
+/// and reads [`INTER_TX_TYPE_SET3_32`] instead.
 pub const INTRA_TX_TYPE_SET2_16: [[u16; 6]; 13] = [
     [1127, 12814, 22772, 27483, 32768, 0],
     [145, 6761, 11980, 26667, 32768, 0],
@@ -957,6 +960,14 @@ pub const INTRA_TX_TYPE_SET2_16: [[u16; 6]; 13] = [
     [83, 5615, 12001, 17228, 32768, 0],
     [1968, 5556, 12023, 18547, 32768, 0],
 ];
+
+/// `Default_Inter_Ext_Tx_Cdf`'s `TX_SET_INTER_3` row for `TX_32X32` (spec
+/// 9.4): the transform type of an `is_inter` 32x32 luma transform, whose
+/// `get_tx_set` (5.11.48) returns `TX_SET_INTER_3` -- `{IDTX, DCT_DCT}` --
+/// because `txSzSqrUp == TX_32X32` takes the `is_inter` branch there, unlike
+/// an intra block's, which is DCT-only at that size. The writer only ever
+/// uses DCT_DCT, index one of `Tx_Type_Inter_Inv_Set3`.
+pub const INTER_TX_TYPE_SET3_32: [u16; 3] = [748, 32768, 0];
 
 // The inter-frame tables below (spec 9.4) support the syntax an inter block
 // needs: whether it is coded as intra at all, which reference frame and
