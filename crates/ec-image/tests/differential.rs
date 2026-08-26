@@ -346,3 +346,93 @@ fn every_fixture_decodes() {
         failures.join("\n")
     );
 }
+
+#[test]
+fn gif_decodes_pixel_exactly() {
+    let files = corpus("gif");
+    if files.is_empty() && skip("gif") {
+        return;
+    }
+    for path in files {
+        let bytes = std::fs::read(&path).unwrap();
+        let ours = ec_image::decode(&bytes).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let theirs = image::load_from_memory(&bytes).expect("incumbent decode");
+        assert_eq!(
+            (ours.width, ours.height),
+            theirs.dimensions(),
+            "{}",
+            path.display()
+        );
+        assert_eq!(
+            ours.to_rgba8(),
+            theirs.to_rgba8().into_raw(),
+            "{} (first frame)",
+            path.file_name().unwrap().to_string_lossy()
+        );
+        eprintln!(
+            "{:<22} {}x{} exact",
+            path.file_name().unwrap().to_string_lossy(),
+            ours.width,
+            ours.height
+        );
+    }
+}
+
+#[test]
+fn a_gif_animation_composites_frame_for_frame_like_the_incumbent() {
+    use image::AnimationDecoder;
+
+    let path = fixtures().join("animated.gif");
+    if !path.exists() && skip("animated.gif") {
+        return;
+    }
+    let bytes = std::fs::read(&path).unwrap();
+    let ours = ec_image::decode_animation(&bytes).expect("our animation decode");
+    let theirs: Vec<image::Frame> =
+        image::codecs::gif::GifDecoder::new(std::io::Cursor::new(&bytes))
+            .expect("incumbent decoder")
+            .into_frames()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("incumbent frames");
+
+    assert_eq!(ours.len(), theirs.len(), "frame count");
+    assert!(ours.len() > 1, "the fixture is not an animation");
+    for (i, (ours, theirs)) in ours.iter().zip(&theirs).enumerate() {
+        let (num, den) = theirs.delay().numer_denom_ms();
+        // Both sides quote the delay in their own units; compare in
+        // milliseconds, which is what a renderer actually waits.
+        let ours_ms = f64::from(ours.delay_num) * 1000.0 / f64::from(ours.delay_den);
+        let theirs_ms = f64::from(num) / f64::from(den);
+        assert!(
+            (ours_ms - theirs_ms).abs() < 0.5,
+            "frame {i}: {ours_ms} ms against the incumbent's {theirs_ms} ms"
+        );
+        assert_eq!(
+            (ours.image.width, ours.image.height),
+            theirs.buffer().dimensions(),
+            "frame {i} is not the whole canvas"
+        );
+        assert_eq!(
+            ours.image.to_rgba8(),
+            theirs.buffer().as_raw().clone(),
+            "frame {i} samples"
+        );
+        eprintln!("frame {i}: {ours_ms:.0} ms, exact");
+    }
+}
+
+#[test]
+fn a_still_of_any_format_is_one_frame_of_animation() {
+    let path = fixtures().join("rgb8.png");
+    if !path.exists() && skip("rgb8.png") {
+        return;
+    }
+    let bytes = std::fs::read(&path).unwrap();
+    let frames = ec_image::decode_animation(&bytes).expect("decode");
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].delay_num, 0);
+    assert_eq!(
+        frames[0].image.to_rgba8(),
+        ec_image::decode(&bytes).unwrap().to_rgba8()
+    );
+}
