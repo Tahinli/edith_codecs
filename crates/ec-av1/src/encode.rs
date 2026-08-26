@@ -2161,17 +2161,40 @@ mod tests {
     /// Reproduces an open defect this lane's sweep found: 854x480 (padded to
     /// 864x480, an *edge-replication* padded key frame -- not a preexisting
     /// bug, since 864x480 coded directly with no padding involved is
-    /// bit-exact) desyncs against ffmpeg's decode starting at luma (row 161,
+    /// bit-exact) diverges from ffmpeg's decode starting at luma (row 161,
     /// col 369), well inside the real (non-padded) region, not at the
-    /// padding edge. 640x352, 1280x720, 854x480's own height (480, already
-    /// 32-aligned) and 1920x1080 all round-trip clean, and the padding/crop
-    /// plumbing itself is exercised bit-exact by
-    /// `a_frame_round_trips_at_its_own_size` and the 64x64-superblock
-    /// sequence case, so this looks like a content-triggered desync inside
-    /// the coefficient/intra coding this lane was told not to touch
-    /// (`tile.rs`), not a padding-wiring bug. Left `#[ignore]`d rather than
-    /// silently dropped from the charter's size list -- next lane should
-    /// start from the row/col this test prints.
+    /// padding edge.
+    ///
+    /// NOT an arithmetic-coder desync: an EC_RNG-per-symbol trace against a
+    /// debug libaom decoder (od_ec_decode_cdf_q15/od_ec_decode_bool_q15
+    /// instrumented) showed the encoder's and the decoder's rng_before/
+    /// rng_after/nsyms/symbol sequences are byte-for-byte identical across
+    /// all 51188 symbols of this frame -- the bitstream itself decodes
+    /// exactly as written. The divergence is a reconstruction/prediction
+    /// mismatch: our own `Encoded::reconstruction` reports 147 at (161,369)
+    /// where both a debug `aomdec` decode of our own bitstream and ffmpeg
+    /// agree on 148, an exact off-by-one that then cascades rightward
+    /// (diff dump: every mismatch in the frame is `ours == ffmpeg - 1`,
+    /// starting at (161,369) and spreading through the rest of that 16x16/
+    /// 32x32 block and everything predicted from it). That points at
+    /// `encode.rs`'s `Reach::of`/`Reach::top_right`/`Reach::bottom_left`
+    /// (the `HAS_TOP_RIGHT`/`HAS_BOTTOM_LEFT` pinned tables used only to
+    /// decide how far a directional intra predictor may read past a block's
+    /// own edges) computing a different above-right/below-left availability
+    /// than the real decoder does for this specific block position, so our
+    /// own search-time prediction differs from the decoder's by one preset
+    /// intensity step -- not the partition/column-edge superblock code this
+    /// lane suspected first (`sb_coeff_key_frame_tile`'s `(has_cols,
+    /// has_rows)` match at tile.rs:783-795 is exercised correctly by this
+    /// same test: the rng trace over that exact superblock matches
+    /// libaom's). 640x352, 1280x720, 854x480's own height (480, already
+    /// 32-aligned), 1920x1080 and 864x480 coded directly all round-trip
+    /// clean, so this needs a specific directional-mode block position
+    /// (content-dependent) to fire. Left `#[ignore]`d -- next lane should
+    /// start from `Reach::top_right`/`bottom_left` in `encode.rs` against
+    /// libaom's `has_tr_16x16`/`has_tr_32x32`/`has_bl_*` source tables,
+    /// checked at the exact position `Reach::position` computes for the
+    /// block covering (row 160ish, col 368ish) in this test's superblock.
     #[test]
     #[ignore = "open defect: content-dependent desync at 854x480 padded, not padding wiring -- see doc comment"]
     fn open_defect_854x480_padded_key_frame_desyncs() {
