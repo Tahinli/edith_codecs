@@ -136,9 +136,10 @@ pub struct Limits {
     /// Largest total bytes accepted across every frame of one decode call.
     ///
     /// A single frame can pass [`Limits::check_bytes`] on its own and still
-    /// be a bomb once a segment count multiplies it — a stripped or tiled
-    /// TIFF decompresses many segments per call, so a file whose segments
-    /// each look small on their own can still retain gigabytes nothing ever
+    /// be a bomb once a frame or segment count multiplies it — GIF and WebP
+    /// both composite onto a full canvas per frame, and a stripped or tiled
+    /// TIFF decompresses many segments per call, so a file whose parts each
+    /// look small on their own can still retain gigabytes nothing ever
     /// checked one buffer at a time. [`AllocBudget`] enforces this across a
     /// decode call.
     pub max_total_alloc: usize,
@@ -170,8 +171,8 @@ impl Limits {
         Ok(())
     }
 
-    /// Check a byte count computed from header-declared fields (a strip's
-    /// `width * height * bpp`, a palette size, a chunk length) before it
+    /// Check a byte count computed from header-declared fields (a frame's or
+    /// strip's `width * height * bpp`, a palette size, a chunk length) before it
     /// sizes a single allocation. `what` names the buffer for the error.
     pub fn check_bytes(&self, what: &str, bytes: Option<usize>) -> Result<usize> {
         let bytes =
@@ -186,10 +187,11 @@ impl Limits {
     }
 }
 
-/// Accumulates bytes spent across every segment of one decode call and
-/// refuses once the running total crosses [`Limits::max_total_alloc`] — the
-/// guard for `segment_count x segment_size`, which [`Limits::check_bytes`]
-/// alone never sees since it only ever looks at one buffer at a time.
+/// Accumulates bytes spent across every frame or segment of one decode call
+/// and refuses once the running total crosses [`Limits::max_total_alloc`] —
+/// the guard for `frame_count x canvas` or `segment_count x segment_size`,
+/// which [`Limits::check_bytes`] alone never sees since it only ever looks
+/// at one buffer at a time.
 #[derive(Debug, Default)]
 pub struct AllocBudget(usize);
 
@@ -545,5 +547,32 @@ mod tests {
         assert!(limits.check(1920, 1080).is_ok());
         assert!(limits.check(0, 10).is_err());
         assert!(limits.check(100_000, 100_000).is_err());
+    }
+
+    #[test]
+    fn check_bytes_refuses_past_max_alloc_before_a_frame_size_carries_it() {
+        let limits = Limits::default();
+        assert!(limits.check_bytes("test", Some(1024)).is_ok());
+        assert!(limits.check_bytes("test", Some(limits.max_alloc + 1)).is_err());
+        assert!(limits.check_bytes("test", None).is_err());
+    }
+
+    #[test]
+    fn alloc_budget_refuses_once_repeated_spends_cross_the_total() {
+        // The class this guards: no single spend is ever over budget on its
+        // own, but a canvas cloned once per animation frame is.
+        let limits = Limits::default();
+        let mut budget = AllocBudget::default();
+        let per_frame = limits.max_total_alloc / 4;
+        for i in 0..4 {
+            assert!(
+                budget.spend(&limits, "frame", per_frame).is_ok(),
+                "frame {i} alone is within budget"
+            );
+        }
+        assert!(
+            budget.spend(&limits, "frame", per_frame).is_err(),
+            "a fifth frame the same size crosses the total"
+        );
     }
 }
