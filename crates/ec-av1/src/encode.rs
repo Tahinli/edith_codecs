@@ -1143,6 +1143,54 @@ pub(crate) fn encode_key_frame_inner(
                 let (c0, r0) = (col * 2, row * 2);
                 let base = snapshot(&luma, &chroma, (x, y));
 
+                // spec `decode_partition`'s hasRows/hasCols recomputed at this
+                // 32x32 block's own half (see `crate::tile::has_half`): the
+                // true frame edge can fall inside a quadrant a superblock-level
+                // check already let through. A quadrant that fails either may
+                // not be left whole; a 16x16 sub-block that fails either (once
+                // split) is a leaf this writer has no rectangular transform
+                // for, so the search must not pick a split that would need one.
+                let (has_cols32, has_rows32) = (
+                    crate::tile::has_half(
+                        col as u32 * crate::tile::BLOCK_MI,
+                        crate::tile::BLOCK_MI,
+                        header.mi_cols,
+                    ),
+                    crate::tile::has_half(
+                        row as u32 * crate::tile::BLOCK_MI,
+                        crate::tile::BLOCK_MI,
+                        header.mi_rows,
+                    ),
+                );
+                let whole_legal = has_cols32 && has_rows32;
+                let split_legal = (0..4)
+                    .map(|i| (r0 + i / 2, c0 + i % 2))
+                    .filter(|&(sr, sc)| {
+                        (sr as u32) * crate::tile::SUB_MI < header.mi_rows
+                            && (sc as u32) * crate::tile::SUB_MI < header.mi_cols
+                    })
+                    .all(|(sr, sc)| {
+                        crate::tile::has_half(
+                            sc as u32 * crate::tile::SUB_MI,
+                            crate::tile::SUB_MI,
+                            header.mi_cols,
+                        ) && crate::tile::has_half(
+                            sr as u32 * crate::tile::SUB_MI,
+                            crate::tile::SUB_MI,
+                            header.mi_rows,
+                        )
+                    });
+                if !whole_legal && !split_legal {
+                    return Err(Error::unsupported(
+                        "AV1 encode",
+                        format!(
+                            "the 32x32 block at ({col},{row}) straddles the true frame edge \
+                             in a way that needs a rectangular (HORZ/VERT) transform this \
+                             encoder does not code yet"
+                        ),
+                    ));
+                }
+
                 // What the whole 32x32 costs, including the partition symbol
                 // that says it is not split.
                 let (whole, mut cost_whole) = code_square(
@@ -1180,7 +1228,7 @@ pub(crate) fn encode_key_frame_inner(
                     split.push(block);
                 }
 
-                if split_blocks && cost_split < cost_whole {
+                if split_legal && (!whole_legal || (split_blocks && cost_split < cost_whole)) {
                     modes.extend_from_slice(&split_modes);
                     blocks.push(Quadrant::Split(split));
                 } else {
@@ -2915,15 +2963,27 @@ mod tests {
     }
 
     /// The sizes the encoder refuses, refused for a reason rather than by
-    /// panicking somewhere below. 40x32 and 32x48 are off the 32x32 block
-    /// grid, which used to be refused outright; the encoder now pads a
-    /// picture like that internally (see `a_frame_round_trips_at_its_own_size`)
-    /// rather than refusing it, so those two are an accept, not a refusal,
-    /// here.
+    /// panicking somewhere below. Most sizes off the 32x32 block grid encode
+    /// fine now (see `a_frame_round_trips_at_its_own_size`) -- the true frame
+    /// edge lands past the halfway point of whichever block it falls in, so
+    /// `PARTITION_NONE` or a single gathered split flag still says everything
+    /// the spec needs. 40x32 and 32x48 are the sizes where the edge instead
+    /// falls *at or before* the halfway point of a 16x16 leaf: the spec's
+    /// `decode_partition` then requires that leaf to split again, to 8x8,
+    /// which this writer has no transform/coefficient path for yet, so it is
+    /// still refused, by name rather than by corrupting the stream.
     #[test]
     fn a_picture_off_the_block_grid_is_refused() {
-        assert!(encode_key_frame(&Picture::grey(40, 32), 100, 0.5).is_ok());
-        assert!(encode_key_frame(&Picture::grey(32, 48), 100, 0.5).is_ok());
+        let refused = |w, h| {
+            let msg = encode_key_frame(&Picture::grey(w, h), 100, 0.5)
+                .expect_err(&format!(
+                    "{w}x{h} needs an 8x8 split this writer does not code"
+                ))
+                .to_string();
+            msg.contains("true frame")
+        };
+        assert!(refused(40, 32));
+        assert!(refused(32, 48));
         let mut short = Picture::grey(64, 64);
         short.u.truncate(10);
         assert!(encode_key_frame(&short, 100, 0.5).is_err());
