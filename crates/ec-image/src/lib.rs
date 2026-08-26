@@ -133,13 +133,23 @@ pub struct Limits {
     pub max_pixels: u64,
     /// Largest single decompressed buffer accepted, in bytes.
     pub max_alloc: usize,
+    /// Largest total bytes accepted across every frame of one decode call.
+    ///
+    /// A single frame can pass [`Limits::check_bytes`] on its own and still
+    /// be a bomb once a segment count multiplies it — a stripped or tiled
+    /// TIFF decompresses many segments per call, so a file whose segments
+    /// each look small on their own can still retain gigabytes nothing ever
+    /// checked one buffer at a time. [`AllocBudget`] enforces this across a
+    /// decode call.
+    pub max_total_alloc: usize,
 }
 
 impl Default for Limits {
     fn default() -> Self {
         Limits {
             max_pixels: 1 << 28,
-            max_alloc: 1 << 32,
+            max_alloc: 1 << 30,
+            max_total_alloc: 1 << 32,
         }
     }
 }
@@ -155,6 +165,49 @@ impl Limits {
             return Err(Error::unsupported(
                 format!("{width}x{height} image"),
                 format!("{pixels} pixels is past the {} limit", self.max_pixels),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Check a byte count computed from header-declared fields (a strip's
+    /// `width * height * bpp`, a palette size, a chunk length) before it
+    /// sizes a single allocation. `what` names the buffer for the error.
+    pub fn check_bytes(&self, what: &str, bytes: Option<usize>) -> Result<usize> {
+        let bytes =
+            bytes.ok_or_else(|| Error::corrupt(format!("{what}: size overflows usize")))?;
+        if bytes > self.max_alloc {
+            return Err(Error::unsupported(
+                what.to_string(),
+                format!("{bytes} bytes past the {} allocation limit", self.max_alloc),
+            ));
+        }
+        Ok(bytes)
+    }
+}
+
+/// Accumulates bytes spent across every segment of one decode call and
+/// refuses once the running total crosses [`Limits::max_total_alloc`] — the
+/// guard for `segment_count x segment_size`, which [`Limits::check_bytes`]
+/// alone never sees since it only ever looks at one buffer at a time.
+#[derive(Debug, Default)]
+pub struct AllocBudget(usize);
+
+impl AllocBudget {
+    /// Spend `bytes` from the budget, refusing once the running total passes
+    /// `limits.max_total_alloc`.
+    pub fn spend(&mut self, limits: &Limits, what: &str, bytes: usize) -> Result<()> {
+        self.0 = self
+            .0
+            .checked_add(bytes)
+            .ok_or_else(|| Error::corrupt(format!("{what}: total size overflows usize")))?;
+        if self.0 > limits.max_total_alloc {
+            return Err(Error::unsupported(
+                what.to_string(),
+                format!(
+                    "{} total decoded bytes past the {} limit",
+                    self.0, limits.max_total_alloc
+                ),
             ));
         }
         Ok(())
