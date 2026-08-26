@@ -256,6 +256,43 @@ pub fn key_frame_headers(
     Ok((seq, header))
 }
 
+/// The frame header for a shown inter frame that predicts from the single
+/// slot `last_slot` (every `ref_frame_idx` entry names it) and refreshes that
+/// same slot with itself once coded. The sequence header is [`key_frame_headers`]'s,
+/// reused verbatim: an inter frame never changes the sequence.
+///
+/// # Errors
+/// Returns an error under the same conditions as [`key_frame_headers`].
+pub fn inter_frame_headers(
+    width: usize,
+    height: usize,
+    base_q_idx: u8,
+    order_hint: u32,
+    last_slot: u8,
+) -> Result<(SequenceHeader, FrameHeader)> {
+    let (seq, key) = key_frame_headers(width, height, base_q_idx)?;
+    let header = FrameHeader {
+        frame_type: FrameType::Inter,
+        frame_is_intra: false,
+        show_frame: true,
+        error_resilient_mode: false,
+        disable_cdf_update: false,
+        disable_frame_end_update_cdf: true,
+        force_integer_mv: false,
+        order_hint,
+        primary_ref_frame: 0,
+        refresh_frame_flags: 1 << last_slot,
+        ref_frame_idx: [last_slot; ec_av1_syntax::REFS_PER_FRAME],
+        allow_high_precision_mv: false,
+        interpolation_filter: ec_av1_syntax::InterpolationFilter::Eighttap,
+        is_motion_mode_switchable: false,
+        use_ref_frame_mvs: false,
+        reduced_tx_set: false,
+        ..key
+    };
+    Ok((seq, header))
+}
+
 fn too_large() -> Error {
     Error::unsupported(
         "AV1 encode",
