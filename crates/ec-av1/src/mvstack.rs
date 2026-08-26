@@ -13,23 +13,29 @@
 //! clamping (7.10.2.14, libaom's `clamp_mv_ref`).
 //!
 //! This module's immediate row/col/top-right scan alone is *not* enough to
-//! get `RefMvContext` (`ref_mv_ctx`) right, even though it *is* enough for
-//! `NewMvContext`/`ZeroMvContext`. Ported straight from libaom's
+//! get `RefMvContext` (`ref_mv_ctx`) right, *nor* `NewMvContext` at
+//! `nearest_match == 0` (see below). Ported straight from libaom's
 //! `av1_find_mv_stack` (`av1/common/mvref_common.c`, `setup_ref_mv_list`,
 //! ~line 480 on): after the immediate row (-1), col (-1) and top-right
 //! probes settle `nearest_match` (and `mode_context`'s `new_mv` bits, which
-//! depend on `nearest_match` alone), libaom runs one more probe *before*
-//! computing `ref_match_count` — `scan_blk_mbmi` at the diagonal top-left
-//! corner `(-1, -1)` — whose match folds into `row_match_count` (and hence
-//! can flip `ref_match_count`'s row term true) without ever touching the
-//! already-captured `nearest_match`. So `ref_match_count >= nearest_match`
-//! always, sometimes strictly greater, and `ref_mv_ctx` (the `REFMV_OFFSET`
-//! half of libaom's `mode_context` switch, mvref_common.c ~line 619-643)
-//! genuinely depends on both counts, not `nearest_match` alone — that
-//! collapse was the bug this module shipped with for several rounds (see
-//! the crate report). [`find_mv_stack`] now runs that corner probe and
-//! computes `ref_mv_ctx` from the true `(nearest_match, ref_match_count)`
-//! pair.
+//! for `nearest_match >= 1` depend on `nearest_match` alone), libaom runs one
+//! more probe *before* computing `ref_match_count` — `scan_blk_mbmi` at the
+//! diagonal top-left corner `(-1, -1)` — whose match folds into
+//! `row_match_count` (and hence can flip `ref_match_count`'s row term true)
+//! without ever touching the already-captured `nearest_match`. So
+//! `ref_match_count >= nearest_match` always, sometimes strictly greater, and
+//! `ref_mv_ctx` (the `REFMV_OFFSET` half of libaom's `mode_context` switch,
+//! mvref_common.c ~line 619-643) genuinely depends on both counts, not
+//! `nearest_match` alone — that collapse was the bug this module shipped
+//! with for several rounds (see the crate report). The `case 0` arm of that
+//! same switch *also* sets `new_mv_ctx`'s own bit from `ref_match_count`
+//! (`mode_context[ref_frame] |= 1` when `ref_match_count >= 1`) — a second
+//! corner-probe dependency this module missed for several more rounds after
+//! the first fix, until real-content inter streams (I8 CLASS B) caught it:
+//! synthetic fixtures never produced a block with `nearest_match == 0` and a
+//! genuine corner match. [`find_mv_stack`] now runs that corner probe and
+//! computes both `ref_mv_ctx` and `new_mv_ctx` from the true
+//! `(nearest_match, ref_match_count)` pair.
 //!
 //! The corner probe's own candidate is added to the stack too (matching
 //! libaom: a genuinely new MV there becomes a real, if low-weight, entry),
@@ -434,7 +440,12 @@ pub fn find_mv_stack(
     // `newmv_count` alone — libaom's switch never reads `ref_match_count`
     // for those bits, so this half was already exact before this round.
     let new_mv_ctx = match nearest_match {
-        0 => 0,
+        // libaom's `case 0` also sets this bit from `ref_match_count`
+        // (`mode_context[ref_frame] |= 1` when `ref_match_count >= 1`,
+        // mvref_common.c ~line 621) — the corner-probe-derived count, not
+        // `nearest_match` alone, despite this module's doc comment above
+        // having claimed the opposite for several rounds.
+        0 => usize::from(ref_match_count >= 1),
         1 => {
             if newmv_count > 0 {
                 2
@@ -704,6 +715,26 @@ mod tests {
         assert_eq!(stack.entries[0].mv, (4, 4));
         assert_eq!(stack.entries[1].mv, (8, 8));
         assert_eq!(stack.drl_ctx, vec![1]);
+    }
+
+    #[test]
+    fn a_corner_only_match_raises_new_mv_ctx_even_when_nearest_match_is_zero() {
+        // Block at (2, 2), 1x1 mi unit: row above (1, 2), col left (2, 1)
+        // and top-right (1, 3) all empty — nearest_match == 0 — but the
+        // diagonal top-left corner (1, 1) matches. libaom's `case 0` arm
+        // (mvref_common.c ~line 621) sets `new_mv_ctx`'s own bit from
+        // `ref_match_count` here, not just `ref_mv_ctx`'s: this is I8 CLASS
+        // B's real-content bitstream desync (real clips hit blocks whose
+        // *only* neighbour match is diagonal; the repo's synthetic tests
+        // never had one until this case).
+        let mut grid = MiGrid::new(8, 8);
+        grid.set(1, 1, inter((4, 4)));
+
+        let stack = find_mv_stack(&grid, 2, 2, 1, 1, 1, 8, 8);
+
+        assert_eq!(stack.entries.len(), 1);
+        assert_eq!(stack.new_mv_ctx, 1); // ref_match_count == 1, not the old hard-0
+        assert_eq!(stack.ref_mv_ctx, 1); // nearest_match=0, ref_match_count=1
     }
 
     #[test]
