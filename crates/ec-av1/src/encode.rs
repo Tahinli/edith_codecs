@@ -475,6 +475,18 @@ struct Plane<'a> {
     reconstruction: Vec<u8>,
     width: usize,
     height: usize,
+    /// The frame's true, decodable extent in this plane's own units --
+    /// `mi_cols`/`mi_rows` (spec `compute_image_size`) converted to samples,
+    /// not `width`/`height` above, which is the padded coding-surface size.
+    /// A decoder's `BlockDecoded` bookkeeping (spec 7.4) and its `mb_to_
+    /// right_edge`/`mb_to_bottom_edge` clamps (libaom's
+    /// `av1/common/reconintra.c` `build_intra_predictors`) never see past
+    /// this bound, even though the padded reconstruction buffer holds real
+    /// (if never-decoded-by-a-real-decoder) samples out there -- reading
+    /// those instead of stopping here is what desyncs prediction at the true
+    /// edge.
+    true_width: usize,
+    true_height: usize,
 }
 
 impl Plane<'_> {
@@ -494,11 +506,18 @@ impl Plane<'_> {
         side: usize,
         reach: Reach,
     ) -> (Option<Vec<u8>>, Option<Vec<u8>>, Option<u8>) {
-        let across = (x + if reach.above_right { 2 * side } else { side }).min(self.width);
-        let down = (y + if reach.below_left { 2 * side } else { side }).min(self.height);
-        let above =
-            (y > 0).then(|| self.reconstruction[(y - 1) * self.width + x..][..across - x].to_vec());
-        let left = (x > 0).then(|| {
+        let across = (x + if reach.above_right { 2 * side } else { side }).min(self.true_width);
+        let down = (y + if reach.below_left { 2 * side } else { side }).min(self.true_height);
+        // `across`/`down` can fall at or below `x`/`y` for a block whose own
+        // origin already sits past the true edge -- only reachable through a
+        // partition trial priced for comparison on a split this frame's
+        // straddling quadrant will go on to refuse (see
+        // `a_picture_off_the_block_grid_is_refused`), never through a block
+        // this encoder actually commits. Such a block has no true-edge
+        // samples above or left of it at all, same as `y == 0`/`x == 0`.
+        let above = (y > 0 && across > x)
+            .then(|| self.reconstruction[(y - 1) * self.width + x..][..across - x].to_vec());
+        let left = (x > 0 && down > y).then(|| {
             (y..down)
                 .map(|row| self.reconstruction[row * self.width + x - 1])
                 .collect::<Vec<_>>()
@@ -887,7 +906,7 @@ fn code_square(
             x,
             y,
             side,
-            reach: Reach::of(side, x, y, luma.width, luma.height),
+            reach: Reach::of(side, x, y, luma.true_width, luma.true_height),
             set: luma_set,
         },
         search,
@@ -1078,11 +1097,16 @@ pub(crate) fn encode_key_frame_inner(
     header.render_width = render.0 as u32;
     header.render_height = render.1 as u32;
 
+    // Prediction reads no further than this, in each plane's own units --
+    // see `Plane::true_width`/`true_height`.
+    let (true_width, true_height) = (header.mi_cols as usize * 4, header.mi_rows as usize * 4);
     let mut luma = Plane {
         source: &picture.y,
         reconstruction: vec![128; picture.y.len()],
         width: picture.width,
         height: picture.height,
+        true_width,
+        true_height,
     };
     let mut chroma = [
         Plane {
@@ -1090,12 +1114,16 @@ pub(crate) fn encode_key_frame_inner(
             reconstruction: vec![128; picture.u.len()],
             width: picture.width / 2,
             height: picture.height / 2,
+            true_width: true_width / 2,
+            true_height: true_height / 2,
         },
         Plane {
             source: &picture.v,
             reconstruction: vec![128; picture.v.len()],
             width: picture.width / 2,
             height: picture.height / 2,
+            true_width: true_width / 2,
+            true_height: true_height / 2,
         },
     ];
 
@@ -1465,7 +1493,7 @@ fn search_inter_block(
     stack: &MvStack,
 ) -> BlockCoeffs {
     let (luma_set, chroma_set) = (TxbSet::Luma32, TxbSet::Chroma16);
-    let reach = Reach::of(BLOCK, x, y, luma.width, luma.height);
+    let reach = Reach::of(BLOCK, x, y, luma.true_width, luma.true_height);
 
     // skip / intra_inter symbol costs at a fixed context -- see this
     // function's doc comment.
@@ -1789,11 +1817,14 @@ pub(crate) fn encode_inter_frame(
     header.render_width = render.0 as u32;
     header.render_height = render.1 as u32;
 
+    let (true_width, true_height) = (header.mi_cols as usize * 4, header.mi_rows as usize * 4);
     let mut luma = Plane {
         source: &picture.y,
         reconstruction: vec![128; picture.y.len()],
         width: picture.width,
         height: picture.height,
+        true_width,
+        true_height,
     };
     let mut chroma = [
         Plane {
@@ -1801,12 +1832,16 @@ pub(crate) fn encode_inter_frame(
             reconstruction: vec![128; picture.u.len()],
             width: picture.width / 2,
             height: picture.height / 2,
+            true_width: true_width / 2,
+            true_height: true_height / 2,
         },
         Plane {
             source: &picture.v,
             reconstruction: vec![128; picture.v.len()],
             width: picture.width / 2,
             height: picture.height / 2,
+            true_width: true_width / 2,
+            true_height: true_height / 2,
         },
     ];
 
