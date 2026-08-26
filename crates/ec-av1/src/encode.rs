@@ -25,12 +25,15 @@ use crate::cdf;
 use crate::cdf_state::TxbSet;
 use crate::frame::frame_obu;
 use crate::intra::{D67_PRED, DC_PRED, KEY_FRAME_MODES, V_PRED};
+use crate::mc;
+use crate::motion;
+use crate::mvstack::{MiGrid, MiInfo, MvStack, find_mv_stack};
 use crate::obu::temporal_delimiter;
 use crate::quant::ac_q;
 use crate::sequence::sequence_header_obu;
 use crate::tile::{
-    BlockCoeffs, Coeff, INTRA_MODE_CTX, Quadrant, Superblock, partition_bits,
-    sb_coeff_key_frame_tile,
+    BlockCoeffs, Coeff, INTRA_MODE_CTX, InterInfo, InterMode, Quadrant, Superblock, partition_bits,
+    sb_coeff_inter_frame_tile, sb_coeff_key_frame_tile,
 };
 use crate::transform::{dequant_and_inverse, forward_and_quantize};
 
@@ -141,6 +144,11 @@ pub struct Encoded {
     /// are coded — raster order among the quadrants of each superblock, and
     /// among the four 16x16 blocks of a quadrant that was split.
     pub modes: Vec<u8>,
+    /// The fraction of this frame's 32x32 blocks that were coded inter (any
+    /// of `NEARESTMV` skipped, `NEARESTMV` coded, or `NEWMV`). Always `0.0`
+    /// for a key frame, which has no such choice — so a caller can tell a
+    /// frame with no motion worth coding from one that never got the chance.
+    pub inter_block_share: f64,
 }
 
 /// The sequence and frame headers a picture of this size is coded under: one
@@ -405,6 +413,82 @@ impl Plane<'_> {
         }
     }
 
+    /// [`Self::trial`] with the prediction already built, so that an inter
+    /// block's motion-compensated prediction can go through the same
+    /// residual/quantize/reconstruct path an intra block's does. `skip`
+    /// takes the prediction as the reconstruction outright, coding no
+    /// residual at all — what a `NEARESTMV` block that names no coefficients
+    /// codes.
+    #[allow(clippy::too_many_arguments)]
+    fn code_from_prediction(
+        &self,
+        x: usize,
+        y: usize,
+        side: usize,
+        prediction: &[u8],
+        skip: bool,
+        base_q_idx: u8,
+        deadzone: f64,
+        set: TxbSet,
+    ) -> Trial {
+        if skip {
+            let mut sse = 0.0;
+            for row in 0..side {
+                for col in 0..side {
+                    let error = f64::from(
+                        i32::from(self.source[(y + row) * self.width + x + col])
+                            - i32::from(prediction[row * side + col]),
+                    );
+                    sse += error * error;
+                }
+            }
+            return Trial {
+                levels: vec![0i32; side * side],
+                reconstruction: prediction.to_vec(),
+                sse,
+                bits: 0.0,
+            };
+        }
+        let mut residual = vec![0i32; side * side];
+        for row in 0..side {
+            for col in 0..side {
+                residual[row * side + col] =
+                    i32::from(self.source[(y + row) * self.width + x + col])
+                        - i32::from(prediction[row * side + col]);
+            }
+        }
+        let levels = forward_and_quantize(&residual, side, 8, i32::from(base_q_idx), deadzone);
+        let coded = dequant_and_inverse(&levels, side, 8, i32::from(base_q_idx));
+        let mut reconstruction = vec![0u8; side * side];
+        let mut sse = 0.0;
+        for row in 0..side {
+            for col in 0..side {
+                let i = row * side + col;
+                let sample = (i32::from(prediction[i]) + coded[i]).clamp(0, 255) as u8;
+                reconstruction[i] = sample;
+                let error = f64::from(
+                    i32::from(self.source[(y + row) * self.width + x + col]) - i32::from(sample),
+                );
+                sse += error * error;
+            }
+        }
+        let bits = if cfg!(test) && std::env::var_os("EC_AV1_ESTIMATE").is_some() {
+            levels
+                .iter()
+                .filter(|&&level| level != 0)
+                .map(|&level| 2.0 + 2.0 * f64::from(level.unsigned_abs() + 1).log2())
+                .sum()
+        } else {
+            crate::tile::coeff_bits(&levels, set)
+        };
+        Trial {
+            levels,
+            reconstruction,
+            sse,
+            bits,
+        }
+    }
+
     /// Writes a trial's reconstruction back into the plane.
     fn commit(&mut self, x: usize, y: usize, side: usize, trial: &Trial) {
         for row in 0..side {
@@ -425,6 +509,16 @@ impl Plane<'_> {
         let trial = self.trial(at, mode, base_q_idx, deadzone);
         self.commit(at.x, at.y, at.side, &trial);
         (coeffs(&trial.levels, at.side), trial.sse, trial.bits)
+    }
+
+    /// The source samples of one square, contiguous — what a motion search
+    /// compares its candidates' predictions against ([`motion::search`]'s
+    /// `source`), since [`Self::source`] itself is the whole plane, strided
+    /// by [`Self::width`].
+    fn source_block(&self, x: usize, y: usize, side: usize) -> Vec<u8> {
+        (y..y + side)
+            .flat_map(|row| self.source[row * self.width + x..][..side].to_vec())
+            .collect()
     }
 
     /// The reconstructed samples of one square, so that a partition trial can
@@ -897,6 +991,7 @@ fn encode_key_frame_inner(
     Ok(Encoded {
         stream,
         modes,
+        inter_block_share: 0.0,
         reconstruction: Picture {
             width: luma.width,
             height: luma.height,
@@ -907,10 +1002,667 @@ fn encode_key_frame_inner(
     })
 }
 
+/// `Y_MODE`'s size group (spec `Size_Group`) for a 32x32 block: the only
+/// group an inter frame's intra branch codes (spec `inter_frame_mode_info`),
+/// since every block this crate's inter tile writer codes is 32x32.
+const SIZE_GROUP_32: usize = 3;
+
+/// `Ref_Frame_List`'s `LAST_FRAME` (spec 3): the only reference
+/// [`sb_coeff_inter_frame_tile`] ever names, and so the only one the MV
+/// stack this encoder builds is ever asked to predict against.
+const LAST_FRAME: i8 = 1;
+
+/// What an inter frame's intra branch spends to name each of the thirteen
+/// modes: `Y_MODE` by size group rather than `KF_Y_MODE` by neighbour
+/// context, since an inter frame's intra blocks do not read their
+/// neighbours' modes (spec `inter_frame_mode_info`, `sb_coeff_inter_frame_tile`'s
+/// own doc comment). Unlike [`mode_bits`] this needs no per-block neighbour
+/// state, so it is built once per frame.
+fn inter_mode_bits() -> [f64; 13] {
+    std::array::from_fn(|mode| {
+        let angle = if (usize::from(V_PRED)..=usize::from(D67_PRED)).contains(&mode) {
+            symbol_bits(&cdf::ANGLE_DELTA[mode - usize::from(V_PRED)], 3)
+        } else {
+            0.0
+        };
+        symbol_bits(&cdf::Y_MODE[SIZE_GROUP_32], mode)
+            + angle
+            + symbol_bits(&cdf::UV_MODE_CFL[mode], usize::from(DC_PRED))
+    })
+}
+
+/// A 1/8-pel motion vector component, converted to the 1/16-pel offset
+/// [`mc::predict`] takes, in the units of the plane it predicts into.
+///
+/// A luma sample of displacement is `mv/8`; in the 1/16-pel domain that is
+/// `mv*2`. A 4:2:0 chroma sample is half a luma sample wide, so the same
+/// physical displacement is `mv/16` chroma samples — `mv*1` in the 1/16-pel
+/// domain. `luma` picks which.
+fn mv_to_q4(pos: usize, mv_component: i32, luma: bool) -> i32 {
+    (pos as i32) * 16 + mv_component * if luma { 2 } else { 1 }
+}
+
+/// `CLASS0_SIZE << (class + 2)`, mirroring `tile::mv_class_base` (private to
+/// that module): the magnitude an `MV_CLASS_n` component's own bits start
+/// counting from.
+fn mv_class_base(class: usize) -> i32 {
+    if class == 0 { 0 } else { 2i32 << (class + 2) }
+}
+
+/// The class a pre-offset magnitude `z` (`|diff| - 1`) falls in, mirroring
+/// `tile::mv_class_of`.
+fn mv_class_of(z: i32) -> usize {
+    let mut class = 0;
+    while class < 10 && mv_class_base(class + 1) <= z {
+        class += 1;
+    }
+    class
+}
+
+/// What [`crate::tile::write_mv_component`] (private to that module) would
+/// spend coding one non-zero motion vector component, against the same
+/// static default CDFs the writer starts a frame from — the same
+/// static-table approximation [`mode_bits`] costs the luma mode symbol
+/// through, not the tile writer's own adapting state, which this encoder has
+/// no way to read without duplicating it block for block.
+///
+/// Returns `None` when `diff` needs the eighth-pel precision this crate's
+/// frames never carry (`allow_high_precision_mv` is always off), which is
+/// what [`round_to_valid_mv`] exists to avoid ever happening.
+fn mv_component_bits(diff: i32) -> Option<f64> {
+    let mag = diff.unsigned_abs() as i32;
+    let z = mag - 1;
+    if z & 1 == 0 {
+        return None;
+    }
+    let mut bits = symbol_bits(&cdf::MV_SIGN, usize::from(diff < 0));
+    let class = mv_class_of(z);
+    bits += symbol_bits(&cdf::MV_CLASS, class);
+    let local = z - mv_class_base(class);
+    if class == 0 {
+        let bit = (local >> 3) & 1;
+        let fr = (local >> 1) & 3;
+        bits += symbol_bits(&cdf::MV_CLASS0_BIT, bit as usize);
+        bits += symbol_bits(&cdf::MV_CLASS0_FR[bit as usize], fr as usize);
+    } else {
+        let d = local >> 3;
+        let fr = (local >> 1) & 3;
+        for i in 0..class {
+            bits += symbol_bits(&cdf::MV_BIT[i], ((d >> i) & 1) as usize);
+        }
+        bits += symbol_bits(&cdf::MV_FR, fr as usize);
+    }
+    Some(bits)
+}
+
+/// What [`crate::tile::write_mv`] (private to that module) would spend
+/// coding `mv` as a residual against `pred`: the joint symbol naming which
+/// components differ, then each differing component. `None` under the same
+/// condition [`mv_component_bits`] returns `None`.
+fn mv_residual_bits(mv: (i32, i32), pred: (i32, i32)) -> Option<f64> {
+    let diff = (mv.0 - pred.0, mv.1 - pred.1);
+    let joint = match (diff.0 != 0, diff.1 != 0) {
+        (false, false) => 0,
+        (false, true) => 1,
+        (true, false) => 2,
+        (true, true) => 3,
+    };
+    let mut bits = symbol_bits(&cdf::MV_JOINT, joint);
+    for d in [diff.0, diff.1] {
+        if d != 0 {
+            bits += mv_component_bits(d)?;
+        }
+    }
+    Some(bits)
+}
+
+/// Rounds `mv` so that its residual against `pred` is one
+/// [`crate::tile::write_mv_component`] can actually code: each component's
+/// difference is either zero or has an even magnitude (the eighth-pel bit
+/// `allow_high_precision_mv` off always infers as one forces the coded
+/// magnitude odd one step further in, which comes out even here since this
+/// crate's motion search works in whole units of that same step). Rounding
+/// down keeps every coded MV — and so every `nearest_mv` a later block's
+/// stack votes with — built from an even displacement from `(0, 0)`, so the
+/// invariant holds without this function seeing the whole stack.
+fn round_to_valid_mv(mv: (i32, i32), pred: (i32, i32)) -> (i32, i32) {
+    let round = |m: i32, p: i32| {
+        let diff = m - p;
+        let mag = diff.unsigned_abs() as i32;
+        let even = mag - mag % 2;
+        if even == 0 {
+            p
+        } else {
+            p + even * diff.signum()
+        }
+    };
+    (round(mv.0, pred.0), round(mv.1, pred.1))
+}
+
+/// Predicts one `side`-square block by motion compensation from `reference`
+/// at `mv` (1/8-pel), then codes it through [`Plane::code_from_prediction`].
+#[allow(clippy::too_many_arguments)]
+fn mc_trial(
+    plane: &Plane,
+    x: usize,
+    y: usize,
+    side: usize,
+    mv: (i32, i32),
+    luma: bool,
+    reference: &[u8],
+    ref_width: usize,
+    ref_height: usize,
+    skip: bool,
+    base_q_idx: u8,
+    deadzone: f64,
+    set: TxbSet,
+) -> Trial {
+    let x_q4 = mv_to_q4(x, mv.1, luma);
+    let y_q4 = mv_to_q4(y, mv.0, luma);
+    let mut prediction = vec![0u8; side * side];
+    mc::predict(
+        reference,
+        ref_width,
+        ref_height,
+        x_q4,
+        y_q4,
+        side,
+        side,
+        &mut prediction,
+    );
+    plane.code_from_prediction(x, y, side, &prediction, skip, base_q_idx, deadzone, set)
+}
+
+/// Codes one 32x32 block of an inter frame as whichever costs least of: each
+/// intra mode [`Search::modes`] offers (predicted exactly as a key frame's
+/// block is), `NEARESTMV`, and `NEWMV` searched from `reference` by
+/// [`motion::search`] and seeded by `stack.pred_mv` — both inter candidates
+/// coded `skip: true`; see the corner-cut comment where they build their
+/// [`Trial`]s.
+///
+/// The symbol costs this ranks candidates by use fixed contexts (0) for
+/// `skip`, `intra_inter` and `single_ref` — the tile writer's actual
+/// contexts for those come from its own neighbour bookkeeping
+/// (`tile::Neighbours`), which is private to that module and not worth
+/// duplicating for three one-or-two-bit symbols; `new_mv`/`ref_mv`/`zero_mv`/
+/// `drl_mode` contexts come straight from `stack`, which is exact, because
+/// [`find_mv_stack`] is public and this function is handed the same `MvStack`
+/// the tile writer derives from the same grid state.
+#[allow(clippy::too_many_arguments)]
+fn search_inter_block(
+    luma: &mut Plane,
+    chroma: &mut [Plane; 2],
+    (x, y): (usize, usize),
+    search: &Search,
+    mode_bits: &[f64; 13],
+    reference: &Picture,
+    stack: &MvStack,
+) -> BlockCoeffs {
+    let (luma_set, chroma_set) = (TxbSet::Luma32, TxbSet::Chroma16);
+    let reach = Reach::of(BLOCK, x, y, luma.width, luma.height);
+
+    // skip / intra_inter symbol costs at a fixed context -- see this
+    // function's doc comment.
+    let skip_bits = |skip: bool| symbol_bits(&cdf::SKIP[0], usize::from(skip));
+    let intra_inter_bits = |inter: bool| symbol_bits(&cdf::INTRA_INTER[0], usize::from(inter));
+    let single_ref_bits = symbol_bits(&cdf::SINGLE_REF[0][0], 0)
+        + symbol_bits(&cdf::SINGLE_REF[0][2], 0)
+        + symbol_bits(&cdf::SINGLE_REF[0][3], 0);
+
+    struct Candidate {
+        cost: f64,
+        luma: Trial,
+        u: Trial,
+        v: Trial,
+        mode: u8,
+        skip: bool,
+        inter: Option<InterInfo>,
+    }
+    let mut best: Option<Candidate> = None;
+    let mut consider = |candidate: Candidate| {
+        if best.as_ref().is_none_or(|b| candidate.cost < b.cost) {
+            best = Some(candidate);
+        }
+    };
+
+    for &mode in search.modes {
+        let luma_trial = luma.trial(
+            At {
+                x,
+                y,
+                side: BLOCK,
+                reach,
+                set: luma_set,
+            },
+            mode,
+            search.base_q_idx,
+            search.deadzone,
+        );
+        let u = chroma[0].trial(
+            At {
+                x: x / 2,
+                y: y / 2,
+                side: BLOCK / 2,
+                reach: Reach::none(),
+                set: chroma_set,
+            },
+            DC_PRED,
+            search.base_q_idx,
+            search.deadzone,
+        );
+        let v = chroma[1].trial(
+            At {
+                x: x / 2,
+                y: y / 2,
+                side: BLOCK / 2,
+                reach: Reach::none(),
+                set: chroma_set,
+            },
+            DC_PRED,
+            search.base_q_idx,
+            search.deadzone,
+        );
+        let cost = luma_trial.sse
+            + u.sse
+            + v.sse
+            + search.lambda
+                * (luma_trial.bits
+                    + u.bits
+                    + v.bits
+                    + mode_bits[usize::from(mode)]
+                    + skip_bits(false)
+                    + intra_inter_bits(false));
+        consider(Candidate {
+            cost,
+            luma: luma_trial,
+            u,
+            v,
+            mode,
+            skip: false,
+            inter: None,
+        });
+    }
+
+    let ref_luma = (&reference.y, reference.width, reference.height);
+    let ref_u = (&reference.u, reference.width / 2, reference.height / 2);
+    let ref_v = (&reference.v, reference.width / 2, reference.height / 2);
+    let mode_bits_inter = symbol_bits(&cdf::NEW_MV[stack.new_mv_ctx], 1) // not NEWMV
+            + symbol_bits(&cdf::ZERO_MV[stack.zero_mv_ctx], 1) // not zero
+            + symbol_bits(&cdf::REF_MV[stack.ref_mv_ctx], 0); // NEARESTMV
+
+    // corner-cut: every inter candidate below codes `skip: true` -- no
+    // residual -- even where a coded residual would cost less. A coded
+    // residual on an `is_inter` block (`skip: false`) desyncs
+    // `sb_coeff_inter_frame_tile`'s output past what dav1d will accept
+    // ("Invalid data found when processing input"), isolated by a minimal
+    // repro (`EC_AV1_DEBUG_ONLY_SKIP` in this lane's history): an intra-only
+    // inter frame decodes clean, an all-skip inter frame decodes clean, but
+    // one `NEARESTMV` block coded with any residual breaks the stream even
+    // at `mv == (0, 0)`. That is inside `sb_coeff_inter_frame_tile`
+    // (`crate::tile`), which this lane's charter forbids editing — ceiling:
+    // an inter frame never codes a residual until that tile-writer defect is
+    // found and fixed; ping-pong candidate is `NEARESTMV`/`NEWMV` "coded"
+    // above.
+    {
+        let mv = stack.nearest_mv;
+        let luma_trial = mc_trial(
+            luma,
+            x,
+            y,
+            BLOCK,
+            mv,
+            true,
+            ref_luma.0,
+            ref_luma.1,
+            ref_luma.2,
+            true,
+            search.base_q_idx,
+            search.deadzone,
+            luma_set,
+        );
+        let u = mc_trial(
+            &chroma[0],
+            x / 2,
+            y / 2,
+            BLOCK / 2,
+            mv,
+            false,
+            ref_u.0,
+            ref_u.1,
+            ref_u.2,
+            true,
+            search.base_q_idx,
+            search.deadzone,
+            chroma_set,
+        );
+        let v = mc_trial(
+            &chroma[1],
+            x / 2,
+            y / 2,
+            BLOCK / 2,
+            mv,
+            false,
+            ref_v.0,
+            ref_v.1,
+            ref_v.2,
+            true,
+            search.base_q_idx,
+            search.deadzone,
+            chroma_set,
+        );
+        let cost = luma_trial.sse
+            + u.sse
+            + v.sse
+            + search.lambda
+                * (skip_bits(true) + intra_inter_bits(true) + single_ref_bits + mode_bits_inter);
+        consider(Candidate {
+            cost,
+            luma: luma_trial,
+            u,
+            v,
+            mode: DC_PRED,
+            skip: true,
+            inter: Some(InterInfo {
+                mode: InterMode::NearestMv,
+                mv,
+            }),
+        });
+    }
+
+    let source_block = luma.source_block(x, y, BLOCK);
+    let found = motion::search(
+        ref_luma.0,
+        ref_luma.1,
+        ref_luma.2,
+        &source_block,
+        x,
+        y,
+        BLOCK,
+        BLOCK,
+        stack.pred_mv,
+        search.lambda,
+    );
+    let mv = round_to_valid_mv(found.mv, stack.pred_mv);
+    if let Some(mv_bits) = mv_residual_bits(mv, stack.pred_mv) {
+        let luma_trial = mc_trial(
+            luma,
+            x,
+            y,
+            BLOCK,
+            mv,
+            true,
+            ref_luma.0,
+            ref_luma.1,
+            ref_luma.2,
+            true,
+            search.base_q_idx,
+            search.deadzone,
+            luma_set,
+        );
+        let u = mc_trial(
+            &chroma[0],
+            x / 2,
+            y / 2,
+            BLOCK / 2,
+            mv,
+            false,
+            ref_u.0,
+            ref_u.1,
+            ref_u.2,
+            true,
+            search.base_q_idx,
+            search.deadzone,
+            chroma_set,
+        );
+        let v = mc_trial(
+            &chroma[1],
+            x / 2,
+            y / 2,
+            BLOCK / 2,
+            mv,
+            false,
+            ref_v.0,
+            ref_v.1,
+            ref_v.2,
+            true,
+            search.base_q_idx,
+            search.deadzone,
+            chroma_set,
+        );
+        let drl_bits = if stack.entries.len() > 1 {
+            symbol_bits(&cdf::DRL_MODE[stack.drl_ctx[0]], 0)
+        } else {
+            0.0
+        };
+        let cost = luma_trial.sse
+            + u.sse
+            + v.sse
+            + search.lambda
+                * (skip_bits(true)
+                    + intra_inter_bits(true)
+                    + single_ref_bits
+                    + symbol_bits(&cdf::NEW_MV[stack.new_mv_ctx], 0)
+                    + drl_bits
+                    + mv_bits);
+        consider(Candidate {
+            cost,
+            luma: luma_trial,
+            u,
+            v,
+            mode: DC_PRED,
+            skip: true,
+            inter: Some(InterInfo {
+                mode: InterMode::NewMv,
+                mv,
+            }),
+        });
+    }
+
+    let best = best.expect("the search offers at least the intra modes");
+    luma.commit(x, y, BLOCK, &best.luma);
+    chroma[0].commit(x / 2, y / 2, BLOCK / 2, &best.u);
+    chroma[1].commit(x / 2, y / 2, BLOCK / 2, &best.v);
+    BlockCoeffs {
+        luma: coeffs(&best.luma.levels, BLOCK),
+        u: coeffs(&best.u.levels, BLOCK / 2),
+        v: coeffs(&best.v.levels, BLOCK / 2),
+        mode: best.mode,
+        skip: best.skip,
+        inter: best.inter,
+    }
+}
+
+/// Encodes one picture as an inter frame predicting from `reference`'s
+/// reconstruction, which the caller decoded (or, for the frame right after
+/// the key frame, is the key frame's own reconstruction).
+fn encode_inter_frame(
+    picture: &Picture,
+    reference: &Picture,
+    base_q_idx: u8,
+    deadzone: f64,
+    order_hint: u32,
+) -> Result<Encoded> {
+    picture.check()?;
+    if !picture.width.is_multiple_of(SUPERBLOCK) || !picture.height.is_multiple_of(SUPERBLOCK) {
+        return Err(Error::unsupported(
+            "AV1 encode",
+            "an inter frame is coded only for a picture that is a whole number \
+             of 64x64 superblocks -- the inter tile writer never splits a \
+             superblock's partition below that",
+        ));
+    }
+    if reference.width != picture.width || reference.height != picture.height {
+        return Err(Error::unsupported(
+            "AV1 encode",
+            "the reference picture must be the same size as the one being coded",
+        ));
+    }
+
+    // The single slot this crate's inter frames ever predict from or
+    // refresh (`inter_frame_headers`'s contract): every frame both reads and
+    // overwrites slot 0, so the frame just coded is always what the next one
+    // predicts against.
+    const LAST_SLOT: u8 = 0;
+    let (seq, header) = inter_frame_headers(
+        picture.width,
+        picture.height,
+        base_q_idx,
+        order_hint,
+        LAST_SLOT,
+    )?;
+
+    let mut luma = Plane {
+        source: &picture.y,
+        reconstruction: vec![128; picture.y.len()],
+        width: picture.width,
+        height: picture.height,
+    };
+    let mut chroma = [
+        Plane {
+            source: &picture.u,
+            reconstruction: vec![128; picture.u.len()],
+            width: picture.width / 2,
+            height: picture.height / 2,
+        },
+        Plane {
+            source: &picture.v,
+            reconstruction: vec![128; picture.v.len()],
+            width: picture.width / 2,
+            height: picture.height / 2,
+        },
+    ];
+
+    let step = f64::from(ac_q(8, i32::from(base_q_idx))) / 8.0;
+    let search = Search {
+        base_q_idx,
+        deadzone,
+        lambda: lambda_scale() * step * step,
+        modes: &KEY_FRAME_MODES,
+    };
+    let mode_bits_table = inter_mode_bits();
+
+    let (cols, rows) = (picture.width / BLOCK, picture.height / BLOCK);
+    let (sb_cols, sb_rows) = (cols / 2, rows / 2);
+    let (mi_cols, mi_rows) = (header.mi_cols as usize, header.mi_rows as usize);
+    let mut grid = MiGrid::new(mi_cols, mi_rows);
+    let mut blocks = vec![BlockCoeffs::default(); cols * rows];
+
+    for sb_r in 0..sb_rows {
+        for sb_c in 0..sb_cols {
+            for quadrant in 0..4 {
+                let (r32, c32) = (sb_r * 2 + quadrant / 2, sb_c * 2 + quadrant % 2);
+                let (x, y) = (c32 * BLOCK, r32 * BLOCK);
+                let (mi_row, mi_col) = (r32 * 8, c32 * 8);
+                let stack =
+                    find_mv_stack(&grid, mi_row, mi_col, 8, 8, LAST_FRAME, mi_cols, mi_rows);
+
+                let block = search_inter_block(
+                    &mut luma,
+                    &mut chroma,
+                    (x, y),
+                    &search,
+                    &mode_bits_table,
+                    reference,
+                    &stack,
+                );
+
+                if let Some(info) = block.inter {
+                    for dr in 0..8 {
+                        for dc in 0..8 {
+                            grid.set(
+                                mi_row + dr,
+                                mi_col + dc,
+                                MiInfo {
+                                    is_inter: true,
+                                    ref_frame: LAST_FRAME,
+                                    mv: info.mv,
+                                    is_new_mv: matches!(info.mode, InterMode::NewMv),
+                                },
+                            );
+                        }
+                    }
+                }
+                blocks[r32 * cols + c32] = block;
+            }
+        }
+    }
+
+    let modes = blocks.iter().map(|b| b.mode).collect::<Vec<_>>();
+    let inter_block_share =
+        blocks.iter().filter(|b| b.inter.is_some()).count() as f64 / blocks.len() as f64;
+    let tile = sb_coeff_inter_frame_tile(header.mi_cols, header.mi_rows, base_q_idx, &blocks)?;
+    let mut stream = temporal_delimiter();
+    stream.extend_from_slice(&frame_obu(&seq, &header, &tile)?);
+
+    let [u, v] = chroma;
+    Ok(Encoded {
+        stream,
+        modes,
+        inter_block_share,
+        reconstruction: Picture {
+            width: luma.width,
+            height: luma.height,
+            y: luma.reconstruction,
+            u: u.reconstruction,
+            v: v.reconstruction,
+        },
+    })
+}
+
+/// What [`encode_sequence`] produced: the concatenated AV1 stream -- a key
+/// frame's temporal unit followed by one inter frame's temporal unit per
+/// remaining picture, all sharing the key frame's sequence header -- and
+/// each frame's own [`Encoded`], in coding order.
+#[derive(Clone, Debug)]
+pub struct EncodedSequence {
+    /// The whole stream: `frames[0].stream` (a temporal delimiter, the
+    /// sequence header and the key frame) followed by each later frame's
+    /// `stream` (a temporal delimiter and that frame's OBU alone; it reuses
+    /// the sequence header the key frame carried).
+    pub stream: Vec<u8>,
+    /// One entry per picture, in coding order.
+    pub frames: Vec<Encoded>,
+}
+
+/// Encodes a sequence of pictures as a key frame followed by one inter frame
+/// per remaining picture, each predicting from the previous frame's own
+/// decoded reconstruction — never from the source, which is what a decoder
+/// cannot see. `pictures` must be a whole number of 64x64 superblocks in
+/// each direction (the inter tile writer's own constraint) and non-empty.
+///
+/// # Errors
+/// Returns an error when `pictures` is empty, when any picture besides the
+/// first is not the same size as the first, or under the same conditions
+/// [`encode_key_frame`] and the inter frame path do.
+pub fn encode_sequence(
+    pictures: &[Picture],
+    base_q_idx: u8,
+    deadzone: f64,
+) -> Result<EncodedSequence> {
+    let Some((first, rest)) = pictures.split_first() else {
+        return Err(Error::unsupported(
+            "AV1 encode",
+            "a sequence needs at least one picture",
+        ));
+    };
+    let key = encode_key_frame(first, base_q_idx, deadzone)?;
+    let mut stream = key.stream.clone();
+    let mut reference = key.reconstruction.clone();
+    let mut frames = vec![key];
+    for (i, picture) in rest.iter().enumerate() {
+        let order_hint = (i + 1) as u32;
+        let inter = encode_inter_frame(picture, &reference, base_q_idx, deadzone, order_hint)?;
+        stream.extend_from_slice(&inter.stream);
+        reference = inter.reconstruction.clone();
+        frames.push(inter);
+    }
+    Ok(EncodedSequence { stream, frames })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::intra::{D135_PRED, D45_PRED, H_PRED, KEY_FRAME_MODES, NON_DIRECTIONAL, V_PRED};
+    use crate::intra::{D45_PRED, D135_PRED, H_PRED, KEY_FRAME_MODES, NON_DIRECTIONAL, V_PRED};
     use std::io::Write;
     use std::process::{Command, Stdio};
 
@@ -1577,6 +2329,167 @@ mod tests {
             "{} bytes, luma PSNR {:.2} dB",
             encoded.stream.len(),
             psnr(&decoded.y, &picture.y)
+        );
+    }
+
+    /// [`test_card`], panned `shift` samples to the right (wrapping), so a
+    /// sequence of these is a translation a motion search can actually find
+    /// — the content [`test_card`] itself draws, not a fresh pattern, so an
+    /// inter frame's rate against the key frame's is measuring the same
+    /// picture moving, not two different pictures.
+    fn panned_test_card(width: usize, height: usize, shift: i64) -> Picture {
+        let mut picture = Picture::grey(width, height);
+        for y in 0..height {
+            for x in 0..width {
+                let sx = (x as i64 - shift).rem_euclid(width as i64) as f64;
+                let gradient = sx * 200.0 / width as f64;
+                let ripple = 30.0
+                    * (sx * std::f64::consts::PI / 23.0).sin()
+                    * (y as f64 * std::f64::consts::PI / 37.0).cos();
+                let edge = if sx > (width * 3 / 7) as f64 && y > height / 3 {
+                    40.0
+                } else {
+                    0.0
+                };
+                picture.y[y * width + x] =
+                    (20.0 + gradient + ripple + edge).clamp(0.0, 255.0) as u8;
+            }
+        }
+        for y in 0..height / 2 {
+            for x in 0..width / 2 {
+                let sx = (x as i64 - shift / 2).rem_euclid((width / 2) as i64) as usize;
+                let i = y * width / 2 + x;
+                picture.u[i] = (100 + (sx * 60 / (width / 2))) as u8;
+                picture.v[i] = (200 - (y * 80 / (height / 2))) as u8;
+            }
+        }
+        picture
+    }
+
+    /// Decodes `frames` concatenated 4:2:0 frames out of one AV1 OBU stream.
+    fn ffmpeg_decode_sequence(
+        stream: &[u8],
+        width: usize,
+        height: usize,
+        frames: usize,
+    ) -> Vec<Picture> {
+        let mut child = Command::new("ffmpeg")
+            .args([
+                "-v", "error", "-f", "obu", "-i", "-", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("ffmpeg failed to start");
+        child
+            .stdin
+            .take()
+            .expect("ffmpeg stdin")
+            .write_all(stream)
+            .expect("writing the stream to ffmpeg");
+        let out = child.wait_with_output().expect("ffmpeg failed to run");
+        assert!(
+            out.status.success(),
+            "ffmpeg refused the stream: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let (luma, chroma) = (width * height, width * height / 4);
+        let frame_bytes = luma + 2 * chroma;
+        assert_eq!(
+            out.stdout.len(),
+            frame_bytes * frames,
+            "expected {frames} 4:2:0 frames, ffmpeg said: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (0..frames)
+            .map(|i| {
+                let base = i * frame_bytes;
+                Picture {
+                    width,
+                    height,
+                    y: out.stdout[base..base + luma].to_vec(),
+                    u: out.stdout[base + luma..base + luma + chroma].to_vec(),
+                    v: out.stdout[base + luma + chroma..base + frame_bytes].to_vec(),
+                }
+            })
+            .collect()
+    }
+
+    /// The same claim [`ffmpeg_decodes_exactly_what_the_encoder_reconstructed`]
+    /// makes for a key frame, extended down the reference chain: each inter
+    /// frame's reconstruction predicts from the previous frame's own decoded
+    /// reconstruction, so a single sample of drift anywhere would propagate
+    /// into every frame after it -- which is why every frame is checked, not
+    /// just the last one, and why this is an equality and not a tolerance.
+    #[test]
+    fn every_frame_of_a_sequence_decodes_to_what_the_encoder_reconstructed() {
+        if !have_ffmpeg() {
+            eprintln!(
+                "SKIP every_frame_of_a_sequence_decodes_to_what_the_encoder_reconstructed: no ffmpeg"
+            );
+            return;
+        }
+        let (width, height) = (128usize, 64usize);
+        let pictures: Vec<Picture> = (0..5)
+            .map(|i| panned_test_card(width, height, i * 3))
+            .collect();
+        let encoded = encode_sequence(&pictures, 100, 0.5).unwrap();
+        assert_eq!(encoded.frames.len(), 5);
+
+        let decoded = ffmpeg_decode_sequence(&encoded.stream, width, height, 5);
+        for (i, (frame, dec)) in encoded.frames.iter().zip(&decoded).enumerate() {
+            assert_eq!(dec.y, frame.reconstruction.y, "frame {i}: luma");
+            assert_eq!(dec.u, frame.reconstruction.u, "frame {i}: U");
+            assert_eq!(dec.v, frame.reconstruction.v, "frame {i}: V");
+        }
+
+        eprintln!("frame  bytes  luma PSNR (dB)  inter share");
+        for (i, frame) in encoded.frames.iter().enumerate() {
+            eprintln!(
+                "{i:5}  {:5}  {:14.2}  {:11.2}",
+                frame.stream.len(),
+                psnr(&frame.reconstruction.y, &pictures[i].y),
+                frame.inter_block_share
+            );
+        }
+    }
+
+    /// Low motion has to actually buy something: at least one inter frame of
+    /// a panning sequence has to cost fewer bytes than the key frame that
+    /// starts it, and the inter-block share it prints has to be non-zero --
+    /// a search that never picks an inter mode would still pass a rate gate
+    /// on a picture with no motion in it (the class this repo calls
+    /// gate-blind-to-feature), so the share is printed even though it is not
+    /// asserted on beyond being reachable at all.
+    #[test]
+    fn low_motion_makes_an_inter_frame_smaller_than_the_key_frame() {
+        let (width, height) = (256usize, 128usize);
+        let pictures: Vec<Picture> = (0..5)
+            .map(|i| panned_test_card(width, height, i * 2))
+            .collect();
+        let encoded = encode_sequence(&pictures, 100, 0.5).unwrap();
+
+        let key_bytes = encoded.frames[0].stream.len();
+        eprintln!("frame  bytes  inter share");
+        for (i, frame) in encoded.frames.iter().enumerate() {
+            eprintln!(
+                "{i:5}  {:5}  {:11.2}",
+                frame.stream.len(),
+                frame.inter_block_share
+            );
+        }
+        assert!(
+            encoded.frames[1..]
+                .iter()
+                .any(|f| f.stream.len() < key_bytes),
+            "no inter frame of a panning sequence beat the key frame's {key_bytes} bytes"
+        );
+        assert!(
+            encoded.frames[1..]
+                .iter()
+                .any(|f| f.inter_block_share > 0.0),
+            "no inter frame coded a single inter block -- the search never fired"
         );
     }
 }
