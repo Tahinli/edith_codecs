@@ -1859,12 +1859,16 @@ pub fn sb_coeff_inter_frame_tile(
     base_q_idx: u8,
     blocks: &[BlockCoeffs],
 ) -> Result<Vec<u8>> {
-    check_superblocks(mi_cols, mi_rows)?;
-    let (cols, rows) = (mi_cols / BLOCK_MI, mi_rows / BLOCK_MI);
+    check_blocks(mi_cols, mi_rows)?;
+    // `block_grid`'s ceiling, not a plain division: a true frame size that is
+    // not a whole number of 32x32 blocks (or of 64x64 superblocks) still has
+    // one more block/superblock whose own origin is inside the true frame,
+    // same as `sb_coeff_key_frame_tile`.
+    let (cols, rows) = block_grid(mi_cols, mi_rows);
     if blocks.len() != (cols * rows) as usize {
         return Err(Error::unsupported(
             "AV1 tile",
-            "an inter frame needs one entry per 32x32 block",
+            "an inter frame needs one entry per 32x32 block inside the true frame",
         ));
     }
     if let Some(bad) = blocks
@@ -1887,7 +1891,7 @@ pub fn sb_coeff_inter_frame_tile(
     /// writer's single-reference chain ever names.
     const LAST_FRAME: i8 = 1;
 
-    let (sb_cols, sb_rows) = (mi_cols / SB_MI, mi_rows / SB_MI);
+    let (sb_cols, sb_rows) = (cols.div_ceil(2), rows.div_ceil(2));
     let mut neighbours = Neighbours::new(
         cols as usize * 2,
         rows as usize * 2,
@@ -1916,14 +1920,57 @@ pub fn sb_coeff_inter_frame_tile(
         for sb_c in 0..sb_cols {
             let sb_at = (sb_r as usize * 4, sb_c as usize * 4);
             let sb_ctx = neighbours.partition_ctx(sb_at, SB);
-            enc.symbol(PARTITION_SPLIT, &mut cdfs.partition_w64[sb_ctx]);
+            // spec `decode_partition`'s hasRows/hasCols (5.11.4): a superblock
+            // whose bottom or right half falls outside the true frame cannot
+            // be left whole, but this writer only ever splits a superblock
+            // into its four 32x32 quadrants (never `PARTITION_NONE` at 64x64),
+            // so the only question is which of the three partition symbols
+            // that split takes — same three-way signaling as
+            // `sb_coeff_key_frame_tile`'s superblock level.
+            let (has_cols, has_rows) = (
+                sb_c * SB_MI + SB_MI / 2 < mi_cols,
+                sb_r * SB_MI + SB_MI / 2 < mi_rows,
+            );
+            match (has_cols, has_rows) {
+                (true, true) => enc.symbol(PARTITION_SPLIT, &mut cdfs.partition_w64[sb_ctx]),
+                (true, false) => {
+                    enc.symbol_fixed(1, &gather(&cdfs.partition_w64[sb_ctx], VERT_ALIKE));
+                }
+                (false, true) => {
+                    enc.symbol_fixed(1, &gather(&cdfs.partition_w64[sb_ctx], HORZ_ALIKE));
+                }
+                (false, false) => {}
+            }
 
             for quadrant in 0..4 {
                 let (r32, c32) = (sb_r * 2 + quadrant / 2, sb_c * 2 + quadrant % 2);
+                // Only a quadrant whose own mi origin is inside the true
+                // frame is coded at all (spec `decode_partition`'s
+                // `r >= MiRows || c >= MiCols` early return), same filter as
+                // `sb_coeff_key_frame_tile`'s `quadrant_positions`.
+                if r32 >= rows || c32 >= cols {
+                    continue;
+                }
                 let block = &blocks[(r32 * cols + c32) as usize];
                 let at = (r32 as usize * 2, c32 as usize * 2);
                 let (r, c) = at;
                 let ctx32 = neighbours.partition_ctx(at, BLOCK);
+                // This writer has no rectangular (HORZ/VERT) or further-split
+                // representation for a 32x32 block, so one that itself
+                // straddles the true edge is refused rather than miscoded --
+                // mirroring `sb_coeff_key_frame_tile`'s "cannot be left whole"
+                // refusal, just with no split arm to fall back to here.
+                let (has_cols32, has_rows32) = (
+                    has_half(c32 * BLOCK_MI, BLOCK_MI, mi_cols),
+                    has_half(r32 * BLOCK_MI, BLOCK_MI, mi_rows),
+                );
+                if !has_cols32 || !has_rows32 {
+                    return Err(Error::unsupported(
+                        "AV1 tile",
+                        "a 32x32 inter-frame block that straddles the true frame edge \
+                         needs an 8x8 split this writer does not code",
+                    ));
+                }
                 enc.symbol(PARTITION_NONE, &mut cdfs.partition_w32[ctx32]);
 
                 let has_above = r32 > 0;
