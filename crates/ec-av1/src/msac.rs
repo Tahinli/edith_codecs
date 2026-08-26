@@ -77,6 +77,15 @@ impl SymbolEncoder {
         self.bits
     }
 
+    /// The exact bit position the stream has committed to so far (libaom's
+    /// `od_ec_enc_tell`, `entenc.c`): `cnt + 10` undoes the `-9` `cnt` starts
+    /// at and reserves the one bit `finish` always spends, and `precarry`
+    /// holds one `u16` per byte already flushed. Pairs with the decoder's
+    /// `aom_reader_tell`, which counts the same bits consumed.
+    pub fn tell(&self) -> i32 {
+        self.cnt + 10 + self.precarry.len() as i32 * 8
+    }
+
     /// Forgets the cost accumulated so far, so that the next stretch of
     /// symbols can be priced on its own.
     pub fn reset_bits(&mut self) {
