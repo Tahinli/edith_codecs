@@ -18,3 +18,9 @@ ec-image = { path = "../../crates/ec-image", version = "0.1.0" }
 png = []
 jpeg = []
 webp = []
+
+# The surface that exists only because gpui consumes it: animation frames,
+# their delays, and the per-format decoder types under `image::codecs`. It is
+# not part of decoding a still picture, so a build that draws no windows does
+# not compile it -- the way `chrono` keeps its `serde` impls behind a feature.
+gpui = []
