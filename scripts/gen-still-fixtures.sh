@@ -136,6 +136,33 @@ magick -delay 7 "$out/source.png" -delay 13 "$out/source-flat.png" \
     -delay 4 "$out/source-odd.png" -dispose Background -loop 0 -colors 64 \
     "$out/animated.gif"
 
+# --- BMP: every depth, both compressions, both row orders ------------------
+# ImageMagick writes the ordinary files; the shapes it has no switch for (16-bit
+# bitfields, top-down rows, a 32-bit alpha channel, the 12-byte OS/2 header,
+# and RLE4, which its RLE switch never chooses) are written by the helper.
+magick "$out/source.png" -resize 64x48! "$out/bmp-source.png"
+magick "$out/source-alpha.png" -resize 64x48! "$out/bmp-source-alpha.png"
+magick "$out/bmp-source.png" -monochrome -type bilevel BMP3:"$out/mono.bmp"
+magick "$out/bmp-source.png" -colors 16 -type palette -depth 4 -compress None \
+    BMP3:"$out/pal4.bmp"
+magick "$out/bmp-source.png" -colors 256 -type palette -compress None \
+    BMP3:"$out/pal8.bmp"
+magick "$out/bmp-source.png" -colors 256 -type palette -compress RLE \
+    BMP3:"$out/rle8.bmp"
+magick "$out/bmp-source.png" BMP3:"$out/rgb24.bmp"
+magick "$out/source-odd.png" -resize 37x29! BMP3:"$out/odd24.bmp"
+# A BITMAPV5HEADER, whose 124 bytes carry the colour space fields a v3 file
+# has no room for; ImageMagick writes one when asked for alpha.
+magick "$out/bmp-source-alpha.png" -define bmp:format=bmp5 BMP:"$out/v5alpha.bmp"
+magick "$out/bmp-source.png" rgba:"$out/bmp-source.rgba"
+magick "$out/bmp-source-alpha.png" rgba:"$out/bmp-source-alpha.rgba"
+magick "$out/bmp-source.png" "$out/bmp-embed.png"
+magick "$out/bmp-source.png" -quality 85 "$out/bmp-embed.jpg"
+python3 "$(dirname "$0")/lib/gen-bmp-shapes.py" "$out" "$out/bmp-source.rgba" 64 48 \
+    "$out/bmp-source-alpha.rgba" "$out/bmp-embed.png" "$out/bmp-embed.jpg"
+rm -f "$out/bmp-source.png" "$out/bmp-source-alpha.png" "$out/bmp-source.rgba" \
+    "$out/bmp-source-alpha.rgba" "$out/bmp-embed.png" "$out/bmp-embed.jpg"
+
 # Small versions of each format, for the fuzz sweep: ten thousand mutations
 # per format is only affordable on a picture that decodes in microseconds.
 magick "$out/source.png" -resize 32x24! "$out/tiny.png"
@@ -144,5 +171,6 @@ ffmpeg -loglevel error -y -i "$out/tiny.png" -c:v libwebp -lossless 0 -quality 7
     "$out/tiny-lossy.webp"
 ffmpeg -loglevel error -y -i "$out/tiny.png" -c:v libwebp -lossless 1 "$out/tiny-lossless.webp"
 magick "$out/tiny.png" -colors 64 "$out/tiny.gif"
+magick "$out/tiny.png" -colors 64 -type palette -compress None BMP3:"$out/tiny.bmp"
 
 echo "wrote $(ls "$out" | wc -l) files to $out"

@@ -382,12 +382,16 @@ fn format_of(data: &[u8]) -> Option<ImageFormat> {
         ec_image::ImageFormat::Png => Some(ImageFormat::Png),
         ec_image::ImageFormat::Jpeg => Some(ImageFormat::Jpeg),
         ec_image::ImageFormat::WebP => Some(ImageFormat::WebP),
-        // Only the gpui half of this shim names the animated formats; a build
-        // without it has no variant to answer with.
+        // Only the gpui half of this shim names the formats gpui asks for; a
+        // build without it has no variant to answer with.
         #[cfg(feature = "gpui")]
         ec_image::ImageFormat::Gif => Some(ImageFormat::Gif),
         #[cfg(not(feature = "gpui"))]
         ec_image::ImageFormat::Gif => None,
+        #[cfg(feature = "gpui")]
+        ec_image::ImageFormat::Bmp => Some(ImageFormat::Bmp),
+        #[cfg(not(feature = "gpui"))]
+        ec_image::ImageFormat::Bmp => None,
     }
 }
 
