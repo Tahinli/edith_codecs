@@ -14,7 +14,7 @@
 //! so a decoder that waits one code longer reads small pictures correctly and
 //! large ones as noise.
 
-use crate::{AnimationFrame, Image, ImageFormat, Info, Limits, Metadata, Pixels};
+use crate::{AllocBudget, AnimationFrame, Image, ImageFormat, Info, Limits, Metadata, Pixels};
 use ec_core::{Error, Result};
 
 /// GIF interlace: `(start, step)` for each of the four passes.
@@ -150,6 +150,13 @@ fn lzw_decode(min_code_size: u8, data: &[u8], expected: usize) -> Result<Vec<u8>
     let mut pos = 0;
 
     while let Some(code) = lzw.read_code(data, &mut pos) {
+        if out.len() >= expected {
+            // Output already satisfies the declared frame size; a bomb-style
+            // stream can keep growing the dictionary and emitting further
+            // codes after this point, so stop before decoding any more of
+            // them rather than let `out` expand unbounded (LZW bomb).
+            break;
+        }
         if code == lzw.clear_code {
             lzw.reset();
             continue;
@@ -328,7 +335,13 @@ fn indices_to_rgba(indices: &[u8], palette: &[[u8; 3]], gce: Option<&Gce>) -> Re
 /// Composite every raw frame onto a full-canvas buffer: blend the frame over
 /// the canvas, then apply its disposal method to the canvas the next frame
 /// starts from.
-fn composite(frames: Vec<RawFrame>, canvas_w: u32, canvas_h: u32) -> Result<Vec<AnimationFrame>> {
+fn composite(
+    frames: Vec<RawFrame>,
+    canvas_w: u32,
+    canvas_h: u32,
+    limits: &Limits,
+    budget: &mut AllocBudget,
+) -> Result<Vec<AnimationFrame>> {
     let cw = canvas_w as usize;
     let ch = canvas_h as usize;
     let n = cw * ch;
@@ -337,6 +350,10 @@ fn composite(frames: Vec<RawFrame>, canvas_w: u32, canvas_h: u32) -> Result<Vec<
     let mut result: Vec<(Vec<[u8; 4]>, u32)> = Vec::with_capacity(frames.len());
 
     for frame in frames {
+        // Every frame clones the whole canvas -- the real multiplier a
+        // single buffer's own bound never catches -- so it is spent from the
+        // decode-wide budget just like the frame's own indices were above.
+        budget.spend(limits, "GIF composited canvas", n * 4)?;
         let indices = if frame.interlaced {
             deinterlace(&frame.indices, frame.width as usize, frame.height as usize)
         } else {
@@ -482,6 +499,8 @@ pub fn decode_animation(data: &[u8], limits: Limits) -> Result<Vec<AnimationFram
     // Block loop
     let mut frames = Vec::new();
     let mut pending_gce: Option<Gce> = None;
+    let mut budget = AllocBudget::default();
+    budget.spend(&limits, "GIF canvas", canvas_bytes)?;
 
     loop {
         let block = r.u8()?;
@@ -497,6 +516,14 @@ pub fn decode_animation(data: &[u8], limits: Limits) -> Result<Vec<AnimationFram
                 if width == 0 || height == 0 {
                     return Err(Error::corrupt("GIF: zero-size frame"));
                 }
+                // A frame's own rectangle is a header field like any other --
+                // nothing says it has to fit inside the canvas the logical
+                // screen descriptor already bounded, so it gets its own check
+                // before it sizes the indices buffer below.
+                limits.check(width, height)?;
+                let indices_bytes =
+                    limits.check_bytes("GIF frame indices", (width as usize).checked_mul(height as usize))?;
+                budget.spend(&limits, "GIF frame indices", indices_bytes)?;
 
                 let has_lct = fpacked & 0x80 != 0;
                 let interlaced = fpacked & 0x40 != 0;
@@ -567,5 +594,5 @@ pub fn decode_animation(data: &[u8], limits: Limits) -> Result<Vec<AnimationFram
         return Err(Error::corrupt("GIF: no image data"));
     }
 
-    composite(frames, canvas_w, canvas_h)
+    composite(frames, canvas_w, canvas_h, &limits, &mut budget)
 }

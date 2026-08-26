@@ -245,8 +245,11 @@ pub fn decode_frames(data: &[u8], limits: Limits) -> Result<Vec<crate::Animation
     // advice to a viewer about what to show behind the animation, not a colour
     // the frames are composited onto -- libwebp's own animation decoder
     // ignores it the same way.
-    let mut canvas = vec![0u8; canvas_width as usize * canvas_height as usize * 4];
+    let canvas_bytes = canvas_width as usize * canvas_height as usize * 4;
+    let mut canvas = vec![0u8; canvas_bytes];
     let mut dispose: Option<(u32, u32, u32, u32)> = None;
+    let mut budget = crate::AllocBudget::default();
+    budget.spend(&limits, "WebP canvas", canvas_bytes)?;
 
     for chunk in &chunks {
         if &chunk.tag != b"ANMF" {
@@ -267,6 +270,10 @@ pub fn decode_frames(data: &[u8], limits: Limits) -> Result<Vec<crate::Animation
                 "WebP: frame {width}x{height}+{x}+{y} runs off a {canvas_width}x{canvas_height} canvas"
             )));
         }
+        // Every ANMF frame clones the whole composited canvas below -- the
+        // real multiplier a single buffer's own bound never catches -- so
+        // it is spent from the decode-wide budget before that clone runs.
+        budget.spend(&limits, "WebP composited canvas", canvas_bytes)?;
 
         // The previous frame's disposal happens before this one is drawn, so a
         // caller that keeps every frame still sees each one whole.
