@@ -517,6 +517,10 @@ const SB: usize = 64;
 /// Side of the smallest block the writer codes, in samples, which is the grid
 /// the neighbour bookkeeping is kept on.
 const SUB: usize = 16;
+/// Side of a 4x4 mode-info unit, in samples: the granularity libaom's above
+/// and left entropy-context arrays are actually kept on (spec
+/// `get_txb_ctx`/`av1_set_entropy_contexts`), finer than [`SUB`].
+const MI: usize = 4;
 
 /// What one coded block leaves behind for the blocks that read it as a
 /// neighbour: whether it coded anything at all, and the sign of its DC.
@@ -612,6 +616,13 @@ struct Neighbours {
     above_inter: Vec<bool>,
     /// The same, down the left edge.
     left_inter: Vec<bool>,
+    /// The frame's true (unpadded) width and height, in 4x4 mode-info units,
+    /// which is what clamps [`Self::above`]/[`Self::left`] at the edge (spec
+    /// `av1_set_entropy_contexts`): a block whose row or column run spills
+    /// past this bound leaves its trailing 4x4 units at their default,
+    /// mid-cell if need be.
+    mi_cols: usize,
+    mi_rows: usize,
 }
 
 /// What one plane's neighbours leave for a block, gathered across every cell
@@ -631,11 +642,13 @@ struct Around {
 
 impl Neighbours {
     /// The state a tile starts from: a block outside it reads as `DC_PRED`,
-    /// as having coded nothing, and as unsplit.
-    fn new(cols: usize, rows: usize) -> Self {
+    /// as having coded nothing, and as unsplit. `cols`/`rows` are in [`SUB`]
+    /// units; `mi_cols`/`mi_rows` are the frame's true (unpadded) size in 4x4
+    /// mode-info units.
+    fn new(cols: usize, rows: usize, mi_cols: usize, mi_rows: usize) -> Self {
         Self {
-            above: vec![[Neighbour::default(); 3]; cols],
-            left: vec![[Neighbour::default(); 3]; rows],
+            above: vec![[Neighbour::default(); 3]; cols * (SUB / MI)],
+            left: vec![[Neighbour::default(); 3]; rows * (SUB / MI)],
             above_mode: vec![DC_PRED; cols],
             left_mode: vec![DC_PRED; rows],
             above_side: vec![SB; cols],
@@ -644,6 +657,8 @@ impl Neighbours {
             left_skip: vec![false; rows],
             above_inter: vec![false; cols],
             left_inter: vec![false; rows],
+            mi_cols,
+            mi_rows,
         }
     }
 
@@ -656,17 +671,36 @@ impl Neighbours {
         self.left_inter.iter_mut().for_each(|i| *i = false);
     }
 
-    /// Writes one coded block into every 16x16 column and row it covers.
+    /// Writes one coded block into every 16x16 column and row it covers, and,
+    /// on the finer 4x4 grid libaom's entropy context arrays are actually
+    /// kept on, into every unit up to the true frame edge -- the units past
+    /// it are left at their default (uncoded), even mid-16x16-cell (spec
+    /// `av1_set_entropy_contexts`, which clamps to `blocks_wide`/`blocks_high`
+    /// derived from the true `mi_cols`/`mi_rows`, not from this block's own
+    /// side).
     fn record(&mut self, at: (usize, usize), side: usize, mode: usize, grids: &[Vec<i32>; 3]) {
         let (r, c) = at;
         let states: [Neighbour; 3] = std::array::from_fn(|plane| neighbour_state(&grids[plane]));
         for cell in 0..side / SUB {
-            self.above[c + cell] = states;
-            self.left[r + cell] = states;
             self.above_mode[c + cell] = mode;
             self.left_mode[r + cell] = mode;
             self.above_side[c + cell] = side;
             self.left_side[r + cell] = side;
+        }
+        let (mi_r, mi_c, side_mi) = (r * (SUB / MI), c * (SUB / MI), side / MI);
+        let valid_h = side_mi.min(self.mi_rows.saturating_sub(mi_r));
+        let valid_w = side_mi.min(self.mi_cols.saturating_sub(mi_c));
+        for cell in 0..side_mi {
+            self.left[mi_r + cell] = if cell < valid_h {
+                states
+            } else {
+                Default::default()
+            };
+            self.above[mi_c + cell] = if cell < valid_w {
+                states
+            } else {
+                Default::default()
+            };
         }
     }
 
@@ -688,10 +722,14 @@ impl Neighbours {
     /// The gathered state of the blocks above and to the left of one block,
     /// per plane.
     fn around(&self, (r, c): (usize, usize), side: usize) -> [Around; 3] {
+        let (mi_r, mi_c, side_mi) = (r * (SUB / MI), c * (SUB / MI), side / MI);
         std::array::from_fn(|plane| {
             let mut around = Around::default();
-            for cell in 0..side / SUB {
-                let (above, left) = (&self.above[c + cell][plane], &self.left[r + cell][plane]);
+            for cell in 0..side_mi {
+                let (above, left) = (
+                    &self.above[mi_c + cell][plane],
+                    &self.left[mi_r + cell][plane],
+                );
                 around.above_coded |= above.coded;
                 around.left_coded |= left.coded;
                 around.dc_vote += dc_vote(above.dc) + dc_vote(left.dc);
@@ -767,7 +805,12 @@ pub fn sb_coeff_key_frame_tile(
     // The blocks above and to the left, on the 16x16 grid. The left edge is
     // reset at every superblock row because a tile starts each row with no
     // left neighbour.
-    let mut neighbours = Neighbours::new(cols as usize * 2, rows as usize * 2);
+    let mut neighbours = Neighbours::new(
+        cols as usize * 2,
+        rows as usize * 2,
+        mi_cols as usize,
+        mi_rows as usize,
+    );
 
     // The tile adapts every non-literal CDF it writes, exactly as the decoder
     // adapts the ones it reads, so the frame header leaves `disable_cdf_update`
@@ -1631,10 +1674,12 @@ fn write_dc_coeffs(
     enc.symbol_fixed(usize::from(dc_level < 0), &cdf::DC_SIGN_LUMA[sign_ctx]);
 }
 
-/// One neighbour cell's vote in `Dc_Sign_Contexts` (spec 8.3.2): plus one for
-/// a positive DC, minus one for a negative one, nothing for a cell whose block
-/// carried no DC. Every 4x4 unit of a cell votes the same way, so counting
-/// cells and counting units differ only by a factor the sign is blind to.
+/// One 4x4 unit's vote in `Dc_Sign_Contexts` (spec 8.3.2): plus one for a
+/// positive DC, minus one for a negative one, nothing for a unit whose block
+/// carried no DC or that sits past the frame's true edge (spec
+/// `av1_set_entropy_contexts`), which is why the vote is gathered per 4x4
+/// unit and not per coded cell -- a unit past the edge does not vote even
+/// when the rest of its cell does.
 fn dc_vote(dc: Option<bool>) -> i32 {
     match dc {
         None => 0,
@@ -1824,7 +1869,12 @@ pub fn sb_coeff_inter_frame_tile(
     const LAST_FRAME: i8 = 1;
 
     let (sb_cols, sb_rows) = (mi_cols / SB_MI, mi_rows / SB_MI);
-    let mut neighbours = Neighbours::new(cols as usize * 2, rows as usize * 2);
+    let mut neighbours = Neighbours::new(
+        cols as usize * 2,
+        rows as usize * 2,
+        mi_cols as usize,
+        mi_rows as usize,
+    );
     let mut grid = MiGrid::new(mi_cols as usize, mi_rows as usize);
     let mut cdfs = Cdfs::new(q_ctx_of(base_q_idx));
     let mut enc = SymbolEncoder::new();
@@ -2995,7 +3045,7 @@ mod tests {
     /// appeared beside a 32x32 one.
     #[test]
     fn a_block_gathers_the_cells_its_neighbours_cover() {
-        let mut neighbours = Neighbours::new(4, 4);
+        let mut neighbours = Neighbours::new(4, 4, 64, 64);
         let quiet = [
             vec![0i32; TX16 * TX16],
             vec![0; TX8 * TX8],
@@ -3018,8 +3068,9 @@ mod tests {
             "the one negative DC above the block is what it votes"
         );
         // The same read one cell at a time misses it, which is the bug this
-        // gate is here for.
-        assert!(!neighbours.above[2][1].coded);
+        // gate is here for. `above[8]` is the first 4x4 unit the quiet block
+        // at `(0, 2)` wrote (2 SUB units * 4 4x4-units-per-SUB).
+        assert!(!neighbours.above[8][1].coded);
     }
 
     /// samples.
