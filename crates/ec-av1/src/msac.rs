@@ -272,7 +272,7 @@ pub(crate) mod tests {
         }
 
         /// `decode_symbol` (spec 8.2.6), with the adaptation of 8.3.2.
-        fn symbol(&mut self, cdf: &mut [u16]) -> usize {
+        pub(crate) fn symbol(&mut self, cdf: &mut [u16]) -> usize {
             let s = self.symbol_fixed(cdf);
             update_cdf(cdf, s);
             s
