@@ -16,7 +16,7 @@
 //! a different format that happens to share a signature byte. The incumbent
 //! `image` crate refuses all three as well.
 
-use crate::{Image, ImageFormat, Info, Limits, Metadata, Pixels};
+use crate::{AllocBudget, Image, ImageFormat, Info, Limits, Metadata, Pixels};
 use ec_core::{Error, Result};
 
 const TAG_WIDTH: u16 = 256;
@@ -363,6 +363,13 @@ fn lzw(input: &[u8], hint: usize) -> Result<Vec<u8>> {
     let (mut bit, mut acc, mut have) = (0usize, 0u32, 0u32);
     let mut stack = Vec::with_capacity(4096);
     loop {
+        if out.len() >= hint {
+            // The declared strip is already full. A bomb-style stream keeps
+            // emitting codes past this point (the dictionary just keeps
+            // growing); stopping here is what keeps a KB-sized input from
+            // expanding into hundreds of megabytes.
+            return Ok(out);
+        }
         while have < width {
             let Some(&byte) = input.get(bit) else {
                 return Ok(out);
@@ -431,6 +438,12 @@ fn packbits(input: &[u8], hint: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(hint);
     let mut at = 0usize;
     while at < input.len() {
+        if out.len() >= hint {
+            // Same bomb shape as LZW: a run byte expands to up to 128 bytes
+            // of output, so a small strip can otherwise inflate far past
+            // what the declared geometry says it should hold.
+            break;
+        }
         let control = input[at] as i8;
         at += 1;
         if control >= 0 {
@@ -522,9 +535,35 @@ pub fn decode(data: &[u8], limits: Limits) -> Result<Image> {
     let per_plane = if planar { 1 } else { samples };
 
     // Samples land here interleaved, whatever the file's own arrangement was.
-    let mut raw = vec![0u16; width * height * samples];
+    // `width`/`height` already passed `limits.check`, but that only bounds
+    // pixel count -- a 4-sample 16-bit picture is 8 bytes/pixel, which can
+    // still cross the allocation limit even inside the pixel limit.
+    let raw_len = width
+        .checked_mul(height)
+        .and_then(|v| v.checked_mul(samples))
+        .ok_or_else(|| Error::corrupt("TIFF: sample count overflows"))?;
+    let mut budget = AllocBudget::default();
+    // A decompression-bomb guard on top of `max_alloc`: no legitimate encoder
+    // writes a file whose declared pixel count decompresses to thousands of
+    // times the bytes actually on disk (uncompressed is 1x, and LZW/Deflate
+    // only improve on that). A tag claiming otherwise is sized past the file
+    // that would have to contain it, not a picture this decoder should spend
+    // possibly-seconds unpacking one strip of.
+    let bomb_cap = data.len().saturating_mul(4096).max(1 << 20);
+    let raw_bytes = limits.check_bytes("TIFF raw samples", raw_len.checked_mul(2))?;
+    if raw_bytes > bomb_cap {
+        return Err(Error::unsupported(
+            "TIFF: a picture out of proportion to its file size",
+            format!("{raw_bytes} raw bytes claimed from a {}-byte file", data.len()),
+        ));
+    }
+    budget.spend(&limits, "TIFF raw samples", raw_bytes)?;
+    let mut raw = vec![0u16; raw_len];
 
-    // Strips and tiles differ only in the rectangle one segment covers.
+    // Strips and tiles differ only in the rectangle one segment covers. Tile
+    // and rows-per-strip dimensions are header fields too, unconstrained by
+    // the picture's own width/height, so a segment's decompressed size is
+    // budgeted before anything is sized from it.
     let (seg_w, seg_h) = match layout.tile {
         Some((w, h)) if w > 0 && h > 0 => (w as usize, h as usize),
         Some(_) => return Err(Error::corrupt("TIFF: a zero-sized tile")),
@@ -541,15 +580,58 @@ pub fn decode(data: &[u8], limits: Limits) -> Result<Image> {
 
     // A tile is always its full width; a strip is only as wide as the picture,
     // and its last one only as tall as the rows that remain.
-    let row_samples = seg_w * per_plane;
-    let row_bytes = (row_samples * bits as usize).div_ceil(8);
+    let row_samples = seg_w
+        .checked_mul(per_plane)
+        .ok_or_else(|| Error::corrupt("TIFF: a row wider than usize"))?;
+    let row_bytes = limits.check_bytes(
+        "TIFF row",
+        row_samples
+            .checked_mul(bits as usize)
+            .map(|bits| bits.div_ceil(8)),
+    )?;
+    // `row` holds one `u16` per *sample*, not per packed byte -- for anything
+    // under 16 bits that is a bigger allocation than `row_bytes` (up to 16x
+    // for a 1-bit picture), so it needs its own check rather than trusting
+    // the packed size to stand in for it.
+    limits.check_bytes("TIFF row samples", row_samples.checked_mul(2))?;
+    if row_samples.saturating_mul(2) > bomb_cap {
+        return Err(Error::unsupported(
+            "TIFF: a row out of proportion to its file size",
+            format!("{row_samples} samples/row claimed from a {}-byte file", data.len()),
+        ));
+    }
     let mut row = Vec::with_capacity(row_samples);
     let full = ((1u32 << bits) - 1) as u16;
+    // `bomb_cap` alone bounds one strip; nothing bounded the strip *count*
+    // yet, and that is attacker-controlled up to the number of offsets a
+    // small file can list. A few thousand small-looking strips can still add
+    // up to gigabytes of real decompression work, so the running total is
+    // held to the same file-size-proportional ceiling as a single strip.
+    let mut segment_bytes_total = 0usize;
     for index in 0..per_plane_segments * planes {
         let plane = index / per_plane_segments;
         let within = index % per_plane_segments;
         let (col, band) = (within % across, within / across);
-        let expect = row_bytes * seg_h;
+        // The declared strip/tile height is a header field like any other:
+        // nothing stops RowsPerStrip or TileLength from claiming far more
+        // rows than the picture has, which would otherwise size an LZW or
+        // Deflate hint (and the compute behind it) off a number with no
+        // relationship to the real image -- a small file claiming a
+        // billion-row strip decodes only as many rows as `height` actually
+        // has, never the declared height.
+        let rows_used = seg_h.min(height.saturating_sub(band * seg_h));
+        let expect = limits.check_bytes("TIFF strip", row_bytes.checked_mul(rows_used))?;
+        segment_bytes_total = segment_bytes_total.saturating_add(expect);
+        if expect > bomb_cap || segment_bytes_total > bomb_cap {
+            return Err(Error::unsupported(
+                "TIFF: strips claim more decompressed data than the file could hold",
+                format!(
+                    "{segment_bytes_total} bytes claimed across strips from a {}-byte file",
+                    data.len()
+                ),
+            ));
+        }
+        budget.spend(&limits, "TIFF strip", expect)?;
         let body = segment(&layout, data, index, expect)?;
         for r in 0..seg_h {
             let y = band * seg_h + r;
