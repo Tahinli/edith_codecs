@@ -212,13 +212,29 @@ fn a_run_length_bmp_survives_mutation() {
     sweep("bmp-rle", "rle8.bmp");
 }
 
+/// TIFF is a directory of offsets into itself: a mutation can point a strip,
+/// a palette or the directory's own continuation anywhere in the file.
+#[test]
+fn tiff_survives_mutation() {
+    sweep("tiff", "tiny.tiff");
+}
+
+/// The compressed, predicted path decodes into a row buffer whose length comes
+/// from tags the mutation is free to disagree about, so it gets its own seed.
+#[test]
+fn a_compressed_tiff_survives_mutation() {
+    sweep("tiff-lzw", "rgb8-lzw-pred.tiff");
+}
+
 #[test]
 fn arbitrary_bytes_behind_a_signature_are_refused_not_believed() {
-    let signatures: [&[u8]; 5] = [
+    let signatures: [&[u8]; 6] = [
         &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a],
         &[0xff, 0xd8, 0xff, 0xe0],
         b"RIFF\x40\x00\x00\x00WEBPVP8 ",
         b"GIF89a",
+        // A TIFF header whose directory offset is inside the header itself.
+        b"II\x2a\x00\x04\x00\x00\x00",
         // "BM" alone is two bytes anything could start with, so the guess also
         // asks the file header to agree with itself: this prefix declares a
         // 40-byte info header and pixels at 54, which is what makes the bytes
