@@ -16,8 +16,17 @@ use crate::cdf;
 /// Which of the four coefficient table sets a transform block is coded with.
 #[derive(Clone, Copy)]
 pub(crate) enum TxbSet {
-    /// The 32x32 luma transform of a 32x32 block.
+    /// The 32x32 luma transform of an intra 32x32 block. `get_tx_set` is
+    /// DCT-only at this size for an intra block, so no `tx_type` symbol is
+    /// coded; an `is_inter` 32x32 block reads a different set and uses
+    /// [`Luma32Inter`](TxbSet::Luma32Inter) instead.
     Luma32,
+    /// The 32x32 luma transform of an `is_inter` 32x32 block: the same
+    /// coefficient tables [`Luma32`](TxbSet::Luma32) reads, but `get_tx_set`
+    /// (spec 5.11.48) returns `TX_SET_INTER_3` rather than `TX_SET_DCTONLY`
+    /// at this size for an inter block, so this variant carries the
+    /// `tx_type` symbol `Luma32` does not.
+    Luma32Inter,
     /// The 64x64 luma transform of a whole superblock, scanned as a 32x32.
     Luma64,
     /// The 16x16 luma transform of a 16x16 block.
@@ -49,8 +58,11 @@ pub(crate) struct TxbTables<'a> {
     pub br: &'a mut [[u16; 5]; 21],
     /// The sign of the DC.
     pub dc_sign: &'a mut [[u16; 3]; 3],
-    /// The transform type, for the one size whose set holds more than one.
-    pub tx_type: Option<&'a mut [u16; 6]>,
+    /// The transform type, for the one size whose set holds more than one --
+    /// a plain slice because the intra 16x16 table's alphabet (five types)
+    /// and the inter 32x32 table's (two, `TX_SET_INTER_3`) are different
+    /// sizes.
+    pub tx_type: Option<&'a mut [u16]>,
 }
 
 /// Every table a key frame's tile writer adapts.
@@ -144,6 +156,10 @@ pub(crate) struct Cdfs {
     pub dc_sign_luma: [[u16; 3]; 3],
     /// The transform type of a 16x16 intra luma transform, by luma mode.
     pub intra_tx_type_16: [[u16; 6]; 13],
+    /// The transform type of an `is_inter` 32x32 luma transform (spec
+    /// `TX_SET_INTER_3`, `TX_32X32` row) -- unlike the intra 16x16 table, it
+    /// is not indexed by mode.
+    pub inter_tx_type_32: [u16; 3],
     /// The DC sign of a chroma coefficient, shared by both chroma sets.
     pub dc_sign_chroma: [[u16; 3]; 3],
     /// Whether an inter frame's block is coded as intra.
@@ -472,6 +488,7 @@ impl Cdfs {
             ),
             dc_sign_luma: cdf::DC_SIGN_LUMA,
             intra_tx_type_16: cdf::INTRA_TX_TYPE_SET2_16,
+            inter_tx_type_32: cdf::INTER_TX_TYPE_SET3_32,
             dc_sign_chroma: cdf::DC_SIGN_CHROMA,
             intra_inter: cdf::INTRA_INTER,
             single_ref: cdf::SINGLE_REF,
@@ -499,6 +516,17 @@ impl Cdfs {
                 dc_sign: &mut self.dc_sign_luma,
                 tx_type: None,
             },
+            TxbSet::Luma32Inter => TxbTables {
+                side: 32,
+                txb_skip: &mut self.txb_skip_luma_32,
+                eob_pt: &mut self.eob_pt_1024_luma,
+                eob_extra: &mut self.eob_extra_luma_32,
+                base: &mut self.base_luma_32,
+                base_eob: &mut self.base_eob_luma_32,
+                br: &mut self.br_luma_32,
+                dc_sign: &mut self.dc_sign_luma,
+                tx_type: Some(self.inter_tx_type_32.as_mut_slice()),
+            },
             TxbSet::Luma64 => TxbTables {
                 side: 32,
                 txb_skip: &mut self.txb_skip_luma_64,
@@ -519,7 +547,7 @@ impl Cdfs {
                 base_eob: &mut self.base_eob_luma_16,
                 br: &mut self.br_luma_16,
                 dc_sign: &mut self.dc_sign_luma,
-                tx_type: Some(&mut self.intra_tx_type_16[mode]),
+                tx_type: Some(self.intra_tx_type_16[mode].as_mut_slice()),
             },
             TxbSet::Chroma8 => TxbTables {
                 side: 8,
