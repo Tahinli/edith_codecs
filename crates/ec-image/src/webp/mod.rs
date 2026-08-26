@@ -1,9 +1,11 @@
 //! WebP: the RIFF container, its lossy (`VP8 `) and lossless (`VP8L`) payloads,
 //! and the separate alpha plane (`ALPH`) an extended file may carry.
 //!
-//! Animation is refused by name. A still decoder that quietly handed back the
-//! first frame of an animation would make "this file plays" and "this file
-//! decoded" indistinguishable to its caller.
+//! `decode` returns one still picture and refuses an animation by name: a still
+//! decoder that quietly handed back the first frame would make "this file
+//! plays" and "this file decoded" indistinguishable to its caller. The
+//! sequence is `decode_frames`, which composites the `ANMF` frames onto the
+//! canvas.
 
 pub mod vp8;
 mod vp8_tables;
@@ -44,6 +46,23 @@ fn chunks(data: &[u8]) -> Result<Vec<Chunk<'_>>> {
         return Err(Error::corrupt("WebP: no chunks"));
     }
     Ok(out)
+}
+
+/// Whether the file is an animation rather than a still.
+///
+/// The question is answerable from the container alone -- the VP8X animation
+/// flag, or an `ANIM`/`ANMF` chunk -- so it is answered even for a file whose
+/// frames fail to decode.  Bytes that are not a readable WebP are not an
+/// animation.
+pub fn is_animated(data: &[u8]) -> bool {
+    let Ok(chunks) = chunks(data) else {
+        return false;
+    };
+    chunks.iter().any(|chunk| match &chunk.tag {
+        b"VP8X" => chunk.data.first().is_some_and(|flags| flags & 0x02 != 0),
+        b"ANIM" | b"ANMF" => true,
+        _ => false,
+    })
 }
 
 /// Dimensions from the container's headers alone.
@@ -131,6 +150,21 @@ pub fn decode(data: &[u8], limits: Limits) -> Result<Image> {
     }
 
     let (tag, body) = image.ok_or_else(|| Error::corrupt("WebP: no VP8 or VP8L chunk"))?;
+    decode_payload(tag, body, alpha, meta, limits)
+}
+
+/// Decode one image payload -- a `VP8 ` or `VP8L` body, with its optional
+/// `ALPH` plane -- into pixels.
+///
+/// A still file and one frame of an animation differ only in where these
+/// chunks were found, so both paths land here.
+fn decode_payload(
+    tag: &[u8; 4],
+    body: &[u8],
+    alpha: Option<&[u8]>,
+    meta: Metadata,
+    limits: Limits,
+) -> Result<Image> {
     if tag == b"VP8L" {
         let argb = vp8l::decode(body, limits)?;
         let mut rgba = Vec::with_capacity(argb.pixels.len() * 4);
@@ -191,6 +225,137 @@ pub fn decode(data: &[u8], limits: Limits) -> Result<Image> {
         },
         meta,
     })
+}
+
+/// Decode an animated WebP into composited canvas frames.
+///
+/// Every frame comes back as the whole canvas in RGBA, the way a player wants
+/// it: the frame rectangles, the two blending methods and the dispose-to-
+/// background rule are applied here rather than left to the caller.
+pub fn decode_frames(data: &[u8], limits: Limits) -> Result<Vec<crate::AnimationFrame>> {
+    let chunks = chunks(data)?;
+    let (canvas_width, canvas_height) = {
+        let info = info(data)?;
+        (info.width, info.height)
+    };
+    limits.check(canvas_width, canvas_height)?;
+
+    let mut frames: Vec<crate::AnimationFrame> = Vec::new();
+    // The canvas starts fully transparent.  The `ANIM` background colour is
+    // advice to a viewer about what to show behind the animation, not a colour
+    // the frames are composited onto -- libwebp's own animation decoder
+    // ignores it the same way.
+    let mut canvas = vec![0u8; canvas_width as usize * canvas_height as usize * 4];
+    let mut dispose: Option<(u32, u32, u32, u32)> = None;
+
+    for chunk in &chunks {
+        if &chunk.tag != b"ANMF" {
+            continue;
+        }
+        let d = chunk.data;
+        if d.len() < 16 {
+            return Err(Error::corrupt("WebP: short ANMF header"));
+        }
+        let u24 = |at: usize| u32::from_le_bytes([d[at], d[at + 1], d[at + 2], 0]);
+        let (x, y) = (u24(0) * 2, u24(3) * 2);
+        let (width, height) = (u24(6) + 1, u24(9) + 1);
+        let duration = u24(12);
+        let blend_over = d[15] & 0x02 == 0;
+        let dispose_to_background = d[15] & 0x01 != 0;
+        if x + width > canvas_width || y + height > canvas_height {
+            return Err(Error::corrupt(format!(
+                "WebP: frame {width}x{height}+{x}+{y} runs off a {canvas_width}x{canvas_height} canvas"
+            )));
+        }
+
+        // The previous frame's disposal happens before this one is drawn, so a
+        // caller that keeps every frame still sees each one whole.
+        if let Some((x, y, width, height)) = dispose.take() {
+            for row in y..y + height {
+                let at = (row as usize * canvas_width as usize + x as usize) * 4;
+                canvas[at..at + width as usize * 4].fill(0);
+            }
+        }
+
+        let mut alpha: Option<&[u8]> = None;
+        let mut payload: Option<(&[u8; 4], &[u8])> = None;
+        let mut at = 16usize;
+        while at + 8 <= d.len() {
+            let tag = [d[at], d[at + 1], d[at + 2], d[at + 3]];
+            let size = u32::from_le_bytes([d[at + 4], d[at + 5], d[at + 6], d[at + 7]]) as usize;
+            let body = d
+                .get(at + 8..at + 8 + size)
+                .ok_or_else(|| Error::corrupt("WebP: ANMF sub-chunk runs past the frame"))?;
+            match &tag {
+                b"ALPH" => alpha = Some(body),
+                // Only the first image chunk of a frame is the frame; the tag
+                // is kept as a static so the borrow of `d` does not outlive
+                // this iteration.
+                b"VP8 " if payload.is_none() => payload = Some((b"VP8 ", body)),
+                b"VP8L" if payload.is_none() => payload = Some((b"VP8L", body)),
+                _ => {}
+            }
+            at += 8 + size + (size & 1);
+        }
+        let (tag, body) =
+            payload.ok_or_else(|| Error::corrupt("WebP: ANMF without an image chunk"))?;
+        let sub = decode_payload(tag, body, alpha, Metadata::default(), limits)?;
+        if sub.width != width || sub.height != height {
+            return Err(Error::corrupt(format!(
+                "WebP: ANMF says {width}x{height}, the payload decodes {}x{}",
+                sub.width, sub.height
+            )));
+        }
+        let pixels = sub.to_rgba8();
+
+        for row in 0..height as usize {
+            for col in 0..width as usize {
+                let src = (row * width as usize + col) * 4;
+                let dst = ((row + y as usize) * canvas_width as usize + col + x as usize) * 4;
+                let src = &pixels[src..src + 4];
+                if !blend_over || src[3] == 255 {
+                    canvas[dst..dst + 4].copy_from_slice(src);
+                    continue;
+                }
+                if src[3] == 0 {
+                    continue;
+                }
+                // Source-over in eight-bit alpha, rounded rather than
+                // truncated: a run of blended frames drifts visibly otherwise.
+                let sa = u32::from(src[3]);
+                let da = u32::from(canvas[dst + 3]);
+                let out_a = sa + da * (255 - sa) / 255;
+                for c in 0..3 {
+                    let s = u32::from(src[c]) * sa;
+                    let dcol = u32::from(canvas[dst + c]) * da * (255 - sa) / 255;
+                    canvas[dst + c] = (s + dcol + out_a / 2)
+                        .checked_div(out_a)
+                        .unwrap_or(0)
+                        .min(255) as u8;
+                }
+                canvas[dst + 3] = out_a as u8;
+            }
+        }
+
+        if dispose_to_background {
+            dispose = Some((x, y, width, height));
+        }
+        frames.push(crate::AnimationFrame {
+            image: Image {
+                width: canvas_width,
+                height: canvas_height,
+                pixels: Pixels::Rgba8(canvas.clone()),
+                meta: Metadata::default(),
+            },
+            delay_num: duration,
+            delay_den: 1000,
+        });
+    }
+
+    if frames.is_empty() {
+        return Err(Error::corrupt("WebP: an animation with no ANMF frame"));
+    }
+    Ok(frames)
 }
 
 /// BT.601 studio-swing YCbCr to RGB, in 16-bit fixed point.
