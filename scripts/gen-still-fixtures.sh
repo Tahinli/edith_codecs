@@ -93,6 +93,19 @@ ffmpeg -loglevel error -y -i "$out/source-flat.png" -c:v libwebp -lossless 1 \
 magick -delay 10 "$out/source.png" "$out/source-flat.png" "$out/source-odd.png" \
     -loop 0 "$out/animated.webp"
 
+# --- GIF: still, interlaced, transparent, odd-size, animated ---------------
+# GIF is palette-only, so every source is quantised first; the differential bar
+# is pixel-exact, which only means anything if both decoders see the same file.
+magick "$out/source.png" -colors 256 "$out/still.gif"
+magick "$out/source.png" -colors 256 -interlace GIF "$out/interlaced.gif"
+magick "$out/source.png" -colors 64 -transparent white "$out/trns.gif"
+magick "$out/source-odd.png" -colors 256 "$out/odd.gif"
+# Three frames, each with its own delay, and a disposal method that clears the
+# frame's rectangle -- the compositing path only runs when frames differ.
+magick -delay 7 "$out/source.png" -delay 13 "$out/source-flat.png" \
+    -delay 4 "$out/source-odd.png" -dispose Background -loop 0 -colors 64 \
+    "$out/animated.gif"
+
 # Small versions of each format, for the fuzz sweep: ten thousand mutations
 # per format is only affordable on a picture that decodes in microseconds.
 magick "$out/source.png" -resize 32x24! "$out/tiny.png"
@@ -100,5 +113,6 @@ magick "$out/tiny.png" -quality 80 -sampling-factor 2x2 "$out/tiny.jpg"
 ffmpeg -loglevel error -y -i "$out/tiny.png" -c:v libwebp -lossless 0 -quality 75 \
     "$out/tiny-lossy.webp"
 ffmpeg -loglevel error -y -i "$out/tiny.png" -c:v libwebp -lossless 1 "$out/tiny-lossless.webp"
+magick "$out/tiny.png" -colors 64 "$out/tiny.gif"
 
 echo "wrote $(ls "$out" | wc -l) files to $out"
