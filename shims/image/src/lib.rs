@@ -38,6 +38,20 @@
 use std::fmt;
 use std::path::Path;
 
+#[cfg(feature = "gpui")]
+pub mod gpui;
+// The names gpui writes as `image::...`; upstream has them at the crate root,
+// so the feature's module is flattened into it.
+#[cfg(feature = "gpui")]
+pub use gpui::{
+    AnimationDecoder, Delay, Frame, Frames, ImageDecoder, codecs, guess_format,
+    load_from_memory_with_format,
+};
+/// Upstream's one generic buffer type. Every caller behind the `gpui` feature
+/// instantiates it at RGBA8, so that is what the name means here.
+#[cfg(feature = "gpui")]
+pub type ImageBuffer = RgbaImage;
+
 /// Failure of a decode, as `image::ImageError`.
 #[derive(Debug)]
 pub enum ImageError {
@@ -98,6 +112,15 @@ pub enum ImageFormat {
     Jpeg,
     /// WebP.
     WebP,
+    /// GIF.
+    #[cfg(feature = "gpui")]
+    Gif,
+    /// Windows bitmap.
+    #[cfg(feature = "gpui")]
+    Bmp,
+    /// TIFF.
+    #[cfg(feature = "gpui")]
+    Tiff,
 }
 
 /// One 8-bit greyscale pixel.
@@ -187,6 +210,12 @@ macro_rules! buffer {
             type Target = [u8];
             fn deref(&self) -> &[u8] {
                 &self.data
+            }
+        }
+
+        impl std::ops::DerefMut for $name {
+            fn deref_mut(&mut self) -> &mut [u8] {
+                &mut self.data
             }
         }
     };
@@ -326,11 +355,7 @@ impl ImageReader {
     /// unrecognised signature is not an error at this point in either crate —
     /// it surfaces at `decode`.
     pub fn with_guessed_format(mut self) -> std::io::Result<ImageReader> {
-        self.format = ec_image::ImageFormat::guess(&self.data).map(|f| match f {
-            ec_image::ImageFormat::Png => ImageFormat::Png,
-            ec_image::ImageFormat::Jpeg => ImageFormat::Jpeg,
-            ec_image::ImageFormat::WebP => ImageFormat::WebP,
-        });
+        self.format = format_of(&self.data);
         Ok(self)
     }
 
@@ -348,6 +373,21 @@ impl ImageReader {
     pub fn into_dimensions(self) -> ImageResult<(u32, u32)> {
         let info = ec_image::info(&self.data)?;
         Ok((info.width, info.height))
+    }
+}
+
+/// The format `data`'s leading bytes name, if this build decodes it.
+fn format_of(data: &[u8]) -> Option<ImageFormat> {
+    match ec_image::ImageFormat::guess(data)? {
+        ec_image::ImageFormat::Png => Some(ImageFormat::Png),
+        ec_image::ImageFormat::Jpeg => Some(ImageFormat::Jpeg),
+        ec_image::ImageFormat::WebP => Some(ImageFormat::WebP),
+        // Only the gpui half of this shim names the animated formats; a build
+        // without it has no variant to answer with.
+        #[cfg(feature = "gpui")]
+        ec_image::ImageFormat::Gif => Some(ImageFormat::Gif),
+        #[cfg(not(feature = "gpui"))]
+        ec_image::ImageFormat::Gif => None,
     }
 }
 
