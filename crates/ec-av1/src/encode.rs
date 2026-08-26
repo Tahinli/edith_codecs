@@ -1264,9 +1264,20 @@ pub(crate) fn encode_key_frame_inner(
                 let mut split = Vec::with_capacity(4);
                 let mut cost_split = search.lambda
                     * (partition_bits(BLOCK, true) + 4.0 * partition_bits(SUB, false));
-                let mut split_modes = [DC_PRED; 4];
-                for (sub, sub_mode) in split_modes.iter_mut().enumerate() {
+                let mut split_modes = Vec::with_capacity(4);
+                for sub in 0..4 {
                     let (sc, sr) = (c0 + sub % 2, r0 + sub / 2);
+                    // Same filter as the writer's `sub_positions` (spec
+                    // `decode_partition`'s `r >= MiRows || c >= MiCols` early
+                    // return): a sub-block whose own origin sits past the
+                    // true frame is never coded, so it must not be searched
+                    // or pushed onto `split` either, or the writer's block
+                    // count will not match what it is prepared to name.
+                    if (sr as u32) * crate::tile::SUB_MI >= header.mi_rows
+                        || (sc as u32) * crate::tile::SUB_MI >= header.mi_cols
+                    {
+                        continue;
+                    }
                     let (block, cost) = code_square(
                         &mut luma,
                         &mut chroma,
@@ -1276,7 +1287,7 @@ pub(crate) fn encode_key_frame_inner(
                         &mode_bits(above_mode[sc], left_mode[sr]),
                     );
                     cost_split += cost;
-                    *sub_mode = block.mode;
+                    split_modes.push(block.mode);
                     above_mode[sc] = block.mode;
                     left_mode[sr] = block.mode;
                     split.push(block);
@@ -1833,13 +1844,14 @@ pub(crate) fn encode_inter_frame(
     // overwrites slot 0, so the frame just coded is always what the next one
     // predicts against.
     const LAST_SLOT: u8 = 0;
-    let (seq, mut header) = inter_frame_headers(
-        picture.width,
-        picture.height,
-        base_q_idx,
-        order_hint,
-        LAST_SLOT,
-    )?;
+    // `render`, not `picture.width`/`picture.height`: `picture` here is
+    // already padded to a whole number of superblocks (`encode_sequence`'s
+    // `padded_to(SUPERBLOCK)`), and the header's `mi_cols`/`mi_rows` (and so
+    // every true-edge clamp downstream) must come from the frame's real,
+    // unpadded size, same as `key_frame_headers_colour` takes `render` and
+    // not the padded picture in `encode_key_frame_inner`.
+    let (seq, mut header) =
+        inter_frame_headers(render.0, render.1, base_q_idx, order_hint, LAST_SLOT)?;
     header.render_width = render.0 as u32;
     header.render_height = render.1 as u32;
 
@@ -1880,8 +1892,14 @@ pub(crate) fn encode_inter_frame(
     };
     let mode_bits_table = inter_mode_bits();
 
-    let (cols, rows) = (picture.width / BLOCK, picture.height / BLOCK);
-    let (sb_cols, sb_rows) = (cols / 2, rows / 2);
+    // The true grid ([`crate::tile::block_grid`]'s ceiling), not the padded
+    // coding surface's: `blocks` carries one entry per 32x32 block the tile
+    // writer will actually visit, same count it checks `blocks.len()`
+    // against, which is fewer than the padded surface's own block count
+    // whenever the true size is not a 64x64 multiple.
+    let (cols, rows) = crate::tile::block_grid(header.mi_cols, header.mi_rows);
+    let (cols, rows) = (cols as usize, rows as usize);
+    let (sb_cols, sb_rows) = (cols.div_ceil(2), rows.div_ceil(2));
     let (mi_cols, mi_rows) = (header.mi_cols as usize, header.mi_rows as usize);
     let mut grid = MiGrid::new(mi_cols, mi_rows);
     let mut blocks = vec![BlockCoeffs::default(); cols * rows];
@@ -1890,6 +1908,11 @@ pub(crate) fn encode_inter_frame(
         for sb_c in 0..sb_cols {
             for quadrant in 0..4 {
                 let (r32, c32) = (sb_r * 2 + quadrant / 2, sb_c * 2 + quadrant % 2);
+                // Same filter as the tile writer's: a quadrant whose own mi
+                // origin is not inside the true frame is never coded.
+                if r32 >= rows || c32 >= cols {
+                    continue;
+                }
                 let (x, y) = (c32 * BLOCK, r32 * BLOCK);
                 let (mi_row, mi_col) = (r32 * 8, c32 * 8);
                 let stack =
@@ -2140,7 +2163,7 @@ mod tests {
             eprintln!("SKIP ffmpeg_decodes_exactly_what_the_encoder_reconstructed: no ffmpeg");
             return;
         }
-        for &(width, height) in &[(64usize, 64usize), (96, 64), (160, 96)] {
+        for &(width, height) in &[(64usize, 64usize), (96, 64), (160, 96), (32, 48)] {
             let picture = test_card(width, height);
             let encoded = encode_key_frame(&picture, 100, 0.5).unwrap();
             let decoded = ffmpeg_decode(&encoded.stream, width, height);
@@ -3036,7 +3059,11 @@ mod tests {
             msg.contains("true frame")
         };
         assert!(refused(40, 32));
-        assert!(refused(32, 48));
+        // 32x48 was refused here through round 9: its split quadrant only
+        // ever has two legal 16x16 subs (the other two sit past the true
+        // 48-row edge, block-aligned, no 8x8 split needed), but the writer
+        // demanded four. See `ffmpeg_decodes_exactly_what_the_encoder_
+        // reconstructed`, which now round-trips it pixel-exact instead.
         let mut short = Picture::grey(64, 64);
         short.u.truncate(10);
         assert!(encode_key_frame(&short, 100, 0.5).is_err());
