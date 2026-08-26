@@ -16,7 +16,7 @@ use ec_core::{Error, Result};
 use crate::cdf;
 use crate::cdf_state::{Cdfs, MvComponentCdfs, TxbSet, TxbTables};
 use crate::msac::SymbolEncoder;
-use crate::mvstack::{find_mv_stack, single_ref_ctx, MiGrid, MiInfo};
+use crate::mvstack::{MiGrid, MiInfo, find_mv_stack, single_ref_ctx};
 
 /// `PARTITION_NONE` (spec 6.10.4): the whole block, undivided.
 const PARTITION_NONE: usize = 0;
@@ -1369,11 +1369,7 @@ fn intra_inter_ctx(has_above: bool, has_left: bool, above_inter: bool, left_inte
 /// `CLASS0_SIZE << (class + 2)` (spec 3), the magnitude an `MV_CLASS_n`
 /// component's own bits start counting from; class zero starts at zero.
 fn mv_class_base(class: usize) -> i32 {
-    if class == 0 {
-        0
-    } else {
-        2i32 << (class + 2)
-    }
+    if class == 0 { 0 } else { 2i32 << (class + 2) }
 }
 
 /// The class a pre-offset magnitude `z` (`|diff| - 1`) falls in — the inverse
@@ -1688,8 +1684,8 @@ mod tests {
     use crate::sequence::sequence_header_obu;
     use ec_av1_syntax::sequence::SequenceHeader;
     use ec_av1_syntax::{
-        FrameHeader, FrameType, LoopFilterParams, QuantizationParams, TileInfo, TxMode,
-        PRIMARY_REF_NONE,
+        FrameHeader, FrameType, LoopFilterParams, PRIMARY_REF_NONE, QuantizationParams, TileInfo,
+        TxMode,
     };
     use std::io::Write;
     use std::process::{Command, Stdio};
@@ -3734,11 +3730,7 @@ mod tests {
             (d << 3) | (fr << 1) | 1
         };
         let mag = mv_class_base(class) + local as i32 + 1;
-        if sign == 1 {
-            -mag
-        } else {
-            mag
-        }
+        if sign == 1 { -mag } else { mag }
     }
 
     /// Decodes one superblock a [`sb_coeff_inter_frame_tile`] payload wrote,
