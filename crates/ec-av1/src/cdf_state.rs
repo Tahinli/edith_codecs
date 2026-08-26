@@ -146,6 +146,63 @@ pub(crate) struct Cdfs {
     pub intra_tx_type_16: [[u16; 6]; 13],
     /// The DC sign of a chroma coefficient, shared by both chroma sets.
     pub dc_sign_chroma: [[u16; 3]; 3],
+    /// Whether an inter frame's block is coded as intra.
+    pub intra_inter: [[u16; 3]; 4],
+    /// The six binary decisions of an inter block's single reference frame.
+    pub single_ref: [[[u16; 3]; 6]; 3],
+    /// The luma mode of an inter frame's intra block, by its size group.
+    pub y_mode: [[u16; 14]; 4],
+    /// Whether an inter block codes its motion vector explicitly.
+    pub new_mv: [[u16; 3]; 6],
+    /// Whether an inter block's motion vector is the zero vector.
+    pub zero_mv: [[u16; 3]; 2],
+    /// Which reference motion vector candidate an inter block takes.
+    pub ref_mv: [[u16; 3]; 6],
+    /// The dynamic reference list index of a motion vector prediction.
+    pub drl_mode: [[u16; 3]; 3],
+    /// A motion vector's joint (which components change), shared by both
+    /// components since it is read once per vector, not once per component.
+    pub mv_joint: [u16; 5],
+    /// The two motion vector components' own tables: separate owned state,
+    /// since spec 8.3.2 adapts one component without touching the other.
+    pub mv_comp: [MvComponentCdfs; 2],
+}
+
+/// One motion vector component's adapting state (spec 9.4's `Default_Mv_*`,
+/// held once per component so that adapting one leaves the other alone).
+#[derive(Clone)]
+pub(crate) struct MvComponentCdfs {
+    /// The magnitude class.
+    pub class: [u16; 12],
+    /// The integer bit of a small-class magnitude.
+    pub class0_bit: [u16; 3],
+    /// The fractional part of a small-class magnitude, by its integer bit.
+    pub class0_fr: [[u16; 5]; 2],
+    /// The half-pel bit of a small-class magnitude.
+    pub class0_hp: [u16; 3],
+    /// One bit of an above-small-class magnitude, by its position.
+    pub bit: [[u16; 3]; 10],
+    /// The fractional part of an above-small-class magnitude.
+    pub fr: [u16; 5],
+    /// The half-pel bit of an above-small-class magnitude.
+    pub hp: [u16; 3],
+    /// The component's sign.
+    pub sign: [u16; 3],
+}
+
+impl MvComponentCdfs {
+    fn new() -> MvComponentCdfs {
+        MvComponentCdfs {
+            class: cdf::MV_CLASS,
+            class0_bit: cdf::MV_CLASS0_BIT,
+            class0_fr: cdf::MV_CLASS0_FR,
+            class0_hp: cdf::MV_CLASS0_HP,
+            bit: cdf::MV_BIT,
+            fr: cdf::MV_FR,
+            hp: cdf::MV_HP,
+            sign: cdf::MV_SIGN,
+        }
+    }
 }
 
 impl Cdfs {
@@ -199,6 +256,15 @@ impl Cdfs {
             dc_sign_luma: cdf::DC_SIGN_LUMA,
             intra_tx_type_16: cdf::INTRA_TX_TYPE_SET2_16,
             dc_sign_chroma: cdf::DC_SIGN_CHROMA,
+            intra_inter: cdf::INTRA_INTER,
+            single_ref: cdf::SINGLE_REF,
+            y_mode: cdf::Y_MODE,
+            new_mv: cdf::NEW_MV,
+            zero_mv: cdf::ZERO_MV,
+            ref_mv: cdf::REF_MV,
+            drl_mode: cdf::DRL_MODE,
+            mv_joint: cdf::MV_JOINT,
+            mv_comp: [MvComponentCdfs::new(), MvComponentCdfs::new()],
         }
     }
 
@@ -328,5 +394,29 @@ mod tests {
             cdf::EOB_EXTRA_CHROMA_16[2]
         );
         assert_eq!(cdfs.partition_w64[2], cdf::PARTITION_W64[2]);
+        assert_eq!(cdfs.intra_inter, cdf::INTRA_INTER);
+        assert_eq!(cdfs.single_ref, cdf::SINGLE_REF);
+        assert_eq!(cdfs.y_mode, cdf::Y_MODE);
+        assert_eq!(cdfs.new_mv, cdf::NEW_MV);
+        assert_eq!(cdfs.zero_mv, cdf::ZERO_MV);
+        assert_eq!(cdfs.ref_mv, cdf::REF_MV);
+        assert_eq!(cdfs.drl_mode, cdf::DRL_MODE);
+        assert_eq!(cdfs.mv_joint, cdf::MV_JOINT);
+        assert_eq!(cdfs.mv_comp[0].class, cdf::MV_CLASS);
+        assert_eq!(cdfs.mv_comp[1].sign, cdf::MV_SIGN);
+    }
+
+    /// A motion vector's two components are separate owned tables: adapting
+    /// one component's CDFs must not be visible through the other, the same
+    /// hazard the coefficient sets guard against above.
+    #[test]
+    fn the_mv_components_are_separate_and_do_not_share_adaptation() {
+        let mut cdfs = Cdfs::new();
+        cdfs.mv_comp[0].class[0] = 1;
+        cdfs.mv_comp[0].bit[3][0] = 2;
+        assert_ne!(cdfs.mv_comp[1].class[0], 1);
+        assert_ne!(cdfs.mv_comp[1].bit[3][0], 2);
+        assert_eq!(cdfs.mv_comp[1].class[0], cdf::MV_CLASS[0]);
+        assert_eq!(cdfs.mv_comp[1].bit[3][0], cdf::MV_BIT[3][0]);
     }
 }
