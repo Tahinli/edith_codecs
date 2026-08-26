@@ -2171,19 +2171,6 @@ mod tests {
         ffmpeg_decode_sequence(&stream, width, height, 2);
     }
 
-    /// The top-left `width` x `height` region of a decoded picture, for
-    /// comparing against [`Encoded::reconstruction`] (already cropped to
-    /// the same region) when ffmpeg hands back the padded, coded-size one.
-    fn crop_picture(picture: &Picture, width: usize, height: usize) -> Picture {
-        Picture {
-            width,
-            height,
-            y: crop_plane(&picture.y, picture.width, width, height),
-            u: crop_plane(&picture.u, picture.width / 2, width / 2, height / 2),
-            v: crop_plane(&picture.v, picture.width / 2, width / 2, height / 2),
-        }
-    }
-
     /// `ffprobe`'s reported `width,height` for one OBU stream -- the coded
     /// frame size an AV1 decoder allocates, not necessarily the render size
     /// (see [`a_frame_round_trips_at_its_own_size`]).
@@ -2283,6 +2270,14 @@ mod tests {
     /// EC_RNG-per-symbol trace against the same debug decoder found the
     /// bitstream byte-for-byte identical to libaom's across all 51188
     /// symbols of this frame before this bug was found).
+    ///
+    /// Since the frame header started writing the true (unpadded) display
+    /// size into `frame_width`/`frame_height` rather than the padded coded
+    /// size, ffmpeg crops to 854x480 on its own -- decoding at the padded
+    /// 864x480 and cropping ourselves now reads past what ffmpeg actually
+    /// emits (`av1_common_int.h`'s render/upscale path, mirrored by
+    /// `av1_frame_size` on the decode side, crops the loop-filtered picture to
+    /// the header's own size before output).
     #[test]
     fn an_854x480_picture_round_trips_through_its_padding() {
         if !have_ffmpeg() {
@@ -2291,13 +2286,10 @@ mod tests {
         let (width, height) = (854usize, 480usize);
         let picture = test_card(width, height);
         let encoded = encode_key_frame(&picture, 100, 0.5).unwrap();
-        let (padded_width, padded_height) = (
-            width.next_multiple_of(BLOCK),
-            height.next_multiple_of(BLOCK),
-        );
-        let decoded = ffmpeg_decode(&encoded.stream, padded_width, padded_height);
-        let cropped = crop_picture(&decoded, width, height);
-        assert_eq!(cropped.y, encoded.reconstruction.y, "854x480: luma");
+        let decoded = ffmpeg_decode(&encoded.stream, width, height);
+        assert_eq!(decoded.y, encoded.reconstruction.y, "854x480: luma");
+        assert_eq!(decoded.u, encoded.reconstruction.u, "854x480: U");
+        assert_eq!(decoded.v, encoded.reconstruction.v, "854x480: V");
     }
 
     /// `Reach::top_right`/`bottom_left` against a from-scratch transcription
