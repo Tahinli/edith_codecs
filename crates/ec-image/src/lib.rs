@@ -1,4 +1,4 @@
-//! Still-image decoding: PNG, JPEG, WebP and GIF.
+//! Still-image decoding: PNG, JPEG, WebP, GIF and BMP.
 //!
 //! One entry point — [`decode`] over bytes, [`open`] over a path — guesses the
 //! format from the leading bytes and hands back an [`Image`]: dimensions, a
@@ -31,6 +31,7 @@
 // what keeps the code readable against the text it comes from.
 #![allow(clippy::needless_range_loop)]
 
+pub mod bmp;
 pub mod gif;
 pub mod jpeg;
 pub mod png;
@@ -54,6 +55,8 @@ pub enum ImageFormat {
     WebP,
     /// GIF, still or animated (GIF87a and GIF89a).
     Gif,
+    /// Windows BMP (device-independent bitmap).
+    Bmp,
 }
 
 impl ImageFormat {
@@ -69,6 +72,8 @@ impl ImageFormat {
             Some(ImageFormat::WebP)
         } else if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
             Some(ImageFormat::Gif)
+        } else if is_bmp(data) {
+            Some(ImageFormat::Bmp)
         } else {
             None
         }
@@ -81,8 +86,26 @@ impl ImageFormat {
             ImageFormat::Jpeg => "jpg",
             ImageFormat::WebP => "webp",
             ImageFormat::Gif => "gif",
+            ImageFormat::Bmp => "bmp",
         }
     }
+}
+
+/// Whether `data` opens like a BMP.
+///
+/// "BM" is two bytes, which half the files on a disk could start with by
+/// accident, so the guess also asks the file header to agree with itself: the
+/// declared info-header length must be one the format defines, and the pixel
+/// data must start after the headers.
+fn is_bmp(data: &[u8]) -> bool {
+    if !data.starts_with(b"BM") || data.len() < 18 {
+        return false;
+    }
+    let u32_at =
+        |at: usize| u32::from_le_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]]);
+    let offset = u32_at(10) as usize;
+    let info_size = u32_at(14) as usize;
+    matches!(info_size, 12 | 16 | 40 | 52 | 56 | 64 | 108 | 124) && offset >= 14 + info_size
 }
 
 /// Bounds applied before any buffer is sized from a header field.
@@ -349,9 +372,10 @@ pub fn decode_with_limits(data: &[u8], limits: Limits) -> Result<Image> {
         Some(ImageFormat::Jpeg) => jpeg::decode(data, limits),
         Some(ImageFormat::WebP) => webp::decode(data, limits),
         Some(ImageFormat::Gif) => gif::decode(data, limits),
+        Some(ImageFormat::Bmp) => bmp::decode(data, limits),
         None => Err(Error::unsupported(
             "image",
-            "no PNG, JPEG, WebP or GIF signature at the start of the data",
+            "no PNG, JPEG, WebP, GIF or BMP signature at the start of the data",
         )),
     }
 }
@@ -363,9 +387,10 @@ pub fn info(data: &[u8]) -> Result<Info> {
         Some(ImageFormat::Jpeg) => jpeg::info(data),
         Some(ImageFormat::WebP) => webp::info(data),
         Some(ImageFormat::Gif) => gif::info(data),
+        Some(ImageFormat::Bmp) => bmp::info(data),
         None => Err(Error::unsupported(
             "image",
-            "no PNG, JPEG, WebP or GIF signature at the start of the data",
+            "no PNG, JPEG, WebP, GIF or BMP signature at the start of the data",
         )),
     }
 }
