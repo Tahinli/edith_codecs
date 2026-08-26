@@ -34,7 +34,22 @@ const VERT_ALIKE: [usize; 6] = [2, PARTITION_SPLIT, 4, 6, 7, 9];
 const HORZ_ALIKE: [usize; 6] = [1, PARTITION_SPLIT, 4, 5, 6, 8];
 
 /// Mode-info units across a 32x32 block.
-const BLOCK_MI: u32 = SB_MI / 2;
+pub(crate) const BLOCK_MI: u32 = SB_MI / 2;
+
+/// Mode-info units across a 16x16 block, the smallest this crate's key-frame
+/// writer codes.
+pub(crate) const SUB_MI: u32 = BLOCK_MI / 2;
+
+/// spec `decode_partition`'s `hasRows`/`hasCols` (5.11.4), recomputed at
+/// whichever block size is asking: a block of `side_mi` mode-info units at mi
+/// position `pos` may be coded unsplit (its own `PARTITION_NONE`) only when
+/// this is true in both directions -- the frame's *true* size can put the
+/// boundary inside a superblock, a 32x32 quadrant or (since this writer's
+/// smallest block is 16x16) even a leaf, and each level must ask again with
+/// its own half, not just once at the superblock.
+pub(crate) fn has_half(pos: u32, side_mi: u32, bound: u32) -> bool {
+    pos + side_mi / 2 < bound
+}
 
 /// The number of 32x32 block columns/rows a frame whose *true* (unpadded)
 /// size gives `mi_cols`/`mi_rows` is coded over: every block whose mi origin
@@ -808,8 +823,25 @@ pub fn sb_coeff_key_frame_tile(
                     for (quadrant, (r, c)) in quadrants.iter().zip(quadrant_positions) {
                         let at = (r * 2, c * 2);
                         let ctx = neighbours.partition_ctx(at, BLOCK);
+                        // Recomputed at this 32x32 block's own half (spec
+                        // `decode_partition`, called again at every size, not
+                        // just once for the superblock): the true frame edge
+                        // can fall inside this quadrant even when the
+                        // superblock it sits in was itself whole or safely
+                        // split above.
+                        let (has_cols32, has_rows32) = (
+                            has_half(c as u32 * BLOCK_MI, BLOCK_MI, mi_cols),
+                            has_half(r as u32 * BLOCK_MI, BLOCK_MI, mi_rows),
+                        );
                         match quadrant {
                             Quadrant::Whole(block) => {
+                                if !has_cols32 || !has_rows32 {
+                                    return Err(Error::unsupported(
+                                        "AV1 tile",
+                                        "a 32x32 block that is half outside the true frame \
+                                         cannot be left whole",
+                                    ));
+                                }
                                 enc.symbol(PARTITION_NONE, &mut cdfs.partition_w32[ctx]);
                                 let grids = [
                                     level_grid(&block.luma, TX32)?,
@@ -830,15 +862,72 @@ pub fn sb_coeff_key_frame_tile(
                                 );
                             }
                             Quadrant::Split(blocks) => {
-                                enc.symbol(PARTITION_SPLIT, &mut cdfs.partition_w32[ctx]);
-                                if blocks.len() != 4 {
+                                // The 16x16 sub-blocks this quadrant's split
+                                // carries: only those whose own mi origin is
+                                // inside the true frame (spec `decode_partition`'s
+                                // `r >= MiRows || c >= MiCols` early return),
+                                // which need not be all four when the true
+                                // edge falls inside this quadrant.
+                                let sub_positions: Vec<(usize, usize)> = (0..4)
+                                    .map(|i| (r * 2 + i / 2, c * 2 + i % 2))
+                                    .filter(|&(sr, sc)| {
+                                        (sr as u32) * SUB_MI < mi_rows
+                                            && (sc as u32) * SUB_MI < mi_cols
+                                    })
+                                    .collect();
+                                if blocks.len() != sub_positions.len() {
                                     return Err(Error::unsupported(
                                         "AV1 tile",
-                                        "a 32x32 block that is split carries four 16x16 blocks",
+                                        "a split 32x32 block needs one 16x16 entry per \
+                                         sub-block inside the true frame",
                                     ));
                                 }
-                                for (i, block) in blocks.iter().enumerate() {
-                                    let at = (at.0 + i / 2, at.1 + i % 2);
+                                // Same three-way spec signaling as the
+                                // superblock level above, recomputed at this
+                                // block's own half: a full alphabet symbol
+                                // only when both halves are inside, a single
+                                // gathered bit when just one is, and nothing
+                                // at all (SPLIT is inferred) when neither is.
+                                match (has_cols32, has_rows32) {
+                                    (true, true) => {
+                                        enc.symbol(PARTITION_SPLIT, &mut cdfs.partition_w32[ctx]);
+                                    }
+                                    (true, false) => {
+                                        enc.symbol_fixed(
+                                            1,
+                                            &gather(&cdfs.partition_w32[ctx], VERT_ALIKE),
+                                        );
+                                    }
+                                    (false, true) => {
+                                        enc.symbol_fixed(
+                                            1,
+                                            &gather(&cdfs.partition_w32[ctx], HORZ_ALIKE),
+                                        );
+                                    }
+                                    (false, false) => {}
+                                }
+                                for (block, (sr, sc)) in blocks.iter().zip(sub_positions) {
+                                    // A 16x16 leaf's own hasRows/hasCols: this
+                                    // writer has no smaller partition than
+                                    // 16x16 (no 8x8 or rectangular transform),
+                                    // so a leaf the true edge itself cuts
+                                    // through -- legal in the spec only via a
+                                    // `PARTITION_HORZ`/`VERT` this writer does
+                                    // not code -- is refused rather than
+                                    // silently miscoded.
+                                    let (has_cols16, has_rows16) = (
+                                        has_half(sc as u32 * SUB_MI, SUB_MI, mi_cols),
+                                        has_half(sr as u32 * SUB_MI, SUB_MI, mi_rows),
+                                    );
+                                    if !has_cols16 || !has_rows16 {
+                                        return Err(Error::unsupported(
+                                            "AV1 tile",
+                                            "a 16x16 block the true frame edge cuts through \
+                                             needs a rectangular transform this writer does \
+                                             not code yet",
+                                        ));
+                                    }
+                                    let at = (sr, sc);
                                     let ctx = neighbours.partition_ctx(at, SUB);
                                     enc.symbol(PARTITION_NONE, &mut cdfs.partition_w16[ctx]);
                                     let grids = [
@@ -3133,6 +3222,44 @@ mod tests {
                 let name = format!("block ({block_row},{block_col})");
                 let block = block_at(&rows, block_row, block_col);
                 if (block_row * 3 + block_col) % 2 == 0 {
+                    assert_falls_across(&block, &name);
+                } else {
+                    assert_falls_down(&block, &name);
+                }
+            }
+        }
+    }
+
+    /// The transpose of [`a_frame_that_is_not_a_whole_number_of_superblocks_codes_every_block`]:
+    /// an odd number of 32x32 block *rows* (superblock hangs off the
+    /// *bottom*, `has_cols=true, has_rows=false`) rather than an odd number of
+    /// columns (hangs off the *right*, `has_cols=false, has_rows=true`) --
+    /// the two halves of the `(has_cols, has_rows)` match in
+    /// `sb_coeff_key_frame_tile` gather from different tables
+    /// (`VERT_ALIKE`/`HORZ_ALIKE`), and only the right-hand-edge direction had
+    /// a real-decoder test before this one.
+    #[test]
+    fn a_frame_that_hangs_off_the_bottom_codes_every_block() {
+        if !have_ffmpeg() {
+            eprintln!("SKIP a_frame_that_hangs_off_the_bottom_codes_every_block: no ffmpeg");
+            return;
+        }
+        let blocks: Vec<BlockCoeffs> = (0..6)
+            .map(|i| {
+                let (row, col) = if i % 2 == 0 { (0, 1) } else { (1, 0) };
+                BlockCoeffs::from(vec![Coeff {
+                    row,
+                    col,
+                    level: 12,
+                }])
+            })
+            .collect();
+        let rows = decode_luma_at(64, 96, &blocks);
+        for block_row in 0..3 {
+            for block_col in 0..2 {
+                let name = format!("block ({block_row},{block_col})");
+                let block = block_at(&rows, block_row, block_col);
+                if (block_row * 2 + block_col) % 2 == 0 {
                     assert_falls_across(&block, &name);
                 } else {
                     assert_falls_down(&block, &name);
