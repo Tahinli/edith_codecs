@@ -197,13 +197,33 @@ fn an_animated_webp_survives_mutation() {
     eprintln!("webp-animation: {ROUNDS} mutations, {decoded} still decoded");
 }
 
+/// BMP sizes three separate things from header fields -- a palette, a row
+/// stride and, for the run-length compressions, a decoded row buffer -- so a
+/// mutation can put any two of them in disagreement.
+#[test]
+fn bmp_survives_mutation() {
+    sweep("bmp", "tiny.bmp");
+}
+
+/// The run-length path is the one that writes at a position the *file* chooses
+/// (delta codes move the cursor), so it gets its own seed.
+#[test]
+fn a_run_length_bmp_survives_mutation() {
+    sweep("bmp-rle", "rle8.bmp");
+}
+
 #[test]
 fn arbitrary_bytes_behind_a_signature_are_refused_not_believed() {
-    let signatures: [&[u8]; 4] = [
+    let signatures: [&[u8]; 5] = [
         &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a],
         &[0xff, 0xd8, 0xff, 0xe0],
         b"RIFF\x40\x00\x00\x00WEBPVP8 ",
         b"GIF89a",
+        // "BM" alone is two bytes anything could start with, so the guess also
+        // asks the file header to agree with itself: this prefix declares a
+        // 40-byte info header and pixels at 54, which is what makes the bytes
+        // behind it reach the decoder at all.
+        b"BM\x00\x10\x00\x00\x00\x00\x00\x00\x36\x00\x00\x00\x28\x00\x00\x00",
     ];
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
     for signature in signatures {
