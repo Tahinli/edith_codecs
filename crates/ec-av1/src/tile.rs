@@ -688,19 +688,38 @@ impl Neighbours {
             self.left_side[r + cell] = side;
         }
         let (mi_r, mi_c, side_mi) = (r * (SUB / MI), c * (SUB / MI), side / MI);
-        let valid_h = side_mi.min(self.mi_rows.saturating_sub(mi_r));
-        let valid_w = side_mi.min(self.mi_cols.saturating_sub(mi_c));
+        // libaom rounds the luma edge up to the plane's own 4x4 unit before
+        // clamping a subsampled plane (`ROUND_POWER_OF_TWO(max_blocks_high,
+        // subsampling_y)` in av1_write_intra_coeffs_mb, encodetxb.c:456-459):
+        // a chroma 4x4 unit straddling the true luma edge is still whole in
+        // chroma's own halved grid, so it stays valid one luma-mi row/col
+        // past where luma's own edge falls when that edge is odd.
+        let round_up_even = |n: usize| n.div_ceil(2) * 2;
+        let bound_h = [
+            self.mi_rows,
+            round_up_even(self.mi_rows),
+            round_up_even(self.mi_rows),
+        ];
+        let bound_w = [
+            self.mi_cols,
+            round_up_even(self.mi_cols),
+            round_up_even(self.mi_cols),
+        ];
         for cell in 0..side_mi {
-            self.left[mi_r + cell] = if cell < valid_h {
-                states
-            } else {
-                Default::default()
-            };
-            self.above[mi_c + cell] = if cell < valid_w {
-                states
-            } else {
-                Default::default()
-            };
+            self.left[mi_r + cell] = std::array::from_fn(|plane| {
+                if cell < side_mi.min(bound_h[plane].saturating_sub(mi_r)) {
+                    states[plane]
+                } else {
+                    Default::default()
+                }
+            });
+            self.above[mi_c + cell] = std::array::from_fn(|plane| {
+                if cell < side_mi.min(bound_w[plane].saturating_sub(mi_c)) {
+                    states[plane]
+                } else {
+                    Default::default()
+                }
+            });
         }
     }
 
