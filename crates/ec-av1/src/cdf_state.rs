@@ -205,11 +205,24 @@ impl MvComponentCdfs {
     }
 }
 
+/// Picks one of the four q-context variants of a coefficient table
+/// (`crate::cdf`'s `_Q0`/`_Q1`/plain/`_Q3` constants), `q_ctx` already reduced
+/// to 0..=3 by the caller.
+pub(crate) fn pick<T: Copy>(q_ctx: usize, q0: T, q1: T, q2: T, q3: T) -> T {
+    match q_ctx {
+        0 => q0,
+        1 => q1,
+        2 => q2,
+        _ => q3,
+    }
+}
+
 impl Cdfs {
     /// The defaults a key frame starts from (spec 8.4, `init_coeff_cdfs` and
-    /// `init_non_coeff_cdfs`), for the one quantizer context whose tables this
-    /// crate carries.
-    pub fn new() -> Cdfs {
+    /// `init_non_coeff_cdfs`), for coefficient q-context `q_ctx` (0..=3, spec
+    /// 8.3.2's `Get_Qctx`). The non-coefficient tables do not vary with the
+    /// quantizer, so they are the same for every `q_ctx`.
+    pub fn new(q_ctx: usize) -> Cdfs {
         Cdfs {
             partition_w64: cdf::PARTITION_W64,
             partition_w32: cdf::PARTITION_W32,
@@ -218,41 +231,245 @@ impl Cdfs {
             uv_mode_no_cfl: cdf::UV_MODE_NO_CFL,
             uv_mode_cfl: cdf::UV_MODE_CFL,
             angle_delta: cdf::ANGLE_DELTA,
-            txb_skip_luma_16: [cdf::TXB_SKIP_LUMA_16],
-            txb_skip_chroma_8: cdf::TXB_SKIP_CHROMA_8,
-            eob_pt_256_luma: cdf::EOB_PT_256_LUMA,
-            eob_pt_64_chroma: cdf::EOB_PT_64_CHROMA,
-            eob_extra_luma_16: cdf::EOB_EXTRA_LUMA_16,
-            eob_extra_chroma_8: cdf::EOB_EXTRA_CHROMA_8,
-            base_luma_16: cdf::COEFF_BASE_LUMA_16,
-            base_chroma_8: cdf::COEFF_BASE_CHROMA_8,
-            base_eob_luma_16: cdf::COEFF_BASE_EOB_LUMA_16,
-            base_eob_chroma_8: cdf::COEFF_BASE_EOB_CHROMA_8,
-            br_luma_16: cdf::COEFF_BR_LUMA_16,
-            br_chroma_8: cdf::COEFF_BR_CHROMA_8,
+            txb_skip_luma_16: [pick(
+                q_ctx,
+                cdf::TXB_SKIP_LUMA_16_Q0,
+                cdf::TXB_SKIP_LUMA_16_Q1,
+                cdf::TXB_SKIP_LUMA_16,
+                cdf::TXB_SKIP_LUMA_16_Q3,
+            )],
+            txb_skip_chroma_8: pick(
+                q_ctx,
+                cdf::TXB_SKIP_CHROMA_8_Q0,
+                cdf::TXB_SKIP_CHROMA_8_Q1,
+                cdf::TXB_SKIP_CHROMA_8,
+                cdf::TXB_SKIP_CHROMA_8_Q3,
+            ),
+            eob_pt_256_luma: pick(
+                q_ctx,
+                cdf::EOB_PT_256_LUMA_Q0,
+                cdf::EOB_PT_256_LUMA_Q1,
+                cdf::EOB_PT_256_LUMA,
+                cdf::EOB_PT_256_LUMA_Q3,
+            ),
+            eob_pt_64_chroma: pick(
+                q_ctx,
+                cdf::EOB_PT_64_CHROMA_Q0,
+                cdf::EOB_PT_64_CHROMA_Q1,
+                cdf::EOB_PT_64_CHROMA,
+                cdf::EOB_PT_64_CHROMA_Q3,
+            ),
+            eob_extra_luma_16: pick(
+                q_ctx,
+                cdf::EOB_EXTRA_LUMA_16_Q0,
+                cdf::EOB_EXTRA_LUMA_16_Q1,
+                cdf::EOB_EXTRA_LUMA_16,
+                cdf::EOB_EXTRA_LUMA_16_Q3,
+            ),
+            eob_extra_chroma_8: pick(
+                q_ctx,
+                cdf::EOB_EXTRA_CHROMA_8_Q0,
+                cdf::EOB_EXTRA_CHROMA_8_Q1,
+                cdf::EOB_EXTRA_CHROMA_8,
+                cdf::EOB_EXTRA_CHROMA_8_Q3,
+            ),
+            base_luma_16: pick(
+                q_ctx,
+                cdf::COEFF_BASE_LUMA_16_Q0,
+                cdf::COEFF_BASE_LUMA_16_Q1,
+                cdf::COEFF_BASE_LUMA_16,
+                cdf::COEFF_BASE_LUMA_16_Q3,
+            ),
+            base_chroma_8: pick(
+                q_ctx,
+                cdf::COEFF_BASE_CHROMA_8_Q0,
+                cdf::COEFF_BASE_CHROMA_8_Q1,
+                cdf::COEFF_BASE_CHROMA_8,
+                cdf::COEFF_BASE_CHROMA_8_Q3,
+            ),
+            base_eob_luma_16: pick(
+                q_ctx,
+                cdf::COEFF_BASE_EOB_LUMA_16_Q0,
+                cdf::COEFF_BASE_EOB_LUMA_16_Q1,
+                cdf::COEFF_BASE_EOB_LUMA_16,
+                cdf::COEFF_BASE_EOB_LUMA_16_Q3,
+            ),
+            base_eob_chroma_8: pick(
+                q_ctx,
+                cdf::COEFF_BASE_EOB_CHROMA_8_Q0,
+                cdf::COEFF_BASE_EOB_CHROMA_8_Q1,
+                cdf::COEFF_BASE_EOB_CHROMA_8,
+                cdf::COEFF_BASE_EOB_CHROMA_8_Q3,
+            ),
+            br_luma_16: pick(
+                q_ctx,
+                cdf::COEFF_BR_LUMA_16_Q0,
+                cdf::COEFF_BR_LUMA_16_Q1,
+                cdf::COEFF_BR_LUMA_16,
+                cdf::COEFF_BR_LUMA_16_Q3,
+            ),
+            br_chroma_8: pick(
+                q_ctx,
+                cdf::COEFF_BR_CHROMA_8_Q0,
+                cdf::COEFF_BR_CHROMA_8_Q1,
+                cdf::COEFF_BR_CHROMA_8,
+                cdf::COEFF_BR_CHROMA_8_Q3,
+            ),
             partition_w16: cdf::PARTITION_W16,
-            txb_skip_luma_32: [cdf::TXB_SKIP_LUMA_32],
-            txb_skip_luma_64: [cdf::TXB_SKIP_LUMA_64],
-            txb_skip_chroma_16: cdf::TXB_SKIP_CHROMA_16,
-            txb_skip_chroma_32: cdf::TXB_SKIP_CHROMA_32,
-            eob_pt_1024_luma: cdf::EOB_PT_1024_LUMA,
-            eob_pt_1024_chroma: cdf::EOB_PT_1024_CHROMA,
-            eob_pt_256_chroma: cdf::EOB_PT_256_CHROMA,
-            eob_extra_luma_32: cdf::EOB_EXTRA_LUMA_32,
-            eob_extra_luma_64: cdf::EOB_EXTRA_LUMA_64,
-            eob_extra_chroma_16: cdf::EOB_EXTRA_CHROMA_16,
-            eob_extra_chroma_32: cdf::EOB_EXTRA_CHROMA_32,
-            base_luma_32: cdf::COEFF_BASE_LUMA_32,
-            base_luma_64: cdf::COEFF_BASE_LUMA_64,
-            base_chroma_16: cdf::COEFF_BASE_CHROMA_16,
-            base_chroma_32: cdf::COEFF_BASE_CHROMA_32,
-            base_eob_luma_32: cdf::COEFF_BASE_EOB_LUMA_32,
-            base_eob_luma_64: cdf::COEFF_BASE_EOB_LUMA_64,
-            base_eob_chroma_16: cdf::COEFF_BASE_EOB_CHROMA_16,
-            base_eob_chroma_32: cdf::COEFF_BASE_EOB_CHROMA_32,
-            br_luma_32: cdf::COEFF_BR_LUMA_32,
-            br_chroma_16: cdf::COEFF_BR_CHROMA_16,
-            br_chroma_32: cdf::COEFF_BR_CHROMA_32,
+            txb_skip_luma_32: [pick(
+                q_ctx,
+                cdf::TXB_SKIP_LUMA_32_Q0,
+                cdf::TXB_SKIP_LUMA_32_Q1,
+                cdf::TXB_SKIP_LUMA_32,
+                cdf::TXB_SKIP_LUMA_32_Q3,
+            )],
+            txb_skip_luma_64: [pick(
+                q_ctx,
+                cdf::TXB_SKIP_LUMA_64_Q0,
+                cdf::TXB_SKIP_LUMA_64_Q1,
+                cdf::TXB_SKIP_LUMA_64,
+                cdf::TXB_SKIP_LUMA_64_Q3,
+            )],
+            txb_skip_chroma_16: pick(
+                q_ctx,
+                cdf::TXB_SKIP_CHROMA_16_Q0,
+                cdf::TXB_SKIP_CHROMA_16_Q1,
+                cdf::TXB_SKIP_CHROMA_16,
+                cdf::TXB_SKIP_CHROMA_16_Q3,
+            ),
+            txb_skip_chroma_32: pick(
+                q_ctx,
+                cdf::TXB_SKIP_CHROMA_32_Q0,
+                cdf::TXB_SKIP_CHROMA_32_Q1,
+                cdf::TXB_SKIP_CHROMA_32,
+                cdf::TXB_SKIP_CHROMA_32_Q3,
+            ),
+            eob_pt_1024_luma: pick(
+                q_ctx,
+                cdf::EOB_PT_1024_LUMA_Q0,
+                cdf::EOB_PT_1024_LUMA_Q1,
+                cdf::EOB_PT_1024_LUMA,
+                cdf::EOB_PT_1024_LUMA_Q3,
+            ),
+            eob_pt_1024_chroma: pick(
+                q_ctx,
+                cdf::EOB_PT_1024_CHROMA_Q0,
+                cdf::EOB_PT_1024_CHROMA_Q1,
+                cdf::EOB_PT_1024_CHROMA,
+                cdf::EOB_PT_1024_CHROMA_Q3,
+            ),
+            eob_pt_256_chroma: pick(
+                q_ctx,
+                cdf::EOB_PT_256_CHROMA_Q0,
+                cdf::EOB_PT_256_CHROMA_Q1,
+                cdf::EOB_PT_256_CHROMA,
+                cdf::EOB_PT_256_CHROMA_Q3,
+            ),
+            eob_extra_luma_32: pick(
+                q_ctx,
+                cdf::EOB_EXTRA_LUMA_32_Q0,
+                cdf::EOB_EXTRA_LUMA_32_Q1,
+                cdf::EOB_EXTRA_LUMA_32,
+                cdf::EOB_EXTRA_LUMA_32_Q3,
+            ),
+            eob_extra_luma_64: pick(
+                q_ctx,
+                cdf::EOB_EXTRA_LUMA_64_Q0,
+                cdf::EOB_EXTRA_LUMA_64_Q1,
+                cdf::EOB_EXTRA_LUMA_64,
+                cdf::EOB_EXTRA_LUMA_64_Q3,
+            ),
+            eob_extra_chroma_16: pick(
+                q_ctx,
+                cdf::EOB_EXTRA_CHROMA_16_Q0,
+                cdf::EOB_EXTRA_CHROMA_16_Q1,
+                cdf::EOB_EXTRA_CHROMA_16,
+                cdf::EOB_EXTRA_CHROMA_16_Q3,
+            ),
+            eob_extra_chroma_32: pick(
+                q_ctx,
+                cdf::EOB_EXTRA_CHROMA_32_Q0,
+                cdf::EOB_EXTRA_CHROMA_32_Q1,
+                cdf::EOB_EXTRA_CHROMA_32,
+                cdf::EOB_EXTRA_CHROMA_32_Q3,
+            ),
+            base_luma_32: pick(
+                q_ctx,
+                cdf::COEFF_BASE_LUMA_32_Q0,
+                cdf::COEFF_BASE_LUMA_32_Q1,
+                cdf::COEFF_BASE_LUMA_32,
+                cdf::COEFF_BASE_LUMA_32_Q3,
+            ),
+            base_luma_64: pick(
+                q_ctx,
+                cdf::COEFF_BASE_LUMA_64_Q0,
+                cdf::COEFF_BASE_LUMA_64_Q1,
+                cdf::COEFF_BASE_LUMA_64,
+                cdf::COEFF_BASE_LUMA_64_Q3,
+            ),
+            base_chroma_16: pick(
+                q_ctx,
+                cdf::COEFF_BASE_CHROMA_16_Q0,
+                cdf::COEFF_BASE_CHROMA_16_Q1,
+                cdf::COEFF_BASE_CHROMA_16,
+                cdf::COEFF_BASE_CHROMA_16_Q3,
+            ),
+            base_chroma_32: pick(
+                q_ctx,
+                cdf::COEFF_BASE_CHROMA_32_Q0,
+                cdf::COEFF_BASE_CHROMA_32_Q1,
+                cdf::COEFF_BASE_CHROMA_32,
+                cdf::COEFF_BASE_CHROMA_32_Q3,
+            ),
+            base_eob_luma_32: pick(
+                q_ctx,
+                cdf::COEFF_BASE_EOB_LUMA_32_Q0,
+                cdf::COEFF_BASE_EOB_LUMA_32_Q1,
+                cdf::COEFF_BASE_EOB_LUMA_32,
+                cdf::COEFF_BASE_EOB_LUMA_32_Q3,
+            ),
+            base_eob_luma_64: pick(
+                q_ctx,
+                cdf::COEFF_BASE_EOB_LUMA_64_Q0,
+                cdf::COEFF_BASE_EOB_LUMA_64_Q1,
+                cdf::COEFF_BASE_EOB_LUMA_64,
+                cdf::COEFF_BASE_EOB_LUMA_64_Q3,
+            ),
+            base_eob_chroma_16: pick(
+                q_ctx,
+                cdf::COEFF_BASE_EOB_CHROMA_16_Q0,
+                cdf::COEFF_BASE_EOB_CHROMA_16_Q1,
+                cdf::COEFF_BASE_EOB_CHROMA_16,
+                cdf::COEFF_BASE_EOB_CHROMA_16_Q3,
+            ),
+            base_eob_chroma_32: pick(
+                q_ctx,
+                cdf::COEFF_BASE_EOB_CHROMA_32_Q0,
+                cdf::COEFF_BASE_EOB_CHROMA_32_Q1,
+                cdf::COEFF_BASE_EOB_CHROMA_32,
+                cdf::COEFF_BASE_EOB_CHROMA_32_Q3,
+            ),
+            br_luma_32: pick(
+                q_ctx,
+                cdf::COEFF_BR_LUMA_32_Q0,
+                cdf::COEFF_BR_LUMA_32_Q1,
+                cdf::COEFF_BR_LUMA_32,
+                cdf::COEFF_BR_LUMA_32_Q3,
+            ),
+            br_chroma_16: pick(
+                q_ctx,
+                cdf::COEFF_BR_CHROMA_16_Q0,
+                cdf::COEFF_BR_CHROMA_16_Q1,
+                cdf::COEFF_BR_CHROMA_16,
+                cdf::COEFF_BR_CHROMA_16_Q3,
+            ),
+            br_chroma_32: pick(
+                q_ctx,
+                cdf::COEFF_BR_CHROMA_32_Q0,
+                cdf::COEFF_BR_CHROMA_32_Q1,
+                cdf::COEFF_BR_CHROMA_32,
+                cdf::COEFF_BR_CHROMA_32_Q3,
+            ),
             dc_sign_luma: cdf::DC_SIGN_LUMA,
             intra_tx_type_16: cdf::INTRA_TX_TYPE_SET2_16,
             dc_sign_chroma: cdf::DC_SIGN_CHROMA,
@@ -351,7 +568,7 @@ mod tests {
     /// was coded.
     #[test]
     fn the_two_luma_sets_share_the_base_range_table() {
-        let mut cdfs = Cdfs::new();
+        let mut cdfs = Cdfs::new(2);
         cdfs.txb(TxbSet::Luma64, 0).br[0][0] = 1;
         assert_eq!(cdfs.txb(TxbSet::Luma32, 0).br[0][0], 1);
     }
@@ -360,7 +577,7 @@ mod tests {
     /// what a luma block adapts must not reach the chroma one.
     #[test]
     fn the_sign_tables_are_shared_within_a_plane_type_and_not_across() {
-        let mut cdfs = Cdfs::new();
+        let mut cdfs = Cdfs::new(2);
         cdfs.txb(TxbSet::Luma32, 0).dc_sign[1][0] = 1;
         cdfs.txb(TxbSet::Chroma16, 0).dc_sign[2][0] = 2;
         assert_eq!(cdfs.txb(TxbSet::Luma64, 0).dc_sign[1][0], 1);
@@ -374,7 +591,7 @@ mod tests {
     /// further along.
     #[test]
     fn the_luma_end_of_block_table_is_shared_and_chromas_is_not() {
-        let mut cdfs = Cdfs::new();
+        let mut cdfs = Cdfs::new(2);
         cdfs.txb(TxbSet::Luma32, 0).eob_pt[0] = 7;
         assert_eq!(cdfs.txb(TxbSet::Luma64, 0).eob_pt[0], 7);
         assert_ne!(cdfs.txb(TxbSet::Chroma32, 0).eob_pt[0], 7);
@@ -384,7 +601,7 @@ mod tests {
     /// writes exactly what a non-adapting one does.
     #[test]
     fn the_state_starts_at_the_defaults() {
-        let mut cdfs = Cdfs::new();
+        let mut cdfs = Cdfs::new(2);
         assert_eq!(
             cdfs.txb(TxbSet::Luma32, 0).base[3],
             cdf::COEFF_BASE_LUMA_32[3]
@@ -411,7 +628,7 @@ mod tests {
     /// hazard the coefficient sets guard against above.
     #[test]
     fn the_mv_components_are_separate_and_do_not_share_adaptation() {
-        let mut cdfs = Cdfs::new();
+        let mut cdfs = Cdfs::new(2);
         cdfs.mv_comp[0].class[0] = 1;
         cdfs.mv_comp[0].bit[3][0] = 2;
         assert_ne!(cdfs.mv_comp[1].class[0], 1);
