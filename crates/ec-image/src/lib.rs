@@ -392,6 +392,9 @@ pub struct AnimationFrame {
 pub fn decode_animation(data: &[u8]) -> Result<Vec<AnimationFrame>> {
     match ImageFormat::guess(data) {
         Some(ImageFormat::Gif) => gif::decode_animation(data, Limits::default()),
+        Some(ImageFormat::WebP) if webp::is_animated(data) => {
+            webp::decode_frames(data, Limits::default())
+        }
         _ => Ok(vec![AnimationFrame {
             image: decode(data)?,
             delay_num: 0,

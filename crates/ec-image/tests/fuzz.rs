@@ -169,6 +169,34 @@ fn a_gif_animation_survives_mutation() {
     eprintln!("gif-animation: {ROUNDS} mutations, {decoded} still decoded");
 }
 
+/// The WebP animation path parses its own ANMF headers and composites onto a
+/// canvas sized by a different chunk, so a mutation can make the two disagree.
+#[test]
+fn an_animated_webp_survives_mutation() {
+    let Ok(seed) = std::fs::read(fixtures().join("anim-alpha.webp")) else {
+        eprintln!("skipped: fixtures/stills not generated; run scripts/gen-still-fixtures.sh");
+        return;
+    };
+    let mut rng = Rng(0x2545_f491_4f6c_dd1d ^ 0x5eed);
+    let mut decoded = 0usize;
+    for round in 0..ROUNDS {
+        let head = if round % 2 == 0 { Some(48) } else { None };
+        let data = mutate(&mut rng, &seed, head);
+        if let Ok(frames) = ec_image::decode_animation(&data) {
+            decoded += 1;
+            for frame in &frames {
+                let image = &frame.image;
+                assert_eq!(
+                    image.to_rgba8().len(),
+                    (image.width as usize) * (image.height as usize) * 4,
+                    "webp-animation round {round}: buffer does not match the dimensions"
+                );
+            }
+        }
+    }
+    eprintln!("webp-animation: {ROUNDS} mutations, {decoded} still decoded");
+}
+
 #[test]
 fn arbitrary_bytes_behind_a_signature_are_refused_not_believed() {
     let signatures: [&[u8]; 4] = [
