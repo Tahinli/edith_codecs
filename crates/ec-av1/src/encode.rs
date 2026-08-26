@@ -506,12 +506,34 @@ impl Plane<'_> {
         side: usize,
         reach: Reach,
     ) -> (Option<Vec<u8>>, Option<Vec<u8>>, Option<u8>) {
-        let across = (x + if reach.above_right { 2 * side } else { side }).min(self.true_width);
-        let down = (y + if reach.below_left { 2 * side } else { side }).min(self.true_height);
-        // `across`/`down` can fall at or below `x`/`y` for a block whose own
-        // origin already sits past the true edge -- only reachable through a
-        // partition trial priced for comparison on a split this frame's
-        // straddling quadrant will go on to refuse (see
+        // A block's own edge (no `reach`) reads samples reconstructed as part
+        // of *some* legally-coded block, whole or not, even where that
+        // block's own extent straddles the true frame edge -- `has_half`
+        // (spec `hasRows`/`hasCols`) lets a whole block stand there, and its
+        // full extent gets a real transform, not a garbage tail, so this
+        // reads no further than the padded coding surface. Only a `reach`
+        // extension crosses into a block that may never be coded at all past
+        // the true edge, so only it clamps to the true bound (`mi_cols`/
+        // `mi_rows` * 4), replicating past it same as spec 7.11.2.2's
+        // `aboveLimit`/`leftLimit` clamp.
+        let across = if reach.above_right {
+            (x + 2 * side)
+                .min(self.width)
+                .min(self.true_width.max(x + side))
+        } else {
+            (x + side).min(self.width)
+        };
+        let down = if reach.below_left {
+            (y + 2 * side)
+                .min(self.height)
+                .min(self.true_height.max(y + side))
+        } else {
+            (y + side).min(self.height)
+        };
+        // `across`/`down` can still fall at or below `x`/`y` for a sub-block
+        // whose own origin already sits past the true edge -- only reachable
+        // through a partition trial priced for comparison on a split this
+        // frame's straddling quadrant will go on to refuse (see
         // `a_picture_off_the_block_grid_is_refused`), never through a block
         // this encoder actually commits. Such a block has no true-edge
         // samples above or left of it at all, same as `y == 0`/`x == 0`.
