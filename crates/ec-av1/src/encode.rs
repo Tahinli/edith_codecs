@@ -379,7 +379,11 @@ pub(crate) fn key_frame_headers_colour(
         enable_ref_frame_mvs: false,
         film_grain_params_present: false,
     };
-    let (mi_cols, mi_rows) = (w / 4, h / 4);
+    // spec `compute_image_size` (5.9.15): MiCols/MiRows come from the frame's
+    // own (true, unpadded) width and height, not from any block-grid
+    // alignment — a decoder derives these straight from `frame_width`/
+    // `frame_height` below, so this must match it exactly.
+    let (mi_cols, mi_rows) = (2 * ((w + 7) >> 3), 2 * ((h + 7) >> 3));
     let header = FrameHeader {
         frame_type: FrameType::Key,
         frame_is_intra: true,
@@ -1063,8 +1067,14 @@ pub(crate) fn encode_key_frame_inner(
             format!("intra mode {bad} is not one the encoder predicts"),
         ));
     }
-    let (seq, mut header) =
-        key_frame_headers_colour(picture.width, picture.height, base_q_idx, color_config)?;
+    // The header carries the frame's true (unpadded) size as `frame_width`/
+    // `frame_height` -- what a decoder actually crops to -- with `mi_cols`/
+    // `mi_rows` derived from that same true size (spec `compute_image_size`).
+    // `render_width`/`render_height` come out equal to it too, so
+    // `render_and_frame_size_different` is false and no render_size bits are
+    // written, mirroring libaom/rav1e: the padded `picture` below is only the
+    // internal coding surface, never what the header names.
+    let (seq, mut header) = key_frame_headers_colour(render.0, render.1, base_q_idx, color_config)?;
     header.render_width = render.0 as u32;
     header.render_height = render.1 as u32;
 
@@ -1099,7 +1109,14 @@ pub(crate) fn encode_key_frame_inner(
         modes,
     };
 
-    let (cols, rows) = (picture.width / BLOCK, picture.height / BLOCK);
+    // The block grid this frame is coded over: [`crate::tile::block_grid`]'s
+    // ceiling of the header's own (true-size-derived) `mi_cols`/`mi_rows`,
+    // which may be fewer columns/rows than the padded picture has room for
+    // -- a block whose origin sits past the true bound is not coded at all,
+    // matching what a decoder derives from `frame_width`/`frame_height` and
+    // so never visits either.
+    let (cols, rows) = crate::tile::block_grid(header.mi_cols, header.mi_rows);
+    let (cols, rows) = (cols as usize, rows as usize);
     // The luma mode of the block above and of the block to the left, which is
     // what picks the CDF the next block's mode is coded against -- the same
     // bookkeeping the tile writer keeps, so that the search is costing the
@@ -2186,23 +2203,18 @@ mod tests {
                 (width, height),
                 "{width}x{height}: reconstruction is cropped to the picture's own size"
             );
-            let (padded_width, padded_height) = (
-                width.next_multiple_of(BLOCK),
-                height.next_multiple_of(BLOCK),
-            );
             assert_eq!(
                 ffprobe_size(&encoded.stream),
-                (padded_width as u32, padded_height as u32),
-                "{width}x{height}: ffprobe reports the coded (padded) size"
+                (width as u32, height as u32),
+                "{width}x{height}: ffprobe reports the true (display) size, not the padded one"
             );
-            let decoded = ffmpeg_decode(&encoded.stream, padded_width, padded_height);
-            let cropped = crop_picture(&decoded, width, height);
+            let decoded = ffmpeg_decode(&encoded.stream, width, height);
             assert_eq!(
-                cropped.y, encoded.reconstruction.y,
+                decoded.y, encoded.reconstruction.y,
                 "{width}x{height}: luma"
             );
-            assert_eq!(cropped.u, encoded.reconstruction.u, "{width}x{height}: U");
-            assert_eq!(cropped.v, encoded.reconstruction.v, "{width}x{height}: V");
+            assert_eq!(decoded.u, encoded.reconstruction.u, "{width}x{height}: U");
+            assert_eq!(decoded.v, encoded.reconstruction.v, "{width}x{height}: V");
         }
     }
 
@@ -2362,24 +2374,18 @@ mod tests {
             );
         }
         // See `a_frame_round_trips_at_its_own_size`: `ffprobe` reports the
-        // coded (superblock-padded) size a sequence's frames share, not the
-        // render size.
-        let (padded_width, padded_height) = (
-            width.next_multiple_of(SUPERBLOCK),
-            height.next_multiple_of(SUPERBLOCK),
-        );
+        // true (display) size a sequence's frames share, not the padded one.
         assert_eq!(
             ffprobe_size(&encoded.stream),
-            (padded_width as u32, padded_height as u32),
-            "sequence: ffprobe reports the coded (padded) size"
+            (width as u32, height as u32),
+            "sequence: ffprobe reports the true (display) size"
         );
-        let decoded = ffmpeg_decode_sequence(&encoded.stream, padded_width, padded_height, 3);
+        let decoded = ffmpeg_decode_sequence(&encoded.stream, width, height, 3);
         assert_eq!(decoded.len(), 3, "decoded frame count");
         for (i, (frame, decoded)) in encoded.frames.iter().zip(&decoded).enumerate() {
-            let cropped = crop_picture(decoded, width, height);
-            assert_eq!(cropped.y, frame.reconstruction.y, "frame {i}: luma");
-            assert_eq!(cropped.u, frame.reconstruction.u, "frame {i}: U");
-            assert_eq!(cropped.v, frame.reconstruction.v, "frame {i}: V");
+            assert_eq!(decoded.y, frame.reconstruction.y, "frame {i}: luma");
+            assert_eq!(decoded.u, frame.reconstruction.u, "frame {i}: U");
+            assert_eq!(decoded.v, frame.reconstruction.v, "frame {i}: V");
         }
     }
 
