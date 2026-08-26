@@ -14,8 +14,9 @@ use std::sync::LazyLock;
 use ec_core::{Error, Result};
 
 use crate::cdf;
-use crate::cdf_state::{Cdfs, TxbSet, TxbTables};
+use crate::cdf_state::{Cdfs, MvComponentCdfs, TxbSet, TxbTables};
 use crate::msac::SymbolEncoder;
+use crate::mvstack::{find_mv_stack, single_ref_ctx, MiGrid, MiInfo};
 
 /// `PARTITION_NONE` (spec 6.10.4): the whole block, undivided.
 const PARTITION_NONE: usize = 0;
@@ -352,6 +353,39 @@ pub struct BlockCoeffs {
     /// [`Default`] and a plain coefficient list give). Chroma stays on
     /// `DC_PRED`.
     pub mode: u8,
+    /// Whether the block carries no residual at all (spec `skip`). An intra
+    /// block may still be skipped; `false` (the [`Default`]) codes whatever
+    /// `luma`/`u`/`v` carry.
+    pub skip: bool,
+    /// The block's inter mode and motion vector, or `None` for an intra
+    /// block. Only [`sb_coeff_inter_frame_tile`] codes `is_inter`; the key
+    /// frame writers never read this field.
+    pub inter: Option<InterInfo>,
+}
+
+/// One inter mode [`sb_coeff_inter_frame_tile`]'s blocks may take (spec
+/// 5.11.24 `read_inter_mode`), reduced to the two branches its symbol chain
+/// needs to prove out: the stack's own top candidate outright, or a coded
+/// residual against it. `NEARMV`/`GLOBALMV` are never written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InterMode {
+    /// `NEARESTMV`: takes `MvStack::nearest_mv` outright, no residual, no DRL.
+    NearestMv,
+    /// `NEWMV`: codes `mv` as a residual against `MvStack::pred_mv`, through
+    /// a DRL index this writer always leaves at zero.
+    NewMv,
+}
+
+/// An inter-coded block's mode and motion vector, `mv` in the spec's 1/8-pel
+/// `(row, col)` units. For [`InterMode::NearestMv`] this writer ignores `mv`
+/// and codes the stack's own candidate instead — the decoder derives it, so
+/// nothing here can disagree with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InterInfo {
+    /// The mode this block is coded with.
+    pub mode: InterMode,
+    /// The motion vector a [`InterMode::NewMv`] block's residual targets.
+    pub mv: (i32, i32),
 }
 
 impl From<Vec<Coeff>> for BlockCoeffs {
@@ -468,6 +502,16 @@ struct Neighbours {
     above_side: Vec<usize>,
     /// The same, down the left edge.
     left_side: Vec<usize>,
+    /// Whether the neighbour carried no residual, for [`sb_coeff_inter_frame_tile`]'s
+    /// skip context. Unused (and left at its default) by the key frame writers.
+    above_skip: Vec<bool>,
+    /// The same, down the left edge.
+    left_skip: Vec<bool>,
+    /// Whether the neighbour was coded inter, for the `is_inter` context.
+    /// Unused by the key frame writers.
+    above_inter: Vec<bool>,
+    /// The same, down the left edge.
+    left_inter: Vec<bool>,
 }
 
 /// What one plane's neighbours leave for a block, gathered across every cell
@@ -496,6 +540,10 @@ impl Neighbours {
             left_mode: vec![DC_PRED; rows],
             above_side: vec![SB; cols],
             left_side: vec![SB; rows],
+            above_skip: vec![false; cols],
+            left_skip: vec![false; rows],
+            above_inter: vec![false; cols],
+            left_inter: vec![false; rows],
         }
     }
 
@@ -504,6 +552,8 @@ impl Neighbours {
         self.left.iter_mut().for_each(|l| *l = Default::default());
         self.left_mode.iter_mut().for_each(|m| *m = DC_PRED);
         self.left_side.iter_mut().for_each(|s| *s = SB);
+        self.left_skip.iter_mut().for_each(|s| *s = false);
+        self.left_inter.iter_mut().for_each(|i| *i = false);
     }
 
     /// Writes one coded block into every 16x16 column and row it covers.
@@ -517,6 +567,19 @@ impl Neighbours {
             self.left_mode[r + cell] = mode;
             self.above_side[c + cell] = side;
             self.left_side[r + cell] = side;
+        }
+    }
+
+    /// Writes one inter-frame block's skip flag and inter/intra state into
+    /// every 16x16 column and row it covers, the same span [`Self::record`]
+    /// fills for the coefficient and mode state.
+    fn record_inter(&mut self, at: (usize, usize), side: usize, skip: bool, is_inter: bool) {
+        let (r, c) = at;
+        for cell in 0..side / SUB {
+            self.above_skip[c + cell] = skip;
+            self.left_skip[r + cell] = skip;
+            self.above_inter[c + cell] = is_inter;
+            self.left_inter[r + cell] = is_inter;
         }
     }
 
@@ -1283,6 +1346,340 @@ fn dc_sign_ctx(vote: i32) -> usize {
     }
 }
 
+/// The `is_inter` context (spec 5.11.16 via `av1_get_intra_inter_context`,
+/// `pred_common.c`): both neighbours' intra/inter state when both are
+/// available, one neighbour's when only one is, and zero at a tile's own
+/// top-left corner.
+fn intra_inter_ctx(has_above: bool, has_left: bool, above_inter: bool, left_inter: bool) -> usize {
+    match (has_above, has_left) {
+        (true, true) => {
+            let (above_intra, left_intra) = (!above_inter, !left_inter);
+            if above_intra && left_intra {
+                3
+            } else {
+                usize::from(above_intra || left_intra)
+            }
+        }
+        (true, false) => 2 * usize::from(!above_inter),
+        (false, true) => 2 * usize::from(!left_inter),
+        (false, false) => 0,
+    }
+}
+
+/// `CLASS0_SIZE << (class + 2)` (spec 3), the magnitude an `MV_CLASS_n`
+/// component's own bits start counting from; class zero starts at zero.
+fn mv_class_base(class: usize) -> i32 {
+    if class == 0 {
+        0
+    } else {
+        2i32 << (class + 2)
+    }
+}
+
+/// The class a pre-offset magnitude `z` (`|diff| - 1`) falls in — the inverse
+/// of `mv_class_base`'s doubling ranges, ported from libaom's
+/// `av1_get_mv_class` (`mv.h`).
+fn mv_class_of(z: i32) -> usize {
+    let mut class = 0;
+    while class < 10 && mv_class_base(class + 1) <= z {
+        class += 1;
+    }
+    class
+}
+
+/// Writes one motion vector component's non-zero diff (spec 5.11.32
+/// `read_mv_component`, run backwards): sign, class, then the class's own
+/// bits. `allow_high_precision_mv` is off in every frame this writer codes,
+/// so the eighth-pel bit is always inferred as one rather than coded — which
+/// means only diffs whose eighth-pel bit really is one are representable;
+/// anything else is refused rather than rounded, since rounding would silently
+/// code a different vector than the caller asked for.
+///
+/// # Errors
+/// Returns an error when `diff` needs the eighth-pel precision this writer's
+/// frames do not carry.
+fn write_mv_component(enc: &mut SymbolEncoder, c: &mut MvComponentCdfs, diff: i32) -> Result<()> {
+    debug_assert_ne!(diff, 0);
+    let sign = diff < 0;
+    enc.symbol(usize::from(sign), &mut c.sign);
+    let mag = diff.unsigned_abs() as i32;
+    let z = mag - 1;
+    if z & 1 == 0 {
+        return Err(Error::unsupported(
+            "AV1 tile",
+            "a motion vector component needs eighth-pel precision, which \
+             allow_high_precision_mv off does not carry",
+        ));
+    }
+    let class = mv_class_of(z);
+    enc.symbol(class, &mut c.class);
+    let local = z - mv_class_base(class);
+    if class == 0 {
+        let bit = (local >> 3) & 1;
+        let fr = (local >> 1) & 3;
+        enc.symbol(bit as usize, &mut c.class0_bit);
+        enc.symbol(fr as usize, &mut c.class0_fr[bit as usize]);
+    } else {
+        let d = local >> 3;
+        let fr = (local >> 1) & 3;
+        for i in 0..class {
+            enc.symbol(((d >> i) & 1) as usize, &mut c.bit[i]);
+        }
+        enc.symbol(fr as usize, &mut c.fr);
+    }
+    // The eighth-pel bit itself is inferred, not coded (spec 5.11.32: "if
+    // (allow_high_precision_mv) mv_class0_hp ... else mv_class0_hp = 1").
+    Ok(())
+}
+
+/// Writes a motion vector as a residual against `pred` (spec 5.11.32
+/// `read_mv`): the joint symbol naming which components differ, then each
+/// differing component.
+fn write_mv(
+    enc: &mut SymbolEncoder,
+    mv_comp: &mut [MvComponentCdfs; 2],
+    mv_joint: &mut [u16; 5],
+    mv: (i32, i32),
+    pred: (i32, i32),
+) -> Result<()> {
+    let diff = (mv.0 - pred.0, mv.1 - pred.1);
+    let joint = match (diff.0 != 0, diff.1 != 0) {
+        (false, false) => 0, // MV_JOINT_ZERO
+        (false, true) => 1,  // MV_JOINT_HNZVZ: column only
+        (true, false) => 2,  // MV_JOINT_HZVNZ: row only
+        (true, true) => 3,   // MV_JOINT_HNZVNZ
+    };
+    enc.symbol(joint, mv_joint);
+    if diff.0 != 0 {
+        write_mv_component(enc, &mut mv_comp[0], diff.0)?;
+    }
+    if diff.1 != 0 {
+        write_mv_component(enc, &mut mv_comp[1], diff.1)?;
+    }
+    Ok(())
+}
+
+/// Writes the payload of a one-tile inter frame built from `blocks`, one
+/// 32x32 block per entry in raster order across the frame — every superblock
+/// is split into its four quadrants the way [`split_coeff_key_frame_tile`]
+/// codes a key frame, because a mixed-size partition tree buys this writer's
+/// gate nothing a flat grid does not already prove: the CDF state, the
+/// neighbour contexts and the single-reference/MV-stack machinery below are
+/// exactly as size-sensitive whether the tree recurses or not, and recursing
+/// it would be undirected scaffolding — see `sb_coeff_key_frame_tile` for
+/// where that tree already lives, ready to graft this block's mode reads
+/// onto once a real partition search needs it.
+///
+/// A block whose [`BlockCoeffs::inter`] is `Some` is coded inter: `skip`,
+/// then `is_inter`, then a single-reference chain that always names `LAST`
+/// (spec 5.11.25 `single_ref_p1`/`p3`/`p4`, this crate's only reference so
+/// far), then the two-mode `read_inter_mode` chain (spec 5.11.24) and, for
+/// [`InterMode::NewMv`], a DRL index (always zero) and a coded motion vector
+/// residual. A block whose `inter` is `None` codes intra, through the
+/// *inter*-frame intra path (spec 5.11.16's `intra_frame_mode_info` is the
+/// key frame writers' path; this is `inter_frame_mode_info`'s intra branch):
+/// `Y_MODE` by size group rather than `KF_Y_MODE` by neighbour context, since
+/// an inter frame's intra blocks do not read their neighbours' modes.
+///
+/// # Errors
+/// Returns an error when the frame is not a whole number of 64x64
+/// superblocks, when `blocks` does not carry exactly one entry per 32x32
+/// block, when an intra block names a mode a key frame does not code, when a
+/// coefficient sits outside its transform or is one the writer cannot code,
+/// when a `NEWMV` block's motion vector needs eighth-pel precision, or when
+/// `base_q_idx` is outside the q-context band whose default CDFs this crate
+/// carries.
+pub fn sb_coeff_inter_frame_tile(
+    mi_cols: u32,
+    mi_rows: u32,
+    base_q_idx: u8,
+    blocks: &[BlockCoeffs],
+) -> Result<Vec<u8>> {
+    check_superblocks(mi_cols, mi_rows)?;
+    if !Q_CTX_2.contains(&base_q_idx) {
+        return Err(Error::unsupported(
+            "AV1 tile",
+            "the coefficient CDFs of only one q context are known, so \
+             base_q_idx must be 61..=120",
+        ));
+    }
+    let (cols, rows) = (mi_cols / BLOCK_MI, mi_rows / BLOCK_MI);
+    if blocks.len() != (cols * rows) as usize {
+        return Err(Error::unsupported(
+            "AV1 tile",
+            "an inter frame needs one entry per 32x32 block",
+        ));
+    }
+    if let Some(bad) = blocks
+        .iter()
+        .find(|b| b.inter.is_none() && usize::from(b.mode) >= INTRA_MODES)
+    {
+        return Err(Error::unsupported(
+            "AV1 tile",
+            format!(
+                "intra mode {} is not one of the thirteen this writer codes",
+                bad.mode
+            ),
+        ));
+    }
+
+    /// `Y_MODE`'s size group (spec `Size_Group`) for a 32x32 block, the only
+    /// size this writer's intra branch codes.
+    const SIZE_GROUP_32: usize = 3;
+    /// `Ref_Frame_List`'s `LAST_FRAME` (spec 3): the only reference this
+    /// writer's single-reference chain ever names.
+    const LAST_FRAME: i8 = 1;
+
+    let (sb_cols, sb_rows) = (mi_cols / SB_MI, mi_rows / SB_MI);
+    let mut neighbours = Neighbours::new(cols as usize * 2, rows as usize * 2);
+    let mut grid = MiGrid::new(mi_cols as usize, mi_rows as usize);
+    let mut cdfs = Cdfs::new();
+    let mut enc = SymbolEncoder::new();
+    let split_planes = [TxbSet::Luma32, TxbSet::Chroma16, TxbSet::Chroma16];
+    let scan32 = default_scan(TX32);
+    let scan16 = default_scan(TX16);
+    let zero_grids = [
+        vec![0i32; TX32 * TX32],
+        vec![0i32; TX16 * TX16],
+        vec![0i32; TX16 * TX16],
+    ];
+
+    for sb_r in 0..sb_rows {
+        neighbours.start_row();
+        for sb_c in 0..sb_cols {
+            let sb_at = (sb_r as usize * 4, sb_c as usize * 4);
+            let sb_ctx = neighbours.partition_ctx(sb_at, SB);
+            enc.symbol(PARTITION_SPLIT, &mut cdfs.partition_w64[sb_ctx]);
+
+            for quadrant in 0..4 {
+                let (r32, c32) = (sb_r * 2 + quadrant / 2, sb_c * 2 + quadrant % 2);
+                let block = &blocks[(r32 * cols + c32) as usize];
+                let at = (r32 as usize * 2, c32 as usize * 2);
+                let (r, c) = at;
+                let ctx32 = neighbours.partition_ctx(at, BLOCK);
+                enc.symbol(PARTITION_NONE, &mut cdfs.partition_w32[ctx32]);
+
+                let has_above = r32 > 0;
+                let has_left = c32 > 0;
+                let skip_ctx =
+                    usize::from(neighbours.above_skip[c]) + usize::from(neighbours.left_skip[r]);
+                enc.symbol(usize::from(block.skip), &mut cdfs.skip[skip_ctx]);
+
+                let is_inter = block.inter.is_some();
+                let (above_inter, left_inter) =
+                    (neighbours.above_inter[c], neighbours.left_inter[r]);
+                let ii_ctx = intra_inter_ctx(has_above, has_left, above_inter, left_inter);
+                enc.symbol(usize::from(is_inter), &mut cdfs.intra_inter[ii_ctx]);
+
+                let mode_for_tx;
+                if let Some(info) = block.inter {
+                    let sr_ctx = single_ref_ctx(above_inter || left_inter);
+                    enc.symbol(0, &mut cdfs.single_ref[sr_ctx][0]); // p1: forward
+                    enc.symbol(0, &mut cdfs.single_ref[sr_ctx][2]); // p3: LAST/LAST2
+                    enc.symbol(0, &mut cdfs.single_ref[sr_ctx][3]); // p4: LAST
+
+                    let (mi_row, mi_col) = (r32 as usize * 8, c32 as usize * 8);
+                    let stack = find_mv_stack(
+                        &grid,
+                        mi_row,
+                        mi_col,
+                        8,
+                        8,
+                        LAST_FRAME,
+                        mi_cols as usize,
+                        mi_rows as usize,
+                    );
+
+                    let is_new_mv = matches!(info.mode, InterMode::NewMv);
+                    if is_new_mv {
+                        enc.symbol(0, &mut cdfs.new_mv[stack.new_mv_ctx]); // NEWMV
+                    } else {
+                        enc.symbol(1, &mut cdfs.new_mv[stack.new_mv_ctx]); // not new
+                        enc.symbol(1, &mut cdfs.zero_mv[stack.zero_mv_ctx]); // not zero
+                        enc.symbol(0, &mut cdfs.ref_mv[stack.ref_mv_ctx]); // NEARESTMV
+                    }
+                    // This writer always keeps the first DRL candidate, so the
+                    // loop (spec 5.11.24 `read_drl_idx`) only ever runs its
+                    // first, breaking iteration.
+                    if is_new_mv && stack.entries.len() > 1 {
+                        enc.symbol(0, &mut cdfs.drl_mode[stack.drl_ctx[0]]);
+                    }
+                    let mv = if is_new_mv {
+                        write_mv(
+                            &mut enc,
+                            &mut cdfs.mv_comp,
+                            &mut cdfs.mv_joint,
+                            info.mv,
+                            stack.pred_mv,
+                        )?;
+                        info.mv
+                    } else {
+                        stack.nearest_mv
+                    };
+                    grid.set(
+                        mi_row,
+                        mi_col,
+                        MiInfo {
+                            is_inter: true,
+                            ref_frame: LAST_FRAME,
+                            mv,
+                            is_new_mv,
+                        },
+                    );
+                    for dr in 0..8 {
+                        for dc in 0..8 {
+                            if dr == 0 && dc == 0 {
+                                continue;
+                            }
+                            grid.set(
+                                mi_row + dr,
+                                mi_col + dc,
+                                MiInfo {
+                                    is_inter: true,
+                                    ref_frame: LAST_FRAME,
+                                    mv,
+                                    is_new_mv,
+                                },
+                            );
+                        }
+                    }
+                    mode_for_tx = 0;
+                } else {
+                    let mode = usize::from(block.mode);
+                    enc.symbol(mode, &mut cdfs.y_mode[SIZE_GROUP_32]);
+                    if (V_PRED..=D67_PRED).contains(&mode) {
+                        enc.symbol(ANGLE_DELTA_ZERO, &mut cdfs.angle_delta[mode - V_PRED]);
+                    }
+                    enc.symbol(DC_PRED, &mut cdfs.uv_mode_cfl[mode]);
+                    mode_for_tx = mode;
+                }
+
+                if block.skip {
+                    neighbours.record(at, BLOCK, mode_for_tx, &zero_grids);
+                } else {
+                    let grids = [
+                        level_grid(&block.luma, TX32)?,
+                        level_grid(&block.u, TX16)?,
+                        level_grid(&block.v, TX16)?,
+                    ];
+                    write_block_planes(
+                        &mut enc,
+                        &mut cdfs,
+                        &split_planes,
+                        &grids,
+                        &[&scan32, &scan16, &scan16],
+                        &neighbours.around(at, BLOCK),
+                        mode_for_tx,
+                    );
+                    neighbours.record(at, BLOCK, mode_for_tx, &grids);
+                }
+                neighbours.record_inter(at, BLOCK, block.skip, is_inter);
+            }
+        }
+    }
+    Ok(enc.finish())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1291,8 +1688,8 @@ mod tests {
     use crate::sequence::sequence_header_obu;
     use ec_av1_syntax::sequence::SequenceHeader;
     use ec_av1_syntax::{
-        FrameHeader, FrameType, LoopFilterParams, PRIMARY_REF_NONE, QuantizationParams, TileInfo,
-        TxMode,
+        FrameHeader, FrameType, LoopFilterParams, QuantizationParams, TileInfo, TxMode,
+        PRIMARY_REF_NONE,
     };
     use std::io::Write;
     use std::process::{Command, Stdio};
@@ -3313,6 +3710,316 @@ mod tests {
         assert!(
             rmse < step / 4.0,
             "the decoded picture is {rmse} off, a step being {step}"
+        );
+    }
+
+    /// The inverse of [`write_mv_component`], mirroring [`SymbolDecoder`]
+    /// against the spec's own `read_mv_component` pseudocode.
+    fn decode_mv_component(
+        dec: &mut crate::msac::tests::SymbolDecoder,
+        c: &mut MvComponentCdfs,
+    ) -> i32 {
+        let sign = dec.symbol(&mut c.sign);
+        let class = dec.symbol(&mut c.class);
+        let local = if class == 0 {
+            let bit = dec.symbol(&mut c.class0_bit);
+            let fr = dec.symbol(&mut c.class0_fr[bit]);
+            (bit << 3) | (fr << 1) | 1
+        } else {
+            let mut d = 0;
+            for i in 0..class {
+                d |= dec.symbol(&mut c.bit[i]) << i;
+            }
+            let fr = dec.symbol(&mut c.fr);
+            (d << 3) | (fr << 1) | 1
+        };
+        let mag = mv_class_base(class) + local as i32 + 1;
+        if sign == 1 {
+            -mag
+        } else {
+            mag
+        }
+    }
+
+    /// Decodes one superblock a [`sb_coeff_inter_frame_tile`] payload wrote,
+    /// mirroring the writer's own context tracking (partition, skip,
+    /// is_inter, and the MV stack) symbol for symbol against a fresh
+    /// [`Cdfs`], so a desync between the two shows up as a wrong decoded
+    /// value rather than a silent pass. Every block here is skipped, so no
+    /// coefficient symbols are read. `wrong_y_mode` swaps in `KF_Y_MODE`'s
+    /// (0, 0) row for an intra block's mode read, to show that reading the
+    /// wrong table decodes the wrong mode rather than the one that was
+    /// written.
+    ///
+    /// One decoded block's `(skip, is_inter, mode, mv)` — `mode` is `None`
+    /// for an inter block, `mv` is `(0, 0)` for an intra one.
+    type DecodedBlock = (bool, bool, Option<usize>, (i32, i32));
+
+    /// Returns the number of symbols and literals read, and each block's
+    /// decoded state.
+    fn decode_inter_sb(
+        data: &[u8],
+        mi_cols: u32,
+        mi_rows: u32,
+        wrong_y_mode: bool,
+    ) -> (usize, Vec<DecodedBlock>) {
+        let mut dec = crate::msac::tests::SymbolDecoder::new(data);
+        let mut cdfs = Cdfs::new();
+        let mut grid = MiGrid::new(mi_cols as usize, mi_rows as usize);
+        let mut above_skip = [false; 2];
+        let mut left_skip = [false; 2];
+        let mut above_inter = [false; 2];
+        let mut left_inter = [false; 2];
+        let mut count = 0usize;
+
+        count += 1;
+        dec.symbol(&mut cdfs.partition_w64[0]);
+
+        let mut results = Vec::new();
+        for quadrant in 0..4usize {
+            let (r32, c32) = (quadrant / 2, quadrant % 2);
+            count += 1;
+            dec.symbol(&mut cdfs.partition_w32[0]);
+
+            let (has_above, has_left) = (r32 > 0, c32 > 0);
+            let skip_ctx = usize::from(above_skip[c32]) + usize::from(left_skip[r32]);
+            count += 1;
+            let skip = dec.symbol(&mut cdfs.skip[skip_ctx]) == 1;
+
+            let ii_ctx = intra_inter_ctx(has_above, has_left, above_inter[c32], left_inter[r32]);
+            count += 1;
+            let is_inter = dec.symbol(&mut cdfs.intra_inter[ii_ctx]) == 1;
+
+            let (mode, mv) = if is_inter {
+                let sr_ctx = single_ref_ctx(above_inter[c32] || left_inter[r32]);
+                count += 3;
+                assert_eq!(
+                    dec.symbol(&mut cdfs.single_ref[sr_ctx][0]),
+                    0,
+                    "single_ref p1"
+                );
+                assert_eq!(
+                    dec.symbol(&mut cdfs.single_ref[sr_ctx][2]),
+                    0,
+                    "single_ref p3"
+                );
+                assert_eq!(
+                    dec.symbol(&mut cdfs.single_ref[sr_ctx][3]),
+                    0,
+                    "single_ref p4"
+                );
+
+                let (mi_row, mi_col) = (r32 * 8, c32 * 8);
+                let stack = find_mv_stack(
+                    &grid,
+                    mi_row,
+                    mi_col,
+                    8,
+                    8,
+                    1,
+                    mi_cols as usize,
+                    mi_rows as usize,
+                );
+
+                count += 1;
+                let new_mv = dec.symbol(&mut cdfs.new_mv[stack.new_mv_ctx]) == 0;
+                let (mv, is_new_mv) = if new_mv {
+                    if stack.entries.len() > 1 {
+                        count += 1;
+                        dec.symbol(&mut cdfs.drl_mode[stack.drl_ctx[0]]);
+                    }
+                    count += 1;
+                    let joint = dec.symbol(&mut cdfs.mv_joint);
+                    let mut diff = (0, 0);
+                    if joint == 2 || joint == 3 {
+                        // sign, class, class0_bit, class0_fr for this test's
+                        // small (class 0) components.
+                        count += 4;
+                        diff.0 = decode_mv_component(&mut dec, &mut cdfs.mv_comp[0]);
+                    }
+                    if joint == 1 || joint == 3 {
+                        count += 4;
+                        diff.1 = decode_mv_component(&mut dec, &mut cdfs.mv_comp[1]);
+                    }
+                    ((stack.pred_mv.0 + diff.0, stack.pred_mv.1 + diff.1), true)
+                } else {
+                    count += 2;
+                    assert_eq!(
+                        dec.symbol(&mut cdfs.zero_mv[stack.zero_mv_ctx]),
+                        1,
+                        "zero_mv"
+                    );
+                    assert_eq!(dec.symbol(&mut cdfs.ref_mv[stack.ref_mv_ctx]), 0, "ref_mv");
+                    (stack.nearest_mv, false)
+                };
+                for dr in 0..8 {
+                    for dc in 0..8 {
+                        grid.set(
+                            mi_row + dr,
+                            mi_col + dc,
+                            MiInfo {
+                                is_inter: true,
+                                ref_frame: 1,
+                                mv,
+                                is_new_mv,
+                            },
+                        );
+                    }
+                }
+                (None, mv)
+            } else {
+                count += 1;
+                let m = if wrong_y_mode {
+                    dec.symbol(&mut cdfs.kf_y_mode[0][0])
+                } else {
+                    dec.symbol(&mut cdfs.y_mode[3])
+                };
+                if (V_PRED..=D67_PRED).contains(&m) {
+                    count += 1;
+                    dec.symbol(&mut cdfs.angle_delta[m - V_PRED]);
+                }
+                count += 1;
+                dec.symbol(&mut cdfs.uv_mode_cfl[m]);
+                (Some(m), (0, 0))
+            };
+
+            above_skip[c32] = skip;
+            left_skip[r32] = skip;
+            above_inter[c32] = is_inter;
+            left_inter[r32] = is_inter;
+            results.push((skip, is_inter, mode, mv));
+        }
+        (count, results)
+    }
+
+    /// Every superblock here skips: no residual, so the only symbols are the
+    /// mode chain, and the byte count and the symbol count both come out
+    /// small enough to hand-check.
+    #[test]
+    fn an_all_skip_inter_superblock_is_small_and_reads_back() {
+        let block = BlockCoeffs {
+            inter: Some(InterInfo {
+                mode: InterMode::NearestMv,
+                mv: (0, 0),
+            }),
+            skip: true,
+            ..BlockCoeffs::default()
+        };
+        let blocks = vec![block.clone(), block.clone(), block.clone(), block];
+        let data = sb_coeff_inter_frame_tile(16, 16, 90, &blocks).unwrap();
+        // Hand count: one partition_w64, then per block partition_w32 + skip +
+        // is_inter + 3 single_ref + new_mv + zero_mv + ref_mv = 9, times four.
+        assert!(
+            data.len() <= 16,
+            "an all-skip NEARESTMV superblock took {} bytes",
+            data.len()
+        );
+
+        let (count, results) = decode_inter_sb(&data, 16, 16, false);
+        assert_eq!(count, 1 + 4 * 9, "symbol count against the hand count");
+        for (skip, is_inter, mode, mv) in results {
+            assert!(skip);
+            assert!(is_inter);
+            assert_eq!(mode, None);
+            // Every block's only inter neighbours carry (0, 0), so the stack's
+            // nearest candidate is (0, 0) throughout.
+            assert_eq!(mv, (0, 0));
+        }
+    }
+
+    /// The fourth block codes NEWMV against a (0, 0) predictor with a coded
+    /// column component: the symbol sequence a decoder reads back has to be
+    /// exactly what [`write_mv`] wrote, not a residual that merely decodes
+    /// to *some* valid vector.
+    #[test]
+    fn a_newmv_block_reads_back_the_exact_symbol_sequence_it_was_written_with() {
+        let nearest = BlockCoeffs {
+            inter: Some(InterInfo {
+                mode: InterMode::NearestMv,
+                mv: (0, 0),
+            }),
+            skip: true,
+            ..BlockCoeffs::default()
+        };
+        let newmv = BlockCoeffs {
+            inter: Some(InterInfo {
+                mode: InterMode::NewMv,
+                mv: (0, 2),
+            }),
+            skip: true,
+            ..BlockCoeffs::default()
+        };
+        let blocks = vec![nearest.clone(), nearest.clone(), nearest, newmv];
+        let data = sb_coeff_inter_frame_tile(16, 16, 90, &blocks).unwrap();
+
+        let (count, results) = decode_inter_sb(&data, 16, 16, false);
+        // Three NEARESTMV blocks at 9 symbols each, one NEWMV block at
+        // partition + skip + is_inter + 3 single_ref + new_mv + mv_joint +
+        // (sign, class, class0_bit, class0_fr for the one nonzero component)
+        // = 12, plus the superblock's partition_w64.
+        assert_eq!(count, 1 + 3 * 9 + 12, "symbol count against the hand count");
+        let (skip, is_inter, mode, mv) = results[3];
+        assert!(skip);
+        assert!(is_inter);
+        assert_eq!(mode, None);
+        assert_eq!(
+            mv,
+            (0, 2),
+            "the decoded motion vector must be exactly what was written"
+        );
+    }
+
+    /// Decodes only the first 32x32 block's mode symbol of a superblock: the
+    /// tile's own first block always reads partition, skip and is_inter at
+    /// context zero, so this needs none of [`decode_inter_sb`]'s neighbour
+    /// bookkeeping — which matters here because the mutation this feeds
+    /// desyncs everything after the one symbol it is testing, and a decoder
+    /// that kept reading past it would be asserting on garbage.
+    fn decode_first_block_mode(data: &[u8], wrong_y_mode: bool) -> usize {
+        let mut dec = crate::msac::tests::SymbolDecoder::new(data);
+        let mut cdfs = Cdfs::new();
+        dec.symbol(&mut cdfs.partition_w64[0]);
+        dec.symbol(&mut cdfs.partition_w32[0]);
+        dec.symbol(&mut cdfs.skip[0]);
+        dec.symbol(&mut cdfs.intra_inter[0]);
+        if wrong_y_mode {
+            dec.symbol(&mut cdfs.kf_y_mode[0][0])
+        } else {
+            dec.symbol(&mut cdfs.y_mode[3])
+        }
+    }
+
+    /// An inter frame's intra block reads its mode against `Y_MODE`'s size
+    /// group, not `KF_Y_MODE`'s neighbour-context table a key frame's block
+    /// reads. Reading the wrong table back — `KF_Y_MODE`'s `(0, 0)` row —
+    /// decodes a different mode than the one [`sb_coeff_inter_frame_tile`]
+    /// wrote, because the two tables carry different default probabilities
+    /// even though a row of each is the same fourteen-entry width. (The swap
+    /// this test's name warns of does not typecheck as a one-line
+    /// substitution at the write site either — `cdfs.kf_y_mode[3]` is a
+    /// `[[u16; 14]; 5]` row, not the single `[u16; 14]` `Y_MODE` indexing
+    /// needs — so a mutation that got the *outer* shape wrong would be
+    /// caught by `cargo check` before it ever reached a test; this test is
+    /// what catches getting the *right* leaf shape from the *wrong* table.)
+    #[test]
+    fn an_intra_block_in_an_inter_frame_is_caught_reading_kf_y_mode() {
+        let block = BlockCoeffs {
+            mode: H_PRED as u8,
+            skip: true,
+            ..BlockCoeffs::default()
+        };
+        let blocks = vec![block; 4];
+        let data = sb_coeff_inter_frame_tile(16, 16, 90, &blocks).unwrap();
+
+        assert_eq!(
+            decode_first_block_mode(&data, false),
+            H_PRED,
+            "the right table reads the mode back exactly"
+        );
+        assert_ne!(
+            decode_first_block_mode(&data, true),
+            H_PRED,
+            "KF_Y_MODE's different probabilities must decode a different mode"
         );
     }
 }
