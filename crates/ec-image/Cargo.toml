@@ -1,6 +1,6 @@
 [package]
 name = "ec-image"
-description = "Still-image decoding: PNG, JPEG and WebP."
+description = "Still-image decoding: PNG, JPEG, WebP and GIF."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

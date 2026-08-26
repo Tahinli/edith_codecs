@@ -1,4 +1,4 @@
-//! Still-image decoding: PNG, JPEG and WebP.
+//! Still-image decoding: PNG, JPEG, WebP and GIF.
 //!
 //! One entry point — [`decode`] over bytes, [`open`] over a path — guesses the
 //! format from the leading bytes and hands back an [`Image`]: dimensions, a
@@ -31,6 +31,7 @@
 // what keeps the code readable against the text it comes from.
 #![allow(clippy::needless_range_loop)]
 
+pub mod gif;
 pub mod jpeg;
 pub mod png;
 mod upsample;
@@ -51,6 +52,8 @@ pub enum ImageFormat {
     Jpeg,
     /// WebP: a RIFF container over VP8 (lossy) or VP8L (lossless).
     WebP,
+    /// GIF, still or animated (GIF87a and GIF89a).
+    Gif,
 }
 
 impl ImageFormat {
@@ -64,6 +67,8 @@ impl ImageFormat {
             Some(ImageFormat::Jpeg)
         } else if data.len() >= 12 && data.starts_with(b"RIFF") && &data[8..12] == b"WEBP" {
             Some(ImageFormat::WebP)
+        } else if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
+            Some(ImageFormat::Gif)
         } else {
             None
         }
@@ -75,6 +80,7 @@ impl ImageFormat {
             ImageFormat::Png => "png",
             ImageFormat::Jpeg => "jpg",
             ImageFormat::WebP => "webp",
+            ImageFormat::Gif => "gif",
         }
     }
 }
@@ -342,9 +348,10 @@ pub fn decode_with_limits(data: &[u8], limits: Limits) -> Result<Image> {
         Some(ImageFormat::Png) => png::decode(data, limits),
         Some(ImageFormat::Jpeg) => jpeg::decode(data, limits),
         Some(ImageFormat::WebP) => webp::decode(data, limits),
+        Some(ImageFormat::Gif) => gif::decode(data, limits),
         None => Err(Error::unsupported(
             "image",
-            "no PNG, JPEG or WebP signature at the start of the data",
+            "no PNG, JPEG, WebP or GIF signature at the start of the data",
         )),
     }
 }
@@ -355,10 +362,41 @@ pub fn info(data: &[u8]) -> Result<Info> {
         Some(ImageFormat::Png) => png::info(data),
         Some(ImageFormat::Jpeg) => jpeg::info(data),
         Some(ImageFormat::WebP) => webp::info(data),
+        Some(ImageFormat::Gif) => gif::info(data),
         None => Err(Error::unsupported(
             "image",
-            "no PNG, JPEG or WebP signature at the start of the data",
+            "no PNG, JPEG, WebP or GIF signature at the start of the data",
         )),
+    }
+}
+
+/// One picture of an animation, already composited onto the canvas.
+///
+/// A frame is the whole canvas, not the sub-rectangle the file stored, because
+/// every consumer of an animation draws whole pictures.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnimationFrame {
+    /// The canvas at this point in the animation.
+    pub image: Image,
+    /// How long the frame is shown, in `delay_num / delay_den` seconds.
+    pub delay_num: u32,
+    /// The denominator of that delay; GIF counts hundredths of a second.
+    pub delay_den: u32,
+}
+
+/// Every frame of an animation, composited.
+///
+/// A format that cannot animate -- and a single-picture file in one that can
+/// -- returns exactly one frame, with a zero delay, so a caller that wants
+/// frames never needs to know which format it holds.
+pub fn decode_animation(data: &[u8]) -> Result<Vec<AnimationFrame>> {
+    match ImageFormat::guess(data) {
+        Some(ImageFormat::Gif) => gif::decode_animation(data, Limits::default()),
+        _ => Ok(vec![AnimationFrame {
+            image: decode(data)?,
+            delay_num: 0,
+            delay_den: 100,
+        }]),
     }
 }
 
