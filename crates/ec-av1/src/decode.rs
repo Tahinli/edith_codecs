@@ -455,6 +455,12 @@ struct Neighbours {
     /// [`crate::tile`]'s private `Neighbours::above_inter`/`left_inter`.
     above_inter: Vec<bool>,
     left_inter: Vec<bool>,
+    /// `interp_filter[0]`/`[1]` (horizontal/vertical kernel index, 0..=2, or
+    /// `3` = "no info": an intra neighbour or the frame's own border) of the
+    /// block above/left of this column/row -- spec
+    /// `av1_get_pred_context_switchable_interp`'s own neighbour lookup.
+    above_filter: Vec<[u8; 2]>,
+    left_filter: Vec<[u8; 2]>,
     mi_cols: usize,
     mi_rows: usize,
     /// Per-8x8 (2x2 mi cells) `skip_txfm` flag over the whole padded frame,
@@ -497,6 +503,8 @@ impl Neighbours {
             left_skip: vec![false; rows],
             above_inter: vec![false; cols],
             left_inter: vec![false; rows],
+            above_filter: vec![[3u8; 2]; cols],
+            left_filter: vec![[3u8; 2]; rows],
             mi_cols,
             mi_rows,
             skip_grid: vec![false; cols * (SUB / MI) * rows * (SUB / MI)],
@@ -577,17 +585,30 @@ impl Neighbours {
         self.left_side_mi.iter_mut().for_each(|s| *s = SB);
         self.left_skip.iter_mut().for_each(|s| *s = false);
         self.left_inter.iter_mut().for_each(|i| *i = false);
+        self.left_filter.iter_mut().for_each(|f| *f = [3u8; 2]);
     }
 
-    /// Records a block's `skip`/`is_inter` state for the next block that
-    /// reads it as a neighbour -- [`crate::tile`]'s `record_inter`.
-    fn record_inter(&mut self, at: (usize, usize), side: usize, skip: bool, is_inter: bool) {
+    /// Records a block's `skip`/`is_inter`/`interp_filter` state for the next
+    /// block that reads it as a neighbour -- [`crate::tile`]'s
+    /// `record_inter`. `filter` is `[3, 3]` for an intra block (spec
+    /// `get_ref_filter_type`'s "not this ref frame" case reads the same as
+    /// "no neighbour").
+    fn record_inter(
+        &mut self,
+        at: (usize, usize),
+        side: usize,
+        skip: bool,
+        is_inter: bool,
+        filter: [u8; 2],
+    ) {
         let (r, c) = at;
         for cell in 0..side / SUB {
             self.above_skip[c + cell] = skip;
             self.left_skip[r + cell] = skip;
             self.above_inter[c + cell] = is_inter;
             self.left_inter[r + cell] = is_inter;
+            self.above_filter[c + cell] = filter;
+            self.left_filter[r + cell] = filter;
         }
     }
 
@@ -2861,6 +2882,75 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     ))
 }
 
+/// `av1_get_pred_context_switchable_interp`'s context for `interp_filter[dir]`
+/// -- `above`/`left` are the neighbour's own resolved index for this
+/// direction (0..=2, or `3` = no info, spec `SWITCHABLE_FILTERS`). This
+/// decoder never codes a compound reference, so `INTER_FILTER_COMP_OFFSET`
+/// is always 0; only `dir`'s own `INTER_FILTER_DIR_OFFSET` (8) is folded in.
+fn switchable_interp_ctx(above: u8, left: u8, dir: usize) -> usize {
+    let base = dir * 8;
+    let term = if left == above {
+        left
+    } else if left == 3 {
+        above
+    } else if above == 3 {
+        left
+    } else {
+        3
+    };
+    base + term as usize
+}
+
+/// Resolves the interpolation filter kernel(s) an inter block's motion
+/// compensation reads (spec 5.11.10/5.11.20): a fixed-filter frame
+/// (`interp_fixed = Some`) never reads a symbol; a `Switchable` frame
+/// (`interp_fixed = None`) reads `interp_filter[0]` and, when
+/// `enable_dual_filter`, a second `interp_filter[1]` -- unless
+/// `force_regular` (this block's own `needs_interp_filter() == 0` case: a
+/// `GLOBALMV` block, whose global motion is always `IDENTITY` in this
+/// decoder's scope, spec 5.11.10's `large && YMode == GLOBALMV` branch),
+/// which forces `EIGHTTAP` without reading anything.
+#[allow(clippy::too_many_arguments)]
+fn resolve_interp_filter(
+    dec: &mut SymbolDecoder,
+    cdfs: &mut Cdfs,
+    interp_fixed: Option<mc::InterpFilterKind>,
+    enable_dual_filter: bool,
+    force_regular: bool,
+    above: [u8; 2],
+    left: [u8; 2],
+) -> (mc::InterpFilterKind, mc::InterpFilterKind, [u8; 2]) {
+    if let Some(kind) = interp_fixed {
+        return (kind, kind, [3, 3]);
+    }
+    if force_regular {
+        return (
+            mc::InterpFilterKind::Regular,
+            mc::InterpFilterKind::Regular,
+            [0, 0],
+        );
+    }
+    // libaom `av1_extract_interp_filter`/`read_mb_interp_filter`: the
+    // symbol read at `dir=0` becomes the block's *vertical* (`y_filter`)
+    // kernel, `dir=1` the *horizontal* (`x_filter`) one -- `dir` is not
+    // "horizontal then vertical" despite `predict_with_filters`' own
+    // `h_kind`/`v_kind` argument order, which is why this function returns
+    // `(h, v, ..)` but reads `dir0` (`v`) before `dir1` (`h`).
+    let ctx0 = switchable_interp_ctx(above[0], left[0], 0);
+    let sym0 = dec.symbol(&mut cdfs.switchable_interp[ctx0]) as u8;
+    let sym1 = if enable_dual_filter {
+        let ctx1 = switchable_interp_ctx(above[1], left[1], 1);
+        dec.symbol(&mut cdfs.switchable_interp[ctx1]) as u8
+    } else {
+        sym0
+    };
+    (
+        mc::InterpFilterKind::from_switchable_symbol(sym1 as usize),
+        mc::InterpFilterKind::from_switchable_symbol(sym0 as usize),
+        [sym0, sym1],
+    )
+}
+
 /// The `is_inter` context (spec 5.11.16 via `av1_get_intra_inter_context`),
 /// duplicating [`crate::tile`]'s private copy of the same rule.
 fn intra_inter_ctx(has_above: bool, has_left: bool, above_inter: bool, left_inter: bool) -> usize {
@@ -3050,6 +3140,8 @@ fn decode_inter_block(
     scan_chroma: &[u16],
     size_group: usize,
     allow_high_precision_mv: bool,
+    interp_fixed: Option<mc::InterpFilterKind>,
+    enable_dual_filter: bool,
 ) -> Result<()> {
     const LAST_FRAME: i8 = 1;
 
@@ -3068,6 +3160,7 @@ fn decode_inter_block(
 
     let mode_for_tx;
     let (luma_grid, u_grid, v_grid);
+    let block_filter;
     if is_inter {
         let sr_ctx = single_ref_ctx(above_inter || left_inter);
         let p1 = dec.symbol(&mut cdfs.single_ref[sr_ctx][0]);
@@ -3093,6 +3186,7 @@ fn decode_inter_block(
         );
 
         let not_new = dec.symbol(&mut cdfs.new_mv[stack.new_mv_ctx]) == 1;
+        let mut is_globalmv = false;
         let (mv, is_new_mv) = if !not_new {
             if stack.entries.len() > 1 {
                 dec.symbol(&mut cdfs.drl_mode[stack.drl_ctx[0]]);
@@ -3109,6 +3203,7 @@ fn decode_inter_block(
             )
         } else {
             let not_zero = dec.symbol(&mut cdfs.zero_mv[stack.zero_mv_ctx]) == 1;
+            is_globalmv = !not_zero;
             let mv = if !not_zero {
                 // GLOBALMV: `gm_get_motion_vector` (spec 7.10.2.1) under the
                 // `GmType::IDENTITY` this crate's `decode_stream` requires of
@@ -3138,6 +3233,16 @@ fn decode_inter_block(
             };
             (mv, false)
         };
+        let (h_filter, v_filter, resolved_filter) = resolve_interp_filter(
+            dec,
+            cdfs,
+            interp_fixed,
+            enable_dual_filter,
+            is_globalmv,
+            neighbours.above_filter[c],
+            neighbours.left_filter[r],
+        );
+        block_filter = resolved_filter;
         if std::env::var_os("EC_AV1_TRACE").is_some() {
             eprintln!(
                 "EC_TRACE mi_row={mi_row} mi_col={mi_col} skip={} is_inter=1 mv=({},{}) is_new_mv={is_new_mv} bsize={side}",
@@ -3162,7 +3267,7 @@ fn decode_inter_block(
         mode_for_tx = 0;
 
         let mut pred_y = vec![0u8; side * side];
-        mc::predict(
+        mc::predict_with_filters(
             &ref_y.data,
             ref_y.width,
             ref_y.true_width,
@@ -3171,10 +3276,12 @@ fn decode_inter_block(
             mv_to_q4(py, mv.0, true),
             side,
             side,
+            h_filter,
+            v_filter,
             &mut pred_y,
         );
         let mut pred_u = vec![0u8; chroma_side * chroma_side];
-        mc::predict(
+        mc::predict_with_filters(
             &ref_u.data,
             ref_u.width,
             ref_u.true_width,
@@ -3183,10 +3290,12 @@ fn decode_inter_block(
             mv_to_q4(cpy, mv.0, false),
             chroma_side,
             chroma_side,
+            h_filter,
+            v_filter,
             &mut pred_u,
         );
         let mut pred_v = vec![0u8; chroma_side * chroma_side];
-        mc::predict(
+        mc::predict_with_filters(
             &ref_v.data,
             ref_v.width,
             ref_v.true_width,
@@ -3195,6 +3304,8 @@ fn decode_inter_block(
             mv_to_q4(cpy, mv.0, false),
             chroma_side,
             chroma_side,
+            h_filter,
+            v_filter,
             &mut pred_v,
         );
 
@@ -3289,6 +3400,7 @@ fn decode_inter_block(
             return Err(unsupported("a directional chroma mode (round 2)"));
         };
         mode_for_tx = mode;
+        block_filter = [3, 3];
         let (mi_row, mi_col) = (r * SUB_MI as usize, c * SUB_MI as usize);
         for dr in 0..side / 4 {
             for dc in 0..side / 4 {
@@ -3408,7 +3520,7 @@ fn decode_inter_block(
         }
     }
     neighbours.record(at, side, mode_for_tx, &[luma_grid, u_grid, v_grid]);
-    neighbours.record_inter(at, side, skip, is_inter);
+    neighbours.record_inter(at, side, skip, is_inter, block_filter);
     neighbours.fill_skip_grid((r * (SUB / MI), c * (SUB / MI)), side / MI, skip);
     neighbours.fill_lf_grid(
         (r * (SUB / MI), c * (SUB / MI)),
@@ -3833,6 +3945,8 @@ pub fn decode_inter_frame_tile(
     cdef: &CdefParams,
     loop_filter: &LoopFilterParams,
     allow_high_precision_mv: bool,
+    interp_fixed: Option<mc::InterpFilterKind>,
+    enable_dual_filter: bool,
 ) -> Result<Picture> {
     decode_inter_frame_tile_with_cdfs(
         data,
@@ -3846,6 +3960,8 @@ pub fn decode_inter_frame_tile(
         loop_filter,
         None,
         allow_high_precision_mv,
+        interp_fixed,
+        enable_dual_filter,
     )
     .map(|(picture, _)| picture)
 }
@@ -3867,6 +3983,8 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     loop_filter: &LoopFilterParams,
     initial_cdfs: Option<Cdfs>,
     allow_high_precision_mv: bool,
+    interp_fixed: Option<mc::InterpFilterKind>,
+    enable_dual_filter: bool,
 ) -> Result<(Picture, Cdfs)> {
     if mi_cols == 0 || mi_rows == 0 {
         return Err(unsupported("a frame with no mode-info grid"));
@@ -4014,6 +4132,8 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &scan16,
                             3,
                             allow_high_precision_mv,
+                            interp_fixed,
+                            enable_dual_filter,
                         )?;
                     }
                     PARTITION_SPLIT => {
@@ -4067,6 +4187,8 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     &scan8,
                                     2,
                                     allow_high_precision_mv,
+                                    interp_fixed,
+                                    enable_dual_filter,
                                 )?;
                             } else {
                                 let ctx16 = neighbours.partition_ctx(at16, SUB);
@@ -4120,7 +4242,18 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     prev_leaf = Some((leaf_mi, skip, is_inter));
                                 }
                                 if let Some((_, skip, is_inter)) = prev_leaf {
-                                    neighbours.record_inter(at16, SUB, skip, is_inter);
+                                    // corner-cut: `decode_inter_block8`'s
+                                    // leaves never read a switchable filter
+                                    // (round-3 GLOBALMV refusal already
+                                    // bounds them away from the Regular-only
+                                    // gap this round closes elsewhere); `[3,
+                                    // 3]` is "no info", the same value an
+                                    // intra neighbour records. Upgrade:
+                                    // thread `interp_fixed`/`enable_dual_filter`
+                                    // into `decode_inter_block8` once a
+                                    // straddling 8x8 SWITCHABLE stream is on
+                                    // hand to pin against.
+                                    neighbours.record_inter(at16, SUB, skip, is_inter, [3, 3]);
                                 }
                             }
                         }
@@ -4606,6 +4739,8 @@ mod tests {
                 &CdefParams::default(),
                 &LoopFilterParams::default(),
                 false,
+                Some(mc::InterpFilterKind::Regular),
+                false,
             )
             .unwrap();
             assert_eq!(
@@ -4780,6 +4915,8 @@ mod tests {
             &[],
             0,
             false,
+            Some(mc::InterpFilterKind::Regular),
+            false,
         )
         .unwrap();
 
@@ -4869,6 +5006,8 @@ mod tests {
                 &reference,
                 &CdefParams::default(),
                 &LoopFilterParams::default(),
+                false,
+                Some(mc::InterpFilterKind::Regular),
                 false,
             )
             .unwrap();
