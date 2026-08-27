@@ -13,7 +13,7 @@
 #![allow(clippy::needless_range_loop)]
 
 use ec_h264_syntax::SliceType;
-use wide::i16x16;
+use wide::{i16x8, i16x16};
 
 use crate::deblock::{edge_params, filter_luma_h_edge16, filter_luma_line};
 use crate::decoder::{
@@ -165,6 +165,10 @@ impl Default for Levels {
 
 /// 4x4 Hadamard sum of absolute transformed differences between the source at
 /// `(sx, sy)` and a 4x4 prediction.
+// Tried (lane-h264perf r2): a transpose-based i32x4 vectorization of this
+// butterfly, bit-identical, but cycles-flat-to-worse under perf stat
+// (22.958B -> 23.042B cycles over 10 reps despite fewer instructions
+// retired) -- reverted, dead end; see ledger.
 fn satd4(src: &[u8], sstride: usize, sx: usize, sy: usize, pred: &[u8], pstride: usize) -> i32 {
     let mut d = [0i32; 16];
     for y in 0..4 {
@@ -2704,18 +2708,41 @@ fn encode_intra_mb(
     );
 }
 
+/// Eight samples widened to 16-bit lanes; the tail past the slice is zero,
+/// which only a caller reading past the plane could reach.
+#[inline]
+fn load8(data: &[u8], at: usize) -> i16x8 {
+    let mut a = [0i16; 8];
+    if let Some(row) = data.get(at..at + 8) {
+        for (o, &b) in a.iter_mut().zip(row) {
+            *o = i16::from(b);
+        }
+    }
+    i16x8::from(a)
+}
+
 /// Squared error of the whole macroblock against the source, luma and chroma:
 /// the distortion term of the skip decision.
+///
+/// Each row's 16 (luma) or 8 (chroma) per-pixel differences fit in `i16`
+/// (range `-255..=255`), and `dot` widens the pairwise products to `i32`
+/// before summing, so this is the exact same integer value as scalar
+/// `i64::from(d) * i64::from(d)` per pixel, just batched a row at a time and
+/// summed into the `i64` accumulator in a different (still overflow-free,
+/// so exact) order.
 fn ssd_mb(pic: &Picture, e: &MbEnc<'_>, mb_x: usize, mb_y: usize) -> i64 {
     let mut sum = 0i64;
     let stride = pic.y.stride;
     let origin = pic.y.at(mb_x * 16, mb_y * 16);
     for row in 0..16 {
         let s = (mb_y * 16 + row) * e.src.stride + mb_x * 16;
-        for x in 0..16 {
-            let d = i64::from(e.src.y[s + x]) - i64::from(pic.y.data[origin + row * stride + x]);
-            sum += d * d;
-        }
+        let d = load16(&e.src.y, s) - load16(&pic.y.data, origin + row * stride);
+        sum += d
+            .dot(d)
+            .to_array()
+            .iter()
+            .map(|&v| i64::from(v))
+            .sum::<i64>();
     }
     for comp in 0..2 {
         let (plane, src) = if comp == 0 {
@@ -2727,10 +2754,13 @@ fn ssd_mb(pic: &Picture, e: &MbEnc<'_>, mb_x: usize, mb_y: usize) -> i64 {
         let origin = plane.at(mb_x * 8, mb_y * 8);
         for row in 0..8 {
             let s = (mb_y * 8 + row) * e.src.c_stride + mb_x * 8;
-            for x in 0..8 {
-                let d = i64::from(src[s + x]) - i64::from(plane.data[origin + row * stride + x]);
-                sum += d * d;
-            }
+            let d = load8(src, s) - load8(&plane.data, origin + row * stride);
+            sum += d
+                .dot(d)
+                .to_array()
+                .iter()
+                .map(|&v| i64::from(v))
+                .sum::<i64>();
         }
     }
     sum
