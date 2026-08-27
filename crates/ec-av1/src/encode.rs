@@ -599,6 +599,7 @@ impl Plane<'_> {
         let mut prediction = vec![0u8; side * side];
         crate::intra::predict(
             mode,
+            0,
             above.as_deref(),
             left.as_deref(),
             corner,
@@ -815,6 +816,7 @@ impl Plane<'_> {
                 let mut prediction = vec![0u8; side * side];
                 crate::intra::predict(
                     mode,
+                    0,
                     above.as_deref(),
                     left.as_deref(),
                     corner,
@@ -863,6 +865,7 @@ impl Plane<'_> {
                 let mut prediction = vec![0u8; side * side];
                 crate::intra::predict(
                     mode,
+                    0,
                     above.as_deref(),
                     left.as_deref(),
                     corner,
@@ -4418,6 +4421,7 @@ mod tests {
             for _ in 0..N {
                 crate::intra::predict(
                     D45_PRED,
+                    0,
                     Some(&above),
                     Some(&left),
                     Some(128),
