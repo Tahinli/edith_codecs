@@ -201,11 +201,18 @@ fn read_eob(dec: &mut SymbolDecoder, coding: &mut TxbTables) -> usize {
     const GROUP_START: [usize; 12] = [0, 1, 2, 3, 5, 9, 17, 33, 65, 129, 257, 513];
     const OFFSET_BITS: [u32; 12] = [0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
 
+    let trace = std::env::var_os("EC_AV1_TRACE").is_some();
     let group = dec.symbol(coding.eob_pt) + 1;
+    if trace {
+        eprintln!("TRACE eob_pt value={group}");
+    }
     let bits = OFFSET_BITS[group];
     let mut offset = 0u32;
     if bits > 0 {
         let top = dec.symbol(&mut coding.eob_extra[group - 3]) as u32;
+        if trace {
+            eprintln!("TRACE eob_extra ctx={} value={top}", group - 3);
+        }
         offset = top << (bits - 1);
         if bits > 1 {
             offset |= dec.literal(bits - 1);
@@ -232,31 +239,53 @@ fn read_coeffs(
     skip_ctx: usize,
     sign_ctx: usize,
 ) -> Result<(Vec<i32>, TxType)> {
+    let trace = std::env::var_os("EC_AV1_TRACE").is_some();
     let side = coding.side;
     let mut grid = vec![0i32; side * side];
     let all_zero = dec.symbol(&mut coding.txb_skip[skip_ctx]) == 1;
+    if trace {
+        eprintln!("TRACE all_zero ctx={skip_ctx} value={}", all_zero as i32);
+    }
     if all_zero {
         return Ok((grid, TxType::DctDct));
     }
     let mut tx_type = TxType::DctDct;
     if let Some(tx_type_cdf) = coding.tx_type.as_deref_mut() {
         let t = dec.symbol(tx_type_cdf);
+        if trace {
+            eprintln!("TRACE tx_type value={t}");
+        }
         tx_type = TxType::from_symbol(t).ok_or_else(|| {
             unsupported(format!("a tx_type symbol outside its CDF's own set: {t}"))
         })?;
     }
 
     let eob = read_eob(dec, coding);
+    if trace {
+        eprintln!("TRACE eob value={eob}");
+    }
     let mut levels = vec![0i32; side * side];
     for scan_idx in (0..eob).rev() {
         let pos = scan[scan_idx] as usize;
         let (row, col) = (pos / side, pos % side);
         let level = if scan_idx == eob - 1 {
             let ctx = eob_coeff_ctx(scan_idx, side * side);
-            dec.symbol(&mut coding.base_eob[ctx]) as i32 + 1
+            let v = dec.symbol(&mut coding.base_eob[ctx]) as i32 + 1;
+            if trace {
+                eprintln!(
+                    "TRACE base_eob scan_idx={scan_idx} pos={pos} row={row} col={col} ctx={ctx} value={v}"
+                );
+            }
+            v
         } else {
             let ctx = base_ctx(&levels, side, row, col);
-            dec.symbol(&mut coding.base[ctx]) as i32
+            let v = dec.symbol(&mut coding.base[ctx]) as i32;
+            if trace {
+                eprintln!(
+                    "TRACE base scan_idx={scan_idx} pos={pos} row={row} col={col} ctx={ctx} value={v}"
+                );
+            }
+            v
         };
         let level = if level > NUM_BASE_LEVELS {
             let ctx = br_ctx(&levels, side, row, col);
@@ -264,6 +293,11 @@ fn read_coeffs(
             let mut sent = 0;
             loop {
                 let k = dec.symbol(&mut coding.br[ctx]) as i32;
+                if trace {
+                    eprintln!(
+                        "TRACE br scan_idx={scan_idx} pos={pos} row={row} col={col} ctx={ctx} value={k}"
+                    );
+                }
                 level += k;
                 sent += BR_STEP;
                 if k < BR_STEP || sent >= COEFF_BASE_RANGE {
@@ -283,12 +317,20 @@ fn read_coeffs(
             continue;
         }
         let negative = if pos == 0 {
-            dec.symbol(&mut coding.dc_sign[sign_ctx]) == 1
+            let v = dec.symbol(&mut coding.dc_sign[sign_ctx]) == 1;
+            if trace {
+                eprintln!("TRACE dc_sign ctx={sign_ctx} value={}", v as i32);
+            }
+            v
         } else {
             dec.literal(1) == 1
         };
         let level = if level.abs_diff(0) as i32 > MAX_BR_LEVEL {
-            level + read_golomb(dec)? as i32
+            let g = read_golomb(dec)?;
+            if trace {
+                eprintln!("TRACE golomb pos={pos} value={g}");
+            }
+            level + g as i32
         } else {
             level
         };
@@ -757,6 +799,13 @@ fn read_plane(
         full
     };
     let residual = dequant_and_inverse_typed(&levels, side, 8, i32::from(base_q_idx), tx_type);
+    if std::env::var_os("EC_AV1_TRACE").is_some() {
+        eprintln!(
+            "TRACE dequant plane={plane_idx} base_q_idx={base_q_idx} levels[0..4]={:?} residual[0..4]={:?}",
+            &levels[..4.min(levels.len())],
+            &residual[..4.min(residual.len())]
+        );
+    }
     plane.reconstruct(x, y, side, predict_mode, reach, &residual, cfl);
     Ok(if tx_side == side {
         residual_grid_placeholder(&levels, side)
