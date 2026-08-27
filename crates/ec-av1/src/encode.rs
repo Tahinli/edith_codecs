@@ -1090,6 +1090,12 @@ struct Search<'a> {
 /// (the default, until a lever's quality gate justifies pruning by default);
 /// `EC_AV1_PRUNE_K` sweeps it in a test build without touching callers.
 fn prune_top_k() -> Option<usize> {
+    #[cfg(test)]
+    {
+        if let Some(k) = TEST_TOP_K_OVERRIDE.with(|cell| cell.get()) {
+            return k;
+        }
+    }
     let swept = std::env::var("EC_AV1_PRUNE_K")
         .ok()
         .and_then(|v| v.parse::<usize>().ok());
@@ -1097,6 +1103,20 @@ fn prune_top_k() -> Option<usize> {
         Some(k) if cfg!(test) => Some(k),
         _ => PRUNE_TOP_K,
     }
+}
+
+/// A per-thread override [`prune_top_k`] checks first, so one test can sweep
+/// `top_k` in-process without mutating the environment (forbidden here --
+/// `#![forbid(unsafe_code)]` -- and racy across parallel tests besides).
+#[cfg(test)]
+thread_local! {
+    static TEST_TOP_K_OVERRIDE: std::cell::Cell<Option<Option<usize>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn set_test_top_k_override(value: Option<usize>) {
+    TEST_TOP_K_OVERRIDE.with(|cell| cell.set(Some(value)));
 }
 
 /// The default: unpruned, thirteen full trials per block, same as before this
@@ -3662,5 +3682,100 @@ mod tests {
                  coeff_bits:                   {entropy_t:>9.2?}"
             );
         }
+    }
+
+    /// The quality gate [`Search::top_k`]'s lever lives or dies by: three real
+    /// frames (a dark/flat one, a detailed one, a normal film one) at two
+    /// `base_q_idx` values, encoded with the mode search unpruned (`top_k =
+    /// None`, the baseline this same build produces without
+    /// `EC_AV1_PRUNE_K` set) and with it pruned to each of a few `K`, bytes
+    /// and luma PSNR compared side by side. Not a gate itself -- the numbers
+    /// go in the lane report, which is where "ship as default" is decided --
+    /// so it stays `#[ignore]`, run by hand with real clips on this machine.
+    /// `cargo test -p ec-av1 --release prune_k_quality_sweep -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "needs real clips and ffmpeg; prints numbers for the lane report to judge"]
+    fn prune_k_quality_sweep() {
+        if !have_ffmpeg() {
+            eprintln!("SKIP prune_k_quality_sweep: no ffmpeg");
+            return;
+        }
+        let (width, height) = (640usize, 352usize);
+        let frames: &[(&str, &str, &str)] = &[
+            // (label, clip, seek) -- a near-black scene, a busy one, and an
+            // ordinary film frame, each from a different real file.
+            (
+                "dark/flat",
+                "/home/tahinli/Videos/he_is_not_the_only_one.mp4",
+                "3",
+            ),
+            (
+                "detailed",
+                "/home/tahinli/Downloads/The.Hunger.Games.The.Ballad.Of.Songbirds.And.Snakes.2023.Bluray.2160p.AV1.HDR10.OPUS.7.1-UH.mkv",
+                "1200",
+            ),
+            (
+                "film",
+                "/home/tahinli/Videos/Films/Troy.Director's.Cut.2004.Bluray.1080P.AV1.OPUS.5.1-DECK.mkv",
+                "600",
+            ),
+        ];
+        for &(label, clip, skip) in frames {
+            if !std::path::Path::new(clip).exists() {
+                eprintln!("SKIP {label}: {clip} not present on this machine");
+                continue;
+            }
+            let picture = clip_frame(clip, skip, width, height);
+            for &q in &[60u8, 150] {
+                // SAFETY (not literally unsafe, just process-global): this is
+                // a single-threaded #[ignore] probe, run by hand, never
+                // alongside other tests that read Search::top_k.
+                set_test_top_k_override(None);
+                let baseline = encode_key_frame(&picture, q, 0.5).unwrap();
+                let baseline_psnr = psnr(&baseline.reconstruction.y, &picture.y);
+                eprint!(
+                    "{label:9} q={q:3}  baseline {:6} bytes  {:6.2} dB",
+                    baseline.stream.len(),
+                    baseline_psnr
+                );
+                for &k in &[3usize, 4, 6] {
+                    set_test_top_k_override(Some(k));
+                    let pruned = encode_key_frame(&picture, q, 0.5).unwrap();
+                    let pruned_psnr = psnr(&pruned.reconstruction.y, &picture.y);
+                    eprint!(
+                        "   K={k} {:6} bytes  {:6.2} dB ({:+.3} dB)",
+                        pruned.stream.len(),
+                        pruned_psnr,
+                        pruned_psnr - baseline_psnr
+                    );
+                }
+                eprintln!();
+            }
+        }
+        set_test_top_k_override(None);
+    }
+
+    /// The replica-shaped path: 24 frames, 1280x720, one key frame followed
+    /// by inter frames -- the same GOP shape [`encode_sequence`] gives the
+    /// facade -- timed end to end, so the edith export-time projection is a
+    /// real number rather than a guess from the isolated key/inter numbers
+    /// above. Run with and without `EC_AV1_PRUNE_K` set to compare.
+    /// `cargo test -p ec-av1 --release sequence_bench_sanity -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a perf probe, not a gate"]
+    fn sequence_bench_sanity() {
+        use std::time::Instant;
+        let (width, height) = (1280usize, 720usize);
+        let pictures: Vec<Picture> = (0..24)
+            .map(|i| panned_test_card(width, height, i * 3))
+            .collect();
+        let t = Instant::now();
+        let encoded = encode_sequence(&pictures, 100, 0.5).unwrap();
+        let elapsed = t.elapsed();
+        let total_bytes: usize = encoded.frames.iter().map(|f| f.stream.len()).sum();
+        eprintln!(
+            "24 frames @ 1280x720: {elapsed:>9.2?} total, {:>9.2?}/frame, {total_bytes} bytes",
+            elapsed / 24
+        );
     }
 }
