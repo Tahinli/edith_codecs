@@ -742,17 +742,83 @@ impl Plane<'_> {
         }
     }
 
-    /// Codes one block under every mode the search offers and commits the one
-    /// whose squared error and estimated rate come out cheapest.
+    /// Codes one block under every mode the search offers (or, when
+    /// [`Search::top_k`] prunes it, the cheapest `top_k` of them by a SAD
+    /// pre-pass plus DC) and commits the one whose squared error and
+    /// estimated rate come out cheapest.
+    ///
+    /// The prediction is built once per mode regardless -- the full RD trial
+    /// needs it too -- so ranking modes by SAD on that same prediction before
+    /// running the expensive part (forward transform, quantize, reconstruct,
+    /// `coeff_bits`) on only the survivors costs nothing extra to predict,
+    /// only to sum.
     fn search_block(
         &mut self,
         at: At,
         search: &Search,
         mode_bits: &[f64; 13],
     ) -> (Vec<Coeff>, u8, f64) {
+        let At {
+            x, y, side, reach, ..
+        } = at;
+        let (above, left, corner) = self.edges(x, y, side, reach);
+        let mut scored: Vec<(f64, u8, Vec<u8>)> = search
+            .modes
+            .iter()
+            .map(|&mode| {
+                let mut prediction = vec![0u8; side * side];
+                crate::intra::predict(
+                    mode,
+                    above.as_deref(),
+                    left.as_deref(),
+                    corner,
+                    side,
+                    &mut prediction,
+                );
+                let sad: f64 = (0..side * side)
+                    .map(|i| {
+                        let (row, col) = (i / side, i % side);
+                        f64::from(
+                            (i32::from(self.source[(y + row) * self.width + x + col])
+                                - i32::from(prediction[i]))
+                            .abs(),
+                        )
+                    })
+                    .sum();
+                (
+                    sad + search.lambda * mode_bits[usize::from(mode)],
+                    mode,
+                    prediction,
+                )
+            })
+            .collect();
+        if let Some(k) = search.top_k {
+            if k < scored.len() {
+                let dc_pos = scored.iter().position(|&(_, mode, _)| mode == DC_PRED);
+                let dc_entry = dc_pos.map(|i| scored.remove(i));
+                scored.sort_by(|a, b| a.0.partial_cmp(&b.0).expect("scores are finite"));
+                scored.truncate(if dc_entry.is_some() {
+                    k.saturating_sub(1)
+                } else {
+                    k
+                });
+                if let Some(dc_entry) = dc_entry {
+                    scored.push(dc_entry);
+                }
+            }
+        }
         let mut best: Option<(f64, u8, Trial)> = None;
-        for &mode in search.modes {
-            let trial = self.trial(at, mode, search.base_q_idx, search.deadzone);
+        for (_, mode, prediction) in scored {
+            let trial = self.code_from_prediction(
+                x,
+                y,
+                side,
+                &prediction,
+                false,
+                search.base_q_idx,
+                search.deadzone,
+                at.set,
+            );
             let cost = trial.sse + search.lambda * (trial.bits + mode_bits[usize::from(mode)]);
             if best
                 .as_ref()
@@ -762,8 +828,8 @@ impl Plane<'_> {
             }
         }
         let (cost, mode, trial) = best.expect("the search offers at least one mode");
-        self.commit(at.x, at.y, at.side, &trial);
-        (coeffs(&trial.levels, at.side), mode, cost)
+        self.commit(x, y, side, &trial);
+        (coeffs(&trial.levels, side), mode, cost)
     }
 }
 
@@ -1011,7 +1077,51 @@ struct Search<'a> {
     deadzone: f64,
     lambda: f64,
     modes: &'a [u8],
+    /// How many of `modes` the full RD trial (forward transform, quantize,
+    /// reconstruct, `coeff_bits`) actually runs on, ranked by a cheap SAD
+    /// pre-pass on the prediction residual alone plus DC (always kept, since
+    /// libaom's own intra pruning -- `av1/encoder/speed_features.c`'s
+    /// `intra_pruning_with_hog` -- never prunes it away). `None` runs every
+    /// mode through full RD, unchanged from before this lever.
+    top_k: Option<usize>,
 }
+
+/// [`Search::top_k`]'s value: `None` keeps every mode's search unchanged
+/// (the default, until a lever's quality gate justifies pruning by default);
+/// `EC_AV1_PRUNE_K` sweeps it in a test build without touching callers.
+fn prune_top_k() -> Option<usize> {
+    #[cfg(test)]
+    {
+        if let Some(k) = TEST_TOP_K_OVERRIDE.with(|cell| cell.get()) {
+            return k;
+        }
+    }
+    let swept = std::env::var("EC_AV1_PRUNE_K")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok());
+    match swept {
+        Some(k) if cfg!(test) => Some(k),
+        _ => PRUNE_TOP_K,
+    }
+}
+
+/// A per-thread override [`prune_top_k`] checks first, so one test can sweep
+/// `top_k` in-process without mutating the environment (forbidden here --
+/// `#![forbid(unsafe_code)]` -- and racy across parallel tests besides).
+#[cfg(test)]
+thread_local! {
+    static TEST_TOP_K_OVERRIDE: std::cell::Cell<Option<Option<usize>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn set_test_top_k_override(value: Option<usize>) {
+    TEST_TOP_K_OVERRIDE.with(|cell| cell.set(Some(value)));
+}
+
+/// The default: unpruned, thirteen full trials per block, same as before this
+/// lever. Set from the sweep in the lane report if the quality gate clears it.
+const PRUNE_TOP_K: Option<usize> = None;
 
 /// One mode's coding of one block, before it is committed.
 struct Trial {
@@ -1161,6 +1271,7 @@ pub(crate) fn encode_key_frame_inner(
         deadzone,
         lambda: lambda_scale() * step * step,
         modes,
+        top_k: prune_top_k(),
     };
 
     // The block grid this frame is coded over: [`crate::tile::block_grid`]'s
@@ -1923,6 +2034,7 @@ pub(crate) fn encode_inter_frame(
         deadzone,
         lambda: lambda_scale() * step * step,
         modes: &KEY_FRAME_MODES,
+        top_k: prune_top_k(),
     };
     let mode_bits_table = inter_mode_bits();
 
@@ -3570,5 +3682,100 @@ mod tests {
                  coeff_bits:                   {entropy_t:>9.2?}"
             );
         }
+    }
+
+    /// The quality gate [`Search::top_k`]'s lever lives or dies by: three real
+    /// frames (a dark/flat one, a detailed one, a normal film one) at two
+    /// `base_q_idx` values, encoded with the mode search unpruned (`top_k =
+    /// None`, the baseline this same build produces without
+    /// `EC_AV1_PRUNE_K` set) and with it pruned to each of a few `K`, bytes
+    /// and luma PSNR compared side by side. Not a gate itself -- the numbers
+    /// go in the lane report, which is where "ship as default" is decided --
+    /// so it stays `#[ignore]`, run by hand with real clips on this machine.
+    /// `cargo test -p ec-av1 --release prune_k_quality_sweep -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "needs real clips and ffmpeg; prints numbers for the lane report to judge"]
+    fn prune_k_quality_sweep() {
+        if !have_ffmpeg() {
+            eprintln!("SKIP prune_k_quality_sweep: no ffmpeg");
+            return;
+        }
+        let (width, height) = (640usize, 352usize);
+        let frames: &[(&str, &str, &str)] = &[
+            // (label, clip, seek) -- a near-black scene, a busy one, and an
+            // ordinary film frame, each from a different real file.
+            (
+                "dark/flat",
+                "/home/tahinli/Videos/he_is_not_the_only_one.mp4",
+                "3",
+            ),
+            (
+                "detailed",
+                "/home/tahinli/Downloads/The.Hunger.Games.The.Ballad.Of.Songbirds.And.Snakes.2023.Bluray.2160p.AV1.HDR10.OPUS.7.1-UH.mkv",
+                "1200",
+            ),
+            (
+                "film",
+                "/home/tahinli/Videos/Films/Troy.Director's.Cut.2004.Bluray.1080P.AV1.OPUS.5.1-DECK.mkv",
+                "600",
+            ),
+        ];
+        for &(label, clip, skip) in frames {
+            if !std::path::Path::new(clip).exists() {
+                eprintln!("SKIP {label}: {clip} not present on this machine");
+                continue;
+            }
+            let picture = clip_frame(clip, skip, width, height);
+            for &q in &[60u8, 150] {
+                // SAFETY (not literally unsafe, just process-global): this is
+                // a single-threaded #[ignore] probe, run by hand, never
+                // alongside other tests that read Search::top_k.
+                set_test_top_k_override(None);
+                let baseline = encode_key_frame(&picture, q, 0.5).unwrap();
+                let baseline_psnr = psnr(&baseline.reconstruction.y, &picture.y);
+                eprint!(
+                    "{label:9} q={q:3}  baseline {:6} bytes  {:6.2} dB",
+                    baseline.stream.len(),
+                    baseline_psnr
+                );
+                for &k in &[3usize, 4, 6] {
+                    set_test_top_k_override(Some(k));
+                    let pruned = encode_key_frame(&picture, q, 0.5).unwrap();
+                    let pruned_psnr = psnr(&pruned.reconstruction.y, &picture.y);
+                    eprint!(
+                        "   K={k} {:6} bytes  {:6.2} dB ({:+.3} dB)",
+                        pruned.stream.len(),
+                        pruned_psnr,
+                        pruned_psnr - baseline_psnr
+                    );
+                }
+                eprintln!();
+            }
+        }
+        set_test_top_k_override(None);
+    }
+
+    /// The replica-shaped path: 24 frames, 1280x720, one key frame followed
+    /// by inter frames -- the same GOP shape [`encode_sequence`] gives the
+    /// facade -- timed end to end, so the edith export-time projection is a
+    /// real number rather than a guess from the isolated key/inter numbers
+    /// above. Run with and without `EC_AV1_PRUNE_K` set to compare.
+    /// `cargo test -p ec-av1 --release sequence_bench_sanity -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a perf probe, not a gate"]
+    fn sequence_bench_sanity() {
+        use std::time::Instant;
+        let (width, height) = (1280usize, 720usize);
+        let pictures: Vec<Picture> = (0..24)
+            .map(|i| panned_test_card(width, height, i * 3))
+            .collect();
+        let t = Instant::now();
+        let encoded = encode_sequence(&pictures, 100, 0.5).unwrap();
+        let elapsed = t.elapsed();
+        let total_bytes: usize = encoded.frames.iter().map(|f| f.stream.len()).sum();
+        eprintln!(
+            "24 frames @ 1280x720: {elapsed:>9.2?} total, {:>9.2?}/frame, {total_bytes} bytes",
+            elapsed / 24
+        );
     }
 }
