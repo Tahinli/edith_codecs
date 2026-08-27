@@ -465,6 +465,13 @@ pub struct BlockCoeffs {
     /// block. Only [`sb_coeff_inter_frame_tile`] codes `is_inter`; the key
     /// frame writers never read this field.
     pub inter: Option<InterInfo>,
+    /// The 8x8 leaves a straddling 16x16 block is split into (lane-av1-rect),
+    /// each with its own 8x8 luma transform and 4x4 chroma transforms, in
+    /// raster order among the leaves that are inside the true frame. `Some`
+    /// overrides this `BlockCoeffs`'s own `luma`/`u`/`v`/`mode`, which are left
+    /// at their defaults and unused, the same way a `Whole` [`Superblock`]'s
+    /// per-quadrant fields are unused.
+    pub eight: Option<Vec<BlockCoeffs>>,
 }
 
 /// One inter mode [`sb_coeff_inter_frame_tile`]'s blocks may take (spec
@@ -509,8 +516,11 @@ const BLOCK: usize = 32;
 /// Side of the chroma transform beside it at 4:2:0, and of the luma transform
 /// of a 16x16 block.
 const TX16: usize = 16;
-/// Side of the chroma transform of a 16x16 block at 4:2:0.
+/// Side of the chroma transform of a 16x16 block at 4:2:0, and of the luma
+/// transform of an 8x8 leaf under a straddling 16x16 (lane-av1-rect).
 const TX8: usize = 8;
+/// Side of the chroma transform of an 8x8 leaf at 4:2:0 (lane-av1-rect).
+const TX4: usize = 4;
 /// Side of a superblock, in samples, which is the size a block outside the
 /// tile reads as.
 const SB: usize = 64;
@@ -606,6 +616,17 @@ struct Neighbours {
     above_side: Vec<usize>,
     /// The same, down the left edge.
     left_side: Vec<usize>,
+    /// The same as `above_side`/`left_side`, but kept at the finer mi (4x4)
+    /// granularity [`Self::above`]/[`Self::left`] are, rather than [`SUB`]:
+    /// two 8x8 leaves of one straddling 16x16 block (lane-av1-rect) share a
+    /// single [`SUB`]-grid cell, so a coarse array cannot tell the second
+    /// leaf's partition symbol that the first one was coded at 8x8 (finer
+    /// than the 16x16 it sits in) -- exactly what its `above`/`left` context
+    /// needs to read (spec 9.3's `AbovePartitionContext`/`LeftPartitionContext`,
+    /// which libaom keeps per mi unit for this reason).
+    above_side_mi: Vec<usize>,
+    /// The same, down the left edge.
+    left_side_mi: Vec<usize>,
     /// Whether the neighbour carried no residual, for [`sb_coeff_inter_frame_tile`]'s
     /// skip context. Unused (and left at its default) by the key frame writers.
     above_skip: Vec<bool>,
@@ -653,6 +674,8 @@ impl Neighbours {
             left_mode: vec![DC_PRED; rows],
             above_side: vec![SB; cols],
             left_side: vec![SB; rows],
+            above_side_mi: vec![SB; cols * (SUB / MI)],
+            left_side_mi: vec![SB; rows * (SUB / MI)],
             above_skip: vec![false; cols],
             left_skip: vec![false; rows],
             above_inter: vec![false; cols],
@@ -667,6 +690,7 @@ impl Neighbours {
         self.left.iter_mut().for_each(|l| *l = Default::default());
         self.left_mode.iter_mut().for_each(|m| *m = DC_PRED);
         self.left_side.iter_mut().for_each(|s| *s = SB);
+        self.left_side_mi.iter_mut().for_each(|s| *s = SB);
         self.left_skip.iter_mut().for_each(|s| *s = false);
         self.left_inter.iter_mut().for_each(|i| *i = false);
     }
@@ -680,14 +704,30 @@ impl Neighbours {
     /// side).
     fn record(&mut self, at: (usize, usize), side: usize, mode: usize, grids: &[Vec<i32>; 3]) {
         let (r, c) = at;
-        let states: [Neighbour; 3] = std::array::from_fn(|plane| neighbour_state(&grids[plane]));
         for cell in 0..side / SUB {
             self.above_mode[c + cell] = mode;
             self.left_mode[r + cell] = mode;
             self.above_side[c + cell] = side;
             self.left_side[r + cell] = side;
         }
-        let (mi_r, mi_c, side_mi) = (r * (SUB / MI), c * (SUB / MI), side / MI);
+        self.record_mi((r * (SUB / MI), c * (SUB / MI)), side, grids);
+    }
+
+    /// The coefficient-context half of [`Self::record`], taking the block's
+    /// position directly in 4x4 mode-info units rather than [`SUB`]-grid
+    /// (r, c): an 8x8 leaf under a straddling 16x16 (lane-av1-rect) sits at a
+    /// mi offset [`Self::record`]'s SUB-unit `at` cannot name, but the
+    /// `above`/`left` arrays it writes into are already sized to the full mi
+    /// grid, so no resizing is needed to write into them at this
+    /// finer-than-SUB granularity.
+    fn record_mi(&mut self, at_mi: (usize, usize), side: usize, grids: &[Vec<i32>; 3]) {
+        let (mi_r, mi_c) = at_mi;
+        let states: [Neighbour; 3] = std::array::from_fn(|plane| neighbour_state(&grids[plane]));
+        let side_mi = side / MI;
+        for cell in 0..side_mi {
+            self.left_side_mi[mi_r + cell] = side;
+            self.above_side_mi[mi_c + cell] = side;
+        }
         // libaom rounds the luma edge up to the plane's own 4x4 unit before
         // clamping a subsampled plane (`ROUND_POWER_OF_TWO(max_blocks_high,
         // subsampling_y)` in av1_write_intra_coeffs_mb, encodetxb.c:456-459):
@@ -741,7 +781,13 @@ impl Neighbours {
     /// The gathered state of the blocks above and to the left of one block,
     /// per plane.
     fn around(&self, (r, c): (usize, usize), side: usize) -> [Around; 3] {
-        let (mi_r, mi_c, side_mi) = (r * (SUB / MI), c * (SUB / MI), side / MI);
+        self.around_mi((r * (SUB / MI), c * (SUB / MI)), side)
+    }
+
+    /// [`Self::around`] taking the block's position directly in 4x4 mode-info
+    /// units, for the same reason [`Self::record_mi`] does.
+    fn around_mi(&self, (mi_r, mi_c): (usize, usize), side: usize) -> [Around; 3] {
+        let side_mi = side / MI;
         std::array::from_fn(|plane| {
             let mut around = Around::default();
             for cell in 0..side_mi {
@@ -758,8 +804,23 @@ impl Neighbours {
     }
 
     fn partition_ctx(&self, at: (usize, usize), side: usize) -> usize {
+        // Delegates to the mi-precise reader (same pattern as `around` /
+        // `around_mi`): `above_side`/`left_side` are only ever advanced in
+        // whole-[`SUB`] steps by [`Self::record`], so a leaf8's `record_mi`
+        // (lane-av1-rect) -- which only touches the finer mi arrays -- leaves
+        // them stale for the *next* sibling's own partition symbol, reading a
+        // 16x16-slot side that already split into 8x8s underneath it.
         let (r, c) = at;
-        2 * usize::from(self.left_side[r] * 2 <= side) + usize::from(self.above_side[c] * 2 <= side)
+        self.partition_ctx_mi((r * (SUB / MI), c * (SUB / MI)), side)
+    }
+
+    /// [`Self::partition_ctx`] at mi granularity, for an 8x8 leaf of a
+    /// straddling 16x16 block: reads the finer `above_side_mi`/`left_side_mi`
+    /// arrays so the second leaf sees the first leaf's own 8x8 side rather
+    /// than the enclosing 16x16 slot's stale, shared state.
+    fn partition_ctx_mi(&self, (mi_r, mi_c): (usize, usize), side: usize) -> usize {
+        2 * usize::from(self.left_side_mi[mi_r] * 2 <= side)
+            + usize::from(self.above_side_mi[mi_c] * 2 <= side)
     }
 }
 
@@ -800,7 +861,12 @@ pub fn sb_coeff_key_frame_tile(
         match superblock {
             Superblock::Whole(block) => coded.push(block),
             Superblock::Split(quadrants) => {
-                coded.extend(quadrants.iter().flat_map(Quadrant::blocks));
+                for block in quadrants.iter().flat_map(Quadrant::blocks) {
+                    match &block.eight {
+                        Some(leaves) => coded.extend(leaves.iter()),
+                        None => coded.push(block),
+                    }
+                }
             }
         }
     }
@@ -820,7 +886,12 @@ pub fn sb_coeff_key_frame_tile(
     let sub_planes = [TxbSet::Luma16, TxbSet::Chroma8, TxbSet::Chroma8];
     let split_planes = [TxbSet::Luma32, TxbSet::Chroma16, TxbSet::Chroma16];
     let whole_planes = [TxbSet::Luma64, TxbSet::Chroma32, TxbSet::Chroma32];
-    let scans = [default_scan(TX32), default_scan(TX16), default_scan(TX8)];
+    let scans = [
+        default_scan(TX32),
+        default_scan(TX16),
+        default_scan(TX8),
+        default_scan(TX4),
+    ];
     // The blocks above and to the left, on the 16x16 grid. The left edge is
     // reset at every superblock row because a tile starts each row with no
     // left neighbour.
@@ -1027,26 +1098,14 @@ pub fn sb_coeff_key_frame_tile(
                                     (false, false) => {}
                                 }
                                 for (block, (sr, sc)) in blocks.iter().zip(sub_positions) {
-                                    // A 16x16 leaf's own hasRows/hasCols: this
-                                    // writer has no smaller partition than
-                                    // 16x16 (no 8x8 or rectangular transform),
-                                    // so a leaf the true edge itself cuts
-                                    // through -- legal in the spec only via a
-                                    // `PARTITION_HORZ`/`VERT` this writer does
-                                    // not code -- is refused rather than
-                                    // silently miscoded.
+                                    // A 16x16 leaf's own hasRows/hasCols,
+                                    // recomputed at this leaf's own half
+                                    // (same three-way signaling as the 32x32
+                                    // and 64x64 levels above).
                                     let (has_cols16, has_rows16) = (
                                         has_half(sc as u32 * SUB_MI, SUB_MI, mi_cols),
                                         has_half(sr as u32 * SUB_MI, SUB_MI, mi_rows),
                                     );
-                                    if !has_cols16 || !has_rows16 {
-                                        return Err(Error::unsupported(
-                                            "AV1 tile",
-                                            "a 16x16 block the true frame edge cuts through \
-                                             needs a rectangular transform this writer does \
-                                             not code yet",
-                                        ));
-                                    }
                                     let at = (sr, sc);
                                     let ctx = neighbours.partition_ctx(at, SUB);
                                     ec_rng_trace(|| {
@@ -1058,32 +1117,156 @@ pub fn sb_coeff_key_frame_tile(
                                             enc.tell()
                                         )
                                     });
-                                    enc.symbol(PARTITION_NONE, &mut cdfs.partition_w16[ctx]);
-                                    let grids = [
-                                        level_grid(&block.luma, TX16)?,
-                                        level_grid(&block.u, TX8)?,
-                                        level_grid(&block.v, TX8)?,
-                                    ];
-                                    write_block(
-                                        &mut enc,
-                                        &mut cdfs,
-                                        &mut neighbours,
-                                        block,
-                                        at,
-                                        SUB,
-                                        &sub_planes,
-                                        &grids,
-                                        [&scans[1], &scans[2], &scans[2]],
-                                        true,
-                                    );
-                                    ec_rng_trace(|| {
-                                        format!(
-                                            "EC_TOK mi_row={} mi_col={} tell={}",
-                                            at.0 * 4,
-                                            at.1 * 4,
-                                            enc.tell()
+                                    if has_cols16 && has_rows16 {
+                                        enc.symbol(PARTITION_NONE, &mut cdfs.partition_w16[ctx]);
+                                        let grids = [
+                                            level_grid(&block.luma, TX16)?,
+                                            level_grid(&block.u, TX8)?,
+                                            level_grid(&block.v, TX8)?,
+                                        ];
+                                        write_block(
+                                            &mut enc,
+                                            &mut cdfs,
+                                            &mut neighbours,
+                                            block,
+                                            at,
+                                            SUB,
+                                            &sub_planes,
+                                            &grids,
+                                            [&scans[1], &scans[2], &scans[2]],
+                                            true,
+                                        );
+                                        ec_rng_trace(|| {
+                                            format!(
+                                                "EC_TOK mi_row={} mi_col={} tell={}",
+                                                at.0 * 4,
+                                                at.1 * 4,
+                                                enc.tell()
+                                            )
+                                        });
+                                        continue;
+                                    }
+                                    // The true edge falls inside this 16x16
+                                    // leaf itself (mod-32==8 target sizes):
+                                    // one axis only, per r6's charter -- an
+                                    // 8x8 leaf never itself straddles, so the
+                                    // block splits cleanly along whichever
+                                    // axis is short and only the in-frame
+                                    // 8x8s are coded, each its own leaf.
+                                    if !has_cols16 && !has_rows16 {
+                                        return Err(Error::unsupported(
+                                            "AV1 tile",
+                                            "a 16x16 block whose true edge cuts through both \
+                                             axes needs a rectangular transform this writer \
+                                             does not code yet",
+                                        ));
+                                    }
+                                    if has_cols16 {
+                                        enc.symbol_fixed(
+                                            1,
+                                            &gather(&cdfs.partition_w16[ctx], VERT_ALIKE),
+                                        );
+                                    } else {
+                                        enc.symbol_fixed(
+                                            1,
+                                            &gather(&cdfs.partition_w16[ctx], HORZ_ALIKE),
+                                        );
+                                    }
+                                    let leaves = block.eight.as_ref().ok_or_else(|| {
+                                        Error::unsupported(
+                                            "AV1 tile",
+                                            "a 16x16 block the true frame edge cuts through \
+                                             needs its `eight` leaves populated",
                                         )
-                                    });
+                                    })?;
+                                    let (mi_row0, mi_col0) =
+                                        (sr as u32 * SUB_MI, sc as u32 * SUB_MI);
+                                    let leaf_positions: Vec<(u32, u32)> = (0..4)
+                                        .map(|i| (mi_row0 + (i / 2) * 2, mi_col0 + (i % 2) * 2))
+                                        .filter(|&(mr, mc)| mr < mi_rows && mc < mi_cols)
+                                        .collect();
+                                    if leaves.len() != leaf_positions.len() {
+                                        return Err(Error::unsupported(
+                                            "AV1 tile",
+                                            "a straddling 16x16 block needs one `eight` entry \
+                                             per 8x8 leaf inside the true frame",
+                                        ));
+                                    }
+                                    // r11: the enclosing 16x16 slot's
+                                    // above_mode/left_mode arrays are too
+                                    // coarse for a second leaf whose true
+                                    // above (or left) neighbour is the FIRST
+                                    // leaf -- track it here and hand it to
+                                    // write_leaf8 as a context override.
+                                    let mut prev_leaf: Option<((usize, usize), usize)> = None;
+                                    for (leaf, (mr, mc)) in leaves.iter().zip(leaf_positions) {
+                                        let leaf_mi = (mr as usize, mc as usize);
+                                        // r8: read at mi granularity, not the
+                                        // enclosing 16x16 slot -- the first
+                                        // leaf's `record_mi` call below
+                                        // updates `above_side_mi`/
+                                        // `left_side_mi` at this leaf's own
+                                        // mi position, which the second
+                                        // leaf's ctx lookup then sees.
+                                        let leaf_ctx = neighbours.partition_ctx_mi(leaf_mi, 8);
+                                        ec_rng_trace(|| {
+                                            format!(
+                                                "EC_PART mi_row={} mi_col={} bsize=3 ctx={} tell={}",
+                                                leaf_mi.0,
+                                                leaf_mi.1,
+                                                leaf_ctx,
+                                                enc.tell()
+                                            )
+                                        });
+                                        enc.symbol(
+                                            PARTITION_NONE,
+                                            &mut cdfs.partition_w8[leaf_ctx],
+                                        );
+                                        let grids = [
+                                            level_grid(&leaf.luma, TX8)?,
+                                            level_grid(&leaf.u, TX4)?,
+                                            level_grid(&leaf.v, TX4)?,
+                                        ];
+                                        let leaf_mode = write_leaf8(
+                                            &mut enc,
+                                            &mut cdfs,
+                                            &mut neighbours,
+                                            leaf,
+                                            at,
+                                            leaf_mi,
+                                            &grids,
+                                            [&scans[2], &scans[3], &scans[3]],
+                                            prev_leaf,
+                                        );
+                                        prev_leaf = Some((leaf_mi, leaf_mode));
+                                        ec_rng_trace(|| {
+                                            format!(
+                                                "EC_TOK mi_row={} mi_col={} tell={}",
+                                                leaf_mi.0,
+                                                leaf_mi.1,
+                                                enc.tell()
+                                            )
+                                        });
+                                    }
+                                    // `record()`'s `above_mode`/`left_mode`
+                                    // write is a no-op at an 8x8 leaf's own
+                                    // side (`side / SUB == 0`), so the next
+                                    // 16x16 quadrant beyond this straddling
+                                    // one would otherwise see whatever stale
+                                    // mode sat here before it: force the
+                                    // write once the whole quadrant's leaves
+                                    // are done, from the last (bottom/right-
+                                    // most) leaf -- lane-av1-rect r15: doing
+                                    // this *inside* `write_leaf8`, once per
+                                    // leaf, let the first leaf's write
+                                    // clobber the true external neighbour a
+                                    // second leaf of the *same* quadrant
+                                    // still needed to read on its
+                                    // non-adjacency axis.
+                                    if let Some((_, mode)) = prev_leaf {
+                                        neighbours.above_mode[at.1] = mode;
+                                        neighbours.left_mode[at.0] = mode;
+                                    }
                                 }
                             }
                         }
@@ -1113,6 +1296,7 @@ fn write_intra_mode(
         mode,
         &mut cdfs.kf_y_mode[INTRA_MODE_CTX[above_mode]][INTRA_MODE_CTX[left_mode]],
     );
+    ec_rng_trace(|| format!("EC_YMODE mode={mode} tell={} rng={}", enc.tell(), enc.rng()));
     if (V_PRED..=D67_PRED).contains(&mode) {
         enc.symbol(ANGLE_DELTA_ZERO, &mut cdfs.angle_delta[mode - V_PRED]);
     }
@@ -1161,6 +1345,62 @@ fn write_block(
         mode,
     );
     neighbours.record(at, side, mode, grids);
+}
+
+/// Writes one 8x8 leaf of a straddling 16x16 block (lane-av1-rect): its own
+/// luma transform and 4x4 chroma transforms, coded exactly like
+/// [`write_block`] but reading its intra-mode context from the *enclosing*
+/// 16x16 slot -- `outer_at`, in [`SUB`]-grid units -- rather than from its own
+/// finer position, since [`Neighbours`]'s `above_mode`/`left_mode` arrays stay
+/// at [`SUB`] (16-sample) granularity. `leaf_mi` is this leaf's own position
+/// in 4x4 mode-info units, which is what its coefficient context (finer than
+/// [`SUB`]) is kept and read at.
+#[allow(clippy::too_many_arguments)]
+fn write_leaf8(
+    enc: &mut SymbolEncoder,
+    cdfs: &mut Cdfs,
+    neighbours: &mut Neighbours,
+    block: &BlockCoeffs,
+    outer_at: (usize, usize),
+    leaf_mi: (usize, usize),
+    grids: &[Vec<i32>; 3],
+    scans: [&Vec<u16>; 3],
+    prev_leaf: Option<((usize, usize), usize)>,
+) -> usize {
+    let (r, c) = outer_at;
+    let mut above_mode = neighbours.above_mode[c];
+    let mut left_mode = neighbours.left_mode[r];
+    // The previous leaf sits directly above (same column, two mi rows up)
+    // or directly to the left (same row, two mi cols over) of this one --
+    // in either case its just-written mode, not the enclosing 16x16 slot's
+    // stale neighbour, is what a decoder reads as this leaf's context.
+    if let Some(((pr, pc), pmode)) = prev_leaf {
+        if pc == leaf_mi.1 && leaf_mi.0 == pr + 2 {
+            above_mode = pmode;
+        } else if pr == leaf_mi.0 && leaf_mi.1 == pc + 2 {
+            left_mode = pmode;
+        }
+    }
+    // An 8x8 leaf is well within `is_cfl_allowed`'s <=32x32 bound (spec
+    // 5.11.5), so it reads the CFL-allowed `uv_mode_cfl` CDF -- like every
+    // other `write_block` caller at 16x16 and up -- not the narrower
+    // no-CFL one: r12 lane-av1-rect, this leaf's own `cfl: false` was the
+    // true first divergence (a differently-sized alphabet under the same
+    // DC_PRED decision desyncs the coder even though the decoded mode is
+    // unchanged).
+    let mode = write_intra_mode(enc, cdfs, block, above_mode, left_mode, true);
+    let planes = [TxbSet::Luma8, TxbSet::Chroma4, TxbSet::Chroma4];
+    write_block_planes(
+        enc,
+        cdfs,
+        &planes,
+        grids,
+        &scans,
+        &neighbours.around_mi(leaf_mi, 8),
+        mode,
+    );
+    neighbours.record_mi(leaf_mi, 8, grids);
+    mode
 }
 
 /// Writes the three transform blocks of one coded block, in the order a
@@ -1331,14 +1571,21 @@ pub(crate) fn luma_32_coeff_bits(grid: &[i32]) -> f64 {
 pub(crate) fn coeff_bits(grid: &[i32], set: TxbSet) -> f64 {
     /// Built once per size: the search prices thirteen modes for every block,
     /// and the scan is the same table every time.
-    static SCANS: LazyLock<[Vec<u16>; 3]> =
-        LazyLock::new(|| [default_scan(TX8), default_scan(TX16), default_scan(TX32)]);
+    static SCANS: LazyLock<[Vec<u16>; 4]> = LazyLock::new(|| {
+        [
+            default_scan(TX4),
+            default_scan(TX8),
+            default_scan(TX16),
+            default_scan(TX32),
+        ]
+    });
     let mut cdfs = Cdfs::new(2);
     let mut coding = cdfs.txb(set, DC_PRED);
     let scan = match coding.side {
-        TX8 => &SCANS[0],
-        TX16 => &SCANS[1],
-        _ => &SCANS[2],
+        TX4 => &SCANS[0],
+        TX8 => &SCANS[1],
+        TX16 => &SCANS[2],
+        _ => &SCANS[3],
     };
     let mut enc = SymbolEncoder::new();
     enc.reset_bits();
@@ -1397,9 +1644,10 @@ fn write_coeffs(
     if plane.is_some() {
         ec_rng_trace(|| {
             format!(
-                "EC_TXBSKIP ctx={skip_ctx} eob0={} tell={}",
+                "EC_TXBSKIP ctx={skip_ctx} eob0={} tell={} rng={}",
                 usize::from(eob == 0),
-                enc.tell()
+                enc.tell(),
+                enc.rng()
             )
         });
     }
@@ -1412,7 +1660,7 @@ fn write_coeffs(
     if let Some(tx_type) = coding.tx_type.as_deref_mut() {
         enc.symbol(TX_TYPE_DCT_DCT_SET2, tx_type);
         if plane.is_some() {
-            ec_rng_trace(|| format!("EC_TXTYPE tell={}", enc.tell()));
+            ec_rng_trace(|| format!("EC_TXTYPE tell={} rng={}", enc.tell(), enc.rng()));
         }
     }
 
@@ -1525,7 +1773,13 @@ fn write_eob(enc: &mut SymbolEncoder, coding: &mut TxbTables, eob: usize, plane:
     // reaches is the size of its own end-of-block alphabet.
     enc.symbol(group - 1, coding.eob_pt);
     if let Some(plane) = plane {
-        ec_rng_trace(|| format!("EC_EOBPT plane={plane} eob_pt={group} tell={}", enc.tell()));
+        ec_rng_trace(|| {
+            format!(
+                "EC_EOBPT plane={plane} eob_pt={group} tell={} rng={}",
+                enc.tell(),
+                enc.rng()
+            )
+        });
     }
 
     let bits = OFFSET_BITS[group];

@@ -431,6 +431,19 @@ pub(crate) fn key_frame_headers_colour(
             ..QuantizationParams::default()
         },
         tx_mode: TxMode::Largest,
+        // Forces `get_tx_set` (spec 5.11.48) to `TX_SET_INTRA_2` for every
+        // intra transform below 32x32, not only 16x16 -- the set this crate
+        // carries a table for at 8x8/16x16 (`INTRA_TX_TYPE_SET2_8`/`_16`).
+        // This bit is part of the bitstream (spec 5.9.2's `reduced_tx_set`),
+        // so a decoder honouring the header picks the same CDF the writer
+        // used only if this is set here too, not only on the inter variant
+        // below -- an r14 lane-av1-rect fix: a key frame's own header used to
+        // default this to `false`, so `av1_get_ext_tx_set_type` picked the
+        // 7-symbol `TX_SET_INTRA_1` table on the decoder side while the
+        // writer coded against the 5-symbol `TX_SET_INTRA_2` one, diverging
+        // the arithmetic coder's `rng` register from the very first 8x8-leaf
+        // luma transform onward with no symbol value ever differing.
+        reduced_tx_set: true,
         ..FrameHeader::default()
     };
     Ok((seq, header))
@@ -472,10 +485,12 @@ pub fn inter_frame_headers(
         // set this crate carries a table for at 16x16 (see
         // `crate::cdf::INTER_TX_TYPE_SET3_16`'s doc comment). A 32x32 inter
         // transform is unaffected (its `txSzSqrUp == TX_32X32` branch already
-        // reads `TX_SET_INTER_3` regardless of this flag), and neither is any
-        // intra transform at any size (`get_tx_set`'s intra branch returns
-        // the same `TX_SET_INTRA_2` at 16x16 with or without it), so this
-        // only narrows the 16x16-and-smaller inter case this crate is adding.
+        // reads `TX_SET_INTER_3` regardless of this flag). An intra transform
+        // IS affected below 16x16 too, not only at 16x16 (r11 lane-av1-rect:
+        // the earlier claim here was wrong and desynced the 8x8-leaf straddle
+        // path) -- with this flag set, `get_tx_set`'s intra branch returns
+        // `TX_SET_INTRA_2` at every size up to 16x16, so `TX_8X8` reads
+        // [`crate::cdf::INTRA_TX_TYPE_SET2_8`], not `SET1_8`.
         reduced_tx_set: true,
         ..key
     };
@@ -946,11 +961,28 @@ pub(crate) struct Reach {
 /// it. Indexed by the block's position in the superblock, in blocks of its own
 /// size, as `row * (128 / side) + col` (`Reach::table_stride`) -- libaom's
 /// 128, not this crate's 64 superblock -- bit by bit from the low end.
-const HAS_TOP_RIGHT: [&[u8]; 2] = [&[255, 85, 119, 85, 127, 85, 119, 85], &[95, 87]];
+const HAS_TOP_RIGHT: [&[u8]; 3] = [
+    &[255, 85, 119, 85, 127, 85, 119, 85],
+    &[95, 87],
+    // has_tr_8x8 (libaom av1/common/reconintra.c) -- table_stride(8) == 16
+    // (128 / 8), so this row is 16 wide by 16 rows, 32 bytes.
+    &[
+        255, 255, 85, 85, 119, 119, 85, 85, 127, 127, 85, 85, 119, 119, 85, 85, 255, 127, 85, 85,
+        119, 119, 85, 85, 127, 127, 85, 85, 119, 119, 85, 85,
+    ],
+];
 
 /// `has_bl_16x16` / `has_bl_32x32`: the same, for the block below and to the
 /// left.
-const HAS_BOTTOM_LEFT: [&[u8]; 2] = [&[84, 16, 84, 0, 84, 16, 84, 0], &[4, 4]];
+const HAS_BOTTOM_LEFT: [&[u8]; 3] = [
+    &[84, 16, 84, 0, 84, 16, 84, 0],
+    &[4, 4],
+    // has_bl_8x8 (libaom av1/common/reconintra.c)
+    &[
+        84, 85, 16, 17, 84, 85, 0, 1, 84, 85, 16, 17, 84, 85, 0, 0, 84, 85, 16, 17, 84, 85, 0, 1,
+        84, 85, 16, 17, 84, 85, 0, 0,
+    ],
+];
 
 impl Reach {
     /// What a block of `side` samples at `(x, y)` may read past its own edges,
@@ -1029,9 +1061,15 @@ impl Reach {
         128 / side
     }
 
-    /// Which of the two block sizes the encoder codes a table row is for.
+    /// Which of the three block sizes the encoder codes a table row is for.
     fn table(side: usize) -> usize {
-        usize::from(side == BLOCK)
+        if side == BLOCK {
+            1
+        } else if side == 8 {
+            2
+        } else {
+            0
+        }
     }
 
     /// One bit of a table, counting from the low end of its first byte.
@@ -1069,6 +1107,15 @@ fn code_square(
 ) -> (BlockCoeffs, f64) {
     let (luma_set, chroma_set) = if side == BLOCK {
         (TxbSet::Luma32, TxbSet::Chroma16)
+    } else if side == 8 {
+        // An 8x8 leaf under a straddling 16x16 (lane-av1-rect). r5 correction:
+        // `TxbSet::Chroma4`'s doc now has the checked spec fact -- chroma is
+        // `is_chroma_reference` at every BLOCK_8X8, so it is coded per leaf at
+        // 4x4, not once at the parent's 8x8. No caller passes `side == 8` yet
+        // (this branch is still unreached), so leaving `Chroma8` here would
+        // silently wire the wrong table the moment one does; `Chroma4` is
+        // what a real caller needs.
+        (TxbSet::Luma8, TxbSet::Chroma4)
     } else {
         (TxbSet::Luma16, TxbSet::Chroma8)
     };
@@ -1253,6 +1300,7 @@ fn code_square_inter(
             v: coeffs(&v.levels, SUB / 2),
             mode: DC_PRED as u8,
             skip,
+            eight: None,
             inter: Some(InterInfo {
                 mode: InterMode::NearestMv,
                 mv,
@@ -1656,24 +1704,37 @@ pub(crate) fn encode_key_frame_inner(
                     ),
                 );
                 let whole_legal = has_cols32 && has_rows32;
-                let split_legal = (0..4)
+                // A 16x16 sub-block's own hasCols/hasRows (spec
+                // `decode_partition`, recomputed at this leaf's own half): one
+                // axis false is a straddling leaf this writer codes as two
+                // 8x8 leaves (`crate::tile::write_leaf8`, lane-av1-rect r7);
+                // both axes false needs a rectangular transform this writer
+                // has no size for at all, whether whole or split.
+                let sub_half = |sr: usize, sc: usize| {
+                    (
+                        crate::tile::has_half(
+                            sc as u32 * crate::tile::SUB_MI,
+                            crate::tile::SUB_MI,
+                            header.mi_cols,
+                        ),
+                        crate::tile::has_half(
+                            sr as u32 * crate::tile::SUB_MI,
+                            crate::tile::SUB_MI,
+                            header.mi_rows,
+                        ),
+                    )
+                };
+                let both_axes_cut = (0..4)
                     .map(|i| (r0 + i / 2, c0 + i % 2))
                     .filter(|&(sr, sc)| {
                         (sr as u32) * crate::tile::SUB_MI < header.mi_rows
                             && (sc as u32) * crate::tile::SUB_MI < header.mi_cols
                     })
-                    .all(|(sr, sc)| {
-                        crate::tile::has_half(
-                            sc as u32 * crate::tile::SUB_MI,
-                            crate::tile::SUB_MI,
-                            header.mi_cols,
-                        ) && crate::tile::has_half(
-                            sr as u32 * crate::tile::SUB_MI,
-                            crate::tile::SUB_MI,
-                            header.mi_rows,
-                        )
+                    .any(|(sr, sc)| {
+                        let (has_cols16, has_rows16) = sub_half(sr, sc);
+                        !has_cols16 && !has_rows16
                     });
-                if !whole_legal && !split_legal {
+                if !whole_legal && both_axes_cut {
                     return Err(Error::unsupported(
                         "AV1 encode",
                         format!(
@@ -1717,22 +1778,67 @@ pub(crate) fn encode_key_frame_inner(
                     {
                         continue;
                     }
-                    let (block, cost) = code_square(
-                        &mut luma,
-                        &mut chroma,
-                        (x + (sub % 2) * SUB, y + (sub / 2) * SUB),
-                        SUB,
-                        &search,
-                        &mode_bits(above_mode[sc], left_mode[sr]),
-                    );
-                    cost_split += cost;
-                    split_modes.push(block.mode);
-                    above_mode[sc] = block.mode;
-                    left_mode[sr] = block.mode;
-                    split.push(block);
+                    let (has_cols16, has_rows16) = sub_half(sr, sc);
+                    if has_cols16 && has_rows16 {
+                        let (block, cost) = code_square(
+                            &mut luma,
+                            &mut chroma,
+                            (x + (sub % 2) * SUB, y + (sub / 2) * SUB),
+                            SUB,
+                            &search,
+                            &mode_bits(above_mode[sc], left_mode[sr]),
+                        );
+                        cost_split += cost;
+                        split_modes.push(block.mode);
+                        above_mode[sc] = block.mode;
+                        left_mode[sr] = block.mode;
+                        split.push(block);
+                    } else {
+                        // A straddling 16x16: two (or, at a true corner, one)
+                        // 8x8 leaves, in the raster order `write_leaf8`'s
+                        // caller expects. Both leaves cost against the SAME
+                        // enclosing-slot mode context (see
+                        // `crate::tile::write_leaf8`'s doc), and neither
+                        // updates `above_mode`/`left_mode` at this SUB slot --
+                        // the writer never does either, so the search must
+                        // not diverge from what it will actually read next.
+                        let leaf_mode_bits = mode_bits(above_mode[sc], left_mode[sr]);
+                        let (x_sub, y_sub) = (x + (sub % 2) * SUB, y + (sub / 2) * SUB);
+                        let mut leaves = Vec::with_capacity(2);
+                        for i in 0..4 {
+                            let leaf_x = x_sub + (i % 2) * 8;
+                            let leaf_y = y_sub + (i / 2) * 8;
+                            if leaf_x >= luma.true_width || leaf_y >= luma.true_height {
+                                continue;
+                            }
+                            let (leaf, cost) = code_square(
+                                &mut luma,
+                                &mut chroma,
+                                (leaf_x, leaf_y),
+                                8,
+                                &search,
+                                &leaf_mode_bits,
+                            );
+                            cost_split += cost;
+                            split_modes.push(leaf.mode);
+                            leaves.push(leaf);
+                        }
+                        split.push(BlockCoeffs {
+                            eight: Some(leaves),
+                            ..BlockCoeffs::default()
+                        });
+                    }
                 }
 
-                if split_legal && (!whole_legal || (split_blocks && cost_split < cost_whole)) {
+                // A split whose subs are all whole 16x16 is a real quality
+                // alternative to `whole`, exactly as before; a split
+                // carrying an 8x8-leaf sub was, through r14, only ever
+                // forced (`!whole_legal`), never chosen on cost, because the
+                // leaf path was not yet proven against a real decoder. r15
+                // closed that gap (`a_single_axis_straddle_round_trips_
+                // through_ffmpeg` decodes clean), so the guard is lifted:
+                // leaf8 splits now compete on cost like any other split.
+                if !whole_legal || (split_blocks && cost_split < cost_whole) {
                     modes.extend_from_slice(&split_modes);
                     blocks.push(Quadrant::Split(split));
                 } else {
@@ -2319,6 +2425,7 @@ fn search_inter_block(
         mode: best.mode,
         skip: best.skip,
         inter: best.inter,
+        eight: None,
     }
 }
 
@@ -2858,6 +2965,7 @@ mod tests {
             v: Vec::new(),
             mode: 0,
             skip: false,
+            eight: None,
             inter: Some(InterInfo {
                 mode: InterMode::NearestMv,
                 mv: (0, 0),
@@ -3207,29 +3315,56 @@ mod tests {
         }
     }
 
-    /// 640x360 is the class the charter asks be kept consistent between the
-    /// key frame and inter frame writers: 360 mod 32 == 8, so a 16x16 leaf's
-    /// own half (`has_half` at the SUB level) itself straddles the true edge
-    /// -- the genuine "needs an 8x8/rectangular transform" case neither
-    /// writer codes. Both must refuse it the same way.
+    /// 640x360 is the class the charter names: 360 mod 32 == 8, so a 16x16
+    /// leaf's own half (`has_half` at the SUB level) itself straddles the
+    /// true edge on one axis only. lane-av1-rect r7 wires the key frame
+    /// writer's 8x8-leaf path (`crate::tile::write_leaf8`) live for exactly
+    /// this case, so the key frame path no longer *refuses* it; the inter
+    /// frame path (`sb_coeff_inter_frame_tile`) was not part of this round's
+    /// wiring and still has no leaf-8 generation, so it must still refuse.
+    /// This only proves the encoder does not error out -- the leaf-8 stream
+    /// it produces is NOT yet proven decoder-clean (see
+    /// `a_single_axis_straddle_round_trips_through_ffmpeg`, currently
+    /// `#[ignore]`d on a genuine dav1d desync at the smaller 40x32 case).
     #[test]
-    fn both_writers_refuse_the_same_strictly_before_half_straddle_size() {
+    fn key_frame_encodes_the_inter_frame_still_refuses_at_half_straddle_size() {
         let (width, height) = (640usize, 360usize);
         let picture = Picture::grey(width, height);
-        let key_err = encode_key_frame(&picture, 100, 0.5).unwrap_err();
-        assert!(
-            key_err.to_string().contains("rectangular"),
-            "key frame refusal: {key_err}"
-        );
+        encode_key_frame(&picture, 100, 0.5).expect("key frame now codes the mod-32==8 straddle");
 
         // `encode_sequence`'s second frame is the inter path: same size,
-        // same class of refusal expected.
+        // still refused -- that machinery was not wired this round.
         let pictures = vec![picture.clone(), picture];
         let inter_err = encode_sequence(&pictures, 100, 0.5).unwrap_err();
         assert!(
             inter_err.to_string().contains("rectangular"),
             "inter frame refusal: {inter_err}"
         );
+    }
+
+    /// The r15 fix at production size: three 640x360 key frames (inter is
+    /// still refused at this size, per the test above, so this stands in for
+    /// the charter's "3-frame sequence" using three independent key frames of
+    /// shifted content), each proven decoder-clean through ffmpeg rather than
+    /// only encoder-clean.
+    #[test]
+    fn a_640x360_half_straddle_round_trips_through_ffmpeg_across_three_frames() {
+        if !have_ffmpeg() {
+            eprintln!(
+                "SKIP a_640x360_half_straddle_round_trips_through_ffmpeg_across_three_frames: \
+                 no ffmpeg"
+            );
+            return;
+        }
+        let (width, height) = (640usize, 360usize);
+        for shift in [0i64, 7, 19] {
+            let picture = panned_test_card(width, height, shift);
+            let encoded = encode_key_frame(&picture, 100, 0.5).unwrap();
+            let decoded = ffmpeg_decode(&encoded.stream, width, height);
+            assert_eq!(decoded.y, encoded.reconstruction.y, "shift {shift}: luma");
+            assert_eq!(decoded.u, encoded.reconstruction.u, "shift {shift}: U");
+            assert_eq!(decoded.v, encoded.reconstruction.v, "shift {shift}: V");
+        }
     }
 
     /// One frame of a real clip, scaled to a whole number of 32x32 blocks.
@@ -3762,30 +3897,115 @@ mod tests {
     /// fine now (see `a_frame_round_trips_at_its_own_size`) -- the true frame
     /// edge lands past the halfway point of whichever block it falls in, so
     /// `PARTITION_NONE` or a single gathered split flag still says everything
-    /// the spec needs. 40x32 and 32x48 are the sizes where the edge instead
-    /// falls *at or before* the halfway point of a 16x16 leaf: the spec's
-    /// `decode_partition` then requires that leaf to split again, to 8x8,
-    /// which this writer has no transform/coefficient path for yet, so it is
-    /// still refused, by name rather than by corrupting the stream.
+    /// the spec needs. lane-av1-rect r7 wires the 8x8-leaf path live, so a
+    /// 16x16 leaf straddling on exactly one axis (e.g. 40x32, cols mod 32 ==
+    /// 8) now encodes too (see `a_frame_round_trips_at_its_own_size`'s
+    /// sibling below). Only a leaf whose true edge cuts *both* axes (e.g.
+    /// 40x40, both dims mod 32 == 8) needs the rectangular transform neither
+    /// writer has, so that class is still refused, by name rather than by
+    /// corrupting the stream.
     #[test]
     fn a_picture_off_the_block_grid_is_refused() {
-        let refused = |w, h| {
-            let msg = encode_key_frame(&Picture::grey(w, h), 100, 0.5)
-                .expect_err(&format!(
-                    "{w}x{h} needs an 8x8 split this writer does not code"
-                ))
-                .to_string();
-            msg.contains("true frame")
-        };
-        assert!(refused(40, 32));
-        // 32x48 was refused here through round 9: its split quadrant only
-        // ever has two legal 16x16 subs (the other two sit past the true
-        // 48-row edge, block-aligned, no 8x8 split needed), but the writer
-        // demanded four. See `ffmpeg_decodes_exactly_what_the_encoder_
-        // reconstructed`, which now round-trips it pixel-exact instead.
+        let msg = encode_key_frame(&Picture::grey(40, 40), 100, 0.5)
+            .expect_err("40x40 straddles both axes of a 16x16 leaf, needs a rectangular transform")
+            .to_string();
+        assert!(msg.contains("rectangular"), "refusal: {msg}");
+
         let mut short = Picture::grey(64, 64);
         short.u.truncate(10);
         assert!(encode_key_frame(&short, 100, 0.5).is_err());
+    }
+
+    /// 40x32: cols mod 32 == 8, so the true edge cuts a 16x16 leaf's own
+    /// column half only (`has_half` false on cols, true on rows) -- exactly
+    /// the single-axis straddle lane-av1-rect r7 wires through
+    /// `crate::tile::write_leaf8`'s 8x8 leaves. Not yet decoder-clean:
+    /// dav1d rejects the stream ("Invalid data found"). r7's falsification
+    /// candidate (`partition_w8`'s ctx reading the enclosing 16x16 slot) is
+    /// FALSIFIED by r8's rng trace against a debug `aomdec`: libaom's own
+    /// `partition_plane_context` masks at `bsl = 0` for `BLOCK_8X8`, and every
+    /// `partition_context_lookup` entry this writer ever produces (no 4x4
+    /// splits exist) has bit 0 clear, so the ctx is provably 0 for every
+    /// leaf regardless of neighbour state -- our writer already agreed with
+    /// the decoder here (`ctx=0` both sides). r8 still ported the mi-precise
+    /// tracking (`Neighbours::{above,left}_side_mi`, `partition_ctx_mi`) as a
+    /// spec-accurate fix in its own right (it matters once 4x4 exists), and
+    /// it does not regress the gate. r11 tell-for-tell traced two further,
+    /// real bugs and fixed both: (1) `write_leaf8`'s intra-mode context read
+    /// the *enclosing* 16x16 slot's stale `above_mode`/`left_mode` for both
+    /// leaves, when the second leaf's true above (or left) neighbour is the
+    /// first leaf itself -- fixed by threading the first leaf's mode into the
+    /// second leaf's context, mi-precise, like `record_mi` already does for
+    /// coefficients; (2) `TxbSet::Luma8`'s transform-type table was
+    /// `INTRA_TX_TYPE_SET1_8` (`TX_SET_INTRA_1`, 7-way, correct only when
+    /// `reduced_tx_set` is false), but this crate's key frames set
+    /// `reduced_tx_set: true`, which per `get_tx_set` (spec 5.11.48) puts
+    /// *every* intra size up to 16x16 -- not only 16x16 -- on `TX_SET_INTRA_2`
+    /// (5-way); the wrong cardinality read enough of the stream as `TX_TYPE`
+    /// symbol bits to desync everything after it. Fixed with a new
+    /// `INTRA_TX_TYPE_SET2_8` (libaom's flat default for that exact
+    /// eset/size slot). Both fixes are provably correct against libaom
+    /// source and each closed part of the gap (leaf0's `eob` went from a
+    /// desynced 36 to a near-miss 3, writer's real eob is 7), but a residual
+    /// divergence remained in the `EOB_PT` symbol's decoded value despite an
+    /// aligned bit cost. r12 traced that residual with a fresh dual-trace
+    /// (do not reuse r11's committed logs, which predate its own fixes) and
+    /// found two more real bugs, both now fixed: (3) `write_leaf8` hardcoded
+    /// `cfl: false` for `write_intra_mode`'s chroma-mode CDF choice, but
+    /// `is_cfl_allowed` (spec 5.11.5) is true for any block `<= 32x32` --
+    /// every other `write_block` caller at 16x16 and up already passes
+    /// `true`; the narrower `uv_mode_no_cfl` alphabet is one symbol short of
+    /// `uv_mode_cfl`, so even an identical `DC_PRED` decision consumed a
+    /// different amount of arithmetic range and derailed everything after
+    /// it. (4) `record()`'s `above_mode`/`left_mode` write is a no-op at an
+    /// 8x8 leaf's own side (`side / SUB == 0` for `SUB` = 16), and
+    /// `write_leaf8` called only `record_mi` (the coefficient-context half),
+    /// never updating those coarse arrays itself -- so a *second* straddling
+    /// 16x16 quadrant stacked above or left of the first (never covered by
+    /// r11's same-call `prev_leaf` override, which only threads state
+    /// between the two leaves of one shared quadrant) read whatever stale
+    /// mode sat in that slot before either leaf ran. Fixed by writing the
+    /// leaf's own mode into `above_mode[c]`/`left_mode[r]` directly. Fixing
+    /// (3) alone shrank the tell drift after leaf(0,8) from a decoder
+    /// `eob_pt=3` (wrong) vs the writer's real `eob_pt=4` down to a `tell`
+    /// offset of a single unit; fixing (3)+(4) together still leaves a
+    /// residual divergence one leaf further in -- the decoder now reads
+    /// leaf(2,8)'s own luma coefficient block as `txs_ctx=1` (a 32-sample
+    /// transform) where the writer intends `TX_8X8` (`txs_ctx=2`), meaning
+    /// something *before* this leaf's own `EC_TXBSKIP`/`EC_TXTYPE` still
+    /// desyncs the stream by exactly the width of one earlier symbol -- not
+    /// yet isolated to a single named symbol. r15 found the last bug: the
+    /// header fix from r14 explained the rng skew fully, and the remaining
+    /// desync (still past `mi_row=4`) was `write_leaf8`'s (4) fix itself --
+    /// its `above_mode[c]`/`left_mode[r]` forced write ran *inside* the leaf
+    /// loop, once per leaf, so the first leaf's write clobbered the true
+    /// external neighbour mode the second leaf of the *same* straddling
+    /// quadrant still needed for its non-adjacency axis (a column-straddle
+    /// case: two leaves share one `outer_at` column index, so leaf 1's
+    /// write to `left_mode[r]` overwrote the real western neighbour before
+    /// leaf 2 read it). Fixed by moving the write out of `write_leaf8` and
+    /// doing it once, after the whole leaf loop, from the last (bottom/
+    /// right-most) leaf's mode. The stream now round-trips through ffmpeg.
+    #[test]
+    fn a_single_axis_straddle_round_trips_through_ffmpeg() {
+        if !have_ffmpeg() {
+            eprintln!("SKIP a_single_axis_straddle_round_trips_through_ffmpeg: no ffmpeg");
+            return;
+        }
+        let (width, height) = (40usize, 32usize);
+        let picture = test_card(width, height);
+        let encoded = encode_key_frame(&picture, 100, 0.5).unwrap();
+        assert_eq!(
+            (encoded.reconstruction.width, encoded.reconstruction.height),
+            (width, height)
+        );
+        if let Ok(path) = std::env::var("EC_AV1_DUMP") {
+            std::fs::write(&path, &encoded.stream).expect("dump the raw stream");
+        }
+        let decoded = ffmpeg_decode(&encoded.stream, width, height);
+        assert_eq!(decoded.y, encoded.reconstruction.y, "luma");
+        assert_eq!(decoded.u, encoded.reconstruction.u, "U");
+        assert_eq!(decoded.v, encoded.reconstruction.v, "V");
     }
 
     /// A frame of real video, rather than a picture built to be easy.
