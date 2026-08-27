@@ -15,6 +15,7 @@
 pub mod bits;
 pub mod cdf;
 mod cdf_state;
+pub mod decode;
 pub mod encode;
 pub mod encoder;
 pub mod frame;
