@@ -539,12 +539,18 @@ mod tests {
     /// of GOLDEN's picture. Round 4 asserted a pixel-exact decode against
     /// ffmpeg here; round 5 (lane-av1golden2) found that only proved the
     /// symbol path plus a whole-pel copy -- the first real aomenc GOLDEN
-    /// streams mismatch past a stacked defect (`decode.rs`'s round-5 note),
-    /// so the arm is masked again and this fixture now asserts the mask:
-    /// the stream must still reach the `GOLDEN_FRAME` `single_ref` read
-    /// (hit counter) and must then refuse by name, not decode-and-be-wrong
-    /// or misparse. The fixture itself is kept verbatim -- r3 flips this
-    /// test back to the pixel-exact form the moment the live path holds.
+    /// streams mismatch past a stacked defect, so the arm is masked again
+    /// and this fixture now asserts the mask: the stream must still reach
+    /// the `GOLDEN_FRAME` `single_ref` read (hit counter) and must then
+    /// refuse by name, not decode-and-be-wrong or misparse. Round 6
+    /// (lane-av1golden4) un-masked, found the residue is now a narrow
+    /// deblock-edge rounding defect at GOLDEN/LAST boundaries (`decode.rs`'s
+    /// round-6 note, pinned by
+    /// `stream::tests::pinned_golden4_stream_decodes_pixel_exact`), and
+    /// re-masked -- this fixture proves the symbol path and a whole-pel
+    /// copy only, not real subpel MC + deblock off the golden plane. The
+    /// fixture itself is kept verbatim -- the next round flips this test
+    /// back to the pixel-exact form the moment the live path holds.
     #[test]
     fn a_hand_built_golden_reference_refuses_by_name() {
         use crate::cdf_state::Cdfs;
@@ -1817,6 +1823,39 @@ mod tests {
             return;
         }
         let frames = decode_stream(&stream).expect("pinned stream must decode");
+        let ffmpeg_frames = ffmpeg_decode_sequence(&stream, 64, 64, 4);
+        for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+            assert_eq!(got.y, want.y, "frame {i} luma vs ffmpeg (pinned)");
+            assert_eq!(got.u, want.u, "frame {i} U vs ffmpeg (pinned)");
+            assert_eq!(got.v, want.v, "frame {i} V vs ffmpeg (pinned)");
+        }
+    }
+
+    /// lane-av1golden4: reproduces the pinned mismatch bytes captured by
+    /// `EC_AV1_GATE_DUMP=$SP/golden4-pin.obu` off
+    /// [`a_real_aomenc_inter_sequence_with_cdf_forwarding_decodes_pixel_exact`]
+    /// (seed 43, frame 3 luma) the round the GOLDEN mask lifted. Deterministic
+    /// and static -- `#[ignore]`d, run manually.
+    #[test]
+    #[ignore = "reads a pinned fixture path outside the repo; run manually"]
+    fn pinned_golden4_stream_decodes_pixel_exact() {
+        use crate::decode::non_last_ref_hits;
+        let path = std::env::var("EC_AV1_GATE_DUMP_PIN").unwrap_or_else(|_| {
+            "/tmp/claude-1000/-home-tahinli-Documents-Code-Rust-edith-codecs/\
+             51b5f611-f998-43a8-b975-e64cb643a3e1/scratchpad/golden4-pin.obu"
+                .to_string()
+        });
+        let stream = std::fs::read(&path).expect("reading pinned stream");
+        if !have_ffmpeg() {
+            eprintln!("SKIP pinned_golden4_stream_decodes_pixel_exact: no ffmpeg");
+            return;
+        }
+        let before = non_last_ref_hits();
+        let frames = decode_stream(&stream).expect("pinned stream must decode");
+        eprintln!(
+            "non_last_ref_hits before={before} after={}",
+            non_last_ref_hits()
+        );
         let ffmpeg_frames = ffmpeg_decode_sequence(&stream, 64, 64, 4);
         for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
             assert_eq!(got.y, want.y, "frame {i} luma vs ffmpeg (pinned)");
