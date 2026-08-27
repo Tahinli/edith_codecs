@@ -55,6 +55,14 @@ pub(crate) enum TxbSet {
     /// adapted table from the 16x16 and 32x32 sizes' own entries in the same
     /// set, per `entropymode.c`).
     Luma8Inter,
+    /// The 4x4 luma transform of a `TxMode::Select` 8x8 leaf or 16x16 block
+    /// whose `tx_depth` resolves all the way down (lane-av1tx4). An
+    /// `is_inter` block has no writer path yet, so this crate has no
+    /// `Luma4Inter` counterpart to [`Luma8Inter`](TxbSet::Luma8Inter).
+    Luma4,
+    /// [`Luma4`](TxbSet::Luma4)'s `reduced_tx_set: false` counterpart, same
+    /// split as [`Luma8Set1`](TxbSet::Luma8Set1).
+    Luma4Set1,
     /// The 8x8 transform of a chroma plane of a 16x16 block.
     Chroma8,
     /// The 4x4 transform of a chroma plane of an 8x8 leaf (lane-av1-rect).
@@ -82,6 +90,11 @@ pub(crate) struct TxbTables<'a> {
     pub txb_skip: &'a mut [[u16; 3]],
     /// The end-of-block group, whose alphabet the transform size sets.
     pub eob_pt: &'a mut [u16],
+    /// `eob_pt`'s `TX_CLASS_HORIZ`/`TX_CLASS_VERT` sibling table (r5): read
+    /// instead of `eob_pt` once this TU's `tx_type` is known to be
+    /// `V_DCT`/`H_DCT`. `None` for any size/set whose `tx_type` alphabet
+    /// cannot produce those two symbols (chroma, and every inter set).
+    pub eob_pt_class1: Option<&'a mut [u16]>,
     /// The top bit of the offset inside that group.
     pub eob_extra: &'a mut [[u16; 3]; 9],
     /// A coefficient's base level.
@@ -128,6 +141,8 @@ pub(crate) struct Cdfs {
     pub txb_skip_luma_16: [[u16; 3]; 7],
     /// The same, for an 8x8 luma transform.
     pub txb_skip_luma_8: [[u16; 3]; 7],
+    /// The same, for a 4x4 luma transform (lane-av1tx4).
+    pub txb_skip_luma_4: [[u16; 3]; 7],
     /// The all-zero flag of an 8x8 chroma transform.
     pub txb_skip_chroma_8: [[u16; 3]; 3],
     /// The all-zero flag of a 4x4 chroma transform.
@@ -140,10 +155,19 @@ pub(crate) struct Cdfs {
     pub eob_pt_64_chroma: [u16; 8],
     /// The end-of-block group of a 4x4 chroma transform.
     pub eob_pt_16_chroma: [u16; 6],
+    /// The end-of-block group of a 4x4 luma transform (lane-av1tx4).
+    pub eob_pt_16_luma: [u16; 6],
+    /// `eob_pt_16_luma`'s `TX_CLASS_HORIZ`/`TX_CLASS_VERT` sibling, read
+    /// instead whenever the TU's `tx_type` is `V_DCT`/`H_DCT` (r5).
+    pub eob_pt_16_luma_class1: [u16; 6],
+    /// `eob_pt_64_luma`'s class-1 sibling (r5), see `eob_pt_16_luma_class1`.
+    pub eob_pt_64_luma_class1: [u16; 8],
     /// The end-of-block offset bit of a 16x16 luma transform.
     pub eob_extra_luma_16: [[u16; 3]; 9],
     /// The same, for an 8x8 luma transform.
     pub eob_extra_luma_8: [[u16; 3]; 9],
+    /// The same, for a 4x4 luma transform.
+    pub eob_extra_luma_4: [[u16; 3]; 9],
     /// The same, for an 8x8 chroma transform.
     pub eob_extra_chroma_8: [[u16; 3]; 9],
     /// The same, for a 4x4 chroma transform.
@@ -152,6 +176,8 @@ pub(crate) struct Cdfs {
     pub base_luma_16: [[u16; 5]; 42],
     /// The base level of an 8x8 luma coefficient.
     pub base_luma_8: [[u16; 5]; 42],
+    /// The base level of a 4x4 luma coefficient.
+    pub base_luma_4: [[u16; 5]; 42],
     /// The base level of an 8x8 chroma coefficient.
     pub base_chroma_8: [[u16; 5]; 42],
     /// The base level of a 4x4 chroma coefficient.
@@ -160,6 +186,8 @@ pub(crate) struct Cdfs {
     pub base_eob_luma_16: [[u16; 4]; 4],
     /// The same, for an 8x8 luma transform.
     pub base_eob_luma_8: [[u16; 4]; 4],
+    /// The same, for a 4x4 luma transform.
+    pub base_eob_luma_4: [[u16; 4]; 4],
     /// The same, for an 8x8 chroma transform.
     pub base_eob_chroma_8: [[u16; 4]; 4],
     /// The same, for a 4x4 chroma transform.
@@ -168,6 +196,8 @@ pub(crate) struct Cdfs {
     pub br_luma_16: [[u16; 5]; 21],
     /// The base-range tail of an 8x8 luma coefficient.
     pub br_luma_8: [[u16; 5]; 21],
+    /// The base-range tail of a 4x4 luma coefficient.
+    pub br_luma_4: [[u16; 5]; 21],
     /// The base-range tail of an 8x8 chroma coefficient.
     pub br_chroma_8: [[u16; 5]; 21],
     /// The base-range tail of a 4x4 chroma coefficient.
@@ -236,6 +266,15 @@ pub(crate) struct Cdfs {
     /// `reduced_tx_set` off desyncs an 8x8 TU read against this row's
     /// wrong-length CDF).
     pub intra_tx_type_8_set1: [[u16; 8]; 13],
+    /// The transform type of a 4x4 intra luma transform, by luma mode
+    /// (lane-av1tx4): the flat five-symbol `reduced_tx_set` row, byte-
+    /// identical to [`Self::intra_tx_type_8`]'s own table
+    /// ([`cdf::INTRA_TX_TYPE_SET2_8`]) -- libaom leaves `TX_4X4` at the same
+    /// uniform default.
+    pub intra_tx_type_4: [[u16; 6]; 13],
+    /// [`Self::intra_tx_type_4`]'s `reduced_tx_set: false` counterpart, same
+    /// split as [`Self::intra_tx_type_8_set1`].
+    pub intra_tx_type_4_set1: [[u16; 8]; 13],
     /// The transform type of an `is_inter` 32x32 luma transform (spec
     /// `TX_SET_INTER_3`, `TX_32X32` row) -- unlike the intra 16x16 table, it
     /// is not indexed by mode.
@@ -395,26 +434,34 @@ impl Cdfs {
         reset2(&mut self.angle_delta);
         reset2(&mut self.txb_skip_luma_16);
         reset2(&mut self.txb_skip_luma_8);
+        reset2(&mut self.txb_skip_luma_4);
         reset2(&mut self.txb_skip_chroma_8);
         reset2(&mut self.txb_skip_chroma_4);
         reset1(&mut self.eob_pt_256_luma);
         reset1(&mut self.eob_pt_64_luma);
         reset1(&mut self.eob_pt_64_chroma);
         reset1(&mut self.eob_pt_16_chroma);
+        reset1(&mut self.eob_pt_16_luma);
+        reset1(&mut self.eob_pt_16_luma_class1);
+        reset1(&mut self.eob_pt_64_luma_class1);
         reset2(&mut self.eob_extra_luma_16);
         reset2(&mut self.eob_extra_luma_8);
+        reset2(&mut self.eob_extra_luma_4);
         reset2(&mut self.eob_extra_chroma_8);
         reset2(&mut self.eob_extra_chroma_4);
         reset2(&mut self.base_luma_16);
         reset2(&mut self.base_luma_8);
+        reset2(&mut self.base_luma_4);
         reset2(&mut self.base_chroma_8);
         reset2(&mut self.base_chroma_4);
         reset2(&mut self.base_eob_luma_16);
         reset2(&mut self.base_eob_luma_8);
+        reset2(&mut self.base_eob_luma_4);
         reset2(&mut self.base_eob_chroma_8);
         reset2(&mut self.base_eob_chroma_4);
         reset2(&mut self.br_luma_16);
         reset2(&mut self.br_luma_8);
+        reset2(&mut self.br_luma_4);
         reset2(&mut self.br_chroma_8);
         reset2(&mut self.br_chroma_4);
         reset2(&mut self.partition_w16);
@@ -445,6 +492,8 @@ impl Cdfs {
         reset2(&mut self.intra_tx_type_16);
         reset2(&mut self.intra_tx_type_8);
         reset2(&mut self.intra_tx_type_8_set1);
+        reset2(&mut self.intra_tx_type_4);
+        reset2(&mut self.intra_tx_type_4_set1);
         reset1(&mut self.inter_tx_type_32);
         reset1(&mut self.inter_tx_type_16);
         reset1(&mut self.inter_tx_type_8);
@@ -497,6 +546,13 @@ impl Cdfs {
                 cdf::TXB_SKIP_LUMA_8_CTX,
                 cdf::TXB_SKIP_LUMA_8_Q3_CTX,
             ),
+            txb_skip_luma_4: pick(
+                q_ctx,
+                cdf::TXB_SKIP_LUMA_4_Q0_CTX,
+                cdf::TXB_SKIP_LUMA_4_Q1_CTX,
+                cdf::TXB_SKIP_LUMA_4_CTX,
+                cdf::TXB_SKIP_LUMA_4_Q3_CTX,
+            ),
             txb_skip_chroma_8: pick(
                 q_ctx,
                 cdf::TXB_SKIP_CHROMA_8_Q0,
@@ -539,6 +595,27 @@ impl Cdfs {
                 cdf::EOB_PT_16_CHROMA,
                 cdf::EOB_PT_16_CHROMA_Q3,
             ),
+            eob_pt_16_luma: pick(
+                q_ctx,
+                cdf::EOB_PT_16_LUMA_Q0,
+                cdf::EOB_PT_16_LUMA_Q1,
+                cdf::EOB_PT_16_LUMA,
+                cdf::EOB_PT_16_LUMA_Q3,
+            ),
+            eob_pt_16_luma_class1: pick(
+                q_ctx,
+                cdf::EOB_PT_16_LUMA_CLASS1_Q0,
+                cdf::EOB_PT_16_LUMA_CLASS1_Q1,
+                cdf::EOB_PT_16_LUMA_CLASS1,
+                cdf::EOB_PT_16_LUMA_CLASS1_Q3,
+            ),
+            eob_pt_64_luma_class1: pick(
+                q_ctx,
+                cdf::EOB_PT_64_LUMA_CLASS1_Q0,
+                cdf::EOB_PT_64_LUMA_CLASS1_Q1,
+                cdf::EOB_PT_64_LUMA_CLASS1,
+                cdf::EOB_PT_64_LUMA_CLASS1_Q3,
+            ),
             eob_extra_luma_16: pick(
                 q_ctx,
                 cdf::EOB_EXTRA_LUMA_16_Q0,
@@ -552,6 +629,13 @@ impl Cdfs {
                 cdf::EOB_EXTRA_LUMA_8_Q1,
                 cdf::EOB_EXTRA_LUMA_8,
                 cdf::EOB_EXTRA_LUMA_8_Q3,
+            ),
+            eob_extra_luma_4: pick(
+                q_ctx,
+                cdf::EOB_EXTRA_LUMA_4_Q0,
+                cdf::EOB_EXTRA_LUMA_4_Q1,
+                cdf::EOB_EXTRA_LUMA_4,
+                cdf::EOB_EXTRA_LUMA_4_Q3,
             ),
             eob_extra_chroma_8: pick(
                 q_ctx,
@@ -581,6 +665,13 @@ impl Cdfs {
                 cdf::COEFF_BASE_LUMA_8,
                 cdf::COEFF_BASE_LUMA_8_Q3,
             ),
+            base_luma_4: pick(
+                q_ctx,
+                cdf::COEFF_BASE_LUMA_4_Q0,
+                cdf::COEFF_BASE_LUMA_4_Q1,
+                cdf::COEFF_BASE_LUMA_4,
+                cdf::COEFF_BASE_LUMA_4_Q3,
+            ),
             base_chroma_8: pick(
                 q_ctx,
                 cdf::COEFF_BASE_CHROMA_8_Q0,
@@ -609,6 +700,13 @@ impl Cdfs {
                 cdf::COEFF_BASE_EOB_LUMA_8,
                 cdf::COEFF_BASE_EOB_LUMA_8_Q3,
             ),
+            base_eob_luma_4: pick(
+                q_ctx,
+                cdf::COEFF_BASE_EOB_LUMA_4_Q0,
+                cdf::COEFF_BASE_EOB_LUMA_4_Q1,
+                cdf::COEFF_BASE_EOB_LUMA_4,
+                cdf::COEFF_BASE_EOB_LUMA_4_Q3,
+            ),
             base_eob_chroma_8: pick(
                 q_ctx,
                 cdf::COEFF_BASE_EOB_CHROMA_8_Q0,
@@ -636,6 +734,13 @@ impl Cdfs {
                 cdf::COEFF_BR_LUMA_8_Q1,
                 cdf::COEFF_BR_LUMA_8,
                 cdf::COEFF_BR_LUMA_8_Q3,
+            ),
+            br_luma_4: pick(
+                q_ctx,
+                cdf::COEFF_BR_LUMA_4_Q0,
+                cdf::COEFF_BR_LUMA_4_Q1,
+                cdf::COEFF_BR_LUMA_4,
+                cdf::COEFF_BR_LUMA_4_Q3,
             ),
             br_chroma_8: pick(
                 q_ctx,
@@ -811,6 +916,8 @@ impl Cdfs {
             intra_tx_type_16: cdf::INTRA_TX_TYPE_SET2_16,
             intra_tx_type_8: cdf::INTRA_TX_TYPE_SET2_8,
             intra_tx_type_8_set1: cdf::INTRA_TX_TYPE_SET1_8,
+            intra_tx_type_4: cdf::INTRA_TX_TYPE_SET2_8,
+            intra_tx_type_4_set1: cdf::INTRA_TX_TYPE_SET1_4,
             inter_tx_type_32: cdf::INTER_TX_TYPE_SET3_32,
             inter_tx_type_16: cdf::INTER_TX_TYPE_SET3_16,
             inter_tx_type_8: cdf::INTER_TX_TYPE_SET3_8,
@@ -847,6 +954,7 @@ impl Cdfs {
                 br: &mut self.br_luma_32,
                 dc_sign: &mut self.dc_sign_luma,
                 tx_type: None,
+                eob_pt_class1: None,
             },
             TxbSet::Luma32Inter => TxbTables {
                 side: 32,
@@ -858,6 +966,7 @@ impl Cdfs {
                 br: &mut self.br_luma_32,
                 dc_sign: &mut self.dc_sign_luma,
                 tx_type: Some(self.inter_tx_type_32.as_mut_slice()),
+                eob_pt_class1: None,
             },
             TxbSet::Luma64 => TxbTables {
                 side: 32,
@@ -869,6 +978,7 @@ impl Cdfs {
                 br: &mut self.br_luma_32,
                 dc_sign: &mut self.dc_sign_luma,
                 tx_type: None,
+                eob_pt_class1: None,
             },
             TxbSet::Luma16 => TxbTables {
                 side: 16,
@@ -880,6 +990,7 @@ impl Cdfs {
                 br: &mut self.br_luma_16,
                 dc_sign: &mut self.dc_sign_luma,
                 tx_type: Some(self.intra_tx_type_16[mode].as_mut_slice()),
+                eob_pt_class1: None,
             },
             TxbSet::Luma16Inter => TxbTables {
                 side: 16,
@@ -891,6 +1002,7 @@ impl Cdfs {
                 br: &mut self.br_luma_16,
                 dc_sign: &mut self.dc_sign_luma,
                 tx_type: Some(self.inter_tx_type_16.as_mut_slice()),
+                eob_pt_class1: None,
             },
             TxbSet::Luma8 => TxbTables {
                 side: 8,
@@ -902,6 +1014,7 @@ impl Cdfs {
                 br: &mut self.br_luma_8,
                 dc_sign: &mut self.dc_sign_luma,
                 tx_type: Some(self.intra_tx_type_8[mode].as_mut_slice()),
+                eob_pt_class1: Some(&mut self.eob_pt_64_luma_class1),
             },
             TxbSet::Luma8Set1 => TxbTables {
                 side: 8,
@@ -913,6 +1026,31 @@ impl Cdfs {
                 br: &mut self.br_luma_8,
                 dc_sign: &mut self.dc_sign_luma,
                 tx_type: Some(self.intra_tx_type_8_set1[mode].as_mut_slice()),
+                eob_pt_class1: Some(&mut self.eob_pt_64_luma_class1),
+            },
+            TxbSet::Luma4 => TxbTables {
+                side: 4,
+                txb_skip: &mut self.txb_skip_luma_4,
+                eob_pt: &mut self.eob_pt_16_luma,
+                eob_extra: &mut self.eob_extra_luma_4,
+                base: &mut self.base_luma_4,
+                base_eob: &mut self.base_eob_luma_4,
+                br: &mut self.br_luma_4,
+                dc_sign: &mut self.dc_sign_luma,
+                tx_type: Some(self.intra_tx_type_4[mode].as_mut_slice()),
+                eob_pt_class1: Some(&mut self.eob_pt_16_luma_class1),
+            },
+            TxbSet::Luma4Set1 => TxbTables {
+                side: 4,
+                txb_skip: &mut self.txb_skip_luma_4,
+                eob_pt: &mut self.eob_pt_16_luma,
+                eob_extra: &mut self.eob_extra_luma_4,
+                base: &mut self.base_luma_4,
+                base_eob: &mut self.base_eob_luma_4,
+                br: &mut self.br_luma_4,
+                dc_sign: &mut self.dc_sign_luma,
+                tx_type: Some(self.intra_tx_type_4_set1[mode].as_mut_slice()),
+                eob_pt_class1: Some(&mut self.eob_pt_16_luma_class1),
             },
             TxbSet::Luma8Inter => TxbTables {
                 side: 8,
@@ -924,6 +1062,7 @@ impl Cdfs {
                 br: &mut self.br_luma_8,
                 dc_sign: &mut self.dc_sign_luma,
                 tx_type: Some(self.inter_tx_type_8.as_mut_slice()),
+                eob_pt_class1: None,
             },
             TxbSet::Chroma8 => TxbTables {
                 side: 8,
@@ -935,6 +1074,7 @@ impl Cdfs {
                 br: &mut self.br_chroma_8,
                 dc_sign: &mut self.dc_sign_chroma,
                 tx_type: None,
+                eob_pt_class1: None,
             },
             TxbSet::Chroma4 => TxbTables {
                 side: 4,
@@ -946,6 +1086,7 @@ impl Cdfs {
                 br: &mut self.br_chroma_4,
                 dc_sign: &mut self.dc_sign_chroma,
                 tx_type: None,
+                eob_pt_class1: None,
             },
             TxbSet::Chroma16 => TxbTables {
                 side: 16,
@@ -957,6 +1098,7 @@ impl Cdfs {
                 br: &mut self.br_chroma_16,
                 dc_sign: &mut self.dc_sign_chroma,
                 tx_type: None,
+                eob_pt_class1: None,
             },
             TxbSet::Chroma32 => TxbTables {
                 side: 32,
@@ -968,6 +1110,7 @@ impl Cdfs {
                 br: &mut self.br_chroma_32,
                 dc_sign: &mut self.dc_sign_chroma,
                 tx_type: None,
+                eob_pt_class1: None,
             },
         }
     }

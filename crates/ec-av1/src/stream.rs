@@ -1563,4 +1563,160 @@ mod tests {
             }
         }
     }
+
+    /// Final round of the TX4/tx-class lane's own gate: `--min-partition-size=8
+    /// --max-partition-size=8` pins every leaf to exactly 8x8 (spec
+    /// 5.11.4's own boundary carve-out aside, which a multiple-of-8 frame
+    /// never triggers), so a real `aomenc` stream from this recipe can only
+    /// legitimately read `PARTITION_NONE` at every `bsize=3` node -- any
+    /// other value this decoder sees there is a genuine desync, not a
+    /// "partition below 8x8" the encoder actually wrote (traced live against
+    /// a debug `aomdec` 2026-08-27: the true bitstream's own 8x8 partition
+    /// reads are all `NONE`; the mismatch was `base_ctx`'s DC-position
+    /// short-circuit firing for `TX_CLASS_HORIZ`/`VERT` too, off by one
+    /// `BR` read into a spurious extra Golomb call). The sinusoidal-stripe
+    /// `geq` source (a smooth luma ramp, not the sharp two-tone stripes that
+    /// tripped `aomenc`'s screen-content-tools auto-detect) is what actually
+    /// resolves `V_DCT`/`H_DCT` (`TxClass::of`) on some 8x8 TUs at this
+    /// content's frequency; the attempt loop moves on from named refusals
+    /// (`allow_screen_content_tools`, angle-delta) same as every other
+    /// multi-seed recipe in this file, and only counts a run as a genuine
+    /// firing when [`decode::tx_class1_hits`] actually moved.
+    #[test]
+    fn a_real_aomenc_min8_stream_with_tx_class1_decodes_pixel_exact() {
+        if !have_ffmpeg() {
+            eprintln!(
+                "SKIP a_real_aomenc_min8_stream_with_tx_class1_decodes_pixel_exact: no ffmpeg"
+            );
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!(
+                "SKIP a_real_aomenc_min8_stream_with_tx_class1_decodes_pixel_exact: no aomenc at {}",
+                aomenc_path().display()
+            );
+            return;
+        }
+        let (width, height) = (64usize, 64usize);
+        let mut refusals = Vec::new();
+        let mut fired_runs = 0u32;
+        for attempt in 0..60u32 {
+            let cq = 20 + (attempt % 5) * 10;
+            let period = [4u32, 6, 8, 12, 16][(attempt as usize / 5) % 5];
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=size=64x64:rate=25",
+                    "-vf",
+                    &format!(
+                        "geq=lum='128+80*sin(2*PI*Y/{period})':cb=128:cr=128,noise=alls=6:allf=t"
+                    ),
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-t",
+                    "0.04",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let mut child = Command::new(aomenc_path())
+                .args([
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    &format!("--cq-level={cq}"),
+                    "--cpu-used=0",
+                    "--enable-directional-intra=0",
+                    "--enable-smooth-intra=0",
+                    "--enable-paeth-intra=0",
+                    "--enable-rect-partitions=0",
+                    "--enable-angle-delta=0",
+                    "--enable-palette=0",
+                    "--reduced-tx-type-set=0",
+                    "--enable-restoration=0",
+                    "--enable-cdef=0",
+                    "--loopfilter-control=0",
+                    "--min-partition-size=8",
+                    "--max-partition-size=8",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    "--enable-filter-intra=0",
+                    "--enable-intrabc=0",
+                    "--enable-cfl-intra=0",
+                    "--tune-content=default",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            if !out.status.success() {
+                refusals.push(format!(
+                    "cq={cq} period={period}: aomenc itself refused the fixture"
+                ));
+                continue;
+            }
+            let stream = out.stdout;
+            let before = decode::tx_class1_hits();
+            let frames = match decode_stream(&stream) {
+                Ok(frames) => frames,
+                Err(e) => {
+                    refusals.push(format!("cq={cq} period={period}: {e}"));
+                    continue;
+                }
+            };
+            if decode::tx_class1_hits() == before {
+                refusals.push(format!(
+                    "cq={cq} period={period}: decoded, but no block read a V_DCT/H_DCT tx_type"
+                ));
+                continue;
+            }
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
+            assert_eq!(
+                frames[0].y, ffmpeg_frames[0].y,
+                "luma vs ffmpeg (cq={cq} period={period})"
+            );
+            assert_eq!(
+                frames[0].u, ffmpeg_frames[0].u,
+                "U vs ffmpeg (cq={cq} period={period})"
+            );
+            assert_eq!(
+                frames[0].v, ffmpeg_frames[0].v,
+                "V vs ffmpeg (cq={cq} period={period})"
+            );
+            fired_runs += 1;
+            if fired_runs >= 4 {
+                return;
+            }
+        }
+        panic!(
+            "fewer than 4 firing+pixel-exact runs out of 60 attempts:\n{}",
+            refusals.join("\n")
+        );
+    }
 }
