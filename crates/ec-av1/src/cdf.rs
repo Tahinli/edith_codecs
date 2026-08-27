@@ -3642,10 +3642,13 @@ pub const COEFF_BR_CHROMA_4_Q3: [[u16; 5]; 21] = [
     [5461, 16384, 27307, 32768, 0],
 ];
 
-/// `Default_Intra_Ext_Tx_Cdf`'s `TX_SET_INTRA_2` row for `TX_8X8` (spec 9.4): the
-/// transform type of an intra 8x8 transform, indexed by the block's luma mode
-/// (reduced_tx_set is always false on this crate's key frames, so `code_square`
-/// always reads this outer set, never a reduced one).
+/// `Default_Intra_Ext_Tx_Cdf`'s `TX_SET_INTRA_1` (`EXT_TX_SET_DTT4_IDTX_1DDCT`)
+/// row for `TX_8X8` (spec 9.4): the transform type of an intra 8x8 transform
+/// when `reduced_tx_set` is false. Unused while this crate's key frames set
+/// `reduced_tx_set: true` (`get_tx_set`'s intra branch then returns
+/// `TX_SET_INTRA_2` -- [`INTRA_TX_TYPE_SET2_8`] -- at every size up to 16x16,
+/// not only 16x16; r11 lane-av1-rect). Kept named for the day a non-reduced
+/// path exists.
 pub const INTRA_TX_TYPE_SET1_8: [[u16; 8]; 13] = [
     [1870, 13742, 14530, 16498, 23770, 27698, 32768, 0],
     [326, 8796, 14632, 15079, 19272, 27486, 32768, 0],
@@ -3661,3 +3664,11 @@ pub const INTRA_TX_TYPE_SET1_8: [[u16; 8]; 13] = [
     [153, 7647, 8112, 9936, 15307, 19996, 32768, 0],
     [3511, 6332, 11165, 15335, 19323, 23594, 32768, 0],
 ];
+
+/// `Default_Intra_Ext_Tx_Cdf`'s `TX_SET_INTRA_2` (`EXT_TX_SET_DTT4_IDTX`) row
+/// for `TX_8X8` (spec 9.4, entropymode.c's `eset==2`/`TX_8X8` slot): the
+/// transform type of an intra 8x8 transform when `reduced_tx_set` is true,
+/// which this crate's key frames always set. libaom leaves this exact slot
+/// at the flat 5-way default (unlike its trained `TX_16X16` neighbour,
+/// [`INTRA_TX_TYPE_SET2_16`]) -- every mode reads the same uniform CDF.
+pub const INTRA_TX_TYPE_SET2_8: [[u16; 6]; 13] = [[6554, 13107, 19661, 26214, 32768, 0]; 13];
