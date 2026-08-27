@@ -40,6 +40,8 @@ fn main() {
     bench_h265_encode(&mut rows);
     bench_av1_encode(&mut rows);
     bench_audio_decode(&mut rows);
+    bench_image_decode(&mut rows);
+    bench_inflate(&mut rows);
 
     rows.sort_by(|a, b| {
         a.rtf
@@ -437,6 +439,114 @@ fn bench_audio_decode(rows: &mut Vec<Row>) {
             rtf: (wall > 0.0 && media_s > 0.0).then_some(media_s / wall),
         });
     }
+}
+
+// ---------------------------------------------------------------------------
+// images: one decode entry point (`ec_image::decode`) covers every format
+// the crate sniffs, so every real-library still is a candidate.
+// ---------------------------------------------------------------------------
+
+fn bench_image_decode(rows: &mut Vec<Row>) {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(fixtures().join("stills")) {
+        candidates.extend(
+            entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some()),
+        );
+    }
+    for f in [
+        "IMG_20260804_170612.jpg",
+        "drawing-1.png",
+        "20260722-233942.png",
+        "giphy.gif",
+    ] {
+        let p = home().join("Downloads").join(f);
+        if p.exists() {
+            candidates.push(p);
+        }
+    }
+    candidates.sort();
+
+    for path in candidates {
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let mp = bytes.len() as f64 / 1_000_000.0;
+        let start = Instant::now();
+        let Ok(img) = ec_image::decode(&bytes) else {
+            continue;
+        };
+        let wall_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let (w, h) = img.dimensions();
+        let megapixels = (w as f64 * h as f64) / 1_000_000.0;
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        rows.push(Row {
+            component: "ec-image",
+            direction: "decode",
+            content: format!("{name} ({w}x{h}, {mp:.2} MB coded)"),
+            media: format!("{megapixels:.2} MP"),
+            wall_ms,
+            rtf: (wall_ms > 0.0).then_some(megapixels / (wall_ms / 1000.0)),
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ec-inflate: the zlib stream a real PNG's IDAT chain already carries.
+// ---------------------------------------------------------------------------
+
+fn bench_inflate(rows: &mut Vec<Row>) {
+    let Some(png) = [
+        fixtures().join("stills/gray16.png"),
+        home().join("Downloads/drawing-1.png"),
+    ]
+    .into_iter()
+    .find(|p| p.exists()) else {
+        rows.push(missing("ec-inflate", "inflate"));
+        return;
+    };
+    let Ok(bytes) = std::fs::read(&png) else {
+        rows.push(missing("ec-inflate", "inflate"));
+        return;
+    };
+    // Concatenate every IDAT chunk's payload: that byte string is exactly the
+    // zlib stream `ec_image`'s own PNG path hands to `ec_inflate`.
+    let mut idat = Vec::new();
+    let mut i = 8usize; // past the PNG signature
+    while i + 8 <= bytes.len() {
+        let len = u32::from_be_bytes(bytes[i..i + 4].try_into().unwrap()) as usize;
+        let kind = &bytes[i + 4..i + 8];
+        let start = i + 8;
+        if kind == b"IDAT" && start + len <= bytes.len() {
+            idat.extend_from_slice(&bytes[start..start + len]);
+        }
+        i = start + len + 4; // skip CRC
+    }
+    if idat.is_empty() {
+        rows.push(missing("ec-inflate", "inflate"));
+        return;
+    }
+    let compressed_mb = idat.len() as f64 / 1_000_000.0;
+    let start = Instant::now();
+    let Ok(out) = ec_inflate::inflate_zlib(&idat, 1 << 30) else {
+        rows.push(missing("ec-inflate", "inflate"));
+        return;
+    };
+    let wall_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let out_mb = out.len() as f64 / 1_000_000.0;
+    rows.push(Row {
+        component: "ec-inflate",
+        direction: "inflate",
+        content: format!(
+            "{} IDAT stream, {compressed_mb:.2} MB in",
+            png.file_name().unwrap().to_string_lossy()
+        ),
+        media: format!("{out_mb:.2} MB out"),
+        wall_ms,
+        rtf: (wall_ms > 0.0).then_some(out_mb / (wall_ms / 1000.0)),
+    });
 }
 
 fn missing(component: &'static str, direction: &'static str) -> Row {
