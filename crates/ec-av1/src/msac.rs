@@ -235,96 +235,110 @@ fn update_cdf(cdf: &mut [u16], symbol: usize) {
     cdf[nsyms] = count + 1 - (count >> 5);
 }
 
+/// The decoding process of spec 8.2, the exact inverse of [`SymbolEncoder`]:
+/// reads the symbols a [`SymbolEncoder`] wrote, in the order it wrote them,
+/// adapting every CDF identically (spec 8.3.2) so the two stay in step. This
+/// is the reader half of the arithmetic coder a real AV1 decoder's tile
+/// reader is built on top of.
+#[derive(Debug)]
+pub struct SymbolDecoder<'a> {
+    data: &'a [u8],
+    /// Next bit to read, as a bit offset into `data`.
+    bit: usize,
+    value: u32,
+    range: u32,
+    /// Bits left before the decoder starts padding with zeros (spec
+    /// `SymbolMaxBits`), which goes negative at the end of the string.
+    max_bits: i32,
+}
+
+impl<'a> SymbolDecoder<'a> {
+    /// `init_symbol` (spec 8.2.2).
+    #[must_use]
+    pub fn new(data: &'a [u8]) -> SymbolDecoder<'a> {
+        let mut d = SymbolDecoder {
+            data,
+            bit: 0,
+            value: 0,
+            range: 1 << 15,
+            max_bits: 8 * data.len() as i32 - 15,
+        };
+        let num_bits = usize::min(data.len() * 8, 15) as u32;
+        let buf = d.f(num_bits);
+        d.value = ((1 << 15) - 1) ^ (buf << (15 - num_bits));
+        d
+    }
+
+    /// `f(n)`: the next `n` bits, most significant first, zero past the end.
+    fn f(&mut self, n: u32) -> u32 {
+        let mut v = 0;
+        for _ in 0..n {
+            let byte = self.data.get(self.bit >> 3).copied().unwrap_or(0);
+            v = (v << 1) | u32::from((byte >> (7 - (self.bit & 7))) & 1);
+            self.bit += 1;
+        }
+        v
+    }
+
+    /// `decode_symbol` (spec 8.2.6), with the adaptation of 8.3.2.
+    pub fn symbol(&mut self, cdf: &mut [u16]) -> usize {
+        let s = self.symbol_fixed(cdf);
+        update_cdf(cdf, s);
+        s
+    }
+
+    /// `decode_symbol`, without the adaptation of 8.3.2 — the form the spec
+    /// uses for the literal and equiprobable reads, mirroring
+    /// [`SymbolEncoder::symbol_fixed`].
+    pub fn symbol_fixed(&mut self, cdf: &[u16]) -> usize {
+        let nsyms = cdf.len() - 1;
+        let mut cur = self.range;
+        let mut prev;
+        let mut symbol = 0;
+        loop {
+            prev = cur;
+            let f = u32::from(CDF_TOP - cdf[symbol]);
+            cur = (((self.range >> 8) * (f >> EC_PROB_SHIFT)) >> (7 - EC_PROB_SHIFT))
+                + EC_MIN_PROB * (nsyms - 1 - symbol) as u32;
+            if self.value >= cur {
+                break;
+            }
+            symbol += 1;
+        }
+        self.range = prev - cur;
+        self.value -= cur;
+
+        // Renormalise back into `[2^15, 2^16)`, the same shift the encoder
+        // applied when it narrowed to this symbol.
+        let bits = 16 - (32 - self.range.leading_zeros());
+        self.range <<= bits;
+        let num_bits = u32::min(bits, self.max_bits.max(0) as u32);
+        let new_data = self.f(num_bits);
+        let padded = new_data << (bits - num_bits);
+        self.value = padded ^ (((self.value + 1) << bits) - 1);
+        self.max_bits -= bits as i32;
+        symbol
+    }
+
+    /// Reads `bits` raw bits, most significant first — the `L(n)` descriptor
+    /// of spec 4.10.4.
+    pub fn literal(&mut self, bits: u32) -> u32 {
+        let mut v = 0;
+        for _ in 0..bits {
+            v = (v << 1) | self.symbol_fixed(&EQUIPROBABLE) as u32;
+        }
+        v
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
 
-    /// The decoding process of spec 8.2, written from the specification's
-    /// pseudocode so that the roundtrip tests measure the encoder against the
-    /// decoder AV1 defines rather than against the encoder's own arithmetic.
-    pub(crate) struct SymbolDecoder<'a> {
-        data: &'a [u8],
-        /// Next bit to read, as a bit offset into `data`.
-        bit: usize,
-        value: u32,
-        range: u32,
-        /// Bits left before the decoder starts padding with zeros (spec
-        /// `SymbolMaxBits`), which goes negative at the end of the string.
-        max_bits: i32,
-    }
-
-    impl<'a> SymbolDecoder<'a> {
-        /// `init_symbol` (spec 8.2.2).
-        pub(crate) fn new(data: &'a [u8]) -> SymbolDecoder<'a> {
-            let mut d = SymbolDecoder {
-                data,
-                bit: 0,
-                value: 0,
-                range: 1 << 15,
-                max_bits: 8 * data.len() as i32 - 15,
-            };
-            let num_bits = usize::min(data.len() * 8, 15) as u32;
-            let buf = d.f(num_bits);
-            d.value = ((1 << 15) - 1) ^ (buf << (15 - num_bits));
-            d
-        }
-
-        /// `f(n)`: the next `n` bits, most significant first, zero past the end.
-        fn f(&mut self, n: u32) -> u32 {
-            let mut v = 0;
-            for _ in 0..n {
-                let byte = self.data.get(self.bit >> 3).copied().unwrap_or(0);
-                v = (v << 1) | u32::from((byte >> (7 - (self.bit & 7))) & 1);
-                self.bit += 1;
-            }
-            v
-        }
-
-        /// `decode_symbol` (spec 8.2.6), with the adaptation of 8.3.2.
-        pub(crate) fn symbol(&mut self, cdf: &mut [u16]) -> usize {
-            let s = self.symbol_fixed(cdf);
-            update_cdf(cdf, s);
-            s
-        }
-
-        fn symbol_fixed(&mut self, cdf: &[u16]) -> usize {
-            let nsyms = cdf.len() - 1;
-            let mut cur = self.range;
-            let mut prev;
-            let mut symbol = 0;
-            loop {
-                prev = cur;
-                let f = u32::from(CDF_TOP - cdf[symbol]);
-                cur = (((self.range >> 8) * (f >> EC_PROB_SHIFT)) >> (7 - EC_PROB_SHIFT))
-                    + EC_MIN_PROB * (nsyms - 1 - symbol) as u32;
-                if self.value >= cur {
-                    break;
-                }
-                symbol += 1;
-            }
-            self.range = prev - cur;
-            self.value -= cur;
-
-            // Renormalise back into `[2^15, 2^16)`, the same shift the encoder
-            // applied when it narrowed to this symbol.
-            let bits = 16 - (32 - self.range.leading_zeros());
-            self.range <<= bits;
-            let num_bits = u32::min(bits, self.max_bits.max(0) as u32);
-            let new_data = self.f(num_bits);
-            let padded = new_data << (bits - num_bits);
-            self.value = padded ^ (((self.value + 1) << bits) - 1);
-            self.max_bits -= bits as i32;
-            symbol
-        }
-
-        pub(crate) fn literal(&mut self, bits: u32) -> u32 {
-            let mut v = 0;
-            for _ in 0..bits {
-                v = (v << 1) | self.symbol_fixed(&EQUIPROBABLE) as u32;
-            }
-            v
-        }
-    }
+    // `tile.rs`'s own tests reach `SymbolDecoder` through this path; it now
+    // lives in the outer module (non-test code decodes with it too), so this
+    // re-export is what keeps those call sites resolving unmodified.
+    pub(crate) use super::SymbolDecoder;
 
     /// A reproducible symbol stream: xorshift, so a failure names one seed.
     fn rng(state: &mut u64) -> u64 {
