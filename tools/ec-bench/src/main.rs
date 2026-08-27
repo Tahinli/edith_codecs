@@ -312,19 +312,16 @@ fn bench_h265_encode(rows: &mut Vec<Row>) {
 // ---------------------------------------------------------------------------
 
 fn bench_av1_encode(rows: &mut Vec<Row>) {
-    rows.push(missing_direction(
-        "ec-av1",
-        "decode",
-        "encode-only crate, no decoder present",
-    ));
     let Some(src) = real_video("h264") else {
         rows.push(missing("ec-av1", "encode"));
+        rows.push(missing("ec-av1", "decode"));
         return;
     };
     // AV1's block grid is 32x32 superblocks: pick a size already a multiple of it.
     let (planes, w, h, n) = extract_yuv420p(&src, 640, 384, 10);
     if n == 0 {
         rows.push(missing("ec-av1", "encode"));
+        rows.push(missing("ec-av1", "decode"));
         return;
     }
     let cfg = Av1Config {
@@ -336,6 +333,7 @@ fn bench_av1_encode(rows: &mut Vec<Row>) {
     };
     let mut enc = Av1Encoder::new(cfg).expect("av1 encoder");
     let frame_len = (w * h + 2 * (w.div_ceil(2) * h.div_ceil(2))) as usize;
+    let mut stream = Vec::new();
     let start = Instant::now();
     for frame in planes.chunks_exact(frame_len) {
         let (y, rest) = frame.split_at((w * h) as usize);
@@ -347,13 +345,27 @@ fn bench_av1_encode(rows: &mut Vec<Row>) {
             u: u.to_vec(),
             v: v.to_vec(),
         };
-        enc.encode(&pic).expect("av1 encode");
+        let packet = enc.encode(&pic).expect("av1 encode");
+        stream.extend_from_slice(&packet.data);
     }
     let wall = start.elapsed().as_secs_f64();
     let media_s = n as f64 / 30.0;
     rows.push(Row {
         component: "ec-av1",
         direction: "encode",
+        content: format!("{w}x{h}, {n} frames, gop=10"),
+        media: format!("{media_s:.1}s"),
+        wall_ms: wall * 1000.0,
+        rtf: (wall > 0.0).then_some(media_s / wall),
+    });
+
+    let start = Instant::now();
+    let pictures = ec_av1::stream::decode_stream(&stream).expect("av1 decode_stream");
+    let wall = start.elapsed().as_secs_f64();
+    assert_eq!(pictures.len(), n as usize, "decode_stream frame count");
+    rows.push(Row {
+        component: "ec-av1",
+        direction: "decode",
         content: format!("{w}x{h}, {n} frames, gop=10"),
         media: format!("{media_s:.1}s"),
         wall_ms: wall * 1000.0,
