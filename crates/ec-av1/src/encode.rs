@@ -4420,6 +4420,68 @@ mod tests {
         );
     }
 
+    /// Sibling of `real_clip_encodes_within_its_quality_and_size_budget` at a
+    /// straddle size: 640x384 is exact on both axes (32-aligned), so
+    /// `Quadrant::Split` never fires there and the 16x16 `NEARESTMV` leaf
+    /// path landed in e19bb47 goes unexercised by real, mixed intra/inter
+    /// content. 704x400 has 400 mod 32 == 16 -- the same "exactly half
+    /// straddle" class as `a_sequence_round_trips_at_the_exactly_half_
+    /// straddle_size`'s 1280x720, but that test is a synthetic panned test
+    /// card; this one is the real-clip gate, same three floors.
+    ///
+    /// Measured 2026-08-27 at q=100, 8 frames: stream 54525 bytes, average
+    /// luma PSNR 45.48 dB across the 8 decoded frames vs the source.
+    /// Floor/ceiling below carry the same margin as the sibling test (PSNR
+    /// floor = measured - 0.5 dB; byte ceiling = measured * 1.15).
+    #[test]
+    fn real_clip_encodes_within_its_quality_and_size_budget_at_a_straddle_size() {
+        if !have_ffmpeg() {
+            eprintln!(
+                "SKIP real_clip_encodes_within_its_quality_and_size_budget_at_a_straddle_size: \
+                 no ffmpeg"
+            );
+            return;
+        }
+        let clip = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/video/h264-1080p-23.976-8bit.mp4");
+        if !clip.exists() {
+            eprintln!(
+                "SKIP real_clip_encodes_within_its_quality_and_size_budget_at_a_straddle_size: \
+                 {} missing",
+                clip.display()
+            );
+            return;
+        }
+        let (width, height, frame_count) = (704usize, 400usize, 8usize);
+        let source = clip_frames(clip.to_str().unwrap(), "0", width, height, frame_count);
+        let encoded = encode_sequence(&source, 100, 0.5).unwrap();
+        assert_eq!(encoded.frames.len(), frame_count);
+
+        // Gate 1: a real AV1 decoder (dav1d, via ffmpeg) accepts the whole
+        // stream and hands back every frame.
+        let decoded = ffmpeg_decode_sequence(&encoded.stream, width, height, frame_count);
+        assert_eq!(decoded.len(), frame_count, "dav1d decoded every frame");
+
+        // Gate 2: quality vs the source did not silently collapse.
+        let mean_psnr: f64 = decoded
+            .iter()
+            .zip(&source)
+            .map(|(d, s)| psnr(&d.y, &s.y))
+            .sum::<f64>()
+            / frame_count as f64;
+        assert!(
+            mean_psnr >= 44.98,
+            "mean luma PSNR {mean_psnr:.2} dB fell below the 44.98 dB floor"
+        );
+
+        // Gate 3: the stream did not silently bloat.
+        assert!(
+            encoded.stream.len() <= 62_703,
+            "stream grew to {} bytes, over the 62703-byte ceiling",
+            encoded.stream.len()
+        );
+    }
+
     /// The replica-shaped path: 24 frames, 1280x720, one key frame followed
     /// by inter frames -- the same GOP shape [`encode_sequence`] gives the
     /// facade -- timed end to end, so the edith export-time projection is a
