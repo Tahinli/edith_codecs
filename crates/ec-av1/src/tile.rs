@@ -1248,6 +1248,25 @@ pub fn sb_coeff_key_frame_tile(
                                             )
                                         });
                                     }
+                                    // `record()`'s `above_mode`/`left_mode`
+                                    // write is a no-op at an 8x8 leaf's own
+                                    // side (`side / SUB == 0`), so the next
+                                    // 16x16 quadrant beyond this straddling
+                                    // one would otherwise see whatever stale
+                                    // mode sat here before it: force the
+                                    // write once the whole quadrant's leaves
+                                    // are done, from the last (bottom/right-
+                                    // most) leaf -- lane-av1-rect r15: doing
+                                    // this *inside* `write_leaf8`, once per
+                                    // leaf, let the first leaf's write
+                                    // clobber the true external neighbour a
+                                    // second leaf of the *same* quadrant
+                                    // still needed to read on its
+                                    // non-adjacency axis.
+                                    if let Some((_, mode)) = prev_leaf {
+                                        neighbours.above_mode[at.1] = mode;
+                                        neighbours.left_mode[at.0] = mode;
+                                    }
                                 }
                             }
                         }
@@ -1381,14 +1400,6 @@ fn write_leaf8(
         mode,
     );
     neighbours.record_mi(leaf_mi, 8, grids);
-    // `record()`'s `above_mode`/`left_mode` write is a no-op at this side
-    // (`side / SUB == 0` for an 8x8 leaf), so the next 16x16 quadrant that
-    // reads this outer cell -- one straddling quadrant stacked above/left of
-    // another, never touched by `prev_leaf`'s same-call override -- would
-    // otherwise see whatever stale mode sat there before this leaf: force
-    // the write here instead (r12 lane-av1-rect, leaf(2,8)'s mode desync).
-    neighbours.above_mode[c] = mode;
-    neighbours.left_mode[r] = mode;
     mode
 }
 
