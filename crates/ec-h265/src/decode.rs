@@ -512,10 +512,25 @@ impl CtuDecoder {
                 mode
             };
             modes[part] = mode;
-            // Mode only, so the next partition's MPM sees it; pixels follow
-            // once the residual syntax below is read.
+            // Mode and availability, so the next partition's `mpm_at` sees
+            // this one as a real coded neighbour — the encoder's own
+            // mode-decide loop calls `mark_coded` (which flips availability)
+            // immediately per partition for exactly this reason (8.4.2: an
+            // NxN CU's later partitions see its earlier ones as available).
+            // Marking modes here without also marking `decoded` left the
+            // second/third/fourth partition's left/above neighbour reading
+            // as unavailable (substituted DC) on the decoder side while the
+            // encoder's MPM saw the real mode, decoding the wrong MPM triple
+            // and desyncing every bin after it — this is what an NxN CU
+            // forced into existence by a boundary split (rather than chosen
+            // by `intra_nxn`'s RD search) actually exercises differently:
+            // the RD search rarely keeps NxN once a real neighbour is
+            // available on all four sides, so the bug went unseen until a
+            // picture edge forced it.
             let stride = self.width / 4;
-            self.modes[(py / 4) * stride + px / 4] = mode;
+            let idx = (py / 4) * stride + px / 4;
+            self.modes[idx] = mode;
+            self.decoded[idx] = true;
         }
 
         let chroma_mode = self.decode_chroma_mode(dec, modes[0]);
