@@ -21,6 +21,7 @@
 //! too). Anything outside that refuses with [`Error::unsupported`] rather than
 //! silently miscoding.
 
+use ec_av1_syntax::CdefParams;
 use ec_core::{Error, Result};
 
 use crate::cdf;
@@ -393,6 +394,15 @@ struct Neighbours {
     left_inter: Vec<bool>,
     mi_cols: usize,
     mi_rows: usize,
+    /// Per-8x8 (2x2 mi cells) `skip_txfm` flag over the whole padded frame,
+    /// spec `av1_cdef_compute_sb_list`'s `is_8x8_block_skip`: CDEF (spec
+    /// 7.15) never filters an 8x8 luma block whose covering coded block read
+    /// `skip` -- one flag per 4x4 mi cell (finer than needed, but matches the
+    /// grain [`Self::record_mi`] already writes at), read back at 8x8
+    /// granularity by [`apply_cdef`] since `skip` is constant across every
+    /// mi cell one coded block covers.
+    skip_grid: Vec<bool>,
+    skip_grid_cols_mi: usize,
 }
 
 impl Neighbours {
@@ -414,7 +424,43 @@ impl Neighbours {
             left_inter: vec![false; rows],
             mi_cols,
             mi_rows,
+            skip_grid: vec![false; cols * (SUB / MI) * rows * (SUB / MI)],
+            skip_grid_cols_mi: cols * (SUB / MI),
         }
+    }
+
+    /// Marks every 4x4 mi cell a just-decoded coded block covers with its
+    /// `skip` flag -- `at_mi`/`side_mi` are the block's own position and
+    /// width/height in 4x4 mode-info units (mirroring [`Self::record_mi`]'s
+    /// own units, not [`Self::record`]'s [`SUB`]-grid ones).
+    fn fill_skip_grid(&mut self, at_mi: (usize, usize), side_mi: usize, skip: bool) {
+        let (mi_r, mi_c) = at_mi;
+        for rr in 0..side_mi {
+            for cc in 0..side_mi {
+                if let Some(cell) = self
+                    .skip_grid
+                    .get_mut((mi_r + rr) * self.skip_grid_cols_mi + (mi_c + cc))
+                {
+                    *cell = skip;
+                }
+            }
+        }
+    }
+
+    /// Whether the 8x8 luma block at mi position `(mi_r, mi_c)` (2x2 mi
+    /// cells) was `skip_txfm` -- [`apply_cdef`]'s dlist membership test.
+    /// Spec/libaom `is_8x8_block_skip` requires *every* one of the four 4x4
+    /// mi cells the 8x8 covers to be skip (a smaller-than-8x8 partition can
+    /// straddle the region with a mix of skip/non-skip blocks).
+    fn is_skip_txfm(&self, mi_r: usize, mi_c: usize) -> bool {
+        (0..2).all(|rr| {
+            (0..2).all(|cc| {
+                self.skip_grid
+                    .get((mi_r + rr) * self.skip_grid_cols_mi + (mi_c + cc))
+                    .copied()
+                    .unwrap_or(false)
+            })
+        })
     }
 
     fn start_row(&mut self) {
@@ -989,6 +1035,7 @@ fn decode_block(
         )?;
     }
     neighbours.record(at, side, mode, &[luma_grid, u_grid, v_grid]);
+    neighbours.fill_skip_grid((r * (SUB / MI), c * (SUB / MI)), side / MI, skip);
     Ok(())
 }
 
@@ -1125,7 +1172,298 @@ fn decode_leaf8(
         )?;
     }
     neighbours.record_mi(leaf_mi, 8, &[luma_grid, u_grid, v_grid]);
+    neighbours.fill_skip_grid(leaf_mi, 2, skip);
     Ok(mode)
+}
+
+/// Spec 7.15.3's `Cdef_Directions`: `(row, col)` offsets for the two primary
+/// taps of each of the eight directions; the secondary taps at `dir+2`/`dir-2`
+/// (mod 8) reuse the same table.
+const CDEF_DIRECTIONS: [[(i32, i32); 2]; 8] = [
+    [(-1, 1), (-2, 2)],
+    [(0, 1), (-1, 2)],
+    [(0, 1), (0, 2)],
+    [(0, 1), (1, 2)],
+    [(1, 1), (2, 2)],
+    [(1, 0), (2, 1)],
+    [(1, 0), (2, 0)],
+    [(1, 0), (2, -1)],
+];
+/// A neighbour tap outside the frame's true extent -- `constrain` reads this
+/// as "so far away it never contributes" (spec/libaom `CDEF_VERY_LARGE`).
+const CDEF_VERY_LARGE: i32 = 0x4000;
+const CDEF_PRI_TAPS: [[i32; 2]; 2] = [[4, 2], [3, 3]];
+const CDEF_SEC_TAPS: [i32; 2] = [2, 1];
+
+fn cdef_msb(x: i32) -> i32 {
+    31 - x.leading_zeros() as i32
+}
+
+/// Spec 7.15.3's `constrain`: how much of a neighbour's difference from the
+/// centre sample a filter tap is allowed to contribute.
+fn cdef_constrain(diff: i32, threshold: i32, damping: i32) -> i32 {
+    if threshold == 0 {
+        return 0;
+    }
+    let shift = (damping - cdef_msb(threshold)).max(0);
+    diff.signum() * (threshold - (diff.abs() >> shift)).clamp(0, diff.abs())
+}
+
+/// Spec 7.15.3's direction search (libaom `cdef_find_dir_c`): the dominant
+/// direction of an 8x8 luma window and the variance gap between it and its
+/// orthogonal, `sample(row, col)` reading that window's own pixels.
+fn cdef_find_dir(sample: impl Fn(usize, usize) -> i32) -> (usize, i32) {
+    const DIV_TABLE: [i64; 9] = [0, 840, 420, 280, 210, 168, 140, 120, 105];
+    let mut partial = [[0i64; 15]; 8];
+    for i in 0..8i64 {
+        for j in 0..8i64 {
+            let x = i64::from(sample(i as usize, j as usize)) - 128;
+            partial[0][(i + j) as usize] += x;
+            partial[1][(i + j / 2) as usize] += x;
+            partial[2][i as usize] += x;
+            partial[3][(3 + i - j / 2) as usize] += x;
+            partial[4][(7 + i - j) as usize] += x;
+            partial[5][(3 - i / 2 + j) as usize] += x;
+            partial[6][j as usize] += x;
+            partial[7][(i / 2 + j) as usize] += x;
+        }
+    }
+    let mut cost = [0i64; 8];
+    for i in 0..8usize {
+        cost[2] += partial[2][i] * partial[2][i];
+        cost[6] += partial[6][i] * partial[6][i];
+    }
+    cost[2] *= DIV_TABLE[8];
+    cost[6] *= DIV_TABLE[8];
+    for i in 0..7usize {
+        cost[0] += (partial[0][i] * partial[0][i] + partial[0][14 - i] * partial[0][14 - i])
+            * DIV_TABLE[i + 1];
+        cost[4] += (partial[4][i] * partial[4][i] + partial[4][14 - i] * partial[4][14 - i])
+            * DIV_TABLE[i + 1];
+    }
+    cost[0] += partial[0][7] * partial[0][7] * DIV_TABLE[8];
+    cost[4] += partial[4][7] * partial[4][7] * DIV_TABLE[8];
+    for i in (1..8).step_by(2) {
+        for j in 0..5usize {
+            cost[i] += partial[i][3 + j] * partial[i][3 + j];
+        }
+        cost[i] *= DIV_TABLE[8];
+        for j in 0..3usize {
+            cost[i] += (partial[i][j] * partial[i][j] + partial[i][10 - j] * partial[i][10 - j])
+                * DIV_TABLE[2 * j + 2];
+        }
+    }
+    let mut best_cost = 0i64;
+    let mut best_dir = 0usize;
+    for (i, &c) in cost.iter().enumerate() {
+        if c > best_cost {
+            best_cost = c;
+            best_dir = i;
+        }
+    }
+    let var = (best_cost - cost[(best_dir + 4) & 7]) >> 10;
+    (best_dir, var as i32)
+}
+
+/// Spec 7.15.2's per-8x8 strength adjustment: a strongly directional 8x8
+/// (high variance gap) gets more deringing than a flat or non-directional
+/// one, only ever applied to the luma primary strength.
+fn cdef_adjust_strength(strength: i32, var: i32) -> i32 {
+    if var == 0 {
+        return 0;
+    }
+    let i = if var >> 6 != 0 {
+        cdef_msb(var >> 6).min(12)
+    } else {
+        0
+    };
+    (strength * (4 + i) + 8) >> 4
+}
+
+/// Spec 7.15.3's `cdef_filter_block`: filters one block (8x8 luma, 4x4 4:2:0
+/// chroma) in place, `sample(row, col)` reading the *unfiltered* frame (a
+/// previously-filtered neighbour must never feed this block's own sum).
+#[allow(clippy::too_many_arguments)]
+fn cdef_filter_block(
+    sample: impl Fn(i32, i32) -> i32,
+    dst: &mut PlaneBuf,
+    ox: usize,
+    oy: usize,
+    bw: usize,
+    bh: usize,
+    pri_strength: i32,
+    sec_strength: i32,
+    dir: usize,
+    pri_damping: i32,
+    sec_damping: i32,
+    enable_primary: bool,
+    enable_secondary: bool,
+) {
+    let clipping_required = enable_primary && enable_secondary;
+    let pri_taps = CDEF_PRI_TAPS[(pri_strength & 1) as usize];
+    for i in 0..bh {
+        for j in 0..bw {
+            let x = sample(i as i32, j as i32);
+            let mut sum = 0i32;
+            let mut max = x;
+            let mut min = x;
+            for k in 0..2usize {
+                if enable_primary {
+                    let (tr, tc) = CDEF_DIRECTIONS[dir][k];
+                    let p0 = sample(i as i32 + tr, j as i32 + tc);
+                    let p1 = sample(i as i32 - tr, j as i32 - tc);
+                    sum += pri_taps[k] * cdef_constrain(p0 - x, pri_strength, pri_damping);
+                    sum += pri_taps[k] * cdef_constrain(p1 - x, pri_strength, pri_damping);
+                    if clipping_required {
+                        if p0 != CDEF_VERY_LARGE {
+                            max = max.max(p0);
+                        }
+                        if p1 != CDEF_VERY_LARGE {
+                            max = max.max(p1);
+                        }
+                        min = min.min(p0).min(p1);
+                    }
+                }
+                if enable_secondary {
+                    let (tr0, tc0) = CDEF_DIRECTIONS[(dir + 2) & 7][k];
+                    let (tr1, tc1) = CDEF_DIRECTIONS[(dir + 6) & 7][k];
+                    let s0 = sample(i as i32 + tr0, j as i32 + tc0);
+                    let s1 = sample(i as i32 - tr0, j as i32 - tc0);
+                    let s2 = sample(i as i32 + tr1, j as i32 + tc1);
+                    let s3 = sample(i as i32 - tr1, j as i32 - tc1);
+                    if clipping_required {
+                        for s in [s0, s1, s2, s3] {
+                            if s != CDEF_VERY_LARGE {
+                                max = max.max(s);
+                            }
+                        }
+                        min = min.min(s0).min(s1).min(s2).min(s3);
+                    }
+                    sum += CDEF_SEC_TAPS[k]
+                        * (cdef_constrain(s0 - x, sec_strength, sec_damping)
+                            + cdef_constrain(s1 - x, sec_strength, sec_damping)
+                            + cdef_constrain(s2 - x, sec_strength, sec_damping)
+                            + cdef_constrain(s3 - x, sec_strength, sec_damping));
+                }
+            }
+            let mut y = x + ((8 + sum - i32::from(sum < 0)) >> 4);
+            if clipping_required {
+                y = y.clamp(min, max);
+            }
+            dst.data[(oy + i) * dst.width + (ox + j)] = y.clamp(0, 255) as u8;
+        }
+    }
+}
+
+/// Applies CDEF (spec 7.15) to the whole reconstructed frame, over its true
+/// (unpadded) `mi_cols`/`mi_rows` extent, before it is cropped to its display
+/// size. `cdef_bits == 0` is this crate's only supported case so far (see the
+/// refusal in `stream.rs`), so every 64x64 filter block always uses index 0's
+/// strengths -- no per-block `cdef_idx` selection is implemented yet.
+fn apply_cdef(
+    y: &mut PlaneBuf,
+    u: &mut PlaneBuf,
+    v: &mut PlaneBuf,
+    cdef: &CdefParams,
+    skip_grid: &Neighbours,
+) {
+    if cdef.y_pri_strength[0] == 0
+        && cdef.y_sec_strength[0] == 0
+        && cdef.uv_pri_strength[0] == 0
+        && cdef.uv_sec_strength[0] == 0
+    {
+        return;
+    }
+    let src_y = y.data.clone();
+    let src_u = u.data.clone();
+    let src_v = v.data.clone();
+    let damping = i32::from(cdef.damping);
+    let damping_uv = (damping - 1).max(0);
+    let mut mi_r = 0usize;
+    while mi_r < skip_grid.mi_rows {
+        let mut mi_c = 0usize;
+        while mi_c < skip_grid.mi_cols {
+            if !skip_grid.is_skip_txfm(mi_r, mi_c) {
+                let (ox, oy) = (mi_c * 4, mi_r * 4);
+                let (y_stride, y_true_w, y_true_h) = (y.width, y.true_width, y.true_height);
+                let sample_y = |r: i32, c: i32| -> i32 {
+                    let (ny, nx) = (oy as i32 + r, ox as i32 + c);
+                    if ny < 0 || nx < 0 || ny as usize >= y_true_h || nx as usize >= y_true_w {
+                        CDEF_VERY_LARGE
+                    } else {
+                        i32::from(src_y[ny as usize * y_stride + nx as usize])
+                    }
+                };
+                let (dir, var) = cdef_find_dir(|r, c| {
+                    let (ny, nx) = ((oy + r).min(y_true_h - 1), (ox + c).min(y_true_w - 1));
+                    i32::from(src_y[ny * y_stride + nx])
+                });
+
+                // libaom `av1_cdef_filter_fb` passes `pri_strength ? dir : 0`
+                // -- each plane zeroes the shared direction when *its own*
+                // frame-level primary strength is 0, independent of the
+                // per-block adjusted `t` and of the other plane's strength.
+                let y_dir = if cdef.y_pri_strength[0] != 0 { dir } else { 0 };
+                let t = cdef_adjust_strength(i32::from(cdef.y_pri_strength[0]), var);
+                let enable_primary = t != 0;
+                let enable_secondary = cdef.y_sec_strength[0] != 0;
+                if enable_primary || enable_secondary {
+                    cdef_filter_block(
+                        sample_y,
+                        y,
+                        ox,
+                        oy,
+                        8,
+                        8,
+                        t,
+                        i32::from(cdef.y_sec_strength[0]),
+                        y_dir,
+                        damping,
+                        damping,
+                        enable_primary,
+                        enable_secondary,
+                    );
+                }
+
+                let t_uv = i32::from(cdef.uv_pri_strength[0]);
+                let uv_dir = if t_uv != 0 { dir } else { 0 };
+                let enable_primary_uv = t_uv != 0;
+                let enable_secondary_uv = cdef.uv_sec_strength[0] != 0;
+                if enable_primary_uv || enable_secondary_uv {
+                    let (cox, coy) = (ox / 2, oy / 2);
+                    for (plane, src_p) in [(&mut *u, &src_u), (&mut *v, &src_v)] {
+                        let (tw, th) = (plane.true_width, plane.true_height);
+                        let stride = plane.width;
+                        let sample_uv = |r: i32, c: i32| -> i32 {
+                            let (ny, nx) = (coy as i32 + r, cox as i32 + c);
+                            if ny < 0 || nx < 0 || ny as usize >= th || nx as usize >= tw {
+                                CDEF_VERY_LARGE
+                            } else {
+                                i32::from(src_p[ny as usize * stride + nx as usize])
+                            }
+                        };
+                        cdef_filter_block(
+                            sample_uv,
+                            plane,
+                            cox,
+                            coy,
+                            4,
+                            4,
+                            t_uv,
+                            i32::from(cdef.uv_sec_strength[0]),
+                            uv_dir,
+                            damping_uv,
+                            damping_uv,
+                            enable_primary_uv,
+                            enable_secondary_uv,
+                        );
+                    }
+                }
+            }
+            mi_c += 2;
+        }
+        mi_r += 2;
+    }
 }
 
 /// Decodes the payload [`crate::tile::sb_coeff_key_frame_tile`] writes,
@@ -1154,6 +1492,7 @@ pub fn decode_key_frame_tile(
     frame_width: u32,
     frame_height: u32,
     enable_filter_intra: bool,
+    cdef: &CdefParams,
 ) -> Result<Picture> {
     if mi_cols == 0 || mi_rows == 0 {
         return Err(unsupported("a frame with no mode-info grid"));
@@ -1487,6 +1826,8 @@ pub fn decode_key_frame_tile(
             }
         }
     }
+
+    apply_cdef(&mut y, &mut u, &mut v, cdef, &neighbours);
 
     let (fw, fh) = (frame_width as usize, frame_height as usize);
     if fw == width && fh == height {
@@ -2008,6 +2349,7 @@ fn decode_inter_block(
     }
     neighbours.record(at, side, mode_for_tx, &[luma_grid, u_grid, v_grid]);
     neighbours.record_inter(at, side, skip, is_inter);
+    neighbours.fill_skip_grid((r * (SUB / MI), c * (SUB / MI)), side / MI, skip);
     Ok(())
 }
 
@@ -2032,6 +2374,7 @@ pub fn decode_inter_frame_tile(
     frame_width: u32,
     frame_height: u32,
     reference: &Picture,
+    cdef: &CdefParams,
 ) -> Result<Picture> {
     if mi_cols == 0 || mi_rows == 0 {
         return Err(unsupported("a frame with no mode-info grid"));
@@ -2237,6 +2580,8 @@ pub fn decode_inter_frame_tile(
         }
     }
 
+    apply_cdef(&mut y, &mut u, &mut v, cdef, &neighbours);
+
     let (fw, fh) = (frame_width as usize, frame_height as usize);
     if fw == width && fh == height {
         return Ok(Picture {
@@ -2279,7 +2624,10 @@ mod tests {
 
     #[test]
     fn a_frame_with_no_mode_info_grid_is_refused() {
-        assert!(decode_key_frame_tile(&[0u8; 4], 0, 32, 32, 0, 128, false).is_err());
+        assert!(
+            decode_key_frame_tile(&[0u8; 4], 0, 32, 32, 0, 128, false, &CdefParams::default())
+                .is_err()
+        );
     }
 
     /// Encodes and decodes one picture with `modes`, asserting the decoder's
@@ -2308,7 +2656,14 @@ mod tests {
             ..
         }: Encoded = crate::encode::encode_key_frame_with_modes(&picture, 40, 0.0, modes).unwrap();
         let decoded = decode_key_frame_tile(
-            &tile, mi_cols, mi_rows, base_q_idx, w as u32, h as u32, false,
+            &tile,
+            mi_cols,
+            mi_rows,
+            base_q_idx,
+            w as u32,
+            h as u32,
+            false,
+            &CdefParams::default(),
         )
         .unwrap();
         assert_eq!(decoded.width, w, "{w}x{h}: decoded width");
@@ -2380,7 +2735,9 @@ mod tests {
         );
         enc.symbol(DC_PRED, &mut cdfs.uv_mode_no_cfl[DC_PRED]);
         let data = enc.finish();
-        let decoded = decode_key_frame_tile(&data, 16, 16, 40, 64, 64, false).unwrap();
+        let decoded =
+            decode_key_frame_tile(&data, 16, 16, 40, 64, 64, false, &CdefParams::default())
+                .unwrap();
         assert!(
             decoded.y.iter().all(|&s| s == 128),
             "a skipped DC_PRED block with no neighbours predicts flat mid-grey"
@@ -2560,6 +2917,7 @@ mod tests {
                 coded_w,
                 coded_h,
                 false,
+                &CdefParams::default(),
             )
             .unwrap();
             assert_eq!(ours.y, ffmpeg_decoded.y, "{width}x{height}: luma vs ffmpeg");
@@ -2628,6 +2986,7 @@ mod tests {
             width as u32,
             height as u32,
             false,
+            &CdefParams::default(),
         )
         .unwrap();
         assert_eq!(
@@ -2652,6 +3011,7 @@ mod tests {
                 width as u32,
                 height as u32,
                 &reference,
+                &CdefParams::default(),
             )
             .unwrap();
             assert_eq!(
@@ -2895,6 +3255,7 @@ mod tests {
             coded_w,
             coded_h,
             false,
+            &CdefParams::default(),
         )
         .unwrap();
         assert_eq!(reference.y, ffmpeg_frames[0].y, "frame 0 luma vs ffmpeg");
@@ -2908,6 +3269,7 @@ mod tests {
                 coded_w,
                 coded_h,
                 &reference,
+                &CdefParams::default(),
             )
             .unwrap();
             assert_eq!(decoded.y, ffmpeg_frames[i].y, "frame {i} luma vs ffmpeg");
