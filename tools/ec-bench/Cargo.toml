@@ -20,3 +20,5 @@ ec-h265 = { workspace = true }
 ec-av1 = { workspace = true }
 ec-probe = { workspace = true }
 ec-h264-syntax = { workspace = true }
+ec-image = { workspace = true }
+ec-inflate = { workspace = true }

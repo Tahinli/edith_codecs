@@ -281,6 +281,8 @@ dependencies = [
  "ec-h264",
  "ec-h264-syntax",
  "ec-h265",
+ "ec-image",
+ "ec-inflate",
  "ec-probe",
 ]
 
