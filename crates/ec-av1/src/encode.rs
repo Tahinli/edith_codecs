@@ -604,6 +604,8 @@ impl Plane<'_> {
             left.as_deref(),
             corner,
             side,
+            false,
+            false,
             &mut prediction,
         );
 
@@ -821,6 +823,8 @@ impl Plane<'_> {
                     left.as_deref(),
                     corner,
                     side,
+                    false,
+                    false,
                     &mut prediction,
                 );
                 let sad: f64 = (0..side * side)
@@ -870,6 +874,8 @@ impl Plane<'_> {
                     left.as_deref(),
                     corner,
                     side,
+                    false,
+                    false,
                     &mut prediction,
                 );
                 let sad: f64 = (0..side * side)
@@ -4426,6 +4432,8 @@ mod tests {
                     Some(&left),
                     Some(128),
                     side,
+                    false,
+                    false,
                     &mut prediction,
                 );
             }
