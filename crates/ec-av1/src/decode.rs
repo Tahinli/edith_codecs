@@ -25,7 +25,8 @@ use ec_core::{Error, Result};
 
 use crate::cdf;
 use crate::cdf_state::{Cdfs, TxbSet, TxbTables};
-use crate::encode::Picture;
+use crate::encode::{Picture, Reach};
+use crate::intra::predict;
 use crate::msac::SymbolDecoder;
 use crate::tile::{INTRA_MODE_CTX, block_grid, has_half};
 use crate::transform::dequant_and_inverse;
@@ -35,6 +36,7 @@ const PARTITION_SPLIT: usize = 3;
 const SB_MI: u32 = 16;
 const BLOCK_MI: u32 = 8;
 const SUB_MI: u32 = 4;
+const MI: usize = 4;
 const SB: usize = 64;
 const BLOCK: usize = 32;
 const SUB: usize = 16;
@@ -42,10 +44,42 @@ const TX32: usize = 32;
 const TX16: usize = 16;
 const TX8: usize = 8;
 const DC_PRED: usize = 0;
+/// `V_PRED` (spec 6.10.2): the first directional mode, and so the first that
+/// carries an angle delta — [`crate::tile`]'s own private copy of the same
+/// constant.
+const V_PRED: usize = 1;
+/// The last directional mode, `D67_PRED`.
+const D67_PRED: usize = 8;
+/// The symbol an angle delta of zero codes as (spec 9.3): the alphabet runs
+/// from -3 to +3, so this is its middle — [`crate::tile`]'s writer never
+/// codes anything else, so this decoder never reads anything else either.
+const ANGLE_DELTA_ZERO: usize = 3;
 const NUM_BASE_LEVELS: i32 = 2;
 const COEFF_BASE_RANGE: i32 = 12;
 const BR_STEP: i32 = 3;
 const MAX_BR_LEVEL: i32 = NUM_BASE_LEVELS + COEFF_BASE_RANGE;
+
+/// `partition_gather_vert_alike`/`_horz_alike` (spec 9.3): the partition types
+/// whose probability mass a superblock or block half outside the frame
+/// gathers into its one remaining flag — [`crate::tile`]'s own private copy,
+/// duplicated here (that module is another lane's territory this round) and
+/// kept in step with it by the byte-exact round-trip tests below rather than
+/// by sharing code.
+const VERT_ALIKE: [usize; 6] = [2, PARTITION_SPLIT, 4, 6, 7, 9];
+const HORZ_ALIKE: [usize; 6] = [1, PARTITION_SPLIT, 4, 5, 6, 8];
+
+fn element_prob(cdf: &[u16], element: usize) -> u16 {
+    cdf[element] - if element > 0 { cdf[element - 1] } else { 0 }
+}
+
+/// The two-symbol CDF a partial superblock/block's forced-split flag is read
+/// with: the mass of `elements` becomes the probability of the one partition
+/// the frame edge still allows, mirroring [`crate::tile`]'s own `gather`
+/// (the encoder's non-adapting counterpart to this read).
+fn gather(cdf: &[u16], elements: [usize; 6]) -> [u16; 3] {
+    let split: u16 = elements.iter().map(|&e| element_prob(cdf, e)).sum();
+    [32768 - split, 32768, 0]
+}
 
 fn unsupported(what: impl Into<String>) -> Error {
     Error::unsupported("AV1 tile", what.into())
@@ -257,32 +291,62 @@ fn read_coeffs(
     Ok(grid)
 }
 
-/// The neighbour state a block's contexts are read from — the decode-side
-/// twin of [`crate::tile`]'s private `Neighbours`, keeping only what a
-/// `DC_PRED`-only decoder needs: per-16x16-cell block size (partition
-/// context) and per-plane coded/DC-sign state (coefficient contexts). Mode
-/// tracking is not needed: every block is `DC_PRED`, so the mode context is
-/// always `[0][0]`.
+/// What one coded block leaves behind for the blocks that read it as a
+/// neighbour: whether it coded anything at all, and the sign of its DC —
+/// [`crate::tile`]'s own private `Neighbour`.
+#[derive(Clone, Copy, Default)]
+struct Neighbour {
+    coded: bool,
+    dc: Option<bool>,
+}
+
+fn neighbour_state(grid: &[i32]) -> Neighbour {
+    Neighbour {
+        coded: grid.iter().any(|&l| l != 0),
+        dc: (grid[0] != 0).then_some(grid[0] < 0),
+    }
+}
+
+/// The neighbour state a block's contexts are read from — a duplicate of
+/// [`crate::tile`]'s own private `Neighbours` (that module is another lane's
+/// territory this round), kept at the same two granularities the real writer
+/// tracks: `above_mode`/`left_mode`/`above_side`/`left_side` on the 16x16
+/// (`SUB`) grid the partition/mode symbols read, and `above`/`left`'s
+/// per-plane coded/DC-sign state on the finer 4x4 (`MI`) grid the coefficient
+/// contexts read (spec `av1_set_entropy_contexts`) — which is what lets a
+/// chroma transform straddling the true, odd-sized frame edge see its
+/// neighbour's state clamped at its own subsampled edge rather than luma's.
 struct Neighbours {
+    above: Vec<[Neighbour; 3]>,
+    left: Vec<[Neighbour; 3]>,
+    above_mode: Vec<usize>,
+    left_mode: Vec<usize>,
     above_side: Vec<usize>,
     left_side: Vec<usize>,
-    above: Vec<[(bool, Option<bool>); 3]>,
-    left: Vec<[(bool, Option<bool>); 3]>,
+    mi_cols: usize,
+    mi_rows: usize,
 }
 
 impl Neighbours {
-    fn new(cols: usize, rows: usize) -> Self {
+    /// `cols`/`rows` are in [`SUB`] units; `mi_cols`/`mi_rows` are the frame's
+    /// true (unpadded) size in 4x4 mode-info units.
+    fn new(cols: usize, rows: usize, mi_cols: usize, mi_rows: usize) -> Self {
         Self {
+            above: vec![[Neighbour::default(); 3]; cols * (SUB / MI)],
+            left: vec![[Neighbour::default(); 3]; rows * (SUB / MI)],
+            above_mode: vec![DC_PRED; cols],
+            left_mode: vec![DC_PRED; rows],
             above_side: vec![SB; cols],
             left_side: vec![SB; rows],
-            above: vec![[(false, None); 3]; cols],
-            left: vec![[(false, None); 3]; rows],
+            mi_cols,
+            mi_rows,
         }
     }
 
     fn start_row(&mut self) {
-        self.left_side.iter_mut().for_each(|s| *s = SB);
         self.left.iter_mut().for_each(|l| *l = Default::default());
+        self.left_mode.iter_mut().for_each(|m| *m = DC_PRED);
+        self.left_side.iter_mut().for_each(|s| *s = SB);
     }
 
     fn partition_ctx(&self, at: (usize, usize), side: usize) -> usize {
@@ -290,57 +354,100 @@ impl Neighbours {
         2 * usize::from(self.left_side[r] * 2 <= side) + usize::from(self.above_side[c] * 2 <= side)
     }
 
-    /// Whether any transform block above/left of this one (spanning `side_sub`
-    /// `SUB`-sized cells) coded a coefficient, and the gathered DC-sign vote,
-    /// per plane.
-    fn around(&self, at: (usize, usize), side_sub: usize) -> [(bool, bool, i32); 3] {
-        let (r, c) = at;
+    /// The gathered coded/DC-sign state of the blocks above and to the left
+    /// of a block `side` samples across, per plane.
+    fn around(&self, (r, c): (usize, usize), side: usize) -> [(bool, bool, i32); 3] {
+        let (mi_r, mi_c, side_mi) = (r * (SUB / MI), c * (SUB / MI), side / MI);
         std::array::from_fn(|plane| {
             let mut above_coded = false;
             let mut left_coded = false;
             let mut vote = 0;
-            for cell in 0..side_sub {
-                let (a_coded, a_dc) = self.above[c + cell][plane];
-                let (l_coded, l_dc) = self.left[r + cell][plane];
-                above_coded |= a_coded;
-                left_coded |= l_coded;
-                vote += dc_vote(a_dc) + dc_vote(l_dc);
+            for cell in 0..side_mi {
+                let above = &self.above[mi_c + cell][plane];
+                let left = &self.left[mi_r + cell][plane];
+                above_coded |= above.coded;
+                left_coded |= left.coded;
+                vote += dc_vote(above.dc) + dc_vote(left.dc);
             }
             (above_coded, left_coded, vote)
         })
     }
 
-    fn record(&mut self, at: (usize, usize), side: usize, grids: &[Vec<i32>; 3]) {
+    /// Writes one coded block into every cell it covers, on both grids: the
+    /// mode/side arrays up to `side`'s own width, and the coefficient-context
+    /// arrays up to the true frame edge — the units past it are left at their
+    /// default (uncoded), even mid-cell, exactly as [`crate::tile`]'s own
+    /// `record` leaves them (spec `av1_set_entropy_contexts`, which clamps to
+    /// `blocks_wide`/`blocks_high` derived from the true `mi_cols`/`mi_rows`,
+    /// not from this block's own side).
+    fn record(&mut self, at: (usize, usize), side: usize, mode: usize, grids: &[Vec<i32>; 3]) {
         let (r, c) = at;
-        let states: [(bool, Option<bool>); 3] = std::array::from_fn(|plane| {
-            let grid = &grids[plane];
-            (
-                grid.iter().any(|&l| l != 0),
-                (grid[0] != 0).then_some(grid[0] < 0),
-            )
-        });
+        let states: [Neighbour; 3] = std::array::from_fn(|plane| neighbour_state(&grids[plane]));
         for cell in 0..side / SUB {
+            self.above_mode[c + cell] = mode;
+            self.left_mode[r + cell] = mode;
             self.above_side[c + cell] = side;
             self.left_side[r + cell] = side;
         }
-        for cell in 0..side / SUB {
-            self.above[c + cell] = states;
-            self.left[r + cell] = states;
+        let (mi_r, mi_c, side_mi) = (r * (SUB / MI), c * (SUB / MI), side / MI);
+        // A chroma 4x4 unit straddling the true luma edge is still whole in
+        // chroma's own halved grid, so libaom rounds the luma bound up to the
+        // plane's own 4x4 unit before clamping a subsampled plane
+        // (`av1_write_intra_coeffs_mb`, encodetxb.c).
+        let round_up_even = |n: usize| n.div_ceil(2) * 2;
+        let bound_h = [
+            self.mi_rows,
+            round_up_even(self.mi_rows),
+            round_up_even(self.mi_rows),
+        ];
+        let bound_w = [
+            self.mi_cols,
+            round_up_even(self.mi_cols),
+            round_up_even(self.mi_cols),
+        ];
+        for cell in 0..side_mi {
+            self.left[mi_r + cell] = std::array::from_fn(|plane| {
+                if cell < side_mi.min(bound_h[plane].saturating_sub(mi_r)) {
+                    states[plane]
+                } else {
+                    Default::default()
+                }
+            });
+            self.above[mi_c + cell] = std::array::from_fn(|plane| {
+                if cell < side_mi.min(bound_w[plane].saturating_sub(mi_c)) {
+                    states[plane]
+                } else {
+                    Default::default()
+                }
+            });
         }
     }
 }
 
-/// Reads one coded block's mode and skip flag, refusing anything but
-/// `DC_PRED`, unskipped — the only shape this round's decoder reconstructs.
-fn read_intra_mode(dec: &mut SymbolDecoder, cdfs: &mut Cdfs, cfl: bool) -> Result<()> {
-    if dec.symbol(&mut cdfs.skip[0]) != 0 {
-        return Err(unsupported("a skipped block (round 2)"));
-    }
-    let mode = dec.symbol(&mut cdfs.kf_y_mode[INTRA_MODE_CTX[DC_PRED]][INTRA_MODE_CTX[DC_PRED]]);
-    if mode != DC_PRED {
-        return Err(unsupported(format!(
-            "intra mode {mode} (round 1 reconstructs DC_PRED only)"
-        )));
+/// Reads one coded block's skip flag, luma mode, angle delta (if the mode
+/// carries one) and chroma mode, mirroring [`crate::tile`]'s `write_intra_mode`
+/// exactly — including its skip context, which the real key-frame writer
+/// always writes at a fixed context of zero (it never tracks a neighbour-based
+/// one for intra blocks; that is the inter-frame writer's rule instead).
+/// Refuses a nonzero angle delta or a chroma-from-luma mode: this decoder
+/// reconstructs the thirteen luma modes at their base angle, DC-only chroma.
+fn read_intra_mode(
+    dec: &mut SymbolDecoder,
+    cdfs: &mut Cdfs,
+    above_mode: usize,
+    left_mode: usize,
+    cfl: bool,
+) -> Result<(bool, usize)> {
+    let skip = dec.symbol(&mut cdfs.skip[0]) != 0;
+    let mode =
+        dec.symbol(&mut cdfs.kf_y_mode[INTRA_MODE_CTX[above_mode]][INTRA_MODE_CTX[left_mode]]);
+    if (V_PRED..=D67_PRED).contains(&mode) {
+        let angle = dec.symbol(&mut cdfs.angle_delta[mode - V_PRED]);
+        if angle != ANGLE_DELTA_ZERO {
+            return Err(unsupported(
+                "a nonzero angle delta (this encoder never writes one)",
+            ));
+        }
     }
     let uv_mode = if cfl {
         dec.symbol(&mut cdfs.uv_mode_cfl[mode])
@@ -350,14 +457,23 @@ fn read_intra_mode(dec: &mut SymbolDecoder, cdfs: &mut Cdfs, cfl: bool) -> Resul
     if uv_mode != DC_PRED {
         return Err(unsupported("a chroma-from-luma mode (round 2)"));
     }
-    Ok(())
+    Ok((skip, mode))
 }
 
 /// One plane's reconstruction buffer, `width * height` samples, and the
-/// prediction/residual reads and writes into it.
+/// prediction/residual reads and writes into it — the decode-side twin of
+/// [`crate::encode`]'s private `Plane`, whose `edges` this mirrors exactly
+/// (own-edge and reach clamps both), passing what it gathers straight to
+/// [`crate::intra::predict`] instead of hand-rolling `DC_PRED` alone.
 struct PlaneBuf {
     data: Vec<u8>,
     width: usize,
+    height: usize,
+    /// The frame's true, decodable extent in this plane's own units — past
+    /// this, samples are the padded coding surface's invented tail, never a
+    /// real decoder's edge or reach reads.
+    true_width: usize,
+    true_height: usize,
 }
 
 impl PlaneBuf {
@@ -366,40 +482,58 @@ impl PlaneBuf {
         x: usize,
         y: usize,
         side: usize,
+        reach: Reach,
     ) -> (Option<Vec<u8>>, Option<Vec<u8>>, Option<u8>) {
-        let above = (y > 0).then(|| self.data[(y - 1) * self.width + x..][..side].to_vec());
-        let left = (x > 0).then(|| {
-            (y..y + side)
+        let own_across = x + side.min(self.true_width.saturating_sub(x));
+        let across = if reach.above_right {
+            own_across + side.min(self.true_width.saturating_sub(own_across))
+        } else {
+            own_across
+        }
+        .min(self.width);
+        let own_down = y + side.min(self.true_height.saturating_sub(y));
+        let down = if reach.below_left {
+            own_down + side.min(self.true_height.saturating_sub(own_down))
+        } else {
+            own_down
+        }
+        .min(self.height);
+        let above = (y > 0 && across > x)
+            .then(|| self.data[(y - 1) * self.width + x..][..across - x].to_vec());
+        let left = (x > 0 && down > y).then(|| {
+            (y..down)
                 .map(|row| self.data[row * self.width + x - 1])
-                .collect()
+                .collect::<Vec<_>>()
         });
         let corner = (x > 0 && y > 0).then(|| self.data[(y - 1) * self.width + x - 1]);
         (above, left, corner)
     }
 
-    /// Predicts (`DC_PRED` only) then adds `residual` (side*side, raster),
+    /// Predicts under `mode` then adds `residual` (side*side, raster),
     /// writing the clamped reconstruction back into the plane at `(x, y)`.
-    fn reconstruct(&mut self, x: usize, y: usize, side: usize, residual: &[i32]) {
-        let (above, left, _corner) = self.edges(x, y, side);
-        let dc = match (&above, &left) {
-            (None, None) => 128,
-            (Some(a), None) => {
-                let sum: u32 = a.iter().map(|&s| u32::from(s)).sum();
-                ((sum + (a.len() as u32 >> 1)) / a.len() as u32) as i32
-            }
-            (None, Some(l)) => {
-                let sum: u32 = l.iter().map(|&s| u32::from(s)).sum();
-                ((sum + (l.len() as u32 >> 1)) / l.len() as u32) as i32
-            }
-            (Some(a), Some(l)) => {
-                let sum: u32 = a.iter().chain(l).map(|&s| u32::from(s)).sum();
-                let count = (a.len() + l.len()) as u32;
-                ((sum + (count >> 1)) / count) as i32
-            }
-        };
+    fn reconstruct(
+        &mut self,
+        x: usize,
+        y: usize,
+        side: usize,
+        mode: usize,
+        reach: Reach,
+        residual: &[i32],
+    ) {
+        let (above, left, corner) = self.edges(x, y, side, reach);
+        let mut prediction = vec![0u8; side * side];
+        predict(
+            mode as u8,
+            above.as_deref(),
+            left.as_deref(),
+            corner,
+            side,
+            &mut prediction,
+        );
         for row in 0..side {
             for col in 0..side {
-                let sample = (dc + residual[row * side + col]).clamp(0, 255) as u8;
+                let sample = (i32::from(prediction[row * side + col]) + residual[row * side + col])
+                    .clamp(0, 255) as u8;
                 self.data[(y + row) * self.width + x + col] = sample;
             }
         }
@@ -416,6 +550,12 @@ fn read_plane(
     scan: &[u16],
     plane_idx: usize,
     around: (bool, bool, i32),
+    // The block's own luma mode — [`crate::tile::write_block_planes`] passes
+    // it for every plane's `txb` lookup (it is what an intra transform type's
+    // CDF is indexed by, spec 9.3), never the plane's own predicted mode.
+    tx_mode: usize,
+    predict_mode: usize,
+    reach: Reach,
     plane: &mut PlaneBuf,
     x: usize,
     y: usize,
@@ -428,7 +568,7 @@ fn read_plane(
     } else {
         usize::from(around.0) + usize::from(around.1)
     };
-    let mut coding = cdfs.txb(set, DC_PRED);
+    let mut coding = cdfs.txb(set, tx_mode);
     let grid = read_coeffs(dec, &mut coding, scan, skip_ctx, dc_sign_ctx(around.2))?;
     // A 64x64 luma block's transform covers the whole 64x64 area, but only its
     // top-left 32x32 of frequencies are coded (spec 5.11.40); the rest of the
@@ -444,7 +584,7 @@ fn read_plane(
         full
     };
     let residual = dequant_and_inverse(&levels, tx_side, 8, i32::from(base_q_idx));
-    plane.reconstruct(x, y, tx_side, &residual);
+    plane.reconstruct(x, y, tx_side, predict_mode, reach, &residual);
     Ok(if tx_side == side {
         residual_grid_placeholder(&levels, tx_side)
     } else {
@@ -481,44 +621,84 @@ fn decode_block(
     v: &mut PlaneBuf,
     base_q_idx: u8,
 ) -> Result<()> {
-    read_intra_mode(dec, cdfs, cfl)?;
     let (r, c) = at;
-    let around = neighbours.around(at, side / SUB);
     let (px, py) = (c * SUB, r * SUB);
-    let luma_grid = read_plane(
-        dec, cdfs, luma_set, scans.0, 0, around[0], y, px, py, side, luma_tx, base_q_idx,
+    let (skip, mode) = read_intra_mode(
+        dec,
+        cdfs,
+        neighbours.above_mode[c],
+        neighbours.left_mode[r],
+        cfl,
     )?;
+    let reach = Reach::of(side, px, py, y.width, y.height);
+    let (luma_grid, u_grid, v_grid);
     let (cpx, cpy) = (px / 2, py / 2);
     let chroma_side = side / 2;
-    let u_grid = read_plane(
-        dec,
-        cdfs,
-        chroma_set,
-        scans.1,
-        1,
-        around[1],
-        u,
-        cpx,
-        cpy,
-        chroma_side,
-        chroma_tx,
-        base_q_idx,
-    )?;
-    let v_grid = read_plane(
-        dec,
-        cdfs,
-        chroma_set,
-        scans.1,
-        2,
-        around[2],
-        v,
-        cpx,
-        cpy,
-        chroma_side,
-        chroma_tx,
-        base_q_idx,
-    )?;
-    neighbours.record(at, side, &[luma_grid, u_grid, v_grid]);
+    if skip {
+        // A skipped block codes no residual syntax at all (spec 5.11.34):
+        // straight prediction, on every plane.
+        y.reconstruct(px, py, side, mode, reach, &vec![0i32; side * side]);
+        u.reconstruct(
+            cpx,
+            cpy,
+            chroma_side,
+            DC_PRED,
+            Reach::none(),
+            &vec![0i32; chroma_side * chroma_side],
+        );
+        v.reconstruct(
+            cpx,
+            cpy,
+            chroma_side,
+            DC_PRED,
+            Reach::none(),
+            &vec![0i32; chroma_side * chroma_side],
+        );
+        luma_grid = vec![0i32; side * side];
+        u_grid = vec![0i32; chroma_side * chroma_side];
+        v_grid = vec![0i32; chroma_side * chroma_side];
+    } else {
+        let around = neighbours.around(at, side);
+        luma_grid = read_plane(
+            dec, cdfs, luma_set, scans.0, 0, around[0], mode, mode, reach, y, px, py, side,
+            luma_tx, base_q_idx,
+        )?;
+        u_grid = read_plane(
+            dec,
+            cdfs,
+            chroma_set,
+            scans.1,
+            1,
+            around[1],
+            mode,
+            DC_PRED,
+            Reach::none(),
+            u,
+            cpx,
+            cpy,
+            chroma_side,
+            chroma_tx,
+            base_q_idx,
+        )?;
+        v_grid = read_plane(
+            dec,
+            cdfs,
+            chroma_set,
+            scans.1,
+            2,
+            around[2],
+            mode,
+            DC_PRED,
+            Reach::none(),
+            v,
+            cpx,
+            cpy,
+            chroma_side,
+            chroma_tx,
+            base_q_idx,
+        )?;
+    }
+    neighbours.record(at, side, mode, &[luma_grid, u_grid, v_grid]);
     Ok(())
 }
 
@@ -526,46 +706,56 @@ fn decode_block(
 /// returning the picture it reconstructs to.
 ///
 /// `mi_cols`/`mi_rows` and `base_q_idx` are the frame header's, as parsed by
-/// [`ec_av1_syntax`].
+/// [`ec_av1_syntax`]. `frame_width`/`frame_height` are the header's own true
+/// (render) size — a separate field from `mi_cols`/`mi_rows` (spec
+/// `compute_image_size` derives one from the other, but not losslessly: a
+/// width that is not a multiple of 8 samples leaves `mi_cols * 4` past it) —
+/// what the reconstruction is cropped to on the way out, mirroring
+/// [`crate::encode::crop_encoded`].
 ///
 /// # Errors
-/// Returns an error when the frame is not a whole number of 64x64
-/// superblocks (round 2: the partial-superblock/gathered-CDF path), when a
-/// block's partition, mode, skip flag or transform type is anything this
-/// decoder does not reconstruct (round 2: non-`DC_PRED` intra, inter, tx
-/// types other than `DCT_DCT`), or when the tile payload runs out of the
-/// symbols this decode expects (a genuinely foreign stream).
+/// Returns an error when a block's partition, mode, skip flag or transform
+/// type is anything this decoder does not reconstruct (round 2: inter, tx
+/// types other than `DCT_DCT`, non-CDF-gathered rectangular splits below
+/// 16x16, a directional mode's angle delta other than zero, chroma-from-luma),
+/// or when the tile payload runs out of the symbols this decode expects (a
+/// genuinely foreign stream).
 pub fn decode_key_frame_tile(
     data: &[u8],
     mi_cols: u32,
     mi_rows: u32,
     base_q_idx: u8,
+    frame_width: u32,
+    frame_height: u32,
 ) -> Result<Picture> {
-    if mi_cols == 0
-        || mi_rows == 0
-        || !mi_cols.is_multiple_of(SB_MI)
-        || !mi_rows.is_multiple_of(SB_MI)
-    {
-        return Err(unsupported(
-            "a frame that is not a whole number of 64x64 superblocks (round 2)",
-        ));
+    if mi_cols == 0 || mi_rows == 0 {
+        return Err(unsupported("a frame with no mode-info grid"));
     }
-    let (sb_cols, sb_rows) = (mi_cols / SB_MI, mi_rows / SB_MI);
+    let (sb_cols, sb_rows) = (mi_cols.div_ceil(SB_MI), mi_rows.div_ceil(SB_MI));
     let (cols32, rows32) = block_grid(mi_cols, mi_rows);
-    let width = (mi_cols * 4) as usize;
-    let height = (mi_rows * 4) as usize;
+    let (true_width, true_height) = ((mi_cols * 4) as usize, (mi_rows * 4) as usize);
+    let (width, height) = (cols32 as usize * BLOCK, rows32 as usize * BLOCK);
 
     let mut y = PlaneBuf {
         data: vec![0u8; width * height],
         width,
+        height,
+        true_width,
+        true_height,
     };
     let mut u = PlaneBuf {
         data: vec![0u8; width * height / 4],
         width: width / 2,
+        height: height / 2,
+        true_width: true_width / 2,
+        true_height: true_height / 2,
     };
     let mut v = PlaneBuf {
         data: vec![0u8; width * height / 4],
         width: width / 2,
+        height: height / 2,
+        true_width: true_width / 2,
+        true_height: true_height / 2,
     };
 
     let scan32 = default_scan(TX32);
@@ -574,7 +764,12 @@ pub fn decode_key_frame_tile(
 
     let mut cdfs = Cdfs::new(q_ctx_of(base_q_idx));
     let mut dec = SymbolDecoder::new(data);
-    let mut neighbours = Neighbours::new(cols32 as usize * 2, rows32 as usize * 2);
+    let mut neighbours = Neighbours::new(
+        cols32 as usize * 2,
+        rows32 as usize * 2,
+        mi_cols as usize,
+        mi_rows as usize,
+    );
 
     for sb_r in 0..sb_rows {
         neighbours.start_row();
@@ -585,12 +780,27 @@ pub fn decode_key_frame_tile(
                 sb_c * SB_MI + SB_MI / 2 < mi_cols,
                 sb_r * SB_MI + SB_MI / 2 < mi_rows,
             );
-            if !has_cols || !has_rows {
-                return Err(unsupported(
-                    "a superblock half outside the true frame (round 2)",
-                ));
-            }
-            let part = dec.symbol(&mut cdfs.partition_w64[ctx]);
+            // Recomputed at this superblock's own half (spec
+            // `decode_partition`): a full alphabet symbol when both halves are
+            // inside the true frame, a single gathered bit when just one is
+            // (the superblock cannot be left whole, so this is forced split),
+            // and nothing at all (SPLIT inferred, no bits) when neither is —
+            // mirroring [`crate::tile::sb_coeff_key_frame_tile`]'s own
+            // three-way write exactly.
+            let part = if has_cols && has_rows {
+                dec.symbol(&mut cdfs.partition_w64[ctx])
+            } else {
+                match (has_cols, has_rows) {
+                    (true, false) => {
+                        dec.symbol_fixed(&gather(&cdfs.partition_w64[ctx], VERT_ALIKE));
+                    }
+                    (false, true) => {
+                        dec.symbol_fixed(&gather(&cdfs.partition_w64[ctx], HORZ_ALIKE));
+                    }
+                    _ => {}
+                }
+                PARTITION_SPLIT
+            };
             match part {
                 PARTITION_NONE => {
                     decode_block(
@@ -623,12 +833,26 @@ pub fn decode_key_frame_tile(
                             has_half(c32 * BLOCK_MI, BLOCK_MI, mi_cols),
                             has_half(r32 * BLOCK_MI, BLOCK_MI, mi_rows),
                         );
-                        if !has_cols32 || !has_rows32 {
-                            return Err(unsupported(
-                                "a 32x32 block half outside the true frame (round 2)",
-                            ));
-                        }
-                        let part32 = dec.symbol(&mut cdfs.partition_w32[ctx32]);
+                        let part32 = if has_cols32 && has_rows32 {
+                            dec.symbol(&mut cdfs.partition_w32[ctx32])
+                        } else {
+                            match (has_cols32, has_rows32) {
+                                (true, false) => {
+                                    dec.symbol_fixed(&gather(
+                                        &cdfs.partition_w32[ctx32],
+                                        VERT_ALIKE,
+                                    ));
+                                }
+                                (false, true) => {
+                                    dec.symbol_fixed(&gather(
+                                        &cdfs.partition_w32[ctx32],
+                                        HORZ_ALIKE,
+                                    ));
+                                }
+                                _ => {}
+                            }
+                            PARTITION_SPLIT
+                        };
                         match part32 {
                             PARTITION_NONE => {
                                 decode_block(
@@ -709,12 +933,29 @@ pub fn decode_key_frame_tile(
         }
     }
 
+    let (fw, fh) = (frame_width as usize, frame_height as usize);
+    if fw == width && fh == height {
+        return Ok(Picture {
+            width,
+            height,
+            y: y.data,
+            u: u.data,
+            v: v.data,
+        });
+    }
+    let crop = |plane: &PlaneBuf, w: usize, h: usize| -> Vec<u8> {
+        let mut out = Vec::with_capacity(w * h);
+        for row in 0..h {
+            out.extend_from_slice(&plane.data[row * plane.width..][..w]);
+        }
+        out
+    };
     Ok(Picture {
-        width,
-        height,
-        y: y.data,
-        u: u.data,
-        v: v.data,
+        width: fw,
+        height: fh,
+        y: crop(&y, fw, fh),
+        u: crop(&u, fw / 2, fh / 2),
+        v: crop(&v, fw / 2, fh / 2),
     })
 }
 
@@ -733,41 +974,97 @@ mod tests {
     // that path with real quantised residual, not a synthetic all-DC frame.
 
     #[test]
-    fn a_frame_that_is_not_a_whole_number_of_superblocks_is_refused() {
-        assert!(decode_key_frame_tile(&[0u8; 4], 33, 32, 32).is_err());
+    fn a_frame_with_no_mode_info_grid_is_refused() {
+        assert!(decode_key_frame_tile(&[0u8; 4], 0, 32, 32, 0, 128).is_err());
+    }
+
+    /// Encodes and decodes one picture with `modes`, asserting the decoder's
+    /// planes are byte-exact against the encoder's own reconstruction.
+    fn round_trips(w: usize, h: usize, modes: &[u8]) {
+        use crate::encode::{Encoded, Picture as Pic};
+        let mut source = vec![0u8; w * h];
+        for row in 0..h {
+            for col in 0..w {
+                source[row * w + col] = ((row * 3 + col * 5) % 251) as u8;
+            }
+        }
+        let picture = Pic {
+            width: w,
+            height: h,
+            y: source,
+            u: vec![128; w * h / 4],
+            v: vec![128; w * h / 4],
+        };
+        let Encoded {
+            tile,
+            reconstruction,
+            mi_cols,
+            mi_rows,
+            base_q_idx,
+            ..
+        }: Encoded = crate::encode::encode_key_frame_with_modes(&picture, 40, 0.0, modes).unwrap();
+        let decoded =
+            decode_key_frame_tile(&tile, mi_cols, mi_rows, base_q_idx, w as u32, h as u32).unwrap();
+        assert_eq!(decoded.width, w, "{w}x{h}: decoded width");
+        assert_eq!(decoded.height, h, "{w}x{h}: decoded height");
+        assert_eq!(decoded.y, reconstruction.y, "{w}x{h} luma mismatch");
+        assert_eq!(decoded.u, reconstruction.u, "{w}x{h} chroma U mismatch");
+        assert_eq!(decoded.v, reconstruction.v, "{w}x{h} chroma V mismatch");
     }
 
     #[test]
     fn real_yuv_round_trips_bit_exact_against_the_encoder_reconstruction() {
-        use crate::encode::{Encoded, Picture as Pic};
         for (w, h) in [(128usize, 128usize), (192, 128)] {
-            let mut source = vec![0u8; w * h];
-            for row in 0..h {
-                for col in 0..w {
-                    source[row * w + col] = ((row * 3 + col * 5) % 251) as u8;
-                }
-            }
-            let picture = Pic {
-                width: w,
-                height: h,
-                y: source,
-                u: vec![128; w * h / 4],
-                v: vec![128; w * h / 4],
-            };
-            let Encoded {
-                tile,
-                reconstruction,
-                mi_cols,
-                mi_rows,
-                base_q_idx,
-                ..
-            }: Encoded =
-                crate::encode::encode_key_frame_with_modes(&picture, 40, 0.0, &[DC_PRED as u8])
-                    .unwrap();
-            let decoded = decode_key_frame_tile(&tile, mi_cols, mi_rows, base_q_idx).unwrap();
-            assert_eq!(decoded.y, reconstruction.y, "{w}x{h} luma mismatch");
-            assert_eq!(decoded.u, reconstruction.u, "{w}x{h} chroma U mismatch");
-            assert_eq!(decoded.v, reconstruction.v, "{w}x{h} chroma V mismatch");
+            round_trips(w, h, &[DC_PRED as u8]);
         }
+    }
+
+    /// Every one of the thirteen key-frame intra modes, at their base angle,
+    /// on real (non-flat) content: the mode search picks whichever wins each
+    /// block, so this exercises the directional edge/reach plumbing this
+    /// decoder round adds, not just `DC_PRED`.
+    #[test]
+    fn every_intra_mode_round_trips_bit_exact_against_the_encoder_reconstruction() {
+        for (w, h) in [(128usize, 128usize), (192, 128)] {
+            round_trips(w, h, &crate::intra::KEY_FRAME_MODES);
+        }
+    }
+
+    /// Sizes not a whole number of 64x64 superblocks (nor even of 32x32
+    /// blocks, for 854x480): the gathered-CDF partial-superblock/32x32 path
+    /// this decoder round adds.
+    #[test]
+    fn odd_sizes_round_trip_bit_exact_against_the_encoder_reconstruction() {
+        for (w, h) in [(854usize, 480usize), (216, 96)] {
+            round_trips(w, h, &crate::intra::KEY_FRAME_MODES);
+        }
+    }
+
+    /// A skipped block codes no residual syntax at all (spec 5.11.34):
+    /// straight prediction on every plane. The real key-frame writer never
+    /// emits `skip = 1` ([`crate::tile::write_intra_mode`] hardcodes it to
+    /// `0`), so this constructs the exact symbol sequence a writer that did
+    /// emit it would produce, by hand, and asserts the decoded reconstruction
+    /// is pure DC prediction (mid-grey, with no neighbours) rather than
+    /// refusing.
+    #[test]
+    fn a_skipped_block_decodes_to_pure_prediction() {
+        use crate::msac::SymbolEncoder;
+        let mut cdfs = Cdfs::new(q_ctx_of(40));
+        let mut enc = SymbolEncoder::new();
+        // One whole, unsplit 64x64 superblock, coded skip = true.
+        enc.symbol(PARTITION_NONE, &mut cdfs.partition_w64[0]);
+        enc.symbol(1, &mut cdfs.skip[0]);
+        enc.symbol(
+            DC_PRED,
+            &mut cdfs.kf_y_mode[INTRA_MODE_CTX[DC_PRED]][INTRA_MODE_CTX[DC_PRED]],
+        );
+        enc.symbol(DC_PRED, &mut cdfs.uv_mode_no_cfl[DC_PRED]);
+        let data = enc.finish();
+        let decoded = decode_key_frame_tile(&data, 16, 16, 40, 64, 64).unwrap();
+        assert!(
+            decoded.y.iter().all(|&s| s == 128),
+            "a skipped DC_PRED block with no neighbours predicts flat mid-grey"
+        );
     }
 }
