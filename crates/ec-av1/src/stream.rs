@@ -1574,16 +1574,16 @@ mod tests {
                     // deterministic header.
                     "--threads=1",
                     "--row-mt=0",
-                    // No `--error-resilient=1` here (that is the whole point of
-                    // this test), but every other reference/compound tool this
-                    // decoder's round-2 inter path does not model is still
-                    // disabled the same way `--error-resilient=1` incidentally
-                    // disabled it in the sibling test above: without
-                    // `--enable-order-hint=0` aomenc's RD search picks a
-                    // non-`LAST_FRAME` reference (`GOLDEN_FRAME`) for some
-                    // blocks even in this short a sequence, which is a separate,
-                    // already-documented round-2 gap ("a reference frame other
-                    // than LAST_FRAME"), not a CDF-forwarding one.
+                    // `--enable-order-hint=0` kills BWDREF/ALTREF entirely (no
+                    // order hints -> no bidirectional distance weighting) and,
+                    // combined with `--auto-alt-ref=0`/`--lag-in-frames=0`
+                    // above, leaves aomenc's RD search only LAST_FRAME/
+                    // LAST2_FRAME/LAST3_FRAME/GOLDEN_FRAME to pick from --
+                    // GOLDEN itself needs no order hint (it is the keyframe's
+                    // fixed slot, not a distance-weighted reference), so this
+                    // does not suppress GOLDEN selection the way the sibling
+                    // CDF-forwarding gate's own comment worried about; it just
+                    // narrows the pool this gate needs GOLDEN to win out of.
                     "--enable-order-hint=0",
                     "--enable-warped-motion=0",
                     "--enable-obmc=0",
@@ -1698,8 +1698,20 @@ mod tests {
         let (width, height, frame_count) = (64usize, 64usize, 8usize);
         let mut refusals = Vec::new();
         let mut never_fired = 0u32;
-        for attempt in 0..40u32 {
-            let seed = 42 + attempt;
+        // aomenc's own RD search is nondeterministic run-to-run even at
+        // `--threads=1` (confirmed live: identical CLI args, identical
+        // input, two different output byte streams) -- so beyond varying
+        // the fixture's seed, each attempt is its own independent coin
+        // flip against every named refusal below. 120 attempts (not 40)
+        // to give that coin flip enough tries to land on a stream this
+        // decoder both accepts and that fires GOLDEN_FRAME. `duration=0.32`
+        // at `rate=25` (not `0.24`) matches every sibling gate's own
+        // frame-count fixture exactly -- a shorter duration here once
+        // produced a frame-0 (keyframe, no reference at all) luma mismatch
+        // against ffmpeg, i.e. a source-frame-count rounding artifact of
+        // this recipe's own choosing, not a decoder bug.
+        for attempt in 0..120u32 {
+            let seed = 42 + attempt % 40;
             let source = format!("gradients=size=64x64:seed={seed}:duration=0.32:rate=25");
             let y4m = Command::new("ffmpeg")
                 .args([
@@ -1765,10 +1777,29 @@ mod tests {
                     "--enable-tx-size-search=0",
                     "--enable-cdef=0",
                     "--enable-restoration=0",
+                    // `min == max == 32` forces PARTITION_NONE for every
+                    // 32x32 block, not just biases toward it -- with
+                    // `--min-partition-size=16` alone aomenc's exhaustive
+                    // `cpu-used=0` RD search still occasionally read HORZ/
+                    // VERT/SPLIT partitions below 32x32 despite
+                    // `--enable-rect-partitions=0`/`--enable-ab-partitions=0`/
+                    // `--enable-1to4-partitions=0` all being off (two
+                    // separate, already-documented round-2 gaps: "a
+                    // partition below 16x16", "a partition type this encoder
+                    // never writes"), starving this gate's already-narrow
+                    // seed pool. Locking both bounds to 32 removes any
+                    // partition-depth choice from the search entirely, so
+                    // this gate can isolate GOLDEN_FRAME selection alone.
                     "--max-partition-size=32",
+                    "--min-partition-size=32",
                     "--enable-palette=0",
                     "--enable-intrabc=0",
                     "--enable-cfl-intra=0",
+                    // `default` still lets aomenc's heuristic flip
+                    // `allow_screen_content_tools` on for this synthetic
+                    // gradient content -- `film` forces the non-screen path
+                    // instead.
+                    "--tune-content=film",
                     "--obu",
                     "-o",
                     "-",
@@ -1831,6 +1862,46 @@ mod tests {
              attempt hit a named refusal:\n{}",
             refusals.join("\n")
         );
+    }
+
+    /// scratch: decode a pinned stream end to end and report where/why it
+    /// refuses, plus `non_last_ref_hits` progression.
+    #[test]
+    #[ignore]
+    fn scratch_decode_pinned_stream() {
+        let path = std::env::var("EC_AV1_PIN").expect("set EC_AV1_PIN to the .obu path");
+        let stream = std::fs::read(&path).expect("read pinned stream");
+        let before = decode::non_last_ref_hits();
+        match decode_stream(&stream) {
+            Ok(frames) => eprintln!(
+                "OK: {} frames, non_last_ref_hits {} -> {}",
+                frames.len(),
+                before,
+                decode::non_last_ref_hits()
+            ),
+            Err(e) => eprintln!(
+                "ERR: {} (non_last_ref_hits {} -> {})",
+                e,
+                before,
+                decode::non_last_ref_hits()
+            ),
+        }
+        // Truncate at each Frame OBU boundary and re-decode from scratch, to
+        // see which frame index first fails.
+        let mut p = Av1Parser::new();
+        let mut pos = 0usize;
+        let mut frame_idx = 0;
+        while pos < stream.len() {
+            let obu = p.parse_obu(&stream[pos..]).expect("parse");
+            pos += obu.total_size;
+            if matches!(obu.kind, ObuKind::Frame(_, _)) {
+                match decode_stream(&stream[..pos]) {
+                    Ok(_) => eprintln!("through frame {frame_idx}: OK"),
+                    Err(e) => eprintln!("through frame {frame_idx}: ERR {e}"),
+                }
+                frame_idx += 1;
+            }
+        }
     }
 
     /// scratch: isolate a pinned mismatching stream's first divergent pixel.
