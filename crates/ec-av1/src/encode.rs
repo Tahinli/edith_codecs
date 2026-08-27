@@ -3889,12 +3889,37 @@ mod tests {
     /// eset/size slot). Both fixes are provably correct against libaom
     /// source and each closed part of the gap (leaf0's `eob` went from a
     /// desynced 36 to a near-miss 3, writer's real eob is 7), but a residual
-    /// divergence remains in the `EOB_PT` symbol's decoded value despite an
-    /// aligned bit cost -- next candidate: `eob_pt_64_luma`'s CDF
-    /// adaptation state, exercised nowhere else. Ignored rather than
-    /// deleted, so the class stays named and the gate stays green.
+    /// divergence remained in the `EOB_PT` symbol's decoded value despite an
+    /// aligned bit cost. r12 traced that residual with a fresh dual-trace
+    /// (do not reuse r11's committed logs, which predate its own fixes) and
+    /// found two more real bugs, both now fixed: (3) `write_leaf8` hardcoded
+    /// `cfl: false` for `write_intra_mode`'s chroma-mode CDF choice, but
+    /// `is_cfl_allowed` (spec 5.11.5) is true for any block `<= 32x32` --
+    /// every other `write_block` caller at 16x16 and up already passes
+    /// `true`; the narrower `uv_mode_no_cfl` alphabet is one symbol short of
+    /// `uv_mode_cfl`, so even an identical `DC_PRED` decision consumed a
+    /// different amount of arithmetic range and derailed everything after
+    /// it. (4) `record()`'s `above_mode`/`left_mode` write is a no-op at an
+    /// 8x8 leaf's own side (`side / SUB == 0` for `SUB` = 16), and
+    /// `write_leaf8` called only `record_mi` (the coefficient-context half),
+    /// never updating those coarse arrays itself -- so a *second* straddling
+    /// 16x16 quadrant stacked above or left of the first (never covered by
+    /// r11's same-call `prev_leaf` override, which only threads state
+    /// between the two leaves of one shared quadrant) read whatever stale
+    /// mode sat in that slot before either leaf ran. Fixed by writing the
+    /// leaf's own mode into `above_mode[c]`/`left_mode[r]` directly. Fixing
+    /// (3) alone shrank the tell drift after leaf(0,8) from a decoder
+    /// `eob_pt=3` (wrong) vs the writer's real `eob_pt=4` down to a `tell`
+    /// offset of a single unit; fixing (3)+(4) together still leaves a
+    /// residual divergence one leaf further in -- the decoder now reads
+    /// leaf(2,8)'s own luma coefficient block as `txs_ctx=1` (a 32-sample
+    /// transform) where the writer intends `TX_8X8` (`txs_ctx=2`), meaning
+    /// something *before* this leaf's own `EC_TXBSKIP`/`EC_TXTYPE` still
+    /// desyncs the stream by exactly the width of one earlier symbol -- not
+    /// yet isolated to a single named symbol. Ignored rather than deleted,
+    /// so the class stays named and the gate stays green.
     #[test]
-    #[ignore = "lane-av1-rect r11: 8x8-leaf path desyncs dav1d; EOB_PT for Luma8 still wrong"]
+    #[ignore = "lane-av1-rect r12: 8x8-leaf path desyncs dav1d; leaf(2,8) reads the wrong tx size"]
     fn a_single_axis_straddle_round_trips_through_ffmpeg() {
         if !have_ffmpeg() {
             eprintln!("SKIP a_single_axis_straddle_round_trips_through_ffmpeg: no ffmpeg");
