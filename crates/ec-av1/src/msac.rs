@@ -77,6 +77,13 @@ impl SymbolEncoder {
         self.bits
     }
 
+    /// The coder's current interval width — libaom's `od_ec_enc_rng` /
+    /// decoder's `rng` field. Exposed only for the rng-register bisect trace
+    /// (`EC_RNG=1`); not part of the bitstream contract.
+    pub(crate) fn rng(&self) -> u32 {
+        self.rng
+    }
+
     /// The exact bit position the stream has committed to so far (libaom's
     /// `od_ec_enc_tell`, `entenc.c`): `cnt + 10` undoes the `-9` `cnt` starts
     /// at and reserves the one bit `finish` always spends, and `precarry`
