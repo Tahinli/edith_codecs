@@ -1169,6 +1169,15 @@ pub fn sb_coeff_key_frame_tile(
                                         // 16x16, so both read the same
                                         // enclosing-slot context.
                                         let leaf_ctx = neighbours.partition_ctx(at, SUB);
+                                        ec_rng_trace(|| {
+                                            format!(
+                                                "EC_PART mi_row={} mi_col={} bsize=3 ctx={} tell={}",
+                                                leaf_mi.0,
+                                                leaf_mi.1,
+                                                leaf_ctx,
+                                                enc.tell()
+                                            )
+                                        });
                                         enc.symbol(
                                             PARTITION_NONE,
                                             &mut cdfs.partition_w8[leaf_ctx],
@@ -1188,6 +1197,14 @@ pub fn sb_coeff_key_frame_tile(
                                             &grids,
                                             [&scans[2], &scans[3], &scans[3]],
                                         );
+                                        ec_rng_trace(|| {
+                                            format!(
+                                                "EC_TOK mi_row={} mi_col={} tell={}",
+                                                leaf_mi.0,
+                                                leaf_mi.1,
+                                                enc.tell()
+                                            )
+                                        });
                                     }
                                 }
                             }
@@ -1477,14 +1494,21 @@ pub(crate) fn luma_32_coeff_bits(grid: &[i32]) -> f64 {
 pub(crate) fn coeff_bits(grid: &[i32], set: TxbSet) -> f64 {
     /// Built once per size: the search prices thirteen modes for every block,
     /// and the scan is the same table every time.
-    static SCANS: LazyLock<[Vec<u16>; 3]> =
-        LazyLock::new(|| [default_scan(TX8), default_scan(TX16), default_scan(TX32)]);
+    static SCANS: LazyLock<[Vec<u16>; 4]> = LazyLock::new(|| {
+        [
+            default_scan(TX4),
+            default_scan(TX8),
+            default_scan(TX16),
+            default_scan(TX32),
+        ]
+    });
     let mut cdfs = Cdfs::new(2);
     let mut coding = cdfs.txb(set, DC_PRED);
     let scan = match coding.side {
-        TX8 => &SCANS[0],
-        TX16 => &SCANS[1],
-        _ => &SCANS[2],
+        TX4 => &SCANS[0],
+        TX8 => &SCANS[1],
+        TX16 => &SCANS[2],
+        _ => &SCANS[3],
     };
     let mut enc = SymbolEncoder::new();
     enc.reset_bits();
