@@ -3860,11 +3860,26 @@ mod tests {
     /// column half only (`has_half` false on cols, true on rows) -- exactly
     /// the single-axis straddle lane-av1-rect r7 wires through
     /// `crate::tile::write_leaf8`'s 8x8 leaves. Not yet decoder-clean:
-    /// dav1d rejects the stream ("Invalid data found"), a genuine desync r7
-    /// ran out of budget to trace (see the r7 handoff -- first falsification
-    /// candidate is `partition_w8`'s ctx being read from the *enclosing*
-    /// 16x16 slot identically for both leaves). Ignored rather than deleted,
-    /// so the class stays named and the gate stays green.
+    /// dav1d rejects the stream ("Invalid data found"). r7's falsification
+    /// candidate (`partition_w8`'s ctx reading the enclosing 16x16 slot) is
+    /// FALSIFIED by r8's rng trace against a debug `aomdec`: libaom's own
+    /// `partition_plane_context` masks at `bsl = 0` for `BLOCK_8X8`, and every
+    /// `partition_context_lookup` entry this writer ever produces (no 4x4
+    /// splits exist) has bit 0 clear, so the ctx is provably 0 for every
+    /// leaf regardless of neighbour state -- our writer already agreed with
+    /// the decoder here (`ctx=0` both sides). r8 still ported the mi-precise
+    /// tracking (`Neighbours::{above,left}_side_mi`, `partition_ctx_mi`) as a
+    /// spec-accurate fix in its own right (it matters once 4x4 exists), and
+    /// it does not regress the gate. The real first divergence is later:
+    /// leaf0's own luma transform (`TxbSet::Luma8`/`Chroma4`, exercised by no
+    /// other caller) reads a wrong `EC_EOBPT` category (decoder eob=36 vs the
+    /// writer's real eob=7) -- the writer's own `EC_TXBSKIP`/`EC_TXBCTX`
+    /// equivalents agree with the decoder up to and including the skip flag,
+    /// so the fault is between the `TX_TYPE` symbol and the `EOB_PT` symbol:
+    /// either the intra tx-type CDF selection or the eob CDF table/adaptation
+    /// state for the never-before-exercised `Luma8`/`Chroma4` pair. Ignored
+    /// rather than deleted, so the class stays named and the gate stays
+    /// green.
     #[test]
     #[ignore = "lane-av1-rect r7: 8x8-leaf path desyncs dav1d, not yet traced"]
     fn a_single_axis_straddle_round_trips_through_ffmpeg() {
