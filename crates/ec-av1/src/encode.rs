@@ -419,6 +419,19 @@ pub(crate) fn key_frame_headers_colour(
             ..QuantizationParams::default()
         },
         tx_mode: TxMode::Largest,
+        // Forces `get_tx_set` (spec 5.11.48) to `TX_SET_INTRA_2` for every
+        // intra transform below 32x32, not only 16x16 -- the set this crate
+        // carries a table for at 8x8/16x16 (`INTRA_TX_TYPE_SET2_8`/`_16`).
+        // This bit is part of the bitstream (spec 5.9.2's `reduced_tx_set`),
+        // so a decoder honouring the header picks the same CDF the writer
+        // used only if this is set here too, not only on the inter variant
+        // below -- an r14 lane-av1-rect fix: a key frame's own header used to
+        // default this to `false`, so `av1_get_ext_tx_set_type` picked the
+        // 7-symbol `TX_SET_INTRA_1` table on the decoder side while the
+        // writer coded against the 5-symbol `TX_SET_INTRA_2` one, diverging
+        // the arithmetic coder's `rng` register from the very first 8x8-leaf
+        // luma transform onward with no symbol value ever differing.
+        reduced_tx_set: true,
         ..FrameHeader::default()
     };
     Ok((seq, header))
@@ -3919,7 +3932,9 @@ mod tests {
     /// yet isolated to a single named symbol. Ignored rather than deleted,
     /// so the class stays named and the gate stays green.
     #[test]
-    #[ignore = "lane-av1-rect r12: 8x8-leaf path desyncs dav1d; leaf(2,8) reads the wrong tx size"]
+    #[ignore = "lane-av1-rect r14: leaf(0,8)'s rng now matches through several further \
+                leaves after the reduced_tx_set header fix; residual desync moved past \
+                mi_row=4, not yet isolated to a named symbol"]
     fn a_single_axis_straddle_round_trips_through_ffmpeg() {
         if !have_ffmpeg() {
             eprintln!("SKIP a_single_axis_straddle_round_trips_through_ffmpeg: no ffmpeg");
