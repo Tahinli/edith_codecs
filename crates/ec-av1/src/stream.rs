@@ -596,5 +596,15 @@ mod tests {
                 eprintln!("plane {plane_name}: MATCH");
             }
         }
+        for row in 0..8 {
+            eprintln!(
+                "ours  row{row}: {:?}",
+                &ours.y[row * width..row * width + 8]
+            );
+            eprintln!(
+                "theirs row{row}: {:?}",
+                &theirs.y[row * width..row * width + 8]
+            );
+        }
     }
 }
