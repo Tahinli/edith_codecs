@@ -42,10 +42,15 @@ pub(crate) enum TxbSet {
     Luma8,
     /// The 8x8 transform of a chroma plane of a 16x16 block.
     Chroma8,
-    /// The 4x4 transform of a chroma plane of an 8x8 leaf (lane-av1-rect):
-    /// per `get_tx_size` for chroma, this stays 8x8 at the *parent* 16x16's
-    /// granularity today (see `Chroma8`), so this variant is currently unused
-    /// but shipped for when a chroma-follows-luma split is wired.
+    /// The 4x4 transform of a chroma plane of an 8x8 leaf (lane-av1-rect).
+    /// r5 correction: libaom's `is_chroma_reference` (`av1_common_int.h`) is
+    /// unconditionally true for `bsize >= BLOCK_8X8`, so chroma *does* follow
+    /// luma all the way down to 8x8 — it is coded once per 8x8 leaf, not once
+    /// per parent 16x16 (that "stays at the parent's Chroma8 granularity"
+    /// framing this doc carried through r4 was never checked against a real
+    /// decoder and is wrong; only `BLOCK_4X4`/`4X8`/`8X4`, one mi-unit wide or
+    /// high, get the "last sub-block only" chroma-merge treatment). A real
+    /// writer for the straddling-16x16 case must use this variant per leaf.
     Chroma4,
     /// The 16x16 transform of a chroma plane of a 32x32 block.
     Chroma16,
