@@ -1192,6 +1192,13 @@ pub fn sb_coeff_key_frame_tile(
                                              per 8x8 leaf inside the true frame",
                                         ));
                                     }
+                                    // r11: the enclosing 16x16 slot's
+                                    // above_mode/left_mode arrays are too
+                                    // coarse for a second leaf whose true
+                                    // above (or left) neighbour is the FIRST
+                                    // leaf -- track it here and hand it to
+                                    // write_leaf8 as a context override.
+                                    let mut prev_leaf: Option<((usize, usize), usize)> = None;
                                     for (leaf, (mr, mc)) in leaves.iter().zip(leaf_positions) {
                                         let leaf_mi = (mr as usize, mc as usize);
                                         // r8: read at mi granularity, not the
@@ -1220,7 +1227,7 @@ pub fn sb_coeff_key_frame_tile(
                                             level_grid(&leaf.u, TX4)?,
                                             level_grid(&leaf.v, TX4)?,
                                         ];
-                                        write_leaf8(
+                                        let leaf_mode = write_leaf8(
                                             &mut enc,
                                             &mut cdfs,
                                             &mut neighbours,
@@ -1229,7 +1236,9 @@ pub fn sb_coeff_key_frame_tile(
                                             leaf_mi,
                                             &grids,
                                             [&scans[2], &scans[3], &scans[3]],
+                                            prev_leaf,
                                         );
+                                        prev_leaf = Some((leaf_mi, leaf_mode));
                                         ec_rng_trace(|| {
                                             format!(
                                                 "EC_TOK mi_row={} mi_col={} tell={}",
@@ -1268,6 +1277,7 @@ fn write_intra_mode(
         mode,
         &mut cdfs.kf_y_mode[INTRA_MODE_CTX[above_mode]][INTRA_MODE_CTX[left_mode]],
     );
+    ec_rng_trace(|| format!("EC_YMODE mode={mode} tell={}", enc.tell()));
     if (V_PRED..=D67_PRED).contains(&mode) {
         enc.symbol(ANGLE_DELTA_ZERO, &mut cdfs.angle_delta[mode - V_PRED]);
     }
@@ -1327,6 +1337,7 @@ fn write_block(
 /// in 4x4 mode-info units, which is what its coefficient context (finer than
 /// [`SUB`]) is kept and read at.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn write_leaf8(
     enc: &mut SymbolEncoder,
     cdfs: &mut Cdfs,
@@ -1336,16 +1347,23 @@ fn write_leaf8(
     leaf_mi: (usize, usize),
     grids: &[Vec<i32>; 3],
     scans: [&Vec<u16>; 3],
-) {
+    prev_leaf: Option<((usize, usize), usize)>,
+) -> usize {
     let (r, c) = outer_at;
-    let mode = write_intra_mode(
-        enc,
-        cdfs,
-        block,
-        neighbours.above_mode[c],
-        neighbours.left_mode[r],
-        false,
-    );
+    let mut above_mode = neighbours.above_mode[c];
+    let mut left_mode = neighbours.left_mode[r];
+    // The previous leaf sits directly above (same column, two mi rows up)
+    // or directly to the left (same row, two mi cols over) of this one --
+    // in either case its just-written mode, not the enclosing 16x16 slot's
+    // stale neighbour, is what a decoder reads as this leaf's context.
+    if let Some(((pr, pc), pmode)) = prev_leaf {
+        if pc == leaf_mi.1 && leaf_mi.0 == pr + 2 {
+            above_mode = pmode;
+        } else if pr == leaf_mi.0 && leaf_mi.1 == pc + 2 {
+            left_mode = pmode;
+        }
+    }
+    let mode = write_intra_mode(enc, cdfs, block, above_mode, left_mode, false);
     let planes = [TxbSet::Luma8, TxbSet::Chroma4, TxbSet::Chroma4];
     write_block_planes(
         enc,
@@ -1357,6 +1375,7 @@ fn write_leaf8(
         mode,
     );
     neighbours.record_mi(leaf_mi, 8, grids);
+    mode
 }
 
 /// Writes the three transform blocks of one coded block, in the order a

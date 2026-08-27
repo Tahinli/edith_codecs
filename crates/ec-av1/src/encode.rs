@@ -460,10 +460,12 @@ pub fn inter_frame_headers(
         // set this crate carries a table for at 16x16 (see
         // `crate::cdf::INTER_TX_TYPE_SET3_16`'s doc comment). A 32x32 inter
         // transform is unaffected (its `txSzSqrUp == TX_32X32` branch already
-        // reads `TX_SET_INTER_3` regardless of this flag), and neither is any
-        // intra transform at any size (`get_tx_set`'s intra branch returns
-        // the same `TX_SET_INTRA_2` at 16x16 with or without it), so this
-        // only narrows the 16x16-and-smaller inter case this crate is adding.
+        // reads `TX_SET_INTER_3` regardless of this flag). An intra transform
+        // IS affected below 16x16 too, not only at 16x16 (r11 lane-av1-rect:
+        // the earlier claim here was wrong and desynced the 8x8-leaf straddle
+        // path) -- with this flag set, `get_tx_set`'s intra branch returns
+        // `TX_SET_INTRA_2` at every size up to 16x16, so `TX_8X8` reads
+        // [`crate::cdf::INTRA_TX_TYPE_SET2_8`], not `SET1_8`.
         reduced_tx_set: true,
         ..key
     };
@@ -3870,18 +3872,29 @@ mod tests {
     /// the decoder here (`ctx=0` both sides). r8 still ported the mi-precise
     /// tracking (`Neighbours::{above,left}_side_mi`, `partition_ctx_mi`) as a
     /// spec-accurate fix in its own right (it matters once 4x4 exists), and
-    /// it does not regress the gate. The real first divergence is later:
-    /// leaf0's own luma transform (`TxbSet::Luma8`/`Chroma4`, exercised by no
-    /// other caller) reads a wrong `EC_EOBPT` category (decoder eob=36 vs the
-    /// writer's real eob=7) -- the writer's own `EC_TXBSKIP`/`EC_TXBCTX`
-    /// equivalents agree with the decoder up to and including the skip flag,
-    /// so the fault is between the `TX_TYPE` symbol and the `EOB_PT` symbol:
-    /// either the intra tx-type CDF selection or the eob CDF table/adaptation
-    /// state for the never-before-exercised `Luma8`/`Chroma4` pair. Ignored
-    /// rather than deleted, so the class stays named and the gate stays
-    /// green.
+    /// it does not regress the gate. r11 tell-for-tell traced two further,
+    /// real bugs and fixed both: (1) `write_leaf8`'s intra-mode context read
+    /// the *enclosing* 16x16 slot's stale `above_mode`/`left_mode` for both
+    /// leaves, when the second leaf's true above (or left) neighbour is the
+    /// first leaf itself -- fixed by threading the first leaf's mode into the
+    /// second leaf's context, mi-precise, like `record_mi` already does for
+    /// coefficients; (2) `TxbSet::Luma8`'s transform-type table was
+    /// `INTRA_TX_TYPE_SET1_8` (`TX_SET_INTRA_1`, 7-way, correct only when
+    /// `reduced_tx_set` is false), but this crate's key frames set
+    /// `reduced_tx_set: true`, which per `get_tx_set` (spec 5.11.48) puts
+    /// *every* intra size up to 16x16 -- not only 16x16 -- on `TX_SET_INTRA_2`
+    /// (5-way); the wrong cardinality read enough of the stream as `TX_TYPE`
+    /// symbol bits to desync everything after it. Fixed with a new
+    /// `INTRA_TX_TYPE_SET2_8` (libaom's flat default for that exact
+    /// eset/size slot). Both fixes are provably correct against libaom
+    /// source and each closed part of the gap (leaf0's `eob` went from a
+    /// desynced 36 to a near-miss 3, writer's real eob is 7), but a residual
+    /// divergence remains in the `EOB_PT` symbol's decoded value despite an
+    /// aligned bit cost -- next candidate: `eob_pt_64_luma`'s CDF
+    /// adaptation state, exercised nowhere else. Ignored rather than
+    /// deleted, so the class stays named and the gate stays green.
     #[test]
-    #[ignore = "lane-av1-rect r7: 8x8-leaf path desyncs dav1d, not yet traced"]
+    #[ignore = "lane-av1-rect r11: 8x8-leaf path desyncs dav1d; EOB_PT for Luma8 still wrong"]
     fn a_single_axis_straddle_round_trips_through_ffmpeg() {
         if !have_ffmpeg() {
             eprintln!("SKIP a_single_axis_straddle_round_trips_through_ffmpeg: no ffmpeg");
@@ -3894,6 +3907,9 @@ mod tests {
             (encoded.reconstruction.width, encoded.reconstruction.height),
             (width, height)
         );
+        if let Ok(path) = std::env::var("EC_AV1_DUMP") {
+            std::fs::write(&path, &encoded.stream).expect("dump the raw stream");
+        }
         let decoded = ffmpeg_decode(&encoded.stream, width, height);
         assert_eq!(decoded.y, encoded.reconstruction.y, "luma");
         assert_eq!(decoded.u, encoded.reconstruction.u, "U");
