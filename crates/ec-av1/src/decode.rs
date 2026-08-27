@@ -3724,19 +3724,22 @@ fn decode_inter_block(
     if is_inter {
         let ref_frame = read_single_ref(dec, cdfs, neighbours.above_ref[c], neighbours.left_ref[r]);
         ref_frame_for_lf = ref_frame;
+        // round 3 (lane-av1refs): the GOLDEN_FRAME arm below decodes and
+        // threads a real golden picture through MC/mvstack/deblock, but 120+
+        // attempts across a real aomenc recipe built to isolate exactly this
+        // path (min==max partition size, order-hint off, screen-content
+        // tools off) still could not clear this crate's OWN gate
+        // (`a_real_aomenc_inter_sequence_with_a_golden_reference_decodes_pixel_exact`,
+        // stream.rs) 4 consecutive times -- every attempt either never fired
+        // GOLDEN_FRAME or hit an unrelated named refusal first (see that
+        // test's own refusal log). Refuse GOLDEN_FRAME here, narrowly, until
+        // a round actually gets that gate green: main should not carry a
+        // reference-selection path with zero live pixel-exact proof.
         let (py_ref, pu_ref, pv_ref) = match ref_frame {
             LAST_FRAME => (ref_y, ref_u, ref_v),
-            GOLDEN_FRAME => match (golden_y, golden_u, golden_v) {
-                (Some(y), Some(u), Some(v)) => (y, u, v),
-                _ => {
-                    return Err(unsupported(
-                        "a GOLDEN_FRAME reference with no picture in that slot (round 2)",
-                    ));
-                }
-            },
             _ => {
                 return Err(unsupported(
-                    "a reference frame other than LAST_FRAME/GOLDEN_FRAME (round 2)",
+                    "a reference frame other than LAST_FRAME (round 3: GOLDEN_FRAME's decode path exists but has no live pixel-exact proof yet)",
                 ));
             }
         };
