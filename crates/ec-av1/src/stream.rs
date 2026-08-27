@@ -155,14 +155,33 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         // case, spec 7.10.2.1) uses `gm_get_motion_vector`, which is the
         // zero vector only under `GmType == IDENTITY` -- any other warp
         // model needs the full affine/translation MV derivation this
-        // decoder does not carry. `global_motion[0]` is `LAST_FRAME`'s own
-        // entry (`read_global_motion_params`'s `i` loops from `LAST_FRAME`).
+        // decoder does not carry. `global_motion` is indexed `ref_frame - 1`
+        // (`read_global_motion_params`'s `i` loops from `LAST_FRAME`);
+        // lane-av1refs widens this from `[0]` (LAST_FRAME) alone to every
+        // reference `decode_inter_block` can now select -- LAST_FRAME (index
+        // 0) and GOLDEN_FRAME (index 3).
         if header.frame_type != FrameType::Key
-            && header.global_motion[0].model != WarpModel::Identity
+            && (header.global_motion[0].model != WarpModel::Identity
+                || header.global_motion[3].model != WarpModel::Identity)
         {
             return Err(Error::unsupported(
                 "AV1 decode_stream",
-                "an inter frame whose LAST_FRAME global motion is not IDENTITY (GLOBALMV needs the full warp derivation this decoder does not carry)",
+                "an inter frame whose LAST_FRAME/GOLDEN_FRAME global motion is not IDENTITY (GLOBALMV needs the full warp derivation this decoder does not carry)",
+            ));
+        }
+        // `decode_inter_block`'s `single_ref_p*` chain codes only
+        // `SINGLE_REFERENCE` blocks (never reads `comp_mode`) -- a frame
+        // whose `reference_select` header bit lets any block choose
+        // `COMPOUND_REFERENCE` would desync at the first block that reads
+        // a `comp_mode` symbol this decoder never consumes. `skip_mode`
+        // (spec 5.9.22) is provably unreachable here as a consequence: its
+        // own `skip_mode_params()` only sets `skip_mode_present` when
+        // `reference_select` is set, so refusing `reference_select` refuses
+        // `skip_mode` too, without needing a second check.
+        if header.reference_select {
+            return Err(Error::unsupported(
+                "AV1 decode_stream",
+                "a frame with reference_select set (this decoder never reads comp_mode / codes only single-reference blocks)",
             ));
         }
         // `context_update_tile_id` (spec `decode_tile`/`exit_symbol`) names
@@ -236,6 +255,14 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                     "an inter frame with no key frame before it",
                 )
             })?;
+            // `ref_frame_idx[3]` names GOLDEN_FRAME's own DPB slot (spec
+            // 7.8/7.20 -- `ref_frame_idx` is indexed `ref_frame - LAST_FRAME`).
+            // Unlike LAST_FRAME, GOLDEN_FRAME having no picture yet is not a
+            // stream error on its own: `decode_inter_block` only needs it
+            // when a block actually selects GOLDEN_FRAME, and refuses by
+            // name there if the slot is still empty.
+            let golden_slot = header.ref_frame_idx[3] as usize;
+            let golden = ref_slots.get(golden_slot).and_then(Option::as_ref);
             decode_inter_frame_tile_with_cdfs(
                 tile_bytes,
                 header.mi_cols,
@@ -244,6 +271,7 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 header.frame_width,
                 header.frame_height,
                 reference,
+                golden,
                 &header.cdef,
                 &header.loop_filter,
                 initial_cdfs,
@@ -1634,6 +1662,172 @@ mod tests {
         }
         eprintln!(
             "SKIP a_real_aomenc_inter_sequence_with_cdf_forwarding_decodes_pixel_exact: every \
+             attempt hit a named refusal:\n{}",
+            refusals.join("\n")
+        );
+    }
+
+    /// lane-av1refs's decisive single-non-LAST-reference gate: identical
+    /// recipe to
+    /// [`a_real_aomenc_inter_sequence_with_cdf_forwarding_decodes_pixel_exact`]
+    /// except `--enable-order-hint=0` is DROPPED (that flag's own comment on
+    /// the sibling test names it as exactly what suppresses aomenc's RD from
+    /// ever picking `GOLDEN_FRAME`) and the sequence runs 8 frames, not 4 --
+    /// more chances for the RD search to reach past the first GOP's initial
+    /// key frame. `--auto-alt-ref=0` stays: this decoder only supports
+    /// `LAST_FRAME`/`GOLDEN_FRAME` so far, and alt-ref/backward references
+    /// are still a named refusal, not this gate's target. A stream that
+    /// decodes without firing [`decode::non_last_ref_hits`] is not a
+    /// coverage win for this round -- SKIP it as a genuine, named miss
+    /// rather than pass silently on untested ground.
+    #[test]
+    fn a_real_aomenc_inter_sequence_with_a_golden_reference_decodes_pixel_exact() {
+        if !have_ffmpeg() {
+            eprintln!(
+                "SKIP a_real_aomenc_inter_sequence_with_a_golden_reference_decodes_pixel_exact: no ffmpeg"
+            );
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!(
+                "SKIP a_real_aomenc_inter_sequence_with_a_golden_reference_decodes_pixel_exact: no aomenc at {}",
+                aomenc_path().display()
+            );
+            return;
+        }
+        let (width, height, frame_count) = (64usize, 64usize, 8usize);
+        let mut refusals = Vec::new();
+        let mut never_fired = 0u32;
+        for attempt in 0..40u32 {
+            let seed = 42 + attempt;
+            let source = format!("gradients=size=64x64:seed={seed}:duration=0.32:rate=25");
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let mut child = Command::new(aomenc_path())
+                .args([
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    "--cq-level=55",
+                    "--cpu-used=0",
+                    "--lag-in-frames=0",
+                    "--auto-alt-ref=0",
+                    "--kf-max-dist=1000",
+                    "--threads=1",
+                    "--row-mt=0",
+                    // Narrows the RD search's reference alphabet toward
+                    // LAST_FRAME/GOLDEN_FRAME -- without this, aomenc's RD is
+                    // just as likely to pick LAST2/LAST3/BWDREF/ALTREF2/
+                    // ALTREF (this decoder's already-documented, still-open
+                    // refusals), starving this gate of the one reference it
+                    // targets.
+                    "--max-reference-frames=3",
+                    "--reduced-reference-set=1",
+                    "--enable-warped-motion=0",
+                    "--enable-obmc=0",
+                    "--enable-masked-comp=0",
+                    "--enable-interintra-comp=0",
+                    "--enable-dist-wtd-comp=0",
+                    "--enable-diff-wtd-comp=0",
+                    "--enable-onesided-comp=0",
+                    "--enable-interintra-wedge=0",
+                    "--enable-smooth-interintra=0",
+                    "--enable-rect-partitions=0",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    "--enable-filter-intra=0",
+                    "--enable-smooth-intra=0",
+                    "--enable-paeth-intra=0",
+                    "--enable-directional-intra=0",
+                    "--enable-angle-delta=0",
+                    "--enable-tx-size-search=0",
+                    "--enable-cdef=0",
+                    "--enable-restoration=0",
+                    "--max-partition-size=32",
+                    "--enable-palette=0",
+                    "--enable-intrabc=0",
+                    "--enable-cfl-intra=0",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let before = decode::non_last_ref_hits();
+            let frames = match decode_stream(&stream) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "a golden-reference stream failed outright (seed {seed}): {msg}"
+                    );
+                    refusals.push(format!("seed {seed}: {msg}"));
+                    continue;
+                }
+                Ok(frames) => frames,
+            };
+            if decode::non_last_ref_hits() == before {
+                // This seed's RD search never actually picked GOLDEN_FRAME --
+                // a genuine miss, not a refusal. Try the next seed rather
+                // than claiming coverage this attempt did not exercise.
+                never_fired += 1;
+                continue;
+            }
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
+            assert_eq!(frames.len(), frame_count);
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(got.y, want.y, "frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(got.u, want.u, "frame {i} U vs ffmpeg (seed {seed})");
+                assert_eq!(got.v, want.v, "frame {i} V vs ffmpeg (seed {seed})");
+            }
+            eprintln!(
+                "FIRING seed {seed}: non_last_ref_hits advanced by {}",
+                decode::non_last_ref_hits() - before
+            );
+            return;
+        }
+        eprintln!(
+            "SKIP a_real_aomenc_inter_sequence_with_a_golden_reference_decodes_pixel_exact: \
+             {never_fired} attempts decoded but never fired GOLDEN_FRAME, and every other \
              attempt hit a named refusal:\n{}",
             refusals.join("\n")
         );

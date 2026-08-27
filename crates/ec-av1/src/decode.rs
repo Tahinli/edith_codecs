@@ -30,7 +30,11 @@ use crate::encode::{Picture, Reach};
 use crate::intra::predict;
 use crate::mc;
 use crate::msac::SymbolDecoder;
-use crate::mvstack::{MiGrid, MiInfo, find_mv_stack, single_ref_ctx};
+use crate::mvstack::{
+    ALTREF_FRAME, ALTREF2_FRAME, BWDREF_FRAME, GOLDEN_FRAME, LAST_FRAME, LAST2_FRAME, LAST3_FRAME,
+    MiGrid, MiInfo, find_mv_stack, single_ref_ctx, single_ref_p1_ctx, single_ref_p2_ctx,
+    single_ref_p3_ctx, single_ref_p4_ctx, single_ref_p5_ctx, single_ref_p6_ctx,
+};
 use crate::tile::{INTRA_MODE_CTX, block_grid, has_half};
 use crate::transform::{TxType, dequant_and_inverse_typed};
 
@@ -99,6 +103,19 @@ pub(crate) fn directional_uv_hits() -> usize {
 /// process -- the same before/after counter pattern as [`FILTER_INTRA_HITS`],
 /// proving a stream actually exercised a nonzero angle delta.
 static ANGLE_DELTA_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many [`read_single_ref`] reads resolved to a reference other than
+/// `LAST_FRAME`, across every call in the process -- the same before/after
+/// counter pattern as [`FILTER_INTRA_HITS`], proving a stream actually
+/// exercised a non-`LAST_FRAME` reference (`GOLDEN_FRAME`, this decoder's
+/// only other supported one so far) rather than every block coincidentally
+/// resolving `LAST_FRAME`.
+static NON_LAST_REF_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Current value of [`NON_LAST_REF_HITS`].
+pub(crate) fn non_last_ref_hits() -> usize {
+    NON_LAST_REF_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 thread_local! {
     /// The sequence header's `enable_intra_edge_filter`, set once per
@@ -625,6 +642,15 @@ struct Neighbours {
     /// [`crate::tile`]'s private `Neighbours::above_inter`/`left_inter`.
     above_inter: Vec<bool>,
     left_inter: Vec<bool>,
+    /// The actual reference frame (`1..=7`, spec's `MV_REFERENCE_FRAME`
+    /// alphabet) the block above/left of this column/row coded, or `-1` for
+    /// an intra neighbour/frame border -- the `single_ref_p1`..`p6` context
+    /// functions (`mvstack::ref_ctx` family) need the real reference, not
+    /// just "was it inter" (lane-av1refs: every inter block used to be
+    /// `LAST_FRAME` by construction, so `above_inter`/`left_inter` alone was
+    /// enough).
+    above_ref: Vec<i8>,
+    left_ref: Vec<i8>,
     /// `interp_filter[0]`/`[1]` (horizontal/vertical kernel index, 0..=2, or
     /// `3` = "no info": an intra neighbour or the frame's own border) of the
     /// block above/left of this column/row -- spec
@@ -648,12 +674,12 @@ struct Neighbours {
     /// transform size, spec 7.14's `get_transform_size`/`get_filter_level`
     /// edge-length lookup (`apply_deblock`).
     tx_grid: Vec<u8>,
-    /// Per-4x4-mi `is_inter` flag -- the loop filter's ref/mode delta lookup
-    /// (spec 7.14.4 `get_filter_level`; every inter block this decoder
-    /// produces is a single `LAST_FRAME` reference with a non-`GLOBALMV`
-    /// mode, so `is_inter` alone picks the right `ref_deltas`/`mode_deltas`
-    /// entry without a separate ref/mode grid).
-    inter_grid: Vec<bool>,
+    /// Per-4x4-mi reference frame (`0` = intra, `1..=7` = `MV_REFERENCE_FRAME`)
+    /// -- the loop filter's ref/mode delta lookup (spec 7.14.4
+    /// `get_filter_level`, `loop_filter_ref_deltas[ref_frame]`; lane-av1refs:
+    /// widened from a bare `is_inter` bool, which collapsed every non-`LAST`
+    /// reference onto `LAST_FRAME`'s own delta).
+    ref_grid: Vec<i8>,
 }
 
 impl Neighbours {
@@ -673,6 +699,8 @@ impl Neighbours {
             left_skip: vec![false; rows],
             above_inter: vec![false; cols],
             left_inter: vec![false; rows],
+            above_ref: vec![-1; cols],
+            left_ref: vec![-1; rows],
             above_filter: vec![[3u8; 2]; cols],
             left_filter: vec![[3u8; 2]; rows],
             mi_cols,
@@ -680,7 +708,7 @@ impl Neighbours {
             skip_grid: vec![false; cols * (SUB / MI) * rows * (SUB / MI)],
             skip_grid_cols_mi: cols * (SUB / MI),
             tx_grid: vec![0u8; cols * (SUB / MI) * rows * (SUB / MI)],
-            inter_grid: vec![false; cols * (SUB / MI) * rows * (SUB / MI)],
+            ref_grid: vec![0i8; cols * (SUB / MI) * rows * (SUB / MI)],
         }
     }
 
@@ -688,7 +716,7 @@ impl Neighbours {
     /// transform width (in pixels) and `is_inter` flag -- the loop filter's
     /// per-edge lookup (`apply_deblock`), filled at the same call sites and
     /// units as [`Self::fill_skip_grid`].
-    fn fill_lf_grid(&mut self, at_mi: (usize, usize), side_mi: usize, tx_px: u8, is_inter: bool) {
+    fn fill_lf_grid(&mut self, at_mi: (usize, usize), side_mi: usize, tx_px: u8, ref_frame: i8) {
         let (mi_r, mi_c) = at_mi;
         for rr in 0..side_mi {
             for cc in 0..side_mi {
@@ -696,8 +724,8 @@ impl Neighbours {
                 if let Some(cell) = self.tx_grid.get_mut(idx) {
                     *cell = tx_px;
                 }
-                if let Some(cell) = self.inter_grid.get_mut(idx) {
-                    *cell = is_inter;
+                if let Some(cell) = self.ref_grid.get_mut(idx) {
+                    *cell = ref_frame;
                 }
             }
         }
@@ -755,6 +783,7 @@ impl Neighbours {
         self.left_side_mi.iter_mut().for_each(|s| *s = SB);
         self.left_skip.iter_mut().for_each(|s| *s = false);
         self.left_inter.iter_mut().for_each(|i| *i = false);
+        self.left_ref.iter_mut().for_each(|r| *r = -1);
         self.left_filter.iter_mut().for_each(|f| *f = [3u8; 2]);
     }
 
@@ -762,13 +791,16 @@ impl Neighbours {
     /// block that reads it as a neighbour -- [`crate::tile`]'s
     /// `record_inter`. `filter` is `[3, 3]` for an intra block (spec
     /// `get_ref_filter_type`'s "not this ref frame" case reads the same as
-    /// "no neighbour").
+    /// "no neighbour"). `ref_frame` is `-1` for an intra block, else the
+    /// `1..=7` reference it coded (lane-av1refs's `single_ref_p*_ctx` needs
+    /// the real value, not just `is_inter`).
     fn record_inter(
         &mut self,
         at: (usize, usize),
         side: usize,
         skip: bool,
         is_inter: bool,
+        ref_frame: i8,
         filter: [u8; 2],
     ) {
         let (r, c) = at;
@@ -777,6 +809,8 @@ impl Neighbours {
             self.left_skip[r + cell] = skip;
             self.above_inter[c + cell] = is_inter;
             self.left_inter[r + cell] = is_inter;
+            self.above_ref[c + cell] = ref_frame;
+            self.left_ref[r + cell] = ref_frame;
             self.above_filter[c + cell] = filter;
             self.left_filter[r + cell] = filter;
         }
@@ -1727,7 +1761,7 @@ fn decode_block(
         (r * (SUB / MI), c * (SUB / MI)),
         side / MI,
         logical_tx as u8,
-        false,
+        0,
     );
     Ok(())
 }
@@ -2032,12 +2066,12 @@ fn decode_leaf8(
             }
         }
         neighbours.fill_skip_grid(leaf_mi, 2, skip);
-        neighbours.fill_lf_grid(leaf_mi, 2, 4, false);
+        neighbours.fill_lf_grid(leaf_mi, 2, 4, 0);
         return Ok(mode);
     }
     neighbours.record_mi(leaf_mi, 8, &[luma_grid, u_grid, v_grid]);
     neighbours.fill_skip_grid(leaf_mi, 2, skip);
-    neighbours.fill_lf_grid(leaf_mi, 2, 8, false);
+    neighbours.fill_lf_grid(leaf_mi, 2, 8, 0);
     Ok(mode)
 }
 
@@ -2254,7 +2288,7 @@ fn apply_deblock(
 }
 
 /// Luma-mi-grid position (row or col) a plane-local pixel coordinate falls
-/// in -- `Neighbours::tx_grid`/`inter_grid` are always indexed at the luma
+/// in -- `Neighbours::tx_grid`/`ref_grid` are always indexed at the luma
 /// 4x4-mi grain, even when `coord` is a chroma coordinate (2 chroma px per
 /// mi unit under this decoder's assumed 4:2:0 subsampling).
 fn plane_to_mi(chroma: bool, coord: usize) -> usize {
@@ -2367,8 +2401,8 @@ fn unit_log2(px: u32) -> i32 {
 /// spec 7.14.4's `get_filter_level`, restricted to this decoder's shapes:
 /// every inter block is a single `LAST_FRAME` reference with a non-`GLOBALMV`
 /// mode, so `is_inter` alone selects `ref_deltas`/`mode_deltas` (design note
-/// on [`Neighbours::inter_grid`]).
-fn lf_level(lf: &LoopFilterParams, plane_idx: usize, dir: usize, is_inter: bool) -> i32 {
+/// on [`Neighbours::ref_grid`]).
+fn lf_level(lf: &LoopFilterParams, plane_idx: usize, dir: usize, ref_frame: i8) -> i32 {
     let base = i32::from(if plane_idx == 0 {
         lf.level[dir]
     } else if plane_idx == 1 {
@@ -2380,7 +2414,8 @@ fn lf_level(lf: &LoopFilterParams, plane_idx: usize, dir: usize, is_inter: bool)
         return base;
     }
     let scale = 1i32 << (base >> 5);
-    let ref_idx = usize::from(is_inter);
+    let is_inter = ref_frame != 0;
+    let ref_idx = ref_frame as usize;
     let mut lvl = base + i32::from(lf.ref_deltas[ref_idx]) * scale;
     if is_inter {
         lvl += i32::from(lf.mode_deltas[1]) * scale;
@@ -2409,17 +2444,17 @@ fn edge_params(
     if cur_tx == 0 || (if dir == 0 { x0 } else { y0 }) % cur_tx as usize != 0 {
         return None;
     }
-    let cur_inter = n.inter_grid[mi_r * n.skip_grid_cols_mi + mi_c];
+    let cur_ref = n.ref_grid[mi_r * n.skip_grid_cols_mi + mi_c];
     let (pv_mi_r, pv_mi_c) = if dir == 0 {
         (mi_r, mi_c - 1)
     } else {
         (mi_r - 1, mi_c)
     };
     let pv_tx = tx_px_at(n, chroma, pv_mi_r, pv_mi_c);
-    let pv_inter = n.inter_grid[pv_mi_r * n.skip_grid_cols_mi + pv_mi_c];
+    let pv_ref = n.ref_grid[pv_mi_r * n.skip_grid_cols_mi + pv_mi_c];
 
-    let cur_level = lf_level(lf, plane_idx, dir, cur_inter);
-    let pv_level = lf_level(lf, plane_idx, dir, pv_inter);
+    let cur_level = lf_level(lf, plane_idx, dir, cur_ref);
+    let pv_level = lf_level(lf, plane_idx, dir, pv_ref);
     if cur_level == 0 && pv_level == 0 {
         return None;
     }
@@ -3580,6 +3615,39 @@ fn read_inter_plane(
     Ok(grid)
 }
 
+/// Spec 5.11.25's `single_ref_p1`..`p6` tree (reachable only once `comp_mode`
+/// is known `SINGLE_REFERENCE` -- `decode_stream` refuses any frame with
+/// `reference_select` set before this is ever called, so that read is never
+/// needed here). `above_ref`/`left_ref` are `-1` for an intra/unavailable
+/// neighbour, else the `1..=7` reference that neighbour coded (lane-av1refs).
+fn read_single_ref(dec: &mut SymbolDecoder, cdfs: &mut Cdfs, above_ref: i8, left_ref: i8) -> i8 {
+    let above = (above_ref > 0).then_some(above_ref);
+    let left = (left_ref > 0).then_some(left_ref);
+    let p1 = dec.symbol(&mut cdfs.single_ref[single_ref_p1_ctx(above, left)][0]);
+    let ref_frame = if p1 == 1 {
+        let p2 = dec.symbol(&mut cdfs.single_ref[single_ref_p2_ctx(above, left)][1]);
+        if p2 == 1 {
+            ALTREF_FRAME
+        } else {
+            let p6 = dec.symbol(&mut cdfs.single_ref[single_ref_p6_ctx(above, left)][5]);
+            if p6 == 1 { ALTREF2_FRAME } else { BWDREF_FRAME }
+        }
+    } else {
+        let p3 = dec.symbol(&mut cdfs.single_ref[single_ref_p3_ctx(above, left)][2]);
+        if p3 == 1 {
+            let p5 = dec.symbol(&mut cdfs.single_ref[single_ref_p5_ctx(above, left)][4]);
+            if p5 == 1 { GOLDEN_FRAME } else { LAST3_FRAME }
+        } else {
+            let p4 = dec.symbol(&mut cdfs.single_ref[single_ref_p4_ctx(above, left)][3]);
+            if p4 == 1 { LAST2_FRAME } else { LAST_FRAME }
+        }
+    };
+    if ref_frame != LAST_FRAME {
+        NON_LAST_REF_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    ref_frame
+}
+
 /// Decodes one square inter-frame block (32x32 whole or 16x16 leaf): skip,
 /// `is_inter`, then either the single-reference/MV-stack/motion-vector chain
 /// and motion-compensated reconstruction, or the inter frame's own intra
@@ -3611,6 +3679,18 @@ fn decode_inter_block(
     ref_y: &PlaneBuf,
     ref_u: &PlaneBuf,
     ref_v: &PlaneBuf,
+    // corner-cut (lane-av1refs r1): only `LAST_FRAME` (`ref_y`/`u`/`v`) and
+    // `GOLDEN_FRAME` (`golden_*`, when the frame header's own
+    // `ref_frame_idx` names a slot with a picture) are threaded down to MC.
+    // Ceiling: `LAST2`/`LAST3`/`BWDREF`/`ALTREF2`/`ALTREF` still refuse by
+    // name -- real short low-lag streams overwhelmingly pick `LAST` or
+    // `GOLDEN` (the ledger's cdffwd trace). Upgrade path: widen `golden_*`
+    // into a `[Option<&PlaneBuf>; REFS_PER_FRAME]` addressed by the decoded
+    // reference, same as the CDF/picture DPB slots `decode_stream` already
+    // keeps.
+    golden_y: Option<&PlaneBuf>,
+    golden_u: Option<&PlaneBuf>,
+    golden_v: Option<&PlaneBuf>,
     base_q_idx: u8,
     luma_set_intra: TxbSet,
     luma_set_inter: TxbSet,
@@ -3624,8 +3704,6 @@ fn decode_inter_block(
     interp_fixed: Option<mc::InterpFilterKind>,
     enable_dual_filter: bool,
 ) -> Result<()> {
-    const LAST_FRAME: i8 = 1;
-
     let (r, c) = at;
     let (px, py) = (c * SUB, r * SUB);
     let (cpx, cpy) = (px / 2, py / 2);
@@ -3642,16 +3720,26 @@ fn decode_inter_block(
     let mode_for_tx;
     let (luma_grid, u_grid, v_grid);
     let block_filter;
+    let ref_frame_for_lf;
     if is_inter {
-        let sr_ctx = single_ref_ctx(above_inter || left_inter);
-        let p1 = dec.symbol(&mut cdfs.single_ref[sr_ctx][0]);
-        let p3 = dec.symbol(&mut cdfs.single_ref[sr_ctx][2]);
-        let p4 = dec.symbol(&mut cdfs.single_ref[sr_ctx][3]);
-        if (p1, p3, p4) != (0, 0, 0) {
-            return Err(unsupported(
-                "a reference frame other than LAST_FRAME (round 2)",
-            ));
-        }
+        let ref_frame = read_single_ref(dec, cdfs, neighbours.above_ref[c], neighbours.left_ref[r]);
+        ref_frame_for_lf = ref_frame;
+        let (py_ref, pu_ref, pv_ref) = match ref_frame {
+            LAST_FRAME => (ref_y, ref_u, ref_v),
+            GOLDEN_FRAME => match (golden_y, golden_u, golden_v) {
+                (Some(y), Some(u), Some(v)) => (y, u, v),
+                _ => {
+                    return Err(unsupported(
+                        "a GOLDEN_FRAME reference with no picture in that slot (round 2)",
+                    ));
+                }
+            },
+            _ => {
+                return Err(unsupported(
+                    "a reference frame other than LAST_FRAME/GOLDEN_FRAME (round 2)",
+                ));
+            }
+        };
 
         let (mi_row, mi_col) = (r * SUB_MI as usize, c * SUB_MI as usize);
         let bw4 = side / 4;
@@ -3661,7 +3749,7 @@ fn decode_inter_block(
             mi_col,
             bw4,
             bw4,
-            LAST_FRAME,
+            ref_frame,
             mi_cols as usize,
             mi_rows as usize,
         );
@@ -3748,7 +3836,7 @@ fn decode_inter_block(
                     mi_col + dc,
                     MiInfo {
                         is_inter: true,
-                        ref_frame: LAST_FRAME,
+                        ref_frame,
                         mv,
                         is_new_mv,
                         size: bw4,
@@ -3760,10 +3848,10 @@ fn decode_inter_block(
 
         let mut pred_y = vec![0u8; side * side];
         mc::predict_with_filters(
-            &ref_y.data,
-            ref_y.width,
-            ref_y.true_width,
-            ref_y.true_height,
+            &py_ref.data,
+            py_ref.width,
+            py_ref.true_width,
+            py_ref.true_height,
             mv_to_q4(px, mv.1, true),
             mv_to_q4(py, mv.0, true),
             side,
@@ -3774,10 +3862,10 @@ fn decode_inter_block(
         );
         let mut pred_u = vec![0u8; chroma_side * chroma_side];
         mc::predict_with_filters(
-            &ref_u.data,
-            ref_u.width,
-            ref_u.true_width,
-            ref_u.true_height,
+            &pu_ref.data,
+            pu_ref.width,
+            pu_ref.true_width,
+            pu_ref.true_height,
             mv_to_q4(cpx, mv.1, false),
             mv_to_q4(cpy, mv.0, false),
             chroma_side,
@@ -3788,10 +3876,10 @@ fn decode_inter_block(
         );
         let mut pred_v = vec![0u8; chroma_side * chroma_side];
         mc::predict_with_filters(
-            &ref_v.data,
-            ref_v.width,
-            ref_v.true_width,
-            ref_v.true_height,
+            &pv_ref.data,
+            pv_ref.width,
+            pv_ref.true_width,
+            pv_ref.true_height,
             mv_to_q4(cpx, mv.1, false),
             mv_to_q4(cpy, mv.0, false),
             chroma_side,
@@ -3893,6 +3981,7 @@ fn decode_inter_block(
         };
         mode_for_tx = mode;
         block_filter = [3, 3];
+        ref_frame_for_lf = 0;
         let (mi_row, mi_col) = (r * SUB_MI as usize, c * SUB_MI as usize);
         for dr in 0..side / 4 {
             for dc in 0..side / 4 {
@@ -4018,13 +4107,13 @@ fn decode_inter_block(
         }
     }
     neighbours.record(at, side, mode_for_tx, &[luma_grid, u_grid, v_grid]);
-    neighbours.record_inter(at, side, skip, is_inter, block_filter);
+    neighbours.record_inter(at, side, skip, is_inter, ref_frame_for_lf, block_filter);
     neighbours.fill_skip_grid((r * (SUB / MI), c * (SUB / MI)), side / MI, skip);
     neighbours.fill_lf_grid(
         (r * (SUB / MI), c * (SUB / MI)),
         side / MI,
         side as u8,
-        is_inter,
+        ref_frame_for_lf,
     );
     Ok(())
 }
@@ -4432,7 +4521,7 @@ fn decode_inter_block8(
         }
     }
     neighbours.record_mi(leaf_mi, 8, &[luma_grid, u_grid, v_grid]);
-    neighbours.fill_lf_grid(leaf_mi, 2, 8, is_inter);
+    neighbours.fill_lf_grid(leaf_mi, 2, 8, if is_inter { LAST_FRAME } else { 0 });
     Ok((skip, is_inter))
 }
 
@@ -4457,6 +4546,7 @@ pub fn decode_inter_frame_tile(
     frame_width: u32,
     frame_height: u32,
     reference: &Picture,
+    golden: Option<&Picture>,
     cdef: &CdefParams,
     loop_filter: &LoopFilterParams,
     allow_high_precision_mv: bool,
@@ -4471,6 +4561,7 @@ pub fn decode_inter_frame_tile(
         frame_width,
         frame_height,
         reference,
+        golden,
         cdef,
         loop_filter,
         None,
@@ -4494,6 +4585,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     frame_width: u32,
     frame_height: u32,
     reference: &Picture,
+    golden: Option<&Picture>,
     cdef: &CdefParams,
     loop_filter: &LoopFilterParams,
     initial_cdfs: Option<Cdfs>,
@@ -4534,6 +4626,38 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         height: reference.height / 2,
         true_width: reference.width / 2,
         true_height: reference.height / 2,
+    };
+    // `GOLDEN_FRAME`'s own picture, when the frame header's `ref_frame_idx`
+    // names a DPB slot holding one and it is this frame's own true size --
+    // `decode_inter_block`'s GOLDEN_FRAME arm refuses when it is `None` or a
+    // mismatched size (spec 7.9 requires every active reference be a
+    // compatible size; this decoder's single-slot-per-frame update makes
+    // that always true for a stream this crate's own encoder writes).
+    let (golden_y, golden_u, golden_v) = match golden {
+        Some(g) if g.width == reference.width && g.height == reference.height => (
+            Some(PlaneBuf {
+                data: g.y.clone(),
+                width: g.width,
+                height: g.height,
+                true_width: g.width,
+                true_height: g.height,
+            }),
+            Some(PlaneBuf {
+                data: g.u.clone(),
+                width: g.width / 2,
+                height: g.height / 2,
+                true_width: g.width / 2,
+                true_height: g.height / 2,
+            }),
+            Some(PlaneBuf {
+                data: g.v.clone(),
+                width: g.width / 2,
+                height: g.height / 2,
+                true_width: g.width / 2,
+                true_height: g.height / 2,
+            }),
+        ),
+        _ => (None, None, None),
     };
 
     let mut y = PlaneBuf {
@@ -4637,6 +4761,9 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &ref_y,
                             &ref_u,
                             &ref_v,
+                            golden_y.as_ref(),
+                            golden_u.as_ref(),
+                            golden_v.as_ref(),
                             base_q_idx,
                             TxbSet::Luma32,
                             TxbSet::Luma32Inter,
@@ -4692,6 +4819,9 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     &ref_y,
                                     &ref_u,
                                     &ref_v,
+                                    golden_y.as_ref(),
+                                    golden_u.as_ref(),
+                                    golden_v.as_ref(),
                                     base_q_idx,
                                     TxbSet::Luma16,
                                     TxbSet::Luma16Inter,
@@ -4768,7 +4898,14 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     // into `decode_inter_block8` once a
                                     // straddling 8x8 SWITCHABLE stream is on
                                     // hand to pin against.
-                                    neighbours.record_inter(at16, SUB, skip, is_inter, [3, 3]);
+                                    neighbours.record_inter(
+                                        at16,
+                                        SUB,
+                                        skip,
+                                        is_inter,
+                                        if is_inter { LAST_FRAME } else { -1 },
+                                        [3, 3],
+                                    );
                                 }
                             }
                         }
@@ -5251,6 +5388,7 @@ mod tests {
                 width as u32,
                 height as u32,
                 &reference,
+                None,
                 &CdefParams::default(),
                 &LoopFilterParams::default(),
                 false,
@@ -5420,6 +5558,9 @@ mod tests {
             &ref_y,
             &ref_u,
             &ref_v,
+            None,
+            None,
+            None,
             100,
             TxbSet::Luma16,
             TxbSet::Luma16Inter,
@@ -5519,6 +5660,7 @@ mod tests {
                 coded_w,
                 coded_h,
                 &reference,
+                None,
                 &CdefParams::default(),
                 &LoopFilterParams::default(),
                 false,
