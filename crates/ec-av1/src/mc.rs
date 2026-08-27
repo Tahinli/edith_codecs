@@ -79,6 +79,147 @@ const SUBPEL_FILTERS_4: [[i32; 8]; 16] = [
     [0, 0, -2, 8, 126, -4, 0, 0],
 ];
 
+/// `Subpel_Filters[EIGHTTAP_SMOOTH]` (`filter.h`'s `av1_sub_pel_filters_8smooth`).
+const SUBPEL_FILTERS_SMOOTH: [[i32; 8]; 16] = [
+    [0, 0, 0, 128, 0, 0, 0, 0],
+    [0, 2, 28, 62, 34, 2, 0, 0],
+    [0, 0, 26, 62, 36, 4, 0, 0],
+    [0, 0, 22, 62, 40, 4, 0, 0],
+    [0, 0, 20, 60, 42, 6, 0, 0],
+    [0, 0, 18, 58, 44, 8, 0, 0],
+    [0, 0, 16, 56, 46, 10, 0, 0],
+    [0, -2, 16, 54, 48, 12, 0, 0],
+    [0, -2, 14, 52, 52, 14, -2, 0],
+    [0, 0, 12, 48, 54, 16, -2, 0],
+    [0, 0, 10, 46, 56, 16, 0, 0],
+    [0, 0, 8, 44, 58, 18, 0, 0],
+    [0, 0, 6, 42, 60, 20, 0, 0],
+    [0, 0, 4, 40, 62, 22, 0, 0],
+    [0, 0, 4, 36, 62, 26, 0, 0],
+    [0, 0, 2, 34, 62, 28, 2, 0],
+];
+
+/// `SUBPEL_FILTERS_SMOOTH`'s narrow-block counterpart (`av1_sub_pel_filters_4smooth`).
+const SUBPEL_FILTERS_SMOOTH_4: [[i32; 8]; 16] = [
+    [0, 0, 0, 128, 0, 0, 0, 0],
+    [0, 0, 30, 62, 34, 2, 0, 0],
+    [0, 0, 26, 62, 36, 4, 0, 0],
+    [0, 0, 22, 62, 40, 4, 0, 0],
+    [0, 0, 20, 60, 42, 6, 0, 0],
+    [0, 0, 18, 58, 44, 8, 0, 0],
+    [0, 0, 16, 56, 46, 10, 0, 0],
+    [0, 0, 14, 54, 48, 12, 0, 0],
+    [0, 0, 12, 52, 52, 12, 0, 0],
+    [0, 0, 12, 48, 54, 14, 0, 0],
+    [0, 0, 10, 46, 56, 16, 0, 0],
+    [0, 0, 8, 44, 58, 18, 0, 0],
+    [0, 0, 6, 42, 60, 20, 0, 0],
+    [0, 0, 4, 40, 62, 22, 0, 0],
+    [0, 0, 4, 36, 62, 26, 0, 0],
+    [0, 0, 2, 34, 62, 30, 0, 0],
+];
+
+/// `Subpel_Filters[EIGHTTAP_SHARP]` (`av1_sub_pel_filters_8sharp`) -- unlike
+/// REGULAR/SMOOTH, spec 7.11.3.4 never swaps this for a narrow-block table.
+const SUBPEL_FILTERS_SHARP: [[i32; 8]; 16] = [
+    [0, 0, 0, 128, 0, 0, 0, 0],
+    [-2, 2, -6, 126, 8, -2, 2, 0],
+    [-2, 6, -12, 124, 16, -6, 4, -2],
+    [-2, 8, -18, 120, 26, -10, 6, -2],
+    [-4, 10, -22, 116, 38, -14, 6, -2],
+    [-4, 10, -22, 108, 48, -18, 8, -2],
+    [-4, 10, -24, 100, 60, -20, 8, -2],
+    [-4, 10, -24, 90, 70, -22, 10, -2],
+    [-4, 12, -24, 80, 80, -24, 12, -4],
+    [-2, 10, -22, 70, 90, -24, 10, -4],
+    [-2, 8, -20, 60, 100, -24, 10, -4],
+    [-2, 8, -18, 48, 108, -22, 10, -4],
+    [-2, 6, -14, 38, 116, -22, 10, -4],
+    [-2, 6, -10, 26, 120, -18, 8, -2],
+    [-2, 4, -6, 16, 124, -12, 6, -2],
+    [0, 2, -2, 8, 126, -6, 2, -2],
+];
+
+/// `Subpel_Filters[BILINEAR]` (`av1_bilinear_filters`) -- also never swapped
+/// for a narrow-block table (it is already only 2 non-zero taps).
+const SUBPEL_FILTERS_BILINEAR: [[i32; 8]; 16] = [
+    [0, 0, 0, 128, 0, 0, 0, 0],
+    [0, 0, 0, 120, 8, 0, 0, 0],
+    [0, 0, 0, 112, 16, 0, 0, 0],
+    [0, 0, 0, 104, 24, 0, 0, 0],
+    [0, 0, 0, 96, 32, 0, 0, 0],
+    [0, 0, 0, 88, 40, 0, 0, 0],
+    [0, 0, 0, 80, 48, 0, 0, 0],
+    [0, 0, 0, 72, 56, 0, 0, 0],
+    [0, 0, 0, 64, 64, 0, 0, 0],
+    [0, 0, 0, 56, 72, 0, 0, 0],
+    [0, 0, 0, 48, 80, 0, 0, 0],
+    [0, 0, 0, 40, 88, 0, 0, 0],
+    [0, 0, 0, 32, 96, 0, 0, 0],
+    [0, 0, 0, 24, 104, 0, 0, 0],
+    [0, 0, 0, 16, 112, 0, 0, 0],
+    [0, 0, 0, 8, 120, 0, 0, 0],
+];
+
+/// Which of the spec's four `interpolation_filter` kernels a block's motion
+/// compensation reads (spec 6.8.9 / `frame_header`'s `interpolation_filter`).
+/// A frame codes exactly one of these when not `Switchable`; a `Switchable`
+/// frame codes one per block per direction (spec 5.11.20's
+/// `read_interp_filter`, see `decode::decode_inter_block`), so `predict`'s
+/// callers resolve `Switchable` to a concrete pair of kinds themselves --
+/// this type only ever names the resolved kernel, never `Switchable` itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InterpFilterKind {
+    Regular,
+    Smooth,
+    Sharp,
+    Bilinear,
+}
+
+impl InterpFilterKind {
+    fn tables(self) -> (&'static [[i32; 8]; 16], &'static [[i32; 8]; 16]) {
+        match self {
+            InterpFilterKind::Regular => (&SUBPEL_FILTERS, &SUBPEL_FILTERS_4),
+            InterpFilterKind::Smooth => (&SUBPEL_FILTERS_SMOOTH, &SUBPEL_FILTERS_SMOOTH_4),
+            InterpFilterKind::Sharp => (&SUBPEL_FILTERS_SHARP, &SUBPEL_FILTERS_SHARP),
+            InterpFilterKind::Bilinear => (&SUBPEL_FILTERS_BILINEAR, &SUBPEL_FILTERS_BILINEAR),
+        }
+    }
+
+    /// The three-symbol alphabet spec 5.11.20's `interp_filter[dir]` reads
+    /// under a `Switchable` frame decodes to (`EIGHTTAP`/`_SMOOTH`/`_SHARP`
+    /// in that order -- `BILINEAR` is never a `switchable_interp` outcome).
+    ///
+    /// # Panics
+    /// Panics when `symbol` is not `0..=2`.
+    pub fn from_switchable_symbol(symbol: usize) -> InterpFilterKind {
+        match symbol {
+            0 => InterpFilterKind::Regular,
+            1 => InterpFilterKind::Smooth,
+            2 => InterpFilterKind::Sharp,
+            _ => panic!("switchable_interp's alphabet is exactly 3 symbols"),
+        }
+    }
+
+    /// The frame header's own `interpolation_filter` (spec 6.8.9), for the
+    /// non-`Switchable` values a fixed-filter frame codes directly.
+    ///
+    /// # Panics
+    /// Panics on `Switchable`, which is not a concrete kernel -- callers
+    /// resolve it per block instead (spec 5.11.20).
+    pub fn from_header(filter: ec_av1_syntax::InterpolationFilter) -> InterpFilterKind {
+        match filter {
+            ec_av1_syntax::InterpolationFilter::Eighttap => InterpFilterKind::Regular,
+            ec_av1_syntax::InterpolationFilter::EighttapSmooth => InterpFilterKind::Smooth,
+            ec_av1_syntax::InterpolationFilter::EighttapSharp => InterpFilterKind::Sharp,
+            ec_av1_syntax::InterpolationFilter::Bilinear => InterpFilterKind::Bilinear,
+            ec_av1_syntax::InterpolationFilter::Switchable => {
+                panic!("Switchable is resolved per block, not as one frame-wide kernel")
+            }
+        }
+    }
+}
+
 /// A reference sample at `(x, y)`, clamped to the frame's true (unpadded)
 /// extent -- `true_width`/`true_height`, which can be narrower than
 /// `stride` -- rather than read out of range (spec 7.11.3.4's `Clip3`
@@ -127,6 +268,69 @@ pub fn predict(
     block_h: usize,
     dst: &mut [u8],
 ) {
+    predict_with_filter(
+        reference,
+        stride,
+        true_width,
+        true_height,
+        x_q4,
+        y_q4,
+        block_w,
+        block_h,
+        InterpFilterKind::Regular,
+        dst,
+    );
+}
+
+/// [`predict`], selecting the interpolation filter kernel explicitly (spec
+/// 6.8.9's `interpolation_filter`) instead of always `Regular` -- the same
+/// kernel both directions.
+#[allow(clippy::too_many_arguments)]
+pub fn predict_with_filter(
+    reference: &[u8],
+    stride: usize,
+    true_width: usize,
+    true_height: usize,
+    x_q4: i32,
+    y_q4: i32,
+    block_w: usize,
+    block_h: usize,
+    filter_kind: InterpFilterKind,
+    dst: &mut [u8],
+) {
+    predict_with_filters(
+        reference,
+        stride,
+        true_width,
+        true_height,
+        x_q4,
+        y_q4,
+        block_w,
+        block_h,
+        filter_kind,
+        filter_kind,
+        dst,
+    );
+}
+
+/// [`predict_with_filter`], with the horizontal (`interp_filter[0]`) and
+/// vertical (`interp_filter[1]`) kernels chosen independently -- spec
+/// 5.11.20's per-block `SWITCHABLE` read is per-direction (`enable_dual_filter`),
+/// so the two passes can genuinely differ.
+#[allow(clippy::too_many_arguments)]
+pub fn predict_with_filters(
+    reference: &[u8],
+    stride: usize,
+    true_width: usize,
+    true_height: usize,
+    x_q4: i32,
+    y_q4: i32,
+    block_w: usize,
+    block_h: usize,
+    h_kind: InterpFilterKind,
+    v_kind: InterpFilterKind,
+    dst: &mut [u8],
+) {
     assert_eq!(dst.len(), block_w * block_h, "the destination is the block");
     assert!(!reference.is_empty(), "a reference plane has samples");
 
@@ -164,15 +368,17 @@ pub fn predict(
         return;
     }
 
+    let (h_wide, h_narrow) = h_kind.tables();
+    let (v_wide, v_narrow) = v_kind.tables();
     let h_filter = if block_w <= 4 {
-        &SUBPEL_FILTERS_4[xfrac]
+        &h_narrow[xfrac]
     } else {
-        &SUBPEL_FILTERS[xfrac]
+        &h_wide[xfrac]
     };
     let v_filter = if block_h <= 4 {
-        &SUBPEL_FILTERS_4[yfrac]
+        &v_narrow[yfrac]
     } else {
-        &SUBPEL_FILTERS[yfrac]
+        &v_wide[yfrac]
     };
 
     // The vertical pass reads 3 rows above and 4 below the block, so the
@@ -207,7 +413,93 @@ pub fn predict(
 
 #[cfg(test)]
 mod tests {
-    use super::predict;
+    use super::{InterpFilterKind, predict, predict_with_filter};
+
+    /// Regression pin for the lane-av1flake ±1 defect: a real aomenc chroma
+    /// inter block at the frame's top-left corner (mv q4 = (row 7, col 15),
+    /// bw=bh=16) predicted the wrong value because this decoder always used
+    /// the REGULAR filter table -- aomdec's own `av1_convolve_2d_sr_c` trace
+    /// showed this block actually used `EIGHTTAP_SMOOTH`
+    /// (`0 0 2 34 62 28 2 0` at xfrac=15, not REGULAR's `0 0 -2 8 126 -6 2
+    /// 0`). Window and expected output dumped straight from an
+    /// instrumented aomdec's `av1_convolve_2d_sr_c` on the pinned stream.
+    #[test]
+    fn smooth_filter_matches_aomdec_chroma_inter_block() {
+        #[rustfmt::skip]
+        let window: [[u8; 24]; 24] = [
+            [114,114,114,114,114,114,114,114,115,115,115,115,116,116,116,116,117,117,117,116,115,115,114,114],
+            [114,114,114,114,114,114,114,114,115,115,115,115,116,116,116,116,117,117,117,116,115,115,114,114],
+            [114,114,114,114,114,114,114,114,115,115,115,115,116,116,116,116,117,117,117,116,115,115,114,114],
+            [114,114,114,114,114,114,114,114,115,115,115,115,116,116,116,116,117,117,117,116,115,115,114,114],
+            [114,114,114,114,114,114,114,114,115,115,115,115,116,116,116,116,117,117,117,116,115,115,114,114],
+            [114,114,114,114,114,114,114,114,114,115,115,115,116,116,116,116,116,117,117,116,116,115,115,115],
+            [114,114,114,114,114,114,114,114,114,114,115,115,115,115,116,116,116,116,116,116,115,115,115,115],
+            [113,113,113,113,113,113,113,113,114,114,114,114,115,115,115,115,116,116,116,116,115,115,115,115],
+            [113,113,113,113,113,113,113,113,113,113,114,114,114,114,115,115,115,115,115,115,115,115,115,115],
+            [112,112,112,112,112,112,112,112,112,113,113,113,113,114,114,114,114,114,115,115,115,115,115,115],
+            [111,111,111,111,111,111,111,111,112,112,112,112,113,113,113,113,114,114,114,114,115,115,115,115],
+            [110,110,110,110,110,110,110,110,111,111,111,111,112,112,112,113,113,113,113,113,114,114,114,115],
+            [109,109,109,109,109,109,109,110,110,110,110,111,111,111,111,112,112,112,112,113,113,114,114,114],
+            [108,108,108,108,108,109,109,109,109,109,110,110,110,110,111,111,111,111,111,112,112,113,113,113],
+            [108,108,108,108,108,108,108,108,108,108,109,109,109,110,110,110,110,110,111,111,112,112,112,112],
+            [107,107,107,107,107,107,107,107,107,108,108,108,109,109,109,109,109,110,110,110,110,111,111,111],
+            [106,106,106,106,106,106,106,107,107,107,107,108,108,108,108,109,109,109,109,109,109,110,110,110],
+            [106,106,106,106,106,106,106,106,106,107,107,107,107,108,108,108,108,109,109,109,109,109,109,109],
+            [105,105,105,105,105,105,105,105,106,106,106,107,107,107,107,108,108,108,108,108,108,108,108,109],
+            [104,104,104,104,104,104,104,104,104,105,105,106,106,106,107,107,107,107,107,107,107,108,108,108],
+            [102,102,102,102,102,103,103,103,103,104,104,105,105,105,106,106,107,107,107,107,107,107,107,107],
+            [101,101,101,101,101,101,101,102,102,103,103,104,104,104,105,105,106,106,106,106,106,107,107,107],
+            [100,100,100,100,100,100,100,101,101,102,102,103,103,104,104,105,105,105,106,106,106,106,106,106],
+            [99,99,99,99,99,99,100,100,100,101,101,102,103,103,104,104,105,105,105,105,105,105,105,106],
+        ];
+        // The dumped window spans real cols/rows -4..19; the block itself
+        // starts at real (0, 0), so pad the reference plane so col/row 4 of
+        // this buffer is real col/row 0, and hand `predict_with_filter` the
+        // real (0, 0) coordinates -- clamping then reproduces the identical
+        // extended border the dump already captured.
+        let stride = 24;
+        let mut reference = vec![0u8; stride * 24];
+        for (r, row) in window.iter().enumerate() {
+            reference[r * stride..r * stride + stride].copy_from_slice(row);
+        }
+        // predict()'s own edge clamp starts at true (0,0); shift so the
+        // dumped window's row/col 4 lands there by biasing x_q4/y_q4's
+        // whole-pel part by -4 and reading from a plane whose true origin
+        // is the window's row/col 4 -- simplest is to pass true_width /
+        // true_height covering the whole dumped window and offset the
+        // whole-pel part of x_q4/y_q4 by +4 to land on real (0,0).
+        let x_q4 = (4 + 0) * 16 + 15; // real block x0=0, xfrac=15
+        let y_q4 = (4 + 0) * 16 + 7; // real block y0=0, yfrac=7
+        let mut dst = vec![0u8; 16 * 16];
+        predict_with_filter(
+            &reference,
+            stride,
+            24,
+            24,
+            x_q4,
+            y_q4,
+            16,
+            16,
+            InterpFilterKind::Smooth,
+            &mut dst,
+        );
+        #[rustfmt::skip]
+        let expected_row0: [u8; 16] =
+            [114,114,114,114,115,115,115,116,116,116,116,116,117,117,116,116];
+        assert_eq!(
+            &dst[0..16],
+            &expected_row0,
+            "row0 vs aomdec's real av1_convolve_2d_sr_c output"
+        );
+        #[rustfmt::skip]
+        let expected_row15: [u8; 16] =
+            [103,103,104,104,104,105,105,106,106,106,107,107,107,107,107,107];
+        assert_eq!(
+            &dst[15 * 16..15 * 16 + 16],
+            &expected_row15,
+            "row15 vs aomdec"
+        );
+    }
 
     #[test]
     fn integer_mv_is_identity() {
