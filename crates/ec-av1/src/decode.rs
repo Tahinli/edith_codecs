@@ -83,6 +83,28 @@ pub(crate) fn tx_depth_hits() -> usize {
 /// landing on `DCT_DCT`.
 static TX_CLASS1_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// How many `uv_mode` reads resolved to a directional chroma mode (neither
+/// `DC_PRED` nor `UV_CFL_PRED`), across every call in the process -- the same
+/// before/after counter pattern as [`FILTER_INTRA_HITS`], proving a stream
+/// actually exercised chroma's own directional predictor.
+static DIRECTIONAL_UV_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Current value of [`DIRECTIONAL_UV_HITS`].
+pub(crate) fn directional_uv_hits() -> usize {
+    DIRECTIONAL_UV_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// How many `angle_delta`/`angle_delta_uv` symbols this decoder has read as
+/// something other than [`ANGLE_DELTA_ZERO`], across every call in the
+/// process -- the same before/after counter pattern as [`FILTER_INTRA_HITS`],
+/// proving a stream actually exercised a nonzero angle delta.
+static ANGLE_DELTA_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Current value of [`ANGLE_DELTA_HITS`].
+pub(crate) fn angle_delta_hits() -> usize {
+    ANGLE_DELTA_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Current value of [`TX_CLASS1_HITS`].
 pub(crate) fn tx_class1_hits() -> usize {
     TX_CLASS1_HITS.load(std::sync::atomic::Ordering::Relaxed)
@@ -368,12 +390,41 @@ fn read_eob(dec: &mut SymbolDecoder, coding: &mut TxbTables, class: TxClass) -> 
 /// CDF's own set (a corrupt or unsupported bitstream) — every value the
 /// intra `Tx_Type_Intra_Inv_Set2` and inter `Tx_Type_Inter_Inv_Set3` CDFs can
 /// produce dispatches to a real inverse transform.
+/// `Intra_Mode_To_Tx_Type` (spec 9.3): chroma's transform type is never its
+/// own coded symbol -- `TxbSet::Chroma*`'s `tx_type` slot is always `None`
+/// (a chroma block shares no CDF row with `Luma16`'s mode-indexed one) -- so
+/// libaom's own `intra_mode_to_tx_type` (`blockd.h`) derives it purely from
+/// the plane's own predicted mode instead. Every entry this table can
+/// produce is a member of both `TX_SET_INTRA_1` and `_2` (spec 9.3's two
+/// intra sets differ only in `IDTX`/`V_DCT`/`H_DCT`, none of which this
+/// table ever names), so unlike the CDF-coded luma path there is no
+/// ext-tx-set membership check to fall back from here.
+fn default_intra_tx_type(mode: u8) -> TxType {
+    use crate::intra::{
+        D45_PRED, D67_PRED, D113_PRED, D135_PRED, D157_PRED, D203_PRED, DC_PRED, H_PRED,
+        PAETH_PRED, SMOOTH_H_PRED, SMOOTH_PRED, SMOOTH_V_PRED, V_PRED,
+    };
+    match mode {
+        DC_PRED | D45_PRED => TxType::DctDct,
+        V_PRED | D113_PRED | D67_PRED | SMOOTH_V_PRED => TxType::AdstDct,
+        H_PRED | D157_PRED | D203_PRED | SMOOTH_H_PRED => TxType::DctAdst,
+        D135_PRED | SMOOTH_PRED | PAETH_PRED => TxType::AdstAdst,
+        other => panic!("intra mode {other} has no Intra_Mode_To_Tx_Type entry"),
+    }
+}
+
 fn read_coeffs(
     dec: &mut SymbolDecoder,
     coding: &mut TxbTables,
     scan: &[u16],
     skip_ctx: usize,
     sign_ctx: usize,
+    // The chroma default (spec `Intra_Mode_To_Tx_Type`, see
+    // [`default_intra_tx_type`]) for the sizes where `coding.tx_type` codes
+    // nothing at all; `DctDct` for every luma call and every chroma call at
+    // a size the spec forces to `DCT_DCT` regardless of mode (32-point and
+    // up, `EXT_TX_SET_DCTONLY`) -- the caller already folds that in.
+    default_tx_type: TxType,
 ) -> Result<(Vec<i32>, TxType)> {
     let trace = std::env::var_os("EC_AV1_TRACE").is_some();
     let side = coding.side;
@@ -385,7 +436,7 @@ fn read_coeffs(
     if all_zero {
         return Ok((grid, TxType::DctDct));
     }
-    let mut tx_type = TxType::DctDct;
+    let mut tx_type = default_tx_type;
     if let Some(tx_type_cdf) = coding.tx_type.as_deref_mut() {
         // The CDF row's own width names its set: 7 symbols (8 slots) is
         // `TX_SET_INTRA_1`, 5 (6 slots) the reduced `TX_SET_INTRA_2` (the
@@ -940,6 +991,18 @@ fn filter_intra_size_class(side: usize) -> Option<usize> {
     }
 }
 
+/// `read_angle_delta`/`Angle_Delta` (spec 5.11.42 + 9.3): the symbol minus
+/// [`ANGLE_DELTA_ZERO`] gives the signed `-MAX_ANGLE_DELTA..=MAX_ANGLE_DELTA`
+/// delta [`crate::intra::predict`] wants; bumps [`ANGLE_DELTA_HITS`] whenever
+/// it lands away from zero, for gate tests to prove a real stream fired one.
+fn read_angle_delta(dec: &mut SymbolDecoder, cdf: &mut [u16]) -> i32 {
+    let symbol = dec.symbol(cdf);
+    if symbol != ANGLE_DELTA_ZERO {
+        ANGLE_DELTA_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    symbol as i32 - ANGLE_DELTA_ZERO as i32
+}
+
 fn read_intra_mode(
     dec: &mut SymbolDecoder,
     cdfs: &mut Cdfs,
@@ -948,7 +1011,15 @@ fn read_intra_mode(
     cfl: bool,
     side: usize,
     enable_filter_intra: bool,
-) -> Result<(bool, usize, Option<(i32, i32)>, Option<usize>)> {
+) -> Result<(
+    bool,
+    usize,
+    i32,
+    usize,
+    i32,
+    Option<(i32, i32)>,
+    Option<usize>,
+)> {
     let trace = std::env::var_os("EC_AV1_TRACE").is_some();
     let skip = dec.symbol(&mut cdfs.skip[0]) != 0;
     if trace {
@@ -960,17 +1031,18 @@ fn read_intra_mode(
     if trace {
         eprintln!("TRACE y_mode ctx=({above_ctx},{left_ctx}) value={mode}");
     }
-    if (V_PRED..=D67_PRED).contains(&mode) {
-        let angle = dec.symbol(&mut cdfs.angle_delta[mode - V_PRED]);
+    let angle_delta_y = if (V_PRED..=D67_PRED).contains(&mode) {
+        let delta = read_angle_delta(dec, &mut cdfs.angle_delta[mode - V_PRED]);
         if trace {
-            eprintln!("TRACE angle_delta value={angle}");
+            eprintln!(
+                "TRACE angle_delta value={}",
+                delta + ANGLE_DELTA_ZERO as i32
+            );
         }
-        if angle != ANGLE_DELTA_ZERO {
-            return Err(unsupported(
-                "a nonzero angle delta (this encoder never writes one)",
-            ));
-        }
-    }
+        delta
+    } else {
+        0
+    };
     let uv_mode = if cfl {
         dec.symbol(&mut cdfs.uv_mode_cfl[mode])
     } else {
@@ -979,12 +1051,31 @@ fn read_intra_mode(
     if trace {
         eprintln!("TRACE uv_mode cfl={cfl} y_mode={mode} value={uv_mode}");
     }
-    let alpha = if uv_mode == DC_PRED {
-        None
-    } else if cfl && uv_mode == UV_CFL_PRED {
+    let alpha = if cfl && uv_mode == UV_CFL_PRED {
         Some(read_cfl_alphas(dec, cdfs))
     } else {
-        return Err(unsupported("a directional chroma mode (round 2)"));
+        None
+    };
+    // `SMOOTH_PRED..PAETH_PRED` (9..=12) chroma is a separate round-2 gap
+    // from this lane's directional chroma: a corner block with neither
+    // `above` nor `left` (both `Edges::build`'s no-neighbour fallback,
+    // 127/129) fed `SMOOTH_PRED` produces the wrong pixel there (worst delta
+    // 78 against ffmpeg, traced 2026-08-27) -- an existing, un-lane-touched
+    // bug in that fallback this lane's own scope does not cover. Keep it
+    // refused here rather than ship a silently-wrong decode.
+    if (9..=12).contains(&uv_mode) {
+        return Err(unsupported("a smooth or paeth chroma mode (round 2)"));
+    }
+    // `get_uv_mode` (spec 9.3): `UV_CFL_PRED` predicts as `DC_PRED` for the
+    // angle-delta question -- libaom's own `read_intra_frame_mode_info` reads
+    // `angle_delta_uv` off `get_uv_mode(uv_mode)`, never off `uv_mode` raw,
+    // so a CFL block (uv_mode==13, outside `V_PRED..=D67_PRED`) already takes
+    // the `else` branch below and never reads one either way.
+    let angle_delta_uv = if (V_PRED..=D67_PRED).contains(&uv_mode) {
+        DIRECTIONAL_UV_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        read_angle_delta(dec, &mut cdfs.angle_delta[uv_mode - V_PRED])
+    } else {
+        0
     };
     // `read_filter_intra_mode_info` (spec 5.11.14, libaom decodemv.c): a
     // `use_filter_intra` symbol this decoder never read at all until
@@ -1014,7 +1105,15 @@ fn read_intra_mode(
             filter_intra = Some(fi_mode);
         }
     }
-    Ok((skip, mode, alpha, filter_intra))
+    Ok((
+        skip,
+        mode,
+        angle_delta_y,
+        uv_mode,
+        angle_delta_uv,
+        alpha,
+        filter_intra,
+    ))
 }
 
 /// `UV_CFL_PRED` (spec 6.10.19's chroma intra mode enum): the fourteenth
@@ -1149,6 +1248,7 @@ impl PlaneBuf {
         y: usize,
         side: usize,
         mode: usize,
+        angle_delta: i32,
         reach: Reach,
         residual: &[i32],
         cfl: Option<(i32, &[i32])>,
@@ -1168,6 +1268,7 @@ impl PlaneBuf {
         } else {
             predict(
                 mode as u8,
+                angle_delta,
                 above.as_deref(),
                 left.as_deref(),
                 corner,
@@ -1204,6 +1305,7 @@ fn read_plane(
     // CDF is indexed by, spec 9.3), never the plane's own predicted mode.
     tx_mode: usize,
     predict_mode: usize,
+    angle_delta: i32,
     reach: Reach,
     plane: &mut PlaneBuf,
     x: usize,
@@ -1227,7 +1329,31 @@ fn read_plane(
         usize::from(around.0) + usize::from(around.1)
     };
     let mut coding = cdfs.txb(set, tx_mode);
-    let (grid, tx_type) = read_coeffs(dec, &mut coding, scan, skip_ctx, dc_sign_ctx(around.2))?;
+    // Luma's `default_tx_type` is only a fallback for the sizes whose
+    // `TxbSet` carries no symbol at all (32-point and up), which the spec
+    // fixes at `DCT_DCT` regardless of mode; a chroma plane's `tx_type` is
+    // *never* its own coded symbol (`coding.tx_type` is always `None` for
+    // every `TxbSet::Chroma*`), so it would take `Intra_Mode_To_Tx_Type` of
+    // the plane's own predicted mode (`default_intra_tx_type`) -- except
+    // `av1_get_ext_tx_set_type` (`blockd.h`) resolves chroma at `tx_size_sqr
+    // >= TX_32X32` to `EXT_TX_SET_DCTONLY`, which forces the result back to
+    // `DCT_DCT` no matter what the mode-indexed table said (`TxbSet::Chroma8`
+    // and `Chroma16` never hit this — every value `default_intra_tx_type` can
+    // produce is already a member of both `TX_SET_INTRA_1`/`_2`, so nothing
+    // narrows there — only `Chroma32` and up do).
+    let default_tx_type = if plane_idx == 0 || side >= 32 {
+        TxType::DctDct
+    } else {
+        default_intra_tx_type(predict_mode as u8)
+    };
+    let (grid, tx_type) = read_coeffs(
+        dec,
+        &mut coding,
+        scan,
+        skip_ctx,
+        dc_sign_ctx(around.2),
+        default_tx_type,
+    )?;
     // A 64x64 luma block's transform covers the whole 64x64 area, but only its
     // top-left 32x32 of frequencies are coded (spec 5.11.40); the rest of the
     // dequantized grid stays zero, which `inverse_transform_2d`'s own `< 32`
@@ -1248,9 +1374,7 @@ fn read_plane(
     let residual = dequant_and_inverse_typed(&levels, side, 8, i32::from(base_q_idx), tx_type);
     if std::env::var_os("EC_AV1_TRACE").is_some() {
         eprintln!(
-            "TRACE dequant plane={plane_idx} base_q_idx={base_q_idx} levels[0..4]={:?} residual[0..4]={:?}",
-            &levels[..4.min(levels.len())],
-            &residual[..4.min(residual.len())]
+            "TRACE dequant plane={plane_idx} base_q_idx={base_q_idx} tx_type={tx_type:?} side={side} levels={levels:?} residual={residual:?}",
         );
     }
     plane.reconstruct(
@@ -1258,6 +1382,7 @@ fn read_plane(
         y,
         side,
         predict_mode,
+        angle_delta,
         reach,
         &residual,
         cfl,
@@ -1308,15 +1433,30 @@ fn decode_block(
 ) -> Result<()> {
     let (r, c) = at;
     let (px, py) = (c * SUB, r * SUB);
-    let (skip, mode, alpha, filter_intra) = read_intra_mode(
-        dec,
-        cdfs,
-        neighbours.above_mode[c],
-        neighbours.left_mode[r],
-        cfl,
-        side,
-        enable_filter_intra,
-    )?;
+    let (skip, mode, angle_delta_y, uv_mode, angle_delta_uv, alpha, filter_intra) =
+        read_intra_mode(
+            dec,
+            cdfs,
+            neighbours.above_mode[c],
+            neighbours.left_mode[r],
+            cfl,
+            side,
+            enable_filter_intra,
+        )?;
+    // `predict` panics outside `DC_PRED..=PAETH_PRED` (0..=12); `UV_CFL_PRED`
+    // (13) predicts as `DC_PRED` with the [`cfl_scaled`] nudge carrying the
+    // actual chroma-from-luma correlation, same as this decoder always did.
+    let uv_predict_mode = if uv_mode == UV_CFL_PRED {
+        DC_PRED
+    } else {
+        uv_mode
+    };
+    if std::env::var_os("EC_AV1_TRACE").is_some() {
+        eprintln!(
+            "TRACE block px={px} py={py} side={side} mode={mode} uv_mode={uv_mode} \
+             angle_delta_uv={angle_delta_uv}"
+        );
+    }
     let (mi_r, mi_c) = (r * (SUB / MI), c * (SUB / MI));
     // `TxMode::Select`'s `tx_depth` (spec 5.11.16): read for every intra
     // block, skipped or not. `logical_tx` is what the loop filter's edge
@@ -1347,6 +1487,7 @@ fn decode_block(
             py,
             side,
             mode,
+            angle_delta_y,
             reach,
             &vec![0i32; side * side],
             None,
@@ -1357,7 +1498,8 @@ fn decode_block(
             cpx,
             cpy,
             chroma_side,
-            DC_PRED,
+            uv_predict_mode,
+            angle_delta_uv,
             Reach::none(),
             &vec![0i32; chroma_side * chroma_side],
             alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
@@ -1367,7 +1509,8 @@ fn decode_block(
             cpx,
             cpy,
             chroma_side,
-            DC_PRED,
+            uv_predict_mode,
+            angle_delta_uv,
             Reach::none(),
             &vec![0i32; chroma_side * chroma_side],
             alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
@@ -1391,6 +1534,7 @@ fn decode_block(
             around[0],
             mode,
             mode,
+            angle_delta_y,
             reach,
             y,
             px,
@@ -1411,7 +1555,8 @@ fn decode_block(
             1,
             around[1],
             mode,
-            DC_PRED,
+            uv_predict_mode,
+            angle_delta_uv,
             Reach::none(),
             u,
             cpx,
@@ -1423,6 +1568,12 @@ fn decode_block(
             None,
             None,
         )?;
+        if std::env::var_os("EC_AV1_TRACE").is_some() {
+            eprintln!(
+                "TRACE u-write cpx={cpx} cpy={cpy} chroma_side={chroma_side} row0={:?}",
+                &u.data[cpy * u.width + cpx..][..chroma_side]
+            );
+        }
         let v_grid = read_plane(
             dec,
             cdfs,
@@ -1431,7 +1582,8 @@ fn decode_block(
             2,
             around[2],
             mode,
-            DC_PRED,
+            uv_predict_mode,
+            angle_delta_uv,
             Reach::none(),
             v,
             cpx,
@@ -1476,6 +1628,7 @@ fn decode_block(
                     tu_around,
                     mode,
                     mode,
+                    angle_delta_y,
                     tu_reach,
                     y,
                     tu_px,
@@ -1508,7 +1661,8 @@ fn decode_block(
             1,
             chroma_around[1],
             mode,
-            DC_PRED,
+            uv_predict_mode,
+            angle_delta_uv,
             Reach::none(),
             u,
             cpx,
@@ -1528,7 +1682,8 @@ fn decode_block(
             2,
             chroma_around[2],
             mode,
-            DC_PRED,
+            uv_predict_mode,
+            angle_delta_uv,
             Reach::none(),
             v,
             cpx,
@@ -1591,15 +1746,21 @@ fn decode_leaf8(
     // An 8x8 leaf is well within `is_cfl_allowed`'s <=32x32 bound (spec
     // 5.11.5), so it reads the CFL-allowed `uv_mode_cfl` CDF, like every other
     // `decode_block` caller at 16x16 and up.
-    let (skip, mode, alpha, filter_intra) = read_intra_mode(
-        dec,
-        cdfs,
-        above_mode,
-        left_mode,
-        true,
-        8,
-        enable_filter_intra,
-    )?;
+    let (skip, mode, angle_delta_y, uv_mode, angle_delta_uv, alpha, filter_intra) =
+        read_intra_mode(
+            dec,
+            cdfs,
+            above_mode,
+            left_mode,
+            true,
+            8,
+            enable_filter_intra,
+        )?;
+    let uv_predict_mode = if uv_mode == UV_CFL_PRED {
+        DC_PRED
+    } else {
+        uv_mode
+    };
     // `TxMode::Select`'s `tx_depth` at an 8x8 leaf (spec 5.11.16): the only
     // depths an 8x8 block offers are `TX8` (depth 0) and `TX4` (depth 1,
     // which splits the leaf's own 8x8 prediction into a 2x2 grid of 4x4
@@ -1615,13 +1776,24 @@ fn decode_leaf8(
     let (cpx, cpy) = (px / 2, py / 2);
     let (luma_grid, u_grid, v_grid);
     if skip {
-        y.reconstruct(px, py, 8, mode, reach, &vec![0i32; 64], None, filter_intra);
+        y.reconstruct(
+            px,
+            py,
+            8,
+            mode,
+            angle_delta_y,
+            reach,
+            &vec![0i32; 64],
+            None,
+            filter_intra,
+        );
         let ac = alpha.map(|_| cfl_ac_q3(y, px, py, 8));
         u.reconstruct(
             cpx,
             cpy,
             4,
-            DC_PRED,
+            uv_predict_mode,
+            angle_delta_uv,
             Reach::none(),
             &vec![0i32; 16],
             alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
@@ -1631,7 +1803,8 @@ fn decode_leaf8(
             cpx,
             cpy,
             4,
-            DC_PRED,
+            uv_predict_mode,
+            angle_delta_uv,
             Reach::none(),
             &vec![0i32; 16],
             alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
@@ -1655,6 +1828,7 @@ fn decode_leaf8(
             around[0],
             mode,
             mode,
+            angle_delta_y,
             reach,
             y,
             px,
@@ -1675,7 +1849,8 @@ fn decode_leaf8(
             1,
             around[1],
             mode,
-            DC_PRED,
+            uv_predict_mode,
+            angle_delta_uv,
             Reach::none(),
             u,
             cpx,
@@ -1695,7 +1870,8 @@ fn decode_leaf8(
             2,
             around[2],
             mode,
-            DC_PRED,
+            uv_predict_mode,
+            angle_delta_uv,
             Reach::none(),
             v,
             cpx,
@@ -1735,6 +1911,7 @@ fn decode_leaf8(
                     tu_around,
                     mode,
                     mode,
+                    angle_delta_y,
                     tu_reach,
                     y,
                     tu_px,
@@ -1767,7 +1944,8 @@ fn decode_leaf8(
             1,
             chroma_around[1],
             mode,
-            DC_PRED,
+            uv_predict_mode,
+            angle_delta_uv,
             Reach::none(),
             u,
             cpx,
@@ -1787,7 +1965,8 @@ fn decode_leaf8(
             2,
             chroma_around[2],
             mode,
-            DC_PRED,
+            uv_predict_mode,
+            angle_delta_uv,
             Reach::none(),
             v,
             cpx,
@@ -3353,7 +3532,21 @@ fn read_inter_plane(
         usize::from(around.0) + usize::from(around.1)
     };
     let mut coding = cdfs.txb(set, tx_mode);
-    let (grid, tx_type) = read_coeffs(dec, &mut coding, scan, skip_ctx, dc_sign_ctx(around.2))?;
+    // `av1_get_tx_type` (libaom `blockd.h`): `Intra_Mode_To_Tx_Type` only
+    // ever applies to an intra block's chroma plane -- an `is_inter` block
+    // (this function, [`read_inter_plane`], reads only those) has no
+    // predicted intra mode to index it with, and its `tx_type` (luma or
+    // chroma alike) is `DCT_DCT` whenever the `TxbSet` itself codes no
+    // symbol for it.
+    let default_tx_type = TxType::DctDct;
+    let (grid, tx_type) = read_coeffs(
+        dec,
+        &mut coding,
+        scan,
+        skip_ctx,
+        dc_sign_ctx(around.2),
+        default_tx_type,
+    )?;
     let residual = dequant_and_inverse_typed(&grid, side, 8, i32::from(base_q_idx), tx_type);
     plane.reconstruct_mc(x, y, side, prediction, &residual);
     Ok(grid)
@@ -3685,6 +3878,7 @@ fn decode_inter_block(
                 py,
                 side,
                 mode,
+                0,
                 reach,
                 &vec![0i32; side * side],
                 None,
@@ -3696,6 +3890,7 @@ fn decode_inter_block(
                 cpy,
                 chroma_side,
                 DC_PRED,
+                0,
                 Reach::none(),
                 &vec![0i32; chroma_side * chroma_side],
                 alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
@@ -3706,6 +3901,7 @@ fn decode_inter_block(
                 cpy,
                 chroma_side,
                 DC_PRED,
+                0,
                 Reach::none(),
                 &vec![0i32; chroma_side * chroma_side],
                 alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
@@ -3725,6 +3921,7 @@ fn decode_inter_block(
                 around[0],
                 mode,
                 mode,
+                0,
                 reach,
                 y,
                 px,
@@ -3746,6 +3943,7 @@ fn decode_inter_block(
                 around[1],
                 mode,
                 DC_PRED,
+                0,
                 Reach::none(),
                 u,
                 cpx,
@@ -3766,6 +3964,7 @@ fn decode_inter_block(
                 around[2],
                 mode,
                 DC_PRED,
+                0,
                 Reach::none(),
                 v,
                 cpx,
@@ -4084,6 +4283,7 @@ fn decode_inter_block8(
                 py,
                 SIDE,
                 mode,
+                0,
                 reach,
                 &vec![0i32; SIDE * SIDE],
                 None,
@@ -4094,6 +4294,7 @@ fn decode_inter_block8(
                 cpy,
                 CHROMA_SIDE,
                 DC_PRED,
+                0,
                 Reach::none(),
                 &vec![0i32; CHROMA_SIDE * CHROMA_SIDE],
                 None,
@@ -4104,6 +4305,7 @@ fn decode_inter_block8(
                 cpy,
                 CHROMA_SIDE,
                 DC_PRED,
+                0,
                 Reach::none(),
                 &vec![0i32; CHROMA_SIDE * CHROMA_SIDE],
                 None,
@@ -4123,6 +4325,7 @@ fn decode_inter_block8(
                 around[0],
                 mode,
                 mode,
+                0,
                 reach,
                 y,
                 px,
@@ -4143,6 +4346,7 @@ fn decode_inter_block8(
                 around[1],
                 mode,
                 DC_PRED,
+                0,
                 Reach::none(),
                 u,
                 cpx,
@@ -4163,6 +4367,7 @@ fn decode_inter_block8(
                 around[2],
                 mode,
                 DC_PRED,
+                0,
                 Reach::none(),
                 v,
                 cpx,

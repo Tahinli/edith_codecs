@@ -124,6 +124,10 @@ fn dr_intra_derivative(angle: u16) -> i32 {
 /// `Mode_To_Angle` (spec 9.3), zero for the modes that have no angle.
 const MODE_TO_ANGLE: [u16; 13] = [0, 90, 180, 45, 135, 113, 157, 203, 67, 0, 0, 0, 0];
 
+/// `ANGLE_STEP` (spec 9.3): degrees per unit of `angle_delta`, whose own
+/// range is `-MAX_ANGLE_DELTA..=MAX_ANGLE_DELTA` (`MAX_ANGLE_DELTA == 3`).
+const ANGLE_STEP: i32 = 3;
+
 /// The edges a block predicts from, as the decoder builds them (spec 7.11.2.2):
 /// a side that does not exist is filled from the side that does, a side that
 /// runs out is extended by repeating its last sample, and the corner falls back
@@ -195,11 +199,18 @@ impl Edges {
 /// the edge is extended by repetition where it does not, which is what the
 /// decoder's own clamp to `aboveLimit` and `leftLimit` comes to.
 ///
+/// `angle_delta` (spec `AngleDeltaY`/`AngleDeltaUV`, `-MAX_ANGLE_DELTA` to
+/// `MAX_ANGLE_DELTA`) steers every one of `V_PRED`, `H_PRED` and the six
+/// diagonal modes off their base angle by `ANGLE_STEP` degrees per unit (spec
+/// 7.11.2.1's `pAngle = Mode_To_Angle[mode] + angleDelta * ANGLE_STEP`);
+/// ignored (must be `0`) for the seven modes that carry no angle at all.
+///
 /// # Panics
 /// Panics on a mode this module does not predict, or when `dst` is not
 /// `side * side` long.
 pub fn predict(
     mode: u8,
+    angle_delta: i32,
     above: Option<&[u8]>,
     left: Option<&[u8]>,
     corner: Option<u8>,
@@ -208,13 +219,21 @@ pub fn predict(
 ) {
     assert_eq!(dst.len(), side * side, "the destination is the block");
     let edges = Edges::build(above, left, corner, side);
-    let angle = MODE_TO_ANGLE[usize::from(mode)];
-    if matches!(
+    let is_directional = matches!(
         mode,
-        D45_PRED | D67_PRED | D113_PRED | D135_PRED | D157_PRED | D203_PRED
-    ) {
-        directional(angle, &edges, side, dst);
-        return;
+        V_PRED | H_PRED | D45_PRED | D67_PRED | D113_PRED | D135_PRED | D157_PRED | D203_PRED
+    );
+    if is_directional {
+        let angle = i32::from(MODE_TO_ANGLE[usize::from(mode)]) + angle_delta * ANGLE_STEP;
+        // `pAngle == 90`/`180` is `V_PRED`/`H_PRED` at zero delta: a plain
+        // edge copy, no walk -- and the only two angles `dr_intra_derivative`
+        // has no table entry for, since libaom special-cases them the same
+        // way (`av1_is_directional_mode`'s callers never call the z1/z2/z3
+        // walk there either).
+        if angle != 90 && angle != 180 {
+            directional(angle as u16, &edges, side, dst);
+            return;
+        }
     }
     let weights = &SM_WEIGHTS[side..side * 2];
     for row in 0..side {
