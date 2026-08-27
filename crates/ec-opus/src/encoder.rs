@@ -680,6 +680,7 @@ impl Encoder {
             48000 => Bandwidth::Full,
             24000 => Bandwidth::SuperWide,
             16000 => Bandwidth::Wide,
+            12000 => Bandwidth::Medium,
             _ => Bandwidth::Narrow,
         };
         BWS[idx].min(ceiling)
