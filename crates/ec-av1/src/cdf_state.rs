@@ -194,14 +194,14 @@ pub(crate) struct MvComponentCdfs {
     pub class0_bit: [u16; 3],
     /// The fractional part of a small-class magnitude, by its integer bit.
     pub class0_fr: [[u16; 5]; 2],
-    /// The half-pel bit of a small-class magnitude.
-    pub class0_hp: [u16; 3],
+    // `class0_hp`/`hp` (spec's half-pel-bit CDFs) are never written: this
+    // encoder always sets `allow_high_precision_mv = false`, so the syntax
+    // that reads them (spec 5.9.32 `mv_class0_hp`/`mv_hp`) never fires --
+    // dropped rather than kept dead. Add back if/when hp mode ships.
     /// One bit of an above-small-class magnitude, by its position.
     pub bit: [[u16; 3]; 10],
     /// The fractional part of an above-small-class magnitude.
     pub fr: [u16; 5],
-    /// The half-pel bit of an above-small-class magnitude.
-    pub hp: [u16; 3],
     /// The component's sign.
     pub sign: [u16; 3],
 }
@@ -212,10 +212,8 @@ impl MvComponentCdfs {
             class: cdf::MV_CLASS,
             class0_bit: cdf::MV_CLASS0_BIT,
             class0_fr: cdf::MV_CLASS0_FR,
-            class0_hp: cdf::MV_CLASS0_HP,
             bit: cdf::MV_BIT,
             fr: cdf::MV_FR,
-            hp: cdf::MV_HP,
             sign: cdf::MV_SIGN,
         }
     }
