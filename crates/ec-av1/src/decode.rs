@@ -3669,15 +3669,26 @@ fn decode_inter_block(
         let not_new = dec.symbol(&mut cdfs.new_mv[stack.new_mv_ctx]) == 1;
         let mut is_globalmv = false;
         let (mv, is_new_mv) = if !not_new {
-            if stack.entries.len() > 1 {
-                dec.symbol(&mut cdfs.drl_mode[stack.drl_ctx[0]]);
+            // NEWMV (spec 5.11.24's `read_drl_idx`, `RefMvIdx` starting at 0):
+            // read at most two `drl_mode` bits, one per stack entry past the
+            // first, stopping at the first `0`. The chosen index selects
+            // which stack entry `read_mv`'s base predictor comes from
+            // (spec 7.10.2.10 `assign_mv`'s `PredMv = RefStackMv[RefMvIdx]`)
+            // -- entry 0 (`stack.pred_mv`) only when the loop never advances.
+            let mut idx = 0usize;
+            while idx < 2 && stack.entries.len() > idx + 1 {
+                if dec.symbol(&mut cdfs.drl_mode[stack.drl_ctx[idx]]) == 0 {
+                    break;
+                }
+                idx += 1;
             }
+            let base_mv = stack.entries.get(idx).map_or(stack.pred_mv, |e| e.mv);
             (
                 read_mv(
                     dec,
                     &mut cdfs.mv_comp,
                     &mut cdfs.mv_joint,
-                    stack.pred_mv,
+                    base_mv,
                     allow_high_precision_mv,
                 ),
                 true,
@@ -4111,15 +4122,26 @@ fn decode_inter_block8(
 
         let not_new = dec.symbol(&mut cdfs.new_mv[stack.new_mv_ctx]) == 1;
         let (mv, is_new_mv) = if !not_new {
-            if stack.entries.len() > 1 {
-                dec.symbol(&mut cdfs.drl_mode[stack.drl_ctx[0]]);
+            // NEWMV (spec 5.11.24's `read_drl_idx`, `RefMvIdx` starting at 0):
+            // read at most two `drl_mode` bits, one per stack entry past the
+            // first, stopping at the first `0`. The chosen index selects
+            // which stack entry `read_mv`'s base predictor comes from
+            // (spec 7.10.2.10 `assign_mv`'s `PredMv = RefStackMv[RefMvIdx]`)
+            // -- entry 0 (`stack.pred_mv`) only when the loop never advances.
+            let mut idx = 0usize;
+            while idx < 2 && stack.entries.len() > idx + 1 {
+                if dec.symbol(&mut cdfs.drl_mode[stack.drl_ctx[idx]]) == 0 {
+                    break;
+                }
+                idx += 1;
             }
+            let base_mv = stack.entries.get(idx).map_or(stack.pred_mv, |e| e.mv);
             (
                 read_mv(
                     dec,
                     &mut cdfs.mv_comp,
                     &mut cdfs.mv_joint,
-                    stack.pred_mv,
+                    base_mv,
                     allow_high_precision_mv,
                 ),
                 true,
