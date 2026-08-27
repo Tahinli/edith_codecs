@@ -2117,6 +2117,7 @@ pub fn sb_coeff_inter_frame_tile(
                             ref_frame: LAST_FRAME,
                             mv,
                             is_new_mv,
+                            size: 8,
                         },
                     );
                     for dr in 0..8 {
@@ -2132,6 +2133,7 @@ pub fn sb_coeff_inter_frame_tile(
                                     ref_frame: LAST_FRAME,
                                     mv,
                                     is_new_mv,
+                                    size: 8,
                                 },
                             );
                         }
@@ -2145,6 +2147,24 @@ pub fn sb_coeff_inter_frame_tile(
                     }
                     enc.symbol(DC_PRED, &mut cdfs.uv_mode_cfl[mode]);
                     mode_for_tx = mode;
+                    // Intra: no vote, but still a coded cell -- mvstack's
+                    // extended-scan coverage must see it (module doc).
+                    let (mi_row, mi_col) = (r32 as usize * 8, c32 as usize * 8);
+                    for dr in 0..8 {
+                        for dc in 0..8 {
+                            grid.set(
+                                mi_row + dr,
+                                mi_col + dc,
+                                MiInfo {
+                                    is_inter: false,
+                                    ref_frame: -1,
+                                    mv: (0, 0),
+                                    is_new_mv: false,
+                                    size: 8,
+                                },
+                            );
+                        }
+                    }
                 }
 
                 if block.skip {
@@ -2278,6 +2298,7 @@ fn write_inter_frame_leaf(
                         ref_frame: LAST_FRAME,
                         mv,
                         is_new_mv,
+                        size: SUB_MI as usize,
                     },
                 );
             }
@@ -2291,6 +2312,24 @@ fn write_inter_frame_leaf(
         }
         enc.symbol(DC_PRED, &mut cdfs.uv_mode_cfl[mode]);
         mode_for_tx = mode;
+        // Intra: no vote, but still a coded cell -- mvstack's extended-scan
+        // coverage must see it (module doc).
+        let (mi_row, mi_col) = (r * SUB_MI as usize, c * SUB_MI as usize);
+        for dr in 0..SUB_MI as usize {
+            for dc in 0..SUB_MI as usize {
+                grid.set(
+                    mi_row + dr,
+                    mi_col + dc,
+                    MiInfo {
+                        is_inter: false,
+                        ref_frame: -1,
+                        mv: (0, 0),
+                        is_new_mv: false,
+                        size: SUB_MI as usize,
+                    },
+                );
+            }
+        }
     }
 
     if block.skip {
@@ -4538,6 +4577,7 @@ mod tests {
                                 ref_frame: 1,
                                 mv,
                                 is_new_mv,
+                                size: 8,
                             },
                         );
                     }
