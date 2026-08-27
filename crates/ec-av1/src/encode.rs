@@ -3459,6 +3459,9 @@ mod tests {
             .collect();
         let encoded = encode_sequence(&pictures, 100, 0.5).unwrap();
         assert_eq!(encoded.frames.len(), 4);
+        if let Ok(path) = std::env::var("EC_AV1_DUMP") {
+            std::fs::write(&path, &encoded.stream).expect("dump the raw stream");
+        }
         let decoded = ffmpeg_decode_sequence(&encoded.stream, width, height, 4);
         assert_eq!(decoded.len(), 4, "decoded frame count");
         for (i, (frame, decoded)) in encoded.frames.iter().zip(&decoded).enumerate() {
