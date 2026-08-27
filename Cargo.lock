@@ -329,6 +329,7 @@ version = "0.1.0"
 dependencies = [
  "ec-core",
  "ec-h265-syntax",
+ "wide",
 ]
 
 [[package]]
