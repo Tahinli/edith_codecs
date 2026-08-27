@@ -403,9 +403,148 @@ impl CabacEncoder {
     }
 }
 
+/// The CABAC decoding engine (9.3.4.3.2), the mirror image of
+/// [`CabacEncoder`]: same context tables, same `RANGE_TAB_LPS` /
+/// `TRANS_IDX_LPS` / `TRANS_IDX_MPS`, so a context updates identically on
+/// both sides and a decoded bin is exactly the bin the encoder wrote.
+///
+/// Reads bits MSB-first from `data` starting at bit 0; a read past the end of
+/// `data` returns zero, the standard convention for the handful of bits a
+/// CABAC engine may read past a substream's real end while renormalising
+/// around its final terminating bin.
+pub struct CabacDecoder<'a> {
+    data: &'a [u8],
+    bit: usize,
+    range: u32,
+    offset: u32,
+    /// Context variables, public for the same reason [`CabacEncoder::contexts`] is.
+    pub contexts: Contexts,
+}
+
+impl<'a> CabacDecoder<'a> {
+    /// A fresh engine reading `data` from its first bit (9.3.2.5 init).
+    pub fn new(data: &'a [u8], contexts: Contexts) -> CabacDecoder<'a> {
+        let mut d = CabacDecoder {
+            data,
+            bit: 0,
+            range: 510,
+            offset: 0,
+            contexts,
+        };
+        for _ in 0..9 {
+            d.offset = (d.offset << 1) | d.read_bit();
+        }
+        d
+    }
+
+    fn read_bit(&mut self) -> u32 {
+        let byte = self.data.get(self.bit / 8).copied().unwrap_or(0);
+        let bit = u32::from((byte >> (7 - (self.bit % 8))) & 1);
+        self.bit += 1;
+        bit
+    }
+
+    /// Decode one context-coded bin (9.3.4.3.2.2).
+    pub fn decode_bin(&mut self, ctx_idx: usize) -> u32 {
+        let state = self.contexts.state[ctx_idx];
+        let p_state = (state >> 1) as usize;
+        let val_mps = u32::from(state & 1);
+        let q = ((self.range >> 6) & 3) as usize;
+        let lps = u32::from(RANGE_TAB_LPS[p_state][q]);
+        self.range -= lps;
+        let bin;
+        if self.offset >= self.range {
+            bin = 1 - val_mps;
+            self.offset -= self.range;
+            self.range = lps;
+            let new_mps = if p_state == 0 { 1 - val_mps } else { val_mps };
+            self.contexts.state[ctx_idx] = (TRANS_IDX_LPS[p_state] << 1) | new_mps as u8;
+        } else {
+            bin = val_mps;
+            self.contexts.state[ctx_idx] = (TRANS_IDX_MPS[p_state] << 1) | val_mps as u8;
+        }
+        while self.range < 256 {
+            self.range <<= 1;
+            self.offset = (self.offset << 1) | self.read_bit();
+        }
+        bin
+    }
+
+    /// Decode one bypass bin (9.3.4.3.4).
+    pub fn decode_bypass(&mut self) -> u32 {
+        self.offset = (self.offset << 1) | self.read_bit();
+        if self.offset >= self.range {
+            self.offset -= self.range;
+            1
+        } else {
+            0
+        }
+    }
+
+    /// Decode `count` bypass bins into one value, most significant first.
+    pub fn decode_bypass_bits(&mut self, count: u32) -> u32 {
+        let mut v = 0;
+        for _ in 0..count {
+            v = (v << 1) | self.decode_bypass();
+        }
+        v
+    }
+
+    /// Decode a terminating bin: `end_of_slice_segment_flag` or
+    /// `end_of_subset_one_bit` (9.3.4.3.5).
+    pub fn decode_terminate(&mut self) -> u32 {
+        self.range -= 2;
+        if self.offset >= self.range {
+            1
+        } else {
+            while self.range < 256 {
+                self.range <<= 1;
+                self.offset = (self.offset << 1) | self.read_bit();
+            }
+            0
+        }
+    }
+
+    /// Byte offset, from the start of `data`, of the substream after a
+    /// `decode_terminate() == 1`: the encoder's flush always pads to a byte
+    /// boundary here, so the next WPP row's substream starts exactly there.
+    pub fn byte_position_aligned(&self) -> usize {
+        self.bit.div_ceil(8)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decoder_inverts_the_encoder_bin_by_bin() {
+        // Every context-coded and bypass bin the encoder can write, decoded
+        // back through the same context table, must reproduce the exact
+        // sequence: this is what makes a CABAC decoder a mirror rather than a
+        // second implementation that might disagree with the first.
+        let bins: Vec<(usize, u32)> = (0..NUM_CONTEXTS)
+            .flat_map(|ctx| [(ctx, 0u32), (ctx, 1), (ctx, 0), (ctx, 1), (ctx, 1)])
+            .collect();
+        let mut enc = CabacEncoder::new(Contexts::new(27));
+        for &(ctx, bin) in &bins {
+            enc.encode_bin(ctx, bin);
+        }
+        for i in 0..37u32 {
+            enc.encode_bypass(i & 1);
+        }
+        enc.encode_terminate(1);
+        let bytes = enc.finish();
+
+        let mut dec = CabacDecoder::new(&bytes, Contexts::new(27));
+        for &(ctx, bin) in &bins {
+            assert_eq!(dec.decode_bin(ctx), bin);
+        }
+        for i in 0..37u32 {
+            assert_eq!(dec.decode_bypass(), i & 1);
+        }
+        assert_eq!(dec.decode_terminate(), 1);
+    }
 
     #[test]
     fn context_init_matches_the_worked_formula() {
@@ -462,87 +601,6 @@ mod tests {
         assert_eq!(writer.contexts, counter.contexts);
     }
 
-    /// The decoding engine of 9.3.4.3, written from the normative flowcharts,
-    /// as an oracle for the encoder above.
-    struct RefDecoder<'a> {
-        data: &'a [u8],
-        bit: usize,
-        range: u32,
-        offset: u32,
-        contexts: Contexts,
-    }
-
-    impl<'a> RefDecoder<'a> {
-        fn new(data: &'a [u8], contexts: Contexts) -> RefDecoder<'a> {
-            let mut d = RefDecoder {
-                data,
-                bit: 0,
-                range: 510,
-                offset: 0,
-                contexts,
-            };
-            for _ in 0..9 {
-                d.offset = (d.offset << 1) | d.read_bit();
-            }
-            d
-        }
-
-        fn read_bit(&mut self) -> u32 {
-            let byte = self.data.get(self.bit / 8).copied().unwrap_or(0);
-            let bit = u32::from((byte >> (7 - (self.bit % 8))) & 1);
-            self.bit += 1;
-            bit
-        }
-
-        fn decode_bin(&mut self, ctx_idx: usize) -> u32 {
-            let state = self.contexts.state[ctx_idx];
-            let p_state = (state >> 1) as usize;
-            let val_mps = u32::from(state & 1);
-            let q = ((self.range >> 6) & 3) as usize;
-            let lps = u32::from(RANGE_TAB_LPS[p_state][q]);
-            self.range -= lps;
-            let bin;
-            if self.offset >= self.range {
-                bin = 1 - val_mps;
-                self.offset -= self.range;
-                self.range = lps;
-                let new_mps = if p_state == 0 { 1 - val_mps } else { val_mps };
-                self.contexts.state[ctx_idx] = (TRANS_IDX_LPS[p_state] << 1) | new_mps as u8;
-            } else {
-                bin = val_mps;
-                self.contexts.state[ctx_idx] = (TRANS_IDX_MPS[p_state] << 1) | val_mps as u8;
-            }
-            while self.range < 256 {
-                self.range <<= 1;
-                self.offset = (self.offset << 1) | self.read_bit();
-            }
-            bin
-        }
-
-        fn decode_bypass(&mut self) -> u32 {
-            self.offset = (self.offset << 1) | self.read_bit();
-            if self.offset >= self.range {
-                self.offset -= self.range;
-                1
-            } else {
-                0
-            }
-        }
-
-        fn decode_terminate(&mut self) -> u32 {
-            self.range -= 2;
-            if self.offset >= self.range {
-                1
-            } else {
-                while self.range < 256 {
-                    self.range <<= 1;
-                    self.offset = (self.offset << 1) | self.read_bit();
-                }
-                0
-            }
-        }
-    }
-
     #[test]
     fn the_spec_decoder_reads_back_what_the_encoder_wrote() {
         // A long mixed sequence: context bins across many contexts, bypass bins,
@@ -572,7 +630,7 @@ mod tests {
         enc.encode_terminate(1);
         let bytes = enc.finish();
 
-        let mut dec = RefDecoder::new(&bytes, Contexts::new(32));
+        let mut dec = CabacDecoder::new(&bytes, Contexts::new(32));
         for (i, &(ctx_idx, bin, kind)) in plan.iter().enumerate() {
             let got = if kind == 0 {
                 dec.decode_bin(ctx_idx)
