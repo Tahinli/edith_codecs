@@ -627,23 +627,49 @@ fn asc_matches_the_one_ffmpeg_writes() {
 /// The DecoderSpecificInfo payload of the first `esds` box: tag 0x05 inside the
 /// DecoderConfigDescriptor, with the usual 7-bit length encoding.
 fn esds_asc(mp4: &[u8]) -> Option<Vec<u8>> {
+    // Walks the MPEG-4 descriptor tree (tag, BER length, payload) rather than
+    // scanning raw bytes for 0x05: a scalar field elsewhere in the tree
+    // (e.g. avgBitrate) can legitimately contain that byte value, which a
+    // blind byte scan would mistake for the DecSpecificInfoTag.
     let at = mp4.windows(4).position(|w| w == b"esds")?;
-    let mut i = at + 4;
+    let mut i = at + 4 + 4; // "esds" tag, then the box's version+flags
     while i < mp4.len() {
-        if mp4[i] == 0x05 {
-            let mut j = i + 1;
-            let mut len = 0usize;
-            loop {
-                let b = *mp4.get(j)?;
-                len = (len << 7) | usize::from(b & 0x7F);
-                j += 1;
-                if b & 0x80 == 0 {
-                    break;
+        let tag = mp4[i];
+        i += 1;
+        let mut len = 0usize;
+        loop {
+            let b = *mp4.get(i)?;
+            i += 1;
+            len = (len << 7) | usize::from(b & 0x7F);
+            if b & 0x80 == 0 {
+                break;
+            }
+        }
+        match tag {
+            0x05 => return mp4.get(i..i + len).map(<[u8]>::to_vec),
+            // ES_DescrTag: ES_ID(2) + flags(1), then optional fields the
+            // flags select, before its nested descriptors.
+            0x03 => {
+                let flags = *mp4.get(i + 2)?;
+                i += 3;
+                if flags & 0x80 != 0 {
+                    i += 2; // dependsOn ES_ID
+                }
+                if flags & 0x40 != 0 {
+                    let url_len = usize::from(*mp4.get(i)?);
+                    i += 1 + url_len;
+                }
+                if flags & 0x20 != 0 {
+                    i += 2; // OCR ES_ID
                 }
             }
-            return mp4.get(j..j + len).map(<[u8]>::to_vec);
+            // DecoderConfigDescrTag: objectType(1) + streamType/flags(1) +
+            // bufferSizeDB(3) + maxBitrate(4) + avgBitrate(4), then its
+            // nested DecSpecificInfo.
+            0x04 => i += 13,
+            // An opaque leaf descriptor: its whole payload is `len` bytes.
+            _ => i += len,
         }
-        i += 1;
     }
     None
 }
