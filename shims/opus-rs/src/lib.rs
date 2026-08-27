@@ -374,15 +374,19 @@ mod tests {
     }
 
     /// Input below 48 kHz, which the shim used to refuse outright, and the
-    /// `look_ahead` that goes with it (120 samples at 48 kHz, scaled).
+    /// `look_ahead` that goes with it. 48/24 kHz VoIP at 32 kbps run
+    /// hybrid (SWB/FB), so the delay is CELT's 120-sample overlap, scaled;
+    /// 16 kHz and below cap the bandwidth at WB or narrower, where hybrid
+    /// does not exist, so dispatch takes SILK and the delay is the SILK
+    /// resampler look-ahead (WB 50 / MB 54 / NB 58 at 48 kHz), scaled.
     #[test]
     fn slower_input_rates_encode_and_report_their_own_delay() {
         for &(rate, frame, look) in &[
             (48_000i32, 960usize, 120usize),
             (24_000, 480, 60),
-            (16_000, 320, 40),
-            (12_000, 240, 30),
-            (8_000, 160, 20),
+            (16_000, 320, 50 / 3),
+            (12_000, 240, 54 / 4),
+            (8_000, 160, 58 / 6),
         ] {
             let mut enc = OpusEncoder::new(rate, 1, Application::Voip).unwrap();
             enc.bitrate_bps = 32_000;
