@@ -164,8 +164,16 @@ pub fn predict(
         return;
     }
 
-    let h_filter = if block_w <= 4 { &SUBPEL_FILTERS_4[xfrac] } else { &SUBPEL_FILTERS[xfrac] };
-    let v_filter = if block_h <= 4 { &SUBPEL_FILTERS_4[yfrac] } else { &SUBPEL_FILTERS[yfrac] };
+    let h_filter = if block_w <= 4 {
+        &SUBPEL_FILTERS_4[xfrac]
+    } else {
+        &SUBPEL_FILTERS[xfrac]
+    };
+    let v_filter = if block_h <= 4 {
+        &SUBPEL_FILTERS_4[yfrac]
+    } else {
+        &SUBPEL_FILTERS[yfrac]
+    };
 
     // The vertical pass reads 3 rows above and 4 below the block, so the
     // horizontal pass must produce that many extra intermediate rows.

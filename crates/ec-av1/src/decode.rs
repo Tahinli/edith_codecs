@@ -38,6 +38,18 @@ const PARTITION_NONE: usize = 0;
 const PARTITION_SPLIT: usize = 3;
 const SB_MI: u32 = 16;
 const BLOCK_MI: u32 = 8;
+
+/// How many `use_filter_intra` symbols this decoder has read as `1`, across
+/// every call in the process -- the cheap counter [`filter_intra_hits`] gate
+/// tests read (before/after, not the absolute value) to prove a stream
+/// actually exercised the filter-intra predictor rather than silently
+/// skipping it.
+static FILTER_INTRA_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Current value of [`FILTER_INTRA_HITS`].
+pub(crate) fn filter_intra_hits() -> usize {
+    FILTER_INTRA_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
 const SUB_MI: u32 = 4;
 const MI: usize = 4;
 const SB: usize = 64;
@@ -682,6 +694,7 @@ fn read_intra_mode(
             );
         }
         if use_filter_intra {
+            FILTER_INTRA_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let fi_mode = dec.symbol(&mut cdfs.filter_intra_mode);
             if trace {
                 eprintln!("TRACE filter_intra_mode value={fi_mode}");
@@ -921,7 +934,16 @@ fn read_plane(
             &residual[..4.min(residual.len())]
         );
     }
-    plane.reconstruct(x, y, side, predict_mode, reach, &residual, cfl, filter_intra);
+    plane.reconstruct(
+        x,
+        y,
+        side,
+        predict_mode,
+        reach,
+        &residual,
+        cfl,
+        filter_intra,
+    );
     Ok(if tx_side == side {
         residual_grid_placeholder(&levels, side)
     } else {
@@ -1014,8 +1036,23 @@ fn decode_block(
     } else {
         let around = neighbours.around(at, side);
         luma_grid = read_plane(
-            dec, cdfs, luma_set, scans.0, 0, around[0], mode, mode, reach, y, px, py, side,
-            luma_tx, base_q_idx, None, filter_intra,
+            dec,
+            cdfs,
+            luma_set,
+            scans.0,
+            0,
+            around[0],
+            mode,
+            mode,
+            reach,
+            y,
+            px,
+            py,
+            side,
+            luma_tx,
+            base_q_idx,
+            None,
+            filter_intra,
         )?;
         let ac = alpha.map(|_| cfl_ac_q3(y, px, py, side));
         u_grid = read_plane(
