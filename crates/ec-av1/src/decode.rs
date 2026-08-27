@@ -2509,20 +2509,38 @@ fn mv_class_base(class: usize) -> i32 {
 /// One motion vector component's non-zero diff (spec 5.11.32
 /// `read_mv_component`), the inverse of [`crate::tile`]'s private
 /// `write_mv_component`.
-fn read_mv_component(dec: &mut SymbolDecoder, c: &mut MvComponentCdfs) -> i32 {
+fn read_mv_component(
+    dec: &mut SymbolDecoder,
+    c: &mut MvComponentCdfs,
+    allow_high_precision_mv: bool,
+) -> i32 {
     let sign = dec.symbol(&mut c.sign);
     let class = dec.symbol(&mut c.class);
     let local = if class == 0 {
         let bit = dec.symbol(&mut c.class0_bit);
         let fr = dec.symbol(&mut c.class0_fr[bit]);
-        (bit << 3) | (fr << 1) | 1
+        // spec 5.11.32 `mv_class0_hp`: read only when the frame allows
+        // high-precision motion vectors, else implicitly 1 (the low bit
+        // stays at half-pel precision) -- this crate's own writer always
+        // leaves the flag off, but a foreign stream can set it per frame.
+        let hp = if allow_high_precision_mv {
+            dec.symbol(&mut c.class0_hp)
+        } else {
+            1
+        };
+        (bit << 3) | (fr << 1) | hp
     } else {
         let mut d = 0;
         for i in 0..class {
             d |= dec.symbol(&mut c.bit[i]) << i;
         }
         let fr = dec.symbol(&mut c.fr);
-        (d << 3) | (fr << 1) | 1
+        let hp = if allow_high_precision_mv {
+            dec.symbol(&mut c.hp)
+        } else {
+            1
+        };
+        (d << 3) | (fr << 1) | hp
     };
     let mag = mv_class_base(class) + local as i32 + 1;
     if sign == 1 { -mag } else { mag }
@@ -2535,14 +2553,15 @@ fn read_mv(
     mv_comp: &mut [MvComponentCdfs; 2],
     mv_joint: &mut [u16; 5],
     pred: (i32, i32),
+    allow_high_precision_mv: bool,
 ) -> (i32, i32) {
     let joint = dec.symbol(mv_joint);
     let mut diff = (0, 0);
     if joint == 2 || joint == 3 {
-        diff.0 = read_mv_component(dec, &mut mv_comp[0]);
+        diff.0 = read_mv_component(dec, &mut mv_comp[0], allow_high_precision_mv);
     }
     if joint == 1 || joint == 3 {
-        diff.1 = read_mv_component(dec, &mut mv_comp[1]);
+        diff.1 = read_mv_component(dec, &mut mv_comp[1], allow_high_precision_mv);
     }
     (pred.0 + diff.0, pred.1 + diff.1)
 }
@@ -2650,6 +2669,7 @@ fn decode_inter_block(
     scan_luma: &[u16],
     scan_chroma: &[u16],
     size_group: usize,
+    allow_high_precision_mv: bool,
 ) -> Result<()> {
     const LAST_FRAME: i8 = 1;
 
@@ -2698,7 +2718,13 @@ fn decode_inter_block(
                 dec.symbol(&mut cdfs.drl_mode[stack.drl_ctx[0]]);
             }
             (
-                read_mv(dec, &mut cdfs.mv_comp, &mut cdfs.mv_joint, stack.pred_mv),
+                read_mv(
+                    dec,
+                    &mut cdfs.mv_comp,
+                    &mut cdfs.mv_joint,
+                    stack.pred_mv,
+                    allow_high_precision_mv,
+                ),
                 true,
             )
         } else {
@@ -3044,6 +3070,7 @@ fn decode_inter_block8(
     scan8: &[u16],
     scan4: &[u16],
     prev_leaf: Option<((usize, usize), bool, bool)>,
+    allow_high_precision_mv: bool,
 ) -> Result<(bool, bool)> {
     const LAST_FRAME: i8 = 1;
     /// `Y_MODE`'s size group (`common_data.h`'s `size_group_lookup[BLOCK_8X8]`).
@@ -3106,7 +3133,13 @@ fn decode_inter_block8(
                 dec.symbol(&mut cdfs.drl_mode[stack.drl_ctx[0]]);
             }
             (
-                read_mv(dec, &mut cdfs.mv_comp, &mut cdfs.mv_joint, stack.pred_mv),
+                read_mv(
+                    dec,
+                    &mut cdfs.mv_comp,
+                    &mut cdfs.mv_joint,
+                    stack.pred_mv,
+                    allow_high_precision_mv,
+                ),
                 true,
             )
         } else {
@@ -3413,6 +3446,7 @@ pub fn decode_inter_frame_tile(
     reference: &Picture,
     cdef: &CdefParams,
     loop_filter: &LoopFilterParams,
+    allow_high_precision_mv: bool,
 ) -> Result<Picture> {
     decode_inter_frame_tile_with_cdfs(
         data,
@@ -3425,6 +3459,7 @@ pub fn decode_inter_frame_tile(
         cdef,
         loop_filter,
         None,
+        allow_high_precision_mv,
     )
     .map(|(picture, _)| picture)
 }
@@ -3445,6 +3480,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     cdef: &CdefParams,
     loop_filter: &LoopFilterParams,
     initial_cdfs: Option<Cdfs>,
+    allow_high_precision_mv: bool,
 ) -> Result<(Picture, Cdfs)> {
     if mi_cols == 0 || mi_rows == 0 {
         return Err(unsupported("a frame with no mode-info grid"));
@@ -3591,6 +3627,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &scan32,
                             &scan16,
                             3,
+                            allow_high_precision_mv,
                         )?;
                     }
                     PARTITION_SPLIT => {
@@ -3643,6 +3680,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     &scan16,
                                     &scan8,
                                     2,
+                                    allow_high_precision_mv,
                                 )?;
                             } else {
                                 let ctx16 = neighbours.partition_ctx(at16, SUB);
@@ -3691,6 +3729,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                         &scan8,
                                         &scan4,
                                         prev_leaf,
+                                        allow_high_precision_mv,
                                     )?;
                                     prev_leaf = Some((leaf_mi, skip, is_inter));
                                 }
@@ -4170,6 +4209,7 @@ mod tests {
                 &reference,
                 &CdefParams::default(),
                 &LoopFilterParams::default(),
+                false,
             )
             .unwrap();
             assert_eq!(
@@ -4343,6 +4383,7 @@ mod tests {
             &[],
             &[],
             0,
+            false,
         )
         .unwrap();
 
@@ -4430,6 +4471,7 @@ mod tests {
                 &reference,
                 &CdefParams::default(),
                 &LoopFilterParams::default(),
+                false,
             )
             .unwrap();
             assert_eq!(decoded.y, ffmpeg_frames[i].y, "frame {i} luma vs ffmpeg");
