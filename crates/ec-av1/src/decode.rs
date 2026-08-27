@@ -658,6 +658,69 @@ impl Neighbours {
             });
         }
     }
+
+    /// [`Self::record_mi`]'s plane-0 half only, for one luma transform unit
+    /// inside a coded block whose luma transform is smaller than its own
+    /// side (`TxMode::Select`): the real per-transform-unit coefficient
+    /// context (spec `AboveLevelContext`/`LeftLevelContext`), unlike the
+    /// coarse per-block `tx_grid`/`fill_lf_grid` state
+    /// [`Self::record_split_luma`] still writes once for the whole block.
+    /// Leaves `above_side_mi`/`left_side_mi` and the chroma planes alone --
+    /// the caller's own [`Self::record_split_luma`] call sets those once,
+    /// at the block's own true side, not this TU's.
+    fn record_mi_luma(&mut self, (mi_r, mi_c): (usize, usize), tx_px: usize, grid: &[i32]) {
+        let state = neighbour_state(grid);
+        let side_mi = tx_px / MI;
+        for cell in 0..side_mi {
+            if mi_r + cell < self.mi_rows {
+                self.left[mi_r + cell][0] = state;
+            }
+            if mi_c + cell < self.mi_cols {
+                self.above[mi_c + cell][0] = state;
+            }
+        }
+    }
+
+    /// [`Self::record`]'s mode/side and chroma-context bookkeeping, for a
+    /// block whose luma was decoded as several transform units through
+    /// [`Self::record_mi_luma`] rather than [`Self::record`]'s own single
+    /// whole-block luma write -- everything [`Self::record`] does except
+    /// plane 0, which is already correct per-TU by the time this runs.
+    fn record_split_luma(
+        &mut self,
+        at: (usize, usize),
+        side: usize,
+        mode: usize,
+        chroma_grids: [&[i32]; 2],
+    ) {
+        let (r, c) = at;
+        for cell in 0..side / SUB {
+            self.above_mode[c + cell] = mode;
+            self.left_mode[r + cell] = mode;
+            self.above_side[c + cell] = side;
+            self.left_side[r + cell] = side;
+        }
+        let (mi_r, mi_c) = (r * (SUB / MI), c * (SUB / MI));
+        let side_mi = side / MI;
+        for cell in 0..side_mi {
+            self.left_side_mi[mi_r + cell] = side;
+            self.above_side_mi[mi_c + cell] = side;
+        }
+        let round_up_even = |n: usize| n.div_ceil(2) * 2;
+        let (bound_h, bound_w) = (round_up_even(self.mi_rows), round_up_even(self.mi_cols));
+        for (plane_idx, grid) in chroma_grids.into_iter().enumerate() {
+            let plane = plane_idx + 1;
+            let state = neighbour_state(grid);
+            for cell in 0..side_mi {
+                if cell < side_mi.min(bound_h.saturating_sub(mi_r)) {
+                    self.left[mi_r + cell][plane] = state;
+                }
+                if cell < side_mi.min(bound_w.saturating_sub(mi_c)) {
+                    self.above[mi_c + cell][plane] = state;
+                }
+            }
+        }
+    }
 }
 
 /// Reads one coded block's skip flag, luma mode, angle delta (if the mode
