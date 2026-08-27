@@ -349,7 +349,7 @@ pub fn dequant_and_inverse(levels: &[i32], side: usize, bit_depth: u8, q_idx: i3
 /// undo, and nothing else: measuring the network's response to a unit
 /// coefficient at every size gives the same `1 / (8 * sqrt(2))` per unit of
 /// `dqDenom`, which is what [`forward_transform_2d`] divides out.
-fn dct_basis(n: usize) -> Vec<f64> {
+fn build_dct_basis(n: usize) -> Vec<f64> {
     let mut basis = vec![0.0f64; n * n];
     let scale = (2.0 / n as f64).sqrt();
     for u in 0..n {
@@ -360,6 +360,23 @@ fn dct_basis(n: usize) -> Vec<f64> {
         }
     }
     basis
+}
+
+/// [`build_dct_basis`], computed once per transform size and reused: the
+/// search calls [`forward_transform_2d`] for every mode of every block, and
+/// the basis does not depend on the residual, only on `n` -- recomputing
+/// `n * n` cosines per call was measured as this search's single largest
+/// per-trial cost (`stage_timing_breakdown`, ec-av1 perf lane). `n` is always
+/// one of the transform sizes this crate codes (4 to 64, a power of two), so
+/// a small fixed table indexed by `log2(n)` covers every caller without a
+/// hash lookup.
+fn dct_basis(n: usize) -> &'static [f64] {
+    use std::sync::OnceLock;
+    // log2(4)=2 .. log2(64)=6, so index by trailing_zeros() - 2.
+    static CACHE: OnceLock<[OnceLock<Vec<f64>>; 5]> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::array::from_fn(|_| OnceLock::new()));
+    let idx = (n.trailing_zeros() as usize).saturating_sub(2);
+    cache[idx].get_or_init(|| build_dct_basis(n))
 }
 
 /// How much the decoder's inverse transform shrinks an orthonormal DCT.
@@ -392,24 +409,40 @@ pub fn forward_transform_2d(residual: &[i32], side: usize) -> Vec<f64> {
         "one residual sample per position"
     );
     let basis = dct_basis(side);
-    // Rows first, into a scratch of the same shape, then columns.
+    // Rows first, into a scratch of the same shape, then columns. Both passes
+    // are written as a contiguous dot product (row of `residual`/`rows_t`
+    // against a row of `basis`) rather than an index loop with one strided
+    // operand -- same summation order, so the same bits out, but a shape the
+    // optimizer can autovectorize (measured: this halved the per-call cost
+    // that `stage_timing_breakdown`, ec-av1 perf lane, found dominant).
     let mut rows = vec![0.0f64; side * side];
     for i in 0..side {
+        let residual_row = &residual[i * side..][..side];
         for u in 0..side {
-            let mut sum = 0.0;
-            for j in 0..side {
-                sum += f64::from(residual[i * side + j]) * basis[u * side + j];
-            }
+            let sum: f64 = residual_row
+                .iter()
+                .zip(&basis[u * side..][..side])
+                .map(|(&r, &b)| f64::from(r) * b)
+                .sum();
             rows[i * side + u] = sum;
+        }
+    }
+    // Transposed so the column pass reads `rows` contiguously too, without
+    // changing which terms are summed in which order.
+    let mut rows_t = vec![0.0f64; side * side];
+    for i in 0..side {
+        for v in 0..side {
+            rows_t[v * side + i] = rows[i * side + v];
         }
     }
     let mut out = vec![0.0f64; side * side];
     for u in 0..side {
         for v in 0..side {
-            let mut sum = 0.0;
-            for i in 0..side {
-                sum += rows[i * side + v] * basis[u * side + i];
-            }
+            let sum: f64 = rows_t[v * side..][..side]
+                .iter()
+                .zip(&basis[u * side..][..side])
+                .map(|(&r, &b)| r * b)
+                .sum();
             out[u * side + v] = sum;
         }
     }
