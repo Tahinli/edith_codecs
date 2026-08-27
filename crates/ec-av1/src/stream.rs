@@ -1,0 +1,282 @@
+//! The stream-level entry point a real decoder needs: walk a raw AV1 OBU
+//! stream (`Encoded::stream`, or any low-overhead-format bitstream this
+//! crate's own writers produce) via [`ec_av1_syntax::Av1Parser`] and dispatch
+//! each frame's tile payload to [`crate::decode::decode_key_frame_tile`] /
+//! [`crate::decode::decode_inter_frame_tile`], threading a single-slot DPB
+//! exactly as [`crate::encode::encode_sequence`] does on the write side.
+//!
+//! This is the only reachable path for a caller that does not have the
+//! encoder's own `Encoded::tile`/`mi_cols`/`mi_rows`/`base_q_idx` fields (they
+//! are `pub(crate)`, and rightly so: the wire is `stream`, everything else is
+//! an implementation detail of how this crate happens to build it).
+
+use ec_av1_syntax::{Av1Parser, FrameType, ObuKind};
+use ec_core::{Error, Result};
+
+use crate::decode::{decode_inter_frame_tile, decode_key_frame_tile};
+use crate::encode::Picture;
+
+/// Decode every frame in a raw AV1 OBU stream, in coding order.
+///
+/// A key frame becomes the reference for the inter frames that follow it,
+/// until the next key frame resets the DPB — the same single-slot chain
+/// [`crate::encode::encode_sequence`] threads on the write side. Only a
+/// `Frame` OBU (an uncompressed header and its tile group in one OBU, which
+/// is all this crate's encoder ever writes) carries a tile payload; sequence
+/// headers and temporal delimiters are consumed for the state they carry (or
+/// skipped) and produce no picture.
+///
+/// # Errors
+/// Returns an error when the stream is truncated or malformed (as
+/// [`Av1Parser`] reports it), when a frame header names anything this
+/// crate's tile decoders do not reconstruct (see their own docs), or when an
+/// inter frame appears before any key frame has supplied a reference.
+pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
+    let mut parser = Av1Parser::new();
+    let mut pictures = Vec::new();
+    let mut reference: Option<Picture> = None;
+
+    let mut pos = 0usize;
+    while pos < data.len() {
+        let obu = parser.parse_obu(&data[pos..])?;
+        let obu_offset = pos;
+        pos += obu.total_size;
+
+        let ObuKind::Frame(header, tiles) = obu.kind else {
+            continue;
+        };
+        let tile = tiles.first().ok_or_else(|| {
+            Error::unsupported("AV1 decode_stream", "a frame OBU with no tile group")
+        })?;
+        // `Tile::offset` is relative to the buffer `parse_obu` was handed
+        // (`&data[pos..]` at the time this OBU was parsed), so it is relative
+        // to `obu_offset`, not to `data` as a whole.
+        let start = obu_offset + tile.offset;
+        let tile_bytes = data.get(start..start + tile.size).ok_or(Error::NeedMore)?;
+
+        let picture = if header.frame_type == FrameType::Key {
+            decode_key_frame_tile(
+                tile_bytes,
+                header.mi_cols,
+                header.mi_rows,
+                header.quantization.base_q_idx,
+                header.frame_width,
+                header.frame_height,
+            )?
+        } else {
+            let reference = reference.as_ref().ok_or_else(|| {
+                Error::unsupported(
+                    "AV1 decode_stream",
+                    "an inter frame with no key frame before it",
+                )
+            })?;
+            decode_inter_frame_tile(
+                tile_bytes,
+                header.mi_cols,
+                header.mi_rows,
+                header.quantization.base_q_idx,
+                header.frame_width,
+                header.frame_height,
+                reference,
+            )?
+        };
+        reference = Some(picture.clone());
+        pictures.push(picture);
+    }
+    Ok(pictures)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::encode::{Picture as Pic, encode_key_frame, encode_sequence};
+
+    fn test_card(width: usize, height: usize) -> Pic {
+        let mut picture = Pic::grey(width, height);
+        for row in 0..height {
+            for col in 0..width {
+                picture.y[row * width + col] = ((row * 7 + col * 11) % 251) as u8;
+            }
+        }
+        for row in 0..height / 2 {
+            for col in 0..width / 2 {
+                let i = row * width / 2 + col;
+                picture.u[i] = (100 + (col * 60 / (width / 2).max(1))) as u8;
+                picture.v[i] = (200 - (row * 80 / (height / 2).max(1))) as u8;
+            }
+        }
+        picture
+    }
+
+    fn panned_test_card(width: usize, height: usize, shift: i64) -> Pic {
+        let mut picture = Pic::grey(width, height);
+        for y in 0..height {
+            for x in 0..width {
+                let sx = (x as i64 - shift).rem_euclid(width as i64) as f64;
+                let gradient = sx * 200.0 / width as f64;
+                picture.y[y * width + x] = (20.0 + gradient).clamp(0.0, 255.0) as u8;
+            }
+        }
+        for y in 0..height / 2 {
+            for x in 0..width / 2 {
+                let sx = (x as i64 - shift / 2).rem_euclid((width / 2) as i64) as usize;
+                let i = y * width / 2 + x;
+                picture.u[i] = (100 + (sx * 60 / (width / 2))) as u8;
+                picture.v[i] = (200 - (y * 80 / (height / 2))) as u8;
+            }
+        }
+        picture
+    }
+
+    /// `decode_stream` on a lone key frame's stream matches both the tile
+    /// path (`decode_key_frame_tile` called directly on `Encoded::tile`) and
+    /// the encoder's own reconstruction, at an even and an odd size.
+    #[test]
+    fn decode_stream_matches_the_tile_path_on_a_key_frame() {
+        for &(width, height) in &[(64usize, 64usize), (216, 96)] {
+            let picture = test_card(width, height);
+            let encoded = encode_key_frame(&picture, 100, 0.5).unwrap();
+            let via_tile = decode_key_frame_tile(
+                &encoded.tile,
+                encoded.mi_cols,
+                encoded.mi_rows,
+                encoded.base_q_idx,
+                width as u32,
+                height as u32,
+            )
+            .unwrap();
+            let via_stream = decode_stream(&encoded.stream).unwrap();
+            assert_eq!(via_stream.len(), 1, "{width}x{height}: one picture");
+            assert_eq!(via_stream[0].y, via_tile.y, "{width}x{height}: luma");
+            assert_eq!(via_stream[0].u, via_tile.u, "{width}x{height}: U");
+            assert_eq!(via_stream[0].v, via_tile.v, "{width}x{height}: V");
+            assert_eq!(
+                via_stream[0].y, encoded.reconstruction.y,
+                "{width}x{height}: luma vs encoder reconstruction"
+            );
+        }
+    }
+
+    /// A GOP (key frame plus panned inter frames, so blocks actually take
+    /// motion) decodes bit-exact through `decode_stream` alone, threading its
+    /// own DPB rather than a test-supplied reference.
+    fn gop_round_trips(width: usize, height: usize) {
+        let pictures: Vec<_> = (0..4)
+            .map(|i| panned_test_card(width, height, i * 3))
+            .collect();
+        let encoded = encode_sequence(&pictures, 100, 0.5).unwrap();
+        let decoded = decode_stream(&encoded.stream).unwrap();
+        assert_eq!(decoded.len(), encoded.frames.len());
+        for (i, (got, frame)) in decoded.iter().zip(&encoded.frames).enumerate() {
+            assert_eq!(
+                got.y, frame.reconstruction.y,
+                "{width}x{height} frame {i} luma"
+            );
+            assert_eq!(
+                got.u, frame.reconstruction.u,
+                "{width}x{height} frame {i} U"
+            );
+            assert_eq!(
+                got.v, frame.reconstruction.v,
+                "{width}x{height} frame {i} V"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_stream_round_trips_a_gop() {
+        gop_round_trips(128, 64);
+    }
+
+    /// Same claim at a size that is not a whole number of 32x32 blocks, so
+    /// the inter frame's 16x16-leaf split path is exercised too.
+    #[test]
+    fn decode_stream_round_trips_an_odd_size_gop() {
+        gop_round_trips(216, 96);
+    }
+
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    fn have_ffmpeg() -> bool {
+        Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    /// Decodes `frames` concatenated 4:2:0 frames out of one AV1 OBU stream.
+    fn ffmpeg_decode_sequence(
+        stream: &[u8],
+        width: usize,
+        height: usize,
+        frames: usize,
+    ) -> Vec<Pic> {
+        let mut child = Command::new("ffmpeg")
+            .args([
+                "-v", "error", "-f", "obu", "-i", "-", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("ffmpeg failed to start");
+        child
+            .stdin
+            .take()
+            .expect("ffmpeg stdin")
+            .write_all(stream)
+            .expect("writing the stream to ffmpeg");
+        let out = child.wait_with_output().expect("ffmpeg failed to run");
+        assert!(
+            out.status.success(),
+            "ffmpeg refused the stream: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let (luma, chroma) = (width * height, width * height / 4);
+        let frame_bytes = luma + 2 * chroma;
+        assert_eq!(
+            out.stdout.len(),
+            frame_bytes * frames,
+            "expected {frames} 4:2:0 frames, ffmpeg said: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (0..frames)
+            .map(|i| {
+                let base = i * frame_bytes;
+                Pic {
+                    width,
+                    height,
+                    y: out.stdout[base..base + luma].to_vec(),
+                    u: out.stdout[base + luma..base + luma + chroma].to_vec(),
+                    v: out.stdout[base + luma + chroma..base + frame_bytes].to_vec(),
+                }
+            })
+            .collect()
+    }
+
+    /// `decode_stream` agrees with ffmpeg/dav1d on the same wire bytes -- an
+    /// independent decoder, not just this crate checking its own tile path.
+    #[test]
+    fn decode_stream_agrees_with_ffmpeg_on_a_gop() {
+        if !have_ffmpeg() {
+            eprintln!("SKIP decode_stream_agrees_with_ffmpeg_on_a_gop: no ffmpeg");
+            return;
+        }
+        let (width, height) = (128usize, 64usize);
+        let pictures: Vec<_> = (0..3)
+            .map(|i| panned_test_card(width, height, i * 3))
+            .collect();
+        let encoded = encode_sequence(&pictures, 100, 0.5).unwrap();
+        let ffmpeg_frames = ffmpeg_decode_sequence(&encoded.stream, width, height, 3);
+        let decoded = decode_stream(&encoded.stream).unwrap();
+        assert_eq!(decoded.len(), 3);
+        for (i, (got, want)) in decoded.iter().zip(&ffmpeg_frames).enumerate() {
+            assert_eq!(got.y, want.y, "frame {i} luma vs ffmpeg");
+            assert_eq!(got.u, want.u, "frame {i} U vs ffmpeg");
+            assert_eq!(got.v, want.v, "frame {i} V vs ffmpeg");
+        }
+    }
+}
