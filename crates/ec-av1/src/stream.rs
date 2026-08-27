@@ -10,11 +10,26 @@
 //! are `pub(crate)`, and rightly so: the wire is `stream`, everything else is
 //! an implementation detail of how this crate happens to build it).
 
-use ec_av1_syntax::{Av1Parser, FrameType, ObuKind};
+use ec_av1_syntax::{Av1Parser, CdefParams, FrameType, ObuKind};
 use ec_core::{Error, Result};
 
 use crate::decode::{decode_inter_frame_tile, decode_key_frame_tile};
 use crate::encode::Picture;
+
+/// Whether a frame's CDEF parameters would actually filter any samples —
+/// `1 << bits` strength pairs are declared, but only the used ones (any
+/// non-zero primary/secondary strength) matter; `read_cdef_params` already
+/// zeroes every field when CDEF is off for the frame (lossless, intrabc, or
+/// the sequence header disabling it), so a plain field check is enough.
+fn cdef_is_active(cdef: &CdefParams) -> bool {
+    let n = 1usize << cdef.bits;
+    (0..n).any(|i| {
+        cdef.y_pri_strength[i] != 0
+            || cdef.y_sec_strength[i] != 0
+            || cdef.uv_pri_strength[i] != 0
+            || cdef.uv_sec_strength[i] != 0
+    })
+}
 
 /// Decode every frame in a raw AV1 OBU stream, in coding order.
 ///
@@ -48,6 +63,18 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         let tile = tiles.first().ok_or_else(|| {
             Error::unsupported("AV1 decode_stream", "a frame OBU with no tile group")
         })?;
+        // Neither tile decoder applies the in-loop CDEF filter (spec 7.15):
+        // its `cdef_idx` syntax needs no bits when `cdef_bits == 0` (this
+        // crate's own writer's only case), so a real libaom stream with an
+        // active strength decodes with the bitstream in sync but the wrong
+        // pixels — decodes-but-wrong, worse than a refusal. Refuse before
+        // that happens rather than let it through silently.
+        if cdef_is_active(&header.cdef) {
+            return Err(Error::unsupported(
+                "AV1 decode_stream",
+                "a frame with an active CDEF filter (not yet applied by this decoder)",
+            ));
+        }
         // `Tile::offset` is relative to the buffer `parse_obu` was handed
         // (`&data[pos..]` at the time this OBU was parsed), so it is relative
         // to `obu_offset`, not to `data` as a whole.
@@ -287,38 +314,55 @@ mod tests {
     /// [`decode_stream`] -- lifting the round-2 refusal is only real if it
     /// gets past an encoder this crate never wrote a byte of.
     fn libaom_encode(lavfi: &str, width: usize, height: usize, crf: u32) -> Option<Vec<u8>> {
+        libaom_encode_with(lavfi, width, height, crf, &[])
+    }
+
+    /// As [`libaom_encode`], with extra encoder args appended -- used to pin
+    /// a deterministic stream (`-threads 1` etc., since libaom's `cpu-used 8`
+    /// RD search is not otherwise stable run-to-run on this box, and lavfi
+    /// `gradients` needs its own `seed=` for the same reason) and to gate
+    /// individual feature flags (`-enable-cdef 0`) a given fixture needs off.
+    fn libaom_encode_with(
+        lavfi: &str,
+        width: usize,
+        height: usize,
+        crf: u32,
+        extra: &[&str],
+    ) -> Option<Vec<u8>> {
+        let mut args = vec![
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            lavfi,
+            "-frames:v",
+            "1",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:v",
+            "libaom-av1",
+        ];
+        let crf_str = crf.to_string();
+        args.extend(["-crf", &crf_str]);
+        args.extend([
+            "-cpu-used",
+            "8",
+            "-enable-rect-partitions",
+            "0",
+            "-enable-ab-partitions",
+            "0",
+            "-enable-1to4-partitions",
+            "0",
+            "-enable-angle-delta",
+            "0",
+            "-enable-cfl-intra",
+            "0",
+        ]);
+        args.extend(extra.iter().copied());
+        args.extend(["-f", "obu", "-"]);
         let out = Command::new("ffmpeg")
-            .args([
-                "-v",
-                "error",
-                "-f",
-                "lavfi",
-                "-i",
-                lavfi,
-                "-frames:v",
-                "1",
-                "-pix_fmt",
-                "yuv420p",
-                "-c:v",
-                "libaom-av1",
-                "-crf",
-                &crf.to_string(),
-                "-cpu-used",
-                "8",
-                "-enable-rect-partitions",
-                "0",
-                "-enable-ab-partitions",
-                "0",
-                "-enable-1to4-partitions",
-                "0",
-                "-enable-angle-delta",
-                "0",
-                "-enable-cfl-intra",
-                "0",
-                "-f",
-                "obu",
-                "-",
-            ])
+            .args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -391,6 +435,101 @@ mod tests {
         eprintln!("libaom ADST end-to-end verdicts:");
         for v in &verdicts {
             eprintln!("  {v}");
+        }
+    }
+
+    /// Hardened past the report-only test above: a real libaom-av1 gradients
+    /// stream, pinned deterministic (`gradients`' own `seed=`, plus
+    /// `-threads 1`/`-row-mt 0`/no tiling so libaom's `cpu-used 8` RD search
+    /// cannot pick a different mode set run to run) and with CDEF turned off
+    /// (this decoder's tile path never applies that in-loop filter -- see
+    /// `cdef_is_active` in `decode_stream` -- so a stream that leaves it on
+    /// decodes-but-wrong instead of refusing at cdef_bits==0; ffmpeg's
+    /// `-enable-cdef 0` keeps this fixture out of that gap rather than this
+    /// test working around it). Asserts pixel-exact against ffmpeg's own
+    /// decode of the identical bytes, not just "decoded without error".
+    #[test]
+    fn a_real_libaom_gradients_stream_decodes_pixel_exact() {
+        if !have_ffmpeg() {
+            eprintln!("SKIP a_real_libaom_gradients_stream_decodes_pixel_exact: no ffmpeg");
+            return;
+        }
+        let (width, height) = (64, 64);
+        let stream = libaom_encode_with(
+            "gradients=size=64x64:c0=red:c1=blue:c2=green:rate=1:seed=42",
+            width,
+            height,
+            15,
+            &[
+                "-threads",
+                "1",
+                "-row-mt",
+                "0",
+                "-tile-columns",
+                "0",
+                "-tile-rows",
+                "0",
+                "-enable-cdef",
+                "0",
+            ],
+        )
+        .expect("ffmpeg encode");
+        let frames = decode_stream(&stream).expect("decode_stream on a real libaom stream");
+        let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
+        assert_eq!(frames[0].y, ffmpeg_frames[0].y, "luma vs ffmpeg");
+        assert_eq!(frames[0].u, ffmpeg_frames[0].u, "U vs ffmpeg");
+        assert_eq!(frames[0].v, ffmpeg_frames[0].v, "V vs ffmpeg");
+    }
+
+    /// scratch: isolate a pinned mismatching stream's first divergent pixel.
+    #[test]
+    #[ignore]
+    fn scratch_isolate_pinned_mismatch() {
+        let path = std::env::var("EC_AV1_PIN").expect("set EC_AV1_PIN to the .obu path");
+        let stream = std::fs::read(&path).expect("read pinned stream");
+        {
+            let mut p = Av1Parser::new();
+            let mut pos = 0usize;
+            while pos < stream.len() {
+                let obu = p.parse_obu(&stream[pos..]).expect("parse");
+                pos += obu.total_size;
+                if let ObuKind::Frame(header, _) = obu.kind {
+                    eprintln!("cdef: {:?}", header.cdef);
+                }
+            }
+        }
+        let width = 64;
+        let height = 64;
+        let frames = decode_stream(&stream).expect("our decode");
+        let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
+        let ours = &frames[0];
+        let theirs = &ffmpeg_frames[0];
+        for (plane_name, a, b, w) in [
+            ("y", &ours.y, &theirs.y, width),
+            ("u", &ours.u, &theirs.u, width / 2),
+            ("v", &ours.v, &theirs.v, width / 2),
+        ] {
+            let mut first = None;
+            let mut count = 0;
+            for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+                if x != y {
+                    count += 1;
+                    if first.is_none() {
+                        first = Some(i);
+                    }
+                }
+            }
+            if let Some(i) = first {
+                eprintln!(
+                    "plane {plane_name}: {count} mismatches, first at offset {i} (row {}, col {}) ours={} theirs={}",
+                    i / w,
+                    i % w,
+                    a[i],
+                    b[i]
+                );
+            } else {
+                eprintln!("plane {plane_name}: MATCH");
+            }
         }
     }
 }
