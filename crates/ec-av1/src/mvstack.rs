@@ -97,6 +97,18 @@ pub struct MiInfo {
     /// has no compound candidates). Feeds `NewMvContext` (7.10.2.8): a
     /// neighbour's own coded-with-NEWMV state, not this block's.
     pub is_new_mv: bool,
+    /// The side, in 4x4 units, of the square block this unit belongs to (8
+    /// for a whole 32x32 block, 4 for a 16x16 leaf -- every block this crate
+    /// ever codes is square, so one dimension is enough). Feeds the extended
+    /// row/col scan's `processed_rows`/`processed_cols` (spec 7.10.2.2/.3,
+    /// libaom `scan_row_mbmi`/`scan_col_mbmi`'s `inc` term): a query block no
+    /// wider than its immediate neighbour has that neighbour's whole span
+    /// already covered by the immediate (-1) scan, so the extended scan
+    /// below only has to run past that. Set for *every* coded unit, intra or
+    /// inter -- libaom's `scan_row_mbmi` advances `processed_rows` from any
+    /// candidate's `bsize` regardless of whether it also casts a vote (that
+    /// requires a ref-frame match, checked separately in `add_ref_mv_candidate`).
+    pub size: usize,
 }
 
 /// The whole frame's `mi` grid, one [`MiInfo`] per 4x4 unit, in raster order.
@@ -188,6 +200,10 @@ const MAX_STACK_SIZE: usize = 8;
 /// this module makes — see the module doc).
 const IMMEDIATE_WEIGHT: u32 = 2;
 
+/// Spec `MVREF_ROW_COLS`: the extended row/col scan runs at offsets `-3` and
+/// `-5` (`idx = 2..=3`), one past `IMMEDIATE_WEIGHT`'s own `-1`.
+const MVREF_ROW_COLS: usize = 3;
+
 /// Adds one candidate MV with `weight` to `candidates`, merging it into an
 /// existing entry with the same MV rather than duplicating it (spec
 /// `add_ref_mv_candidate`, 7.10.2.5).
@@ -200,7 +216,14 @@ fn add_candidate(candidates: &mut Vec<StackEntry>, mv: (i32, i32), weight: u32) 
 }
 
 /// The row-above scan (spec 7.10.2.2): every 4x4 unit directly above the
-/// block's span. Returns whether any unit voted.
+/// block's span. Returns whether any unit voted, and `processed_rows`
+/// (libaom `scan_row_mbmi`'s output): how many rows past the immediate one
+/// this span already covers by *geometry* alone (0 unless a same-or-wider
+/// neighbour occupies it, in which case that neighbour's own `size` is the
+/// coverage, spec 7.10.2.2's `inc` term reduced to this crate's square,
+/// fixed-weight candidates) -- tracked for *every* coded cell, intra or
+/// inter, since libaom's `processed_rows` update sits outside the
+/// ref-frame-matching `add_ref_mv_candidate` call.
 fn scan_row(
     grid: &MiGrid,
     mi_row: usize,
@@ -209,26 +232,31 @@ fn scan_row(
     ref_frame: i8,
     candidates: &mut Vec<StackEntry>,
     newmv_count: &mut u32,
-) -> bool {
+) -> (bool, usize) {
     let Some(row) = mi_row.checked_sub(1) else {
-        return false;
+        return (false, 0);
     };
     let mut found = false;
+    let mut processed_rows = 0;
     for col in mi_col..mi_col + bw4 {
-        if let Some(info) = grid.get(row, col)
-            && info.is_inter
-            && info.ref_frame == ref_frame
-        {
+        let Some(info) = grid.get(row, col) else {
+            continue;
+        };
+        if bw4 <= info.size {
+            processed_rows = processed_rows.max(info.size);
+        }
+        if info.is_inter && info.ref_frame == ref_frame {
             found = true;
             add_candidate(candidates, info.mv, IMMEDIATE_WEIGHT);
             *newmv_count += u32::from(info.is_new_mv);
         }
     }
-    found
+    (found, processed_rows)
 }
 
 /// The col-left scan (spec 7.10.2.3): every 4x4 unit directly left of the
-/// block's span. Returns whether any unit voted.
+/// block's span. Returns whether any unit voted, and `processed_cols`
+/// (`scan_row`'s doc, transposed).
 fn scan_col(
     grid: &MiGrid,
     mi_row: usize,
@@ -237,19 +265,97 @@ fn scan_col(
     ref_frame: i8,
     candidates: &mut Vec<StackEntry>,
     newmv_count: &mut u32,
-) -> bool {
+) -> (bool, usize) {
     let Some(col) = mi_col.checked_sub(1) else {
-        return false;
+        return (false, 0);
     };
     let mut found = false;
+    let mut processed_cols = 0;
     for row in mi_row..mi_row + bh4 {
-        if let Some(info) = grid.get(row, col)
-            && info.is_inter
-            && info.ref_frame == ref_frame
-        {
+        let Some(info) = grid.get(row, col) else {
+            continue;
+        };
+        if bh4 <= info.size {
+            processed_cols = processed_cols.max(info.size);
+        }
+        if info.is_inter && info.ref_frame == ref_frame {
             found = true;
             add_candidate(candidates, info.mv, IMMEDIATE_WEIGHT);
             *newmv_count += u32::from(info.is_new_mv);
+        }
+    }
+    (found, processed_cols)
+}
+
+/// The extended row scan (spec 7.10.2.4's `idx = 2..MVREF_ROW_COLS` row
+/// positions, libaom `mvref_common.c`'s second loop): probes rows `-3` and
+/// `-5`, shifted one column right (`col_offset = 1`, libaom's `col_adj`
+/// collapses to that for every block size this crate ever queries), each
+/// only run when the immediate scan's own `processed_rows` hasn't already
+/// covered it and the tile's top edge doesn't clip it first. Its match folds
+/// into the row side (`ref_match_count`, never `nearest_match`), same as the
+/// corner probe.
+fn scan_row_extended(
+    grid: &MiGrid,
+    mi_row: usize,
+    mi_col: usize,
+    bw4: usize,
+    ref_frame: i8,
+    candidates: &mut Vec<StackEntry>,
+    processed_rows: usize,
+) -> bool {
+    let max_row_offset = mi_row.min(MVREF_ROW_COLS * 2);
+    let mut found = false;
+    for idx in 2..=MVREF_ROW_COLS {
+        let offset = idx * 2 - 1;
+        if offset > max_row_offset || offset <= processed_rows {
+            continue;
+        }
+        let Some(row) = mi_row.checked_sub(offset) else {
+            continue;
+        };
+        for col in mi_col + 1..mi_col + 1 + bw4 {
+            if let Some(info) = grid.get(row, col)
+                && info.is_inter
+                && info.ref_frame == ref_frame
+            {
+                found = true;
+                add_candidate(candidates, info.mv, IMMEDIATE_WEIGHT);
+            }
+        }
+    }
+    found
+}
+
+/// The extended col scan: `scan_row_extended`, transposed (probes cols `-3`
+/// and `-5`, shifted one row down).
+fn scan_col_extended(
+    grid: &MiGrid,
+    mi_row: usize,
+    mi_col: usize,
+    bh4: usize,
+    ref_frame: i8,
+    candidates: &mut Vec<StackEntry>,
+    processed_cols: usize,
+) -> bool {
+    let max_col_offset = mi_col.min(MVREF_ROW_COLS * 2);
+    let mut found = false;
+    for idx in 2..=MVREF_ROW_COLS {
+        let offset = idx * 2 - 1;
+        if offset > max_col_offset || offset <= processed_cols {
+            continue;
+        }
+        let Some(col) = mi_col.checked_sub(offset) else {
+            continue;
+        };
+        for row in mi_row + 1..mi_row + 1 + bh4 {
+            if let Some(info) = grid.get(row, col)
+                && info.is_inter
+                && info.ref_frame == ref_frame
+            {
+                found = true;
+                add_candidate(candidates, info.mv, IMMEDIATE_WEIGHT);
+            }
         }
     }
     found
@@ -363,7 +469,7 @@ pub fn find_mv_stack(
 ) -> MvStack {
     let mut candidates = Vec::new();
     let mut newmv_count = 0u32;
-    let found_above = scan_row(
+    let (found_above, processed_rows) = scan_row(
         grid,
         mi_row,
         mi_col,
@@ -372,7 +478,7 @@ pub fn find_mv_stack(
         &mut candidates,
         &mut newmv_count,
     );
-    let found_left = scan_col(
+    let (found_left, processed_cols) = scan_col(
         grid,
         mi_row,
         mi_col,
@@ -417,7 +523,34 @@ pub fn find_mv_stack(
         &mut candidates,
         &mut dummy_newmv_count,
     );
-    let ref_match_count = usize::from(row_matched || corner_matched) + usize::from(found_left);
+    // The extended row/col scan (spec 7.10.2.4's `idx = 2..MVREF_ROW_COLS`):
+    // only reachable once the immediate scan's own reach (`processed_rows`/
+    // `processed_cols`) leaves a gap the tile's edge doesn't already clip.
+    // At this module's fixed 8-mi block geometry with every coded cell
+    // (intra or inter) now feeding coverage, that reach always hits
+    // `MVREF_ROW_COLS`'s farthest offset first -- a true no-op there (see
+    // module doc and `extended_scan_is_a_no_op_at_8mi_geometry` below). Folds
+    // into the row/col match booleans, never `nearest_match`.
+    let row_matched_ext = scan_row_extended(
+        grid,
+        mi_row,
+        mi_col,
+        bw4,
+        ref_frame,
+        &mut candidates,
+        processed_rows,
+    );
+    let col_matched_ext = scan_col_extended(
+        grid,
+        mi_row,
+        mi_col,
+        bh4,
+        ref_frame,
+        &mut candidates,
+        processed_cols,
+    );
+    let ref_match_count = usize::from(row_matched || corner_matched || row_matched_ext)
+        + usize::from(found_left || col_matched_ext);
 
     // Highest weight first; a stable sort keeps scan order (above, left,
     // top-right, corner) among ties, matching spec 7.10.2.6. The corner
@@ -537,6 +670,10 @@ mod tests {
             ref_frame: 1,
             mv,
             is_new_mv: false,
+            // 1: smaller than every `bw4`/`bh4` these small-grid tests use,
+            // so it never trips the extended-scan coverage boost -- these
+            // tests only exercise the immediate/corner/top-right scans.
+            size: 1,
         }
     }
 
@@ -682,6 +819,7 @@ mod tests {
                 ref_frame: 1,
                 mv: (4, 4),
                 is_new_mv: true,
+                size: 1,
             },
         );
         // Only the row matches (nearest_match == 1): newmv_count > 0 picks
@@ -741,5 +879,105 @@ mod tests {
     fn single_ref_ctx_matches_libaoms_collapsed_forward_only_case() {
         assert_eq!(single_ref_ctx(false), 1);
         assert_eq!(single_ref_ctx(true), 2);
+    }
+
+    /// An 8-mi-sized (`size: 8`) coded-but-intra neighbour: contributes no
+    /// vote (`is_inter: false`) but must still count for extended-scan
+    /// coverage, the way libaom's `scan_row_mbmi`/`scan_col_mbmi` advance
+    /// `processed_rows`/`processed_cols` from any candidate's `bsize` alone.
+    fn intra8() -> MiInfo {
+        MiInfo {
+            is_inter: false,
+            ref_frame: -1,
+            mv: (0, 0),
+            is_new_mv: false,
+            size: 8,
+        }
+    }
+
+    /// An 8-mi-sized inter neighbour with an arbitrary, distinctive `mv` --
+    /// used below as a "would this get picked up" tracer at extended-scan
+    /// offsets that a correct implementation must never reach at 8-mi
+    /// geometry.
+    fn inter8(mv: (i32, i32)) -> MiInfo {
+        MiInfo {
+            is_inter: true,
+            ref_frame: 1,
+            mv,
+            is_new_mv: false,
+            size: 8,
+        }
+    }
+
+    /// The class of bug this round fixed: at 8-mi geometry, an intra
+    /// neighbour directly above the query block must suppress the extended
+    /// row scan exactly as an inter one would (spec 7.10.2.2's
+    /// `processed_rows` tracks *coded* neighbours, not merely *matching*
+    /// ones). Two tracer candidates sit at the row's extended-scan offsets
+    /// (-3 and -5, spec 7.10.2.4) with MVs no other scan could produce; if
+    /// the coverage bug regresses, they show up in `stack.entries`.
+    #[test]
+    fn extended_row_scan_is_a_no_op_at_8mi_geometry_even_behind_an_intra_neighbour() {
+        let mut grid = MiGrid::new(32, 32);
+        let (mi_row, mi_col) = (10, 10);
+        for col in mi_col..mi_col + 8 {
+            grid.set(mi_row - 1, col, intra8());
+        }
+        for col in mi_col + 1..mi_col + 1 + 8 {
+            grid.set(mi_row - 3, col, inter8((999, 999)));
+            grid.set(mi_row - 5, col, inter8((888, 888)));
+        }
+
+        let stack = find_mv_stack(&grid, mi_row, mi_col, 8, 8, 1, 32, 32);
+
+        assert!(
+            stack.entries.is_empty(),
+            "extended row scan fired at 8-mi geometry: {:?}",
+            stack.entries
+        );
+    }
+
+    /// `extended_row_scan_is_a_no_op_at_8mi_geometry_even_behind_an_intra_neighbour`,
+    /// transposed to the col-left scan.
+    #[test]
+    fn extended_col_scan_is_a_no_op_at_8mi_geometry_even_behind_an_intra_neighbour() {
+        let mut grid = MiGrid::new(32, 32);
+        let (mi_row, mi_col) = (10, 10);
+        for row in mi_row..mi_row + 8 {
+            grid.set(row, mi_col - 1, intra8());
+        }
+        for row in mi_row + 1..mi_row + 1 + 8 {
+            grid.set(row, mi_col - 3, inter8((999, 999)));
+            grid.set(row, mi_col - 5, inter8((888, 888)));
+        }
+
+        let stack = find_mv_stack(&grid, mi_row, mi_col, 8, 8, 1, 32, 32);
+
+        assert!(
+            stack.entries.is_empty(),
+            "extended col scan fired at 8-mi geometry: {:?}",
+            stack.entries
+        );
+    }
+
+    /// Same shape, but the immediate neighbour is itself inter (a same-size
+    /// vote) rather than intra -- the geometry-only coverage path must not
+    /// have broken the ordinary matching one.
+    #[test]
+    fn extended_row_scan_is_a_no_op_at_8mi_geometry_behind_an_inter_neighbour() {
+        let mut grid = MiGrid::new(32, 32);
+        let (mi_row, mi_col) = (10, 10);
+        for col in mi_col..mi_col + 8 {
+            grid.set(mi_row - 1, col, inter8((4, 4)));
+        }
+        for col in mi_col + 1..mi_col + 1 + 8 {
+            grid.set(mi_row - 3, col, inter8((999, 999)));
+            grid.set(mi_row - 5, col, inter8((888, 888)));
+        }
+
+        let stack = find_mv_stack(&grid, mi_row, mi_col, 8, 8, 1, 32, 32);
+
+        assert_eq!(stack.entries.len(), 1);
+        assert_eq!(stack.entries[0].mv, (4, 4));
     }
 }

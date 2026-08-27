@@ -1217,18 +1217,21 @@ fn code_square_inter(
                     luma_trial.bits + u.bits + v.bits
                 });
 
-    // corner-cut: the NEARESTMV choice below is gated off (`false &&`) --
-    // enabling it round-trips ffmpeg/dav1d as "Invalid data found" on the
-    // straddle test, a desync somewhere in `write_inter_frame_leaf`'s or this
-    // function's new symbol chain, not yet isolated. With the gate off this
-    // is dead code (never reached, `intra_block` always wins), kept in place
-    // for the next round to debug with an `EC_RNG` trace rather than delete
-    // and re-derive. Ceiling: no real inter coding for these leaves until
-    // this is lifted. Upgrade path: trace the first diverging symbol between
-    // this function's cost model and `write_inter_frame_leaf`'s actual
-    // write, most likely a stack/grid mismatch between the encode-time and
-    // write-time `find_mv_stack` calls despite both using `bw4=bh4=4`.
-    if false && inter_cost < intra_cost {
+    // NEARESTMV for 16x16 leaves, gated on real cost. r1/r2 found the gate's
+    // desync in `mvstack.rs`'s `find_mv_stack`: it lacked spec 7.10.2.4's
+    // extended row/col scan, invisible at 8-mi-only geometry (the immediate
+    // scan's own coverage already reached as far) but a real gap at 4-mi
+    // leaf geometry. r3 ported the extended scan and, while proving it a
+    // no-op at 8-mi (`extended_row_scan_is_a_no_op_at_8mi_geometry_*`,
+    // `mvstack.rs`), found and fixed a second bug the extended scan's
+    // coverage bookkeeping (`processed_rows`/`processed_cols`) exposed: an
+    // intra neighbour is a coded cell too (libaom's `scan_row_mbmi`/
+    // `scan_col_mbmi` advance coverage from any candidate's `bsize`,
+    // regardless of whether it also casts a ref-frame-matching vote) --
+    // `MiGrid` now records intra cells (`tile.rs`/`encode.rs`'s `else`
+    // branches), which is what made 8-mi geometry a true no-op instead of
+    // one that only held when every neighbour happened to be inter.
+    if inter_cost < intra_cost {
         luma.commit(x, y, SUB, &luma_trial);
         chroma[0].commit(x / 2, y / 2, SUB / 2, &u);
         chroma[1].commit(x / 2, y / 2, SUB / 2, &v);
@@ -2441,20 +2444,32 @@ pub(crate) fn encode_inter_frame(
                         &stack,
                     );
 
-                    if let Some(info) = block.inter {
-                        for dr in 0..8 {
-                            for dc in 0..8 {
-                                grid.set(
-                                    mi_row + dr,
-                                    mi_col + dc,
-                                    MiInfo {
+                    for dr in 0..8 {
+                        for dc in 0..8 {
+                            grid.set(
+                                mi_row + dr,
+                                mi_col + dc,
+                                match block.inter {
+                                    Some(info) => MiInfo {
                                         is_inter: true,
                                         ref_frame: LAST_FRAME,
                                         mv: info.mv,
                                         is_new_mv: matches!(info.mode, InterMode::NewMv),
+                                        size: 8,
                                     },
-                                );
-                            }
+                                    // Intra: no vote, but still a coded cell
+                                    // -- mvstack's extended-scan coverage
+                                    // (`processed_rows`/`processed_cols`)
+                                    // must see it (module doc).
+                                    None => MiInfo {
+                                        is_inter: false,
+                                        ref_frame: -1,
+                                        mv: (0, 0),
+                                        is_new_mv: false,
+                                        size: 8,
+                                    },
+                                },
+                            );
                         }
                     }
                     blocks[r32 * cols + c32] = Quadrant::Whole(block);
@@ -2512,20 +2527,28 @@ pub(crate) fn encode_inter_frame(
                             reference,
                             &stack,
                         );
-                        if let Some(info) = block.inter {
-                            for dr in 0..4 {
-                                for dc in 0..4 {
-                                    grid.set(
-                                        mi_row + dr,
-                                        mi_col + dc,
-                                        MiInfo {
+                        for dr in 0..4 {
+                            for dc in 0..4 {
+                                grid.set(
+                                    mi_row + dr,
+                                    mi_col + dc,
+                                    match block.inter {
+                                        Some(info) => MiInfo {
                                             is_inter: true,
                                             ref_frame: LAST_FRAME,
                                             mv: info.mv,
                                             is_new_mv: matches!(info.mode, InterMode::NewMv),
+                                            size: 4,
                                         },
-                                    );
-                                }
+                                        None => MiInfo {
+                                            is_inter: false,
+                                            ref_frame: -1,
+                                            mv: (0, 0),
+                                            is_new_mv: false,
+                                            size: 4,
+                                        },
+                                    },
+                                );
                             }
                         }
                         leaves.push(block);
