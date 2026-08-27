@@ -284,6 +284,9 @@ pub(crate) struct Cdfs {
     pub tx_size_cat2: [[u16; 4]; 3],
     /// `tx_depth` at a 64x64 block -- see [`cdf::TX_SIZE_CAT3`].
     pub tx_size_cat3: [[u16; 4]; 3],
+    /// A `SWITCHABLE`-filter inter block's own `interp_filter[dir]` -- see
+    /// [`cdf::SWITCHABLE_INTERP`].
+    pub switchable_interp: [[u16; 4]; 16],
 }
 
 /// One motion vector component's adapting state (spec 9.4's `Default_Mv_*`,
@@ -827,6 +830,7 @@ impl Cdfs {
             tx_size_cat1: cdf::TX_SIZE_CAT1,
             tx_size_cat2: cdf::TX_SIZE_CAT2,
             tx_size_cat3: cdf::TX_SIZE_CAT3,
+            switchable_interp: cdf::SWITCHABLE_INTERP,
         }
     }
 

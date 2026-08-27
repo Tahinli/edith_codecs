@@ -184,6 +184,13 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         let enable_filter_intra = parser
             .sequence_header()
             .is_some_and(|seq| seq.enable_filter_intra);
+        let enable_dual_filter = parser
+            .sequence_header()
+            .is_some_and(|seq| seq.enable_dual_filter);
+        let interp_fixed = match header.interpolation_filter {
+            ec_av1_syntax::InterpolationFilter::Switchable => None,
+            fixed => Some(crate::mc::InterpFilterKind::from_header(fixed)),
+        };
 
         // Spec 7.20 `load_cdfs`: a frame naming a `primary_ref_frame` resumes
         // from that reference slot's saved CDF state instead of the spec 8.4
@@ -237,6 +244,8 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 &header.loop_filter,
                 initial_cdfs,
                 header.allow_high_precision_mv,
+                interp_fixed,
+                enable_dual_filter,
             )?
         };
         // Spec 7.20: `disable_frame_end_update_cdf` stores the frame's
@@ -1487,6 +1496,7 @@ mod tests {
                 let obu = p.parse_obu(&stream[pos..]).expect("parse");
                 pos += obu.total_size;
                 if let ObuKind::Frame(header, _) = obu.kind {
+                    eprintln!("interpolation_filter: {:?}", header.interpolation_filter);
                     eprintln!("cdef: {:?}", header.cdef);
                     eprintln!("quantization: {:?}", header.quantization);
                     eprintln!(
