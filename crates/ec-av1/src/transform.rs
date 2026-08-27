@@ -1050,6 +1050,41 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    #[ignore]
+    fn scratch_probe_32x32_dequant() {
+        let mut levels = vec![0i32; 32 * 32];
+        levels[0] = -2;
+        levels[1] = -2;
+        levels[2] = -2;
+        let dq = crate::quant::dequant(&levels, 32, 8, 60);
+        eprintln!("dq[0..4]={:?}", &dq[0..4]);
+        let residual = dequant_and_inverse(&levels, 32, 8, 60);
+        eprintln!("row0: {:?}", &residual[0..32]);
+        eprintln!("row1: {:?}", &residual[32..64]);
+
+        // superposition probe: does inverse_transform_2d at side=32 sum
+        // three simultaneous low-frequency coefficients the same as it
+        // reconstructs each alone?
+        let side = 32usize;
+        let mut single_sum = vec![0i32; side * side];
+        for &(pos, val) in &[(0usize, -57i32), (1, -67), (2, -67)] {
+            let mut c = vec![0i32; side * side];
+            c[pos] = val;
+            let got = inverse_transform_2d(&c, side, 8);
+            for i in 0..side * side {
+                single_sum[i] += got[i];
+            }
+        }
+        let mut combined = vec![0i32; side * side];
+        combined[0] = -57;
+        combined[1] = -67;
+        combined[2] = -67;
+        let got_combined = inverse_transform_2d(&combined, side, 8);
+        eprintln!("single_sum row0: {:?}", &single_sum[0..8]);
+        eprintln!("combined  row0: {:?}", &got_combined[0..8]);
+    }
+
     fn rmse(a: &[i32], b: &[i32]) -> f64 {
         let sum: f64 = a
             .iter()

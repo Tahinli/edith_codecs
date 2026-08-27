@@ -10,7 +10,7 @@
 //! are `pub(crate)`, and rightly so: the wire is `stream`, everything else is
 //! an implementation detail of how this crate happens to build it).
 
-use ec_av1_syntax::{Av1Parser, CdefParams, FrameType, ObuKind};
+use ec_av1_syntax::{Av1Parser, CdefParams, FrameType, ObuKind, TxMode};
 use ec_core::{Error, Result};
 
 use crate::decode::{decode_inter_frame_tile, decode_key_frame_tile};
@@ -75,11 +75,60 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 "a frame with an active CDEF filter (not yet applied by this decoder)",
             ));
         }
+        // Every `decode_block` call below assumes the block's transform is
+        // its own full size (`TxMode::Largest`, which is all this crate's own
+        // encoder ever writes, spec `read_tx_size` inferring the max depth
+        // with no bits) -- it never reads a `tx_depth` symbol at all. A real
+        // encoder's `TxMode::Select` (spec 5.9.2's `tx_mode` bit) codes one
+        // per intra block, and skipping that read does not error -- the
+        // decoder just goes on consuming the next bits as if they were the
+        // uv_mode/coefficient symbols they are not, so the block "decodes"
+        // syntactically clean into low-energy garbage: lane-av1real r3's
+        // luma-near-flat-vs-ffmpeg-gradient bug. Refuse before that, the same
+        // way as the CDEF case above, rather than silently miscode every
+        // `TxMode::Select` stream.
+        if header.tx_mode == TxMode::Select {
+            return Err(Error::unsupported(
+                "AV1 decode_stream",
+                "a frame using TxMode::Select (this decoder never reads a tx_depth symbol, so it desyncs after the first intra block's mode)",
+            ));
+        }
+        // lane-av1real r11's blindness-audit sweep (`read_intra_frame_mode_info`,
+        // libaom decodemv.c): three more per-block/per-SB symbols this crate
+        // never reads at all, each gated by a header field this decoder
+        // otherwise accepts uncomplaining -- the same silent-desync shape
+        // `use_filter_intra` was. `allow_screen_content_tools` gates both
+        // `read_intrabc_info` and `read_palette_mode_info`; `delta.q_present`/
+        // `delta.lf_present` gate `read_delta_qindex`/`read_delta_lflevel`
+        // (spec 5.11.10/5.11.11, one symbol group per superblock). Refuse
+        // before desyncing rather than silently miscode, the same pattern as
+        // the CDEF/TxMode::Select refusals above.
+        if header.allow_screen_content_tools {
+            return Err(Error::unsupported(
+                "AV1 decode_stream",
+                "a frame with allow_screen_content_tools set (this decoder never reads intrabc/palette_mode_info)",
+            ));
+        }
+        if header.delta.q_present || header.delta.lf_present {
+            return Err(Error::unsupported(
+                "AV1 decode_stream",
+                "a frame with delta_q_present or delta_lf_present set (this decoder never reads the per-superblock delta symbols)",
+            ));
+        }
+        if header.segmentation.enabled {
+            return Err(Error::unsupported(
+                "AV1 decode_stream",
+                "a frame with segmentation enabled (this decoder never reads a per-block segment_id symbol)",
+            ));
+        }
         // `Tile::offset` is relative to the buffer `parse_obu` was handed
         // (`&data[pos..]` at the time this OBU was parsed), so it is relative
         // to `obu_offset`, not to `data` as a whole.
         let start = obu_offset + tile.offset;
         let tile_bytes = data.get(start..start + tile.size).ok_or(Error::NeedMore)?;
+        let enable_filter_intra = parser
+            .sequence_header()
+            .is_some_and(|seq| seq.enable_filter_intra);
 
         let picture = if header.frame_type == FrameType::Key {
             decode_key_frame_tile(
@@ -89,6 +138,7 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 header.quantization.base_q_idx,
                 header.frame_width,
                 header.frame_height,
+                enable_filter_intra,
             )?
         } else {
             let reference = reference.as_ref().ok_or_else(|| {
@@ -170,6 +220,7 @@ mod tests {
                 encoded.base_q_idx,
                 width as u32,
                 height as u32,
+                false,
             )
             .unwrap();
             let via_stream = decode_stream(&encoded.stream).unwrap();
@@ -481,6 +532,52 @@ mod tests {
         assert_eq!(frames[0].v, ffmpeg_frames[0].v, "V vs ffmpeg");
     }
 
+    /// As [`a_real_libaom_gradients_stream_decodes_pixel_exact`], but at
+    /// 32x32 (below `is_cfl_allowed`'s 32x32 luma bound as a *single*
+    /// undivided block, spec 5.11.5) rather than 64x64 -- a whole 64x64 SB
+    /// is never CFL-eligible itself, only its <=32x32 partitions, and
+    /// `testsrc2`/`gradients` at 64x64 with rect/ab/1to4/angle-delta search
+    /// disabled reliably pick a whole-SB `PARTITION_NONE` (probed
+    /// lane-av1real r2), so no fixture at that size exercises CfL at all.
+    /// A 32x32 frame is exactly the whole-block, CFL-allowed case, and
+    /// lane-av1real r2 found `gradients` there reliably selects
+    /// `UV_CFL_PRED` (`uv_mode=13`) across a crf sweep -- `testsrc2` there
+    /// stays DC. Proves the CfL port this round added, not just DC-chroma
+    /// decode: pixel-exact against ffmpeg's own decode, not just "decoded".
+    ///
+    #[test]
+    fn a_real_libaom_cfl_stream_decodes_pixel_exact() {
+        if !have_ffmpeg() {
+            eprintln!("SKIP a_real_libaom_cfl_stream_decodes_pixel_exact: no ffmpeg");
+            return;
+        }
+        let (width, height) = (32, 32);
+        let stream = libaom_encode_with(
+            "gradients=size=32x32:c0=red:c1=blue:c2=green:rate=1:seed=42",
+            width,
+            height,
+            15,
+            &[
+                "-threads",
+                "1",
+                "-row-mt",
+                "0",
+                "-tile-columns",
+                "0",
+                "-tile-rows",
+                "0",
+                "-enable-cdef",
+                "0",
+            ],
+        )
+        .expect("ffmpeg encode");
+        let frames = decode_stream(&stream).expect("decode_stream on a real libaom stream");
+        let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
+        assert_eq!(frames[0].y, ffmpeg_frames[0].y, "luma vs ffmpeg");
+        assert_eq!(frames[0].u, ffmpeg_frames[0].u, "U vs ffmpeg");
+        assert_eq!(frames[0].v, ffmpeg_frames[0].v, "V vs ffmpeg");
+    }
+
     /// scratch: isolate a pinned mismatching stream's first divergent pixel.
     #[test]
     #[ignore]
@@ -495,11 +592,18 @@ mod tests {
                 pos += obu.total_size;
                 if let ObuKind::Frame(header, _) = obu.kind {
                     eprintln!("cdef: {:?}", header.cdef);
+                    eprintln!("quantization: {:?}", header.quantization);
+                    eprintln!(
+                        "coded_lossless: {:?} tx_mode: {:?}",
+                        header.coded_lossless, header.tx_mode
+                    );
+                    eprintln!("delta: {:?}", header.delta);
+                    eprintln!("segmentation: {:?}", header.segmentation);
                 }
             }
         }
-        let width = 64;
-        let height = 64;
+        let width = 32;
+        let height = 32;
         let frames = decode_stream(&stream).expect("our decode");
         let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
         let ours = &frames[0];
@@ -530,6 +634,16 @@ mod tests {
             } else {
                 eprintln!("plane {plane_name}: MATCH");
             }
+        }
+        for row in 0..8 {
+            eprintln!(
+                "ours  row{row}: {:?}",
+                &ours.y[row * width..row * width + 8]
+            );
+            eprintln!(
+                "theirs row{row}: {:?}",
+                &theirs.y[row * width..row * width + 8]
+            );
         }
     }
 }

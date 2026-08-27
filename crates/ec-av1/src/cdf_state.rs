@@ -98,6 +98,10 @@ pub(crate) struct Cdfs {
     pub uv_mode_no_cfl: [[u16; 14]; 13],
     /// The chroma mode of a block that is offered it.
     pub uv_mode_cfl: [[u16; 15]; 13],
+    /// The joint sign of a `UV_CFL_PRED` block's U/V alpha.
+    pub cfl_sign: [u16; 9],
+    /// A `UV_CFL_PRED` block's per-plane alpha magnitude, by joint-sign context.
+    pub cfl_alpha: [[u16; 17]; 6],
     /// The angle a directional mode is nudged by.
     pub angle_delta: [[u16; 8]; 8],
     /// The one-context all-zero flag of a 16x16 luma transform.
@@ -235,6 +239,11 @@ pub(crate) struct Cdfs {
     /// The two motion vector components' own tables: separate owned state,
     /// since spec 8.3.2 adapts one component without touching the other.
     pub mv_comp: [MvComponentCdfs; 2],
+    /// The `use_filter_intra` flag, indexed by block-size class (`[0]`=4x4,
+    /// `[1]`=8x8, `[2]`=16x16, `[3]`=32x32) -- see [`cdf::FILTER_INTRA`].
+    pub filter_intra: [[u16; 3]; 4],
+    /// Which `FILTER_INTRA_MODES` entry a `use_filter_intra` block picks.
+    pub filter_intra_mode: [u16; 6],
 }
 
 /// One motion vector component's adapting state (spec 9.4's `Default_Mv_*`,
@@ -297,6 +306,8 @@ impl Cdfs {
             kf_y_mode: cdf::KF_Y_MODE,
             uv_mode_no_cfl: cdf::UV_MODE_NO_CFL,
             uv_mode_cfl: cdf::UV_MODE_CFL,
+            cfl_sign: cdf::CFL_SIGN,
+            cfl_alpha: cdf::CFL_ALPHA,
             angle_delta: cdf::ANGLE_DELTA,
             txb_skip_luma_16: [pick(
                 q_ctx,
@@ -637,6 +648,8 @@ impl Cdfs {
             drl_mode: cdf::DRL_MODE,
             mv_joint: cdf::MV_JOINT,
             mv_comp: [MvComponentCdfs::new(), MvComponentCdfs::new()],
+            filter_intra: cdf::FILTER_INTRA,
+            filter_intra_mode: cdf::FILTER_INTRA_MODE,
         }
     }
 

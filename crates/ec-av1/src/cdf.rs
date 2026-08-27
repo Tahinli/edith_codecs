@@ -305,6 +305,58 @@ pub const UV_MODE_CFL: [[u16; 15]; 13] = [
     ],
 ];
 
+/// `Default_Cfl_Sign_Cdf` (spec 9.4): the joint sign of a `UV_CFL_PRED`
+/// block's U/V alpha (spec 5.11.45's `cfl_alpha_signs`) — libaom's
+/// `default_cfl_sign_cdf` (entropymode.c), whose `AOM_CDF8(a0..a6)` arguments
+/// are this convention's cumulative points verbatim (only the *storage*, not
+/// the spec's own table, is `AOM_ICDF`-inverted).
+pub const CFL_SIGN: [u16; 9] = [1418, 2123, 13340, 18405, 26972, 28343, 32294, 32768, 0];
+
+/// `default_filter_intra_cdfs` (entropymode.c), the `use_filter_intra` flag's
+/// prior, indexed by block-size class: `[0]`=4x4, `[1]`=8x8, `[2]`=16x16,
+/// `[3]`=32x32 -- the only square sizes `av1_filter_intra_allowed_bsize`
+/// (width and height both <=32) ever offers this decoder's square blocks.
+pub const FILTER_INTRA: [[u16; 3]; 4] = [
+    [4621, 32768, 0],
+    [7866, 32768, 0],
+    [12408, 32768, 0],
+    [22343, 32768, 0],
+];
+/// `default_filter_intra_mode_cdf` (entropymode.c): which of the five
+/// `FILTER_INTRA_MODES` a `use_filter_intra` block picks.
+pub const FILTER_INTRA_MODE: [u16; 6] = [8949, 12776, 17211, 29558, 32768, 0];
+
+/// `Default_Cfl_Alpha_Cdf` (spec 9.4): a `UV_CFL_PRED` block's per-plane
+/// alpha magnitude (spec 5.11.45's `cfl_alpha_u`/`cfl_alpha_v`), indexed by
+/// the joint sign's context (`CFL_CONTEXT_U`/`CFL_CONTEXT_V`,
+/// libaom's cfl.h) — libaom's `default_cfl_alpha_cdf`.
+pub const CFL_ALPHA: [[u16; 17]; 6] = [
+    [
+        7637, 20719, 31401, 32481, 32657, 32688, 32692, 32696, 32700, 32704, 32708, 32712, 32716,
+        32720, 32724, 32768, 0,
+    ],
+    [
+        14365, 23603, 28135, 31168, 32167, 32395, 32487, 32573, 32620, 32647, 32668, 32672, 32676,
+        32680, 32684, 32768, 0,
+    ],
+    [
+        11532, 22380, 28445, 31360, 32349, 32523, 32584, 32649, 32673, 32677, 32681, 32685, 32689,
+        32693, 32697, 32768, 0,
+    ],
+    [
+        26990, 31402, 32282, 32571, 32692, 32696, 32700, 32704, 32708, 32712, 32716, 32720, 32724,
+        32728, 32732, 32768, 0,
+    ],
+    [
+        17248, 26058, 28904, 30608, 31305, 31877, 32126, 32321, 32394, 32464, 32516, 32560, 32576,
+        32593, 32622, 32768, 0,
+    ],
+    [
+        14738, 21678, 25779, 27901, 29024, 30302, 30980, 31843, 32144, 32413, 32520, 32594, 32622,
+        32656, 32660, 32768, 0,
+    ],
+];
+
 /// `Default_Txb_Skip_Cdf[2][3][0]` (spec 9.4): the all-zero flag of a 32x32
 /// luma transform block that covers its whole plane block, which is context 0.
 pub const TXB_SKIP_LUMA_32: [u16; 3] = [30669, 32768, 0];
