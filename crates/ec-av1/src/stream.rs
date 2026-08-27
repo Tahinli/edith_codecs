@@ -481,6 +481,52 @@ mod tests {
         assert_eq!(frames[0].v, ffmpeg_frames[0].v, "V vs ffmpeg");
     }
 
+    /// As [`a_real_libaom_gradients_stream_decodes_pixel_exact`], but at
+    /// 32x32 (below `is_cfl_allowed`'s 32x32 luma bound as a *single*
+    /// undivided block, spec 5.11.5) rather than 64x64 -- a whole 64x64 SB
+    /// is never CFL-eligible itself, only its <=32x32 partitions, and
+    /// `testsrc2`/`gradients` at 64x64 with rect/ab/1to4/angle-delta search
+    /// disabled reliably pick a whole-SB `PARTITION_NONE` (probed
+    /// lane-av1real r2), so no fixture at that size exercises CfL at all.
+    /// A 32x32 frame is exactly the whole-block, CFL-allowed case, and
+    /// lane-av1real r2 found `gradients` there reliably selects
+    /// `UV_CFL_PRED` (`uv_mode=13`) across a crf sweep -- `testsrc2` there
+    /// stays DC. Proves the CfL port this round added, not just DC-chroma
+    /// decode: pixel-exact against ffmpeg's own decode, not just "decoded".
+    #[test]
+    #[ignore = "r2 checkpoint: LUMA (not chroma) decodes near-flat 126-129 where ffmpeg shows a 41-82 gradient on the pinned CfL stream — the remaining bug is upstream of the CfL chroma math this round added; isolate the luma path first (r3)"]
+    fn a_real_libaom_cfl_stream_decodes_pixel_exact() {
+        if !have_ffmpeg() {
+            eprintln!("SKIP a_real_libaom_cfl_stream_decodes_pixel_exact: no ffmpeg");
+            return;
+        }
+        let (width, height) = (32, 32);
+        let stream = libaom_encode_with(
+            "gradients=size=32x32:c0=red:c1=blue:c2=green:rate=1:seed=42",
+            width,
+            height,
+            15,
+            &[
+                "-threads",
+                "1",
+                "-row-mt",
+                "0",
+                "-tile-columns",
+                "0",
+                "-tile-rows",
+                "0",
+                "-enable-cdef",
+                "0",
+            ],
+        )
+        .expect("ffmpeg encode");
+        let frames = decode_stream(&stream).expect("decode_stream on a real libaom stream");
+        let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
+        assert_eq!(frames[0].y, ffmpeg_frames[0].y, "luma vs ffmpeg");
+        assert_eq!(frames[0].u, ffmpeg_frames[0].u, "U vs ffmpeg");
+        assert_eq!(frames[0].v, ffmpeg_frames[0].v, "V vs ffmpeg");
+    }
+
     /// scratch: isolate a pinned mismatching stream's first divergent pixel.
     #[test]
     #[ignore]
