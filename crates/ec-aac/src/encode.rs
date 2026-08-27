@@ -20,6 +20,8 @@
 //! rather than iterators.
 #![allow(clippy::needless_range_loop)]
 
+use std::sync::LazyLock;
+
 use ec_core::{BitWriter, Error, Result};
 use ec_dsp::{Complex, Mdct, RealFft, Window};
 
@@ -650,14 +652,22 @@ impl AacEncoder {
                 continue;
             }
             floor[b] = sf_floor(peak).max(0);
+            // Noise is non-decreasing in level (coarser step -> more error),
+            // the same assumption the original linear scan relied on to break
+            // on first overage; bisect for the largest level still under
+            // target instead of walking it one step at a time.
             let mut best = floor[b];
-            let mut level = best;
-            while level < 255 {
-                if self.band_noise(frame, swb, b, level, windows, short) > target {
-                    break;
+            if self.band_noise(frame, swb, b, floor[b], windows, short) <= target {
+                let (mut lo, mut hi) = (floor[b], 255);
+                while lo < hi {
+                    let mid = lo + (hi - lo + 1) / 2;
+                    if self.band_noise(frame, swb, b, mid, windows, short) <= target {
+                        lo = mid;
+                    } else {
+                        hi = mid - 1;
+                    }
                 }
-                best = level;
-                level += 1;
+                best = lo;
             }
             sf[b] = best.clamp(floor[b], 255);
             zero[b] = false;
@@ -766,7 +776,7 @@ impl AacEncoder {
             for k in base + lo..base + hi {
                 let x = frame.coef[k];
                 let q = quantise_one(x, sf);
-                let mut back = (q.unsigned_abs() as f32).powf(4.0 / 3.0) * gain;
+                let mut back = pow43(q.unsigned_abs()) * gain;
                 if q < 0 {
                     back = -back;
                 }
@@ -839,6 +849,19 @@ fn apply_ms(pair: &mut [ChannelFrame], ms: &[bool], swb: &[u16], max_sfb: usize,
     }
 }
 
+/// `q^(4/3)` for the (small, bounded-by-`MAX_QUANT`) integer magnitudes the
+/// rate loop's noise search re-tests at every candidate scalefactor: a table
+/// lookup replaces what was otherwise the encoder's hottest `powf` call site.
+static POW43: LazyLock<Vec<f32>> = LazyLock::new(|| {
+    (0..=MAX_QUANT as u32)
+        .map(|q| (q as f32).powf(4.0 / 3.0))
+        .collect()
+});
+
+fn pow43(q: u32) -> f32 {
+    POW43[q.min(MAX_QUANT as u32) as usize]
+}
+
 /// The finest scalefactor at which a peak of this size still fits the escape
 /// codebook: below it the quantiser saturates, which costs bits *and* adds
 /// distortion.
@@ -852,7 +875,10 @@ fn quantise_one(x: f32, sf: i32) -> i32 {
         return 0;
     }
     let gain = 2f32.powf(-(sf - SF_OFFSET) as f32 * 0.25);
-    let q = ((x.abs() * gain).powf(0.75) + ROUND_BIAS) as i32;
+    // x^0.75 == sqrt(x * sqrt(x)): two sqrtf beat one powf by a wide margin,
+    // and this call site is the rate loop's inner-inner loop.
+    let v = x.abs() * gain;
+    let q = (v.sqrt() * v.sqrt().sqrt() + ROUND_BIAS) as i32;
     let q = q.min(MAX_QUANT);
     if x < 0.0 { -q } else { q }
 }
