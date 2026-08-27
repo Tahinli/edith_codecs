@@ -237,9 +237,9 @@ fn read_coeffs(
     if let Some(tx_type) = coding.tx_type.as_deref_mut() {
         let t = dec.symbol(tx_type);
         if t != 1 {
-            return Err(unsupported(
-                "a transform type other than DCT_DCT (round 2: inter/other intra tx sets)",
-            ));
+            return Err(unsupported(format!(
+                "a transform type other than DCT_DCT (round 2: inter/other intra tx sets), symbol {t}"
+            )));
         }
     }
 
@@ -655,16 +655,20 @@ fn read_plane(
     let levels = if tx_side == side {
         grid
     } else {
-        let mut full = vec![0i32; tx_side * tx_side];
-        for row in 0..side {
-            full[row * tx_side..][..side].copy_from_slice(&grid[row * side..][..side]);
+        // `grid` is `tx_side x tx_side` (the coded corner); `dequant_and_inverse`
+        // wants the true `side x side` transform, with dqDenom (spec 7.12.3)
+        // keyed by that true size, not the coded corner's -- so the corner
+        // goes into the top-left of a `side`-sized grid, not the reverse.
+        let mut full = vec![0i32; side * side];
+        for row in 0..tx_side {
+            full[row * side..][..tx_side].copy_from_slice(&grid[row * tx_side..][..tx_side]);
         }
         full
     };
-    let residual = dequant_and_inverse(&levels, tx_side, 8, i32::from(base_q_idx));
-    plane.reconstruct(x, y, tx_side, predict_mode, reach, &residual);
+    let residual = dequant_and_inverse(&levels, side, 8, i32::from(base_q_idx));
+    plane.reconstruct(x, y, side, predict_mode, reach, &residual);
     Ok(if tx_side == side {
-        residual_grid_placeholder(&levels, tx_side)
+        residual_grid_placeholder(&levels, side)
     } else {
         levels
     })
@@ -1075,28 +1079,72 @@ pub fn decode_key_frame_tile(
                                     let ctx16 = neighbours.partition_ctx(at16, SUB);
                                     if has_cols16 && has_rows16 {
                                         let part16 = dec.symbol(&mut cdfs.partition_w16[ctx16]);
-                                        if part16 != PARTITION_NONE {
+                                        if part16 == PARTITION_NONE {
+                                            decode_block(
+                                                &mut dec,
+                                                &mut cdfs,
+                                                &mut neighbours,
+                                                at16,
+                                                SUB,
+                                                TxbSet::Luma16,
+                                                TxbSet::Chroma8,
+                                                TX16,
+                                                TX8,
+                                                (&scan16, &scan8),
+                                                true,
+                                                &mut y,
+                                                &mut u,
+                                                &mut v,
+                                                base_q_idx,
+                                            )?;
+                                            continue;
+                                        }
+                                        if part16 != PARTITION_SPLIT {
                                             return Err(unsupported(
-                                                "a partition below 16x16 (this encoder never writes one)",
+                                                "a partition below 16x16 other than a clean split (this encoder never writes one)",
                                             ));
                                         }
-                                        decode_block(
-                                            &mut dec,
-                                            &mut cdfs,
-                                            &mut neighbours,
-                                            at16,
-                                            SUB,
-                                            TxbSet::Luma16,
-                                            TxbSet::Chroma8,
-                                            TX16,
-                                            TX8,
-                                            (&scan16, &scan8),
-                                            true,
-                                            &mut y,
-                                            &mut u,
-                                            &mut v,
-                                            base_q_idx,
-                                        )?;
+                                        // A real (non-straddle) SPLIT of a
+                                        // whole 16x16 into four 8x8 leaves --
+                                        // the same recursion the straddle
+                                        // path below already runs when the
+                                        // true frame edge forces it, just
+                                        // over all four positions instead of
+                                        // the one or two the edge leaves.
+                                        let (mi_row0, mi_col0) =
+                                            (sr as u32 * SUB_MI, sc as u32 * SUB_MI);
+                                        let mut prev_leaf: Option<((usize, usize), usize)> = None;
+                                        for i in 0..4 {
+                                            let (mr, mc) =
+                                                (mi_row0 + (i / 2) * 2, mi_col0 + (i % 2) * 2);
+                                            let leaf_mi = (mr as usize, mc as usize);
+                                            let leaf_ctx = neighbours.partition_ctx_mi(leaf_mi, 8);
+                                            let part8 =
+                                                dec.symbol(&mut cdfs.partition_w8[leaf_ctx]);
+                                            if part8 != PARTITION_NONE {
+                                                return Err(unsupported(
+                                                    "a partition below 8x8 (this encoder never writes one)",
+                                                ));
+                                            }
+                                            let leaf_mode = decode_leaf8(
+                                                &mut dec,
+                                                &mut cdfs,
+                                                &mut neighbours,
+                                                at16,
+                                                leaf_mi,
+                                                (&scan8, &scan4),
+                                                prev_leaf,
+                                                &mut y,
+                                                &mut u,
+                                                &mut v,
+                                                base_q_idx,
+                                            )?;
+                                            prev_leaf = Some((leaf_mi, leaf_mode));
+                                        }
+                                        if let Some((_, mode)) = prev_leaf {
+                                            neighbours.above_mode[sc] = mode;
+                                            neighbours.left_mode[sr] = mode;
+                                        }
                                         continue;
                                     }
                                     // The true edge falls inside this 16x16
