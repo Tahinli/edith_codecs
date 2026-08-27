@@ -1936,7 +1936,7 @@ pub(crate) fn encode_inter_frame(
     let (sb_cols, sb_rows) = (cols.div_ceil(2), rows.div_ceil(2));
     let (mi_cols, mi_rows) = (header.mi_cols as usize, header.mi_rows as usize);
     let mut grid = MiGrid::new(mi_cols, mi_rows);
-    let mut blocks = vec![BlockCoeffs::default(); cols * rows];
+    let mut blocks = vec![Quadrant::Whole(BlockCoeffs::default()); cols * rows];
 
     for sb_r in 0..sb_rows {
         for sb_c in 0..sb_cols {
@@ -1947,45 +1947,130 @@ pub(crate) fn encode_inter_frame(
                 if r32 >= rows || c32 >= cols {
                     continue;
                 }
-                let (x, y) = (c32 * BLOCK, r32 * BLOCK);
-                let (mi_row, mi_col) = (r32 * 8, c32 * 8);
-                let stack =
-                    find_mv_stack(&grid, mi_row, mi_col, 8, 8, LAST_FRAME, mi_cols, mi_rows);
-
-                let block = search_inter_block(
-                    &mut luma,
-                    &mut chroma,
-                    (x, y),
-                    &search,
-                    &mode_bits_table,
-                    reference,
-                    &stack,
+                // spec `decode_partition`'s hasRows/hasCols recomputed at this
+                // 32x32 block's own half (`crate::tile::has_half`), same as
+                // the key frame search: the true frame edge can fall inside a
+                // quadrant a superblock-level check already let through, and
+                // such a quadrant cannot be left whole -- it must split into
+                // the 16x16 leaves that are actually inside the true frame
+                // (`crate::tile::sb_coeff_inter_frame_tile`'s `Quadrant::Split`
+                // arm).
+                let (has_cols32, has_rows32) = (
+                    crate::tile::has_half(
+                        c32 as u32 * crate::tile::BLOCK_MI,
+                        crate::tile::BLOCK_MI,
+                        header.mi_cols,
+                    ),
+                    crate::tile::has_half(
+                        r32 as u32 * crate::tile::BLOCK_MI,
+                        crate::tile::BLOCK_MI,
+                        header.mi_rows,
+                    ),
                 );
+                if has_cols32 && has_rows32 {
+                    let (x, y) = (c32 * BLOCK, r32 * BLOCK);
+                    let (mi_row, mi_col) = (r32 * 8, c32 * 8);
+                    let stack =
+                        find_mv_stack(&grid, mi_row, mi_col, 8, 8, LAST_FRAME, mi_cols, mi_rows);
 
-                if let Some(info) = block.inter {
-                    for dr in 0..8 {
-                        for dc in 0..8 {
-                            grid.set(
-                                mi_row + dr,
-                                mi_col + dc,
-                                MiInfo {
-                                    is_inter: true,
-                                    ref_frame: LAST_FRAME,
-                                    mv: info.mv,
-                                    is_new_mv: matches!(info.mode, InterMode::NewMv),
-                                },
-                            );
+                    let block = search_inter_block(
+                        &mut luma,
+                        &mut chroma,
+                        (x, y),
+                        &search,
+                        &mode_bits_table,
+                        reference,
+                        &stack,
+                    );
+
+                    if let Some(info) = block.inter {
+                        for dr in 0..8 {
+                            for dc in 0..8 {
+                                grid.set(
+                                    mi_row + dr,
+                                    mi_col + dc,
+                                    MiInfo {
+                                        is_inter: true,
+                                        ref_frame: LAST_FRAME,
+                                        mv: info.mv,
+                                        is_new_mv: matches!(info.mode, InterMode::NewMv),
+                                    },
+                                );
+                            }
                         }
                     }
+                    blocks[r32 * cols + c32] = Quadrant::Whole(block);
+                } else {
+                    // The sub-positions actually inside the true frame, same
+                    // filter as `sb_coeff_inter_frame_tile`'s `sub_positions`.
+                    let sub_positions: Vec<(usize, usize)> = (0..4)
+                        .map(|i| (r32 * 2 + i / 2, c32 * 2 + i % 2))
+                        .filter(|&(sr, sc)| {
+                            (sr as u32) * crate::tile::SUB_MI < header.mi_rows
+                                && (sc as u32) * crate::tile::SUB_MI < header.mi_cols
+                        })
+                        .collect();
+                    // A 16x16 leaf the true edge itself cuts through needs a
+                    // rectangular (HORZ/VERT) transform this writer does not
+                    // code, same refusal as the key frame search's
+                    // `split_legal` check.
+                    if let Some(&(sr, sc)) = sub_positions.iter().find(|&&(sr, sc)| {
+                        !crate::tile::has_half(
+                            sc as u32 * crate::tile::SUB_MI,
+                            crate::tile::SUB_MI,
+                            header.mi_cols,
+                        ) || !crate::tile::has_half(
+                            sr as u32 * crate::tile::SUB_MI,
+                            crate::tile::SUB_MI,
+                            header.mi_rows,
+                        )
+                    }) {
+                        return Err(Error::unsupported(
+                            "AV1 encode",
+                            format!(
+                                "the 16x16 block at ({sc},{sr}) straddles the true frame \
+                                 edge in a way that needs a rectangular (HORZ/VERT) \
+                                 transform this encoder does not code yet"
+                            ),
+                        ));
+                    }
+                    // Coded through the inter frame's intra branch only (see
+                    // `crate::tile::sb_coeff_inter_frame_tile`'s doc comment on
+                    // its `Quadrant::Split` arm): no `Luma16Inter` tx_type
+                    // table exists yet for a genuine inter leaf at this size,
+                    // and these leaves only ever fill the sliver of real
+                    // content a true edge lands in the middle of a 32x32
+                    // block, not a leaf a motion search chose on its own.
+                    let mut leaves = Vec::with_capacity(sub_positions.len());
+                    for (sr, sc) in sub_positions {
+                        let (x, y) = (sc * SUB, sr * SUB);
+                        let (block, _cost) = code_square(
+                            &mut luma,
+                            &mut chroma,
+                            (x, y),
+                            SUB,
+                            &search,
+                            &mode_bits_table,
+                        );
+                        leaves.push(block);
+                    }
+                    blocks[r32 * cols + c32] = Quadrant::Split(leaves);
                 }
-                blocks[r32 * cols + c32] = block;
             }
         }
     }
 
-    let modes = blocks.iter().map(|b| b.mode).collect::<Vec<_>>();
-    let inter_block_share =
-        blocks.iter().filter(|b| b.inter.is_some()).count() as f64 / blocks.len() as f64;
+    let modes = blocks
+        .iter()
+        .flat_map(Quadrant::blocks)
+        .map(|b| b.mode)
+        .collect::<Vec<_>>();
+    let inter_block_share = blocks
+        .iter()
+        .flat_map(Quadrant::blocks)
+        .filter(|b| b.inter.is_some())
+        .count() as f64
+        / modes.len() as f64;
     let tile = sb_coeff_inter_frame_tile(header.mi_cols, header.mi_rows, base_q_idx, &blocks)?;
     let mut stream = temporal_delimiter();
     stream.extend_from_slice(&frame_obu(&seq, &header, &tile)?);
@@ -2268,10 +2353,10 @@ mod tests {
             ..BlockCoeffs::default()
         };
         let blocks = vec![
-            residual_block,
-            skipped_block.clone(),
-            skipped_block.clone(),
-            skipped_block,
+            Quadrant::Whole(residual_block),
+            Quadrant::Whole(skipped_block.clone()),
+            Quadrant::Whole(skipped_block.clone()),
+            Quadrant::Whole(skipped_block),
         ];
         let tile =
             sb_coeff_inter_frame_tile(inter_header.mi_cols, inter_header.mi_rows, 100, &blocks)
@@ -2545,6 +2630,71 @@ mod tests {
             assert_eq!(decoded.u, frame.reconstruction.u, "frame {i}: U");
             assert_eq!(decoded.v, frame.reconstruction.v, "frame {i}: V");
         }
+    }
+
+    /// 1280x720 -- the export size a real edith timeline hits -- is exactly
+    /// the "half straddle" class: 720 mod 32 == 16, so the true frame edge
+    /// falls at exactly half of the last row of 32x32 blocks (`has_half`'s
+    /// `pos + side_mi / 2 < bound` boundary), which is the case
+    /// `sb_coeff_inter_frame_tile`'s `Quadrant::Split` now codes rather than
+    /// refusing. A key frame alone already covered this size; this proves the
+    /// inter tile writer's parity with it across a real multi-frame export.
+    #[test]
+    fn a_sequence_round_trips_at_the_exactly_half_straddle_size() {
+        if !have_ffmpeg() {
+            eprintln!("SKIP a_sequence_round_trips_at_the_exactly_half_straddle_size: no ffmpeg");
+            return;
+        }
+        let (width, height) = (1280usize, 720usize);
+        let pictures: Vec<Picture> = (0..3)
+            .map(|i| panned_test_card(width, height, i * 3))
+            .collect();
+        let encoded = encode_sequence(&pictures, 100, 0.5).unwrap();
+        assert_eq!(encoded.frames.len(), 3);
+        for (i, frame) in encoded.frames.iter().enumerate() {
+            assert_eq!(
+                (frame.reconstruction.width, frame.reconstruction.height),
+                (width, height),
+                "frame {i}: reconstruction size"
+            );
+        }
+        assert_eq!(
+            ffprobe_size(&encoded.stream),
+            (width as u32, height as u32),
+            "ffprobe reports the true (display) 1280x720 size"
+        );
+        let decoded = ffmpeg_decode_sequence(&encoded.stream, width, height, 3);
+        assert_eq!(decoded.len(), 3, "decoded frame count");
+        for (i, (frame, decoded)) in encoded.frames.iter().zip(&decoded).enumerate() {
+            assert_eq!(decoded.y, frame.reconstruction.y, "frame {i}: luma");
+            assert_eq!(decoded.u, frame.reconstruction.u, "frame {i}: U");
+            assert_eq!(decoded.v, frame.reconstruction.v, "frame {i}: V");
+        }
+    }
+
+    /// 640x360 is the class the charter asks be kept consistent between the
+    /// key frame and inter frame writers: 360 mod 32 == 8, so a 16x16 leaf's
+    /// own half (`has_half` at the SUB level) itself straddles the true edge
+    /// -- the genuine "needs an 8x8/rectangular transform" case neither
+    /// writer codes. Both must refuse it the same way.
+    #[test]
+    fn both_writers_refuse_the_same_strictly_before_half_straddle_size() {
+        let (width, height) = (640usize, 360usize);
+        let picture = Picture::grey(width, height);
+        let key_err = encode_key_frame(&picture, 100, 0.5).unwrap_err();
+        assert!(
+            key_err.to_string().contains("rectangular"),
+            "key frame refusal: {key_err}"
+        );
+
+        // `encode_sequence`'s second frame is the inter path: same size,
+        // same class of refusal expected.
+        let pictures = vec![picture.clone(), picture];
+        let inter_err = encode_sequence(&pictures, 100, 0.5).unwrap_err();
+        assert!(
+            inter_err.to_string().contains("rectangular"),
+            "inter frame refusal: {inter_err}"
+        );
     }
 
     /// One frame of a real clip, scaled to a whole number of 32x32 blocks.
