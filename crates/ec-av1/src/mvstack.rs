@@ -39,18 +39,19 @@
 //!
 //! The corner probe's own candidate is added to the stack too (matching
 //! libaom: a genuinely new MV there becomes a real, if low-weight, entry),
-//! but — like the reduced row/col/top-right scans — at this module's own
-//! `IMMEDIATE_WEIGHT` scale rather than libaom's real `len * max(2, inc)`
-//! (row/col) or `2 * mi_size_wide[BLOCK_8X8]` (corner/top-right) weights.
-//! That scale mismatch is harmless for every caller this module has: the
-//! only real caller (`tile.rs`) always asks for a fixed `bw4 == bh4 == 8`
-//! block, at which size libaom's row and col weights are *always tied*
-//! (both scan a full-width same-size neighbour) and its corner/top-right
-//! weight is *always* far below either — exactly the ordering
-//! `IMMEDIATE_WEIGHT` already reproduces, so sort order and the
-//! `REF_CAT_LEVEL`-vs-not DRL split (which only tests a threshold, not a
-//! magnitude) come out identical either way. A caller with mixed block
-//! sizes would need the real weight formula; none exists today.
+//! at libaom's real `2 * mi_size_wide[BLOCK_8X8]` (`CORNER_WEIGHT`, 4) —
+//! same as the top-right probe, which shares `scan_blk_mbmi`'s fixed weight
+//! in libaom too. The row/col scans (`scan_row`/`scan_col`) carry libaom's
+//! real per-block-run `len * weight` formula (`scan_row_mbmi`/
+//! `scan_col_mbmi`, mvref_common.c), not a flat per-cell weight: this
+//! module shipped a flat `IMMEDIATE_WEIGHT = 2` for several rounds, exact
+//! only for `tile.rs`'s own encoder (always a fixed `bw4 == bh4 == 8` query
+//! against same-size-8 neighbours, where the real formula's `bw4 <= n4`
+//! weight boost applies identically on every candidate and so never
+//! reorders anything) — decode.rs's real variable partition sizes need the
+//! real formula, since a same-or-wider neighbour against a *smaller* query
+//! block gets a real, non-flat weight boost there libaom's DRL-index
+//! selection depends on.
 //!
 //! The corner probe's own match does *not* count toward the real
 //! `newmv_count` that feeds `new_mv_ctx` (libaom passes it a `dummy_newmv_count`
@@ -69,12 +70,8 @@
 //!
 //! Deliberately reduced away (see the crate report, not reproduced bit-exact
 //! here): compound/multi-reference candidates, the temporal MV projection
-//! scan, the real (non-corner) `idx = 2..MVREF_ROW_COLS` extended row/col
-//! scan positions (libaom's own `processed_rows`/`processed_cols` bookkeeping
-//! means those never fire for this module's fixed 8-mi block geometry — the
-//! immediate-offset scan's coverage window already reaches as far as the
-//! extended offsets can, so nothing there is left unscanned), the
-//! single-reference "extension" pass that re-walks the same row/col
+//! scan, and the single-reference "extension" pass that re-walks the same
+//! row/col
 //! neighbours through `process_single_ref_mv_candidate` (a no-op here: with
 //! only one reference frame ever in play, whatever it would add was already
 //! added by the row/col scan), and the "extra search" that pads a short
@@ -195,13 +192,19 @@ const REF_CAT_LEVEL: u32 = 640;
 /// The most candidates a stack keeps (spec `MAX_REF_MV_STACK_SIZE`).
 const MAX_STACK_SIZE: usize = 8;
 
-/// Weight one immediate (row `-1` / col `-1`) neighbour 4x4 unit's vote
-/// counts for (spec: `len * 2` with `len = 1` per unit for the reduction
-/// this module makes — see the module doc).
-const IMMEDIATE_WEIGHT: u32 = 2;
+/// The floor libaom's `scan_row_mbmi`/`scan_col_mbmi` weight starts at
+/// before a same-or-wider candidate block can raise it (`uint16_t weight =
+/// 2;`, mvref_common.c).
+const ROW_COL_WEIGHT_FLOOR: u32 = 2;
+
+/// Fixed weight libaom's `scan_blk_mbmi` uses for both single-cell probes
+/// (`2 * mi_size_wide[BLOCK_8X8]` = `2 * 2`): the diagonal corner and the
+/// top-right, neither of which ever runs the row/col scans' real per-block
+/// weight below.
+const CORNER_WEIGHT: u32 = 4;
 
 /// Spec `MVREF_ROW_COLS`: the extended row/col scan runs at offsets `-3` and
-/// `-5` (`idx = 2..=3`), one past `IMMEDIATE_WEIGHT`'s own `-1`.
+/// `-5` (`idx = 2..=3`), one past the immediate scan's own `-1`.
 const MVREF_ROW_COLS: usize = 3;
 
 /// Adds one candidate MV with `weight` to `candidates`, merging it into an
@@ -215,148 +218,133 @@ fn add_candidate(candidates: &mut Vec<StackEntry>, mv: (i32, i32), weight: u32) 
     }
 }
 
-/// The row-above scan (spec 7.10.2.2): every 4x4 unit directly above the
-/// block's span. Returns whether any unit voted, and `processed_rows`
-/// (libaom `scan_row_mbmi`'s output): how many rows past the immediate one
-/// this span already covers by *geometry* alone (0 unless a same-or-wider
-/// neighbour occupies it, in which case that neighbour's own `size` is the
-/// coverage, spec 7.10.2.2's `inc` term reduced to this crate's square,
-/// fixed-weight candidates) -- tracked for *every* coded cell, intra or
-/// inter, since libaom's `processed_rows` update sits outside the
-/// ref-frame-matching `add_ref_mv_candidate` call.
+/// The row scan (spec 7.10.2.2, libaom `scan_row_mbmi`): walks candidate
+/// *blocks* — not individual 4x4 cells — along the row `row_offset` mi units
+/// above the block's own row, in run-length steps sized by each candidate's
+/// own block width. Handles both the immediate probe (`row_offset == -1`)
+/// and the extended ones (`-3`, `-5`) libaom threads through the same
+/// function: `max_row_offset` is the immediate scan's own reach (spec
+/// 7.10.2.4's `find_valid_row_offset`, clamped to the tile's top edge), used
+/// only to size the weight boost below, not to gate whether this call runs
+/// at all (the caller does that via `processed_rows`/the tile edge).
+///
+/// Each matching candidate's vote is weighted `len * weight`: `len` is how
+/// many mi columns the run covers (the candidate's own width, floored to
+/// the query block's `bw4` and — at the wide/extended-scan geometries
+/// libaom's own `use_step_16`/`abs(row_offset) > 1` branches cover — raised
+/// to a block-size floor); `weight` starts at 2 and, only when the candidate
+/// is at least as wide as the query block (`bw4 <= n4`), rises to how much
+/// of `max_row_offset`'s remaining reach the candidate's own height can
+/// still cover. That `bw4 <= n4` condition is why this module's old flat
+/// `IMMEDIATE_WEIGHT = 2` was exact for every real caller before decode.rs
+/// existed: `tile.rs`'s own encoder only ever asks with `bw4 == 8` against
+/// neighbours it also always wrote at `size == 8`, and every synthetic test
+/// neighbour here uses `size: 1` (which the `n4 < weight`-floor condition
+/// keeps at the `2` floor regardless of `bw4`) — this real formula only
+/// diverges from that flat weight when a *bigger* candidate meets a
+/// *smaller* query block, which only decode.rs's variable partition sizes
+/// ever produce.
+///
+/// Threads `processed_rows` (`*mut` in libaom, `&mut` here) across every row
+/// call — immediate, then the two extended offsets — the way libaom's
+/// single stack `int` does: only the `bw4 <= n4` branch above updates it,
+/// same as libaom only updating `*processed_rows` there.
+#[allow(clippy::too_many_arguments)]
 fn scan_row(
     grid: &MiGrid,
     mi_row: usize,
     mi_col: usize,
     bw4: usize,
+    row_offset: isize,
+    max_row_offset: isize,
     ref_frame: i8,
     candidates: &mut Vec<StackEntry>,
     newmv_count: &mut u32,
-) -> (bool, usize) {
-    let Some(row) = mi_row.checked_sub(1) else {
-        return (false, 0);
+    processed_rows: &mut usize,
+) -> bool {
+    let Some(row) = mi_row.checked_add_signed(row_offset) else {
+        return false;
     };
+    let col_shift: usize = if row_offset.unsigned_abs() > 1 { 1 } else { 0 };
+    let use_step_16 = bw4 >= 16;
+    let end_mi = bw4.min(16);
     let mut found = false;
-    let mut processed_rows = 0;
-    for col in mi_col..mi_col + bw4 {
-        let Some(info) = grid.get(row, col) else {
+    let mut i = 0usize;
+    while i < end_mi {
+        let Some(info) = grid.get(row, mi_col + col_shift + i) else {
+            i += 1;
             continue;
         };
-        if bw4 <= info.size {
-            processed_rows = processed_rows.max(info.size);
+        let n4 = info.size;
+        let mut len = bw4.min(n4);
+        if use_step_16 {
+            len = len.max(4);
+        } else if row_offset.unsigned_abs() > 1 {
+            len = len.max(2);
+        }
+        let mut weight = ROW_COL_WEIGHT_FLOOR;
+        if bw4 <= n4 {
+            let inc = ((-max_row_offset + row_offset + 1) as usize).min(n4);
+            weight = weight.max(inc as u32);
+            *processed_rows = (inc as isize - row_offset - 1).max(0) as usize;
         }
         if info.is_inter && info.ref_frame == ref_frame {
             found = true;
-            add_candidate(candidates, info.mv, IMMEDIATE_WEIGHT);
+            add_candidate(candidates, info.mv, len as u32 * weight);
             *newmv_count += u32::from(info.is_new_mv);
         }
+        i += len.max(1);
     }
-    (found, processed_rows)
+    found
 }
 
-/// The col-left scan (spec 7.10.2.3): every 4x4 unit directly left of the
-/// block's span. Returns whether any unit voted, and `processed_cols`
-/// (`scan_row`'s doc, transposed).
+/// The col scan (spec 7.10.2.3, libaom `scan_col_mbmi`): `scan_row`,
+/// transposed.
+#[allow(clippy::too_many_arguments)]
 fn scan_col(
     grid: &MiGrid,
     mi_row: usize,
     mi_col: usize,
     bh4: usize,
+    col_offset: isize,
+    max_col_offset: isize,
     ref_frame: i8,
     candidates: &mut Vec<StackEntry>,
     newmv_count: &mut u32,
-) -> (bool, usize) {
-    let Some(col) = mi_col.checked_sub(1) else {
-        return (false, 0);
+    processed_cols: &mut usize,
+) -> bool {
+    let Some(col) = mi_col.checked_add_signed(col_offset) else {
+        return false;
     };
+    let row_shift: usize = if col_offset.unsigned_abs() > 1 { 1 } else { 0 };
+    let use_step_16 = bh4 >= 16;
+    let end_mi = bh4.min(16);
     let mut found = false;
-    let mut processed_cols = 0;
-    for row in mi_row..mi_row + bh4 {
-        let Some(info) = grid.get(row, col) else {
+    let mut i = 0usize;
+    while i < end_mi {
+        let Some(info) = grid.get(mi_row + row_shift + i, col) else {
+            i += 1;
             continue;
         };
-        if bh4 <= info.size {
-            processed_cols = processed_cols.max(info.size);
+        let n4 = info.size;
+        let mut len = bh4.min(n4);
+        if use_step_16 {
+            len = len.max(4);
+        } else if col_offset.unsigned_abs() > 1 {
+            len = len.max(2);
+        }
+        let mut weight = ROW_COL_WEIGHT_FLOOR;
+        if bh4 <= n4 {
+            let inc = ((-max_col_offset + col_offset + 1) as usize).min(n4);
+            weight = weight.max(inc as u32);
+            *processed_cols = (inc as isize - col_offset - 1).max(0) as usize;
         }
         if info.is_inter && info.ref_frame == ref_frame {
             found = true;
-            add_candidate(candidates, info.mv, IMMEDIATE_WEIGHT);
+            add_candidate(candidates, info.mv, len as u32 * weight);
             *newmv_count += u32::from(info.is_new_mv);
         }
-    }
-    (found, processed_cols)
-}
-
-/// The extended row scan (spec 7.10.2.4's `idx = 2..MVREF_ROW_COLS` row
-/// positions, libaom `mvref_common.c`'s second loop): probes rows `-3` and
-/// `-5`, shifted one column right (`col_offset = 1`, libaom's `col_adj`
-/// collapses to that for every block size this crate ever queries), each
-/// only run when the immediate scan's own `processed_rows` hasn't already
-/// covered it and the tile's top edge doesn't clip it first. Its match folds
-/// into the row side (`ref_match_count`, never `nearest_match`), same as the
-/// corner probe.
-fn scan_row_extended(
-    grid: &MiGrid,
-    mi_row: usize,
-    mi_col: usize,
-    bw4: usize,
-    ref_frame: i8,
-    candidates: &mut Vec<StackEntry>,
-    processed_rows: usize,
-) -> bool {
-    let max_row_offset = mi_row.min(MVREF_ROW_COLS * 2);
-    let mut found = false;
-    for idx in 2..=MVREF_ROW_COLS {
-        let offset = idx * 2 - 1;
-        if offset > max_row_offset || offset <= processed_rows {
-            continue;
-        }
-        let Some(row) = mi_row.checked_sub(offset) else {
-            continue;
-        };
-        for col in mi_col + 1..mi_col + 1 + bw4 {
-            if let Some(info) = grid.get(row, col)
-                && info.is_inter
-                && info.ref_frame == ref_frame
-            {
-                found = true;
-                add_candidate(candidates, info.mv, IMMEDIATE_WEIGHT);
-            }
-        }
-    }
-    found
-}
-
-/// The extended col scan: `scan_row_extended`, transposed (probes cols `-3`
-/// and `-5`, shifted one row down).
-fn scan_col_extended(
-    grid: &MiGrid,
-    mi_row: usize,
-    mi_col: usize,
-    bh4: usize,
-    ref_frame: i8,
-    candidates: &mut Vec<StackEntry>,
-    processed_cols: usize,
-) -> bool {
-    let max_col_offset = mi_col.min(MVREF_ROW_COLS * 2);
-    let mut found = false;
-    for idx in 2..=MVREF_ROW_COLS {
-        let offset = idx * 2 - 1;
-        if offset > max_col_offset || offset <= processed_cols {
-            continue;
-        }
-        let Some(col) = mi_col.checked_sub(offset) else {
-            continue;
-        };
-        for row in mi_row + 1..mi_row + 1 + bh4 {
-            if let Some(info) = grid.get(row, col)
-                && info.is_inter
-                && info.ref_frame == ref_frame
-            {
-                found = true;
-                add_candidate(candidates, info.mv, IMMEDIATE_WEIGHT);
-            }
-        }
+        i += len.max(1);
     }
     found
 }
@@ -384,7 +372,7 @@ fn scan_top_right(
         && info.is_inter
         && info.ref_frame == ref_frame
     {
-        add_candidate(candidates, info.mv, IMMEDIATE_WEIGHT);
+        add_candidate(candidates, info.mv, CORNER_WEIGHT);
         *newmv_count += u32::from(info.is_new_mv);
         return true;
     }
@@ -412,7 +400,7 @@ fn scan_corner(
         && info.is_inter
         && info.ref_frame == ref_frame
     {
-        add_candidate(candidates, info.mv, IMMEDIATE_WEIGHT);
+        add_candidate(candidates, info.mv, CORNER_WEIGHT);
         *newmv_count += u32::from(info.is_new_mv);
         return true;
     }
@@ -469,24 +457,56 @@ pub fn find_mv_stack(
 ) -> MvStack {
     let mut candidates = Vec::new();
     let mut newmv_count = 0u32;
-    let (found_above, processed_rows) = scan_row(
-        grid,
-        mi_row,
-        mi_col,
-        bw4,
-        ref_frame,
-        &mut candidates,
-        &mut newmv_count,
-    );
-    let (found_left, processed_cols) = scan_col(
-        grid,
-        mi_row,
-        mi_col,
-        bh4,
-        ref_frame,
-        &mut candidates,
-        &mut newmv_count,
-    );
+
+    // libaom's `max_row_offset`/`max_col_offset` (`setup_ref_mv_list`): how
+    // far the row/col scans may reach, clamped to the tile's near edge
+    // (single-tile-per-frame here, so that's just the frame edge at 0) --
+    // `row_adj`/`col_adj` only ever fire for a sub-8x8 query block, which no
+    // real caller of this module ever is, but are ported anyway since
+    // nothing here relies on that.
+    let row_adj = bh4 < 2 && mi_row % 2 == 1;
+    let col_adj = bw4 < 2 && mi_col % 2 == 1;
+    let max_row_offset: isize = if mi_row > 0 {
+        let reach = if bh4 < 2 { -4 } else { -6 } + isize::from(row_adj);
+        reach.max(-(mi_row as isize))
+    } else {
+        0
+    };
+    let max_col_offset: isize = if mi_col > 0 {
+        let reach = if bw4 < 2 { -4 } else { -6 } + isize::from(col_adj);
+        reach.max(-(mi_col as isize))
+    } else {
+        0
+    };
+
+    let mut processed_rows = 0usize;
+    let mut processed_cols = 0usize;
+    let found_above = mi_row > 0
+        && scan_row(
+            grid,
+            mi_row,
+            mi_col,
+            bw4,
+            -1,
+            max_row_offset,
+            ref_frame,
+            &mut candidates,
+            &mut newmv_count,
+            &mut processed_rows,
+        );
+    let found_left = mi_col > 0
+        && scan_col(
+            grid,
+            mi_row,
+            mi_col,
+            bh4,
+            -1,
+            max_col_offset,
+            ref_frame,
+            &mut candidates,
+            &mut newmv_count,
+            &mut processed_cols,
+        );
     let found_top_right = scan_top_right(
         grid,
         mi_row,
@@ -523,32 +543,58 @@ pub fn find_mv_stack(
         &mut candidates,
         &mut dummy_newmv_count,
     );
-    // The extended row/col scan (spec 7.10.2.4's `idx = 2..MVREF_ROW_COLS`):
-    // only reachable once the immediate scan's own reach (`processed_rows`/
-    // `processed_cols`) leaves a gap the tile's edge doesn't already clip.
-    // At this module's fixed 8-mi block geometry with every coded cell
-    // (intra or inter) now feeding coverage, that reach always hits
+    // The extended row/col scan (spec 7.10.2.4's `idx = 2..MVREF_ROW_COLS`,
+    // libaom's second `scan_row_mbmi`/`scan_col_mbmi` loop): reachable only
+    // once the immediate scan's own reach (`processed_rows`/`processed_cols`,
+    // threaded across calls the way libaom's own `int`s are) leaves a gap
+    // `max_row_offset`/`max_col_offset` (the tile edge) doesn't already
+    // clip. At this module's fixed 8-mi `tile.rs` geometry with every coded
+    // cell (intra or inter) feeding coverage, that reach always hits
     // `MVREF_ROW_COLS`'s farthest offset first -- a true no-op there (see
-    // module doc and `extended_scan_is_a_no_op_at_8mi_geometry` below). Folds
-    // into the row/col match booleans, never `nearest_match`.
-    let row_matched_ext = scan_row_extended(
-        grid,
-        mi_row,
-        mi_col,
-        bw4,
-        ref_frame,
-        &mut candidates,
-        processed_rows,
-    );
-    let col_matched_ext = scan_col_extended(
-        grid,
-        mi_row,
-        mi_col,
-        bh4,
-        ref_frame,
-        &mut candidates,
-        processed_cols,
-    );
+    // `extended_scan_is_a_no_op_at_8mi_geometry` below); decode.rs's smaller
+    // query blocks can leave real gaps this now actually scans. Folds into
+    // the row/col match booleans, never `nearest_match`; shares the corner
+    // probe's `dummy_newmv_count` (libaom's `setup_ref_mv_list` does too).
+    let mut row_matched_ext = false;
+    let mut col_matched_ext = false;
+    for idx in 2..=MVREF_ROW_COLS {
+        let row_offset = -((idx as isize) * 2) + 1 + isize::from(row_adj);
+        let col_offset = -((idx as isize) * 2) + 1 + isize::from(col_adj);
+        if row_offset.unsigned_abs() <= max_row_offset.unsigned_abs()
+            && row_offset.unsigned_abs() > processed_rows
+            && scan_row(
+                grid,
+                mi_row,
+                mi_col,
+                bw4,
+                row_offset,
+                max_row_offset,
+                ref_frame,
+                &mut candidates,
+                &mut dummy_newmv_count,
+                &mut processed_rows,
+            )
+        {
+            row_matched_ext = true;
+        }
+        if col_offset.unsigned_abs() <= max_col_offset.unsigned_abs()
+            && col_offset.unsigned_abs() > processed_cols
+            && scan_col(
+                grid,
+                mi_row,
+                mi_col,
+                bh4,
+                col_offset,
+                max_col_offset,
+                ref_frame,
+                &mut candidates,
+                &mut dummy_newmv_count,
+                &mut processed_cols,
+            )
+        {
+            col_matched_ext = true;
+        }
+    }
     let ref_match_count = usize::from(row_matched || corner_matched || row_matched_ext)
         + usize::from(found_left || col_matched_ext);
 
@@ -693,10 +739,12 @@ mod tests {
 
         assert_eq!(stack.entries.len(), 1);
         assert_eq!(stack.entries[0].mv, mv);
-        // 2 above cells + 2 left cells + 1 top-right, each weight 2, plus the
-        // REF_CAT_LEVEL boost av1_find_mv_stack applies to every entry the
-        // immediate row/col/top-right scan found (module doc).
-        assert_eq!(stack.entries[0].weight, 10 + REF_CAT_LEVEL);
+        // 2 above cells + 2 left cells (weight 2 each, `size: 1` neighbours
+        // below the `bw4 <= n4` weight-boost floor) + 1 top-right (libaom's
+        // real `scan_blk_mbmi` weight, `CORNER_WEIGHT` = 4, not a flat 2),
+        // plus the REF_CAT_LEVEL boost av1_find_mv_stack applies to every
+        // entry the immediate row/col/top-right scan found (module doc).
+        assert_eq!(stack.entries[0].weight, 12 + REF_CAT_LEVEL);
         assert_eq!(stack.nearest_mv, mv);
         // Exact ctx (see module doc): both sides matched (nearest_match=2)
         // and no neighbour was coded NEWMV, which is libaom's
@@ -873,6 +921,39 @@ mod tests {
         assert_eq!(stack.entries.len(), 1);
         assert_eq!(stack.new_mv_ctx, 1); // ref_match_count == 1, not the old hard-0
         assert_eq!(stack.ref_mv_ctx, 1); // nearest_match=0, ref_match_count=1
+    }
+
+    /// The class this round ports: a query block *smaller* than its
+    /// same-row neighbour (decode.rs's real variable partition sizes, never
+    /// `tile.rs`'s fixed `bw4 == 8`) gets libaom's real, non-flat weight —
+    /// hand-computed against `scan_row_mbmi` (mvref_common.c): `bw4 = 2`
+    /// against an `n4 = 8` neighbour 6 mi rows from the frame's top edge
+    /// gives `len = min(bw4, n4) = 2`, `inc = min(-max_row_offset +
+    /// row_offset + 1, n4) = min(6 - 1 + 1, 8) = 6`, `weight = max(2, inc) =
+    /// 6`, total `len * weight = 12` -- not the flat `IMMEDIATE_WEIGHT = 2`
+    /// this module used to report for every match regardless of block size.
+    #[test]
+    fn a_wider_neighbour_than_the_query_block_gets_libaoms_real_weight() {
+        let mut grid = MiGrid::new(32, 32);
+        let (mi_row, mi_col) = (8, 8);
+        let mv = (4, 4);
+        grid.set(
+            mi_row - 1,
+            mi_col,
+            MiInfo {
+                is_inter: true,
+                ref_frame: 1,
+                mv,
+                is_new_mv: false,
+                size: 8,
+            },
+        );
+
+        let stack = find_mv_stack(&grid, mi_row, mi_col, 2, 2, 1, 32, 32);
+
+        assert_eq!(stack.entries.len(), 1);
+        assert_eq!(stack.entries[0].mv, mv);
+        assert_eq!(stack.entries[0].weight, 12 + REF_CAT_LEVEL);
     }
 
     #[test]
