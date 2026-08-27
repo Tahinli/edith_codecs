@@ -215,6 +215,7 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 &header.loop_filter,
                 initial_cdfs,
                 header.tx_mode == TxMode::Select,
+                header.reduced_tx_set,
             )?
         } else {
             let last_slot = header.ref_frame_idx[0] as usize;
@@ -341,6 +342,8 @@ mod tests {
                 &ec_av1_syntax::CdefParams::default(),
                 &ec_av1_syntax::LoopFilterParams::default(),
                 false,
+                // Our own encoder always writes `reduced_tx_set: true`.
+                true,
             )
             .unwrap();
             let via_stream = decode_stream(&encoded.stream).unwrap();
@@ -1036,9 +1039,13 @@ mod tests {
             // search to prefer a split transform over the block's own full
             // size -- `mandelbrot`'s fractal boundary gives every attempt
             // (a different `start_scale`) sharp, varied-frequency edges.
+            // start_scale 5.0 is the proven first try (decodes pixel-exact
+            // AND reads the seven-symbol set-1 tx_type rows on TX8 TUs);
+            // later attempts walk down for variety when aomenc's RD flips
+            // elsewhere.
             let source = format!(
                 "mandelbrot=size=64x64:start_scale={}:rate=25",
-                3.0 - f64::from(attempt) * 0.06
+                5.0 - f64::from(attempt) * 0.06
             );
             let y4m = Command::new("ffmpeg")
                 .args([
@@ -1084,6 +1091,13 @@ mod tests {
                     "--enable-ab-partitions=0",
                     "--enable-1to4-partitions=0",
                     "--enable-filter-intra=0",
+                    // Every non-DC intra tool off: directional chroma and
+                    // angle deltas are separate round-2 gaps, and DC-only
+                    // residual is exactly what gives the RD search a reason
+                    // to split a transform.
+                    "--enable-smooth-intra=0",
+                    "--enable-paeth-intra=0",
+                    "--enable-directional-intra=0",
                     "--enable-angle-delta=0",
                     "--enable-cdef=0",
                     // Loop restoration is a named refusal (aomenc's RD picks
@@ -1091,9 +1105,14 @@ mod tests {
                     // whose test targets a different surface.
                     "--enable-restoration=0",
                     "--max-partition-size=32",
+                    // 16x16 blocks are what split into the TX8 TUs whose
+                    // set-1 tx_type rows this gate exists to prove; some
+                    // scales resolve depth 2 (TX4, a named refusal) and the
+                    // attempt loop just moves on.
+                    "--min-partition-size=16",
                     "--enable-palette=0",
                     "--enable-intrabc=0",
-                    "--enable-cfl-intra=1",
+                    "--enable-cfl-intra=0",
                     "--obu",
                     "-o",
                     "-",

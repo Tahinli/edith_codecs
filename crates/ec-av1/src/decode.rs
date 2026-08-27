@@ -288,13 +288,20 @@ fn read_coeffs(
     }
     let mut tx_type = TxType::DctDct;
     if let Some(tx_type_cdf) = coding.tx_type.as_deref_mut() {
+        // The CDF row's own width names its set: 7 symbols (8 slots) is
+        // `TX_SET_INTRA_1`, 5 (6 slots) the reduced `TX_SET_INTRA_2` (the
+        // inter sets we read share set 2's symbol order).
+        let set1 = tx_type_cdf.len() == 8;
         let t = dec.symbol(tx_type_cdf);
         if trace {
-            eprintln!("TRACE tx_type value={t}");
+            eprintln!("TRACE tx_type value={t} set1={set1}");
         }
-        tx_type = TxType::from_symbol(t).ok_or_else(|| {
-            unsupported(format!("a tx_type symbol outside its CDF's own set: {t}"))
-        })?;
+        tx_type = if set1 {
+            TxType::from_symbol_set1(t)
+        } else {
+            TxType::from_symbol(t)
+        }
+        .ok_or_else(|| unsupported(format!("a tx_type symbol outside its CDF's own set: {t}")))?;
     }
 
     let eob = read_eob(dec, coding);
@@ -1165,6 +1172,7 @@ fn decode_block(
     scan16: &[u16],
     scan8: &[u16],
     tx_select: bool,
+    reduced_tx_set: bool,
 ) -> Result<()> {
     let (r, c) = at;
     let (px, py) = (c * SUB, r * SUB);
@@ -1196,7 +1204,7 @@ fn decode_block(
         (side, luma_tx)
     };
     let luma_set = if tx_select {
-        txbset_for(logical_tx)
+        txbset_for(logical_tx, reduced_tx_set)
     } else {
         luma_set
     };
@@ -1433,6 +1441,7 @@ fn decode_leaf8(
     base_q_idx: u8,
     enable_filter_intra: bool,
     tx_select: bool,
+    reduced_tx_set: bool,
 ) -> Result<usize> {
     let (r, c) = outer_at;
     let mut above_mode = neighbours.above_mode[c];
@@ -1504,7 +1513,11 @@ fn decode_leaf8(
         luma_grid = read_plane(
             dec,
             cdfs,
-            TxbSet::Luma8,
+            if reduced_tx_set {
+                TxbSet::Luma8
+            } else {
+                TxbSet::Luma8Set1
+            },
             scans.0,
             0,
             around[0],
@@ -1856,13 +1869,19 @@ fn scan_for<'a>(tx_px: usize, scan32: &'a [u16], scan16: &'a [u16], scan8: &'a [
 /// The [`TxbSet`] a resolved luma transform side reads its coefficient tables
 /// from -- 64 is only ever the 64x64-block, depth-0, corner-scanned case
 /// ([`TxbSet::Luma64`]); every other resolved side maps to its own matching
-/// set.
-fn txbset_for(tx_px: usize) -> TxbSet {
+/// set. `get_tx_set` (spec 5.11.48) only splits on `reduced_tx_set` at
+/// `TX_8X8`: an intra `TX_16X16` always reads `TX_SET_INTRA_2` regardless of
+/// the flag (`av1_get_ext_tx_set_type`'s `tx_size_sqr == TX_16X16` branch
+/// ignores `use_reduced_set` once it is past the `TX_32X32`/reduced-set
+/// checks), so only the 8x8 case has a second table
+/// ([`TxbSet::Luma8Set1`]).
+fn txbset_for(tx_px: usize, reduced_tx_set: bool) -> TxbSet {
     match tx_px {
         64 => TxbSet::Luma64,
         32 => TxbSet::Luma32,
         16 => TxbSet::Luma16,
-        8 => TxbSet::Luma8,
+        8 if reduced_tx_set => TxbSet::Luma8,
+        8 => TxbSet::Luma8Set1,
         _ => unreachable!("read_tx_size never resolves a block's own side to anything else"),
     }
 }
@@ -2408,6 +2427,7 @@ pub fn decode_key_frame_tile(
     cdef: &CdefParams,
     loop_filter: &LoopFilterParams,
     tx_select: bool,
+    reduced_tx_set: bool,
 ) -> Result<Picture> {
     decode_key_frame_tile_with_cdfs(
         data,
@@ -2421,6 +2441,7 @@ pub fn decode_key_frame_tile(
         loop_filter,
         None,
         tx_select,
+        reduced_tx_set,
     )
     .map(|(picture, _)| picture)
 }
@@ -2445,6 +2466,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     loop_filter: &LoopFilterParams,
     initial_cdfs: Option<Cdfs>,
     tx_select: bool,
+    reduced_tx_set: bool,
 ) -> Result<(Picture, Cdfs)> {
     if mi_cols == 0 || mi_rows == 0 {
         return Err(unsupported("a frame with no mode-info grid"));
@@ -2554,6 +2576,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                         &scan16,
                         &scan8,
                         tx_select,
+                        reduced_tx_set,
                     )?;
                 }
                 PARTITION_SPLIT => {
@@ -2615,6 +2638,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                     &scan16,
                                     &scan8,
                                     tx_select,
+                                    reduced_tx_set,
                                 )?;
                             }
                             PARTITION_SPLIT => {
@@ -2662,6 +2686,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                                 &scan16,
                                                 &scan8,
                                                 tx_select,
+                                                reduced_tx_set,
                                             )?;
                                             continue;
                                         }
@@ -2706,6 +2731,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                                 base_q_idx,
                                                 enable_filter_intra,
                                                 tx_select,
+                                                reduced_tx_set,
                                             )?;
                                             prev_leaf = Some((leaf_mi, leaf_mode));
                                         }
@@ -2769,6 +2795,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                             base_q_idx,
                                             enable_filter_intra,
                                             tx_select,
+                                            reduced_tx_set,
                                         )?;
                                         prev_leaf = Some((leaf_mi, leaf_mode));
                                     }
@@ -4168,7 +4195,8 @@ mod tests {
                 false,
                 &CdefParams::default(),
                 &LoopFilterParams::default(),
-                false
+                false,
+                true,
             )
             .is_err()
         );
@@ -4210,6 +4238,7 @@ mod tests {
             &CdefParams::default(),
             &LoopFilterParams::default(),
             false,
+            true,
         )
         .unwrap();
         assert_eq!(decoded.width, w, "{w}x{h}: decoded width");
@@ -4292,6 +4321,7 @@ mod tests {
             &CdefParams::default(),
             &LoopFilterParams::default(),
             false,
+            true,
         )
         .unwrap();
         assert!(
@@ -4476,6 +4506,7 @@ mod tests {
                 &CdefParams::default(),
                 &LoopFilterParams::default(),
                 false,
+                true,
             )
             .unwrap();
             assert_eq!(ours.y, ffmpeg_decoded.y, "{width}x{height}: luma vs ffmpeg");
@@ -4547,6 +4578,7 @@ mod tests {
             &CdefParams::default(),
             &LoopFilterParams::default(),
             false,
+            true,
         )
         .unwrap();
         assert_eq!(
@@ -4821,6 +4853,7 @@ mod tests {
             &CdefParams::default(),
             &LoopFilterParams::default(),
             false,
+            true,
         )
         .unwrap();
         assert_eq!(reference.y, ffmpeg_frames[0].y, "frame 0 luma vs ffmpeg");
