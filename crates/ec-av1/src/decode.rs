@@ -21,7 +21,7 @@
 //! too). Anything outside that refuses with [`Error::unsupported`] rather than
 //! silently miscoding.
 
-use ec_av1_syntax::CdefParams;
+use ec_av1_syntax::{CdefParams, LoopFilterParams};
 use ec_core::{Error, Result};
 
 use crate::cdf;
@@ -49,6 +49,17 @@ static FILTER_INTRA_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::At
 /// Current value of [`FILTER_INTRA_HITS`].
 pub(crate) fn filter_intra_hits() -> usize {
     FILTER_INTRA_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// How many 4-pixel deblocking edge groups [`edge_params`] has actually
+/// selected for filtering, across every call in the process -- the same
+/// before/after counter pattern as [`FILTER_INTRA_HITS`], proving a stream
+/// exercised `apply_deblock` rather than every edge landing on level 0.
+static DEBLOCK_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Current value of [`DEBLOCK_HITS`].
+pub(crate) fn deblock_hits() -> usize {
+    DEBLOCK_HITS.load(std::sync::atomic::Ordering::Relaxed)
 }
 const SUB_MI: u32 = 4;
 const MI: usize = 4;
@@ -415,6 +426,18 @@ struct Neighbours {
     /// mi cell one coded block covers.
     skip_grid: Vec<bool>,
     skip_grid_cols_mi: usize,
+    /// Per-4x4-mi luma transform width in pixels (8/16/32/64) -- this decoder
+    /// never splits a coded block's transform below its own size (round 2:
+    /// `TxMode::Select`/`tx_depth` refused), so a block's own side *is* its
+    /// transform size, spec 7.14's `get_transform_size`/`get_filter_level`
+    /// edge-length lookup (`apply_deblock`).
+    tx_grid: Vec<u8>,
+    /// Per-4x4-mi `is_inter` flag -- the loop filter's ref/mode delta lookup
+    /// (spec 7.14.4 `get_filter_level`; every inter block this decoder
+    /// produces is a single `LAST_FRAME` reference with a non-`GLOBALMV`
+    /// mode, so `is_inter` alone picks the right `ref_deltas`/`mode_deltas`
+    /// entry without a separate ref/mode grid).
+    inter_grid: Vec<bool>,
 }
 
 impl Neighbours {
@@ -438,6 +461,27 @@ impl Neighbours {
             mi_rows,
             skip_grid: vec![false; cols * (SUB / MI) * rows * (SUB / MI)],
             skip_grid_cols_mi: cols * (SUB / MI),
+            tx_grid: vec![0u8; cols * (SUB / MI) * rows * (SUB / MI)],
+            inter_grid: vec![false; cols * (SUB / MI) * rows * (SUB / MI)],
+        }
+    }
+
+    /// Marks every 4x4 mi cell a just-decoded coded block covers with its own
+    /// transform width (in pixels) and `is_inter` flag -- the loop filter's
+    /// per-edge lookup (`apply_deblock`), filled at the same call sites and
+    /// units as [`Self::fill_skip_grid`].
+    fn fill_lf_grid(&mut self, at_mi: (usize, usize), side_mi: usize, tx_px: u8, is_inter: bool) {
+        let (mi_r, mi_c) = at_mi;
+        for rr in 0..side_mi {
+            for cc in 0..side_mi {
+                let idx = (mi_r + rr) * self.skip_grid_cols_mi + (mi_c + cc);
+                if let Some(cell) = self.tx_grid.get_mut(idx) {
+                    *cell = tx_px;
+                }
+                if let Some(cell) = self.inter_grid.get_mut(idx) {
+                    *cell = is_inter;
+                }
+            }
         }
     }
 
@@ -464,6 +508,17 @@ impl Neighbours {
     /// Spec/libaom `is_8x8_block_skip` requires *every* one of the four 4x4
     /// mi cells the 8x8 covers to be skip (a smaller-than-8x8 partition can
     /// straddle the region with a mix of skip/non-skip blocks).
+    /// A single 4x4 mi cell's own `skip` flag, unaggregated (unlike
+    /// [`Self::is_skip_txfm`]'s 8x8 all-four-cells rule) -- what the loop
+    /// filter's `curr_skipped`/`pv_skip_txfm` (spec 7.14.2) want, since a
+    /// filtered edge's two sides are each exactly one coded block wide.
+    fn skip_at(&self, mi_r: usize, mi_c: usize) -> bool {
+        self.skip_grid
+            .get(mi_r * self.skip_grid_cols_mi + mi_c)
+            .copied()
+            .unwrap_or(false)
+    }
+
     fn is_skip_txfm(&self, mi_r: usize, mi_c: usize) -> bool {
         (0..2).all(|rr| {
             (0..2).all(|cc| {
@@ -1096,6 +1151,12 @@ fn decode_block(
     }
     neighbours.record(at, side, mode, &[luma_grid, u_grid, v_grid]);
     neighbours.fill_skip_grid((r * (SUB / MI), c * (SUB / MI)), side / MI, skip);
+    neighbours.fill_lf_grid(
+        (r * (SUB / MI), c * (SUB / MI)),
+        side / MI,
+        side as u8,
+        false,
+    );
     Ok(())
 }
 
@@ -1238,6 +1299,7 @@ fn decode_leaf8(
     }
     neighbours.record_mi(leaf_mi, 8, &[luma_grid, u_grid, v_grid]);
     neighbours.fill_skip_grid(leaf_mi, 2, skip);
+    neighbours.fill_lf_grid(leaf_mi, 2, 8, false);
     Ok(mode)
 }
 
@@ -1425,6 +1487,462 @@ fn cdef_filter_block(
 /// size. `cdef_bits == 0` is this crate's only supported case so far (see the
 /// refusal in `stream.rs`), so every 64x64 filter block always uses index 0's
 /// strengths -- no per-block `cdef_idx` selection is implemented yet.
+/// Spec 7.14: the in-loop deblocking filter, applied once per frame after
+/// tile reconstruction and before [`apply_cdef`]. Uniform-level path only --
+/// `stream.rs` already refuses `delta_lf_present`/segmentation upstream, so
+/// every block's level comes from [`LoopFilterParams::level`] plus the
+/// `ref_deltas`/`mode_deltas` adjustment alone (spec 7.14.4's
+/// `get_filter_level`, precomputed per-block here rather than cached in a
+/// table the way libaom's `av1_loop_filter_frame_init` does).
+///
+/// Ported from libaom's `av1/common/av1_loopfilter.c` (edge/level decision)
+/// and `aom_dsp/loopfilter.c` (the `aom_lpf_*` pixel kernels).
+fn apply_deblock(
+    y: &mut PlaneBuf,
+    u: &mut PlaneBuf,
+    v: &mut PlaneBuf,
+    lf: &LoopFilterParams,
+    n: &Neighbours,
+) {
+    if lf.level[0] != 0 || lf.level[1] != 0 {
+        deblock_plane(y, 0, lf, n);
+    }
+    if lf.level[2] != 0 {
+        deblock_plane(u, 1, lf, n);
+    }
+    if lf.level[3] != 0 {
+        deblock_plane(v, 2, lf, n);
+    }
+}
+
+/// Luma-mi-grid position (row or col) a plane-local pixel coordinate falls
+/// in -- `Neighbours::tx_grid`/`inter_grid` are always indexed at the luma
+/// 4x4-mi grain, even when `coord` is a chroma coordinate (2 chroma px per
+/// mi unit under this decoder's assumed 4:2:0 subsampling).
+fn plane_to_mi(chroma: bool, coord: usize) -> usize {
+    if chroma { coord / 2 } else { coord / 4 }
+}
+
+/// This plane's own transform width in pixels at the covering block, spec
+/// `get_transform_size`'s plane-aware lookup: `tx_grid` stores the luma
+/// width directly; chroma halves it (this decoder's UV transform is always
+/// half its coded block's luma transform, spec's `av1_get_max_uv_txsize`
+/// under 4:2:0 and a block that never splits its own transform).
+fn tx_px_at(n: &Neighbours, chroma: bool, mi_r: usize, mi_c: usize) -> u32 {
+    let luma_tx = n
+        .tx_grid
+        .get(mi_r * n.skip_grid_cols_mi + mi_c)
+        .copied()
+        .unwrap_or(0) as u32;
+    if chroma { luma_tx / 2 } else { luma_tx }
+}
+
+/// `tx_size_wide_unit_log2`/`tx_size_high_unit_log2`: `log2(px / 4)`, the
+/// index [`tx_dim_to_filter_length`] and the chroma 4-vs-6 choice key on.
+fn unit_log2(px: u32) -> i32 {
+    if px == 0 {
+        0
+    } else {
+        px.trailing_zeros() as i32 - 2
+    }
+}
+
+/// spec 7.14.4's `get_filter_level`, restricted to this decoder's shapes:
+/// every inter block is a single `LAST_FRAME` reference with a non-`GLOBALMV`
+/// mode, so `is_inter` alone selects `ref_deltas`/`mode_deltas` (design note
+/// on [`Neighbours::inter_grid`]).
+fn lf_level(lf: &LoopFilterParams, plane_idx: usize, dir: usize, is_inter: bool) -> i32 {
+    let base = i32::from(if plane_idx == 0 {
+        lf.level[dir]
+    } else if plane_idx == 1 {
+        lf.level[2]
+    } else {
+        lf.level[3]
+    });
+    if !lf.delta_enabled {
+        return base;
+    }
+    let scale = 1i32 << (base >> 5);
+    let ref_idx = usize::from(is_inter);
+    let mut lvl = base + i32::from(lf.ref_deltas[ref_idx]) * scale;
+    if is_inter {
+        lvl += i32::from(lf.mode_deltas[1]) * scale;
+    }
+    lvl.clamp(0, 63)
+}
+
+/// Spec 7.14.2's `set_lpf_parameters`, restricted to the uniform-level,
+/// no-segmentation, no-delta-LF path and to this decoder's own invariant
+/// that a coded block's transform is always its own full size -- so a TU
+/// edge is always also a PU edge, and the "both sides skipped, not a PU
+/// edge" suppression (which only ever fires at a non-PU-edge TU boundary)
+/// never applies here, letting this skip the `skip`/`skip_txfm` lookup
+/// entirely. Returns `None` when this 4-pixel edge group is not filtered.
+fn edge_params(
+    lf: &LoopFilterParams,
+    n: &Neighbours,
+    plane_idx: usize,
+    dir: usize,
+    chroma: bool,
+    x0: usize,
+    y0: usize,
+) -> Option<(u8, i32)> {
+    let (mi_r, mi_c) = (plane_to_mi(chroma, y0), plane_to_mi(chroma, x0));
+    let cur_tx = tx_px_at(n, chroma, mi_r, mi_c);
+    if cur_tx == 0 || (if dir == 0 { x0 } else { y0 }) % cur_tx as usize != 0 {
+        return None;
+    }
+    let cur_inter = n.inter_grid[mi_r * n.skip_grid_cols_mi + mi_c];
+    let (pv_mi_r, pv_mi_c) = if dir == 0 {
+        (mi_r, mi_c - 1)
+    } else {
+        (mi_r - 1, mi_c)
+    };
+    let pv_tx = tx_px_at(n, chroma, pv_mi_r, pv_mi_c);
+    let pv_inter = n.inter_grid[pv_mi_r * n.skip_grid_cols_mi + pv_mi_c];
+
+    let cur_level = lf_level(lf, plane_idx, dir, cur_inter);
+    let pv_level = lf_level(lf, plane_idx, dir, pv_inter);
+    if cur_level == 0 && pv_level == 0 {
+        return None;
+    }
+    let dim = unit_log2(cur_tx).min(unit_log2(pv_tx)).clamp(0, 4) as usize;
+    let len: u8 = if chroma {
+        if dim == 0 { 4 } else { 6 }
+    } else {
+        [4, 8, 14, 14, 14][dim]
+    };
+    let level = if cur_level != 0 { cur_level } else { pv_level };
+    DEBLOCK_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Some((len, level))
+}
+
+/// `update_sharpness`'s per-level `(blimit, limit, hev_thr)` triple.
+fn deblock_thresholds(level: i32, sharpness: u8) -> (i32, i32, i32) {
+    let sharpness = i32::from(sharpness);
+    let shift = i32::from(sharpness > 0) + i32::from(sharpness > 4);
+    let mut lim = level >> shift;
+    if sharpness > 0 {
+        lim = lim.min(9 - sharpness);
+    }
+    lim = lim.max(1);
+    (2 * (level + 2) + lim, lim, level >> 4)
+}
+
+fn sclamp(v: i32) -> i32 {
+    v.clamp(-128, 127)
+}
+
+fn round_pow2(v: i32, n: u32) -> i32 {
+    (v + (1 << (n - 1))) >> n
+}
+
+/// `filter4`: the narrow 4-tap kernel, and every wider kernel's non-flat
+/// fallback.
+fn filter4(mask: bool, thresh: i32, p1: i32, p0: i32, q0: i32, q1: i32) -> [i32; 4] {
+    if !mask {
+        return [p1, p0, q0, q1];
+    }
+    let hev = (p1 - p0).abs() > thresh || (q1 - q0).abs() > thresh;
+    let (ps1, ps0, qs0, qs1) = (p1 - 128, p0 - 128, q0 - 128, q1 - 128);
+    let outer = if hev { sclamp(ps1 - qs1) } else { 0 };
+    let filter = sclamp(outer + 3 * (qs0 - ps0));
+    let filter1 = sclamp(filter + 4) >> 3;
+    let filter2 = sclamp(filter + 3) >> 3;
+    let oq0 = sclamp(qs0 - filter1) + 128;
+    let op0 = sclamp(ps0 + filter2) + 128;
+    let tap = if hev { 0 } else { round_pow2(filter1, 1) };
+    let oq1 = sclamp(qs1 - tap) + 128;
+    let op1 = sclamp(ps1 + tap) + 128;
+    [op1, op0, oq0, oq1]
+}
+
+/// `filter6`: chroma's flat 5-tap smoothing (spec `[1,2,2,2,1]`) over
+/// `filter4`'s narrow taps.
+#[allow(clippy::too_many_arguments)]
+fn filter6(
+    mask: bool,
+    thresh: i32,
+    flat: bool,
+    p2: i32,
+    p1: i32,
+    p0: i32,
+    q0: i32,
+    q1: i32,
+    q2: i32,
+) -> [i32; 4] {
+    if flat && mask {
+        [
+            round_pow2(p2 * 3 + p1 * 2 + p0 * 2 + q0, 3),
+            round_pow2(p2 + p1 * 2 + p0 * 2 + q0 * 2 + q1, 3),
+            round_pow2(p1 + p0 * 2 + q0 * 2 + q1 * 2 + q2, 3),
+            round_pow2(p0 + q0 * 2 + q1 * 2 + q2 * 3, 3),
+        ]
+    } else {
+        filter4(mask, thresh, p1, p0, q0, q1)
+    }
+}
+
+/// `filter8`: luma's flat 7-tap smoothing (spec `[1,1,1,2,1,1,1]`).
+#[allow(clippy::too_many_arguments)]
+fn filter8(
+    mask: bool,
+    thresh: i32,
+    flat: bool,
+    p3: i32,
+    p2: i32,
+    p1: i32,
+    p0: i32,
+    q0: i32,
+    q1: i32,
+    q2: i32,
+    q3: i32,
+) -> [i32; 6] {
+    if flat && mask {
+        [
+            round_pow2(p3 + p3 + p3 + 2 * p2 + p1 + p0 + q0, 3),
+            round_pow2(p3 + p3 + p2 + 2 * p1 + p0 + q0 + q1, 3),
+            round_pow2(p3 + p2 + p1 + 2 * p0 + q0 + q1 + q2, 3),
+            round_pow2(p2 + p1 + p0 + 2 * q0 + q1 + q2 + q3, 3),
+            round_pow2(p1 + p0 + q0 + 2 * q1 + q2 + q3 + q3, 3),
+            round_pow2(p0 + q0 + q1 + 2 * q2 + q3 + q3 + q3, 3),
+        ]
+    } else {
+        let [op1, op0, oq0, oq1] = filter4(mask, thresh, p1, p0, q0, q1);
+        [p2, op1, op0, oq0, oq1, q2]
+    }
+}
+
+/// `filter14`: the wide 13-tap smoothing used at 16x16-and-larger transform
+/// edges; falls back to [`filter8`] (leaving `op6`/`oq6` untouched either
+/// way -- they are only ever taps here, never written).
+#[allow(clippy::too_many_arguments)]
+fn filter14(
+    mask: bool,
+    thresh: i32,
+    flat: bool,
+    flat2: bool,
+    p6: i32,
+    p5: i32,
+    p4: i32,
+    p3: i32,
+    p2: i32,
+    p1: i32,
+    p0: i32,
+    q0: i32,
+    q1: i32,
+    q2: i32,
+    q3: i32,
+    q4: i32,
+    q5: i32,
+    q6: i32,
+) -> [i32; 12] {
+    if flat2 && flat && mask {
+        [
+            round_pow2(p6 * 7 + p5 * 2 + p4 * 2 + p3 + p2 + p1 + p0 + q0, 4),
+            round_pow2(
+                p6 * 5 + p5 * 2 + p4 * 2 + p3 * 2 + p2 + p1 + p0 + q0 + q1,
+                4,
+            ),
+            round_pow2(
+                p6 * 4 + p5 + p4 * 2 + p3 * 2 + p2 * 2 + p1 + p0 + q0 + q1 + q2,
+                4,
+            ),
+            round_pow2(
+                p6 * 3 + p5 + p4 + p3 * 2 + p2 * 2 + p1 * 2 + p0 + q0 + q1 + q2 + q3,
+                4,
+            ),
+            round_pow2(
+                p6 * 2 + p5 + p4 + p3 + p2 * 2 + p1 * 2 + p0 * 2 + q0 + q1 + q2 + q3 + q4,
+                4,
+            ),
+            round_pow2(
+                p6 + p5 + p4 + p3 + p2 + p1 * 2 + p0 * 2 + q0 * 2 + q1 + q2 + q3 + q4 + q5,
+                4,
+            ),
+            round_pow2(
+                p5 + p4 + p3 + p2 + p1 + p0 * 2 + q0 * 2 + q1 * 2 + q2 + q3 + q4 + q5 + q6,
+                4,
+            ),
+            round_pow2(
+                p4 + p3 + p2 + p1 + p0 + q0 * 2 + q1 * 2 + q2 * 2 + q3 + q4 + q5 + q6 * 2,
+                4,
+            ),
+            round_pow2(
+                p3 + p2 + p1 + p0 + q0 + q1 * 2 + q2 * 2 + q3 * 2 + q4 + q5 + q6 * 3,
+                4,
+            ),
+            round_pow2(
+                p2 + p1 + p0 + q0 + q1 + q2 * 2 + q3 * 2 + q4 * 2 + q5 + q6 * 4,
+                4,
+            ),
+            round_pow2(
+                p1 + p0 + q0 + q1 + q2 + q3 * 2 + q4 * 2 + q5 * 2 + q6 * 5,
+                4,
+            ),
+            round_pow2(p0 + q0 + q1 + q2 + q3 + q4 * 2 + q5 * 2 + q6 * 7, 4),
+        ]
+    } else {
+        let [op2, op1, op0, oq0, oq1, oq2] =
+            filter8(mask, thresh, flat, p3, p2, p1, p0, q0, q1, q2, q3);
+        [p5, p4, p3, op2, op1, op0, oq0, oq1, oq2, q3, q4, q5]
+    }
+}
+
+/// Filters one 4-pixel edge group: `base` is the plane-local byte offset of
+/// the first (`q0`) sample past the edge, `outer_stride` advances to the
+/// next of the 4 perpendicular samples, `tap_stride` steps from one tap to
+/// the next along the edge's own filtering direction.
+#[allow(clippy::too_many_arguments)]
+fn filter_edge(
+    data: &mut [u8],
+    base: usize,
+    outer_stride: isize,
+    tap_stride: isize,
+    len: u8,
+    level: i32,
+    sharpness: u8,
+) {
+    let (blimit, limit, hev_thr) = deblock_thresholds(level, sharpness);
+    for i in 0..4isize {
+        let center = (base as isize + i * outer_stride) as usize;
+        let idx = |k: isize| -> usize { (center as isize + k * tap_stride) as usize };
+        let px = |k: isize| -> i32 { i32::from(data[idx(k)]) };
+        match len {
+            4 => {
+                let (p1, p0, q0, q1) = (px(-2), px(-1), px(0), px(1));
+                let mask = (p1 - p0).abs() <= limit
+                    && (q1 - q0).abs() <= limit
+                    && (p0 - q0).abs() * 2 + (p1 - q1).abs() / 2 <= blimit;
+                let [op1, op0, oq0, oq1] = filter4(mask, hev_thr, p1, p0, q0, q1);
+                data[idx(-2)] = op1.clamp(0, 255) as u8;
+                data[idx(-1)] = op0.clamp(0, 255) as u8;
+                data[idx(0)] = oq0.clamp(0, 255) as u8;
+                data[idx(1)] = oq1.clamp(0, 255) as u8;
+            }
+            6 => {
+                let (p2, p1, p0, q0, q1, q2) = (px(-3), px(-2), px(-1), px(0), px(1), px(2));
+                let mask = (p2 - p1).abs() <= limit
+                    && (p1 - p0).abs() <= limit
+                    && (q1 - q0).abs() <= limit
+                    && (q2 - q1).abs() <= limit
+                    && (p0 - q0).abs() * 2 + (p1 - q1).abs() / 2 <= blimit;
+                let flat = (p1 - p0).abs() <= 1
+                    && (q1 - q0).abs() <= 1
+                    && (p2 - p0).abs() <= 1
+                    && (q2 - q0).abs() <= 1;
+                let [op1, op0, oq0, oq1] = filter6(mask, hev_thr, flat, p2, p1, p0, q0, q1, q2);
+                data[idx(-2)] = op1.clamp(0, 255) as u8;
+                data[idx(-1)] = op0.clamp(0, 255) as u8;
+                data[idx(0)] = oq0.clamp(0, 255) as u8;
+                data[idx(1)] = oq1.clamp(0, 255) as u8;
+            }
+            8 => {
+                let (p3, p2, p1, p0, q0, q1, q2, q3) =
+                    (px(-4), px(-3), px(-2), px(-1), px(0), px(1), px(2), px(3));
+                let mask = (p3 - p2).abs() <= limit
+                    && (p2 - p1).abs() <= limit
+                    && (p1 - p0).abs() <= limit
+                    && (q1 - q0).abs() <= limit
+                    && (q2 - q1).abs() <= limit
+                    && (q3 - q2).abs() <= limit
+                    && (p0 - q0).abs() * 2 + (p1 - q1).abs() / 2 <= blimit;
+                let flat = (p1 - p0).abs() <= 1
+                    && (q1 - q0).abs() <= 1
+                    && (p2 - p0).abs() <= 1
+                    && (q2 - q0).abs() <= 1
+                    && (p3 - p0).abs() <= 1
+                    && (q3 - q0).abs() <= 1;
+                let [op2, op1, op0, oq0, oq1, oq2] =
+                    filter8(mask, hev_thr, flat, p3, p2, p1, p0, q0, q1, q2, q3);
+                data[idx(-3)] = op2.clamp(0, 255) as u8;
+                data[idx(-2)] = op1.clamp(0, 255) as u8;
+                data[idx(-1)] = op0.clamp(0, 255) as u8;
+                data[idx(0)] = oq0.clamp(0, 255) as u8;
+                data[idx(1)] = oq1.clamp(0, 255) as u8;
+                data[idx(2)] = oq2.clamp(0, 255) as u8;
+            }
+            _ => {
+                let (p6, p5, p4, p3, p2, p1, p0) =
+                    (px(-7), px(-6), px(-5), px(-4), px(-3), px(-2), px(-1));
+                let (q0, q1, q2, q3, q4, q5, q6) =
+                    (px(0), px(1), px(2), px(3), px(4), px(5), px(6));
+                let mask = (p3 - p2).abs() <= limit
+                    && (p2 - p1).abs() <= limit
+                    && (p1 - p0).abs() <= limit
+                    && (q1 - q0).abs() <= limit
+                    && (q2 - q1).abs() <= limit
+                    && (q3 - q2).abs() <= limit
+                    && (p0 - q0).abs() * 2 + (p1 - q1).abs() / 2 <= blimit;
+                let flat = (p1 - p0).abs() <= 1
+                    && (q1 - q0).abs() <= 1
+                    && (p2 - p0).abs() <= 1
+                    && (q2 - q0).abs() <= 1
+                    && (p3 - p0).abs() <= 1
+                    && (q3 - q0).abs() <= 1;
+                let flat2 = (p4 - p0).abs() <= 1
+                    && (q4 - q0).abs() <= 1
+                    && (p5 - p0).abs() <= 1
+                    && (q5 - q0).abs() <= 1
+                    && (p6 - p0).abs() <= 1
+                    && (q6 - q0).abs() <= 1;
+                let out = filter14(
+                    mask, hev_thr, flat, flat2, p6, p5, p4, p3, p2, p1, p0, q0, q1, q2, q3, q4, q5,
+                    q6,
+                );
+                for (k, v) in (-6..=5isize).zip(out) {
+                    data[idx(k)] = v.clamp(0, 255) as u8;
+                }
+            }
+        }
+    }
+}
+
+/// One plane's worth of spec 7.14: every vertical edge across the plane,
+/// then every horizontal edge (the order the spec and libaom both use).
+fn deblock_plane(plane: &mut PlaneBuf, plane_idx: usize, lf: &LoopFilterParams, n: &Neighbours) {
+    let chroma = plane_idx != 0;
+    let (tw, th, stride) = (plane.true_width, plane.true_height, plane.width);
+    let mut y0 = 0usize;
+    while y0 < th {
+        let mut x0 = 4usize;
+        while x0 < tw {
+            if let Some((len, level)) = edge_params(lf, n, plane_idx, 0, chroma, x0, y0) {
+                filter_edge(
+                    &mut plane.data,
+                    y0 * stride + x0,
+                    stride as isize,
+                    1,
+                    len,
+                    level,
+                    lf.sharpness,
+                );
+            }
+            x0 += 4;
+        }
+        y0 += 4;
+    }
+    let mut x0 = 0usize;
+    while x0 < tw {
+        let mut y0 = 4usize;
+        while y0 < th {
+            if let Some((len, level)) = edge_params(lf, n, plane_idx, 1, chroma, x0, y0) {
+                filter_edge(
+                    &mut plane.data,
+                    y0 * stride + x0,
+                    1,
+                    stride as isize,
+                    len,
+                    level,
+                    lf.sharpness,
+                );
+            }
+            y0 += 4;
+        }
+        x0 += 4;
+    }
+}
+
 fn apply_cdef(
     y: &mut PlaneBuf,
     u: &mut PlaneBuf,
@@ -1558,6 +2076,7 @@ pub fn decode_key_frame_tile(
     frame_height: u32,
     enable_filter_intra: bool,
     cdef: &CdefParams,
+    loop_filter: &LoopFilterParams,
 ) -> Result<Picture> {
     if mi_cols == 0 || mi_rows == 0 {
         return Err(unsupported("a frame with no mode-info grid"));
@@ -1892,6 +2411,7 @@ pub fn decode_key_frame_tile(
         }
     }
 
+    apply_deblock(&mut y, &mut u, &mut v, loop_filter, &neighbours);
     apply_cdef(&mut y, &mut u, &mut v, cdef, &neighbours);
 
     let (fw, fh) = (frame_width as usize, frame_height as usize);
@@ -2429,6 +2949,12 @@ fn decode_inter_block(
     neighbours.record(at, side, mode_for_tx, &[luma_grid, u_grid, v_grid]);
     neighbours.record_inter(at, side, skip, is_inter);
     neighbours.fill_skip_grid((r * (SUB / MI), c * (SUB / MI)), side / MI, skip);
+    neighbours.fill_lf_grid(
+        (r * (SUB / MI), c * (SUB / MI)),
+        side / MI,
+        side as u8,
+        is_inter,
+    );
     Ok(())
 }
 
@@ -2808,6 +3334,7 @@ fn decode_inter_block8(
         }
     }
     neighbours.record_mi(leaf_mi, 8, &[luma_grid, u_grid, v_grid]);
+    neighbours.fill_lf_grid(leaf_mi, 2, 8, is_inter);
     Ok((skip, is_inter))
 }
 
@@ -2833,6 +3360,7 @@ pub fn decode_inter_frame_tile(
     frame_height: u32,
     reference: &Picture,
     cdef: &CdefParams,
+    loop_filter: &LoopFilterParams,
 ) -> Result<Picture> {
     if mi_cols == 0 || mi_rows == 0 {
         return Err(unsupported("a frame with no mode-info grid"));
@@ -3096,6 +3624,7 @@ pub fn decode_inter_frame_tile(
         }
     }
 
+    apply_deblock(&mut y, &mut u, &mut v, loop_filter, &neighbours);
     apply_cdef(&mut y, &mut u, &mut v, cdef, &neighbours);
 
     let (fw, fh) = (frame_width as usize, frame_height as usize);
@@ -3141,8 +3670,18 @@ mod tests {
     #[test]
     fn a_frame_with_no_mode_info_grid_is_refused() {
         assert!(
-            decode_key_frame_tile(&[0u8; 4], 0, 32, 32, 0, 128, false, &CdefParams::default())
-                .is_err()
+            decode_key_frame_tile(
+                &[0u8; 4],
+                0,
+                32,
+                32,
+                0,
+                128,
+                false,
+                &CdefParams::default(),
+                &LoopFilterParams::default()
+            )
+            .is_err()
         );
     }
 
@@ -3180,6 +3719,7 @@ mod tests {
             h as u32,
             false,
             &CdefParams::default(),
+            &LoopFilterParams::default(),
         )
         .unwrap();
         assert_eq!(decoded.width, w, "{w}x{h}: decoded width");
@@ -3251,9 +3791,18 @@ mod tests {
         );
         enc.symbol(DC_PRED, &mut cdfs.uv_mode_no_cfl[DC_PRED]);
         let data = enc.finish();
-        let decoded =
-            decode_key_frame_tile(&data, 16, 16, 40, 64, 64, false, &CdefParams::default())
-                .unwrap();
+        let decoded = decode_key_frame_tile(
+            &data,
+            16,
+            16,
+            40,
+            64,
+            64,
+            false,
+            &CdefParams::default(),
+            &LoopFilterParams::default(),
+        )
+        .unwrap();
         assert!(
             decoded.y.iter().all(|&s| s == 128),
             "a skipped DC_PRED block with no neighbours predicts flat mid-grey"
@@ -3434,6 +3983,7 @@ mod tests {
                 coded_h,
                 false,
                 &CdefParams::default(),
+                &LoopFilterParams::default(),
             )
             .unwrap();
             assert_eq!(ours.y, ffmpeg_decoded.y, "{width}x{height}: luma vs ffmpeg");
@@ -3503,6 +4053,7 @@ mod tests {
             height as u32,
             false,
             &CdefParams::default(),
+            &LoopFilterParams::default(),
         )
         .unwrap();
         assert_eq!(
@@ -3528,6 +4079,7 @@ mod tests {
                 height as u32,
                 &reference,
                 &CdefParams::default(),
+                &LoopFilterParams::default(),
             )
             .unwrap();
             assert_eq!(
@@ -3772,6 +4324,7 @@ mod tests {
             coded_h,
             false,
             &CdefParams::default(),
+            &LoopFilterParams::default(),
         )
         .unwrap();
         assert_eq!(reference.y, ffmpeg_frames[0].y, "frame 0 luma vs ffmpeg");
@@ -3786,6 +4339,7 @@ mod tests {
                 coded_h,
                 &reference,
                 &CdefParams::default(),
+                &LoopFilterParams::default(),
             )
             .unwrap();
             assert_eq!(decoded.y, ffmpeg_frames[i].y, "frame {i} luma vs ffmpeg");
