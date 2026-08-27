@@ -1370,23 +1370,18 @@ impl<'a> CtuEncoder<'a> {
             // The winner gets the full RDOQ refinement below, once.
             let (ssd, cbf) = self.transform_luma(n, mode, &source, &refs, false);
             enc.encode_bin(ctx::CBF_LUMA + 1, u32::from(cbf));
+            let mut bits = (enc.bit_count() - bits_before) as f64;
             if cbf {
+                // Ranking candidates against each other only needs a proxy
+                // for encode_residual's exact bit count, not the count
+                // itself: the real per-bin CABAC search (context updates,
+                // greater1/greater2/remaining binarization) is the hot loop
+                // this replaces, and only the winner ever pays for it below.
                 let scan = intra::scan_index(mode, log2, true);
-                let levels = std::mem::take(&mut self.scratch.levels);
-                encode_residual(
-                    enc,
-                    &levels[..n * n],
-                    log2,
-                    0,
-                    scan,
-                    self.sign_hiding,
-                    self.transform_skip,
-                );
-                self.scratch.levels = levels;
+                bits += residual::estimate_residual_bits(&self.scratch.levels[..n * n], log2, scan);
             }
-            let bits = enc.bit_count() - bits_before;
             enc.restore(&start);
-            let cost = ssd + self.lambda * bits as f64;
+            let cost = ssd + self.lambda * bits;
             if cost < best.0 {
                 best = (cost, mode);
                 best_levels[..n * n].copy_from_slice(&self.scratch.levels[..n * n]);
