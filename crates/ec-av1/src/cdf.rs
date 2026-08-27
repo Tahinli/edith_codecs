@@ -2980,6 +2980,14 @@ pub const EOB_PT_64_LUMA: [u16; 8] = [2374, 2772, 4583, 7276, 12288, 19706, 3276
 /// EOB_PT_64_LUMA_Q3, q-context 3: the same table as [`EOB_PT_64_LUMA`], for `base_q_idx` 121..=255.
 pub const EOB_PT_64_LUMA_Q3: [u16; 8] = [6307, 7541, 12060, 16358, 22553, 27865, 32768, 0];
 
+/// The `EOB_PT_64_LUMA` sibling of [`EOB_PT_16_LUMA_CLASS1`]
+/// (`av1_default_eob_multi64_cdfs[q][0][1]`), for an 8x8 luma TU whose
+/// `tx_type` resolves `V_DCT`/`H_DCT`.
+pub const EOB_PT_64_LUMA_CLASS1_Q0: [u16; 8] = [335, 730, 1459, 5494, 8755, 12997, 32768, 0];
+pub const EOB_PT_64_LUMA_CLASS1_Q1: [u16; 8] = [401, 605, 1029, 2563, 5845, 12626, 32768, 0];
+pub const EOB_PT_64_LUMA_CLASS1: [u16; 8] = [497, 810, 1315, 3000, 7004, 15641, 32768, 0];
+pub const EOB_PT_64_LUMA_CLASS1_Q3: [u16; 8] = [1289, 2320, 3971, 7926, 14153, 24291, 32768, 0];
+
 /// EOB_PT_16_CHROMA_Q0, q-context 0: the same table as [`EOB_PT_16_CHROMA`], for `base_q_idx` 0..=20.
 pub const EOB_PT_16_CHROMA_Q0: [u16; 6] = [3247, 4950, 9688, 14563, 32768, 0];
 
@@ -3962,6 +3970,17 @@ pub const EOB_PT_16_LUMA_Q0: [u16; 6] = [840, 1039, 1980, 4895, 32768, 0];
 pub const EOB_PT_16_LUMA_Q1: [u16; 6] = [2125, 2551, 5165, 8946, 32768, 0];
 pub const EOB_PT_16_LUMA: [u16; 6] = [4016, 4897, 8881, 14968, 32768, 0];
 pub const EOB_PT_16_LUMA_Q3: [u16; 6] = [6708, 8958, 14746, 22133, 32768, 0];
+
+/// The `TX_CLASS_HORIZ`/`TX_CLASS_VERT` (non-2D-scan) sibling of
+/// [`EOB_PT_16_LUMA`] (`av1_default_eob_multi16_cdfs[q][0][1]`) -- read
+/// instead of the 2D table whenever a 4x4 luma TU's `tx_type` resolves to
+/// `V_DCT`/`H_DCT` (lane-av1tx4 r5: the class dimension libaom always keeps,
+/// this crate never carried at all until a real aomdec trace showed the
+/// desync starting exactly at this read).
+pub const EOB_PT_16_LUMA_CLASS1_Q0: [u16; 6] = [370, 671, 1883, 4471, 32768, 0];
+pub const EOB_PT_16_LUMA_CLASS1_Q1: [u16; 6] = [513, 765, 1859, 6339, 32768, 0];
+pub const EOB_PT_16_LUMA_CLASS1: [u16; 6] = [716, 1105, 2646, 10056, 32768, 0];
+pub const EOB_PT_16_LUMA_CLASS1_Q3: [u16; 6] = [1222, 2074, 4783, 15410, 32768, 0];
 
 // EOB_EXTRA_LUMA_4
 pub const EOB_EXTRA_LUMA_4_Q0: [[u16; 3]; 9] = [

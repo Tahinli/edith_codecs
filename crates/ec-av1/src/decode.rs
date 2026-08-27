@@ -302,12 +302,22 @@ fn read_golomb(dec: &mut SymbolDecoder) -> Result<u32> {
 
 /// `decode_symbol`'s end-of-block position (spec 5.11.39): the inverse of
 /// [`crate::tile`]'s `write_eob`.
-fn read_eob(dec: &mut SymbolDecoder, coding: &mut TxbTables) -> usize {
+fn read_eob(dec: &mut SymbolDecoder, coding: &mut TxbTables, class: TxClass) -> usize {
     const GROUP_START: [usize; 12] = [0, 1, 2, 3, 5, 9, 17, 33, 65, 129, 257, 513];
     const OFFSET_BITS: [u32; 12] = [0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
 
     let trace = std::env::var_os("EC_AV1_TRACE").is_some();
-    let group = dec.symbol(coding.eob_pt) + 1;
+    // libaom's `eob_flag_cdf*` tables carry a second dimension the 2D scan
+    // never touches: `TX_CLASS_HORIZ`/`TX_CLASS_VERT` (`V_DCT`/`H_DCT`) adapt
+    // a wholly separate CDF from every other tx_type (`decodetxb.c`'s
+    // `eob_multi_ctx`). Missing that split desynced the very first
+    // `V_DCT`/`H_DCT` TU this decoder ever produced (lane-av1tx4 r5, caught
+    // against a real aomdec trace).
+    let eob_pt: &mut [u16] = match (class, coding.eob_pt_class1.as_deref_mut()) {
+        (TxClass::TwoD, _) | (_, None) => coding.eob_pt,
+        (_, Some(class1)) => class1,
+    };
+    let group = dec.symbol(eob_pt) + 1;
     if trace {
         eprintln!("TRACE eob_pt value={group}");
     }
@@ -372,11 +382,11 @@ fn read_coeffs(
         .ok_or_else(|| unsupported(format!("a tx_type symbol outside its CDF's own set: {t}")))?;
     }
 
-    let eob = read_eob(dec, coding);
+    let class = TxClass::of(tx_type);
+    let eob = read_eob(dec, coding, class);
     if trace {
         eprintln!("TRACE eob value={eob}");
     }
-    let class = TxClass::of(tx_type);
     let class_scan;
     let scan: &[u16] = if class == TxClass::TwoD {
         scan
