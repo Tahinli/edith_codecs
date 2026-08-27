@@ -314,6 +314,12 @@ pub enum TxType {
     AdstDct,
     /// DCT down the column axis, ADST across the row axis.
     DctAdst,
+    /// DCT down the column axis, identity across the row axis
+    /// (`V_DCT` -- `TX_SET_INTRA_1` only).
+    VDct,
+    /// Identity down the column axis, DCT across the row axis
+    /// (`H_DCT` -- `TX_SET_INTRA_1` only).
+    HDct,
 }
 
 impl TxType {
@@ -325,6 +331,24 @@ impl TxType {
             2 => Some(Self::AdstAdst),
             3 => Some(Self::AdstDct),
             4 => Some(Self::DctAdst),
+            _ => None,
+        }
+    }
+
+    /// The inverse of `Tx_Type_Intra_Inv_Set1`'s CDF symbol order
+    /// (`av1_ext_tx_inv[EXT_TX_SET_DTT4_IDTX_1DDCT]`, entropymode.h:
+    /// `{9, 0, 10, 11, 3, 1, 2}` = IDTX, DCT_DCT, V_DCT, H_DCT, ADST_ADST,
+    /// ADST_DCT, DCT_ADST) -- the seven-type set a `reduced_tx_set == 0`
+    /// frame's small intra transforms read from.
+    pub fn from_symbol_set1(t: usize) -> Option<Self> {
+        match t {
+            0 => Some(Self::Idtx),
+            1 => Some(Self::DctDct),
+            2 => Some(Self::VDct),
+            3 => Some(Self::HDct),
+            4 => Some(Self::AdstAdst),
+            5 => Some(Self::AdstDct),
+            6 => Some(Self::DctAdst),
             _ => None,
         }
     }
@@ -343,6 +367,9 @@ impl TxType {
             Self::AdstAdst => (Adst, Adst),
             Self::AdstDct => (Dct, Adst),
             Self::DctAdst => (Adst, Dct),
+            // `av1_inv_txfm2d.c`: V_DCT vtx=DCT htx=IDTX, H_DCT the mirror.
+            Self::VDct => (Identity, Dct),
+            Self::HDct => (Dct, Identity),
         }
     }
 }

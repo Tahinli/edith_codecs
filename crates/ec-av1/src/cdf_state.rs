@@ -41,6 +41,10 @@ pub(crate) enum TxbSet {
     /// block (lane-av1-rect). An `is_inter` leaf reads
     /// [`Luma8Inter`](TxbSet::Luma8Inter) instead.
     Luma8,
+    /// [`Luma8`](TxbSet::Luma8)'s `reduced_tx_set: false` counterpart (round
+    /// 8): the same coefficient tables, but the seven-symbol `TX_SET_INTRA_1`
+    /// `tx_type` table rather than `Luma8`'s five-symbol reduced one.
+    Luma8Set1,
     /// The 8x8 luma transform of an `is_inter` 8x8 leaf under a straddling
     /// 16x16 block (lane-av1inter8): the same coefficient tables
     /// [`Luma8`](TxbSet::Luma8) reads, but `get_tx_set` (spec 5.11.48)
@@ -116,10 +120,14 @@ pub(crate) struct Cdfs {
     pub cfl_alpha: [[u16; 17]; 6],
     /// The angle a directional mode is nudged by.
     pub angle_delta: [[u16; 8]; 8],
-    /// The one-context all-zero flag of a 16x16 luma transform.
-    pub txb_skip_luma_16: [[u16; 3]; 1],
-    /// The one-context all-zero flag of an 8x8 luma transform.
-    pub txb_skip_luma_8: [[u16; 3]; 1],
+    /// The all-zero flag of a 16x16 luma transform, 7 contexts (index 0 for
+    /// a lone TU whose own bsize equals the block's; 1..6 the
+    /// `skip_contexts[top][left]` table when `TxMode::Select` splits the
+    /// block's luma into several smaller transform units, spec
+    /// `get_txb_ctx_general`).
+    pub txb_skip_luma_16: [[u16; 3]; 7],
+    /// The same, for an 8x8 luma transform.
+    pub txb_skip_luma_8: [[u16; 3]; 7],
     /// The all-zero flag of an 8x8 chroma transform.
     pub txb_skip_chroma_8: [[u16; 3]; 3],
     /// The all-zero flag of a 4x4 chroma transform.
@@ -170,10 +178,10 @@ pub(crate) struct Cdfs {
     /// `PARTITION_NONE` is ever coded against it, but the alphabet still
     /// adapts on every read, same as every other partition table.
     pub partition_w8: [[u16; 5]; 4],
-    /// The one-context all-zero flag of a 32x32 luma transform.
-    pub txb_skip_luma_32: [[u16; 3]; 1],
+    /// The same as `txb_skip_luma_16`'s 7 contexts, for a 32x32 luma transform.
+    pub txb_skip_luma_32: [[u16; 3]; 7],
     /// The same, for a 64x64 luma transform.
-    pub txb_skip_luma_64: [[u16; 3]; 1],
+    pub txb_skip_luma_64: [[u16; 3]; 7],
     /// The all-zero flag of a 16x16 chroma transform.
     pub txb_skip_chroma_16: [[u16; 3]; 3],
     /// The all-zero flag of a 32x32 chroma transform.
@@ -221,6 +229,13 @@ pub(crate) struct Cdfs {
     pub intra_tx_type_16: [[u16; 6]; 13],
     /// The transform type of an 8x8 intra luma transform, by luma mode.
     pub intra_tx_type_8: [[u16; 6]; 13],
+    /// The transform type of an 8x8 intra luma transform, by luma mode, when
+    /// `reduced_tx_set` is false (spec `TX_SET_INTRA_1`, seven types) --
+    /// [`Self::intra_tx_type_8`]'s five-type table is only the
+    /// `reduced_tx_set` row (round 8: a real `aomenc` stream with
+    /// `reduced_tx_set` off desyncs an 8x8 TU read against this row's
+    /// wrong-length CDF).
+    pub intra_tx_type_8_set1: [[u16; 8]; 13],
     /// The transform type of an `is_inter` 32x32 luma transform (spec
     /// `TX_SET_INTER_3`, `TX_32X32` row) -- unlike the intra 16x16 table, it
     /// is not indexed by mode.
@@ -260,6 +275,15 @@ pub(crate) struct Cdfs {
     pub filter_intra: [[u16; 3]; 4],
     /// Which `FILTER_INTRA_MODES` entry a `use_filter_intra` block picks.
     pub filter_intra_mode: [u16; 6],
+    /// `TxMode::Select`'s `tx_depth` flag at an 8x8 block, by `tx_size_context`
+    /// (0..=2) -- see [`cdf::TX_SIZE_CAT0`].
+    pub tx_size_cat0: [[u16; 3]; 3],
+    /// `tx_depth` at a 16x16 block -- see [`cdf::TX_SIZE_CAT1`].
+    pub tx_size_cat1: [[u16; 4]; 3],
+    /// `tx_depth` at a 32x32 block -- see [`cdf::TX_SIZE_CAT2`].
+    pub tx_size_cat2: [[u16; 4]; 3],
+    /// `tx_depth` at a 64x64 block -- see [`cdf::TX_SIZE_CAT3`].
+    pub tx_size_cat3: [[u16; 4]; 3],
 }
 
 /// One motion vector component's adapting state (spec 9.4's `Default_Mv_*`,
@@ -417,6 +441,7 @@ impl Cdfs {
         reset2(&mut self.dc_sign_luma);
         reset2(&mut self.intra_tx_type_16);
         reset2(&mut self.intra_tx_type_8);
+        reset2(&mut self.intra_tx_type_8_set1);
         reset1(&mut self.inter_tx_type_32);
         reset1(&mut self.inter_tx_type_16);
         reset1(&mut self.inter_tx_type_8);
@@ -434,6 +459,10 @@ impl Cdfs {
             .for_each(MvComponentCdfs::reset_counts);
         reset2(&mut self.filter_intra);
         reset1(&mut self.filter_intra_mode);
+        reset2(&mut self.tx_size_cat0);
+        reset2(&mut self.tx_size_cat1);
+        reset2(&mut self.tx_size_cat2);
+        reset2(&mut self.tx_size_cat3);
     }
 
     /// The defaults a key frame starts from (spec 8.4, `init_coeff_cdfs` and
@@ -451,20 +480,20 @@ impl Cdfs {
             cfl_sign: cdf::CFL_SIGN,
             cfl_alpha: cdf::CFL_ALPHA,
             angle_delta: cdf::ANGLE_DELTA,
-            txb_skip_luma_16: [pick(
+            txb_skip_luma_16: pick(
                 q_ctx,
-                cdf::TXB_SKIP_LUMA_16_Q0,
-                cdf::TXB_SKIP_LUMA_16_Q1,
-                cdf::TXB_SKIP_LUMA_16,
-                cdf::TXB_SKIP_LUMA_16_Q3,
-            )],
-            txb_skip_luma_8: [pick(
+                cdf::TXB_SKIP_LUMA_16_Q0_CTX,
+                cdf::TXB_SKIP_LUMA_16_Q1_CTX,
+                cdf::TXB_SKIP_LUMA_16_CTX,
+                cdf::TXB_SKIP_LUMA_16_Q3_CTX,
+            ),
+            txb_skip_luma_8: pick(
                 q_ctx,
-                cdf::TXB_SKIP_LUMA_8_Q0,
-                cdf::TXB_SKIP_LUMA_8_Q1,
-                cdf::TXB_SKIP_LUMA_8,
-                cdf::TXB_SKIP_LUMA_8_Q3,
-            )],
+                cdf::TXB_SKIP_LUMA_8_Q0_CTX,
+                cdf::TXB_SKIP_LUMA_8_Q1_CTX,
+                cdf::TXB_SKIP_LUMA_8_CTX,
+                cdf::TXB_SKIP_LUMA_8_Q3_CTX,
+            ),
             txb_skip_chroma_8: pick(
                 q_ctx,
                 cdf::TXB_SKIP_CHROMA_8_Q0,
@@ -621,20 +650,20 @@ impl Cdfs {
             ),
             partition_w16: cdf::PARTITION_W16,
             partition_w8: cdf::PARTITION_W8,
-            txb_skip_luma_32: [pick(
+            txb_skip_luma_32: pick(
                 q_ctx,
-                cdf::TXB_SKIP_LUMA_32_Q0,
-                cdf::TXB_SKIP_LUMA_32_Q1,
-                cdf::TXB_SKIP_LUMA_32,
-                cdf::TXB_SKIP_LUMA_32_Q3,
-            )],
-            txb_skip_luma_64: [pick(
+                cdf::TXB_SKIP_LUMA_32_Q0_CTX,
+                cdf::TXB_SKIP_LUMA_32_Q1_CTX,
+                cdf::TXB_SKIP_LUMA_32_CTX,
+                cdf::TXB_SKIP_LUMA_32_Q3_CTX,
+            ),
+            txb_skip_luma_64: pick(
                 q_ctx,
-                cdf::TXB_SKIP_LUMA_64_Q0,
-                cdf::TXB_SKIP_LUMA_64_Q1,
-                cdf::TXB_SKIP_LUMA_64,
-                cdf::TXB_SKIP_LUMA_64_Q3,
-            )],
+                cdf::TXB_SKIP_LUMA_64_Q0_CTX,
+                cdf::TXB_SKIP_LUMA_64_Q1_CTX,
+                cdf::TXB_SKIP_LUMA_64_CTX,
+                cdf::TXB_SKIP_LUMA_64_Q3_CTX,
+            ),
             txb_skip_chroma_16: pick(
                 q_ctx,
                 cdf::TXB_SKIP_CHROMA_16_Q0,
@@ -778,6 +807,7 @@ impl Cdfs {
             dc_sign_luma: cdf::DC_SIGN_LUMA,
             intra_tx_type_16: cdf::INTRA_TX_TYPE_SET2_16,
             intra_tx_type_8: cdf::INTRA_TX_TYPE_SET2_8,
+            intra_tx_type_8_set1: cdf::INTRA_TX_TYPE_SET1_8,
             inter_tx_type_32: cdf::INTER_TX_TYPE_SET3_32,
             inter_tx_type_16: cdf::INTER_TX_TYPE_SET3_16,
             inter_tx_type_8: cdf::INTER_TX_TYPE_SET3_8,
@@ -793,6 +823,10 @@ impl Cdfs {
             mv_comp: [MvComponentCdfs::new(), MvComponentCdfs::new()],
             filter_intra: cdf::FILTER_INTRA,
             filter_intra_mode: cdf::FILTER_INTRA_MODE,
+            tx_size_cat0: cdf::TX_SIZE_CAT0,
+            tx_size_cat1: cdf::TX_SIZE_CAT1,
+            tx_size_cat2: cdf::TX_SIZE_CAT2,
+            tx_size_cat3: cdf::TX_SIZE_CAT3,
         }
     }
 
@@ -864,6 +898,17 @@ impl Cdfs {
                 br: &mut self.br_luma_8,
                 dc_sign: &mut self.dc_sign_luma,
                 tx_type: Some(self.intra_tx_type_8[mode].as_mut_slice()),
+            },
+            TxbSet::Luma8Set1 => TxbTables {
+                side: 8,
+                txb_skip: &mut self.txb_skip_luma_8,
+                eob_pt: &mut self.eob_pt_64_luma,
+                eob_extra: &mut self.eob_extra_luma_8,
+                base: &mut self.base_luma_8,
+                base_eob: &mut self.base_eob_luma_8,
+                br: &mut self.br_luma_8,
+                dc_sign: &mut self.dc_sign_luma,
+                tx_type: Some(self.intra_tx_type_8_set1[mode].as_mut_slice()),
             },
             TxbSet::Luma8Inter => TxbTables {
                 side: 8,
