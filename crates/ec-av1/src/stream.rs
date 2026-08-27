@@ -560,6 +560,13 @@ mod tests {
                 pos += obu.total_size;
                 if let ObuKind::Frame(header, _) = obu.kind {
                     eprintln!("cdef: {:?}", header.cdef);
+                    eprintln!("quantization: {:?}", header.quantization);
+                    eprintln!(
+                        "coded_lossless: {:?} tx_mode: {:?}",
+                        header.coded_lossless, header.tx_mode
+                    );
+                    eprintln!("delta: {:?}", header.delta);
+                    eprintln!("segmentation: {:?}", header.segmentation);
                 }
             }
         }
