@@ -3455,7 +3455,12 @@ fn resolve_interp_filter(
 
 /// The `is_inter` context (spec 5.11.16 via `av1_get_intra_inter_context`),
 /// duplicating [`crate::tile`]'s private copy of the same rule.
-fn intra_inter_ctx(has_above: bool, has_left: bool, above_inter: bool, left_inter: bool) -> usize {
+pub(crate) fn intra_inter_ctx(
+    has_above: bool,
+    has_left: bool,
+    above_inter: bool,
+    left_inter: bool,
+) -> usize {
     match (has_above, has_left) {
         (true, true) => {
             let (above_intra, left_intra) = (!above_inter, !left_inter);
@@ -3724,22 +3729,31 @@ fn decode_inter_block(
     if is_inter {
         let ref_frame = read_single_ref(dec, cdfs, neighbours.above_ref[c], neighbours.left_ref[r]);
         ref_frame_for_lf = ref_frame;
-        // round 3 (lane-av1refs): the GOLDEN_FRAME arm below decodes and
-        // threads a real golden picture through MC/mvstack/deblock, but 120+
-        // attempts across a real aomenc recipe built to isolate exactly this
-        // path (min==max partition size, order-hint off, screen-content
-        // tools off) still could not clear this crate's OWN gate
-        // (`a_real_aomenc_inter_sequence_with_a_golden_reference_decodes_pixel_exact`,
-        // stream.rs) 4 consecutive times -- every attempt either never fired
-        // GOLDEN_FRAME or hit an unrelated named refusal first (see that
-        // test's own refusal log). Refuse GOLDEN_FRAME here, narrowly, until
-        // a round actually gets that gate green: main should not carry a
-        // reference-selection path with zero live pixel-exact proof.
+        // round 4 (lane-av1golden): 120+ attempts across a real aomenc
+        // recipe never landed a GOLDEN_FRAME-firing, decodable stream (every
+        // attempt hit an unrelated named refusal first), so this arm stayed
+        // refused pending a fixture that could prove it another way. A
+        // hand-built stream now does: `a_hand_built_golden_reference_decodes_pixel_exact_against_ffmpeg`
+        // (stream.rs) drives GOLDEN_FRAME through a real OBU stream that
+        // ffmpeg also decodes, byte for byte. GOLDEN_FRAME is threaded to
+        // MC/mvstack/deblock the same as LAST_FRAME from here; every other
+        // reference (LAST2/LAST3/BWDREF/ALTREF2/ALTREF) still refuses by
+        // name below -- none of them have a live pixel-exact proof yet.
         let (py_ref, pu_ref, pv_ref) = match ref_frame {
             LAST_FRAME => (ref_y, ref_u, ref_v),
+            GOLDEN_FRAME => match (golden_y, golden_u, golden_v) {
+                (Some(gy), Some(gu), Some(gv)) => (gy, gu, gv),
+                _ => {
+                    return Err(unsupported(
+                        "GOLDEN_FRAME selected with no golden picture at this frame's \
+                         ref_frame_idx[3] slot",
+                    ));
+                }
+            },
             _ => {
                 return Err(unsupported(
-                    "a reference frame other than LAST_FRAME (round 3: GOLDEN_FRAME's decode path exists but has no live pixel-exact proof yet)",
+                    "a reference frame other than LAST_FRAME/GOLDEN_FRAME (LAST2/LAST3/\
+                     BWDREF/ALTREF2/ALTREF still have no live pixel-exact proof)",
                 ));
             }
         };
