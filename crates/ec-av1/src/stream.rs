@@ -221,6 +221,7 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 &header.cdef,
                 &header.loop_filter,
                 initial_cdfs,
+                header.allow_high_precision_mv,
             )?
         };
         // Spec 7.20: `disable_frame_end_update_cdf` stores the frame's
@@ -1313,11 +1314,13 @@ mod tests {
                     eprintln!("segmentation: {:?}", header.segmentation);
                     eprintln!("loop_restoration: {:?}", header.loop_restoration);
                     eprintln!(
-                        "use_128x128_superblock: {:?} disable_cdf_update: {:?} disable_frame_end_update_cdf: {:?} primary_ref_frame: {:?}",
+                        "use_128x128_superblock: {:?} disable_cdf_update: {:?} disable_frame_end_update_cdf: {:?} primary_ref_frame: {:?} allow_high_precision_mv: {:?} force_integer_mv: {:?}",
                         p.sequence_header().map(|s| s.use_128x128_superblock),
                         header.disable_cdf_update,
                         header.disable_frame_end_update_cdf,
                         header.primary_ref_frame,
+                        header.allow_high_precision_mv,
+                        header.force_integer_mv,
                     );
                 }
             }
