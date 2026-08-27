@@ -3700,8 +3700,8 @@ fn decode_inter_block(
     // into a `[Option<&PlaneBuf>; REFS_PER_FRAME]` addressed by the decoded
     // reference, same as the CDF/picture DPB slots `decode_stream` already
     // keeps.
-    // (round 5: parameters kept threaded but unread while the GOLDEN arm is
-    // masked -- see the refusal below.)
+    // (round 6: parameters kept threaded but unread while the GOLDEN arm is
+    // masked again -- see the refusal below.)
     _golden_y: Option<&PlaneBuf>,
     _golden_u: Option<&PlaneBuf>,
     _golden_v: Option<&PlaneBuf>,
@@ -3750,22 +3750,34 @@ fn decode_inter_block(
         // this arm mismatched. Symbol-trace vs a patched aomdec proved one
         // cause `LAST_FRAME`-reachable -- `lf_level`'s flat `mode_deltas[1]`
         // on `GLOBALMV` blocks (fixed; see `Neighbours::ref_grid`'s packed
-        // sign), previously masked because a GOLDEN block anywhere aborted
-        // the whole stream via `?` here -- and that fix moved the failure
-        // from seed 42 (frame 1, V) to seed 48 (frame 3, U): at least one
-        // more stacked defect remains on the GOLDEN-live path, so the
-        // refusal narrows back to `LAST_FRAME` until a real-stream gate
-        // holds pixel-exact with GOLDEN live (the hand-built fixture below
-        // proved the symbol path and a whole-pel copy, not subpel MC off the
-        // golden plane -- `a_hand_built_golden_reference_refuses_by_name`
-        // keeps the fixture and asserts the mask instead).
+        // sign) -- and a second, loop-filter level/sharpness wrongly
+        // forwarding from the primary ref frame instead of spec 7.20's
+        // `ref_deltas`/`mode_deltas` (fixed, lane-av1golden3). Both fixes
+        // are `LAST_FRAME`-reachable and independent of the golden plane
+        // itself.
+        // round 6 (lane-av1golden4): un-masked again and re-masked in the
+        // same round. A real aomenc stream (pinned:
+        // `stream::tests::pinned_golden4_stream_decodes_pixel_exact`, seed
+        // 43, frame 3 luma) mismatched by exactly +-1 on 3 of 4096 pixels,
+        // all inside the loop filter's 14-wide edge window at the y=32
+        // horizontal boundary between a GOLDEN_FRAME block (ref_idx 4,
+        // computed level 3) and a LAST_FRAME block (ref_idx 1, level 4) --
+        // `edge_params`/`lf_level`'s own math checks out against spec 7.14.4
+        // by hand (`base=4`, `ref_deltas[4]=-1`, `mode_deltas=[0,0]` all
+        // match the default table), so the residue is unproven: either a
+        // narrow rounding/flatness-threshold defect in the wide deblock
+        // kernel (`filter8`/`filter14`) that any GOLDEN/LAST level split
+        // happens to be the first content to reach, or a golden-side pixel
+        // one narrow filter tap upstream of the edge. Refused again pending
+        // that isolation -- do not re-litigate the `lf_level` arithmetic
+        // itself, it was checked by hand this round.
         let (py_ref, pu_ref, pv_ref) = match ref_frame {
             LAST_FRAME => (ref_y, ref_u, ref_v),
             _ => {
                 return Err(unsupported(
-                    "a reference frame other than LAST_FRAME (round 5: GOLDEN_FRAME's decode \
-                     path exists but is masked -- a stacked defect past the GLOBALMV \
-                     loop-filter mode-delta fix keeps real GOLDEN streams from pixel-exact)",
+                    "a reference frame other than LAST_FRAME (round 6: GOLDEN_FRAME's decode \
+                     path exists but is masked -- a narrow deblock-edge residue at GOLDEN/LAST \
+                     boundaries keeps real GOLDEN streams from pixel-exact)",
                 ));
             }
         };
