@@ -76,11 +76,99 @@ impl Colour {
     }
 }
 
+/// A quality/size targeting surface for callers who would rather not pick a
+/// `base_q_idx` themselves, oracled at CRF's own shape (a single "quality"
+/// dial that holds a stable perceptual level across content, `ffmpeg -crf`)
+/// since a from-scratch scheme is not this lane's charter to invent.
+/// [`Av1Encoder::with_rate_target`] is additive: [`EncoderConfig::base_q_idx`]
+/// keeps working exactly as before for every existing caller, this is a
+/// second, opt-in constructor.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RateTarget {
+    /// Exactly `base_q_idx`, unchanged — the `EncoderConfig` field's own
+    /// value, for a caller that already has one.
+    QIndex(u8),
+    /// A CRF-like single dial, 0 (smallest/worst) to 100 (largest/best),
+    /// mapped to a fixed `base_q_idx` by the calibration in
+    /// `encode::tests::calibration_sweep_base_q_idx` (linear in `q_idx`
+    /// across the sweep's own 40..=240 span, since the measured bytes/PSNR
+    /// curve is close enough to log-linear there that a straight line is
+    /// the "simplest correct" fit this lane's charter asks for). No
+    /// per-frame feedback: one value, picked once at construction.
+    Quality(u8),
+    /// A closed loop that steers `base_q_idx` frame by frame to land each
+    /// coded frame near this many bytes, via [`RateLoop`] — see there for
+    /// the controller and its windup bound.
+    BytesPerFrame(u32),
+}
+
+/// `quality`'s mapping to `base_q_idx`, linear across the calibration sweep's
+/// span (`q_idx` 40 at `quality` 100 down to `q_idx` 240 at `quality` 0);
+/// `quality` above 100 clamps to the best point measured, matching a CRF
+/// dial's own saturating ends rather than extrapolating past calibrated
+/// data.
+fn quality_to_q_idx(quality: u8) -> u8 {
+    let quality = f64::from(quality.min(100));
+    (240.0 - quality * 2.0).round() as u8
+}
+
+/// The closed-loop controller behind [`RateTarget::BytesPerFrame`]: a
+/// proportional step on `base_q_idx`, sized from the calibration sweep's own
+/// log-linear slope (bytes roughly halve every ~45 `q_idx` steps there, i.e.
+/// `d(ln bytes)/d(q_idx) ≈ -0.0154`), clamped per frame. Pure proportional —
+/// no accumulated error term — is the windup bound itself
+/// ([[vorbis-rate-loop-windup]]'s class): the only state carried between
+/// frames is `q`, already clamped to `0..=255`, so a quiet lead-in cannot
+/// build a debt a later transient has to repay; each frame's step is bounded
+/// by `STEP_CLAMP` regardless of history.
+#[derive(Debug, Clone, Copy)]
+struct RateLoop {
+    target_bytes: u32,
+    q: f64,
+}
+
+impl RateLoop {
+    /// The steepest a single frame is allowed to move `base_q_idx`, in
+    /// either direction — chosen so one wildly over/under-sized frame
+    /// (a scene cut, a black lead-in) nudges the next frame's quantizer
+    /// rather than slamming it to an extreme.
+    const STEP_CLAMP: f64 = 12.0;
+    /// The calibration sweep's own slope (see the struct doc), inverted to
+    /// convert a bytes ratio into a `q_idx` step.
+    const GAIN: f64 = 1.0 / 0.0154;
+
+    fn new(target_bytes: u32, start_q: f64) -> Self {
+        Self {
+            target_bytes,
+            q: start_q,
+        }
+    }
+
+    fn q_idx(&self) -> u8 {
+        self.q.round().clamp(0.0, 255.0) as u8
+    }
+
+    /// Steers `q` toward `target_bytes` from this frame's actual coded size.
+    fn update(&mut self, actual_bytes: usize) {
+        if self.target_bytes == 0 || actual_bytes == 0 {
+            return;
+        }
+        let ratio = actual_bytes as f64 / f64::from(self.target_bytes);
+        let step = (ratio.ln() * Self::GAIN).clamp(-Self::STEP_CLAMP, Self::STEP_CLAMP);
+        self.q = (self.q + step).clamp(0.0, 255.0);
+    }
+}
+
 /// What [`Av1Encoder::new`] takes: geometry, rate, key-frame cadence and
 /// colour. `base_q_idx` is picked directly (0..=255, `crate::encode`'s own
 /// unit) rather than a bitrate — a bitrate control loop is not part of this
 /// lane's charter, and a caller that wants one can still derive a
-/// `base_q_idx` from its own target and set that field.
+/// `base_q_idx` from its own target and set that field. A caller who wants
+/// [`RateTarget`]'s quality/size dials instead of picking `base_q_idx`
+/// itself uses [`Av1Encoder::with_rate_target`], which still starts from an
+/// `EncoderConfig` (its `base_q_idx` is the loop's seed/fallback for
+/// [`RateTarget::BytesPerFrame`], and is overwritten outright for the other
+/// two variants).
 #[derive(Debug, Clone, Copy)]
 pub struct EncoderConfig {
     /// The picture's width in luma samples; must be even and nonzero.
@@ -128,6 +216,11 @@ pub struct Av1Encoder {
     /// than read.
     reference: Option<Picture>,
     next_index: u64,
+    /// `Some` only when constructed via
+    /// [`Av1Encoder::with_rate_target`]`(_, RateTarget::BytesPerFrame(_))`;
+    /// otherwise every picture is coded at `config.base_q_idx`, unchanged
+    /// from before this field existed.
+    rate_loop: Option<RateLoop>,
 }
 
 impl Av1Encoder {
@@ -149,7 +242,33 @@ impl Av1Encoder {
             config,
             reference: None,
             next_index: 0,
+            rate_loop: None,
         })
+    }
+
+    /// [`Av1Encoder::new`], but `rate` picks `base_q_idx` (or steers it,
+    /// frame by frame, for [`RateTarget::BytesPerFrame`]) instead of
+    /// `config.base_q_idx` being used as-is.
+    ///
+    /// # Errors
+    /// Same as [`Av1Encoder::new`].
+    pub fn with_rate_target(mut config: EncoderConfig, rate: RateTarget) -> Result<Self> {
+        let rate_loop = match rate {
+            RateTarget::QIndex(q) => {
+                config.base_q_idx = q;
+                None
+            }
+            RateTarget::Quality(quality) => {
+                config.base_q_idx = quality_to_q_idx(quality);
+                None
+            }
+            RateTarget::BytesPerFrame(target_bytes) => {
+                Some(RateLoop::new(target_bytes, f64::from(config.base_q_idx)))
+            }
+        };
+        let mut encoder = Self::new(config)?;
+        encoder.rate_loop = rate_loop;
+        Ok(encoder)
     }
 
     /// The coded (padded-to-64) frame size every picture in this stream is
@@ -192,11 +311,15 @@ impl Av1Encoder {
         let padded = picture.padded_to(SUPERBLOCK);
         let is_key = self.next_index % self.config.gop as u64 == 0;
         let order = self.next_index;
+        let base_q_idx = self
+            .rate_loop
+            .as_ref()
+            .map_or(self.config.base_q_idx, RateLoop::q_idx);
 
         let encoded: Encoded = if is_key {
             encode_key_frame_inner(
                 &padded,
-                self.config.base_q_idx,
+                base_q_idx,
                 DEADZONE,
                 &KEY_FRAME_MODES,
                 split_blocks(),
@@ -213,7 +336,7 @@ impl Av1Encoder {
             encode_inter_frame(
                 &padded,
                 reference,
-                self.config.base_q_idx,
+                base_q_idx,
                 DEADZONE,
                 order as u32,
                 render,
@@ -223,6 +346,9 @@ impl Av1Encoder {
         self.reference = Some(encoded.reconstruction.clone());
         self.next_index += 1;
         let cropped = crop_encoded(&encoded, render.0, render.1);
+        if let Some(rate_loop) = self.rate_loop.as_mut() {
+            rate_loop.update(cropped.stream.len());
+        }
         Ok(Packet {
             data: cropped.stream,
             key: is_key,
@@ -511,5 +637,229 @@ mod tests {
         };
         let err = Av1Encoder::new(config).unwrap_err();
         assert!(err.to_string().contains("gop"), "{err}");
+    }
+
+    /// The 12-frame real clip `real_clip_encodes_within_its_quality_and_size_budget`
+    /// already gates on at `q=100` (`crates/ec-av1/src/encode.rs`), decoded down
+    /// to this facade's own input size, and re-coded through the facade so the
+    /// rate-target surface is exercised at the entry point a caller actually
+    /// drives.
+    fn h264_clip_frames(width: usize, height: usize, frames: usize) -> Option<Vec<Picture>> {
+        if !have_ffmpeg() {
+            return None;
+        }
+        let clip = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/video/h264-1080p-23.976-8bit.mp4");
+        if !clip.exists() {
+            return None;
+        }
+        let out = Command::new("ffmpeg")
+            .args(["-v", "error", "-i", clip.to_str().unwrap()])
+            .args(["-frames:v", &frames.to_string()])
+            .args(["-vf", &format!("scale={width}:{height}")])
+            .args(["-f", "rawvideo", "-pix_fmt", "yuv420p", "-"])
+            .output()
+            .expect("ffmpeg failed to run");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let (luma, chroma) = (width * height, width * height / 4);
+        let frame_len = luma + 2 * chroma;
+        assert_eq!(
+            out.stdout.len(),
+            frame_len * frames,
+            "expected {frames} 4:2:0 frames"
+        );
+        Some(
+            (0..frames)
+                .map(|i| {
+                    let bytes = &out.stdout[i * frame_len..][..frame_len];
+                    Picture {
+                        width,
+                        height,
+                        y: bytes[..luma].to_vec(),
+                        u: bytes[luma..luma + chroma].to_vec(),
+                        v: bytes[luma + chroma..].to_vec(),
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    /// [`RateTarget::BytesPerFrame`] on a real, 24-frame clip lands its total
+    /// coded size within ±20% of `frames * target` once the first few
+    /// frames' settling has been discarded (the key frame's own reference
+    /// state and the controller's first couple of steps).
+    #[test]
+    fn bytes_per_frame_target_settles_within_20_percent() {
+        let Some(pictures) = h264_clip_frames(640, 384, 24) else {
+            eprintln!("SKIP bytes_per_frame_target_settles_within_20_percent: no ffmpeg/fixture");
+            return;
+        };
+        let target_bytes = 4_000u32;
+        let config = EncoderConfig {
+            width: 640,
+            height: 384,
+            base_q_idx: 100,
+            gop: 24,
+            colour: Colour::Bt709Limited,
+        };
+        let mut enc =
+            Av1Encoder::with_rate_target(config, RateTarget::BytesPerFrame(target_bytes)).unwrap();
+        let sizes: Vec<usize> = pictures
+            .iter()
+            .map(|p| enc.encode(p).unwrap().data.len())
+            .collect();
+        // Discard the key frame (always far larger than an inter target) and
+        // the next 4 inter frames the loop needs to step toward it.
+        let settled = &sizes[5..];
+        let mean = settled.iter().sum::<usize>() as f64 / settled.len() as f64;
+        let low = f64::from(target_bytes) * 0.8;
+        let high = f64::from(target_bytes) * 1.2;
+        assert!(
+            mean >= low && mean <= high,
+            "settled mean {mean:.0} bytes/frame outside ±20% of {target_bytes} ({low:.0}..{high:.0}); sizes={sizes:?}"
+        );
+    }
+
+    /// The `BytesPerFrame` controller's own windup bound: no frame's coded
+    /// `base_q_idx` step exceeds [`RateLoop::STEP_CLAMP`], across a real
+    /// clip's full range of content (so a scene cut can't be the one frame
+    /// that breaks the bound).
+    #[test]
+    fn bytes_per_frame_controller_never_oscillates_past_its_clamp() {
+        let Some(pictures) = h264_clip_frames(640, 384, 24) else {
+            eprintln!(
+                "SKIP bytes_per_frame_controller_never_oscillates_past_its_clamp: no ffmpeg/fixture"
+            );
+            return;
+        };
+        let config = EncoderConfig {
+            width: 640,
+            height: 384,
+            base_q_idx: 100,
+            gop: 24,
+            colour: Colour::Bt709Limited,
+        };
+        let mut enc =
+            Av1Encoder::with_rate_target(config, RateTarget::BytesPerFrame(4_000)).unwrap();
+        let mut prev_q = enc.rate_loop.as_ref().unwrap().q_idx();
+        for picture in &pictures {
+            enc.encode(picture).unwrap();
+            let q = enc.rate_loop.as_ref().unwrap().q_idx();
+            let step = (i32::from(q) - i32::from(prev_q)).abs();
+            assert!(
+                f64::from(step) <= RateLoop::STEP_CLAMP + 1.0, // +1 for u8 rounding
+                "q stepped from {prev_q} to {q}, past the {} clamp",
+                RateLoop::STEP_CLAMP
+            );
+            prev_q = q;
+        }
+    }
+
+    fn psnr(a: &[u8], b: &[u8]) -> f64 {
+        let squared: f64 = a
+            .iter()
+            .zip(b)
+            .map(|(&x, &y)| {
+                let d = f64::from(x) - f64::from(y);
+                d * d
+            })
+            .sum();
+        if squared == 0.0 {
+            return f64::INFINITY;
+        }
+        10.0 * (255.0 * 255.0 * a.len() as f64 / squared).log10()
+    }
+
+    /// Decodes an OBU stream back to raw luma planes via `ffmpeg`/dav1d, one
+    /// entry per coded frame, in order — this facade's own equivalent of
+    /// `encode::tests::ffmpeg_decode_sequence`, needed here too since a
+    /// PSNR check needs the decoded pixels, not just the coded byte count.
+    fn ffmpeg_decode_luma(stream: &[u8], width: usize, height: usize) -> Vec<Vec<u8>> {
+        let path = std::env::temp_dir().join(format!(
+            "ec-av1-facade-rate-decode-{}-{}.obu",
+            std::process::id(),
+            std::ptr::addr_of!(stream) as usize
+        ));
+        std::fs::write(&path, stream).expect("writing the decode probe stream");
+        let out = Command::new("ffmpeg")
+            .args(["-v", "error", "-f", "obu", "-i"])
+            .arg(&path)
+            .args(["-f", "rawvideo", "-pix_fmt", "yuv420p", "-"])
+            .output()
+            .expect("ffmpeg failed to run");
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let (luma, chroma) = (width * height, width * height / 4);
+        let frame_len = luma + 2 * chroma;
+        out.stdout
+            .chunks_exact(frame_len)
+            .map(|f| f[..luma].to_vec())
+            .collect()
+    }
+
+    /// [`RateTarget::Quality`] is monotone: a higher quality dial never
+    /// produces a smaller stream or a worse mean PSNR than a lower one, on
+    /// the same real clip.
+    #[test]
+    fn quality_target_is_monotone_in_bytes_and_psnr() {
+        if !have_ffmpeg() {
+            eprintln!("SKIP quality_target_is_monotone_in_bytes_and_psnr: no ffmpeg");
+            return;
+        }
+        let (width, height) = (640, 384);
+        let Some(pictures) = h264_clip_frames(width, height, 8) else {
+            eprintln!("SKIP quality_target_is_monotone_in_bytes_and_psnr: no fixture");
+            return;
+        };
+        let mut prev_bytes = 0usize;
+        let mut prev_psnr = 0.0f64;
+        for quality in [20u8, 50, 80] {
+            let config = EncoderConfig {
+                width,
+                height,
+                base_q_idx: 100,
+                gop: 8,
+                colour: Colour::Bt709Limited,
+            };
+            let mut enc =
+                Av1Encoder::with_rate_target(config, RateTarget::Quality(quality)).unwrap();
+            let mut stream = Vec::new();
+            let mut total_bytes = 0usize;
+            for picture in &pictures {
+                let packet = enc.encode(picture).unwrap();
+                total_bytes += packet.data.len();
+                stream.extend_from_slice(&packet.data);
+            }
+            let decoded = ffmpeg_decode_luma(&stream, width, height);
+            assert_eq!(
+                decoded.len(),
+                pictures.len(),
+                "quality {quality}: dav1d frame count"
+            );
+            let mean_psnr: f64 = decoded
+                .iter()
+                .zip(&pictures)
+                .map(|(d, p)| psnr(d, &p.y))
+                .sum::<f64>()
+                / decoded.len() as f64;
+            assert!(
+                total_bytes >= prev_bytes,
+                "quality {quality}: {total_bytes} bytes not >= previous {prev_bytes}"
+            );
+            assert!(
+                mean_psnr >= prev_psnr - 0.01, // rounding slack, same-ish q_idx neighbours
+                "quality {quality}: {mean_psnr:.2} dB not >= previous {prev_psnr:.2} dB"
+            );
+            prev_bytes = total_bytes;
+            prev_psnr = mean_psnr;
+        }
     }
 }
