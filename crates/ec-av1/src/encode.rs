@@ -1831,16 +1831,14 @@ pub(crate) fn encode_key_frame_inner(
                 }
 
                 // A split whose subs are all whole 16x16 is a real quality
-                // alternative to `whole`, exactly as before; a split
-                // carrying an 8x8-leaf sub was, through r14, only ever
-                // forced (`!whole_legal`), never chosen on cost, because the
-                // leaf path was not yet proven against a real decoder. r15
-                // proved it against ffmpeg, but crate::decode has not learned
-                // the 8x8-leaf read path yet, so choosing leaf8 on cost at a
-                // size our own decoder round-trips would break decode_stream;
-                // the guard stays until decode.rs reads leaf8, then lifts.
-                let has_leaf8 = split.iter().any(|b| b.eight.is_some());
-                if !whole_legal || (split_blocks && !has_leaf8 && cost_split < cost_whole) {
+                // alternative to `whole`, exactly as before. Through r14, a
+                // split carrying an 8x8-leaf sub was only ever forced
+                // (`!whole_legal`), never chosen on cost, because the leaf
+                // path was not yet proven against a real decoder; r15 proved
+                // it against ffmpeg, and lane-av1dec r5 taught crate::decode
+                // the read path (`decode_leaf8`), so leaf8 can now win on
+                // cost anywhere, same as any other split.
+                if !whole_legal || (split_blocks && cost_split < cost_whole) {
                     modes.extend_from_slice(&split_modes);
                     blocks.push(Quadrant::Split(split));
                 } else {
