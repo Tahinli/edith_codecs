@@ -10,7 +10,7 @@
 //! are `pub(crate)`, and rightly so: the wire is `stream`, everything else is
 //! an implementation detail of how this crate happens to build it).
 
-use ec_av1_syntax::{Av1Parser, FrameType, ObuKind, TxMode};
+use ec_av1_syntax::{Av1Parser, FrameType, ObuKind, TxMode, WarpModel};
 use ec_core::{Error, Result};
 
 use crate::decode;
@@ -108,6 +108,21 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
             return Err(Error::unsupported(
                 "AV1 decode_stream",
                 "a frame with segmentation enabled (this decoder never reads a per-block segment_id symbol)",
+            ));
+        }
+        // `decode_inter_block`/`decode_inter_block8`'s `GLOBALMV` arm (spec
+        // 5.11.26's `read_inter_intra`... really `assign_mv`'s `GLOBALMV`
+        // case, spec 7.10.2.1) uses `gm_get_motion_vector`, which is the
+        // zero vector only under `GmType == IDENTITY` -- any other warp
+        // model needs the full affine/translation MV derivation this
+        // decoder does not carry. `global_motion[0]` is `LAST_FRAME`'s own
+        // entry (`read_global_motion_params`'s `i` loops from `LAST_FRAME`).
+        if header.frame_type != FrameType::Key
+            && header.global_motion[0].model != WarpModel::Identity
+        {
+            return Err(Error::unsupported(
+                "AV1 decode_stream",
+                "an inter frame whose LAST_FRAME global motion is not IDENTITY (GLOBALMV needs the full warp derivation this decoder does not carry)",
             ));
         }
         // `Tile::offset` is relative to the buffer `parse_obu` was handed
@@ -924,6 +939,21 @@ mod tests {
                 "--lag-in-frames=0",
                 "--auto-alt-ref=0",
                 "--kf-max-dist=1000",
+                // Forces `primary_ref_frame = PRIMARY_REF_NONE` on every
+                // frame (spec 5.9.2): without it a real encoder's inter
+                // frame loads its initial CDF state from the previous
+                // frame's *adapted* tables (spec 7.20's `load_cdfs`), which
+                // this decoder never does -- it always starts each frame's
+                // `Cdfs` from the spec defaults (`decode.rs`'s
+                // `Cdfs::new(q_ctx)`, called fresh per frame in
+                // `decode_stream`). Without this flag the inter frame's
+                // very first symbol desyncs immediately (traced 2026-08-27:
+                // no coefficient trace at all before the tile's first
+                // partition read comes back an out-of-alphabet value). A
+                // real decoder needs cross-frame CDF forwarding to handle
+                // that stream; this fixture sidesteps it the same way a
+                // real broadcast/low-latency encode legitimately can.
+                "--error-resilient=1",
                 "--enable-rect-partitions=0",
                 "--enable-ab-partitions=0",
                 "--enable-1to4-partitions=0",
