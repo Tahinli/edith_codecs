@@ -581,7 +581,7 @@ pub enum Quadrant {
 
 impl Quadrant {
     /// The blocks it carries, in the order they are coded.
-    fn blocks(&self) -> &[BlockCoeffs] {
+    pub(crate) fn blocks(&self) -> &[BlockCoeffs] {
         match self {
             Quadrant::Whole(block) => std::slice::from_ref(block),
             Quadrant::Split(blocks) => blocks.as_slice(),
@@ -1857,7 +1857,7 @@ pub fn sb_coeff_inter_frame_tile(
     mi_cols: u32,
     mi_rows: u32,
     base_q_idx: u8,
-    blocks: &[BlockCoeffs],
+    blocks: &[Quadrant],
 ) -> Result<Vec<u8>> {
     check_blocks(mi_cols, mi_rows)?;
     // `block_grid`'s ceiling, not a plain division: a true frame size that is
@@ -1871,8 +1871,9 @@ pub fn sb_coeff_inter_frame_tile(
             "an inter frame needs one entry per 32x32 block inside the true frame",
         ));
     }
-    if let Some(bad) = blocks
-        .iter()
+    let coded: Vec<&BlockCoeffs> = blocks.iter().flat_map(Quadrant::blocks).collect();
+    if let Some(bad) = coded
+        .into_iter()
         .find(|b| b.inter.is_none() && usize::from(b.mode) >= INTRA_MODES)
     {
         return Err(Error::unsupported(
@@ -1885,7 +1886,7 @@ pub fn sb_coeff_inter_frame_tile(
     }
 
     /// `Y_MODE`'s size group (spec `Size_Group`) for a 32x32 block, the only
-    /// size this writer's intra branch codes.
+    /// size this writer's inter branch codes.
     const SIZE_GROUP_32: usize = 3;
     /// `Ref_Frame_List`'s `LAST_FRAME` (spec 3): the only reference this
     /// writer's single-reference chain ever names.
@@ -1909,6 +1910,7 @@ pub fn sb_coeff_inter_frame_tile(
     let inter_planes = [TxbSet::Luma32Inter, TxbSet::Chroma16, TxbSet::Chroma16];
     let scan32 = default_scan(TX32);
     let scan16 = default_scan(TX16);
+    let scan8 = default_scan(TX8);
     let zero_grids = [
         vec![0i32; TX32 * TX32],
         vec![0i32; TX16 * TX16],
@@ -1951,28 +1953,102 @@ pub fn sb_coeff_inter_frame_tile(
                 if r32 >= rows || c32 >= cols {
                     continue;
                 }
-                let block = &blocks[(r32 * cols + c32) as usize];
+                let site = &blocks[(r32 * cols + c32) as usize];
                 let at = (r32 as usize * 2, c32 as usize * 2);
-                let (r, c) = at;
                 let ctx32 = neighbours.partition_ctx(at, BLOCK);
-                // This writer has no rectangular (HORZ/VERT) or further-split
-                // representation for a 32x32 block, so one that itself
-                // straddles the true edge is refused rather than miscoded --
-                // mirroring `sb_coeff_key_frame_tile`'s "cannot be left whole"
-                // refusal, just with no split arm to fall back to here.
+                // spec `decode_partition`'s hasRows/hasCols recomputed at this
+                // quadrant's own half: a whole 32x32 block cannot be left
+                // whole once its own half straddles the true edge, mirroring
+                // `sb_coeff_key_frame_tile`'s "cannot be left whole" refusal.
                 let (has_cols32, has_rows32) = (
                     has_half(c32 * BLOCK_MI, BLOCK_MI, mi_cols),
                     has_half(r32 * BLOCK_MI, BLOCK_MI, mi_rows),
                 );
-                if !has_cols32 || !has_rows32 {
-                    return Err(Error::unsupported(
-                        "AV1 tile",
-                        "a 32x32 inter-frame block that straddles the true frame edge \
-                         needs an 8x8 split this writer does not code",
-                    ));
-                }
-                enc.symbol(PARTITION_NONE, &mut cdfs.partition_w32[ctx32]);
+                let block = match site {
+                    Quadrant::Whole(block) => {
+                        if !has_cols32 || !has_rows32 {
+                            return Err(Error::unsupported(
+                                "AV1 tile",
+                                "a 32x32 block that is half outside the true frame \
+                                 cannot be left whole",
+                            ));
+                        }
+                        enc.symbol(PARTITION_NONE, &mut cdfs.partition_w32[ctx32]);
+                        block
+                    }
+                    Quadrant::Split(sub_blocks) => {
+                        // Same filter as `sb_coeff_key_frame_tile`'s
+                        // `sub_positions`: only the 16x16 leaves whose own mi
+                        // origin is inside the true frame are coded.
+                        let sub_positions: Vec<(usize, usize)> = (0..4)
+                            .map(|i| (r32 as usize * 2 + i / 2, c32 as usize * 2 + i % 2))
+                            .filter(|&(sr, sc)| {
+                                (sr as u32) * SUB_MI < mi_rows && (sc as u32) * SUB_MI < mi_cols
+                            })
+                            .collect();
+                        if sub_blocks.len() != sub_positions.len() {
+                            return Err(Error::unsupported(
+                                "AV1 tile",
+                                "a split 32x32 inter-frame block needs one 16x16 entry \
+                                 per sub-block inside the true frame",
+                            ));
+                        }
+                        // Same three-way spec signaling as the superblock
+                        // level above, recomputed at this quadrant's own half.
+                        match (has_cols32, has_rows32) {
+                            (true, true) => {
+                                enc.symbol(PARTITION_SPLIT, &mut cdfs.partition_w32[ctx32]);
+                            }
+                            (true, false) => {
+                                enc.symbol_fixed(
+                                    1,
+                                    &gather(&cdfs.partition_w32[ctx32], VERT_ALIKE),
+                                );
+                            }
+                            (false, true) => {
+                                enc.symbol_fixed(
+                                    1,
+                                    &gather(&cdfs.partition_w32[ctx32], HORZ_ALIKE),
+                                );
+                            }
+                            (false, false) => {}
+                        }
+                        for (leaf, (sr, sc)) in sub_blocks.iter().zip(sub_positions) {
+                            // A 16x16 leaf the true frame edge itself cuts
+                            // through needs a rectangular transform this
+                            // writer does not code yet -- same refusal as
+                            // `sb_coeff_key_frame_tile`'s SUB level, just
+                            // named for an inter-frame leaf.
+                            let (has_cols16, has_rows16) = (
+                                has_half(sc as u32 * SUB_MI, SUB_MI, mi_cols),
+                                has_half(sr as u32 * SUB_MI, SUB_MI, mi_rows),
+                            );
+                            if !has_cols16 || !has_rows16 {
+                                return Err(Error::unsupported(
+                                    "AV1 tile",
+                                    "a 16x16 inter-frame block the true frame edge cuts \
+                                     through needs a rectangular transform this writer \
+                                     does not code yet",
+                                ));
+                            }
+                            let at16 = (sr, sc);
+                            let ctx16 = neighbours.partition_ctx(at16, SUB);
+                            enc.symbol(PARTITION_NONE, &mut cdfs.partition_w16[ctx16]);
+                            write_inter_frame_intra_leaf(
+                                &mut enc,
+                                &mut cdfs,
+                                &mut neighbours,
+                                leaf,
+                                at16,
+                                &scan16,
+                                &scan8,
+                            )?;
+                        }
+                        continue;
+                    }
+                };
 
+                let (r, c) = at;
                 let has_above = r32 > 0;
                 let has_left = c32 > 0;
                 let skip_ctx =
@@ -2096,6 +2172,85 @@ pub fn sb_coeff_inter_frame_tile(
         }
     }
     Ok(enc.finish())
+}
+
+/// Writes one 16x16 leaf a straddling 32x32 quadrant's [`Quadrant::Split`]
+/// splits into, always through the inter frame's intra branch (spec
+/// `inter_frame_mode_info`'s intra branch, `is_inter` coded `false`): no
+/// `Luma16Inter` tx_type table exists yet for a genuine inter leaf at this
+/// size (see [`TxbSet::Luma32Inter`]'s doc comment), and these leaves only
+/// ever fill the sliver of real content a true edge lands in the middle of a
+/// 32x32 block, never a leaf a motion search chose on its own. Its own
+/// `PARTITION_NONE` symbol is already written, same contract as
+/// [`write_block`].
+fn write_inter_frame_intra_leaf(
+    enc: &mut SymbolEncoder,
+    cdfs: &mut Cdfs,
+    neighbours: &mut Neighbours,
+    block: &BlockCoeffs,
+    at: (usize, usize),
+    scan16: &Vec<u16>,
+    scan8: &Vec<u16>,
+) -> Result<()> {
+    if usize::from(block.mode) >= INTRA_MODES {
+        return Err(Error::unsupported(
+            "AV1 tile",
+            format!(
+                "intra mode {} is not one of the thirteen this writer codes",
+                block.mode
+            ),
+        ));
+    }
+    /// `Y_MODE`'s size group (spec `Size_Group`, `common_data.h`'s
+    /// `size_group_lookup[BLOCK_16X16]`) for this leaf's own size.
+    const SIZE_GROUP_16: usize = 2;
+
+    let (r, c) = at;
+    let skip_ctx = usize::from(neighbours.above_skip[c]) + usize::from(neighbours.left_skip[r]);
+    enc.symbol(usize::from(block.skip), &mut cdfs.skip[skip_ctx]);
+
+    let (has_above, has_left) = (r > 0, c > 0);
+    let ii_ctx = intra_inter_ctx(
+        has_above,
+        has_left,
+        neighbours.above_inter[c],
+        neighbours.left_inter[r],
+    );
+    enc.symbol(0, &mut cdfs.intra_inter[ii_ctx]); // is_inter = false
+
+    let mode = usize::from(block.mode);
+    enc.symbol(mode, &mut cdfs.y_mode[SIZE_GROUP_16]);
+    if (V_PRED..=D67_PRED).contains(&mode) {
+        enc.symbol(ANGLE_DELTA_ZERO, &mut cdfs.angle_delta[mode - V_PRED]);
+    }
+    enc.symbol(DC_PRED, &mut cdfs.uv_mode_cfl[mode]);
+
+    if block.skip {
+        let zero_grids = [
+            vec![0i32; TX16 * TX16],
+            vec![0i32; TX8 * TX8],
+            vec![0i32; TX8 * TX8],
+        ];
+        neighbours.record(at, SUB, mode, &zero_grids);
+    } else {
+        let grids = [
+            level_grid(&block.luma, TX16)?,
+            level_grid(&block.u, TX8)?,
+            level_grid(&block.v, TX8)?,
+        ];
+        write_block_planes(
+            enc,
+            cdfs,
+            &[TxbSet::Luma16, TxbSet::Chroma8, TxbSet::Chroma8],
+            &grids,
+            &[scan16, scan8, scan8],
+            &neighbours.around(at, SUB),
+            mode,
+        );
+        neighbours.record(at, SUB, mode, &grids);
+    }
+    neighbours.record_inter(at, SUB, block.skip, false);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -4354,7 +4509,12 @@ mod tests {
             skip: true,
             ..BlockCoeffs::default()
         };
-        let blocks = vec![block.clone(), block.clone(), block.clone(), block];
+        let blocks = vec![
+            Quadrant::Whole(block.clone()),
+            Quadrant::Whole(block.clone()),
+            Quadrant::Whole(block.clone()),
+            Quadrant::Whole(block),
+        ];
         let data = sb_coeff_inter_frame_tile(16, 16, 90, &blocks).unwrap();
         // Hand count: one partition_w64, then per block partition_w32 + skip +
         // is_inter + 3 single_ref + new_mv + zero_mv + ref_mv = 9, times four.
@@ -4398,7 +4558,12 @@ mod tests {
             skip: true,
             ..BlockCoeffs::default()
         };
-        let blocks = vec![nearest.clone(), nearest.clone(), nearest, newmv];
+        let blocks = vec![
+            Quadrant::Whole(nearest.clone()),
+            Quadrant::Whole(nearest.clone()),
+            Quadrant::Whole(nearest),
+            Quadrant::Whole(newmv),
+        ];
         let data = sb_coeff_inter_frame_tile(16, 16, 90, &blocks).unwrap();
 
         let (count, results) = decode_inter_sb(&data, 16, 16, false);
@@ -4457,7 +4622,7 @@ mod tests {
             skip: true,
             ..BlockCoeffs::default()
         };
-        let blocks = vec![block; 4];
+        let blocks = vec![Quadrant::Whole(block); 4];
         let data = sb_coeff_inter_frame_tile(16, 16, 90, &blocks).unwrap();
 
         assert_eq!(
