@@ -236,6 +236,24 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
             end_cdfs.reset_counts();
             end_cdfs
         };
+        if let Ok(path) = std::env::var("EC_AV1_DUMP_TABLES") {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                let _ = writeln!(f, "=== frame idx={} ===", pictures.len());
+                let _ = writeln!(f, "partition_w64 {:?}", stored_cdfs.partition_w64);
+                let _ = writeln!(f, "partition_w32 {:?}", stored_cdfs.partition_w32);
+                let _ = writeln!(f, "partition_w16 {:?}", stored_cdfs.partition_w16);
+                let _ = writeln!(f, "skip {:?}", stored_cdfs.skip);
+                let _ = writeln!(f, "new_mv {:?}", stored_cdfs.new_mv);
+                let _ = writeln!(f, "zero_mv {:?}", stored_cdfs.zero_mv);
+                let _ = writeln!(f, "ref_mv {:?}", stored_cdfs.ref_mv);
+                let _ = writeln!(f, "mv_joint {:?}", stored_cdfs.mv_joint);
+            }
+        }
         for i in 0..NUM_REF_FRAMES {
             if header.refresh_frame_flags & (1 << i) != 0 {
                 cdf_slots[i] = Some(stored_cdfs.clone());
