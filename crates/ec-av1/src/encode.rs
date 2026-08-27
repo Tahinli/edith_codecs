@@ -1820,13 +1820,13 @@ pub(crate) fn encode_key_frame_inner(
 
                 // A split whose subs are all whole 16x16 is a real quality
                 // alternative to `whole`, exactly as before; a split
-                // carrying an 8x8-leaf sub is only ever forced (`!whole_
-                // legal`), never chosen on cost -- the leaf path is new this
-                // round and not yet proven against a real decoder (see the
-                // r7 handoff), so it must not regress a size that already
-                // had a legal, working whole-32x32 alternative.
-                let has_leaf8 = split.iter().any(|b| b.eight.is_some());
-                if !whole_legal || (split_blocks && !has_leaf8 && cost_split < cost_whole) {
+                // carrying an 8x8-leaf sub was, through r14, only ever
+                // forced (`!whole_legal`), never chosen on cost, because the
+                // leaf path was not yet proven against a real decoder. r15
+                // closed that gap (`a_single_axis_straddle_round_trips_
+                // through_ffmpeg` decodes clean), so the guard is lifted:
+                // leaf8 splits now compete on cost like any other split.
+                if !whole_legal || (split_blocks && cost_split < cost_whole) {
                     modes.extend_from_slice(&split_modes);
                     blocks.push(Quadrant::Split(split));
                 } else {
@@ -3322,6 +3322,31 @@ mod tests {
         );
     }
 
+    /// The r15 fix at production size: three 640x360 key frames (inter is
+    /// still refused at this size, per the test above, so this stands in for
+    /// the charter's "3-frame sequence" using three independent key frames of
+    /// shifted content), each proven decoder-clean through ffmpeg rather than
+    /// only encoder-clean.
+    #[test]
+    fn a_640x360_half_straddle_round_trips_through_ffmpeg_across_three_frames() {
+        if !have_ffmpeg() {
+            eprintln!(
+                "SKIP a_640x360_half_straddle_round_trips_through_ffmpeg_across_three_frames: \
+                 no ffmpeg"
+            );
+            return;
+        }
+        let (width, height) = (640usize, 360usize);
+        for shift in [0i64, 7, 19] {
+            let picture = panned_test_card(width, height, shift);
+            let encoded = encode_key_frame(&picture, 100, 0.5).unwrap();
+            let decoded = ffmpeg_decode(&encoded.stream, width, height);
+            assert_eq!(decoded.y, encoded.reconstruction.y, "shift {shift}: luma");
+            assert_eq!(decoded.u, encoded.reconstruction.u, "shift {shift}: U");
+            assert_eq!(decoded.v, encoded.reconstruction.v, "shift {shift}: V");
+        }
+    }
+
     /// One frame of a real clip, scaled to a whole number of 32x32 blocks.
     fn clip_frame(clip: &str, skip: &str, width: usize, height: usize) -> Picture {
         let out = Command::new("ffmpeg")
@@ -3929,12 +3954,19 @@ mod tests {
     /// transform) where the writer intends `TX_8X8` (`txs_ctx=2`), meaning
     /// something *before* this leaf's own `EC_TXBSKIP`/`EC_TXTYPE` still
     /// desyncs the stream by exactly the width of one earlier symbol -- not
-    /// yet isolated to a single named symbol. Ignored rather than deleted,
-    /// so the class stays named and the gate stays green.
+    /// yet isolated to a single named symbol. r15 found the last bug: the
+    /// header fix from r14 explained the rng skew fully, and the remaining
+    /// desync (still past `mi_row=4`) was `write_leaf8`'s (4) fix itself --
+    /// its `above_mode[c]`/`left_mode[r]` forced write ran *inside* the leaf
+    /// loop, once per leaf, so the first leaf's write clobbered the true
+    /// external neighbour mode the second leaf of the *same* straddling
+    /// quadrant still needed for its non-adjacency axis (a column-straddle
+    /// case: two leaves share one `outer_at` column index, so leaf 1's
+    /// write to `left_mode[r]` overwrote the real western neighbour before
+    /// leaf 2 read it). Fixed by moving the write out of `write_leaf8` and
+    /// doing it once, after the whole leaf loop, from the last (bottom/
+    /// right-most) leaf's mode. The stream now round-trips through ffmpeg.
     #[test]
-    #[ignore = "lane-av1-rect r14: leaf(0,8)'s rng now matches through several further \
-                leaves after the reduced_tx_set header fix; residual desync moved past \
-                mi_row=4, not yet isolated to a named symbol"]
     fn a_single_axis_straddle_round_trips_through_ffmpeg() {
         if !have_ffmpeg() {
             eprintln!("SKIP a_single_axis_straddle_round_trips_through_ffmpeg: no ffmpeg");
