@@ -758,6 +758,48 @@ impl Plane<'_> {
         }
     }
 
+    /// The SAD-plus-mode-cost score [`Self::search_block`] ranks candidates
+    /// by, exposed so [`search_inter_block`]'s intra-candidate loop can
+    /// prescreen by the identical rule rather than a second one that could
+    /// drift from it.
+    fn intra_scores(
+        &self,
+        at: At,
+        modes: &[u8],
+        mode_bits: &[f64; 13],
+        lambda: f64,
+    ) -> Vec<(f64, u8)> {
+        let At {
+            x, y, side, reach, ..
+        } = at;
+        let (above, left, corner) = self.edges(x, y, side, reach);
+        modes
+            .iter()
+            .map(|&mode| {
+                let mut prediction = vec![0u8; side * side];
+                crate::intra::predict(
+                    mode,
+                    above.as_deref(),
+                    left.as_deref(),
+                    corner,
+                    side,
+                    &mut prediction,
+                );
+                let sad: f64 = (0..side * side)
+                    .map(|i| {
+                        let (row, col) = (i / side, i % side);
+                        f64::from(
+                            (i32::from(self.source[(y + row) * self.width + x + col])
+                                - i32::from(prediction[i]))
+                            .abs(),
+                        )
+                    })
+                    .sum();
+                (sad + lambda * mode_bits[usize::from(mode)], mode)
+            })
+            .collect()
+    }
+
     /// Codes one block under every mode the search offers (or, when
     /// [`Search::top_k`] prunes it, the cheapest `top_k` of them by a SAD
     /// pre-pass plus DC) and commits the one whose squared error and
@@ -1074,6 +1116,27 @@ fn restore(
     chroma[1].restore(x / 2, y / 2, BLOCK / 2, &saved[2]);
 }
 
+/// Keeps the DC candidate plus the cheapest `top_k` (or fewer, once DC is set
+/// aside) of `scored` (as [`Plane::intra_scores`] built it), in `modes`' own
+/// order -- the same DC-always-kept, cheapest-by-SAD rule [`Plane::search_block`]
+/// applies, so [`search_inter_block`]'s intra-candidate loop prunes by one
+/// rule shared with the key-frame path, not a second one that could diverge.
+fn prune_by_sad(modes: &[u8], mut scored: Vec<(f64, u8)>, top_k: usize) -> Vec<u8> {
+    let dc_pos = scored.iter().position(|&(_, mode)| mode == DC_PRED);
+    let dc_entry = dc_pos.map(|i| scored.remove(i));
+    scored.sort_by(|a, b| a.0.partial_cmp(&b.0).expect("scores are finite"));
+    scored.truncate(if dc_entry.is_some() {
+        top_k.saturating_sub(1)
+    } else {
+        top_k
+    });
+    if let Some(dc_entry) = dc_entry {
+        scored.push(dc_entry);
+    }
+    let keep: Vec<u8> = scored.into_iter().map(|(_, mode)| mode).collect();
+    modes.iter().copied().filter(|m| keep.contains(m)).collect()
+}
+
 fn mode_bits(above_mode: u8, left_mode: u8) -> [f64; 13] {
     let luma = &cdf::KF_Y_MODE[INTRA_MODE_CTX[usize::from(above_mode)]]
         [INTRA_MODE_CTX[usize::from(left_mode)]];
@@ -1138,6 +1201,49 @@ fn set_test_top_k_override(value: Option<usize>) {
 /// The default: unpruned, thirteen full trials per block, same as before this
 /// lever. Set from the sweep in the lane report if the quality gate clears it.
 const PRUNE_TOP_K: Option<usize> = None;
+
+/// [`Search::top_k`] for [`search_inter_block`]'s intra-candidate loop --
+/// kept apart from [`prune_top_k`]/[`PRUNE_TOP_K`] because the two paths'
+/// quality gates were measured separately and may land on different
+/// defaults; `EC_AV1_PRUNE_K_INTER` sweeps it without touching
+/// [`EC_AV1_PRUNE_K`] or the key-frame path.
+fn prune_top_k_inter() -> Option<usize> {
+    #[cfg(test)]
+    {
+        if let Some(k) = TEST_TOP_K_OVERRIDE_INTER.with(|cell| cell.get()) {
+            return k;
+        }
+    }
+    let swept = std::env::var("EC_AV1_PRUNE_K_INTER")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok());
+    match swept {
+        Some(k) if cfg!(test) => Some(k),
+        _ => INTER_PRUNE_TOP_K,
+    }
+}
+
+/// A per-thread override [`prune_top_k_inter`] checks first, same reason as
+/// [`TEST_TOP_K_OVERRIDE`].
+#[cfg(test)]
+thread_local! {
+    static TEST_TOP_K_OVERRIDE_INTER: std::cell::Cell<Option<Option<usize>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn set_test_top_k_override_inter(value: Option<usize>) {
+    TEST_TOP_K_OVERRIDE_INTER.with(|cell| cell.set(Some(value)));
+}
+
+/// The inter path's default `top_k`: `Some(3)`, from `prune_k_quality_sweep_inter`
+/// (three real clips, q 60 and 150) -- every `K` in {3, 4, 6} cleared the
+/// same rule the key-frame lever uses (every PSNR delta <0.05dB, bytes
+/// within +1%; worst seen was -0.011dB / +0.147% bytes), so the cheapest,
+/// `K=3`, ships as default. Unlike the key-frame path (still `None`), an
+/// inter block's intra candidates rarely win against NEWMV/NEARESTMV, so
+/// pruning them costs less quality here.
+const INTER_PRUNE_TOP_K: Option<usize> = Some(3);
 
 /// Per-thread nanosecond counters `stage_timing_breakdown_inter` (and
 /// [`crate::mc::predict`], through [`stage_add`]) accumulate into, so an
@@ -1755,7 +1861,25 @@ fn search_inter_block(
         search.deadzone,
     );
 
-    for &mode in search.modes {
+    let intra_modes: Vec<u8> = match search.top_k {
+        Some(k) if k < search.modes.len() => {
+            let scored = luma.intra_scores(
+                At {
+                    x,
+                    y,
+                    side: BLOCK,
+                    reach,
+                    set: luma_set,
+                },
+                search.modes,
+                mode_bits,
+                search.lambda,
+            );
+            prune_by_sad(search.modes, scored, k)
+        }
+        _ => search.modes.to_vec(),
+    };
+    for &mode in &intra_modes {
         let luma_trial = luma.trial(
             At {
                 x,
@@ -2102,7 +2226,7 @@ pub(crate) fn encode_inter_frame(
         deadzone,
         lambda: lambda_scale() * step * step,
         modes: &KEY_FRAME_MODES,
-        top_k: prune_top_k(),
+        top_k: prune_top_k_inter(),
     };
     let mode_bits_table = inter_mode_bits();
 
@@ -3869,6 +3993,120 @@ mod tests {
             }
         }
         set_test_top_k_override(None);
+    }
+
+    /// Two consecutive decoded frames from one clip, for an inter-frame
+    /// sweep -- [`clip_frame`] alone only ever gives one.
+    fn clip_frame_pair(clip: &str, skip: &str, width: usize, height: usize) -> [Picture; 2] {
+        let out = Command::new("ffmpeg")
+            .args(["-v", "error", "-ss", skip, "-i", clip, "-frames:v", "2"])
+            .args(["-vf", &format!("scale={width}:{height}")])
+            .args(["-f", "rawvideo", "-pix_fmt", "yuv420p", "-"])
+            .output()
+            .expect("ffmpeg failed to run");
+        assert!(
+            out.status.success(),
+            "ffmpeg: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let (luma, chroma) = (width * height, width * height / 4);
+        let frame_len = luma + 2 * chroma;
+        assert_eq!(out.stdout.len(), frame_len * 2, "expected two 4:2:0 frames");
+        std::array::from_fn(|i| {
+            let bytes = &out.stdout[i * frame_len..][..frame_len];
+            Picture {
+                width,
+                height,
+                y: bytes[..luma].to_vec(),
+                u: bytes[luma..luma + chroma].to_vec(),
+                v: bytes[luma + chroma..].to_vec(),
+            }
+        })
+    }
+
+    /// The quality gate [`INTER_PRUNE_TOP_K`] lives or dies by: the same
+    /// three real clips as [`prune_k_quality_sweep`], but coding a key frame
+    /// then one inter frame off it (`search_inter_block`'s own intra
+    /// candidates are what [`prune_by_sad`] prunes here, not the key-frame
+    /// loop), at 1280x704 -- a whole number of 64x64 superblocks, so no
+    /// padding step complicates the comparison. Prints bytes and luma PSNR
+    /// for the inter frame alone, unpruned vs each `K`.
+    /// `cargo test -p ec-av1 --release prune_k_quality_sweep_inter -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "needs real clips and ffmpeg; prints numbers for the lane report to judge"]
+    fn prune_k_quality_sweep_inter() {
+        if !have_ffmpeg() {
+            eprintln!("SKIP prune_k_quality_sweep_inter: no ffmpeg");
+            return;
+        }
+        let (width, height) = (1280usize, 704usize);
+        let frames: &[(&str, &str, &str)] = &[
+            (
+                "dark/flat",
+                "/home/tahinli/Videos/he_is_not_the_only_one.mp4",
+                "3",
+            ),
+            (
+                "detailed",
+                "/home/tahinli/Downloads/The.Hunger.Games.The.Ballad.Of.Songbirds.And.Snakes.2023.Bluray.2160p.AV1.HDR10.OPUS.7.1-UH.mkv",
+                "1200",
+            ),
+            (
+                "film",
+                "/home/tahinli/Videos/Films/Troy.Director's.Cut.2004.Bluray.1080P.AV1.OPUS.5.1-DECK.mkv",
+                "600",
+            ),
+        ];
+        for &(label, clip, skip) in frames {
+            if !std::path::Path::new(clip).exists() {
+                eprintln!("SKIP {label}: {clip} not present on this machine");
+                continue;
+            }
+            let [key_source, inter_source] = clip_frame_pair(clip, skip, width, height);
+            for &q in &[60u8, 150] {
+                // SAFETY (not literally unsafe, just process-global): a
+                // single-threaded #[ignore] probe, run by hand, never
+                // alongside other tests that read Search::top_k.
+                set_test_top_k_override_inter(None);
+                let key = encode_key_frame(&key_source, q, 0.5).unwrap();
+                let baseline = encode_inter_frame(
+                    &inter_source,
+                    &key.reconstruction,
+                    q,
+                    0.5,
+                    1,
+                    (width, height),
+                )
+                .unwrap();
+                let baseline_psnr = psnr(&baseline.reconstruction.y, &inter_source.y);
+                eprint!(
+                    "{label:9} q={q:3}  baseline {:6} bytes  {:6.2} dB",
+                    baseline.stream.len(),
+                    baseline_psnr
+                );
+                for &k in &[3usize, 4, 6] {
+                    set_test_top_k_override_inter(Some(k));
+                    let pruned = encode_inter_frame(
+                        &inter_source,
+                        &key.reconstruction,
+                        q,
+                        0.5,
+                        1,
+                        (width, height),
+                    )
+                    .unwrap();
+                    let pruned_psnr = psnr(&pruned.reconstruction.y, &inter_source.y);
+                    eprint!(
+                        "   K={k} {:6} bytes  {:6.2} dB ({:+.3} dB)",
+                        pruned.stream.len(),
+                        pruned_psnr,
+                        pruned_psnr - baseline_psnr
+                    );
+                }
+                eprintln!();
+            }
+        }
+        set_test_top_k_override_inter(None);
     }
 
     /// The replica-shaped path: 24 frames, 1280x720, one key frame followed
