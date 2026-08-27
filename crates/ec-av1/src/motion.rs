@@ -191,6 +191,7 @@ pub struct MotionSearch {
 #[allow(clippy::too_many_arguments)] // one reference plane, one block, one predictor
 pub fn search(
     reference: &[u8],
+    stride: usize,
     ref_width: usize,
     ref_height: usize,
     source: &[u8],
@@ -202,8 +203,8 @@ pub fn search(
     lambda: f64,
 ) -> MotionSearch {
     let (result, _trace) = search_traced(
-        reference, ref_width, ref_height, source, block_x, block_y, block_w, block_h, pred_mv,
-        lambda,
+        reference, stride, ref_width, ref_height, source, block_x, block_y, block_w, block_h,
+        pred_mv, lambda,
     );
     result
 }
@@ -214,6 +215,7 @@ pub fn search(
 #[allow(clippy::too_many_arguments)] // one reference plane, one block, one predictor
 fn search_traced(
     reference: &[u8],
+    stride: usize,
     ref_width: usize,
     ref_height: usize,
     source: &[u8],
@@ -226,6 +228,7 @@ fn search_traced(
 ) -> (MotionSearch, Vec<f64>) {
     search_traced_from_step(
         reference,
+        stride,
         ref_width,
         ref_height,
         source,
@@ -245,6 +248,7 @@ fn search_traced(
 #[allow(clippy::too_many_arguments)]
 fn search_traced_from_step(
     reference: &[u8],
+    stride: usize,
     ref_width: usize,
     ref_height: usize,
     source: &[u8],
@@ -264,7 +268,7 @@ fn search_traced_from_step(
         let x_q4 = (block_x as i32) * 16 + mv.1 * Q4_PER_Q3;
         let y_q4 = (block_y as i32) * 16 + mv.0 * Q4_PER_Q3;
         predict(
-            reference, ref_width, ref_height, x_q4, y_q4, block_w, block_h, &mut dst,
+            reference, stride, ref_width, ref_height, x_q4, y_q4, block_w, block_h, &mut dst,
         );
         let sad: f64 = source
             .iter()
@@ -424,6 +428,7 @@ mod tests {
             let result = search(
                 &plane,
                 width,
+                width,
                 height,
                 &block,
                 anchor_x,
@@ -470,6 +475,7 @@ mod tests {
         let result = search(
             &plane,
             width,
+            width,
             height,
             &block,
             anchor_x,
@@ -504,6 +510,7 @@ mod tests {
         }
         let (_result, trace) = search_traced(
             &plane,
+            width,
             width,
             height,
             &block,
@@ -570,6 +577,7 @@ mod tests {
                 }
                 let (result, trace) = search_traced_from_step(
                     &plane,
+                    width,
                     width,
                     height,
                     &block,
