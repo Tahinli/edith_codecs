@@ -40,3 +40,16 @@ fn rdoq_cache_hash_1920x1080() {
 fn rdoq_cache_hash_416x240() {
     println!("hash 416x240 = {:016x}", encode_hash(416, 240));
 }
+
+/// lane-h265simd: pinned bit-identity gate for the transform's hot path. The
+/// value is the same hash the two tests above print, verified by hand
+/// (`git stash` the transform.rs change, rerun, compare) to be identical
+/// before and after replacing `m32()`'s per-element branch with a
+/// compile-time-mirrored flat table in `forward_1d`/`inverse_1d` — this pins
+/// that equality so a future change to the hot path is caught if it ever
+/// produces a different byte.
+#[test]
+fn rdoq_cache_hash_is_pinned() {
+    assert_eq!(encode_hash(416, 240), 0xda5d606db0755d97);
+    assert_eq!(encode_hash(1920, 1080), 0xf08a816c9fa9ca2c);
+}
