@@ -187,6 +187,9 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         let enable_dual_filter = parser
             .sequence_header()
             .is_some_and(|seq| seq.enable_dual_filter);
+        let enable_edge_filter = parser
+            .sequence_header()
+            .is_some_and(|seq| seq.enable_intra_edge_filter);
         let interp_fixed = match header.interpolation_filter {
             ec_av1_syntax::InterpolationFilter::Switchable => None,
             fixed => Some(crate::mc::InterpFilterKind::from_header(fixed)),
@@ -218,6 +221,7 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 header.frame_width,
                 header.frame_height,
                 enable_filter_intra,
+                enable_edge_filter,
                 &header.cdef,
                 &header.loop_filter,
                 initial_cdfs,
@@ -1254,12 +1258,12 @@ mod tests {
                     "--enable-tx-size-search=0",
                     "--enable-cdef=0",
                     "--enable-restoration=0",
-                    // The intra edge filter/upsample (spec 7.11.2.7-2.10) is
-                    // its own unimplemented corner-cut (`directional()`'s own
-                    // doc comment) -- off so a nonzero angle delta does not
-                    // also need it, same convention as every other
-                    // not-yet-supported tool disabled above.
-                    "--enable-intra-edge-filter=0",
+                    // The intra edge filter/upsample (spec 7.11.2.7-2.9) is
+                    // now implemented (`directional()`) -- left ON (aomenc's
+                    // own default) so this gate actually exercises it instead
+                    // of the un-filtered fast path a disabled flag would keep
+                    // testing.
+                    "--enable-intra-edge-filter=1",
                     "--max-partition-size=32",
                     // Same reason as the tx-select gate above: 8x8 and other
                     // sub-16x16 splits are a separate, already-named refusal.
