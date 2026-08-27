@@ -373,6 +373,7 @@ pub fn rdoq(
     let scale = coeff_ssd_scale(n);
     let lambda = RDOQ_LAMBDA * lambda;
     let base = enc.snapshot();
+    let base_bits = enc.bit_count();
     let err = |level: i32, coeff: i32| {
         let d = f64::from(dequant_level(level, n, qp) - coeff);
         d * d
@@ -397,6 +398,10 @@ pub fn rdoq(
     // it is tried while the levels above it are already gone.
     let sub_scan = scan(log2_size - 2, scan_idx);
     let pos_scan = scan(2, scan_idx);
+    // Sub-block index in *scan* order (what the encoder's own sub-block loop
+    // is indexed by) for a flat row-major position — distinct from `sub_idx`
+    // below, which is the *raster* sub-block index `csbf`/`sub_count` use.
+    let positions = &POSITIONS[(log2_size - 2) as usize][scan_idx];
     let order: Vec<usize> = sub_scan
         .iter()
         .flat_map(|&(xs, ys)| {
@@ -428,6 +433,23 @@ pub fn rdoq(
     }
     let mut cur_last = nz_positions.first().copied().unwrap_or(0);
     let mut nz_idx = 0usize;
+    let (dc_xs, dc_ys) = sub_scan[0];
+    let dc_idx = dc_ys as usize * sub_wide + dc_xs as usize;
+
+    // Sub-block frozen-prefix cache: `cursor` holds the CABAC state right
+    // before encoding sub-block `cursor.2`, plus the `greater1_ctx` carry the
+    // sub-block above it left behind. Every trial that neither moves the last
+    // significant position nor touches a sub-block above the cursor can
+    // restore from it and re-encode only `sub_idx..=0` — the sub-blocks above
+    // are already committed to the bitstream and, since `csbf` and
+    // `greater1_ctx` only ever flow from a higher-index sub-block to a lower
+    // one (never the reverse — 9.3.4.2.6's `greater1_ctx` carry and the
+    // coded-sub-block-flag neighbour lookups both read only already-visited
+    // neighbours), their bits cannot change. `cursor` is invalidated (`None`)
+    // whenever `cur_last` moves, since that changes the header and `last_sub`
+    // themselves.
+    let mut cursor: Option<(CabacState, u32, usize)> = None;
+    let mut cursor_last = cur_last;
 
     for (k, &i) in order.iter().enumerate().rev() {
         let level = levels[i];
@@ -440,6 +462,7 @@ pub fn rdoq(
             continue;
         }
         let sub_idx = ((i / n) >> 2) * sub_wide + ((i % n) >> 2);
+        let scan_sub = (positions[i] as usize) / 16;
         let mut tried = level.abs();
         for candidate in [level.abs() - 1, 0] {
             if candidate == tried {
@@ -455,26 +478,80 @@ pub fn rdoq(
                 sub_count[sub_idx] -= 1;
                 csbf[sub_idx] = sub_count[sub_idx] > 0;
             }
-            let trial_last = if now_zero && k as i32 == cur_last {
-                next_last
-            } else {
-                cur_last
-            };
+            let moves_last = now_zero && k as i32 == cur_last;
+            let trial_last = if moves_last { next_last } else { cur_last };
             let trial_dist = dist - err(keep, coeffs[i]) + err(levels[i], coeffs[i]);
             let any = sub_count.iter().any(|&c| c > 0);
-            let trial_bits = levels_bits_with(
-                enc,
-                &base,
-                levels,
-                log2_size,
-                c_idx,
-                scan_idx,
-                cbf_ctx,
-                any,
-                transform_skip,
-                trial_last,
-                csbf,
-            );
+
+            let trial_bits = if moves_last {
+                // The last position itself moves: the header changes, so
+                // there is no shortcut — re-derive the whole block from
+                // `base`, same as before this round.
+                levels_bits_with(
+                    enc,
+                    &base,
+                    levels,
+                    log2_size,
+                    c_idx,
+                    scan_idx,
+                    cbf_ctx,
+                    any,
+                    transform_skip,
+                    trial_last,
+                    csbf,
+                )
+            } else {
+                if cursor_last != cur_last {
+                    cursor = None;
+                    cursor_last = cur_last;
+                }
+                let last_sub_now = (cur_last as usize) / 16;
+                let last_pos_now = (cur_last as usize) % 16;
+                let (mut cur_state, mut g1, mut at) = cursor.take().unwrap_or_else(|| {
+                    enc.restore(&base);
+                    enc.encode_bin(cbf_ctx, 1);
+                    encode_last_position(enc, log2_size, c_idx, scan_idx, cur_last);
+                    (enc.snapshot(), 1u32, last_sub_now)
+                });
+                let mut csbf_forced = csbf;
+                csbf_forced[dc_idx] = true;
+                if at > scan_sub {
+                    enc.restore(&cur_state);
+                    while at > scan_sub {
+                        g1 = encode_subblock(
+                            enc,
+                            levels,
+                            n,
+                            c_idx,
+                            scan_idx,
+                            false,
+                            at,
+                            last_sub_now,
+                            last_pos_now,
+                            &csbf_forced,
+                            g1,
+                        );
+                        at -= 1;
+                    }
+                    cur_state = enc.snapshot();
+                }
+                cursor = Some((cur_state.clone(), g1, at));
+                enc.restore(&cur_state);
+                encode_subblock_range(
+                    enc,
+                    levels,
+                    n,
+                    c_idx,
+                    scan_idx,
+                    false,
+                    last_sub_now,
+                    last_pos_now,
+                    scan_sub,
+                    g1,
+                    &csbf_forced,
+                );
+                enc.bit_count() - base_bits
+            };
             let trial = scale * trial_dist + lambda * trial_bits as f64;
             if trial < cost {
                 cost = trial;
@@ -584,9 +661,41 @@ fn encode_residual_with(
     let n = 1usize << log2_size;
     let sub_wide = n >> 2;
     let sub_scan = scan(log2_size - 2, scan_idx);
-    let pos_scan = scan(2, scan_idx);
-    let chroma = c_idx > 0;
+    let (last_sub, last_pos) = encode_last_position(enc, log2_size, c_idx, scan_idx, last_full);
 
+    // The DC sub-block is always coded (7.4.9.11 inference).
+    let (dc_xs, dc_ys) = sub_scan[0];
+    csbf[dc_ys as usize * sub_wide + dc_xs as usize] = true;
+
+    encode_subblock_range(
+        enc,
+        levels,
+        n,
+        c_idx,
+        scan_idx,
+        sign_hiding,
+        last_sub,
+        last_pos,
+        last_sub,
+        1,
+        &csbf,
+    );
+}
+
+/// The `last_sig_coeff_x/y` syntax (9.3.4.2.3), given the flat scan position of
+/// the last significant coefficient. Returns the sub-block and within-sub-block
+/// position it decomposes into, since the sub-block loop is keyed by those —
+/// split out so a sub-block-range re-encode (see [`encode_subblock_range`])
+/// need not re-derive them.
+fn encode_last_position(
+    enc: &mut CabacEncoder,
+    log2_size: u32,
+    c_idx: usize,
+    scan_idx: usize,
+    last_full: i32,
+) -> (usize, usize) {
+    let sub_scan = scan(log2_size - 2, scan_idx);
+    let pos_scan = scan(2, scan_idx);
     let last_sub = (last_full / 16) as usize;
     let last_pos = (last_full % 16) as usize;
     let (last_xs, last_ys) = sub_scan[last_sub];
@@ -625,151 +734,212 @@ fn encode_residual_with(
         let base = (1 << y_suffix_bits) * (2 + (y_prefix & 1));
         enc.encode_bypass_bits(last_y - base, y_suffix_bits);
     }
+    (last_sub, last_pos)
+}
 
-    // The DC sub-block is always coded (7.4.9.11 inference).
-    let (dc_xs, dc_ys) = sub_scan[0];
-    csbf[dc_ys as usize * sub_wide + dc_xs as usize] = true;
+/// Encode sub-blocks `from_sub` down to (and including) 0 — the tail of
+/// [`encode_residual_with`]'s loop, split out so a trial that only changes a
+/// coefficient inside `from_sub` can restore a cached frozen-prefix state (the
+/// bits for sub-blocks above `from_sub` never change) instead of re-encoding
+/// the whole block. `greater1_ctx_in` is the carry the sub-block above
+/// `from_sub` left behind (1 when there is no such sub-block, matching
+/// [`encode_residual_with`]'s own initial value).
+#[allow(clippy::too_many_arguments)]
+fn encode_subblock_range(
+    enc: &mut CabacEncoder,
+    levels: &[i32],
+    n: usize,
+    c_idx: usize,
+    scan_idx: usize,
+    sign_hiding: bool,
+    last_sub: usize,
+    last_pos: usize,
+    from_sub: usize,
+    greater1_ctx_in: u32,
+    csbf: &[bool; 64],
+) -> u32 {
+    let mut greater1_ctx = greater1_ctx_in;
+    for i in (0..=from_sub).rev() {
+        greater1_ctx = encode_subblock(
+            enc,
+            levels,
+            n,
+            c_idx,
+            scan_idx,
+            sign_hiding,
+            i,
+            last_sub,
+            last_pos,
+            csbf,
+            greater1_ctx,
+        );
+    }
+    greater1_ctx
+}
 
-    let mut greater1_ctx = 1u32;
-    for i in (0..=last_sub).rev() {
-        let (xs, ys) = sub_scan[i];
-        let (xs, ys) = (xs as usize, ys as usize);
-        let coded = csbf[ys * sub_wide + xs];
-        let mut infer_dc_sig = false;
-        if i < last_sub && i > 0 {
-            let mut csbf_ctx = 0;
-            if xs < sub_wide - 1 && csbf[ys * sub_wide + xs + 1] {
-                csbf_ctx += 1;
-            }
-            if ys < sub_wide - 1 && csbf[(ys + 1) * sub_wide + xs] {
-                csbf_ctx += 1;
-            }
-            let inc = if chroma {
-                2 + csbf_ctx.min(1)
-            } else {
-                csbf_ctx.min(1)
-            };
-            enc.encode_bin(ctx::CODED_SUB_BLOCK + inc, u32::from(coded));
-            infer_dc_sig = true;
-        }
-        if !coded {
-            continue;
-        }
+/// One iteration of [`encode_residual_with`]'s sub-block loop, split out so
+/// [`encode_subblock_range`] can drive it from a starting index other than
+/// `last_sub`. Returns the `greater1_ctx` carry the *next* (lower-index)
+/// sub-block reads.
+#[allow(clippy::too_many_arguments)]
+fn encode_subblock(
+    enc: &mut CabacEncoder,
+    levels: &[i32],
+    n: usize,
+    c_idx: usize,
+    scan_idx: usize,
+    sign_hiding: bool,
+    i: usize,
+    last_sub: usize,
+    last_pos: usize,
+    csbf: &[bool; 64],
+    greater1_ctx_in: u32,
+) -> u32 {
+    let log2_size = n.trailing_zeros();
+    let sub_wide = n >> 2;
+    let sub_scan = scan(log2_size - 2, scan_idx);
+    let pos_scan = scan(2, scan_idx);
+    let chroma = c_idx > 0;
+    let mut greater1_ctx = greater1_ctx_in;
 
-        // sig_coeff_flag over the sub-block, high scan position first.
-        let mut significant = [false; 16];
-        if i == last_sub {
-            significant[last_pos] = true;
+    let (xs, ys) = sub_scan[i];
+    let (xs, ys) = (xs as usize, ys as usize);
+    let coded = csbf[ys * sub_wide + xs];
+    let mut infer_dc_sig = false;
+    if i < last_sub && i > 0 {
+        let mut csbf_ctx = 0;
+        if xs < sub_wide - 1 && csbf[ys * sub_wide + xs + 1] {
+            csbf_ctx += 1;
         }
-        let first = if i == last_sub {
-            last_pos as i32 - 1
+        if ys < sub_wide - 1 && csbf[(ys + 1) * sub_wide + xs] {
+            csbf_ctx += 1;
+        }
+        let inc = if chroma {
+            2 + csbf_ctx.min(1)
         } else {
-            15
+            csbf_ctx.min(1)
         };
-        let mut scan_pos = first;
-        while scan_pos >= 0 {
-            let p = scan_pos as usize;
-            scan_pos -= 1;
-            let (xp, yp) = pos_scan[p];
-            let xc = xs * 4 + xp as usize;
-            let yc = ys * 4 + yp as usize;
-            let sig = levels[yc * n + xc] != 0;
-            if p > 0 || !infer_dc_sig {
-                let inc = sig_ctx_inc(xc, yc, xs, ys, sub_wide, &csbf, log2_size, c_idx, scan_idx);
-                enc.encode_bin(ctx::SIG_COEFF + inc, u32::from(sig));
-            }
-            significant[p] = sig;
-            if sig {
-                infer_dc_sig = false;
-            }
-        }
-        if infer_dc_sig {
-            // The flag was not coded because it is inferred to be one.
-            significant[0] = true;
-        }
+        enc.encode_bin(ctx::CODED_SUB_BLOCK + inc, u32::from(coded));
+        infer_dc_sig = true;
+    }
+    if !coded {
+        return greater1_ctx;
+    }
 
-        let mut order = [0usize; 16];
-        let mut order_len = 0;
-        for p in (0..16).rev() {
-            if significant[p] {
-                order[order_len] = p;
-                order_len += 1;
-            }
+    // sig_coeff_flag over the sub-block, high scan position first.
+    let mut significant = [false; 16];
+    if i == last_sub {
+        significant[last_pos] = true;
+    }
+    let first = if i == last_sub {
+        last_pos as i32 - 1
+    } else {
+        15
+    };
+    let mut scan_pos = first;
+    while scan_pos >= 0 {
+        let p = scan_pos as usize;
+        scan_pos -= 1;
+        let (xp, yp) = pos_scan[p];
+        let xc = xs * 4 + xp as usize;
+        let yc = ys * 4 + yp as usize;
+        let sig = levels[yc * n + xc] != 0;
+        if p > 0 || !infer_dc_sig {
+            let inc = sig_ctx_inc(xc, yc, xs, ys, sub_wide, csbf, log2_size, c_idx, scan_idx);
+            enc.encode_bin(ctx::SIG_COEFF + inc, u32::from(sig));
         }
-        let order = &order[..order_len];
-        if order.is_empty() {
-            continue;
-        }
-
-        // coeff_abs_level_greater1_flag, first eight only (9.3.4.2.6).
-        let mut ctx_set = if i == 0 || chroma { 0 } else { 2 };
-        if greater1_ctx == 0 {
-            ctx_set += 1;
-        }
-        greater1_ctx = 1;
-        let mut last_greater1 = None;
-        let mut greater1 = [false; 16];
-        for &p in order.iter().take(8) {
-            let (xp, yp) = pos_scan[p];
-            let level = levels[(ys * 4 + yp as usize) * n + xs * 4 + xp as usize].unsigned_abs();
-            let flag = level > 1;
-            let inc = ctx_set * 4 + greater1_ctx.min(3) + if chroma { 16 } else { 0 };
-            enc.encode_bin(ctx::GREATER1 + inc as usize, u32::from(flag));
-            greater1[p] = flag;
-            if flag {
-                if last_greater1.is_none() {
-                    last_greater1 = Some(p);
-                }
-                greater1_ctx = 0;
-            } else if greater1_ctx > 0 {
-                greater1_ctx += 1;
-            }
-        }
-
-        // coeff_abs_level_greater2_flag for the first greater-than-one level.
-        let mut greater2 = false;
-        if let Some(p) = last_greater1 {
-            let (xp, yp) = pos_scan[p];
-            let level = levels[(ys * 4 + yp as usize) * n + xs * 4 + xp as usize].unsigned_abs();
-            greater2 = level > 2;
-            let inc = ctx_set + if chroma { 4 } else { 0 };
-            enc.encode_bin(ctx::GREATER2 + inc as usize, u32::from(greater2));
-        }
-
-        // Signs, then the remaining magnitudes. With sign data hiding on and
-        // the significant coefficients of this sub-block more than three scan
-        // positions apart, the first one's sign is not coded at all: the
-        // decoder reads it off the parity of the sub-block's absolute levels,
-        // which `hide_signs` has already made match.
-        let hidden = sign_hiding && order[0] - order[order_len - 1] > 3;
-        for (k, &p) in order.iter().enumerate() {
-            if hidden && k == order_len - 1 {
-                continue;
-            }
-            let (xp, yp) = pos_scan[p];
-            let level = levels[(ys * 4 + yp as usize) * n + xs * 4 + xp as usize];
-            enc.encode_bypass(u32::from(level < 0));
-        }
-        let mut rice = 0u32;
-        for (num_sig, &p) in order.iter().enumerate() {
-            let (xp, yp) = pos_scan[p];
-            let level = levels[(ys * 4 + yp as usize) * n + xs * 4 + xp as usize].unsigned_abs();
-            let coded_greater1 = num_sig < 8;
-            let base_level = 1
-                + u32::from(coded_greater1 && greater1[p])
-                + u32::from(last_greater1 == Some(p) && greater2);
-            let threshold = if num_sig < 8 {
-                if last_greater1 == Some(p) { 3 } else { 2 }
-            } else {
-                1
-            };
-            if base_level == threshold {
-                let remaining = level - base_level;
-                encode_remaining(enc, remaining, rice);
-                rice = (rice + u32::from(level > (3 << rice))).min(4);
-            }
+        significant[p] = sig;
+        if sig {
+            infer_dc_sig = false;
         }
     }
+    if infer_dc_sig {
+        // The flag was not coded because it is inferred to be one.
+        significant[0] = true;
+    }
+
+    let mut order = [0usize; 16];
+    let mut order_len = 0;
+    for p in (0..16).rev() {
+        if significant[p] {
+            order[order_len] = p;
+            order_len += 1;
+        }
+    }
+    let order = &order[..order_len];
+    if order.is_empty() {
+        return greater1_ctx;
+    }
+
+    // coeff_abs_level_greater1_flag, first eight only (9.3.4.2.6).
+    let mut ctx_set = if i == 0 || chroma { 0 } else { 2 };
+    if greater1_ctx == 0 {
+        ctx_set += 1;
+    }
+    greater1_ctx = 1;
+    let mut last_greater1 = None;
+    let mut greater1 = [false; 16];
+    for &p in order.iter().take(8) {
+        let (xp, yp) = pos_scan[p];
+        let level = levels[(ys * 4 + yp as usize) * n + xs * 4 + xp as usize].unsigned_abs();
+        let flag = level > 1;
+        let inc = ctx_set * 4 + greater1_ctx.min(3) + if chroma { 16 } else { 0 };
+        enc.encode_bin(ctx::GREATER1 + inc as usize, u32::from(flag));
+        greater1[p] = flag;
+        if flag {
+            if last_greater1.is_none() {
+                last_greater1 = Some(p);
+            }
+            greater1_ctx = 0;
+        } else if greater1_ctx > 0 {
+            greater1_ctx += 1;
+        }
+    }
+
+    // coeff_abs_level_greater2_flag for the first greater-than-one level.
+    let mut greater2 = false;
+    if let Some(p) = last_greater1 {
+        let (xp, yp) = pos_scan[p];
+        let level = levels[(ys * 4 + yp as usize) * n + xs * 4 + xp as usize].unsigned_abs();
+        greater2 = level > 2;
+        let inc = ctx_set + if chroma { 4 } else { 0 };
+        enc.encode_bin(ctx::GREATER2 + inc as usize, u32::from(greater2));
+    }
+
+    // Signs, then the remaining magnitudes. With sign data hiding on and
+    // the significant coefficients of this sub-block more than three scan
+    // positions apart, the first one's sign is not coded at all: the
+    // decoder reads it off the parity of the sub-block's absolute levels,
+    // which `hide_signs` has already made match.
+    let hidden = sign_hiding && order[0] - order[order_len - 1] > 3;
+    for (k, &p) in order.iter().enumerate() {
+        if hidden && k == order_len - 1 {
+            continue;
+        }
+        let (xp, yp) = pos_scan[p];
+        let level = levels[(ys * 4 + yp as usize) * n + xs * 4 + xp as usize];
+        enc.encode_bypass(u32::from(level < 0));
+    }
+    let mut rice = 0u32;
+    for (num_sig, &p) in order.iter().enumerate() {
+        let (xp, yp) = pos_scan[p];
+        let level = levels[(ys * 4 + yp as usize) * n + xs * 4 + xp as usize].unsigned_abs();
+        let coded_greater1 = num_sig < 8;
+        let base_level = 1
+            + u32::from(coded_greater1 && greater1[p])
+            + u32::from(last_greater1 == Some(p) && greater2);
+        let threshold = if num_sig < 8 {
+            if last_greater1 == Some(p) { 3 } else { 2 }
+        } else {
+            1
+        };
+        if base_level == threshold {
+            let remaining = level - base_level;
+            encode_remaining(enc, remaining, rice);
+            rice = (rice + u32::from(level > (3 << rice))).min(4);
+        }
+    }
+    greater1_ctx
 }
 
 /// Inverse of [`encode_remaining`]: read one `coeff_abs_level_remaining` back
@@ -1270,6 +1440,261 @@ mod tests {
                     let mut enc = CabacEncoder::counter(Contexts::new(27));
                     encode_residual(&mut enc, &levels, log2, c_idx, scan_idx, false, false);
                     assert!(enc.bit_count() > 0);
+                }
+            }
+        }
+    }
+
+    /// [`rdoq`], but every trial re-derives the whole block's bits from `base`
+    /// (the pre-change behaviour) instead of using the sub-block frozen-prefix
+    /// cursor. Kept only for
+    /// [`sub_block_cursor_matches_full_recompute`] to check the cursor against.
+    #[allow(clippy::too_many_arguments)]
+    fn rdoq_full_recompute(
+        coeffs: &[i32],
+        levels: &mut [i32],
+        n: usize,
+        qp: i32,
+        c_idx: usize,
+        scan_idx: usize,
+        cbf_ctx: usize,
+        lambda: f64,
+        transform_skip: bool,
+        enc: &mut CabacEncoder,
+    ) -> usize {
+        let log2_size = n.trailing_zeros();
+        let scale = coeff_ssd_scale(n);
+        let lambda = RDOQ_LAMBDA * lambda;
+        let base = enc.snapshot();
+        let err = |level: i32, coeff: i32| {
+            let d = f64::from(dequant_level(level, n, qp) - coeff);
+            d * d
+        };
+
+        let mut dist: f64 = (0..n * n).map(|i| err(levels[i], coeffs[i])).sum();
+        let bits = levels_bits(
+            enc,
+            &base,
+            levels,
+            log2_size,
+            c_idx,
+            scan_idx,
+            cbf_ctx,
+            true,
+            transform_skip,
+        );
+        let mut cost = scale * dist + lambda * bits as f64;
+
+        let sub_scan = scan(log2_size - 2, scan_idx);
+        let pos_scan = scan(2, scan_idx);
+        let order: Vec<usize> = sub_scan
+            .iter()
+            .flat_map(|&(xs, ys)| {
+                pos_scan.iter().map(move |&(xp, yp)| {
+                    (ys as usize * 4 + yp as usize) * n + xs as usize * 4 + xp as usize
+                })
+            })
+            .collect();
+
+        let sub_wide = n >> 2;
+        let mut csbf = [false; 64];
+        let mut sub_count = [0i32; 64];
+        let mut nz_positions: Vec<i32> = Vec::new();
+        for (k, &i) in order.iter().enumerate().rev() {
+            if levels[i] != 0 {
+                nz_positions.push(k as i32);
+                let sub_idx = ((i / n) >> 2) * sub_wide + ((i % n) >> 2);
+                sub_count[sub_idx] += 1;
+                csbf[sub_idx] = true;
+            }
+        }
+        let mut cur_last = nz_positions.first().copied().unwrap_or(0);
+        let mut nz_idx = 0usize;
+
+        for (k, &i) in order.iter().enumerate().rev() {
+            let level = levels[i];
+            if level == 0 {
+                continue;
+            }
+            let next_last = nz_positions.get(nz_idx + 1).copied().unwrap_or(0);
+            nz_idx += 1;
+            if level.abs() > RDOQ_MAX_LEVEL {
+                continue;
+            }
+            let sub_idx = ((i / n) >> 2) * sub_wide + ((i % n) >> 2);
+            let mut tried = level.abs();
+            for candidate in [level.abs() - 1, 0] {
+                if candidate == tried {
+                    continue;
+                }
+                tried = candidate;
+                let keep = levels[i];
+                levels[i] = candidate * level.signum();
+                let now_zero = levels[i] == 0;
+                let sub_count_before = sub_count[sub_idx];
+                let csbf_before = csbf[sub_idx];
+                if now_zero {
+                    sub_count[sub_idx] -= 1;
+                    csbf[sub_idx] = sub_count[sub_idx] > 0;
+                }
+                let trial_last = if now_zero && k as i32 == cur_last {
+                    next_last
+                } else {
+                    cur_last
+                };
+                let trial_dist = dist - err(keep, coeffs[i]) + err(levels[i], coeffs[i]);
+                let any = sub_count.iter().any(|&c| c > 0);
+                let trial_bits = levels_bits_with(
+                    enc,
+                    &base,
+                    levels,
+                    log2_size,
+                    c_idx,
+                    scan_idx,
+                    cbf_ctx,
+                    any,
+                    transform_skip,
+                    trial_last,
+                    csbf,
+                );
+                let trial = scale * trial_dist + lambda * trial_bits as f64;
+                if trial < cost {
+                    cost = trial;
+                    dist = trial_dist;
+                    if now_zero {
+                        cur_last = trial_last;
+                    }
+                } else {
+                    levels[i] = keep;
+                    sub_count[sub_idx] = sub_count_before;
+                    csbf[sub_idx] = csbf_before;
+                }
+            }
+        }
+        let zero_dist: f64 = (0..n * n).map(|i| err(0, coeffs[i])).sum();
+        let zero_bits = levels_bits(
+            enc,
+            &base,
+            levels,
+            log2_size,
+            c_idx,
+            scan_idx,
+            cbf_ctx,
+            false,
+            transform_skip,
+        );
+        if scale * zero_dist + lambda * zero_bits as f64 <= cost {
+            levels[..n * n].fill(0);
+            enc.restore(&base);
+            return 0;
+        }
+        enc.restore(&base);
+        levels[..n * n].iter().filter(|&&l| l != 0).count()
+    }
+
+    /// A tiny xorshift RNG — deterministic across runs, no extra dependency.
+    struct Xorshift(u32);
+    impl Xorshift {
+        fn next(&mut self) -> u32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 17;
+            self.0 ^= self.0 << 5;
+            self.0
+        }
+    }
+
+    /// ENTRY GATE for lane-h265rdoq r3: the sub-block frozen-prefix cursor
+    /// [`rdoq`] now uses must produce bit-for-bit the same trial decisions —
+    /// and so the same final `levels` and the same final bitstream — as
+    /// always re-deriving every trial's bits from the block's start
+    /// ([`rdoq_full_recompute`], this round's pre-change behaviour). Covers
+    /// every block size with a sub-block split (8/16/32 — 4x4 has none),
+    /// every scan, 8 seeds, sign-hiding on/off on the final bitstream, and
+    /// deliberately includes levels of magnitude 1-3 so some trials drop the
+    /// last significant coefficient, some empty a whole sub-block (csbf
+    /// flips), and some sit right at the greater1/greater2 escape boundary.
+    #[test]
+    fn sub_block_cursor_matches_full_recompute() {
+        for log2 in [3u32, 4, 5] {
+            let n = 1usize << log2;
+            for scan_idx in 0..3 {
+                for seed in 1..=8u32 {
+                    let mut rng = Xorshift(seed.wrapping_mul(2654435761).max(1));
+                    let mut coeffs = vec![0i32; n * n];
+                    for c in coeffs.iter_mut() {
+                        // Skewed toward small magnitudes (0..=3) so RDOQ_MAX_LEVEL's
+                        // trial window and the greater1/greater2 boundary both fire
+                        // often, with occasional larger outliers left untouched.
+                        let r = rng.next();
+                        *c = match r % 5 {
+                            0 => 0,
+                            1 => (r >> 8) as i32 % 2 + 1,
+                            2 => -(((r >> 8) as i32 % 2) + 1),
+                            3 => (r >> 8) as i32 % 6 + 1,
+                            _ => -(((r >> 8) as i32 % 6) + 1),
+                        };
+                    }
+                    let qp = 20 + (seed as i32 % 20);
+
+                    let mut levels_a = coeffs.clone();
+                    let mut enc_a = CabacEncoder::counter(Contexts::new(30));
+                    let count_a = rdoq(
+                        &coeffs,
+                        &mut levels_a,
+                        n,
+                        qp,
+                        0,
+                        scan_idx,
+                        ctx::CBF_LUMA,
+                        1.0,
+                        false,
+                        &mut enc_a,
+                    );
+
+                    let mut levels_b = coeffs.clone();
+                    let mut enc_b = CabacEncoder::counter(Contexts::new(30));
+                    let count_b = rdoq_full_recompute(
+                        &coeffs,
+                        &mut levels_b,
+                        n,
+                        qp,
+                        0,
+                        scan_idx,
+                        ctx::CBF_LUMA,
+                        1.0,
+                        false,
+                        &mut enc_b,
+                    );
+
+                    assert_eq!(
+                        count_a, count_b,
+                        "log2={log2} scan={scan_idx} seed={seed}: non-zero count differs"
+                    );
+                    assert_eq!(
+                        levels_a, levels_b,
+                        "log2={log2} scan={scan_idx} seed={seed}: decided levels differ"
+                    );
+
+                    if count_a == 0 {
+                        continue;
+                    }
+                    for sign_hiding in [false, true] {
+                        let mut final_levels = levels_a.clone();
+                        if sign_hiding {
+                            hide_signs(&coeffs, &mut final_levels, n, 30, scan_idx);
+                        }
+                        let mut fenc = CabacEncoder::counter(Contexts::new(30));
+                        encode_residual(
+                            &mut fenc,
+                            &final_levels,
+                            log2,
+                            0,
+                            scan_idx,
+                            sign_hiding,
+                            false,
+                        );
+                        assert!(fenc.bit_count() > 0);
+                    }
                 }
             }
         }
