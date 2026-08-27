@@ -213,6 +213,70 @@ const RDOQ_MAX_LEVEL: i32 = 2;
 /// content still behind x265, so it takes the tie.
 const RDOQ_LAMBDA: f64 = 1.0;
 
+/// How hard the significance map's per-position flag is priced in the
+/// coefficient-statistics proxy below, in bits. Swept against
+/// `bd_psnr_vs_x265` (synthetic clip + a real screen-capture clip) alongside
+/// [`ESTIMATE_MAG_SCALE`]; see that constant's comment for the numbers.
+const ESTIMATE_SIG_BIT: f64 = 0.15;
+
+/// Scale on the per-level magnitude term of [`estimate_residual_bits`].
+///
+/// Swept BD-PSNR-YUV against x265 on the synthetic clip (real-bits baseline
+/// +7.862 dB): 1.0 reads +7.790, 1.25 reads +7.817, 1.5 reads +7.868 — closest
+/// to the baseline, and confirmed on a real 2560x1440 screen capture too
+/// (real-bits baseline -0.317 dB, this scale -0.331, both other scales
+/// untried there once the synthetic sweep picked a direction).
+const ESTIMATE_MAG_SCALE: f64 = 1.5;
+
+/// A cheap stand-in for [`encode_residual`]'s exact bit count, for ranking
+/// intra-mode candidates before the real search runs once on the winner
+/// (`choose_luma_mode`). No CABAC context is touched — the last position is
+/// priced by the same closed-form binarization the real coder uses (a few
+/// arithmetic ops, not a per-bin call), and every level's cost comes from a
+/// log2 magnitude estimate instead of walking greater1/greater2/remaining
+/// bins one context update at a time. This is a ranking proxy only: the
+/// committed bitstream always goes through `encode_residual`.
+pub fn estimate_residual_bits(levels: &[i32], log2_size: u32, scan_idx: usize) -> f64 {
+    let n = 1usize << log2_size;
+    let positions = &POSITIONS[(log2_size - 2) as usize][scan_idx];
+    let mut last_full = 0i32;
+    let mut mag_bits = 0.0f64;
+    let mut any = false;
+    for (i, &level) in levels[..n * n].iter().enumerate() {
+        if level != 0 {
+            any = true;
+            last_full = last_full.max(i32::from(positions[i]));
+            let v = level.unsigned_abs();
+            // 1 (sign) + 2 for the first two magnitudes (mirroring the real
+            // coder's greater1/greater2 flags), Exp-Golomb-ish beyond that.
+            mag_bits += 1.0
+                + if v <= 2 {
+                    v as f64
+                } else {
+                    2.0 + 2.0 * ((v - 1) as f64).log2()
+                };
+        }
+    }
+    if !any {
+        return 0.0;
+    }
+    let last_sub = (last_full / 16) as usize;
+    let last_pos = (last_full % 16) as usize;
+    let sub_scan = scan(log2_size - 2, scan_idx);
+    let pos_scan = scan(2, scan_idx);
+    let (last_xs, last_ys) = sub_scan[last_sub];
+    let (last_xp, last_yp) = pos_scan[last_pos];
+    let mut last_x = (last_xs as u32) * 4 + last_xp as u32;
+    let mut last_y = (last_ys as u32) * 4 + last_yp as u32;
+    if scan_idx == 2 {
+        std::mem::swap(&mut last_x, &mut last_y);
+    }
+    let (x_prefix, x_suffix) = last_prefix(last_x);
+    let (y_prefix, y_suffix) = last_prefix(last_y);
+    let last_bits = (x_prefix + y_prefix + x_suffix + y_suffix) as f64;
+    last_bits + ESTIMATE_SIG_BIT * (last_full + 1) as f64 + ESTIMATE_MAG_SCALE * mag_bits
+}
+
 /// What one candidate set of levels costs in bits, priced by the CABAC coder
 /// itself against `base`'s context state.
 #[allow(clippy::too_many_arguments)]
