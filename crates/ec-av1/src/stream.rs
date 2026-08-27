@@ -93,11 +93,42 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 "a frame using TxMode::Select (this decoder never reads a tx_depth symbol, so it desyncs after the first intra block's mode)",
             ));
         }
+        // lane-av1real r11's blindness-audit sweep (`read_intra_frame_mode_info`,
+        // libaom decodemv.c): three more per-block/per-SB symbols this crate
+        // never reads at all, each gated by a header field this decoder
+        // otherwise accepts uncomplaining -- the same silent-desync shape
+        // `use_filter_intra` was. `allow_screen_content_tools` gates both
+        // `read_intrabc_info` and `read_palette_mode_info`; `delta.q_present`/
+        // `delta.lf_present` gate `read_delta_qindex`/`read_delta_lflevel`
+        // (spec 5.11.10/5.11.11, one symbol group per superblock). Refuse
+        // before desyncing rather than silently miscode, the same pattern as
+        // the CDEF/TxMode::Select refusals above.
+        if header.allow_screen_content_tools {
+            return Err(Error::unsupported(
+                "AV1 decode_stream",
+                "a frame with allow_screen_content_tools set (this decoder never reads intrabc/palette_mode_info)",
+            ));
+        }
+        if header.delta.q_present || header.delta.lf_present {
+            return Err(Error::unsupported(
+                "AV1 decode_stream",
+                "a frame with delta_q_present or delta_lf_present set (this decoder never reads the per-superblock delta symbols)",
+            ));
+        }
+        if header.segmentation.enabled {
+            return Err(Error::unsupported(
+                "AV1 decode_stream",
+                "a frame with segmentation enabled (this decoder never reads a per-block segment_id symbol)",
+            ));
+        }
         // `Tile::offset` is relative to the buffer `parse_obu` was handed
         // (`&data[pos..]` at the time this OBU was parsed), so it is relative
         // to `obu_offset`, not to `data` as a whole.
         let start = obu_offset + tile.offset;
         let tile_bytes = data.get(start..start + tile.size).ok_or(Error::NeedMore)?;
+        let enable_filter_intra = parser
+            .sequence_header()
+            .is_some_and(|seq| seq.enable_filter_intra);
 
         let picture = if header.frame_type == FrameType::Key {
             decode_key_frame_tile(
@@ -107,6 +138,7 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 header.quantization.base_q_idx,
                 header.frame_width,
                 header.frame_height,
+                enable_filter_intra,
             )?
         } else {
             let reference = reference.as_ref().ok_or_else(|| {
@@ -188,6 +220,7 @@ mod tests {
                 encoded.base_q_idx,
                 width as u32,
                 height as u32,
+                false,
             )
             .unwrap();
             let via_stream = decode_stream(&encoded.stream).unwrap();
@@ -513,7 +546,6 @@ mod tests {
     /// decode: pixel-exact against ffmpeg's own decode, not just "decoded".
     ///
     #[test]
-    #[ignore = "r8: BOTH remaining hypotheses from r7 are now falsified. (1) Tile-data byte offset: an independent from-spec OBU parse in Python (obu_header/leb128/full sequence_header/full uncompressed_header bit-by-bit) derives the tile group starting at absolute byte 23 in the pinned stream; `EC_AV1_TRACE`'s new `key_tile_bytes` line shows our own `decode_stream` (stream.rs `obu_offset + tile.offset`) feeds `decode_key_frame_tile` that exact same byte 23 (first8 04 c8 d9 35 3d a6 de 5e); the r7 python scripts' hardcoded literal agrees too -- three-way match, offset is not the bug. (2) mode_info symbols: `EC_AV1_TRACE` extended to partition/skip/y_mode/uv_mode (decode.rs read_intra_mode + the two partition sites); an independent Python MSAC decoder over the SAME CDF literals -- this round re-verified partition_w32_cdf[0], kf_y_mode_cdf[0][0] and uv_mode_cdf[cfl=1][DC_PRED] byte-for-byte against /tmp/libaom-src/av1/common/entropymode.c source, not trusted from a prior round -- reads partition=NONE, skip=0, y_mode=DC_PRED(0), uv_mode=DC_PRED(0), matching our decoder exactly. So the bitstream genuinely codes DC_PRED with a near-zero residual (three magnitude-2 AC coefficients) for this block, and our decode of that is bit-exact; ffmpeg's real output (a smooth 46..61 diagonal gradient) cannot come from that symbol sequence under any correct DC_PRED reconstruction. The desync is downstream of symbol decode entirely -- intra prediction (`crate::intra::predict`) or the inverse-transform/dequant path (`dequant_and_inverse_typed`) miscomputing the reconstructed pixels from a genuinely-correct DC_PRED + tiny-residual decode, not a wrong symbol. r9: trace/diff `crate::intra::predict`'s DC output and the post-dequant residual grid against an independent implementation of both, the same way r6-r8 did for the entropy layer."]
     fn a_real_libaom_cfl_stream_decodes_pixel_exact() {
         if !have_ffmpeg() {
             eprintln!("SKIP a_real_libaom_cfl_stream_decodes_pixel_exact: no ffmpeg");

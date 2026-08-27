@@ -557,12 +557,27 @@ impl Neighbours {
 /// offered (`cfl`, `is_cfl_allowed`, spec 5.11.5), chroma-from-luma -- the
 /// third element carries that mode's `(alpha_q3_u, alpha_q3_v)`, `None` for
 /// plain DC chroma.
+/// A block-size class index into [`cdf::FILTER_INTRA`]/`Cdfs::filter_intra`,
+/// or `None` when `side` is past `av1_filter_intra_allowed_bsize`'s <=32
+/// bound (spec `filter_intra_mode_info` never reads a symbol there).
+fn filter_intra_size_class(side: usize) -> Option<usize> {
+    match side {
+        4 => Some(0),
+        8 => Some(1),
+        16 => Some(2),
+        32 => Some(3),
+        _ => None,
+    }
+}
+
 fn read_intra_mode(
     dec: &mut SymbolDecoder,
     cdfs: &mut Cdfs,
     above_mode: usize,
     left_mode: usize,
     cfl: bool,
+    side: usize,
+    enable_filter_intra: bool,
 ) -> Result<(bool, usize, Option<(i32, i32)>)> {
     let trace = std::env::var_os("EC_AV1_TRACE").is_some();
     let skip = dec.symbol(&mut cdfs.skip[0]) != 0;
@@ -601,6 +616,36 @@ fn read_intra_mode(
     } else {
         return Err(unsupported("a directional chroma mode (round 2)"));
     };
+    // `read_filter_intra_mode_info` (spec 5.11.14, libaom decodemv.c): a
+    // `use_filter_intra` symbol this decoder never read at all until
+    // lane-av1real r10 -- silently skipping it left every bit past a
+    // DC_PRED block at <=32x32 read one symbol short of libaom for the rest
+    // of the tile (the pinned CfL stream's actual bug: partition/skip/mode
+    // matched bit-exact, then `eob_pt` read 5 instead of 6, because this
+    // symbol's bits were never consumed).
+    if mode == DC_PRED
+        && enable_filter_intra
+        && let Some(class) = filter_intra_size_class(side)
+    {
+        let use_filter_intra = dec.symbol(&mut cdfs.filter_intra[class]) != 0;
+        if trace {
+            eprintln!(
+                "TRACE use_filter_intra side={side} value={}",
+                use_filter_intra as i32
+            );
+        }
+        if use_filter_intra {
+            // libaom still reads `filter_intra_mode` to stay in sync, but
+            // this decoder does not implement filter-intra prediction
+            // (spec 7.11.2.3's 5-tap recursive filter) -- refuse rather
+            // than silently miscode the reconstruction, the same pattern
+            // as this crate's other `Error::unsupported` refusals.
+            let _ = dec.symbol(&mut cdfs.filter_intra_mode);
+            return Err(unsupported(
+                "a filter-intra block (this decoder does not implement the 5.11.14 recursive predictor)",
+            ));
+        }
+    }
     Ok((skip, mode, alpha))
 }
 
@@ -856,6 +901,7 @@ fn decode_block(
     u: &mut PlaneBuf,
     v: &mut PlaneBuf,
     base_q_idx: u8,
+    enable_filter_intra: bool,
 ) -> Result<()> {
     let (r, c) = at;
     let (px, py) = (c * SUB, r * SUB);
@@ -865,6 +911,8 @@ fn decode_block(
         neighbours.above_mode[c],
         neighbours.left_mode[r],
         cfl,
+        side,
+        enable_filter_intra,
     )?;
     let reach = Reach::of(side, px, py, y.width, y.height);
     let (luma_grid, u_grid, v_grid);
@@ -966,6 +1014,7 @@ fn decode_leaf8(
     u: &mut PlaneBuf,
     v: &mut PlaneBuf,
     base_q_idx: u8,
+    enable_filter_intra: bool,
 ) -> Result<usize> {
     let (r, c) = outer_at;
     let mut above_mode = neighbours.above_mode[c];
@@ -980,7 +1029,15 @@ fn decode_leaf8(
     // An 8x8 leaf is well within `is_cfl_allowed`'s <=32x32 bound (spec
     // 5.11.5), so it reads the CFL-allowed `uv_mode_cfl` CDF, like every other
     // `decode_block` caller at 16x16 and up.
-    let (skip, mode, alpha) = read_intra_mode(dec, cdfs, above_mode, left_mode, true)?;
+    let (skip, mode, alpha) = read_intra_mode(
+        dec,
+        cdfs,
+        above_mode,
+        left_mode,
+        true,
+        8,
+        enable_filter_intra,
+    )?;
     let (px, py) = (leaf_mi.1 * MI, leaf_mi.0 * MI);
     let reach = Reach::of(8, px, py, y.width, y.height);
     let (cpx, cpy) = (px / 2, py / 2);
@@ -1096,6 +1153,7 @@ pub fn decode_key_frame_tile(
     base_q_idx: u8,
     frame_width: u32,
     frame_height: u32,
+    enable_filter_intra: bool,
 ) -> Result<Picture> {
     if mi_cols == 0 || mi_rows == 0 {
         return Err(unsupported("a frame with no mode-info grid"));
@@ -1200,6 +1258,7 @@ pub fn decode_key_frame_tile(
                         &mut u,
                         &mut v,
                         base_q_idx,
+                        enable_filter_intra,
                     )?;
                 }
                 PARTITION_SPLIT => {
@@ -1256,6 +1315,7 @@ pub fn decode_key_frame_tile(
                                     &mut u,
                                     &mut v,
                                     base_q_idx,
+                                    enable_filter_intra,
                                 )?;
                             }
                             PARTITION_SPLIT => {
@@ -1292,6 +1352,7 @@ pub fn decode_key_frame_tile(
                                                 &mut u,
                                                 &mut v,
                                                 base_q_idx,
+                                                enable_filter_intra,
                                             )?;
                                             continue;
                                         }
@@ -1334,6 +1395,7 @@ pub fn decode_key_frame_tile(
                                                 &mut u,
                                                 &mut v,
                                                 base_q_idx,
+                                                enable_filter_intra,
                                             )?;
                                             prev_leaf = Some((leaf_mi, leaf_mode));
                                         }
@@ -1395,6 +1457,7 @@ pub fn decode_key_frame_tile(
                                             &mut u,
                                             &mut v,
                                             base_q_idx,
+                                            enable_filter_intra,
                                         )?;
                                         prev_leaf = Some((leaf_mi, leaf_mode));
                                     }
@@ -2216,7 +2279,7 @@ mod tests {
 
     #[test]
     fn a_frame_with_no_mode_info_grid_is_refused() {
-        assert!(decode_key_frame_tile(&[0u8; 4], 0, 32, 32, 0, 128).is_err());
+        assert!(decode_key_frame_tile(&[0u8; 4], 0, 32, 32, 0, 128, false).is_err());
     }
 
     /// Encodes and decodes one picture with `modes`, asserting the decoder's
@@ -2244,8 +2307,10 @@ mod tests {
             base_q_idx,
             ..
         }: Encoded = crate::encode::encode_key_frame_with_modes(&picture, 40, 0.0, modes).unwrap();
-        let decoded =
-            decode_key_frame_tile(&tile, mi_cols, mi_rows, base_q_idx, w as u32, h as u32).unwrap();
+        let decoded = decode_key_frame_tile(
+            &tile, mi_cols, mi_rows, base_q_idx, w as u32, h as u32, false,
+        )
+        .unwrap();
         assert_eq!(decoded.width, w, "{w}x{h}: decoded width");
         assert_eq!(decoded.height, h, "{w}x{h}: decoded height");
         assert_eq!(decoded.y, reconstruction.y, "{w}x{h} luma mismatch");
@@ -2315,7 +2380,7 @@ mod tests {
         );
         enc.symbol(DC_PRED, &mut cdfs.uv_mode_no_cfl[DC_PRED]);
         let data = enc.finish();
-        let decoded = decode_key_frame_tile(&data, 16, 16, 40, 64, 64).unwrap();
+        let decoded = decode_key_frame_tile(&data, 16, 16, 40, 64, 64, false).unwrap();
         assert!(
             decoded.y.iter().all(|&s| s == 128),
             "a skipped DC_PRED block with no neighbours predicts flat mid-grey"
@@ -2494,6 +2559,7 @@ mod tests {
                 encoded.base_q_idx,
                 coded_w,
                 coded_h,
+                false,
             )
             .unwrap();
             assert_eq!(ours.y, ffmpeg_decoded.y, "{width}x{height}: luma vs ffmpeg");
@@ -2561,6 +2627,7 @@ mod tests {
             key.base_q_idx,
             width as u32,
             height as u32,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -2827,6 +2894,7 @@ mod tests {
             key.base_q_idx,
             coded_w,
             coded_h,
+            false,
         )
         .unwrap();
         assert_eq!(reference.y, ffmpeg_frames[0].y, "frame 0 luma vs ffmpeg");
