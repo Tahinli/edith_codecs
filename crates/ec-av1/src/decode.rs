@@ -3764,20 +3764,39 @@ fn decode_inter_block(
         // computed level 3) and a LAST_FRAME block (ref_idx 1, level 4) --
         // `edge_params`/`lf_level`'s own math checks out against spec 7.14.4
         // by hand (`base=4`, `ref_deltas[4]=-1`, `mode_deltas=[0,0]` all
-        // match the default table), so the residue is unproven: either a
-        // narrow rounding/flatness-threshold defect in the wide deblock
-        // kernel (`filter8`/`filter14`) that any GOLDEN/LAST level split
-        // happens to be the first content to reach, or a golden-side pixel
-        // one narrow filter tap upstream of the edge. Refused again pending
-        // that isolation -- do not re-litigate the `lf_level` arithmetic
-        // itself, it was checked by hand this round.
+        // match the default table).
+        //
+        // round 7 (lane-av1golden5): un-masked again, bisected with a
+        // patched aomdec (`EC_AV1_PREFILT_DUMP`/`EC_AV1_POSTFILT_DUMP` env
+        // dumps already in `/tmp/libaom-src`'s `decodeframe.c`) against the
+        // same pin. Dumped this decoder's own pre-`apply_deblock` luma rows
+        // 30-36 for frame 3 and diffed them against aomdec's pre-filter
+        // dump for the same bytes: the exact same 3 pixels (row32 col37,
+        // row33 col39, row33 col54) already mismatch BEFORE the loop filter
+        // runs, by the exact same +-1 the final assertion sees --
+        // `apply_deblock` itself is now CLEARED, both this round's kernel
+        // hypothesis and round 6's are ruled out. All 3 pixels are inside
+        // the single `GOLDEN_FRAME` 32x32 NEWMV block at (px=32,py=32),
+        // mv=(-7,-7) 1/8-pel (x_q4=y_q4=498, both axes fraction 2/16),
+        // `skip=1` (no residual, so the mismatch is pure MC output),
+        // REGULAR/REGULAR resolved filter, `enable_dual_filter=true`. The
+        // reference plane bytes this block reads (dumped, rows 28-37) match
+        // the picture the outer per-frame ffmpeg assertion already proved
+        // bit-exact for frames 0-2, so it is not a stale/wrong golden
+        // picture either -- the divergence is inside
+        // `mc::predict_with_filters`'s own 2D convolution or the
+        // switchable-filter symbol resolution for this exact (dual axis,
+        // non-globalmv, GOLDEN_FRAME) combination, unproven past that.
+        // Re-masked pending that isolation -- do not re-litigate
+        // `apply_deblock`/`lf_level` again, both are cleared for this pin.
         let (py_ref, pu_ref, pv_ref) = match ref_frame {
             LAST_FRAME => (ref_y, ref_u, ref_v),
             _ => {
                 return Err(unsupported(
-                    "a reference frame other than LAST_FRAME (round 6: GOLDEN_FRAME's decode \
-                     path exists but is masked -- a narrow deblock-edge residue at GOLDEN/LAST \
-                     boundaries keeps real GOLDEN streams from pixel-exact)",
+                    "a reference frame other than LAST_FRAME (round 7: GOLDEN_FRAME's decode \
+                     path exists but is masked -- a narrow +-1 MC residue on a dual-axis \
+                     subpel GOLDEN block, isolated to pre-deblock this round, keeps real \
+                     GOLDEN streams from pixel-exact)",
                 ));
             }
         };
