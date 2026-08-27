@@ -326,6 +326,31 @@ pub const FILTER_INTRA: [[u16; 3]; 4] = [
 /// `FILTER_INTRA_MODES` a `use_filter_intra` block picks.
 pub const FILTER_INTRA_MODE: [u16; 6] = [8949, 12776, 17211, 29558, 32768, 0];
 
+/// `default_tx_size_cdf[0]` (entropymode.c): an 8x8 block's `tx_depth` flag
+/// (`TX8` vs `TX4`), indexed by `tx_size_context` (0..=2).
+pub const TX_SIZE_CAT0: [[u16; 3]; 3] = [[19968, 32768, 0], [19968, 32768, 0], [24320, 32768, 0]];
+/// `default_tx_size_cdf[1]` (entropymode.c): a 16x16 block's `tx_depth`
+/// (`TX16`/`TX8`/`TX4`), indexed by `tx_size_context`.
+pub const TX_SIZE_CAT1: [[u16; 4]; 3] = [
+    [12272, 30172, 32768, 0],
+    [12272, 30172, 32768, 0],
+    [18677, 30848, 32768, 0],
+];
+/// `default_tx_size_cdf[2]` (entropymode.c): a 32x32 block's `tx_depth`
+/// (`TX32`/`TX16`/`TX8`), indexed by `tx_size_context`.
+pub const TX_SIZE_CAT2: [[u16; 4]; 3] = [
+    [12986, 15180, 32768, 0],
+    [12986, 15180, 32768, 0],
+    [24302, 25602, 32768, 0],
+];
+/// `default_tx_size_cdf[3]` (entropymode.c): a 64x64 block's `tx_depth`
+/// (`TX64`/`TX32`/`TX16`), indexed by `tx_size_context`.
+pub const TX_SIZE_CAT3: [[u16; 4]; 3] = [
+    [5782, 11475, 32768, 0],
+    [5782, 11475, 32768, 0],
+    [16803, 22759, 32768, 0],
+];
+
 /// `Default_Cfl_Alpha_Cdf` (spec 9.4): a `UV_CFL_PRED` block's per-plane
 /// alpha magnitude (spec 5.11.45's `cfl_alpha_u`/`cfl_alpha_v`), indexed by
 /// the joint sign's context (`CFL_CONTEXT_U`/`CFL_CONTEXT_V`,
@@ -3733,3 +3758,153 @@ pub const INTRA_TX_TYPE_SET1_8: [[u16; 8]; 13] = [
 /// at the flat 5-way default (unlike its trained `TX_16X16` neighbour,
 /// [`INTRA_TX_TYPE_SET2_16`]) -- every mode reads the same uniform CDF.
 pub const INTRA_TX_TYPE_SET2_8: [[u16; 6]; 13] = [[6554, 13107, 19661, 26214, 32768, 0]; 13];
+/// The full luma sub-range of spec `TXB_SKIP_CONTEXTS` (contexts 0..6, the
+/// `plane_bsize != tx_size` `skip_contexts[top][left]` table plus its own
+/// single `plane_bsize == tx_size` context 0), for a `TxMode::Select` block
+/// whose luma transform is split into several transform units smaller than
+/// the block itself -- the single-context `TXB_SKIP_LUMA_*` constants above
+/// stay for every other caller, which only ever reads context 0.
+pub const TXB_SKIP_LUMA_8_Q0_CTX: [[u16; 3]; 7] = [
+    [31548, 32768, 0],
+    [1549, 32768, 0],
+    [10130, 32768, 0],
+    [16656, 32768, 0],
+    [18591, 32768, 0],
+    [26308, 32768, 0],
+    [32537, 32768, 0],
+];
+pub const TXB_SKIP_LUMA_8_Q1_CTX: [[u16; 3]; 7] = [
+    [31782, 32768, 0],
+    [1836, 32768, 0],
+    [10689, 32768, 0],
+    [17604, 32768, 0],
+    [21622, 32768, 0],
+    [27518, 32768, 0],
+    [32399, 32768, 0],
+];
+pub const TXB_SKIP_LUMA_8_CTX: [[u16; 3]; 7] = [
+    [31957, 32768, 0],
+    [3230, 32768, 0],
+    [11153, 32768, 0],
+    [18123, 32768, 0],
+    [20143, 32768, 0],
+    [26536, 32768, 0],
+    [31986, 32768, 0],
+];
+pub const TXB_SKIP_LUMA_8_Q3_CTX: [[u16; 3]; 7] = [
+    [31903, 32768, 0],
+    [2044, 32768, 0],
+    [7528, 32768, 0],
+    [14618, 32768, 0],
+    [16182, 32768, 0],
+    [24168, 32768, 0],
+    [31037, 32768, 0],
+];
+pub const TXB_SKIP_LUMA_16_Q0_CTX: [[u16; 3]; 7] = [
+    [29957, 32768, 0],
+    [5391, 32768, 0],
+    [18039, 32768, 0],
+    [23566, 32768, 0],
+    [22431, 32768, 0],
+    [25822, 32768, 0],
+    [32197, 32768, 0],
+];
+pub const TXB_SKIP_LUMA_16_Q1_CTX: [[u16; 3]; 7] = [
+    [31901, 32768, 0],
+    [10311, 32768, 0],
+    [18047, 32768, 0],
+    [24806, 32768, 0],
+    [23288, 32768, 0],
+    [27914, 32768, 0],
+    [32296, 32768, 0],
+];
+pub const TXB_SKIP_LUMA_16_CTX: [[u16; 3]; 7] = [
+    [32363, 32768, 0],
+    [10692, 32768, 0],
+    [19090, 32768, 0],
+    [24357, 32768, 0],
+    [24442, 32768, 0],
+    [28312, 32768, 0],
+    [32169, 32768, 0],
+];
+pub const TXB_SKIP_LUMA_16_Q3_CTX: [[u16; 3]; 7] = [
+    [32510, 32768, 0],
+    [8430, 32768, 0],
+    [17318, 32768, 0],
+    [24154, 32768, 0],
+    [23674, 32768, 0],
+    [28789, 32768, 0],
+    [32139, 32768, 0],
+];
+pub const TXB_SKIP_LUMA_32_Q0_CTX: [[u16; 3]; 7] = [
+    [17920, 32768, 0],
+    [1818, 32768, 0],
+    [7282, 32768, 0],
+    [25273, 32768, 0],
+    [10923, 32768, 0],
+    [31554, 32768, 0],
+    [32624, 32768, 0],
+];
+pub const TXB_SKIP_LUMA_32_Q1_CTX: [[u16; 3]; 7] = [
+    [26726, 32768, 0],
+    [1045, 32768, 0],
+    [11703, 32768, 0],
+    [20590, 32768, 0],
+    [18554, 32768, 0],
+    [25970, 32768, 0],
+    [31938, 32768, 0],
+];
+pub const TXB_SKIP_LUMA_32_CTX: [[u16; 3]; 7] = [
+    [30669, 32768, 0],
+    [3832, 32768, 0],
+    [11663, 32768, 0],
+    [18889, 32768, 0],
+    [19782, 32768, 0],
+    [23313, 32768, 0],
+    [31330, 32768, 0],
+];
+pub const TXB_SKIP_LUMA_32_Q3_CTX: [[u16; 3]; 7] = [
+    [31671, 32768, 0],
+    [2056, 32768, 0],
+    [11746, 32768, 0],
+    [16852, 32768, 0],
+    [18635, 32768, 0],
+    [24715, 32768, 0],
+    [31484, 32768, 0],
+];
+pub const TXB_SKIP_LUMA_64_Q0_CTX: [[u16; 3]; 7] = [
+    [6308, 32768, 0],
+    [117, 32768, 0],
+    [1638, 32768, 0],
+    [2161, 32768, 0],
+    [16384, 32768, 0],
+    [10923, 32768, 0],
+    [30247, 32768, 0],
+];
+pub const TXB_SKIP_LUMA_64_Q1_CTX: [[u16; 3]; 7] = [
+    [26584, 32768, 0],
+    [188, 32768, 0],
+    [8847, 32768, 0],
+    [24519, 32768, 0],
+    [22938, 32768, 0],
+    [30583, 32768, 0],
+    [32608, 32768, 0],
+];
+pub const TXB_SKIP_LUMA_64_CTX: [[u16; 3]; 7] = [
+    [28573, 32768, 0],
+    [3183, 32768, 0],
+    [17802, 32768, 0],
+    [25977, 32768, 0],
+    [26677, 32768, 0],
+    [27832, 32768, 0],
+    [32387, 32768, 0],
+];
+pub const TXB_SKIP_LUMA_64_Q3_CTX: [[u16; 3]; 7] = [
+    [31539, 32768, 0],
+    [8433, 32768, 0],
+    [20576, 32768, 0],
+    [27904, 32768, 0],
+    [27852, 32768, 0],
+    [30026, 32768, 0],
+    [32441, 32768, 0],
+];
