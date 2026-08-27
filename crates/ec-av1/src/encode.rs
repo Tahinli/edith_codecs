@@ -379,7 +379,11 @@ pub(crate) fn key_frame_headers_colour(
         enable_ref_frame_mvs: false,
         film_grain_params_present: false,
     };
-    let (mi_cols, mi_rows) = (w / 4, h / 4);
+    // spec `compute_image_size` (5.9.15): MiCols/MiRows come from the frame's
+    // own (true, unpadded) width and height, not from any block-grid
+    // alignment — a decoder derives these straight from `frame_width`/
+    // `frame_height` below, so this must match it exactly.
+    let (mi_cols, mi_rows) = (2 * ((w + 7) >> 3), 2 * ((h + 7) >> 3));
     let header = FrameHeader {
         frame_type: FrameType::Key,
         frame_is_intra: true,
@@ -471,6 +475,18 @@ struct Plane<'a> {
     reconstruction: Vec<u8>,
     width: usize,
     height: usize,
+    /// The frame's true, decodable extent in this plane's own units --
+    /// `mi_cols`/`mi_rows` (spec `compute_image_size`) converted to samples,
+    /// not `width`/`height` above, which is the padded coding-surface size.
+    /// A decoder's `BlockDecoded` bookkeeping (spec 7.4) and its `mb_to_
+    /// right_edge`/`mb_to_bottom_edge` clamps (libaom's
+    /// `av1/common/reconintra.c` `build_intra_predictors`) never see past
+    /// this bound, even though the padded reconstruction buffer holds real
+    /// (if never-decoded-by-a-real-decoder) samples out there -- reading
+    /// those instead of stopping here is what desyncs prediction at the true
+    /// edge.
+    true_width: usize,
+    true_height: usize,
 }
 
 impl Plane<'_> {
@@ -490,11 +506,44 @@ impl Plane<'_> {
         side: usize,
         reach: Reach,
     ) -> (Option<Vec<u8>>, Option<Vec<u8>>, Option<u8>) {
-        let across = (x + if reach.above_right { 2 * side } else { side }).min(self.width);
-        let down = (y + if reach.below_left { 2 * side } else { side }).min(self.height);
-        let above =
-            (y > 0).then(|| self.reconstruction[(y - 1) * self.width + x..][..across - x].to_vec());
-        let left = (x > 0).then(|| {
+        // Even a block's *own* edge is clamped to the true frame bound, not
+        // just a `reach` extension: libaom's `av1_predict_intra_block`
+        // (`av1/common/reconintra.c`) derives `xr`/`yd` -- the distance from
+        // this block's own right/bottom to the frame edge -- from
+        // `mb_to_right_edge`/`mb_to_bottom_edge`, which are built from
+        // `mi_cols`/`mi_rows` (the true, decodable extent), never from any
+        // padded coding surface. `n_top_px`/`n_left_px` (how many *real*
+        // samples the row/column above/left holds before the decoder starts
+        // repeating the last one, same clamp as spec 7.11.2.2's `aboveLimit`/
+        // `leftLimit`) is `min(side, xr + side)` even for a block whose own
+        // extent straddles that edge legally (`has_half`) -- the transform
+        // still covers the whole block, but prediction does not get to read
+        // real reconstructed pixels past the true edge for its own row/column,
+        // only for the padded tail it invents.
+        let own_across = x + side.min(self.true_width.saturating_sub(x));
+        let across = if reach.above_right {
+            own_across + side.min(self.true_width.saturating_sub(own_across))
+        } else {
+            own_across
+        }
+        .min(self.width);
+        let own_down = y + side.min(self.true_height.saturating_sub(y));
+        let down = if reach.below_left {
+            own_down + side.min(self.true_height.saturating_sub(own_down))
+        } else {
+            own_down
+        }
+        .min(self.height);
+        // `across`/`down` can still fall at or below `x`/`y` for a sub-block
+        // whose own origin already sits past the true edge -- only reachable
+        // through a partition trial priced for comparison on a split this
+        // frame's straddling quadrant will go on to refuse (see
+        // `a_picture_off_the_block_grid_is_refused`), never through a block
+        // this encoder actually commits. Such a block has no true-edge
+        // samples above or left of it at all, same as `y == 0`/`x == 0`.
+        let above = (y > 0 && across > x)
+            .then(|| self.reconstruction[(y - 1) * self.width + x..][..across - x].to_vec());
+        let left = (x > 0 && down > y).then(|| {
             (y..down)
                 .map(|row| self.reconstruction[row * self.width + x - 1])
                 .collect::<Vec<_>>()
@@ -883,7 +932,7 @@ fn code_square(
             x,
             y,
             side,
-            reach: Reach::of(side, x, y, luma.width, luma.height),
+            reach: Reach::of(side, x, y, luma.true_width, luma.true_height),
             set: luma_set,
         },
         search,
@@ -1063,16 +1112,27 @@ pub(crate) fn encode_key_frame_inner(
             format!("intra mode {bad} is not one the encoder predicts"),
         ));
     }
-    let (seq, mut header) =
-        key_frame_headers_colour(picture.width, picture.height, base_q_idx, color_config)?;
+    // The header carries the frame's true (unpadded) size as `frame_width`/
+    // `frame_height` -- what a decoder actually crops to -- with `mi_cols`/
+    // `mi_rows` derived from that same true size (spec `compute_image_size`).
+    // `render_width`/`render_height` come out equal to it too, so
+    // `render_and_frame_size_different` is false and no render_size bits are
+    // written, mirroring libaom/rav1e: the padded `picture` below is only the
+    // internal coding surface, never what the header names.
+    let (seq, mut header) = key_frame_headers_colour(render.0, render.1, base_q_idx, color_config)?;
     header.render_width = render.0 as u32;
     header.render_height = render.1 as u32;
 
+    // Prediction reads no further than this, in each plane's own units --
+    // see `Plane::true_width`/`true_height`.
+    let (true_width, true_height) = (header.mi_cols as usize * 4, header.mi_rows as usize * 4);
     let mut luma = Plane {
         source: &picture.y,
         reconstruction: vec![128; picture.y.len()],
         width: picture.width,
         height: picture.height,
+        true_width,
+        true_height,
     };
     let mut chroma = [
         Plane {
@@ -1080,12 +1140,16 @@ pub(crate) fn encode_key_frame_inner(
             reconstruction: vec![128; picture.u.len()],
             width: picture.width / 2,
             height: picture.height / 2,
+            true_width: true_width / 2,
+            true_height: true_height / 2,
         },
         Plane {
             source: &picture.v,
             reconstruction: vec![128; picture.v.len()],
             width: picture.width / 2,
             height: picture.height / 2,
+            true_width: true_width / 2,
+            true_height: true_height / 2,
         },
     ];
 
@@ -1099,7 +1163,14 @@ pub(crate) fn encode_key_frame_inner(
         modes,
     };
 
-    let (cols, rows) = (picture.width / BLOCK, picture.height / BLOCK);
+    // The block grid this frame is coded over: [`crate::tile::block_grid`]'s
+    // ceiling of the header's own (true-size-derived) `mi_cols`/`mi_rows`,
+    // which may be fewer columns/rows than the padded picture has room for
+    // -- a block whose origin sits past the true bound is not coded at all,
+    // matching what a decoder derives from `frame_width`/`frame_height` and
+    // so never visits either.
+    let (cols, rows) = crate::tile::block_grid(header.mi_cols, header.mi_rows);
+    let (cols, rows) = (cols as usize, rows as usize);
     // The luma mode of the block above and of the block to the left, which is
     // what picks the CDF the next block's mode is coded against -- the same
     // bookkeeping the tile writer keeps, so that the search is costing the
@@ -1126,6 +1197,54 @@ pub(crate) fn encode_key_frame_inner(
                 let (c0, r0) = (col * 2, row * 2);
                 let base = snapshot(&luma, &chroma, (x, y));
 
+                // spec `decode_partition`'s hasRows/hasCols recomputed at this
+                // 32x32 block's own half (see `crate::tile::has_half`): the
+                // true frame edge can fall inside a quadrant a superblock-level
+                // check already let through. A quadrant that fails either may
+                // not be left whole; a 16x16 sub-block that fails either (once
+                // split) is a leaf this writer has no rectangular transform
+                // for, so the search must not pick a split that would need one.
+                let (has_cols32, has_rows32) = (
+                    crate::tile::has_half(
+                        col as u32 * crate::tile::BLOCK_MI,
+                        crate::tile::BLOCK_MI,
+                        header.mi_cols,
+                    ),
+                    crate::tile::has_half(
+                        row as u32 * crate::tile::BLOCK_MI,
+                        crate::tile::BLOCK_MI,
+                        header.mi_rows,
+                    ),
+                );
+                let whole_legal = has_cols32 && has_rows32;
+                let split_legal = (0..4)
+                    .map(|i| (r0 + i / 2, c0 + i % 2))
+                    .filter(|&(sr, sc)| {
+                        (sr as u32) * crate::tile::SUB_MI < header.mi_rows
+                            && (sc as u32) * crate::tile::SUB_MI < header.mi_cols
+                    })
+                    .all(|(sr, sc)| {
+                        crate::tile::has_half(
+                            sc as u32 * crate::tile::SUB_MI,
+                            crate::tile::SUB_MI,
+                            header.mi_cols,
+                        ) && crate::tile::has_half(
+                            sr as u32 * crate::tile::SUB_MI,
+                            crate::tile::SUB_MI,
+                            header.mi_rows,
+                        )
+                    });
+                if !whole_legal && !split_legal {
+                    return Err(Error::unsupported(
+                        "AV1 encode",
+                        format!(
+                            "the 32x32 block at ({col},{row}) straddles the true frame edge \
+                             in a way that needs a rectangular (HORZ/VERT) transform this \
+                             encoder does not code yet"
+                        ),
+                    ));
+                }
+
                 // What the whole 32x32 costs, including the partition symbol
                 // that says it is not split.
                 let (whole, mut cost_whole) = code_square(
@@ -1145,9 +1264,20 @@ pub(crate) fn encode_key_frame_inner(
                 let mut split = Vec::with_capacity(4);
                 let mut cost_split = search.lambda
                     * (partition_bits(BLOCK, true) + 4.0 * partition_bits(SUB, false));
-                let mut split_modes = [DC_PRED; 4];
-                for (sub, sub_mode) in split_modes.iter_mut().enumerate() {
+                let mut split_modes = Vec::with_capacity(4);
+                for sub in 0..4 {
                     let (sc, sr) = (c0 + sub % 2, r0 + sub / 2);
+                    // Same filter as the writer's `sub_positions` (spec
+                    // `decode_partition`'s `r >= MiRows || c >= MiCols` early
+                    // return): a sub-block whose own origin sits past the
+                    // true frame is never coded, so it must not be searched
+                    // or pushed onto `split` either, or the writer's block
+                    // count will not match what it is prepared to name.
+                    if (sr as u32) * crate::tile::SUB_MI >= header.mi_rows
+                        || (sc as u32) * crate::tile::SUB_MI >= header.mi_cols
+                    {
+                        continue;
+                    }
                     let (block, cost) = code_square(
                         &mut luma,
                         &mut chroma,
@@ -1157,13 +1287,13 @@ pub(crate) fn encode_key_frame_inner(
                         &mode_bits(above_mode[sc], left_mode[sr]),
                     );
                     cost_split += cost;
-                    *sub_mode = block.mode;
+                    split_modes.push(block.mode);
                     above_mode[sc] = block.mode;
                     left_mode[sr] = block.mode;
                     split.push(block);
                 }
 
-                if split_blocks && cost_split < cost_whole {
+                if split_legal && (!whole_legal || (split_blocks && cost_split < cost_whole)) {
                     modes.extend_from_slice(&split_modes);
                     blocks.push(Quadrant::Split(split));
                 } else {
@@ -1348,6 +1478,7 @@ fn mc_trial(
     mv: (i32, i32),
     luma: bool,
     reference: &[u8],
+    stride: usize,
     ref_width: usize,
     ref_height: usize,
     skip: bool,
@@ -1360,6 +1491,7 @@ fn mc_trial(
     let mut prediction = vec![0u8; side * side];
     mc::predict(
         reference,
+        stride,
         ref_width,
         ref_height,
         x_q4,
@@ -1400,7 +1532,7 @@ fn search_inter_block(
     stack: &MvStack,
 ) -> BlockCoeffs {
     let (luma_set, chroma_set) = (TxbSet::Luma32, TxbSet::Chroma16);
-    let reach = Reach::of(BLOCK, x, y, luma.width, luma.height);
+    let reach = Reach::of(BLOCK, x, y, luma.true_width, luma.true_height);
 
     // skip / intra_inter symbol costs at a fixed context -- see this
     // function's doc comment.
@@ -1484,9 +1616,34 @@ fn search_inter_block(
         });
     }
 
-    let ref_luma = (&reference.y, reference.width, reference.height);
-    let ref_u = (&reference.u, reference.width / 2, reference.height / 2);
-    let ref_v = (&reference.v, reference.width / 2, reference.height / 2);
+    // The reference frame buffer a spec decoder holds is exactly the true
+    // (unpadded) coded extent -- a superblock whose partition stops early at
+    // `has_cols`/`has_rows` never codes syntax for the padding columns/rows
+    // beyond it, so those samples are never part of the decoded picture.
+    // Motion compensation clamps reads to that true extent (spec 7.11.3.4's
+    // reference sample position clamp), not to this crate's own
+    // padded-to-`SUPERBLOCK` coding surface -- passing the padded width/height
+    // here would let a fractional-pel read past the true edge pick up this
+    // encoder's own uncoded padding instead of the true edge's replicated
+    // value a decoder computes.
+    let ref_luma = (
+        &reference.y,
+        reference.width,
+        luma.true_width,
+        luma.true_height,
+    );
+    let ref_u = (
+        &reference.u,
+        reference.width / 2,
+        chroma[0].true_width,
+        chroma[0].true_height,
+    );
+    let ref_v = (
+        &reference.v,
+        reference.width / 2,
+        chroma[1].true_width,
+        chroma[1].true_height,
+    );
     let mode_bits_inter = symbol_bits(&cdf::NEW_MV[stack.new_mv_ctx], 1) // not NEWMV
             + symbol_bits(&cdf::ZERO_MV[stack.zero_mv_ctx], 1) // not zero
             + symbol_bits(&cdf::REF_MV[stack.ref_mv_ctx], 0); // NEARESTMV
@@ -1506,6 +1663,7 @@ fn search_inter_block(
             ref_luma.0,
             ref_luma.1,
             ref_luma.2,
+            ref_luma.3,
             false,
             search.base_q_idx,
             search.deadzone,
@@ -1521,6 +1679,7 @@ fn search_inter_block(
             ref_u.0,
             ref_u.1,
             ref_u.2,
+            ref_u.3,
             false,
             search.base_q_idx,
             search.deadzone,
@@ -1536,6 +1695,7 @@ fn search_inter_block(
             ref_v.0,
             ref_v.1,
             ref_v.2,
+            ref_v.3,
             false,
             search.base_q_idx,
             search.deadzone,
@@ -1576,6 +1736,7 @@ fn search_inter_block(
         ref_luma.0,
         ref_luma.1,
         ref_luma.2,
+        ref_luma.3,
         &source_block,
         x,
         y,
@@ -1596,6 +1757,7 @@ fn search_inter_block(
             ref_luma.0,
             ref_luma.1,
             ref_luma.2,
+            ref_luma.3,
             false,
             search.base_q_idx,
             search.deadzone,
@@ -1611,6 +1773,7 @@ fn search_inter_block(
             ref_u.0,
             ref_u.1,
             ref_u.2,
+            ref_u.3,
             false,
             search.base_q_idx,
             search.deadzone,
@@ -1626,6 +1789,7 @@ fn search_inter_block(
             ref_v.0,
             ref_v.1,
             ref_v.2,
+            ref_v.3,
             false,
             search.base_q_idx,
             search.deadzone,
@@ -1714,21 +1878,25 @@ pub(crate) fn encode_inter_frame(
     // overwrites slot 0, so the frame just coded is always what the next one
     // predicts against.
     const LAST_SLOT: u8 = 0;
-    let (seq, mut header) = inter_frame_headers(
-        picture.width,
-        picture.height,
-        base_q_idx,
-        order_hint,
-        LAST_SLOT,
-    )?;
+    // `render`, not `picture.width`/`picture.height`: `picture` here is
+    // already padded to a whole number of superblocks (`encode_sequence`'s
+    // `padded_to(SUPERBLOCK)`), and the header's `mi_cols`/`mi_rows` (and so
+    // every true-edge clamp downstream) must come from the frame's real,
+    // unpadded size, same as `key_frame_headers_colour` takes `render` and
+    // not the padded picture in `encode_key_frame_inner`.
+    let (seq, mut header) =
+        inter_frame_headers(render.0, render.1, base_q_idx, order_hint, LAST_SLOT)?;
     header.render_width = render.0 as u32;
     header.render_height = render.1 as u32;
 
+    let (true_width, true_height) = (header.mi_cols as usize * 4, header.mi_rows as usize * 4);
     let mut luma = Plane {
         source: &picture.y,
         reconstruction: vec![128; picture.y.len()],
         width: picture.width,
         height: picture.height,
+        true_width,
+        true_height,
     };
     let mut chroma = [
         Plane {
@@ -1736,12 +1904,16 @@ pub(crate) fn encode_inter_frame(
             reconstruction: vec![128; picture.u.len()],
             width: picture.width / 2,
             height: picture.height / 2,
+            true_width: true_width / 2,
+            true_height: true_height / 2,
         },
         Plane {
             source: &picture.v,
             reconstruction: vec![128; picture.v.len()],
             width: picture.width / 2,
             height: picture.height / 2,
+            true_width: true_width / 2,
+            true_height: true_height / 2,
         },
     ];
 
@@ -1754,8 +1926,14 @@ pub(crate) fn encode_inter_frame(
     };
     let mode_bits_table = inter_mode_bits();
 
-    let (cols, rows) = (picture.width / BLOCK, picture.height / BLOCK);
-    let (sb_cols, sb_rows) = (cols / 2, rows / 2);
+    // The true grid ([`crate::tile::block_grid`]'s ceiling), not the padded
+    // coding surface's: `blocks` carries one entry per 32x32 block the tile
+    // writer will actually visit, same count it checks `blocks.len()`
+    // against, which is fewer than the padded surface's own block count
+    // whenever the true size is not a 64x64 multiple.
+    let (cols, rows) = crate::tile::block_grid(header.mi_cols, header.mi_rows);
+    let (cols, rows) = (cols as usize, rows as usize);
+    let (sb_cols, sb_rows) = (cols.div_ceil(2), rows.div_ceil(2));
     let (mi_cols, mi_rows) = (header.mi_cols as usize, header.mi_rows as usize);
     let mut grid = MiGrid::new(mi_cols, mi_rows);
     let mut blocks = vec![BlockCoeffs::default(); cols * rows];
@@ -1764,6 +1942,11 @@ pub(crate) fn encode_inter_frame(
         for sb_c in 0..sb_cols {
             for quadrant in 0..4 {
                 let (r32, c32) = (sb_r * 2 + quadrant / 2, sb_c * 2 + quadrant % 2);
+                // Same filter as the tile writer's: a quadrant whose own mi
+                // origin is not inside the true frame is never coded.
+                if r32 >= rows || c32 >= cols {
+                    continue;
+                }
                 let (x, y) = (c32 * BLOCK, r32 * BLOCK);
                 let (mi_row, mi_col) = (r32 * 8, c32 * 8);
                 let stack =
@@ -2014,7 +2197,7 @@ mod tests {
             eprintln!("SKIP ffmpeg_decodes_exactly_what_the_encoder_reconstructed: no ffmpeg");
             return;
         }
-        for &(width, height) in &[(64usize, 64usize), (96, 64), (160, 96)] {
+        for &(width, height) in &[(64usize, 64usize), (96, 64), (160, 96), (32, 48)] {
             let picture = test_card(width, height);
             let encoded = encode_key_frame(&picture, 100, 0.5).unwrap();
             let decoded = ffmpeg_decode(&encoded.stream, width, height);
@@ -2106,19 +2289,6 @@ mod tests {
         ffmpeg_decode_sequence(&stream, width, height, 2);
     }
 
-    /// The top-left `width` x `height` region of a decoded picture, for
-    /// comparing against [`Encoded::reconstruction`] (already cropped to
-    /// the same region) when ffmpeg hands back the padded, coded-size one.
-    fn crop_picture(picture: &Picture, width: usize, height: usize) -> Picture {
-        Picture {
-            width,
-            height,
-            y: crop_plane(&picture.y, picture.width, width, height),
-            u: crop_plane(&picture.u, picture.width / 2, width / 2, height / 2),
-            v: crop_plane(&picture.v, picture.width / 2, width / 2, height / 2),
-        }
-    }
-
     /// `ffprobe`'s reported `width,height` for one OBU stream -- the coded
     /// frame size an AV1 decoder allocates, not necessarily the render size
     /// (see [`a_frame_round_trips_at_its_own_size`]).
@@ -2186,23 +2356,18 @@ mod tests {
                 (width, height),
                 "{width}x{height}: reconstruction is cropped to the picture's own size"
             );
-            let (padded_width, padded_height) = (
-                width.next_multiple_of(BLOCK),
-                height.next_multiple_of(BLOCK),
-            );
             assert_eq!(
                 ffprobe_size(&encoded.stream),
-                (padded_width as u32, padded_height as u32),
-                "{width}x{height}: ffprobe reports the coded (padded) size"
+                (width as u32, height as u32),
+                "{width}x{height}: ffprobe reports the true (display) size, not the padded one"
             );
-            let decoded = ffmpeg_decode(&encoded.stream, padded_width, padded_height);
-            let cropped = crop_picture(&decoded, width, height);
+            let decoded = ffmpeg_decode(&encoded.stream, width, height);
             assert_eq!(
-                cropped.y, encoded.reconstruction.y,
+                decoded.y, encoded.reconstruction.y,
                 "{width}x{height}: luma"
             );
-            assert_eq!(cropped.u, encoded.reconstruction.u, "{width}x{height}: U");
-            assert_eq!(cropped.v, encoded.reconstruction.v, "{width}x{height}: V");
+            assert_eq!(decoded.u, encoded.reconstruction.u, "{width}x{height}: U");
+            assert_eq!(decoded.v, encoded.reconstruction.v, "{width}x{height}: V");
         }
     }
 
@@ -2223,6 +2388,14 @@ mod tests {
     /// EC_RNG-per-symbol trace against the same debug decoder found the
     /// bitstream byte-for-byte identical to libaom's across all 51188
     /// symbols of this frame before this bug was found).
+    ///
+    /// Since the frame header started writing the true (unpadded) display
+    /// size into `frame_width`/`frame_height` rather than the padded coded
+    /// size, ffmpeg crops to 854x480 on its own -- decoding at the padded
+    /// 864x480 and cropping ourselves now reads past what ffmpeg actually
+    /// emits (`av1_common_int.h`'s render/upscale path, mirrored by
+    /// `av1_frame_size` on the decode side, crops the loop-filtered picture to
+    /// the header's own size before output).
     #[test]
     fn an_854x480_picture_round_trips_through_its_padding() {
         if !have_ffmpeg() {
@@ -2231,13 +2404,10 @@ mod tests {
         let (width, height) = (854usize, 480usize);
         let picture = test_card(width, height);
         let encoded = encode_key_frame(&picture, 100, 0.5).unwrap();
-        let (padded_width, padded_height) = (
-            width.next_multiple_of(BLOCK),
-            height.next_multiple_of(BLOCK),
-        );
-        let decoded = ffmpeg_decode(&encoded.stream, padded_width, padded_height);
-        let cropped = crop_picture(&decoded, width, height);
-        assert_eq!(cropped.y, encoded.reconstruction.y, "854x480: luma");
+        let decoded = ffmpeg_decode(&encoded.stream, width, height);
+        assert_eq!(decoded.y, encoded.reconstruction.y, "854x480: luma");
+        assert_eq!(decoded.u, encoded.reconstruction.u, "854x480: U");
+        assert_eq!(decoded.v, encoded.reconstruction.v, "854x480: V");
     }
 
     /// `Reach::top_right`/`bottom_left` against a from-scratch transcription
@@ -2362,24 +2532,18 @@ mod tests {
             );
         }
         // See `a_frame_round_trips_at_its_own_size`: `ffprobe` reports the
-        // coded (superblock-padded) size a sequence's frames share, not the
-        // render size.
-        let (padded_width, padded_height) = (
-            width.next_multiple_of(SUPERBLOCK),
-            height.next_multiple_of(SUPERBLOCK),
-        );
+        // true (display) size a sequence's frames share, not the padded one.
         assert_eq!(
             ffprobe_size(&encoded.stream),
-            (padded_width as u32, padded_height as u32),
-            "sequence: ffprobe reports the coded (padded) size"
+            (width as u32, height as u32),
+            "sequence: ffprobe reports the true (display) size"
         );
-        let decoded = ffmpeg_decode_sequence(&encoded.stream, padded_width, padded_height, 3);
+        let decoded = ffmpeg_decode_sequence(&encoded.stream, width, height, 3);
         assert_eq!(decoded.len(), 3, "decoded frame count");
         for (i, (frame, decoded)) in encoded.frames.iter().zip(&decoded).enumerate() {
-            let cropped = crop_picture(decoded, width, height);
-            assert_eq!(cropped.y, frame.reconstruction.y, "frame {i}: luma");
-            assert_eq!(cropped.u, frame.reconstruction.u, "frame {i}: U");
-            assert_eq!(cropped.v, frame.reconstruction.v, "frame {i}: V");
+            assert_eq!(decoded.y, frame.reconstruction.y, "frame {i}: luma");
+            assert_eq!(decoded.u, frame.reconstruction.u, "frame {i}: U");
+            assert_eq!(decoded.v, frame.reconstruction.v, "frame {i}: V");
         }
     }
 
@@ -2909,15 +3073,31 @@ mod tests {
     }
 
     /// The sizes the encoder refuses, refused for a reason rather than by
-    /// panicking somewhere below. 40x32 and 32x48 are off the 32x32 block
-    /// grid, which used to be refused outright; the encoder now pads a
-    /// picture like that internally (see `a_frame_round_trips_at_its_own_size`)
-    /// rather than refusing it, so those two are an accept, not a refusal,
-    /// here.
+    /// panicking somewhere below. Most sizes off the 32x32 block grid encode
+    /// fine now (see `a_frame_round_trips_at_its_own_size`) -- the true frame
+    /// edge lands past the halfway point of whichever block it falls in, so
+    /// `PARTITION_NONE` or a single gathered split flag still says everything
+    /// the spec needs. 40x32 and 32x48 are the sizes where the edge instead
+    /// falls *at or before* the halfway point of a 16x16 leaf: the spec's
+    /// `decode_partition` then requires that leaf to split again, to 8x8,
+    /// which this writer has no transform/coefficient path for yet, so it is
+    /// still refused, by name rather than by corrupting the stream.
     #[test]
     fn a_picture_off_the_block_grid_is_refused() {
-        assert!(encode_key_frame(&Picture::grey(40, 32), 100, 0.5).is_ok());
-        assert!(encode_key_frame(&Picture::grey(32, 48), 100, 0.5).is_ok());
+        let refused = |w, h| {
+            let msg = encode_key_frame(&Picture::grey(w, h), 100, 0.5)
+                .expect_err(&format!(
+                    "{w}x{h} needs an 8x8 split this writer does not code"
+                ))
+                .to_string();
+            msg.contains("true frame")
+        };
+        assert!(refused(40, 32));
+        // 32x48 was refused here through round 9: its split quadrant only
+        // ever has two legal 16x16 subs (the other two sit past the true
+        // 48-row edge, block-aligned, no 8x8 split needed), but the writer
+        // demanded four. See `ffmpeg_decodes_exactly_what_the_encoder_
+        // reconstructed`, which now round-trips it pixel-exact instead.
         let mut short = Picture::grey(64, 64);
         short.u.truncate(10);
         assert!(encode_key_frame(&short, 100, 0.5).is_err());

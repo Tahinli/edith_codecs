@@ -306,15 +306,30 @@ fn directional(angle: u16, edges: &Edges, side: usize, dst: &mut [u8]) {
 /// `dc_predict` (spec 7.11.2.5): the average of whichever neighbours exist.
 ///
 /// Only the block's own `side` samples of each edge count: what a directional
-/// mode reaches past them is no part of the average.
+/// mode reaches past them is no part of the average. But `side` samples it
+/// always is: libaom's `build_intra_predictors` (`av1/common/reconintra.c`)
+/// replicates the last real sample out to the full transform width/height
+/// before `dc_predictor` averages, so a slice truncated short by the true
+/// frame edge must be extended by repetition here too, not averaged over its
+/// own shorter length.
 fn dc(above: Option<&[u8]>, left: Option<&[u8]>, side: usize) -> i32 {
-    let above = above.map(|a| &a[..side.min(a.len())]);
-    let left = left.map(|l| &l[..side.min(l.len())]);
+    let extend = |samples: &[u8]| -> Vec<u8> {
+        if samples.len() >= side {
+            samples[..side].to_vec()
+        } else {
+            let last = *samples.last().expect("an edge that exists has samples");
+            let mut v = samples.to_vec();
+            v.resize(side, last);
+            v
+        }
+    };
+    let above = above.map(extend);
+    let left = left.map(extend);
     let average = |samples: &[u8]| {
         let sum: u32 = samples.iter().map(|&s| u32::from(s)).sum();
         ((sum + (samples.len() as u32 >> 1)) / samples.len() as u32) as i32
     };
-    match (above, left) {
+    match (&above, &left) {
         (None, None) => 128,
         (Some(a), None) => average(a),
         (None, Some(l)) => average(l),
