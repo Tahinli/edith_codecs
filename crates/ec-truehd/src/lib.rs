@@ -37,8 +37,12 @@
 #![warn(missing_docs)]
 
 pub mod decode;
+pub mod encode;
 pub mod sync;
 
-pub use ec_core::Error;
 pub use decode::CheckStats;
-pub use sync::{AccessUnitHeader, MajorSyncInfo, MajorSyncFormat, SubstreamInfo, TrueHdDecoder, frame_length};
+pub use ec_core::Error;
+pub use encode::TrueHdEncoder;
+pub use sync::{
+    AccessUnitHeader, MajorSyncFormat, MajorSyncInfo, SubstreamInfo, TrueHdDecoder, frame_length,
+};

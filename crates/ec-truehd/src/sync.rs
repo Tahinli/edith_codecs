@@ -208,19 +208,24 @@ impl AccessUnitHeader {
         let input_timing = u16::from_be_bytes([au[2], au[3]]);
 
         let major_sync = match au.get(4..8) {
-            Some(w) if w == MAJOR_SYNC_TRUEHD.to_be_bytes() || w == MAJOR_SYNC_MLP.to_be_bytes() => {
+            Some(w)
+                if w == MAJOR_SYNC_TRUEHD.to_be_bytes() || w == MAJOR_SYNC_MLP.to_be_bytes() =>
+            {
                 Some(MajorSyncInfo::parse(&au[4..])?)
             }
             _ => None,
         };
-        let dir_start = AU_HEADER_LEN + if major_sync.is_some() { MAJOR_SYNC_LEN } else { 0 };
+        let dir_start = AU_HEADER_LEN
+            + if major_sync.is_some() {
+                MAJOR_SYNC_LEN
+            } else {
+                0
+            };
 
         let mut substreams = Vec::new();
         let mut pos = dir_start;
         loop {
-            let word = au
-                .get(pos..pos + 2)
-                .ok_or(Error::NeedMore)?;
+            let word = au.get(pos..pos + 2).ok_or(Error::NeedMore)?;
             let word = u16::from_be_bytes([word[0], word[1]]);
             let flags = (word >> 12) as u8;
             let end_offset_words = word & 0x0FFF;
@@ -270,7 +275,10 @@ impl AccessUnitHeader {
         } else {
             self.data_start + usize::from(self.substreams[i - 1].end_offset_words) * 2
         };
-        (start, self.data_start + usize::from(self.substreams[i].end_offset_words) * 2)
+        (
+            start,
+            self.data_start + usize::from(self.substreams[i].end_offset_words) * 2,
+        )
     }
 
     /// The channel layout Dolby's substream convention implies: substream 0

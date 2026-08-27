@@ -111,16 +111,64 @@ const PARAM_PRESENCE: u8 = 1 << 0;
 /// external encoder's output (`tests/oracle.rs`).
 pub const HUFFMAN_TABLES: [[(u16, u8); 18]; 3] = [
     [
-        (0x01, 9), (0x01, 8), (0x01, 7), (0x01, 6), (0x01, 5), (0x01, 4), (0x01, 3), (0x04, 3), (0x05, 3),
-        (0x06, 3), (0x07, 3), (0x03, 3), (0x05, 4), (0x09, 5), (0x11, 6), (0x21, 7), (0x41, 8), (0x81, 9),
+        (0x01, 9),
+        (0x01, 8),
+        (0x01, 7),
+        (0x01, 6),
+        (0x01, 5),
+        (0x01, 4),
+        (0x01, 3),
+        (0x04, 3),
+        (0x05, 3),
+        (0x06, 3),
+        (0x07, 3),
+        (0x03, 3),
+        (0x05, 4),
+        (0x09, 5),
+        (0x11, 6),
+        (0x21, 7),
+        (0x41, 8),
+        (0x81, 9),
     ],
     [
-        (0x01, 9), (0x01, 8), (0x01, 7), (0x01, 6), (0x01, 5), (0x01, 4), (0x01, 3), (0x02, 2), (0x03, 2),
-        (0x03, 3), (0x05, 4), (0x09, 5), (0x11, 6), (0x21, 7), (0x41, 8), (0x81, 9), (0, 0), (0, 0),
+        (0x01, 9),
+        (0x01, 8),
+        (0x01, 7),
+        (0x01, 6),
+        (0x01, 5),
+        (0x01, 4),
+        (0x01, 3),
+        (0x02, 2),
+        (0x03, 2),
+        (0x03, 3),
+        (0x05, 4),
+        (0x09, 5),
+        (0x11, 6),
+        (0x21, 7),
+        (0x41, 8),
+        (0x81, 9),
+        (0, 0),
+        (0, 0),
     ],
     [
-        (0x01, 9), (0x01, 8), (0x01, 7), (0x01, 6), (0x01, 5), (0x01, 4), (0x01, 3), (0x01, 1), (0x03, 3),
-        (0x05, 4), (0x09, 5), (0x11, 6), (0x21, 7), (0x41, 8), (0x81, 9), (0, 0), (0, 0), (0, 0),
+        (0x01, 9),
+        (0x01, 8),
+        (0x01, 7),
+        (0x01, 6),
+        (0x01, 5),
+        (0x01, 4),
+        (0x01, 3),
+        (0x01, 1),
+        (0x03, 3),
+        (0x05, 4),
+        (0x09, 5),
+        (0x11, 6),
+        (0x21, 7),
+        (0x41, 8),
+        (0x81, 9),
+        (0, 0),
+        (0, 0),
+        (0, 0),
     ],
 ];
 
@@ -165,7 +213,11 @@ fn crc8(poly: u8, init: u8, bytes: &[u8]) -> u8 {
     for &b in bytes {
         crc ^= b;
         for _ in 0..8 {
-            crc = if crc & 0x80 != 0 { (crc << 1) ^ poly } else { crc << 1 };
+            crc = if crc & 0x80 != 0 {
+                (crc << 1) ^ poly
+            } else {
+                crc << 1
+            };
         }
     }
     crc
@@ -174,7 +226,7 @@ fn crc8(poly: u8, init: u8, bytes: &[u8]) -> u8 {
 /// The restart header's own CRC-8 (poly 0x1D), over the header from its
 /// first byte (`buf[0]`, whose two leading bits — the params/restart flags —
 /// are masked off) through its last full byte and the trailing partial bits.
-fn restart_checksum(buf: &[u8], bit_size: u64) -> u8 {
+pub(crate) fn restart_checksum(buf: &[u8], bit_size: u64) -> u8 {
     let bit_size = bit_size as usize + 2;
     let num_bytes = bit_size / 8;
     let mut crc = crc8(0x1D, 0, &[buf[0] & 0x3F]);
@@ -271,7 +323,12 @@ impl Substream {
     fn recompute_sign_offset(&mut self, ch: usize) {
         let cp = &mut self.channels[ch];
         let lsb_bits = i32::from(cp.huff_lsbs) - self.quant_step_size[ch] as i32;
-        let sign_shift = lsb_bits + if cp.codebook > 0 { 2 - i32::from(cp.codebook) } else { -1 };
+        let sign_shift = lsb_bits
+            + if cp.codebook > 0 {
+                2 - i32::from(cp.codebook)
+            } else {
+                -1
+            };
         let mut off = cp.huff_offset;
         if cp.codebook > 0 {
             off -= 7 << lsb_bits;
@@ -350,7 +407,11 @@ impl Core {
 
     /// Decodes one access unit whose header already parsed; `None` until the
     /// first major sync and every substream's first restart header are seen.
-    pub(crate) fn decode(&mut self, header: &AccessUnitHeader, data: &[u8]) -> Result<Option<AudioFrame>> {
+    pub(crate) fn decode(
+        &mut self,
+        header: &AccessUnitHeader,
+        data: &[u8],
+    ) -> Result<Option<AudioFrame>> {
         if !self.prepare(header)? || !self.decode_substreams(header, data)? {
             return Ok(None);
         }
@@ -403,7 +464,10 @@ impl Core {
         let layout = ChannelLayout::from_count(channels);
         if layout == ChannelLayout::Surround7_1 && self.ch8_assignment != 0x4F {
             return Err(Error::unsupported(
-                format!("TrueHD 8-channel presentation with channel assignment {:#x}", self.ch8_assignment),
+                format!(
+                    "TrueHD 8-channel presentation with channel assignment {:#x}",
+                    self.ch8_assignment
+                ),
                 "only the standard 7.1 (L R C LFE Ls Rs Lrs Rrs) assignment is mapped",
             ));
         }
@@ -543,7 +607,10 @@ impl Core {
         if flags & PARAM_BLOCKSIZE != 0 && br.read_bit()? {
             s.blocksize = br.read_bits(9)? as usize;
             if s.blocksize < 8 || s.blocksize > self.access_unit_size {
-                return Err(Error::corrupt(format!("TrueHD: block size {}", s.blocksize)));
+                return Err(Error::corrupt(format!(
+                    "TrueHD: block size {}",
+                    s.blocksize
+                )));
             }
         }
         if flags & PARAM_MATRIX != 0 && br.read_bit()? {
@@ -649,7 +716,12 @@ impl Core {
             }
         }
         for ch in s.min_channel..=s.max_channel {
-            filter_channel(&mut s.channels[ch], s.quant_step_size[ch], &mut self.sample_buffer[s.blockpos..s.blockpos + s.blocksize], ch);
+            filter_channel(
+                &mut s.channels[ch],
+                s.quant_step_size[ch],
+                &mut self.sample_buffer[s.blockpos..s.blockpos + s.blocksize],
+                ch,
+            );
         }
         s.blockpos += s.blocksize;
         if let Some(end) = expected_end {
@@ -745,7 +817,9 @@ fn read_filter(br: &mut BitReader, f: &mut Filter, iir: bool) -> Result<()> {
         let coeff_bits = br.read_bits(5)?;
         let coeff_shift = br.read_bits(3)?;
         if !(1..=16).contains(&coeff_bits) || coeff_bits + coeff_shift > 16 {
-            return Err(Error::corrupt("TrueHD: filter coefficient precision out of range"));
+            return Err(Error::corrupt(
+                "TrueHD: filter coefficient precision out of range",
+            ));
         }
         for c in f.coeffs.iter_mut().take(f.order) {
             *c = br.read_signed(coeff_bits)? << coeff_shift;
@@ -757,7 +831,11 @@ fn read_filter(br: &mut BitReader, f: &mut Filter, iir: bool) -> Result<()> {
             let state_bits = br.read_bits(4)?;
             let state_shift = br.read_bits(4)?;
             for st in f.state.iter_mut().take(f.order) {
-                *st = if state_bits > 0 { br.read_signed(state_bits)? << state_shift } else { 0 };
+                *st = if state_bits > 0 {
+                    br.read_signed(state_bits)? << state_shift
+                } else {
+                    0
+                };
             }
         }
     }
@@ -768,7 +846,11 @@ fn read_filter(br: &mut BitReader, f: &mut Filter, iir: bool) -> Result<()> {
 /// (over past residual-after-prediction) filters, in place on column `ch`.
 fn filter_channel(cp: &mut ChannelParams, qss: u32, rows: &mut [[i32; MAX_CHANNELS]], ch: usize) {
     let mask = !((1i32 << qss) - 1);
-    let shift = if cp.fir.order > 0 { cp.fir.shift } else { cp.iir.shift };
+    let shift = if cp.fir.order > 0 {
+        cp.fir.shift
+    } else {
+        cp.iir.shift
+    };
     for row in rows {
         let mut accum: i64 = 0;
         for j in 0..cp.fir.order {
@@ -807,7 +889,11 @@ mod tests {
                 w.write_bits(0x5A5, 11);
                 let bytes = w.into_bytes();
                 let mut br = BitReader::new(&bytes);
-                assert_eq!(lut.decode(&mut br, book).unwrap(), index as i32, "book {book} index {index}");
+                assert_eq!(
+                    lut.decode(&mut br, book).unwrap(),
+                    index as i32,
+                    "book {book} index {index}"
+                );
                 assert_eq!(br.bit_position(), u64::from(len));
                 // Bare code at the very end of the buffer must decode too.
                 let mut w = BitWriter::new();
@@ -836,4 +922,3 @@ mod tests {
         }
     }
 }
-
