@@ -37,9 +37,20 @@ pub(crate) enum TxbSet {
     /// reads, but its own two-symbol `tx_type` table rather than `Luma16`'s
     /// five-symbol, mode-indexed one.
     Luma16Inter,
-    /// The 8x8 luma transform of an 8x8 leaf under a straddling 16x16 block
-    /// (lane-av1-rect): intra-only, so no `Luma8Inter` counterpart exists yet.
+    /// The 8x8 luma transform of an intra 8x8 leaf under a straddling 16x16
+    /// block (lane-av1-rect). An `is_inter` leaf reads
+    /// [`Luma8Inter`](TxbSet::Luma8Inter) instead.
     Luma8,
+    /// The 8x8 luma transform of an `is_inter` 8x8 leaf under a straddling
+    /// 16x16 block (lane-av1inter8): the same coefficient tables
+    /// [`Luma8`](TxbSet::Luma8) reads, but `get_tx_set` (spec 5.11.48)
+    /// returns `TX_SET_INTER_3` at this size too under this encoder's
+    /// always-on `reduced_tx_set` -- the same two-symbol alphabet
+    /// [`Luma16Inter`](TxbSet::Luma16Inter) carries, just its own CDF (libaom
+    /// `default_inter_ext_tx_cdf[EXT_TX_SET_DCT_IDTX][TX_8X8]`, a distinct
+    /// adapted table from the 16x16 and 32x32 sizes' own entries in the same
+    /// set, per `entropymode.c`).
+    Luma8Inter,
     /// The 8x8 transform of a chroma plane of a 16x16 block.
     Chroma8,
     /// The 4x4 transform of a chroma plane of an 8x8 leaf (lane-av1-rect).
@@ -217,6 +228,10 @@ pub(crate) struct Cdfs {
     /// `reduced_tx_set` (spec `TX_SET_INTER_3`, `TX_16X16` row) -- not
     /// indexed by mode, same as [`Self::inter_tx_type_32`].
     pub inter_tx_type_16: [u16; 3],
+    /// The transform type of an `is_inter` 8x8 luma transform under
+    /// `reduced_tx_set` (spec `TX_SET_INTER_3`, `TX_8X8` row) -- not indexed
+    /// by mode, same as [`Self::inter_tx_type_32`] (lane-av1inter8).
+    pub inter_tx_type_8: [u16; 3],
     /// The DC sign of a chroma coefficient, shared by both chroma sets.
     pub dc_sign_chroma: [[u16; 3]; 3],
     /// Whether an inter frame's block is coded as intra.
@@ -638,6 +653,7 @@ impl Cdfs {
             intra_tx_type_8: cdf::INTRA_TX_TYPE_SET2_8,
             inter_tx_type_32: cdf::INTER_TX_TYPE_SET3_32,
             inter_tx_type_16: cdf::INTER_TX_TYPE_SET3_16,
+            inter_tx_type_8: cdf::INTER_TX_TYPE_SET3_8,
             dc_sign_chroma: cdf::DC_SIGN_CHROMA,
             intra_inter: cdf::INTRA_INTER,
             single_ref: cdf::SINGLE_REF,
@@ -721,6 +737,17 @@ impl Cdfs {
                 br: &mut self.br_luma_8,
                 dc_sign: &mut self.dc_sign_luma,
                 tx_type: Some(self.intra_tx_type_8[mode].as_mut_slice()),
+            },
+            TxbSet::Luma8Inter => TxbTables {
+                side: 8,
+                txb_skip: &mut self.txb_skip_luma_8,
+                eob_pt: &mut self.eob_pt_64_luma,
+                eob_extra: &mut self.eob_extra_luma_8,
+                base: &mut self.base_luma_8,
+                base_eob: &mut self.base_eob_luma_8,
+                br: &mut self.br_luma_8,
+                dc_sign: &mut self.dc_sign_luma,
+                tx_type: Some(self.inter_tx_type_8.as_mut_slice()),
             },
             TxbSet::Chroma8 => TxbTables {
                 side: 8,
