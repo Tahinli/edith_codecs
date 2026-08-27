@@ -312,6 +312,20 @@ pub const UV_MODE_CFL: [[u16; 15]; 13] = [
 /// the spec's own table, is `AOM_ICDF`-inverted).
 pub const CFL_SIGN: [u16; 9] = [1418, 2123, 13340, 18405, 26972, 28343, 32294, 32768, 0];
 
+/// `default_filter_intra_cdfs` (entropymode.c), the `use_filter_intra` flag's
+/// prior, indexed by block-size class: `[0]`=4x4, `[1]`=8x8, `[2]`=16x16,
+/// `[3]`=32x32 -- the only square sizes `av1_filter_intra_allowed_bsize`
+/// (width and height both <=32) ever offers this decoder's square blocks.
+pub const FILTER_INTRA: [[u16; 3]; 4] = [
+    [4621, 32768, 0],
+    [7866, 32768, 0],
+    [12408, 32768, 0],
+    [22343, 32768, 0],
+];
+/// `default_filter_intra_mode_cdf` (entropymode.c): which of the five
+/// `FILTER_INTRA_MODES` a `use_filter_intra` block picks.
+pub const FILTER_INTRA_MODE: [u16; 6] = [8949, 12776, 17211, 29558, 32768, 0];
+
 /// `Default_Cfl_Alpha_Cdf` (spec 9.4): a `UV_CFL_PRED` block's per-plane
 /// alpha magnitude (spec 5.11.45's `cfl_alpha_u`/`cfl_alpha_v`), indexed by
 /// the joint sign's context (`CFL_CONTEXT_U`/`CFL_CONTEXT_V`,

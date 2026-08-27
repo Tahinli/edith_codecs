@@ -239,6 +239,11 @@ pub(crate) struct Cdfs {
     /// The two motion vector components' own tables: separate owned state,
     /// since spec 8.3.2 adapts one component without touching the other.
     pub mv_comp: [MvComponentCdfs; 2],
+    /// The `use_filter_intra` flag, indexed by block-size class (`[0]`=4x4,
+    /// `[1]`=8x8, `[2]`=16x16, `[3]`=32x32) -- see [`cdf::FILTER_INTRA`].
+    pub filter_intra: [[u16; 3]; 4],
+    /// Which `FILTER_INTRA_MODES` entry a `use_filter_intra` block picks.
+    pub filter_intra_mode: [u16; 6],
 }
 
 /// One motion vector component's adapting state (spec 9.4's `Default_Mv_*`,
@@ -643,6 +648,8 @@ impl Cdfs {
             drl_mode: cdf::DRL_MODE,
             mv_joint: cdf::MV_JOINT,
             mv_comp: [MvComponentCdfs::new(), MvComponentCdfs::new()],
+            filter_intra: cdf::FILTER_INTRA,
+            filter_intra_mode: cdf::FILTER_INTRA_MODE,
         }
     }
 
