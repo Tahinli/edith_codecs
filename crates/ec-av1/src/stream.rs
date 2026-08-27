@@ -46,7 +46,19 @@ use crate::encode::Picture;
 pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
     let mut parser = Av1Parser::new();
     let mut pictures = Vec::new();
-    let mut reference: Option<Picture> = None;
+    // Spec 7.20/7.4: each of the 8 reference slots remembers the picture a
+    // previous frame's `refresh_frame_flags` stored into it, exactly like the
+    // CDF slots below -- `LAST_FRAME` names a slot via `ref_frame_idx[0]`,
+    // not simply "the previous frame decoded"; a frame whose own predecessor
+    // didn't refresh that slot (an altref/hidden frame, or any GOP with more
+    // than one live reference) must keep predicting from whatever picture is
+    // still sitting there. Round 7's cdffwd hunt: a global `reference`
+    // overwritten every frame silently always used "the most recent decode"
+    // instead, producing a bit-exact motion vector into the WRONG picture --
+    // luma-only (chroma coincidentally shares this fixture's flat regions)
+    // and small-magnitude (the two pictures mostly agree), which is exactly
+    // what made it look like a rounding bug rather than a wrong reference.
+    let mut ref_slots: [Option<Picture>; NUM_REF_FRAMES] = std::array::from_fn(|_| None);
     // Spec 7.20/7.4: each of the 8 reference slots remembers the CDF state a
     // previous frame's `refresh_frame_flags` stored into it -- the frame's
     // own end-of-tile adapted table, or (when the frame set
@@ -204,7 +216,8 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 initial_cdfs,
             )?
         } else {
-            let reference = reference.as_ref().ok_or_else(|| {
+            let last_slot = header.ref_frame_idx[0] as usize;
+            let reference = ref_slots[last_slot].as_ref().ok_or_else(|| {
                 Error::unsupported(
                     "AV1 decode_stream",
                     "an inter frame with no key frame before it",
@@ -258,9 +271,9 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         for i in 0..NUM_REF_FRAMES {
             if header.refresh_frame_flags & (1 << i) != 0 {
                 cdf_slots[i] = Some(stored_cdfs.clone());
+                ref_slots[i] = Some(picture.clone());
             }
         }
-        reference = Some(picture.clone());
         pictures.push(picture);
     }
     Ok(pictures)
