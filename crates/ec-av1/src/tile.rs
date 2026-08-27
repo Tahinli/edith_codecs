@@ -2034,10 +2034,13 @@ pub fn sb_coeff_inter_frame_tile(
                             let at16 = (sr, sc);
                             let ctx16 = neighbours.partition_ctx(at16, SUB);
                             enc.symbol(PARTITION_NONE, &mut cdfs.partition_w16[ctx16]);
-                            write_inter_frame_intra_leaf(
+                            write_inter_frame_leaf(
                                 &mut enc,
                                 &mut cdfs,
                                 &mut neighbours,
+                                &mut grid,
+                                mi_cols,
+                                mi_rows,
                                 leaf,
                                 at16,
                                 &scan16,
@@ -2175,24 +2178,29 @@ pub fn sb_coeff_inter_frame_tile(
 }
 
 /// Writes one 16x16 leaf a straddling 32x32 quadrant's [`Quadrant::Split`]
-/// splits into, always through the inter frame's intra branch (spec
-/// `inter_frame_mode_info`'s intra branch, `is_inter` coded `false`): no
-/// `Luma16Inter` tx_type table exists yet for a genuine inter leaf at this
-/// size (see [`TxbSet::Luma32Inter`]'s doc comment), and these leaves only
-/// ever fill the sliver of real content a true edge lands in the middle of a
-/// 32x32 block, never a leaf a motion search chose on its own. Its own
-/// `PARTITION_NONE` symbol is already written, same contract as
+/// splits into: intra (spec `inter_frame_mode_info`'s intra branch, the only
+/// one this writer used to code here) or real inter (`is_inter` coded
+/// `true`), `NEARESTMV` only -- `NEWMV` at this size is this function's
+/// caller's to never build (`Quadrant::Split`'s `BlockCoeffs.inter`) -- same
+/// `single_ref`/mv-stack/DRL symbol chain as the whole-32x32 branch above,
+/// just at this leaf's own 4x4-mi window (`bw4`/`bh4` of 4, not 8) and coded
+/// through [`TxbSet::Luma16Inter`] rather than [`TxbSet::Luma32Inter`]. Its
+/// own `PARTITION_NONE` symbol is already written, same contract as
 /// [`write_block`].
-fn write_inter_frame_intra_leaf(
+#[allow(clippy::too_many_arguments)]
+fn write_inter_frame_leaf(
     enc: &mut SymbolEncoder,
     cdfs: &mut Cdfs,
     neighbours: &mut Neighbours,
+    grid: &mut MiGrid,
+    mi_cols: u32,
+    mi_rows: u32,
     block: &BlockCoeffs,
     at: (usize, usize),
     scan16: &Vec<u16>,
     scan8: &Vec<u16>,
 ) -> Result<()> {
-    if usize::from(block.mode) >= INTRA_MODES {
+    if block.inter.is_none() && usize::from(block.mode) >= INTRA_MODES {
         return Err(Error::unsupported(
             "AV1 tile",
             format!(
@@ -2204,26 +2212,86 @@ fn write_inter_frame_intra_leaf(
     /// `Y_MODE`'s size group (spec `Size_Group`, `common_data.h`'s
     /// `size_group_lookup[BLOCK_16X16]`) for this leaf's own size.
     const SIZE_GROUP_16: usize = 2;
+    /// `Ref_Frame_List`'s `LAST_FRAME` (spec 3): the only reference this
+    /// writer's single-reference chain ever names, same as the 32x32 branch.
+    const LAST_FRAME: i8 = 1;
 
     let (r, c) = at;
     let skip_ctx = usize::from(neighbours.above_skip[c]) + usize::from(neighbours.left_skip[r]);
     enc.symbol(usize::from(block.skip), &mut cdfs.skip[skip_ctx]);
 
     let (has_above, has_left) = (r > 0, c > 0);
-    let ii_ctx = intra_inter_ctx(
-        has_above,
-        has_left,
-        neighbours.above_inter[c],
-        neighbours.left_inter[r],
-    );
-    enc.symbol(0, &mut cdfs.intra_inter[ii_ctx]); // is_inter = false
+    let (above_inter, left_inter) = (neighbours.above_inter[c], neighbours.left_inter[r]);
+    let ii_ctx = intra_inter_ctx(has_above, has_left, above_inter, left_inter);
+    let is_inter = block.inter.is_some();
+    enc.symbol(usize::from(is_inter), &mut cdfs.intra_inter[ii_ctx]);
 
-    let mode = usize::from(block.mode);
-    enc.symbol(mode, &mut cdfs.y_mode[SIZE_GROUP_16]);
-    if (V_PRED..=D67_PRED).contains(&mode) {
-        enc.symbol(ANGLE_DELTA_ZERO, &mut cdfs.angle_delta[mode - V_PRED]);
+    let mode_for_tx;
+    if let Some(info) = block.inter {
+        let sr_ctx = single_ref_ctx(above_inter || left_inter);
+        enc.symbol(0, &mut cdfs.single_ref[sr_ctx][0]); // p1: forward
+        enc.symbol(0, &mut cdfs.single_ref[sr_ctx][2]); // p3: LAST/LAST2
+        enc.symbol(0, &mut cdfs.single_ref[sr_ctx][3]); // p4: LAST
+
+        let (mi_row, mi_col) = (r * SUB_MI as usize, c * SUB_MI as usize);
+        let stack = find_mv_stack(
+            grid,
+            mi_row,
+            mi_col,
+            SUB_MI as usize,
+            SUB_MI as usize,
+            LAST_FRAME,
+            mi_cols as usize,
+            mi_rows as usize,
+        );
+
+        let is_new_mv = matches!(info.mode, InterMode::NewMv);
+        if is_new_mv {
+            enc.symbol(0, &mut cdfs.new_mv[stack.new_mv_ctx]); // NEWMV
+        } else {
+            enc.symbol(1, &mut cdfs.new_mv[stack.new_mv_ctx]); // not new
+            enc.symbol(1, &mut cdfs.zero_mv[stack.zero_mv_ctx]); // not zero
+            enc.symbol(0, &mut cdfs.ref_mv[stack.ref_mv_ctx]); // NEARESTMV
+        }
+        if is_new_mv && stack.entries.len() > 1 {
+            enc.symbol(0, &mut cdfs.drl_mode[stack.drl_ctx[0]]);
+        }
+        let mv = if is_new_mv {
+            write_mv(
+                enc,
+                &mut cdfs.mv_comp,
+                &mut cdfs.mv_joint,
+                info.mv,
+                stack.pred_mv,
+            )?;
+            info.mv
+        } else {
+            stack.nearest_mv
+        };
+        for dr in 0..SUB_MI as usize {
+            for dc in 0..SUB_MI as usize {
+                grid.set(
+                    mi_row + dr,
+                    mi_col + dc,
+                    MiInfo {
+                        is_inter: true,
+                        ref_frame: LAST_FRAME,
+                        mv,
+                        is_new_mv,
+                    },
+                );
+            }
+        }
+        mode_for_tx = 0;
+    } else {
+        let mode = usize::from(block.mode);
+        enc.symbol(mode, &mut cdfs.y_mode[SIZE_GROUP_16]);
+        if (V_PRED..=D67_PRED).contains(&mode) {
+            enc.symbol(ANGLE_DELTA_ZERO, &mut cdfs.angle_delta[mode - V_PRED]);
+        }
+        enc.symbol(DC_PRED, &mut cdfs.uv_mode_cfl[mode]);
+        mode_for_tx = mode;
     }
-    enc.symbol(DC_PRED, &mut cdfs.uv_mode_cfl[mode]);
 
     if block.skip {
         let zero_grids = [
@@ -2231,7 +2299,7 @@ fn write_inter_frame_intra_leaf(
             vec![0i32; TX8 * TX8],
             vec![0i32; TX8 * TX8],
         ];
-        neighbours.record(at, SUB, mode, &zero_grids);
+        neighbours.record(at, SUB, mode_for_tx, &zero_grids);
     } else {
         let grids = [
             level_grid(&block.luma, TX16)?,
@@ -2241,15 +2309,19 @@ fn write_inter_frame_intra_leaf(
         write_block_planes(
             enc,
             cdfs,
-            &[TxbSet::Luma16, TxbSet::Chroma8, TxbSet::Chroma8],
+            if is_inter {
+                &[TxbSet::Luma16Inter, TxbSet::Chroma8, TxbSet::Chroma8]
+            } else {
+                &[TxbSet::Luma16, TxbSet::Chroma8, TxbSet::Chroma8]
+            },
             &grids,
             &[scan16, scan8, scan8],
             &neighbours.around(at, SUB),
-            mode,
+            mode_for_tx,
         );
-        neighbours.record(at, SUB, mode, &grids);
+        neighbours.record(at, SUB, mode_for_tx, &grids);
     }
-    neighbours.record_inter(at, SUB, block.skip, false);
+    neighbours.record_inter(at, SUB, block.skip, is_inter);
     Ok(())
 }
 

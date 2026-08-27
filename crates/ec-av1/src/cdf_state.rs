@@ -31,6 +31,12 @@ pub(crate) enum TxbSet {
     Luma64,
     /// The 16x16 luma transform of a 16x16 block.
     Luma16,
+    /// The 16x16 luma transform of an `is_inter` 16x16 block, coded under
+    /// `reduced_tx_set` (see [`crate::cdf::INTER_TX_TYPE_SET3_16`]'s doc
+    /// comment): the same coefficient tables [`Luma16`](TxbSet::Luma16)
+    /// reads, but its own two-symbol `tx_type` table rather than `Luma16`'s
+    /// five-symbol, mode-indexed one.
+    Luma16Inter,
     /// The 8x8 transform of a chroma plane of a 16x16 block.
     Chroma8,
     /// The 16x16 transform of a chroma plane of a 32x32 block.
@@ -160,6 +166,10 @@ pub(crate) struct Cdfs {
     /// `TX_SET_INTER_3`, `TX_32X32` row) -- unlike the intra 16x16 table, it
     /// is not indexed by mode.
     pub inter_tx_type_32: [u16; 3],
+    /// The transform type of an `is_inter` 16x16 luma transform under
+    /// `reduced_tx_set` (spec `TX_SET_INTER_3`, `TX_16X16` row) -- not
+    /// indexed by mode, same as [`Self::inter_tx_type_32`].
+    pub inter_tx_type_16: [u16; 3],
     /// The DC sign of a chroma coefficient, shared by both chroma sets.
     pub dc_sign_chroma: [[u16; 3]; 3],
     /// Whether an inter frame's block is coded as intra.
@@ -487,6 +497,7 @@ impl Cdfs {
             dc_sign_luma: cdf::DC_SIGN_LUMA,
             intra_tx_type_16: cdf::INTRA_TX_TYPE_SET2_16,
             inter_tx_type_32: cdf::INTER_TX_TYPE_SET3_32,
+            inter_tx_type_16: cdf::INTER_TX_TYPE_SET3_16,
             dc_sign_chroma: cdf::DC_SIGN_CHROMA,
             intra_inter: cdf::INTRA_INTER,
             single_ref: cdf::SINGLE_REF,
@@ -546,6 +557,17 @@ impl Cdfs {
                 br: &mut self.br_luma_16,
                 dc_sign: &mut self.dc_sign_luma,
                 tx_type: Some(self.intra_tx_type_16[mode].as_mut_slice()),
+            },
+            TxbSet::Luma16Inter => TxbTables {
+                side: 16,
+                txb_skip: &mut self.txb_skip_luma_16,
+                eob_pt: &mut self.eob_pt_256_luma,
+                eob_extra: &mut self.eob_extra_luma_16,
+                base: &mut self.base_luma_16,
+                base_eob: &mut self.base_eob_luma_16,
+                br: &mut self.br_luma_16,
+                dc_sign: &mut self.dc_sign_luma,
+                tx_type: Some(self.inter_tx_type_16.as_mut_slice()),
             },
             TxbSet::Chroma8 => TxbTables {
                 side: 8,
