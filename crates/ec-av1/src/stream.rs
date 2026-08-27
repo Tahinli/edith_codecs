@@ -10,26 +10,11 @@
 //! are `pub(crate)`, and rightly so: the wire is `stream`, everything else is
 //! an implementation detail of how this crate happens to build it).
 
-use ec_av1_syntax::{Av1Parser, CdefParams, FrameType, ObuKind, TxMode};
+use ec_av1_syntax::{Av1Parser, FrameType, ObuKind, TxMode};
 use ec_core::{Error, Result};
 
 use crate::decode::{decode_inter_frame_tile, decode_key_frame_tile};
 use crate::encode::Picture;
-
-/// Whether a frame's CDEF parameters would actually filter any samples —
-/// `1 << bits` strength pairs are declared, but only the used ones (any
-/// non-zero primary/secondary strength) matter; `read_cdef_params` already
-/// zeroes every field when CDEF is off for the frame (lossless, intrabc, or
-/// the sequence header disabling it), so a plain field check is enough.
-fn cdef_is_active(cdef: &CdefParams) -> bool {
-    let n = 1usize << cdef.bits;
-    (0..n).any(|i| {
-        cdef.y_pri_strength[i] != 0
-            || cdef.y_sec_strength[i] != 0
-            || cdef.uv_pri_strength[i] != 0
-            || cdef.uv_sec_strength[i] != 0
-    })
-}
 
 /// Decode every frame in a raw AV1 OBU stream, in coding order.
 ///
@@ -63,16 +48,19 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         let tile = tiles.first().ok_or_else(|| {
             Error::unsupported("AV1 decode_stream", "a frame OBU with no tile group")
         })?;
-        // Neither tile decoder applies the in-loop CDEF filter (spec 7.15):
-        // its `cdef_idx` syntax needs no bits when `cdef_bits == 0` (this
-        // crate's own writer's only case), so a real libaom stream with an
-        // active strength decodes with the bitstream in sync but the wrong
-        // pixels — decodes-but-wrong, worse than a refusal. Refuse before
-        // that happens rather than let it through silently.
-        if cdef_is_active(&header.cdef) {
+        // `read_cdef` (spec `decodeframe.c`, called at the first non-skip
+        // block of each 64x64) only reads a literal `cdef_idx` when
+        // `cdef_bits > 0`; at `cdef_bits == 0` there is nothing to read (this
+        // crate's own writer's only case, and both `lane-av1cdef` gate
+        // streams'), so the per-block symbol this crate's tile readers never
+        // consume is a true no-op there. A `cdef_bits > 0` stream would
+        // desync the moment it hit a real strength selector this decoder
+        // never reads — refuse that by name rather than silently miscode,
+        // the same pattern as the other round-2 refusals below.
+        if header.cdef.bits != 0 {
             return Err(Error::unsupported(
                 "AV1 decode_stream",
-                "a frame with an active CDEF filter (not yet applied by this decoder)",
+                "a frame with cdef_bits > 0 (this decoder never reads the per-64x64 cdef_idx symbol)",
             ));
         }
         // Every `decode_block` call below assumes the block's transform is
@@ -139,6 +127,7 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 header.frame_width,
                 header.frame_height,
                 enable_filter_intra,
+                &header.cdef,
             )?
         } else {
             let reference = reference.as_ref().ok_or_else(|| {
@@ -155,6 +144,7 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 header.frame_width,
                 header.frame_height,
                 reference,
+                &header.cdef,
             )?
         };
         reference = Some(picture.clone());
@@ -221,6 +211,7 @@ mod tests {
                 width as u32,
                 height as u32,
                 false,
+                &ec_av1_syntax::CdefParams::default(),
             )
             .unwrap();
             let via_stream = decode_stream(&encoded.stream).unwrap();
@@ -576,6 +567,54 @@ mod tests {
         assert_eq!(frames[0].y, ffmpeg_frames[0].y, "luma vs ffmpeg");
         assert_eq!(frames[0].u, ffmpeg_frames[0].u, "U vs ffmpeg");
         assert_eq!(frames[0].v, ffmpeg_frames[0].v, "V vs ffmpeg");
+    }
+
+    /// As [`a_real_libaom_gradients_stream_decodes_pixel_exact`], but leaves
+    /// CDEF *on* (no `-enable-cdef 0`) -- the whole point of `lane-av1cdef`:
+    /// proves `apply_cdef` itself, not just that this decoder still works
+    /// when the filter never fires. Gradient content at a low crf reliably
+    /// gives libaom something to dering. If a run happens to land on
+    /// `cdef_bits > 0` (per-64x64 `cdef_idx`, still unimplemented -- see the
+    /// refusal in `decode_stream`) the stream is skipped rather than failed:
+    /// that gap is named by the refusal's own error text, not silently
+    /// swallowed here.
+    #[test]
+    fn a_real_libaom_gradients_stream_with_cdef_decodes_pixel_exact() {
+        if !have_ffmpeg() {
+            eprintln!(
+                "SKIP a_real_libaom_gradients_stream_with_cdef_decodes_pixel_exact: no ffmpeg"
+            );
+            return;
+        }
+        let (width, height) = (64, 64);
+        let stream = libaom_encode_with(
+            "gradients=size=64x64:c0=red:c1=blue:c2=green:rate=1:seed=42",
+            width,
+            height,
+            30,
+            &[
+                "-threads",
+                "1",
+                "-row-mt",
+                "0",
+                "-tile-columns",
+                "0",
+                "-tile-rows",
+                "0",
+            ],
+        )
+        .expect("ffmpeg encode");
+        match decode_stream(&stream) {
+            Ok(frames) => {
+                let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
+                assert_eq!(frames[0].y, ffmpeg_frames[0].y, "luma vs ffmpeg (CDEF on)");
+                assert_eq!(frames[0].u, ffmpeg_frames[0].u, "U vs ffmpeg (CDEF on)");
+                assert_eq!(frames[0].v, ffmpeg_frames[0].v, "V vs ffmpeg (CDEF on)");
+            }
+            Err(e) => {
+                eprintln!("SKIP a_real_libaom_gradients_stream_with_cdef_decodes_pixel_exact: {e}");
+            }
+        }
     }
 
     /// scratch: isolate a pinned mismatching stream's first divergent pixel.
