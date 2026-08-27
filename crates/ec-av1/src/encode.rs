@@ -259,6 +259,10 @@ pub(crate) fn crop_encoded(encoded: &Encoded, width: usize, height: usize) -> En
         modes: encoded.modes.clone(),
         inter_block_share: encoded.inter_block_share,
         reconstruction: cropped,
+        tile: encoded.tile.clone(),
+        mi_cols: encoded.mi_cols,
+        mi_rows: encoded.mi_rows,
+        base_q_idx: encoded.base_q_idx,
     }
 }
 
@@ -280,6 +284,14 @@ pub struct Encoded {
     /// for a key frame, which has no such choice — so a caller can tell a
     /// frame with no motion worth coding from one that never got the chance.
     pub inter_block_share: f64,
+    /// The tile payload alone, undecorated by any OBU framing, and the frame
+    /// header fields a decoder of it needs: `mi_cols`/`mi_rows`/`base_q_idx`.
+    /// `crate::decode`'s tests are the only reader; a real decoder gets these
+    /// off the wire by parsing `stream`'s OBUs instead.
+    pub(crate) tile: Vec<u8>,
+    pub(crate) mi_cols: u32,
+    pub(crate) mi_rows: u32,
+    pub(crate) base_q_idx: u8,
 }
 
 /// The sequence and frame headers a picture of this size is coded under: one
@@ -1754,6 +1766,10 @@ pub(crate) fn encode_key_frame_inner(
             u: u.reconstruction,
             v: v.reconstruction,
         },
+        tile,
+        mi_cols: header.mi_cols,
+        mi_rows: header.mi_rows,
+        base_q_idx,
     })
 }
 
@@ -2586,6 +2602,10 @@ pub(crate) fn encode_inter_frame(
             u: u.reconstruction,
             v: v.reconstruction,
         },
+        tile,
+        mi_cols: header.mi_cols,
+        mi_rows: header.mi_rows,
+        base_q_idx,
     })
 }
 
