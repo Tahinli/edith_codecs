@@ -1,6 +1,6 @@
 //! `residual_coding()` (7.3.8.11) and the scan orders it walks (6.5.3 - 6.5.5).
 
-use crate::cabac::{CabacEncoder, CabacState, ctx};
+use crate::cabac::{CabacDecoder, CabacEncoder, CabacState, ctx};
 use crate::transform::{coeff_ssd_scale, dequant_level, ideal_level};
 use std::sync::LazyLock;
 
@@ -586,6 +586,264 @@ pub fn encode_residual(
     }
 }
 
+/// Inverse of [`encode_remaining`]: read one `coeff_abs_level_remaining` back
+/// off the bypass bins (9.3.3.11).
+fn decode_remaining(dec: &mut CabacDecoder, rice: u32) -> u32 {
+    let mut prefix = 0u32;
+    while prefix < 4 {
+        if dec.decode_bypass() == 0 {
+            break;
+        }
+        prefix += 1;
+    }
+    if prefix < 4 {
+        let suffix = if rice > 0 {
+            dec.decode_bypass_bits(rice)
+        } else {
+            0
+        };
+        (prefix << rice) + suffix
+    } else {
+        let c_max = 4 << rice;
+        let mut k = rice + 1;
+        let mut rest = 0u32;
+        loop {
+            if dec.decode_bypass() == 1 {
+                rest += 1 << k;
+                k += 1;
+            } else {
+                rest += dec.decode_bypass_bits(k);
+                break;
+            }
+        }
+        c_max + rest
+    }
+}
+
+/// Decode one transform block's levels — the mirror of [`encode_residual`],
+/// read bin for bin through the same context derivations so the same
+/// bitstream that a [`CabacEncoder`] wrote comes back out as the same
+/// `levels`.
+///
+/// `levels` must already be zeroed and at least `n * n` long. Returns whether
+/// `transform_skip_flag` was present and set (only possible at `log2_size ==
+/// 2` and only when `transform_skip_enabled` is true, i.e. the PPS turned the
+/// syntax element on).
+pub fn decode_residual(
+    dec: &mut CabacDecoder,
+    levels: &mut [i32],
+    log2_size: u32,
+    c_idx: usize,
+    scan_idx: usize,
+    sign_hiding: bool,
+    transform_skip_enabled: bool,
+) -> bool {
+    let mut transform_skip = false;
+    if transform_skip_enabled && log2_size == 2 {
+        let ctx_idx = ctx::TRANSFORM_SKIP + if c_idx == 0 { 0 } else { 1 };
+        transform_skip = dec.decode_bin(ctx_idx) != 0;
+    }
+    let n = 1usize << log2_size;
+    let sub_wide = n >> 2;
+    let sub_scan = scan(log2_size - 2, scan_idx);
+    let pos_scan = scan(2, scan_idx);
+    let chroma = c_idx > 0;
+
+    let (offset, shift) = if c_idx == 0 {
+        (
+            3 * (log2_size - 2) + ((log2_size - 1) >> 2),
+            (log2_size + 1) >> 2,
+        )
+    } else {
+        (15, log2_size - 2)
+    };
+    let c_max = (log2_size << 1) - 1;
+    let decode_prefix = |dec: &mut CabacDecoder, base: usize| -> u32 {
+        let mut prefix = 0u32;
+        while prefix < c_max {
+            let ctx_idx = base + ((prefix >> shift) + offset) as usize;
+            if dec.decode_bin(ctx_idx) == 0 {
+                break;
+            }
+            prefix += 1;
+        }
+        prefix
+    };
+    let x_prefix = decode_prefix(dec, ctx::LAST_X);
+    let y_prefix = decode_prefix(dec, ctx::LAST_Y);
+    let decode_coord = |dec: &mut CabacDecoder, prefix: u32| -> u32 {
+        if prefix < 4 {
+            prefix
+        } else {
+            let suffix_bits = (prefix >> 1) - 1;
+            let base = (1 << suffix_bits) * (2 + (prefix & 1));
+            base + dec.decode_bypass_bits(suffix_bits)
+        }
+    };
+    let mut last_x = decode_coord(dec, x_prefix);
+    let mut last_y = decode_coord(dec, y_prefix);
+    if scan_idx == 2 {
+        std::mem::swap(&mut last_x, &mut last_y);
+    }
+    let (xs0, ys0) = (last_x as usize / 4, last_y as usize / 4);
+    let last_sub = sub_scan
+        .iter()
+        .position(|&(a, b)| a as usize == xs0 && b as usize == ys0)
+        .expect("last coordinate's sub-block is in the scan");
+    let (xp0, yp0) = (last_x as usize % 4, last_y as usize % 4);
+    let last_pos = pos_scan
+        .iter()
+        .position(|&(a, b)| a as usize == xp0 && b as usize == yp0)
+        .expect("last coordinate's position is in the sub-block scan");
+
+    let mut csbf = [false; 64];
+    let (dc_xs, dc_ys) = sub_scan[0];
+    csbf[dc_ys as usize * sub_wide + dc_xs as usize] = true;
+
+    let mut greater1_ctx = 1u32;
+    for i in (0..=last_sub).rev() {
+        let (xs, ys) = sub_scan[i];
+        let (xs, ys) = (xs as usize, ys as usize);
+        let mut infer_dc_sig = false;
+        let coded = if i == last_sub {
+            true
+        } else if i == 0 {
+            true
+        } else {
+            let mut csbf_ctx = 0;
+            if xs < sub_wide - 1 && csbf[ys * sub_wide + xs + 1] {
+                csbf_ctx += 1;
+            }
+            if ys < sub_wide - 1 && csbf[(ys + 1) * sub_wide + xs] {
+                csbf_ctx += 1;
+            }
+            let inc = if chroma {
+                2 + csbf_ctx.min(1)
+            } else {
+                csbf_ctx.min(1)
+            };
+            infer_dc_sig = true;
+            dec.decode_bin(ctx::CODED_SUB_BLOCK + inc) != 0
+        };
+        csbf[ys * sub_wide + xs] = coded;
+        if !coded {
+            continue;
+        }
+
+        let mut significant = [false; 16];
+        if i == last_sub {
+            significant[last_pos] = true;
+        }
+        let first = if i == last_sub {
+            last_pos as i32 - 1
+        } else {
+            15
+        };
+        let mut scan_pos = first;
+        while scan_pos >= 0 {
+            let p = scan_pos as usize;
+            scan_pos -= 1;
+            let (xp, yp) = pos_scan[p];
+            let xc = xs * 4 + xp as usize;
+            let yc = ys * 4 + yp as usize;
+            let sig = if p > 0 || !infer_dc_sig {
+                let inc = sig_ctx_inc(xc, yc, xs, ys, sub_wide, &csbf, log2_size, c_idx, scan_idx);
+                dec.decode_bin(ctx::SIG_COEFF + inc) != 0
+            } else {
+                false // filled in by the post-loop inference below
+            };
+            significant[p] = sig;
+            if sig {
+                infer_dc_sig = false;
+            }
+        }
+        if infer_dc_sig {
+            significant[0] = true;
+        }
+
+        let mut order = [0usize; 16];
+        let mut order_len = 0;
+        for p in (0..16).rev() {
+            if significant[p] {
+                order[order_len] = p;
+                order_len += 1;
+            }
+        }
+        let order = &order[..order_len];
+        if order.is_empty() {
+            continue;
+        }
+
+        let mut ctx_set = if i == 0 || chroma { 0 } else { 2 };
+        if greater1_ctx == 0 {
+            ctx_set += 1;
+        }
+        greater1_ctx = 1;
+        let mut last_greater1 = None;
+        let mut greater1 = [false; 16];
+        for &p in order.iter().take(8) {
+            let inc = ctx_set * 4 + greater1_ctx.min(3) + if chroma { 16 } else { 0 };
+            let flag = dec.decode_bin(ctx::GREATER1 + inc as usize) != 0;
+            greater1[p] = flag;
+            if flag {
+                if last_greater1.is_none() {
+                    last_greater1 = Some(p);
+                }
+                greater1_ctx = 0;
+            } else if greater1_ctx > 0 {
+                greater1_ctx += 1;
+            }
+        }
+
+        let mut greater2 = false;
+        if last_greater1.is_some() {
+            let inc = ctx_set + if chroma { 4 } else { 0 };
+            greater2 = dec.decode_bin(ctx::GREATER2 + inc as usize) != 0;
+        }
+
+        let hidden = sign_hiding && order[0] - order[order_len - 1] > 3;
+        let mut signs = [false; 16];
+        for (k, &p) in order.iter().enumerate() {
+            if hidden && k == order_len - 1 {
+                continue;
+            }
+            signs[p] = dec.decode_bypass() != 0;
+        }
+
+        let mut magnitude = [0u32; 16];
+        let mut rice = 0u32;
+        for (num_sig, &p) in order.iter().enumerate() {
+            let coded_greater1 = num_sig < 8;
+            let mut level = 1
+                + u32::from(coded_greater1 && greater1[p])
+                + u32::from(last_greater1 == Some(p) && greater2);
+            let threshold = if num_sig < 8 {
+                if last_greater1 == Some(p) { 3 } else { 2 }
+            } else {
+                1
+            };
+            if level == threshold {
+                let remaining = decode_remaining(dec, rice);
+                rice = (rice + u32::from(level + remaining > (3 << rice))).min(4);
+                level += remaining;
+            }
+            magnitude[p] = level;
+        }
+        if hidden {
+            let last = order[order_len - 1];
+            let sum: u32 = order.iter().map(|&p| magnitude[p]).sum();
+            signs[last] = sum & 1 == 1;
+        }
+        for &p in order {
+            let (xp, yp) = pos_scan[p];
+            let (xc, yc) = (xs * 4 + xp as usize, ys * 4 + yp as usize);
+            let value = magnitude[p] as i32;
+            levels[yc * n + xc] = if signs[p] { -value } else { value };
+        }
+    }
+    transform_skip
+}
+
 /// `ctxInc` for `sig_coeff_flag` (9.3.4.2.5).
 #[allow(clippy::too_many_arguments)]
 fn sig_ctx_inc(
@@ -743,6 +1001,66 @@ mod tests {
         }
         assert!(costs[0] < costs[1], "{costs:?}");
         assert!(costs[0] > 0);
+    }
+
+    #[test]
+    fn decode_residual_inverts_encode_residual() {
+        use crate::cabac::CabacDecoder;
+        for log2 in 2..=5u32 {
+            let n = 1usize << log2;
+            for scan_idx in 0..3 {
+                for c_idx in [0usize, 1] {
+                    for sign_hiding in [false, true] {
+                        let mut levels = vec![0i32; n * n];
+                        for (i, v) in levels.iter_mut().enumerate() {
+                            *v = match i % 11 {
+                                0 => 0,
+                                1 => 1,
+                                2 => -2,
+                                3 => 3,
+                                4 => -17,
+                                5 => 400,
+                                6 => -1,
+                                _ => 0,
+                            };
+                        }
+                        if sign_hiding {
+                            let coeffs = levels.clone();
+                            hide_signs(&coeffs, &mut levels, n, 27, scan_idx);
+                        }
+                        let mut enc = CabacEncoder::new(Contexts::new(27));
+                        encode_residual(
+                            &mut enc,
+                            &levels,
+                            log2,
+                            c_idx,
+                            scan_idx,
+                            sign_hiding,
+                            false,
+                        );
+                        enc.encode_terminate(1);
+                        let bytes = enc.finish();
+
+                        let mut dec = CabacDecoder::new(&bytes, Contexts::new(27));
+                        let mut decoded = vec![0i32; n * n];
+                        decode_residual(
+                            &mut dec,
+                            &mut decoded,
+                            log2,
+                            c_idx,
+                            scan_idx,
+                            sign_hiding,
+                            false,
+                        );
+                        assert_eq!(dec.decode_terminate(), 1);
+                        assert_eq!(
+                            decoded, levels,
+                            "log2={log2} scan={scan_idx} c_idx={c_idx} sign_hiding={sign_hiding}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
