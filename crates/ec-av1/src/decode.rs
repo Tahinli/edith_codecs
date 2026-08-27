@@ -381,16 +381,36 @@ fn read_coeffs(
 /// [`crate::tile`]'s own private `Neighbour`.
 #[derive(Clone, Copy, Default)]
 struct Neighbour {
-    coded: bool,
+    /// The transform unit's cumulative coefficient level (spec `cul_level`,
+    /// `decodetxb.c`'s `read_coeffs_txb`): the sum of every coded level's
+    /// magnitude, clamped to `COEFF_CONTEXT_MASK` (7). A plain "coded or not"
+    /// boolean (`level != 0`) is enough for every context this decoder read
+    /// until now, but the *luma* `txb_skip_ctx` of a transform unit smaller
+    /// than its own block (`TxMode::Select`, spec `get_txb_ctx_general`)
+    /// needs the actual magnitude tier of its above/left neighbours, not
+    /// just whether they coded anything.
+    level: u8,
     dc: Option<bool>,
 }
 
 fn neighbour_state(grid: &[i32]) -> Neighbour {
+    let cul: u32 = grid.iter().map(|&l| l.unsigned_abs()).sum();
     Neighbour {
-        coded: grid.iter().any(|&l| l != 0),
+        level: cul.min(7) as u8,
         dc: (grid[0] != 0).then_some(grid[0] < 0),
     }
 }
+
+/// spec `get_txb_ctx_general`'s `skip_contexts[top][left]` table (plane 0,
+/// transform unit smaller than the block it sits in): `top`/`left` are the
+/// above/left neighbours' magnitude tiers, each already clamped to 4.
+const SKIP_CONTEXTS: [[usize; 5]; 5] = [
+    [1, 2, 2, 2, 3],
+    [2, 4, 4, 4, 5],
+    [2, 4, 4, 4, 5],
+    [2, 4, 4, 4, 5],
+    [3, 5, 5, 5, 6],
+];
 
 /// The neighbour state a block's contexts are read from — a duplicate of
 /// [`crate::tile`]'s own private `Neighbours` (that module is another lane's
@@ -601,12 +621,35 @@ impl Neighbours {
             for cell in 0..side_mi {
                 let above = &self.above[mi_c + cell][plane];
                 let left = &self.left[mi_r + cell][plane];
-                above_coded |= above.coded;
-                left_coded |= left.coded;
+                above_coded |= above.level != 0;
+                left_coded |= left.level != 0;
                 vote += dc_vote(above.dc) + dc_vote(left.dc);
             }
             (above_coded, left_coded, vote)
         })
+    }
+
+    /// The luma `txb_skip_ctx` of a transform unit smaller than its own block
+    /// (spec `get_txb_ctx_general`, plane 0, `plane_bsize != tx_size`): the
+    /// above/left neighbours' magnitude tiers, OR-reduced over the unit's own
+    /// span and each clamped to 4, indexed into [`SKIP_CONTEXTS`]. Unlike
+    /// [`Self::around_mi`]'s plain coded/uncoded bit, this needs the real
+    /// cumulative level -- a lone-TU block never calls this (its `txb_skip_ctx`
+    /// is always 0, spec's `plane_bsize == tx_size` branch).
+    fn luma_skip_ctx(&self, (mi_r, mi_c): (usize, usize), side_mi: usize) -> usize {
+        let mut top = 0u8;
+        let mut left = 0u8;
+        for cell in 0..side_mi {
+            top |= self.above[mi_c + cell][0].level;
+            left |= self.left[mi_r + cell][0].level;
+        }
+        let ctx = SKIP_CONTEXTS[(top as usize).min(4)][(left as usize).min(4)];
+        if std::env::var_os("EC_AV1_TRACE").is_some() {
+            eprintln!(
+                "TRACE luma_skip_ctx mi=({mi_r},{mi_c}) side_mi={side_mi} top={top} left={left} ctx={ctx}"
+            );
+        }
+        ctx
     }
 
     /// Writes one coded block into every cell it covers, on both grids: the
@@ -1032,9 +1075,16 @@ fn read_plane(
     base_q_idx: u8,
     cfl: Option<(i32, &[i32])>,
     filter_intra: Option<usize>,
+    // Only meaningful for `plane_idx == 0`: `Some` when this transform unit is
+    // smaller than its own block (spec `get_txb_ctx_general`'s
+    // `plane_bsize != tx_size` branch), carrying the already-looked-up
+    // `SKIP_CONTEXTS` value; `None` everywhere else (a lone luma TU, or any
+    // chroma plane), where `txb_skip_ctx` is 0 or the usual OR-of-neighbours
+    // formula below.
+    luma_skip_ctx: Option<usize>,
 ) -> Result<Vec<i32>> {
     let skip_ctx = if plane_idx == 0 {
-        0
+        luma_skip_ctx.unwrap_or(0)
     } else {
         usize::from(around.0) + usize::from(around.1)
     };
@@ -1215,6 +1265,7 @@ fn decode_block(
             base_q_idx,
             None,
             filter_intra,
+            None,
         )?;
         let ac = alpha.map(|_| cfl_ac_q3(y, px, py, side));
         let u_grid = read_plane(
@@ -1235,6 +1286,7 @@ fn decode_block(
             base_q_idx,
             alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
             None,
+            None,
         )?;
         let v_grid = read_plane(
             dec,
@@ -1253,6 +1305,7 @@ fn decode_block(
             chroma_tx,
             base_q_idx,
             alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
+            None,
             None,
         )?;
         neighbours.record(at, side, mode, &[luma_grid, u_grid, v_grid]);
@@ -1274,6 +1327,11 @@ fn decode_block(
                 let tu_py = py + tu_row * logical_tx;
                 let tu_around = neighbours.around_mi(tu_mi, logical_tx)[0];
                 let tu_reach = Reach::of(logical_tx, tu_px, tu_py, y.width, y.height);
+                // This transform unit's own bsize (`logical_tx`) is smaller
+                // than the block it sits in (`side`), so `txb_skip_ctx` is
+                // the neighbour-magnitude table, not the lone-TU 0 (spec
+                // `get_txb_ctx_general`'s `plane_bsize != tx_size` branch).
+                let tu_skip_ctx = neighbours.luma_skip_ctx(tu_mi, logical_tx / MI);
                 let tu_grid = read_plane(
                     dec,
                     cdfs,
@@ -1292,6 +1350,7 @@ fn decode_block(
                     base_q_idx,
                     None,
                     filter_intra,
+                    Some(tu_skip_ctx),
                 )?;
                 neighbours.record_mi_luma(tu_mi, logical_tx, &tu_grid);
             }
@@ -1316,6 +1375,7 @@ fn decode_block(
             base_q_idx,
             alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
             None,
+            None,
         )?;
         let v_grid = read_plane(
             dec,
@@ -1334,6 +1394,7 @@ fn decode_block(
             chroma_tx,
             base_q_idx,
             alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
+            None,
             None,
         )?;
         neighbours.record_split_luma(at, side, mode, [&u_grid, &v_grid]);
@@ -1458,6 +1519,7 @@ fn decode_leaf8(
             base_q_idx,
             None,
             filter_intra,
+            None,
         )?;
         let ac = alpha.map(|_| cfl_ac_q3(y, px, py, 8));
         u_grid = read_plane(
@@ -1478,6 +1540,7 @@ fn decode_leaf8(
             base_q_idx,
             alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
             None,
+            None,
         )?;
         v_grid = read_plane(
             dec,
@@ -1496,6 +1559,7 @@ fn decode_leaf8(
             TX4,
             base_q_idx,
             alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
+            None,
             None,
         )?;
     }
@@ -2570,6 +2634,12 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                     let ctx16 = neighbours.partition_ctx(at16, SUB);
                                     if has_cols16 && has_rows16 {
                                         let part16 = dec.symbol(&mut cdfs.partition_w16[ctx16]);
+                                        if std::env::var_os("EC_AV1_TRACE").is_some() {
+                                            eprintln!(
+                                                "TRACE partition_w16 mi=({},{}) ctx={ctx16} value={part16}",
+                                                at16.0, at16.1
+                                            );
+                                        }
                                         if part16 == PARTITION_NONE {
                                             decode_block(
                                                 &mut dec,
@@ -3265,6 +3335,7 @@ fn decode_inter_block(
                 base_q_idx,
                 None,
                 None,
+                None,
             )?;
             let ac = alpha.map(|_| cfl_ac_q3(y, px, py, side));
             u_grid = read_plane(
@@ -3285,6 +3356,7 @@ fn decode_inter_block(
                 base_q_idx,
                 alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
                 None,
+                None,
             )?;
             v_grid = read_plane(
                 dec,
@@ -3303,6 +3375,7 @@ fn decode_inter_block(
                 chroma_tx,
                 base_q_idx,
                 alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
+                None,
                 None,
             )?;
         }
@@ -3660,6 +3733,7 @@ fn decode_inter_block8(
                 base_q_idx,
                 None,
                 None,
+                None,
             )?;
             u_grid = read_plane(
                 dec,
@@ -3679,6 +3753,7 @@ fn decode_inter_block8(
                 base_q_idx,
                 None,
                 None,
+                None,
             )?;
             v_grid = read_plane(
                 dec,
@@ -3696,6 +3771,7 @@ fn decode_inter_block8(
                 CHROMA_SIDE,
                 TX4,
                 base_q_idx,
+                None,
                 None,
                 None,
             )?;
