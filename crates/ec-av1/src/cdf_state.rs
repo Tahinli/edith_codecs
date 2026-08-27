@@ -150,6 +150,10 @@ pub(crate) struct Cdfs {
     pub br_chroma_4: [[u16; 5]; 21],
     /// The partition symbol of a 16x16 block.
     pub partition_w16: [[u16; 11]; 4],
+    /// The partition symbol of an 8x8 block (lane-av1-rect): only
+    /// `PARTITION_NONE` is ever coded against it, but the alphabet still
+    /// adapts on every read, same as every other partition table.
+    pub partition_w8: [[u16; 5]; 4],
     /// The one-context all-zero flag of a 32x32 luma transform.
     pub txb_skip_luma_32: [[u16; 3]; 1],
     /// The same, for a 64x64 luma transform.
@@ -463,6 +467,7 @@ impl Cdfs {
                 cdf::COEFF_BR_CHROMA_4_Q3,
             ),
             partition_w16: cdf::PARTITION_W16,
+            partition_w8: cdf::PARTITION_W8,
             txb_skip_luma_32: [pick(
                 q_ctx,
                 cdf::TXB_SKIP_LUMA_32_Q0,
