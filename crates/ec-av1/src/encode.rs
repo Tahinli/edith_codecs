@@ -1162,26 +1162,39 @@ fn code_square(
     )
 }
 
-/// Codes one 16x16 leaf of a straddling 32x32 quadrant as whichever costs
-/// least of intra ([`code_square`], unchanged) or `NEARESTMV` against
-/// `reference` at `stack.nearest_mv` -- the same NEARESTMV candidate
-/// [`search_inter_block`] prices for a whole 32x32 block, just at this leaf's
-/// own 16x16 side and through [`TxbSet::Luma16Inter`]. `NEWMV` (a motion
-/// search of its own) is not attempted here: these leaves only ever fill the
-/// sliver of real content a true edge lands in the middle of a 32x32 block,
-/// not a leaf worth a full search, so `NEARESTMV`-or-intra is this function's
-/// deliberate first cut (see `write_inter_frame_leaf`'s doc comment).
+/// Codes one leaf of a straddling quadrant as whichever costs least of intra
+/// ([`code_square`], unchanged) or `NEARESTMV` against `reference` at
+/// `stack.nearest_mv` -- the same NEARESTMV candidate [`search_inter_block`]
+/// prices for a whole 32x32 block, just at this leaf's own `side` (16, for a
+/// 16x16 leaf under a straddling 32x32 quadrant, or 8, for an 8x8 leaf under
+/// a straddling 16x16 -- lane-av1inter8) and through [`TxbSet::Luma16Inter`]
+/// or [`TxbSet::Luma8Inter`]. `NEWMV` (a motion search of its own) is not
+/// attempted here: these leaves only ever fill the sliver of real content a
+/// true edge lands in the middle of a larger block, not a leaf worth a full
+/// search, so `NEARESTMV`-or-intra is this function's deliberate first cut
+/// (see `write_inter_frame_leaf`'s doc comment).
 #[allow(clippy::too_many_arguments)]
 fn code_square_inter(
     luma: &mut Plane,
     chroma: &mut [Plane; 2],
     (x, y): (usize, usize),
+    side: usize,
     search: &Search,
     mode_bits: &[f64; 13],
     reference: &Picture,
     stack: &MvStack,
 ) -> BlockCoeffs {
-    let (intra_block, intra_cost) = code_square(luma, chroma, (x, y), SUB, search, mode_bits);
+    let (intra_block, intra_cost) = code_square(luma, chroma, (x, y), side, search, mode_bits);
+    let luma_set = if side == 8 {
+        TxbSet::Luma8Inter
+    } else {
+        TxbSet::Luma16Inter
+    };
+    let chroma_set = if side == 8 {
+        TxbSet::Chroma4
+    } else {
+        TxbSet::Chroma8
+    };
 
     let skip_bits = |skip: bool| symbol_bits(&cdf::SKIP[0], usize::from(skip));
     let intra_inter_bits = |inter: bool| symbol_bits(&cdf::INTRA_INTER[0], usize::from(inter));
@@ -1215,7 +1228,7 @@ fn code_square_inter(
         luma,
         x,
         y,
-        SUB,
+        side,
         mv,
         true,
         ref_luma.0,
@@ -1225,13 +1238,13 @@ fn code_square_inter(
         false,
         search.base_q_idx,
         search.deadzone,
-        TxbSet::Luma16Inter,
+        luma_set,
     );
     let u = mc_trial(
         &chroma[0],
         x / 2,
         y / 2,
-        SUB / 2,
+        side / 2,
         mv,
         false,
         ref_u.0,
@@ -1241,13 +1254,13 @@ fn code_square_inter(
         false,
         search.base_q_idx,
         search.deadzone,
-        TxbSet::Chroma8,
+        chroma_set,
     );
     let v = mc_trial(
         &chroma[1],
         x / 2,
         y / 2,
-        SUB / 2,
+        side / 2,
         mv,
         false,
         ref_v.0,
@@ -1257,7 +1270,7 @@ fn code_square_inter(
         false,
         search.base_q_idx,
         search.deadzone,
-        TxbSet::Chroma8,
+        chroma_set,
     );
     let skip = luma_trial.levels.iter().all(|&l| l == 0)
         && u.levels.iter().all(|&l| l == 0)
@@ -1291,13 +1304,13 @@ fn code_square_inter(
     // branches), which is what made 8-mi geometry a true no-op instead of
     // one that only held when every neighbour happened to be inter.
     if inter_cost < intra_cost {
-        luma.commit(x, y, SUB, &luma_trial);
-        chroma[0].commit(x / 2, y / 2, SUB / 2, &u);
-        chroma[1].commit(x / 2, y / 2, SUB / 2, &v);
+        luma.commit(x, y, side, &luma_trial);
+        chroma[0].commit(x / 2, y / 2, side / 2, &u);
+        chroma[1].commit(x / 2, y / 2, side / 2, &v);
         BlockCoeffs {
-            luma: coeffs(&luma_trial.levels, SUB),
-            u: coeffs(&u.levels, SUB / 2),
-            v: coeffs(&v.levels, SUB / 2),
+            luma: coeffs(&luma_trial.levels, side),
+            u: coeffs(&u.levels, side / 2),
+            v: coeffs(&v.levels, side / 2),
             mode: DC_PRED as u8,
             skip,
             eight: None,
@@ -2606,75 +2619,139 @@ pub(crate) fn encode_inter_frame(
                                 && (sc as u32) * crate::tile::SUB_MI < header.mi_cols
                         })
                         .collect();
-                    // A 16x16 leaf the true edge itself cuts through needs a
-                    // rectangular (HORZ/VERT) transform this writer does not
-                    // code, same refusal as the key frame search's
-                    // `split_legal` check.
-                    if let Some(&(sr, sc)) = sub_positions.iter().find(|&&(sr, sc)| {
-                        !crate::tile::has_half(
-                            sc as u32 * crate::tile::SUB_MI,
-                            crate::tile::SUB_MI,
-                            header.mi_cols,
-                        ) || !crate::tile::has_half(
-                            sr as u32 * crate::tile::SUB_MI,
-                            crate::tile::SUB_MI,
-                            header.mi_rows,
-                        )
-                    }) {
-                        return Err(Error::unsupported(
-                            "AV1 encode",
-                            format!(
-                                "the 16x16 block at ({sc},{sr}) straddles the true frame \
-                                 edge in a way that needs a rectangular (HORZ/VERT) \
-                                 transform this encoder does not code yet"
-                            ),
-                        ));
-                    }
                     // Each leaf searches intra against its own `NEARESTMV`
                     // candidate (`code_square_inter`), same real-inter choice
                     // `search_inter_block` makes for a whole 32x32 block, at
-                    // this leaf's own 4x4-mi mv-stack window.
+                    // this leaf's own 4x4-mi mv-stack window -- unless the
+                    // leaf's own half itself straddles the true edge, which
+                    // it codes as two (or one, at a true corner) 8x8 leaves
+                    // (`crate::tile::write_leaf8`'s inter counterpart),
+                    // mirroring the key frame search's straddling-16x16
+                    // handling above (lane-av1inter8).
                     let mut leaves = Vec::with_capacity(sub_positions.len());
                     for (sr, sc) in sub_positions {
-                        let (x, y) = (sc * SUB, sr * SUB);
-                        let (mi_row, mi_col) = (sr * 4, sc * 4);
-                        let stack = find_mv_stack(
-                            &grid, mi_row, mi_col, 4, 4, LAST_FRAME, mi_cols, mi_rows,
+                        let (has_cols16, has_rows16) = (
+                            crate::tile::has_half(
+                                sc as u32 * crate::tile::SUB_MI,
+                                crate::tile::SUB_MI,
+                                header.mi_cols,
+                            ),
+                            crate::tile::has_half(
+                                sr as u32 * crate::tile::SUB_MI,
+                                crate::tile::SUB_MI,
+                                header.mi_rows,
+                            ),
                         );
-                        let block = code_square_inter(
-                            &mut luma,
-                            &mut chroma,
-                            (x, y),
-                            &search,
-                            &mode_bits_table,
-                            reference,
-                            &stack,
-                        );
-                        for dr in 0..4 {
-                            for dc in 0..4 {
-                                grid.set(
-                                    mi_row + dr,
-                                    mi_col + dc,
-                                    match block.inter {
-                                        Some(info) => MiInfo {
-                                            is_inter: true,
-                                            ref_frame: LAST_FRAME,
-                                            mv: info.mv,
-                                            is_new_mv: matches!(info.mode, InterMode::NewMv),
-                                            size: 4,
-                                        },
-                                        None => MiInfo {
-                                            is_inter: false,
-                                            ref_frame: -1,
-                                            mv: (0, 0),
-                                            is_new_mv: false,
-                                            size: 4,
-                                        },
-                                    },
-                                );
-                            }
+                        if !has_cols16 && !has_rows16 {
+                            return Err(Error::unsupported(
+                                "AV1 encode",
+                                format!(
+                                    "the 16x16 block at ({sc},{sr}) straddles the true \
+                                     frame edge in a way that needs a rectangular \
+                                     (HORZ/VERT) transform this encoder does not code yet"
+                                ),
+                            ));
                         }
-                        leaves.push(block);
+                        if has_cols16 && has_rows16 {
+                            let (x, y) = (sc * SUB, sr * SUB);
+                            let (mi_row, mi_col) = (sr * 4, sc * 4);
+                            let stack = find_mv_stack(
+                                &grid, mi_row, mi_col, 4, 4, LAST_FRAME, mi_cols, mi_rows,
+                            );
+                            let block = code_square_inter(
+                                &mut luma,
+                                &mut chroma,
+                                (x, y),
+                                SUB,
+                                &search,
+                                &mode_bits_table,
+                                reference,
+                                &stack,
+                            );
+                            for dr in 0..4 {
+                                for dc in 0..4 {
+                                    grid.set(
+                                        mi_row + dr,
+                                        mi_col + dc,
+                                        match block.inter {
+                                            Some(info) => MiInfo {
+                                                is_inter: true,
+                                                ref_frame: LAST_FRAME,
+                                                mv: info.mv,
+                                                is_new_mv: matches!(info.mode, InterMode::NewMv),
+                                                size: 4,
+                                            },
+                                            None => MiInfo {
+                                                is_inter: false,
+                                                ref_frame: -1,
+                                                mv: (0, 0),
+                                                is_new_mv: false,
+                                                size: 4,
+                                            },
+                                        },
+                                    );
+                                }
+                            }
+                            leaves.push(block);
+                        } else {
+                            let (x_sub, y_sub) = (sc * SUB, sr * SUB);
+                            let (mi_row0, mi_col0) = (sr * 4, sc * 4);
+                            let mut eight = Vec::with_capacity(2);
+                            for i in 0..4 {
+                                let leaf_x = x_sub + (i % 2) * 8;
+                                let leaf_y = y_sub + (i / 2) * 8;
+                                if leaf_x >= luma.true_width || leaf_y >= luma.true_height {
+                                    continue;
+                                }
+                                let (mi_row, mi_col) =
+                                    (mi_row0 + (i / 2) * 2, mi_col0 + (i % 2) * 2);
+                                let stack = find_mv_stack(
+                                    &grid, mi_row, mi_col, 2, 2, LAST_FRAME, mi_cols, mi_rows,
+                                );
+                                let leaf = code_square_inter(
+                                    &mut luma,
+                                    &mut chroma,
+                                    (leaf_x, leaf_y),
+                                    8,
+                                    &search,
+                                    &mode_bits_table,
+                                    reference,
+                                    &stack,
+                                );
+                                for dr in 0..2 {
+                                    for dc in 0..2 {
+                                        grid.set(
+                                            mi_row + dr,
+                                            mi_col + dc,
+                                            match leaf.inter {
+                                                Some(info) => MiInfo {
+                                                    is_inter: true,
+                                                    ref_frame: LAST_FRAME,
+                                                    mv: info.mv,
+                                                    is_new_mv: matches!(
+                                                        info.mode,
+                                                        InterMode::NewMv
+                                                    ),
+                                                    size: 2,
+                                                },
+                                                None => MiInfo {
+                                                    is_inter: false,
+                                                    ref_frame: -1,
+                                                    mv: (0, 0),
+                                                    is_new_mv: false,
+                                                    size: 2,
+                                                },
+                                            },
+                                        );
+                                    }
+                                }
+                                eight.push(leaf);
+                            }
+                            leaves.push(BlockCoeffs {
+                                eight: Some(eight),
+                                ..BlockCoeffs::default()
+                            });
+                        }
                     }
                     blocks[r32 * cols + c32] = Quadrant::Split(leaves);
                 }
@@ -3317,29 +3394,26 @@ mod tests {
 
     /// 640x360 is the class the charter names: 360 mod 32 == 8, so a 16x16
     /// leaf's own half (`has_half` at the SUB level) itself straddles the
-    /// true edge on one axis only. lane-av1-rect r7 wires the key frame
+    /// true edge on one axis only. lane-av1-rect r7 wired the key frame
     /// writer's 8x8-leaf path (`crate::tile::write_leaf8`) live for exactly
-    /// this case, so the key frame path no longer *refuses* it; the inter
-    /// frame path (`sb_coeff_inter_frame_tile`) was not part of this round's
-    /// wiring and still has no leaf-8 generation, so it must still refuse.
-    /// This only proves the encoder does not error out -- the leaf-8 stream
-    /// it produces is NOT yet proven decoder-clean (see
-    /// `a_single_axis_straddle_round_trips_through_ffmpeg`, currently
-    /// `#[ignore]`d on a genuine dav1d desync at the smaller 40x32 case).
+    /// this case; lane-av1inter8 extends the same leaf-8 path to inter
+    /// frames (`code_square_inter` at `side == 8`, `sb_coeff_inter_frame_tile`'s
+    /// straddling-16x16 branch), so an inter frame no longer refuses this
+    /// size either. This only proves the encoder does not error out -- see
+    /// `a_640x360_half_straddle_sequence_round_trips_through_ffmpeg` for the
+    /// decoder-clean proof (a 3-frame sequence, so the inter path is
+    /// actually exercised).
     #[test]
-    fn key_frame_encodes_the_inter_frame_still_refuses_at_half_straddle_size() {
+    fn key_frame_and_inter_frame_both_encode_at_half_straddle_size() {
         let (width, height) = (640usize, 360usize);
         let picture = Picture::grey(width, height);
         encode_key_frame(&picture, 100, 0.5).expect("key frame now codes the mod-32==8 straddle");
 
-        // `encode_sequence`'s second frame is the inter path: same size,
-        // still refused -- that machinery was not wired this round.
+        // `encode_sequence`'s second frame is the inter path: same size, now
+        // wired the same way.
         let pictures = vec![picture.clone(), picture];
-        let inter_err = encode_sequence(&pictures, 100, 0.5).unwrap_err();
-        assert!(
-            inter_err.to_string().contains("rectangular"),
-            "inter frame refusal: {inter_err}"
-        );
+        encode_sequence(&pictures, 100, 0.5)
+            .expect("inter frame now codes the mod-32==8 straddle too");
     }
 
     /// The r15 fix at production size: three 640x360 key frames (inter is
@@ -3364,6 +3438,33 @@ mod tests {
             assert_eq!(decoded.y, encoded.reconstruction.y, "shift {shift}: luma");
             assert_eq!(decoded.u, encoded.reconstruction.u, "shift {shift}: U");
             assert_eq!(decoded.v, encoded.reconstruction.v, "shift {shift}: V");
+        }
+    }
+
+    /// The 640x360 straddle class, but through the inter path an actual
+    /// 3-frame sequence exercises (lane-av1inter8's own ladder rung (b)):
+    /// proves the leaf-8 inter stream this round wires up is not just
+    /// encoder-clean (the test above) but decoder-clean against ffmpeg too.
+    #[test]
+    fn a_640x360_half_straddle_sequence_round_trips_through_ffmpeg() {
+        if !have_ffmpeg() {
+            eprintln!(
+                "SKIP a_640x360_half_straddle_sequence_round_trips_through_ffmpeg: no ffmpeg"
+            );
+            return;
+        }
+        let (width, height) = (640usize, 360usize);
+        let pictures: Vec<Picture> = (0..4)
+            .map(|i| panned_test_card(width, height, i * 3))
+            .collect();
+        let encoded = encode_sequence(&pictures, 100, 0.5).unwrap();
+        assert_eq!(encoded.frames.len(), 4);
+        let decoded = ffmpeg_decode_sequence(&encoded.stream, width, height, 4);
+        assert_eq!(decoded.len(), 4, "decoded frame count");
+        for (i, (frame, decoded)) in encoded.frames.iter().zip(&decoded).enumerate() {
+            assert_eq!(decoded.y, frame.reconstruction.y, "frame {i}: luma");
+            assert_eq!(decoded.u, frame.reconstruction.u, "frame {i}: U");
+            assert_eq!(decoded.v, frame.reconstruction.v, "frame {i}: V");
         }
     }
 

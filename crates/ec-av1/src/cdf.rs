@@ -1043,6 +1043,15 @@ pub const INTER_TX_TYPE_SET3_32: [u16; 3] = [748, 32768, 0];
 /// DCT_DCT, index one of `Tx_Type_Inter_Inv_Set3`, same as the 32x32 table.
 pub const INTER_TX_TYPE_SET3_16: [u16; 3] = [1998, 32768, 0];
 
+/// `Default_Inter_Ext_Tx_Cdf`'s `TX_SET_INTER_3` row for `TX_8X8` (spec 9.4):
+/// the transform type of an `is_inter` 8x8 luma transform under
+/// `reduced_tx_set` -- an 8x8 leaf under a straddling 16x16 block
+/// (lane-av1inter8), the same two-symbol set [`INTER_TX_TYPE_SET3_16`] and
+/// [`INTER_TX_TYPE_SET3_32`] read at their own sizes, just its own default
+/// probability and adaptation state (libaom `entropymode.c`'s
+/// `default_inter_ext_tx_cdf[EXT_TX_SET_DCT_IDTX][TX_8X8]`).
+pub const INTER_TX_TYPE_SET3_8: [u16; 3] = [4167, 32768, 0];
+
 // The inter-frame tables below (spec 9.4) support the syntax an inter block
 // needs: whether it is coded as intra at all, which reference frame and
 // motion vector it takes when it is not. Compound reference and compound
