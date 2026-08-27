@@ -427,8 +427,8 @@ mod tests {
             assert_eq!(*key, expect_key[t], "picture {t}: ffprobe key_frame flag");
             assert_eq!(
                 (*w, *h),
-                (coded_w as u32, coded_h as u32),
-                "picture {t}: coded size"
+                (width as u32, height as u32),
+                "picture {t}: ffprobe reports the true (display) size, not the padded coded one"
             );
         }
     }

@@ -18,6 +18,30 @@ use crate::cdf_state::{Cdfs, MvComponentCdfs, TxbSet, TxbTables};
 use crate::msac::SymbolEncoder;
 use crate::mvstack::{MiGrid, MiInfo, find_mv_stack, single_ref_ctx};
 
+/// round-4 av1-truesize debugging aid: prints `msg()` to stderr when the
+/// `EC_RNG` environment variable is set, mirroring the `EC_PART`/`EC_TOK`
+/// trace `/tmp/libaom-src`'s debug `aomdec` build already emits under the
+/// same variable, so the two traces line up symbol for symbol. Checked once
+/// per process, so unset (the default) costs one atomic load per call and no
+/// allocation. Only the real tile writer below calls this -- the mode/rate
+/// search's own trial encoders never do -- so the trace does not need the
+/// throwaway-encoder gating a whole-encoder trace would.
+fn ec_rng_trace(msg: impl FnOnce() -> String) {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2); // 2 = unknown, 1 = on, 0 = off
+    let on = match ON.load(Ordering::Relaxed) {
+        2 => {
+            let on = u8::from(std::env::var_os("EC_RNG").is_some());
+            ON.store(on, Ordering::Relaxed);
+            on
+        }
+        v => v,
+    };
+    if on == 1 {
+        eprintln!("{}", msg());
+    }
+}
+
 /// `PARTITION_NONE` (spec 6.10.4): the whole block, undivided.
 const PARTITION_NONE: usize = 0;
 /// `PARTITION_SPLIT` (spec 6.10.4): the block cut into four quadrants.
@@ -34,7 +58,32 @@ const VERT_ALIKE: [usize; 6] = [2, PARTITION_SPLIT, 4, 6, 7, 9];
 const HORZ_ALIKE: [usize; 6] = [1, PARTITION_SPLIT, 4, 5, 6, 8];
 
 /// Mode-info units across a 32x32 block.
-const BLOCK_MI: u32 = SB_MI / 2;
+pub(crate) const BLOCK_MI: u32 = SB_MI / 2;
+
+/// Mode-info units across a 16x16 block, the smallest this crate's key-frame
+/// writer codes.
+pub(crate) const SUB_MI: u32 = BLOCK_MI / 2;
+
+/// spec `decode_partition`'s `hasRows`/`hasCols` (5.11.4), recomputed at
+/// whichever block size is asking: a block of `side_mi` mode-info units at mi
+/// position `pos` may be coded unsplit (its own `PARTITION_NONE`) only when
+/// this is true in both directions -- the frame's *true* size can put the
+/// boundary inside a superblock, a 32x32 quadrant or (since this writer's
+/// smallest block is 16x16) even a leaf, and each level must ask again with
+/// its own half, not just once at the superblock.
+pub(crate) fn has_half(pos: u32, side_mi: u32, bound: u32) -> bool {
+    pos + side_mi / 2 < bound
+}
+
+/// The number of 32x32 block columns/rows a frame whose *true* (unpadded)
+/// size gives `mi_cols`/`mi_rows` is coded over: every block whose mi origin
+/// (`col * BLOCK_MI`) is inside the true bound is coded, so this is a
+/// ceiling, not the exact division a block-aligned frame would give. Shared
+/// by the tile writer's own iteration and by [`crate::encode`]'s block/
+/// superblock generation, which must agree with it exactly.
+pub(crate) fn block_grid(mi_cols: u32, mi_rows: u32) -> (u32, u32) {
+    (mi_cols.div_ceil(BLOCK_MI), mi_rows.div_ceil(BLOCK_MI))
+}
 /// `DC_PRED` (spec 6.10.2), as both the luma and the chroma mode.
 const DC_PRED: usize = 0;
 
@@ -468,6 +517,10 @@ const SB: usize = 64;
 /// Side of the smallest block the writer codes, in samples, which is the grid
 /// the neighbour bookkeeping is kept on.
 const SUB: usize = 16;
+/// Side of a 4x4 mode-info unit, in samples: the granularity libaom's above
+/// and left entropy-context arrays are actually kept on (spec
+/// `get_txb_ctx`/`av1_set_entropy_contexts`), finer than [`SUB`].
+const MI: usize = 4;
 
 /// What one coded block leaves behind for the blocks that read it as a
 /// neighbour: whether it coded anything at all, and the sign of its DC.
@@ -479,22 +532,18 @@ struct Neighbour {
     dc: Option<bool>,
 }
 
-/// Rejects a frame the 32x32 block grid cannot tile.
+/// Rejects a frame with no mode-info grid at all.
 ///
-/// The frame need not be a whole number of superblocks — a superblock at the
-/// right-hand or bottom edge may be half outside it — but every 32x32 block
-/// that is coded has to be wholly inside, because a block that hangs over the
-/// edge has to be coded as a rectangle this writer has no transform for.
+/// `mi_cols`/`mi_rows` are the frame's *true* (unpadded) size in 4x4 units
+/// (spec `compute_image_size`), not necessarily a multiple of the 32x32 block
+/// grid: a block whose origin sits at or past this bound is not coded (spec's
+/// `decode_partition` never visits it), and one that straddles the bound is
+/// coded whole, its samples coming from the padded planes.
 fn check_blocks(mi_cols: u32, mi_rows: u32) -> Result<()> {
-    if mi_cols == 0
-        || mi_rows == 0
-        || !mi_cols.is_multiple_of(BLOCK_MI)
-        || !mi_rows.is_multiple_of(BLOCK_MI)
-    {
+    if mi_cols == 0 || mi_rows == 0 {
         return Err(Error::unsupported(
             "AV1 tile",
-            "a coefficient key frame is written only for frames that are a \
-             whole number of 32x32 blocks",
+            "a coefficient key frame needs a nonzero mode-info grid",
         ));
     }
     Ok(())
@@ -567,6 +616,13 @@ struct Neighbours {
     above_inter: Vec<bool>,
     /// The same, down the left edge.
     left_inter: Vec<bool>,
+    /// The frame's true (unpadded) width and height, in 4x4 mode-info units,
+    /// which is what clamps [`Self::above`]/[`Self::left`] at the edge (spec
+    /// `av1_set_entropy_contexts`): a block whose row or column run spills
+    /// past this bound leaves its trailing 4x4 units at their default,
+    /// mid-cell if need be.
+    mi_cols: usize,
+    mi_rows: usize,
 }
 
 /// What one plane's neighbours leave for a block, gathered across every cell
@@ -586,11 +642,13 @@ struct Around {
 
 impl Neighbours {
     /// The state a tile starts from: a block outside it reads as `DC_PRED`,
-    /// as having coded nothing, and as unsplit.
-    fn new(cols: usize, rows: usize) -> Self {
+    /// as having coded nothing, and as unsplit. `cols`/`rows` are in [`SUB`]
+    /// units; `mi_cols`/`mi_rows` are the frame's true (unpadded) size in 4x4
+    /// mode-info units.
+    fn new(cols: usize, rows: usize, mi_cols: usize, mi_rows: usize) -> Self {
         Self {
-            above: vec![[Neighbour::default(); 3]; cols],
-            left: vec![[Neighbour::default(); 3]; rows],
+            above: vec![[Neighbour::default(); 3]; cols * (SUB / MI)],
+            left: vec![[Neighbour::default(); 3]; rows * (SUB / MI)],
             above_mode: vec![DC_PRED; cols],
             left_mode: vec![DC_PRED; rows],
             above_side: vec![SB; cols],
@@ -599,6 +657,8 @@ impl Neighbours {
             left_skip: vec![false; rows],
             above_inter: vec![false; cols],
             left_inter: vec![false; rows],
+            mi_cols,
+            mi_rows,
         }
     }
 
@@ -611,17 +671,55 @@ impl Neighbours {
         self.left_inter.iter_mut().for_each(|i| *i = false);
     }
 
-    /// Writes one coded block into every 16x16 column and row it covers.
+    /// Writes one coded block into every 16x16 column and row it covers, and,
+    /// on the finer 4x4 grid libaom's entropy context arrays are actually
+    /// kept on, into every unit up to the true frame edge -- the units past
+    /// it are left at their default (uncoded), even mid-16x16-cell (spec
+    /// `av1_set_entropy_contexts`, which clamps to `blocks_wide`/`blocks_high`
+    /// derived from the true `mi_cols`/`mi_rows`, not from this block's own
+    /// side).
     fn record(&mut self, at: (usize, usize), side: usize, mode: usize, grids: &[Vec<i32>; 3]) {
         let (r, c) = at;
         let states: [Neighbour; 3] = std::array::from_fn(|plane| neighbour_state(&grids[plane]));
         for cell in 0..side / SUB {
-            self.above[c + cell] = states;
-            self.left[r + cell] = states;
             self.above_mode[c + cell] = mode;
             self.left_mode[r + cell] = mode;
             self.above_side[c + cell] = side;
             self.left_side[r + cell] = side;
+        }
+        let (mi_r, mi_c, side_mi) = (r * (SUB / MI), c * (SUB / MI), side / MI);
+        // libaom rounds the luma edge up to the plane's own 4x4 unit before
+        // clamping a subsampled plane (`ROUND_POWER_OF_TWO(max_blocks_high,
+        // subsampling_y)` in av1_write_intra_coeffs_mb, encodetxb.c:456-459):
+        // a chroma 4x4 unit straddling the true luma edge is still whole in
+        // chroma's own halved grid, so it stays valid one luma-mi row/col
+        // past where luma's own edge falls when that edge is odd.
+        let round_up_even = |n: usize| n.div_ceil(2) * 2;
+        let bound_h = [
+            self.mi_rows,
+            round_up_even(self.mi_rows),
+            round_up_even(self.mi_rows),
+        ];
+        let bound_w = [
+            self.mi_cols,
+            round_up_even(self.mi_cols),
+            round_up_even(self.mi_cols),
+        ];
+        for cell in 0..side_mi {
+            self.left[mi_r + cell] = std::array::from_fn(|plane| {
+                if cell < side_mi.min(bound_h[plane].saturating_sub(mi_r)) {
+                    states[plane]
+                } else {
+                    Default::default()
+                }
+            });
+            self.above[mi_c + cell] = std::array::from_fn(|plane| {
+                if cell < side_mi.min(bound_w[plane].saturating_sub(mi_c)) {
+                    states[plane]
+                } else {
+                    Default::default()
+                }
+            });
         }
     }
 
@@ -643,10 +741,14 @@ impl Neighbours {
     /// The gathered state of the blocks above and to the left of one block,
     /// per plane.
     fn around(&self, (r, c): (usize, usize), side: usize) -> [Around; 3] {
+        let (mi_r, mi_c, side_mi) = (r * (SUB / MI), c * (SUB / MI), side / MI);
         std::array::from_fn(|plane| {
             let mut around = Around::default();
-            for cell in 0..side / SUB {
-                let (above, left) = (&self.above[c + cell][plane], &self.left[r + cell][plane]);
+            for cell in 0..side_mi {
+                let (above, left) = (
+                    &self.above[mi_c + cell][plane],
+                    &self.left[mi_r + cell][plane],
+                );
                 around.above_coded |= above.coded;
                 around.left_coded |= left.coded;
                 around.dc_vote += dc_vote(above.dc) + dc_vote(left.dc);
@@ -685,7 +787,7 @@ pub fn sb_coeff_key_frame_tile(
     superblocks: &[Superblock],
 ) -> Result<Vec<u8>> {
     check_blocks(mi_cols, mi_rows)?;
-    let (cols, rows) = (mi_cols / BLOCK_MI, mi_rows / BLOCK_MI);
+    let (cols, rows) = block_grid(mi_cols, mi_rows);
     let (sb_cols, sb_rows) = (cols.div_ceil(2), rows.div_ceil(2));
     if superblocks.len() != (sb_cols * sb_rows) as usize {
         return Err(Error::unsupported(
@@ -722,7 +824,12 @@ pub fn sb_coeff_key_frame_tile(
     // The blocks above and to the left, on the 16x16 grid. The left edge is
     // reset at every superblock row because a tile starts each row with no
     // left neighbour.
-    let mut neighbours = Neighbours::new(cols as usize * 2, rows as usize * 2);
+    let mut neighbours = Neighbours::new(
+        cols as usize * 2,
+        rows as usize * 2,
+        mi_cols as usize,
+        mi_rows as usize,
+    );
 
     // The tile adapts every non-literal CDF it writes, exactly as the decoder
     // adapts the ones it reads, so the frame header leaves `disable_cdf_update`
@@ -734,6 +841,15 @@ pub fn sb_coeff_key_frame_tile(
         for sb_c in 0..sb_cols {
             let at = (sb_r as usize * 4, sb_c as usize * 4);
             let ctx = neighbours.partition_ctx(at, SB);
+            ec_rng_trace(|| {
+                format!(
+                    "EC_PART mi_row={} mi_col={} bsize=12 ctx={} tell={}",
+                    at.0 * 4,
+                    at.1 * 4,
+                    ctx,
+                    enc.tell()
+                )
+            });
             // A superblock whose bottom or right half is outside the frame
             // cannot be left unsplit, so the decoder reads a flag instead of
             // the partition symbol — and reads nothing at all when both halves
@@ -778,6 +894,14 @@ pub fn sb_coeff_key_frame_tile(
                         // luma, so its chroma mode reads the table without it.
                         false,
                     );
+                    ec_rng_trace(|| {
+                        format!(
+                            "EC_TOK mi_row={} mi_col={} tell={}",
+                            at.0 * 4,
+                            at.1 * 4,
+                            enc.tell()
+                        )
+                    });
                 }
                 Superblock::Split(quadrants) => {
                     match (has_cols, has_rows) {
@@ -802,8 +926,34 @@ pub fn sb_coeff_key_frame_tile(
                     for (quadrant, (r, c)) in quadrants.iter().zip(quadrant_positions) {
                         let at = (r * 2, c * 2);
                         let ctx = neighbours.partition_ctx(at, BLOCK);
+                        // Recomputed at this 32x32 block's own half (spec
+                        // `decode_partition`, called again at every size, not
+                        // just once for the superblock): the true frame edge
+                        // can fall inside this quadrant even when the
+                        // superblock it sits in was itself whole or safely
+                        // split above.
+                        let (has_cols32, has_rows32) = (
+                            has_half(c as u32 * BLOCK_MI, BLOCK_MI, mi_cols),
+                            has_half(r as u32 * BLOCK_MI, BLOCK_MI, mi_rows),
+                        );
+                        ec_rng_trace(|| {
+                            format!(
+                                "EC_PART mi_row={} mi_col={} bsize=9 ctx={} tell={}",
+                                at.0 * 4,
+                                at.1 * 4,
+                                ctx,
+                                enc.tell()
+                            )
+                        });
                         match quadrant {
                             Quadrant::Whole(block) => {
+                                if !has_cols32 || !has_rows32 {
+                                    return Err(Error::unsupported(
+                                        "AV1 tile",
+                                        "a 32x32 block that is half outside the true frame \
+                                         cannot be left whole",
+                                    ));
+                                }
                                 enc.symbol(PARTITION_NONE, &mut cdfs.partition_w32[ctx]);
                                 let grids = [
                                     level_grid(&block.luma, TX32)?,
@@ -822,18 +972,92 @@ pub fn sb_coeff_key_frame_tile(
                                     [&scans[0], &scans[1], &scans[1]],
                                     true,
                                 );
+                                ec_rng_trace(|| {
+                                    format!(
+                                        "EC_TOK mi_row={} mi_col={} tell={}",
+                                        at.0 * 4,
+                                        at.1 * 4,
+                                        enc.tell()
+                                    )
+                                });
                             }
                             Quadrant::Split(blocks) => {
-                                enc.symbol(PARTITION_SPLIT, &mut cdfs.partition_w32[ctx]);
-                                if blocks.len() != 4 {
+                                // The 16x16 sub-blocks this quadrant's split
+                                // carries: only those whose own mi origin is
+                                // inside the true frame (spec `decode_partition`'s
+                                // `r >= MiRows || c >= MiCols` early return),
+                                // which need not be all four when the true
+                                // edge falls inside this quadrant.
+                                let sub_positions: Vec<(usize, usize)> = (0..4)
+                                    .map(|i| (r * 2 + i / 2, c * 2 + i % 2))
+                                    .filter(|&(sr, sc)| {
+                                        (sr as u32) * SUB_MI < mi_rows
+                                            && (sc as u32) * SUB_MI < mi_cols
+                                    })
+                                    .collect();
+                                if blocks.len() != sub_positions.len() {
                                     return Err(Error::unsupported(
                                         "AV1 tile",
-                                        "a 32x32 block that is split carries four 16x16 blocks",
+                                        "a split 32x32 block needs one 16x16 entry per \
+                                         sub-block inside the true frame",
                                     ));
                                 }
-                                for (i, block) in blocks.iter().enumerate() {
-                                    let at = (at.0 + i / 2, at.1 + i % 2);
+                                // Same three-way spec signaling as the
+                                // superblock level above, recomputed at this
+                                // block's own half: a full alphabet symbol
+                                // only when both halves are inside, a single
+                                // gathered bit when just one is, and nothing
+                                // at all (SPLIT is inferred) when neither is.
+                                match (has_cols32, has_rows32) {
+                                    (true, true) => {
+                                        enc.symbol(PARTITION_SPLIT, &mut cdfs.partition_w32[ctx]);
+                                    }
+                                    (true, false) => {
+                                        enc.symbol_fixed(
+                                            1,
+                                            &gather(&cdfs.partition_w32[ctx], VERT_ALIKE),
+                                        );
+                                    }
+                                    (false, true) => {
+                                        enc.symbol_fixed(
+                                            1,
+                                            &gather(&cdfs.partition_w32[ctx], HORZ_ALIKE),
+                                        );
+                                    }
+                                    (false, false) => {}
+                                }
+                                for (block, (sr, sc)) in blocks.iter().zip(sub_positions) {
+                                    // A 16x16 leaf's own hasRows/hasCols: this
+                                    // writer has no smaller partition than
+                                    // 16x16 (no 8x8 or rectangular transform),
+                                    // so a leaf the true edge itself cuts
+                                    // through -- legal in the spec only via a
+                                    // `PARTITION_HORZ`/`VERT` this writer does
+                                    // not code -- is refused rather than
+                                    // silently miscoded.
+                                    let (has_cols16, has_rows16) = (
+                                        has_half(sc as u32 * SUB_MI, SUB_MI, mi_cols),
+                                        has_half(sr as u32 * SUB_MI, SUB_MI, mi_rows),
+                                    );
+                                    if !has_cols16 || !has_rows16 {
+                                        return Err(Error::unsupported(
+                                            "AV1 tile",
+                                            "a 16x16 block the true frame edge cuts through \
+                                             needs a rectangular transform this writer does \
+                                             not code yet",
+                                        ));
+                                    }
+                                    let at = (sr, sc);
                                     let ctx = neighbours.partition_ctx(at, SUB);
+                                    ec_rng_trace(|| {
+                                        format!(
+                                            "EC_PART mi_row={} mi_col={} bsize=6 ctx={} tell={}",
+                                            at.0 * 4,
+                                            at.1 * 4,
+                                            ctx,
+                                            enc.tell()
+                                        )
+                                    });
                                     enc.symbol(PARTITION_NONE, &mut cdfs.partition_w16[ctx]);
                                     let grids = [
                                         level_grid(&block.luma, TX16)?,
@@ -852,6 +1076,14 @@ pub fn sb_coeff_key_frame_tile(
                                         [&scans[1], &scans[2], &scans[2]],
                                         true,
                                     );
+                                    ec_rng_trace(|| {
+                                        format!(
+                                            "EC_TOK mi_row={} mi_col={} tell={}",
+                                            at.0 * 4,
+                                            at.1 * 4,
+                                            enc.tell()
+                                        )
+                                    });
                                 }
                             }
                         }
@@ -960,7 +1192,15 @@ fn write_block_planes(
             scan,
             skip_ctx,
             dc_sign_ctx(around[plane].dc_vote),
+            Some(plane),
         );
+        ec_rng_trace(|| {
+            format!(
+                "EC_PLANE plane={plane} nz={} skip_ctx={skip_ctx} tell={}",
+                grid.iter().filter(|&&l| l != 0).count(),
+                enc.tell()
+            )
+        });
     }
 }
 
@@ -988,7 +1228,7 @@ pub fn split_coeff_key_frame_tile(
     blocks: &[BlockCoeffs],
 ) -> Result<Vec<u8>> {
     check_blocks(mi_cols, mi_rows)?;
-    let (cols, rows) = (mi_cols / BLOCK_MI, mi_rows / BLOCK_MI);
+    let (cols, rows) = block_grid(mi_cols, mi_rows);
     if blocks.len() != (cols * rows) as usize {
         return Err(Error::unsupported(
             "AV1 tile",
@@ -1102,7 +1342,7 @@ pub(crate) fn coeff_bits(grid: &[i32], set: TxbSet) -> f64 {
     };
     let mut enc = SymbolEncoder::new();
     enc.reset_bits();
-    write_coeffs(&mut enc, &mut coding, grid, scan, 0, 0);
+    write_coeffs(&mut enc, &mut coding, grid, scan, 0, 0, None);
     enc.bits()
 }
 
@@ -1135,6 +1375,7 @@ pub(crate) fn partition_bits(side: usize, split: bool) -> f64 {
 /// levels the contexts below are read from are the levels of
 /// coefficients later in the scan, which a decoder walking the scan backwards
 /// already has.
+#[allow(clippy::too_many_arguments)]
 fn write_coeffs(
     enc: &mut SymbolEncoder,
     coding: &mut TxbTables,
@@ -1142,13 +1383,26 @@ fn write_coeffs(
     scan: &[u16],
     skip_ctx: usize,
     sign_ctx: usize,
+    plane: Option<usize>,
 ) {
+    if let Some(plane) = plane {
+        ec_rng_trace(|| format!("EC_PLANE plane={plane} tell_before={}", enc.tell()));
+    }
     let side = coding.side;
     let eob = scan
         .iter()
         .rposition(|&pos| grid[pos as usize] != 0)
         .map_or(0, |i| i + 1);
     enc.symbol(usize::from(eob == 0), &mut coding.txb_skip[skip_ctx]);
+    if plane.is_some() {
+        ec_rng_trace(|| {
+            format!(
+                "EC_TXBSKIP ctx={skip_ctx} eob0={} tell={}",
+                usize::from(eob == 0),
+                enc.tell()
+            )
+        });
+    }
     if eob == 0 {
         return;
     }
@@ -1157,9 +1411,12 @@ fn write_coeffs(
     // uses DCT_DCT, which is index one of `Tx_Type_Intra_Inv_Set2`.
     if let Some(tx_type) = coding.tx_type.as_deref_mut() {
         enc.symbol(TX_TYPE_DCT_DCT_SET2, tx_type);
+        if plane.is_some() {
+            ec_rng_trace(|| format!("EC_TXTYPE tell={}", enc.tell()));
+        }
     }
 
-    write_eob(enc, coding, eob);
+    write_eob(enc, coding, eob, plane);
 
     for scan_idx in (0..eob).rev() {
         let pos = scan[scan_idx] as usize;
@@ -1167,16 +1424,29 @@ fn write_coeffs(
         let level = grid[pos].abs();
         if scan_idx == eob - 1 {
             let ctx = eob_coeff_ctx(scan_idx, side * side);
-            enc.symbol(
-                (level.min(NUM_BASE_LEVELS + 1) - 1) as usize,
-                &mut coding.base_eob[ctx],
-            );
+            let sym = (level.min(NUM_BASE_LEVELS + 1) - 1) as usize;
+            enc.symbol(sym, &mut coding.base_eob[ctx]);
+            if plane.is_some() {
+                ec_rng_trace(|| {
+                    format!(
+                        "EC_BASEEOB scan_idx={scan_idx} ctx={ctx} level={} tell={}",
+                        sym + 1,
+                        enc.tell()
+                    )
+                });
+            }
         } else {
             let ctx = base_ctx(grid, side, row, col);
-            enc.symbol(
-                level.min(NUM_BASE_LEVELS + 1) as usize,
-                &mut coding.base[ctx],
-            );
+            let sym = level.min(NUM_BASE_LEVELS + 1) as usize;
+            enc.symbol(sym, &mut coding.base[ctx]);
+            if plane.is_some() {
+                ec_rng_trace(|| {
+                    format!(
+                        "EC_BASE scan_idx={scan_idx} ctx={ctx} level={sym} tell={}",
+                        enc.tell()
+                    )
+                });
+            }
         }
         if level > NUM_BASE_LEVELS {
             let ctx = br_ctx(grid, side, row, col);
@@ -1185,6 +1455,14 @@ fn write_coeffs(
             while sent < COEFF_BASE_RANGE {
                 let k = remaining.min(BR_STEP);
                 enc.symbol(k as usize, &mut coding.br[ctx]);
+                if plane.is_some() {
+                    ec_rng_trace(|| {
+                        format!(
+                            "EC_BR scan_idx={scan_idx} ctx={ctx} k={k} tell={}",
+                            enc.tell()
+                        )
+                    });
+                }
                 if k < BR_STEP {
                     break;
                 }
@@ -1203,6 +1481,15 @@ fn write_coeffs(
         }
         if pos == 0 {
             enc.symbol(usize::from(level < 0), &mut coding.dc_sign[sign_ctx]);
+            if plane.is_some() {
+                ec_rng_trace(|| {
+                    format!(
+                        "EC_DCSIGN ctx={sign_ctx} neg={} tell={}",
+                        usize::from(level < 0),
+                        enc.tell()
+                    )
+                });
+            }
         } else {
             enc.literal(u32::from(level < 0), 1);
         }
@@ -1210,14 +1497,20 @@ fn write_coeffs(
         // of itself here, after its own sign (spec 5.11.39).
         if level.abs() > MAX_BR_LEVEL {
             write_golomb(enc, (level.abs() - MAX_BR_LEVEL - 1) as u32);
+            if plane.is_some() {
+                ec_rng_trace(|| format!("EC_GOLOMB tell={}", enc.tell()));
+            }
         }
+    }
+    if let Some(plane) = plane {
+        ec_rng_trace(|| format!("EC_PLANE plane={plane} eob={eob} tell_after={}", enc.tell()));
     }
 }
 
 /// The end-of-block position (spec 5.11.39): which group of scan positions the
 /// last coded coefficient falls in, then its offset inside that group — the
 /// offset's top bit from a CDF and the rest as raw bits.
-fn write_eob(enc: &mut SymbolEncoder, coding: &mut TxbTables, eob: usize) {
+fn write_eob(enc: &mut SymbolEncoder, coding: &mut TxbTables, eob: usize, plane: Option<usize>) {
     /// `Eob_Group_Start` (spec 5.11.39): the first scan position each group of
     /// end-of-block positions covers, indexed by the group's own number.
     const GROUP_START: [usize; 12] = [0, 1, 2, 3, 5, 9, 17, 33, 65, 129, 257, 513];
@@ -1231,14 +1524,34 @@ fn write_eob(enc: &mut SymbolEncoder, coding: &mut TxbTables, eob: usize) {
     // The groups are numbered from one, and how many of them the transform
     // reaches is the size of its own end-of-block alphabet.
     enc.symbol(group - 1, coding.eob_pt);
+    if let Some(plane) = plane {
+        ec_rng_trace(|| format!("EC_EOBPT plane={plane} eob_pt={group} tell={}", enc.tell()));
+    }
 
     let bits = OFFSET_BITS[group];
     if bits > 0 {
         let offset = (eob - GROUP_START[group]) as u32;
         let top = (offset >> (bits - 1)) & 1;
         enc.symbol(top as usize, &mut coding.eob_extra[group - 3]);
+        if let Some(plane) = plane {
+            ec_rng_trace(|| {
+                format!(
+                    "EC_EOBEXTRA plane={plane} eob_ctx={} top={top} tell={}",
+                    group - 3,
+                    enc.tell()
+                )
+            });
+        }
         if bits > 1 {
             enc.literal(offset & ((1 << (bits - 1)) - 1), bits - 1);
+            if let Some(plane) = plane {
+                ec_rng_trace(|| {
+                    format!(
+                        "EC_EOBBITS plane={plane} eob_extra={offset} tell={}",
+                        enc.tell()
+                    )
+                });
+            }
         }
     }
 }
@@ -1380,10 +1693,12 @@ fn write_dc_coeffs(
     enc.symbol_fixed(usize::from(dc_level < 0), &cdf::DC_SIGN_LUMA[sign_ctx]);
 }
 
-/// One neighbour cell's vote in `Dc_Sign_Contexts` (spec 8.3.2): plus one for
-/// a positive DC, minus one for a negative one, nothing for a cell whose block
-/// carried no DC. Every 4x4 unit of a cell votes the same way, so counting
-/// cells and counting units differ only by a factor the sign is blind to.
+/// One 4x4 unit's vote in `Dc_Sign_Contexts` (spec 8.3.2): plus one for a
+/// positive DC, minus one for a negative one, nothing for a unit whose block
+/// carried no DC or that sits past the frame's true edge (spec
+/// `av1_set_entropy_contexts`), which is why the vote is gathered per 4x4
+/// unit and not per coded cell -- a unit past the edge does not vote even
+/// when the rest of its cell does.
 fn dc_vote(dc: Option<bool>) -> i32 {
     match dc {
         None => 0,
@@ -1544,12 +1859,16 @@ pub fn sb_coeff_inter_frame_tile(
     base_q_idx: u8,
     blocks: &[BlockCoeffs],
 ) -> Result<Vec<u8>> {
-    check_superblocks(mi_cols, mi_rows)?;
-    let (cols, rows) = (mi_cols / BLOCK_MI, mi_rows / BLOCK_MI);
+    check_blocks(mi_cols, mi_rows)?;
+    // `block_grid`'s ceiling, not a plain division: a true frame size that is
+    // not a whole number of 32x32 blocks (or of 64x64 superblocks) still has
+    // one more block/superblock whose own origin is inside the true frame,
+    // same as `sb_coeff_key_frame_tile`.
+    let (cols, rows) = block_grid(mi_cols, mi_rows);
     if blocks.len() != (cols * rows) as usize {
         return Err(Error::unsupported(
             "AV1 tile",
-            "an inter frame needs one entry per 32x32 block",
+            "an inter frame needs one entry per 32x32 block inside the true frame",
         ));
     }
     if let Some(bad) = blocks
@@ -1572,8 +1891,13 @@ pub fn sb_coeff_inter_frame_tile(
     /// writer's single-reference chain ever names.
     const LAST_FRAME: i8 = 1;
 
-    let (sb_cols, sb_rows) = (mi_cols / SB_MI, mi_rows / SB_MI);
-    let mut neighbours = Neighbours::new(cols as usize * 2, rows as usize * 2);
+    let (sb_cols, sb_rows) = (cols.div_ceil(2), rows.div_ceil(2));
+    let mut neighbours = Neighbours::new(
+        cols as usize * 2,
+        rows as usize * 2,
+        mi_cols as usize,
+        mi_rows as usize,
+    );
     let mut grid = MiGrid::new(mi_cols as usize, mi_rows as usize);
     let mut cdfs = Cdfs::new(q_ctx_of(base_q_idx));
     let mut enc = SymbolEncoder::new();
@@ -1596,14 +1920,57 @@ pub fn sb_coeff_inter_frame_tile(
         for sb_c in 0..sb_cols {
             let sb_at = (sb_r as usize * 4, sb_c as usize * 4);
             let sb_ctx = neighbours.partition_ctx(sb_at, SB);
-            enc.symbol(PARTITION_SPLIT, &mut cdfs.partition_w64[sb_ctx]);
+            // spec `decode_partition`'s hasRows/hasCols (5.11.4): a superblock
+            // whose bottom or right half falls outside the true frame cannot
+            // be left whole, but this writer only ever splits a superblock
+            // into its four 32x32 quadrants (never `PARTITION_NONE` at 64x64),
+            // so the only question is which of the three partition symbols
+            // that split takes — same three-way signaling as
+            // `sb_coeff_key_frame_tile`'s superblock level.
+            let (has_cols, has_rows) = (
+                sb_c * SB_MI + SB_MI / 2 < mi_cols,
+                sb_r * SB_MI + SB_MI / 2 < mi_rows,
+            );
+            match (has_cols, has_rows) {
+                (true, true) => enc.symbol(PARTITION_SPLIT, &mut cdfs.partition_w64[sb_ctx]),
+                (true, false) => {
+                    enc.symbol_fixed(1, &gather(&cdfs.partition_w64[sb_ctx], VERT_ALIKE));
+                }
+                (false, true) => {
+                    enc.symbol_fixed(1, &gather(&cdfs.partition_w64[sb_ctx], HORZ_ALIKE));
+                }
+                (false, false) => {}
+            }
 
             for quadrant in 0..4 {
                 let (r32, c32) = (sb_r * 2 + quadrant / 2, sb_c * 2 + quadrant % 2);
+                // Only a quadrant whose own mi origin is inside the true
+                // frame is coded at all (spec `decode_partition`'s
+                // `r >= MiRows || c >= MiCols` early return), same filter as
+                // `sb_coeff_key_frame_tile`'s `quadrant_positions`.
+                if r32 >= rows || c32 >= cols {
+                    continue;
+                }
                 let block = &blocks[(r32 * cols + c32) as usize];
                 let at = (r32 as usize * 2, c32 as usize * 2);
                 let (r, c) = at;
                 let ctx32 = neighbours.partition_ctx(at, BLOCK);
+                // This writer has no rectangular (HORZ/VERT) or further-split
+                // representation for a 32x32 block, so one that itself
+                // straddles the true edge is refused rather than miscoded --
+                // mirroring `sb_coeff_key_frame_tile`'s "cannot be left whole"
+                // refusal, just with no split arm to fall back to here.
+                let (has_cols32, has_rows32) = (
+                    has_half(c32 * BLOCK_MI, BLOCK_MI, mi_cols),
+                    has_half(r32 * BLOCK_MI, BLOCK_MI, mi_rows),
+                );
+                if !has_cols32 || !has_rows32 {
+                    return Err(Error::unsupported(
+                        "AV1 tile",
+                        "a 32x32 inter-frame block that straddles the true frame edge \
+                         needs an 8x8 split this writer does not code",
+                    ));
+                }
                 enc.symbol(PARTITION_NONE, &mut cdfs.partition_w32[ctx32]);
 
                 let has_above = r32 > 0;
@@ -2445,6 +2812,7 @@ mod tests {
                 &scan,
                 0,
                 0,
+                None,
             );
             priced += luma_32_coeff_bits(grid);
         }
@@ -2743,7 +3111,7 @@ mod tests {
     /// appeared beside a 32x32 one.
     #[test]
     fn a_block_gathers_the_cells_its_neighbours_cover() {
-        let mut neighbours = Neighbours::new(4, 4);
+        let mut neighbours = Neighbours::new(4, 4, 64, 64);
         let quiet = [
             vec![0i32; TX16 * TX16],
             vec![0; TX8 * TX8],
@@ -2766,8 +3134,9 @@ mod tests {
             "the one negative DC above the block is what it votes"
         );
         // The same read one cell at a time misses it, which is the bug this
-        // gate is here for.
-        assert!(!neighbours.above[2][1].coded);
+        // gate is here for. `above[8]` is the first 4x4 unit the quiet block
+        // at `(0, 2)` wrote (2 SUB units * 4 4x4-units-per-SUB).
+        assert!(!neighbours.above[8][1].coded);
     }
 
     /// samples.
@@ -3127,6 +3496,44 @@ mod tests {
                 let name = format!("block ({block_row},{block_col})");
                 let block = block_at(&rows, block_row, block_col);
                 if (block_row * 3 + block_col) % 2 == 0 {
+                    assert_falls_across(&block, &name);
+                } else {
+                    assert_falls_down(&block, &name);
+                }
+            }
+        }
+    }
+
+    /// The transpose of [`a_frame_that_is_not_a_whole_number_of_superblocks_codes_every_block`]:
+    /// an odd number of 32x32 block *rows* (superblock hangs off the
+    /// *bottom*, `has_cols=true, has_rows=false`) rather than an odd number of
+    /// columns (hangs off the *right*, `has_cols=false, has_rows=true`) --
+    /// the two halves of the `(has_cols, has_rows)` match in
+    /// `sb_coeff_key_frame_tile` gather from different tables
+    /// (`VERT_ALIKE`/`HORZ_ALIKE`), and only the right-hand-edge direction had
+    /// a real-decoder test before this one.
+    #[test]
+    fn a_frame_that_hangs_off_the_bottom_codes_every_block() {
+        if !have_ffmpeg() {
+            eprintln!("SKIP a_frame_that_hangs_off_the_bottom_codes_every_block: no ffmpeg");
+            return;
+        }
+        let blocks: Vec<BlockCoeffs> = (0..6)
+            .map(|i| {
+                let (row, col) = if i % 2 == 0 { (0, 1) } else { (1, 0) };
+                BlockCoeffs::from(vec![Coeff {
+                    row,
+                    col,
+                    level: 12,
+                }])
+            })
+            .collect();
+        let rows = decode_luma_at(64, 96, &blocks);
+        for block_row in 0..3 {
+            for block_col in 0..2 {
+                let name = format!("block ({block_row},{block_col})");
+                let block = block_at(&rows, block_row, block_col);
+                if (block_row * 2 + block_col) % 2 == 0 {
                     assert_falls_across(&block, &name);
                 } else {
                     assert_falls_down(&block, &name);
