@@ -920,6 +920,18 @@ pub const COEFF_BR_CHROMA_8: [[u16; 5]; 21] = [
     [7625, 13801, 19144, 32768, 0],
 ];
 
+/// `Default_Partition_Cdf[0..4]`, `PARTITION_W16` format (spec 5.11.4 codes an
+/// 8x8 block's partition as a 4-symbol read that only ever terminates
+/// `PARTITION_NONE` for this writer -- `PARTITION_SPLIT` is illegal at 8x8, so
+/// row 4 of libaom's real (8-symbol) 8x8 table is dropped and only the shared
+/// leading four symbols, common to every partition-symbol alphabet, are kept.
+pub const PARTITION_W8: [[u16; 5]; 4] = [
+    [19132, 25510, 30392, 32768, 0],
+    [13928, 19855, 28540, 32768, 0],
+    [12522, 23679, 28629, 32768, 0],
+    [9896, 18783, 25853, 32768, 0],
+];
+
 /// `Default_Partition_Cdf[0..4]`: the partition symbol of a 16x16 block.
 pub const PARTITION_W16: [[u16; 11]; 4] = [
     [

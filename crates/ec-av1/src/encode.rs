@@ -1250,6 +1250,7 @@ fn code_square_inter(
             v: coeffs(&v.levels, SUB / 2),
             mode: DC_PRED as u8,
             skip,
+            eight: None,
             inter: Some(InterInfo {
                 mode: InterMode::NearestMv,
                 mv,
@@ -1671,6 +1672,15 @@ pub(crate) fn encode_key_frame_inner(
                         )
                     });
                 if !whole_legal && !split_legal {
+                    // lane-av1-rect r6: the 8x8-leaf path this branch could
+                    // take (a straddling 16x16 coded as two 8x8 leaves, see
+                    // `crate::tile::write_leaf8`) hits an index-out-of-bounds
+                    // in `code_square`'s edge-sample read (`Plane::edges`,
+                    // this file ~line 1027) the moment a leaf sits at the
+                    // true frame's own edge -- not yet debugged (r6 ran out
+                    // of budget on it) -- so this refuses exactly as before
+                    // rather than ship a panic. See the r6 handoff for the
+                    // ranked next step.
                     return Err(Error::unsupported(
                         "AV1 encode",
                         format!(
@@ -2312,6 +2322,7 @@ fn search_inter_block(
         mode: best.mode,
         skip: best.skip,
         inter: best.inter,
+        eight: None,
     }
 }
 
@@ -2847,6 +2858,7 @@ mod tests {
             v: Vec::new(),
             mode: 0,
             skip: false,
+            eight: None,
             inter: Some(InterInfo {
                 mode: InterMode::NearestMv,
                 mv: (0, 0),
@@ -3200,7 +3212,8 @@ mod tests {
     /// key frame and inter frame writers: 360 mod 32 == 8, so a 16x16 leaf's
     /// own half (`has_half` at the SUB level) itself straddles the true edge
     /// -- the genuine "needs an 8x8/rectangular transform" case neither
-    /// writer codes. Both must refuse it the same way.
+    /// writer codes (r6: the key writer's 8x8-leaf path exists but is not
+    /// wired live yet, see the r6 handoff). Both must refuse it the same way.
     #[test]
     fn both_writers_refuse_the_same_strictly_before_half_straddle_size() {
         let (width, height) = (640usize, 360usize);
