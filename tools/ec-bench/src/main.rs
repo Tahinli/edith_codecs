@@ -254,22 +254,19 @@ fn parse_ratio(s: &str) -> Option<f64> {
 }
 
 // ---------------------------------------------------------------------------
-// h265: encode only -- this crate has no decoder (intra-only HEVC encoder).
+// h265: encode, then software-decode the encoded stream back.
 // ---------------------------------------------------------------------------
 
 fn bench_h265_encode(rows: &mut Vec<Row>) {
-    rows.push(missing_direction(
-        "ec-h265",
-        "decode",
-        "encode-only crate, no decoder present",
-    ));
     let Some(src) = real_video("h264").or_else(|| real_video("hevc")) else {
+        rows.push(missing("ec-h265", "decode"));
         rows.push(missing("ec-h265", "encode"));
         return;
     };
     let (planes, w, h, n) = extract_yuv420p(&src, 640, 360, 10);
     if n == 0 {
         rows.push(missing("ec-h265", "encode"));
+        rows.push(missing("ec-h265", "decode"));
         return;
     }
     let cfg = H265Config::new(w, h);
@@ -277,6 +274,7 @@ fn bench_h265_encode(rows: &mut Vec<Row>) {
     let frame_len = (w * h + 2 * (w.div_ceil(2) * h.div_ceil(2))) as usize;
     let cw = w.div_ceil(2);
     let ch = h.div_ceil(2);
+    let mut aus = Vec::new();
     let start = Instant::now();
     for frame in planes.chunks_exact(frame_len) {
         let (y, rest) = frame.split_at((w * h) as usize);
@@ -293,7 +291,7 @@ fn bench_h265_encode(rows: &mut Vec<Row>) {
         )
         .expect("i420 frame");
         let _ = ch; // silence unused if plane_geometry ignores it
-        enc.encode_idr(&vf).expect("h265 encode");
+        aus.push(enc.encode_idr(&vf).expect("h265 encode").au);
     }
     let wall = start.elapsed().as_secs_f64();
     let media_s = n as f64 / 30.0;
@@ -301,6 +299,20 @@ fn bench_h265_encode(rows: &mut Vec<Row>) {
         component: "ec-h265",
         direction: "encode",
         content: format!("{w}x{h}, {n} frames, IDR-only"),
+        media: format!("{media_s:.1}s"),
+        wall_ms: wall * 1000.0,
+        rtf: (wall > 0.0).then_some(media_s / wall),
+    });
+
+    let start = Instant::now();
+    for au in &aus {
+        ec_h265::decode::decode_idr_au(au).expect("h265 decode");
+    }
+    let wall = start.elapsed().as_secs_f64();
+    rows.push(Row {
+        component: "ec-h265",
+        direction: "decode",
+        content: format!("{w}x{h}, {n} frames, own IDR stream"),
         media: format!("{media_s:.1}s"),
         wall_ms: wall * 1000.0,
         rtf: (wall > 0.0).then_some(media_s / wall),
