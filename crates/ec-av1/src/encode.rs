@@ -2433,7 +2433,15 @@ mod tests {
         // 854x480 is covered separately by
         // `an_854x480_picture_round_trips_through_its_padding`, which its own
         // doc comment explains was worth keeping as its own test.
-        for &(width, height) in &[(1920usize, 1080usize), (640, 352), (1280, 720)] {
+        for &(width, height) in &[
+            (1920usize, 1080usize),
+            (640, 352),
+            (1280, 720),
+            (64, 56),
+            (854, 480),
+            (216, 96),
+            (192, 120),
+        ] {
             let picture = test_card(width, height);
             let encoded = encode_key_frame(&picture, 100, 0.5).unwrap();
             assert_eq!(
