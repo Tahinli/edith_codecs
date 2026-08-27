@@ -337,6 +337,13 @@ impl<'a> SymbolDecoder<'a> {
         symbol
     }
 
+    /// Debug-only: the current bit offset into `data`, for cross-checking
+    /// against a reference decoder's own `aom_reader_tell()` while chasing a
+    /// desync (see `EC_AV1_TRACE`). Not spec state, just `self.bit`.
+    pub(crate) fn debug_bitpos(&self) -> usize {
+        self.bit
+    }
+
     /// Reads `bits` raw bits, most significant first — the `L(n)` descriptor
     /// of spec 4.10.4.
     pub fn literal(&mut self, bits: u32) -> u32 {
