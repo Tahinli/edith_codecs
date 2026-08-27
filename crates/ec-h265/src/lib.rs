@@ -5,6 +5,7 @@
 pub mod cabac;
 pub mod ctu;
 pub mod deblock;
+pub mod decode;
 pub mod encoder;
 pub mod intra;
 pub mod residual;
