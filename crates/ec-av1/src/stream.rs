@@ -13,6 +13,7 @@
 use ec_av1_syntax::{Av1Parser, FrameType, ObuKind, TxMode};
 use ec_core::{Error, Result};
 
+use crate::decode;
 use crate::decode::{decode_inter_frame_tile, decode_key_frame_tile};
 use crate::encode::Picture;
 
@@ -615,6 +616,147 @@ mod tests {
                 eprintln!("SKIP a_real_libaom_gradients_stream_with_cdef_decodes_pixel_exact: {e}");
             }
         }
+    }
+
+    /// Path to a real `aomenc` build carrying the reference options this
+    /// fixture needs (`--max-partition-size`, `--enable-tx-size-search`,
+    /// `--loopfilter-control`) -- this box's `ffmpeg` links a libaom too old
+    /// to expose `enable-tx-size-search`/`loopfilter-control` through its
+    /// own `-aom-params` passthrough (probed live: "Cannot find aom
+    /// option"), so [`a_real_aomenc_filter_intra_stream_decodes_pixel_exact`]
+    /// shells out to the standalone binary instead of ffmpeg's libaom-av1
+    /// wrapper every other test here uses. `EC_AV1_AOMENC` overrides the
+    /// default dev-build path; the test skips (not fails) when neither this
+    /// nor `ffmpeg` is present.
+    fn aomenc_path() -> std::path::PathBuf {
+        std::env::var_os("EC_AV1_AOMENC")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| "/tmp/libaom-src/build/encoder/aomenc".into())
+    }
+
+    fn have_aomenc() -> bool {
+        aomenc_path().is_file()
+    }
+
+    /// A real `aomenc` filter-intra fixture: every other intra mode disabled
+    /// (smooth/paeth/directional/angle-delta) and
+    /// `--max-partition-size=32` (past which `av1_filter_intra_allowed_bsize`'s
+    /// <=32x32 bound means `use_filter_intra` never reads at all, spec
+    /// 5.11.14), so the only way this frame codes is `DC_PRED` with filter
+    /// intra on top -- `--loopfilter-control=0` is required too: this
+    /// decoder has no in-loop deblocking filter at all, and libaom's default
+    /// (on) smooths every block-boundary column, which first looked like a
+    /// filter-intra math bug (mismatches straddling the 32-pixel block
+    /// seam) until the recipe without it round-tripped byte-exact. Checks
+    /// [`decode::filter_intra_hits`] actually moved (a process-global
+    /// counter, so before/after rather than an absolute value) to prove the
+    /// symbol fired, then pixel-exactness against ffmpeg's own decode of the
+    /// identical bytes on every plane.
+    #[test]
+    fn a_real_aomenc_filter_intra_stream_decodes_pixel_exact() {
+        if !have_ffmpeg() {
+            eprintln!("SKIP a_real_aomenc_filter_intra_stream_decodes_pixel_exact: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!(
+                "SKIP a_real_aomenc_filter_intra_stream_decodes_pixel_exact: no aomenc at {}",
+                aomenc_path().display()
+            );
+            return;
+        }
+        let (width, height) = (64usize, 64usize);
+        let y4m = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "gradients=size=64x64:seed=42:duration=0.04:rate=25",
+                "-pix_fmt",
+                "yuv420p",
+                "-f",
+                "yuv4mpegpipe",
+                "-",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ffmpeg failed to run");
+        assert!(
+            y4m.status.success(),
+            "ffmpeg refused to generate the y4m fixture: {}",
+            String::from_utf8_lossy(&y4m.stderr)
+        );
+        let mut child = Command::new(aomenc_path())
+            .args([
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                "--cq-level=40",
+                "--cpu-used=0",
+                "--enable-filter-intra=1",
+                "--enable-smooth-intra=0",
+                "--enable-paeth-intra=0",
+                "--enable-directional-intra=0",
+                "--enable-angle-delta=0",
+                "--enable-tx-size-search=0",
+                "--enable-cdef=0",
+                "--max-partition-size=32",
+                "--loopfilter-control=0",
+                "--enable-palette=0",
+                "--enable-intrabc=0",
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("aomenc failed to start");
+        child
+            .stdin
+            .take()
+            .expect("aomenc stdin")
+            .write_all(&y4m.stdout)
+            .expect("writing the y4m fixture to aomenc");
+        let out = child.wait_with_output().expect("aomenc failed to run");
+        assert!(
+            out.status.success(),
+            "aomenc refused the fixture: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stream = out.stdout;
+        let before = decode::filter_intra_hits();
+        // `screen_content_tools_determination` (libaom encoder_utils.c) is a
+        // real internal trial-encode/PSNR comparison, not a flag this CLI
+        // exposes a knob for -- on this flat gradient fixture it lands on
+        // `allow_screen_content_tools=0` most runs but occasionally trips
+        // over its 0.9 dB threshold the other way even with palette/intrabc
+        // both disabled. That is a genuine separate gap (`decode_stream`
+        // never reads `intrabc`/`palette_mode_info`), not a filter-intra
+        // regression, so it is skipped here exactly as
+        // `a_real_libaom_gradients_stream_with_cdef_decodes_pixel_exact`
+        // above skips its own still-unsupported-gap runs.
+        let frames = match decode_stream(&stream) {
+            Ok(frames) => frames,
+            Err(e) => {
+                eprintln!("SKIP a_real_aomenc_filter_intra_stream_decodes_pixel_exact: {e}");
+                return;
+            }
+        };
+        assert!(
+            decode::filter_intra_hits() > before,
+            "use_filter_intra never fired decoding this stream"
+        );
+        let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
+        assert_eq!(frames[0].y, ffmpeg_frames[0].y, "luma vs ffmpeg");
+        assert_eq!(frames[0].u, ffmpeg_frames[0].u, "U vs ffmpeg");
+        assert_eq!(frames[0].v, ffmpeg_frames[0].v, "V vs ffmpeg");
     }
 
     /// scratch: isolate a pinned mismatching stream's first divergent pixel.

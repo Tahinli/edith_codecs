@@ -38,6 +38,18 @@ const PARTITION_NONE: usize = 0;
 const PARTITION_SPLIT: usize = 3;
 const SB_MI: u32 = 16;
 const BLOCK_MI: u32 = 8;
+
+/// How many `use_filter_intra` symbols this decoder has read as `1`, across
+/// every call in the process -- the cheap counter [`filter_intra_hits`] gate
+/// tests read (before/after, not the absolute value) to prove a stream
+/// actually exercised the filter-intra predictor rather than silently
+/// skipping it.
+static FILTER_INTRA_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Current value of [`FILTER_INTRA_HITS`].
+pub(crate) fn filter_intra_hits() -> usize {
+    FILTER_INTRA_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
 const SUB_MI: u32 = 4;
 const MI: usize = 4;
 const SB: usize = 64;
@@ -624,7 +636,7 @@ fn read_intra_mode(
     cfl: bool,
     side: usize,
     enable_filter_intra: bool,
-) -> Result<(bool, usize, Option<(i32, i32)>)> {
+) -> Result<(bool, usize, Option<(i32, i32)>, Option<usize>)> {
     let trace = std::env::var_os("EC_AV1_TRACE").is_some();
     let skip = dec.symbol(&mut cdfs.skip[0]) != 0;
     if trace {
@@ -669,6 +681,7 @@ fn read_intra_mode(
     // of the tile (the pinned CfL stream's actual bug: partition/skip/mode
     // matched bit-exact, then `eob_pt` read 5 instead of 6, because this
     // symbol's bits were never consumed).
+    let mut filter_intra = None;
     if mode == DC_PRED
         && enable_filter_intra
         && let Some(class) = filter_intra_size_class(side)
@@ -681,18 +694,15 @@ fn read_intra_mode(
             );
         }
         if use_filter_intra {
-            // libaom still reads `filter_intra_mode` to stay in sync, but
-            // this decoder does not implement filter-intra prediction
-            // (spec 7.11.2.3's 5-tap recursive filter) -- refuse rather
-            // than silently miscode the reconstruction, the same pattern
-            // as this crate's other `Error::unsupported` refusals.
-            let _ = dec.symbol(&mut cdfs.filter_intra_mode);
-            return Err(unsupported(
-                "a filter-intra block (this decoder does not implement the 5.11.14 recursive predictor)",
-            ));
+            FILTER_INTRA_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let fi_mode = dec.symbol(&mut cdfs.filter_intra_mode);
+            if trace {
+                eprintln!("TRACE filter_intra_mode value={fi_mode}");
+            }
+            filter_intra = Some(fi_mode);
         }
     }
-    Ok((skip, mode, alpha))
+    Ok((skip, mode, alpha, filter_intra))
 }
 
 /// `UV_CFL_PRED` (spec 6.10.19's chroma intra mode enum): the fourteenth
@@ -830,17 +840,29 @@ impl PlaneBuf {
         reach: Reach,
         residual: &[i32],
         cfl: Option<(i32, &[i32])>,
+        filter_intra: Option<usize>,
     ) {
         let (above, left, corner) = self.edges(x, y, side, reach);
         let mut prediction = vec![0u8; side * side];
-        predict(
-            mode as u8,
-            above.as_deref(),
-            left.as_deref(),
-            corner,
-            side,
-            &mut prediction,
-        );
+        if let Some(fi_mode) = filter_intra {
+            crate::intra::predict_filter_intra(
+                fi_mode,
+                above.as_deref(),
+                left.as_deref(),
+                corner,
+                side,
+                &mut prediction,
+            );
+        } else {
+            predict(
+                mode as u8,
+                above.as_deref(),
+                left.as_deref(),
+                corner,
+                side,
+                &mut prediction,
+            );
+        }
         for row in 0..side {
             for col in 0..side {
                 let idx = row * side + col;
@@ -878,6 +900,7 @@ fn read_plane(
     tx_side: usize,
     base_q_idx: u8,
     cfl: Option<(i32, &[i32])>,
+    filter_intra: Option<usize>,
 ) -> Result<Vec<i32>> {
     let skip_ctx = if plane_idx == 0 {
         0
@@ -911,7 +934,16 @@ fn read_plane(
             &residual[..4.min(residual.len())]
         );
     }
-    plane.reconstruct(x, y, side, predict_mode, reach, &residual, cfl);
+    plane.reconstruct(
+        x,
+        y,
+        side,
+        predict_mode,
+        reach,
+        &residual,
+        cfl,
+        filter_intra,
+    );
     Ok(if tx_side == side {
         residual_grid_placeholder(&levels, side)
     } else {
@@ -951,7 +983,7 @@ fn decode_block(
 ) -> Result<()> {
     let (r, c) = at;
     let (px, py) = (c * SUB, r * SUB);
-    let (skip, mode, alpha) = read_intra_mode(
+    let (skip, mode, alpha, filter_intra) = read_intra_mode(
         dec,
         cdfs,
         neighbours.above_mode[c],
@@ -967,7 +999,16 @@ fn decode_block(
     if skip {
         // A skipped block codes no residual syntax at all (spec 5.11.34):
         // straight prediction, on every plane.
-        y.reconstruct(px, py, side, mode, reach, &vec![0i32; side * side], None);
+        y.reconstruct(
+            px,
+            py,
+            side,
+            mode,
+            reach,
+            &vec![0i32; side * side],
+            None,
+            filter_intra,
+        );
         let ac = alpha.map(|_| cfl_ac_q3(y, px, py, side));
         u.reconstruct(
             cpx,
@@ -977,6 +1018,7 @@ fn decode_block(
             Reach::none(),
             &vec![0i32; chroma_side * chroma_side],
             alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
+            None,
         );
         v.reconstruct(
             cpx,
@@ -986,6 +1028,7 @@ fn decode_block(
             Reach::none(),
             &vec![0i32; chroma_side * chroma_side],
             alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
+            None,
         );
         luma_grid = vec![0i32; side * side];
         u_grid = vec![0i32; chroma_side * chroma_side];
@@ -993,8 +1036,23 @@ fn decode_block(
     } else {
         let around = neighbours.around(at, side);
         luma_grid = read_plane(
-            dec, cdfs, luma_set, scans.0, 0, around[0], mode, mode, reach, y, px, py, side,
-            luma_tx, base_q_idx, None,
+            dec,
+            cdfs,
+            luma_set,
+            scans.0,
+            0,
+            around[0],
+            mode,
+            mode,
+            reach,
+            y,
+            px,
+            py,
+            side,
+            luma_tx,
+            base_q_idx,
+            None,
+            filter_intra,
         )?;
         let ac = alpha.map(|_| cfl_ac_q3(y, px, py, side));
         u_grid = read_plane(
@@ -1014,6 +1072,7 @@ fn decode_block(
             chroma_tx,
             base_q_idx,
             alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
+            None,
         )?;
         v_grid = read_plane(
             dec,
@@ -1032,6 +1091,7 @@ fn decode_block(
             chroma_tx,
             base_q_idx,
             alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
+            None,
         )?;
     }
     neighbours.record(at, side, mode, &[luma_grid, u_grid, v_grid]);
@@ -1076,7 +1136,7 @@ fn decode_leaf8(
     // An 8x8 leaf is well within `is_cfl_allowed`'s <=32x32 bound (spec
     // 5.11.5), so it reads the CFL-allowed `uv_mode_cfl` CDF, like every other
     // `decode_block` caller at 16x16 and up.
-    let (skip, mode, alpha) = read_intra_mode(
+    let (skip, mode, alpha, filter_intra) = read_intra_mode(
         dec,
         cdfs,
         above_mode,
@@ -1090,7 +1150,7 @@ fn decode_leaf8(
     let (cpx, cpy) = (px / 2, py / 2);
     let (luma_grid, u_grid, v_grid);
     if skip {
-        y.reconstruct(px, py, 8, mode, reach, &vec![0i32; 64], None);
+        y.reconstruct(px, py, 8, mode, reach, &vec![0i32; 64], None, filter_intra);
         let ac = alpha.map(|_| cfl_ac_q3(y, px, py, 8));
         u.reconstruct(
             cpx,
@@ -1100,6 +1160,7 @@ fn decode_leaf8(
             Reach::none(),
             &vec![0i32; 16],
             alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
+            None,
         );
         v.reconstruct(
             cpx,
@@ -1109,6 +1170,7 @@ fn decode_leaf8(
             Reach::none(),
             &vec![0i32; 16],
             alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
+            None,
         );
         luma_grid = vec![0i32; 64];
         u_grid = vec![0i32; 16];
@@ -1132,6 +1194,7 @@ fn decode_leaf8(
             TX8,
             base_q_idx,
             None,
+            filter_intra,
         )?;
         let ac = alpha.map(|_| cfl_ac_q3(y, px, py, 8));
         u_grid = read_plane(
@@ -1151,6 +1214,7 @@ fn decode_leaf8(
             TX4,
             base_q_idx,
             alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
+            None,
         )?;
         v_grid = read_plane(
             dec,
@@ -1169,6 +1233,7 @@ fn decode_leaf8(
             TX4,
             base_q_idx,
             alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
+            None,
         )?;
     }
     neighbours.record_mi(leaf_mi, 8, &[luma_grid, u_grid, v_grid]);
@@ -2265,7 +2330,16 @@ fn decode_inter_block(
 
         let reach = Reach::of(side, px, py, y.width, y.height);
         if skip {
-            y.reconstruct(px, py, side, mode, reach, &vec![0i32; side * side], None);
+            y.reconstruct(
+                px,
+                py,
+                side,
+                mode,
+                reach,
+                &vec![0i32; side * side],
+                None,
+                None,
+            );
             let ac = alpha.map(|_| cfl_ac_q3(y, px, py, side));
             u.reconstruct(
                 cpx,
@@ -2275,6 +2349,7 @@ fn decode_inter_block(
                 Reach::none(),
                 &vec![0i32; chroma_side * chroma_side],
                 alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
+                None,
             );
             v.reconstruct(
                 cpx,
@@ -2284,6 +2359,7 @@ fn decode_inter_block(
                 Reach::none(),
                 &vec![0i32; chroma_side * chroma_side],
                 alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
+                None,
             );
             luma_grid = vec![0i32; side * side];
             u_grid = vec![0i32; chroma_side * chroma_side];
@@ -2307,6 +2383,7 @@ fn decode_inter_block(
                 luma_tx,
                 base_q_idx,
                 None,
+                None,
             )?;
             let ac = alpha.map(|_| cfl_ac_q3(y, px, py, side));
             u_grid = read_plane(
@@ -2326,6 +2403,7 @@ fn decode_inter_block(
                 chroma_tx,
                 base_q_idx,
                 alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
+                None,
             )?;
             v_grid = read_plane(
                 dec,
@@ -2344,6 +2422,7 @@ fn decode_inter_block(
                 chroma_tx,
                 base_q_idx,
                 alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
+                None,
             )?;
         }
     }
@@ -2634,7 +2713,16 @@ fn decode_inter_block8(
 
         let reach = Reach::of(SIDE, px, py, y.width, y.height);
         if skip {
-            y.reconstruct(px, py, SIDE, mode, reach, &vec![0i32; SIDE * SIDE], None);
+            y.reconstruct(
+                px,
+                py,
+                SIDE,
+                mode,
+                reach,
+                &vec![0i32; SIDE * SIDE],
+                None,
+                None,
+            );
             u.reconstruct(
                 cpx,
                 cpy,
@@ -2642,6 +2730,7 @@ fn decode_inter_block8(
                 DC_PRED,
                 Reach::none(),
                 &vec![0i32; CHROMA_SIDE * CHROMA_SIDE],
+                None,
                 None,
             );
             v.reconstruct(
@@ -2651,6 +2740,7 @@ fn decode_inter_block8(
                 DC_PRED,
                 Reach::none(),
                 &vec![0i32; CHROMA_SIDE * CHROMA_SIDE],
+                None,
                 None,
             );
             luma_grid = vec![0i32; SIDE * SIDE];
@@ -2675,6 +2765,7 @@ fn decode_inter_block8(
                 TX8,
                 base_q_idx,
                 None,
+                None,
             )?;
             u_grid = read_plane(
                 dec,
@@ -2693,6 +2784,7 @@ fn decode_inter_block8(
                 TX4,
                 base_q_idx,
                 None,
+                None,
             )?;
             v_grid = read_plane(
                 dec,
@@ -2710,6 +2802,7 @@ fn decode_inter_block8(
                 CHROMA_SIDE,
                 TX4,
                 base_q_idx,
+                None,
                 None,
             )?;
         }
