@@ -65,15 +65,52 @@ const DST_MATRIX: [[i32; 4]; 4] = [
 
 /// `M[m][n]` of the 32-point matrix, mirrored out of the stored half.
 #[inline]
-fn m32(row: usize, col: usize) -> i32 {
+const fn m32(row: usize, col: usize) -> i32 {
     if col < 16 {
         TRANS_MATRIX_HALF[row][col]
-    } else if row.is_multiple_of(2) {
+    } else if row % 2 == 0 {
         TRANS_MATRIX_HALF[row][31 - col]
     } else {
         -TRANS_MATRIX_HALF[row][31 - col]
     }
 }
+
+/// The full 32x32 matrix, mirrored out at compile time so the hot butterfly
+/// loops below index a flat table instead of taking [`m32`]'s per-element
+/// branch: same values (this *is* [`m32`], evaluated ahead of time), fewer
+/// instructions per multiply-add.
+const fn build_full_matrix() -> [[i32; 32]; 32] {
+    let mut out = [[0i32; 32]; 32];
+    let mut row = 0;
+    while row < 32 {
+        let mut col = 0;
+        while col < 32 {
+            out[row][col] = m32(row, col);
+            col += 1;
+        }
+        row += 1;
+    }
+    out
+}
+const FULL_MATRIX: [[i32; 32]; 32] = build_full_matrix();
+
+/// [`FULL_MATRIX`] transposed: `FULL_MATRIX_T[col][row] == FULL_MATRIX[row][col]`.
+/// [`inverse_1d`]'s odd sum walks a fixed column across varying rows, which
+/// this makes a contiguous read.
+const fn transpose(m: &[[i32; 32]; 32]) -> [[i32; 32]; 32] {
+    let mut out = [[0i32; 32]; 32];
+    let mut row = 0;
+    while row < 32 {
+        let mut col = 0;
+        while col < 32 {
+            out[col][row] = m[row][col];
+            col += 1;
+        }
+        row += 1;
+    }
+    out
+}
+const FULL_MATRIX_T: [[i32; 32]; 32] = transpose(&FULL_MATRIX);
 
 /// `levelScale[k]`, 8.6.3.
 const LEVEL_SCALE: [i32; 6] = [40, 45, 51, 57, 64, 72];
@@ -110,8 +147,9 @@ fn inverse_1d(n: usize, src: &[i32], dst: &mut [i32]) {
     inverse_1d(half, &even_src[..half], &mut even[..half]);
     for x in 0..half {
         let mut odd = 0i32;
+        let matrix_col = &FULL_MATRIX_T[x];
         for j in 0..half {
-            odd += m32((2 * j + 1) * stride, x) * src[2 * j + 1];
+            odd += matrix_col[(2 * j + 1) * stride] * src[2 * j + 1];
         }
         dst[x] = even[x] + odd;
         dst[n - 1 - x] = even[x] - odd;
@@ -141,8 +179,9 @@ fn forward_1d(n: usize, src: &[i32], dst: &mut [i32]) {
     for j in 0..half {
         dst[2 * j] = even[j];
         let mut odd = 0i32;
+        let matrix_row = &FULL_MATRIX[(2 * j + 1) * stride];
         for (x, &diff) in diffs[..half].iter().enumerate() {
-            odd += m32((2 * j + 1) * stride, x) * diff;
+            odd += matrix_row[x] * diff;
         }
         dst[2 * j + 1] = odd;
     }
