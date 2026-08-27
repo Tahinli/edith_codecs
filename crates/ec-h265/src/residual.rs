@@ -308,6 +308,42 @@ fn levels_bits(
     enc.bit_count() - before
 }
 
+/// [`levels_bits`], given the header state instead of deriving it from
+/// `levels` — what [`rdoq`]'s inner loop calls once the header is
+/// incrementally maintained.
+#[allow(clippy::too_many_arguments)]
+fn levels_bits_with(
+    enc: &mut CabacEncoder,
+    base: &CabacState,
+    levels: &[i32],
+    log2_size: u32,
+    c_idx: usize,
+    scan_idx: usize,
+    cbf_ctx: usize,
+    coded: bool,
+    transform_skip: bool,
+    last_full: i32,
+    csbf: [bool; 64],
+) -> u64 {
+    enc.restore(base);
+    let before = enc.bit_count();
+    enc.encode_bin(cbf_ctx, u32::from(coded));
+    if coded {
+        encode_residual_with(
+            enc,
+            levels,
+            log2_size,
+            c_idx,
+            scan_idx,
+            false,
+            transform_skip,
+            last_full,
+            csbf,
+        );
+    }
+    enc.bit_count() - before
+}
+
 /// Rate-distortion quantisation of one transform block: each small level is
 /// offered the magnitudes below it, and takes one when the squared error it
 /// gives up costs less than the bits it saves.
@@ -369,11 +405,41 @@ pub fn rdoq(
             })
         })
         .collect();
-    for &i in order.iter().rev() {
+
+    // The header state `encode_residual` would otherwise rescan the whole
+    // block for on every trial, maintained incrementally instead: a trial
+    // only ever changes one coefficient. `nz_positions` lists the positions
+    // that started non-zero, in the same descending scan order this loop
+    // visits them in, so "what becomes the new last position if this one
+    // empties" (the one hazard: the last position moves when its own
+    // coefficient is dropped) is a lookahead into the still-untouched region
+    // below, not a rescan.
+    let sub_wide = n >> 2;
+    let mut csbf = [false; 64];
+    let mut sub_count = [0i32; 64];
+    let mut nz_positions: Vec<i32> = Vec::new();
+    for (k, &i) in order.iter().enumerate().rev() {
+        if levels[i] != 0 {
+            nz_positions.push(k as i32);
+            let sub_idx = ((i / n) >> 2) * sub_wide + ((i % n) >> 2);
+            sub_count[sub_idx] += 1;
+            csbf[sub_idx] = true;
+        }
+    }
+    let mut cur_last = nz_positions.first().copied().unwrap_or(0);
+    let mut nz_idx = 0usize;
+
+    for (k, &i) in order.iter().enumerate().rev() {
         let level = levels[i];
-        if level == 0 || level.abs() > RDOQ_MAX_LEVEL {
+        if level == 0 {
             continue;
         }
+        let next_last = nz_positions.get(nz_idx + 1).copied().unwrap_or(0);
+        nz_idx += 1;
+        if level.abs() > RDOQ_MAX_LEVEL {
+            continue;
+        }
+        let sub_idx = ((i / n) >> 2) * sub_wide + ((i % n) >> 2);
         let mut tried = level.abs();
         for candidate in [level.abs() - 1, 0] {
             if candidate == tried {
@@ -382,9 +448,21 @@ pub fn rdoq(
             tried = candidate;
             let keep = levels[i];
             levels[i] = candidate * level.signum();
+            let now_zero = levels[i] == 0;
+            let sub_count_before = sub_count[sub_idx];
+            let csbf_before = csbf[sub_idx];
+            if now_zero {
+                sub_count[sub_idx] -= 1;
+                csbf[sub_idx] = sub_count[sub_idx] > 0;
+            }
+            let trial_last = if now_zero && k as i32 == cur_last {
+                next_last
+            } else {
+                cur_last
+            };
             let trial_dist = dist - err(keep, coeffs[i]) + err(levels[i], coeffs[i]);
-            let any = levels[..n * n].iter().any(|&l| l != 0);
-            let trial_bits = levels_bits(
+            let any = sub_count.iter().any(|&c| c > 0);
+            let trial_bits = levels_bits_with(
                 enc,
                 &base,
                 levels,
@@ -394,13 +472,20 @@ pub fn rdoq(
                 cbf_ctx,
                 any,
                 transform_skip,
+                trial_last,
+                csbf,
             );
             let trial = scale * trial_dist + lambda * trial_bits as f64;
             if trial < cost {
                 cost = trial;
                 dist = trial_dist;
+                if now_zero {
+                    cur_last = trial_last;
+                }
             } else {
                 levels[i] = keep;
+                sub_count[sub_idx] = sub_count_before;
+                csbf[sub_idx] = csbf_before;
             }
         }
     }
@@ -427,6 +512,29 @@ pub fn rdoq(
     levels[..n * n].iter().filter(|&&l| l != 0).count()
 }
 
+/// The coded-sub-block flags and last significant scan position that
+/// [`encode_residual`] needs, found by one pass over `levels` — the state
+/// [`rdoq`] maintains incrementally instead, since a trial only ever changes
+/// one coefficient and re-deriving this from scratch is what made the search
+/// quadratic in the block size per trial.
+fn residual_header(levels: &[i32], log2_size: u32, scan_idx: usize) -> (i32, [bool; 64]) {
+    let n = 1usize << log2_size;
+    let sub_wide = n >> 2;
+    let positions = &POSITIONS[(log2_size - 2) as usize][scan_idx];
+    let mut csbf = [false; 64];
+    let mut last_full = 0i32;
+    for yc in 0..n {
+        let row = &levels[yc * n..yc * n + n];
+        for (xc, &level) in row.iter().enumerate() {
+            if level != 0 {
+                csbf[(yc >> 2) * sub_wide + (xc >> 2)] = true;
+                last_full = last_full.max(i32::from(positions[yc * n + xc]));
+            }
+        }
+    }
+    (last_full, csbf)
+}
+
 /// Encode one transform block's levels.
 ///
 /// `levels` is row-major `n x n` with `levels[y * n + x]`, `c_idx` is 0 for luma
@@ -441,6 +549,34 @@ pub fn encode_residual(
     sign_hiding: bool,
     transform_skip: bool,
 ) {
+    let (last_full, csbf) = residual_header(levels, log2_size, scan_idx);
+    encode_residual_with(
+        enc,
+        levels,
+        log2_size,
+        c_idx,
+        scan_idx,
+        sign_hiding,
+        transform_skip,
+        last_full,
+        csbf,
+    );
+}
+
+/// [`encode_residual`], given the header state ([`residual_header`]'s output)
+/// instead of deriving it from `levels`.
+#[allow(clippy::too_many_arguments)]
+fn encode_residual_with(
+    enc: &mut CabacEncoder,
+    levels: &[i32],
+    log2_size: u32,
+    c_idx: usize,
+    scan_idx: usize,
+    sign_hiding: bool,
+    transform_skip: bool,
+    last_full: i32,
+    mut csbf: [bool; 64],
+) {
     if transform_skip && log2_size == 2 {
         let ctx_idx = ctx::TRANSFORM_SKIP + if c_idx == 0 { 0 } else { 1 };
         enc.encode_bin(ctx_idx, 1);
@@ -451,20 +587,6 @@ pub fn encode_residual(
     let pos_scan = scan(2, scan_idx);
     let chroma = c_idx > 0;
 
-    // One pass over the levels finds both the end of the scan and which
-    // sub-blocks hold anything.
-    let positions = &POSITIONS[(log2_size - 2) as usize][scan_idx];
-    let mut csbf = [false; 64];
-    let mut last_full = 0i32;
-    for yc in 0..n {
-        let row = &levels[yc * n..yc * n + n];
-        for (xc, &level) in row.iter().enumerate() {
-            if level != 0 {
-                csbf[(yc >> 2) * sub_wide + (xc >> 2)] = true;
-                last_full = last_full.max(i32::from(positions[yc * n + xc]));
-            }
-        }
-    }
     let last_sub = (last_full / 16) as usize;
     let last_pos = (last_full % 16) as usize;
     let (last_xs, last_ys) = sub_scan[last_sub];
