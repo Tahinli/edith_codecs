@@ -14,8 +14,11 @@ use std::time::Instant;
 
 use ec_av1::encode::Picture as Av1Picture;
 use ec_av1::encoder::{Av1Encoder, Colour, EncoderConfig as Av1Config};
-use ec_core::frame::{PixelFormat, Plane, VideoFrame};
-use ec_core::registry::MediaType;
+use ec_core::frame::{
+    AudioFrame, ChannelLayout, Frame, PixelFormat, Plane, SampleFormat, VideoFrame,
+};
+use ec_core::packet::Buf;
+use ec_core::registry::{Encoder as CoreEncoder, MediaType};
 use ec_h264::{
     Decoder as H264Decoder, Encoder as H264Encoder, EncoderConfig as H264Config, NalOutcome,
     PictureView,
@@ -40,6 +43,9 @@ fn main() {
     bench_h265_encode(&mut rows);
     bench_av1_encode(&mut rows);
     bench_audio_decode(&mut rows);
+    bench_audio_encode(&mut rows);
+    bench_truehd(&mut rows);
+    bench_container_demux(&mut rows);
     bench_image_decode(&mut rows);
     bench_inflate(&mut rows);
 
@@ -461,6 +467,382 @@ fn bench_audio_decode(rows: &mut Vec<Row>) {
             media: format!("{media_s:.1}s"),
             wall_ms: wall * 1000.0,
             rtf: (wall > 0.0 && media_s > 0.0).then_some(media_s / wall),
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// audio encode: real, decoded PCM (the same WAV fixture the decode rows
+// already read, run back through `AudioDecoder`'s own PCM path) fed to each
+// crate's own encoder at its default/representative settings.
+// ---------------------------------------------------------------------------
+
+/// `seconds` of real interleaved `f32` PCM, decoded through `ec-probe`'s own
+/// `Reader`/`AudioDecoder` route (the same one `bench_audio_decode` drives).
+fn real_pcm(seconds: f64) -> Option<(Vec<f32>, u32, usize)> {
+    let path = fixtures().join("audio/wav16-stereo-48000.wav");
+    let mut reader = Reader::open(&path).ok()?;
+    let stream = reader.default_stream(MediaType::Audio)?.index;
+    let mut dec = reader.make_decoder(stream).ok()?;
+    let channels = dec.channels();
+    let rate = dec.sample_rate();
+    let want = (seconds * f64::from(rate)) as usize * channels;
+    let mut pcm = Vec::new();
+    let mut out = Vec::new();
+    while pcm.len() < want {
+        match reader.next_packet() {
+            Ok(pkt) if pkt.stream == stream => {
+                if dec.decode(&pkt, &mut out).is_ok() {
+                    pcm.extend_from_slice(&out);
+                }
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    pcm.truncate(want - want % channels);
+    (!pcm.is_empty()).then_some((pcm, rate, channels))
+}
+
+fn bench_audio_encode(rows: &mut Vec<Row>) {
+    let Some((pcm, rate, channels)) = real_pcm(5.0) else {
+        for name in ["opus", "vorbis", "aac", "mp3", "flac", "alac", "ac3"] {
+            rows.push(missing(
+                Box::leak(format!("ec-{name}").into_boxed_str()),
+                "encode",
+            ));
+        }
+        return;
+    };
+    let frames = pcm.len() / channels;
+    let media_s = frames as f64 / f64::from(rate);
+    let content = format!("{media_s:.1}s wav16 {channels}ch @ {rate}Hz");
+
+    // opus: 20ms frames at the input rate, dropping a short tail frame.
+    {
+        let frame_size = rate as usize / 50;
+        let mut enc = ec_opus::Encoder::new(rate, channels, ec_opus::Application::Audio)
+            .expect("opus encoder");
+        let mut out = vec![0u8; 4000];
+        let start = Instant::now();
+        for chunk in pcm.chunks_exact(frame_size * channels) {
+            enc.encode_float(chunk, frame_size, &mut out)
+                .expect("opus encode");
+        }
+        let wall = start.elapsed().as_secs_f64();
+        rows.push(Row {
+            component: "ec-opus",
+            direction: "encode",
+            content: content.clone(),
+            media: format!("{media_s:.1}s"),
+            wall_ms: wall * 1000.0,
+            rtf: (wall > 0.0).then_some(media_s / wall),
+        });
+    }
+
+    // vorbis: quality 0.6, the level the oracle tests already encode at.
+    {
+        let mut enc = ec_vorbis::VorbisEncoder::new(ec_vorbis::EncoderConfig {
+            sample_rate: rate,
+            channels: channels as u16,
+            bitrate_bps: 0,
+            quality: 0.6,
+        })
+        .expect("vorbis encoder");
+        let start = Instant::now();
+        enc.push_interleaved(&pcm).expect("vorbis push");
+        enc.finish();
+        let mut n = 0usize;
+        loop {
+            match enc.next_packet() {
+                Ok(p) => n += p.data.len(),
+                Err(e) if e.is_eof() => break,
+                Err(e) => panic!("vorbis encode: {e}"),
+            }
+        }
+        let wall = start.elapsed().as_secs_f64();
+        let _ = n;
+        rows.push(Row {
+            component: "ec-vorbis",
+            direction: "encode",
+            content: content.clone(),
+            media: format!("{media_s:.1}s"),
+            wall_ms: wall * 1000.0,
+            rtf: (wall > 0.0).then_some(media_s / wall),
+        });
+    }
+
+    // aac: 128 kbit/s, raw (no ADTS wrap) -- the default config.
+    {
+        let mut enc = ec_aac::AacEncoder::new(ec_aac::AacEncoderConfig::default());
+        let start = Instant::now();
+        enc.push_pcm(&pcm, channels as u16, rate).expect("aac pcm");
+        enc.finish();
+        while enc.next_packet().is_ok() {}
+        let wall = start.elapsed().as_secs_f64();
+        rows.push(Row {
+            component: "ec-aac",
+            direction: "encode",
+            content: content.clone(),
+            media: format!("{media_s:.1}s"),
+            wall_ms: wall * 1000.0,
+            rtf: (wall > 0.0).then_some(media_s / wall),
+        });
+    }
+
+    // mp3: CBR 192 kbit/s, the incumbent-matching default the tests gate on.
+    {
+        let mut enc = ec_mp3::Mp3Encoder::new(ec_mp3::Mp3EncoderConfig {
+            bitrate_kbps: 192,
+            vbr_quality: None,
+        });
+        let start = Instant::now();
+        enc.push_pcm_f32(&pcm, channels as u16, rate)
+            .expect("mp3 pcm");
+        enc.finish();
+        while enc.next_packet().is_ok() {}
+        let wall = start.elapsed().as_secs_f64();
+        rows.push(Row {
+            component: "ec-mp3",
+            direction: "encode",
+            content: content.clone(),
+            media: format!("{media_s:.1}s"),
+            wall_ms: wall * 1000.0,
+            rtf: (wall > 0.0).then_some(media_s / wall),
+        });
+    }
+
+    // flac: single-shot, default config (4096-sample blocks, LPC-12), 16-bit.
+    {
+        let samples: Vec<i32> = pcm
+            .iter()
+            .map(|&s| (s.clamp(-1.0, 1.0) * 32767.0) as i32)
+            .collect();
+        let cfg = ec_flac::EncoderConfig::default();
+        let start = Instant::now();
+        let _ = ec_flac::encode(&cfg, &samples, channels, 16, rate).expect("flac encode");
+        let wall = start.elapsed().as_secs_f64();
+        rows.push(Row {
+            component: "ec-flac",
+            direction: "encode",
+            content: content.clone(),
+            media: format!("{media_s:.1}s"),
+            wall_ms: wall * 1000.0,
+            rtf: (wall > 0.0).then_some(media_s / wall),
+        });
+    }
+
+    // alac: 4096-sample frames, 16-bit -- same shape the round-trip tests use.
+    {
+        let samples: Vec<i32> = pcm
+            .iter()
+            .map(|&s| (s.clamp(-1.0, 1.0) * 32767.0) as i32)
+            .collect();
+        let enc = ec_alac::AlacEncoder::new(rate, channels as u8, 16, 4096).expect("alac encoder");
+        let per_frame = 4096 * channels;
+        let start = Instant::now();
+        for chunk in samples.chunks(per_frame) {
+            let _ = enc.encode_frame(chunk);
+        }
+        let wall = start.elapsed().as_secs_f64();
+        rows.push(Row {
+            component: "ec-alac",
+            direction: "encode",
+            content: content.clone(),
+            media: format!("{media_s:.1}s"),
+            wall_ms: wall * 1000.0,
+            rtf: (wall > 0.0).then_some(media_s / wall),
+        });
+    }
+
+    // ac3: 192 kbit/s -- only if the source's channel count is one A/52 codes.
+    if (1..=6).contains(&channels) && matches!(rate, 48_000 | 44_100 | 32_000) {
+        let mut enc = ec_ac3::Ac3Encoder::new(ec_ac3::EncoderConfig {
+            sample_rate: rate,
+            channels: channels as u16,
+            bitrate_kbps: 192,
+        })
+        .expect("ac3 encoder");
+        let start = Instant::now();
+        enc.push_pcm_f32(&pcm).expect("ac3 pcm");
+        enc.finish();
+        loop {
+            match enc.next_packet() {
+                Ok(_) => {}
+                Err(e) if e.is_eof() => break,
+                Err(e) => panic!("ac3 encode: {e}"),
+            }
+        }
+        let wall = start.elapsed().as_secs_f64();
+        rows.push(Row {
+            component: "ec-ac3",
+            direction: "encode",
+            content,
+            media: format!("{media_s:.1}s"),
+            wall_ms: wall * 1000.0,
+            rtf: (wall > 0.0).then_some(media_s / wall),
+        });
+    } else {
+        rows.push(missing_direction(
+            "ec-ac3",
+            "encode",
+            "source channel/rate combination is not one A/52 codes",
+        ));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// truehd: no fixture stream exists yet, so this round-trips the new encoder
+// through its own decoder, same shape as ec-h265's own-stream decode row.
+// ---------------------------------------------------------------------------
+
+fn bench_truehd(rows: &mut Vec<Row>) {
+    let Some((pcm, rate, channels)) = real_pcm(5.0) else {
+        rows.push(missing("ec-truehd", "encode"));
+        rows.push(missing("ec-truehd", "decode"));
+        return;
+    };
+    if channels != 2 || !matches!(rate, 48_000 | 44_100 | 96_000 | 88_200 | 192_000 | 176_400) {
+        rows.push(missing_direction(
+            "ec-truehd",
+            "encode",
+            "this encoder writes 44.1/48 kHz-family stereo only",
+        ));
+        rows.push(missing_direction(
+            "ec-truehd",
+            "decode",
+            "this encoder writes 44.1/48 kHz-family stereo only",
+        ));
+        return;
+    }
+    let n = pcm.len() / channels;
+    let media_s = n as f64 / f64::from(rate);
+    let mut bytes = Vec::with_capacity(pcm.len() * 4);
+    for &s in &pcm {
+        let sample = (s.clamp(-1.0, 1.0) * 8_388_607.0) as i32;
+        bytes.extend_from_slice(&(sample << 8).to_le_bytes());
+    }
+    let frame = AudioFrame::try_new(
+        SampleFormat::S32,
+        false,
+        ChannelLayout::Stereo,
+        rate,
+        n,
+        vec![Buf::from_vec(bytes)],
+    )
+    .expect("audio frame");
+
+    let mut enc = ec_truehd::TrueHdEncoder::new(rate).expect("truehd encoder");
+    let start = Instant::now();
+    enc.send_frame(&Frame::Audio(frame)).expect("truehd send");
+    enc.flush().expect("truehd flush");
+    let mut thd = Vec::new();
+    while let Ok(pkt) = enc.receive_packet() {
+        thd.extend_from_slice(&pkt.data);
+    }
+    let wall = start.elapsed().as_secs_f64();
+    rows.push(Row {
+        component: "ec-truehd",
+        direction: "encode",
+        content: format!("{media_s:.1}s wav16 stereo @ {rate}Hz"),
+        media: format!("{media_s:.1}s"),
+        wall_ms: wall * 1000.0,
+        rtf: (wall > 0.0).then_some(media_s / wall),
+    });
+
+    let mut dec = ec_truehd::TrueHdDecoder::new();
+    let start = Instant::now();
+    let mut samples = 0u64;
+    let mut pos = 0usize;
+    while pos < thd.len() {
+        let Ok(len) = ec_truehd::frame_length(&thd[pos..]) else {
+            break;
+        };
+        if len == 0 || pos + len > thd.len() {
+            break;
+        }
+        if let Ok(Some(f)) = dec.decode_access_unit(&thd[pos..pos + len]) {
+            samples += (f.data[0].len() / 4 / channels) as u64;
+        }
+        pos += len;
+    }
+    let wall = start.elapsed().as_secs_f64();
+    let media_s = samples as f64 / f64::from(rate);
+    rows.push(Row {
+        component: "ec-truehd",
+        direction: "decode",
+        content: "own encoded stream, stereo".to_string(),
+        media: format!("{media_s:.1}s"),
+        wall_ms: wall * 1000.0,
+        rtf: (wall > 0.0).then_some(media_s / wall),
+    });
+}
+
+// ---------------------------------------------------------------------------
+// container demux: whole-file `ec-matroska`/`ec-mp4` packet reads (through
+// `ec-probe`'s own container routing) over real muxes already on disk.
+// ---------------------------------------------------------------------------
+
+/// Container-level duration (`format=duration`), for a mux whose per-stream
+/// packets carry no duration field of their own (some Matroska tracks don't).
+fn format_duration(path: &Path) -> Option<String> {
+    let out = Command::new("ffprobe")
+        .args(["-v", "error", "-show_entries", "format=duration"])
+        .args(["-of", "default=nw=1:nk=1"])
+        .arg(path)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!s.is_empty() && s != "N/A").then_some(s)
+}
+
+fn bench_container_demux(rows: &mut Vec<Row>) {
+    for (component, ext) in [("ec-matroska", "mkv"), ("ec-mp4", "mp4")] {
+        let Some(src) = [fixtures().join("video"), home().join("Videos")]
+            .into_iter()
+            .filter_map(|d| std::fs::read_dir(d).ok())
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some(ext))
+            .max_by_key(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+        else {
+            rows.push(missing(component, "demux"));
+            continue;
+        };
+        let Ok(mut reader) = Reader::open(&src) else {
+            rows.push(missing(component, "demux"));
+            continue;
+        };
+        let file_mb = std::fs::metadata(&src).map(|m| m.len()).unwrap_or(0) as f64 / 1_000_000.0;
+        let duration_s = [
+            ffprobe_field(&src, "v:0", "duration"),
+            ffprobe_field(&src, "a:0", "duration"),
+            format_duration(&src),
+        ]
+        .into_iter()
+        .find_map(|s| s.and_then(|s| s.parse::<f64>().ok()))
+        .unwrap_or(0.0);
+        let mut packets = 0u64;
+        let start = Instant::now();
+        loop {
+            match reader.next_packet() {
+                Ok(_) => packets += 1,
+                Err(_) => break,
+            }
+        }
+        let wall = start.elapsed().as_secs_f64();
+        let name = src.file_name().unwrap().to_string_lossy().into_owned();
+        rows.push(Row {
+            component,
+            direction: "demux",
+            content: format!("{name} ({file_mb:.1} MB, {packets} packets)"),
+            media: format!("{duration_s:.1}s"),
+            wall_ms: wall * 1000.0,
+            rtf: (wall > 0.0 && duration_s > 0.0).then_some(duration_s / wall),
         });
     }
 }
