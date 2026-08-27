@@ -103,6 +103,9 @@ pub fn predict(
     assert_eq!(dst.len(), block_w * block_h, "the destination is the block");
     assert!(!reference.is_empty(), "a reference plane has samples");
 
+    #[cfg(test)]
+    let stage_t = std::time::Instant::now();
+
     let x0 = x_q4.div_euclid(16);
     let xfrac = x_q4.rem_euclid(16) as usize;
     let y0 = y_q4.div_euclid(16);
@@ -136,6 +139,9 @@ pub fn predict(
             dst[row * block_w + col] = round2(sum, INTER_ROUND_1).clamp(0, 255) as u8;
         }
     }
+
+    #[cfg(test)]
+    crate::encode::stage_add(1, stage_t.elapsed());
 }
 
 #[cfg(test)]
