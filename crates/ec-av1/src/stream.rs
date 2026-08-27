@@ -10,7 +10,7 @@
 //! are `pub(crate)`, and rightly so: the wire is `stream`, everything else is
 //! an implementation detail of how this crate happens to build it).
 
-use ec_av1_syntax::{Av1Parser, CdefParams, FrameType, ObuKind};
+use ec_av1_syntax::{Av1Parser, CdefParams, FrameType, ObuKind, TxMode};
 use ec_core::{Error, Result};
 
 use crate::decode::{decode_inter_frame_tile, decode_key_frame_tile};
@@ -73,6 +73,24 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
             return Err(Error::unsupported(
                 "AV1 decode_stream",
                 "a frame with an active CDEF filter (not yet applied by this decoder)",
+            ));
+        }
+        // Every `decode_block` call below assumes the block's transform is
+        // its own full size (`TxMode::Largest`, which is all this crate's own
+        // encoder ever writes, spec `read_tx_size` inferring the max depth
+        // with no bits) -- it never reads a `tx_depth` symbol at all. A real
+        // encoder's `TxMode::Select` (spec 5.9.2's `tx_mode` bit) codes one
+        // per intra block, and skipping that read does not error -- the
+        // decoder just goes on consuming the next bits as if they were the
+        // uv_mode/coefficient symbols they are not, so the block "decodes"
+        // syntactically clean into low-energy garbage: lane-av1real r3's
+        // luma-near-flat-vs-ffmpeg-gradient bug. Refuse before that, the same
+        // way as the CDEF case above, rather than silently miscode every
+        // `TxMode::Select` stream.
+        if header.tx_mode == TxMode::Select {
+            return Err(Error::unsupported(
+                "AV1 decode_stream",
+                "a frame using TxMode::Select (this decoder never reads a tx_depth symbol, so it desyncs after the first intra block's mode)",
             ));
         }
         // `Tile::offset` is relative to the buffer `parse_obu` was handed
@@ -494,7 +512,7 @@ mod tests {
     /// stays DC. Proves the CfL port this round added, not just DC-chroma
     /// decode: pixel-exact against ffmpeg's own decode, not just "decoded".
     #[test]
-    #[ignore = "r2 checkpoint: LUMA (not chroma) decodes near-flat 126-129 where ffmpeg shows a 41-82 gradient on the pinned CfL stream — the remaining bug is upstream of the CfL chroma math this round added; isolate the luma path first (r3)"]
+    #[ignore = "r4: NOT the TX_64X64 corner-padding path (that path is proven pixel-exact by a_real_libaom_gradients_stream_decodes_pixel_exact, side=64/tx_side=32, real non-skip content) -- this stream's one block is TX32-on-side-32 (tx_side==side, the trivial no-padding branch), luma_set=TxbSet::Luma32, cfl=true. Independently cross-checked with a from-scratch Python spec-8.2.6 MSAC decoder against the raw tile bytes: partition_w32/skip/kf_y_mode/uv_mode_cfl/txb_skip_luma_32_q1/eob_pt_1024_luma_q1 all match our Rust decode's symbols bit-for-bit (partition=NONE, skip=false, y_mode=DC_PRED, uv_mode=DC_PRED, all_zero=false, eob group=5 i.e. eob in 9..=12) -- so the desync (if any) is not in decode_block's mode/uv_mode reads nor in read_eob's group symbol. dq_denom(32*32=1024)=2 and dq_denom(64*64=4096)=4 both match spec 7.12.3 and both are covered by the passing the_inverse_network_is_an_orthonormal_dct_over_eight unit test. Remaining candidates, unverified this round: (a) the base/base_eob/br coefficient-level symbols past eob group (not traced), (b) TxbSet::Luma32's coefficient CDF tables specifically at q-context 1 (only skip/eob_pt were cross-checked, not base/br), (c) the ffmpeg reference decode itself for a 32x32-only frame (possible harness mismatch, unverified). r5 should extend the python cross-check through the full coefficient loop (base/base_eob/br/dc_sign) using the q1 tables, and/or dump ffmpeg's own frame_size/superres fields for this specific OBU to rule out (c)"]
     fn a_real_libaom_cfl_stream_decodes_pixel_exact() {
         if !have_ffmpeg() {
             eprintln!("SKIP a_real_libaom_cfl_stream_decodes_pixel_exact: no ffmpeg");
