@@ -31,7 +31,7 @@ use crate::mc;
 use crate::msac::SymbolDecoder;
 use crate::mvstack::{MiGrid, MiInfo, find_mv_stack, single_ref_ctx};
 use crate::tile::{INTRA_MODE_CTX, block_grid, has_half};
-use crate::transform::dequant_and_inverse;
+use crate::transform::{TxType, dequant_and_inverse_typed};
 
 const PARTITION_NONE: usize = 0;
 const PARTITION_SPLIT: usize = 3;
@@ -215,32 +215,35 @@ fn read_eob(dec: &mut SymbolDecoder, coding: &mut TxbTables) -> usize {
 }
 
 /// One transform block's levels, the inverse of [`crate::tile`]'s
-/// `write_coeffs`, returned as a `side * side` grid in raster order.
+/// `write_coeffs`, returned as a `side * side` grid in raster order, along
+/// with the transform type that grid was coded under (`DCT_DCT` when the
+/// block's `TxbSet` carries no `tx_type` symbol at all, e.g. 32-point and
+/// 64-point transforms, which never code anything else).
 ///
 /// # Errors
-/// Returns an error if the transform codes a type other than `DCT_DCT` — this
-/// decoder reads only the intra key-frame path the encoder still writes,
-/// which never selects another type.
+/// Returns an error if the `tx_type` symbol decodes to a value outside its
+/// CDF's own set (a corrupt or unsupported bitstream) — every value the
+/// intra `Tx_Type_Intra_Inv_Set2` and inter `Tx_Type_Inter_Inv_Set3` CDFs can
+/// produce dispatches to a real inverse transform.
 fn read_coeffs(
     dec: &mut SymbolDecoder,
     coding: &mut TxbTables,
     scan: &[u16],
     skip_ctx: usize,
     sign_ctx: usize,
-) -> Result<Vec<i32>> {
+) -> Result<(Vec<i32>, TxType)> {
     let side = coding.side;
     let mut grid = vec![0i32; side * side];
     let all_zero = dec.symbol(&mut coding.txb_skip[skip_ctx]) == 1;
     if all_zero {
-        return Ok(grid);
+        return Ok((grid, TxType::DctDct));
     }
-    if let Some(tx_type) = coding.tx_type.as_deref_mut() {
-        let t = dec.symbol(tx_type);
-        if t != 1 {
-            return Err(unsupported(format!(
-                "a transform type other than DCT_DCT (round 2: inter/other intra tx sets), symbol {t}"
-            )));
-        }
+    let mut tx_type = TxType::DctDct;
+    if let Some(tx_type_cdf) = coding.tx_type.as_deref_mut() {
+        let t = dec.symbol(tx_type_cdf);
+        tx_type = TxType::from_symbol(t).ok_or_else(|| {
+            unsupported(format!("a tx_type symbol outside its CDF's own set: {t}"))
+        })?;
     }
 
     let eob = read_eob(dec, coding);
@@ -291,7 +294,7 @@ fn read_coeffs(
         };
         grid[pos as usize] = if negative { -level } else { level };
     }
-    Ok(grid)
+    Ok((grid, tx_type))
 }
 
 /// What one coded block leaves behind for the blocks that read it as a
@@ -647,7 +650,7 @@ fn read_plane(
         usize::from(around.0) + usize::from(around.1)
     };
     let mut coding = cdfs.txb(set, tx_mode);
-    let grid = read_coeffs(dec, &mut coding, scan, skip_ctx, dc_sign_ctx(around.2))?;
+    let (grid, tx_type) = read_coeffs(dec, &mut coding, scan, skip_ctx, dc_sign_ctx(around.2))?;
     // A 64x64 luma block's transform covers the whole 64x64 area, but only its
     // top-left 32x32 of frequencies are coded (spec 5.11.40); the rest of the
     // dequantized grid stays zero, which `inverse_transform_2d`'s own `< 32`
@@ -665,7 +668,7 @@ fn read_plane(
         }
         full
     };
-    let residual = dequant_and_inverse(&levels, side, 8, i32::from(base_q_idx));
+    let residual = dequant_and_inverse_typed(&levels, side, 8, i32::from(base_q_idx), tx_type);
     plane.reconstruct(x, y, side, predict_mode, reach, &residual);
     Ok(if tx_side == side {
         residual_grid_placeholder(&levels, side)
@@ -1378,8 +1381,8 @@ fn read_inter_plane(
         usize::from(around.0) + usize::from(around.1)
     };
     let mut coding = cdfs.txb(set, tx_mode);
-    let grid = read_coeffs(dec, &mut coding, scan, skip_ctx, dc_sign_ctx(around.2))?;
-    let residual = dequant_and_inverse(&grid, side, 8, i32::from(base_q_idx));
+    let (grid, tx_type) = read_coeffs(dec, &mut coding, scan, skip_ctx, dc_sign_ctx(around.2))?;
+    let residual = dequant_and_inverse_typed(&grid, side, 8, i32::from(base_q_idx), tx_type);
     plane.reconstruct_mc(x, y, side, prediction, &residual);
     Ok(grid)
 }
