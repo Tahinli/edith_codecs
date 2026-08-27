@@ -522,6 +522,136 @@ mod tests {
         }
     }
 
+    /// A hand-built 3-frame stream that actually fires `GOLDEN_FRAME`
+    /// through [`decode_stream`], proving the round-4 flip (`decode.rs`'s
+    /// `decode_inter_block` `GOLDEN_FRAME` arm) the way 120+ real aomenc
+    /// attempts never could: frame 0 is a real key frame (this crate's own
+    /// encoder, real texture), refreshing all 8 DPB slots as spec requires --
+    /// slot 3 keeps that exact picture from here on. Frame 1 is a hand-coded
+    /// inter frame whose lone 32x32 block is *intra* (`DC_PRED`, `skip`),
+    /// refreshing only slot 0 with a flat 128 block -- distinguishable from
+    /// frame 0's real texture, so slot 0 (`LAST_FRAME`) and slot 3
+    /// (`GOLDEN_FRAME`) hold visibly different pictures once frame 2 runs.
+    /// Frame 2 is a hand-coded inter frame naming `ref_frame_idx[3] = 3`
+    /// (GOLDEN_FRAME's slot) and `ref_frame_idx[0] = 0` (LAST_FRAME's), whose
+    /// lone block codes `single_ref` all the way out to `GOLDEN_FRAME`
+    /// (`p1=0, p3=1, p5=1`) and a `skip` zero-MV `NEARESTMV`: a direct copy
+    /// of GOLDEN's picture, so its output must equal frame 0's own
+    /// reconstruction exactly, and must differ from frame 1's -- proof the
+    /// decoder actually read the golden plane, not silently substituted
+    /// `LAST_FRAME`'s. ffmpeg decodes the identical wire bytes as the
+    /// foreign oracle (shared-oracle-blindness class): this crate's own
+    /// decoder agreeing with itself would prove nothing.
+    #[test]
+    fn a_hand_built_golden_reference_decodes_pixel_exact_against_ffmpeg() {
+        if !have_ffmpeg() {
+            eprintln!(
+                "SKIP a_hand_built_golden_reference_decodes_pixel_exact_against_ffmpeg: no ffmpeg"
+            );
+            return;
+        }
+        use crate::cdf_state::Cdfs;
+        use crate::decode::{intra_inter_ctx, non_last_ref_hits, q_ctx_of};
+        use crate::encode::{inter_frame_headers, key_frame_headers};
+        use crate::frame::frame_obu;
+        use crate::msac::SymbolEncoder;
+        use crate::mvstack::{
+            GOLDEN_FRAME, MiGrid, find_mv_stack, single_ref_p1_ctx, single_ref_p3_ctx,
+            single_ref_p5_ctx,
+        };
+        use crate::obu::temporal_delimiter;
+
+        let (width, height) = (32usize, 32usize);
+        let base_q_idx = 100u8;
+        // The whole picture is one 32x32 block: `partition_ctx`/`skip_ctx`/
+        // `intra_inter_ctx`'s neighbour inputs are all "no neighbour yet" --
+        // a fresh `Neighbours`' `above_side_mi`/`left_side_mi` start at `SB`
+        // (64), so `partition_ctx_mi`'s `side_mi * 2 <= side` (32) is false
+        // on both axes (ctx 0), and `above_skip`/`left_skip`/`above_inter`/
+        // `left_inter`/`above_ref`/`left_ref` all start `false`/`-1`
+        // (decode.rs `Neighbours::new`) -- computed here without
+        // constructing the (module-private) `Neighbours` itself.
+        const PARTITION_NONE: usize = 0;
+        let ii_ctx = intra_inter_ctx(false, false, false, false);
+        let sr_p1_ctx = single_ref_p1_ctx(None, None);
+        let sr_p3_ctx = single_ref_p3_ctx(None, None);
+        let sr_p5_ctx = single_ref_p5_ctx(None, None);
+
+        for run in 0..4 {
+            let picture = test_card(width, height);
+            let key = encode_key_frame(&picture, base_q_idx, 0.5).unwrap();
+            let (seq, _) = key_frame_headers(width, height, base_q_idx).unwrap();
+
+            // Frame 1: hand-coded, intra-only, refreshes slot 0 with a flat
+            // 128 block (no neighbours to predict `DC_PRED` from).
+            let (_, header1) = inter_frame_headers(width, height, base_q_idx, 1, 0).unwrap();
+            let tile1 = {
+                let mut cdfs = Cdfs::new(q_ctx_of(base_q_idx));
+                let mut enc = SymbolEncoder::new();
+                enc.symbol(PARTITION_NONE, &mut cdfs.partition_w32[0]);
+                enc.symbol(1, &mut cdfs.skip[0]); // skip
+                enc.symbol(0, &mut cdfs.intra_inter[ii_ctx]); // is_inter = false
+                enc.symbol(0, &mut cdfs.y_mode[3]); // DC_PRED, size group 3 (32x32)
+                enc.symbol(0, &mut cdfs.uv_mode_cfl[0]); // DC_PRED
+                enc.finish()
+            };
+            let mut stream = key.stream.clone();
+            stream.extend(temporal_delimiter());
+            stream.extend(frame_obu(&seq, &header1, &tile1).unwrap());
+
+            // Frame 2: hand-coded, single_ref all the way to GOLDEN_FRAME,
+            // skip zero-MV NEARESTMV -- a direct copy of slot 3 (frame 0).
+            let (_, mut header2) = inter_frame_headers(width, height, base_q_idx, 2, 0).unwrap();
+            header2.ref_frame_idx[3] = 3; // GOLDEN_FRAME's own slot: frame 0's, untouched by frame 1
+            let tile2 = {
+                let mut cdfs = Cdfs::new(q_ctx_of(base_q_idx));
+                let mut enc = SymbolEncoder::new();
+                let grid = MiGrid::new(8, 8);
+                let stack = find_mv_stack(&grid, 0, 0, 8, 8, GOLDEN_FRAME, 8, 8);
+                enc.symbol(PARTITION_NONE, &mut cdfs.partition_w32[0]);
+                enc.symbol(1, &mut cdfs.skip[0]); // skip
+                enc.symbol(1, &mut cdfs.intra_inter[ii_ctx]); // is_inter = true
+                enc.symbol(0, &mut cdfs.single_ref[sr_p1_ctx][0]); // p1: LAST/LAST2/LAST3/GOLDEN group
+                enc.symbol(1, &mut cdfs.single_ref[sr_p3_ctx][2]); // p3: GOLDEN/LAST3 sub-group
+                enc.symbol(1, &mut cdfs.single_ref[sr_p5_ctx][4]); // p5: GOLDEN_FRAME
+                enc.symbol(1, &mut cdfs.new_mv[stack.new_mv_ctx]); // not_new -> not NEWMV
+                enc.symbol(1, &mut cdfs.zero_mv[stack.zero_mv_ctx]); // not_zero -> not GLOBALMV
+                enc.symbol(0, &mut cdfs.ref_mv[stack.ref_mv_ctx]); // nearest -> NEARESTMV, (0, 0)
+                enc.finish()
+            };
+            stream.extend(temporal_delimiter());
+            stream.extend(frame_obu(&seq, &header2, &tile2).unwrap());
+
+            let before = non_last_ref_hits();
+            let decoded = decode_stream(&stream).unwrap();
+            assert_eq!(decoded.len(), 3, "run {run}: expected 3 pictures");
+            assert!(
+                non_last_ref_hits() > before,
+                "run {run}: GOLDEN_FRAME never fired"
+            );
+
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 3);
+            for (i, (got, want)) in decoded.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(got.y, want.y, "run {run} frame {i}: luma vs ffmpeg");
+                assert_eq!(got.u, want.u, "run {run} frame {i}: U vs ffmpeg");
+                assert_eq!(got.v, want.v, "run {run} frame {i}: V vs ffmpeg");
+            }
+            assert_eq!(
+                decoded[0].y, key.reconstruction.y,
+                "run {run}: frame 0 vs the encoder's own reconstruction"
+            );
+            assert_eq!(
+                decoded[2].y, key.reconstruction.y,
+                "run {run}: GOLDEN_FRAME's block did not reproduce the keyframe it names"
+            );
+            assert_ne!(
+                decoded[2].y, decoded[1].y,
+                "run {run}: LAST_FRAME's and GOLDEN_FRAME's slots were not actually \
+                 distinguishable -- the gate proves nothing"
+            );
+        }
+    }
+
     /// Encodes a real libaom-av1 stream (via ffmpeg's own encoder, not this
     /// crate's) with the same reduced-partition flags lane-av1adst's r6
     /// probe found still select `ADST_ADST`/`ADST_DCT`/`DCT_ADST` on
