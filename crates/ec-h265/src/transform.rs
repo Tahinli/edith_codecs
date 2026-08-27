@@ -127,6 +127,33 @@ const QUANT_SCALE: [i32; 6] = [26_214, 23_302, 20_560, 18_396, 16_384, 14_564];
 const COEFF_MIN: i32 = -32_768;
 const COEFF_MAX: i32 = 32_767;
 
+/// Dot product of two equal-length slices, SIMD in 8-wide chunks with a
+/// scalar tail.
+///
+/// Both `forward_1d` and `inverse_1d`'s odd sums are `sum_j m[j] * x[j]` over
+/// at most 16 terms; matrix entries are `|m| <= 90` and `x` is a coefficient
+/// or residual sample clamped to `COEFF_MIN..=COEFF_MAX` (+/-32768), so each
+/// product is bounded by ~3.0e6 and the full sum of 16 by ~4.7e7 — nowhere
+/// near overflowing i32, whether accumulated in one lane or spread across
+/// eight and reduced at the end.
+#[inline]
+fn dot(a: &[i32], b: &[i32]) -> i32 {
+    debug_assert_eq!(a.len(), b.len());
+    let mut acc = wide::i32x8::splat(0);
+    let mut i = 0;
+    while i + 8 <= a.len() {
+        let av = wide::i32x8::from(<[i32; 8]>::try_from(&a[i..i + 8]).unwrap());
+        let bv = wide::i32x8::from(<[i32; 8]>::try_from(&b[i..i + 8]).unwrap());
+        acc += av * bv;
+        i += 8;
+    }
+    let mut total: i32 = acc.to_array().iter().sum();
+    for j in i..a.len() {
+        total += a[j] * b[j];
+    }
+    total
+}
+
 /// One-dimensional inverse transform, `y[i] = sum_j M[j][i] * x[j]`.
 ///
 /// Split even/odd once per level: the even rows of the size-N matrix *are* the
@@ -145,12 +172,19 @@ fn inverse_1d(n: usize, src: &[i32], dst: &mut [i32]) {
     }
     let mut even = [0i32; 16];
     inverse_1d(half, &even_src[..half], &mut even[..half]);
+    // `src[2 * j + 1]` doesn't depend on `x`: gather it once instead of once
+    // per `x` (it was being re-read `half` times over).
+    let mut odd_src = [0i32; 16];
+    for j in 0..half {
+        odd_src[j] = src[2 * j + 1];
+    }
     for x in 0..half {
-        let mut odd = 0i32;
         let matrix_col = &FULL_MATRIX_T[x];
+        let mut odd_matrix = [0i32; 16];
         for j in 0..half {
-            odd += matrix_col[(2 * j + 1) * stride] * src[2 * j + 1];
+            odd_matrix[j] = matrix_col[(2 * j + 1) * stride];
         }
+        let odd = dot(&odd_matrix[..half], &odd_src[..half]);
         dst[x] = even[x] + odd;
         dst[n - 1 - x] = even[x] - odd;
     }
@@ -178,12 +212,8 @@ fn forward_1d(n: usize, src: &[i32], dst: &mut [i32]) {
     forward_1d(half, &sums[..half], &mut even[..half]);
     for j in 0..half {
         dst[2 * j] = even[j];
-        let mut odd = 0i32;
         let matrix_row = &FULL_MATRIX[(2 * j + 1) * stride];
-        for (x, &diff) in diffs[..half].iter().enumerate() {
-            odd += matrix_row[x] * diff;
-        }
-        dst[2 * j + 1] = odd;
+        dst[2 * j + 1] = dot(&matrix_row[..half], &diffs[..half]);
     }
 }
 
