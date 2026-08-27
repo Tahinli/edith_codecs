@@ -4505,4 +4505,47 @@ mod tests {
             elapsed / 24
         );
     }
+
+    /// The `base_q_idx` calibration sweep for `lane-av1-ratectl` -- feeds the
+    /// `Quality`/`BytesPerFrame` rate-control surface in `encoder.rs`, not a
+    /// gate itself. `cargo test -p ec-av1 --release calibration_sweep_base_q_idx
+    /// -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a calibration probe, not a gate"]
+    fn calibration_sweep_base_q_idx() {
+        if !have_ffmpeg() {
+            eprintln!("SKIP calibration_sweep_base_q_idx: no ffmpeg");
+            return;
+        }
+        let (width, height, frames) = (640usize, 384usize, 12usize);
+        for clip in [
+            "h264-1080p-23.976-8bit.mp4", // film-ish, 23.976fps
+            "h264-1080p-60-8bit.mp4",     // higher motion, 60fps
+        ] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../fixtures/video")
+                .join(clip);
+            if !path.exists() {
+                eprintln!("SKIP {clip}: fixture missing");
+                continue;
+            }
+            let source = clip_frames(path.to_str().unwrap(), "0", width, height, frames);
+            eprintln!("--- {clip} ---");
+            for q in [40u8, 70, 100, 130, 160, 190, 220, 240] {
+                let encoded = encode_sequence(&source, q, 0.5).unwrap();
+                let decoded = ffmpeg_decode_sequence(&encoded.stream, width, height, frames);
+                let mean_psnr: f64 = decoded
+                    .iter()
+                    .zip(&source)
+                    .map(|(d, s)| psnr(&d.y, &s.y))
+                    .sum::<f64>()
+                    / frames as f64;
+                let bytes_per_px = encoded.stream.len() as f64 / (width * height * frames) as f64;
+                eprintln!(
+                    "q={q:3}  bytes={:7}  bytes/px={bytes_per_px:.5}  psnr={mean_psnr:.2} dB",
+                    encoded.stream.len()
+                );
+            }
+        }
+    }
 }
