@@ -24,10 +24,12 @@
 use ec_core::{Error, Result};
 
 use crate::cdf;
-use crate::cdf_state::{Cdfs, TxbSet, TxbTables};
+use crate::cdf_state::{Cdfs, MvComponentCdfs, TxbSet, TxbTables};
 use crate::encode::{Picture, Reach};
 use crate::intra::predict;
+use crate::mc;
 use crate::msac::SymbolDecoder;
+use crate::mvstack::{MiGrid, MiInfo, find_mv_stack, single_ref_ctx};
 use crate::tile::{INTRA_MODE_CTX, block_grid, has_half};
 use crate::transform::dequant_and_inverse;
 
@@ -323,6 +325,18 @@ struct Neighbours {
     left_mode: Vec<usize>,
     above_side: Vec<usize>,
     left_side: Vec<usize>,
+    /// Whether the block above/left of this column/row was coded `skip` --
+    /// an inter frame's own `skip` context (spec `SkipContext`), which the
+    /// key-frame writer never tracks (its skip context is always zero); a
+    /// duplicate of [`crate::tile`]'s private `Neighbours::above_skip`/
+    /// `left_skip`.
+    above_skip: Vec<bool>,
+    left_skip: Vec<bool>,
+    /// Whether the block above/left was coded inter -- the `is_inter`
+    /// context (spec `av1_get_intra_inter_context`), a duplicate of
+    /// [`crate::tile`]'s private `Neighbours::above_inter`/`left_inter`.
+    above_inter: Vec<bool>,
+    left_inter: Vec<bool>,
     mi_cols: usize,
     mi_rows: usize,
 }
@@ -338,6 +352,10 @@ impl Neighbours {
             left_mode: vec![DC_PRED; rows],
             above_side: vec![SB; cols],
             left_side: vec![SB; rows],
+            above_skip: vec![false; cols],
+            left_skip: vec![false; rows],
+            above_inter: vec![false; cols],
+            left_inter: vec![false; rows],
             mi_cols,
             mi_rows,
         }
@@ -347,6 +365,20 @@ impl Neighbours {
         self.left.iter_mut().for_each(|l| *l = Default::default());
         self.left_mode.iter_mut().for_each(|m| *m = DC_PRED);
         self.left_side.iter_mut().for_each(|s| *s = SB);
+        self.left_skip.iter_mut().for_each(|s| *s = false);
+        self.left_inter.iter_mut().for_each(|i| *i = false);
+    }
+
+    /// Records a block's `skip`/`is_inter` state for the next block that
+    /// reads it as a neighbour -- [`crate::tile`]'s `record_inter`.
+    fn record_inter(&mut self, at: (usize, usize), side: usize, skip: bool, is_inter: bool) {
+        let (r, c) = at;
+        for cell in 0..side / SUB {
+            self.above_skip[c + cell] = skip;
+            self.left_skip[r + cell] = skip;
+            self.above_inter[c + cell] = is_inter;
+            self.left_inter[r + cell] = is_inter;
+        }
     }
 
     fn partition_ctx(&self, at: (usize, usize), side: usize) -> usize {
@@ -959,6 +991,727 @@ pub fn decode_key_frame_tile(
     })
 }
 
+/// The `is_inter` context (spec 5.11.16 via `av1_get_intra_inter_context`),
+/// duplicating [`crate::tile`]'s private copy of the same rule.
+fn intra_inter_ctx(has_above: bool, has_left: bool, above_inter: bool, left_inter: bool) -> usize {
+    match (has_above, has_left) {
+        (true, true) => {
+            let (above_intra, left_intra) = (!above_inter, !left_inter);
+            if above_intra && left_intra {
+                3
+            } else {
+                usize::from(above_intra || left_intra)
+            }
+        }
+        (true, false) => 2 * usize::from(!above_inter),
+        (false, true) => 2 * usize::from(!left_inter),
+        (false, false) => 0,
+    }
+}
+
+/// `CLASS0_SIZE << (class + 2)`, duplicating `crate::tile`'s private
+/// `mv_class_base` (spec 3): the magnitude an `MV_CLASS_n` component's own
+/// bits start counting from.
+fn mv_class_base(class: usize) -> i32 {
+    if class == 0 { 0 } else { 2i32 << (class + 2) }
+}
+
+/// One motion vector component's non-zero diff (spec 5.11.32
+/// `read_mv_component`), the inverse of [`crate::tile`]'s private
+/// `write_mv_component`.
+fn read_mv_component(dec: &mut SymbolDecoder, c: &mut MvComponentCdfs) -> i32 {
+    let sign = dec.symbol(&mut c.sign);
+    let class = dec.symbol(&mut c.class);
+    let local = if class == 0 {
+        let bit = dec.symbol(&mut c.class0_bit);
+        let fr = dec.symbol(&mut c.class0_fr[bit]);
+        (bit << 3) | (fr << 1) | 1
+    } else {
+        let mut d = 0;
+        for i in 0..class {
+            d |= dec.symbol(&mut c.bit[i]) << i;
+        }
+        let fr = dec.symbol(&mut c.fr);
+        (d << 3) | (fr << 1) | 1
+    };
+    let mag = mv_class_base(class) + local as i32 + 1;
+    if sign == 1 { -mag } else { mag }
+}
+
+/// A motion vector coded as a residual against `pred` (spec 5.11.32
+/// `read_mv`), the inverse of [`crate::tile`]'s private `write_mv`.
+fn read_mv(
+    dec: &mut SymbolDecoder,
+    mv_comp: &mut [MvComponentCdfs; 2],
+    mv_joint: &mut [u16; 5],
+    pred: (i32, i32),
+) -> (i32, i32) {
+    let joint = dec.symbol(mv_joint);
+    let mut diff = (0, 0);
+    if joint == 2 || joint == 3 {
+        diff.0 = read_mv_component(dec, &mut mv_comp[0]);
+    }
+    if joint == 1 || joint == 3 {
+        diff.1 = read_mv_component(dec, &mut mv_comp[1]);
+    }
+    (pred.0 + diff.0, pred.1 + diff.1)
+}
+
+/// A 1/8-pel motion vector component converted to the 1/16-pel offset
+/// [`mc::predict`] takes, duplicating [`crate::encode`]'s private `mv_to_q4`
+/// (its own doc comment explains the `*2`/`*1` luma/chroma split).
+fn mv_to_q4(pos: usize, mv_component: i32, luma: bool) -> i32 {
+    (pos as i32) * 16 + mv_component * if luma { 2 } else { 1 }
+}
+
+impl PlaneBuf {
+    /// Adds `residual` onto an already-computed `prediction` (motion
+    /// compensation's output, rather than [`predict`]'s intra one), writing
+    /// the clamped reconstruction into the plane at `(x, y)` -- the inter
+    /// counterpart of [`PlaneBuf::reconstruct`].
+    fn reconstruct_mc(
+        &mut self,
+        x: usize,
+        y: usize,
+        side: usize,
+        prediction: &[u8],
+        residual: &[i32],
+    ) {
+        for row in 0..side {
+            for col in 0..side {
+                let sample = (i32::from(prediction[row * side + col]) + residual[row * side + col])
+                    .clamp(0, 255) as u8;
+                self.data[(y + row) * self.width + x + col] = sample;
+            }
+        }
+    }
+}
+
+/// Reads one inter-coded plane's transform block and reconstructs it by
+/// adding its residual onto a motion-compensated `prediction` -- the inter
+/// counterpart of [`read_plane`] (every inter transform this decoder reads is
+/// `side`-square with no oversized-64 case, so there is no padded-grid
+/// branch to mirror).
+#[allow(clippy::too_many_arguments)]
+fn read_inter_plane(
+    dec: &mut SymbolDecoder,
+    cdfs: &mut Cdfs,
+    set: TxbSet,
+    scan: &[u16],
+    plane_idx: usize,
+    around: (bool, bool, i32),
+    tx_mode: usize,
+    plane: &mut PlaneBuf,
+    x: usize,
+    y: usize,
+    side: usize,
+    base_q_idx: u8,
+    prediction: &[u8],
+) -> Result<Vec<i32>> {
+    let skip_ctx = if plane_idx == 0 {
+        0
+    } else {
+        usize::from(around.0) + usize::from(around.1)
+    };
+    let mut coding = cdfs.txb(set, tx_mode);
+    let grid = read_coeffs(dec, &mut coding, scan, skip_ctx, dc_sign_ctx(around.2))?;
+    let residual = dequant_and_inverse(&grid, side, 8, i32::from(base_q_idx));
+    plane.reconstruct_mc(x, y, side, prediction, &residual);
+    Ok(grid)
+}
+
+/// Decodes one square inter-frame block (32x32 whole or 16x16 leaf): skip,
+/// `is_inter`, then either the single-reference/MV-stack/motion-vector chain
+/// and motion-compensated reconstruction, or the inter frame's own intra
+/// path (`Y_MODE` by size group, not `KF_Y_MODE` by neighbour), mirroring
+/// [`crate::tile`]'s `sb_coeff_inter_frame_tile`'s whole-block branch and its
+/// private `write_inter_frame_leaf` -- both share this one function here,
+/// parameterised by `side`/the transform sets/scan tables/size group they
+/// each use.
+///
+/// # Errors
+/// Returns an error when a symbol names anything this decoder does not
+/// reconstruct: a reference other than `LAST_FRAME`, an inter mode other
+/// than `NEARESTMV`/`NEWMV`, or an intra mode/tx-type outside what
+/// [`read_intra_mode`]/[`read_coeffs`] already refuse.
+#[allow(clippy::too_many_arguments)]
+fn decode_inter_block(
+    dec: &mut SymbolDecoder,
+    cdfs: &mut Cdfs,
+    neighbours: &mut Neighbours,
+    grid: &mut MiGrid,
+    at: (usize, usize),
+    side: usize,
+    mi_cols: u32,
+    mi_rows: u32,
+    y: &mut PlaneBuf,
+    u: &mut PlaneBuf,
+    v: &mut PlaneBuf,
+    ref_y: &PlaneBuf,
+    ref_u: &PlaneBuf,
+    ref_v: &PlaneBuf,
+    base_q_idx: u8,
+    luma_set_intra: TxbSet,
+    luma_set_inter: TxbSet,
+    chroma_set: TxbSet,
+    luma_tx: usize,
+    chroma_tx: usize,
+    scan_luma: &[u16],
+    scan_chroma: &[u16],
+    size_group: usize,
+) -> Result<()> {
+    const LAST_FRAME: i8 = 1;
+
+    let (r, c) = at;
+    let (px, py) = (c * SUB, r * SUB);
+    let (cpx, cpy) = (px / 2, py / 2);
+    let chroma_side = side / 2;
+
+    let skip_ctx = usize::from(neighbours.above_skip[c]) + usize::from(neighbours.left_skip[r]);
+    let skip = dec.symbol(&mut cdfs.skip[skip_ctx]) == 1;
+
+    let (has_above, has_left) = (r > 0, c > 0);
+    let (above_inter, left_inter) = (neighbours.above_inter[c], neighbours.left_inter[r]);
+    let ii_ctx = intra_inter_ctx(has_above, has_left, above_inter, left_inter);
+    let is_inter = dec.symbol(&mut cdfs.intra_inter[ii_ctx]) == 1;
+
+    let mode_for_tx;
+    let (luma_grid, u_grid, v_grid);
+    if is_inter {
+        let sr_ctx = single_ref_ctx(above_inter || left_inter);
+        let p1 = dec.symbol(&mut cdfs.single_ref[sr_ctx][0]);
+        let p3 = dec.symbol(&mut cdfs.single_ref[sr_ctx][2]);
+        let p4 = dec.symbol(&mut cdfs.single_ref[sr_ctx][3]);
+        if (p1, p3, p4) != (0, 0, 0) {
+            return Err(unsupported(
+                "a reference frame other than LAST_FRAME (round 2)",
+            ));
+        }
+
+        let (mi_row, mi_col) = (r * SUB_MI as usize, c * SUB_MI as usize);
+        let bw4 = side / 4;
+        let stack = find_mv_stack(
+            grid,
+            mi_row,
+            mi_col,
+            bw4,
+            bw4,
+            LAST_FRAME,
+            mi_cols as usize,
+            mi_rows as usize,
+        );
+
+        let not_new = dec.symbol(&mut cdfs.new_mv[stack.new_mv_ctx]) == 1;
+        let (mv, is_new_mv) = if !not_new {
+            if stack.entries.len() > 1 {
+                dec.symbol(&mut cdfs.drl_mode[stack.drl_ctx[0]]);
+            }
+            (
+                read_mv(dec, &mut cdfs.mv_comp, &mut cdfs.mv_joint, stack.pred_mv),
+                true,
+            )
+        } else {
+            let not_zero = dec.symbol(&mut cdfs.zero_mv[stack.zero_mv_ctx]) == 1;
+            let nearest = dec.symbol(&mut cdfs.ref_mv[stack.ref_mv_ctx]) == 0;
+            if !not_zero || !nearest {
+                return Err(unsupported(
+                    "an inter mode other than NEARESTMV/NEWMV (round 2)",
+                ));
+            }
+            (stack.nearest_mv, false)
+        };
+        for dr in 0..bw4 {
+            for dc in 0..bw4 {
+                grid.set(
+                    mi_row + dr,
+                    mi_col + dc,
+                    MiInfo {
+                        is_inter: true,
+                        ref_frame: LAST_FRAME,
+                        mv,
+                        is_new_mv,
+                        size: bw4,
+                    },
+                );
+            }
+        }
+        mode_for_tx = 0;
+
+        let mut pred_y = vec![0u8; side * side];
+        mc::predict(
+            &ref_y.data,
+            ref_y.width,
+            ref_y.true_width,
+            ref_y.true_height,
+            mv_to_q4(px, mv.1, true),
+            mv_to_q4(py, mv.0, true),
+            side,
+            side,
+            &mut pred_y,
+        );
+        let mut pred_u = vec![0u8; chroma_side * chroma_side];
+        mc::predict(
+            &ref_u.data,
+            ref_u.width,
+            ref_u.true_width,
+            ref_u.true_height,
+            mv_to_q4(cpx, mv.1, false),
+            mv_to_q4(cpy, mv.0, false),
+            chroma_side,
+            chroma_side,
+            &mut pred_u,
+        );
+        let mut pred_v = vec![0u8; chroma_side * chroma_side];
+        mc::predict(
+            &ref_v.data,
+            ref_v.width,
+            ref_v.true_width,
+            ref_v.true_height,
+            mv_to_q4(cpx, mv.1, false),
+            mv_to_q4(cpy, mv.0, false),
+            chroma_side,
+            chroma_side,
+            &mut pred_v,
+        );
+
+        if skip {
+            y.reconstruct_mc(px, py, side, &pred_y, &vec![0i32; side * side]);
+            u.reconstruct_mc(
+                cpx,
+                cpy,
+                chroma_side,
+                &pred_u,
+                &vec![0i32; chroma_side * chroma_side],
+            );
+            v.reconstruct_mc(
+                cpx,
+                cpy,
+                chroma_side,
+                &pred_v,
+                &vec![0i32; chroma_side * chroma_side],
+            );
+            luma_grid = vec![0i32; side * side];
+            u_grid = vec![0i32; chroma_side * chroma_side];
+            v_grid = vec![0i32; chroma_side * chroma_side];
+        } else {
+            let around = neighbours.around(at, side);
+            luma_grid = read_inter_plane(
+                dec,
+                cdfs,
+                luma_set_inter,
+                scan_luma,
+                0,
+                around[0],
+                mode_for_tx,
+                y,
+                px,
+                py,
+                side,
+                base_q_idx,
+                &pred_y,
+            )?;
+            u_grid = read_inter_plane(
+                dec,
+                cdfs,
+                chroma_set,
+                scan_chroma,
+                1,
+                around[1],
+                mode_for_tx,
+                u,
+                cpx,
+                cpy,
+                chroma_side,
+                base_q_idx,
+                &pred_u,
+            )?;
+            v_grid = read_inter_plane(
+                dec,
+                cdfs,
+                chroma_set,
+                scan_chroma,
+                2,
+                around[2],
+                mode_for_tx,
+                v,
+                cpx,
+                cpy,
+                chroma_side,
+                base_q_idx,
+                &pred_v,
+            )?;
+        }
+    } else {
+        let mode = dec.symbol(&mut cdfs.y_mode[size_group]);
+        if mode >= 13 {
+            return Err(unsupported(
+                "an intra mode this decoder does not code (round 2)",
+            ));
+        }
+        if (V_PRED..=D67_PRED).contains(&mode) {
+            let angle = dec.symbol(&mut cdfs.angle_delta[mode - V_PRED]);
+            if angle != ANGLE_DELTA_ZERO {
+                return Err(unsupported(
+                    "a nonzero angle delta (this encoder never writes one)",
+                ));
+            }
+        }
+        let uv_mode = dec.symbol(&mut cdfs.uv_mode_cfl[mode]);
+        if uv_mode != DC_PRED {
+            return Err(unsupported("a chroma-from-luma mode (round 2)"));
+        }
+        mode_for_tx = mode;
+        let (mi_row, mi_col) = (r * SUB_MI as usize, c * SUB_MI as usize);
+        for dr in 0..side / 4 {
+            for dc in 0..side / 4 {
+                grid.set(
+                    mi_row + dr,
+                    mi_col + dc,
+                    MiInfo {
+                        is_inter: false,
+                        ref_frame: -1,
+                        mv: (0, 0),
+                        is_new_mv: false,
+                        size: side / 4,
+                    },
+                );
+            }
+        }
+
+        let reach = Reach::of(side, px, py, y.width, y.height);
+        if skip {
+            y.reconstruct(px, py, side, mode, reach, &vec![0i32; side * side]);
+            u.reconstruct(
+                cpx,
+                cpy,
+                chroma_side,
+                DC_PRED,
+                Reach::none(),
+                &vec![0i32; chroma_side * chroma_side],
+            );
+            v.reconstruct(
+                cpx,
+                cpy,
+                chroma_side,
+                DC_PRED,
+                Reach::none(),
+                &vec![0i32; chroma_side * chroma_side],
+            );
+            luma_grid = vec![0i32; side * side];
+            u_grid = vec![0i32; chroma_side * chroma_side];
+            v_grid = vec![0i32; chroma_side * chroma_side];
+        } else {
+            let around = neighbours.around(at, side);
+            luma_grid = read_plane(
+                dec,
+                cdfs,
+                luma_set_intra,
+                scan_luma,
+                0,
+                around[0],
+                mode,
+                mode,
+                reach,
+                y,
+                px,
+                py,
+                side,
+                luma_tx,
+                base_q_idx,
+            )?;
+            u_grid = read_plane(
+                dec,
+                cdfs,
+                chroma_set,
+                scan_chroma,
+                1,
+                around[1],
+                mode,
+                DC_PRED,
+                Reach::none(),
+                u,
+                cpx,
+                cpy,
+                chroma_side,
+                chroma_tx,
+                base_q_idx,
+            )?;
+            v_grid = read_plane(
+                dec,
+                cdfs,
+                chroma_set,
+                scan_chroma,
+                2,
+                around[2],
+                mode,
+                DC_PRED,
+                Reach::none(),
+                v,
+                cpx,
+                cpy,
+                chroma_side,
+                chroma_tx,
+                base_q_idx,
+            )?;
+        }
+    }
+    neighbours.record(at, side, mode_for_tx, &[luma_grid, u_grid, v_grid]);
+    neighbours.record_inter(at, side, skip, is_inter);
+    Ok(())
+}
+
+/// Decodes the payload [`crate::tile::sb_coeff_inter_frame_tile`] writes,
+/// against `reference` (the previous frame's own decoded picture, at this
+/// frame's true size -- a decoder's single-slot DPB, matching what this
+/// crate's encoder always predicts from), returning the picture it
+/// reconstructs to. Mirrors [`decode_key_frame_tile`]'s own contract
+/// (`mi_cols`/`mi_rows`/`base_q_idx` from the frame header,
+/// `frame_width`/`frame_height` its true render size).
+///
+/// # Errors
+/// Returns an error under the same conditions [`decode_inter_block`] does,
+/// or when `reference` is not this frame's own true size, or when the tile
+/// codes a 16x16 leaf whose own true edge cuts through it (round 2, same
+/// refusal [`crate::tile`]'s writer gives its encoder).
+pub fn decode_inter_frame_tile(
+    data: &[u8],
+    mi_cols: u32,
+    mi_rows: u32,
+    base_q_idx: u8,
+    frame_width: u32,
+    frame_height: u32,
+    reference: &Picture,
+) -> Result<Picture> {
+    if mi_cols == 0 || mi_rows == 0 {
+        return Err(unsupported("a frame with no mode-info grid"));
+    }
+    let (true_width, true_height) = ((mi_cols * 4) as usize, (mi_rows * 4) as usize);
+    if reference.width != true_width || reference.height != true_height {
+        return Err(unsupported(
+            "a reference picture that is not this frame's own true size",
+        ));
+    }
+    let (cols, rows) = block_grid(mi_cols, mi_rows);
+    let (sb_cols, sb_rows) = (cols.div_ceil(2), rows.div_ceil(2));
+    let (width, height) = (cols as usize * BLOCK, rows as usize * BLOCK);
+
+    let ref_y = PlaneBuf {
+        data: reference.y.clone(),
+        width: reference.width,
+        height: reference.height,
+        true_width: reference.width,
+        true_height: reference.height,
+    };
+    let ref_u = PlaneBuf {
+        data: reference.u.clone(),
+        width: reference.width / 2,
+        height: reference.height / 2,
+        true_width: reference.width / 2,
+        true_height: reference.height / 2,
+    };
+    let ref_v = PlaneBuf {
+        data: reference.v.clone(),
+        width: reference.width / 2,
+        height: reference.height / 2,
+        true_width: reference.width / 2,
+        true_height: reference.height / 2,
+    };
+
+    let mut y = PlaneBuf {
+        data: vec![0u8; width * height],
+        width,
+        height,
+        true_width,
+        true_height,
+    };
+    let mut u = PlaneBuf {
+        data: vec![0u8; width * height / 4],
+        width: width / 2,
+        height: height / 2,
+        true_width: true_width / 2,
+        true_height: true_height / 2,
+    };
+    let mut v = PlaneBuf {
+        data: vec![0u8; width * height / 4],
+        width: width / 2,
+        height: height / 2,
+        true_width: true_width / 2,
+        true_height: true_height / 2,
+    };
+
+    let scan32 = default_scan(TX32);
+    let scan16 = default_scan(TX16);
+    let scan8 = default_scan(TX8);
+
+    let mut cdfs = Cdfs::new(q_ctx_of(base_q_idx));
+    let mut dec = SymbolDecoder::new(data);
+    let mut neighbours = Neighbours::new(
+        cols as usize * 2,
+        rows as usize * 2,
+        mi_cols as usize,
+        mi_rows as usize,
+    );
+    let mut grid = MiGrid::new(mi_cols as usize, mi_rows as usize);
+
+    for sb_r in 0..sb_rows {
+        neighbours.start_row();
+        for sb_c in 0..sb_cols {
+            let sb_at = (sb_r as usize * 4, sb_c as usize * 4);
+            let sb_ctx = neighbours.partition_ctx(sb_at, SB);
+            let (has_cols, has_rows) = (
+                sb_c * SB_MI + SB_MI / 2 < mi_cols,
+                sb_r * SB_MI + SB_MI / 2 < mi_rows,
+            );
+            match (has_cols, has_rows) {
+                (true, true) => {
+                    dec.symbol(&mut cdfs.partition_w64[sb_ctx]);
+                }
+                (true, false) => {
+                    dec.symbol_fixed(&gather(&cdfs.partition_w64[sb_ctx], VERT_ALIKE));
+                }
+                (false, true) => {
+                    dec.symbol_fixed(&gather(&cdfs.partition_w64[sb_ctx], HORZ_ALIKE));
+                }
+                (false, false) => {}
+            }
+
+            for quadrant in 0..4 {
+                let (r32, c32) = (sb_r * 2 + quadrant / 2, sb_c * 2 + quadrant % 2);
+                if r32 >= rows || c32 >= cols {
+                    continue;
+                }
+                let at = (r32 as usize * 2, c32 as usize * 2);
+                let ctx32 = neighbours.partition_ctx(at, BLOCK);
+                let (has_cols32, has_rows32) = (
+                    has_half(c32 * BLOCK_MI, BLOCK_MI, mi_cols),
+                    has_half(r32 * BLOCK_MI, BLOCK_MI, mi_rows),
+                );
+                let part32 = if has_cols32 && has_rows32 {
+                    dec.symbol(&mut cdfs.partition_w32[ctx32])
+                } else {
+                    match (has_cols32, has_rows32) {
+                        (true, false) => {
+                            dec.symbol_fixed(&gather(&cdfs.partition_w32[ctx32], VERT_ALIKE));
+                        }
+                        (false, true) => {
+                            dec.symbol_fixed(&gather(&cdfs.partition_w32[ctx32], HORZ_ALIKE));
+                        }
+                        _ => {}
+                    }
+                    PARTITION_SPLIT
+                };
+                match part32 {
+                    PARTITION_NONE => {
+                        decode_inter_block(
+                            &mut dec,
+                            &mut cdfs,
+                            &mut neighbours,
+                            &mut grid,
+                            at,
+                            BLOCK,
+                            mi_cols,
+                            mi_rows,
+                            &mut y,
+                            &mut u,
+                            &mut v,
+                            &ref_y,
+                            &ref_u,
+                            &ref_v,
+                            base_q_idx,
+                            TxbSet::Luma32,
+                            TxbSet::Luma32Inter,
+                            TxbSet::Chroma16,
+                            TX32,
+                            TX16,
+                            &scan32,
+                            &scan16,
+                            3,
+                        )?;
+                    }
+                    PARTITION_SPLIT => {
+                        for sub in 0..4 {
+                            let (sr, sc) = (r32 as usize * 2 + sub / 2, c32 as usize * 2 + sub % 2);
+                            if (sr as u32) * SUB_MI >= mi_rows || (sc as u32) * SUB_MI >= mi_cols {
+                                continue;
+                            }
+                            let (has_cols16, has_rows16) = (
+                                has_half(sc as u32 * SUB_MI, SUB_MI, mi_cols),
+                                has_half(sr as u32 * SUB_MI, SUB_MI, mi_rows),
+                            );
+                            if !has_cols16 || !has_rows16 {
+                                return Err(unsupported(
+                                    "a 16x16 inter block the true frame edge cuts through (round 2)",
+                                ));
+                            }
+                            let at16 = (sr, sc);
+                            let ctx16 = neighbours.partition_ctx(at16, SUB);
+                            let part16 = dec.symbol(&mut cdfs.partition_w16[ctx16]);
+                            if part16 != PARTITION_NONE {
+                                return Err(unsupported(
+                                    "a partition below 16x16 (this encoder never writes one)",
+                                ));
+                            }
+                            decode_inter_block(
+                                &mut dec,
+                                &mut cdfs,
+                                &mut neighbours,
+                                &mut grid,
+                                at16,
+                                SUB,
+                                mi_cols,
+                                mi_rows,
+                                &mut y,
+                                &mut u,
+                                &mut v,
+                                &ref_y,
+                                &ref_u,
+                                &ref_v,
+                                base_q_idx,
+                                TxbSet::Luma16,
+                                TxbSet::Luma16Inter,
+                                TxbSet::Chroma8,
+                                TX16,
+                                TX8,
+                                &scan16,
+                                &scan8,
+                                2,
+                            )?;
+                        }
+                    }
+                    _ => {
+                        return Err(unsupported("a partition type this encoder never writes"));
+                    }
+                }
+            }
+        }
+    }
+
+    let (fw, fh) = (frame_width as usize, frame_height as usize);
+    if fw == width && fh == height {
+        return Ok(Picture {
+            width,
+            height,
+            y: y.data,
+            u: u.data,
+            v: v.data,
+        });
+    }
+    let crop = |plane: &PlaneBuf, w: usize, h: usize| -> Vec<u8> {
+        let mut out = Vec::with_capacity(w * h);
+        for row in 0..h {
+            out.extend_from_slice(&plane.data[row * plane.width..][..w]);
+        }
+        out
+    };
+    Ok(Picture {
+        width: fw,
+        height: fh,
+        y: crop(&y, fw, fh),
+        u: crop(&u, fw / 2, fh / 2),
+        v: crop(&v, fw / 2, fh / 2),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1066,5 +1819,347 @@ mod tests {
             decoded.y.iter().all(|&s| s == 128),
             "a skipped DC_PRED block with no neighbours predicts flat mid-grey"
         );
+    }
+
+    // ffmpeg cross-oracle: an independent decoder (not this crate's own
+    // encoder-side reconstruction) agrees with what this module decodes,
+    // duplicating `crate::encode`'s own `#[cfg(test)]` helpers of the same
+    // name (that module is another lane's territory this round, and the
+    // helpers are `#[cfg(test)]`-private to it).
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    fn have_ffmpeg() -> bool {
+        Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    /// Decodes one AV1 OBU stream with ffmpeg and hands back its one 4:2:0
+    /// frame's planes, at ffmpeg's own (coded, block-padded) size.
+    fn ffmpeg_decode(stream: &[u8], width: usize, height: usize) -> Picture {
+        let mut child = Command::new("ffmpeg")
+            .args([
+                "-v", "error", "-f", "obu", "-i", "-", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("ffmpeg failed to start");
+        child
+            .stdin
+            .take()
+            .expect("ffmpeg stdin")
+            .write_all(stream)
+            .expect("writing the stream to ffmpeg");
+        let out = child.wait_with_output().expect("ffmpeg failed to run");
+        assert!(
+            out.status.success(),
+            "ffmpeg refused the stream: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let (luma, chroma) = (width * height, width * height / 4);
+        assert_eq!(
+            out.stdout.len(),
+            luma + 2 * chroma,
+            "expected one 4:2:0 frame"
+        );
+        Picture {
+            width,
+            height,
+            y: out.stdout[..luma].to_vec(),
+            u: out.stdout[luma..luma + chroma].to_vec(),
+            v: out.stdout[luma + chroma..].to_vec(),
+        }
+    }
+
+    /// Decodes `frames` concatenated 4:2:0 frames out of one AV1 OBU stream.
+    fn ffmpeg_decode_sequence(
+        stream: &[u8],
+        width: usize,
+        height: usize,
+        frames: usize,
+    ) -> Vec<Picture> {
+        let mut child = Command::new("ffmpeg")
+            .args([
+                "-v", "error", "-f", "obu", "-i", "-", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("ffmpeg failed to start");
+        child
+            .stdin
+            .take()
+            .expect("ffmpeg stdin")
+            .write_all(stream)
+            .expect("writing the stream to ffmpeg");
+        let out = child.wait_with_output().expect("ffmpeg failed to run");
+        assert!(
+            out.status.success(),
+            "ffmpeg refused the stream: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let (luma, chroma) = (width * height, width * height / 4);
+        let frame_bytes = luma + 2 * chroma;
+        assert_eq!(
+            out.stdout.len(),
+            frame_bytes * frames,
+            "expected {frames} 4:2:0 frames, ffmpeg said: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (0..frames)
+            .map(|i| {
+                let base = i * frame_bytes;
+                Picture {
+                    width,
+                    height,
+                    y: out.stdout[base..base + luma].to_vec(),
+                    u: out.stdout[base + luma..base + luma + chroma].to_vec(),
+                    v: out.stdout[base + luma + chroma..base + frame_bytes].to_vec(),
+                }
+            })
+            .collect()
+    }
+
+    /// `ffprobe`'s reported coded `width,height` for one OBU stream --
+    /// duplicating `crate::encode`'s own helper (per-call temp naming: the
+    /// test binary runs callers on parallel threads, and a shared name lets
+    /// one test's cleanup race another's still-reading ffprobe --
+    /// pid-keyed-temp-path class).
+    fn ffprobe_size(stream: &[u8]) -> (u32, u32) {
+        static PROBE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "ec-av1-decode-probe-{}-{}.obu",
+            std::process::id(),
+            PROBE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, stream).expect("writing the probe stream");
+        let out = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "obu",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=width,height",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(&path)
+            .output()
+            .expect("ffprobe failed to run");
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            out.status.success(),
+            "ffprobe refused the stream: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut fields = text.trim().split(',');
+        let width: u32 = fields.next().expect("ffprobe width").parse().unwrap();
+        let height: u32 = fields.next().expect("ffprobe height").parse().unwrap();
+        (width, height)
+    }
+
+    /// This module's own decoder against an independent one (ffmpeg), not
+    /// just against this crate's encoder-side reconstruction: both decoders
+    /// read the identical tile bytes, so agreement here rules out a bug this
+    /// crate's own writer and reader could otherwise share.
+    #[test]
+    fn ffmpeg_and_this_decoder_agree_on_a_key_frame() {
+        if !have_ffmpeg() {
+            eprintln!("SKIP ffmpeg_and_this_decoder_agree_on_a_key_frame: no ffmpeg");
+            return;
+        }
+        use crate::encode::encode_key_frame;
+        for &(width, height) in &[(64usize, 64usize), (216, 96)] {
+            let picture = round_trip_test_card(width, height);
+            let encoded = encode_key_frame(&picture, 100, 0.5).unwrap();
+            let (coded_w, coded_h) = ffprobe_size(&encoded.stream);
+            let ffmpeg_decoded = ffmpeg_decode(&encoded.stream, coded_w as usize, coded_h as usize);
+            let ours = decode_key_frame_tile(
+                &encoded.tile,
+                encoded.mi_cols,
+                encoded.mi_rows,
+                encoded.base_q_idx,
+                coded_w,
+                coded_h,
+            )
+            .unwrap();
+            assert_eq!(ours.y, ffmpeg_decoded.y, "{width}x{height}: luma vs ffmpeg");
+            assert_eq!(ours.u, ffmpeg_decoded.u, "{width}x{height}: U vs ffmpeg");
+            assert_eq!(ours.v, ffmpeg_decoded.v, "{width}x{height}: V vs ffmpeg");
+        }
+    }
+
+    fn round_trip_test_card(width: usize, height: usize) -> crate::encode::Picture {
+        let mut picture = crate::encode::Picture::grey(width, height);
+        for row in 0..height {
+            for col in 0..width {
+                picture.y[row * width + col] = ((row * 7 + col * 11) % 251) as u8;
+            }
+        }
+        for row in 0..height / 2 {
+            for col in 0..width / 2 {
+                let i = row * width / 2 + col;
+                picture.u[i] = (100 + (col * 60 / (width / 2).max(1))) as u8;
+                picture.v[i] = (200 - (row * 80 / (height / 2).max(1))) as u8;
+            }
+        }
+        picture
+    }
+
+    fn panned_test_card(width: usize, height: usize, shift: i64) -> crate::encode::Picture {
+        let mut picture = crate::encode::Picture::grey(width, height);
+        for y in 0..height {
+            for x in 0..width {
+                let sx = (x as i64 - shift).rem_euclid(width as i64) as f64;
+                let gradient = sx * 200.0 / width as f64;
+                picture.y[y * width + x] = (20.0 + gradient).clamp(0.0, 255.0) as u8;
+            }
+        }
+        for y in 0..height / 2 {
+            for x in 0..width / 2 {
+                let sx = (x as i64 - shift / 2).rem_euclid((width / 2) as i64) as usize;
+                let i = y * width / 2 + x;
+                picture.u[i] = (100 + (sx * 60 / (width / 2))) as u8;
+                picture.v[i] = (200 - (y * 80 / (height / 2))) as u8;
+            }
+        }
+        picture
+    }
+
+    /// A GOP (one key frame plus several inter frames, each panned so its
+    /// blocks actually take `NEARESTMV`/`NEWMV` rather than an all-skip
+    /// `(0, 0)` no-op) decodes bit-exact against the encoder's own
+    /// reconstruction, frame by frame, chaining each decoded frame straight
+    /// into the next as its reference -- exactly the single-slot DPB
+    /// [`crate::encode::encode_sequence`] itself threads.
+    fn gop_round_trips(width: usize, height: usize) {
+        use crate::encode::encode_sequence;
+        let pictures: Vec<_> = (0..4)
+            .map(|i| panned_test_card(width, height, i * 3))
+            .collect();
+        let encoded = encode_sequence(&pictures, 100, 0.5).unwrap();
+        assert_eq!(encoded.frames.len(), 4);
+
+        let key = &encoded.frames[0];
+        let mut reference = decode_key_frame_tile(
+            &key.tile,
+            key.mi_cols,
+            key.mi_rows,
+            key.base_q_idx,
+            width as u32,
+            height as u32,
+        )
+        .unwrap();
+        assert_eq!(
+            reference.y, key.reconstruction.y,
+            "{width}x{height} frame 0 luma"
+        );
+        assert_eq!(
+            reference.u, key.reconstruction.u,
+            "{width}x{height} frame 0 U"
+        );
+        assert_eq!(
+            reference.v, key.reconstruction.v,
+            "{width}x{height} frame 0 V"
+        );
+
+        for (i, frame) in encoded.frames.iter().enumerate().skip(1) {
+            let decoded = decode_inter_frame_tile(
+                &frame.tile,
+                frame.mi_cols,
+                frame.mi_rows,
+                frame.base_q_idx,
+                width as u32,
+                height as u32,
+                &reference,
+            )
+            .unwrap();
+            assert_eq!(
+                decoded.y, frame.reconstruction.y,
+                "{width}x{height} frame {i} luma"
+            );
+            assert_eq!(
+                decoded.u, frame.reconstruction.u,
+                "{width}x{height} frame {i} U"
+            );
+            assert_eq!(
+                decoded.v, frame.reconstruction.v,
+                "{width}x{height} frame {i} V"
+            );
+            reference = decoded;
+        }
+    }
+
+    #[test]
+    fn a_gop_round_trips_bit_exact_against_the_encoder_reconstruction() {
+        gop_round_trips(128, 64);
+    }
+
+    /// Same claim, at a size that is not a whole number of 32x32 blocks
+    /// (216x96: 216/32 is not exact), so an inter frame's own 16x16-leaf
+    /// split path is exercised too.
+    #[test]
+    fn an_odd_size_gop_round_trips_bit_exact_against_the_encoder_reconstruction() {
+        gop_round_trips(216, 96);
+    }
+
+    /// The GOP cross-oracle: ffmpeg decodes the whole sequence the same way
+    /// this module does, frame for frame.
+    #[test]
+    fn ffmpeg_and_this_decoder_agree_on_a_gop() {
+        if !have_ffmpeg() {
+            eprintln!("SKIP ffmpeg_and_this_decoder_agree_on_a_gop: no ffmpeg");
+            return;
+        }
+        use crate::encode::encode_sequence;
+        let (width, height) = (128usize, 64usize);
+        let pictures: Vec<_> = (0..3)
+            .map(|i| panned_test_card(width, height, i * 3))
+            .collect();
+        let encoded = encode_sequence(&pictures, 100, 0.5).unwrap();
+        let (coded_w, coded_h) = ffprobe_size(&encoded.stream);
+        let ffmpeg_frames =
+            ffmpeg_decode_sequence(&encoded.stream, coded_w as usize, coded_h as usize, 3);
+
+        let key = &encoded.frames[0];
+        let mut reference = decode_key_frame_tile(
+            &key.tile,
+            key.mi_cols,
+            key.mi_rows,
+            key.base_q_idx,
+            coded_w,
+            coded_h,
+        )
+        .unwrap();
+        assert_eq!(reference.y, ffmpeg_frames[0].y, "frame 0 luma vs ffmpeg");
+
+        for (i, frame) in encoded.frames.iter().enumerate().skip(1) {
+            let decoded = decode_inter_frame_tile(
+                &frame.tile,
+                frame.mi_cols,
+                frame.mi_rows,
+                frame.base_q_idx,
+                coded_w,
+                coded_h,
+                &reference,
+            )
+            .unwrap();
+            assert_eq!(decoded.y, ffmpeg_frames[i].y, "frame {i} luma vs ffmpeg");
+            assert_eq!(decoded.u, ffmpeg_frames[i].u, "frame {i} U vs ffmpeg");
+            assert_eq!(decoded.v, ffmpeg_frames[i].v, "frame {i} V vs ffmpeg");
+            reference = decoded;
+        }
     }
 }
