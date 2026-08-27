@@ -294,17 +294,31 @@ impl CtuDecoder {
         }
     }
 
+    /// The mode at a position if one has been assigned, independent of
+    /// whether its *pixels* have been reconstructed yet: an NxN coding unit's
+    /// `prev_intra_luma_pred_flag`s (and then every remainder) are all
+    /// signalled before any of its four partitions is reconstructed
+    /// (7.3.8.5), so by the time partition 2's mode is decoded, partition 1's
+    /// mode is already known even though its transform tree has not run —
+    /// MPM only needs the syntax-level mode (8.4.2), not the reconstructed
+    /// sample `available()` gates for prediction reference construction
+    /// (8.4.4.2.1). Using the `modes` sentinel directly (unset stays 255)
+    /// keeps those two notions of "available" from being conflated: pixel
+    /// availability still comes from `decoded`, set only once a position is
+    /// actually reconstructed.
+    fn mode_if_known(&self, x: isize, y: isize) -> Option<u8> {
+        if x < 0 || y < 0 || x >= self.width as isize || y >= self.height as isize {
+            return None;
+        }
+        let m = self.modes[(y as usize / 4) * (self.width / 4) + x as usize / 4];
+        if m == 255 { None } else { Some(m) }
+    }
+
     fn mpm_at(&self, x: usize, y: usize) -> [u8; 3] {
-        let left = if self.available(x as isize - 1, y as isize) {
-            let m = self.mode_at(x - 1, y);
-            if m == 255 { None } else { Some(m) }
-        } else {
-            None
-        };
+        let left = self.mode_if_known(x as isize - 1, y as isize);
         let band_y0 = (y / self.ctb_size) * self.ctb_size;
-        let above = if y > band_y0 && self.available(x as isize, y as isize - 1) {
-            let m = self.mode_at(x, y - 1);
-            if m == 255 { None } else { Some(m) }
+        let above = if y > band_y0 {
+            self.mode_if_known(x as isize, y as isize - 1)
         } else {
             None
         };
@@ -512,25 +526,23 @@ impl CtuDecoder {
                 mode
             };
             modes[part] = mode;
-            // Mode and availability, so the next partition's `mpm_at` sees
-            // this one as a real coded neighbour — the encoder's own
-            // mode-decide loop calls `mark_coded` (which flips availability)
-            // immediately per partition for exactly this reason (8.4.2: an
-            // NxN CU's later partitions see its earlier ones as available).
-            // Marking modes here without also marking `decoded` left the
-            // second/third/fourth partition's left/above neighbour reading
-            // as unavailable (substituted DC) on the decoder side while the
-            // encoder's MPM saw the real mode, decoding the wrong MPM triple
-            // and desyncing every bin after it — this is what an NxN CU
-            // forced into existence by a boundary split (rather than chosen
-            // by `intra_nxn`'s RD search) actually exercises differently:
-            // the RD search rarely keeps NxN once a real neighbour is
-            // available on all four sides, so the bug went unseen until a
-            // picture edge forced it.
+            // Mode only, so the next partition's `mpm_at` (via
+            // `mode_if_known`) sees this one's mode without its pixels being
+            // reconstructed yet — 8.4.2's candIntraPredMode only needs the
+            // neighbour's syntax-level mode, which an NxN CU's own earlier
+            // partition already has despite its transform tree not having
+            // run (7.3.8.5 signals all four modes before any residual).
+            // Marking `self.decoded` here too (as an earlier version of this
+            // loop did) went further than that: it made partition 2 and 3's
+            // *pixels* look available to partition 1's own reference-sample
+            // construction (8.4.4.2.1) before the second loop below had
+            // reconstructed them, reading zero-initialised `y_buf` instead of
+            // the correctly-substituted "not yet available" edge case — a
+            // one-CU-late reconstruction that stayed invisible until a
+            // picture edge forced this exact NxN+RQT combination.
             let stride = self.width / 4;
             let idx = (py / 4) * stride + px / 4;
             self.modes[idx] = mode;
-            self.decoded[idx] = true;
         }
 
         let chroma_mode = self.decode_chroma_mode(dec, modes[0]);
