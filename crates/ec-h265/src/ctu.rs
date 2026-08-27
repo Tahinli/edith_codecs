@@ -1208,8 +1208,16 @@ impl<'a> CtuEncoder<'a> {
                 let mut sorted = *mpm;
                 sorted.sort_unstable();
                 let mut rem = mode;
+                // The inverse of the decoder's iterative reconstruction
+                // (`for m in sorted (ascending): if mode >= m { mode += 1 }`)
+                // has to walk descending and compare the *running* `rem`,
+                // not the original `mode`: decrementing across one candidate
+                // can drop `rem` at or below the next one down, which then
+                // must also count. Comparing against the fixed `mode` missed
+                // that second step whenever two MPM candidates sat on either
+                // side of it.
                 for &m in sorted.iter().rev() {
-                    if mode > m {
+                    if rem > m {
                         rem -= 1;
                     }
                 }

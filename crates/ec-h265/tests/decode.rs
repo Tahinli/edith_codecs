@@ -24,10 +24,7 @@ fn roundtrip_at(width: u32, height: u32) {
     });
 
     let sps = enc.sps();
-    assert_eq!(
-        decoded.width,
-        sps.pic_width_in_ctbs() as usize * sps.ctb_size() as usize
-    );
+    assert_eq!(decoded.width, sps.pic_width_in_luma_samples as usize);
 
     // Compare over the displayed region only: `recon` is cropped by the
     // conformance window, `decoded` is the full coded (padded) picture.
@@ -59,10 +56,16 @@ fn decode_matches_the_encoders_own_reconstruction_over_several_ctbs() {
 }
 
 #[test]
-#[ignore = "r1 checkpoint: fails with 'end_of_subset_one_bit was not set at a WPP \
-row boundary' — the decoder's WPP substream handling at a sub-CTB-tail row is \
-wrong or the single-slice no-WPP case is misdetected; whole-CTB sizes decode \
-byte-exact. Next round fixes this, then un-ignores."]
 fn decode_matches_the_encoders_own_reconstruction_at_an_odd_padded_size() {
     roundtrip_at(70, 50);
+}
+
+#[test]
+fn decode_matches_the_encoders_own_reconstruction_at_another_odd_size() {
+    roundtrip_at(150, 94);
+}
+
+#[test]
+fn decode_matches_the_encoders_own_reconstruction_at_an_extreme_odd_size() {
+    roundtrip_at(41, 33);
 }
