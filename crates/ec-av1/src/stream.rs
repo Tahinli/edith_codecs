@@ -1769,6 +1769,19 @@ mod tests {
             };
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
             assert_eq!(frames.len(), frame_count);
+            // lane-av1golden3: pin the exact raw stream on the first mismatch
+            // so a flaky-looking gate failure becomes a deterministic, static
+            // fixture to bisect against -- env-gated, no cost on a normal run.
+            let mismatched = frames
+                .iter()
+                .zip(&ffmpeg_frames)
+                .any(|(got, want)| got.y != want.y || got.u != want.u || got.v != want.v);
+            if mismatched {
+                if let Ok(path) = std::env::var("EC_AV1_GATE_DUMP") {
+                    std::fs::write(&path, &stream).expect("writing pinned stream");
+                    eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
+                }
+            }
             for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
                 assert_eq!(got.y, want.y, "frame {i} luma vs ffmpeg (seed {seed})");
                 assert_eq!(got.u, want.u, "frame {i} U vs ffmpeg (seed {seed})");
@@ -1781,6 +1794,35 @@ mod tests {
              attempt hit a named refusal:\n{}",
             refusals.join("\n")
         );
+    }
+
+    /// lane-av1golden3: reproduces the pinned mismatch bytes captured by
+    /// `EC_AV1_GATE_DUMP=$SP/golden3-pin.obu` off
+    /// [`a_real_aomenc_inter_sequence_with_cdf_forwarding_decodes_pixel_exact`]
+    /// (seed 47, frame 1 U). Deterministic and static -- no aomenc/ffmpeg
+    /// re-encode involved, only re-decodes the fixed bytes on disk, so it is
+    /// `#[ignore]`d (the file only exists on this machine's scratchpad) but
+    /// gives a fast red/green loop for the actual fix.
+    #[test]
+    #[ignore = "reads a pinned fixture path outside the repo; run manually"]
+    fn pinned_golden3_stream_decodes_pixel_exact() {
+        let path = std::env::var("EC_AV1_GATE_DUMP_PIN").unwrap_or_else(|_| {
+            "/tmp/claude-1000/-home-tahinli-Documents-Code-Rust-edith-codecs/\
+             51b5f611-f998-43a8-b975-e64cb643a3e1/scratchpad/golden3-pin.obu"
+                .to_string()
+        });
+        let stream = std::fs::read(&path).expect("reading pinned stream");
+        if !have_ffmpeg() {
+            eprintln!("SKIP pinned_golden3_stream_decodes_pixel_exact: no ffmpeg");
+            return;
+        }
+        let frames = decode_stream(&stream).expect("pinned stream must decode");
+        let ffmpeg_frames = ffmpeg_decode_sequence(&stream, 64, 64, 4);
+        for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+            assert_eq!(got.y, want.y, "frame {i} luma vs ffmpeg (pinned)");
+            assert_eq!(got.u, want.u, "frame {i} U vs ffmpeg (pinned)");
+            assert_eq!(got.v, want.v, "frame {i} V vs ffmpeg (pinned)");
+        }
     }
 
     /// lane-av1refs's decisive single-non-LAST-reference gate: identical
