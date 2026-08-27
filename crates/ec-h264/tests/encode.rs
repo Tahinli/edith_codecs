@@ -437,9 +437,17 @@ fn have_ffmpeg() -> bool {
 
 /// Decode an Annex B stream with ffmpeg, returning one I420 triple per picture.
 fn ffmpeg_decode(stream: &[u8], w: usize, h: usize, extra: &[&str]) -> Option<Vec<Planes>> {
+    // Distinct per call, not per process: several #[test]s in this binary
+    // call this on parallel threads, and a path keyed only on stream length
+    // lets one call's cleanup delete another's still-being-read file.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let dir = std::env::temp_dir().join(format!("ec-h264-enc-{}", std::process::id()));
     std::fs::create_dir_all(&dir).ok()?;
-    let path = dir.join(format!("s{}.264", stream.len()));
+    let path = dir.join(format!(
+        "s{}-{}.264",
+        stream.len(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     std::fs::write(&path, stream).ok()?;
     let mut cmd = std::process::Command::new("ffmpeg");
     cmd.args(["-v", "error"]);
@@ -1010,10 +1018,15 @@ fn have_x264() -> bool {
 /// off so both encoders spend bits by the same rule. Returns the Annex B
 /// stream.
 fn x264_encode_qp(sources: &[Planes], w: usize, h: usize, qp: i32, gop: u32) -> Option<Vec<u8>> {
+    // Distinct per call, not per process: two #[test]s in this binary call
+    // this on parallel threads with overlapping qp values, and a path keyed
+    // only on qp lets one call's cleanup delete another's still-in-use file.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!("ec-h264-x264-{}", std::process::id()));
     std::fs::create_dir_all(&dir).ok()?;
-    let raw = dir.join(format!("in-q{qp}.yuv"));
-    let out = dir.join(format!("out-q{qp}.264"));
+    let raw = dir.join(format!("in-q{qp}-{seq}.yuv"));
+    let out = dir.join(format!("out-q{qp}-{seq}.264"));
     let mut buf = Vec::with_capacity(sources.len() * w * h * 3 / 2);
     for (y, u, v) in sources {
         buf.extend_from_slice(y);
