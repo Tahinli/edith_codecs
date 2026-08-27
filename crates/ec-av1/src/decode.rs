@@ -674,7 +674,9 @@ struct Neighbours {
     /// transform size, spec 7.14's `get_transform_size`/`get_filter_level`
     /// edge-length lookup (`apply_deblock`).
     tx_grid: Vec<u8>,
-    /// Per-4x4-mi reference frame (`0` = intra, `1..=7` = `MV_REFERENCE_FRAME`)
+    /// Per-4x4-mi reference frame (`0` = intra, magnitude `1..=7` =
+    /// `MV_REFERENCE_FRAME`, negative = that reference coded as `GLOBALMV` --
+    /// `lf_level`'s `mode_lf_lut` row 0, lane-av1golden2)
     /// -- the loop filter's ref/mode delta lookup (spec 7.14.4
     /// `get_filter_level`, `loop_filter_ref_deltas[ref_frame]`; lane-av1refs:
     /// widened from a bare `is_inter` bool, which collapsed every non-`LAST`
@@ -2398,10 +2400,14 @@ fn unit_log2(px: u32) -> i32 {
     }
 }
 
-/// spec 7.14.4's `get_filter_level`, restricted to this decoder's shapes:
-/// every inter block is a single `LAST_FRAME` reference with a non-`GLOBALMV`
-/// mode, so `is_inter` alone selects `ref_deltas`/`mode_deltas` (design note
-/// on [`Neighbours::ref_grid`]).
+/// spec 7.14.4's `get_filter_level`: `ref_deltas` is indexed by the block's
+/// reference frame, `mode_deltas` by `mode_lf_lut[mode]` -- `0` for
+/// `GLOBALMV`, `1` for `NEARESTMV`/`NEARMV`/`NEWMV` (intra gets no mode
+/// delta). `ref_frame` here is [`Neighbours::ref_grid`]'s packed cell:
+/// magnitude = reference (`0` = intra), sign = `GLOBALMV` (lane-av1golden2:
+/// the flat `mode_deltas[1]` this used before was a `LAST_FRAME`-reachable
+/// wrong delta on every `GLOBALMV` block, masked while any `GOLDEN_FRAME`
+/// block anywhere aborted the whole stream's decode before comparison).
 fn lf_level(lf: &LoopFilterParams, plane_idx: usize, dir: usize, ref_frame: i8) -> i32 {
     let base = i32::from(if plane_idx == 0 {
         lf.level[dir]
@@ -2415,10 +2421,11 @@ fn lf_level(lf: &LoopFilterParams, plane_idx: usize, dir: usize, ref_frame: i8) 
     }
     let scale = 1i32 << (base >> 5);
     let is_inter = ref_frame != 0;
-    let ref_idx = ref_frame as usize;
+    let is_globalmv = ref_frame < 0;
+    let ref_idx = ref_frame.unsigned_abs() as usize;
     let mut lvl = base + i32::from(lf.ref_deltas[ref_idx]) * scale;
     if is_inter {
-        lvl += i32::from(lf.mode_deltas[1]) * scale;
+        lvl += i32::from(lf.mode_deltas[usize::from(!is_globalmv)]) * scale;
     }
     lvl.clamp(0, 63)
 }
@@ -3693,9 +3700,11 @@ fn decode_inter_block(
     // into a `[Option<&PlaneBuf>; REFS_PER_FRAME]` addressed by the decoded
     // reference, same as the CDF/picture DPB slots `decode_stream` already
     // keeps.
-    golden_y: Option<&PlaneBuf>,
-    golden_u: Option<&PlaneBuf>,
-    golden_v: Option<&PlaneBuf>,
+    // (round 5: parameters kept threaded but unread while the GOLDEN arm is
+    // masked -- see the refusal below.)
+    _golden_y: Option<&PlaneBuf>,
+    _golden_u: Option<&PlaneBuf>,
+    _golden_v: Option<&PlaneBuf>,
     base_q_idx: u8,
     luma_set_intra: TxbSet,
     luma_set_inter: TxbSet,
@@ -3726,6 +3735,7 @@ fn decode_inter_block(
     let (luma_grid, u_grid, v_grid);
     let block_filter;
     let ref_frame_for_lf;
+    let globalmv_for_lf;
     if is_inter {
         let ref_frame = read_single_ref(dec, cdfs, neighbours.above_ref[c], neighbours.left_ref[r]);
         ref_frame_for_lf = ref_frame;
@@ -3733,27 +3743,29 @@ fn decode_inter_block(
         // recipe never landed a GOLDEN_FRAME-firing, decodable stream (every
         // attempt hit an unrelated named refusal first), so this arm stayed
         // refused pending a fixture that could prove it another way. A
-        // hand-built stream now does: `a_hand_built_golden_reference_decodes_pixel_exact_against_ffmpeg`
-        // (stream.rs) drives GOLDEN_FRAME through a real OBU stream that
-        // ffmpeg also decodes, byte for byte. GOLDEN_FRAME is threaded to
-        // MC/mvstack/deblock the same as LAST_FRAME from here; every other
-        // reference (LAST2/LAST3/BWDREF/ALTREF2/ALTREF) still refuses by
-        // name below -- none of them have a live pixel-exact proof yet.
+        // hand-built stream did (stream.rs's fixture drives GOLDEN_FRAME
+        // through a real OBU stream ffmpeg also decodes), and the arm went
+        // live at the round-4 merge.
+        // round 5 (lane-av1golden2): the first real aomenc streams through
+        // this arm mismatched. Symbol-trace vs a patched aomdec proved one
+        // cause `LAST_FRAME`-reachable -- `lf_level`'s flat `mode_deltas[1]`
+        // on `GLOBALMV` blocks (fixed; see `Neighbours::ref_grid`'s packed
+        // sign), previously masked because a GOLDEN block anywhere aborted
+        // the whole stream via `?` here -- and that fix moved the failure
+        // from seed 42 (frame 1, V) to seed 48 (frame 3, U): at least one
+        // more stacked defect remains on the GOLDEN-live path, so the
+        // refusal narrows back to `LAST_FRAME` until a real-stream gate
+        // holds pixel-exact with GOLDEN live (the hand-built fixture below
+        // proved the symbol path and a whole-pel copy, not subpel MC off the
+        // golden plane -- `a_hand_built_golden_reference_refuses_by_name`
+        // keeps the fixture and asserts the mask instead).
         let (py_ref, pu_ref, pv_ref) = match ref_frame {
             LAST_FRAME => (ref_y, ref_u, ref_v),
-            GOLDEN_FRAME => match (golden_y, golden_u, golden_v) {
-                (Some(gy), Some(gu), Some(gv)) => (gy, gu, gv),
-                _ => {
-                    return Err(unsupported(
-                        "GOLDEN_FRAME selected with no golden picture at this frame's \
-                         ref_frame_idx[3] slot",
-                    ));
-                }
-            },
             _ => {
                 return Err(unsupported(
-                    "a reference frame other than LAST_FRAME/GOLDEN_FRAME (LAST2/LAST3/\
-                     BWDREF/ALTREF2/ALTREF still have no live pixel-exact proof)",
+                    "a reference frame other than LAST_FRAME (round 5: GOLDEN_FRAME's decode \
+                     path exists but is masked -- a stacked defect past the GLOBALMV \
+                     loop-filter mode-delta fix keeps real GOLDEN streams from pixel-exact)",
                 ));
             }
         };
@@ -3840,6 +3852,7 @@ fn decode_inter_block(
             neighbours.left_filter[r],
         );
         block_filter = resolved_filter;
+        globalmv_for_lf = is_globalmv;
         if std::env::var_os("EC_AV1_TRACE").is_some() {
             eprintln!(
                 "EC_TRACE mi_row={mi_row} mi_col={mi_col} skip={} is_inter=1 mv=({},{}) is_new_mv={is_new_mv} bsize={side}",
@@ -3999,6 +4012,7 @@ fn decode_inter_block(
         mode_for_tx = mode;
         block_filter = [3, 3];
         ref_frame_for_lf = 0;
+        globalmv_for_lf = false;
         let (mi_row, mi_col) = (r * SUB_MI as usize, c * SUB_MI as usize);
         for dr in 0..side / 4 {
             for dc in 0..side / 4 {
@@ -4130,7 +4144,13 @@ fn decode_inter_block(
         (r * (SUB / MI), c * (SUB / MI)),
         side / MI,
         side as u8,
-        ref_frame_for_lf,
+        // ref_grid's packed convention (lf_level): sign carries GLOBALMV,
+        // whose mode_lf_lut row is 0, not the 1 every other inter mode gets.
+        if globalmv_for_lf {
+            -ref_frame_for_lf
+        } else {
+            ref_frame_for_lf
+        },
     );
     Ok(())
 }
