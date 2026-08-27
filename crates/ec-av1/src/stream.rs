@@ -187,6 +187,9 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         let enable_dual_filter = parser
             .sequence_header()
             .is_some_and(|seq| seq.enable_dual_filter);
+        let enable_edge_filter = parser
+            .sequence_header()
+            .is_some_and(|seq| seq.enable_intra_edge_filter);
         let interp_fixed = match header.interpolation_filter {
             ec_av1_syntax::InterpolationFilter::Switchable => None,
             fixed => Some(crate::mc::InterpFilterKind::from_header(fixed)),
@@ -218,6 +221,7 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 header.frame_width,
                 header.frame_height,
                 enable_filter_intra,
+                enable_edge_filter,
                 &header.cdef,
                 &header.loop_filter,
                 initial_cdfs,
@@ -1171,6 +1175,158 @@ mod tests {
         eprintln!(
             "SKIP a_real_aomenc_intra_stream_with_tx_select_decodes_pixel_exact: every attempt \
              hit a named refusal or never split a transform:\n{}",
+            refusals.join("\n")
+        );
+    }
+
+    /// The directional-chroma/angle-delta gate: a real aomenc key frame with
+    /// `--enable-directional-intra`/`--enable-angle-delta` left ON (the
+    /// opposite of every sibling recipe's `=0`, which existed specifically to
+    /// keep this round-2 gap from firing while a different surface was under
+    /// test). A colourful, sharp-edged source gives the RD search a reason to
+    /// pick a directional `uv_mode` and/or a nonzero angle delta -- some
+    /// seeds still won't, so retry like every other real-encoder gate here,
+    /// but the first attempt that actually fires either counter must decode
+    /// pixel-exact.
+    #[test]
+    fn a_real_aomenc_stream_with_directional_chroma_decodes_pixel_exact() {
+        if !have_ffmpeg() {
+            eprintln!(
+                "SKIP a_real_aomenc_stream_with_directional_chroma_decodes_pixel_exact: no ffmpeg"
+            );
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!(
+                "SKIP a_real_aomenc_stream_with_directional_chroma_decodes_pixel_exact: no aomenc at {}",
+                aomenc_path().display()
+            );
+            return;
+        }
+        let (width, height) = (64usize, 64usize);
+        let mut refusals = Vec::new();
+        let mut fired_runs = 0u32;
+        for attempt in 0..40u32 {
+            let seed = 42 + attempt;
+            let source = format!(
+                "mandelbrot=size=64x64:start_scale={}:rate=25",
+                5.0 - f64::from(attempt) * 0.06
+            );
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-t",
+                    "0.04",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let mut child = Command::new(aomenc_path())
+                .args([
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    "--cq-level=45",
+                    "--cpu-used=0",
+                    "--enable-rect-partitions=0",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    "--enable-filter-intra=0",
+                    // Smooth/Paeth chroma is a separate, still-refused round-2
+                    // gap (an unrelated `Edges::build` no-neighbour bug this
+                    // lane does not cover) -- off so the RD search's only
+                    // non-DC/CFL chroma choice left is directional.
+                    "--enable-smooth-intra=0",
+                    "--enable-paeth-intra=0",
+                    "--enable-tx-size-search=0",
+                    "--enable-cdef=0",
+                    "--enable-restoration=0",
+                    // The intra edge filter/upsample (spec 7.11.2.7-2.9) is
+                    // now implemented (`directional()`) -- left ON (aomenc's
+                    // own default) so this gate actually exercises it instead
+                    // of the un-filtered fast path a disabled flag would keep
+                    // testing.
+                    "--enable-intra-edge-filter=1",
+                    "--max-partition-size=32",
+                    // Same reason as the tx-select gate above: 8x8 and other
+                    // sub-16x16 splits are a separate, already-named refusal.
+                    "--min-partition-size=16",
+                    "--enable-palette=0",
+                    "--enable-intrabc=0",
+                    "--enable-cfl-intra=0",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let (uv_before, angle_before) =
+                (decode::directional_uv_hits(), decode::angle_delta_hits());
+            let frames = match decode_stream(&stream) {
+                Ok(frames) => frames,
+                Err(e) => {
+                    refusals.push(format!("seed {seed}: {e}"));
+                    continue;
+                }
+            };
+            if decode::directional_uv_hits() == uv_before
+                && decode::angle_delta_hits() == angle_before
+            {
+                refusals.push(format!(
+                    "seed {seed}: decoded, but neither a directional uv_mode nor a \
+                     nonzero angle delta fired"
+                ));
+                continue;
+            }
+            fired_runs += 1;
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
+            assert_eq!(
+                frames[0].y, ffmpeg_frames[0].y,
+                "luma vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(frames[0].u, ffmpeg_frames[0].u, "U vs ffmpeg (seed {seed})");
+            assert_eq!(frames[0].v, ffmpeg_frames[0].v, "V vs ffmpeg (seed {seed})");
+            if fired_runs >= 4 {
+                return;
+            }
+        }
+        assert!(
+            fired_runs > 0,
+            "every attempt hit a named refusal or never exercised directional chroma:\n{}",
             refusals.join("\n")
         );
     }

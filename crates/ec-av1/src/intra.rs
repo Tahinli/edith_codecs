@@ -124,6 +124,10 @@ fn dr_intra_derivative(angle: u16) -> i32 {
 /// `Mode_To_Angle` (spec 9.3), zero for the modes that have no angle.
 const MODE_TO_ANGLE: [u16; 13] = [0, 90, 180, 45, 135, 113, 157, 203, 67, 0, 0, 0, 0];
 
+/// `ANGLE_STEP` (spec 9.3): degrees per unit of `angle_delta`, whose own
+/// range is `-MAX_ANGLE_DELTA..=MAX_ANGLE_DELTA` (`MAX_ANGLE_DELTA == 3`).
+const ANGLE_STEP: i32 = 3;
+
 /// The edges a block predicts from, as the decoder builds them (spec 7.11.2.2):
 /// a side that does not exist is filled from the side that does, a side that
 /// runs out is extended by repeating its last sample, and the corner falls back
@@ -195,26 +199,62 @@ impl Edges {
 /// the edge is extended by repetition where it does not, which is what the
 /// decoder's own clamp to `aboveLimit` and `leftLimit` comes to.
 ///
+/// `angle_delta` (spec `AngleDeltaY`/`AngleDeltaUV`, `-MAX_ANGLE_DELTA` to
+/// `MAX_ANGLE_DELTA`) steers every one of `V_PRED`, `H_PRED` and the six
+/// diagonal modes off their base angle by `ANGLE_STEP` degrees per unit (spec
+/// 7.11.2.1's `pAngle = Mode_To_Angle[mode] + angleDelta * ANGLE_STEP`);
+/// ignored (must be `0`) for the seven modes that carry no angle at all.
+///
+/// `enable_edge_filter` is the sequence header's `enable_intra_edge_filter`
+/// (spec 7.11.2.4's own gate on the whole filter/upsample step); `smooth_neighbor`
+/// is `get_intra_edge_filter_type` (spec 7.11.2.9, libaom `reconintra.c`) --
+/// whether the block above or to the left predicted with one of the three
+/// smooth modes, which steers [`intra_edge_filter_strength`]'s threshold
+/// table. Ignored outside the directional modes.
+///
 /// # Panics
 /// Panics on a mode this module does not predict, or when `dst` is not
 /// `side * side` long.
+#[allow(clippy::too_many_arguments)]
 pub fn predict(
     mode: u8,
+    angle_delta: i32,
     above: Option<&[u8]>,
     left: Option<&[u8]>,
     corner: Option<u8>,
     side: usize,
+    enable_edge_filter: bool,
+    smooth_neighbor: bool,
     dst: &mut [u8],
 ) {
     assert_eq!(dst.len(), side * side, "the destination is the block");
     let edges = Edges::build(above, left, corner, side);
-    let angle = MODE_TO_ANGLE[usize::from(mode)];
-    if matches!(
+    let is_directional = matches!(
         mode,
-        D45_PRED | D67_PRED | D113_PRED | D135_PRED | D157_PRED | D203_PRED
-    ) {
-        directional(angle, &edges, side, dst);
-        return;
+        V_PRED | H_PRED | D45_PRED | D67_PRED | D113_PRED | D135_PRED | D157_PRED | D203_PRED
+    );
+    if is_directional {
+        let angle = i32::from(MODE_TO_ANGLE[usize::from(mode)]) + angle_delta * ANGLE_STEP;
+        // `pAngle == 90`/`180` is `V_PRED`/`H_PRED` at zero delta: a plain
+        // edge copy, no walk -- and the only two angles `dr_intra_derivative`
+        // has no table entry for, since libaom special-cases them the same
+        // way (`av1_is_directional_mode`'s callers never call the z1/z2/z3
+        // walk there either).
+        if angle != 90 && angle != 180 {
+            let n_top = above.map_or(0, |a| a.len().min(side));
+            let n_left = left.map_or(0, |a| a.len().min(side));
+            directional(
+                angle as u16,
+                &edges,
+                side,
+                enable_edge_filter,
+                smooth_neighbor,
+                n_top,
+                n_left,
+                dst,
+            );
+            return;
+        }
     }
     let weights = &SM_WEIGHTS[side..side * 2];
     for row in 0..side {
@@ -250,52 +290,245 @@ pub fn predict(
     }
 }
 
-/// Directional intra prediction (spec 7.11.2.4), with the intra edge filter off
-/// -- which is what our sequence header says -- so nothing here upsamples.
-fn directional(angle: u16, edges: &Edges, side: usize, dst: &mut [u8]) {
+/// `intra_edge_filter_strength` (spec 7.11.2.9, libaom `reconintra.c`): the
+/// filter kernel index (`0`..=`3`) for a gap of `delta` degrees against a
+/// `bs0 + bs1`-wide block, split by `smooth_neighbor`'s two threshold tables.
+fn intra_edge_filter_strength(bs0: i32, bs1: i32, delta: i32, smooth_neighbor: bool) -> i32 {
+    let d = delta.abs();
+    let blk_wh = bs0 + bs1;
+    let mut strength = 0;
+    if !smooth_neighbor {
+        if blk_wh <= 8 {
+            if d >= 56 {
+                strength = 1;
+            }
+        } else if blk_wh <= 16 {
+            if d >= 40 {
+                strength = 1;
+            }
+        } else if blk_wh <= 24 {
+            if d >= 8 {
+                strength = 1;
+            }
+            if d >= 16 {
+                strength = 2;
+            }
+            if d >= 32 {
+                strength = 3;
+            }
+        } else if blk_wh <= 32 {
+            if d >= 1 {
+                strength = 1;
+            }
+            if d >= 4 {
+                strength = 2;
+            }
+            if d >= 32 {
+                strength = 3;
+            }
+        } else if d >= 1 {
+            strength = 3;
+        }
+    } else if blk_wh <= 8 {
+        if d >= 40 {
+            strength = 1;
+        }
+        if d >= 64 {
+            strength = 2;
+        }
+    } else if blk_wh <= 16 {
+        if d >= 20 {
+            strength = 1;
+        }
+        if d >= 48 {
+            strength = 2;
+        }
+    } else if blk_wh <= 24 {
+        if d >= 4 {
+            strength = 3;
+        }
+    } else if d >= 1 {
+        strength = 3;
+    }
+    strength
+}
+
+/// `av1_use_intra_edge_upsample` (spec 7.11.2.9): whether the edge doubles in
+/// density before the walk reads it.
+fn use_intra_edge_upsample(bs0: i32, bs1: i32, delta: i32, smooth_neighbor: bool) -> bool {
+    let d = delta.abs();
+    let blk_wh = bs0 + bs1;
+    if d == 0 || d >= 40 {
+        return false;
+    }
+    if smooth_neighbor {
+        blk_wh <= 8
+    } else {
+        blk_wh <= 16
+    }
+}
+
+/// `av1_filter_intra_edge_c` (spec 7.11.2.8): a 5-tap smoothing pass over
+/// `buf` in place, `buf[0]` (the corner) held fixed as every tap's clamp
+/// floor/ceiling.
+fn filter_intra_edge(buf: &mut [i32], strength: i32) {
+    if strength == 0 {
+        return;
+    }
+    const KERNEL: [[i32; 5]; 3] = [[0, 4, 8, 4, 0], [0, 5, 6, 5, 0], [2, 4, 4, 4, 2]];
+    let filt = usize::try_from(strength - 1).expect("a filter strength is never negative");
+    let sz = buf.len() as i32;
+    let edge = buf.to_vec();
+    for i in 1..buf.len() {
+        let mut s = 0;
+        for (j, &tap) in KERNEL[filt].iter().enumerate() {
+            let k = (i as i32 - 2 + j as i32).clamp(0, sz - 1);
+            s += edge[k as usize] * tap;
+        }
+        buf[i] = (s + 8) >> 4;
+    }
+}
+
+/// `av1_upsample_intra_edge_c` (spec 7.11.2.8): doubles `buf`'s density.
+/// `buf[0]` is spec position `-1` and `buf[buf.len() - 1]` is `sz - 1`; the
+/// result's `[0]` is spec position `-2`, `[2*i + 1]` the half-sample between
+/// `i - 1` and `i`, `[2*i + 2]` the original sample `i` moved to its doubled
+/// slot.
+fn upsample_intra_edge(buf: &[i32]) -> Vec<i32> {
+    let sz = buf.len() - 1;
+    let mut inp = vec![0i32; sz + 3];
+    inp[0] = buf[0];
+    inp[1] = buf[0];
+    inp[2..sz + 2].copy_from_slice(&buf[1..]);
+    inp[sz + 2] = buf[sz];
+    let mut out = vec![0i32; 2 * sz + 1];
+    out[0] = inp[0];
+    for i in 0..sz {
+        let s = -inp[i] + 9 * inp[i + 1] + 9 * inp[i + 2] - inp[i + 3];
+        out[2 * i + 1] = ((s + 8) >> 4).clamp(0, 255);
+        out[2 * i + 2] = inp[i + 2];
+    }
+    out
+}
+
+/// Directional intra prediction (spec 7.11.2.4): the edge filter/upsample
+/// steps (spec 7.11.2.7-2.9) run first when `enable_edge_filter` (the
+/// sequence header's own gate) says to, then the z1/z2/z3 walk (libaom
+/// `av1_dr_prediction_z{1,2,3}_c`) reads whichever of the two -- filtered,
+/// upsampled, or neither -- it ends with.
+#[allow(clippy::too_many_arguments)]
+fn directional(
+    angle: u16,
+    edges: &Edges,
+    side: usize,
+    enable_edge_filter: bool,
+    smooth_neighbor: bool,
+    n_top: usize,
+    n_left: usize,
+    dst: &mut [u8],
+) {
     let n = side as i32;
-    // The furthest sample the walk can reach, past which the edge is flat.
-    let max_base = n + n - 1;
+    let need_above = angle < 180;
+    let need_left = angle > 90;
+    let need_right = angle < 90;
+    let need_bottom = angle > 180;
+
+    // Spec position `-1..=2n - 1`, `above[0]`/`left[0]` the shared corner.
+    let mut above: Vec<i32> = (-1..2 * n).map(|p| edges.above(p)).collect();
+    let mut left: Vec<i32> = (-1..2 * n).map(|p| edges.left(p)).collect();
+
+    if enable_edge_filter && angle != 90 && angle != 180 {
+        if need_above && need_left && 2 * n >= 24 {
+            let s = round2(left[1] * 5 + above[0] * 6 + above[1] * 5, 4);
+            above[0] = s;
+            left[0] = s;
+        }
+        if need_above && n_top > 0 {
+            let strength = intra_edge_filter_strength(n, n, i32::from(angle) - 90, smooth_neighbor);
+            let n_px = n_top as i32 + 1 + if need_right { n } else { 0 };
+            filter_intra_edge(&mut above[..n_px as usize], strength);
+        }
+        if need_left && n_left > 0 {
+            let strength =
+                intra_edge_filter_strength(n, n, i32::from(angle) - 180, smooth_neighbor);
+            let n_px = n_left as i32 + 1 + if need_bottom { n } else { 0 };
+            filter_intra_edge(&mut left[..n_px as usize], strength);
+        }
+    }
+
+    let upsample_above =
+        enable_edge_filter && use_intra_edge_upsample(n, n, i32::from(angle) - 90, smooth_neighbor);
+    let upsample_left = enable_edge_filter
+        && use_intra_edge_upsample(n, n, i32::from(angle) - 180, smooth_neighbor);
+
+    let above_up;
+    let (above_buf, above_off): (&[i32], i32) = if need_above && upsample_above {
+        let n_px = (n + if need_right { n } else { 0 }) as usize;
+        above_up = upsample_intra_edge(&above[..=n_px]);
+        (&above_up, 2)
+    } else {
+        (&above, 1)
+    };
+    let left_up;
+    let (left_buf, left_off): (&[i32], i32) = if need_left && upsample_left {
+        let n_px = (n + if need_bottom { n } else { 0 }) as usize;
+        left_up = upsample_intra_edge(&left[..=n_px]);
+        (&left_up, 2)
+    } else {
+        (&left, 1)
+    };
+    let above_at = |p: i32| above_buf[(p + above_off) as usize];
+    let left_at = |p: i32| left_buf[(p + left_off) as usize];
+    let up_a = i32::from(upsample_above);
+    let up_l = i32::from(upsample_left);
     let blend = |edge: &dyn Fn(i32) -> i32, base: i32, shift: i32| {
         round2(edge(base) * (32 - shift) + edge(base + 1) * shift, 5)
     };
-    let above = |i: i32| edges.above(i);
-    let left = |i: i32| edges.left(i);
+
     for row in 0..n {
         for col in 0..n {
             let value = if angle < 90 {
                 let dx = dr_intra_derivative(angle);
-                let idx = (row + 1) * dx;
-                let base = (idx >> 6) + col;
-                let shift = (idx >> 1) & 0x1F;
+                let max_base = (2 * n - 1) << up_a;
+                let frac_bits = 6 - up_a;
+                let x = dx * (row + 1);
+                let base = (x >> frac_bits) + (col << up_a);
+                let shift = ((x << up_a) & 0x3F) >> 1;
                 if base < max_base {
-                    blend(&above, base, shift)
+                    blend(&above_at, base, shift)
                 } else {
-                    above(max_base)
+                    above_at(max_base)
                 }
             } else if angle > 180 {
                 let dy = dr_intra_derivative(270 - angle);
-                let idx = (col + 1) * dy;
-                let base = (idx >> 6) + row;
-                let shift = (idx >> 1) & 0x1F;
+                let max_base = (2 * n - 1) << up_l;
+                let frac_bits = 6 - up_l;
+                let y = dy * (col + 1);
+                let base = (y >> frac_bits) + (row << up_l);
+                let shift = ((y << up_l) & 0x3F) >> 1;
                 if base < max_base {
-                    blend(&left, base, shift)
+                    blend(&left_at, base, shift)
                 } else {
-                    left(max_base)
+                    left_at(max_base)
                 }
             } else {
                 // The two zones meet here: a ray that leaves through the row
                 // above is read there, and one that leaves through the column
                 // to the left is read there instead.
                 let dx = dr_intra_derivative(180 - angle);
-                let idx = (col << 6) - (row + 1) * dx;
-                let base = idx >> 6;
-                if base >= -1 {
-                    blend(&above, base, (idx >> 1) & 0x1F)
+                let min_base = -(1 << up_a);
+                let frac_bits_x = 6 - up_a;
+                let y = row + 1;
+                let x = (col << 6) - y * dx;
+                let base = x >> frac_bits_x;
+                if base >= min_base {
+                    blend(&above_at, base, ((x << up_a) & 0x3F) >> 1)
                 } else {
                     let dy = dr_intra_derivative(angle - 90);
-                    let idx = (row << 6) - (col + 1) * dy;
-                    blend(&left, idx >> 6, (idx >> 1) & 0x1F)
+                    let frac_bits_y = 6 - up_l;
+                    let x2 = col + 1;
+                    let y2 = (row << 6) - x2 * dy;
+                    blend(&left_at, y2 >> frac_bits_y, ((y2 << up_l) & 0x3F) >> 1)
                 }
             };
             dst[(row * n + col) as usize] = value.clamp(0, 255) as u8;
