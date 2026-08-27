@@ -821,6 +821,32 @@ impl<'a> CtuEncoder<'a> {
         let cb_cbf = self.code_chroma(x, y, n, chroma_mode, 1, chroma_tskip).1;
         let cr_cbf = self.code_chroma(x, y, n, chroma_mode, 2, chroma_tskip).1;
 
+        if self.rqt && log2 > 2 && !luma_cbf && !cb_cbf && !cr_cbf {
+            // Every plane already quantised to zero at this size: a
+            // transform-tree split can only re-signal the same empty leaf as
+            // four children, adding a split_transform_flag and their mode
+            // bits on top of an SSD that is already zero. Same reasoning as
+            // the CU-quadtree's `last_cu_empty` early out, one level down —
+            // skip the four-child trial and its transform/CABAC-counting
+            // work outright instead of running it to confirm nosplit wins.
+            enc.encode_bin(ctx::SPLIT_TRANSFORM + (5 - log2) as usize, 0);
+            self.write_single_tu(
+                enc,
+                n,
+                log2,
+                mode,
+                chroma_mode,
+                chroma_tskip,
+                luma_cbf,
+                cb_cbf,
+                cr_cbf,
+            );
+            self.mark_coded(x, y, n, mode, depth);
+            self.mark_tu(x, y, n);
+            self.last_cu_empty = true;
+            let bits = enc.bit_count() - before;
+            return self.region_ssd(x, y, n) + self.lambda * bits as f64;
+        }
         if self.rqt && log2 > 2 {
             // A child transform tree signals its own chroma as long as its
             // chroma blocks are still 4x4 or larger; only the 8x8 luma tree,

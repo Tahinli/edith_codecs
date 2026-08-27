@@ -48,8 +48,18 @@ fn rdoq_cache_hash_416x240() {
 /// compile-time-mirrored flat table in `forward_1d`/`inverse_1d` — this pins
 /// that equality so a future change to the hot path is caught if it ever
 /// produces a different byte.
+///
+/// lane-h265prune: re-pinned after the RQT split trial gained an all-zero-CBF
+/// early out (mirrors the CU-quadtree's existing `last_cu_empty` skip one
+/// level down at the transform tree): a coding unit whose luma+chroma already
+/// quantised to nothing is committed as one leaf transform unit without
+/// trying the four-child split first, since splitting a zero-SSD block can
+/// only add split_transform_flag and mode-signalling bits. This changes the
+/// bitstream on any content where that trial used to flip a leaf to split
+/// (BD-gated, not bit-identical — see `EncoderConfig::rqt` and this crate's
+/// `bd_psnr_vs_x265`).
 #[test]
 fn rdoq_cache_hash_is_pinned() {
-    assert_eq!(encode_hash(416, 240), 0xda5d606db0755d97);
-    assert_eq!(encode_hash(1920, 1080), 0xf08a816c9fa9ca2c);
+    assert_eq!(encode_hash(416, 240), 0xdb39f995b147beae);
+    assert_eq!(encode_hash(1920, 1080), 0xff5abdf102465a46);
 }
