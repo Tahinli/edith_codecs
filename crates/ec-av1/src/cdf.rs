@@ -351,6 +351,34 @@ pub const TX_SIZE_CAT3: [[u16; 4]; 3] = [
     [16803, 22759, 32768, 0],
 ];
 
+/// `default_switchable_interp_cdf` (spec 9.4): a `SWITCHABLE`-filter frame's
+/// per-block `interp_filter[dir]` (spec 5.11.20's `read_interpolation_filter`,
+/// three symbols -- `EIGHTTAP`/`EIGHTTAP_SMOOTH`/`EIGHTTAP_SHARP`, `BILINEAR`
+/// is never chosen this way), indexed by `av1_get_pred_context_switchable_interp`'s
+/// `ctx_offset + dir * INTER_FILTER_DIR_OFFSET + neighbour_term`
+/// (`INTER_FILTER_DIR_OFFSET` = 8; this decoder never codes a compound
+/// reference, so `ctx_offset` -- `INTER_FILTER_COMP_OFFSET` on a second
+/// reference frame -- is always 0, leaving rows 0..=3 for `dir` 0 and 8..=11
+/// for `dir` 1).
+pub const SWITCHABLE_INTERP: [[u16; 4]; 16] = [
+    [31935, 32720, 32768, 0],
+    [5568, 32719, 32768, 0],
+    [422, 2938, 32768, 0],
+    [28244, 32608, 32768, 0],
+    [31206, 31953, 32768, 0],
+    [4862, 32121, 32768, 0],
+    [770, 1152, 32768, 0],
+    [20889, 25637, 32768, 0],
+    [31910, 32724, 32768, 0],
+    [4120, 32712, 32768, 0],
+    [305, 2247, 32768, 0],
+    [27403, 32636, 32768, 0],
+    [31022, 32009, 32768, 0],
+    [2963, 32093, 32768, 0],
+    [601, 943, 32768, 0],
+    [14969, 21398, 32768, 0],
+];
+
 /// `Default_Cfl_Alpha_Cdf` (spec 9.4): a `UV_CFL_PRED` block's per-plane
 /// alpha magnitude (spec 5.11.45's `cfl_alpha_u`/`cfl_alpha_v`), indexed by
 /// the joint sign's context (`CFL_CONTEXT_U`/`CFL_CONTEXT_V`,
