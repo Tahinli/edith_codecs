@@ -282,21 +282,47 @@ fn predict_angular(refs: &Refs, mode: u8, n: usize, is_luma: bool, out: &mut [u8
             reference[BIAS + x] = i32::from(main[x - 1]);
         }
     }
-    for y in 0..n {
-        // The "row" index along the prediction direction: y for the vertical
-        // modes, x for the horizontal ones, which is the whole difference
-        // between the two halves of 8.4.4.2.6.
-        for x in 0..n {
-            let (along, across) = if mode >= 18 { (y, x) } else { (x, y) };
-            let idx = ((along as i32 + 1) * angle) >> 5;
-            let fact = ((along as i32 + 1) * angle) & 31;
-            let base = (BIAS as i32 + across as i32 + idx + 1) as usize;
-            let value = if fact != 0 {
-                ((32 - fact) * reference[base] + fact * reference[base + 1] + 16) >> 5
+    // `idx`/`fact` depend only on the "row" index along the prediction
+    // direction (y for the vertical modes, x for the horizontal ones — the
+    // whole difference between the two halves of 8.4.4.2.6), not on the
+    // position across it. The mode>=18 branch and the idx/fact division used
+    // to be recomputed at every one of the n*n pixels; hoisting them to one
+    // per row/column turns the inner loop into a contiguous, near-linear scan
+    // over `reference`, which is both fewer instructions and autovectorizes.
+    if mode >= 18 {
+        for y in 0..n {
+            let idx = ((y as i32 + 1) * angle) >> 5;
+            let fact = ((y as i32 + 1) * angle) & 31;
+            let base = (BIAS as i32 + idx + 1) as usize;
+            let row = &mut out[y * n..y * n + n];
+            if fact != 0 {
+                let (w0, w1) = (32 - fact, fact);
+                for x in 0..n {
+                    row[x] =
+                        ((w0 * reference[base + x] + w1 * reference[base + x + 1] + 16) >> 5) as u8;
+                }
             } else {
-                reference[base]
-            };
-            out[y * n + x] = value as u8;
+                for x in 0..n {
+                    row[x] = reference[base + x] as u8;
+                }
+            }
+        }
+    } else {
+        for x in 0..n {
+            let idx = ((x as i32 + 1) * angle) >> 5;
+            let fact = ((x as i32 + 1) * angle) & 31;
+            let base = (BIAS as i32 + idx + 1) as usize;
+            if fact != 0 {
+                let (w0, w1) = (32 - fact, fact);
+                for y in 0..n {
+                    out[y * n + x] =
+                        ((w0 * reference[base + y] + w1 * reference[base + y + 1] + 16) >> 5) as u8;
+                }
+            } else {
+                for y in 0..n {
+                    out[y * n + x] = reference[base + y] as u8;
+                }
+            }
         }
     }
     // The vertical and horizontal modes carry a boundary filter on luma
