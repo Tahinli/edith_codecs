@@ -2732,6 +2732,12 @@ fn decode_inter_block(
             };
             (mv, false)
         };
+        if std::env::var_os("EC_AV1_TRACE").is_some() {
+            eprintln!(
+                "EC_TRACE mi_row={mi_row} mi_col={mi_col} skip={} is_inter=1 mv=({},{}) is_new_mv={is_new_mv} bsize={side}",
+                skip as u8, mv.0, mv.1
+            );
+        }
         for dr in 0..bw4 {
             for dc in 0..bw4 {
                 grid.set(
