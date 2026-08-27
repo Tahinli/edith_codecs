@@ -289,19 +289,388 @@ fn row_shift(log2: u32) -> usize {
     }
 }
 
-/// The 2D inverse transform (spec 7.13.3) for a square `DCT_DCT` block.
-///
-/// `dequant` is the dequantized coefficient grid in raster order; the returned
-/// residual is in the same order. A 64-point transform only ever carries
-/// coefficients in its first 32 rows and columns, and the spec zeroes the rest
-/// before the row transform, which is what the `< 32` guard does.
-pub fn inverse_transform_2d(dequant: &[i32], side: usize, bit_depth: u8) -> Vec<i32> {
+/// One 1D inverse transform family, ported from libaom's `av1_inv_txfm1d.c`
+/// (`av1_iadst4`/`8`/`16`, `av1_iidentity*`) rather than derived from the
+/// spec's own butterfly writeup -- see the ADST family below.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TxType1d {
+    Dct,
+    Adst,
+    Identity,
+}
+
+/// `Tx_Type_Intra_Inv_Set2`'s five members (spec 9.3), in the CDF's own
+/// symbol order (`0..=4`): `IDTX, DCT_DCT, ADST_ADST, ADST_DCT, DCT_ADST`.
+/// [`crate::decode`] reads the symbol; this is what it dispatches to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TxType {
+    /// Identity on both axes.
+    Idtx,
+    /// DCT on both axes -- this crate's original, still most common case.
+    DctDct,
+    /// ADST on both axes.
+    AdstAdst,
+    /// ADST down the column axis, DCT across the row axis.
+    AdstDct,
+    /// DCT down the column axis, ADST across the row axis.
+    DctAdst,
+}
+
+impl TxType {
+    /// The inverse of `Tx_Type_Intra_Inv_Set2`'s CDF symbol order.
+    pub fn from_symbol(t: usize) -> Option<Self> {
+        match t {
+            0 => Some(Self::Idtx),
+            1 => Some(Self::DctDct),
+            2 => Some(Self::AdstAdst),
+            3 => Some(Self::AdstDct),
+            4 => Some(Self::DctAdst),
+            _ => None,
+        }
+    }
+
+    /// `(row, col)`: the transform `inverse_transform_2d_typed`'s row pass
+    /// (`htx_tab`, spec/libaom "horizontal") and column pass (`vtx_tab`,
+    /// "vertical") each run. Read off libaom's `av1_inv_txfm2d.c` `vtx_tab`/
+    /// `htx_tab` tables directly, not derived: e.g. `ADST_DCT` has
+    /// `vtx_tab = ADST_1D` (column), `htx_tab = DCT_1D` (row) -- the name's
+    /// first half is the *column* transform, not the row one.
+    fn axes(self) -> (TxType1d, TxType1d) {
+        use TxType1d::{Adst, Dct, Identity};
+        match self {
+            Self::Idtx => (Identity, Identity),
+            Self::DctDct => (Dct, Dct),
+            Self::AdstAdst => (Adst, Adst),
+            Self::AdstDct => (Dct, Adst),
+            Self::DctAdst => (Adst, Dct),
+        }
+    }
+}
+
+/// `sinpi[]` at `cos_bit = 12` (`av1_sinpi_arr_data[2]`, `av1_txfm.c`): the
+/// fixed constants [`inverse_adst4`] alone uses, unrelated to [`cos128`].
+const SINPI: [i64; 5] = [0, 1321, 2482, 3344, 3803];
+
+/// `NewSqrt2`/`NewSqrt2Bits` (`av1_txfm.h`): the `sqrt(2)` scale
+/// [`inverse_identity`] uses at sizes 4 and 16.
+const NEW_SQRT2: i64 = 5793;
+const NEW_SQRT2_BITS: u32 = 12;
+
+/// `round_shift` (`av1_txfm.h`): round-to-nearest to `bit` places, taking the
+/// pre-shift value in 64 bits since the ADST/identity intermediates
+/// routinely exceed 32.
+fn round_shift(x: i64, bit: u32) -> i32 {
+    ((x + (1i64 << (bit - 1))) >> bit) as i32
+}
+
+/// `half_btf(w0, in0, w1, in1, bit)` (`av1_txfm.h`) at `bit = COS_BITS`,
+/// the only value AV1's inverse transforms ever pass (`INV_COS_BIT`).
+fn half_btf(w0: i32, in0: i32, w1: i32, in1: i32) -> i32 {
+    let acc = i64::from(w0) * i64::from(in0) + i64::from(w1) * i64::from(in1);
+    round_shift(acc, COS_BITS as u32)
+}
+
+/// `av1_iadst4` (`av1_inv_txfm1d.c`): every intermediate stage there goes
+/// through `range_check_value`, which is a debug-only no-op in a conformant
+/// decoder (unlike `av1_iadst8`/`16`'s `clamp_value`, a real clamp) -- so
+/// this port carries no [`clamp_range`] calls, matching the reference
+/// exactly rather than adding a clamp libaom's own default build never
+/// takes.
+fn inverse_adst4(t: &mut [i32]) {
+    let (x0, x1, x2, x3) = (
+        i64::from(t[0]),
+        i64::from(t[1]),
+        i64::from(t[2]),
+        i64::from(t[3]),
+    );
+    if x0 == 0 && x1 == 0 && x2 == 0 && x3 == 0 {
+        t[0] = 0;
+        t[1] = 0;
+        t[2] = 0;
+        t[3] = 0;
+        return;
+    }
+    let mut s0 = SINPI[1] * x0;
+    let mut s1 = SINPI[2] * x0;
+    let s2 = SINPI[3] * x1;
+    let mut s3 = SINPI[4] * x2;
+    let s4 = SINPI[1] * x2;
+    let s5 = SINPI[2] * x3;
+    let s6 = SINPI[4] * x3;
+    let s7 = (x0 - x2) + x3;
+
+    s0 += s3;
+    s1 -= s4;
+    s3 = s2;
+    let s2 = SINPI[3] * s7;
+    s0 += s5;
+    s1 -= s6;
+
+    let o0 = s0 + s3;
+    let o1 = s1 + s3;
+    let o2 = s2;
+    let o3 = (s0 + s1) - s3;
+
+    t[0] = round_shift(o0, COS_BITS as u32);
+    t[1] = round_shift(o1, COS_BITS as u32);
+    t[2] = round_shift(o2, COS_BITS as u32);
+    t[3] = round_shift(o3, COS_BITS as u32);
+}
+
+/// `av1_iadst8` (`av1_inv_txfm1d.c`), stage for stage; `r` is the same
+/// per-stage clamp bit width `av1_gen_inv_stage_range` hands every stage in
+/// the square, 8-bit-depth case this decoder targets (row and column both
+/// land on 16 there, matching [`inverse_transform_2d_typed`]'s own
+/// `row_clamp`/`col_clamp`).
+fn inverse_adst8(t: &mut [i32], r: usize) {
+    let bf1 = [t[7], t[0], t[5], t[2], t[3], t[4], t[1], t[6]];
+
+    let mut step = [0i32; 8];
+    step[0] = half_btf(cos128(4), bf1[0], cos128(60), bf1[1]);
+    step[1] = half_btf(cos128(60), bf1[0], -cos128(4), bf1[1]);
+    step[2] = half_btf(cos128(20), bf1[2], cos128(44), bf1[3]);
+    step[3] = half_btf(cos128(44), bf1[2], -cos128(20), bf1[3]);
+    step[4] = half_btf(cos128(36), bf1[4], cos128(28), bf1[5]);
+    step[5] = half_btf(cos128(28), bf1[4], -cos128(36), bf1[5]);
+    step[6] = half_btf(cos128(52), bf1[6], cos128(12), bf1[7]);
+    step[7] = half_btf(cos128(12), bf1[6], -cos128(52), bf1[7]);
+
+    let mut out = [0i32; 8];
+    for i in 0..4 {
+        out[i] = clamp_range(step[i] + step[i + 4], r);
+        out[i + 4] = clamp_range(step[i] - step[i + 4], r);
+    }
+
+    step[0] = out[0];
+    step[1] = out[1];
+    step[2] = out[2];
+    step[3] = out[3];
+    step[4] = half_btf(cos128(16), out[4], cos128(48), out[5]);
+    step[5] = half_btf(cos128(48), out[4], -cos128(16), out[5]);
+    step[6] = half_btf(-cos128(48), out[6], cos128(16), out[7]);
+    step[7] = half_btf(cos128(16), out[6], cos128(48), out[7]);
+
+    out[0] = clamp_range(step[0] + step[2], r);
+    out[1] = clamp_range(step[1] + step[3], r);
+    out[2] = clamp_range(step[0] - step[2], r);
+    out[3] = clamp_range(step[1] - step[3], r);
+    out[4] = clamp_range(step[4] + step[6], r);
+    out[5] = clamp_range(step[5] + step[7], r);
+    out[6] = clamp_range(step[4] - step[6], r);
+    out[7] = clamp_range(step[5] - step[7], r);
+
+    step[0] = out[0];
+    step[1] = out[1];
+    step[2] = half_btf(cos128(32), out[2], cos128(32), out[3]);
+    step[3] = half_btf(cos128(32), out[2], -cos128(32), out[3]);
+    step[4] = out[4];
+    step[5] = out[5];
+    step[6] = half_btf(cos128(32), out[6], cos128(32), out[7]);
+    step[7] = half_btf(cos128(32), out[6], -cos128(32), out[7]);
+
+    t[0] = step[0];
+    t[1] = -step[4];
+    t[2] = step[6];
+    t[3] = -step[2];
+    t[4] = step[3];
+    t[5] = -step[7];
+    t[6] = step[5];
+    t[7] = -step[1];
+}
+
+/// `av1_iadst16` (`av1_inv_txfm1d.c`), stage for stage; `r` as
+/// [`inverse_adst8`].
+fn inverse_adst16(t: &mut [i32], r: usize) {
+    let inp: [i32; 16] = t[..16].try_into().expect("16-point input");
+    let bf1 = [
+        inp[15], inp[0], inp[13], inp[2], inp[11], inp[4], inp[9], inp[6], inp[7], inp[8], inp[5],
+        inp[10], inp[3], inp[12], inp[1], inp[14],
+    ];
+
+    let mut step = [0i32; 16];
+    step[0] = half_btf(cos128(2), bf1[0], cos128(62), bf1[1]);
+    step[1] = half_btf(cos128(62), bf1[0], -cos128(2), bf1[1]);
+    step[2] = half_btf(cos128(10), bf1[2], cos128(54), bf1[3]);
+    step[3] = half_btf(cos128(54), bf1[2], -cos128(10), bf1[3]);
+    step[4] = half_btf(cos128(18), bf1[4], cos128(46), bf1[5]);
+    step[5] = half_btf(cos128(46), bf1[4], -cos128(18), bf1[5]);
+    step[6] = half_btf(cos128(26), bf1[6], cos128(38), bf1[7]);
+    step[7] = half_btf(cos128(38), bf1[6], -cos128(26), bf1[7]);
+    step[8] = half_btf(cos128(34), bf1[8], cos128(30), bf1[9]);
+    step[9] = half_btf(cos128(30), bf1[8], -cos128(34), bf1[9]);
+    step[10] = half_btf(cos128(42), bf1[10], cos128(22), bf1[11]);
+    step[11] = half_btf(cos128(22), bf1[10], -cos128(42), bf1[11]);
+    step[12] = half_btf(cos128(50), bf1[12], cos128(14), bf1[13]);
+    step[13] = half_btf(cos128(14), bf1[12], -cos128(50), bf1[13]);
+    step[14] = half_btf(cos128(58), bf1[14], cos128(6), bf1[15]);
+    step[15] = half_btf(cos128(6), bf1[14], -cos128(58), bf1[15]);
+
+    let mut out = [0i32; 16];
+    for i in 0..8 {
+        out[i] = clamp_range(step[i] + step[i + 8], r);
+        out[i + 8] = clamp_range(step[i] - step[i + 8], r);
+    }
+
+    step[..8].copy_from_slice(&out[..8]);
+    step[8] = half_btf(cos128(8), out[8], cos128(56), out[9]);
+    step[9] = half_btf(cos128(56), out[8], -cos128(8), out[9]);
+    step[10] = half_btf(cos128(40), out[10], cos128(24), out[11]);
+    step[11] = half_btf(cos128(24), out[10], -cos128(40), out[11]);
+    step[12] = half_btf(-cos128(56), out[12], cos128(8), out[13]);
+    step[13] = half_btf(cos128(8), out[12], cos128(56), out[13]);
+    step[14] = half_btf(-cos128(24), out[14], cos128(40), out[15]);
+    step[15] = half_btf(cos128(40), out[14], cos128(24), out[15]);
+
+    out[0] = clamp_range(step[0] + step[4], r);
+    out[1] = clamp_range(step[1] + step[5], r);
+    out[2] = clamp_range(step[2] + step[6], r);
+    out[3] = clamp_range(step[3] + step[7], r);
+    out[4] = clamp_range(step[0] - step[4], r);
+    out[5] = clamp_range(step[1] - step[5], r);
+    out[6] = clamp_range(step[2] - step[6], r);
+    out[7] = clamp_range(step[3] - step[7], r);
+    out[8] = clamp_range(step[8] + step[12], r);
+    out[9] = clamp_range(step[9] + step[13], r);
+    out[10] = clamp_range(step[10] + step[14], r);
+    out[11] = clamp_range(step[11] + step[15], r);
+    out[12] = clamp_range(step[8] - step[12], r);
+    out[13] = clamp_range(step[9] - step[13], r);
+    out[14] = clamp_range(step[10] - step[14], r);
+    out[15] = clamp_range(step[11] - step[15], r);
+
+    step[0] = out[0];
+    step[1] = out[1];
+    step[2] = out[2];
+    step[3] = out[3];
+    step[4] = half_btf(cos128(16), out[4], cos128(48), out[5]);
+    step[5] = half_btf(cos128(48), out[4], -cos128(16), out[5]);
+    step[6] = half_btf(-cos128(48), out[6], cos128(16), out[7]);
+    step[7] = half_btf(cos128(16), out[6], cos128(48), out[7]);
+    step[8] = out[8];
+    step[9] = out[9];
+    step[10] = out[10];
+    step[11] = out[11];
+    step[12] = half_btf(cos128(16), out[12], cos128(48), out[13]);
+    step[13] = half_btf(cos128(48), out[12], -cos128(16), out[13]);
+    step[14] = half_btf(-cos128(48), out[14], cos128(16), out[15]);
+    step[15] = half_btf(cos128(16), out[14], cos128(48), out[15]);
+
+    out[0] = clamp_range(step[0] + step[2], r);
+    out[1] = clamp_range(step[1] + step[3], r);
+    out[2] = clamp_range(step[0] - step[2], r);
+    out[3] = clamp_range(step[1] - step[3], r);
+    out[4] = clamp_range(step[4] + step[6], r);
+    out[5] = clamp_range(step[5] + step[7], r);
+    out[6] = clamp_range(step[4] - step[6], r);
+    out[7] = clamp_range(step[5] - step[7], r);
+    out[8] = clamp_range(step[8] + step[10], r);
+    out[9] = clamp_range(step[9] + step[11], r);
+    out[10] = clamp_range(step[8] - step[10], r);
+    out[11] = clamp_range(step[9] - step[11], r);
+    out[12] = clamp_range(step[12] + step[14], r);
+    out[13] = clamp_range(step[13] + step[15], r);
+    out[14] = clamp_range(step[12] - step[14], r);
+    out[15] = clamp_range(step[13] - step[15], r);
+
+    step[0] = out[0];
+    step[1] = out[1];
+    step[2] = half_btf(cos128(32), out[2], cos128(32), out[3]);
+    step[3] = half_btf(cos128(32), out[2], -cos128(32), out[3]);
+    step[4] = out[4];
+    step[5] = out[5];
+    step[6] = half_btf(cos128(32), out[6], cos128(32), out[7]);
+    step[7] = half_btf(cos128(32), out[6], -cos128(32), out[7]);
+    step[8] = out[8];
+    step[9] = out[9];
+    step[10] = half_btf(cos128(32), out[10], cos128(32), out[11]);
+    step[11] = half_btf(cos128(32), out[10], -cos128(32), out[11]);
+    step[12] = out[12];
+    step[13] = out[13];
+    step[14] = half_btf(cos128(32), out[14], cos128(32), out[15]);
+    step[15] = half_btf(cos128(32), out[14], -cos128(32), out[15]);
+
+    t[0] = step[0];
+    t[1] = -step[8];
+    t[2] = step[12];
+    t[3] = -step[4];
+    t[4] = step[6];
+    t[5] = -step[14];
+    t[6] = step[10];
+    t[7] = -step[2];
+    t[8] = step[3];
+    t[9] = -step[11];
+    t[10] = step[15];
+    t[11] = -step[7];
+    t[12] = step[5];
+    t[13] = -step[13];
+    t[14] = step[9];
+    t[15] = -step[1];
+}
+
+/// `av1_iidentity4_c`/`8_c`/`16_c`/`32_c` (`av1_inv_txfm1d.c`): a fixed
+/// per-size scale, `sqrt(2)`-based at 4 and 16 (`NewSqrt2`/`NewSqrt2Bits`),
+/// exact doubling at 8 and 32.
+fn inverse_identity(t: &mut [i32], side: usize) {
+    match side {
+        4 => {
+            for v in &mut t[..4] {
+                *v = round_shift(NEW_SQRT2 * i64::from(*v), NEW_SQRT2_BITS);
+            }
+        }
+        8 => {
+            for v in &mut t[..8] {
+                *v = (i64::from(*v) * 2) as i32;
+            }
+        }
+        16 => {
+            for v in &mut t[..16] {
+                *v = round_shift(NEW_SQRT2 * 2 * i64::from(*v), NEW_SQRT2_BITS);
+            }
+        }
+        32 => {
+            for v in &mut t[..32] {
+                *v = (i64::from(*v) * 4) as i32;
+            }
+        }
+        _ => unreachable!("identity is defined at sizes 4, 8, 16 and 32"),
+    }
+}
+
+/// Dispatches one row or column's 1D inverse transform by [`TxType1d`],
+/// `log2` the spec's transform-size log (as [`inverse_dct`] takes).
+fn inverse_1d(t: &mut [i32], log2: u32, r: usize, kind: TxType1d) {
+    match kind {
+        TxType1d::Dct => inverse_dct(t, log2, r),
+        TxType1d::Adst => match log2 {
+            2 => inverse_adst4(t),
+            3 => inverse_adst8(t, r),
+            4 => inverse_adst16(t, r),
+            _ => unreachable!("ADST is undefined at sizes above 16 (spec: 32+ uses DCT/identity)"),
+        },
+        TxType1d::Identity => inverse_identity(t, 1usize << log2),
+    }
+}
+
+/// The 2D inverse transform (spec 7.13.3) for a square block of any
+/// [`TxType`]. `dequant` is the dequantized coefficient grid in raster order;
+/// the returned residual is in the same order. A 64-point transform only ever
+/// carries coefficients in its first 32 rows and columns, and the spec
+/// zeroes the rest before the row transform, which is what the `< 32` guard
+/// does (`TxType`s other than `DctDct` never reach a 64-point transform in
+/// this decoder -- `Luma64`'s CDF set carries no `tx_type` symbol).
+pub fn inverse_transform_2d_typed(
+    dequant: &[i32],
+    side: usize,
+    bit_depth: u8,
+    tx_type: TxType,
+) -> Vec<i32> {
     let log2 = side.trailing_zeros();
     assert_eq!(1usize << log2, side, "the transform is square");
     assert_eq!(dequant.len(), side * side, "one coefficient per position");
     let row_clamp = usize::from(bit_depth) + 8;
     let col_clamp = (usize::from(bit_depth) + 6).max(16);
     let mut residual = vec![0i32; side * side];
+    let (row_kind, col_kind) = tx_type.axes();
 
     let mut t = [0i32; 64];
     for i in 0..side {
@@ -312,7 +681,7 @@ pub fn inverse_transform_2d(dequant: &[i32], side: usize, bit_depth: u8) -> Vec<
                 0
             };
         }
-        inverse_dct(&mut t, log2, row_clamp);
+        inverse_1d(&mut t, log2, row_clamp, row_kind);
         for j in 0..side {
             // The row's output is shifted, then clamped before the column
             // transform reads it back.
@@ -324,7 +693,7 @@ pub fn inverse_transform_2d(dequant: &[i32], side: usize, bit_depth: u8) -> Vec<
         for i in 0..side {
             t[i] = residual[i * side + j];
         }
-        inverse_dct(&mut t, log2, col_clamp);
+        inverse_1d(&mut t, log2, col_clamp, col_kind);
         for i in 0..side {
             residual[i * side + j] = round2(t[i], 4);
         }
@@ -332,15 +701,32 @@ pub fn inverse_transform_2d(dequant: &[i32], side: usize, bit_depth: u8) -> Vec<
     residual
 }
 
-/// Dequantize (spec 7.12.3) and inverse transform one square `DCT_DCT` block,
-/// returning its residual in raster order.
+/// [`inverse_transform_2d_typed`] at `DCT_DCT`, this crate's original
+/// (and still most common) transform.
+pub fn inverse_transform_2d(dequant: &[i32], side: usize, bit_depth: u8) -> Vec<i32> {
+    inverse_transform_2d_typed(dequant, side, bit_depth, TxType::DctDct)
+}
+
+/// Dequantize (spec 7.12.3) and inverse transform one square block of any
+/// [`TxType`], returning its residual in raster order.
 ///
 /// This is the encoder's model of what the decoder will add to its prediction,
 /// so it follows the spec's dequantization exactly, truncation toward zero and
 /// all.
-pub fn dequant_and_inverse(levels: &[i32], side: usize, bit_depth: u8, q_idx: i32) -> Vec<i32> {
+pub fn dequant_and_inverse_typed(
+    levels: &[i32],
+    side: usize,
+    bit_depth: u8,
+    q_idx: i32,
+    tx_type: TxType,
+) -> Vec<i32> {
     let dq = crate::quant::dequant(levels, side, bit_depth, q_idx);
-    inverse_transform_2d(&dq, side, bit_depth)
+    inverse_transform_2d_typed(&dq, side, bit_depth, tx_type)
+}
+
+/// [`dequant_and_inverse_typed`] at `DCT_DCT`.
+pub fn dequant_and_inverse(levels: &[i32], side: usize, bit_depth: u8, q_idx: i32) -> Vec<i32> {
+    dequant_and_inverse_typed(levels, side, bit_depth, q_idx, TxType::DctDct)
 }
 
 /// The orthonormal DCT-II basis row for output `u` of an `n`-point transform.
@@ -890,5 +1276,129 @@ mod tests {
                 }
             }
         }
+    }
+
+    // --- ADST/identity family: reference vectors from libaom's own
+    // `av1_iadst4`/`8`/`16` and `av1_iidentity*_c`, computed by a small C
+    // probe (`gcc` against `/tmp/libaom-src/build/decoder-debug/libaom.a`,
+    // calling those exported symbols directly with the inputs pinned below --
+    // no hand-derived arithmetic) so these are decisive, not memory-derived.
+
+    #[test]
+    fn iadst4_matches_libaoms_own_output() {
+        let mut t = [100, -50, 25, 7];
+        inverse_adst4(&mut t);
+        assert_eq!(t, [19, 5, 67, 147]);
+    }
+
+    #[test]
+    fn iadst4_an_all_zero_input_short_circuits_to_zero() {
+        let mut t = [0, 0, 0, 0];
+        inverse_adst4(&mut t);
+        assert_eq!(t, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn iadst8_matches_libaoms_own_output() {
+        let mut t = [100, -50, 25, 7, -3, 60, -12, 8];
+        inverse_adst8(&mut t, 16);
+        assert_eq!(t, [59, 15, -25, 52, 25, 27, 207, 130]);
+    }
+
+    #[test]
+    fn iadst16_matches_libaoms_own_output() {
+        let mut t = [
+            100, -50, 25, 7, -3, 60, -12, 8, 15, -40, 33, -5, 22, 1, -70, 44,
+        ];
+        inverse_adst16(&mut t, 16);
+        assert_eq!(
+            t,
+            [
+                32, 73, 28, 6, -45, -28, 111, -52, 135, -54, 85, -67, 305, 190, 102, 145
+            ]
+        );
+    }
+
+    #[test]
+    fn iidentity_matches_libaoms_own_output_at_every_size() {
+        let mut t4 = [100, -50, 25, 7];
+        inverse_identity(&mut t4, 4);
+        assert_eq!(t4, [141, -71, 35, 10]);
+
+        let mut t8 = [100, -50, 25, 7, -3, 60, -12, 8];
+        inverse_identity(&mut t8, 8);
+        assert_eq!(t8, [200, -100, 50, 14, -6, 120, -24, 16]);
+
+        let mut t16 = [
+            100, -50, 25, 7, -3, 60, -12, 8, 15, -40, 33, -5, 22, 1, -70, 44,
+        ];
+        inverse_identity(&mut t16, 16);
+        assert_eq!(
+            t16,
+            [
+                283, -141, 71, 20, -8, 170, -34, 23, 42, -113, 93, -14, 62, 3, -198, 124
+            ]
+        );
+
+        let mut t32 = [0i32; 32];
+        for (i, v) in t32.iter_mut().enumerate() {
+            *v = i as i32 * 7 - 100;
+        }
+        inverse_identity(&mut t32, 32);
+        assert_eq!(
+            t32,
+            [
+                -400, -372, -344, -316, -288, -260, -232, -204, -176, -148, -120, -92, -64, -36,
+                -8, 20, 48, 76, 104, 132, 160, 188, 216, 244, 272, 300, 328, 356, 384, 412, 440,
+                468
+            ]
+        );
+    }
+
+    /// The axis-convention gate: an impulse in row 0 (`ADST_DCT`'s row
+    /// transform is DCT, so an ADST call here stands in for `DCT_ADST`'s row
+    /// pass) fed through `inverse_adst8` at "row position 0" must differ from
+    /// the same impulse at "column position 1" -- i.e. ADST is not a
+    /// symmetric function of its input's position, which is what lets
+    /// `ADST_DCT` and `DCT_ADST` decode to different residuals for the same
+    /// coefficient grid. Values pinned from the same libaom probe.
+    #[test]
+    fn iadst8_is_not_symmetric_in_its_input_position() {
+        let mut row = [40, 0, 0, 0, 0, 0, 0, 0];
+        let mut col = [0, 40, 0, 0, 0, 0, 0, 0];
+        inverse_adst8(&mut row, 16);
+        inverse_adst8(&mut col, 16);
+        assert_eq!(row, [4, 12, 18, 25, 31, 35, 38, 40]);
+        assert_eq!(col, [12, 31, 40, 35, 18, -4, -26, -38]);
+        assert_ne!(
+            row, col,
+            "an asymmetric input must not decode symmetrically"
+        );
+    }
+
+    /// The decisive end-to-end asymmetry gate `inverse_transform_2d_typed`
+    /// itself: `ADST_DCT` and `DCT_ADST` must decode the same asymmetric
+    /// coefficient grid to *different* residuals, which is only true if the
+    /// row/column axis assignment (`TxType::axes`) is not accidentally
+    /// symmetric (e.g. both pointing at the same 1D transform, or swapped
+    /// with each other in a way that cancels out on this input).
+    #[test]
+    fn adst_dct_and_dct_adst_disagree_on_an_asymmetric_grid() {
+        let side = 8;
+        let mut dequant = vec![0i32; side * side];
+        // An asymmetric coefficient: nonzero only at (row=0, col=1).
+        dequant[1] = 64;
+        let adst_dct = inverse_transform_2d_typed(&dequant, side, 8, TxType::AdstDct);
+        let dct_adst = inverse_transform_2d_typed(&dequant, side, 8, TxType::DctAdst);
+        assert_ne!(
+            adst_dct, dct_adst,
+            "ADST_DCT and DCT_ADST must not be interchangeable on an asymmetric grid"
+        );
+        // Also distinct from plain DCT_DCT and ADST_ADST at the same input.
+        let dct_dct = inverse_transform_2d_typed(&dequant, side, 8, TxType::DctDct);
+        let adst_adst = inverse_transform_2d_typed(&dequant, side, 8, TxType::AdstAdst);
+        assert_ne!(adst_dct, dct_dct);
+        assert_ne!(dct_adst, dct_dct);
+        assert_ne!(adst_adst, dct_dct);
     }
 }
