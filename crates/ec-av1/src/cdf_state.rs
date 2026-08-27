@@ -116,10 +116,14 @@ pub(crate) struct Cdfs {
     pub cfl_alpha: [[u16; 17]; 6],
     /// The angle a directional mode is nudged by.
     pub angle_delta: [[u16; 8]; 8],
-    /// The one-context all-zero flag of a 16x16 luma transform.
-    pub txb_skip_luma_16: [[u16; 3]; 1],
-    /// The one-context all-zero flag of an 8x8 luma transform.
-    pub txb_skip_luma_8: [[u16; 3]; 1],
+    /// The all-zero flag of a 16x16 luma transform, 7 contexts (index 0 for
+    /// a lone TU whose own bsize equals the block's; 1..6 the
+    /// `skip_contexts[top][left]` table when `TxMode::Select` splits the
+    /// block's luma into several smaller transform units, spec
+    /// `get_txb_ctx_general`).
+    pub txb_skip_luma_16: [[u16; 3]; 7],
+    /// The same, for an 8x8 luma transform.
+    pub txb_skip_luma_8: [[u16; 3]; 7],
     /// The all-zero flag of an 8x8 chroma transform.
     pub txb_skip_chroma_8: [[u16; 3]; 3],
     /// The all-zero flag of a 4x4 chroma transform.
@@ -170,10 +174,10 @@ pub(crate) struct Cdfs {
     /// `PARTITION_NONE` is ever coded against it, but the alphabet still
     /// adapts on every read, same as every other partition table.
     pub partition_w8: [[u16; 5]; 4],
-    /// The one-context all-zero flag of a 32x32 luma transform.
-    pub txb_skip_luma_32: [[u16; 3]; 1],
+    /// The same as `txb_skip_luma_16`'s 7 contexts, for a 32x32 luma transform.
+    pub txb_skip_luma_32: [[u16; 3]; 7],
     /// The same, for a 64x64 luma transform.
-    pub txb_skip_luma_64: [[u16; 3]; 1],
+    pub txb_skip_luma_64: [[u16; 3]; 7],
     /// The all-zero flag of a 16x16 chroma transform.
     pub txb_skip_chroma_16: [[u16; 3]; 3],
     /// The all-zero flag of a 32x32 chroma transform.
@@ -464,20 +468,20 @@ impl Cdfs {
             cfl_sign: cdf::CFL_SIGN,
             cfl_alpha: cdf::CFL_ALPHA,
             angle_delta: cdf::ANGLE_DELTA,
-            txb_skip_luma_16: [pick(
+            txb_skip_luma_16: pick(
                 q_ctx,
-                cdf::TXB_SKIP_LUMA_16_Q0,
-                cdf::TXB_SKIP_LUMA_16_Q1,
-                cdf::TXB_SKIP_LUMA_16,
-                cdf::TXB_SKIP_LUMA_16_Q3,
-            )],
-            txb_skip_luma_8: [pick(
+                cdf::TXB_SKIP_LUMA_16_Q0_CTX,
+                cdf::TXB_SKIP_LUMA_16_Q1_CTX,
+                cdf::TXB_SKIP_LUMA_16_CTX,
+                cdf::TXB_SKIP_LUMA_16_Q3_CTX,
+            ),
+            txb_skip_luma_8: pick(
                 q_ctx,
-                cdf::TXB_SKIP_LUMA_8_Q0,
-                cdf::TXB_SKIP_LUMA_8_Q1,
-                cdf::TXB_SKIP_LUMA_8,
-                cdf::TXB_SKIP_LUMA_8_Q3,
-            )],
+                cdf::TXB_SKIP_LUMA_8_Q0_CTX,
+                cdf::TXB_SKIP_LUMA_8_Q1_CTX,
+                cdf::TXB_SKIP_LUMA_8_CTX,
+                cdf::TXB_SKIP_LUMA_8_Q3_CTX,
+            ),
             txb_skip_chroma_8: pick(
                 q_ctx,
                 cdf::TXB_SKIP_CHROMA_8_Q0,
@@ -634,20 +638,20 @@ impl Cdfs {
             ),
             partition_w16: cdf::PARTITION_W16,
             partition_w8: cdf::PARTITION_W8,
-            txb_skip_luma_32: [pick(
+            txb_skip_luma_32: pick(
                 q_ctx,
-                cdf::TXB_SKIP_LUMA_32_Q0,
-                cdf::TXB_SKIP_LUMA_32_Q1,
-                cdf::TXB_SKIP_LUMA_32,
-                cdf::TXB_SKIP_LUMA_32_Q3,
-            )],
-            txb_skip_luma_64: [pick(
+                cdf::TXB_SKIP_LUMA_32_Q0_CTX,
+                cdf::TXB_SKIP_LUMA_32_Q1_CTX,
+                cdf::TXB_SKIP_LUMA_32_CTX,
+                cdf::TXB_SKIP_LUMA_32_Q3_CTX,
+            ),
+            txb_skip_luma_64: pick(
                 q_ctx,
-                cdf::TXB_SKIP_LUMA_64_Q0,
-                cdf::TXB_SKIP_LUMA_64_Q1,
-                cdf::TXB_SKIP_LUMA_64,
-                cdf::TXB_SKIP_LUMA_64_Q3,
-            )],
+                cdf::TXB_SKIP_LUMA_64_Q0_CTX,
+                cdf::TXB_SKIP_LUMA_64_Q1_CTX,
+                cdf::TXB_SKIP_LUMA_64_CTX,
+                cdf::TXB_SKIP_LUMA_64_Q3_CTX,
+            ),
             txb_skip_chroma_16: pick(
                 q_ctx,
                 cdf::TXB_SKIP_CHROMA_16_Q0,
