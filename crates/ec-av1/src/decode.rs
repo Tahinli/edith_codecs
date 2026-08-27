@@ -115,7 +115,7 @@ fn unsupported(what: impl Into<String>) -> Error {
 /// The coefficient q-context a frame's `base_q_idx` picks its default CDFs
 /// from (spec `Get_Qctx`), mirroring [`crate::tile`]'s private copy of the
 /// same rule.
-fn q_ctx_of(base_q_idx: u8) -> usize {
+pub(crate) fn q_ctx_of(base_q_idx: u8) -> usize {
     match base_q_idx {
         0..=20 => 0,
         21..=60 => 1,
@@ -2078,6 +2078,41 @@ pub fn decode_key_frame_tile(
     cdef: &CdefParams,
     loop_filter: &LoopFilterParams,
 ) -> Result<Picture> {
+    decode_key_frame_tile_with_cdfs(
+        data,
+        mi_cols,
+        mi_rows,
+        base_q_idx,
+        frame_width,
+        frame_height,
+        enable_filter_intra,
+        cdef,
+        loop_filter,
+        None,
+    )
+    .map(|(picture, _)| picture)
+}
+
+/// [`decode_key_frame_tile`], threading a cross-frame CDF forward (spec
+/// 7.20's `load_cdfs`): `initial_cdfs` is the caller's forwarded state (from
+/// a prior frame's saved reference slot) when set, or the spec 8.4 defaults
+/// when `None` (the only case [`decode_key_frame_tile`] itself ever needs,
+/// since a key frame's own header always forces `primary_ref_frame ==
+/// PRIMARY_REF_NONE`). Returns the tile's own end-of-tile adapted table
+/// alongside the picture, for the caller to save into whichever reference
+/// slots this frame's `refresh_frame_flags` names.
+pub(crate) fn decode_key_frame_tile_with_cdfs(
+    data: &[u8],
+    mi_cols: u32,
+    mi_rows: u32,
+    base_q_idx: u8,
+    frame_width: u32,
+    frame_height: u32,
+    enable_filter_intra: bool,
+    cdef: &CdefParams,
+    loop_filter: &LoopFilterParams,
+    initial_cdfs: Option<Cdfs>,
+) -> Result<(Picture, Cdfs)> {
     if mi_cols == 0 || mi_rows == 0 {
         return Err(unsupported("a frame with no mode-info grid"));
     }
@@ -2113,7 +2148,7 @@ pub fn decode_key_frame_tile(
     let scan8 = default_scan(TX8);
     let scan4 = default_scan(TX4);
 
-    let mut cdfs = Cdfs::new(q_ctx_of(base_q_idx));
+    let mut cdfs = initial_cdfs.unwrap_or_else(|| Cdfs::new(q_ctx_of(base_q_idx)));
     if std::env::var_os("EC_AV1_TRACE").is_some() {
         eprintln!(
             "TRACE key_tile_bytes len={} first8={:02x?} base_q_idx={base_q_idx} mi_cols={mi_cols} mi_rows={mi_rows}",
@@ -2416,13 +2451,16 @@ pub fn decode_key_frame_tile(
 
     let (fw, fh) = (frame_width as usize, frame_height as usize);
     if fw == width && fh == height {
-        return Ok(Picture {
-            width,
-            height,
-            y: y.data,
-            u: u.data,
-            v: v.data,
-        });
+        return Ok((
+            Picture {
+                width,
+                height,
+                y: y.data,
+                u: u.data,
+                v: v.data,
+            },
+            cdfs,
+        ));
     }
     let crop = |plane: &PlaneBuf, w: usize, h: usize| -> Vec<u8> {
         let mut out = Vec::with_capacity(w * h);
@@ -2431,13 +2469,16 @@ pub fn decode_key_frame_tile(
         }
         out
     };
-    Ok(Picture {
-        width: fw,
-        height: fh,
-        y: crop(&y, fw, fh),
-        u: crop(&u, fw / 2, fh / 2),
-        v: crop(&v, fw / 2, fh / 2),
-    })
+    Ok((
+        Picture {
+            width: fw,
+            height: fh,
+            y: crop(&y, fw, fh),
+            u: crop(&u, fw / 2, fh / 2),
+            v: crop(&v, fw / 2, fh / 2),
+        },
+        cdfs,
+    ))
 }
 
 /// The `is_inter` context (spec 5.11.16 via `av1_get_intra_inter_context`),
@@ -3367,6 +3408,38 @@ pub fn decode_inter_frame_tile(
     cdef: &CdefParams,
     loop_filter: &LoopFilterParams,
 ) -> Result<Picture> {
+    decode_inter_frame_tile_with_cdfs(
+        data,
+        mi_cols,
+        mi_rows,
+        base_q_idx,
+        frame_width,
+        frame_height,
+        reference,
+        cdef,
+        loop_filter,
+        None,
+    )
+    .map(|(picture, _)| picture)
+}
+
+/// [`decode_inter_frame_tile`], threading a cross-frame CDF forward -- see
+/// [`decode_key_frame_tile_with_cdfs`]'s doc for `initial_cdfs`/the returned
+/// end-of-tile table. An inter frame's own header can name
+/// `primary_ref_frame == PRIMARY_REF_NONE` too (an error-resilient stream),
+/// so `None` is a real case here, not only a convenience default.
+pub(crate) fn decode_inter_frame_tile_with_cdfs(
+    data: &[u8],
+    mi_cols: u32,
+    mi_rows: u32,
+    base_q_idx: u8,
+    frame_width: u32,
+    frame_height: u32,
+    reference: &Picture,
+    cdef: &CdefParams,
+    loop_filter: &LoopFilterParams,
+    initial_cdfs: Option<Cdfs>,
+) -> Result<(Picture, Cdfs)> {
     if mi_cols == 0 || mi_rows == 0 {
         return Err(unsupported("a frame with no mode-info grid"));
     }
@@ -3429,7 +3502,7 @@ pub fn decode_inter_frame_tile(
     let scan8 = default_scan(TX8);
     let scan4 = default_scan(TX4);
 
-    let mut cdfs = Cdfs::new(q_ctx_of(base_q_idx));
+    let mut cdfs = initial_cdfs.unwrap_or_else(|| Cdfs::new(q_ctx_of(base_q_idx)));
     let mut dec = SymbolDecoder::new(data);
     let mut neighbours = Neighbours::new(
         cols as usize * 2,
@@ -3634,13 +3707,16 @@ pub fn decode_inter_frame_tile(
 
     let (fw, fh) = (frame_width as usize, frame_height as usize);
     if fw == width && fh == height {
-        return Ok(Picture {
-            width,
-            height,
-            y: y.data,
-            u: u.data,
-            v: v.data,
-        });
+        return Ok((
+            Picture {
+                width,
+                height,
+                y: y.data,
+                u: u.data,
+                v: v.data,
+            },
+            cdfs,
+        ));
     }
     let crop = |plane: &PlaneBuf, w: usize, h: usize| -> Vec<u8> {
         let mut out = Vec::with_capacity(w * h);
@@ -3649,13 +3725,16 @@ pub fn decode_inter_frame_tile(
         }
         out
     };
-    Ok(Picture {
-        width: fw,
-        height: fh,
-        y: crop(&y, fw, fh),
-        u: crop(&u, fw / 2, fh / 2),
-        v: crop(&v, fw / 2, fh / 2),
-    })
+    Ok((
+        Picture {
+            width: fw,
+            height: fh,
+            y: crop(&y, fw, fh),
+            u: crop(&u, fw / 2, fh / 2),
+            v: crop(&v, fw / 2, fh / 2),
+        },
+        cdfs,
+    ))
 }
 
 #[cfg(test)]
