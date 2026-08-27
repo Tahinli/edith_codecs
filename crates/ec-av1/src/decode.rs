@@ -115,7 +115,7 @@ fn unsupported(what: impl Into<String>) -> Error {
 /// The coefficient q-context a frame's `base_q_idx` picks its default CDFs
 /// from (spec `Get_Qctx`), mirroring [`crate::tile`]'s private copy of the
 /// same rule.
-fn q_ctx_of(base_q_idx: u8) -> usize {
+pub(crate) fn q_ctx_of(base_q_idx: u8) -> usize {
     match base_q_idx {
         0..=20 => 0,
         21..=60 => 1,
@@ -2078,6 +2078,41 @@ pub fn decode_key_frame_tile(
     cdef: &CdefParams,
     loop_filter: &LoopFilterParams,
 ) -> Result<Picture> {
+    decode_key_frame_tile_with_cdfs(
+        data,
+        mi_cols,
+        mi_rows,
+        base_q_idx,
+        frame_width,
+        frame_height,
+        enable_filter_intra,
+        cdef,
+        loop_filter,
+        None,
+    )
+    .map(|(picture, _)| picture)
+}
+
+/// [`decode_key_frame_tile`], threading a cross-frame CDF forward (spec
+/// 7.20's `load_cdfs`): `initial_cdfs` is the caller's forwarded state (from
+/// a prior frame's saved reference slot) when set, or the spec 8.4 defaults
+/// when `None` (the only case [`decode_key_frame_tile`] itself ever needs,
+/// since a key frame's own header always forces `primary_ref_frame ==
+/// PRIMARY_REF_NONE`). Returns the tile's own end-of-tile adapted table
+/// alongside the picture, for the caller to save into whichever reference
+/// slots this frame's `refresh_frame_flags` names.
+pub(crate) fn decode_key_frame_tile_with_cdfs(
+    data: &[u8],
+    mi_cols: u32,
+    mi_rows: u32,
+    base_q_idx: u8,
+    frame_width: u32,
+    frame_height: u32,
+    enable_filter_intra: bool,
+    cdef: &CdefParams,
+    loop_filter: &LoopFilterParams,
+    initial_cdfs: Option<Cdfs>,
+) -> Result<(Picture, Cdfs)> {
     if mi_cols == 0 || mi_rows == 0 {
         return Err(unsupported("a frame with no mode-info grid"));
     }
@@ -2113,7 +2148,7 @@ pub fn decode_key_frame_tile(
     let scan8 = default_scan(TX8);
     let scan4 = default_scan(TX4);
 
-    let mut cdfs = Cdfs::new(q_ctx_of(base_q_idx));
+    let mut cdfs = initial_cdfs.unwrap_or_else(|| Cdfs::new(q_ctx_of(base_q_idx)));
     if std::env::var_os("EC_AV1_TRACE").is_some() {
         eprintln!(
             "TRACE key_tile_bytes len={} first8={:02x?} base_q_idx={base_q_idx} mi_cols={mi_cols} mi_rows={mi_rows}",
@@ -2416,13 +2451,16 @@ pub fn decode_key_frame_tile(
 
     let (fw, fh) = (frame_width as usize, frame_height as usize);
     if fw == width && fh == height {
-        return Ok(Picture {
-            width,
-            height,
-            y: y.data,
-            u: u.data,
-            v: v.data,
-        });
+        return Ok((
+            Picture {
+                width,
+                height,
+                y: y.data,
+                u: u.data,
+                v: v.data,
+            },
+            cdfs,
+        ));
     }
     let crop = |plane: &PlaneBuf, w: usize, h: usize| -> Vec<u8> {
         let mut out = Vec::with_capacity(w * h);
@@ -2431,13 +2469,16 @@ pub fn decode_key_frame_tile(
         }
         out
     };
-    Ok(Picture {
-        width: fw,
-        height: fh,
-        y: crop(&y, fw, fh),
-        u: crop(&u, fw / 2, fh / 2),
-        v: crop(&v, fw / 2, fh / 2),
-    })
+    Ok((
+        Picture {
+            width: fw,
+            height: fh,
+            y: crop(&y, fw, fh),
+            u: crop(&u, fw / 2, fh / 2),
+            v: crop(&v, fw / 2, fh / 2),
+        },
+        cdfs,
+    ))
 }
 
 /// The `is_inter` context (spec 5.11.16 via `av1_get_intra_inter_context`),
@@ -2468,20 +2509,38 @@ fn mv_class_base(class: usize) -> i32 {
 /// One motion vector component's non-zero diff (spec 5.11.32
 /// `read_mv_component`), the inverse of [`crate::tile`]'s private
 /// `write_mv_component`.
-fn read_mv_component(dec: &mut SymbolDecoder, c: &mut MvComponentCdfs) -> i32 {
+fn read_mv_component(
+    dec: &mut SymbolDecoder,
+    c: &mut MvComponentCdfs,
+    allow_high_precision_mv: bool,
+) -> i32 {
     let sign = dec.symbol(&mut c.sign);
     let class = dec.symbol(&mut c.class);
     let local = if class == 0 {
         let bit = dec.symbol(&mut c.class0_bit);
         let fr = dec.symbol(&mut c.class0_fr[bit]);
-        (bit << 3) | (fr << 1) | 1
+        // spec 5.11.32 `mv_class0_hp`: read only when the frame allows
+        // high-precision motion vectors, else implicitly 1 (the low bit
+        // stays at half-pel precision) -- this crate's own writer always
+        // leaves the flag off, but a foreign stream can set it per frame.
+        let hp = if allow_high_precision_mv {
+            dec.symbol(&mut c.class0_hp)
+        } else {
+            1
+        };
+        (bit << 3) | (fr << 1) | hp
     } else {
         let mut d = 0;
         for i in 0..class {
             d |= dec.symbol(&mut c.bit[i]) << i;
         }
         let fr = dec.symbol(&mut c.fr);
-        (d << 3) | (fr << 1) | 1
+        let hp = if allow_high_precision_mv {
+            dec.symbol(&mut c.hp)
+        } else {
+            1
+        };
+        (d << 3) | (fr << 1) | hp
     };
     let mag = mv_class_base(class) + local as i32 + 1;
     if sign == 1 { -mag } else { mag }
@@ -2494,14 +2553,15 @@ fn read_mv(
     mv_comp: &mut [MvComponentCdfs; 2],
     mv_joint: &mut [u16; 5],
     pred: (i32, i32),
+    allow_high_precision_mv: bool,
 ) -> (i32, i32) {
     let joint = dec.symbol(mv_joint);
     let mut diff = (0, 0);
     if joint == 2 || joint == 3 {
-        diff.0 = read_mv_component(dec, &mut mv_comp[0]);
+        diff.0 = read_mv_component(dec, &mut mv_comp[0], allow_high_precision_mv);
     }
     if joint == 1 || joint == 3 {
-        diff.1 = read_mv_component(dec, &mut mv_comp[1]);
+        diff.1 = read_mv_component(dec, &mut mv_comp[1], allow_high_precision_mv);
     }
     (pred.0 + diff.0, pred.1 + diff.1)
 }
@@ -2609,6 +2669,7 @@ fn decode_inter_block(
     scan_luma: &[u16],
     scan_chroma: &[u16],
     size_group: usize,
+    allow_high_precision_mv: bool,
 ) -> Result<()> {
     const LAST_FRAME: i8 = 1;
 
@@ -2657,7 +2718,13 @@ fn decode_inter_block(
                 dec.symbol(&mut cdfs.drl_mode[stack.drl_ctx[0]]);
             }
             (
-                read_mv(dec, &mut cdfs.mv_comp, &mut cdfs.mv_joint, stack.pred_mv),
+                read_mv(
+                    dec,
+                    &mut cdfs.mv_comp,
+                    &mut cdfs.mv_joint,
+                    stack.pred_mv,
+                    allow_high_precision_mv,
+                ),
                 true,
             )
         } else {
@@ -2691,6 +2758,12 @@ fn decode_inter_block(
             };
             (mv, false)
         };
+        if std::env::var_os("EC_AV1_TRACE").is_some() {
+            eprintln!(
+                "EC_TRACE mi_row={mi_row} mi_col={mi_col} skip={} is_inter=1 mv=({},{}) is_new_mv={is_new_mv} bsize={side}",
+                skip as u8, mv.0, mv.1
+            );
+        }
         for dr in 0..bw4 {
             for dc in 0..bw4 {
                 grid.set(
@@ -2997,6 +3070,7 @@ fn decode_inter_block8(
     scan8: &[u16],
     scan4: &[u16],
     prev_leaf: Option<((usize, usize), bool, bool)>,
+    allow_high_precision_mv: bool,
 ) -> Result<(bool, bool)> {
     const LAST_FRAME: i8 = 1;
     /// `Y_MODE`'s size group (`common_data.h`'s `size_group_lookup[BLOCK_8X8]`).
@@ -3059,7 +3133,13 @@ fn decode_inter_block8(
                 dec.symbol(&mut cdfs.drl_mode[stack.drl_ctx[0]]);
             }
             (
-                read_mv(dec, &mut cdfs.mv_comp, &mut cdfs.mv_joint, stack.pred_mv),
+                read_mv(
+                    dec,
+                    &mut cdfs.mv_comp,
+                    &mut cdfs.mv_joint,
+                    stack.pred_mv,
+                    allow_high_precision_mv,
+                ),
                 true,
             )
         } else {
@@ -3366,7 +3446,42 @@ pub fn decode_inter_frame_tile(
     reference: &Picture,
     cdef: &CdefParams,
     loop_filter: &LoopFilterParams,
+    allow_high_precision_mv: bool,
 ) -> Result<Picture> {
+    decode_inter_frame_tile_with_cdfs(
+        data,
+        mi_cols,
+        mi_rows,
+        base_q_idx,
+        frame_width,
+        frame_height,
+        reference,
+        cdef,
+        loop_filter,
+        None,
+        allow_high_precision_mv,
+    )
+    .map(|(picture, _)| picture)
+}
+
+/// [`decode_inter_frame_tile`], threading a cross-frame CDF forward -- see
+/// [`decode_key_frame_tile_with_cdfs`]'s doc for `initial_cdfs`/the returned
+/// end-of-tile table. An inter frame's own header can name
+/// `primary_ref_frame == PRIMARY_REF_NONE` too (an error-resilient stream),
+/// so `None` is a real case here, not only a convenience default.
+pub(crate) fn decode_inter_frame_tile_with_cdfs(
+    data: &[u8],
+    mi_cols: u32,
+    mi_rows: u32,
+    base_q_idx: u8,
+    frame_width: u32,
+    frame_height: u32,
+    reference: &Picture,
+    cdef: &CdefParams,
+    loop_filter: &LoopFilterParams,
+    initial_cdfs: Option<Cdfs>,
+    allow_high_precision_mv: bool,
+) -> Result<(Picture, Cdfs)> {
     if mi_cols == 0 || mi_rows == 0 {
         return Err(unsupported("a frame with no mode-info grid"));
     }
@@ -3429,7 +3544,7 @@ pub fn decode_inter_frame_tile(
     let scan8 = default_scan(TX8);
     let scan4 = default_scan(TX4);
 
-    let mut cdfs = Cdfs::new(q_ctx_of(base_q_idx));
+    let mut cdfs = initial_cdfs.unwrap_or_else(|| Cdfs::new(q_ctx_of(base_q_idx)));
     let mut dec = SymbolDecoder::new(data);
     let mut neighbours = Neighbours::new(
         cols as usize * 2,
@@ -3512,6 +3627,7 @@ pub fn decode_inter_frame_tile(
                             &scan32,
                             &scan16,
                             3,
+                            allow_high_precision_mv,
                         )?;
                     }
                     PARTITION_SPLIT => {
@@ -3564,6 +3680,7 @@ pub fn decode_inter_frame_tile(
                                     &scan16,
                                     &scan8,
                                     2,
+                                    allow_high_precision_mv,
                                 )?;
                             } else {
                                 let ctx16 = neighbours.partition_ctx(at16, SUB);
@@ -3612,6 +3729,7 @@ pub fn decode_inter_frame_tile(
                                         &scan8,
                                         &scan4,
                                         prev_leaf,
+                                        allow_high_precision_mv,
                                     )?;
                                     prev_leaf = Some((leaf_mi, skip, is_inter));
                                 }
@@ -3634,13 +3752,16 @@ pub fn decode_inter_frame_tile(
 
     let (fw, fh) = (frame_width as usize, frame_height as usize);
     if fw == width && fh == height {
-        return Ok(Picture {
-            width,
-            height,
-            y: y.data,
-            u: u.data,
-            v: v.data,
-        });
+        return Ok((
+            Picture {
+                width,
+                height,
+                y: y.data,
+                u: u.data,
+                v: v.data,
+            },
+            cdfs,
+        ));
     }
     let crop = |plane: &PlaneBuf, w: usize, h: usize| -> Vec<u8> {
         let mut out = Vec::with_capacity(w * h);
@@ -3649,13 +3770,16 @@ pub fn decode_inter_frame_tile(
         }
         out
     };
-    Ok(Picture {
-        width: fw,
-        height: fh,
-        y: crop(&y, fw, fh),
-        u: crop(&u, fw / 2, fh / 2),
-        v: crop(&v, fw / 2, fh / 2),
-    })
+    Ok((
+        Picture {
+            width: fw,
+            height: fh,
+            y: crop(&y, fw, fh),
+            u: crop(&u, fw / 2, fh / 2),
+            v: crop(&v, fw / 2, fh / 2),
+        },
+        cdfs,
+    ))
 }
 
 #[cfg(test)]
@@ -4085,6 +4209,7 @@ mod tests {
                 &reference,
                 &CdefParams::default(),
                 &LoopFilterParams::default(),
+                false,
             )
             .unwrap();
             assert_eq!(
@@ -4258,6 +4383,7 @@ mod tests {
             &[],
             &[],
             0,
+            false,
         )
         .unwrap();
 
@@ -4345,6 +4471,7 @@ mod tests {
                 &reference,
                 &CdefParams::default(),
                 &LoopFilterParams::default(),
+                false,
             )
             .unwrap();
             assert_eq!(decoded.y, ffmpeg_frames[i].y, "frame {i} luma vs ffmpeg");

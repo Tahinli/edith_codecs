@@ -96,6 +96,7 @@ pub(crate) struct TxbTables<'a> {
 }
 
 /// Every table a key frame's tile writer adapts.
+#[derive(Clone)]
 pub(crate) struct Cdfs {
     /// The partition symbol of a 64x64 superblock.
     pub partition_w64: [[u16; 11]; 4],
@@ -271,14 +272,19 @@ pub(crate) struct MvComponentCdfs {
     pub class0_bit: [u16; 3],
     /// The fractional part of a small-class magnitude, by its integer bit.
     pub class0_fr: [[u16; 5]; 2],
-    // `class0_hp`/`hp` (spec's half-pel-bit CDFs) are never written: this
-    // encoder always sets `allow_high_precision_mv = false`, so the syntax
-    // that reads them (spec 5.9.32 `mv_class0_hp`/`mv_hp`) never fires --
-    // dropped rather than kept dead. Add back if/when hp mode ships.
+    /// The half-pel bit of a small-class magnitude (spec `mv_class0_hp`),
+    /// read only when the frame header sets `allow_high_precision_mv` (a
+    /// real encoder's choice, not this crate's own writer's -- which always
+    /// leaves the flag off and so never needs this table, but a foreign
+    /// stream this decoder reads can set it per frame).
+    pub class0_hp: [u16; 3],
     /// One bit of an above-small-class magnitude, by its position.
     pub bit: [[u16; 3]; 10],
     /// The fractional part of an above-small-class magnitude.
     pub fr: [u16; 5],
+    /// The half-pel bit of an above-small-class magnitude (spec `mv_hp`),
+    /// same `allow_high_precision_mv` gating as [`Self::class0_hp`].
+    pub hp: [u16; 3],
     /// The component's sign.
     pub sign: [u16; 3],
 }
@@ -289,8 +295,10 @@ impl MvComponentCdfs {
             class: cdf::MV_CLASS,
             class0_bit: cdf::MV_CLASS0_BIT,
             class0_fr: cdf::MV_CLASS0_FR,
+            class0_hp: cdf::MV_CLASS0_HP,
             bit: cdf::MV_BIT,
             fr: cdf::MV_FR,
+            hp: cdf::MV_HP,
             sign: cdf::MV_SIGN,
         }
     }
@@ -308,7 +316,126 @@ pub(crate) fn pick<T: Copy>(q_ctx: usize, q0: T, q1: T, q2: T, q3: T) -> T {
     }
 }
 
+/// `reset_cdf_symbol_counter` (spec 7.20's `save_cdfs`, libaom
+/// `av1_reset_cdf_symbol_counters`, `entropy.c`): every adapting table's last
+/// entry is a symbol counter that slows [`update_cdf`](crate::msac)'s rate
+/// down for a table's first 32 observations. A tile decoded with
+/// `disable_frame_end_update_cdf == false` saves its *adapted* table into the
+/// reference slots the frame refreshes, but the counters go back to zero
+/// first -- forwarding the raw counts (this crate's bug until it was found:
+/// the counts climbed unchecked, so every table forwarded across two or more
+/// frames adapted *faster* than the real decoder's, a divergence too small to
+/// flip any one symbol in a single hop but compounding into a visible
+/// mismatch by the third).
+fn reset1<const N: usize>(a: &mut [u16; N]) {
+    a[N - 1] = 0;
+}
+fn reset2<const N: usize, const M: usize>(a: &mut [[u16; N]; M]) {
+    a.iter_mut().for_each(reset1);
+}
+fn reset3<const N: usize, const M: usize, const K: usize>(a: &mut [[[u16; N]; M]; K]) {
+    a.iter_mut().for_each(reset2);
+}
+
+impl MvComponentCdfs {
+    fn reset_counts(&mut self) {
+        reset1(&mut self.class);
+        reset1(&mut self.class0_bit);
+        reset2(&mut self.class0_fr);
+        reset1(&mut self.class0_hp);
+        reset2(&mut self.bit);
+        reset1(&mut self.fr);
+        reset1(&mut self.hp);
+        reset1(&mut self.sign);
+    }
+}
+
 impl Cdfs {
+    /// Zeroes every table's symbol counter (its last entry), leaving the
+    /// probabilities themselves untouched -- spec 7.20's `save_cdfs`. Call
+    /// this on the tile's own end-of-tile adapted state before storing it
+    /// into a reference slot for cross-frame forwarding; never on a table
+    /// still being read within the same tile.
+    pub(crate) fn reset_counts(&mut self) {
+        reset2(&mut self.partition_w64);
+        reset2(&mut self.partition_w32);
+        reset2(&mut self.skip);
+        reset3(&mut self.kf_y_mode);
+        reset2(&mut self.uv_mode_no_cfl);
+        reset2(&mut self.uv_mode_cfl);
+        reset1(&mut self.cfl_sign);
+        reset2(&mut self.cfl_alpha);
+        reset2(&mut self.angle_delta);
+        reset2(&mut self.txb_skip_luma_16);
+        reset2(&mut self.txb_skip_luma_8);
+        reset2(&mut self.txb_skip_chroma_8);
+        reset2(&mut self.txb_skip_chroma_4);
+        reset1(&mut self.eob_pt_256_luma);
+        reset1(&mut self.eob_pt_64_luma);
+        reset1(&mut self.eob_pt_64_chroma);
+        reset1(&mut self.eob_pt_16_chroma);
+        reset2(&mut self.eob_extra_luma_16);
+        reset2(&mut self.eob_extra_luma_8);
+        reset2(&mut self.eob_extra_chroma_8);
+        reset2(&mut self.eob_extra_chroma_4);
+        reset2(&mut self.base_luma_16);
+        reset2(&mut self.base_luma_8);
+        reset2(&mut self.base_chroma_8);
+        reset2(&mut self.base_chroma_4);
+        reset2(&mut self.base_eob_luma_16);
+        reset2(&mut self.base_eob_luma_8);
+        reset2(&mut self.base_eob_chroma_8);
+        reset2(&mut self.base_eob_chroma_4);
+        reset2(&mut self.br_luma_16);
+        reset2(&mut self.br_luma_8);
+        reset2(&mut self.br_chroma_8);
+        reset2(&mut self.br_chroma_4);
+        reset2(&mut self.partition_w16);
+        reset2(&mut self.partition_w8);
+        reset2(&mut self.txb_skip_luma_32);
+        reset2(&mut self.txb_skip_luma_64);
+        reset2(&mut self.txb_skip_chroma_16);
+        reset2(&mut self.txb_skip_chroma_32);
+        reset1(&mut self.eob_pt_1024_luma);
+        reset1(&mut self.eob_pt_1024_chroma);
+        reset1(&mut self.eob_pt_256_chroma);
+        reset2(&mut self.eob_extra_luma_32);
+        reset2(&mut self.eob_extra_luma_64);
+        reset2(&mut self.eob_extra_chroma_16);
+        reset2(&mut self.eob_extra_chroma_32);
+        reset2(&mut self.base_luma_32);
+        reset2(&mut self.base_luma_64);
+        reset2(&mut self.base_chroma_16);
+        reset2(&mut self.base_chroma_32);
+        reset2(&mut self.base_eob_luma_32);
+        reset2(&mut self.base_eob_luma_64);
+        reset2(&mut self.base_eob_chroma_16);
+        reset2(&mut self.base_eob_chroma_32);
+        reset2(&mut self.br_luma_32);
+        reset2(&mut self.br_chroma_16);
+        reset2(&mut self.br_chroma_32);
+        reset2(&mut self.dc_sign_luma);
+        reset2(&mut self.intra_tx_type_16);
+        reset2(&mut self.intra_tx_type_8);
+        reset1(&mut self.inter_tx_type_32);
+        reset1(&mut self.inter_tx_type_16);
+        reset1(&mut self.inter_tx_type_8);
+        reset2(&mut self.dc_sign_chroma);
+        reset2(&mut self.intra_inter);
+        reset3(&mut self.single_ref);
+        reset2(&mut self.y_mode);
+        reset2(&mut self.new_mv);
+        reset2(&mut self.zero_mv);
+        reset2(&mut self.ref_mv);
+        reset2(&mut self.drl_mode);
+        reset1(&mut self.mv_joint);
+        self.mv_comp
+            .iter_mut()
+            .for_each(MvComponentCdfs::reset_counts);
+        reset2(&mut self.filter_intra);
+        reset1(&mut self.filter_intra_mode);
+    }
+
     /// The defaults a key frame starts from (spec 8.4, `init_coeff_cdfs` and
     /// `init_non_coeff_cdfs`), for coefficient q-context `q_ctx` (0..=3, spec
     /// 8.3.2's `Get_Qctx`). The non-coefficient tables do not vary with the
