@@ -2165,6 +2165,7 @@ pub fn sb_coeff_inter_frame_tile(
     let scan32 = default_scan(TX32);
     let scan16 = default_scan(TX16);
     let scan8 = default_scan(TX8);
+    let scan4 = default_scan(TX4);
     let zero_grids = [
         vec![0i32; TX32 * TX32],
         vec![0i32; TX16 * TX16],
@@ -2268,38 +2269,102 @@ pub fn sb_coeff_inter_frame_tile(
                             (false, false) => {}
                         }
                         for (leaf, (sr, sc)) in sub_blocks.iter().zip(sub_positions) {
-                            // A 16x16 leaf the true frame edge itself cuts
-                            // through needs a rectangular transform this
-                            // writer does not code yet -- same refusal as
-                            // `sb_coeff_key_frame_tile`'s SUB level, just
-                            // named for an inter-frame leaf.
+                            // A 16x16 leaf whose own half straddles the true
+                            // frame edge on both axes needs a rectangular
+                            // transform this writer does not code yet; one
+                            // axis only is two (or, at a true corner, one)
+                            // 8x8 leaves (lane-av1inter8), same split the key
+                            // frame search takes at this geometry.
                             let (has_cols16, has_rows16) = (
                                 has_half(sc as u32 * SUB_MI, SUB_MI, mi_cols),
                                 has_half(sr as u32 * SUB_MI, SUB_MI, mi_rows),
                             );
-                            if !has_cols16 || !has_rows16 {
+                            if !has_cols16 && !has_rows16 {
                                 return Err(Error::unsupported(
                                     "AV1 tile",
-                                    "a 16x16 inter-frame block the true frame edge cuts \
-                                     through needs a rectangular transform this writer \
+                                    "a 16x16 inter-frame block whose true edge cuts through \
+                                     both axes needs a rectangular transform this writer \
                                      does not code yet",
                                 ));
                             }
                             let at16 = (sr, sc);
-                            let ctx16 = neighbours.partition_ctx(at16, SUB);
-                            enc.symbol(PARTITION_NONE, &mut cdfs.partition_w16[ctx16]);
-                            write_inter_frame_leaf(
-                                &mut enc,
-                                &mut cdfs,
-                                &mut neighbours,
-                                &mut grid,
-                                mi_cols,
-                                mi_rows,
-                                leaf,
-                                at16,
-                                &scan16,
-                                &scan8,
-                            )?;
+                            if has_cols16 && has_rows16 {
+                                let ctx16 = neighbours.partition_ctx(at16, SUB);
+                                enc.symbol(PARTITION_NONE, &mut cdfs.partition_w16[ctx16]);
+                                write_inter_frame_leaf(
+                                    &mut enc,
+                                    &mut cdfs,
+                                    &mut neighbours,
+                                    &mut grid,
+                                    mi_cols,
+                                    mi_rows,
+                                    leaf,
+                                    at16,
+                                    &scan16,
+                                    &scan8,
+                                )?;
+                            } else {
+                                let ctx16 = neighbours.partition_ctx(at16, SUB);
+                                if has_cols16 {
+                                    enc.symbol_fixed(
+                                        1,
+                                        &gather(&cdfs.partition_w16[ctx16], VERT_ALIKE),
+                                    );
+                                } else {
+                                    enc.symbol_fixed(
+                                        1,
+                                        &gather(&cdfs.partition_w16[ctx16], HORZ_ALIKE),
+                                    );
+                                }
+                                let leaves = leaf.eight.as_ref().ok_or_else(|| {
+                                    Error::unsupported(
+                                        "AV1 tile",
+                                        "a 16x16 inter-frame block the true frame edge cuts \
+                                         through needs its `eight` leaves populated",
+                                    )
+                                })?;
+                                let (mi_row0, mi_col0) = (sr as u32 * SUB_MI, sc as u32 * SUB_MI);
+                                let leaf_positions: Vec<(u32, u32)> = (0..4)
+                                    .map(|i| (mi_row0 + (i / 2) * 2, mi_col0 + (i % 2) * 2))
+                                    .filter(|&(mr, mc)| mr < mi_rows && mc < mi_cols)
+                                    .collect();
+                                if leaves.len() != leaf_positions.len() {
+                                    return Err(Error::unsupported(
+                                        "AV1 tile",
+                                        "a straddling 16x16 inter-frame block needs one \
+                                         `eight` entry per 8x8 leaf inside the true frame",
+                                    ));
+                                }
+                                let mut prev_leaf: Option<((usize, usize), bool, bool)> = None;
+                                for (leaf8, (mr, mc)) in leaves.iter().zip(leaf_positions) {
+                                    let leaf_mi = (mr as usize, mc as usize);
+                                    let leaf_ctx = neighbours.partition_ctx_mi(leaf_mi, 8);
+                                    enc.symbol(PARTITION_NONE, &mut cdfs.partition_w8[leaf_ctx]);
+                                    let (skip, is_inter) = write_inter_frame_leaf8(
+                                        &mut enc,
+                                        &mut cdfs,
+                                        &mut neighbours,
+                                        &mut grid,
+                                        mi_cols,
+                                        mi_rows,
+                                        leaf8,
+                                        at16,
+                                        leaf_mi,
+                                        &scan8,
+                                        &scan4,
+                                        prev_leaf,
+                                    )?;
+                                    prev_leaf = Some((leaf_mi, skip, is_inter));
+                                }
+                                // Same write-back-once-from-the-last-leaf rule
+                                // as the key frame search's `write_leaf8`
+                                // caller (r15): the SUB-grid skip/inter arrays
+                                // are otherwise left stale for the next
+                                // 16x16 slot.
+                                if let Some((_, skip, is_inter)) = prev_leaf {
+                                    neighbours.record_inter(at16, SUB, skip, is_inter);
+                                }
+                            }
                         }
                         continue;
                     }
@@ -2616,6 +2681,194 @@ fn write_inter_frame_leaf(
     }
     neighbours.record_inter(at, SUB, block.skip, is_inter);
     Ok(())
+}
+
+/// Writes one 8x8 leaf of a straddling 16x16 inter-frame block
+/// (lane-av1inter8): its own skip flag, intra/inter choice and (when inter)
+/// `NEARESTMV`/`NEWMV` chain, or (when intra) `Y_MODE`, then its own luma and
+/// two chroma transform blocks -- coded exactly like
+/// [`write_inter_frame_leaf`] but through [`TxbSet::Luma8Inter`]/
+/// [`TxbSet::Chroma4`] and at this leaf's own 2x2-mi mv-stack window, reading
+/// its skip/intra-inter context from the *enclosing* 16x16 slot's
+/// [`Neighbours`] arrays (`outer_at`, in [`SUB`]-grid units) unless
+/// `prev_leaf` names this straddling block's own first leaf as the true
+/// mi-adjacent neighbour -- the same override [`write_leaf8`] applies to its
+/// mode context, needed for the same reason: `Neighbours`' above/left arrays
+/// only resolve to [`SUB`] granularity, too coarse for the second leaf of a
+/// straddling 16x16 to see the first. `Y_MODE`'s own context (`Size_Group`)
+/// is not neighbour-dependent, unlike the key frame path's `kf_y_mode`, so no
+/// override is needed there. Hands back this leaf's own skip flag and
+/// intra/inter choice, which is what the next leaf (or the caller's final
+/// write-back, mirroring `write_leaf8`'s caller) reads.
+#[allow(clippy::too_many_arguments)]
+fn write_inter_frame_leaf8(
+    enc: &mut SymbolEncoder,
+    cdfs: &mut Cdfs,
+    neighbours: &mut Neighbours,
+    grid: &mut MiGrid,
+    mi_cols: u32,
+    mi_rows: u32,
+    block: &BlockCoeffs,
+    outer_at: (usize, usize),
+    leaf_mi: (usize, usize),
+    scan8: &Vec<u16>,
+    scan4: &Vec<u16>,
+    prev_leaf: Option<((usize, usize), bool, bool)>,
+) -> Result<(bool, bool)> {
+    if block.inter.is_none() && usize::from(block.mode) >= INTRA_MODES {
+        return Err(Error::unsupported(
+            "AV1 tile",
+            format!(
+                "intra mode {} is not one of the thirteen this writer codes",
+                block.mode
+            ),
+        ));
+    }
+    /// `Y_MODE`'s size group (spec `Size_Group`, `common_data.h`'s
+    /// `size_group_lookup[BLOCK_8X8]`) for this leaf's own size.
+    const SIZE_GROUP_8: usize = 1;
+    /// `Ref_Frame_List`'s `LAST_FRAME` (spec 3), same as the 16x16/32x32
+    /// branches.
+    const LAST_FRAME: i8 = 1;
+
+    let (r, c) = outer_at;
+    let mut above_skip = neighbours.above_skip[c];
+    let mut left_skip = neighbours.left_skip[r];
+    let mut above_inter = neighbours.above_inter[c];
+    let mut left_inter = neighbours.left_inter[r];
+    if let Some(((pr, pc), pskip, pinter)) = prev_leaf {
+        if pc == leaf_mi.1 && leaf_mi.0 == pr + 2 {
+            above_skip = pskip;
+            above_inter = pinter;
+        } else if pr == leaf_mi.0 && leaf_mi.1 == pc + 2 {
+            left_skip = pskip;
+            left_inter = pinter;
+        }
+    }
+    let skip_ctx = usize::from(above_skip) + usize::from(left_skip);
+    enc.symbol(usize::from(block.skip), &mut cdfs.skip[skip_ctx]);
+
+    let (has_above, has_left) = (leaf_mi.0 > 0, leaf_mi.1 > 0);
+    let ii_ctx = intra_inter_ctx(has_above, has_left, above_inter, left_inter);
+    let is_inter = block.inter.is_some();
+    enc.symbol(usize::from(is_inter), &mut cdfs.intra_inter[ii_ctx]);
+
+    let mode_for_tx;
+    if let Some(info) = block.inter {
+        let sr_ctx = single_ref_ctx(above_inter || left_inter);
+        enc.symbol(0, &mut cdfs.single_ref[sr_ctx][0]); // p1: forward
+        enc.symbol(0, &mut cdfs.single_ref[sr_ctx][2]); // p3: LAST/LAST2
+        enc.symbol(0, &mut cdfs.single_ref[sr_ctx][3]); // p4: LAST
+
+        let (mi_row, mi_col) = leaf_mi;
+        let stack = find_mv_stack(
+            grid,
+            mi_row,
+            mi_col,
+            2,
+            2,
+            LAST_FRAME,
+            mi_cols as usize,
+            mi_rows as usize,
+        );
+
+        let is_new_mv = matches!(info.mode, InterMode::NewMv);
+        if is_new_mv {
+            enc.symbol(0, &mut cdfs.new_mv[stack.new_mv_ctx]); // NEWMV
+        } else {
+            enc.symbol(1, &mut cdfs.new_mv[stack.new_mv_ctx]); // not new
+            enc.symbol(1, &mut cdfs.zero_mv[stack.zero_mv_ctx]); // not zero
+            enc.symbol(0, &mut cdfs.ref_mv[stack.ref_mv_ctx]); // NEARESTMV
+        }
+        if is_new_mv && stack.entries.len() > 1 {
+            enc.symbol(0, &mut cdfs.drl_mode[stack.drl_ctx[0]]);
+        }
+        let mv = if is_new_mv {
+            write_mv(
+                enc,
+                &mut cdfs.mv_comp,
+                &mut cdfs.mv_joint,
+                info.mv,
+                stack.pred_mv,
+            )?;
+            info.mv
+        } else {
+            stack.nearest_mv
+        };
+        for dr in 0..2 {
+            for dc in 0..2 {
+                grid.set(
+                    mi_row + dr,
+                    mi_col + dc,
+                    MiInfo {
+                        is_inter: true,
+                        ref_frame: LAST_FRAME,
+                        mv,
+                        is_new_mv,
+                        size: 2,
+                    },
+                );
+            }
+        }
+        mode_for_tx = 0;
+    } else {
+        let mode = usize::from(block.mode);
+        enc.symbol(mode, &mut cdfs.y_mode[SIZE_GROUP_8]);
+        if (V_PRED..=D67_PRED).contains(&mode) {
+            enc.symbol(ANGLE_DELTA_ZERO, &mut cdfs.angle_delta[mode - V_PRED]);
+        }
+        enc.symbol(DC_PRED, &mut cdfs.uv_mode_cfl[mode]);
+        mode_for_tx = mode;
+        // Intra: no vote, but still a coded cell -- mvstack's extended-scan
+        // coverage must see it (module doc).
+        let (mi_row, mi_col) = leaf_mi;
+        for dr in 0..2 {
+            for dc in 0..2 {
+                grid.set(
+                    mi_row + dr,
+                    mi_col + dc,
+                    MiInfo {
+                        is_inter: false,
+                        ref_frame: -1,
+                        mv: (0, 0),
+                        is_new_mv: false,
+                        size: 2,
+                    },
+                );
+            }
+        }
+    }
+
+    let planes = if is_inter {
+        [TxbSet::Luma8Inter, TxbSet::Chroma4, TxbSet::Chroma4]
+    } else {
+        [TxbSet::Luma8, TxbSet::Chroma4, TxbSet::Chroma4]
+    };
+    if block.skip {
+        let zero_grids = [
+            vec![0i32; TX8 * TX8],
+            vec![0i32; TX4 * TX4],
+            vec![0i32; TX4 * TX4],
+        ];
+        neighbours.record_mi(leaf_mi, 8, &zero_grids);
+    } else {
+        let grids = [
+            level_grid(&block.luma, TX8)?,
+            level_grid(&block.u, TX4)?,
+            level_grid(&block.v, TX4)?,
+        ];
+        write_block_planes(
+            enc,
+            cdfs,
+            &planes,
+            &grids,
+            &[scan8, scan4, scan4],
+            &neighbours.around_mi(leaf_mi, 8),
+            mode_for_tx,
+        );
+        neighbours.record_mi(leaf_mi, 8, &grids);
+    }
+    Ok((block.skip, is_inter))
 }
 
 #[cfg(test)]
