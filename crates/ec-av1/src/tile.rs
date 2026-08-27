@@ -616,6 +616,17 @@ struct Neighbours {
     above_side: Vec<usize>,
     /// The same, down the left edge.
     left_side: Vec<usize>,
+    /// The same as `above_side`/`left_side`, but kept at the finer mi (4x4)
+    /// granularity [`Self::above`]/[`Self::left`] are, rather than [`SUB`]:
+    /// two 8x8 leaves of one straddling 16x16 block (lane-av1-rect) share a
+    /// single [`SUB`]-grid cell, so a coarse array cannot tell the second
+    /// leaf's partition symbol that the first one was coded at 8x8 (finer
+    /// than the 16x16 it sits in) -- exactly what its `above`/`left` context
+    /// needs to read (spec 9.3's `AbovePartitionContext`/`LeftPartitionContext`,
+    /// which libaom keeps per mi unit for this reason).
+    above_side_mi: Vec<usize>,
+    /// The same, down the left edge.
+    left_side_mi: Vec<usize>,
     /// Whether the neighbour carried no residual, for [`sb_coeff_inter_frame_tile`]'s
     /// skip context. Unused (and left at its default) by the key frame writers.
     above_skip: Vec<bool>,
@@ -663,6 +674,8 @@ impl Neighbours {
             left_mode: vec![DC_PRED; rows],
             above_side: vec![SB; cols],
             left_side: vec![SB; rows],
+            above_side_mi: vec![SB; cols * (SUB / MI)],
+            left_side_mi: vec![SB; rows * (SUB / MI)],
             above_skip: vec![false; cols],
             left_skip: vec![false; rows],
             above_inter: vec![false; cols],
@@ -677,6 +690,7 @@ impl Neighbours {
         self.left.iter_mut().for_each(|l| *l = Default::default());
         self.left_mode.iter_mut().for_each(|m| *m = DC_PRED);
         self.left_side.iter_mut().for_each(|s| *s = SB);
+        self.left_side_mi.iter_mut().for_each(|s| *s = SB);
         self.left_skip.iter_mut().for_each(|s| *s = false);
         self.left_inter.iter_mut().for_each(|i| *i = false);
     }
@@ -710,6 +724,10 @@ impl Neighbours {
         let (mi_r, mi_c) = at_mi;
         let states: [Neighbour; 3] = std::array::from_fn(|plane| neighbour_state(&grids[plane]));
         let side_mi = side / MI;
+        for cell in 0..side_mi {
+            self.left_side_mi[mi_r + cell] = side;
+            self.above_side_mi[mi_c + cell] = side;
+        }
         // libaom rounds the luma edge up to the plane's own 4x4 unit before
         // clamping a subsampled plane (`ROUND_POWER_OF_TWO(max_blocks_high,
         // subsampling_y)` in av1_write_intra_coeffs_mb, encodetxb.c:456-459):
@@ -788,6 +806,15 @@ impl Neighbours {
     fn partition_ctx(&self, at: (usize, usize), side: usize) -> usize {
         let (r, c) = at;
         2 * usize::from(self.left_side[r] * 2 <= side) + usize::from(self.above_side[c] * 2 <= side)
+    }
+
+    /// [`Self::partition_ctx`] at mi granularity, for an 8x8 leaf of a
+    /// straddling 16x16 block: reads the finer `above_side_mi`/`left_side_mi`
+    /// arrays so the second leaf sees the first leaf's own 8x8 side rather
+    /// than the enclosing 16x16 slot's stale, shared state.
+    fn partition_ctx_mi(&self, (mi_r, mi_c): (usize, usize), side: usize) -> usize {
+        2 * usize::from(self.left_side_mi[mi_r] * 2 <= side)
+            + usize::from(self.above_side_mi[mi_c] * 2 <= side)
     }
 }
 
@@ -1161,14 +1188,14 @@ pub fn sb_coeff_key_frame_tile(
                                     }
                                     for (leaf, (mr, mc)) in leaves.iter().zip(leaf_positions) {
                                         let leaf_mi = (mr as usize, mc as usize);
-                                        // Per r6's charter, this must be
-                                        // recomputed per leaf; nothing this
-                                        // writer's [`Neighbours`] tracks at
-                                        // [`SUB`] granularity changes between
-                                        // the two leaves of one straddling
-                                        // 16x16, so both read the same
-                                        // enclosing-slot context.
-                                        let leaf_ctx = neighbours.partition_ctx(at, SUB);
+                                        // r8: read at mi granularity, not the
+                                        // enclosing 16x16 slot -- the first
+                                        // leaf's `record_mi` call below
+                                        // updates `above_side_mi`/
+                                        // `left_side_mi` at this leaf's own
+                                        // mi position, which the second
+                                        // leaf's ctx lookup then sees.
+                                        let leaf_ctx = neighbours.partition_ctx_mi(leaf_mi, 8);
                                         ec_rng_trace(|| {
                                             format!(
                                                 "EC_PART mi_row={} mi_col={} bsize=3 ctx={} tell={}",
