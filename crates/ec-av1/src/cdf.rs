@@ -969,6 +969,16 @@ pub const INTRA_TX_TYPE_SET2_16: [[u16; 6]; 13] = [
 /// uses DCT_DCT, index one of `Tx_Type_Inter_Inv_Set3`.
 pub const INTER_TX_TYPE_SET3_32: [u16; 3] = [748, 32768, 0];
 
+/// `Default_Inter_Ext_Tx_Cdf`'s `TX_SET_INTER_3` row for `TX_16X16` (spec
+/// 9.4): the transform type of an `is_inter` 16x16 luma transform coded under
+/// `reduced_tx_set` (spec 5.11.48's `use_reduced_set` branch forces
+/// `TX_SET_INTER_3` for every inter size below 32x32, the same two-symbol set
+/// [`INTER_TX_TYPE_SET3_32`] reads at 32x32) -- without `reduced_tx_set` a
+/// 16x16 inter transform reads the twelve-symbol `TX_SET_INTER_2` instead,
+/// which this crate does not carry a table for. The writer only ever uses
+/// DCT_DCT, index one of `Tx_Type_Inter_Inv_Set3`, same as the 32x32 table.
+pub const INTER_TX_TYPE_SET3_16: [u16; 3] = [1998, 32768, 0];
+
 // The inter-frame tables below (spec 9.4) support the syntax an inter block
 // needs: whether it is coded as intra at all, which reference frame and
 // motion vector it takes when it is not. Compound reference and compound
