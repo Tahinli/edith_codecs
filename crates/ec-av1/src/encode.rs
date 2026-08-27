@@ -1478,6 +1478,7 @@ fn mc_trial(
     mv: (i32, i32),
     luma: bool,
     reference: &[u8],
+    stride: usize,
     ref_width: usize,
     ref_height: usize,
     skip: bool,
@@ -1490,6 +1491,7 @@ fn mc_trial(
     let mut prediction = vec![0u8; side * side];
     mc::predict(
         reference,
+        stride,
         ref_width,
         ref_height,
         x_q4,
@@ -1614,9 +1616,34 @@ fn search_inter_block(
         });
     }
 
-    let ref_luma = (&reference.y, reference.width, reference.height);
-    let ref_u = (&reference.u, reference.width / 2, reference.height / 2);
-    let ref_v = (&reference.v, reference.width / 2, reference.height / 2);
+    // The reference frame buffer a spec decoder holds is exactly the true
+    // (unpadded) coded extent -- a superblock whose partition stops early at
+    // `has_cols`/`has_rows` never codes syntax for the padding columns/rows
+    // beyond it, so those samples are never part of the decoded picture.
+    // Motion compensation clamps reads to that true extent (spec 7.11.3.4's
+    // reference sample position clamp), not to this crate's own
+    // padded-to-`SUPERBLOCK` coding surface -- passing the padded width/height
+    // here would let a fractional-pel read past the true edge pick up this
+    // encoder's own uncoded padding instead of the true edge's replicated
+    // value a decoder computes.
+    let ref_luma = (
+        &reference.y,
+        reference.width,
+        luma.true_width,
+        luma.true_height,
+    );
+    let ref_u = (
+        &reference.u,
+        reference.width / 2,
+        chroma[0].true_width,
+        chroma[0].true_height,
+    );
+    let ref_v = (
+        &reference.v,
+        reference.width / 2,
+        chroma[1].true_width,
+        chroma[1].true_height,
+    );
     let mode_bits_inter = symbol_bits(&cdf::NEW_MV[stack.new_mv_ctx], 1) // not NEWMV
             + symbol_bits(&cdf::ZERO_MV[stack.zero_mv_ctx], 1) // not zero
             + symbol_bits(&cdf::REF_MV[stack.ref_mv_ctx], 0); // NEARESTMV
@@ -1636,6 +1663,7 @@ fn search_inter_block(
             ref_luma.0,
             ref_luma.1,
             ref_luma.2,
+            ref_luma.3,
             false,
             search.base_q_idx,
             search.deadzone,
@@ -1651,6 +1679,7 @@ fn search_inter_block(
             ref_u.0,
             ref_u.1,
             ref_u.2,
+            ref_u.3,
             false,
             search.base_q_idx,
             search.deadzone,
@@ -1666,6 +1695,7 @@ fn search_inter_block(
             ref_v.0,
             ref_v.1,
             ref_v.2,
+            ref_v.3,
             false,
             search.base_q_idx,
             search.deadzone,
@@ -1706,6 +1736,7 @@ fn search_inter_block(
         ref_luma.0,
         ref_luma.1,
         ref_luma.2,
+        ref_luma.3,
         &source_block,
         x,
         y,
@@ -1726,6 +1757,7 @@ fn search_inter_block(
             ref_luma.0,
             ref_luma.1,
             ref_luma.2,
+            ref_luma.3,
             false,
             search.base_q_idx,
             search.deadzone,
@@ -1741,6 +1773,7 @@ fn search_inter_block(
             ref_u.0,
             ref_u.1,
             ref_u.2,
+            ref_u.3,
             false,
             search.base_q_idx,
             search.deadzone,
@@ -1756,6 +1789,7 @@ fn search_inter_block(
             ref_v.0,
             ref_v.1,
             ref_v.2,
+            ref_v.3,
             false,
             search.base_q_idx,
             search.deadzone,

@@ -52,18 +52,33 @@ const SUBPEL_FILTERS: [[i32; 8]; 16] = [
     [0, 0, -2, 8, 126, -6, 2, 0],
 ];
 
-/// A reference sample at `(x, y)`, clamped to the plane's bounds (spec
-/// 7.11.3.4's `Clip3` against the frame's edges) rather than read out of
-/// range -- a motion vector that points past the frame repeats the edge
-/// sample instead of panicking.
-fn sample(reference: &[u8], ref_width: usize, ref_height: usize, x: i32, y: i32) -> i32 {
-    let cx = x.clamp(0, ref_width as i32 - 1) as usize;
-    let cy = y.clamp(0, ref_height as i32 - 1) as usize;
-    i32::from(reference[cy * ref_width + cx])
+/// A reference sample at `(x, y)`, clamped to the frame's true (unpadded)
+/// extent -- `true_width`/`true_height`, which can be narrower than
+/// `stride` -- rather than read out of range (spec 7.11.3.4's `Clip3`
+/// against the frame's edges): a motion vector that points past the true
+/// edge repeats the true edge's sample instead of panicking or picking up
+/// whatever this encoder's own uncoded padding columns/rows hold.
+#[allow(clippy::too_many_arguments)]
+fn sample(
+    reference: &[u8],
+    stride: usize,
+    true_width: usize,
+    true_height: usize,
+    x: i32,
+    y: i32,
+) -> i32 {
+    let cx = x.clamp(0, true_width as i32 - 1) as usize;
+    let cy = y.clamp(0, true_height as i32 - 1) as usize;
+    i32::from(reference[cy * stride + cx])
 }
 
 /// Predicts one `block_w * block_h` block into `dst`, row-major, from
-/// `reference` (row-major, `ref_width * ref_height`, stride `ref_width`).
+/// `reference` (row-major, stride `stride`, true content
+/// `true_width` x `true_height` -- a reference frame's decoded picture
+/// buffer can be wider/taller than the true frame it holds, when this
+/// encoder pads a picture to a whole number of superblocks; a spec decoder
+/// never codes syntax for those extra columns/rows, so motion compensation
+/// must clamp to the true extent, not the buffer's own stride).
 ///
 /// `x_q4` / `y_q4` are the block's top-left position in the reference, in
 /// 1/16-pel units (an integer MV has its low 4 bits zero); this function
@@ -76,8 +91,9 @@ fn sample(reference: &[u8], ref_width: usize, ref_height: usize, x: i32, y: i32)
 #[allow(clippy::too_many_arguments)] // one reference plane, one position, one block shape
 pub fn predict(
     reference: &[u8],
-    ref_width: usize,
-    ref_height: usize,
+    stride: usize,
+    true_width: usize,
+    true_height: usize,
     x_q4: i32,
     y_q4: i32,
     block_w: usize,
@@ -105,7 +121,7 @@ pub fn predict(
             let mut sum = 0;
             for (t, &tap) in h_filter.iter().enumerate() {
                 let x = x0 + c as i32 + t as i32 - 3;
-                sum += tap * sample(reference, ref_width, ref_height, x, y);
+                sum += tap * sample(reference, stride, true_width, true_height, x, y);
             }
             intermediate[r * block_w + c] = round2(sum, INTER_ROUND_0);
         }
@@ -132,7 +148,17 @@ mod tests {
         let height = 12;
         let reference: Vec<u8> = (0..width * height).map(|i| (i * 7 % 251) as u8).collect();
         let mut dst = vec![0u8; 6 * 6];
-        predict(&reference, width, height, 3 * 16, 4 * 16, 6, 6, &mut dst);
+        predict(
+            &reference,
+            width,
+            width,
+            height,
+            3 * 16,
+            4 * 16,
+            6,
+            6,
+            &mut dst,
+        );
         for row in 0..6 {
             for col in 0..6 {
                 assert_eq!(
@@ -156,6 +182,7 @@ mod tests {
         // Half-pel in x only: fraction 8/16, integer part at column 5.
         predict(
             &reference,
+            width,
             width,
             height,
             5 * 16 + 8,
@@ -186,6 +213,7 @@ mod tests {
                 let mut dst = vec![0u8; 5 * 5];
                 predict(
                     &reference,
+                    width,
                     width,
                     height,
                     5 * 16 + xfrac,
@@ -219,6 +247,7 @@ mod tests {
         predict(
             &reference,
             width,
+            width,
             height,
             3 * 16 + 8,
             3 * 16,
@@ -229,6 +258,7 @@ mod tests {
         let mut vert = vec![0u8; 4 * 4];
         predict(
             &reference,
+            width,
             width,
             height,
             3 * 16,
@@ -271,6 +301,7 @@ mod tests {
         predict(
             &reference,
             width,
+            width,
             height,
             -50 * 16 + 5,
             -50 * 16 + 5,
@@ -287,6 +318,7 @@ mod tests {
         let mut dst2 = vec![0u8; 4 * 4];
         predict(
             &reference,
+            width,
             width,
             height,
             50 * 16 + 5,
