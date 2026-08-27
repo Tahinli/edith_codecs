@@ -935,9 +935,9 @@ struct At {
 /// (or below its left) are decoded depends only on where the block sits inside
 /// its 64x64 superblock, which is a pinned table per block size.
 #[derive(Clone, Copy)]
-struct Reach {
-    above_right: bool,
-    below_left: bool,
+pub(crate) struct Reach {
+    pub(crate) above_right: bool,
+    pub(crate) below_left: bool,
 }
 
 /// `has_tr_16x16` / `has_tr_32x32` (`recon_intra.rs` in rav1e, `has_tr_*` in
@@ -955,7 +955,7 @@ const HAS_BOTTOM_LEFT: [&[u8]; 2] = [&[84, 16, 84, 0, 84, 16, 84, 0], &[4, 4]];
 impl Reach {
     /// What a block of `side` samples at `(x, y)` may read past its own edges,
     /// in a frame of `width` by `height`.
-    fn of(side: usize, x: usize, y: usize, width: usize, height: usize) -> Self {
+    pub(crate) fn of(side: usize, x: usize, y: usize, width: usize, height: usize) -> Self {
         Self {
             above_right: y > 0 && x + side < width && Self::top_right(side, x, y),
             below_left: x > 0 && y + side < height && Self::bottom_left(side, x, y),
@@ -964,7 +964,7 @@ impl Reach {
 
     /// Neither, which is all a mode that reads no further than its own edges
     /// needs.
-    fn none() -> Self {
+    pub(crate) fn none() -> Self {
         Self {
             above_right: false,
             below_left: false,
