@@ -3460,4 +3460,116 @@ mod tests {
             "no inter frame coded a single inter block -- the search never fired"
         );
     }
+
+    /// A manual perf probe, not a gate: prints where a key frame's and an
+    /// inter frame's time goes, coarse stage by coarse stage, so a perf lane
+    /// measures before it optimizes rather than guessing. Run with
+    /// `cargo test -p ec-av1 --release stage_timing_breakdown -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a perf probe, not a gate"]
+    fn stage_timing_breakdown() {
+        use std::time::Instant;
+
+        for &(width, height) in &[(1920usize, 1080usize), (3840, 2160)] {
+            let picture = test_card(width, height);
+
+            let t = Instant::now();
+            let dc_only = encode_key_frame_with_modes(&picture, 100, 0.5, &[DC_PRED]).unwrap();
+            let dc_only_t = t.elapsed();
+
+            let t = Instant::now();
+            let non_directional =
+                encode_key_frame_with_modes(&picture, 100, 0.5, &NON_DIRECTIONAL).unwrap();
+            let non_directional_t = t.elapsed();
+
+            let t = Instant::now();
+            let all_modes = encode_key_frame(&picture, 100, 0.5).unwrap();
+            let all_modes_t = t.elapsed();
+
+            eprintln!(
+                "\n=== key frame {width}x{height} ===\n\
+                 1 mode  (DC only):        {dc_only_t:>9.2?}  ({} bytes)\n\
+                 7 modes (non-directional): {non_directional_t:>9.2?}  ({} bytes)\n\
+                 13 modes (default search):  {all_modes_t:>9.2?}  ({} bytes)",
+                dc_only.stream.len(),
+                non_directional.stream.len(),
+                all_modes.stream.len(),
+            );
+
+            // One inter frame predicting off the key frame's own
+            // reconstruction, the (256, 256)-padded surface encode_sequence
+            // itself would hand encode_inter_frame.
+            let padded_ref = all_modes.reconstruction.padded_to(SUPERBLOCK);
+            let padded_pic = picture.padded_to(SUPERBLOCK);
+            let t = Instant::now();
+            let inter =
+                encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, (width, height))
+                    .unwrap();
+            let inter_t = t.elapsed();
+            eprintln!(
+                "inter frame vs its own key frame: {inter_t:>9.2?}  ({} bytes, inter share \
+                 {:.2})",
+                inter.stream.len(),
+                inter.inter_block_share
+            );
+        }
+
+        // Isolated per-call cost of the trial pipeline's own stages, at both
+        // transform sizes the search runs, averaged over enough calls to
+        // rise above `Instant::now`'s own noise.
+        for side in [16usize, 32] {
+            const N: u32 = 20_000;
+            let residual: Vec<i32> = (0..side * side)
+                .map(|i| ((i * 37 % 61) as i32) - 30)
+                .collect();
+
+            let t = Instant::now();
+            let mut levels = Vec::new();
+            for _ in 0..N {
+                levels = forward_and_quantize(&residual, side, 8, 100, 0.5);
+            }
+            let forward_t = t.elapsed() / N;
+
+            let t = Instant::now();
+            for _ in 0..N {
+                std::hint::black_box(dequant_and_inverse(&levels, side, 8, 100));
+            }
+            let inverse_t = t.elapsed() / N;
+
+            let set = if side == 32 {
+                crate::cdf_state::TxbSet::Luma32
+            } else {
+                crate::cdf_state::TxbSet::Luma16
+            };
+            let t = Instant::now();
+            for _ in 0..N {
+                std::hint::black_box(crate::tile::coeff_bits(&levels, set));
+            }
+            let entropy_t = t.elapsed() / N;
+
+            let above = vec![128u8; side * 2];
+            let left = vec![128u8; side * 2];
+            let mut prediction = vec![0u8; side * side];
+            let t = Instant::now();
+            for _ in 0..N {
+                crate::intra::predict(
+                    D45_PRED,
+                    Some(&above),
+                    Some(&left),
+                    Some(128),
+                    side,
+                    &mut prediction,
+                );
+            }
+            let predict_t = t.elapsed() / N;
+
+            eprintln!(
+                "\n=== per-call cost at {side}x{side}, averaged over {N} calls ===\n\
+                 predict (1 directional mode): {predict_t:>9.2?}\n\
+                 forward_and_quantize:         {forward_t:>9.2?}\n\
+                 dequant_and_inverse:          {inverse_t:>9.2?}\n\
+                 coeff_bits:                   {entropy_t:>9.2?}"
+            );
+        }
+    }
 }
