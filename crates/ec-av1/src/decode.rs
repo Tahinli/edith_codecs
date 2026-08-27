@@ -45,6 +45,7 @@ const SUB: usize = 16;
 const TX32: usize = 32;
 const TX16: usize = 16;
 const TX8: usize = 8;
+const TX4: usize = 4;
 const DC_PRED: usize = 0;
 /// `V_PRED` (spec 6.10.2): the first directional mode, and so the first that
 /// carries an angle delta — [`crate::tile`]'s own private copy of the same
@@ -325,6 +326,14 @@ struct Neighbours {
     left_mode: Vec<usize>,
     above_side: Vec<usize>,
     left_side: Vec<usize>,
+    /// The same as `above_side`/`left_side`, but kept at the finer mi (4x4)
+    /// granularity `above`/`left` are, rather than [`SUB`] -- [`crate::tile`]'s
+    /// `above_side_mi`/`left_side_mi`: two 8x8 leaves of one straddling 16x16
+    /// block (lane-av1-rect) share a single [`SUB`]-grid cell, so a coarse
+    /// array cannot tell the second leaf's partition symbol that the first
+    /// one was coded at 8x8.
+    above_side_mi: Vec<usize>,
+    left_side_mi: Vec<usize>,
     /// Whether the block above/left of this column/row was coded `skip` --
     /// an inter frame's own `skip` context (spec `SkipContext`), which the
     /// key-frame writer never tracks (its skip context is always zero); a
@@ -352,6 +361,8 @@ impl Neighbours {
             left_mode: vec![DC_PRED; rows],
             above_side: vec![SB; cols],
             left_side: vec![SB; rows],
+            above_side_mi: vec![SB; cols * (SUB / MI)],
+            left_side_mi: vec![SB; rows * (SUB / MI)],
             above_skip: vec![false; cols],
             left_skip: vec![false; rows],
             above_inter: vec![false; cols],
@@ -365,6 +376,7 @@ impl Neighbours {
         self.left.iter_mut().for_each(|l| *l = Default::default());
         self.left_mode.iter_mut().for_each(|m| *m = DC_PRED);
         self.left_side.iter_mut().for_each(|s| *s = SB);
+        self.left_side_mi.iter_mut().for_each(|s| *s = SB);
         self.left_skip.iter_mut().for_each(|s| *s = false);
         self.left_inter.iter_mut().for_each(|i| *i = false);
     }
@@ -381,15 +393,36 @@ impl Neighbours {
         }
     }
 
+    /// The context of a block's partition symbol: delegates to the mi-precise
+    /// reader (same pattern as `around`/`around_mi`) -- `above_side`/
+    /// `left_side` are only ever advanced in whole-[`SUB`] steps by
+    /// [`Self::record`], so a leaf8's `record_mi` (lane-av1-rect) -- which
+    /// only touches the finer mi arrays -- leaves them stale for the *next*
+    /// sibling's own partition symbol.
     fn partition_ctx(&self, at: (usize, usize), side: usize) -> usize {
         let (r, c) = at;
-        2 * usize::from(self.left_side[r] * 2 <= side) + usize::from(self.above_side[c] * 2 <= side)
+        self.partition_ctx_mi((r * (SUB / MI), c * (SUB / MI)), side)
+    }
+
+    /// [`Self::partition_ctx`] at mi granularity, for an 8x8 leaf of a
+    /// straddling 16x16 block: reads the finer `above_side_mi`/`left_side_mi`
+    /// arrays so the second leaf sees the first leaf's own 8x8 side rather
+    /// than the enclosing 16x16 slot's stale, shared state.
+    fn partition_ctx_mi(&self, (mi_r, mi_c): (usize, usize), side: usize) -> usize {
+        2 * usize::from(self.left_side_mi[mi_r] * 2 <= side)
+            + usize::from(self.above_side_mi[mi_c] * 2 <= side)
     }
 
     /// The gathered coded/DC-sign state of the blocks above and to the left
     /// of a block `side` samples across, per plane.
     fn around(&self, (r, c): (usize, usize), side: usize) -> [(bool, bool, i32); 3] {
-        let (mi_r, mi_c, side_mi) = (r * (SUB / MI), c * (SUB / MI), side / MI);
+        self.around_mi((r * (SUB / MI), c * (SUB / MI)), side)
+    }
+
+    /// [`Self::around`] taking the block's position directly in 4x4 mode-info
+    /// units, for the same reason [`Self::record_mi`] does.
+    fn around_mi(&self, (mi_r, mi_c): (usize, usize), side: usize) -> [(bool, bool, i32); 3] {
+        let side_mi = side / MI;
         std::array::from_fn(|plane| {
             let mut above_coded = false;
             let mut left_coded = false;
@@ -414,14 +447,27 @@ impl Neighbours {
     /// not from this block's own side).
     fn record(&mut self, at: (usize, usize), side: usize, mode: usize, grids: &[Vec<i32>; 3]) {
         let (r, c) = at;
-        let states: [Neighbour; 3] = std::array::from_fn(|plane| neighbour_state(&grids[plane]));
         for cell in 0..side / SUB {
             self.above_mode[c + cell] = mode;
             self.left_mode[r + cell] = mode;
             self.above_side[c + cell] = side;
             self.left_side[r + cell] = side;
         }
-        let (mi_r, mi_c, side_mi) = (r * (SUB / MI), c * (SUB / MI), side / MI);
+        self.record_mi((r * (SUB / MI), c * (SUB / MI)), side, grids);
+    }
+
+    /// The coefficient-context half of [`Self::record`], taking the block's
+    /// position directly in 4x4 mode-info units rather than [`SUB`]-grid
+    /// `(r, c)`: an 8x8 leaf under a straddling 16x16 (lane-av1-rect) sits at
+    /// a mi offset [`Self::record`]'s SUB-unit `at` cannot name.
+    fn record_mi(&mut self, at_mi: (usize, usize), side: usize, grids: &[Vec<i32>; 3]) {
+        let (mi_r, mi_c) = at_mi;
+        let states: [Neighbour; 3] = std::array::from_fn(|plane| neighbour_state(&grids[plane]));
+        let side_mi = side / MI;
+        for cell in 0..side_mi {
+            self.left_side_mi[mi_r + cell] = side;
+            self.above_side_mi[mi_c + cell] = side;
+        }
         // A chroma 4x4 unit straddling the true luma edge is still whole in
         // chroma's own halved grid, so libaom rounds the luma bound up to the
         // plane's own 4x4 unit before clamping a subsampled plane
@@ -734,6 +780,112 @@ fn decode_block(
     Ok(())
 }
 
+/// Decodes one 8x8 leaf of a straddling 16x16 block (lane-av1-rect), mirroring
+/// [`crate::tile::write_leaf8`]: its intra-mode context comes from the
+/// *enclosing* 16x16 slot's `above_mode`/`left_mode` (`outer_at`, [`SUB`]-grid),
+/// overridden on whichever axis `prev_leaf` sits along -- the previous leaf's
+/// just-decoded mode, not the enclosing slot's stale one, is the true
+/// neighbour there. `leaf_mi` is this leaf's own position in 4x4 mode-info
+/// units, which is what its coefficient context (finer than [`SUB`]) is read
+/// at. Returns the mode this leaf decoded, for the caller's own
+/// `prev_leaf`/final mode-writeback bookkeeping.
+#[allow(clippy::too_many_arguments)]
+fn decode_leaf8(
+    dec: &mut SymbolDecoder,
+    cdfs: &mut Cdfs,
+    neighbours: &mut Neighbours,
+    outer_at: (usize, usize),
+    leaf_mi: (usize, usize),
+    scans: (&[u16], &[u16]),
+    prev_leaf: Option<((usize, usize), usize)>,
+    y: &mut PlaneBuf,
+    u: &mut PlaneBuf,
+    v: &mut PlaneBuf,
+    base_q_idx: u8,
+) -> Result<usize> {
+    let (r, c) = outer_at;
+    let mut above_mode = neighbours.above_mode[c];
+    let mut left_mode = neighbours.left_mode[r];
+    if let Some(((pr, pc), pmode)) = prev_leaf {
+        if pc == leaf_mi.1 && leaf_mi.0 == pr + 2 {
+            above_mode = pmode;
+        } else if pr == leaf_mi.0 && leaf_mi.1 == pc + 2 {
+            left_mode = pmode;
+        }
+    }
+    // An 8x8 leaf is well within `is_cfl_allowed`'s <=32x32 bound (spec
+    // 5.11.5), so it reads the CFL-allowed `uv_mode_cfl` CDF, like every other
+    // `decode_block` caller at 16x16 and up.
+    let (skip, mode) = read_intra_mode(dec, cdfs, above_mode, left_mode, true)?;
+    let (px, py) = (leaf_mi.1 * MI, leaf_mi.0 * MI);
+    let reach = Reach::of(8, px, py, y.width, y.height);
+    let (cpx, cpy) = (px / 2, py / 2);
+    let (luma_grid, u_grid, v_grid);
+    if skip {
+        y.reconstruct(px, py, 8, mode, reach, &vec![0i32; 64]);
+        u.reconstruct(cpx, cpy, 4, DC_PRED, Reach::none(), &vec![0i32; 16]);
+        v.reconstruct(cpx, cpy, 4, DC_PRED, Reach::none(), &vec![0i32; 16]);
+        luma_grid = vec![0i32; 64];
+        u_grid = vec![0i32; 16];
+        v_grid = vec![0i32; 16];
+    } else {
+        let around = neighbours.around_mi(leaf_mi, 8);
+        luma_grid = read_plane(
+            dec,
+            cdfs,
+            TxbSet::Luma8,
+            scans.0,
+            0,
+            around[0],
+            mode,
+            mode,
+            reach,
+            y,
+            px,
+            py,
+            8,
+            TX8,
+            base_q_idx,
+        )?;
+        u_grid = read_plane(
+            dec,
+            cdfs,
+            TxbSet::Chroma4,
+            scans.1,
+            1,
+            around[1],
+            mode,
+            DC_PRED,
+            Reach::none(),
+            u,
+            cpx,
+            cpy,
+            4,
+            TX4,
+            base_q_idx,
+        )?;
+        v_grid = read_plane(
+            dec,
+            cdfs,
+            TxbSet::Chroma4,
+            scans.1,
+            2,
+            around[2],
+            mode,
+            DC_PRED,
+            Reach::none(),
+            v,
+            cpx,
+            cpy,
+            4,
+            TX4,
+            base_q_idx,
+        )?;
+    }
+    neighbours.record_mi(leaf_mi, 8, &[luma_grid, u_grid, v_grid]);
+    Ok(mode)
+}
+
 /// Decodes the payload [`crate::tile::sb_coeff_key_frame_tile`] writes,
 /// returning the picture it reconstructs to.
 ///
@@ -793,6 +945,7 @@ pub fn decode_key_frame_tile(
     let scan32 = default_scan(TX32);
     let scan16 = default_scan(TX16);
     let scan8 = default_scan(TX8);
+    let scan4 = default_scan(TX4);
 
     let mut cdfs = Cdfs::new(q_ctx_of(base_q_idx));
     let mut dec = SymbolDecoder::new(data);
@@ -918,36 +1071,99 @@ pub fn decode_key_frame_tile(
                                         has_half(sc as u32 * SUB_MI, SUB_MI, mi_cols),
                                         has_half(sr as u32 * SUB_MI, SUB_MI, mi_rows),
                                     );
-                                    if !has_cols16 || !has_rows16 {
-                                        return Err(unsupported(
-                                            "a 16x16 block the true frame edge cuts through (round 2)",
-                                        ));
-                                    }
                                     let at16 = (sr, sc);
                                     let ctx16 = neighbours.partition_ctx(at16, SUB);
-                                    let part16 = dec.symbol(&mut cdfs.partition_w16[ctx16]);
-                                    if part16 != PARTITION_NONE {
+                                    if has_cols16 && has_rows16 {
+                                        let part16 = dec.symbol(&mut cdfs.partition_w16[ctx16]);
+                                        if part16 != PARTITION_NONE {
+                                            return Err(unsupported(
+                                                "a partition below 16x16 (this encoder never writes one)",
+                                            ));
+                                        }
+                                        decode_block(
+                                            &mut dec,
+                                            &mut cdfs,
+                                            &mut neighbours,
+                                            at16,
+                                            SUB,
+                                            TxbSet::Luma16,
+                                            TxbSet::Chroma8,
+                                            TX16,
+                                            TX8,
+                                            (&scan16, &scan8),
+                                            true,
+                                            &mut y,
+                                            &mut u,
+                                            &mut v,
+                                            base_q_idx,
+                                        )?;
+                                        continue;
+                                    }
+                                    // The true edge falls inside this 16x16
+                                    // leaf itself (mod-32==8 target sizes,
+                                    // lane-av1-rect): one axis only -- an 8x8
+                                    // leaf never itself straddles, so the
+                                    // block splits cleanly along whichever
+                                    // axis is short.
+                                    if !has_cols16 && !has_rows16 {
                                         return Err(unsupported(
-                                            "a partition below 16x16 (this encoder never writes one)",
+                                            "a 16x16 block whose true edge cuts through both \
+                                             axes needs a rectangular transform this decoder \
+                                             does not code yet",
                                         ));
                                     }
-                                    decode_block(
-                                        &mut dec,
-                                        &mut cdfs,
-                                        &mut neighbours,
-                                        at16,
-                                        SUB,
-                                        TxbSet::Luma16,
-                                        TxbSet::Chroma8,
-                                        TX16,
-                                        TX8,
-                                        (&scan16, &scan8),
-                                        true,
-                                        &mut y,
-                                        &mut u,
-                                        &mut v,
-                                        base_q_idx,
-                                    )?;
+                                    if has_cols16 {
+                                        dec.symbol_fixed(&gather(
+                                            &cdfs.partition_w16[ctx16],
+                                            VERT_ALIKE,
+                                        ));
+                                    } else {
+                                        dec.symbol_fixed(&gather(
+                                            &cdfs.partition_w16[ctx16],
+                                            HORZ_ALIKE,
+                                        ));
+                                    }
+                                    let (mi_row0, mi_col0) =
+                                        (sr as u32 * SUB_MI, sc as u32 * SUB_MI);
+                                    let leaf_positions: Vec<(u32, u32)> = (0..4)
+                                        .map(|i| (mi_row0 + (i / 2) * 2, mi_col0 + (i % 2) * 2))
+                                        .filter(|&(mr, mc)| mr < mi_rows && mc < mi_cols)
+                                        .collect();
+                                    let mut prev_leaf: Option<((usize, usize), usize)> = None;
+                                    for (mr, mc) in leaf_positions {
+                                        let leaf_mi = (mr as usize, mc as usize);
+                                        let leaf_ctx = neighbours.partition_ctx_mi(leaf_mi, 8);
+                                        let part8 = dec.symbol(&mut cdfs.partition_w8[leaf_ctx]);
+                                        if part8 != PARTITION_NONE {
+                                            return Err(unsupported(
+                                                "a partition below 8x8 (this encoder never writes one)",
+                                            ));
+                                        }
+                                        let leaf_mode = decode_leaf8(
+                                            &mut dec,
+                                            &mut cdfs,
+                                            &mut neighbours,
+                                            at16,
+                                            leaf_mi,
+                                            (&scan8, &scan4),
+                                            prev_leaf,
+                                            &mut y,
+                                            &mut u,
+                                            &mut v,
+                                            base_q_idx,
+                                        )?;
+                                        prev_leaf = Some((leaf_mi, leaf_mode));
+                                    }
+                                    // `record()`'s `above_mode`/`left_mode`
+                                    // write is a no-op at an 8x8 leaf's own
+                                    // side, so force the write once the whole
+                                    // 16x16 slot's leaves are done, from the
+                                    // last leaf (mirrors the writer's r15
+                                    // fix).
+                                    if let Some((_, mode)) = prev_leaf {
+                                        neighbours.above_mode[sc] = mode;
+                                        neighbours.left_mode[sr] = mode;
+                                    }
                                 }
                             }
                             _ => {
@@ -1810,6 +2026,19 @@ mod tests {
         }
     }
 
+    /// mod-32==8 sizes (lane-av1-rect): the true frame edge falls inside a
+    /// 16x16 block itself, forcing the encoder's 8x8-leaf straddle path
+    /// ([`crate::tile::write_leaf8`]) regardless of the RD-cost guard, since
+    /// no whole 16x16/32x32 legally covers the true edge here -- this decoder
+    /// round's leaf8 read path (`decode_leaf8`, gathered `partition_w16` split
+    /// bit, `partition_w8` leaves).
+    #[test]
+    fn leaf8_straddle_sizes_round_trip_bit_exact_against_the_encoder_reconstruction() {
+        for (w, h) in [(40usize, 32usize), (640, 360)] {
+            round_trips(w, h, &crate::intra::KEY_FRAME_MODES);
+        }
+    }
+
     /// A skipped block codes no residual syntax at all (spec 5.11.34):
     /// straight prediction on every plane. The real key-frame writer never
     /// emits `skip = 1` ([`crate::tile::write_intra_mode`] hardcodes it to
@@ -1998,7 +2227,7 @@ mod tests {
             return;
         }
         use crate::encode::encode_key_frame;
-        for &(width, height) in &[(64usize, 64usize), (216, 96)] {
+        for &(width, height) in &[(64usize, 64usize), (216, 96), (40, 32)] {
             let picture = round_trip_test_card(width, height);
             let encoded = encode_key_frame(&picture, 100, 0.5).unwrap();
             let (coded_w, coded_h) = ffprobe_size(&encoded.stream);
