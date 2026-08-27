@@ -1131,9 +1131,10 @@ fn read_inter_plane(
 ///
 /// # Errors
 /// Returns an error when a symbol names anything this decoder does not
-/// reconstruct: a reference other than `LAST_FRAME`, an inter mode other
-/// than `NEARESTMV`/`NEWMV`, or an intra mode/tx-type outside what
-/// [`read_intra_mode`]/[`read_coeffs`] already refuse.
+/// reconstruct: a reference other than `LAST_FRAME`, `GLOBALMV` (round 3;
+/// `NEARESTMV`/`NEARMV`/`NEWMV` are all reconstructed), or an intra
+/// mode/tx-type outside what [`read_intra_mode`]/[`read_coeffs`] already
+/// refuse.
 #[allow(clippy::too_many_arguments)]
 fn decode_inter_block(
     dec: &mut SymbolDecoder,
@@ -1212,13 +1213,29 @@ fn decode_inter_block(
             )
         } else {
             let not_zero = dec.symbol(&mut cdfs.zero_mv[stack.zero_mv_ctx]) == 1;
-            let nearest = dec.symbol(&mut cdfs.ref_mv[stack.ref_mv_ctx]) == 0;
-            if !not_zero || !nearest {
-                return Err(unsupported(
-                    "an inter mode other than NEARESTMV/NEWMV (round 2)",
-                ));
+            if !not_zero {
+                return Err(unsupported("GLOBALMV (round 3)"));
             }
-            (stack.nearest_mv, false)
+            let nearest = dec.symbol(&mut cdfs.ref_mv[stack.ref_mv_ctx]) == 0;
+            let mv = if nearest {
+                stack.nearest_mv
+            } else {
+                // NEARMV (spec 5.11.24's `read_drl_idx`, `RefMvIdx` starting
+                // at 1): read at most two more `drl_mode` bits, one per stack
+                // entry past the second, stopping at the first `0`.
+                // `drl_ctx[idx]` is the context between `entries[idx]` and
+                // `entries[idx + 1]` (`MvStack::drl_ctx`'s own doc), which is
+                // exactly the pair this index is choosing between.
+                let mut idx = 1usize;
+                while idx < 3 && stack.entries.len() > idx + 1 {
+                    if dec.symbol(&mut cdfs.drl_mode[stack.drl_ctx[idx]]) == 0 {
+                        break;
+                    }
+                    idx += 1;
+                }
+                stack.entries.get(idx).map_or(stack.near_mv, |e| e.mv)
+            };
+            (mv, false)
         };
         for dr in 0..bw4 {
             for dc in 0..bw4 {
@@ -2117,6 +2134,191 @@ mod tests {
 
     /// The GOP cross-oracle: ffmpeg decodes the whole sequence the same way
     /// this module does, frame for frame.
+    /// A NEARMV block (`not_new`, `not_zero`, `!nearest`) predicts from the
+    /// MV stack's *second* candidate (`near_mv`), not its first
+    /// (`nearest_mv`) -- a hand-built symbol stream drives
+    /// [`decode_inter_block`] directly, since this crate's own encoder never
+    /// writes NEARMV (round 3: it never chooses the mode).
+    #[test]
+    fn a_nearmv_block_predicts_from_the_stacks_second_candidate() {
+        use crate::msac::SymbolEncoder;
+        use crate::mvstack::{MiGrid, MiInfo, find_mv_stack, single_ref_ctx};
+
+        const LAST_FRAME: i8 = 1;
+        let (mi_cols, mi_rows) = (12u32, 12u32);
+        let side = 16usize; // one 16x16 leaf block
+        let (r, c) = (1usize, 1usize); // `at`, in SUB (16px) units
+        let (mi_row, mi_col) = (r * SUB_MI as usize, c * SUB_MI as usize);
+        let bw4 = side / 4;
+
+        let mut grid = MiGrid::new(mi_cols as usize, mi_rows as usize);
+        let (above_mv, left_mv) = ((4, 4), (8, 8));
+        let neighbour = |mv| MiInfo {
+            is_inter: true,
+            ref_frame: LAST_FRAME,
+            mv,
+            is_new_mv: false,
+            size: 1,
+        };
+        for col in mi_col..mi_col + bw4 {
+            grid.set(mi_row - 1, col, neighbour(above_mv));
+        }
+        for row in mi_row..mi_row + bw4 {
+            grid.set(row, mi_col - 1, neighbour(left_mv));
+        }
+
+        let stack = find_mv_stack(
+            &grid,
+            mi_row,
+            mi_col,
+            bw4,
+            bw4,
+            LAST_FRAME,
+            mi_cols as usize,
+            mi_rows as usize,
+        );
+        // Sanity on the test's own setup, not the code under test: two equal-
+        // weight candidates keep scan order (above, then left -- module doc).
+        assert_eq!(stack.entries.len(), 2);
+        assert_eq!(stack.nearest_mv, above_mv);
+        assert_eq!(stack.near_mv, left_mv);
+
+        let (skip_ctx, ii_ctx, sr_ctx) = (
+            0usize,
+            intra_inter_ctx(true, true, false, false),
+            single_ref_ctx(false),
+        );
+
+        let mut cdfs = Cdfs::new(q_ctx_of(100));
+        let mut enc = SymbolEncoder::new();
+        enc.symbol(1, &mut cdfs.skip[skip_ctx]); // skip
+        enc.symbol(1, &mut cdfs.intra_inter[ii_ctx]); // is_inter
+        enc.symbol(0, &mut cdfs.single_ref[sr_ctx][0]); // LAST_FRAME
+        enc.symbol(0, &mut cdfs.single_ref[sr_ctx][2]);
+        enc.symbol(0, &mut cdfs.single_ref[sr_ctx][3]);
+        enc.symbol(1, &mut cdfs.new_mv[stack.new_mv_ctx]); // not_new
+        enc.symbol(1, &mut cdfs.zero_mv[stack.zero_mv_ctx]); // not_zero
+        enc.symbol(1, &mut cdfs.ref_mv[stack.ref_mv_ctx]); // !nearest -> NEARMV
+        let data = enc.finish();
+
+        let (width, height) = (64usize, 64usize);
+        let ref_pattern: Vec<u8> = (0..width * height).map(|i| (i % 251) as u8).collect();
+        let ref_plane = |scale: usize| PlaneBuf {
+            data: ref_pattern
+                .iter()
+                .step_by(scale.max(1))
+                .take((width / scale) * (height / scale))
+                .copied()
+                .collect(),
+            width: width / scale,
+            height: height / scale,
+            true_width: width / scale,
+            true_height: height / scale,
+        };
+        let ref_y = PlaneBuf {
+            data: ref_pattern.clone(),
+            width,
+            height,
+            true_width: width,
+            true_height: height,
+        };
+        let ref_u = ref_plane(2);
+        let ref_v = ref_plane(2);
+
+        let mut y = PlaneBuf {
+            data: vec![0u8; width * height],
+            width,
+            height,
+            true_width: width,
+            true_height: height,
+        };
+        let mut u = PlaneBuf {
+            data: vec![0u8; (width / 2) * (height / 2)],
+            width: width / 2,
+            height: height / 2,
+            true_width: width / 2,
+            true_height: height / 2,
+        };
+        let mut v = PlaneBuf {
+            data: vec![0u8; (width / 2) * (height / 2)],
+            width: width / 2,
+            height: height / 2,
+            true_width: width / 2,
+            true_height: height / 2,
+        };
+
+        let mut cdfs = Cdfs::new(q_ctx_of(100));
+        let mut dec = SymbolDecoder::new(&data);
+        let mut neighbours = Neighbours::new(3, 3, mi_cols as usize, mi_rows as usize);
+        decode_inter_block(
+            &mut dec,
+            &mut cdfs,
+            &mut neighbours,
+            &mut grid,
+            (r, c),
+            side,
+            mi_cols,
+            mi_rows,
+            &mut y,
+            &mut u,
+            &mut v,
+            &ref_y,
+            &ref_u,
+            &ref_v,
+            100,
+            TxbSet::Luma16,
+            TxbSet::Luma16Inter,
+            TxbSet::Chroma8,
+            TX16,
+            TX8,
+            &[],
+            &[],
+            0,
+        )
+        .unwrap();
+
+        let (px, py) = (c * SUB, r * SUB);
+        let mut want_near = vec![0u8; side * side];
+        crate::mc::predict(
+            &ref_y.data,
+            ref_y.width,
+            ref_y.true_width,
+            ref_y.true_height,
+            mv_to_q4(px, left_mv.1, true),
+            mv_to_q4(py, left_mv.0, true),
+            side,
+            side,
+            &mut want_near,
+        );
+        let mut want_nearest = vec![0u8; side * side];
+        crate::mc::predict(
+            &ref_y.data,
+            ref_y.width,
+            ref_y.true_width,
+            ref_y.true_height,
+            mv_to_q4(px, above_mv.1, true),
+            mv_to_q4(py, above_mv.0, true),
+            side,
+            side,
+            &mut want_nearest,
+        );
+        assert_ne!(
+            want_near, want_nearest,
+            "test setup: the two candidate MVs must predict differently"
+        );
+
+        let mut got = vec![0u8; side * side];
+        for row in 0..side {
+            got[row * side..(row + 1) * side].copy_from_slice(
+                &y.data[(py + row) * y.width + px..(py + row) * y.width + px + side],
+            );
+        }
+        assert_eq!(
+            got, want_near,
+            "NEARMV predicted from the wrong stack entry"
+        );
+    }
+
     #[test]
     fn ffmpeg_and_this_decoder_agree_on_a_gop() {
         if !have_ffmpeg() {
