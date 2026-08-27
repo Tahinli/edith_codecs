@@ -2662,27 +2662,32 @@ fn decode_inter_block(
             )
         } else {
             let not_zero = dec.symbol(&mut cdfs.zero_mv[stack.zero_mv_ctx]) == 1;
-            if !not_zero {
-                return Err(unsupported("GLOBALMV (round 3)"));
-            }
-            let nearest = dec.symbol(&mut cdfs.ref_mv[stack.ref_mv_ctx]) == 0;
-            let mv = if nearest {
-                stack.nearest_mv
+            let mv = if !not_zero {
+                // GLOBALMV: `gm_get_motion_vector` (spec 7.10.2.1) under the
+                // `GmType::IDENTITY` this crate's `decode_stream` requires of
+                // every inter frame's `LAST_FRAME` entry (any other warp
+                // model is refused before the tile decoder is ever called).
+                (0, 0)
             } else {
-                // NEARMV (spec 5.11.24's `read_drl_idx`, `RefMvIdx` starting
-                // at 1): read at most two more `drl_mode` bits, one per stack
-                // entry past the second, stopping at the first `0`.
-                // `drl_ctx[idx]` is the context between `entries[idx]` and
-                // `entries[idx + 1]` (`MvStack::drl_ctx`'s own doc), which is
-                // exactly the pair this index is choosing between.
-                let mut idx = 1usize;
-                while idx < 3 && stack.entries.len() > idx + 1 {
-                    if dec.symbol(&mut cdfs.drl_mode[stack.drl_ctx[idx]]) == 0 {
-                        break;
+                let nearest = dec.symbol(&mut cdfs.ref_mv[stack.ref_mv_ctx]) == 0;
+                if nearest {
+                    stack.nearest_mv
+                } else {
+                    // NEARMV (spec 5.11.24's `read_drl_idx`, `RefMvIdx` starting
+                    // at 1): read at most two more `drl_mode` bits, one per stack
+                    // entry past the second, stopping at the first `0`.
+                    // `drl_ctx[idx]` is the context between `entries[idx]` and
+                    // `entries[idx + 1]` (`MvStack::drl_ctx`'s own doc), which is
+                    // exactly the pair this index is choosing between.
+                    let mut idx = 1usize;
+                    while idx < 3 && stack.entries.len() > idx + 1 {
+                        if dec.symbol(&mut cdfs.drl_mode[stack.drl_ctx[idx]]) == 0 {
+                            break;
+                        }
+                        idx += 1;
                     }
-                    idx += 1;
+                    stack.entries.get(idx).map_or(stack.near_mv, |e| e.mv)
                 }
-                stack.entries.get(idx).map_or(stack.near_mv, |e| e.mv)
             };
             (mv, false)
         };
