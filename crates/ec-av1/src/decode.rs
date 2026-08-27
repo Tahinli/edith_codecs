@@ -2011,6 +2011,371 @@ fn decode_inter_block(
     Ok(())
 }
 
+/// Decodes one 8x8 leaf of a straddling 16x16 inter-frame block
+/// (lane-av1inter8), mirroring [`crate::tile::write_inter_frame_leaf8`]'s
+/// exact symbol order: its own skip flag, intra/inter choice and (when
+/// inter) `NEARESTMV`/`NEWMV` chain against this leaf's own 2x2-mi mv-stack
+/// window, or (when intra) `Y_MODE`, then its own luma and two chroma
+/// transform blocks through [`TxbSet::Luma8Inter`]/[`TxbSet::Chroma4`],
+/// same as [`decode_leaf8`]'s coefficient layer but with
+/// motion-compensated prediction instead of intra prediction when inter.
+/// `outer_at` (in [`SUB`]-grid units) is the enclosing 16x16 slot's
+/// skip/intra-inter context, overridden by `prev_leaf` exactly as
+/// [`decode_leaf8`] overrides mode context: `Neighbours`' above/left arrays
+/// only resolve to [`SUB`] granularity. Hands back this leaf's own skip flag
+/// and intra/inter choice, for the next leaf or the caller's final
+/// write-back.
+#[allow(clippy::too_many_arguments)]
+fn decode_inter_block8(
+    dec: &mut SymbolDecoder,
+    cdfs: &mut Cdfs,
+    neighbours: &mut Neighbours,
+    grid: &mut MiGrid,
+    mi_cols: u32,
+    mi_rows: u32,
+    outer_at: (usize, usize),
+    leaf_mi: (usize, usize),
+    y: &mut PlaneBuf,
+    u: &mut PlaneBuf,
+    v: &mut PlaneBuf,
+    ref_y: &PlaneBuf,
+    ref_u: &PlaneBuf,
+    ref_v: &PlaneBuf,
+    base_q_idx: u8,
+    scan8: &[u16],
+    scan4: &[u16],
+    prev_leaf: Option<((usize, usize), bool, bool)>,
+) -> Result<(bool, bool)> {
+    const LAST_FRAME: i8 = 1;
+    /// `Y_MODE`'s size group (`common_data.h`'s `size_group_lookup[BLOCK_8X8]`).
+    const SIZE_GROUP_8: usize = 1;
+
+    let (px, py) = (leaf_mi.1 * MI, leaf_mi.0 * MI);
+    let (cpx, cpy) = (px / 2, py / 2);
+    const SIDE: usize = 8;
+    const CHROMA_SIDE: usize = 4;
+
+    let (r, c) = outer_at;
+    let mut above_skip = neighbours.above_skip[c];
+    let mut left_skip = neighbours.left_skip[r];
+    let mut above_inter = neighbours.above_inter[c];
+    let mut left_inter = neighbours.left_inter[r];
+    if let Some(((pr, pc), pskip, pinter)) = prev_leaf {
+        if pc == leaf_mi.1 && leaf_mi.0 == pr + 2 {
+            above_skip = pskip;
+            above_inter = pinter;
+        } else if pr == leaf_mi.0 && leaf_mi.1 == pc + 2 {
+            left_skip = pskip;
+            left_inter = pinter;
+        }
+    }
+    let skip_ctx = usize::from(above_skip) + usize::from(left_skip);
+    let skip = dec.symbol(&mut cdfs.skip[skip_ctx]) == 1;
+
+    let (has_above, has_left) = (leaf_mi.0 > 0, leaf_mi.1 > 0);
+    let ii_ctx = intra_inter_ctx(has_above, has_left, above_inter, left_inter);
+    let is_inter = dec.symbol(&mut cdfs.intra_inter[ii_ctx]) == 1;
+
+    let mode_for_tx;
+    let (luma_grid, u_grid, v_grid);
+    if is_inter {
+        let sr_ctx = single_ref_ctx(above_inter || left_inter);
+        let p1 = dec.symbol(&mut cdfs.single_ref[sr_ctx][0]);
+        let p3 = dec.symbol(&mut cdfs.single_ref[sr_ctx][2]);
+        let p4 = dec.symbol(&mut cdfs.single_ref[sr_ctx][3]);
+        if (p1, p3, p4) != (0, 0, 0) {
+            return Err(unsupported(
+                "a reference frame other than LAST_FRAME (round 2)",
+            ));
+        }
+
+        let (mi_row, mi_col) = leaf_mi;
+        let stack = find_mv_stack(
+            grid,
+            mi_row,
+            mi_col,
+            2,
+            2,
+            LAST_FRAME,
+            mi_cols as usize,
+            mi_rows as usize,
+        );
+
+        let not_new = dec.symbol(&mut cdfs.new_mv[stack.new_mv_ctx]) == 1;
+        let (mv, is_new_mv) = if !not_new {
+            if stack.entries.len() > 1 {
+                dec.symbol(&mut cdfs.drl_mode[stack.drl_ctx[0]]);
+            }
+            (
+                read_mv(dec, &mut cdfs.mv_comp, &mut cdfs.mv_joint, stack.pred_mv),
+                true,
+            )
+        } else {
+            let not_zero = dec.symbol(&mut cdfs.zero_mv[stack.zero_mv_ctx]) == 1;
+            if !not_zero {
+                return Err(unsupported("GLOBALMV (round 3)"));
+            }
+            let nearest = dec.symbol(&mut cdfs.ref_mv[stack.ref_mv_ctx]) == 0;
+            let mv = if nearest {
+                stack.nearest_mv
+            } else {
+                let mut idx = 1usize;
+                while idx < 3 && stack.entries.len() > idx + 1 {
+                    if dec.symbol(&mut cdfs.drl_mode[stack.drl_ctx[idx]]) == 0 {
+                        break;
+                    }
+                    idx += 1;
+                }
+                stack.entries.get(idx).map_or(stack.near_mv, |e| e.mv)
+            };
+            (mv, false)
+        };
+        for dr in 0..2 {
+            for dc in 0..2 {
+                grid.set(
+                    mi_row + dr,
+                    mi_col + dc,
+                    MiInfo {
+                        is_inter: true,
+                        ref_frame: LAST_FRAME,
+                        mv,
+                        is_new_mv,
+                        size: 2,
+                    },
+                );
+            }
+        }
+        mode_for_tx = 0;
+
+        let mut pred_y = vec![0u8; SIDE * SIDE];
+        mc::predict(
+            &ref_y.data,
+            ref_y.width,
+            ref_y.true_width,
+            ref_y.true_height,
+            mv_to_q4(px, mv.1, true),
+            mv_to_q4(py, mv.0, true),
+            SIDE,
+            SIDE,
+            &mut pred_y,
+        );
+        let mut pred_u = vec![0u8; CHROMA_SIDE * CHROMA_SIDE];
+        mc::predict(
+            &ref_u.data,
+            ref_u.width,
+            ref_u.true_width,
+            ref_u.true_height,
+            mv_to_q4(cpx, mv.1, false),
+            mv_to_q4(cpy, mv.0, false),
+            CHROMA_SIDE,
+            CHROMA_SIDE,
+            &mut pred_u,
+        );
+        let mut pred_v = vec![0u8; CHROMA_SIDE * CHROMA_SIDE];
+        mc::predict(
+            &ref_v.data,
+            ref_v.width,
+            ref_v.true_width,
+            ref_v.true_height,
+            mv_to_q4(cpx, mv.1, false),
+            mv_to_q4(cpy, mv.0, false),
+            CHROMA_SIDE,
+            CHROMA_SIDE,
+            &mut pred_v,
+        );
+
+        if skip {
+            y.reconstruct_mc(px, py, SIDE, &pred_y, &vec![0i32; SIDE * SIDE]);
+            u.reconstruct_mc(
+                cpx,
+                cpy,
+                CHROMA_SIDE,
+                &pred_u,
+                &vec![0i32; CHROMA_SIDE * CHROMA_SIDE],
+            );
+            v.reconstruct_mc(
+                cpx,
+                cpy,
+                CHROMA_SIDE,
+                &pred_v,
+                &vec![0i32; CHROMA_SIDE * CHROMA_SIDE],
+            );
+            luma_grid = vec![0i32; SIDE * SIDE];
+            u_grid = vec![0i32; CHROMA_SIDE * CHROMA_SIDE];
+            v_grid = vec![0i32; CHROMA_SIDE * CHROMA_SIDE];
+        } else {
+            let around = neighbours.around_mi(leaf_mi, 8);
+            luma_grid = read_inter_plane(
+                dec,
+                cdfs,
+                TxbSet::Luma8Inter,
+                scan8,
+                0,
+                around[0],
+                mode_for_tx,
+                y,
+                px,
+                py,
+                SIDE,
+                base_q_idx,
+                &pred_y,
+            )?;
+            u_grid = read_inter_plane(
+                dec,
+                cdfs,
+                TxbSet::Chroma4,
+                scan4,
+                1,
+                around[1],
+                mode_for_tx,
+                u,
+                cpx,
+                cpy,
+                CHROMA_SIDE,
+                base_q_idx,
+                &pred_u,
+            )?;
+            v_grid = read_inter_plane(
+                dec,
+                cdfs,
+                TxbSet::Chroma4,
+                scan4,
+                2,
+                around[2],
+                mode_for_tx,
+                v,
+                cpx,
+                cpy,
+                CHROMA_SIDE,
+                base_q_idx,
+                &pred_v,
+            )?;
+        }
+    } else {
+        let mode = dec.symbol(&mut cdfs.y_mode[SIZE_GROUP_8]);
+        if mode >= 13 {
+            return Err(unsupported(
+                "an intra mode this decoder does not code (round 2)",
+            ));
+        }
+        if (V_PRED..=D67_PRED).contains(&mode) {
+            let angle = dec.symbol(&mut cdfs.angle_delta[mode - V_PRED]);
+            if angle != ANGLE_DELTA_ZERO {
+                return Err(unsupported(
+                    "a nonzero angle delta (this encoder never writes one)",
+                ));
+            }
+        }
+        let uv_mode = dec.symbol(&mut cdfs.uv_mode_cfl[mode]);
+        if uv_mode != DC_PRED {
+            return Err(unsupported(
+                "a non-DC chroma mode on an 8x8 inter-frame leaf (this encoder never writes one)",
+            ));
+        }
+        mode_for_tx = mode;
+        let (mi_row, mi_col) = leaf_mi;
+        for dr in 0..2 {
+            for dc in 0..2 {
+                grid.set(
+                    mi_row + dr,
+                    mi_col + dc,
+                    MiInfo {
+                        is_inter: false,
+                        ref_frame: -1,
+                        mv: (0, 0),
+                        is_new_mv: false,
+                        size: 2,
+                    },
+                );
+            }
+        }
+
+        let reach = Reach::of(SIDE, px, py, y.width, y.height);
+        if skip {
+            y.reconstruct(px, py, SIDE, mode, reach, &vec![0i32; SIDE * SIDE], None);
+            u.reconstruct(
+                cpx,
+                cpy,
+                CHROMA_SIDE,
+                DC_PRED,
+                Reach::none(),
+                &vec![0i32; CHROMA_SIDE * CHROMA_SIDE],
+                None,
+            );
+            v.reconstruct(
+                cpx,
+                cpy,
+                CHROMA_SIDE,
+                DC_PRED,
+                Reach::none(),
+                &vec![0i32; CHROMA_SIDE * CHROMA_SIDE],
+                None,
+            );
+            luma_grid = vec![0i32; SIDE * SIDE];
+            u_grid = vec![0i32; CHROMA_SIDE * CHROMA_SIDE];
+            v_grid = vec![0i32; CHROMA_SIDE * CHROMA_SIDE];
+        } else {
+            let around = neighbours.around_mi(leaf_mi, 8);
+            luma_grid = read_plane(
+                dec,
+                cdfs,
+                TxbSet::Luma8,
+                scan8,
+                0,
+                around[0],
+                mode,
+                mode,
+                reach,
+                y,
+                px,
+                py,
+                SIDE,
+                TX8,
+                base_q_idx,
+                None,
+            )?;
+            u_grid = read_plane(
+                dec,
+                cdfs,
+                TxbSet::Chroma4,
+                scan4,
+                1,
+                around[1],
+                mode,
+                DC_PRED,
+                Reach::none(),
+                u,
+                cpx,
+                cpy,
+                CHROMA_SIDE,
+                TX4,
+                base_q_idx,
+                None,
+            )?;
+            v_grid = read_plane(
+                dec,
+                cdfs,
+                TxbSet::Chroma4,
+                scan4,
+                2,
+                around[2],
+                mode,
+                DC_PRED,
+                Reach::none(),
+                v,
+                cpx,
+                cpy,
+                CHROMA_SIDE,
+                TX4,
+                base_q_idx,
+                None,
+            )?;
+        }
+    }
+    neighbours.record_mi(leaf_mi, 8, &[luma_grid, u_grid, v_grid]);
+    Ok((skip, is_inter))
+}
+
 /// Decodes the payload [`crate::tile::sb_coeff_inter_frame_tile`] writes,
 /// against `reference` (the previous frame's own decoded picture, at this
 /// frame's true size -- a decoder's single-slot DPB, matching what this
@@ -2093,6 +2458,7 @@ pub fn decode_inter_frame_tile(
     let scan32 = default_scan(TX32);
     let scan16 = default_scan(TX16);
     let scan8 = default_scan(TX8);
+    let scan4 = default_scan(TX4);
 
     let mut cdfs = Cdfs::new(q_ctx_of(base_q_idx));
     let mut dec = SymbolDecoder::new(data);
@@ -2189,44 +2555,101 @@ pub fn decode_inter_frame_tile(
                                 has_half(sc as u32 * SUB_MI, SUB_MI, mi_cols),
                                 has_half(sr as u32 * SUB_MI, SUB_MI, mi_rows),
                             );
-                            if !has_cols16 || !has_rows16 {
+                            if !has_cols16 && !has_rows16 {
                                 return Err(unsupported(
-                                    "a 16x16 inter block the true frame edge cuts through (round 2)",
+                                    "a 16x16 inter block whose true edge cuts through both \
+                                     axes needs a rectangular transform this decoder does \
+                                     not code yet",
                                 ));
                             }
                             let at16 = (sr, sc);
-                            let ctx16 = neighbours.partition_ctx(at16, SUB);
-                            let part16 = dec.symbol(&mut cdfs.partition_w16[ctx16]);
-                            if part16 != PARTITION_NONE {
-                                return Err(unsupported(
-                                    "a partition below 16x16 (this encoder never writes one)",
-                                ));
+                            if has_cols16 && has_rows16 {
+                                let ctx16 = neighbours.partition_ctx(at16, SUB);
+                                let part16 = dec.symbol(&mut cdfs.partition_w16[ctx16]);
+                                if part16 != PARTITION_NONE {
+                                    return Err(unsupported(
+                                        "a partition below 16x16 (this encoder never writes one)",
+                                    ));
+                                }
+                                decode_inter_block(
+                                    &mut dec,
+                                    &mut cdfs,
+                                    &mut neighbours,
+                                    &mut grid,
+                                    at16,
+                                    SUB,
+                                    mi_cols,
+                                    mi_rows,
+                                    &mut y,
+                                    &mut u,
+                                    &mut v,
+                                    &ref_y,
+                                    &ref_u,
+                                    &ref_v,
+                                    base_q_idx,
+                                    TxbSet::Luma16,
+                                    TxbSet::Luma16Inter,
+                                    TxbSet::Chroma8,
+                                    TX16,
+                                    TX8,
+                                    &scan16,
+                                    &scan8,
+                                    2,
+                                )?;
+                            } else {
+                                let ctx16 = neighbours.partition_ctx(at16, SUB);
+                                if has_cols16 {
+                                    dec.symbol_fixed(&gather(
+                                        &cdfs.partition_w16[ctx16],
+                                        VERT_ALIKE,
+                                    ));
+                                } else {
+                                    dec.symbol_fixed(&gather(
+                                        &cdfs.partition_w16[ctx16],
+                                        HORZ_ALIKE,
+                                    ));
+                                }
+                                let (mi_row0, mi_col0) = (sr as u32 * SUB_MI, sc as u32 * SUB_MI);
+                                let leaf_positions: Vec<(u32, u32)> = (0..4)
+                                    .map(|i| (mi_row0 + (i / 2) * 2, mi_col0 + (i % 2) * 2))
+                                    .filter(|&(mr, mc)| mr < mi_rows && mc < mi_cols)
+                                    .collect();
+                                let mut prev_leaf: Option<((usize, usize), bool, bool)> = None;
+                                for (mr, mc) in leaf_positions {
+                                    let leaf_mi = (mr as usize, mc as usize);
+                                    let leaf_ctx = neighbours.partition_ctx_mi(leaf_mi, 8);
+                                    let part8 = dec.symbol(&mut cdfs.partition_w8[leaf_ctx]);
+                                    if part8 != PARTITION_NONE {
+                                        return Err(unsupported(
+                                            "a partition below 8x8 (this encoder never writes one)",
+                                        ));
+                                    }
+                                    let (skip, is_inter) = decode_inter_block8(
+                                        &mut dec,
+                                        &mut cdfs,
+                                        &mut neighbours,
+                                        &mut grid,
+                                        mi_cols,
+                                        mi_rows,
+                                        at16,
+                                        leaf_mi,
+                                        &mut y,
+                                        &mut u,
+                                        &mut v,
+                                        &ref_y,
+                                        &ref_u,
+                                        &ref_v,
+                                        base_q_idx,
+                                        &scan8,
+                                        &scan4,
+                                        prev_leaf,
+                                    )?;
+                                    prev_leaf = Some((leaf_mi, skip, is_inter));
+                                }
+                                if let Some((_, skip, is_inter)) = prev_leaf {
+                                    neighbours.record_inter(at16, SUB, skip, is_inter);
+                                }
                             }
-                            decode_inter_block(
-                                &mut dec,
-                                &mut cdfs,
-                                &mut neighbours,
-                                &mut grid,
-                                at16,
-                                SUB,
-                                mi_cols,
-                                mi_rows,
-                                &mut y,
-                                &mut u,
-                                &mut v,
-                                &ref_y,
-                                &ref_u,
-                                &ref_v,
-                                base_q_idx,
-                                TxbSet::Luma16,
-                                TxbSet::Luma16Inter,
-                                TxbSet::Chroma8,
-                                TX16,
-                                TX8,
-                                &scan16,
-                                &scan8,
-                                2,
-                            )?;
                         }
                     }
                     _ => {
