@@ -578,8 +578,12 @@ impl Plane<'_> {
                         - i32::from(prediction[row * side + col]);
             }
         }
+        #[cfg(test)]
+        let t = std::time::Instant::now();
         let levels = forward_and_quantize(&residual, side, 8, i32::from(base_q_idx), deadzone);
         let coded = dequant_and_inverse(&levels, side, 8, i32::from(base_q_idx));
+        #[cfg(test)]
+        stage_add(2, t.elapsed());
 
         let mut reconstruction = vec![0u8; side * side];
         let mut sse = 0.0;
@@ -597,6 +601,8 @@ impl Plane<'_> {
         // What the levels cost is priced through the same CDFs the tile writer
         // will code them with, so the search ranks modes -- and the partition
         // trial ranks trees -- by the bits they actually spend.
+        #[cfg(test)]
+        let t = std::time::Instant::now();
         let bits = if cfg!(test) && std::env::var_os("EC_AV1_ESTIMATE").is_some() {
             // What the search used before it could price a block exactly: a
             // level costs its magnitude's width plus a sign and a run. Kept
@@ -610,6 +616,8 @@ impl Plane<'_> {
         } else {
             crate::tile::coeff_bits(&levels, at.set)
         };
+        #[cfg(test)]
+        stage_add(3, t.elapsed());
         Trial {
             levels,
             reconstruction,
@@ -662,8 +670,12 @@ impl Plane<'_> {
                         - i32::from(prediction[row * side + col]);
             }
         }
+        #[cfg(test)]
+        let t = std::time::Instant::now();
         let levels = forward_and_quantize(&residual, side, 8, i32::from(base_q_idx), deadzone);
         let coded = dequant_and_inverse(&levels, side, 8, i32::from(base_q_idx));
+        #[cfg(test)]
+        stage_add(2, t.elapsed());
         let mut reconstruction = vec![0u8; side * side];
         let mut sse = 0.0;
         for row in 0..side {
@@ -677,6 +689,8 @@ impl Plane<'_> {
                 sse += error * error;
             }
         }
+        #[cfg(test)]
+        let t = std::time::Instant::now();
         let bits = if cfg!(test) && std::env::var_os("EC_AV1_ESTIMATE").is_some() {
             levels
                 .iter()
@@ -686,6 +700,8 @@ impl Plane<'_> {
         } else {
             crate::tile::coeff_bits(&levels, set)
         };
+        #[cfg(test)]
+        stage_add(3, t.elapsed());
         Trial {
             levels,
             reconstruction,
@@ -1123,7 +1139,44 @@ fn set_test_top_k_override(value: Option<usize>) {
 /// lever. Set from the sweep in the lane report if the quality gate clears it.
 const PRUNE_TOP_K: Option<usize> = None;
 
+/// Per-thread nanosecond counters `stage_timing_breakdown_inter` (and
+/// [`crate::mc::predict`], through [`stage_add`]) accumulate into, so an
+/// inter frame's cost can be attributed to a bucket without changing what
+/// the search actually does. Index: 0 = whole-call time inside
+/// [`motion::search`] (includes bucket 1's time, run from inside it), 1 =
+/// [`crate::mc::predict`] (every call, from the motion search's own
+/// candidates and from a committed inter block's final prediction alike),
+/// 2 = `forward_and_quantize` + `dequant_and_inverse`, 3 = `coeff_bits`.
+#[cfg(test)]
+thread_local! {
+    static STAGE_NS: [std::cell::Cell<u64>; 4] = [
+        std::cell::Cell::new(0),
+        std::cell::Cell::new(0),
+        std::cell::Cell::new(0),
+        std::cell::Cell::new(0),
+    ];
+}
+
+#[cfg(test)]
+pub(crate) fn stage_add(bucket: usize, dur: std::time::Duration) {
+    STAGE_NS.with(|c| c[bucket].set(c[bucket].get() + dur.as_nanos() as u64));
+}
+
+#[cfg(test)]
+fn stage_reset() {
+    STAGE_NS.with(|c| c.iter().for_each(|cell| cell.set(0)));
+}
+
+#[cfg(test)]
+fn stage_read() -> [std::time::Duration; 4] {
+    STAGE_NS.with(|c| {
+        c.each_ref()
+            .map(|cell| std::time::Duration::from_nanos(cell.get()))
+    })
+}
+
 /// One mode's coding of one block, before it is committed.
+#[derive(Clone)]
 struct Trial {
     levels: Vec<i32>,
     reconstruction: Vec<u8>,
@@ -1669,6 +1722,39 @@ fn search_inter_block(
         }
     };
 
+    // The chroma trial an intra candidate prices does not depend on `mode`
+    // at all -- both planes always code `DC_PRED` here (a coding choice this
+    // search inherited, not this loop's to second-guess) at the same `reach:
+    // Reach::none()` -- so it is the same call with the same inputs on every
+    // one of the thirteen iterations below; run it once and reuse the result
+    // rather than repeat an already-priced transform/quantize/entropy call
+    // twelve times for nothing (bit-identical: the value each iteration
+    // reads back is exactly what it used to recompute).
+    let u_trial = chroma[0].trial(
+        At {
+            x: x / 2,
+            y: y / 2,
+            side: BLOCK / 2,
+            reach: Reach::none(),
+            set: chroma_set,
+        },
+        DC_PRED,
+        search.base_q_idx,
+        search.deadzone,
+    );
+    let v_trial = chroma[1].trial(
+        At {
+            x: x / 2,
+            y: y / 2,
+            side: BLOCK / 2,
+            reach: Reach::none(),
+            set: chroma_set,
+        },
+        DC_PRED,
+        search.base_q_idx,
+        search.deadzone,
+    );
+
     for &mode in search.modes {
         let luma_trial = luma.trial(
             At {
@@ -1682,30 +1768,8 @@ fn search_inter_block(
             search.base_q_idx,
             search.deadzone,
         );
-        let u = chroma[0].trial(
-            At {
-                x: x / 2,
-                y: y / 2,
-                side: BLOCK / 2,
-                reach: Reach::none(),
-                set: chroma_set,
-            },
-            DC_PRED,
-            search.base_q_idx,
-            search.deadzone,
-        );
-        let v = chroma[1].trial(
-            At {
-                x: x / 2,
-                y: y / 2,
-                side: BLOCK / 2,
-                reach: Reach::none(),
-                set: chroma_set,
-            },
-            DC_PRED,
-            search.base_q_idx,
-            search.deadzone,
-        );
+        let u = u_trial.clone();
+        let v = v_trial.clone();
         let cost = luma_trial.sse
             + u.sse
             + v.sse
@@ -1843,6 +1907,8 @@ fn search_inter_block(
     }
 
     let source_block = luma.source_block(x, y, BLOCK);
+    #[cfg(test)]
+    let t = std::time::Instant::now();
     let found = motion::search(
         ref_luma.0,
         ref_luma.1,
@@ -1856,6 +1922,8 @@ fn search_inter_block(
         stack.pred_mv,
         search.lambda,
     );
+    #[cfg(test)]
+    stage_add(0, t.elapsed());
     let mv = round_to_valid_mv(found.mv, stack.pred_mv);
     if let Some(mv_bits) = mv_residual_bits(mv, stack.pred_mv) {
         let luma_trial = mc_trial(
@@ -3682,6 +3750,54 @@ mod tests {
                  coeff_bits:                   {entropy_t:>9.2?}"
             );
         }
+    }
+
+    /// Breaks one inter frame's own cost into the four [`STAGE_NS`] buckets
+    /// (motion search, [`crate::mc::predict`], transform+quantize,
+    /// `coeff_bits`), plus what is left over once those are subtracted --
+    /// the thirteen-mode intra-candidate loop `search_inter_block` still
+    /// runs on every inter block (its own transform/quant/entropy calls are
+    /// already inside buckets 2/3, so "left over" here is everything NOT
+    /// timed: `crate::intra::predict` for those 13 modes, RD bookkeeping,
+    /// symbol-cost lookups outside `coeff_bits`).
+    ///
+    /// `cargo test -p ec-av1 --release stage_timing_breakdown_inter -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a perf probe, not a gate"]
+    fn stage_timing_breakdown_inter() {
+        use std::time::Instant;
+
+        let (width, height) = (1280usize, 720);
+        let picture = test_card(width, height);
+        let key = encode_key_frame(&picture, 100, 0.5).unwrap();
+        let padded_ref = key.reconstruction.padded_to(SUPERBLOCK);
+        let padded_pic = picture.padded_to(SUPERBLOCK);
+
+        stage_reset();
+        let t = Instant::now();
+        let inter =
+            encode_inter_frame(&padded_pic, &padded_ref, 100, 0.5, 1, (width, height)).unwrap();
+        let total_t = t.elapsed();
+        let [motion_search, interpolation, transform_quant, entropy] = stage_read();
+        let accounted = motion_search + transform_quant + entropy;
+        // motion_search already contains interpolation's own time (every
+        // candidate the search costs calls crate::mc::predict), so it is not
+        // added again here -- interpolation is reported alongside as "of
+        // which interpolation", not as a fifth additive bucket.
+        let other = total_t.saturating_sub(accounted);
+
+        eprintln!(
+            "\n=== inter frame {width}x{height}, one frame ===\n\
+             total:                          {total_t:>9.2?}  ({} bytes)\n\
+             motion search (NEWMV):          {motion_search:>9.2?}  (of which interpolation \
+             {interpolation:>9.2?})\n\
+             transform + quantize:           {transform_quant:>9.2?}\n\
+             coeff_bits (entropy pricing):   {entropy:>9.2?}\n\
+             everything else (13-mode intra  {other:>9.2?}\n\
+             candidate loop's own predict/bookkeeping, NEARESTMV's own \
+             predict, RD glue):",
+            inter.stream.len(),
+        );
     }
 
     /// The quality gate [`Search::top_k`]'s lever lives or dies by: three real
