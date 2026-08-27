@@ -2682,7 +2682,15 @@ mod tests {
     /// frame size an AV1 decoder allocates, not necessarily the render size
     /// (see [`a_frame_round_trips_at_its_own_size`]).
     fn ffprobe_size(stream: &[u8]) -> (u32, u32) {
-        let path = std::env::temp_dir().join(format!("ec-av1-probe-{}.obu", std::process::id()));
+        // Distinct per call, not per process: the test binary runs callers on
+        // parallel threads, and a shared name lets one test's cleanup delete
+        // the stream another test's ffprobe is still reading.
+        static PROBE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "ec-av1-probe-{}-{}.obu",
+            std::process::id(),
+            PROBE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         let _ = std::fs::remove_file(&path);
         std::fs::write(&path, stream).expect("writing the probe stream");
         let out = Command::new("ffprobe")
