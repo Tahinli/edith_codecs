@@ -184,6 +184,13 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         let enable_filter_intra = parser
             .sequence_header()
             .is_some_and(|seq| seq.enable_filter_intra);
+        let enable_dual_filter = parser
+            .sequence_header()
+            .is_some_and(|seq| seq.enable_dual_filter);
+        let interp_fixed = match header.interpolation_filter {
+            ec_av1_syntax::InterpolationFilter::Switchable => None,
+            fixed => Some(crate::mc::InterpFilterKind::from_header(fixed)),
+        };
 
         // Spec 7.20 `load_cdfs`: a frame naming a `primary_ref_frame` resumes
         // from that reference slot's saved CDF state instead of the spec 8.4
@@ -237,6 +244,8 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 &header.loop_filter,
                 initial_cdfs,
                 header.allow_high_precision_mv,
+                interp_fixed,
+                enable_dual_filter,
             )?
         };
         // Spec 7.20: `disable_frame_end_update_cdf` stores the frame's
@@ -1487,6 +1496,7 @@ mod tests {
                 let obu = p.parse_obu(&stream[pos..]).expect("parse");
                 pos += obu.total_size;
                 if let ObuKind::Frame(header, _) = obu.kind {
+                    eprintln!("interpolation_filter: {:?}", header.interpolation_filter);
                     eprintln!("cdef: {:?}", header.cdef);
                     eprintln!("quantization: {:?}", header.quantization);
                     eprintln!(
@@ -1529,17 +1539,19 @@ mod tests {
             ] {
                 let mut first = None;
                 let mut count = 0;
+                let mut worst = 0i32;
                 for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
                     if x != y {
                         count += 1;
                         if first.is_none() {
                             first = Some(i);
                         }
+                        worst = worst.max((*x as i32 - *y as i32).abs());
                     }
                 }
                 if let Some(i) = first {
                     eprintln!(
-                        "frame {f} plane {plane_name}: {count} mismatches, first at offset {i} (row {}, col {}) ours={} theirs={}",
+                        "frame {f} plane {plane_name}: {count} mismatches (worst delta {worst}), first at offset {i} (row {}, col {}) ours={} theirs={}",
                         i / w,
                         i % w,
                         a[i],
