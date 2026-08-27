@@ -1337,7 +1337,6 @@ fn write_block(
 /// in 4x4 mode-info units, which is what its coefficient context (finer than
 /// [`SUB`]) is kept and read at.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn write_leaf8(
     enc: &mut SymbolEncoder,
     cdfs: &mut Cdfs,
@@ -1363,7 +1362,14 @@ fn write_leaf8(
             left_mode = pmode;
         }
     }
-    let mode = write_intra_mode(enc, cdfs, block, above_mode, left_mode, false);
+    // An 8x8 leaf is well within `is_cfl_allowed`'s <=32x32 bound (spec
+    // 5.11.5), so it reads the CFL-allowed `uv_mode_cfl` CDF -- like every
+    // other `write_block` caller at 16x16 and up -- not the narrower
+    // no-CFL one: r12 lane-av1-rect, this leaf's own `cfl: false` was the
+    // true first divergence (a differently-sized alphabet under the same
+    // DC_PRED decision desyncs the coder even though the decoded mode is
+    // unchanged).
+    let mode = write_intra_mode(enc, cdfs, block, above_mode, left_mode, true);
     let planes = [TxbSet::Luma8, TxbSet::Chroma4, TxbSet::Chroma4];
     write_block_planes(
         enc,
@@ -1375,6 +1381,14 @@ fn write_leaf8(
         mode,
     );
     neighbours.record_mi(leaf_mi, 8, grids);
+    // `record()`'s `above_mode`/`left_mode` write is a no-op at this side
+    // (`side / SUB == 0` for an 8x8 leaf), so the next 16x16 quadrant that
+    // reads this outer cell -- one straddling quadrant stacked above/left of
+    // another, never touched by `prev_leaf`'s same-call override -- would
+    // otherwise see whatever stale mode sat there before this leaf: force
+    // the write here instead (r12 lane-av1-rect, leaf(2,8)'s mode desync).
+    neighbours.above_mode[c] = mode;
+    neighbours.left_mode[r] = mode;
     mode
 }
 
