@@ -260,6 +260,15 @@ pub(crate) struct Cdfs {
     pub filter_intra: [[u16; 3]; 4],
     /// Which `FILTER_INTRA_MODES` entry a `use_filter_intra` block picks.
     pub filter_intra_mode: [u16; 6],
+    /// `TxMode::Select`'s `tx_depth` flag at an 8x8 block, by `tx_size_context`
+    /// (0..=2) -- see [`cdf::TX_SIZE_CAT0`].
+    pub tx_size_cat0: [[u16; 3]; 3],
+    /// `tx_depth` at a 16x16 block -- see [`cdf::TX_SIZE_CAT1`].
+    pub tx_size_cat1: [[u16; 4]; 3],
+    /// `tx_depth` at a 32x32 block -- see [`cdf::TX_SIZE_CAT2`].
+    pub tx_size_cat2: [[u16; 4]; 3],
+    /// `tx_depth` at a 64x64 block -- see [`cdf::TX_SIZE_CAT3`].
+    pub tx_size_cat3: [[u16; 4]; 3],
 }
 
 /// One motion vector component's adapting state (spec 9.4's `Default_Mv_*`,
@@ -434,6 +443,10 @@ impl Cdfs {
             .for_each(MvComponentCdfs::reset_counts);
         reset2(&mut self.filter_intra);
         reset1(&mut self.filter_intra_mode);
+        reset2(&mut self.tx_size_cat0);
+        reset2(&mut self.tx_size_cat1);
+        reset2(&mut self.tx_size_cat2);
+        reset2(&mut self.tx_size_cat3);
     }
 
     /// The defaults a key frame starts from (spec 8.4, `init_coeff_cdfs` and
@@ -793,6 +806,10 @@ impl Cdfs {
             mv_comp: [MvComponentCdfs::new(), MvComponentCdfs::new()],
             filter_intra: cdf::FILTER_INTRA,
             filter_intra_mode: cdf::FILTER_INTRA_MODE,
+            tx_size_cat0: cdf::TX_SIZE_CAT0,
+            tx_size_cat1: cdf::TX_SIZE_CAT1,
+            tx_size_cat2: cdf::TX_SIZE_CAT2,
+            tx_size_cat3: cdf::TX_SIZE_CAT3,
         }
     }
 
