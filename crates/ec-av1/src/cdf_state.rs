@@ -98,6 +98,10 @@ pub(crate) struct Cdfs {
     pub uv_mode_no_cfl: [[u16; 14]; 13],
     /// The chroma mode of a block that is offered it.
     pub uv_mode_cfl: [[u16; 15]; 13],
+    /// The joint sign of a `UV_CFL_PRED` block's U/V alpha.
+    pub cfl_sign: [u16; 9],
+    /// A `UV_CFL_PRED` block's per-plane alpha magnitude, by joint-sign context.
+    pub cfl_alpha: [[u16; 17]; 6],
     /// The angle a directional mode is nudged by.
     pub angle_delta: [[u16; 8]; 8],
     /// The one-context all-zero flag of a 16x16 luma transform.
@@ -297,6 +301,8 @@ impl Cdfs {
             kf_y_mode: cdf::KF_Y_MODE,
             uv_mode_no_cfl: cdf::UV_MODE_NO_CFL,
             uv_mode_cfl: cdf::UV_MODE_CFL,
+            cfl_sign: cdf::CFL_SIGN,
+            cfl_alpha: cdf::CFL_ALPHA,
             angle_delta: cdf::ANGLE_DELTA,
             txb_skip_luma_16: [pick(
                 q_ctx,
