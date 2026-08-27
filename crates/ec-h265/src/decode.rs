@@ -101,8 +101,15 @@ fn decode_i_slice(
     header: &SliceHeader,
     slice_data: &[u8],
 ) -> Result<DecodedPicture> {
-    let width = sps.pic_width_in_ctbs() as usize * sps.ctb_size() as usize;
-    let height = sps.pic_height_in_ctbs() as usize * sps.ctb_size() as usize;
+    // The coded picture, not the CTB-grid-rounded size: HEVC's last CTU in a
+    // row/column is legally partial (7.3.8.4's boundary-forced split exists
+    // precisely for this), and the encoder's own boundary checks are against
+    // `pic_width_in_luma_samples`/`pic_height_in_luma_samples`, not the next
+    // multiple of the CTB size. Rounding up here desynchronised the decoder's
+    // split_cu_flag inference from the encoder's whenever the two bases
+    // differed — every size that is not itself an exact CTB-size multiple.
+    let width = sps.pic_width_in_luma_samples as usize;
+    let height = sps.pic_height_in_luma_samples as usize;
     let ctb = sps.ctb_size() as usize;
     let cols = width.div_ceil(ctb);
     let rows = height.div_ceil(ctb);
@@ -522,7 +529,13 @@ impl CtuDecoder {
             self.mark_coded(px, py, 4, modes[part], depth);
             self.mark_tu(px, py, 4);
             if part == 3 {
-                self.reconstruct_chroma(x, y, 8, chroma_mode, 2, cb_cbf, cr_cbf, dec);
+                // `reconstruct_chroma`'s `log2_luma` is the covering luma
+                // block's log2 (it derives `clog2 = log2_luma - 1` for the
+                // transform-split convention); an NxN CU's covering block is
+                // the whole 8x8 CU (`MIN_CB_LOG2`), not a 4x4 partition —
+                // passing `2` here derived `clog2 = 1` and underflowed
+                // `decode_residual`'s `log2_size - 2`.
+                self.reconstruct_chroma(x, y, 8, chroma_mode, MIN_CB_LOG2, cb_cbf, cr_cbf, dec);
             }
         }
     }
