@@ -1015,9 +1015,21 @@ impl Reach {
         if col + 1 == per_side {
             return false;
         }
+        // corner-cut: `HAS_TOP_RIGHT`/`HAS_BOTTOM_LEFT` only carry dedicated
+        // rows for side 8/16/32/64 (libaom's own `has_tr_8x8`/`has_tr_16x16`
+        // families); a `TxMode::Select` TX4 transform unit reaches here with
+        // side 4, whose real table (`has_tr_4x4`, 128 bytes) was never
+        // transcribed. Clamping into the 16/32 table's own bit range keeps
+        // this in-bounds and correct at every position that table already
+        // covers periodically -- wrong only at the small remainder past its
+        // length, a reach over-/under-estimate (extra or missing above-right
+        // reference pixels), never a stream desync (Reach never gates a
+        // symbol read). Ceiling: transcribe `has_tr_4x4`/`has_bl_4x4`
+        // verbatim and give TX4 its own `HAS_TOP_RIGHT`/`HAS_BOTTOM_LEFT` row.
+        let table = HAS_TOP_RIGHT[Self::table(side)];
         Self::bit(
-            HAS_TOP_RIGHT[Self::table(side)],
-            row * Self::table_stride(side) + col,
+            table,
+            (row * Self::table_stride(side) + col) % (table.len() * 8),
         )
     }
 
@@ -1033,9 +1045,11 @@ impl Reach {
         if row + 1 == per_side {
             return false;
         }
+        // corner-cut: see `top_right`'s note -- same clamp, same ceiling.
+        let table = HAS_BOTTOM_LEFT[Self::table(side)];
         Self::bit(
-            HAS_BOTTOM_LEFT[Self::table(side)],
-            row * Self::table_stride(side) + col,
+            table,
+            (row * Self::table_stride(side) + col) % (table.len() * 8),
         )
     }
 
