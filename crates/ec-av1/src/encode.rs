@@ -742,17 +742,83 @@ impl Plane<'_> {
         }
     }
 
-    /// Codes one block under every mode the search offers and commits the one
-    /// whose squared error and estimated rate come out cheapest.
+    /// Codes one block under every mode the search offers (or, when
+    /// [`Search::top_k`] prunes it, the cheapest `top_k` of them by a SAD
+    /// pre-pass plus DC) and commits the one whose squared error and
+    /// estimated rate come out cheapest.
+    ///
+    /// The prediction is built once per mode regardless -- the full RD trial
+    /// needs it too -- so ranking modes by SAD on that same prediction before
+    /// running the expensive part (forward transform, quantize, reconstruct,
+    /// `coeff_bits`) on only the survivors costs nothing extra to predict,
+    /// only to sum.
     fn search_block(
         &mut self,
         at: At,
         search: &Search,
         mode_bits: &[f64; 13],
     ) -> (Vec<Coeff>, u8, f64) {
+        let At {
+            x, y, side, reach, ..
+        } = at;
+        let (above, left, corner) = self.edges(x, y, side, reach);
+        let mut scored: Vec<(f64, u8, Vec<u8>)> = search
+            .modes
+            .iter()
+            .map(|&mode| {
+                let mut prediction = vec![0u8; side * side];
+                crate::intra::predict(
+                    mode,
+                    above.as_deref(),
+                    left.as_deref(),
+                    corner,
+                    side,
+                    &mut prediction,
+                );
+                let sad: f64 = (0..side * side)
+                    .map(|i| {
+                        let (row, col) = (i / side, i % side);
+                        f64::from(
+                            (i32::from(self.source[(y + row) * self.width + x + col])
+                                - i32::from(prediction[i]))
+                            .abs(),
+                        )
+                    })
+                    .sum();
+                (
+                    sad + search.lambda * mode_bits[usize::from(mode)],
+                    mode,
+                    prediction,
+                )
+            })
+            .collect();
+        if let Some(k) = search.top_k {
+            if k < scored.len() {
+                let dc_pos = scored.iter().position(|&(_, mode, _)| mode == DC_PRED);
+                let dc_entry = dc_pos.map(|i| scored.remove(i));
+                scored.sort_by(|a, b| a.0.partial_cmp(&b.0).expect("scores are finite"));
+                scored.truncate(if dc_entry.is_some() {
+                    k.saturating_sub(1)
+                } else {
+                    k
+                });
+                if let Some(dc_entry) = dc_entry {
+                    scored.push(dc_entry);
+                }
+            }
+        }
         let mut best: Option<(f64, u8, Trial)> = None;
-        for &mode in search.modes {
-            let trial = self.trial(at, mode, search.base_q_idx, search.deadzone);
+        for (_, mode, prediction) in scored {
+            let trial = self.code_from_prediction(
+                x,
+                y,
+                side,
+                &prediction,
+                false,
+                search.base_q_idx,
+                search.deadzone,
+                at.set,
+            );
             let cost = trial.sse + search.lambda * (trial.bits + mode_bits[usize::from(mode)]);
             if best
                 .as_ref()
@@ -762,8 +828,8 @@ impl Plane<'_> {
             }
         }
         let (cost, mode, trial) = best.expect("the search offers at least one mode");
-        self.commit(at.x, at.y, at.side, &trial);
-        (coeffs(&trial.levels, at.side), mode, cost)
+        self.commit(x, y, side, &trial);
+        (coeffs(&trial.levels, side), mode, cost)
     }
 }
 
@@ -1011,7 +1077,31 @@ struct Search<'a> {
     deadzone: f64,
     lambda: f64,
     modes: &'a [u8],
+    /// How many of `modes` the full RD trial (forward transform, quantize,
+    /// reconstruct, `coeff_bits`) actually runs on, ranked by a cheap SAD
+    /// pre-pass on the prediction residual alone plus DC (always kept, since
+    /// libaom's own intra pruning -- `av1/encoder/speed_features.c`'s
+    /// `intra_pruning_with_hog` -- never prunes it away). `None` runs every
+    /// mode through full RD, unchanged from before this lever.
+    top_k: Option<usize>,
 }
+
+/// [`Search::top_k`]'s value: `None` keeps every mode's search unchanged
+/// (the default, until a lever's quality gate justifies pruning by default);
+/// `EC_AV1_PRUNE_K` sweeps it in a test build without touching callers.
+fn prune_top_k() -> Option<usize> {
+    let swept = std::env::var("EC_AV1_PRUNE_K")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok());
+    match swept {
+        Some(k) if cfg!(test) => Some(k),
+        _ => PRUNE_TOP_K,
+    }
+}
+
+/// The default: unpruned, thirteen full trials per block, same as before this
+/// lever. Set from the sweep in the lane report if the quality gate clears it.
+const PRUNE_TOP_K: Option<usize> = None;
 
 /// One mode's coding of one block, before it is committed.
 struct Trial {
@@ -1161,6 +1251,7 @@ pub(crate) fn encode_key_frame_inner(
         deadzone,
         lambda: lambda_scale() * step * step,
         modes,
+        top_k: prune_top_k(),
     };
 
     // The block grid this frame is coded over: [`crate::tile::block_grid`]'s
@@ -1923,6 +2014,7 @@ pub(crate) fn encode_inter_frame(
         deadzone,
         lambda: lambda_scale() * step * step,
         modes: &KEY_FRAME_MODES,
+        top_k: prune_top_k(),
     };
     let mode_bits_table = inter_mode_bits();
 
