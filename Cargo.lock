@@ -273,6 +273,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ec-bench"
+version = "0.1.0"
+dependencies = [
+ "ec-av1",
+ "ec-core",
+ "ec-h264",
+ "ec-h264-syntax",
+ "ec-h265",
+ "ec-image",
+ "ec-inflate",
+ "ec-probe",
+]
+
+[[package]]
 name = "ec-core"
 version = "0.1.0"
 
