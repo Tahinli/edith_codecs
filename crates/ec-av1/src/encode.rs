@@ -4109,6 +4109,114 @@ mod tests {
         set_test_top_k_override_inter(None);
     }
 
+    /// `frames` consecutive pictures out of a real clip, scaled to a whole
+    /// number of 32x32 blocks. Generalizes [`clip_frame`]/[`clip_frame_pair`]
+    /// to an arbitrary count for the fixture regression gate below.
+    fn clip_frames(
+        clip: &str,
+        skip: &str,
+        width: usize,
+        height: usize,
+        frames: usize,
+    ) -> Vec<Picture> {
+        let out = Command::new("ffmpeg")
+            .args(["-v", "error", "-ss", skip, "-i", clip])
+            .args(["-frames:v", &frames.to_string()])
+            .args(["-vf", &format!("scale={width}:{height}")])
+            .args(["-f", "rawvideo", "-pix_fmt", "yuv420p", "-"])
+            .output()
+            .expect("ffmpeg failed to run");
+        assert!(
+            out.status.success(),
+            "ffmpeg: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let (luma, chroma) = (width * height, width * height / 4);
+        let frame_len = luma + 2 * chroma;
+        assert_eq!(
+            out.stdout.len(),
+            frame_len * frames,
+            "expected {frames} 4:2:0 frames"
+        );
+        (0..frames)
+            .map(|i| {
+                let bytes = &out.stdout[i * frame_len..][..frame_len];
+                Picture {
+                    width,
+                    height,
+                    y: bytes[..luma].to_vec(),
+                    u: bytes[luma..luma + chroma].to_vec(),
+                    v: bytes[luma + chroma..].to_vec(),
+                }
+            })
+            .collect()
+    }
+
+    /// The standing regression gate on real content: 12 frames of a real
+    /// clip (`fixtures/video/h264-1080p-23.976-8bit.mp4`, decoded down to
+    /// this crate's own input regardless of its own source codec), encoded
+    /// as an AV1 GOP and checked against three numeric floors so a
+    /// compatibility or quality regression fails the suite instead of
+    /// waiting for a downstream repo's gate to catch it (as happened for a
+    /// padded-size inter `FrameHeader` dav1d rejected, and a 1280x720 export
+    /// refusal, both caught only that way).
+    ///
+    /// 640x384 is a whole number of 32x32 blocks (no straddle edge case;
+    /// that geometry is already covered elsewhere), chosen only so encode
+    /// time and gate numbers are not muddied by an edge-block class this
+    /// test is not about.
+    ///
+    /// Measured 2026-08-27 at q=100: stream 69861 bytes, average luma PSNR
+    /// 45.41 dB across the 12 decoded frames vs the source. Floor/ceiling
+    /// below carry a margin off those measured numbers (PSNR floor =
+    /// measured - 0.5 dB; byte ceiling = measured * 1.15).
+    #[test]
+    fn real_clip_encodes_within_its_quality_and_size_budget() {
+        if !have_ffmpeg() {
+            eprintln!("SKIP real_clip_encodes_within_its_quality_and_size_budget: no ffmpeg");
+            return;
+        }
+        let clip = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/video/h264-1080p-23.976-8bit.mp4");
+        if !clip.exists() {
+            eprintln!(
+                "SKIP real_clip_encodes_within_its_quality_and_size_budget: {} missing",
+                clip.display()
+            );
+            return;
+        }
+        let (width, height, frame_count) = (640usize, 384usize, 12usize);
+        let source = clip_frames(clip.to_str().unwrap(), "0", width, height, frame_count);
+        let encoded = encode_sequence(&source, 100, 0.5).unwrap();
+        assert_eq!(encoded.frames.len(), frame_count);
+
+        // Gate 1: a real AV1 decoder (dav1d, via ffmpeg) accepts the whole
+        // stream and hands back every frame -- a stream a downstream
+        // decoder refuses is the exact class of regression this gate
+        // exists for.
+        let decoded = ffmpeg_decode_sequence(&encoded.stream, width, height, frame_count);
+        assert_eq!(decoded.len(), frame_count, "dav1d decoded every frame");
+
+        // Gate 2: quality vs the source did not silently collapse.
+        let mean_psnr: f64 = decoded
+            .iter()
+            .zip(&source)
+            .map(|(d, s)| psnr(&d.y, &s.y))
+            .sum::<f64>()
+            / frame_count as f64;
+        assert!(
+            mean_psnr >= 44.91,
+            "mean luma PSNR {mean_psnr:.2} dB fell below the 44.91 dB floor"
+        );
+
+        // Gate 3: the stream did not silently bloat.
+        assert!(
+            encoded.stream.len() <= 80_340,
+            "stream grew to {} bytes, over the 80340-byte ceiling",
+            encoded.stream.len()
+        );
+    }
+
     /// The replica-shaped path: 24 frames, 1280x720, one key frame followed
     /// by inter frames -- the same GOP shape [`encode_sequence`] gives the
     /// facade -- timed end to end, so the edith export-time projection is a
