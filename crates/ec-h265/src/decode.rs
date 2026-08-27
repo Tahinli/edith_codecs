@@ -262,10 +262,6 @@ impl CtuDecoder {
         self.decoded[(y as usize / 4) * (self.width / 4) + x as usize / 4]
     }
 
-    fn mode_at(&self, x: usize, y: usize) -> u8 {
-        self.modes[(y / 4) * (self.width / 4) + x / 4]
-    }
-
     fn depth_at(&self, x: usize, y: usize) -> u8 {
         self.depths[(y / 4) * (self.width / 4) + x / 4]
     }
