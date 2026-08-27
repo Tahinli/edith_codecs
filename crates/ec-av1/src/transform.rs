@@ -393,28 +393,163 @@ fn dct_basis(n: usize) -> &'static [f64] {
 /// to agree on for a level to mean what the encoder thinks it means.
 const INVERSE_GAIN_RECIPROCAL: f64 = 8.0;
 
+/// A complex sample, `(re, im)`, for the radix-2 FFT beneath [`dct1d`].
+type Complex = (f64, f64);
+
+fn cmul(a: Complex, b: Complex) -> Complex {
+    (a.0 * b.0 - a.1 * b.1, a.0 * b.1 + a.1 * b.0)
+}
+
+/// An in-place iterative radix-2 Cooley-Tukey FFT (forward, i.e. the `exp(-i
+/// theta)` convention), `a.len()` a power of two. Only [`dct1d`] calls this,
+/// on sizes 4 to 64, so no bounds beyond "power of two" are enforced.
+fn fft(a: &mut [Complex]) {
+    let n = a.len();
+    if n <= 1 {
+        return;
+    }
+    let mut j = 0;
+    for i in 1..n {
+        let mut bit = n >> 1;
+        while j & bit != 0 {
+            j ^= bit;
+            bit >>= 1;
+        }
+        j |= bit;
+        if i < j {
+            a.swap(i, j);
+        }
+    }
+    let mut len = 2;
+    while len <= n {
+        let ang = -2.0 * std::f64::consts::PI / len as f64;
+        let wlen = (ang.cos(), ang.sin());
+        let mut i = 0;
+        while i < n {
+            let mut w = (1.0, 0.0);
+            for k in 0..len / 2 {
+                let u = a[i + k];
+                let v = cmul(a[i + k + len / 2], w);
+                a[i + k] = (u.0 + v.0, u.1 + v.1);
+                a[i + k + len / 2] = (u.0 - v.0, u.1 - v.1);
+                w = cmul(w, wlen);
+            }
+            i += len;
+        }
+        len <<= 1;
+    }
+}
+
+/// The orthonormal DCT-II of one line of `n` samples, in `O(n log n)` via
+/// Makhoul's FFT reduction rather than the `n^2` direct dot product against
+/// [`build_dct_basis`]'s rows.
+///
+/// The reduction: reorder `x` into `v[i] = x[2i]`, `v[n-1-i] = x[2i+1]` for
+/// `i < n/2`; an `n`-point FFT of `v` then gives the unnormalized DCT-II as
+/// `X_k = Re(V_k * exp(-i*pi*k/(2n)))` (measured against the direct
+/// definition, not the textbook `2 * Re(...)` form, which double-counts here
+/// because `v`'s construction already folds each input pair once). What is
+/// returned here is that,
+/// scaled to match [`build_dct_basis`]'s convention exactly (`alpha_0 =
+/// 1/sqrt(2)`, `alpha_k = 1` otherwise, both times `sqrt(2/n)`) so the result
+/// is bit-for-bit the same *contract* as the old matmul, only reordered in
+/// its summation (equal up to floating-point rounding, checked in
+/// `fast_forward_matches_the_naive_matmul`).
+/// The post-FFT twist for [`dct1d`], `(cos(theta_k), sin(theta_k), alpha_k *
+/// sqrt(2/n))` per output `k` -- cached per size for the same reason
+/// [`dct_basis`] is: computed from a `k`-dependent angle, so a call-time
+/// `cos`/`sin` per output (`n` of them, every call) was measured as this
+/// factorization's actual bottleneck, worse than the matmul it was meant to
+/// beat.
+fn dct_twist(n: usize) -> &'static [(f64, f64, f64)] {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<[OnceLock<Vec<(f64, f64, f64)>>; 5]> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::array::from_fn(|_| OnceLock::new()));
+    let idx = (n.trailing_zeros() as usize).saturating_sub(2);
+    cache[idx].get_or_init(|| {
+        (0..n)
+            .map(|k| {
+                let theta = std::f64::consts::PI * k as f64 / (2.0 * n as f64);
+                let alpha = if k == 0 { 1.0 / 2.0f64.sqrt() } else { 1.0 };
+                (theta.cos(), theta.sin(), alpha * (2.0 / n as f64).sqrt())
+            })
+            .collect()
+    })
+}
+
+///
+/// `x` and `out` are both exactly `n` long (`n` at most 64, the largest
+/// transform side this crate codes); the FFT itself runs on a fixed 64-slot
+/// stack array rather than a heap `Vec` -- this call happens twice per row
+/// and twice per column of every RD trial's transform, and the allocations
+/// that a `Vec` per call cost here were measured as a first source of a first
+/// cut of this factorization being *slower* than the matmul it replaced (the
+/// call-time trig in [`dct_twist`]'s table was the other, larger one).
+fn dct1d(x: &[f64], out: &mut [f64]) {
+    let n = x.len();
+    let half = n / 2;
+    let mut v = [(0.0f64, 0.0f64); 64];
+    for i in 0..half {
+        v[i] = (x[2 * i], 0.0);
+        v[n - 1 - i] = (x[2 * i + 1], 0.0);
+    }
+    fft(&mut v[..n]);
+    let twist = dct_twist(n);
+    for (k, &(c, s, scale)) in twist.iter().enumerate() {
+        out[k] = scale * (v[k].0 * c + v[k].1 * s);
+    }
+}
+
 /// The forward transform (encoder side, spec-free): the transpose of what the
 /// decoder's inverse does, so that `inverse_transform_2d` of the result
 /// reproduces `residual`.
 ///
 /// AV1 specifies only the inverse transform. The encoder may reach its
-/// coefficients however it likes, and this reaches them the direct way — an
-/// orthonormal DCT-II in double precision, scaled to the decoder's fixed-point
-/// gain. It is deterministic, and its accuracy is measured against the
-/// decoder's own inverse rather than asserted.
+/// coefficients however it likes, and this reaches them via [`dct1d`], an
+/// `O(n log n)` orthonormal DCT-II factorization equal to the direct
+/// `O(n^2)` matmul up to floating-point rounding (see
+/// `fast_forward_matches_the_naive_matmul`), scaled to the decoder's
+/// fixed-point gain. It is deterministic, and its accuracy is measured
+/// against the decoder's own inverse rather than asserted.
 pub fn forward_transform_2d(residual: &[i32], side: usize) -> Vec<f64> {
     assert_eq!(
         residual.len(),
         side * side,
         "one residual sample per position"
     );
+    let mut rows = vec![0.0f64; side * side];
+    let mut buf = [0.0f64; 64];
+    let mut line = [0.0f64; 64];
+    for i in 0..side {
+        for (j, &r) in residual[i * side..][..side].iter().enumerate() {
+            buf[j] = f64::from(r);
+        }
+        dct1d(&buf[..side], &mut line[..side]);
+        rows[i * side..][..side].copy_from_slice(&line[..side]);
+    }
+    let mut out = vec![0.0f64; side * side];
+    for v in 0..side {
+        for (i, c) in buf[..side].iter_mut().enumerate() {
+            *c = rows[i * side + v];
+        }
+        dct1d(&buf[..side], &mut line[..side]);
+        for (u, &t) in line[..side].iter().enumerate() {
+            out[u * side + v] = t;
+        }
+    }
+    let scale = INVERSE_GAIN_RECIPROCAL;
+    for v in &mut out {
+        *v *= scale;
+    }
+    out
+}
+
+/// The old direct `O(n^2)` matmul against [`build_dct_basis`], kept only as
+/// the differential oracle for [`forward_transform_2d`]'s fast replacement
+/// (`fast_forward_matches_the_naive_matmul`).
+#[cfg(test)]
+fn forward_transform_2d_naive(residual: &[i32], side: usize) -> Vec<f64> {
     let basis = dct_basis(side);
-    // Rows first, into a scratch of the same shape, then columns. Both passes
-    // are written as a contiguous dot product (row of `residual`/`rows_t`
-    // against a row of `basis`) rather than an index loop with one strided
-    // operand -- same summation order, so the same bits out, but a shape the
-    // optimizer can autovectorize (measured: this halved the per-call cost
-    // that `stage_timing_breakdown`, ec-av1 perf lane, found dominant).
     let mut rows = vec![0.0f64; side * side];
     for i in 0..side {
         let residual_row = &residual[i * side..][..side];
@@ -427,8 +562,6 @@ pub fn forward_transform_2d(residual: &[i32], side: usize) -> Vec<f64> {
             rows[i * side + u] = sum;
         }
     }
-    // Transposed so the column pass reads `rows` contiguously too, without
-    // changing which terms are summed in which order.
     let mut rows_t = vec![0.0f64; side * side];
     for i in 0..side {
         for v in 0..side {
@@ -538,6 +671,26 @@ mod tests {
             .map(|(&x, &y)| f64::from(x - y) * f64::from(x - y))
             .sum();
         (sum / a.len() as f64).sqrt()
+    }
+
+    /// [`forward_transform_2d`]'s fast FFT-based factorization against
+    /// [`forward_transform_2d_naive`]'s direct matmul: same summation
+    /// reordered, so equal up to floating-point rounding, not bit-exact.
+    #[test]
+    fn fast_forward_matches_the_naive_matmul() {
+        for &side in &[4usize, 8, 16, 32, 64] {
+            for seed in [1u64, 2, 3] {
+                let residual = noise(side * side, seed * 1000 + side as u64);
+                let fast = forward_transform_2d(&residual, side);
+                let naive = forward_transform_2d_naive(&residual, side);
+                for (i, (&f, &n)) in fast.iter().zip(&naive).enumerate() {
+                    assert!(
+                        (f - n).abs() < 1e-6 * n.abs().max(1.0),
+                        "{side}x{side} seed {seed} coefficient {i}: fast {f} vs naive {n}"
+                    );
+                }
+            }
+        }
     }
 
     /// The one thing the encoder and the decoder have to agree on.
