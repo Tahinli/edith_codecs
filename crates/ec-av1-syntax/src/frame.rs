@@ -989,12 +989,25 @@ pub(crate) fn parse_uncompressed_header(
     // setup_past_independence / load_previous (spec 6.8.2): the loop filter
     // deltas, segmentation data and global motion this frame starts from either
     // reset to their defaults or come from the primary reference frame.
-    let mut lf = LoopFilterParams::default();
+    // `loop_filter_level`/`loop_filter_sharpness` are NOT part of that forward
+    // (spec 7.20 only loads `LoopFilterRefDeltas`/`LoopFilterModeDeltas`) --
+    // level is always parsed fresh in `read_loop_filter_params`, defaulting to
+    // 0 for the chroma levels when that frame's luma levels are both 0 (its
+    // own guard skips reading them). Forwarding the whole struct here left a
+    // previous frame's nonzero chroma level in place on a frame that never
+    // wrote one, over-filtering U/V at edges this frame's own header says are
+    // off (lane-av1golden3: seed 47, frame 1 chroma vs ffmpeg).
+    let mut lf = LoopFilterParams {
+        level: [0; 4],
+        sharpness: 0,
+        ..LoopFilterParams::default()
+    };
     let mut seg = SegmentationParams::default();
     let mut prev_gm_params = [WarpParams::default(); REFS_PER_FRAME];
     if h.primary_ref_frame != PRIMARY_REF_NONE {
         let prev = state.refs[h.ref_frame_idx[h.primary_ref_frame as usize] as usize];
-        lf = prev.loop_filter;
+        lf.ref_deltas = prev.loop_filter.ref_deltas;
+        lf.mode_deltas = prev.loop_filter.mode_deltas;
         seg = prev.segmentation;
         prev_gm_params = prev.gm_params;
     }
