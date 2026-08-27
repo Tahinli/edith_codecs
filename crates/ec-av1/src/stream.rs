@@ -1529,17 +1529,19 @@ mod tests {
             ] {
                 let mut first = None;
                 let mut count = 0;
+                let mut worst = 0i32;
                 for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
                     if x != y {
                         count += 1;
                         if first.is_none() {
                             first = Some(i);
                         }
+                        worst = worst.max((*x as i32 - *y as i32).abs());
                     }
                 }
                 if let Some(i) = first {
                     eprintln!(
-                        "frame {f} plane {plane_name}: {count} mismatches, first at offset {i} (row {}, col {}) ours={} theirs={}",
+                        "frame {f} plane {plane_name}: {count} mismatches (worst delta {worst}), first at offset {i} (row {}, col {}) ours={} theirs={}",
                         i / w,
                         i % w,
                         a[i],
