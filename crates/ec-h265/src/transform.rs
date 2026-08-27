@@ -365,11 +365,35 @@ pub fn quantize_offset(
     let qbits = 21 + qp / 6 - log2n;
     let scale = QUANT_SCALE[(qp % 6) as usize] as i64;
     let offset = (1i64 << qbits) / dead_zone;
+    // `scale` <= 26_214 and `|coeffs[i]|` <= 32_768 (COEFF_MIN/MAX), and qp is
+    // clamped to 0..=51 (crates/ec-h265/src/encoder.rs), so
+    // `abs(c) * scale + offset` never exceeds ~1e9: it fits in i32 without
+    // overflow, which is what lets this run in 32-bit SIMD lanes and still be
+    // the exact same integer as the scalar i64 computation below.
+    debug_assert!(scale <= i64::from(i32::MAX) && offset <= i64::from(i32::MAX));
+    let scale32 = scale as i32;
+    let offset32 = offset as i32;
     let mut nonzero = 0;
-    for (i, &c) in coeffs[..n * n].iter().enumerate() {
+    let coeffs = &coeffs[..n * n];
+    let mut i = 0;
+    while i + 8 <= coeffs.len() {
+        let c = wide::i32x8::from(<[i32; 8]>::try_from(&coeffs[i..i + 8]).unwrap());
+        let mag =
+            ((c.abs() * scale32 + offset32) >> (qbits as u32)).min(wide::i32x8::splat(COEFF_MAX));
+        let level = c.simd_lt(wide::i32x8::splat(0)).select(-mag, mag);
+        for (j, &lv) in level.to_array().iter().enumerate() {
+            levels[i + j] = lv;
+            if lv != 0 {
+                nonzero += 1;
+            }
+        }
+        i += 8;
+    }
+    for j in i..coeffs.len() {
+        let c = coeffs[j];
         let magnitude = ((c.unsigned_abs() as i64 * scale + offset) >> qbits) as i32;
         let level = magnitude.min(COEFF_MAX);
-        levels[i] = if c < 0 { -level } else { level };
+        levels[j] = if c < 0 { -level } else { level };
         if level != 0 {
             nonzero += 1;
         }

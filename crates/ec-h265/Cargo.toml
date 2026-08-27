@@ -9,6 +9,7 @@ authors.workspace = true
 [dependencies]
 ec-core.workspace = true
 ec-h265-syntax.workspace = true
+wide.workspace = true
 
 [dev-dependencies]
 ec-h265-syntax.workspace = true
