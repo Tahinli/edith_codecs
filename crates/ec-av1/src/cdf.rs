@@ -326,6 +326,31 @@ pub const FILTER_INTRA: [[u16; 3]; 4] = [
 /// `FILTER_INTRA_MODES` a `use_filter_intra` block picks.
 pub const FILTER_INTRA_MODE: [u16; 6] = [8949, 12776, 17211, 29558, 32768, 0];
 
+/// `default_tx_size_cdf[0]` (entropymode.c): an 8x8 block's `tx_depth` flag
+/// (`TX8` vs `TX4`), indexed by `tx_size_context` (0..=2).
+pub const TX_SIZE_CAT0: [[u16; 3]; 3] = [[19968, 32768, 0], [19968, 32768, 0], [24320, 32768, 0]];
+/// `default_tx_size_cdf[1]` (entropymode.c): a 16x16 block's `tx_depth`
+/// (`TX16`/`TX8`/`TX4`), indexed by `tx_size_context`.
+pub const TX_SIZE_CAT1: [[u16; 4]; 3] = [
+    [12272, 30172, 32768, 0],
+    [12272, 30172, 32768, 0],
+    [18677, 30848, 32768, 0],
+];
+/// `default_tx_size_cdf[2]` (entropymode.c): a 32x32 block's `tx_depth`
+/// (`TX32`/`TX16`/`TX8`), indexed by `tx_size_context`.
+pub const TX_SIZE_CAT2: [[u16; 4]; 3] = [
+    [12986, 15180, 32768, 0],
+    [12986, 15180, 32768, 0],
+    [24302, 25602, 32768, 0],
+];
+/// `default_tx_size_cdf[3]` (entropymode.c): a 64x64 block's `tx_depth`
+/// (`TX64`/`TX32`/`TX16`), indexed by `tx_size_context`.
+pub const TX_SIZE_CAT3: [[u16; 4]; 3] = [
+    [5782, 11475, 32768, 0],
+    [5782, 11475, 32768, 0],
+    [16803, 22759, 32768, 0],
+];
+
 /// `Default_Cfl_Alpha_Cdf` (spec 9.4): a `UV_CFL_PRED` block's per-plane
 /// alpha magnitude (spec 5.11.45's `cfl_alpha_u`/`cfl_alpha_v`), indexed by
 /// the joint sign's context (`CFL_CONTEXT_U`/`CFL_CONTEXT_V`,

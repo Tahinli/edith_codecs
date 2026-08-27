@@ -92,22 +92,22 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 "a frame with cdef_bits > 0 (this decoder never reads the per-64x64 cdef_idx symbol)",
             ));
         }
-        // Every `decode_block` call below assumes the block's transform is
-        // its own full size (`TxMode::Largest`, which is all this crate's own
-        // encoder ever writes, spec `read_tx_size` inferring the max depth
-        // with no bits) -- it never reads a `tx_depth` symbol at all. A real
-        // encoder's `TxMode::Select` (spec 5.9.2's `tx_mode` bit) codes one
-        // per intra block, and skipping that read does not error -- the
-        // decoder just goes on consuming the next bits as if they were the
-        // uv_mode/coefficient symbols they are not, so the block "decodes"
-        // syntactically clean into low-energy garbage: lane-av1real r3's
-        // luma-near-flat-vs-ffmpeg-gradient bug. Refuse before that, the same
-        // way as the CDEF case above, rather than silently miscode every
-        // `TxMode::Select` stream.
-        if header.tx_mode == TxMode::Select {
+        // An intra frame's `decode_key_frame_tile*` now reads `tx_depth`
+        // under `TxMode::Select` (lane-av1txsel, spec 5.11.16): the key-frame
+        // decode path threads `tx_select` through `decode_block`/
+        // `decode_leaf8`, and refuses on its own (a named `unsupported`, not
+        // a silent desync) the one case it still cannot code -- a resolved
+        // 4x4 luma transform, which has no coefficient tables here. This
+        // refusal is narrowed to what genuinely still has no reader at all:
+        // `decode_inter_frame`'s inter path never threads `tx_select`
+        // through its own block loop, so an inter frame under
+        // `TxMode::Select` still desyncs the same way the comment above used
+        // to describe for every frame -- lane-av1real r3's
+        // luma-near-flat-vs-ffmpeg-gradient bug.
+        if header.tx_mode == TxMode::Select && header.frame_type != FrameType::Key {
             return Err(Error::unsupported(
                 "AV1 decode_stream",
-                "a frame using TxMode::Select (this decoder never reads a tx_depth symbol, so it desyncs after the first intra block's mode)",
+                "an inter frame using TxMode::Select (this decoder's inter path never reads a tx_depth symbol, so it desyncs after the first block's mode)",
             ));
         }
         // lane-av1real r11's blindness-audit sweep (`read_intra_frame_mode_info`,
@@ -214,6 +214,7 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 &header.cdef,
                 &header.loop_filter,
                 initial_cdfs,
+                header.tx_mode == TxMode::Select,
             )?
         } else {
             let last_slot = header.ref_frame_idx[0] as usize;
@@ -339,6 +340,7 @@ mod tests {
                 false,
                 &ec_av1_syntax::CdefParams::default(),
                 &ec_av1_syntax::LoopFilterParams::default(),
+                false,
             )
             .unwrap();
             let via_stream = decode_stream(&encoded.stream).unwrap();
@@ -994,6 +996,155 @@ mod tests {
         assert_eq!(frames[0].y, ffmpeg_frames[0].y, "luma vs ffmpeg");
         assert_eq!(frames[0].u, ffmpeg_frames[0].u, "U vs ffmpeg");
         assert_eq!(frames[0].v, ffmpeg_frames[0].v, "V vs ffmpeg");
+    }
+
+    /// As [`a_real_aomenc_intra_stream_with_deblocking_decodes_pixel_exact`],
+    /// but WITHOUT `--enable-tx-size-search=0` -- the one flag every other
+    /// recipe in this file pins off specifically to keep the stream on
+    /// `TxMode::Largest`. Dropped, aomenc's RD is free to pick
+    /// `TxMode::Select` and split some blocks' luma transform below their own
+    /// side (spec 5.11.16), which is what this test's `tx_depth_hits()`
+    /// counter proves actually happened -- a stream that resolves every
+    /// `tx_depth` to 0 would pixel-match by construction (identical to
+    /// `TxMode::Largest`) without exercising the new split-TU decode path at
+    /// all. Same multi-seed retry shape as
+    /// [`a_real_aomenc_inter_sequence_with_cdf_forwarding_decodes_pixel_exact`]:
+    /// aomenc's own RD is free (with tx-size search on) to also occasionally
+    /// pick `allow_screen_content_tools` on this content, a separate,
+    /// already-named refusal -- try several seeds, and the first stream that
+    /// both decodes AND actually split a transform must be pixel-exact.
+    #[test]
+    fn a_real_aomenc_intra_stream_with_tx_select_decodes_pixel_exact() {
+        if !have_ffmpeg() {
+            eprintln!(
+                "SKIP a_real_aomenc_intra_stream_with_tx_select_decodes_pixel_exact: no ffmpeg"
+            );
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!(
+                "SKIP a_real_aomenc_intra_stream_with_tx_select_decodes_pixel_exact: no aomenc at {}",
+                aomenc_path().display()
+            );
+            return;
+        }
+        let (width, height) = (64usize, 64usize);
+        let mut refusals = Vec::new();
+        for attempt in 0..40u32 {
+            let seed = 42 + attempt;
+            // A flat gradient never has enough local detail for the RD
+            // search to prefer a split transform over the block's own full
+            // size -- `mandelbrot`'s fractal boundary gives every attempt
+            // (a different `start_scale`) sharp, varied-frequency edges.
+            let source = format!(
+                "mandelbrot=size=64x64:start_scale={}:rate=25",
+                3.0 - f64::from(attempt) * 0.06
+            );
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    // Desaturated: chroma stays flat (constant 128) so
+                    // `uv_mode` always resolves to `DC_PRED` and this
+                    // decoder's still-unsupported directional-chroma round-2
+                    // gap never fires, leaving the luma detail alone to
+                    // drive whether `TxMode::Select`'s RD splits a block.
+                    "-vf",
+                    "hue=s=0",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-t",
+                    "0.04",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let mut child = Command::new(aomenc_path())
+                .args([
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    "--cq-level=45",
+                    "--cpu-used=0",
+                    "--enable-rect-partitions=0",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    "--enable-filter-intra=0",
+                    "--enable-angle-delta=0",
+                    "--enable-cdef=0",
+                    // Loop restoration is a named refusal (aomenc's RD picks
+                    // Sgrproj on this kind of content) -- off in every recipe
+                    // whose test targets a different surface.
+                    "--enable-restoration=0",
+                    "--max-partition-size=32",
+                    "--enable-palette=0",
+                    "--enable-intrabc=0",
+                    "--enable-cfl-intra=1",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let before = decode::tx_depth_hits();
+            let frames = match decode_stream(&stream) {
+                Ok(frames) => frames,
+                Err(e) => {
+                    refusals.push(format!("seed {seed}: {e}"));
+                    continue;
+                }
+            };
+            if decode::tx_depth_hits() == before {
+                refusals.push(format!(
+                    "seed {seed}: decoded, but no block resolved a split tx_depth"
+                ));
+                continue;
+            }
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
+            assert_eq!(
+                frames[0].y, ffmpeg_frames[0].y,
+                "luma vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(frames[0].u, ffmpeg_frames[0].u, "U vs ffmpeg (seed {seed})");
+            assert_eq!(frames[0].v, ffmpeg_frames[0].v, "V vs ffmpeg (seed {seed})");
+            return;
+        }
+        eprintln!(
+            "SKIP a_real_aomenc_intra_stream_with_tx_select_decodes_pixel_exact: every attempt \
+             hit a named refusal or never split a transform:\n{}",
+            refusals.join("\n")
+        );
     }
 
     /// As above, but a multi-frame inter sequence -- `--lag-in-frames=0

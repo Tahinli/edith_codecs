@@ -61,6 +61,19 @@ static DEBLOCK_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicU
 pub(crate) fn deblock_hits() -> usize {
     DEBLOCK_HITS.load(std::sync::atomic::Ordering::Relaxed)
 }
+
+/// How many [`read_tx_size`] reads resolved a `tx_depth` strictly less than
+/// the block's own side, across every call in the process -- the same
+/// before/after counter pattern as [`FILTER_INTRA_HITS`], proving a stream
+/// actually exercised a *split* transform under `TxMode::Select` rather than
+/// every block coincidentally resolving `depth=0` (indistinguishable from
+/// `TxMode::Largest` pixel-wise).
+static TX_DEPTH_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Current value of [`TX_DEPTH_HITS`].
+pub(crate) fn tx_depth_hits() -> usize {
+    TX_DEPTH_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
 const SUB_MI: u32 = 4;
 const MI: usize = 4;
 const SB: usize = 64;
@@ -1098,6 +1111,10 @@ fn decode_block(
     v: &mut PlaneBuf,
     base_q_idx: u8,
     enable_filter_intra: bool,
+    scan32: &[u16],
+    scan16: &[u16],
+    scan8: &[u16],
+    tx_select: bool,
 ) -> Result<()> {
     let (r, c) = at;
     let (px, py) = (c * SUB, r * SUB);
@@ -1110,8 +1127,31 @@ fn decode_block(
         side,
         enable_filter_intra,
     )?;
+    let (mi_r, mi_c) = (r * (SUB / MI), c * (SUB / MI));
+    // `TxMode::Select`'s `tx_depth` (spec 5.11.16): read for every intra
+    // block, skipped or not. `logical_tx` is what the loop filter's edge
+    // lookup and the next block's own `tx_size_context` want (the *nominal*
+    // transform size -- 64 even for the 64x64 corner-scanned case, spec
+    // 5.11.40); `coeff_tx_side` is the actual coded coefficient grid's side,
+    // which only differs from it at that one corner case.
+    let (logical_tx, coeff_tx_side) = if tx_select {
+        let resolved = read_tx_size(dec, cdfs, neighbours, (mi_r, mi_c), side);
+        if resolved == 4 {
+            return Err(unsupported(
+                "a resolved 4x4 luma transform (TxMode::Select depth exhausted; this decoder has no 4x4 luma coefficient tables)",
+            ));
+        }
+        (resolved, if resolved == 64 { 32 } else { resolved })
+    } else {
+        (side, luma_tx)
+    };
+    let luma_set = if tx_select {
+        txbset_for(logical_tx)
+    } else {
+        luma_set
+    };
+    let luma_scan = scan_for(coeff_tx_side, scan32, scan16, scan8);
     let reach = Reach::of(side, px, py, y.width, y.height);
-    let (luma_grid, u_grid, v_grid);
     let (cpx, cpy) = (px / 2, py / 2);
     let chroma_side = side / 2;
     if skip {
@@ -1148,16 +1188,20 @@ fn decode_block(
             alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
             None,
         );
-        luma_grid = vec![0i32; side * side];
-        u_grid = vec![0i32; chroma_side * chroma_side];
-        v_grid = vec![0i32; chroma_side * chroma_side];
-    } else {
+        let luma_grid = vec![0i32; side * side];
+        let u_grid = vec![0i32; chroma_side * chroma_side];
+        let v_grid = vec![0i32; chroma_side * chroma_side];
+        neighbours.record(at, side, mode, &[luma_grid, u_grid, v_grid]);
+    } else if !tx_select || logical_tx == side {
+        // A single luma transform unit -- the old path, unchanged (including
+        // the 64x64 corner case, `logical_tx == side == 64` with
+        // `coeff_tx_side == 32`).
         let around = neighbours.around(at, side);
-        luma_grid = read_plane(
+        let luma_grid = read_plane(
             dec,
             cdfs,
             luma_set,
-            scans.0,
+            luma_scan,
             0,
             around[0],
             mode,
@@ -1167,13 +1211,13 @@ fn decode_block(
             px,
             py,
             side,
-            luma_tx,
+            coeff_tx_side,
             base_q_idx,
             None,
             filter_intra,
         )?;
         let ac = alpha.map(|_| cfl_ac_q3(y, px, py, side));
-        u_grid = read_plane(
+        let u_grid = read_plane(
             dec,
             cdfs,
             chroma_set,
@@ -1192,7 +1236,7 @@ fn decode_block(
             alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
             None,
         )?;
-        v_grid = read_plane(
+        let v_grid = read_plane(
             dec,
             cdfs,
             chroma_set,
@@ -1211,13 +1255,94 @@ fn decode_block(
             alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
             None,
         )?;
+        neighbours.record(at, side, mode, &[luma_grid, u_grid, v_grid]);
+    } else {
+        // Several luma transform units, raster order (spec
+        // `transform_block`'s loop): the block's resolved transform is
+        // genuinely smaller than its own side, so each tile of it predicts
+        // and codes independently, its own context read fresh off whatever
+        // the earlier tiles in this same block already wrote -- the same
+        // per-TU pattern [`decode_leaf8`] already runs for an 8x8 leaf.
+        let n_axis = side / logical_tx;
+        for tu_row in 0..n_axis {
+            for tu_col in 0..n_axis {
+                let tu_mi = (
+                    mi_r + tu_row * (logical_tx / MI),
+                    mi_c + tu_col * (logical_tx / MI),
+                );
+                let tu_px = px + tu_col * logical_tx;
+                let tu_py = py + tu_row * logical_tx;
+                let tu_around = neighbours.around_mi(tu_mi, logical_tx)[0];
+                let tu_reach = Reach::of(logical_tx, tu_px, tu_py, y.width, y.height);
+                let tu_grid = read_plane(
+                    dec,
+                    cdfs,
+                    luma_set,
+                    luma_scan,
+                    0,
+                    tu_around,
+                    mode,
+                    mode,
+                    tu_reach,
+                    y,
+                    tu_px,
+                    tu_py,
+                    logical_tx,
+                    logical_tx,
+                    base_q_idx,
+                    None,
+                    filter_intra,
+                )?;
+                neighbours.record_mi_luma(tu_mi, logical_tx, &tu_grid);
+            }
+        }
+        let ac = alpha.map(|_| cfl_ac_q3(y, px, py, side));
+        let chroma_around = neighbours.around(at, side);
+        let u_grid = read_plane(
+            dec,
+            cdfs,
+            chroma_set,
+            scans.1,
+            1,
+            chroma_around[1],
+            mode,
+            DC_PRED,
+            Reach::none(),
+            u,
+            cpx,
+            cpy,
+            chroma_side,
+            chroma_tx,
+            base_q_idx,
+            alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
+            None,
+        )?;
+        let v_grid = read_plane(
+            dec,
+            cdfs,
+            chroma_set,
+            scans.1,
+            2,
+            chroma_around[2],
+            mode,
+            DC_PRED,
+            Reach::none(),
+            v,
+            cpx,
+            cpy,
+            chroma_side,
+            chroma_tx,
+            base_q_idx,
+            alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
+            None,
+        )?;
+        neighbours.record_split_luma(at, side, mode, [&u_grid, &v_grid]);
     }
-    neighbours.record(at, side, mode, &[luma_grid, u_grid, v_grid]);
     neighbours.fill_skip_grid((r * (SUB / MI), c * (SUB / MI)), side / MI, skip);
     neighbours.fill_lf_grid(
         (r * (SUB / MI), c * (SUB / MI)),
         side / MI,
-        side as u8,
+        logical_tx as u8,
         false,
     );
     Ok(())
@@ -1246,6 +1371,7 @@ fn decode_leaf8(
     v: &mut PlaneBuf,
     base_q_idx: u8,
     enable_filter_intra: bool,
+    tx_select: bool,
 ) -> Result<usize> {
     let (r, c) = outer_at;
     let mut above_mode = neighbours.above_mode[c];
@@ -1269,6 +1395,19 @@ fn decode_leaf8(
         8,
         enable_filter_intra,
     )?;
+    // `TxMode::Select`'s `tx_depth` at an 8x8 leaf (spec 5.11.16): the only
+    // depths an 8x8 block offers are `TX8` (depth 0, this decoder's one
+    // supported case) and `TX4` (depth 1, which this crate has no 4x4 luma
+    // coefficient tables for) -- read to stay in sync, then refuse rather
+    // than silently miscode.
+    if tx_select {
+        let resolved = read_tx_size(dec, cdfs, neighbours, leaf_mi, 8);
+        if resolved == 4 {
+            return Err(unsupported(
+                "a resolved 4x4 luma transform (TxMode::Select depth exhausted; this decoder has no 4x4 luma coefficient tables)",
+            ));
+        }
+    }
     let (px, py) = (leaf_mi.1 * MI, leaf_mi.0 * MI);
     let reach = Reach::of(8, px, py, y.width, y.height);
     let (cpx, cpy) = (px / 2, py / 2);
@@ -1598,6 +1737,70 @@ fn tx_px_at(n: &Neighbours, chroma: bool, mi_r: usize, mi_c: usize) -> u32 {
         .copied()
         .unwrap_or(0) as u32;
     if chroma { luma_tx / 2 } else { luma_tx }
+}
+
+/// `get_tx_size_context` (spec 9.3's `TxDepthCtx`, libaom
+/// `TXFM_CONTEXT`/`entropymode.c`): the sum of two boolean terms, each
+/// present only when its neighbour exists inside the true frame -- whether
+/// the block immediately above (at this block's own leftmost mi column) or
+/// to the left (at its own topmost mi row) coded a transform at least as wide
+/// as `own_side`.
+fn tx_size_context(n: &Neighbours, (mi_r, mi_c): (usize, usize), own_side: usize) -> usize {
+    let above = mi_r > 0 && tx_px_at(n, false, mi_r - 1, mi_c) as usize >= own_side;
+    let left = mi_c > 0 && tx_px_at(n, false, mi_r, mi_c - 1) as usize >= own_side;
+    usize::from(above) + usize::from(left)
+}
+
+/// `read_tx_size`/`read_selected_tx_size` (spec 5.11.16): under
+/// `TxMode::Select`, an intra block's `tx_depth` symbol, resolved straight to
+/// the transform's own side in pixels (`side >> depth`) -- this decoder's
+/// four square categories (8/16/32/64) each halve at most twice, matching
+/// libaom's own per-size depth cap (`cdf::TX_SIZE_CAT0`..`TX_SIZE_CAT3`).
+fn read_tx_size(
+    dec: &mut SymbolDecoder,
+    cdfs: &mut Cdfs,
+    n: &Neighbours,
+    at_mi: (usize, usize),
+    side: usize,
+) -> usize {
+    let ctx = tx_size_context(n, at_mi, side);
+    let depth = match side {
+        8 => dec.symbol(&mut cdfs.tx_size_cat0[ctx]),
+        16 => dec.symbol(&mut cdfs.tx_size_cat1[ctx]),
+        32 => dec.symbol(&mut cdfs.tx_size_cat2[ctx]),
+        64 => dec.symbol(&mut cdfs.tx_size_cat3[ctx]),
+        _ => unreachable!("decode_block/decode_leaf8 only call this at 8/16/32/64"),
+    };
+    if depth != 0 {
+        TX_DEPTH_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    side >> depth
+}
+
+/// The luma coefficient scan table for a resolved transform side -- 32/16/8,
+/// the only three sizes a `TxMode::Select` block's coded coefficient grid
+/// ([`read_tx_size`]'s resolved side, or 32 at the 64x64 corner case) can be.
+fn scan_for<'a>(tx_px: usize, scan32: &'a [u16], scan16: &'a [u16], scan8: &'a [u16]) -> &'a [u16] {
+    match tx_px {
+        32 => scan32,
+        16 => scan16,
+        8 => scan8,
+        _ => unreachable!("read_tx_size never resolves the coefficient grid to anything else"),
+    }
+}
+
+/// The [`TxbSet`] a resolved luma transform side reads its coefficient tables
+/// from -- 64 is only ever the 64x64-block, depth-0, corner-scanned case
+/// ([`TxbSet::Luma64`]); every other resolved side maps to its own matching
+/// set.
+fn txbset_for(tx_px: usize) -> TxbSet {
+    match tx_px {
+        64 => TxbSet::Luma64,
+        32 => TxbSet::Luma32,
+        16 => TxbSet::Luma16,
+        8 => TxbSet::Luma8,
+        _ => unreachable!("read_tx_size never resolves a block's own side to anything else"),
+    }
 }
 
 /// `tx_size_wide_unit_log2`/`tx_size_high_unit_log2`: `log2(px / 4)`, the
@@ -2140,6 +2343,7 @@ pub fn decode_key_frame_tile(
     enable_filter_intra: bool,
     cdef: &CdefParams,
     loop_filter: &LoopFilterParams,
+    tx_select: bool,
 ) -> Result<Picture> {
     decode_key_frame_tile_with_cdfs(
         data,
@@ -2152,6 +2356,7 @@ pub fn decode_key_frame_tile(
         cdef,
         loop_filter,
         None,
+        tx_select,
     )
     .map(|(picture, _)| picture)
 }
@@ -2175,6 +2380,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     cdef: &CdefParams,
     loop_filter: &LoopFilterParams,
     initial_cdfs: Option<Cdfs>,
+    tx_select: bool,
 ) -> Result<(Picture, Cdfs)> {
     if mi_cols == 0 || mi_rows == 0 {
         return Err(unsupported("a frame with no mode-info grid"));
@@ -2280,6 +2486,10 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                         &mut v,
                         base_q_idx,
                         enable_filter_intra,
+                        &scan32,
+                        &scan16,
+                        &scan8,
+                        tx_select,
                     )?;
                 }
                 PARTITION_SPLIT => {
@@ -2337,6 +2547,10 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                     &mut v,
                                     base_q_idx,
                                     enable_filter_intra,
+                                    &scan32,
+                                    &scan16,
+                                    &scan8,
+                                    tx_select,
                                 )?;
                             }
                             PARTITION_SPLIT => {
@@ -2374,6 +2588,10 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                                 &mut v,
                                                 base_q_idx,
                                                 enable_filter_intra,
+                                                &scan32,
+                                                &scan16,
+                                                &scan8,
+                                                tx_select,
                                             )?;
                                             continue;
                                         }
@@ -2417,6 +2635,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                                 &mut v,
                                                 base_q_idx,
                                                 enable_filter_intra,
+                                                tx_select,
                                             )?;
                                             prev_leaf = Some((leaf_mi, leaf_mode));
                                         }
@@ -2479,6 +2698,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                             &mut v,
                                             base_q_idx,
                                             enable_filter_intra,
+                                            tx_select,
                                         )?;
                                         prev_leaf = Some((leaf_mi, leaf_mode));
                                     }
@@ -3871,7 +4091,8 @@ mod tests {
                 128,
                 false,
                 &CdefParams::default(),
-                &LoopFilterParams::default()
+                &LoopFilterParams::default(),
+                false
             )
             .is_err()
         );
@@ -3912,6 +4133,7 @@ mod tests {
             false,
             &CdefParams::default(),
             &LoopFilterParams::default(),
+            false,
         )
         .unwrap();
         assert_eq!(decoded.width, w, "{w}x{h}: decoded width");
@@ -3993,6 +4215,7 @@ mod tests {
             false,
             &CdefParams::default(),
             &LoopFilterParams::default(),
+            false,
         )
         .unwrap();
         assert!(
@@ -4176,6 +4399,7 @@ mod tests {
                 false,
                 &CdefParams::default(),
                 &LoopFilterParams::default(),
+                false,
             )
             .unwrap();
             assert_eq!(ours.y, ffmpeg_decoded.y, "{width}x{height}: luma vs ffmpeg");
@@ -4246,6 +4470,7 @@ mod tests {
             false,
             &CdefParams::default(),
             &LoopFilterParams::default(),
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -4519,6 +4744,7 @@ mod tests {
             false,
             &CdefParams::default(),
             &LoopFilterParams::default(),
+            false,
         )
         .unwrap();
         assert_eq!(reference.y, ffmpeg_frames[0].y, "frame 0 luma vs ffmpeg");
