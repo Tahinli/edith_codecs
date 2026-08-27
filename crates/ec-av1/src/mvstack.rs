@@ -706,6 +706,85 @@ pub(crate) fn single_ref_ctx(has_inter_neighbour: bool) -> usize {
     if has_inter_neighbour { 2 } else { 1 }
 }
 
+/// `MV_REFERENCE_FRAME` values a single (non-compound) reference can name
+/// (spec 6.10.24's `ref_frame` alphabet; libaom `av1/common/enums.h`).
+pub(crate) const LAST_FRAME: i8 = 1;
+pub(crate) const LAST2_FRAME: i8 = 2;
+pub(crate) const LAST3_FRAME: i8 = 3;
+pub(crate) const GOLDEN_FRAME: i8 = 4;
+pub(crate) const BWDREF_FRAME: i8 = 5;
+pub(crate) const ALTREF2_FRAME: i8 = 6;
+pub(crate) const ALTREF_FRAME: i8 = 7;
+
+/// libaom `pred_common.c`'s shared shape behind every `single_ref_p*`/
+/// `comp_ref*` context function once compound prediction (a second ref per
+/// neighbour) is out of scope: count how many of the immediate above/left
+/// neighbours (spec 5.11.25's own single-neighbour read, not a whole-span
+/// scan -- `av1_collect_neighbors_ref_counts`, `MACROBLOCKD::above_mbmi`/
+/// `left_mbmi`) coded a reference in `a_set` vs. `b_set`, and compare: fewer
+/// `a`s than `b`s is context 0, equal is 1 (also every unavailable-neighbour
+/// case, both counts zero), more `a`s is 2.
+fn ref_ctx(above: Option<i8>, left: Option<i8>, a_set: &[i8], b_set: &[i8]) -> usize {
+    let a = [above, left]
+        .into_iter()
+        .flatten()
+        .filter(|r| a_set.contains(r))
+        .count();
+    let b = [above, left]
+        .into_iter()
+        .flatten()
+        .filter(|r| b_set.contains(r))
+        .count();
+    match a.cmp(&b) {
+        std::cmp::Ordering::Less => 0,
+        std::cmp::Ordering::Equal => 1,
+        std::cmp::Ordering::Greater => 2,
+    }
+}
+
+const FORWARD_REFS: [i8; 4] = [LAST_FRAME, LAST2_FRAME, LAST3_FRAME, GOLDEN_FRAME];
+const BACKWARD_REFS: [i8; 3] = [BWDREF_FRAME, ALTREF2_FRAME, ALTREF_FRAME];
+
+/// `av1_get_pred_context_single_ref_p1`: forward vs. backward reference.
+pub(crate) fn single_ref_p1_ctx(above: Option<i8>, left: Option<i8>) -> usize {
+    ref_ctx(above, left, &FORWARD_REFS, &BACKWARD_REFS)
+}
+
+/// `av1_get_pred_context_single_ref_p2`
+/// (`get_pred_context_brfarf2_or_arf`): `BWDREF`/`ALTREF2` vs. `ALTREF`.
+pub(crate) fn single_ref_p2_ctx(above: Option<i8>, left: Option<i8>) -> usize {
+    ref_ctx(above, left, &[BWDREF_FRAME, ALTREF2_FRAME], &[ALTREF_FRAME])
+}
+
+/// `av1_get_pred_context_single_ref_p3`
+/// (`get_pred_context_ll2_or_l3gld`): `LAST`/`LAST2` vs. `LAST3`/`GOLDEN`.
+pub(crate) fn single_ref_p3_ctx(above: Option<i8>, left: Option<i8>) -> usize {
+    ref_ctx(
+        above,
+        left,
+        &[LAST_FRAME, LAST2_FRAME],
+        &[LAST3_FRAME, GOLDEN_FRAME],
+    )
+}
+
+/// `av1_get_pred_context_single_ref_p4`
+/// (`get_pred_context_last_or_last2`): `LAST` vs. `LAST2`.
+pub(crate) fn single_ref_p4_ctx(above: Option<i8>, left: Option<i8>) -> usize {
+    ref_ctx(above, left, &[LAST_FRAME], &[LAST2_FRAME])
+}
+
+/// `av1_get_pred_context_single_ref_p5`
+/// (`get_pred_context_last3_or_gld`): `LAST3` vs. `GOLDEN`.
+pub(crate) fn single_ref_p5_ctx(above: Option<i8>, left: Option<i8>) -> usize {
+    ref_ctx(above, left, &[LAST3_FRAME], &[GOLDEN_FRAME])
+}
+
+/// `av1_get_pred_context_single_ref_p6`
+/// (`get_pred_context_brf_or_arf2`): `BWDREF` vs. `ALTREF2`.
+pub(crate) fn single_ref_p6_ctx(above: Option<i8>, left: Option<i8>) -> usize {
+    ref_ctx(above, left, &[BWDREF_FRAME], &[ALTREF2_FRAME])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
