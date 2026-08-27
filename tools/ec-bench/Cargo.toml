@@ -1,0 +1,22 @@
+[package]
+name = "ec-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "ec-bench"
+path = "src/main.rs"
+
+# Standing performance harness: real media -> each codec's public one-shot
+# API -> a ranked realtime-factor table. Drives ffmpeg/ffprobe as a child
+# process for extraction and duration only, same as the crates' own tests.
+[dependencies]
+ec-core = { workspace = true }
+ec-h264 = { workspace = true }
+ec-h265 = { workspace = true }
+ec-av1 = { workspace = true }
+ec-probe = { workspace = true }
+ec-h264-syntax = { workspace = true }
