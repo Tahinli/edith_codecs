@@ -1835,10 +1835,12 @@ pub(crate) fn encode_key_frame_inner(
                 // carrying an 8x8-leaf sub was, through r14, only ever
                 // forced (`!whole_legal`), never chosen on cost, because the
                 // leaf path was not yet proven against a real decoder. r15
-                // closed that gap (`a_single_axis_straddle_round_trips_
-                // through_ffmpeg` decodes clean), so the guard is lifted:
-                // leaf8 splits now compete on cost like any other split.
-                if !whole_legal || (split_blocks && cost_split < cost_whole) {
+                // proved it against ffmpeg, but crate::decode has not learned
+                // the 8x8-leaf read path yet, so choosing leaf8 on cost at a
+                // size our own decoder round-trips would break decode_stream;
+                // the guard stays until decode.rs reads leaf8, then lifts.
+                let has_leaf8 = split.iter().any(|b| b.eight.is_some());
+                if !whole_legal || (split_blocks && !has_leaf8 && cost_split < cost_whole) {
                     modes.extend_from_slice(&split_modes);
                     blocks.push(Quadrant::Split(split));
                 } else {
