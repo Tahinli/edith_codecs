@@ -52,6 +52,33 @@ const SUBPEL_FILTERS: [[i32; 8]; 16] = [
     [0, 0, -2, 8, 126, -6, 2, 0],
 ];
 
+/// `Subpel_Filters[EIGHTTAP]`'s narrow-block counterpart (spec 7.11.3.4's
+/// filter selection is per-axis: a `predict` axis whose output block
+/// dimension is 4 or less reads this table instead of [`SUBPEL_FILTERS`]),
+/// mirroring `av1_sub_pel_filters_4` (`filter.h`): the same 8-slot shape but
+/// zeroed at taps 0/1/6/7, so a 4-wide (or 4-tall) block's filter never
+/// reaches a full 3 samples past its own edge. Every 4:2:0 chroma block
+/// under an 8x8 (or smaller) luma leaf hits this on at least one axis --
+/// this is not an edge case, it is the common chroma shape.
+const SUBPEL_FILTERS_4: [[i32; 8]; 16] = [
+    [0, 0, 0, 128, 0, 0, 0, 0],
+    [0, 0, -4, 126, 8, -2, 0, 0],
+    [0, 0, -8, 122, 18, -4, 0, 0],
+    [0, 0, -10, 116, 28, -6, 0, 0],
+    [0, 0, -12, 110, 38, -8, 0, 0],
+    [0, 0, -12, 102, 48, -10, 0, 0],
+    [0, 0, -14, 94, 58, -10, 0, 0],
+    [0, 0, -12, 84, 66, -10, 0, 0],
+    [0, 0, -12, 76, 76, -12, 0, 0],
+    [0, 0, -10, 66, 84, -12, 0, 0],
+    [0, 0, -10, 58, 94, -14, 0, 0],
+    [0, 0, -10, 48, 102, -12, 0, 0],
+    [0, 0, -8, 38, 110, -12, 0, 0],
+    [0, 0, -6, 28, 116, -10, 0, 0],
+    [0, 0, -4, 18, 122, -8, 0, 0],
+    [0, 0, -2, 8, 126, -4, 0, 0],
+];
+
 /// A reference sample at `(x, y)`, clamped to the frame's true (unpadded)
 /// extent -- `true_width`/`true_height`, which can be narrower than
 /// `stride` -- rather than read out of range (spec 7.11.3.4's `Clip3`
@@ -137,8 +164,8 @@ pub fn predict(
         return;
     }
 
-    let h_filter = &SUBPEL_FILTERS[xfrac];
-    let v_filter = &SUBPEL_FILTERS[yfrac];
+    let h_filter = if block_w <= 4 { &SUBPEL_FILTERS_4[xfrac] } else { &SUBPEL_FILTERS[xfrac] };
+    let v_filter = if block_h <= 4 { &SUBPEL_FILTERS_4[yfrac] } else { &SUBPEL_FILTERS[yfrac] };
 
     // The vertical pass reads 3 rows above and 4 below the block, so the
     // horizontal pass must produce that many extra intermediate rows.
