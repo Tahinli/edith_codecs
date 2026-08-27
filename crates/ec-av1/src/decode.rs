@@ -564,11 +564,22 @@ fn read_intra_mode(
     left_mode: usize,
     cfl: bool,
 ) -> Result<(bool, usize, Option<(i32, i32)>)> {
+    let trace = std::env::var_os("EC_AV1_TRACE").is_some();
     let skip = dec.symbol(&mut cdfs.skip[0]) != 0;
-    let mode =
-        dec.symbol(&mut cdfs.kf_y_mode[INTRA_MODE_CTX[above_mode]][INTRA_MODE_CTX[left_mode]]);
+    if trace {
+        eprintln!("TRACE skip value={}", skip as i32);
+    }
+    let above_ctx = INTRA_MODE_CTX[above_mode];
+    let left_ctx = INTRA_MODE_CTX[left_mode];
+    let mode = dec.symbol(&mut cdfs.kf_y_mode[above_ctx][left_ctx]);
+    if trace {
+        eprintln!("TRACE y_mode ctx=({above_ctx},{left_ctx}) value={mode}");
+    }
     if (V_PRED..=D67_PRED).contains(&mode) {
         let angle = dec.symbol(&mut cdfs.angle_delta[mode - V_PRED]);
+        if trace {
+            eprintln!("TRACE angle_delta value={angle}");
+        }
         if angle != ANGLE_DELTA_ZERO {
             return Err(unsupported(
                 "a nonzero angle delta (this encoder never writes one)",
@@ -580,6 +591,9 @@ fn read_intra_mode(
     } else {
         dec.symbol(&mut cdfs.uv_mode_no_cfl[mode])
     };
+    if trace {
+        eprintln!("TRACE uv_mode cfl={cfl} y_mode={mode} value={uv_mode}");
+    }
     let alpha = if uv_mode == DC_PRED {
         None
     } else if cfl && uv_mode == UV_CFL_PRED {
@@ -1119,6 +1133,13 @@ pub fn decode_key_frame_tile(
     let scan4 = default_scan(TX4);
 
     let mut cdfs = Cdfs::new(q_ctx_of(base_q_idx));
+    if std::env::var_os("EC_AV1_TRACE").is_some() {
+        eprintln!(
+            "TRACE key_tile_bytes len={} first8={:02x?} base_q_idx={base_q_idx} mi_cols={mi_cols} mi_rows={mi_rows}",
+            data.len(),
+            &data[..data.len().min(8)]
+        );
+    }
     let mut dec = SymbolDecoder::new(data);
     let mut neighbours = Neighbours::new(
         cols32 as usize * 2,
@@ -1144,7 +1165,11 @@ pub fn decode_key_frame_tile(
             // mirroring [`crate::tile::sb_coeff_key_frame_tile`]'s own
             // three-way write exactly.
             let part = if has_cols && has_rows {
-                dec.symbol(&mut cdfs.partition_w64[ctx])
+                let p = dec.symbol(&mut cdfs.partition_w64[ctx]);
+                if std::env::var_os("EC_AV1_TRACE").is_some() {
+                    eprintln!("TRACE partition_w64 ctx={ctx} value={p}");
+                }
+                p
             } else {
                 match (has_cols, has_rows) {
                     (true, false) => {
@@ -1190,7 +1215,11 @@ pub fn decode_key_frame_tile(
                             has_half(r32 * BLOCK_MI, BLOCK_MI, mi_rows),
                         );
                         let part32 = if has_cols32 && has_rows32 {
-                            dec.symbol(&mut cdfs.partition_w32[ctx32])
+                            let p = dec.symbol(&mut cdfs.partition_w32[ctx32]);
+                            if std::env::var_os("EC_AV1_TRACE").is_some() {
+                                eprintln!("TRACE partition_w32 ctx={ctx32} value={p}");
+                            }
+                            p
                         } else {
                             match (has_cols32, has_rows32) {
                                 (true, false) => {
