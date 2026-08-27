@@ -1058,11 +1058,14 @@ fn code_square(
     let (luma_set, chroma_set) = if side == BLOCK {
         (TxbSet::Luma32, TxbSet::Chroma16)
     } else if side == 8 {
-        // An 8x8 leaf under a straddling 16x16 (lane-av1-rect): chroma of an
-        // 8x8 luma leaf still codes at its parent 16x16's granularity (see
-        // `TxbSet::Chroma4`'s doc comment), so the chroma set stays Chroma8
-        // even though luma has split down to 8x8.
-        (TxbSet::Luma8, TxbSet::Chroma8)
+        // An 8x8 leaf under a straddling 16x16 (lane-av1-rect). r5 correction:
+        // `TxbSet::Chroma4`'s doc now has the checked spec fact -- chroma is
+        // `is_chroma_reference` at every BLOCK_8X8, so it is coded per leaf at
+        // 4x4, not once at the parent's 8x8. No caller passes `side == 8` yet
+        // (this branch is still unreached), so leaving `Chroma8` here would
+        // silently wire the wrong table the moment one does; `Chroma4` is
+        // what a real caller needs.
+        (TxbSet::Luma8, TxbSet::Chroma4)
     } else {
         (TxbSet::Luma16, TxbSet::Chroma8)
     };
