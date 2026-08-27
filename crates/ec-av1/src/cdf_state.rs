@@ -204,7 +204,7 @@ pub(crate) struct Cdfs {
     /// The transform type of a 16x16 intra luma transform, by luma mode.
     pub intra_tx_type_16: [[u16; 6]; 13],
     /// The transform type of an 8x8 intra luma transform, by luma mode.
-    pub intra_tx_type_8: [[u16; 8]; 13],
+    pub intra_tx_type_8: [[u16; 6]; 13],
     /// The transform type of an `is_inter` 32x32 luma transform (spec
     /// `TX_SET_INTER_3`, `TX_32X32` row) -- unlike the intra 16x16 table, it
     /// is not indexed by mode.
@@ -624,7 +624,7 @@ impl Cdfs {
             ),
             dc_sign_luma: cdf::DC_SIGN_LUMA,
             intra_tx_type_16: cdf::INTRA_TX_TYPE_SET2_16,
-            intra_tx_type_8: cdf::INTRA_TX_TYPE_SET1_8,
+            intra_tx_type_8: cdf::INTRA_TX_TYPE_SET2_8,
             inter_tx_type_32: cdf::INTER_TX_TYPE_SET3_32,
             inter_tx_type_16: cdf::INTER_TX_TYPE_SET3_16,
             dc_sign_chroma: cdf::DC_SIGN_CHROMA,
