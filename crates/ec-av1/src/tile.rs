@@ -804,8 +804,14 @@ impl Neighbours {
     }
 
     fn partition_ctx(&self, at: (usize, usize), side: usize) -> usize {
+        // Delegates to the mi-precise reader (same pattern as `around` /
+        // `around_mi`): `above_side`/`left_side` are only ever advanced in
+        // whole-[`SUB`] steps by [`Self::record`], so a leaf8's `record_mi`
+        // (lane-av1-rect) -- which only touches the finer mi arrays -- leaves
+        // them stale for the *next* sibling's own partition symbol, reading a
+        // 16x16-slot side that already split into 8x8s underneath it.
         let (r, c) = at;
-        2 * usize::from(self.left_side[r] * 2 <= side) + usize::from(self.above_side[c] * 2 <= side)
+        self.partition_ctx_mi((r * (SUB / MI), c * (SUB / MI)), side)
     }
 
     /// [`Self::partition_ctx`] at mi granularity, for an 8x8 leaf of a
