@@ -836,6 +836,7 @@ fn encode_subblock(
     } else {
         15
     };
+    let sig_base = sig_ctx_base(xs, ys, sub_wide, csbf, log2_size, c_idx, scan_idx);
     let mut scan_pos = first;
     while scan_pos >= 0 {
         let p = scan_pos as usize;
@@ -845,7 +846,7 @@ fn encode_subblock(
         let yc = ys * 4 + yp as usize;
         let sig = levels[yc * n + xc] != 0;
         if p > 0 || !infer_dc_sig {
-            let inc = sig_ctx_inc(xc, yc, xs, ys, sub_wide, csbf, log2_size, c_idx, scan_idx);
+            let inc = sig_ctx_inc(xc, yc, log2_size, c_idx, sig_base);
             enc.encode_bin(ctx::SIG_COEFF + inc, u32::from(sig));
         }
         significant[p] = sig;
@@ -1095,6 +1096,7 @@ pub fn decode_residual(
         } else {
             15
         };
+        let sig_base = sig_ctx_base(xs, ys, sub_wide, &csbf, log2_size, c_idx, scan_idx);
         let mut scan_pos = first;
         while scan_pos >= 0 {
             let p = scan_pos as usize;
@@ -1103,7 +1105,7 @@ pub fn decode_residual(
             let xc = xs * 4 + xp as usize;
             let yc = ys * 4 + yp as usize;
             let sig = if p > 0 || !infer_dc_sig {
-                let inc = sig_ctx_inc(xc, yc, xs, ys, sub_wide, &csbf, log2_size, c_idx, scan_idx);
+                let inc = sig_ctx_inc(xc, yc, log2_size, c_idx, sig_base);
                 dec.decode_bin(ctx::SIG_COEFF + inc) != 0
             } else {
                 false // filled in by the post-loop inference below
@@ -1202,9 +1204,13 @@ pub fn decode_residual(
 
 /// `ctxInc` for `sig_coeff_flag` (9.3.4.2.5).
 #[allow(clippy::too_many_arguments)]
-fn sig_ctx_inc(
-    xc: usize,
-    yc: usize,
+/// Sub-block-invariant part of [`sig_ctx_inc`]'s context: `prev_csbf` and the
+/// additive base both depend only on the sub-block's own coordinates
+/// (`xs`/`ys`), never on the position within it, so a caller stepping through
+/// up to 15 significant positions in one sub-block computes this once instead
+/// of on every position. `None` when `log2_size == 2` (the small-block path
+/// doesn't use `prev_csbf`/base at all — [`sig_ctx_inc`] handles it directly).
+fn sig_ctx_base(
     xs: usize,
     ys: usize,
     sub_wide: usize,
@@ -1212,20 +1218,52 @@ fn sig_ctx_inc(
     log2_size: u32,
     c_idx: usize,
     scan_idx: usize,
+) -> Option<(usize, usize)> {
+    if log2_size == 2 {
+        return None;
+    }
+    let mut prev_csbf = 0usize;
+    if xs < sub_wide - 1 && csbf[ys * sub_wide + xs + 1] {
+        prev_csbf += 1;
+    }
+    if ys < sub_wide - 1 && csbf[(ys + 1) * sub_wide + xs] {
+        prev_csbf += 2;
+    }
+    let mut base = 0usize;
+    if c_idx == 0 {
+        if xs + ys > 0 {
+            base += 3;
+        }
+        if log2_size == 3 {
+            base += if scan_idx == 0 { 9 } else { 15 };
+        } else {
+            base += 21;
+        }
+    } else if log2_size == 3 {
+        base += 9;
+    } else {
+        base += 12;
+    }
+    if c_idx != 0 {
+        base += 27;
+    }
+    Some((prev_csbf, base))
+}
+
+fn sig_ctx_inc(
+    xc: usize,
+    yc: usize,
+    log2_size: u32,
+    c_idx: usize,
+    base: Option<(usize, usize)>,
 ) -> usize {
-    let mut sig_ctx;
+    let sig_ctx;
     if log2_size == 2 {
         sig_ctx = CTX_IDX_MAP[(yc << 2) + xc];
     } else if xc + yc == 0 {
         sig_ctx = 0;
     } else {
-        let mut prev_csbf = 0usize;
-        if xs < sub_wide - 1 && csbf[ys * sub_wide + xs + 1] {
-            prev_csbf += 1;
-        }
-        if ys < sub_wide - 1 && csbf[(ys + 1) * sub_wide + xs] {
-            prev_csbf += 2;
-        }
+        let (prev_csbf, base) = base.expect("sig_ctx_base returns Some when log2_size != 2");
         let (xp, yp) = (xc & 3, yc & 3);
         sig_ctx = match prev_csbf {
             0 => {
@@ -1257,20 +1295,7 @@ fn sig_ctx_inc(
             }
             _ => 2,
         };
-        if c_idx == 0 {
-            if xs + ys > 0 {
-                sig_ctx += 3;
-            }
-            if log2_size == 3 {
-                sig_ctx += if scan_idx == 0 { 9 } else { 15 };
-            } else {
-                sig_ctx += 21;
-            }
-        } else if log2_size == 3 {
-            sig_ctx += 9;
-        } else {
-            sig_ctx += 12;
-        }
+        return sig_ctx + base;
     }
     if c_idx == 0 { sig_ctx } else { 27 + sig_ctx }
 }
