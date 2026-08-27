@@ -74,6 +74,19 @@ static TX_DEPTH_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomic
 pub(crate) fn tx_depth_hits() -> usize {
     TX_DEPTH_HITS.load(std::sync::atomic::Ordering::Relaxed)
 }
+
+/// How many [`read_coeffs`] reads resolved a `tx_type` outside `TX_CLASS_2D`
+/// (`V_DCT`/`H_DCT`, spec 5.11.39's `TxClass::Horiz`/`Vert`), across every
+/// call in the process -- the same before/after counter pattern as
+/// [`TX_DEPTH_HITS`], proving a stream actually exercised the class-split
+/// `eob_pt`/1D-neighbour context path rather than every block coincidentally
+/// landing on `DCT_DCT`.
+static TX_CLASS1_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Current value of [`TX_CLASS1_HITS`].
+pub(crate) fn tx_class1_hits() -> usize {
+    TX_CLASS1_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
 const SUB_MI: u32 = 4;
 const MI: usize = 4;
 const SB: usize = 64;
@@ -225,7 +238,15 @@ fn nz_map_ctx_offset_1d(i: usize) -> usize {
 }
 
 fn base_ctx(grid: &[i32], side: usize, row: usize, col: usize, class: TxClass) -> usize {
-    if row == 0 && col == 0 {
+    // libaom's `get_nz_map_ctx_from_stats` only special-cases the DC
+    // coefficient to ctx 0 for `TX_CLASS_2D` (`(tx_class | coeff_idx) == 0`,
+    // txb_common.h) -- `V_DCT`/`H_DCT` (class `Horiz`/`Vert`) still run the DC
+    // position through the full 1D neighbour sum and offset table. Skipping
+    // that for every class desynced the last (DC) coefficient of a
+    // `TX_CLASS_HORIZ` block (lane-av1tx4 final round: real ctx 28 read as
+    // 0, which then read one extra `BR` symbol at the max and forced a
+    // spurious third Golomb call).
+    if class == TxClass::TwoD && row == 0 && col == 0 {
         return 0;
     }
     let offsets: [(usize, usize); 5] = match class {
@@ -383,6 +404,9 @@ fn read_coeffs(
     }
 
     let class = TxClass::of(tx_type);
+    if class != TxClass::TwoD {
+        TX_CLASS1_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     let eob = read_eob(dec, coding, class);
     if trace {
         eprintln!("TRACE eob value={eob}");
@@ -2814,7 +2838,11 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                         let part32 = if has_cols32 && has_rows32 {
                             let p = dec.symbol(&mut cdfs.partition_w32[ctx32]);
                             if std::env::var_os("EC_AV1_TRACE").is_some() {
-                                eprintln!("TRACE partition_w32 ctx={ctx32} value={p}");
+                                eprintln!(
+                                    "TRACE partition_w32 mi=({},{}) ctx={ctx32} value={p}",
+                                    r32 * BLOCK_MI,
+                                    c32 * BLOCK_MI
+                                );
                             }
                             p
                         } else {
@@ -2934,6 +2962,11 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                             let leaf_ctx = neighbours.partition_ctx_mi(leaf_mi, 8);
                                             let part8 =
                                                 dec.symbol(&mut cdfs.partition_w8[leaf_ctx]);
+                                            if std::env::var_os("EC_AV1_TRACE").is_some() {
+                                                eprintln!(
+                                                    "TRACE partition_w8 mi=({mr},{mc}) ctx={leaf_ctx} value={part8}"
+                                                );
+                                            }
                                             if part8 != PARTITION_NONE {
                                                 return Err(unsupported(
                                                     "a partition below 8x8 (this encoder never writes one)",
@@ -2998,6 +3031,11 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                         let leaf_mi = (mr as usize, mc as usize);
                                         let leaf_ctx = neighbours.partition_ctx_mi(leaf_mi, 8);
                                         let part8 = dec.symbol(&mut cdfs.partition_w8[leaf_ctx]);
+                                        if std::env::var_os("EC_AV1_TRACE").is_some() {
+                                            eprintln!(
+                                                "TRACE partition_w8 mi=({mr},{mc}) ctx={leaf_ctx} value={part8}"
+                                            );
+                                        }
                                         if part8 != PARTITION_NONE {
                                             return Err(unsupported(
                                                 "a partition below 8x8 (this encoder never writes one)",
