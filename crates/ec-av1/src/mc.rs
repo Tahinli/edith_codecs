@@ -111,6 +111,32 @@ pub fn predict(
     let y0 = y_q4.div_euclid(16);
     let yfrac = y_q4.rem_euclid(16) as usize;
 
+    // Whole-pel fast path: `SUBPEL_FILTERS[0]` is the identity tap (`128` at
+    // its centre, everything else `0`), and both rounding shifts are exactly
+    // that filter's own gain (see `INTER_ROUND_1`'s doc comment), so the two
+    // 8-tap passes reproduce the reference sample byte-for-byte here --
+    // `integer_mv_is_identity` below pins that. Skipping straight to a
+    // clamped copy is bit-identical, not an approximation: it matters
+    // because the motion search's own log/diamond stage (`motion.rs`) is
+    // whole-pel-only and calls `predict` for every candidate it prices, so
+    // this path is what most of a search's `predict` calls actually hit
+    // (measured: `stage_timing_breakdown_inter` attributed 403 of a 720p
+    // inter frame's 408ms motion-search bucket to `predict`, almost all of
+    // it whole-pel candidates from stage 1).
+    if xfrac == 0 && yfrac == 0 {
+        for row in 0..block_h {
+            let y = y0 + row as i32;
+            for col in 0..block_w {
+                let x = x0 + col as i32;
+                dst[row * block_w + col] =
+                    sample(reference, stride, true_width, true_height, x, y) as u8;
+            }
+        }
+        #[cfg(test)]
+        crate::encode::stage_add(1, stage_t.elapsed());
+        return;
+    }
+
     let h_filter = &SUBPEL_FILTERS[xfrac];
     let v_filter = &SUBPEL_FILTERS[yfrac];
 
