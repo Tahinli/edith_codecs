@@ -1,20 +1,31 @@
 //! The stream-level entry point a real decoder needs: walk a raw AV1 OBU
 //! stream (`Encoded::stream`, or any low-overhead-format bitstream this
 //! crate's own writers produce) via [`ec_av1_syntax::Av1Parser`] and dispatch
-//! each frame's tile payload to [`crate::decode::decode_key_frame_tile`] /
-//! [`crate::decode::decode_inter_frame_tile`], threading a single-slot DPB
-//! exactly as [`crate::encode::encode_sequence`] does on the write side.
+//! each frame's tile payload to [`crate::decode::decode_key_frame_tile_with_cdfs`] /
+//! [`crate::decode::decode_inter_frame_tile_with_cdfs`], threading a
+//! single-slot picture DPB exactly as [`crate::encode::encode_sequence`] does
+//! on the write side, plus the full 8-slot *CDF* reference bank spec 7.20
+//! (`load_cdfs`) and 7.4 (the reference frame update) describe: a frame whose
+//! header names `primary_ref_frame != PRIMARY_REF_NONE` resumes from the
+//! adapted table a previous frame's `refresh_frame_flags` left in that slot,
+//! rather than the spec 8.4 defaults.
 //!
 //! This is the only reachable path for a caller that does not have the
 //! encoder's own `Encoded::tile`/`mi_cols`/`mi_rows`/`base_q_idx` fields (they
 //! are `pub(crate)`, and rightly so: the wire is `stream`, everything else is
 //! an implementation detail of how this crate happens to build it).
 
-use ec_av1_syntax::{Av1Parser, FrameType, ObuKind, TxMode, WarpModel};
+use ec_av1_syntax::{
+    Av1Parser, FrameType, NUM_REF_FRAMES, ObuKind, PRIMARY_REF_NONE, TxMode, WarpModel,
+};
 use ec_core::{Error, Result};
 
+use crate::cdf_state::Cdfs;
 use crate::decode;
-use crate::decode::{decode_inter_frame_tile, decode_key_frame_tile};
+use crate::decode::{
+    decode_inter_frame_tile_with_cdfs, decode_key_frame_tile, decode_key_frame_tile_with_cdfs,
+    q_ctx_of,
+};
 use crate::encode::Picture;
 
 /// Decode every frame in a raw AV1 OBU stream, in coding order.
@@ -35,7 +46,24 @@ use crate::encode::Picture;
 pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
     let mut parser = Av1Parser::new();
     let mut pictures = Vec::new();
-    let mut reference: Option<Picture> = None;
+    // Spec 7.20/7.4: each of the 8 reference slots remembers the picture a
+    // previous frame's `refresh_frame_flags` stored into it, exactly like the
+    // CDF slots below -- `LAST_FRAME` names a slot via `ref_frame_idx[0]`,
+    // not simply "the previous frame decoded"; a frame whose own predecessor
+    // didn't refresh that slot (an altref/hidden frame, or any GOP with more
+    // than one live reference) must keep predicting from whatever picture is
+    // still sitting there. Round 7's cdffwd hunt: a global `reference`
+    // overwritten every frame silently always used "the most recent decode"
+    // instead, producing a bit-exact motion vector into the WRONG picture --
+    // luma-only (chroma coincidentally shares this fixture's flat regions)
+    // and small-magnitude (the two pictures mostly agree), which is exactly
+    // what made it look like a rounding bug rather than a wrong reference.
+    let mut ref_slots: [Option<Picture>; NUM_REF_FRAMES] = std::array::from_fn(|_| None);
+    // Spec 7.20/7.4: each of the 8 reference slots remembers the CDF state a
+    // previous frame's `refresh_frame_flags` stored into it -- the frame's
+    // own end-of-tile adapted table, or (when the frame set
+    // `disable_frame_end_update_cdf`) the table it started from, unchanged.
+    let mut cdf_slots: [Option<Cdfs>; NUM_REF_FRAMES] = std::array::from_fn(|_| None);
 
     let mut pos = 0usize;
     while pos < data.len() {
@@ -110,6 +138,18 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 "a frame with segmentation enabled (this decoder never reads a per-block segment_id symbol)",
             ));
         }
+        // Loop restoration carries per-restoration-unit symbols in the tile
+        // (spec 5.11.57 `read_lr`, one group per LR unit reached from the
+        // superblock walk) that this decoder never reads -- same
+        // silent-desync shape as the refusals above. Traced live 2026-08-27:
+        // an aomenc inter frame with `Sgrproj` on the V plane desynced the
+        // partition walk into out-of-alphabet garbage.
+        if header.loop_restoration.uses_lr {
+            return Err(Error::unsupported(
+                "AV1 decode_stream",
+                "a frame with loop restoration enabled (this decoder never reads the per-unit lr symbols)",
+            ));
+        }
         // `decode_inter_block`/`decode_inter_block8`'s `GLOBALMV` arm (spec
         // 5.11.26's `read_inter_intra`... really `assign_mv`'s `GLOBALMV`
         // case, spec 7.10.2.1) uses `gm_get_motion_vector`, which is the
@@ -125,6 +165,17 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 "an inter frame whose LAST_FRAME global motion is not IDENTITY (GLOBALMV needs the full warp derivation this decoder does not carry)",
             ));
         }
+        // `context_update_tile_id` (spec `decode_tile`/`exit_symbol`) names
+        // which tile's end-of-tile adapted CDFs become the frame's own; this
+        // decoder only ever decodes tile 0 (`tiles.first()` above), so a
+        // multi-tile frame is refused rather than silently forwarding the
+        // wrong tile's table (or leaving the rest of the picture undecoded).
+        if header.tile_info.cols > 1 || header.tile_info.rows > 1 {
+            return Err(Error::unsupported(
+                "AV1 decode_stream",
+                "a frame with more than one tile (this decoder only ever decodes tile 0)",
+            ));
+        }
         // `Tile::offset` is relative to the buffer `parse_obu` was handed
         // (`&data[pos..]` at the time this OBU was parsed), so it is relative
         // to `obu_offset`, not to `data` as a whole.
@@ -134,8 +185,25 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
             .sequence_header()
             .is_some_and(|seq| seq.enable_filter_intra);
 
-        let picture = if header.frame_type == FrameType::Key {
-            decode_key_frame_tile(
+        // Spec 7.20 `load_cdfs`: a frame naming a `primary_ref_frame` resumes
+        // from that reference slot's saved CDF state instead of the spec 8.4
+        // defaults `decode_key/inter_frame_tile_with_cdfs`'s `None` case
+        // builds.
+        let initial_cdfs = if header.primary_ref_frame == PRIMARY_REF_NONE {
+            None
+        } else {
+            let slot = header.ref_frame_idx[header.primary_ref_frame as usize] as usize;
+            Some(cdf_slots[slot].clone().ok_or_else(|| {
+                Error::unsupported(
+                    "AV1 decode_stream",
+                    "a frame naming primary_ref_frame at a reference slot with no saved CDF state",
+                )
+            })?)
+        };
+        let started_from = initial_cdfs.clone();
+
+        let (picture, end_cdfs) = if header.frame_type == FrameType::Key {
+            decode_key_frame_tile_with_cdfs(
                 tile_bytes,
                 header.mi_cols,
                 header.mi_rows,
@@ -145,15 +213,17 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 enable_filter_intra,
                 &header.cdef,
                 &header.loop_filter,
+                initial_cdfs,
             )?
         } else {
-            let reference = reference.as_ref().ok_or_else(|| {
+            let last_slot = header.ref_frame_idx[0] as usize;
+            let reference = ref_slots[last_slot].as_ref().ok_or_else(|| {
                 Error::unsupported(
                     "AV1 decode_stream",
                     "an inter frame with no key frame before it",
                 )
             })?;
-            decode_inter_frame_tile(
+            decode_inter_frame_tile_with_cdfs(
                 tile_bytes,
                 header.mi_cols,
                 header.mi_rows,
@@ -163,9 +233,47 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 reference,
                 &header.cdef,
                 &header.loop_filter,
+                initial_cdfs,
+                header.allow_high_precision_mv,
             )?
         };
-        reference = Some(picture.clone());
+        // Spec 7.20: `disable_frame_end_update_cdf` stores the frame's
+        // *initial* table into the slots it refreshes, not the adapted
+        // end-of-tile one.
+        let stored_cdfs = if header.disable_frame_end_update_cdf {
+            started_from.unwrap_or_else(|| Cdfs::new(q_ctx_of(header.quantization.base_q_idx)))
+        } else {
+            // Spec 7.20 `save_cdfs` (libaom `av1_reset_cdf_symbol_counters`):
+            // the adapted table is saved with every symbol counter zeroed,
+            // not with the counts the tile's own decode left behind.
+            let mut end_cdfs = end_cdfs;
+            end_cdfs.reset_counts();
+            end_cdfs
+        };
+        if let Ok(path) = std::env::var("EC_AV1_DUMP_TABLES") {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                let _ = writeln!(f, "=== frame idx={} ===", pictures.len());
+                let _ = writeln!(f, "partition_w64 {:?}", stored_cdfs.partition_w64);
+                let _ = writeln!(f, "partition_w32 {:?}", stored_cdfs.partition_w32);
+                let _ = writeln!(f, "partition_w16 {:?}", stored_cdfs.partition_w16);
+                let _ = writeln!(f, "skip {:?}", stored_cdfs.skip);
+                let _ = writeln!(f, "new_mv {:?}", stored_cdfs.new_mv);
+                let _ = writeln!(f, "zero_mv {:?}", stored_cdfs.zero_mv);
+                let _ = writeln!(f, "ref_mv {:?}", stored_cdfs.ref_mv);
+                let _ = writeln!(f, "mv_joint {:?}", stored_cdfs.mv_joint);
+            }
+        }
+        for i in 0..NUM_REF_FRAMES {
+            if header.refresh_frame_flags & (1 << i) != 0 {
+                cdf_slots[i] = Some(stored_cdfs.clone());
+                ref_slots[i] = Some(picture.clone());
+            }
+        }
         pictures.push(picture);
     }
     Ok(pictures)
@@ -837,6 +945,10 @@ mod tests {
                 "--enable-angle-delta=0",
                 "--enable-tx-size-search=0",
                 "--enable-cdef=0",
+                // Loop restoration is a named refusal (aomenc's RD picks
+                // Sgrproj on this kind of content) -- off in every recipe
+                // whose test targets a different surface.
+                "--enable-restoration=0",
                 "--max-partition-size=32",
                 "--enable-palette=0",
                 "--enable-intrabc=0",
@@ -964,6 +1076,10 @@ mod tests {
                 "--enable-angle-delta=0",
                 "--enable-tx-size-search=0",
                 "--enable-cdef=0",
+                // Loop restoration is a named refusal (aomenc's RD picks
+                // Sgrproj on this kind of content) -- off in every recipe
+                // whose test targets a different surface.
+                "--enable-restoration=0",
                 "--max-partition-size=32",
                 "--enable-palette=0",
                 "--enable-intrabc=0",
@@ -1014,6 +1130,180 @@ mod tests {
         }
     }
 
+    /// The decisive cross-frame CDF forwarding test: identical to
+    /// [`a_real_aomenc_inter_sequence_with_deblocking_decodes_pixel_exact`]
+    /// except it drops `--error-resilient=1`, so aomenc codes every inter
+    /// frame's `primary_ref_frame` at its default (not `PRIMARY_REF_NONE`)
+    /// and expects the decoder to resume from the previous frame's *adapted*
+    /// CDF state (spec 7.20 `load_cdfs`). Without cross-frame forwarding,
+    /// frame 1's very first tile symbol desyncs (an out-of-alphabet
+    /// partition read); with it, every frame decodes pixel-exact.
+    #[test]
+    fn a_real_aomenc_inter_sequence_with_cdf_forwarding_decodes_pixel_exact() {
+        if !have_ffmpeg() {
+            eprintln!(
+                "SKIP a_real_aomenc_inter_sequence_with_cdf_forwarding_decodes_pixel_exact: no ffmpeg"
+            );
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!(
+                "SKIP a_real_aomenc_inter_sequence_with_cdf_forwarding_decodes_pixel_exact: no aomenc at {}",
+                aomenc_path().display()
+            );
+            return;
+        }
+        let (width, height, frame_count) = (64usize, 64usize, 4usize);
+        // aomenc's RD is nondeterministic run to run even on a fixed fixture:
+        // most encodes of this recipe trip one of the decoder's NAMED round-2
+        // refusals (a reference other than LAST_FRAME, a sub-16 partition --
+        // genuine coverage gaps, separately documented), and only some produce
+        // a stream fully inside this decoder's declared support. So: attempt
+        // several seeds, and the first stream that DECODES must be pixel-exact
+        // -- that assertion is what guards the forwarded-CDF state (a wrong
+        // table decodes plausible-but-wrong pixels; the counter-reset bug this
+        // gate caught did exactly that). Exhausting every attempt on named
+        // refusals skips loudly, listing them.
+        let mut refusals = Vec::new();
+        for attempt in 0..8u32 {
+            let seed = 42 + attempt;
+            let source = format!("gradients=size=64x64:seed={seed}:duration=0.16:rate=25");
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let mut child = Command::new(aomenc_path())
+                .args([
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    "--cq-level=55",
+                    "--cpu-used=0",
+                    "--lag-in-frames=0",
+                    "--auto-alt-ref=0",
+                    "--kf-max-dist=1000",
+                    // `--threads=1` (not the default): a multithreaded RD search
+                    // makes aomenc's screen-content-tools heuristic race (seen
+                    // flaky under `cargo test`'s own parallelism -- the same
+                    // fixture, same seed, occasionally sets
+                    // `allow_screen_content_tools`, a round-2 gap unrelated to
+                    // CDF forwarding), so pin it to one thread for a
+                    // deterministic header.
+                    "--threads=1",
+                    "--row-mt=0",
+                    // No `--error-resilient=1` here (that is the whole point of
+                    // this test), but every other reference/compound tool this
+                    // decoder's round-2 inter path does not model is still
+                    // disabled the same way `--error-resilient=1` incidentally
+                    // disabled it in the sibling test above: without
+                    // `--enable-order-hint=0` aomenc's RD search picks a
+                    // non-`LAST_FRAME` reference (`GOLDEN_FRAME`) for some
+                    // blocks even in this short a sequence, which is a separate,
+                    // already-documented round-2 gap ("a reference frame other
+                    // than LAST_FRAME"), not a CDF-forwarding one.
+                    "--enable-order-hint=0",
+                    "--enable-warped-motion=0",
+                    "--enable-obmc=0",
+                    "--enable-masked-comp=0",
+                    "--enable-interintra-comp=0",
+                    "--enable-dist-wtd-comp=0",
+                    "--enable-diff-wtd-comp=0",
+                    "--enable-onesided-comp=0",
+                    "--enable-interintra-wedge=0",
+                    "--enable-smooth-interintra=0",
+                    "--enable-rect-partitions=0",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    "--enable-filter-intra=0",
+                    "--enable-smooth-intra=0",
+                    "--enable-paeth-intra=0",
+                    "--enable-directional-intra=0",
+                    "--enable-angle-delta=0",
+                    "--enable-tx-size-search=0",
+                    "--enable-cdef=0",
+                    // Loop restoration is a named refusal (aomenc's RD picks
+                    // Sgrproj on this kind of content) -- off in every recipe
+                    // whose test targets a different surface.
+                    "--enable-restoration=0",
+                    "--max-partition-size=32",
+                    "--enable-palette=0",
+                    "--enable-intrabc=0",
+                    "--enable-cfl-intra=0",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            // A named `unsupported` refusal is a documented coverage gap (each
+            // one carries its own test debt elsewhere), not a forwarding verdict
+            // -- try the next seed. Any stream that DECODES must be pixel-exact,
+            // and any non-refusal error is a hard failure.
+            let frames = match decode_stream(&stream) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "cross-frame CDF forwarding failed outright (seed {seed}): {msg}"
+                    );
+                    refusals.push(format!("seed {seed}: {msg}"));
+                    continue;
+                }
+                Ok(frames) => frames,
+            };
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
+            assert_eq!(frames.len(), frame_count);
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(got.y, want.y, "frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(got.u, want.u, "frame {i} U vs ffmpeg (seed {seed})");
+                assert_eq!(got.v, want.v, "frame {i} V vs ffmpeg (seed {seed})");
+            }
+            return;
+        }
+        eprintln!(
+            "SKIP a_real_aomenc_inter_sequence_with_cdf_forwarding_decodes_pixel_exact: every \
+             attempt hit a named refusal:\n{}",
+            refusals.join("\n")
+        );
+    }
+
     /// scratch: isolate a pinned mismatching stream's first divergent pixel.
     #[test]
     #[ignore]
@@ -1035,51 +1325,60 @@ mod tests {
                     );
                     eprintln!("delta: {:?}", header.delta);
                     eprintln!("segmentation: {:?}", header.segmentation);
+                    eprintln!("loop_restoration: {:?}", header.loop_restoration);
+                    eprintln!(
+                        "use_128x128_superblock: {:?} disable_cdf_update: {:?} disable_frame_end_update_cdf: {:?} primary_ref_frame: {:?} allow_high_precision_mv: {:?} force_integer_mv: {:?}",
+                        p.sequence_header().map(|s| s.use_128x128_superblock),
+                        header.disable_cdf_update,
+                        header.disable_frame_end_update_cdf,
+                        header.primary_ref_frame,
+                        header.allow_high_precision_mv,
+                        header.force_integer_mv,
+                    );
                 }
             }
         }
-        let width = 32;
-        let height = 32;
+        let width = std::env::var("EC_AV1_PIN_W")
+            .map(|s| s.parse().unwrap())
+            .unwrap_or(64);
+        let height = std::env::var("EC_AV1_PIN_H")
+            .map(|s| s.parse().unwrap())
+            .unwrap_or(64);
+        let frame_count = std::env::var("EC_AV1_PIN_N")
+            .map(|s| s.parse().unwrap())
+            .unwrap_or(4);
         let frames = decode_stream(&stream).expect("our decode");
-        let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
-        let ours = &frames[0];
-        let theirs = &ffmpeg_frames[0];
-        for (plane_name, a, b, w) in [
-            ("y", &ours.y, &theirs.y, width),
-            ("u", &ours.u, &theirs.u, width / 2),
-            ("v", &ours.v, &theirs.v, width / 2),
-        ] {
-            let mut first = None;
-            let mut count = 0;
-            for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
-                if x != y {
-                    count += 1;
-                    if first.is_none() {
-                        first = Some(i);
+        let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
+        for f in 0..frame_count.min(frames.len()).min(ffmpeg_frames.len()) {
+            let ours = &frames[f];
+            let theirs = &ffmpeg_frames[f];
+            for (plane_name, a, b, w) in [
+                ("y", &ours.y, &theirs.y, width),
+                ("u", &ours.u, &theirs.u, width / 2),
+                ("v", &ours.v, &theirs.v, width / 2),
+            ] {
+                let mut first = None;
+                let mut count = 0;
+                for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+                    if x != y {
+                        count += 1;
+                        if first.is_none() {
+                            first = Some(i);
+                        }
                     }
                 }
+                if let Some(i) = first {
+                    eprintln!(
+                        "frame {f} plane {plane_name}: {count} mismatches, first at offset {i} (row {}, col {}) ours={} theirs={}",
+                        i / w,
+                        i % w,
+                        a[i],
+                        b[i]
+                    );
+                } else {
+                    eprintln!("frame {f} plane {plane_name}: MATCH");
+                }
             }
-            if let Some(i) = first {
-                eprintln!(
-                    "plane {plane_name}: {count} mismatches, first at offset {i} (row {}, col {}) ours={} theirs={}",
-                    i / w,
-                    i % w,
-                    a[i],
-                    b[i]
-                );
-            } else {
-                eprintln!("plane {plane_name}: MATCH");
-            }
-        }
-        for row in 0..8 {
-            eprintln!(
-                "ours  row{row}: {:?}",
-                &ours.y[row * width..row * width + 8]
-            );
-            eprintln!(
-                "theirs row{row}: {:?}",
-                &theirs.y[row * width..row * width + 8]
-            );
         }
     }
 }
