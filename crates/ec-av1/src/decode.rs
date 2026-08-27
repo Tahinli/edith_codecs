@@ -100,6 +100,15 @@ pub(crate) fn directional_uv_hits() -> usize {
 /// proving a stream actually exercised a nonzero angle delta.
 static ANGLE_DELTA_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+thread_local! {
+    /// The sequence header's `enable_intra_edge_filter`, set once per
+    /// [`decode_key_frame_tile_with_cdfs`] call: [`PlaneBuf::reconstruct`]'s
+    /// own read of it, kept off the call stack (see that function's own doc
+    /// comment for why) rather than threaded through every `read_plane`/
+    /// `decode_block`/`decode_leaf8` call between here and there.
+    static ENABLE_EDGE_FILTER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Current value of [`ANGLE_DELTA_HITS`].
 pub(crate) fn angle_delta_hits() -> usize {
     ANGLE_DELTA_HITS.load(std::sync::atomic::Ordering::Relaxed)
@@ -1266,6 +1275,20 @@ impl PlaneBuf {
                 &mut prediction,
             );
         } else {
+            // `enable_intra_edge_filter` is the sequence header's own flag
+            // (`ENABLE_EDGE_FILTER`, set once per `decode_key_frame_tile_with_cdfs`
+            // call, never per-block) -- threading it through every
+            // `read_plane`/`decode_block`/`decode_leaf8` call would touch two
+            // dozen sites for a value that never changes mid-decode, so it
+            // rides a thread-local instead (this decoder is single-threaded
+            // per stream). `smooth_neighbor` (spec `get_intra_edge_filter_type`)
+            // is left `false`: exact for chroma here (a smooth `uv_mode` is
+            // refused before decode reaches this call) and a corner-cut for
+            // luma -- ceiling is one wrong filter-strength bucket on a block
+            // whose real neighbour predicted smooth; upgrade path is
+            // threading `Neighbours::above_mode`/`left_mode`'s
+            // `SMOOTH_PRED..=SMOOTH_H_PRED` membership down instead of `false`.
+            let enable_edge_filter = ENABLE_EDGE_FILTER.with(std::cell::Cell::get);
             predict(
                 mode as u8,
                 angle_delta,
@@ -1273,6 +1296,8 @@ impl PlaneBuf {
                 left.as_deref(),
                 corner,
                 side,
+                enable_edge_filter,
+                false,
                 &mut prediction,
             );
         }
@@ -2880,6 +2905,7 @@ pub fn decode_key_frame_tile(
         frame_width,
         frame_height,
         enable_filter_intra,
+        false,
         cdef,
         loop_filter,
         None,
@@ -2905,6 +2931,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     frame_width: u32,
     frame_height: u32,
     enable_filter_intra: bool,
+    enable_edge_filter: bool,
     cdef: &CdefParams,
     loop_filter: &LoopFilterParams,
     initial_cdfs: Option<Cdfs>,
@@ -2914,6 +2941,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     if mi_cols == 0 || mi_rows == 0 {
         return Err(unsupported("a frame with no mode-info grid"));
     }
+    ENABLE_EDGE_FILTER.with(|f| f.set(enable_edge_filter));
     let (sb_cols, sb_rows) = (mi_cols.div_ceil(SB_MI), mi_rows.div_ceil(SB_MI));
     let (cols32, rows32) = block_grid(mi_cols, mi_rows);
     let (true_width, true_height) = ((mi_cols * 4) as usize, (mi_rows * 4) as usize);
