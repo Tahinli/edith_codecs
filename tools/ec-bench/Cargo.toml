@@ -22,3 +22,11 @@ ec-probe = { workspace = true }
 ec-h264-syntax = { workspace = true }
 ec-image = { workspace = true }
 ec-inflate = { workspace = true }
+ec-opus = { workspace = true }
+ec-vorbis = { workspace = true }
+ec-aac = { workspace = true }
+ec-mp3 = { workspace = true }
+ec-flac = { workspace = true }
+ec-alac = { workspace = true }
+ec-ac3 = { workspace = true }
+ec-truehd = { workspace = true }

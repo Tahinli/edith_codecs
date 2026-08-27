@@ -276,14 +276,22 @@ dependencies = [
 name = "ec-bench"
 version = "0.1.0"
 dependencies = [
+ "ec-aac",
+ "ec-ac3",
+ "ec-alac",
  "ec-av1",
  "ec-core",
+ "ec-flac",
  "ec-h264",
  "ec-h264-syntax",
  "ec-h265",
  "ec-image",
  "ec-inflate",
+ "ec-mp3",
+ "ec-opus",
  "ec-probe",
+ "ec-truehd",
+ "ec-vorbis",
 ]
 
 [[package]]
