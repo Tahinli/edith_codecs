@@ -341,6 +341,139 @@ fn dc(above: Option<&[u8]>, left: Option<&[u8]>, side: usize) -> i32 {
     }
 }
 
+/// `Intra_Filter_Taps` (spec 7.11.2.3 / libaom `av1_filter_intra_taps`,
+/// `av1/common/reconintra.c`): five recursive-filter modes (DC/V/H/D157/Paeth
+/// variants, in that order), each predicting an 8-tap block of eight output
+/// samples from seven already-known neighbours.
+const FILTER_INTRA_TAPS: [[[i32; 7]; 8]; 5] = [
+    [
+        [-6, 10, 0, 0, 0, 12, 0],
+        [-5, 2, 10, 0, 0, 9, 0],
+        [-3, 1, 1, 10, 0, 7, 0],
+        [-3, 1, 1, 2, 10, 5, 0],
+        [-4, 6, 0, 0, 0, 2, 12],
+        [-3, 2, 6, 0, 0, 2, 9],
+        [-3, 2, 2, 6, 0, 2, 7],
+        [-3, 1, 2, 2, 6, 3, 5],
+    ],
+    [
+        [-10, 16, 0, 0, 0, 10, 0],
+        [-6, 0, 16, 0, 0, 6, 0],
+        [-4, 0, 0, 16, 0, 4, 0],
+        [-2, 0, 0, 0, 16, 2, 0],
+        [-10, 16, 0, 0, 0, 0, 10],
+        [-6, 0, 16, 0, 0, 0, 6],
+        [-4, 0, 0, 16, 0, 0, 4],
+        [-2, 0, 0, 0, 16, 0, 2],
+    ],
+    [
+        [-8, 8, 0, 0, 0, 16, 0],
+        [-8, 0, 8, 0, 0, 16, 0],
+        [-8, 0, 0, 8, 0, 16, 0],
+        [-8, 0, 0, 0, 8, 16, 0],
+        [-4, 4, 0, 0, 0, 0, 16],
+        [-4, 0, 4, 0, 0, 0, 16],
+        [-4, 0, 0, 4, 0, 0, 16],
+        [-4, 0, 0, 0, 4, 0, 16],
+    ],
+    [
+        [-2, 8, 0, 0, 0, 10, 0],
+        [-1, 3, 8, 0, 0, 6, 0],
+        [-1, 2, 3, 8, 0, 4, 0],
+        [0, 1, 2, 3, 8, 2, 0],
+        [-1, 4, 0, 0, 0, 3, 10],
+        [-1, 3, 4, 0, 0, 4, 6],
+        [-1, 2, 3, 4, 0, 4, 4],
+        [-1, 2, 2, 3, 4, 3, 3],
+    ],
+    [
+        [-12, 14, 0, 0, 0, 14, 0],
+        [-10, 0, 14, 0, 0, 12, 0],
+        [-9, 0, 0, 14, 0, 11, 0],
+        [-8, 0, 0, 0, 14, 10, 0],
+        [-10, 12, 0, 0, 0, 0, 14],
+        [-9, 1, 12, 0, 0, 0, 12],
+        [-8, 0, 0, 12, 0, 1, 11],
+        [-7, 0, 0, 1, 12, 1, 9],
+    ],
+];
+
+/// `FILTER_INTRA_SCALE_BITS` (libaom `reconintra.h`): the taps' fixed-point
+/// shift.
+const FILTER_INTRA_SCALE_BITS: u32 = 4;
+
+/// Recursive filter-intra prediction (spec 7.11.2.3, libaom
+/// `av1_filter_intra_predictor_c`): walks 4x2 sub-blocks left-to-right,
+/// top-to-bottom, each of the eight output samples a linear combination of
+/// seven already-decoded or already-predicted neighbours (never past the
+/// block's own top row / left column -- unlike the directional modes, this
+/// one never reaches beyond `side` samples of either edge).
+///
+/// `mode` is `0..=4`, indexing [`FILTER_INTRA_TAPS`]/`FILTER_DC_PRED`
+/// through `FILTER_PAETH_PRED`. `above`/`left`/`corner` are exactly
+/// [`predict`]'s edge arguments -- a side that does not exist is filled from
+/// the side that does and a side that runs out is extended by repeating its
+/// last sample, the same [`Edges::build`] rule every other mode uses, even
+/// though this mode itself never reaches past its own `side` samples of
+/// either edge.
+///
+/// # Panics
+/// Panics when `dst` is not `side * side` long, or `side` is not a multiple
+/// of 4 (spec `av1_filter_intra_allowed_bsize` never offers this mode past
+/// 32x32, and only on square blocks: 4, 8, 16 or 32).
+pub fn predict_filter_intra(
+    mode: usize,
+    above: Option<&[u8]>,
+    left: Option<&[u8]>,
+    corner: Option<u8>,
+    side: usize,
+    dst: &mut [u8],
+) {
+    assert_eq!(dst.len(), side * side, "the destination is the block");
+    assert_eq!(side % 4, 0, "filter intra only offers 4/8/16/32");
+    let edges = Edges::build(above, left, corner, side);
+    let taps = &FILTER_INTRA_TAPS[mode];
+    // A (side+1)-square buffer: row 0 / column 0 hold the corner and the
+    // above/left edges, `buffer[r+1][c+1]` the block's own sample at (r, c).
+    let mut buffer = vec![0i32; (side + 1) * (side + 1)];
+    let at = |buffer: &[i32], r: usize, c: usize| buffer[r * (side + 1) + c];
+    buffer[0] = edges.above(-1);
+    for c in 0..side {
+        buffer[c + 1] = edges.above(c as i32);
+    }
+    for r in 0..side {
+        buffer[(r + 1) * (side + 1)] = edges.left(r as i32);
+    }
+    let mut r = 1;
+    while r < side + 1 {
+        let mut c = 1;
+        while c < side + 1 {
+            let p0 = at(&buffer, r - 1, c - 1);
+            let p1 = at(&buffer, r - 1, c);
+            let p2 = at(&buffer, r - 1, c + 1);
+            let p3 = at(&buffer, r - 1, c + 2);
+            let p4 = at(&buffer, r - 1, c + 3);
+            let p5 = at(&buffer, r, c - 1);
+            let p6 = at(&buffer, r + 1, c - 1);
+            let p = [p0, p1, p2, p3, p4, p5, p6];
+            for k in 0..8 {
+                let (r_off, c_off) = (k >> 2, k & 3);
+                let pr: i32 = taps[k].iter().zip(&p).map(|(t, s)| t * s).sum();
+                let value = round2(pr, FILTER_INTRA_SCALE_BITS).clamp(0, 255);
+                let idx = (r + r_off) * (side + 1) + c + c_off;
+                buffer[idx] = value;
+            }
+            c += 4;
+        }
+        r += 2;
+    }
+    for row in 0..side {
+        for col in 0..side {
+            dst[row * side + col] = at(&buffer, row + 1, col + 1) as u8;
+        }
+    }
+}
+
 /// `paeth_predict` (spec 7.11.2.2): of the three neighbours, the one nearest
 /// the gradient they describe.
 fn paeth(above: i32, left: i32, corner: i32) -> i32 {
