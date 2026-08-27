@@ -1277,7 +1277,7 @@ fn write_intra_mode(
         mode,
         &mut cdfs.kf_y_mode[INTRA_MODE_CTX[above_mode]][INTRA_MODE_CTX[left_mode]],
     );
-    ec_rng_trace(|| format!("EC_YMODE mode={mode} tell={}", enc.tell()));
+    ec_rng_trace(|| format!("EC_YMODE mode={mode} tell={} rng={}", enc.tell(), enc.rng()));
     if (V_PRED..=D67_PRED).contains(&mode) {
         enc.symbol(ANGLE_DELTA_ZERO, &mut cdfs.angle_delta[mode - V_PRED]);
     }
@@ -1633,9 +1633,10 @@ fn write_coeffs(
     if plane.is_some() {
         ec_rng_trace(|| {
             format!(
-                "EC_TXBSKIP ctx={skip_ctx} eob0={} tell={}",
+                "EC_TXBSKIP ctx={skip_ctx} eob0={} tell={} rng={}",
                 usize::from(eob == 0),
-                enc.tell()
+                enc.tell(),
+                enc.rng()
             )
         });
     }
@@ -1648,7 +1649,7 @@ fn write_coeffs(
     if let Some(tx_type) = coding.tx_type.as_deref_mut() {
         enc.symbol(TX_TYPE_DCT_DCT_SET2, tx_type);
         if plane.is_some() {
-            ec_rng_trace(|| format!("EC_TXTYPE tell={}", enc.tell()));
+            ec_rng_trace(|| format!("EC_TXTYPE tell={} rng={}", enc.tell(), enc.rng()));
         }
     }
 
@@ -1761,7 +1762,13 @@ fn write_eob(enc: &mut SymbolEncoder, coding: &mut TxbTables, eob: usize, plane:
     // reaches is the size of its own end-of-block alphabet.
     enc.symbol(group - 1, coding.eob_pt);
     if let Some(plane) = plane {
-        ec_rng_trace(|| format!("EC_EOBPT plane={plane} eob_pt={group} tell={}", enc.tell()));
+        ec_rng_trace(|| {
+            format!(
+                "EC_EOBPT plane={plane} eob_pt={group} tell={} rng={}",
+                enc.tell(),
+                enc.rng()
+            )
+        });
     }
 
     let bits = OFFSET_BITS[group];
