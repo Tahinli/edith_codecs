@@ -550,6 +550,9 @@ fn read_eob(dec: &mut SymbolDecoder, coding: &mut TxbTables, class: TxClass) -> 
         (TxClass::TwoD, _) | (_, None) => coding.eob_pt,
         (_, Some(class1)) => class1,
     };
+    if std::env::var_os("EC_AV1_EOBPT_CDF").is_some() && eob_pt.len() == 12 {
+        eprintln!("EC_AV1_EOBPT_CDF {eob_pt:?}");
+    }
     let group = dec.symbol(eob_pt) + 1;
     if trace {
         eprintln!("TRACE eob_pt value={group}");
@@ -637,6 +640,9 @@ fn read_coeffs(
         // share their symbol order with (`Tx_Type_Inter_Inv_Set3`'s two
         // members are a prefix of `Tx_Type_Intra_Inv_Set2`'s five).
         let len = tx_type_cdf.len();
+        if std::env::var_os("EC_AV1_EOBPT_CDF").is_some() && len == 3 {
+            eprintln!("EC_AV1_TXTYPE32_CDF {tx_type_cdf:?}");
+        }
         let t = dec.symbol(tx_type_cdf);
         if trace {
             eprintln!("TRACE tx_type value={t} len={len}");
