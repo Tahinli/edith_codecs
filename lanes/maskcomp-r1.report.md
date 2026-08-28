@@ -1,0 +1,25 @@
+# lane-maskcomp r1 report
+
+VERDICT: PARTIAL -- entropy-exact syntax ported and gated; wedge/diffwtd mask blend (prediction) is NOT ported, refused by name (charter's hard-rule fallback: mergeable r1 progress).
+
+## What landed
+- `crates/ec-av1/src/cdf.rs`: `COMPOUND_TYPE` (`default_compound_type_cdf`, 22x`BLOCK_SIZES_ALL`) and `WEDGE_IDX` (`default_wedge_idx_cdf`, 22x16-ary) tables, transcribed value-for-value from `/tmp/libaom-src/av1/common/entropymode.c`.
+- `crates/ec-av1/src/cdf_state.rs`: 4-site CDF wiring (default table already above; `Cdfs` struct fields `compound_type`/`wedge_idx`; `Cdfs::new` init; `reset_counts` -- per memory `cdf-counter-not-reset`, all 4 sites hit this round).
+- `crates/ec-av1/src/decode.rs`: at both `comp_group_idx == 1` refusal sites (`decode_inter_block`'s 16x16/32x32 leaf, `decode_inter_block8`'s 8x8 leaf), replaced the bare refusal with the real syntax port: `compound_type` symbol (`cdfs.compound_type[bsize]`, alphabet never collapses at this decoder's square 8x8/16x16/32x32 leaves -- `av1_is_wedge_used`/`av1_wedge_params_lookup` has `wedge_types > 0` for bsize indices 3/6/9), then either `wedge_index` (16-ary `cdfs.wedge_idx[bsize]`) + `wedge_sign` (literal bit) for `COMPOUND_WEDGE`, or `mask_type` (literal bit, `MAX_DIFFWTD_MASK_BITS == 1`) for `COMPOUND_DIFFWTD` -- then still refuses (mask blend unbuilt), now naming the syntax as consumed. New `MASKED_COMPOUND_HITS` atomic (mirrors `INTERINTRA_HITS`/`WARP_SELECTED_HITS`) counts real syntax-consumption hits.
+- `crates/ec-av1/src/stream.rs`: new gate `a_real_aomenc_stream_with_masked_compound_decodes_pixel_exact`, cloned from the interintra gate with `--enable-masked-comp=1 --enable-dist-wtd-comp=1` added (warp/obmc/interintra flags kept as-is). Because the blend is unported, the masked-compound refusal is EXPECTED this round (not forbidden like the interintra gate treats its own capability) -- only OTHER named refusals (screen content tools) skip a seed silently; `masked_compound_hits() > 0` is asserted so the gate proves the new syntax actually fired and did not desync the rest of the stream (23-49/... pixel-exact matches every run, zero pixel mismatches observed).
+
+## Scope item 3 (grid/neighbour sweep)
+Not applicable this round: `comp_group_idx == 1` always hits `return Err(...)` before reaching `record_compound_ctx`/the `compound_ctx = Some(...)` assignment on both leaves, so no masked-compound block's own bit is ever recorded into `Neighbours` yet (same as before this round -- neighbour propagation only matters once the block actually completes). Revisit once the blend lands and the function stops early-returning.
+
+## Evidence
+- `cargo check -p ec-av1 --release`: clean (only pre-existing missing-doc warnings).
+- New gate, single run (n=80, EC_MASKCOMP_GATE_ATTEMPTS overridable): `30 other-capability refusals, 1 expected masked-compound refusal (r1: blend unported), 49 pixel-exact matches out of 80, masked_compound_hits=1` -- `ok`.
+- Full `cargo test -p ec-av1 --release --lib`: 218 passed, 0 failed, 17 ignored (before the last gate-attempts bump; re-ran the new gate alone afterward, green) -- all 11 existing pinned bit-exact regression tests unaffected.
+- KNOWN FLAKE (not a decode bug): at `n_attempts=40` the new gate hit `masked_compound_hits() == 0` once in ~5 runs -- `allow_screen_content_tools` (aomenc's own nondeterministic cpu-used=0 RD choice on synthetic gradients content) ate 13-16 of the 40 seeds and the remainder happened to never pick `comp_group_idx == 1`. This is the documented `gate-recipe-confound`/`never-fired-gate` sampling class (memory), not a pixel mismatch and not a desync -- every attempt across every run that DID reach a real block decoded either pixel-exact or hit the named masked-compound refusal cleanly, never a wrong-pixel or panic-outside-the-hits-assert failure. Mitigation landed: bumped default `n_attempts` 40->80 (halves the zero-hits probability, does not eliminate it). `EC_MASKCOMP_GATE_ATTEMPTS=200` for a more robust one-off run if this flakes in CI.
+
+## Deferred
+- deferred: wedge/diffwtd mask-based blend prediction (reconinter.c `av1_make_masked_inter_predictor`/`build_compound_diffwtd_mask`/wedge master-mask tables + chroma subsampling) -- explicitly out of r1 per the charter's hard-rule fallback; unblocks by porting the wedge codebook tables (`wedge_codebook_16_*`, `wedge_signflip_lookup`, `wedge_masks`) and `build_compound_diffwtd_mask`'s clamp-38..64 shape, then flipping the two refusal sites' `return Err` to build+apply the mask and forbidding the refusal in the gate (matching how the interintra gate forbids its own non-wedge refusal).
+- deferred: gate zero-hits flake fully eliminated -- unblocks by either a higher-yield encoder recipe (force `comp_group_idx` more reliably, e.g. explicit two-reference synthetic content with strong local motion boundaries) or accepting `EC_MASKCOMP_GATE_ATTEMPTS` as a CI-tunable knob.
+
+## Commit
+`wip(av1): consume compound_type/wedge_idx/wedge_sign/mask_type on the masked-compound path (comp_group_idx==1), blend still refused` on branch lane-maskcomp.

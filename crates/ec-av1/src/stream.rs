@@ -3642,6 +3642,201 @@ mod tests {
         );
     }
 
+    /// lane-maskcomp r1: `--enable-masked-comp=1 --enable-dist-wtd-comp=1`
+    /// streams must consume `compound_type`/`wedge_idx`/`wedge_sign`/
+    /// `mask_type` entropy-exact (`masked_compound_hits() > 0`) whenever a
+    /// block reads `comp_group_idx == 1` -- the syntax is ported this
+    /// round, the wedge/diffwtd mask blend is NOT, so a masked-compound
+    /// refusal itself is still EXPECTED here (r1's own named refusal,
+    /// asserted for wording only) rather than forbidden; only OTHER named
+    /// refusals (screen content tools etc.) skip a seed without counting.
+    /// Once the blend lands, this gate's own masked-compound refusal
+    /// becomes forbidden like `a_real_aomenc_stream_with_interintra_...`
+    /// above's wedge case was for non-wedge interintra.
+    #[test]
+    fn a_real_aomenc_stream_with_masked_compound_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_stream_with_masked_compound_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height, frame_count) = (64usize, 64usize, 24usize);
+        let mut named_refusals = 0u32;
+        let mut masked_refusals = 0u32;
+        let mut matched = 0u32;
+        let n_attempts: u32 = std::env::var("EC_MASKCOMP_GATE_ATTEMPTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(80);
+        for attempt in 0..n_attempts {
+            let seed = 42 + attempt;
+            let duration = frame_count as f64 / 25.0;
+            let source =
+                format!("gradients=size={width}x{height}:seed={seed}:duration={duration}:rate=25");
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let args: Vec<&str> = vec![
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                "--cq-level=45",
+                "--cpu-used=0",
+                "--kf-max-dist=1000",
+                "--threads=1",
+                "--row-mt=0",
+                "--auto-alt-ref=1",
+                "--lag-in-frames=16",
+                "--enable-fwd-kf=0",
+                "--enable-order-hint=1",
+                "--enable-warped-motion=1",
+                "--enable-obmc=1",
+                "--tune-content=default",
+                "--enable-masked-comp=1",
+                "--enable-dist-wtd-comp=1",
+                "--enable-interintra-comp=1",
+                "--enable-onesided-comp=0",
+                "--enable-interintra-wedge=0",
+                "--enable-smooth-interintra=1",
+                "--enable-rect-partitions=0",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0",
+                "--enable-filter-intra=0",
+                "--enable-smooth-intra=0",
+                "--enable-paeth-intra=0",
+                "--enable-directional-intra=0",
+                "--enable-angle-delta=0",
+                "--enable-tx-size-search=0",
+                "--enable-cdef=0",
+                "--enable-restoration=0",
+                "--max-partition-size=32",
+                "--min-partition-size=32",
+                "--enable-palette=0",
+                "--enable-intrabc=0",
+                "--enable-cfl-intra=0",
+                "--enable-ref-frame-mvs=0",
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ];
+            let mut child = Command::new(aomenc_path())
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let frames = match decode_stream(&stream) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME} failed outright, not a named refusal (seed {seed}): {msg}"
+                    );
+                    assert!(
+                        !msg.contains("warp"),
+                        "{NAME} refused on warp (seed {seed}) -- warp decode is ported: {msg}"
+                    );
+                    if msg.contains("masked COMPOUND_REFERENCE") {
+                        masked_refusals += 1;
+                    } else {
+                        assert!(
+                            !msg.contains("interintra"),
+                            "{NAME} refused on interintra (seed {seed}) -- non-wedge \
+                             interintra is ported: {msg}"
+                        );
+                        named_refusals += 1;
+                    }
+                    eprintln!("seed {seed} refusal: {msg}");
+                    if std::env::var_os("EC_AV1_GATE_DUMP").is_some() {
+                        // r1's self-pin is armed via EC_AV1_GATE_DUMP=<path>
+                        // only for a real pixel MISMATCH below, not for this
+                        // still-expected named refusal.
+                    }
+                    continue;
+                }
+                Ok(frames) => frames,
+            };
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
+            assert_eq!(frames.len(), frame_count);
+            let mismatched = frames
+                .iter()
+                .zip(&ffmpeg_frames)
+                .any(|(got, want)| got.y != want.y || got.u != want.u || got.v != want.v);
+            if mismatched && let Ok(path) = std::env::var("EC_AV1_GATE_DUMP") {
+                std::fs::write(&path, &stream).expect("writing pinned stream");
+                eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
+            }
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
+                assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
+            }
+            matched += 1;
+        }
+        // r1: observed flaky at 40 attempts -- aomenc's cpu-used=0 RD is
+        // run-to-run nondeterministic in whether it ever picks
+        // comp_group_idx == 1 for this synthetic gradients content, and
+        // allow_screen_content_tools sometimes eats most of a small seed
+        // window (class gate-recipe-confound / never-fired-gate, memory).
+        // 80 attempts is the mitigation, not a fix; a still-zero run here
+        // is that sampling flake, not a decode regression -- check
+        // masked_compound_hits/named_refusals in the panic message before
+        // assuming a real bug.
+        assert!(
+            crate::decode::masked_compound_hits() > 0,
+            "{NAME}: zero masked-compound blocks fired ({masked_refusals} masked refusals, \
+             {matched} matches, {named_refusals} other refusals out of {n_attempts}) -- the \
+             gate never exercised comp_group_idx == 1, so it proves nothing about this round's \
+             syntax port"
+        );
+        eprintln!(
+            "{NAME}: {named_refusals} other-capability refusals, {masked_refusals} expected \
+             masked-compound refusals (r1: blend unported), {matched} pixel-exact matches out \
+             of {n_attempts}, masked_compound_hits={}",
+            crate::decode::masked_compound_hits()
+        );
+    }
 
     /// Pinned streams captured by `EC_AV1_GATE_DUMP` off
     /// `a_real_aomenc_stream_with_warped_motion_refuses_or_matches` -- each
