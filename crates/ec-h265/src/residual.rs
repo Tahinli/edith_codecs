@@ -522,6 +522,10 @@ pub fn rdoq(
                             enc,
                             levels,
                             n,
+                            log2_size,
+                            sub_wide,
+                            sub_scan,
+                            pos_scan,
                             c_idx,
                             scan_idx,
                             false,
@@ -758,12 +762,23 @@ fn encode_subblock_range(
     greater1_ctx_in: u32,
     csbf: &[bool; 64],
 ) -> u32 {
+    // Hoisted once for the whole range instead of re-derived by every
+    // `encode_subblock` call: `log2_size`/`sub_wide`/the scan tables are the
+    // same for every sub-block this loop visits.
+    let log2_size = n.trailing_zeros();
+    let sub_wide = n >> 2;
+    let sub_scan = scan(log2_size - 2, scan_idx);
+    let pos_scan = scan(2, scan_idx);
     let mut greater1_ctx = greater1_ctx_in;
     for i in (0..=from_sub).rev() {
         greater1_ctx = encode_subblock(
             enc,
             levels,
             n,
+            log2_size,
+            sub_wide,
+            sub_scan,
+            pos_scan,
             c_idx,
             scan_idx,
             sign_hiding,
@@ -786,6 +801,10 @@ fn encode_subblock(
     enc: &mut CabacEncoder,
     levels: &[i32],
     n: usize,
+    log2_size: u32,
+    sub_wide: usize,
+    sub_scan: &'static [(u8, u8)],
+    pos_scan: &'static [(u8, u8)],
     c_idx: usize,
     scan_idx: usize,
     sign_hiding: bool,
@@ -795,10 +814,6 @@ fn encode_subblock(
     csbf: &[bool; 64],
     greater1_ctx_in: u32,
 ) -> u32 {
-    let log2_size = n.trailing_zeros();
-    let sub_wide = n >> 2;
-    let sub_scan = scan(log2_size - 2, scan_idx);
-    let pos_scan = scan(2, scan_idx);
     let chroma = c_idx > 0;
     let mut greater1_ctx = greater1_ctx_in;
 
