@@ -192,6 +192,15 @@ const REF_CAT_LEVEL: u32 = 640;
 /// The most candidates a stack keeps (spec `MAX_REF_MV_STACK_SIZE`).
 const MAX_STACK_SIZE: usize = 8;
 
+/// The single-reference extension's own, *smaller* cap (spec's
+/// `MAX_MV_REF_CANDIDATES`, `av1/common/enums.h`): that pass only ever tops
+/// the stack up to two entries — enough to guarantee `NEARESTMV`/`NEARMV`
+/// predictors — never all the way to [`MAX_STACK_SIZE`]. libaom gates its
+/// two extension loops on `*refmv_count < MAX_MV_REF_CANDIDATES`, not the
+/// 8-entry stack cap; this module's prior hand-written pass used
+/// `MAX_STACK_SIZE` here, which is the wrong bound.
+const MAX_MV_REF_CANDIDATES: usize = 2;
+
 /// The floor libaom's `scan_row_mbmi`/`scan_col_mbmi` weight starts at
 /// before a same-or-wider candidate block can raise it (`uint16_t weight =
 /// 2;`, mvref_common.c).
@@ -215,6 +224,53 @@ fn add_candidate(candidates: &mut Vec<StackEntry>, mv: (i32, i32), weight: u32) 
         entry.weight += weight;
     } else {
         candidates.push(StackEntry { mv, weight });
+    }
+}
+
+/// Whether `ref_frame`'s prediction runs backward in display order
+/// (`cm->ref_frame_sign_bias`, libaom): flips a borrowed neighbour's MV
+/// sign in [`process_single_ref_mv_candidate`] when the neighbour's own
+/// reference disagrees. This decoder only ever threads forward references
+/// (`LAST_FRAME`/`GOLDEN_FRAME`) to MC — never `BWDREF`/`ALTREF` — so every
+/// call site compares `false != false` and the flip is always inert. Ported
+/// anyway (never proved away, per this round's own bounds): a real
+/// backward reference would need this to be correct on day one.
+fn sign_bias(_ref_frame: i8) -> bool {
+    false
+}
+
+/// libaom's `process_single_ref_mv_candidate` (mvref_common.c): folds one
+/// already-coded neighbour into the stack as a low-weight (`2`, unboosted)
+/// filler entry, used only by the single-reference extension pass below.
+/// Unlike every scan above, this runs over *any* inter neighbour regardless
+/// of which reference frame it coded — that is the whole point of the
+/// pass (topping the stack up when the real scans found too few same-ref
+/// candidates) — and dedupes by MV value against the *whole* stack so far,
+/// silently dropping the candidate (no weight bump, unlike
+/// [`add_candidate`]) when a match is already there.
+///
+/// libaom's real signature loops `rf_idx` over the candidate's up to two
+/// coded reference-frame slots (a compound-coded neighbour donates two
+/// candidates, one per slot); this crate's [`MiInfo`] carries a single
+/// `ref_frame`, since no coded neighbour here is ever compound — ported as
+/// that loop's `rf_idx == 0` iteration alone.
+fn process_single_ref_mv_candidate(
+    candidate: &MiInfo,
+    ref_frame: i8,
+    candidates: &mut Vec<StackEntry>,
+) {
+    if !candidate.is_inter {
+        return;
+    }
+    let mut this_mv = candidate.mv;
+    if sign_bias(candidate.ref_frame) != sign_bias(ref_frame) {
+        this_mv = (-this_mv.0, -this_mv.1);
+    }
+    if !candidates.iter().any(|e| e.mv == this_mv) {
+        candidates.push(StackEntry {
+            mv: this_mv,
+            weight: 2,
+        });
     }
 }
 
@@ -604,6 +660,65 @@ pub fn find_mv_stack(
     // ones above, matching libaom's separate two-phase ranking.
     candidates.sort_by_key(|e| std::cmp::Reverse(e.weight));
     candidates.truncate(MAX_STACK_SIZE);
+
+    // libaom's "single reference frame extension" (`setup_ref_mv_list`,
+    // mvref_common.c, the `else` branch under "Handle single reference
+    // frame extension", calling `process_single_ref_mv_candidate`): when
+    // fewer than [`MAX_MV_REF_CANDIDATES`] (2, *not* `MAX_STACK_SIZE`) survive
+    // the scans above, top the stack up to that guarantee by re-walking the
+    // row directly above and the column directly left, gated on
+    // `refmv_count < MAX_MV_REF_CANDIDATES` per step (so it can stop after
+    // just one addition) -- over *any* inter neighbour regardless of which
+    // reference frame it coded, not just `ref_frame`. This module's doc
+    // used to call this pass a no-op ("whatever it would add was already
+    // added by the row/col scan"), true only while a stream ever has one
+    // live reference frame: once a second reference (`GOLDEN_FRAME`) is
+    // live next to `LAST_FRAME` blocks, this pass pulls in the other
+    // reference's MV as a low-weight (`2`, unboosted -- below
+    // `REF_CAT_LEVEL`) filler entry purely to make `entries.len()` (and
+    // hence how many `drl_mode` bits a `NEWMV` block reads) match the real
+    // bitstream -- round 10 (lane-av1golden8) traced a `GOLDEN_FRAME`
+    // `NEWMV` block desyncing its own `read_mv` by exactly this gap (real
+    // stack `len=2`, this module's `len=1`, one missing `drl_mode` bit).
+    // Round 11 replaced that round's hand-proved reduction (a bespoke
+    // re-scan gated on `MAX_STACK_SIZE`, weighing every hit `2` unconditionally)
+    // with this exact port: real gate is `MAX_MV_REF_CANDIDATES` (2), real
+    // reach is the block's own `bw4`/`bh4` (see `mi_size` below, not a flat
+    // 16), and dedup/weight/sign-bias now live in
+    // [`process_single_ref_mv_candidate`] itself, ported from libaom's
+    // function of the same name rather than re-derived by hand.
+    // libaom's `mi_size` for this pass (`setup_ref_mv_list`): the block's
+    // own span (`xd->width`/`xd->height`, i.e. `bw4`/`bh4` here), capped at
+    // a 64x64 superblock's 16 mi units, further clipped to the frame edge —
+    // never just "16, clipped to the frame edge" the way the prior
+    // hand-written pass had it, which over-walked past a small query
+    // block's own row/col run into cells that real neighbour scan (a wider
+    // block covering more than `bw4`/`bh4`) had already folded in above.
+    let mi_width = (16usize).min(bw4).min(mi_cols.saturating_sub(mi_col));
+    let mi_height = (16usize).min(bh4).min(mi_rows.saturating_sub(mi_row));
+    let mi_size = mi_width.min(mi_height);
+    if max_row_offset.unsigned_abs() >= 1 {
+        let mut idx = 0usize;
+        while idx < mi_size && candidates.len() < MAX_MV_REF_CANDIDATES {
+            let cand = grid.get(mi_row - 1, mi_col + idx);
+            let step = cand.map_or(1, |c| c.size).max(1);
+            if let Some(c) = cand {
+                process_single_ref_mv_candidate(c, ref_frame, &mut candidates);
+            }
+            idx += step;
+        }
+    }
+    if max_col_offset.unsigned_abs() >= 1 {
+        let mut idx = 0usize;
+        while idx < mi_size && candidates.len() < MAX_MV_REF_CANDIDATES {
+            let cand = grid.get(mi_row + idx, mi_col - 1);
+            let step = cand.map_or(1, |c| c.size).max(1);
+            if let Some(c) = cand {
+                process_single_ref_mv_candidate(c, ref_frame, &mut candidates);
+            }
+            idx += step;
+        }
+    }
 
     let clamp = |mv| clamp_mv_ref(mv, mi_row, mi_col, bw4, bh4, mi_cols, mi_rows);
     let nearest_mv = candidates.first().map_or((0, 0), |e| clamp(e.mv));
