@@ -6,6 +6,13 @@
 //! decisions are made against that count, so the rate a decision is judged by is
 //! the rate it actually costs — no bit-estimate table to drift out of step with
 //! the coder.
+//!
+//! A third mode, *estimating*, exists purely for RDOQ's own trial-costing
+//! instrument (`rdoq_enc`): it skips the range/renorm arithmetic and instead
+//! looks up a per-context fractional-bit cost from [`ENTROPY_BITS`], the
+//! x265/HM `entropyBits`-table idiom. The committing encoder never uses it.
+
+use std::sync::LazyLock;
 
 /// Number of context variables this encoder keeps.
 pub const NUM_CONTEXTS: usize = ctx::TOTAL;
@@ -120,6 +127,26 @@ const TRANS_IDX_MPS: [u8; 64] = [
     49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 62, 63,
 ];
 
+/// `ENTROPY_BITS[pStateIdx] = [bits if the bin matches valMps, bits if it
+/// doesn't]`, the fractional-bit cost of a context-coded bin under its
+/// context's current probability state — RDOQ's estimating mode reads this
+/// instead of replaying the exact range-narrowing arithmetic per trial.
+///
+/// HEVC's 64 probability states follow the same geometric decay as H.264's
+/// (Marpe et al.): `pLPS(pStateIdx) = 0.5 * ALPHA^pStateIdx`, `ALPHA =
+/// 0.9493`, running from 0.5 at state 0 down to the ~0.01875 floor at state
+/// 63 that `RANGE_TAB_LPS`'s last row (all `2`s) also converges to. Bits are
+/// `-log2` of the matching/mismatching probability, x265/HM's `entropyBits`
+/// idiom — an entropy estimate, not the coder's own count, so RDOQ under
+/// this mode ranks candidates instead of pricing them exactly.
+static ENTROPY_BITS: LazyLock<[[f64; 2]; 64]> = LazyLock::new(|| {
+    const ALPHA: f64 = 0.9493;
+    std::array::from_fn(|p_state| {
+        let p_lps = 0.5 * ALPHA.powi(p_state as i32);
+        [-(1.0 - p_lps).log2(), -p_lps.log2()]
+    })
+});
+
 /// The context variables, `pStateIdx << 1 | valMps` per entry.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Contexts {
@@ -169,6 +196,8 @@ pub struct CabacState {
     partial: u8,
     partial_bits: u8,
     contexts: Contexts,
+    /// [`CabacEncoder::est_bits`] at snapshot time, restored alongside it.
+    est_bits: f64,
 }
 
 /// The CABAC encoding engine (9.3.5).
@@ -189,6 +218,16 @@ pub struct CabacEncoder {
     partial_bits: u8,
     /// Context variables, public to the modules that index them by name.
     pub contexts: Contexts,
+    /// While set, `encode_bin`/`encode_bypass*` skip the range/renorm
+    /// arithmetic entirely and instead accumulate [`ENTROPY_BITS`]-table
+    /// lookups into `est_bits` — RDOQ's trial-costing instrument only; the
+    /// committing encoder never sets this. `low`/`range`/`bits_outstanding`
+    /// are left untouched while this is set, so a `restore()` back to a
+    /// snapshot taken before estimating began is exact.
+    estimating: bool,
+    /// Fractional bits accumulated while `estimating`; read by
+    /// [`CabacEncoder::bit_count_f64`].
+    est_bits: f64,
 }
 
 impl CabacEncoder {
@@ -205,6 +244,8 @@ impl CabacEncoder {
             partial: 0,
             partial_bits: 0,
             contexts,
+            estimating: false,
+            est_bits: 0.0,
         }
     }
 
@@ -217,8 +258,27 @@ impl CabacEncoder {
     }
 
     /// Bits produced so far, including the ones a counting engine discards.
+    /// In `estimating` mode this is stale (the estimating path never
+    /// increments it) — read [`CabacEncoder::bit_count_f64`] instead.
     pub fn bit_count(&self) -> u64 {
         self.bits
+    }
+
+    /// [`CabacEncoder::bit_count`], but fractional and estimating-mode-aware:
+    /// the exact bit count as `f64` normally, or the accumulated
+    /// [`ENTROPY_BITS`] estimate while `estimating` is set.
+    pub fn bit_count_f64(&self) -> f64 {
+        if self.estimating {
+            self.est_bits
+        } else {
+            self.bits as f64
+        }
+    }
+
+    /// Switch between exact range/renorm costing and the estimated
+    /// per-context fracbits table. See the `estimating` field.
+    pub fn set_estimating(&mut self, estimating: bool) {
+        self.estimating = estimating;
     }
 
     /// Code bins without keeping their bytes; the counter still runs.
@@ -290,6 +350,7 @@ impl CabacEncoder {
             partial: self.partial,
             partial_bits: self.partial_bits,
             contexts: self.contexts.clone(),
+            est_bits: self.est_bits,
         }
     }
 
@@ -315,6 +376,7 @@ impl CabacEncoder {
         self.partial = state.partial;
         self.partial_bits = state.partial_bits;
         self.contexts.clone_from(&state.contexts);
+        self.est_bits = state.est_bits;
         if let Some(out) = &mut self.out {
             out.truncate(state.tail_base);
             out.extend_from_slice(&state.tail);
@@ -328,6 +390,16 @@ impl CabacEncoder {
         let state = self.contexts.state[ctx_idx];
         let p_state = (state >> 1) as usize;
         let val_mps = u32::from(state & 1);
+        if self.estimating {
+            self.est_bits += ENTROPY_BITS[p_state][usize::from(bin != val_mps)];
+            self.contexts.state[ctx_idx] = if bin != val_mps {
+                let new_mps = if p_state == 0 { 1 - val_mps } else { val_mps };
+                (TRANS_IDX_LPS[p_state] << 1) | new_mps as u8
+            } else {
+                (TRANS_IDX_MPS[p_state] << 1) | val_mps as u8
+            };
+            return;
+        }
         let q_range_idx = ((self.range >> 6) & 3) as usize;
         let lps_range = u32::from(RANGE_TAB_LPS[p_state][q_range_idx]);
         self.range -= lps_range;
@@ -345,6 +417,14 @@ impl CabacEncoder {
     /// Encode one bypass bin (9.3.5.5).
     #[inline]
     pub fn encode_bypass(&mut self, bin: u32) {
+        if self.estimating {
+            // Bypass bins are uncontexted and uniform-probability: the real
+            // coder's carry propagation can occasionally defer more than one
+            // output bit to a later call, but the standard entropy estimate
+            // (x265/HM alike) is exactly one bit per bypass bin.
+            self.est_bits += 1.0;
+            return;
+        }
         self.low <<= 1;
         if bin != 0 {
             self.low += self.range;
