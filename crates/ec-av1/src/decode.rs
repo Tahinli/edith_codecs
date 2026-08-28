@@ -400,8 +400,10 @@ enum TxClass {
 impl TxClass {
     fn of(tx_type: TxType) -> Self {
         match tx_type {
-            TxType::VDct => Self::Vert,
-            TxType::HDct => Self::Horiz,
+            // `TX_CLASS_VERT`/`TX_CLASS_HORIZ` (`txb_common.h`'s `tx_type_to_class`)
+            // key on axis alone -- FLIPADST is still ADST for this purpose.
+            TxType::VDct | TxType::VAdst | TxType::VFlipAdst => Self::Vert,
+            TxType::HDct | TxType::HAdst | TxType::HFlipAdst => Self::Horiz,
             _ => Self::TwoD,
         }
     }
@@ -599,18 +601,24 @@ fn read_coeffs(
     }
     let mut tx_type = default_tx_type;
     if let Some(tx_type_cdf) = coding.tx_type.as_deref_mut() {
-        // The CDF row's own width names its set: 7 symbols (8 slots) is
-        // `TX_SET_INTRA_1`, 5 (6 slots) the reduced `TX_SET_INTRA_2` (the
-        // inter sets we read share set 2's symbol order).
-        let set1 = tx_type_cdf.len() == 8;
+        // The CDF row's own width names its set (lane-cdffwd2: extended
+        // past the original two-way intra split once wider `reduced_tx_set
+        // == 0` inter sets joined the table): 17 slots (16 symbols) is
+        // `EXT_TX_SET_ALL16`, 13 (12 symbols) `EXT_TX_SET_DTT9_IDTX_1DDCT`,
+        // 8 (7 symbols) `TX_SET_INTRA_1`, everything else (6 slots, 5
+        // symbols) the reduced `TX_SET_INTRA_2`/`TX_SET_INTER_3` two sets
+        // share their symbol order with (`Tx_Type_Inter_Inv_Set3`'s two
+        // members are a prefix of `Tx_Type_Intra_Inv_Set2`'s five).
+        let len = tx_type_cdf.len();
         let t = dec.symbol(tx_type_cdf);
         if trace {
-            eprintln!("TRACE tx_type value={t} set1={set1}");
+            eprintln!("TRACE tx_type value={t} len={len}");
         }
-        tx_type = if set1 {
-            TxType::from_symbol_set1(t)
-        } else {
-            TxType::from_symbol(t)
+        tx_type = match len {
+            17 => TxType::from_symbol_all16(t),
+            13 => TxType::from_symbol_set2_12(t),
+            8 => TxType::from_symbol_set1(t),
+            _ => TxType::from_symbol(t),
         }
         .ok_or_else(|| unsupported(format!("a tx_type symbol outside its CDF's own set: {t}")))?;
     }
@@ -5395,6 +5403,9 @@ fn decode_inter_block8(
     // just above).
     skip_mode_present: bool,
     skip_mode_frame: [u8; 2],
+    // lane-cdffwd2: this frame header's own `reduced_tx_set` bit -- see
+    // [`decode_inter_frame_tile_with_cdfs`]'s own doc.
+    reduced_tx_set: bool,
     // lane-av1comp: `Some((ref1, comp_group_idx, compound_idx))` only for a
     // real `COMPOUND_REFERENCE` leaf, for the caller's own end-of-16x16
     // `record_compound_ctx` call -- mirrors [`decode_inter_block`]'s own
@@ -5718,7 +5729,11 @@ fn decode_inter_block8(
                     luma_grid = read_inter_plane(
                         dec,
                         cdfs,
-                        TxbSet::Luma8Inter,
+                        if reduced_tx_set {
+                            TxbSet::Luma8Inter
+                        } else {
+                            TxbSet::Luma8InterSet1
+                        },
                         scan8,
                         0,
                         around[0],
@@ -5912,7 +5927,11 @@ fn decode_inter_block8(
             luma_grid = read_inter_plane(
                 dec,
                 cdfs,
-                TxbSet::Luma8Inter,
+                if reduced_tx_set {
+                    TxbSet::Luma8Inter
+                } else {
+                    TxbSet::Luma8InterSet1
+                },
                 scan8,
                 0,
                 around[0],
@@ -6160,6 +6179,7 @@ pub fn decode_inter_frame_tile(
         false,
         false,
         [0; 2],
+        true,
     )
     .map(|(picture, _, _)| picture)
 }
@@ -6205,6 +6225,11 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     // `decode_inter_block8` call below.
     skip_mode_present: bool,
     skip_mode_frame: [u8; 2],
+    // lane-cdffwd2: this frame header's own `reduced_tx_set` bit, threaded to
+    // every inter `tx_type` read below (`false` needs the 12-/16-symbol
+    // `Set1` coefficient tables at 16x16/8x8 rather than the reduced
+    // 2-symbol ones -- see [`TxbSet::Luma16InterSet1`]/[`TxbSet::Luma8InterSet1`]).
+    reduced_tx_set: bool,
 ) -> Result<(Picture, Cdfs, crate::motion_field::MotionField)> {
     let tpl_frame = tpl_field.map(|field| TplFrameArgs {
         field,
@@ -6456,7 +6481,11 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     &sign_bias_table,
                                     base_q_idx,
                                     TxbSet::Luma16,
-                                    TxbSet::Luma16Inter,
+                                    if reduced_tx_set {
+                                        TxbSet::Luma16Inter
+                                    } else {
+                                        TxbSet::Luma16InterSet1
+                                    },
                                     TxbSet::Chroma8,
                                     TX16,
                                     TX8,
@@ -6536,6 +6565,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                             ref_order_hints,
                                             skip_mode_present,
                                             skip_mode_frame,
+                                            reduced_tx_set,
                                         )?;
                                     prev_leaf = Some((leaf_mi, skip, is_inter));
                                     last_skip_mode = skip_mode_leaf;
