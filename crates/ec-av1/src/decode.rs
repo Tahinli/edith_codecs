@@ -4299,6 +4299,14 @@ fn decode_inter_block(
     let (cpx, cpy) = (px / 2, py / 2);
     let chroma_side = side / 2;
 
+    if std::env::var_os("EC_AV1_COMPIDX_DUMP").is_some() {
+        eprintln!(
+            "BITPOS_BLK_START mi_row={} mi_col={} bitpos={}",
+            py / 4,
+            px / 4,
+            dec.debug_bitpos()
+        );
+    }
     let skip_mode_ctx =
         usize::from(neighbours.above_skip_mode[c]) + usize::from(neighbours.left_skip_mode[r]);
     let skip_mode = skip_mode_present && dec.symbol(&mut cdfs.skip_mode[skip_mode_ctx]) == 1;
@@ -4418,16 +4426,6 @@ fn decode_inter_block(
             } else {
                 [3, 3]
             };
-            let (h_filter, v_filter, resolved_filter) = resolve_interp_filter(
-                dec,
-                cdfs,
-                interp_fixed,
-                enable_dual_filter,
-                is_globalmv,
-                above_filter_ctx,
-                left_filter_ctx,
-            );
-            block_filter = resolved_filter;
             globalmv_for_lf = is_globalmv;
             ref_frame_for_lf = ref0;
             mode_for_tx = 0;
@@ -4600,6 +4598,52 @@ fn decode_inter_block(
             // read specifically, not just the surrounding mode/mv/skip
             // trace which does match -- the desync (if any) is local to
             // this one read, not a wider stream desync.
+            //
+            // r5 (this round): the `resolve_interp_filter` call used to sit
+            // right here, ahead of `comp_group_idx`/`compound_idx` -- spec
+            // 5.11.19/libaom `decodemv.c:1575` reads `interp_filter` AFTER
+            // `read_compound_type`, not before, so that was a genuine
+            // ordering bug for a Switchable-filter frame (moved below, past
+            // the `compound_ctx = Some(...)` line). It does NOT explain this
+            // fixture's own mismatch, though: `av1blend-r1-mismatch.obu`'s
+            // header carries a *fixed* interpolation filter
+            // (`interp_fixed = Some(Regular)`, confirmed live via a
+            // one-off dump), so `resolve_interp_filter` never read a symbol
+            // in either position -- zero bits moved, decoded values
+            // unchanged before and after the reorder. Kept anyway: it is a
+            // real spec-order fix for the next Switchable-filter compound
+            // stream, independently correct regardless of this fixture.
+            //
+            // Also ruled out this round: comparing this crate's own
+            // `SymbolDecoder::debug_bitpos()` against aomdec's
+            // `aom_reader_tell()` at the block boundary is NOT a valid
+            // desync probe -- they are different quantities (raw consumed
+            // input bits vs. an entropy-cost estimate that advances without
+            // a literal byte fetch), so equal/unequal bitpos proves nothing
+            // either way. Do not repeat that comparison; instead trace
+            // `range`/`value` (this crate) against libaom's own internal
+            // `dif`/`rng` (needs new instrumentation in both) immediately
+            // after each read *upstream* of this one in the same block:
+            // `read_comp_mode`, `read_compound_ref_frames` (comp_ref_type/
+            // uni_comp_ref/comp_ref/comp_bwdref), `read_inter_compound_mode`,
+            // and the DRL loop. All of those independently decoded the SAME
+            // values this crate and aomdec both show (ref0=1, ref1=5, mode
+            // NEAREST_NEARESTMV, mv=(0,0)) -- but an upstream *context*
+            // miscomputation can still decode the identical symbol value off
+            // a slightly different CDF, narrowing `range` by a different
+            // amount than aomdec without changing the decoded value itself,
+            // and only surface as a wrong decode a few reads later exactly
+            // like this. `get_comp_index_context` and the `COMPOUND_IDX`
+            // table were independently re-verified again this round and are
+            // still correct; the four candidates above were not re-audited
+            // this round. Refusing here (rather than shipping a value-exact-
+            // most-of-the-time blend) until one of them is found wrong.
+            return Err(unsupported(
+                "a COMPOUND_REFERENCE 16x16 leaf using the plain/distance-weighted average \
+                 blend (comp_group_idx == 0) -- proven non-pixel-exact against a real aomenc \
+                 stream (lane-av1blend r1/r3/r5, see av1blend-r1-mismatch.obu)",
+            ));
+            #[allow(unreachable_code)]
             let (fwd_offset, bck_offset, compound_idx) = if !skip_mode && enable_jnt_comp {
                 let idx_ctx = get_comp_index_context(
                     neighbours,
@@ -4622,7 +4666,12 @@ fn decode_inter_block(
                 }
                 let idx = dec.symbol(&mut cdfs.compound_idx[idx_ctx]);
                 if std::env::var_os("EC_AV1_COMPIDX_DUMP").is_some() {
-                    eprintln!("COMPIDX_VAL mi_row={} mi_col={} decoded={idx}", py / 4, px / 4);
+                    eprintln!(
+                        "COMPIDX_VAL mi_row={} mi_col={} decoded={idx} bitpos={}",
+                        py / 4,
+                        px / 4,
+                        dec.debug_bitpos()
+                    );
                 }
                 if idx == 1 {
                     (8, 8, 1u8)
@@ -4639,6 +4688,31 @@ fn decode_inter_block(
                 (8, 8, 1u8)
             };
             compound_ctx = Some((ref1, comp_group_idx as u8, compound_idx));
+
+            // spec 5.11.19/libaom `decodemv.c` 1575: `read_mb_interp_filter`
+            // comes AFTER `read_compound_type` (the `comp_group_idx`/
+            // `compound_idx` reads just above), not before -- moved here
+            // (lane-av1blend r5) from its old position ahead of those reads,
+            // which stole their bits for a Switchable-filter compound block
+            // and desynced every symbol read after it in the tile.
+            if std::env::var_os("EC_AV1_COMPIDX_DUMP").is_some() {
+                eprintln!(
+                    "IFILTER_PRE mi_row={} mi_col={} interp_fixed={:?} is_globalmv={is_globalmv}",
+                    py / 4,
+                    px / 4,
+                    interp_fixed
+                );
+            }
+            let (h_filter, v_filter, resolved_filter) = resolve_interp_filter(
+                dec,
+                cdfs,
+                interp_fixed,
+                enable_dual_filter,
+                is_globalmv,
+                above_filter_ctx,
+                left_filter_ctx,
+            );
+            block_filter = resolved_filter;
 
             let mut inter0_y = vec![0i32; side * side];
             mc::predict_compound_intermediate(
