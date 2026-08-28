@@ -2488,11 +2488,6 @@ fn cdef_filter_block(
     }
 }
 
-/// Applies CDEF (spec 7.15) to the whole reconstructed frame, over its true
-/// (unpadded) `mi_cols`/`mi_rows` extent, before it is cropped to its display
-/// size. `cdef_bits == 0` is this crate's only supported case so far (see the
-/// refusal in `stream.rs`), so every 64x64 filter block always uses index 0's
-/// strengths -- no per-block `cdef_idx` selection is implemented yet.
 /// Spec 7.14: the in-loop deblocking filter, applied once per frame after
 /// tile reconstruction and before [`apply_cdef`]. Uniform-level path only --
 /// `stream.rs` already refuses `delta_lf_present`/segmentation upstream, so
@@ -3847,20 +3842,28 @@ fn read_inter_plane(
     side: usize,
     base_q_idx: u8,
     prediction: &[u8],
-) -> Result<Vec<i32>> {
+    // lane-chromau: this block's own luma transform's *actual coded*
+    // `tx_type` -- `av1_get_tx_type` (libaom `blockd.h`): an inter block's
+    // chroma plane never codes its own `tx_type` symbol, but (unlike an
+    // intra block, which falls back to `Intra_Mode_To_Tx_Type`) it inherits
+    // the colocated luma transform's coded type verbatim, clamped back to
+    // `DCT_DCT` at the chroma tx sizes the spec forces DCT-only
+    // (`av1_get_ext_tx_set_type`: `tx_size_sqr_up >= TX_32X32`, i.e. this
+    // function's own `side >= 32`). `None` for the luma call itself
+    // (`plane_idx == 0`), where the `TxbSet`'s own symbol (or the true
+    // `DCT_DCT` default at 32-point+) already resolves it without help.
+    inherited_luma_tx_type: Option<TxType>,
+) -> Result<(Vec<i32>, TxType)> {
     let skip_ctx = if plane_idx == 0 {
         0
     } else {
         usize::from(around.0) + usize::from(around.1)
     };
     let mut coding = cdfs.txb(set, tx_mode);
-    // `av1_get_tx_type` (libaom `blockd.h`): `Intra_Mode_To_Tx_Type` only
-    // ever applies to an intra block's chroma plane -- an `is_inter` block
-    // (this function, [`read_inter_plane`], reads only those) has no
-    // predicted intra mode to index it with, and its `tx_type` (luma or
-    // chroma alike) is `DCT_DCT` whenever the `TxbSet` itself codes no
-    // symbol for it.
-    let default_tx_type = TxType::DctDct;
+    let default_tx_type = match inherited_luma_tx_type {
+        Some(t) if side < 32 => t,
+        _ => TxType::DctDct,
+    };
     let (grid, tx_type) = read_coeffs(
         dec,
         &mut coding,
@@ -3871,7 +3874,7 @@ fn read_inter_plane(
     )?;
     let residual = dequant_and_inverse_typed(&grid, side, 8, i32::from(base_q_idx), tx_type);
     plane.reconstruct_mc(x, y, side, prediction, &residual);
-    Ok(grid)
+    Ok((grid, tx_type))
 }
 
 /// Spec 5.11.25's `single_ref_p1`..`p6` tree (reachable only once `comp_mode`
@@ -4836,7 +4839,8 @@ fn decode_inter_block(
                 v_grid = vec![0i32; chroma_side * chroma_side];
             } else {
                 let around = neighbours.around(at, side);
-                luma_grid = read_inter_plane(
+                let luma_tx_type;
+                (luma_grid, luma_tx_type) = read_inter_plane(
                     dec,
                     cdfs,
                     luma_set_inter,
@@ -4850,6 +4854,7 @@ fn decode_inter_block(
                     side,
                     base_q_idx,
                     &pred_y,
+                    None,
                 )?;
                 u_grid = read_inter_plane(
                     dec,
@@ -4865,7 +4870,9 @@ fn decode_inter_block(
                     chroma_side,
                     base_q_idx,
                     &pred_u,
-                )?;
+                    Some(luma_tx_type),
+                )?
+                .0;
                 v_grid = read_inter_plane(
                     dec,
                     cdfs,
@@ -4880,7 +4887,9 @@ fn decode_inter_block(
                     chroma_side,
                     base_q_idx,
                     &pred_v,
-                )?;
+                    Some(luma_tx_type),
+                )?
+                .0;
             }
         } else {
             let ref_frame =
@@ -5128,7 +5137,8 @@ fn decode_inter_block(
                 v_grid = vec![0i32; chroma_side * chroma_side];
             } else {
                 let around = neighbours.around(at, side);
-                luma_grid = read_inter_plane(
+                let luma_tx_type;
+                (luma_grid, luma_tx_type) = read_inter_plane(
                     dec,
                     cdfs,
                     luma_set_inter,
@@ -5142,6 +5152,7 @@ fn decode_inter_block(
                     side,
                     base_q_idx,
                     &pred_y,
+                    None,
                 )?;
                 u_grid = read_inter_plane(
                     dec,
@@ -5157,7 +5168,9 @@ fn decode_inter_block(
                     chroma_side,
                     base_q_idx,
                     &pred_u,
-                )?;
+                    Some(luma_tx_type),
+                )?
+                .0;
                 v_grid = read_inter_plane(
                     dec,
                     cdfs,
@@ -5172,7 +5185,9 @@ fn decode_inter_block(
                     chroma_side,
                     base_q_idx,
                     &pred_v,
-                )?;
+                    Some(luma_tx_type),
+                )?
+                .0;
             }
         }
     } else {
@@ -5726,7 +5741,8 @@ fn decode_inter_block8(
                     v_grid = vec![0i32; CHROMA_SIDE * CHROMA_SIDE];
                 } else {
                     let around = neighbours.around_mi(leaf_mi, 8);
-                    luma_grid = read_inter_plane(
+                    let luma_tx_type;
+                    (luma_grid, luma_tx_type) = read_inter_plane(
                         dec,
                         cdfs,
                         if reduced_tx_set {
@@ -5744,6 +5760,7 @@ fn decode_inter_block8(
                         SIDE,
                         base_q_idx,
                         &pred_y,
+                        None,
                     )?;
                     u_grid = read_inter_plane(
                         dec,
@@ -5759,7 +5776,9 @@ fn decode_inter_block8(
                         CHROMA_SIDE,
                         base_q_idx,
                         &pred_u,
-                    )?;
+                        Some(luma_tx_type),
+                    )?
+                    .0;
                     v_grid = read_inter_plane(
                         dec,
                         cdfs,
@@ -5774,7 +5793,9 @@ fn decode_inter_block8(
                         CHROMA_SIDE,
                         base_q_idx,
                         &pred_v,
-                    )?;
+                        Some(luma_tx_type),
+                    )?
+                    .0;
                 }
                 return Ok((skip, is_inter, skip_mode, compound_ctx8));
             }
@@ -5924,7 +5945,8 @@ fn decode_inter_block8(
             v_grid = vec![0i32; CHROMA_SIDE * CHROMA_SIDE];
         } else {
             let around = neighbours.around_mi(leaf_mi, 8);
-            luma_grid = read_inter_plane(
+            let luma_tx_type;
+            (luma_grid, luma_tx_type) = read_inter_plane(
                 dec,
                 cdfs,
                 if reduced_tx_set {
@@ -5942,6 +5964,7 @@ fn decode_inter_block8(
                 SIDE,
                 base_q_idx,
                 &pred_y,
+                None,
             )?;
             u_grid = read_inter_plane(
                 dec,
@@ -5957,7 +5980,9 @@ fn decode_inter_block8(
                 CHROMA_SIDE,
                 base_q_idx,
                 &pred_u,
-            )?;
+                Some(luma_tx_type),
+            )?
+            .0;
             v_grid = read_inter_plane(
                 dec,
                 cdfs,
@@ -5972,7 +5997,9 @@ fn decode_inter_block8(
                 CHROMA_SIDE,
                 base_q_idx,
                 &pred_v,
-            )?;
+                Some(luma_tx_type),
+            )?
+            .0;
         }
     } else {
         let mode = dec.symbol(&mut cdfs.y_mode[SIZE_GROUP_8]);
