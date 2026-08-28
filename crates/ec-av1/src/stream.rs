@@ -138,6 +138,28 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 "a frame with segmentation enabled (this decoder never reads a per-block segment_id symbol)",
             ));
         }
+        // lane-av1golden7 r9: `apply_grain` (spec 7.18.3, the decoder-side
+        // synthesis `film_grain_params` drives) is never applied by this
+        // crate -- it returns the coded (denoised, for content aomenc's
+        // `--tune-content=film` re-grains) base picture unchanged. Traced
+        // live from `fixtures/golden6-mismatch.obu`: a frame-0 intra
+        // keyframe with `apply_grain=true` mismatched ffmpeg on 3855/4096
+        // luma pixels, all explained by missing synthetic grain (this
+        // decoder's smooth prediction+residual output visually matches
+        // ffmpeg's grain-textured one; pixel-exact only where the grain
+        // scaling curve happens to hit zero). This is what a round-8 hunt
+        // mistook for a GOLDEN_FRAME-adjacent bug: the golden gate only
+        // ever compares streams where `non_last_ref_hits` fired, and
+        // `--tune-content=film` (which turns grain synthesis on) is part of
+        // that same gate's own aomenc recipe -- pure survivor bias, not
+        // causation. Refuse by name rather than silently return a
+        // grain-free picture.
+        if header.film_grain.apply_grain {
+            return Err(Error::unsupported(
+                "AV1 decode_stream",
+                "a frame with apply_grain set (this decoder never synthesizes film grain, spec 7.18.3)",
+            ));
+        }
         // Loop restoration carries per-restoration-unit symbols in the tile
         // (spec 5.11.57 `read_lr`, one group per LR unit reached from the
         // superblock walk) that this decoder never reads -- same
@@ -1864,6 +1886,37 @@ mod tests {
         }
     }
 
+    /// lane-av1golden7 round 9: pins the residual GOLDEN_FRAME MC bug found
+    /// by the forwarding gate once film grain is out of the way (1/20 real
+    /// aomenc streams, frame 3 luma, apply_grain=false, `non_last_ref_hits`
+    /// delta=2). `GOLDEN_FRAME` refuses by name until this decodes exact.
+    #[test]
+    #[ignore = "reads a pinned fixture path outside the repo; run manually"]
+    fn pinned_golden7_stream_decodes_pixel_exact() {
+        use crate::decode::non_last_ref_hits;
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/golden7-forwarding-mismatch.obu"
+        );
+        let stream = std::fs::read(path).expect("reading pinned stream");
+        if !have_ffmpeg() {
+            eprintln!("SKIP pinned_golden7_stream_decodes_pixel_exact: no ffmpeg");
+            return;
+        }
+        let before = non_last_ref_hits();
+        let frames = decode_stream(&stream).expect("pinned stream must decode");
+        eprintln!(
+            "non_last_ref_hits before={before} after={}",
+            non_last_ref_hits()
+        );
+        let ffmpeg_frames = ffmpeg_decode_sequence(&stream, 64, 64, 4);
+        for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+            assert_eq!(got.y, want.y, "frame {i} luma vs ffmpeg (pinned)");
+            assert_eq!(got.u, want.u, "frame {i} U vs ffmpeg (pinned)");
+            assert_eq!(got.v, want.v, "frame {i} V vs ffmpeg (pinned)");
+        }
+    }
+
     /// lane-av1refs's decisive single-non-LAST-reference gate: identical
     /// recipe to
     /// [`a_real_aomenc_inter_sequence_with_cdf_forwarding_decodes_pixel_exact`]
@@ -2347,6 +2400,28 @@ mod tests {
         panic!(
             "fewer than 4 firing+pixel-exact runs out of 60 attempts:\n{}",
             refusals.join("\n")
+        );
+    }
+
+    /// lane-av1golden7 r9's decisive fixture: a real aomenc stream (seed 59,
+    /// `--tune-content=film`, GOLDEN_FRAME firing downstream) whose frame-0
+    /// *intra keyframe* mismatched ffmpeg on 3855/4096 luma pixels -- traced
+    /// to `apply_grain=true` (spec 7.18.3 grain synthesis, never
+    /// implemented here), entirely unrelated to GOLDEN_FRAME or frame
+    /// ordering. `decode_stream` now refuses `apply_grain` streams by name;
+    /// this pins that refusal rather than a silent grain-free mismatch.
+    #[test]
+    fn a_real_aomenc_stream_with_film_grain_refuses_by_name() {
+        let data = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/golden6-mismatch.obu"
+        ))
+        .unwrap();
+        let err = decode_stream(&data).expect_err("apply_grain stream must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("apply_grain"),
+            "expected an apply_grain refusal, got: {msg}"
         );
     }
 }

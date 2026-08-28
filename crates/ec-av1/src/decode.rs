@@ -3700,11 +3700,9 @@ fn decode_inter_block(
     // into a `[Option<&PlaneBuf>; REFS_PER_FRAME]` addressed by the decoded
     // reference, same as the CDF/picture DPB slots `decode_stream` already
     // keeps.
-    // (round 6: parameters kept threaded but unread while the GOLDEN arm is
-    // masked again -- see the refusal below.)
-    _golden_y: Option<&PlaneBuf>,
-    _golden_u: Option<&PlaneBuf>,
-    _golden_v: Option<&PlaneBuf>,
+    golden_y: Option<&PlaneBuf>,
+    golden_u: Option<&PlaneBuf>,
+    golden_v: Option<&PlaneBuf>,
     base_q_idx: u8,
     luma_set_intra: TxbSet,
     luma_set_inter: TxbSet,
@@ -3739,71 +3737,41 @@ fn decode_inter_block(
     if is_inter {
         let ref_frame = read_single_ref(dec, cdfs, neighbours.above_ref[c], neighbours.left_ref[r]);
         ref_frame_for_lf = ref_frame;
-        // round 4 (lane-av1golden): 120+ attempts across a real aomenc
-        // recipe never landed a GOLDEN_FRAME-firing, decodable stream (every
-        // attempt hit an unrelated named refusal first), so this arm stayed
-        // refused pending a fixture that could prove it another way. A
-        // hand-built stream did (stream.rs's fixture drives GOLDEN_FRAME
-        // through a real OBU stream ffmpeg also decodes), and the arm went
-        // live at the round-4 merge.
-        // round 5 (lane-av1golden2): the first real aomenc streams through
-        // this arm mismatched. Symbol-trace vs a patched aomdec proved one
-        // cause `LAST_FRAME`-reachable -- `lf_level`'s flat `mode_deltas[1]`
-        // on `GLOBALMV` blocks (fixed; see `Neighbours::ref_grid`'s packed
-        // sign) -- and a second, loop-filter level/sharpness wrongly
-        // forwarding from the primary ref frame instead of spec 7.20's
-        // `ref_deltas`/`mode_deltas` (fixed, lane-av1golden3). Both fixes
-        // are `LAST_FRAME`-reachable and independent of the golden plane
-        // itself.
-        // round 6 (lane-av1golden4): un-masked again and re-masked in the
-        // same round. A real aomenc stream (pinned:
-        // `stream::tests::pinned_golden4_stream_decodes_pixel_exact`, seed
-        // 43, frame 3 luma) mismatched by exactly +-1 on 3 of 4096 pixels,
-        // all inside the loop filter's 14-wide edge window at the y=32
-        // horizontal boundary between a GOLDEN_FRAME block (ref_idx 4,
-        // computed level 3) and a LAST_FRAME block (ref_idx 1, level 4) --
-        // `edge_params`/`lf_level`'s own math checks out against spec 7.14.4
-        // by hand (`base=4`, `ref_deltas[4]=-1`, `mode_deltas=[0,0]` all
-        // match the default table).
-        //
-        // round 7 (lane-av1golden5): un-masked again, bisected with a
-        // patched aomdec (`EC_AV1_PREFILT_DUMP`/`EC_AV1_POSTFILT_DUMP` env
-        // dumps already in `/tmp/libaom-src`'s `decodeframe.c`) against the
-        // same pin. Dumped this decoder's own pre-`apply_deblock` luma rows
-        // 30-36 for frame 3 and diffed them against aomdec's pre-filter
-        // dump for the same bytes: the exact same 3 pixels (row32 col37,
-        // row33 col39, row33 col54) already mismatch BEFORE the loop filter
-        // runs, by the exact same +-1 the final assertion sees --
-        // `apply_deblock` itself is now CLEARED, both this round's kernel
-        // hypothesis and round 6's are ruled out. All 3 pixels are inside
-        // the single `GOLDEN_FRAME` 32x32 NEWMV block at (px=32,py=32),
-        // mv=(-7,-7) 1/8-pel (x_q4=y_q4=498, both axes fraction 2/16),
-        // `skip=1` (no residual, so the mismatch is pure MC output),
-        // REGULAR/REGULAR resolved filter, `enable_dual_filter=true`. The
-        // reference plane bytes this block reads (dumped, rows 28-37) match
-        // the picture the outer per-frame ffmpeg assertion already proved
-        // bit-exact for frames 0-2, so it is not a stale/wrong golden
-        // picture either -- the divergence is inside
-        // `mc::predict_with_filters`'s own 2D convolution or the
-        // switchable-filter symbol resolution for this exact (dual axis,
-        // non-globalmv, GOLDEN_FRAME) combination, unproven past that.
-        // Re-masked pending that isolation -- do not re-litigate
-        // `apply_deblock`/`lf_level` again, both are cleared for this pin.
+        // round 4-8 (lane-av1golden through lane-av1golden6): repeatedly
+        // un-masked and re-masked chasing what looked like a GOLDEN_FRAME MC
+        // bug -- lf_level `mode_deltas`/`ref_deltas` forwarding fixes
+        // (rounds 5/6, both real and kept), and a switchable_interp ctx
+        // ref-frame gate (round 8, real and kept). Every remaining
+        // "GOLDEN_FRAME mismatch" chased past round 8 (including a frame-0
+        // *intra keyframe* luma mismatch that could not possibly depend on
+        // this arm at all) turned out to be a single unrelated cause: round
+        // 9 (lane-av1golden7) traced `fixtures/golden6-mismatch.obu`'s
+        // frame-0 mismatch down to `header.film_grain.apply_grain == true`
+        // (aomenc's `--tune-content=film` denoises the coded picture and
+        // has the decoder re-synthesize grain per spec 7.18.3) -- this
+        // decoder never implements grain synthesis at all, so it silently
+        // returned the clean base picture while ffmpeg (dav1d) returned the
+        // grain-synthesized one. That bug fires on *any* frame, key or
+        // inter, and is orthogonal to which reference a block selects --
+        // the earlier "correlates with GOLDEN firing" pattern was survivor
+        // bias: the golden gate only ever compared streams where
+        // `non_last_ref_hits` fired, and `--tune-content=film` is part of
+        // that same gate's own aomenc recipe. `decode_stream` now refuses
+        // `apply_grain` streams by name instead of silently mismatching --
+        // but unmasking `GOLDEN_FRAME` with that fix in still shows a real,
+        // separate residual MC bug: round 9 (lane-av1golden7)'s forwarding
+        // gate hit 1/20 real aomenc streams mismatching (frame 3 luma,
+        // apply_grain=false, non_last_ref_hits delta=2), pinned in
+        // `fixtures/golden7-forwarding-mismatch.obu` for round 10. `GOLDEN_FRAME`
+        // stays refused by name until that's found.
         let (py_ref, pu_ref, pv_ref) = match ref_frame {
             LAST_FRAME => (ref_y, ref_u, ref_v),
             _ => {
                 return Err(unsupported(
-                    "a reference frame other than LAST_FRAME (round 8: GOLDEN_FRAME's decode \
-                     path exists but is masked -- unmasking it with a switchable_interp \
-                     ref_frame-gated context fix still produces a real frame-0 (intra \
-                     keyframe) luma mismatch against ffmpeg whenever GOLDEN_FRAME actually \
-                     fires downstream in the same stream, reproduced twice live \
-                     (seeds 57, 59; reproducing stream dumped to \
-                     fixtures/golden6-mismatch.obu). Root cause is not \
-                     the switchable_interp context (that gate is correct and kept) but \
-                     something GOLDEN-adjacent that corrupts an unrelated earlier frame's \
-                     comparison -- possibly frame-count/ordering divergence between our \
-                     decoder and ffmpeg once aomenc's RD picks GOLDEN, unproven past that)",
+                    "a reference frame other than LAST_FRAME (LAST2/LAST3/GOLDEN/BWDREF/\
+                     ALTREF2/ALTREF still have no MC path -- GOLDEN's residual MC bug is \
+                     pinned in fixtures/golden7-forwarding-mismatch.obu, round 9 \
+                     lane-av1golden7)",
                 ));
             }
         };
