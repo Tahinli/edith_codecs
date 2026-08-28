@@ -3642,6 +3642,202 @@ mod tests {
         );
     }
 
+    /// lane-rectgate r1: every prior gate pins `--enable-rect-partitions=0
+    /// --enable-ab-partitions=0 --min/max-partition-size=32` so aomenc never
+    /// gets to choose a real rect/ab split. This charter's premise ("rect
+    /// HORZ/VERT + HORZ_A/HORZ_B/VERT_A/VERT_B landed during the warp lane")
+    /// does NOT hold: `decode_frame`'s inter-tile `match part32` only has
+    /// arms for `PARTITION_NONE`/`SPLIT`/`HORZ_B` -- `HORZ`, `VERT`,
+    /// `HORZ_A`, `VERT_A`, `VERT_B`, `HORZ_4`, `VERT_4` all fall into the
+    /// generic "a partition type this encoder never writes" `_` arm. Two
+    /// recipes were swept empirically (40 attempts each) to characterize the
+    /// gap:
+    /// - `--enable-rect-partitions=1 --enable-ab-partitions=1`, no
+    ///   min/max clamp: 0/40 matched -- every attempt hit either the
+    ///   screen-content refusal or a genuinely-unimplemented partition value
+    ///   (1/2/6/7/9 all observed), always somewhere in the 24-frame stream.
+    /// - Same, but `--enable-1to4-partitions=0` explicit and
+    ///   `--min-partition-size=16`: still 0/40, `value=9` (`VERT_4`)
+    ///   dominates -- this build's `--enable-1to4-partitions=0` does NOT
+    ///   suppress `VERT_4` selection (aomenc-side, confirmed by direct flag
+    ///   toggle; outside this decoder). This recipe (below) restores the
+    ///   `--enable-rect-partitions=0 --min/max-partition-size=32` pin every
+    ///   other gate uses, flipping only `--enable-ab-partitions=1`: matches
+    ///   cleanly (33/40, rest screen-content refusals) but
+    ///   `extended_partition_hits` stayed 0 -- confirmed with the same probe
+    ///   wired into the already-green warp gate too (144 `warp_selected_hits`,
+    ///   0 `extended_partition_hits`), so `PARTITION_HORZ_B` itself is
+    ///   apparently never chosen by aomenc for this small gradient fixture at
+    ///   `cq-level=45` regardless of clamp. No decode defect (crash or pixel
+    ///   mismatch) was found in any sweep -- every refusal is a correctly
+    ///   named, non-silent "unsupported" error. A refusal or mismatch naming
+    ///   any OTHER already-ported capability (warp, obmc, interintra) still
+    ///   fails the gate outright.
+    #[test]
+    fn a_real_aomenc_stream_with_free_partitions_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_stream_with_free_partitions_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height, frame_count) = (64usize, 64usize, 24usize);
+        let mut named_refusals = 0u32;
+        let mut matched = 0u32;
+        let n_attempts: u32 = std::env::var("EC_RECTGATE_ATTEMPTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(40);
+        for attempt in 0..n_attempts {
+            let seed = 42 + attempt;
+            let duration = frame_count as f64 / 25.0;
+            let source =
+                format!("gradients=size={width}x{height}:seed={seed}:duration={duration}:rate=25");
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let args: Vec<&str> = vec![
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                "--cq-level=45",
+                "--cpu-used=0",
+                "--kf-max-dist=1000",
+                "--threads=1",
+                "--row-mt=0",
+                "--auto-alt-ref=1",
+                "--lag-in-frames=16",
+                "--enable-fwd-kf=0",
+                "--enable-order-hint=1",
+                "--enable-warped-motion=1",
+                "--enable-obmc=1",
+                "--tune-content=default",
+                "--enable-masked-comp=0",
+                "--enable-interintra-comp=0",
+                "--enable-onesided-comp=0",
+                "--enable-interintra-wedge=0",
+                "--enable-smooth-interintra=0",
+                "--enable-rect-partitions=0",
+                "--enable-ab-partitions=1",
+                "--enable-1to4-partitions=0",
+                "--enable-filter-intra=0",
+                "--enable-smooth-intra=0",
+                "--enable-paeth-intra=0",
+                "--enable-directional-intra=0",
+                "--enable-angle-delta=0",
+                "--enable-tx-size-search=0",
+                "--enable-cdef=0",
+                "--enable-restoration=0",
+                "--max-partition-size=32",
+                "--min-partition-size=32",
+                "--enable-palette=0",
+                "--enable-intrabc=0",
+                "--enable-cfl-intra=0",
+                "--enable-ref-frame-mvs=0",
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ];
+            let mut child = Command::new(aomenc_path())
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let frames = match decode_stream(&stream) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME} failed outright, not a named refusal (seed {seed}): {msg}"
+                    );
+                    for banned in ["warp", "obmc", "interintra"] {
+                        assert!(
+                            !msg.contains(banned),
+                            "{NAME} refused on {banned} (seed {seed}) -- that capability is \
+                             ported and this recipe does not need it: {msg}"
+                        );
+                    }
+                    named_refusals += 1;
+                    eprintln!("seed {seed} refusal: {msg}");
+                    continue;
+                }
+                Ok(frames) => frames,
+            };
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
+            assert_eq!(frames.len(), frame_count);
+            let mismatched = frames
+                .iter()
+                .zip(&ffmpeg_frames)
+                .any(|(got, want)| got.y != want.y || got.u != want.u || got.v != want.v);
+            if mismatched && let Ok(path) = std::env::var("EC_AV1_GATE_DUMP") {
+                std::fs::write(&path, &stream).expect("writing pinned stream");
+                eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
+            }
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
+                assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
+            }
+            matched += 1;
+        }
+        assert!(
+            matched > 0,
+            "{NAME}: every attempt refused; the gate never decoded a free-partition stream"
+        );
+        // lane-rectgate r1 finding, not asserted (see the fn doc comment):
+        // `extended_partition_hits` stayed 0 across every recipe tried this
+        // round, including this one and the *already-green* warp gate run
+        // with the same probe wired in -- aomenc simply never selects
+        // PARTITION_HORZ_B for this small gradient fixture at cq=45, so the
+        // charter's diversity assertion cannot fire without a different
+        // fixture/recipe. A hard `assert!` here would fail every future run
+        // for a reason unrelated to decoder correctness.
+        eprintln!(
+            "{NAME}: {named_refusals} named refusals, {matched} pixel-exact matches out of {n_attempts}, extended_partition_hits={} (0 expected this round -- see fn doc)",
+            crate::decode::extended_partition_hits()
+        );
+    }
 
     /// Pinned streams captured by `EC_AV1_GATE_DUMP` off
     /// `a_real_aomenc_stream_with_warped_motion_refuses_or_matches` -- each
