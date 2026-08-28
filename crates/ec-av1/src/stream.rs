@@ -3090,6 +3090,22 @@ mod tests {
         a_real_aomenc_temporal_mv_gate(42, 40);
     }
 
+    /// r17 bisect scratch: decode a pinned stream exactly once, so
+    /// `decode::r17_dump`'s frame index (a process-wide counter) lines up
+    /// with `aomdec`'s own per-frame `EC_AV1_PREFILT_DUMP`/
+    /// `EC_AV1_POSTFILT_DUMP` numbering. Remove with the rest of the r17
+    /// scaffolding.
+    #[test]
+    #[ignore]
+    fn scratch_decode_pinned_stream_once() {
+        let path = std::env::var("EC_AV1_PIN").expect("set EC_AV1_PIN to the .obu path");
+        let stream = std::fs::read(&path).expect("read pinned stream");
+        match decode_stream(&stream) {
+            Ok(frames) => eprintln!("OK: {} frames", frames.len()),
+            Err(e) => eprintln!("ERR: {e}"),
+        }
+    }
+
     /// scratch: decode a pinned stream end to end and report where/why it
     /// refuses, plus `non_last_ref_hits` progression.
     #[test]
