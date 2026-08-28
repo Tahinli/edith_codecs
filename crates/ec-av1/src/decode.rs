@@ -3704,9 +3704,21 @@ fn resolve_interp_filter(
     // `h_kind`/`v_kind` argument order, which is why this function returns
     // `(h, v, ..)` but reads `dir0` (`v`) before `dir1` (`h`).
     let ctx0 = switchable_interp_ctx(above[0], left[0], 0, is_compound);
+    if std::env::var_os("EC_AV1_SREF_DUMP").is_some() {
+        eprintln!(
+            "IFILTER_RS dir=0 ctx={ctx0} cdf={:?}",
+            &cdfs.switchable_interp[ctx0][..3]
+        );
+    }
     let sym0 = dec.symbol(&mut cdfs.switchable_interp[ctx0]) as u8;
     let sym1 = if enable_dual_filter {
         let ctx1 = switchable_interp_ctx(above[1], left[1], 1, is_compound);
+        if std::env::var_os("EC_AV1_SREF_DUMP").is_some() {
+            eprintln!(
+                "IFILTER_RS dir=1 ctx={ctx1} cdf={:?}",
+                &cdfs.switchable_interp[ctx1][..3]
+            );
+        }
         dec.symbol(&mut cdfs.switchable_interp[ctx1]) as u8
     } else {
         sym0
