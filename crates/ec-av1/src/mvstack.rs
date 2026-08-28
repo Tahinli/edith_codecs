@@ -2107,7 +2107,10 @@ mod tests {
         // span plus MV_BORDER (128), all in 1/8-pel: (2*4)*8 + 1*4*8 + 128 =
         // 64 + 32 + 128 = 224.
         assert_eq!(stack.nearest_mv, (224, 224));
-        assert_ne!(stack.entries[0].mv, stack.nearest_mv);
+        // libaom `av1_find_mv_refs` clamps every stack ENTRY too -- the DRL
+        // reads entries directly, so a raw candidate must not survive
+        // (pinned warp-flake-5.obu regression).
+        assert_eq!(stack.entries[0].mv, (224, 224));
     }
 
     #[test]
