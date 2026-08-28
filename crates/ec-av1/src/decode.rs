@@ -3793,10 +3793,17 @@ fn decode_inter_block(
             LAST_FRAME => (ref_y, ref_u, ref_v),
             _ => {
                 return Err(unsupported(
-                    "a reference frame other than LAST_FRAME (round 7: GOLDEN_FRAME's decode \
-                     path exists but is masked -- a narrow +-1 MC residue on a dual-axis \
-                     subpel GOLDEN block, isolated to pre-deblock this round, keeps real \
-                     GOLDEN streams from pixel-exact)",
+                    "a reference frame other than LAST_FRAME (round 8: GOLDEN_FRAME's decode \
+                     path exists but is masked -- unmasking it with a switchable_interp \
+                     ref_frame-gated context fix still produces a real frame-0 (intra \
+                     keyframe) luma mismatch against ffmpeg whenever GOLDEN_FRAME actually \
+                     fires downstream in the same stream, reproduced twice live \
+                     (seeds 57, 59; reproducing stream dumped to \
+                     fixtures/golden6-mismatch.obu). Root cause is not \
+                     the switchable_interp context (that gate is correct and kept) but \
+                     something GOLDEN-adjacent that corrupts an unrelated earlier frame's \
+                     comparison -- possibly frame-count/ordering divergence between our \
+                     decoder and ffmpeg once aomenc's RD picks GOLDEN, unproven past that)",
                 ));
             }
         };
@@ -3873,14 +3880,32 @@ fn decode_inter_block(
             };
             (mv, false)
         };
+        // spec `get_ref_filter_type`: a neighbour's own filter only feeds
+        // this block's switchable_interp context when that neighbour coded
+        // the SAME reference frame this block is about to read -- a
+        // different-ref neighbour reads as "no neighbour" ([3, 3], the
+        // sentinel `Neighbours::new` already seeds unset slots with),
+        // exactly like an intra neighbour. Without this gate, a GOLDEN_FRAME
+        // block next to a LAST_FRAME one inherits that neighbour's filter
+        // choice into its own context, corrupting the symbol it reads.
+        let above_filter_ctx = if neighbours.above_ref[c] == ref_frame {
+            neighbours.above_filter[c]
+        } else {
+            [3, 3]
+        };
+        let left_filter_ctx = if neighbours.left_ref[r] == ref_frame {
+            neighbours.left_filter[r]
+        } else {
+            [3, 3]
+        };
         let (h_filter, v_filter, resolved_filter) = resolve_interp_filter(
             dec,
             cdfs,
             interp_fixed,
             enable_dual_filter,
             is_globalmv,
-            neighbours.above_filter[c],
-            neighbours.left_filter[r],
+            above_filter_ctx,
+            left_filter_ctx,
         );
         block_filter = resolved_filter;
         globalmv_for_lf = is_globalmv;
