@@ -121,6 +121,14 @@ pub struct MiInfo {
     /// The single reference frame this unit's MV points into. Ignored (and
     /// the unit contributes no candidate) when `is_inter` is `false`.
     pub ref_frame: i8,
+    /// The unit's *second* reference frame when it was coded compound
+    /// (spec `RefFrames[1]`), `None` for a single-reference/intra unit --
+    /// lane-av1comp: today's callers (single-ref decode/encode) never set
+    /// this, so it exists only so [`MiGrid`] can carry compound state once
+    /// `read_ref_frames` (spec 5.11.25) lands; nothing reads it yet, and
+    /// [`find_mv_stack`]'s scan still matches candidates on `ref_frame`
+    /// alone (its own compound dual-ref scan is unported -- see the ledger).
+    pub ref_frame1: Option<i8>,
     /// The unit's motion vector, `(row, col)`, in the spec's 1/8-pel units.
     pub mv: (i32, i32),
     /// Whether this unit's own mode was `NEWMV` (spec's
@@ -1179,6 +1187,7 @@ mod tests {
         MiInfo {
             is_inter: true,
             ref_frame: 1,
+            ref_frame1: None,
             mv,
             is_new_mv: false,
             // 1: smaller than every `bw4`/`bh4` these small-grid tests use,
@@ -1330,6 +1339,7 @@ mod tests {
             MiInfo {
                 is_inter: true,
                 ref_frame: 1,
+                ref_frame1: None,
                 mv: (4, 4),
                 is_new_mv: true,
                 size: 1,
@@ -1408,6 +1418,7 @@ mod tests {
             MiInfo {
                 is_inter: true,
                 ref_frame: 1,
+                ref_frame1: None,
                 mv,
                 is_new_mv: false,
                 size: 8,
@@ -1435,6 +1446,7 @@ mod tests {
         MiInfo {
             is_inter: false,
             ref_frame: -1,
+            ref_frame1: None,
             mv: (0, 0),
             is_new_mv: false,
             size: 8,
@@ -1449,6 +1461,7 @@ mod tests {
         MiInfo {
             is_inter: true,
             ref_frame: 1,
+            ref_frame1: None,
             mv,
             is_new_mv: false,
             size: 8,
