@@ -200,9 +200,37 @@ pub(crate) fn interintra_hits() -> usize {
     INTERINTRA_HITS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// How many blocks decoded `comp_group_idx == 1` (masked COMPOUND_REFERENCE,
+/// wedge or diffwtd) and had `compound_type`/`wedge_idx`/`wedge_sign`/
+/// `mask_type` consumed entropy-exact -- lane-maskcomp r1's proof that a
+/// gate fixture actually exercises this alphabet, even though the block
+/// still refuses (the mask blend itself is unported).
+static MASKED_COMPOUND_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Current value of [`MASKED_COMPOUND_HITS`].
+pub(crate) fn masked_compound_hits() -> usize {
+    MASKED_COMPOUND_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Current value of [`OBMC_HITS_8`].
 pub(crate) fn obmc_hits_8() -> usize {
     OBMC_HITS_8.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// lane-rectgate r1: how many 32x32 quadrants actually decoded a
+/// `PARTITION_HORZ_B` split (the one extended/ab partition this decoder's
+/// inter-frame tile loop decodes -- `PARTITION_HORZ`/`VERT`/`HORZ_A`/`VERT_A`/
+/// `VERT_B` all still fall into the generic "a partition type this encoder
+/// never writes" refusal below) -- the gate's proof that a free-partition
+/// aomenc stream actually exercised a non-`NONE`/`SPLIT` partition rather than
+/// coincidentally never selecting one.
+static EXTENDED_PARTITION_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Current value of [`EXTENDED_PARTITION_HITS`].
+pub(crate) fn extended_partition_hits() -> usize {
+    EXTENDED_PARTITION_HITS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// How many [`read_inter_compound_mode`] reads actually happened
@@ -5160,10 +5188,35 @@ fn decode_inter_block(
                 0
             };
             if comp_group_idx == 1 {
+                // lane-maskcomp r1: `read_compound_type` (spec 5.11.25,
+                // libaom `decodemv.c` 1634-1656). `is_interinter_compound_used
+                // (COMPOUND_WEDGE, bsize)` (`av1_is_wedge_used`,
+                // `av1_wedge_params_lookup`) is true for every square bsize
+                // this leaf reaches (8x8/16x16/32x32 all have
+                // `wedge_types > 0`), so `compound_type` always reads a real
+                // symbol here -- no alphabet collapse to worry about at this
+                // block-size family.
+                let wedge_bsize = match side {
+                    8 => 3,
+                    16 => 6,
+                    32 => 9,
+                    _ => unreachable!("decode_inter_block leaf side is 8/16/32"),
+                };
+                let compound_type = dec.symbol(&mut cdfs.compound_type[wedge_bsize]);
+                if compound_type == 0 {
+                    // COMPOUND_WEDGE
+                    let _wedge_index = dec.symbol(&mut cdfs.wedge_idx[wedge_bsize]);
+                    let _wedge_sign = dec.literal(1);
+                } else {
+                    // COMPOUND_DIFFWTD: `mask_type`, MAX_DIFFWTD_MASK_BITS==1.
+                    let _mask_type = dec.literal(1);
+                }
+                MASKED_COMPOUND_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Err(unsupported(
                     "a masked COMPOUND_REFERENCE block (comp_group_idx == 1, wedge/\
-                     diffwtd) -- this decoder's compound blend is the plain distance-\
-                     weighted/simple-average combine only, lane-av1comp",
+                     diffwtd) -- syntax consumed entropy-exact (compound_type/wedge_idx/\
+                     wedge_sign/mask_type), but this decoder's compound blend does not yet \
+                     build the wedge/diffwtd mask, lane-maskcomp r1",
                 ));
             }
             // corner-cut (lane-av1comp r16/r17, lane-av1blend r1): r16/r17
@@ -6518,10 +6571,22 @@ fn decode_inter_block8(
                     0
                 };
                 if comp_group_idx == 1 {
+                    // lane-maskcomp r1: see the 16x16 leaf's own comment
+                    // above -- SIDE==8 here, `wedge_bsize` index 3
+                    // (BLOCK_8X8, `wedge_types > 0`).
+                    let compound_type = dec.symbol(&mut cdfs.compound_type[3]);
+                    if compound_type == 0 {
+                        let _wedge_index = dec.symbol(&mut cdfs.wedge_idx[3]);
+                        let _wedge_sign = dec.literal(1);
+                    } else {
+                        let _mask_type = dec.literal(1);
+                    }
+                    MASKED_COMPOUND_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return Err(unsupported(
                         "a masked COMPOUND_REFERENCE 8x8 leaf (comp_group_idx == 1, wedge/\
-                         diffwtd) -- this decoder's compound blend is the plain distance-\
-                         weighted/simple-average combine only, lane-av1comp",
+                         diffwtd) -- syntax consumed entropy-exact (compound_type/wedge_idx/\
+                         wedge_sign/mask_type), but this decoder's compound blend does not \
+                         yet build the wedge/diffwtd mask, lane-maskcomp r1",
                     ));
                 }
                 // corner-cut (lane-av1comp r16/r17, lane-av1blend r1): same
@@ -7792,6 +7857,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                         // mi-granular `left_side_mi` rows of a last-block-in-
                         // tile strip leak 32-vs-16 only until the per-tile
                         // `Neighbours::new` reset.
+                        EXTENDED_PARTITION_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let at32 = at;
                         decode_inter_block(
                             &mut dec,
