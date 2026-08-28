@@ -5327,6 +5327,12 @@ fn decode_inter_block(
             } else {
                 0
             };
+            // lane-maskcomp r2: `Some(mask_type)` only for a real
+            // `COMPOUND_DIFFWTD` block (`comp_group_idx == 1`, `compound_type
+            // == 1`) -- wedge (`compound_type == 0`) still refuses by name,
+            // its mask codebook unported (charter's mergeable-partial
+            // fallback).
+            let mut diffwtd_mask_type: Option<u8> = None;
             if comp_group_idx == 1 {
                 // lane-maskcomp r1: `read_compound_type` (spec 5.11.25,
                 // libaom `decodemv.c` 1634-1656). `is_interinter_compound_used
@@ -5344,20 +5350,21 @@ fn decode_inter_block(
                 };
                 let compound_type = dec.symbol(&mut cdfs.compound_type[wedge_bsize]);
                 if compound_type == 0 {
-                    // COMPOUND_WEDGE
+                    // COMPOUND_WEDGE: mask codebook not ported (r2 scope).
                     let _wedge_index = dec.symbol(&mut cdfs.wedge_idx[wedge_bsize]);
                     let _wedge_sign = dec.literal(1);
-                } else {
-                    // COMPOUND_DIFFWTD: `mask_type`, MAX_DIFFWTD_MASK_BITS==1.
-                    let _mask_type = dec.literal(1);
+                    MASKED_COMPOUND_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Err(unsupported(
+                        "a masked COMPOUND_REFERENCE block (comp_group_idx == 1, \
+                         COMPOUND_WEDGE) -- syntax consumed entropy-exact (compound_type/\
+                         wedge_idx/wedge_sign), but this decoder's wedge mask codebook is \
+                         not ported (lane-maskcomp r2 scope: DIFFWTD only)",
+                    ));
                 }
+                // COMPOUND_DIFFWTD: `mask_type`, MAX_DIFFWTD_MASK_BITS==1.
+                let mask_type = dec.literal(1);
+                diffwtd_mask_type = Some(mask_type as u8);
                 MASKED_COMPOUND_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Err(unsupported(
-                    "a masked COMPOUND_REFERENCE block (comp_group_idx == 1, wedge/\
-                     diffwtd) -- syntax consumed entropy-exact (compound_type/wedge_idx/\
-                     wedge_sign/mask_type), but this decoder's compound blend does not yet \
-                     build the wedge/diffwtd mask, lane-maskcomp r1",
-                ));
             }
             // corner-cut (lane-av1comp r16/r17, lane-av1blend r1): r16/r17
             // called this a `predict_compound_intermediate`/`combine_compound`
@@ -5552,7 +5559,16 @@ fn decode_inter_block(
             // Re-masking: see that fixture + `scratch_isolate_pinned_mismatch`
             // (`EC_AV1_PIN=fixtures/av1idx-refsel-pin.obu EC_AV1_PIN_N=20`)
             // for the next round's starting point.
-            let (fwd_offset, bck_offset, compound_idx) = if !skip_mode && enable_jnt_comp {
+            // lane-maskcomp r2: `compound_idx` is only read when
+            // `comp_group_idx == 0` (libaom `decodemv.c:1606`) -- a masked
+            // (wedge/diffwtd) block never also carries a distance-weighted
+            // split. This gate was missing before r2 (dead code: the masked
+            // path always refused earlier, so it never executed with
+            // `comp_group_idx == 1` in practice).
+            let (fwd_offset, bck_offset, compound_idx) = if comp_group_idx == 0
+                && !skip_mode
+                && enable_jnt_comp
+            {
                 let idx_ctx = get_comp_index_context(
                     neighbours,
                     at,
@@ -5636,7 +5652,23 @@ fn decode_inter_block(
                 &mut inter1_y,
             );
             let mut pred_y = vec![0u8; side * side];
-            mc::combine_compound(&inter0_y, &inter1_y, fwd_offset, bck_offset, &mut pred_y);
+            let mut diffwtd_mask_y = Vec::new();
+            if let Some(mask_type) = diffwtd_mask_type {
+                diffwtd_mask_y = vec![0u8; side * side];
+                mc::diffwtd_mask(&inter0_y, &inter1_y, mask_type == 1, &mut diffwtd_mask_y);
+                mc::blend_masked_compound(
+                    &inter0_y,
+                    &inter1_y,
+                    &diffwtd_mask_y,
+                    side,
+                    side,
+                    side,
+                    false,
+                    &mut pred_y,
+                );
+            } else {
+                mc::combine_compound(&inter0_y, &inter1_y, fwd_offset, bck_offset, &mut pred_y);
+            }
 
             let mut inter0_u = vec![0i32; chroma_side * chroma_side];
             mc::predict_compound_intermediate(
@@ -5667,7 +5699,20 @@ fn decode_inter_block(
                 &mut inter1_u,
             );
             let mut pred_u = vec![0u8; chroma_side * chroma_side];
-            mc::combine_compound(&inter0_u, &inter1_u, fwd_offset, bck_offset, &mut pred_u);
+            if diffwtd_mask_type.is_some() {
+                mc::blend_masked_compound(
+                    &inter0_u,
+                    &inter1_u,
+                    &diffwtd_mask_y,
+                    side,
+                    chroma_side,
+                    chroma_side,
+                    true,
+                    &mut pred_u,
+                );
+            } else {
+                mc::combine_compound(&inter0_u, &inter1_u, fwd_offset, bck_offset, &mut pred_u);
+            }
 
             let mut inter0_v = vec![0i32; chroma_side * chroma_side];
             mc::predict_compound_intermediate(
@@ -5698,7 +5743,20 @@ fn decode_inter_block(
                 &mut inter1_v,
             );
             let mut pred_v = vec![0u8; chroma_side * chroma_side];
-            mc::combine_compound(&inter0_v, &inter1_v, fwd_offset, bck_offset, &mut pred_v);
+            if diffwtd_mask_type.is_some() {
+                mc::blend_masked_compound(
+                    &inter0_v,
+                    &inter1_v,
+                    &diffwtd_mask_y,
+                    side,
+                    chroma_side,
+                    chroma_side,
+                    true,
+                    &mut pred_v,
+                );
+            } else {
+                mc::combine_compound(&inter0_v, &inter1_v, fwd_offset, bck_offset, &mut pred_v);
+            }
 
             if skip {
                 y.reconstruct_mc_rect(
@@ -6765,24 +6823,28 @@ fn decode_inter_block8(
                 } else {
                     0
                 };
+                // lane-maskcomp r2: see the 16x16/32x32 leaf's own comment.
+                let mut diffwtd_mask_type: Option<u8> = None;
                 if comp_group_idx == 1 {
                     // lane-maskcomp r1: see the 16x16 leaf's own comment
                     // above -- SIDE==8 here, `wedge_bsize` index 3
                     // (BLOCK_8X8, `wedge_types > 0`).
                     let compound_type = dec.symbol(&mut cdfs.compound_type[3]);
                     if compound_type == 0 {
+                        // COMPOUND_WEDGE: mask codebook not ported (r2 scope).
                         let _wedge_index = dec.symbol(&mut cdfs.wedge_idx[3]);
                         let _wedge_sign = dec.literal(1);
-                    } else {
-                        let _mask_type = dec.literal(1);
+                        MASKED_COMPOUND_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return Err(unsupported(
+                            "a masked COMPOUND_REFERENCE 8x8 leaf (comp_group_idx == 1, \
+                             COMPOUND_WEDGE) -- syntax consumed entropy-exact (compound_type/\
+                             wedge_idx/wedge_sign), but this decoder's wedge mask codebook is \
+                             not ported (lane-maskcomp r2 scope: DIFFWTD only)",
+                        ));
                     }
+                    let mask_type = dec.literal(1);
+                    diffwtd_mask_type = Some(mask_type as u8);
                     MASKED_COMPOUND_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    return Err(unsupported(
-                        "a masked COMPOUND_REFERENCE 8x8 leaf (comp_group_idx == 1, wedge/\
-                         diffwtd) -- syntax consumed entropy-exact (compound_type/wedge_idx/\
-                         wedge_sign/mask_type), but this decoder's compound blend does not \
-                         yet build the wedge/diffwtd mask, lane-maskcomp r1",
-                    ));
                 }
                 // corner-cut (lane-av1comp r16/r17, lane-av1blend r1): same
                 // reference-slot defect as the 16x16 leaf's own mask above
@@ -6797,7 +6859,10 @@ fn decode_inter_block8(
                 // compound_idx defect surfaces on the wide gate sweep.
                 // lane-av1idx r1: same re-mask as the 16x16 leaf above --
                 // see that comment.
-                let (fwd_offset, bck_offset, compound_idx) = if !skip_mode && enable_jnt_comp {
+                let (fwd_offset, bck_offset, compound_idx) = if comp_group_idx == 0
+                    && !skip_mode
+                    && enable_jnt_comp
+                {
                     let idx_ctx = get_comp_index_context(
                         neighbours,
                         outer_at,
@@ -6886,7 +6951,23 @@ fn decode_inter_block8(
                     &mut inter1_y,
                 );
                 let mut pred_y = vec![0u8; SIDE * SIDE];
-                mc::combine_compound(&inter0_y, &inter1_y, fwd_offset, bck_offset, &mut pred_y);
+                let mut diffwtd_mask_y = Vec::new();
+                if let Some(mask_type) = diffwtd_mask_type {
+                    diffwtd_mask_y = vec![0u8; SIDE * SIDE];
+                    mc::diffwtd_mask(&inter0_y, &inter1_y, mask_type == 1, &mut diffwtd_mask_y);
+                    mc::blend_masked_compound(
+                        &inter0_y,
+                        &inter1_y,
+                        &diffwtd_mask_y,
+                        SIDE,
+                        SIDE,
+                        SIDE,
+                        false,
+                        &mut pred_y,
+                    );
+                } else {
+                    mc::combine_compound(&inter0_y, &inter1_y, fwd_offset, bck_offset, &mut pred_y);
+                }
 
                 let mut inter0_u = vec![0i32; CHROMA_SIDE * CHROMA_SIDE];
                 mc::predict_compound_intermediate(
@@ -6917,7 +6998,20 @@ fn decode_inter_block8(
                     &mut inter1_u,
                 );
                 let mut pred_u = vec![0u8; CHROMA_SIDE * CHROMA_SIDE];
-                mc::combine_compound(&inter0_u, &inter1_u, fwd_offset, bck_offset, &mut pred_u);
+                if diffwtd_mask_type.is_some() {
+                    mc::blend_masked_compound(
+                        &inter0_u,
+                        &inter1_u,
+                        &diffwtd_mask_y,
+                        SIDE,
+                        CHROMA_SIDE,
+                        CHROMA_SIDE,
+                        true,
+                        &mut pred_u,
+                    );
+                } else {
+                    mc::combine_compound(&inter0_u, &inter1_u, fwd_offset, bck_offset, &mut pred_u);
+                }
 
                 let mut inter0_v = vec![0i32; CHROMA_SIDE * CHROMA_SIDE];
                 mc::predict_compound_intermediate(
@@ -6948,7 +7042,20 @@ fn decode_inter_block8(
                     &mut inter1_v,
                 );
                 let mut pred_v = vec![0u8; CHROMA_SIDE * CHROMA_SIDE];
-                mc::combine_compound(&inter0_v, &inter1_v, fwd_offset, bck_offset, &mut pred_v);
+                if diffwtd_mask_type.is_some() {
+                    mc::blend_masked_compound(
+                        &inter0_v,
+                        &inter1_v,
+                        &diffwtd_mask_y,
+                        SIDE,
+                        CHROMA_SIDE,
+                        CHROMA_SIDE,
+                        true,
+                        &mut pred_v,
+                    );
+                } else {
+                    mc::combine_compound(&inter0_v, &inter1_v, fwd_offset, bck_offset, &mut pred_v);
+                }
 
                 if skip {
                     y.reconstruct_mc(px, py, SIDE, &pred_y, &vec![0i32; SIDE * SIDE]);
