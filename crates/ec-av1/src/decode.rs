@@ -118,6 +118,34 @@ pub(crate) fn non_last_ref_hits() -> usize {
     NON_LAST_REF_HITS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Per-reference [`NON_LAST_REF_HITS`] breakdown (lane-av1refs): one counter
+/// per `MV_REFERENCE_FRAME` past `LAST_FRAME`, so a gate targeting one
+/// specific reference (`LAST2`/`LAST3`/`GOLDEN`/`BWDREF`/`ALTREF2`/`ALTREF`)
+/// can prove THAT reference fired rather than any non-`LAST_FRAME` one --
+/// `NON_LAST_REF_HITS` alone cannot tell a `LAST2_FRAME` gate from a
+/// `GOLDEN_FRAME` draw it did not ask for.
+static LAST2_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static LAST3_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static GOLDEN_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static BWDREF_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static ALTREF2_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static ALTREF_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Current value of the counter for `ref_frame` (`LAST2_FRAME`..=`ALTREF_FRAME`;
+/// panics on `LAST_FRAME`/`INTRA_FRAME`/`NONE`, which have no counter here).
+pub(crate) fn ref_hits(ref_frame: i8) -> usize {
+    let c = match ref_frame {
+        LAST2_FRAME => &LAST2_HITS,
+        LAST3_FRAME => &LAST3_HITS,
+        GOLDEN_FRAME => &GOLDEN_HITS,
+        BWDREF_FRAME => &BWDREF_HITS,
+        ALTREF2_FRAME => &ALTREF2_HITS,
+        ALTREF_FRAME => &ALTREF_HITS,
+        other => panic!("ref_hits: no per-reference counter for ref_frame {other}"),
+    };
+    c.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 thread_local! {
     /// The sequence header's `enable_intra_edge_filter`, set once per
     /// [`decode_key_frame_tile_with_cdfs`] call: [`PlaneBuf::reconstruct`]'s
@@ -3665,6 +3693,16 @@ fn read_single_ref(dec: &mut SymbolDecoder, cdfs: &mut Cdfs, above_ref: i8, left
     };
     if ref_frame != LAST_FRAME {
         NON_LAST_REF_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let c = match ref_frame {
+            LAST2_FRAME => &LAST2_HITS,
+            LAST3_FRAME => &LAST3_HITS,
+            GOLDEN_FRAME => &GOLDEN_HITS,
+            BWDREF_FRAME => &BWDREF_HITS,
+            ALTREF2_FRAME => &ALTREF2_HITS,
+            ALTREF_FRAME => &ALTREF_HITS,
+            _ => unreachable!("read_single_ref only ever returns LAST_FRAME..=ALTREF_FRAME"),
+        };
+        c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     ref_frame
 }
@@ -4714,7 +4752,8 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                 )
             })
     });
-    let ref_slots: RefSlots = std::array::from_fn(|i| owned_refs[i].as_ref().map(|(a, b, c)| (a, b, c)));
+    let ref_slots: RefSlots =
+        std::array::from_fn(|i| owned_refs[i].as_ref().map(|(a, b, c)| (a, b, c)));
 
     let mut y = PlaneBuf {
         data: vec![0u8; width * height],
