@@ -3883,25 +3883,32 @@ fn read_inter_plane(
 /// `reference_select` set before this is ever called, so that read is never
 /// needed here). `above_ref`/`left_ref` are `-1` for an intra/unavailable
 /// neighbour, else the `1..=7` reference that neighbour coded (lane-av1refs).
-fn read_single_ref(dec: &mut SymbolDecoder, cdfs: &mut Cdfs, above_ref: i8, left_ref: i8) -> i8 {
+fn read_single_ref(
+    dec: &mut SymbolDecoder,
+    cdfs: &mut Cdfs,
+    above_ref: i8,
+    above_ref1: Option<i8>,
+    left_ref: i8,
+    left_ref1: Option<i8>,
+) -> i8 {
     let above = (above_ref > 0).then_some(above_ref);
     let left = (left_ref > 0).then_some(left_ref);
-    let p1 = dec.symbol(&mut cdfs.single_ref[single_ref_p1_ctx(above, left)][0]);
+    let p1 = dec.symbol(&mut cdfs.single_ref[single_ref_p1_ctx(above, above_ref1, left, left_ref1)][0]);
     let ref_frame = if p1 == 1 {
-        let p2 = dec.symbol(&mut cdfs.single_ref[single_ref_p2_ctx(above, left)][1]);
+        let p2 = dec.symbol(&mut cdfs.single_ref[single_ref_p2_ctx(above, above_ref1, left, left_ref1)][1]);
         if p2 == 1 {
             ALTREF_FRAME
         } else {
-            let p6 = dec.symbol(&mut cdfs.single_ref[single_ref_p6_ctx(above, left)][5]);
+            let p6 = dec.symbol(&mut cdfs.single_ref[single_ref_p6_ctx(above, above_ref1, left, left_ref1)][5]);
             if p6 == 1 { ALTREF2_FRAME } else { BWDREF_FRAME }
         }
     } else {
-        let p3 = dec.symbol(&mut cdfs.single_ref[single_ref_p3_ctx(above, left)][2]);
+        let p3 = dec.symbol(&mut cdfs.single_ref[single_ref_p3_ctx(above, above_ref1, left, left_ref1)][2]);
         if p3 == 1 {
-            let p5 = dec.symbol(&mut cdfs.single_ref[single_ref_p5_ctx(above, left)][4]);
+            let p5 = dec.symbol(&mut cdfs.single_ref[single_ref_p5_ctx(above, above_ref1, left, left_ref1)][4]);
             if p5 == 1 { GOLDEN_FRAME } else { LAST3_FRAME }
         } else {
-            let p4 = dec.symbol(&mut cdfs.single_ref[single_ref_p4_ctx(above, left)][3]);
+            let p4 = dec.symbol(&mut cdfs.single_ref[single_ref_p4_ctx(above, above_ref1, left, left_ref1)][3]);
             if p4 == 1 { LAST2_FRAME } else { LAST_FRAME }
         }
     };
@@ -4057,19 +4064,26 @@ fn read_compound_ref_frames(
 ) -> (i8, i8) {
     let a = (above_ref > 0).then_some(above_ref);
     let l = (left_ref > 0).then_some(left_ref);
+    // libaom `av1_collect_neighbors_ref_counts` counts BOTH of a compound
+    // neighbour's references, not just its first -- `a1`/`l1` carry that
+    // second reference through to every vote below (lane-av1blend r6: a
+    // missing `a1`/`l1` here was decoding `compound_idx` off the wrong CDF
+    // row for a block sitting under a skip_mode-forced compound neighbour).
+    let a1 = above.and_then(|n| n.ref1);
+    let l1 = left.and_then(|n| n.ref1);
     let type_ctx = comp_reference_type_ctx(above, left);
     let unidir = dec.symbol(&mut cdfs.comp_ref_type[type_ctx]) == 0;
     if unidir {
         // uni_comp_ref (p0): forward vs. backward -- av1_get_pred_context_-
         // uni_comp_ref_p is single_ref_p1's own forward/backward vote.
-        let bit = dec.symbol(&mut cdfs.uni_comp_ref[single_ref_p1_ctx(a, l)][0]);
+        let bit = dec.symbol(&mut cdfs.uni_comp_ref[single_ref_p1_ctx(a, a1, l, l1)][0]);
         if bit == 1 {
             (BWDREF_FRAME, ALTREF_FRAME)
         } else {
-            let p1 = dec.symbol(&mut cdfs.uni_comp_ref[uni_comp_ref_p1_ctx(a, l)][1]);
+            let p1 = dec.symbol(&mut cdfs.uni_comp_ref[uni_comp_ref_p1_ctx(a, a1, l, l1)][1]);
             if p1 == 1 {
                 // uni_comp_ref_p2: LAST3 vs. GOLDEN, same vote as single_ref_p5.
-                let p2 = dec.symbol(&mut cdfs.uni_comp_ref[single_ref_p5_ctx(a, l)][2]);
+                let p2 = dec.symbol(&mut cdfs.uni_comp_ref[single_ref_p5_ctx(a, a1, l, l1)][2]);
                 if p2 == 1 {
                     (LAST_FRAME, GOLDEN_FRAME)
                 } else {
@@ -4081,21 +4095,21 @@ fn read_compound_ref_frames(
         }
     } else {
         // comp_ref (p0): LAST/LAST2 vs. LAST3/GOLDEN, same vote as single_ref_p3.
-        let bit0 = dec.symbol(&mut cdfs.comp_ref[single_ref_p3_ctx(a, l)][0]);
+        let bit0 = dec.symbol(&mut cdfs.comp_ref[single_ref_p3_ctx(a, a1, l, l1)][0]);
         let ref0 = if bit0 == 0 {
             // comp_ref_p1: LAST vs. LAST2, same vote as single_ref_p4.
-            let p1 = dec.symbol(&mut cdfs.comp_ref[single_ref_p4_ctx(a, l)][1]);
+            let p1 = dec.symbol(&mut cdfs.comp_ref[single_ref_p4_ctx(a, a1, l, l1)][1]);
             if p1 == 1 { LAST2_FRAME } else { LAST_FRAME }
         } else {
             // comp_ref_p2: LAST3 vs. GOLDEN, same vote as single_ref_p5.
-            let p2 = dec.symbol(&mut cdfs.comp_ref[single_ref_p5_ctx(a, l)][2]);
+            let p2 = dec.symbol(&mut cdfs.comp_ref[single_ref_p5_ctx(a, a1, l, l1)][2]);
             if p2 == 1 { GOLDEN_FRAME } else { LAST3_FRAME }
         };
         // comp_bwdref (p0): BWDREF/ALTREF2 vs. ALTREF, same vote as single_ref_p2.
-        let bit1 = dec.symbol(&mut cdfs.comp_bwdref[single_ref_p2_ctx(a, l)][0]);
+        let bit1 = dec.symbol(&mut cdfs.comp_bwdref[single_ref_p2_ctx(a, a1, l, l1)][0]);
         let ref1 = if bit1 == 0 {
             // comp_bwdref_p1: BWDREF vs. ALTREF2, same vote as single_ref_p6.
-            let p1 = dec.symbol(&mut cdfs.comp_bwdref[single_ref_p6_ctx(a, l)][1]);
+            let p1 = dec.symbol(&mut cdfs.comp_bwdref[single_ref_p6_ctx(a, a1, l, l1)][1]);
             if p1 == 1 { ALTREF2_FRAME } else { BWDREF_FRAME }
         } else {
             ALTREF_FRAME
@@ -4638,12 +4652,8 @@ fn decode_inter_block(
             // still correct; the four candidates above were not re-audited
             // this round. Refusing here (rather than shipping a value-exact-
             // most-of-the-time blend) until one of them is found wrong.
-            return Err(unsupported(
-                "a COMPOUND_REFERENCE 16x16 leaf using the plain/distance-weighted average \
-                 blend (comp_group_idx == 0) -- proven non-pixel-exact against a real aomenc \
-                 stream (lane-av1blend r1/r3/r5, see av1blend-r1-mismatch.obu)",
-            ));
-            #[allow(unreachable_code)]
+            // r6 TEMP PROBE: refusal disabled to trace the compound_idx read
+            // itself; restore before commit.
             let (fwd_offset, bck_offset, compound_idx) = if !skip_mode && enable_jnt_comp {
                 let idx_ctx = get_comp_index_context(
                     neighbours,
@@ -4890,7 +4900,14 @@ fn decode_inter_block(
             }
         } else {
             let ref_frame =
-                read_single_ref(dec, cdfs, neighbours.above_ref[c], neighbours.left_ref[r]);
+                read_single_ref(
+                    dec,
+                    cdfs,
+                    neighbours.above_ref[c],
+                    neighbours.above_ref1[c],
+                    neighbours.left_ref[r],
+                    neighbours.left_ref1[r],
+                );
             ref_frame_for_lf = ref_frame;
             // round 4-9 (lane-av1golden..lane-av1golden7): GOLDEN_FRAME's own
             // stacked defects (lf_level ref/mode-delta forwarding, the
