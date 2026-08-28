@@ -342,6 +342,13 @@ pub(crate) struct Cdfs {
     /// `wedge_interintra`, indexed by bsize over `BLOCK_SIZES_ALL` -- see
     /// `cdf::WEDGE_INTERINTRA` (lane-interintra r1).
     pub wedge_interintra: [[u16; 3]; 22],
+    /// `compound_type` (`COMPOUND_WEDGE` vs `COMPOUND_DIFFWTD`), indexed by
+    /// bsize over `BLOCK_SIZES_ALL` -- see `cdf::COMPOUND_TYPE`
+    /// (lane-maskcomp).
+    pub compound_type: [[u16; 3]; 22],
+    /// `wedge_index` (16-ary), indexed by bsize over `BLOCK_SIZES_ALL` --
+    /// see `cdf::WEDGE_IDX` (lane-maskcomp).
+    pub wedge_idx: [[u16; 17]; 22],
     /// Which of the eight `INTER_COMPOUND_MODES` a `COMPOUND_REFERENCE`
     /// block takes (lane-av1comp, spec 5.11.24's `compound_mode`).
     pub inter_compound_mode: [[u16; 9]; 8],
@@ -584,6 +591,8 @@ impl Cdfs {
         reset2(&mut self.interintra);
         reset2(&mut self.interintra_mode);
         reset2(&mut self.wedge_interintra);
+        reset2(&mut self.compound_type);
+        reset2(&mut self.wedge_idx);
         reset2(&mut self.inter_compound_mode);
         reset2(&mut self.comp_ref_type);
         reset3(&mut self.uni_comp_ref);
@@ -1029,6 +1038,8 @@ impl Cdfs {
             interintra: cdf::INTERINTRA,
             interintra_mode: cdf::INTERINTRA_MODE,
             wedge_interintra: cdf::WEDGE_INTERINTRA,
+            compound_type: cdf::COMPOUND_TYPE,
+            wedge_idx: cdf::WEDGE_IDX,
             comp_group_idx: cdf::COMP_GROUP_IDX,
             compound_idx: cdf::COMPOUND_IDX,
             y_mode: cdf::Y_MODE,
