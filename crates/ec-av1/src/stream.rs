@@ -74,7 +74,6 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
     let mut cdf_slots: [Option<Cdfs>; NUM_REF_FRAMES] = std::array::from_fn(|_| None);
 
     let mut pos = 0usize;
-    let mut decode_idx = 0u32;
     while pos < data.len() {
         let obu = parser.parse_obu(&data[pos..])?;
         let obu_offset = pos;
@@ -115,12 +114,6 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 picture
             };
             pictures.push(output);
-            if std::env::var("EC_AV1_COMPOUND_DEBUG").is_ok() {
-                eprintln!(
-                    "PUSH (show_existing_frame slot {slot}) pictures.len()={}",
-                    pictures.len()
-                );
-            }
             continue;
         }
         let ObuKind::Frame(header, tiles) = obu.kind else {
@@ -266,19 +259,6 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
             ec_av1_syntax::InterpolationFilter::Switchable => None,
             fixed => Some(crate::mc::InterpFilterKind::from_header(fixed)),
         };
-        if std::env::var_os("EC_AV1_SREF_DUMP").is_some() {
-            eprintln!(
-                "STREAM_HEADER r17_before={} interpolation_filter={:?} interp_fixed={interp_fixed:?} is_motion_mode_switchable={} enable_interintra_compound={:?} allow_warped_motion={} reference_select={} primary_ref_frame={}",
-                crate::decode::r17_dump_frame_idx(),
-                header.interpolation_filter,
-                header.is_motion_mode_switchable,
-                parser.sequence_header().map(|s| s.enable_interintra_compound),
-                header.allow_warped_motion,
-                header.reference_select,
-                header.primary_ref_frame,
-            );
-        }
-
         // Spec 7.20 `load_cdfs`: a frame naming a `primary_ref_frame` resumes
         // from that reference slot's saved CDF state instead of the spec 8.4
         // defaults `decode_key/inter_frame_tile_with_cdfs`'s `None` case
@@ -306,19 +286,6 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         // reads temporal candidates.
         let ref_order_hints: [u32; 7] =
             std::array::from_fn(|i| order_hint_slots[header.ref_frame_idx[i] as usize]);
-
-        if std::env::var("EC_AV1_COMPOUND_DEBUG").is_ok() {
-            eprintln!(
-                "FRAME decode_idx={decode_idx} type={:?} show={} order_hint={} refresh_frame_flags={:#04x} ref_frame_idx={:?} order_hint_slots={:?}",
-                header.frame_type,
-                header.show_frame,
-                header.order_hint,
-                header.refresh_frame_flags,
-                header.ref_frame_idx,
-                order_hint_slots,
-            );
-        }
-        decode_idx += 1;
 
         let (picture, end_cdfs, motion_field) = if header.frame_type == FrameType::Key {
             let (picture, end_cdfs) = decode_key_frame_tile_with_cdfs(
@@ -466,18 +433,6 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 picture
             };
             pictures.push(output);
-            if std::env::var("EC_AV1_COMPOUND_DEBUG").is_ok() {
-                eprintln!(
-                    "PUSH (shown-direct) pictures.len()={} <- decode.rs r17 fidx {}",
-                    pictures.len(),
-                    crate::decode::r17_dump_frame_idx()
-                );
-            }
-        } else if std::env::var("EC_AV1_COMPOUND_DEBUG").is_ok() {
-            eprintln!(
-                "HIDDEN frame decoded, not pushed <- decode.rs r17 fidx {}",
-                crate::decode::r17_dump_frame_idx()
-            );
         }
     }
     Ok(pictures)
@@ -3201,11 +3156,8 @@ mod tests {
         a_real_aomenc_temporal_mv_gate(42, 40);
     }
 
-    /// r17 bisect scratch: decode a pinned stream exactly once, so
-    /// `decode::r17_dump`'s frame index (a process-wide counter) lines up
-    /// with `aomdec`'s own per-frame `EC_AV1_PREFILT_DUMP`/
-    /// `EC_AV1_POSTFILT_DUMP` numbering. Remove with the rest of the r17
-    /// scaffolding.
+    /// bisect scratch: decode a pinned stream exactly once -- generic
+    /// pin-repro tool, kept for manual use.
     #[test]
     #[ignore]
     fn scratch_decode_pinned_stream_once() {
@@ -3214,46 +3166,6 @@ mod tests {
         match decode_stream(&stream) {
             Ok(frames) => eprintln!("OK: {} frames", frames.len()),
             Err(e) => eprintln!("ERR: {e}"),
-        }
-    }
-
-    /// scratch: decode a pinned stream end to end and report where/why it
-    /// refuses, plus `non_last_ref_hits` progression.
-    #[test]
-    #[ignore]
-    fn scratch_decode_pinned_stream() {
-        let path = std::env::var("EC_AV1_PIN").expect("set EC_AV1_PIN to the .obu path");
-        let stream = std::fs::read(&path).expect("read pinned stream");
-        let before = decode::non_last_ref_hits();
-        match decode_stream(&stream) {
-            Ok(frames) => eprintln!(
-                "OK: {} frames, non_last_ref_hits {} -> {}",
-                frames.len(),
-                before,
-                decode::non_last_ref_hits()
-            ),
-            Err(e) => eprintln!(
-                "ERR: {} (non_last_ref_hits {} -> {})",
-                e,
-                before,
-                decode::non_last_ref_hits()
-            ),
-        }
-        // Truncate at each Frame OBU boundary and re-decode from scratch, to
-        // see which frame index first fails.
-        let mut p = Av1Parser::new();
-        let mut pos = 0usize;
-        let mut frame_idx = 0;
-        while pos < stream.len() {
-            let obu = p.parse_obu(&stream[pos..]).expect("parse");
-            pos += obu.total_size;
-            if matches!(obu.kind, ObuKind::Frame(_, _)) {
-                match decode_stream(&stream[..pos]) {
-                    Ok(_) => eprintln!("through frame {frame_idx}: OK"),
-                    Err(e) => eprintln!("through frame {frame_idx}: ERR {e}"),
-                }
-                frame_idx += 1;
-            }
         }
     }
 
@@ -3336,109 +3248,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    /// lane-av1blend r4 scratch: decodes the pinned `av1blend-r1-mismatch.obu`
-    /// (seed 45) with `EC_AV1_COMPIDX_DUMP` set, to compare the pre-tile-decode
-    /// `compound_idx` CDF state of every frame against an instrumented
-    /// aomdec's own `COMPIDX_PRE` dump. Errors out at decode-order frame 3
-    /// (the still-masked compound path) -- that is expected, the dump lines
-    /// before the error are what this test is for. Remove with the rest of
-    /// the r1-r4 scaffolding.
-    #[test]
-    #[ignore]
-    fn scratch_dump_compound_idx_cdf_state() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../fixtures/av1blend-r1-mismatch.obu"
-        );
-        let stream = std::fs::read(path).expect("reading pinned stream");
-        let _ = decode_stream(&stream);
-    }
-
-    /// lane-av1blend r2 scratch: sweep every seed of the compound_references
-    /// recipe (with the plain-average blend UNMASKED locally) looking for a
-    /// pixel mismatch, dumping the first one found to `EC_AV1_GATE_DUMP`.
-    /// Remove with the rest of the r1/r2 scaffolding.
-    #[test]
-    #[ignore]
-    fn scratch_sweep_compound_mismatch() {
-        if !have_ffmpeg() || !have_aomenc() {
-            eprintln!("SKIP: missing ffmpeg/aomenc");
-            return;
-        }
-        let (width, height, frame_count) = (64usize, 64usize, 24usize);
-        for seed in 42..82u32 {
-            let duration = frame_count as f64 / 25.0;
-            let source =
-                format!("gradients=size={width}x{height}:seed={seed}:duration={duration}:rate=25");
-            let y4m = Command::new("ffmpeg")
-                .args([
-                    "-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", "yuv420p", "-f",
-                    "yuv4mpegpipe", "-",
-                ])
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output()
-                .expect("ffmpeg failed to run");
-            assert!(y4m.status.success());
-            let args: Vec<&str> = vec![
-                "--codec=av1", "--passes=1", "--end-usage=q", "--cq-level=45", "--cpu-used=0",
-                "--kf-max-dist=1000", "--threads=1", "--row-mt=0", "--auto-alt-ref=1",
-                "--lag-in-frames=16", "--enable-fwd-kf=0", "--enable-order-hint=1",
-                "--enable-warped-motion=0", "--enable-obmc=0", "--enable-masked-comp=0",
-                "--enable-interintra-comp=0", "--enable-onesided-comp=0",
-                "--enable-interintra-wedge=0", "--enable-smooth-interintra=0",
-                "--enable-rect-partitions=0", "--enable-ab-partitions=0",
-                "--enable-1to4-partitions=0", "--enable-filter-intra=0",
-                "--enable-smooth-intra=0", "--enable-paeth-intra=0",
-                "--enable-directional-intra=0", "--enable-angle-delta=0",
-                "--enable-tx-size-search=0", "--enable-cdef=0", "--enable-restoration=0",
-                "--max-partition-size=32", "--min-partition-size=32", "--enable-palette=0",
-                "--enable-intrabc=0", "--enable-cfl-intra=0", "--enable-ref-frame-mvs=0",
-                "--obu", "-o", "-", "-",
-            ];
-            let mut child = Command::new(aomenc_path())
-                .args(&args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .expect("aomenc failed to start");
-            child
-                .stdin
-                .take()
-                .expect("aomenc stdin")
-                .write_all(&y4m.stdout)
-                .expect("writing y4m to aomenc");
-            let out = child.wait_with_output().expect("aomenc failed to run");
-            assert!(out.status.success());
-            let stream = out.stdout;
-            let frames = match decode_stream(&stream) {
-                Err(_) => continue,
-                Ok(frames) => frames,
-            };
-            if frames.len() != frame_count {
-                continue;
-            }
-            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
-            let mismatched = frames
-                .iter()
-                .zip(&ffmpeg_frames)
-                .any(|(got, want)| got.y != want.y || got.u != want.u || got.v != want.v);
-            if mismatched {
-                eprintln!("MISMATCH seed {seed}");
-                if let Ok(path) = std::env::var("EC_AV1_GATE_DUMP") {
-                    std::fs::write(&path, &stream).expect("writing pinned stream");
-                    eprintln!("wrote {path}");
-                }
-                return;
-            } else {
-                eprintln!("seed {seed}: bit-exact");
-            }
-        }
-        eprintln!("no mismatch found in sweep");
     }
 
     /// Final round of the TX4/tx-class lane's own gate: `--min-partition-size=8
