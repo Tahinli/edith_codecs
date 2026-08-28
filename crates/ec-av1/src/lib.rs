@@ -23,6 +23,7 @@ pub mod frame;
 pub mod intra;
 pub mod mc;
 pub mod motion;
+mod motion_field;
 pub mod msac;
 pub mod mvstack;
 pub mod obu;
