@@ -32,9 +32,10 @@ use crate::mc;
 use crate::msac::SymbolDecoder;
 use crate::mvstack::{
     ALTREF_FRAME, ALTREF2_FRAME, BWDREF_FRAME, GOLDEN_FRAME, LAST_FRAME, LAST2_FRAME, LAST3_FRAME,
-    MiGrid, MiInfo, NO_SIGN_BIAS, SignBiasTable, find_mv_stack, find_mv_stack_with_sign_bias,
-    single_ref_ctx, single_ref_p1_ctx, single_ref_p2_ctx, single_ref_p3_ctx, single_ref_p4_ctx,
-    single_ref_p5_ctx, single_ref_p6_ctx,
+    MiGrid, MiInfo, NO_SIGN_BIAS, NeighbourRef, SignBiasTable, comp_reference_type_ctx,
+    find_mv_stack, find_mv_stack_with_sign_bias, reference_mode_ctx, single_ref_ctx,
+    single_ref_p1_ctx, single_ref_p2_ctx, single_ref_p3_ctx, single_ref_p4_ctx, single_ref_p5_ctx,
+    single_ref_p6_ctx, uni_comp_ref_p1_ctx,
 };
 use crate::tile::{INTRA_MODE_CTX, block_grid, has_half};
 use crate::transform::{TxType, dequant_and_inverse_typed};
@@ -3791,6 +3792,99 @@ fn read_single_ref(dec: &mut SymbolDecoder, cdfs: &mut Cdfs, above_ref: i8, left
         c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     ref_frame
+}
+
+/// Spec 5.11.25's `comp_mode` (lane-av1comp): whether an inter block reads
+/// `SINGLE_REFERENCE` or `COMPOUND_REFERENCE`, only reached once a frame's
+/// `reference_select` header bit lets a block choose per-block instead of
+/// fixing the mode. `above`/`left` are `None` for an intra/unavailable
+/// neighbour, [`NeighbourRef`] for a coded one -- [`reference_mode_ctx`]'s
+/// own doc. Not yet called from [`decode_inter_block`]/
+/// [`decode_inter_block8`]: `decode_stream`'s frame-level `reference_select`
+/// refusal still gates every caller, so this and
+/// [`read_compound_ref_frames`] are dead code today, kept compiling and
+/// reviewable for the round that wires them.
+#[allow(dead_code)]
+fn read_comp_mode(
+    dec: &mut SymbolDecoder,
+    cdfs: &mut Cdfs,
+    above: Option<NeighbourRef>,
+    left: Option<NeighbourRef>,
+) -> bool {
+    let ctx = reference_mode_ctx(above, left);
+    dec.symbol(&mut cdfs.comp_mode[ctx]) == 1
+}
+
+/// Spec 5.11.25's `comp_reference_type` + the `uni_comp_ref`/`comp_ref`/
+/// `comp_bwdref` trees (libaom `decodemv.c`'s `read_ref_frames` compound
+/// arm), reached once [`read_comp_mode`] has already returned
+/// `COMPOUND_REFERENCE`. Returns `(RefFrame[0], RefFrame[1])`.
+/// `above`/`left` are [`comp_reference_type_ctx`]'s own `NeighbourRef`
+/// convention; `above_ref`/`left_ref` are the scalar `1..=7`/`-1`
+/// convention [`read_single_ref`] already uses, for every downstream binary
+/// decision. libaom `pred_common.c`'s own compound context functions
+/// (`av1_get_pred_context_uni_comp_ref_p[1|2]`, `comp_ref_p[1|2]`,
+/// `comp_bwdref_p[1]`) turned out to be exactly [`single_ref_p1_ctx`]..
+/// [`single_ref_p6_ctx`]/[`uni_comp_ref_p1_ctx`] under a different name
+/// (same vote-the-neighbours-above-left shape, same forward/backward and
+/// LAST/LAST2/LAST3/GOLDEN groupings) -- lane-av1comp audited each one
+/// against the C source rather than porting six near-duplicate functions.
+#[allow(dead_code)]
+fn read_compound_ref_frames(
+    dec: &mut SymbolDecoder,
+    cdfs: &mut Cdfs,
+    above: Option<NeighbourRef>,
+    left: Option<NeighbourRef>,
+    above_ref: i8,
+    left_ref: i8,
+) -> (i8, i8) {
+    let a = (above_ref > 0).then_some(above_ref);
+    let l = (left_ref > 0).then_some(left_ref);
+    let type_ctx = comp_reference_type_ctx(above, left);
+    let unidir = dec.symbol(&mut cdfs.comp_ref_type[type_ctx]) == 0;
+    if unidir {
+        // uni_comp_ref (p0): forward vs. backward -- av1_get_pred_context_-
+        // uni_comp_ref_p is single_ref_p1's own forward/backward vote.
+        let bit = dec.symbol(&mut cdfs.uni_comp_ref[single_ref_p1_ctx(a, l)][0]);
+        if bit == 1 {
+            (BWDREF_FRAME, ALTREF_FRAME)
+        } else {
+            let p1 = dec.symbol(&mut cdfs.uni_comp_ref[uni_comp_ref_p1_ctx(a, l)][1]);
+            if p1 == 1 {
+                // uni_comp_ref_p2: LAST3 vs. GOLDEN, same vote as single_ref_p5.
+                let p2 = dec.symbol(&mut cdfs.uni_comp_ref[single_ref_p5_ctx(a, l)][2]);
+                if p2 == 1 {
+                    (LAST_FRAME, GOLDEN_FRAME)
+                } else {
+                    (LAST_FRAME, LAST3_FRAME)
+                }
+            } else {
+                (LAST_FRAME, LAST2_FRAME)
+            }
+        }
+    } else {
+        // comp_ref (p0): LAST/LAST2 vs. LAST3/GOLDEN, same vote as single_ref_p3.
+        let bit0 = dec.symbol(&mut cdfs.comp_ref[single_ref_p3_ctx(a, l)][0]);
+        let ref0 = if bit0 == 0 {
+            // comp_ref_p1: LAST vs. LAST2, same vote as single_ref_p4.
+            let p1 = dec.symbol(&mut cdfs.comp_ref[single_ref_p4_ctx(a, l)][1]);
+            if p1 == 1 { LAST2_FRAME } else { LAST_FRAME }
+        } else {
+            // comp_ref_p2: LAST3 vs. GOLDEN, same vote as single_ref_p5.
+            let p2 = dec.symbol(&mut cdfs.comp_ref[single_ref_p5_ctx(a, l)][2]);
+            if p2 == 1 { GOLDEN_FRAME } else { LAST3_FRAME }
+        };
+        // comp_bwdref (p0): BWDREF/ALTREF2 vs. ALTREF, same vote as single_ref_p2.
+        let bit1 = dec.symbol(&mut cdfs.comp_bwdref[single_ref_p2_ctx(a, l)][0]);
+        let ref1 = if bit1 == 0 {
+            // comp_bwdref_p1: BWDREF vs. ALTREF2, same vote as single_ref_p6.
+            let p1 = dec.symbol(&mut cdfs.comp_bwdref[single_ref_p6_ctx(a, l)][1]);
+            if p1 == 1 { ALTREF2_FRAME } else { BWDREF_FRAME }
+        } else {
+            ALTREF_FRAME
+        };
+        (ref0, ref1)
+    }
 }
 
 /// Decodes one square inter-frame block (32x32 whole or 16x16 leaf): skip,
