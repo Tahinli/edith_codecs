@@ -157,16 +157,17 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         // model needs the full affine/translation MV derivation this
         // decoder does not carry. `global_motion` is indexed `ref_frame - 1`
         // (`read_global_motion_params`'s `i` loops from `LAST_FRAME`);
-        // lane-av1refs widens this from `[0]` (LAST_FRAME) alone to every
-        // reference `decode_inter_block` can now select -- LAST_FRAME (index
-        // 0) and GOLDEN_FRAME (index 3).
+        // lane-av1refs widens this from `[0, 3]` (LAST_FRAME/GOLDEN_FRAME)
+        // to every one of the 7 single-reference slots `decode_inter_block`
+        // can now select.
         if header.frame_type != FrameType::Key
-            && (header.global_motion[0].model != WarpModel::Identity
-                || header.global_motion[3].model != WarpModel::Identity)
+            && header.global_motion[..7]
+                .iter()
+                .any(|gm| gm.model != WarpModel::Identity)
         {
             return Err(Error::unsupported(
                 "AV1 decode_stream",
-                "an inter frame whose LAST_FRAME/GOLDEN_FRAME global motion is not IDENTITY (GLOBALMV needs the full warp derivation this decoder does not carry)",
+                "an inter frame whose global motion for a single-reference frame is not IDENTITY (GLOBALMV needs the full warp derivation this decoder does not carry)",
             ));
         }
         // `decode_inter_block`'s `single_ref_p*` chain codes only
@@ -255,14 +256,22 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                     "an inter frame with no key frame before it",
                 )
             })?;
-            // `ref_frame_idx[3]` names GOLDEN_FRAME's own DPB slot (spec
-            // 7.8/7.20 -- `ref_frame_idx` is indexed `ref_frame - LAST_FRAME`).
-            // Unlike LAST_FRAME, GOLDEN_FRAME having no picture yet is not a
-            // stream error on its own: `decode_inter_block` only needs it
-            // when a block actually selects GOLDEN_FRAME, and refuses by
-            // name there if the slot is still empty.
-            let golden_slot = header.ref_frame_idx[3] as usize;
-            let golden = ref_slots.get(golden_slot).and_then(Option::as_ref);
+            // `ref_frame_idx[i]` names the DPB slot for `LAST_FRAME + i`
+            // (spec 7.8/7.20). Any of them having no picture yet is not a
+            // stream error on its own: `decode_inter_block` only needs a
+            // given slot when a block actually selects that reference, and
+            // refuses by name there if the slot is still empty -- widened
+            // (lane-av1refs) from `GOLDEN_FRAME`'s own slot alone to every
+            // one of the 7 single-reference slots.
+            let other_refs: [Option<&Picture>; 8] = std::array::from_fn(|ref_frame| {
+                if ref_frame == 0 {
+                    None
+                } else {
+                    ref_slots
+                        .get(header.ref_frame_idx[ref_frame - 1] as usize)
+                        .and_then(Option::as_ref)
+                }
+            });
             decode_inter_frame_tile_with_cdfs(
                 tile_bytes,
                 header.mi_cols,
@@ -271,11 +280,12 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 header.frame_width,
                 header.frame_height,
                 reference,
-                golden,
+                other_refs,
                 &header.cdef,
                 &header.loop_filter,
                 initial_cdfs,
                 header.allow_high_precision_mv,
+                header.ref_frame_sign_bias,
                 interp_fixed,
                 enable_dual_filter,
             )?

@@ -227,17 +227,29 @@ fn add_candidate(candidates: &mut Vec<StackEntry>, mv: (i32, i32), weight: u32) 
     }
 }
 
-/// Whether `ref_frame`'s prediction runs backward in display order
-/// (`cm->ref_frame_sign_bias`, libaom): flips a borrowed neighbour's MV
-/// sign in [`process_single_ref_mv_candidate`] when the neighbour's own
-/// reference disagrees. This decoder only ever threads forward references
-/// (`LAST_FRAME`/`GOLDEN_FRAME`) to MC — never `BWDREF`/`ALTREF` — so every
-/// call site compares `false != false` and the flip is always inert. Ported
-/// anyway (never proved away, per this round's own bounds): a real
-/// backward reference would need this to be correct on day one.
-fn sign_bias(_ref_frame: i8) -> bool {
-    false
+/// `cm->ref_frame_sign_bias[ref_frame]`, looked up from the frame header's
+/// own `ref_frame_sign_bias` (spec 5.9.2's `get_relative_dist(ref_order_hint,
+/// OrderHint) > 0` per active reference, already computed by
+/// `ec_av1_syntax::frame::read_uncompressed_header` and indexed exactly like
+/// `ref_frame_idx`: `table[ref_frame - LAST_FRAME]`). `find_mv_stack`'s
+/// no-sign-bias callers (this crate's own encoder, which only ever writes
+/// `LAST_FRAME`) pass an all-`false` table, matching this stub's old
+/// always-`false` behaviour exactly.
+fn sign_bias(table: &SignBiasTable, ref_frame: i8) -> bool {
+    table[(ref_frame - LAST_FRAME) as usize]
 }
+
+/// One `bool` per `MV_REFERENCE_FRAME` past `INTRA_FRAME`/`NONE`
+/// (`LAST_FRAME`..=`ALTREF_FRAME`), indexed `[ref_frame - LAST_FRAME]` --
+/// spec `ec_av1_syntax::frame::FrameHeader::ref_frame_sign_bias`'s own
+/// shape, threaded straight through.
+pub type SignBiasTable = [bool; 7];
+
+/// The all-`false` table every no-sign-bias caller (this crate's own
+/// encoder, and every test below) passes: correct as long as no candidate
+/// or query ever names a backward reference, exactly this module's old
+/// hardcoded `sign_bias` stub.
+pub const NO_SIGN_BIAS: SignBiasTable = [false; 7];
 
 /// libaom's `process_single_ref_mv_candidate` (mvref_common.c): folds one
 /// already-coded neighbour into the stack as a low-weight (`2`, unboosted)
@@ -257,13 +269,14 @@ fn sign_bias(_ref_frame: i8) -> bool {
 fn process_single_ref_mv_candidate(
     candidate: &MiInfo,
     ref_frame: i8,
+    sign_bias_table: &SignBiasTable,
     candidates: &mut Vec<StackEntry>,
 ) {
     if !candidate.is_inter {
         return;
     }
     let mut this_mv = candidate.mv;
-    if sign_bias(candidate.ref_frame) != sign_bias(ref_frame) {
+    if sign_bias(sign_bias_table, candidate.ref_frame) != sign_bias(sign_bias_table, ref_frame) {
         this_mv = (-this_mv.0, -this_mv.1);
     }
     if !candidates.iter().any(|e| e.mv == this_mv) {
@@ -511,6 +524,36 @@ pub fn find_mv_stack(
     mi_cols: usize,
     mi_rows: usize,
 ) -> MvStack {
+    find_mv_stack_with_sign_bias(
+        grid,
+        mi_row,
+        mi_col,
+        bw4,
+        bh4,
+        ref_frame,
+        mi_cols,
+        mi_rows,
+        &NO_SIGN_BIAS,
+    )
+}
+
+/// [`find_mv_stack`], with the frame header's real `ref_frame_sign_bias`
+/// (lane-av1refs: `BWDREF_FRAME`/`ALTREF2_FRAME`/`ALTREF_FRAME` are forward
+/// in display order, so the single-reference extension pass's borrowed-MV
+/// flip is no longer always inert once one of them is live next to a
+/// backward-biased neighbour).
+#[allow(clippy::too_many_arguments)]
+pub fn find_mv_stack_with_sign_bias(
+    grid: &MiGrid,
+    mi_row: usize,
+    mi_col: usize,
+    bw4: usize,
+    bh4: usize,
+    ref_frame: i8,
+    mi_cols: usize,
+    mi_rows: usize,
+    sign_bias_table: &SignBiasTable,
+) -> MvStack {
     let mut candidates = Vec::new();
     let mut newmv_count = 0u32;
 
@@ -703,7 +746,7 @@ pub fn find_mv_stack(
             let cand = grid.get(mi_row - 1, mi_col + idx);
             let step = cand.map_or(1, |c| c.size).max(1);
             if let Some(c) = cand {
-                process_single_ref_mv_candidate(c, ref_frame, &mut candidates);
+                process_single_ref_mv_candidate(c, ref_frame, sign_bias_table, &mut candidates);
             }
             idx += step;
         }
@@ -714,7 +757,7 @@ pub fn find_mv_stack(
             let cand = grid.get(mi_row + idx, mi_col - 1);
             let step = cand.map_or(1, |c| c.size).max(1);
             if let Some(c) = cand {
-                process_single_ref_mv_candidate(c, ref_frame, &mut candidates);
+                process_single_ref_mv_candidate(c, ref_frame, sign_bias_table, &mut candidates);
             }
             idx += step;
         }
