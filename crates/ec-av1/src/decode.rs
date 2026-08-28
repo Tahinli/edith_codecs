@@ -2493,6 +2493,29 @@ fn cdef_filter_block(
 /// size. `cdef_bits == 0` is this crate's only supported case so far (see the
 /// refusal in `stream.rs`), so every 64x64 filter block always uses index 0's
 /// strengths -- no per-block `cdef_idx` selection is implemented yet.
+/// bisect scratch (lane-chromau): dump this frame's Y/U/V pre-deblock, mirrors
+/// the instrumented `aomdec` build's `EC_AV1_PREFILT_DUMP` (raw
+/// `true_width`x`true_height` bytes per plane, decode order, one file per
+/// frame index). Zero-cost/zero-behavior off. Called from both the key-frame
+/// and inter-frame tile decoders so the frame index lines up with aomdec's.
+fn scratch_dump_prefilt(y: &PlaneBuf, u: &PlaneBuf, v: &PlaneBuf) {
+    let Some(base) = std::env::var_os("EC_AV1_PREFILT_DUMP_OURS") else {
+        return;
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static IDX: AtomicUsize = AtomicUsize::new(0);
+    let idx = IDX.fetch_add(1, Ordering::SeqCst);
+    let path = format!("{}.f{}", base.to_string_lossy(), idx);
+    let mut out = Vec::new();
+    for plane in [y, u, v] {
+        for row in 0..plane.true_height {
+            let start = row * plane.width;
+            out.extend_from_slice(&plane.data[start..start + plane.true_width]);
+        }
+    }
+    let _ = std::fs::write(path, out);
+}
+
 /// Spec 7.14: the in-loop deblocking filter, applied once per frame after
 /// tile reconstruction and before [`apply_cdef`]. Uniform-level path only --
 /// `stream.rs` already refuses `delta_lf_present`/segmentation upstream, so
@@ -3596,6 +3619,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         }
     }
 
+    scratch_dump_prefilt(&y, &u, &v);
     apply_deblock(&mut y, &mut u, &mut v, loop_filter, &neighbours);
     apply_cdef(&mut y, &mut u, &mut v, cdef, &neighbours);
 
@@ -3847,20 +3871,28 @@ fn read_inter_plane(
     side: usize,
     base_q_idx: u8,
     prediction: &[u8],
-) -> Result<Vec<i32>> {
+    // lane-chromau: this block's own luma transform's *actual coded*
+    // `tx_type` -- `av1_get_tx_type` (libaom `blockd.h`): an inter block's
+    // chroma plane never codes its own `tx_type` symbol, but (unlike an
+    // intra block, which falls back to `Intra_Mode_To_Tx_Type`) it inherits
+    // the colocated luma transform's coded type verbatim, clamped back to
+    // `DCT_DCT` at the chroma tx sizes the spec forces DCT-only
+    // (`av1_get_ext_tx_set_type`: `tx_size_sqr_up >= TX_32X32`, i.e. this
+    // function's own `side >= 32`). `None` for the luma call itself
+    // (`plane_idx == 0`), where the `TxbSet`'s own symbol (or the true
+    // `DCT_DCT` default at 32-point+) already resolves it without help.
+    inherited_luma_tx_type: Option<TxType>,
+) -> Result<(Vec<i32>, TxType)> {
     let skip_ctx = if plane_idx == 0 {
         0
     } else {
         usize::from(around.0) + usize::from(around.1)
     };
     let mut coding = cdfs.txb(set, tx_mode);
-    // `av1_get_tx_type` (libaom `blockd.h`): `Intra_Mode_To_Tx_Type` only
-    // ever applies to an intra block's chroma plane -- an `is_inter` block
-    // (this function, [`read_inter_plane`], reads only those) has no
-    // predicted intra mode to index it with, and its `tx_type` (luma or
-    // chroma alike) is `DCT_DCT` whenever the `TxbSet` itself codes no
-    // symbol for it.
-    let default_tx_type = TxType::DctDct;
+    let default_tx_type = match inherited_luma_tx_type {
+        Some(t) if side < 32 => t,
+        _ => TxType::DctDct,
+    };
     let (grid, tx_type) = read_coeffs(
         dec,
         &mut coding,
@@ -3870,8 +3902,14 @@ fn read_inter_plane(
         default_tx_type,
     )?;
     let residual = dequant_and_inverse_typed(&grid, side, 8, i32::from(base_q_idx), tx_type);
+    if std::env::var_os("EC_AV1_CHROMA_TRACE").is_some() && x == 16 && y == 24 && plane_idx != 0 {
+        eprintln!(
+            "CHROMA_TRACE plane={plane_idx} x={x} y={y} side={side} tx_type={tx_type:?} \
+             q_idx={base_q_idx} grid={grid:?} pred={prediction:?} residual={residual:?}"
+        );
+    }
     plane.reconstruct_mc(x, y, side, prediction, &residual);
-    Ok(grid)
+    Ok((grid, tx_type))
 }
 
 /// Spec 5.11.25's `single_ref_p1`..`p6` tree (reachable only once `comp_mode`
@@ -6619,6 +6657,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         }
     }
 
+    scratch_dump_prefilt(&y, &u, &v);
     apply_deblock(&mut y, &mut u, &mut v, loop_filter, &neighbours);
     apply_cdef(&mut y, &mut u, &mut v, cdef, &neighbours);
 
