@@ -5309,12 +5309,16 @@ fn decode_inter_block(
             // (lane-av1blend r5) from its old position ahead of those reads,
             // which stole their bits for a Switchable-filter compound block
             // and desynced every symbol read after it in the tile.
+            // `av1_is_interp_needed` is also 0 for `skip_mode` blocks: the
+            // filter is derived (Regular), never read -- same
+            // conditional-read contract as the WARPED_CAUSAL suppression on
+            // the single-ref path below.
             let (h_filter, v_filter, resolved_filter) = resolve_interp_filter(
                 dec,
                 cdfs,
                 interp_fixed,
                 enable_dual_filter,
-                is_globalmv,
+                is_globalmv || skip_mode,
                 above_filter_ctx,
                 left_filter_ctx,
                 true,
@@ -7367,6 +7371,14 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                     has_half(r32 * BLOCK_MI, BLOCK_MI, mi_rows),
                 );
                 let part32 = if has_cols32 && has_rows32 {
+                    if std::env::var_os("EC_AV1_TRACE").is_some() {
+                        eprintln!(
+                            "TRACE part32_pre mi=({},{}) rng={}",
+                            r32 * BLOCK_MI,
+                            c32 * BLOCK_MI,
+                            dec.debug_state().0
+                        );
+                    }
                     let p = dec.symbol(&mut cdfs.partition_w32[ctx32]);
                     if std::env::var_os("EC_AV1_TRACE").is_some() {
                         eprintln!(
