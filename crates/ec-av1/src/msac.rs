@@ -303,9 +303,6 @@ impl<'a> SymbolDecoder<'a> {
         let mut cur = self.range;
         let mut prev;
         let mut symbol = 0;
-        // bisect scratch (lane-cdffwd2): rng_before, matching libaom
-        // entdec.c's own EC_RNG trace field of the same name.
-        let rng_before = self.range;
         loop {
             prev = cur;
             let f = u32::from(CDF_TOP - cdf[symbol]);
@@ -318,15 +315,6 @@ impl<'a> SymbolDecoder<'a> {
         }
         self.range = prev - cur;
         self.value -= cur;
-        if std::env::var_os("EC_RNG").is_some() {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static N: AtomicU64 = AtomicU64::new(0);
-            let n = N.fetch_add(1, Ordering::SeqCst);
-            eprintln!(
-                "EC_RNG n={n} rng_before={rng_before} rng_after={} nsyms={nsyms} symbol={symbol}",
-                self.range
-            );
-        }
 
         // Renormalise back into `[2^15, 2^16)`, the same shift the encoder
         // applied when it narrowed to this symbol.
