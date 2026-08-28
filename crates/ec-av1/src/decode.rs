@@ -4652,8 +4652,27 @@ fn decode_inter_block(
             // still correct; the four candidates above were not re-audited
             // this round. Refusing here (rather than shipping a value-exact-
             // most-of-the-time blend) until one of them is found wrong.
-            // r6 TEMP PROBE: refusal disabled to trace the compound_idx read
-            // itself; restore before commit.
+            // r6/r7: found and fixed one real bug (mvstack.rs ref_ctx family
+            // undercounted compound neighbours in the single_ref_p*/comp_ref*/
+            // comp_bwdref* context reads -- kept, real fix). Unmasking on
+            // that fix alone and running the wide gate sweep (many seeds,
+            // `a_real_aomenc_stream_with_compound_references_decodes_pixel_exact`/
+            // `a_real_aomenc_stream_with_reference_select_reads_comp_mode_correctly`,
+            // cq-level=45) still mismatches roughly half the time, at
+            // different frames each run for the SAME seed -- aomenc's own
+            // cpu-used=0 RD search is run-to-run nondeterministic (noted
+            // above), so this is a second, still-unfound compound_idx defect,
+            // not the one r6/r7 fixed. r6's own residual-mismatch note (321/
+            // 846 pixels not fitting the (9,7)-vs-plain-average hypothesis
+            // either) already flagged more than one bug here. Re-masking:
+            // do not ship a blend that is right only sometimes.
+            return Err(unsupported(
+                "a COMPOUND_REFERENCE 16x16 leaf using the plain/distance-weighted \
+                 average blend (comp_group_idx == 0) -- proven non-pixel-exact against \
+                 real aomenc streams beyond the one bug lane-av1blend r6/r7 fixed \
+                 (lane-av1blend r7, wide gate sweep)",
+            ));
+            #[allow(unreachable_code)]
             let (fwd_offset, bck_offset, compound_idx) = if !skip_mode && enable_jnt_comp {
                 let idx_ctx = get_comp_index_context(
                     neighbours,
@@ -5557,12 +5576,15 @@ fn decode_inter_block8(
                 // that comment.
                 // r3: same defect as the 16x16 leaf's own mask above -- see
                 // that comment (compound_idx's decoded value, not the blend
-                // math or reference-slot bookkeeping).
+                // math or reference-slot bookkeeping). r6/r7: same re-mask
+                // as the 16x16 leaf above -- one real bug found and fixed
+                // (mvstack.rs ref_ctx family), a second, still-unfound
+                // compound_idx defect surfaces on the wide gate sweep.
                 return Err(unsupported(
                     "a COMPOUND_REFERENCE 8x8 leaf using the plain/distance-weighted \
                      average blend (comp_group_idx == 0) -- proven non-pixel-exact \
-                     against a real aomenc stream (lane-av1blend r1/r3, see \
-                     av1blend-r1-mismatch.obu)",
+                     against real aomenc streams beyond the one bug lane-av1blend \
+                     r6/r7 fixed (lane-av1blend r7, wide gate sweep)",
                 ));
                 #[allow(unreachable_code)]
                 let (fwd_offset, bck_offset, compound_idx) = if !skip_mode && enable_jnt_comp {

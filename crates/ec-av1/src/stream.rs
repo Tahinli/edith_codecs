@@ -744,9 +744,9 @@ mod tests {
         // constructing the (module-private) `Neighbours` itself.
         const PARTITION_NONE: usize = 0;
         let ii_ctx = intra_inter_ctx(false, false, false, false);
-        let sr_p1_ctx = single_ref_p1_ctx(None, None);
-        let sr_p3_ctx = single_ref_p3_ctx(None, None);
-        let sr_p5_ctx = single_ref_p5_ctx(None, None);
+        let sr_p1_ctx = single_ref_p1_ctx(None, None, None, None);
+        let sr_p3_ctx = single_ref_p3_ctx(None, None, None, None);
+        let sr_p5_ctx = single_ref_p5_ctx(None, None, None, None);
 
         for run in 0..4 {
             let picture = test_card(width, height);
@@ -2633,7 +2633,12 @@ mod tests {
                         // capability gap tracked on its own (not a
                         // COMPOUND_REFERENCE defect); accept it here too
                         // rather than fail a compound-specific gate on a
-                        // partition-search coincidence.
+                        // partition-search coincidence. lane-av1blend r7:
+                        // re-swept the wide gate with the plain-average
+                        // blend unmasked (r6/r7's ref_ctx fix alone) and it
+                        // still mismatches on real streams beyond that one
+                        // bug -- re-masked comp_group_idx == 0 too, so this
+                        // stays a legal named refusal.
                         assert!(
                             msg.contains("COMPOUND_REFERENCE") || msg.contains("a partition"),
                             "{NAME}: comp_mode fired (seed {seed}) but the refusal \
