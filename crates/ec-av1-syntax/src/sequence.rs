@@ -372,6 +372,23 @@ impl SequenceHeader {
         seq.enable_restoration = r.read_bit()?;
         seq.color_config = read_color_config(r, seq_profile)?;
         seq.film_grain_params_present = r.read_bit()?;
+        if std::env::var_os("EC_AV1_SEQDUMP").is_some() {
+            eprintln!(
+                "SEQDUMP profile={seq_profile} still={still_picture} reduced={reduced_still_picture_header} \
+                 timing_present={} op_cnt={} idc0={} level0={} frame_width_bits={frame_width_bits} \
+                 frame_height_bits={frame_height_bits} max_w={max_frame_width} max_h={max_frame_height} \
+                 frame_id_present={frame_id_numbers_present_flag} use_128={} filter_intra={} edge_filter={} \
+                 interintra={} masked={} warped={} dual_filter={} order_hint={} jnt_comp={} ref_frame_mvs={}",
+                timing_info.is_some(),
+                seq.operating_points.len(),
+                seq.operating_points.first().map_or(0, |o| o.idc),
+                seq.operating_points.first().map_or(0, |o| o.seq_level_idx),
+                use_128x128_superblock, enable_filter_intra, enable_intra_edge_filter,
+                seq.enable_interintra_compound, seq.enable_masked_compound,
+                seq.enable_warped_motion, seq.enable_dual_filter, seq.enable_order_hint,
+                seq.enable_jnt_comp, seq.enable_ref_frame_mvs
+            );
+        }
         Ok(seq)
     }
 
