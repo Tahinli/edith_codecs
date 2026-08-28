@@ -379,6 +379,8 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 header.skip_mode_present,
                 header.skip_mode_frame,
                 header.reduced_tx_set,
+                header.is_motion_mode_switchable,
+                header.allow_warped_motion,
             )?
         };
         // Spec 7.20: `disable_frame_end_update_cdf` stores the frame's
@@ -2895,6 +2897,487 @@ mod tests {
             "SKIP {NAME}: {never_fired} attempts decoded but never fired skip_mode, and every \
              other attempt hit a named refusal:\n{}",
             refusals.join("\n")
+        );
+    }
+
+    /// lane-motionmode round 1: `--enable-obmc=1 --enable-warped-motion=0`
+    /// on the base recipe (`--auto-alt-ref=1 --lag-in-frames=16
+    /// --enable-fwd-kf=0 --enable-ref-frame-mvs=0`) -- pixel-exact against
+    /// ffmpeg, gated on [`decode::obmc_hits`] actually advancing (a real
+    /// block picked `OBMC_CAUSAL`, not just that the header bit was set).
+    /// Structure copied from
+    /// `a_real_aomenc_stream_with_compound_references_decodes_pixel_exact`:
+    /// a seed sweep with a named-refusal escape hatch and an
+    /// `EC_AV1_GATE_DUMP` pin on mismatch.
+    #[test]
+    fn a_real_aomenc_stream_with_obmc_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_stream_with_obmc_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height, frame_count) = (64usize, 64usize, 24usize);
+        let mut refusals = Vec::new();
+        let mut never_fired = 0u32;
+        for attempt in 0..80u32 {
+            let seed = 42 + attempt % 40;
+            let duration = frame_count as f64 / 25.0;
+            let source =
+                format!("gradients=size={width}x{height}:seed={seed}:duration={duration}:rate=25");
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let args: Vec<&str> = vec![
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                "--cq-level=45",
+                "--cpu-used=0",
+                "--kf-max-dist=1000",
+                "--threads=1",
+                "--row-mt=0",
+                "--auto-alt-ref=1",
+                "--lag-in-frames=16",
+                "--enable-fwd-kf=0",
+                "--enable-order-hint=1",
+                "--enable-warped-motion=0",
+                "--enable-obmc=1",
+                "--enable-masked-comp=0",
+                "--enable-interintra-comp=0",
+                "--enable-onesided-comp=0",
+                "--enable-interintra-wedge=0",
+                "--enable-smooth-interintra=0",
+                "--enable-rect-partitions=0",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0",
+                "--enable-filter-intra=0",
+                "--enable-smooth-intra=0",
+                "--enable-paeth-intra=0",
+                "--enable-directional-intra=0",
+                "--enable-angle-delta=0",
+                "--enable-tx-size-search=0",
+                "--enable-cdef=0",
+                "--enable-restoration=0",
+                "--max-partition-size=32",
+                "--min-partition-size=32",
+                "--enable-palette=0",
+                "--enable-intrabc=0",
+                "--enable-cfl-intra=0",
+                "--enable-ref-frame-mvs=0",
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ];
+            let mut child = Command::new(aomenc_path())
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let before = decode::obmc_hits();
+            let frames = match decode_stream(&stream) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME} failed outright (seed {seed}): {msg}"
+                    );
+                    refusals.push(format!("seed {seed}: {msg}"));
+                    continue;
+                }
+                Ok(frames) => frames,
+            };
+            if decode::obmc_hits() == before {
+                never_fired += 1;
+                continue;
+            }
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
+            assert_eq!(frames.len(), frame_count);
+            let mismatched = frames
+                .iter()
+                .zip(&ffmpeg_frames)
+                .any(|(got, want)| got.y != want.y || got.u != want.u || got.v != want.v);
+            if mismatched {
+                if let Ok(path) = std::env::var("EC_AV1_GATE_DUMP") {
+                    std::fs::write(&path, &stream).expect("writing pinned stream");
+                    eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
+                }
+            }
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
+                assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
+            }
+            eprintln!(
+                "{NAME} FIRING seed {seed}: obmc hits advanced by {}",
+                decode::obmc_hits() - before
+            );
+            return;
+        }
+        eprintln!(
+            "SKIP {NAME}: {never_fired} attempts decoded but never fired obmc, and every \
+             other attempt hit a named refusal:\n{}",
+            refusals.join("\n")
+        );
+    }
+
+    /// lane-motionmode round 3: same shape as
+    /// `a_real_aomenc_stream_with_obmc_decodes_pixel_exact`, but relaxed the
+    /// `--min-partition-size=32 --max-partition-size=32` clamp (that other
+    /// gate's own doc: locked to remove partition-depth choice from the
+    /// search entirely) to `8`/`32`, to make an 8x8-leaf `OBMC_CAUSAL` pick
+    /// possible at all. Gated on [`decode::obmc_hits_8`] specifically, not
+    /// the aggregate [`decode::obmc_hits`]. Measured live (round 3, this
+    /// box): 80 attempts, 0 ever called `decode_inter_block8` at all --
+    /// `cpu-used=0`'s RD search never once splits a 16x16 down to a clean
+    /// 4-way 8x8 leaf for this smooth `gradients` fixture (large blocks
+    /// always win the RD cost there); the handful of named refusals seen
+    /// are `PARTITION_SPLIT` chosen *at* 8x8 (down to 4x4, already refused
+    /// at `decode.rs`'s `part8 != PARTITION_NONE` check) or
+    /// `allow_screen_content_tools`, neither reaching a leaf. Kept anyway
+    /// (mirrors this file's own `never_fired`-skip convention) as the
+    /// honest record of the attempt; a real 8x8 OBMC fixture needs
+    /// higher-frequency content than this gate's fixtures use, out of
+    /// round-3 budget.
+    #[test]
+    fn a_real_aomenc_stream_with_obmc_8x8_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_stream_with_obmc_8x8_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height, frame_count) = (64usize, 64usize, 24usize);
+        let mut refusals = Vec::new();
+        let mut never_fired = 0u32;
+        let mut total_obmc8 = 0usize;
+        for attempt in 0..80u32 {
+            let seed = 42 + attempt % 40;
+            let duration = frame_count as f64 / 25.0;
+            let source =
+                format!("gradients=size={width}x{height}:seed={seed}:duration={duration}:rate=25");
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let args: Vec<&str> = vec![
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                "--cq-level=45",
+                "--cpu-used=0",
+                "--kf-max-dist=1000",
+                "--threads=1",
+                "--row-mt=0",
+                "--auto-alt-ref=1",
+                "--lag-in-frames=16",
+                "--enable-fwd-kf=0",
+                "--enable-order-hint=1",
+                "--enable-warped-motion=0",
+                "--enable-obmc=1",
+                "--enable-masked-comp=0",
+                "--enable-interintra-comp=0",
+                "--enable-onesided-comp=0",
+                "--enable-interintra-wedge=0",
+                "--enable-smooth-interintra=0",
+                "--enable-rect-partitions=0",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0",
+                "--enable-filter-intra=0",
+                "--enable-smooth-intra=0",
+                "--enable-paeth-intra=0",
+                "--enable-directional-intra=0",
+                "--enable-angle-delta=0",
+                "--enable-tx-size-search=0",
+                "--enable-cdef=0",
+                "--enable-restoration=0",
+                "--min-partition-size=8",
+                "--max-partition-size=32",
+                "--enable-palette=0",
+                "--enable-intrabc=0",
+                "--enable-cfl-intra=0",
+                "--enable-ref-frame-mvs=0",
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ];
+            let mut child = Command::new(aomenc_path())
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let before8 = decode::obmc_hits_8();
+            let frames = match decode_stream(&stream) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME} failed outright (seed {seed}): {msg}"
+                    );
+                    refusals.push(format!("seed {seed}: {msg}"));
+                    continue;
+                }
+                Ok(frames) => frames,
+            };
+            let fired8 = decode::obmc_hits_8() - before8;
+            total_obmc8 += fired8;
+            if fired8 == 0 {
+                never_fired += 1;
+                continue;
+            }
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
+            assert_eq!(frames.len(), frame_count);
+            let mismatched = frames
+                .iter()
+                .zip(&ffmpeg_frames)
+                .any(|(got, want)| got.y != want.y || got.u != want.u || got.v != want.v);
+            if mismatched {
+                if let Ok(path) = std::env::var("EC_AV1_GATE_DUMP") {
+                    std::fs::write(&path, &stream).expect("writing pinned stream");
+                    eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
+                }
+            }
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
+                assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
+            }
+            eprintln!(
+                "{NAME} FIRING seed {seed}: 8x8 obmc hits {fired8} (total across attempts so far {total_obmc8})"
+            );
+            return;
+        }
+        eprintln!(
+            "SKIP {NAME}: {never_fired} attempts decoded but never fired an 8x8 obmc block \
+             ({total_obmc8} total 8x8 obmc hits across all attempts), and every other attempt \
+             hit a named refusal:\n{}",
+            refusals.join("\n")
+        );
+    }
+
+    /// lane-motionmode round 1: `--enable-warped-motion=1` must be a NAMED
+    /// refusal, never a silent mis-decode -- this decoder does not port
+    /// `av1_findSamples`/`num_proj_ref`, so it cannot tell `OBMC_CAUSAL`
+    /// from `WARPED_CAUSAL` at an eligible block once the header allows
+    /// warp (see `decode_inter_block`'s own `allow_warped_motion` refusal).
+    /// Every attempt across the seed sweep must either name the refusal or
+    /// decode pixel-exact (an eligible block simply never fired in that
+    /// attempt) -- a silent pixel mismatch here would mean the refusal
+    /// failed to fire on a stream that actually needed it.
+    #[test]
+    fn a_real_aomenc_stream_with_warped_motion_refuses_or_matches() {
+        const NAME: &str = "a_real_aomenc_stream_with_warped_motion_refuses_or_matches";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height, frame_count) = (64usize, 64usize, 24usize);
+        let mut named_refusals = 0u32;
+        let mut matched = 0u32;
+        for attempt in 0..40u32 {
+            let seed = 42 + attempt;
+            let duration = frame_count as f64 / 25.0;
+            let source =
+                format!("gradients=size={width}x{height}:seed={seed}:duration={duration}:rate=25");
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let args: Vec<&str> = vec![
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                "--cq-level=45",
+                "--cpu-used=0",
+                "--kf-max-dist=1000",
+                "--threads=1",
+                "--row-mt=0",
+                "--auto-alt-ref=1",
+                "--lag-in-frames=16",
+                "--enable-fwd-kf=0",
+                "--enable-order-hint=1",
+                "--enable-warped-motion=1",
+                "--enable-obmc=1",
+                "--enable-masked-comp=0",
+                "--enable-interintra-comp=0",
+                "--enable-onesided-comp=0",
+                "--enable-interintra-wedge=0",
+                "--enable-smooth-interintra=0",
+                "--enable-rect-partitions=0",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0",
+                "--enable-filter-intra=0",
+                "--enable-smooth-intra=0",
+                "--enable-paeth-intra=0",
+                "--enable-directional-intra=0",
+                "--enable-angle-delta=0",
+                "--enable-tx-size-search=0",
+                "--enable-cdef=0",
+                "--enable-restoration=0",
+                "--max-partition-size=32",
+                "--min-partition-size=32",
+                "--enable-palette=0",
+                "--enable-intrabc=0",
+                "--enable-cfl-intra=0",
+                "--enable-ref-frame-mvs=0",
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ];
+            let mut child = Command::new(aomenc_path())
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let frames = match decode_stream(&stream) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME} failed outright, not a named refusal (seed {seed}): {msg}"
+                    );
+                    named_refusals += 1;
+                    continue;
+                }
+                Ok(frames) => frames,
+            };
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
+            assert_eq!(frames.len(), frame_count);
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(
+                    got.y, want.y,
+                    "{NAME} frame {i} luma vs ffmpeg (seed {seed}) -- decoded without a named \
+                     refusal but mismatched, meaning the refusal failed to fire"
+                );
+                assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
+                assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
+            }
+            matched += 1;
+        }
+        eprintln!(
+            "{NAME}: {named_refusals} named refusals, {matched} pixel-exact matches out of 40"
         );
     }
 
