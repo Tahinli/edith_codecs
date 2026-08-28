@@ -1211,11 +1211,16 @@ pub const SKIP_MODE: [[u16; 3]; 3] = [[32621, 32768, 0], [20708, 32768, 0], [812
 /// `motion_mode_allowed` (spec 5.11.24's `read_motion_mode`) offers
 /// `OBMC_CAUSAL` rather than `WARPED_CAUSAL` -- lane-motionmode round 1
 /// never reaches the three-way `motion_mode_cdf`, see `decode.rs`.
-pub const OBMC: [[u16; 3]; 4] = [
+pub const OBMC: [[u16; 3]; 6] = [
     [10437, 32768, 0],
     [17432, 32768, 0],
     [25817, 32768, 0],
     [30128, 32768, 0],
+    // lane-rect r2: BLOCK_16X32 (index 7) and BLOCK_32X16 (index 8) rows --
+    // rect strips read their own bsize row, not the square class
+    // (rect-flake-1: the strip's motion_mode read diverged on this).
+    [14423, 32768, 0],
+    [15142, 32768, 0],
 ];
 
 /// `default_motion_mode_cdf` (spec 9.4, `entropymode.c`), the square-bsize
@@ -1225,11 +1230,14 @@ pub const OBMC: [[u16; 3]; 4] = [
 /// `read_motion_mode` reads instead of [`OBMC`] whenever `motion_mode_allowed`
 /// (spec 5.11.24) resolves to `WARPED_CAUSAL`-eligible (`num_proj_ref >= 1`
 /// under `allow_warped_motion`) -- lane-warp round 1.
-pub const MOTION_MODE: [[u16; 4]; 4] = [
+pub const MOTION_MODE: [[u16; 4]; 6] = [
     [7651, 24760, 32768, 0],
     [19419, 26810, 32768, 0],
     [26260, 29116, 32768, 0],
     [29516, 30701, 32768, 0],
+    // lane-rect r2: BLOCK_16X32 / BLOCK_32X16 rows (indices 7/8).
+    [5123, 23606, 32768, 0],
+    [11606, 24308, 32768, 0],
 ];
 
 /// `default_interintra_cdf` (spec 9.4): `interintra`, indexed by

@@ -6080,8 +6080,18 @@ fn decode_inter_block(
             // wmtype check here.
             let mut warped_selected = false;
             if motion_mode_eligible {
-                // `default_obmc_cdf`'s own index: square bsize 8/16/32/64 -> 0/1/2/3.
-                let bsize_idx = (side.trailing_zeros() - 3) as usize;
+                // `default_obmc_cdf`'s own index: square bsize 8/16/32/64 ->
+                // 0/1/2/3; lane-rect r2: a rect strip reads its OWN bsize row
+                // (libaom `motion_mode_cdf[mbmi->bsize]`: BLOCK_16X32 -> 4,
+                // BLOCK_32X16 -> 5 in our packed table) -- rect-flake-1's
+                // strip motion_mode read diverged on the square row.
+                let bsize_idx = if write_w == write_h {
+                    (write_w.trailing_zeros() - 3) as usize
+                } else if write_w == 16 {
+                    4
+                } else {
+                    5
+                };
                 // `motion_mode_allowed` reads the 3-symbol `motion_mode_cdf`
                 // instead of the 2-symbol `obmc_cdf` exactly when
                 // `num_proj_ref >= 1` under `allow_warped_motion`.
