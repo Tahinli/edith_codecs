@@ -3467,9 +3467,7 @@ mod tests {
     fn pinned_warp_stream_decodes_pixel_exact() {
         use crate::decode::warp_selected_hits;
         let path = std::env::var("EC_AV1_GATE_DUMP_PIN").unwrap_or_else(|_| {
-            "/tmp/claude-1000/-home-tahinli-Documents-Code-Rust-edith-codecs/\
-             51b5f611-f998-43a8-b975-e64cb643a3e1/scratchpad/warp-mismatch.obu"
-                .to_string()
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/warp-mismatch.obu").to_string()
         });
         let stream = std::fs::read(&path).expect("reading pinned stream");
         if !have_ffmpeg() {
