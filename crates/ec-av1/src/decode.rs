@@ -62,6 +62,11 @@ pub(crate) fn filter_intra_hits() -> usize {
 /// before/after counter pattern as [`FILTER_INTRA_HITS`], proving a stream
 /// exercised `apply_deblock` rather than every edge landing on level 0.
 static DEBLOCK_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// lane-comppin r4: decode-order picture counter for `EC_AV1_PREFILT_DUMP`,
+/// mirroring stream.rs's `pictures_decoded` so the two dumps index
+/// identically against aomdec's own `ec_frame_idx` in decodeframe.c.
+static PREFILT_PICTURE_IDX: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// Current value of [`DEBLOCK_HITS`].
 pub(crate) fn deblock_hits() -> usize {
@@ -3613,6 +3618,22 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         }
     }
 
+    // lane-comppin r4: pre-loop-filter decode-order dump, matching aomdec's
+    // own EC_AV1_PREFILT_DUMP shape (decodeframe.c ~5451) -- diffs against
+    // that isolate whether a decode-order frame's mismatch already exists
+    // in reconstruction (this dump) vs is introduced by the loop filter
+    // (EC_AV1_DECODE_ORDER_DUMP's post-filter dump).
+    if let Ok(path) = std::env::var("EC_AV1_PREFILT_DUMP") {
+        use std::io::Write;
+        let idx = PREFILT_PICTURE_IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Ok(mut f) = std::fs::File::create(format!("{path}.f{idx}")) {
+            let _ = f.write_all(&y.data);
+            let _ = f.write_all(&u.data);
+            let _ = f.write_all(&v.data);
+        }
+    } else {
+        PREFILT_PICTURE_IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
     apply_deblock(&mut y, &mut u, &mut v, loop_filter, &neighbours);
     apply_cdef(&mut y, &mut u, &mut v, cdef, &neighbours);
 
@@ -7190,6 +7211,22 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         }
     }
 
+    // lane-comppin r4: pre-loop-filter decode-order dump, matching aomdec's
+    // own EC_AV1_PREFILT_DUMP shape (decodeframe.c ~5451) -- diffs against
+    // that isolate whether a decode-order frame's mismatch already exists
+    // in reconstruction (this dump) vs is introduced by the loop filter
+    // (EC_AV1_DECODE_ORDER_DUMP's post-filter dump).
+    if let Ok(path) = std::env::var("EC_AV1_PREFILT_DUMP") {
+        use std::io::Write;
+        let idx = PREFILT_PICTURE_IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Ok(mut f) = std::fs::File::create(format!("{path}.f{idx}")) {
+            let _ = f.write_all(&y.data);
+            let _ = f.write_all(&u.data);
+            let _ = f.write_all(&v.data);
+        }
+    } else {
+        PREFILT_PICTURE_IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
     apply_deblock(&mut y, &mut u, &mut v, loop_filter, &neighbours);
     apply_cdef(&mut y, &mut u, &mut v, cdef, &neighbours);
 
