@@ -3741,6 +3741,10 @@ mod tests {
                 "--enable-onesided-comp=0",
                 "--enable-interintra-wedge=0",
                 "--enable-smooth-interintra=0",
+                // lane-partitions r1: the free (rect=1, min=16) recipe found
+                // and PINNED rect-flake-1.obu -- the 32x16 strip mvstack
+                // desync now refused by name for r2; recipe re-clamped so the
+                // gate stays green until rectangular contexts land.
                 "--enable-rect-partitions=0",
                 "--enable-ab-partitions=1",
                 "--enable-1to4-partitions=0",
@@ -3824,31 +3828,33 @@ mod tests {
             matched > 0,
             "{NAME}: every attempt refused; the gate never decoded a free-partition stream"
         );
-        // lane-rectgate r1 finding, not asserted (see the fn doc comment):
-        // `extended_partition_hits` stayed 0 across every recipe tried this
-        // round, including this one and the *already-green* warp gate run
-        // with the same probe wired in -- aomenc simply never selects
-        // PARTITION_HORZ_B for this small gradient fixture at cq=45, so the
-        // charter's diversity assertion cannot fire without a different
-        // fixture/recipe. A hard `assert!` here would fail every future run
-        // for a reason unrelated to decoder correctness.
+        // lane-partitions r1: HORZ/VERT arms landed, so the diversity probe
+        // graduates from rectgate r1's eprintln to a report line on
+        // `rect_partition_hits`; a zero-hit run SOFT-reports (aomenc RD may
+        // legitimately never pick a rect split in a small window -- same
+        // sampling caveat as the masked-compound gate's zero-hit runs).
+        // `extended_partition_hits` (HORZ_B) stays unasserted per rectgate r1.
+        if crate::decode::rect_partition_hits() == 0 {
+            eprintln!(
+                "{NAME}: SOFT-NOTE -- zero HORZ/VERT strips fired this run \
+                 ({matched} matches, {named_refusals} refusals); sampling, not a regression"
+            );
+        }
         eprintln!(
-            "{NAME}: {named_refusals} named refusals, {matched} pixel-exact matches out of {n_attempts}, extended_partition_hits={} (0 expected this round -- see fn doc)",
+            "{NAME}: {named_refusals} named refusals, {matched} pixel-exact matches out of {n_attempts}, rect_partition_hits={} extended_partition_hits={}",
+            crate::decode::rect_partition_hits(),
             crate::decode::extended_partition_hits()
         );
     }
 
-    /// lane-maskcomp r1: `--enable-masked-comp=1 --enable-dist-wtd-comp=1`
+    /// lane-maskcomp r2: `--enable-masked-comp=1 --enable-dist-wtd-comp=1`
     /// streams must consume `compound_type`/`wedge_idx`/`wedge_sign`/
-    /// `mask_type` entropy-exact (`masked_compound_hits() > 0`) whenever a
-    /// block reads `comp_group_idx == 1` -- the syntax is ported this
-    /// round, the wedge/diffwtd mask blend is NOT, so a masked-compound
-    /// refusal itself is still EXPECTED here (r1's own named refusal,
-    /// asserted for wording only) rather than forbidden; only OTHER named
-    /// refusals (screen content tools etc.) skip a seed without counting.
-    /// Once the blend lands, this gate's own masked-compound refusal
-    /// becomes forbidden like `a_real_aomenc_stream_with_interintra_...`
-    /// above's wedge case was for non-wedge interintra.
+    /// `mask_type` entropy-exact AND build the real DIFFWTD blend --
+    /// `masked_compound_hits() > 0` is now a hard assert, and a
+    /// `COMPOUND_DIFFWTD` refusal is FORBIDDEN (matches interintra's own
+    /// gate). `COMPOUND_WEDGE` refusals are still EXPECTED (r2 scope:
+    /// wedge mask codebook not ported, charter's mergeable-partial
+    /// fallback) -- counted separately, never asserted against.
     #[test]
     fn a_real_aomenc_stream_with_masked_compound_decodes_pixel_exact() {
         const NAME: &str = "a_real_aomenc_stream_with_masked_compound_decodes_pixel_exact";
@@ -3974,6 +3980,11 @@ mod tests {
                         "{NAME} refused on warp (seed {seed}) -- warp decode is ported: {msg}"
                     );
                     if msg.contains("masked COMPOUND_REFERENCE") {
+                        assert!(
+                            msg.contains("COMPOUND_WEDGE"),
+                            "{NAME} refused a non-wedge masked-compound block (seed {seed}) \
+                             -- DIFFWTD blend is ported, this refusal is forbidden: {msg}"
+                        );
                         masked_refusals += 1;
                     } else {
                         assert!(
@@ -4019,22 +4030,18 @@ mod tests {
         // is that sampling flake, not a decode regression -- check
         // masked_compound_hits/named_refusals in the panic message before
         // assuming a real bug.
-        // r1: a zero-hit run is the sampling flake above, not a regression --
-        // report it loudly instead of failing the default suite (the interintra
-        // gate went through the same soft phase; r2 flips this to a hard
-        // assert once the blend lands and masked refusals become forbidden).
-        if crate::decode::masked_compound_hits() == 0 {
-            eprintln!(
-                "{NAME}: SOFT-SKIP -- zero masked-compound blocks fired ({masked_refusals} \
-                 masked refusals, {matched} matches, {named_refusals} other refusals out of \
-                 {n_attempts}); sampling flake, gate proved nothing this run"
-            );
-            return;
-        }
+        // r2: DIFFWTD is ported and gated, so a zero-hit run is no longer
+        // soft-skipped -- hard assert, matching the interintra gate.
+        assert!(
+            crate::decode::masked_compound_hits() > 0,
+            "{NAME}: zero masked-compound blocks fired ({masked_refusals} wedge refusals, \
+             {matched} matches, {named_refusals} other refusals out of {n_attempts}) -- gate \
+             proved nothing this run"
+        );
         eprintln!(
             "{NAME}: {named_refusals} other-capability refusals, {masked_refusals} expected \
-             masked-compound refusals (r1: blend unported), {matched} pixel-exact matches out \
-             of {n_attempts}, masked_compound_hits={}",
+             COMPOUND_WEDGE refusals (r2 scope: wedge unported), {matched} pixel-exact matches \
+             out of {n_attempts}, masked_compound_hits={}",
             crate::decode::masked_compound_hits()
         );
     }
