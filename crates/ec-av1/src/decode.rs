@@ -5697,6 +5697,15 @@ fn decode_inter_block(
                                 mi_rows as usize,
                                 ref_frame,
                             );
+                            if std::env::var_os("EC_WARP_DEBUG").is_some() {
+                                eprintln!(
+                                    "EC_WARP_DEBUG findSamples mi_row={mi_row} mi_col={mi_col} bsize={side} num_proj_ref={}",
+                                    samples.len()
+                                );
+                                for (i, s) in samples.iter().enumerate() {
+                                    eprintln!("EC_WARP_DEBUG sample[{i}] pts={:?} pts_inref={:?}", s.pts1, s.pts2);
+                                }
+                            }
                             if samples.len() > 1 {
                                 crate::warp::select_samples(mv, &mut samples, side as i32, side as i32);
                             }
@@ -5709,6 +5718,15 @@ fn decode_inter_block(
                                 mi_row as i32,
                                 mi_col as i32,
                             );
+                            if std::env::var_os("EC_WARP_DEBUG").is_some() {
+                                eprintln!(
+                                    "EC_WARP_DEBUG projection mi_row={mi_row} mi_col={mi_col} num_proj_ref(final)={} mv=({},{}) params={:?}",
+                                    samples.len(), mv.0, mv.1, warp_params
+                                );
+                                for (i, s) in samples.iter().enumerate() {
+                                    eprintln!("EC_WARP_DEBUG sample_used[{i}] pts={:?} pts_inref={:?}", s.pts1, s.pts2);
+                                }
+                            }
                         }
                     }
                 } else {
