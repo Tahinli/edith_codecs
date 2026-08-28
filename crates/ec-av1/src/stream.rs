@@ -2453,17 +2453,11 @@ mod tests {
             eprintln!("SKIP real_aomenc_film_grain_streams_decode_pixel_exact: no ffmpeg");
             return;
         }
-        let have_aomenc = Command::new("aomenc")
-            .arg("--help")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success());
-        if !have_aomenc {
+        if !have_aomenc() {
             eprintln!("SKIP real_aomenc_film_grain_streams_decode_pixel_exact: no aomenc");
             return;
         }
-        let (width, height) = (64usize, 48usize);
+        let (width, height) = (64usize, 64usize);
         for seed in [1u64, 2, 3] {
             let dir = std::env::temp_dir().join(format!(
                 "ec-av1-filmgrain-gate-{}-{seed}",
@@ -2483,21 +2477,57 @@ mod tests {
                 yuv.extend_from_slice(&card.v);
             }
             std::fs::write(&yuv_path, &yuv).unwrap();
-            let status = Command::new("aomenc")
+            let status = Command::new(aomenc_path())
                 .args([
-                    "--width",
-                    &width.to_string(),
-                    "--height",
-                    &height.to_string(),
+                    &format!("--width={width}"),
+                    &format!("--height={height}"),
                     "--input-bit-depth=8",
                     "--bit-depth=8",
                     "--fps=25/1",
-                    "--limit",
-                    &frames.to_string(),
-                    "--tune-content=film",
-                    "--cpu-used=6",
+                    &format!("--limit={frames}"),
+                    // The full constraint set of the forwarding/golden gates,
+                    // so the streams stay inside this decoder's supported
+                    // envelope and the gate isolates grain synthesis alone;
+                    // `--tune-content=film` is the one flag under test (it
+                    // enables apply_grain).
+                    "--codec=av1",
+                    "--passes=1",
                     "--end-usage=q",
                     "--cq-level=32",
+                    "--cpu-used=0",
+                    "--lag-in-frames=0",
+                    "--auto-alt-ref=0",
+                    "--kf-max-dist=1000",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--max-reference-frames=3",
+                    "--reduced-reference-set=1",
+                    "--enable-warped-motion=0",
+                    "--enable-obmc=0",
+                    "--enable-masked-comp=0",
+                    "--enable-interintra-comp=0",
+                    "--enable-dist-wtd-comp=0",
+                    "--enable-diff-wtd-comp=0",
+                    "--enable-onesided-comp=0",
+                    "--enable-interintra-wedge=0",
+                    "--enable-smooth-interintra=0",
+                    "--enable-rect-partitions=0",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    "--enable-filter-intra=0",
+                    "--enable-smooth-intra=0",
+                    "--enable-paeth-intra=0",
+                    "--enable-directional-intra=0",
+                    "--enable-angle-delta=0",
+                    "--enable-tx-size-search=0",
+                    "--enable-cdef=0",
+                    "--enable-restoration=0",
+                    "--max-partition-size=32",
+                    "--min-partition-size=32",
+                    "--enable-palette=0",
+                    "--enable-intrabc=0",
+                    "--enable-cfl-intra=0",
+                    "--tune-content=film",
                     "--obu",
                     "-o",
                 ])
