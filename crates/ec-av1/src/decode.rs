@@ -3644,11 +3644,17 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
 
 /// `av1_get_pred_context_switchable_interp`'s context for `interp_filter[dir]`
 /// -- `above`/`left` are the neighbour's own resolved index for this
-/// direction (0..=2, or `3` = no info, spec `SWITCHABLE_FILTERS`). This
-/// decoder never codes a compound reference, so `INTER_FILTER_COMP_OFFSET`
-/// is always 0; only `dir`'s own `INTER_FILTER_DIR_OFFSET` (8) is folded in.
-fn switchable_interp_ctx(above: u8, left: u8, dir: usize) -> usize {
-    let base = dir * 8;
+/// direction (0..=2, or `3` = no info, spec `SWITCHABLE_FILTERS`).
+/// `is_compound` folds in libaom `av1_get_pred_context_switchable_interp`'s
+/// own `ctx_offset` term (`INTER_FILTER_COMP_OFFSET` = 4, added when *this*
+/// block itself has a second reference) -- lane-av1idx: a stale "this
+/// decoder never codes a compound reference" assumption baked this to
+/// always-0, which desynced the CDF context bucket (not the decoded value
+/// outright, hence small pixel deltas rather than a hard desync) the moment
+/// lane-av1blend unmasked plain-average compound blocks on a Switchable-
+/// filter frame.
+fn switchable_interp_ctx(above: u8, left: u8, dir: usize, is_compound: bool) -> usize {
+    let base = dir * 8 + if is_compound { 4 } else { 0 };
     let term = if left == above {
         left
     } else if left == 3 {
@@ -3679,6 +3685,7 @@ fn resolve_interp_filter(
     force_regular: bool,
     above: [u8; 2],
     left: [u8; 2],
+    is_compound: bool,
 ) -> (mc::InterpFilterKind, mc::InterpFilterKind, [u8; 2]) {
     if let Some(kind) = interp_fixed {
         return (kind, kind, [3, 3]);
@@ -3696,10 +3703,10 @@ fn resolve_interp_filter(
     // "horizontal then vertical" despite `predict_with_filters`' own
     // `h_kind`/`v_kind` argument order, which is why this function returns
     // `(h, v, ..)` but reads `dir0` (`v`) before `dir1` (`h`).
-    let ctx0 = switchable_interp_ctx(above[0], left[0], 0);
+    let ctx0 = switchable_interp_ctx(above[0], left[0], 0, is_compound);
     let sym0 = dec.symbol(&mut cdfs.switchable_interp[ctx0]) as u8;
     let sym1 = if enable_dual_filter {
-        let ctx1 = switchable_interp_ctx(above[1], left[1], 1);
+        let ctx1 = switchable_interp_ctx(above[1], left[1], 1, is_compound);
         dec.symbol(&mut cdfs.switchable_interp[ctx1]) as u8
     } else {
         sym0
@@ -4666,11 +4673,22 @@ fn decode_inter_block(
             // 846 pixels not fitting the (9,7)-vs-plain-average hypothesis
             // either) already flagged more than one bug here. Re-masking:
             // do not ship a blend that is right only sometimes.
+            // lane-av1idx r1: fixed one real bug this round
+            // (`switchable_interp_ctx` never folded in libaom's
+            // `INTER_FILTER_COMP_OFFSET` for a compound block's own
+            // interp_filter context -- kept). Pinned
+            // `fixtures/av1idx-refsel-pin.obu` (seed 61, reference_select
+            // gate) still mismatches after that fix (decode-order frame 8
+            // first, small deltas, worst 1-2, propagating through later
+            // frames via DPB reference) -- a second, still-unfound bug.
+            // Re-masking: see that fixture + `scratch_isolate_pinned_mismatch`
+            // (`EC_AV1_PIN=fixtures/av1idx-refsel-pin.obu EC_AV1_PIN_N=20`)
+            // for the next round's starting point.
             return Err(unsupported(
                 "a COMPOUND_REFERENCE 16x16 leaf using the plain/distance-weighted \
                  average blend (comp_group_idx == 0) -- proven non-pixel-exact against \
-                 real aomenc streams beyond the one bug lane-av1blend r6/r7 fixed \
-                 (lane-av1blend r7, wide gate sweep)",
+                 real aomenc streams beyond the bugs lane-av1blend r6/r7 and lane-av1idx \
+                 r1 fixed (wide gate sweep, fixtures/av1idx-refsel-pin.obu)",
             ));
             #[allow(unreachable_code)]
             let (fwd_offset, bck_offset, compound_idx) = if !skip_mode && enable_jnt_comp {
@@ -4740,6 +4758,7 @@ fn decode_inter_block(
                 is_globalmv,
                 above_filter_ctx,
                 left_filter_ctx,
+                true,
             );
             block_filter = resolved_filter;
 
@@ -5063,6 +5082,7 @@ fn decode_inter_block(
                 is_globalmv,
                 above_filter_ctx,
                 left_filter_ctx,
+                false,
             );
             block_filter = resolved_filter;
             globalmv_for_lf = is_globalmv;
@@ -5580,11 +5600,14 @@ fn decode_inter_block8(
                 // as the 16x16 leaf above -- one real bug found and fixed
                 // (mvstack.rs ref_ctx family), a second, still-unfound
                 // compound_idx defect surfaces on the wide gate sweep.
+                // lane-av1idx r1: same re-mask as the 16x16 leaf above --
+                // see that comment.
                 return Err(unsupported(
                     "a COMPOUND_REFERENCE 8x8 leaf using the plain/distance-weighted \
                      average blend (comp_group_idx == 0) -- proven non-pixel-exact \
-                     against real aomenc streams beyond the one bug lane-av1blend \
-                     r6/r7 fixed (lane-av1blend r7, wide gate sweep)",
+                     against real aomenc streams beyond the bugs lane-av1blend r6/r7 \
+                     and lane-av1idx r1 fixed (wide gate sweep, \
+                     fixtures/av1idx-refsel-pin.obu)",
                 ));
                 #[allow(unreachable_code)]
                 let (fwd_offset, bck_offset, compound_idx) = if !skip_mode && enable_jnt_comp {
