@@ -16,6 +16,20 @@ use ec_core::{CodecId, Demuxer, Packet};
 use ec_matroska::MatroskaDemuxer;
 use ec_mp4::Mp4Demuxer;
 
+/// Every `#[test]` in this file decodes real SBR content through
+/// `our_decode`/`our_decode_uncapped`, and a handful of them steer that
+/// decode with process-global env vars (`EC_AAC_SBR_HF_BYPASS`,
+/// `EC_AAC_SBR_SIDEINFO_DEBUG`, `EC_AAC_SBR_NOISE_ZERO`,
+/// `EC_AAC_SBR_NOISE_FRACTION`) as debug toggles, set then removed mid-test.
+/// Cargo runs this binary's tests in parallel threads by default, so an
+/// unguarded `set_var`/`remove_var` window in one test can flip decode
+/// behaviour out from under another test's own concurrent decode -- this is
+/// exactly what turned `sbr_real_library_matches_reference`'s HF-band
+/// correlation into a full-suite-only flake (`sbr_hf_window_band_probe`
+/// toggling `EC_AAC_SBR_HF_BYPASS` while it ran). Every test locks this for
+/// its whole body so no toggle window and no concurrent read can interleave.
+static DECODE_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn have_ffmpeg() -> bool {
     Command::new("ffmpeg")
         .arg("-version")
@@ -2189,6 +2203,7 @@ fn ffmpeg_decode_at_rate(
 /// the crossover at all.
 #[test]
 fn core_only_matches_reference() {
+    let _guard = DECODE_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     if !have_ffmpeg() {
         eprintln!("SKIP: ffmpeg not on PATH");
         return;
@@ -2228,6 +2243,7 @@ fn core_only_matches_reference() {
 /// that scaling.
 #[test]
 fn dump_sideinfo_kx() {
+    let _guard = DECODE_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     unsafe {
         std::env::set_var("EC_AAC_SBR_SIDEINFO_DEBUG", "1");
     }
@@ -2261,6 +2277,7 @@ fn dump_sideinfo_kx() {
 /// content itself being wrong.
 #[test]
 fn wide_lag_search_full_chain() {
+    let _guard = DECODE_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     if !have_ffmpeg() {
         eprintln!("SKIP: ffmpeg not on PATH");
         return;
@@ -2313,6 +2330,7 @@ fn wide_lag_search_full_chain() {
 /// factor (alignment against a reference, different tool, etc.) to blame.
 #[test]
 fn full_chain_low_band_matches_own_core() {
+    let _guard = DECODE_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     for c in &candidates() {
         let Some((core, core_rate)) = our_decode_core_only(&c.path, c.aac_stream) else {
             continue;
@@ -2405,6 +2423,7 @@ fn full_chain_low_band_matches_own_core() {
 /// directory is absent.
 #[test]
 fn synthetic_heaac_matrix() {
+    let _guard = DECODE_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     if !have_ffmpeg() {
         eprintln!("SKIP: ffmpeg not on PATH");
         return;
@@ -2719,6 +2738,7 @@ fn candidates() -> Vec<Candidate> {
 /// touches.
 #[test]
 fn sbr_real_library_matches_reference() {
+    let _guard = DECODE_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     if !have_ffmpeg() {
         eprintln!("SKIP: ffmpeg not on PATH");
         return;
@@ -3391,6 +3411,7 @@ fn report_conviction(label: &str, rows: &[(f64, f64, f64, f64, f64, f64)]) {
 /// need to be recalibrated against whatever this control actually measures.
 #[test]
 fn sbr_instrument_anchor_controls() {
+    let _guard = DECODE_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     if std::env::var("EC_AAC_SBR_INSTRUMENT_ANCHOR").is_err() {
         eprintln!(
             "SKIP (round-41 Task 1): EC_AAC_SBR_INSTRUMENT_ANCHOR=1 cargo test -p ec-aac \
@@ -3470,6 +3491,7 @@ fn sbr_instrument_anchor_controls() {
 /// ACTUALLY realizes in the output, independent of either prior claim.
 #[test]
 fn sbr_actual_noise_fraction() {
+    let _guard = DECODE_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     if std::env::var("EC_AAC_SBR_NOISE_ANCHOR").is_err() {
         eprintln!(
             "SKIP (round-41 Task 2): EC_AAC_SBR_NOISE_ANCHOR=1 cargo test -p ec-aac \
@@ -3666,6 +3688,7 @@ fn sbr_actual_noise_fraction() {
 /// generates nothing.
 #[test]
 fn sbr_header_feature_table() {
+    let _guard = DECODE_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     if !have_ffmpeg() {
         eprintln!("SKIP: ffmpeg not on PATH");
         return;
@@ -3915,6 +3938,7 @@ fn per_au_low_band_probe(label: &str, path: &Path, aac_stream: usize) {
 
 #[test]
 fn per_au_low_band_divergence() {
+    let _guard = DECODE_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     if !have_ffmpeg() {
         eprintln!("SKIP: ffmpeg not on PATH");
         return;
@@ -3948,6 +3972,7 @@ fn per_au_low_band_divergence() {
 /// own_core`'s FMJ probe with `WIDE_LAG_MAX` raised to 100_000.
 #[test]
 fn probe_explicit_config_and_wide_lag() {
+    let _guard = DECODE_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     if !have_ffmpeg() {
         eprintln!("SKIP: ffmpeg not on PATH");
         return;
@@ -4149,6 +4174,7 @@ fn ffmpeg_decode_pan_channel(path: &Path, absolute_stream: usize, channel: usize
 /// (never `-ac 1`, which would remix rather than isolate).
 #[test]
 fn boneknapper_multichannel_lc_matches_reference() {
+    let _guard = DECODE_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     if !have_ffmpeg() {
         eprintln!("SKIP: ffmpeg not on PATH");
         return;
@@ -4208,6 +4234,7 @@ fn boneknapper_multichannel_lc_matches_reference() {
 /// the swap-shaped-result gate this round adds.
 #[test]
 fn coupled_cpe_channel_swap_probe() {
+    let _guard = DECODE_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     if !have_ffmpeg() {
         eprintln!("SKIP: ffmpeg not on PATH");
         return;
@@ -4537,6 +4564,7 @@ fn narrow_lag_at(
 /// (real 44.1k HE-AAC) as controls that are known NOT to show the drift.
 #[test]
 fn sbr441_family_sample_drift_probe() {
+    let _guard = DECODE_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     if !have_ffmpeg() {
         eprintln!("SKIP: ffmpeg not on PATH");
         return;
@@ -4657,6 +4685,7 @@ fn sbr441_family_sample_drift_probe() {
 /// readable straight from the printed corr numbers.
 #[test]
 fn sbr_hf_window_band_probe() {
+    let _guard = DECODE_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     if !have_ffmpeg() {
         eprintln!("SKIP: ffmpeg not on PATH");
         return;
@@ -4761,6 +4790,7 @@ fn sbr_hf_window_band_probe() {
 /// band, so it needs no calibration) with an ours-vs-ours self-check column.
 #[test]
 fn sbr_residual_locator() {
+    let _guard = DECODE_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     if !have_ffmpeg() {
         return;
     }
