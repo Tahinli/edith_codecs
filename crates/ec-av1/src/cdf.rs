@@ -1201,6 +1201,34 @@ pub const COMP_REF_TYPE: [[u16; 3]; 5] = [
     [22475, 32768, 0],
 ];
 
+/// `Default_Comp_Group_Idx_Cdf` (spec 9.4, libaom `default_comp_group_idx_cdfs`):
+/// whether a compound block's `comp_group_idx` picks masked compound (`1`)
+/// over the plain distance-weighted/simple-average blend (`0`), indexed by
+/// `get_comp_group_idx_context` -- only read when `seq.enable_masked_compound`
+/// and the block size is masked-compound-eligible (lane-av1comp).
+pub const COMP_GROUP_IDX: [[u16; 3]; 6] = [
+    [26607, 32768, 0],
+    [22891, 32768, 0],
+    [18840, 32768, 0],
+    [24594, 32768, 0],
+    [19934, 32768, 0],
+    [22674, 32768, 0],
+];
+
+/// `Default_Compound_Idx_Cdf` (spec 9.4, libaom `default_compound_idx_cdfs`):
+/// whether a compound block's `compound_idx` picks the simple average
+/// (`1`) or [`crate::compound::dist_wtd_comp_weight_assign`]'s distance
+/// weights (`0`), indexed by `get_comp_index_context` -- only read when
+/// `seq.enable_jnt_comp` (lane-av1comp).
+pub const COMPOUND_IDX: [[u16; 3]; 6] = [
+    [18244, 32768, 0],
+    [12865, 32768, 0],
+    [7053, 32768, 0],
+    [13259, 32768, 0],
+    [9334, 32768, 0],
+    [4644, 32768, 0],
+];
+
 /// `Default_Uni_Comp_Ref_Cdf` (spec 9.4, `default_uni_comp_ref_cdf`): the
 /// three binary decisions narrowing a unidirectional compound pair down to
 /// one of `{BWDREF,ALTREF}`/`{LAST,LAST2}`/`{LAST,LAST3}`/`{LAST,GOLDEN}`.

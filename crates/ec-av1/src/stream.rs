@@ -219,6 +219,13 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         let enable_edge_filter = parser
             .sequence_header()
             .is_some_and(|seq| seq.enable_intra_edge_filter);
+        // lane-av1comp: `comp_group_idx`/`compound_idx`'s own gating bits.
+        let enable_masked_compound = parser
+            .sequence_header()
+            .is_some_and(|seq| seq.enable_masked_compound);
+        let enable_jnt_comp = parser
+            .sequence_header()
+            .is_some_and(|seq| seq.enable_jnt_comp);
         let interp_fixed = match header.interpolation_filter {
             ec_av1_syntax::InterpolationFilter::Switchable => None,
             fixed => Some(crate::mc::InterpFilterKind::from_header(fixed)),
@@ -339,6 +346,8 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 ref_order_hints,
                 tpl_field.as_ref(),
                 header.reference_select,
+                enable_masked_compound,
+                enable_jnt_comp,
             )?
         };
         // Spec 7.20: `disable_frame_end_update_cdf` stores the frame's

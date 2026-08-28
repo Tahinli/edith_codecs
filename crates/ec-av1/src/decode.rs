@@ -784,6 +784,15 @@ struct Neighbours {
     /// (no decode path here ever produces a compound block yet).
     above_ref1: Vec<Option<i8>>,
     left_ref1: Vec<Option<i8>>,
+    /// The precomputed `get_comp_group_idx_context`/`get_comp_index_context`
+    /// neighbour contribution (spec 5.11.25, libaom `pred_common.h`):
+    /// a compound neighbour's own `comp_group_idx`/`compound_idx` bit, or
+    /// the "ref_frame[0] == ALTREF_FRAME" special case (`3`/`1`) for a
+    /// single-ref one, or `0` for intra/unavailable -- lane-av1comp.
+    above_comp_group_idx: Vec<u8>,
+    left_comp_group_idx: Vec<u8>,
+    above_compound_idx: Vec<u8>,
+    left_compound_idx: Vec<u8>,
     /// `interp_filter[0]`/`[1]` (horizontal/vertical kernel index, 0..=2, or
     /// `3` = "no info": an intra neighbour or the frame's own border) of the
     /// block above/left of this column/row -- spec
@@ -838,6 +847,10 @@ impl Neighbours {
             left_ref: vec![-1; rows],
             above_ref1: vec![None; cols],
             left_ref1: vec![None; rows],
+            above_comp_group_idx: vec![0; cols],
+            left_comp_group_idx: vec![0; rows],
+            above_compound_idx: vec![0; cols],
+            left_compound_idx: vec![0; rows],
             above_filter: vec![[3u8; 2]; cols],
             left_filter: vec![[3u8; 2]; rows],
             mi_cols,
@@ -922,6 +935,8 @@ impl Neighbours {
         self.left_inter.iter_mut().for_each(|i| *i = false);
         self.left_ref.iter_mut().for_each(|r| *r = -1);
         self.left_ref1.iter_mut().for_each(|r| *r = None);
+        self.left_comp_group_idx.iter_mut().for_each(|r| *r = 0);
+        self.left_compound_idx.iter_mut().for_each(|r| *r = 0);
         self.left_filter.iter_mut().for_each(|f| *f = [3u8; 2]);
     }
 
@@ -954,8 +969,39 @@ impl Neighbours {
             // parameter this becomes lands with `read_ref_frames`.
             self.above_ref1[c + cell] = None;
             self.left_ref1[r + cell] = None;
+            // libaom `get_comp_group_idx_context`/`get_comp_index_context`'s
+            // single-ref special case: `ref_frame[0] == ALTREF_FRAME` reads
+            // as `3`/`1` even though this block has no second reference.
+            // `record_compound_ctx` overwrites this with the real bit for an
+            // actual compound block's cells, called right after this one.
+            let altref = is_inter && ref_frame == crate::mvstack::ALTREF_FRAME;
+            self.above_comp_group_idx[c + cell] = if altref { 3 } else { 0 };
+            self.left_comp_group_idx[r + cell] = if altref { 3 } else { 0 };
+            self.above_compound_idx[c + cell] = u8::from(altref);
+            self.left_compound_idx[r + cell] = u8::from(altref);
             self.above_filter[c + cell] = filter;
             self.left_filter[r + cell] = filter;
+        }
+    }
+
+    /// Overwrites [`Self::record_inter`]'s ALTREF-special-case default with
+    /// a real compound block's own `comp_group_idx`/`compound_idx` bits
+    /// (libaom `has_second_ref(mbmi)` branch of `get_comp_group_idx_context`/
+    /// `get_comp_index_context`) -- called right after `record_inter` for
+    /// the same `at`/`side`, only on the `COMPOUND_REFERENCE` path.
+    fn record_compound_ctx(
+        &mut self,
+        at: (usize, usize),
+        side: usize,
+        comp_group_idx: u8,
+        compound_idx: u8,
+    ) {
+        let (r, c) = at;
+        for cell in 0..side / SUB {
+            self.above_comp_group_idx[c + cell] = comp_group_idx;
+            self.left_comp_group_idx[r + cell] = comp_group_idx;
+            self.above_compound_idx[c + cell] = compound_idx;
+            self.left_compound_idx[r + cell] = compound_idx;
         }
     }
 
@@ -3827,6 +3873,77 @@ fn read_single_ref(dec: &mut SymbolDecoder, cdfs: &mut Cdfs, above_ref: i8, left
 /// own doc. Called from [`decode_inter_block`] once its own `reference_select`
 /// parameter is set; [`decode_inter_block8`]'s 8x8 leaf path gates the same
 /// way with a coarser (`LAST_FRAME`-only) neighbour shape.
+/// Resolves a compound reference's own planes -- the same `ref_frame ==
+/// LAST_FRAME -> ref_y/u/v, else other_refs[ref_frame]` lookup
+/// [`decode_inter_block`]'s single-ref path already does, factored out so
+/// the compound path can call it twice (lane-av1comp).
+fn ref_planes<'a>(
+    ref_frame: i8,
+    ref_y: &'a PlaneBuf,
+    ref_u: &'a PlaneBuf,
+    ref_v: &'a PlaneBuf,
+    other_refs: &'a RefSlots,
+) -> Result<(&'a PlaneBuf, &'a PlaneBuf, &'a PlaneBuf)> {
+    if ref_frame == LAST_FRAME {
+        Ok((ref_y, ref_u, ref_v))
+    } else {
+        match other_refs[ref_frame as usize] {
+            Some((ry, ru, rv)) => Ok((ry, ru, rv)),
+            None => Err(unsupported(
+                "a reference frame selected with no picture at this frame's own \
+                 ref_frame_idx slot for it",
+            )),
+        }
+    }
+}
+
+/// `is_any_masked_compound_used` (libaom `reconinter.h`), specialised to
+/// the square block sizes this decoder ever decodes (32/16/8, all
+/// `min(w,h) >= 8`, `is_comp_ref_allowed` true): `COMPOUND_DIFFWTD` is then
+/// always `is_interinter_compound_used`, so the function is always `true`
+/// for `side` -- kept as a named call (rather than inlined `true`) so a
+/// future sub-8 block size does not silently misdecode a real stream.
+fn is_any_masked_compound_used_here(side: usize) -> bool {
+    side.min(side) >= 8
+}
+
+/// `get_comp_group_idx_context` (libaom `pred_common.h`): sums the
+/// above/left neighbour contributions [`Neighbours::record_inter`]/
+/// [`Neighbours::record_compound_ctx`] already precomputed, clamped to 5.
+fn get_comp_group_idx_context(neighbours: &Neighbours, at: (usize, usize), side: usize) -> usize {
+    let _ = side;
+    let (r, c) = at;
+    (neighbours.above_comp_group_idx[c] as usize + neighbours.left_comp_group_idx[r] as usize)
+        .min(5)
+}
+
+/// `get_comp_index_context` (libaom `pred_common.h`): the above/left
+/// neighbour bits plus `3 * (fwd == bck)`, where `fwd`/`bck` are this
+/// block's own two references' distances from the current frame (spec
+/// 7.11.3.15's `get_relative_dist`, same convention
+/// [`crate::compound::dist_wtd_comp_weight_assign`] uses).
+#[allow(clippy::too_many_arguments)]
+fn get_comp_index_context(
+    neighbours: &Neighbours,
+    at: (usize, usize),
+    side: usize,
+    order_hint_bits: u32,
+    cur_order_hint: u32,
+    ref0_order_hint: u32,
+    ref1_order_hint: u32,
+) -> usize {
+    let _ = side;
+    let (r, c) = at;
+    let fwd =
+        crate::motion_field::get_relative_dist(order_hint_bits, ref1_order_hint, cur_order_hint)
+            .abs();
+    let bck =
+        crate::motion_field::get_relative_dist(order_hint_bits, cur_order_hint, ref0_order_hint)
+            .abs();
+    let offset = usize::from(fwd == bck);
+    neighbours.above_compound_idx[c] as usize + neighbours.left_compound_idx[r] as usize + 3 * offset
+}
+
 fn read_comp_mode(
     dec: &mut SymbolDecoder,
     cdfs: &mut Cdfs,
@@ -4084,6 +4201,16 @@ fn decode_inter_block(
     // `COMPOUND_REFERENCE`, since two-reference motion compensation is not
     // wired yet.
     reference_select: bool,
+    // lane-av1comp: `seq_params`' own masked-compound/distance-weighted-
+    // compound enable bits, gating `comp_group_idx`/`compound_idx`
+    // (spec 5.11.25) -- always present (unlike `tpl_frame`), since the
+    // compound blend weights need this frame's own order hint regardless
+    // of `use_ref_frame_mvs`.
+    enable_masked_compound: bool,
+    enable_jnt_comp: bool,
+    order_hint_bits: u32,
+    order_hint: u32,
+    ref_order_hints: [u32; 7],
 ) -> Result<()> {
     let (r, c) = at;
     let (px, py) = (c * SUB, r * SUB);
@@ -4103,88 +4230,339 @@ fn decode_inter_block(
     let block_filter;
     let ref_frame_for_lf;
     let globalmv_for_lf;
+    // lane-av1comp: `Some((comp_group_idx, compound_idx))` only for a real
+    // `COMPOUND_REFERENCE` block -- applied to `neighbours` *after* the
+    // common `record_inter` call below (which would otherwise stamp the
+    // single-ref ALTREF-special-case default over it).
+    let mut compound_ctx: Option<(u8, u8)> = None;
     if is_inter {
-        if reference_select {
-            let above_nbr = has_above.then(|| NeighbourRef {
-                is_inter: above_inter,
-                ref0: if above_inter {
-                    neighbours.above_ref[c]
-                } else {
-                    0
-                },
-                ref1: neighbours.above_ref1[c],
-                uni: false,
+        let above_nbr = has_above.then(|| NeighbourRef {
+            is_inter: above_inter,
+            ref0: if above_inter {
+                neighbours.above_ref[c]
+            } else {
+                0
+            },
+            ref1: neighbours.above_ref1[c],
+            uni: false,
+        });
+        let left_nbr = has_left.then(|| NeighbourRef {
+            is_inter: left_inter,
+            ref0: if left_inter {
+                neighbours.left_ref[r]
+            } else {
+                0
+            },
+            ref1: neighbours.left_ref1[r],
+            uni: false,
+        });
+        let is_compound = reference_select && read_comp_mode(dec, cdfs, above_nbr, left_nbr);
+        if is_compound {
+            let (ref0, ref1) = read_compound_ref_frames(
+                dec,
+                cdfs,
+                above_nbr,
+                left_nbr,
+                neighbours.above_ref[c],
+                neighbours.left_ref[r],
+            );
+            let (mi_row, mi_col) = (r * SUB_MI as usize, c * SUB_MI as usize);
+            let bw4 = side / 4;
+            // spec 7.10.2.8, doubled per side (`CompoundTplArgs`): same
+            // `use_ref_frame_mvs` gating as the single-ref `tpl` build
+            // below, just one `get_relative_dist` per reference.
+            let comp_tpl = tpl_frame.map(|t| crate::mvstack::CompoundTplArgs {
+                field: t.field,
+                cur_offset_0: crate::motion_field::get_relative_dist(
+                    t.order_hint_bits,
+                    t.order_hint,
+                    t.ref_order_hints[(ref0 - LAST_FRAME) as usize],
+                ),
+                cur_offset_1: crate::motion_field::get_relative_dist(
+                    t.order_hint_bits,
+                    t.order_hint,
+                    t.ref_order_hints[(ref1 - LAST_FRAME) as usize],
+                ),
+                allow_high_precision_mv,
             });
-            let left_nbr = has_left.then(|| NeighbourRef {
-                is_inter: left_inter,
-                ref0: if left_inter {
-                    neighbours.left_ref[r]
-                } else {
-                    0
-                },
-                ref1: neighbours.left_ref1[r],
-                uni: false,
-            });
-            if read_comp_mode(dec, cdfs, above_nbr, left_nbr) {
-                let (ref0, ref1) = read_compound_ref_frames(
-                    dec,
-                    cdfs,
-                    above_nbr,
-                    left_nbr,
-                    neighbours.above_ref[c],
-                    neighbours.left_ref[r],
-                );
-                let (mi_row, mi_col) = (r * SUB_MI as usize, c * SUB_MI as usize);
-                let bw4 = side / 4;
-                // spec 7.10.2.8, doubled per side (`CompoundTplArgs`): same
-                // `use_ref_frame_mvs` gating as the single-ref `tpl` build
-                // below, just one `get_relative_dist` per reference.
-                let comp_tpl = tpl_frame.map(|t| crate::mvstack::CompoundTplArgs {
-                    field: t.field,
-                    cur_offset_0: crate::motion_field::get_relative_dist(
-                        t.order_hint_bits,
-                        t.order_hint,
-                        t.ref_order_hints[(ref0 - LAST_FRAME) as usize],
-                    ),
-                    cur_offset_1: crate::motion_field::get_relative_dist(
-                        t.order_hint_bits,
-                        t.order_hint,
-                        t.ref_order_hints[(ref1 - LAST_FRAME) as usize],
-                    ),
-                    allow_high_precision_mv,
-                });
-                let comp_stack = crate::mvstack::find_mv_stack_compound(
-                    grid,
-                    mi_row,
-                    mi_col,
-                    bw4,
-                    bw4,
-                    (ref0, ref1),
-                    mi_cols as usize,
-                    mi_rows as usize,
-                    sign_bias_table,
-                    comp_tpl,
-                );
-                let compound_mode = read_inter_compound_mode(
-                    dec,
-                    cdfs,
-                    comp_stack.new_mv_ctx,
-                    comp_stack.ref_mv_ctx,
-                );
-                let _mv_pair = assign_compound_mv(
-                    dec,
-                    cdfs,
-                    &comp_stack,
-                    compound_mode,
-                    allow_high_precision_mv,
-                );
+            let comp_stack = crate::mvstack::find_mv_stack_compound(
+                grid,
+                mi_row,
+                mi_col,
+                bw4,
+                bw4,
+                (ref0, ref1),
+                mi_cols as usize,
+                mi_rows as usize,
+                sign_bias_table,
+                comp_tpl,
+            );
+            let compound_mode = read_inter_compound_mode(
+                dec,
+                cdfs,
+                comp_stack.new_mv_ctx,
+                comp_stack.ref_mv_ctx,
+            );
+            let (mv0, mv1) = assign_compound_mv(
+                dec,
+                cdfs,
+                &comp_stack,
+                compound_mode,
+                allow_high_precision_mv,
+            );
+            let is_globalmv = compound_mode == 6; // GLOBAL_GLOBALMV
+            let (py0, pu0, pv0) = ref_planes(ref0, ref_y, ref_u, ref_v, other_refs)?;
+            let (py1, pu1, pv1) = ref_planes(ref1, ref_y, ref_u, ref_v, other_refs)?;
+            let above_filter_ctx = if neighbours.above_ref[c] == ref0 {
+                neighbours.above_filter[c]
+            } else {
+                [3, 3]
+            };
+            let left_filter_ctx = if neighbours.left_ref[r] == ref0 {
+                neighbours.left_filter[r]
+            } else {
+                [3, 3]
+            };
+            let (h_filter, v_filter, resolved_filter) = resolve_interp_filter(
+                dec,
+                cdfs,
+                interp_fixed,
+                enable_dual_filter,
+                is_globalmv,
+                above_filter_ctx,
+                left_filter_ctx,
+            );
+            block_filter = resolved_filter;
+            globalmv_for_lf = is_globalmv;
+            ref_frame_for_lf = ref0;
+            mode_for_tx = 0;
+            for dr in 0..bw4 {
+                for dc in 0..bw4 {
+                    grid.set(
+                        mi_row + dr,
+                        mi_col + dc,
+                        MiInfo {
+                            is_inter: true,
+                            ref_frame: ref0,
+                            ref_frame1: Some(ref1),
+                            mv1: Some(mv1),
+                            mv: mv0,
+                            is_new_mv: matches!(compound_mode, 2 | 3 | 4 | 5 | 7),
+                            size: bw4,
+                        },
+                    );
+                }
+            }
+            // spec 5.11.25's `comp_group_idx`/`compound_idx`: only read when
+            // masked compound / distance-weighted compound are actually
+            // enabled for this stream -- `is_any_masked_compound_used_here`
+            // is `true` for every block size this decoder ever reaches
+            // (`min(side,side) >= 8`, `COMPOUND_DIFFWTD` always eligible
+            // there), so the gate reduces to the sequence header bit; kept
+            // as an explicit call so a future smaller block size is not
+            // silently wrong (libaom `reconinter.h::is_any_masked_compound_used`).
+            let group_ctx = get_comp_group_idx_context(neighbours, at, side);
+            let comp_group_idx = if enable_masked_compound && is_any_masked_compound_used_here(side)
+            {
+                dec.symbol(&mut cdfs.comp_group_idx[group_ctx])
+            } else {
+                0
+            };
+            if comp_group_idx == 1 {
                 return Err(unsupported(
-                    "a COMPOUND_REFERENCE block (comp_mode/comp_ref/inter_compound_mode/\
-                     compound DRL/MV assignment read correctly; two-reference motion \
-                     compensation is not wired yet -- lane-av1comp)",
+                    "a masked COMPOUND_REFERENCE block (comp_group_idx == 1, wedge/\
+                     diffwtd) -- this decoder's compound blend is the plain distance-\
+                     weighted/simple-average combine only, lane-av1comp",
                 ));
             }
-        }
+            let (fwd_offset, bck_offset, compound_idx) = if enable_jnt_comp {
+                let idx_ctx = get_comp_index_context(
+                    neighbours,
+                    at,
+                    side,
+                    order_hint_bits,
+                    order_hint,
+                    ref_order_hints[(ref0 - LAST_FRAME) as usize],
+                    ref_order_hints[(ref1 - LAST_FRAME) as usize],
+                );
+                let idx = dec.symbol(&mut cdfs.compound_idx[idx_ctx]);
+                if idx == 1 {
+                    (8, 8, 1u8)
+                } else {
+                    let (fwd, bck) = crate::compound::dist_wtd_comp_weight_assign(
+                        order_hint_bits,
+                        order_hint,
+                        ref_order_hints[(ref0 - LAST_FRAME) as usize],
+                        ref_order_hints[(ref1 - LAST_FRAME) as usize],
+                    );
+                    (fwd, bck, 0u8)
+                }
+            } else {
+                (8, 8, 1u8)
+            };
+            compound_ctx = Some((comp_group_idx as u8, compound_idx));
+
+            let mut inter0_y = vec![0i32; side * side];
+            mc::predict_compound_intermediate(
+                &py0.data,
+                py0.width,
+                py0.true_width,
+                py0.true_height,
+                mv_to_q4(px, mv0.1, true),
+                mv_to_q4(py, mv0.0, true),
+                side,
+                side,
+                h_filter,
+                v_filter,
+                &mut inter0_y,
+            );
+            let mut inter1_y = vec![0i32; side * side];
+            mc::predict_compound_intermediate(
+                &py1.data,
+                py1.width,
+                py1.true_width,
+                py1.true_height,
+                mv_to_q4(px, mv1.1, true),
+                mv_to_q4(py, mv1.0, true),
+                side,
+                side,
+                h_filter,
+                v_filter,
+                &mut inter1_y,
+            );
+            let mut pred_y = vec![0u8; side * side];
+            mc::combine_compound(&inter0_y, &inter1_y, fwd_offset, bck_offset, &mut pred_y);
+
+            let mut inter0_u = vec![0i32; chroma_side * chroma_side];
+            mc::predict_compound_intermediate(
+                &pu0.data,
+                pu0.width,
+                pu0.true_width,
+                pu0.true_height,
+                mv_to_q4(cpx, mv0.1, false),
+                mv_to_q4(cpy, mv0.0, false),
+                chroma_side,
+                chroma_side,
+                h_filter,
+                v_filter,
+                &mut inter0_u,
+            );
+            let mut inter1_u = vec![0i32; chroma_side * chroma_side];
+            mc::predict_compound_intermediate(
+                &pu1.data,
+                pu1.width,
+                pu1.true_width,
+                pu1.true_height,
+                mv_to_q4(cpx, mv1.1, false),
+                mv_to_q4(cpy, mv1.0, false),
+                chroma_side,
+                chroma_side,
+                h_filter,
+                v_filter,
+                &mut inter1_u,
+            );
+            let mut pred_u = vec![0u8; chroma_side * chroma_side];
+            mc::combine_compound(&inter0_u, &inter1_u, fwd_offset, bck_offset, &mut pred_u);
+
+            let mut inter0_v = vec![0i32; chroma_side * chroma_side];
+            mc::predict_compound_intermediate(
+                &pv0.data,
+                pv0.width,
+                pv0.true_width,
+                pv0.true_height,
+                mv_to_q4(cpx, mv0.1, false),
+                mv_to_q4(cpy, mv0.0, false),
+                chroma_side,
+                chroma_side,
+                h_filter,
+                v_filter,
+                &mut inter0_v,
+            );
+            let mut inter1_v = vec![0i32; chroma_side * chroma_side];
+            mc::predict_compound_intermediate(
+                &pv1.data,
+                pv1.width,
+                pv1.true_width,
+                pv1.true_height,
+                mv_to_q4(cpx, mv1.1, false),
+                mv_to_q4(cpy, mv1.0, false),
+                chroma_side,
+                chroma_side,
+                h_filter,
+                v_filter,
+                &mut inter1_v,
+            );
+            let mut pred_v = vec![0u8; chroma_side * chroma_side];
+            mc::combine_compound(&inter0_v, &inter1_v, fwd_offset, bck_offset, &mut pred_v);
+
+            if skip {
+                y.reconstruct_mc(px, py, side, &pred_y, &vec![0i32; side * side]);
+                u.reconstruct_mc(
+                    cpx,
+                    cpy,
+                    chroma_side,
+                    &pred_u,
+                    &vec![0i32; chroma_side * chroma_side],
+                );
+                v.reconstruct_mc(
+                    cpx,
+                    cpy,
+                    chroma_side,
+                    &pred_v,
+                    &vec![0i32; chroma_side * chroma_side],
+                );
+                luma_grid = vec![0i32; side * side];
+                u_grid = vec![0i32; chroma_side * chroma_side];
+                v_grid = vec![0i32; chroma_side * chroma_side];
+            } else {
+                let around = neighbours.around(at, side);
+                luma_grid = read_inter_plane(
+                    dec,
+                    cdfs,
+                    luma_set_inter,
+                    scan_luma,
+                    0,
+                    around[0],
+                    mode_for_tx,
+                    y,
+                    px,
+                    py,
+                    side,
+                    base_q_idx,
+                    &pred_y,
+                )?;
+                u_grid = read_inter_plane(
+                    dec,
+                    cdfs,
+                    chroma_set,
+                    scan_chroma,
+                    1,
+                    around[1],
+                    mode_for_tx,
+                    u,
+                    cpx,
+                    cpy,
+                    chroma_side,
+                    base_q_idx,
+                    &pred_u,
+                )?;
+                v_grid = read_inter_plane(
+                    dec,
+                    cdfs,
+                    chroma_set,
+                    scan_chroma,
+                    2,
+                    around[2],
+                    mode_for_tx,
+                    v,
+                    cpx,
+                    cpy,
+                    chroma_side,
+                    base_q_idx,
+                    &pred_v,
+                )?;
+            }
+        } else {
         let ref_frame = read_single_ref(dec, cdfs, neighbours.above_ref[c], neighbours.left_ref[r]);
         ref_frame_for_lf = ref_frame;
         // round 4-9 (lane-av1golden..lane-av1golden7): GOLDEN_FRAME's own
@@ -4460,6 +4838,7 @@ fn decode_inter_block(
                 &pred_v,
             )?;
         }
+        }
     } else {
         let mode = dec.symbol(&mut cdfs.y_mode[size_group]);
         if mode >= 13 {
@@ -4615,6 +4994,9 @@ fn decode_inter_block(
     }
     neighbours.record(at, side, mode_for_tx, &[luma_grid, u_grid, v_grid]);
     neighbours.record_inter(at, side, skip, is_inter, ref_frame_for_lf, block_filter);
+    if let Some((group_idx, idx)) = compound_ctx {
+        neighbours.record_compound_ctx(at, side, group_idx, idx);
+    }
     neighbours.fill_skip_grid((r * (SUB / MI), c * (SUB / MI)), side / MI, skip);
     neighbours.fill_lf_grid(
         (r * (SUB / MI), c * (SUB / MI)),
@@ -5166,6 +5548,8 @@ pub fn decode_inter_frame_tile(
         [0; 7],
         None,
         reference_select,
+        false,
+        false,
     )
     .map(|(picture, _, _)| picture)
 }
@@ -5203,6 +5587,9 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     // lane-av1comp: this frame header's own `reference_select` bit, threaded
     // to every `decode_inter_block`/`decode_inter_block8` call below.
     reference_select: bool,
+    // lane-av1comp: `seq_params`' own compound-blend enable bits.
+    enable_masked_compound: bool,
+    enable_jnt_comp: bool,
 ) -> Result<(Picture, Cdfs, crate::motion_field::MotionField)> {
     let tpl_frame = tpl_field.map(|field| TplFrameArgs {
         field,
@@ -5400,6 +5787,11 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             enable_dual_filter,
                             tpl_frame.as_ref(),
                             reference_select,
+                            enable_masked_compound,
+                            enable_jnt_comp,
+                            order_hint_bits,
+                            order_hint,
+                            ref_order_hints,
                         )?;
                     }
                     PARTITION_SPLIT => {
@@ -5459,6 +5851,11 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     enable_dual_filter,
                                     tpl_frame.as_ref(),
                                     reference_select,
+                                    enable_masked_compound,
+                                    enable_jnt_comp,
+                                    order_hint_bits,
+                                    order_hint,
+                                    ref_order_hints,
                                 )?;
                             } else {
                                 let ctx16 = neighbours.partition_ctx(at16, SUB);
@@ -6231,6 +6628,11 @@ mod tests {
             false,
             None,
             false,
+            false,
+            false,
+            0,
+            0,
+            [0; 7],
         )
         .unwrap();
 
