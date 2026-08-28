@@ -290,9 +290,9 @@ fn levels_bits(
     cbf_ctx: usize,
     coded: bool,
     transform_skip: bool,
-) -> u64 {
+) -> f64 {
     enc.restore(base);
-    let before = enc.bit_count();
+    let before = enc.bit_count_f64();
     enc.encode_bin(cbf_ctx, u32::from(coded));
     if coded {
         encode_residual(
@@ -305,7 +305,7 @@ fn levels_bits(
             transform_skip,
         );
     }
-    enc.bit_count() - before
+    enc.bit_count_f64() - before
 }
 
 /// [`levels_bits`], given the header state instead of deriving it from
@@ -324,9 +324,9 @@ fn levels_bits_with(
     transform_skip: bool,
     last_full: i32,
     csbf: [bool; 64],
-) -> u64 {
+) -> f64 {
     enc.restore(base);
-    let before = enc.bit_count();
+    let before = enc.bit_count_f64();
     enc.encode_bin(cbf_ctx, u32::from(coded));
     if coded {
         encode_residual_with(
@@ -341,7 +341,7 @@ fn levels_bits_with(
             csbf,
         );
     }
-    enc.bit_count() - before
+    enc.bit_count_f64() - before
 }
 
 /// Rate-distortion quantisation of one transform block: each small level is
@@ -373,7 +373,7 @@ pub fn rdoq(
     let scale = coeff_ssd_scale(n);
     let lambda = RDOQ_LAMBDA * lambda;
     let base = enc.snapshot();
-    let base_bits = enc.bit_count();
+    let base_bits = enc.bit_count_f64();
     let err = |level: i32, coeff: i32| {
         let d = f64::from(dequant_level(level, n, qp) - coeff);
         d * d
@@ -554,7 +554,7 @@ pub fn rdoq(
                     g1,
                     &csbf_forced,
                 );
-                enc.bit_count() - base_bits
+                enc.bit_count_f64() - base_bits
             };
             let trial = scale * trial_dist + lambda * trial_bits as f64;
             if trial < cost {
