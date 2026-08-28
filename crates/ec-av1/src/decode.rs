@@ -4437,12 +4437,24 @@ fn decode_inter_block(
             let is_globalmv = compound_mode == 6; // GLOBAL_GLOBALMV
             let (py0, pu0, pv0) = ref_planes(ref0, ref_y, ref_u, ref_v, other_refs)?;
             let (py1, pu1, pv1) = ref_planes(ref1, ref_y, ref_u, ref_v, other_refs)?;
-            let above_filter_ctx = if neighbours.above_ref[c] == ref0 {
+            // spec `get_ref_filter_type`: matches when EITHER of the
+            // neighbour's two references equals this block's own ref0 --
+            // `above_ref1`/`left_ref1` is the neighbour's real second
+            // reference (`record_compound_ctx`) when it was itself a
+            // compound block; checking `above_ref`/`left_ref` alone drops a
+            // real filter match down to the "no neighbour" sentinel
+            // whenever the shared reference sits in the neighbour's SECOND
+            // slot (lane-av1idx r2).
+            let above_filter_ctx = if neighbours.above_ref[c] == ref0
+                || neighbours.above_ref1[c] == Some(ref0)
+            {
                 neighbours.above_filter[c]
             } else {
                 [3, 3]
             };
-            let left_filter_ctx = if neighbours.left_ref[r] == ref0 {
+            let left_filter_ctx = if neighbours.left_ref[r] == ref0
+                || neighbours.left_ref1[r] == Some(ref0)
+            {
                 neighbours.left_filter[r]
             } else {
                 [3, 3]
@@ -4684,13 +4696,6 @@ fn decode_inter_block(
             // Re-masking: see that fixture + `scratch_isolate_pinned_mismatch`
             // (`EC_AV1_PIN=fixtures/av1idx-refsel-pin.obu EC_AV1_PIN_N=20`)
             // for the next round's starting point.
-            return Err(unsupported(
-                "a COMPOUND_REFERENCE 16x16 leaf using the plain/distance-weighted \
-                 average blend (comp_group_idx == 0) -- proven non-pixel-exact against \
-                 real aomenc streams beyond the bugs lane-av1blend r6/r7 and lane-av1idx \
-                 r1 fixed (wide gate sweep, fixtures/av1idx-refsel-pin.obu)",
-            ));
-            #[allow(unreachable_code)]
             let (fwd_offset, bck_offset, compound_idx) = if !skip_mode && enable_jnt_comp {
                 let idx_ctx = get_comp_index_context(
                     neighbours,
@@ -4750,6 +4755,20 @@ fn decode_inter_block(
                     interp_fixed
                 );
             }
+            if std::env::var_os("EC_AV1_SREF_DUMP").is_some() {
+                let fidx = R17_DUMP_FRAME_IDX.load(std::sync::atomic::Ordering::Relaxed);
+                eprintln!(
+                    "CREF fidx={fidx} mi_row={} mi_col={} side={side} ref0={ref0} ref1={ref1} \
+                     above_ref={} left_ref={} above_ref1={:?} left_ref1={:?} \
+                     above_filter_ctx={above_filter_ctx:?} left_filter_ctx={left_filter_ctx:?}",
+                    py / 4,
+                    px / 4,
+                    neighbours.above_ref[c],
+                    neighbours.left_ref[r],
+                    neighbours.above_ref1[c],
+                    neighbours.left_ref1[r],
+                );
+            }
             let (h_filter, v_filter, resolved_filter) = resolve_interp_filter(
                 dec,
                 cdfs,
@@ -4761,6 +4780,14 @@ fn decode_inter_block(
                 true,
             );
             block_filter = resolved_filter;
+            if std::env::var_os("EC_AV1_SREF_DUMP").is_some() {
+                let fidx = R17_DUMP_FRAME_IDX.load(std::sync::atomic::Ordering::Relaxed);
+                eprintln!(
+                    "CREF_RESOLVED fidx={fidx} mi_row={} mi_col={} resolved={resolved_filter:?}",
+                    py / 4,
+                    px / 4,
+                );
+            }
 
             let mut inter0_y = vec![0i32; side * side];
             mc::predict_compound_intermediate(
@@ -5064,16 +5091,37 @@ fn decode_inter_block(
             // exactly like an intra neighbour. Without this gate, a GOLDEN_FRAME
             // block next to a LAST_FRAME one inherits that neighbour's filter
             // choice into its own context, corrupting the symbol it reads.
-            let above_filter_ctx = if neighbours.above_ref[c] == ref_frame {
+            // lane-av1idx r2: also match on the neighbour's SECOND reference
+            // (`above_ref1`/`left_ref1`, real for a compound neighbour) --
+            // see the 16x16 leaf's own comment above for the spec citation.
+            let above_filter_ctx = if neighbours.above_ref[c] == ref_frame
+                || neighbours.above_ref1[c] == Some(ref_frame)
+            {
                 neighbours.above_filter[c]
             } else {
                 [3, 3]
             };
-            let left_filter_ctx = if neighbours.left_ref[r] == ref_frame {
+            let left_filter_ctx = if neighbours.left_ref[r] == ref_frame
+                || neighbours.left_ref1[r] == Some(ref_frame)
+            {
                 neighbours.left_filter[r]
             } else {
                 [3, 3]
             };
+            if std::env::var_os("EC_AV1_SREF_DUMP").is_some() {
+                let fidx = R17_DUMP_FRAME_IDX.load(std::sync::atomic::Ordering::Relaxed);
+                eprintln!(
+                    "SREF fidx={fidx} mi_row={} mi_col={} side={side} ref_frame={ref_frame} \
+                     above_ref={} left_ref={} above_ref1={:?} left_ref1={:?} \
+                     above_filter_ctx={above_filter_ctx:?} left_filter_ctx={left_filter_ctx:?}",
+                    py / 4,
+                    px / 4,
+                    neighbours.above_ref[c],
+                    neighbours.left_ref[r],
+                    neighbours.above_ref1[c],
+                    neighbours.left_ref1[r],
+                );
+            }
             let (h_filter, v_filter, resolved_filter) = resolve_interp_filter(
                 dec,
                 cdfs,
@@ -5084,6 +5132,14 @@ fn decode_inter_block(
                 left_filter_ctx,
                 false,
             );
+            if std::env::var_os("EC_AV1_SREF_DUMP").is_some() {
+                let fidx = R17_DUMP_FRAME_IDX.load(std::sync::atomic::Ordering::Relaxed);
+                eprintln!(
+                    "SREF_RESOLVED fidx={fidx} mi_row={} mi_col={} resolved={resolved_filter:?}",
+                    py / 4,
+                    px / 4,
+                );
+            }
             block_filter = resolved_filter;
             globalmv_for_lf = is_globalmv;
             if std::env::var_os("EC_AV1_TRACE").is_some() {
@@ -5602,14 +5658,6 @@ fn decode_inter_block8(
                 // compound_idx defect surfaces on the wide gate sweep.
                 // lane-av1idx r1: same re-mask as the 16x16 leaf above --
                 // see that comment.
-                return Err(unsupported(
-                    "a COMPOUND_REFERENCE 8x8 leaf using the plain/distance-weighted \
-                     average blend (comp_group_idx == 0) -- proven non-pixel-exact \
-                     against real aomenc streams beyond the bugs lane-av1blend r6/r7 \
-                     and lane-av1idx r1 fixed (wide gate sweep, \
-                     fixtures/av1idx-refsel-pin.obu)",
-                ));
-                #[allow(unreachable_code)]
                 let (fwd_offset, bck_offset, compound_idx) = if !skip_mode && enable_jnt_comp {
                     let idx_ctx = get_comp_index_context(
                         neighbours,
