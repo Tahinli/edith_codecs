@@ -37,6 +37,13 @@ pub(crate) enum TxbSet {
     /// reads, but its own two-symbol `tx_type` table rather than `Luma16`'s
     /// five-symbol, mode-indexed one.
     Luma16Inter,
+    /// [`Luma16Inter`](TxbSet::Luma16Inter)'s `reduced_tx_set: false`
+    /// counterpart (lane-cdffwd2, root-caused off `cdfflake-stream-seed45`):
+    /// the same coefficient tables, but the twelve-symbol
+    /// `EXT_TX_SET_DTT9_IDTX_1DDCT` `tx_type` table
+    /// ([`crate::cdf::INTER_TX_TYPE_SET2_16`]) rather than `Luma16Inter`'s
+    /// two-symbol reduced one.
+    Luma16InterSet1,
     /// The 8x8 luma transform of an intra 8x8 leaf under a straddling 16x16
     /// block (lane-av1-rect). An `is_inter` leaf reads
     /// [`Luma8Inter`](TxbSet::Luma8Inter) instead.
@@ -55,6 +62,10 @@ pub(crate) enum TxbSet {
     /// adapted table from the 16x16 and 32x32 sizes' own entries in the same
     /// set, per `entropymode.c`).
     Luma8Inter,
+    /// [`Luma8Inter`](TxbSet::Luma8Inter)'s `reduced_tx_set: false`
+    /// counterpart (lane-cdffwd2): the sixteen-symbol `EXT_TX_SET_ALL16`
+    /// `tx_type` table ([`crate::cdf::INTER_TX_TYPE_SET1_8`]).
+    Luma8InterSet1,
     /// The 4x4 luma transform of a `TxMode::Select` 8x8 leaf or 16x16 block
     /// whose `tx_depth` resolves all the way down (lane-av1tx4). An
     /// `is_inter` block has no writer path yet, so this crate has no
@@ -287,6 +298,14 @@ pub(crate) struct Cdfs {
     /// `reduced_tx_set` (spec `TX_SET_INTER_3`, `TX_8X8` row) -- not indexed
     /// by mode, same as [`Self::inter_tx_type_32`] (lane-av1inter8).
     pub inter_tx_type_8: [u16; 3],
+    /// [`Self::inter_tx_type_16`]'s `reduced_tx_set: false` counterpart
+    /// (lane-cdffwd2): the twelve-symbol `EXT_TX_SET_DTT9_IDTX_1DDCT` row,
+    /// not indexed by mode.
+    pub inter_tx_type_16_set2: [u16; 13],
+    /// [`Self::inter_tx_type_8`]'s `reduced_tx_set: false` counterpart
+    /// (lane-cdffwd2): the sixteen-symbol `EXT_TX_SET_ALL16` row, not
+    /// indexed by mode.
+    pub inter_tx_type_8_set1: [u16; 17],
     /// The DC sign of a chroma coefficient, shared by both chroma sets.
     pub dc_sign_chroma: [[u16; 3]; 3],
     /// Whether an inter frame's block is coded as intra.
@@ -522,6 +541,8 @@ impl Cdfs {
         reset1(&mut self.inter_tx_type_32);
         reset1(&mut self.inter_tx_type_16);
         reset1(&mut self.inter_tx_type_8);
+        reset1(&mut self.inter_tx_type_16_set2);
+        reset1(&mut self.inter_tx_type_8_set1);
         reset2(&mut self.dc_sign_chroma);
         reset2(&mut self.intra_inter);
         reset3(&mut self.single_ref);
@@ -955,6 +976,8 @@ impl Cdfs {
             inter_tx_type_32: cdf::INTER_TX_TYPE_SET3_32,
             inter_tx_type_16: cdf::INTER_TX_TYPE_SET3_16,
             inter_tx_type_8: cdf::INTER_TX_TYPE_SET3_8,
+            inter_tx_type_16_set2: cdf::INTER_TX_TYPE_SET2_16,
+            inter_tx_type_8_set1: cdf::INTER_TX_TYPE_SET1_8,
             dc_sign_chroma: cdf::DC_SIGN_CHROMA,
             intra_inter: cdf::INTRA_INTER,
             single_ref: cdf::SINGLE_REF,
@@ -1047,6 +1070,18 @@ impl Cdfs {
                 tx_type: Some(self.inter_tx_type_16.as_mut_slice()),
                 eob_pt_class1: None,
             },
+            TxbSet::Luma16InterSet1 => TxbTables {
+                side: 16,
+                txb_skip: &mut self.txb_skip_luma_16,
+                eob_pt: &mut self.eob_pt_256_luma,
+                eob_extra: &mut self.eob_extra_luma_16,
+                base: &mut self.base_luma_16,
+                base_eob: &mut self.base_eob_luma_16,
+                br: &mut self.br_luma_16,
+                dc_sign: &mut self.dc_sign_luma,
+                tx_type: Some(self.inter_tx_type_16_set2.as_mut_slice()),
+                eob_pt_class1: None,
+            },
             TxbSet::Luma8 => TxbTables {
                 side: 8,
                 txb_skip: &mut self.txb_skip_luma_8,
@@ -1106,6 +1141,18 @@ impl Cdfs {
                 dc_sign: &mut self.dc_sign_luma,
                 tx_type: Some(self.inter_tx_type_8.as_mut_slice()),
                 eob_pt_class1: None,
+            },
+            TxbSet::Luma8InterSet1 => TxbTables {
+                side: 8,
+                txb_skip: &mut self.txb_skip_luma_8,
+                eob_pt: &mut self.eob_pt_64_luma,
+                eob_extra: &mut self.eob_extra_luma_8,
+                base: &mut self.base_luma_8,
+                base_eob: &mut self.base_eob_luma_8,
+                br: &mut self.br_luma_8,
+                dc_sign: &mut self.dc_sign_luma,
+                tx_type: Some(self.inter_tx_type_8_set1.as_mut_slice()),
+                eob_pt_class1: Some(&mut self.eob_pt_64_luma_class1),
             },
             TxbSet::Chroma8 => TxbTables {
                 side: 8,
