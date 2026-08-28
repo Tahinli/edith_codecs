@@ -62,6 +62,11 @@ pub(crate) fn filter_intra_hits() -> usize {
 /// before/after counter pattern as [`FILTER_INTRA_HITS`], proving a stream
 /// exercised `apply_deblock` rather than every edge landing on level 0.
 static DEBLOCK_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// lane-comppin r4: decode-order picture counter for `EC_AV1_PREFILT_DUMP`,
+/// mirroring stream.rs's `pictures_decoded` so the two dumps index
+/// identically against aomdec's own `ec_frame_idx` in decodeframe.c.
+static PREFILT_PICTURE_IDX: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// Current value of [`DEBLOCK_HITS`].
 pub(crate) fn deblock_hits() -> usize {
@@ -545,6 +550,10 @@ fn read_eob(dec: &mut SymbolDecoder, coding: &mut TxbTables, class: TxClass) -> 
         (TxClass::TwoD, _) | (_, None) => coding.eob_pt,
         (_, Some(class1)) => class1,
     };
+    if std::env::var_os("EC_AV1_EOBPT_CDF").is_some() && eob_pt.len() == 12 {
+        let (range, value) = dec.debug_state();
+        eprintln!("EC_AV1_EOBPT_CDF {eob_pt:?} range={range} value={value}");
+    }
     let group = dec.symbol(eob_pt) + 1;
     if trace {
         eprintln!("TRACE eob_pt value={group}");
@@ -614,9 +623,23 @@ fn read_coeffs(
     let trace = std::env::var_os("EC_AV1_TRACE").is_some();
     let side = coding.side;
     let mut grid = vec![0i32; side * side];
+    if std::env::var_os("EC_AV1_EOBPT_CDF").is_some() {
+        let (range, value) = dec.debug_state();
+        eprintln!("EC_AV1_STATE_BEFORE_TXBSKIP range={range} value={value}");
+    }
     let all_zero = dec.symbol(&mut coding.txb_skip[skip_ctx]) == 1;
+    if std::env::var_os("EC_AV1_TELL").is_some() {
+        eprintln!(
+            "TELL label=post_txb_skip ctx={skip_ctx} all_zero={} tell={} range={}",
+            all_zero as u8, dec.debug_bitpos(), dec.debug_state().0
+        );
+    }
     if trace {
         eprintln!("TRACE all_zero ctx={skip_ctx} value={}", all_zero as i32);
+    }
+    if std::env::var_os("EC_AV1_EOBPT_CDF").is_some() {
+        let (range, value) = dec.debug_state();
+        eprintln!("EC_AV1_STATE_AFTER_TXBSKIP range={range} value={value}");
     }
     if all_zero {
         return Ok((grid, TxType::DctDct));
@@ -632,7 +655,14 @@ fn read_coeffs(
         // share their symbol order with (`Tx_Type_Inter_Inv_Set3`'s two
         // members are a prefix of `Tx_Type_Intra_Inv_Set2`'s five).
         let len = tx_type_cdf.len();
+        if std::env::var_os("EC_AV1_EOBPT_CDF").is_some() && len == 3 {
+            eprintln!("EC_AV1_TXTYPE32_CDF {tx_type_cdf:?}");
+        }
         let t = dec.symbol(tx_type_cdf);
+        if std::env::var_os("EC_AV1_EOBPT_CDF").is_some() {
+            let (range, value) = dec.debug_state();
+            eprintln!("EC_AV1_STATE_AFTER_TXTYPE range={range} value={value}");
+        }
         if trace {
             eprintln!("TRACE tx_type value={t} len={len}");
         }
@@ -3613,6 +3643,22 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         }
     }
 
+    // lane-comppin r4: pre-loop-filter decode-order dump, matching aomdec's
+    // own EC_AV1_PREFILT_DUMP shape (decodeframe.c ~5451) -- diffs against
+    // that isolate whether a decode-order frame's mismatch already exists
+    // in reconstruction (this dump) vs is introduced by the loop filter
+    // (EC_AV1_DECODE_ORDER_DUMP's post-filter dump).
+    if let Ok(path) = std::env::var("EC_AV1_PREFILT_DUMP") {
+        use std::io::Write;
+        let idx = PREFILT_PICTURE_IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Ok(mut f) = std::fs::File::create(format!("{path}.f{idx}")) {
+            let _ = f.write_all(&y.data);
+            let _ = f.write_all(&u.data);
+            let _ = f.write_all(&v.data);
+        }
+    } else {
+        PREFILT_PICTURE_IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
     apply_deblock(&mut y, &mut u, &mut v, loop_filter, &neighbours);
     apply_cdef(&mut y, &mut u, &mut v, cdef, &neighbours);
 
@@ -3761,12 +3807,21 @@ fn read_mv_component(
     dec: &mut SymbolDecoder,
     c: &mut MvComponentCdfs,
     allow_high_precision_mv: bool,
+    force_integer_mv: bool,
 ) -> i32 {
     let sign = dec.symbol(&mut c.sign);
     let class = dec.symbol(&mut c.class);
     let local = if class == 0 {
         let bit = dec.symbol(&mut c.class0_bit);
-        let fr = dec.symbol(&mut c.class0_fr[bit]);
+        // spec 5.11.32 `mv_class0_fr`: not coded at all when the frame
+        // forces integer motion vectors -- implicitly `3` (the top
+        // fractional value) rather than read, else every symbol after it
+        // in the tile desyncs by one read.
+        let fr = if force_integer_mv {
+            3
+        } else {
+            dec.symbol(&mut c.class0_fr[bit])
+        };
         // spec 5.11.32 `mv_class0_hp`: read only when the frame allows
         // high-precision motion vectors, else implicitly 1 (the low bit
         // stays at half-pel precision) -- this crate's own writer always
@@ -3782,7 +3837,9 @@ fn read_mv_component(
         for i in 0..class {
             d |= dec.symbol(&mut c.bit[i]) << i;
         }
-        let fr = dec.symbol(&mut c.fr);
+        // spec 5.11.32 `mv_fr`: same force_integer_mv carve-out as
+        // `mv_class0_fr` above.
+        let fr = if force_integer_mv { 3 } else { dec.symbol(&mut c.fr) };
         let hp = if allow_high_precision_mv {
             dec.symbol(&mut c.hp)
         } else {
@@ -3802,14 +3859,15 @@ fn read_mv(
     mv_joint: &mut [u16; 5],
     pred: (i32, i32),
     allow_high_precision_mv: bool,
+    force_integer_mv: bool,
 ) -> (i32, i32) {
     let joint = dec.symbol(mv_joint);
     let mut diff = (0, 0);
     if joint == 2 || joint == 3 {
-        diff.0 = read_mv_component(dec, &mut mv_comp[0], allow_high_precision_mv);
+        diff.0 = read_mv_component(dec, &mut mv_comp[0], allow_high_precision_mv, force_integer_mv);
     }
     if joint == 1 || joint == 3 {
-        diff.1 = read_mv_component(dec, &mut mv_comp[1], allow_high_precision_mv);
+        diff.1 = read_mv_component(dec, &mut mv_comp[1], allow_high_precision_mv, force_integer_mv);
     }
     (pred.0 + diff.0, pred.1 + diff.1)
 }
@@ -4435,6 +4493,7 @@ fn assign_compound_mv(
     comp_stack: &crate::mvstack::CompoundMvStack,
     mode: u8,
     allow_high_precision_mv: bool,
+    force_integer_mv: bool,
 ) -> ((i32, i32), (i32, i32)) {
     const NEAREST_NEARESTMV: u8 = 0;
     const NEAR_NEARMV: u8 = 1;
@@ -4487,6 +4546,7 @@ fn assign_compound_mv(
             &mut cdfs.mv_joint,
             base,
             allow_high_precision_mv,
+            force_integer_mv,
         )
     };
 
@@ -4554,6 +4614,7 @@ fn decode_inter_block(
     scan_chroma: &[u16],
     size_group: usize,
     allow_high_precision_mv: bool,
+    force_integer_mv: bool,
     interp_fixed: Option<mc::InterpFilterKind>,
     enable_dual_filter: bool,
     tpl_frame: Option<&TplFrameArgs>,
@@ -4605,9 +4666,30 @@ fn decode_inter_block(
     let (cpx, cpy) = (px / 2, py / 2);
     let chroma_side = side / 2;
 
+    if std::env::var_os("EC_AV1_TELL").is_some() {
+        eprintln!(
+            "TELL mi_row={} mi_col={} label=block_entry side={side} tell={} range={}",
+            r * SUB_MI as usize, c * SUB_MI as usize, dec.debug_bitpos(), dec.debug_state().0
+        );
+    }
     let skip_mode_ctx =
         usize::from(neighbours.above_skip_mode[c]) + usize::from(neighbours.left_skip_mode[r]);
+    // lane-comppin r3: skip_mode desync isolation -- dump ctx + the pre-read
+    // MSAC tell so it can be diffed against an equivalent hook in libaom's
+    // own `read_skip_mode`/`av1_get_skip_mode_context`.
+    if std::env::var_os("EC_AV1_SKIPMODE_DUMP").is_some() {
+        eprintln!(
+            "EC_SKIPMODE r={r} c={c} ctx={skip_mode_ctx} skip_mode_present={skip_mode_present} tell_before={}",
+            dec.debug_bitpos()
+        );
+    }
     let skip_mode = skip_mode_present && dec.symbol(&mut cdfs.skip_mode[skip_mode_ctx]) == 1;
+    if std::env::var_os("EC_AV1_SKIPMODE_DUMP").is_some() {
+        eprintln!(
+            "EC_SKIPMODE r={r} c={c} result={skip_mode} tell_after={}",
+            dec.debug_bitpos()
+        );
+    }
     if skip_mode {
         SKIP_MODE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
@@ -4619,6 +4701,12 @@ fn decode_inter_block(
     let (above_inter, left_inter) = (neighbours.above_inter[c], neighbours.left_inter[r]);
     let ii_ctx = intra_inter_ctx(has_above, has_left, above_inter, left_inter);
     let is_inter = skip_mode || dec.symbol(&mut cdfs.intra_inter[ii_ctx]) == 1;
+    if std::env::var_os("EC_AV1_TELL").is_some() {
+        eprintln!(
+            "TELL mi_row={} mi_col={} label=post_is_inter skip_mode={skip_mode} skip={skip} is_inter={is_inter} tell={} range={}",
+            r * SUB_MI as usize, c * SUB_MI as usize, dec.debug_bitpos(), dec.debug_state().0
+        );
+    }
 
     let mode_for_tx;
     let (luma_grid, u_grid, v_grid);
@@ -4653,6 +4741,12 @@ fn decode_inter_block(
             uni: neighbours.left_ref1[r]
                 .is_some_and(|r1| is_uni_comp_ref(neighbours.left_ref[r], r1)),
         });
+        if std::env::var_os("EC_AV1_COMPIDX_DUMP").is_some() {
+            eprintln!(
+                "EC_PRECOMP r={r} c={c} skip_mode={skip_mode} skip={skip} reference_select={reference_select} tell={}",
+                dec.debug_bitpos()
+            );
+        }
         let is_compound =
             skip_mode || (reference_select && read_comp_mode(dec, cdfs, above_nbr, left_nbr));
         if is_compound {
@@ -4710,6 +4804,7 @@ fn decode_inter_block(
                 &comp_stack,
                 compound_mode,
                 allow_high_precision_mv,
+                force_integer_mv,
             );
             let is_globalmv = compound_mode == 6; // GLOBAL_GLOBALMV
             let (py0, pu0, pv0) = ref_planes(ref0, ref_y, ref_u, ref_v, other_refs)?;
@@ -4999,6 +5094,12 @@ fn decode_inter_block(
                 (8, 8, 1u8)
             };
             compound_ctx = Some((ref1, comp_group_idx as u8, compound_idx));
+            if std::env::var_os("EC_AV1_COMPIDX_DUMP").is_some() {
+                eprintln!(
+                    "EC_COMPIDX mi_row={mi_row} mi_col={mi_col} bsize={side} mode={compound_mode} mv0=({},{}) mv1=({},{}) ref0={ref0} ref1={ref1} comp_group_idx={comp_group_idx} compound_idx={compound_idx} tell={}",
+                    mv0.0, mv0.1, mv1.0, mv1.1, dec.debug_bitpos()
+                );
+            }
 
             // spec 5.11.19/libaom `decodemv.c` 1575: `read_mb_interp_filter`
             // comes AFTER `read_compound_type` (the `comp_group_idx`/
@@ -5195,6 +5296,13 @@ fn decode_inter_block(
                     neighbours.left_ref1[r],
                 );
             ref_frame_for_lf = ref_frame;
+            if std::env::var_os("EC_AV1_TELL").is_some() {
+                let (mi_row, mi_col) = (r * SUB_MI as usize, c * SUB_MI as usize);
+                eprintln!(
+                    "TELL mi_row={mi_row} mi_col={mi_col} label=post_ref_frame ref={ref_frame} tell={} range={}",
+                    dec.debug_bitpos(), dec.debug_state().0
+                );
+            }
             // round 4-9 (lane-av1golden..lane-av1golden7): GOLDEN_FRAME's own
             // stacked defects (lf_level ref/mode-delta forwarding, the
             // switchable_interp ref-frame ctx gate, and a film-grain synthesis
@@ -5269,6 +5377,7 @@ fn decode_inter_block(
                         &mut cdfs.mv_joint,
                         base_mv,
                         allow_high_precision_mv,
+                        force_integer_mv,
                     ),
                     true,
                 )
@@ -5304,6 +5413,12 @@ fn decode_inter_block(
                 };
                 (mv, false)
             };
+            if std::env::var_os("EC_AV1_TELL").is_some() {
+                eprintln!(
+                    "TELL mi_row={mi_row} mi_col={mi_col} label=post_assign_mv tell={} range={}",
+                    dec.debug_bitpos(), dec.debug_state().0
+                );
+            }
             // lane-sb128 r4: `interintra` (spec 5.11.24; libaom
             // `decodemv.c` read_inter_block_mode_info ~1490-1510), placed
             // right after `assign_mv` and before `read_motion_mode` below --
@@ -5324,6 +5439,12 @@ fn decode_inter_block(
                          blended prediction unimplemented)",
                     ));
                 }
+            }
+            if std::env::var_os("EC_AV1_TELL").is_some() {
+                eprintln!(
+                    "TELL mi_row={mi_row} mi_col={mi_col} label=post_interintra tell={} range={}",
+                    dec.debug_bitpos(), dec.debug_state().0
+                );
             }
             // lane-motionmode round 1: `read_motion_mode` (spec 5.11.24;
             // libaom `decodemv.c` read_inter_block_mode_info, ~1520-1528),
@@ -5367,6 +5488,12 @@ fn decode_inter_block(
                     OBMC_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
+            if std::env::var_os("EC_AV1_TELL").is_some() {
+                eprintln!(
+                    "TELL mi_row={mi_row} mi_col={mi_col} label=post_motion_mode eligible={} tell={} range={}",
+                    motion_mode_eligible as u8, dec.debug_bitpos(), dec.debug_state().0
+                );
+            }
             // spec `get_ref_filter_type`: a neighbour's own filter only feeds
             // this block's switchable_interp context when that neighbour coded
             // the SAME reference frame this block is about to read -- a
@@ -5404,6 +5531,12 @@ fn decode_inter_block(
             );
             block_filter = resolved_filter;
             globalmv_for_lf = is_globalmv;
+            if std::env::var_os("EC_AV1_TELL").is_some() {
+                eprintln!(
+                    "TELL mi_row={mi_row} mi_col={mi_col} label=post_interp_filter tell={} range={}",
+                    dec.debug_bitpos(), dec.debug_state().0
+                );
+            }
             if std::env::var_os("EC_AV1_TRACE").is_some() {
                 eprintln!(
                     "EC_TRACE mi_row={mi_row} mi_col={mi_col} skip={} is_inter=1 mv=({},{}) is_new_mv={is_new_mv} bsize={side} ref={ref_frame} filter={:?} motion_mode_eligible={} obmc_selected={} tell={}",
@@ -5725,6 +5858,18 @@ fn decode_inter_block(
             )?;
         }
     }
+    // lane-comppin r9: end-of-block checkpoint -- everything between
+    // post_assign_mv and here (interintra, motion_mode, interp_filter, then
+    // every plane's coeffs) is unproven; a range mismatch here vs aomdec's
+    // equivalent post-content point (added at the matching call site)
+    // narrows the ladder to this block's own tail instead of the next
+    // block's partition read.
+    if std::env::var_os("EC_AV1_TELL").is_some() {
+        eprintln!(
+            "TELL mi_row={} mi_col={} label=block_end tell={} range={}",
+            r * SUB_MI as usize, c * SUB_MI as usize, dec.debug_bitpos(), dec.debug_state().0
+        );
+    }
     neighbours.record(at, side, mode_for_tx, &[luma_grid, u_grid, v_grid]);
     neighbours.record_inter(at, side, skip, is_inter, ref_frame_for_lf, block_filter, skip_mode);
     if let Some((ref1, group_idx, idx)) = compound_ctx {
@@ -5782,6 +5927,7 @@ fn decode_inter_block8(
     scan4: &[u16],
     prev_leaf: Option<((usize, usize), bool, bool)>,
     allow_high_precision_mv: bool,
+    force_integer_mv: bool,
     // lane-av1comp: see [`decode_inter_block`]'s own doc -- this leaf path
     // only ever tracks a coarse `LAST_FRAME`-or-intra neighbour shape (no
     // per-leaf `above_ref`/`left_ref` array exists here), so `comp_mode`'s
@@ -5934,6 +6080,7 @@ fn decode_inter_block8(
                     &comp_stack,
                     compound_mode,
                     allow_high_precision_mv,
+                    force_integer_mv,
                 );
 
                 // spec 5.11.25: same gating [`decode_inter_block`]'s own
@@ -5995,6 +6142,12 @@ fn decode_inter_block8(
                     (8, 8, 1u8)
                 };
                 compound_ctx8 = Some((ref0, ref1, comp_group_idx as u8, compound_idx));
+                if std::env::var_os("EC_AV1_COMPIDX_DUMP").is_some() {
+                    eprintln!(
+                        "EC_COMPIDX mi_row={mi_row} mi_col={mi_col} bsize=8 mode={compound_mode} mv0=({},{}) mv1=({},{}) ref0={ref0} ref1={ref1} comp_group_idx={comp_group_idx} compound_idx={compound_idx} tell={}",
+                        mv0.0, mv0.1, mv1.0, mv1.1, dec.debug_bitpos()
+                    );
+                }
 
                 let (py0, pu0, pv0) = ref_planes(ref0, ref_y, ref_u, ref_v, other_refs)?;
                 let (py1, pu1, pv1) = ref_planes(ref1, ref_y, ref_u, ref_v, other_refs)?;
@@ -6241,6 +6394,7 @@ fn decode_inter_block8(
                     &mut cdfs.mv_joint,
                     base_mv,
                     allow_high_precision_mv,
+                    force_integer_mv,
                 ),
                 true,
             )
@@ -6640,6 +6794,7 @@ pub fn decode_inter_frame_tile(
     cdef: &CdefParams,
     loop_filter: &LoopFilterParams,
     allow_high_precision_mv: bool,
+    force_integer_mv: bool,
     interp_fixed: Option<mc::InterpFilterKind>,
     enable_dual_filter: bool,
     reference_select: bool,
@@ -6657,6 +6812,7 @@ pub fn decode_inter_frame_tile(
         loop_filter,
         None,
         allow_high_precision_mv,
+        force_integer_mv,
         NO_SIGN_BIAS,
         interp_fixed,
         enable_dual_filter,
@@ -6695,6 +6851,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     loop_filter: &LoopFilterParams,
     initial_cdfs: Option<Cdfs>,
     allow_high_precision_mv: bool,
+    force_integer_mv: bool,
     sign_bias_table: SignBiasTable,
     interp_fixed: Option<mc::InterpFilterKind>,
     enable_dual_filter: bool,
@@ -6841,6 +6998,16 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
 
     let mut cdfs = initial_cdfs.unwrap_or_else(|| Cdfs::new(q_ctx_of(base_q_idx)));
     let mut dec = SymbolDecoder::new(data);
+    // lane-comppin r9: tile-entry range, the earliest point comparable
+    // against aomdec's own `r->ec.rng` right after `aom_reader_init` -- the
+    // first ladder rung before any symbol (partition or otherwise) is read.
+    if std::env::var_os("EC_AV1_TELL").is_some() {
+        eprintln!(
+            "TELL label=tile_init tell={} range={}",
+            dec.debug_bitpos(),
+            dec.debug_state().0
+        );
+    }
     let mut neighbours = Neighbours::new(
         cols as usize * 2,
         rows as usize * 2,
@@ -6925,6 +7092,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &scan16,
                             3,
                             allow_high_precision_mv,
+                            force_integer_mv,
                             interp_fixed,
                             enable_dual_filter,
                             tpl_frame.as_ref(),
@@ -6998,6 +7166,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     &scan8,
                                     2,
                                     allow_high_precision_mv,
+                                    force_integer_mv,
                                     interp_fixed,
                                     enable_dual_filter,
                                     tpl_frame.as_ref(),
@@ -7065,6 +7234,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                             &scan4,
                                             prev_leaf,
                                             allow_high_precision_mv,
+                                            force_integer_mv,
                                             reference_select,
                                             enable_masked_compound,
                                             enable_interintra_compound,
@@ -7131,6 +7301,22 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         }
     }
 
+    // lane-comppin r4: pre-loop-filter decode-order dump, matching aomdec's
+    // own EC_AV1_PREFILT_DUMP shape (decodeframe.c ~5451) -- diffs against
+    // that isolate whether a decode-order frame's mismatch already exists
+    // in reconstruction (this dump) vs is introduced by the loop filter
+    // (EC_AV1_DECODE_ORDER_DUMP's post-filter dump).
+    if let Ok(path) = std::env::var("EC_AV1_PREFILT_DUMP") {
+        use std::io::Write;
+        let idx = PREFILT_PICTURE_IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if let Ok(mut f) = std::fs::File::create(format!("{path}.f{idx}")) {
+            let _ = f.write_all(&y.data);
+            let _ = f.write_all(&u.data);
+            let _ = f.write_all(&v.data);
+        }
+    } else {
+        PREFILT_PICTURE_IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
     apply_deblock(&mut y, &mut u, &mut v, loop_filter, &neighbours);
     apply_cdef(&mut y, &mut u, &mut v, cdef, &neighbours);
 
@@ -7666,6 +7852,7 @@ mod tests {
                 &CdefParams::default(),
                 &LoopFilterParams::default(),
                 false,
+                false,
                 Some(mc::InterpFilterKind::Regular),
                 false,
                 false,
@@ -7847,6 +8034,7 @@ mod tests {
             &[],
             0,
             false,
+            false,
             Some(mc::InterpFilterKind::Regular),
             false,
             None,
@@ -7951,6 +8139,7 @@ mod tests {
                 [None; 8],
                 &CdefParams::default(),
                 &LoopFilterParams::default(),
+                false,
                 false,
                 Some(mc::InterpFilterKind::Regular),
                 false,
