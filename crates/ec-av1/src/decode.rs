@@ -7621,7 +7621,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                         // mi-granular `left_side_mi` rows of a last-block-in-
                         // tile strip leak 32-vs-16 only until the per-tile
                         // `Neighbours::new` reset.
-                        let at32 = (r32 as usize, c32 as usize);
+                        let at32 = at;
                         decode_inter_block(
                             &mut dec,
                             &mut cdfs,
@@ -7666,13 +7666,13 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             allow_warped_motion,
                             true,
                         )?;
-                        if (r32 + 1) as u32 * SUB_MI < mi_rows {
+                        if (r32 * 2 + 1) as u32 * SUB_MI < mi_rows {
                             decode_inter_block(
                                 &mut dec,
                                 &mut cdfs,
                                 &mut neighbours,
                                 &mut grid,
-                                (r32 as usize + 1, c32 as usize),
+                            (r32 as usize * 2 + 1, c32 as usize * 2),
                                 SUB,
                                 mi_cols,
                                 mi_rows,
@@ -7715,13 +7715,13 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                 allow_warped_motion,
                                 false,
                             )?;
-                            if (c32 + 1) as u32 * SUB_MI < mi_cols {
+                            if (c32 * 2 + 1) as u32 * SUB_MI < mi_cols {
                                 decode_inter_block(
                                     &mut dec,
                                     &mut cdfs,
                                     &mut neighbours,
                                     &mut grid,
-                                    (r32 as usize + 1, c32 as usize + 1),
+                                    (r32 as usize * 2 + 1, c32 as usize * 2 + 1),
                                     SUB,
                                     mi_cols,
                                     mi_rows,
