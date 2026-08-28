@@ -4660,6 +4660,12 @@ fn decode_inter_block(
     let (cpx, cpy) = (px / 2, py / 2);
     let chroma_side = side / 2;
 
+    if std::env::var_os("EC_AV1_TELL").is_some() {
+        eprintln!(
+            "TELL mi_row={} mi_col={} label=block_entry side={side} tell={}",
+            r * SUB_MI as usize, c * SUB_MI as usize, dec.debug_bitpos()
+        );
+    }
     let skip_mode_ctx =
         usize::from(neighbours.above_skip_mode[c]) + usize::from(neighbours.left_skip_mode[r]);
     // lane-comppin r3: skip_mode desync isolation -- dump ctx + the pre-read
@@ -4689,6 +4695,12 @@ fn decode_inter_block(
     let (above_inter, left_inter) = (neighbours.above_inter[c], neighbours.left_inter[r]);
     let ii_ctx = intra_inter_ctx(has_above, has_left, above_inter, left_inter);
     let is_inter = skip_mode || dec.symbol(&mut cdfs.intra_inter[ii_ctx]) == 1;
+    if std::env::var_os("EC_AV1_TELL").is_some() {
+        eprintln!(
+            "TELL mi_row={} mi_col={} label=post_is_inter skip_mode={skip_mode} skip={skip} is_inter={is_inter} tell={}",
+            r * SUB_MI as usize, c * SUB_MI as usize, dec.debug_bitpos()
+        );
+    }
 
     let mode_for_tx;
     let (luma_grid, u_grid, v_grid);
@@ -5278,6 +5290,13 @@ fn decode_inter_block(
                     neighbours.left_ref1[r],
                 );
             ref_frame_for_lf = ref_frame;
+            if std::env::var_os("EC_AV1_TELL").is_some() {
+                let (mi_row, mi_col) = (r * SUB_MI as usize, c * SUB_MI as usize);
+                eprintln!(
+                    "TELL mi_row={mi_row} mi_col={mi_col} label=post_ref_frame ref={ref_frame} tell={}",
+                    dec.debug_bitpos()
+                );
+            }
             // round 4-9 (lane-av1golden..lane-av1golden7): GOLDEN_FRAME's own
             // stacked defects (lf_level ref/mode-delta forwarding, the
             // switchable_interp ref-frame ctx gate, and a film-grain synthesis
@@ -5388,6 +5407,12 @@ fn decode_inter_block(
                 };
                 (mv, false)
             };
+            if std::env::var_os("EC_AV1_TELL").is_some() {
+                eprintln!(
+                    "TELL mi_row={mi_row} mi_col={mi_col} label=post_assign_mv tell={}",
+                    dec.debug_bitpos()
+                );
+            }
             // lane-sb128 r4: `interintra` (spec 5.11.24; libaom
             // `decodemv.c` read_inter_block_mode_info ~1490-1510), placed
             // right after `assign_mv` and before `read_motion_mode` below --
