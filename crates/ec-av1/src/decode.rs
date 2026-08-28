@@ -205,6 +205,21 @@ pub(crate) fn obmc_hits_8() -> usize {
     OBMC_HITS_8.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// lane-rectgate r1: how many 32x32 quadrants actually decoded a
+/// `PARTITION_HORZ_B` split (the one extended/ab partition this decoder's
+/// inter-frame tile loop decodes -- `PARTITION_HORZ`/`VERT`/`HORZ_A`/`VERT_A`/
+/// `VERT_B` all still fall into the generic "a partition type this encoder
+/// never writes" refusal below) -- the gate's proof that a free-partition
+/// aomenc stream actually exercised a non-`NONE`/`SPLIT` partition rather than
+/// coincidentally never selecting one.
+static EXTENDED_PARTITION_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Current value of [`EXTENDED_PARTITION_HITS`].
+pub(crate) fn extended_partition_hits() -> usize {
+    EXTENDED_PARTITION_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// How many [`read_inter_compound_mode`] reads actually happened
 /// (lane-av1comp) -- proves a `COMPOUND_REFERENCE` block reached its own
 /// `compound_mode` symbol (past `comp_mode`/`comp_ref` and the compound
@@ -7792,6 +7807,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                         // mi-granular `left_side_mi` rows of a last-block-in-
                         // tile strip leak 32-vs-16 only until the per-tile
                         // `Neighbours::new` reset.
+                        EXTENDED_PARTITION_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let at32 = at;
                         decode_inter_block(
                             &mut dec,
