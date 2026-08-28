@@ -1107,9 +1107,12 @@ pub const INTER_TX_TYPE_SET3_8: [u16; 3] = [4167, 32768, 0];
 
 // The inter-frame tables below (spec 9.4) support the syntax an inter block
 // needs: whether it is coded as intra at all, which reference frame and
-// motion vector it takes when it is not. Compound reference and compound
-// prediction are not among them -- this encoder never sets
-// `reference_select`, so their CDFs are never read.
+// motion vector it takes when it is not. The compound-reference tables
+// (`COMP_MODE`/`COMP_REF_TYPE`/`UNI_COMP_REF`/`COMP_REF`/`COMP_BWDREF` above)
+// read once a frame's `reference_select` header bit is set (lane-av1comp);
+// compound *prediction* itself -- `inter_compound_mode`, compound DRL, the
+// mvstack's dual-ref scan, and distance-weighted MC blending -- is not yet
+// ported, so a block that actually reads `COMPOUND_REFERENCE` still refuses.
 
 /// `Default_Intra_Inter_Cdf` (spec 9.4): whether an inter frame's block is
 /// coded as intra, indexed by whether the block above and left are inter.
@@ -1148,6 +1151,55 @@ pub const SINGLE_REF: [[[u16; 3]; 6]; 3] = [
         [26875, 32768, 0],
         [30304, 32768, 0],
     ],
+];
+
+/// `Default_Comp_Mode_Cdf` (spec 9.4, `default_comp_inter_cdf`): whether an
+/// inter block reads `SINGLE_REFERENCE` or `COMPOUND_REFERENCE` -- only
+/// reached once `read_ref_frames` knows the frame's `reference_select`
+/// header bit made the choice per-block instead of fixing it, indexed by
+/// `av1_get_reference_mode_context` (lane-av1comp).
+pub const COMP_MODE: [[u16; 3]; 5] = [
+    [26828, 32768, 0],
+    [24035, 32768, 0],
+    [12031, 32768, 0],
+    [10640, 32768, 0],
+    [2901, 32768, 0],
+];
+
+/// `Default_Comp_Ref_Type_Cdf` (spec 9.4, `default_comp_ref_type_cdf`):
+/// unidirectional vs. bidirectional compound reference pair, indexed by
+/// `av1_get_comp_reference_type_context`.
+pub const COMP_REF_TYPE: [[u16; 3]; 5] = [
+    [1198, 32768, 0],
+    [2070, 32768, 0],
+    [9166, 32768, 0],
+    [7499, 32768, 0],
+    [22475, 32768, 0],
+];
+
+/// `Default_Uni_Comp_Ref_Cdf` (spec 9.4, `default_uni_comp_ref_cdf`): the
+/// three binary decisions narrowing a unidirectional compound pair down to
+/// one of `{BWDREF,ALTREF}`/`{LAST,LAST2}`/`{LAST,LAST3}`/`{LAST,GOLDEN}`.
+pub const UNI_COMP_REF: [[[u16; 3]; 3]; 3] = [
+    [[5284, 32768, 0], [3865, 32768, 0], [3128, 32768, 0]],
+    [[23152, 32768, 0], [14173, 32768, 0], [15270, 32768, 0]],
+    [[31774, 32768, 0], [25120, 32768, 0], [26710, 32768, 0]],
+];
+
+/// `Default_Comp_Ref_Cdf` (spec 9.4, `default_comp_ref_cdf`): the three
+/// binary decisions narrowing a bidirectional pair's forward reference.
+pub const COMP_REF: [[[u16; 3]; 3]; 3] = [
+    [[4946, 32768, 0], [9468, 32768, 0], [1503, 32768, 0]],
+    [[19891, 32768, 0], [22441, 32768, 0], [15160, 32768, 0]],
+    [[30731, 32768, 0], [31059, 32768, 0], [27544, 32768, 0]],
+];
+
+/// `Default_Comp_Bwdref_Cdf` (spec 9.4, `default_comp_bwdref_cdf`): the two
+/// binary decisions narrowing a bidirectional pair's backward reference.
+pub const COMP_BWDREF: [[[u16; 3]; 2]; 3] = [
+    [[2235, 32768, 0], [1423, 32768, 0]],
+    [[17182, 32768, 0], [15175, 32768, 0]],
+    [[30606, 32768, 0], [30489, 32768, 0]],
 ];
 
 /// `Default_Y_Mode_Cdf` (spec 9.4): the thirteen luma intra modes of an inter

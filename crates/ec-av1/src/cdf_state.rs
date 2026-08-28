@@ -293,6 +293,18 @@ pub(crate) struct Cdfs {
     pub intra_inter: [[u16; 3]; 4],
     /// The six binary decisions of an inter block's single reference frame.
     pub single_ref: [[[u16; 3]; 6]; 3],
+    /// Whether a block reads `SINGLE_REFERENCE` or `COMPOUND_REFERENCE`
+    /// (lane-av1comp, spec 5.11.25's `comp_mode`).
+    pub comp_mode: [[u16; 3]; 5],
+    /// Unidirectional vs. bidirectional compound reference pair
+    /// (lane-av1comp, spec 5.11.25's `comp_reference_type`).
+    pub comp_ref_type: [[u16; 3]; 5],
+    /// The three binary decisions of a unidirectional compound pair.
+    pub uni_comp_ref: [[[u16; 3]; 3]; 3],
+    /// The three binary decisions of a bidirectional pair's forward ref.
+    pub comp_ref: [[[u16; 3]; 3]; 3],
+    /// The two binary decisions of a bidirectional pair's backward ref.
+    pub comp_bwdref: [[[u16; 3]; 2]; 3],
     /// The luma mode of an inter frame's intra block, by its size group.
     pub y_mode: [[u16; 14]; 4],
     /// Whether an inter block codes its motion vector explicitly.
@@ -500,6 +512,11 @@ impl Cdfs {
         reset2(&mut self.dc_sign_chroma);
         reset2(&mut self.intra_inter);
         reset3(&mut self.single_ref);
+        reset2(&mut self.comp_mode);
+        reset2(&mut self.comp_ref_type);
+        reset3(&mut self.uni_comp_ref);
+        reset3(&mut self.comp_ref);
+        reset3(&mut self.comp_bwdref);
         reset2(&mut self.y_mode);
         reset2(&mut self.new_mv);
         reset2(&mut self.zero_mv);
@@ -924,6 +941,11 @@ impl Cdfs {
             dc_sign_chroma: cdf::DC_SIGN_CHROMA,
             intra_inter: cdf::INTRA_INTER,
             single_ref: cdf::SINGLE_REF,
+            comp_mode: cdf::COMP_MODE,
+            comp_ref_type: cdf::COMP_REF_TYPE,
+            uni_comp_ref: cdf::UNI_COMP_REF,
+            comp_ref: cdf::COMP_REF,
+            comp_bwdref: cdf::COMP_BWDREF,
             y_mode: cdf::Y_MODE,
             new_mv: cdf::NEW_MV,
             zero_mv: cdf::ZERO_MV,
@@ -1171,6 +1193,11 @@ mod tests {
         assert_eq!(cdfs.partition_w64[2], cdf::PARTITION_W64[2]);
         assert_eq!(cdfs.intra_inter, cdf::INTRA_INTER);
         assert_eq!(cdfs.single_ref, cdf::SINGLE_REF);
+        assert_eq!(cdfs.comp_mode, cdf::COMP_MODE);
+        assert_eq!(cdfs.comp_ref_type, cdf::COMP_REF_TYPE);
+        assert_eq!(cdfs.uni_comp_ref, cdf::UNI_COMP_REF);
+        assert_eq!(cdfs.comp_ref, cdf::COMP_REF);
+        assert_eq!(cdfs.comp_bwdref, cdf::COMP_BWDREF);
         assert_eq!(cdfs.y_mode, cdf::Y_MODE);
         assert_eq!(cdfs.new_mv, cdf::NEW_MV);
         assert_eq!(cdfs.zero_mv, cdf::ZERO_MV);

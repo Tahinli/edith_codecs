@@ -1070,6 +1070,107 @@ pub(crate) fn single_ref_p6_ctx(above: Option<i8>, left: Option<i8>) -> usize {
     ref_ctx(above, left, &[BWDREF_FRAME], &[ALTREF2_FRAME])
 }
 
+/// `av1_get_pred_context_uni_comp_ref_p1`: `LAST2` vs. `LAST3`/`GOLDEN`,
+/// conditioned on a unidirectional pair known to be one of the three
+/// `LAST`-anchored ones (lane-av1comp).
+pub(crate) fn uni_comp_ref_p1_ctx(above: Option<i8>, left: Option<i8>) -> usize {
+    ref_ctx(above, left, &[LAST2_FRAME], &[LAST3_FRAME, GOLDEN_FRAME])
+}
+
+/// One neighbouring block's reference-frame shape, as
+/// [`reference_mode_ctx`]/[`comp_reference_type_ctx`] need it: `None` for an
+/// out-of-frame neighbour, `Some(ref0, None)` for an intra or single-ref
+/// inter block, `Some(ref0, Some(ref1))` for a compound one. `uni` is
+/// `ref1`'s meaning only when compound: whether the pair libaom's
+/// `has_uni_comp_refs` would call unidirectional (both refs on the same
+/// side of the current frame).
+#[derive(Clone, Copy)]
+pub(crate) struct NeighbourRef {
+    pub is_inter: bool,
+    pub ref0: i8,
+    pub ref1: Option<i8>,
+    pub uni: bool,
+}
+
+fn is_backward(r: i8) -> bool {
+    (BWDREF_FRAME..=ALTREF_FRAME).contains(&r)
+}
+
+/// `av1_get_reference_mode_context` (spec 5.11.25's `comp_mode` context,
+/// libaom `pred_common.c`): 5 contexts from how many of the above/left
+/// neighbours are themselves compound-predicted, and (when neither/one is)
+/// whether their single reference is a backward one.
+pub(crate) fn reference_mode_ctx(above: Option<NeighbourRef>, left: Option<NeighbourRef>) -> usize {
+    match (above, left) {
+        (Some(a), Some(l)) => match (a.ref1.is_some(), l.ref1.is_some()) {
+            (false, false) => usize::from(is_backward(a.ref0) ^ is_backward(l.ref0)),
+            (false, true) => 2 + usize::from(is_backward(a.ref0) || !a.is_inter),
+            (true, false) => 2 + usize::from(is_backward(l.ref0) || !l.is_inter),
+            (true, true) => 4,
+        },
+        (Some(e), None) | (None, Some(e)) => {
+            if e.ref1.is_some() {
+                3
+            } else {
+                usize::from(is_backward(e.ref0))
+            }
+        }
+        (None, None) => 1,
+    }
+}
+
+/// `av1_get_comp_reference_type_context` (spec 5.11.25's
+/// `comp_reference_type` context, libaom `pred_common.c`): 5 contexts from
+/// whether the above/left neighbours are intra, single-ref, unidirectional
+/// compound, or bidirectional compound.
+pub(crate) fn comp_reference_type_ctx(
+    above: Option<NeighbourRef>,
+    left: Option<NeighbourRef>,
+) -> usize {
+    match (above, left) {
+        (Some(a), Some(l)) => match (a.is_inter, l.is_inter) {
+            (false, false) => 2,
+            (false, true) | (true, false) => {
+                let inter = if a.is_inter { a } else { l };
+                if inter.ref1.is_none() {
+                    2
+                } else {
+                    1 + 2 * usize::from(inter.uni)
+                }
+            }
+            (true, true) => {
+                let (a_sg, l_sg) = (a.ref1.is_none(), l.ref1.is_none());
+                if a_sg && l_sg {
+                    1 + 2 * usize::from(!(is_backward(a.ref0) ^ is_backward(l.ref0)))
+                } else if a_sg || l_sg {
+                    let uni = if a_sg { l.uni } else { a.uni };
+                    if !uni {
+                        1
+                    } else {
+                        3 + usize::from(!(is_backward(a.ref0) ^ is_backward(l.ref0)))
+                    }
+                } else if !a.uni && !l.uni {
+                    0
+                } else if !a.uni || !l.uni {
+                    2
+                } else {
+                    3 + usize::from(!((a.ref0 == BWDREF_FRAME) ^ (l.ref0 == BWDREF_FRAME)))
+                }
+            }
+        },
+        (Some(e), None) | (None, Some(e)) => {
+            if !e.is_inter {
+                2
+            } else if e.ref1.is_none() {
+                2
+            } else {
+                4 * usize::from(e.uni)
+            }
+        }
+        (None, None) => 2,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1424,5 +1525,154 @@ mod tests {
 
         assert_eq!(stack.entries.len(), 1);
         assert_eq!(stack.entries[0].mv, (4, 4));
+    }
+
+    fn single(ref0: i8) -> NeighbourRef {
+        NeighbourRef {
+            is_inter: true,
+            ref0,
+            ref1: None,
+            uni: false,
+        }
+    }
+    fn comp(ref0: i8, ref1: i8, uni: bool) -> NeighbourRef {
+        NeighbourRef {
+            is_inter: true,
+            ref0,
+            ref1: Some(ref1),
+            uni,
+        }
+    }
+    fn intra() -> NeighbourRef {
+        NeighbourRef {
+            is_inter: false,
+            ref0: 0,
+            ref1: None,
+            uni: false,
+        }
+    }
+
+    /// `av1_get_reference_mode_context`, no edges available: libaom's `ctx
+    /// = 1` fallback.
+    #[test]
+    fn reference_mode_ctx_no_edges_is_one() {
+        assert_eq!(reference_mode_ctx(None, None), 1);
+    }
+
+    /// Both edges single-ref, same forward/backward-ness: `ctx = 0`; one of
+    /// each: `ctx = 1` (the XOR in libaom's `ctx = IS_BACKWARD(above) ^
+    /// IS_BACKWARD(left)`).
+    #[test]
+    fn reference_mode_ctx_single_single() {
+        assert_eq!(
+            reference_mode_ctx(Some(single(LAST_FRAME)), Some(single(LAST2_FRAME))),
+            0
+        );
+        assert_eq!(
+            reference_mode_ctx(Some(single(LAST_FRAME)), Some(single(BWDREF_FRAME))),
+            1
+        );
+    }
+
+    /// One edge compound, the other single forward: libaom's `2 +
+    /// IS_BACKWARD(above)` collapses to `2` here (forward, inter).
+    #[test]
+    fn reference_mode_ctx_single_and_compound() {
+        assert_eq!(
+            reference_mode_ctx(
+                Some(single(LAST_FRAME)),
+                Some(comp(LAST_FRAME, LAST2_FRAME, true))
+            ),
+            2
+        );
+        assert_eq!(
+            reference_mode_ctx(
+                Some(comp(LAST_FRAME, LAST2_FRAME, true)),
+                Some(single(LAST_FRAME))
+            ),
+            2
+        );
+    }
+
+    /// Both edges compound: libaom's fixed `ctx = 4`.
+    #[test]
+    fn reference_mode_ctx_compound_compound_is_four() {
+        assert_eq!(
+            reference_mode_ctx(
+                Some(comp(LAST_FRAME, LAST2_FRAME, true)),
+                Some(comp(BWDREF_FRAME, ALTREF_FRAME, true))
+            ),
+            4
+        );
+    }
+
+    /// `av1_get_comp_reference_type_context`, no edges: libaom's `ctx = 2`
+    /// fallback.
+    #[test]
+    fn comp_reference_type_ctx_no_edges_is_two() {
+        assert_eq!(comp_reference_type_ctx(None, None), 2);
+    }
+
+    /// Both edges intra: libaom's `ctx = 2`.
+    #[test]
+    fn comp_reference_type_ctx_intra_intra_is_two() {
+        assert_eq!(comp_reference_type_ctx(Some(intra()), Some(intra())), 2);
+    }
+
+    /// Both edges single/single: forward-vs-backward split doubles the same
+    /// way `single_ref_p1`'s own XOR does (libaom's `1 + 2 * !(a ^ l)`).
+    #[test]
+    fn comp_reference_type_ctx_single_single() {
+        assert_eq!(
+            comp_reference_type_ctx(Some(single(LAST_FRAME)), Some(single(LAST2_FRAME))),
+            3
+        );
+        assert_eq!(
+            comp_reference_type_ctx(Some(single(LAST_FRAME)), Some(single(BWDREF_FRAME))),
+            1
+        );
+    }
+
+    /// Both edges bidirectional compound: libaom's `ctx = 0`.
+    #[test]
+    fn comp_reference_type_ctx_bidir_bidir_is_zero() {
+        assert_eq!(
+            comp_reference_type_ctx(
+                Some(comp(LAST_FRAME, BWDREF_FRAME, false)),
+                Some(comp(LAST2_FRAME, ALTREF_FRAME, false))
+            ),
+            0
+        );
+    }
+
+    /// Both edges unidirectional compound: libaom's `3 + !(a==BWDREF ^
+    /// l==BWDREF)`.
+    #[test]
+    fn comp_reference_type_ctx_unidir_unidir() {
+        assert_eq!(
+            comp_reference_type_ctx(
+                Some(comp(LAST_FRAME, LAST2_FRAME, true)),
+                Some(comp(LAST_FRAME, LAST3_FRAME, true))
+            ),
+            4
+        );
+        assert_eq!(
+            comp_reference_type_ctx(
+                Some(comp(LAST_FRAME, LAST2_FRAME, true)),
+                Some(comp(BWDREF_FRAME, ALTREF_FRAME, true))
+            ),
+            3
+        );
+    }
+
+    /// `av1_get_pred_context_uni_comp_ref_p1`: `LAST2` beats `LAST3`/
+    /// `GOLDEN` in the vote, context 2 (libaom's `<` branch reversed --
+    /// fewer `a`s than `b`s is context 0, matching [`ref_ctx`]'s shared
+    /// convention).
+    #[test]
+    fn uni_comp_ref_p1_ctx_matches_ref_ctx_shape() {
+        assert_eq!(uni_comp_ref_p1_ctx(Some(LAST2_FRAME), None), 2);
+        assert_eq!(uni_comp_ref_p1_ctx(Some(LAST3_FRAME), None), 0);
+        assert_eq!(uni_comp_ref_p1_ctx(None, None), 1);
     }
 }
