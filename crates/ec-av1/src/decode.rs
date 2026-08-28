@@ -176,6 +176,19 @@ pub(crate) fn obmc_hits() -> usize {
 /// 8x8-leaf OBMC block apart from a 16x16+ one.
 static OBMC_HITS_8: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// lane-warp round 1: how many blocks resolved `motion_mode_allowed` to
+/// `WARPED_CAUSAL`-eligible (3-symbol read, `num_proj_ref >= 1` under
+/// `allow_warped_motion`) AND the symbol actually decoded to `WARPED_CAUSAL`
+/// -- the gate's proof that a fixture really exercises the alphabet this
+/// round changed, even though the block itself still refuses (warp
+/// estimation/filter not ported).
+static WARP_SELECTED_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Current value of [`WARP_SELECTED_HITS`].
+pub(crate) fn warp_selected_hits() -> usize {
+    WARP_SELECTED_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Current value of [`OBMC_HITS_8`].
 pub(crate) fn obmc_hits_8() -> usize {
     OBMC_HITS_8.load(std::sync::atomic::Ordering::Relaxed)
@@ -4107,6 +4120,165 @@ fn overlappable_left(
     out
 }
 
+/// `has_top_right` (`av1/common/mvref_common.c`), reduced to the
+/// square-block, fixed-64px-superblock case this decoder ever reaches: no
+/// rectangular partition (`VERT`/`HORZ`/`_4`/`VERT_A`) ever produces an
+/// inter leaf here (`xd->width == xd->height` always), so libaom's own
+/// rect-partition branches (`xd->width < xd->height`, `xd->width >
+/// xd->height`, `PARTITION_VERT_A`) never fire and are dropped. `bs` is the
+/// block's own side in 4x4 (`mi`) units.
+fn has_top_right(mi_row: usize, mi_col: usize, bs: usize) -> bool {
+    let sb_mi_size = SB_MI as usize;
+    let mask_row = mi_row & (sb_mi_size - 1);
+    let mask_col = mi_col & (sb_mi_size - 1);
+    if bs > sb_mi_size {
+        return false;
+    }
+    let mut has_tr = !((mask_row & bs != 0) && (mask_col & bs != 0));
+    let mut b = bs;
+    while b < sb_mi_size {
+        if mask_col & b != 0 {
+            if (mask_col & (2 * b) != 0) && (mask_row & (2 * b) != 0) {
+                has_tr = false;
+                break;
+            }
+        } else {
+            break;
+        }
+        b <<= 1;
+    }
+    has_tr
+}
+
+/// `av1_findSamples`' sample *count* only (`mvref_common.c`): the number of
+/// above/left/top-left/top-right neighbours (up to `LEAST_SQUARES_SAMPLES_MAX
+/// = 8`) that share this block's own single reference frame and are
+/// themselves single-ref -- exactly `mbmi->num_proj_ref`. The actual sample
+/// coordinates (`record_samples`, `pts`/`pts_inref`) feed the warp parameter
+/// *estimation* (`av1_find_projection`), not ported this round -- only the
+/// count is needed to resolve `motion_mode_allowed`'s `WARPED_CAUSAL` vs
+/// `OBMC_CAUSAL` alphabet choice (spec 5.11.24), so that's all this port
+/// keeps. `bw4` is the block's own side in 4x4 units (square, so also
+/// `bh4`; a real block's `xd->width`/`xd->height` in libaom are also mi
+/// units of that same square side here).
+fn num_proj_ref(
+    grid: &MiGrid,
+    mi_row: usize,
+    mi_col: usize,
+    bw4: usize,
+    mi_cols: usize,
+    mi_rows: usize,
+    ref_frame: i8,
+) -> u8 {
+    const MAX: u8 = 8;
+    let up_available = mi_row > 0;
+    let left_available = mi_col > 0;
+    let mut np = 0u8;
+    let single_ref_match = |info: &MiInfo| info.ref_frame == ref_frame && info.ref_frame1.is_none();
+    let mut do_tl = true;
+    let mut do_tr = true;
+
+    if up_available {
+        let above = grid.get(mi_row - 1, mi_col);
+        let superblock_width = above.map_or(1, |c| c.size).max(1);
+        if bw4 <= superblock_width {
+            let col_offset = -((mi_col % superblock_width) as isize);
+            if col_offset < 0 {
+                do_tl = false;
+            }
+            if col_offset + superblock_width as isize > bw4 as isize {
+                do_tr = false;
+            }
+            if let Some(info) = above {
+                if single_ref_match(info) {
+                    np += 1;
+                    if np >= MAX {
+                        return MAX;
+                    }
+                }
+            }
+        } else {
+            let mut i = 0usize;
+            let limit = bw4.min(mi_cols.saturating_sub(mi_col));
+            while i < limit {
+                let cell = grid.get(mi_row - 1, mi_col + i);
+                let sw = cell.map_or(1, |c| c.size).max(1);
+                if let Some(info) = cell {
+                    if single_ref_match(info) {
+                        np += 1;
+                        if np >= MAX {
+                            return MAX;
+                        }
+                    }
+                }
+                i += sw;
+            }
+        }
+    }
+
+    if left_available {
+        let left = grid.get(mi_row, mi_col - 1);
+        let superblock_height = left.map_or(1, |c| c.size).max(1);
+        if bw4 <= superblock_height {
+            let row_offset = -((mi_row % superblock_height) as isize);
+            if row_offset < 0 {
+                do_tl = false;
+            }
+            if let Some(info) = left {
+                if single_ref_match(info) {
+                    np += 1;
+                    if np >= MAX {
+                        return MAX;
+                    }
+                }
+            }
+        } else {
+            let mut i = 0usize;
+            let limit = bw4.min(mi_rows.saturating_sub(mi_row));
+            while i < limit {
+                let cell = grid.get(mi_row + i, mi_col - 1);
+                let sh = cell.map_or(1, |c| c.size).max(1);
+                if let Some(info) = cell {
+                    if single_ref_match(info) {
+                        np += 1;
+                        if np >= MAX {
+                            return MAX;
+                        }
+                    }
+                }
+                i += sh;
+            }
+        }
+    }
+
+    if do_tl && left_available && up_available {
+        if let Some(info) = grid.get(mi_row - 1, mi_col - 1) {
+            if single_ref_match(info) {
+                np += 1;
+                if np >= MAX {
+                    return MAX;
+                }
+            }
+        }
+    }
+
+    if do_tr && has_top_right(mi_row, mi_col, bw4) {
+        let tr_col = mi_col + bw4;
+        if mi_row > 0 && tr_col < mi_cols {
+            if let Some(info) = grid.get(mi_row - 1, tr_col) {
+                if single_ref_match(info) {
+                    np += 1;
+                    if np >= MAX {
+                        return MAX;
+                    }
+                }
+            }
+        }
+    }
+
+    np
+}
+
 /// `av1_get_obmc_mask` (`reconinter.c`): the per-position blend weight
 /// (`AOM_BLEND_A64` numerator, out of 64) for the neighbour's own
 /// contribution's *complement* -- i.e. `dst = (mask*orig + (64-mask)*nbr +
@@ -5474,18 +5646,37 @@ fn decode_inter_block(
                         .is_empty());
             let mut obmc_selected = false;
             if motion_mode_eligible {
-                if allow_warped_motion {
-                    return Err(unsupported(
-                        "a motion-variation-eligible block under allow_warped_motion=1 \
-                         (round 1 only reads the 2-symbol obmc_cdf; telling OBMC_CAUSAL \
-                         from WARPED_CAUSAL needs av1_findSamples, not ported)",
-                    ));
-                }
                 // `default_obmc_cdf`'s own index: square bsize 8/16/32/64 -> 0/1/2/3.
                 let bsize_idx = (side.trailing_zeros() - 3) as usize;
-                obmc_selected = dec.symbol(&mut cdfs.obmc[bsize_idx]) == 1;
-                if obmc_selected {
-                    OBMC_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // lane-warp round 1: `motion_mode_allowed` reads the 3-symbol
+                // `motion_mode_cdf` instead of the 2-symbol `obmc_cdf` exactly
+                // when `num_proj_ref >= 1` under `allow_warped_motion` (see
+                // `num_proj_ref`'s own doc -- only the *count* is ported,
+                // not the sample coordinates the warp estimation needs).
+                let warp_eligible = allow_warped_motion
+                    && num_proj_ref(grid, mi_row, mi_col, bw4, mi_cols as usize, mi_rows as usize, ref_frame) >= 1;
+                if warp_eligible {
+                    let mode = dec.symbol(&mut cdfs.motion_mode[bsize_idx]);
+                    match mode {
+                        0 => {}
+                        1 => {
+                            obmc_selected = true;
+                            OBMC_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        _ => {
+                            WARP_SELECTED_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            return Err(unsupported(
+                                "a block that coded WARPED_CAUSAL (motion_mode == 2): \
+                                 av1_find_projection/the affine warp filter are not \
+                                 ported, only motion_mode_allowed's alphabet choice is",
+                            ));
+                        }
+                    }
+                } else {
+                    obmc_selected = dec.symbol(&mut cdfs.obmc[bsize_idx]) == 1;
+                    if obmc_selected {
+                        OBMC_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
             }
             if std::env::var_os("EC_AV1_TELL").is_some() {
@@ -6445,18 +6636,36 @@ fn decode_inter_block8(
                 || !overlappable_left(grid, mi_row, mi_col, 2, mi_rows as usize, 1).is_empty());
         let mut obmc_selected = false;
         if motion_mode_eligible {
-            if allow_warped_motion {
-                return Err(unsupported(
-                    "a motion-variation-eligible 8x8 leaf under allow_warped_motion=1 \
-                     (round 3 only reads the 2-symbol obmc_cdf; telling OBMC_CAUSAL \
-                     from WARPED_CAUSAL needs av1_findSamples, not ported)",
-                ));
-            }
-            // `default_obmc_cdf`'s own index: square bsize 8/16/32/64 -> 0/1/2/3.
-            obmc_selected = dec.symbol(&mut cdfs.obmc[0]) == 1;
-            if obmc_selected {
-                OBMC_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                OBMC_HITS_8.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // lane-warp round 1: same 3-vs-2-symbol split as the 16x16+ leaf
+            // (see its own doc) -- this leaf is always `LAST_FRAME`-only
+            // (grid.set below hardcodes it).
+            let warp_eligible = allow_warped_motion
+                && num_proj_ref(grid, mi_row, mi_col, 2, mi_cols as usize, mi_rows as usize, LAST_FRAME) >= 1;
+            if warp_eligible {
+                let mode = dec.symbol(&mut cdfs.motion_mode[0]);
+                match mode {
+                    0 => {}
+                    1 => {
+                        obmc_selected = true;
+                        OBMC_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        OBMC_HITS_8.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    _ => {
+                        WARP_SELECTED_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return Err(unsupported(
+                            "an 8x8 leaf that coded WARPED_CAUSAL (motion_mode == 2): \
+                             av1_find_projection/the affine warp filter are not \
+                             ported, only motion_mode_allowed's alphabet choice is",
+                        ));
+                    }
+                }
+            } else {
+                // `default_obmc_cdf`'s own index: square bsize 8/16/32/64 -> 0/1/2/3.
+                obmc_selected = dec.symbol(&mut cdfs.obmc[0]) == 1;
+                if obmc_selected {
+                    OBMC_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    OBMC_HITS_8.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         }
         for dr in 0..2 {
