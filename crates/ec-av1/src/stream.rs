@@ -3298,15 +3298,15 @@ mod tests {
         );
     }
 
-    /// lane-motionmode round 1: `--enable-warped-motion=1` must be a NAMED
-    /// refusal, never a silent mis-decode -- this decoder does not port
-    /// `av1_findSamples`/`num_proj_ref`, so it cannot tell `OBMC_CAUSAL`
-    /// from `WARPED_CAUSAL` at an eligible block once the header allows
-    /// warp (see `decode_inter_block`'s own `allow_warped_motion` refusal).
-    /// Every attempt across the seed sweep must either name the refusal or
-    /// decode pixel-exact (an eligible block simply never fired in that
-    /// attempt) -- a silent pixel mismatch here would mean the refusal
-    /// failed to fire on a stream that actually needed it.
+    /// lane-warp r5e (flipped from lane-motionmode r1's refuses-or-matches):
+    /// `--enable-warped-motion=1` streams must DECODE pixel-exact --
+    /// `av1_findSamples`/`num_proj_ref`, the 3-symbol `motion_mode` read,
+    /// the affine projection/filter, and the WARPED_CAUSAL interp-filter
+    /// derivation are all ported. A refusal naming warp, or any pixel
+    /// mismatch, fails the gate; refusals for OTHER named capabilities
+    /// (screen content tools) still skip that seed. The sweep must also
+    /// actually exercise warp (`warp_selected_hits > 0`) so a decoder that
+    /// silently stops selecting WARPED_CAUSAL cannot pass vacuously.
     #[test]
     fn a_real_aomenc_stream_with_warped_motion_refuses_or_matches() {
         const NAME: &str = "a_real_aomenc_stream_with_warped_motion_refuses_or_matches";
@@ -3425,8 +3425,13 @@ mod tests {
                         msg.contains("unsupported"),
                         "{NAME} failed outright, not a named refusal (seed {seed}): {msg}"
                     );
+                    assert!(
+                        !msg.contains("warp"),
+                        "{NAME} refused on warp (seed {seed}) -- warp decode is ported, this \
+                         refusal must not exist: {msg}"
+                    );
                     named_refusals += 1;
-                    eprintln!("seed {seed} refusal: {msg}");
+                    eprintln!("seed {seed} refusal (non-warp capability): {msg}");
                     continue;
                 }
                 Ok(frames) => frames,
@@ -3442,18 +3447,23 @@ mod tests {
                 eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
             }
             for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                assert_eq!(
-                    got.y, want.y,
-                    "{NAME} frame {i} luma vs ffmpeg (seed {seed}) -- decoded without a named \
-                     refusal but mismatched, meaning the refusal failed to fire"
-                );
+                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
             }
             matched += 1;
         }
+        assert!(
+            matched > 0,
+            "{NAME}: every attempt refused on other capabilities; the gate never exercised warp"
+        );
+        assert!(
+            crate::decode::warp_selected_hits() > 0,
+            "{NAME}: {matched} matches but zero WARPED_CAUSAL blocks fired -- the gate decodes \
+             warp streams without ever selecting warp, so it proves nothing about warp"
+        );
         eprintln!(
-            "{NAME}: {named_refusals} named refusals, {matched} pixel-exact matches out of {n_attempts}, warp_selected_hits={}",
+            "{NAME}: {named_refusals} non-warp refusals, {matched} pixel-exact matches out of {n_attempts}, warp_selected_hits={}",
             crate::decode::warp_selected_hits()
         );
     }
