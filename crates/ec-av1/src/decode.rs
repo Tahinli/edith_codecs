@@ -2499,6 +2499,12 @@ fn cdef_filter_block(
 // aomdec's EC_AV1_PREFILT_DUMP/EC_AV1_POSTFILT_DUMP) to `$var.f$idx` when
 // `var` is set. Remove with the rest of the r17 bisect scaffolding.
 static R17_DUMP_FRAME_IDX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+// r17 bisect scratch accessor for stream.rs's own debug prints -- shares the
+// same counter block-decode already reads. Remove with the rest of the r17
+// bisect scaffolding.
+pub fn r17_dump_frame_idx() -> usize {
+    R17_DUMP_FRAME_IDX.load(std::sync::atomic::Ordering::Relaxed)
+}
 fn r17_dump(var: &str, y: &PlaneBuf, u: &PlaneBuf, v: &PlaneBuf, idx: usize) {
     let Ok(base) = std::env::var(var) else {
         return;
@@ -3877,25 +3883,32 @@ fn read_inter_plane(
 /// `reference_select` set before this is ever called, so that read is never
 /// needed here). `above_ref`/`left_ref` are `-1` for an intra/unavailable
 /// neighbour, else the `1..=7` reference that neighbour coded (lane-av1refs).
-fn read_single_ref(dec: &mut SymbolDecoder, cdfs: &mut Cdfs, above_ref: i8, left_ref: i8) -> i8 {
+fn read_single_ref(
+    dec: &mut SymbolDecoder,
+    cdfs: &mut Cdfs,
+    above_ref: i8,
+    above_ref1: Option<i8>,
+    left_ref: i8,
+    left_ref1: Option<i8>,
+) -> i8 {
     let above = (above_ref > 0).then_some(above_ref);
     let left = (left_ref > 0).then_some(left_ref);
-    let p1 = dec.symbol(&mut cdfs.single_ref[single_ref_p1_ctx(above, left)][0]);
+    let p1 = dec.symbol(&mut cdfs.single_ref[single_ref_p1_ctx(above, above_ref1, left, left_ref1)][0]);
     let ref_frame = if p1 == 1 {
-        let p2 = dec.symbol(&mut cdfs.single_ref[single_ref_p2_ctx(above, left)][1]);
+        let p2 = dec.symbol(&mut cdfs.single_ref[single_ref_p2_ctx(above, above_ref1, left, left_ref1)][1]);
         if p2 == 1 {
             ALTREF_FRAME
         } else {
-            let p6 = dec.symbol(&mut cdfs.single_ref[single_ref_p6_ctx(above, left)][5]);
+            let p6 = dec.symbol(&mut cdfs.single_ref[single_ref_p6_ctx(above, above_ref1, left, left_ref1)][5]);
             if p6 == 1 { ALTREF2_FRAME } else { BWDREF_FRAME }
         }
     } else {
-        let p3 = dec.symbol(&mut cdfs.single_ref[single_ref_p3_ctx(above, left)][2]);
+        let p3 = dec.symbol(&mut cdfs.single_ref[single_ref_p3_ctx(above, above_ref1, left, left_ref1)][2]);
         if p3 == 1 {
-            let p5 = dec.symbol(&mut cdfs.single_ref[single_ref_p5_ctx(above, left)][4]);
+            let p5 = dec.symbol(&mut cdfs.single_ref[single_ref_p5_ctx(above, above_ref1, left, left_ref1)][4]);
             if p5 == 1 { GOLDEN_FRAME } else { LAST3_FRAME }
         } else {
-            let p4 = dec.symbol(&mut cdfs.single_ref[single_ref_p4_ctx(above, left)][3]);
+            let p4 = dec.symbol(&mut cdfs.single_ref[single_ref_p4_ctx(above, above_ref1, left, left_ref1)][3]);
             if p4 == 1 { LAST2_FRAME } else { LAST_FRAME }
         }
     };
@@ -4051,19 +4064,26 @@ fn read_compound_ref_frames(
 ) -> (i8, i8) {
     let a = (above_ref > 0).then_some(above_ref);
     let l = (left_ref > 0).then_some(left_ref);
+    // libaom `av1_collect_neighbors_ref_counts` counts BOTH of a compound
+    // neighbour's references, not just its first -- `a1`/`l1` carry that
+    // second reference through to every vote below (lane-av1blend r6: a
+    // missing `a1`/`l1` here was decoding `compound_idx` off the wrong CDF
+    // row for a block sitting under a skip_mode-forced compound neighbour).
+    let a1 = above.and_then(|n| n.ref1);
+    let l1 = left.and_then(|n| n.ref1);
     let type_ctx = comp_reference_type_ctx(above, left);
     let unidir = dec.symbol(&mut cdfs.comp_ref_type[type_ctx]) == 0;
     if unidir {
         // uni_comp_ref (p0): forward vs. backward -- av1_get_pred_context_-
         // uni_comp_ref_p is single_ref_p1's own forward/backward vote.
-        let bit = dec.symbol(&mut cdfs.uni_comp_ref[single_ref_p1_ctx(a, l)][0]);
+        let bit = dec.symbol(&mut cdfs.uni_comp_ref[single_ref_p1_ctx(a, a1, l, l1)][0]);
         if bit == 1 {
             (BWDREF_FRAME, ALTREF_FRAME)
         } else {
-            let p1 = dec.symbol(&mut cdfs.uni_comp_ref[uni_comp_ref_p1_ctx(a, l)][1]);
+            let p1 = dec.symbol(&mut cdfs.uni_comp_ref[uni_comp_ref_p1_ctx(a, a1, l, l1)][1]);
             if p1 == 1 {
                 // uni_comp_ref_p2: LAST3 vs. GOLDEN, same vote as single_ref_p5.
-                let p2 = dec.symbol(&mut cdfs.uni_comp_ref[single_ref_p5_ctx(a, l)][2]);
+                let p2 = dec.symbol(&mut cdfs.uni_comp_ref[single_ref_p5_ctx(a, a1, l, l1)][2]);
                 if p2 == 1 {
                     (LAST_FRAME, GOLDEN_FRAME)
                 } else {
@@ -4075,21 +4095,21 @@ fn read_compound_ref_frames(
         }
     } else {
         // comp_ref (p0): LAST/LAST2 vs. LAST3/GOLDEN, same vote as single_ref_p3.
-        let bit0 = dec.symbol(&mut cdfs.comp_ref[single_ref_p3_ctx(a, l)][0]);
+        let bit0 = dec.symbol(&mut cdfs.comp_ref[single_ref_p3_ctx(a, a1, l, l1)][0]);
         let ref0 = if bit0 == 0 {
             // comp_ref_p1: LAST vs. LAST2, same vote as single_ref_p4.
-            let p1 = dec.symbol(&mut cdfs.comp_ref[single_ref_p4_ctx(a, l)][1]);
+            let p1 = dec.symbol(&mut cdfs.comp_ref[single_ref_p4_ctx(a, a1, l, l1)][1]);
             if p1 == 1 { LAST2_FRAME } else { LAST_FRAME }
         } else {
             // comp_ref_p2: LAST3 vs. GOLDEN, same vote as single_ref_p5.
-            let p2 = dec.symbol(&mut cdfs.comp_ref[single_ref_p5_ctx(a, l)][2]);
+            let p2 = dec.symbol(&mut cdfs.comp_ref[single_ref_p5_ctx(a, a1, l, l1)][2]);
             if p2 == 1 { GOLDEN_FRAME } else { LAST3_FRAME }
         };
         // comp_bwdref (p0): BWDREF/ALTREF2 vs. ALTREF, same vote as single_ref_p2.
-        let bit1 = dec.symbol(&mut cdfs.comp_bwdref[single_ref_p2_ctx(a, l)][0]);
+        let bit1 = dec.symbol(&mut cdfs.comp_bwdref[single_ref_p2_ctx(a, a1, l, l1)][0]);
         let ref1 = if bit1 == 0 {
             // comp_bwdref_p1: BWDREF vs. ALTREF2, same vote as single_ref_p6.
-            let p1 = dec.symbol(&mut cdfs.comp_bwdref[single_ref_p6_ctx(a, l)][1]);
+            let p1 = dec.symbol(&mut cdfs.comp_bwdref[single_ref_p6_ctx(a, a1, l, l1)][1]);
             if p1 == 1 { ALTREF2_FRAME } else { BWDREF_FRAME }
         } else {
             ALTREF_FRAME
@@ -4293,6 +4313,14 @@ fn decode_inter_block(
     let (cpx, cpy) = (px / 2, py / 2);
     let chroma_side = side / 2;
 
+    if std::env::var_os("EC_AV1_COMPIDX_DUMP").is_some() {
+        eprintln!(
+            "BITPOS_BLK_START mi_row={} mi_col={} bitpos={}",
+            py / 4,
+            px / 4,
+            dec.debug_bitpos()
+        );
+    }
     let skip_mode_ctx =
         usize::from(neighbours.above_skip_mode[c]) + usize::from(neighbours.left_skip_mode[r]);
     let skip_mode = skip_mode_present && dec.symbol(&mut cdfs.skip_mode[skip_mode_ctx]) == 1;
@@ -4412,16 +4440,6 @@ fn decode_inter_block(
             } else {
                 [3, 3]
             };
-            let (h_filter, v_filter, resolved_filter) = resolve_interp_filter(
-                dec,
-                cdfs,
-                interp_fixed,
-                enable_dual_filter,
-                is_globalmv,
-                above_filter_ctx,
-                left_filter_ctx,
-            );
-            block_filter = resolved_filter;
             globalmv_for_lf = is_globalmv;
             ref_frame_for_lf = ref0;
             mode_for_tx = 0;
@@ -4466,33 +4484,193 @@ fn decode_inter_block(
                      weighted/simple-average combine only, lane-av1comp",
                 ));
             }
-            // corner-cut (lane-av1comp r16/r17): a real aomenc stream
-            // (fixtures/av1comp-r16-compound-mismatch.obu, seed 42) proved
-            // predict_compound_intermediate/combine_compound wrong by up to
-            // 4/255 in a 32x32 quadrant, spilling a few pixels into
-            // neighbours. r16 called this "loop-filter-shaped"; r17
-            // FALSIFIED that -- dumping this decoder's own pre-deblock
-            // frame buffer (`r17_dump`, `EC_AV1_PREFILT_DUMP`) against
-            // aomdec's own `EC_AV1_PREFILT_DUMP` shows the same 32x32-
-            // quadrant mismatch already present *before* either decoder's
-            // loop filter runs (898/1024 px, rows 32-63 cols 32-63 of a
-            // 64x64 luma plane, frame index 2 zero-based / this decoder's
-            // 3rd frame) -- this is a `predict_compound_intermediate`/
-            // `combine_compound` reconstruction defect, not a deblock
-            // interaction. DRL/assign_compound_mv/dist_wtd_comp_weight_assign
-            // stay cross-checked bit-for-bit against libaom decodemv.c/
-            // reconinter.c (r16). Root cause still not isolated within this
-            // arithmetic; refuse by name rather than ship a non-pixel-exact
-            // compound blend. Ceiling: r13/r14's MC plumbing above this line
+            // corner-cut (lane-av1comp r16/r17, lane-av1blend r1): r16/r17
+            // called this a `predict_compound_intermediate`/`combine_compound`
+            // reconstruction defect. r1 FALSIFIED that hypothesis outright:
+            // unmasking and running the real gates
+            // (a_real_aomenc_stream_with_reference_select_reads_comp_mode_correctly,
+            // a_real_aomenc_stream_with_compound_references_decodes_pixel_exact)
+            // shows the plain-average blend is bit-exact *most of the time*
+            // -- `combine_compound`'s two-shift-in-one round2 was proven
+            // algebraically identical to libaom's separate
+            // `>>DIST_PRECISION_BITS`-then-`ROUND_POWER_OF_TWO` sequence
+            // (av1_dist_wtd_convolve_2d_c, convolve.c:402-415) for every
+            // input, and a whole-pel zero-MV compound block (mv0=mv1=(0,0),
+            // the common case a lag-in-frames GOP's hidden altref frames
+            // hit) reproduces aomdec's own pre-deblock `EC_AV1_PREFILT_DUMP`
+            // byte-for-byte for several consecutive frames.
+            //
+            // The real defect a live gate run isolated (seed 49,
+            // `fixtures/av1blend-r1-mismatch.obu`): decode-order frame 0
+            // (keyframe) and frame 1 (first hidden altref, `ref1 ==
+            // ALTREF_FRAME`) match aomdec's own pre-deblock dump byte for
+            // byte; decode-order frame 2 -- same shape, same zero MV, only
+            // difference `ref1 == BWDREF_FRAME` instead of `ALTREF_FRAME` --
+            // is the *first* frame to diverge (881/6144 luma+chroma bytes).
+            // Every later frame up through decode-order 9 also mismatches,
+            // *including* frame 8, whose four blocks are back to
+            // `ref1 == ALTREF_FRAME` only -- ruling out "BWDREF_FRAME's MC
+            // math is wrong" (that block's own math is proven exact) in
+            // favour of "the picture sitting in some DPB slot is already
+            // wrong by the time frame 2 reads it, and the corruption
+            // propagates through refresh_frame_flags into every later
+            // reference regardless of which named ref a later block picks".
+            // Frames 10 through 18 (once the GOP's lineage stops tracing
+            // back through the bad slot) are bit-exact again. This points at
+            // reference-slot bookkeeping (`ref_slots`/`refresh_frame_flags`
+            // in `stream.rs`'s `decode_stream`, or `ref_order_hints`/DPB
+            // indexing feeding `dist_wtd_comp_weight_assign`) around
+            // BWDREF_FRAME specifically, not at the MC/blend arithmetic in
+            // mc.rs. Not isolated further within lane-av1blend's budget --
+            // refuse by name rather than ship a blend that is right only
+            // sometimes. Ceiling: r13/r14's MC plumbing above this line
             // stays -- only the plain-average reconstruct is masked off
-            // again. Upgrade: bisect predict_compound_intermediate itself
-            // (subpel filter taps / rounding) against the pinned fixture's
-            // 3rd frame, quadrant rows 32-63 cols 32-63.
+            // again. Upgrade: instrument `ref_slots`/`refresh_frame_flags`
+            // per decode-order frame (which slot each `Frame` OBU refreshes,
+            // and which slot each `ref_frame_idx[BWDREF_FRAME - LAST_FRAME]`
+            // reads) against aomdec's own `RefCntBuffer` bookkeeping on
+            // `fixtures/av1blend-r1-mismatch.obu`, starting at decode-order
+            // frame 2.
+            //
+            // r2 (fresh fixture, seed 45, same recipe -- the original r1
+            // fixture is gitignored and could not be regenerated byte-exact):
+            // static review of `stream.rs`'s `ref_slots`/`refresh_frame_flags`/
+            // `cdf_slots` bookkeeping and the `show_existing_frame` refresh
+            // arm (spec 7.21: only refreshes on a shown KEY frame, which the
+            // parser already enforces at `frame.rs:791/815` -- `refresh_frame_flags`
+            // is forced 0 on every non-key `show_existing_frame`) turned up
+            // nothing wrong; `other_refs`/`ref_planes` slot indexing for
+            // `BWDREF_FRAME` is spec-correct too. A live unmasked run
+            // isolated a *different, smaller* shape than r1's: decode-order
+            // frame 3 (a `ref1 == BWDREF_FRAME`, zero-MV, simple-average
+            // compound block) is the first to diverge from ffmpeg (worst
+            // delta 1, luma only, clustered at 32-pixel block edges) even
+            // though BOTH its compound inputs -- the key frame and
+            // decode-order frame 2's own picture (`ref1 == ALTREF_FRAME`,
+            // itself proven bit-exact: it is later re-shown via
+            // `show_existing_frame` and matches ffmpeg exactly) -- are
+            // independently pixel-exact, and the blend arithmetic is the
+            // same proven-exact formula. That rules out "wrong slot"/"stale
+            // picture" for this fixture: the inputs are right, so the defect
+            // is in decode-order frame 3's *own* per-block decode (entropy
+            // desync from compound-CDF adaptation carried across a slot, or
+            // the compound mode/MV read itself) -- not in `ref_slots`/
+            // `refresh_frame_flags`. Not isolated further within budget.
+            // Upgrade: bisect decode-order frame 3's tile decode against a
+            // synced `EC_TOK`/`EC_PART` trace from the instrumented aomdec
+            // build (`/tmp/libaom-src/build/decoder-debug/aomdec`) on
+            // `fixtures/av1blend-r1-mismatch.obu` (seed 45 now, not seed 49)
+            // -- the pre-deblock `EC_AV1_PREFILT_DUMP` frame-index alignment
+            // between this crate and that aomdec build is NOT 1:1 on this
+            // fixture (23 dumps here vs 24 there), so calibrate that first.
+            // r3 (this round): pre-deblock buffers were bisected byte-for-byte
+            // against an instrumented aomdec build (EC_AV1_PREFILT_DUMP,
+            // frame-index alignment recalibrated via content-hash matching
+            // rather than the raw dump count -- the keyframe never calls this
+            // crate's own `r17_dump` at all, since only `decode_inter_frame_
+            // tile` does, which is the whole "23 vs 24" gap, not a real bug).
+            // Decode-order frame 3 (`fixtures/av1blend-r1-mismatch.obu`,
+            // seed 45) is still the first divergence: PRE-deblock differs
+            // from aomdec's own pre-deblock dump by up to 1, on ~20% of
+            // luma pixels, clustered where its two compound inputs' pixel
+            // values disagree by more than a couple of levels -- both
+            // inputs (the keyframe and decode-order frame 2's own picture)
+            // are independently proven bit-exact (pre- and post-deblock)
+            // against aomdec, and `decodemv`'s own EC_TRACE (mode/mv/skip)
+            // matches this decoder's block loop exactly for every block in
+            // this frame. Solving `aomval = (key*w0 + bwd*w1 + 8) >> 4` for
+            // every mismatching pixel against `key`/`bwd` (both known-exact)
+            // picks out `w0=9, w1=7` for the majority (525/846) with zero
+            // matches for the plain average this decoder actually emits or
+            // the reversed `w0=7, w1=9` -- i.e. `compound_idx` is being
+            // decoded as `1` (simple average, spec `COMPOUND_AVERAGE`) when
+            // the real bitstream encoded `0` (`COMPOUND_DISTWTD`,
+            // `dist_wtd_comp_weight_assign`'s own weights for this frame's
+            // order-hint distances 2/3 land on exactly `(9, 7)` -- this
+            // decoder's own `dist_wtd_comp_weight_assign` was independently
+            // re-verified against `QUANT_DIST_WEIGHT`/`QUANT_DIST_LOOKUP_TABLE`
+            // by hand for these distances and gives the same `(9, 7)`).
+            // `get_comp_index_context` was checked line-for-line against
+            // libaom's `pred_common.h` (the `fwd`/`bck` distance halves, the
+            // `above_mi`/`left_mi` `has_second_ref`/`ALTREF_FRAME` fallback,
+            // the `3 * offset` term) and matches; `Default_Compound_Idx_Cdf`
+            // (`cdf.rs`'s `COMPOUND_IDX`) matches `entropymode.c`'s
+            // `default_compound_idx_cdfs` value-for-value; the read is
+            // gated on `!skip_mode && enable_jnt_comp`, matching libaom's
+            // `has_second_ref(mbmi) && !mbmi->skip_mode` outer guard plus
+            // `order_hint_info.enable_dist_wtd_comp` inner guard. The
+            // remaining 321/846 mismatched pixels do NOT fit `(9, 7)`
+            // either -- some blocks in this frame plausibly decode a
+            // genuinely different (correct, context-dependent) compound_idx
+            // than block (0,0)'s own -- so this is not simply "always wrong
+            // the same way": table/context/gate are all individually
+            // verified correct, yet the decoded VALUE at this specific
+            // symbol is wrong at least once in this frame. Not isolated
+            // further within budget. Upgrade: instrument `dec.symbol`'s own
+            // range/bit state (`rng`/`tell`, matching aomdec's own EC_PART
+            // trace fields) immediately before and after the `compound_idx`
+            // read specifically, not just the surrounding mode/mv/skip
+            // trace which does match -- the desync (if any) is local to
+            // this one read, not a wider stream desync.
+            //
+            // r5 (this round): the `resolve_interp_filter` call used to sit
+            // right here, ahead of `comp_group_idx`/`compound_idx` -- spec
+            // 5.11.19/libaom `decodemv.c:1575` reads `interp_filter` AFTER
+            // `read_compound_type`, not before, so that was a genuine
+            // ordering bug for a Switchable-filter frame (moved below, past
+            // the `compound_ctx = Some(...)` line). It does NOT explain this
+            // fixture's own mismatch, though: `av1blend-r1-mismatch.obu`'s
+            // header carries a *fixed* interpolation filter
+            // (`interp_fixed = Some(Regular)`, confirmed live via a
+            // one-off dump), so `resolve_interp_filter` never read a symbol
+            // in either position -- zero bits moved, decoded values
+            // unchanged before and after the reorder. Kept anyway: it is a
+            // real spec-order fix for the next Switchable-filter compound
+            // stream, independently correct regardless of this fixture.
+            //
+            // Also ruled out this round: comparing this crate's own
+            // `SymbolDecoder::debug_bitpos()` against aomdec's
+            // `aom_reader_tell()` at the block boundary is NOT a valid
+            // desync probe -- they are different quantities (raw consumed
+            // input bits vs. an entropy-cost estimate that advances without
+            // a literal byte fetch), so equal/unequal bitpos proves nothing
+            // either way. Do not repeat that comparison; instead trace
+            // `range`/`value` (this crate) against libaom's own internal
+            // `dif`/`rng` (needs new instrumentation in both) immediately
+            // after each read *upstream* of this one in the same block:
+            // `read_comp_mode`, `read_compound_ref_frames` (comp_ref_type/
+            // uni_comp_ref/comp_ref/comp_bwdref), `read_inter_compound_mode`,
+            // and the DRL loop. All of those independently decoded the SAME
+            // values this crate and aomdec both show (ref0=1, ref1=5, mode
+            // NEAREST_NEARESTMV, mv=(0,0)) -- but an upstream *context*
+            // miscomputation can still decode the identical symbol value off
+            // a slightly different CDF, narrowing `range` by a different
+            // amount than aomdec without changing the decoded value itself,
+            // and only surface as a wrong decode a few reads later exactly
+            // like this. `get_comp_index_context` and the `COMPOUND_IDX`
+            // table were independently re-verified again this round and are
+            // still correct; the four candidates above were not re-audited
+            // this round. Refusing here (rather than shipping a value-exact-
+            // most-of-the-time blend) until one of them is found wrong.
+            // r6/r7: found and fixed one real bug (mvstack.rs ref_ctx family
+            // undercounted compound neighbours in the single_ref_p*/comp_ref*/
+            // comp_bwdref* context reads -- kept, real fix). Unmasking on
+            // that fix alone and running the wide gate sweep (many seeds,
+            // `a_real_aomenc_stream_with_compound_references_decodes_pixel_exact`/
+            // `a_real_aomenc_stream_with_reference_select_reads_comp_mode_correctly`,
+            // cq-level=45) still mismatches roughly half the time, at
+            // different frames each run for the SAME seed -- aomenc's own
+            // cpu-used=0 RD search is run-to-run nondeterministic (noted
+            // above), so this is a second, still-unfound compound_idx defect,
+            // not the one r6/r7 fixed. r6's own residual-mismatch note (321/
+            // 846 pixels not fitting the (9,7)-vs-plain-average hypothesis
+            // either) already flagged more than one bug here. Re-masking:
+            // do not ship a blend that is right only sometimes.
             return Err(unsupported(
-                "a COMPOUND_REFERENCE block using the plain/distance-weighted \
-                 average blend (comp_group_idx == 0) -- proven non-pixel-exact \
-                 against a real aomenc stream (lane-av1comp r16, see \
-                 av1comp-r16-compound-mismatch.obu)",
+                "a COMPOUND_REFERENCE 16x16 leaf using the plain/distance-weighted \
+                 average blend (comp_group_idx == 0) -- proven non-pixel-exact against \
+                 real aomenc streams beyond the one bug lane-av1blend r6/r7 fixed \
+                 (lane-av1blend r7, wide gate sweep)",
             ));
             #[allow(unreachable_code)]
             let (fwd_offset, bck_offset, compound_idx) = if !skip_mode && enable_jnt_comp {
@@ -4505,7 +4683,25 @@ fn decode_inter_block(
                     ref_order_hints[(ref0 - LAST_FRAME) as usize],
                     ref_order_hints[(ref1 - LAST_FRAME) as usize],
                 );
+                if std::env::var_os("EC_AV1_COMPIDX_DUMP").is_some() {
+                    let fidx = R17_DUMP_FRAME_IDX.load(std::sync::atomic::Ordering::Relaxed);
+                    eprintln!(
+                        "COMPIDX_BLK fidx={fidx} mi_row={} mi_col={} ctx={idx_ctx} cdf0={} \
+                         ref0={ref0} ref1={ref1}",
+                        py / 4,
+                        px / 4,
+                        cdfs.compound_idx[idx_ctx][0]
+                    );
+                }
                 let idx = dec.symbol(&mut cdfs.compound_idx[idx_ctx]);
+                if std::env::var_os("EC_AV1_COMPIDX_DUMP").is_some() {
+                    eprintln!(
+                        "COMPIDX_VAL mi_row={} mi_col={} decoded={idx} bitpos={}",
+                        py / 4,
+                        px / 4,
+                        dec.debug_bitpos()
+                    );
+                }
                 if idx == 1 {
                     (8, 8, 1u8)
                 } else {
@@ -4521,6 +4717,31 @@ fn decode_inter_block(
                 (8, 8, 1u8)
             };
             compound_ctx = Some((ref1, comp_group_idx as u8, compound_idx));
+
+            // spec 5.11.19/libaom `decodemv.c` 1575: `read_mb_interp_filter`
+            // comes AFTER `read_compound_type` (the `comp_group_idx`/
+            // `compound_idx` reads just above), not before -- moved here
+            // (lane-av1blend r5) from its old position ahead of those reads,
+            // which stole their bits for a Switchable-filter compound block
+            // and desynced every symbol read after it in the tile.
+            if std::env::var_os("EC_AV1_COMPIDX_DUMP").is_some() {
+                eprintln!(
+                    "IFILTER_PRE mi_row={} mi_col={} interp_fixed={:?} is_globalmv={is_globalmv}",
+                    py / 4,
+                    px / 4,
+                    interp_fixed
+                );
+            }
+            let (h_filter, v_filter, resolved_filter) = resolve_interp_filter(
+                dec,
+                cdfs,
+                interp_fixed,
+                enable_dual_filter,
+                is_globalmv,
+                above_filter_ctx,
+                left_filter_ctx,
+            );
+            block_filter = resolved_filter;
 
             let mut inter0_y = vec![0i32; side * side];
             mc::predict_compound_intermediate(
@@ -4552,6 +4773,20 @@ fn decode_inter_block(
             );
             let mut pred_y = vec![0u8; side * side];
             mc::combine_compound(&inter0_y, &inter1_y, fwd_offset, bck_offset, &mut pred_y);
+
+            // r17 bisect scratch: dump per-block compound state when this
+            // block overlaps the pinned fixture's bad quadrant (frame 2,
+            // rows 32-63 cols 32-63). Remove with the rest of the scaffolding.
+            if std::env::var("EC_AV1_COMPOUND_DEBUG").is_ok() {
+                let fidx = R17_DUMP_FRAME_IDX.load(std::sync::atomic::Ordering::Relaxed);
+                eprintln!(
+                    "leaf16 fidx={fidx} px={px} py={py} side={side} ref0={ref0} ref1={ref1} \
+                     mv0={mv0:?} mv1={mv1:?} filter={resolved_filter:?} \
+                     fwd={fwd_offset} bck={bck_offset} compound_idx={compound_idx} \
+                     pred_y[0..4]={:?}",
+                    &pred_y[0..4.min(pred_y.len())]
+                );
+            }
 
             let mut inter0_u = vec![0i32; chroma_side * chroma_side];
             mc::predict_compound_intermediate(
@@ -4684,7 +4919,14 @@ fn decode_inter_block(
             }
         } else {
             let ref_frame =
-                read_single_ref(dec, cdfs, neighbours.above_ref[c], neighbours.left_ref[r]);
+                read_single_ref(
+                    dec,
+                    cdfs,
+                    neighbours.above_ref[c],
+                    neighbours.above_ref1[c],
+                    neighbours.left_ref[r],
+                    neighbours.left_ref1[r],
+                );
             ref_frame_for_lf = ref_frame;
             // round 4-9 (lane-av1golden..lane-av1golden7): GOLDEN_FRAME's own
             // stacked defects (lf_level ref/mode-delta forwarding, the
@@ -5327,16 +5569,22 @@ fn decode_inter_block8(
                          weighted/simple-average combine only, lane-av1comp",
                     ));
                 }
-                // corner-cut (lane-av1comp r16/r17): same non-pixel-exact
-                // plain-average reconstruction defect as the 16x16 leaf's
-                // own mask above (r17: falsified as loop-filter-shaped,
-                // isolated to predict_compound_intermediate/combine_compound
-                // itself) -- see that comment.
+                // corner-cut (lane-av1comp r16/r17, lane-av1blend r1): same
+                // reference-slot defect as the 16x16 leaf's own mask above
+                // (r1: falsified as an MC/blend math bug, isolated to a DPB
+                // slot/refresh_frame_flags issue around BWDREF_FRAME) -- see
+                // that comment.
+                // r3: same defect as the 16x16 leaf's own mask above -- see
+                // that comment (compound_idx's decoded value, not the blend
+                // math or reference-slot bookkeeping). r6/r7: same re-mask
+                // as the 16x16 leaf above -- one real bug found and fixed
+                // (mvstack.rs ref_ctx family), a second, still-unfound
+                // compound_idx defect surfaces on the wide gate sweep.
                 return Err(unsupported(
                     "a COMPOUND_REFERENCE 8x8 leaf using the plain/distance-weighted \
                      average blend (comp_group_idx == 0) -- proven non-pixel-exact \
-                     against a real aomenc stream (lane-av1comp r16, see \
-                     av1comp-r16-compound-mismatch.obu)",
+                     against real aomenc streams beyond the one bug lane-av1blend \
+                     r6/r7 fixed (lane-av1blend r7, wide gate sweep)",
                 ));
                 #[allow(unreachable_code)]
                 let (fwd_offset, bck_offset, compound_idx) = if !skip_mode && enable_jnt_comp {
@@ -5423,6 +5671,15 @@ fn decode_inter_block8(
                 );
                 let mut pred_y = vec![0u8; SIDE * SIDE];
                 mc::combine_compound(&inter0_y, &inter1_y, fwd_offset, bck_offset, &mut pred_y);
+
+                if std::env::var("EC_AV1_COMPOUND_DEBUG").is_ok() {
+                    let fidx = R17_DUMP_FRAME_IDX.load(std::sync::atomic::Ordering::Relaxed);
+                    eprintln!(
+                        "leaf8 fidx={fidx} px={px} py={py} ref0={ref0} ref1={ref1} \
+                         mv0={mv0:?} mv1={mv1:?} fwd={fwd_offset} bck={bck_offset} \
+                         compound_idx={compound_idx} pred_y={pred_y:?}"
+                    );
+                }
 
                 let mut inter0_u = vec![0i32; CHROMA_SIDE * CHROMA_SIDE];
                 mc::predict_compound_intermediate(
@@ -6105,6 +6362,14 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     let scan4 = default_scan(TX4);
 
     let mut cdfs = initial_cdfs.unwrap_or_else(|| Cdfs::new(q_ctx_of(base_q_idx)));
+    if std::env::var_os("EC_AV1_COMPIDX_DUMP").is_some() {
+        let idx = R17_DUMP_FRAME_IDX.load(std::sync::atomic::Ordering::Relaxed);
+        eprint!("COMPIDX_PRE fidx={} (aomdec fidx={})", idx, idx + 1);
+        for (c, row) in cdfs.compound_idx.iter().enumerate() {
+            eprint!(" ctx{c}={}", row[0]);
+        }
+        eprintln!();
+    }
     let mut dec = SymbolDecoder::new(data);
     let mut neighbours = Neighbours::new(
         cols as usize * 2,
