@@ -4570,6 +4570,16 @@ fn decode_inter_block(
     // compound blend weights need this frame's own order hint regardless
     // of `use_ref_frame_mvs`.
     enable_masked_compound: bool,
+    // lane-sb128 r4: this sequence header's own `enable_interintra_compound`
+    // bit (spec 5.11.24's `interintra` read, libaom `decodemv.c`
+    // read_inter_block_mode_info ~1490-1510) -- read right after `assign_mv`
+    // and before `read_motion_mode` on the single-ref path below, gated by
+    // `is_interintra_allowed` (single-ref, `BLOCK_8X8..=BLOCK_32X32`, and
+    // every mode this single-ref branch can produce is already in
+    // `SINGLE_INTER_MODE_START..END`); `interintra == 1` is a named refusal
+    // (inter+intra blended prediction unimplemented) rather than a
+    // mis-decode.
+    enable_interintra_compound: bool,
     enable_jnt_comp: bool,
     order_hint_bits: u32,
     order_hint: u32,
@@ -5294,6 +5304,27 @@ fn decode_inter_block(
                 };
                 (mv, false)
             };
+            // lane-sb128 r4: `interintra` (spec 5.11.24; libaom
+            // `decodemv.c` read_inter_block_mode_info ~1490-1510), placed
+            // right after `assign_mv` and before `read_motion_mode` below --
+            // libaom's own sequential order. `is_interintra_allowed_bsize`
+            // (`BLOCK_8X8..=BLOCK_32X32`) is the only real gate on this
+            // single-ref path: `is_interintra_allowed_ref` always holds here
+            // (single ref, `ref_frame[1]` not yet `INTRA_FRAME`) and
+            // `is_interintra_allowed_mode` always holds (every mode this
+            // branch produces -- NEARESTMV/NEARMV/GLOBALMV/NEWMV -- is
+            // `SINGLE_INTER_MODE_START..END` by construction).
+            // `size_group_lookup`: BLOCK_16X16 -> 2, BLOCK_32X32 -> 3.
+            if enable_interintra_compound && !skip_mode && (side == 16 || side == 32) {
+                let bsize_group = if side == 16 { 2 } else { 3 };
+                let interintra = dec.symbol(&mut cdfs.interintra[bsize_group]) == 1;
+                if interintra {
+                    return Err(unsupported(
+                        "an interintra-compound block (interintra == 1, inter+intra \
+                         blended prediction unimplemented)",
+                    ));
+                }
+            }
             // lane-motionmode round 1: `read_motion_mode` (spec 5.11.24;
             // libaom `decodemv.c` read_inter_block_mode_info, ~1520-1528),
             // placed right after MV assignment and before the switchable
@@ -5375,8 +5406,8 @@ fn decode_inter_block(
             globalmv_for_lf = is_globalmv;
             if std::env::var_os("EC_AV1_TRACE").is_some() {
                 eprintln!(
-                    "EC_TRACE mi_row={mi_row} mi_col={mi_col} skip={} is_inter=1 mv=({},{}) is_new_mv={is_new_mv} bsize={side} ref={ref_frame} filter={:?}",
-                    skip as u8, mv.0, mv.1, block_filter
+                    "EC_TRACE mi_row={mi_row} mi_col={mi_col} skip={} is_inter=1 mv=({},{}) is_new_mv={is_new_mv} bsize={side} ref={ref_frame} filter={:?} motion_mode_eligible={} obmc_selected={} tell={}",
+                    skip as u8, mv.0, mv.1, block_filter, motion_mode_eligible as u8, obmc_selected as u8, dec.debug_bitpos()
                 );
             }
             for dr in 0..bw4 {
@@ -5757,6 +5788,10 @@ fn decode_inter_block8(
     // context uses that same approximation.
     reference_select: bool,
     enable_masked_compound: bool,
+    // lane-sb128 r4: see [`decode_inter_block`]'s own doc -- `BLOCK_8X8` is
+    // always `is_interintra_allowed_bsize`-eligible, so this leaf's own gate
+    // drops the `side` check entirely.
+    enable_interintra_compound: bool,
     enable_jnt_comp: bool,
     order_hint_bits: u32,
     order_hint: u32,
@@ -6229,6 +6264,20 @@ fn decode_inter_block8(
             };
             (mv, false)
         };
+        // lane-sb128 r4: `interintra` (spec 5.11.24) at the 8x8 leaf too --
+        // see [`decode_inter_block`]'s own doc; `BLOCK_8X8` is always
+        // `is_interintra_allowed_bsize`-eligible, single-ref-only branch
+        // (compound already returned above), GLOBALMV already refused
+        // (round 3), so the only real gate left is the header enable bit.
+        if enable_interintra_compound && !skip_mode {
+            let interintra = dec.symbol(&mut cdfs.interintra[SIZE_GROUP_8]) == 1;
+            if interintra {
+                return Err(unsupported(
+                    "an interintra-compound block (interintra == 1, inter+intra \
+                     blended prediction unimplemented)",
+                ));
+            }
+        }
         // lane-motionmode round 3: `read_motion_mode` (spec 5.11.24) at the
         // 8x8 leaf too -- `motion_mode_allowed` still holds here (BLOCK_8X8
         // is the spec's own minimum eligible size, single-ref-only branch,
@@ -6619,6 +6668,7 @@ pub fn decode_inter_frame_tile(
         false,
         false,
         false,
+        false,
         [0; 2],
         true,
         false,
@@ -6663,6 +6713,10 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     // lane-av1comp: `seq_params`' own compound-blend enable bits.
     enable_masked_compound: bool,
     enable_jnt_comp: bool,
+    // lane-sb128 r3: this sequence header's own `enable_interintra_compound`
+    // bit, threaded to every `decode_inter_block`/`decode_inter_block8` call
+    // below (spec 5.11.24's `interintra` read).
+    enable_interintra_compound: bool,
     // lane-av1comp round 14: this frame header's own `skip_mode_present`/
     // `skip_mode_frame` (spec 5.9.22), threaded to every `decode_inter_block`/
     // `decode_inter_block8` call below.
@@ -6876,6 +6930,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             tpl_frame.as_ref(),
                             reference_select,
                             enable_masked_compound,
+                            enable_interintra_compound,
                             enable_jnt_comp,
                             order_hint_bits,
                             order_hint,
@@ -6948,6 +7003,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     tpl_frame.as_ref(),
                                     reference_select,
                                     enable_masked_compound,
+                                    enable_interintra_compound,
                                     enable_jnt_comp,
                                     order_hint_bits,
                                     order_hint,
@@ -7011,6 +7067,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                             allow_high_precision_mv,
                                             reference_select,
                                             enable_masked_compound,
+                                            enable_interintra_compound,
                                             enable_jnt_comp,
                                             order_hint_bits,
                                             order_hint,
@@ -7793,6 +7850,7 @@ mod tests {
             Some(mc::InterpFilterKind::Regular),
             false,
             None,
+            false,
             false,
             false,
             false,
