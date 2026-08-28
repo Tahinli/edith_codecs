@@ -58,8 +58,14 @@ fn rdoq_cache_hash_416x240() {
 /// bitstream on any content where that trial used to flip a leaf to split
 /// (BD-gated, not bit-identical — see `EncoderConfig::rqt` and this crate's
 /// `bd_psnr_vs_x265`).
+///
+/// lane-h265rdoq: re-pinned after RDOQ's trial costing switched from exact
+/// per-trial CABAC replay to an estimated per-context fracbits table
+/// (`EncoderConfig::rdoq_estimate`, now on by default) — deliberately
+/// bit-different, not exact-mode-preserving; see that field's doc comment
+/// for the BD/speed numbers that justified flipping the default.
 #[test]
 fn rdoq_cache_hash_is_pinned() {
-    assert_eq!(encode_hash(416, 240), 0xdb39f995b147beae);
-    assert_eq!(encode_hash(1920, 1080), 0xff5abdf102465a46);
+    assert_eq!(encode_hash(416, 240), 0x3dc2876c9104b7b3);
+    assert_eq!(encode_hash(1920, 1080), 0x03188155f21c2174);
 }
