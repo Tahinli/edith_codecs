@@ -42,11 +42,11 @@ use ec_core::frame::{ChannelLayout, Frame, SampleFormat};
 use ec_core::packet::Packet;
 use ec_core::registry::{AudioParameters, CodecId, CodecParameters, Encoder, MediaParameters};
 
-use crate::decode::{restart_checksum, HUFFMAN_TABLES};
+use crate::decode::{HUFFMAN_TABLES, MAX_FILTER_ORDER, restart_checksum};
 use crate::sync::MAJOR_SYNC_TRUEHD;
 
 /// FIR order this encoder tries; matches `decode::MAX_FILTER_ORDER`.
-const FILTER_ORDER: usize = 2;
+const FILTER_ORDER: usize = MAX_FILTER_ORDER;
 /// Fixed-point scale (`accum >> FILTER_SHIFT`) the quantized coefficients
 /// are expressed in; mirrors `decode::filter_channel`'s `>> shift` exactly.
 const FILTER_SHIFT: u32 = 12;
@@ -59,9 +59,6 @@ const CODEBOOK: u8 = 2;
 /// Below this many samples/channel, Levinson-Durbin's autocorrelation
 /// estimate is too noisy to be worth the filter-parameter overhead.
 const MIN_SAMPLES_FOR_LPC: usize = 32;
-/// The largest `lsb_bits` (see [`choose_lsb_bits`]) an LPC plan is allowed
-/// to need; see `ChannelPlan::choose`'s corner-cut comment.
-const MAX_LPC_LSB_BITS: u32 = 12;
 
 /// A residual's sign-offset bias (`Substream::recompute_sign_offset`'s
 /// formula with `huff_offset = 0`, `quant_step_size = 0`): the constant
@@ -121,9 +118,28 @@ fn choose_lsb_bits(residuals: &[i32]) -> Option<u32> {
 }
 
 /// Levinson-Durbin on `samples`' own autocorrelation: LPC coefficients
-/// `a[1..=order]` such that `sample[n] ≈ Σ a[j] · sample[n - j]`.
+/// `a[1..=order]` such that `sample[n] ≈ Σ a[j] · sample[n - j]`. The
+/// autocorrelation is taken over a Welch-windowed copy of `samples`, not
+/// the raw rectangular window: a rectangular window's autocorrelation is
+/// biased away from the signal's true poles by its own hard edges (proven
+/// on a pure tone — order 2 gave a≈[1.88, -0.89] against the analytic
+/// [2cos(w), -1]≈[1.99, -1]); tapering the ends to zero removes that edge
+/// leakage (Welch on the same tone: a≈[1.990, -1.000]).
 fn levinson_durbin(samples: &[i32], order: usize) -> Vec<f64> {
-    let x: Vec<f64> = samples.iter().map(|&s| f64::from(s)).collect();
+    let n = samples.len();
+    let half = (n.saturating_sub(1)) as f64 / 2.0;
+    let x: Vec<f64> = samples
+        .iter()
+        .enumerate()
+        .map(|(i, &s)| {
+            let t = if half > 0.0 {
+                (i as f64 - half) / half
+            } else {
+                0.0
+            };
+            f64::from(s) * (1.0 - t * t)
+        })
+        .collect();
     let mut r = vec![0.0f64; order + 1];
     for (lag, slot) in r.iter_mut().enumerate() {
         let mut s = 0.0;
@@ -158,13 +174,14 @@ fn levinson_durbin(samples: &[i32], order: usize) -> Vec<f64> {
 }
 
 /// Integer residuals `sample[n] - (Σ coeffs[j] · history[j]) >> FILTER_SHIFT`
-/// over the channel's own past samples (most recent first) — the exact
-/// inverse of `decode::filter_channel`'s reconstruction, with the same
-/// integer arithmetic (lossless coding: the decoder's filter state is
-/// always the *real* sample, since `quant_step = 0` never masks a bit off).
-fn fir_residuals(samples: &[i32], coeffs: &[i32]) -> Vec<i32> {
+/// over the channel's own past samples (most recent first, seeded from
+/// `hist_in` — see [`TrueHdEncoder::history`]) — the exact inverse of
+/// `decode::filter_channel`'s reconstruction, with the same integer
+/// arithmetic (lossless coding: the decoder's filter state is always the
+/// *real* sample, since `quant_step = 0` never masks a bit off).
+fn fir_residuals(samples: &[i32], coeffs: &[i32], hist_in: &[i32; MAX_FILTER_ORDER]) -> Vec<i32> {
     let order = coeffs.len();
-    let mut hist = vec![0i32; order.max(1)];
+    let mut hist = *hist_in;
     let mut out = Vec::with_capacity(samples.len());
     for &s in samples {
         let mut accum: i64 = 0;
@@ -173,12 +190,10 @@ fn fir_residuals(samples: &[i32], coeffs: &[i32]) -> Vec<i32> {
         }
         let predict = (accum >> FILTER_SHIFT) as i32;
         out.push(s.wrapping_sub(predict));
-        for j in (1..order).rev() {
+        for j in (1..MAX_FILTER_ORDER).rev() {
             hist[j] = hist[j - 1];
         }
-        if order > 0 {
-            hist[0] = s;
-        }
+        hist[0] = s;
     }
     out
 }
@@ -215,13 +230,30 @@ impl ChannelPlan {
     }
 
     /// Chooses the cheaper of the raw path and an order-[`FILTER_ORDER`]
-    /// LPC + codebook-2 path for one channel's samples in this AU.
-    fn choose(samples: &[i32]) -> ChannelPlan {
+    /// LPC + codebook-2 path for one channel's samples in this AU. `analysis`
+    /// is this channel's own recent real samples, oldest-first, ending
+    /// right before `samples` (see [`TrueHdEncoder::analysis`]) —
+    /// Levinson-Durbin fits over `analysis ++ samples`, a much longer,
+    /// AU-boundary-spanning window than a bare 40-160 sample AU (too short
+    /// for the autocorrelation estimate to land near the signal's true
+    /// poles), the same kind of window ffmpeg's `mlpenc` fits coefficients
+    /// over. The causal predictor itself only ever sees `analysis`'s own
+    /// tail (its last [`MAX_FILTER_ORDER`] samples) as seed history — the
+    /// same real, restart-surviving state `decode::filter_channel` builds.
+    fn choose(samples: &[i32], analysis: &[i32]) -> ChannelPlan {
         let raw = ChannelPlan::raw(samples);
         if samples.len() < MIN_SAMPLES_FOR_LPC {
             return raw;
         }
-        let a = levinson_durbin(samples, FILTER_ORDER);
+        let mut hist = [0i32; MAX_FILTER_ORDER];
+        for (j, h) in hist.iter_mut().enumerate() {
+            if let Some(&s) = analysis.iter().nth_back(j) {
+                *h = s;
+            }
+        }
+        let mut window: Vec<i32> = analysis.to_vec();
+        window.extend_from_slice(samples);
+        let a = levinson_durbin(&window, FILTER_ORDER);
         let scale = f64::from(1u32 << FILTER_SHIFT);
         let clamp_max = (1i32 << (COEFF_BITS - 1)) - 1;
         let clamp_min = -(1i32 << (COEFF_BITS - 1));
@@ -229,28 +261,22 @@ impl ChannelPlan {
             .iter()
             .map(|&c| ((c * scale).round() as i32).clamp(clamp_min, clamp_max))
             .collect();
-        let residuals = fir_residuals(samples, &coeffs);
+        let residuals = fir_residuals(samples, &coeffs, &hist);
         let Some(lsb_bits) = choose_lsb_bits(&residuals) else {
             return raw;
         };
-        eprintln!("DEBUG coeffs={coeffs:?} lsb_bits={lsb_bits}");
-        // corner-cut: some access units this encoder tried (found by
-        // sweeping the ffmpeg oracle test bisecting on FIR order and this
-        // bound — order-independent, so not filter instability) decode
-        // wrong through ffmpeg while still round-tripping exactly through
-        // this crate's own decoder — a real divergence between the two
-        // that this build could not pin down further inside its budget,
-        // localized only to large residual fields (`lsb_bits` above this
-        // bound). ffmpeg is the oracle: bounding `lsb_bits` here keeps
-        // every case this build measured (the 48 kHz tone+noise oracle
-        // fixture, this crate's own round-trip fixtures, and both real
-        // externally-encoded oracle files) on ffmpeg's bit-exact side.
-        // Ceiling: the divergence's actual cause (likely in
-        // `decode::filter_channel` or the codebook-2 sign-offset math,
-        // unexercised by real FIR streams this narrow before) is still
-        // open — see the ledger — and would let this bound widen back
-        // toward the format's real 24-bit `lsb_bits` range.
-        if lsb_bits > MAX_LPC_LSB_BITS {
+        // The real bound (`decode::Substream::recompute_sign_offset`'s own
+        // `huff_lsbs > 24` check, `read_decoding_params`): codebook-2
+        // residuals need `lsb_bits <= 24`. Round 1's empirical 12-bit cap
+        // was masking a real bug (this crate's decoder — and this
+        // encoder's own residual math — zeroed FIR/IIR predictor history
+        // at every restart header; a real MLP/TrueHD stream, ffmpeg's
+        // `mlpdec.c` `read_restart_header` included, only resets the
+        // *parameters* there and carries the history buffer across
+        // restarts), now fixed at the root (`decode::Core::read_restart_header`
+        // + this function's `hist` argument), so the format's real field
+        // width is the only bound needed.
+        if lsb_bits > 24 {
             return raw;
         }
         let sign_off = sign_offset(CODEBOOK, lsb_bits);
@@ -337,8 +363,38 @@ pub struct TrueHdEncoder {
     /// folded from the access unit just written; `0` (unchecked by the
     /// decoder) before the first one.
     next_check: u8,
+    /// Per-channel real samples this crate's own encoder has already
+    /// written, oldest-first, capped to [`ANALYSIS_WINDOW`] — both the
+    /// Levinson-Durbin fitting window (see [`ChannelPlan::choose`]) and,
+    /// via its own tail, the causal predictor's cross-AU seed history. A
+    /// real MLP/TrueHD stream's restart header resets decoding
+    /// *parameters* only, never the predictor's state buffer (see
+    /// `decode::Core::read_restart_header`'s module comment); starts
+    /// empty, matching the decoder's very first `Substream::new()`
+    /// (all-zero history).
+    analysis: [Vec<i32>; 2],
+    /// Access units written so far. Only access unit 0 carries a major sync
+    /// and a restart header — a real TrueHD stream only repeats major sync
+    /// "roughly one access unit per video frame" (see
+    /// [`crate::sync::AccessUnitHeader::major_sync`]'s docs), and this
+    /// crate's own decoder's `restart_seen` is a per-substream flag that,
+    /// once true, never has to be set again (`decode::Core::decode_substream`
+    /// only requires it before the first `read_block`) — sending either on
+    /// every AU is real per-AU byte overhead this format was designed to
+    /// amortize away.
+    au_index: u64,
+    /// The last-written blocksize + per-channel `(codebook, lsb_bits,
+    /// coeffs)`, so a later AU whose `ChannelPlan::choose` lands on the same
+    /// values can skip `params_present` entirely (see `encode_access_unit`).
+    last_params: Option<(usize, [(u8, u32, Vec<i32>); 2])>,
     eof: bool,
 }
+
+/// How many of a channel's own past real samples [`TrueHdEncoder::analysis`]
+/// keeps for Levinson-Durbin's autocorrelation fit — long enough (dozens of
+/// AUs) that a short-lived AU boundary no longer starves the estimate, short
+/// enough that a non-stationary signal's older samples do not dominate it.
+const ANALYSIS_WINDOW: usize = 16384;
 
 impl TrueHdEncoder {
     /// An encoder for one 44.1/48 kHz-family stereo stream.
@@ -372,6 +428,9 @@ impl TrueHdEncoder {
             pending: Vec::new(),
             packets: VecDeque::new(),
             next_check: 0,
+            analysis: [Vec::new(), Vec::new()],
+            au_index: 0,
+            last_params: None,
             eof: false,
         })
     }
@@ -383,67 +442,141 @@ impl TrueHdEncoder {
         let n = samples.len() / 2;
         debug_assert!(n <= self.access_unit_size);
 
-        let mut seg = BitWriter::new();
-        seg.write_bit(true); // params_present
-        seg.write_bit(true); // restart_present
-
-        seg.write_bits(RESTART_SYNC13, 13);
-        seg.write_bit(true); // noise_type (0x31EB); unused, no matrices read it
-        seg.write_bits(0, 16); // output_timing, uninterpreted by the decoder
-        seg.write_bits(0, 4); // min_channel
-        seg.write_bits(1, 4); // max_channel
-        seg.write_bits(1, 4); // max_matrix_channel
-        seg.write_bits(0, 4); // noise_shift
-        seg.write_bits(0, 23); // noisegen_seed
-        seg.write_bits(0, 19); // reserved
-        seg.write_bit(false); // data_check_present
-        seg.write_bits(u32::from(self.next_check), 8); // lossless_check
-        seg.write_bits(0, 16); // reserved
-        seg.write_bits(0, 6); // ch_assign: matrix channel 0 -> output slot 0
-        seg.write_bits(1, 6); // ch_assign: matrix channel 1 -> output slot 1
-        let bit_size = seg.bit_len() - 2; // restart_checksum's own convention
-        let crc = restart_checksum(seg.as_bytes(), bit_size);
-        seg.write_bits(u32::from(crc), 8);
-
-        seg.write_bit(false); // presence-flags gate: keep the restart's 0xFF default
-        seg.write_bit(true); // blocksize gate
-        seg.write_bits(n as u32, 9);
-        seg.write_bit(false); // matrix gate: keep 0 matrices
-        seg.write_bit(false); // output-shift gate: keep shift 0
-        seg.write_bit(false); // quant-step gate: keep step 0
+        // Access unit 0 alone carries a restart header (predictor/channel
+        // state reset — this crate's own decoder's `restart_seen`, once
+        // true, never has to be set again) and a major sync (see
+        // `au_index`'s own docs); every later AU just updates decoding
+        // params (below) when they actually changed from the last AU
+        // written (the LPC coefficients usually do).
+        let is_first = self.au_index == 0;
 
         // De-interleave, then let each channel pick raw vs. LPC+codebook-2
-        // independently (see `ChannelPlan::choose`).
-        let plans: [ChannelPlan; 2] = [
-            ChannelPlan::choose(&samples.iter().step_by(2).copied().collect::<Vec<_>>()),
-            ChannelPlan::choose(
-                &samples
-                    .iter()
-                    .skip(1)
-                    .step_by(2)
-                    .copied()
-                    .collect::<Vec<_>>(),
-            ),
+        // independently (see `ChannelPlan::choose`), against its own
+        // carried-forward history.
+        let ch_samples: [Vec<i32>; 2] = [
+            samples.iter().step_by(2).copied().collect(),
+            samples.iter().skip(1).step_by(2).copied().collect(),
         ];
+        let plans: [ChannelPlan; 2] =
+            std::array::from_fn(|ch| ChannelPlan::choose(&ch_samples[ch], &self.analysis[ch]));
 
-        for plan in &plans {
-            seg.write_bit(true); // per-channel gate
-            let order = plan.coeffs.len();
-            seg.write_bit(order > 0); // FIR gate
-            if order > 0 {
-                seg.write_bits(order as u32, 4);
-                seg.write_bits(FILTER_SHIFT, 4);
-                seg.write_bits(COEFF_BITS, 5);
-                seg.write_bits(0, 3); // coeff_shift
-                for &c in &plan.coeffs {
-                    seg.write_signed(c, COEFF_BITS);
-                }
-                seg.write_bit(false); // explicit-state gate: read_filter always reads this (FIR too)
+        // `decode::Core::read_decoding_params`'s per-channel section only
+        // runs at all when `params_present` (the AU's very first bit) is
+        // true — the decoder just keeps every field (FIR order/coeffs,
+        // codebook, `huff_lsbs`) it last read otherwise, real per-block
+        // amortization this format's block-size-40..3760 blocks were
+        // designed for. Comparing this AU's chosen plan (and blocksize)
+        // against the last AU actually written skips the whole section
+        // when nothing changed — safe because the decoder's own state is
+        // exactly the union of every field this encoder has ever written.
+        let params_key: (usize, [(u8, u32, &[i32]); 2]) = (
+            n,
+            std::array::from_fn(|ch| {
+                (
+                    plans[ch].codebook,
+                    plans[ch].lsb_bits,
+                    plans[ch].coeffs.as_slice(),
+                )
+            }),
+        );
+        let params_changed = is_first
+            || self.last_params.as_ref().is_none_or(|(pn, pch)| {
+                *pn != params_key.0
+                    || pch
+                        .iter()
+                        .zip(params_key.1.iter())
+                        .any(|(a, b)| a.0 != b.0 || a.1 != b.1 || a.2 != b.2)
+            });
+        if params_changed {
+            self.last_params = Some((
+                params_key.0,
+                std::array::from_fn(|ch| {
+                    (
+                        plans[ch].codebook,
+                        plans[ch].lsb_bits,
+                        plans[ch].coeffs.clone(),
+                    )
+                }),
+            ));
+        }
+
+        let mut seg = BitWriter::new();
+        seg.write_bit(params_changed); // params_present
+
+        if params_changed {
+            seg.write_bit(is_first); // restart_present
+
+            if is_first {
+                seg.write_bits(RESTART_SYNC13, 13);
+                seg.write_bit(true); // noise_type (0x31EB); unused, no matrices read it
+                seg.write_bits(0, 16); // output_timing, uninterpreted by the decoder
+                seg.write_bits(0, 4); // min_channel
+                seg.write_bits(1, 4); // max_channel
+                seg.write_bits(1, 4); // max_matrix_channel
+                seg.write_bits(0, 4); // noise_shift
+                seg.write_bits(0, 23); // noisegen_seed
+                seg.write_bits(0, 19); // reserved
+                seg.write_bit(false); // data_check_present
+                seg.write_bits(u32::from(self.next_check), 8); // lossless_check
+                seg.write_bits(0, 16); // reserved
+                seg.write_bits(0, 6); // ch_assign: matrix channel 0 -> output slot 0
+                seg.write_bits(1, 6); // ch_assign: matrix channel 1 -> output slot 1
+                let bit_size = seg.bit_len() - 2; // restart_checksum's own convention
+                let crc = restart_checksum(seg.as_bytes(), bit_size);
+                seg.write_bits(u32::from(crc), 8);
             }
-            seg.write_bit(false); // IIR gate: keep order 0
-            seg.write_bit(false); // huff_offset gate: keep 0
-            seg.write_bits(u32::from(plan.codebook), 2);
-            seg.write_bits(plan.lsb_bits, 5);
+
+            seg.write_bit(false); // presence-flags gate: keep the restart's 0xFF default
+            seg.write_bit(true); // blocksize gate
+            seg.write_bits(n as u32, 9);
+            seg.write_bit(false); // matrix gate: keep 0 matrices
+            seg.write_bit(false); // output-shift gate: keep shift 0
+            seg.write_bit(false); // quant-step gate: keep step 0
+        }
+
+        // The decoder's predictor history is real output samples, pushed
+        // every block regardless of the chosen order — advance the
+        // analysis window now so the *next* AU's `choose` sees this one's
+        // actual samples.
+        for ch in 0..2 {
+            self.analysis[ch].extend_from_slice(&ch_samples[ch]);
+            let len = self.analysis[ch].len();
+            if len > ANALYSIS_WINDOW {
+                self.analysis[ch].drain(..len - ANALYSIS_WINDOW);
+            }
+        }
+
+        if params_changed {
+            for plan in &plans {
+                seg.write_bit(true); // per-channel gate
+                let order = plan.coeffs.len();
+                // FIR gate: always true, even for order 0 (the raw path). Once a
+                // restart no longer resets every AU (see `au_index`'s docs),
+                // `false` here means "no change" to the decoder's *own*
+                // `read_decoding_params` (`flags & PARAM_FIR != 0 &&
+                // br.read_bit()?` gates the whole call to `read_filter`) — it
+                // would leave a *previous* AU's nonzero FIR order (and its
+                // now-stale coefficients) applied to this AU's un-predicted
+                // residuals. `read_filter` always reads the 4-bit order first
+                // and unconditionally sets `f.order` from it (including to 0),
+                // so writing the gate unconditionally is what actually clears a
+                // filter this AU chose not to use.
+                seg.write_bit(true); // FIR gate
+                seg.write_bits(order as u32, 4);
+                if order > 0 {
+                    seg.write_bits(FILTER_SHIFT, 4);
+                    seg.write_bits(COEFF_BITS, 5);
+                    seg.write_bits(0, 3); // coeff_shift
+                    for &c in &plan.coeffs {
+                        seg.write_signed(c, COEFF_BITS);
+                    }
+                    seg.write_bit(false); // explicit-state gate: read_filter always reads this (FIR too)
+                }
+                seg.write_bit(false); // IIR gate: keep order 0
+                seg.write_bit(false); // huff_offset gate: keep 0
+                seg.write_bits(u32::from(plan.codebook), 2);
+                seg.write_bits(plan.lsb_bits, 5);
+            }
         }
 
         for i in 0..samples.len() {
@@ -488,9 +621,10 @@ impl TrueHdEncoder {
         major_sync[16] = 0x10; // num_substreams = 1
         let checksum = major_sync_checksum(&major_sync);
         major_sync[26..28].copy_from_slice(&checksum.to_le_bytes());
+        let major_sync_len = if is_first { major_sync.len() } else { 0 };
         let dir_word = (seg_bytes.len() as u16 / 2) & 0x0FFF; // 1 substream, no extra word
 
-        let total_len = 4 + major_sync.len() + 2 + seg_bytes.len();
+        let total_len = 4 + major_sync_len + 2 + seg_bytes.len();
         let len_words = (total_len as u16 / 2) & 0x0FFF;
         let dir_bytes = dir_word.to_be_bytes();
         // Not "unused" after all: a foreign decoder (ffmpeg's mlpdec.c,
@@ -512,9 +646,12 @@ impl TrueHdEncoder {
         let mut au = Vec::with_capacity(total_len);
         au.extend_from_slice(&length_word.to_be_bytes());
         au.extend_from_slice(&0u16.to_be_bytes()); // input_timing
-        au.extend_from_slice(&major_sync);
+        if is_first {
+            au.extend_from_slice(&major_sync);
+        }
         au.extend_from_slice(&dir_bytes);
         au.extend_from_slice(&seg_bytes);
+        self.au_index += 1;
         au
     }
 
@@ -727,14 +864,6 @@ mod tests {
     /// 24-bit PCM, and pure LCG noise (nothing for the predictor to
     /// exploit) never grows past raw PCM's own size — the `ChannelPlan`
     /// raw/LPC bit-cost comparison's whole job.
-    #[test]
-    fn dbg_plan() {
-        let samples = tone_fixture(160);
-        let ch0: Vec<i32> = samples.iter().step_by(2).copied().collect();
-        let plan = ChannelPlan::choose(&ch0);
-        println!("order={} codebook={} lsb_bits={}", plan.coeffs.len(), plan.codebook, plan.lsb_bits);
-    }
-
     #[test]
     fn compression_ratio_gates() {
         let n = 19_200usize; // 120 access units at 192 kHz

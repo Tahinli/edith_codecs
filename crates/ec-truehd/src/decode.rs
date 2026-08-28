@@ -66,7 +66,7 @@ const MAX_MATRIX_CHANNEL: usize = 7;
 /// appends after the last matrix channel.
 const MAX_CHANNELS: usize = MAX_MATRIX_CHANNEL + 3;
 const MAX_MATRICES: usize = 8;
-const MAX_FILTER_ORDER: usize = 8;
+pub(crate) const MAX_FILTER_ORDER: usize = 8;
 const END_OF_STREAM: u32 = 0xD234_D234;
 
 /// The fixed 256-entry dither table noise type 1 (TrueHD's `0x31EB`) draws
@@ -583,6 +583,21 @@ impl Core {
             self.stats.lossless_check_failures += 1;
         }
         let s = &mut self.substreams[idx];
+        // A restart header resets every decoding *parameter* (order,
+        // codebook, huff_lsbs, ...) to its spec default, but — per ffmpeg's
+        // `read_restart_header` (mlpdec.c), which `memset`s
+        // `output_shift`/`quant_step_size`/per-channel param fields but
+        // never touches `filter_params[FIR/IIR].state` — the FIR/IIR
+        // predictor's *history* (the actual past decoded samples) is a
+        // rolling buffer `filter_channel` maintains every block regardless
+        // of the channel's current order, and survives every restart
+        // header in an access-unit stream. Zeroing it here (this crate's
+        // previous behaviour) was self-consistent with our own encoder's
+        // matching per-AU-fresh-history assumption but diverges from a
+        // real MLP/TrueHD stream from AU 2 onward whenever a channel uses
+        // a nonzero-order filter.
+        let old_states: [(Filter, Filter); MAX_CHANNELS] =
+            std::array::from_fn(|ch| (s.channels[ch].fir, s.channels[ch].iir));
         *s = Substream {
             restart_seen: true,
             noise_type,
@@ -595,6 +610,10 @@ impl Core {
             ch_assign,
             ..Substream::new()
         };
+        for (ch, (old_fir, old_iir)) in old_states.into_iter().enumerate() {
+            s.channels[ch].fir.state = old_fir.state;
+            s.channels[ch].iir.state = old_iir.state;
+        }
         Ok(())
     }
 
