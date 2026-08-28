@@ -4089,6 +4089,10 @@ mod tests {
                 // block under a 32x16 strip, and suppressed the -5 extended
                 // row scan.
                 "rect-flake-2",
+                // overlappable_left stepped the vertical walk by the
+                // neighbour's WIDTH: a 32x16 left strip swallowed the strip
+                // below it, blending the wrong OBMC prediction there.
+                "rect-flake-3",
             ]
                 .iter()
                 .map(|n| format!("{fixtures}/{n}.obu"))
