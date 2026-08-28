@@ -3322,7 +3322,11 @@ mod tests {
         let (width, height, frame_count) = (64usize, 64usize, 24usize);
         let mut named_refusals = 0u32;
         let mut matched = 0u32;
-        for attempt in 0..40u32 {
+        let n_attempts: u32 = std::env::var("EC_WARP_GATE_ATTEMPTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(40);
+        for attempt in 0..n_attempts {
             let seed = 42 + attempt;
             let duration = frame_count as f64 / 25.0;
             let source =
@@ -3366,6 +3370,7 @@ mod tests {
                 "--enable-order-hint=1",
                 "--enable-warped-motion=1",
                 "--enable-obmc=1",
+                "--tune-content=default",
                 "--enable-masked-comp=0",
                 "--enable-interintra-comp=0",
                 "--enable-onesided-comp=0",
@@ -3421,12 +3426,21 @@ mod tests {
                         "{NAME} failed outright, not a named refusal (seed {seed}): {msg}"
                     );
                     named_refusals += 1;
+                    eprintln!("seed {seed} refusal: {msg}");
                     continue;
                 }
                 Ok(frames) => frames,
             };
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
             assert_eq!(frames.len(), frame_count);
+            let mismatched = frames
+                .iter()
+                .zip(&ffmpeg_frames)
+                .any(|(got, want)| got.y != want.y || got.u != want.u || got.v != want.v);
+            if mismatched && let Ok(path) = std::env::var("EC_AV1_GATE_DUMP") {
+                std::fs::write(&path, &stream).expect("writing pinned stream");
+                eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
+            }
             for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
                 assert_eq!(
                     got.y, want.y,
@@ -3439,8 +3453,57 @@ mod tests {
             matched += 1;
         }
         eprintln!(
-            "{NAME}: {named_refusals} named refusals, {matched} pixel-exact matches out of 40"
+            "{NAME}: {named_refusals} named refusals, {matched} pixel-exact matches out of {n_attempts}, warp_selected_hits={}",
+            crate::decode::warp_selected_hits()
         );
+    }
+
+    /// lane-warp round 3: reproduces the pinned mismatch bytes captured by
+    /// `EC_AV1_GATE_DUMP=$SP/warp-mismatch.obu` off
+    /// `a_real_aomenc_stream_with_warped_motion_refuses_or_matches` (seed 49,
+    /// frame 1). Deterministic and static -- `#[ignore]`d, run manually.
+    #[test]
+    #[ignore = "reads a pinned fixture path outside the repo; run manually"]
+    fn pinned_warp_stream_decodes_pixel_exact() {
+        use crate::decode::warp_selected_hits;
+        let path = std::env::var("EC_AV1_GATE_DUMP_PIN").unwrap_or_else(|_| {
+            "/tmp/claude-1000/-home-tahinli-Documents-Code-Rust-edith-codecs/\
+             51b5f611-f998-43a8-b975-e64cb643a3e1/scratchpad/warp-mismatch.obu"
+                .to_string()
+        });
+        let stream = std::fs::read(&path).expect("reading pinned stream");
+        if !have_ffmpeg() {
+            eprintln!("SKIP pinned_warp_stream_decodes_pixel_exact: no ffmpeg");
+            return;
+        }
+        let before = warp_selected_hits();
+        let frames = decode_stream(&stream).expect("pinned stream must decode");
+        eprintln!(
+            "warp_selected_hits before={before} after={}",
+            warp_selected_hits()
+        );
+        let ffmpeg_frames = ffmpeg_decode_sequence(&stream, 64, 64, 24);
+        for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+            if got.y != want.y {
+                for row in 0..64 {
+                    let mut line = String::new();
+                    for col in 0..64 {
+                        let d = got.y[row * 64 + col] as i32 - want.y[row * 64 + col] as i32;
+                        line.push(if d == 0 {
+                            '.'
+                        } else if d.abs() < 4 {
+                            'o'
+                        } else {
+                            'X'
+                        });
+                    }
+                    eprintln!("{line}");
+                }
+            }
+            assert_eq!(got.y, want.y, "frame {i} luma vs ffmpeg (pinned)");
+            assert_eq!(got.u, want.u, "frame {i} U vs ffmpeg (pinned)");
+            assert_eq!(got.v, want.v, "frame {i} V vs ffmpeg (pinned)");
+        }
     }
 
     /// `LAST2_FRAME`/`LAST3_FRAME` are just older slots in the same forward
