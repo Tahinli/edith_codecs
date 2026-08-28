@@ -3259,6 +3259,24 @@ mod tests {
         }
     }
 
+    /// lane-av1blend r4 scratch: decodes the pinned `av1blend-r1-mismatch.obu`
+    /// (seed 45) with `EC_AV1_COMPIDX_DUMP` set, to compare the pre-tile-decode
+    /// `compound_idx` CDF state of every frame against an instrumented
+    /// aomdec's own `COMPIDX_PRE` dump. Errors out at decode-order frame 3
+    /// (the still-masked compound path) -- that is expected, the dump lines
+    /// before the error are what this test is for. Remove with the rest of
+    /// the r1-r4 scaffolding.
+    #[test]
+    #[ignore]
+    fn scratch_dump_compound_idx_cdf_state() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/av1blend-r1-mismatch.obu"
+        );
+        let stream = std::fs::read(path).expect("reading pinned stream");
+        let _ = decode_stream(&stream);
+    }
+
     /// lane-av1blend r2 scratch: sweep every seed of the compound_references
     /// recipe (with the plain-average blend UNMASKED locally) looking for a
     /// pixel mismatch, dumping the first one found to `EC_AV1_GATE_DUMP`.
