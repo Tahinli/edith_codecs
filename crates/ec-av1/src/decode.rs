@@ -628,6 +628,12 @@ fn read_coeffs(
         eprintln!("EC_AV1_STATE_BEFORE_TXBSKIP range={range} value={value}");
     }
     let all_zero = dec.symbol(&mut coding.txb_skip[skip_ctx]) == 1;
+    if std::env::var_os("EC_AV1_TELL").is_some() {
+        eprintln!(
+            "TELL label=post_txb_skip ctx={skip_ctx} all_zero={} tell={} range={}",
+            all_zero as u8, dec.debug_bitpos(), dec.debug_state().0
+        );
+    }
     if trace {
         eprintln!("TRACE all_zero ctx={skip_ctx} value={}", all_zero as i32);
     }
@@ -5434,6 +5440,12 @@ fn decode_inter_block(
                     ));
                 }
             }
+            if std::env::var_os("EC_AV1_TELL").is_some() {
+                eprintln!(
+                    "TELL mi_row={mi_row} mi_col={mi_col} label=post_interintra tell={} range={}",
+                    dec.debug_bitpos(), dec.debug_state().0
+                );
+            }
             // lane-motionmode round 1: `read_motion_mode` (spec 5.11.24;
             // libaom `decodemv.c` read_inter_block_mode_info, ~1520-1528),
             // placed right after MV assignment and before the switchable
@@ -5476,6 +5488,12 @@ fn decode_inter_block(
                     OBMC_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
+            if std::env::var_os("EC_AV1_TELL").is_some() {
+                eprintln!(
+                    "TELL mi_row={mi_row} mi_col={mi_col} label=post_motion_mode eligible={} tell={} range={}",
+                    motion_mode_eligible as u8, dec.debug_bitpos(), dec.debug_state().0
+                );
+            }
             // spec `get_ref_filter_type`: a neighbour's own filter only feeds
             // this block's switchable_interp context when that neighbour coded
             // the SAME reference frame this block is about to read -- a
@@ -5513,6 +5531,12 @@ fn decode_inter_block(
             );
             block_filter = resolved_filter;
             globalmv_for_lf = is_globalmv;
+            if std::env::var_os("EC_AV1_TELL").is_some() {
+                eprintln!(
+                    "TELL mi_row={mi_row} mi_col={mi_col} label=post_interp_filter tell={} range={}",
+                    dec.debug_bitpos(), dec.debug_state().0
+                );
+            }
             if std::env::var_os("EC_AV1_TRACE").is_some() {
                 eprintln!(
                     "EC_TRACE mi_row={mi_row} mi_col={mi_col} skip={} is_inter=1 mv=({},{}) is_new_mv={is_new_mv} bsize={side} ref={ref_frame} filter={:?} motion_mode_eligible={} obmc_selected={} tell={}",
