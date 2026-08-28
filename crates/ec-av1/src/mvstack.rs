@@ -121,8 +121,22 @@ pub struct MiInfo {
     /// The single reference frame this unit's MV points into. Ignored (and
     /// the unit contributes no candidate) when `is_inter` is `false`.
     pub ref_frame: i8,
+    /// The unit's *second* reference frame when it was coded compound
+    /// (spec `RefFrames[1]`), `None` for a single-reference/intra unit --
+    /// lane-av1comp: today's callers (single-ref decode/encode) never set
+    /// this, so it exists only so [`MiGrid`] can carry compound state once
+    /// `read_ref_frames` (spec 5.11.25) lands; nothing reads it yet, and
+    /// [`find_mv_stack`]'s scan still matches candidates on `ref_frame`
+    /// alone (its own compound dual-ref scan is unported -- see the ledger).
+    pub ref_frame1: Option<i8>,
     /// The unit's motion vector, `(row, col)`, in the spec's 1/8-pel units.
     pub mv: (i32, i32),
+    /// The unit's second motion vector, matching `ref_frame1` (spec
+    /// `Mvs[1]`) — `Some` only for a compound-coded unit, `None` otherwise.
+    /// lane-av1comp step 4: exists so the compound mvstack scan below can
+    /// read a compound neighbour's second MV; no caller sets it yet (same
+    /// unwired state `ref_frame1` landed in for r3).
+    pub mv1: Option<(i32, i32)>,
     /// Whether this unit's own mode was `NEWMV` (spec's
     /// `have_newmv_in_inter_mode`, compound modes excluded since this module
     /// has no compound candidates). Feeds `NewMvContext` (7.10.2.8): a
@@ -977,6 +991,680 @@ pub fn find_mv_stack_with_sign_bias(
     }
 }
 
+/// One neighbour's vote for a compound-reference (spec `RefFrame[0]` *and*
+/// `RefFrame[1]` both active) candidate: two full motion vectors and the
+/// combined weight — spec 7.10.2's compound half of `add_ref_mv_candidate`
+/// (libaom `mvref_common.c`, the `is_compound` branch of `scan_row_mbmi`/
+/// `scan_col_mbmi`/`scan_blk_mbmi`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompoundStackEntry {
+    /// The candidate's vote for `RefFrame[0]`'s motion vector.
+    pub mv0: (i32, i32),
+    /// The candidate's vote for `RefFrame[1]`'s motion vector.
+    pub mv1: (i32, i32),
+    /// The summed weight of every neighbour cell that voted for this pair.
+    pub weight: u32,
+}
+
+/// [`find_mv_stack_compound`]'s result — [`MvStack`]'s shape, doubled for
+/// the reference pair.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompoundMvStack {
+    /// The candidates, highest weight first.
+    pub entries: Vec<CompoundStackEntry>,
+    /// `RefStackMv[0]` for both refs, or `((0,0),(0,0))` when the stack is
+    /// empty.
+    pub nearest_mv: ((i32, i32), (i32, i32)),
+    /// `RefStackMv[1]` for both refs, or `((0,0),(0,0))` when the stack has
+    /// fewer than two entries.
+    pub near_mv: ((i32, i32), (i32, i32)),
+    /// The predictor pair a `NEW_NEWMV`-family block's MV differences are
+    /// coded against.
+    pub pred_mv: ((i32, i32), (i32, i32)),
+    /// Context for the compound `new_mv` symbol.
+    pub new_mv_ctx: usize,
+    /// Context for the compound `ref_mv` symbol.
+    pub ref_mv_ctx: usize,
+    /// Context for the compound `zero_mv` symbol.
+    pub zero_mv_ctx: usize,
+    /// Context for each `drl_mode` symbol between consecutive stack entries.
+    pub drl_ctx: Vec<usize>,
+}
+
+/// [`add_candidate`], doubled: dedupes on the whole `(mv0, mv1)` pair.
+fn add_compound_candidate(
+    candidates: &mut Vec<CompoundStackEntry>,
+    mv0: (i32, i32),
+    mv1: (i32, i32),
+    weight: u32,
+) {
+    if let Some(entry) = candidates.iter_mut().find(|e| e.mv0 == mv0 && e.mv1 == mv1) {
+        entry.weight += weight;
+    } else {
+        candidates.push(CompoundStackEntry { mv0, mv1, weight });
+    }
+}
+
+/// The compound row scan (spec 7.10.2.2's compound branch, libaom
+/// `scan_row_mbmi`'s `is_compound` path): [`scan_row`]'s weight/run-length
+/// math unchanged, but a candidate only votes when *both* its `ref_frame`
+/// and `ref_frame1` equal the query's pair exactly, in that order — a
+/// compound pair is always encoded forward-then-backward
+/// (`RefFrame[0]`/`RefFrame[1]`), so unlike [`process_single_ref_mv_candidate`]'s
+/// extension pass, no sign-bias flip ever applies to an exact-pair scan
+/// match (libaom's own `scan_row_mbmi` compound branch doesn't flip either).
+#[allow(clippy::too_many_arguments)]
+fn scan_row_compound(
+    grid: &MiGrid,
+    mi_row: usize,
+    mi_col: usize,
+    bw4: usize,
+    row_offset: isize,
+    max_row_offset: isize,
+    ref_frame: (i8, i8),
+    candidates: &mut Vec<CompoundStackEntry>,
+    newmv_count: &mut u32,
+    processed_rows: &mut usize,
+) -> bool {
+    let Some(row) = mi_row.checked_add_signed(row_offset) else {
+        return false;
+    };
+    let col_shift: usize = if row_offset.unsigned_abs() > 1 { 1 } else { 0 };
+    let use_step_16 = bw4 >= 16;
+    let end_mi = bw4.min(16);
+    let mut found = false;
+    let mut i = 0usize;
+    while i < end_mi {
+        let Some(info) = grid.get(row, mi_col + col_shift + i) else {
+            i += 1;
+            continue;
+        };
+        let n4 = info.size;
+        let mut len = bw4.min(n4);
+        if use_step_16 {
+            len = len.max(4);
+        } else if row_offset.unsigned_abs() > 1 {
+            len = len.max(2);
+        }
+        let mut weight = ROW_COL_WEIGHT_FLOOR;
+        if bw4 <= n4 {
+            let inc = ((-max_row_offset + row_offset + 1) as usize).min(n4);
+            weight = weight.max(inc as u32);
+            *processed_rows = (inc as isize - row_offset - 1).max(0) as usize;
+        }
+        if info.is_inter && info.ref_frame == ref_frame.0 && info.ref_frame1 == Some(ref_frame.1) {
+            found = true;
+            add_compound_candidate(
+                candidates,
+                info.mv,
+                info.mv1.unwrap_or((0, 0)),
+                len as u32 * weight,
+            );
+            *newmv_count += u32::from(info.is_new_mv);
+        }
+        i += len.max(1);
+    }
+    found
+}
+
+/// The compound col scan (spec 7.10.2.3's compound branch): [`scan_row_compound`],
+/// transposed — mirrors [`scan_col`]/[`scan_row`]'s own relationship.
+#[allow(clippy::too_many_arguments)]
+fn scan_col_compound(
+    grid: &MiGrid,
+    mi_row: usize,
+    mi_col: usize,
+    bh4: usize,
+    col_offset: isize,
+    max_col_offset: isize,
+    ref_frame: (i8, i8),
+    candidates: &mut Vec<CompoundStackEntry>,
+    newmv_count: &mut u32,
+    processed_cols: &mut usize,
+) -> bool {
+    let Some(col) = mi_col.checked_add_signed(col_offset) else {
+        return false;
+    };
+    let row_shift: usize = if col_offset.unsigned_abs() > 1 { 1 } else { 0 };
+    let use_step_16 = bh4 >= 16;
+    let end_mi = bh4.min(16);
+    let mut found = false;
+    let mut i = 0usize;
+    while i < end_mi {
+        let Some(info) = grid.get(mi_row + row_shift + i, col) else {
+            i += 1;
+            continue;
+        };
+        let n4 = info.size;
+        let mut len = bh4.min(n4);
+        if use_step_16 {
+            len = len.max(4);
+        } else if col_offset.unsigned_abs() > 1 {
+            len = len.max(2);
+        }
+        let mut weight = ROW_COL_WEIGHT_FLOOR;
+        if bh4 <= n4 {
+            let inc = ((-max_col_offset + col_offset + 1) as usize).min(n4);
+            weight = weight.max(inc as u32);
+            *processed_cols = (inc as isize - col_offset - 1).max(0) as usize;
+        }
+        if info.is_inter && info.ref_frame == ref_frame.0 && info.ref_frame1 == Some(ref_frame.1) {
+            found = true;
+            add_compound_candidate(
+                candidates,
+                info.mv,
+                info.mv1.unwrap_or((0, 0)),
+                len as u32 * weight,
+            );
+            *newmv_count += u32::from(info.is_new_mv);
+        }
+        i += len.max(1);
+    }
+    found
+}
+
+/// The compound top-right probe ([`scan_top_right`]'s pair-matched twin).
+fn scan_top_right_compound(
+    grid: &MiGrid,
+    mi_row: usize,
+    mi_col: usize,
+    bw4: usize,
+    ref_frame: (i8, i8),
+    candidates: &mut Vec<CompoundStackEntry>,
+    newmv_count: &mut u32,
+) -> bool {
+    let Some(row) = mi_row.checked_sub(1) else {
+        return false;
+    };
+    let col = mi_col + bw4;
+    if let Some(info) = grid.get(row, col)
+        && info.is_inter
+        && info.ref_frame == ref_frame.0
+        && info.ref_frame1 == Some(ref_frame.1)
+    {
+        add_compound_candidate(
+            candidates,
+            info.mv,
+            info.mv1.unwrap_or((0, 0)),
+            CORNER_WEIGHT,
+        );
+        *newmv_count += u32::from(info.is_new_mv);
+        return true;
+    }
+    false
+}
+
+/// The compound diagonal corner probe ([`scan_corner`]'s pair-matched twin).
+fn scan_corner_compound(
+    grid: &MiGrid,
+    mi_row: usize,
+    mi_col: usize,
+    ref_frame: (i8, i8),
+    candidates: &mut Vec<CompoundStackEntry>,
+    newmv_count: &mut u32,
+) -> bool {
+    let (Some(row), Some(col)) = (mi_row.checked_sub(1), mi_col.checked_sub(1)) else {
+        return false;
+    };
+    if let Some(info) = grid.get(row, col)
+        && info.is_inter
+        && info.ref_frame == ref_frame.0
+        && info.ref_frame1 == Some(ref_frame.1)
+    {
+        add_compound_candidate(
+            candidates,
+            info.mv,
+            info.mv1.unwrap_or((0, 0)),
+            CORNER_WEIGHT,
+        );
+        *newmv_count += u32::from(info.is_new_mv);
+        return true;
+    }
+    false
+}
+
+/// Per-side unresolved-MV accumulator [`process_compound_ref_mv_candidate`]
+/// fills across every candidate the compound extension pass walks: up to two
+/// motion vectors that matched `ref_frame.0`/`.1` exactly (`ref_id`), and up
+/// to two more borrowed from a differently-referenced but still-inter
+/// neighbour under the sign-bias flip [`process_single_ref_mv_candidate`]
+/// also applies (`ref_diff`). Ported from libaom's `setup_ref_mv_list`
+/// (`mvref_common.c`, `process_compound_ref_mv_candidate` ~line 380-430 plus
+/// the combine step at ~696-762): the extension walk fills this once across
+/// the whole row-then-col scan, and [`combine_compound_candidates`] below
+/// zips the two independently-filled sides back into full pair candidates.
+#[derive(Default)]
+struct CompoundRefLists {
+    ref_id: [Vec<(i32, i32)>; 2],
+    ref_diff: [Vec<(i32, i32)>; 2],
+}
+
+/// libaom's `process_compound_ref_mv_candidate`: folds one already-coded
+/// neighbour's up to two reference slots into `lists`, split by which side
+/// of `ref_frame` (the query block's own compound pair) each slot's own
+/// reference frame matches — an exact match goes to that side's `ref_id`
+/// list, anything else (still inter, wrong reference) goes to `ref_diff`
+/// under the usual sign-bias flip.
+fn process_compound_ref_mv_candidate(
+    candidate: &MiInfo,
+    ref_frame: (i8, i8),
+    sign_bias_table: &SignBiasTable,
+    lists: &mut CompoundRefLists,
+) {
+    if !candidate.is_inter {
+        return;
+    }
+    let slots = [
+        Some((candidate.ref_frame, candidate.mv)),
+        candidate
+            .ref_frame1
+            .map(|rf1| (rf1, candidate.mv1.unwrap_or((0, 0)))),
+    ];
+    for (candidate_ref, candidate_mv) in slots.into_iter().flatten() {
+        for (i, side_ref) in [ref_frame.0, ref_frame.1].into_iter().enumerate() {
+            if candidate_ref == side_ref {
+                if lists.ref_id[i].len() < 2 {
+                    lists.ref_id[i].push(candidate_mv);
+                }
+            } else if lists.ref_diff[i].len() < 2 {
+                let mut mv = candidate_mv;
+                if sign_bias(sign_bias_table, candidate_ref) != sign_bias(sign_bias_table, side_ref)
+                {
+                    mv = (-mv.0, -mv.1);
+                }
+                lists.ref_diff[i].push(mv);
+            }
+        }
+    }
+}
+
+/// libaom's combine step (`setup_ref_mv_list`, `mvref_common.c` ~696-720):
+/// zips each side's `ref_id` (exact matches) then `ref_diff` (borrowed,
+/// sign-flipped) entries, position-wise and independently per side, into up
+/// to two full `(mv0, mv1)` pair candidates — missing slots default to
+/// `(0, 0)`, matching libaom's zero-initialized `combined_mvs`.
+fn combine_compound_candidates(lists: &CompoundRefLists) -> [((i32, i32), (i32, i32)); 2] {
+    let side_slots = |side: usize| -> [(i32, i32); 2] {
+        let merged: Vec<(i32, i32)> = lists.ref_id[side]
+            .iter()
+            .chain(lists.ref_diff[side].iter())
+            .take(2)
+            .copied()
+            .collect();
+        std::array::from_fn(|i| merged.get(i).copied().unwrap_or((0, 0)))
+    };
+    let side0 = side_slots(0);
+    let side1 = side_slots(1);
+    [(side0[0], side1[0]), (side0[1], side1[1])]
+}
+
+/// [`find_mv_stack_with_sign_bias`]'s compound-reference twin (spec
+/// 7.10.2's `is_compound` path throughout): builds the reference MV stack
+/// for a block predicted against *two* simultaneously-active reference
+/// frames (`ref_frame.0`, `ref_frame.1`), keeping every existing
+/// single-reference caller of [`find_mv_stack`]/[`find_mv_stack_with_sign_bias`]
+/// untouched — this is a new, parallel entry point, not an extension of the
+/// single-ref one. Same reduction scope as the single-ref module doc
+/// (single tile, square blocks, `IDENTITY` global motion only); the
+/// mode-context switch below reuses the identical `(nearest_match,
+/// ref_match_count)` derivation the single-ref path uses, since libaom's own
+/// switch statement (`mvref_common.c` ~619-643) is ref-count-agnostic — it
+/// only ever reads those two counts, regardless of which `MODE_CTX_REF_FRAMES`
+/// slot `mode_context` it's indexing.
+///
+/// The compound extension combine step (`setup_ref_mv_list`, ~line 700-754)
+/// and the temporal `add_tpl_ref_mv` fold-in (~line 341-433) are both exact
+/// ports of libaom's real behaviour as of r5 — see the inline comments at
+/// each site.
+#[allow(clippy::too_many_arguments)]
+pub fn find_mv_stack_compound(
+    grid: &MiGrid,
+    mi_row: usize,
+    mi_col: usize,
+    bw4: usize,
+    bh4: usize,
+    ref_frame: (i8, i8),
+    mi_cols: usize,
+    mi_rows: usize,
+    sign_bias_table: &SignBiasTable,
+    tpl: Option<CompoundTplArgs>,
+) -> CompoundMvStack {
+    let mut candidates: Vec<CompoundStackEntry> = Vec::new();
+    let mut newmv_count = 0u32;
+
+    let row_adj = bh4 < 2 && mi_row % 2 == 1;
+    let col_adj = bw4 < 2 && mi_col % 2 == 1;
+    let max_row_offset: isize = if mi_row > 0 {
+        let reach = if bh4 < 2 { -4 } else { -6 } + isize::from(row_adj);
+        reach.max(-(mi_row as isize))
+    } else {
+        0
+    };
+    let max_col_offset: isize = if mi_col > 0 {
+        let reach = if bw4 < 2 { -4 } else { -6 } + isize::from(col_adj);
+        reach.max(-(mi_col as isize))
+    } else {
+        0
+    };
+
+    let mut processed_rows = 0usize;
+    let mut processed_cols = 0usize;
+    let found_above = mi_row > 0
+        && scan_row_compound(
+            grid,
+            mi_row,
+            mi_col,
+            bw4,
+            -1,
+            max_row_offset,
+            ref_frame,
+            &mut candidates,
+            &mut newmv_count,
+            &mut processed_rows,
+        );
+    let found_left = mi_col > 0
+        && scan_col_compound(
+            grid,
+            mi_row,
+            mi_col,
+            bh4,
+            -1,
+            max_col_offset,
+            ref_frame,
+            &mut candidates,
+            &mut newmv_count,
+            &mut processed_cols,
+        );
+    let found_top_right = scan_top_right_compound(
+        grid,
+        mi_row,
+        mi_col,
+        bw4,
+        ref_frame,
+        &mut candidates,
+        &mut newmv_count,
+    );
+
+    let row_matched = found_above || found_top_right;
+    let nearest_match = usize::from(row_matched) + usize::from(found_left);
+
+    for entry in &mut candidates {
+        entry.weight += REF_CAT_LEVEL;
+    }
+
+    // Temporal compound candidates (spec 7.10.2.8's compound
+    // `add_tpl_ref_mv`): the same projected field, read once per side of the
+    // pair through the existing single-ref [`crate::motion_field::add_tpl_ref_mv`]
+    // — each side's own `cur_offset` scales the *same* stored candidate to
+    // that side's reference frame. libaom's real `add_tpl_ref_mv` looks up
+    // the stored `mfmv0`/`ref_frame_offset` pair exactly once per `(blk_row,
+    // blk_col)` and, if present, always projects it to *both* sides (the
+    // lookup itself never fails for one side and succeeds for the other);
+    // a missing side there is `INVALID_MV`/global-motion zero-fill, never a
+    // dropped candidate. Ported exactly: each side is read independently and
+    // a missing side zero-fills rather than vetoing the pair.
+    let mut zero_mv_ctx = 0usize;
+    if let Some(CompoundTplArgs {
+        field,
+        cur_offset_0,
+        cur_offset_1,
+        allow_high_precision_mv,
+    }) = tpl
+    {
+        let mut any_hit = false;
+        let blk_row_end = bh4.min(16);
+        let blk_col_end = bw4.min(16);
+        let step_h = if bh4 >= 16 { 4 } else { 2 };
+        let step_w = if bw4 >= 16 { 4 } else { 2 };
+        let mut first_sample_missing = true;
+        let mut first_sample_far = false;
+        let mut blk_row = 0usize;
+        while blk_row < blk_row_end {
+            let mut blk_col = 0usize;
+            while blk_col < blk_col_end {
+                let cand0 = crate::motion_field::add_tpl_ref_mv(
+                    field,
+                    mi_row,
+                    mi_col,
+                    blk_row as isize,
+                    blk_col as isize,
+                    cur_offset_0,
+                    allow_high_precision_mv,
+                );
+                let cand1 = crate::motion_field::add_tpl_ref_mv(
+                    field,
+                    mi_row,
+                    mi_col,
+                    blk_row as isize,
+                    blk_col as isize,
+                    cur_offset_1,
+                    allow_high_precision_mv,
+                );
+                if cand0.is_some() || cand1.is_some() {
+                    any_hit = true;
+                    let mv0 = cand0.map_or((0, 0), |c| c.mv);
+                    let mv1 = cand1.map_or((0, 0), |c| c.mv);
+                    if blk_row == 0 && blk_col == 0 {
+                        first_sample_missing = false;
+                        first_sample_far = mv0.0.abs() >= 16
+                            || mv0.1.abs() >= 16
+                            || mv1.0.abs() >= 16
+                            || mv1.1.abs() >= 16;
+                    }
+                    add_compound_candidate(&mut candidates, mv0, mv1, 2);
+                }
+                blk_col += step_w;
+            }
+            blk_row += step_h;
+        }
+        if any_hit {
+            TMV_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        zero_mv_ctx = usize::from(first_sample_missing || first_sample_far);
+    }
+
+    let mut dummy_newmv_count = 0u32;
+    let corner_matched = scan_corner_compound(
+        grid,
+        mi_row,
+        mi_col,
+        ref_frame,
+        &mut candidates,
+        &mut dummy_newmv_count,
+    );
+    let mut row_matched_ext = false;
+    let mut col_matched_ext = false;
+    for idx in 2..=MVREF_ROW_COLS {
+        let row_offset = -((idx as isize) * 2) + 1 + isize::from(row_adj);
+        let col_offset = -((idx as isize) * 2) + 1 + isize::from(col_adj);
+        if row_offset.unsigned_abs() <= max_row_offset.unsigned_abs()
+            && row_offset.unsigned_abs() > processed_rows
+            && scan_row_compound(
+                grid,
+                mi_row,
+                mi_col,
+                bw4,
+                row_offset,
+                max_row_offset,
+                ref_frame,
+                &mut candidates,
+                &mut dummy_newmv_count,
+                &mut processed_rows,
+            )
+        {
+            row_matched_ext = true;
+        }
+        if col_offset.unsigned_abs() <= max_col_offset.unsigned_abs()
+            && col_offset.unsigned_abs() > processed_cols
+            && scan_col_compound(
+                grid,
+                mi_row,
+                mi_col,
+                bh4,
+                col_offset,
+                max_col_offset,
+                ref_frame,
+                &mut candidates,
+                &mut dummy_newmv_count,
+                &mut processed_cols,
+            )
+        {
+            col_matched_ext = true;
+        }
+    }
+    let ref_match_count = usize::from(row_matched || corner_matched || row_matched_ext)
+        + usize::from(found_left || col_matched_ext);
+
+    candidates.sort_by_key(|e| std::cmp::Reverse(e.weight));
+    candidates.truncate(MAX_STACK_SIZE);
+
+    // The compound extension pass (libaom's `setup_ref_mv_list`, "Handle
+    // compound reference frame extension"): gather across the row directly
+    // above and the column directly left (same `mi_size` reach as the
+    // single-ref pass), then combine once.
+    let mi_width = (16usize).min(bw4).min(mi_cols.saturating_sub(mi_col));
+    let mi_height = (16usize).min(bh4).min(mi_rows.saturating_sub(mi_row));
+    let mi_size = mi_width.min(mi_height);
+    if candidates.len() < MAX_MV_REF_CANDIDATES {
+        let mut lists = CompoundRefLists::default();
+        if max_row_offset.unsigned_abs() >= 1 {
+            let mut idx = 0usize;
+            while idx < mi_size {
+                let cand = grid.get(mi_row - 1, mi_col + idx);
+                let step = cand.map_or(1, |c| c.size).max(1);
+                if let Some(c) = cand {
+                    process_compound_ref_mv_candidate(c, ref_frame, sign_bias_table, &mut lists);
+                }
+                idx += step;
+            }
+        }
+        if max_col_offset.unsigned_abs() >= 1 {
+            let mut idx = 0usize;
+            while idx < mi_size {
+                let cand = grid.get(mi_row + idx, mi_col - 1);
+                let step = cand.map_or(1, |c| c.size).max(1);
+                if let Some(c) = cand {
+                    process_compound_ref_mv_candidate(c, ref_frame, sign_bias_table, &mut lists);
+                }
+                idx += step;
+            }
+        }
+        // libaom's real dedup (`setup_ref_mv_list` ~735-754): when the stack
+        // already has exactly one entry, compare only `comp_list[0]` against
+        // it and, on a match, take `comp_list[1]` instead (skip, no weight
+        // bump) — otherwise append `comp_list[0]` as a brand-new entry. When
+        // the stack is empty, both `comp_list[0]` and `comp_list[1]` are
+        // appended unconditionally, with no dedup check at all.
+        let comp_list = combine_compound_candidates(&lists);
+        if candidates.len() == 1 {
+            let (mv0, mv1) = if comp_list[0] == (candidates[0].mv0, candidates[0].mv1) {
+                comp_list[1]
+            } else {
+                comp_list[0]
+            };
+            candidates.push(CompoundStackEntry {
+                mv0,
+                mv1,
+                weight: 2,
+            });
+        } else if candidates.is_empty() {
+            for (mv0, mv1) in comp_list {
+                candidates.push(CompoundStackEntry {
+                    mv0,
+                    mv1,
+                    weight: 2,
+                });
+            }
+        }
+    }
+
+    let clamp = |mv| clamp_mv_ref(mv, mi_row, mi_col, bw4, bh4, mi_cols, mi_rows);
+    let nearest_mv = candidates
+        .first()
+        .map_or(((0, 0), (0, 0)), |e| (clamp(e.mv0), clamp(e.mv1)));
+    let near_mv = candidates
+        .get(1)
+        .map_or(((0, 0), (0, 0)), |e| (clamp(e.mv0), clamp(e.mv1)));
+    let pred_mv = if candidates.is_empty() {
+        ((0, 0), (0, 0))
+    } else {
+        nearest_mv
+    };
+
+    let new_mv_ctx = match nearest_match {
+        0 => usize::from(ref_match_count >= 1),
+        1 => {
+            if newmv_count > 0 {
+                2
+            } else {
+                3
+            }
+        }
+        _ => {
+            if newmv_count >= 1 {
+                4
+            } else {
+                5
+            }
+        }
+    };
+    let ref_mv_ctx = match nearest_match {
+        0 => match ref_match_count {
+            0 => 0,
+            1 => 1,
+            _ => 2,
+        },
+        1 => {
+            if ref_match_count >= 2 {
+                4
+            } else {
+                3
+            }
+        }
+        _ => 5,
+    };
+
+    let drl_ctx = candidates
+        .windows(2)
+        .map(|w| {
+            let (a, b) = (w[0].weight, w[1].weight);
+            if a >= REF_CAT_LEVEL && b >= REF_CAT_LEVEL {
+                0
+            } else if a >= REF_CAT_LEVEL && b < REF_CAT_LEVEL {
+                1
+            } else {
+                2
+            }
+        })
+        .collect();
+
+    CompoundMvStack {
+        entries: candidates,
+        nearest_mv,
+        near_mv,
+        pred_mv,
+        new_mv_ctx,
+        ref_mv_ctx,
+        zero_mv_ctx,
+        drl_ctx,
+    }
+}
+
+/// [`find_mv_stack_compound`]'s temporal-MV inputs — [`TplArgs`], doubled:
+/// one `cur_offset` per side of the pair (`get_relative_dist(OrderHint,
+/// OrderHints[ref_frame.N - LAST_FRAME])`, spec 7.9.3), since a compound
+/// query projects the same stored field twice, once per reference.
+pub struct CompoundTplArgs<'a> {
+    /// The current frame's projected temporal motion field.
+    pub field: &'a crate::motion_field::TplField,
+    /// `get_relative_dist` for `ref_frame.0`.
+    pub cur_offset_0: i32,
+    /// `get_relative_dist` for `ref_frame.1`.
+    pub cur_offset_1: i32,
+    /// The frame header's own `allow_high_precision_mv`.
+    pub allow_high_precision_mv: bool,
+}
+
 /// The single-reference context shared by the `single_ref_p1`/`p3`/`p4`
 /// binary decisions this crate's LAST-only reference chain codes (spec
 /// 5.11.25; libaom's `av1_get_pred_context_single_ref_p1/p3/p4`,
@@ -1070,6 +1758,107 @@ pub(crate) fn single_ref_p6_ctx(above: Option<i8>, left: Option<i8>) -> usize {
     ref_ctx(above, left, &[BWDREF_FRAME], &[ALTREF2_FRAME])
 }
 
+/// `av1_get_pred_context_uni_comp_ref_p1`: `LAST2` vs. `LAST3`/`GOLDEN`,
+/// conditioned on a unidirectional pair known to be one of the three
+/// `LAST`-anchored ones (lane-av1comp).
+pub(crate) fn uni_comp_ref_p1_ctx(above: Option<i8>, left: Option<i8>) -> usize {
+    ref_ctx(above, left, &[LAST2_FRAME], &[LAST3_FRAME, GOLDEN_FRAME])
+}
+
+/// One neighbouring block's reference-frame shape, as
+/// [`reference_mode_ctx`]/[`comp_reference_type_ctx`] need it: `None` for an
+/// out-of-frame neighbour, `Some(ref0, None)` for an intra or single-ref
+/// inter block, `Some(ref0, Some(ref1))` for a compound one. `uni` is
+/// `ref1`'s meaning only when compound: whether the pair libaom's
+/// `has_uni_comp_refs` would call unidirectional (both refs on the same
+/// side of the current frame).
+#[derive(Clone, Copy)]
+pub(crate) struct NeighbourRef {
+    pub is_inter: bool,
+    pub ref0: i8,
+    pub ref1: Option<i8>,
+    pub uni: bool,
+}
+
+fn is_backward(r: i8) -> bool {
+    (BWDREF_FRAME..=ALTREF_FRAME).contains(&r)
+}
+
+/// `av1_get_reference_mode_context` (spec 5.11.25's `comp_mode` context,
+/// libaom `pred_common.c`): 5 contexts from how many of the above/left
+/// neighbours are themselves compound-predicted, and (when neither/one is)
+/// whether their single reference is a backward one.
+pub(crate) fn reference_mode_ctx(above: Option<NeighbourRef>, left: Option<NeighbourRef>) -> usize {
+    match (above, left) {
+        (Some(a), Some(l)) => match (a.ref1.is_some(), l.ref1.is_some()) {
+            (false, false) => usize::from(is_backward(a.ref0) ^ is_backward(l.ref0)),
+            (false, true) => 2 + usize::from(is_backward(a.ref0) || !a.is_inter),
+            (true, false) => 2 + usize::from(is_backward(l.ref0) || !l.is_inter),
+            (true, true) => 4,
+        },
+        (Some(e), None) | (None, Some(e)) => {
+            if e.ref1.is_some() {
+                3
+            } else {
+                usize::from(is_backward(e.ref0))
+            }
+        }
+        (None, None) => 1,
+    }
+}
+
+/// `av1_get_comp_reference_type_context` (spec 5.11.25's
+/// `comp_reference_type` context, libaom `pred_common.c`): 5 contexts from
+/// whether the above/left neighbours are intra, single-ref, unidirectional
+/// compound, or bidirectional compound.
+pub(crate) fn comp_reference_type_ctx(
+    above: Option<NeighbourRef>,
+    left: Option<NeighbourRef>,
+) -> usize {
+    match (above, left) {
+        (Some(a), Some(l)) => match (a.is_inter, l.is_inter) {
+            (false, false) => 2,
+            (false, true) | (true, false) => {
+                let inter = if a.is_inter { a } else { l };
+                if inter.ref1.is_none() {
+                    2
+                } else {
+                    1 + 2 * usize::from(inter.uni)
+                }
+            }
+            (true, true) => {
+                let (a_sg, l_sg) = (a.ref1.is_none(), l.ref1.is_none());
+                if a_sg && l_sg {
+                    1 + 2 * usize::from(!(is_backward(a.ref0) ^ is_backward(l.ref0)))
+                } else if a_sg || l_sg {
+                    let uni = if a_sg { l.uni } else { a.uni };
+                    if !uni {
+                        1
+                    } else {
+                        3 + usize::from(!(is_backward(a.ref0) ^ is_backward(l.ref0)))
+                    }
+                } else if !a.uni && !l.uni {
+                    0
+                } else if !a.uni || !l.uni {
+                    2
+                } else {
+                    3 + usize::from(!((a.ref0 == BWDREF_FRAME) ^ (l.ref0 == BWDREF_FRAME)))
+                }
+            }
+        },
+        (Some(e), None) | (None, Some(e)) => {
+            if !e.is_inter {
+                2
+            } else if e.ref1.is_none() {
+                2
+            } else {
+                4 * usize::from(e.uni)
+            }
+        }
+        (None, None) => 2,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1078,6 +1867,8 @@ mod tests {
         MiInfo {
             is_inter: true,
             ref_frame: 1,
+            ref_frame1: None,
+            mv1: None,
             mv,
             is_new_mv: false,
             // 1: smaller than every `bw4`/`bh4` these small-grid tests use,
@@ -1229,6 +2020,8 @@ mod tests {
             MiInfo {
                 is_inter: true,
                 ref_frame: 1,
+                ref_frame1: None,
+                mv1: None,
                 mv: (4, 4),
                 is_new_mv: true,
                 size: 1,
@@ -1307,6 +2100,8 @@ mod tests {
             MiInfo {
                 is_inter: true,
                 ref_frame: 1,
+                ref_frame1: None,
+                mv1: None,
                 mv,
                 is_new_mv: false,
                 size: 8,
@@ -1334,6 +2129,8 @@ mod tests {
         MiInfo {
             is_inter: false,
             ref_frame: -1,
+            ref_frame1: None,
+            mv1: None,
             mv: (0, 0),
             is_new_mv: false,
             size: 8,
@@ -1348,6 +2145,8 @@ mod tests {
         MiInfo {
             is_inter: true,
             ref_frame: 1,
+            ref_frame1: None,
+            mv1: None,
             mv,
             is_new_mv: false,
             size: 8,
@@ -1424,5 +2223,348 @@ mod tests {
 
         assert_eq!(stack.entries.len(), 1);
         assert_eq!(stack.entries[0].mv, (4, 4));
+    }
+
+    fn single(ref0: i8) -> NeighbourRef {
+        NeighbourRef {
+            is_inter: true,
+            ref0,
+            ref1: None,
+            uni: false,
+        }
+    }
+    fn comp(ref0: i8, ref1: i8, uni: bool) -> NeighbourRef {
+        NeighbourRef {
+            is_inter: true,
+            ref0,
+            ref1: Some(ref1),
+            uni,
+        }
+    }
+    fn intra() -> NeighbourRef {
+        NeighbourRef {
+            is_inter: false,
+            ref0: 0,
+            ref1: None,
+            uni: false,
+        }
+    }
+
+    /// `av1_get_reference_mode_context`, no edges available: libaom's `ctx
+    /// = 1` fallback.
+    #[test]
+    fn reference_mode_ctx_no_edges_is_one() {
+        assert_eq!(reference_mode_ctx(None, None), 1);
+    }
+
+    /// Both edges single-ref, same forward/backward-ness: `ctx = 0`; one of
+    /// each: `ctx = 1` (the XOR in libaom's `ctx = IS_BACKWARD(above) ^
+    /// IS_BACKWARD(left)`).
+    #[test]
+    fn reference_mode_ctx_single_single() {
+        assert_eq!(
+            reference_mode_ctx(Some(single(LAST_FRAME)), Some(single(LAST2_FRAME))),
+            0
+        );
+        assert_eq!(
+            reference_mode_ctx(Some(single(LAST_FRAME)), Some(single(BWDREF_FRAME))),
+            1
+        );
+    }
+
+    /// One edge compound, the other single forward: libaom's `2 +
+    /// IS_BACKWARD(above)` collapses to `2` here (forward, inter).
+    #[test]
+    fn reference_mode_ctx_single_and_compound() {
+        assert_eq!(
+            reference_mode_ctx(
+                Some(single(LAST_FRAME)),
+                Some(comp(LAST_FRAME, LAST2_FRAME, true))
+            ),
+            2
+        );
+        assert_eq!(
+            reference_mode_ctx(
+                Some(comp(LAST_FRAME, LAST2_FRAME, true)),
+                Some(single(LAST_FRAME))
+            ),
+            2
+        );
+    }
+
+    /// Both edges compound: libaom's fixed `ctx = 4`.
+    #[test]
+    fn reference_mode_ctx_compound_compound_is_four() {
+        assert_eq!(
+            reference_mode_ctx(
+                Some(comp(LAST_FRAME, LAST2_FRAME, true)),
+                Some(comp(BWDREF_FRAME, ALTREF_FRAME, true))
+            ),
+            4
+        );
+    }
+
+    /// `av1_get_comp_reference_type_context`, no edges: libaom's `ctx = 2`
+    /// fallback.
+    #[test]
+    fn comp_reference_type_ctx_no_edges_is_two() {
+        assert_eq!(comp_reference_type_ctx(None, None), 2);
+    }
+
+    /// Both edges intra: libaom's `ctx = 2`.
+    #[test]
+    fn comp_reference_type_ctx_intra_intra_is_two() {
+        assert_eq!(comp_reference_type_ctx(Some(intra()), Some(intra())), 2);
+    }
+
+    /// Both edges single/single: forward-vs-backward split doubles the same
+    /// way `single_ref_p1`'s own XOR does (libaom's `1 + 2 * !(a ^ l)`).
+    #[test]
+    fn comp_reference_type_ctx_single_single() {
+        assert_eq!(
+            comp_reference_type_ctx(Some(single(LAST_FRAME)), Some(single(LAST2_FRAME))),
+            3
+        );
+        assert_eq!(
+            comp_reference_type_ctx(Some(single(LAST_FRAME)), Some(single(BWDREF_FRAME))),
+            1
+        );
+    }
+
+    /// Both edges bidirectional compound: libaom's `ctx = 0`.
+    #[test]
+    fn comp_reference_type_ctx_bidir_bidir_is_zero() {
+        assert_eq!(
+            comp_reference_type_ctx(
+                Some(comp(LAST_FRAME, BWDREF_FRAME, false)),
+                Some(comp(LAST2_FRAME, ALTREF_FRAME, false))
+            ),
+            0
+        );
+    }
+
+    /// Both edges unidirectional compound: libaom's `3 + !(a==BWDREF ^
+    /// l==BWDREF)`.
+    #[test]
+    fn comp_reference_type_ctx_unidir_unidir() {
+        assert_eq!(
+            comp_reference_type_ctx(
+                Some(comp(LAST_FRAME, LAST2_FRAME, true)),
+                Some(comp(LAST_FRAME, LAST3_FRAME, true))
+            ),
+            4
+        );
+        assert_eq!(
+            comp_reference_type_ctx(
+                Some(comp(LAST_FRAME, LAST2_FRAME, true)),
+                Some(comp(BWDREF_FRAME, ALTREF_FRAME, true))
+            ),
+            3
+        );
+    }
+
+    /// `av1_get_pred_context_uni_comp_ref_p1`: `LAST2` beats `LAST3`/
+    /// `GOLDEN` in the vote, context 2 (libaom's `<` branch reversed --
+    /// fewer `a`s than `b`s is context 0, matching [`ref_ctx`]'s shared
+    /// convention).
+    #[test]
+    fn uni_comp_ref_p1_ctx_matches_ref_ctx_shape() {
+        assert_eq!(uni_comp_ref_p1_ctx(Some(LAST2_FRAME), None), 2);
+        assert_eq!(uni_comp_ref_p1_ctx(Some(LAST3_FRAME), None), 0);
+        assert_eq!(uni_comp_ref_p1_ctx(None, None), 1);
+    }
+
+    // --- lane-av1comp step 4: compound mvstack (find_mv_stack_compound) ---
+
+    const COMP_PAIR: (i8, i8) = (LAST_FRAME, ALTREF_FRAME);
+
+    fn comp_inter(mv0: (i32, i32), mv1: (i32, i32)) -> MiInfo {
+        MiInfo {
+            is_inter: true,
+            ref_frame: COMP_PAIR.0,
+            ref_frame1: Some(COMP_PAIR.1),
+            mv: mv0,
+            mv1: Some(mv1),
+            is_new_mv: false,
+            size: 1,
+        }
+    }
+
+    #[test]
+    fn compound_scan_only_matches_the_exact_pair() {
+        let mut grid = MiGrid::new(8, 8);
+        // Same-side single-ref neighbour (LAST only) must not vote.
+        grid.set(1, 2, inter((4, 4)));
+        // Wrong second ref (GOLDEN, not ALTREF) must not vote either.
+        grid.set(
+            1,
+            3,
+            MiInfo {
+                is_inter: true,
+                ref_frame: LAST_FRAME,
+                ref_frame1: Some(GOLDEN_FRAME),
+                mv: (9, 9),
+                mv1: Some((9, 9)),
+                is_new_mv: false,
+                size: 1,
+            },
+        );
+        // Exact pair match.
+        let (mv0, mv1) = ((2, 2), (-6, 3));
+        grid.set(2, 1, comp_inter(mv0, mv1));
+
+        let stack = find_mv_stack_compound(&grid, 2, 2, 2, 2, COMP_PAIR, 8, 8, &NO_SIGN_BIAS, None);
+
+        // The exact-pair immediate scan lands one boosted entry; the
+        // compound extension pass (short stack, len < MAX_MV_REF_CANDIDATES)
+        // separately tops it up with a low-weight combo built from the two
+        // near-miss neighbours it's allowed to gather over regardless of
+        // reference frame -- a real second entry, not spurious.
+        assert_eq!(stack.entries.len(), 2);
+        assert_eq!(stack.entries[0].mv0, mv0);
+        assert_eq!(stack.entries[0].mv1, mv1);
+        assert_eq!(stack.entries[0].weight, 2 + REF_CAT_LEVEL);
+        assert_eq!(stack.nearest_mv, (mv0, mv1));
+    }
+
+    #[test]
+    fn compound_dedupes_same_pair_and_sums_weight() {
+        let mut grid = MiGrid::new(8, 8);
+        let (mv0, mv1) = ((4, 4), (-4, -4));
+        // Block at (2, 2), 2x2 mi units: above spans cols 2..4, left rows 2..4.
+        grid.set(1, 2, comp_inter(mv0, mv1));
+        grid.set(1, 3, comp_inter(mv0, mv1));
+        grid.set(2, 1, comp_inter(mv0, mv1));
+        grid.set(3, 1, comp_inter(mv0, mv1));
+
+        let stack = find_mv_stack_compound(&grid, 2, 2, 2, 2, COMP_PAIR, 8, 8, &NO_SIGN_BIAS, None);
+
+        // Exact libaom `is_dup` port: with exactly one entry already in the
+        // stack (the four identical-pair neighbours deduped by the
+        // immediate-scan pass), the extension combine step compares only
+        // `comp_list[0]` against that entry -- a match here, since both are
+        // built from the same identical-pair neighbours -- so it takes
+        // `comp_list[1]` (the *second* ref_id slot, still the same (mv0,
+        // mv1) pair) as a brand-new stack entry rather than folding weight
+        // into the existing one. Two entries, same pair, not merged.
+        assert_eq!(stack.entries.len(), 2);
+        assert_eq!(stack.entries[0].mv0, mv0);
+        assert_eq!(stack.entries[0].mv1, mv1);
+        // 2 above + 2 left cells, weight 2 each (size:1 floor), plus the
+        // REF_CAT_LEVEL boost every immediate-scan entry gets.
+        assert_eq!(stack.entries[0].weight, 8 + REF_CAT_LEVEL);
+        assert_eq!(stack.entries[1].mv0, mv0);
+        assert_eq!(stack.entries[1].mv1, mv1);
+        assert_eq!(stack.entries[1].weight, 2);
+    }
+
+    #[test]
+    fn compound_two_distinct_pairs_sort_by_weight() {
+        let mut grid = MiGrid::new(8, 8);
+        let above = ((4, 4), (1, 1));
+        let left = ((8, 8), (2, 2));
+        grid.set(2, 3, comp_inter(above.0, above.1));
+        grid.set(2, 4, comp_inter(above.0, above.1));
+        grid.set(3, 2, comp_inter(left.0, left.1));
+        grid.set(4, 2, comp_inter(left.0, left.1));
+        grid.set(5, 2, comp_inter(left.0, left.1));
+
+        let stack = find_mv_stack_compound(&grid, 3, 3, 2, 3, COMP_PAIR, 8, 8, &NO_SIGN_BIAS, None);
+
+        assert_eq!(stack.entries.len(), 2);
+        assert_eq!(stack.entries[0].mv0, left.0);
+        assert_eq!(stack.entries[0].mv1, left.1);
+        assert_eq!(stack.entries[1].mv0, above.0);
+        assert_eq!(stack.entries[1].mv1, above.1);
+        assert_eq!(stack.nearest_mv, left);
+        assert_eq!(stack.near_mv, above);
+    }
+
+    #[test]
+    fn combine_compound_candidates_zips_ref_id_then_ref_diff_per_side() {
+        let mut lists = CompoundRefLists::default();
+        lists.ref_id[0].push((1, 1));
+        lists.ref_diff[0].push((2, 2));
+        lists.ref_id[1].push((3, 3));
+        // side 1 has only one entry -> comp_idx 1 falls back to ref_diff.
+        lists.ref_diff[1].push((4, 4));
+
+        let combined = combine_compound_candidates(&lists);
+        assert_eq!(combined[0], ((1, 1), (3, 3)));
+        assert_eq!(combined[1], ((2, 2), (4, 4)));
+    }
+
+    #[test]
+    fn process_compound_ref_mv_candidate_splits_exact_vs_borrowed() {
+        let mut lists = CompoundRefLists::default();
+        // Exact match on side 0 (LAST_FRAME), wrong ref on side 1 -> borrowed
+        // into ref_diff[1] with no sign flip (NO_SIGN_BIAS).
+        let candidate = MiInfo {
+            is_inter: true,
+            ref_frame: LAST_FRAME,
+            ref_frame1: None,
+            mv: (5, 5),
+            mv1: None,
+            is_new_mv: false,
+            size: 1,
+        };
+        process_compound_ref_mv_candidate(&candidate, COMP_PAIR, &NO_SIGN_BIAS, &mut lists);
+        assert_eq!(lists.ref_id[0], vec![(5, 5)]);
+        assert_eq!(lists.ref_diff[1], vec![(5, 5)]);
+        assert!(lists.ref_id[1].is_empty());
+        assert!(lists.ref_diff[0].is_empty());
+    }
+
+    #[test]
+    fn compound_extension_pass_tops_up_a_short_stack() {
+        // No exact-pair neighbour at all, but a LAST-only neighbour above and
+        // an ALTREF-only neighbour left: the extension pass should combine
+        // them into one topped-up candidate rather than leaving the stack
+        // empty.
+        let mut grid = MiGrid::new(8, 8);
+        grid.set(
+            1,
+            2,
+            MiInfo {
+                is_inter: true,
+                ref_frame: LAST_FRAME,
+                ref_frame1: None,
+                mv: (7, 7),
+                mv1: None,
+                is_new_mv: false,
+                size: 8,
+            },
+        );
+        grid.set(
+            2,
+            1,
+            MiInfo {
+                is_inter: true,
+                ref_frame: ALTREF_FRAME,
+                ref_frame1: None,
+                mv: (-3, -3),
+                mv1: None,
+                is_new_mv: false,
+                size: 8,
+            },
+        );
+
+        let stack = find_mv_stack_compound(&grid, 2, 2, 2, 2, COMP_PAIR, 8, 8, &NO_SIGN_BIAS, None);
+
+        // The combine step (libaom's real "Handle compound reference frame
+        // extension") zips each side's ref_id-then-ref_diff lists
+        // independently, producing *two* distinct combos here (the exact
+        // match and the borrowed one land on opposite sides for each combo
+        // index) — both get added, `MAX_MV_REF_CANDIDATES` (2) is exactly
+        // this stack's cap.
+        assert_eq!(stack.entries.len(), 2);
+        assert_eq!(stack.entries[0].weight, 2);
+        // combo 0: side 0's own exact ref_id match, side 1's borrowed one.
+        assert_eq!(stack.entries[0].mv0, (7, 7));
+        assert_eq!(stack.entries[0].mv1, (-3, -3));
+        // combo 1: the mirror -- side 0's borrowed entry, side 1's own exact
+        // ref_id match.
+        assert_eq!(stack.entries[1].mv0, (-3, -3));
+        assert_eq!(stack.entries[1].mv1, (7, 7));
     }
 }
