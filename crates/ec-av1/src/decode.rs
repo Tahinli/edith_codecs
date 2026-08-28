@@ -2488,34 +2488,6 @@ fn cdef_filter_block(
     }
 }
 
-/// Applies CDEF (spec 7.15) to the whole reconstructed frame, over its true
-/// (unpadded) `mi_cols`/`mi_rows` extent, before it is cropped to its display
-/// size. `cdef_bits == 0` is this crate's only supported case so far (see the
-/// refusal in `stream.rs`), so every 64x64 filter block always uses index 0's
-/// strengths -- no per-block `cdef_idx` selection is implemented yet.
-/// bisect scratch (lane-chromau): dump this frame's Y/U/V pre-deblock, mirrors
-/// the instrumented `aomdec` build's `EC_AV1_PREFILT_DUMP` (raw
-/// `true_width`x`true_height` bytes per plane, decode order, one file per
-/// frame index). Zero-cost/zero-behavior off. Called from both the key-frame
-/// and inter-frame tile decoders so the frame index lines up with aomdec's.
-fn scratch_dump_prefilt(y: &PlaneBuf, u: &PlaneBuf, v: &PlaneBuf) {
-    let Some(base) = std::env::var_os("EC_AV1_PREFILT_DUMP_OURS") else {
-        return;
-    };
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    static IDX: AtomicUsize = AtomicUsize::new(0);
-    let idx = IDX.fetch_add(1, Ordering::SeqCst);
-    let path = format!("{}.f{}", base.to_string_lossy(), idx);
-    let mut out = Vec::new();
-    for plane in [y, u, v] {
-        for row in 0..plane.true_height {
-            let start = row * plane.width;
-            out.extend_from_slice(&plane.data[start..start + plane.true_width]);
-        }
-    }
-    let _ = std::fs::write(path, out);
-}
-
 /// Spec 7.14: the in-loop deblocking filter, applied once per frame after
 /// tile reconstruction and before [`apply_cdef`]. Uniform-level path only --
 /// `stream.rs` already refuses `delta_lf_present`/segmentation upstream, so
@@ -3619,7 +3591,6 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         }
     }
 
-    scratch_dump_prefilt(&y, &u, &v);
     apply_deblock(&mut y, &mut u, &mut v, loop_filter, &neighbours);
     apply_cdef(&mut y, &mut u, &mut v, cdef, &neighbours);
 
@@ -3902,12 +3873,6 @@ fn read_inter_plane(
         default_tx_type,
     )?;
     let residual = dequant_and_inverse_typed(&grid, side, 8, i32::from(base_q_idx), tx_type);
-    if std::env::var_os("EC_AV1_CHROMA_TRACE").is_some() && x == 16 && y == 24 && plane_idx != 0 {
-        eprintln!(
-            "CHROMA_TRACE plane={plane_idx} x={x} y={y} side={side} tx_type={tx_type:?} \
-             q_idx={base_q_idx} grid={grid:?} pred={prediction:?} residual={residual:?}"
-        );
-    }
     plane.reconstruct_mc(x, y, side, prediction, &residual);
     Ok((grid, tx_type))
 }
@@ -4874,7 +4839,8 @@ fn decode_inter_block(
                 v_grid = vec![0i32; chroma_side * chroma_side];
             } else {
                 let around = neighbours.around(at, side);
-                luma_grid = read_inter_plane(
+                let luma_tx_type;
+                (luma_grid, luma_tx_type) = read_inter_plane(
                     dec,
                     cdfs,
                     luma_set_inter,
@@ -4888,6 +4854,7 @@ fn decode_inter_block(
                     side,
                     base_q_idx,
                     &pred_y,
+                    None,
                 )?;
                 u_grid = read_inter_plane(
                     dec,
@@ -4903,7 +4870,9 @@ fn decode_inter_block(
                     chroma_side,
                     base_q_idx,
                     &pred_u,
-                )?;
+                    Some(luma_tx_type),
+                )?
+                .0;
                 v_grid = read_inter_plane(
                     dec,
                     cdfs,
@@ -4918,7 +4887,9 @@ fn decode_inter_block(
                     chroma_side,
                     base_q_idx,
                     &pred_v,
-                )?;
+                    Some(luma_tx_type),
+                )?
+                .0;
             }
         } else {
             let ref_frame =
@@ -5166,7 +5137,8 @@ fn decode_inter_block(
                 v_grid = vec![0i32; chroma_side * chroma_side];
             } else {
                 let around = neighbours.around(at, side);
-                luma_grid = read_inter_plane(
+                let luma_tx_type;
+                (luma_grid, luma_tx_type) = read_inter_plane(
                     dec,
                     cdfs,
                     luma_set_inter,
@@ -5180,6 +5152,7 @@ fn decode_inter_block(
                     side,
                     base_q_idx,
                     &pred_y,
+                    None,
                 )?;
                 u_grid = read_inter_plane(
                     dec,
@@ -5195,7 +5168,9 @@ fn decode_inter_block(
                     chroma_side,
                     base_q_idx,
                     &pred_u,
-                )?;
+                    Some(luma_tx_type),
+                )?
+                .0;
                 v_grid = read_inter_plane(
                     dec,
                     cdfs,
@@ -5210,7 +5185,9 @@ fn decode_inter_block(
                     chroma_side,
                     base_q_idx,
                     &pred_v,
-                )?;
+                    Some(luma_tx_type),
+                )?
+                .0;
             }
         }
     } else {
@@ -5764,7 +5741,8 @@ fn decode_inter_block8(
                     v_grid = vec![0i32; CHROMA_SIDE * CHROMA_SIDE];
                 } else {
                     let around = neighbours.around_mi(leaf_mi, 8);
-                    luma_grid = read_inter_plane(
+                    let luma_tx_type;
+                    (luma_grid, luma_tx_type) = read_inter_plane(
                         dec,
                         cdfs,
                         if reduced_tx_set {
@@ -5782,6 +5760,7 @@ fn decode_inter_block8(
                         SIDE,
                         base_q_idx,
                         &pred_y,
+                        None,
                     )?;
                     u_grid = read_inter_plane(
                         dec,
@@ -5797,7 +5776,9 @@ fn decode_inter_block8(
                         CHROMA_SIDE,
                         base_q_idx,
                         &pred_u,
-                    )?;
+                        Some(luma_tx_type),
+                    )?
+                    .0;
                     v_grid = read_inter_plane(
                         dec,
                         cdfs,
@@ -5812,7 +5793,9 @@ fn decode_inter_block8(
                         CHROMA_SIDE,
                         base_q_idx,
                         &pred_v,
-                    )?;
+                        Some(luma_tx_type),
+                    )?
+                    .0;
                 }
                 return Ok((skip, is_inter, skip_mode, compound_ctx8));
             }
@@ -5962,7 +5945,8 @@ fn decode_inter_block8(
             v_grid = vec![0i32; CHROMA_SIDE * CHROMA_SIDE];
         } else {
             let around = neighbours.around_mi(leaf_mi, 8);
-            luma_grid = read_inter_plane(
+            let luma_tx_type;
+            (luma_grid, luma_tx_type) = read_inter_plane(
                 dec,
                 cdfs,
                 if reduced_tx_set {
@@ -5980,6 +5964,7 @@ fn decode_inter_block8(
                 SIDE,
                 base_q_idx,
                 &pred_y,
+                None,
             )?;
             u_grid = read_inter_plane(
                 dec,
@@ -5995,7 +5980,9 @@ fn decode_inter_block8(
                 CHROMA_SIDE,
                 base_q_idx,
                 &pred_u,
-            )?;
+                Some(luma_tx_type),
+            )?
+            .0;
             v_grid = read_inter_plane(
                 dec,
                 cdfs,
@@ -6010,7 +5997,9 @@ fn decode_inter_block8(
                 CHROMA_SIDE,
                 base_q_idx,
                 &pred_v,
-            )?;
+                Some(luma_tx_type),
+            )?
+            .0;
         }
     } else {
         let mode = dec.symbol(&mut cdfs.y_mode[SIZE_GROUP_8]);
@@ -6657,7 +6646,6 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         }
     }
 
-    scratch_dump_prefilt(&y, &u, &v);
     apply_deblock(&mut y, &mut u, &mut v, loop_filter, &neighbours);
     apply_cdef(&mut y, &mut u, &mut v, cdef, &neighbours);
 
