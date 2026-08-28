@@ -1764,6 +1764,9 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         let stream = out.stdout;
+        if let Ok(dump) = std::env::var("EC_AV1_GATE_DUMP") {
+            std::fs::write(dump, &stream).expect("dump stream");
+        }
         let before = decode::deblock_hits();
         let frames = match decode_stream(&stream) {
             Ok(frames) => frames,
