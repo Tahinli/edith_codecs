@@ -558,23 +558,26 @@ mod tests {
     /// (GOLDEN_FRAME's slot) and `ref_frame_idx[0] = 0` (LAST_FRAME's), whose
     /// lone block codes `single_ref` all the way out to `GOLDEN_FRAME`
     /// (`p1=0, p3=1, p5=1`) and a `skip` zero-MV `NEARESTMV`: a direct copy
-    /// of GOLDEN's picture. Round 4 asserted a pixel-exact decode against
-    /// ffmpeg here; round 5 (lane-av1golden2) found that only proved the
-    /// symbol path plus a whole-pel copy -- the first real aomenc GOLDEN
-    /// streams mismatch past a stacked defect, so the arm is masked again
-    /// and this fixture now asserts the mask: the stream must still reach
-    /// the `GOLDEN_FRAME` `single_ref` read (hit counter) and must then
-    /// refuse by name, not decode-and-be-wrong or misparse. Round 6
-    /// (lane-av1golden4) un-masked, found the residue is now a narrow
-    /// deblock-edge rounding defect at GOLDEN/LAST boundaries (`decode.rs`'s
-    /// round-6 note, pinned by
-    /// `stream::tests::pinned_golden4_stream_decodes_pixel_exact`), and
-    /// re-masked -- this fixture proves the symbol path and a whole-pel
-    /// copy only, not real subpel MC + deblock off the golden plane. The
-    /// fixture itself is kept verbatim -- the next round flips this test
-    /// back to the pixel-exact form the moment the live path holds.
+    /// of GOLDEN's picture, so its output must equal frame 0's own
+    /// reconstruction exactly, and must differ from frame 1's -- proof the
+    /// decoder actually read the golden plane, not silently substituted
+    /// `LAST_FRAME`'s. Rounds 4-9 masked and re-masked this arm chasing a
+    /// deblock/MC residue that turned out to be film-grain synthesis
+    /// (lane-av1golden7's `apply_grain` refusal, unrelated to GOLDEN);
+    /// lane-av1golden8 fixed mvstack's single-ref extension pass, clearing
+    /// the last real defect (`pinned_golden7` non_last_ref_hits 0->2), so
+    /// this fixture flips back to its round-4 pixel-exact form. ffmpeg
+    /// decodes the identical wire bytes as the foreign oracle
+    /// (shared-oracle-blindness class): this crate's own decoder agreeing
+    /// with itself would prove nothing.
     #[test]
-    fn a_hand_built_golden_reference_refuses_by_name() {
+    fn a_hand_built_golden_reference_decodes_pixel_exact_against_ffmpeg() {
+        if !have_ffmpeg() {
+            eprintln!(
+                "SKIP a_hand_built_golden_reference_decodes_pixel_exact_against_ffmpeg: no ffmpeg"
+            );
+            return;
+        }
         use crate::cdf_state::Cdfs;
         use crate::decode::{intra_inter_ctx, non_last_ref_hits, q_ctx_of};
         use crate::encode::{inter_frame_headers, key_frame_headers};
@@ -648,20 +651,31 @@ mod tests {
             stream.extend(frame_obu(&seq, &header2, &tile2).unwrap());
 
             let before = non_last_ref_hits();
-            let err = decode_stream(&stream).expect_err(
-                "the masked GOLDEN_FRAME arm decoded a hand-built GOLDEN stream -- \
-                 if the mask was lifted on purpose, flip this test back to its round-4 \
-                 pixel-exact form",
-            );
+            let decoded = decode_stream(&stream).unwrap();
+            assert_eq!(decoded.len(), 3, "run {run}: expected 3 pictures");
             assert!(
                 non_last_ref_hits() > before,
-                "run {run}: GOLDEN_FRAME's single_ref read never fired -- the stream \
-                 misparsed before reaching the refusal it is supposed to prove"
+                "run {run}: GOLDEN_FRAME never fired"
             );
-            let msg = err.to_string();
-            assert!(
-                msg.contains("other than LAST_FRAME"),
-                "run {run}: refused, but not by the GOLDEN mask's own name: {msg}"
+
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 3);
+            for (i, (got, want)) in decoded.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(got.y, want.y, "run {run} frame {i}: luma vs ffmpeg");
+                assert_eq!(got.u, want.u, "run {run} frame {i}: U vs ffmpeg");
+                assert_eq!(got.v, want.v, "run {run} frame {i}: V vs ffmpeg");
+            }
+            assert_eq!(
+                decoded[0].y, key.reconstruction.y,
+                "run {run}: frame 0 vs the encoder's own reconstruction"
+            );
+            assert_eq!(
+                decoded[2].y, key.reconstruction.y,
+                "run {run}: GOLDEN_FRAME's block did not reproduce the keyframe it names"
+            );
+            assert_ne!(
+                decoded[2].y, decoded[1].y,
+                "run {run}: LAST_FRAME's and GOLDEN_FRAME's slots were not actually \
+                 distinguishable -- the gate proves nothing"
             );
         }
     }
@@ -2045,11 +2059,19 @@ mod tests {
                     "--enable-palette=0",
                     "--enable-intrabc=0",
                     "--enable-cfl-intra=0",
-                    // `default` still lets aomenc's heuristic flip
+                    // `--tune-content=film` was dropped: on this box it
+                    // makes aomenc emit `apply_grain` almost every attempt
+                    // (lane-av1golden8 round 10 measurement, live: 120/120
+                    // real attempts hit a named refusal, 0 ever fired
+                    // GOLDEN_FRAME -- mostly `apply_grain`, dominated by its
+                    // own recipe flag) -- film grain synthesis has its own
+                    // dedicated refusal test and must not starve this gate
+                    // of the GOLDEN_FRAME draws it exists to prove. Default
+                    // content tuning still occasionally flips
                     // `allow_screen_content_tools` on for this synthetic
-                    // gradient content -- `film` forces the non-screen path
-                    // instead.
-                    "--tune-content=film",
+                    // gradient content (a separate, already-documented open
+                    // refusal), which the 120-attempt coin flip below
+                    // tolerates the same way.
                     "--obu",
                     "-o",
                     "-",
