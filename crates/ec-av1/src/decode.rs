@@ -132,6 +132,18 @@ static BWDREF_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUs
 static ALTREF2_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static ALTREF_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// How many [`read_comp_mode`] reads resolved `COMPOUND_REFERENCE` (lane-av1comp)
+/// -- proves a `reference_select` stream actually reached a block that picked
+/// compound, not just that the header bit was set. Every such block is
+/// refused after this fires ([`decode_inter_block`]/[`decode_inter_block8`]),
+/// so this only ever counts attempted reads, never a completed decode.
+static COMP_MODE_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Current value of [`COMP_MODE_HITS`].
+pub(crate) fn comp_mode_hits() -> usize {
+    COMP_MODE_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// How many query blocks folded in at least one temporal MV candidate
 /// (spec 7.10.2.8's `add_tpl_ref_mv`) so far in this process -- the
 /// temporal-MV gate's own firing counter (lane-av1tmvp).
@@ -3799,12 +3811,9 @@ fn read_single_ref(dec: &mut SymbolDecoder, cdfs: &mut Cdfs, above_ref: i8, left
 /// `reference_select` header bit lets a block choose per-block instead of
 /// fixing the mode. `above`/`left` are `None` for an intra/unavailable
 /// neighbour, [`NeighbourRef`] for a coded one -- [`reference_mode_ctx`]'s
-/// own doc. Not yet called from [`decode_inter_block`]/
-/// [`decode_inter_block8`]: `decode_stream`'s frame-level `reference_select`
-/// refusal still gates every caller, so this and
-/// [`read_compound_ref_frames`] are dead code today, kept compiling and
-/// reviewable for the round that wires them.
-#[allow(dead_code)]
+/// own doc. Called from [`decode_inter_block`] once its own `reference_select`
+/// parameter is set; [`decode_inter_block8`]'s 8x8 leaf path gates the same
+/// way with a coarser (`LAST_FRAME`-only) neighbour shape.
 fn read_comp_mode(
     dec: &mut SymbolDecoder,
     cdfs: &mut Cdfs,
@@ -3812,7 +3821,11 @@ fn read_comp_mode(
     left: Option<NeighbourRef>,
 ) -> bool {
     let ctx = reference_mode_ctx(above, left);
-    dec.symbol(&mut cdfs.comp_mode[ctx]) == 1
+    let compound = dec.symbol(&mut cdfs.comp_mode[ctx]) == 1;
+    if compound {
+        COMP_MODE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    compound
 }
 
 /// Spec 5.11.25's `comp_reference_type` + the `uni_comp_ref`/`comp_ref`/
@@ -3829,7 +3842,10 @@ fn read_comp_mode(
 /// (same vote-the-neighbours-above-left shape, same forward/backward and
 /// LAST/LAST2/LAST3/GOLDEN groupings) -- lane-av1comp audited each one
 /// against the C source rather than porting six near-duplicate functions.
-#[allow(dead_code)]
+/// Its caller today only needs the symbols consumed, correctly, to keep the
+/// arithmetic decoder's own state in sync before refusing the block by name
+/// -- the returned pair is not yet threaded into any motion-compensation
+/// path.
 fn read_compound_ref_frames(
     dec: &mut SymbolDecoder,
     cdfs: &mut Cdfs,
@@ -3939,6 +3955,13 @@ fn decode_inter_block(
     interp_fixed: Option<mc::InterpFilterKind>,
     enable_dual_filter: bool,
     tpl_frame: Option<&TplFrameArgs>,
+    // lane-av1comp: this frame header's own `reference_select` bit -- `false`
+    // means every block is `SINGLE_REFERENCE` by construction and `comp_mode`
+    // is never read (spec 5.11.25); `true` reads `comp_mode` per block and
+    // refuses (rather than silently misdecoding) the ones that pick
+    // `COMPOUND_REFERENCE`, since two-reference motion compensation is not
+    // wired yet.
+    reference_select: bool,
 ) -> Result<()> {
     let (r, c) = at;
     let (px, py) = (c * SUB, r * SUB);
@@ -3959,6 +3982,42 @@ fn decode_inter_block(
     let ref_frame_for_lf;
     let globalmv_for_lf;
     if is_inter {
+        if reference_select {
+            let above_nbr = has_above.then(|| NeighbourRef {
+                is_inter: above_inter,
+                ref0: if above_inter {
+                    neighbours.above_ref[c]
+                } else {
+                    0
+                },
+                ref1: neighbours.above_ref1[c],
+                uni: false,
+            });
+            let left_nbr = has_left.then(|| NeighbourRef {
+                is_inter: left_inter,
+                ref0: if left_inter {
+                    neighbours.left_ref[r]
+                } else {
+                    0
+                },
+                ref1: neighbours.left_ref1[r],
+                uni: false,
+            });
+            if read_comp_mode(dec, cdfs, above_nbr, left_nbr) {
+                read_compound_ref_frames(
+                    dec,
+                    cdfs,
+                    above_nbr,
+                    left_nbr,
+                    neighbours.above_ref[c],
+                    neighbours.left_ref[r],
+                );
+                return Err(unsupported(
+                    "a COMPOUND_REFERENCE block (comp_mode/comp_ref read correctly; \
+                     two-reference motion compensation is not wired yet -- lane-av1comp)",
+                ));
+            }
+        }
         let ref_frame = read_single_ref(dec, cdfs, neighbours.above_ref[c], neighbours.left_ref[r]);
         ref_frame_for_lf = ref_frame;
         // round 4-9 (lane-av1golden..lane-av1golden7): GOLDEN_FRAME's own
@@ -4440,6 +4499,11 @@ fn decode_inter_block8(
     scan4: &[u16],
     prev_leaf: Option<((usize, usize), bool, bool)>,
     allow_high_precision_mv: bool,
+    // lane-av1comp: see [`decode_inter_block`]'s own doc -- this leaf path
+    // only ever tracks a coarse `LAST_FRAME`-or-intra neighbour shape (no
+    // per-leaf `above_ref`/`left_ref` array exists here), so `comp_mode`'s
+    // context uses that same approximation.
+    reference_select: bool,
 ) -> Result<(bool, bool)> {
     const LAST_FRAME: i8 = 1;
     /// `Y_MODE`'s size group (`common_data.h`'s `size_group_lookup[BLOCK_8X8]`).
@@ -4474,6 +4538,42 @@ fn decode_inter_block8(
     let mode_for_tx;
     let (luma_grid, u_grid, v_grid);
     if is_inter {
+        if reference_select {
+            let above_nbr = has_above.then(|| NeighbourRef {
+                is_inter: above_inter,
+                ref0: if above_inter { LAST_FRAME } else { 0 },
+                ref1: None,
+                uni: false,
+            });
+            let left_nbr = has_left.then(|| NeighbourRef {
+                is_inter: left_inter,
+                ref0: if left_inter { LAST_FRAME } else { 0 },
+                ref1: None,
+                uni: false,
+            });
+            if read_comp_mode(dec, cdfs, above_nbr, left_nbr) {
+                read_compound_ref_frames(
+                    dec,
+                    cdfs,
+                    above_nbr,
+                    left_nbr,
+                    if has_above && above_inter {
+                        LAST_FRAME
+                    } else {
+                        -1
+                    },
+                    if has_left && left_inter {
+                        LAST_FRAME
+                    } else {
+                        -1
+                    },
+                );
+                return Err(unsupported(
+                    "a COMPOUND_REFERENCE 8x8 leaf (comp_mode/comp_ref read correctly; \
+                     two-reference motion compensation is not wired yet -- lane-av1comp)",
+                ));
+            }
+        }
         let sr_ctx = single_ref_ctx(above_inter || left_inter);
         let p1 = dec.symbol(&mut cdfs.single_ref[sr_ctx][0]);
         let p3 = dec.symbol(&mut cdfs.single_ref[sr_ctx][2]);
@@ -4843,6 +4943,7 @@ pub fn decode_inter_frame_tile(
     allow_high_precision_mv: bool,
     interp_fixed: Option<mc::InterpFilterKind>,
     enable_dual_filter: bool,
+    reference_select: bool,
 ) -> Result<Picture> {
     decode_inter_frame_tile_with_cdfs(
         data,
@@ -4864,6 +4965,7 @@ pub fn decode_inter_frame_tile(
         0,
         [0; 7],
         None,
+        reference_select,
     )
     .map(|(picture, _, _)| picture)
 }
@@ -4898,6 +5000,9 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     order_hint: u32,
     ref_order_hints: [u32; 7],
     tpl_field: Option<&crate::motion_field::TplField>,
+    // lane-av1comp: this frame header's own `reference_select` bit, threaded
+    // to every `decode_inter_block`/`decode_inter_block8` call below.
+    reference_select: bool,
 ) -> Result<(Picture, Cdfs, crate::motion_field::MotionField)> {
     let tpl_frame = tpl_field.map(|field| TplFrameArgs {
         field,
@@ -5094,6 +5199,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             interp_fixed,
                             enable_dual_filter,
                             tpl_frame.as_ref(),
+                            reference_select,
                         )?;
                     }
                     PARTITION_SPLIT => {
@@ -5152,6 +5258,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     interp_fixed,
                                     enable_dual_filter,
                                     tpl_frame.as_ref(),
+                                    reference_select,
                                 )?;
                             } else {
                                 let ctx16 = neighbours.partition_ctx(at16, SUB);
@@ -5201,6 +5308,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                         &scan4,
                                         prev_leaf,
                                         allow_high_precision_mv,
+                                        reference_select,
                                     )?;
                                     prev_leaf = Some((leaf_mi, skip, is_inter));
                                 }
@@ -5722,6 +5830,7 @@ mod tests {
                 false,
                 Some(mc::InterpFilterKind::Regular),
                 false,
+                false,
             )
             .unwrap();
             assert_eq!(
@@ -5903,6 +6012,7 @@ mod tests {
             Some(mc::InterpFilterKind::Regular),
             false,
             None,
+            false,
         )
         .unwrap();
 
@@ -5995,6 +6105,7 @@ mod tests {
                 &LoopFilterParams::default(),
                 false,
                 Some(mc::InterpFilterKind::Regular),
+                false,
                 false,
             )
             .unwrap();

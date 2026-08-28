@@ -178,19 +178,20 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 "an inter frame whose global motion for a single-reference frame is not IDENTITY (GLOBALMV needs the full warp derivation this decoder does not carry)",
             ));
         }
-        // `decode_inter_block`'s `single_ref_p*` chain codes only
-        // `SINGLE_REFERENCE` blocks (never reads `comp_mode`) -- a frame
-        // whose `reference_select` header bit lets any block choose
-        // `COMPOUND_REFERENCE` would desync at the first block that reads
-        // a `comp_mode` symbol this decoder never consumes. `skip_mode`
-        // (spec 5.9.22) is provably unreachable here as a consequence: its
-        // own `skip_mode_params()` only sets `skip_mode_present` when
-        // `reference_select` is set, so refusing `reference_select` refuses
-        // `skip_mode` too, without needing a second check.
-        if header.reference_select {
+        // lane-av1comp: `decode_inter_block`/`decode_inter_block8` now read
+        // `comp_mode` per block whenever this frame's own `reference_select`
+        // header bit is set (spec 5.11.25), and refuse by name the blocks
+        // that pick `COMPOUND_REFERENCE` -- two-reference motion
+        // compensation is not wired yet. `skip_mode` (spec 5.9.22) is a
+        // separate header bit `skip_mode_params()` only ever sets alongside
+        // `reference_select`, but never implied by it (an encoder may leave
+        // `skip_mode_present` false even with `reference_select` true); it
+        // still needs its own refusal since no block-level reader for it
+        // exists.
+        if header.skip_mode_present {
             return Err(Error::unsupported(
                 "AV1 decode_stream",
-                "a frame with reference_select set (this decoder never reads comp_mode / codes only single-reference blocks)",
+                "a frame with skip_mode_present set (this decoder never reads skip_mode)",
             ));
         }
         // `context_update_tile_id` (spec `decode_tile`/`exit_symbol`) names
@@ -337,6 +338,7 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 header.order_hint,
                 ref_order_hints,
                 tpl_field.as_ref(),
+                header.reference_select,
             )?
         };
         // Spec 7.20: `disable_frame_end_update_cdf` stores the frame's
@@ -2396,6 +2398,172 @@ mod tests {
         eprintln!(
             "SKIP {gate_name}: {never_fired} attempts decoded but never fired {target_ref_name}, \
              and every other attempt hit a named refusal:\n{}",
+            refusals.join("\n")
+        );
+    }
+
+    /// lane-av1comp: proves `reference_select`/`comp_mode` are actually read
+    /// off a real bitstream rather than only unit-tested in isolation --
+    /// `--auto-alt-ref=1 --lag-in-frames=16` gives aomenc a backward
+    /// reference to pick `COMPOUND_REFERENCE` with, `--enable-order-hint=1`
+    /// is required for it to ever consider compound at all. Two acceptable
+    /// outcomes: (a) a stream where `reference_select` never actually drove
+    /// a block to `COMPOUND_REFERENCE` decodes bit-exact end to end (proving
+    /// the per-block `comp_mode` read did not desync the single-ref blocks
+    /// around it); (b) a stream that does fire compound is refused by name
+    /// with [`COMP_MODE_HITS`] having advanced (proving `comp_mode`/
+    /// `read_compound_ref_frames` consumed the right symbols before
+    /// refusing, rather than desyncing and refusing for an unrelated
+    /// reason). Masked/wedge/interintra compound stay pinned off
+    /// (readiness step 4): this decoder never reconstructs any compound
+    /// prediction yet, so what fires plain `COMPOUND_AVERAGE` vs. a masked
+    /// variant does not change which of (a)/(b) applies.
+    #[test]
+    fn a_real_aomenc_stream_with_reference_select_reads_comp_mode_correctly() {
+        const NAME: &str = "a_real_aomenc_stream_with_reference_select_reads_comp_mode_correctly";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height, frame_count) = (64usize, 64usize, 20usize);
+        let mut refusals = Vec::new();
+        let mut never_fired = 0u32;
+        for attempt in 0..60u32 {
+            let seed = 42 + attempt % 40;
+            let duration = frame_count as f64 / 25.0;
+            let source =
+                format!("gradients=size={width}x{height}:seed={seed}:duration={duration}:rate=25");
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let args: Vec<&str> = vec![
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                "--cq-level=45",
+                "--cpu-used=0",
+                "--kf-max-dist=1000",
+                "--threads=1",
+                "--row-mt=0",
+                "--auto-alt-ref=1",
+                "--lag-in-frames=16",
+                "--enable-order-hint=1",
+                "--enable-warped-motion=0",
+                "--enable-obmc=0",
+                "--enable-masked-comp=0",
+                "--enable-interintra-comp=0",
+                "--enable-onesided-comp=0",
+                "--enable-interintra-wedge=0",
+                "--enable-smooth-interintra=0",
+                "--enable-rect-partitions=0",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0",
+                "--enable-filter-intra=0",
+                "--enable-smooth-intra=0",
+                "--enable-paeth-intra=0",
+                "--enable-directional-intra=0",
+                "--enable-angle-delta=0",
+                "--enable-tx-size-search=0",
+                "--enable-cdef=0",
+                "--enable-restoration=0",
+                "--max-partition-size=32",
+                "--min-partition-size=32",
+                "--enable-palette=0",
+                "--enable-intrabc=0",
+                "--enable-cfl-intra=0",
+                "--enable-ref-frame-mvs=0",
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ];
+            let mut child = Command::new(aomenc_path())
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let before = decode::comp_mode_hits();
+            match decode_stream(&stream) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    let fired = decode::comp_mode_hits() > before;
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME} failed outright (seed {seed}): {msg}"
+                    );
+                    if fired {
+                        assert!(
+                            msg.contains("COMPOUND_REFERENCE"),
+                            "{NAME}: comp_mode fired (seed {seed}) but the refusal \
+                             was for something else: {msg}"
+                        );
+                        let advanced = decode::comp_mode_hits() - before;
+                        eprintln!(
+                            "{NAME} FIRING seed {seed}: comp_mode hits advanced by \
+                             {advanced}, refused by name as expected: {msg}"
+                        );
+                        return;
+                    }
+                    refusals.push(format!("seed {seed}: {msg}"));
+                    continue;
+                }
+                Ok(frames) => {
+                    if decode::comp_mode_hits() == before {
+                        never_fired += 1;
+                        continue;
+                    }
+                    let _ = frames;
+                    panic!(
+                        "{NAME}: comp_mode fired (seed {seed}) yet decode_stream returned Ok \
+                         -- a compound block was decoded without being refused"
+                    );
+                }
+            }
+        }
+        eprintln!(
+            "SKIP {NAME}: {never_fired} attempts decoded fully (reference_select never drove a \
+             block to COMPOUND_REFERENCE) and every other attempt hit a named refusal that never \
+             reached comp_mode:\n{}",
             refusals.join("\n")
         );
     }
