@@ -296,6 +296,9 @@ pub(crate) struct Cdfs {
     /// Whether a block reads `SINGLE_REFERENCE` or `COMPOUND_REFERENCE`
     /// (lane-av1comp, spec 5.11.25's `comp_mode`).
     pub comp_mode: [[u16; 3]; 5],
+    /// Whether a block reads `skip_mode` (lane-av1comp, spec 5.11.29's
+    /// `skip_mode`), indexed by `av1_get_skip_mode_context`.
+    pub skip_mode: [[u16; 3]; 3],
     /// Which of the eight `INTER_COMPOUND_MODES` a `COMPOUND_REFERENCE`
     /// block takes (lane-av1comp, spec 5.11.24's `compound_mode`).
     pub inter_compound_mode: [[u16; 9]; 8],
@@ -523,6 +526,7 @@ impl Cdfs {
         reset2(&mut self.intra_inter);
         reset3(&mut self.single_ref);
         reset2(&mut self.comp_mode);
+        reset2(&mut self.skip_mode);
         reset2(&mut self.inter_compound_mode);
         reset2(&mut self.comp_ref_type);
         reset3(&mut self.uni_comp_ref);
@@ -960,6 +964,7 @@ impl Cdfs {
             uni_comp_ref: cdf::UNI_COMP_REF,
             comp_ref: cdf::COMP_REF,
             comp_bwdref: cdf::COMP_BWDREF,
+            skip_mode: cdf::SKIP_MODE,
             comp_group_idx: cdf::COMP_GROUP_IDX,
             compound_idx: cdf::COMPOUND_IDX,
             y_mode: cdf::Y_MODE,

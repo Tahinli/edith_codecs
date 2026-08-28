@@ -1177,6 +1177,14 @@ pub const SINGLE_REF: [[[u16; 3]; 6]; 3] = [
     ],
 ];
 
+/// `default_skip_mode_cdfs` (entropymode.c, `SKIP_MODE_CONTEXTS` = 3): whether
+/// a block reads `skip_mode` (forced `NEAREST_NEARESTMV` compound, `skip`
+/// forced true, no residual) -- indexed by `av1_get_skip_mode_context`
+/// (`above.skip_mode + left.skip_mode`, `pred_common.h`), only read when this
+/// frame's own `skip_mode_present` header bit is set and the block is at
+/// least 8x8 both dims (`is_comp_ref_allowed`) -- lane-av1comp.
+pub const SKIP_MODE: [[u16; 3]; 3] = [[32621, 32768, 0], [20708, 32768, 0], [8127, 32768, 0]];
+
 /// `Default_Comp_Mode_Cdf` (spec 9.4, `default_comp_inter_cdf`): whether an
 /// inter block reads `SINGLE_REFERENCE` or `COMPOUND_REFERENCE` -- only
 /// reached once `read_ref_frames` knows the frame's `reference_select`
