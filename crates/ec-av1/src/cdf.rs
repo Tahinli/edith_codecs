@@ -1218,6 +1218,20 @@ pub const OBMC: [[u16; 3]; 4] = [
     [30128, 32768, 0],
 ];
 
+/// `default_interintra_cdf` (spec 9.4): `interintra`, indexed by
+/// `size_group_lookup[bsize]` (0..=3) -- read only when the sequence header's
+/// `enable_interintra_compound` is set and `is_interintra_allowed(mbmi)`
+/// holds (single-ref, `BLOCK_8X8..=BLOCK_32X32`, mode `NEARESTMV..NEWMV`);
+/// lane-sb128 r3: consuming this symbol (even always-refused on `interintra
+/// == 1`) is required to stay bit-aligned with every later block once the
+/// sequence header turns the tool on -- see decode.rs's own read site.
+pub const INTERINTRA: [[u16; 3]; 4] = [
+    [16384, 32768, 0],
+    [26887, 32768, 0],
+    [27597, 32768, 0],
+    [30237, 32768, 0],
+];
+
 /// `Default_Comp_Mode_Cdf` (spec 9.4, `default_comp_inter_cdf`): whether an
 /// inter block reads `SINGLE_REFERENCE` or `COMPOUND_REFERENCE` -- only
 /// reached once `read_ref_frames` knows the frame's `reference_select`
