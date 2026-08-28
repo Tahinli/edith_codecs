@@ -525,6 +525,70 @@ pub fn combine_compound(
     }
 }
 
+/// lane-maskcomp r2: `build_compound_diffwtd_mask` (reconinter.c) --
+/// `DIFFWTD_38`/`DIFFWTD_38_INV` (`mask_type` bit: 0/1). Operates directly on
+/// the two [`predict_compound_intermediate`] outputs: libaom's own
+/// `av1_build_compound_diffwtd_mask_d16_c` runs on its CONV_BUF domain (which
+/// carries a constant `round_offset` bias baked into every sample by its
+/// convolve stage), but `abs(src0 - src1)` cancels an equal bias on both
+/// sides exactly, so the unbiased `i32` intermediates this crate already
+/// produces give the identical `diff` libaom computes. `round` is
+/// `2*FILTER_BITS - round_0 - round_1 + (bd-8)` == [`INTER_POST_ROUND`] for
+/// 8-bit content (`round_0=3`, compound `round_1=7`, `bd=8`).
+pub fn diffwtd_mask(pred0: &[i32], pred1: &[i32], inv: bool, mask: &mut [u8]) {
+    assert_eq!(pred0.len(), pred1.len(), "both refs predict the same block");
+    assert_eq!(mask.len(), pred0.len(), "one mask byte per pixel");
+    for i in 0..mask.len() {
+        let diff = round2((pred0[i] - pred1[i]).abs(), INTER_POST_ROUND);
+        let m = (38 + diff / 16).clamp(0, 64);
+        mask[i] = if inv { (64 - m) as u8 } else { m as u8 };
+    }
+}
+
+/// lane-maskcomp r2: `aom_lowbd_blend_a64_d16_mask_c` (blend_a64_mask.c),
+/// algebraically simplified to this crate's unbiased `i32` intermediate
+/// domain the same way [`diffwtd_mask`]'s doc comment derives -- libaom's
+/// `res -= round_offset` step cancels exactly against the bias `m + (64-m)
+/// == 64` contributes equally from both inputs, leaving `(m*pred0 +
+/// (64-m)*pred1) >> 6` (a plain, unrounded shift, matching the C `>>` on
+/// `int32_t`) then one final [`round2`] by [`INTER_POST_ROUND`]. `mask` is
+/// always the LUMA-resolution mask (`mask_stride` == luma block width);
+/// `subsampled` selects the 2x2-average chroma read (spec 7.11.3.14 /
+/// libaom's `subw == 1 && subh == 1` branch) vs. the direct luma read.
+#[allow(clippy::too_many_arguments)]
+pub fn blend_masked_compound(
+    pred0: &[i32],
+    pred1: &[i32],
+    mask: &[u8],
+    mask_stride: usize,
+    w: usize,
+    h: usize,
+    subsampled: bool,
+    dst: &mut [u8],
+) {
+    assert_eq!(pred0.len(), w * h, "pred0 is the destination-sized block");
+    assert_eq!(pred1.len(), w * h, "pred1 is the destination-sized block");
+    assert_eq!(dst.len(), w * h, "the destination is the block");
+    for i in 0..h {
+        for j in 0..w {
+            let m = if subsampled {
+                let idx = (2 * i) * mask_stride + 2 * j;
+                round2(
+                    i32::from(mask[idx])
+                        + i32::from(mask[idx + 1])
+                        + i32::from(mask[idx + mask_stride])
+                        + i32::from(mask[idx + mask_stride + 1]),
+                    2,
+                )
+            } else {
+                i32::from(mask[i * mask_stride + j])
+            };
+            let res = (m * pred0[i * w + j] + (64 - m) * pred1[i * w + j]) >> 6;
+            dst[i * w + j] = round2(res, INTER_POST_ROUND).clamp(0, 255) as u8;
+        }
+    }
+}
+
 /// Whole-pel identity case: [`predict_compound_intermediate`]'s two-pass
 /// filter reduces to `16 * source_sample` exactly (the fraction-0 row is a
 /// single `128` tap both passes, and `128*128 == 1 << 14`, `14 - 7 == 7 ==
