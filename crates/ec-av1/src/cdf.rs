@@ -1105,6 +1105,26 @@ pub const INTER_TX_TYPE_SET3_16: [u16; 3] = [1998, 32768, 0];
 /// `default_inter_ext_tx_cdf[EXT_TX_SET_DCT_IDTX][TX_8X8]`).
 pub const INTER_TX_TYPE_SET3_8: [u16; 3] = [4167, 32768, 0];
 
+/// `Default_Inter_Ext_Tx_Cdf`'s `TX_SET_INTER_2` (`EXT_TX_SET_DTT9_IDTX_1DDCT`)
+/// row for `TX_16X16` (lane-cdffwd2, spec 9.4/5.11.48): the twelve-symbol
+/// transform type of an `is_inter` 16x16 luma transform when `reduced_tx_set
+/// == 0` -- `av1_get_ext_tx_set_type`'s `av1_ext_tx_set_lookup[1][1]`, not
+/// [`INTER_TX_TYPE_SET3_16`]'s two-symbol reduced set (libaom
+/// `entropymode.c` `default_inter_ext_tx_cdf[2][TX_16X16]`).
+pub const INTER_TX_TYPE_SET2_16: [u16; 13] = [
+    770, 2421, 5225, 12907, 15819, 18927, 21561, 24089, 26595, 28526, 30529, 32768, 0,
+];
+
+/// `Default_Inter_Ext_Tx_Cdf`'s `TX_SET_INTER_1` (`EXT_TX_SET_ALL16`) row for
+/// `TX_8X8` (lane-cdffwd2): the full sixteen-symbol transform type of an
+/// `is_inter` 8x8 luma transform when `reduced_tx_set == 0`
+/// (`av1_ext_tx_set_lookup[1][0]`, libaom `entropymode.c`
+/// `default_inter_ext_tx_cdf[1][TX_8X8]`).
+pub const INTER_TX_TYPE_SET1_8: [u16; 17] = [
+    1645, 2573, 4778, 5711, 7807, 8622, 10522, 15357, 17674, 20408, 22517, 25010, 27116, 28856,
+    30749, 32768, 0,
+];
+
 // The inter-frame tables below (spec 9.4) support the syntax an inter block
 // needs: whether it is coded as intra at all, which reference frame and
 // motion vector it takes when it is not. The compound-reference tables
