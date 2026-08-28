@@ -5529,6 +5529,12 @@ fn decode_inter_block(
 
             let (mi_row, mi_col) = (r * SUB_MI as usize, c * SUB_MI as usize);
             let bw4 = side / 4;
+            // lane-warp r5d: `reject_residual` marks the HORZ_B arm's top
+            // strip, decoded as a square 32x32 block but truly 32x16 -- the
+            // mv stack must be queried with the block's REAL extent (libaom
+            // `av1_get_mv_refs` gets bw4=8, bh4=4), else scan_col, the
+            // corner probes and `clamp_mv_ref` all size a 32-tall block.
+            let bh4 = if reject_residual { bw4 / 2 } else { bw4 };
             // spec 7.10.2.8: only reached when the frame header set
             // `use_ref_frame_mvs` (`tpl_frame` is `Some` then, `None`
             // otherwise) -- `cur_offset_0` is this query block's own resolved
@@ -5548,7 +5554,7 @@ fn decode_inter_block(
                 mi_row,
                 mi_col,
                 bw4,
-                bw4,
+                bh4,
                 ref_frame,
                 mi_cols as usize,
                 mi_rows as usize,
