@@ -5689,6 +5689,11 @@ fn decode_inter_block(
             // fallback here since this decoder's global motion is always
             // IDENTITY).
             let mut warp_params: Option<crate::warp::WarpParams> = None;
+            // Tracks the SYMBOL value, not projection validity: libaom's
+            // `av1_is_interp_needed` suppresses the interp-filter read for
+            // `motion_mode == WARPED_CAUSAL` even when the projection later
+            // falls back to translation.
+            let mut warped_selected = false;
             if motion_mode_eligible {
                 // `default_obmc_cdf`'s own index: square bsize 8/16/32/64 -> 0/1/2/3.
                 let bsize_idx = (side.trailing_zeros() - 3) as usize;
@@ -5706,6 +5711,7 @@ fn decode_inter_block(
                             OBMC_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
                         _ => {
+                            warped_selected = true;
                             WARP_SELECTED_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let mut samples = find_samples(
                                 grid,
@@ -5791,7 +5797,7 @@ fn decode_inter_block(
                 cdfs,
                 interp_fixed,
                 enable_dual_filter,
-                is_globalmv,
+                is_globalmv || warped_selected,
                 above_filter_ctx,
                 left_filter_ctx,
                 false,
