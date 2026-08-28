@@ -4622,7 +4622,22 @@ fn decode_inter_block(
 
     let skip_mode_ctx =
         usize::from(neighbours.above_skip_mode[c]) + usize::from(neighbours.left_skip_mode[r]);
+    // lane-comppin r3: skip_mode desync isolation -- dump ctx + the pre-read
+    // MSAC tell so it can be diffed against an equivalent hook in libaom's
+    // own `read_skip_mode`/`av1_get_skip_mode_context`.
+    if std::env::var_os("EC_AV1_SKIPMODE_DUMP").is_some() {
+        eprintln!(
+            "EC_SKIPMODE r={r} c={c} ctx={skip_mode_ctx} skip_mode_present={skip_mode_present} tell_before={}",
+            dec.debug_bitpos()
+        );
+    }
     let skip_mode = skip_mode_present && dec.symbol(&mut cdfs.skip_mode[skip_mode_ctx]) == 1;
+    if std::env::var_os("EC_AV1_SKIPMODE_DUMP").is_some() {
+        eprintln!(
+            "EC_SKIPMODE r={r} c={c} result={skip_mode} tell_after={}",
+            dec.debug_bitpos()
+        );
+    }
     if skip_mode {
         SKIP_MODE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
