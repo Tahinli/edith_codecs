@@ -2612,6 +2612,7 @@ pub(crate) fn encode_inter_frame(
                                     Some(info) => MiInfo {
                                         is_inter: true,
                                         ref_frame: LAST_FRAME,
+                                        ref_frame1: None,
                                         mv: info.mv,
                                         is_new_mv: matches!(info.mode, InterMode::NewMv),
                                         size: 8,
@@ -2623,6 +2624,7 @@ pub(crate) fn encode_inter_frame(
                                     None => MiInfo {
                                         is_inter: false,
                                         ref_frame: -1,
+                                        ref_frame1: None,
                                         mv: (0, 0),
                                         is_new_mv: false,
                                         size: 8,
@@ -2700,6 +2702,7 @@ pub(crate) fn encode_inter_frame(
                                             Some(info) => MiInfo {
                                                 is_inter: true,
                                                 ref_frame: LAST_FRAME,
+                                                ref_frame1: None,
                                                 mv: info.mv,
                                                 is_new_mv: matches!(info.mode, InterMode::NewMv),
                                                 size: 4,
@@ -2707,6 +2710,7 @@ pub(crate) fn encode_inter_frame(
                                             None => MiInfo {
                                                 is_inter: false,
                                                 ref_frame: -1,
+                                                ref_frame1: None,
                                                 mv: (0, 0),
                                                 is_new_mv: false,
                                                 size: 4,
@@ -2750,6 +2754,7 @@ pub(crate) fn encode_inter_frame(
                                                 Some(info) => MiInfo {
                                                     is_inter: true,
                                                     ref_frame: LAST_FRAME,
+                                                    ref_frame1: None,
                                                     mv: info.mv,
                                                     is_new_mv: matches!(
                                                         info.mode,
@@ -2760,6 +2765,7 @@ pub(crate) fn encode_inter_frame(
                                                 None => MiInfo {
                                                     is_inter: false,
                                                     ref_frame: -1,
+                                                    ref_frame1: None,
                                                     mv: (0, 0),
                                                     is_new_mv: false,
                                                     size: 2,

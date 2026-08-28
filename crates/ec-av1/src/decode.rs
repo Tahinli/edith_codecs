@@ -750,6 +750,14 @@ struct Neighbours {
     /// enough).
     above_ref: Vec<i8>,
     left_ref: Vec<i8>,
+    /// The block above/left's *second* reference frame when it was coded
+    /// compound (spec `RefFrames[1]`), or `None` for single-ref/intra --
+    /// lane-av1comp: `mvstack::reference_mode_ctx`/`comp_reference_type_ctx`
+    /// need a full [`crate::mvstack::NeighbourRef`], not just `above_ref`'s
+    /// `i8`, once a compound `read_ref_frames` lands. Always `None` today
+    /// (no decode path here ever produces a compound block yet).
+    above_ref1: Vec<Option<i8>>,
+    left_ref1: Vec<Option<i8>>,
     /// `interp_filter[0]`/`[1]` (horizontal/vertical kernel index, 0..=2, or
     /// `3` = "no info": an intra neighbour or the frame's own border) of the
     /// block above/left of this column/row -- spec
@@ -802,6 +810,8 @@ impl Neighbours {
             left_inter: vec![false; rows],
             above_ref: vec![-1; cols],
             left_ref: vec![-1; rows],
+            above_ref1: vec![None; cols],
+            left_ref1: vec![None; rows],
             above_filter: vec![[3u8; 2]; cols],
             left_filter: vec![[3u8; 2]; rows],
             mi_cols,
@@ -885,6 +895,7 @@ impl Neighbours {
         self.left_skip.iter_mut().for_each(|s| *s = false);
         self.left_inter.iter_mut().for_each(|i| *i = false);
         self.left_ref.iter_mut().for_each(|r| *r = -1);
+        self.left_ref1.iter_mut().for_each(|r| *r = None);
         self.left_filter.iter_mut().for_each(|f| *f = [3u8; 2]);
     }
 
@@ -912,6 +923,11 @@ impl Neighbours {
             self.left_inter[r + cell] = is_inter;
             self.above_ref[c + cell] = ref_frame;
             self.left_ref[r + cell] = ref_frame;
+            // lane-av1comp: no caller of `record_inter` ever decodes a
+            // compound block yet (see [`Self::above_ref1`]'s doc); the
+            // parameter this becomes lands with `read_ref_frames`.
+            self.above_ref1[c + cell] = None;
+            self.left_ref1[r + cell] = None;
             self.above_filter[c + cell] = filter;
             self.left_filter[r + cell] = filter;
         }
@@ -4003,6 +4019,7 @@ fn decode_inter_block(
                     MiInfo {
                         is_inter: true,
                         ref_frame,
+                        ref_frame1: None,
                         mv,
                         is_new_mv,
                         size: bw4,
@@ -4158,6 +4175,7 @@ fn decode_inter_block(
                     MiInfo {
                         is_inter: false,
                         ref_frame: -1,
+                        ref_frame1: None,
                         mv: (0, 0),
                         is_new_mv: false,
                         size: side / 4,
@@ -4436,6 +4454,7 @@ fn decode_inter_block8(
                     MiInfo {
                         is_inter: true,
                         ref_frame: LAST_FRAME,
+                        ref_frame1: None,
                         mv,
                         is_new_mv,
                         size: 2,
@@ -4580,6 +4599,7 @@ fn decode_inter_block8(
                     MiInfo {
                         is_inter: false,
                         ref_frame: -1,
+                        ref_frame1: None,
                         mv: (0, 0),
                         is_new_mv: false,
                         size: 2,
@@ -5659,6 +5679,7 @@ mod tests {
         let neighbour = |mv| MiInfo {
             is_inter: true,
             ref_frame: LAST_FRAME,
+            ref_frame1: None,
             mv,
             is_new_mv: false,
             size: 1,
