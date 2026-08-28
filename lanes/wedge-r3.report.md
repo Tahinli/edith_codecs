@@ -63,10 +63,12 @@ an independent C dump, gate fires live (475 wedge hits / 20 attempts), 20/20 pix
   mismatches, so this is belt-and-suspenders, not missing coverage — next
   round if a flake ever surfaces.
 - Full `cargo test -p ec-av1 --release --lib` (11-pin default list + whole
-  suite) was launched in background under budget pressure; see the bash
-  task output for the pass/fail tally -- if this report was committed
-  before that background run finished, treat the lib-green claim as
-  PENDING, not asserted, and check the task output file directly.
+  suite) completed after this report's first commit:
+  `test result: ok. 221 passed; 0 failed; 17 ignored; 0 measured; 0 filtered
+  out; finished in 317.31s` -- includes both `wedge_codebook_matches_c_dump`
+  and `a_real_aomenc_stream_with_masked_compound_decodes_pixel_exact`
+  passing inside the full suite (not just standalone). Lib-green CONFIRMED,
+  no longer pending.
 - rect bsizes (8x16/16x8/16x32/32x16/8x32/32x8, `hgtw`/`hltw` codebooks) are
   genuinely NOT reachable yet (rect partition decode is a separate lane,
   per ledger `h264-t8x8-debt-stale`-style stale-premise caution avoided:
