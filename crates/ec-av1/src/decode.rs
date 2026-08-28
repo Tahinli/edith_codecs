@@ -551,7 +551,8 @@ fn read_eob(dec: &mut SymbolDecoder, coding: &mut TxbTables, class: TxClass) -> 
         (_, Some(class1)) => class1,
     };
     if std::env::var_os("EC_AV1_EOBPT_CDF").is_some() && eob_pt.len() == 12 {
-        eprintln!("EC_AV1_EOBPT_CDF {eob_pt:?}");
+        let (range, value) = dec.debug_state();
+        eprintln!("EC_AV1_EOBPT_CDF {eob_pt:?} range={range} value={value}");
     }
     let group = dec.symbol(eob_pt) + 1;
     if trace {
@@ -622,9 +623,17 @@ fn read_coeffs(
     let trace = std::env::var_os("EC_AV1_TRACE").is_some();
     let side = coding.side;
     let mut grid = vec![0i32; side * side];
+    if std::env::var_os("EC_AV1_EOBPT_CDF").is_some() {
+        let (range, value) = dec.debug_state();
+        eprintln!("EC_AV1_STATE_BEFORE_TXBSKIP range={range} value={value}");
+    }
     let all_zero = dec.symbol(&mut coding.txb_skip[skip_ctx]) == 1;
     if trace {
         eprintln!("TRACE all_zero ctx={skip_ctx} value={}", all_zero as i32);
+    }
+    if std::env::var_os("EC_AV1_EOBPT_CDF").is_some() {
+        let (range, value) = dec.debug_state();
+        eprintln!("EC_AV1_STATE_AFTER_TXBSKIP range={range} value={value}");
     }
     if all_zero {
         return Ok((grid, TxType::DctDct));
@@ -644,6 +653,10 @@ fn read_coeffs(
             eprintln!("EC_AV1_TXTYPE32_CDF {tx_type_cdf:?}");
         }
         let t = dec.symbol(tx_type_cdf);
+        if std::env::var_os("EC_AV1_EOBPT_CDF").is_some() {
+            let (range, value) = dec.debug_state();
+            eprintln!("EC_AV1_STATE_AFTER_TXTYPE range={range} value={value}");
+        }
         if trace {
             eprintln!("TRACE tx_type value={t} len={len}");
         }

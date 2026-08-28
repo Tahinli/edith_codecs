@@ -335,6 +335,14 @@ impl<'a> SymbolDecoder<'a> {
         self.bit
     }
 
+    /// Debug-only: the raw coder state (`range`, `value`) entering the next
+    /// read, for a byte-for-byte diff against a reference decoder's own
+    /// `r->ec.rng`/`r->ec.dif` while chasing a desync (see
+    /// `EC_AV1_EOBPT_CDF`). Not spec output, just the two live fields.
+    pub(crate) fn debug_state(&self) -> (u32, u32) {
+        (self.range, self.value)
+    }
+
     /// Reads `bits` raw bits, most significant first — the `L(n)` descriptor
     /// of spec 4.10.4.
     pub fn literal(&mut self, bits: u32) -> u32 {
