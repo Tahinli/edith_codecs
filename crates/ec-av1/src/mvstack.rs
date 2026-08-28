@@ -1293,6 +1293,10 @@ fn process_compound_ref_mv_candidate(
         Some((candidate.ref_frame, candidate.mv)),
         candidate
             .ref_frame1
+            // An interintra neighbour stores INTRA_FRAME (0) here; libaom's
+            // ref-diff scan requires `can_rf > INTRA_FRAME`
+            // (process_compound_ref_mv_candidate), so it contributes nothing.
+            .filter(|&rf1| rf1 > 0)
             .map(|rf1| (rf1, candidate.mv1.unwrap_or((0, 0)))),
     ];
     for (candidate_ref, candidate_mv) in slots.into_iter().flatten() {

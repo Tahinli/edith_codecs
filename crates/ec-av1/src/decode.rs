@@ -190,6 +190,16 @@ pub(crate) fn warp_selected_hits() -> usize {
     WARP_SELECTED_HITS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// How many blocks decoded `interintra == 1` with the non-wedge blended
+/// prediction applied (lane-interintra r1) -- the gate's proof that a
+/// stream actually exercised interintra.
+static INTERINTRA_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Current value of [`INTERINTRA_HITS`].
+pub(crate) fn interintra_hits() -> usize {
+    INTERINTRA_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Current value of [`OBMC_HITS_8`].
 pub(crate) fn obmc_hits_8() -> usize {
     OBMC_HITS_8.load(std::sync::atomic::Ordering::Relaxed)
@@ -3770,9 +3780,21 @@ fn resolve_interp_filter(
     // `h_kind`/`v_kind` argument order, which is why this function returns
     // `(h, v, ..)` but reads `dir0` (`v`) before `dir1` (`h`).
     let ctx0 = switchable_interp_ctx(above[0], left[0], 0, is_compound);
+    if std::env::var_os("EC_AV1_IFDBG").is_some() {
+        eprintln!(
+            "IFDBG dir=0 ctx={ctx0} above={above:?} left={left:?} cdf={:?}",
+            &cdfs.switchable_interp[ctx0][..3]
+        );
+    }
     let sym0 = dec.symbol(&mut cdfs.switchable_interp[ctx0]) as u8;
     let sym1 = if enable_dual_filter {
         let ctx1 = switchable_interp_ctx(above[1], left[1], 1, is_compound);
+        if std::env::var_os("EC_AV1_IFDBG").is_some() {
+            eprintln!(
+                "IFDBG dir=1 ctx={ctx1} above={above:?} left={left:?} cdf={:?} sym0={sym0}",
+                &cdfs.switchable_interp[ctx1][..3]
+            );
+        }
         dec.symbol(&mut cdfs.switchable_interp[ctx1]) as u8
     } else {
         sym0
@@ -4378,6 +4400,73 @@ fn obmc_neighbour_pred(
 
 /// Blends `tmp` into `dst` (stride `stride`) at `(ox, oy)`, mask varying by
 /// row (the above-neighbour pass, `aom_blend_a64_vmask`).
+/// `ii_weights1d` (reconinter.c:524): the interintra smooth-mask falloff.
+const II_WEIGHTS_1D: [u8; 128] = [
+    60, 58, 56, 54, 52, 50, 48, 47, 45, 44, 42, 41, 39, 38, 37, 35, 34, 33, 32,
+    31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 22, 21, 20, 19, 19, 18, 18, 17, 16,
+    16, 15, 15, 14, 14, 13, 13, 12, 12, 12, 11, 11, 10, 10, 10, 9, 9, 9, 8,
+    8, 8, 8, 7, 7, 7, 7, 6, 6, 6, 6, 6, 5, 5, 5, 5, 5, 4, 4,
+    4, 4, 4, 4, 4, 4, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2,
+    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+];
+
+/// lane-interintra r1: non-wedge interintra prediction for one plane
+/// (reconinter.c `av1_build_interintra_predictor` + `combine_interintra` +
+/// `build_smooth_interintra_mask`). Builds the intra predictor for the
+/// block's II mode (DC/V/H/SMOOTH, angle 0, no filter-intra) from `plane`'s
+/// own decoded edges at `(x, y)`, then blends it over the inter prediction
+/// in `pred`: `comp = (mask*intra + (64-mask)*inter + 32) >> 6`
+/// (`aom_blend_a64_mask`, intra as src0). `ii_size_scales[plane_bsize]`
+/// reduces to `128 / side` for the square plane sizes this decoder reaches.
+fn interintra_blend(plane: &PlaneBuf, x: usize, y: usize, side: usize, ii_mode: u8, pred: &mut [u8]) {
+    // `interintra_to_intra_mode`: II_DC/II_V/II_H/II_SMOOTH.
+    let intra_mode = match ii_mode {
+        0 => crate::intra::DC_PRED,
+        1 => crate::intra::V_PRED,
+        2 => crate::intra::H_PRED,
+        _ => crate::intra::SMOOTH_PRED,
+    };
+    let (above, left, corner) = plane.edges(
+        x,
+        y,
+        side,
+        crate::encode::Reach {
+            above_right: false,
+            below_left: false,
+        },
+    );
+    let mut intra = vec![0u8; side * side];
+    // Edge filtering never applies here: V/H at delta 0 are plain edge
+    // copies (angle 90/180 skip the directional walk), DC/SMOOTH carry no
+    // angle at all.
+    predict(
+        intra_mode,
+        0,
+        above.as_deref(),
+        left.as_deref(),
+        corner,
+        side,
+        false,
+        false,
+        &mut intra,
+    );
+    let scale = 128 / side;
+    for i in 0..side {
+        for j in 0..side {
+            let m = u32::from(match ii_mode {
+                0 => 32,
+                1 => II_WEIGHTS_1D[i * scale],
+                2 => II_WEIGHTS_1D[j * scale],
+                _ => II_WEIGHTS_1D[i.min(j) * scale],
+            });
+            let idx = i * side + j;
+            pred[idx] =
+                ((m * u32::from(intra[idx]) + (64 - m) * u32::from(pred[idx]) + 32) >> 6) as u8;
+        }
+    }
+}
+
 fn obmc_blend_v(dst: &mut [u8], stride: usize, ox: usize, oy: usize, w: usize, h: usize, tmp: &[u8]) {
     let mask = obmc_mask(h);
     for row in 0..h {
@@ -5642,14 +5731,26 @@ fn decode_inter_block(
             // branch produces -- NEARESTMV/NEARMV/GLOBALMV/NEWMV -- is
             // `SINGLE_INTER_MODE_START..END` by construction).
             // `size_group_lookup`: BLOCK_16X16 -> 2, BLOCK_32X32 -> 3.
+            let mut interintra_mode: Option<u8> = None;
             if enable_interintra_compound && !skip_mode && (side == 16 || side == 32) {
                 let bsize_group = if side == 16 { 2 } else { 3 };
                 let interintra = dec.symbol(&mut cdfs.interintra[bsize_group]) == 1;
                 if interintra {
-                    return Err(unsupported(
-                        "an interintra-compound block (interintra == 1, inter+intra \
-                         blended prediction unimplemented)",
-                    ));
+                    // lane-interintra r1 (decodemv.c 1540-1555): interintra_mode,
+                    // then -- gated on block size ALONE, never the
+                    // `enable_interintra_wedge` seq bit -- the wedge flag
+                    // (`av1_is_wedge_used(bsize)` holds for 16x16/32x32).
+                    let ii = dec.symbol(&mut cdfs.interintra_mode[bsize_group]) as u8;
+                    let wedge_bsize = if side == 16 { 6 } else { 9 };
+                    let wedge = dec.symbol(&mut cdfs.wedge_interintra[wedge_bsize]) == 1;
+                    if wedge {
+                        return Err(unsupported(
+                            "a wedge-interintra block (use_wedge_interintra == 1, \
+                             wedge-masked blending unimplemented)",
+                        ));
+                    }
+                    INTERINTRA_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    interintra_mode = Some(ii);
                 }
             }
             if std::env::var_os("EC_AV1_TELL").is_some() {
@@ -5679,8 +5780,12 @@ fn decode_inter_block(
             // from an `OBMC_CAUSAL`-only one (2-symbol `obmc_cdf`) whenever
             // the header allows warp -- reading the wrong alphabet desyncs
             // the tile.
+            // An interintra block has `ref_frame[1] == INTRA_FRAME`, which
+            // fails libaom's `is_motion_variation_allowed_compound`: the
+            // motion_mode symbol is NOT read (SIMPLE_TRANSLATION implied).
             let motion_mode_eligible = switchable_motion_mode
                 && !skip_mode
+                && interintra_mode.is_none()
                 && (!overlappable_above(grid, mi_row, mi_col, bw4, mi_cols as usize, 1).is_empty()
                     || !overlappable_left(grid, mi_row, mi_col, bw4, mi_rows as usize, 1)
                         .is_empty());
@@ -5833,7 +5938,13 @@ fn decode_inter_block(
                         MiInfo {
                             is_inter: true,
                             ref_frame,
-                            ref_frame1: None,
+                            // An interintra block records ref_frame[1] ==
+                            // INTRA_FRAME (0): warp-sample gathering
+                            // (libaom av1_findSamples, mvref_common.c:1155)
+                            // requires ref_frame[1] == NONE_FRAME, so such a
+                            // neighbour must not donate samples or count in
+                            // num_proj_ref.
+                            ref_frame1: interintra_mode.map(|_| 0),
                             mv1: None,
                             mv,
                             is_new_mv,
@@ -5929,6 +6040,16 @@ fn decode_inter_block(
                     &mut pred_u,
                     &mut pred_v,
                 )?;
+            }
+
+            // Mutually exclusive with warp/OBMC (motion_mode is not read for
+            // an interintra block): blend the intra predictor over the MC
+            // result, all planes (reconinter.c av1_build_interintra_predictor
+            // plane loop).
+            if let Some(ii) = interintra_mode {
+                interintra_blend(y, px, py, side, ii, &mut pred_y);
+                interintra_blend(u, cpx, cpy, chroma_side, ii, &mut pred_u);
+                interintra_blend(v, cpx, cpy, chroma_side, ii, &mut pred_v);
             }
 
             if skip {
@@ -6723,13 +6844,23 @@ fn decode_inter_block8(
         // `is_interintra_allowed_bsize`-eligible, single-ref-only branch
         // (compound already returned above), GLOBALMV already refused
         // (round 3), so the only real gate left is the header enable bit.
+        let mut interintra_mode: Option<u8> = None;
         if enable_interintra_compound && !skip_mode {
             let interintra = dec.symbol(&mut cdfs.interintra[SIZE_GROUP_8]) == 1;
             if interintra {
-                return Err(unsupported(
-                    "an interintra-compound block (interintra == 1, inter+intra \
-                     blended prediction unimplemented)",
-                ));
+                // lane-interintra r1: same read pair as the 16/32 site;
+                // wedge cdf row = BLOCK_8X8 (index 3), read on block size
+                // alone, never the `enable_interintra_wedge` seq bit.
+                let ii = dec.symbol(&mut cdfs.interintra_mode[SIZE_GROUP_8]) as u8;
+                let wedge = dec.symbol(&mut cdfs.wedge_interintra[3]) == 1;
+                if wedge {
+                    return Err(unsupported(
+                        "a wedge-interintra block (use_wedge_interintra == 1, \
+                         wedge-masked blending unimplemented)",
+                    ));
+                }
+                INTERINTRA_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                interintra_mode = Some(ii);
             }
         }
         // lane-motionmode round 3: `read_motion_mode` (spec 5.11.24) at the
@@ -6741,6 +6872,7 @@ fn decode_inter_block8(
         // refusal (warp needs `av1_findSamples`, not ported at either leaf).
         let motion_mode_eligible = switchable_motion_mode
             && !skip_mode
+            && interintra_mode.is_none()
             && (!overlappable_above(grid, mi_row, mi_col, 2, mi_cols as usize, 1).is_empty()
                 || !overlappable_left(grid, mi_row, mi_col, 2, mi_rows as usize, 1).is_empty());
         let mut obmc_selected = false;
@@ -6785,7 +6917,9 @@ fn decode_inter_block8(
                     MiInfo {
                         is_inter: true,
                         ref_frame: LAST_FRAME,
-                        ref_frame1: None,
+                        // INTRA_FRAME marker for interintra blocks -- keeps
+                        // them out of warp-sample gathering (see 16/32 site).
+                        ref_frame1: interintra_mode.map(|_| 0),
                         mv1: None,
                         mv,
                         is_new_mv,
@@ -6857,6 +6991,14 @@ fn decode_inter_block8(
                 &mut pred_u,
                 &mut pred_v,
             )?;
+        }
+
+        // Non-wedge interintra blend, mutually exclusive with OBMC (the
+        // motion_mode symbol is not read for an interintra block).
+        if let Some(ii) = interintra_mode {
+            interintra_blend(y, px, py, SIDE, ii, &mut pred_y);
+            interintra_blend(u, cpx, cpy, CHROMA_SIDE, ii, &mut pred_u);
+            interintra_blend(v, cpx, cpy, CHROMA_SIDE, ii, &mut pred_v);
         }
 
         if skip {
