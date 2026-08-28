@@ -371,6 +371,7 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 &header.loop_filter,
                 initial_cdfs,
                 header.allow_high_precision_mv,
+                header.force_integer_mv,
                 header.ref_frame_sign_bias,
                 interp_fixed,
                 enable_dual_filter,

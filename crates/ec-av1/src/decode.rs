@@ -3761,12 +3761,21 @@ fn read_mv_component(
     dec: &mut SymbolDecoder,
     c: &mut MvComponentCdfs,
     allow_high_precision_mv: bool,
+    force_integer_mv: bool,
 ) -> i32 {
     let sign = dec.symbol(&mut c.sign);
     let class = dec.symbol(&mut c.class);
     let local = if class == 0 {
         let bit = dec.symbol(&mut c.class0_bit);
-        let fr = dec.symbol(&mut c.class0_fr[bit]);
+        // spec 5.11.32 `mv_class0_fr`: not coded at all when the frame
+        // forces integer motion vectors -- implicitly `3` (the top
+        // fractional value) rather than read, else every symbol after it
+        // in the tile desyncs by one read.
+        let fr = if force_integer_mv {
+            3
+        } else {
+            dec.symbol(&mut c.class0_fr[bit])
+        };
         // spec 5.11.32 `mv_class0_hp`: read only when the frame allows
         // high-precision motion vectors, else implicitly 1 (the low bit
         // stays at half-pel precision) -- this crate's own writer always
@@ -3782,7 +3791,9 @@ fn read_mv_component(
         for i in 0..class {
             d |= dec.symbol(&mut c.bit[i]) << i;
         }
-        let fr = dec.symbol(&mut c.fr);
+        // spec 5.11.32 `mv_fr`: same force_integer_mv carve-out as
+        // `mv_class0_fr` above.
+        let fr = if force_integer_mv { 3 } else { dec.symbol(&mut c.fr) };
         let hp = if allow_high_precision_mv {
             dec.symbol(&mut c.hp)
         } else {
@@ -3802,14 +3813,15 @@ fn read_mv(
     mv_joint: &mut [u16; 5],
     pred: (i32, i32),
     allow_high_precision_mv: bool,
+    force_integer_mv: bool,
 ) -> (i32, i32) {
     let joint = dec.symbol(mv_joint);
     let mut diff = (0, 0);
     if joint == 2 || joint == 3 {
-        diff.0 = read_mv_component(dec, &mut mv_comp[0], allow_high_precision_mv);
+        diff.0 = read_mv_component(dec, &mut mv_comp[0], allow_high_precision_mv, force_integer_mv);
     }
     if joint == 1 || joint == 3 {
-        diff.1 = read_mv_component(dec, &mut mv_comp[1], allow_high_precision_mv);
+        diff.1 = read_mv_component(dec, &mut mv_comp[1], allow_high_precision_mv, force_integer_mv);
     }
     (pred.0 + diff.0, pred.1 + diff.1)
 }
@@ -4435,6 +4447,7 @@ fn assign_compound_mv(
     comp_stack: &crate::mvstack::CompoundMvStack,
     mode: u8,
     allow_high_precision_mv: bool,
+    force_integer_mv: bool,
 ) -> ((i32, i32), (i32, i32)) {
     const NEAREST_NEARESTMV: u8 = 0;
     const NEAR_NEARMV: u8 = 1;
@@ -4487,6 +4500,7 @@ fn assign_compound_mv(
             &mut cdfs.mv_joint,
             base,
             allow_high_precision_mv,
+            force_integer_mv,
         )
     };
 
@@ -4554,6 +4568,7 @@ fn decode_inter_block(
     scan_chroma: &[u16],
     size_group: usize,
     allow_high_precision_mv: bool,
+    force_integer_mv: bool,
     interp_fixed: Option<mc::InterpFilterKind>,
     enable_dual_filter: bool,
     tpl_frame: Option<&TplFrameArgs>,
@@ -4710,6 +4725,7 @@ fn decode_inter_block(
                 &comp_stack,
                 compound_mode,
                 allow_high_precision_mv,
+                force_integer_mv,
             );
             let is_globalmv = compound_mode == 6; // GLOBAL_GLOBALMV
             let (py0, pu0, pv0) = ref_planes(ref0, ref_y, ref_u, ref_v, other_refs)?;
@@ -5269,6 +5285,7 @@ fn decode_inter_block(
                         &mut cdfs.mv_joint,
                         base_mv,
                         allow_high_precision_mv,
+                        force_integer_mv,
                     ),
                     true,
                 )
@@ -5782,6 +5799,7 @@ fn decode_inter_block8(
     scan4: &[u16],
     prev_leaf: Option<((usize, usize), bool, bool)>,
     allow_high_precision_mv: bool,
+    force_integer_mv: bool,
     // lane-av1comp: see [`decode_inter_block`]'s own doc -- this leaf path
     // only ever tracks a coarse `LAST_FRAME`-or-intra neighbour shape (no
     // per-leaf `above_ref`/`left_ref` array exists here), so `comp_mode`'s
@@ -5934,6 +5952,7 @@ fn decode_inter_block8(
                     &comp_stack,
                     compound_mode,
                     allow_high_precision_mv,
+                    force_integer_mv,
                 );
 
                 // spec 5.11.25: same gating [`decode_inter_block`]'s own
@@ -6241,6 +6260,7 @@ fn decode_inter_block8(
                     &mut cdfs.mv_joint,
                     base_mv,
                     allow_high_precision_mv,
+                    force_integer_mv,
                 ),
                 true,
             )
@@ -6640,6 +6660,7 @@ pub fn decode_inter_frame_tile(
     cdef: &CdefParams,
     loop_filter: &LoopFilterParams,
     allow_high_precision_mv: bool,
+    force_integer_mv: bool,
     interp_fixed: Option<mc::InterpFilterKind>,
     enable_dual_filter: bool,
     reference_select: bool,
@@ -6657,6 +6678,7 @@ pub fn decode_inter_frame_tile(
         loop_filter,
         None,
         allow_high_precision_mv,
+        force_integer_mv,
         NO_SIGN_BIAS,
         interp_fixed,
         enable_dual_filter,
@@ -6695,6 +6717,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     loop_filter: &LoopFilterParams,
     initial_cdfs: Option<Cdfs>,
     allow_high_precision_mv: bool,
+    force_integer_mv: bool,
     sign_bias_table: SignBiasTable,
     interp_fixed: Option<mc::InterpFilterKind>,
     enable_dual_filter: bool,
@@ -6925,6 +6948,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &scan16,
                             3,
                             allow_high_precision_mv,
+                            force_integer_mv,
                             interp_fixed,
                             enable_dual_filter,
                             tpl_frame.as_ref(),
@@ -6998,6 +7022,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     &scan8,
                                     2,
                                     allow_high_precision_mv,
+                                    force_integer_mv,
                                     interp_fixed,
                                     enable_dual_filter,
                                     tpl_frame.as_ref(),
@@ -7065,6 +7090,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                             &scan4,
                                             prev_leaf,
                                             allow_high_precision_mv,
+                                            force_integer_mv,
                                             reference_select,
                                             enable_masked_compound,
                                             enable_interintra_compound,
@@ -7666,6 +7692,7 @@ mod tests {
                 &CdefParams::default(),
                 &LoopFilterParams::default(),
                 false,
+                false,
                 Some(mc::InterpFilterKind::Regular),
                 false,
                 false,
@@ -7847,6 +7874,7 @@ mod tests {
             &[],
             0,
             false,
+            false,
             Some(mc::InterpFilterKind::Regular),
             false,
             None,
@@ -7951,6 +7979,7 @@ mod tests {
                 [None; 8],
                 &CdefParams::default(),
                 &LoopFilterParams::default(),
+                false,
                 false,
                 Some(mc::InterpFilterKind::Regular),
                 false,
