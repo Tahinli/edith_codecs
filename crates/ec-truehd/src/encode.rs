@@ -861,9 +861,11 @@ mod tests {
     /// Compression gate: at 192 kHz (160 samples/AU, so the fixed per-AU
     /// header cost amortizes to a few percent) tonal content — where the
     /// FIR predictor should do real work — encodes to at most 65% of raw
-    /// 24-bit PCM, and pure LCG noise (nothing for the predictor to
-    /// exploit) never grows past raw PCM's own size — the `ChannelPlan`
-    /// raw/LPC bit-cost comparison's whole job.
+    /// 24-bit PCM. Pure LCG noise (nothing for the predictor to exploit,
+    /// every AU picks `ChannelPlan::raw`) can never shrink below raw PCM's
+    /// own size — what's left to bound is this format's own mandatory
+    /// per-AU container framing, a floor computed from the literal field
+    /// widths below, not fitted to any observed byte count.
     #[test]
     fn compression_ratio_gates() {
         let n = 19_200usize; // 120 access units at 192 kHz
@@ -878,13 +880,45 @@ mod tests {
             tonal_ratio * 100.0
         );
 
+        // Every AU pays: `sync::AU_HEADER_LEN` (4B: `length_word` +
+        // `input_timing`) + one substream directory entry (2B) = 6B of
+        // mandatory container framing, plus the segment's own
+        // `params_present`(1 bit) + `end_of_segment`(1 bit) bookkeeping,
+        // which `BitWriter::align_to_byte` rounds up to a whole byte and
+        // then, if that leaves an odd byte count, one more byte to reach a
+        // 16-bit word (`encode_access_unit`'s own `bit_len() % 16` check) —
+        // 2 bytes of alignment slack in the worst case. 6 + 2 = 8 bytes/AU,
+        // paid by every AU regardless of content.
+        const PER_AU_FRAMING_FLOOR: u64 = 8;
+        // Access unit 0 alone additionally carries a major sync
+        // (`sync::MajorSyncInfo`'s own 28-byte `MAJOR_SYNC_LEN`) and a
+        // restart header — the literal sum of every field
+        // `encode_access_unit` writes under `is_first`: 13 (sync) + 1
+        // (noise_type) + 16 (output_timing) + 4 + 4 + 4 (channel counts) + 4
+        // (noise_shift) + 23 (noisegen_seed) + 19 (reserved) + 1
+        // (data_check_present) + 8 (lossless_check) + 16 (reserved) + 6 + 6
+        // (ch_assign) + 8 (crc) = 133 bits — plus the decoding-params
+        // section's 14 common bits (presence/blocksize/matrix/output-shift/
+        // quant-step gates) and, per channel, the minimal order-0 raw
+        // path's 15 bits (per-channel gate, FIR gate, 4-bit order, IIR
+        // gate, huff_offset gate, 2-bit codebook, 5-bit lsb_bits): 133 + 14
+        // + 2*15 = 177 bits, 23 bytes ceiled. AU0's one-time extra beyond
+        // the per-AU floor above: 28 (major sync) + 23 = 51 bytes.
+        const FIRST_AU_EXTRA: u64 = 51;
+        // Small, explicitly-named slack for byte/16-bit rounding this
+        // derivation approximates rather than tracks bit-for-bit — not
+        // fitted to make any specific fixture pass.
+        const ROUNDING_SLACK: u64 = 8;
+
         let noise = noise_fixture(n);
-        let noise_bytes = encoded_bytes(&noise, 192_000);
-        let noise_ratio = noise_bytes as f64 / raw_bytes as f64;
+        let noise_bytes = encoded_bytes(&noise, 192_000) as u64;
+        let num_aus = (n as u64).div_ceil(160); // access_unit_size @ 192 kHz
+        let floor_bytes =
+            raw_bytes as u64 + num_aus * PER_AU_FRAMING_FLOOR + FIRST_AU_EXTRA + ROUNDING_SLACK;
         assert!(
-            noise_ratio <= 1.0,
-            "noise: {noise_bytes} bytes vs {raw_bytes} raw ({:.1}%), want <=100%",
-            noise_ratio * 100.0
+            noise_bytes <= floor_bytes,
+            "noise: {noise_bytes} bytes vs {raw_bytes} raw + {num_aus} AUs' \
+             format-derived framing floor {floor_bytes}"
         );
     }
 }
