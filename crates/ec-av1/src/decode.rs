@@ -148,6 +148,59 @@ pub(crate) fn tmv_hits() -> usize {
     crate::mvstack::tmv_hits()
 }
 
+/// Everything [`decode_inter_block`] needs to fold temporal MV candidates
+/// (spec 7.10.2.8), threaded down from [`decode_inter_frame_tile_with_cdfs`]:
+/// the current frame's own projected field ([`crate::motion_field::setup_motion_field`]'s
+/// output, built by the caller when `header.use_ref_frame_mvs` is set) plus
+/// the order-hint bookkeeping [`crate::motion_field::get_relative_dist`]
+/// needs to turn a query block's own resolved `ref_frame` into
+/// `TplArgs::cur_offset_0` (spec 7.9.3).
+pub(crate) struct TplFrameArgs<'a> {
+    pub field: &'a crate::motion_field::TplField,
+    pub order_hint_bits: u32,
+    pub order_hint: u32,
+    /// `ref_order_hints[ref_frame - LAST_FRAME]` for `ref_frame` in
+    /// `LAST_FRAME..=ALTREF_FRAME` — the OrderHint of the picture this
+    /// frame's own `ref_frame_idx` names for each single reference.
+    pub ref_order_hints: [u32; 7],
+}
+
+/// Builds this frame's own saved motion field (libaom `av1_copy_frame_mvs`,
+/// spec 7.9's per-frame `MotionFieldMvs` storage step) from its fully
+/// decoded `grid`: every 4x4 unit an inter block covers reads the same
+/// `MiInfo` ([`decode_inter_block`]/`decode_inter_block8` write it
+/// block-uniform), so sampling any one 4x4 unit inside each 8x8 cell is
+/// exact — every block this crate ever codes is at least 8x8, so no 8x8
+/// cell straddles two different blocks' values.
+pub(crate) fn build_motion_field(
+    grid: &MiGrid,
+    mi_cols: usize,
+    mi_rows: usize,
+    order_hint: u32,
+    ref_order_hints: [u32; 7],
+) -> crate::motion_field::MotionField {
+    let mut field =
+        crate::motion_field::MotionField::new(mi_cols, mi_rows, order_hint, ref_order_hints);
+    for row in 0..mi_rows {
+        for col in 0..mi_cols {
+            if let Some(info) = grid.get(row, col)
+                && info.is_inter
+                && info.ref_frame > 0
+            {
+                field.set(
+                    row,
+                    col,
+                    crate::motion_field::SavedMv {
+                        mv: info.mv,
+                        ref_frame: info.ref_frame,
+                    },
+                );
+            }
+        }
+    }
+    field
+}
+
 /// Current value of the counter for `ref_frame` (`LAST2_FRAME`..=`ALTREF_FRAME`;
 /// panics on `LAST_FRAME`/`INTRA_FRAME`/`NONE`, which have no counter here).
 pub(crate) fn ref_hits(ref_frame: i8) -> usize {
@@ -3775,6 +3828,7 @@ fn decode_inter_block(
     allow_high_precision_mv: bool,
     interp_fixed: Option<mc::InterpFilterKind>,
     enable_dual_filter: bool,
+    tpl_frame: Option<&TplFrameArgs>,
 ) -> Result<()> {
     let (r, c) = at;
     let (px, py) = (c * SUB, r * SUB);
@@ -3821,6 +3875,20 @@ fn decode_inter_block(
 
         let (mi_row, mi_col) = (r * SUB_MI as usize, c * SUB_MI as usize);
         let bw4 = side / 4;
+        // spec 7.10.2.8: only reached when the frame header set
+        // `use_ref_frame_mvs` (`tpl_frame` is `Some` then, `None`
+        // otherwise) -- `cur_offset_0` is this query block's own resolved
+        // `ref_frame`'s distance from the current frame (spec 7.9.3),
+        // recomputed per block since different blocks pick different refs.
+        let tpl = tpl_frame.map(|t| crate::mvstack::TplArgs {
+            field: t.field,
+            cur_offset_0: crate::motion_field::get_relative_dist(
+                t.order_hint_bits,
+                t.order_hint,
+                t.ref_order_hints[(ref_frame - LAST_FRAME) as usize],
+            ),
+            allow_high_precision_mv,
+        });
         let stack = find_mv_stack_with_sign_bias(
             grid,
             mi_row,
@@ -3831,11 +3899,7 @@ fn decode_inter_block(
             mi_cols as usize,
             mi_rows as usize,
             sign_bias_table,
-            // TODO(lane-av1tmvp HANDOFF): thread a real `TplArgs` here once
-            // `decode_inter_frame_tile_with_cdfs` carries a projected
-            // `TplField` (see that function's own doc) -- `None` keeps
-            // today's `use_ref_frame_mvs = 0`-only behaviour exact.
-            None,
+            tpl,
         );
         let not_new = dec.symbol(&mut cdfs.new_mv[stack.new_mv_ctx]) == 1;
         let mut is_globalmv = false;
@@ -4678,8 +4742,12 @@ pub fn decode_inter_frame_tile(
         NO_SIGN_BIAS,
         interp_fixed,
         enable_dual_filter,
+        0,
+        0,
+        [0; 7],
+        None,
     )
-    .map(|(picture, _)| picture)
+    .map(|(picture, _, _)| picture)
 }
 
 /// [`decode_inter_frame_tile`], threading a cross-frame CDF forward -- see
@@ -4703,7 +4771,22 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     sign_bias_table: SignBiasTable,
     interp_fixed: Option<mc::InterpFilterKind>,
     enable_dual_filter: bool,
-) -> Result<(Picture, Cdfs)> {
+    // lane-av1tmvp: `order_hint`/`order_hint_bits`/`ref_order_hints` are
+    // always needed (this frame's own saved [`crate::motion_field::MotionField`]
+    // carries them for a *later* frame's projection, spec 7.9); `tpl_field`
+    // is `Some` only when this frame's own header set `use_ref_frame_mvs`
+    // and the caller ([`crate::stream::decode_stream`]) projected one.
+    order_hint_bits: u32,
+    order_hint: u32,
+    ref_order_hints: [u32; 7],
+    tpl_field: Option<&crate::motion_field::TplField>,
+) -> Result<(Picture, Cdfs, crate::motion_field::MotionField)> {
+    let tpl_frame = tpl_field.map(|field| TplFrameArgs {
+        field,
+        order_hint_bits,
+        order_hint,
+        ref_order_hints,
+    });
     if mi_cols == 0 || mi_rows == 0 {
         return Err(unsupported("a frame with no mode-info grid"));
     }
@@ -4892,6 +4975,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             allow_high_precision_mv,
                             interp_fixed,
                             enable_dual_filter,
+                            tpl_frame.as_ref(),
                         )?;
                     }
                     PARTITION_SPLIT => {
@@ -4949,6 +5033,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     allow_high_precision_mv,
                                     interp_fixed,
                                     enable_dual_filter,
+                                    tpl_frame.as_ref(),
                                 )?;
                             } else {
                                 let ctx16 = neighbours.partition_ctx(at16, SUB);
@@ -5036,6 +5121,14 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     apply_deblock(&mut y, &mut u, &mut v, loop_filter, &neighbours);
     apply_cdef(&mut y, &mut u, &mut v, cdef, &neighbours);
 
+    let motion_field = build_motion_field(
+        &grid,
+        mi_cols as usize,
+        mi_rows as usize,
+        order_hint,
+        ref_order_hints,
+    );
+
     let (fw, fh) = (frame_width as usize, frame_height as usize);
     if fw == width && fh == height {
         return Ok((
@@ -5047,6 +5140,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                 v: v.data,
             },
             cdfs,
+            motion_field,
         ));
     }
     let crop = |plane: &PlaneBuf, w: usize, h: usize| -> Vec<u8> {
@@ -5065,6 +5159,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
             v: crop(&v, fw / 2, fh / 2),
         },
         cdfs,
+        motion_field,
     ))
 }
 
@@ -5687,6 +5782,7 @@ mod tests {
             false,
             Some(mc::InterpFilterKind::Regular),
             false,
+            None,
         )
         .unwrap();
 

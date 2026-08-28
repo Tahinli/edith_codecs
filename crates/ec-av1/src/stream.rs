@@ -59,6 +59,14 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
     // and small-magnitude (the two pictures mostly agree), which is exactly
     // what made it look like a rounding bug rather than a wrong reference.
     let mut ref_slots: [Option<Picture>; NUM_REF_FRAMES] = std::array::from_fn(|_| None);
+    // lane-av1tmvp: each of the 8 reference slots' own saved temporal motion
+    // field (spec 7.9's per-frame `MotionFieldMvs` storage, libaom
+    // `cur_frame->mvs`) plus the `OrderHint` the picture in that slot was
+    // decoded with -- `Picture` itself carries neither, so both ride
+    // alongside `ref_slots` on the exact same `refresh_frame_flags` update.
+    let mut motion_field_slots: [Option<crate::motion_field::MotionField>; NUM_REF_FRAMES] =
+        std::array::from_fn(|_| None);
+    let mut order_hint_slots: [u32; NUM_REF_FRAMES] = [0; NUM_REF_FRAMES];
     // Spec 7.20/7.4: each of the 8 reference slots remembers the CDF state a
     // previous frame's `refresh_frame_flags` stored into it -- the frame's
     // own end-of-tile adapted table, or (when the frame set
@@ -232,8 +240,19 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         };
         let started_from = initial_cdfs.clone();
 
-        let (picture, end_cdfs) = if header.frame_type == FrameType::Key {
-            decode_key_frame_tile_with_cdfs(
+        let order_hint_bits = parser
+            .sequence_header()
+            .map_or(0, |seq| seq.order_hint_bits);
+        // spec 7.9/7.20: this frame's own `ref_order_hints` -- the OrderHint
+        // of the picture sitting in each of its 7 single references' DPB
+        // slots, for this frame's *own* saved [`crate::motion_field::MotionField`]
+        // (a later frame projects from it) whether or not this frame itself
+        // reads temporal candidates.
+        let ref_order_hints: [u32; 7] =
+            std::array::from_fn(|i| order_hint_slots[header.ref_frame_idx[i] as usize]);
+
+        let (picture, end_cdfs, motion_field) = if header.frame_type == FrameType::Key {
+            let (picture, end_cdfs) = decode_key_frame_tile_with_cdfs(
                 tile_bytes,
                 header.mi_cols,
                 header.mi_rows,
@@ -247,7 +266,19 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 initial_cdfs,
                 header.tx_mode == TxMode::Select,
                 header.reduced_tx_set,
-            )?
+            )?;
+            // A key frame codes no inter blocks -- its own saved motion
+            // field has no cells set, matching libaom's own "intra frame
+            // contributes nothing to a later projection" behaviour, but
+            // still carries `order_hint`/`ref_order_hints` for the distance
+            // arithmetic a later frame's projection needs.
+            let motion_field = crate::motion_field::MotionField::new(
+                header.mi_cols as usize,
+                header.mi_rows as usize,
+                header.order_hint,
+                ref_order_hints,
+            );
+            (picture, end_cdfs, motion_field)
         } else {
             let last_slot = header.ref_frame_idx[0] as usize;
             let reference = ref_slots[last_slot].as_ref().ok_or_else(|| {
@@ -272,6 +303,20 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                         .and_then(Option::as_ref)
                 }
             });
+            // spec 7.9's own driver, `av1_setup_motion_field`: only run when
+            // this frame's header actually asks for temporal candidates --
+            // `find_mv_stack_with_sign_bias` reproduces its old always-`None`
+            // behaviour bit for bit when this is `None` (see its own doc).
+            let tpl_field = header.use_ref_frame_mvs.then(|| {
+                crate::motion_field::setup_motion_field(
+                    &motion_field_slots,
+                    header.ref_frame_idx,
+                    header.order_hint,
+                    order_hint_bits,
+                    header.mi_rows as usize,
+                    header.mi_cols as usize,
+                )
+            });
             decode_inter_frame_tile_with_cdfs(
                 tile_bytes,
                 header.mi_cols,
@@ -288,6 +333,10 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 header.ref_frame_sign_bias,
                 interp_fixed,
                 enable_dual_filter,
+                order_hint_bits,
+                header.order_hint,
+                ref_order_hints,
+                tpl_field.as_ref(),
             )?
         };
         // Spec 7.20: `disable_frame_end_update_cdf` stores the frame's
@@ -329,6 +378,8 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 // pre-grain decode, even though the frame pushed onto the
                 // caller's output below carries the grained picture.
                 ref_slots[i] = Some(picture.clone());
+                motion_field_slots[i] = Some(motion_field.clone());
+                order_hint_slots[i] = header.order_hint;
             }
         }
         let output = if header.film_grain.apply_grain {
@@ -2442,6 +2493,180 @@ mod tests {
             16,
             120,
         );
+    }
+
+    /// lane-av1tmvp: the temporal-MV gate -- unlike every `_single_ref_gate`
+    /// attempt above, this one leaves `--enable-ref-frame-mvs` at aomenc's
+    /// own default (on) instead of pinning it off, so `use_ref_frame_mvs`
+    /// actually fires and `decode::tmv_hits()` (this gate's own capability
+    /// proof, not just `non_last_ref_hits`) has to advance for the run to
+    /// count as a real pass rather than a `never_fired` skip.
+    fn a_real_aomenc_temporal_mv_gate(seed_base: u32, attempts: u32) {
+        let gate_name = "a_real_aomenc_temporal_mv_gate";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {gate_name}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {gate_name}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height, frame_count) = (64usize, 64usize, 16usize);
+        let mut never_fired = 0u32;
+        let mut refusals = Vec::new();
+        for attempt in 0..attempts {
+            let seed = seed_base + attempt;
+            let duration = frame_count as f64 / 25.0;
+            let source =
+                format!("gradients=size={width}x{height}:seed={seed}:duration={duration}:rate=25");
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            // Same envelope as `a_real_aomenc_single_ref_gate`, minus its
+            // `--enable-ref-frame-mvs=0` pin -- everything else this decoder
+            // still cannot code stays refused the same way.
+            let args: Vec<&str> = vec![
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                "--cq-level=55",
+                "--cpu-used=0",
+                "--kf-max-dist=1000",
+                "--threads=1",
+                "--row-mt=0",
+                "--auto-alt-ref=1",
+                "--lag-in-frames=16",
+                "--enable-fwd-kf=0",
+                "--enable-warped-motion=0",
+                "--enable-obmc=0",
+                "--enable-masked-comp=0",
+                "--enable-interintra-comp=0",
+                "--enable-dist-wtd-comp=0",
+                "--enable-diff-wtd-comp=0",
+                "--enable-onesided-comp=0",
+                "--enable-interintra-wedge=0",
+                "--enable-smooth-interintra=0",
+                "--enable-rect-partitions=0",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0",
+                "--enable-filter-intra=0",
+                "--enable-smooth-intra=0",
+                "--enable-paeth-intra=0",
+                "--enable-directional-intra=0",
+                "--enable-angle-delta=0",
+                "--enable-tx-size-search=0",
+                "--enable-cdef=0",
+                "--enable-restoration=0",
+                "--max-partition-size=32",
+                "--min-partition-size=32",
+                "--enable-palette=0",
+                "--enable-intrabc=0",
+                "--enable-cfl-intra=0",
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ];
+            let mut child = Command::new(aomenc_path())
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let before = decode::tmv_hits();
+            let frames = match decode_stream(&stream) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{gate_name} failed outright (seed {seed}): {msg}"
+                    );
+                    refusals.push(format!("seed {seed}: {msg}"));
+                    continue;
+                }
+                Ok(frames) => frames,
+            };
+            if decode::tmv_hits() == before {
+                never_fired += 1;
+                continue;
+            }
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
+            assert_eq!(frames.len(), frame_count);
+            if let Ok(path) = std::env::var("EC_AV1_GATE_DUMP") {
+                let mismatched = frames
+                    .iter()
+                    .zip(&ffmpeg_frames)
+                    .any(|(got, want)| got.y != want.y || got.u != want.u || got.v != want.v);
+                if mismatched {
+                    std::fs::write(&path, &stream).expect("writing pinned stream");
+                    eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
+                }
+            }
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(
+                    got.y, want.y,
+                    "{gate_name} frame {i} luma vs ffmpeg (seed {seed})"
+                );
+                assert_eq!(
+                    got.u, want.u,
+                    "{gate_name} frame {i} U vs ffmpeg (seed {seed})"
+                );
+                assert_eq!(
+                    got.v, want.v,
+                    "{gate_name} frame {i} V vs ffmpeg (seed {seed})"
+                );
+            }
+            eprintln!(
+                "{gate_name} FIRING seed {seed}: tmv_hits advanced by {}",
+                decode::tmv_hits() - before
+            );
+            return;
+        }
+        eprintln!(
+            "SKIP {gate_name}: {never_fired} attempts decoded but never fired a temporal MV \
+             candidate, and every other attempt hit a named refusal:\n{}",
+            refusals.join("\n")
+        );
+    }
+
+    #[test]
+    fn a_real_aomenc_stream_with_temporal_mvs_decodes_pixel_exact() {
+        a_real_aomenc_temporal_mv_gate(42, 40);
     }
 
     /// scratch: decode a pinned stream end to end and report where/why it
