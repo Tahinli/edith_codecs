@@ -2166,6 +2166,284 @@ mod tests {
         );
     }
 
+    /// lane-av1refs's decisive gate for the 5 references widened past
+    /// `LAST_FRAME`/`GOLDEN_FRAME`: same envelope and pin-on-mismatch
+    /// pattern as
+    /// [`a_real_aomenc_inter_sequence_with_a_golden_reference_decodes_pixel_exact`],
+    /// generalised over `(target_ref, extra_args, frame_count)` so each of
+    /// `LAST2`/`LAST3`/`BWDREF`/`ALTREF2`/`ALTREF` gets its own attempt pool
+    /// and its own proof that `decode::ref_hits(target_ref)` -- not just
+    /// `non_last_ref_hits`, which cannot distinguish one reference from
+    /// another -- actually advanced. `--max-reference-frames=3
+    /// --reduced-reference-set=1` (the golden gate's own narrowing) is
+    /// DROPPED here: both suppress exactly the references this gate needs
+    /// aomenc's RD to reach.
+    fn a_real_aomenc_single_ref_gate(
+        gate_name: &str,
+        target_ref: i8,
+        target_ref_name: &str,
+        extra_args: &[&str],
+        width: usize,
+        height: usize,
+        frame_count: usize,
+        attempts: u32,
+    ) {
+        if !have_ffmpeg() {
+            eprintln!("SKIP {gate_name}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {gate_name}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let mut refusals = Vec::new();
+        let mut never_fired = 0u32;
+        for attempt in 0..attempts {
+            let seed = 42 + attempt % 40;
+            let duration = frame_count as f64 / 25.0;
+            let source =
+                format!("gradients=size={width}x{height}:seed={seed}:duration={duration}:rate=25");
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let mut args: Vec<&str> = vec![
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                "--cq-level=55",
+                "--cpu-used=0",
+                "--kf-max-dist=1000",
+                "--threads=1",
+                "--row-mt=0",
+                "--enable-warped-motion=0",
+                "--enable-obmc=0",
+                "--enable-masked-comp=0",
+                "--enable-interintra-comp=0",
+                "--enable-dist-wtd-comp=0",
+                "--enable-diff-wtd-comp=0",
+                "--enable-onesided-comp=0",
+                "--enable-interintra-wedge=0",
+                "--enable-smooth-interintra=0",
+                "--enable-rect-partitions=0",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0",
+                "--enable-filter-intra=0",
+                "--enable-smooth-intra=0",
+                "--enable-paeth-intra=0",
+                "--enable-directional-intra=0",
+                "--enable-angle-delta=0",
+                "--enable-tx-size-search=0",
+                "--enable-cdef=0",
+                "--enable-restoration=0",
+                "--max-partition-size=32",
+                "--min-partition-size=32",
+                "--enable-palette=0",
+                "--enable-intrabc=0",
+                "--enable-cfl-intra=0",
+                // use_ref_frame_mvs (temporal MV projection) is unimplemented in
+                // mvstack; leaving it on silently desyncs symbols on inter frames.
+                "--enable-ref-frame-mvs=0",
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ];
+            // extra_args goes right before the trailing "-o", "-", "-" triple.
+            let tail = args.split_off(args.len() - 3);
+            args.extend_from_slice(extra_args);
+            args.extend_from_slice(&tail);
+            let mut child = Command::new(aomenc_path())
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let before = decode::ref_hits(target_ref);
+            let frames = match decode_stream(&stream) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{gate_name} failed outright (seed {seed}): {msg}"
+                    );
+                    refusals.push(format!("seed {seed}: {msg}"));
+                    continue;
+                }
+                Ok(frames) => frames,
+            };
+            if decode::ref_hits(target_ref) == before {
+                never_fired += 1;
+                continue;
+            }
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
+            assert_eq!(frames.len(), frame_count);
+            let mismatched = frames
+                .iter()
+                .zip(&ffmpeg_frames)
+                .any(|(got, want)| got.y != want.y || got.u != want.u || got.v != want.v);
+            if mismatched {
+                if let Ok(path) = std::env::var("EC_AV1_GATE_DUMP") {
+                    std::fs::write(&path, &stream).expect("writing pinned stream");
+                    eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
+                }
+            }
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(
+                    got.y, want.y,
+                    "{gate_name} frame {i} luma vs ffmpeg (seed {seed})"
+                );
+                assert_eq!(
+                    got.u, want.u,
+                    "{gate_name} frame {i} U vs ffmpeg (seed {seed})"
+                );
+                assert_eq!(
+                    got.v, want.v,
+                    "{gate_name} frame {i} V vs ffmpeg (seed {seed})"
+                );
+            }
+            eprintln!(
+                "{gate_name} FIRING seed {seed}: {target_ref_name} hits advanced by {}",
+                decode::ref_hits(target_ref) - before
+            );
+            return;
+        }
+        eprintln!(
+            "SKIP {gate_name}: {never_fired} attempts decoded but never fired {target_ref_name}, \
+             and every other attempt hit a named refusal:\n{}",
+            refusals.join("\n")
+        );
+    }
+
+    /// `LAST2_FRAME`/`LAST3_FRAME` are just older slots in the same forward
+    /// reference-buffer ring `LAST_FRAME`/`GOLDEN_FRAME` already prove --
+    /// dropping the golden gate's `--max-reference-frames=3
+    /// --reduced-reference-set=1` narrowing (which suppresses exactly these)
+    /// and running long enough for aomenc's own buffer rotation to reach
+    /// past the first 2 frames is the whole difference.
+    #[test]
+    fn a_real_aomenc_stream_with_a_last2_reference_decodes_pixel_exact() {
+        a_real_aomenc_single_ref_gate(
+            "a_real_aomenc_stream_with_a_last2_reference_decodes_pixel_exact",
+            crate::mvstack::LAST2_FRAME,
+            "LAST2_FRAME",
+            &["--auto-alt-ref=0", "--lag-in-frames=0"],
+            64,
+            64,
+            8,
+            120,
+        );
+    }
+
+    #[test]
+    fn a_real_aomenc_stream_with_a_last3_reference_decodes_pixel_exact() {
+        a_real_aomenc_single_ref_gate(
+            "a_real_aomenc_stream_with_a_last3_reference_decodes_pixel_exact",
+            crate::mvstack::LAST3_FRAME,
+            "LAST3_FRAME",
+            &["--auto-alt-ref=0", "--lag-in-frames=0"],
+            64,
+            64,
+            8,
+            120,
+        );
+    }
+
+    /// `BWDREF`/`ALTREF2`/`ALTREF` are all backward (display-order-forward)
+    /// references that only exist once aomenc builds a hierarchical GOP --
+    /// `--auto-alt-ref=1 --lag-in-frames` (need at least one full mini-GOP
+    /// of lookahead) is what makes aomenc code them at all; without it
+    /// every attempt would hit this decoder's own real, still-open
+    /// per-block sign-bias gap by never drawing the reference in the first
+    /// place, not by proving it correct.
+    #[test]
+    fn a_real_aomenc_stream_with_a_bwdref_reference_decodes_pixel_exact() {
+        a_real_aomenc_single_ref_gate(
+            "a_real_aomenc_stream_with_a_bwdref_reference_decodes_pixel_exact",
+            crate::mvstack::BWDREF_FRAME,
+            "BWDREF_FRAME",
+            &[
+                "--auto-alt-ref=1",
+                "--lag-in-frames=16",
+                "--enable-fwd-kf=0",
+            ],
+            64,
+            64,
+            16,
+            120,
+        );
+    }
+
+    #[test]
+    fn a_real_aomenc_stream_with_an_altref2_reference_decodes_pixel_exact() {
+        a_real_aomenc_single_ref_gate(
+            "a_real_aomenc_stream_with_an_altref2_reference_decodes_pixel_exact",
+            crate::mvstack::ALTREF2_FRAME,
+            "ALTREF2_FRAME",
+            &[
+                "--auto-alt-ref=1",
+                "--lag-in-frames=16",
+                "--enable-fwd-kf=0",
+            ],
+            64,
+            64,
+            16,
+            120,
+        );
+    }
+
+    #[test]
+    fn a_real_aomenc_stream_with_an_altref_reference_decodes_pixel_exact() {
+        a_real_aomenc_single_ref_gate(
+            "a_real_aomenc_stream_with_an_altref_reference_decodes_pixel_exact",
+            crate::mvstack::ALTREF_FRAME,
+            "ALTREF_FRAME",
+            &[
+                "--auto-alt-ref=1",
+                "--lag-in-frames=16",
+                "--enable-fwd-kf=0",
+            ],
+            64,
+            64,
+            16,
+            120,
+        );
+    }
+
     /// scratch: decode a pinned stream end to end and report where/why it
     /// refuses, plus `non_last_ref_hits` progression.
     #[test]
