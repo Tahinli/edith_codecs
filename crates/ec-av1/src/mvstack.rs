@@ -932,6 +932,14 @@ pub fn find_mv_stack_with_sign_bias(
     }
 
     let clamp = |mv| clamp_mv_ref(mv, mi_row, mi_col, bw4, bh4, mi_cols, mi_rows);
+    // libaom `av1_find_mv_refs` clamps EVERY stack entry once the stack is
+    // built -- the NEWMV predictor is the DRL-selected entry itself, so a
+    // raw out-of-range candidate (left neighbour coding past the frame
+    // edge) must not survive here (pinned warp-flake-5.obu: pred col 520
+    // vs libaom's clamped 384, a value-equal-entropy mv drift).
+    for e in candidates.iter_mut() {
+        e.mv = clamp(e.mv);
+    }
     let nearest_mv = candidates.first().map_or((0, 0), |e| clamp(e.mv));
     let near_mv = candidates.get(1).map_or((0, 0), |e| clamp(e.mv));
     let pred_mv = if candidates.is_empty() {
@@ -1606,6 +1614,12 @@ pub fn find_mv_stack_compound(
     }
 
     let clamp = |mv| clamp_mv_ref(mv, mi_row, mi_col, bw4, bh4, mi_cols, mi_rows);
+    // Same as the single-ref builder: libaom clamps every stack entry, and
+    // DRL reads the entries directly.
+    for e in candidates.iter_mut() {
+        e.mv0 = clamp(e.mv0);
+        e.mv1 = clamp(e.mv1);
+    }
     let nearest_mv = candidates
         .first()
         .map_or(((0, 0), (0, 0)), |e| (clamp(e.mv0), clamp(e.mv1)));
