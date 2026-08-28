@@ -18,6 +18,7 @@ mod cdf_state;
 pub mod decode;
 pub mod encode;
 pub mod encoder;
+mod film_grain;
 pub mod frame;
 pub mod intra;
 pub mod mc;
