@@ -8287,8 +8287,11 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             switchable_motion_mode,
                             allow_warped_motion,
                             true,
+                            // lane-rect r2: the top strip's TRUE 32x16
+                            // footprint (was BLOCK,BLOCK -- the same square
+                            // corner-cut rect-flake-1 exposed on HORZ).
                             BLOCK,
-                            BLOCK,
+                            SUB,
                         )?;
                         if (r32 * 2 + 1) as u32 * SUB_MI < mi_rows {
                             decode_inter_block(
