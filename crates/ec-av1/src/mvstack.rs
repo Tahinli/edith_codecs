@@ -78,6 +78,40 @@
 //! stack to two entries (spec 7.10.2.12) — this module's stack can be
 //! shorter than two candidates where libaom's never is.
 
+/// How many query blocks [`find_mv_stack_with_sign_bias`] has folded at
+/// least one temporal MV candidate into (spec 7.9/7.10.2.8's
+/// `add_tpl_ref_mv`) — the real-aomenc temporal-MV gate's own firing
+/// counter (`crate::decode::tmv_hits`), proving the projection path in
+/// [`crate::motion_field`] is actually reached, not just compiled.
+static TMV_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The number of query blocks that received at least one temporal MV
+/// candidate so far, across every [`find_mv_stack_with_sign_bias`] call in
+/// this process.
+pub(crate) fn tmv_hits() -> usize {
+    TMV_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Everything [`find_mv_stack_with_sign_bias`] needs to fold temporal MV
+/// candidates into a block's stack (spec 7.10.2.8, only reached when the
+/// frame header's own `use_ref_frame_mvs` is set): the current frame's own
+/// projected motion field, the distance (in `get_relative_dist` units) from
+/// the current frame to *this query's* single reference frame's own
+/// `OrderHint` (`cur_offset_0`, spec 7.9.3 — computed by the caller, since
+/// this module has no reason to carry `order_hint_bits`/`OrderHints[]`
+/// itself), and `allow_high_precision_mv` (`lower_mv_precision`, spec
+/// 7.10.2.8).
+pub struct TplArgs<'a> {
+    /// The current frame's projected temporal motion field
+    /// ([`crate::motion_field::setup_motion_field`]'s output).
+    pub field: &'a crate::motion_field::TplField,
+    /// `get_relative_dist(OrderHint, OrderHints[ref_frame - LAST_FRAME])`,
+    /// pre-computed by the caller.
+    pub cur_offset_0: i32,
+    /// The frame header's own `allow_high_precision_mv`.
+    pub allow_high_precision_mv: bool,
+}
+
 /// One 4x4 `mi` unit's motion state, as the encode loop will have filled it
 /// in by the time it asks for a block's MV stack.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -534,6 +568,7 @@ pub fn find_mv_stack(
         mi_cols,
         mi_rows,
         &NO_SIGN_BIAS,
+        None,
     )
 }
 
@@ -553,6 +588,7 @@ pub fn find_mv_stack_with_sign_bias(
     mi_cols: usize,
     mi_rows: usize,
     sign_bias_table: &SignBiasTable,
+    tpl: Option<TplArgs>,
 ) -> MvStack {
     let mut candidates = Vec::new();
     let mut newmv_count = 0u32;
@@ -627,6 +663,97 @@ pub fn find_mv_stack_with_sign_bias(
     // can add anything else (mvref_common.c ~line 544-545).
     for entry in &mut candidates {
         entry.weight += REF_CAT_LEVEL;
+    }
+
+    // Temporal MV candidates (spec 7.10.2.8's `add_tpl_ref_mv`, only reached
+    // when the frame header set `use_ref_frame_mvs`): probed over a grid of
+    // 8x8-unit offsets spanning the block (libaom's own `blk_row_end`/
+    // `blk_col_end`/`step_h`/`step_w`, every real block this crate ever
+    // codes being square and no wider than 32x32 — `BLOCK_64X64`'s own
+    // 16x16-mi-unit step branch is dead here, ported anyway since nothing
+    // relies on that), plus three "extension" samples past the block's own
+    // span (`tpl_sample_pos`) once the block is at least 8x8 and smaller
+    // than 64x64 (`allow_extension` — true for every block size this crate
+    // codes). Folded in *after* the row/col/top-right scan's own
+    // `REF_CAT_LEVEL` boost above and *before* the corner probe, matching
+    // libaom's call order in `setup_ref_mv_list` exactly (a temporal
+    // candidate never gets the boost, and the corner probe can still add a
+    // genuinely new, lower-weight entry after it).
+    let mut zero_mv_ctx = 0usize;
+    if let Some(TplArgs {
+        field,
+        cur_offset_0,
+        allow_high_precision_mv,
+    }) = tpl
+    {
+        let mut any_hit = false;
+        let voffset = bh4.max(2);
+        let hoffset = bw4.max(2);
+        let blk_row_end = bh4.min(16);
+        let blk_col_end = bw4.min(16);
+        let step_h = if bh4 >= 16 { 4 } else { 2 };
+        let step_w = if bw4 >= 16 { 4 } else { 2 };
+        let mut first_sample_missing = true;
+        let mut first_sample_far = false;
+        let mut blk_row = 0usize;
+        while blk_row < blk_row_end {
+            let mut blk_col = 0usize;
+            while blk_col < blk_col_end {
+                if let Some(cand) = crate::motion_field::add_tpl_ref_mv(
+                    field,
+                    mi_row,
+                    mi_col,
+                    blk_row as isize,
+                    blk_col as isize,
+                    cur_offset_0,
+                    allow_high_precision_mv,
+                ) {
+                    any_hit = true;
+                    if blk_row == 0 && blk_col == 0 {
+                        first_sample_missing = false;
+                        first_sample_far = cand.mv.0.abs() >= 16 || cand.mv.1.abs() >= 16;
+                    }
+                    add_candidate(&mut candidates, cand.mv, 2);
+                }
+                blk_col += step_w;
+            }
+            blk_row += step_h;
+        }
+        // Three "extension" samples past the block's own span (libaom
+        // `tpl_sample_pos`), reachable for every 8x8..32x32 block this crate
+        // codes (`allow_extension`), gated on staying inside the block's own
+        // 64x64 superblock (`check_sb_border`).
+        let allow_extension = (2..16).contains(&bh4) && (2..16).contains(&bw4);
+        if allow_extension {
+            let sb_mask = 16isize;
+            for (row_off, col_off) in [
+                (voffset as isize, -2isize),
+                (voffset as isize, hoffset as isize),
+                (voffset as isize - 2, hoffset as isize),
+            ] {
+                let row = (mi_row as isize & (sb_mask - 1)) + row_off;
+                let col = (mi_col as isize & (sb_mask - 1)) + col_off;
+                if row < 0 || row >= sb_mask || col < 0 || col >= sb_mask {
+                    continue;
+                }
+                if let Some(cand) = crate::motion_field::add_tpl_ref_mv(
+                    field,
+                    mi_row,
+                    mi_col,
+                    row_off,
+                    col_off,
+                    cur_offset_0,
+                    allow_high_precision_mv,
+                ) {
+                    any_hit = true;
+                    add_candidate(&mut candidates, cand.mv, 2);
+                }
+            }
+        }
+        if any_hit {
+            TMV_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        zero_mv_ctx = usize::from(first_sample_missing || first_sample_far);
     }
 
     // The diagonal top-left corner probe (module doc): folds into the row
@@ -816,10 +943,10 @@ pub fn find_mv_stack_with_sign_bias(
         }
         _ => 5,
     };
-    // GLOBALMV_OFFSET is only ever set by temporal MV projection
-    // (`cm->features.allow_ref_frame_mvs`), which this reduction never runs
-    // (see module doc) — exact, not a stand-in.
-    let zero_mv_ctx = 0;
+    // `zero_mv_ctx` was already computed above, from the temporal-MV pass
+    // when `tpl` is `Some` (GLOBALMV_OFFSET, spec 7.10.2.8) — `0` otherwise,
+    // exactly this reduction's old always-0 behaviour when
+    // `use_ref_frame_mvs` is unset.
 
     // av1_drl_ctx (mvref_common.h): weight was boosted in place above for
     // the nearest entries only, so this now compares the real stored weight
