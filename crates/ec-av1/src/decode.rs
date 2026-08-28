@@ -42,6 +42,7 @@ use crate::transform::{TxType, dequant_and_inverse_typed};
 
 const PARTITION_NONE: usize = 0;
 const PARTITION_SPLIT: usize = 3;
+const PARTITION_HORZ_B: usize = 5;
 const SB_MI: u32 = 16;
 const BLOCK_MI: u32 = 8;
 
@@ -3642,9 +3643,9 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                 }
                             }
                             _ => {
-                                return Err(unsupported(
-                                    "a partition type this encoder never writes",
-                                ));
+                                return Err(unsupported(format!(
+                                    "a partition type this encoder never writes (value={part32})"
+                                )));
                             }
                         }
                     }
@@ -4849,6 +4850,10 @@ fn decode_inter_block(
     // `allow_warped_motion` bits (spec 5.11.24's `read_motion_mode`).
     switchable_motion_mode: bool,
     allow_warped_motion: bool,
+    // lane-warp r5: set by the HORZ_B arm -- the 32x16 top strip is decoded
+    // as a square 32x32 block, which over-reads a residual unless coded
+    // `skip`; a non-skip strip must refuse cleanly instead of desyncing.
+    reject_residual: bool,
 ) -> Result<()> {
     let (r, c) = at;
     let (px, py) = (c * SUB, r * SUB);
@@ -4885,6 +4890,14 @@ fn decode_inter_block(
 
     let skip_ctx = usize::from(neighbours.above_skip[c]) + usize::from(neighbours.left_skip[r]);
     let skip = skip_mode || dec.symbol(&mut cdfs.skip[skip_ctx]) == 1;
+    // lane-warp r5: see `reject_residual` -- a square-block decode of a
+    // HORZ_B strip is symbol-exact only for `skip` (no residual, no
+    // motion_mode/warp symbol), so gate here before any further read.
+    if reject_residual && !skip {
+        return Err(unsupported(
+            "a non-skip 32x16 HORZ_B strip needs rectangular residual coding",
+        ));
+    }
 
     let (has_above, has_left) = (r > 0, c > 0);
     let (above_inter, left_inter) = (neighbours.above_inter[c], neighbours.left_inter[r]);
@@ -5787,8 +5800,8 @@ fn decode_inter_block(
             }
             if std::env::var_os("EC_AV1_TRACE").is_some() {
                 eprintln!(
-                    "EC_TRACE mi_row={mi_row} mi_col={mi_col} skip={} is_inter=1 mv=({},{}) is_new_mv={is_new_mv} bsize={side} ref={ref_frame} filter={:?} motion_mode_eligible={} obmc_selected={} tell={}",
-                    skip as u8, mv.0, mv.1, block_filter, motion_mode_eligible as u8, obmc_selected as u8, dec.debug_bitpos()
+                    "EC_TRACE mi_row={mi_row} mi_col={mi_col} skip={} is_inter=1 mv=({},{}) is_new_mv={is_new_mv} bsize={side} ref={ref_frame} filter={:?} motion_mode_eligible={} obmc_selected={} warped={} tell={}",
+                    skip as u8, mv.0, mv.1, block_filter, motion_mode_eligible as u8, obmc_selected as u8, warp_params.is_some() as u8, dec.debug_bitpos()
                 );
             }
             for dr in 0..bw4 {
@@ -7311,7 +7324,15 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
             );
             match (has_cols, has_rows) {
                 (true, true) => {
-                    dec.symbol(&mut cdfs.partition_w64[sb_ctx]);
+                    let part64 = dec.symbol(&mut cdfs.partition_w64[sb_ctx]);
+                    if std::env::var_os("EC_AV1_TRACE").is_some() {
+                        eprintln!(
+                            "TRACE partition_w64 mi=({},{}) ctx={sb_ctx} value={part64}",
+                            sb_r * SB_MI,
+                            sb_c * SB_MI
+                        );
+                    }
+                    let _ = part64;
                 }
                 (true, false) => {
                     dec.symbol_fixed(&gather(&cdfs.partition_w64[sb_ctx], VERT_ALIKE));
@@ -7334,7 +7355,15 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                     has_half(r32 * BLOCK_MI, BLOCK_MI, mi_rows),
                 );
                 let part32 = if has_cols32 && has_rows32 {
-                    dec.symbol(&mut cdfs.partition_w32[ctx32])
+                    let p = dec.symbol(&mut cdfs.partition_w32[ctx32]);
+                    if std::env::var_os("EC_AV1_TRACE").is_some() {
+                        eprintln!(
+                            "TRACE partition_w32 mi=({},{}) ctx={ctx32} value={p}",
+                            r32 * BLOCK_MI,
+                            c32 * BLOCK_MI
+                        );
+                    }
+                    p
                 } else {
                     match (has_cols32, has_rows32) {
                         (true, false) => {
@@ -7391,6 +7420,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             skip_mode_frame,
                             switchable_motion_mode,
                             allow_warped_motion,
+                            false,
                         )?;
                     }
                     PARTITION_SPLIT => {
@@ -7465,6 +7495,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     skip_mode_frame,
                                     switchable_motion_mode,
                                     allow_warped_motion,
+                                    false,
                                 )?;
                             } else {
                                 let ctx16 = neighbours.partition_ctx(at16, SUB);
@@ -7577,8 +7608,169 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             }
                         }
                     }
+                    PARTITION_HORZ_B => {
+                        // lane-warp r5: PARTITION_HORZ_B = 32x32 top strip +
+                        // 16x16 bottom-left + 16x16 bottom-right. aomenc
+                        // carves static regions into it; the strip is
+                        // decoded as a square 32x32 block: for a `skip`
+                        // block the symbol stream is identical to the true
+                        // 32x16 coding (no residual, no motion_mode/warp
+                        // symbol), and the square stamps it leaves over the
+                        // bottom half (neighbour arrays, skip/lf grids) are
+                        // re-stamped by the C/D leaves right after. The
+                        // mi-granular `left_side_mi` rows of a last-block-in-
+                        // tile strip leak 32-vs-16 only until the per-tile
+                        // `Neighbours::new` reset.
+                        let at32 = (r32 as usize, c32 as usize);
+                        decode_inter_block(
+                            &mut dec,
+                            &mut cdfs,
+                            &mut neighbours,
+                            &mut grid,
+                            at32,
+                            BLOCK,
+                            mi_cols,
+                            mi_rows,
+                            &mut y,
+                            &mut u,
+                            &mut v,
+                            &ref_y,
+                            &ref_u,
+                            &ref_v,
+                            &ref_slots,
+                            &sign_bias_table,
+                            base_q_idx,
+                            TxbSet::Luma32,
+                            TxbSet::Luma32Inter,
+                            TxbSet::Chroma16,
+                            TX32,
+                            TX16,
+                            &scan32,
+                            &scan16,
+                            3,
+                            allow_high_precision_mv,
+                            force_integer_mv,
+                            interp_fixed,
+                            enable_dual_filter,
+                            tpl_frame.as_ref(),
+                            reference_select,
+                            enable_masked_compound,
+                            enable_interintra_compound,
+                            enable_jnt_comp,
+                            order_hint_bits,
+                            order_hint,
+                            ref_order_hints,
+                            skip_mode_present,
+                            skip_mode_frame,
+                            switchable_motion_mode,
+                            allow_warped_motion,
+                            true,
+                        )?;
+                        if (r32 + 1) as u32 * SUB_MI < mi_rows {
+                            decode_inter_block(
+                                &mut dec,
+                                &mut cdfs,
+                                &mut neighbours,
+                                &mut grid,
+                                (r32 as usize + 1, c32 as usize),
+                                SUB,
+                                mi_cols,
+                                mi_rows,
+                                &mut y,
+                                &mut u,
+                                &mut v,
+                                &ref_y,
+                                &ref_u,
+                                &ref_v,
+                                &ref_slots,
+                                &sign_bias_table,
+                                base_q_idx,
+                                TxbSet::Luma16,
+                                if reduced_tx_set {
+                                    TxbSet::Luma16Inter
+                                } else {
+                                    TxbSet::Luma16InterSet1
+                                },
+                                TxbSet::Chroma8,
+                                TX16,
+                                TX8,
+                                &scan16,
+                                &scan8,
+                                2,
+                                allow_high_precision_mv,
+                                force_integer_mv,
+                                interp_fixed,
+                                enable_dual_filter,
+                                tpl_frame.as_ref(),
+                                reference_select,
+                                enable_masked_compound,
+                                enable_interintra_compound,
+                                enable_jnt_comp,
+                                order_hint_bits,
+                                order_hint,
+                                ref_order_hints,
+                                skip_mode_present,
+                                skip_mode_frame,
+                                switchable_motion_mode,
+                                allow_warped_motion,
+                                false,
+                            )?;
+                            if (c32 + 1) as u32 * SUB_MI < mi_cols {
+                                decode_inter_block(
+                                    &mut dec,
+                                    &mut cdfs,
+                                    &mut neighbours,
+                                    &mut grid,
+                                    (r32 as usize + 1, c32 as usize + 1),
+                                    SUB,
+                                    mi_cols,
+                                    mi_rows,
+                                    &mut y,
+                                    &mut u,
+                                    &mut v,
+                                    &ref_y,
+                                    &ref_u,
+                                    &ref_v,
+                                    &ref_slots,
+                                    &sign_bias_table,
+                                    base_q_idx,
+                                    TxbSet::Luma16,
+                                    if reduced_tx_set {
+                                        TxbSet::Luma16Inter
+                                    } else {
+                                        TxbSet::Luma16InterSet1
+                                    },
+                                    TxbSet::Chroma8,
+                                    TX16,
+                                    TX8,
+                                    &scan16,
+                                    &scan8,
+                                    2,
+                                    allow_high_precision_mv,
+                                    force_integer_mv,
+                                    interp_fixed,
+                                    enable_dual_filter,
+                                    tpl_frame.as_ref(),
+                                    reference_select,
+                                    enable_masked_compound,
+                                    enable_interintra_compound,
+                                    enable_jnt_comp,
+                                    order_hint_bits,
+                                    order_hint,
+                                    ref_order_hints,
+                                    skip_mode_present,
+                                    skip_mode_frame,
+                                    switchable_motion_mode,
+                                    allow_warped_motion,
+                                    false,
+                                )?;
+                            }
+                        }
+                    }
                     _ => {
-                        return Err(unsupported("a partition type this encoder never writes"));
+                        return Err(unsupported(format!(
+                            "a partition type this encoder never writes (value={part32})"
+                        )));
                     }
                 }
             }
@@ -8331,6 +8523,7 @@ mod tests {
             [0; 7],
             false,
             [0; 2],
+            false,
             false,
             false,
         )
