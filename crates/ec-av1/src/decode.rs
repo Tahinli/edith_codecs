@@ -400,8 +400,10 @@ enum TxClass {
 impl TxClass {
     fn of(tx_type: TxType) -> Self {
         match tx_type {
-            TxType::VDct => Self::Vert,
-            TxType::HDct => Self::Horiz,
+            // `TX_CLASS_VERT`/`TX_CLASS_HORIZ` (`txb_common.h`'s `tx_type_to_class`)
+            // key on axis alone -- FLIPADST is still ADST for this purpose.
+            TxType::VDct | TxType::VAdst | TxType::VFlipAdst => Self::Vert,
+            TxType::HDct | TxType::HAdst | TxType::HFlipAdst => Self::Horiz,
             _ => Self::TwoD,
         }
     }
@@ -599,18 +601,24 @@ fn read_coeffs(
     }
     let mut tx_type = default_tx_type;
     if let Some(tx_type_cdf) = coding.tx_type.as_deref_mut() {
-        // The CDF row's own width names its set: 7 symbols (8 slots) is
-        // `TX_SET_INTRA_1`, 5 (6 slots) the reduced `TX_SET_INTRA_2` (the
-        // inter sets we read share set 2's symbol order).
-        let set1 = tx_type_cdf.len() == 8;
+        // The CDF row's own width names its set (lane-cdffwd2: extended
+        // past the original two-way intra split once wider `reduced_tx_set
+        // == 0` inter sets joined the table): 17 slots (16 symbols) is
+        // `EXT_TX_SET_ALL16`, 13 (12 symbols) `EXT_TX_SET_DTT9_IDTX_1DDCT`,
+        // 8 (7 symbols) `TX_SET_INTRA_1`, everything else (6 slots, 5
+        // symbols) the reduced `TX_SET_INTRA_2`/`TX_SET_INTER_3` two sets
+        // share their symbol order with (`Tx_Type_Inter_Inv_Set3`'s two
+        // members are a prefix of `Tx_Type_Intra_Inv_Set2`'s five).
+        let len = tx_type_cdf.len();
         let t = dec.symbol(tx_type_cdf);
         if trace {
-            eprintln!("TRACE tx_type value={t} set1={set1}");
+            eprintln!("TRACE tx_type value={t} len={len}");
         }
-        tx_type = if set1 {
-            TxType::from_symbol_set1(t)
-        } else {
-            TxType::from_symbol(t)
+        tx_type = match len {
+            17 => TxType::from_symbol_all16(t),
+            13 => TxType::from_symbol_set2_12(t),
+            8 => TxType::from_symbol_set1(t),
+            _ => TxType::from_symbol(t),
         }
         .ok_or_else(|| unsupported(format!("a tx_type symbol outside its CDF's own set: {t}")))?;
     }
