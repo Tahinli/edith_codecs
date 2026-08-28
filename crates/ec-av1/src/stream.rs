@@ -573,6 +573,19 @@ mod tests {
         GATE_COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// lane-cdfflake: a cheap, dependency-free (FNV-1a, not cryptographic --
+    /// this is a load-bearing-identity fingerprint for flake triage, not a
+    /// security digest, so no `sha2` dep is pulled in) fixture fingerprint
+    /// for the cdf-forwarding gate's instrumentation below.
+    fn fnv1a64(bytes: &[u8]) -> u64 {
+        let mut hash = 0xcbf29ce484222325u64;
+        for &b in bytes {
+            hash ^= b as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash
+    }
+
     fn have_ffmpeg() -> bool {
         Command::new("ffmpeg")
             .arg("-version")
@@ -1836,6 +1849,25 @@ mod tests {
                 "ffmpeg fixture: {}",
                 String::from_utf8_lossy(&y4m.stderr)
             );
+            // lane-cdfflake: hard length check on the y4m fixture itself --
+            // a truncated/racing ffmpeg write would otherwise surface as a
+            // downstream pixel mismatch indistinguishable from a real decode
+            // defect. y4m frames are `FRAME\n` (6 bytes) + raw 4:2:0 payload;
+            // find the header/frame-data boundary at the first `FRAME` marker
+            // rather than parsing the header fields (duration/rate can move
+            // the header text length without moving the frame math).
+            let marker_at = y4m
+                .stdout
+                .windows(5)
+                .position(|w| w == b"FRAME")
+                .expect("y4m stream missing FRAME marker");
+            let frame_420_bytes = width * height * 3 / 2;
+            assert_eq!(
+                y4m.stdout.len(),
+                marker_at + frame_count * (6 + frame_420_bytes),
+                "y4m fixture length mismatch (seed {seed})"
+            );
+            let y4m_hash = fnv1a64(&y4m.stdout);
             let mut child = Command::new(aomenc_path())
                 .args([
                     "--codec=av1",
@@ -1919,6 +1951,7 @@ mod tests {
                 String::from_utf8_lossy(&out.stderr)
             );
             let stream = out.stdout;
+            let stream_hash = fnv1a64(&stream);
             // A named `unsupported` refusal is a documented coverage gap (each
             // one carries its own test debt elsewhere), not a forwarding verdict
             // -- try the next seed. Any stream that DECODES must be pixel-exact,
@@ -1937,6 +1970,20 @@ mod tests {
             };
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
             assert_eq!(frames.len(), frame_count);
+            // lane-cdfflake: reconstruct ffmpeg's raw reference bytes (the
+            // three per-frame slices are contiguous chunks of the raw
+            // `-f rawvideo` output ffmpeg_decode_sequence sliced, so
+            // concatenating them back is bit-for-bit the same bytes ffmpeg
+            // actually produced -- no second ffmpeg invocation needed).
+            let ffmpeg_raw: Vec<u8> = ffmpeg_frames
+                .iter()
+                .flat_map(|p| p.y.iter().chain(&p.u).chain(&p.v).copied())
+                .collect();
+            let ffmpeg_raw_hash = fnv1a64(&ffmpeg_raw);
+            eprintln!(
+                "cdfflake attempt seed={seed}: y4m_hash={y4m_hash:016x} \
+                 stream_hash={stream_hash:016x} ffmpeg_raw_hash={ffmpeg_raw_hash:016x}"
+            );
             // lane-av1golden3: pin the exact raw stream on the first mismatch
             // so a flaky-looking gate failure becomes a deterministic, static
             // fixture to bisect against -- env-gated, no cost on a normal run.
@@ -1949,6 +1996,21 @@ mod tests {
                     std::fs::write(&path, &stream).expect("writing pinned stream");
                     eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
                 }
+                // lane-cdfflake: unconditional pin on mismatch -- the aomenc
+                // stream AND ffmpeg's raw reference bytes, so a flake caught
+                // under load names the liar (stream bytes differ from a
+                // clean rerun -> subprocess instability; reference bytes
+                // differ -> ffmpeg instability; both stable -> real decode
+                // defect) without relying on the env var being set.
+                let sp = "/tmp/claude-1000/-home-tahinli-Documents-Code-Rust-edith-codecs/\
+                          51b5f611-f998-43a8-b975-e64cb643a3e1/scratchpad";
+                std::fs::write(format!("{sp}/cdfflake-stream-seed{seed}.bin"), &stream)
+                    .expect("writing pinned stream");
+                std::fs::write(format!("{sp}/cdfflake-ffmpeg-raw-seed{seed}.bin"), &ffmpeg_raw)
+                    .expect("writing pinned ffmpeg reference");
+                eprintln!(
+                    "cdfflake MISMATCH seed={seed}: pinned stream + ffmpeg reference to {sp}"
+                );
             }
             for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
                 assert_eq!(got.y, want.y, "frame {i} luma vs ffmpeg (seed {seed})");
