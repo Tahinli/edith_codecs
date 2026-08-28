@@ -1205,6 +1205,19 @@ pub const SINGLE_REF: [[[u16; 3]; 6]; 3] = [
 /// least 8x8 both dims (`is_comp_ref_allowed`) -- lane-av1comp.
 pub const SKIP_MODE: [[u16; 3]; 3] = [[32621, 32768, 0], [20708, 32768, 0], [8127, 32768, 0]];
 
+/// `default_obmc_cdf` (spec 9.4): `use_obmc`, by square bsize (`BLOCK_8X8`,
+/// `BLOCK_16X16`, `BLOCK_32X32`, `BLOCK_64X64` -- `BLOCK_SIZES_ALL` indices
+/// 3/6/9/12, the only sizes this decoder ever codes). Read only once
+/// `motion_mode_allowed` (spec 5.11.24's `read_motion_mode`) offers
+/// `OBMC_CAUSAL` rather than `WARPED_CAUSAL` -- lane-motionmode round 1
+/// never reaches the three-way `motion_mode_cdf`, see `decode.rs`.
+pub const OBMC: [[u16; 3]; 4] = [
+    [10437, 32768, 0],
+    [17432, 32768, 0],
+    [25817, 32768, 0],
+    [30128, 32768, 0],
+];
+
 /// `Default_Comp_Mode_Cdf` (spec 9.4, `default_comp_inter_cdf`): whether an
 /// inter block reads `SINGLE_REFERENCE` or `COMPOUND_REFERENCE` -- only
 /// reached once `read_ref_frames` knows the frame's `reference_select`
