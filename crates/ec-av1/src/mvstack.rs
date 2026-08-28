@@ -412,7 +412,7 @@ fn scan_row(
         }
         let mut weight = ROW_COL_WEIGHT_FLOOR;
         if bw4 <= n4 {
-            let inc = ((-max_row_offset + row_offset + 1) as usize).min(n4);
+            let inc = ((-max_row_offset + row_offset + 1) as usize).min(info.size_h);
             weight = weight.max(inc as u32);
             *processed_rows = (inc as isize - row_offset - 1).max(0) as usize;
         }
@@ -485,7 +485,7 @@ fn scan_col(
         }
         let mut weight = ROW_COL_WEIGHT_FLOOR;
         if bh4 <= n4 {
-            let inc = ((-max_col_offset + col_offset + 1) as usize).min(n4);
+            let inc = ((-max_col_offset + col_offset + 1) as usize).min(info.size);
             weight = weight.max(inc as u32);
             *processed_cols = (inc as isize - col_offset - 1).max(0) as usize;
         }
@@ -1127,7 +1127,7 @@ fn scan_row_compound(
         }
         let mut weight = ROW_COL_WEIGHT_FLOOR;
         if bw4 <= n4 {
-            let inc = ((-max_row_offset + row_offset + 1) as usize).min(n4);
+            let inc = ((-max_row_offset + row_offset + 1) as usize).min(info.size_h);
             weight = weight.max(inc as u32);
             *processed_rows = (inc as isize - row_offset - 1).max(0) as usize;
         }
@@ -1183,7 +1183,7 @@ fn scan_col_compound(
         }
         let mut weight = ROW_COL_WEIGHT_FLOOR;
         if bh4 <= n4 {
-            let inc = ((-max_col_offset + col_offset + 1) as usize).min(n4);
+            let inc = ((-max_col_offset + col_offset + 1) as usize).min(info.size);
             weight = weight.max(inc as u32);
             *processed_cols = (inc as isize - col_offset - 1).max(0) as usize;
         }
