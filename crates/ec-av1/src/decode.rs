@@ -5375,8 +5375,8 @@ fn decode_inter_block(
             globalmv_for_lf = is_globalmv;
             if std::env::var_os("EC_AV1_TRACE").is_some() {
                 eprintln!(
-                    "EC_TRACE mi_row={mi_row} mi_col={mi_col} skip={} is_inter=1 mv=({},{}) is_new_mv={is_new_mv} bsize={side} ref={ref_frame} filter={:?}",
-                    skip as u8, mv.0, mv.1, block_filter
+                    "EC_TRACE mi_row={mi_row} mi_col={mi_col} skip={} is_inter=1 mv=({},{}) is_new_mv={is_new_mv} bsize={side} ref={ref_frame} filter={:?} motion_mode_eligible={} obmc_selected={} tell={}",
+                    skip as u8, mv.0, mv.1, block_filter, motion_mode_eligible as u8, obmc_selected as u8, dec.debug_bitpos()
                 );
             }
             for dr in 0..bw4 {
@@ -6663,6 +6663,10 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     // lane-av1comp: `seq_params`' own compound-blend enable bits.
     enable_masked_compound: bool,
     enable_jnt_comp: bool,
+    // lane-sb128 r3: this sequence header's own `enable_interintra_compound`
+    // bit, threaded to every `decode_inter_block`/`decode_inter_block8` call
+    // below (spec 5.11.24's `interintra` read).
+    enable_interintra_compound: bool,
     // lane-av1comp round 14: this frame header's own `skip_mode_present`/
     // `skip_mode_frame` (spec 5.9.22), threaded to every `decode_inter_block`/
     // `decode_inter_block8` call below.
@@ -6876,6 +6880,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             tpl_frame.as_ref(),
                             reference_select,
                             enable_masked_compound,
+                            enable_interintra_compound,
                             enable_jnt_comp,
                             order_hint_bits,
                             order_hint,
@@ -6948,6 +6953,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     tpl_frame.as_ref(),
                                     reference_select,
                                     enable_masked_compound,
+                                    enable_interintra_compound,
                                     enable_jnt_comp,
                                     order_hint_bits,
                                     order_hint,
@@ -7011,6 +7017,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                             allow_high_precision_mv,
                                             reference_select,
                                             enable_masked_compound,
+                                            enable_interintra_compound,
                                             enable_jnt_comp,
                                             order_hint_bits,
                                             order_hint,
