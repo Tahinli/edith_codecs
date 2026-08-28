@@ -3937,6 +3937,94 @@ fn read_inter_compound_mode(
     dec.symbol(&mut cdfs.inter_compound_mode[ctx]) as u8
 }
 
+/// spec 7.10.2.10 `assign_mv`'s compound branch, plus the compound half of
+/// `read_drl_idx` (spec 5.11.24) it depends on -- `mode` is
+/// [`read_inter_compound_mode`]'s own `0..=7` (`NEAREST_NEARESTMV`..
+/// `NEW_NEWMV`, libaom `enums.h` order). Every `GLOBAL_GLOBALMV` side reads
+/// as `(0, 0)` since [`crate::stream::decode_stream`] already refuses any
+/// non-`IDENTITY` global motion model before a tile is ever decoded.
+///
+/// Ported straight from libaom `decodemv.c`'s `read_drl_idx` (the
+/// `NEW_NEWMV`/`have_nearmv_in_inter_mode` branches) and `assign_mv`/its
+/// caller's `ref_mv[]`/`nearmv[]` setup: the `NEAR_NEWMV`/`NEW_NEARMV`
+/// `1 + ref_mv_idx` special case is folded into `new_idx` below, matching
+/// `read_drl_idx`'s own comment about "offsetting the NEARESTMV mode".
+fn assign_compound_mv(
+    dec: &mut SymbolDecoder,
+    cdfs: &mut Cdfs,
+    comp_stack: &crate::mvstack::CompoundMvStack,
+    mode: u8,
+    allow_high_precision_mv: bool,
+) -> ((i32, i32), (i32, i32)) {
+    const NEAREST_NEARESTMV: u8 = 0;
+    const NEAR_NEARMV: u8 = 1;
+    const NEAREST_NEWMV: u8 = 2;
+    const NEW_NEARESTMV: u8 = 3;
+    const NEAR_NEWMV: u8 = 4;
+    const NEW_NEARMV: u8 = 5;
+    const GLOBAL_GLOBALMV: u8 = 6;
+    const NEW_NEWMV: u8 = 7;
+
+    let mut ref_mv_idx = 0usize;
+    if mode == NEW_NEWMV {
+        let mut idx = 0usize;
+        while idx < 2 && comp_stack.entries.len() > idx + 1 {
+            if dec.symbol(&mut cdfs.drl_mode[comp_stack.drl_ctx[idx]]) == 0 {
+                break;
+            }
+            idx += 1;
+        }
+        ref_mv_idx = idx;
+    } else if matches!(mode, NEAR_NEARMV | NEAR_NEWMV | NEW_NEARMV) {
+        let mut idx = 1usize;
+        while idx < 3 && comp_stack.entries.len() > idx + 1 {
+            if dec.symbol(&mut cdfs.drl_mode[comp_stack.drl_ctx[idx]]) == 0 {
+                break;
+            }
+            idx += 1;
+        }
+        ref_mv_idx = idx - 1;
+    }
+
+    let near = comp_stack
+        .entries
+        .get(ref_mv_idx + 1)
+        .map_or(comp_stack.near_mv, |e| (e.mv0, e.mv1));
+    let new_idx = if matches!(mode, NEAR_NEWMV | NEW_NEARMV) {
+        ref_mv_idx + 1
+    } else {
+        ref_mv_idx
+    };
+    let new_pred = comp_stack
+        .entries
+        .get(new_idx)
+        .map_or(comp_stack.nearest_mv, |e| (e.mv0, e.mv1));
+
+    let read_new = |dec: &mut SymbolDecoder, cdfs: &mut Cdfs, base: (i32, i32)| {
+        read_mv(
+            dec,
+            &mut cdfs.mv_comp,
+            &mut cdfs.mv_joint,
+            base,
+            allow_high_precision_mv,
+        )
+    };
+
+    match mode {
+        NEAREST_NEARESTMV => comp_stack.nearest_mv,
+        NEAR_NEARMV => near,
+        NEAREST_NEWMV => (comp_stack.nearest_mv.0, read_new(dec, cdfs, new_pred.1)),
+        NEW_NEARESTMV => (read_new(dec, cdfs, new_pred.0), comp_stack.nearest_mv.1),
+        NEAR_NEWMV => (near.0, read_new(dec, cdfs, new_pred.1)),
+        NEW_NEARMV => (read_new(dec, cdfs, new_pred.0), near.1),
+        GLOBAL_GLOBALMV => ((0, 0), (0, 0)),
+        _ => (
+            read_new(dec, cdfs, new_pred.0),
+            read_new(dec, cdfs, new_pred.1),
+        ),
+    }
+}
+
 /// Decodes one square inter-frame block (32x32 whole or 16x16 leaf): skip,
 /// `is_inter`, then either the single-reference/MV-stack/motion-vector chain
 /// and motion-compensated reconstruction, or the inter frame's own intra
@@ -4077,16 +4165,23 @@ fn decode_inter_block(
                     sign_bias_table,
                     comp_tpl,
                 );
-                let _compound_mode = read_inter_compound_mode(
+                let compound_mode = read_inter_compound_mode(
                     dec,
                     cdfs,
                     comp_stack.new_mv_ctx,
                     comp_stack.ref_mv_ctx,
                 );
+                let _mv_pair = assign_compound_mv(
+                    dec,
+                    cdfs,
+                    &comp_stack,
+                    compound_mode,
+                    allow_high_precision_mv,
+                );
                 return Err(unsupported(
-                    "a COMPOUND_REFERENCE block (comp_mode/comp_ref/inter_compound_mode read \
-                     correctly; compound DRL, MV assignment, and two-reference motion \
-                     compensation are not wired yet -- lane-av1comp)",
+                    "a COMPOUND_REFERENCE block (comp_mode/comp_ref/inter_compound_mode/\
+                     compound DRL/MV assignment read correctly; two-reference motion \
+                     compensation is not wired yet -- lane-av1comp)",
                 ));
             }
         }
@@ -4624,7 +4719,7 @@ fn decode_inter_block8(
                 uni: false,
             });
             if read_comp_mode(dec, cdfs, above_nbr, left_nbr) {
-                read_compound_ref_frames(
+                let (ref0, ref1) = read_compound_ref_frames(
                     dec,
                     cdfs,
                     above_nbr,
@@ -4640,9 +4735,42 @@ fn decode_inter_block8(
                         -1
                     },
                 );
+                let (mi_row, mi_col) = leaf_mi;
+                // lane-av1comp: this leaf path has neither a real sign-bias
+                // table nor `tpl_frame` (see this function's own doc on the
+                // coarse `LAST_FRAME`-or-intra neighbour approximation
+                // already in force above), matching the plain `find_mv_stack`
+                // (no bias, no tpl) the leaf's single-ref arm below already
+                // uses.
+                let comp_stack = crate::mvstack::find_mv_stack_compound(
+                    grid,
+                    mi_row,
+                    mi_col,
+                    2,
+                    2,
+                    (ref0, ref1),
+                    mi_cols as usize,
+                    mi_rows as usize,
+                    &NO_SIGN_BIAS,
+                    None,
+                );
+                let compound_mode = read_inter_compound_mode(
+                    dec,
+                    cdfs,
+                    comp_stack.new_mv_ctx,
+                    comp_stack.ref_mv_ctx,
+                );
+                let _mv_pair = assign_compound_mv(
+                    dec,
+                    cdfs,
+                    &comp_stack,
+                    compound_mode,
+                    allow_high_precision_mv,
+                );
                 return Err(unsupported(
-                    "a COMPOUND_REFERENCE 8x8 leaf (comp_mode/comp_ref read correctly; \
-                     two-reference motion compensation is not wired yet -- lane-av1comp)",
+                    "a COMPOUND_REFERENCE 8x8 leaf (comp_mode/comp_ref/inter_compound_mode/\
+                     compound DRL/MV assignment read correctly; two-reference motion \
+                     compensation is not wired yet -- lane-av1comp)",
                 ));
             }
         }
