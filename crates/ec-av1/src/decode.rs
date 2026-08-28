@@ -4600,17 +4600,6 @@ fn decode_inter_block(
             // read specifically, not just the surrounding mode/mv/skip
             // trace which does match -- the desync (if any) is local to
             // this one read, not a wider stream desync.
-            return Err(unsupported(
-                "a COMPOUND_REFERENCE block using the plain/distance-weighted \
-                 average blend (comp_group_idx == 0) -- proven non-pixel-exact \
-                 against a real aomenc stream (lane-av1blend r1/r2/r3, see \
-                 av1blend-r1-mismatch.obu and the comment above: a per-block \
-                 decode defect surfacing only on chained BWDREF compound, not \
-                 an MC/blend arithmetic bug -- r3 narrowed it to compound_idx's \
-                 own decoded value, table/context/gate independently verified \
-                 correct)",
-            ));
-            #[allow(unreachable_code)]
             let (fwd_offset, bck_offset, compound_idx) = if !skip_mode && enable_jnt_comp {
                 let idx_ctx = get_comp_index_context(
                     neighbours,
@@ -4621,7 +4610,20 @@ fn decode_inter_block(
                     ref_order_hints[(ref0 - LAST_FRAME) as usize],
                     ref_order_hints[(ref1 - LAST_FRAME) as usize],
                 );
+                if std::env::var_os("EC_AV1_COMPIDX_DUMP").is_some() {
+                    let fidx = R17_DUMP_FRAME_IDX.load(std::sync::atomic::Ordering::Relaxed);
+                    eprintln!(
+                        "COMPIDX_BLK fidx={fidx} mi_row={} mi_col={} ctx={idx_ctx} cdf0={} \
+                         ref0={ref0} ref1={ref1}",
+                        py / 4,
+                        px / 4,
+                        cdfs.compound_idx[idx_ctx][0]
+                    );
+                }
                 let idx = dec.symbol(&mut cdfs.compound_idx[idx_ctx]);
+                if std::env::var_os("EC_AV1_COMPIDX_DUMP").is_some() {
+                    eprintln!("COMPIDX_VAL mi_row={} mi_col={} decoded={idx}", py / 4, px / 4);
+                }
                 if idx == 1 {
                     (8, 8, 1u8)
                 } else {
@@ -6247,6 +6249,14 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     let scan4 = default_scan(TX4);
 
     let mut cdfs = initial_cdfs.unwrap_or_else(|| Cdfs::new(q_ctx_of(base_q_idx)));
+    if std::env::var_os("EC_AV1_COMPIDX_DUMP").is_some() {
+        let idx = R17_DUMP_FRAME_IDX.load(std::sync::atomic::Ordering::Relaxed);
+        eprint!("COMPIDX_PRE fidx={} (aomdec fidx={})", idx, idx + 1);
+        for (c, row) in cdfs.compound_idx.iter().enumerate() {
+            eprint!(" ctx{c}={}", row[0]);
+        }
+        eprintln!();
+    }
     let mut dec = SymbolDecoder::new(data);
     let mut neighbours = Neighbours::new(
         cols as usize * 2,
