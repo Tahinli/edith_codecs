@@ -1246,6 +1246,47 @@ pub const INTERINTRA: [[u16; 3]; 4] = [
     [30237, 32768, 0],
 ];
 
+/// `default_interintra_mode_cdf` (spec 9.4): `interintra_mode` (II_DC/II_V/
+/// II_H/II_SMOOTH), indexed by `size_group_lookup[bsize]`, read right after
+/// `interintra == 1` (lane-interintra r1).
+pub const INTERINTRA_MODE: [[u16; 5]; 4] = [
+    [8192, 16384, 24576, 32768, 0],
+    [1875, 11082, 27332, 32768, 0],
+    [2473, 9996, 26388, 32768, 0],
+    [4238, 11537, 25926, 32768, 0],
+];
+
+/// `default_wedge_interintra_cdf` (spec 9.4): `wedge_interintra`, indexed by
+/// bsize over `BLOCK_SIZES_ALL` -- read for every interintra block whose
+/// size `av1_is_wedge_used` allows (the 8x8..32x32 family), REGARDLESS of
+/// the sequence header's `enable_interintra_wedge` bit (libaom
+/// decodemv.c:1548 gates on block size alone; the seq bit constrains only
+/// the encoder).
+pub const WEDGE_INTERINTRA: [[u16; 3]; 22] = [
+    [16384, 32768, 0],
+    [16384, 32768, 0],
+    [16384, 32768, 0],
+    [20036, 32768, 0],
+    [24957, 32768, 0],
+    [26704, 32768, 0],
+    [27530, 32768, 0],
+    [29564, 32768, 0],
+    [29444, 32768, 0],
+    [26872, 32768, 0],
+    [16384, 32768, 0],
+    [16384, 32768, 0],
+    [16384, 32768, 0],
+    [16384, 32768, 0],
+    [16384, 32768, 0],
+    [16384, 32768, 0],
+    [16384, 32768, 0],
+    [16384, 32768, 0],
+    [16384, 32768, 0],
+    [16384, 32768, 0],
+    [16384, 32768, 0],
+    [16384, 32768, 0],
+];
+
 /// `Default_Comp_Mode_Cdf` (spec 9.4, `default_comp_inter_cdf`): whether an
 /// inter block reads `SINGLE_REFERENCE` or `COMPOUND_REFERENCE` -- only
 /// reached once `read_ref_frames` knows the frame's `reference_select`

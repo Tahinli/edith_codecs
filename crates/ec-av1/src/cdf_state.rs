@@ -336,6 +336,12 @@ pub(crate) struct Cdfs {
     /// `interintra`, indexed by `size_group_lookup[bsize]` -- see
     /// `cdf::INTERINTRA`'s own doc.
     pub interintra: [[u16; 3]; 4],
+    /// `interintra_mode` (II_DC/II_V/II_H/II_SMOOTH), same size-group
+    /// indexing -- see `cdf::INTERINTRA_MODE` (lane-interintra r1).
+    pub interintra_mode: [[u16; 5]; 4],
+    /// `wedge_interintra`, indexed by bsize over `BLOCK_SIZES_ALL` -- see
+    /// `cdf::WEDGE_INTERINTRA` (lane-interintra r1).
+    pub wedge_interintra: [[u16; 3]; 22],
     /// Which of the eight `INTER_COMPOUND_MODES` a `COMPOUND_REFERENCE`
     /// block takes (lane-av1comp, spec 5.11.24's `compound_mode`).
     pub inter_compound_mode: [[u16; 9]; 8],
@@ -568,7 +574,16 @@ impl Cdfs {
         reset2(&mut self.skip_mode);
         reset2(&mut self.obmc);
         reset2(&mut self.motion_mode);
+        // lane-interintra r1 (ii-flake-9): the ONE table this list missed --
+        // an unreset counter saturates past 15 reads and slows update_cdf's
+        // rate to >>5 while libaom (reset per frame) stays at >>4; the rows
+        // drift a few counts apart and the gate flakes only on streams with
+        // enough switchable-filter reads. Audit: every other Cdfs field was
+        // covered (script-checked against the struct's field list).
+        reset2(&mut self.switchable_interp);
         reset2(&mut self.interintra);
+        reset2(&mut self.interintra_mode);
+        reset2(&mut self.wedge_interintra);
         reset2(&mut self.inter_compound_mode);
         reset2(&mut self.comp_ref_type);
         reset3(&mut self.uni_comp_ref);
@@ -1012,6 +1027,8 @@ impl Cdfs {
             obmc: cdf::OBMC,
             motion_mode: cdf::MOTION_MODE,
             interintra: cdf::INTERINTRA,
+            interintra_mode: cdf::INTERINTRA_MODE,
+            wedge_interintra: cdf::WEDGE_INTERINTRA,
             comp_group_idx: cdf::COMP_GROUP_IDX,
             compound_idx: cdf::COMPOUND_IDX,
             y_mode: cdf::Y_MODE,
