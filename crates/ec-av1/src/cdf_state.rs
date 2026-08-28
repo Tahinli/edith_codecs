@@ -318,6 +318,15 @@ pub(crate) struct Cdfs {
     /// Whether a block reads `skip_mode` (lane-av1comp, spec 5.11.29's
     /// `skip_mode`), indexed by `av1_get_skip_mode_context`.
     pub skip_mode: [[u16; 3]; 3],
+    /// `use_obmc` (spec 5.11.24's `read_motion_mode`, the `OBMC_CAUSAL`-vs-
+    /// `SIMPLE_TRANSLATION` two-symbol alphabet libaom's `obmc_cdf` reads
+    /// whenever `motion_mode_allowed` can't offer `WARPED_CAUSAL` --
+    /// lane-motionmode round 1 only reaches this arm, never the three-way
+    /// `motion_mode_cdf`), indexed by this block's own square bsize: 0 =
+    /// `BLOCK_8X8`, 1 = `BLOCK_16X16`, 2 = `BLOCK_32X32`, 3 = `BLOCK_64X64`
+    /// (`default_obmc_cdf`'s own `BLOCK_SIZES_ALL` indices 3/6/9/12 --
+    /// this decoder only ever codes those four square sizes).
+    pub obmc: [[u16; 3]; 4],
     /// Which of the eight `INTER_COMPOUND_MODES` a `COMPOUND_REFERENCE`
     /// block takes (lane-av1comp, spec 5.11.24's `compound_mode`).
     pub inter_compound_mode: [[u16; 9]; 8],
@@ -548,6 +557,7 @@ impl Cdfs {
         reset3(&mut self.single_ref);
         reset2(&mut self.comp_mode);
         reset2(&mut self.skip_mode);
+        reset2(&mut self.obmc);
         reset2(&mut self.inter_compound_mode);
         reset2(&mut self.comp_ref_type);
         reset3(&mut self.uni_comp_ref);
@@ -988,6 +998,7 @@ impl Cdfs {
             comp_ref: cdf::COMP_REF,
             comp_bwdref: cdf::COMP_BWDREF,
             skip_mode: cdf::SKIP_MODE,
+            obmc: cdf::OBMC,
             comp_group_idx: cdf::COMP_GROUP_IDX,
             compound_idx: cdf::COMPOUND_IDX,
             y_mode: cdf::Y_MODE,
