@@ -4662,8 +4662,8 @@ fn decode_inter_block(
 
     if std::env::var_os("EC_AV1_TELL").is_some() {
         eprintln!(
-            "TELL mi_row={} mi_col={} label=block_entry side={side} tell={}",
-            r * SUB_MI as usize, c * SUB_MI as usize, dec.debug_bitpos()
+            "TELL mi_row={} mi_col={} label=block_entry side={side} tell={} range={}",
+            r * SUB_MI as usize, c * SUB_MI as usize, dec.debug_bitpos(), dec.debug_state().0
         );
     }
     let skip_mode_ctx =
@@ -4697,8 +4697,8 @@ fn decode_inter_block(
     let is_inter = skip_mode || dec.symbol(&mut cdfs.intra_inter[ii_ctx]) == 1;
     if std::env::var_os("EC_AV1_TELL").is_some() {
         eprintln!(
-            "TELL mi_row={} mi_col={} label=post_is_inter skip_mode={skip_mode} skip={skip} is_inter={is_inter} tell={}",
-            r * SUB_MI as usize, c * SUB_MI as usize, dec.debug_bitpos()
+            "TELL mi_row={} mi_col={} label=post_is_inter skip_mode={skip_mode} skip={skip} is_inter={is_inter} tell={} range={}",
+            r * SUB_MI as usize, c * SUB_MI as usize, dec.debug_bitpos(), dec.debug_state().0
         );
     }
 
@@ -5293,8 +5293,8 @@ fn decode_inter_block(
             if std::env::var_os("EC_AV1_TELL").is_some() {
                 let (mi_row, mi_col) = (r * SUB_MI as usize, c * SUB_MI as usize);
                 eprintln!(
-                    "TELL mi_row={mi_row} mi_col={mi_col} label=post_ref_frame ref={ref_frame} tell={}",
-                    dec.debug_bitpos()
+                    "TELL mi_row={mi_row} mi_col={mi_col} label=post_ref_frame ref={ref_frame} tell={} range={}",
+                    dec.debug_bitpos(), dec.debug_state().0
                 );
             }
             // round 4-9 (lane-av1golden..lane-av1golden7): GOLDEN_FRAME's own
@@ -5409,8 +5409,8 @@ fn decode_inter_block(
             };
             if std::env::var_os("EC_AV1_TELL").is_some() {
                 eprintln!(
-                    "TELL mi_row={mi_row} mi_col={mi_col} label=post_assign_mv tell={}",
-                    dec.debug_bitpos()
+                    "TELL mi_row={mi_row} mi_col={mi_col} label=post_assign_mv tell={} range={}",
+                    dec.debug_bitpos(), dec.debug_state().0
                 );
             }
             // lane-sb128 r4: `interintra` (spec 5.11.24; libaom
@@ -5833,6 +5833,18 @@ fn decode_inter_block(
                 None,
             )?;
         }
+    }
+    // lane-comppin r9: end-of-block checkpoint -- everything between
+    // post_assign_mv and here (interintra, motion_mode, interp_filter, then
+    // every plane's coeffs) is unproven; a range mismatch here vs aomdec's
+    // equivalent post-content point (added at the matching call site)
+    // narrows the ladder to this block's own tail instead of the next
+    // block's partition read.
+    if std::env::var_os("EC_AV1_TELL").is_some() {
+        eprintln!(
+            "TELL mi_row={} mi_col={} label=block_end tell={} range={}",
+            r * SUB_MI as usize, c * SUB_MI as usize, dec.debug_bitpos(), dec.debug_state().0
+        );
     }
     neighbours.record(at, side, mode_for_tx, &[luma_grid, u_grid, v_grid]);
     neighbours.record_inter(at, side, skip, is_inter, ref_frame_for_lf, block_filter, skip_mode);
@@ -6962,6 +6974,16 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
 
     let mut cdfs = initial_cdfs.unwrap_or_else(|| Cdfs::new(q_ctx_of(base_q_idx)));
     let mut dec = SymbolDecoder::new(data);
+    // lane-comppin r9: tile-entry range, the earliest point comparable
+    // against aomdec's own `r->ec.rng` right after `aom_reader_init` -- the
+    // first ladder rung before any symbol (partition or otherwise) is read.
+    if std::env::var_os("EC_AV1_TELL").is_some() {
+        eprintln!(
+            "TELL label=tile_init tell={} range={}",
+            dec.debug_bitpos(),
+            dec.debug_state().0
+        );
+    }
     let mut neighbours = Neighbours::new(
         cols as usize * 2,
         rows as usize * 2,
