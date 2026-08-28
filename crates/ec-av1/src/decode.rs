@@ -988,16 +988,24 @@ impl Neighbours {
     /// a real compound block's own `comp_group_idx`/`compound_idx` bits
     /// (libaom `has_second_ref(mbmi)` branch of `get_comp_group_idx_context`/
     /// `get_comp_index_context`) -- called right after `record_inter` for
-    /// the same `at`/`side`, only on the `COMPOUND_REFERENCE` path.
+    /// the same `at`/`side`, only on the `COMPOUND_REFERENCE` path. Also
+    /// stamps `above_ref1`/`left_ref1` with the block's real second
+    /// reference, which `record_inter` always clears to `None` (lane-av1comp:
+    /// this is the one caller that actually knows it) -- so the next block's
+    /// [`NeighbourRef`](crate::mvstack::NeighbourRef) sees a real compound
+    /// neighbour instead of `record_inter`'s single-ref default.
     fn record_compound_ctx(
         &mut self,
         at: (usize, usize),
         side: usize,
+        ref1: i8,
         comp_group_idx: u8,
         compound_idx: u8,
     ) {
         let (r, c) = at;
         for cell in 0..side / SUB {
+            self.above_ref1[c + cell] = Some(ref1);
+            self.left_ref1[r + cell] = Some(ref1);
             self.above_comp_group_idx[c + cell] = comp_group_idx;
             self.left_comp_group_idx[r + cell] = comp_group_idx;
             self.above_compound_idx[c + cell] = compound_idx;
@@ -3907,6 +3915,19 @@ fn is_any_masked_compound_used_here(side: usize) -> bool {
     side.min(side) >= 8
 }
 
+/// Whether a compound reference pair is unidirectional (both references on
+/// the same temporal side of the current frame) -- `has_uni_comp_refs`
+/// (libaom `av1_reference_frame_utils.h`/`pred_common.c`'s own definition:
+/// a pair is `UNIDIR_COMP_REFERENCE` exactly when neither reference is
+/// backward-while-the-other-is-forward, i.e. `is_backward(ref0) ==
+/// is_backward(ref1)`). Used to build a real
+/// [`crate::mvstack::NeighbourRef::uni`] once `ref1` is known, matching
+/// [`crate::mvstack::comp_reference_type_ctx`]'s own `is_backward` calls.
+fn is_uni_comp_ref(ref0: i8, ref1: i8) -> bool {
+    let backward = |r: i8| (BWDREF_FRAME..=ALTREF_FRAME).contains(&r);
+    backward(ref0) == backward(ref1)
+}
+
 /// `get_comp_group_idx_context` (libaom `pred_common.h`): sums the
 /// above/left neighbour contributions [`Neighbours::record_inter`]/
 /// [`Neighbours::record_compound_ctx`] already precomputed, clamped to 5.
@@ -3941,7 +3962,9 @@ fn get_comp_index_context(
         crate::motion_field::get_relative_dist(order_hint_bits, cur_order_hint, ref0_order_hint)
             .abs();
     let offset = usize::from(fwd == bck);
-    neighbours.above_compound_idx[c] as usize + neighbours.left_compound_idx[r] as usize + 3 * offset
+    neighbours.above_compound_idx[c] as usize
+        + neighbours.left_compound_idx[r] as usize
+        + 3 * offset
 }
 
 fn read_comp_mode(
@@ -4234,7 +4257,7 @@ fn decode_inter_block(
     // `COMPOUND_REFERENCE` block -- applied to `neighbours` *after* the
     // common `record_inter` call below (which would otherwise stamp the
     // single-ref ALTREF-special-case default over it).
-    let mut compound_ctx: Option<(u8, u8)> = None;
+    let mut compound_ctx: Option<(i8, u8, u8)> = None;
     if is_inter {
         let above_nbr = has_above.then(|| NeighbourRef {
             is_inter: above_inter,
@@ -4244,7 +4267,8 @@ fn decode_inter_block(
                 0
             },
             ref1: neighbours.above_ref1[c],
-            uni: false,
+            uni: neighbours.above_ref1[c]
+                .is_some_and(|r1| is_uni_comp_ref(neighbours.above_ref[c], r1)),
         });
         let left_nbr = has_left.then(|| NeighbourRef {
             is_inter: left_inter,
@@ -4254,7 +4278,8 @@ fn decode_inter_block(
                 0
             },
             ref1: neighbours.left_ref1[r],
-            uni: false,
+            uni: neighbours.left_ref1[r]
+                .is_some_and(|r1| is_uni_comp_ref(neighbours.left_ref[r], r1)),
         });
         let is_compound = reference_select && read_comp_mode(dec, cdfs, above_nbr, left_nbr);
         if is_compound {
@@ -4297,12 +4322,8 @@ fn decode_inter_block(
                 sign_bias_table,
                 comp_tpl,
             );
-            let compound_mode = read_inter_compound_mode(
-                dec,
-                cdfs,
-                comp_stack.new_mv_ctx,
-                comp_stack.ref_mv_ctx,
-            );
+            let compound_mode =
+                read_inter_compound_mode(dec, cdfs, comp_stack.new_mv_ctx, comp_stack.ref_mv_ctx);
             let (mv0, mv1) = assign_compound_mv(
                 dec,
                 cdfs,
@@ -4400,7 +4421,7 @@ fn decode_inter_block(
             } else {
                 (8, 8, 1u8)
             };
-            compound_ctx = Some((comp_group_idx as u8, compound_idx));
+            compound_ctx = Some((ref1, comp_group_idx as u8, compound_idx));
 
             let mut inter0_y = vec![0i32; side * side];
             mc::predict_compound_intermediate(
@@ -4563,281 +4584,282 @@ fn decode_inter_block(
                 )?;
             }
         } else {
-        let ref_frame = read_single_ref(dec, cdfs, neighbours.above_ref[c], neighbours.left_ref[r]);
-        ref_frame_for_lf = ref_frame;
-        // round 4-9 (lane-av1golden..lane-av1golden7): GOLDEN_FRAME's own
-        // stacked defects (lf_level ref/mode-delta forwarding, the
-        // switchable_interp ref-frame ctx gate, and a film-grain synthesis
-        // gap that looked like a GOLDEN MC bug by survivor bias -- see the
-        // ledger) are all closed; GOLDEN_FRAME decodes live via `other_refs`
-        // below same as every other non-`LAST_FRAME` reference. lane-av1refs
-        // widens this from GOLDEN alone to every reference `read_single_ref`
-        // can name.
-        let (py_ref, pu_ref, pv_ref) = if ref_frame == LAST_FRAME {
-            (ref_y, ref_u, ref_v)
-        } else {
-            match other_refs[ref_frame as usize] {
-                Some((ry, ru, rv)) => (ry, ru, rv),
-                None => {
-                    return Err(unsupported(
-                        "a reference frame selected with no picture at this frame's own \
-                         ref_frame_idx slot for it",
-                    ));
-                }
-            }
-        };
-
-        let (mi_row, mi_col) = (r * SUB_MI as usize, c * SUB_MI as usize);
-        let bw4 = side / 4;
-        // spec 7.10.2.8: only reached when the frame header set
-        // `use_ref_frame_mvs` (`tpl_frame` is `Some` then, `None`
-        // otherwise) -- `cur_offset_0` is this query block's own resolved
-        // `ref_frame`'s distance from the current frame (spec 7.9.3),
-        // recomputed per block since different blocks pick different refs.
-        let tpl = tpl_frame.map(|t| crate::mvstack::TplArgs {
-            field: t.field,
-            cur_offset_0: crate::motion_field::get_relative_dist(
-                t.order_hint_bits,
-                t.order_hint,
-                t.ref_order_hints[(ref_frame - LAST_FRAME) as usize],
-            ),
-            allow_high_precision_mv,
-        });
-        let stack = find_mv_stack_with_sign_bias(
-            grid,
-            mi_row,
-            mi_col,
-            bw4,
-            bw4,
-            ref_frame,
-            mi_cols as usize,
-            mi_rows as usize,
-            sign_bias_table,
-            tpl,
-        );
-        let not_new = dec.symbol(&mut cdfs.new_mv[stack.new_mv_ctx]) == 1;
-        let mut is_globalmv = false;
-        let (mv, is_new_mv) = if !not_new {
-            // NEWMV (spec 5.11.24's `read_drl_idx`, `RefMvIdx` starting at 0):
-            // read at most two `drl_mode` bits, one per stack entry past the
-            // first, stopping at the first `0`. The chosen index selects
-            // which stack entry `read_mv`'s base predictor comes from
-            // (spec 7.10.2.10 `assign_mv`'s `PredMv = RefStackMv[RefMvIdx]`)
-            // -- entry 0 (`stack.pred_mv`) only when the loop never advances.
-            let mut idx = 0usize;
-            while idx < 2 && stack.entries.len() > idx + 1 {
-                if dec.symbol(&mut cdfs.drl_mode[stack.drl_ctx[idx]]) == 0 {
-                    break;
-                }
-                idx += 1;
-            }
-            let base_mv = stack.entries.get(idx).map_or(stack.pred_mv, |e| e.mv);
-            (
-                read_mv(
-                    dec,
-                    &mut cdfs.mv_comp,
-                    &mut cdfs.mv_joint,
-                    base_mv,
-                    allow_high_precision_mv,
-                ),
-                true,
-            )
-        } else {
-            let not_zero = dec.symbol(&mut cdfs.zero_mv[stack.zero_mv_ctx]) == 1;
-            is_globalmv = !not_zero;
-            let mv = if !not_zero {
-                // GLOBALMV: `gm_get_motion_vector` (spec 7.10.2.1) under the
-                // `GmType::IDENTITY` this crate's `decode_stream` requires of
-                // every inter frame's `LAST_FRAME` entry (any other warp
-                // model is refused before the tile decoder is ever called).
-                (0, 0)
+            let ref_frame =
+                read_single_ref(dec, cdfs, neighbours.above_ref[c], neighbours.left_ref[r]);
+            ref_frame_for_lf = ref_frame;
+            // round 4-9 (lane-av1golden..lane-av1golden7): GOLDEN_FRAME's own
+            // stacked defects (lf_level ref/mode-delta forwarding, the
+            // switchable_interp ref-frame ctx gate, and a film-grain synthesis
+            // gap that looked like a GOLDEN MC bug by survivor bias -- see the
+            // ledger) are all closed; GOLDEN_FRAME decodes live via `other_refs`
+            // below same as every other non-`LAST_FRAME` reference. lane-av1refs
+            // widens this from GOLDEN alone to every reference `read_single_ref`
+            // can name.
+            let (py_ref, pu_ref, pv_ref) = if ref_frame == LAST_FRAME {
+                (ref_y, ref_u, ref_v)
             } else {
-                let nearest = dec.symbol(&mut cdfs.ref_mv[stack.ref_mv_ctx]) == 0;
-                if nearest {
-                    stack.nearest_mv
-                } else {
-                    // NEARMV (spec 5.11.24's `read_drl_idx`, `RefMvIdx` starting
-                    // at 1): read at most two more `drl_mode` bits, one per stack
-                    // entry past the second, stopping at the first `0`.
-                    // `drl_ctx[idx]` is the context between `entries[idx]` and
-                    // `entries[idx + 1]` (`MvStack::drl_ctx`'s own doc), which is
-                    // exactly the pair this index is choosing between.
-                    let mut idx = 1usize;
-                    while idx < 3 && stack.entries.len() > idx + 1 {
-                        if dec.symbol(&mut cdfs.drl_mode[stack.drl_ctx[idx]]) == 0 {
-                            break;
-                        }
-                        idx += 1;
+                match other_refs[ref_frame as usize] {
+                    Some((ry, ru, rv)) => (ry, ru, rv),
+                    None => {
+                        return Err(unsupported(
+                            "a reference frame selected with no picture at this frame's own \
+                         ref_frame_idx slot for it",
+                        ));
                     }
-                    stack.entries.get(idx).map_or(stack.near_mv, |e| e.mv)
                 }
             };
-            (mv, false)
-        };
-        // spec `get_ref_filter_type`: a neighbour's own filter only feeds
-        // this block's switchable_interp context when that neighbour coded
-        // the SAME reference frame this block is about to read -- a
-        // different-ref neighbour reads as "no neighbour" ([3, 3], the
-        // sentinel `Neighbours::new` already seeds unset slots with),
-        // exactly like an intra neighbour. Without this gate, a GOLDEN_FRAME
-        // block next to a LAST_FRAME one inherits that neighbour's filter
-        // choice into its own context, corrupting the symbol it reads.
-        let above_filter_ctx = if neighbours.above_ref[c] == ref_frame {
-            neighbours.above_filter[c]
-        } else {
-            [3, 3]
-        };
-        let left_filter_ctx = if neighbours.left_ref[r] == ref_frame {
-            neighbours.left_filter[r]
-        } else {
-            [3, 3]
-        };
-        let (h_filter, v_filter, resolved_filter) = resolve_interp_filter(
-            dec,
-            cdfs,
-            interp_fixed,
-            enable_dual_filter,
-            is_globalmv,
-            above_filter_ctx,
-            left_filter_ctx,
-        );
-        block_filter = resolved_filter;
-        globalmv_for_lf = is_globalmv;
-        if std::env::var_os("EC_AV1_TRACE").is_some() {
-            eprintln!(
-                "EC_TRACE mi_row={mi_row} mi_col={mi_col} skip={} is_inter=1 mv=({},{}) is_new_mv={is_new_mv} bsize={side} ref={ref_frame} filter={:?}",
-                skip as u8, mv.0, mv.1, block_filter
+
+            let (mi_row, mi_col) = (r * SUB_MI as usize, c * SUB_MI as usize);
+            let bw4 = side / 4;
+            // spec 7.10.2.8: only reached when the frame header set
+            // `use_ref_frame_mvs` (`tpl_frame` is `Some` then, `None`
+            // otherwise) -- `cur_offset_0` is this query block's own resolved
+            // `ref_frame`'s distance from the current frame (spec 7.9.3),
+            // recomputed per block since different blocks pick different refs.
+            let tpl = tpl_frame.map(|t| crate::mvstack::TplArgs {
+                field: t.field,
+                cur_offset_0: crate::motion_field::get_relative_dist(
+                    t.order_hint_bits,
+                    t.order_hint,
+                    t.ref_order_hints[(ref_frame - LAST_FRAME) as usize],
+                ),
+                allow_high_precision_mv,
+            });
+            let stack = find_mv_stack_with_sign_bias(
+                grid,
+                mi_row,
+                mi_col,
+                bw4,
+                bw4,
+                ref_frame,
+                mi_cols as usize,
+                mi_rows as usize,
+                sign_bias_table,
+                tpl,
             );
-        }
-        for dr in 0..bw4 {
-            for dc in 0..bw4 {
-                grid.set(
-                    mi_row + dr,
-                    mi_col + dc,
-                    MiInfo {
-                        is_inter: true,
-                        ref_frame,
-                        ref_frame1: None,
-                        mv1: None,
-                        mv,
-                        is_new_mv,
-                        size: bw4,
-                    },
+            let not_new = dec.symbol(&mut cdfs.new_mv[stack.new_mv_ctx]) == 1;
+            let mut is_globalmv = false;
+            let (mv, is_new_mv) = if !not_new {
+                // NEWMV (spec 5.11.24's `read_drl_idx`, `RefMvIdx` starting at 0):
+                // read at most two `drl_mode` bits, one per stack entry past the
+                // first, stopping at the first `0`. The chosen index selects
+                // which stack entry `read_mv`'s base predictor comes from
+                // (spec 7.10.2.10 `assign_mv`'s `PredMv = RefStackMv[RefMvIdx]`)
+                // -- entry 0 (`stack.pred_mv`) only when the loop never advances.
+                let mut idx = 0usize;
+                while idx < 2 && stack.entries.len() > idx + 1 {
+                    if dec.symbol(&mut cdfs.drl_mode[stack.drl_ctx[idx]]) == 0 {
+                        break;
+                    }
+                    idx += 1;
+                }
+                let base_mv = stack.entries.get(idx).map_or(stack.pred_mv, |e| e.mv);
+                (
+                    read_mv(
+                        dec,
+                        &mut cdfs.mv_comp,
+                        &mut cdfs.mv_joint,
+                        base_mv,
+                        allow_high_precision_mv,
+                    ),
+                    true,
+                )
+            } else {
+                let not_zero = dec.symbol(&mut cdfs.zero_mv[stack.zero_mv_ctx]) == 1;
+                is_globalmv = !not_zero;
+                let mv = if !not_zero {
+                    // GLOBALMV: `gm_get_motion_vector` (spec 7.10.2.1) under the
+                    // `GmType::IDENTITY` this crate's `decode_stream` requires of
+                    // every inter frame's `LAST_FRAME` entry (any other warp
+                    // model is refused before the tile decoder is ever called).
+                    (0, 0)
+                } else {
+                    let nearest = dec.symbol(&mut cdfs.ref_mv[stack.ref_mv_ctx]) == 0;
+                    if nearest {
+                        stack.nearest_mv
+                    } else {
+                        // NEARMV (spec 5.11.24's `read_drl_idx`, `RefMvIdx` starting
+                        // at 1): read at most two more `drl_mode` bits, one per stack
+                        // entry past the second, stopping at the first `0`.
+                        // `drl_ctx[idx]` is the context between `entries[idx]` and
+                        // `entries[idx + 1]` (`MvStack::drl_ctx`'s own doc), which is
+                        // exactly the pair this index is choosing between.
+                        let mut idx = 1usize;
+                        while idx < 3 && stack.entries.len() > idx + 1 {
+                            if dec.symbol(&mut cdfs.drl_mode[stack.drl_ctx[idx]]) == 0 {
+                                break;
+                            }
+                            idx += 1;
+                        }
+                        stack.entries.get(idx).map_or(stack.near_mv, |e| e.mv)
+                    }
+                };
+                (mv, false)
+            };
+            // spec `get_ref_filter_type`: a neighbour's own filter only feeds
+            // this block's switchable_interp context when that neighbour coded
+            // the SAME reference frame this block is about to read -- a
+            // different-ref neighbour reads as "no neighbour" ([3, 3], the
+            // sentinel `Neighbours::new` already seeds unset slots with),
+            // exactly like an intra neighbour. Without this gate, a GOLDEN_FRAME
+            // block next to a LAST_FRAME one inherits that neighbour's filter
+            // choice into its own context, corrupting the symbol it reads.
+            let above_filter_ctx = if neighbours.above_ref[c] == ref_frame {
+                neighbours.above_filter[c]
+            } else {
+                [3, 3]
+            };
+            let left_filter_ctx = if neighbours.left_ref[r] == ref_frame {
+                neighbours.left_filter[r]
+            } else {
+                [3, 3]
+            };
+            let (h_filter, v_filter, resolved_filter) = resolve_interp_filter(
+                dec,
+                cdfs,
+                interp_fixed,
+                enable_dual_filter,
+                is_globalmv,
+                above_filter_ctx,
+                left_filter_ctx,
+            );
+            block_filter = resolved_filter;
+            globalmv_for_lf = is_globalmv;
+            if std::env::var_os("EC_AV1_TRACE").is_some() {
+                eprintln!(
+                    "EC_TRACE mi_row={mi_row} mi_col={mi_col} skip={} is_inter=1 mv=({},{}) is_new_mv={is_new_mv} bsize={side} ref={ref_frame} filter={:?}",
+                    skip as u8, mv.0, mv.1, block_filter
                 );
             }
-        }
-        mode_for_tx = 0;
+            for dr in 0..bw4 {
+                for dc in 0..bw4 {
+                    grid.set(
+                        mi_row + dr,
+                        mi_col + dc,
+                        MiInfo {
+                            is_inter: true,
+                            ref_frame,
+                            ref_frame1: None,
+                            mv1: None,
+                            mv,
+                            is_new_mv,
+                            size: bw4,
+                        },
+                    );
+                }
+            }
+            mode_for_tx = 0;
 
-        let mut pred_y = vec![0u8; side * side];
-        mc::predict_with_filters(
-            &py_ref.data,
-            py_ref.width,
-            py_ref.true_width,
-            py_ref.true_height,
-            mv_to_q4(px, mv.1, true),
-            mv_to_q4(py, mv.0, true),
-            side,
-            side,
-            h_filter,
-            v_filter,
-            &mut pred_y,
-        );
-        let mut pred_u = vec![0u8; chroma_side * chroma_side];
-        mc::predict_with_filters(
-            &pu_ref.data,
-            pu_ref.width,
-            pu_ref.true_width,
-            pu_ref.true_height,
-            mv_to_q4(cpx, mv.1, false),
-            mv_to_q4(cpy, mv.0, false),
-            chroma_side,
-            chroma_side,
-            h_filter,
-            v_filter,
-            &mut pred_u,
-        );
-        let mut pred_v = vec![0u8; chroma_side * chroma_side];
-        mc::predict_with_filters(
-            &pv_ref.data,
-            pv_ref.width,
-            pv_ref.true_width,
-            pv_ref.true_height,
-            mv_to_q4(cpx, mv.1, false),
-            mv_to_q4(cpy, mv.0, false),
-            chroma_side,
-            chroma_side,
-            h_filter,
-            v_filter,
-            &mut pred_v,
-        );
-
-        if skip {
-            y.reconstruct_mc(px, py, side, &pred_y, &vec![0i32; side * side]);
-            u.reconstruct_mc(
-                cpx,
-                cpy,
-                chroma_side,
-                &pred_u,
-                &vec![0i32; chroma_side * chroma_side],
-            );
-            v.reconstruct_mc(
-                cpx,
-                cpy,
-                chroma_side,
-                &pred_v,
-                &vec![0i32; chroma_side * chroma_side],
-            );
-            luma_grid = vec![0i32; side * side];
-            u_grid = vec![0i32; chroma_side * chroma_side];
-            v_grid = vec![0i32; chroma_side * chroma_side];
-        } else {
-            let around = neighbours.around(at, side);
-            luma_grid = read_inter_plane(
-                dec,
-                cdfs,
-                luma_set_inter,
-                scan_luma,
-                0,
-                around[0],
-                mode_for_tx,
-                y,
-                px,
-                py,
+            let mut pred_y = vec![0u8; side * side];
+            mc::predict_with_filters(
+                &py_ref.data,
+                py_ref.width,
+                py_ref.true_width,
+                py_ref.true_height,
+                mv_to_q4(px, mv.1, true),
+                mv_to_q4(py, mv.0, true),
                 side,
-                base_q_idx,
-                &pred_y,
-            )?;
-            u_grid = read_inter_plane(
-                dec,
-                cdfs,
-                chroma_set,
-                scan_chroma,
-                1,
-                around[1],
-                mode_for_tx,
-                u,
-                cpx,
-                cpy,
+                side,
+                h_filter,
+                v_filter,
+                &mut pred_y,
+            );
+            let mut pred_u = vec![0u8; chroma_side * chroma_side];
+            mc::predict_with_filters(
+                &pu_ref.data,
+                pu_ref.width,
+                pu_ref.true_width,
+                pu_ref.true_height,
+                mv_to_q4(cpx, mv.1, false),
+                mv_to_q4(cpy, mv.0, false),
                 chroma_side,
-                base_q_idx,
-                &pred_u,
-            )?;
-            v_grid = read_inter_plane(
-                dec,
-                cdfs,
-                chroma_set,
-                scan_chroma,
-                2,
-                around[2],
-                mode_for_tx,
-                v,
-                cpx,
-                cpy,
                 chroma_side,
-                base_q_idx,
-                &pred_v,
-            )?;
-        }
+                h_filter,
+                v_filter,
+                &mut pred_u,
+            );
+            let mut pred_v = vec![0u8; chroma_side * chroma_side];
+            mc::predict_with_filters(
+                &pv_ref.data,
+                pv_ref.width,
+                pv_ref.true_width,
+                pv_ref.true_height,
+                mv_to_q4(cpx, mv.1, false),
+                mv_to_q4(cpy, mv.0, false),
+                chroma_side,
+                chroma_side,
+                h_filter,
+                v_filter,
+                &mut pred_v,
+            );
+
+            if skip {
+                y.reconstruct_mc(px, py, side, &pred_y, &vec![0i32; side * side]);
+                u.reconstruct_mc(
+                    cpx,
+                    cpy,
+                    chroma_side,
+                    &pred_u,
+                    &vec![0i32; chroma_side * chroma_side],
+                );
+                v.reconstruct_mc(
+                    cpx,
+                    cpy,
+                    chroma_side,
+                    &pred_v,
+                    &vec![0i32; chroma_side * chroma_side],
+                );
+                luma_grid = vec![0i32; side * side];
+                u_grid = vec![0i32; chroma_side * chroma_side];
+                v_grid = vec![0i32; chroma_side * chroma_side];
+            } else {
+                let around = neighbours.around(at, side);
+                luma_grid = read_inter_plane(
+                    dec,
+                    cdfs,
+                    luma_set_inter,
+                    scan_luma,
+                    0,
+                    around[0],
+                    mode_for_tx,
+                    y,
+                    px,
+                    py,
+                    side,
+                    base_q_idx,
+                    &pred_y,
+                )?;
+                u_grid = read_inter_plane(
+                    dec,
+                    cdfs,
+                    chroma_set,
+                    scan_chroma,
+                    1,
+                    around[1],
+                    mode_for_tx,
+                    u,
+                    cpx,
+                    cpy,
+                    chroma_side,
+                    base_q_idx,
+                    &pred_u,
+                )?;
+                v_grid = read_inter_plane(
+                    dec,
+                    cdfs,
+                    chroma_set,
+                    scan_chroma,
+                    2,
+                    around[2],
+                    mode_for_tx,
+                    v,
+                    cpx,
+                    cpy,
+                    chroma_side,
+                    base_q_idx,
+                    &pred_v,
+                )?;
+            }
         }
     } else {
         let mode = dec.symbol(&mut cdfs.y_mode[size_group]);
@@ -4994,8 +5016,8 @@ fn decode_inter_block(
     }
     neighbours.record(at, side, mode_for_tx, &[luma_grid, u_grid, v_grid]);
     neighbours.record_inter(at, side, skip, is_inter, ref_frame_for_lf, block_filter);
-    if let Some((group_idx, idx)) = compound_ctx {
-        neighbours.record_compound_ctx(at, side, group_idx, idx);
+    if let Some((ref1, group_idx, idx)) = compound_ctx {
+        neighbours.record_compound_ctx(at, side, ref1, group_idx, idx);
     }
     neighbours.fill_skip_grid((r * (SUB / MI), c * (SUB / MI)), side / MI, skip);
     neighbours.fill_lf_grid(
@@ -5043,6 +5065,7 @@ fn decode_inter_block8(
     ref_y: &PlaneBuf,
     ref_u: &PlaneBuf,
     ref_v: &PlaneBuf,
+    other_refs: &RefSlots,
     base_q_idx: u8,
     scan8: &[u16],
     scan4: &[u16],
@@ -5053,7 +5076,18 @@ fn decode_inter_block8(
     // per-leaf `above_ref`/`left_ref` array exists here), so `comp_mode`'s
     // context uses that same approximation.
     reference_select: bool,
-) -> Result<(bool, bool)> {
+    enable_masked_compound: bool,
+    enable_jnt_comp: bool,
+    order_hint_bits: u32,
+    order_hint: u32,
+    ref_order_hints: [u32; 7],
+    // lane-av1comp: `Some((ref1, comp_group_idx, compound_idx))` only for a
+    // real `COMPOUND_REFERENCE` leaf, for the caller's own end-of-16x16
+    // `record_compound_ctx` call -- mirrors [`decode_inter_block`]'s own
+    // `compound_ctx` local, just handed back instead of applied here (this
+    // fn's `neighbours` recording happens once for the whole straddling
+    // 16x16 block, after every leaf).
+) -> Result<(bool, bool, Option<(i8, i8, u8, u8)>)> {
     const LAST_FRAME: i8 = 1;
     /// `Y_MODE`'s size group (`common_data.h`'s `size_group_lookup[BLOCK_8X8]`).
     const SIZE_GROUP_8: usize = 1;
@@ -5086,6 +5120,7 @@ fn decode_inter_block8(
 
     let mode_for_tx;
     let (luma_grid, u_grid, v_grid);
+    let mut compound_ctx8: Option<(i8, i8, u8, u8)> = None;
     if is_inter {
         if reference_select {
             let above_nbr = has_above.then(|| NeighbourRef {
@@ -5142,18 +5177,247 @@ fn decode_inter_block8(
                     comp_stack.new_mv_ctx,
                     comp_stack.ref_mv_ctx,
                 );
-                let _mv_pair = assign_compound_mv(
+                let (mv0, mv1) = assign_compound_mv(
                     dec,
                     cdfs,
                     &comp_stack,
                     compound_mode,
                     allow_high_precision_mv,
                 );
-                return Err(unsupported(
-                    "a COMPOUND_REFERENCE 8x8 leaf (comp_mode/comp_ref/inter_compound_mode/\
-                     compound DRL/MV assignment read correctly; two-reference motion \
-                     compensation is not wired yet -- lane-av1comp)",
-                ));
+
+                // spec 5.11.25: same gating [`decode_inter_block`]'s own
+                // compound arm uses, keyed off `outer_at`'s [`SUB`]-grid
+                // slot -- the only granularity `Neighbours`' comp_group_idx/
+                // compound_idx arrays track.
+                let group_ctx = get_comp_group_idx_context(neighbours, outer_at, SIDE);
+                let comp_group_idx =
+                    if enable_masked_compound && is_any_masked_compound_used_here(SIDE) {
+                        dec.symbol(&mut cdfs.comp_group_idx[group_ctx])
+                    } else {
+                        0
+                    };
+                if comp_group_idx == 1 {
+                    return Err(unsupported(
+                        "a masked COMPOUND_REFERENCE 8x8 leaf (comp_group_idx == 1, wedge/\
+                         diffwtd) -- this decoder's compound blend is the plain distance-\
+                         weighted/simple-average combine only, lane-av1comp",
+                    ));
+                }
+                let (fwd_offset, bck_offset, compound_idx) = if enable_jnt_comp {
+                    let idx_ctx = get_comp_index_context(
+                        neighbours,
+                        outer_at,
+                        SIDE,
+                        order_hint_bits,
+                        order_hint,
+                        ref_order_hints[(ref0 - LAST_FRAME) as usize],
+                        ref_order_hints[(ref1 - LAST_FRAME) as usize],
+                    );
+                    let idx = dec.symbol(&mut cdfs.compound_idx[idx_ctx]);
+                    if idx == 1 {
+                        (8, 8, 1u8)
+                    } else {
+                        let (fwd, bck) = crate::compound::dist_wtd_comp_weight_assign(
+                            order_hint_bits,
+                            order_hint,
+                            ref_order_hints[(ref0 - LAST_FRAME) as usize],
+                            ref_order_hints[(ref1 - LAST_FRAME) as usize],
+                        );
+                        (fwd, bck, 0u8)
+                    }
+                } else {
+                    (8, 8, 1u8)
+                };
+                compound_ctx8 = Some((ref0, ref1, comp_group_idx as u8, compound_idx));
+
+                let (py0, pu0, pv0) = ref_planes(ref0, ref_y, ref_u, ref_v, other_refs)?;
+                let (py1, pu1, pv1) = ref_planes(ref1, ref_y, ref_u, ref_v, other_refs)?;
+
+                for dr in 0..2 {
+                    for dc in 0..2 {
+                        grid.set(
+                            mi_row + dr,
+                            mi_col + dc,
+                            MiInfo {
+                                is_inter: true,
+                                ref_frame: ref0,
+                                ref_frame1: Some(ref1),
+                                mv1: Some(mv1),
+                                mv: mv0,
+                                is_new_mv: matches!(compound_mode, 2 | 3 | 4 | 5 | 7),
+                                size: 2,
+                            },
+                        );
+                    }
+                }
+                mode_for_tx = 0;
+
+                // lane-av1comp corner-cut, matching this leaf's single-ref
+                // arm below (`mc::predict`'s own fixed-Regular default):
+                // `decode_inter_block8` never resolves a switchable filter,
+                // so both compound taps use `Regular` too.
+                use mc::InterpFilterKind::Regular;
+                let mut inter0_y = vec![0i32; SIDE * SIDE];
+                mc::predict_compound_intermediate(
+                    &py0.data,
+                    py0.width,
+                    py0.true_width,
+                    py0.true_height,
+                    mv_to_q4(px, mv0.1, true),
+                    mv_to_q4(py, mv0.0, true),
+                    SIDE,
+                    SIDE,
+                    Regular,
+                    Regular,
+                    &mut inter0_y,
+                );
+                let mut inter1_y = vec![0i32; SIDE * SIDE];
+                mc::predict_compound_intermediate(
+                    &py1.data,
+                    py1.width,
+                    py1.true_width,
+                    py1.true_height,
+                    mv_to_q4(px, mv1.1, true),
+                    mv_to_q4(py, mv1.0, true),
+                    SIDE,
+                    SIDE,
+                    Regular,
+                    Regular,
+                    &mut inter1_y,
+                );
+                let mut pred_y = vec![0u8; SIDE * SIDE];
+                mc::combine_compound(&inter0_y, &inter1_y, fwd_offset, bck_offset, &mut pred_y);
+
+                let mut inter0_u = vec![0i32; CHROMA_SIDE * CHROMA_SIDE];
+                mc::predict_compound_intermediate(
+                    &pu0.data,
+                    pu0.width,
+                    pu0.true_width,
+                    pu0.true_height,
+                    mv_to_q4(cpx, mv0.1, false),
+                    mv_to_q4(cpy, mv0.0, false),
+                    CHROMA_SIDE,
+                    CHROMA_SIDE,
+                    Regular,
+                    Regular,
+                    &mut inter0_u,
+                );
+                let mut inter1_u = vec![0i32; CHROMA_SIDE * CHROMA_SIDE];
+                mc::predict_compound_intermediate(
+                    &pu1.data,
+                    pu1.width,
+                    pu1.true_width,
+                    pu1.true_height,
+                    mv_to_q4(cpx, mv1.1, false),
+                    mv_to_q4(cpy, mv1.0, false),
+                    CHROMA_SIDE,
+                    CHROMA_SIDE,
+                    Regular,
+                    Regular,
+                    &mut inter1_u,
+                );
+                let mut pred_u = vec![0u8; CHROMA_SIDE * CHROMA_SIDE];
+                mc::combine_compound(&inter0_u, &inter1_u, fwd_offset, bck_offset, &mut pred_u);
+
+                let mut inter0_v = vec![0i32; CHROMA_SIDE * CHROMA_SIDE];
+                mc::predict_compound_intermediate(
+                    &pv0.data,
+                    pv0.width,
+                    pv0.true_width,
+                    pv0.true_height,
+                    mv_to_q4(cpx, mv0.1, false),
+                    mv_to_q4(cpy, mv0.0, false),
+                    CHROMA_SIDE,
+                    CHROMA_SIDE,
+                    Regular,
+                    Regular,
+                    &mut inter0_v,
+                );
+                let mut inter1_v = vec![0i32; CHROMA_SIDE * CHROMA_SIDE];
+                mc::predict_compound_intermediate(
+                    &pv1.data,
+                    pv1.width,
+                    pv1.true_width,
+                    pv1.true_height,
+                    mv_to_q4(cpx, mv1.1, false),
+                    mv_to_q4(cpy, mv1.0, false),
+                    CHROMA_SIDE,
+                    CHROMA_SIDE,
+                    Regular,
+                    Regular,
+                    &mut inter1_v,
+                );
+                let mut pred_v = vec![0u8; CHROMA_SIDE * CHROMA_SIDE];
+                mc::combine_compound(&inter0_v, &inter1_v, fwd_offset, bck_offset, &mut pred_v);
+
+                if skip {
+                    y.reconstruct_mc(px, py, SIDE, &pred_y, &vec![0i32; SIDE * SIDE]);
+                    u.reconstruct_mc(
+                        cpx,
+                        cpy,
+                        CHROMA_SIDE,
+                        &pred_u,
+                        &vec![0i32; CHROMA_SIDE * CHROMA_SIDE],
+                    );
+                    v.reconstruct_mc(
+                        cpx,
+                        cpy,
+                        CHROMA_SIDE,
+                        &pred_v,
+                        &vec![0i32; CHROMA_SIDE * CHROMA_SIDE],
+                    );
+                    luma_grid = vec![0i32; SIDE * SIDE];
+                    u_grid = vec![0i32; CHROMA_SIDE * CHROMA_SIDE];
+                    v_grid = vec![0i32; CHROMA_SIDE * CHROMA_SIDE];
+                } else {
+                    let around = neighbours.around_mi(leaf_mi, 8);
+                    luma_grid = read_inter_plane(
+                        dec,
+                        cdfs,
+                        TxbSet::Luma8Inter,
+                        scan8,
+                        0,
+                        around[0],
+                        mode_for_tx,
+                        y,
+                        px,
+                        py,
+                        SIDE,
+                        base_q_idx,
+                        &pred_y,
+                    )?;
+                    u_grid = read_inter_plane(
+                        dec,
+                        cdfs,
+                        TxbSet::Chroma4,
+                        scan4,
+                        1,
+                        around[1],
+                        mode_for_tx,
+                        u,
+                        cpx,
+                        cpy,
+                        CHROMA_SIDE,
+                        base_q_idx,
+                        &pred_u,
+                    )?;
+                    v_grid = read_inter_plane(
+                        dec,
+                        cdfs,
+                        TxbSet::Chroma4,
+                        scan4,
+                        2,
+                        around[2],
+                        mode_for_tx,
+                        v,
+                        cpx,
+                        cpy,
+                        CHROMA_SIDE,
+                        base_q_idx,
+                        &pred_v,
+                    )?;
+                }
+                return Ok((skip, is_inter, compound_ctx8));
             }
         }
         let sr_ctx = single_ref_ctx(above_inter || left_inter);
@@ -5495,7 +5759,7 @@ fn decode_inter_block8(
     }
     neighbours.record_mi(leaf_mi, 8, &[luma_grid, u_grid, v_grid]);
     neighbours.fill_lf_grid(leaf_mi, 2, 8, if is_inter { LAST_FRAME } else { 0 });
-    Ok((skip, is_inter))
+    Ok((skip, is_inter, compound_ctx8))
 }
 
 /// Decodes the payload [`crate::tile::sb_coeff_inter_frame_tile`] writes,
@@ -5876,6 +6140,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     .filter(|&(mr, mc)| mr < mi_rows && mc < mi_cols)
                                     .collect();
                                 let mut prev_leaf: Option<((usize, usize), bool, bool)> = None;
+                                let mut last_compound_ctx: Option<(i8, i8, u8, u8)> = None;
                                 for (mr, mc) in leaf_positions {
                                     let leaf_mi = (mr as usize, mc as usize);
                                     let leaf_ctx = neighbours.partition_ctx_mi(leaf_mi, 8);
@@ -5885,7 +6150,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                             "a partition below 8x8 (this encoder never writes one)",
                                         ));
                                     }
-                                    let (skip, is_inter) = decode_inter_block8(
+                                    let (skip, is_inter, compound_ctx8) = decode_inter_block8(
                                         &mut dec,
                                         &mut cdfs,
                                         &mut neighbours,
@@ -5900,14 +6165,23 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                         &ref_y,
                                         &ref_u,
                                         &ref_v,
+                                        &ref_slots,
                                         base_q_idx,
                                         &scan8,
                                         &scan4,
                                         prev_leaf,
                                         allow_high_precision_mv,
                                         reference_select,
+                                        enable_masked_compound,
+                                        enable_jnt_comp,
+                                        order_hint_bits,
+                                        order_hint,
+                                        ref_order_hints,
                                     )?;
                                     prev_leaf = Some((leaf_mi, skip, is_inter));
+                                    if compound_ctx8.is_some() {
+                                        last_compound_ctx = compound_ctx8;
+                                    }
                                 }
                                 if let Some((_, skip, is_inter)) = prev_leaf {
                                     // corner-cut: `decode_inter_block8`'s
@@ -5929,6 +6203,18 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                         if is_inter { LAST_FRAME } else { -1 },
                                         [3, 3],
                                     );
+                                    if let Some((ref0, ref1, group_idx, idx)) = last_compound_ctx {
+                                        neighbours.record_inter(
+                                            at16,
+                                            SUB,
+                                            skip,
+                                            is_inter,
+                                            ref0,
+                                            [3, 3],
+                                        );
+                                        neighbours
+                                            .record_compound_ctx(at16, SUB, ref1, group_idx, idx);
+                                    }
                                 }
                             }
                         }
@@ -5999,6 +6285,39 @@ mod tests {
     // one below. `sb_coeff_key_frame_tile`, what the real encoder writes, is
     // this decoder's one target, and the round-trip test below is against
     // that path with real quantised residual, not a synthetic all-DC frame.
+
+    /// `is_uni_comp_ref` (lane-av1comp): a pair is unidirectional exactly
+    /// when both references sit on the same temporal side -- the three
+    /// `uni_comp_ref` bitstream pairs (LAST/LAST2, LAST/LAST3, LAST/GOLDEN)
+    /// all read `true`, a forward/backward mix (LAST/BWDREF) reads `false`,
+    /// and a same-side non-`uni_comp_ref` pair (BWDREF/ALTREF) still reads
+    /// `true` (spec `has_uni_comp_refs` is symmetric in the reference set,
+    /// not just the three enumerated syntax pairs).
+    #[test]
+    fn is_uni_comp_ref_matches_forward_backward_sides() {
+        assert!(is_uni_comp_ref(LAST_FRAME, LAST2_FRAME));
+        assert!(is_uni_comp_ref(LAST_FRAME, LAST3_FRAME));
+        assert!(is_uni_comp_ref(LAST_FRAME, GOLDEN_FRAME));
+        assert!(is_uni_comp_ref(BWDREF_FRAME, ALTREF_FRAME));
+        assert!(!is_uni_comp_ref(LAST_FRAME, BWDREF_FRAME));
+        assert!(!is_uni_comp_ref(GOLDEN_FRAME, ALTREF_FRAME));
+    }
+
+    /// [`Neighbours::record_compound_ctx`] stamps `above_ref1`/`left_ref1`
+    /// with the real second reference (lane-av1comp round 12: previously
+    /// always cleared to `None` by `record_inter`, so the next block's own
+    /// `NeighbourRef::uni` -- and `comp_reference_type_ctx` downstream of it
+    /// -- could never see a real compound neighbour).
+    #[test]
+    fn record_compound_ctx_stamps_ref1_for_the_next_block_to_read() {
+        let mut n = Neighbours::new(4, 4, 16, 16);
+        n.record_inter((0, 0), SUB, false, true, LAST_FRAME, [3, 3]);
+        assert_eq!(n.above_ref1[0], None, "record_inter alone never sets ref1");
+        n.record_compound_ctx((0, 0), SUB, ALTREF_FRAME, 0, 1);
+        assert_eq!(n.above_ref1[0], Some(ALTREF_FRAME));
+        assert_eq!(n.left_ref1[0], Some(ALTREF_FRAME));
+        assert!(!is_uni_comp_ref(LAST_FRAME, n.above_ref1[0].unwrap()));
+    }
 
     /// [`cdf::COMPOUND_MODE_CTX_MAP`] folded by hand against libaom's
     /// `av1_mode_context_analyzer` compound branch (`mvref_common.h`):
