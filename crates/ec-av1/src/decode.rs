@@ -144,6 +144,16 @@ pub(crate) fn comp_mode_hits() -> usize {
     COMP_MODE_HITS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// How many blocks decoded `skip_mode == 1` (lane-av1comp round 14) --
+/// proves a real `skip_mode_present` stream actually reached a block that
+/// picked it, not just that the frame header bit was set.
+static SKIP_MODE_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Current value of [`SKIP_MODE_HITS`].
+pub(crate) fn skip_mode_hits() -> usize {
+    SKIP_MODE_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// How many [`read_inter_compound_mode`] reads actually happened
 /// (lane-av1comp) -- proves a `COMPOUND_REFERENCE` block reached its own
 /// `compound_mode` symbol (past `comp_mode`/`comp_ref` and the compound
@@ -762,6 +772,11 @@ struct Neighbours {
     /// `left_skip`.
     above_skip: Vec<bool>,
     left_skip: Vec<bool>,
+    /// Whether the block above/left of this column/row coded `skip_mode`
+    /// (spec 5.11.23) -- `av1_get_skip_mode_context`'s own neighbour lookup,
+    /// lane-av1comp round 14.
+    above_skip_mode: Vec<bool>,
+    left_skip_mode: Vec<bool>,
     /// Whether the block above/left was coded inter -- the `is_inter`
     /// context (spec `av1_get_intra_inter_context`), a duplicate of
     /// [`crate::tile`]'s private `Neighbours::above_inter`/`left_inter`.
@@ -841,6 +856,8 @@ impl Neighbours {
             left_side_mi: vec![SB; rows * (SUB / MI)],
             above_skip: vec![false; cols],
             left_skip: vec![false; rows],
+            above_skip_mode: vec![false; cols],
+            left_skip_mode: vec![false; rows],
             above_inter: vec![false; cols],
             left_inter: vec![false; rows],
             above_ref: vec![-1; cols],
@@ -932,6 +949,7 @@ impl Neighbours {
         self.left_side.iter_mut().for_each(|s| *s = SB);
         self.left_side_mi.iter_mut().for_each(|s| *s = SB);
         self.left_skip.iter_mut().for_each(|s| *s = false);
+        self.left_skip_mode.iter_mut().for_each(|s| *s = false);
         self.left_inter.iter_mut().for_each(|i| *i = false);
         self.left_ref.iter_mut().for_each(|r| *r = -1);
         self.left_ref1.iter_mut().for_each(|r| *r = None);
@@ -955,11 +973,14 @@ impl Neighbours {
         is_inter: bool,
         ref_frame: i8,
         filter: [u8; 2],
+        skip_mode: bool,
     ) {
         let (r, c) = at;
         for cell in 0..side / SUB {
             self.above_skip[c + cell] = skip;
             self.left_skip[r + cell] = skip;
+            self.above_skip_mode[c + cell] = skip_mode;
+            self.left_skip_mode[r + cell] = skip_mode;
             self.above_inter[c + cell] = is_inter;
             self.left_inter[r + cell] = is_inter;
             self.above_ref[c + cell] = ref_frame;
@@ -4234,19 +4255,37 @@ fn decode_inter_block(
     order_hint_bits: u32,
     order_hint: u32,
     ref_order_hints: [u32; 7],
+    // lane-av1comp round 14: this frame header's own `skip_mode_present` bit
+    // and `skip_mode_frame` reference pair (spec 5.9.22, `frame.rs`'s
+    // `read_skip_mode_params`, already 1-based `MV_REFERENCE_FRAME`) --
+    // `skip_mode` (spec 5.11.23 `read_skip_mode`) is read *before* `skip`
+    // when this is `true` (every block this decoder reaches is >= 8x8, so
+    // `is_comp_ref_allowed` never gates it further); a `true` result forces
+    // `skip_txfm`, `is_inter`, `NEAREST_NEARESTMV` of this pair with no mode/
+    // DRL symbol read, and a plain average blend with no `comp_group_idx`/
+    // `compound_idx` read (libaom `decodemv.c` 1604-1619, 1382-1384, 1509).
+    skip_mode_present: bool,
+    skip_mode_frame: [u8; 2],
 ) -> Result<()> {
     let (r, c) = at;
     let (px, py) = (c * SUB, r * SUB);
     let (cpx, cpy) = (px / 2, py / 2);
     let chroma_side = side / 2;
 
+    let skip_mode_ctx =
+        usize::from(neighbours.above_skip_mode[c]) + usize::from(neighbours.left_skip_mode[r]);
+    let skip_mode = skip_mode_present && dec.symbol(&mut cdfs.skip_mode[skip_mode_ctx]) == 1;
+    if skip_mode {
+        SKIP_MODE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     let skip_ctx = usize::from(neighbours.above_skip[c]) + usize::from(neighbours.left_skip[r]);
-    let skip = dec.symbol(&mut cdfs.skip[skip_ctx]) == 1;
+    let skip = skip_mode || dec.symbol(&mut cdfs.skip[skip_ctx]) == 1;
 
     let (has_above, has_left) = (r > 0, c > 0);
     let (above_inter, left_inter) = (neighbours.above_inter[c], neighbours.left_inter[r]);
     let ii_ctx = intra_inter_ctx(has_above, has_left, above_inter, left_inter);
-    let is_inter = dec.symbol(&mut cdfs.intra_inter[ii_ctx]) == 1;
+    let is_inter = skip_mode || dec.symbol(&mut cdfs.intra_inter[ii_ctx]) == 1;
 
     let mode_for_tx;
     let (luma_grid, u_grid, v_grid);
@@ -4281,16 +4320,21 @@ fn decode_inter_block(
             uni: neighbours.left_ref1[r]
                 .is_some_and(|r1| is_uni_comp_ref(neighbours.left_ref[r], r1)),
         });
-        let is_compound = reference_select && read_comp_mode(dec, cdfs, above_nbr, left_nbr);
+        let is_compound =
+            skip_mode || (reference_select && read_comp_mode(dec, cdfs, above_nbr, left_nbr));
         if is_compound {
-            let (ref0, ref1) = read_compound_ref_frames(
-                dec,
-                cdfs,
-                above_nbr,
-                left_nbr,
-                neighbours.above_ref[c],
-                neighbours.left_ref[r],
-            );
+            let (ref0, ref1) = if skip_mode {
+                (skip_mode_frame[0] as i8, skip_mode_frame[1] as i8)
+            } else {
+                read_compound_ref_frames(
+                    dec,
+                    cdfs,
+                    above_nbr,
+                    left_nbr,
+                    neighbours.above_ref[c],
+                    neighbours.left_ref[r],
+                )
+            };
             let (mi_row, mi_col) = (r * SUB_MI as usize, c * SUB_MI as usize);
             let bw4 = side / 4;
             // spec 7.10.2.8, doubled per side (`CompoundTplArgs`): same
@@ -4322,8 +4366,11 @@ fn decode_inter_block(
                 sign_bias_table,
                 comp_tpl,
             );
-            let compound_mode =
-                read_inter_compound_mode(dec, cdfs, comp_stack.new_mv_ctx, comp_stack.ref_mv_ctx);
+            let compound_mode = if skip_mode {
+                0 // NEAREST_NEARESTMV, forced -- no mode symbol read
+            } else {
+                read_inter_compound_mode(dec, cdfs, comp_stack.new_mv_ctx, comp_stack.ref_mv_ctx)
+            };
             let (mv0, mv1) = assign_compound_mv(
                 dec,
                 cdfs,
@@ -4383,7 +4430,9 @@ fn decode_inter_block(
             // as an explicit call so a future smaller block size is not
             // silently wrong (libaom `reconinter.h::is_any_masked_compound_used`).
             let group_ctx = get_comp_group_idx_context(neighbours, at, side);
-            let comp_group_idx = if enable_masked_compound && is_any_masked_compound_used_here(side)
+            let comp_group_idx = if !skip_mode
+                && enable_masked_compound
+                && is_any_masked_compound_used_here(side)
             {
                 dec.symbol(&mut cdfs.comp_group_idx[group_ctx])
             } else {
@@ -4396,7 +4445,7 @@ fn decode_inter_block(
                      weighted/simple-average combine only, lane-av1comp",
                 ));
             }
-            let (fwd_offset, bck_offset, compound_idx) = if enable_jnt_comp {
+            let (fwd_offset, bck_offset, compound_idx) = if !skip_mode && enable_jnt_comp {
                 let idx_ctx = get_comp_index_context(
                     neighbours,
                     at,
@@ -5015,7 +5064,7 @@ fn decode_inter_block(
         }
     }
     neighbours.record(at, side, mode_for_tx, &[luma_grid, u_grid, v_grid]);
-    neighbours.record_inter(at, side, skip, is_inter, ref_frame_for_lf, block_filter);
+    neighbours.record_inter(at, side, skip, is_inter, ref_frame_for_lf, block_filter, skip_mode);
     if let Some((ref1, group_idx, idx)) = compound_ctx {
         neighbours.record_compound_ctx(at, side, ref1, group_idx, idx);
     }
@@ -5081,13 +5130,21 @@ fn decode_inter_block8(
     order_hint_bits: u32,
     order_hint: u32,
     ref_order_hints: [u32; 7],
+    // lane-av1comp round 14: see [`decode_inter_block`]'s own doc -- this
+    // leaf has no per-leaf `above_skip_mode`/`left_skip_mode` array either,
+    // so its `skip_mode` context reuses the same [`SUB`]-grid
+    // `above_skip_mode[c]`/`left_skip_mode[r]` the enclosing 16x16 slot
+    // tracks (mirroring `above_skip`/`left_skip`'s own leaf approximation
+    // just above).
+    skip_mode_present: bool,
+    skip_mode_frame: [u8; 2],
     // lane-av1comp: `Some((ref1, comp_group_idx, compound_idx))` only for a
     // real `COMPOUND_REFERENCE` leaf, for the caller's own end-of-16x16
     // `record_compound_ctx` call -- mirrors [`decode_inter_block`]'s own
     // `compound_ctx` local, just handed back instead of applied here (this
     // fn's `neighbours` recording happens once for the whole straddling
     // 16x16 block, after every leaf).
-) -> Result<(bool, bool, Option<(i8, i8, u8, u8)>)> {
+) -> Result<(bool, bool, bool, Option<(i8, i8, u8, u8)>)> {
     const LAST_FRAME: i8 = 1;
     /// `Y_MODE`'s size group (`common_data.h`'s `size_group_lookup[BLOCK_8X8]`).
     const SIZE_GROUP_8: usize = 1;
@@ -5111,18 +5168,25 @@ fn decode_inter_block8(
             left_inter = pinter;
         }
     }
+    let skip_mode_ctx =
+        usize::from(neighbours.above_skip_mode[c]) + usize::from(neighbours.left_skip_mode[r]);
+    let skip_mode = skip_mode_present && dec.symbol(&mut cdfs.skip_mode[skip_mode_ctx]) == 1;
+    if skip_mode {
+        SKIP_MODE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     let skip_ctx = usize::from(above_skip) + usize::from(left_skip);
-    let skip = dec.symbol(&mut cdfs.skip[skip_ctx]) == 1;
+    let skip = skip_mode || dec.symbol(&mut cdfs.skip[skip_ctx]) == 1;
 
     let (has_above, has_left) = (leaf_mi.0 > 0, leaf_mi.1 > 0);
     let ii_ctx = intra_inter_ctx(has_above, has_left, above_inter, left_inter);
-    let is_inter = dec.symbol(&mut cdfs.intra_inter[ii_ctx]) == 1;
+    let is_inter = skip_mode || dec.symbol(&mut cdfs.intra_inter[ii_ctx]) == 1;
 
     let mode_for_tx;
     let (luma_grid, u_grid, v_grid);
     let mut compound_ctx8: Option<(i8, i8, u8, u8)> = None;
     if is_inter {
-        if reference_select {
+        if reference_select || skip_mode {
             let above_nbr = has_above.then(|| NeighbourRef {
                 is_inter: above_inter,
                 ref0: if above_inter { LAST_FRAME } else { 0 },
@@ -5135,23 +5199,27 @@ fn decode_inter_block8(
                 ref1: None,
                 uni: false,
             });
-            if read_comp_mode(dec, cdfs, above_nbr, left_nbr) {
-                let (ref0, ref1) = read_compound_ref_frames(
-                    dec,
-                    cdfs,
-                    above_nbr,
-                    left_nbr,
-                    if has_above && above_inter {
-                        LAST_FRAME
-                    } else {
-                        -1
-                    },
-                    if has_left && left_inter {
-                        LAST_FRAME
-                    } else {
-                        -1
-                    },
-                );
+            if skip_mode || read_comp_mode(dec, cdfs, above_nbr, left_nbr) {
+                let (ref0, ref1) = if skip_mode {
+                    (skip_mode_frame[0] as i8, skip_mode_frame[1] as i8)
+                } else {
+                    read_compound_ref_frames(
+                        dec,
+                        cdfs,
+                        above_nbr,
+                        left_nbr,
+                        if has_above && above_inter {
+                            LAST_FRAME
+                        } else {
+                            -1
+                        },
+                        if has_left && left_inter {
+                            LAST_FRAME
+                        } else {
+                            -1
+                        },
+                    )
+                };
                 let (mi_row, mi_col) = leaf_mi;
                 // lane-av1comp: this leaf path has neither a real sign-bias
                 // table nor `tpl_frame` (see this function's own doc on the
@@ -5171,12 +5239,16 @@ fn decode_inter_block8(
                     &NO_SIGN_BIAS,
                     None,
                 );
-                let compound_mode = read_inter_compound_mode(
-                    dec,
-                    cdfs,
-                    comp_stack.new_mv_ctx,
-                    comp_stack.ref_mv_ctx,
-                );
+                let compound_mode = if skip_mode {
+                    0 // NEAREST_NEARESTMV, forced -- no mode symbol read
+                } else {
+                    read_inter_compound_mode(
+                        dec,
+                        cdfs,
+                        comp_stack.new_mv_ctx,
+                        comp_stack.ref_mv_ctx,
+                    )
+                };
                 let (mv0, mv1) = assign_compound_mv(
                     dec,
                     cdfs,
@@ -5190,12 +5262,14 @@ fn decode_inter_block8(
                 // slot -- the only granularity `Neighbours`' comp_group_idx/
                 // compound_idx arrays track.
                 let group_ctx = get_comp_group_idx_context(neighbours, outer_at, SIDE);
-                let comp_group_idx =
-                    if enable_masked_compound && is_any_masked_compound_used_here(SIDE) {
-                        dec.symbol(&mut cdfs.comp_group_idx[group_ctx])
-                    } else {
-                        0
-                    };
+                let comp_group_idx = if !skip_mode
+                    && enable_masked_compound
+                    && is_any_masked_compound_used_here(SIDE)
+                {
+                    dec.symbol(&mut cdfs.comp_group_idx[group_ctx])
+                } else {
+                    0
+                };
                 if comp_group_idx == 1 {
                     return Err(unsupported(
                         "a masked COMPOUND_REFERENCE 8x8 leaf (comp_group_idx == 1, wedge/\
@@ -5203,7 +5277,7 @@ fn decode_inter_block8(
                          weighted/simple-average combine only, lane-av1comp",
                     ));
                 }
-                let (fwd_offset, bck_offset, compound_idx) = if enable_jnt_comp {
+                let (fwd_offset, bck_offset, compound_idx) = if !skip_mode && enable_jnt_comp {
                     let idx_ctx = get_comp_index_context(
                         neighbours,
                         outer_at,
@@ -5417,7 +5491,7 @@ fn decode_inter_block8(
                         &pred_v,
                     )?;
                 }
-                return Ok((skip, is_inter, compound_ctx8));
+                return Ok((skip, is_inter, skip_mode, compound_ctx8));
             }
         }
         let sr_ctx = single_ref_ctx(above_inter || left_inter);
@@ -5759,7 +5833,7 @@ fn decode_inter_block8(
     }
     neighbours.record_mi(leaf_mi, 8, &[luma_grid, u_grid, v_grid]);
     neighbours.fill_lf_grid(leaf_mi, 2, 8, if is_inter { LAST_FRAME } else { 0 });
-    Ok((skip, is_inter, compound_ctx8))
+    Ok((skip, is_inter, skip_mode, compound_ctx8))
 }
 
 /// Decodes the payload [`crate::tile::sb_coeff_inter_frame_tile`] writes,
@@ -5814,6 +5888,8 @@ pub fn decode_inter_frame_tile(
         reference_select,
         false,
         false,
+        false,
+        [0; 2],
     )
     .map(|(picture, _, _)| picture)
 }
@@ -5854,6 +5930,11 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     // lane-av1comp: `seq_params`' own compound-blend enable bits.
     enable_masked_compound: bool,
     enable_jnt_comp: bool,
+    // lane-av1comp round 14: this frame header's own `skip_mode_present`/
+    // `skip_mode_frame` (spec 5.9.22), threaded to every `decode_inter_block`/
+    // `decode_inter_block8` call below.
+    skip_mode_present: bool,
+    skip_mode_frame: [u8; 2],
 ) -> Result<(Picture, Cdfs, crate::motion_field::MotionField)> {
     let tpl_frame = tpl_field.map(|field| TplFrameArgs {
         field,
@@ -6056,6 +6137,8 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             order_hint_bits,
                             order_hint,
                             ref_order_hints,
+                            skip_mode_present,
+                            skip_mode_frame,
                         )?;
                     }
                     PARTITION_SPLIT => {
@@ -6120,6 +6203,8 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     order_hint_bits,
                                     order_hint,
                                     ref_order_hints,
+                                    skip_mode_present,
+                                    skip_mode_frame,
                                 )?;
                             } else {
                                 let ctx16 = neighbours.partition_ctx(at16, SUB);
@@ -6141,6 +6226,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     .collect();
                                 let mut prev_leaf: Option<((usize, usize), bool, bool)> = None;
                                 let mut last_compound_ctx: Option<(i8, i8, u8, u8)> = None;
+                                let mut last_skip_mode = false;
                                 for (mr, mc) in leaf_positions {
                                     let leaf_mi = (mr as usize, mc as usize);
                                     let leaf_ctx = neighbours.partition_ctx_mi(leaf_mi, 8);
@@ -6150,35 +6236,39 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                             "a partition below 8x8 (this encoder never writes one)",
                                         ));
                                     }
-                                    let (skip, is_inter, compound_ctx8) = decode_inter_block8(
-                                        &mut dec,
-                                        &mut cdfs,
-                                        &mut neighbours,
-                                        &mut grid,
-                                        mi_cols,
-                                        mi_rows,
-                                        at16,
-                                        leaf_mi,
-                                        &mut y,
-                                        &mut u,
-                                        &mut v,
-                                        &ref_y,
-                                        &ref_u,
-                                        &ref_v,
-                                        &ref_slots,
-                                        base_q_idx,
-                                        &scan8,
-                                        &scan4,
-                                        prev_leaf,
-                                        allow_high_precision_mv,
-                                        reference_select,
-                                        enable_masked_compound,
-                                        enable_jnt_comp,
-                                        order_hint_bits,
-                                        order_hint,
-                                        ref_order_hints,
-                                    )?;
+                                    let (skip, is_inter, skip_mode_leaf, compound_ctx8) =
+                                        decode_inter_block8(
+                                            &mut dec,
+                                            &mut cdfs,
+                                            &mut neighbours,
+                                            &mut grid,
+                                            mi_cols,
+                                            mi_rows,
+                                            at16,
+                                            leaf_mi,
+                                            &mut y,
+                                            &mut u,
+                                            &mut v,
+                                            &ref_y,
+                                            &ref_u,
+                                            &ref_v,
+                                            &ref_slots,
+                                            base_q_idx,
+                                            &scan8,
+                                            &scan4,
+                                            prev_leaf,
+                                            allow_high_precision_mv,
+                                            reference_select,
+                                            enable_masked_compound,
+                                            enable_jnt_comp,
+                                            order_hint_bits,
+                                            order_hint,
+                                            ref_order_hints,
+                                            skip_mode_present,
+                                            skip_mode_frame,
+                                        )?;
                                     prev_leaf = Some((leaf_mi, skip, is_inter));
+                                    last_skip_mode = skip_mode_leaf;
                                     if compound_ctx8.is_some() {
                                         last_compound_ctx = compound_ctx8;
                                     }
@@ -6202,6 +6292,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                         is_inter,
                                         if is_inter { LAST_FRAME } else { -1 },
                                         [3, 3],
+                                        last_skip_mode,
                                     );
                                     if let Some((ref0, ref1, group_idx, idx)) = last_compound_ctx {
                                         neighbours.record_inter(
@@ -6211,6 +6302,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                             is_inter,
                                             ref0,
                                             [3, 3],
+                                            last_skip_mode,
                                         );
                                         neighbours
                                             .record_compound_ctx(at16, SUB, ref1, group_idx, idx);
@@ -6311,7 +6403,7 @@ mod tests {
     #[test]
     fn record_compound_ctx_stamps_ref1_for_the_next_block_to_read() {
         let mut n = Neighbours::new(4, 4, 16, 16);
-        n.record_inter((0, 0), SUB, false, true, LAST_FRAME, [3, 3]);
+        n.record_inter((0, 0), SUB, false, true, LAST_FRAME, [3, 3], false);
         assert_eq!(n.above_ref1[0], None, "record_inter alone never sets ref1");
         n.record_compound_ctx((0, 0), SUB, ALTREF_FRAME, 0, 1);
         assert_eq!(n.above_ref1[0], Some(ALTREF_FRAME));
@@ -6952,6 +7044,8 @@ mod tests {
             0,
             0,
             [0; 7],
+            false,
+            [0; 2],
         )
         .unwrap();
 
