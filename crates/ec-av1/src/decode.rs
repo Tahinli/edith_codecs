@@ -32,8 +32,9 @@ use crate::mc;
 use crate::msac::SymbolDecoder;
 use crate::mvstack::{
     ALTREF_FRAME, ALTREF2_FRAME, BWDREF_FRAME, GOLDEN_FRAME, LAST_FRAME, LAST2_FRAME, LAST3_FRAME,
-    MiGrid, MiInfo, find_mv_stack, single_ref_ctx, single_ref_p1_ctx, single_ref_p2_ctx,
-    single_ref_p3_ctx, single_ref_p4_ctx, single_ref_p5_ctx, single_ref_p6_ctx,
+    MiGrid, MiInfo, NO_SIGN_BIAS, SignBiasTable, find_mv_stack, find_mv_stack_with_sign_bias,
+    single_ref_ctx, single_ref_p1_ctx, single_ref_p2_ctx, single_ref_p3_ctx, single_ref_p4_ctx,
+    single_ref_p5_ctx, single_ref_p6_ctx,
 };
 use crate::tile::{INTRA_MODE_CTX, block_grid, has_half};
 use crate::transform::{TxType, dequant_and_inverse_typed};
@@ -1247,6 +1248,14 @@ struct PlaneBuf {
     true_width: usize,
     true_height: usize,
 }
+
+/// One entry per `MV_REFERENCE_FRAME` (index 0/1 unused -- `NONE`/
+/// `INTRA_FRAME`/`LAST_FRAME` all resolve elsewhere), `Some` when this
+/// frame's own `ref_frame_idx` names a DPB slot that has a picture in it
+/// (lane-av1refs: the same "empty slot" case `GOLDEN_FRAME` already
+/// refused by name, now generic across `LAST2`/`LAST3`/`GOLDEN`/`BWDREF`/
+/// `ALTREF2`/`ALTREF`).
+type RefSlots<'a> = [Option<(&'a PlaneBuf, &'a PlaneBuf, &'a PlaneBuf)>; 8];
 
 impl PlaneBuf {
     fn edges(
@@ -3691,18 +3700,14 @@ fn decode_inter_block(
     ref_y: &PlaneBuf,
     ref_u: &PlaneBuf,
     ref_v: &PlaneBuf,
-    // corner-cut (lane-av1refs r1): only `LAST_FRAME` (`ref_y`/`u`/`v`) and
-    // `GOLDEN_FRAME` (`golden_*`, when the frame header's own
-    // `ref_frame_idx` names a slot with a picture) are threaded down to MC.
-    // Ceiling: `LAST2`/`LAST3`/`BWDREF`/`ALTREF2`/`ALTREF` still refuse by
-    // name -- real short low-lag streams overwhelmingly pick `LAST` or
-    // `GOLDEN` (the ledger's cdffwd trace). Upgrade path: widen `golden_*`
-    // into a `[Option<&PlaneBuf>; REFS_PER_FRAME]` addressed by the decoded
-    // reference, same as the CDF/picture DPB slots `decode_stream` already
-    // keeps.
-    golden_y: Option<&PlaneBuf>,
-    golden_u: Option<&PlaneBuf>,
-    golden_v: Option<&PlaneBuf>,
+    // lane-av1refs: every non-`LAST_FRAME` reference this frame header's own
+    // `ref_frame_idx` names a live DPB slot for, indexed `[ref_frame]`
+    // (`LAST2_FRAME`=2 .. `ALTREF_FRAME`=7; index 0/1 unused, `LAST_FRAME`
+    // stays on `ref_y`/`u`/`v` above) -- `None` at a live index means the
+    // slot's still empty (an error-resilient stream, or too early in the
+    // GOP), matching `GOLDEN_FRAME`'s existing empty-slot refusal below.
+    other_refs: &RefSlots,
+    sign_bias_table: &SignBiasTable,
     base_q_idx: u8,
     luma_set_intra: TxbSet,
     luma_set_inter: TxbSet,
@@ -3737,57 +3742,31 @@ fn decode_inter_block(
     if is_inter {
         let ref_frame = read_single_ref(dec, cdfs, neighbours.above_ref[c], neighbours.left_ref[r]);
         ref_frame_for_lf = ref_frame;
-        // round 4-8 (lane-av1golden through lane-av1golden6): repeatedly
-        // un-masked and re-masked chasing what looked like a GOLDEN_FRAME MC
-        // bug -- lf_level `mode_deltas`/`ref_deltas` forwarding fixes
-        // (rounds 5/6, both real and kept), and a switchable_interp ctx
-        // ref-frame gate (round 8, real and kept). Every remaining
-        // "GOLDEN_FRAME mismatch" chased past round 8 (including a frame-0
-        // *intra keyframe* luma mismatch that could not possibly depend on
-        // this arm at all) turned out to be a single unrelated cause: round
-        // 9 (lane-av1golden7) traced `fixtures/golden6-mismatch.obu`'s
-        // frame-0 mismatch down to `header.film_grain.apply_grain == true`
-        // (aomenc's `--tune-content=film` denoises the coded picture and
-        // has the decoder re-synthesize grain per spec 7.18.3) -- this
-        // decoder never implements grain synthesis at all, so it silently
-        // returned the clean base picture while ffmpeg (dav1d) returned the
-        // grain-synthesized one. That bug fires on *any* frame, key or
-        // inter, and is orthogonal to which reference a block selects --
-        // the earlier "correlates with GOLDEN firing" pattern was survivor
-        // bias: the golden gate only ever compared streams where
-        // `non_last_ref_hits` fired, and `--tune-content=film` is part of
-        // that same gate's own aomenc recipe. `decode_stream` now refuses
-        // `apply_grain` streams by name instead of silently mismatching --
-        // but unmasking `GOLDEN_FRAME` with that fix in still shows a real,
-        // separate residual MC bug: round 9 (lane-av1golden7)'s forwarding
-        // gate hit 1/20 real aomenc streams mismatching (frame 3 luma,
-        // apply_grain=false, non_last_ref_hits delta=2), pinned in
-        // `fixtures/golden7-forwarding-mismatch.obu` for round 10. `GOLDEN_FRAME`
-        // stays refused by name until that's found.
-        let (py_ref, pu_ref, pv_ref) = match ref_frame {
-            LAST_FRAME => (ref_y, ref_u, ref_v),
-            GOLDEN_FRAME => match (golden_y, golden_u, golden_v) {
-                (Some(gy), Some(gu), Some(gv)) => (gy, gu, gv),
-                _ => {
+        // round 4-9 (lane-av1golden..lane-av1golden7): GOLDEN_FRAME's own
+        // stacked defects (lf_level ref/mode-delta forwarding, the
+        // switchable_interp ref-frame ctx gate, and a film-grain synthesis
+        // gap that looked like a GOLDEN MC bug by survivor bias -- see the
+        // ledger) are all closed; GOLDEN_FRAME decodes live via `other_refs`
+        // below same as every other non-`LAST_FRAME` reference. lane-av1refs
+        // widens this from GOLDEN alone to every reference `read_single_ref`
+        // can name.
+        let (py_ref, pu_ref, pv_ref) = if ref_frame == LAST_FRAME {
+            (ref_y, ref_u, ref_v)
+        } else {
+            match other_refs[ref_frame as usize] {
+                Some((ry, ru, rv)) => (ry, ru, rv),
+                None => {
                     return Err(unsupported(
-                        "GOLDEN_FRAME selected with no golden picture at this frame's \
-                         ref_frame_idx[3] slot",
+                        "a reference frame selected with no picture at this frame's own \
+                         ref_frame_idx slot for it",
                     ));
                 }
-            },
-            _ => {
-                return Err(unsupported(
-                    "a reference frame other than LAST_FRAME (LAST2/LAST3/GOLDEN/BWDREF/\
-                     ALTREF2/ALTREF still have no MC path -- GOLDEN's residual MC bug is \
-                     pinned in fixtures/golden7-forwarding-mismatch.obu, round 9 \
-                     lane-av1golden7)",
-                ));
             }
         };
 
         let (mi_row, mi_col) = (r * SUB_MI as usize, c * SUB_MI as usize);
         let bw4 = side / 4;
-        let stack = find_mv_stack(
+        let stack = find_mv_stack_with_sign_bias(
             grid,
             mi_row,
             mi_col,
@@ -3796,6 +3775,7 @@ fn decode_inter_block(
             ref_frame,
             mi_cols as usize,
             mi_rows as usize,
+            sign_bias_table,
         );
         let not_new = dec.symbol(&mut cdfs.new_mv[stack.new_mv_ctx]) == 1;
         let mut is_globalmv = false;
@@ -4615,7 +4595,7 @@ pub fn decode_inter_frame_tile(
     frame_width: u32,
     frame_height: u32,
     reference: &Picture,
-    golden: Option<&Picture>,
+    other_refs: [Option<&Picture>; 8],
     cdef: &CdefParams,
     loop_filter: &LoopFilterParams,
     allow_high_precision_mv: bool,
@@ -4630,11 +4610,12 @@ pub fn decode_inter_frame_tile(
         frame_width,
         frame_height,
         reference,
-        golden,
+        other_refs,
         cdef,
         loop_filter,
         None,
         allow_high_precision_mv,
+        NO_SIGN_BIAS,
         interp_fixed,
         enable_dual_filter,
     )
@@ -4654,11 +4635,12 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     frame_width: u32,
     frame_height: u32,
     reference: &Picture,
-    golden: Option<&Picture>,
+    other_refs: [Option<&Picture>; 8],
     cdef: &CdefParams,
     loop_filter: &LoopFilterParams,
     initial_cdfs: Option<Cdfs>,
     allow_high_precision_mv: bool,
+    sign_bias_table: SignBiasTable,
     interp_fixed: Option<mc::InterpFilterKind>,
     enable_dual_filter: bool,
 ) -> Result<(Picture, Cdfs)> {
@@ -4696,38 +4678,43 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         true_width: reference.width / 2,
         true_height: reference.height / 2,
     };
-    // `GOLDEN_FRAME`'s own picture, when the frame header's `ref_frame_idx`
-    // names a DPB slot holding one and it is this frame's own true size --
-    // `decode_inter_block`'s GOLDEN_FRAME arm refuses when it is `None` or a
-    // mismatched size (spec 7.9 requires every active reference be a
-    // compatible size; this decoder's single-slot-per-frame update makes
-    // that always true for a stream this crate's own encoder writes).
-    let (golden_y, golden_u, golden_v) = match golden {
-        Some(g) if g.width == reference.width && g.height == reference.height => (
-            Some(PlaneBuf {
-                data: g.y.clone(),
-                width: g.width,
-                height: g.height,
-                true_width: g.width,
-                true_height: g.height,
-            }),
-            Some(PlaneBuf {
-                data: g.u.clone(),
-                width: g.width / 2,
-                height: g.height / 2,
-                true_width: g.width / 2,
-                true_height: g.height / 2,
-            }),
-            Some(PlaneBuf {
-                data: g.v.clone(),
-                width: g.width / 2,
-                height: g.height / 2,
-                true_width: g.width / 2,
-                true_height: g.height / 2,
-            }),
-        ),
-        _ => (None, None, None),
-    };
+    // Every non-`LAST_FRAME` reference this frame header's own `ref_frame_idx`
+    // names a live DPB slot for (lane-av1refs: generalised from the old
+    // GOLDEN_FRAME-only block -- same empty-slot/size-mismatch refusal,
+    // now per-reference). `decode_inter_block` refuses by name when the
+    // block it is decoding selects an index that is still `None` here
+    // (spec 7.9 requires every *active* reference be a compatible size;
+    // an inactive one this frame never selects is simply left `None`).
+    let owned_refs: [Option<(PlaneBuf, PlaneBuf, PlaneBuf)>; 8] = std::array::from_fn(|i| {
+        other_refs[i]
+            .filter(|g| g.width == reference.width && g.height == reference.height)
+            .map(|g| {
+                (
+                    PlaneBuf {
+                        data: g.y.clone(),
+                        width: g.width,
+                        height: g.height,
+                        true_width: g.width,
+                        true_height: g.height,
+                    },
+                    PlaneBuf {
+                        data: g.u.clone(),
+                        width: g.width / 2,
+                        height: g.height / 2,
+                        true_width: g.width / 2,
+                        true_height: g.height / 2,
+                    },
+                    PlaneBuf {
+                        data: g.v.clone(),
+                        width: g.width / 2,
+                        height: g.height / 2,
+                        true_width: g.width / 2,
+                        true_height: g.height / 2,
+                    },
+                )
+            })
+    });
+    let ref_slots: RefSlots = std::array::from_fn(|i| owned_refs[i].as_ref().map(|(a, b, c)| (a, b, c)));
 
     let mut y = PlaneBuf {
         data: vec![0u8; width * height],
@@ -4830,9 +4817,8 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &ref_y,
                             &ref_u,
                             &ref_v,
-                            golden_y.as_ref(),
-                            golden_u.as_ref(),
-                            golden_v.as_ref(),
+                            &ref_slots,
+                            &sign_bias_table,
                             base_q_idx,
                             TxbSet::Luma32,
                             TxbSet::Luma32Inter,
@@ -4888,9 +4874,8 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     &ref_y,
                                     &ref_u,
                                     &ref_v,
-                                    golden_y.as_ref(),
-                                    golden_u.as_ref(),
-                                    golden_v.as_ref(),
+                                    &ref_slots,
+                                    &sign_bias_table,
                                     base_q_idx,
                                     TxbSet::Luma16,
                                     TxbSet::Luma16Inter,
@@ -5457,7 +5442,7 @@ mod tests {
                 width as u32,
                 height as u32,
                 &reference,
-                None,
+                [None; 8],
                 &CdefParams::default(),
                 &LoopFilterParams::default(),
                 false,
@@ -5627,9 +5612,8 @@ mod tests {
             &ref_y,
             &ref_u,
             &ref_v,
-            None,
-            None,
-            None,
+            &[None; 8],
+            &NO_SIGN_BIAS,
             100,
             TxbSet::Luma16,
             TxbSet::Luma16Inter,
@@ -5729,7 +5713,7 @@ mod tests {
                 coded_w,
                 coded_h,
                 &reference,
-                None,
+                [None; 8],
                 &CdefParams::default(),
                 &LoopFilterParams::default(),
                 false,
