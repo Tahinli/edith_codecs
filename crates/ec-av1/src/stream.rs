@@ -2736,14 +2736,36 @@ mod tests {
                         .iter()
                         .zip(&ffmpeg_frames)
                         .any(|(got, want)| got.y != want.y || got.u != want.u || got.v != want.v);
-                    if mismatched && let Ok(path) = std::env::var("EC_AV1_GATE_DUMP") {
-                        std::fs::write(&path, &stream).expect("writing pinned stream");
-                        eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
-                    }
-                    for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                        assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
-                        assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
-                        assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
+                    if mismatched {
+                        let pin = std::env::temp_dir().join("ec-av1-reference-select-gate-fail.obu");
+                        let _ = std::fs::write(&pin, &stream);
+                        if let Ok(path) = std::env::var("EC_AV1_GATE_DUMP") {
+                            std::fs::write(&path, &stream).expect("writing pinned stream");
+                            eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
+                        }
+                        for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                            assert_eq!(
+                                got.y, want.y,
+                                "{NAME} frame {i} luma vs ffmpeg (seed {seed}) -- stream pinned at {}",
+                                pin.display()
+                            );
+                            assert_eq!(
+                                got.u, want.u,
+                                "{NAME} frame {i} U vs ffmpeg (seed {seed}) -- stream pinned at {}",
+                                pin.display()
+                            );
+                            assert_eq!(
+                                got.v, want.v,
+                                "{NAME} frame {i} V vs ffmpeg (seed {seed}) -- stream pinned at {}",
+                                pin.display()
+                            );
+                        }
+                    } else {
+                        for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                            assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                            assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
+                            assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
+                        }
                     }
                     eprintln!(
                         "{NAME} FIRING seed {seed}: comp_mode hits advanced by {}, decoded \
@@ -2903,15 +2925,29 @@ mod tests {
                 .zip(&ffmpeg_frames)
                 .any(|(got, want)| got.y != want.y || got.u != want.u || got.v != want.v);
             if mismatched {
+                let pin = std::env::temp_dir().join("ec-av1-compound-refs-gate-fail.obu");
+                let _ = std::fs::write(&pin, &stream);
                 if let Ok(path) = std::env::var("EC_AV1_GATE_DUMP") {
                     std::fs::write(&path, &stream).expect("writing pinned stream");
                     eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
                 }
-            }
-            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
-                assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
-                assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
+                for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                    assert_eq!(
+                        got.y, want.y,
+                        "{NAME} frame {i} luma vs ffmpeg (seed {seed}) -- stream pinned at {}",
+                        pin.display()
+                    );
+                    assert_eq!(
+                        got.u, want.u,
+                        "{NAME} frame {i} U vs ffmpeg (seed {seed}) -- stream pinned at {}",
+                        pin.display()
+                    );
+                    assert_eq!(
+                        got.v, want.v,
+                        "{NAME} frame {i} V vs ffmpeg (seed {seed}) -- stream pinned at {}",
+                        pin.display()
+                    );
+                }
             }
             eprintln!(
                 "{NAME} FIRING seed {seed}: skip_mode hits advanced by {}",
