@@ -4551,13 +4551,64 @@ fn decode_inter_block(
             // -- the pre-deblock `EC_AV1_PREFILT_DUMP` frame-index alignment
             // between this crate and that aomdec build is NOT 1:1 on this
             // fixture (23 dumps here vs 24 there), so calibrate that first.
+            // r3 (this round): pre-deblock buffers were bisected byte-for-byte
+            // against an instrumented aomdec build (EC_AV1_PREFILT_DUMP,
+            // frame-index alignment recalibrated via content-hash matching
+            // rather than the raw dump count -- the keyframe never calls this
+            // crate's own `r17_dump` at all, since only `decode_inter_frame_
+            // tile` does, which is the whole "23 vs 24" gap, not a real bug).
+            // Decode-order frame 3 (`fixtures/av1blend-r1-mismatch.obu`,
+            // seed 45) is still the first divergence: PRE-deblock differs
+            // from aomdec's own pre-deblock dump by up to 1, on ~20% of
+            // luma pixels, clustered where its two compound inputs' pixel
+            // values disagree by more than a couple of levels -- both
+            // inputs (the keyframe and decode-order frame 2's own picture)
+            // are independently proven bit-exact (pre- and post-deblock)
+            // against aomdec, and `decodemv`'s own EC_TRACE (mode/mv/skip)
+            // matches this decoder's block loop exactly for every block in
+            // this frame. Solving `aomval = (key*w0 + bwd*w1 + 8) >> 4` for
+            // every mismatching pixel against `key`/`bwd` (both known-exact)
+            // picks out `w0=9, w1=7` for the majority (525/846) with zero
+            // matches for the plain average this decoder actually emits or
+            // the reversed `w0=7, w1=9` -- i.e. `compound_idx` is being
+            // decoded as `1` (simple average, spec `COMPOUND_AVERAGE`) when
+            // the real bitstream encoded `0` (`COMPOUND_DISTWTD`,
+            // `dist_wtd_comp_weight_assign`'s own weights for this frame's
+            // order-hint distances 2/3 land on exactly `(9, 7)` -- this
+            // decoder's own `dist_wtd_comp_weight_assign` was independently
+            // re-verified against `QUANT_DIST_WEIGHT`/`QUANT_DIST_LOOKUP_TABLE`
+            // by hand for these distances and gives the same `(9, 7)`).
+            // `get_comp_index_context` was checked line-for-line against
+            // libaom's `pred_common.h` (the `fwd`/`bck` distance halves, the
+            // `above_mi`/`left_mi` `has_second_ref`/`ALTREF_FRAME` fallback,
+            // the `3 * offset` term) and matches; `Default_Compound_Idx_Cdf`
+            // (`cdf.rs`'s `COMPOUND_IDX`) matches `entropymode.c`'s
+            // `default_compound_idx_cdfs` value-for-value; the read is
+            // gated on `!skip_mode && enable_jnt_comp`, matching libaom's
+            // `has_second_ref(mbmi) && !mbmi->skip_mode` outer guard plus
+            // `order_hint_info.enable_dist_wtd_comp` inner guard. The
+            // remaining 321/846 mismatched pixels do NOT fit `(9, 7)`
+            // either -- some blocks in this frame plausibly decode a
+            // genuinely different (correct, context-dependent) compound_idx
+            // than block (0,0)'s own -- so this is not simply "always wrong
+            // the same way": table/context/gate are all individually
+            // verified correct, yet the decoded VALUE at this specific
+            // symbol is wrong at least once in this frame. Not isolated
+            // further within budget. Upgrade: instrument `dec.symbol`'s own
+            // range/bit state (`rng`/`tell`, matching aomdec's own EC_PART
+            // trace fields) immediately before and after the `compound_idx`
+            // read specifically, not just the surrounding mode/mv/skip
+            // trace which does match -- the desync (if any) is local to
+            // this one read, not a wider stream desync.
             return Err(unsupported(
                 "a COMPOUND_REFERENCE block using the plain/distance-weighted \
                  average blend (comp_group_idx == 0) -- proven non-pixel-exact \
-                 against a real aomenc stream (lane-av1blend r1/r2, see \
+                 against a real aomenc stream (lane-av1blend r1/r2/r3, see \
                  av1blend-r1-mismatch.obu and the comment above: a per-block \
                  decode defect surfacing only on chained BWDREF compound, not \
-                 an MC/blend arithmetic bug)",
+                 an MC/blend arithmetic bug -- r3 narrowed it to compound_idx's \
+                 own decoded value, table/context/gate independently verified \
+                 correct)",
             ));
             #[allow(unreachable_code)]
             let (fwd_offset, bck_offset, compound_idx) = if !skip_mode && enable_jnt_comp {
@@ -5411,10 +5462,13 @@ fn decode_inter_block8(
                 // (r1: falsified as an MC/blend math bug, isolated to a DPB
                 // slot/refresh_frame_flags issue around BWDREF_FRAME) -- see
                 // that comment.
+                // r3: same defect as the 16x16 leaf's own mask above -- see
+                // that comment (compound_idx's decoded value, not the blend
+                // math or reference-slot bookkeeping).
                 return Err(unsupported(
                     "a COMPOUND_REFERENCE 8x8 leaf using the plain/distance-weighted \
                      average blend (comp_group_idx == 0) -- proven non-pixel-exact \
-                     against a real aomenc stream (lane-av1blend r1, see \
+                     against a real aomenc stream (lane-av1blend r1/r3, see \
                      av1blend-r1-mismatch.obu)",
                 ));
                 #[allow(unreachable_code)]
