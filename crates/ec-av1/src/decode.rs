@@ -2495,33 +2495,6 @@ fn cdef_filter_block(
 ///
 /// Ported from libaom's `av1/common/av1_loopfilter.c` (edge/level decision)
 /// and `aom_dsp/loopfilter.c` (the `aom_lpf_*` pixel kernels).
-// r17 bisect scratch: dump this frame's true-extent Y/U/V (same layout as
-// aomdec's EC_AV1_PREFILT_DUMP/EC_AV1_POSTFILT_DUMP) to `$var.f$idx` when
-// `var` is set. Remove with the rest of the r17 bisect scaffolding.
-static R17_DUMP_FRAME_IDX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-// r17 bisect scratch accessor for stream.rs's own debug prints -- shares the
-// same counter block-decode already reads. Remove with the rest of the r17
-// bisect scaffolding.
-pub fn r17_dump_frame_idx() -> usize {
-    R17_DUMP_FRAME_IDX.load(std::sync::atomic::Ordering::Relaxed)
-}
-fn r17_dump(var: &str, y: &PlaneBuf, u: &PlaneBuf, v: &PlaneBuf, idx: usize) {
-    let Ok(base) = std::env::var(var) else {
-        return;
-    };
-    let mut out = Vec::new();
-    for r in 0..y.true_height {
-        out.extend_from_slice(&y.data[r * y.width..r * y.width + y.true_width]);
-    }
-    for r in 0..u.true_height {
-        out.extend_from_slice(&u.data[r * u.width..r * u.width + u.true_width]);
-    }
-    for r in 0..v.true_height {
-        out.extend_from_slice(&v.data[r * v.width..r * v.width + v.true_width]);
-    }
-    let _ = std::fs::write(format!("{base}.f{idx}"), out);
-}
-
 fn apply_deblock(
     y: &mut PlaneBuf,
     u: &mut PlaneBuf,
@@ -2588,10 +2561,18 @@ fn read_tx_size(
 ) -> usize {
     let ctx = tx_size_context(n, at_mi, side);
     let depth = match side {
-        8 => dec.symbol(&mut cdfs.tx_size_cat0[ctx]),
-        16 => dec.symbol(&mut cdfs.tx_size_cat1[ctx]),
-        32 => dec.symbol(&mut cdfs.tx_size_cat2[ctx]),
-        64 => dec.symbol(&mut cdfs.tx_size_cat3[ctx]),
+        8 => {
+            dec.symbol(&mut cdfs.tx_size_cat0[ctx])
+        }
+        16 => {
+            dec.symbol(&mut cdfs.tx_size_cat1[ctx])
+        }
+        32 => {
+            dec.symbol(&mut cdfs.tx_size_cat2[ctx])
+        }
+        64 => {
+            dec.symbol(&mut cdfs.tx_size_cat3[ctx])
+        }
         _ => unreachable!("decode_block/decode_leaf8 only call this at 8/16/32/64"),
     };
     if depth != 0 {
@@ -3644,11 +3625,17 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
 
 /// `av1_get_pred_context_switchable_interp`'s context for `interp_filter[dir]`
 /// -- `above`/`left` are the neighbour's own resolved index for this
-/// direction (0..=2, or `3` = no info, spec `SWITCHABLE_FILTERS`). This
-/// decoder never codes a compound reference, so `INTER_FILTER_COMP_OFFSET`
-/// is always 0; only `dir`'s own `INTER_FILTER_DIR_OFFSET` (8) is folded in.
-fn switchable_interp_ctx(above: u8, left: u8, dir: usize) -> usize {
-    let base = dir * 8;
+/// direction (0..=2, or `3` = no info, spec `SWITCHABLE_FILTERS`).
+/// `is_compound` folds in libaom `av1_get_pred_context_switchable_interp`'s
+/// own `ctx_offset` term (`INTER_FILTER_COMP_OFFSET` = 4, added when *this*
+/// block itself has a second reference) -- lane-av1idx: a stale "this
+/// decoder never codes a compound reference" assumption baked this to
+/// always-0, which desynced the CDF context bucket (not the decoded value
+/// outright, hence small pixel deltas rather than a hard desync) the moment
+/// lane-av1blend unmasked plain-average compound blocks on a Switchable-
+/// filter frame.
+fn switchable_interp_ctx(above: u8, left: u8, dir: usize, is_compound: bool) -> usize {
+    let base = dir * 8 + if is_compound { 4 } else { 0 };
     let term = if left == above {
         left
     } else if left == 3 {
@@ -3679,6 +3666,7 @@ fn resolve_interp_filter(
     force_regular: bool,
     above: [u8; 2],
     left: [u8; 2],
+    is_compound: bool,
 ) -> (mc::InterpFilterKind, mc::InterpFilterKind, [u8; 2]) {
     if let Some(kind) = interp_fixed {
         return (kind, kind, [3, 3]);
@@ -3696,10 +3684,10 @@ fn resolve_interp_filter(
     // "horizontal then vertical" despite `predict_with_filters`' own
     // `h_kind`/`v_kind` argument order, which is why this function returns
     // `(h, v, ..)` but reads `dir0` (`v`) before `dir1` (`h`).
-    let ctx0 = switchable_interp_ctx(above[0], left[0], 0);
+    let ctx0 = switchable_interp_ctx(above[0], left[0], 0, is_compound);
     let sym0 = dec.symbol(&mut cdfs.switchable_interp[ctx0]) as u8;
     let sym1 = if enable_dual_filter {
-        let ctx1 = switchable_interp_ctx(above[1], left[1], 1);
+        let ctx1 = switchable_interp_ctx(above[1], left[1], 1, is_compound);
         dec.symbol(&mut cdfs.switchable_interp[ctx1]) as u8
     } else {
         sym0
@@ -4313,14 +4301,6 @@ fn decode_inter_block(
     let (cpx, cpy) = (px / 2, py / 2);
     let chroma_side = side / 2;
 
-    if std::env::var_os("EC_AV1_COMPIDX_DUMP").is_some() {
-        eprintln!(
-            "BITPOS_BLK_START mi_row={} mi_col={} bitpos={}",
-            py / 4,
-            px / 4,
-            dec.debug_bitpos()
-        );
-    }
     let skip_mode_ctx =
         usize::from(neighbours.above_skip_mode[c]) + usize::from(neighbours.left_skip_mode[r]);
     let skip_mode = skip_mode_present && dec.symbol(&mut cdfs.skip_mode[skip_mode_ctx]) == 1;
@@ -4430,12 +4410,24 @@ fn decode_inter_block(
             let is_globalmv = compound_mode == 6; // GLOBAL_GLOBALMV
             let (py0, pu0, pv0) = ref_planes(ref0, ref_y, ref_u, ref_v, other_refs)?;
             let (py1, pu1, pv1) = ref_planes(ref1, ref_y, ref_u, ref_v, other_refs)?;
-            let above_filter_ctx = if neighbours.above_ref[c] == ref0 {
+            // spec `get_ref_filter_type`: matches when EITHER of the
+            // neighbour's two references equals this block's own ref0 --
+            // `above_ref1`/`left_ref1` is the neighbour's real second
+            // reference (`record_compound_ctx`) when it was itself a
+            // compound block; checking `above_ref`/`left_ref` alone drops a
+            // real filter match down to the "no neighbour" sentinel
+            // whenever the shared reference sits in the neighbour's SECOND
+            // slot (lane-av1idx r2).
+            let above_filter_ctx = if neighbours.above_ref[c] == ref0
+                || neighbours.above_ref1[c] == Some(ref0)
+            {
                 neighbours.above_filter[c]
             } else {
                 [3, 3]
             };
-            let left_filter_ctx = if neighbours.left_ref[r] == ref0 {
+            let left_filter_ctx = if neighbours.left_ref[r] == ref0
+                || neighbours.left_ref1[r] == Some(ref0)
+            {
                 neighbours.left_filter[r]
             } else {
                 [3, 3]
@@ -4497,8 +4489,8 @@ fn decode_inter_block(
             // (av1_dist_wtd_convolve_2d_c, convolve.c:402-415) for every
             // input, and a whole-pel zero-MV compound block (mv0=mv1=(0,0),
             // the common case a lag-in-frames GOP's hidden altref frames
-            // hit) reproduces aomdec's own pre-deblock `EC_AV1_PREFILT_DUMP`
-            // byte-for-byte for several consecutive frames.
+            // hit) reproduces aomdec's own pre-deblock dump byte-for-byte
+            // for several consecutive frames.
             //
             // The real defect a live gate run isolated (seed 49,
             // `fixtures/av1blend-r1-mismatch.obu`): decode-order frame 0
@@ -4560,15 +4552,15 @@ fn decode_inter_block(
             // synced `EC_TOK`/`EC_PART` trace from the instrumented aomdec
             // build (`/tmp/libaom-src/build/decoder-debug/aomdec`) on
             // `fixtures/av1blend-r1-mismatch.obu` (seed 45 now, not seed 49)
-            // -- the pre-deblock `EC_AV1_PREFILT_DUMP` frame-index alignment
-            // between this crate and that aomdec build is NOT 1:1 on this
-            // fixture (23 dumps here vs 24 there), so calibrate that first.
+            // -- the pre-deblock dump frame-index alignment between this
+            // crate and that aomdec build is NOT 1:1 on this fixture (23
+            // dumps here vs 24 there), so calibrate that first.
             // r3 (this round): pre-deblock buffers were bisected byte-for-byte
-            // against an instrumented aomdec build (EC_AV1_PREFILT_DUMP,
-            // frame-index alignment recalibrated via content-hash matching
-            // rather than the raw dump count -- the keyframe never calls this
-            // crate's own `r17_dump` at all, since only `decode_inter_frame_
-            // tile` does, which is the whole "23 vs 24" gap, not a real bug).
+            // against an instrumented aomdec build (frame-index alignment
+            // recalibrated via content-hash matching rather than the raw
+            // dump count -- the keyframe never calls a pre-deblock dump at
+            // all, since only `decode_inter_frame_tile` does, which is the
+            // whole "23 vs 24" gap, not a real bug).
             // Decode-order frame 3 (`fixtures/av1blend-r1-mismatch.obu`,
             // seed 45) is still the first divergence: PRE-deblock differs
             // from aomdec's own pre-deblock dump by up to 1, on ~20% of
@@ -4666,13 +4658,17 @@ fn decode_inter_block(
             // 846 pixels not fitting the (9,7)-vs-plain-average hypothesis
             // either) already flagged more than one bug here. Re-masking:
             // do not ship a blend that is right only sometimes.
-            return Err(unsupported(
-                "a COMPOUND_REFERENCE 16x16 leaf using the plain/distance-weighted \
-                 average blend (comp_group_idx == 0) -- proven non-pixel-exact against \
-                 real aomenc streams beyond the one bug lane-av1blend r6/r7 fixed \
-                 (lane-av1blend r7, wide gate sweep)",
-            ));
-            #[allow(unreachable_code)]
+            // lane-av1idx r1: fixed one real bug this round
+            // (`switchable_interp_ctx` never folded in libaom's
+            // `INTER_FILTER_COMP_OFFSET` for a compound block's own
+            // interp_filter context -- kept). Pinned
+            // `fixtures/av1idx-refsel-pin.obu` (seed 61, reference_select
+            // gate) still mismatches after that fix (decode-order frame 8
+            // first, small deltas, worst 1-2, propagating through later
+            // frames via DPB reference) -- a second, still-unfound bug.
+            // Re-masking: see that fixture + `scratch_isolate_pinned_mismatch`
+            // (`EC_AV1_PIN=fixtures/av1idx-refsel-pin.obu EC_AV1_PIN_N=20`)
+            // for the next round's starting point.
             let (fwd_offset, bck_offset, compound_idx) = if !skip_mode && enable_jnt_comp {
                 let idx_ctx = get_comp_index_context(
                     neighbours,
@@ -4683,25 +4679,7 @@ fn decode_inter_block(
                     ref_order_hints[(ref0 - LAST_FRAME) as usize],
                     ref_order_hints[(ref1 - LAST_FRAME) as usize],
                 );
-                if std::env::var_os("EC_AV1_COMPIDX_DUMP").is_some() {
-                    let fidx = R17_DUMP_FRAME_IDX.load(std::sync::atomic::Ordering::Relaxed);
-                    eprintln!(
-                        "COMPIDX_BLK fidx={fidx} mi_row={} mi_col={} ctx={idx_ctx} cdf0={} \
-                         ref0={ref0} ref1={ref1}",
-                        py / 4,
-                        px / 4,
-                        cdfs.compound_idx[idx_ctx][0]
-                    );
-                }
                 let idx = dec.symbol(&mut cdfs.compound_idx[idx_ctx]);
-                if std::env::var_os("EC_AV1_COMPIDX_DUMP").is_some() {
-                    eprintln!(
-                        "COMPIDX_VAL mi_row={} mi_col={} decoded={idx} bitpos={}",
-                        py / 4,
-                        px / 4,
-                        dec.debug_bitpos()
-                    );
-                }
                 if idx == 1 {
                     (8, 8, 1u8)
                 } else {
@@ -4724,14 +4702,6 @@ fn decode_inter_block(
             // (lane-av1blend r5) from its old position ahead of those reads,
             // which stole their bits for a Switchable-filter compound block
             // and desynced every symbol read after it in the tile.
-            if std::env::var_os("EC_AV1_COMPIDX_DUMP").is_some() {
-                eprintln!(
-                    "IFILTER_PRE mi_row={} mi_col={} interp_fixed={:?} is_globalmv={is_globalmv}",
-                    py / 4,
-                    px / 4,
-                    interp_fixed
-                );
-            }
             let (h_filter, v_filter, resolved_filter) = resolve_interp_filter(
                 dec,
                 cdfs,
@@ -4740,6 +4710,7 @@ fn decode_inter_block(
                 is_globalmv,
                 above_filter_ctx,
                 left_filter_ctx,
+                true,
             );
             block_filter = resolved_filter;
 
@@ -4773,20 +4744,6 @@ fn decode_inter_block(
             );
             let mut pred_y = vec![0u8; side * side];
             mc::combine_compound(&inter0_y, &inter1_y, fwd_offset, bck_offset, &mut pred_y);
-
-            // r17 bisect scratch: dump per-block compound state when this
-            // block overlaps the pinned fixture's bad quadrant (frame 2,
-            // rows 32-63 cols 32-63). Remove with the rest of the scaffolding.
-            if std::env::var("EC_AV1_COMPOUND_DEBUG").is_ok() {
-                let fidx = R17_DUMP_FRAME_IDX.load(std::sync::atomic::Ordering::Relaxed);
-                eprintln!(
-                    "leaf16 fidx={fidx} px={px} py={py} side={side} ref0={ref0} ref1={ref1} \
-                     mv0={mv0:?} mv1={mv1:?} filter={resolved_filter:?} \
-                     fwd={fwd_offset} bck={bck_offset} compound_idx={compound_idx} \
-                     pred_y[0..4]={:?}",
-                    &pred_y[0..4.min(pred_y.len())]
-                );
-            }
 
             let mut inter0_u = vec![0i32; chroma_side * chroma_side];
             mc::predict_compound_intermediate(
@@ -5045,12 +5002,19 @@ fn decode_inter_block(
             // exactly like an intra neighbour. Without this gate, a GOLDEN_FRAME
             // block next to a LAST_FRAME one inherits that neighbour's filter
             // choice into its own context, corrupting the symbol it reads.
-            let above_filter_ctx = if neighbours.above_ref[c] == ref_frame {
+            // lane-av1idx r2: also match on the neighbour's SECOND reference
+            // (`above_ref1`/`left_ref1`, real for a compound neighbour) --
+            // see the 16x16 leaf's own comment above for the spec citation.
+            let above_filter_ctx = if neighbours.above_ref[c] == ref_frame
+                || neighbours.above_ref1[c] == Some(ref_frame)
+            {
                 neighbours.above_filter[c]
             } else {
                 [3, 3]
             };
-            let left_filter_ctx = if neighbours.left_ref[r] == ref_frame {
+            let left_filter_ctx = if neighbours.left_ref[r] == ref_frame
+                || neighbours.left_ref1[r] == Some(ref_frame)
+            {
                 neighbours.left_filter[r]
             } else {
                 [3, 3]
@@ -5063,6 +5027,7 @@ fn decode_inter_block(
                 is_globalmv,
                 above_filter_ctx,
                 left_filter_ctx,
+                false,
             );
             block_filter = resolved_filter;
             globalmv_for_lf = is_globalmv;
@@ -5580,13 +5545,8 @@ fn decode_inter_block8(
                 // as the 16x16 leaf above -- one real bug found and fixed
                 // (mvstack.rs ref_ctx family), a second, still-unfound
                 // compound_idx defect surfaces on the wide gate sweep.
-                return Err(unsupported(
-                    "a COMPOUND_REFERENCE 8x8 leaf using the plain/distance-weighted \
-                     average blend (comp_group_idx == 0) -- proven non-pixel-exact \
-                     against real aomenc streams beyond the one bug lane-av1blend \
-                     r6/r7 fixed (lane-av1blend r7, wide gate sweep)",
-                ));
-                #[allow(unreachable_code)]
+                // lane-av1idx r1: same re-mask as the 16x16 leaf above --
+                // see that comment.
                 let (fwd_offset, bck_offset, compound_idx) = if !skip_mode && enable_jnt_comp {
                     let idx_ctx = get_comp_index_context(
                         neighbours,
@@ -5671,15 +5631,6 @@ fn decode_inter_block8(
                 );
                 let mut pred_y = vec![0u8; SIDE * SIDE];
                 mc::combine_compound(&inter0_y, &inter1_y, fwd_offset, bck_offset, &mut pred_y);
-
-                if std::env::var("EC_AV1_COMPOUND_DEBUG").is_ok() {
-                    let fidx = R17_DUMP_FRAME_IDX.load(std::sync::atomic::Ordering::Relaxed);
-                    eprintln!(
-                        "leaf8 fidx={fidx} px={px} py={py} ref0={ref0} ref1={ref1} \
-                         mv0={mv0:?} mv1={mv1:?} fwd={fwd_offset} bck={bck_offset} \
-                         compound_idx={compound_idx} pred_y={pred_y:?}"
-                    );
-                }
 
                 let mut inter0_u = vec![0i32; CHROMA_SIDE * CHROMA_SIDE];
                 mc::predict_compound_intermediate(
@@ -6362,14 +6313,6 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     let scan4 = default_scan(TX4);
 
     let mut cdfs = initial_cdfs.unwrap_or_else(|| Cdfs::new(q_ctx_of(base_q_idx)));
-    if std::env::var_os("EC_AV1_COMPIDX_DUMP").is_some() {
-        let idx = R17_DUMP_FRAME_IDX.load(std::sync::atomic::Ordering::Relaxed);
-        eprint!("COMPIDX_PRE fidx={} (aomdec fidx={})", idx, idx + 1);
-        for (c, row) in cdfs.compound_idx.iter().enumerate() {
-            eprint!(" ctx{c}={}", row[0]);
-        }
-        eprintln!();
-    }
     let mut dec = SymbolDecoder::new(data);
     let mut neighbours = Neighbours::new(
         cols as usize * 2,
@@ -6646,10 +6589,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         }
     }
 
-    let r17_idx = R17_DUMP_FRAME_IDX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    r17_dump("EC_AV1_PREFILT_DUMP", &y, &u, &v, r17_idx);
     apply_deblock(&mut y, &mut u, &mut v, loop_filter, &neighbours);
-    r17_dump("EC_AV1_POSTFILT_DUMP", &y, &u, &v, r17_idx);
     apply_cdef(&mut y, &mut u, &mut v, cdef, &neighbours);
 
     let motion_field = build_motion_field(
