@@ -266,6 +266,13 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
             ec_av1_syntax::InterpolationFilter::Switchable => None,
             fixed => Some(crate::mc::InterpFilterKind::from_header(fixed)),
         };
+        if std::env::var_os("EC_AV1_SREF_DUMP").is_some() {
+            eprintln!(
+                "STREAM_HEADER r17_before={} interpolation_filter={:?} interp_fixed={interp_fixed:?}",
+                crate::decode::r17_dump_frame_idx(),
+                header.interpolation_filter
+            );
+        }
 
         // Spec 7.20 `load_cdfs`: a frame naming a `primary_ref_frame` resumes
         // from that reference slot's saved CDF state instead of the spec 8.4
