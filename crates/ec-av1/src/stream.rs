@@ -378,6 +378,7 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 enable_jnt_comp,
                 header.skip_mode_present,
                 header.skip_mode_frame,
+                header.reduced_tx_set,
             )?
         };
         // Spec 7.20: `disable_frame_end_update_cdf` stores the frame's

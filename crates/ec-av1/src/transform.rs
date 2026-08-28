@@ -320,6 +320,31 @@ pub enum TxType {
     /// Identity down the column axis, DCT across the row axis
     /// (`H_DCT` -- `TX_SET_INTRA_1` only).
     HDct,
+    /// FLIPADST down the column axis, DCT across the row axis (lane-cdffwd2:
+    /// reachable once `reduced_tx_set == false`'s wider inter sets are read
+    /// -- `EXT_TX_SET_DTT9_IDTX_1DDCT`/`EXT_TX_SET_ALL16`). FLIPADST is the
+    /// same 1D ADST kernel [`AdstDct`] uses (`vtx_tab`/`htx_tab`,
+    /// `common_data.h`), just read/written flipped -- see [`TxType::flip`].
+    FlipAdstDct,
+    /// DCT down the column axis, FLIPADST across the row axis.
+    DctFlipAdst,
+    /// FLIPADST on both axes.
+    FlipAdstFlipAdst,
+    /// ADST down the column axis, FLIPADST across the row axis.
+    AdstFlipAdst,
+    /// FLIPADST down the column axis, ADST across the row axis.
+    FlipAdstAdst,
+    /// ADST down the column axis, identity across the row axis (`V_ADST` --
+    /// `EXT_TX_SET_ALL16` only).
+    VAdst,
+    /// Identity down the column axis, ADST across the row axis (`H_ADST`).
+    HAdst,
+    /// FLIPADST down the column axis, identity across the row axis
+    /// (`V_FLIPADST`).
+    VFlipAdst,
+    /// Identity down the column axis, FLIPADST across the row axis
+    /// (`H_FLIPADST`).
+    HFlipAdst,
 }
 
 impl TxType {
@@ -353,6 +378,57 @@ impl TxType {
         }
     }
 
+    /// The inverse of `Tx_Type_Inter_Inv_Set2`'s CDF symbol order
+    /// (`av1_ext_tx_inv[EXT_TX_SET_DTT9_IDTX_1DDCT]`, `entropymode.h`:
+    /// `{9, 10, 11, 0, 1, 2, 4, 5, 3, 6, 7, 8}`) -- the twelve-type set a
+    /// `reduced_tx_set == 0` frame's 16x16 *inter* transform reads from
+    /// (`av1_get_ext_tx_set_type`'s `tx_size_sqr == TX_16X16` branch of
+    /// `av1_ext_tx_set_lookup[1]`).
+    pub fn from_symbol_set2_12(t: usize) -> Option<Self> {
+        match t {
+            0 => Some(Self::Idtx),
+            1 => Some(Self::VDct),
+            2 => Some(Self::HDct),
+            3 => Some(Self::DctDct),
+            4 => Some(Self::AdstDct),
+            5 => Some(Self::DctAdst),
+            6 => Some(Self::FlipAdstDct),
+            7 => Some(Self::DctFlipAdst),
+            8 => Some(Self::AdstAdst),
+            9 => Some(Self::FlipAdstFlipAdst),
+            10 => Some(Self::AdstFlipAdst),
+            11 => Some(Self::FlipAdstAdst),
+            _ => None,
+        }
+    }
+
+    /// The inverse of `Tx_Type_Inter_Inv_Set1`'s CDF symbol order
+    /// (`av1_ext_tx_inv[EXT_TX_SET_ALL16]`, `entropymode.h`:
+    /// `{9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 4, 5, 3, 6, 7, 8}`) -- the full
+    /// sixteen-type set a `reduced_tx_set == 0` frame's 8x8 (and 4x4) inter
+    /// transform reads from (`av1_ext_tx_set_lookup[1][0]`).
+    pub fn from_symbol_all16(t: usize) -> Option<Self> {
+        match t {
+            0 => Some(Self::Idtx),
+            1 => Some(Self::VDct),
+            2 => Some(Self::HDct),
+            3 => Some(Self::VAdst),
+            4 => Some(Self::HAdst),
+            5 => Some(Self::VFlipAdst),
+            6 => Some(Self::HFlipAdst),
+            7 => Some(Self::DctDct),
+            8 => Some(Self::AdstDct),
+            9 => Some(Self::DctAdst),
+            10 => Some(Self::FlipAdstDct),
+            11 => Some(Self::DctFlipAdst),
+            12 => Some(Self::AdstAdst),
+            13 => Some(Self::FlipAdstFlipAdst),
+            14 => Some(Self::AdstFlipAdst),
+            15 => Some(Self::FlipAdstAdst),
+            _ => None,
+        }
+    }
+
     /// `(row, col)`: the transform `inverse_transform_2d_typed`'s row pass
     /// (`htx_tab`, spec/libaom "horizontal") and column pass (`vtx_tab`,
     /// "vertical") each run. Read off libaom's `av1_inv_txfm2d.c` `vtx_tab`/
@@ -370,6 +446,29 @@ impl TxType {
             // `av1_inv_txfm2d.c`: V_DCT vtx=DCT htx=IDTX, H_DCT the mirror.
             Self::VDct => (Identity, Dct),
             Self::HDct => (Dct, Identity),
+            // FLIPADST reads the same 1D ADST kernel as ADST -- `vtx_tab`/
+            // `htx_tab` (`common_data.h`) map `FLIPADST_1D` and `ADST_1D`
+            // to the exact same butterfly network; only [`Self::flip`]
+            // differs. So every FLIPADST-bearing axis below mirrors its
+            // plain-ADST counterpart's kernel pairing.
+            Self::FlipAdstDct => (Dct, Adst),
+            Self::DctFlipAdst => (Adst, Dct),
+            Self::FlipAdstFlipAdst | Self::AdstFlipAdst | Self::FlipAdstAdst => (Adst, Adst),
+            Self::VAdst | Self::VFlipAdst => (Identity, Adst),
+            Self::HAdst | Self::HFlipAdst => (Adst, Identity),
+        }
+    }
+
+    /// `(ud_flip, lr_flip)` (`get_flip_cfg`, `av1_txfm.h`): whether the
+    /// column pass reads its input right-to-left and/or the finished
+    /// residual is written bottom-to-top. Every FLIPADST-bearing type sets
+    /// one or both; every other type is `(false, false)`.
+    fn flip(self) -> (bool, bool) {
+        match self {
+            Self::FlipAdstDct | Self::FlipAdstAdst | Self::VFlipAdst => (true, false),
+            Self::DctFlipAdst | Self::AdstFlipAdst | Self::HFlipAdst => (false, true),
+            Self::FlipAdstFlipAdst => (true, true),
+            _ => (false, false),
         }
     }
 }
@@ -698,6 +797,7 @@ pub fn inverse_transform_2d_typed(
     let col_clamp = (usize::from(bit_depth) + 6).max(16);
     let mut residual = vec![0i32; side * side];
     let (row_kind, col_kind) = tx_type.axes();
+    let (ud_flip, lr_flip) = tx_type.flip();
 
     let mut t = [0i32; 64];
     for i in 0..side {
@@ -716,16 +816,25 @@ pub fn inverse_transform_2d_typed(
         }
     }
 
+    // A FLIPADST axis reads the row-pass output right-to-left and/or writes
+    // its own output bottom-to-top (`inv_txfm2d_add_c`, `av1_inv_txfm2d.c`
+    // lines 291-314): `out` is a second buffer, not `residual` reused in
+    // place, because a flipped read/write pair aliases a column this same
+    // loop has not visited yet (column `j`'s write target under `lr_flip`
+    // is a column an unflipped loop would still need to read from later).
+    let mut out = vec![0i32; side * side];
     for j in 0..side {
+        let src_col = if lr_flip { side - 1 - j } else { j };
         for i in 0..side {
-            t[i] = residual[i * side + j];
+            t[i] = residual[i * side + src_col];
         }
         inverse_1d(&mut t, log2, col_clamp, col_kind);
         for i in 0..side {
-            residual[i * side + j] = round2(t[i], 4);
+            let dst_row = if ud_flip { side - 1 - i } else { i };
+            out[dst_row * side + j] = round2(t[i], 4);
         }
     }
-    residual
+    out
 }
 
 /// [`inverse_transform_2d_typed`] at `DCT_DCT`, this crate's original
