@@ -123,19 +123,18 @@ pub struct MiInfo {
     pub ref_frame: i8,
     /// The unit's *second* reference frame when it was coded compound
     /// (spec `RefFrames[1]`), `None` for a single-reference/intra unit --
-    /// lane-av1comp: today's callers (single-ref decode/encode) never set
-    /// this, so it exists only so [`MiGrid`] can carry compound state once
-    /// `read_ref_frames` (spec 5.11.25) lands; nothing reads it yet, and
-    /// [`find_mv_stack`]'s scan still matches candidates on `ref_frame`
-    /// alone (its own compound dual-ref scan is unported -- see the ledger).
+    /// compound-coded decode leaves set this. lane-av1idx r5:
+    /// [`find_mv_stack`]'s single-ref row/col/corner scans (via
+    /// `single_ref_match`) now also match a compound neighbour on this
+    /// second field, donating that side's own MV -- the real read #538
+    /// desync (a `new_mv_ctx` fed by a `newmv_count`/`nearest_match` that
+    /// silently dropped a compound neighbour's vote whenever its match sat
+    /// in this slot).
     pub ref_frame1: Option<i8>,
     /// The unit's motion vector, `(row, col)`, in the spec's 1/8-pel units.
     pub mv: (i32, i32),
     /// The unit's second motion vector, matching `ref_frame1` (spec
     /// `Mvs[1]`) — `Some` only for a compound-coded unit, `None` otherwise.
-    /// lane-av1comp step 4: exists so the compound mvstack scan below can
-    /// read a compound neighbour's second MV; no caller sets it yet (same
-    /// unwired state `ref_frame1` landed in for r3).
     pub mv1: Option<(i32, i32)>,
     /// Whether this unit's own mode was `NEWMV` (spec's
     /// `have_newmv_in_inter_mode`, compound modes excluded since this module
@@ -311,9 +310,9 @@ pub const NO_SIGN_BIAS: SignBiasTable = [false; 7];
 ///
 /// libaom's real signature loops `rf_idx` over the candidate's up to two
 /// coded reference-frame slots (a compound-coded neighbour donates two
-/// candidates, one per slot); this crate's [`MiInfo`] carries a single
-/// `ref_frame`, since no coded neighbour here is ever compound — ported as
-/// that loop's `rf_idx == 0` iteration alone.
+/// candidates, one per slot) -- now ported in full: a compound `candidate`
+/// (`ref_frame1`/`mv1` both `Some`) donates a second entry from its second
+/// slot too, each sign-flipped against its own reference frame independently.
 fn process_single_ref_mv_candidate(
     candidate: &MiInfo,
     ref_frame: i8,
@@ -323,15 +322,23 @@ fn process_single_ref_mv_candidate(
     if !candidate.is_inter {
         return;
     }
-    let mut this_mv = candidate.mv;
-    if sign_bias(sign_bias_table, candidate.ref_frame) != sign_bias(sign_bias_table, ref_frame) {
-        this_mv = (-this_mv.0, -this_mv.1);
+    let mut slots = [(candidate.ref_frame, candidate.mv); 2];
+    let mut n_slots = 1;
+    if let (Some(rf1), Some(mv1)) = (candidate.ref_frame1, candidate.mv1) {
+        slots[1] = (rf1, mv1);
+        n_slots = 2;
     }
-    if !candidates.iter().any(|e| e.mv == this_mv) {
-        candidates.push(StackEntry {
-            mv: this_mv,
-            weight: 2,
-        });
+    for &(rf, mv) in &slots[..n_slots] {
+        let mut this_mv = mv;
+        if sign_bias(sign_bias_table, rf) != sign_bias(sign_bias_table, ref_frame) {
+            this_mv = (-this_mv.0, -this_mv.1);
+        }
+        if !candidates.iter().any(|e| e.mv == this_mv) {
+            candidates.push(StackEntry {
+                mv: this_mv,
+                weight: 2,
+            });
+        }
     }
 }
 
@@ -405,14 +412,36 @@ fn scan_row(
             weight = weight.max(inc as u32);
             *processed_rows = (inc as isize - row_offset - 1).max(0) as usize;
         }
-        if info.is_inter && info.ref_frame == ref_frame {
+        if let Some(mv) = single_ref_match(info, ref_frame) {
             found = true;
-            add_candidate(candidates, info.mv, len as u32 * weight);
+            add_candidate(candidates, mv, len as u32 * weight);
             *newmv_count += u32::from(info.is_new_mv);
         }
         i += len.max(1);
     }
     found
+}
+
+/// libaom's `add_ref_mv_candidate` (mvref_common.c) for a single-reference
+/// query: a compound-coded neighbour still votes when *either* of its two
+/// coded reference frames matches `ref_frame`, contributing that side's own
+/// MV -- checked first slot then second, matching libaom's `for (ref = 0;
+/// ref < 1 + is_compound; ++ref)` loop order. The row/col/corner scans below
+/// used to check `info.ref_frame == ref_frame` alone, silently dropping a
+/// compound neighbour's vote whenever the match sat in its *second* slot
+/// (the class this crate's own compound-stack scan already had to close for
+/// [`find_mv_stack_compound`] -- see the module doc).
+fn single_ref_match(info: &MiInfo, ref_frame: i8) -> Option<(i32, i32)> {
+    if !info.is_inter {
+        return None;
+    }
+    if info.ref_frame == ref_frame {
+        Some(info.mv)
+    } else if info.ref_frame1 == Some(ref_frame) {
+        info.mv1
+    } else {
+        None
+    }
 }
 
 /// The col scan (spec 7.10.2.3, libaom `scan_col_mbmi`): `scan_row`,
@@ -456,9 +485,9 @@ fn scan_col(
             weight = weight.max(inc as u32);
             *processed_cols = (inc as isize - col_offset - 1).max(0) as usize;
         }
-        if info.is_inter && info.ref_frame == ref_frame {
+        if let Some(mv) = single_ref_match(info, ref_frame) {
             found = true;
-            add_candidate(candidates, info.mv, len as u32 * weight);
+            add_candidate(candidates, mv, len as u32 * weight);
             *newmv_count += u32::from(info.is_new_mv);
         }
         i += len.max(1);
@@ -486,10 +515,9 @@ fn scan_top_right(
     };
     let col = mi_col + bw4;
     if let Some(info) = grid.get(row, col)
-        && info.is_inter
-        && info.ref_frame == ref_frame
+        && let Some(mv) = single_ref_match(info, ref_frame)
     {
-        add_candidate(candidates, info.mv, CORNER_WEIGHT);
+        add_candidate(candidates, mv, CORNER_WEIGHT);
         *newmv_count += u32::from(info.is_new_mv);
         return true;
     }
@@ -514,10 +542,9 @@ fn scan_corner(
         return false;
     };
     if let Some(info) = grid.get(row, col)
-        && info.is_inter
-        && info.ref_frame == ref_frame
+        && let Some(mv) = single_ref_match(info, ref_frame)
     {
-        add_candidate(candidates, info.mv, CORNER_WEIGHT);
+        add_candidate(candidates, mv, CORNER_WEIGHT);
         *newmv_count += u32::from(info.is_new_mv);
         return true;
     }

@@ -268,12 +268,14 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         };
         if std::env::var_os("EC_AV1_SREF_DUMP").is_some() {
             eprintln!(
-                "STREAM_HEADER r17_before={} interpolation_filter={:?} interp_fixed={interp_fixed:?} is_motion_mode_switchable={} enable_interintra_compound={:?} allow_warped_motion={}",
+                "STREAM_HEADER r17_before={} interpolation_filter={:?} interp_fixed={interp_fixed:?} is_motion_mode_switchable={} enable_interintra_compound={:?} allow_warped_motion={} reference_select={} primary_ref_frame={}",
                 crate::decode::r17_dump_frame_idx(),
                 header.interpolation_filter,
                 header.is_motion_mode_switchable,
                 parser.sequence_header().map(|s| s.enable_interintra_compound),
                 header.allow_warped_motion,
+                header.reference_select,
+                header.primary_ref_frame,
             );
         }
 

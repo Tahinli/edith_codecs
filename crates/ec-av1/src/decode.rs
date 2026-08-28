@@ -521,6 +521,7 @@ fn read_eob(dec: &mut SymbolDecoder, coding: &mut TxbTables, class: TxClass) -> 
         (TxClass::TwoD, _) | (_, None) => coding.eob_pt,
         (_, Some(class1)) => class1,
     };
+    crate::msac::CURRENT_OP.with(|c| c.set("L524"));
     let group = dec.symbol(eob_pt) + 1;
     if trace {
         eprintln!("TRACE eob_pt value={group}");
@@ -528,6 +529,7 @@ fn read_eob(dec: &mut SymbolDecoder, coding: &mut TxbTables, class: TxClass) -> 
     let bits = OFFSET_BITS[group];
     let mut offset = 0u32;
     if bits > 0 {
+        crate::msac::CURRENT_OP.with(|c| c.set("L531"));
         let top = dec.symbol(&mut coding.eob_extra[group - 3]) as u32;
         if trace {
             eprintln!("TRACE eob_extra ctx={} value={top}", group - 3);
@@ -590,6 +592,7 @@ fn read_coeffs(
     let trace = std::env::var_os("EC_AV1_TRACE").is_some();
     let side = coding.side;
     let mut grid = vec![0i32; side * side];
+    crate::msac::CURRENT_OP.with(|c| c.set("L593"));
     let all_zero = dec.symbol(&mut coding.txb_skip[skip_ctx]) == 1;
     if trace {
         eprintln!("TRACE all_zero ctx={skip_ctx} value={}", all_zero as i32);
@@ -603,6 +606,7 @@ fn read_coeffs(
         // `TX_SET_INTRA_1`, 5 (6 slots) the reduced `TX_SET_INTRA_2` (the
         // inter sets we read share set 2's symbol order).
         let set1 = tx_type_cdf.len() == 8;
+        crate::msac::CURRENT_OP.with(|c| c.set("L606"));
         let t = dec.symbol(tx_type_cdf);
         if trace {
             eprintln!("TRACE tx_type value={t} set1={set1}");
@@ -636,6 +640,7 @@ fn read_coeffs(
         let (row, col) = (pos / side, pos % side);
         let level = if scan_idx == eob - 1 {
             let ctx = eob_coeff_ctx(scan_idx, side * side);
+            crate::msac::CURRENT_OP.with(|c| c.set("L639"));
             let v = dec.symbol(&mut coding.base_eob[ctx]) as i32 + 1;
             if trace {
                 eprintln!(
@@ -645,6 +650,7 @@ fn read_coeffs(
             v
         } else {
             let ctx = base_ctx(&levels, side, row, col, class);
+            crate::msac::CURRENT_OP.with(|c| c.set("L648"));
             let v = dec.symbol(&mut coding.base[ctx]) as i32;
             if trace {
                 eprintln!(
@@ -658,6 +664,7 @@ fn read_coeffs(
             let mut level = level;
             let mut sent = 0;
             loop {
+                crate::msac::CURRENT_OP.with(|c| c.set("L661"));
                 let k = dec.symbol(&mut coding.br[ctx]) as i32;
                 if trace {
                     eprintln!(
@@ -683,6 +690,7 @@ fn read_coeffs(
             continue;
         }
         let negative = if pos == 0 {
+            crate::msac::CURRENT_OP.with(|c| c.set("L686"));
             let v = dec.symbol(&mut coding.dc_sign[sign_ctx]) == 1;
             if trace {
                 eprintln!("TRACE dc_sign ctx={sign_ctx} value={}", v as i32);
@@ -1257,6 +1265,7 @@ fn filter_intra_size_class(side: usize) -> Option<usize> {
 /// delta [`crate::intra::predict`] wants; bumps [`ANGLE_DELTA_HITS`] whenever
 /// it lands away from zero, for gate tests to prove a real stream fired one.
 fn read_angle_delta(dec: &mut SymbolDecoder, cdf: &mut [u16]) -> i32 {
+    crate::msac::CURRENT_OP.with(|c| c.set("L1260"));
     let symbol = dec.symbol(cdf);
     if symbol != ANGLE_DELTA_ZERO {
         ANGLE_DELTA_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1282,12 +1291,14 @@ fn read_intra_mode(
     Option<usize>,
 )> {
     let trace = std::env::var_os("EC_AV1_TRACE").is_some();
+    crate::msac::CURRENT_OP.with(|c| c.set("L1285"));
     let skip = dec.symbol(&mut cdfs.skip[0]) != 0;
     if trace {
         eprintln!("TRACE skip value={}", skip as i32);
     }
     let above_ctx = INTRA_MODE_CTX[above_mode];
     let left_ctx = INTRA_MODE_CTX[left_mode];
+    crate::msac::CURRENT_OP.with(|c| c.set("L1291"));
     let mode = dec.symbol(&mut cdfs.kf_y_mode[above_ctx][left_ctx]);
     if trace {
         eprintln!("TRACE y_mode ctx=({above_ctx},{left_ctx}) value={mode}");
@@ -1305,8 +1316,10 @@ fn read_intra_mode(
         0
     };
     let uv_mode = if cfl {
+        crate::msac::CURRENT_OP.with(|c| c.set("L1308"));
         dec.symbol(&mut cdfs.uv_mode_cfl[mode])
     } else {
+        crate::msac::CURRENT_OP.with(|c| c.set("L1310"));
         dec.symbol(&mut cdfs.uv_mode_no_cfl[mode])
     };
     if trace {
@@ -1350,6 +1363,7 @@ fn read_intra_mode(
         && enable_filter_intra
         && let Some(class) = filter_intra_size_class(side)
     {
+        crate::msac::CURRENT_OP.with(|c| c.set("L1353"));
         let use_filter_intra = dec.symbol(&mut cdfs.filter_intra[class]) != 0;
         if trace {
             eprintln!(
@@ -1359,6 +1373,7 @@ fn read_intra_mode(
         }
         if use_filter_intra {
             FILTER_INTRA_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::msac::CURRENT_OP.with(|c| c.set("L1362"));
             let fi_mode = dec.symbol(&mut cdfs.filter_intra_mode);
             if trace {
                 eprintln!("TRACE filter_intra_mode value={fi_mode}");
@@ -1389,6 +1404,7 @@ const UV_CFL_PRED: usize = 13;
 /// joint sign the same way. Returns each plane's final signed `alpha_q3`
 /// (`cfl_idx_to_alpha`, cfl.c): magnitude `idx + 1`, sign-zero collapsing to 0.
 fn read_cfl_alphas(dec: &mut SymbolDecoder, cdfs: &mut Cdfs) -> (i32, i32) {
+    crate::msac::CURRENT_OP.with(|c| c.set("L1392"));
     let joint_sign = dec.symbol(&mut cdfs.cfl_sign) as i32;
     let sign_u = ((joint_sign + 1) * 11) >> 5;
     let sign_v = (joint_sign + 1) - 3 * sign_u;
@@ -1396,6 +1412,7 @@ fn read_cfl_alphas(dec: &mut SymbolDecoder, cdfs: &mut Cdfs) -> (i32, i32) {
         0
     } else {
         let ctx_u = (joint_sign + 1 - 3) as usize;
+        crate::msac::CURRENT_OP.with(|c| c.set("L1399"));
         let mag = dec.symbol(&mut cdfs.cfl_alpha[ctx_u]) as i32 + 1;
         if sign_u == 2 { mag } else { -mag }
     };
@@ -1403,6 +1420,7 @@ fn read_cfl_alphas(dec: &mut SymbolDecoder, cdfs: &mut Cdfs) -> (i32, i32) {
         0
     } else {
         let ctx_v = (sign_v * 3 + sign_u - 3) as usize;
+        crate::msac::CURRENT_OP.with(|c| c.set("L1406"));
         let mag = dec.symbol(&mut cdfs.cfl_alpha[ctx_v]) as i32 + 1;
         if sign_v == 2 { mag } else { -mag }
     };
@@ -2588,10 +2606,22 @@ fn read_tx_size(
 ) -> usize {
     let ctx = tx_size_context(n, at_mi, side);
     let depth = match side {
-        8 => dec.symbol(&mut cdfs.tx_size_cat0[ctx]),
-        16 => dec.symbol(&mut cdfs.tx_size_cat1[ctx]),
-        32 => dec.symbol(&mut cdfs.tx_size_cat2[ctx]),
-        64 => dec.symbol(&mut cdfs.tx_size_cat3[ctx]),
+        8 => {
+            crate::msac::CURRENT_OP.with(|c| c.set("L2591"));
+            dec.symbol(&mut cdfs.tx_size_cat0[ctx])
+        }
+        16 => {
+            crate::msac::CURRENT_OP.with(|c| c.set("L2592"));
+            dec.symbol(&mut cdfs.tx_size_cat1[ctx])
+        }
+        32 => {
+            crate::msac::CURRENT_OP.with(|c| c.set("L2593"));
+            dec.symbol(&mut cdfs.tx_size_cat2[ctx])
+        }
+        64 => {
+            crate::msac::CURRENT_OP.with(|c| c.set("L2594"));
+            dec.symbol(&mut cdfs.tx_size_cat3[ctx])
+        }
         _ => unreachable!("decode_block/decode_leaf8 only call this at 8/16/32/64"),
     };
     if depth != 0 {
@@ -3300,6 +3330,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
             // mirroring [`crate::tile::sb_coeff_key_frame_tile`]'s own
             // three-way write exactly.
             let part = if has_cols && has_rows {
+                crate::msac::CURRENT_OP.with(|c| c.set("L3303"));
                 let p = dec.symbol(&mut cdfs.partition_w64[ctx]);
                 if std::env::var_os("EC_AV1_TRACE").is_some() {
                     eprintln!("TRACE partition_w64 ctx={ctx} value={p}");
@@ -3308,9 +3339,11 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
             } else {
                 match (has_cols, has_rows) {
                     (true, false) => {
+                        crate::msac::CURRENT_OP.with(|c| c.set("L3311"));
                         dec.symbol_fixed(&gather(&cdfs.partition_w64[ctx], VERT_ALIKE));
                     }
                     (false, true) => {
+                        crate::msac::CURRENT_OP.with(|c| c.set("L3314"));
                         dec.symbol_fixed(&gather(&cdfs.partition_w64[ctx], HORZ_ALIKE));
                     }
                     _ => {}
@@ -3357,6 +3390,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                             has_half(r32 * BLOCK_MI, BLOCK_MI, mi_rows),
                         );
                         let part32 = if has_cols32 && has_rows32 {
+                            crate::msac::CURRENT_OP.with(|c| c.set("L3360"));
                             let p = dec.symbol(&mut cdfs.partition_w32[ctx32]);
                             if std::env::var_os("EC_AV1_TRACE").is_some() {
                                 eprintln!(
@@ -3369,12 +3403,14 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                         } else {
                             match (has_cols32, has_rows32) {
                                 (true, false) => {
+                                    crate::msac::CURRENT_OP.with(|c| c.set("L3372"));
                                     dec.symbol_fixed(&gather(
                                         &cdfs.partition_w32[ctx32],
                                         VERT_ALIKE,
                                     ));
                                 }
                                 (false, true) => {
+                                    crate::msac::CURRENT_OP.with(|c| c.set("L3378"));
                                     dec.symbol_fixed(&gather(
                                         &cdfs.partition_w32[ctx32],
                                         HORZ_ALIKE,
@@ -3427,6 +3463,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                     let at16 = (sr, sc);
                                     let ctx16 = neighbours.partition_ctx(at16, SUB);
                                     if has_cols16 && has_rows16 {
+                                        crate::msac::CURRENT_OP.with(|c| c.set("L3430"));
                                         let part16 = dec.symbol(&mut cdfs.partition_w16[ctx16]);
                                         if std::env::var_os("EC_AV1_TRACE").is_some() {
                                             eprintln!(
@@ -3481,6 +3518,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                                 (mi_row0 + (i / 2) * 2, mi_col0 + (i % 2) * 2);
                                             let leaf_mi = (mr as usize, mc as usize);
                                             let leaf_ctx = neighbours.partition_ctx_mi(leaf_mi, 8);
+                                            crate::msac::CURRENT_OP.with(|c| c.set("L3485"));
                                             let part8 =
                                                 dec.symbol(&mut cdfs.partition_w8[leaf_ctx]);
                                             if std::env::var_os("EC_AV1_TRACE").is_some() {
@@ -3531,11 +3569,13 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                         ));
                                     }
                                     if has_cols16 {
+                                        crate::msac::CURRENT_OP.with(|c| c.set("L3534"));
                                         dec.symbol_fixed(&gather(
                                             &cdfs.partition_w16[ctx16],
                                             VERT_ALIKE,
                                         ));
                                     } else {
+                                        crate::msac::CURRENT_OP.with(|c| c.set("L3539"));
                                         dec.symbol_fixed(&gather(
                                             &cdfs.partition_w16[ctx16],
                                             HORZ_ALIKE,
@@ -3551,6 +3591,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                     for (mr, mc) in leaf_positions {
                                         let leaf_mi = (mr as usize, mc as usize);
                                         let leaf_ctx = neighbours.partition_ctx_mi(leaf_mi, 8);
+                                        crate::msac::CURRENT_OP.with(|c| c.set("L3554"));
                                         let part8 = dec.symbol(&mut cdfs.partition_w8[leaf_ctx]);
                                         if std::env::var_os("EC_AV1_TRACE").is_some() {
                                             eprintln!(
@@ -3710,6 +3751,7 @@ fn resolve_interp_filter(
             &cdfs.switchable_interp[ctx0][..3]
         );
     }
+    crate::msac::CURRENT_OP.with(|c| c.set("L3713"));
     let sym0 = dec.symbol(&mut cdfs.switchable_interp[ctx0]) as u8;
     let sym1 = if enable_dual_filter {
         let ctx1 = switchable_interp_ctx(above[1], left[1], 1, is_compound);
@@ -3719,6 +3761,7 @@ fn resolve_interp_filter(
                 &cdfs.switchable_interp[ctx1][..3]
             );
         }
+        crate::msac::CURRENT_OP.with(|c| c.set("L3722"));
         dec.symbol(&mut cdfs.switchable_interp[ctx1]) as u8
     } else {
         sym0
@@ -3768,16 +3811,21 @@ fn read_mv_component(
     c: &mut MvComponentCdfs,
     allow_high_precision_mv: bool,
 ) -> i32 {
+    crate::msac::CURRENT_OP.with(|c| c.set("L3771"));
     let sign = dec.symbol(&mut c.sign);
+    crate::msac::CURRENT_OP.with(|c| c.set("L3772"));
     let class = dec.symbol(&mut c.class);
     let local = if class == 0 {
+        crate::msac::CURRENT_OP.with(|c| c.set("L3774"));
         let bit = dec.symbol(&mut c.class0_bit);
+        crate::msac::CURRENT_OP.with(|c| c.set("L3775"));
         let fr = dec.symbol(&mut c.class0_fr[bit]);
         // spec 5.11.32 `mv_class0_hp`: read only when the frame allows
         // high-precision motion vectors, else implicitly 1 (the low bit
         // stays at half-pel precision) -- this crate's own writer always
         // leaves the flag off, but a foreign stream can set it per frame.
         let hp = if allow_high_precision_mv {
+            crate::msac::CURRENT_OP.with(|c| c.set("L3781"));
             dec.symbol(&mut c.class0_hp)
         } else {
             1
@@ -3786,10 +3834,13 @@ fn read_mv_component(
     } else {
         let mut d = 0;
         for i in 0..class {
+            crate::msac::CURRENT_OP.with(|c| c.set("L3789"));
             d |= dec.symbol(&mut c.bit[i]) << i;
         }
+        crate::msac::CURRENT_OP.with(|c| c.set("L3791"));
         let fr = dec.symbol(&mut c.fr);
         let hp = if allow_high_precision_mv {
+            crate::msac::CURRENT_OP.with(|c| c.set("L3793"));
             dec.symbol(&mut c.hp)
         } else {
             1
@@ -3809,6 +3860,7 @@ fn read_mv(
     pred: (i32, i32),
     allow_high_precision_mv: bool,
 ) -> (i32, i32) {
+    crate::msac::CURRENT_OP.with(|c| c.set("L3812"));
     let joint = dec.symbol(mv_joint);
     let mut diff = (0, 0);
     if joint == 2 || joint == 3 {
@@ -3912,21 +3964,27 @@ fn read_single_ref(
 ) -> i8 {
     let above = (above_ref > 0).then_some(above_ref);
     let left = (left_ref > 0).then_some(left_ref);
+    crate::msac::CURRENT_OP.with(|c| c.set("L3915"));
     let p1 = dec.symbol(&mut cdfs.single_ref[single_ref_p1_ctx(above, above_ref1, left, left_ref1)][0]);
     let ref_frame = if p1 == 1 {
+        crate::msac::CURRENT_OP.with(|c| c.set("L3917"));
         let p2 = dec.symbol(&mut cdfs.single_ref[single_ref_p2_ctx(above, above_ref1, left, left_ref1)][1]);
         if p2 == 1 {
             ALTREF_FRAME
         } else {
+            crate::msac::CURRENT_OP.with(|c| c.set("L3921"));
             let p6 = dec.symbol(&mut cdfs.single_ref[single_ref_p6_ctx(above, above_ref1, left, left_ref1)][5]);
             if p6 == 1 { ALTREF2_FRAME } else { BWDREF_FRAME }
         }
     } else {
+        crate::msac::CURRENT_OP.with(|c| c.set("L3925"));
         let p3 = dec.symbol(&mut cdfs.single_ref[single_ref_p3_ctx(above, above_ref1, left, left_ref1)][2]);
         if p3 == 1 {
+            crate::msac::CURRENT_OP.with(|c| c.set("L3927"));
             let p5 = dec.symbol(&mut cdfs.single_ref[single_ref_p5_ctx(above, above_ref1, left, left_ref1)][4]);
             if p5 == 1 { GOLDEN_FRAME } else { LAST3_FRAME }
         } else {
+            crate::msac::CURRENT_OP.with(|c| c.set("L3930"));
             let p4 = dec.symbol(&mut cdfs.single_ref[single_ref_p4_ctx(above, above_ref1, left, left_ref1)][3]);
             if p4 == 1 { LAST2_FRAME } else { LAST_FRAME }
         }
@@ -4048,6 +4106,7 @@ fn read_comp_mode(
     left: Option<NeighbourRef>,
 ) -> bool {
     let ctx = reference_mode_ctx(above, left);
+    crate::msac::CURRENT_OP.with(|c| c.set("L4051"));
     let compound = dec.symbol(&mut cdfs.comp_mode[ctx]) == 1;
     if compound {
         COMP_MODE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4091,17 +4150,21 @@ fn read_compound_ref_frames(
     let a1 = above.and_then(|n| n.ref1);
     let l1 = left.and_then(|n| n.ref1);
     let type_ctx = comp_reference_type_ctx(above, left);
+    crate::msac::CURRENT_OP.with(|c| c.set("L4094"));
     let unidir = dec.symbol(&mut cdfs.comp_ref_type[type_ctx]) == 0;
     if unidir {
         // uni_comp_ref (p0): forward vs. backward -- av1_get_pred_context_-
         // uni_comp_ref_p is single_ref_p1's own forward/backward vote.
+        crate::msac::CURRENT_OP.with(|c| c.set("L4098"));
         let bit = dec.symbol(&mut cdfs.uni_comp_ref[single_ref_p1_ctx(a, a1, l, l1)][0]);
         if bit == 1 {
             (BWDREF_FRAME, ALTREF_FRAME)
         } else {
+            crate::msac::CURRENT_OP.with(|c| c.set("L4102"));
             let p1 = dec.symbol(&mut cdfs.uni_comp_ref[uni_comp_ref_p1_ctx(a, a1, l, l1)][1]);
             if p1 == 1 {
                 // uni_comp_ref_p2: LAST3 vs. GOLDEN, same vote as single_ref_p5.
+                crate::msac::CURRENT_OP.with(|c| c.set("L4105"));
                 let p2 = dec.symbol(&mut cdfs.uni_comp_ref[single_ref_p5_ctx(a, a1, l, l1)][2]);
                 if p2 == 1 {
                     (LAST_FRAME, GOLDEN_FRAME)
@@ -4114,20 +4177,25 @@ fn read_compound_ref_frames(
         }
     } else {
         // comp_ref (p0): LAST/LAST2 vs. LAST3/GOLDEN, same vote as single_ref_p3.
+        crate::msac::CURRENT_OP.with(|c| c.set("L4117"));
         let bit0 = dec.symbol(&mut cdfs.comp_ref[single_ref_p3_ctx(a, a1, l, l1)][0]);
         let ref0 = if bit0 == 0 {
             // comp_ref_p1: LAST vs. LAST2, same vote as single_ref_p4.
+            crate::msac::CURRENT_OP.with(|c| c.set("L4120"));
             let p1 = dec.symbol(&mut cdfs.comp_ref[single_ref_p4_ctx(a, a1, l, l1)][1]);
             if p1 == 1 { LAST2_FRAME } else { LAST_FRAME }
         } else {
             // comp_ref_p2: LAST3 vs. GOLDEN, same vote as single_ref_p5.
+            crate::msac::CURRENT_OP.with(|c| c.set("L4124"));
             let p2 = dec.symbol(&mut cdfs.comp_ref[single_ref_p5_ctx(a, a1, l, l1)][2]);
             if p2 == 1 { GOLDEN_FRAME } else { LAST3_FRAME }
         };
         // comp_bwdref (p0): BWDREF/ALTREF2 vs. ALTREF, same vote as single_ref_p2.
+        crate::msac::CURRENT_OP.with(|c| c.set("L4128"));
         let bit1 = dec.symbol(&mut cdfs.comp_bwdref[single_ref_p2_ctx(a, a1, l, l1)][0]);
         let ref1 = if bit1 == 0 {
             // comp_bwdref_p1: BWDREF vs. ALTREF2, same vote as single_ref_p6.
+            crate::msac::CURRENT_OP.with(|c| c.set("L4131"));
             let p1 = dec.symbol(&mut cdfs.comp_bwdref[single_ref_p6_ctx(a, a1, l, l1)][1]);
             if p1 == 1 { ALTREF2_FRAME } else { BWDREF_FRAME }
         } else {
@@ -4155,6 +4223,7 @@ fn read_inter_compound_mode(
 ) -> u8 {
     let ctx = cdf::COMPOUND_MODE_CTX_MAP[ref_mv_ctx >> 1][new_mv_ctx.min(4)];
     COMPOUND_MODE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::msac::CURRENT_OP.with(|c| c.set("L4158"));
     dec.symbol(&mut cdfs.inter_compound_mode[ctx]) as u8
 }
 
@@ -4190,6 +4259,7 @@ fn assign_compound_mv(
     if mode == NEW_NEWMV {
         let mut idx = 0usize;
         while idx < 2 && comp_stack.entries.len() > idx + 1 {
+            crate::msac::CURRENT_OP.with(|c| c.set("L4193"));
             if dec.symbol(&mut cdfs.drl_mode[comp_stack.drl_ctx[idx]]) == 0 {
                 break;
             }
@@ -4199,6 +4269,7 @@ fn assign_compound_mv(
     } else if matches!(mode, NEAR_NEARMV | NEAR_NEWMV | NEW_NEARMV) {
         let mut idx = 1usize;
         while idx < 3 && comp_stack.entries.len() > idx + 1 {
+            crate::msac::CURRENT_OP.with(|c| c.set("L4202"));
             if dec.symbol(&mut cdfs.drl_mode[comp_stack.drl_ctx[idx]]) == 0 {
                 break;
             }
@@ -4342,17 +4413,20 @@ fn decode_inter_block(
     }
     let skip_mode_ctx =
         usize::from(neighbours.above_skip_mode[c]) + usize::from(neighbours.left_skip_mode[r]);
+    crate::msac::CURRENT_OP.with(|c| c.set("L4345"));
     let skip_mode = skip_mode_present && dec.symbol(&mut cdfs.skip_mode[skip_mode_ctx]) == 1;
     if skip_mode {
         SKIP_MODE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     let skip_ctx = usize::from(neighbours.above_skip[c]) + usize::from(neighbours.left_skip[r]);
+    crate::msac::CURRENT_OP.with(|c| c.set("L4351"));
     let skip = skip_mode || dec.symbol(&mut cdfs.skip[skip_ctx]) == 1;
 
     let (has_above, has_left) = (r > 0, c > 0);
     let (above_inter, left_inter) = (neighbours.above_inter[c], neighbours.left_inter[r]);
     let ii_ctx = intra_inter_ctx(has_above, has_left, above_inter, left_inter);
+    crate::msac::CURRENT_OP.with(|c| c.set("L4356"));
     let is_inter = skip_mode || dec.symbol(&mut cdfs.intra_inter[ii_ctx]) == 1;
 
     let mode_for_tx;
@@ -4504,6 +4578,7 @@ fn decode_inter_block(
                 && enable_masked_compound
                 && is_any_masked_compound_used_here(side)
             {
+                crate::msac::CURRENT_OP.with(|c| c.set("L4507"));
                 dec.symbol(&mut cdfs.comp_group_idx[group_ctx])
             } else {
                 0
@@ -4728,6 +4803,7 @@ fn decode_inter_block(
                         cdfs.compound_idx[idx_ctx][0]
                     );
                 }
+                crate::msac::CURRENT_OP.with(|c| c.set("L4731"));
                 let idx = dec.symbol(&mut cdfs.compound_idx[idx_ctx]);
                 if std::env::var_os("EC_AV1_COMPIDX_DUMP").is_some() {
                     eprintln!(
@@ -5036,6 +5112,7 @@ fn decode_inter_block(
                 sign_bias_table,
                 tpl,
             );
+            crate::msac::CURRENT_OP.with(|c| c.set("L5039"));
             let not_new = dec.symbol(&mut cdfs.new_mv[stack.new_mv_ctx]) == 1;
             let mut is_globalmv = false;
             let (mv, is_new_mv) = if !not_new {
@@ -5047,6 +5124,7 @@ fn decode_inter_block(
                 // -- entry 0 (`stack.pred_mv`) only when the loop never advances.
                 let mut idx = 0usize;
                 while idx < 2 && stack.entries.len() > idx + 1 {
+                    crate::msac::CURRENT_OP.with(|c| c.set("L5050"));
                     if dec.symbol(&mut cdfs.drl_mode[stack.drl_ctx[idx]]) == 0 {
                         break;
                     }
@@ -5064,6 +5142,7 @@ fn decode_inter_block(
                     true,
                 )
             } else {
+                crate::msac::CURRENT_OP.with(|c| c.set("L5067"));
                 let not_zero = dec.symbol(&mut cdfs.zero_mv[stack.zero_mv_ctx]) == 1;
                 is_globalmv = !not_zero;
                 let mv = if !not_zero {
@@ -5073,6 +5152,7 @@ fn decode_inter_block(
                     // model is refused before the tile decoder is ever called).
                     (0, 0)
                 } else {
+                    crate::msac::CURRENT_OP.with(|c| c.set("L5076"));
                     let nearest = dec.symbol(&mut cdfs.ref_mv[stack.ref_mv_ctx]) == 0;
                     if nearest {
                         stack.nearest_mv
@@ -5085,6 +5165,7 @@ fn decode_inter_block(
                         // exactly the pair this index is choosing between.
                         let mut idx = 1usize;
                         while idx < 3 && stack.entries.len() > idx + 1 {
+                            crate::msac::CURRENT_OP.with(|c| c.set("L5088"));
                             if dec.symbol(&mut cdfs.drl_mode[stack.drl_ctx[idx]]) == 0 {
                                 break;
                             }
@@ -5291,6 +5372,7 @@ fn decode_inter_block(
             }
         }
     } else {
+        crate::msac::CURRENT_OP.with(|c| c.set("L5294"));
         let mode = dec.symbol(&mut cdfs.y_mode[size_group]);
         if mode >= 13 {
             return Err(unsupported(
@@ -5298,6 +5380,7 @@ fn decode_inter_block(
             ));
         }
         if (V_PRED..=D67_PRED).contains(&mode) {
+            crate::msac::CURRENT_OP.with(|c| c.set("L5301"));
             let angle = dec.symbol(&mut cdfs.angle_delta[mode - V_PRED]);
             if angle != ANGLE_DELTA_ZERO {
                 return Err(unsupported(
@@ -5305,6 +5388,7 @@ fn decode_inter_block(
                 ));
             }
         }
+        crate::msac::CURRENT_OP.with(|c| c.set("L5308"));
         let uv_mode = dec.symbol(&mut cdfs.uv_mode_cfl[mode]);
         let alpha = if uv_mode == DC_PRED {
             None
@@ -5550,16 +5634,19 @@ fn decode_inter_block8(
     }
     let skip_mode_ctx =
         usize::from(neighbours.above_skip_mode[c]) + usize::from(neighbours.left_skip_mode[r]);
+    crate::msac::CURRENT_OP.with(|c| c.set("L5553"));
     let skip_mode = skip_mode_present && dec.symbol(&mut cdfs.skip_mode[skip_mode_ctx]) == 1;
     if skip_mode {
         SKIP_MODE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     let skip_ctx = usize::from(above_skip) + usize::from(left_skip);
+    crate::msac::CURRENT_OP.with(|c| c.set("L5559"));
     let skip = skip_mode || dec.symbol(&mut cdfs.skip[skip_ctx]) == 1;
 
     let (has_above, has_left) = (leaf_mi.0 > 0, leaf_mi.1 > 0);
     let ii_ctx = intra_inter_ctx(has_above, has_left, above_inter, left_inter);
+    crate::msac::CURRENT_OP.with(|c| c.set("L5563"));
     let is_inter = skip_mode || dec.symbol(&mut cdfs.intra_inter[ii_ctx]) == 1;
 
     let mode_for_tx;
@@ -5646,6 +5733,7 @@ fn decode_inter_block8(
                     && enable_masked_compound
                     && is_any_masked_compound_used_here(SIDE)
                 {
+                    crate::msac::CURRENT_OP.with(|c| c.set("L5649"));
                     dec.symbol(&mut cdfs.comp_group_idx[group_ctx])
                 } else {
                     0
@@ -5680,6 +5768,7 @@ fn decode_inter_block8(
                         ref_order_hints[(ref0 - LAST_FRAME) as usize],
                         ref_order_hints[(ref1 - LAST_FRAME) as usize],
                     );
+                    crate::msac::CURRENT_OP.with(|c| c.set("L5683"));
                     let idx = dec.symbol(&mut cdfs.compound_idx[idx_ctx]);
                     if idx == 1 {
                         (8, 8, 1u8)
@@ -5897,8 +5986,11 @@ fn decode_inter_block8(
             }
         }
         let sr_ctx = single_ref_ctx(above_inter || left_inter);
+        crate::msac::CURRENT_OP.with(|c| c.set("L5900"));
         let p1 = dec.symbol(&mut cdfs.single_ref[sr_ctx][0]);
+        crate::msac::CURRENT_OP.with(|c| c.set("L5901"));
         let p3 = dec.symbol(&mut cdfs.single_ref[sr_ctx][2]);
+        crate::msac::CURRENT_OP.with(|c| c.set("L5902"));
         let p4 = dec.symbol(&mut cdfs.single_ref[sr_ctx][3]);
         if (p1, p3, p4) != (0, 0, 0) {
             return Err(unsupported(
@@ -5918,6 +6010,7 @@ fn decode_inter_block8(
             mi_rows as usize,
         );
 
+        crate::msac::CURRENT_OP.with(|c| c.set("L5921"));
         let not_new = dec.symbol(&mut cdfs.new_mv[stack.new_mv_ctx]) == 1;
         let (mv, is_new_mv) = if !not_new {
             // NEWMV (spec 5.11.24's `read_drl_idx`, `RefMvIdx` starting at 0):
@@ -5928,6 +6021,7 @@ fn decode_inter_block8(
             // -- entry 0 (`stack.pred_mv`) only when the loop never advances.
             let mut idx = 0usize;
             while idx < 2 && stack.entries.len() > idx + 1 {
+                crate::msac::CURRENT_OP.with(|c| c.set("L5931"));
                 if dec.symbol(&mut cdfs.drl_mode[stack.drl_ctx[idx]]) == 0 {
                     break;
                 }
@@ -5945,16 +6039,19 @@ fn decode_inter_block8(
                 true,
             )
         } else {
+            crate::msac::CURRENT_OP.with(|c| c.set("L5948"));
             let not_zero = dec.symbol(&mut cdfs.zero_mv[stack.zero_mv_ctx]) == 1;
             if !not_zero {
                 return Err(unsupported("GLOBALMV (round 3)"));
             }
+            crate::msac::CURRENT_OP.with(|c| c.set("L5952"));
             let nearest = dec.symbol(&mut cdfs.ref_mv[stack.ref_mv_ctx]) == 0;
             let mv = if nearest {
                 stack.nearest_mv
             } else {
                 let mut idx = 1usize;
                 while idx < 3 && stack.entries.len() > idx + 1 {
+                    crate::msac::CURRENT_OP.with(|c| c.set("L5958"));
                     if dec.symbol(&mut cdfs.drl_mode[stack.drl_ctx[idx]]) == 0 {
                         break;
                     }
@@ -6088,6 +6185,7 @@ fn decode_inter_block8(
             )?;
         }
     } else {
+        crate::msac::CURRENT_OP.with(|c| c.set("L6091"));
         let mode = dec.symbol(&mut cdfs.y_mode[SIZE_GROUP_8]);
         if mode >= 13 {
             return Err(unsupported(
@@ -6095,6 +6193,7 @@ fn decode_inter_block8(
             ));
         }
         if (V_PRED..=D67_PRED).contains(&mode) {
+            crate::msac::CURRENT_OP.with(|c| c.set("L6098"));
             let angle = dec.symbol(&mut cdfs.angle_delta[mode - V_PRED]);
             if angle != ANGLE_DELTA_ZERO {
                 return Err(unsupported(
@@ -6102,6 +6201,7 @@ fn decode_inter_block8(
                 ));
             }
         }
+        crate::msac::CURRENT_OP.with(|c| c.set("L6105"));
         let uv_mode = dec.symbol(&mut cdfs.uv_mode_cfl[mode]);
         if uv_mode != DC_PRED {
             return Err(unsupported(
@@ -6473,12 +6573,15 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
             );
             match (has_cols, has_rows) {
                 (true, true) => {
+                    crate::msac::CURRENT_OP.with(|c| c.set("L6476"));
                     dec.symbol(&mut cdfs.partition_w64[sb_ctx]);
                 }
                 (true, false) => {
+                    crate::msac::CURRENT_OP.with(|c| c.set("L6479"));
                     dec.symbol_fixed(&gather(&cdfs.partition_w64[sb_ctx], VERT_ALIKE));
                 }
                 (false, true) => {
+                    crate::msac::CURRENT_OP.with(|c| c.set("L6482"));
                     dec.symbol_fixed(&gather(&cdfs.partition_w64[sb_ctx], HORZ_ALIKE));
                 }
                 (false, false) => {}
@@ -6496,13 +6599,16 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                     has_half(r32 * BLOCK_MI, BLOCK_MI, mi_rows),
                 );
                 let part32 = if has_cols32 && has_rows32 {
+                    crate::msac::CURRENT_OP.with(|c| c.set("L6499"));
                     dec.symbol(&mut cdfs.partition_w32[ctx32])
                 } else {
                     match (has_cols32, has_rows32) {
                         (true, false) => {
+                            crate::msac::CURRENT_OP.with(|c| c.set("L6503"));
                             dec.symbol_fixed(&gather(&cdfs.partition_w32[ctx32], VERT_ALIKE));
                         }
                         (false, true) => {
+                            crate::msac::CURRENT_OP.with(|c| c.set("L6506"));
                             dec.symbol_fixed(&gather(&cdfs.partition_w32[ctx32], HORZ_ALIKE));
                         }
                         _ => {}
@@ -6571,6 +6677,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             let at16 = (sr, sc);
                             if has_cols16 && has_rows16 {
                                 let ctx16 = neighbours.partition_ctx(at16, SUB);
+                                crate::msac::CURRENT_OP.with(|c| c.set("L6574"));
                                 let part16 = dec.symbol(&mut cdfs.partition_w16[ctx16]);
                                 if part16 != PARTITION_NONE {
                                     return Err(unsupported(
@@ -6619,11 +6726,13 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             } else {
                                 let ctx16 = neighbours.partition_ctx(at16, SUB);
                                 if has_cols16 {
+                                    crate::msac::CURRENT_OP.with(|c| c.set("L6622"));
                                     dec.symbol_fixed(&gather(
                                         &cdfs.partition_w16[ctx16],
                                         VERT_ALIKE,
                                     ));
                                 } else {
+                                    crate::msac::CURRENT_OP.with(|c| c.set("L6627"));
                                     dec.symbol_fixed(&gather(
                                         &cdfs.partition_w16[ctx16],
                                         HORZ_ALIKE,
@@ -6640,6 +6749,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                 for (mr, mc) in leaf_positions {
                                     let leaf_mi = (mr as usize, mc as usize);
                                     let leaf_ctx = neighbours.partition_ctx_mi(leaf_mi, 8);
+                                    crate::msac::CURRENT_OP.with(|c| c.set("L6643"));
                                     let part8 = dec.symbol(&mut cdfs.partition_w8[leaf_ctx]);
                                     if part8 != PARTITION_NONE {
                                         return Err(unsupported(
