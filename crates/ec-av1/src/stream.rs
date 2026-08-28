@@ -182,18 +182,10 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         // `comp_mode` per block whenever this frame's own `reference_select`
         // header bit is set (spec 5.11.25), and refuse by name the blocks
         // that pick `COMPOUND_REFERENCE` -- two-reference motion
-        // compensation is not wired yet. `skip_mode` (spec 5.9.22) is a
-        // separate header bit `skip_mode_params()` only ever sets alongside
-        // `reference_select`, but never implied by it (an encoder may leave
-        // `skip_mode_present` false even with `reference_select` true); it
-        // still needs its own refusal since no block-level reader for it
-        // exists.
-        if header.skip_mode_present {
-            return Err(Error::unsupported(
-                "AV1 decode_stream",
-                "a frame with skip_mode_present set (this decoder never reads skip_mode)",
-            ));
-        }
+        // compensation is not wired yet. Round 14: `skip_mode` (spec 5.9.22)
+        // is wired at the block level too (forced NEAREST_NEARESTMV compound
+        // of `skip_mode_frame`, plain average blend), so the old blanket
+        // `skip_mode_present` refusal is gone.
         // `context_update_tile_id` (spec `decode_tile`/`exit_symbol`) names
         // which tile's end-of-tile adapted CDFs become the frame's own; this
         // decoder only ever decodes tile 0 (`tiles.first()` above), so a
@@ -348,6 +340,8 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 header.reference_select,
                 enable_masked_compound,
                 enable_jnt_comp,
+                header.skip_mode_present,
+                header.skip_mode_frame,
             )?
         };
         // Spec 7.20: `disable_frame_end_update_cdf` stores the frame's
@@ -2573,6 +2567,169 @@ mod tests {
             "SKIP {NAME}: {never_fired} attempts decoded fully (reference_select never drove a \
              block to COMPOUND_REFERENCE) and every other attempt hit a named refusal that never \
              reached comp_mode:\n{}",
+            refusals.join("\n")
+        );
+    }
+
+    /// lane-av1comp round 14's decisive gate for `skip_mode`: same
+    /// pin-on-mismatch pattern as [`a_real_aomenc_single_ref_gate`], proving
+    /// [`decode::skip_mode_hits`] actually advanced (a real block picked
+    /// `skip_mode`, not just that the frame header bit was set) and that the
+    /// resulting forced-compound `NEAREST_NEARESTMV` decode is still
+    /// pixel-exact against ffmpeg. `--auto-alt-ref=1 --lag-in-frames=16
+    /// --enable-fwd-kf=0` (backward references) plus
+    /// `--enable-ref-frame-mvs=0` (unimplemented temporal MV projection,
+    /// same as every other gate here) is aomenc's own requirement for
+    /// `skip_mode_present` to ever be considered at all (spec 5.9.22 needs
+    /// both a forward and a backward reference candidate).
+    #[test]
+    fn a_real_aomenc_stream_with_compound_references_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_stream_with_compound_references_decodes_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height, frame_count) = (64usize, 64usize, 24usize);
+        let mut refusals = Vec::new();
+        let mut never_fired = 0u32;
+        for attempt in 0..80u32 {
+            let seed = 42 + attempt % 40;
+            let duration = frame_count as f64 / 25.0;
+            let source =
+                format!("gradients=size={width}x{height}:seed={seed}:duration={duration}:rate=25");
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let args: Vec<&str> = vec![
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                "--cq-level=45",
+                "--cpu-used=0",
+                "--kf-max-dist=1000",
+                "--threads=1",
+                "--row-mt=0",
+                "--auto-alt-ref=1",
+                "--lag-in-frames=16",
+                "--enable-fwd-kf=0",
+                "--enable-order-hint=1",
+                "--enable-warped-motion=0",
+                "--enable-obmc=0",
+                "--enable-masked-comp=0",
+                "--enable-interintra-comp=0",
+                "--enable-onesided-comp=0",
+                "--enable-interintra-wedge=0",
+                "--enable-smooth-interintra=0",
+                "--enable-rect-partitions=0",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0",
+                "--enable-filter-intra=0",
+                "--enable-smooth-intra=0",
+                "--enable-paeth-intra=0",
+                "--enable-directional-intra=0",
+                "--enable-angle-delta=0",
+                "--enable-tx-size-search=0",
+                "--enable-cdef=0",
+                "--enable-restoration=0",
+                "--max-partition-size=32",
+                "--min-partition-size=32",
+                "--enable-palette=0",
+                "--enable-intrabc=0",
+                "--enable-cfl-intra=0",
+                "--enable-ref-frame-mvs=0",
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ];
+            let mut child = Command::new(aomenc_path())
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let before = decode::skip_mode_hits();
+            let frames = match decode_stream(&stream) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME} failed outright (seed {seed}): {msg}"
+                    );
+                    refusals.push(format!("seed {seed}: {msg}"));
+                    continue;
+                }
+                Ok(frames) => frames,
+            };
+            if decode::skip_mode_hits() == before {
+                never_fired += 1;
+                continue;
+            }
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
+            assert_eq!(frames.len(), frame_count);
+            let mismatched = frames
+                .iter()
+                .zip(&ffmpeg_frames)
+                .any(|(got, want)| got.y != want.y || got.u != want.u || got.v != want.v);
+            if mismatched {
+                if let Ok(path) = std::env::var("EC_AV1_GATE_DUMP") {
+                    std::fs::write(&path, &stream).expect("writing pinned stream");
+                    eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
+                }
+            }
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
+                assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
+            }
+            eprintln!(
+                "{NAME} FIRING seed {seed}: skip_mode hits advanced by {}",
+                decode::skip_mode_hits() - before
+            );
+            return;
+        }
+        eprintln!(
+            "SKIP {NAME}: {never_fired} attempts decoded but never fired skip_mode, and every \
+             other attempt hit a named refusal:\n{}",
             refusals.join("\n")
         );
     }
