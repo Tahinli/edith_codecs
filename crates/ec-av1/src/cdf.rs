@@ -1107,9 +1107,36 @@ pub const INTER_TX_TYPE_SET3_8: [u16; 3] = [4167, 32768, 0];
 
 // The inter-frame tables below (spec 9.4) support the syntax an inter block
 // needs: whether it is coded as intra at all, which reference frame and
-// motion vector it takes when it is not. Compound reference and compound
-// prediction are not among them -- this encoder never sets
-// `reference_select`, so their CDFs are never read.
+// motion vector it takes when it is not. The compound-reference tables
+// (`COMP_MODE`/`COMP_REF_TYPE`/`UNI_COMP_REF`/`COMP_REF`/`COMP_BWDREF` above)
+// read once a frame's `reference_select` header bit is set (lane-av1comp);
+// compound *prediction* itself -- `inter_compound_mode`, compound DRL, the
+// mvstack's dual-ref scan, and distance-weighted MC blending -- is not yet
+// ported, so a block that actually reads `COMPOUND_REFERENCE` still refuses.
+
+/// `default_inter_compound_mode_cdf` (entropymode.c): which of the eight
+/// `INTER_COMPOUND_MODES` (`NEAREST_NEARESTMV`..`NEW_NEWMV`) a compound
+/// block takes, indexed by `av1_mode_context_analyzer`'s `comp_ctx` (spec
+/// 5.11.24's `compound_mode`, libaom's `read_inter_compound_mode`) --
+/// lane-av1comp, symbol read only, not yet wired into MV assignment or MC.
+pub const INTER_COMPOUND_MODE: [[u16; 9]; 8] = [
+    [7760, 13823, 15808, 17641, 19156, 20666, 26891, 32768, 0],
+    [10730, 19452, 21145, 22749, 24039, 25131, 28724, 32768, 0],
+    [10664, 20221, 21588, 22906, 24295, 25387, 28436, 32768, 0],
+    [13298, 16984, 20471, 24182, 25067, 25736, 26422, 32768, 0],
+    [18904, 23325, 25242, 27432, 27898, 28258, 30758, 32768, 0],
+    [10725, 17454, 20124, 22820, 24195, 25168, 26046, 32768, 0],
+    [17125, 24273, 25814, 27492, 28214, 28704, 30592, 32768, 0],
+    [13046, 23214, 24505, 25942, 27435, 28442, 29330, 32768, 0],
+];
+
+/// `compound_mode_ctx_map` (`mvref_common.h`): folds a compound block's
+/// `new_mv_ctx`/`ref_mv_ctx` pair (row = `ref_mv_ctx >> 1`, column =
+/// `min(new_mv_ctx, COMP_NEWMV_CTXS - 1)`, `COMP_NEWMV_CTXS` = 5) down to
+/// the single `comp_ctx` [`INTER_COMPOUND_MODE`] is indexed by --
+/// `av1_mode_context_analyzer`'s compound branch.
+pub const COMPOUND_MODE_CTX_MAP: [[usize; 5]; 3] =
+    [[0, 1, 1, 1, 1], [1, 2, 3, 4, 4], [4, 4, 5, 6, 7]];
 
 /// `Default_Intra_Inter_Cdf` (spec 9.4): whether an inter frame's block is
 /// coded as intra, indexed by whether the block above and left are inter.
@@ -1148,6 +1175,91 @@ pub const SINGLE_REF: [[[u16; 3]; 6]; 3] = [
         [26875, 32768, 0],
         [30304, 32768, 0],
     ],
+];
+
+/// `default_skip_mode_cdfs` (entropymode.c, `SKIP_MODE_CONTEXTS` = 3): whether
+/// a block reads `skip_mode` (forced `NEAREST_NEARESTMV` compound, `skip`
+/// forced true, no residual) -- indexed by `av1_get_skip_mode_context`
+/// (`above.skip_mode + left.skip_mode`, `pred_common.h`), only read when this
+/// frame's own `skip_mode_present` header bit is set and the block is at
+/// least 8x8 both dims (`is_comp_ref_allowed`) -- lane-av1comp.
+pub const SKIP_MODE: [[u16; 3]; 3] = [[32621, 32768, 0], [20708, 32768, 0], [8127, 32768, 0]];
+
+/// `Default_Comp_Mode_Cdf` (spec 9.4, `default_comp_inter_cdf`): whether an
+/// inter block reads `SINGLE_REFERENCE` or `COMPOUND_REFERENCE` -- only
+/// reached once `read_ref_frames` knows the frame's `reference_select`
+/// header bit made the choice per-block instead of fixing it, indexed by
+/// `av1_get_reference_mode_context` (lane-av1comp).
+pub const COMP_MODE: [[u16; 3]; 5] = [
+    [26828, 32768, 0],
+    [24035, 32768, 0],
+    [12031, 32768, 0],
+    [10640, 32768, 0],
+    [2901, 32768, 0],
+];
+
+/// `Default_Comp_Ref_Type_Cdf` (spec 9.4, `default_comp_ref_type_cdf`):
+/// unidirectional vs. bidirectional compound reference pair, indexed by
+/// `av1_get_comp_reference_type_context`.
+pub const COMP_REF_TYPE: [[u16; 3]; 5] = [
+    [1198, 32768, 0],
+    [2070, 32768, 0],
+    [9166, 32768, 0],
+    [7499, 32768, 0],
+    [22475, 32768, 0],
+];
+
+/// `Default_Comp_Group_Idx_Cdf` (spec 9.4, libaom `default_comp_group_idx_cdfs`):
+/// whether a compound block's `comp_group_idx` picks masked compound (`1`)
+/// over the plain distance-weighted/simple-average blend (`0`), indexed by
+/// `get_comp_group_idx_context` -- only read when `seq.enable_masked_compound`
+/// and the block size is masked-compound-eligible (lane-av1comp).
+pub const COMP_GROUP_IDX: [[u16; 3]; 6] = [
+    [26607, 32768, 0],
+    [22891, 32768, 0],
+    [18840, 32768, 0],
+    [24594, 32768, 0],
+    [19934, 32768, 0],
+    [22674, 32768, 0],
+];
+
+/// `Default_Compound_Idx_Cdf` (spec 9.4, libaom `default_compound_idx_cdfs`):
+/// whether a compound block's `compound_idx` picks the simple average
+/// (`1`) or [`crate::compound::dist_wtd_comp_weight_assign`]'s distance
+/// weights (`0`), indexed by `get_comp_index_context` -- only read when
+/// `seq.enable_jnt_comp` (lane-av1comp).
+pub const COMPOUND_IDX: [[u16; 3]; 6] = [
+    [18244, 32768, 0],
+    [12865, 32768, 0],
+    [7053, 32768, 0],
+    [13259, 32768, 0],
+    [9334, 32768, 0],
+    [4644, 32768, 0],
+];
+
+/// `Default_Uni_Comp_Ref_Cdf` (spec 9.4, `default_uni_comp_ref_cdf`): the
+/// three binary decisions narrowing a unidirectional compound pair down to
+/// one of `{BWDREF,ALTREF}`/`{LAST,LAST2}`/`{LAST,LAST3}`/`{LAST,GOLDEN}`.
+pub const UNI_COMP_REF: [[[u16; 3]; 3]; 3] = [
+    [[5284, 32768, 0], [3865, 32768, 0], [3128, 32768, 0]],
+    [[23152, 32768, 0], [14173, 32768, 0], [15270, 32768, 0]],
+    [[31774, 32768, 0], [25120, 32768, 0], [26710, 32768, 0]],
+];
+
+/// `Default_Comp_Ref_Cdf` (spec 9.4, `default_comp_ref_cdf`): the three
+/// binary decisions narrowing a bidirectional pair's forward reference.
+pub const COMP_REF: [[[u16; 3]; 3]; 3] = [
+    [[4946, 32768, 0], [9468, 32768, 0], [1503, 32768, 0]],
+    [[19891, 32768, 0], [22441, 32768, 0], [15160, 32768, 0]],
+    [[30731, 32768, 0], [31059, 32768, 0], [27544, 32768, 0]],
+];
+
+/// `Default_Comp_Bwdref_Cdf` (spec 9.4, `default_comp_bwdref_cdf`): the two
+/// binary decisions narrowing a bidirectional pair's backward reference.
+pub const COMP_BWDREF: [[[u16; 3]; 2]; 3] = [
+    [[2235, 32768, 0], [1423, 32768, 0]],
+    [[17182, 32768, 0], [15175, 32768, 0]],
+    [[30606, 32768, 0], [30489, 32768, 0]],
 ];
 
 /// `Default_Y_Mode_Cdf` (spec 9.4): the thirteen luma intra modes of an inter
