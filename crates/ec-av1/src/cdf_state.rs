@@ -327,6 +327,12 @@ pub(crate) struct Cdfs {
     /// (`default_obmc_cdf`'s own `BLOCK_SIZES_ALL` indices 3/6/9/12 --
     /// this decoder only ever codes those four square sizes).
     pub obmc: [[u16; 3]; 4],
+    /// `motion_mode` (spec 5.11.24's `read_motion_mode`), the 3-symbol
+    /// `SIMPLE_TRANSLATION`/`OBMC_CAUSAL`/`WARPED_CAUSAL` alphabet read
+    /// instead of [`Self::obmc`] whenever `motion_mode_allowed` resolves to
+    /// `WARPED_CAUSAL`-eligible -- same square-bsize indexing as `obmc`.
+    /// lane-warp round 1.
+    pub motion_mode: [[u16; 4]; 4],
     /// `interintra`, indexed by `size_group_lookup[bsize]` -- see
     /// `cdf::INTERINTRA`'s own doc.
     pub interintra: [[u16; 3]; 4],
@@ -561,6 +567,7 @@ impl Cdfs {
         reset2(&mut self.comp_mode);
         reset2(&mut self.skip_mode);
         reset2(&mut self.obmc);
+        reset2(&mut self.motion_mode);
         reset2(&mut self.interintra);
         reset2(&mut self.inter_compound_mode);
         reset2(&mut self.comp_ref_type);
@@ -1003,6 +1010,7 @@ impl Cdfs {
             comp_bwdref: cdf::COMP_BWDREF,
             skip_mode: cdf::SKIP_MODE,
             obmc: cdf::OBMC,
+            motion_mode: cdf::MOTION_MODE,
             interintra: cdf::INTERINTRA,
             comp_group_idx: cdf::COMP_GROUP_IDX,
             compound_idx: cdf::COMPOUND_IDX,
