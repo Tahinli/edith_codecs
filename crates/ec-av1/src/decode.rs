@@ -154,6 +154,17 @@ pub(crate) fn skip_mode_hits() -> usize {
     SKIP_MODE_HITS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// lane-motionmode: how many blocks actually decoded `obmc_selected == true`
+/// (as opposed to just reaching an eligible `read_motion_mode` symbol read)
+/// -- the gate's own proof that a real aomenc `--enable-obmc=1` stream
+/// reached [`obmc_blend`], not just the header bit.
+static OBMC_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Current value of [`OBMC_HITS`].
+pub(crate) fn obmc_hits() -> usize {
+    OBMC_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// How many [`read_inter_compound_mode`] reads actually happened
 /// (lane-av1comp) -- proves a `COMPOUND_REFERENCE` block reached its own
 /// `compound_mode` symbol (past `comp_mode`/`comp_ref` and the compound
@@ -3959,6 +3970,263 @@ fn ref_planes<'a>(
     }
 }
 
+/// libaom `foreach_overlappable_nb_above` (`obmc.h`): walks the mi row
+/// directly above this block's own column span, one bordering block at a
+/// time (stepping by that neighbour's own `MiInfo::size`, which is always
+/// `<= 16` since no block this decoder ever codes exceeds 64x64), collecting
+/// every *inter* neighbour found (an intra or unset cell is skipped, one mi
+/// unit at a time, and does not itself count as a step). `max_neighbors`
+/// caller-bounds the scan: `1` for the eligibility check (any hit at all),
+/// `av1_build_obmc_inter_prediction`'s own `max_neighbor_obmc` table for the
+/// real blend pass. Round 1 corner-cut: libaom's own "4-wide block, treat as
+/// half of a chroma pair" merge (`obmc.h`'s `mi_step == 1` special case) is
+/// not ported -- no block this decoder codes is narrower than 8px, so it
+/// never fires here regardless of what a neighbour's own decoder was.
+fn overlappable_above(
+    grid: &MiGrid,
+    mi_row: usize,
+    mi_col: usize,
+    bw4: usize,
+    mi_cols: usize,
+    max_neighbors: usize,
+) -> Vec<(usize, usize, MiInfo)> {
+    let mut out = Vec::new();
+    if mi_row == 0 {
+        return out;
+    }
+    let end_col = (mi_col + bw4).min(mi_cols);
+    let mut col = mi_col;
+    while col < end_col && out.len() < max_neighbors {
+        let cell = grid.get(mi_row - 1, col);
+        let step = cell.map_or(1, |c| c.size).max(1);
+        if let Some(info) = cell {
+            if info.is_inter {
+                out.push((col - mi_col, step.min(end_col - col), *info));
+            }
+        }
+        col += step;
+    }
+    out
+}
+
+/// `foreach_overlappable_nb_left`'s left-column mirror of
+/// [`overlappable_above`] -- see its doc for the shared corner-cut.
+fn overlappable_left(
+    grid: &MiGrid,
+    mi_row: usize,
+    mi_col: usize,
+    bh4: usize,
+    mi_rows: usize,
+    max_neighbors: usize,
+) -> Vec<(usize, usize, MiInfo)> {
+    let mut out = Vec::new();
+    if mi_col == 0 {
+        return out;
+    }
+    let end_row = (mi_row + bh4).min(mi_rows);
+    let mut row = mi_row;
+    while row < end_row && out.len() < max_neighbors {
+        let cell = grid.get(row, mi_col - 1);
+        let step = cell.map_or(1, |c| c.size).max(1);
+        if let Some(info) = cell {
+            if info.is_inter {
+                out.push((row - mi_row, step.min(end_row - row), *info));
+            }
+        }
+        row += step;
+    }
+    out
+}
+
+/// `av1_get_obmc_mask` (`reconinter.c`): the per-position blend weight
+/// (`AOM_BLEND_A64` numerator, out of 64) for the neighbour's own
+/// contribution's *complement* -- i.e. `dst = (mask*orig + (64-mask)*nbr +
+/// 32) >> 6`, low near the shared border (heavier neighbour weight) rising
+/// to 64 (no neighbour contribution) away from it. Only the lengths this
+/// decoder's own overlap sizes ever produce (luma 8/16/32, chroma 4/8/16)
+/// are transcribed.
+fn obmc_mask(len: usize) -> &'static [u8] {
+    const M4: [u8; 4] = [39, 50, 59, 64];
+    const M8: [u8; 8] = [36, 42, 48, 53, 57, 61, 64, 64];
+    const M16: [u8; 16] = [
+        34, 37, 40, 43, 46, 49, 52, 54, 56, 58, 60, 61, 64, 64, 64, 64,
+    ];
+    const M32: [u8; 32] = [
+        33, 35, 36, 38, 40, 41, 43, 44, 45, 47, 48, 50, 51, 52, 53, 55, 56, 57, 58, 59, 60, 60,
+        61, 62, 64, 64, 64, 64, 64, 64, 64, 64,
+    ];
+    match len {
+        4 => &M4,
+        8 => &M8,
+        16 => &M16,
+        32 => &M32,
+        _ => unreachable!("obmc overlap length outside this decoder's own block-size range"),
+    }
+}
+
+/// A bordering block's own resolved interp filter kernel, `(h, v)` --
+/// mirrors [`resolve_interp_filter`]'s own return order from its stored
+/// `[u8; 2]` (`Neighbours::above_filter`/`left_filter`, `[sym0, sym1]` =
+/// `[v_sym, h_sym]`). Never calls `from_switchable_symbol` on the `[3, 3]`
+/// sentinel: that value is only ever stored for an intra neighbour (already
+/// excluded by [`overlappable_above`]/[`overlappable_left`]'s `is_inter`
+/// gate) or when `interp_fixed` is `Some` for the whole frame, handled here
+/// first.
+fn neighbour_filter(
+    interp_fixed: Option<mc::InterpFilterKind>,
+    sym: [u8; 2],
+) -> (mc::InterpFilterKind, mc::InterpFilterKind) {
+    if let Some(kind) = interp_fixed {
+        return (kind, kind);
+    }
+    (
+        mc::InterpFilterKind::from_switchable_symbol(sym[1] as usize),
+        mc::InterpFilterKind::from_switchable_symbol(sym[0] as usize),
+    )
+}
+
+/// One neighbour's own re-prediction over a `w`x`h` region, MC'd fresh
+/// against its own `mv`/reference/filter (libaom `av1_build_inter_predictor`
+/// under `av1_setup_build_prediction_by_{above,left}_pred`).
+#[allow(clippy::too_many_arguments)]
+fn obmc_neighbour_pred(
+    refplane: &PlaneBuf,
+    x: usize,
+    y: usize,
+    mv: (i32, i32),
+    w: usize,
+    h: usize,
+    luma: bool,
+    h_kind: mc::InterpFilterKind,
+    v_kind: mc::InterpFilterKind,
+) -> Vec<u8> {
+    let mut out = vec![0u8; w * h];
+    mc::predict_with_filters(
+        &refplane.data,
+        refplane.width,
+        refplane.true_width,
+        refplane.true_height,
+        mv_to_q4(x, mv.1, luma),
+        mv_to_q4(y, mv.0, luma),
+        w,
+        h,
+        h_kind,
+        v_kind,
+        &mut out,
+    );
+    out
+}
+
+/// Blends `tmp` into `dst` (stride `stride`) at `(ox, oy)`, mask varying by
+/// row (the above-neighbour pass, `aom_blend_a64_vmask`).
+fn obmc_blend_v(dst: &mut [u8], stride: usize, ox: usize, oy: usize, w: usize, h: usize, tmp: &[u8]) {
+    let mask = obmc_mask(h);
+    for row in 0..h {
+        let m = u32::from(mask[row]);
+        for col in 0..w {
+            let d = &mut dst[(oy + row) * stride + ox + col];
+            let t = u32::from(tmp[row * w + col]);
+            *d = ((m * u32::from(*d) + (64 - m) * t + 32) >> 6) as u8;
+        }
+    }
+}
+
+/// Blends `tmp` into `dst` at `(ox, oy)`, mask varying by column (the
+/// left-neighbour pass, `aom_blend_a64_hmask`).
+fn obmc_blend_h(dst: &mut [u8], stride: usize, ox: usize, oy: usize, w: usize, h: usize, tmp: &[u8]) {
+    let mask = obmc_mask(w);
+    for row in 0..h {
+        for col in 0..w {
+            let m = u32::from(mask[col]);
+            let d = &mut dst[(oy + row) * stride + ox + col];
+            let t = u32::from(tmp[row * w + col]);
+            *d = ((m * u32::from(*d) + (64 - m) * t + 32) >> 6) as u8;
+        }
+    }
+}
+
+/// `av1_build_obmc_inter_prediction` (libaom `reconinter.c`): re-predicts
+/// the overlap strip against each bordering above/left inter neighbour's own
+/// mv/ref/filter and blends it into this block's just-built single-reference
+/// prediction, luma then both 4:2:0 chroma planes -- above pass first, then
+/// left, each reading only the *original* prediction this function was
+/// handed (never the other pass's own output), matching libaom's own
+/// independence between the two. `max_neighbor_obmc`'s own cap table
+/// (`{0,1,2,3,4,4}` indexed by `mi_size_wide_log2`/`_high_log2`, this
+/// decoder's own square blocks always index the same value both ways) bounds
+/// how many bordering blocks actually get blended, separate from the
+/// eligibility scan's own unbounded ("any at all") walk.
+#[allow(clippy::too_many_arguments)]
+fn obmc_blend(
+    grid: &MiGrid,
+    neighbours: &Neighbours,
+    mi_row: usize,
+    mi_col: usize,
+    bw4: usize,
+    mi_rows: usize,
+    mi_cols: usize,
+    side: usize,
+    chroma_side: usize,
+    px: usize,
+    py: usize,
+    cpx: usize,
+    cpy: usize,
+    ref_y: &PlaneBuf,
+    ref_u: &PlaneBuf,
+    ref_v: &PlaneBuf,
+    other_refs: &RefSlots,
+    interp_fixed: Option<mc::InterpFilterKind>,
+    pred_y: &mut [u8],
+    pred_u: &mut [u8],
+    pred_v: &mut [u8],
+) -> Result<()> {
+    let max_neighbors = match bw4 {
+        1..=4 => 2,
+        5..=8 => 3,
+        _ => 4,
+    };
+    let overlap = side / 2;
+    let coverlap = overlap / 2;
+
+    for (off4, span4, nb) in overlappable_above(grid, mi_row, mi_col, bw4, mi_cols, max_neighbors)
+    {
+        // `Neighbours::above_filter` is indexed in `SUB`(16px)-wide columns
+        // (this decoder's own outer block-loop granularity), one step
+        // coarser than the mi(4px) units `overlappable_above` walks in --
+        // divide back down to that column.
+        let (h_kind, v_kind) = neighbour_filter(
+            interp_fixed,
+            neighbours.above_filter[(mi_col + off4) / SUB_MI as usize],
+        );
+        let (ny, nu, nv) = ref_planes(nb.ref_frame, ref_y, ref_u, ref_v, other_refs)?;
+        let (bw, bh, ox) = (span4 * 4, overlap, off4 * 4);
+        let tmp_y = obmc_neighbour_pred(ny, px + ox, py, nb.mv, bw, bh, true, h_kind, v_kind);
+        obmc_blend_v(pred_y, side, ox, 0, bw, bh, &tmp_y);
+        let (cbw, cbh, cox) = (bw / 2, coverlap, ox / 2);
+        let tmp_u = obmc_neighbour_pred(nu, cpx + cox, cpy, nb.mv, cbw, cbh, false, h_kind, v_kind);
+        obmc_blend_v(pred_u, chroma_side, cox, 0, cbw, cbh, &tmp_u);
+        let tmp_v = obmc_neighbour_pred(nv, cpx + cox, cpy, nb.mv, cbw, cbh, false, h_kind, v_kind);
+        obmc_blend_v(pred_v, chroma_side, cox, 0, cbw, cbh, &tmp_v);
+    }
+
+    for (off4, span4, nb) in overlappable_left(grid, mi_row, mi_col, bw4, mi_rows, max_neighbors) {
+        let (h_kind, v_kind) = neighbour_filter(
+            interp_fixed,
+            neighbours.left_filter[(mi_row + off4) / SUB_MI as usize],
+        );
+        let (ny, nu, nv) = ref_planes(nb.ref_frame, ref_y, ref_u, ref_v, other_refs)?;
+        let (bw, bh, oy) = (overlap, span4 * 4, off4 * 4);
+        let tmp_y = obmc_neighbour_pred(ny, px, py + oy, nb.mv, bw, bh, true, h_kind, v_kind);
+        obmc_blend_h(pred_y, side, 0, oy, bw, bh, &tmp_y);
+        let (cbw, cbh, coy) = (coverlap, bh / 2, oy / 2);
+        let tmp_u = obmc_neighbour_pred(nu, cpx, cpy + coy, nb.mv, cbw, cbh, false, h_kind, v_kind);
+        obmc_blend_h(pred_u, chroma_side, 0, coy, cbw, cbh, &tmp_u);
+        let tmp_v = obmc_neighbour_pred(nv, cpx, cpy + coy, nb.mv, cbw, cbh, false, h_kind, v_kind);
+        obmc_blend_h(pred_v, chroma_side, 0, coy, cbw, cbh, &tmp_v);
+    }
+    Ok(())
+}
+
 /// `is_any_masked_compound_used` (libaom `reconinter.h`), specialised to
 /// the square block sizes this decoder ever decodes (32/16/8, all
 /// `min(w,h) >= 8`, `is_comp_ref_allowed` true): `COMPOUND_DIFFWTD` is then
@@ -5015,6 +5283,48 @@ fn decode_inter_block(
                 };
                 (mv, false)
             };
+            // lane-motionmode round 1: `read_motion_mode` (spec 5.11.24;
+            // libaom `decodemv.c` read_inter_block_mode_info, ~1520-1528),
+            // placed right after MV assignment and before the switchable
+            // interp filter read below (`read_mb_interp_filter`, decodemv.c
+            // ~1600) -- libaom's own sequential order. `motion_mode_allowed`
+            // (`reconinter.h`) reduces, for every block this single-ref path
+            // reaches, to "does an inter neighbour border the above row or
+            // left column": `is_motion_variation_allowed_bsize` always holds
+            // (`side` is never below 16px on this path), `ref_frame[1] !=
+            // INTRA_FRAME` always holds (no interintra reader here),
+            // `is_motion_variation_allowed_compound` always holds (this is
+            // the single-ref branch), and `is_global_mv_block` never
+            // triggers (this decoder's global motion is always `IDENTITY`,
+            // so its warp `type` is never `> TRANSLATION`). A stream with
+            // `allow_warped_motion=1` is refused right at an eligible block
+            // rather than guessed at: `av1_findSamples`/`num_proj_ref` is
+            // not ported, so this decoder cannot tell a real
+            // `WARPED_CAUSAL`-eligible block (3-symbol `motion_mode_cdf`)
+            // from an `OBMC_CAUSAL`-only one (2-symbol `obmc_cdf`) whenever
+            // the header allows warp -- reading the wrong alphabet desyncs
+            // the tile.
+            let motion_mode_eligible = switchable_motion_mode
+                && !skip_mode
+                && (!overlappable_above(grid, mi_row, mi_col, bw4, mi_cols as usize, 1).is_empty()
+                    || !overlappable_left(grid, mi_row, mi_col, bw4, mi_rows as usize, 1)
+                        .is_empty());
+            let mut obmc_selected = false;
+            if motion_mode_eligible {
+                if allow_warped_motion {
+                    return Err(unsupported(
+                        "a motion-variation-eligible block under allow_warped_motion=1 \
+                         (round 1 only reads the 2-symbol obmc_cdf; telling OBMC_CAUSAL \
+                         from WARPED_CAUSAL needs av1_findSamples, not ported)",
+                    ));
+                }
+                // `default_obmc_cdf`'s own index: square bsize 8/16/32/64 -> 0/1/2/3.
+                let bsize_idx = (side.trailing_zeros() - 3) as usize;
+                obmc_selected = dec.symbol(&mut cdfs.obmc[bsize_idx]) == 1;
+                if obmc_selected {
+                    OBMC_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
             // spec `get_ref_filter_type`: a neighbour's own filter only feeds
             // this block's switchable_interp context when that neighbour coded
             // the SAME reference frame this block is about to read -- a
@@ -5119,6 +5429,32 @@ fn decode_inter_block(
                 v_filter,
                 &mut pred_v,
             );
+
+            if obmc_selected {
+                obmc_blend(
+                    grid,
+                    neighbours,
+                    mi_row,
+                    mi_col,
+                    bw4,
+                    mi_rows as usize,
+                    mi_cols as usize,
+                    side,
+                    chroma_side,
+                    px,
+                    py,
+                    cpx,
+                    cpy,
+                    ref_y,
+                    ref_u,
+                    ref_v,
+                    other_refs,
+                    interp_fixed,
+                    &mut pred_y,
+                    &mut pred_u,
+                    &mut pred_v,
+                )?;
+            }
 
             if skip {
                 y.reconstruct_mc(px, py, side, &pred_y, &vec![0i32; side * side]);
