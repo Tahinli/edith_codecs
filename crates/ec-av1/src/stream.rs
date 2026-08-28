@@ -138,28 +138,6 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 "a frame with segmentation enabled (this decoder never reads a per-block segment_id symbol)",
             ));
         }
-        // lane-av1golden7 r9: `apply_grain` (spec 7.18.3, the decoder-side
-        // synthesis `film_grain_params` drives) is never applied by this
-        // crate -- it returns the coded (denoised, for content aomenc's
-        // `--tune-content=film` re-grains) base picture unchanged. Traced
-        // live from `fixtures/golden6-mismatch.obu`: a frame-0 intra
-        // keyframe with `apply_grain=true` mismatched ffmpeg on 3855/4096
-        // luma pixels, all explained by missing synthetic grain (this
-        // decoder's smooth prediction+residual output visually matches
-        // ffmpeg's grain-textured one; pixel-exact only where the grain
-        // scaling curve happens to hit zero). This is what a round-8 hunt
-        // mistook for a GOLDEN_FRAME-adjacent bug: the golden gate only
-        // ever compares streams where `non_last_ref_hits` fired, and
-        // `--tune-content=film` (which turns grain synthesis on) is part of
-        // that same gate's own aomenc recipe -- pure survivor bias, not
-        // causation. Refuse by name rather than silently return a
-        // grain-free picture.
-        if header.film_grain.apply_grain {
-            return Err(Error::unsupported(
-                "AV1 decode_stream",
-                "a frame with apply_grain set (this decoder never synthesizes film grain, spec 7.18.3)",
-            ));
-        }
         // Loop restoration carries per-restoration-unit symbols in the tile
         // (spec 5.11.57 `read_lr`, one group per LR unit reached from the
         // superblock walk) that this decoder never reads -- same
@@ -336,10 +314,22 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         for i in 0..NUM_REF_FRAMES {
             if header.refresh_frame_flags & (1 << i) != 0 {
                 cdf_slots[i] = Some(stored_cdfs.clone());
+                // Spec 7.18.3.1: synthesized grain is never stored for later
+                // prediction -- the reference bank always keeps the clean,
+                // pre-grain decode, even though the frame pushed onto the
+                // caller's output below carries the grained picture.
                 ref_slots[i] = Some(picture.clone());
             }
         }
-        pictures.push(picture);
+        let output = if header.film_grain.apply_grain {
+            let mc_identity = parser
+                .sequence_header()
+                .is_some_and(|seq| seq.color_config.matrix_coefficients == 0);
+            crate::film_grain::apply_grain(&picture, &header.film_grain, mc_identity)
+        } else {
+            picture
+        };
+        pictures.push(output);
     }
     Ok(pictures)
 }
@@ -2406,22 +2396,143 @@ mod tests {
     /// lane-av1golden7 r9's decisive fixture: a real aomenc stream (seed 59,
     /// `--tune-content=film`, GOLDEN_FRAME firing downstream) whose frame-0
     /// *intra keyframe* mismatched ffmpeg on 3855/4096 luma pixels -- traced
-    /// to `apply_grain=true` (spec 7.18.3 grain synthesis, never
-    /// implemented here), entirely unrelated to GOLDEN_FRAME or frame
-    /// ordering. `decode_stream` now refuses `apply_grain` streams by name;
-    /// this pins that refusal rather than a silent grain-free mismatch.
+    /// to `apply_grain=true` (spec 7.18.3 grain synthesis, now implemented in
+    /// `crate::film_grain`), entirely unrelated to GOLDEN_FRAME or frame
+    /// ordering. Frames beyond 0 in this fixture hit an unrelated, pre-existing
+    /// gap (`decode_inter_block`'s GOLDEN_FRAME MC path, lane-av1golden7's own
+    /// `golden7-forwarding-mismatch.obu`), so this test truncates the stream to
+    /// the sequence header + frame-0 OBUs only -- exactly the span the
+    /// mismatch was traced to -- rather than reaching into `decode.rs`/`mc.rs`
+    /// to widen MC support, which is out of this lane's scope.
     #[test]
-    fn a_real_aomenc_stream_with_film_grain_refuses_by_name() {
+    fn a_real_aomenc_stream_with_film_grain_decodes_pixel_exact() {
+        if !have_ffmpeg() {
+            eprintln!("SKIP a_real_aomenc_stream_with_film_grain_decodes_pixel_exact: no ffmpeg");
+            return;
+        }
         let data = std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../fixtures/golden6-mismatch.obu"
         ))
         .unwrap();
-        let err = decode_stream(&data).expect_err("apply_grain stream must be refused");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("apply_grain"),
-            "expected an apply_grain refusal, got: {msg}"
-        );
+        // Truncate right after the first `Frame` OBU (the key frame): every
+        // byte up to there is sequence header + frame-0, which is a complete,
+        // independently decodable single-frame stream.
+        let mut parser = Av1Parser::new();
+        let mut pos = 0usize;
+        let mut frame0_end = None;
+        while pos < data.len() {
+            let obu = parser.parse_obu(&data[pos..]).unwrap();
+            pos += obu.total_size;
+            if matches!(obu.kind, ObuKind::Frame(..)) {
+                frame0_end = Some(pos);
+                break;
+            }
+        }
+        let data = &data[..frame0_end.expect("fixture has at least one frame OBU")];
+        let (width, height) = (64usize, 64usize);
+        let ffmpeg_frames = ffmpeg_decode_sequence(data, width, height, 1);
+        let decoded = decode_stream(data).unwrap();
+        assert_eq!(decoded.len(), 1);
+        let (got, want) = (&decoded[0], &ffmpeg_frames[0]);
+        assert_eq!(got.y, want.y, "frame 0 luma vs ffmpeg (film grain)");
+        assert_eq!(got.u, want.u, "frame 0 U vs ffmpeg (film grain)");
+        assert_eq!(got.v, want.v, "frame 0 V vs ffmpeg (film grain)");
+    }
+
+    /// A real-encoder sweep, not just the one pinned fixture above
+    /// (fixture-proves-symbol-not-signal class): several fresh
+    /// `--tune-content=film` draws at different seeds/content, each decoded
+    /// pixel-exact against ffmpeg's own AV1 decoder (which synthesizes grain
+    /// by default -- confirmed via `ffmpeg -h decoder=av1`, no
+    /// `-export_side_data`/grain-disable flag is passed anywhere in this
+    /// file).
+    #[test]
+    fn real_aomenc_film_grain_streams_decode_pixel_exact() {
+        if !have_ffmpeg() {
+            eprintln!("SKIP real_aomenc_film_grain_streams_decode_pixel_exact: no ffmpeg");
+            return;
+        }
+        let have_aomenc = Command::new("aomenc")
+            .arg("--help")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !have_aomenc {
+            eprintln!("SKIP real_aomenc_film_grain_streams_decode_pixel_exact: no aomenc");
+            return;
+        }
+        let (width, height) = (64usize, 48usize);
+        for seed in [1u64, 2, 3] {
+            let dir = std::env::temp_dir().join(format!(
+                "ec-av1-filmgrain-gate-{}-{seed}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let yuv_path = dir.join("in.yuv");
+            let obu_path = dir.join("out.obu");
+            let frames = 3usize;
+            let luma = width * height;
+            let chroma = luma / 4;
+            let mut yuv = Vec::with_capacity((luma + 2 * chroma) * frames);
+            for f in 0..frames {
+                let card = panned_test_card(width, height, ((f as i32 + seed as i32) * 5) as i64);
+                yuv.extend_from_slice(&card.y);
+                yuv.extend_from_slice(&card.u);
+                yuv.extend_from_slice(&card.v);
+            }
+            std::fs::write(&yuv_path, &yuv).unwrap();
+            let status = Command::new("aomenc")
+                .args([
+                    "--width",
+                    &width.to_string(),
+                    "--height",
+                    &height.to_string(),
+                    "--input-bit-depth=8",
+                    "--bit-depth=8",
+                    "--fps=25/1",
+                    "--limit",
+                    &frames.to_string(),
+                    "--tune-content=film",
+                    "--cpu-used=6",
+                    "--end-usage=q",
+                    "--cq-level=32",
+                    "--obu",
+                    "-o",
+                ])
+                .arg(&obu_path)
+                .arg(&yuv_path)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .expect("aomenc failed to start");
+            assert!(status.success(), "aomenc failed for seed {seed}");
+            let encoded = std::fs::read(&obu_path).unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+
+            let mut parser = ec_av1_syntax::Av1Parser::new();
+            let mut pos = 0usize;
+            let mut saw_grain = false;
+            while pos < encoded.len() {
+                let obu = parser.parse_obu(&encoded[pos..]).unwrap();
+                pos += obu.total_size;
+                if let ec_av1_syntax::ObuKind::Frame(header, _) = obu.kind
+                    && header.film_grain.apply_grain
+                {
+                    saw_grain = true;
+                }
+            }
+            assert!(saw_grain, "seed {seed}: aomenc did not turn on apply_grain");
+
+            let ffmpeg_frames = ffmpeg_decode_sequence(&encoded, width, height, frames);
+            let decoded = decode_stream(&encoded).unwrap();
+            assert_eq!(decoded.len(), frames, "seed {seed}");
+            for (i, (got, want)) in decoded.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(got.y, want.y, "seed {seed} frame {i} luma vs ffmpeg");
+                assert_eq!(got.u, want.u, "seed {seed} frame {i} U vs ffmpeg");
+                assert_eq!(got.v, want.v, "seed {seed} frame {i} V vs ffmpeg");
+            }
+        }
     }
 }
