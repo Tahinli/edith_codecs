@@ -3298,15 +3298,15 @@ mod tests {
         );
     }
 
-    /// lane-motionmode round 1: `--enable-warped-motion=1` must be a NAMED
-    /// refusal, never a silent mis-decode -- this decoder does not port
-    /// `av1_findSamples`/`num_proj_ref`, so it cannot tell `OBMC_CAUSAL`
-    /// from `WARPED_CAUSAL` at an eligible block once the header allows
-    /// warp (see `decode_inter_block`'s own `allow_warped_motion` refusal).
-    /// Every attempt across the seed sweep must either name the refusal or
-    /// decode pixel-exact (an eligible block simply never fired in that
-    /// attempt) -- a silent pixel mismatch here would mean the refusal
-    /// failed to fire on a stream that actually needed it.
+    /// lane-warp r5e (flipped from lane-motionmode r1's refuses-or-matches):
+    /// `--enable-warped-motion=1` streams must DECODE pixel-exact --
+    /// `av1_findSamples`/`num_proj_ref`, the 3-symbol `motion_mode` read,
+    /// the affine projection/filter, and the WARPED_CAUSAL interp-filter
+    /// derivation are all ported. A refusal naming warp, or any pixel
+    /// mismatch, fails the gate; refusals for OTHER named capabilities
+    /// (screen content tools) still skip that seed. The sweep must also
+    /// actually exercise warp (`warp_selected_hits > 0`) so a decoder that
+    /// silently stops selecting WARPED_CAUSAL cannot pass vacuously.
     #[test]
     fn a_real_aomenc_stream_with_warped_motion_refuses_or_matches() {
         const NAME: &str = "a_real_aomenc_stream_with_warped_motion_refuses_or_matches";
@@ -3322,7 +3322,11 @@ mod tests {
         let (width, height, frame_count) = (64usize, 64usize, 24usize);
         let mut named_refusals = 0u32;
         let mut matched = 0u32;
-        for attempt in 0..40u32 {
+        let n_attempts: u32 = std::env::var("EC_WARP_GATE_ATTEMPTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(40);
+        for attempt in 0..n_attempts {
             let seed = 42 + attempt;
             let duration = frame_count as f64 / 25.0;
             let source =
@@ -3366,6 +3370,7 @@ mod tests {
                 "--enable-order-hint=1",
                 "--enable-warped-motion=1",
                 "--enable-obmc=1",
+                "--tune-content=default",
                 "--enable-masked-comp=0",
                 "--enable-interintra-comp=0",
                 "--enable-onesided-comp=0",
@@ -3420,27 +3425,109 @@ mod tests {
                         msg.contains("unsupported"),
                         "{NAME} failed outright, not a named refusal (seed {seed}): {msg}"
                     );
+                    assert!(
+                        !msg.contains("warp"),
+                        "{NAME} refused on warp (seed {seed}) -- warp decode is ported, this \
+                         refusal must not exist: {msg}"
+                    );
                     named_refusals += 1;
+                    eprintln!("seed {seed} refusal (non-warp capability): {msg}");
                     continue;
                 }
                 Ok(frames) => frames,
             };
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
             assert_eq!(frames.len(), frame_count);
+            let mismatched = frames
+                .iter()
+                .zip(&ffmpeg_frames)
+                .any(|(got, want)| got.y != want.y || got.u != want.u || got.v != want.v);
+            if mismatched && let Ok(path) = std::env::var("EC_AV1_GATE_DUMP") {
+                std::fs::write(&path, &stream).expect("writing pinned stream");
+                eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
+            }
             for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                assert_eq!(
-                    got.y, want.y,
-                    "{NAME} frame {i} luma vs ffmpeg (seed {seed}) -- decoded without a named \
-                     refusal but mismatched, meaning the refusal failed to fire"
-                );
+                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
             }
             matched += 1;
         }
-        eprintln!(
-            "{NAME}: {named_refusals} named refusals, {matched} pixel-exact matches out of 40"
+        assert!(
+            matched > 0,
+            "{NAME}: every attempt refused on other capabilities; the gate never exercised warp"
         );
+        assert!(
+            crate::decode::warp_selected_hits() > 0,
+            "{NAME}: {matched} matches but zero WARPED_CAUSAL blocks fired -- the gate decodes \
+             warp streams without ever selecting warp, so it proves nothing about warp"
+        );
+        eprintln!(
+            "{NAME}: {named_refusals} non-warp refusals, {matched} pixel-exact matches out of {n_attempts}, warp_selected_hits={}",
+            crate::decode::warp_selected_hits()
+        );
+    }
+
+    /// Pinned streams captured by `EC_AV1_GATE_DUMP` off
+    /// `a_real_aomenc_stream_with_warped_motion_refuses_or_matches` -- each
+    /// one is a former mismatch, kept as a regression pin (warp-mismatch:
+    /// the WARPED_CAUSAL interp-read suppression; warp-flake-7: the same
+    /// suppression for skip_mode blocks; warp-flake-5: mvstack entry
+    /// clamping). `EC_AV1_GATE_DUMP_PIN` overrides to a single stream.
+    /// Deterministic and static -- `#[ignore]`d because the gitignored
+    /// fixtures dir may be absent; run manually.
+    #[test]
+    #[ignore = "reads pinned fixture paths under the gitignored fixtures dir; run manually"]
+    fn pinned_warp_stream_decodes_pixel_exact() {
+        if !have_ffmpeg() {
+            eprintln!("SKIP pinned_warp_stream_decodes_pixel_exact: no ffmpeg");
+            return;
+        }
+        let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures");
+        let paths: Vec<String> = match std::env::var("EC_AV1_GATE_DUMP_PIN") {
+            Ok(p) => vec![p],
+            Err(_) => ["warp-mismatch", "warp-flake-5", "warp-flake-7"]
+                .iter()
+                .map(|n| format!("{fixtures}/{n}.obu"))
+                .collect(),
+        };
+        for path in paths {
+            eprintln!("pin: {path}");
+            check_pinned_warp_stream(&path);
+        }
+    }
+
+    fn check_pinned_warp_stream(path: &str) {
+        use crate::decode::warp_selected_hits;
+        let stream = std::fs::read(path).expect("reading pinned stream");
+        let before = warp_selected_hits();
+        let frames = decode_stream(&stream).expect("pinned stream must decode");
+        eprintln!(
+            "warp_selected_hits before={before} after={}",
+            warp_selected_hits()
+        );
+        let ffmpeg_frames = ffmpeg_decode_sequence(&stream, 64, 64, 24);
+        for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+            if got.y != want.y {
+                for row in 0..64 {
+                    let mut line = String::new();
+                    for col in 0..64 {
+                        let d = got.y[row * 64 + col] as i32 - want.y[row * 64 + col] as i32;
+                        line.push(if d == 0 {
+                            '.'
+                        } else if d.abs() < 4 {
+                            'o'
+                        } else {
+                            'X'
+                        });
+                    }
+                    eprintln!("{line}");
+                }
+            }
+            assert_eq!(got.y, want.y, "frame {i} luma vs ffmpeg (pinned)");
+            assert_eq!(got.u, want.u, "frame {i} U vs ffmpeg (pinned)");
+            assert_eq!(got.v, want.v, "frame {i} V vs ffmpeg (pinned)");
+        }
     }
 
     /// `LAST2_FRAME`/`LAST3_FRAME` are just older slots in the same forward

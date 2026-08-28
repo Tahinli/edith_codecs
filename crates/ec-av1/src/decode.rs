@@ -42,6 +42,7 @@ use crate::transform::{TxType, dequant_and_inverse_typed};
 
 const PARTITION_NONE: usize = 0;
 const PARTITION_SPLIT: usize = 3;
+const PARTITION_HORZ_B: usize = 5;
 const SB_MI: u32 = 16;
 const BLOCK_MI: u32 = 8;
 
@@ -175,6 +176,19 @@ pub(crate) fn obmc_hits() -> usize {
 /// [`OBMC_HITS`] (both fire together on an 8x8 hit), lets the gate tell an
 /// 8x8-leaf OBMC block apart from a 16x16+ one.
 static OBMC_HITS_8: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// lane-warp round 1: how many blocks resolved `motion_mode_allowed` to
+/// `WARPED_CAUSAL`-eligible (3-symbol read, `num_proj_ref >= 1` under
+/// `allow_warped_motion`) AND the symbol actually decoded to `WARPED_CAUSAL`
+/// -- the gate's proof that a fixture really exercises the alphabet this
+/// round changed, even though the block itself still refuses (warp
+/// estimation/filter not ported).
+static WARP_SELECTED_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Current value of [`WARP_SELECTED_HITS`].
+pub(crate) fn warp_selected_hits() -> usize {
+    WARP_SELECTED_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Current value of [`OBMC_HITS_8`].
 pub(crate) fn obmc_hits_8() -> usize {
@@ -3629,9 +3643,9 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                 }
                             }
                             _ => {
-                                return Err(unsupported(
-                                    "a partition type this encoder never writes",
-                                ));
+                                return Err(unsupported(format!(
+                                    "a partition type this encoder never writes (value={part32})"
+                                )));
                             }
                         }
                     }
@@ -4105,6 +4119,182 @@ fn overlappable_left(
         row += step;
     }
     out
+}
+
+/// `has_top_right` (`av1/common/mvref_common.c`), reduced to the
+/// square-block, fixed-64px-superblock case this decoder ever reaches: no
+/// rectangular partition (`VERT`/`HORZ`/`_4`/`VERT_A`) ever produces an
+/// inter leaf here (`xd->width == xd->height` always), so libaom's own
+/// rect-partition branches (`xd->width < xd->height`, `xd->width >
+/// xd->height`, `PARTITION_VERT_A`) never fire and are dropped. `bs` is the
+/// block's own side in 4x4 (`mi`) units.
+fn has_top_right(mi_row: usize, mi_col: usize, bs: usize) -> bool {
+    let sb_mi_size = SB_MI as usize;
+    let mask_row = mi_row & (sb_mi_size - 1);
+    let mask_col = mi_col & (sb_mi_size - 1);
+    if bs > sb_mi_size {
+        return false;
+    }
+    let mut has_tr = !((mask_row & bs != 0) && (mask_col & bs != 0));
+    let mut b = bs;
+    while b < sb_mi_size {
+        if mask_col & b != 0 {
+            if (mask_col & (2 * b) != 0) && (mask_row & (2 * b) != 0) {
+                has_tr = false;
+                break;
+            }
+        } else {
+            break;
+        }
+        b <<= 1;
+    }
+    has_tr
+}
+
+/// `av1_findSamples` (`mvref_common.c`), full port: the up to
+/// `LEAST_SQUARES_SAMPLES_MAX` (8) above/left/top-left/top-right neighbour
+/// samples (`record_samples`) that share this block's own single reference
+/// frame and are themselves single-ref -- `mbmi->num_proj_ref` is
+/// `.len()` of the returned vec. `bw4` is the block's own side in 4x4 units
+/// (square, so also `bh4`; a real block's `xd->width`/`xd->height` in
+/// libaom are also mi units of that same square side here). Each sample's
+/// own `bw`/`bh` (fed to [`crate::warp::record_sample`]'s offset formula)
+/// come from the *neighbour* cell's own coded size, not this block's.
+#[allow(clippy::too_many_arguments)]
+fn find_samples(
+    grid: &MiGrid,
+    mi_row: usize,
+    mi_col: usize,
+    bw4: usize,
+    mi_cols: usize,
+    mi_rows: usize,
+    ref_frame: i8,
+) -> Vec<crate::warp::Sample> {
+    const MAX: usize = crate::warp::LEAST_SQUARES_SAMPLES_MAX;
+    let up_available = mi_row > 0;
+    let left_available = mi_col > 0;
+    let mut samples = Vec::with_capacity(MAX);
+    let single_ref_match = |info: &MiInfo| info.ref_frame == ref_frame && info.ref_frame1.is_none();
+    let mut do_tl = true;
+    let mut do_tr = true;
+    let rec = |info: &MiInfo, row_offset: i32, sign_r: i32, col_offset: i32, sign_c: i32| {
+        let nb_bw = (info.size * 4) as i32;
+        crate::warp::record_sample(nb_bw, nb_bw, info.mv, row_offset, sign_r, col_offset, sign_c)
+    };
+
+    'outer: {
+        if up_available {
+            let above = grid.get(mi_row - 1, mi_col);
+            let superblock_width = above.map_or(1, |c| c.size).max(1);
+            if bw4 <= superblock_width {
+                let col_offset = -((mi_col % superblock_width) as isize);
+                if col_offset < 0 {
+                    do_tl = false;
+                }
+                if col_offset + superblock_width as isize > bw4 as isize {
+                    do_tr = false;
+                }
+                if let Some(info) = above {
+                    if single_ref_match(info) {
+                        samples.push(rec(info, 0, -1, col_offset as i32, 1));
+                        if samples.len() >= MAX {
+                            break 'outer;
+                        }
+                    }
+                }
+            } else {
+                let mut i = 0usize;
+                let limit = bw4.min(mi_cols.saturating_sub(mi_col));
+                while i < limit {
+                    let cell = grid.get(mi_row - 1, mi_col + i);
+                    let sw = cell.map_or(1, |c| c.size).max(1);
+                    if let Some(info) = cell {
+                        if single_ref_match(info) {
+                            samples.push(rec(info, 0, -1, i as i32, 1));
+                            if samples.len() >= MAX {
+                                break 'outer;
+                            }
+                        }
+                    }
+                    i += sw;
+                }
+            }
+        }
+
+        if left_available {
+            let left = grid.get(mi_row, mi_col - 1);
+            let superblock_height = left.map_or(1, |c| c.size).max(1);
+            if bw4 <= superblock_height {
+                let row_offset = -((mi_row % superblock_height) as isize);
+                if row_offset < 0 {
+                    do_tl = false;
+                }
+                if let Some(info) = left {
+                    if single_ref_match(info) {
+                        samples.push(rec(info, row_offset as i32, 1, 0, -1));
+                        if samples.len() >= MAX {
+                            break 'outer;
+                        }
+                    }
+                }
+            } else {
+                let mut i = 0usize;
+                let limit = bw4.min(mi_rows.saturating_sub(mi_row));
+                while i < limit {
+                    let cell = grid.get(mi_row + i, mi_col - 1);
+                    let sh = cell.map_or(1, |c| c.size).max(1);
+                    if let Some(info) = cell {
+                        if single_ref_match(info) {
+                            samples.push(rec(info, i as i32, 1, 0, -1));
+                            if samples.len() >= MAX {
+                                break 'outer;
+                            }
+                        }
+                    }
+                    i += sh;
+                }
+            }
+        }
+
+        if do_tl && left_available && up_available {
+            if let Some(info) = grid.get(mi_row - 1, mi_col - 1) {
+                if single_ref_match(info) {
+                    samples.push(rec(info, 0, -1, 0, -1));
+                    if samples.len() >= MAX {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+
+        if do_tr && has_top_right(mi_row, mi_col, bw4) {
+            let tr_col = mi_col + bw4;
+            if mi_row > 0 && tr_col < mi_cols {
+                if let Some(info) = grid.get(mi_row - 1, tr_col) {
+                    if single_ref_match(info) {
+                        samples.push(rec(info, 0, -1, bw4 as i32, 1));
+                    }
+                }
+            }
+        }
+    }
+    samples
+}
+
+/// `mbmi->num_proj_ref`: [`find_samples`]'s own count, all that
+/// `motion_mode_allowed` needs to pick the 3-symbol `motion_mode_cdf` over
+/// the 2-symbol `obmc_cdf` (spec 5.11.24).
+#[allow(clippy::too_many_arguments)]
+fn num_proj_ref(
+    grid: &MiGrid,
+    mi_row: usize,
+    mi_col: usize,
+    bw4: usize,
+    mi_cols: usize,
+    mi_rows: usize,
+    ref_frame: i8,
+) -> u8 {
+    find_samples(grid, mi_row, mi_col, bw4, mi_cols, mi_rows, ref_frame).len() as u8
 }
 
 /// `av1_get_obmc_mask` (`reconinter.c`): the per-position blend weight
@@ -4660,6 +4850,10 @@ fn decode_inter_block(
     // `allow_warped_motion` bits (spec 5.11.24's `read_motion_mode`).
     switchable_motion_mode: bool,
     allow_warped_motion: bool,
+    // lane-warp r5: set by the HORZ_B arm -- the 32x16 top strip is decoded
+    // as a square 32x32 block, which over-reads a residual unless coded
+    // `skip`; a non-skip strip must refuse cleanly instead of desyncing.
+    reject_residual: bool,
 ) -> Result<()> {
     let (r, c) = at;
     let (px, py) = (c * SUB, r * SUB);
@@ -4696,6 +4890,14 @@ fn decode_inter_block(
 
     let skip_ctx = usize::from(neighbours.above_skip[c]) + usize::from(neighbours.left_skip[r]);
     let skip = skip_mode || dec.symbol(&mut cdfs.skip[skip_ctx]) == 1;
+    // lane-warp r5: see `reject_residual` -- a square-block decode of a
+    // HORZ_B strip is symbol-exact only for `skip` (no residual, no
+    // motion_mode/warp symbol), so gate here before any further read.
+    if reject_residual && !skip {
+        return Err(unsupported(
+            "a non-skip 32x16 HORZ_B strip needs rectangular residual coding",
+        ));
+    }
 
     let (has_above, has_left) = (r > 0, c > 0);
     let (above_inter, left_inter) = (neighbours.above_inter[c], neighbours.left_inter[r]);
@@ -5107,12 +5309,16 @@ fn decode_inter_block(
             // (lane-av1blend r5) from its old position ahead of those reads,
             // which stole their bits for a Switchable-filter compound block
             // and desynced every symbol read after it in the tile.
+            // `av1_is_interp_needed` is also 0 for `skip_mode` blocks: the
+            // filter is derived (Regular), never read -- same
+            // conditional-read contract as the WARPED_CAUSAL suppression on
+            // the single-ref path below.
             let (h_filter, v_filter, resolved_filter) = resolve_interp_filter(
                 dec,
                 cdfs,
                 interp_fixed,
                 enable_dual_filter,
-                is_globalmv,
+                is_globalmv || skip_mode,
                 above_filter_ctx,
                 left_filter_ctx,
                 true,
@@ -5327,6 +5533,12 @@ fn decode_inter_block(
 
             let (mi_row, mi_col) = (r * SUB_MI as usize, c * SUB_MI as usize);
             let bw4 = side / 4;
+            // lane-warp r5d: `reject_residual` marks the HORZ_B arm's top
+            // strip, decoded as a square 32x32 block but truly 32x16 -- the
+            // mv stack must be queried with the block's REAL extent (libaom
+            // `av1_get_mv_refs` gets bw4=8, bh4=4), else scan_col, the
+            // corner probes and `clamp_mv_ref` all size a 32-tall block.
+            let bh4 = if reject_residual { bw4 / 2 } else { bw4 };
             // spec 7.10.2.8: only reached when the frame header set
             // `use_ref_frame_mvs` (`tpl_frame` is `Some` then, `None`
             // otherwise) -- `cur_offset_0` is this query block's own resolved
@@ -5346,7 +5558,7 @@ fn decode_inter_block(
                 mi_row,
                 mi_col,
                 bw4,
-                bw4,
+                bh4,
                 ref_frame,
                 mi_cols as usize,
                 mi_rows as usize,
@@ -5473,19 +5685,89 @@ fn decode_inter_block(
                     || !overlappable_left(grid, mi_row, mi_col, bw4, mi_rows as usize, 1)
                         .is_empty());
             let mut obmc_selected = false;
+            // lane-warp round 2: `Some` when motion_mode == WARPED_CAUSAL
+            // *and* the local warp estimate is valid (`!wm_params.invalid`,
+            // `av1_find_projection`) -- an invalid estimate falls back to
+            // this block's own translational mv, same as any other block
+            // (spec `allow_warp`/`reconinter.c` -- global warp is never the
+            // fallback here since this decoder's global motion is always
+            // IDENTITY).
+            let mut warp_params: Option<crate::warp::WarpParams> = None;
+            // Tracks the SYMBOL value, not projection validity: libaom's
+            // `av1_is_interp_needed` suppresses the interp-filter read for
+            // `motion_mode == WARPED_CAUSAL` even when the projection later
+            // falls back to translation. Its third suppressor,
+            // `is_nontrans_global_motion`, matches our unconditional
+            // `is_globalmv` only because this decoder codes global motion as
+            // IDENTITY (non-TRANSLATION) and never reads switchable filters
+            // below 8x8 -- porting TRANSLATION global motion must add the
+            // wmtype check here.
+            let mut warped_selected = false;
             if motion_mode_eligible {
-                if allow_warped_motion {
-                    return Err(unsupported(
-                        "a motion-variation-eligible block under allow_warped_motion=1 \
-                         (round 1 only reads the 2-symbol obmc_cdf; telling OBMC_CAUSAL \
-                         from WARPED_CAUSAL needs av1_findSamples, not ported)",
-                    ));
-                }
                 // `default_obmc_cdf`'s own index: square bsize 8/16/32/64 -> 0/1/2/3.
                 let bsize_idx = (side.trailing_zeros() - 3) as usize;
-                obmc_selected = dec.symbol(&mut cdfs.obmc[bsize_idx]) == 1;
-                if obmc_selected {
-                    OBMC_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // `motion_mode_allowed` reads the 3-symbol `motion_mode_cdf`
+                // instead of the 2-symbol `obmc_cdf` exactly when
+                // `num_proj_ref >= 1` under `allow_warped_motion`.
+                let warp_eligible = allow_warped_motion
+                    && num_proj_ref(grid, mi_row, mi_col, bw4, mi_cols as usize, mi_rows as usize, ref_frame) >= 1;
+                if warp_eligible {
+                    let mode = dec.symbol(&mut cdfs.motion_mode[bsize_idx]);
+                    match mode {
+                        0 => {}
+                        1 => {
+                            obmc_selected = true;
+                            OBMC_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        _ => {
+                            warped_selected = true;
+                            WARP_SELECTED_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let mut samples = find_samples(
+                                grid,
+                                mi_row,
+                                mi_col,
+                                bw4,
+                                mi_cols as usize,
+                                mi_rows as usize,
+                                ref_frame,
+                            );
+                            if std::env::var_os("EC_WARP_DEBUG").is_some() {
+                                eprintln!(
+                                    "EC_WARP_DEBUG findSamples mi_row={mi_row} mi_col={mi_col} bsize={side} num_proj_ref={}",
+                                    samples.len()
+                                );
+                                for (i, s) in samples.iter().enumerate() {
+                                    eprintln!("EC_WARP_DEBUG sample[{i}] pts={:?} pts_inref={:?}", s.pts1, s.pts2);
+                                }
+                            }
+                            if samples.len() > 1 {
+                                crate::warp::select_samples(mv, &mut samples, side as i32, side as i32);
+                            }
+                            warp_params = crate::warp::find_projection(
+                                &samples,
+                                side as i32,
+                                side as i32,
+                                mv.1,
+                                mv.0,
+                                mi_row as i32,
+                                mi_col as i32,
+                            );
+                            if std::env::var_os("EC_WARP_DEBUG").is_some() {
+                                eprintln!(
+                                    "EC_WARP_DEBUG projection mi_row={mi_row} mi_col={mi_col} num_proj_ref(final)={} mv=({},{}) params={:?}",
+                                    samples.len(), mv.0, mv.1, warp_params
+                                );
+                                for (i, s) in samples.iter().enumerate() {
+                                    eprintln!("EC_WARP_DEBUG sample_used[{i}] pts={:?} pts_inref={:?}", s.pts1, s.pts2);
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    obmc_selected = dec.symbol(&mut cdfs.obmc[bsize_idx]) == 1;
+                    if obmc_selected {
+                        OBMC_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
             }
             if std::env::var_os("EC_AV1_TELL").is_some() {
@@ -5524,7 +5806,7 @@ fn decode_inter_block(
                 cdfs,
                 interp_fixed,
                 enable_dual_filter,
-                is_globalmv,
+                is_globalmv || warped_selected,
                 above_filter_ctx,
                 left_filter_ctx,
                 false,
@@ -5539,8 +5821,8 @@ fn decode_inter_block(
             }
             if std::env::var_os("EC_AV1_TRACE").is_some() {
                 eprintln!(
-                    "EC_TRACE mi_row={mi_row} mi_col={mi_col} skip={} is_inter=1 mv=({},{}) is_new_mv={is_new_mv} bsize={side} ref={ref_frame} filter={:?} motion_mode_eligible={} obmc_selected={} tell={}",
-                    skip as u8, mv.0, mv.1, block_filter, motion_mode_eligible as u8, obmc_selected as u8, dec.debug_bitpos()
+                    "EC_TRACE mi_row={mi_row} mi_col={mi_col} skip={} is_inter=1 mv=({},{}) is_new_mv={is_new_mv} bsize={side} ref={ref_frame} filter={:?} motion_mode_eligible={} obmc_selected={} warped={} tell={}",
+                    skip as u8, mv.0, mv.1, block_filter, motion_mode_eligible as u8, obmc_selected as u8, warp_params.is_some() as u8, dec.debug_bitpos()
                 );
             }
             for dr in 0..bw4 {
@@ -5604,6 +5886,24 @@ fn decode_inter_block(
                 v_filter,
                 &mut pred_v,
             );
+
+            if let Some(params) = &warp_params {
+                crate::warp::warp_affine(
+                    params, &py_ref.data, py_ref.true_width as i32, py_ref.true_height as i32,
+                    py_ref.width as i32, &mut pred_y, px as i32, py as i32, side as i32,
+                    side as i32, side as i32, 0, 0,
+                );
+                crate::warp::warp_affine(
+                    params, &pu_ref.data, pu_ref.true_width as i32, pu_ref.true_height as i32,
+                    pu_ref.width as i32, &mut pred_u, cpx as i32, cpy as i32, chroma_side as i32,
+                    chroma_side as i32, chroma_side as i32, 1, 1,
+                );
+                crate::warp::warp_affine(
+                    params, &pv_ref.data, pv_ref.true_width as i32, pv_ref.true_height as i32,
+                    pv_ref.width as i32, &mut pred_v, cpx as i32, cpy as i32, chroma_side as i32,
+                    chroma_side as i32, chroma_side as i32, 1, 1,
+                );
+            }
 
             if obmc_selected {
                 obmc_blend(
@@ -6445,18 +6745,36 @@ fn decode_inter_block8(
                 || !overlappable_left(grid, mi_row, mi_col, 2, mi_rows as usize, 1).is_empty());
         let mut obmc_selected = false;
         if motion_mode_eligible {
-            if allow_warped_motion {
-                return Err(unsupported(
-                    "a motion-variation-eligible 8x8 leaf under allow_warped_motion=1 \
-                     (round 3 only reads the 2-symbol obmc_cdf; telling OBMC_CAUSAL \
-                     from WARPED_CAUSAL needs av1_findSamples, not ported)",
-                ));
-            }
-            // `default_obmc_cdf`'s own index: square bsize 8/16/32/64 -> 0/1/2/3.
-            obmc_selected = dec.symbol(&mut cdfs.obmc[0]) == 1;
-            if obmc_selected {
-                OBMC_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                OBMC_HITS_8.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // lane-warp round 1: same 3-vs-2-symbol split as the 16x16+ leaf
+            // (see its own doc) -- this leaf is always `LAST_FRAME`-only
+            // (grid.set below hardcodes it).
+            let warp_eligible = allow_warped_motion
+                && num_proj_ref(grid, mi_row, mi_col, 2, mi_cols as usize, mi_rows as usize, LAST_FRAME) >= 1;
+            if warp_eligible {
+                let mode = dec.symbol(&mut cdfs.motion_mode[0]);
+                match mode {
+                    0 => {}
+                    1 => {
+                        obmc_selected = true;
+                        OBMC_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        OBMC_HITS_8.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    _ => {
+                        WARP_SELECTED_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return Err(unsupported(
+                            "an 8x8 leaf that coded WARPED_CAUSAL (motion_mode == 2): \
+                             av1_find_projection/the affine warp filter are not \
+                             ported, only motion_mode_allowed's alphabet choice is",
+                        ));
+                    }
+                }
+            } else {
+                // `default_obmc_cdf`'s own index: square bsize 8/16/32/64 -> 0/1/2/3.
+                obmc_selected = dec.symbol(&mut cdfs.obmc[0]) == 1;
+                if obmc_selected {
+                    OBMC_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    OBMC_HITS_8.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         }
         for dr in 0..2 {
@@ -7027,7 +7345,15 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
             );
             match (has_cols, has_rows) {
                 (true, true) => {
-                    dec.symbol(&mut cdfs.partition_w64[sb_ctx]);
+                    let part64 = dec.symbol(&mut cdfs.partition_w64[sb_ctx]);
+                    if std::env::var_os("EC_AV1_TRACE").is_some() {
+                        eprintln!(
+                            "TRACE partition_w64 mi=({},{}) ctx={sb_ctx} value={part64}",
+                            sb_r * SB_MI,
+                            sb_c * SB_MI
+                        );
+                    }
+                    let _ = part64;
                 }
                 (true, false) => {
                     dec.symbol_fixed(&gather(&cdfs.partition_w64[sb_ctx], VERT_ALIKE));
@@ -7050,7 +7376,23 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                     has_half(r32 * BLOCK_MI, BLOCK_MI, mi_rows),
                 );
                 let part32 = if has_cols32 && has_rows32 {
-                    dec.symbol(&mut cdfs.partition_w32[ctx32])
+                    if std::env::var_os("EC_AV1_TRACE").is_some() {
+                        eprintln!(
+                            "TRACE part32_pre mi=({},{}) rng={}",
+                            r32 * BLOCK_MI,
+                            c32 * BLOCK_MI,
+                            dec.debug_state().0
+                        );
+                    }
+                    let p = dec.symbol(&mut cdfs.partition_w32[ctx32]);
+                    if std::env::var_os("EC_AV1_TRACE").is_some() {
+                        eprintln!(
+                            "TRACE partition_w32 mi=({},{}) ctx={ctx32} value={p}",
+                            r32 * BLOCK_MI,
+                            c32 * BLOCK_MI
+                        );
+                    }
+                    p
                 } else {
                     match (has_cols32, has_rows32) {
                         (true, false) => {
@@ -7107,6 +7449,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             skip_mode_frame,
                             switchable_motion_mode,
                             allow_warped_motion,
+                            false,
                         )?;
                     }
                     PARTITION_SPLIT => {
@@ -7181,6 +7524,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     skip_mode_frame,
                                     switchable_motion_mode,
                                     allow_warped_motion,
+                                    false,
                                 )?;
                             } else {
                                 let ctx16 = neighbours.partition_ctx(at16, SUB);
@@ -7293,8 +7637,169 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             }
                         }
                     }
+                    PARTITION_HORZ_B => {
+                        // lane-warp r5: PARTITION_HORZ_B = 32x32 top strip +
+                        // 16x16 bottom-left + 16x16 bottom-right. aomenc
+                        // carves static regions into it; the strip is
+                        // decoded as a square 32x32 block: for a `skip`
+                        // block the symbol stream is identical to the true
+                        // 32x16 coding (no residual, no motion_mode/warp
+                        // symbol), and the square stamps it leaves over the
+                        // bottom half (neighbour arrays, skip/lf grids) are
+                        // re-stamped by the C/D leaves right after. The
+                        // mi-granular `left_side_mi` rows of a last-block-in-
+                        // tile strip leak 32-vs-16 only until the per-tile
+                        // `Neighbours::new` reset.
+                        let at32 = at;
+                        decode_inter_block(
+                            &mut dec,
+                            &mut cdfs,
+                            &mut neighbours,
+                            &mut grid,
+                            at32,
+                            BLOCK,
+                            mi_cols,
+                            mi_rows,
+                            &mut y,
+                            &mut u,
+                            &mut v,
+                            &ref_y,
+                            &ref_u,
+                            &ref_v,
+                            &ref_slots,
+                            &sign_bias_table,
+                            base_q_idx,
+                            TxbSet::Luma32,
+                            TxbSet::Luma32Inter,
+                            TxbSet::Chroma16,
+                            TX32,
+                            TX16,
+                            &scan32,
+                            &scan16,
+                            3,
+                            allow_high_precision_mv,
+                            force_integer_mv,
+                            interp_fixed,
+                            enable_dual_filter,
+                            tpl_frame.as_ref(),
+                            reference_select,
+                            enable_masked_compound,
+                            enable_interintra_compound,
+                            enable_jnt_comp,
+                            order_hint_bits,
+                            order_hint,
+                            ref_order_hints,
+                            skip_mode_present,
+                            skip_mode_frame,
+                            switchable_motion_mode,
+                            allow_warped_motion,
+                            true,
+                        )?;
+                        if (r32 * 2 + 1) as u32 * SUB_MI < mi_rows {
+                            decode_inter_block(
+                                &mut dec,
+                                &mut cdfs,
+                                &mut neighbours,
+                                &mut grid,
+                            (r32 as usize * 2 + 1, c32 as usize * 2),
+                                SUB,
+                                mi_cols,
+                                mi_rows,
+                                &mut y,
+                                &mut u,
+                                &mut v,
+                                &ref_y,
+                                &ref_u,
+                                &ref_v,
+                                &ref_slots,
+                                &sign_bias_table,
+                                base_q_idx,
+                                TxbSet::Luma16,
+                                if reduced_tx_set {
+                                    TxbSet::Luma16Inter
+                                } else {
+                                    TxbSet::Luma16InterSet1
+                                },
+                                TxbSet::Chroma8,
+                                TX16,
+                                TX8,
+                                &scan16,
+                                &scan8,
+                                2,
+                                allow_high_precision_mv,
+                                force_integer_mv,
+                                interp_fixed,
+                                enable_dual_filter,
+                                tpl_frame.as_ref(),
+                                reference_select,
+                                enable_masked_compound,
+                                enable_interintra_compound,
+                                enable_jnt_comp,
+                                order_hint_bits,
+                                order_hint,
+                                ref_order_hints,
+                                skip_mode_present,
+                                skip_mode_frame,
+                                switchable_motion_mode,
+                                allow_warped_motion,
+                                false,
+                            )?;
+                            if (c32 * 2 + 1) as u32 * SUB_MI < mi_cols {
+                                decode_inter_block(
+                                    &mut dec,
+                                    &mut cdfs,
+                                    &mut neighbours,
+                                    &mut grid,
+                                    (r32 as usize * 2 + 1, c32 as usize * 2 + 1),
+                                    SUB,
+                                    mi_cols,
+                                    mi_rows,
+                                    &mut y,
+                                    &mut u,
+                                    &mut v,
+                                    &ref_y,
+                                    &ref_u,
+                                    &ref_v,
+                                    &ref_slots,
+                                    &sign_bias_table,
+                                    base_q_idx,
+                                    TxbSet::Luma16,
+                                    if reduced_tx_set {
+                                        TxbSet::Luma16Inter
+                                    } else {
+                                        TxbSet::Luma16InterSet1
+                                    },
+                                    TxbSet::Chroma8,
+                                    TX16,
+                                    TX8,
+                                    &scan16,
+                                    &scan8,
+                                    2,
+                                    allow_high_precision_mv,
+                                    force_integer_mv,
+                                    interp_fixed,
+                                    enable_dual_filter,
+                                    tpl_frame.as_ref(),
+                                    reference_select,
+                                    enable_masked_compound,
+                                    enable_interintra_compound,
+                                    enable_jnt_comp,
+                                    order_hint_bits,
+                                    order_hint,
+                                    ref_order_hints,
+                                    skip_mode_present,
+                                    skip_mode_frame,
+                                    switchable_motion_mode,
+                                    allow_warped_motion,
+                                    false,
+                                )?;
+                            }
+                        }
+                    }
                     _ => {
-                        return Err(unsupported("a partition type this encoder never writes"));
+                        return Err(unsupported(format!(
+                            "a partition type this encoder never writes (value={part32})"
+                        )));
                     }
                 }
             }
@@ -8047,6 +8552,7 @@ mod tests {
             [0; 7],
             false,
             [0; 2],
+            false,
             false,
             false,
         )

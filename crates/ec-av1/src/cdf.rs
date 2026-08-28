@@ -1218,6 +1218,20 @@ pub const OBMC: [[u16; 3]; 4] = [
     [30128, 32768, 0],
 ];
 
+/// `default_motion_mode_cdf` (spec 9.4, `entropymode.c`), the square-bsize
+/// rows only (`BLOCK_8X8`/`16X16`/`32X32`/`64X64` -- indices 3/6/9/12 of
+/// libaom's `BLOCK_SIZES_ALL`, same square subset [`OBMC`] keeps): the
+/// 3-symbol `SIMPLE_TRANSLATION`/`OBMC_CAUSAL`/`WARPED_CAUSAL` alphabet
+/// `read_motion_mode` reads instead of [`OBMC`] whenever `motion_mode_allowed`
+/// (spec 5.11.24) resolves to `WARPED_CAUSAL`-eligible (`num_proj_ref >= 1`
+/// under `allow_warped_motion`) -- lane-warp round 1.
+pub const MOTION_MODE: [[u16; 4]; 4] = [
+    [7651, 24760, 32768, 0],
+    [19419, 26810, 32768, 0],
+    [26260, 29116, 32768, 0],
+    [29516, 30701, 32768, 0],
+];
+
 /// `default_interintra_cdf` (spec 9.4): `interintra`, indexed by
 /// `size_group_lookup[bsize]` (0..=3) -- read only when the sequence header's
 /// `enable_interintra_compound` is set and `is_interintra_allowed(mbmi)`
