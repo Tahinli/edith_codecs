@@ -4445,6 +4445,25 @@ fn decode_inter_block(
                      weighted/simple-average combine only, lane-av1comp",
                 ));
             }
+            // corner-cut (lane-av1comp r16): a real aomenc stream (fixtures/
+            // av1comp-r16-compound-mismatch.obu, seed 42) proved
+            // predict_compound_intermediate/combine_compound wrong by up to
+            // 4/255 in a ~30x32 patch of one 32x32 quadrant, spilling a few
+            // pixels into neighbours (loop-filter-shaped, not a desync --
+            // DRL/assign_compound_mv/dist_wtd_comp_weight_assign all cross-
+            // checked bit-for-bit against libaom decodemv.c/reconinter.c and
+            // matched). Root cause not yet isolated; refuse by name rather
+            // than ship a non-pixel-exact compound blend. Ceiling: r13/r14's
+            // MC plumbing above this line stays -- only the plain-average
+            // reconstruct is masked off again. Upgrade: bisect against the
+            // pinned fixture (frame 1, rows 16-31 cols 32-63).
+            return Err(unsupported(
+                "a COMPOUND_REFERENCE block using the plain/distance-weighted \
+                 average blend (comp_group_idx == 0) -- proven non-pixel-exact \
+                 against a real aomenc stream (lane-av1comp r16, see \
+                 av1comp-r16-compound-mismatch.obu)",
+            ));
+            #[allow(unreachable_code)]
             let (fwd_offset, bck_offset, compound_idx) = if !skip_mode && enable_jnt_comp {
                 let idx_ctx = get_comp_index_context(
                     neighbours,
@@ -5277,6 +5296,16 @@ fn decode_inter_block8(
                          weighted/simple-average combine only, lane-av1comp",
                     ));
                 }
+                // corner-cut (lane-av1comp r16): same non-pixel-exact plain-
+                // average defect as the 16x16 leaf's own mask above -- see
+                // that comment.
+                return Err(unsupported(
+                    "a COMPOUND_REFERENCE 8x8 leaf using the plain/distance-weighted \
+                     average blend (comp_group_idx == 0) -- proven non-pixel-exact \
+                     against a real aomenc stream (lane-av1comp r16, see \
+                     av1comp-r16-compound-mismatch.obu)",
+                ));
+                #[allow(unreachable_code)]
                 let (fwd_offset, bck_offset, compound_idx) = if !skip_mode && enable_jnt_comp {
                     let idx_ctx = get_comp_index_context(
                         neighbours,
