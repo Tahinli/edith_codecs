@@ -46,6 +46,7 @@ use crate::encode::Picture;
 pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
     let mut parser = Av1Parser::new();
     let mut pictures = Vec::new();
+    let mut pictures_decoded: usize = 0;
     // Spec 7.20/7.4: each of the 8 reference slots remembers the picture a
     // previous frame's `refresh_frame_flags` stored into it, exactly like the
     // CDF slots below -- `LAST_FRAME` names a slot via `ref_frame_idx[0]`,
@@ -421,6 +422,24 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 let _ = writeln!(f, "mv_joint {:?}", stored_cdfs.mv_joint);
             }
         }
+        // lane-comppin r3: decode-order (not display-order) dump of every
+        // frame's own post-deblock buffer -- the pre-existing pixel diff
+        // (`scratch_isolate_pinned_mismatch`) only ever compares *shown*
+        // frames, so a hidden reference (altref/bwdref) that DPB-corrupts a
+        // later shown frame is otherwise invisible; diff this byte-for-byte
+        // against `EC_AV1_POSTFILT_DUMP.fN` from the instrumented aomdec
+        // build to isolate whether the defect is in a hidden frame's own
+        // reconstruction or downstream of it.
+        if let Ok(path) = std::env::var("EC_AV1_DECODE_ORDER_DUMP") {
+            use std::io::Write;
+            let idx = pictures_decoded;
+            if let Ok(mut f) = std::fs::File::create(format!("{path}.f{idx}")) {
+                let _ = f.write_all(&picture.y);
+                let _ = f.write_all(&picture.u);
+                let _ = f.write_all(&picture.v);
+            }
+        }
+        pictures_decoded += 1;
         for i in 0..NUM_REF_FRAMES {
             if header.refresh_frame_flags & (1 << i) != 0 {
                 cdf_slots[i] = Some(stored_cdfs.clone());
