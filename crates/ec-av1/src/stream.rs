@@ -2549,6 +2549,17 @@ mod tests {
                     "--enable-palette=0",
                     "--enable-intrabc=0",
                     "--enable-cfl-intra=0",
+                    // Temporal MV projection (`use_ref_frame_mvs`) has no
+                    // decode path here (`mvstack.rs`'s documented corner-cut:
+                    // `zero_mv_ctx` and the mode-context GLOBALMV_OFFSET bit
+                    // are always computed as if it were off) -- this gate
+                    // isolates grain synthesis, so it must stay inside that
+                    // envelope like every other feature disabled above, not
+                    // silently decode a wrong mode context. Root cause of
+                    // this test's frame-1 mismatch: aomenc turns
+                    // `use_ref_frame_mvs` on by default once order hints are
+                    // enabled, unrelated to `--tune-content=film`.
+                    "--enable-ref-frame-mvs=0",
                     "--tune-content=film",
                     "--obu",
                     "-o",
