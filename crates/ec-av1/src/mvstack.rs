@@ -153,6 +153,10 @@ pub struct MiInfo {
     /// candidate's `bsize` regardless of whether it also casts a vote (that
     /// requires a ref-frame match, checked separately in `add_ref_mv_candidate`).
     pub size: usize,
+    /// The unit's height in 4x4 mi cells (== `size` for every square block;
+    /// differs only for rect partition strips, lane-rect r2). Row scans step
+    /// and weight by `size` (width), column scans by `size_h`.
+    pub size_h: usize,
 }
 
 /// The whole frame's `mi` grid, one [`MiInfo`] per 4x4 unit, in raster order.
@@ -472,7 +476,7 @@ fn scan_col(
             i += 1;
             continue;
         };
-        let n4 = info.size;
+        let n4 = info.size_h;
         let mut len = bh4.min(n4);
         if use_step_16 {
             len = len.max(4);
@@ -923,7 +927,7 @@ pub fn find_mv_stack_with_sign_bias(
         let mut idx = 0usize;
         while idx < mi_size && candidates.len() < MAX_MV_REF_CANDIDATES {
             let cand = grid.get(mi_row + idx, mi_col - 1);
-            let step = cand.map_or(1, |c| c.size).max(1);
+            let step = cand.map_or(1, |c| c.size_h).max(1);
             if let Some(c) = cand {
                 process_single_ref_mv_candidate(c, ref_frame, sign_bias_table, &mut candidates);
             }
@@ -1170,7 +1174,7 @@ fn scan_col_compound(
             i += 1;
             continue;
         };
-        let n4 = info.size;
+        let n4 = info.size_h;
         let mut len = bh4.min(n4);
         if use_step_16 {
             len = len.max(4);
@@ -1581,7 +1585,7 @@ pub fn find_mv_stack_compound(
             let mut idx = 0usize;
             while idx < mi_size {
                 let cand = grid.get(mi_row + idx, mi_col - 1);
-                let step = cand.map_or(1, |c| c.size).max(1);
+                let step = cand.map_or(1, |c| c.size_h).max(1);
                 if let Some(c) = cand {
                     process_compound_ref_mv_candidate(c, ref_frame, sign_bias_table, &mut lists);
                 }
@@ -1978,6 +1982,7 @@ mod tests {
             // so it never trips the extended-scan coverage boost -- these
             // tests only exercise the immediate/corner/top-right scans.
             size: 1,
+            size_h: 1,
         }
     }
 
@@ -2131,6 +2136,7 @@ mod tests {
                 mv: (4, 4),
                 is_new_mv: true,
                 size: 1,
+                size_h: 1,
             },
         );
         // Only the row matches (nearest_match == 1): newmv_count > 0 picks
@@ -2211,6 +2217,7 @@ mod tests {
                 mv,
                 is_new_mv: false,
                 size: 8,
+                size_h: 8,
             },
         );
 
@@ -2240,6 +2247,7 @@ mod tests {
             mv: (0, 0),
             is_new_mv: false,
             size: 8,
+            size_h: 8,
         }
     }
 
@@ -2256,6 +2264,7 @@ mod tests {
             mv,
             is_new_mv: false,
             size: 8,
+            size_h: 8,
         }
     }
 
@@ -2493,6 +2502,7 @@ mod tests {
             mv1: Some(mv1),
             is_new_mv: false,
             size: 1,
+            size_h: 1,
         }
     }
 
@@ -2513,6 +2523,7 @@ mod tests {
                 mv1: Some((9, 9)),
                 is_new_mv: false,
                 size: 1,
+                size_h: 1,
             },
         );
         // Exact pair match.
@@ -2613,6 +2624,7 @@ mod tests {
             mv1: None,
             is_new_mv: false,
             size: 1,
+            size_h: 1,
         };
         process_compound_ref_mv_candidate(&candidate, COMP_PAIR, &NO_SIGN_BIAS, &mut lists);
         assert_eq!(lists.ref_id[0], vec![(5, 5)]);
@@ -2639,6 +2651,7 @@ mod tests {
                 mv1: None,
                 is_new_mv: false,
                 size: 8,
+                size_h: 8,
             },
         );
         grid.set(
@@ -2652,6 +2665,7 @@ mod tests {
                 mv1: None,
                 is_new_mv: false,
                 size: 8,
+                size_h: 8,
             },
         );
 
