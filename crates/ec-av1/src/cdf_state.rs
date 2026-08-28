@@ -561,6 +561,7 @@ impl Cdfs {
         reset2(&mut self.comp_mode);
         reset2(&mut self.skip_mode);
         reset2(&mut self.obmc);
+        reset2(&mut self.interintra);
         reset2(&mut self.inter_compound_mode);
         reset2(&mut self.comp_ref_type);
         reset3(&mut self.uni_comp_ref);
