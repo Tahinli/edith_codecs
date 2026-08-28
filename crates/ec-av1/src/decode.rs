@@ -2499,6 +2499,12 @@ fn cdef_filter_block(
 // aomdec's EC_AV1_PREFILT_DUMP/EC_AV1_POSTFILT_DUMP) to `$var.f$idx` when
 // `var` is set. Remove with the rest of the r17 bisect scaffolding.
 static R17_DUMP_FRAME_IDX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+// r17 bisect scratch accessor for stream.rs's own debug prints -- shares the
+// same counter block-decode already reads. Remove with the rest of the r17
+// bisect scaffolding.
+pub fn r17_dump_frame_idx() -> usize {
+    R17_DUMP_FRAME_IDX.load(std::sync::atomic::Ordering::Relaxed)
+}
 fn r17_dump(var: &str, y: &PlaneBuf, u: &PlaneBuf, v: &PlaneBuf, idx: usize) {
     let Ok(base) = std::env::var(var) else {
         return;
@@ -4466,33 +4472,59 @@ fn decode_inter_block(
                      weighted/simple-average combine only, lane-av1comp",
                 ));
             }
-            // corner-cut (lane-av1comp r16/r17): a real aomenc stream
-            // (fixtures/av1comp-r16-compound-mismatch.obu, seed 42) proved
-            // predict_compound_intermediate/combine_compound wrong by up to
-            // 4/255 in a 32x32 quadrant, spilling a few pixels into
-            // neighbours. r16 called this "loop-filter-shaped"; r17
-            // FALSIFIED that -- dumping this decoder's own pre-deblock
-            // frame buffer (`r17_dump`, `EC_AV1_PREFILT_DUMP`) against
-            // aomdec's own `EC_AV1_PREFILT_DUMP` shows the same 32x32-
-            // quadrant mismatch already present *before* either decoder's
-            // loop filter runs (898/1024 px, rows 32-63 cols 32-63 of a
-            // 64x64 luma plane, frame index 2 zero-based / this decoder's
-            // 3rd frame) -- this is a `predict_compound_intermediate`/
-            // `combine_compound` reconstruction defect, not a deblock
-            // interaction. DRL/assign_compound_mv/dist_wtd_comp_weight_assign
-            // stay cross-checked bit-for-bit against libaom decodemv.c/
-            // reconinter.c (r16). Root cause still not isolated within this
-            // arithmetic; refuse by name rather than ship a non-pixel-exact
-            // compound blend. Ceiling: r13/r14's MC plumbing above this line
+            // corner-cut (lane-av1comp r16/r17, lane-av1blend r1): r16/r17
+            // called this a `predict_compound_intermediate`/`combine_compound`
+            // reconstruction defect. r1 FALSIFIED that hypothesis outright:
+            // unmasking and running the real gates
+            // (a_real_aomenc_stream_with_reference_select_reads_comp_mode_correctly,
+            // a_real_aomenc_stream_with_compound_references_decodes_pixel_exact)
+            // shows the plain-average blend is bit-exact *most of the time*
+            // -- `combine_compound`'s two-shift-in-one round2 was proven
+            // algebraically identical to libaom's separate
+            // `>>DIST_PRECISION_BITS`-then-`ROUND_POWER_OF_TWO` sequence
+            // (av1_dist_wtd_convolve_2d_c, convolve.c:402-415) for every
+            // input, and a whole-pel zero-MV compound block (mv0=mv1=(0,0),
+            // the common case a lag-in-frames GOP's hidden altref frames
+            // hit) reproduces aomdec's own pre-deblock `EC_AV1_PREFILT_DUMP`
+            // byte-for-byte for several consecutive frames.
+            //
+            // The real defect a live gate run isolated (seed 49,
+            // `fixtures/av1blend-r1-mismatch.obu`): decode-order frame 0
+            // (keyframe) and frame 1 (first hidden altref, `ref1 ==
+            // ALTREF_FRAME`) match aomdec's own pre-deblock dump byte for
+            // byte; decode-order frame 2 -- same shape, same zero MV, only
+            // difference `ref1 == BWDREF_FRAME` instead of `ALTREF_FRAME` --
+            // is the *first* frame to diverge (881/6144 luma+chroma bytes).
+            // Every later frame up through decode-order 9 also mismatches,
+            // *including* frame 8, whose four blocks are back to
+            // `ref1 == ALTREF_FRAME` only -- ruling out "BWDREF_FRAME's MC
+            // math is wrong" (that block's own math is proven exact) in
+            // favour of "the picture sitting in some DPB slot is already
+            // wrong by the time frame 2 reads it, and the corruption
+            // propagates through refresh_frame_flags into every later
+            // reference regardless of which named ref a later block picks".
+            // Frames 10 through 18 (once the GOP's lineage stops tracing
+            // back through the bad slot) are bit-exact again. This points at
+            // reference-slot bookkeeping (`ref_slots`/`refresh_frame_flags`
+            // in `stream.rs`'s `decode_stream`, or `ref_order_hints`/DPB
+            // indexing feeding `dist_wtd_comp_weight_assign`) around
+            // BWDREF_FRAME specifically, not at the MC/blend arithmetic in
+            // mc.rs. Not isolated further within lane-av1blend's budget --
+            // refuse by name rather than ship a blend that is right only
+            // sometimes. Ceiling: r13/r14's MC plumbing above this line
             // stays -- only the plain-average reconstruct is masked off
-            // again. Upgrade: bisect predict_compound_intermediate itself
-            // (subpel filter taps / rounding) against the pinned fixture's
-            // 3rd frame, quadrant rows 32-63 cols 32-63.
+            // again. Upgrade: instrument `ref_slots`/`refresh_frame_flags`
+            // per decode-order frame (which slot each `Frame` OBU refreshes,
+            // and which slot each `ref_frame_idx[BWDREF_FRAME - LAST_FRAME]`
+            // reads) against aomdec's own `RefCntBuffer` bookkeeping on
+            // `fixtures/av1blend-r1-mismatch.obu`, starting at decode-order
+            // frame 2.
             return Err(unsupported(
                 "a COMPOUND_REFERENCE block using the plain/distance-weighted \
                  average blend (comp_group_idx == 0) -- proven non-pixel-exact \
-                 against a real aomenc stream (lane-av1comp r16, see \
-                 av1comp-r16-compound-mismatch.obu)",
+                 against a real aomenc stream (lane-av1blend r1, see \
+                 av1blend-r1-mismatch.obu: a reference-slot bug, not an MC/blend \
+                 arithmetic bug -- see the comment above)",
             ));
             #[allow(unreachable_code)]
             let (fwd_offset, bck_offset, compound_idx) = if !skip_mode && enable_jnt_comp {
@@ -4552,6 +4584,20 @@ fn decode_inter_block(
             );
             let mut pred_y = vec![0u8; side * side];
             mc::combine_compound(&inter0_y, &inter1_y, fwd_offset, bck_offset, &mut pred_y);
+
+            // r17 bisect scratch: dump per-block compound state when this
+            // block overlaps the pinned fixture's bad quadrant (frame 2,
+            // rows 32-63 cols 32-63). Remove with the rest of the scaffolding.
+            if std::env::var("EC_AV1_COMPOUND_DEBUG").is_ok() {
+                let fidx = R17_DUMP_FRAME_IDX.load(std::sync::atomic::Ordering::Relaxed);
+                eprintln!(
+                    "leaf16 fidx={fidx} px={px} py={py} side={side} ref0={ref0} ref1={ref1} \
+                     mv0={mv0:?} mv1={mv1:?} filter={resolved_filter:?} \
+                     fwd={fwd_offset} bck={bck_offset} compound_idx={compound_idx} \
+                     pred_y[0..4]={:?}",
+                    &pred_y[0..4.min(pred_y.len())]
+                );
+            }
 
             let mut inter0_u = vec![0i32; chroma_side * chroma_side];
             mc::predict_compound_intermediate(
@@ -5327,16 +5373,16 @@ fn decode_inter_block8(
                          weighted/simple-average combine only, lane-av1comp",
                     ));
                 }
-                // corner-cut (lane-av1comp r16/r17): same non-pixel-exact
-                // plain-average reconstruction defect as the 16x16 leaf's
-                // own mask above (r17: falsified as loop-filter-shaped,
-                // isolated to predict_compound_intermediate/combine_compound
-                // itself) -- see that comment.
+                // corner-cut (lane-av1comp r16/r17, lane-av1blend r1): same
+                // reference-slot defect as the 16x16 leaf's own mask above
+                // (r1: falsified as an MC/blend math bug, isolated to a DPB
+                // slot/refresh_frame_flags issue around BWDREF_FRAME) -- see
+                // that comment.
                 return Err(unsupported(
                     "a COMPOUND_REFERENCE 8x8 leaf using the plain/distance-weighted \
                      average blend (comp_group_idx == 0) -- proven non-pixel-exact \
-                     against a real aomenc stream (lane-av1comp r16, see \
-                     av1comp-r16-compound-mismatch.obu)",
+                     against a real aomenc stream (lane-av1blend r1, see \
+                     av1blend-r1-mismatch.obu)",
                 ));
                 #[allow(unreachable_code)]
                 let (fwd_offset, bck_offset, compound_idx) = if !skip_mode && enable_jnt_comp {
@@ -5423,6 +5469,15 @@ fn decode_inter_block8(
                 );
                 let mut pred_y = vec![0u8; SIDE * SIDE];
                 mc::combine_compound(&inter0_y, &inter1_y, fwd_offset, bck_offset, &mut pred_y);
+
+                if std::env::var("EC_AV1_COMPOUND_DEBUG").is_ok() {
+                    let fidx = R17_DUMP_FRAME_IDX.load(std::sync::atomic::Ordering::Relaxed);
+                    eprintln!(
+                        "leaf8 fidx={fidx} px={px} py={py} ref0={ref0} ref1={ref1} \
+                         mv0={mv0:?} mv1={mv1:?} fwd={fwd_offset} bck={bck_offset} \
+                         compound_idx={compound_idx} pred_y={pred_y:?}"
+                    );
+                }
 
                 let mut inter0_u = vec![0i32; CHROMA_SIDE * CHROMA_SIDE];
                 mc::predict_compound_intermediate(
