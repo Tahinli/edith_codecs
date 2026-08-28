@@ -1114,6 +1114,30 @@ pub const INTER_TX_TYPE_SET3_8: [u16; 3] = [4167, 32768, 0];
 // mvstack's dual-ref scan, and distance-weighted MC blending -- is not yet
 // ported, so a block that actually reads `COMPOUND_REFERENCE` still refuses.
 
+/// `default_inter_compound_mode_cdf` (entropymode.c): which of the eight
+/// `INTER_COMPOUND_MODES` (`NEAREST_NEARESTMV`..`NEW_NEWMV`) a compound
+/// block takes, indexed by `av1_mode_context_analyzer`'s `comp_ctx` (spec
+/// 5.11.24's `compound_mode`, libaom's `read_inter_compound_mode`) --
+/// lane-av1comp, symbol read only, not yet wired into MV assignment or MC.
+pub const INTER_COMPOUND_MODE: [[u16; 9]; 8] = [
+    [7760, 13823, 15808, 17641, 19156, 20666, 26891, 32768, 0],
+    [10730, 19452, 21145, 22749, 24039, 25131, 28724, 32768, 0],
+    [10664, 20221, 21588, 22906, 24295, 25387, 28436, 32768, 0],
+    [13298, 16984, 20471, 24182, 25067, 25736, 26422, 32768, 0],
+    [18904, 23325, 25242, 27432, 27898, 28258, 30758, 32768, 0],
+    [10725, 17454, 20124, 22820, 24195, 25168, 26046, 32768, 0],
+    [17125, 24273, 25814, 27492, 28214, 28704, 30592, 32768, 0],
+    [13046, 23214, 24505, 25942, 27435, 28442, 29330, 32768, 0],
+];
+
+/// `compound_mode_ctx_map` (`mvref_common.h`): folds a compound block's
+/// `new_mv_ctx`/`ref_mv_ctx` pair (row = `ref_mv_ctx >> 1`, column =
+/// `min(new_mv_ctx, COMP_NEWMV_CTXS - 1)`, `COMP_NEWMV_CTXS` = 5) down to
+/// the single `comp_ctx` [`INTER_COMPOUND_MODE`] is indexed by --
+/// `av1_mode_context_analyzer`'s compound branch.
+pub const COMPOUND_MODE_CTX_MAP: [[usize; 5]; 3] =
+    [[0, 1, 1, 1, 1], [1, 2, 3, 4, 4], [4, 4, 5, 6, 7]];
+
 /// `Default_Intra_Inter_Cdf` (spec 9.4): whether an inter frame's block is
 /// coded as intra, indexed by whether the block above and left are inter.
 pub const INTRA_INTER: [[u16; 3]; 4] = [
