@@ -296,6 +296,9 @@ pub(crate) struct Cdfs {
     /// Whether a block reads `SINGLE_REFERENCE` or `COMPOUND_REFERENCE`
     /// (lane-av1comp, spec 5.11.25's `comp_mode`).
     pub comp_mode: [[u16; 3]; 5],
+    /// Which of the eight `INTER_COMPOUND_MODES` a `COMPOUND_REFERENCE`
+    /// block takes (lane-av1comp, spec 5.11.24's `compound_mode`).
+    pub inter_compound_mode: [[u16; 9]; 8],
     /// Unidirectional vs. bidirectional compound reference pair
     /// (lane-av1comp, spec 5.11.25's `comp_reference_type`).
     pub comp_ref_type: [[u16; 3]; 5],
@@ -513,6 +516,7 @@ impl Cdfs {
         reset2(&mut self.intra_inter);
         reset3(&mut self.single_ref);
         reset2(&mut self.comp_mode);
+        reset2(&mut self.inter_compound_mode);
         reset2(&mut self.comp_ref_type);
         reset3(&mut self.uni_comp_ref);
         reset3(&mut self.comp_ref);
@@ -942,6 +946,7 @@ impl Cdfs {
             intra_inter: cdf::INTRA_INTER,
             single_ref: cdf::SINGLE_REF,
             comp_mode: cdf::COMP_MODE,
+            inter_compound_mode: cdf::INTER_COMPOUND_MODE,
             comp_ref_type: cdf::COMP_REF_TYPE,
             uni_comp_ref: cdf::UNI_COMP_REF,
             comp_ref: cdf::COMP_REF,
@@ -1194,6 +1199,7 @@ mod tests {
         assert_eq!(cdfs.intra_inter, cdf::INTRA_INTER);
         assert_eq!(cdfs.single_ref, cdf::SINGLE_REF);
         assert_eq!(cdfs.comp_mode, cdf::COMP_MODE);
+        assert_eq!(cdfs.inter_compound_mode, cdf::INTER_COMPOUND_MODE);
         assert_eq!(cdfs.comp_ref_type, cdf::COMP_REF_TYPE);
         assert_eq!(cdfs.uni_comp_ref, cdf::UNI_COMP_REF);
         assert_eq!(cdfs.comp_ref, cdf::COMP_REF);

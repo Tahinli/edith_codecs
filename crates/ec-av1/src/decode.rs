@@ -144,6 +144,19 @@ pub(crate) fn comp_mode_hits() -> usize {
     COMP_MODE_HITS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// How many [`read_inter_compound_mode`] reads actually happened
+/// (lane-av1comp) -- proves a `COMPOUND_REFERENCE` block reached its own
+/// `compound_mode` symbol (past `comp_mode`/`comp_ref` and the compound
+/// mvstack build), not just that `comp_mode` fired. Still refused right
+/// after (no MV assignment or MC wired), so this only counts attempted
+/// reads.
+static COMPOUND_MODE_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Current value of [`COMPOUND_MODE_HITS`].
+pub(crate) fn compound_mode_hits() -> usize {
+    COMPOUND_MODE_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// How many query blocks folded in at least one temporal MV candidate
 /// (spec 7.10.2.8's `add_tpl_ref_mv`) so far in this process -- the
 /// temporal-MV gate's own firing counter (lane-av1tmvp).
@@ -3903,6 +3916,27 @@ fn read_compound_ref_frames(
     }
 }
 
+/// Spec 5.11.24's `compound_mode` (lane-av1comp): which of the eight
+/// `INTER_COMPOUND_MODES` (`NEAREST_NEARESTMV`..`NEW_NEWMV`, returned as
+/// `0..=7`) a `COMPOUND_REFERENCE` block takes, reached once
+/// [`read_comp_mode`] has already returned `COMPOUND_REFERENCE`. `ctx` is
+/// libaom's `av1_mode_context_analyzer`'s compound branch --
+/// `compound_mode_ctx_map[ref_mv_ctx >> 1][min(new_mv_ctx, COMP_NEWMV_CTXS
+/// - 1)]` (`mvref_common.h`) -- folded from [`crate::mvstack::
+/// find_mv_stack_compound`]'s own `new_mv_ctx`/`ref_mv_ctx`. The read symbol
+/// is not yet turned into an assigned MV pair or motion-compensated --
+/// lane-av1comp.
+fn read_inter_compound_mode(
+    dec: &mut SymbolDecoder,
+    cdfs: &mut Cdfs,
+    new_mv_ctx: usize,
+    ref_mv_ctx: usize,
+) -> u8 {
+    let ctx = cdf::COMPOUND_MODE_CTX_MAP[ref_mv_ctx >> 1][new_mv_ctx.min(4)];
+    COMPOUND_MODE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    dec.symbol(&mut cdfs.inter_compound_mode[ctx]) as u8
+}
+
 /// Decodes one square inter-frame block (32x32 whole or 16x16 leaf): skip,
 /// `is_inter`, then either the single-reference/MV-stack/motion-vector chain
 /// and motion-compensated reconstruction, or the inter frame's own intra
@@ -4004,7 +4038,7 @@ fn decode_inter_block(
                 uni: false,
             });
             if read_comp_mode(dec, cdfs, above_nbr, left_nbr) {
-                read_compound_ref_frames(
+                let (ref0, ref1) = read_compound_ref_frames(
                     dec,
                     cdfs,
                     above_nbr,
@@ -4012,9 +4046,47 @@ fn decode_inter_block(
                     neighbours.above_ref[c],
                     neighbours.left_ref[r],
                 );
+                let (mi_row, mi_col) = (r * SUB_MI as usize, c * SUB_MI as usize);
+                let bw4 = side / 4;
+                // spec 7.10.2.8, doubled per side (`CompoundTplArgs`): same
+                // `use_ref_frame_mvs` gating as the single-ref `tpl` build
+                // below, just one `get_relative_dist` per reference.
+                let comp_tpl = tpl_frame.map(|t| crate::mvstack::CompoundTplArgs {
+                    field: t.field,
+                    cur_offset_0: crate::motion_field::get_relative_dist(
+                        t.order_hint_bits,
+                        t.order_hint,
+                        t.ref_order_hints[(ref0 - LAST_FRAME) as usize],
+                    ),
+                    cur_offset_1: crate::motion_field::get_relative_dist(
+                        t.order_hint_bits,
+                        t.order_hint,
+                        t.ref_order_hints[(ref1 - LAST_FRAME) as usize],
+                    ),
+                    allow_high_precision_mv,
+                });
+                let comp_stack = crate::mvstack::find_mv_stack_compound(
+                    grid,
+                    mi_row,
+                    mi_col,
+                    bw4,
+                    bw4,
+                    (ref0, ref1),
+                    mi_cols as usize,
+                    mi_rows as usize,
+                    sign_bias_table,
+                    comp_tpl,
+                );
+                let _compound_mode = read_inter_compound_mode(
+                    dec,
+                    cdfs,
+                    comp_stack.new_mv_ctx,
+                    comp_stack.ref_mv_ctx,
+                );
                 return Err(unsupported(
-                    "a COMPOUND_REFERENCE block (comp_mode/comp_ref read correctly; \
-                     two-reference motion compensation is not wired yet -- lane-av1comp)",
+                    "a COMPOUND_REFERENCE block (comp_mode/comp_ref/inter_compound_mode read \
+                     correctly; compound DRL, MV assignment, and two-reference motion \
+                     compensation are not wired yet -- lane-av1comp)",
                 ));
             }
         }
@@ -5402,6 +5474,24 @@ mod tests {
     // one below. `sb_coeff_key_frame_tile`, what the real encoder writes, is
     // this decoder's one target, and the round-trip test below is against
     // that path with real quantised residual, not a synthetic all-DC frame.
+
+    /// [`cdf::COMPOUND_MODE_CTX_MAP`] folded by hand against libaom's
+    /// `av1_mode_context_analyzer` compound branch (`mvref_common.h`):
+    /// `comp_ctx = compound_mode_ctx_map[refmv_ctx >> 1][min(newmv_ctx, 4)]`
+    /// -- a few corner and interior points, not the whole 6x6 grid.
+    #[test]
+    fn compound_mode_ctx_map_matches_libaom_corners() {
+        assert_eq!(cdf::COMPOUND_MODE_CTX_MAP[0][0], 0);
+        assert_eq!(cdf::COMPOUND_MODE_CTX_MAP[0][4], 1);
+        assert_eq!(cdf::COMPOUND_MODE_CTX_MAP[1][0], 1);
+        assert_eq!(cdf::COMPOUND_MODE_CTX_MAP[1][3], 4);
+        assert_eq!(cdf::COMPOUND_MODE_CTX_MAP[2][2], 5);
+        assert_eq!(cdf::COMPOUND_MODE_CTX_MAP[2][4], 7);
+        // `ref_mv_ctx` up to 5 (`>> 1` = 2, the map's last row) and
+        // `new_mv_ctx` up to 5 (clamped to 4, `COMP_NEWMV_CTXS - 1`) are
+        // exactly the ranges `find_mv_stack_compound` produces.
+        assert_eq!(cdf::COMPOUND_MODE_CTX_MAP[5 >> 1][5usize.min(4)], 7);
+    }
 
     #[test]
     fn a_frame_with_no_mode_info_grid_is_refused() {
