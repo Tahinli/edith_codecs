@@ -1312,17 +1312,10 @@ fn combine_compound_candidates(lists: &CompoundRefLists) -> [((i32, i32), (i32, 
 /// only ever reads those two counts, regardless of which `MODE_CTX_REF_FRAMES`
 /// slot `mode_context` it's indexing.
 ///
-/// Deviation from libaom's real compound extension combine step
-/// (`setup_ref_mv_list`, ~line 715): when the stack already has exactly one
-/// entry, libaom compares the first combined candidate against that entry
-/// and *skips* adding it on a match (`is_dup`, no weight change) rather than
-/// folding it in; this port instead runs every combined candidate through
-/// [`add_compound_candidate`]'s ordinary dedup, which bumps the existing
-/// entry's weight on a match. Weight-only, never mv/rank -- affects `drl_ctx`
-/// (a `REF_CAT_LEVEL`-boosted entry crosses that threshold slightly earlier
-/// than real libaom would in this exact corner) but not `nearest_mv`/`near_mv`.
-/// Documented rather than fixed this round for budget; r5 or later should
-/// port the real `is_dup` check if a live compound gate's `drl_ctx` disagrees.
+/// The compound extension combine step (`setup_ref_mv_list`, ~line 700-754)
+/// and the temporal `add_tpl_ref_mv` fold-in (~line 341-433) are both exact
+/// ports of libaom's real behaviour as of r5 — see the inline comments at
+/// each site.
 #[allow(clippy::too_many_arguments)]
 pub fn find_mv_stack_compound(
     grid: &MiGrid,
@@ -1403,11 +1396,13 @@ pub fn find_mv_stack_compound(
     // `add_tpl_ref_mv`): the same projected field, read once per side of the
     // pair through the existing single-ref [`crate::motion_field::add_tpl_ref_mv`]
     // — each side's own `cur_offset` scales the *same* stored candidate to
-    // that side's reference frame. A combined pair candidate is only added
-    // when *both* sides land a projection (libaom folds a missing side to
-    // `(0,0)` rather than dropping the candidate entirely; this reduction
-    // drops it instead — a documented, conservative deviation: fewer
-    // candidates than the real bitstream, never more).
+    // that side's reference frame. libaom's real `add_tpl_ref_mv` looks up
+    // the stored `mfmv0`/`ref_frame_offset` pair exactly once per `(blk_row,
+    // blk_col)` and, if present, always projects it to *both* sides (the
+    // lookup itself never fails for one side and succeeds for the other);
+    // a missing side there is `INVALID_MV`/global-motion zero-fill, never a
+    // dropped candidate. Ported exactly: each side is read independently and
+    // a missing side zero-fills rather than vetoing the pair.
     let mut zero_mv_ctx = 0usize;
     if let Some(CompoundTplArgs {
         field,
@@ -1445,16 +1440,18 @@ pub fn find_mv_stack_compound(
                     cur_offset_1,
                     allow_high_precision_mv,
                 );
-                if let (Some(c0), Some(c1)) = (cand0, cand1) {
+                if cand0.is_some() || cand1.is_some() {
                     any_hit = true;
+                    let mv0 = cand0.map_or((0, 0), |c| c.mv);
+                    let mv1 = cand1.map_or((0, 0), |c| c.mv);
                     if blk_row == 0 && blk_col == 0 {
                         first_sample_missing = false;
-                        first_sample_far = c0.mv.0.abs() >= 16
-                            || c0.mv.1.abs() >= 16
-                            || c1.mv.0.abs() >= 16
-                            || c1.mv.1.abs() >= 16;
+                        first_sample_far = mv0.0.abs() >= 16
+                            || mv0.1.abs() >= 16
+                            || mv1.0.abs() >= 16
+                            || mv1.1.abs() >= 16;
                     }
-                    add_compound_candidate(&mut candidates, c0.mv, c1.mv, 2);
+                    add_compound_candidate(&mut candidates, mv0, mv1, 2);
                 }
                 blk_col += step_w;
             }
@@ -1552,9 +1549,31 @@ pub fn find_mv_stack_compound(
                 idx += step;
             }
         }
-        for (mv0, mv1) in combine_compound_candidates(&lists) {
-            if candidates.len() < MAX_MV_REF_CANDIDATES {
-                add_compound_candidate(&mut candidates, mv0, mv1, 2);
+        // libaom's real dedup (`setup_ref_mv_list` ~735-754): when the stack
+        // already has exactly one entry, compare only `comp_list[0]` against
+        // it and, on a match, take `comp_list[1]` instead (skip, no weight
+        // bump) — otherwise append `comp_list[0]` as a brand-new entry. When
+        // the stack is empty, both `comp_list[0]` and `comp_list[1]` are
+        // appended unconditionally, with no dedup check at all.
+        let comp_list = combine_compound_candidates(&lists);
+        if candidates.len() == 1 {
+            let (mv0, mv1) = if comp_list[0] == (candidates[0].mv0, candidates[0].mv1) {
+                comp_list[1]
+            } else {
+                comp_list[0]
+            };
+            candidates.push(CompoundStackEntry {
+                mv0,
+                mv1,
+                weight: 2,
+            });
+        } else if candidates.is_empty() {
+            for (mv0, mv1) in comp_list {
+                candidates.push(CompoundStackEntry {
+                    mv0,
+                    mv1,
+                    weight: 2,
+                });
             }
         }
     }
@@ -2420,19 +2439,23 @@ mod tests {
 
         let stack = find_mv_stack_compound(&grid, 2, 2, 2, 2, COMP_PAIR, 8, 8, &NO_SIGN_BIAS, None);
 
-        // Every extension-pass combo the four identical-pair neighbours can
-        // build also matches this same (mv0, mv1) pair, so
-        // [`add_compound_candidate`]'s dedup keeps it a single entry --
-        // this reduction's own deviation from libaom's real `is_dup`
-        // early-exit (which would skip the redundant combos rather than
-        // folding their weight in, see [`find_mv_stack_compound`]'s doc):
-        // both combined candidates the extension pass builds here land on
-        // this dedup path and bump the weight instead of no-opping.
-        assert_eq!(stack.entries.len(), 1);
-        // 2 above + 2 left cells, weight 2 each (size:1 floor), the
-        // REF_CAT_LEVEL boost every immediate-scan entry gets, plus the two
-        // extension-pass combos folded in above.
-        assert_eq!(stack.entries[0].weight, 8 + REF_CAT_LEVEL + 2 + 2);
+        // Exact libaom `is_dup` port: with exactly one entry already in the
+        // stack (the four identical-pair neighbours deduped by the
+        // immediate-scan pass), the extension combine step compares only
+        // `comp_list[0]` against that entry -- a match here, since both are
+        // built from the same identical-pair neighbours -- so it takes
+        // `comp_list[1]` (the *second* ref_id slot, still the same (mv0,
+        // mv1) pair) as a brand-new stack entry rather than folding weight
+        // into the existing one. Two entries, same pair, not merged.
+        assert_eq!(stack.entries.len(), 2);
+        assert_eq!(stack.entries[0].mv0, mv0);
+        assert_eq!(stack.entries[0].mv1, mv1);
+        // 2 above + 2 left cells, weight 2 each (size:1 floor), plus the
+        // REF_CAT_LEVEL boost every immediate-scan entry gets.
+        assert_eq!(stack.entries[0].weight, 8 + REF_CAT_LEVEL);
+        assert_eq!(stack.entries[1].mv0, mv0);
+        assert_eq!(stack.entries[1].mv1, mv1);
+        assert_eq!(stack.entries[1].weight, 2);
     }
 
     #[test]
