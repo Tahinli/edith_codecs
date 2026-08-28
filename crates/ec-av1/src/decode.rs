@@ -4319,7 +4319,9 @@ fn overlappable_left(
     let mut row = mi_row;
     while row < end_row && out.len() < max_neighbors {
         let cell = grid.get(row, mi_col - 1);
-        let step = cell.map_or(1, |c| c.size).max(1);
+        // Vertical walk steps by the neighbour's HEIGHT -- a 32x16 strip's
+        // width (8) would swallow the strip below it.
+        let step = cell.map_or(1, |c| c.size_h).max(1);
         if let Some(info) = cell {
             if info.is_inter {
                 out.push((row - mi_row, step.min(end_row - row), *info));
