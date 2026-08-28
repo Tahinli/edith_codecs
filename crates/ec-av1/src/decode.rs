@@ -2495,6 +2495,27 @@ fn cdef_filter_block(
 ///
 /// Ported from libaom's `av1/common/av1_loopfilter.c` (edge/level decision)
 /// and `aom_dsp/loopfilter.c` (the `aom_lpf_*` pixel kernels).
+// r17 bisect scratch: dump this frame's true-extent Y/U/V (same layout as
+// aomdec's EC_AV1_PREFILT_DUMP/EC_AV1_POSTFILT_DUMP) to `$var.f$idx` when
+// `var` is set. Remove with the rest of the r17 bisect scaffolding.
+static R17_DUMP_FRAME_IDX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+fn r17_dump(var: &str, y: &PlaneBuf, u: &PlaneBuf, v: &PlaneBuf, idx: usize) {
+    let Ok(base) = std::env::var(var) else {
+        return;
+    };
+    let mut out = Vec::new();
+    for r in 0..y.true_height {
+        out.extend_from_slice(&y.data[r * y.width..r * y.width + y.true_width]);
+    }
+    for r in 0..u.true_height {
+        out.extend_from_slice(&u.data[r * u.width..r * u.width + u.true_width]);
+    }
+    for r in 0..v.true_height {
+        out.extend_from_slice(&v.data[r * v.width..r * v.width + v.true_width]);
+    }
+    let _ = std::fs::write(format!("{base}.f{idx}"), out);
+}
+
 fn apply_deblock(
     y: &mut PlaneBuf,
     u: &mut PlaneBuf,
@@ -4445,18 +4466,28 @@ fn decode_inter_block(
                      weighted/simple-average combine only, lane-av1comp",
                 ));
             }
-            // corner-cut (lane-av1comp r16): a real aomenc stream (fixtures/
-            // av1comp-r16-compound-mismatch.obu, seed 42) proved
+            // corner-cut (lane-av1comp r16/r17): a real aomenc stream
+            // (fixtures/av1comp-r16-compound-mismatch.obu, seed 42) proved
             // predict_compound_intermediate/combine_compound wrong by up to
-            // 4/255 in a ~30x32 patch of one 32x32 quadrant, spilling a few
-            // pixels into neighbours (loop-filter-shaped, not a desync --
-            // DRL/assign_compound_mv/dist_wtd_comp_weight_assign all cross-
-            // checked bit-for-bit against libaom decodemv.c/reconinter.c and
-            // matched). Root cause not yet isolated; refuse by name rather
-            // than ship a non-pixel-exact compound blend. Ceiling: r13/r14's
-            // MC plumbing above this line stays -- only the plain-average
-            // reconstruct is masked off again. Upgrade: bisect against the
-            // pinned fixture (frame 1, rows 16-31 cols 32-63).
+            // 4/255 in a 32x32 quadrant, spilling a few pixels into
+            // neighbours. r16 called this "loop-filter-shaped"; r17
+            // FALSIFIED that -- dumping this decoder's own pre-deblock
+            // frame buffer (`r17_dump`, `EC_AV1_PREFILT_DUMP`) against
+            // aomdec's own `EC_AV1_PREFILT_DUMP` shows the same 32x32-
+            // quadrant mismatch already present *before* either decoder's
+            // loop filter runs (898/1024 px, rows 32-63 cols 32-63 of a
+            // 64x64 luma plane, frame index 2 zero-based / this decoder's
+            // 3rd frame) -- this is a `predict_compound_intermediate`/
+            // `combine_compound` reconstruction defect, not a deblock
+            // interaction. DRL/assign_compound_mv/dist_wtd_comp_weight_assign
+            // stay cross-checked bit-for-bit against libaom decodemv.c/
+            // reconinter.c (r16). Root cause still not isolated within this
+            // arithmetic; refuse by name rather than ship a non-pixel-exact
+            // compound blend. Ceiling: r13/r14's MC plumbing above this line
+            // stays -- only the plain-average reconstruct is masked off
+            // again. Upgrade: bisect predict_compound_intermediate itself
+            // (subpel filter taps / rounding) against the pinned fixture's
+            // 3rd frame, quadrant rows 32-63 cols 32-63.
             return Err(unsupported(
                 "a COMPOUND_REFERENCE block using the plain/distance-weighted \
                  average blend (comp_group_idx == 0) -- proven non-pixel-exact \
@@ -5296,9 +5327,11 @@ fn decode_inter_block8(
                          weighted/simple-average combine only, lane-av1comp",
                     ));
                 }
-                // corner-cut (lane-av1comp r16): same non-pixel-exact plain-
-                // average defect as the 16x16 leaf's own mask above -- see
-                // that comment.
+                // corner-cut (lane-av1comp r16/r17): same non-pixel-exact
+                // plain-average reconstruction defect as the 16x16 leaf's
+                // own mask above (r17: falsified as loop-filter-shaped,
+                // isolated to predict_compound_intermediate/combine_compound
+                // itself) -- see that comment.
                 return Err(unsupported(
                     "a COMPOUND_REFERENCE 8x8 leaf using the plain/distance-weighted \
                      average blend (comp_group_idx == 0) -- proven non-pixel-exact \
@@ -6348,7 +6381,10 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         }
     }
 
+    let r17_idx = R17_DUMP_FRAME_IDX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    r17_dump("EC_AV1_PREFILT_DUMP", &y, &u, &v, r17_idx);
     apply_deblock(&mut y, &mut u, &mut v, loop_filter, &neighbours);
+    r17_dump("EC_AV1_POSTFILT_DUMP", &y, &u, &v, r17_idx);
     apply_cdef(&mut y, &mut u, &mut v, cdef, &neighbours);
 
     let motion_field = build_motion_field(
