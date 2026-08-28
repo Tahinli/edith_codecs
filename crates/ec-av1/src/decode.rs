@@ -3766,6 +3766,15 @@ fn decode_inter_block(
         // stays refused by name until that's found.
         let (py_ref, pu_ref, pv_ref) = match ref_frame {
             LAST_FRAME => (ref_y, ref_u, ref_v),
+            GOLDEN_FRAME => match (golden_y, golden_u, golden_v) {
+                (Some(gy), Some(gu), Some(gv)) => (gy, gu, gv),
+                _ => {
+                    return Err(unsupported(
+                        "GOLDEN_FRAME selected with no golden picture at this frame's \
+                         ref_frame_idx[3] slot",
+                    ));
+                }
+            },
             _ => {
                 return Err(unsupported(
                     "a reference frame other than LAST_FRAME (LAST2/LAST3/GOLDEN/BWDREF/\
@@ -3788,7 +3797,6 @@ fn decode_inter_block(
             mi_cols as usize,
             mi_rows as usize,
         );
-
         let not_new = dec.symbol(&mut cdfs.new_mv[stack.new_mv_ctx]) == 1;
         let mut is_globalmv = false;
         let (mv, is_new_mv) = if !not_new {
@@ -3879,8 +3887,8 @@ fn decode_inter_block(
         globalmv_for_lf = is_globalmv;
         if std::env::var_os("EC_AV1_TRACE").is_some() {
             eprintln!(
-                "EC_TRACE mi_row={mi_row} mi_col={mi_col} skip={} is_inter=1 mv=({},{}) is_new_mv={is_new_mv} bsize={side}",
-                skip as u8, mv.0, mv.1
+                "EC_TRACE mi_row={mi_row} mi_col={mi_col} skip={} is_inter=1 mv=({},{}) is_new_mv={is_new_mv} bsize={side} ref={ref_frame} filter={:?}",
+                skip as u8, mv.0, mv.1, block_filter
             );
         }
         for dr in 0..bw4 {
