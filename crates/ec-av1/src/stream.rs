@@ -114,6 +114,12 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 picture
             };
             pictures.push(output);
+            if std::env::var("EC_AV1_COMPOUND_DEBUG").is_ok() {
+                eprintln!(
+                    "PUSH (show_existing_frame slot {slot}) pictures.len()={}",
+                    pictures.len()
+                );
+            }
             continue;
         }
         let ObuKind::Frame(header, tiles) = obu.kind else {
@@ -434,6 +440,18 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 picture
             };
             pictures.push(output);
+            if std::env::var("EC_AV1_COMPOUND_DEBUG").is_ok() {
+                eprintln!(
+                    "PUSH (shown-direct) pictures.len()={} <- decode.rs r17 fidx {}",
+                    pictures.len(),
+                    crate::decode::r17_dump_frame_idx()
+                );
+            }
+        } else if std::env::var("EC_AV1_COMPOUND_DEBUG").is_ok() {
+            eprintln!(
+                "HIDDEN frame decoded, not pushed <- decode.rs r17 fidx {}",
+                crate::decode::r17_dump_frame_idx()
+            );
         }
     }
     Ok(pictures)
