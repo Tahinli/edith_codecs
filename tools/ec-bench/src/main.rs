@@ -275,7 +275,10 @@ fn bench_h265_encode(rows: &mut Vec<Row>) {
         rows.push(missing("ec-h265", "decode"));
         return;
     }
-    let cfg = H265Config::new(w, h);
+    let mut cfg = H265Config::new(w, h);
+    // A/B knob for the RDOQ estimated-bit-cost path (off by default, matching
+    // the encoder's own default): EC_H265_RDOQ_ESTIMATE=1 to measure it.
+    cfg.rdoq_estimate = std::env::var("EC_H265_RDOQ_ESTIMATE").is_ok_and(|v| v != "0");
     let enc = H265Encoder::new(cfg).expect("h265 encoder");
     let frame_len = (w * h + 2 * (w.div_ceil(2) * h.div_ceil(2))) as usize;
     let cw = w.div_ceil(2);

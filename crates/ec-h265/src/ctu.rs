@@ -214,6 +214,7 @@ impl<'a> CtuEncoder<'a> {
         intra_nxn: bool,
         sign_hiding: bool,
         rdoq: bool,
+        rdoq_estimate: bool,
         transform_skip: bool,
         rqt: bool,
         cu64: bool,
@@ -242,7 +243,11 @@ impl<'a> CtuEncoder<'a> {
             transform_skip,
             rqt,
             cu64,
-            rdoq_enc: CabacEncoder::counter(Contexts::new(qp)),
+            rdoq_enc: {
+                let mut enc = CabacEncoder::counter(Contexts::new(qp));
+                enc.set_estimating(rdoq_estimate);
+                enc
+            },
             min_cb_log2: min_cb_log2.clamp(MIN_CB_LOG2, 5),
             modes: vec![255; (width / 4) * (ctb_size / 4)],
             depths: vec![0; (width / 4) * (ctb_size / 4)],

@@ -448,6 +448,9 @@ fn bd_psnr_vs_x265() {
         if let Ok(v) = std::env::var("EC_H265_RDOQ") {
             cfg.rdoq = v != "0";
         }
+        if let Ok(v) = std::env::var("EC_H265_RDOQ_ESTIMATE") {
+            cfg.rdoq_estimate = v != "0";
+        }
         if let Ok(v) = std::env::var("EC_H265_TSKIP") {
             cfg.transform_skip = if v != "0" {
                 TransformSkip::AlwaysFor4x4
