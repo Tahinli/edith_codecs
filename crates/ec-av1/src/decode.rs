@@ -5696,7 +5696,12 @@ fn decode_inter_block(
             // Tracks the SYMBOL value, not projection validity: libaom's
             // `av1_is_interp_needed` suppresses the interp-filter read for
             // `motion_mode == WARPED_CAUSAL` even when the projection later
-            // falls back to translation.
+            // falls back to translation. Its third suppressor,
+            // `is_nontrans_global_motion`, matches our unconditional
+            // `is_globalmv` only because this decoder codes global motion as
+            // IDENTITY (non-TRANSLATION) and never reads switchable filters
+            // below 8x8 -- porting TRANSLATION global motion must add the
+            // wmtype check here.
             let mut warped_selected = false;
             if motion_mode_eligible {
                 // `default_obmc_cdf`'s own index: square bsize 8/16/32/64 -> 0/1/2/3.
