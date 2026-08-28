@@ -4150,17 +4150,140 @@ fn has_top_right(mi_row: usize, mi_col: usize, bs: usize) -> bool {
     has_tr
 }
 
-/// `av1_findSamples`' sample *count* only (`mvref_common.c`): the number of
-/// above/left/top-left/top-right neighbours (up to `LEAST_SQUARES_SAMPLES_MAX
-/// = 8`) that share this block's own single reference frame and are
-/// themselves single-ref -- exactly `mbmi->num_proj_ref`. The actual sample
-/// coordinates (`record_samples`, `pts`/`pts_inref`) feed the warp parameter
-/// *estimation* (`av1_find_projection`), not ported this round -- only the
-/// count is needed to resolve `motion_mode_allowed`'s `WARPED_CAUSAL` vs
-/// `OBMC_CAUSAL` alphabet choice (spec 5.11.24), so that's all this port
-/// keeps. `bw4` is the block's own side in 4x4 units (square, so also
-/// `bh4`; a real block's `xd->width`/`xd->height` in libaom are also mi
-/// units of that same square side here).
+/// `av1_findSamples` (`mvref_common.c`), full port: the up to
+/// `LEAST_SQUARES_SAMPLES_MAX` (8) above/left/top-left/top-right neighbour
+/// samples (`record_samples`) that share this block's own single reference
+/// frame and are themselves single-ref -- `mbmi->num_proj_ref` is
+/// `.len()` of the returned vec. `bw4` is the block's own side in 4x4 units
+/// (square, so also `bh4`; a real block's `xd->width`/`xd->height` in
+/// libaom are also mi units of that same square side here). Each sample's
+/// own `bw`/`bh` (fed to [`crate::warp::record_sample`]'s offset formula)
+/// come from the *neighbour* cell's own coded size, not this block's.
+#[allow(clippy::too_many_arguments)]
+fn find_samples(
+    grid: &MiGrid,
+    mi_row: usize,
+    mi_col: usize,
+    bw4: usize,
+    mi_cols: usize,
+    mi_rows: usize,
+    ref_frame: i8,
+) -> Vec<crate::warp::Sample> {
+    const MAX: usize = crate::warp::LEAST_SQUARES_SAMPLES_MAX;
+    let up_available = mi_row > 0;
+    let left_available = mi_col > 0;
+    let mut samples = Vec::with_capacity(MAX);
+    let single_ref_match = |info: &MiInfo| info.ref_frame == ref_frame && info.ref_frame1.is_none();
+    let mut do_tl = true;
+    let mut do_tr = true;
+    let rec = |info: &MiInfo, row_offset: i32, sign_r: i32, col_offset: i32, sign_c: i32| {
+        let nb_bw = (info.size * 4) as i32;
+        crate::warp::record_sample(nb_bw, nb_bw, info.mv, row_offset, sign_r, col_offset, sign_c)
+    };
+
+    'outer: {
+        if up_available {
+            let above = grid.get(mi_row - 1, mi_col);
+            let superblock_width = above.map_or(1, |c| c.size).max(1);
+            if bw4 <= superblock_width {
+                let col_offset = -((mi_col % superblock_width) as isize);
+                if col_offset < 0 {
+                    do_tl = false;
+                }
+                if col_offset + superblock_width as isize > bw4 as isize {
+                    do_tr = false;
+                }
+                if let Some(info) = above {
+                    if single_ref_match(info) {
+                        samples.push(rec(info, 0, -1, col_offset as i32, 1));
+                        if samples.len() >= MAX {
+                            break 'outer;
+                        }
+                    }
+                }
+            } else {
+                let mut i = 0usize;
+                let limit = bw4.min(mi_cols.saturating_sub(mi_col));
+                while i < limit {
+                    let cell = grid.get(mi_row - 1, mi_col + i);
+                    let sw = cell.map_or(1, |c| c.size).max(1);
+                    if let Some(info) = cell {
+                        if single_ref_match(info) {
+                            samples.push(rec(info, 0, -1, i as i32, 1));
+                            if samples.len() >= MAX {
+                                break 'outer;
+                            }
+                        }
+                    }
+                    i += sw;
+                }
+            }
+        }
+
+        if left_available {
+            let left = grid.get(mi_row, mi_col - 1);
+            let superblock_height = left.map_or(1, |c| c.size).max(1);
+            if bw4 <= superblock_height {
+                let row_offset = -((mi_row % superblock_height) as isize);
+                if row_offset < 0 {
+                    do_tl = false;
+                }
+                if let Some(info) = left {
+                    if single_ref_match(info) {
+                        samples.push(rec(info, row_offset as i32, 1, 0, -1));
+                        if samples.len() >= MAX {
+                            break 'outer;
+                        }
+                    }
+                }
+            } else {
+                let mut i = 0usize;
+                let limit = bw4.min(mi_rows.saturating_sub(mi_row));
+                while i < limit {
+                    let cell = grid.get(mi_row + i, mi_col - 1);
+                    let sh = cell.map_or(1, |c| c.size).max(1);
+                    if let Some(info) = cell {
+                        if single_ref_match(info) {
+                            samples.push(rec(info, i as i32, 1, 0, -1));
+                            if samples.len() >= MAX {
+                                break 'outer;
+                            }
+                        }
+                    }
+                    i += sh;
+                }
+            }
+        }
+
+        if do_tl && left_available && up_available {
+            if let Some(info) = grid.get(mi_row - 1, mi_col - 1) {
+                if single_ref_match(info) {
+                    samples.push(rec(info, 0, -1, 0, -1));
+                    if samples.len() >= MAX {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+
+        if do_tr && has_top_right(mi_row, mi_col, bw4) {
+            let tr_col = mi_col + bw4;
+            if mi_row > 0 && tr_col < mi_cols {
+                if let Some(info) = grid.get(mi_row - 1, tr_col) {
+                    if single_ref_match(info) {
+                        samples.push(rec(info, 0, -1, bw4 as i32, 1));
+                    }
+                }
+            }
+        }
+    }
+    samples
+}
+
+/// `mbmi->num_proj_ref`: [`find_samples`]'s own count, all that
+/// `motion_mode_allowed` needs to pick the 3-symbol `motion_mode_cdf` over
+/// the 2-symbol `obmc_cdf` (spec 5.11.24).
+#[allow(clippy::too_many_arguments)]
 fn num_proj_ref(
     grid: &MiGrid,
     mi_row: usize,
@@ -4170,113 +4293,7 @@ fn num_proj_ref(
     mi_rows: usize,
     ref_frame: i8,
 ) -> u8 {
-    const MAX: u8 = 8;
-    let up_available = mi_row > 0;
-    let left_available = mi_col > 0;
-    let mut np = 0u8;
-    let single_ref_match = |info: &MiInfo| info.ref_frame == ref_frame && info.ref_frame1.is_none();
-    let mut do_tl = true;
-    let mut do_tr = true;
-
-    if up_available {
-        let above = grid.get(mi_row - 1, mi_col);
-        let superblock_width = above.map_or(1, |c| c.size).max(1);
-        if bw4 <= superblock_width {
-            let col_offset = -((mi_col % superblock_width) as isize);
-            if col_offset < 0 {
-                do_tl = false;
-            }
-            if col_offset + superblock_width as isize > bw4 as isize {
-                do_tr = false;
-            }
-            if let Some(info) = above {
-                if single_ref_match(info) {
-                    np += 1;
-                    if np >= MAX {
-                        return MAX;
-                    }
-                }
-            }
-        } else {
-            let mut i = 0usize;
-            let limit = bw4.min(mi_cols.saturating_sub(mi_col));
-            while i < limit {
-                let cell = grid.get(mi_row - 1, mi_col + i);
-                let sw = cell.map_or(1, |c| c.size).max(1);
-                if let Some(info) = cell {
-                    if single_ref_match(info) {
-                        np += 1;
-                        if np >= MAX {
-                            return MAX;
-                        }
-                    }
-                }
-                i += sw;
-            }
-        }
-    }
-
-    if left_available {
-        let left = grid.get(mi_row, mi_col - 1);
-        let superblock_height = left.map_or(1, |c| c.size).max(1);
-        if bw4 <= superblock_height {
-            let row_offset = -((mi_row % superblock_height) as isize);
-            if row_offset < 0 {
-                do_tl = false;
-            }
-            if let Some(info) = left {
-                if single_ref_match(info) {
-                    np += 1;
-                    if np >= MAX {
-                        return MAX;
-                    }
-                }
-            }
-        } else {
-            let mut i = 0usize;
-            let limit = bw4.min(mi_rows.saturating_sub(mi_row));
-            while i < limit {
-                let cell = grid.get(mi_row + i, mi_col - 1);
-                let sh = cell.map_or(1, |c| c.size).max(1);
-                if let Some(info) = cell {
-                    if single_ref_match(info) {
-                        np += 1;
-                        if np >= MAX {
-                            return MAX;
-                        }
-                    }
-                }
-                i += sh;
-            }
-        }
-    }
-
-    if do_tl && left_available && up_available {
-        if let Some(info) = grid.get(mi_row - 1, mi_col - 1) {
-            if single_ref_match(info) {
-                np += 1;
-                if np >= MAX {
-                    return MAX;
-                }
-            }
-        }
-    }
-
-    if do_tr && has_top_right(mi_row, mi_col, bw4) {
-        let tr_col = mi_col + bw4;
-        if mi_row > 0 && tr_col < mi_cols {
-            if let Some(info) = grid.get(mi_row - 1, tr_col) {
-                if single_ref_match(info) {
-                    np += 1;
-                    if np >= MAX {
-                        return MAX;
-                    }
-                }
-            }
-        }
-    }
-
-    np
+    find_samples(grid, mi_row, mi_col, bw4, mi_cols, mi_rows, ref_frame).len() as u8
 }
 
 /// `av1_get_obmc_mask` (`reconinter.c`): the per-position blend weight
@@ -5645,14 +5662,20 @@ fn decode_inter_block(
                     || !overlappable_left(grid, mi_row, mi_col, bw4, mi_rows as usize, 1)
                         .is_empty());
             let mut obmc_selected = false;
+            // lane-warp round 2: `Some` when motion_mode == WARPED_CAUSAL
+            // *and* the local warp estimate is valid (`!wm_params.invalid`,
+            // `av1_find_projection`) -- an invalid estimate falls back to
+            // this block's own translational mv, same as any other block
+            // (spec `allow_warp`/`reconinter.c` -- global warp is never the
+            // fallback here since this decoder's global motion is always
+            // IDENTITY).
+            let mut warp_params: Option<crate::warp::WarpParams> = None;
             if motion_mode_eligible {
                 // `default_obmc_cdf`'s own index: square bsize 8/16/32/64 -> 0/1/2/3.
                 let bsize_idx = (side.trailing_zeros() - 3) as usize;
-                // lane-warp round 1: `motion_mode_allowed` reads the 3-symbol
-                // `motion_mode_cdf` instead of the 2-symbol `obmc_cdf` exactly
-                // when `num_proj_ref >= 1` under `allow_warped_motion` (see
-                // `num_proj_ref`'s own doc -- only the *count* is ported,
-                // not the sample coordinates the warp estimation needs).
+                // `motion_mode_allowed` reads the 3-symbol `motion_mode_cdf`
+                // instead of the 2-symbol `obmc_cdf` exactly when
+                // `num_proj_ref >= 1` under `allow_warped_motion`.
                 let warp_eligible = allow_warped_motion
                     && num_proj_ref(grid, mi_row, mi_col, bw4, mi_cols as usize, mi_rows as usize, ref_frame) >= 1;
                 if warp_eligible {
@@ -5665,11 +5688,27 @@ fn decode_inter_block(
                         }
                         _ => {
                             WARP_SELECTED_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            return Err(unsupported(
-                                "a block that coded WARPED_CAUSAL (motion_mode == 2): \
-                                 av1_find_projection/the affine warp filter are not \
-                                 ported, only motion_mode_allowed's alphabet choice is",
-                            ));
+                            let mut samples = find_samples(
+                                grid,
+                                mi_row,
+                                mi_col,
+                                bw4,
+                                mi_cols as usize,
+                                mi_rows as usize,
+                                ref_frame,
+                            );
+                            if samples.len() > 1 {
+                                crate::warp::select_samples(mv, &mut samples, side as i32, side as i32);
+                            }
+                            warp_params = crate::warp::find_projection(
+                                &samples,
+                                side as i32,
+                                side as i32,
+                                mv.1,
+                                mv.0,
+                                mi_row as i32,
+                                mi_col as i32,
+                            );
                         }
                     }
                 } else {
@@ -5795,6 +5834,24 @@ fn decode_inter_block(
                 v_filter,
                 &mut pred_v,
             );
+
+            if let Some(params) = &warp_params {
+                crate::warp::warp_affine(
+                    params, &py_ref.data, py_ref.true_width as i32, py_ref.true_height as i32,
+                    py_ref.width as i32, &mut pred_y, px as i32, py as i32, side as i32,
+                    side as i32, side as i32, 0, 0,
+                );
+                crate::warp::warp_affine(
+                    params, &pu_ref.data, pu_ref.true_width as i32, pu_ref.true_height as i32,
+                    pu_ref.width as i32, &mut pred_u, cpx as i32, cpy as i32, chroma_side as i32,
+                    chroma_side as i32, chroma_side as i32, 1, 1,
+                );
+                crate::warp::warp_affine(
+                    params, &pv_ref.data, pv_ref.true_width as i32, pv_ref.true_height as i32,
+                    pv_ref.width as i32, &mut pred_v, cpx as i32, cpy as i32, chroma_side as i32,
+                    chroma_side as i32, chroma_side as i32, 1, 1,
+                );
+            }
 
             if obmc_selected {
                 obmc_blend(
