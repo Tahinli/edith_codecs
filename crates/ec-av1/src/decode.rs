@@ -2493,30 +2493,6 @@ fn cdef_filter_block(
 /// size. `cdef_bits == 0` is this crate's only supported case so far (see the
 /// refusal in `stream.rs`), so every 64x64 filter block always uses index 0's
 /// strengths -- no per-block `cdef_idx` selection is implemented yet.
-/// bisect scratch (lane-cdffwd2): dump this frame's Y/U/V exactly the way
-/// the instrumented `aomdec` build's `EC_AV1_PREFILT_DUMP` does (raw
-/// `true_width`x`true_height` bytes per plane, decode order, one file per
-/// frame index), gated on env so it is zero-cost/zero-behavior off. Called
-/// from both the key-frame and inter-frame tile decoders so the frame index
-/// lines up with aomdec's own (which dumps unconditionally every frame).
-fn scratch_dump_prefilt(y: &PlaneBuf, u: &PlaneBuf, v: &PlaneBuf) {
-    let Some(base) = std::env::var_os("EC_AV1_PREFILT_DUMP_OURS") else {
-        return;
-    };
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    static IDX: AtomicUsize = AtomicUsize::new(0);
-    let idx = IDX.fetch_add(1, Ordering::SeqCst);
-    let path = format!("{}.f{}", base.to_string_lossy(), idx);
-    let mut out = Vec::new();
-    for plane in [y, u, v] {
-        for row in 0..plane.true_height {
-            let start = row * plane.width;
-            out.extend_from_slice(&plane.data[start..start + plane.true_width]);
-        }
-    }
-    let _ = std::fs::write(path, out);
-}
-
 /// Spec 7.14: the in-loop deblocking filter, applied once per frame after
 /// tile reconstruction and before [`apply_cdef`]. Uniform-level path only --
 /// `stream.rs` already refuses `delta_lf_present`/segmentation upstream, so
@@ -3620,7 +3596,6 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         }
     }
 
-    scratch_dump_prefilt(&y, &u, &v);
     apply_deblock(&mut y, &mut u, &mut v, loop_filter, &neighbours);
     apply_cdef(&mut y, &mut u, &mut v, cdef, &neighbours);
 
@@ -5428,6 +5403,9 @@ fn decode_inter_block8(
     // just above).
     skip_mode_present: bool,
     skip_mode_frame: [u8; 2],
+    // lane-cdffwd2: this frame header's own `reduced_tx_set` bit -- see
+    // [`decode_inter_frame_tile_with_cdfs`]'s own doc.
+    reduced_tx_set: bool,
     // lane-av1comp: `Some((ref1, comp_group_idx, compound_idx))` only for a
     // real `COMPOUND_REFERENCE` leaf, for the caller's own end-of-16x16
     // `record_compound_ctx` call -- mirrors [`decode_inter_block`]'s own
@@ -5751,7 +5729,11 @@ fn decode_inter_block8(
                     luma_grid = read_inter_plane(
                         dec,
                         cdfs,
-                        TxbSet::Luma8Inter,
+                        if reduced_tx_set {
+                            TxbSet::Luma8Inter
+                        } else {
+                            TxbSet::Luma8InterSet1
+                        },
                         scan8,
                         0,
                         around[0],
@@ -5945,7 +5927,11 @@ fn decode_inter_block8(
             luma_grid = read_inter_plane(
                 dec,
                 cdfs,
-                TxbSet::Luma8Inter,
+                if reduced_tx_set {
+                    TxbSet::Luma8Inter
+                } else {
+                    TxbSet::Luma8InterSet1
+                },
                 scan8,
                 0,
                 around[0],
@@ -6193,6 +6179,7 @@ pub fn decode_inter_frame_tile(
         false,
         false,
         [0; 2],
+        true,
     )
     .map(|(picture, _, _)| picture)
 }
@@ -6238,6 +6225,11 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     // `decode_inter_block8` call below.
     skip_mode_present: bool,
     skip_mode_frame: [u8; 2],
+    // lane-cdffwd2: this frame header's own `reduced_tx_set` bit, threaded to
+    // every inter `tx_type` read below (`false` needs the 12-/16-symbol
+    // `Set1` coefficient tables at 16x16/8x8 rather than the reduced
+    // 2-symbol ones -- see [`TxbSet::Luma16InterSet1`]/[`TxbSet::Luma8InterSet1`]).
+    reduced_tx_set: bool,
 ) -> Result<(Picture, Cdfs, crate::motion_field::MotionField)> {
     let tpl_frame = tpl_field.map(|field| TplFrameArgs {
         field,
@@ -6489,7 +6481,11 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     &sign_bias_table,
                                     base_q_idx,
                                     TxbSet::Luma16,
-                                    TxbSet::Luma16Inter,
+                                    if reduced_tx_set {
+                                        TxbSet::Luma16Inter
+                                    } else {
+                                        TxbSet::Luma16InterSet1
+                                    },
                                     TxbSet::Chroma8,
                                     TX16,
                                     TX8,
@@ -6569,6 +6565,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                             ref_order_hints,
                                             skip_mode_present,
                                             skip_mode_frame,
+                                            reduced_tx_set,
                                         )?;
                                     prev_leaf = Some((leaf_mi, skip, is_inter));
                                     last_skip_mode = skip_mode_leaf;
@@ -6622,7 +6619,6 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         }
     }
 
-    scratch_dump_prefilt(&y, &u, &v);
     apply_deblock(&mut y, &mut u, &mut v, loop_filter, &neighbours);
     apply_cdef(&mut y, &mut u, &mut v, cdef, &neighbours);
 
