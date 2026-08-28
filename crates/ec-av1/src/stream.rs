@@ -3468,22 +3468,38 @@ mod tests {
         );
     }
 
-    /// lane-warp round 3: reproduces the pinned mismatch bytes captured by
-    /// `EC_AV1_GATE_DUMP=$SP/warp-mismatch.obu` off
-    /// `a_real_aomenc_stream_with_warped_motion_refuses_or_matches` (seed 49,
-    /// frame 1). Deterministic and static -- `#[ignore]`d, run manually.
+    /// Pinned streams captured by `EC_AV1_GATE_DUMP` off
+    /// `a_real_aomenc_stream_with_warped_motion_refuses_or_matches` -- each
+    /// one is a former mismatch, kept as a regression pin (warp-mismatch:
+    /// the WARPED_CAUSAL interp-read suppression; warp-flake-7: the same
+    /// suppression for skip_mode blocks; warp-flake-5: mvstack entry
+    /// clamping). `EC_AV1_GATE_DUMP_PIN` overrides to a single stream.
+    /// Deterministic and static -- `#[ignore]`d because the gitignored
+    /// fixtures dir may be absent; run manually.
     #[test]
-    #[ignore = "reads a pinned fixture path outside the repo; run manually"]
+    #[ignore = "reads pinned fixture paths under the gitignored fixtures dir; run manually"]
     fn pinned_warp_stream_decodes_pixel_exact() {
-        use crate::decode::warp_selected_hits;
-        let path = std::env::var("EC_AV1_GATE_DUMP_PIN").unwrap_or_else(|_| {
-            concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/warp-mismatch.obu").to_string()
-        });
-        let stream = std::fs::read(&path).expect("reading pinned stream");
         if !have_ffmpeg() {
             eprintln!("SKIP pinned_warp_stream_decodes_pixel_exact: no ffmpeg");
             return;
         }
+        let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures");
+        let paths: Vec<String> = match std::env::var("EC_AV1_GATE_DUMP_PIN") {
+            Ok(p) => vec![p],
+            Err(_) => ["warp-mismatch", "warp-flake-5", "warp-flake-7"]
+                .iter()
+                .map(|n| format!("{fixtures}/{n}.obu"))
+                .collect(),
+        };
+        for path in paths {
+            eprintln!("pin: {path}");
+            check_pinned_warp_stream(&path);
+        }
+    }
+
+    fn check_pinned_warp_stream(path: &str) {
+        use crate::decode::warp_selected_hits;
+        let stream = std::fs::read(path).expect("reading pinned stream");
         let before = warp_selected_hits();
         let frames = decode_stream(&stream).expect("pinned stream must decode");
         eprintln!(
