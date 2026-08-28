@@ -4306,6 +4306,10 @@ fn decode_inter_block(
     // `compound_idx` read (libaom `decodemv.c` 1604-1619, 1382-1384, 1509).
     skip_mode_present: bool,
     skip_mode_frame: [u8; 2],
+    // lane-motionmode round 1: this frame header's own `is_motion_mode_switchable`/
+    // `allow_warped_motion` bits (spec 5.11.24's `read_motion_mode`).
+    switchable_motion_mode: bool,
+    allow_warped_motion: bool,
 ) -> Result<()> {
     let (r, c) = at;
     let (px, py) = (c * SUB, r * SUB);
@@ -6207,6 +6211,8 @@ pub fn decode_inter_frame_tile(
         false,
         [0; 2],
         true,
+        false,
+        false,
     )
     .map(|(picture, _, _)| picture)
 }
@@ -6257,6 +6263,12 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     // `Set1` coefficient tables at 16x16/8x8 rather than the reduced
     // 2-symbol ones -- see [`TxbSet::Luma16InterSet1`]/[`TxbSet::Luma8InterSet1`]).
     reduced_tx_set: bool,
+    // lane-motionmode round 1: this frame header's own `is_motion_mode_switchable`/
+    // `allow_warped_motion` bits, threaded to every `decode_inter_block` call
+    // below (spec 5.11.24's `read_motion_mode`) -- `decode_inter_block8`'s 8x8
+    // leaves do not read this symbol yet (round 2).
+    switchable_motion_mode: bool,
+    allow_warped_motion: bool,
 ) -> Result<(Picture, Cdfs, crate::motion_field::MotionField)> {
     let tpl_frame = tpl_field.map(|field| TplFrameArgs {
         field,
@@ -6461,6 +6473,8 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             ref_order_hints,
                             skip_mode_present,
                             skip_mode_frame,
+                            switchable_motion_mode,
+                            allow_warped_motion,
                         )?;
                     }
                     PARTITION_SPLIT => {
@@ -6531,6 +6545,8 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     ref_order_hints,
                                     skip_mode_present,
                                     skip_mode_frame,
+                                    switchable_motion_mode,
+                                    allow_warped_motion,
                                 )?;
                             } else {
                                 let ctx16 = neighbours.partition_ctx(at16, SUB);
@@ -7373,6 +7389,8 @@ mod tests {
             [0; 7],
             false,
             [0; 2],
+            false,
+            false,
         )
         .unwrap();
 
