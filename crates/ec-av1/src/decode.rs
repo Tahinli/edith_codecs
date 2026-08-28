@@ -131,6 +131,23 @@ static BWDREF_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUs
 static ALTREF2_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static ALTREF_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// How many query blocks folded in at least one temporal MV candidate
+/// (spec 7.10.2.8's `add_tpl_ref_mv`) so far in this process -- the
+/// temporal-MV gate's own firing counter (lane-av1tmvp).
+///
+/// # HANDOFF (lane-av1tmvp): not yet wired to a live stream
+/// [`crate::mvstack::find_mv_stack_with_sign_bias`]'s only call site in
+/// this file (`decode_inter_block`) still passes `tpl: None` -- this
+/// counter compiles and the projection math it counts is unit-tested
+/// ([`crate::motion_field`]), but nothing in [`crate::stream::decode_stream`]
+/// builds a per-DPB-slot [`crate::motion_field::MotionField`] or calls
+/// [`crate::motion_field::setup_motion_field`] yet, so this will read `0`
+/// against any real stream today. See the module doc on
+/// `crate::motion_field` and this crate's ledger for the remaining wiring.
+pub(crate) fn tmv_hits() -> usize {
+    crate::mvstack::tmv_hits()
+}
+
 /// Current value of the counter for `ref_frame` (`LAST2_FRAME`..=`ALTREF_FRAME`;
 /// panics on `LAST_FRAME`/`INTRA_FRAME`/`NONE`, which have no counter here).
 pub(crate) fn ref_hits(ref_frame: i8) -> usize {
@@ -3814,6 +3831,11 @@ fn decode_inter_block(
             mi_cols as usize,
             mi_rows as usize,
             sign_bias_table,
+            // TODO(lane-av1tmvp HANDOFF): thread a real `TplArgs` here once
+            // `decode_inter_frame_tile_with_cdfs` carries a projected
+            // `TplField` (see that function's own doc) -- `None` keeps
+            // today's `use_ref_frame_mvs = 0`-only behaviour exact.
+            None,
         );
         let not_new = dec.symbol(&mut cdfs.new_mv[stack.new_mv_ctx]) == 1;
         let mut is_globalmv = false;
