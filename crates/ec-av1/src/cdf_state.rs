@@ -308,6 +308,13 @@ pub(crate) struct Cdfs {
     pub comp_ref: [[[u16; 3]; 3]; 3],
     /// The two binary decisions of a bidirectional pair's backward ref.
     pub comp_bwdref: [[[u16; 3]; 2]; 3],
+    /// Whether a compound block's `comp_group_idx` picks masked compound
+    /// (lane-av1comp, spec 5.11.25's `comp_group_idx`).
+    pub comp_group_idx: [[u16; 3]; 6],
+    /// Whether a compound block's `compound_idx` picks the simple average
+    /// over the distance-weighted blend (lane-av1comp, spec 5.11.25's
+    /// `compound_idx`).
+    pub compound_idx: [[u16; 3]; 6],
     /// The luma mode of an inter frame's intra block, by its size group.
     pub y_mode: [[u16; 14]; 4],
     /// Whether an inter block codes its motion vector explicitly.
@@ -521,6 +528,8 @@ impl Cdfs {
         reset3(&mut self.uni_comp_ref);
         reset3(&mut self.comp_ref);
         reset3(&mut self.comp_bwdref);
+        reset2(&mut self.comp_group_idx);
+        reset2(&mut self.compound_idx);
         reset2(&mut self.y_mode);
         reset2(&mut self.new_mv);
         reset2(&mut self.zero_mv);
@@ -951,6 +960,8 @@ impl Cdfs {
             uni_comp_ref: cdf::UNI_COMP_REF,
             comp_ref: cdf::COMP_REF,
             comp_bwdref: cdf::COMP_BWDREF,
+            comp_group_idx: cdf::COMP_GROUP_IDX,
+            compound_idx: cdf::COMPOUND_IDX,
             y_mode: cdf::Y_MODE,
             new_mv: cdf::NEW_MV,
             zero_mv: cdf::ZERO_MV,
