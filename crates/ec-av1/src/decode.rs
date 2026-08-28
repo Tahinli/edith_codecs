@@ -5222,7 +5222,9 @@ fn decode_inter_block(
                 )
             };
             let (mi_row, mi_col) = (r * SUB_MI as usize, c * SUB_MI as usize);
-            let bw4 = side / 4;
+            // lane-rect r2: true footprint, mirroring the single-ref path below.
+            let bw4 = write_w / 4;
+            let bh4 = write_h / 4;
             // spec 7.10.2.8, doubled per side (`CompoundTplArgs`): same
             // `use_ref_frame_mvs` gating as the single-ref `tpl` build
             // below, just one `get_relative_dist` per reference.
@@ -5245,7 +5247,7 @@ fn decode_inter_block(
                 mi_row,
                 mi_col,
                 bw4,
-                bw4,
+                bh4,
                 (ref0, ref1),
                 mi_cols as usize,
                 mi_rows as usize,
@@ -5293,7 +5295,12 @@ fn decode_inter_block(
             globalmv_for_lf = is_globalmv;
             ref_frame_for_lf = ref0;
             mode_for_tx = 0;
-            for dr in 0..bw4 {
+            // lane-rect r2: `grid` (mvstack.rs's own MiGrid, distinct from
+            // `neighbours`) must be stamped with the block's true footprint
+            // too -- a square `bw4`x`bw4` stamp here claims a rect strip's
+            // NEXT strip's own rows/cols before it decodes, corrupting
+            // every later mvstack scan that reads this cell back.
+            for dr in 0..bh4 {
                 for dc in 0..bw4 {
                     grid.set(
                         mi_row + dr,
@@ -5884,13 +5891,14 @@ fn decode_inter_block(
             };
 
             let (mi_row, mi_col) = (r * SUB_MI as usize, c * SUB_MI as usize);
-            let bw4 = side / 4;
-            // lane-warp r5d: `reject_residual` marks the HORZ_B arm's top
-            // strip, decoded as a square 32x32 block but truly 32x16 -- the
-            // mv stack must be queried with the block's REAL extent (libaom
-            // `av1_get_mv_refs` gets bw4=8, bh4=4), else scan_col, the
-            // corner probes and `clamp_mv_ref` all size a 32-tall block.
-            let bh4 = if reject_residual { bw4 / 2 } else { bw4 };
+            // lane-rect r2: the mv stack must be queried with the block's
+            // REAL extent (libaom `av1_get_mv_refs` gets bw4/bh4 from
+            // xd->width/xd->height, not a square guess) -- `write_w`/
+            // `write_h` already name the true HORZ/VERT/HORZ_B strip
+            // footprint (r1's plumbing), so derive bw4/bh4 from those
+            // instead of the old `side`-square (HORZ_B-only) heuristic.
+            let bw4 = write_w / 4;
+            let bh4 = write_h / 4;
             // spec 7.10.2.8: only reached when the frame header set
             // `use_ref_frame_mvs` (`tpl_frame` is `Some` then, `None`
             // otherwise) -- `cur_offset_0` is this query block's own resolved
@@ -6050,7 +6058,7 @@ fn decode_inter_block(
                 && !skip_mode
                 && interintra_mode.is_none()
                 && (!overlappable_above(grid, mi_row, mi_col, bw4, mi_cols as usize, 1).is_empty()
-                    || !overlappable_left(grid, mi_row, mi_col, bw4, mi_rows as usize, 1)
+                    || !overlappable_left(grid, mi_row, mi_col, bh4, mi_rows as usize, 1)
                         .is_empty());
             let mut obmc_selected = false;
             // lane-warp round 2: `Some` when motion_mode == WARPED_CAUSAL
@@ -6193,7 +6201,10 @@ fn decode_inter_block(
                     skip as u8, mv.0, mv.1, block_filter, motion_mode_eligible as u8, obmc_selected as u8, warp_params.is_some() as u8, dec.debug_bitpos()
                 );
             }
-            for dr in 0..bw4 {
+            // lane-rect r2: see the compound path's matching comment above --
+            // `grid` must be stamped with the block's true bh4/bw4 span, not
+            // a square `bw4`x`bw4` guess.
+            for dr in 0..bh4 {
                 for dc in 0..bw4 {
                     grid.set(
                         mi_row + dr,
@@ -8317,31 +8328,202 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                         }
                     }
                     PARTITION_HORZ => {
-                        // lane-partitions r1 FINDING (pin rect-flake-1.obu,
-                        // decode frame 16 strip 2): decoding each 32x16 strip
-                        // with `side=32` square contexts desyncs -- a real
-                        // 32x16 block's mvstack weights/DRL selection use
-                        // n4_h=4, and the second strip picked a different
-                        // NEARMV than aomdec (class
-                        // decision-at-wrong-granularity). The write-footprint
-                        // plumbing (`write_w`/`write_h`, `_rect` methods)
-                        // stays; r2 threads true bw4/bh4 through
-                        // find_mv_stack + every neighbour ctx, gated by the
-                        // pinned stream. NOTE: HORZ_B's top strip carries the
-                        // same square-context corner-cut and owes the same
-                        // fix; its pins are byte-exact only because their
-                        // stacks happen to coincide.
-                        return Err(unsupported(
-                            "a HORZ rect partition (32x16 strips need rectangular \
-                             mvstack/context derivation, r2)",
-                        ));
+                        // lane-rect r2: two true 32x16 strips. Both read at
+                        // `side=BLOCK` (CDF/size-class selection stays square,
+                        // matching HORZ_B's accepted corner-cut) but bw4/bh4
+                        // (mvstack.rs, `motion_mode_eligible`) now derive from
+                        // `write_w`/`write_h`'s true 32x16 footprint -- the
+                        // pin's fix (r1's finding).
+                        RECT_PARTITION_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        decode_inter_block(
+                            &mut dec,
+                            &mut cdfs,
+                            &mut neighbours,
+                            &mut grid,
+                            at,
+                            BLOCK,
+                            mi_cols,
+                            mi_rows,
+                            &mut y,
+                            &mut u,
+                            &mut v,
+                            &ref_y,
+                            &ref_u,
+                            &ref_v,
+                            &ref_slots,
+                            &sign_bias_table,
+                            base_q_idx,
+                            TxbSet::Luma32,
+                            TxbSet::Luma32Inter,
+                            TxbSet::Chroma16,
+                            TX32,
+                            TX16,
+                            &scan32,
+                            &scan16,
+                            3,
+                            allow_high_precision_mv,
+                            force_integer_mv,
+                            interp_fixed,
+                            enable_dual_filter,
+                            tpl_frame.as_ref(),
+                            reference_select,
+                            enable_masked_compound,
+                            enable_interintra_compound,
+                            enable_jnt_comp,
+                            order_hint_bits,
+                            order_hint,
+                            ref_order_hints,
+                            skip_mode_present,
+                            skip_mode_frame,
+                            switchable_motion_mode,
+                            allow_warped_motion,
+                            true,
+                            BLOCK,
+                            SUB,
+                        )?;
+                        decode_inter_block(
+                            &mut dec,
+                            &mut cdfs,
+                            &mut neighbours,
+                            &mut grid,
+                            (r32 as usize * 2 + 1, c32 as usize * 2),
+                            BLOCK,
+                            mi_cols,
+                            mi_rows,
+                            &mut y,
+                            &mut u,
+                            &mut v,
+                            &ref_y,
+                            &ref_u,
+                            &ref_v,
+                            &ref_slots,
+                            &sign_bias_table,
+                            base_q_idx,
+                            TxbSet::Luma32,
+                            TxbSet::Luma32Inter,
+                            TxbSet::Chroma16,
+                            TX32,
+                            TX16,
+                            &scan32,
+                            &scan16,
+                            3,
+                            allow_high_precision_mv,
+                            force_integer_mv,
+                            interp_fixed,
+                            enable_dual_filter,
+                            tpl_frame.as_ref(),
+                            reference_select,
+                            enable_masked_compound,
+                            enable_interintra_compound,
+                            enable_jnt_comp,
+                            order_hint_bits,
+                            order_hint,
+                            ref_order_hints,
+                            skip_mode_present,
+                            skip_mode_frame,
+                            switchable_motion_mode,
+                            allow_warped_motion,
+                            true,
+                            BLOCK,
+                            SUB,
+                        )?;
                     }
                     PARTITION_VERT => {
-                        // See PARTITION_HORZ above -- same r2 refusal.
-                        return Err(unsupported(
-                            "a VERT rect partition (16x32 strips need rectangular \
-                             mvstack/context derivation, r2)",
-                        ));
+                        // lane-rect r2: mirror of PARTITION_HORZ above with
+                        // width/height swapped.
+                        RECT_PARTITION_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        decode_inter_block(
+                            &mut dec,
+                            &mut cdfs,
+                            &mut neighbours,
+                            &mut grid,
+                            at,
+                            BLOCK,
+                            mi_cols,
+                            mi_rows,
+                            &mut y,
+                            &mut u,
+                            &mut v,
+                            &ref_y,
+                            &ref_u,
+                            &ref_v,
+                            &ref_slots,
+                            &sign_bias_table,
+                            base_q_idx,
+                            TxbSet::Luma32,
+                            TxbSet::Luma32Inter,
+                            TxbSet::Chroma16,
+                            TX32,
+                            TX16,
+                            &scan32,
+                            &scan16,
+                            3,
+                            allow_high_precision_mv,
+                            force_integer_mv,
+                            interp_fixed,
+                            enable_dual_filter,
+                            tpl_frame.as_ref(),
+                            reference_select,
+                            enable_masked_compound,
+                            enable_interintra_compound,
+                            enable_jnt_comp,
+                            order_hint_bits,
+                            order_hint,
+                            ref_order_hints,
+                            skip_mode_present,
+                            skip_mode_frame,
+                            switchable_motion_mode,
+                            allow_warped_motion,
+                            true,
+                            SUB,
+                            BLOCK,
+                        )?;
+                        decode_inter_block(
+                            &mut dec,
+                            &mut cdfs,
+                            &mut neighbours,
+                            &mut grid,
+                            (r32 as usize * 2, c32 as usize * 2 + 1),
+                            BLOCK,
+                            mi_cols,
+                            mi_rows,
+                            &mut y,
+                            &mut u,
+                            &mut v,
+                            &ref_y,
+                            &ref_u,
+                            &ref_v,
+                            &ref_slots,
+                            &sign_bias_table,
+                            base_q_idx,
+                            TxbSet::Luma32,
+                            TxbSet::Luma32Inter,
+                            TxbSet::Chroma16,
+                            TX32,
+                            TX16,
+                            &scan32,
+                            &scan16,
+                            3,
+                            allow_high_precision_mv,
+                            force_integer_mv,
+                            interp_fixed,
+                            enable_dual_filter,
+                            tpl_frame.as_ref(),
+                            reference_select,
+                            enable_masked_compound,
+                            enable_interintra_compound,
+                            enable_jnt_comp,
+                            order_hint_bits,
+                            order_hint,
+                            ref_order_hints,
+                            skip_mode_present,
+                            skip_mode_frame,
+                            switchable_motion_mode,
+                            allow_warped_motion,
+                            true,
+                            SUB,
+                            BLOCK,
+                        )?;
                     }
                     _ => {
                         return Err(unsupported(format!(
