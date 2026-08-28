@@ -1157,6 +1157,9 @@ mod tests {
                 "--enable-palette=0",
                 "--enable-intrabc=0",
                 "--enable-cfl-intra=0",
+                // use_ref_frame_mvs (temporal MV projection) is unimplemented in mvstack;
+                // leaving it on silently desyncs symbols on inter frames (grainfix lesson).
+                "--enable-ref-frame-mvs=0",
                 "--obu",
                 "-o",
                 "-",
@@ -1312,6 +1315,9 @@ mod tests {
                     "--enable-palette=0",
                     "--enable-intrabc=0",
                     "--enable-cfl-intra=0",
+                    // use_ref_frame_mvs (temporal MV projection) is unimplemented in mvstack;
+                    // leaving it on silently desyncs symbols on inter frames (grainfix lesson).
+                    "--enable-ref-frame-mvs=0",
                     "--obu",
                     "-o",
                     "-",
@@ -1457,6 +1463,9 @@ mod tests {
                     "--enable-palette=0",
                     "--enable-intrabc=0",
                     "--enable-cfl-intra=0",
+                    // use_ref_frame_mvs (temporal MV projection) is unimplemented in mvstack;
+                    // leaving it on silently desyncs symbols on inter frames (grainfix lesson).
+                    "--enable-ref-frame-mvs=0",
                     "--obu",
                     "-o",
                     "-",
@@ -1605,6 +1614,9 @@ mod tests {
                 "--enable-palette=0",
                 "--enable-intrabc=0",
                 "--enable-cfl-intra=0",
+                // use_ref_frame_mvs (temporal MV projection) is unimplemented in mvstack;
+                // leaving it on silently desyncs symbols on inter frames (grainfix lesson).
+                "--enable-ref-frame-mvs=0",
                 "--obu",
                 "-o",
                 "-",
@@ -1770,6 +1782,9 @@ mod tests {
                     "--enable-palette=0",
                     "--enable-intrabc=0",
                     "--enable-cfl-intra=0",
+                    // use_ref_frame_mvs (temporal MV projection) is unimplemented in mvstack;
+                    // leaving it on silently desyncs symbols on inter frames (grainfix lesson).
+                    "--enable-ref-frame-mvs=0",
                     "--obu",
                     "-o",
                     "-",
@@ -2059,6 +2074,9 @@ mod tests {
                     "--enable-palette=0",
                     "--enable-intrabc=0",
                     "--enable-cfl-intra=0",
+                    // use_ref_frame_mvs (temporal MV projection) is unimplemented in mvstack;
+                    // leaving it on silently desyncs symbols on inter frames (grainfix lesson).
+                    "--enable-ref-frame-mvs=0",
                     // `--tune-content=film` was dropped: on this box it
                     // makes aomenc emit `apply_grain` almost every attempt
                     // (lane-av1golden8 round 10 measurement, live: 120/120
@@ -2362,6 +2380,9 @@ mod tests {
                     "--enable-filter-intra=0",
                     "--enable-intrabc=0",
                     "--enable-cfl-intra=0",
+                    // use_ref_frame_mvs (temporal MV projection) is unimplemented in mvstack;
+                    // leaving it on silently desyncs symbols on inter frames (grainfix lesson).
+                    "--enable-ref-frame-mvs=0",
                     "--tune-content=default",
                     "--obu",
                     "-o",
