@@ -165,6 +165,17 @@ pub(crate) fn obmc_hits() -> usize {
     OBMC_HITS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// lane-motionmode round 3: same proof as [`OBMC_HITS`], narrowed to
+/// `decode_inter_block8`'s own 8x8-leaf `read_motion_mode` -- a subset of
+/// [`OBMC_HITS`] (both fire together on an 8x8 hit), lets the gate tell an
+/// 8x8-leaf OBMC block apart from a 16x16+ one.
+static OBMC_HITS_8: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Current value of [`OBMC_HITS_8`].
+pub(crate) fn obmc_hits_8() -> usize {
+    OBMC_HITS_8.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// How many [`read_inter_compound_mode`] reads actually happened
 /// (lane-av1comp) -- proves a `COMPOUND_REFERENCE` block reached its own
 /// `compound_mode` symbol (past `comp_mode`/`comp_ref` and the compound
@@ -5761,6 +5772,16 @@ fn decode_inter_block8(
     // lane-cdffwd2: this frame header's own `reduced_tx_set` bit -- see
     // [`decode_inter_frame_tile_with_cdfs`]'s own doc.
     reduced_tx_set: bool,
+    // lane-motionmode round 3: this frame header's own `is_motion_mode_switchable`/
+    // `allow_warped_motion` bits (spec 5.11.24's `read_motion_mode`), plus
+    // the fixed/switchable interp filter kind `obmc_blend`'s own neighbour
+    // reads need (see [`decode_inter_block`]'s own doc) -- this leaf's own
+    // prediction is always `Regular` (documented corner-cut, `mc::predict`
+    // has no filter param), but an OBMC neighbour can be a real 16x16+
+    // block that DID resolve a switchable filter.
+    interp_fixed: Option<mc::InterpFilterKind>,
+    switchable_motion_mode: bool,
+    allow_warped_motion: bool,
     // lane-av1comp: `Some((ref1, comp_group_idx, compound_idx))` only for a
     // real `COMPOUND_REFERENCE` leaf, for the caller's own end-of-16x16
     // `record_compound_ctx` call -- mirrors [`decode_inter_block`]'s own
@@ -6208,6 +6229,33 @@ fn decode_inter_block8(
             };
             (mv, false)
         };
+        // lane-motionmode round 3: `read_motion_mode` (spec 5.11.24) at the
+        // 8x8 leaf too -- `motion_mode_allowed` still holds here (BLOCK_8X8
+        // is the spec's own minimum eligible size, single-ref-only branch,
+        // no interintra reader, `IDENTITY`-only global motion). Mirrors the
+        // 16x16 leaf's own `decode_inter_block` read (see its doc above) --
+        // same 2-symbol `obmc_cdf` alphabet, same `allow_warped_motion=1`
+        // refusal (warp needs `av1_findSamples`, not ported at either leaf).
+        let motion_mode_eligible = switchable_motion_mode
+            && !skip_mode
+            && (!overlappable_above(grid, mi_row, mi_col, 2, mi_cols as usize, 1).is_empty()
+                || !overlappable_left(grid, mi_row, mi_col, 2, mi_rows as usize, 1).is_empty());
+        let mut obmc_selected = false;
+        if motion_mode_eligible {
+            if allow_warped_motion {
+                return Err(unsupported(
+                    "a motion-variation-eligible 8x8 leaf under allow_warped_motion=1 \
+                     (round 3 only reads the 2-symbol obmc_cdf; telling OBMC_CAUSAL \
+                     from WARPED_CAUSAL needs av1_findSamples, not ported)",
+                ));
+            }
+            // `default_obmc_cdf`'s own index: square bsize 8/16/32/64 -> 0/1/2/3.
+            obmc_selected = dec.symbol(&mut cdfs.obmc[0]) == 1;
+            if obmc_selected {
+                OBMC_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                OBMC_HITS_8.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         for dr in 0..2 {
             for dc in 0..2 {
                 grid.set(
@@ -6263,6 +6311,32 @@ fn decode_inter_block8(
             CHROMA_SIDE,
             &mut pred_v,
         );
+
+        if obmc_selected {
+            obmc_blend(
+                grid,
+                neighbours,
+                mi_row,
+                mi_col,
+                2,
+                mi_rows as usize,
+                mi_cols as usize,
+                SIDE,
+                CHROMA_SIDE,
+                px,
+                py,
+                cpx,
+                cpy,
+                ref_y,
+                ref_u,
+                ref_v,
+                other_refs,
+                interp_fixed,
+                &mut pred_y,
+                &mut pred_u,
+                &mut pred_v,
+            )?;
+        }
 
         if skip {
             y.reconstruct_mc(px, py, SIDE, &pred_y, &vec![0i32; SIDE * SIDE]);
@@ -6599,10 +6673,9 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     // `Set1` coefficient tables at 16x16/8x8 rather than the reduced
     // 2-symbol ones -- see [`TxbSet::Luma16InterSet1`]/[`TxbSet::Luma8InterSet1`]).
     reduced_tx_set: bool,
-    // lane-motionmode round 1: this frame header's own `is_motion_mode_switchable`/
-    // `allow_warped_motion` bits, threaded to every `decode_inter_block` call
-    // below (spec 5.11.24's `read_motion_mode`) -- `decode_inter_block8`'s 8x8
-    // leaves do not read this symbol yet (round 2).
+    // lane-motionmode round 1/3: this frame header's own `is_motion_mode_switchable`/
+    // `allow_warped_motion` bits, threaded to every `decode_inter_block`/
+    // `decode_inter_block8` call below (spec 5.11.24's `read_motion_mode`).
     switchable_motion_mode: bool,
     allow_warped_motion: bool,
 ) -> Result<(Picture, Cdfs, crate::motion_field::MotionField)> {
@@ -6945,6 +7018,9 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                             skip_mode_present,
                                             skip_mode_frame,
                                             reduced_tx_set,
+                                            interp_fixed,
+                                            switchable_motion_mode,
+                                            allow_warped_motion,
                                         )?;
                                     prev_leaf = Some((leaf_mi, skip, is_inter));
                                     last_skip_mode = skip_mode_leaf;
