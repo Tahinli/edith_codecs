@@ -3468,12 +3468,189 @@ mod tests {
         );
     }
 
+    /// lane-interintra r1: `--enable-interintra-comp=1` streams must DECODE
+    /// pixel-exact -- the interintra flag/mode/wedge-flag syntax and the
+    /// non-wedge smooth blend are ported. A refusal naming interintra fails
+    /// the gate UNLESS it is the wedge refusal (`use_wedge_interintra == 1`
+    /// is r2, and this recipe encodes with wedge off so it must not fire
+    /// either); warp/obmc are enabled and supported; refusals for OTHER
+    /// named capabilities (screen content tools) still skip that seed. The
+    /// sweep must actually exercise interintra (`interintra_hits > 0`).
+    #[test]
+    fn a_real_aomenc_stream_with_interintra_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_stream_with_interintra_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height, frame_count) = (64usize, 64usize, 24usize);
+        let mut named_refusals = 0u32;
+        let mut matched = 0u32;
+        let n_attempts: u32 = std::env::var("EC_INTERINTRA_GATE_ATTEMPTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(40);
+        for attempt in 0..n_attempts {
+            let seed = 42 + attempt;
+            let duration = frame_count as f64 / 25.0;
+            let source =
+                format!("gradients=size={width}x{height}:seed={seed}:duration={duration}:rate=25");
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let args: Vec<&str> = vec![
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                "--cq-level=45",
+                "--cpu-used=0",
+                "--kf-max-dist=1000",
+                "--threads=1",
+                "--row-mt=0",
+                "--auto-alt-ref=1",
+                "--lag-in-frames=16",
+                "--enable-fwd-kf=0",
+                "--enable-order-hint=1",
+                "--enable-warped-motion=1",
+                "--enable-obmc=1",
+                "--tune-content=default",
+                "--enable-masked-comp=0",
+                "--enable-interintra-comp=1",
+                "--enable-onesided-comp=0",
+                "--enable-interintra-wedge=0",
+                "--enable-smooth-interintra=1",
+                "--enable-rect-partitions=0",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0",
+                "--enable-filter-intra=0",
+                "--enable-smooth-intra=0",
+                "--enable-paeth-intra=0",
+                "--enable-directional-intra=0",
+                "--enable-angle-delta=0",
+                "--enable-tx-size-search=0",
+                "--enable-cdef=0",
+                "--enable-restoration=0",
+                "--max-partition-size=32",
+                "--min-partition-size=32",
+                "--enable-palette=0",
+                "--enable-intrabc=0",
+                "--enable-cfl-intra=0",
+                "--enable-ref-frame-mvs=0",
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ];
+            let mut child = Command::new(aomenc_path())
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let frames = match decode_stream(&stream) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME} failed outright, not a named refusal (seed {seed}): {msg}"
+                    );
+                    assert!(
+                        !msg.contains("warp"),
+                        "{NAME} refused on warp (seed {seed}) -- warp decode is ported, this \
+                         refusal must not exist: {msg}"
+                    );
+                    assert!(
+                        !msg.contains("interintra"),
+                        "{NAME} refused on interintra (seed {seed}) -- non-wedge interintra \
+                         is ported and this recipe encodes with wedge off: {msg}"
+                    );
+                    named_refusals += 1;
+                    eprintln!("seed {seed} refusal (non-warp capability): {msg}");
+                    continue;
+                }
+                Ok(frames) => frames,
+            };
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
+            assert_eq!(frames.len(), frame_count);
+            let mismatched = frames
+                .iter()
+                .zip(&ffmpeg_frames)
+                .any(|(got, want)| got.y != want.y || got.u != want.u || got.v != want.v);
+            if mismatched && let Ok(path) = std::env::var("EC_AV1_GATE_DUMP") {
+                std::fs::write(&path, &stream).expect("writing pinned stream");
+                eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
+            }
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
+                assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
+            }
+            matched += 1;
+        }
+        assert!(
+            matched > 0,
+            "{NAME}: every attempt refused on other capabilities; the gate never exercised warp"
+        );
+        assert!(
+            crate::decode::interintra_hits() > 0,
+            "{NAME}: {matched} matches but zero interintra blocks fired -- the gate decodes \
+             these streams without ever taking interintra, so it proves nothing"
+        );
+        eprintln!(
+            "{NAME}: {named_refusals} other-capability refusals, {matched} pixel-exact matches out of {n_attempts}, interintra_hits={}",
+            crate::decode::interintra_hits()
+        );
+    }
+
+
     /// Pinned streams captured by `EC_AV1_GATE_DUMP` off
     /// `a_real_aomenc_stream_with_warped_motion_refuses_or_matches` -- each
     /// one is a former mismatch, kept as a regression pin (warp-mismatch:
     /// the WARPED_CAUSAL interp-read suppression; warp-flake-7: the same
     /// suppression for skip_mode blocks; warp-flake-5: mvstack entry
-    /// clamping). `EC_AV1_GATE_DUMP_PIN` overrides to a single stream.
+    /// clamping; ii-flake-1..8: interintra neighbours excluded from
+    /// warp-sample gathering, ref_frame[1] == INTRA_FRAME in the mi grid).
+    /// `EC_AV1_GATE_DUMP_PIN` overrides to a single stream.
     /// Deterministic and static -- `#[ignore]`d because the gitignored
     /// fixtures dir may be absent; run manually.
     #[test]
@@ -3486,7 +3663,22 @@ mod tests {
         let fixtures = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures");
         let paths: Vec<String> = match std::env::var("EC_AV1_GATE_DUMP_PIN") {
             Ok(p) => vec![p],
-            Err(_) => ["warp-mismatch", "warp-flake-5", "warp-flake-7"]
+            Err(_) => [
+                "warp-mismatch",
+                "warp-flake-5",
+                "warp-flake-7",
+                "ii-flake-1",
+                "ii-flake-2",
+                "ii-flake-3",
+                "ii-flake-5",
+                "ii-flake-6",
+                "ii-flake-7",
+                "ii-flake-8",
+                // switchable_interp missing from reset_counts (counter
+                // saturation slowed the adaptation rate) -- unrelated to
+                // interintra, caught by the same gate.
+                "ii-flake-9",
+            ]
                 .iter()
                 .map(|n| format!("{fixtures}/{n}.obu"))
                 .collect(),
