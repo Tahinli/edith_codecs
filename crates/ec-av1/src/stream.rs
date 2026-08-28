@@ -255,6 +255,11 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         let enable_jnt_comp = parser
             .sequence_header()
             .is_some_and(|seq| seq.enable_jnt_comp);
+        // lane-sb128 r4: `interintra`'s own gating bit -- see decode.rs's
+        // read site doc.
+        let enable_interintra_compound = parser
+            .sequence_header()
+            .is_some_and(|seq| seq.enable_interintra_compound);
         let interp_fixed = match header.interpolation_filter {
             ec_av1_syntax::InterpolationFilter::Switchable => None,
             fixed => Some(crate::mc::InterpFilterKind::from_header(fixed)),
@@ -375,6 +380,7 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 tpl_field.as_ref(),
                 header.reference_select,
                 enable_masked_compound,
+                enable_interintra_compound,
                 enable_jnt_comp,
                 header.skip_mode_present,
                 header.skip_mode_frame,
