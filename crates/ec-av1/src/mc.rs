@@ -411,6 +411,154 @@ pub fn predict_with_filters(
     crate::encode::stage_add(1, stage_t.elapsed());
 }
 
+/// `InterRound1` for a compound ref (spec 7.11.3.2's `isCompound` branch,
+/// `COMPOUND_ROUND1_BITS` in libaom's `convolve.h`): 4 bits shallower than
+/// [`INTER_ROUND_1`] so the vertical pass lands in the `CONV_BUF` domain
+/// (still above 8-bit pixel range) instead of a finished sample --
+/// `predict_compound_intermediate` below stops there and leaves the final
+/// clip to whichever combine step (simple/distance-weighted average, or a
+/// future masked blend) runs on the pair of intermediates.
+const INTER_ROUND_1_COMPOUND: u32 = 7;
+
+/// `InterPostRound` (spec 7.11.3.2): `2 * FILTER_BITS - (InterRound0 +
+/// InterRound1)` with the *compound* `InterRound1` above -- `2*7 - (3+7) ==
+/// 4`. [`combine_compound`] folds this together with `DIST_PRECISION_BITS`
+/// (below) into one final shift.
+const INTER_POST_ROUND: u32 = 4;
+
+/// `DIST_PRECISION_BITS` (spec 7.11.3.15 / libaom `enums.h`): the two
+/// weights [`combine_compound`] takes always sum to `1 << 4 == 16`, whether
+/// they are the simple-average split (8/8) or a distance-weighted split
+/// from [`crate::compound::dist_wtd_comp_weight_assign`].
+const DIST_PRECISION_BITS: u32 = 4;
+
+/// [`predict_with_filters`]'s compound counterpart: same two-pass separable
+/// filter, but the vertical pass rounds by [`INTER_ROUND_1_COMPOUND`]
+/// instead of [`INTER_ROUND_1`] and is never clipped to a pixel -- the
+/// `CONV_BUF` intermediate domain spec 7.11.3.2 keeps a compound block's two
+/// per-reference predictions in until [`combine_compound`] blends them.
+/// `dst` receives one `i32` per sample, row-major, same shape as
+/// [`predict_with_filters`]'s `u8` `dst`.
+///
+/// # Panics
+/// Panics when `dst` is not `block_w * block_h` long, or the reference is
+/// empty.
+#[allow(clippy::too_many_arguments)]
+pub fn predict_compound_intermediate(
+    reference: &[u8],
+    stride: usize,
+    true_width: usize,
+    true_height: usize,
+    x_q4: i32,
+    y_q4: i32,
+    block_w: usize,
+    block_h: usize,
+    h_kind: InterpFilterKind,
+    v_kind: InterpFilterKind,
+    dst: &mut [i32],
+) {
+    assert_eq!(dst.len(), block_w * block_h, "the destination is the block");
+    assert!(!reference.is_empty(), "a reference plane has samples");
+
+    let x0 = x_q4.div_euclid(16);
+    let xfrac = x_q4.rem_euclid(16) as usize;
+    let y0 = y_q4.div_euclid(16);
+    let yfrac = y_q4.rem_euclid(16) as usize;
+
+    let (h_wide, h_narrow) = h_kind.tables();
+    let (v_wide, v_narrow) = v_kind.tables();
+    let h_filter = if block_w <= 4 {
+        &h_narrow[xfrac]
+    } else {
+        &h_wide[xfrac]
+    };
+    let v_filter = if block_h <= 4 {
+        &v_narrow[yfrac]
+    } else {
+        &v_wide[yfrac]
+    };
+
+    let rows = block_h + 7;
+    let mut intermediate = vec![0i32; rows * block_w];
+    for r in 0..rows {
+        let y = y0 - 3 + r as i32;
+        for c in 0..block_w {
+            let mut sum = 0;
+            for (t, &tap) in h_filter.iter().enumerate() {
+                let x = x0 + c as i32 + t as i32 - 3;
+                sum += tap * sample(reference, stride, true_width, true_height, x, y);
+            }
+            intermediate[r * block_w + c] = round2(sum, INTER_ROUND_0);
+        }
+    }
+
+    for row in 0..block_h {
+        for col in 0..block_w {
+            let mut sum = 0;
+            for (t, &tap) in v_filter.iter().enumerate() {
+                sum += tap * intermediate[(row + t) * block_w + col];
+            }
+            dst[row * block_w + col] = round2(sum, INTER_ROUND_1_COMPOUND);
+        }
+    }
+}
+
+/// Blends two [`predict_compound_intermediate`] outputs into a finished
+/// 8-bit block (spec 7.11.3.15's weighted-average combine, the
+/// `comp_group_idx == 0` path -- `fwd_weight`/`bck_weight` are either the
+/// simple-average split `(8, 8)` or [`crate::compound::dist_wtd_comp_weight_assign`]'s
+/// output; both always sum to `1 << DIST_PRECISION_BITS`). Masked compound
+/// (`comp_group_idx == 1`, wedge/diffwtd) is a different combine this
+/// function does not cover -- decode.rs still refuses those by name.
+pub fn combine_compound(
+    pred0: &[i32],
+    pred1: &[i32],
+    fwd_weight: i32,
+    bck_weight: i32,
+    dst: &mut [u8],
+) {
+    assert_eq!(pred0.len(), pred1.len(), "both refs predict the same block");
+    assert_eq!(dst.len(), pred0.len(), "the destination is the block");
+    for i in 0..dst.len() {
+        let sum = pred0[i] * fwd_weight + pred1[i] * bck_weight;
+        dst[i] = round2(sum, INTER_POST_ROUND + DIST_PRECISION_BITS).clamp(0, 255) as u8;
+    }
+}
+
+/// Whole-pel identity case: [`predict_compound_intermediate`]'s two-pass
+/// filter reduces to `16 * source_sample` exactly (the fraction-0 row is a
+/// single `128` tap both passes, and `128*128 == 1 << 14`, `14 - 7 == 7 ==
+/// INTER_ROUND_1_COMPOUND`, so the extra `2^4` of gain the compound path
+/// keeps over [`predict`]'s 11-bit round survives untouched) --
+/// [`combine_compound`] then divides that back out exactly with an 8/8
+/// simple-average weight split, so a compound block whose two references
+/// (and MVs) happen to coincide reproduces the plain source sample, not an
+/// off-by-one from double rounding.
+#[test]
+fn compound_intermediate_whole_pel_identity_round_trips_through_combine() {
+    let reference = vec![100u8; 16 * 16];
+    let mut pred0 = vec![0i32; 16];
+    predict_compound_intermediate(
+        &reference,
+        16,
+        16,
+        16,
+        0,
+        0,
+        4,
+        4,
+        InterpFilterKind::Regular,
+        InterpFilterKind::Regular,
+        &mut pred0,
+    );
+    assert!(pred0.iter().all(|&v| v == 1600), "{pred0:?}");
+
+    let pred1 = pred0.clone();
+    let mut dst = vec![0u8; 16];
+    combine_compound(&pred0, &pred1, 8, 8, &mut dst);
+    assert!(dst.iter().all(|&v| v == 100), "{dst:?}");
+}
+
 #[cfg(test)]
 mod tests {
     use super::{InterpFilterKind, predict, predict_with_filter};

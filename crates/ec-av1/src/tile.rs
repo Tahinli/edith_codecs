@@ -2434,6 +2434,8 @@ pub fn sb_coeff_inter_frame_tile(
                         MiInfo {
                             is_inter: true,
                             ref_frame: LAST_FRAME,
+                            ref_frame1: None,
+                            mv1: None,
                             mv,
                             is_new_mv,
                             size: 8,
@@ -2450,6 +2452,8 @@ pub fn sb_coeff_inter_frame_tile(
                                 MiInfo {
                                     is_inter: true,
                                     ref_frame: LAST_FRAME,
+                                    ref_frame1: None,
+                                    mv1: None,
                                     mv,
                                     is_new_mv,
                                     size: 8,
@@ -2477,6 +2481,8 @@ pub fn sb_coeff_inter_frame_tile(
                                 MiInfo {
                                     is_inter: false,
                                     ref_frame: -1,
+                                    ref_frame1: None,
+                                    mv1: None,
                                     mv: (0, 0),
                                     is_new_mv: false,
                                     size: 8,
@@ -2615,6 +2621,8 @@ fn write_inter_frame_leaf(
                     MiInfo {
                         is_inter: true,
                         ref_frame: LAST_FRAME,
+                        ref_frame1: None,
+                        mv1: None,
                         mv,
                         is_new_mv,
                         size: SUB_MI as usize,
@@ -2642,6 +2650,8 @@ fn write_inter_frame_leaf(
                     MiInfo {
                         is_inter: false,
                         ref_frame: -1,
+                        ref_frame1: None,
+                        mv1: None,
                         mv: (0, 0),
                         is_new_mv: false,
                         size: SUB_MI as usize,
@@ -2803,6 +2813,8 @@ fn write_inter_frame_leaf8(
                     MiInfo {
                         is_inter: true,
                         ref_frame: LAST_FRAME,
+                        ref_frame1: None,
+                        mv1: None,
                         mv,
                         is_new_mv,
                         size: 2,
@@ -2830,6 +2842,8 @@ fn write_inter_frame_leaf8(
                     MiInfo {
                         is_inter: false,
                         ref_frame: -1,
+                        ref_frame1: None,
+                        mv1: None,
                         mv: (0, 0),
                         is_new_mv: false,
                         size: 2,
@@ -5082,6 +5096,8 @@ mod tests {
                             MiInfo {
                                 is_inter: true,
                                 ref_frame: 1,
+                                ref_frame1: None,
+                                mv1: None,
                                 mv,
                                 is_new_mv,
                                 size: 8,
