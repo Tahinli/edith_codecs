@@ -1784,9 +1784,16 @@ mod tests {
         let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
         assert_eq!(frames.len(), frame_count);
         for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-            assert_eq!(got.y, want.y, "frame {i} luma vs ffmpeg");
-            assert_eq!(got.u, want.u, "frame {i} U vs ffmpeg");
-            assert_eq!(got.v, want.v, "frame {i} V vs ffmpeg");
+            // gradients' colors ignore its seed, so this gate encodes fresh
+            // content every run -- a mismatch here may never reproduce.
+            // Self-pin the stream before panicking so the failure is
+            // bisectable (replay: EC_AV1_PIN on scratch_isolate_pinned_mismatch).
+            let ok = got.y == want.y && got.u == want.u && got.v == want.v;
+            if !ok {
+                let pin = std::env::temp_dir().join("ec-av1-deblocking-gate-fail.obu");
+                let _ = std::fs::write(&pin, &stream);
+                panic!("frame {i} mismatch vs ffmpeg -- stream pinned at {}", pin.display());
+            }
         }
     }
 
@@ -1814,7 +1821,8 @@ mod tests {
             return;
         }
         let (width, height, frame_count) = (64usize, 64usize, 4usize);
-        // aomenc's RD is nondeterministic run to run even on a fixed fixture:
+        // The fixture's content varies run to run (lavfi gradients ignores its
+        // seed option for the c0..c7 colors -- they default to "random"), so:
         // most encodes of this recipe trip one of the decoder's NAMED round-2
         // refusals (a reference other than LAST_FRAME, a sub-16 partition --
         // genuine coverage gaps, separately documented), and only some produce
