@@ -1697,17 +1697,24 @@ pub(crate) const ALTREF_FRAME: i8 = 7;
 /// `left_mbmi`) coded a reference in `a_set` vs. `b_set`, and compare: fewer
 /// `a`s than `b`s is context 0, equal is 1 (also every unavailable-neighbour
 /// case, both counts zero), more `a`s is 2.
-fn ref_ctx(above: Option<i8>, left: Option<i8>, a_set: &[i8], b_set: &[i8]) -> usize {
-    let a = [above, left]
-        .into_iter()
-        .flatten()
-        .filter(|r| a_set.contains(r))
-        .count();
-    let b = [above, left]
-        .into_iter()
-        .flatten()
-        .filter(|r| b_set.contains(r))
-        .count();
+// libaom `av1_collect_neighbors_ref_counts` (mvref_common.h): a neighbour
+// contributes ONE count per reference frame it actually names, which for a
+// compound neighbour is BOTH `ref_frame[0]` and `ref_frame[1]` -- not just
+// its first. Every one of these vote functions takes each side's pair
+// (`ref0` always, `ref1` only for a compound neighbour) so a compound
+// neighbour is not undercounted the way a single scalar per side would.
+#[allow(clippy::too_many_arguments)]
+fn ref_ctx(
+    above0: Option<i8>,
+    above1: Option<i8>,
+    left0: Option<i8>,
+    left1: Option<i8>,
+    a_set: &[i8],
+    b_set: &[i8],
+) -> usize {
+    let refs = [above0, above1, left0, left1];
+    let a = refs.into_iter().flatten().filter(|r| a_set.contains(r)).count();
+    let b = refs.into_iter().flatten().filter(|r| b_set.contains(r)).count();
     match a.cmp(&b) {
         std::cmp::Ordering::Less => 0,
         std::cmp::Ordering::Equal => 1,
@@ -1719,22 +1726,46 @@ const FORWARD_REFS: [i8; 4] = [LAST_FRAME, LAST2_FRAME, LAST3_FRAME, GOLDEN_FRAM
 const BACKWARD_REFS: [i8; 3] = [BWDREF_FRAME, ALTREF2_FRAME, ALTREF_FRAME];
 
 /// `av1_get_pred_context_single_ref_p1`: forward vs. backward reference.
-pub(crate) fn single_ref_p1_ctx(above: Option<i8>, left: Option<i8>) -> usize {
-    ref_ctx(above, left, &FORWARD_REFS, &BACKWARD_REFS)
+pub(crate) fn single_ref_p1_ctx(
+    above0: Option<i8>,
+    above1: Option<i8>,
+    left0: Option<i8>,
+    left1: Option<i8>,
+) -> usize {
+    ref_ctx(above0, above1, left0, left1, &FORWARD_REFS, &BACKWARD_REFS)
 }
 
 /// `av1_get_pred_context_single_ref_p2`
 /// (`get_pred_context_brfarf2_or_arf`): `BWDREF`/`ALTREF2` vs. `ALTREF`.
-pub(crate) fn single_ref_p2_ctx(above: Option<i8>, left: Option<i8>) -> usize {
-    ref_ctx(above, left, &[BWDREF_FRAME, ALTREF2_FRAME], &[ALTREF_FRAME])
+pub(crate) fn single_ref_p2_ctx(
+    above0: Option<i8>,
+    above1: Option<i8>,
+    left0: Option<i8>,
+    left1: Option<i8>,
+) -> usize {
+    ref_ctx(
+        above0,
+        above1,
+        left0,
+        left1,
+        &[BWDREF_FRAME, ALTREF2_FRAME],
+        &[ALTREF_FRAME],
+    )
 }
 
 /// `av1_get_pred_context_single_ref_p3`
 /// (`get_pred_context_ll2_or_l3gld`): `LAST`/`LAST2` vs. `LAST3`/`GOLDEN`.
-pub(crate) fn single_ref_p3_ctx(above: Option<i8>, left: Option<i8>) -> usize {
+pub(crate) fn single_ref_p3_ctx(
+    above0: Option<i8>,
+    above1: Option<i8>,
+    left0: Option<i8>,
+    left1: Option<i8>,
+) -> usize {
     ref_ctx(
-        above,
-        left,
+        above0,
+        above1,
+        left0,
+        left1,
         &[LAST_FRAME, LAST2_FRAME],
         &[LAST3_FRAME, GOLDEN_FRAME],
     )
@@ -1742,27 +1773,54 @@ pub(crate) fn single_ref_p3_ctx(above: Option<i8>, left: Option<i8>) -> usize {
 
 /// `av1_get_pred_context_single_ref_p4`
 /// (`get_pred_context_last_or_last2`): `LAST` vs. `LAST2`.
-pub(crate) fn single_ref_p4_ctx(above: Option<i8>, left: Option<i8>) -> usize {
-    ref_ctx(above, left, &[LAST_FRAME], &[LAST2_FRAME])
+pub(crate) fn single_ref_p4_ctx(
+    above0: Option<i8>,
+    above1: Option<i8>,
+    left0: Option<i8>,
+    left1: Option<i8>,
+) -> usize {
+    ref_ctx(above0, above1, left0, left1, &[LAST_FRAME], &[LAST2_FRAME])
 }
 
 /// `av1_get_pred_context_single_ref_p5`
 /// (`get_pred_context_last3_or_gld`): `LAST3` vs. `GOLDEN`.
-pub(crate) fn single_ref_p5_ctx(above: Option<i8>, left: Option<i8>) -> usize {
-    ref_ctx(above, left, &[LAST3_FRAME], &[GOLDEN_FRAME])
+pub(crate) fn single_ref_p5_ctx(
+    above0: Option<i8>,
+    above1: Option<i8>,
+    left0: Option<i8>,
+    left1: Option<i8>,
+) -> usize {
+    ref_ctx(above0, above1, left0, left1, &[LAST3_FRAME], &[GOLDEN_FRAME])
 }
 
 /// `av1_get_pred_context_single_ref_p6`
 /// (`get_pred_context_brf_or_arf2`): `BWDREF` vs. `ALTREF2`.
-pub(crate) fn single_ref_p6_ctx(above: Option<i8>, left: Option<i8>) -> usize {
-    ref_ctx(above, left, &[BWDREF_FRAME], &[ALTREF2_FRAME])
+pub(crate) fn single_ref_p6_ctx(
+    above0: Option<i8>,
+    above1: Option<i8>,
+    left0: Option<i8>,
+    left1: Option<i8>,
+) -> usize {
+    ref_ctx(above0, above1, left0, left1, &[BWDREF_FRAME], &[ALTREF2_FRAME])
 }
 
 /// `av1_get_pred_context_uni_comp_ref_p1`: `LAST2` vs. `LAST3`/`GOLDEN`,
 /// conditioned on a unidirectional pair known to be one of the three
 /// `LAST`-anchored ones (lane-av1comp).
-pub(crate) fn uni_comp_ref_p1_ctx(above: Option<i8>, left: Option<i8>) -> usize {
-    ref_ctx(above, left, &[LAST2_FRAME], &[LAST3_FRAME, GOLDEN_FRAME])
+pub(crate) fn uni_comp_ref_p1_ctx(
+    above0: Option<i8>,
+    above1: Option<i8>,
+    left0: Option<i8>,
+    left1: Option<i8>,
+) -> usize {
+    ref_ctx(
+        above0,
+        above1,
+        left0,
+        left1,
+        &[LAST2_FRAME],
+        &[LAST3_FRAME, GOLDEN_FRAME],
+    )
 }
 
 /// One neighbouring block's reference-frame shape, as
@@ -2369,9 +2427,9 @@ mod tests {
     /// convention).
     #[test]
     fn uni_comp_ref_p1_ctx_matches_ref_ctx_shape() {
-        assert_eq!(uni_comp_ref_p1_ctx(Some(LAST2_FRAME), None), 2);
-        assert_eq!(uni_comp_ref_p1_ctx(Some(LAST3_FRAME), None), 0);
-        assert_eq!(uni_comp_ref_p1_ctx(None, None), 1);
+        assert_eq!(uni_comp_ref_p1_ctx(Some(LAST2_FRAME), None, None, None), 2);
+        assert_eq!(uni_comp_ref_p1_ctx(Some(LAST3_FRAME), None, None, None), 0);
+        assert_eq!(uni_comp_ref_p1_ctx(None, None, None, None), 1);
     }
 
     // --- lane-av1comp step 4: compound mvstack (find_mv_stack_compound) ---
