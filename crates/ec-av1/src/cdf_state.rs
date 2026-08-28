@@ -1038,6 +1038,18 @@ impl Cdfs {
                 tx_type: None,
                 eob_pt_class1: None,
             },
+            // lane-comppin r4 (REVERTED, see r4's own commit message):
+            // `Some(inter_tx_type_32)` looked wrong against aomdec's 32x32
+            // trace (degenerate 1-symbol EC_TXTYPE_VAL=0 read) and matches
+            // spec `av1_get_ext_tx_set_type`'s `EXT_TX_SET_DCTONLY` for
+            // every tx_size_sqr >= TX_32X32 -- but flipping this to `None`
+            // regressed 16 previously-green `ec-av1` tests (full-suite count
+            // went 217/217 -> 201/216), and did NOT fix the pin's own
+            // eob_pt desync either (still reads 6 instead of aomdec's 5
+            // right after this read, proving eob_pt's own context/table
+            // selection is a SEPARATE, still-unfound bug upstream of this
+            // one) -- kept `Some` pending a real fix that ports both without
+            // breaking the 16.
             TxbSet::Luma32Inter => TxbTables {
                 side: 32,
                 txb_skip: &mut self.txb_skip_luma_32,
