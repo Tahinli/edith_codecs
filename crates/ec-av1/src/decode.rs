@@ -957,6 +957,10 @@ struct Neighbours {
     /// transform size, spec 7.14's `get_transform_size`/`get_filter_level`
     /// edge-length lookup (`apply_deblock`).
     tx_grid: Vec<u8>,
+    /// The transform HEIGHT companion to [`Self::tx_grid`]'s width --
+    /// lane-rect r2: TX_32X16/TX_16X32 strips deblock their horizontal
+    /// edges by tx height (spec 7.14.2 `set_lpf_parameters` dir==VERT).
+    tx_h_grid: Vec<u8>,
     /// Per-4x4-mi reference frame (`0` = intra, magnitude `1..=7` =
     /// `MV_REFERENCE_FRAME`, negative = that reference coded as `GLOBALMV` --
     /// `lf_level`'s `mode_lf_lut` row 0, lane-av1golden2)
@@ -1001,6 +1005,7 @@ impl Neighbours {
             skip_grid: vec![false; cols * (SUB / MI) * rows * (SUB / MI)],
             skip_grid_cols_mi: cols * (SUB / MI),
             tx_grid: vec![0u8; cols * (SUB / MI) * rows * (SUB / MI)],
+            tx_h_grid: vec![0u8; cols * (SUB / MI) * rows * (SUB / MI)],
             ref_grid: vec![0i8; cols * (SUB / MI) * rows * (SUB / MI)],
         }
     }
@@ -1010,7 +1015,7 @@ impl Neighbours {
     /// per-edge lookup (`apply_deblock`), filled at the same call sites and
     /// units as [`Self::fill_skip_grid`].
     fn fill_lf_grid(&mut self, at_mi: (usize, usize), side_mi: usize, tx_px: u8, ref_frame: i8) {
-        self.fill_lf_grid_rect(at_mi, side_mi, side_mi, tx_px, ref_frame);
+        self.fill_lf_grid_rect(at_mi, side_mi, side_mi, tx_px, tx_px, ref_frame);
     }
 
     /// [`Self::fill_lf_grid`] with independent row/col extents -- lane-partitions
@@ -1025,6 +1030,7 @@ impl Neighbours {
         w_mi: usize,
         h_mi: usize,
         tx_px: u8,
+        tx_h_px: u8,
         ref_frame: i8,
     ) {
         let (mi_r, mi_c) = at_mi;
@@ -1033,6 +1039,9 @@ impl Neighbours {
                 let idx = (mi_r + rr) * self.skip_grid_cols_mi + (mi_c + cc);
                 if let Some(cell) = self.tx_grid.get_mut(idx) {
                     *cell = tx_px;
+                }
+                if let Some(cell) = self.tx_h_grid.get_mut(idx) {
+                    *cell = tx_h_px;
                 }
                 if let Some(cell) = self.ref_grid.get_mut(idx) {
                     *cell = ref_frame;
@@ -2751,6 +2760,18 @@ fn tx_px_at(n: &Neighbours, chroma: bool, mi_r: usize, mi_c: usize) -> u32 {
     if chroma { luma_tx / 2 } else { luma_tx }
 }
 
+/// [`tx_px_at`]'s HEIGHT twin (lane-rect r2): the deblocker's horizontal
+/// edges step and gate by transform height, which differs from width only
+/// on rect partition strips.
+fn tx_h_px_at(n: &Neighbours, chroma: bool, mi_r: usize, mi_c: usize) -> u32 {
+    let luma_tx = n
+        .tx_h_grid
+        .get(mi_r * n.skip_grid_cols_mi + mi_c)
+        .copied()
+        .unwrap_or(0) as u32;
+    if chroma { luma_tx / 2 } else { luma_tx }
+}
+
 /// `get_tx_size_context` (spec 9.3's `TxDepthCtx`, libaom
 /// `TXFM_CONTEXT`/`entropymode.c`): the sum of two boolean terms, each
 /// present only when its neighbour exists inside the true frame -- whether
@@ -2759,7 +2780,7 @@ fn tx_px_at(n: &Neighbours, chroma: bool, mi_r: usize, mi_c: usize) -> u32 {
 /// as `own_side`.
 fn tx_size_context(n: &Neighbours, (mi_r, mi_c): (usize, usize), own_side: usize) -> usize {
     let above = mi_r > 0 && tx_px_at(n, false, mi_r - 1, mi_c) as usize >= own_side;
-    let left = mi_c > 0 && tx_px_at(n, false, mi_r, mi_c - 1) as usize >= own_side;
+    let left = mi_c > 0 && tx_h_px_at(n, false, mi_r, mi_c - 1) as usize >= own_side;
     usize::from(above) + usize::from(left)
 }
 
@@ -2895,7 +2916,11 @@ fn edge_params(
     y0: usize,
 ) -> Option<(u8, i32)> {
     let (mi_r, mi_c) = (plane_to_mi(chroma, y0), plane_to_mi(chroma, x0));
-    let cur_tx = tx_px_at(n, chroma, mi_r, mi_c);
+    let cur_tx = if dir == 0 {
+        tx_px_at(n, chroma, mi_r, mi_c)
+    } else {
+        tx_h_px_at(n, chroma, mi_r, mi_c)
+    };
     if cur_tx == 0 || (if dir == 0 { x0 } else { y0 }) % cur_tx as usize != 0 {
         return None;
     }
@@ -2905,7 +2930,11 @@ fn edge_params(
     } else {
         (mi_r - 1, mi_c)
     };
-    let pv_tx = tx_px_at(n, chroma, pv_mi_r, pv_mi_c);
+    let pv_tx = if dir == 0 {
+        tx_px_at(n, chroma, pv_mi_r, pv_mi_c)
+    } else {
+        tx_h_px_at(n, chroma, pv_mi_r, pv_mi_c)
+    };
     let pv_ref = n.ref_grid[pv_mi_r * n.skip_grid_cols_mi + pv_mi_c];
 
     let cur_level = lf_level(lf, plane_idx, dir, cur_ref);
@@ -4346,6 +4375,7 @@ fn find_samples(
     mi_row: usize,
     mi_col: usize,
     bw4: usize,
+    bh4: usize,
     mi_cols: usize,
     mi_rows: usize,
     ref_frame: i8,
@@ -4359,7 +4389,11 @@ fn find_samples(
     let mut do_tr = true;
     let rec = |info: &MiInfo, row_offset: i32, sign_r: i32, col_offset: i32, sign_c: i32| {
         let nb_bw = (info.size * 4) as i32;
-        crate::warp::record_sample(nb_bw, nb_bw, info.mv, row_offset, sign_r, col_offset, sign_c)
+        // lane-rect r2: the neighbour's own true height -- a rect strip
+        // neighbour donates its sample at ITS center (aom pts y=-72 for a
+        // 32x16 above strip; the square assumption put it at -136).
+        let nb_bh = (info.size_h * 4) as i32;
+        crate::warp::record_sample(nb_bw, nb_bh, info.mv, row_offset, sign_r, col_offset, sign_c)
     };
 
     'outer: {
@@ -4403,8 +4437,8 @@ fn find_samples(
 
         if left_available {
             let left = grid.get(mi_row, mi_col - 1);
-            let superblock_height = left.map_or(1, |c| c.size).max(1);
-            if bw4 <= superblock_height {
+            let superblock_height = left.map_or(1, |c| c.size_h).max(1);
+            if bh4 <= superblock_height {
                 let row_offset = -((mi_row % superblock_height) as isize);
                 if row_offset < 0 {
                     do_tl = false;
@@ -4419,10 +4453,10 @@ fn find_samples(
                 }
             } else {
                 let mut i = 0usize;
-                let limit = bw4.min(mi_rows.saturating_sub(mi_row));
+                let limit = bh4.min(mi_rows.saturating_sub(mi_row));
                 while i < limit {
                     let cell = grid.get(mi_row + i, mi_col - 1);
-                    let sh = cell.map_or(1, |c| c.size).max(1);
+                    let sh = cell.map_or(1, |c| c.size_h).max(1);
                     if let Some(info) = cell {
                         if single_ref_match(info) {
                             samples.push(rec(info, i as i32, 1, 0, -1));
@@ -4470,11 +4504,12 @@ fn num_proj_ref(
     mi_row: usize,
     mi_col: usize,
     bw4: usize,
+    bh4: usize,
     mi_cols: usize,
     mi_rows: usize,
     ref_frame: i8,
 ) -> u8 {
-    find_samples(grid, mi_row, mi_col, bw4, mi_cols, mi_rows, ref_frame).len() as u8
+    find_samples(grid, mi_row, mi_col, bw4, bh4, mi_cols, mi_rows, ref_frame).len() as u8
 }
 
 /// `av1_get_obmc_mask` (`reconinter.c`): the per-position blend weight
@@ -4669,9 +4704,12 @@ fn obmc_blend(
     mi_row: usize,
     mi_col: usize,
     bw4: usize,
+    bh4: usize,
     mi_rows: usize,
     mi_cols: usize,
     side: usize,
+    write_w: usize,
+    write_h: usize,
     chroma_side: usize,
     px: usize,
     py: usize,
@@ -4686,15 +4724,19 @@ fn obmc_blend(
     pred_u: &mut [u8],
     pred_v: &mut [u8],
 ) -> Result<()> {
-    let max_neighbors = match bw4 {
+    // lane-rect r2 (libaom av1_build_obmc_inter_prediction): each pass has
+    // its OWN neighbour cap (width-log2 for above, height-log2 for left) and
+    // overlap (bh/2 rows above, bw/2 cols left) -- one square `side` was
+    // right only for square blocks.
+    let max_nb = |n4: usize| match n4 {
         1..=4 => 2,
         5..=8 => 3,
         _ => 4,
     };
-    let overlap = side / 2;
-    let coverlap = overlap / 2;
+    let overlap_above = write_h / 2;
+    let overlap_left = write_w / 2;
 
-    for (off4, span4, nb) in overlappable_above(grid, mi_row, mi_col, bw4, mi_cols, max_neighbors)
+    for (off4, span4, nb) in overlappable_above(grid, mi_row, mi_col, bw4, mi_cols, max_nb(bw4))
     {
         // `Neighbours::above_filter` is indexed in `SUB`(16px)-wide columns
         // (this decoder's own outer block-loop granularity), one step
@@ -4705,26 +4747,26 @@ fn obmc_blend(
             neighbours.above_filter[(mi_col + off4) / SUB_MI as usize],
         );
         let (ny, nu, nv) = ref_planes(nb.ref_frame, ref_y, ref_u, ref_v, other_refs)?;
-        let (bw, bh, ox) = (span4 * 4, overlap, off4 * 4);
+        let (bw, bh, ox) = (span4 * 4, overlap_above, off4 * 4);
         let tmp_y = obmc_neighbour_pred(ny, px + ox, py, nb.mv, bw, bh, true, h_kind, v_kind);
         obmc_blend_v(pred_y, side, ox, 0, bw, bh, &tmp_y);
-        let (cbw, cbh, cox) = (bw / 2, coverlap, ox / 2);
+        let (cbw, cbh, cox) = (bw / 2, overlap_above / 2, ox / 2);
         let tmp_u = obmc_neighbour_pred(nu, cpx + cox, cpy, nb.mv, cbw, cbh, false, h_kind, v_kind);
         obmc_blend_v(pred_u, chroma_side, cox, 0, cbw, cbh, &tmp_u);
         let tmp_v = obmc_neighbour_pred(nv, cpx + cox, cpy, nb.mv, cbw, cbh, false, h_kind, v_kind);
         obmc_blend_v(pred_v, chroma_side, cox, 0, cbw, cbh, &tmp_v);
     }
 
-    for (off4, span4, nb) in overlappable_left(grid, mi_row, mi_col, bw4, mi_rows, max_neighbors) {
+    for (off4, span4, nb) in overlappable_left(grid, mi_row, mi_col, bh4, mi_rows, max_nb(bh4)) {
         let (h_kind, v_kind) = neighbour_filter(
             interp_fixed,
             neighbours.left_filter[(mi_row + off4) / SUB_MI as usize],
         );
         let (ny, nu, nv) = ref_planes(nb.ref_frame, ref_y, ref_u, ref_v, other_refs)?;
-        let (bw, bh, oy) = (overlap, span4 * 4, off4 * 4);
+        let (bw, bh, oy) = (overlap_left, span4 * 4, off4 * 4);
         let tmp_y = obmc_neighbour_pred(ny, px, py + oy, nb.mv, bw, bh, true, h_kind, v_kind);
         obmc_blend_h(pred_y, side, 0, oy, bw, bh, &tmp_y);
-        let (cbw, cbh, coy) = (coverlap, bh / 2, oy / 2);
+        let (cbw, cbh, coy) = (overlap_left / 2, bh / 2, oy / 2);
         let tmp_u = obmc_neighbour_pred(nu, cpx, cpy + coy, nb.mv, cbw, cbh, false, h_kind, v_kind);
         obmc_blend_h(pred_u, chroma_side, 0, coy, cbw, cbh, &tmp_u);
         let tmp_v = obmc_neighbour_pred(nv, cpx, cpy + coy, nb.mv, cbw, cbh, false, h_kind, v_kind);
@@ -5313,6 +5355,7 @@ fn decode_inter_block(
                             mv: mv0,
                             is_new_mv: matches!(compound_mode, 2 | 3 | 4 | 5 | 7),
                             size: bw4,
+                            size_h: bh4,
                         },
                     );
                 }
@@ -6096,7 +6139,7 @@ fn decode_inter_block(
                 // instead of the 2-symbol `obmc_cdf` exactly when
                 // `num_proj_ref >= 1` under `allow_warped_motion`.
                 let warp_eligible = allow_warped_motion
-                    && num_proj_ref(grid, mi_row, mi_col, bw4, mi_cols as usize, mi_rows as usize, ref_frame) >= 1;
+                    && num_proj_ref(grid, mi_row, mi_col, bw4, bh4, mi_cols as usize, mi_rows as usize, ref_frame) >= 1;
                 if warp_eligible {
                     let mode = dec.symbol(&mut cdfs.motion_mode[bsize_idx]);
                     match mode {
@@ -6113,6 +6156,7 @@ fn decode_inter_block(
                                 mi_row,
                                 mi_col,
                                 bw4,
+                                bh4,
                                 mi_cols as usize,
                                 mi_rows as usize,
                                 ref_frame,
@@ -6131,8 +6175,11 @@ fn decode_inter_block(
                             }
                             warp_params = crate::warp::find_projection(
                                 &samples,
-                                side as i32,
-                                side as i32,
+                                // lane-rect r2: the block's TRUE dims -- a
+                                // 32x16 strip's model center is not a
+                                // 32x32's (aom av1_find_projection bw/bh).
+                                write_w as i32,
+                                write_h as i32,
                                 mv.1,
                                 mv.0,
                                 mi_row as i32,
@@ -6233,6 +6280,7 @@ fn decode_inter_block(
                             mv,
                             is_new_mv,
                             size: bw4,
+                            size_h: bh4,
                         },
                     );
                 }
@@ -6307,9 +6355,12 @@ fn decode_inter_block(
                     mi_row,
                     mi_col,
                     bw4,
+                    bh4,
                     mi_rows as usize,
                     mi_cols as usize,
                     side,
+                    write_w,
+                    write_h,
                     chroma_side,
                     px,
                     py,
@@ -6475,6 +6526,7 @@ fn decode_inter_block(
                         mv: (0, 0),
                         is_new_mv: false,
                         size: side / 4,
+                        size_h: side / 4,
                     },
                 );
             }
@@ -6623,11 +6675,11 @@ fn decode_inter_block(
         (r * (SUB / MI), c * (SUB / MI)),
         write_w / MI,
         write_h / MI,
-        // lane-warp r5 / lane-partitions r1: `tx_grid` names one scalar
-        // (its own doc comment) -- a true rectangular strip's real
-        // TX_32X16/TX_16X32 keeps using `side`, the same square-context
-        // corner-cut `HORZ_B`'s top strip already shipped.
-        side as u8,
+        // lane-rect r2: the strip's true TX_32X16/TX_16X32 dims -- the
+        // single-scalar corner-cut deblocked the strip seam with the wrong
+        // edge length (1-px chroma drift on rect-flake-1 f17+).
+        write_w as u8,
+        write_h as u8,
         // ref_grid's packed convention (lf_level): sign carries GLOBALMV,
         // whose mode_lf_lut row is 0, not the 1 every other inter mode gets.
         if globalmv_for_lf {
@@ -6932,6 +6984,7 @@ fn decode_inter_block8(
                                 mv: mv0,
                                 is_new_mv: matches!(compound_mode, 2 | 3 | 4 | 5 | 7),
                                 size: 2,
+                                size_h: 2,
                             },
                         );
                     }
@@ -7269,7 +7322,7 @@ fn decode_inter_block8(
             // (see its own doc) -- this leaf is always `LAST_FRAME`-only
             // (grid.set below hardcodes it).
             let warp_eligible = allow_warped_motion
-                && num_proj_ref(grid, mi_row, mi_col, 2, mi_cols as usize, mi_rows as usize, LAST_FRAME) >= 1;
+                && num_proj_ref(grid, mi_row, mi_col, 2, 2, mi_cols as usize, mi_rows as usize, LAST_FRAME) >= 1;
             if warp_eligible {
                 let mode = dec.symbol(&mut cdfs.motion_mode[0]);
                 match mode {
@@ -7312,6 +7365,7 @@ fn decode_inter_block8(
                         mv,
                         is_new_mv,
                         size: 2,
+                        size_h: 2,
                     },
                 );
             }
@@ -7362,8 +7416,11 @@ fn decode_inter_block8(
                 mi_row,
                 mi_col,
                 2,
+                2,
                 mi_rows as usize,
                 mi_cols as usize,
+                SIDE,
+                SIDE,
                 SIDE,
                 CHROMA_SIDE,
                 px,
@@ -7502,6 +7559,7 @@ fn decode_inter_block8(
                         mv: (0, 0),
                         is_new_mv: false,
                         size: 2,
+                        size_h: 2,
                     },
                 );
             }
@@ -9160,6 +9218,7 @@ mod tests {
             mv,
             is_new_mv: false,
             size: 1,
+            size_h: 1,
         };
         for col in mi_col..mi_col + bw4 {
             grid.set(mi_row - 1, col, neighbour(above_mv));
