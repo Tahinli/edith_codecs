@@ -18,6 +18,13 @@
 
 /// Probability precision dropped before the range multiply (spec `EC_PROB_SHIFT`).
 const EC_PROB_SHIFT: u32 = 6;
+
+thread_local! {
+    /// Debug-only tag naming the call site of the in-flight `symbol()` read,
+    /// for the `EC_RNG=1` trace (r5 scratch instrumentation). Set immediately
+    /// before each `dec.symbol()`/`symbol_fixed()` call in decode.rs.
+    pub static CURRENT_OP: std::cell::Cell<&'static str> = const { std::cell::Cell::new("?") };
+}
 /// Minimum interval width reserved for every symbol (spec `EC_MIN_PROB`).
 const EC_MIN_PROB: u32 = 4;
 /// Total probability mass of a CDF (spec `1 << 15`).
@@ -319,8 +326,9 @@ impl<'a> SymbolDecoder<'a> {
             use std::sync::atomic::{AtomicU64, Ordering};
             static EC_RNG_N: AtomicU64 = AtomicU64::new(0);
             let n = EC_RNG_N.fetch_add(1, Ordering::Relaxed);
+            let op = CURRENT_OP.with(|c| c.get());
             eprintln!(
-                "EC_RNG n={n} rng_before={rng_before} rng_after={} nsyms={nsyms} symbol={symbol}",
+                "EC_RNG n={n} op={op} rng_before={rng_before} rng_after={} nsyms={nsyms} symbol={symbol}",
                 self.range
             );
         }
