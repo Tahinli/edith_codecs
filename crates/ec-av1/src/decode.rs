@@ -4668,6 +4668,12 @@ fn decode_inter_block(
             uni: neighbours.left_ref1[r]
                 .is_some_and(|r1| is_uni_comp_ref(neighbours.left_ref[r], r1)),
         });
+        if std::env::var_os("EC_AV1_COMPIDX_DUMP").is_some() {
+            eprintln!(
+                "EC_PRECOMP r={r} c={c} skip_mode={skip_mode} skip={skip} reference_select={reference_select} tell={}",
+                dec.debug_bitpos()
+            );
+        }
         let is_compound =
             skip_mode || (reference_select && read_comp_mode(dec, cdfs, above_nbr, left_nbr));
         if is_compound {
@@ -5015,6 +5021,12 @@ fn decode_inter_block(
                 (8, 8, 1u8)
             };
             compound_ctx = Some((ref1, comp_group_idx as u8, compound_idx));
+            if std::env::var_os("EC_AV1_COMPIDX_DUMP").is_some() {
+                eprintln!(
+                    "EC_COMPIDX mi_row={mi_row} mi_col={mi_col} bsize={side} mode={compound_mode} mv0=({},{}) mv1=({},{}) ref0={ref0} ref1={ref1} comp_group_idx={comp_group_idx} compound_idx={compound_idx} tell={}",
+                    mv0.0, mv0.1, mv1.0, mv1.1, dec.debug_bitpos()
+                );
+            }
 
             // spec 5.11.19/libaom `decodemv.c` 1575: `read_mb_interp_filter`
             // comes AFTER `read_compound_type` (the `comp_group_idx`/
@@ -6014,6 +6026,12 @@ fn decode_inter_block8(
                     (8, 8, 1u8)
                 };
                 compound_ctx8 = Some((ref0, ref1, comp_group_idx as u8, compound_idx));
+                if std::env::var_os("EC_AV1_COMPIDX_DUMP").is_some() {
+                    eprintln!(
+                        "EC_COMPIDX mi_row={mi_row} mi_col={mi_col} bsize=8 mode={compound_mode} mv0=({},{}) mv1=({},{}) ref0={ref0} ref1={ref1} comp_group_idx={comp_group_idx} compound_idx={compound_idx} tell={}",
+                        mv0.0, mv0.1, mv1.0, mv1.1, dec.debug_bitpos()
+                    );
+                }
 
                 let (py0, pu0, pv0) = ref_planes(ref0, ref_y, ref_u, ref_v, other_refs)?;
                 let (py1, pu1, pv1) = ref_planes(ref1, ref_y, ref_u, ref_v, other_refs)?;
