@@ -3677,8 +3677,12 @@ mod tests {
             let source = if attempt % 2 == 0 {
                 format!("gradients=size={width}x{height}:seed={seed}:duration={duration}:rate=25")
             } else {
-                format!("mandelbrot=size={width}x{height}:rate=25:end_pts={frame_count}")
+                // `end_pts` does NOT bound mandelbrot (it generated 300+
+                // frames and hung the gate for an hour); `-t` below is the
+                // real bound, matching every other mandelbrot gate recipe.
+                format!("mandelbrot=size={width}x{height}:rate=25")
             };
+            let duration_arg = format!("{duration}");
             let y4m = Command::new("ffmpeg")
                 .args([
                     "-v",
@@ -3689,6 +3693,8 @@ mod tests {
                     &source,
                     "-pix_fmt",
                     "yuv420p",
+                    "-t",
+                    &duration_arg,
                     "-f",
                     "yuv4mpegpipe",
                     "-",
@@ -3773,16 +3779,11 @@ mod tests {
                         msg.contains("unsupported"),
                         "{NAME} failed outright, not a named refusal (seed {seed}): {msg}"
                     );
-                    assert!(
-                        !msg.contains("wedge"),
-                        "{NAME} refused on wedge (seed {seed}) -- wedge-interintra is ported \
-                         (lane-wii r2) and this recipe keeps masked-comp off: {msg}"
-                    );
-                    assert!(
-                        !msg.contains("interintra"),
-                        "{NAME} refused on interintra (seed {seed}) -- interintra and \
-                         wedge-interintra are both ported: {msg}"
-                    );
+                    // Verifier note (lane-wii r2): no refusal string containing
+                    // "wedge"/"interintra" exists in the decoder any more, so
+                    // string-forbidding asserts here would be vacuous (class
+                    // gate-blind-to-feature). The proof this gate carries is
+                    // pixel-exact decode plus the wii_hits count printed below.
                     named_refusals += 1;
                     eprintln!("seed {seed} refusal (non-wedge capability): {msg}");
                     continue;
@@ -3810,12 +3811,14 @@ mod tests {
             matched > 0,
             "{NAME}: every attempt refused on other capabilities; the gate never exercised wedge-interintra"
         );
-        if crate::decode::wii_hits() == 0 {
-            eprintln!(
-                "{NAME}: {matched} pixel-exact matches but zero wedge-interintra blocks fired \
-                 this run -- encoder never selected wedge; gate soft-skipped, rerun to exercise"
-            );
-        }
+        // Hardened from a soft-note (verifier: gate-blind-to-feature): the
+        // recipe fired wedge-interintra on EVERY one of 6 hammer runs
+        // (wii_hits 2-7), so a zero-hit run is a regression, not sampling.
+        assert!(
+            crate::decode::wii_hits() > 0,
+            "{NAME}: {matched} pixel-exact matches but zero wedge-interintra blocks fired -- \
+             the blend is unexercised (recipe fired 2-7 hits per run when landed)"
+        );
         eprintln!(
             "{NAME}: {named_refusals} other-capability refusals, {matched} pixel-exact matches out of {n_attempts}, wii_hits={}",
             crate::decode::wii_hits()
