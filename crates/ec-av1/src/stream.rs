@@ -3741,11 +3741,11 @@ mod tests {
                 "--enable-onesided-comp=0",
                 "--enable-interintra-wedge=0",
                 "--enable-smooth-interintra=0",
-                // lane-partitions r1: the free (rect=1, min=16) recipe found
-                // and PINNED rect-flake-1.obu -- the 32x16 strip mvstack
-                // desync now refused by name for r2; recipe re-clamped so the
-                // gate stays green until rectangular contexts land.
-                "--enable-rect-partitions=0",
+                // lane-rect r2: HORZ/VERT decode for real (rect-flake-1
+                // byte-exact: size_h + warp dims + OBMC overlap + tx height)
+                // -- free recipe restored; remaining partition kinds refuse
+                // by name and skip their seeds.
+                "--enable-rect-partitions=1",
                 "--enable-ab-partitions=1",
                 "--enable-1to4-partitions=0",
                 "--enable-filter-intra=0",
@@ -3757,7 +3757,7 @@ mod tests {
                 "--enable-cdef=0",
                 "--enable-restoration=0",
                 "--max-partition-size=32",
-                "--min-partition-size=32",
+                "--min-partition-size=16",
                 "--enable-palette=0",
                 "--enable-intrabc=0",
                 "--enable-cfl-intra=0",
@@ -4081,6 +4081,18 @@ mod tests {
                 // saturation slowed the adaptation rate) -- unrelated to
                 // interintra, caught by the same gate.
                 "ii-flake-9",
+                // lane-rect r2: HORZ strip rect defects (mvstack size_h,
+                // warp sample/projection dims, OBMC overlap, deblock tx-h).
+                "rect-flake-1",
+                // scan_row/scan_col weight `inc` min'd by the wrong candidate
+                // axis (width vs height) -- ties reordered DRL entry 1 for a
+                // block under a 32x16 strip, and suppressed the -5 extended
+                // row scan.
+                "rect-flake-2",
+                // overlappable_left stepped the vertical walk by the
+                // neighbour's WIDTH: a 32x16 left strip swallowed the strip
+                // below it, blending the wrong OBMC prediction there.
+                "rect-flake-3",
             ]
                 .iter()
                 .map(|n| format!("{fixtures}/{n}.obu"))

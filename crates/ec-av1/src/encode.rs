@@ -2617,6 +2617,7 @@ pub(crate) fn encode_inter_frame(
                                         mv: info.mv,
                                         is_new_mv: matches!(info.mode, InterMode::NewMv),
                                         size: 8,
+                                        size_h: 8,
                                     },
                                     // Intra: no vote, but still a coded cell
                                     // -- mvstack's extended-scan coverage
@@ -2630,6 +2631,7 @@ pub(crate) fn encode_inter_frame(
                                         mv: (0, 0),
                                         is_new_mv: false,
                                         size: 8,
+                                        size_h: 8,
                                     },
                                 },
                             );
@@ -2709,6 +2711,7 @@ pub(crate) fn encode_inter_frame(
                                                 mv: info.mv,
                                                 is_new_mv: matches!(info.mode, InterMode::NewMv),
                                                 size: 4,
+                                                size_h: 4,
                                             },
                                             None => MiInfo {
                                                 is_inter: false,
@@ -2718,6 +2721,7 @@ pub(crate) fn encode_inter_frame(
                                                 mv: (0, 0),
                                                 is_new_mv: false,
                                                 size: 4,
+                                                size_h: 4,
                                             },
                                         },
                                     );
@@ -2766,6 +2770,7 @@ pub(crate) fn encode_inter_frame(
                                                         InterMode::NewMv
                                                     ),
                                                     size: 2,
+                                                    size_h: 2,
                                                 },
                                                 None => MiInfo {
                                                     is_inter: false,
@@ -2775,6 +2780,7 @@ pub(crate) fn encode_inter_frame(
                                                     mv: (0, 0),
                                                     is_new_mv: false,
                                                     size: 2,
+                                                    size_h: 2,
                                                 },
                                             },
                                         );
