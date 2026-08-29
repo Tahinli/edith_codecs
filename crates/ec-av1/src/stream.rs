@@ -3840,13 +3840,13 @@ mod tests {
                  ({matched} matches, {named_refusals} refusals); sampling, not a regression"
             );
         }
-    eprintln!(
-        "{NAME}: {named_refusals} named refusals, {matched} pixel-exact matches out of {n_attempts}, rect_partition_hits={} extended_partition_hits={} partab_hits={}",
-        crate::decode::rect_partition_hits(),
-        crate::decode::extended_partition_hits(),
-        crate::decode::partab_hits()
-    );
-}
+        eprintln!(
+            "{NAME}: {named_refusals} named refusals, {matched} pixel-exact matches out of {n_attempts}, rect_partition_hits={} extended_partition_hits={} partab_hits={}",
+            crate::decode::rect_partition_hits(),
+            crate::decode::extended_partition_hits(),
+            crate::decode::partab_hits()
+        );
+    }
 
     /// lane-partab r1: `--enable-ab-partitions=1` (aomenc default-on) INTER
     /// streams must consume PARTITION_HORZ_A/VERT_A/VERT_B entropy-exact AND
