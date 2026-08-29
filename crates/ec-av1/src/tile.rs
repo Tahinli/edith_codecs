@@ -2439,6 +2439,7 @@ pub fn sb_coeff_inter_frame_tile(
                             mv,
                             is_new_mv,
                             size: 8,
+                            size_h: 8,
                         },
                     );
                     for dr in 0..8 {
@@ -2457,6 +2458,7 @@ pub fn sb_coeff_inter_frame_tile(
                                     mv,
                                     is_new_mv,
                                     size: 8,
+                                    size_h: 8,
                                 },
                             );
                         }
@@ -2486,6 +2488,7 @@ pub fn sb_coeff_inter_frame_tile(
                                     mv: (0, 0),
                                     is_new_mv: false,
                                     size: 8,
+                                    size_h: 8,
                                 },
                             );
                         }
@@ -2626,6 +2629,7 @@ fn write_inter_frame_leaf(
                         mv,
                         is_new_mv,
                         size: SUB_MI as usize,
+                        size_h: SUB_MI as usize,
                     },
                 );
             }
@@ -2655,6 +2659,7 @@ fn write_inter_frame_leaf(
                         mv: (0, 0),
                         is_new_mv: false,
                         size: SUB_MI as usize,
+                        size_h: SUB_MI as usize,
                     },
                 );
             }
@@ -2818,6 +2823,7 @@ fn write_inter_frame_leaf8(
                         mv,
                         is_new_mv,
                         size: 2,
+                        size_h: 2,
                     },
                 );
             }
@@ -2847,6 +2853,7 @@ fn write_inter_frame_leaf8(
                         mv: (0, 0),
                         is_new_mv: false,
                         size: 2,
+                        size_h: 2,
                     },
                 );
             }
@@ -5101,6 +5108,7 @@ mod tests {
                                 mv,
                                 is_new_mv,
                                 size: 8,
+                                size_h: 8,
                             },
                         );
                     }
