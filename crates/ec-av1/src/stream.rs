@@ -3840,12 +3840,13 @@ mod tests {
                  ({matched} matches, {named_refusals} refusals); sampling, not a regression"
             );
         }
-        eprintln!(
-            "{NAME}: {named_refusals} named refusals, {matched} pixel-exact matches out of {n_attempts}, rect_partition_hits={} extended_partition_hits={}",
-            crate::decode::rect_partition_hits(),
-            crate::decode::extended_partition_hits()
-        );
-    }
+    eprintln!(
+        "{NAME}: {named_refusals} named refusals, {matched} pixel-exact matches out of {n_attempts}, rect_partition_hits={} extended_partition_hits={} partab_hits={}",
+        crate::decode::rect_partition_hits(),
+        crate::decode::extended_partition_hits(),
+        crate::decode::partab_hits()
+    );
+}
 
     /// lane-maskcomp r2 / lane-wedge r3: `--enable-masked-comp=1` streams
     /// must consume `compound_type`/`wedge_idx`/`wedge_sign`/`mask_type`
