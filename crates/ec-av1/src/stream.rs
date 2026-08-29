@@ -3847,14 +3847,18 @@ mod tests {
         );
     }
 
-    /// lane-maskcomp r2: `--enable-masked-comp=1 --enable-dist-wtd-comp=1`
-    /// streams must consume `compound_type`/`wedge_idx`/`wedge_sign`/
-    /// `mask_type` entropy-exact AND build the real DIFFWTD blend --
-    /// `masked_compound_hits() > 0` is now a hard assert, and a
-    /// `COMPOUND_DIFFWTD` refusal is FORBIDDEN (matches interintra's own
-    /// gate). `COMPOUND_WEDGE` refusals are still EXPECTED (r2 scope:
-    /// wedge mask codebook not ported, charter's mergeable-partial
-    /// fallback) -- counted separately, never asserted against.
+    /// lane-maskcomp r2 / lane-wedge r3: `--enable-masked-comp=1` streams
+    /// must consume `compound_type`/`wedge_idx`/`wedge_sign`/`mask_type`
+    /// entropy-exact AND build the real blend, DIFFWTD or WEDGE --
+    /// `masked_compound_hits() > 0` is a hard assert and BOTH
+    /// `COMPOUND_DIFFWTD` and `COMPOUND_WEDGE` refusals are now FORBIDDEN
+    /// (matches interintra's own gate). r3: `--enable-dist-wtd-comp=0`
+    /// (forces the masked choice toward wedge when comp_group_idx==1) plus
+    /// a hard-diagonal-edge `geq` source (wedge's OBLIQUE directions favor
+    /// a real diagonal edge over the r2 gradients content) to fire
+    /// COMPOUND_WEDGE live; `wedge_hits()` is soft-skipped (not hard
+    /// asserted) on a zero-hit run -- the recipe search is not proven to
+    /// converge every run, see charter's "if no recipe fires" fallback.
     #[test]
     fn a_real_aomenc_stream_with_masked_compound_decodes_pixel_exact() {
         const NAME: &str = "a_real_aomenc_stream_with_masked_compound_decodes_pixel_exact";
@@ -3869,7 +3873,6 @@ mod tests {
         }
         let (width, height, frame_count) = (64usize, 64usize, 24usize);
         let mut named_refusals = 0u32;
-        let mut masked_refusals = 0u32;
         let mut matched = 0u32;
         let n_attempts: u32 = std::env::var("EC_MASKCOMP_GATE_ATTEMPTS")
             .ok()
@@ -3878,8 +3881,15 @@ mod tests {
         for attempt in 0..n_attempts {
             let seed = 42 + attempt;
             let duration = frame_count as f64 / 25.0;
-            let source =
-                format!("gradients=size={width}x{height}:seed={seed}:duration={duration}:rate=25");
+            // lane-wedge r3: a hard diagonal edge (not a smooth gradient)
+            // is the content wedge's OBLIQUE master masks are shaped for --
+            // `mandelbrot`'s pan position varies the edge angle/position
+            // across attempts the way the r2 gradients seed did.
+            let source = format!(
+                "mandelbrot=size={width}x{height}:rate=25:start_x={sx}:start_y={sy}",
+                sx = -0.6 + 0.005 * (attempt as f64),
+                sy = -0.4 + 0.005 * (attempt as f64)
+            );
             let y4m = Command::new("ffmpeg")
                 .args([
                     "-v",
@@ -3888,6 +3898,8 @@ mod tests {
                     "lavfi",
                     "-i",
                     &source,
+                    "-t",
+                    &duration.to_string(),
                     "-pix_fmt",
                     "yuv420p",
                     "-f",
@@ -3918,10 +3930,18 @@ mod tests {
                 "--enable-fwd-kf=0",
                 "--enable-order-hint=1",
                 "--enable-warped-motion=1",
+                // r3: mandelbrot's pan/zoom triggers aomenc's single-ref
+                // GLOBALMV global-motion search (a capability distinct from
+                // and outside this lane's scope) -- off, matching this
+                // gate's own goal of exercising masked compound, not GM.
+                "--enable-global-motion=0",
                 "--enable-obmc=1",
                 "--tune-content=default",
                 "--enable-masked-comp=1",
-                "--enable-dist-wtd-comp=1",
+                // r3: force the masked choice toward wedge (r2 always set
+                // this =1; distance-weighted compound competes with the
+                // wedge/diffwtd choice for the same comp_group_idx==1 slot).
+                "--enable-dist-wtd-comp=0",
                 "--enable-interintra-comp=1",
                 "--enable-onesided-comp=0",
                 "--enable-interintra-wedge=0",
@@ -3979,21 +3999,17 @@ mod tests {
                         !msg.contains("warp"),
                         "{NAME} refused on warp (seed {seed}) -- warp decode is ported: {msg}"
                     );
-                    if msg.contains("masked COMPOUND_REFERENCE") {
-                        assert!(
-                            msg.contains("COMPOUND_WEDGE"),
-                            "{NAME} refused a non-wedge masked-compound block (seed {seed}) \
-                             -- DIFFWTD blend is ported, this refusal is forbidden: {msg}"
-                        );
-                        masked_refusals += 1;
-                    } else {
-                        assert!(
-                            !msg.contains("interintra"),
-                            "{NAME} refused on interintra (seed {seed}) -- non-wedge \
-                             interintra is ported: {msg}"
-                        );
-                        named_refusals += 1;
-                    }
+                    assert!(
+                        !msg.contains("masked COMPOUND_REFERENCE"),
+                        "{NAME} refused a masked-compound block (seed {seed}) -- both DIFFWTD \
+                         and WEDGE blends are ported, this refusal is forbidden: {msg}"
+                    );
+                    assert!(
+                        !msg.contains("interintra"),
+                        "{NAME} refused on interintra (seed {seed}) -- non-wedge \
+                         interintra is ported: {msg}"
+                    );
+                    named_refusals += 1;
                     eprintln!("seed {seed} refusal: {msg}");
                     if std::env::var_os("EC_AV1_GATE_DUMP").is_some() {
                         // r1's self-pin is armed via EC_AV1_GATE_DUMP=<path>
@@ -4034,15 +4050,25 @@ mod tests {
         // soft-skipped -- hard assert, matching the interintra gate.
         assert!(
             crate::decode::masked_compound_hits() > 0,
-            "{NAME}: zero masked-compound blocks fired ({masked_refusals} wedge refusals, \
-             {matched} matches, {named_refusals} other refusals out of {n_attempts}) -- gate \
-             proved nothing this run"
+            "{NAME}: zero masked-compound blocks fired ({matched} matches, {named_refusals} \
+             other refusals out of {n_attempts}) -- gate proved nothing this run"
         );
+        // r3: wedge_hits() is soft-skipped, not hard-asserted -- the recipe
+        // search (dist-wtd-comp=0 + diagonal mandelbrot content) is not
+        // proven to fire wedge on every run; charter's fallback is to land
+        // the checksum-verified codebook + blend with this soft path.
+        if crate::decode::wedge_hits() == 0 {
+            eprintln!(
+                "{NAME}: WARNING wedge_hits()==0 this run -- COMPOUND_WEDGE never fired \
+                 ({matched} matches, {named_refusals} refusals out of {n_attempts}); codebook \
+                 is checksum-verified but unexercised live this run"
+            );
+        }
         eprintln!(
-            "{NAME}: {named_refusals} other-capability refusals, {masked_refusals} expected \
-             COMPOUND_WEDGE refusals (r2 scope: wedge unported), {matched} pixel-exact matches \
-             out of {n_attempts}, masked_compound_hits={}",
-            crate::decode::masked_compound_hits()
+            "{NAME}: {named_refusals} other-capability refusals, {matched} pixel-exact matches \
+             out of {n_attempts}, masked_compound_hits={} wedge_hits={}",
+            crate::decode::masked_compound_hits(),
+            crate::decode::wedge_hits()
         );
     }
 
