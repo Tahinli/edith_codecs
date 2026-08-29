@@ -229,6 +229,17 @@ pub(crate) fn wedge_hits() -> usize {
     WEDGE_HITS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// How many blocks decoded a real wedge-INTERINTRA block
+/// (`interintra == 1 && use_wedge_interintra == 1`) -- lane-wii r2's proof
+/// a gate fixture exercised the wedge blend (fixed sign 0), not just the
+/// smooth arm counted by `INTERINTRA_HITS`.
+static WII_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Current value of [`WII_HITS`].
+pub(crate) fn wii_hits() -> usize {
+    WII_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Current value of [`OBMC_HITS_8`].
 pub(crate) fn obmc_hits_8() -> usize {
     OBMC_HITS_8.load(std::sync::atomic::Ordering::Relaxed)
@@ -4640,7 +4651,17 @@ const II_WEIGHTS_1D: [u8; 128] = [
 /// in `pred`: `comp = (mask*intra + (64-mask)*inter + 32) >> 6`
 /// (`aom_blend_a64_mask`, intra as src0). `ii_size_scales[plane_bsize]`
 /// reduces to `128 / side` for the square plane sizes this decoder reaches.
-fn interintra_blend(plane: &PlaneBuf, x: usize, y: usize, side: usize, ii_mode: u8, pred: &mut [u8]) {
+/// lane-wii r2: `wedge == Some(..)` replaces the mode mask with the wedge
+/// codebook mask (fixed sign 0; luma stride, 2x2 box-averaged for chroma).
+fn interintra_blend(
+    plane: &PlaneBuf,
+    x: usize,
+    y: usize,
+    side: usize,
+    ii_mode: u8,
+    wedge: Option<(&'static [u8], usize)>,
+    pred: &mut [u8],
+) {
     // `interintra_to_intra_mode`: II_DC/II_V/II_H/II_SMOOTH.
     let intra_mode = match ii_mode {
         0 => crate::intra::DC_PRED,
@@ -4675,11 +4696,28 @@ fn interintra_blend(plane: &PlaneBuf, x: usize, y: usize, side: usize, ii_mode: 
     let scale = 128 / side;
     for i in 0..side {
         for j in 0..side {
-            let m = u32::from(match ii_mode {
-                0 => 32,
-                1 => II_WEIGHTS_1D[i * scale],
-                2 => II_WEIGHTS_1D[j * scale],
-                _ => II_WEIGHTS_1D[i.min(j) * scale],
+            let m = u32::from(match wedge {
+                // lane-wii r2: wedge-interintra mask (aom_blend_a64_mask
+                // over the wedge codebook, intra as src0, fixed sign 0).
+                // Luma plane: mask rows are luma-resolution, ms == side.
+                // 4:2:0 chroma: 2x2 box average (reconinter.c sub8x8 --
+                // subw == subh == 1).
+                Some((mask, ms)) if ms == side => mask[i * side + j],
+                Some((mask, ms)) => {
+                    let t = 2 * i * ms + 2 * j;
+                    ((u32::from(mask[t])
+                        + u32::from(mask[t + 1])
+                        + u32::from(mask[t + ms])
+                        + u32::from(mask[t + ms + 1])
+                        + 2)
+                        >> 2) as u8
+                }
+                None => match ii_mode {
+                    0 => 32,
+                    1 => II_WEIGHTS_1D[i * scale],
+                    2 => II_WEIGHTS_1D[j * scale],
+                    _ => II_WEIGHTS_1D[i.min(j) * scale],
+                },
             });
             let idx = i * side + j;
             pred[idx] =
@@ -6077,6 +6115,7 @@ fn decode_inter_block(
             // `SINGLE_INTER_MODE_START..END` by construction).
             // `size_group_lookup`: BLOCK_16X16 -> 2, BLOCK_32X32 -> 3.
             let mut interintra_mode: Option<u8> = None;
+            let mut wedge_mask: Option<(&'static [u8], usize)> = None;
             if enable_interintra_compound && !skip_mode && (side == 16 || side == 32) {
                 let bsize_group = if side == 16 { 2 } else { 3 };
                 let interintra = dec.symbol(&mut cdfs.interintra[bsize_group]) == 1;
@@ -6089,12 +6128,21 @@ fn decode_inter_block(
                     let wedge_bsize = if side == 16 { 6 } else { 9 };
                     let wedge = dec.symbol(&mut cdfs.wedge_interintra[wedge_bsize]) == 1;
                     if wedge {
-                        return Err(unsupported(
-                            "a wedge-interintra block (use_wedge_interintra == 1, \
-                             wedge-masked blending unimplemented)",
+                        // lane-wii r2 (spec 5.11.25): `wedge_index` is an
+                        // ADAPTING CDF symbol over the same `wedge_bsize` row;
+                        // NO sign symbol follows -- libaom fixes
+                        // INTERINTRA_WEDGE_SIGN 0 (blockd.h).
+                        let wedge_index = dec.symbol(&mut cdfs.wedge_idx[wedge_bsize]);
+                        WII_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        wedge_mask = Some((
+                            crate::wedge::wedge_masks()
+                                .codebook(side)
+                                .mask(0, wedge_index as usize),
+                            side,
                         ));
+                    } else {
+                        INTERINTRA_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
-                    INTERINTRA_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     interintra_mode = Some(ii);
                 }
             }
@@ -6413,9 +6461,9 @@ fn decode_inter_block(
             // result, all planes (reconinter.c av1_build_interintra_predictor
             // plane loop).
             if let Some(ii) = interintra_mode {
-                interintra_blend(y, px, py, side, ii, &mut pred_y);
-                interintra_blend(u, cpx, cpy, chroma_side, ii, &mut pred_u);
-                interintra_blend(v, cpx, cpy, chroma_side, ii, &mut pred_v);
+                interintra_blend(y, px, py, side, ii, wedge_mask, &mut pred_y);
+                interintra_blend(u, cpx, cpy, chroma_side, ii, wedge_mask, &mut pred_u);
+                interintra_blend(v, cpx, cpy, chroma_side, ii, wedge_mask, &mut pred_v);
             }
 
             if skip {
@@ -7318,6 +7366,7 @@ fn decode_inter_block8(
         // (compound already returned above), GLOBALMV already refused
         // (round 3), so the only real gate left is the header enable bit.
         let mut interintra_mode: Option<u8> = None;
+        let mut wedge_mask: Option<(&'static [u8], usize)> = None;
         if enable_interintra_compound && !skip_mode {
             let interintra = dec.symbol(&mut cdfs.interintra[SIZE_GROUP_8]) == 1;
             if interintra {
@@ -7327,12 +7376,19 @@ fn decode_inter_block8(
                 let ii = dec.symbol(&mut cdfs.interintra_mode[SIZE_GROUP_8]) as u8;
                 let wedge = dec.symbol(&mut cdfs.wedge_interintra[3]) == 1;
                 if wedge {
-                    return Err(unsupported(
-                        "a wedge-interintra block (use_wedge_interintra == 1, \
-                         wedge-masked blending unimplemented)",
+                    // lane-wii r2: same adapting `wedge_index` symbol as the
+                    // 16/32 leaf, fixed sign 0 -- see that site's comment.
+                    let wedge_index = dec.symbol(&mut cdfs.wedge_idx[3]);
+                    WII_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    wedge_mask = Some((
+                        crate::wedge::wedge_masks()
+                            .codebook(SIDE)
+                            .mask(0, wedge_index as usize),
+                        SIDE,
                     ));
+                } else {
+                    INTERINTRA_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
-                INTERINTRA_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 interintra_mode = Some(ii);
             }
         }
@@ -7473,9 +7529,9 @@ fn decode_inter_block8(
         // Non-wedge interintra blend, mutually exclusive with OBMC (the
         // motion_mode symbol is not read for an interintra block).
         if let Some(ii) = interintra_mode {
-            interintra_blend(y, px, py, SIDE, ii, &mut pred_y);
-            interintra_blend(u, cpx, cpy, CHROMA_SIDE, ii, &mut pred_u);
-            interintra_blend(v, cpx, cpy, CHROMA_SIDE, ii, &mut pred_v);
+            interintra_blend(y, px, py, SIDE, ii, wedge_mask, &mut pred_y);
+            interintra_blend(u, cpx, cpy, CHROMA_SIDE, ii, wedge_mask, &mut pred_u);
+            interintra_blend(v, cpx, cpy, CHROMA_SIDE, ii, wedge_mask, &mut pred_v);
         }
 
         if skip {
