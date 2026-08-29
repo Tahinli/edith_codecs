@@ -9085,7 +9085,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                     }
                     _ => {
                         return Err(unsupported(format!(
-                            "a partition type this encoder never writes (value={part32})"
+                            "an INTER 32x32 partition type this encoder never writes (value={part32})"
                         )));
                     }
                 }

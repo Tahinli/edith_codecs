@@ -3848,6 +3848,184 @@ mod tests {
     );
 }
 
+    /// lane-partab r1: `--enable-ab-partitions=1` (aomenc default-on) INTER
+    /// streams must consume PARTITION_HORZ_A/VERT_A/VERT_B entropy-exact AND
+    /// decode pixel-exact -- `partab_hits() > 0` is soft-skipped on a
+    /// zero-hit run (aomenc RD may legitimately never pick an AB split in a
+    /// small window, same sampling caveat as wedge/rect). The INTER AB
+    /// refusal is FORBIDDEN (decode.rs names it "an INTER 32x32 partition
+    /// ..."); intra-frame AB refusals stay accepted named refusals -- the
+    /// intra dispatch is a later lane. Recipe = the free-partition gate's,
+    /// which fires AB live (r1: partab_hits 6/2/4/3/1/5 over six
+    /// 40-attempt runs).
+    #[test]
+    fn a_real_aomenc_stream_with_ab_partitions_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_stream_with_ab_partitions_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height, frame_count) = (64usize, 64usize, 24usize);
+        let mut named_refusals = 0u32;
+        let mut matched = 0u32;
+        let n_attempts: u32 = std::env::var("EC_RECTGATE_ATTEMPTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(40);
+        for attempt in 0..n_attempts {
+            let seed = 42 + attempt;
+            let duration = frame_count as f64 / 25.0;
+            let source =
+                format!("gradients=size={width}x{height}:seed={seed}:duration={duration}:rate=25");
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let args: Vec<&str> = vec![
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                "--cq-level=45",
+                "--cpu-used=0",
+                "--kf-max-dist=1000",
+                "--threads=1",
+                "--row-mt=0",
+                "--auto-alt-ref=1",
+                "--lag-in-frames=16",
+                "--enable-fwd-kf=0",
+                "--enable-order-hint=1",
+                "--enable-warped-motion=1",
+                "--enable-obmc=1",
+                "--tune-content=default",
+                "--enable-masked-comp=0",
+                "--enable-interintra-comp=0",
+                "--enable-onesided-comp=0",
+                "--enable-interintra-wedge=0",
+                "--enable-smooth-interintra=0",
+                // lane-rect r2 recipe, kept byte-identical by lane-partab
+                // r1: free partition search, 1to4 off, intra tools off.
+                "--enable-rect-partitions=1",
+                "--enable-ab-partitions=1",
+                "--enable-1to4-partitions=0",
+                "--enable-filter-intra=0",
+                "--enable-smooth-intra=0",
+                "--enable-paeth-intra=0",
+                "--enable-directional-intra=0",
+                "--enable-angle-delta=0",
+                "--enable-tx-size-search=0",
+                "--enable-cdef=0",
+                "--enable-restoration=0",
+                "--max-partition-size=32",
+                "--min-partition-size=16",
+                "--enable-palette=0",
+                "--enable-intrabc=0",
+                "--enable-cfl-intra=0",
+                "--enable-ref-frame-mvs=0",
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ];
+            let mut child = Command::new(aomenc_path())
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let frames = match decode_stream(&stream) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME} failed outright, not a named refusal (seed {seed}): {msg}"
+                    );
+                    for banned in ["warp", "obmc", "interintra"] {
+                        assert!(
+                            !msg.contains(banned),
+                            "{NAME} refused on {banned} (seed {seed}) -- that capability is \
+                             ported and this recipe does not need it: {msg}"
+                        );
+                    }
+                    for v in [4, 6, 7] {
+                        assert!(
+                            !msg.contains(&format!(
+                                "an INTER 32x32 partition type this encoder never writes \
+                                 (value={v})"
+                            )),
+                            "{NAME} refused an INTER AB partition (value={v}, seed {seed}) -- \
+                             all three AB arms are ported, this refusal is forbidden: {msg}"
+                        );
+                    }
+                    named_refusals += 1;
+                    eprintln!("seed {seed} refusal: {msg}");
+                    continue;
+                }
+                Ok(frames) => frames,
+            };
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
+            assert_eq!(frames.len(), frame_count);
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
+                assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
+            }
+            matched += 1;
+        }
+        assert!(
+            matched > 0,
+            "{NAME}: every attempt refused; the gate never decoded a stream"
+        );
+        if crate::decode::partab_hits() == 0 {
+            eprintln!(
+                "{NAME}: SOFT-NOTE -- zero AB partitions fired this run \
+                 ({matched} matches, {named_refusals} refusals); sampling, not a regression"
+            );
+        }
+        eprintln!(
+            "{NAME}: {named_refusals} named refusals, {matched} pixel-exact matches out of {n_attempts}, partab_hits={}",
+            crate::decode::partab_hits()
+        );
+    }
+
     /// lane-maskcomp r2 / lane-wedge r3: `--enable-masked-comp=1` streams
     /// must consume `compound_type`/`wedge_idx`/`wedge_sign`/`mask_type`
     /// entropy-exact AND build the real blend, DIFFWTD or WEDGE --
