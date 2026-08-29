@@ -34,3 +34,4 @@ pub mod stream;
 pub mod tile;
 pub mod transform;
 mod warp;
+mod wedge;

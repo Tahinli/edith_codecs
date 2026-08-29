@@ -215,6 +215,17 @@ pub(crate) fn masked_compound_hits() -> usize {
     MASKED_COMPOUND_HITS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// How many blocks decoded a real `COMPOUND_WEDGE` block (`comp_group_idx ==
+/// 1`, `compound_type == 0`) -- lane-wedge r3's proof a gate fixture
+/// actually exercised the wedge blend, not just the DIFFWTD half of
+/// `MASKED_COMPOUND_HITS`.
+static WEDGE_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Current value of [`WEDGE_HITS`].
+pub(crate) fn wedge_hits() -> usize {
+    WEDGE_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Current value of [`OBMC_HITS_8`].
 pub(crate) fn obmc_hits_8() -> usize {
     OBMC_HITS_8.load(std::sync::atomic::Ordering::Relaxed)
@@ -5379,12 +5390,12 @@ fn decode_inter_block(
             } else {
                 0
             };
-            // lane-maskcomp r2: `Some(mask_type)` only for a real
-            // `COMPOUND_DIFFWTD` block (`comp_group_idx == 1`, `compound_type
-            // == 1`) -- wedge (`compound_type == 0`) still refuses by name,
-            // its mask codebook unported (charter's mergeable-partial
-            // fallback).
+            // lane-maskcomp r2 / lane-wedge r3: `Some(mask_type)` for a
+            // `COMPOUND_DIFFWTD` block, `Some(mask)` (wedge codebook lookup)
+            // for a `COMPOUND_WEDGE` block -- exactly one of the two is set
+            // when `comp_group_idx == 1`.
             let mut diffwtd_mask_type: Option<u8> = None;
+            let mut wedge_mask: Option<&'static [u8]> = None;
             if comp_group_idx == 1 {
                 // lane-maskcomp r1: `read_compound_type` (spec 5.11.25,
                 // libaom `decodemv.c` 1634-1656). `is_interinter_compound_used
@@ -5402,20 +5413,21 @@ fn decode_inter_block(
                 };
                 let compound_type = dec.symbol(&mut cdfs.compound_type[wedge_bsize]);
                 if compound_type == 0 {
-                    // COMPOUND_WEDGE: mask codebook not ported (r2 scope).
-                    let _wedge_index = dec.symbol(&mut cdfs.wedge_idx[wedge_bsize]);
-                    let _wedge_sign = dec.literal(1);
-                    MASKED_COMPOUND_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    return Err(unsupported(
-                        "a masked COMPOUND_REFERENCE block (comp_group_idx == 1, \
-                         COMPOUND_WEDGE) -- syntax consumed entropy-exact (compound_type/\
-                         wedge_idx/wedge_sign), but this decoder's wedge mask codebook is \
-                         not ported (lane-maskcomp r2 scope: DIFFWTD only)",
-                    ));
+                    // COMPOUND_WEDGE: lane-wedge r3, codebook checksum-
+                    // verified vs independent C dump (wedge.rs).
+                    let wedge_index = dec.symbol(&mut cdfs.wedge_idx[wedge_bsize]);
+                    let wedge_sign = dec.literal(1);
+                    WEDGE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    wedge_mask = Some(
+                        crate::wedge::wedge_masks()
+                            .codebook(side)
+                            .mask(wedge_sign as usize, wedge_index as usize),
+                    );
+                } else {
+                    // COMPOUND_DIFFWTD: `mask_type`, MAX_DIFFWTD_MASK_BITS==1.
+                    let mask_type = dec.literal(1);
+                    diffwtd_mask_type = Some(mask_type as u8);
                 }
-                // COMPOUND_DIFFWTD: `mask_type`, MAX_DIFFWTD_MASK_BITS==1.
-                let mask_type = dec.literal(1);
-                diffwtd_mask_type = Some(mask_type as u8);
                 MASKED_COMPOUND_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             // corner-cut (lane-av1comp r16/r17, lane-av1blend r1): r16/r17
@@ -5705,18 +5717,20 @@ fn decode_inter_block(
             );
             let mut pred_y = vec![0u8; side * side];
             let mut diffwtd_mask_y = Vec::new();
-            if let Some(mask_type) = diffwtd_mask_type {
+            // lane-wedge r3: `mask_y` is the DIFFWTD buffer just computed OR
+            // the wedge codebook lookup (comp_group_idx==1's two mutually
+            // exclusive branches) -- same [`mc::blend_masked_compound`] call
+            // either way, only the mask source differs.
+            let mask_y: Option<&[u8]> = if let Some(mask_type) = diffwtd_mask_type {
                 diffwtd_mask_y = vec![0u8; side * side];
                 mc::diffwtd_mask(&inter0_y, &inter1_y, mask_type == 1, &mut diffwtd_mask_y);
+                Some(diffwtd_mask_y.as_slice())
+            } else {
+                wedge_mask
+            };
+            if let Some(mask_y) = mask_y {
                 mc::blend_masked_compound(
-                    &inter0_y,
-                    &inter1_y,
-                    &diffwtd_mask_y,
-                    side,
-                    side,
-                    side,
-                    false,
-                    &mut pred_y,
+                    &inter0_y, &inter1_y, mask_y, side, side, side, false, &mut pred_y,
                 );
             } else {
                 mc::combine_compound(&inter0_y, &inter1_y, fwd_offset, bck_offset, &mut pred_y);
@@ -5751,11 +5765,11 @@ fn decode_inter_block(
                 &mut inter1_u,
             );
             let mut pred_u = vec![0u8; chroma_side * chroma_side];
-            if diffwtd_mask_type.is_some() {
+            if let Some(mask_y) = mask_y {
                 mc::blend_masked_compound(
                     &inter0_u,
                     &inter1_u,
-                    &diffwtd_mask_y,
+                    mask_y,
                     side,
                     chroma_side,
                     chroma_side,
@@ -5795,11 +5809,11 @@ fn decode_inter_block(
                 &mut inter1_v,
             );
             let mut pred_v = vec![0u8; chroma_side * chroma_side];
-            if diffwtd_mask_type.is_some() {
+            if let Some(mask_y) = mask_y {
                 mc::blend_masked_compound(
                     &inter0_v,
                     &inter1_v,
-                    &diffwtd_mask_y,
+                    mask_y,
                     side,
                     chroma_side,
                     chroma_side,
@@ -6898,27 +6912,30 @@ fn decode_inter_block8(
                 } else {
                     0
                 };
-                // lane-maskcomp r2: see the 16x16/32x32 leaf's own comment.
+                // lane-maskcomp r2 / lane-wedge r3: see the 16x16/32x32
+                // leaf's own comment.
                 let mut diffwtd_mask_type: Option<u8> = None;
+                let mut wedge_mask: Option<&'static [u8]> = None;
                 if comp_group_idx == 1 {
                     // lane-maskcomp r1: see the 16x16 leaf's own comment
                     // above -- SIDE==8 here, `wedge_bsize` index 3
                     // (BLOCK_8X8, `wedge_types > 0`).
                     let compound_type = dec.symbol(&mut cdfs.compound_type[3]);
                     if compound_type == 0 {
-                        // COMPOUND_WEDGE: mask codebook not ported (r2 scope).
-                        let _wedge_index = dec.symbol(&mut cdfs.wedge_idx[3]);
-                        let _wedge_sign = dec.literal(1);
-                        MASKED_COMPOUND_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        return Err(unsupported(
-                            "a masked COMPOUND_REFERENCE 8x8 leaf (comp_group_idx == 1, \
-                             COMPOUND_WEDGE) -- syntax consumed entropy-exact (compound_type/\
-                             wedge_idx/wedge_sign), but this decoder's wedge mask codebook is \
-                             not ported (lane-maskcomp r2 scope: DIFFWTD only)",
-                        ));
+                        // COMPOUND_WEDGE: lane-wedge r3, see the 16x16/32x32
+                        // leaf's own comment.
+                        let wedge_index = dec.symbol(&mut cdfs.wedge_idx[3]);
+                        let wedge_sign = dec.literal(1);
+                        WEDGE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        wedge_mask = Some(
+                            crate::wedge::wedge_masks()
+                                .codebook(SIDE)
+                                .mask(wedge_sign as usize, wedge_index as usize),
+                        );
+                    } else {
+                        let mask_type = dec.literal(1);
+                        diffwtd_mask_type = Some(mask_type as u8);
                     }
-                    let mask_type = dec.literal(1);
-                    diffwtd_mask_type = Some(mask_type as u8);
                     MASKED_COMPOUND_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 // corner-cut (lane-av1comp r16/r17, lane-av1blend r1): same
@@ -7028,18 +7045,16 @@ fn decode_inter_block8(
                 );
                 let mut pred_y = vec![0u8; SIDE * SIDE];
                 let mut diffwtd_mask_y = Vec::new();
-                if let Some(mask_type) = diffwtd_mask_type {
+                let mask_y: Option<&[u8]> = if let Some(mask_type) = diffwtd_mask_type {
                     diffwtd_mask_y = vec![0u8; SIDE * SIDE];
                     mc::diffwtd_mask(&inter0_y, &inter1_y, mask_type == 1, &mut diffwtd_mask_y);
+                    Some(diffwtd_mask_y.as_slice())
+                } else {
+                    wedge_mask
+                };
+                if let Some(mask_y) = mask_y {
                     mc::blend_masked_compound(
-                        &inter0_y,
-                        &inter1_y,
-                        &diffwtd_mask_y,
-                        SIDE,
-                        SIDE,
-                        SIDE,
-                        false,
-                        &mut pred_y,
+                        &inter0_y, &inter1_y, mask_y, SIDE, SIDE, SIDE, false, &mut pred_y,
                     );
                 } else {
                     mc::combine_compound(&inter0_y, &inter1_y, fwd_offset, bck_offset, &mut pred_y);
@@ -7074,11 +7089,11 @@ fn decode_inter_block8(
                     &mut inter1_u,
                 );
                 let mut pred_u = vec![0u8; CHROMA_SIDE * CHROMA_SIDE];
-                if diffwtd_mask_type.is_some() {
+                if let Some(mask_y) = mask_y {
                     mc::blend_masked_compound(
                         &inter0_u,
                         &inter1_u,
-                        &diffwtd_mask_y,
+                        mask_y,
                         SIDE,
                         CHROMA_SIDE,
                         CHROMA_SIDE,
@@ -7118,11 +7133,11 @@ fn decode_inter_block8(
                     &mut inter1_v,
                 );
                 let mut pred_v = vec![0u8; CHROMA_SIDE * CHROMA_SIDE];
-                if diffwtd_mask_type.is_some() {
+                if let Some(mask_y) = mask_y {
                     mc::blend_masked_compound(
                         &inter0_v,
                         &inter1_v,
-                        &diffwtd_mask_y,
+                        mask_y,
                         SIDE,
                         CHROMA_SIDE,
                         CHROMA_SIDE,
