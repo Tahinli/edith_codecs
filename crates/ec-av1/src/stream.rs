@@ -308,12 +308,12 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         //     is capped at 2. Tile rows are untested this round, so `rows`
         //     stays capped at 1.
         let loop_filter_on = header.loop_filter.level.iter().any(|&l| l != 0);
-        if header.frame_type != FrameType::Key && header.tile_info.cols > 1 {
-            return Err(Error::unsupported(
-                "AV1 decode_stream",
-                "an inter frame with more than one tile (the inter tile-decode path has no per-tile loop, only key frames do)",
-            ));
-        }
+        // lane-tiles r6: decode_inter_frame_tile_with_cdfs now takes
+        // `tiles: &[&[u8]]` and grows the same per-tile loop
+        // decode_key_frame_tile_with_cdfs has (mvstack.rs's MiGrid bounded
+        // per tile too, see MiGrid::set_tile_bounds), so an inter frame with
+        // >1 tile column is no longer refused by name -- the >2-columns and
+        // loop-filter refusals below stay (unproven this round).
         if header.tile_info.rows > 1 {
             return Err(Error::unsupported(
                 "AV1 decode_stream",
@@ -472,7 +472,8 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 )
             });
             decode_inter_frame_tile_with_cdfs(
-                tile_bytes,
+                &tile_bufs,
+                &header.tile_info,
                 header.mi_cols,
                 header.mi_rows,
                 header.quantization.base_q_idx,

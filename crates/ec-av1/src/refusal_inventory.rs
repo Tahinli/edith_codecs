@@ -51,7 +51,6 @@ const REFUSALS: &[&str] = &[
     "a frame with more than one tile row (only tile columns are proven pixel-exact so far)",
     "a frame with more than two tile columns (a non-last column's right-edge reach bound past column 0 is unimplemented)",
     "a multi-tile frame with loop filtering enabled (deblocking crosses tile boundaries by spec default; PlaneBuf's tile origin does not clip a non-last column's right-edge reach)",
-    "an inter frame with more than one tile (the inter tile-decode path has no per-tile loop, only key frames do)",
     "a frame with no mode-info grid",
     "a frame with segmentation enabled (this decoder never reads a per-block segment_id symbol)",
     "a non-skip rectangular (HORZ/VERT/HORZ_B) strip needs rectangular residual coding",
