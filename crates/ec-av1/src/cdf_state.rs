@@ -117,6 +117,30 @@ pub(crate) enum TxbSet {
     /// different existing sets is why this variant exists at all rather than
     /// reusing [`LumaRect32x16`](TxbSet::LumaRect32x16)'s chroma sibling.
     ChromaRect32x16,
+    /// The luma 16x8/8x16 transform of a `PARTITION_HORZ`/`VERT` intra strip
+    /// below 16x16 (lane-rectx, `decode_leaf_rect`'s own leaf, one level
+    /// under [`LumaRect32x16`](TxbSet::LumaRect32x16)): `get_txsize_entropy_ctx`
+    /// reduces this 2:1 rect size to `TX_16X16` too, so this shares every
+    /// table [`Luma16`](TxbSet::Luma16) does -- INCLUDING its mode-indexed
+    /// `tx_type` CDF, the same adapted table object -- except `eob_pt`, which
+    /// reads the true 128-position [`crate::cdf::EOB_PT_128_LUMA`] rather
+    /// than `Luma16`'s 256-position one. Unlike
+    /// [`LumaRect32x16`](TxbSet::LumaRect32x16), this size DOES carry a
+    /// `tx_type` symbol: `av1_get_ext_tx_set_type`'s `use_reduced_set` branch
+    /// returns `EXT_TX_SET_DTT4_IDTX` for every `tx_size_sqr_up == TX_16X16`
+    /// regardless of the real (non-square) `tx_size`, the same set
+    /// `Luma16`'s own read already uses -- confirmed against
+    /// `av1/common/blockd.h`'s `av1_get_ext_tx_set_type` before landing,
+    /// see `decode_block_rect`'s own doc comment for the desync this gap
+    /// left when it was still unhandled.
+    LumaRect16x8,
+    /// The chroma 8x4/4x8 transform under the same leaf (lane-rectx):
+    /// [`Chroma8`](TxbSet::Chroma8)'s tables except `eob_pt`, which reads the
+    /// true 32-position [`crate::cdf::EOB_PT_32_CHROMA`] instead of
+    /// `Chroma8`'s 64-position one -- the same square-up relationship
+    /// [`ChromaRect16x8`](TxbSet::ChromaRect16x8) has to `Chroma16`, one size
+    /// class down.
+    ChromaRect8x4,
 }
 
 /// The tables one transform block is coded with, borrowed from the state for
@@ -269,6 +293,12 @@ pub(crate) struct Cdfs {
     /// The end-of-block group of a true 32x16/16x32 rect CHROMA transform
     /// (lane-sbpart), see [`TxbSet::ChromaRect32x16`].
     pub eob_pt_512_chroma: [u16; 11],
+    /// The end-of-block group of a true 16x8/8x16 rect LUMA transform
+    /// (lane-rectx), see [`TxbSet::LumaRect16x8`].
+    pub eob_pt_128_luma: [u16; 9],
+    /// The end-of-block group of a true 8x4/4x8 rect CHROMA transform
+    /// (lane-rectx), see [`TxbSet::ChromaRect8x4`].
+    pub eob_pt_32_chroma: [u16; 7],
     /// The end-of-block offset bit, per table set.
     pub eob_extra_luma_32: [[u16; 3]; 9],
     /// The same, for a 64x64 luma transform.
@@ -624,6 +654,8 @@ impl Cdfs {
         reset1(&mut self.eob_pt_512_luma);
         reset1(&mut self.eob_pt_128_chroma);
         reset1(&mut self.eob_pt_512_chroma);
+        reset1(&mut self.eob_pt_128_luma);
+        reset1(&mut self.eob_pt_32_chroma);
         reset2(&mut self.eob_extra_luma_32);
         reset2(&mut self.eob_extra_luma_64);
         reset2(&mut self.eob_extra_chroma_16);
@@ -1009,6 +1041,20 @@ impl Cdfs {
                 cdf::EOB_PT_128_CHROMA_Q1,
                 cdf::EOB_PT_128_CHROMA,
                 cdf::EOB_PT_128_CHROMA_Q3,
+            ),
+            eob_pt_128_luma: pick(
+                q_ctx,
+                cdf::EOB_PT_128_LUMA_Q0,
+                cdf::EOB_PT_128_LUMA_Q1,
+                cdf::EOB_PT_128_LUMA,
+                cdf::EOB_PT_128_LUMA_Q3,
+            ),
+            eob_pt_32_chroma: pick(
+                q_ctx,
+                cdf::EOB_PT_32_CHROMA_Q0,
+                cdf::EOB_PT_32_CHROMA_Q1,
+                cdf::EOB_PT_32_CHROMA,
+                cdf::EOB_PT_32_CHROMA_Q3,
             ),
             // Flat default at every q-context (see the constant's own doc
             // comment) -- no `pick()` needed.
@@ -1417,6 +1463,30 @@ impl Cdfs {
                 base: &mut self.base_chroma_32,
                 base_eob: &mut self.base_eob_chroma_32,
                 br: &mut self.br_chroma_32,
+                dc_sign: &mut self.dc_sign_chroma,
+                tx_type: None,
+                eob_pt_class1: None,
+            },
+            TxbSet::LumaRect16x8 => TxbTables {
+                side: 16,
+                txb_skip: &mut self.txb_skip_luma_16,
+                eob_pt: &mut self.eob_pt_128_luma,
+                eob_extra: &mut self.eob_extra_luma_16,
+                base: &mut self.base_luma_16,
+                base_eob: &mut self.base_eob_luma_16,
+                br: &mut self.br_luma_16,
+                dc_sign: &mut self.dc_sign_luma,
+                tx_type: Some(self.intra_tx_type_16[mode].as_mut_slice()),
+                eob_pt_class1: None,
+            },
+            TxbSet::ChromaRect8x4 => TxbTables {
+                side: 8,
+                txb_skip: &mut self.txb_skip_chroma_8,
+                eob_pt: &mut self.eob_pt_32_chroma,
+                eob_extra: &mut self.eob_extra_chroma_8,
+                base: &mut self.base_chroma_8,
+                base_eob: &mut self.base_eob_chroma_8,
+                br: &mut self.br_chroma_8,
                 dc_sign: &mut self.dc_sign_chroma,
                 tx_type: None,
                 eob_pt_class1: None,

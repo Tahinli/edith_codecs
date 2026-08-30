@@ -744,6 +744,19 @@ pub(crate) fn rect_coeff_hits() -> usize {
     RECT_COEFF_HITS.with(|c| c.get())
 }
 
+// lane-rectx r1: how many below-16x16 HORZ/VERT leaves ([`decode_leaf_rect`])
+// decoded real (non-skip) TX_16X8/TX_8X16 coefficients -- the counter the
+// charter's real-aomenc gate hard-asserts.
+thread_local! {
+    static RECT_LEAF_COEFF_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`RECT_LEAF_COEFF_HITS`].
+pub(crate) fn rect_leaf_coeff_hits() -> usize {
+    RECT_LEAF_COEFF_HITS.with(|c| c.get())
+}
+
 // lane-sbpart r2: how many superblock-level `PARTITION_HORZ`/`PARTITION_VERT`
 // blocks (two true 64x32/32x64 strips, [`decode_block_rect64`]) fired -- the
 // gate's proof this round's arms actually reached a real block, not just
@@ -1236,6 +1249,26 @@ const SCAN_8X16: [u16; 128] = [
     123, 103, 110, 117, 124, 111, 118, 125, 119, 126, 127,
 ];
 
+/// `Default_Scan_8x4` (lane-rectx, see [`SCAN_32X16`]'s doc comment for the
+/// transposition rule this repo's `SCAN_WxH` names follow): this repo's
+/// `(w=8, h=4)` reads libaom's own `default_scan_4x8` verbatim -- the same
+/// axis swap [`SCAN_16X8`]/[`SCAN_8X16`] already carry one size class up
+/// (repo `SCAN_16X8` == libaom `default_scan_8x16`, repo `SCAN_8X16` ==
+/// libaom `default_scan_16x8`), checked against `scan.c` before landing
+/// rather than re-deriving the zigzag formula.
+const SCAN_8X4: [u16; 32] = [
+    0, 8, 1, 16, 9, 2, 24, 17, 10, 3, 25, 18, 11, 4, 26, 19, 12, 5, 27, 20, 13, 6, 28, 21, 14, 7,
+    29, 22, 15, 30, 23, 31,
+];
+
+/// `Default_Scan_4x8` (lane-rectx): this repo's `(w=4, h=8)` reads libaom's
+/// own `default_scan_8x4` verbatim, the same transposition [`SCAN_8X4`]'s
+/// doc comment explains.
+const SCAN_4X8: [u16; 32] = [
+    0, 1, 4, 2, 5, 8, 3, 6, 9, 12, 7, 10, 13, 16, 11, 14, 17, 20, 15, 18, 21, 24, 19, 22, 25, 28,
+    23, 26, 29, 27, 30, 31,
+];
+
 /// [`neighbour`] with independent `w` (row stride)/`h` (row-bound) extents
 /// (lane-rectwire, mirrors [`record_rect`](Neighbours::record_rect)'s
 /// asymmetric-extent pattern).
@@ -1599,12 +1632,14 @@ fn read_coeffs(
     Ok((grid, tx_type))
 }
 
-/// [`read_coeffs`] widened to `(w, h)` (lane-rectwire), restricted to
-/// `TxClass::TwoD` -- the only class either rect size pair this decoder codes
-/// can ever produce (see [`decode_block_rect`]'s doc comment): refuses by
-/// name rather than guess-decode if a `tx_type` symbol or non-2D class ever
-/// shows up here, since neither `base_ctx_rect`/`br_ctx_rect` nor
-/// [`class_scan_table`] have a rect form for those.
+/// [`read_coeffs`] widened to `(w, h)` (lane-rectwire; lane-rectx added the
+/// `tx_type` read [`TxbSet::LumaRect16x8`] needs), restricted to
+/// `TxClass::TwoD` -- the only class any rect size pair this decoder codes
+/// can ever produce, since every `tx_type` this decoder's rect sets can read
+/// (`EXT_TX_SET_DTT4_IDTX`'s five members) is itself 2D: refuses by name
+/// rather than guess-decode if a non-2D class ever shows up here, since
+/// neither `base_ctx_rect`/`br_ctx_rect` nor [`class_scan_table`] have a rect
+/// form for those.
 fn read_coeffs_rect(
     dec: &mut SymbolDecoder,
     coding: &mut TxbTables,
@@ -1620,12 +1655,21 @@ fn read_coeffs_rect(
     if all_zero {
         return Ok((grid, TxType::DctDct));
     }
-    if coding.tx_type.is_some() {
-        return Err(unsupported(
-            "a tx_type symbol on a rectangular transform (never expected at this size)",
-        ));
+    let mut tx_type = default_tx_type;
+    if let Some(tx_type_cdf) = coding.tx_type.as_deref_mut() {
+        // Mirrors [`read_coeffs`]'s own `tx_type` read: the CDF row's width
+        // names its set (lane-rectx, `TxbSet::LumaRect16x8` -- the one rect
+        // set here that carries a `tx_type` symbol at all).
+        let len = tx_type_cdf.len();
+        let t = dec.symbol(tx_type_cdf);
+        tx_type = match len {
+            17 => TxType::from_symbol_all16(t),
+            13 => TxType::from_symbol_set2_12(t),
+            8 => TxType::from_symbol_set1(t),
+            _ => TxType::from_symbol(t),
+        }
+        .ok_or_else(|| unsupported(format!("a tx_type symbol outside its CDF's own set: {t}")))?;
     }
-    let tx_type = default_tx_type;
     if TxClass::of(tx_type) != TxClass::TwoD {
         return Err(unsupported(
             "a non-2D tx class on a rectangular transform (never expected at this size)",
@@ -3469,9 +3513,10 @@ fn decode_block_rect(
 /// writers (`record_mi_rect`, `fill_skip_grid_rect`, `fill_lf_grid_rect`) at
 /// this strip's real position, never the coarse `record_rect` (which the
 /// caller uses once, after both strips, exactly like the `VERT_B` arm next
-/// to it). Only the skip case is ported -- see [`decode_block_rect`]'s own
-/// doc for why a coded rect strip below 16x16 has no coefficient tables here
-/// yet.
+/// to it). The non-skip case (lane-rectx) reads real `TX_16X8`/`TX_8X16`
+/// luma coefficients (`TxbSet::LumaRect16x8`) and their `TX_8X4`/`TX_4X8`
+/// chroma half (`TxbSet::ChromaRect8x4`), the two size classes one level
+/// under [`decode_block_rect`]'s own 32x16/16x32 strip.
 #[allow(clippy::too_many_arguments)]
 fn decode_leaf_rect(
     dec: &mut SymbolDecoder,
@@ -3540,66 +3585,90 @@ fn decode_leaf_rect(
              prediction is not ported)",
         ));
     }
-    if !skip {
-        return Err(unsupported(
-            "a coded (non-skip) HORZ/VERT rect strip below 16x16 (this decoder ports only \
-             the skip case at this size)",
-        ));
-    }
     let (px, py) = (leaf_mi.1 * MI, leaf_mi.0 * MI);
     let reach = Reach::of_rect(bw, bh, px, py, y.width, y.height);
     let (cpx, cpy) = (px / 2, py / 2);
     let (chroma_w, chroma_h) = (bw / 2, bh / 2);
-    y.reconstruct_rect(
-        px,
-        py,
-        bw,
-        bh,
-        mode,
-        angle_delta_y,
-        reach,
-        &vec![0i32; bw * bh],
-        None,
-        filter_intra,
-        smooth_neighbor,
-    );
-    let ac = alpha.map(|_| cfl_ac_q3_rect(y, px, py, bw, bh));
-    u.reconstruct_rect(
-        cpx,
-        cpy,
-        chroma_w,
-        chroma_h,
-        uv_predict_mode,
-        angle_delta_uv,
-        reach,
-        &vec![0i32; chroma_w * chroma_h],
-        alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
-        None,
-        false,
-    );
-    v.reconstruct_rect(
-        cpx,
-        cpy,
-        chroma_w,
-        chroma_h,
-        uv_predict_mode,
-        angle_delta_uv,
-        reach,
-        &vec![0i32; chroma_w * chroma_h],
-        alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
-        None,
-        false,
-    );
-    neighbours.record_mi_rect(
-        leaf_mi,
-        bw,
-        bh,
-        &[
-            vec![0i32; bw * bh],
-            vec![0i32; chroma_w * chroma_h],
-            vec![0i32; chroma_w * chroma_h],
-        ],
-    );
+    let (luma_levels, u_levels, v_levels);
+    if skip {
+        luma_levels = vec![0i32; bw * bh];
+        u_levels = vec![0i32; chroma_w * chroma_h];
+        v_levels = vec![0i32; chroma_w * chroma_h];
+        y.reconstruct_rect(
+            px, py, bw, bh, mode, angle_delta_y, reach, &luma_levels, None, filter_intra,
+            smooth_neighbor,
+        );
+        let ac = alpha.map(|_| cfl_ac_q3_rect(y, px, py, bw, bh));
+        u.reconstruct_rect(
+            cpx, cpy, chroma_w, chroma_h, uv_predict_mode, angle_delta_uv, reach, &u_levels,
+            alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)), None, false,
+        );
+        v.reconstruct_rect(
+            cpx, cpy, chroma_w, chroma_h, uv_predict_mode, angle_delta_uv, reach, &v_levels,
+            alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)), None, false,
+        );
+    } else {
+        // lane-rectx: a genuine 16x8/8x16 luma transform (`TxbSet::LumaRect16x8`,
+        // real `EOB_PT_128_LUMA` alphabet + the same mode-indexed `tx_type`
+        // symbol the square `Luma16` set reads -- `get_ext_tx_set_type`'s
+        // `use_reduced_set` branch returns `EXT_TX_SET_DTT4_IDTX` at
+        // `tx_size_sqr_up == TX_16X16` regardless of the true, non-square
+        // `tx_size`) and its chroma half (8x4/4x8, `TxbSet::ChromaRect8x4`).
+        let (luma_scan, chroma_scan): (&[u16], &[u16]) = if bw == 16 {
+            (&SCAN_16X8, &SCAN_8X4)
+        } else {
+            (&SCAN_8X16, &SCAN_4X8)
+        };
+        let around = neighbours.around_mi_rect(leaf_mi, bw, bh);
+        let mut luma_coding = cdfs.txb(TxbSet::LumaRect16x8, mode);
+        let (l_levels, luma_tx_type) = read_coeffs_rect(
+            dec, &mut luma_coding, luma_scan, bw, bh, 0, dc_sign_ctx(around[0].2), TxType::DctDct,
+        )?;
+        luma_levels = l_levels;
+        let luma_residual = dequant_and_inverse_typed_wh(
+            &luma_levels, bw, bh, crate::decode::bit_depth(),
+            CURRENT_Q_IDX.with(|c| c.get()), plane_q_delta(0).0, plane_q_delta(0).1, luma_tx_type,
+        );
+        y.reconstruct_rect(
+            px, py, bw, bh, mode, angle_delta_y, reach, &luma_residual, None, filter_intra,
+            smooth_neighbor,
+        );
+        let ac = alpha.map(|_| cfl_ac_q3_rect(y, px, py, bw, bh));
+        let u_default_tx = default_intra_tx_type(uv_predict_mode as u8);
+        let u_skip_ctx = usize::from(around[1].0) + usize::from(around[1].1);
+        let mut u_coding = cdfs.txb(TxbSet::ChromaRect8x4, uv_predict_mode);
+        let (u_l, u_tx_type) = read_coeffs_rect(
+            dec, &mut u_coding, chroma_scan, chroma_w, chroma_h, u_skip_ctx,
+            dc_sign_ctx(around[1].2), u_default_tx,
+        )?;
+        u_levels = u_l;
+        let u_residual = dequant_and_inverse_typed_wh(
+            &u_levels, chroma_w, chroma_h, crate::decode::bit_depth(),
+            CURRENT_Q_IDX.with(|c| c.get()), plane_q_delta(1).0, plane_q_delta(1).1, u_tx_type,
+        );
+        u.reconstruct_rect(
+            cpx, cpy, chroma_w, chroma_h, uv_predict_mode, angle_delta_uv, reach, &u_residual,
+            alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)), None, false,
+        );
+        let v_default_tx = default_intra_tx_type(uv_predict_mode as u8);
+        let v_skip_ctx = usize::from(around[2].0) + usize::from(around[2].1);
+        let mut v_coding = cdfs.txb(TxbSet::ChromaRect8x4, uv_predict_mode);
+        let (v_l, v_tx_type) = read_coeffs_rect(
+            dec, &mut v_coding, chroma_scan, chroma_w, chroma_h, v_skip_ctx,
+            dc_sign_ctx(around[2].2), v_default_tx,
+        )?;
+        v_levels = v_l;
+        let v_residual = dequant_and_inverse_typed_wh(
+            &v_levels, chroma_w, chroma_h, crate::decode::bit_depth(),
+            CURRENT_Q_IDX.with(|c| c.get()), plane_q_delta(2).0, plane_q_delta(2).1, v_tx_type,
+        );
+        v.reconstruct_rect(
+            cpx, cpy, chroma_w, chroma_h, uv_predict_mode, angle_delta_uv, reach, &v_residual,
+            alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)), None, false,
+        );
+        RECT_LEAF_COEFF_HITS.with(|c| c.set(c.get() + 1));
+    }
+    neighbours.record_mi_rect(leaf_mi, bw, bh, &[luma_levels, u_levels, v_levels]);
     neighbours.fill_skip_grid_rect(leaf_mi, mi_w, mi_h, skip);
     neighbours.fill_lf_grid_rect(leaf_mi, mi_w, mi_h, bw as u8, bh as u8, 0);
     Ok(mode)
