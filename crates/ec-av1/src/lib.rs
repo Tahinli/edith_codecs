@@ -29,6 +29,7 @@ pub mod msac;
 pub mod mvstack;
 pub mod obu;
 pub mod quant;
+mod restoration;
 pub mod sequence;
 pub mod stream;
 pub mod tile;
