@@ -104,6 +104,19 @@ pub(crate) enum TxbSet {
     /// the true 128-position [`crate::cdf::EOB_PT_128_CHROMA`] instead of
     /// `Chroma16`'s 256-position one.
     ChromaRect16x8,
+    /// The chroma 32x16/16x32 transform of an intra `PARTITION_HORZ`/`VERT`
+    /// 64x32/32x64 SUPERBLOCK strip (lane-sbpart): `get_txsize_entropy_ctx`
+    /// (`(txsize_sqr_map + txsize_sqr_up_map + 1) >> 1`) resolves `TX_32X16`
+    /// to `TX_32X32`, so this shares every table
+    /// [`Chroma32`](TxbSet::Chroma32) does except `eob_pt`, which reads the
+    /// true 512-position [`crate::cdf::EOB_PT_512_CHROMA`] instead of
+    /// `Chroma32`'s 1024-position one. The SIBLING luma plane of this same
+    /// strip is genuinely truncated (64/32 > 32), so it reads
+    /// [`Luma64`](TxbSet::Luma64) instead -- `get_txsize_entropy_ctx(TX_64X32)`
+    /// resolves to `TX_64X64`, not `TX_32X32`, the two axes landing on
+    /// different existing sets is why this variant exists at all rather than
+    /// reusing [`LumaRect32x16`](TxbSet::LumaRect32x16)'s chroma sibling.
+    ChromaRect32x16,
 }
 
 /// The tables one transform block is coded with, borrowed from the state for
@@ -253,6 +266,9 @@ pub(crate) struct Cdfs {
     /// The end-of-block group of a true 16x8/8x16 rect chroma transform
     /// (lane-rectwire), see [`TxbSet::ChromaRect16x8`].
     pub eob_pt_128_chroma: [u16; 9],
+    /// The end-of-block group of a true 32x16/16x32 rect CHROMA transform
+    /// (lane-sbpart), see [`TxbSet::ChromaRect32x16`].
+    pub eob_pt_512_chroma: [u16; 11],
     /// The end-of-block offset bit, per table set.
     pub eob_extra_luma_32: [[u16; 3]; 9],
     /// The same, for a 64x64 luma transform.
@@ -582,6 +598,7 @@ impl Cdfs {
         reset1(&mut self.eob_pt_256_chroma);
         reset1(&mut self.eob_pt_512_luma);
         reset1(&mut self.eob_pt_128_chroma);
+        reset1(&mut self.eob_pt_512_chroma);
         reset2(&mut self.eob_extra_luma_32);
         reset2(&mut self.eob_extra_luma_64);
         reset2(&mut self.eob_extra_chroma_16);
@@ -960,6 +977,9 @@ impl Cdfs {
                 cdf::EOB_PT_128_CHROMA,
                 cdf::EOB_PT_128_CHROMA_Q3,
             ),
+            // Flat default at every q-context (see the constant's own doc
+            // comment) -- no `pick()` needed.
+            eob_pt_512_chroma: cdf::EOB_PT_512_CHROMA,
             eob_extra_luma_32: pick(
                 q_ctx,
                 cdf::EOB_EXTRA_LUMA_32_Q0,
@@ -1344,6 +1364,18 @@ impl Cdfs {
                 base: &mut self.base_chroma_16,
                 base_eob: &mut self.base_eob_chroma_16,
                 br: &mut self.br_chroma_16,
+                dc_sign: &mut self.dc_sign_chroma,
+                tx_type: None,
+                eob_pt_class1: None,
+            },
+            TxbSet::ChromaRect32x16 => TxbTables {
+                side: 32,
+                txb_skip: &mut self.txb_skip_chroma_32,
+                eob_pt: &mut self.eob_pt_512_chroma,
+                eob_extra: &mut self.eob_extra_chroma_32,
+                base: &mut self.base_chroma_32,
+                base_eob: &mut self.base_eob_chroma_32,
+                br: &mut self.br_chroma_32,
                 dc_sign: &mut self.dc_sign_chroma,
                 tx_type: None,
                 eob_pt_class1: None,
