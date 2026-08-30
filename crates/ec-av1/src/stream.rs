@@ -401,8 +401,16 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
             // and BEFORE this picture is stored as a reference or handed to
             // the caller -- loop restoration is not yet ported, so there is
             // no LR step here for the upscale to precede.
+            // r3: the real decoded margin beyond `frame_width` (set by the
+            // call above, right before anything else can overwrite it) --
+            // see `decode::take_last_key_frame_wide_margin`'s doc.
+            let wide_margin = crate::decode::take_last_key_frame_wide_margin();
             let picture = if header.use_superres {
-                crate::superres::upscale_picture(&picture, header.upscaled_width as usize)
+                crate::superres::upscale_picture(
+                    &picture,
+                    header.upscaled_width as usize,
+                    wide_margin.as_ref(),
+                )
             } else {
                 picture
             };
