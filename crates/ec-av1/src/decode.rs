@@ -2580,6 +2580,9 @@ fn decode_block_rect(
     neighbours.fill_skip_grid_rect((mi_r, mi_c), bw / MI, bh / MI, skip);
     neighbours.fill_lf_grid_rect((mi_r, mi_c), bw / MI, bh / MI, tx_w as u8, tx_h as u8, 0);
     RECT_PARTITION_HITS.with(|c| c.set(c.get() + 1));
+    if std::env::var_os("EC_AV1_TRACE").is_some() {
+        eprintln!("TRACE_RECT32_END mi_row={mi_r} mi_col={mi_c} bw={bw} bh={bh}");
+    }
     Ok(())
 }
 

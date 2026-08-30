@@ -6547,7 +6547,52 @@ mod tests {
         }
         let frames = decode_stream(&stream).expect("pinned stream must decode");
         let ffmpeg_frames = ffmpeg_decode_sequence(&stream, 192, 128, 1);
+        let (width, height) = (192usize, 128usize);
         for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+            if std::env::var_os("EC_SBPART_DIAG").is_some() {
+                let (mut min_r, mut max_r, mut min_c, mut max_c, mut n) =
+                    (usize::MAX, 0usize, usize::MAX, 0usize, 0usize);
+                for r in 0..height {
+                    for c in 0..width {
+                        let idx = r * width + c;
+                        if got.y[idx] != want.y[idx] {
+                            min_r = min_r.min(r);
+                            max_r = max_r.max(r);
+                            min_c = min_c.min(c);
+                            max_c = max_c.max(c);
+                            n += 1;
+                        }
+                    }
+                }
+                eprintln!(
+                    "DIAG frame {i}: {n} luma mismatches, bbox rows [{min_r}..{max_r}] cols \
+                     [{min_c}..{max_c}] of {width}x{height}"
+                );
+                // Per-64px-superblock-column mismatch counts, to see whether
+                // corruption starts exactly at the rect64 SB or bleeds into
+                // SBs decoded earlier (raster order).
+                for sb_col in 0..(width + 63) / 64 {
+                    let c0 = sb_col * 64;
+                    let c1 = (c0 + 64).min(width);
+                    let mut cnt = 0usize;
+                    let mut first = None;
+                    for r in 0..height {
+                        for c in c0..c1 {
+                            let idx = r * width + c;
+                            if got.y[idx] != want.y[idx] {
+                                cnt += 1;
+                                if first.is_none() {
+                                    first = Some((r, c));
+                                }
+                            }
+                        }
+                    }
+                    eprintln!(
+                        "DIAG frame {i} sb_col {sb_col} (cols {c0}..{c1}): {cnt} mismatches, \
+                         first={first:?}"
+                    );
+                }
+            }
             assert_eq!(got.y, want.y, "frame {i} luma vs ffmpeg (pinned sbpart)");
             assert_eq!(got.u, want.u, "frame {i} U vs ffmpeg (pinned sbpart)");
             assert_eq!(got.v, want.v, "frame {i} V vs ffmpeg (pinned sbpart)");
