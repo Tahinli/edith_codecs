@@ -185,6 +185,22 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 "a frame with segmentation enabled (this decoder never reads a per-block segment_id symbol)",
             ));
         }
+        // lane-superres Step 0: `use_superres` adds/removes no per-block
+        // symbol (spec 7.16's upscaling is a pixel-domain post-process run
+        // after loop restoration, `av1_upscale_normative_*` in libaom's
+        // `resize.c`), so this crate's tile readers stay bit-exact-in-sync
+        // even without support. But every decode path below reads and
+        // stores the frame at `header.frame_width` (the downscaled coded
+        // width) and never runs the upscaler, so a superres stream would
+        // silently produce a `Picture` sized `frame_width` instead of the
+        // spec's `upscaled_width` -- SILENT WRONGNESS, not a desync. Refuse
+        // by name until the upscaler (lane-superres) lands.
+        if header.use_superres {
+            return Err(Error::unsupported(
+                "AV1 decode_stream",
+                "a frame with use_superres set (this decoder never runs the spec 7.16 upscaler; it would silently output the frame at the downscaled frame_width instead of upscaled_width)",
+            ));
+        }
         // Loop restoration carries per-restoration-unit symbols in the tile
         // (spec 5.11.57 `read_lr`, one group per LR unit reached from the
         // superblock walk) that this decoder never reads -- same
@@ -3681,6 +3697,103 @@ mod tests {
             "{NAME}: {named_refusals} non-warp refusals, {matched} pixel-exact matches out of {n_attempts}, warp_selected_hits={}",
             crate::decode::warp_selected_hits()
         );
+    }
+
+    /// lane-superres Step 0/stage 1: a real aomenc `--superres-mode=1`
+    /// stream must refuse BY NAME (`use_superres`), never desync into a
+    /// different error and never silently decode a wrong-sized picture.
+    /// `use_superres` adds no per-block symbol (spec 7.16's upscaler is a
+    /// pixel-domain post-process), so before the stream.rs refusal landed
+    /// this crate's tile readers stayed bit-exact in sync but stored the
+    /// `Picture` at the downscaled `frame_width` instead of
+    /// `upscaled_width` -- exactly the SILENT WRONGNESS the charter's Step 0
+    /// called for turning into an explicit refusal first.
+    #[test]
+    fn a_real_aomenc_stream_with_superres_refuses_by_name() {
+        const NAME: &str = "a_real_aomenc_stream_with_superres_refuses_by_name";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height, frame_count) = (64usize, 64usize, 4usize);
+        let duration = frame_count as f64 / 25.0;
+        let source = gradients_source(42, width, height, &format!("duration={duration}:rate=25"));
+        let y4m = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                &source,
+                "-pix_fmt",
+                "yuv420p",
+                "-f",
+                "yuv4mpegpipe",
+                "-",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ffmpeg failed to run");
+        assert!(
+            y4m.status.success(),
+            "ffmpeg fixture: {}",
+            String::from_utf8_lossy(&y4m.stderr)
+        );
+        let args: Vec<&str> = vec![
+            "--codec=av1",
+            "--passes=1",
+            "--end-usage=q",
+            "--cq-level=32",
+            "--cpu-used=0",
+            "--kf-max-dist=1000",
+            "--threads=1",
+            "--row-mt=0",
+            "--superres-mode=1",
+            "--superres-denominator=12",
+            "--obu",
+            "-o",
+            "-",
+            "-",
+        ];
+        let mut child = Command::new(aomenc_path())
+            .args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("aomenc failed to start");
+        child
+            .stdin
+            .take()
+            .expect("aomenc stdin")
+            .write_all(&y4m.stdout)
+            .expect("writing y4m to aomenc");
+        let out = child.wait_with_output().expect("aomenc failed to run");
+        assert!(
+            out.status.success(),
+            "aomenc refused the fixture: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stream = out.stdout;
+        let err = decode_stream(&stream).expect_err(
+            "a real --superres-mode=1 stream must refuse -- superres decode is not implemented \
+             and silently produces a wrong-sized picture otherwise",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("use_superres"),
+            "{NAME}: refused, but not by the superres name -- this stream desynced into a \
+             different refusal instead: {msg}"
+        );
+        eprintln!("{NAME}: refused by name: {msg}");
     }
 
     /// lane-interintra r1: `--enable-interintra-comp=1` streams must DECODE
