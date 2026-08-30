@@ -4690,8 +4690,19 @@ mod tests {
         );
     }
 
+    /// lane-altref2 r1: 16 frames was too short for aomenc to ever build a
+    /// second-level alt-ref pyramid, so this gate ran 86 attempts and fired
+    /// ALTREF2 exactly zero times (class `gate-blind-to-feature`) -- the
+    /// flags were already right, only the clip length was wrong. A 64-frame
+    /// clip at the same `--lag-in-frames=16` gives aomenc enough lookahead
+    /// to schedule a 2-level GF pyramid and reliably codes ALTREF2 (4/4
+    /// hits on a plain seed-42 direct-aomenc probe; see
+    /// lanes/altref2-r1.report.md for the recipe search table). Firing is
+    /// now HARD-asserted below: the gate fails rather than skips if
+    /// `ref_hits(ALTREF2_FRAME)` does not advance.
     #[test]
     fn a_real_aomenc_stream_with_an_altref2_reference_decodes_pixel_exact() {
+        let before = decode::ref_hits(crate::mvstack::ALTREF2_FRAME);
         a_real_aomenc_single_ref_gate(
             "a_real_aomenc_stream_with_an_altref2_reference_decodes_pixel_exact",
             crate::mvstack::ALTREF2_FRAME,
@@ -4703,8 +4714,16 @@ mod tests {
             ],
             64,
             64,
-            16,
+            64,
             120,
+        );
+        let after = decode::ref_hits(crate::mvstack::ALTREF2_FRAME);
+        assert!(
+            after > before,
+            "a_real_aomenc_stream_with_an_altref2_reference_decodes_pixel_exact: \
+             ALTREF2_FRAME never fired across 120 attempts -- the gate is vacuous \
+             again (class gate-blind-to-feature); see lanes/altref2-r1.report.md \
+             for the recipe that is supposed to make this fire"
         );
     }
 
