@@ -27,6 +27,15 @@
 #       the key-frame path has no traced symbol at all between the partition
 #       read and the first coefficient block, which is precisely the gap a
 #       rect-strip desync hides in.
+#   Rung 6 (unconditional, no env gate) -- SGR per-tap ground truth
+#       (lane-lr r7): `calculate_intermediate_result` in
+#       av1/common/restoration.c is `static`, so a standalone harness cannot
+#       call it to get real A[]/B[] intermediate arrays, only the final
+#       flt0/flt1 via the public av1_selfguided_restoration_c. This rung
+#       drops `static` so an external harness can call it directly with a
+#       `dgd32`-style buffer (see scripts/lr-sgr-pin-harness.c) and diff
+#       every A[k]/B[k] tap against a from-scratch recompute -- the missing
+#       half of r6's 9-tap cross-check. No behaviour change (only linkage).
 #
 # Idempotent: re-running is a no-op. Rebuild afterwards with
 #   ninja -C ~/.cache/aom-oracle/build aomdec
@@ -263,3 +272,24 @@ s = s.replace(old, new, 1)
 open(path, "w").write(s)
 print("intra mode-info instrumented")
 PYI
+
+# --- rung 6: export calculate_intermediate_result for a direct harness call
+I="$SRC/av1/common/restoration.c"
+[ -f "$I" ] || { echo "no oracle source at $I" >&2; exit 1; }
+
+python3 - "$I" <<'PYA'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+if "/* EC_INSTRUMENTED_AB */" in s:
+    print("calculate_intermediate_result already exported (no-op)")
+    sys.exit(0)
+
+old = """static void calculate_intermediate_result(int32_t *dgd, int width, int height,"""
+new = """/* EC_INSTRUMENTED_AB */
+void calculate_intermediate_result(int32_t *dgd, int width, int height,"""
+assert old in s, "calculate_intermediate_result signature moved"
+s = s.replace(old, new, 1)
+open(path, "w").write(s)
+print("calculate_intermediate_result exported")
+PYA

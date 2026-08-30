@@ -4781,6 +4781,20 @@ mod tests {
                     // frame must now decode Ok AND match an independent
                     // decoder pixel-exact, not just refuse cleanly.
                     let reference = ffmpeg_decode_sequence(&stream, width, height, pics.len());
+                    let mismatched = pics
+                        .iter()
+                        .zip(&reference)
+                        .any(|(got, want)| got.y != want.y || got.u != want.u || got.v != want.v);
+                    // r7: pin a mismatching stream the same way the
+                    // masked-compound gate does -- lets a follow-up round
+                    // decode this exact seed's bytes directly instead of
+                    // re-deriving them from a live 40-attempt sweep.
+                    if mismatched && let Ok(path) = std::env::var("EC_AV1_GATE_DUMP") {
+                        std::fs::write(&path, &stream).expect("writing pinned stream");
+                        eprintln!(
+                            "EC_AV1_GATE_DUMP: wrote mismatching LR stream (seed {seed}) to {path}"
+                        );
+                    }
                     for (i, (pic, refpic)) in pics.iter().zip(reference.iter()).enumerate() {
                         assert_eq!(pic.y, refpic.y, "{NAME}: luma mismatch (seed {seed} frame {i})");
                         assert_eq!(pic.u, refpic.u, "{NAME}: U mismatch (seed {seed} frame {i})");
