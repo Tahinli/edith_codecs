@@ -5671,11 +5671,23 @@ fn decode_leaf_split4(
     // Chroma neighbour bookkeeping for the whole 8x8 group -- mirrors
     // [`decode_leaf8`]'s own tx4-chroma section (`record_split_luma`'s
     // rescaling is wrong for an already-mi-unit position, so this inlines
-    // its tail directly at `leaf_mi`, side_mi=2).
+    // its tail directly at `leaf_mi`, side_mi=2), EXCEPT for the partition
+    // context value itself. Unlike `decode_leaf8`'s TX4 branch (still one
+    // `BLOCK_8X8`, `PARTITION_NONE`, transform depth only), this group is
+    // genuinely four `BLOCK_4X4` blocks (`PARTITION_SPLIT` at the 8x8
+    // level, libaom `decode_partition`'s `bsize2`/`subsize` recursion
+    // bottom). libaom's `update_ext_partition_context` writes
+    // `partition_context_lookup[subsize]` at the 8x8 slot -- `{30,30}` for
+    // `BLOCK_8X8` (bit0=0, what `decode_leaf8` already reproduces via
+    // side_mi=8) but `{31,31}` for `BLOCK_4X4` (bit0=1) here, and
+    // `partition_ctx_mi`'s `left_side_mi[mi_r]*2 <= side` needs
+    // `left_side_mi <= 4` to read that bit as 1. Leaving this at 8 (this
+    // round's bug) makes the very next sibling 8x8's `partition_w8` read
+    // with the wrong context and desync immediately.
     let side_mi = 2;
     for cell in 0..side_mi {
-        neighbours.left_side_mi[leaf_mi.0 + cell] = 8;
-        neighbours.above_side_mi[leaf_mi.1 + cell] = 8;
+        neighbours.left_side_mi[leaf_mi.0 + cell] = 4;
+        neighbours.above_side_mi[leaf_mi.1 + cell] = 4;
     }
     let round_up_even = |n: usize| n.div_ceil(2) * 2;
     let bound_h = round_up_even(neighbours.mi_rows);
