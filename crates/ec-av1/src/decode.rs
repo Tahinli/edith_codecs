@@ -5796,6 +5796,15 @@ fn decode_inter_block(
     // for every existing (square) caller.
     write_w: usize,
     write_h: usize,
+    // lane-screen r2: this frame header's own `allow_screen_content_tools`
+    // bit, threaded to the intra-sub-block branch below -- libaom's
+    // `read_intra_block_mode_info` (decodemv.c:1065-1107, the inter-frame
+    // counterpart of `read_intra_frame_mode_info`) reads `y_mode_cdf`
+    // (never `kf_y_mode_cdf`) and has NO `use_intrabc` call at all (that
+    // symbol is intra-frame-only, spec `av1_read_mode_info` dispatches on
+    // `frame_is_intra_only`), but it still calls `read_palette_mode_info`
+    // under the same `av1_allow_palette` gate as the key-frame path.
+    allow_screen_content_tools: bool,
 ) -> Result<()> {
     let (r, c) = at;
     let (px, py) = (c * SUB, r * SUB);
@@ -7240,6 +7249,26 @@ fn decode_inter_block(
         } else {
             return Err(unsupported("a directional chroma mode (round 2)"));
         };
+        // `read_palette_mode_info` (decodemv.c:567, called from
+        // `read_intra_block_mode_info` right after `xd->cfl.store_y`, same
+        // gating and same corner-cut as `read_intra_mode`'s own copy above
+        // -- `palette_mode_ctx`/`palette_uv_mode_ctx` hardcoded 0, provably
+        // safe since a nonzero neighbour `palette_size` would already have
+        // refused the decode that produced it.
+        if allow_screen_content_tools
+            && let Some(bsize_ctx) = palette_bsize_ctx(side)
+        {
+            if mode == DC_PRED && dec.symbol(&mut cdfs.palette_y_mode[bsize_ctx][0]) != 0 {
+                return Err(unsupported(
+                    "a block that actually uses a palette (Y) -- reconstruction is out of scope",
+                ));
+            }
+            if uv_mode == DC_PRED && dec.symbol(&mut cdfs.palette_uv_mode[0]) != 0 {
+                return Err(unsupported(
+                    "a block that actually uses a palette (UV) -- reconstruction is out of scope",
+                ));
+            }
+        }
         mode_for_tx = mode;
         block_filter = [3, 3];
         ref_frame_for_lf = 0;
@@ -7503,6 +7532,10 @@ fn decode_inter_block8(
     // `compound_ctx` local, just handed back instead of applied here (this
     // fn's `neighbours` recording happens once for the whole straddling
     // 16x16 block, after every leaf).
+    // lane-screen r2: see [`decode_inter_block`]'s own copy of this param --
+    // `BLOCK_8X8` (this leaf's fixed size) is always `av1_allow_palette`-
+    // eligible (`bsize >= BLOCK_8X8`).
+    allow_screen_content_tools: bool,
 ) -> Result<(bool, bool, bool, Option<(i8, i8, u8, u8)>)> {
     const LAST_FRAME: i8 = 1;
     /// `Y_MODE`'s size group (`common_data.h`'s `size_group_lookup[BLOCK_8X8]`).
@@ -8295,6 +8328,23 @@ fn decode_inter_block8(
                 "a non-DC chroma mode on an 8x8 inter-frame leaf (this encoder never writes one)",
             ));
         }
+        // lane-screen r2: see [`decode_inter_block`]'s own copy -- `mode`/
+        // `uv_mode` are both effectively `DC_PRED`-gated already on this
+        // leaf (a nonzero `mode` still passes, but `uv_mode` is forced
+        // `DC_PRED` by the refusal just above), same order as libaom's
+        // `read_palette_mode_info` call right after `xd->cfl.store_y`.
+        if allow_screen_content_tools {
+            if mode == DC_PRED && dec.symbol(&mut cdfs.palette_y_mode[0][0]) != 0 {
+                return Err(unsupported(
+                    "a block that actually uses a palette (Y) -- reconstruction is out of scope",
+                ));
+            }
+            if dec.symbol(&mut cdfs.palette_uv_mode[0]) != 0 {
+                return Err(unsupported(
+                    "a block that actually uses a palette (UV) -- reconstruction is out of scope",
+                ));
+            }
+        }
         mode_for_tx = mode;
         let (mi_row, mi_col) = leaf_mi;
         for dr in 0..2 {
@@ -8489,6 +8539,7 @@ pub fn decode_inter_frame_tile(
         true,
         false,
         false,
+        false,
     )
     .map(|(picture, _, _)| picture)
 }
@@ -8552,6 +8603,12 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     // `decode_inter_block8` call below (spec 5.11.24's `read_motion_mode`).
     switchable_motion_mode: bool,
     allow_warped_motion: bool,
+    // lane-screen r2: this frame header's own `allow_screen_content_tools`
+    // bit, threaded to every `decode_inter_block`/`decode_inter_block8`
+    // call below -- consumes (never reconstructs) the intra-sub-block
+    // palette syntax libaom's `read_intra_block_mode_info` reads under the
+    // same `av1_allow_palette` gate as the key-frame path.
+    allow_screen_content_tools: bool,
 ) -> Result<(Picture, Cdfs, crate::motion_field::MotionField)> {
     let tpl_frame = tpl_field.map(|field| TplFrameArgs {
         field,
@@ -8798,6 +8855,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             false,
                             BLOCK,
                             BLOCK,
+                            allow_screen_content_tools,
                         )?;
                     }
                     PARTITION_SPLIT => {
@@ -8876,6 +8934,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     false,
                                     SUB,
                                     SUB,
+                                    allow_screen_content_tools,
                                 )?;
                             } else {
                                 let ctx16 = neighbours.partition_ctx(at16, SUB);
@@ -8943,6 +9002,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                             interp_fixed,
                                             switchable_motion_mode,
                                             allow_warped_motion,
+                                            allow_screen_content_tools,
                                         )?;
                                     prev_leaf = Some((leaf_mi, skip, is_inter));
                                     last_skip_mode = skip_mode_leaf;
@@ -9052,6 +9112,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             // corner-cut rect-flake-1 exposed on HORZ).
                             BLOCK,
                             SUB,
+                            allow_screen_content_tools,
                         )?;
                         if (r32 * 2 + 1) as u32 * SUB_MI < mi_rows {
                             decode_inter_block(
@@ -9104,6 +9165,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                 false,
                                 SUB,
                                 SUB,
+                                allow_screen_content_tools,
                             )?;
                             if (c32 * 2 + 1) as u32 * SUB_MI < mi_cols {
                                 decode_inter_block(
@@ -9156,6 +9218,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     false,
                                     SUB,
                                     SUB,
+                                    allow_screen_content_tools,
                                 )?;
                             }
                         }
@@ -9214,6 +9277,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             true,
                             BLOCK,
                             SUB,
+                            allow_screen_content_tools,
                         )?;
                         decode_inter_block(
                             &mut dec,
@@ -9261,6 +9325,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             true,
                             BLOCK,
                             SUB,
+                            allow_screen_content_tools,
                         )?;
                     }
                     PARTITION_VERT => {
@@ -9313,6 +9378,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             true,
                             SUB,
                             BLOCK,
+                            allow_screen_content_tools,
                         )?;
                         decode_inter_block(
                             &mut dec,
@@ -9360,6 +9426,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             true,
                             SUB,
                             BLOCK,
+                            allow_screen_content_tools,
                         )?;
                     }
                     PARTITION_HORZ_A => {
@@ -9417,6 +9484,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             false,
                             SUB,
                             SUB,
+                            allow_screen_content_tools,
                         )?;
                         decode_inter_block(
                             &mut dec,
@@ -9468,6 +9536,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             false,
                             SUB,
                             SUB,
+                            allow_screen_content_tools,
                         )?;
                         decode_inter_block(
                             &mut dec,
@@ -9515,6 +9584,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             true,
                             BLOCK,
                             SUB,
+                            allow_screen_content_tools,
                         )?;
                     }
                     PARTITION_VERT_A => {
@@ -9571,6 +9641,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             false,
                             SUB,
                             SUB,
+                            allow_screen_content_tools,
                         )?;
                         decode_inter_block(
                             &mut dec,
@@ -9622,6 +9693,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             false,
                             SUB,
                             SUB,
+                            allow_screen_content_tools,
                         )?;
                         decode_inter_block(
                             &mut dec,
@@ -9669,6 +9741,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             true,
                             SUB,
                             BLOCK,
+                            allow_screen_content_tools,
                         )?;
                     }
                     PARTITION_VERT_B => {
@@ -9722,6 +9795,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             true,
                             SUB,
                             BLOCK,
+                            allow_screen_content_tools,
                         )?;
                         decode_inter_block(
                             &mut dec,
@@ -9773,6 +9847,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             false,
                             SUB,
                             SUB,
+                            allow_screen_content_tools,
                         )?;
                         decode_inter_block(
                             &mut dec,
@@ -9824,6 +9899,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             false,
                             SUB,
                             SUB,
+                            allow_screen_content_tools,
                         )?;
                     }
                     _ => {
@@ -10601,6 +10677,7 @@ mod tests {
             false,
             side,
             side,
+            false,
         )
         .unwrap();
 
