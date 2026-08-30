@@ -431,8 +431,24 @@ pub(crate) struct Cdfs {
     pub palette_uv_mode: [[u16; 3]; 2],
     /// A chroma palette block's own size -- see [`cdf::PALETTE_UV_SIZE`].
     pub palette_uv_size: [[u16; 8]; 7],
+    /// A palette-Y block's per-pixel colour-index symbol -- see
+    /// [`cdf::PALETTE_Y_COLOR_INDEX`].
+    pub palette_y_color_index: [[[u16; 9]; 5]; 7],
+    /// A palette-UV block's per-pixel colour-index symbol -- see
+    /// [`cdf::PALETTE_UV_COLOR_INDEX`].
+    pub palette_uv_color_index: [[[u16; 9]; 5]; 7],
     /// The `use_intrabc` flag -- see [`cdf::INTRABC`].
     pub intrabc: [u16; 3],
+    /// `delta_q_abs` (lane-realworld r4, spec 5.11.10) -- see [`cdf::DELTA_Q`].
+    pub delta_q: [u16; 5],
+    /// `delta_lf_abs`, the single-value form (spec 5.11.11) -- see
+    /// [`cdf::DELTA_LF`]. Currently unread: `delta_lf_present` still refuses
+    /// by name in `stream.rs` (the deblocker has no per-block carrier for
+    /// the result yet), kept here so the struct is ready for that round.
+    pub delta_lf: [u16; 5],
+    /// `delta_lf_abs[i]`, the `delta_lf_multi` per-plane/direction form
+    /// (`FRAME_LF_COUNT = 4`) -- same unread status as [`Self::delta_lf`].
+    pub delta_lf_multi: [[u16; 5]; 4],
 }
 
 /// One motion vector component's adapting state (spec 9.4's `Default_Mv_*`,
@@ -653,7 +669,12 @@ impl Cdfs {
         reset2(&mut self.palette_y_size);
         reset2(&mut self.palette_uv_mode);
         reset2(&mut self.palette_uv_size);
+        reset3(&mut self.palette_y_color_index);
+        reset3(&mut self.palette_uv_color_index);
         reset1(&mut self.intrabc);
+        reset1(&mut self.delta_q);
+        reset1(&mut self.delta_lf);
+        reset2(&mut self.delta_lf_multi);
     }
 
     /// The defaults a key frame starts from (spec 8.4, `init_coeff_cdfs` and
@@ -1113,7 +1134,12 @@ impl Cdfs {
             palette_y_size: cdf::PALETTE_Y_SIZE,
             palette_uv_mode: cdf::PALETTE_UV_MODE,
             palette_uv_size: cdf::PALETTE_UV_SIZE,
+            palette_y_color_index: cdf::PALETTE_Y_COLOR_INDEX,
+            palette_uv_color_index: cdf::PALETTE_UV_COLOR_INDEX,
             intrabc: cdf::INTRABC,
+            delta_q: cdf::DELTA_Q,
+            delta_lf: cdf::DELTA_LF,
+            delta_lf_multi: [cdf::DELTA_LF; 4],
         }
     }
 
