@@ -144,7 +144,16 @@ pub fn ac_q(bit_depth: u8, b: i32) -> i32 {
 /// `dqDenom` (spec 7.12.3): what the dequantized coefficient is divided by,
 /// which is driven by the transform's area rather than its side.
 pub fn dq_denom(side: usize) -> i64 {
-    match side * side {
+    dq_denom_area(side * side)
+}
+
+/// [`dq_denom`] keyed directly on the transform's area (lane-recttx): a
+/// rectangular block's denominator is an area threshold too, not a
+/// per-side one (`av1_get_tx_scale`, `av1/common/idct.c:24-28`:
+/// `(pels > 256) + (pels > 1024)` on `tx_size_2d[tx_size]`, which is
+/// `w * h`).
+pub fn dq_denom_area(pels: usize) -> i64 {
+    match pels {
         0..=256 => 1,
         257..=1024 => 2,
         _ => 4,
@@ -155,6 +164,12 @@ pub fn dq_denom(side: usize) -> i64 {
 /// quantizer, mask to 24 bits, divide by the transform's denominator toward
 /// zero, and clip to the coefficient range.
 pub fn dequant_coeff(level: i32, is_dc: bool, bit_depth: u8, q_idx: i32, side: usize) -> i32 {
+    dequant_coeff_wh(level, is_dc, bit_depth, q_idx, side, side)
+}
+
+/// [`dequant_coeff`] widened to `(w, h)` (lane-recttx): only the denominator
+/// (an area threshold, [`dq_denom_area`]) depends on the transform's shape.
+pub fn dequant_coeff_wh(level: i32, is_dc: bool, bit_depth: u8, q_idx: i32, w: usize, h: usize) -> i32 {
     let q = i64::from(if is_dc {
         dc_q(bit_depth, q_idx)
     } else {
@@ -162,7 +177,7 @@ pub fn dequant_coeff(level: i32, is_dc: bool, bit_depth: u8, q_idx: i32, side: u
     });
     let dq = i64::from(level) * q;
     let sign = if dq < 0 { -1 } else { 1 };
-    let dq2 = sign * ((dq.abs() & 0xFF_FFFF) / dq_denom(side));
+    let dq2 = sign * ((dq.abs() & 0xFF_FFFF) / dq_denom_area(w * h));
     let bound = 1i64 << (7 + u32::from(bit_depth));
     dq2.clamp(-bound, bound - 1) as i32
 }
@@ -170,10 +185,15 @@ pub fn dequant_coeff(level: i32, is_dc: bool, bit_depth: u8, q_idx: i32, side: u
 /// Dequantize a whole raster-order coefficient grid of a `side` x `side`
 /// transform.
 pub fn dequant(levels: &[i32], side: usize, bit_depth: u8, q_idx: i32) -> Vec<i32> {
+    dequant_wh(levels, side, side, bit_depth, q_idx)
+}
+
+/// [`dequant`] widened to `(w, h)` (lane-recttx).
+pub fn dequant_wh(levels: &[i32], w: usize, h: usize, bit_depth: u8, q_idx: i32) -> Vec<i32> {
     levels
         .iter()
         .enumerate()
-        .map(|(i, &l)| dequant_coeff(l, i == 0, bit_depth, q_idx, side))
+        .map(|(i, &l)| dequant_coeff_wh(l, i == 0, bit_depth, q_idx, w, h))
         .collect()
 }
 
