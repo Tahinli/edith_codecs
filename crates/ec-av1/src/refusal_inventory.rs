@@ -28,7 +28,7 @@ const CAPABILITY_CLAIMS: &[&str] = &[
     "a non-DC chroma mode on an 8x8 inter-frame leaf (this encoder never writes one)",
     "a nonzero angle delta (this encoder never writes one)",
     "a partition below 16x16 other than a clean split (this decoder codes only the square arms below 16x16)",
-    "a partition below 8x8 (this encoder never writes one)",
+    "a partition below 8x8 (this decoder codes no leaf smaller than 8x8)",
     "a tx_type symbol on a rectangular transform (never expected at this size)",
 ];
 
