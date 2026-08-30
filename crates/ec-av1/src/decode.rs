@@ -5457,18 +5457,21 @@ pub fn decode_key_frame_tile(
 thread_local! {
     /// lane-superres r3: the real decoded margin beyond `frame_width` up to
     /// the mi-aligned `true_width`, set by the most recent
-    /// [`decode_key_frame_tile_with_cdfs`] call. See that function's own
-    /// comment at the write site. `None` when there was no margin to save.
-    static LAST_KEY_FRAME_WIDE_MARGIN: std::cell::RefCell<Option<Picture>> =
+    /// [`decode_key_frame_tile_with_cdfs`] OR (lane-superres r10)
+    /// [`decode_inter_frame_tile_with_cdfs`] call -- both frame kinds crop
+    /// their reconstructed buffer down from the same mi-aligned extent, so
+    /// they share this one slot. See each function's own comment at its
+    /// write site. `None` when there was no margin to save.
+    static LAST_FRAME_WIDE_MARGIN: std::cell::RefCell<Option<Picture>> =
         const { std::cell::RefCell::new(None) };
 }
 
-/// The margin [`decode_key_frame_tile_with_cdfs`] most recently stashed
-/// (see [`LAST_KEY_FRAME_WIDE_MARGIN`]) -- `stream.rs`'s superres path
-/// reads this immediately after the call, before any other key frame
+/// The margin the most recent key- or inter-frame tile decode stashed
+/// (see [`LAST_FRAME_WIDE_MARGIN`]) -- `stream.rs`'s superres path
+/// reads this immediately after the call, before any other frame
 /// decode can overwrite it.
-pub(crate) fn take_last_key_frame_wide_margin() -> Option<Picture> {
-    LAST_KEY_FRAME_WIDE_MARGIN.with(|m| m.borrow_mut().take())
+pub(crate) fn take_last_frame_wide_margin() -> Option<Picture> {
+    LAST_FRAME_WIDE_MARGIN.with(|m| m.borrow_mut().take())
 }
 
 /// [`decode_key_frame_tile`], threading a cross-frame CDF forward (spec
@@ -6102,7 +6105,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
 
     let (fw, fh) = (frame_width as usize, frame_height as usize);
     if fw == width && fh == height {
-        LAST_KEY_FRAME_WIDE_MARGIN.with(|m| *m.borrow_mut() = None);
+        LAST_FRAME_WIDE_MARGIN.with(|m| *m.borrow_mut() = None);
         return Ok((
             Picture {
                 width,
@@ -6135,7 +6138,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     // reaches into that real margin; `None` when there is no margin (this
     // frame's `true_width`/`true_height` already equal `fw`/`fh`, e.g. a
     // non-superres frame whose width just isn't 32-block aligned).
-    LAST_KEY_FRAME_WIDE_MARGIN.with(|m| {
+    LAST_FRAME_WIDE_MARGIN.with(|m| {
         *m.borrow_mut() = if true_width > fw || true_height > fh {
             let yc = crop(&y, true_width, true_height);
             if let Ok(path) = std::env::var("EC_AV1_MARGIN_DUMP") {
@@ -10479,9 +10482,16 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         return Err(unsupported("a frame with no mode-info grid"));
     }
     let (true_width, true_height) = ((mi_cols * 4) as usize, (mi_rows * 4) as usize);
-    if reference.width != true_width || reference.height != true_height {
+    // lane-superres r10: a width mismatch alone is no longer refused here --
+    // `mc::predict_scaled` (spec 7.11.3.3, threaded through
+    // `decode_inter_block`'s single-ref branch) exists precisely for a
+    // `use_superres` reference at a different width than this frame's own
+    // true size. Height must still match: AV1 superres never scales height
+    // (r8's derivation, `mc.rs`'s own doc), and nothing in this decode path
+    // has a vertical scaling pass.
+    if reference.height != true_height {
         return Err(unsupported(
-            "a reference picture that is not this frame's own true size",
+            "a reference picture whose height does not match this frame's own true size",
         ));
     }
     let (cols, rows) = block_grid(mi_cols, mi_rows);
@@ -11987,6 +11997,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
 
     let (fw, fh) = (frame_width as usize, frame_height as usize);
     if fw == width && fh == height {
+        LAST_FRAME_WIDE_MARGIN.with(|m| *m.borrow_mut() = None);
         return Ok((
             Picture {
                 width,
@@ -12006,6 +12017,24 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         }
         out
     };
+    // lane-superres r10: same real-margin stash as
+    // `decode_key_frame_tile_with_cdfs` (see that function's comment) -- an
+    // inter frame under `use_superres` crops from the same mi-aligned
+    // `width`/`height` down to `fw`/`fh`, and `stream.rs`'s upscale needs
+    // the same real border-extension columns, not a synthetic replicate.
+    LAST_FRAME_WIDE_MARGIN.with(|m| {
+        *m.borrow_mut() = if width > fw || height > fh {
+            Some(Picture {
+                width,
+                height,
+                y: crop(&y, width, height),
+                u: crop(&u, width.div_ceil(2), height.div_ceil(2)),
+                v: crop(&v, width.div_ceil(2), height.div_ceil(2)),
+            })
+        } else {
+            None
+        }
+    });
     Ok((
         Picture {
             width: fw,

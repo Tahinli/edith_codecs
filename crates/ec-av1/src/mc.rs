@@ -427,6 +427,20 @@ pub fn scale_factor(other_width: usize, this_width: usize) -> i64 {
     (((other_width as i64) << 14) + this_width as i64 / 2) / this_width as i64
 }
 
+thread_local! {
+    /// lane-superres r10: firing count for the bypass gate (class
+    /// `gate-blind-to-feature`) -- how many times [`predict_scaled`] itself
+    /// ran, so the gate can hard-assert the scaled MC path actually fired
+    /// rather than trust a pixel match alone (an unscaled reference would
+    /// pass the pixels and prove nothing).
+    static PREDICT_SCALED_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`PREDICT_SCALED_HITS`].
+pub fn predict_scaled_hits() -> usize {
+    PREDICT_SCALED_HITS.with(|c| c.get())
+}
+
 fn round_pow2_64(value: i64, shift: u32) -> i64 {
     if shift == 0 {
         value
@@ -478,6 +492,7 @@ pub fn predict_scaled(
 ) {
     assert_eq!(dst.len(), block_w * block_h, "the destination is the block");
     assert!(!reference.is_empty(), "a reference plane has samples");
+    PREDICT_SCALED_HITS.with(|c| c.set(c.get() + 1));
 
     let y0 = y_q4.div_euclid(16);
     let yfrac = y_q4.rem_euclid(16) as usize;
