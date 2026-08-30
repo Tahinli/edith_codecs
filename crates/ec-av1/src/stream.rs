@@ -360,7 +360,8 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
 
         let (picture, end_cdfs, motion_field) = if header.frame_type == FrameType::Key {
             let (picture, end_cdfs) = decode_key_frame_tile_with_cdfs(
-                tile_bytes,
+                &[tile_bytes],
+                &header.tile_info,
                 header.mi_cols,
                 header.mi_rows,
                 header.quantization.base_q_idx,
