@@ -7174,6 +7174,150 @@ mod tests {
         );
     }
 
+    /// lane-sub8 r1: `--min-partition-size=4` on fine-detail noisy gradients
+    /// at low cq reliably makes aomenc split an 8x8 block all the way to
+    /// four `BLOCK_4X4` leaves (`PARTITION_SPLIT` below 8x8, spec
+    /// `decode_partition`'s recursion bottom) -- confirmed with
+    /// `EC_AV1_TRACE=1` against `examples/decode_probe` before this gate was
+    /// written (`partition_w8 ... value=3` at mi=(0,0) on the very first
+    /// block). [`decode::sub8_split_hits`] hard-asserts the path actually
+    /// ran rather than every attempt landing on `PARTITION_NONE`.
+    #[test]
+    fn a_real_aomenc_stream_with_a_sub8_split_decodes_pixel_exact() {
+        if !have_ffmpeg() {
+            eprintln!("SKIP a_real_aomenc_stream_with_a_sub8_split_decodes_pixel_exact: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            let msg = format!(
+                "no aomenc at {}",
+                aomenc_path().display()
+            );
+            assert!(
+                std::env::var_os("EC_AV1_REQUIRE_AOMENC").is_none(),
+                "EC_AV1_REQUIRE_AOMENC is set but {msg}"
+            );
+            eprintln!("SKIP a_real_aomenc_stream_with_a_sub8_split_decodes_pixel_exact: {msg}");
+            return;
+        }
+        let (width, height) = (64usize, 64usize);
+        let mut refusals = Vec::new();
+        let mut fired_runs = 0u32;
+        for attempt in 0..40u32 {
+            let seed = 100 + attempt;
+            let cq = 6 + (attempt % 4) * 2;
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &gradients_source(seed, width, height, "rate=25"),
+                    "-vf",
+                    "noise=alls=40:allf=t,format=yuv420p",
+                    "-t",
+                    "0.04",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let mut child = Command::new(aomenc_path())
+                .args([
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    &format!("--cq-level={cq}"),
+                    "--cpu-used=0",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--sb-size=64",
+                    "--min-partition-size=4",
+                    "--max-partition-size=8",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=1",
+                    "--enable-palette=0",
+                    "--enable-intrabc=0",
+                    "--enable-restoration=0",
+                    "--enable-cdef=0",
+                    "--loopfilter-control=0",
+                    // use_ref_frame_mvs (temporal MV projection) is unimplemented in
+                    // mvstack; this is a key-frame-only fixture, but keep it off for
+                    // safety against a run that emits a second frame.
+                    "--enable-ref-frame-mvs=0",
+                    "--limit=1",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            if !out.status.success() {
+                refusals.push(format!(
+                    "seed={seed} cq={cq}: aomenc itself refused the fixture"
+                ));
+                continue;
+            }
+            let stream = out.stdout;
+            let before = decode::sub8_split_hits();
+            let frames = match decode_stream(&stream) {
+                Ok(frames) => frames,
+                Err(e) => {
+                    refusals.push(format!("seed={seed} cq={cq}: {e}"));
+                    continue;
+                }
+            };
+            if decode::sub8_split_hits() == before {
+                refusals.push(format!(
+                    "seed={seed} cq={cq}: decoded, but no block read a real PARTITION_SPLIT below 8x8"
+                ));
+                continue;
+            }
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
+            assert_eq!(
+                frames[0].y, ffmpeg_frames[0].y,
+                "luma vs ffmpeg (seed={seed} cq={cq})"
+            );
+            assert_eq!(
+                frames[0].u, ffmpeg_frames[0].u,
+                "U vs ffmpeg (seed={seed} cq={cq})"
+            );
+            assert_eq!(
+                frames[0].v, ffmpeg_frames[0].v,
+                "V vs ffmpeg (seed={seed} cq={cq})"
+            );
+            fired_runs += 1;
+            if fired_runs >= 4 {
+                return;
+            }
+        }
+        panic!(
+            "fewer than 4 firing+pixel-exact runs out of 40 attempts:\n{}",
+            refusals.join("\n")
+        );
+    }
+
     /// lane-av1golden7 r9's decisive fixture: a real aomenc stream (seed 59,
     /// `--tune-content=film`, GOLDEN_FRAME firing downstream) whose frame-0
     /// *intra keyframe* mismatched ffmpeg on 3855/4096 luma pixels -- traced
