@@ -52,7 +52,6 @@ const REFUSALS: &[&str] = &[
     "a frame naming primary_ref_frame at a reference slot with no saved CDF state",
     "a frame with delta_q_present or delta_lf_present set (this decoder never reads the per-superblock delta symbols)",
     "a frame with loop restoration enabled (this decoder never reads the per-unit lr symbols)",
-    "a frame with more than one tile row (only tile columns are proven pixel-exact so far)",
     "a frame with no mode-info grid",
     "a frame with segmentation enabled (this decoder never reads a per-block segment_id symbol)",
     "a non-skip rectangular (HORZ/VERT/HORZ_B) strip needs rectangular residual coding",
