@@ -5194,9 +5194,14 @@ fn cdef_filter_block(
     sec_damping: i32,
     enable_primary: bool,
     enable_secondary: bool,
+    coeff_shift: i32,
 ) {
     let clipping_required = enable_primary && enable_secondary;
-    let pri_taps = CDEF_PRI_TAPS[(pri_strength & 1) as usize];
+    // libaom `cdef_filter_block_internal`: `cdef_pri_taps[(pri_strength >>
+    // coeff_shift) & 1]` -- `pri_strength` (and its `adjust_strength`
+    // derivative) carries the bit-depth shift, so the tap-set parity bit
+    // must be read back above that shift, not off the raw low bit.
+    let pri_taps = CDEF_PRI_TAPS[((pri_strength >> coeff_shift) & 1) as usize];
     for i in 0..bh {
         for j in 0..bw {
             let x = sample(i as i32, j as i32);
@@ -5960,6 +5965,7 @@ fn apply_cdef(
                         damping,
                         enable_primary,
                         enable_secondary,
+                        coeff_shift,
                     );
                 }
 
@@ -5995,6 +6001,7 @@ fn apply_cdef(
                             damping_uv,
                             enable_primary_uv,
                             enable_secondary_uv,
+                            coeff_shift,
                         );
                     }
                 }
