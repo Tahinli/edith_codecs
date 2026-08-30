@@ -66,6 +66,73 @@ pub(crate) fn filter_intra_hits() -> usize {
     FILTER_INTRA_HITS.with(|c| c.get())
 }
 
+/// lane-realworld r1: this frame's `cdef.bits` (spec 5.9.19), threaded into
+/// [`maybe_read_cdef_idx`] the same way [`ENABLE_EDGE_FILTER`] threads a
+/// frame-level flag through the recursive block decode -- `0` (the default)
+/// makes every call a true no-op, matching every existing gate stream's
+/// `cdef_bits == 0` behaviour exactly.
+thread_local! {
+    static CDEF_BITS: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+/// Whether this superblock's single CDEF unit (this decoder has no 128x128
+/// SB, so the SB IS the CDEF unit) has already had its `cdef_idx` literal
+/// read -- reset to `false` at the top of each superblock in the two tile
+/// loops, spec `read_cdef`'s `cdef_transmitted[index]`.
+thread_local! {
+    static CDEF_TRANSMITTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+/// Number of superblock columns in the current tile's grid, so
+/// [`maybe_read_cdef_idx`] can turn an `(mi_r, mi_c)` into a flat index into
+/// [`CDEF_IDX_GRID`].
+thread_local! {
+    static CDEF_SB_COLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+/// One resolved `cdef_idx` per superblock, read by [`apply_cdef`] to select
+/// which of the header's `1 << cdef.bits` strength pairs applies to that
+/// superblock's samples.
+thread_local! {
+    static CDEF_IDX_GRID: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(Vec::new());
+}
+/// How many real (`cdef.bits > 0`) `cdef_idx` literals [`maybe_read_cdef_idx`]
+/// has read, across every call in the process -- the gate's proof that a
+/// `cdef_bits > 0` stream actually reached the new reader rather than every
+/// superblock coincidentally being all-skip.
+thread_local! {
+    static CDEF_IDX_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`CDEF_IDX_HITS`].
+pub(crate) fn cdef_idx_hits() -> usize {
+    CDEF_IDX_HITS.with(|c| c.get())
+}
+
+/// `read_cdef` (spec 5.11.56, libaom `decodemv.c:read_cdef`), called right
+/// after `skip` is known at every block-decode call site. A no-op at
+/// `cdef.bits == 0` (0-bit literal, nothing to consume) -- and
+/// `read_cdef_params` already forces `bits = 0` under `coded_lossless`/
+/// `allow_intrabc`, so neither needs a separate check here. Reads once per
+/// superblock, at the first non-skip block.
+fn maybe_read_cdef_idx(dec: &mut SymbolDecoder, mi_r: usize, mi_c: usize, skip: bool) {
+    let bits = CDEF_BITS.with(|c| c.get());
+    if bits == 0 || skip || CDEF_TRANSMITTED.with(|c| c.get()) {
+        return;
+    }
+    let idx = dec.literal(u32::from(bits)) as u8;
+    CDEF_TRANSMITTED.with(|c| c.set(true));
+    CDEF_IDX_HITS.with(|c| c.set(c.get() + 1));
+    let (sb_r, sb_c) = (mi_r / SB_MI as usize, mi_c / SB_MI as usize);
+    let sb_cols = CDEF_SB_COLS.with(|c| c.get());
+    if sb_cols > 0 {
+        CDEF_IDX_GRID.with(|g| {
+            let mut g = g.borrow_mut();
+            let i = sb_r * sb_cols + sb_c;
+            if i < g.len() {
+                g[i] = idx;
+            }
+        });
+    }
+}
+
 /// How many 4-pixel deblocking edge groups [`edge_params`] has actually
 /// selected for filtering, across every call in the process -- the same
 /// before/after counter pattern as [`FILTER_INTRA_HITS`], proving a stream
@@ -1928,6 +1995,8 @@ fn read_intra_mode_rect(
     enable_filter_intra: bool,
     skip_ctx: usize,
     allow_screen_content_tools: bool,
+    mi_r: usize,
+    mi_c: usize,
 ) -> Result<(
     bool,
     usize,
@@ -1948,6 +2017,7 @@ fn read_intra_mode_rect(
         ));
     }
     let skip = dec.symbol(&mut cdfs.skip[skip_ctx]) != 0;
+    maybe_read_cdef_idx(dec, mi_r, mi_c, skip);
     let above_ctx = INTRA_MODE_CTX[above_mode];
     let left_ctx = INTRA_MODE_CTX[left_mode];
     let mode = dec.symbol(&mut cdfs.kf_y_mode[above_ctx][left_ctx]);
@@ -2089,6 +2159,8 @@ fn decode_block_rect(
             enable_filter_intra,
             neighbours.skip_txfm_ctx(r * (SUB / MI), c * (SUB / MI)),
             allow_screen_content_tools,
+            r * (SUB / MI),
+            c * (SUB / MI),
         )?;
     if filter_intra.is_some() {
         // `predict_filter_intra` (spec 7.11.2.3) is square-only in this
@@ -2371,6 +2443,7 @@ fn read_angle_delta(dec: &mut SymbolDecoder, cdf: &mut [u16]) -> i32 {
     symbol as i32 - ANGLE_DELTA_ZERO as i32
 }
 
+#[allow(clippy::too_many_arguments)]
 fn read_intra_mode(
     dec: &mut SymbolDecoder,
     cdfs: &mut Cdfs,
@@ -2382,6 +2455,8 @@ fn read_intra_mode(
     skip_ctx: usize,
     allow_screen_content_tools: bool,
     allow_intrabc: bool,
+    mi_r: usize,
+    mi_c: usize,
 ) -> Result<(
     bool,
     usize,
@@ -2396,6 +2471,9 @@ fn read_intra_mode(
     if trace {
         eprintln!("TRACE skip value={}", skip as i32);
     }
+    // spec order (see the comment below on `read_intrabc_info`): `skip`,
+    // `segment_id`, `cdef`, `delta_q` -- `cdef` lands right here.
+    maybe_read_cdef_idx(dec, mi_r, mi_c, skip);
     // `read_intrabc_info` (spec 5.11.13, libaom decodemv.c:693, called at
     // :811 right after `skip_txfm`/`segment_id`/`cdef`/`delta_q` and before
     // `mbmi->mode` is ever read): a `use_intrabc` symbol only present on an
@@ -2981,6 +3059,8 @@ fn decode_block(
             neighbours.skip_txfm_ctx(r * (SUB / MI), c * (SUB / MI)),
             allow_screen_content_tools,
             allow_intrabc,
+            r * (SUB / MI),
+            c * (SUB / MI),
         )?;
     // `predict` panics outside `DC_PRED..=PAETH_PRED` (0..=12); `UV_CFL_PRED`
     // (13) predicts as `DC_PRED` with the [`cfl_scaled`] nudge carrying the
@@ -3299,6 +3379,8 @@ fn decode_leaf8(
             neighbours.skip_txfm_ctx(leaf_mi.0, leaf_mi.1),
             allow_screen_content_tools,
             allow_intrabc,
+            leaf_mi.0,
+            leaf_mi.1,
         )?;
     let uv_predict_mode = if uv_mode == UV_CFL_PRED {
         DC_PRED
@@ -4315,13 +4397,32 @@ fn apply_cdef(
     cdef: &CdefParams,
     skip_grid: &Neighbours,
 ) {
-    if cdef.y_pri_strength[0] == 0
+    // `cdef.bits == 0` still means "no filtering at all" whenever the single
+    // (index 0) strength pair is all-zero -- the fast path every existing
+    // gate stream takes. A `bits > 0` frame can still be all-zero-strength
+    // at every index, but that is rare enough not to special-case; the
+    // per-superblock lookup below degrades to the same index-0 read anyway
+    // when [`CDEF_IDX_GRID`] was never populated (`bits == 0`).
+    if cdef.bits == 0
+        && cdef.y_pri_strength[0] == 0
         && cdef.y_sec_strength[0] == 0
         && cdef.uv_pri_strength[0] == 0
         && cdef.uv_sec_strength[0] == 0
     {
         return;
     }
+    let sb_cols = CDEF_SB_COLS.with(|c| c.get());
+    let idx_grid = CDEF_IDX_GRID.with(|g| g.borrow().clone());
+    let strength_idx = |mi_r: usize, mi_c: usize| -> usize {
+        if sb_cols == 0 {
+            return 0;
+        }
+        let (sb_r, sb_c) = (mi_r / SB_MI as usize, mi_c / SB_MI as usize);
+        idx_grid
+            .get(sb_r * sb_cols + sb_c)
+            .copied()
+            .unwrap_or(0) as usize
+    };
     let src_y = y.data.clone();
     let src_u = u.data.clone();
     let src_v = v.data.clone();
@@ -4332,6 +4433,7 @@ fn apply_cdef(
         let mut mi_c = 0usize;
         while mi_c < skip_grid.mi_cols {
             if !skip_grid.is_skip_txfm(mi_r, mi_c) {
+                let sidx = strength_idx(mi_r, mi_c);
                 let (ox, oy) = (mi_c * 4, mi_r * 4);
                 let (y_stride, y_true_w, y_true_h) = (y.width, y.true_width, y.true_height);
                 let sample_y = |r: i32, c: i32| -> i32 {
@@ -4351,10 +4453,10 @@ fn apply_cdef(
                 // -- each plane zeroes the shared direction when *its own*
                 // frame-level primary strength is 0, independent of the
                 // per-block adjusted `t` and of the other plane's strength.
-                let y_dir = if cdef.y_pri_strength[0] != 0 { dir } else { 0 };
-                let t = cdef_adjust_strength(i32::from(cdef.y_pri_strength[0]), var);
+                let y_dir = if cdef.y_pri_strength[sidx] != 0 { dir } else { 0 };
+                let t = cdef_adjust_strength(i32::from(cdef.y_pri_strength[sidx]), var);
                 let enable_primary = t != 0;
-                let enable_secondary = cdef.y_sec_strength[0] != 0;
+                let enable_secondary = cdef.y_sec_strength[sidx] != 0;
                 if enable_primary || enable_secondary {
                     cdef_filter_block(
                         sample_y,
@@ -4364,7 +4466,7 @@ fn apply_cdef(
                         8,
                         8,
                         t,
-                        i32::from(cdef.y_sec_strength[0]),
+                        i32::from(cdef.y_sec_strength[sidx]),
                         y_dir,
                         damping,
                         damping,
@@ -4373,10 +4475,10 @@ fn apply_cdef(
                     );
                 }
 
-                let t_uv = i32::from(cdef.uv_pri_strength[0]);
+                let t_uv = i32::from(cdef.uv_pri_strength[sidx]);
                 let uv_dir = if t_uv != 0 { dir } else { 0 };
                 let enable_primary_uv = t_uv != 0;
-                let enable_secondary_uv = cdef.uv_sec_strength[0] != 0;
+                let enable_secondary_uv = cdef.uv_sec_strength[sidx] != 0;
                 if enable_primary_uv || enable_secondary_uv {
                     let (cox, coy) = (ox / 2, oy / 2);
                     for (plane, src_p) in [(&mut *u, &src_u), (&mut *v, &src_v)] {
@@ -4398,7 +4500,7 @@ fn apply_cdef(
                             4,
                             4,
                             t_uv,
-                            i32::from(cdef.uv_sec_strength[0]),
+                            i32::from(cdef.uv_sec_strength[sidx]),
                             uv_dir,
                             damping_uv,
                             damping_uv,
@@ -4497,6 +4599,9 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     }
     ENABLE_EDGE_FILTER.with(|f| f.set(enable_edge_filter));
     let (sb_cols, sb_rows) = (mi_cols.div_ceil(SB_MI), mi_rows.div_ceil(SB_MI));
+    CDEF_BITS.with(|c| c.set(cdef.bits));
+    CDEF_SB_COLS.with(|c| c.set(sb_cols as usize));
+    CDEF_IDX_GRID.with(|g| *g.borrow_mut() = vec![0u8; sb_cols as usize * sb_rows as usize]);
     let (cols32, rows32) = block_grid(mi_cols, mi_rows);
     let (true_width, true_height) = ((mi_cols * 4) as usize, (mi_rows * 4) as usize);
     let (width, height) = (cols32 as usize * BLOCK, rows32 as usize * BLOCK);
@@ -4547,6 +4652,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     for sb_r in 0..sb_rows {
         neighbours.start_row();
         for sb_c in 0..sb_cols {
+            CDEF_TRANSMITTED.with(|c| c.set(false));
             let at = (sb_r as usize * 4, sb_c as usize * 4);
             let ctx = neighbours.partition_ctx(at, SB);
             let (has_cols, has_rows) = (
@@ -6378,6 +6484,7 @@ fn decode_inter_block(
 
     let skip_ctx = usize::from(neighbours.above_skip[c]) + usize::from(neighbours.left_skip[r]);
     let skip = skip_mode || dec.symbol(&mut cdfs.skip[skip_ctx]) == 1;
+    maybe_read_cdef_idx(dec, r * SUB_MI as usize, c * SUB_MI as usize, skip);
     // lane-warp r5: see `reject_residual` -- a square-block decode of a
     // HORZ_B strip is symbol-exact only for `skip` (no residual, no
     // motion_mode/warp symbol), so gate here before any further read.
@@ -8105,6 +8212,7 @@ fn decode_inter_block8(
 
     let skip_ctx = usize::from(above_skip) + usize::from(left_skip);
     let skip = skip_mode || dec.symbol(&mut cdfs.skip[skip_ctx]) == 1;
+    maybe_read_cdef_idx(dec, leaf_mi.0, leaf_mi.1, skip);
 
     let (has_above, has_left) = (leaf_mi.0 > 0, leaf_mi.1 > 0);
     let ii_ctx = intra_inter_ctx(has_above, has_left, above_inter, left_inter);
@@ -9163,6 +9271,9 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     }
     let (cols, rows) = block_grid(mi_cols, mi_rows);
     let (sb_cols, sb_rows) = (cols.div_ceil(2), rows.div_ceil(2));
+    CDEF_BITS.with(|c| c.set(cdef.bits));
+    CDEF_SB_COLS.with(|c| c.set(sb_cols as usize));
+    CDEF_IDX_GRID.with(|g| *g.borrow_mut() = vec![0u8; sb_cols as usize * sb_rows as usize]);
     let (width, height) = (cols as usize * BLOCK, rows as usize * BLOCK);
 
     let ref_y = PlaneBuf {
@@ -9275,6 +9386,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     for sb_r in 0..sb_rows {
         neighbours.start_row();
         for sb_c in 0..sb_cols {
+            CDEF_TRANSMITTED.with(|c| c.set(false));
             let sb_at = (sb_r as usize * 4, sb_c as usize * 4);
             let sb_ctx = neighbours.partition_ctx(sb_at, SB);
             let (has_cols, has_rows) = (

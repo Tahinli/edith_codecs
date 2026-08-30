@@ -125,19 +125,11 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         })?;
         // `read_cdef` (spec `decodeframe.c`, called at the first non-skip
         // block of each 64x64) only reads a literal `cdef_idx` when
-        // `cdef_bits > 0`; at `cdef_bits == 0` there is nothing to read (this
-        // crate's own writer's only case, and both `lane-av1cdef` gate
-        // streams'), so the per-block symbol this crate's tile readers never
-        // consume is a true no-op there. A `cdef_bits > 0` stream would
-        // desync the moment it hit a real strength selector this decoder
-        // never reads — refuse that by name rather than silently miscode,
-        // the same pattern as the other round-2 refusals below.
-        if header.cdef.bits != 0 {
-            return Err(Error::unsupported(
-                "AV1 decode_stream",
-                "a frame with cdef_bits > 0 (this decoder never reads the per-64x64 cdef_idx symbol)",
-            ));
-        }
+        // `cdef_bits > 0`; at `cdef_bits == 0` there is nothing to read (a
+        // true no-op). lane-realworld r1: the per-64x64 `cdef_idx` literal is
+        // now read (`maybe_read_cdef_idx` in decode.rs) and threaded into
+        // [`crate::decode::apply_cdef`]'s per-superblock strength lookup, so
+        // a `cdef_bits > 0` stream no longer needs this refusal.
         // An intra frame's `decode_key_frame_tile*` now reads `tx_depth`
         // under `TxMode::Select` (lane-av1txsel, spec 5.11.16): the key-frame
         // decode path threads `tx_select` through `decode_block`/
