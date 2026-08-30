@@ -165,6 +165,25 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         // intrabc call at all -- that symbol is intra-frame-only). A
         // genuine palette/intrabc use still refuses by name deeper in the
         // block readers, so no whole-frame refusal is needed here anymore.
+        // Both AV1 files in this box's own library (a 2160p HDR10 encode and a
+        // 1080p one, probed 2026-08-30 through `examples/decode_probe`) are
+        // `yuv420p10le`, and every buffer this decoder reconstructs into --
+        // `Picture`'s `y`/`u`/`v` -- is `Vec<u8>`. A 10- or 12-bit stream would
+        // therefore be reconstructed into 8-bit samples and compared against a
+        // 10-bit reference, which is silent wrongness rather than a desync: no
+        // symbol goes unread, the pixels are just quietly truncated. Refuse it
+        // by name until the planes are widened. `bit_depth` defaults to 8 when
+        // no sequence header has been seen, which is the existing behaviour for
+        // every fixture in this crate.
+        if parser
+            .sequence_header()
+            .is_some_and(|seq| seq.color_config.bit_depth != 8)
+        {
+            return Err(Error::unsupported(
+                "AV1 decode_stream",
+                "a stream whose bit depth is not 8 (this decoder reconstructs into 8-bit planes)",
+            ));
+        }
         if header.delta.q_present || header.delta.lf_present {
             return Err(Error::unsupported(
                 "AV1 decode_stream",
