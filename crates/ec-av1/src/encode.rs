@@ -3104,9 +3104,9 @@ mod tests {
         Picture {
             width,
             height,
-            y: out.stdout[..luma].to_vec(),
-            u: out.stdout[luma..luma + chroma].to_vec(),
-            v: out.stdout[luma + chroma..].to_vec(),
+            y: out.stdout[..luma].iter().map(|&v| u16::from(v)).collect(),
+            u: out.stdout[luma..luma + chroma].iter().map(|&v| u16::from(v)).collect(),
+            v: out.stdout[luma + chroma..].iter().map(|&v| u16::from(v)).collect(),
         }
     }
 
@@ -3127,20 +3127,20 @@ mod tests {
                     0.0
                 };
                 picture.y[y * width + x] =
-                    (20.0 + gradient + ripple + edge).clamp(0.0, 255.0) as u8;
+                    (20.0 + gradient + ripple + edge).clamp(0.0, 255.0) as u16;
             }
         }
         for y in 0..height / 2 {
             for x in 0..width / 2 {
                 let i = y * width / 2 + x;
-                picture.u[i] = (100 + (x * 60 / (width / 2))) as u8;
-                picture.v[i] = (200 - (y * 80 / (height / 2))) as u8;
+                picture.u[i] = (100 + (x * 60 / (width / 2))) as u16;
+                picture.v[i] = (200 - (y * 80 / (height / 2))) as u16;
             }
         }
         picture
     }
 
-    fn psnr(a: &[u8], b: &[u8]) -> f64 {
+    fn psnr(a: &[u16], b: &[u16]) -> f64 {
         let squared: f64 = a
             .iter()
             .zip(b)
@@ -3675,9 +3675,9 @@ mod tests {
         Picture {
             width,
             height,
-            y: out.stdout[..luma].to_vec(),
-            u: out.stdout[luma..luma + chroma].to_vec(),
-            v: out.stdout[luma + chroma..].to_vec(),
+            y: out.stdout[..luma].iter().map(|&v| u16::from(v)).collect(),
+            u: out.stdout[luma..luma + chroma].iter().map(|&v| u16::from(v)).collect(),
+            v: out.stdout[luma + chroma..].iter().map(|&v| u16::from(v)).collect(),
         }
     }
 
@@ -3797,7 +3797,7 @@ mod tests {
     /// Where two planes first disagree, and by how much: a mismatch reported as
     /// a position says which block and which sample of it went wrong, which a
     /// pair of thousand-sample arrays does not.
-    fn first_difference(ours: &[u8], theirs: &[u8], width: usize) -> Option<String> {
+    fn first_difference(ours: &[u16], theirs: &[u16], width: usize) -> Option<String> {
         let i = ours.iter().zip(theirs).position(|(a, b)| a != b)?;
         let differ = ours.iter().zip(theirs).filter(|(a, b)| a != b).count();
         Some(format!(
@@ -4353,15 +4353,15 @@ mod tests {
                     0.0
                 };
                 picture.y[y * width + x] =
-                    (20.0 + gradient + ripple + edge).clamp(0.0, 255.0) as u8;
+                    (20.0 + gradient + ripple + edge).clamp(0.0, 255.0) as u16;
             }
         }
         for y in 0..height / 2 {
             for x in 0..width / 2 {
                 let sx = (x as i64 - shift / 2).rem_euclid((width / 2) as i64) as usize;
                 let i = y * width / 2 + x;
-                picture.u[i] = (100 + (sx * 60 / (width / 2))) as u8;
-                picture.v[i] = (200 - (y * 80 / (height / 2))) as u8;
+                picture.u[i] = (100 + (sx * 60 / (width / 2))) as u16;
+                picture.v[i] = (200 - (y * 80 / (height / 2))) as u16;
             }
         }
         picture
@@ -4409,9 +4409,9 @@ mod tests {
                 Picture {
                     width,
                     height,
-                    y: out.stdout[base..base + luma].to_vec(),
-                    u: out.stdout[base + luma..base + luma + chroma].to_vec(),
-                    v: out.stdout[base + luma + chroma..base + frame_bytes].to_vec(),
+                    y: out.stdout[base..base + luma].iter().map(|&v| u16::from(v)).collect(),
+                    u: out.stdout[base + luma..base + luma + chroma].iter().map(|&v| u16::from(v)).collect(),
+                    v: out.stdout[base + luma + chroma..base + frame_bytes].iter().map(|&v| u16::from(v)).collect(),
                 }
             })
             .collect()
@@ -4750,9 +4750,9 @@ mod tests {
             Picture {
                 width,
                 height,
-                y: bytes[..luma].to_vec(),
-                u: bytes[luma..luma + chroma].to_vec(),
-                v: bytes[luma + chroma..].to_vec(),
+                y: bytes[..luma].iter().map(|&v| u16::from(v)).collect(),
+                u: bytes[luma..luma + chroma].iter().map(|&v| u16::from(v)).collect(),
+                v: bytes[luma + chroma..].iter().map(|&v| u16::from(v)).collect(),
             }
         })
     }
@@ -4877,9 +4877,9 @@ mod tests {
                 Picture {
                     width,
                     height,
-                    y: bytes[..luma].to_vec(),
-                    u: bytes[luma..luma + chroma].to_vec(),
-                    v: bytes[luma + chroma..].to_vec(),
+                    y: bytes[..luma].iter().map(|&v| u16::from(v)).collect(),
+                    u: bytes[luma..luma + chroma].iter().map(|&v| u16::from(v)).collect(),
+                    v: bytes[luma + chroma..].iter().map(|&v| u16::from(v)).collect(),
                 }
             })
             .collect()
