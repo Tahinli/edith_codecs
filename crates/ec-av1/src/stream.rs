@@ -6358,4 +6358,206 @@ mod tests {
             "{NAME}: {matched} pixel-exact matches, {named_refusals} named refusals out of 20"
         );
     }
+
+    /// lane-realworld r6: r5 ported `maybe_read_delta_q`/`maybe_read_delta_lf`
+    /// and removed the whole-frame refusal, but no fixture anywhere set
+    /// `delta_lf_present` -- the removal was unproven. `--deltaq-mode=2`
+    /// (`DELTA_Q_PERCEPTUAL`, checked against libaom's own
+    /// `encodeframe.c:2192-2225`) sets `delta_q_present_flag` unconditionally
+    /// once `base_qindex > 0` (unlike the default `--deltaq-mode=1`
+    /// `DELTA_Q_OBJECTIVE`, which additionally requires an alt-ref-eligible
+    /// frame and `allow_deltaq_mode`'s own RD search); `--delta-lf-mode=1`
+    /// then ANDs `delta_lf_present_flag` on top
+    /// (`tool_cfg->enable_deltalf_mode`, `av1_cx_iface.c:1269-1270`). 128x64
+    /// (2 SBs; this decoder hardcodes 64px SBs) is the charter's minimum for
+    /// a per-superblock symbol to have somewhere to differ; `--cpu-used=4`
+    /// (not the other gates' `=0`) sidesteps the multi-SB
+    /// HORZ_4/VERT_B-at-part64 gap the cdef gate's own comment documents
+    /// (lane-realworld r2 dead-end, part64 only covers NONE/SPLIT). Note:
+    /// libaom hardcodes `delta_lf_multi = DEFAULT_DELTA_LF_MULTI == 0`
+    /// (`enums.h:73`) with no CLI flag to set it -- this gate cannot and
+    /// does not claim to exercise this decoder's `delta_lf_multi` branch;
+    /// only the single-plane path is gate-proven.
+    #[test]
+    fn a_real_aomenc_stream_with_delta_q_and_delta_lf_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_stream_with_delta_q_and_delta_lf_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height, frame_count) = (128usize, 64usize, 24usize);
+        let mut named_refusals = 0u32;
+        let mut matched = 0u32;
+        let n_attempts: u32 = std::env::var("EC_DELTAQ_GATE_ATTEMPTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(40);
+        for attempt in 0..n_attempts {
+            let seed = 42 + attempt;
+            let duration = frame_count as f64 / 25.0;
+            // Mandelbrot's varying local contrast is what gives
+            // DELTA_Q_PERCEPTUAL's per-superblock RD something to
+            // differentiate; flat gradients risk every superblock
+            // resolving the same delta.
+            let source = format!(
+                "mandelbrot=size={width}x{height}:rate=25:start_x={sx}:start_y={sy}",
+                sx = -0.6 + 0.005 * (attempt as f64),
+                sy = -0.4 + 0.005 * (attempt as f64)
+            );
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-t",
+                    &duration.to_string(),
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let args: Vec<&str> = vec![
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                "--cq-level=45",
+                "--cpu-used=4",
+                "--aq-mode=0",
+                "--deltaq-mode=2",
+                "--delta-lf-mode=1",
+                "--kf-max-dist=1000",
+                "--threads=1",
+                "--row-mt=0",
+                "--sb-size=64",
+                "--auto-alt-ref=1",
+                "--lag-in-frames=16",
+                "--enable-fwd-kf=0",
+                "--enable-order-hint=1",
+                "--enable-warped-motion=1",
+                "--enable-global-motion=0",
+                "--enable-obmc=1",
+                "--tune-content=default",
+                "--enable-masked-comp=1",
+                "--enable-dist-wtd-comp=0",
+                "--enable-interintra-comp=1",
+                "--enable-onesided-comp=0",
+                "--enable-interintra-wedge=0",
+                "--enable-smooth-interintra=1",
+                "--enable-rect-partitions=0",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0",
+                "--enable-filter-intra=0",
+                "--enable-smooth-intra=0",
+                "--enable-paeth-intra=0",
+                "--enable-directional-intra=0",
+                "--enable-angle-delta=0",
+                "--enable-tx-size-search=0",
+                "--enable-cdef=1",
+                "--enable-restoration=0",
+                "--max-partition-size=32",
+                "--min-partition-size=32",
+                "--enable-palette=0",
+                "--enable-intrabc=0",
+                "--enable-cfl-intra=0",
+                "--enable-ref-frame-mvs=0",
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ];
+            let mut child = Command::new(aomenc_path())
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let frames = match decode_stream(&stream) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME} failed outright, not a named refusal (seed {seed}): {msg}"
+                    );
+                    assert!(
+                        !msg.contains("delta_q") && !msg.contains("delta_lf"),
+                        "{NAME} refused on delta_q/delta_lf (seed {seed}) -- that read is ported: {msg}"
+                    );
+                    named_refusals += 1;
+                    eprintln!("seed {seed} refusal: {msg}");
+                    continue;
+                }
+                Ok(frames) => frames,
+            };
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
+            assert_eq!(frames.len(), frame_count);
+            let mismatched = frames
+                .iter()
+                .zip(&ffmpeg_frames)
+                .any(|(got, want)| got.y != want.y || got.u != want.u || got.v != want.v);
+            if mismatched && let Ok(path) = std::env::var("EC_AV1_GATE_DUMP") {
+                std::fs::write(&path, &stream).expect("writing pinned stream");
+                eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
+            }
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
+                assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
+            }
+            matched += 1;
+        }
+        assert!(
+            matched > 0,
+            "{NAME}: every attempt refused on other capabilities ({named_refusals} refusals); \
+             the gate never exercised delta_q/delta_lf"
+        );
+        assert!(
+            crate::decode::delta_q_hits() > 0,
+            "{NAME}: {matched} pixel-exact matches but zero delta_q symbol groups fired -- \
+             the reader is unexercised"
+        );
+        assert!(
+            crate::decode::delta_lf_hits() > 0,
+            "{NAME}: {matched} pixel-exact matches but zero delta_lf symbol groups fired -- \
+             the reader is unexercised"
+        );
+        eprintln!(
+            "{NAME}: {named_refusals} other-capability refusals, {matched} pixel-exact matches \
+             out of {n_attempts}, delta_q_hits={}, delta_lf_hits={}",
+            crate::decode::delta_q_hits(),
+            crate::decode::delta_lf_hits()
+        );
+    }
 }
