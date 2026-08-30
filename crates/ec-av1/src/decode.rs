@@ -2095,6 +2095,28 @@ fn decode_block_rect(
         } else {
             (&SCAN_16X32, &SCAN_8X16)
         };
+        // lane-rectwire r3: real coefficients desync a pixel-exact gate
+        // (rectwire-flake-1.obu, seed 55) -- both 32x16 strips of frame 0's
+        // mi(8,8) HORZ quadrant come out ~100% wrong from their very first
+        // pixel (not a subtle context-table off-by-one), while the sibling
+        // non-rect quadrants of the same frame match. Range-ladder bisection
+        // against a real aomdec (EC_TRACE_COEFF/EC_TRACE_MODE) was started
+        // but the intra key-frame path has no traced symbol between the
+        // partition read and the first coefficient block (mode/skip/tx_depth
+        // reads are all untraced in libaom's decodeframe.c intra path, unlike
+        // the inter EC_TRACE_MODE this round added), so a same-length range
+        // comparison wasn't reachable within budget -- see
+        // lanes/rectwire-r3.report.md for what was ruled out (base_ctx_rect's
+        // 5-neighbour offsets, u/v_skip_ctx's above+left formula, and
+        // dc_sign_ctx's around-index all cross-checked byte-for-byte against
+        // libaom and match). Refusing by name again (r1 behavior) rather than
+        // risk landing the desync.
+        return Err(unsupported(
+            "a HORZ/VERT intra strip with real (non-skip) coefficients \
+             (lane-rectwire r3: confirmed desync, not yet isolated)",
+        ));
+        #[allow(unreachable_code)]
+        {
         let around = neighbours.around_rect(at, bw, bh);
         let mut luma_coding = cdfs.txb(TxbSet::LumaRect32x16, mode);
         let (luma_levels, luma_tx_type) = read_coeffs_rect(
@@ -2196,6 +2218,7 @@ fn decode_block_rect(
         );
         neighbours.record_rect(at, bw, bh, mode, &[luma_levels, u_levels, v_levels]);
         RECT_COEFF_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     neighbours.fill_skip_grid_rect((mi_r, mi_c), bw / MI, bh / MI, skip);
     neighbours.fill_lf_grid_rect((mi_r, mi_c), bw / MI, bh / MI, tx_w as u8, tx_h as u8, 0);
