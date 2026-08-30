@@ -31,6 +31,7 @@ pub mod mvstack;
 pub mod obu;
 pub mod quant;
 mod refusal_inventory;
+mod restoration;
 pub mod sequence;
 mod superres;
 pub mod stream;
