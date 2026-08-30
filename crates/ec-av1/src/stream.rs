@@ -6240,6 +6240,164 @@ mod tests {
             crate::decode::cdef_idx_hits()
         );
     }
+    /// lane-tiny r1 diagnostic (not a gate): sweeps tiny key-frame sizes
+    /// against real aomenc + ffmpeg to find the exact size boundary of the
+    /// silent-wrong-pixels defect the sub8 lane's r2 dead-end flagged (a
+    /// plain 16x16 stream, no exotic tools). `#[ignore]`d -- prints a
+    /// pass/fail table, asserts nothing; run manually with `--nocapture`.
+    #[test]
+    #[ignore = "diagnostic sweep, run manually with --nocapture"]
+    fn probe_tiny_frame_size_boundary() {
+        if !have_ffmpeg() || !have_aomenc() {
+            eprintln!("SKIP: no ffmpeg/aomenc");
+            return;
+        }
+        let sizes: &[(usize, usize)] =
+            &[(8, 8), (16, 16), (32, 32), (16, 32), (32, 16), (64, 64), (48, 48), (24, 24)];
+        for &(width, height) in sizes {
+            let mut ok = 0u32;
+            let mut bad = 0u32;
+            let mut refused = 0u32;
+            let n = 10u32;
+            for attempt in 0..n {
+                let seed = 42 + attempt;
+                let source = format!(
+                    "mandelbrot=size={width}x{height}:rate=25:start_x={sx}:start_y={sy}",
+                    sx = -0.6 + 0.005 * (attempt as f64),
+                    sy = -0.4 + 0.005 * (attempt as f64)
+                );
+                let y4m = Command::new("ffmpeg")
+                    .args([
+                        "-v", "error", "-f", "lavfi", "-i", &source, "-t", "0.04", "-pix_fmt",
+                        "yuv420p", "-f", "yuv4mpegpipe", "-",
+                    ])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .expect("ffmpeg failed to run");
+                assert!(y4m.status.success(), "ffmpeg fixture: {}", String::from_utf8_lossy(&y4m.stderr));
+                let max_part = width.max(height).min(64).next_power_of_two();
+                let min_part = width.min(height).next_power_of_two().max(8).min(max_part);
+                let max_part_arg = format!("--max-partition-size={max_part}");
+                let min_part_arg = format!("--min-partition-size={min_part}");
+                let args: Vec<&str> = vec![
+                    "--codec=av1", "--passes=1", "--end-usage=q", "--cq-level=32",
+                    "--cpu-used=4", "--kf-max-dist=0", "--limit=1", "--threads=1",
+                    "--row-mt=0", "--enable-rect-partitions=0", "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    &max_part_arg, &min_part_arg,
+                    "--obu", "-o", "-", "-",
+                ];
+                let mut child = Command::new(aomenc_path())
+                    .args(&args)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("aomenc failed to start");
+                child.stdin.take().expect("aomenc stdin").write_all(&y4m.stdout).expect("write y4m");
+                let out = child.wait_with_output().expect("aomenc failed to run");
+                assert!(out.status.success(), "aomenc refused: {}", String::from_utf8_lossy(&out.stderr));
+                let stream = out.stdout;
+                let frames = match decode_stream(&stream) {
+                    Err(e) => {
+                        eprintln!("  {width}x{height} seed {seed}: REFUSED {e}");
+                        refused += 1;
+                        continue;
+                    }
+                    Ok(f) => f,
+                };
+                let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
+                if frames.len() == 1
+                    && frames[0].y == ffmpeg_frames[0].y
+                    && frames[0].u == ffmpeg_frames[0].u
+                    && frames[0].v == ffmpeg_frames[0].v
+                {
+                    ok += 1;
+                } else {
+                    bad += 1;
+                    let mut first = None;
+                    for row in 0..height {
+                        for col in 0..width {
+                            let i = row * width + col;
+                            if frames[0].y[i] != ffmpeg_frames[0].y[i] {
+                                first = Some((row, col, frames[0].y[i], ffmpeg_frames[0].y[i]));
+                                break;
+                            }
+                        }
+                        if first.is_some() {
+                            break;
+                        }
+                    }
+                    let ndiff = frames[0]
+                        .y
+                        .iter()
+                        .zip(&ffmpeg_frames[0].y)
+                        .filter(|(a, b)| a != b)
+                        .count();
+                    eprintln!(
+                        "  {width}x{height} seed {seed}: MISMATCH luma first_diff={first:?} ndiff_luma={ndiff}/{}",
+                        width * height
+                    );
+                }
+            }
+            eprintln!("{width}x{height}: {ok} ok / {bad} mismatch / {refused} refused (of {n})");
+        }
+    }
+
+    /// lane-tiny r1: re-decodes the known-failing 32x32 seed 45 fixture with
+    /// `EC_AV1_TRACE` on to inspect what mode/tx this single-block frame
+    /// picked. Diagnostic only, `#[ignore]`d, run manually with --nocapture.
+    #[test]
+    #[ignore = "diagnostic, run manually with --nocapture"]
+    fn probe_tiny_32x32_trace() {
+        if !have_ffmpeg() || !have_aomenc() {
+            eprintln!("SKIP: no ffmpeg/aomenc");
+            return;
+        }
+        let (width, height) = (32usize, 32usize);
+        let attempt = 3u32; // seed 45
+        let source = format!(
+            "mandelbrot=size={width}x{height}:rate=25:start_x={sx}:start_y={sy}",
+            sx = -0.6 + 0.005 * (attempt as f64),
+            sy = -0.4 + 0.005 * (attempt as f64)
+        );
+        let y4m = Command::new("ffmpeg")
+            .args([
+                "-v", "error", "-f", "lavfi", "-i", &source, "-t", "0.04", "-pix_fmt", "yuv420p",
+                "-f", "yuv4mpegpipe", "-",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ffmpeg failed to run");
+        assert!(y4m.status.success());
+        let args: Vec<&str> = vec![
+            "--codec=av1", "--passes=1", "--end-usage=q", "--cq-level=32", "--cpu-used=4",
+            "--kf-max-dist=0", "--limit=1", "--threads=1", "--row-mt=0",
+            "--enable-rect-partitions=0", "--enable-ab-partitions=0",
+            "--enable-1to4-partitions=0", "--max-partition-size=32", "--min-partition-size=32",
+            "--enable-filter-intra=0",
+            "--obu", "-o", "-", "-",
+        ];
+        let mut child = Command::new(aomenc_path())
+            .args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("aomenc failed to start");
+        child.stdin.take().unwrap().write_all(&y4m.stdout).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success());
+        let stream = out.stdout;
+        let frames = decode_stream(&stream).expect("decode");
+        let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
+        let mismatched = frames[0].y != ffmpeg_frames[0].y;
+        eprintln!("mismatched={mismatched}");
+    }
     /// Pinned streams captured by `EC_AV1_GATE_DUMP` off
     /// `a_real_aomenc_stream_with_warped_motion_refuses_or_matches` -- each
     /// one is a former mismatch, kept as a regression pin (warp-mismatch:
