@@ -4191,10 +4191,23 @@ mod tests {
                 "{NAME}: SOFT-NOTE -- zero HORZ/VERT strips fired this run \
                  ({matched} matches, {named_refusals} refusals); sampling, not a regression"
             );
+        } else {
+            // lane-rectwire r2: once a run fires any HORZ/VERT strip at all,
+            // real coefficient decode (not just the skip case) must also
+            // fire -- a rect_partition_hits>0, rect_coeff_hits==0 run would
+            // mean every fired strip happened to be skip, which the encoder
+            // recipe's rate target does not produce in practice.
+            assert!(
+                crate::decode::rect_coeff_hits() > 0,
+                "{NAME}: {} HORZ/VERT strips fired but zero coded real coefficients \
+                 (rect_coeff_hits==0) -- the rect coefficient reader is unexercised",
+                crate::decode::rect_partition_hits()
+            );
         }
         eprintln!(
-            "{NAME}: {named_refusals} named refusals, {matched} pixel-exact matches out of {n_attempts}, rect_partition_hits={} extended_partition_hits={} partab_hits={}",
+            "{NAME}: {named_refusals} named refusals, {matched} pixel-exact matches out of {n_attempts}, rect_partition_hits={} rect_coeff_hits={} extended_partition_hits={} partab_hits={}",
             crate::decode::rect_partition_hits(),
+            crate::decode::rect_coeff_hits(),
             crate::decode::extended_partition_hits(),
             crate::decode::partab_hits()
         );
