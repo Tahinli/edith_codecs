@@ -5422,6 +5422,8 @@ fn decode_inter_block(
                             is_new_mv: matches!(compound_mode, 2 | 3 | 4 | 5 | 7),
                             size: bw4,
                             size_h: bh4,
+                            is_global_mv0: false,
+                            is_global_mv1: false,
                         },
                     );
                 }
@@ -6035,6 +6037,15 @@ fn decode_inter_block(
                 mi_cols as usize,
                 mi_rows as usize,
                 sign_bias_table,
+                // lane-gm r2: gm_get_motion_vector + mvstack substitution are
+                // ported and unit-tested (warp.rs, mvstack.rs) but not yet
+                // wired to this frame's real `global_motion` table -- every
+                // `MiInfo` this decoder ever writes still sets
+                // `is_global_mv0`/`is_global_mv1` to `false` (see the ctor
+                // sites), so the substitution path this table would feed is
+                // never taken yet. `NO_GM_MV` keeps this call exactly as
+                // inert as the old 0-arg call was.
+                &crate::mvstack::NO_GM_MV,
                 tpl,
             );
             let not_new = dec.symbol(&mut cdfs.new_mv[stack.new_mv_ctx]) == 1;
@@ -6360,6 +6371,8 @@ fn decode_inter_block(
                             is_new_mv,
                             size: bw4,
                             size_h: bh4,
+                            is_global_mv0: false,
+                            is_global_mv1: false,
                         },
                     );
                 }
@@ -6606,6 +6619,8 @@ fn decode_inter_block(
                         is_new_mv: false,
                         size: side / 4,
                         size_h: side / 4,
+                        is_global_mv0: false,
+                        is_global_mv1: false,
                     },
                 );
             }
@@ -7067,6 +7082,8 @@ fn decode_inter_block8(
                                 is_new_mv: matches!(compound_mode, 2 | 3 | 4 | 5 | 7),
                                 size: 2,
                                 size_h: 2,
+                                is_global_mv0: false,
+                                is_global_mv1: false,
                             },
                         );
                     }
@@ -7454,6 +7471,8 @@ fn decode_inter_block8(
                         is_new_mv,
                         size: 2,
                         size_h: 2,
+                        is_global_mv0: false,
+                        is_global_mv1: false,
                     },
                 );
             }
@@ -7648,6 +7667,8 @@ fn decode_inter_block8(
                         is_new_mv: false,
                         size: 2,
                         size_h: 2,
+                        is_global_mv0: false,
+                        is_global_mv1: false,
                     },
                 );
             }
@@ -9765,6 +9786,8 @@ mod tests {
             is_new_mv: false,
             size: 1,
             size_h: 1,
+            is_global_mv0: false,
+            is_global_mv1: false,
         };
         for col in mi_col..mi_col + bw4 {
             grid.set(mi_row - 1, col, neighbour(above_mv));
