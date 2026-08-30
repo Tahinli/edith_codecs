@@ -5039,6 +5039,9 @@ fn assign_compound_mv(
     mode: u8,
     allow_high_precision_mv: bool,
     force_integer_mv: bool,
+    // lane-gm r2: `gm_get_motion_vector(ref0)`/`(ref1)` at this block's own
+    // position, spec 7.10.2.10's `GLOBAL_GLOBALMV` assignment.
+    global_mv: ((i32, i32), (i32, i32)),
 ) -> ((i32, i32), (i32, i32)) {
     const NEAREST_NEARESTMV: u8 = 0;
     const NEAR_NEARMV: u8 = 1;
@@ -5102,12 +5105,41 @@ fn assign_compound_mv(
         NEW_NEARESTMV => (read_new(dec, cdfs, new_pred.0), comp_stack.nearest_mv.1),
         NEAR_NEWMV => (near.0, read_new(dec, cdfs, new_pred.1)),
         NEW_NEARMV => (read_new(dec, cdfs, new_pred.0), near.1),
-        GLOBAL_GLOBALMV => ((0, 0), (0, 0)),
+        GLOBAL_GLOBALMV => global_mv,
         _ => (
             read_new(dec, cdfs, new_pred.0),
             read_new(dec, cdfs, new_pred.1),
         ),
     }
+}
+
+/// Derives this query block's own [`crate::mvstack::GmMvTable`] -- one
+/// `gm_get_motion_vector` (spec 7.10.2.1) result per reference frame, at
+/// THIS block's own `(mi_row, mi_col, bw4, bh4)` (mvstack.rs's own doc: the
+/// table is always computed at the *querying* block's position, never a
+/// donating neighbour's).
+fn build_gm_mv_table(
+    global_motion: &[ec_av1_syntax::WarpParams; 7],
+    mi_row: usize,
+    mi_col: usize,
+    bw4: usize,
+    bh4: usize,
+    allow_high_precision_mv: bool,
+    force_integer_mv: bool,
+) -> crate::mvstack::GmMvTable {
+    std::array::from_fn(|i| {
+        let gm = &global_motion[i];
+        crate::warp::gm_get_motion_vector(
+            gm.model,
+            &gm.params,
+            mi_row,
+            mi_col,
+            bw4,
+            bh4,
+            allow_high_precision_mv,
+            force_integer_mv,
+        )
+    })
 }
 
 /// Decodes one square inter-frame block (32x32 whole or 16x16 leaf): skip,
@@ -5149,6 +5181,11 @@ fn decode_inter_block(
     // GOP), matching `GOLDEN_FRAME`'s existing empty-slot refusal below.
     other_refs: &RefSlots,
     sign_bias_table: &SignBiasTable,
+    // lane-gm r2: this frame header's own `global_motion` table (spec
+    // 5.9.24), indexed `[ref_frame - LAST_FRAME]` same as `sign_bias_table`
+    // -- feeds `warp::gm_get_motion_vector` for `GLOBALMV`/`GLOBAL_GLOBALMV`
+    // assignment and the mv-stack's neighbour substitution.
+    global_motion: &[ec_av1_syntax::WarpParams; 7],
     base_q_idx: u8,
     luma_set_intra: TxbSet,
     luma_set_inter: TxbSet,
@@ -5350,6 +5387,15 @@ fn decode_inter_block(
                 ),
                 allow_high_precision_mv,
             });
+            let gm_table = build_gm_mv_table(
+                global_motion,
+                mi_row,
+                mi_col,
+                bw4,
+                bh4,
+                allow_high_precision_mv,
+                force_integer_mv,
+            );
             let comp_stack = crate::mvstack::find_mv_stack_compound(
                 grid,
                 mi_row,
@@ -5360,6 +5406,7 @@ fn decode_inter_block(
                 mi_cols as usize,
                 mi_rows as usize,
                 sign_bias_table,
+                &gm_table,
                 comp_tpl,
             );
             let compound_mode = if skip_mode {
@@ -5374,8 +5421,15 @@ fn decode_inter_block(
                 compound_mode,
                 allow_high_precision_mv,
                 force_integer_mv,
+                (gm_table[(ref0 - LAST_FRAME) as usize], gm_table[(ref1 - LAST_FRAME) as usize]),
             );
             let is_globalmv = compound_mode == 6; // GLOBAL_GLOBALMV
+            // spec `is_nontrans_global_motion`: ALL active refs' models must
+            // be non-TRANSLATION (IDENTITY counts) for the compound block's
+            // interp-filter read to be suppressed.
+            let gm_nontrans = is_globalmv
+                && global_motion[(ref0 - LAST_FRAME) as usize].model != ec_av1_syntax::WarpModel::Translation
+                && global_motion[(ref1 - LAST_FRAME) as usize].model != ec_av1_syntax::WarpModel::Translation;
             let (py0, pu0, pv0) = ref_planes(ref0, ref_y, ref_u, ref_v, other_refs)?;
             let (py1, pu1, pv1) = ref_planes(ref1, ref_y, ref_u, ref_v, other_refs)?;
             // spec `get_ref_filter_type`: matches when EITHER of the
@@ -5422,8 +5476,17 @@ fn decode_inter_block(
                             is_new_mv: matches!(compound_mode, 2 | 3 | 4 | 5 | 7),
                             size: bw4,
                             size_h: bh4,
-                            is_global_mv0: false,
-                            is_global_mv1: false,
+                            // libaom `is_global_mv_block`: per-ref-slot, mode
+                            // GLOBAL_GLOBALMV, block >= 8x8, and THAT slot's
+                            // own gm model > TRANSLATION (IDENTITY excluded
+                            // too -- the two-predicate trap, distinct from
+                            // `gm_nontrans` above which allows IDENTITY).
+                            is_global_mv0: is_globalmv
+                                && bw4.min(bh4) >= 2
+                                && global_motion[(ref0 - LAST_FRAME) as usize].model as u8 > 1,
+                            is_global_mv1: is_globalmv
+                                && bw4.min(bh4) >= 2
+                                && global_motion[(ref1 - LAST_FRAME) as usize].model as u8 > 1,
                         },
                     );
                 }
@@ -5735,7 +5798,7 @@ fn decode_inter_block(
                 cdfs,
                 interp_fixed,
                 enable_dual_filter,
-                is_globalmv || skip_mode,
+                gm_nontrans || skip_mode,
                 above_filter_ctx,
                 left_filter_ctx,
                 true,
@@ -6027,6 +6090,15 @@ fn decode_inter_block(
                 ),
                 allow_high_precision_mv,
             });
+            let gm_table = build_gm_mv_table(
+                global_motion,
+                mi_row,
+                mi_col,
+                bw4,
+                bh4,
+                allow_high_precision_mv,
+                force_integer_mv,
+            );
             let stack = find_mv_stack_with_sign_bias(
                 grid,
                 mi_row,
@@ -6037,15 +6109,7 @@ fn decode_inter_block(
                 mi_cols as usize,
                 mi_rows as usize,
                 sign_bias_table,
-                // lane-gm r2: gm_get_motion_vector + mvstack substitution are
-                // ported and unit-tested (warp.rs, mvstack.rs) but not yet
-                // wired to this frame's real `global_motion` table -- every
-                // `MiInfo` this decoder ever writes still sets
-                // `is_global_mv0`/`is_global_mv1` to `false` (see the ctor
-                // sites), so the substitution path this table would feed is
-                // never taken yet. `NO_GM_MV` keeps this call exactly as
-                // inert as the old 0-arg call was.
-                &crate::mvstack::NO_GM_MV,
+                &gm_table,
                 tpl,
             );
             let not_new = dec.symbol(&mut cdfs.new_mv[stack.new_mv_ctx]) == 1;
@@ -6080,11 +6144,9 @@ fn decode_inter_block(
                 let not_zero = dec.symbol(&mut cdfs.zero_mv[stack.zero_mv_ctx]) == 1;
                 is_globalmv = !not_zero;
                 let mv = if !not_zero {
-                    // GLOBALMV: `gm_get_motion_vector` (spec 7.10.2.1) under the
-                    // `GmType::IDENTITY` this crate's `decode_stream` requires of
-                    // every inter frame's `LAST_FRAME` entry (any other warp
-                    // model is refused before the tile decoder is ever called).
-                    (0, 0)
+                    // GLOBALMV: `gm_get_motion_vector` (spec 7.10.2.1), already
+                    // computed at this block's own position in `gm_table`.
+                    gm_table[(ref_frame - LAST_FRAME) as usize]
                 } else {
                     let nearest = dec.symbol(&mut cdfs.ref_mv[stack.ref_mv_ctx]) == 0;
                     if nearest {
