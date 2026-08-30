@@ -38,6 +38,16 @@
 #       its superres margin (lane-superres r5: hand-tracing the arithmetic
 #       could only prove our own self-consistency, not correctness against
 #       libaom).
+#   EC_TRACE_MODE_STEP=1 -> per-symbol range ladder inside
+#       ec_read_intra_frame_mode_info_impl (rung 5's renamed body):
+#       "EC_ISTEP mi_row=.. mi_col=.. name=skip val=.. rng=.." after
+#       read_skip_txfm, name=cdef/dq after read_cdef/read_delta_q_params,
+#       name=mode after mbmi->mode, name=angle_y after the Y angle_delta read,
+#       name=uv_mode after mbmi->uv_mode, name=angle_uv after the UV
+#       angle_delta read (rung 10, lane-sbpart r6). EC_TRACE_MODE's own
+#       before/after prints only bracket the WHOLE block; this is the
+#       per-symbol ladder the charter asked for to localize block2's first
+#       wrong read.
 #   Rung 9 (unconditional, no env gate) -- SGR per-tap ground truth
 #       (lane-lr r7): `calculate_intermediate_result` in
 #       av1/common/restoration.c is `static`, so a standalone harness cannot
@@ -488,3 +498,68 @@ s = s.replace(old, new, 1)
 open(path, "w").write(s)
 print("calculate_intermediate_result exported")
 PYA
+
+# --- rung 10: per-symbol range ladder inside intra key-frame mode info --
+python3 - "$SRC/av1/decoder/decodemv.c" <<'PYS'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+if "EC_INSTRUMENTED_INTRA_STEP" in s:
+    print("intra mode-info per-symbol ladder already instrumented (no-op)")
+    sys.exit(0)
+
+def step(name, val):
+    return """  {
+    const int ec_trace = getenv("EC_TRACE_MODE_STEP") != NULL;
+    if (ec_trace) {
+      fprintf(stderr, "EC_ISTEP mi_row=%%d mi_col=%%d name=%s val=%%d rng=%%u\\n",
+              xd->mi_row, xd->mi_col, (int)(%s), (unsigned)r->ec.rng);
+    }
+  }
+""" % (name, val)
+
+old = "  mbmi->skip_txfm = read_skip_txfm(cm, xd, mbmi->segment_id, r);\n"
+assert old in s, "read_skip_txfm call moved"
+s = s.replace(old, old + step("skip", "mbmi->skip_txfm"), 1)
+
+old = "  read_cdef(cm, r, xd);\n"
+assert old in s, "read_cdef call moved"
+s = s.replace(old, old + step("cdef", "0"), 1)
+
+old = "  read_delta_q_params(cm, xd, r);\n"
+assert old in s, "read_delta_q_params call moved"
+s = s.replace(old, old + step("dq", "xd->current_base_qindex"), 1)
+
+old = "  mbmi->mode = read_intra_mode(r, get_y_mode_cdf(ec_ctx, above_mi, left_mi));\n"
+assert old in s, "y mode read moved"
+s = s.replace(old, old + step("mode", "mbmi->mode"), 1)
+
+old = """  mbmi->angle_delta[PLANE_TYPE_Y] =
+      (use_angle_delta && av1_is_directional_mode(mbmi->mode))
+          ? read_angle_delta(r, ec_ctx->angle_delta_cdf[mbmi->mode - V_PRED])
+          : 0;
+"""
+assert old in s, "angle_delta_y block moved"
+s = s.replace(old, old + step("angle_y", "mbmi->angle_delta[PLANE_TYPE_Y]"), 1)
+
+old = """    mbmi->uv_mode =
+        read_intra_mode_uv(ec_ctx, r, is_cfl_allowed(xd), mbmi->mode);
+"""
+assert old in s, "uv_mode read moved"
+s = s.replace(old, old + step("uv_mode", "mbmi->uv_mode"), 1)
+
+old = """    mbmi->angle_delta[PLANE_TYPE_UV] =
+        (use_angle_delta && av1_is_directional_mode(intra_mode))
+            ? read_angle_delta(r, ec_ctx->angle_delta_cdf[intra_mode - V_PRED])
+            : 0;
+"""
+assert old in s, "angle_delta_uv block moved"
+s = s.replace(old, old + step("angle_uv", "mbmi->angle_delta[PLANE_TYPE_UV]"), 1)
+
+marker_old = "static int read_mv_component(aom_reader *r, nmv_component *mvcomp,"
+assert marker_old in s, "anchor for EC_INSTRUMENTED_INTRA_STEP marker moved"
+s = s.replace(marker_old, "/* EC_INSTRUMENTED_INTRA_STEP */\n" + marker_old, 1)
+
+open(path, "w").write(s)
+print("intra mode-info per-symbol ladder instrumented")
+PYS
