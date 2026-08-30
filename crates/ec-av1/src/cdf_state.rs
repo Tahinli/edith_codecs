@@ -433,6 +433,15 @@ pub(crate) struct Cdfs {
     pub palette_uv_size: [[u16; 8]; 7],
     /// The `use_intrabc` flag -- see [`cdf::INTRABC`].
     pub intrabc: [u16; 3],
+    /// A `RESTORE_WIENER`-plane LR unit's `use_wiener` flag -- see
+    /// [`cdf::RESTORE_WIENER`].
+    pub restore_wiener: [u16; 3],
+    /// A `RESTORE_SGRPROJ`-plane LR unit's `use_sgrproj` flag -- see
+    /// [`cdf::RESTORE_SGRPROJ`].
+    pub restore_sgrproj: [u16; 3],
+    /// A `RESTORE_SWITCHABLE`-plane LR unit's `restoration_type` -- see
+    /// [`cdf::RESTORE_SWITCHABLE`].
+    pub restore_switchable: [u16; 4],
 }
 
 /// One motion vector component's adapting state (spec 9.4's `Default_Mv_*`,
@@ -654,6 +663,9 @@ impl Cdfs {
         reset2(&mut self.palette_uv_mode);
         reset2(&mut self.palette_uv_size);
         reset1(&mut self.intrabc);
+        reset1(&mut self.restore_wiener);
+        reset1(&mut self.restore_sgrproj);
+        reset1(&mut self.restore_switchable);
     }
 
     /// The defaults a key frame starts from (spec 8.4, `init_coeff_cdfs` and
@@ -1114,6 +1126,9 @@ impl Cdfs {
             palette_uv_mode: cdf::PALETTE_UV_MODE,
             palette_uv_size: cdf::PALETTE_UV_SIZE,
             intrabc: cdf::INTRABC,
+            restore_wiener: cdf::RESTORE_WIENER,
+            restore_sgrproj: cdf::RESTORE_SGRPROJ,
+            restore_switchable: cdf::RESTORE_SWITCHABLE,
         }
     }
 
