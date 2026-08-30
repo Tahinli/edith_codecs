@@ -5831,7 +5831,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                         }
                                         if part16 != PARTITION_SPLIT {
                                             return Err(unsupported(
-                                                "a partition below 16x16 other than a clean split (this encoder never writes one)",
+                                                "a partition below 16x16 other than a clean split (this decoder codes only the square arms below 16x16)",
                                             ));
                                         }
                                         // A real (non-straddle) SPLIT of a
