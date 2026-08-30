@@ -6372,6 +6372,26 @@ fn decode_inter_block(
                     }
                 }
             }
+            // lane-gm r4: `allow_warp`'s `global_warp_allowed` branch
+            // (`reconinter.c:33-55`), gated INDEPENDENTLY of `motion_mode` --
+            // libaom's `av1_init_warp_params` runs for every inter
+            // predictor build, not just a `WARPED_CAUSAL`-selected one. Only
+            // reachable when `warp_params` is still `None` here: a block
+            // that read (and got) local `WARPED_CAUSAL` above already has
+            // `local_warp_allowed && !wm_params.invalid`, which `allow_warp`
+            // checks FIRST and short-circuits on -- the global branch is an
+            // `else if`, never layered on top. `is_global_mv_block` already
+            // encodes `allow_warp`'s size bound (`min(bw4,bh4) >= 2`, i.e.
+            // >=8px both dims, matching `av1_init_warp_params`'s
+            // `block_height < 8 || block_width < 8` early return) and, via
+            // `motion_mode_eligible`'s own suppression above, the
+            // `force_integer_mv` case never reads a motion_mode symbol at
+            // all -- checked again here directly since this branch fires
+            // independent of `motion_mode_eligible`.
+            let gm_ref = &global_motion[(ref_frame - LAST_FRAME) as usize];
+            if warp_params.is_none() && is_global_mv_block && !force_integer_mv && !gm_ref.invalid {
+                warp_params = crate::warp::global_warp_params(gm_ref.params);
+            }
             if std::env::var_os("EC_AV1_TELL").is_some() {
                 eprintln!(
                     "TELL mi_row={mi_row} mi_col={mi_col} label=post_motion_mode eligible={} tell={} range={}",
