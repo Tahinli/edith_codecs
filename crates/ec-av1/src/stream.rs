@@ -1140,6 +1140,20 @@ mod tests {
     /// checkout without the oracle should still run the rest of the suite),
     /// but `EC_AV1_REQUIRE_AOMENC=1` turns it into a hard failure so a batch
     /// run cannot report green off 20 skipped gates.
+    /// Where a pinned stream lives. `fixtures/` is a symlink to a durable
+    /// directory outside the repo, so a pin captured in one session is still
+    /// there in the next; a session scratchpad is not (tmpfs reaps it, and
+    /// four pins were silently dead because of that).
+    fn pin_dir() -> std::path::PathBuf {
+        if let Some(p) = std::env::var_os("EC_AV1_PIN_DIR") {
+            return std::path::PathBuf::from(p);
+        }
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures")
+            .canonicalize()
+            .unwrap_or_else(|_| std::path::PathBuf::from("fixtures"))
+    }
+
     fn have_aomenc() -> bool {
         let present = aomenc_path().is_file();
         assert!(
@@ -2071,14 +2085,22 @@ mod tests {
                 // clean rerun -> subprocess instability; reference bytes
                 // differ -> ffmpeg instability; both stable -> real decode
                 // defect) without relying on the env var being set.
-                let sp = "/tmp/claude-1000/-home-tahinli-Documents-Code-Rust-edith-codecs/\
-                          51b5f611-f998-43a8-b975-e64cb643a3e1/scratchpad";
-                std::fs::write(format!("{sp}/cdfflake-stream-seed{seed}.bin"), &stream)
-                    .expect("writing pinned stream");
-                std::fs::write(format!("{sp}/cdfflake-ffmpeg-raw-seed{seed}.bin"), &ffmpeg_raw)
-                    .expect("writing pinned ffmpeg reference");
+                // The pin goes to `fixtures/`, which outlives the session: an
+                // earlier version wrote to a session scratchpad, so once tmpfs
+                // reaped it a real mismatch aborted on the write instead of
+                // reporting itself. A failed write must not mask the assert
+                // below either, so it warns rather than panicking.
+                let sp = pin_dir();
+                let stream_pin = sp.join(format!("cdfflake-stream-seed{seed}.bin"));
+                let ref_pin = sp.join(format!("cdfflake-ffmpeg-raw-seed{seed}.bin"));
+                for (path, bytes) in [(&stream_pin, &stream), (&ref_pin, &ffmpeg_raw)] {
+                    if let Err(e) = std::fs::write(path, bytes) {
+                        eprintln!("cdfflake: could not pin to {}: {e}", path.display());
+                    }
+                }
                 eprintln!(
-                    "cdfflake MISMATCH seed={seed}: pinned stream + ffmpeg reference to {sp}"
+                    "cdfflake MISMATCH seed={seed}: pinned stream + ffmpeg reference to {}",
+                    sp.display()
                 );
             }
             for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
@@ -2105,12 +2127,17 @@ mod tests {
     #[test]
     #[ignore = "reads a pinned fixture path outside the repo; run manually"]
     fn pinned_golden3_stream_decodes_pixel_exact() {
-        let path = std::env::var("EC_AV1_GATE_DUMP_PIN").unwrap_or_else(|_| {
-            "/tmp/claude-1000/-home-tahinli-Documents-Code-Rust-edith-codecs/\
-             51b5f611-f998-43a8-b975-e64cb643a3e1/scratchpad/golden3-pin.obu"
-                .to_string()
-        });
-        let stream = std::fs::read(&path).expect("reading pinned stream");
+        let path = std::env::var("EC_AV1_GATE_DUMP_PIN")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| pin_dir().join("golden3-pin.obu"));
+        let Ok(stream) = std::fs::read(&path) else {
+            eprintln!(
+                "SKIP pinned_golden3_stream_decodes_pixel_exact: no pinned bytes at {} \
+                 -- re-capture with EC_AV1_GATE_DUMP off the cdf-forwarding gate",
+                path.display()
+            );
+            return;
+        };
         if !have_ffmpeg() {
             eprintln!("SKIP pinned_golden3_stream_decodes_pixel_exact: no ffmpeg");
             return;
@@ -2133,12 +2160,17 @@ mod tests {
     #[ignore = "reads a pinned fixture path outside the repo; run manually"]
     fn pinned_golden4_stream_decodes_pixel_exact() {
         use crate::decode::non_last_ref_hits;
-        let path = std::env::var("EC_AV1_GATE_DUMP_PIN").unwrap_or_else(|_| {
-            "/tmp/claude-1000/-home-tahinli-Documents-Code-Rust-edith-codecs/\
-             51b5f611-f998-43a8-b975-e64cb643a3e1/scratchpad/golden4-pin.obu"
-                .to_string()
-        });
-        let stream = std::fs::read(&path).expect("reading pinned stream");
+        let path = std::env::var("EC_AV1_GATE_DUMP_PIN")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| pin_dir().join("golden4-pin.obu"));
+        let Ok(stream) = std::fs::read(&path) else {
+            eprintln!(
+                "SKIP pinned_golden4_stream_decodes_pixel_exact: no pinned bytes at {} \
+                 -- re-capture with EC_AV1_GATE_DUMP off the cdf-forwarding gate",
+                path.display()
+            );
+            return;
+        };
         if !have_ffmpeg() {
             eprintln!("SKIP pinned_golden4_stream_decodes_pixel_exact: no ffmpeg");
             return;
