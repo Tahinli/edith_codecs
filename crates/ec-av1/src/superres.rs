@@ -142,6 +142,36 @@ pub(crate) fn upscale_plane(rows: &[u8], height: usize, in_width: usize, out_wid
     out
 }
 
+thread_local! {
+    /// Firing count for the superres gate (class `gate-blind-to-feature`):
+    /// how many whole pictures actually ran through [`upscale_plane`].
+    static SUPERRES_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`SUPERRES_HITS`].
+pub(crate) fn superres_hits() -> usize {
+    SUPERRES_HITS.with(|c| c.get())
+}
+
+/// A whole [`crate::encode::Picture`]'s Y/U/V planes, upscaled from
+/// `frame_width`/`frame_height` (4:2:0 chroma) to `upscaled_width` at the
+/// same height -- spec 7.16 is horizontal-only. Increments
+/// [`SUPERRES_HITS`] once per call.
+pub(crate) fn upscale_picture(picture: &crate::encode::Picture, upscaled_width: usize) -> crate::encode::Picture {
+    SUPERRES_HITS.with(|c| c.set(c.get() + 1));
+    let height = picture.height;
+    let chroma_in_w = picture.width.div_ceil(2);
+    let chroma_out_w = upscaled_width.div_ceil(2);
+    let chroma_h = height.div_ceil(2);
+    crate::encode::Picture {
+        width: upscaled_width,
+        height,
+        y: upscale_plane(&picture.y, height, picture.width, upscaled_width),
+        u: upscale_plane(&picture.u, chroma_h, chroma_in_w, chroma_out_w),
+        v: upscale_plane(&picture.v, chroma_h, chroma_in_w, chroma_out_w),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
