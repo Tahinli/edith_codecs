@@ -21,7 +21,7 @@
 //! too). Anything outside that refuses with [`Error::unsupported`] rather than
 //! silently miscoding.
 
-use ec_av1_syntax::{CdefParams, LoopFilterParams};
+use ec_av1_syntax::{CdefParams, LoopFilterParams, TileInfo};
 use ec_core::{Error, Result};
 
 use crate::cdf;
@@ -64,6 +64,20 @@ thread_local! {
 /// Current value of [`FILTER_INTRA_HITS`].
 pub(crate) fn filter_intra_hits() -> usize {
     FILTER_INTRA_HITS.with(|c| c.get())
+}
+
+// How many tiles [`decode_key_frame_tile_with_cdfs`] has actually decoded a
+// full superblock walk over, across every call on the current thread --
+// lane-tiles r2's own gate-blind-to-feature guard: a gate over a
+// multi-tile stream must prove more than one tile actually fired, not just
+// that the stream carried tile_info.cols > 1.
+thread_local! {
+    static TILE_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+/// Current value of [`TILE_HITS`].
+pub(crate) fn tile_hits() -> usize {
+    TILE_HITS.with(|c| c.get())
 }
 
 // How many 4-pixel deblocking edge groups [`edge_params`] has actually
@@ -2661,6 +2675,16 @@ struct PlaneBuf {
     /// real decoder's edge or reach reads.
     true_width: usize,
     true_height: usize,
+    /// This plane's own tile's top-left pixel origin (spec: intra prediction
+    /// never reaches across a tile boundary even though an earlier-decoded
+    /// tile's real pixels sit right there in the shared buffer) — set via
+    /// [`Self::set_tile_origin`] before each tile's own superblock walk,
+    /// `0` for the single-tile case. lane-tiles r2: only the left/top bound
+    /// is threaded (the two-tile column-split stage 1 fixture's tile always
+    /// ends at the frame's own right/bottom edge); a non-last tile's own
+    /// right/bottom reach bound is still open, tracked in the report.
+    tile_x0: usize,
+    tile_y0: usize,
 }
 
 /// One entry per `MV_REFERENCE_FRAME` (index 0/1 unused -- `NONE`/
@@ -2672,6 +2696,15 @@ struct PlaneBuf {
 type RefSlots<'a> = [Option<(&'a PlaneBuf, &'a PlaneBuf, &'a PlaneBuf)>; 8];
 
 impl PlaneBuf {
+    /// Sets this plane's own tile pixel origin ([`Self::tile_x0`]/
+    /// [`Self::tile_y0`]) before that tile's own superblock walk. `x0`/`y0`
+    /// are already in this plane's own units (luma pixels for `y`, chroma
+    /// pixels — halved — for `u`/`v`).
+    fn set_tile_origin(&mut self, x0: usize, y0: usize) {
+        self.tile_x0 = x0;
+        self.tile_y0 = y0;
+    }
+
     fn edges(
         &self,
         x: usize,
@@ -2693,14 +2726,15 @@ impl PlaneBuf {
             own_down
         }
         .min(self.height);
-        let above = (y > 0 && across > x)
+        let above = (y > self.tile_y0 && across > x)
             .then(|| self.data[(y - 1) * self.width + x..][..across - x].to_vec());
-        let left = (x > 0 && down > y).then(|| {
+        let left = (x > self.tile_x0 && down > y).then(|| {
             (y..down)
                 .map(|row| self.data[row * self.width + x - 1])
                 .collect::<Vec<_>>()
         });
-        let corner = (x > 0 && y > 0).then(|| self.data[(y - 1) * self.width + x - 1]);
+        let corner =
+            (x > self.tile_x0 && y > self.tile_y0).then(|| self.data[(y - 1) * self.width + x - 1]);
         (above, left, corner)
     }
 
@@ -2729,14 +2763,15 @@ impl PlaneBuf {
             own_down
         }
         .min(self.height);
-        let above = (y > 0 && across > x)
+        let above = (y > self.tile_y0 && across > x)
             .then(|| self.data[(y - 1) * self.width + x..][..across - x].to_vec());
-        let left = (x > 0 && down > y).then(|| {
+        let left = (x > self.tile_x0 && down > y).then(|| {
             (y..down)
                 .map(|row| self.data[row * self.width + x - 1])
                 .collect::<Vec<_>>()
         });
-        let corner = (x > 0 && y > 0).then(|| self.data[(y - 1) * self.width + x - 1]);
+        let corner =
+            (x > self.tile_x0 && y > self.tile_y0).then(|| self.data[(y - 1) * self.width + x - 1]);
         (above, left, corner)
     }
 
@@ -4490,8 +4525,14 @@ pub fn decode_key_frame_tile(
     allow_screen_content_tools: bool,
     allow_intrabc: bool,
 ) -> Result<Picture> {
+    let single_tile = TileInfo {
+        mi_col_starts: vec![0, mi_cols],
+        mi_row_starts: vec![0, mi_rows],
+        ..TileInfo::default()
+    };
     decode_key_frame_tile_with_cdfs(
-        data,
+        &[data],
+        &single_tile,
         mi_cols,
         mi_rows,
         base_q_idx,
@@ -4519,7 +4560,8 @@ pub fn decode_key_frame_tile(
 /// alongside the picture, for the caller to save into whichever reference
 /// slots this frame's `refresh_frame_flags` names.
 pub(crate) fn decode_key_frame_tile_with_cdfs(
-    data: &[u8],
+    tiles: &[&[u8]],
+    tile_info: &TileInfo,
     mi_cols: u32,
     mi_rows: u32,
     base_q_idx: u8,
@@ -4550,6 +4592,8 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         height,
         true_width,
         true_height,
+        tile_x0: 0,
+        tile_y0: 0,
     };
     let mut u = PlaneBuf {
         data: vec![0u8; width * height / 4],
@@ -4557,6 +4601,8 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         height: height / 2,
         true_width: true_width / 2,
         true_height: true_height / 2,
+        tile_x0: 0,
+        tile_y0: 0,
     };
     let mut v = PlaneBuf {
         data: vec![0u8; width * height / 4],
@@ -4564,6 +4610,8 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         height: height / 2,
         true_width: true_width / 2,
         true_height: true_height / 2,
+        tile_x0: 0,
+        tile_y0: 0,
     };
 
     let scan32 = default_scan(TX32);
@@ -4571,15 +4619,8 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     let scan8 = default_scan(TX8);
     let scan4 = default_scan(TX4);
 
-    let mut cdfs = initial_cdfs.unwrap_or_else(|| Cdfs::new(q_ctx_of(base_q_idx)));
-    if std::env::var_os("EC_AV1_TRACE").is_some() {
-        eprintln!(
-            "TRACE key_tile_bytes len={} first8={:02x?} base_q_idx={base_q_idx} mi_cols={mi_cols} mi_rows={mi_rows}",
-            data.len(),
-            &data[..data.len().min(8)]
-        );
-    }
-    let mut dec = SymbolDecoder::new(data);
+    let base_cdfs = initial_cdfs.unwrap_or_else(|| Cdfs::new(q_ctx_of(base_q_idx)));
+    let mut result_cdfs = base_cdfs.clone();
     let mut neighbours = Neighbours::new(
         cols32 as usize * 2,
         rows32 as usize * 2,
@@ -4587,9 +4628,50 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         mi_rows as usize,
     );
 
-    for sb_r in 0..sb_rows {
+    // lane-tiles r2: each tile gets its own fresh `SymbolDecoder` over its
+    // own byte range and its own fresh copy of the frame's initial CDFs
+    // (spec 5.11.2 `decode_tile`'s `init_symbol`); only the tile named by
+    // `context_update_tile_id` has its end-of-tile adapted table kept as the
+    // frame's own output (spec `exit_symbol`) -- every other tile's
+    // adaptation is discarded, matching the refusal this replaces.
+    for (tile_idx, &tile_bytes) in tiles.iter().enumerate() {
+        let tile_num = tile_idx as u32;
+        let (trow, tcol) = (tile_num / tile_info.cols, tile_num % tile_info.cols);
+        let mi_row0 = tile_info.mi_row_starts[trow as usize];
+        let mi_row1 = tile_info.mi_row_starts[trow as usize + 1];
+        let mi_col0 = tile_info.mi_col_starts[tcol as usize];
+        let mi_col1 = tile_info.mi_col_starts[tcol as usize + 1];
+        // Tile boundaries are always superblock-aligned in mi units (spec
+        // 5.9.15's uniform/non-uniform derivation both only ever emit
+        // multiples of the superblock's own mi size), so plain division is
+        // exact here -- no rounding needed.
+        // `mi_row0`/`mi_col0` (this tile's own start, `0` or an interior
+        // tile boundary) are always superblock-aligned by spec 5.9.15; the
+        // frame's own true final edge (`mi_row_starts`/`mi_col_starts`'
+        // last entry) is not, so the upper bound needs `div_ceil` the same
+        // way the whole-frame `sb_rows`/`sb_cols` above does, to keep the
+        // trailing partial superblock row/column in scope.
+        let (sb_r0, sb_r1) = ((mi_row0 / SB_MI).min(sb_rows), mi_row1.div_ceil(SB_MI).min(sb_rows));
+        let (sb_c0, sb_c1) = ((mi_col0 / SB_MI).min(sb_cols), mi_col1.div_ceil(SB_MI).min(sb_cols));
+
+        let mut cdfs = base_cdfs.clone();
+        if std::env::var_os("EC_AV1_TRACE").is_some() {
+            eprintln!(
+                "TRACE key_tile_bytes tile={tile_num} len={} first8={:02x?} base_q_idx={base_q_idx} mi_cols={mi_cols} mi_rows={mi_rows}",
+                tile_bytes.len(),
+                &tile_bytes[..tile_bytes.len().min(8)]
+            );
+        }
+        let mut dec = SymbolDecoder::new(tile_bytes);
+        neighbours.start_tile(mi_row0 as usize, mi_col0 as usize, mi_col1 as usize);
+        y.set_tile_origin(mi_col0 as usize * 4, mi_row0 as usize * 4);
+        u.set_tile_origin(mi_col0 as usize * 2, mi_row0 as usize * 2);
+        v.set_tile_origin(mi_col0 as usize * 2, mi_row0 as usize * 2);
+        TILE_HITS.with(|c| c.set(c.get() + 1));
+
+    for sb_r in sb_r0..sb_r1 {
         neighbours.start_row();
-        for sb_c in 0..sb_cols {
+        for sb_c in sb_c0..sb_c1 {
             let at = (sb_r as usize * 4, sb_c as usize * 4);
             let ctx = neighbours.partition_ctx(at, SB);
             let (has_cols, has_rows) = (
@@ -4989,6 +5071,11 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         }
     }
 
+        if tile_num == tile_info.context_update_tile_id {
+            result_cdfs = cdfs;
+        }
+    }
+
     // lane-comppin r4: pre-loop-filter decode-order dump, matching aomdec's
     // own EC_AV1_PREFILT_DUMP shape (decodeframe.c ~5451) -- diffs against
     // that isolate whether a decode-order frame's mismatch already exists
@@ -5018,7 +5105,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                 u: u.data,
                 v: v.data,
             },
-            cdfs,
+            result_cdfs,
         ));
     }
     let crop = |plane: &PlaneBuf, w: usize, h: usize| -> Vec<u8> {
@@ -5036,7 +5123,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
             u: crop(&u, fw / 2, fh / 2),
             v: crop(&v, fw / 2, fh / 2),
         },
-        cdfs,
+        result_cdfs,
     ))
 }
 
@@ -9220,6 +9307,8 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         height: reference.height,
         true_width: reference.width,
         true_height: reference.height,
+        tile_x0: 0,
+        tile_y0: 0,
     };
     let ref_u = PlaneBuf {
         data: reference.u.clone(),
@@ -9227,6 +9316,8 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         height: reference.height / 2,
         true_width: reference.width / 2,
         true_height: reference.height / 2,
+        tile_x0: 0,
+        tile_y0: 0,
     };
     let ref_v = PlaneBuf {
         data: reference.v.clone(),
@@ -9234,6 +9325,8 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         height: reference.height / 2,
         true_width: reference.width / 2,
         true_height: reference.height / 2,
+        tile_x0: 0,
+        tile_y0: 0,
     };
     // Every non-`LAST_FRAME` reference this frame header's own `ref_frame_idx`
     // names a live DPB slot for (lane-av1refs: generalised from the old
@@ -9253,6 +9346,8 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                         height: g.height,
                         true_width: g.width,
                         true_height: g.height,
+                        tile_x0: 0,
+                        tile_y0: 0,
                     },
                     PlaneBuf {
                         data: g.u.clone(),
@@ -9260,6 +9355,8 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                         height: g.height / 2,
                         true_width: g.width / 2,
                         true_height: g.height / 2,
+                        tile_x0: 0,
+                        tile_y0: 0,
                     },
                     PlaneBuf {
                         data: g.v.clone(),
@@ -9267,6 +9364,8 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                         height: g.height / 2,
                         true_width: g.width / 2,
                         true_height: g.height / 2,
+                        tile_x0: 0,
+                        tile_y0: 0,
                     },
                 )
             })
@@ -9280,6 +9379,8 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         height,
         true_width,
         true_height,
+        tile_x0: 0,
+        tile_y0: 0,
     };
     let mut u = PlaneBuf {
         data: vec![0u8; width * height / 4],
@@ -9287,6 +9388,8 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         height: height / 2,
         true_width: true_width / 2,
         true_height: true_height / 2,
+        tile_x0: 0,
+        tile_y0: 0,
     };
     let mut v = PlaneBuf {
         data: vec![0u8; width * height / 4],
@@ -9294,6 +9397,8 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         height: height / 2,
         true_width: true_width / 2,
         true_height: true_height / 2,
+        tile_x0: 0,
+        tile_y0: 0,
     };
 
     let scan32 = default_scan(TX32);
@@ -11180,6 +11285,8 @@ mod tests {
             height: height / scale,
             true_width: width / scale,
             true_height: height / scale,
+            tile_x0: 0,
+            tile_y0: 0,
         };
         let ref_y = PlaneBuf {
             data: ref_pattern.clone(),
@@ -11187,6 +11294,8 @@ mod tests {
             height,
             true_width: width,
             true_height: height,
+            tile_x0: 0,
+            tile_y0: 0,
         };
         let ref_u = ref_plane(2);
         let ref_v = ref_plane(2);
@@ -11197,6 +11306,8 @@ mod tests {
             height,
             true_width: width,
             true_height: height,
+            tile_x0: 0,
+            tile_y0: 0,
         };
         let mut u = PlaneBuf {
             data: vec![0u8; (width / 2) * (height / 2)],
@@ -11204,6 +11315,8 @@ mod tests {
             height: height / 2,
             true_width: width / 2,
             true_height: height / 2,
+            tile_x0: 0,
+            tile_y0: 0,
         };
         let mut v = PlaneBuf {
             data: vec![0u8; (width / 2) * (height / 2)],
@@ -11211,6 +11324,8 @@ mod tests {
             height: height / 2,
             true_width: width / 2,
             true_height: height / 2,
+            tile_x0: 0,
+            tile_y0: 0,
         };
 
         let mut cdfs = Cdfs::new(q_ctx_of(100));
