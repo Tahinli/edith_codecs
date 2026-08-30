@@ -81,7 +81,15 @@ pub(crate) fn split_blocks() -> bool {
     SPLIT_BLOCKS
 }
 
-/// One 8-bit planar 4:2:0 picture.
+/// One planar 4:2:0 picture. `y`/`u`/`v` hold one sample per position as
+/// `u16` regardless of bit depth (`crate::decode`'s own `PlaneBuf` has used
+/// `u16` throughout since the round-hbd-r1/r2 widen; this is the last
+/// narrowing boundary that stayed `u8` -- widened lane-hbd r3 so a 10-bit
+/// stream's decode output actually carries 10-bit precision instead of
+/// silently losing its low 2 bits). The encoder only ever produces values in
+/// `0..=255` (it is still 8-bit-only by design, see `encode.rs`'s r2
+/// decision); `Plane::source` narrows right back to `u8` at its two
+/// construction sites, a lossless round trip for that range.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Picture {
     /// The picture's width in luma samples.
@@ -89,11 +97,11 @@ pub struct Picture {
     /// Its height in luma samples.
     pub height: usize,
     /// The luma plane, `width * height` samples in raster order.
-    pub y: Vec<u8>,
+    pub y: Vec<u16>,
     /// The U plane, at half the width and half the height.
-    pub u: Vec<u8>,
+    pub u: Vec<u16>,
     /// The V plane, the same shape as U.
-    pub v: Vec<u8>,
+    pub v: Vec<u16>,
 }
 
 impl Picture {
@@ -238,14 +246,14 @@ fn intra_predict_u8(
 /// Pads one plane to `(padded_width, padded_height)` by repeating its last
 /// row and column, so the block coder always sees a whole number of blocks.
 /// [`crop_plane`] undoes this on the way back out.
-fn pad_plane(
-    source: &[u8],
+fn pad_plane<T: Copy + Default>(
+    source: &[T],
     width: usize,
     height: usize,
     padded_width: usize,
     padded_height: usize,
-) -> Vec<u8> {
-    let mut out = vec![0u8; padded_width * padded_height];
+) -> Vec<T> {
+    let mut out = vec![T::default(); padded_width * padded_height];
     for row in 0..padded_height {
         let src = source[row.min(height - 1) * width..][..width].as_ref();
         let dst = &mut out[row * padded_width..][..padded_width];
@@ -258,7 +266,7 @@ fn pad_plane(
 /// The top-left `width` x `height` region of a plane that is `padded_width`
 /// wide, which is the render-size crop [`Picture::padded`]'s replication
 /// exists to let a decoder undo.
-fn crop_plane(source: &[u8], padded_width: usize, width: usize, height: usize) -> Vec<u8> {
+fn crop_plane<T: Copy>(source: &[T], padded_width: usize, width: usize, height: usize) -> Vec<T> {
     let mut out = Vec::with_capacity(width * height);
     for row in 0..height {
         out.extend_from_slice(&source[row * padded_width..][..width]);
@@ -1750,9 +1758,16 @@ pub(crate) fn encode_key_frame_inner(
     // Prediction reads no further than this, in each plane's own units --
     // see `Plane::true_width`/`true_height`.
     let (true_width, true_height) = (header.mi_cols as usize * 4, header.mi_rows as usize * 4);
+    // lane-hbd r4: `Picture.y/u/v` widened to `Vec<u16>` for the decoder's
+    // sake (DPB reference slots, 10-bit output); the encoder stays 8-bit by
+    // design (see `intra_predict_u8`'s doc comment), so narrow the source
+    // once here.
+    let picture_y8: Vec<u8> = picture.y.iter().map(|&v| v as u8).collect();
+    let picture_u8: Vec<u8> = picture.u.iter().map(|&v| v as u8).collect();
+    let picture_v8: Vec<u8> = picture.v.iter().map(|&v| v as u8).collect();
     let mut luma = Plane {
-        source: &picture.y,
-        reconstruction: vec![128; picture.y.len()],
+        source: &picture_y8,
+        reconstruction: vec![128; picture_y8.len()],
         width: picture.width,
         height: picture.height,
         true_width,
@@ -1760,16 +1775,16 @@ pub(crate) fn encode_key_frame_inner(
     };
     let mut chroma = [
         Plane {
-            source: &picture.u,
-            reconstruction: vec![128; picture.u.len()],
+            source: &picture_u8,
+            reconstruction: vec![128; picture_u8.len()],
             width: picture.width / 2,
             height: picture.height / 2,
             true_width: true_width / 2,
             true_height: true_height / 2,
         },
         Plane {
-            source: &picture.v,
-            reconstruction: vec![128; picture.v.len()],
+            source: &picture_v8,
+            reconstruction: vec![128; picture_v8.len()],
             width: picture.width / 2,
             height: picture.height / 2,
             true_width: true_width / 2,
@@ -2006,9 +2021,9 @@ pub(crate) fn encode_key_frame_inner(
         reconstruction: Picture {
             width: luma.width,
             height: luma.height,
-            y: luma.reconstruction,
-            u: u.reconstruction,
-            v: v.reconstruction,
+            y: luma.reconstruction.iter().map(|&v| u16::from(v)).collect(),
+            u: u.reconstruction.iter().map(|&v| u16::from(v)).collect(),
+            v: v.reconstruction.iter().map(|&v| u16::from(v)).collect(),
         },
         tile,
         mi_cols: header.mi_cols,
@@ -2164,7 +2179,7 @@ fn mc_trial(
     side: usize,
     mv: (i32, i32),
     luma: bool,
-    reference: &[u8],
+    reference: &[u16],
     stride: usize,
     ref_width: usize,
     ref_height: usize,
@@ -2175,13 +2190,12 @@ fn mc_trial(
 ) -> Trial {
     let x_q4 = mv_to_q4(x, mv.1, luma);
     let y_q4 = mv_to_q4(y, mv.0, luma);
-    // lane-hbd r2: `reference`/`prediction` stay `u8` here (encoder is
-    // 8-bit only this round, see `intra_predict_u8`'s doc comment) --
-    // round-trip through `u16` locally to call the now-widened `mc::predict`.
-    let reference16: Vec<u16> = reference.iter().map(|&v| u16::from(v)).collect();
+    // lane-hbd r4: `reference` (a DPB `Picture`'s plane) is `u16` now that
+    // `Picture` is widened; `prediction`/the encoder stay `u8` (encoder is
+    // 8-bit only this round, see `intra_predict_u8`'s doc comment).
     let mut prediction16 = vec![0u16; side * side];
     mc::predict(
-        &reference16,
+        reference,
         stride,
         ref_width,
         ref_height,
@@ -2453,10 +2467,13 @@ fn search_inter_block(
     }
 
     let source_block = luma.source_block(x, y, BLOCK);
+    // lane-hbd r4: `motion::search` is 8-bit only (its SAD/cost math is
+    // integer-`u8`-scale); narrow the DPB reference plane locally.
+    let ref_luma_8: Vec<u8> = ref_luma.0.iter().map(|&v| v as u8).collect();
     #[cfg(test)]
     let t = std::time::Instant::now();
     let found = motion::search(
-        ref_luma.0,
+        &ref_luma_8,
         ref_luma.1,
         ref_luma.2,
         ref_luma.3,
@@ -2616,9 +2633,14 @@ pub(crate) fn encode_inter_frame(
     header.render_height = render.1 as u32;
 
     let (true_width, true_height) = (header.mi_cols as usize * 4, header.mi_rows as usize * 4);
+    // lane-hbd r4: encoder stays 8-bit by design; narrow the source once
+    // here (see `encode_key_frame_inner`).
+    let picture_y8: Vec<u8> = picture.y.iter().map(|&v| v as u8).collect();
+    let picture_u8: Vec<u8> = picture.u.iter().map(|&v| v as u8).collect();
+    let picture_v8: Vec<u8> = picture.v.iter().map(|&v| v as u8).collect();
     let mut luma = Plane {
-        source: &picture.y,
-        reconstruction: vec![128; picture.y.len()],
+        source: &picture_y8,
+        reconstruction: vec![128; picture_y8.len()],
         width: picture.width,
         height: picture.height,
         true_width,
@@ -2626,16 +2648,16 @@ pub(crate) fn encode_inter_frame(
     };
     let mut chroma = [
         Plane {
-            source: &picture.u,
-            reconstruction: vec![128; picture.u.len()],
+            source: &picture_u8,
+            reconstruction: vec![128; picture_u8.len()],
             width: picture.width / 2,
             height: picture.height / 2,
             true_width: true_width / 2,
             true_height: true_height / 2,
         },
         Plane {
-            source: &picture.v,
-            reconstruction: vec![128; picture.v.len()],
+            source: &picture_v8,
+            reconstruction: vec![128; picture_v8.len()],
             width: picture.width / 2,
             height: picture.height / 2,
             true_width: true_width / 2,
@@ -2942,9 +2964,9 @@ pub(crate) fn encode_inter_frame(
         reconstruction: Picture {
             width: luma.width,
             height: luma.height,
-            y: luma.reconstruction,
-            u: u.reconstruction,
-            v: v.reconstruction,
+            y: luma.reconstruction.iter().map(|&v| u16::from(v)).collect(),
+            u: u.reconstruction.iter().map(|&v| u16::from(v)).collect(),
+            v: v.reconstruction.iter().map(|&v| u16::from(v)).collect(),
         },
         tile,
         mi_cols: header.mi_cols,

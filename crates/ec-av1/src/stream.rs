@@ -634,9 +634,13 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
             use std::io::Write;
             let idx = pictures_decoded;
             if let Ok(mut f) = std::fs::File::create(format!("{path}.f{idx}")) {
-                let _ = f.write_all(&picture.y);
-                let _ = f.write_all(&picture.u);
-                let _ = f.write_all(&picture.v);
+                // lane-hbd r4: debug dump narrows to u8 -- this diagnostic
+                // predates 10-bit support and is an 8-bit-oracle comparison
+                // only (aomdec's own dump is 8-bit here too).
+                let narrow = |v: &[u16]| -> Vec<u8> { v.iter().map(|&s| s as u8).collect() };
+                let _ = f.write_all(&narrow(&picture.y));
+                let _ = f.write_all(&narrow(&picture.u));
+                let _ = f.write_all(&narrow(&picture.v));
             }
         }
         pictures_decoded += 1;
