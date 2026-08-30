@@ -3755,15 +3755,17 @@ fn apply_deblock(
     v: &mut PlaneBuf,
     lf: &LoopFilterParams,
     n: &Neighbours,
+    frame_width: usize,
+    frame_height: usize,
 ) {
     if lf.level[0] != 0 || lf.level[1] != 0 {
-        deblock_plane(y, 0, lf, n);
+        deblock_plane(y, 0, lf, n, frame_width, frame_height);
     }
     if lf.level[2] != 0 {
-        deblock_plane(u, 1, lf, n);
+        deblock_plane(u, 1, lf, n, frame_width, frame_height);
     }
     if lf.level[3] != 0 {
-        deblock_plane(v, 2, lf, n);
+        deblock_plane(v, 2, lf, n, frame_width, frame_height);
     }
 }
 
@@ -4265,9 +4267,33 @@ fn filter_edge(
 
 /// One plane's worth of spec 7.14: every vertical edge across the plane,
 /// then every horizontal edge (the order the spec and libaom both use).
-fn deblock_plane(plane: &mut PlaneBuf, plane_idx: usize, lf: &LoopFilterParams, n: &Neighbours) {
+fn deblock_plane(
+    plane: &mut PlaneBuf,
+    plane_idx: usize,
+    lf: &LoopFilterParams,
+    n: &Neighbours,
+    frame_width: usize,
+    frame_height: usize,
+) {
     let chroma = plane_idx != 0;
-    let (tw, th, stride) = (plane.true_width, plane.true_height, plane.width);
+    // r7: libaom clips the deblock loop to the CODED frame's own
+    // width/height, not the mi-aligned `true_width`/`true_height` margin
+    // (the padding up to the next 8-pixel/superblock boundary that
+    // reconstruction still fills in but the loop filter never visits).
+    // Confirmed against the superres gate: with the margin included, the
+    // last coded mi column's horizontal edges were filtered when libaom's
+    // real output leaves them untouched (r6's post-deblock diff, 37 px, all
+    // in columns 44-47); clipping here closes it (3/3 frames pixel-exact).
+    let (cw, ch) = if chroma {
+        (frame_width.div_ceil(2), frame_height.div_ceil(2))
+    } else {
+        (frame_width, frame_height)
+    };
+    let (tw, th, stride) = (
+        plane.true_width.min(cw),
+        plane.true_height.min(ch),
+        plane.width,
+    );
     let mut y0 = 0usize;
     while y0 < th {
         let mut x0 = 4usize;
@@ -5005,7 +5031,15 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
             let _ = f.write_all(&crop_wide(&v));
         }
     }
-    apply_deblock(&mut y, &mut u, &mut v, loop_filter, &neighbours);
+    apply_deblock(
+        &mut y,
+        &mut u,
+        &mut v,
+        loop_filter,
+        &neighbours,
+        frame_width as usize,
+        frame_height as usize,
+    );
     apply_cdef(&mut y, &mut u, &mut v, cdef, &neighbours);
 
     let (fw, fh) = (frame_width as usize, frame_height as usize);
@@ -10544,7 +10578,15 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     } else {
         PREFILT_PICTURE_IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
-    apply_deblock(&mut y, &mut u, &mut v, loop_filter, &neighbours);
+    apply_deblock(
+        &mut y,
+        &mut u,
+        &mut v,
+        loop_filter,
+        &neighbours,
+        frame_width as usize,
+        frame_height as usize,
+    );
     apply_cdef(&mut y, &mut u, &mut v, cdef, &neighbours);
 
     let motion_field = build_motion_field(
