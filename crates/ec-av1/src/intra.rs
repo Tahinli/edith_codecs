@@ -158,21 +158,24 @@ impl Edges {
             row.resize(want, last);
             row
         };
+        // Spec 7.11.2.2's no-neighbour fallback is `base = 1 << (BitDepth - 1)`
+        // (128 at 8-bit): `base - 1` above, `base + 1` left, `base` corner.
+        let base = 1i32 << (crate::decode::bit_depth() - 1);
         let above_row = match (above, left) {
             (Some(a), _) => extend(a),
             (None, Some(l)) => vec![i32::from(l[0]); want],
-            (None, None) => vec![127; want],
+            (None, None) => vec![base - 1; want],
         };
         let left_col = match (left, above) {
             (Some(l), _) => extend(l),
             (None, Some(a)) => vec![i32::from(a[0]); want],
-            (None, None) => vec![129; want],
+            (None, None) => vec![base + 1; want],
         };
         let corner = match (corner, above, left) {
             (Some(c), Some(_), Some(_)) => i32::from(c),
             (_, Some(a), _) => i32::from(a[0]),
             (_, None, Some(l)) => i32::from(l[0]),
-            (_, None, None) => 128,
+            (_, None, None) => base,
         };
         let with_corner = |edge: Vec<i32>| {
             let mut v = Vec::with_capacity(want + 1);
@@ -597,7 +600,7 @@ fn dc(above: Option<&[u16]>, left: Option<&[u16]>, bw: usize, bh: usize) -> i32 
         ((sum + (samples.len() as u32 >> 1)) / samples.len() as u32) as i32
     };
     match (&above, &left) {
-        (None, None) => 128,
+        (None, None) => 1i32 << (crate::decode::bit_depth() - 1),
         (Some(a), None) => average(a),
         (None, Some(l)) => average(l),
         (Some(a), Some(l)) if bw == bh => {
