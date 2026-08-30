@@ -249,6 +249,11 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         let enable_edge_filter = parser
             .sequence_header()
             .is_some_and(|seq| seq.enable_intra_edge_filter);
+        // Inter frames' intra blocks read this through a thread-local that only
+        // the key-frame tile path used to set; without this call a stream whose
+        // inter frames are decoded on a thread that previously decoded a
+        // different sequence would inherit that sequence's bit.
+        crate::decode::set_enable_edge_filter(enable_edge_filter);
         // lane-av1comp: `comp_group_idx`/`compound_idx`'s own gating bits.
         let enable_masked_compound = parser
             .sequence_header()

@@ -391,6 +391,20 @@ thread_local! {
     static ENABLE_EDGE_FILTER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Set [`ENABLE_EDGE_FILTER`] for this thread.
+///
+/// `decode_key_frame_tile_with_cdfs` sets it, but `decode_inter_frame_tile`
+/// never did -- so an inter frame's intra blocks read whatever value the last
+/// key frame decoded ON THIS THREAD left behind. Inside one stream that is
+/// harmless (its own key frame sets it first), but a caller that decodes an
+/// inter frame directly, or a test harness running several streams on one
+/// thread, inherits a foreign sequence's bit: decode stops being a pure
+/// function of the bitstream. `decode_stream` now calls this once per stream
+/// from the sequence header, which covers every frame including inter ones.
+pub(crate) fn set_enable_edge_filter(value: bool) {
+    ENABLE_EDGE_FILTER.with(|f| f.set(value));
+}
+
 /// Current value of [`ANGLE_DELTA_HITS`].
 pub(crate) fn angle_delta_hits() -> usize {
     ANGLE_DELTA_HITS.load(std::sync::atomic::Ordering::Relaxed)
