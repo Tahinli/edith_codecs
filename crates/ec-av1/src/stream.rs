@@ -634,9 +634,13 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
             use std::io::Write;
             let idx = pictures_decoded;
             if let Ok(mut f) = std::fs::File::create(format!("{path}.f{idx}")) {
-                let _ = f.write_all(&picture.y);
-                let _ = f.write_all(&picture.u);
-                let _ = f.write_all(&picture.v);
+                // lane-hbd r4: debug dump narrows to u8 -- this diagnostic
+                // predates 10-bit support and is an 8-bit-oracle comparison
+                // only (aomdec's own dump is 8-bit here too).
+                let narrow = |v: &[u16]| -> Vec<u8> { v.iter().map(|&s| s as u8).collect() };
+                let _ = f.write_all(&narrow(&picture.y));
+                let _ = f.write_all(&narrow(&picture.u));
+                let _ = f.write_all(&narrow(&picture.v));
             }
         }
         pictures_decoded += 1;
@@ -676,14 +680,14 @@ mod tests {
         let mut picture = Pic::grey(width, height);
         for row in 0..height {
             for col in 0..width {
-                picture.y[row * width + col] = ((row * 7 + col * 11) % 251) as u8;
+                picture.y[row * width + col] = ((row * 7 + col * 11) % 251) as u16;
             }
         }
         for row in 0..height / 2 {
             for col in 0..width / 2 {
                 let i = row * width / 2 + col;
-                picture.u[i] = (100 + (col * 60 / (width / 2).max(1))) as u8;
-                picture.v[i] = (200 - (row * 80 / (height / 2).max(1))) as u8;
+                picture.u[i] = (100 + (col * 60 / (width / 2).max(1))) as u16;
+                picture.v[i] = (200 - (row * 80 / (height / 2).max(1))) as u16;
             }
         }
         picture
@@ -695,15 +699,15 @@ mod tests {
             for x in 0..width {
                 let sx = (x as i64 - shift).rem_euclid(width as i64) as f64;
                 let gradient = sx * 200.0 / width as f64;
-                picture.y[y * width + x] = (20.0 + gradient).clamp(0.0, 255.0) as u8;
+                picture.y[y * width + x] = (20.0 + gradient).clamp(0.0, 255.0) as u16;
             }
         }
         for y in 0..height / 2 {
             for x in 0..width / 2 {
                 let sx = (x as i64 - shift / 2).rem_euclid((width / 2) as i64) as usize;
                 let i = y * width / 2 + x;
-                picture.u[i] = (100 + (sx * 60 / (width / 2))) as u8;
-                picture.v[i] = (200 - (y * 80 / (height / 2))) as u8;
+                picture.u[i] = (100 + (sx * 60 / (width / 2))) as u16;
+                picture.v[i] = (200 - (y * 80 / (height / 2))) as u16;
             }
         }
         picture
@@ -867,9 +871,9 @@ mod tests {
                 Pic {
                     width,
                     height,
-                    y: out.stdout[base..base + luma].to_vec(),
-                    u: out.stdout[base + luma..base + luma + chroma].to_vec(),
-                    v: out.stdout[base + luma + chroma..base + frame_bytes].to_vec(),
+                    y: out.stdout[base..base + luma].iter().map(|&v| u16::from(v)).collect(),
+                    u: out.stdout[base + luma..base + luma + chroma].iter().map(|&v| u16::from(v)).collect(),
+                    v: out.stdout[base + luma + chroma..base + frame_bytes].iter().map(|&v| u16::from(v)).collect(),
                 }
             })
             .collect()
@@ -2854,7 +2858,7 @@ mod tests {
             // actually produced -- no second ffmpeg invocation needed).
             let ffmpeg_raw: Vec<u8> = ffmpeg_frames
                 .iter()
-                .flat_map(|p| p.y.iter().chain(&p.u).chain(&p.v).copied())
+                .flat_map(|p| p.y.iter().chain(&p.u).chain(&p.v).map(|&v| v as u8))
                 .collect();
             let ffmpeg_raw_hash = fnv1a64(&ffmpeg_raw);
             eprintln!(
@@ -6662,9 +6666,9 @@ mod tests {
             let mut yuv = Vec::with_capacity((luma + 2 * chroma) * frames);
             for f in 0..frames {
                 let card = panned_test_card(width, height, ((f as i32 + seed as i32) * 5) as i64);
-                yuv.extend_from_slice(&card.y);
-                yuv.extend_from_slice(&card.u);
-                yuv.extend_from_slice(&card.v);
+                yuv.extend(card.y.iter().map(|&v| v as u8));
+                yuv.extend(card.u.iter().map(|&v| v as u8));
+                yuv.extend(card.v.iter().map(|&v| v as u8));
             }
             std::fs::write(&yuv_path, &yuv).unwrap();
             let status = Command::new(aomenc_path())
