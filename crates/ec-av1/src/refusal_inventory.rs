@@ -46,7 +46,6 @@ const REFUSALS: &[&str] = &[
     "a HORZ/VERT intra strip with a split transform (per-unit rect prediction is not ported)",
     "a block that actually uses a palette (UV) -- reconstruction is out of scope",
     "a block that actually uses a palette (Y) -- reconstruction is out of scope",
-    "a block that actually uses a palette (Y) -- the index map decodes but the reconstructed pixels do not match libaom yet (lane-palette r3/r4)",
     "a block that actually uses intrabc (this decoder never reconstructs one)",
     "a frame OBU with no tile group",
     "a frame naming primary_ref_frame at a reference slot with no saved CDF state",
