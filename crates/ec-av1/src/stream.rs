@@ -1698,6 +1698,272 @@ mod tests {
         );
     }
 
+    /// lane-chroma r2 stage 1: a real aomenc key frame with
+    /// `--enable-smooth-intra=1` (opposite of every sibling recipe's `=0`)
+    /// and `--enable-paeth-intra=0` -- paeth chroma stays off so the still-
+    /// refused smooth/paeth `uv_mode` (round-2, unrelated to this gate) never
+    /// fires; smooth *luma* neighbours are exactly what this gate wants to
+    /// exercise, proving [`decode::smooth_luma_hits`] actually landed a
+    /// directional block next to a smooth-predicted one and decoded
+    /// pixel-exact (the [`PlaneBuf::reconstruct`] `smooth_neighbor` fix).
+    #[test]
+    fn a_real_aomenc_stream_with_smooth_luma_neighbour_decodes_pixel_exact() {
+        if !have_ffmpeg() {
+            eprintln!(
+                "SKIP a_real_aomenc_stream_with_smooth_luma_neighbour_decodes_pixel_exact: no ffmpeg"
+            );
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!(
+                "SKIP a_real_aomenc_stream_with_smooth_luma_neighbour_decodes_pixel_exact: no aomenc at {}",
+                aomenc_path().display()
+            );
+            return;
+        }
+        let (width, height) = (64usize, 64usize);
+        let mut refusals = Vec::new();
+        let mut fired_runs = 0u32;
+        for attempt in 0..40u32 {
+            let seed = 42 + attempt;
+            let source = format!(
+                "mandelbrot=size=64x64:start_scale={}:rate=25",
+                5.0 - f64::from(attempt) * 0.06
+            );
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-t",
+                    "0.04",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let mut child = Command::new(aomenc_path())
+                .args([
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    "--cq-level=45",
+                    "--cpu-used=0",
+                    "--enable-rect-partitions=0",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    "--enable-filter-intra=0",
+                    "--enable-smooth-intra=1",
+                    // Smooth/paeth chroma is a still-refused, separate
+                    // round-2 gap -- off so no attempt trips it while this
+                    // gate is purely about luma's edge-filter fix.
+                    "--enable-paeth-intra=0",
+                    "--enable-tx-size-search=0",
+                    "--enable-cdef=0",
+                    "--enable-restoration=0",
+                    "--enable-intra-edge-filter=1",
+                    "--max-partition-size=32",
+                    "--min-partition-size=16",
+                    "--enable-palette=0",
+                    "--enable-intrabc=0",
+                    "--enable-cfl-intra=0",
+                    "--enable-ref-frame-mvs=0",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let smooth_before = decode::smooth_luma_hits();
+            let frames = match decode_stream(&stream) {
+                Ok(frames) => frames,
+                Err(e) => {
+                    refusals.push(format!("seed {seed}: {e}"));
+                    continue;
+                }
+            };
+            if decode::smooth_luma_hits() == smooth_before {
+                refusals.push(format!(
+                    "seed {seed}: decoded, but no smooth-luma-neighbour block fired"
+                ));
+                continue;
+            }
+            fired_runs += 1;
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
+            assert_eq!(
+                frames[0].y, ffmpeg_frames[0].y,
+                "luma vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(frames[0].u, ffmpeg_frames[0].u, "U vs ffmpeg (seed {seed})");
+            assert_eq!(frames[0].v, ffmpeg_frames[0].v, "V vs ffmpeg (seed {seed})");
+            if fired_runs >= 4 {
+                return;
+            }
+        }
+        assert!(
+            fired_runs > 0,
+            "every attempt hit a named refusal or never exercised a smooth luma neighbour:\n{}",
+            refusals.join("\n")
+        );
+    }
+
+    /// The smooth/paeth-chroma gate (lane-chroma r1/r3): a real aomenc key
+    /// frame with `--enable-smooth-intra=1 --enable-paeth-intra=1` (the
+    /// opposite of the directional-chroma gate below, which turns these OFF
+    /// to keep this gap from firing while directional chroma is under test).
+    /// Some seeds won't pick smooth/paeth for chroma at all -- retry like
+    /// every other real-encoder gate here, but the first attempt that
+    /// actually fires [`decode::smooth_uv_hits`] must decode pixel-exact.
+    #[test]
+    fn a_real_aomenc_stream_with_smooth_paeth_chroma_decodes_pixel_exact() {
+        if !have_ffmpeg() {
+            eprintln!(
+                "SKIP a_real_aomenc_stream_with_smooth_paeth_chroma_decodes_pixel_exact: no ffmpeg"
+            );
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!(
+                "SKIP a_real_aomenc_stream_with_smooth_paeth_chroma_decodes_pixel_exact: no aomenc at {}",
+                aomenc_path().display()
+            );
+            return;
+        }
+        let (width, height) = (64usize, 64usize);
+        let mut refusals = Vec::new();
+        let mut fired_runs = 0u32;
+        for attempt in 0..40u32 {
+            let seed = 42 + attempt;
+            let source = format!(
+                "mandelbrot=size=64x64:start_scale={}:rate=25",
+                5.0 - f64::from(attempt) * 0.06
+            );
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", "yuv420p", "-t",
+                    "0.04", "-f", "yuv4mpegpipe", "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let mut child = Command::new(aomenc_path())
+                .args([
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    "--cq-level=45",
+                    "--cpu-used=0",
+                    "--enable-rect-partitions=0",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    "--enable-filter-intra=0",
+                    "--enable-smooth-intra=1",
+                    "--enable-paeth-intra=1",
+                    "--enable-tx-size-search=0",
+                    "--enable-cdef=0",
+                    "--enable-restoration=0",
+                    "--enable-intra-edge-filter=1",
+                    "--max-partition-size=32",
+                    // 8x8/leaf8 splits are a separate, already-named refusal.
+                    "--min-partition-size=16",
+                    "--enable-palette=0",
+                    "--enable-intrabc=0",
+                    "--enable-cfl-intra=0",
+                    "--enable-ref-frame-mvs=0",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let smooth_before = decode::smooth_uv_hits();
+            let frames = match decode_stream(&stream) {
+                Ok(frames) => frames,
+                Err(e) => {
+                    refusals.push(format!("seed {seed}: {e}"));
+                    continue;
+                }
+            };
+            if decode::smooth_uv_hits() == smooth_before {
+                refusals.push(format!(
+                    "seed {seed}: decoded, but no smooth/paeth uv_mode fired"
+                ));
+                continue;
+            }
+            fired_runs += 1;
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
+            assert_eq!(
+                frames[0].y, ffmpeg_frames[0].y,
+                "luma vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(frames[0].u, ffmpeg_frames[0].u, "U vs ffmpeg (seed {seed})");
+            assert_eq!(frames[0].v, ffmpeg_frames[0].v, "V vs ffmpeg (seed {seed})");
+            if fired_runs >= 4 {
+                return;
+            }
+        }
+        assert!(
+            fired_runs > 0,
+            "every attempt hit a named refusal or never exercised smooth/paeth chroma:\n{}",
+            refusals.join("\n")
+        );
+    }
+
     /// The directional-chroma/angle-delta gate: a real aomenc key frame with
     /// `--enable-directional-intra`/`--enable-angle-delta` left ON (the
     /// opposite of every sibling recipe's `=0`, which existed specifically to
