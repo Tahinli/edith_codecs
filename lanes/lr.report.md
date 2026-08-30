@@ -227,6 +227,81 @@ dropping the refusal) NOT started -- out of turn budget.
   didn't change; report this in case main's guard checks call-site order
   too.
 
+## r5 -- VERDICT: not green. 06ba9af compiles clean and was NOT a
+mid-edit wip; r4 finished all four charter steps (Wiener + SGR pixel
+filters wired at both call sites, gate widened to assert `Ok` +
+pixel-exact, `stream.rs` refusal dropped). Suite: 235/236 -- one real,
+reproducible (not flake) defect in
+`a_real_aomenc_stream_with_restoration_reads_lr_symbols_correctly`:
+`V mismatch (seed 46 frame 0)`, exactly 1 pixel of 6144 in the V plane,
+off by 1 (ours=195, ffmpeg reference=194), at absolute (row=61,col=6),
+inside chroma's last/partial restoration stripe `[60,64)` (unit spans
+the whole 64px plane height, `--sb-size=64` 192x128 fixture), filter
+`Sgrproj{ep:6, xqd:[-16,-32]}` (both radii active, `r0=2` "fast" +
+`r1=1` "dense"). Ran 235/236 with `EC_AV1_REQUIRE_AOMENC=1`,
+`CARGO_TARGET_DIR=$HOME/.cache/cargo-target-lr`, `-j4`, 600000ms timeout.
+
+Did NOT commit anything this round -- the tree was already clean at
+06ba9af (nothing left mid-edit; the orchestrator's "unverified" label
+undersold r4's actual state). All edits made this round were temporary
+`eprintln!`/dump instrumentation, reverted with `git checkout --` before
+finishing (tree is bit-identical to 06ba9af).
+
+Diagnosis done, inconclusive on root cause:
+- Confirmed NOT a flake -- same failure every run, same seed/pixel.
+- Confirmed NOT an above/below stripe-boundary substitution bug --
+  hand-traced `lr_sample`'s doc-commented rules
+  (`stripe_v_start-1`→exact, `-2`/`-3`→both duplicate `stripe_v_start-2`;
+  `stripe_v_end==plane_h`→frame-edge replicate) against libaom's real
+  `setup_processing_stripe_boundary`/`save_deblock_boundary_lines`
+  (`~/.cache/aom-oracle/src/av1/common/restoration.c` ~249-410,
+  1355-1490) line by line -- they match exactly for this stripe
+  (`use_deblock_above=true` since `stripe_idx=2>0`, `use_deblock_below=
+  false` since it's the plane's last stripe).
+- Wrote a live dump harness (env-gated `eprintln!`+file dump inside
+  `apply_sgrproj_stripe`/`filter_restoration_unit`, since reverted) that
+  extracted the REAL cdef/deblocked V-plane bytes for the failing
+  attempt to `/tmp/lr_cdef.bin`/`/tmp/lr_deblocked.bin` (both files
+  byte-identical, as expected -- gate runs `--enable-cdef=0`).
+  Instrumented the live Rust `apply_sgrproj_stripe`/`compute_ab` to
+  print the actual A/B grid values it computes for the failing pixel's
+  5-neighbour dense (`r1`) read: `a_u=254 b_u=303 a_c=251 b_c=922
+  a_d=224 b_d=6502 a_l=252 b_l=700 a_r=249 b_r=1344`, and the final
+  combine: `a1=7674 b1=103359 flt1=3110 xq0=-16 xq1=176`. Hand-verified
+  every one of these numbers independently in Python against the raw
+  9-tap box sums read back from the dumped buffers via `lr_sample` --
+  ALL MATCH; the dense-radius arm's math is provably correct for this
+  pixel. Did not get to instrument the fast (`r0=2`) arm's actual grid
+  reads the same way before the turn cap forced a stop (only its
+  `a=4000 b=16759 flt0=3097` final numbers were captured, not the 5
+  underlying A/B neighbour reads) -- **the fast arm is the one unverified
+  half**; check that first.
+- A hand-written standalone C transcription of libaom's real algorithm
+  (`/tmp/lr_ref.c`, hex box-sum + av1_x_by_xplus1/av1_one_by_x tables
+  copied verbatim from `restoration.c`) produced 194 (matching ffmpeg)
+  against the same dumped buffers -- but a *second*, differently-scoped
+  probe (`/tmp/lr_probe.c`) printing individual A/B taps gave
+  self-inconsistent numbers across separate runs of what should be
+  identical code, so that C reproduction is NOT trustworthy evidence of
+  a real Rust bug; treat both `/tmp/lr_ref.c` divergence claims as
+  unconfirmed, not as a finding. The live-Rust-instrumented numbers
+  above are the reliable data.
+- Next agent: re-run this round's dump harness (recreate the 3
+  env-gated `eprintln!` blocks -- see this section's description, they
+  were reverted, not left in the tree) to print the FAST (`r0=2`) arm's
+  5 individual A/B neighbour reads (`a_um1/b_um1`, `a_up1/b_up1`,
+  `a_uml`, `a_umr`, `a_upl`, `a_upr` for the row-61 ODD-branch case --
+  wait, row61 is ODD relative to `v_start=60`, so it's actually the
+  OTHER branch: own-row `a_c/b_c` + `a_l/a_r` neighbours, matching
+  `restoration.rs`'s `else` arm ~line 738) and hand-verify those 3
+  numbers the same way the dense arm was verified above. If those also
+  check out, the bug is not in `apply_sgrproj_stripe` at all and the
+  next place to look is upstream: whether the V-plane's CDEF/deblocked
+  pixel data feeding `lr_sample` is itself off by something that only
+  this specific rounding-sensitive combination surfaces (Y and U match
+  bit-exact on every attempt; only V, only this one pixel, only this
+  one `(ep,xqd)` combination, across the whole 40-attempt run).
+
 ## Next lever (r3 -> r4)
 1. Wiener pixel filter (charter step 2): `apply_loop_restoration` after
    `apply_cdef` in `decode.rs` (two call sites, ~4983/10502), driven by
