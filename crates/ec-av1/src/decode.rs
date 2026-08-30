@@ -3515,6 +3515,20 @@ fn decode_block_rect64(
             filter_intra,
             smooth_neighbor,
         );
+        if std::env::var_os("EC_SBPART_DUMP64").is_some() {
+            let leftcol: Vec<u16> = if px > 0 {
+                (py..py + bh).map(|row| y.data[row * y.width + px - 1]).collect()
+            } else {
+                vec![]
+            };
+            eprintln!(
+                "DUMP64 mi_r={mi_r} mi_c={mi_c} px={px} py={py} bw={bw} bh={bh} mode={mode} \
+                 skip={skip} eob_nonzero={} row0={:?} leftcol={:?}",
+                luma_corner.iter().any(|&v| v != 0),
+                &y.data[py * y.width + px..][..bw],
+                leftcol,
+            );
+        }
         // CHROMA: a real, untruncated chroma_w x chroma_h transform -- no
         // corner crop needed (see doc comment).
         let ac = alpha.map(|_| cfl_ac_q3_rect(y, px, py, bw, bh));
