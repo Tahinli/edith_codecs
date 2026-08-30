@@ -165,10 +165,14 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         // intrabc call at all -- that symbol is intra-frame-only). A
         // genuine palette/intrabc use still refuses by name deeper in the
         // block readers, so no whole-frame refusal is needed here anymore.
-        if header.delta.q_present || header.delta.lf_present {
+        // lane-realworld r5: delta_q is now read (maybe_read_delta_q,
+        // CURRENT_Q_IDX) -- only delta_lf still lacks a deblocker consumer
+        // (MiGrid/fill_lf_grid needs a new per-block field), so only that
+        // half still refuses by name.
+        if header.delta.lf_present {
             return Err(Error::unsupported(
                 "AV1 decode_stream",
-                "a frame with delta_q_present or delta_lf_present set (this decoder never reads the per-superblock delta symbols)",
+                "a frame with delta_lf_present set (this decoder never applies per-superblock loop-filter deltas)",
             ));
         }
         if header.segmentation.enabled {
@@ -420,6 +424,7 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 header.reduced_tx_set,
                 header.allow_screen_content_tools,
                 header.allow_intrabc,
+                header.delta,
             )?;
             // A key frame codes no inter blocks -- its own saved motion
             // field has no cells set, matching libaom's own "intra frame
@@ -503,6 +508,7 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 header.is_motion_mode_switchable,
                 header.allow_warped_motion,
                 header.allow_screen_content_tools,
+                header.delta,
             )?
         };
         // Spec 7.20: `disable_frame_end_update_cdf` stores the frame's
