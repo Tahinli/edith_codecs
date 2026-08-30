@@ -92,6 +92,11 @@ thread_local! {
 pub(crate) fn sample_max() -> i32 {
     (1i32 << BIT_DEPTH.with(std::cell::Cell::get)) - 1
 }
+/// The current stream's bit depth, for callers (e.g. dequant) that need the
+/// raw value rather than the derived clamp bound.
+pub(crate) fn bit_depth() -> u8 {
+    BIT_DEPTH.with(std::cell::Cell::get)
+}
 /// Sets [`BIT_DEPTH`] for the current thread, called once per frame from
 /// [`crate::stream`]'s decode loop.
 pub(crate) fn set_bit_depth(bit_depth: u8) {
@@ -3237,7 +3242,7 @@ fn decode_block_rect(
             &luma_levels,
             bw,
             bh,
-            8,
+            crate::decode::bit_depth(),
             CURRENT_Q_IDX.with(|c| c.get()),
             plane_q_delta(0).0,
             plane_q_delta(0).1,
@@ -3278,7 +3283,7 @@ fn decode_block_rect(
             &u_levels,
             chroma_w,
             chroma_h,
-            8,
+            crate::decode::bit_depth(),
             CURRENT_Q_IDX.with(|c| c.get()),
             plane_q_delta(1).0,
             plane_q_delta(1).1,
@@ -3318,7 +3323,7 @@ fn decode_block_rect(
             &v_levels,
             chroma_w,
             chroma_h,
-            8,
+            crate::decode::bit_depth(),
             CURRENT_Q_IDX.with(|c| c.get()),
             plane_q_delta(2).0,
             plane_q_delta(2).1,
@@ -3531,7 +3536,7 @@ fn decode_block_rect64(
             &luma_levels,
             bw,
             bh,
-            8,
+            crate::decode::bit_depth(),
             i32::from(base_q_idx),
             plane_q_delta(0).0,
             plane_q_delta(0).1,
@@ -3592,7 +3597,7 @@ fn decode_block_rect64(
             &u_levels,
             chroma_w,
             chroma_h,
-            8,
+            crate::decode::bit_depth(),
             i32::from(base_q_idx),
             plane_q_delta(1).0,
             plane_q_delta(1).1,
@@ -3635,7 +3640,7 @@ fn decode_block_rect64(
             &v_levels,
             chroma_w,
             chroma_h,
-            8,
+            crate::decode::bit_depth(),
             i32::from(base_q_idx),
             plane_q_delta(2).0,
             plane_q_delta(2).1,
@@ -4359,7 +4364,7 @@ fn read_plane(
         full
     };
     let (dc_delta, ac_delta) = plane_q_delta(plane_idx);
-    let residual = dequant_and_inverse_typed(&levels, side, 8, CURRENT_Q_IDX.with(|c| c.get()), dc_delta, ac_delta, tx_type);
+    let residual = dequant_and_inverse_typed(&levels, side, bit_depth(), CURRENT_Q_IDX.with(|c| c.get()), dc_delta, ac_delta, tx_type);
     if std::env::var_os("EC_AV1_TRACE").is_some() {
         eprintln!(
             "TRACE dequant plane={plane_idx} base_q_idx={base_q_idx} tx_type={tx_type:?} side={side} levels={levels:?} residual={residual:?}",
@@ -5155,12 +5160,14 @@ fn cdef_constrain(diff: i32, threshold: i32, damping: i32) -> i32 {
 /// Spec 7.15.3's direction search (libaom `cdef_find_dir_c`): the dominant
 /// direction of an 8x8 luma window and the variance gap between it and its
 /// orthogonal, `sample(row, col)` reading that window's own pixels.
-fn cdef_find_dir(sample: impl Fn(usize, usize) -> i32) -> (usize, i32) {
+fn cdef_find_dir(coeff_shift: i32, sample: impl Fn(usize, usize) -> i32) -> (usize, i32) {
     const DIV_TABLE: [i64; 9] = [0, 840, 420, 280, 210, 168, 140, 120, 105];
     let mut partial = [[0i64; 15]; 8];
     for i in 0..8i64 {
         for j in 0..8i64 {
-            let x = i64::from(sample(i as usize, j as usize)) - 128;
+            // libaom `cdef_find_dir_c`: normalise to an 8-bit sample before
+            // accumulating, same as `constrain`'s threshold shift below.
+            let x = i64::from(sample(i as usize, j as usize) >> coeff_shift) - 128;
             partial[0][(i + j) as usize] += x;
             partial[1][(i + j / 2) as usize] += x;
             partial[2][i as usize] += x;
@@ -5241,9 +5248,14 @@ fn cdef_filter_block(
     sec_damping: i32,
     enable_primary: bool,
     enable_secondary: bool,
+    coeff_shift: i32,
 ) {
     let clipping_required = enable_primary && enable_secondary;
-    let pri_taps = CDEF_PRI_TAPS[(pri_strength & 1) as usize];
+    // libaom `cdef_filter_block_internal`: `cdef_pri_taps[(pri_strength >>
+    // coeff_shift) & 1]` -- `pri_strength` (and its `adjust_strength`
+    // derivative) carries the bit-depth shift, so the tap-set parity bit
+    // must be read back above that shift, not off the raw low bit.
+    let pri_taps = CDEF_PRI_TAPS[((pri_strength >> coeff_shift) & 1) as usize];
     for i in 0..bh {
         for j in 0..bw {
             let x = sample(i as i32, j as i32);
@@ -5563,7 +5575,10 @@ fn deblock_thresholds(level: i32, sharpness: u8) -> (i32, i32, i32) {
 }
 
 fn sclamp(v: i32) -> i32 {
-    v.clamp(-128, 127)
+    // libaom's `signed_char_clamp_high`: the clamp range scales with
+    // `128 << (bit_depth - 8)` alongside the centering constant below.
+    let scale = 1i32 << (bit_depth() - 8);
+    v.clamp(-128 * scale, 128 * scale - 1)
 }
 
 fn round_pow2(v: i32, n: u32) -> i32 {
@@ -5577,16 +5592,17 @@ fn filter4(mask: bool, thresh: i32, p1: i32, p0: i32, q0: i32, q1: i32) -> [i32;
         return [p1, p0, q0, q1];
     }
     let hev = (p1 - p0).abs() > thresh || (q1 - q0).abs() > thresh;
-    let (ps1, ps0, qs0, qs1) = (p1 - 128, p0 - 128, q0 - 128, q1 - 128);
+    let centre = 128i32 << (bit_depth() - 8);
+    let (ps1, ps0, qs0, qs1) = (p1 - centre, p0 - centre, q0 - centre, q1 - centre);
     let outer = if hev { sclamp(ps1 - qs1) } else { 0 };
     let filter = sclamp(outer + 3 * (qs0 - ps0));
     let filter1 = sclamp(filter + 4) >> 3;
     let filter2 = sclamp(filter + 3) >> 3;
-    let oq0 = sclamp(qs0 - filter1) + 128;
-    let op0 = sclamp(ps0 + filter2) + 128;
+    let oq0 = sclamp(qs0 - filter1) + centre;
+    let op0 = sclamp(ps0 + filter2) + centre;
     let tap = if hev { 0 } else { round_pow2(filter1, 1) };
-    let oq1 = sclamp(qs1 - tap) + 128;
-    let op1 = sclamp(ps1 + tap) + 128;
+    let oq1 = sclamp(qs1 - tap) + centre;
+    let op1 = sclamp(ps1 + tap) + centre;
     [op1, op0, oq0, oq1]
 }
 
@@ -5737,6 +5753,13 @@ fn filter_edge(
     sharpness: u8,
 ) {
     let (blimit, limit, hev_thr) = deblock_thresholds(level, sharpness);
+    // libaom `highbd_filter_mask*`/`highbd_flat_mask4`/`highbd_hev_mask`:
+    // every 8-bit threshold (including the flat masks' fixed `1`) is
+    // compared against a raw pixel difference on the stream's own bit-depth
+    // scale, so each is shifted left by `bit_depth - 8` before use.
+    let shift = bit_depth() - 8;
+    let (blimit, limit, hev_thr) = (blimit << shift, limit << shift, hev_thr << shift);
+    let flat_thresh = 1i32 << shift;
     for i in 0..4isize {
         let center = (base as isize + i * outer_stride) as usize;
         let idx = |k: isize| -> usize { (center as isize + k * tap_stride) as usize };
@@ -5760,10 +5783,10 @@ fn filter_edge(
                     && (q1 - q0).abs() <= limit
                     && (q2 - q1).abs() <= limit
                     && (p0 - q0).abs() * 2 + (p1 - q1).abs() / 2 <= blimit;
-                let flat = (p1 - p0).abs() <= 1
-                    && (q1 - q0).abs() <= 1
-                    && (p2 - p0).abs() <= 1
-                    && (q2 - q0).abs() <= 1;
+                let flat = (p1 - p0).abs() <= flat_thresh
+                    && (q1 - q0).abs() <= flat_thresh
+                    && (p2 - p0).abs() <= flat_thresh
+                    && (q2 - q0).abs() <= flat_thresh;
                 let [op1, op0, oq0, oq1] = filter6(mask, hev_thr, flat, p2, p1, p0, q0, q1, q2);
                 data[idx(-2)] = op1.clamp(0, sample_max()) as u16;
                 data[idx(-1)] = op0.clamp(0, sample_max()) as u16;
@@ -5780,12 +5803,12 @@ fn filter_edge(
                     && (q2 - q1).abs() <= limit
                     && (q3 - q2).abs() <= limit
                     && (p0 - q0).abs() * 2 + (p1 - q1).abs() / 2 <= blimit;
-                let flat = (p1 - p0).abs() <= 1
-                    && (q1 - q0).abs() <= 1
-                    && (p2 - p0).abs() <= 1
-                    && (q2 - q0).abs() <= 1
-                    && (p3 - p0).abs() <= 1
-                    && (q3 - q0).abs() <= 1;
+                let flat = (p1 - p0).abs() <= flat_thresh
+                    && (q1 - q0).abs() <= flat_thresh
+                    && (p2 - p0).abs() <= flat_thresh
+                    && (q2 - q0).abs() <= flat_thresh
+                    && (p3 - p0).abs() <= flat_thresh
+                    && (q3 - q0).abs() <= flat_thresh;
                 let [op2, op1, op0, oq0, oq1, oq2] =
                     filter8(mask, hev_thr, flat, p3, p2, p1, p0, q0, q1, q2, q3);
                 data[idx(-3)] = op2.clamp(0, sample_max()) as u16;
@@ -5807,18 +5830,18 @@ fn filter_edge(
                     && (q2 - q1).abs() <= limit
                     && (q3 - q2).abs() <= limit
                     && (p0 - q0).abs() * 2 + (p1 - q1).abs() / 2 <= blimit;
-                let flat = (p1 - p0).abs() <= 1
-                    && (q1 - q0).abs() <= 1
-                    && (p2 - p0).abs() <= 1
-                    && (q2 - q0).abs() <= 1
-                    && (p3 - p0).abs() <= 1
-                    && (q3 - q0).abs() <= 1;
-                let flat2 = (p4 - p0).abs() <= 1
-                    && (q4 - q0).abs() <= 1
-                    && (p5 - p0).abs() <= 1
-                    && (q5 - q0).abs() <= 1
-                    && (p6 - p0).abs() <= 1
-                    && (q6 - q0).abs() <= 1;
+                let flat = (p1 - p0).abs() <= flat_thresh
+                    && (q1 - q0).abs() <= flat_thresh
+                    && (p2 - p0).abs() <= flat_thresh
+                    && (q2 - q0).abs() <= flat_thresh
+                    && (p3 - p0).abs() <= flat_thresh
+                    && (q3 - q0).abs() <= flat_thresh;
+                let flat2 = (p4 - p0).abs() <= flat_thresh
+                    && (q4 - q0).abs() <= flat_thresh
+                    && (p5 - p0).abs() <= flat_thresh
+                    && (q5 - q0).abs() <= flat_thresh
+                    && (p6 - p0).abs() <= flat_thresh
+                    && (q6 - q0).abs() <= flat_thresh;
                 let out = filter14(
                     mask, hev_thr, flat, flat2, p6, p5, p4, p3, p2, p1, p0, q0, q1, q2, q3, q4, q5,
                     q6,
@@ -5945,7 +5968,10 @@ fn apply_cdef(
     let src_y = y.data.clone();
     let src_u = u.data.clone();
     let src_v = v.data.clone();
-    let damping = i32::from(cdef.damping);
+    // libaom `av1_cdef_filter_fb`: `pri_strength = level << coeff_shift`,
+    // `sec_strength <<= coeff_shift`, `damping += coeff_shift - (pli != 0)`.
+    let coeff_shift = i32::from(bit_depth()) - 8;
+    let damping = i32::from(cdef.damping) + coeff_shift;
     let damping_uv = (damping - 1).max(0);
     let mut mi_r = 0usize;
     while mi_r < skip_grid.mi_rows {
@@ -5963,7 +5989,7 @@ fn apply_cdef(
                         i32::from(src_y[ny as usize * y_stride + nx as usize])
                     }
                 };
-                let (dir, var) = cdef_find_dir(|r, c| {
+                let (dir, var) = cdef_find_dir(coeff_shift, |r, c| {
                     let (ny, nx) = ((oy + r).min(y_true_h - 1), (ox + c).min(y_true_w - 1));
                     i32::from(src_y[ny * y_stride + nx])
                 });
@@ -5972,10 +5998,12 @@ fn apply_cdef(
                 // -- each plane zeroes the shared direction when *its own*
                 // frame-level primary strength is 0, independent of the
                 // per-block adjusted `t` and of the other plane's strength.
-                let y_dir = if cdef.y_pri_strength[sidx] != 0 { dir } else { 0 };
-                let t = cdef_adjust_strength(i32::from(cdef.y_pri_strength[sidx]), var);
+                let y_pri_strength = i32::from(cdef.y_pri_strength[sidx]) << coeff_shift;
+                let y_sec_strength = i32::from(cdef.y_sec_strength[sidx]) << coeff_shift;
+                let y_dir = if y_pri_strength != 0 { dir } else { 0 };
+                let t = cdef_adjust_strength(y_pri_strength, var);
                 let enable_primary = t != 0;
-                let enable_secondary = cdef.y_sec_strength[sidx] != 0;
+                let enable_secondary = y_sec_strength != 0;
                 if enable_primary || enable_secondary {
                     cdef_filter_block(
                         sample_y,
@@ -5985,19 +6013,21 @@ fn apply_cdef(
                         8,
                         8,
                         t,
-                        i32::from(cdef.y_sec_strength[sidx]),
+                        y_sec_strength,
                         y_dir,
                         damping,
                         damping,
                         enable_primary,
                         enable_secondary,
+                        coeff_shift,
                     );
                 }
 
-                let t_uv = i32::from(cdef.uv_pri_strength[sidx]);
+                let t_uv = i32::from(cdef.uv_pri_strength[sidx]) << coeff_shift;
+                let uv_sec_strength = i32::from(cdef.uv_sec_strength[sidx]) << coeff_shift;
                 let uv_dir = if t_uv != 0 { dir } else { 0 };
                 let enable_primary_uv = t_uv != 0;
-                let enable_secondary_uv = cdef.uv_sec_strength[sidx] != 0;
+                let enable_secondary_uv = uv_sec_strength != 0;
                 if enable_primary_uv || enable_secondary_uv {
                     let (cox, coy) = (ox / 2, oy / 2);
                     for (plane, src_p) in [(&mut *u, &src_u), (&mut *v, &src_v)] {
@@ -6019,12 +6049,13 @@ fn apply_cdef(
                             4,
                             4,
                             t_uv,
-                            i32::from(cdef.uv_sec_strength[sidx]),
+                            uv_sec_strength,
                             uv_dir,
                             damping_uv,
                             damping_uv,
                             enable_primary_uv,
                             enable_secondary_uv,
+                            coeff_shift,
                         );
                     }
                 }
@@ -7242,7 +7273,7 @@ fn read_inter_plane(
         None,
     )?;
     let (dc_delta, ac_delta) = plane_q_delta(plane_idx);
-    let residual = dequant_and_inverse_typed(&grid, side, 8, CURRENT_Q_IDX.with(|c| c.get()), dc_delta, ac_delta, tx_type);
+    let residual = dequant_and_inverse_typed(&grid, side, bit_depth(), CURRENT_Q_IDX.with(|c| c.get()), dc_delta, ac_delta, tx_type);
     plane.reconstruct_mc(x, y, side, prediction, &residual);
     Ok((grid, tx_type))
 }
