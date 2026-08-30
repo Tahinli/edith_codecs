@@ -12838,7 +12838,7 @@ mod tests {
         let data = enc.finish();
 
         let (width, height) = (64usize, 64usize);
-        let ref_pattern: Vec<u8> = (0..width * height).map(|i| (i % 251) as u8).collect();
+        let ref_pattern: Vec<u16> = (0..width * height).map(|i| (i % 251) as u16).collect();
         let ref_plane = |scale: usize| PlaneBuf {
             data: ref_pattern
                 .iter()
@@ -12881,7 +12881,7 @@ mod tests {
             tile_y1: height,
         };
         let mut u = PlaneBuf {
-            data: vec![0u8; (width / 2) * (height / 2)],
+            data: vec![0u16; (width / 2) * (height / 2)],
             width: width / 2,
             height: height / 2,
             true_width: width / 2,
@@ -12892,7 +12892,7 @@ mod tests {
             tile_y1: height / 2,
         };
         let mut v = PlaneBuf {
-            data: vec![0u8; (width / 2) * (height / 2)],
+            data: vec![0u16; (width / 2) * (height / 2)],
             width: width / 2,
             height: height / 2,
             true_width: width / 2,
@@ -12957,7 +12957,7 @@ mod tests {
         .unwrap();
 
         let (px, py) = (c * SUB, r * SUB);
-        let mut want_near = vec![0u8; side * side];
+        let mut want_near = vec![0u16; side * side];
         crate::mc::predict(
             &ref_y.data,
             ref_y.width,
@@ -12969,7 +12969,7 @@ mod tests {
             side,
             &mut want_near,
         );
-        let mut want_nearest = vec![0u8; side * side];
+        let mut want_nearest = vec![0u16; side * side];
         crate::mc::predict(
             &ref_y.data,
             ref_y.width,
@@ -12986,7 +12986,7 @@ mod tests {
             "test setup: the two candidate MVs must predict differently"
         );
 
-        let mut got = vec![0u8; side * side];
+        let mut got = vec![0u16; side * side];
         for row in 0..side {
             got[row * side..(row + 1) * side].copy_from_slice(
                 &y.data[(py + row) * y.width + px..(py + row) * y.width + px + side],
