@@ -1180,7 +1180,7 @@ fn read_eob(dec: &mut SymbolDecoder, coding: &mut TxbTables, class: TxClass) -> 
     }
     let group = dec.symbol(eob_pt) + 1;
     if trace {
-        eprintln!("TRACE eob_pt value={group}");
+        eprintln!("TRACE eob_pt value={group} rng={}", dec.debug_state().0);
     }
     let bits = OFFSET_BITS[group];
     let mut offset = 0u32;
@@ -3216,6 +3216,10 @@ fn decode_block_rect64(
         // grid (see this function's own doc comment).
         let scan32 = default_scan(TX32);
         let mut luma_coding = cdfs.txb(TxbSet::Luma64, mode);
+        if std::env::var_os("EC_TRACE_COEFF").is_some() {
+            let (rng, _) = dec.debug_state();
+            eprintln!("EC_COEFF plane=0 row={mi_r} col={mi_c} tx_size=64corner rng={rng}");
+        }
         let (luma_corner, luma_tx_type) = read_coeffs(
             dec,
             &mut luma_coding,
@@ -3224,6 +3228,10 @@ fn decode_block_rect64(
             dc_sign_ctx(around[0].2),
             TxType::DctDct,
         )?;
+        if std::env::var_os("EC_TRACE_COEFF").is_some() {
+            let (rng, _) = dec.debug_state();
+            eprintln!("EC_COEFF_VAL plane=0 row={mi_r} col={mi_c} rng={rng}");
+        }
         let mut luma_levels = vec![0i32; bw * bh];
         for row in 0..32 {
             luma_levels[row * bw..][..32].copy_from_slice(&luma_corner[row * 32..][..32]);
@@ -3255,6 +3263,10 @@ fn decode_block_rect64(
         let chroma_scan: &[u16] = if bw == 64 { &SCAN_32X16 } else { &SCAN_16X32 };
         let u_skip_ctx = usize::from(around[1].0) + usize::from(around[1].1);
         let mut u_coding = cdfs.txb(TxbSet::ChromaRect32x16, uv_predict_mode);
+        if std::env::var_os("EC_TRACE_COEFF").is_some() {
+            let (rng, _) = dec.debug_state();
+            eprintln!("EC_COEFF plane=1 row={mi_r} col={mi_c} tx_size=rect32x16 rng={rng}");
+        }
         let (u_levels, u_tx_type) = read_coeffs_rect(
             dec,
             &mut u_coding,
@@ -3265,6 +3277,10 @@ fn decode_block_rect64(
             dc_sign_ctx(around[1].2),
             TxType::DctDct,
         )?;
+        if std::env::var_os("EC_TRACE_COEFF").is_some() {
+            let (rng, _) = dec.debug_state();
+            eprintln!("EC_COEFF_VAL plane=1 row={mi_r} col={mi_c} rng={rng}");
+        }
         let u_residual = dequant_and_inverse_typed_wh(
             &u_levels,
             chroma_w,
@@ -3288,6 +3304,10 @@ fn decode_block_rect64(
         );
         let v_skip_ctx = usize::from(around[2].0) + usize::from(around[2].1);
         let mut v_coding = cdfs.txb(TxbSet::ChromaRect32x16, uv_predict_mode);
+        if std::env::var_os("EC_TRACE_COEFF").is_some() {
+            let (rng, _) = dec.debug_state();
+            eprintln!("EC_COEFF plane=2 row={mi_r} col={mi_c} tx_size=rect32x16 rng={rng}");
+        }
         let (v_levels, v_tx_type) = read_coeffs_rect(
             dec,
             &mut v_coding,
@@ -3298,6 +3318,10 @@ fn decode_block_rect64(
             dc_sign_ctx(around[2].2),
             TxType::DctDct,
         )?;
+        if std::env::var_os("EC_TRACE_COEFF").is_some() {
+            let (rng, _) = dec.debug_state();
+            eprintln!("EC_COEFF_VAL plane=2 row={mi_r} col={mi_c} rng={rng}");
+        }
         let v_residual = dequant_and_inverse_typed_wh(
             &v_levels,
             chroma_w,
