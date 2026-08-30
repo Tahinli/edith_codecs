@@ -9512,6 +9512,59 @@ mod tests {
         );
     }
 
+    /// lane-part32 r2: prints the exact mismatch geometry (block coords,
+    /// got/want pixels) of the pinned seed-42 stream captured off
+    /// `a_real_aomenc_stream_with_a_superblock_level_horz_vert_partition_decodes_pixel_exact`
+    /// via `EC_AV1_GATE_DUMP`. Debug-only, `#[ignore]`d.
+    #[test]
+    #[ignore = "debug harness, run manually with EC_AV1_GATE_DUMP_PIN"]
+    fn debug_part32_r2_sbpart_pin_mismatch_geometry() {
+        let path = std::env::var("EC_AV1_GATE_DUMP_PIN").expect("set EC_AV1_GATE_DUMP_PIN");
+        let stream = std::fs::read(&path).expect("read pinned stream");
+        let frames = decode_stream(&stream).expect("pinned stream must decode");
+        if let Ok(dump) = std::env::var("EC_DEBUG_DUMP_Y") {
+            let bytes: Vec<u8> = frames[0].y.iter().map(|&v| v as u8).collect();
+            std::fs::write(&dump, bytes).expect("write y dump");
+        }
+        let ffmpeg_frames = ffmpeg_decode_sequence(&stream, 192, 128, 1);
+        let got = &frames[0];
+        let want = &ffmpeg_frames[0];
+        let width = 192usize;
+        let mut n = 0;
+        let (mut min_x, mut max_x, mut min_y, mut max_y) = (width, 0, 128, 0);
+        for y in 0..128usize {
+            for x in 0..width {
+                let idx = y * width + x;
+                if got.y[idx] != want.y[idx] {
+                    n += 1;
+                    min_x = min_x.min(x);
+                    max_x = max_x.max(x);
+                    min_y = min_y.min(y);
+                    max_y = max_y.max(y);
+                }
+            }
+        }
+        eprintln!(
+            "total luma mismatches: {n} bbox x=[{min_x},{max_x}] y=[{min_y},{max_y}] frame=192x128"
+        );
+        for y in 0..128usize {
+            let mut row_first = None;
+            let mut row_count = 0;
+            for x in 0..width {
+                let idx = y * width + x;
+                if got.y[idx] != want.y[idx] {
+                    if row_first.is_none() {
+                        row_first = Some(x);
+                    }
+                    row_count += 1;
+                }
+            }
+            if let Some(fx) = row_first {
+                eprintln!("row {y}: first mismatch x={fx} count={row_count}");
+            }
+        }
+    }
+
     /// lane-rect64q r1: same recipe as
     /// [`a_real_aomenc_stream_with_a_superblock_level_horz_vert_partition_decodes_pixel_exact`]
     /// minus `--deltaq-mode=0` -- real aomenc's non-realtime default is
