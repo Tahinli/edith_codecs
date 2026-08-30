@@ -7,9 +7,10 @@
 # started SKIPping, leaving a green-but-vacuous suite. Re-run this whenever
 # `cargo test -p ec-av1` prints "SKIP ...: no aomenc at ...".
 #
-# nasm/yasm are absent on this box, so the build uses AOM_TARGET_CPU=generic
-# (C only). Decode is normative, so aomdec stays bit-exact; encode is slower.
-# Install nasm and drop that flag for a faster oracle.
+# Needs an assembler (nasm or yasm) for the SIMD build. Without one it falls
+# back to AOM_TARGET_CPU=generic (C only) automatically -- decode is normative
+# so aomdec stays bit-exact either way, but encode is slower, which matters
+# because every gate shells out to aomenc 40 times. Install nasm for speed.
 set -euo pipefail
 
 VERSION="${AOM_VERSION:-v3.13.3}"
@@ -21,11 +22,19 @@ if [ ! -d "$SRC/.git" ]; then
   git clone --depth 1 --branch "$VERSION" https://aomedia.googlesource.com/aom "$SRC"
 fi
 
+CPU_ARGS=()
+if [ -n "${AOM_TARGET_CPU:-}" ]; then
+  CPU_ARGS=(-DAOM_TARGET_CPU="$AOM_TARGET_CPU")
+elif ! command -v nasm >/dev/null && ! command -v yasm >/dev/null; then
+  echo "no nasm/yasm found -- falling back to the C-only (generic) build" >&2
+  CPU_ARGS=(-DAOM_TARGET_CPU=generic)
+fi
+
 cmake -S "$SRC" -B "$BUILD" -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DENABLE_TESTS=0 -DENABLE_DOCS=0 -DENABLE_EXAMPLES=1 \
   -DCONFIG_INSPECTION=1 \
-  -DAOM_TARGET_CPU="${AOM_TARGET_CPU:-generic}"
+  "${CPU_ARGS[@]}"
 ninja -C "$BUILD" aomenc aomdec
 
 echo "oracle ready:"
