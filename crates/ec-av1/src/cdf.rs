@@ -420,6 +420,14 @@ pub const PALETTE_UV_MODE: [[u16; 3]; 2] = [[32461, 32768, 0], [21488, 32768, 0]
 /// intra frame with `allow_intrabc` set.
 pub const INTRABC: [u16; 3] = [30531, 32768, 0];
 
+/// `default_delta_q_cdf` (entropymode.c:840-852, lane-realworld r4): the
+/// 4-symbol `delta_q_abs` alphabet read once per superblock when
+/// `delta_q_present` is set. `default_delta_lf_cdf`/`default_delta_lf_multi_cdf`
+/// share this same value (verified against libaom's real source).
+pub const DELTA_Q: [u16; 5] = [28160, 32120, 32677, 32768, 0];
+/// `default_delta_lf_cdf` -- see [`DELTA_Q`]'s doc.
+pub const DELTA_LF: [u16; 5] = DELTA_Q;
+
 /// `default_tx_size_cdf[0]` (entropymode.c): an 8x8 block's `tx_depth` flag
 /// (`TX8` vs `TX4`), indexed by `tx_size_context` (0..=2).
 pub const TX_SIZE_CAT0: [[u16; 3]; 3] = [[19968, 32768, 0], [19968, 32768, 0], [24320, 32768, 0]];
