@@ -21,7 +21,7 @@
 //! too). Anything outside that refuses with [`Error::unsupported`] rather than
 //! silently miscoding.
 
-use ec_av1_syntax::{CdefParams, LoopFilterParams};
+use ec_av1_syntax::{CdefParams, LoopFilterParams, LoopRestorationParams};
 use ec_core::{Error, Result};
 
 use crate::cdf;
@@ -4458,6 +4458,7 @@ pub fn decode_key_frame_tile(
         false,
         cdef,
         loop_filter,
+        &LoopRestorationParams::default(),
         None,
         tx_select,
         reduced_tx_set,
@@ -4486,6 +4487,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     enable_edge_filter: bool,
     cdef: &CdefParams,
     loop_filter: &LoopFilterParams,
+    lr: &LoopRestorationParams,
     initial_cdfs: Option<Cdfs>,
     tx_select: bool,
     reduced_tx_set: bool,
@@ -4543,10 +4545,25 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         mi_cols as usize,
         mi_rows as usize,
     );
+    let mut lr_grid = crate::restoration::RestorationGrid::new(lr, frame_width, frame_height);
+    let mut lr_reference = [(
+        crate::restoration::WienerInfo::default(),
+        crate::restoration::SgrprojInfo::default(),
+    ); 3];
 
     for sb_r in 0..sb_rows {
         neighbours.start_row();
         for sb_c in 0..sb_cols {
+            crate::restoration::read_lr(
+                &mut dec,
+                &mut cdfs,
+                lr,
+                &mut lr_grid,
+                &mut lr_reference,
+                sb_r * SB_MI,
+                sb_c * SB_MI,
+                SB_MI,
+            );
             let at = (sb_r as usize * 4, sb_c as usize * 4);
             let ctx = neighbours.partition_ctx(at, SB);
             let (has_cols, has_rows) = (
@@ -9055,6 +9072,7 @@ pub fn decode_inter_frame_tile(
         other_refs,
         cdef,
         loop_filter,
+        &LoopRestorationParams::default(),
         None,
         allow_high_precision_mv,
         force_integer_mv,
@@ -9096,6 +9114,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     other_refs: [Option<&Picture>; 8],
     cdef: &CdefParams,
     loop_filter: &LoopFilterParams,
+    lr: &LoopRestorationParams,
     initial_cdfs: Option<Cdfs>,
     allow_high_precision_mv: bool,
     force_integer_mv: bool,
@@ -9271,10 +9290,25 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         mi_rows as usize,
     );
     let mut grid = MiGrid::new(mi_cols as usize, mi_rows as usize);
+    let mut lr_grid = crate::restoration::RestorationGrid::new(lr, frame_width, frame_height);
+    let mut lr_reference = [(
+        crate::restoration::WienerInfo::default(),
+        crate::restoration::SgrprojInfo::default(),
+    ); 3];
 
     for sb_r in 0..sb_rows {
         neighbours.start_row();
         for sb_c in 0..sb_cols {
+            crate::restoration::read_lr(
+                &mut dec,
+                &mut cdfs,
+                lr,
+                &mut lr_grid,
+                &mut lr_reference,
+                sb_r * SB_MI,
+                sb_c * SB_MI,
+                SB_MI,
+            );
             let sb_at = (sb_r as usize * 4, sb_c as usize * 4);
             let sb_ctx = neighbours.partition_ctx(sb_at, SB);
             let (has_cols, has_rows) = (
