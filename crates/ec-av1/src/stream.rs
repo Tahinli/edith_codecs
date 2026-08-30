@@ -6193,6 +6193,7 @@ mod tests {
                 header.reduced_tx_set,
                 header.allow_screen_content_tools,
                 header.allow_intrabc,
+                header.delta,
             ) {
                 Err(e) => {
                     let msg = e.to_string();
