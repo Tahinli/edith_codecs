@@ -362,9 +362,11 @@ fn bench_av1_encode(rows: &mut Vec<Row>) {
         let pic = Av1Picture {
             width: w as usize,
             height: h as usize,
-            y: y.to_vec(),
-            u: u.to_vec(),
-            v: v.to_vec(),
+            // ec-av1's Picture carries u16 samples since the high-bit-depth
+            // widen; this bench feeds 8-bit y4m, so widen each plane here.
+            y: y.iter().map(|&s| u16::from(s)).collect(),
+            u: u.iter().map(|&s| u16::from(s)).collect(),
+            v: v.iter().map(|&s| u16::from(s)).collect(),
         };
         let packet = enc.encode(&pic).expect("av1 encode");
         stream.extend_from_slice(&packet.data);

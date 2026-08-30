@@ -145,34 +145,37 @@ impl Edges {
     /// and `z3_c`'s `max_base_y` use (libaom `reconintra.c`) -- above and
     /// left both extend that far regardless of which of `bw`/`bh` is larger.
     fn build(
-        above: Option<&[u8]>,
-        left: Option<&[u8]>,
-        corner: Option<u8>,
+        above: Option<&[u16]>,
+        left: Option<&[u16]>,
+        corner: Option<u16>,
         bw: usize,
         bh: usize,
     ) -> Self {
         let want = bw + bh;
-        let extend = |samples: &[u8]| {
+        let extend = |samples: &[u16]| {
             let mut row: Vec<i32> = samples.iter().map(|&s| i32::from(s)).collect();
             let last = *row.last().expect("an edge that exists has samples");
             row.resize(want, last);
             row
         };
+        // Spec 7.11.2.2's no-neighbour fallback is `base = 1 << (BitDepth - 1)`
+        // (128 at 8-bit): `base - 1` above, `base + 1` left, `base` corner.
+        let base = 1i32 << (crate::decode::bit_depth() - 1);
         let above_row = match (above, left) {
             (Some(a), _) => extend(a),
             (None, Some(l)) => vec![i32::from(l[0]); want],
-            (None, None) => vec![127; want],
+            (None, None) => vec![base - 1; want],
         };
         let left_col = match (left, above) {
             (Some(l), _) => extend(l),
             (None, Some(a)) => vec![i32::from(a[0]); want],
-            (None, None) => vec![129; want],
+            (None, None) => vec![base + 1; want],
         };
         let corner = match (corner, above, left) {
             (Some(c), Some(_), Some(_)) => i32::from(c),
             (_, Some(a), _) => i32::from(a[0]),
             (_, None, Some(l)) => i32::from(l[0]),
-            (_, None, None) => 128,
+            (_, None, None) => base,
         };
         let with_corner = |edge: Vec<i32>| {
             let mut v = Vec::with_capacity(want + 1);
@@ -230,14 +233,14 @@ impl Edges {
 pub fn predict(
     mode: u8,
     angle_delta: i32,
-    above: Option<&[u8]>,
-    left: Option<&[u8]>,
-    corner: Option<u8>,
+    above: Option<&[u16]>,
+    left: Option<&[u16]>,
+    corner: Option<u16>,
     bw: usize,
     bh: usize,
     enable_edge_filter: bool,
     smooth_neighbor: bool,
-    dst: &mut [u8],
+    dst: &mut [u16],
 ) {
     assert_eq!(dst.len(), bw * bh, "the destination is the block");
     let edges = Edges::build(above, left, corner, bw, bh);
@@ -304,7 +307,7 @@ pub fn predict(
                 PAETH_PRED => paeth(edges.above(c), edges.left(r), edges.above(-1)),
                 other => panic!("intra mode {other} is not one this module predicts"),
             };
-            dst[row * bw + col] = value.clamp(0, 255) as u8;
+            dst[row * bw + col] = value.clamp(0, crate::decode::sample_max()) as u16;
         }
     }
 }
@@ -431,7 +434,7 @@ fn upsample_intra_edge(buf: &[i32]) -> Vec<i32> {
     out[0] = inp[0];
     for i in 0..sz {
         let s = -inp[i] + 9 * inp[i + 1] + 9 * inp[i + 2] - inp[i + 3];
-        out[2 * i + 1] = ((s + 8) >> 4).clamp(0, 255);
+        out[2 * i + 1] = ((s + 8) >> 4).clamp(0, crate::decode::sample_max());
         out[2 * i + 2] = inp[i + 2];
     }
     out
@@ -452,7 +455,7 @@ fn directional(
     smooth_neighbor: bool,
     n_top: usize,
     n_left: usize,
-    dst: &mut [u8],
+    dst: &mut [u16],
 ) {
     let (w, h) = (bw as i32, bh as i32);
     let reach = w + h; // `av1_dr_prediction_z{1,3}_c`'s `max_base_{x,y}` reach.
@@ -565,7 +568,7 @@ fn directional(
                     blend(&left_at, y2 >> frac_bits_y, ((y2 << up_l) & 0x3F) >> 1)
                 }
             };
-            dst[(row * w + col) as usize] = value.clamp(0, 255) as u8;
+            dst[(row * w + col) as usize] = value.clamp(0, crate::decode::sample_max()) as u16;
         }
     }
 }
@@ -579,8 +582,8 @@ fn directional(
 /// before `dc_predictor` averages, so a slice truncated short by the true
 /// frame edge must be extended by repetition here too, not averaged over its
 /// own shorter length.
-fn dc(above: Option<&[u8]>, left: Option<&[u8]>, bw: usize, bh: usize) -> i32 {
-    let extend = |samples: &[u8], want: usize| -> Vec<u8> {
+fn dc(above: Option<&[u16]>, left: Option<&[u16]>, bw: usize, bh: usize) -> i32 {
+    let extend = |samples: &[u16], want: usize| -> Vec<u16> {
         if samples.len() >= want {
             samples[..want].to_vec()
         } else {
@@ -592,12 +595,12 @@ fn dc(above: Option<&[u8]>, left: Option<&[u8]>, bw: usize, bh: usize) -> i32 {
     };
     let above = above.map(|a| extend(a, bw));
     let left = left.map(|l| extend(l, bh));
-    let average = |samples: &[u8]| {
+    let average = |samples: &[u16]| {
         let sum: u32 = samples.iter().map(|&s| u32::from(s)).sum();
         ((sum + (samples.len() as u32 >> 1)) / samples.len() as u32) as i32
     };
     match (&above, &left) {
-        (None, None) => 128,
+        (None, None) => 1i32 << (crate::decode::bit_depth() - 1),
         (Some(a), None) => average(a),
         (None, Some(l)) => average(l),
         (Some(a), Some(l)) if bw == bh => {
@@ -723,11 +726,11 @@ const FILTER_INTRA_SCALE_BITS: u32 = 4;
 /// 32x32, and only on square blocks: 4, 8, 16 or 32).
 pub fn predict_filter_intra(
     mode: usize,
-    above: Option<&[u8]>,
-    left: Option<&[u8]>,
-    corner: Option<u8>,
+    above: Option<&[u16]>,
+    left: Option<&[u16]>,
+    corner: Option<u16>,
     side: usize,
-    dst: &mut [u8],
+    dst: &mut [u16],
 ) {
     assert_eq!(dst.len(), side * side, "the destination is the block");
     assert_eq!(side % 4, 0, "filter intra only offers 4/8/16/32");
@@ -759,7 +762,7 @@ pub fn predict_filter_intra(
             for k in 0..8 {
                 let (r_off, c_off) = (k >> 2, k & 3);
                 let pr: i32 = taps[k].iter().zip(&p).map(|(t, s)| t * s).sum();
-                let value = round2(pr, FILTER_INTRA_SCALE_BITS).clamp(0, 255);
+                let value = round2(pr, FILTER_INTRA_SCALE_BITS).clamp(0, crate::decode::sample_max());
                 let idx = (r + r_off) * (side + 1) + c + c_off;
                 buffer[idx] = value;
             }
@@ -769,7 +772,7 @@ pub fn predict_filter_intra(
     }
     for row in 0..side {
         for col in 0..side {
-            dst[row * side + col] = at(&buffer, row + 1, col + 1) as u8;
+            dst[row * side + col] = at(&buffer, row + 1, col + 1) as u16;
         }
     }
 }
@@ -799,15 +802,15 @@ mod tests {
 
     /// Same deterministic synthetic ramp `lanes/intrarect_dump.c`'s `fill`
     /// generates.
-    fn fill(n: usize, seed: i32) -> Vec<u8> {
+    fn fill(n: usize, seed: i32) -> Vec<u16> {
         (0..n)
-            .map(|i| ((i as i32 * 7 + seed * 13 + (i as i32 % 5) * 3).rem_euclid(256)) as u8)
+            .map(|i| ((i as i32 * 7 + seed * 13 + (i as i32 % 5) * 3).rem_euclid(256)) as u16)
             .collect()
     }
 
     /// `lanes/intrarect_dump.c`'s `checksum`: a position-weighted sum so a
     /// wrong value anywhere in the block, not just at index 0, moves it.
-    fn checksum(dst: &[u8]) -> u64 {
+    fn checksum(dst: &[u16]) -> u64 {
         dst.iter()
             .enumerate()
             .map(|(i, &v)| u64::from(v) * (i as u64 + 1))
@@ -897,10 +900,10 @@ mod tests {
             let reach = bw + bh;
             let above = fill(reach, 1);
             let left = fill(reach, 2);
-            let corner = ((bw * 3 + bh * 5) % 256) as u8;
+            let corner = ((bw * 3 + bh * 5) % 256) as u16;
 
             for (name, mode) in [("DC", DC_PRED), ("SMOOTH", SMOOTH_PRED), ("PAETH", PAETH_PRED)] {
-                let mut dst = vec![0u8; bw * bh];
+                let mut dst = vec![0u16; bw * bh];
                 predict(
                     mode,
                     0,
@@ -928,7 +931,7 @@ mod tests {
             for &(angle, mode, delta) in &directional_cases {
                 for ef in [false, true] {
                     for sn in [false, true] {
-                        let mut dst = vec![0u8; bw * bh];
+                        let mut dst = vec![0u16; bw * bh];
                         predict(
                             mode,
                             delta,
