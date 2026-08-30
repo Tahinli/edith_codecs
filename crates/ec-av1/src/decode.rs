@@ -56,18 +56,24 @@ const BLOCK_MI: u32 = 8;
 /// tests read (before/after, not the absolute value) to prove a stream
 /// actually exercised the filter-intra predictor rather than silently
 /// skipping it.
-static FILTER_INTRA_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static FILTER_INTRA_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
 
 /// Current value of [`FILTER_INTRA_HITS`].
 pub(crate) fn filter_intra_hits() -> usize {
-    FILTER_INTRA_HITS.load(std::sync::atomic::Ordering::Relaxed)
+    FILTER_INTRA_HITS.with(|c| c.get())
 }
 
 /// How many 4-pixel deblocking edge groups [`edge_params`] has actually
 /// selected for filtering, across every call in the process -- the same
 /// before/after counter pattern as [`FILTER_INTRA_HITS`], proving a stream
 /// exercised `apply_deblock` rather than every edge landing on level 0.
-static DEBLOCK_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static DEBLOCK_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
 /// lane-comppin r4: decode-order picture counter for `EC_AV1_PREFILT_DUMP`,
 /// mirroring stream.rs's `pictures_decoded` so the two dumps index
 /// identically against aomdec's own `ec_frame_idx` in decodeframe.c.
@@ -76,7 +82,7 @@ static PREFILT_PICTURE_IDX: std::sync::atomic::AtomicUsize =
 
 /// Current value of [`DEBLOCK_HITS`].
 pub(crate) fn deblock_hits() -> usize {
-    DEBLOCK_HITS.load(std::sync::atomic::Ordering::Relaxed)
+    DEBLOCK_HITS.with(|c| c.get())
 }
 
 /// How many [`read_tx_size`] reads resolved a `tx_depth` strictly less than
@@ -85,11 +91,14 @@ pub(crate) fn deblock_hits() -> usize {
 /// actually exercised a *split* transform under `TxMode::Select` rather than
 /// every block coincidentally resolving `depth=0` (indistinguishable from
 /// `TxMode::Largest` pixel-wise).
-static TX_DEPTH_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static TX_DEPTH_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
 
 /// Current value of [`TX_DEPTH_HITS`].
 pub(crate) fn tx_depth_hits() -> usize {
-    TX_DEPTH_HITS.load(std::sync::atomic::Ordering::Relaxed)
+    TX_DEPTH_HITS.with(|c| c.get())
 }
 
 /// How many [`read_coeffs`] reads resolved a `tx_type` outside `TX_CLASS_2D`
@@ -98,24 +107,33 @@ pub(crate) fn tx_depth_hits() -> usize {
 /// [`TX_DEPTH_HITS`], proving a stream actually exercised the class-split
 /// `eob_pt`/1D-neighbour context path rather than every block coincidentally
 /// landing on `DCT_DCT`.
-static TX_CLASS1_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static TX_CLASS1_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
 
 /// How many `uv_mode` reads resolved to a directional chroma mode (neither
 /// `DC_PRED` nor `UV_CFL_PRED`), across every call in the process -- the same
 /// before/after counter pattern as [`FILTER_INTRA_HITS`], proving a stream
 /// actually exercised chroma's own directional predictor.
-static DIRECTIONAL_UV_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static DIRECTIONAL_UV_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
 
 /// Current value of [`DIRECTIONAL_UV_HITS`].
 pub(crate) fn directional_uv_hits() -> usize {
-    DIRECTIONAL_UV_HITS.load(std::sync::atomic::Ordering::Relaxed)
+    DIRECTIONAL_UV_HITS.with(|c| c.get())
 }
 
 /// How many `angle_delta`/`angle_delta_uv` symbols this decoder has read as
 /// something other than [`ANGLE_DELTA_ZERO`], across every call in the
 /// process -- the same before/after counter pattern as [`FILTER_INTRA_HITS`],
 /// proving a stream actually exercised a nonzero angle delta.
-static ANGLE_DELTA_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static ANGLE_DELTA_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
 
 /// How many [`read_single_ref`] reads resolved to a reference other than
 /// `LAST_FRAME`, across every call in the process -- the same before/after
@@ -123,11 +141,14 @@ static ANGLE_DELTA_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::Ato
 /// exercised a non-`LAST_FRAME` reference (`GOLDEN_FRAME`, this decoder's
 /// only other supported one so far) rather than every block coincidentally
 /// resolving `LAST_FRAME`.
-static NON_LAST_REF_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static NON_LAST_REF_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
 
 /// Current value of [`NON_LAST_REF_HITS`].
 pub(crate) fn non_last_ref_hits() -> usize {
-    NON_LAST_REF_HITS.load(std::sync::atomic::Ordering::Relaxed)
+    NON_LAST_REF_HITS.with(|c| c.get())
 }
 
 /// Per-reference [`NON_LAST_REF_HITS`] breakdown (lane-av1refs): one counter
@@ -136,51 +157,80 @@ pub(crate) fn non_last_ref_hits() -> usize {
 /// can prove THAT reference fired rather than any non-`LAST_FRAME` one --
 /// `NON_LAST_REF_HITS` alone cannot tell a `LAST2_FRAME` gate from a
 /// `GOLDEN_FRAME` draw it did not ask for.
-static LAST2_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-static LAST3_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-static GOLDEN_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-static BWDREF_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-static ALTREF2_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-static ALTREF_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static LAST2_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+thread_local! {
+    static LAST3_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+thread_local! {
+    static GOLDEN_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+thread_local! {
+    static BWDREF_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+thread_local! {
+    static ALTREF2_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+thread_local! {
+    static ALTREF_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
 
 /// How many [`read_comp_mode`] reads resolved `COMPOUND_REFERENCE` (lane-av1comp)
 /// -- proves a `reference_select` stream actually reached a block that picked
 /// compound, not just that the header bit was set. Every such block is
 /// refused after this fires ([`decode_inter_block`]/[`decode_inter_block8`]),
 /// so this only ever counts attempted reads, never a completed decode.
-static COMP_MODE_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static COMP_MODE_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
 
 /// Current value of [`COMP_MODE_HITS`].
 pub(crate) fn comp_mode_hits() -> usize {
-    COMP_MODE_HITS.load(std::sync::atomic::Ordering::Relaxed)
+    COMP_MODE_HITS.with(|c| c.get())
 }
 
 /// How many blocks decoded `skip_mode == 1` (lane-av1comp round 14) --
 /// proves a real `skip_mode_present` stream actually reached a block that
 /// picked it, not just that the frame header bit was set.
-static SKIP_MODE_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static SKIP_MODE_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
 
 /// Current value of [`SKIP_MODE_HITS`].
 pub(crate) fn skip_mode_hits() -> usize {
-    SKIP_MODE_HITS.load(std::sync::atomic::Ordering::Relaxed)
+    SKIP_MODE_HITS.with(|c| c.get())
 }
 
 /// lane-motionmode: how many blocks actually decoded `obmc_selected == true`
 /// (as opposed to just reaching an eligible `read_motion_mode` symbol read)
 /// -- the gate's own proof that a real aomenc `--enable-obmc=1` stream
 /// reached [`obmc_blend`], not just the header bit.
-static OBMC_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static OBMC_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
 
 /// Current value of [`OBMC_HITS`].
 pub(crate) fn obmc_hits() -> usize {
-    OBMC_HITS.load(std::sync::atomic::Ordering::Relaxed)
+    OBMC_HITS.with(|c| c.get())
 }
 
 /// lane-motionmode round 3: same proof as [`OBMC_HITS`], narrowed to
 /// `decode_inter_block8`'s own 8x8-leaf `read_motion_mode` -- a subset of
 /// [`OBMC_HITS`] (both fire together on an 8x8 hit), lets the gate tell an
 /// 8x8-leaf OBMC block apart from a 16x16+ one.
-static OBMC_HITS_8: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static OBMC_HITS_8: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// lane-warp round 1: how many blocks resolved `motion_mode_allowed` to
 /// `WARPED_CAUSAL`-eligible (3-symbol read, `num_proj_ref >= 1` under
@@ -188,21 +238,27 @@ static OBMC_HITS_8: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUs
 /// -- the gate's proof that a fixture really exercises the alphabet this
 /// round changed, even though the block itself still refuses (warp
 /// estimation/filter not ported).
-static WARP_SELECTED_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static WARP_SELECTED_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
 
 /// Current value of [`WARP_SELECTED_HITS`].
 pub(crate) fn warp_selected_hits() -> usize {
-    WARP_SELECTED_HITS.load(std::sync::atomic::Ordering::Relaxed)
+    WARP_SELECTED_HITS.with(|c| c.get())
 }
 
 /// How many blocks decoded `interintra == 1` with the non-wedge blended
 /// prediction applied (lane-interintra r1) -- the gate's proof that a
 /// stream actually exercised interintra.
-static INTERINTRA_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static INTERINTRA_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
 
 /// Current value of [`INTERINTRA_HITS`].
 pub(crate) fn interintra_hits() -> usize {
-    INTERINTRA_HITS.load(std::sync::atomic::Ordering::Relaxed)
+    INTERINTRA_HITS.with(|c| c.get())
 }
 
 /// How many blocks decoded `comp_group_idx == 1` (masked COMPOUND_REFERENCE,
@@ -210,39 +266,47 @@ pub(crate) fn interintra_hits() -> usize {
 /// `mask_type` consumed entropy-exact -- lane-maskcomp r1's proof that a
 /// gate fixture actually exercises this alphabet, even though the block
 /// still refuses (the mask blend itself is unported).
-static MASKED_COMPOUND_HITS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static MASKED_COMPOUND_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
 
 /// Current value of [`MASKED_COMPOUND_HITS`].
 pub(crate) fn masked_compound_hits() -> usize {
-    MASKED_COMPOUND_HITS.load(std::sync::atomic::Ordering::Relaxed)
+    MASKED_COMPOUND_HITS.with(|c| c.get())
 }
 
 /// How many blocks decoded a real `COMPOUND_WEDGE` block (`comp_group_idx ==
 /// 1`, `compound_type == 0`) -- lane-wedge r3's proof a gate fixture
 /// actually exercised the wedge blend, not just the DIFFWTD half of
 /// `MASKED_COMPOUND_HITS`.
-static WEDGE_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static WEDGE_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
 
 /// Current value of [`WEDGE_HITS`].
 pub(crate) fn wedge_hits() -> usize {
-    WEDGE_HITS.load(std::sync::atomic::Ordering::Relaxed)
+    WEDGE_HITS.with(|c| c.get())
 }
 
 /// How many blocks decoded a real wedge-INTERINTRA block
 /// (`interintra == 1 && use_wedge_interintra == 1`) -- lane-wii r2's proof
 /// a gate fixture exercised the wedge blend (fixed sign 0), not just the
 /// smooth arm counted by `INTERINTRA_HITS`.
-static WII_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static WII_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
 
 /// Current value of [`WII_HITS`].
 pub(crate) fn wii_hits() -> usize {
-    WII_HITS.load(std::sync::atomic::Ordering::Relaxed)
+    WII_HITS.with(|c| c.get())
 }
 
 /// Current value of [`OBMC_HITS_8`].
 pub(crate) fn obmc_hits_8() -> usize {
-    OBMC_HITS_8.load(std::sync::atomic::Ordering::Relaxed)
+    OBMC_HITS_8.with(|c| c.get())
 }
 
 /// lane-rectgate r1: how many 32x32 quadrants actually decoded a
@@ -252,47 +316,56 @@ pub(crate) fn obmc_hits_8() -> usize {
 /// never writes" refusal below) -- the gate's proof that a free-partition
 /// aomenc stream actually exercised a non-`NONE`/`SPLIT` partition rather than
 /// coincidentally never selecting one.
-static EXTENDED_PARTITION_HITS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static EXTENDED_PARTITION_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
 
 /// Current value of [`EXTENDED_PARTITION_HITS`].
 pub(crate) fn extended_partition_hits() -> usize {
-    EXTENDED_PARTITION_HITS.load(std::sync::atomic::Ordering::Relaxed)
+    EXTENDED_PARTITION_HITS.with(|c| c.get())
 }
 
 /// lane-partitions r1: how many 32x32 quadrants decoded a real
 /// `PARTITION_HORZ`/`PARTITION_VERT` (two true rectangular strips, unlike
 /// `PARTITION_HORZ_B`'s square-context stand-in) -- the free-partition
 /// gate's proof this round's arms actually fired.
-static RECT_PARTITION_HITS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static RECT_PARTITION_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
 
 /// Current value of [`RECT_PARTITION_HITS`].
 pub(crate) fn rect_partition_hits() -> usize {
-    RECT_PARTITION_HITS.load(std::sync::atomic::Ordering::Relaxed)
+    RECT_PARTITION_HITS.with(|c| c.get())
 }
 
 /// lane-rectwire r2: how many `PARTITION_HORZ`/`VERT` strips actually decoded
 /// real (non-skip) coefficients through [`read_coeffs_rect`] -- proves the
 /// rect coefficient reader itself fired, not just the strip-level partition
 /// symbol [`RECT_PARTITION_HITS`] already counts.
-static RECT_COEFF_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static RECT_COEFF_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
 
 /// Current value of [`RECT_COEFF_HITS`].
 pub(crate) fn rect_coeff_hits() -> usize {
-    RECT_COEFF_HITS.load(std::sync::atomic::Ordering::Relaxed)
+    RECT_COEFF_HITS.with(|c| c.get())
 }
 
 /// lane-partab r1: how many 32x32 quadrants decoded an AB partition
 /// (PARTITION_HORZ_A / VERT_A / VERT_B -- two 16x16 squares plus one
 /// 16x32/32x16 strip). Like [`RECT_PARTITION_HITS`], this is the
 /// free-partition gate's proof this round's arms actually fired.
-static PARTAB_HITS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static PARTAB_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
 
 /// Current value of [`PARTAB_HITS`].
 pub(crate) fn partab_hits() -> usize {
-    PARTAB_HITS.load(std::sync::atomic::Ordering::Relaxed)
+    PARTAB_HITS.with(|c| c.get())
 }
 
 /// How many [`read_inter_compound_mode`] reads actually happened
@@ -301,11 +374,14 @@ pub(crate) fn partab_hits() -> usize {
 /// mvstack build), not just that `comp_mode` fired. Still refused right
 /// after (no MV assignment or MC wired), so this only counts attempted
 /// reads.
-static COMPOUND_MODE_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static COMPOUND_MODE_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
 
 /// Current value of [`COMPOUND_MODE_HITS`].
 pub(crate) fn compound_mode_hits() -> usize {
-    COMPOUND_MODE_HITS.load(std::sync::atomic::Ordering::Relaxed)
+    COMPOUND_MODE_HITS.with(|c| c.get())
 }
 
 /// How many query blocks folded in at least one temporal MV candidate
@@ -390,7 +466,7 @@ pub(crate) fn ref_hits(ref_frame: i8) -> usize {
         ALTREF_FRAME => &ALTREF_HITS,
         other => panic!("ref_hits: no per-reference counter for ref_frame {other}"),
     };
-    c.load(std::sync::atomic::Ordering::Relaxed)
+    c.with(|v| v.get())
 }
 
 thread_local! {
@@ -418,12 +494,12 @@ pub(crate) fn set_enable_edge_filter(value: bool) {
 
 /// Current value of [`ANGLE_DELTA_HITS`].
 pub(crate) fn angle_delta_hits() -> usize {
-    ANGLE_DELTA_HITS.load(std::sync::atomic::Ordering::Relaxed)
+    ANGLE_DELTA_HITS.with(|c| c.get())
 }
 
 /// Current value of [`TX_CLASS1_HITS`].
 pub(crate) fn tx_class1_hits() -> usize {
-    TX_CLASS1_HITS.load(std::sync::atomic::Ordering::Relaxed)
+    TX_CLASS1_HITS.with(|c| c.get())
 }
 const SUB_MI: u32 = 4;
 const MI: usize = 4;
@@ -944,7 +1020,7 @@ fn read_coeffs(
 
     let class = TxClass::of(tx_type);
     if class != TxClass::TwoD {
-        TX_CLASS1_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        TX_CLASS1_HITS.with(|c| c.set(c.get() + 1));
     }
     let eob = read_eob(dec, coding, class);
     if trace {
@@ -1894,7 +1970,7 @@ fn read_intra_mode_rect(
         return Err(unsupported("a smooth or paeth chroma mode (round 2)"));
     }
     let angle_delta_uv = if (V_PRED..=D67_PRED).contains(&uv_mode) {
-        DIRECTIONAL_UV_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        DIRECTIONAL_UV_HITS.with(|c| c.set(c.get() + 1));
         read_angle_delta(dec, &mut cdfs.angle_delta[uv_mode - V_PRED])
     } else {
         0
@@ -1906,7 +1982,7 @@ fn read_intra_mode_rect(
     {
         let use_filter_intra = dec.symbol(&mut cdfs.filter_intra[class]) != 0;
         if use_filter_intra {
-            FILTER_INTRA_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            FILTER_INTRA_HITS.with(|c| c.set(c.get() + 1));
             let fi_mode = dec.symbol(&mut cdfs.filter_intra_mode);
             filter_intra = Some(fi_mode);
         }
@@ -2020,7 +2096,7 @@ fn decode_block_rect(
     let ctx = tx_size_context_rect(neighbours, (mi_r, mi_c), bw, bh);
     let depth = dec.symbol(&mut cdfs.tx_size_cat2[ctx]);
     if depth != 0 {
-        TX_DEPTH_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        TX_DEPTH_HITS.with(|c| c.set(c.get() + 1));
         // A split transform is predicted per transform unit, each taking its
         // edges from the previous unit's reconstruction (the square path's own
         // per-TU loop does exactly that). Predicting the whole strip in one
@@ -2217,12 +2293,12 @@ fn decode_block_rect(
             None,
         );
         neighbours.record_rect(at, bw, bh, mode, &[luma_levels, u_levels, v_levels]);
-        RECT_COEFF_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        RECT_COEFF_HITS.with(|c| c.set(c.get() + 1));
         }
     }
     neighbours.fill_skip_grid_rect((mi_r, mi_c), bw / MI, bh / MI, skip);
     neighbours.fill_lf_grid_rect((mi_r, mi_c), bw / MI, bh / MI, tx_w as u8, tx_h as u8, 0);
-    RECT_PARTITION_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    RECT_PARTITION_HITS.with(|c| c.set(c.get() + 1));
     Ok(())
 }
 
@@ -2233,7 +2309,7 @@ fn decode_block_rect(
 fn read_angle_delta(dec: &mut SymbolDecoder, cdf: &mut [u16]) -> i32 {
     let symbol = dec.symbol(cdf);
     if symbol != ANGLE_DELTA_ZERO {
-        ANGLE_DELTA_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ANGLE_DELTA_HITS.with(|c| c.set(c.get() + 1));
     }
     symbol as i32 - ANGLE_DELTA_ZERO as i32
 }
@@ -2330,7 +2406,7 @@ fn read_intra_mode(
     // so a CFL block (uv_mode==13, outside `V_PRED..=D67_PRED`) already takes
     // the `else` branch below and never reads one either way.
     let angle_delta_uv = if (V_PRED..=D67_PRED).contains(&uv_mode) {
-        DIRECTIONAL_UV_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        DIRECTIONAL_UV_HITS.with(|c| c.set(c.get() + 1));
         read_angle_delta(dec, &mut cdfs.angle_delta[uv_mode - V_PRED])
     } else {
         0
@@ -2381,7 +2457,7 @@ fn read_intra_mode(
             );
         }
         if use_filter_intra {
-            FILTER_INTRA_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            FILTER_INTRA_HITS.with(|c| c.set(c.get() + 1));
             let fi_mode = dec.symbol(&mut cdfs.filter_intra_mode);
             if trace {
                 eprintln!("TRACE filter_intra_mode value={fi_mode}");
@@ -3709,7 +3785,7 @@ fn read_tx_size(
         _ => unreachable!("decode_block/decode_leaf8 only call this at 8/16/32/64"),
     };
     if depth != 0 {
-        TX_DEPTH_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        TX_DEPTH_HITS.with(|c| c.set(c.get() + 1));
     }
     side >> depth
 }
@@ -3845,7 +3921,7 @@ fn edge_params(
         [4, 8, 14, 14, 14][dim]
     };
     let level = if cur_level != 0 { cur_level } else { pv_level };
-    DEBLOCK_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    DEBLOCK_HITS.with(|c| c.set(c.get() + 1));
     Some((len, level))
 }
 
@@ -5190,7 +5266,7 @@ fn read_single_ref(
         }
     };
     if ref_frame != LAST_FRAME {
-        NON_LAST_REF_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        NON_LAST_REF_HITS.with(|c| c.set(c.get() + 1));
         let c = match ref_frame {
             LAST2_FRAME => &LAST2_HITS,
             LAST3_FRAME => &LAST3_HITS,
@@ -5200,7 +5276,7 @@ fn read_single_ref(
             ALTREF_FRAME => &ALTREF_HITS,
             _ => unreachable!("read_single_ref only ever returns LAST_FRAME..=ALTREF_FRAME"),
         };
-        c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        c.with(|v| v.set(v.get() + 1));
     }
     ref_frame
 }
@@ -5851,7 +5927,7 @@ fn read_comp_mode(
     let ctx = reference_mode_ctx(above, left);
     let compound = dec.symbol(&mut cdfs.comp_mode[ctx]) == 1;
     if compound {
-        COMP_MODE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        COMP_MODE_HITS.with(|c| c.set(c.get() + 1));
     }
     compound
 }
@@ -5955,7 +6031,7 @@ fn read_inter_compound_mode(
     ref_mv_ctx: usize,
 ) -> u8 {
     let ctx = cdf::COMPOUND_MODE_CTX_MAP[ref_mv_ctx >> 1][new_mv_ctx.min(4)];
-    COMPOUND_MODE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    COMPOUND_MODE_HITS.with(|c| c.set(c.get() + 1));
     dec.symbol(&mut cdfs.inter_compound_mode[ctx]) as u8
 }
 
@@ -6235,7 +6311,7 @@ fn decode_inter_block(
         );
     }
     if skip_mode {
-        SKIP_MODE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        SKIP_MODE_HITS.with(|c| c.set(c.get() + 1));
     }
 
     let skip_ctx = usize::from(neighbours.above_skip[c]) + usize::from(neighbours.left_skip[r]);
@@ -6483,7 +6559,7 @@ fn decode_inter_block(
                     // verified vs independent C dump (wedge.rs).
                     let wedge_index = dec.symbol(&mut cdfs.wedge_idx[wedge_bsize]);
                     let wedge_sign = dec.literal(1);
-                    WEDGE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    WEDGE_HITS.with(|c| c.set(c.get() + 1));
                     wedge_mask = Some(
                         crate::wedge::wedge_masks()
                             .codebook(side)
@@ -6494,7 +6570,7 @@ fn decode_inter_block(
                     let mask_type = dec.literal(1);
                     diffwtd_mask_type = Some(mask_type as u8);
                 }
-                MASKED_COMPOUND_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                MASKED_COMPOUND_HITS.with(|c| c.set(c.get() + 1));
             }
             // corner-cut (lane-av1comp r16/r17, lane-av1blend r1): r16/r17
             // called this a `predict_compound_intermediate`/`combine_compound`
@@ -7166,7 +7242,7 @@ fn decode_inter_block(
                         // NO sign symbol follows -- libaom fixes
                         // INTERINTRA_WEDGE_SIGN 0 (blockd.h).
                         let wedge_index = dec.symbol(&mut cdfs.wedge_idx[wedge_bsize]);
-                        WII_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        WII_HITS.with(|c| c.set(c.get() + 1));
                         wedge_mask = Some((
                             crate::wedge::wedge_masks()
                                 .codebook(side)
@@ -7174,7 +7250,7 @@ fn decode_inter_block(
                             side,
                         ));
                     } else {
-                        INTERINTRA_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        INTERINTRA_HITS.with(|c| c.set(c.get() + 1));
                     }
                     interintra_mode = Some(ii);
                 }
@@ -7263,11 +7339,11 @@ fn decode_inter_block(
                         0 => {}
                         1 => {
                             obmc_selected = true;
-                            OBMC_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            OBMC_HITS.with(|c| c.set(c.get() + 1));
                         }
                         _ => {
                             warped_selected = true;
-                            WARP_SELECTED_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            WARP_SELECTED_HITS.with(|c| c.set(c.get() + 1));
                             let mut samples = find_samples(
                                 grid,
                                 mi_row,
@@ -7316,7 +7392,7 @@ fn decode_inter_block(
                 } else {
                     obmc_selected = dec.symbol(&mut cdfs.obmc[bsize_idx]) == 1;
                     if obmc_selected {
-                        OBMC_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        OBMC_HITS.with(|c| c.set(c.get() + 1));
                     }
                 }
             }
@@ -7962,7 +8038,7 @@ fn decode_inter_block8(
         usize::from(neighbours.above_skip_mode[c]) + usize::from(neighbours.left_skip_mode[r]);
     let skip_mode = skip_mode_present && dec.symbol(&mut cdfs.skip_mode[skip_mode_ctx]) == 1;
     if skip_mode {
-        SKIP_MODE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        SKIP_MODE_HITS.with(|c| c.set(c.get() + 1));
     }
 
     let skip_ctx = usize::from(above_skip) + usize::from(left_skip);
@@ -8079,7 +8155,7 @@ fn decode_inter_block8(
                         // leaf's own comment.
                         let wedge_index = dec.symbol(&mut cdfs.wedge_idx[3]);
                         let wedge_sign = dec.literal(1);
-                        WEDGE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        WEDGE_HITS.with(|c| c.set(c.get() + 1));
                         wedge_mask = Some(
                             crate::wedge::wedge_masks()
                                 .codebook(SIDE)
@@ -8089,7 +8165,7 @@ fn decode_inter_block8(
                         let mask_type = dec.literal(1);
                         diffwtd_mask_type = Some(mask_type as u8);
                     }
-                    MASKED_COMPOUND_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    MASKED_COMPOUND_HITS.with(|c| c.set(c.get() + 1));
                 }
                 // corner-cut (lane-av1comp r16/r17, lane-av1blend r1): same
                 // reference-slot defect as the 16x16 leaf's own mask above
@@ -8471,7 +8547,7 @@ fn decode_inter_block8(
                     // lane-wii r2: same adapting `wedge_index` symbol as the
                     // 16/32 leaf, fixed sign 0 -- see that site's comment.
                     let wedge_index = dec.symbol(&mut cdfs.wedge_idx[3]);
-                    WII_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    WII_HITS.with(|c| c.set(c.get() + 1));
                     wedge_mask = Some((
                         crate::wedge::wedge_masks()
                             .codebook(SIDE)
@@ -8479,7 +8555,7 @@ fn decode_inter_block8(
                         SIDE,
                     ));
                 } else {
-                    INTERINTRA_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    INTERINTRA_HITS.with(|c| c.set(c.get() + 1));
                 }
                 interintra_mode = Some(ii);
             }
@@ -8509,11 +8585,11 @@ fn decode_inter_block8(
                     0 => {}
                     1 => {
                         obmc_selected = true;
-                        OBMC_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        OBMC_HITS_8.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        OBMC_HITS.with(|c| c.set(c.get() + 1));
+                        OBMC_HITS_8.with(|c| c.set(c.get() + 1));
                     }
                     _ => {
-                        WARP_SELECTED_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        WARP_SELECTED_HITS.with(|c| c.set(c.get() + 1));
                         return Err(unsupported(
                             "an 8x8 leaf that coded WARPED_CAUSAL (motion_mode == 2): \
                              av1_find_projection/the affine warp filter are not \
@@ -8525,8 +8601,8 @@ fn decode_inter_block8(
                 // `default_obmc_cdf`'s own index: square bsize 8/16/32/64 -> 0/1/2/3.
                 obmc_selected = dec.symbol(&mut cdfs.obmc[0]) == 1;
                 if obmc_selected {
-                    OBMC_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    OBMC_HITS_8.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    OBMC_HITS.with(|c| c.set(c.get() + 1));
+                    OBMC_HITS_8.with(|c| c.set(c.get() + 1));
                 }
             }
         }
@@ -9459,7 +9535,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                         // mi-granular `left_side_mi` rows of a last-block-in-
                         // tile strip leak 32-vs-16 only until the per-tile
                         // `Neighbours::new` reset.
-                        EXTENDED_PARTITION_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        EXTENDED_PARTITION_HITS.with(|c| c.set(c.get() + 1));
                         let at32 = at;
                         decode_inter_block(
                             &mut dec,
@@ -9628,7 +9704,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                         // (mvstack.rs, `motion_mode_eligible`) now derive from
                         // `write_w`/`write_h`'s true 32x16 footprint -- the
                         // pin's fix (r1's finding).
-                        RECT_PARTITION_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        RECT_PARTITION_HITS.with(|c| c.set(c.get() + 1));
                         decode_inter_block(
                             &mut dec,
                             &mut cdfs,
@@ -9729,7 +9805,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                     PARTITION_VERT => {
                         // lane-rect r2: mirror of PARTITION_HORZ above with
                         // width/height swapped.
-                        RECT_PARTITION_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        RECT_PARTITION_HITS.with(|c| c.set(c.get() + 1));
                         decode_inter_block(
                             &mut dec,
                             &mut cdfs,
@@ -9831,7 +9907,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                         // lane-partab r1: two 16x16 squares on top + a true
                         // 32x16 strip below (libaom decode_partition
                         // PARTITION_HORZ_A: TL, TR, bottom strip).
-                        PARTAB_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        PARTAB_HITS.with(|c| c.set(c.get() + 1));
                         decode_inter_block(
                             &mut dec,
                             &mut cdfs,
@@ -9988,7 +10064,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                     PARTITION_VERT_A => {
                         // lane-partab r1: mirror of PARTITION_HORZ_A with
                         // width/height swapped (TL, BL, right 16x32 strip).
-                        PARTAB_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        PARTAB_HITS.with(|c| c.set(c.get() + 1));
                         decode_inter_block(
                             &mut dec,
                             &mut cdfs,
@@ -10146,7 +10222,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                         // lane-partab r1: true 16x32 strip on the left + two
                         // 16x16 squares on the right (libaom decode_partition
                         // PARTITION_VERT_B: left strip, TR, BR).
-                        PARTAB_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        PARTAB_HITS.with(|c| c.set(c.get() + 1));
                         decode_inter_block(
                             &mut dec,
                             &mut cdfs,
