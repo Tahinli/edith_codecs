@@ -1111,13 +1111,38 @@ mod tests {
     /// default dev-build path; the test skips (not fails) when neither this
     /// nor `ffmpeg` is present.
     fn aomenc_path() -> std::path::PathBuf {
-        std::env::var_os("EC_AV1_AOMENC")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| "/tmp/libaom-src/build/encoder/aomenc".into())
+        if let Some(p) = std::env::var_os("EC_AV1_AOMENC") {
+            return std::path::PathBuf::from(p);
+        }
+        // The oracle used to live only under `/tmp`, which this box's tmpfs
+        // guard reclaims -- when it did, all 20 aomenc gates below went
+        // silently vacuous (SKIP, suite still green). The durable location
+        // is provisioned by `scripts/build-aom-oracle.sh`; the `/tmp` path
+        // stays last as a legacy fallback.
+        let mut candidates = Vec::new();
+        if let Some(home) = std::env::var_os("HOME") {
+            candidates.push(std::path::PathBuf::from(&home).join(".cache/aom-oracle/build/aomenc"));
+        }
+        candidates.push("/tmp/libaom-src/build/encoder/aomenc".into());
+        candidates
+            .iter()
+            .find(|p| p.is_file())
+            .cloned()
+            .unwrap_or_else(|| candidates.remove(0))
     }
 
+    /// Whether the aomenc oracle is present. Absence normally SKIPs (a
+    /// checkout without the oracle should still run the rest of the suite),
+    /// but `EC_AV1_REQUIRE_AOMENC=1` turns it into a hard failure so a batch
+    /// run cannot report green off 20 skipped gates.
     fn have_aomenc() -> bool {
-        aomenc_path().is_file()
+        let present = aomenc_path().is_file();
+        assert!(
+            present || std::env::var_os("EC_AV1_REQUIRE_AOMENC").is_none(),
+            "EC_AV1_REQUIRE_AOMENC is set but no aomenc at {} -- run scripts/build-aom-oracle.sh",
+            aomenc_path().display()
+        );
+        present
     }
 
     /// A real `aomenc` filter-intra fixture: every other intra mode disabled
