@@ -96,7 +96,105 @@ lines ~5346-5369) is wrong.
   this round (turn budget spent on the above investigation). Deferred to
   round 3.
 
-## Open (round 3 charter should start here)
+## Round 3 (05b20f9)
+
+### Fixed: the partition-context bug the round-2 finding pointed at
+libaom's `update_ext_partition_context` (`av1_common_int.h:1500`) only
+writes anything when `bsize >= BLOCK_8X8`; the four recursive
+`decode_partition(BLOCK_4X4)` calls a real `PARTITION_SPLIT` at 8x8
+produces are no-ops for context purposes. The *one* write that happens is
+at the 8x8 level itself, with `subsize = BLOCK_4X4`:
+`partition_context_lookup[BLOCK_4X4] = {31, 31}` (bit0 = 1), vs
+`partition_context_lookup[BLOCK_8X8] = {30, 30}` (bit0 = 0) for a plain
+`PARTITION_NONE` 8x8. `decode_leaf_split4`'s chroma-tail (the block that
+sets `left_side_mi`/`above_side_mi` for the whole 8x8 group, `decode.rs`
+~5350-5354) had copied `decode_leaf8`'s own TX4-branch value (`8`,
+correct there -- that block is still one whole `BLOCK_8X8`, just with a
+split *transform*) instead of the value that makes
+`partition_ctx_mi`'s `left_side_mi[mi_r]*2 <= side` bit read as 1, which
+needs `<= 4`. Changed both writes to `4`. Verified directly against the
+libaom source at `~/.cache/aom-oracle/src/av1/common/av1_common_int.h:1441-1552`
+(`update_partition_context`/`update_ext_partition_context`/
+`partition_plane_context`), not by re-deriving it by hand.
+
+**Effect measured**: before the fix, every attempt that hit a real SPLIT
+crashed the very next sibling 8x8's `partition_w8` read (round 2's
+finding). After the fix, `EC_AV1_TRACE=1` on the dumped stream that
+previously crashed shows the sibling reads land on the *correct* context
+(cross-checked bit-for-bit against instrumented aomdec's `EC_PART` trace
+at the equivalent block, ctx encodes the same left/above bits both sides)
+and the whole stream decodes to completion with `Ok`, no error, no panic.
+This is real, but not sufficient -- see below.
+
+### Range-ladder result: gate still RED, and the divergence is UPSTREAM of any sub8 code
+Ran the decisive check the charter asked for: rebuilt
+`~/.cache/aom-oracle` (rungs 2/5/10 already present in the source,
+`EC_PART`/`EC_PART_VAL`/`EC_ISTEP` per-symbol range ladder), decoded the
+one dumped failing stream (seed=139, cq=12, 64x64,
+`--enable-rect-partitions=0 --min-partition-size=4 --max-partition-size=8`)
+through instrumented `aomdec` and compared trace order against our own
+`EC_AV1_TRACE` output block by block.
+
+**First divergence**: the 16x16-level partition read at SUB-unit
+`at16=(0,1)` (mi=(0,4)), the *second* 16x16 quadrant of the first 32x32
+block -- i.e. it fires before our decoder has executed one single line of
+`decode_leaf_split4`/`read_intra_mode_sub8` (the actual sub8x8-SPLIT in
+this stream is at mi=(2,6), inside quadrant (0,1)'s own subtree, per
+aomdec's `EC_PART_VAL mi_row=2 mi_col=6 bsize=3 value=3`). aomdec reads
+`PARTITION_SPLIT` (value=3) there; ours reads `PARTITION_NONE` (value=0).
+The context bits agree (both decode to left=1, above=0, aomdec's combined
+`ctx=6` and ours `ctx=2` are the same left/above pair under different
+context-array encodings) -- so this is not a context bug, it is either a
+CDF-adaptation drift carried in from the *first* 16x16 quadrant's own
+four 8x8 leaves (all plain `decode_leaf8`, zero sub8 code touched) or a
+genuine range/probability desync from something even earlier that this
+round did not get to trace symbol-by-symbol (no per-symbol trace exists
+in our decoder for `decode_leaf8`'s own mode-info reads, only for the
+`read_intra_mode_sub8` leaves added in round 1 -- that instrumentation
+gap is why the ladder stops here this round).
+
+**This changes the round-2 hypothesis**: the failure is very likely NOT
+inside `decode_leaf_split4`/`read_intra_mode_sub8` at all. It reproduces
+on this stream before any of that code has run. Whatever the true root
+cause is, it sits in code shared by every 8x8/16x16 intra block in this
+recipe (`decode_leaf8`, `partition_w16`/`partition_w32` context, or CDF
+adaptation for `kf_y_mode`/`uv_mode`/`skip`), and `--min-partition-size=4`
+is what surfaces it (this exact recipe may not be exercised by any other
+gate). Round 4 should NOT keep assuming the bug is sub8-owned code --
+start by adding the same per-symbol trace (`skip`/`mode`/`uv_mode`/
+`angle_delta`) to `decode_leaf8` itself and ladder the *first* 16x16
+quadrant's four 8x8 leaves symbol-by-symbol against aomdec's `EC_ISTEP`
+trace before looking at sub8 code again.
+
+### Suite / build state at HEAD (05b20f9)
+- `cargo check --workspace --all-targets`: clean.
+- Gate `a_real_aomenc_stream_with_a_sub8_split_decodes_pixel_exact`:
+  still FAILS, now for a different, better-localized reason (see above).
+  Only 1/40 attempts this round both fired a real SPLIT and reached the
+  pixel comparison at all (39/40 either fired no SPLIT -- most now decode
+  clean with `PARTITION_NONE` chosen throughout the min-partition-size=4
+  region, itself now consistent with correct decoding since they don't
+  panic -- or the run's own aomenc/decode plumbing skipped). The one that
+  did fire failed pixel-exact per the finding above.
+- `cargo test -p ec-av1 --lib`: not completed this round (turn budget
+  spent on the range-ladder trace above); deferred to round 4, run it
+  first thing.
+- Debug-only instrumentation (`EC_AV1_DUMP_SUB8` stream dump in
+  `stream.rs`, temp `dec.rng()` trace print attempt in `decode.rs`) was
+  added, used, and **reverted** this round -- not left in the tree.
+
+## Open (round 4 charter should start here)
+- fix-now candidate: root cause is upstream of sub8's own code (see
+  "changes the round-2 hypothesis" above) -- add per-symbol trace to
+  `decode_leaf8` and ladder against aomdec `EC_ISTEP` on the first 16x16
+  quadrant before touching `decode_leaf_split4` again.
+- `cargo test -p ec-av1 --lib` full run: not done this round, do it first.
+- Hunger Games extract probe (charter step 4): not reached this round --
+  the gate is still red and the 10-bit wall in this branch (main merged
+  10-bit at 5636fd2, this branch has not) makes it low-value until the
+  above is fixed.
+
+## Open (carried from round 2, unchanged)
 - fix-now candidate: the desync in `decode_leaf_split4`/
   `read_intra_mode_sub8` (see "the actual finding" above) -- root cause,
   not yet found.
