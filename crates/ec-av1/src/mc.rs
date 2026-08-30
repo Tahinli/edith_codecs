@@ -600,7 +600,7 @@ pub fn blend_masked_compound(
 /// off-by-one from double rounding.
 #[test]
 fn compound_intermediate_whole_pel_identity_round_trips_through_combine() {
-    let reference = vec![100u8; 16 * 16];
+    let reference = vec![100u16; 16 * 16];
     let mut pred0 = vec![0i32; 16];
     predict_compound_intermediate(
         &reference,
@@ -618,7 +618,7 @@ fn compound_intermediate_whole_pel_identity_round_trips_through_combine() {
     assert!(pred0.iter().all(|&v| v == 1600), "{pred0:?}");
 
     let pred1 = pred0.clone();
-    let mut dst = vec![0u8; 16];
+    let mut dst = vec![0u16; 16];
     combine_compound(&pred0, &pred1, 8, 8, &mut dst);
     assert!(dst.iter().all(|&v| v == 100), "{dst:?}");
 }
@@ -670,9 +670,11 @@ mod tests {
         // real (0, 0) coordinates -- clamping then reproduces the identical
         // extended border the dump already captured.
         let stride = 24;
-        let mut reference = vec![0u8; stride * 24];
+        let mut reference = vec![0u16; stride * 24];
         for (r, row) in window.iter().enumerate() {
-            reference[r * stride..r * stride + stride].copy_from_slice(row);
+            for (c, &v) in row.iter().enumerate() {
+                reference[r * stride + c] = u16::from(v);
+            }
         }
         // predict()'s own edge clamp starts at true (0,0); shift so the
         // dumped window's row/col 4 lands there by biasing x_q4/y_q4's
@@ -682,7 +684,7 @@ mod tests {
         // whole-pel part of x_q4/y_q4 by +4 to land on real (0,0).
         let x_q4 = (4 + 0) * 16 + 15; // real block x0=0, xfrac=15
         let y_q4 = (4 + 0) * 16 + 7; // real block y0=0, yfrac=7
-        let mut dst = vec![0u8; 16 * 16];
+        let mut dst = vec![0u16; 16 * 16];
         predict_with_filter(
             &reference,
             stride,
@@ -696,7 +698,7 @@ mod tests {
             &mut dst,
         );
         #[rustfmt::skip]
-        let expected_row0: [u8; 16] =
+        let expected_row0: [u16; 16] =
             [114,114,114,114,115,115,115,116,116,116,116,116,117,117,116,116];
         assert_eq!(
             &dst[0..16],
@@ -704,7 +706,7 @@ mod tests {
             "row0 vs aomdec's real av1_convolve_2d_sr_c output"
         );
         #[rustfmt::skip]
-        let expected_row15: [u8; 16] =
+        let expected_row15: [u16; 16] =
             [103,103,104,104,104,105,105,106,106,106,107,107,107,107,107,107];
         assert_eq!(
             &dst[15 * 16..15 * 16 + 16],
@@ -717,8 +719,8 @@ mod tests {
     fn integer_mv_is_identity() {
         let width = 12;
         let height = 12;
-        let reference: Vec<u8> = (0..width * height).map(|i| (i * 7 % 251) as u8).collect();
-        let mut dst = vec![0u8; 6 * 6];
+        let reference: Vec<u16> = (0..width * height).map(|i| (i * 7 % 251) as u16).collect();
+        let mut dst = vec![0u16; 6 * 6];
         predict(
             &reference,
             width,
@@ -746,10 +748,10 @@ mod tests {
         // Step 2 so every half-pel position lands on an exact integer.
         let width = 16;
         let height = 16;
-        let reference: Vec<u8> = (0..width * height)
-            .map(|i| (2 * (i % width)) as u8)
+        let reference: Vec<u16> = (0..width * height)
+            .map(|i| (2 * (i % width)) as u16)
             .collect();
-        let mut dst = vec![0u8; 4 * 4];
+        let mut dst = vec![0u16; 4 * 4];
         // Half-pel in x only: fraction 8/16, integer part at column 5.
         predict(
             &reference,
@@ -778,10 +780,10 @@ mod tests {
     fn constant_plane_has_unit_dc_gain_at_every_subpel_position() {
         let width = 20;
         let height = 20;
-        let reference = vec![142u8; width * height];
+        let reference = vec![142u16; width * height];
         for yfrac in 0..16 {
             for xfrac in 0..16 {
-                let mut dst = vec![0u8; 5 * 5];
+                let mut dst = vec![0u16; 5 * 5];
                 predict(
                     &reference,
                     width,
@@ -810,11 +812,11 @@ mod tests {
         // it happened to produce two merely-different numbers.
         let width = 10;
         let height = 10;
-        let reference: Vec<u8> = (0..height)
-            .flat_map(|y| (0..width).map(move |x| (20 * x + 4 * y) as u8))
+        let reference: Vec<u16> = (0..height)
+            .flat_map(|y| (0..width).map(move |x| (20 * x + 4 * y) as u16))
             .collect();
 
-        let mut horiz = vec![0u8; 4 * 4];
+        let mut horiz = vec![0u16; 4 * 4];
         predict(
             &reference,
             width,
@@ -826,7 +828,7 @@ mod tests {
             4,
             &mut horiz,
         );
-        let mut vert = vec![0u8; 4 * 4];
+        let mut vert = vec![0u16; 4 * 4];
         predict(
             &reference,
             width,
@@ -865,8 +867,8 @@ mod tests {
     fn mv_past_the_edge_clamps_instead_of_panicking() {
         let width = 8;
         let height = 8;
-        let reference: Vec<u8> = (0..width * height).map(|i| (i * 3 % 200) as u8).collect();
-        let mut dst = vec![0u8; 4 * 4];
+        let reference: Vec<u16> = (0..width * height).map(|i| (i * 3 % 200) as u16).collect();
+        let mut dst = vec![0u16; 4 * 4];
         // Whole-sample position far above and to the left of the plane, with
         // an odd fraction so both filter passes exercise the clamp.
         predict(
@@ -886,7 +888,7 @@ mod tests {
             "an MV past the top-left edge must clamp to the corner sample, got {dst:?}"
         );
 
-        let mut dst2 = vec![0u8; 4 * 4];
+        let mut dst2 = vec![0u16; 4 * 4];
         predict(
             &reference,
             width,
