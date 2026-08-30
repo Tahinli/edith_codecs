@@ -351,20 +351,23 @@ fn process_single_ref_mv_candidate(
     candidate: &MiInfo,
     ref_frame: i8,
     sign_bias_table: &SignBiasTable,
-    gm: &GmMvTable,
     candidates: &mut Vec<StackEntry>,
 ) {
     if !candidate.is_inter {
         return;
     }
-    let mut slots = [(candidate.ref_frame, candidate.mv, candidate.is_global_mv0); 2];
+    // libaom's `process_single_ref_mv_candidate` (mvref_common.c ~440-475)
+    // reads `candidate->mv[rf_idx]` unconditionally here -- unlike
+    // `add_ref_mv_candidate`'s row/col/corner scans, this extension pass
+    // never checks `is_global_mv_block`/substitutes `gm_mv_candidates`.
+    let mut slots = [(candidate.ref_frame, candidate.mv); 2];
     let mut n_slots = 1;
     if let (Some(rf1), Some(mv1)) = (candidate.ref_frame1, candidate.mv1) {
-        slots[1] = (rf1, mv1, candidate.is_global_mv1);
+        slots[1] = (rf1, mv1);
         n_slots = 2;
     }
-    for &(rf, mv, is_global) in &slots[..n_slots] {
-        let mut this_mv = if is_global { gm_mv(gm, rf) } else { mv };
+    for &(rf, mv) in &slots[..n_slots] {
+        let mut this_mv = mv;
         if sign_bias(sign_bias_table, rf) != sign_bias(sign_bias_table, ref_frame) {
             this_mv = (-this_mv.0, -this_mv.1);
         }
@@ -971,7 +974,7 @@ pub fn find_mv_stack_with_sign_bias(
             let cand = grid.get(mi_row - 1, mi_col + idx);
             let step = cand.map_or(1, |c| c.size).max(1);
             if let Some(c) = cand {
-                process_single_ref_mv_candidate(c, ref_frame, sign_bias_table, gm, &mut candidates);
+                process_single_ref_mv_candidate(c, ref_frame, sign_bias_table, &mut candidates);
             }
             idx += step;
         }
@@ -982,7 +985,7 @@ pub fn find_mv_stack_with_sign_bias(
             let cand = grid.get(mi_row + idx, mi_col - 1);
             let step = cand.map_or(1, |c| c.size_h).max(1);
             if let Some(c) = cand {
-                process_single_ref_mv_candidate(c, ref_frame, sign_bias_table, gm, &mut candidates);
+                process_single_ref_mv_candidate(c, ref_frame, sign_bias_table, &mut candidates);
             }
             idx += step;
         }
@@ -1154,6 +1157,7 @@ fn scan_row_compound(
     row_offset: isize,
     max_row_offset: isize,
     ref_frame: (i8, i8),
+    gm: &GmMvTable,
     candidates: &mut Vec<CompoundStackEntry>,
     newmv_count: &mut u32,
     processed_rows: &mut usize,
@@ -1188,8 +1192,8 @@ fn scan_row_compound(
             found = true;
             add_compound_candidate(
                 candidates,
-                info.mv,
-                info.mv1.unwrap_or((0, 0)),
+                if info.is_global_mv0 { gm_mv(gm, ref_frame.0) } else { info.mv },
+                if info.is_global_mv1 { gm_mv(gm, ref_frame.1) } else { info.mv1.unwrap_or((0, 0)) },
                 len as u32 * weight,
             );
             *newmv_count += u32::from(info.is_new_mv);
@@ -1210,6 +1214,7 @@ fn scan_col_compound(
     col_offset: isize,
     max_col_offset: isize,
     ref_frame: (i8, i8),
+    gm: &GmMvTable,
     candidates: &mut Vec<CompoundStackEntry>,
     newmv_count: &mut u32,
     processed_cols: &mut usize,
@@ -1244,8 +1249,8 @@ fn scan_col_compound(
             found = true;
             add_compound_candidate(
                 candidates,
-                info.mv,
-                info.mv1.unwrap_or((0, 0)),
+                if info.is_global_mv0 { gm_mv(gm, ref_frame.0) } else { info.mv },
+                if info.is_global_mv1 { gm_mv(gm, ref_frame.1) } else { info.mv1.unwrap_or((0, 0)) },
                 len as u32 * weight,
             );
             *newmv_count += u32::from(info.is_new_mv);
@@ -1256,12 +1261,14 @@ fn scan_col_compound(
 }
 
 /// The compound top-right probe ([`scan_top_right`]'s pair-matched twin).
+#[allow(clippy::too_many_arguments)]
 fn scan_top_right_compound(
     grid: &MiGrid,
     mi_row: usize,
     mi_col: usize,
     bw4: usize,
     ref_frame: (i8, i8),
+    gm: &GmMvTable,
     candidates: &mut Vec<CompoundStackEntry>,
     newmv_count: &mut u32,
 ) -> bool {
@@ -1276,8 +1283,8 @@ fn scan_top_right_compound(
     {
         add_compound_candidate(
             candidates,
-            info.mv,
-            info.mv1.unwrap_or((0, 0)),
+            if info.is_global_mv0 { gm_mv(gm, ref_frame.0) } else { info.mv },
+            if info.is_global_mv1 { gm_mv(gm, ref_frame.1) } else { info.mv1.unwrap_or((0, 0)) },
             CORNER_WEIGHT,
         );
         *newmv_count += u32::from(info.is_new_mv);
@@ -1292,6 +1299,7 @@ fn scan_corner_compound(
     mi_row: usize,
     mi_col: usize,
     ref_frame: (i8, i8),
+    gm: &GmMvTable,
     candidates: &mut Vec<CompoundStackEntry>,
     newmv_count: &mut u32,
 ) -> bool {
@@ -1305,8 +1313,8 @@ fn scan_corner_compound(
     {
         add_compound_candidate(
             candidates,
-            info.mv,
-            info.mv1.unwrap_or((0, 0)),
+            if info.is_global_mv0 { gm_mv(gm, ref_frame.0) } else { info.mv },
+            if info.is_global_mv1 { gm_mv(gm, ref_frame.1) } else { info.mv1.unwrap_or((0, 0)) },
             CORNER_WEIGHT,
         );
         *newmv_count += u32::from(info.is_new_mv);
@@ -1413,6 +1421,7 @@ fn combine_compound_candidates(lists: &CompoundRefLists) -> [((i32, i32), (i32, 
 /// ports of libaom's real behaviour as of r5 — see the inline comments at
 /// each site.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn find_mv_stack_compound(
     grid: &MiGrid,
     mi_row: usize,
@@ -1423,6 +1432,7 @@ pub fn find_mv_stack_compound(
     mi_cols: usize,
     mi_rows: usize,
     sign_bias_table: &SignBiasTable,
+    gm: &GmMvTable,
     tpl: Option<CompoundTplArgs>,
 ) -> CompoundMvStack {
     let mut candidates: Vec<CompoundStackEntry> = Vec::new();
@@ -1454,6 +1464,7 @@ pub fn find_mv_stack_compound(
             -1,
             max_row_offset,
             ref_frame,
+            gm,
             &mut candidates,
             &mut newmv_count,
             &mut processed_rows,
@@ -1467,6 +1478,7 @@ pub fn find_mv_stack_compound(
             -1,
             max_col_offset,
             ref_frame,
+            gm,
             &mut candidates,
             &mut newmv_count,
             &mut processed_cols,
@@ -1477,6 +1489,7 @@ pub fn find_mv_stack_compound(
         mi_col,
         bw4,
         ref_frame,
+        gm,
         &mut candidates,
         &mut newmv_count,
     );
@@ -1542,10 +1555,12 @@ pub fn find_mv_stack_compound(
                     let mv1 = cand1.map_or((0, 0), |c| c.mv);
                     if blk_row == 0 && blk_col == 0 {
                         first_sample_missing = false;
-                        first_sample_far = mv0.0.abs() >= 16
-                            || mv0.1.abs() >= 16
-                            || mv1.0.abs() >= 16
-                            || mv1.1.abs() >= 16;
+                        let this_gm0 = gm_mv(gm, ref_frame.0);
+                        let this_gm1 = gm_mv(gm, ref_frame.1);
+                        first_sample_far = (mv0.0 - this_gm0.0).abs() >= 16
+                            || (mv0.1 - this_gm0.1).abs() >= 16
+                            || (mv1.0 - this_gm1.0).abs() >= 16
+                            || (mv1.1 - this_gm1.1).abs() >= 16;
                     }
                     add_compound_candidate(&mut candidates, mv0, mv1, 2);
                 }
@@ -1565,6 +1580,7 @@ pub fn find_mv_stack_compound(
         mi_row,
         mi_col,
         ref_frame,
+        gm,
         &mut candidates,
         &mut dummy_newmv_count,
     );
@@ -1583,6 +1599,7 @@ pub fn find_mv_stack_compound(
                 row_offset,
                 max_row_offset,
                 ref_frame,
+                gm,
                 &mut candidates,
                 &mut dummy_newmv_count,
                 &mut processed_rows,
@@ -1600,6 +1617,7 @@ pub fn find_mv_stack_compound(
                 col_offset,
                 max_col_offset,
                 ref_frame,
+                gm,
                 &mut candidates,
                 &mut dummy_newmv_count,
                 &mut processed_cols,
