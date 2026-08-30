@@ -235,25 +235,16 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         // Neighbours::delta_lf_grid -> lf_level) are now read and applied;
         // no whole-frame refusal needed here anymore.
         //
-        // Both AV1 files in this box's own library (a 2160p HDR10 encode and a
-        // 1080p one, probed 2026-08-30 through `examples/decode_probe`) are
-        // `yuv420p10le`, and every buffer this decoder reconstructs into --
-        // `Picture`'s `y`/`u`/`v` -- is `Vec<u8>`. A 10- or 12-bit stream would
-        // therefore be reconstructed into 8-bit samples and compared against a
-        // 10-bit reference, which is silent wrongness rather than a desync: no
-        // symbol goes unread, the pixels are just quietly truncated. Refuse it
-        // by name until the planes are widened. `bit_depth` defaults to 8 when
-        // no sequence header has been seen, which is the existing behaviour for
-        // every fixture in this crate.
-        if parser
-            .sequence_header()
-            .is_some_and(|seq| seq.color_config.bit_depth != 8)
-        {
-            return Err(Error::unsupported(
-                "AV1 decode_stream",
-                "a stream whose bit depth is not 8 (this decoder reconstructs into 8-bit planes)",
-            ));
-        }
+        // lane-hbd r5: `Picture`'s `y`/`u`/`v` are `u16` now (widened an
+        // earlier round), `BIT_DEPTH` is wired from this frame's own sequence
+        // header (`set_bit_depth` above), and a real `aomenc --bit-depth=10`
+        // stream decodes pixel-exact against ffmpeg's own decode of the same
+        // bytes (`a_real_aomenc_10bit_stream_decodes_pixel_exact`). The
+        // blanket refusal that used to be here is gone; `film_grain.rs` and
+        // `superres.rs` still refuse narrowly by name (their own hardcoded
+        // 8-bit LUT/clamp, above), and any other rounding gap 10-bit exposes
+        // will show up as a real pixel mismatch, not a silent truncation --
+        // the whole reason the widen (and this wiring) happened.
         if header.segmentation.enabled {
             return Err(Error::unsupported(
                 "AV1 decode_stream",
@@ -913,6 +904,68 @@ mod tests {
                     y: out.stdout[base..base + luma].iter().map(|&v| u16::from(v)).collect(),
                     u: out.stdout[base + luma..base + luma + chroma].iter().map(|&v| u16::from(v)).collect(),
                     v: out.stdout[base + luma + chroma..base + frame_bytes].iter().map(|&v| u16::from(v)).collect(),
+                }
+            })
+            .collect()
+    }
+
+    /// As [`ffmpeg_decode_sequence`], but for a `yuv420p10le` stream: samples
+    /// are 2-byte little-endian, one full 16-bit range regardless of the
+    /// stream's real 10-bit depth (ffmpeg's rawvideo muxer never packs to the
+    /// bit depth). The 8-bit helper above stays untouched -- every existing
+    /// gate depends on it.
+    fn ffmpeg_decode_sequence_10bit(
+        stream: &[u8],
+        width: usize,
+        height: usize,
+        frames: usize,
+    ) -> Vec<Pic> {
+        let mut child = Command::new("ffmpeg")
+            .args([
+                "-v", "error", "-f", "obu", "-i", "-", "-f", "rawvideo", "-pix_fmt",
+                "yuv420p10le", "-",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("ffmpeg failed to start");
+        child
+            .stdin
+            .take()
+            .expect("ffmpeg stdin")
+            .write_all(stream)
+            .expect("writing the stream to ffmpeg");
+        let out = child.wait_with_output().expect("ffmpeg failed to run");
+        assert!(
+            out.status.success(),
+            "ffmpeg refused the stream: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let (luma, chroma) = (width * height, width * height / 4);
+        let frame_samples = luma + 2 * chroma;
+        let frame_bytes = frame_samples * 2;
+        assert_eq!(
+            out.stdout.len(),
+            frame_bytes * frames,
+            "expected {frames} 4:2:0 10-bit frames, ffmpeg said: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        fn le16(bytes: &[u8]) -> Vec<u16> {
+            bytes
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect()
+        }
+        (0..frames)
+            .map(|i| {
+                let base = i * frame_bytes;
+                Pic {
+                    width,
+                    height,
+                    y: le16(&out.stdout[base..base + luma * 2]),
+                    u: le16(&out.stdout[base + luma * 2..base + luma * 2 + chroma * 2]),
+                    v: le16(&out.stdout[base + luma * 2 + chroma * 2..base + frame_bytes]),
                 }
             })
             .collect()
@@ -1748,6 +1801,115 @@ mod tests {
         assert_eq!(frames[0].y, ffmpeg_frames[0].y, "luma vs ffmpeg");
         assert_eq!(frames[0].u, ffmpeg_frames[0].u, "U vs ffmpeg");
         assert_eq!(frames[0].v, ffmpeg_frames[0].v, "V vs ffmpeg");
+    }
+
+    /// lane-hbd r5: a real `aomenc --bit-depth=10` stream, decoded through
+    /// this crate's own 10-bit planes (`Picture` widened to `u16` in an
+    /// earlier round) and checked pixel-exact against ffmpeg's own decode of
+    /// the identical bytes via [`ffmpeg_decode_sequence_10bit`]. Confirms
+    /// (hard-asserts, not just trusts) the sequence header this stream
+    /// actually parses to says `bit_depth == 10` before trusting any pixel
+    /// match -- a stream that silently fell back to 8-bit would still
+    /// "match" trivially.
+    #[test]
+    fn a_real_aomenc_10bit_stream_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_10bit_stream_decodes_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height) = (64usize, 64usize);
+        let y4m = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                &gradients_source(42, width, height, "duration=0.04:rate=25"),
+                "-pix_fmt",
+                "yuv420p10le",
+                "-strict",
+                "-1",
+                "-t",
+                "0.04",
+                "-f",
+                "yuv4mpegpipe",
+                "-",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ffmpeg failed to run");
+        assert!(
+            y4m.status.success(),
+            "ffmpeg failed to render the 10-bit fixture: {}",
+            String::from_utf8_lossy(&y4m.stderr)
+        );
+        let mut child = Command::new(aomenc_path())
+            .args([
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                "--cq-level=30",
+                "--cpu-used=0",
+                "--threads=1",
+                "--row-mt=0",
+                "--sb-size=64",
+                "--input-bit-depth=10",
+                "--bit-depth=10",
+                "--limit=1",
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("aomenc failed to start");
+        child
+            .stdin
+            .take()
+            .expect("aomenc stdin")
+            .write_all(&y4m.stdout)
+            .expect("writing y4m to aomenc");
+        let out = child.wait_with_output().expect("aomenc failed to run");
+        assert!(
+            out.status.success(),
+            "aomenc refused the 10-bit fixture: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stream = out.stdout;
+        // Confirm the sequence header this stream actually parses to before
+        // trusting any pixel comparison below.
+        let mut probe = Av1Parser::new();
+        let mut pos = 0usize;
+        while pos < stream.len() && probe.sequence_header().is_none() {
+            let obu = probe.parse_obu(&stream[pos..]).unwrap();
+            pos += obu.total_size;
+        }
+        let seq = probe
+            .sequence_header()
+            .expect("stream has a sequence header OBU");
+        assert_eq!(
+            seq.color_config.bit_depth, 10,
+            "{NAME}: aomenc did not actually write a 10-bit sequence header"
+        );
+        let frames = match decode_stream(&stream) {
+            Ok(frames) => frames,
+            Err(e) => panic!("{NAME}: decode_stream refused a real 10-bit stream: {e}"),
+        };
+        let ffmpeg_frames = ffmpeg_decode_sequence_10bit(&stream, width, height, 1);
+        assert_eq!(frames[0].y, ffmpeg_frames[0].y, "luma vs ffmpeg (10-bit)");
+        assert_eq!(frames[0].u, ffmpeg_frames[0].u, "U vs ffmpeg (10-bit)");
+        assert_eq!(frames[0].v, ffmpeg_frames[0].v, "V vs ffmpeg (10-bit)");
     }
 
     /// A real `aomenc` palette-**UV** fixture (lane-palette2 r2): `testsrc2`
