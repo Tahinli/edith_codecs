@@ -38,7 +38,7 @@ use crate::mvstack::{
     single_ref_p6_ctx, uni_comp_ref_p1_ctx,
 };
 use crate::tile::{INTRA_MODE_CTX, block_grid, has_half};
-use crate::transform::{TxType, dequant_and_inverse_typed};
+use crate::transform::{TxType, dequant_and_inverse_typed, dequant_and_inverse_typed_wh};
 
 const PARTITION_NONE: usize = 0;
 const PARTITION_HORZ: usize = 1;
@@ -270,6 +270,17 @@ static RECT_PARTITION_HITS: std::sync::atomic::AtomicUsize =
 /// Current value of [`RECT_PARTITION_HITS`].
 pub(crate) fn rect_partition_hits() -> usize {
     RECT_PARTITION_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// lane-rectwire r2: how many `PARTITION_HORZ`/`VERT` strips actually decoded
+/// real (non-skip) coefficients through [`read_coeffs_rect`] -- proves the
+/// rect coefficient reader itself fired, not just the strip-level partition
+/// symbol [`RECT_PARTITION_HITS`] already counts.
+static RECT_COEFF_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Current value of [`RECT_COEFF_HITS`].
+pub(crate) fn rect_coeff_hits() -> usize {
+    RECT_COEFF_HITS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// lane-partab r1: how many 32x32 quadrants decoded an AB partition
@@ -616,6 +627,145 @@ fn br_ctx(grid: &[i32], side: usize, row: usize, col: usize, class: TxClass) -> 
     if near_origin { mag + 7 } else { mag + 14 }
 }
 
+/// `Default_Scan_32x16` (spec 8.4.2, libaom `scan.c`'s `default_scan_32x16`):
+/// transposed from libaom's column-major buffer into this decoder's row-major
+/// `pos = row * 32 + col` (lane-rectwire, verified as a bijection of `0..512`
+/// against the real table). Not the square zigzag formula generalized to
+/// unequal `w`/`h` -- checked and that does NOT reproduce this table.
+const SCAN_32X16: [u16; 512] = [
+    0, 32, 1, 64, 33, 2, 96, 65, 34, 3, 128, 97, 66, 35, 4, 160, 129, 98, 67, 36, 5, 192, 161,
+    130, 99, 68, 37, 6, 224, 193, 162, 131, 100, 69, 38, 7, 256, 225, 194, 163, 132, 101, 70, 39,
+    8, 288, 257, 226, 195, 164, 133, 102, 71, 40, 9, 320, 289, 258, 227, 196, 165, 134, 103, 72,
+    41, 10, 352, 321, 290, 259, 228, 197, 166, 135, 104, 73, 42, 11, 384, 353, 322, 291, 260, 229,
+    198, 167, 136, 105, 74, 43, 12, 416, 385, 354, 323, 292, 261, 230, 199, 168, 137, 106, 75, 44,
+    13, 448, 417, 386, 355, 324, 293, 262, 231, 200, 169, 138, 107, 76, 45, 14, 480, 449, 418,
+    387, 356, 325, 294, 263, 232, 201, 170, 139, 108, 77, 46, 15, 481, 450, 419, 388, 357, 326,
+    295, 264, 233, 202, 171, 140, 109, 78, 47, 16, 482, 451, 420, 389, 358, 327, 296, 265, 234,
+    203, 172, 141, 110, 79, 48, 17, 483, 452, 421, 390, 359, 328, 297, 266, 235, 204, 173, 142,
+    111, 80, 49, 18, 484, 453, 422, 391, 360, 329, 298, 267, 236, 205, 174, 143, 112, 81, 50, 19,
+    485, 454, 423, 392, 361, 330, 299, 268, 237, 206, 175, 144, 113, 82, 51, 20, 486, 455, 424,
+    393, 362, 331, 300, 269, 238, 207, 176, 145, 114, 83, 52, 21, 487, 456, 425, 394, 363, 332,
+    301, 270, 239, 208, 177, 146, 115, 84, 53, 22, 488, 457, 426, 395, 364, 333, 302, 271, 240,
+    209, 178, 147, 116, 85, 54, 23, 489, 458, 427, 396, 365, 334, 303, 272, 241, 210, 179, 148,
+    117, 86, 55, 24, 490, 459, 428, 397, 366, 335, 304, 273, 242, 211, 180, 149, 118, 87, 56, 25,
+    491, 460, 429, 398, 367, 336, 305, 274, 243, 212, 181, 150, 119, 88, 57, 26, 492, 461, 430,
+    399, 368, 337, 306, 275, 244, 213, 182, 151, 120, 89, 58, 27, 493, 462, 431, 400, 369, 338,
+    307, 276, 245, 214, 183, 152, 121, 90, 59, 28, 494, 463, 432, 401, 370, 339, 308, 277, 246,
+    215, 184, 153, 122, 91, 60, 29, 495, 464, 433, 402, 371, 340, 309, 278, 247, 216, 185, 154,
+    123, 92, 61, 30, 496, 465, 434, 403, 372, 341, 310, 279, 248, 217, 186, 155, 124, 93, 62, 31,
+    497, 466, 435, 404, 373, 342, 311, 280, 249, 218, 187, 156, 125, 94, 63, 498, 467, 436, 405,
+    374, 343, 312, 281, 250, 219, 188, 157, 126, 95, 499, 468, 437, 406, 375, 344, 313, 282, 251,
+    220, 189, 158, 127, 500, 469, 438, 407, 376, 345, 314, 283, 252, 221, 190, 159, 501, 470, 439,
+    408, 377, 346, 315, 284, 253, 222, 191, 502, 471, 440, 409, 378, 347, 316, 285, 254, 223, 503,
+    472, 441, 410, 379, 348, 317, 286, 255, 504, 473, 442, 411, 380, 349, 318, 287, 505, 474, 443,
+    412, 381, 350, 319, 506, 475, 444, 413, 382, 351, 507, 476, 445, 414, 383, 508, 477, 446, 415,
+    509, 478, 447, 510, 479, 511,
+];
+
+/// `Default_Scan_16x32`, this decoder's own row-major transcription (see
+/// [`SCAN_32X16`]'s doc comment).
+const SCAN_16X32: [u16; 512] = [
+    0, 1, 16, 2, 17, 32, 3, 18, 33, 48, 4, 19, 34, 49, 64, 5, 20, 35, 50, 65, 80, 6, 21, 36, 51,
+    66, 81, 96, 7, 22, 37, 52, 67, 82, 97, 112, 8, 23, 38, 53, 68, 83, 98, 113, 128, 9, 24, 39, 54,
+    69, 84, 99, 114, 129, 144, 10, 25, 40, 55, 70, 85, 100, 115, 130, 145, 160, 11, 26, 41, 56, 71,
+    86, 101, 116, 131, 146, 161, 176, 12, 27, 42, 57, 72, 87, 102, 117, 132, 147, 162, 177, 192,
+    13, 28, 43, 58, 73, 88, 103, 118, 133, 148, 163, 178, 193, 208, 14, 29, 44, 59, 74, 89, 104,
+    119, 134, 149, 164, 179, 194, 209, 224, 15, 30, 45, 60, 75, 90, 105, 120, 135, 150, 165, 180,
+    195, 210, 225, 240, 31, 46, 61, 76, 91, 106, 121, 136, 151, 166, 181, 196, 211, 226, 241, 256,
+    47, 62, 77, 92, 107, 122, 137, 152, 167, 182, 197, 212, 227, 242, 257, 272, 63, 78, 93, 108,
+    123, 138, 153, 168, 183, 198, 213, 228, 243, 258, 273, 288, 79, 94, 109, 124, 139, 154, 169,
+    184, 199, 214, 229, 244, 259, 274, 289, 304, 95, 110, 125, 140, 155, 170, 185, 200, 215, 230,
+    245, 260, 275, 290, 305, 320, 111, 126, 141, 156, 171, 186, 201, 216, 231, 246, 261, 276, 291,
+    306, 321, 336, 127, 142, 157, 172, 187, 202, 217, 232, 247, 262, 277, 292, 307, 322, 337, 352,
+    143, 158, 173, 188, 203, 218, 233, 248, 263, 278, 293, 308, 323, 338, 353, 368, 159, 174, 189,
+    204, 219, 234, 249, 264, 279, 294, 309, 324, 339, 354, 369, 384, 175, 190, 205, 220, 235, 250,
+    265, 280, 295, 310, 325, 340, 355, 370, 385, 400, 191, 206, 221, 236, 251, 266, 281, 296, 311,
+    326, 341, 356, 371, 386, 401, 416, 207, 222, 237, 252, 267, 282, 297, 312, 327, 342, 357, 372,
+    387, 402, 417, 432, 223, 238, 253, 268, 283, 298, 313, 328, 343, 358, 373, 388, 403, 418, 433,
+    448, 239, 254, 269, 284, 299, 314, 329, 344, 359, 374, 389, 404, 419, 434, 449, 464, 255, 270,
+    285, 300, 315, 330, 345, 360, 375, 390, 405, 420, 435, 450, 465, 480, 271, 286, 301, 316, 331,
+    346, 361, 376, 391, 406, 421, 436, 451, 466, 481, 496, 287, 302, 317, 332, 347, 362, 377, 392,
+    407, 422, 437, 452, 467, 482, 497, 303, 318, 333, 348, 363, 378, 393, 408, 423, 438, 453, 468,
+    483, 498, 319, 334, 349, 364, 379, 394, 409, 424, 439, 454, 469, 484, 499, 335, 350, 365, 380,
+    395, 410, 425, 440, 455, 470, 485, 500, 351, 366, 381, 396, 411, 426, 441, 456, 471, 486, 501,
+    367, 382, 397, 412, 427, 442, 457, 472, 487, 502, 383, 398, 413, 428, 443, 458, 473, 488, 503,
+    399, 414, 429, 444, 459, 474, 489, 504, 415, 430, 445, 460, 475, 490, 505, 431, 446, 461, 476,
+    491, 506, 447, 462, 477, 492, 507, 463, 478, 493, 508, 479, 494, 509, 495, 510, 511,
+];
+
+/// `Default_Scan_16x8`, this decoder's own row-major transcription (see
+/// [`SCAN_32X16`]'s doc comment).
+const SCAN_16X8: [u16; 128] = [
+    0, 16, 1, 32, 17, 2, 48, 33, 18, 3, 64, 49, 34, 19, 4, 80, 65, 50, 35, 20, 5, 96, 81, 66, 51,
+    36, 21, 6, 112, 97, 82, 67, 52, 37, 22, 7, 113, 98, 83, 68, 53, 38, 23, 8, 114, 99, 84, 69, 54,
+    39, 24, 9, 115, 100, 85, 70, 55, 40, 25, 10, 116, 101, 86, 71, 56, 41, 26, 11, 117, 102, 87,
+    72, 57, 42, 27, 12, 118, 103, 88, 73, 58, 43, 28, 13, 119, 104, 89, 74, 59, 44, 29, 14, 120,
+    105, 90, 75, 60, 45, 30, 15, 121, 106, 91, 76, 61, 46, 31, 122, 107, 92, 77, 62, 47, 123, 108,
+    93, 78, 63, 124, 109, 94, 79, 125, 110, 95, 126, 111, 127,
+];
+
+/// `Default_Scan_8x16`, this decoder's own row-major transcription (see
+/// [`SCAN_32X16`]'s doc comment).
+const SCAN_8X16: [u16; 128] = [
+    0, 1, 8, 2, 9, 16, 3, 10, 17, 24, 4, 11, 18, 25, 32, 5, 12, 19, 26, 33, 40, 6, 13, 20, 27, 34,
+    41, 48, 7, 14, 21, 28, 35, 42, 49, 56, 15, 22, 29, 36, 43, 50, 57, 64, 23, 30, 37, 44, 51, 58,
+    65, 72, 31, 38, 45, 52, 59, 66, 73, 80, 39, 46, 53, 60, 67, 74, 81, 88, 47, 54, 61, 68, 75, 82,
+    89, 96, 55, 62, 69, 76, 83, 90, 97, 104, 63, 70, 77, 84, 91, 98, 105, 112, 71, 78, 85, 92, 99,
+    106, 113, 120, 79, 86, 93, 100, 107, 114, 121, 87, 94, 101, 108, 115, 122, 95, 102, 109, 116,
+    123, 103, 110, 117, 124, 111, 118, 125, 119, 126, 127,
+];
+
+/// [`neighbour`] with independent `w` (row stride)/`h` (row-bound) extents
+/// (lane-rectwire, mirrors [`record_rect`](Neighbours::record_rect)'s
+/// asymmetric-extent pattern).
+fn neighbour_rect(grid: &[i32], w: usize, h: usize, row: usize, col: usize) -> i32 {
+    if row >= h || col >= w {
+        0
+    } else {
+        grid[row * w + col]
+    }
+}
+
+/// [`base_ctx`]'s `TxClass::TwoD` arm widened to `(w, h)` (lane-rectwire):
+/// the rect generalization is libaom's own comment in
+/// `get_nz_map_ctx_from_stats` (`txb_common.h:189-224`), reduces to the exact
+/// same [`cdf::NZ_MAP_CTX_OFFSET_32`] table when `w == h`. Never called for
+/// `V_DCT`/`H_DCT` -- geometrically impossible at the two size pairs
+/// [`decode_block_rect`] codes (see that function's own doc comment).
+fn base_ctx_rect(grid: &[i32], w: usize, h: usize, row: usize, col: usize) -> usize {
+    if row == 0 && col == 0 {
+        return 0;
+    }
+    const OFFSETS: [(usize, usize); 5] = [(1, 0), (0, 1), (1, 1), (2, 0), (0, 2)];
+    let mag: i32 = OFFSETS
+        .iter()
+        .map(|&(dr, dc)| neighbour_rect(grid, w, h, row + dr, col + dc).abs().min(3))
+        .sum();
+    let ctx = ((mag + 1) >> 1).min(4) as usize;
+    if w < h && row < 2 {
+        return ctx + 11;
+    }
+    if w > h && col < 2 {
+        return ctx + 16;
+    }
+    ctx + cdf::NZ_MAP_CTX_OFFSET_32[row.min(4)][col.min(4)] as usize
+}
+
+/// [`br_ctx`]'s `TxClass::TwoD` arm widened to `(w, h)` (lane-rectwire): the
+/// neighbour-offset math itself is shape-independent, only the boundary
+/// clamp needs the real bound in each axis.
+fn br_ctx_rect(grid: &[i32], w: usize, h: usize, row: usize, col: usize) -> usize {
+    let extra = neighbour_rect(grid, w, h, row + 1, col + 1).abs();
+    let mag = neighbour_rect(grid, w, h, row + 1, col).abs()
+        + neighbour_rect(grid, w, h, row, col + 1).abs()
+        + extra;
+    let mag = (((mag + 1) >> 1).min(6)) as usize;
+    if row == 0 && col == 0 {
+        return mag;
+    }
+    if row < 2 && col < 2 { mag + 7 } else { mag + 14 }
+}
+
 fn dc_vote(dc: Option<bool>) -> i32 {
     match dc {
         None => 0,
@@ -873,6 +1023,89 @@ fn read_coeffs(
             if trace {
                 eprintln!("TRACE golomb pos={pos} value={g}");
             }
+            level + g as i32
+        } else {
+            level
+        };
+        grid[pos as usize] = if negative { -level } else { level };
+    }
+    Ok((grid, tx_type))
+}
+
+/// [`read_coeffs`] widened to `(w, h)` (lane-rectwire), restricted to
+/// `TxClass::TwoD` -- the only class either rect size pair this decoder codes
+/// can ever produce (see [`decode_block_rect`]'s doc comment): refuses by
+/// name rather than guess-decode if a `tx_type` symbol or non-2D class ever
+/// shows up here, since neither `base_ctx_rect`/`br_ctx_rect` nor
+/// [`class_scan_table`] have a rect form for those.
+fn read_coeffs_rect(
+    dec: &mut SymbolDecoder,
+    coding: &mut TxbTables,
+    scan: &[u16],
+    w: usize,
+    h: usize,
+    skip_ctx: usize,
+    sign_ctx: usize,
+    default_tx_type: TxType,
+) -> Result<(Vec<i32>, TxType)> {
+    let mut grid = vec![0i32; w * h];
+    let all_zero = dec.symbol(&mut coding.txb_skip[skip_ctx]) == 1;
+    if all_zero {
+        return Ok((grid, TxType::DctDct));
+    }
+    if coding.tx_type.is_some() {
+        return Err(unsupported(
+            "a tx_type symbol on a rectangular transform (never expected at this size)",
+        ));
+    }
+    let tx_type = default_tx_type;
+    if TxClass::of(tx_type) != TxClass::TwoD {
+        return Err(unsupported(
+            "a non-2D tx class on a rectangular transform (never expected at this size)",
+        ));
+    }
+    let eob = read_eob(dec, coding, TxClass::TwoD);
+    let mut levels = vec![0i32; w * h];
+    for scan_idx in (0..eob).rev() {
+        let pos = scan[scan_idx] as usize;
+        let (row, col) = (pos / w, pos % w);
+        let level = if scan_idx == eob - 1 {
+            let ctx = eob_coeff_ctx(scan_idx, w * h);
+            dec.symbol(&mut coding.base_eob[ctx]) as i32 + 1
+        } else {
+            let ctx = base_ctx_rect(&levels, w, h, row, col);
+            dec.symbol(&mut coding.base[ctx]) as i32
+        };
+        let level = if level > NUM_BASE_LEVELS {
+            let ctx = br_ctx_rect(&levels, w, h, row, col);
+            let mut level = level;
+            let mut sent = 0;
+            loop {
+                let k = dec.symbol(&mut coding.br[ctx]) as i32;
+                level += k;
+                sent += BR_STEP;
+                if k < BR_STEP || sent >= COEFF_BASE_RANGE {
+                    break;
+                }
+            }
+            level
+        } else {
+            level
+        };
+        levels[pos] = level;
+    }
+    for &pos in &scan[..eob] {
+        let level = levels[pos as usize];
+        if level == 0 {
+            continue;
+        }
+        let negative = if pos == 0 {
+            dec.symbol(&mut coding.dc_sign[sign_ctx]) == 1
+        } else {
+            dec.literal(1) == 1
+        };
+        let level = if level.abs_diff(0) as i32 > MAX_BR_LEVEL {
+            let g = read_golomb(dec)?;
             level + g as i32
         } else {
             level
@@ -1336,6 +1569,35 @@ impl Neighbours {
         })
     }
 
+    /// [`Self::around`] with independent above (`w`)/left (`h`) extents, in
+    /// pixels -- lane-rectwire, mirrors [`Self::record_rect`]'s asymmetric
+    /// extent pattern for a true rectangular strip's own coefficient context.
+    fn around_rect(&self, (r, c): (usize, usize), w: usize, h: usize) -> [(bool, bool, i32); 3] {
+        self.around_mi_rect((r * (SUB / MI), c * (SUB / MI)), w, h)
+    }
+
+    /// [`Self::around_rect`] taking the block's position directly in 4x4
+    /// mode-info units, mirroring [`Self::around_mi`].
+    fn around_mi_rect(&self, (mi_r, mi_c): (usize, usize), w: usize, h: usize) -> [(bool, bool, i32); 3] {
+        let (w_mi, h_mi) = (w / MI, h / MI);
+        std::array::from_fn(|plane| {
+            let mut above_coded = false;
+            let mut left_coded = false;
+            let mut vote = 0;
+            for cell in 0..w_mi {
+                let above = &self.above[mi_c + cell][plane];
+                above_coded |= above.level != 0;
+                vote += dc_vote(above.dc);
+            }
+            for cell in 0..h_mi {
+                let left = &self.left[mi_r + cell][plane];
+                left_coded |= left.level != 0;
+                vote += dc_vote(left.dc);
+            }
+            (above_coded, left_coded, vote)
+        })
+    }
+
     /// The luma `txb_skip_ctx` of a transform unit smaller than its own block
     /// (spec `get_txb_ctx_general`, plane 0, `plane_bsize != tx_size`): the
     /// above/left neighbours' magnitude tiers, OR-reduced over the unit's own
@@ -1722,6 +1984,7 @@ fn decode_block_rect(
     v: &mut PlaneBuf,
     enable_filter_intra: bool,
     allow_screen_content_tools: bool,
+    base_q_idx: u8,
 ) -> Result<()> {
     let (r, c) = at;
     let (px, py) = (c * SUB, r * SUB);
@@ -1769,64 +2032,195 @@ fn decode_block_rect(
         ));
     }
     let (tx_w, tx_h) = (bw, bh);
-    if !skip {
-        return Err(unsupported(
-            "a non-skip HORZ/VERT intra strip needs a rectangular transform \
-             this decoder does not code yet",
-        ));
-    }
     let (cpx, cpy) = (px / 2, py / 2);
     let (chroma_w, chroma_h) = (bw / 2, bh / 2);
     let reach = Reach::of_rect(bw, bh, px, py, y.width, y.height);
-    y.reconstruct_rect(
-        px,
-        py,
-        bw,
-        bh,
-        mode,
-        angle_delta_y,
-        reach,
-        &vec![0i32; bw * bh],
-        None,
-        filter_intra,
-    );
-    let ac = alpha.map(|_| cfl_ac_q3_rect(y, px, py, bw, bh));
-    u.reconstruct_rect(
-        cpx,
-        cpy,
-        chroma_w,
-        chroma_h,
-        uv_predict_mode,
-        angle_delta_uv,
-        reach,
-        &vec![0i32; chroma_w * chroma_h],
-        alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
-        None,
-    );
-    v.reconstruct_rect(
-        cpx,
-        cpy,
-        chroma_w,
-        chroma_h,
-        uv_predict_mode,
-        angle_delta_uv,
-        reach,
-        &vec![0i32; chroma_w * chroma_h],
-        alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
-        None,
-    );
-    neighbours.record_rect(
-        at,
-        bw,
-        bh,
-        mode,
-        &[
-            vec![0i32; bw * bh],
-            vec![0i32; chroma_w * chroma_h],
-            vec![0i32; chroma_w * chroma_h],
-        ],
-    );
-    neighbours.fill_skip_grid_rect((mi_r, mi_c), bw / MI, bh / MI, true);
+    if skip {
+        y.reconstruct_rect(
+            px,
+            py,
+            bw,
+            bh,
+            mode,
+            angle_delta_y,
+            reach,
+            &vec![0i32; bw * bh],
+            None,
+            filter_intra,
+        );
+        let ac = alpha.map(|_| cfl_ac_q3_rect(y, px, py, bw, bh));
+        u.reconstruct_rect(
+            cpx,
+            cpy,
+            chroma_w,
+            chroma_h,
+            uv_predict_mode,
+            angle_delta_uv,
+            reach,
+            &vec![0i32; chroma_w * chroma_h],
+            alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
+            None,
+        );
+        v.reconstruct_rect(
+            cpx,
+            cpy,
+            chroma_w,
+            chroma_h,
+            uv_predict_mode,
+            angle_delta_uv,
+            reach,
+            &vec![0i32; chroma_w * chroma_h],
+            alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
+            None,
+        );
+        neighbours.record_rect(
+            at,
+            bw,
+            bh,
+            mode,
+            &[
+                vec![0i32; bw * bh],
+                vec![0i32; chroma_w * chroma_h],
+                vec![0i32; chroma_w * chroma_h],
+            ],
+        );
+    } else {
+        // lane-rectwire r2: real coefficients. `get_txsize_entropy_ctx`
+        // reduces both size pairs to their square-up CDF sets
+        // (`TxbSet::LumaRect32x16`/`ChromaRect16x8`, see those variants' own
+        // doc comments); the scan order and 2D context tables are the real
+        // rect ones (`SCAN_32X16`/etc, `base_ctx_rect`/`br_ctx_rect`).
+        let (luma_scan, chroma_scan): (&[u16], &[u16]) = if bw == 32 {
+            (&SCAN_32X16, &SCAN_16X8)
+        } else {
+            (&SCAN_16X32, &SCAN_8X16)
+        };
+        // lane-rectwire r3: real coefficients desync a pixel-exact gate
+        // (rectwire-flake-1.obu, seed 55) -- both 32x16 strips of frame 0's
+        // mi(8,8) HORZ quadrant come out ~100% wrong from their very first
+        // pixel (not a subtle context-table off-by-one), while the sibling
+        // non-rect quadrants of the same frame match. Range-ladder bisection
+        // against a real aomdec (EC_TRACE_COEFF/EC_TRACE_MODE) was started
+        // but the intra key-frame path has no traced symbol between the
+        // partition read and the first coefficient block (mode/skip/tx_depth
+        // reads are all untraced in libaom's decodeframe.c intra path, unlike
+        // the inter EC_TRACE_MODE this round added), so a same-length range
+        // comparison wasn't reachable within budget -- see
+        // lanes/rectwire-r3.report.md for what was ruled out (base_ctx_rect's
+        // 5-neighbour offsets, u/v_skip_ctx's above+left formula, and
+        // dc_sign_ctx's around-index all cross-checked byte-for-byte against
+        // libaom and match). Refusing by name again (r1 behavior) rather than
+        // risk landing the desync.
+        return Err(unsupported(
+            "a HORZ/VERT intra strip with real (non-skip) coefficients \
+             (lane-rectwire r3: confirmed desync, not yet isolated)",
+        ));
+        #[allow(unreachable_code)]
+        {
+        let around = neighbours.around_rect(at, bw, bh);
+        let mut luma_coding = cdfs.txb(TxbSet::LumaRect32x16, mode);
+        let (luma_levels, luma_tx_type) = read_coeffs_rect(
+            dec,
+            &mut luma_coding,
+            luma_scan,
+            bw,
+            bh,
+            0,
+            dc_sign_ctx(around[0].2),
+            TxType::DctDct,
+        )?;
+        let luma_residual = dequant_and_inverse_typed_wh(
+            &luma_levels,
+            bw,
+            bh,
+            8,
+            i32::from(base_q_idx),
+            luma_tx_type,
+        );
+        y.reconstruct_rect(
+            px,
+            py,
+            bw,
+            bh,
+            mode,
+            angle_delta_y,
+            reach,
+            &luma_residual,
+            None,
+            filter_intra,
+        );
+        let ac = alpha.map(|_| cfl_ac_q3_rect(y, px, py, bw, bh));
+        let u_default_tx = default_intra_tx_type(uv_predict_mode as u8);
+        let u_skip_ctx = usize::from(around[1].0) + usize::from(around[1].1);
+        let mut u_coding = cdfs.txb(TxbSet::ChromaRect16x8, uv_predict_mode);
+        let (u_levels, u_tx_type) = read_coeffs_rect(
+            dec,
+            &mut u_coding,
+            chroma_scan,
+            chroma_w,
+            chroma_h,
+            u_skip_ctx,
+            dc_sign_ctx(around[1].2),
+            u_default_tx,
+        )?;
+        let u_residual = dequant_and_inverse_typed_wh(
+            &u_levels,
+            chroma_w,
+            chroma_h,
+            8,
+            i32::from(base_q_idx),
+            u_tx_type,
+        );
+        u.reconstruct_rect(
+            cpx,
+            cpy,
+            chroma_w,
+            chroma_h,
+            uv_predict_mode,
+            angle_delta_uv,
+            reach,
+            &u_residual,
+            alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
+            None,
+        );
+        let v_default_tx = default_intra_tx_type(uv_predict_mode as u8);
+        let v_skip_ctx = usize::from(around[2].0) + usize::from(around[2].1);
+        let mut v_coding = cdfs.txb(TxbSet::ChromaRect16x8, uv_predict_mode);
+        let (v_levels, v_tx_type) = read_coeffs_rect(
+            dec,
+            &mut v_coding,
+            chroma_scan,
+            chroma_w,
+            chroma_h,
+            v_skip_ctx,
+            dc_sign_ctx(around[2].2),
+            v_default_tx,
+        )?;
+        let v_residual = dequant_and_inverse_typed_wh(
+            &v_levels,
+            chroma_w,
+            chroma_h,
+            8,
+            i32::from(base_q_idx),
+            v_tx_type,
+        );
+        v.reconstruct_rect(
+            cpx,
+            cpy,
+            chroma_w,
+            chroma_h,
+            uv_predict_mode,
+            angle_delta_uv,
+            reach,
+            &v_residual,
+            alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
+            None,
+        );
+        neighbours.record_rect(at, bw, bh, mode, &[luma_levels, u_levels, v_levels]);
+        RECT_COEFF_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    neighbours.fill_skip_grid_rect((mi_r, mi_c), bw / MI, bh / MI, skip);
     neighbours.fill_lf_grid_rect((mi_r, mi_c), bw / MI, bh / MI, tx_w as u8, tx_h as u8, 0);
     RECT_PARTITION_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Ok(())
@@ -4350,6 +4744,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                     &mut v,
                                     enable_filter_intra,
                                     allow_screen_content_tools,
+                                    base_q_idx,
                                 )?;
                                 decode_block_rect(
                                     &mut dec,
@@ -4363,6 +4758,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                     &mut v,
                                     enable_filter_intra,
                                     allow_screen_content_tools,
+                                    base_q_idx,
                                 )?;
                             }
                             PARTITION_VERT => {
@@ -4380,6 +4776,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                     &mut v,
                                     enable_filter_intra,
                                     allow_screen_content_tools,
+                                    base_q_idx,
                                 )?;
                                 decode_block_rect(
                                     &mut dec,
@@ -4393,6 +4790,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                     &mut v,
                                     enable_filter_intra,
                                     allow_screen_content_tools,
+                                    base_q_idx,
                                 )?;
                             }
                             _ => {

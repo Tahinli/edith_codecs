@@ -90,6 +90,20 @@ pub(crate) enum TxbSet {
     Chroma16,
     /// The 32x32 transform of a chroma plane of a whole superblock.
     Chroma32,
+    /// The luma 32x16/16x32 transform of a `PARTITION_HORZ`/`VERT` intra
+    /// strip (lane-rectwire): `get_txsize_entropy_ctx` reduces any 2:1 rect
+    /// size to its square-up equivalent (`entropy.h:172`), so this shares
+    /// every table [`Luma32`](TxbSet::Luma32) does except `eob_pt` -- a true
+    /// 512-position transform reads [`crate::cdf::EOB_PT_512_LUMA`], not
+    /// `Luma32`'s 1024-position one. Never carries a `tx_type` symbol: both
+    /// orientations use one variant (`get_tx_set` is `EXT_TX_SET_DCTONLY` at
+    /// `tx_size_sqr_up == TX_32X32` regardless of which axis is longer).
+    LumaRect32x16,
+    /// The chroma 16x8/8x16 transform under the same strip (lane-rectwire):
+    /// [`Chroma16`](TxbSet::Chroma16)'s tables except `eob_pt`, which reads
+    /// the true 128-position [`crate::cdf::EOB_PT_128_CHROMA`] instead of
+    /// `Chroma16`'s 256-position one.
+    ChromaRect16x8,
 }
 
 /// The tables one transform block is coded with, borrowed from the state for
@@ -233,6 +247,12 @@ pub(crate) struct Cdfs {
     pub eob_pt_1024_chroma: [u16; 12],
     /// The end-of-block group of a 16x16 chroma transform.
     pub eob_pt_256_chroma: [u16; 10],
+    /// The end-of-block group of a true 32x16/16x32 rect luma transform
+    /// (lane-rectwire), see [`TxbSet::LumaRect32x16`].
+    pub eob_pt_512_luma: [u16; 11],
+    /// The end-of-block group of a true 16x8/8x16 rect chroma transform
+    /// (lane-rectwire), see [`TxbSet::ChromaRect16x8`].
+    pub eob_pt_128_chroma: [u16; 9],
     /// The end-of-block offset bit, per table set.
     pub eob_extra_luma_32: [[u16; 3]; 9],
     /// The same, for a 64x64 luma transform.
@@ -560,6 +580,8 @@ impl Cdfs {
         reset1(&mut self.eob_pt_1024_luma);
         reset1(&mut self.eob_pt_1024_chroma);
         reset1(&mut self.eob_pt_256_chroma);
+        reset1(&mut self.eob_pt_512_luma);
+        reset1(&mut self.eob_pt_128_chroma);
         reset2(&mut self.eob_extra_luma_32);
         reset2(&mut self.eob_extra_luma_64);
         reset2(&mut self.eob_extra_chroma_16);
@@ -924,6 +946,20 @@ impl Cdfs {
                 cdf::EOB_PT_256_CHROMA,
                 cdf::EOB_PT_256_CHROMA_Q3,
             ),
+            eob_pt_512_luma: pick(
+                q_ctx,
+                cdf::EOB_PT_512_LUMA_Q0,
+                cdf::EOB_PT_512_LUMA_Q1,
+                cdf::EOB_PT_512_LUMA,
+                cdf::EOB_PT_512_LUMA_Q3,
+            ),
+            eob_pt_128_chroma: pick(
+                q_ctx,
+                cdf::EOB_PT_128_CHROMA_Q0,
+                cdf::EOB_PT_128_CHROMA_Q1,
+                cdf::EOB_PT_128_CHROMA,
+                cdf::EOB_PT_128_CHROMA_Q3,
+            ),
             eob_extra_luma_32: pick(
                 q_ctx,
                 cdf::EOB_EXTRA_LUMA_32_Q0,
@@ -1284,6 +1320,30 @@ impl Cdfs {
                 base: &mut self.base_chroma_32,
                 base_eob: &mut self.base_eob_chroma_32,
                 br: &mut self.br_chroma_32,
+                dc_sign: &mut self.dc_sign_chroma,
+                tx_type: None,
+                eob_pt_class1: None,
+            },
+            TxbSet::LumaRect32x16 => TxbTables {
+                side: 32,
+                txb_skip: &mut self.txb_skip_luma_32,
+                eob_pt: &mut self.eob_pt_512_luma,
+                eob_extra: &mut self.eob_extra_luma_32,
+                base: &mut self.base_luma_32,
+                base_eob: &mut self.base_eob_luma_32,
+                br: &mut self.br_luma_32,
+                dc_sign: &mut self.dc_sign_luma,
+                tx_type: None,
+                eob_pt_class1: None,
+            },
+            TxbSet::ChromaRect16x8 => TxbTables {
+                side: 16,
+                txb_skip: &mut self.txb_skip_chroma_16,
+                eob_pt: &mut self.eob_pt_128_chroma,
+                eob_extra: &mut self.eob_extra_chroma_16,
+                base: &mut self.base_chroma_16,
+                base_eob: &mut self.base_eob_chroma_16,
+                br: &mut self.br_chroma_16,
                 dc_sign: &mut self.dc_sign_chroma,
                 tx_type: None,
                 eob_pt_class1: None,

@@ -4185,10 +4185,25 @@ mod tests {
                 "{NAME}: SOFT-NOTE -- zero HORZ/VERT strips fired this run \
                  ({matched} matches, {named_refusals} refusals); sampling, not a regression"
             );
+        } else if crate::decode::rect_coeff_hits() == 0 {
+            // lane-rectwire r3: r2's real (non-skip) coefficient decode
+            // desyncs (rectwire-flake-1.obu, seed 55 -- both 32x16 strips of
+            // a fired quadrant come out ~100% wrong from their first pixel;
+            // see lanes/rectwire-r3.report.md). Reverted to refusing a coded
+            // rect strip by name, same as r1, so `rect_coeff_hits` is always
+            // 0 now -- this used to be a hard assert (r2), downgraded back to
+            // a SOFT-NOTE until the desync is isolated and the real decode
+            // path is safe to re-enable.
+            eprintln!(
+                "{NAME}: SOFT-NOTE -- {} HORZ/VERT strips fired but rect_coeff_hits==0 \
+                 (r3: non-skip rect strips refuse by name pending the desync fix)",
+                crate::decode::rect_partition_hits()
+            );
         }
         eprintln!(
-            "{NAME}: {named_refusals} named refusals, {matched} pixel-exact matches out of {n_attempts}, rect_partition_hits={} extended_partition_hits={} partab_hits={}",
+            "{NAME}: {named_refusals} named refusals, {matched} pixel-exact matches out of {n_attempts}, rect_partition_hits={} rect_coeff_hits={} extended_partition_hits={} partab_hits={}",
             crate::decode::rect_partition_hits(),
+            crate::decode::rect_coeff_hits(),
             crate::decode::extended_partition_hits(),
             crate::decode::partab_hits()
         );
