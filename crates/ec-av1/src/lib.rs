@@ -30,6 +30,7 @@ pub mod mvstack;
 pub mod obu;
 pub mod quant;
 pub mod sequence;
+mod superres;
 pub mod stream;
 pub mod tile;
 pub mod transform;
