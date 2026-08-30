@@ -60,6 +60,7 @@ const REFUSALS: &[&str] = &[
     "an inter frame using TxMode::Select (this decoder's inter path never reads a tx_depth symbol, so it desyncs after the first block's mode)",
     "an inter frame whose global motion for a single-reference frame is AFFINE (unverified this round; ROTZOOM/TRANSLATION/IDENTITY are proven)",
     "an inter frame with no key frame before it",
+    "an inter SB-level partition type other than SPLIT (this decoder's inter tile path only recurses a superblock as SPLIT)",
     "an inter partition below 16x16 (8x8 and smaller inter blocks are not coded yet)",
     "an intra mode this decoder does not code (round 2)",
     "an intra-coded HORZ/VERT strip needs rectangular intra prediction this decoder does not code yet",
