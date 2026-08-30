@@ -2440,6 +2440,8 @@ pub fn sb_coeff_inter_frame_tile(
                             is_new_mv,
                             size: 8,
                             size_h: 8,
+                            is_global_mv0: false,
+                            is_global_mv1: false,
                         },
                     );
                     for dr in 0..8 {
@@ -2459,6 +2461,8 @@ pub fn sb_coeff_inter_frame_tile(
                                     is_new_mv,
                                     size: 8,
                                     size_h: 8,
+                                    is_global_mv0: false,
+                                    is_global_mv1: false,
                                 },
                             );
                         }
@@ -2489,6 +2493,8 @@ pub fn sb_coeff_inter_frame_tile(
                                     is_new_mv: false,
                                     size: 8,
                                     size_h: 8,
+                                    is_global_mv0: false,
+                                    is_global_mv1: false,
                                 },
                             );
                         }
@@ -2630,6 +2636,8 @@ fn write_inter_frame_leaf(
                         is_new_mv,
                         size: SUB_MI as usize,
                         size_h: SUB_MI as usize,
+                        is_global_mv0: false,
+                        is_global_mv1: false,
                     },
                 );
             }
@@ -2660,6 +2668,8 @@ fn write_inter_frame_leaf(
                         is_new_mv: false,
                         size: SUB_MI as usize,
                         size_h: SUB_MI as usize,
+                        is_global_mv0: false,
+                        is_global_mv1: false,
                     },
                 );
             }
@@ -2824,6 +2834,8 @@ fn write_inter_frame_leaf8(
                         is_new_mv,
                         size: 2,
                         size_h: 2,
+                        is_global_mv0: false,
+                        is_global_mv1: false,
                     },
                 );
             }
@@ -2854,6 +2866,8 @@ fn write_inter_frame_leaf8(
                         is_new_mv: false,
                         size: 2,
                         size_h: 2,
+                        is_global_mv0: false,
+                        is_global_mv1: false,
                     },
                 );
             }
@@ -5109,6 +5123,8 @@ mod tests {
                                 is_new_mv,
                                 size: 8,
                                 size_h: 8,
+                                is_global_mv0: false,
+                                is_global_mv1: false,
                             },
                         );
                     }
