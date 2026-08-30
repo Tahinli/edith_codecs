@@ -110,7 +110,7 @@ self-pin firing counts for wiener/sgrproj/switchable via thread-local
 `Cell<usize>` hit counters the way every other gate in this lane's charter
 requires.
 
-## Turn budget
+## Turn budget (r1)
 Spent ~55 of 75 turns on recon (spec/libaom read_lr shape, corner math,
 subexp/recenter porting requirements, CDF value derivation) plus the CDF
 landing above; stopped short of wiring `read_lr` itself to avoid leaving a
@@ -118,3 +118,80 @@ half-edited, untested threading change across two large decode functions
 uncommitted at the cap. Everything above is proven correct in principle
 (SB-only firing is a real spec property, not skipped-and-hoped) but wiring
 + the gate itself are unstarted.
+
+## r2 landed (committed on `lane-lr`, 32892df; 235 passed / 0 failed,
+EC_AV1_REQUIRE_AOMENC=1, `232` baseline + 3 new tests)
+- `crates/ec-av1/src/restoration.rs` (new): msac-flavoured
+  `decode_subexp_msac`/`decode_unsigned_subexp_with_ref_msac`/
+  `decode_signed_subexp_with_ref_msac`/`ns_msac` (libaom
+  `read_primitive_subexpfin_`/`aom_read_primitive_refsubexpfin_`/
+  `read_primitive_quniform_`, `k` a per-call parameter unlike global
+  motion's fixed 3) -- pinned by 3 roundtrip tests
+  (`subexp_roundtrips_every_value`, `unsigned_subexp_with_ref_roundtrips`,
+  `signed_subexp_with_ref_roundtrips`) against a hand-written encode-side
+  mirror (`SymbolEncoder` has no LR writer of its own, this crate never
+  writes LR). Also: `WienerInfo`/`SgrprojInfo`/`UnitFilter`,
+  `SGR_PARAMS` (`av1_sgr_params`, restoration.c:36, all 16 entries),
+  `read_wiener_filter`/`read_sgrproj_filter`/`read_lr_unit`/`read_lr`
+  (spec 5.11.57, decodeframe.c ~1595-1723), `RestorationGrid` (per-plane
+  unit grid + flattened `runit_idx` storage, `av1_lr_count_units`'s ROUND
+  not ceil).
+- `crates/ec-av1/src/decode.rs`: `decode_key_frame_tile_with_cdfs` and
+  `decode_inter_frame_tile_with_cdfs` now take `lr: &LoopRestorationParams`
+  and call `crate::restoration::read_lr` once per superblock (before
+  `decode_partition`'s own symbol), building a `RestorationGrid` +
+  per-plane `(WienerInfo, SgrprojInfo)` running reference state before the
+  loop. The public one-star wrappers (`decode_key_frame_tile`/
+  `decode_inter_frame_tile`) pass `&LoopRestorationParams::default()`
+  unchanged, so their ~10 existing test call sites needed no edits.
+- `crates/ec-av1/src/stream.rs`: both call sites thread
+  `&header.loop_restoration` through; the refusal string is renamed from
+  "never reads the per-unit lr symbols" to "the per-unit lr symbols are
+  read but the Wiener/self-guided filters are not yet applied to pixels"
+  -- the frame STILL refuses (no pixel filter is applied anywhere yet),
+  but the refusal now names the true remaining gap per charter stage 2's
+  exit criterion.
+- NOT done this round, no gate written: I did not build the aomenc
+  `--enable-restoration=1` gate the charter's stage 1/2 asks for (proving
+  the partition walk survives past a real LR stream and self-pinning
+  wiener/sgrproj/switchable firing counts via thread-local `Cell<usize>`
+  hit counters). Ran out of turn budget before writing it; the full
+  `cargo test -p ec-av1` suite (235/0, unrelated fixtures) is the only
+  evidence this round has that the wiring compiles and does not regress
+  anything -- it does NOT exercise a real LR stream at all, since no
+  existing gate/fixture in this suite turns `--enable-restoration` on.
+
+## Next lever (r3)
+1. Write the gate: `gradients_source` fixture through aomenc with
+   `--threads=1 --row-mt=0 --enable-restoration=1` (default on already,
+   so no flag omission risk), decode it, assert the NEW refusal string
+   (not an `Err` from a block reader = partition desync, not the old
+   string). Self-pin `WIENER_HITS`/`SGRPROJ_HITS`/`SWITCHABLE_HITS`
+   thread-local `Cell<usize>` counters bumped inside `read_lr_unit`
+   (`crates/ec-av1/src/restoration.rs`) -- a gate that cannot prove LR
+   fired is vacuous per this lane's charter. Given how rare a `Wiener`
+   frame-level restoration_type is likely to be vs `Switchable` at
+   default aomenc settings, may need `EC_LR_GATE_ATTEMPTS` bumped like
+   other lanes' flaky-firing gates (see ledger `lane-maskcomp`).
+2. Wiener pixel filter (stage 3): apply after `apply_cdef` (LR runs on the
+   post-CDEF, post-deblock frame, spec 7.17) as a new `apply_loop_restoration`
+   pass over `lr_grid`, one restoration-unit rectangle at a time, using
+   the already-decoded `vfilter`/`hfilter`. The 3-pixel stripe boundary
+   save/restore (libaom's `rlbs`) is the known trap -- not investigated
+   this round beyond the report's own citation.
+3. SGR filter (stage 4): box-sum radii from `SGR_PARAMS`' `(r0, r1)`,
+   `av1_apply_selfguided_restoration` shape -- not investigated this
+   round.
+4. Once both filters are wired, drop the `stream.rs` refusal entirely
+   (stage 5) -- gate should then assert `Ok`, never `Err`.
+
+## Turn budget (r2)
+Spent the full 75-turn allowance on: recon of libaom's exact `k`-per-tap
+subexp/SGR-table/read_lr_unit shape (not fully covered by r1's report --
+the report's own citations turned out right, but exact constants/ep-branch
+logic needed a fresh libaom read from `~/.cache/aom-oracle`), writing +
+pinning `restoration.rs`'s bitstream-read half, wiring it into both SB
+loops, and confirming no regression (235/0). Did not reach the gate or
+either pixel filter -- see "Next lever" above; r3 should start there
+directly rather than re-reading libaom (this doc + `restoration.rs`'s own
+doc comments now carry every file:line needed).
