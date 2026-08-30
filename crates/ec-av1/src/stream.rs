@@ -283,53 +283,24 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         // naming a different tile there is refused rather than silently
         // forwarding the wrong tile's table.
         //
-        // lane-tiles r4: the multi-tile refusal itself is now scoped, not
-        // blanket. `decode_key_frame_tile_with_cdfs` genuinely loops every
-        // tile (r2/r3), proven pixel-exact by
-        // `a_real_aomenc_stream_with_two_tile_columns_decodes_pixel_exact`
-        // (2 tile columns, `--loopfilter-control=0`) -- but that gate's own
-        // doc comment names two gaps it deliberately sidesteps, so this
-        // refusal keeps refusing exactly those:
-        //   - `decode_inter_frame_tile_with_cdfs` takes one `&[u8]` tile
-        //     payload, not a `tiles: &[&[u8]]` list -- it has no per-tile
-        //     loop at all, so an inter frame with >1 tile is still refused
-        //     unconditionally.
-        //   - Deblocking crosses tile boundaries by spec default (AV1 has
-        //     no `loop_filter_across_tiles_enabled`-style flag at all --
-        //     confirmed absent from `ec-av1-syntax`'s `loop_filter_params`
-        //     read, spec 5.9.11 has no such field either), but `PlaneBuf`'s
-        //     `tile_x0`/`tile_y0` origin only ever clips a tile's own
-        //     left/top reach, not a non-last column's right-edge reach --
-        //     so a key frame with `loop_filter.level` non-zero (deblocking
-        //     actually on) still refuses.
-        //   - The proven gate is 2 tile *columns*, 1 tile *row*; a
-        //     non-last column's right-edge reach bound past column 0 is
-        //     unimplemented for 3+ columns (r3's own known gap), so `cols`
-        //     is capped at 2. Tile rows are untested this round, so `rows`
-        //     stays capped at 1.
-        let loop_filter_on = header.loop_filter.level.iter().any(|&l| l != 0);
-        // lane-tiles r6: decode_inter_frame_tile_with_cdfs now takes
-        // `tiles: &[&[u8]]` and grows the same per-tile loop
-        // decode_key_frame_tile_with_cdfs has (mvstack.rs's MiGrid bounded
-        // per tile too, see MiGrid::set_tile_bounds), so an inter frame with
-        // >1 tile column is no longer refused by name -- the >2-columns and
-        // loop-filter refusals below stay (unproven this round).
+        // lane-tiles r4/r6/r7: the multi-tile refusal itself is scoped, not
+        // blanket. `decode_key_frame_tile_with_cdfs` and (r6)
+        // `decode_inter_frame_tile_with_cdfs` both genuinely loop every
+        // tile, `mvstack.rs`'s `MiGrid` is bounded per tile
+        // (`MiGrid::set_tile_bounds`), and `PlaneBuf`'s `tile_x0/y0/x1/y1`
+        // origin receives real values at every call site (r6's
+        // `set_tile_origin` sweep). r7 proved the two remaining named gaps
+        // both closed: `a_real_aomenc_stream_with_two_tile_columns_and_an_
+        // inter_frame_decodes_pixel_exact` (inter frame, 2 tile columns) and
+        // `a_real_aomenc_stream_with_four_tile_columns_decodes_pixel_exact`
+        // (>2 columns AND loop filtering ON, an interior tile boundary) --
+        // 20/20 pixel-exact each. Only tile *rows* stay unproven and
+        // refused; tile *columns* (any count) and loop filtering across
+        // them are no longer capped.
         if header.tile_info.rows > 1 {
             return Err(Error::unsupported(
                 "AV1 decode_stream",
                 "a frame with more than one tile row (only tile columns are proven pixel-exact so far)",
-            ));
-        }
-        if header.tile_info.cols > 2 {
-            return Err(Error::unsupported(
-                "AV1 decode_stream",
-                "a frame with more than two tile columns (a non-last column's right-edge reach bound past column 0 is unimplemented)",
-            ));
-        }
-        if header.tile_info.cols > 1 && loop_filter_on {
-            return Err(Error::unsupported(
-                "AV1 decode_stream",
-                "a multi-tile frame with loop filtering enabled (deblocking crosses tile boundaries by spec default; PlaneBuf's tile origin does not clip a non-last column's right-edge reach)",
             ));
         }
         // `Tile::offset` is relative to the buffer `parse_obu` was handed
@@ -5990,7 +5961,7 @@ mod tests {
         }
     }
 
-    /// lane-tiles r3: a real two-tile-column aomenc key frame, decoded
+    /// lane-tiles r3/r7: a real two-tile-column aomenc key frame, decoded
     /// through [`decode_key_frame_tile_with_cdfs`] directly with the whole
     /// `tiles: &[&[u8]]` list -- `decode_stream`'s `cols > 1 || rows > 1`
     /// refusal (this file, ~line 292) still fires for any stream this wide,
@@ -6002,7 +5973,12 @@ mod tests {
     /// also the frame's own right edge -- the known gap (`PlaneBuf`'s
     /// tile_x0/tile_y0 only clip left/top reach, not a non-last column's
     /// right-edge reach) does not apply to this fixture; it would to a
-    /// 3+-column one. Tile count itself is a structural aomenc param, not
+    /// 3+-column one, proven separately by the four-tile-column gate below.
+    /// r7: `--loopfilter-control=0` REMOVED per the charter -- `PlaneBuf`'s
+    /// `tile_x1`/`tile_y1` clamps now receive real values at every call site
+    /// (r6's `set_tile_origin` sweep), so this gate now proves real
+    /// deblocking across the tile boundary too, not just decode with it off.
+    /// Tile count itself is a structural aomenc param, not
     /// RD-dependent content, but this decoder's chroma smooth/paeth gap
     /// (`decode.rs` "a smooth or paeth chroma mode (round 2)", unrelated to
     /// tiles, pre-dating this lane) is content-dependent -- no aomenc flag
@@ -6083,7 +6059,6 @@ mod tests {
                     // into the next tile's still-undecoded/differently-
                     // origined samples. Off here since deblocking itself is
                     // not what this gate is proving.
-                    "--loopfilter-control=0",
                     "--enable-rect-partitions=0",
                     "--enable-ab-partitions=0",
                     "--enable-1to4-partitions=0",
@@ -6224,16 +6199,200 @@ mod tests {
         );
     }
 
-    /// lane-tiles r4: the same real two-tile-column stream as the gate
-    /// above, this time run through `decode_stream` itself -- the entry
-    /// point real callers use, not the `decode_key_frame_tile_with_cdfs`
-    /// bypass. Proves the `cols > 1` refusal is actually lifted (not just
-    /// that the underlying per-tile loop works) for the scoped case this
-    /// round proved safe: 2 tile columns, 1 tile row, key frame, loop
-    /// filtering off (`--loopfilter-control=0` stays -- deblocking crosses
-    /// tile boundaries by spec default and `PlaneBuf` cannot bound a
-    /// non-last column's right-edge reach yet, see the refusal's own doc
-    /// comment above `decode_stream`).
+    /// lane-tiles r7: the `>2 tile columns` refusal's own capability, proven
+    /// separately from the 2-column gate above -- `--tile-columns=2` gives
+    /// aomenc `TileCols=4` (log2), a real non-last-column right-edge case the
+    /// 2-column fixture cannot exercise (there tile 1 IS the frame's right
+    /// edge). 256x64 is four 64x64 superblocks wide with `--sb-size=64`, so
+    /// each tile column is exactly one superblock. Loop filtering stays ON
+    /// (no `--loopfilter-control=0`) to prove the same reach-bound fix also
+    /// covers deblocking across an *interior* tile boundary, not just the
+    /// 2-column case's boundary-that-is-also-the-frame-edge.
+    #[test]
+    fn a_real_aomenc_stream_with_four_tile_columns_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_stream_with_four_tile_columns_decodes_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height) = (256usize, 64usize);
+        let mut matched = 0u32;
+        let mut named_refusals = 0u32;
+        for attempt in 0..20u32 {
+            let seed = 42 + attempt;
+            let source = gradients_source(seed, width, height, "duration=0.04:rate=25");
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", "yuv420p", "-f",
+                    "yuv4mpegpipe", "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let mut child = Command::new(aomenc_path())
+                .args([
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    "--cq-level=45",
+                    "--cpu-used=0",
+                    "--limit=1",
+                    "--kf-max-dist=1000",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--tile-columns=2",
+                    "--tile-rows=0",
+                    "--sb-size=64",
+                    "--enable-rect-partitions=0",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    "--enable-filter-intra=0",
+                    "--enable-smooth-intra=0",
+                    "--enable-paeth-intra=0",
+                    "--enable-directional-intra=0",
+                    "--enable-angle-delta=0",
+                    "--enable-tx-size-search=0",
+                    "--enable-cdef=0",
+                    "--enable-restoration=0",
+                    "--max-partition-size=32",
+                    "--min-partition-size=32",
+                    "--enable-palette=0",
+                    "--enable-intrabc=0",
+                    "--enable-cfl-intra=0",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+
+            let mut parser = Av1Parser::new();
+            let mut pos = 0usize;
+            let mut frame = None;
+            while pos < stream.len() {
+                let obu_offset = pos;
+                let obu = parser.parse_obu(&stream[pos..]).unwrap();
+                pos += obu.total_size;
+                if let ObuKind::Frame(header, tiles) = obu.kind {
+                    frame = Some((header, tiles, obu_offset));
+                    break;
+                }
+            }
+            let (header, tiles, obu_offset) = frame.expect("stream has a Frame OBU");
+            assert!(
+                header.tile_info.cols > 2,
+                "{NAME}: aomenc did not actually split into >2 tile columns (cols={}, seed {seed})",
+                header.tile_info.cols
+            );
+            assert_eq!(
+                tiles.len(),
+                header.tile_info.cols as usize,
+                "{NAME}: expected one tile per column (seed {seed})"
+            );
+            let tile_bufs: Vec<&[u8]> = tiles
+                .iter()
+                .map(|t| &stream[obu_offset + t.offset..obu_offset + t.offset + t.size])
+                .collect();
+
+            let enable_filter_intra = parser
+                .sequence_header()
+                .is_some_and(|seq| seq.enable_filter_intra);
+            let enable_edge_filter = parser
+                .sequence_header()
+                .is_some_and(|seq| seq.enable_intra_edge_filter);
+
+            let before = crate::decode::tile_hits();
+            let picture = match decode_key_frame_tile_with_cdfs(
+                &tile_bufs,
+                &header.tile_info,
+                header.mi_cols,
+                header.mi_rows,
+                header.quantization.base_q_idx,
+                header.frame_width,
+                header.frame_height,
+                enable_filter_intra,
+                enable_edge_filter,
+                &header.cdef,
+                &header.loop_filter,
+                None,
+                header.tx_mode == TxMode::Select,
+                header.reduced_tx_set,
+                header.allow_screen_content_tools,
+                header.allow_intrabc,
+            ) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME} failed outright, not a named refusal (seed {seed}): {msg}"
+                    );
+                    named_refusals += 1;
+                    eprintln!("seed {seed} refusal: {msg}");
+                    continue;
+                }
+                Ok((picture, _end_cdfs)) => picture,
+            };
+            let hits = crate::decode::tile_hits() - before;
+            assert!(
+                hits > 2,
+                "{NAME}: tile_hits delta was {hits}, expected >2 -- all four tiles must actually \
+                 decode, not just a subset (seed {seed})"
+            );
+
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
+            assert_eq!(picture.y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg (seed {seed})");
+            assert_eq!(picture.u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg (seed {seed})");
+            assert_eq!(picture.v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg (seed {seed})");
+            matched += 1;
+        }
+        assert!(
+            matched > 0,
+            "{NAME}: every attempt refused ({named_refusals} refusals); the gate never decoded \
+             a four-tile-column stream"
+        );
+        eprintln!(
+            "{NAME}: {matched} pixel-exact matches, {named_refusals} named refusals out of 20"
+        );
+    }
+
+    /// lane-tiles r4/r7: the same real two-tile-column stream as the
+    /// bypass gate above, this time run through `decode_stream` itself --
+    /// the entry point real callers use. Proves the `cols > 1` refusal is
+    /// actually lifted (not just that the underlying per-tile loop works)
+    /// for a key frame; `--loopfilter-control=0` stays here for its own
+    /// sake (isolating the entry-point wiring from deblocking), but r7's
+    /// `a_real_aomenc_stream_with_four_tile_columns_decodes_pixel_exact`
+    /// bypass gate now proves loop filtering ON across a tile boundary too,
+    /// and the `cols > 1 && loop_filter_on` / `cols > 2` refusals this
+    /// comment used to describe are gone from `decode_stream`.
     #[test]
     fn a_real_aomenc_stream_with_two_tile_columns_decodes_through_decode_stream() {
         const NAME: &str = "a_real_aomenc_stream_with_two_tile_columns_decodes_through_decode_stream";
