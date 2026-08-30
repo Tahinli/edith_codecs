@@ -2624,7 +2624,14 @@ fn decode_block_rect64(
             cdfs,
             neighbours.above_mode[c],
             neighbours.left_mode[r],
-            true,
+            // `is_cfl_allowed` (spec 5.11.5) caps CFL at <=32x32; these
+            // superblock-level HORZ/VERT strips are 64x32/32x64, so unlike
+            // `decode_block_rect`'s own 32x16/16x32 strips (where `true` is
+            // correct), CFL must never be offered here -- passing `true`
+            // read `uv_mode` off the 14-symbol `uv_mode_cfl` CDF instead of
+            // the real 13-symbol `uv_mode_no_cfl` one and desynced the tile
+            // from this block's very first symbol (lane-sbpart r3 bisect).
+            false,
             bw,
             bh,
             enable_filter_intra,
