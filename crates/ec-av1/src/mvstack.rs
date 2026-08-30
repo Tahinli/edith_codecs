@@ -2615,7 +2615,7 @@ mod tests {
         let (mv0, mv1) = ((2, 2), (-6, 3));
         grid.set(2, 1, comp_inter(mv0, mv1));
 
-        let stack = find_mv_stack_compound(&grid, 2, 2, 2, 2, COMP_PAIR, 8, 8, &NO_SIGN_BIAS, None);
+        let stack = find_mv_stack_compound(&grid, 2, 2, 2, 2, COMP_PAIR, 8, 8, &NO_SIGN_BIAS, &NO_GM_MV, None);
 
         // The exact-pair immediate scan lands one boosted entry; the
         // compound extension pass (short stack, len < MAX_MV_REF_CANDIDATES)
@@ -2639,7 +2639,7 @@ mod tests {
         grid.set(2, 1, comp_inter(mv0, mv1));
         grid.set(3, 1, comp_inter(mv0, mv1));
 
-        let stack = find_mv_stack_compound(&grid, 2, 2, 2, 2, COMP_PAIR, 8, 8, &NO_SIGN_BIAS, None);
+        let stack = find_mv_stack_compound(&grid, 2, 2, 2, 2, COMP_PAIR, 8, 8, &NO_SIGN_BIAS, &NO_GM_MV, None);
 
         // Exact libaom `is_dup` port: with exactly one entry already in the
         // stack (the four identical-pair neighbours deduped by the
@@ -2671,7 +2671,7 @@ mod tests {
         grid.set(4, 2, comp_inter(left.0, left.1));
         grid.set(5, 2, comp_inter(left.0, left.1));
 
-        let stack = find_mv_stack_compound(&grid, 3, 3, 2, 3, COMP_PAIR, 8, 8, &NO_SIGN_BIAS, None);
+        let stack = find_mv_stack_compound(&grid, 3, 3, 2, 3, COMP_PAIR, 8, 8, &NO_SIGN_BIAS, &NO_GM_MV, None);
 
         assert_eq!(stack.entries.len(), 2);
         assert_eq!(stack.entries[0].mv0, left.0);
@@ -2760,7 +2760,7 @@ mod tests {
             },
         );
 
-        let stack = find_mv_stack_compound(&grid, 2, 2, 2, 2, COMP_PAIR, 8, 8, &NO_SIGN_BIAS, None);
+        let stack = find_mv_stack_compound(&grid, 2, 2, 2, 2, COMP_PAIR, 8, 8, &NO_SIGN_BIAS, &NO_GM_MV, None);
 
         // The combine step (libaom's real "Handle compound reference frame
         // extension") zips each side's ref_id-then-ref_diff lists
