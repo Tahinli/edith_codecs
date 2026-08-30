@@ -376,14 +376,14 @@ mod tests {
         for y in 0..height {
             for x in 0..width {
                 let sx = (x + shift) % width;
-                picture.y[y * width + x] = ((sx * 3 + y * 5) % 256) as u8;
+                picture.y[y * width + x] = ((sx * 3 + y * 5) % 256) as u16;
             }
         }
         for y in 0..height / 2 {
             for x in 0..width / 2 {
                 let i = y * (width / 2) + x;
-                picture.u[i] = ((100 + shift * 4) % 256) as u8;
-                picture.v[i] = ((200 + 256 - shift * 2 % 256) % 256) as u8;
+                picture.u[i] = ((100 + shift * 4) % 256) as u16;
+                picture.v[i] = ((200 + 256 - shift * 2 % 256) % 256) as u16;
             }
         }
         picture
@@ -679,9 +679,9 @@ mod tests {
                     Picture {
                         width,
                         height,
-                        y: bytes[..luma].to_vec(),
-                        u: bytes[luma..luma + chroma].to_vec(),
-                        v: bytes[luma + chroma..].to_vec(),
+                        y: bytes[..luma].iter().map(|&v| u16::from(v)).collect(),
+                        u: bytes[luma..luma + chroma].iter().map(|&v| u16::from(v)).collect(),
+                        v: bytes[luma + chroma..].iter().map(|&v| u16::from(v)).collect(),
                     }
                 })
                 .collect(),
@@ -759,7 +759,7 @@ mod tests {
         }
     }
 
-    fn psnr(a: &[u8], b: &[u8]) -> f64 {
+    fn psnr(a: &[u16], b: &[u16]) -> f64 {
         let squared: f64 = a
             .iter()
             .zip(b)
@@ -847,7 +847,10 @@ mod tests {
             let mean_psnr: f64 = decoded
                 .iter()
                 .zip(&pictures)
-                .map(|(d, p)| psnr(d, &p.y))
+                .map(|(d, p)| {
+                    let d16: Vec<u16> = d.iter().map(|&v| u16::from(v)).collect();
+                    psnr(&d16, &p.y)
+                })
                 .sum::<f64>()
                 / decoded.len() as f64;
             assert!(
