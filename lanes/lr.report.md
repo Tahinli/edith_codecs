@@ -334,3 +334,109 @@ loops, and confirming no regression (235/0). Did not reach the gate or
 either pixel filter -- see "Next lever" above; r3 should start there
 directly rather than re-reading libaom (this doc + `restoration.rs`'s own
 doc comments now carry every file:line needed).
+
+## r6 -- VERDICT: not green, still one pixel. Real progress: the
+r5-reported divergence source is now DISPROVEN and a decisive,
+reusable ground-truth harness exists. Did not commit (no green step;
+all edits this round were temporary diagnostics, reverted with `git
+checkout --` before finishing -- tree is bit-identical to 02a08bf).
+
+**Decisive new evidence** (`/tmp/claude-*/scratchpad/lr_sgr_harness.c`,
+linked against the real `~/.cache/aom-oracle/build/libaom.a`, calling
+the actually-exported `av1_apply_selfguided_restoration_c` /
+`av1_selfguided_restoration_c` directly -- not a hand-transcribed
+reimplementation, the real compiled function):
+- Dumped the exact `lr_sample`-boundary-substituted 102x10 byte buffer
+  our own `compute_ab`/`apply_sgrproj_stripe` uses for the failing
+  pixel (V plane, seed 46, ep=6/xqd=[-16,-32], stripe [60,64) of the
+  96x64 chroma plane, row 61 col 6) to `/tmp/lr_full.bin`, via a temp
+  `EC_LR_DUMP`-gated `eprintln!`/`std::fs::write` in
+  `apply_sgrproj_stripe` (since reverted).
+- Fed that *exact same buffer* to the real libaom function (chunked to
+  width=64 matching libaom's own `RESTORATION_PROC_UNIT_SIZE`
+  splitting -- `av1_apply_selfguided_restoration_c`'s internal
+  fixed-size arrays overflow above that, segfault first attempt,
+  fixed by chunking like `sgrproj_filter_stripe` does). Real libaom,
+  given identical input pixels, produces **194** (matches ffmpeg) --
+  proving the bug is not in `lr_sample`/stripe-boundary substitution
+  at all (r5's suspicion), since both implementations read the same
+  bytes and only ours is wrong.
+- Also called `av1_selfguided_restoration_c` directly to get the
+  pre-combine `flt0`/`flt1`: real `flt0[1][6]=3097` (matches our
+  Rust's fast/r0 arm exactly), real `flt1[1][6]=3109` vs our Rust's
+  `3110` -- **the divergence is entirely in the dense/r1 arm**, not
+  the fast arm r5 flagged as the unverified half.
+- Instrumented `compute_ab` directly (temp `eprintln!`, reverted) to
+  dump the 9 individual A/B taps (`c,u,d,l,r,ul,ur,dl,dr`) the dense
+  combine at (i=1,j=6) actually uses, and independently recomputed
+  every one from the raw dumped bytes via a clean Python box-sum (not
+  the earlier untrusted `/tmp/lr_ref.c`/`/tmp/lr_probe.c`) -- **all 9
+  match exactly** (`ab1: c=(251,922) u=(254,303) d=(224,6502)
+  l=(252,700) r=(249,1344) ul=(253,422) ur=(253,486) dl=(241,2974)
+  dr=(171,17543)`), and the combine formula (weight 4/3, `nb=5`,
+  `SGRPROJ_SGR_BITS+5-SGRPROJ_RST_BITS` shift) reproduces `3110`
+  exactly from those 9 values by hand -- so `compute_ab`'s per-cell
+  math (box sum, `SGR_X_BY_XPLUS1`/`SGR_ONE_BY_X` lookup, rounding) is
+  internally self-consistent with a naive centered-window recompute,
+  AND matches the real libaom answer for 8 of 9 taps that a *separate*
+  cross-check against `boxsum1`'s real sliding-window source
+  (`restoration.c:418-483`) traced by hand this round confirms is
+  mathematically equivalent to a naive per-position 3x3 sum for every
+  physical row/col our grid needs (the sliding-window's own 2-tap
+  boundary special cases only fire at `local index 0` / the far edge,
+  both outside the `physical -1..h` range this stripe's grid touches).
+- Net: given all 9 A/B taps individually reproduce via a from-scratch
+  box-sum recompute of the real bytes, but the combined `flt1` still
+  disagrees with the real compiled function by exactly the 1 LSB that
+  explains the whole defect, the remaining unaccounted gap is narrow
+  but NOT yet pinned to a single line -- either one of the 9 taps
+  itself differs from what real libaom's *compiled* `boxsum`/
+  `calculate_intermediate_result` computes (despite the hand-traced
+  sliding-window algebra saying it shouldn't), or there is a rounding
+  mode difference (`ROUND_POWER_OF_TWO` for negative/tie values,
+  `2*(bit_depth-8)` pre-rounds that are no-ops at 8-bit but were not
+  independently verified as no-ops in the compiled binary) not yet
+  checked against the real function's per-tap output directly.
+
+**Ruled out this round** (do not redo):
+- `lr_sample`/stripe-boundary substitution as the cause -- disproven
+  directly (see above), not just re-verified by hand.
+- The fast (`r0=2`) arm -- `flt0` matches the real compiled function
+  bit-exact. r5's charter guess that this was the unverified half was
+  wrong; it turned out to be already correct.
+- `compute_ab`'s formula/table lookup being *generically* wrong -- 8
+  of 9 taps match a from-scratch recompute of the real bytes exactly,
+  and the combine weights/shift match libaom's source line-for-line.
+- The earlier `/tmp/lr_ref.c`/`/tmp/lr_probe.c` "194 vs self-inconsistent"
+  claim from r5 -- irrelevant now; the new harness supersedes it with a
+  real linked answer, not a hand transcription.
+
+**Start here (r7)**: get a per-tap ground-truth number directly out of
+the compiled libaom binary instead of hand-tracing `boxsum1` further --
+`av1_selfguided_restoration_c` only returns the final `flt0`/`flt1`,
+not the intermediate `A`/`B` arrays (`calculate_intermediate_result` is
+`static`). Two ways to get them: (a) build a *second* aom-oracle copy
+with `calculate_intermediate_result` changed from `static` to
+exported-and-declared-in-a-header (rebuild is the `scripts/build-aom-oracle.sh`
+recipe, ~5min), then call it directly with the same 9 physical
+positions and diff against the 9 values dumped above; or (b) bisect by
+zeroing individual pixels in the dumped buffer one at a time and
+re-running the harness against both the real function and a
+from-scratch recompute to see which single input pixel's value moves
+the two answers apart. (a) is more direct. The harness itself
+(`av1_apply_selfguided_restoration_c` call pattern, chunked to
+width=64, `tmpbuf` sized `2*400*400` -- undersizing it segfaults, see
+`RESTORATION_UNITPELS_MAX`) is reusable as-is; a copy is in this
+worktree's scratchpad
+(`/tmp/claude-1000/.../scratchpad/lr_sgr_harness.c`,
+`lr_sgr_harness`), not committed (scratch, not source).
+
+## Turn budget (r6)
+Spent on: building + debugging the real-libaom-linked harness (one
+segfault from undersizing the internal tmpbuf, fixed), the input-buffer
+dump wiring in `restoration.rs`, and the 9-tap cross-check (including
+chasing down two of my own Python transcription bugs mid-round --
+lesson: rerun a "found the bug" number at least once before trusting
+it, both false positives here were stale/mistyped variable state, not
+real). Ran out of budget before pinning the exact source-level cause;
+r7 should start at option (a) above, not redo any of the ruled-out list.
