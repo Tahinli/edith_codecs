@@ -5208,20 +5208,25 @@ mod tests {
         );
     }
 
-    /// lane-rect16 r1: a plain default-settings aomenc run over lavfi
+    /// lane-rect16 r1/r2: a plain default-settings aomenc run over lavfi
     /// `mandelbrot` (`--cpu-used=4 --end-usage=q --cq-level=32`, no
     /// `--enable-*` flags) used to refuse frame 0 outright with "a partition
-    /// below 16x16 other than a clean split" -- reproduced live with
-    /// `decode_probe`, root-caused to a `PARTITION_VERT_B` `partition_w16`
-    /// symbol at mi=(3,2), not the plain HORZ/VERT this lane's charter
-    /// assumed (`refusal-names-a-correlate`). The `PARTITION_VERT_B` arm is
-    /// now wired (left 8x16 real `decode_block_rect` strip + two stacked
-    /// 8x8 `decode_leaf8` leaves on the right); `vert_b_intra_hits` proves
-    /// that arm fires. This exact stream's own VERT_B block is *coded*
-    /// (real coefficients), which is NOT ported (see the refusal on
-    /// `decode_block_rect`'s non-skip else-branch) -- so this gate proves
-    /// the new arm fires and no longer trips the OLD (now-false) refusal,
-    /// not a pixel-exact decode of this stream.
+    /// below 16x16 other than a clean split". r1 root-caused the FIRST hit to
+    /// a `PARTITION_VERT_B` `partition_w16` symbol at mi=(3,2) and wired it
+    /// (left 8x16 real `decode_block_rect` strip + two stacked 8x8
+    /// `decode_leaf8` leaves on the right). r2 re-measured after that fix
+    /// (`decision-before-quantiser`-shaped: don't trust a stale premise) and
+    /// found this stream's REAL first-hit blocker in z-order is earlier, at
+    /// mi=(0,7): a plain `PARTITION_HORZ`. That arm is now wired too
+    /// (`decode_leaf_rect`, sibling to `decode_leaf8` but real-mi-addressed
+    /// for a non-square strip) -- `horz_vert_intra_hits` proves it fires.
+    /// This exact stream's own HORZ block at mi=(0,7) is *coded* (real
+    /// coefficients), which is NOT ported (same ceiling as VERT_B's own
+    /// non-skip refusal -- no rectangular-transform coefficient tables at
+    /// this size), so decode still stops there and `vert_b_intra_hits`
+    /// never gets a chance to increment on this particular stream. This gate
+    /// proves the HORZ arm fires and the OLD (now-false) two-clause refusal
+    /// never reappears, not a pixel-exact decode of this stream.
     #[test]
     fn a_real_aomenc_stream_with_mandelbrot_fires_the_vert_b_partition_arm() {
         const NAME: &str = "a_real_aomenc_stream_with_mandelbrot_fires_the_vert_b_partition_arm";
@@ -5269,6 +5274,7 @@ mod tests {
                 "--cpu-used=4",
                 "--end-usage=q",
                 "--cq-level=32",
+                "--passes=1",
                 "--obu",
                 "-o",
                 "-",
@@ -5292,6 +5298,14 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         let stream = out.stdout;
+        // lane-rect16 r2: the recipe above was missing `--passes=1` --
+        // without it aomenc silently ran 2-pass and wrote nothing to stdout
+        // on pass 1 (still exit 0), so this gate always decoded an EMPTY
+        // stream and never actually exercised the arm it claims to gate.
+        assert!(
+            !stream.is_empty(),
+            "{NAME}: aomenc wrote an empty stream (missing --passes=1?)"
+        );
         let result = decode_stream(&stream);
         // The now-lifted false claim ("codes only the square arms below
         // 16x16") must never appear again.
@@ -5303,12 +5317,13 @@ mod tests {
             );
         }
         assert!(
-            crate::decode::vert_b_intra_hits() > 0,
-            "{NAME}: the PARTITION_VERT_B arm never fired on this stream (regression -- it fired \
-             deterministically at mi=(3,2) when this gate was written)"
+            crate::decode::horz_vert_intra_hits() > 0,
+            "{NAME}: the plain PARTITION_HORZ/VERT arm never fired on this stream (regression -- \
+             it fired deterministically at mi=(0,7) when this gate was written)"
         );
         eprintln!(
-            "{NAME}: vert_b_intra_hits={}, decode result: {:?}",
+            "{NAME}: horz_vert_intra_hits={}, vert_b_intra_hits={}, decode result: {:?}",
+            crate::decode::horz_vert_intra_hits(),
             crate::decode::vert_b_intra_hits(),
             result.as_ref().map(|f| f.len()).map_err(|e| e.to_string())
         );

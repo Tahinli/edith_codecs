@@ -412,6 +412,22 @@ pub(crate) fn vert_b_intra_hits() -> usize {
     VERT_B_INTRA_HITS.with(|c| c.get())
 }
 
+// How many `partition_w16` reads resolved to a plain `PARTITION_HORZ`/
+// `PARTITION_VERT` (lane-rect16 r2): re-measuring after the VERT_B fix above
+// showed mandelbrot's real first-hit blocker is this plain arm at mi=(0,7),
+// not VERT_B (`refusal-names-a-correlate`; the VERT_B write-up's "frame 0's
+// very first non-NONE/SPLIT symbol" claim was about decode ORDER within one
+// superblock's z-order recursion, not raster mi position).
+thread_local! {
+    static HORZ_VERT_INTRA_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`HORZ_VERT_INTRA_HITS`].
+pub(crate) fn horz_vert_intra_hits() -> usize {
+    HORZ_VERT_INTRA_HITS.with(|c| c.get())
+}
+
 // How many [`read_coeffs`] reads resolved a `tx_type` outside `TX_CLASS_2D`
 // (`V_DCT`/`H_DCT`, spec 5.11.39's `TxClass::Horiz`/`Vert`), across every
 // call on the current thread -- the same before/after counter pattern as
@@ -3401,6 +3417,156 @@ fn decode_block_rect(
         eprintln!("TRACE_RECT32_END mi_row={mi_r} mi_col={mi_c} bw={bw} bh={bh}");
     }
     Ok(())
+}
+
+/// Decodes one `bw`x`bh` rect strip of a plain 16x16-level `PARTITION_HORZ`/
+/// `PARTITION_VERT` (lane-rect16 r2), sibling to [`decode_block_rect`] but
+/// addressed by REAL mi coordinates rather than derived from an [`SUB`]-grid
+/// `outer_at`, the same relationship [`decode_leaf8`] has to `decode_block`:
+/// the second strip of a HORZ/VERT split sits offset by half the 16x16
+/// parent, which `decode_block_rect`'s `at`-derived `px = c * SUB` can't
+/// name. `prev_leaf` mirrors `decode_leaf8`'s own convention -- when the
+/// previous strip is directly above (same column, `mi_h` rows up) or
+/// directly left (same row, `mi_w` cols over), its mode overrides the coarse
+/// per-16x16-cell `above_mode`/`left_mode` slot for THIS strip's own mode
+/// context read, and bookkeeping goes through the `_mi`/`_rect` neighbour
+/// writers (`record_mi_rect`, `fill_skip_grid_rect`, `fill_lf_grid_rect`) at
+/// this strip's real position, never the coarse `record_rect` (which the
+/// caller uses once, after both strips, exactly like the `VERT_B` arm next
+/// to it). Only the skip case is ported -- see [`decode_block_rect`]'s own
+/// doc for why a coded rect strip below 16x16 has no coefficient tables here
+/// yet.
+#[allow(clippy::too_many_arguments)]
+fn decode_leaf_rect(
+    dec: &mut SymbolDecoder,
+    cdfs: &mut Cdfs,
+    neighbours: &mut Neighbours,
+    outer_at: (usize, usize),
+    leaf_mi: (usize, usize),
+    bw: usize,
+    bh: usize,
+    prev_leaf: Option<((usize, usize), usize)>,
+    y: &mut PlaneBuf,
+    u: &mut PlaneBuf,
+    v: &mut PlaneBuf,
+    enable_filter_intra: bool,
+    allow_screen_content_tools: bool,
+    base_q_idx: u8,
+    tx_select: bool,
+) -> Result<usize> {
+    let _ = base_q_idx;
+    let (r, c) = outer_at;
+    let mut above_mode = neighbours.above_mode[c];
+    let mut left_mode = neighbours.left_mode[r];
+    let (mi_w, mi_h) = (bw / MI, bh / MI);
+    if let Some(((pr, pc), pmode)) = prev_leaf {
+        if pc == leaf_mi.1 && leaf_mi.0 == pr + mi_h {
+            above_mode = pmode;
+        } else if pr == leaf_mi.0 && leaf_mi.1 == pc + mi_w {
+            left_mode = pmode;
+        }
+    }
+    let smooth_neighbor =
+        is_smooth_mode(above_mode) || is_smooth_mode(left_mode);
+    if smooth_neighbor {
+        SMOOTH_LUMA_HITS.with(|c| c.set(c.get() + 1));
+    }
+    let (skip, mode, angle_delta_y, uv_mode, angle_delta_uv, alpha, filter_intra) =
+        read_intra_mode_rect(
+            dec,
+            cdfs,
+            above_mode,
+            left_mode,
+            true,
+            bw,
+            bh,
+            enable_filter_intra,
+            neighbours.skip_txfm_ctx(leaf_mi.0, leaf_mi.1),
+            allow_screen_content_tools,
+            leaf_mi.0,
+            leaf_mi.1,
+        )?;
+    if filter_intra.is_some() {
+        return Err(unsupported(
+            "filter intra on a HORZ/VERT strip (this decoder predicts square-only)",
+        ));
+    }
+    let uv_predict_mode = if uv_mode == UV_CFL_PRED { DC_PRED } else { uv_mode };
+    let depth = if tx_select {
+        let ctx = tx_size_context_rect(neighbours, leaf_mi, bw, bh);
+        dec.symbol(&mut cdfs.tx_size_cat2[ctx])
+    } else {
+        0
+    };
+    if depth != 0 {
+        return Err(unsupported(
+            "a HORZ/VERT intra strip with a split transform (per-unit rect \
+             prediction is not ported)",
+        ));
+    }
+    if !skip {
+        return Err(unsupported(
+            "a coded (non-skip) HORZ/VERT rect strip below 16x16 (this decoder ports only \
+             the skip case at this size)",
+        ));
+    }
+    let (px, py) = (leaf_mi.1 * MI, leaf_mi.0 * MI);
+    let reach = Reach::of_rect(bw, bh, px, py, y.width, y.height);
+    let (cpx, cpy) = (px / 2, py / 2);
+    let (chroma_w, chroma_h) = (bw / 2, bh / 2);
+    y.reconstruct_rect(
+        px,
+        py,
+        bw,
+        bh,
+        mode,
+        angle_delta_y,
+        reach,
+        &vec![0i32; bw * bh],
+        None,
+        filter_intra,
+        smooth_neighbor,
+    );
+    let ac = alpha.map(|_| cfl_ac_q3_rect(y, px, py, bw, bh));
+    u.reconstruct_rect(
+        cpx,
+        cpy,
+        chroma_w,
+        chroma_h,
+        uv_predict_mode,
+        angle_delta_uv,
+        reach,
+        &vec![0i32; chroma_w * chroma_h],
+        alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
+        None,
+        false,
+    );
+    v.reconstruct_rect(
+        cpx,
+        cpy,
+        chroma_w,
+        chroma_h,
+        uv_predict_mode,
+        angle_delta_uv,
+        reach,
+        &vec![0i32; chroma_w * chroma_h],
+        alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
+        None,
+        false,
+    );
+    neighbours.record_mi_rect(
+        leaf_mi,
+        bw,
+        bh,
+        &[
+            vec![0i32; bw * bh],
+            vec![0i32; chroma_w * chroma_h],
+            vec![0i32; chroma_w * chroma_h],
+        ],
+    );
+    neighbours.fill_skip_grid_rect(leaf_mi, mi_w, mi_h, skip);
+    neighbours.fill_lf_grid_rect(leaf_mi, mi_w, mi_h, bw as u8, bh as u8, 0);
+    Ok(mode)
 }
 
 /// Decodes one true `bw`x`bh` superblock-level `PARTITION_HORZ`/
@@ -6737,9 +6903,101 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                             neighbours.left_mode[sr] = mode_br;
                                             continue;
                                         }
+                                        if part16 == PARTITION_HORZ {
+                                            HORZ_VERT_INTRA_HITS.with(|c| c.set(c.get() + 1));
+                                            let (mi_row0, mi_col0) = (
+                                                sr as u32 * SUB_MI,
+                                                sc as u32 * SUB_MI,
+                                            );
+                                            let top = (mi_row0 as usize, mi_col0 as usize);
+                                            let bot = (mi_row0 as usize + 2, mi_col0 as usize);
+                                            let mode_top = decode_leaf_rect(
+                                                &mut dec,
+                                                &mut cdfs,
+                                                &mut neighbours,
+                                                at16,
+                                                top,
+                                                16,
+                                                8,
+                                                None,
+                                                &mut y,
+                                                &mut u,
+                                                &mut v,
+                                                enable_filter_intra,
+                                                allow_screen_content_tools,
+                                                base_q_idx,
+                                                tx_select,
+                                            )?;
+                                            let mode_bot = decode_leaf_rect(
+                                                &mut dec,
+                                                &mut cdfs,
+                                                &mut neighbours,
+                                                at16,
+                                                bot,
+                                                16,
+                                                8,
+                                                Some((top, mode_top)),
+                                                &mut y,
+                                                &mut u,
+                                                &mut v,
+                                                enable_filter_intra,
+                                                allow_screen_content_tools,
+                                                base_q_idx,
+                                                tx_select,
+                                            )?;
+                                            neighbours.above_mode[sc] = mode_bot;
+                                            neighbours.left_mode[sr] = mode_bot;
+                                            continue;
+                                        }
+                                        if part16 == PARTITION_VERT {
+                                            HORZ_VERT_INTRA_HITS.with(|c| c.set(c.get() + 1));
+                                            let (mi_row0, mi_col0) = (
+                                                sr as u32 * SUB_MI,
+                                                sc as u32 * SUB_MI,
+                                            );
+                                            let left = (mi_row0 as usize, mi_col0 as usize);
+                                            let right = (mi_row0 as usize, mi_col0 as usize + 2);
+                                            let mode_left = decode_leaf_rect(
+                                                &mut dec,
+                                                &mut cdfs,
+                                                &mut neighbours,
+                                                at16,
+                                                left,
+                                                8,
+                                                16,
+                                                None,
+                                                &mut y,
+                                                &mut u,
+                                                &mut v,
+                                                enable_filter_intra,
+                                                allow_screen_content_tools,
+                                                base_q_idx,
+                                                tx_select,
+                                            )?;
+                                            let mode_right = decode_leaf_rect(
+                                                &mut dec,
+                                                &mut cdfs,
+                                                &mut neighbours,
+                                                at16,
+                                                right,
+                                                8,
+                                                16,
+                                                Some((left, mode_left)),
+                                                &mut y,
+                                                &mut u,
+                                                &mut v,
+                                                enable_filter_intra,
+                                                allow_screen_content_tools,
+                                                base_q_idx,
+                                                tx_select,
+                                            )?;
+                                            neighbours.above_mode[sc] = mode_right;
+                                            neighbours.left_mode[sr] = mode_right;
+                                            continue;
+                                        }
                                         if part16 != PARTITION_SPLIT {
                                             return Err(unsupported(
-                                                "a partition below 16x16 other than a clean split or a VERT_B (this decoder codes only the square arms, VERT_B, and a clean split below 16x16)",
+                                                "a HORZ_A/HORZ_B/VERT_A partition below 16x16 (this decoder codes only the square arms, HORZ, VERT, VERT_B, and a clean split below 16x16)",
                                             ));
                                         }
                                         // A real (non-straddle) SPLIT of a
