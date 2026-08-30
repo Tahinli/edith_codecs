@@ -9032,6 +9032,169 @@ mod tests {
         );
     }
 
+    /// lane-rect64q r1: same recipe as
+    /// [`a_real_aomenc_stream_with_a_superblock_level_horz_vert_partition_decodes_pixel_exact`]
+    /// minus `--deltaq-mode=0` -- real aomenc's non-realtime default is
+    /// `DELTA_Q_OBJECTIVE` (`av1_cx_iface.c:271`), so dropping that one flag
+    /// is enough to make `delta_q_present=1` the norm and drive
+    /// [`crate::decode::decode_block_rect64`]'s running `CURRENT_Q_IDX` away
+    /// from the frame-constant `base_q_idx` inside a real rect64 SB --
+    /// exactly the bug this round's dequant fix targets. Hard-asserts
+    /// `rect64_qidx_drift_hits() > 0`: without that, this gate could pass
+    /// vacuously the same way the `--deltaq-mode=0` sibling always did.
+    ///
+    /// lane-rect64q r1: measured, does NOT fire -- 15/40 attempts matched
+    /// but `rect64_qidx_drift_hits()` stayed 0 every time. Real aomenc's RD
+    /// never chose a nonzero delta-q on this tiny synthetic gradients frame
+    /// even with `deltaq-mode` left at its default; `#[ignore]`d rather than
+    /// deleted so the recipe and the negative result both survive for the
+    /// next attempt (see `lanes/rect64q-r1.report.md`).
+    #[test]
+    #[ignore = "drift never observed this round -- see lanes/rect64q-r1.report.md"]
+    fn a_real_aomenc_stream_with_a_superblock_level_horz_vert_partition_and_delta_q_decodes_pixel_exact()
+    {
+        const NAME: &str =
+            "a_real_aomenc_stream_with_a_superblock_level_horz_vert_partition_and_delta_q_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height, frame_count) = (192usize, 128usize, 1usize);
+        let mut named_refusals = 0u32;
+        let mut matched = 0u32;
+        let n_attempts: u32 = std::env::var("EC_SBPART_DQ_GATE_ATTEMPTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(40);
+        for attempt in 0..n_attempts {
+            let seed = 42 + attempt;
+            let duration = frame_count as f64 / 25.0;
+            let source =
+                gradients_source(seed, width, height, &format!("duration={duration}:rate=25"));
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let args: Vec<&str> = vec![
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                "--cq-level=45",
+                "--cpu-used=0",
+                "--threads=1",
+                "--row-mt=0",
+                "--sb-size=64",
+                "--enable-rect-partitions=1",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0",
+                "--min-partition-size=32",
+                "--max-partition-size=64",
+                "--enable-restoration=0",
+                "--enable-palette=0",
+                "--enable-filter-intra=0",
+                "--enable-cfl-intra=0",
+                "--enable-intrabc=0",
+                "--enable-tx-size-search=0",
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ];
+            let mut child = Command::new(aomenc_path())
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let frames = match decode_stream(&stream) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME} failed outright, not a named refusal (seed {seed}): {msg}"
+                    );
+                    named_refusals += 1;
+                    eprintln!("seed {seed} refusal: {msg}");
+                    continue;
+                }
+                Ok(frames) => frames,
+            };
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
+            assert_eq!(frames.len(), frame_count);
+            let mismatched = frames
+                .iter()
+                .zip(&ffmpeg_frames)
+                .any(|(got, want)| got.y != want.y || got.u != want.u || got.v != want.v);
+            if mismatched {
+                if let Ok(path) = std::env::var("EC_AV1_GATE_DUMP") {
+                    std::fs::write(&path, &stream).expect("writing pinned stream");
+                    eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
+                }
+            }
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
+                assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
+            }
+            matched += 1;
+        }
+        assert!(
+            matched > 0,
+            "{NAME}: every attempt refused; the gate never decoded a stream"
+        );
+        assert!(
+            crate::decode::rect64_qidx_drift_hits() > 0,
+            "{NAME}: zero rect64 dequant calls ever observed CURRENT_Q_IDX != base_q_idx \
+             ({matched} matches, {named_refusals} refusals out of {n_attempts}) -- delta_q \
+             was never actually exercised through decode_block_rect64 this run"
+        );
+        eprintln!(
+            "{NAME}: {named_refusals} named refusals, {matched} pixel-exact matches out of \
+             {n_attempts}, sb_rect_hits={}, rect64_qidx_drift_hits={}",
+            crate::decode::sb_rect_hits(),
+            crate::decode::rect64_qidx_drift_hits()
+        );
+    }
+
     /// lane-sbpart r4: replays a pinned mismatch byte-for-byte off disk (no
     /// aomenc/ffmpeg re-encode), same pattern as `pinned_golden3/4_stream_
     /// decodes_pixel_exact` -- fast red/green loop for the bisect, and lets
