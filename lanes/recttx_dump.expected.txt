@@ -1,0 +1,14 @@
+4x8 DCT_DCT checksum=7290
+8x4 DCT_DCT checksum=7223
+8x16 DCT_DCT checksum=56211
+16x8 DCT_DCT checksum=56161
+16x32 DCT_DCT checksum=893635
+32x16 DCT_DCT checksum=893210
+32x64 DCT_DCT checksum=14260693
+64x32 DCT_DCT checksum=14265125
+4x16 DCT_DCT checksum=20091
+16x4 DCT_DCT checksum=20156
+8x32 DCT_DCT checksum=159207
+32x8 DCT_DCT checksum=159430
+16x64 DCT_DCT checksum=2537255
+64x16 DCT_DCT checksum=2548119
