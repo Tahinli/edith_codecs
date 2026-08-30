@@ -4907,9 +4907,24 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         }
         let mut dec = SymbolDecoder::new(tile_bytes);
         neighbours.start_tile(mi_row0 as usize, mi_col0 as usize, mi_col1 as usize);
-        y.set_tile_origin(mi_col0 as usize * 4, mi_row0 as usize * 4);
-        u.set_tile_origin(mi_col0 as usize * 2, mi_row0 as usize * 2);
-        v.set_tile_origin(mi_col0 as usize * 2, mi_row0 as usize * 2);
+        y.set_tile_origin(
+            mi_col0 as usize * 4,
+            mi_row0 as usize * 4,
+            (mi_col1 as usize * 4).min(y.width),
+            (mi_row1 as usize * 4).min(y.height),
+        );
+        u.set_tile_origin(
+            mi_col0 as usize * 2,
+            mi_row0 as usize * 2,
+            (mi_col1 as usize * 2).min(u.width),
+            (mi_row1 as usize * 2).min(u.height),
+        );
+        v.set_tile_origin(
+            mi_col0 as usize * 2,
+            mi_row0 as usize * 2,
+            (mi_col1 as usize * 2).min(v.width),
+            (mi_row1 as usize * 2).min(v.height),
+        );
         TILE_HITS.with(|c| c.set(c.get() + 1));
 
     for sb_r in sb_r0..sb_r1 {
