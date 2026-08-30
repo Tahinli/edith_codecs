@@ -27,6 +27,26 @@
 #       the key-frame path has no traced symbol at all between the partition
 #       read and the first coefficient block, which is precisely the gap a
 #       rect-strip desync hides in.
+#   EC_AV1_POSTDEBLOCK_DUMP=<prefix> -> <prefix>.f<N> per frame, Y then U then
+#       V, full ALIGNED-buffer rows (y_width/y_height, not y_crop_width --
+#       cm->cur_frame->buf at this point is still the pre-superres buffer,
+#       but its aligned width already extends past FrameWidth out to the
+#       mi-aligned true width, which is exactly the margin content we need).
+#       Written right after av1_loop_filter_frame_mt returns and before
+#       CDEF/superres run -- ground truth for the post-deblock, pre-superres
+#       row content over frame_width..true_width that decode.rs stashes as
+#       its superres margin (lane-superres r5: hand-tracing the arithmetic
+#       could only prove our own self-consistency, not correctness against
+#       libaom).
+#   Rung 9 (unconditional, no env gate) -- SGR per-tap ground truth
+#       (lane-lr r7): `calculate_intermediate_result` in
+#       av1/common/restoration.c is `static`, so a standalone harness cannot
+#       call it to get real A[]/B[] intermediate arrays, only the final
+#       flt0/flt1 via the public av1_selfguided_restoration_c. This rung
+#       drops `static` so an external harness can call it directly with a
+#       `dgd32`-style buffer (see scripts/lr-sgr-pin-harness.c) and diff
+#       every A[k]/B[k] tap against a from-scratch recompute -- the missing
+#       half of r6's 9-tap cross-check. No behaviour change (only linkage).
 #
 # Idempotent: re-running is a no-op. Rebuild afterwards with
 #   ninja -C ~/.cache/aom-oracle/build aomdec
@@ -263,3 +283,208 @@ s = s.replace(old, new, 1)
 open(path, "w").write(s)
 print("intra mode-info instrumented")
 PYI
+
+# --- rung 6: post-deblock, pre-superres row dump ------------------------
+python3 - "$F" <<'PYD'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+if "EC_INSTRUMENTED_POSTDEBLOCK" in s:
+    print("postdeblock dump already instrumented (no-op)")
+    sys.exit(0)
+
+anchor = """    if (cm->lf.filter_level[0] || cm->lf.filter_level[1]) {
+      av1_loop_filter_frame_mt(&cm->cur_frame->buf, cm, &pbi->dcb.xd, 0,
+                               num_planes, 0, pbi->tile_workers,
+                               pbi->num_workers, &pbi->lf_row_sync, 0);
+    }
+"""
+dump = """
+    /* EC_INSTRUMENTED_POSTDEBLOCK */
+    {
+      const char *ec_dump = getenv("EC_AV1_POSTDEBLOCK_DUMP");
+      if (ec_dump) {
+        static int ec_postdeblock_idx = 0;
+        char ec_path[1024];
+        snprintf(ec_path, sizeof(ec_path), "%s.f%d", ec_dump,
+                 ec_postdeblock_idx++);
+        FILE *ec_f = fopen(ec_path, "wb");
+        if (ec_f) {
+          const YV12_BUFFER_CONFIG *ec_b = &cm->cur_frame->buf;
+          /* Dump the FULL aligned buffer (y_width/y_height), not the
+           * crop_width/crop_height (== FrameWidth/FrameHeight): the
+           * superres margin (columns [FrameWidth, true mi-aligned width))
+           * only exists in the aligned buffer -- lane-superres r5. */
+          for (int ec_r = 0; ec_r < ec_b->y_height; ++ec_r)
+            fwrite(ec_b->y_buffer + ec_r * ec_b->y_stride, 1, ec_b->y_width,
+                   ec_f);
+          if (num_planes > 1) {
+            for (int ec_r = 0; ec_r < ec_b->uv_height; ++ec_r)
+              fwrite(ec_b->u_buffer + ec_r * ec_b->uv_stride, 1,
+                     ec_b->uv_width, ec_f);
+            for (int ec_r = 0; ec_r < ec_b->uv_height; ++ec_r)
+              fwrite(ec_b->v_buffer + ec_r * ec_b->uv_stride, 1,
+                     ec_b->uv_width, ec_f);
+          }
+          fclose(ec_f);
+        }
+      }
+    }
+"""
+assert anchor in s, "loop filter call anchor moved"
+s = s.replace(anchor, anchor + dump, 1)
+open(path, "w").write(s)
+print("postdeblock dump instrumented")
+PYD
+
+# --- rung 7: pre-deblock, FULL aligned-buffer row dump (lane-superres r5) -
+# EC_AV1_PREFILT_DUMP (rung 1) is used by other lanes at its existing
+# y_crop_width/y_crop_height shape -- left untouched. This adds a second,
+# additive env var at the SAME anchor (pre-loop-filter) but dumping the full
+# y_width/y_height aligned buffer, so a margin-region reconstruction bug can
+# be told apart from a margin-region deblock bug.
+python3 - "$F" <<'PYW'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+if "EC_INSTRUMENTED_PREFILT_WIDE" in s:
+    print("prefilt-wide dump already instrumented (no-op)")
+    sys.exit(0)
+
+anchor = """  av1_alloc_cdef_buffers(cm, &pbi->cdef_worker, &pbi->cdef_sync,
+                         pbi->num_workers, 1);"""
+dump = """  /* EC_INSTRUMENTED_PREFILT_WIDE */
+  {
+    const char *ec_dump = getenv("EC_AV1_PREFILT_WIDE_DUMP");
+    if (ec_dump) {
+      static int ec_prefilt_wide_idx = 0;
+      char ec_path[1024];
+      snprintf(ec_path, sizeof(ec_path), "%s.f%d", ec_dump,
+               ec_prefilt_wide_idx++);
+      FILE *ec_f = fopen(ec_path, "wb");
+      if (ec_f) {
+        const YV12_BUFFER_CONFIG *ec_b = &cm->cur_frame->buf;
+        for (int ec_r = 0; ec_r < ec_b->y_height; ++ec_r)
+          fwrite(ec_b->y_buffer + ec_r * ec_b->y_stride, 1, ec_b->y_width,
+                 ec_f);
+        if (num_planes > 1) {
+          for (int ec_r = 0; ec_r < ec_b->uv_height; ++ec_r)
+            fwrite(ec_b->u_buffer + ec_r * ec_b->uv_stride, 1,
+                   ec_b->uv_width, ec_f);
+          for (int ec_r = 0; ec_r < ec_b->uv_height; ++ec_r)
+            fwrite(ec_b->v_buffer + ec_r * ec_b->uv_stride, 1,
+                   ec_b->uv_width, ec_f);
+        }
+        fclose(ec_f);
+      }
+    }
+  }
+
+"""
+assert anchor in s, "cdef alloc anchor moved"
+s = s.replace(anchor, dump + anchor, 1)
+open(path, "w").write(s)
+print("prefilt-wide dump instrumented")
+PYW
+# --- rung 8: palette colour-index map range ladder (detokenize.c) -------
+# EC_TRACE_PALETTE=1 -> "EC_PAL row=.. col=.. ctx=.. n=.. rng=.." before every
+# colour-index symbol in decode_color_map_tokens's wavefront, "EC_PAL_VAL
+# row=.. col=.. color_idx=.. rng=.." after. lane-palette r4: r3 already
+# cleared every table/context function against this same source line-for-line
+# by hand; this rung is what lets a real per-symbol range compare (class
+# compare-range-not-tell / equal-range-means-unread) replace that by-hand
+# check instead of re-reading the tables again.
+I="$SRC/av1/decoder/detokenize.c"
+[ -f "$I" ] || { echo "no oracle source at $I" >&2; exit 1; }
+
+python3 - "$I" <<'PYP'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+if "EC_INSTRUMENTED_PALETTE" in s:
+    print("palette map already instrumented (no-op)")
+    sys.exit(0)
+
+old = """      const int color_ctx = av1_get_palette_color_index_context(
+          color_map, plane_block_width, (i - j), j, n, color_order, NULL);
+      const int color_idx = aom_read_symbol(
+          r, color_map_cdf[n - PALETTE_MIN_SIZE][color_ctx], n, ACCT_STR);
+      assert(color_idx >= 0 && color_idx < n);
+      color_map[(i - j) * plane_block_width + j] = color_order[color_idx];"""
+new = """/* EC_INSTRUMENTED_PALETTE */
+      const int color_ctx = av1_get_palette_color_index_context(
+          color_map, plane_block_width, (i - j), j, n, color_order, NULL);
+      const int ec_pal_trace = getenv("EC_TRACE_PALETTE") != NULL;
+      if (ec_pal_trace) {
+        fprintf(stderr, "EC_PAL row=%d col=%d ctx=%d n=%d rng=%u\\n", (i - j),
+                j, color_ctx, n, (unsigned)r->ec.rng);
+      }
+      const int color_idx = aom_read_symbol(
+          r, color_map_cdf[n - PALETTE_MIN_SIZE][color_ctx], n, ACCT_STR);
+      assert(color_idx >= 0 && color_idx < n);
+      color_map[(i - j) * plane_block_width + j] = color_order[color_idx];
+      if (ec_pal_trace) {
+        fprintf(stderr, "EC_PAL_VAL row=%d col=%d color_idx=%d rng=%u\\n",
+                (i - j), j, color_idx, (unsigned)r->ec.rng);
+      }"""
+assert old in s, "decode_color_map_tokens loop body moved"
+s = s.replace(old, new, 1)
+s = s.replace(
+    "static void decode_color_map_tokens(Av1ColorMapParam *param, aom_reader *r) {",
+    "/* EC_INSTRUMENTED_PALETTE */\nstatic void decode_color_map_tokens(Av1ColorMapParam *param, aom_reader *r) {",
+    1,
+)
+open(path, "w").write(s)
+print("palette map instrumented")
+PYP
+
+# --- rung 8b: palette map[0] (av1_read_uniform) range ladder ------------
+python3 - "$I" <<'PYP0'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+if "EC_INSTRUMENTED_PALETTE_UNIFORM" in s:
+    print("palette map[0] already instrumented (no-op)")
+    sys.exit(0)
+
+old = """  // The first color index.
+  color_map[0] = av1_read_uniform(r, n);
+  assert(color_map[0] < n);"""
+new = """  // The first color index.
+  /* EC_INSTRUMENTED_PALETTE_UNIFORM */
+  if (getenv("EC_TRACE_PALETTE") != NULL) {
+    fprintf(stderr, "EC_PAL row=0 col=0 ctx=-1 n=%d rng=%u\\n", n,
+            (unsigned)r->ec.rng);
+  }
+  color_map[0] = av1_read_uniform(r, n);
+  assert(color_map[0] < n);
+  if (getenv("EC_TRACE_PALETTE") != NULL) {
+    fprintf(stderr, "EC_PAL_VAL row=0 col=0 color_idx=%d rng=%u\\n",
+            color_map[0], (unsigned)r->ec.rng);
+  }"""
+assert old in s, "color_map[0] uniform read moved"
+s = s.replace(old, new, 1)
+open(path, "w").write(s)
+print("palette map[0] instrumented")
+PYP0
+
+# --- rung 9: export calculate_intermediate_result for a direct harness call
+I="$SRC/av1/common/restoration.c"
+[ -f "$I" ] || { echo "no oracle source at $I" >&2; exit 1; }
+
+python3 - "$I" <<'PYA'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+if "/* EC_INSTRUMENTED_AB */" in s:
+    print("calculate_intermediate_result already exported (no-op)")
+    sys.exit(0)
+
+old = """static void calculate_intermediate_result(int32_t *dgd, int width, int height,"""
+new = """/* EC_INSTRUMENTED_AB */
+void calculate_intermediate_result(int32_t *dgd, int width, int height,"""
+assert old in s, "calculate_intermediate_result signature moved"
+s = s.replace(old, new, 1)
+open(path, "w").write(s)
+print("calculate_intermediate_result exported")
+PYA
