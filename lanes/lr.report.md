@@ -440,3 +440,90 @@ lesson: rerun a "found the bug" number at least once before trusting
 it, both false positives here were stale/mistyped variable state, not
 real). Ran out of budget before pinning the exact source-level cause;
 r7 should start at option (a) above, not redo any of the ruled-out list.
+
+## r7 -- VERDICT: not green, still one pixel. Built the ground-truth
+instrument r6 asked for, but it could not reproduce r6's own "254 vs
+253" divergence this round -- open, needs r8 to re-derive with a
+uniquely-identified call (see below). Committed `ff1e62f` (harness +
+oracle rung + gate pin, all forward progress, no behaviour change to
+the decoder).
+
+**Built** (option (a) from r6, done):
+- `scripts/instrument-aom-oracle.sh` rung 6: drops `static` from
+  libaom's `calculate_intermediate_result` (restoration.c) so an
+  external harness can call it directly. Rebuilt
+  `~/.cache/aom-oracle/build/libaom.a` with it (`ninja libaom.a`).
+- `scripts/lr-sgr-pin-harness.c` extended: replicates
+  `av1_selfguided_restoration_c`'s own uint8->int32 border-extend copy,
+  then calls `calculate_intermediate_result` directly with
+  `sgr_params_idx=6, radius_idx=1, pass=0` and prints the real A/B for
+  all 9 dense-arm neighbour taps of the r6 failing pixel.
+- Wired `EC_AV1_GATE_DUMP` into
+  `a_real_aomenc_stream_with_restoration_reads_lr_symbols_correctly`
+  (stream.rs ~4791), mirroring the masked-compound gate's existing
+  pattern -- pins the exact mismatching stream instead of only
+  asserting. Ran once, wrote seed 46's stream to
+  `fixtures/lr-sgr-r7.obu` (gitignored, not in the commit -- copy
+  survives in this worktree only; regenerate with
+  `EC_AV1_GATE_DUMP=fixtures/lr-sgr-r7.obu EC_LR_GATE_ATTEMPTS=10` if
+  it's gone).
+
+**Result — real ground truth for the "u" tap**: `av1_x_by_xplus1`/
+`av1_one_by_x` real compiled tables, real box sum, real
+`ROUND_POWER_OF_TWO` all say the "u" tap (physical row 60, the box
+centred one row above the failing pixel) is `(A,B) = (253,454)`, not
+the `(254,303)` r6's report recorded. Hand-verified twice (once by
+reading libaom's source directly with these exact numbers -- z=101,
+`av1_x_by_xplus1[101]=253`, `av1_one_by_x[8]=455`,
+`ROUND_POWER_OF_TWO(3*1362*455,12)=454` -- and once independently via
+the harness's compiled call). The other 8 taps r6 already trusted are
+untouched this round.
+
+**Could not reproduce r6's divergence.** Added a temporary
+`EC_LR_SAMPLE_DUMP` env-gated `eprintln!` to `lr_sample` (reverted,
+not in the commit) and reran the live gate at `EC_LR_GATE_ATTEMPTS=5`
+(seeds 42-46, the one that panics is 46): the raw bytes our own
+`compute_ab` actually reads for the "u" tap's 3x3 window at column 6
+across the three box rows are `111` (row 59, deblocked-boundary read),
+`154` (row 60), `194` (row 61) -- these match `/tmp/lr_full.bin`'s
+bytes at the same physical positions bit for bit, and an independent
+Python replica of `compute_ab`'s exact box-sum/`z`/`A`/`B` formula fed
+the full real 9-byte window (100,111,117/140,154,163/182,194,201)
+reproduces `(253,454)` exactly -- i.e. this round could not find *any*
+wrong input or wrong arithmetic for the "u" tap; both check out
+against the real answer independently. r6's `(254,303)` number was not
+re-derived from a uniquely-identified call this round (the dump filter
+matched on `v_start==60` only, which several different seeds/frames in
+the 5-attempt window share, so the samples confirmed above are not
+provably from the exact same call r6's `eprintln!` captured, only from
+*a* call at the same coordinates producing the same real bytes).
+
+**Do not re-suspect** (unchanged from r6, now doubly confirmed): `lr_sample`
+boundary substitution, the box-sum inputs themselves, the fast/r0 arm,
+`compute_ab`'s formula in the abstract (matches source + a from-scratch
+Python replica bit for bit for these 9 real bytes).
+
+**r8 should**: use the now-committed `EC_AV1_GATE_DUMP` wiring plus
+`fixtures/lr-sgr-r7.obu` to decode the *single pinned seed-46 stream*
+directly (not the live 40-attempt sweep, which reuses coordinates
+across unrelated frames), and re-add a debug dump keyed to a value
+unique to this one call (e.g. tag the print with a per-call sequence
+counter, or gate on the exact `xqd=[-16,-32]` this pixel uses) so the
+9 bytes it captures are provably the same call r6's original 3110-vs-3109
+mismatch came from. If that live-captured 9-byte window differs at all
+from `100,111,117,140,154,163,182,194,201`, that's the real bug; if it
+matches, the (254,303) transcription itself was wrong and the fix is
+elsewhere (recheck `flt1`'s combine step in `apply_sgrproj_stripe`
+directly, not `compute_ab`, since r6 also independently reproduced
+`3110` by hand from the taps it recorded -- meaning either the taps or
+the combine, not both, are broken, and this round's evidence points
+at the taps).
+
+## Turn budget (r7)
+Spent on: building + verifying the rung 6 harness/oracle patch,
+capturing a fresh 9-tap real-libaom answer (all matches r6's 8 except
+the "u" tap), a live `EC_LR_SAMPLE_DUMP` trace to try to falsify
+r6's claim, and wiring + exercising `EC_AV1_GATE_DUMP` for the gate
+(new, reusable). Ran out of budget chasing down the coordinate-vs-call
+ambiguity above; r8 should start there, not redo any of this round's
+ground-truth derivation.
