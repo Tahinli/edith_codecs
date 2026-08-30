@@ -159,7 +159,13 @@ impl Edges {
             row
         };
         // Spec 7.11.2.2's no-neighbour fallback is `base = 1 << (BitDepth - 1)`
-        // (128 at 8-bit): `base - 1` above, `base + 1` left, `base` corner.
+        // (128 at 8-bit): `base - 1` above, `base + 1` left, `base` corner
+        // (libaom `reconintra.c`'s own diagram: the shared top-left corner
+        // cell is literally `base`, distinct from either row's own
+        // replicated value -- confirmed against `av1_highbd_build_intra_predictors`'s
+        // comment block, lane-tiny r1; an earlier attempt at this fix used
+        // 127/129 for the corner instead and made a passing 16x16 fixture
+        // regress, which is what caught the misreading).
         let base = 1i32 << (crate::decode::bit_depth() - 1);
         let above_row = match (above, left) {
             (Some(a), _) => extend(a),
