@@ -6398,6 +6398,28 @@ mod tests {
         let mismatched = frames[0].y != ffmpeg_frames[0].y;
         eprintln!("mismatched={mismatched}");
     }
+
+    /// lane-tiny r2: decodes a raw OBU stream at `EC_TINY_FIXTURE_PATH` --
+    /// no ffmpeg/aomenc invocation -- so a range ladder can be run
+    /// (`EC_TRACE_MODE_STEP=1`) against the exact same bytes fed to the
+    /// oracle aomdec, byte for byte. `#[ignore]`d diagnostic, no assertion.
+    #[test]
+    #[ignore = "diagnostic, run manually with --nocapture and EC_TINY_FIXTURE_PATH set"]
+    fn probe_tiny_fixture_trace() {
+        let path = std::env::var("EC_TINY_FIXTURE_PATH")
+            .expect("set EC_TINY_FIXTURE_PATH to an .obu file");
+        let stream = std::fs::read(&path).expect("reading fixture");
+        match decode_stream(&stream) {
+            Ok(frames) => {
+                eprintln!("decoded {} frame(s)", frames.len());
+                if let Ok(dump) = std::env::var("EC_TINY_FIXTURE_Y_DUMP") {
+                    let bytes: Vec<u8> = frames[0].y.iter().map(|&v| v as u8).collect();
+                    std::fs::write(&dump, &bytes).expect("dump y plane");
+                }
+            }
+            Err(e) => eprintln!("REFUSED: {e}"),
+        }
+    }
     /// Pinned streams captured by `EC_AV1_GATE_DUMP` off
     /// `a_real_aomenc_stream_with_warped_motion_refuses_or_matches` -- each
     /// one is a former mismatch, kept as a regression pin (warp-mismatch:
