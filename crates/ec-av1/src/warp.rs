@@ -415,8 +415,8 @@ pub fn global_warp_params(wmmat: [i32; 6]) -> Option<WarpParams> {
     Some(WarpParams { wmmat, alpha, beta, gamma, delta })
 }
 
-fn clip_pixel(v: i32) -> u8 {
-    v.clamp(0, 255) as u8
+fn clip_pixel(v: i32) -> u16 {
+    v.clamp(0, crate::decode::sample_max()) as u16
 }
 
 /// `av1_warp_affine_c` (`warped_motion.c`), 8-bit, non-compound only:
@@ -427,11 +427,11 @@ fn clip_pixel(v: i32) -> u8 {
 #[allow(clippy::too_many_arguments)]
 pub fn warp_affine(
     params: &WarpParams,
-    reference: &[u8],
+    reference: &[u16],
     width: i32,
     height: i32,
     stride: i32,
-    dst: &mut [u8],
+    dst: &mut [u16],
     p_col: i32,
     p_row: i32,
     p_width: i32,

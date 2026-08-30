@@ -353,7 +353,7 @@ fn add_noise_to_block(
                 let delta = (scaling_cb[scaled as usize] * cb_grain[gidx] + rounding_offset)
                     >> scaling_shift;
                 picture.u[cidx] =
-                    ((picture.u[cidx] as i32 + delta).clamp(min_chroma, max_chroma)) as u8;
+                    ((picture.u[cidx] as i32 + delta).clamp(min_chroma, max_chroma)) as u16;
             }
             if apply_cr {
                 let scaled = (((average_luma * cr_luma_mult + cr_mult * picture.v[cidx] as i32)
@@ -363,7 +363,7 @@ fn add_noise_to_block(
                 let delta = (scaling_cr[scaled as usize] * cr_grain[gidx] + rounding_offset)
                     >> scaling_shift;
                 picture.v[cidx] =
-                    ((picture.v[cidx] as i32 + delta).clamp(min_chroma, max_chroma)) as u8;
+                    ((picture.v[cidx] as i32 + delta).clamp(min_chroma, max_chroma)) as u16;
             }
         }
     }
@@ -376,7 +376,7 @@ fn add_noise_to_block(
                     + rounding_offset)
                     >> scaling_shift;
                 picture.y[pidx] =
-                    ((picture.y[pidx] as i32 + delta).clamp(min_luma, max_luma)) as u8;
+                    ((picture.y[pidx] as i32 + delta).clamp(min_luma, max_luma)) as u16;
             }
         }
     }
