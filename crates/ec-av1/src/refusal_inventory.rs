@@ -39,6 +39,7 @@ const REFUSALS: &[&str] = &[
     "a 16x16 inter block whose true edge cuts through both axes needs a rectangular transform this decoder does not code yet",
     "a 32x32 partition type this decoder does not code (value={part32})",
     "a Golomb tail longer than this decoder reads",
+    "a stream whose bit depth is not 8 (this decoder reconstructs into 8-bit planes)",
     "a tx_type symbol outside its CDF's own set: {t}",
     "an INTER 32x32 partition type this decoder does not code (value={part32})",
     "a superblock-level partition type other than NONE or SPLIT (this decoder's intra tile path codes only those two at 64x64)",
