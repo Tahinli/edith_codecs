@@ -128,6 +128,19 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 }
             }
             let output = if header.film_grain.apply_grain {
+                // lane-hbd r5: `film_grain.rs`'s grain LUT and blend are
+                // hardcoded 8-bit (`[i32; 256]`, clamps at 255) -- narrowed
+                // from the old blanket bit-depth refusal to only the case
+                // that actually reaches unported code.
+                let bit_depth = parser
+                    .sequence_header()
+                    .map_or(8, |seq| seq.color_config.bit_depth);
+                if bit_depth != 8 {
+                    return Err(Error::unsupported(
+                        "AV1 decode_stream",
+                        "a bit depth other than 8 with film grain applied (film_grain.rs's LUT and blend are hardcoded 8-bit)",
+                    ));
+                }
                 let mc_identity = parser
                     .sequence_header()
                     .is_some_and(|seq| seq.color_config.matrix_coefficients == 0);
@@ -501,6 +514,15 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
             // call above, right before anything else can overwrite it) --
             // see `decode::take_last_key_frame_wide_margin`'s doc.
             let wide_margin = crate::decode::take_last_key_frame_wide_margin();
+            // lane-hbd r5: `upscale_row` (superres.rs) is `&[u8]`, clamping at
+            // 255 -- narrowed from the old blanket bit-depth refusal to only
+            // the case that actually reaches unported code.
+            if header.use_superres && bit_depth != 8 {
+                return Err(Error::unsupported(
+                    "AV1 decode_stream",
+                    "a bit depth other than 8 with use_superres set (superres.rs's upscale_row is hardcoded 8-bit)",
+                ));
+            }
             let picture = if header.use_superres {
                 crate::superres::upscale_picture(
                     &picture,
@@ -667,6 +689,14 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         }
         if header.show_frame {
             let output = if header.film_grain.apply_grain {
+                // lane-hbd r5: same 8-bit-only LUT/blend as the
+                // show_existing_frame arm above.
+                if bit_depth != 8 {
+                    return Err(Error::unsupported(
+                        "AV1 decode_stream",
+                        "a bit depth other than 8 with film grain applied (film_grain.rs's LUT and blend are hardcoded 8-bit)",
+                    ));
+                }
                 let mc_identity = parser
                     .sequence_header()
                     .is_some_and(|seq| seq.color_config.matrix_coefficients == 0);
