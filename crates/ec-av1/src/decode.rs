@@ -21,7 +21,9 @@
 //! too). Anything outside that refuses with [`Error::unsupported`] rather than
 //! silently miscoding.
 
-use ec_av1_syntax::{CdefParams, DeltaParams, LoopFilterParams, TileInfo};
+use ec_av1_syntax::{
+    CdefParams, DeltaParams, LoopFilterParams, LoopRestorationParams, TileInfo,
+};
 use ec_core::{Error, Result};
 
 use crate::cdf;
@@ -3353,6 +3355,7 @@ fn cfl_scaled(alpha_q3: i32, ac_q3: i32) -> i32 {
 /// [`crate::encode`]'s private `Plane`, whose `edges` this mirrors exactly
 /// (own-edge and reach clamps both), passing what it gathers straight to
 /// [`crate::intra::predict`] instead of hand-rolling `DC_PRED` alone.
+#[derive(Clone)]
 struct PlaneBuf {
     data: Vec<u8>,
     width: usize,
@@ -5333,6 +5336,62 @@ fn apply_cdef(
     }
 }
 
+/// Spec 7.17: loop restoration, run after [`apply_cdef`] (a sibling lane's
+/// ordering note: libaom also runs `superres_post_decode` between the two,
+/// but this decoder never implements super-resolution, so there is nothing
+/// to interleave). `deblocked_*` is each plane's post-deblock, pre-CDEF
+/// buffer (the caller clones it before calling [`apply_cdef`]) -- loop
+/// restoration's stripe-boundary rows read from it instead of the
+/// CDEF-filtered plane, per `restoration.rs`'s own `lr_sample` doc comment.
+#[allow(clippy::too_many_arguments)]
+fn apply_loop_restoration(
+    y: &mut PlaneBuf,
+    u: &mut PlaneBuf,
+    v: &mut PlaneBuf,
+    deblocked_y: &PlaneBuf,
+    deblocked_u: &PlaneBuf,
+    deblocked_v: &PlaneBuf,
+    lr: &LoopRestorationParams,
+    grid: &crate::restoration::RestorationGrid,
+) {
+    y.data = crate::restoration::apply_loop_restoration_plane(
+        &y.data,
+        &deblocked_y.data,
+        y.width,
+        y.true_width,
+        y.true_height,
+        0,
+        lr.frame_restoration_type[0],
+        lr.loop_restoration_size[0],
+        grid,
+        0,
+    );
+    u.data = crate::restoration::apply_loop_restoration_plane(
+        &u.data,
+        &deblocked_u.data,
+        u.width,
+        u.true_width,
+        u.true_height,
+        1,
+        lr.frame_restoration_type[1],
+        lr.loop_restoration_size[1],
+        grid,
+        1,
+    );
+    v.data = crate::restoration::apply_loop_restoration_plane(
+        &v.data,
+        &deblocked_v.data,
+        v.width,
+        v.true_width,
+        v.true_height,
+        1,
+        lr.frame_restoration_type[2],
+        lr.loop_restoration_size[2],
+        grid,
+        2,
+    );
+}
+
 /// Decodes the payload [`crate::tile::sb_coeff_key_frame_tile`] writes,
 /// returning the picture it reconstructs to.
 ///
@@ -5384,6 +5443,7 @@ pub fn decode_key_frame_tile(
         false,
         cdef,
         loop_filter,
+        &LoopRestorationParams::default(),
         None,
         tx_select,
         reduced_tx_set,
@@ -5431,6 +5491,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     enable_edge_filter: bool,
     cdef: &CdefParams,
     loop_filter: &LoopFilterParams,
+    lr: &LoopRestorationParams,
     initial_cdfs: Option<Cdfs>,
     tx_select: bool,
     reduced_tx_set: bool,
@@ -5506,6 +5567,11 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         mi_cols as usize,
         mi_rows as usize,
     );
+    let mut lr_grid = crate::restoration::RestorationGrid::new(lr, frame_width, frame_height);
+    let mut lr_reference = [(
+        crate::restoration::WienerInfo::default(),
+        crate::restoration::SgrprojInfo::default(),
+    ); 3];
 
     // lane-tiles r2: each tile gets its own fresh `SymbolDecoder` over its
     // own byte range and its own fresh copy of the frame's initial CDFs
@@ -5570,6 +5636,16 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     for sb_r in sb_r0..sb_r1 {
         neighbours.start_row();
         for sb_c in sb_c0..sb_c1 {
+            crate::restoration::read_lr(
+                &mut dec,
+                &mut cdfs,
+                lr,
+                &mut lr_grid,
+                &mut lr_reference,
+                sb_r * SB_MI,
+                sb_c * SB_MI,
+                SB_MI,
+            );
             CDEF_TRANSMITTED.with(|c| c.set(false));
             let at = (sb_r as usize * 4, sb_c as usize * 4);
             let ctx = neighbours.partition_ctx(at, SB);
@@ -6020,7 +6096,9 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         frame_width as usize,
         frame_height as usize,
     );
+    let (deblocked_y, deblocked_u, deblocked_v) = (y.clone(), u.clone(), v.clone());
     apply_cdef(&mut y, &mut u, &mut v, cdef, &neighbours);
+    apply_loop_restoration(&mut y, &mut u, &mut v, &deblocked_y, &deblocked_u, &deblocked_v, lr, &lr_grid);
 
     let (fw, fh) = (frame_width as usize, frame_height as usize);
     if fw == width && fh == height {
@@ -10213,6 +10291,7 @@ pub fn decode_inter_frame_tile(
         other_refs,
         cdef,
         loop_filter,
+        &LoopRestorationParams::default(),
         None,
         allow_high_precision_mv,
         force_integer_mv,
@@ -10256,6 +10335,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     other_refs: [Option<&Picture>; 8],
     cdef: &CdefParams,
     loop_filter: &LoopFilterParams,
+    lr: &LoopRestorationParams,
     initial_cdfs: Option<Cdfs>,
     allow_high_precision_mv: bool,
     force_integer_mv: bool,
@@ -10474,6 +10554,11 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         mi_rows as usize,
     );
     let mut grid = MiGrid::new(mi_cols as usize, mi_rows as usize);
+    let mut lr_grid = crate::restoration::RestorationGrid::new(lr, frame_width, frame_height);
+    let mut lr_reference = [(
+        crate::restoration::WienerInfo::default(),
+        crate::restoration::SgrprojInfo::default(),
+    ); 3];
 
     // lane-tiles r6: mirrors decode_key_frame_tile_with_cdfs's own per-tile
     // loop (spec 5.11.2 decode_tile / 7.20 exit_symbol) -- each tile gets
@@ -10544,6 +10629,16 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     for sb_r in sb_r0..sb_r1 {
         neighbours.start_row();
         for sb_c in sb_c0..sb_c1 {
+            crate::restoration::read_lr(
+                &mut dec,
+                &mut cdfs,
+                lr,
+                &mut lr_grid,
+                &mut lr_reference,
+                sb_r * SB_MI,
+                sb_c * SB_MI,
+                SB_MI,
+            );
             CDEF_TRANSMITTED.with(|c| c.set(false));
             let sb_at = (sb_r as usize * 4, sb_c as usize * 4);
             let sb_ctx = neighbours.partition_ctx(sb_at, SB);
@@ -11763,7 +11858,9 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         frame_width as usize,
         frame_height as usize,
     );
+    let (deblocked_y, deblocked_u, deblocked_v) = (y.clone(), u.clone(), v.clone());
     apply_cdef(&mut y, &mut u, &mut v, cdef, &neighbours);
+    apply_loop_restoration(&mut y, &mut u, &mut v, &deblocked_y, &deblocked_u, &deblocked_v, lr, &lr_grid);
 
     let motion_field = build_motion_field(
         &grid,
