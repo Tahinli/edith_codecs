@@ -1329,6 +1329,15 @@ struct Neighbours {
     /// widened from a bare `is_inter` bool, which collapsed every non-`LAST`
     /// reference onto `LAST_FRAME`'s own delta).
     ref_grid: Vec<i8>,
+    /// This tile's own top-left corner, in 4x4 mode-info units (spec
+    /// `MiRowStart`/`MiColStart`) -- lane-tiles: every "is there really a
+    /// neighbour" check compares against this instead of literal `0`, since a
+    /// block at the tile's own top/left edge has no usable neighbour even
+    /// though a decoded block sits there in the picture (spec `decode_tile`'s
+    /// per-tile `clear_above_context`/`left_available`/`up_available`).
+    /// `0` for a single-tile frame, matching every existing caller exactly.
+    tile_row0_mi: usize,
+    tile_col0_mi: usize,
 }
 
 impl Neighbours {
@@ -1367,6 +1376,40 @@ impl Neighbours {
             tx_grid: vec![0u8; cols * (SUB / MI) * rows * (SUB / MI)],
             tx_h_grid: vec![0u8; cols * (SUB / MI) * rows * (SUB / MI)],
             ref_grid: vec![0i8; cols * (SUB / MI) * rows * (SUB / MI)],
+            tile_row0_mi: 0,
+            tile_col0_mi: 0,
+        }
+    }
+
+    /// spec `decode_tile`'s per-tile reset: `clear_above_context` over this
+    /// tile's own column span (`col1_mi` exclusive), plus recording
+    /// `(row0_mi, col0_mi)` as the tile's own top-left mi cell for every
+    /// availability check below. Left context resets every superblock row
+    /// regardless of tile ([`Self::start_row`], already called once per SB
+    /// row by every caller) so it needs no tile-specific reset here.
+    fn start_tile(&mut self, row0_mi: usize, col0_mi: usize, col1_mi: usize) {
+        self.tile_row0_mi = row0_mi;
+        self.tile_col0_mi = col0_mi;
+        let end = col1_mi.min(self.above.len());
+        for i in col0_mi.min(end)..end {
+            self.above[i] = Default::default();
+            self.above_side_mi[i] = SB;
+        }
+        let (sc0, sc1) = (
+            col0_mi / (SUB / MI),
+            (col1_mi / (SUB / MI)).min(self.above_mode.len()),
+        );
+        for i in sc0.min(sc1)..sc1 {
+            self.above_mode[i] = DC_PRED;
+            self.above_side[i] = SB;
+            self.above_skip[i] = false;
+            self.above_skip_mode[i] = false;
+            self.above_inter[i] = false;
+            self.above_ref[i] = -1;
+            self.above_ref1[i] = None;
+            self.above_comp_group_idx[i] = 0;
+            self.above_compound_idx[i] = 0;
+            self.above_filter[i] = [3u8; 2];
         }
     }
 
@@ -1455,8 +1498,8 @@ impl Neighbours {
     /// with an absent neighbour contributing 0. The mi grid is per tile, so
     /// row/column 0 is a tile edge and has no neighbour on that axis.
     fn skip_txfm_ctx(&self, mi_r: usize, mi_c: usize) -> usize {
-        usize::from(mi_r > 0 && self.skip_at(mi_r - 1, mi_c))
-            + usize::from(mi_c > 0 && self.skip_at(mi_r, mi_c - 1))
+        usize::from(mi_r > self.tile_row0_mi && self.skip_at(mi_r - 1, mi_c))
+            + usize::from(mi_c > self.tile_col0_mi && self.skip_at(mi_r, mi_c - 1))
     }
 
     fn is_skip_txfm(&self, mi_r: usize, mi_c: usize) -> bool {
@@ -2021,8 +2064,8 @@ fn tx_size_context_rect(
     own_w: usize,
     own_h: usize,
 ) -> usize {
-    let above = mi_r > 0 && tx_px_at(n, false, mi_r - 1, mi_c) as usize >= own_w;
-    let left = mi_c > 0 && tx_h_px_at(n, false, mi_r, mi_c - 1) as usize >= own_h;
+    let above = mi_r > n.tile_row0_mi && tx_px_at(n, false, mi_r - 1, mi_c) as usize >= own_w;
+    let left = mi_c > n.tile_col0_mi && tx_h_px_at(n, false, mi_r, mi_c - 1) as usize >= own_h;
     usize::from(above) + usize::from(left)
 }
 
@@ -3808,8 +3851,8 @@ fn tx_h_px_at(n: &Neighbours, chroma: bool, mi_r: usize, mi_c: usize) -> u32 {
 /// to the left (at its own topmost mi row) coded a transform at least as wide
 /// as `own_side`.
 fn tx_size_context(n: &Neighbours, (mi_r, mi_c): (usize, usize), own_side: usize) -> usize {
-    let above = mi_r > 0 && tx_px_at(n, false, mi_r - 1, mi_c) as usize >= own_side;
-    let left = mi_c > 0 && tx_h_px_at(n, false, mi_r, mi_c - 1) as usize >= own_side;
+    let above = mi_r > n.tile_row0_mi && tx_px_at(n, false, mi_r - 1, mi_c) as usize >= own_side;
+    let left = mi_c > n.tile_col0_mi && tx_h_px_at(n, false, mi_r, mi_c - 1) as usize >= own_side;
     usize::from(above) + usize::from(left)
 }
 
@@ -6387,7 +6430,10 @@ fn decode_inter_block(
         ));
     }
 
-    let (has_above, has_left) = (r > 0, c > 0);
+    let (has_above, has_left) = (
+        r > neighbours.tile_row0_mi / (SUB / MI),
+        c > neighbours.tile_col0_mi / (SUB / MI),
+    );
     let (above_inter, left_inter) = (neighbours.above_inter[c], neighbours.left_inter[r]);
     let ii_ctx = intra_inter_ctx(has_above, has_left, above_inter, left_inter);
     let is_inter = skip_mode || dec.symbol(&mut cdfs.intra_inter[ii_ctx]) == 1;
@@ -8106,7 +8152,10 @@ fn decode_inter_block8(
     let skip_ctx = usize::from(above_skip) + usize::from(left_skip);
     let skip = skip_mode || dec.symbol(&mut cdfs.skip[skip_ctx]) == 1;
 
-    let (has_above, has_left) = (leaf_mi.0 > 0, leaf_mi.1 > 0);
+    let (has_above, has_left) = (
+        leaf_mi.0 > neighbours.tile_row0_mi,
+        leaf_mi.1 > neighbours.tile_col0_mi,
+    );
     let ii_ctx = intra_inter_ctx(has_above, has_left, above_inter, left_inter);
     let is_inter = skip_mode || dec.symbol(&mut cdfs.intra_inter[ii_ctx]) == 1;
 
