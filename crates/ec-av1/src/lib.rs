@@ -30,6 +30,7 @@ pub mod msac;
 pub mod mvstack;
 pub mod obu;
 pub mod quant;
+mod refusal_inventory;
 pub mod sequence;
 pub mod stream;
 pub mod tile;
