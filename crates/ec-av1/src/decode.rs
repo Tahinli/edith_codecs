@@ -970,7 +970,14 @@ fn nz_map_ctx_offset_1d(i: usize) -> usize {
     }
 }
 
-fn base_ctx(grid: &[i32], side: usize, row: usize, col: usize, class: TxClass) -> usize {
+fn base_ctx(
+    grid: &[i32],
+    side: usize,
+    row: usize,
+    col: usize,
+    class: TxClass,
+    rect_shape: Option<(usize, usize)>,
+) -> usize {
     // libaom's `get_nz_map_ctx_from_stats` only special-cases the DC
     // coefficient to ctx 0 for `TX_CLASS_2D` (`(tx_class | coeff_idx) == 0`,
     // txb_common.h) -- `V_DCT`/`H_DCT` (class `Horiz`/`Vert`) still run the DC
@@ -993,7 +1000,22 @@ fn base_ctx(grid: &[i32], side: usize, row: usize, col: usize, class: TxClass) -
         .sum();
     let ctx = ((mag + 1) >> 1).min(4) as usize;
     match class {
-        TxClass::TwoD => ctx + cdf::NZ_MAP_CTX_OFFSET_32[row.min(4)][col.min(4)] as usize,
+        // libaom's CDF *set* for a truncated 64-wide/tall corner resolves
+        // through `get_txsize_entropy_ctx` to the square `TX_64X64` (this
+        // decoder's `TxbSet::Luma64`), but `get_nz_map_ctx_from_stats`
+        // separately indexes `av1_nz_map_ctx_offset` by the raw, un-adjusted
+        // `tx_size` -- `TX_32X64`/`TX_64X32` for a superblock-level HORZ/VERT
+        // strip, which own a genuinely different table from the square one
+        // (lane-sbpart r8 root cause: `(row=1, col=0)` reads ctx 2 under the
+        // square table vs the real ctx 13 the rect table gives).
+        TxClass::TwoD => {
+            let table = match rect_shape {
+                Some((w, h)) if w < h => &cdf::NZ_MAP_CTX_OFFSET_32X64,
+                Some((w, h)) if w > h => &cdf::NZ_MAP_CTX_OFFSET_64X32,
+                _ => &cdf::NZ_MAP_CTX_OFFSET_32,
+            };
+            ctx + table[row.min(4)][col.min(4)] as usize
+        }
         TxClass::Horiz => ctx + nz_map_ctx_offset_1d(col.min(31)),
         TxClass::Vert => ctx + nz_map_ctx_offset_1d(row.min(31)),
     }
@@ -1286,6 +1308,13 @@ fn read_coeffs(
     // a size the spec forces to `DCT_DCT` regardless of mode (32-point and
     // up, `EXT_TX_SET_DCTONLY`) -- the caller already folds that in.
     default_tx_type: TxType,
+    // `Some((w, h))` with `w != h` when this read is a superblock-level
+    // HORZ/VERT strip's truncated luma corner: the CDF *set* resolves square
+    // (`side`/`coding` above), but `av1_nz_map_ctx_offset`'s position table
+    // is indexed by the real, un-adjusted rectangular shape (lane-sbpart r8
+    // root cause, see [`base_ctx`]). `None` everywhere else -- every other
+    // caller's block genuinely is `side` x `side`.
+    rect_shape: Option<(usize, usize)>,
 ) -> Result<(Vec<i32>, TxType)> {
     let trace = std::env::var_os("EC_AV1_TRACE").is_some();
     let side = coding.side;
@@ -1371,7 +1400,7 @@ fn read_coeffs(
             }
             v
         } else {
-            let ctx = base_ctx(&levels, side, row, col, class);
+            let ctx = base_ctx(&levels, side, row, col, class, rect_shape);
             let v = dec.symbol(&mut coding.base[ctx]) as i32;
             if trace {
                 eprintln!(
@@ -3434,6 +3463,7 @@ fn decode_block_rect64(
             0,
             dc_sign_ctx(around[0].2),
             TxType::DctDct,
+            Some((bw, bh)),
         )?;
         if std::env::var_os("EC_TRACE_COEFF").is_some() {
             let (rng, _) = dec.debug_state();
@@ -4235,6 +4265,7 @@ fn read_plane(
         skip_ctx,
         dc_sign_ctx(around.2),
         default_tx_type,
+        None,
     )?;
     // A 64x64 luma block's transform covers the whole 64x64 area, but only its
     // top-left 32x32 of frequencies are coded (spec 5.11.40); the rest of the
@@ -7115,6 +7146,7 @@ fn read_inter_plane(
         skip_ctx,
         dc_sign_ctx(around.2),
         default_tx_type,
+        None,
     )?;
     let residual = dequant_and_inverse_typed(&grid, side, 8, CURRENT_Q_IDX.with(|c| c.get()), tx_type);
     plane.reconstruct_mc(x, y, side, prediction, &residual);

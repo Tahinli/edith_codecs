@@ -761,6 +761,33 @@ pub const NZ_MAP_CTX_OFFSET_32: [[u8; 5]; 5] = [
     [21, 21, 21, 21, 21],
 ];
 
+/// `Av1_Nz_Map_Ctx_Offset[TX_32X64]` (libaom `txb_common.c`
+/// `av1_nz_map_ctx_offset_32x64`, row and column clamped to four): the real
+/// 32-wide/64-tall transform's own table, used when a superblock-level
+/// `PARTITION_VERT` strip's luma corner is read through [`NZ_MAP_CTX_OFFSET_32`]'s
+/// scan/CDF-set but the *un-adjusted* block shape (spec `get_txsize_entropy_ctx`
+/// resolves the CDF *set* to `TX_64X64`, but `get_nz_map_ctx_from_stats` still
+/// indexes this position table by the raw, un-adjusted `tx_size` -- lane-sbpart
+/// r8 root cause) is genuinely rectangular, not square. Distinct from
+/// [`NZ_MAP_CTX_OFFSET_32`] starting at `(row=1, col=0)`.
+pub const NZ_MAP_CTX_OFFSET_32X64: [[u8; 5]; 5] = [
+    [0, 11, 6, 6, 21],
+    [11, 11, 6, 21, 21],
+    [11, 11, 21, 21, 21],
+    [11, 11, 21, 21, 21],
+    [11, 11, 21, 21, 21],
+];
+
+/// [`NZ_MAP_CTX_OFFSET_32X64`]'s `TX_64X32` counterpart (libaom
+/// `av1_nz_map_ctx_offset_64x32`): a `PARTITION_HORZ` strip's luma corner.
+pub const NZ_MAP_CTX_OFFSET_64X32: [[u8; 5]; 5] = [
+    [0, 16, 16, 16, 16],
+    [16, 16, 16, 16, 16],
+    [6, 6, 21, 21, 21],
+    [6, 21, 21, 21, 21],
+    [21, 21, 21, 21, 21],
+];
+
 /// `Default_Txb_Skip_Cdf[2][2][7..10]` (spec 9.4): the all-zero flag of a
 /// 16x16 chroma transform block that covers its whole plane block, for the
 /// three contexts its coded neighbours give.
