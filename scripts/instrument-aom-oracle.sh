@@ -21,7 +21,12 @@
 #       two lanes stalled on 2026-08-30 because this rung did not exist.
 #   EC_TRACE_MODE=1 -> "EC_MODE mi_row=.. mi_col=.. rng=.." before every inter
 #       block's mode info, "EC_MODE_VAL .. mode=.. ref0/1=.. mv0=.. rng=.."
-#       after -- the mv-stack/DRL/mv reads EC_PART cannot see.
+#       after -- the mv-stack/DRL/mv reads EC_PART cannot see. The same flag
+#       also emits "EC_IMODE .. rng=.." / "EC_IMODE_VAL .. mode=.. uv_mode=..
+#       skip=.. tx=.. rng=.." around every INTRA key-frame block: without it
+#       the key-frame path has no traced symbol at all between the partition
+#       read and the first coefficient block, which is precisely the gap a
+#       rect-strip desync hides in.
 #
 # Idempotent: re-running is a no-op. Rebuild afterwards with
 #   ninja -C ~/.cache/aom-oracle/build aomdec
@@ -212,3 +217,49 @@ s = s.replace(old, new, 1)
 open(path, "w").write(s)
 print("decodemv instrumented")
 PYM
+
+# --- rung 5: intra key-frame mode-info ladder (decodemv.c) --------------
+python3 - "$SRC/av1/decoder/decodemv.c" <<'PYI'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+if "EC_INSTRUMENTED_INTRA" in s:
+    print("intra mode-info already instrumented (no-op)")
+    sys.exit(0)
+
+old = """static void read_intra_frame_mode_info(AV1_COMMON *const cm,
+                                       DecoderCodingBlock *dcb, aom_reader *r) {"""
+new = """/* EC_INSTRUMENTED_INTRA */
+static void ec_read_intra_frame_mode_info_impl(AV1_COMMON *const cm,
+                                               DecoderCodingBlock *dcb,
+                                               aom_reader *r);
+
+static void read_intra_frame_mode_info(AV1_COMMON *const cm,
+                                       DecoderCodingBlock *dcb, aom_reader *r) {
+  const int ec_trace = getenv("EC_TRACE_MODE") != NULL;
+  const MACROBLOCKD *const ec_xd = &dcb->xd;
+  if (ec_trace) {
+    fprintf(stderr, "EC_IMODE mi_row=%d mi_col=%d bsize=%d rng=%u\\n",
+            ec_xd->mi_row, ec_xd->mi_col, (int)ec_xd->mi[0]->bsize,
+            (unsigned)r->ec.rng);
+  }
+  ec_read_intra_frame_mode_info_impl(cm, dcb, r);
+  if (ec_trace) {
+    const MB_MODE_INFO *const ec_mbmi = ec_xd->mi[0];
+    fprintf(stderr,
+            "EC_IMODE_VAL mi_row=%d mi_col=%d mode=%d uv_mode=%d skip=%d "
+            "tx=%d rng=%u\\n",
+            ec_xd->mi_row, ec_xd->mi_col, (int)ec_mbmi->mode,
+            (int)ec_mbmi->uv_mode, (int)ec_mbmi->skip_txfm,
+            (int)ec_mbmi->tx_size, (unsigned)r->ec.rng);
+  }
+}
+
+static void ec_read_intra_frame_mode_info_impl(AV1_COMMON *const cm,
+                                               DecoderCodingBlock *dcb,
+                                               aom_reader *r) {"""
+assert old in s, "read_intra_frame_mode_info signature moved"
+s = s.replace(old, new, 1)
+open(path, "w").write(s)
+print("intra mode-info instrumented")
+PYI
