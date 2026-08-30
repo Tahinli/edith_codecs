@@ -5481,4 +5481,238 @@ mod tests {
             }
         }
     }
+
+    /// lane-tiles r3: a real two-tile-column aomenc key frame, decoded
+    /// through [`decode_key_frame_tile_with_cdfs`] directly with the whole
+    /// `tiles: &[&[u8]]` list -- `decode_stream`'s `cols > 1 || rows > 1`
+    /// refusal (this file, ~line 292) still fires for any stream this wide,
+    /// so this gate bypasses it on purpose to prove the per-tile loop r2
+    /// landed (fresh `SymbolDecoder`/CDF copy per tile, `Neighbours::start_tile`,
+    /// `PlaneBuf::set_tile_origin`) actually decodes both tiles pixel-exact
+    /// before that refusal is lifted. 128x64 is exactly two 64x64
+    /// superblocks wide with `--tile-columns=1` (`TileCols=2`), so tile 1 is
+    /// also the frame's own right edge -- the known gap (`PlaneBuf`'s
+    /// tile_x0/tile_y0 only clip left/top reach, not a non-last column's
+    /// right-edge reach) does not apply to this fixture; it would to a
+    /// 3+-column one. Tile count itself is a structural aomenc param, not
+    /// RD-dependent content, but this decoder's chroma smooth/paeth gap
+    /// (`decode.rs` "a smooth or paeth chroma mode (round 2)", unrelated to
+    /// tiles, pre-dating this lane) is content-dependent -- no aomenc flag
+    /// disables UV-only smooth/paeth search, so a small seed sweep is
+    /// needed the same way the sibling `a_real_aomenc_stream_with_*` gates
+    /// retry past unrelated named refusals (every refusal in this crate is
+    /// prefixed `"AV1 tile"` regardless of category, so unlike the sibling
+    /// gates' `warp`/`obmc`/`interintra` banned lists there is no
+    /// tile-specific substring to forbid here -- `matched > 0` plus the
+    /// hard `tile_hits > 1`/pixel-exact asserts on any actual decode are
+    /// the real proof).
+    #[test]
+    fn a_real_aomenc_stream_with_two_tile_columns_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_stream_with_two_tile_columns_decodes_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height) = (128usize, 64usize);
+        let mut matched = 0u32;
+        let mut named_refusals = 0u32;
+        for attempt in 0..20u32 {
+            let seed = 42 + attempt;
+            let source = gradients_source(seed, width, height, "duration=0.04:rate=25");
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let mut child = Command::new(aomenc_path())
+                .args([
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    "--cq-level=45",
+                    "--cpu-used=0",
+                    "--limit=1",
+                    "--kf-max-dist=1000",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--tile-columns=1",
+                    "--tile-rows=0",
+                    // This decoder hardcodes SB_MI=16 (64px) superblocks
+                    // everywhere (`decode.rs`'s sb128 dead-end, ledger
+                    // `av1-superblock-contexts`) -- without this, aomenc's
+                    // own default 128x128 superblock makes 128x64 exactly
+                    // ONE superblock wide, so `--tile-columns=1` has nothing
+                    // to split and `cols` comes back 1.
+                    "--sb-size=64",
+                    // Deblocking crosses tile boundaries by default (spec
+                    // `loop_filter_across_tiles_enabled`); `PlaneBuf`'s
+                    // tile_x0/tile_y0 origin only ever clips a tile's own
+                    // left/top reach (r2/r3's documented known gap), so a
+                    // non-last tile column's right-edge deblock would read
+                    // into the next tile's still-undecoded/differently-
+                    // origined samples. Off here since deblocking itself is
+                    // not what this gate is proving.
+                    "--loopfilter-control=0",
+                    "--enable-rect-partitions=0",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    "--enable-filter-intra=0",
+                    "--enable-smooth-intra=0",
+                    "--enable-paeth-intra=0",
+                    "--enable-directional-intra=0",
+                    "--enable-angle-delta=0",
+                    "--enable-tx-size-search=0",
+                    "--enable-cdef=0",
+                    "--enable-restoration=0",
+                    "--max-partition-size=32",
+                    "--min-partition-size=32",
+                    "--enable-palette=0",
+                    "--enable-intrabc=0",
+                    "--enable-cfl-intra=0",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+
+            // Parse the stream ourselves (rather than `decode_stream`, whose
+            // multi-tile refusal is exactly what this gate exists to run
+            // ahead of) to reach the real `Frame` OBU's `tile_info` and its
+            // full `Vec<Tile>` -- `Av1Parser::parse_obu` already locates
+            // every tile in a multi-tile tile group (`parse_tile_group`), it
+            // is only `decode_stream` that ever narrows this to
+            // `tiles.first()`.
+            let mut parser = Av1Parser::new();
+            let mut pos = 0usize;
+            let mut frame = None;
+            while pos < stream.len() {
+                let obu_offset = pos;
+                let obu = parser.parse_obu(&stream[pos..]).unwrap();
+                pos += obu.total_size;
+                if let ObuKind::Frame(header, tiles) = obu.kind {
+                    frame = Some((header, tiles, obu_offset));
+                    break;
+                }
+            }
+            let (header, tiles, obu_offset) = frame.expect("stream has a Frame OBU");
+            assert!(
+                header.tile_info.cols > 1,
+                "{NAME}: aomenc did not actually split into >1 tile column (cols={}, seed {seed})",
+                header.tile_info.cols
+            );
+            assert_eq!(
+                tiles.len(),
+                header.tile_info.cols as usize,
+                "{NAME}: expected one tile per column (seed {seed})"
+            );
+            // `Tile::offset` is relative to the buffer `parse_obu` was
+            // handed (`&stream[pos..]` at the time this OBU was parsed), so
+            // it needs `obu_offset` added back -- the same adjustment
+            // `decode_stream` makes for its own single-tile slice above.
+            let tile_bufs: Vec<&[u8]> = tiles
+                .iter()
+                .map(|t| &stream[obu_offset + t.offset..obu_offset + t.offset + t.size])
+                .collect();
+
+            let enable_filter_intra = parser
+                .sequence_header()
+                .is_some_and(|seq| seq.enable_filter_intra);
+            let enable_edge_filter = parser
+                .sequence_header()
+                .is_some_and(|seq| seq.enable_intra_edge_filter);
+
+            let before = crate::decode::tile_hits();
+            let picture = match decode_key_frame_tile_with_cdfs(
+                &tile_bufs,
+                &header.tile_info,
+                header.mi_cols,
+                header.mi_rows,
+                header.quantization.base_q_idx,
+                header.frame_width,
+                header.frame_height,
+                enable_filter_intra,
+                enable_edge_filter,
+                &header.cdef,
+                &header.loop_filter,
+                None,
+                header.tx_mode == TxMode::Select,
+                header.reduced_tx_set,
+                header.allow_screen_content_tools,
+                header.allow_intrabc,
+            ) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME} failed outright, not a named refusal (seed {seed}): {msg}"
+                    );
+                    named_refusals += 1;
+                    eprintln!("seed {seed} refusal: {msg}");
+                    continue;
+                }
+                Ok((picture, _end_cdfs)) => picture,
+            };
+            let hits = crate::decode::tile_hits() - before;
+            assert!(
+                hits > 1,
+                "{NAME}: tile_hits delta was {hits}, expected >1 -- both tiles must actually \
+                 decode, not just tile 0 (seed {seed})"
+            );
+
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
+            assert_eq!(picture.y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg (seed {seed})");
+            assert_eq!(picture.u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg (seed {seed})");
+            assert_eq!(picture.v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg (seed {seed})");
+            matched += 1;
+        }
+        assert!(
+            matched > 0,
+            "{NAME}: every attempt refused ({named_refusals} refusals); the gate never decoded \
+             a two-tile-column stream"
+        );
+        eprintln!(
+            "{NAME}: {matched} pixel-exact matches, {named_refusals} named refusals out of 20"
+        );
+    }
 }
