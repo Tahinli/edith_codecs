@@ -5207,6 +5207,127 @@ mod tests {
             crate::decode::wii_hits()
         );
     }
+
+    /// lane-rect16 r1/r2: a plain default-settings aomenc run over lavfi
+    /// `mandelbrot` (`--cpu-used=4 --end-usage=q --cq-level=32`, no
+    /// `--enable-*` flags) used to refuse frame 0 outright with "a partition
+    /// below 16x16 other than a clean split". r1 root-caused the FIRST hit to
+    /// a `PARTITION_VERT_B` `partition_w16` symbol at mi=(3,2) and wired it
+    /// (left 8x16 real `decode_block_rect` strip + two stacked 8x8
+    /// `decode_leaf8` leaves on the right). r2 re-measured after that fix
+    /// (`decision-before-quantiser`-shaped: don't trust a stale premise) and
+    /// found this stream's REAL first-hit blocker in z-order is earlier, at
+    /// mi=(0,7): a plain `PARTITION_HORZ`. That arm is now wired too
+    /// (`decode_leaf_rect`, sibling to `decode_leaf8` but real-mi-addressed
+    /// for a non-square strip) -- `horz_vert_intra_hits` proves it fires.
+    /// This exact stream's own HORZ block at mi=(0,7) is *coded* (real
+    /// coefficients), which is NOT ported (same ceiling as VERT_B's own
+    /// non-skip refusal -- no rectangular-transform coefficient tables at
+    /// this size), so decode still stops there and `vert_b_intra_hits`
+    /// never gets a chance to increment on this particular stream. This gate
+    /// proves the HORZ arm fires and the OLD (now-false) two-clause refusal
+    /// never reappears, not a pixel-exact decode of this stream.
+    #[test]
+    fn a_real_aomenc_stream_with_mandelbrot_fires_the_vert_b_partition_arm() {
+        const NAME: &str = "a_real_aomenc_stream_with_mandelbrot_fires_the_vert_b_partition_arm";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height) = (192usize, 128usize);
+        let y4m = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("mandelbrot=size={width}x{height}"),
+                "-pix_fmt",
+                "yuv420p",
+                "-t",
+                "1",
+                "-f",
+                "yuv4mpegpipe",
+                "-",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ffmpeg failed to run");
+        assert!(
+            y4m.status.success(),
+            "ffmpeg fixture: {}",
+            String::from_utf8_lossy(&y4m.stderr)
+        );
+        let mut child = Command::new(aomenc_path())
+            .args([
+                "--threads=1",
+                "--row-mt=0",
+                "--sb-size=64",
+                "--cpu-used=4",
+                "--end-usage=q",
+                "--cq-level=32",
+                "--passes=1",
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("aomenc failed to start");
+        child
+            .stdin
+            .take()
+            .expect("aomenc stdin")
+            .write_all(&y4m.stdout)
+            .expect("writing y4m to aomenc");
+        let out = child.wait_with_output().expect("aomenc failed to run");
+        assert!(
+            out.status.success(),
+            "aomenc refused the fixture: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stream = out.stdout;
+        // lane-rect16 r2: the recipe above was missing `--passes=1` --
+        // without it aomenc silently ran 2-pass and wrote nothing to stdout
+        // on pass 1 (still exit 0), so this gate always decoded an EMPTY
+        // stream and never actually exercised the arm it claims to gate.
+        assert!(
+            !stream.is_empty(),
+            "{NAME}: aomenc wrote an empty stream (missing --passes=1?)"
+        );
+        let result = decode_stream(&stream);
+        // The now-lifted false claim ("codes only the square arms below
+        // 16x16") must never appear again.
+        if let Err(e) = &result {
+            let msg = e.to_string();
+            assert!(
+                !msg.contains("this decoder codes only the square arms below 16x16"),
+                "{NAME}: the OLD (disproved) refusal reappeared: {msg}"
+            );
+        }
+        assert!(
+            crate::decode::horz_vert_intra_hits() > 0,
+            "{NAME}: the plain PARTITION_HORZ/VERT arm never fired on this stream (regression -- \
+             it fired deterministically at mi=(0,7) when this gate was written)"
+        );
+        eprintln!(
+            "{NAME}: horz_vert_intra_hits={}, vert_b_intra_hits={}, decode result: {:?}",
+            crate::decode::horz_vert_intra_hits(),
+            crate::decode::vert_b_intra_hits(),
+            result.as_ref().map(|f| f.len()).map_err(|e| e.to_string())
+        );
+    }
     /// lane-rectgate r1: every prior gate pins `--enable-rect-partitions=0
     /// --enable-ab-partitions=0 --min/max-partition-size=32` so aomenc never
     /// gets to choose a real rect/ab split. This charter's premise ("rect
