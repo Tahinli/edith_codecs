@@ -16,7 +16,8 @@
 //! an implementation detail of how this crate happens to build it).
 
 use ec_av1_syntax::{
-    Av1Parser, FrameType, NUM_REF_FRAMES, ObuKind, PRIMARY_REF_NONE, TxMode, WarpModel,
+    Av1Parser, FrameHeader, FrameType, NUM_REF_FRAMES, ObuKind, PRIMARY_REF_NONE, Tile, TxMode,
+    WarpModel,
 };
 use ec_core::{Error, Result};
 
@@ -75,12 +76,32 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
     let mut cdf_slots: [Option<Cdfs>; NUM_REF_FRAMES] = std::array::from_fn(|_| None);
 
     let mut pos = 0usize;
+    // A frame whose tiles are split across several `OBU_TILE_GROUP`s (spec
+    // 5.11.1, aomenc's `--num-tile-groups`) sends a standalone
+    // `OBU_FRAME_HEADER` first, with `show_existing_frame == false` and no
+    // tile payload of its own -- `OBU_FRAME` (the `ObuKind::Frame` arm below)
+    // only ever folds ONE tile group into the header's own OBU. Stash the
+    // header here and accumulate tiles from each `OBU_TILE_GROUP` that
+    // follows until every tile of the frame has arrived.
+    let mut pending_header: Option<Box<FrameHeader>> = None;
+    let mut pending_tiles: Vec<Tile> = Vec::new();
     while pos < data.len() {
         let obu = parser.parse_obu(&data[pos..])?;
         let obu_offset = pos;
         pos += obu.total_size;
 
         if let ObuKind::FrameHeader(header) = &obu.kind {
+            if !header.show_existing_frame {
+                // Before this fix, this branch fired unconditionally for
+                // EVERY `FrameHeader` OBU (including this one), so a
+                // standalone header always fell into the `show_existing_frame`
+                // slot lookup below and misreported "a show_existing_frame
+                // header naming an empty reference slot" for a frame that was
+                // never a show_existing_frame header at all.
+                pending_header = Some(header.clone());
+                pending_tiles = Vec::new();
+                continue;
+            }
             // `show_existing_frame` (spec 7.21/5.9.2): no tile payload, this
             // OBU only names a DPB slot to output again -- the coded-frame
             // count and the shown-picture count are different things (a
@@ -117,9 +138,35 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
             pictures.push(output);
             continue;
         }
-        let ObuKind::Frame(header, tiles) = obu.kind else {
-            continue;
-        };
+        // `tiles_base_offset` is added to every `Tile::offset` below to reach
+        // an absolute position in `data`. `OBU_FRAME`'s tiles are relative to
+        // this OBU's own `obu_offset`; an accumulated run of `OBU_TILE_GROUP`s
+        // may span several different OBUs (each at a different offset in
+        // `data`), so those tiles are normalised to an absolute offset the
+        // moment they are appended to `pending_tiles`, and `tiles_base_offset`
+        // is 0 for that case.
+        let (header, tiles, tiles_base_offset): (Box<FrameHeader>, Vec<Tile>, usize) =
+            match obu.kind {
+                ObuKind::Frame(header, tiles) => (header, tiles, obu_offset),
+                ObuKind::TileGroup(new_tiles) => {
+                    let header = pending_header.clone().ok_or_else(|| {
+                        Error::corrupt(
+                            "AV1 decode_stream: a tile group OBU with no preceding frame header",
+                        )
+                    })?;
+                    let expected = header.tile_info.cols * header.tile_info.rows;
+                    pending_tiles.extend(new_tiles.into_iter().map(|mut t| {
+                        t.offset += obu_offset;
+                        t
+                    }));
+                    if (pending_tiles.len() as u32) < expected {
+                        continue;
+                    }
+                    pending_header = None;
+                    (header, std::mem::take(&mut pending_tiles), 0)
+                }
+                _ => continue,
+            };
         // Every tile is decoded below through `tile_bufs`; this only rejects a
         // frame OBU that carries no tile group at all.
         if tiles.is_empty() {
@@ -353,7 +400,7 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         let tile_bufs: Vec<&[u8]> = tiles
             .iter()
             .map(|t| {
-                data.get(obu_offset + t.offset..obu_offset + t.offset + t.size)
+                data.get(tiles_base_offset + t.offset..tiles_base_offset + t.offset + t.size)
                     .ok_or(Error::NeedMore)
             })
             .collect::<Result<_>>()?;
@@ -8043,6 +8090,348 @@ mod tests {
             matched > 0,
             "{NAME}: every attempt refused ({named_refusals} refusals); decode_stream never \
              decoded a two-tile-column inter frame"
+        );
+        eprintln!(
+            "{NAME}: {matched} pixel-exact matches, {named_refusals} named refusals out of 20"
+        );
+    }
+
+    /// lane-tiles r9: `--num-tile-groups` makes aomenc split one frame's
+    /// tiles across several `OBU_TILE_GROUP`s instead of folding them into
+    /// the single `OBU_FRAME` every other gate in this file relies on --
+    /// verified live (`scratch_probe_num_tile_groups`, this round) to emit a
+    /// standalone `OBU_FRAME_HEADER` (`show_existing_frame == false`)
+    /// followed by two `OBU_TILE_GROUP` OBUs, one tile each. Before this
+    /// round `decode_stream` had no arm for `ObuKind::TileGroup` at all (it
+    /// fell through the catch-all `continue`, silently dropping the frame),
+    /// and its `ObuKind::FrameHeader` arm matched *every* frame header
+    /// unconditionally, so a standalone header was misrouted into the
+    /// `show_existing_frame` slot lookup and returned the wrong named error
+    /// ("a show_existing_frame header naming an empty reference slot") for a
+    /// frame that was never a show_existing_frame header. Both are fixed
+    /// above: the `FrameHeader` arm now checks `show_existing_frame`, and a
+    /// `pending_header`/`pending_tiles` accumulator collects tile groups
+    /// until the frame's `cols * rows` tiles have all arrived.
+    #[test]
+    fn a_real_aomenc_stream_with_several_tile_group_obus_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_stream_with_several_tile_group_obus_decodes_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height) = (64usize, 128usize);
+        let mut matched = 0u32;
+        let mut named_refusals = 0u32;
+        let mut saw_multiple_tile_group_obus = false;
+        for attempt in 0..20u32 {
+            let seed = 42 + attempt;
+            let source = gradients_source(seed, width, height, "duration=0.04:rate=25");
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", "yuv420p", "-f",
+                    "yuv4mpegpipe", "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let mut child = Command::new(aomenc_path())
+                .args([
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    "--cq-level=45",
+                    "--cpu-used=0",
+                    "--limit=1",
+                    "--kf-max-dist=1000",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--tile-columns=0",
+                    "--tile-rows=1",
+                    "--sb-size=64",
+                    "--num-tile-groups=4",
+                    "--loopfilter-control=0",
+                    "--enable-rect-partitions=0",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    "--enable-filter-intra=0",
+                    "--enable-smooth-intra=0",
+                    "--enable-paeth-intra=0",
+                    "--enable-directional-intra=0",
+                    "--enable-angle-delta=0",
+                    "--enable-tx-size-search=0",
+                    "--enable-cdef=0",
+                    "--enable-restoration=0",
+                    "--max-partition-size=32",
+                    "--min-partition-size=32",
+                    "--enable-palette=0",
+                    "--enable-intrabc=0",
+                    "--enable-cfl-intra=0",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+
+            let mut probe = Av1Parser::new();
+            let mut pos = 0usize;
+            let mut tile_group_obus = 0u32;
+            while pos < stream.len() {
+                let obu = probe.parse_obu(&stream[pos..]).unwrap();
+                pos += obu.total_size;
+                if matches!(obu.kind, ObuKind::TileGroup(_)) {
+                    tile_group_obus += 1;
+                }
+            }
+            if tile_group_obus > 1 {
+                saw_multiple_tile_group_obus = true;
+            }
+
+            let before = crate::decode::tile_hits();
+            let pictures = match decode_stream(&stream) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME} failed outright, not a named refusal (seed {seed}): {msg}"
+                    );
+                    named_refusals += 1;
+                    eprintln!("seed {seed} refusal: {msg}");
+                    continue;
+                }
+                Ok(pictures) => pictures,
+            };
+            let hits = crate::decode::tile_hits() - before;
+            assert!(
+                hits > 0,
+                "{NAME}: tile_hits delta was {hits}, expected >0 (seed {seed})"
+            );
+            assert_eq!(pictures.len(), 1, "{NAME}: expected exactly 1 picture (seed {seed})");
+
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
+            assert_eq!(pictures[0].y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg (seed {seed})");
+            assert_eq!(pictures[0].u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg (seed {seed})");
+            assert_eq!(pictures[0].v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg (seed {seed})");
+            matched += 1;
+        }
+        assert!(
+            matched > 0,
+            "{NAME}: every attempt refused ({named_refusals} refusals); decode_stream never \
+             decoded a several-tile-group-OBUs stream"
+        );
+        assert!(
+            saw_multiple_tile_group_obus,
+            "{NAME}: no attempt actually split into more than one OBU_TILE_GROUP -- this sweep \
+             proves nothing about the multi-tile-group case (aomenc's --num-tile-groups is \
+             RD/heuristic-driven, same as tile sizing)"
+        );
+        eprintln!(
+            "{NAME}: {matched} pixel-exact matches, {named_refusals} named refusals out of 20"
+        );
+    }
+
+    /// lane-tiles r10: non-uniform tile spacing (`uniform_spacing_flag == 0`,
+    /// spec 5.9.15). aomenc never sets this from `--tile-columns`/
+    /// `--tile-rows` (those always take the `uniform_spacing = 1` branch in
+    /// `set_tile_info`, libaom `encoder.c`), and `--auto-tiles` only takes
+    /// the non-uniform balancing path when `g_threads >= 2` -- this charter's
+    /// `--threads=1` rules that out. The only CLI surface that reaches
+    /// libaom's `else { tiles->uniform_spacing = 0; ... }` arm is the
+    /// explicit per-tile size lists `--tile-width=<sb-list>`/
+    /// `--tile-height=<sb-list>` (`av1_cx_iface.c` `set_tile_info`, argument
+    /// parsing at `arg_defs.c`'s `.tile_width`/`.tile_height` -- present in
+    /// the binary, just not printed by `--help`). Probed live with
+    /// `aomenc --tile-width=1,3 --tile-height=1 --sb-size=64` on a 256x64
+    /// source (4 SB columns, 1 SB row): confirmed by hand this round to
+    /// produce a real OBU stream aomdec/ffmpeg both decode.
+    ///
+    /// `decode.rs`'s tile loop was already generic over spacing before this
+    /// gate existed -- it walks `tile_info.mi_col_starts`/`mi_row_starts`
+    /// (populated identically by `read_tile_info` for both the uniform and
+    /// non-uniform branches, spec 5.9.15) and never recomputes tile bounds
+    /// from `cols_log2`/`rows_log2`. The only place in this crate that ever
+    /// refused non-uniform spacing is `frame.rs`'s OBU *writer*
+    /// (`"non-uniform tile spacing is not written"`), an unrelated encode
+    /// path this gate does not touch. So this is a staleness check, not new
+    /// machinery: prove the already-generic decode path live and pin it.
+    #[test]
+    fn a_real_aomenc_stream_with_non_uniform_tile_spacing_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_stream_with_non_uniform_tile_spacing_decodes_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height) = (256usize, 64usize);
+        let mut matched = 0u32;
+        let mut named_refusals = 0u32;
+        let mut saw_non_uniform_spacing = false;
+        for attempt in 0..20u32 {
+            let seed = 42 + attempt;
+            let source = gradients_source(seed, width, height, "duration=0.04:rate=25");
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", "yuv420p", "-f",
+                    "yuv4mpegpipe", "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let mut child = Command::new(aomenc_path())
+                .args([
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    "--cq-level=45",
+                    "--cpu-used=0",
+                    "--limit=1",
+                    "--kf-max-dist=1000",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--sb-size=64",
+                    "--tile-width=1,3",
+                    "--tile-height=1",
+                    "--loopfilter-control=0",
+                    "--enable-rect-partitions=0",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    "--enable-filter-intra=0",
+                    "--enable-smooth-intra=0",
+                    "--enable-paeth-intra=0",
+                    "--enable-directional-intra=0",
+                    "--enable-angle-delta=0",
+                    "--enable-tx-size-search=0",
+                    "--enable-cdef=0",
+                    "--enable-restoration=0",
+                    "--max-partition-size=32",
+                    "--min-partition-size=32",
+                    "--enable-palette=0",
+                    "--enable-intrabc=0",
+                    "--enable-cfl-intra=0",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+
+            let mut probe = Av1Parser::new();
+            let mut pos = 0usize;
+            while pos < stream.len() {
+                let obu = probe.parse_obu(&stream[pos..]).unwrap();
+                pos += obu.total_size;
+                let tile_info = match &obu.kind {
+                    ObuKind::Frame(header, _) => Some(&header.tile_info),
+                    ObuKind::FrameHeader(header) if !header.show_existing_frame => {
+                        Some(&header.tile_info)
+                    }
+                    _ => None,
+                };
+                if let Some(info) = tile_info {
+                    if !info.uniform_spacing {
+                        saw_non_uniform_spacing = true;
+                    }
+                    assert!(
+                        info.cols > 1 || info.rows > 1,
+                        "{NAME}: --tile-width=1,3 --tile-height=1 produced only 1 tile \
+                         (cols={} rows={}, seed {seed}) -- fixture stopped exercising the case",
+                        info.cols,
+                        info.rows
+                    );
+                }
+            }
+
+            let before = crate::decode::tile_hits();
+            let pictures = match decode_stream(&stream) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME} failed outright, not a named refusal (seed {seed}): {msg}"
+                    );
+                    named_refusals += 1;
+                    eprintln!("seed {seed} refusal: {msg}");
+                    continue;
+                }
+                Ok(pictures) => pictures,
+            };
+            let hits = crate::decode::tile_hits() - before;
+            assert!(
+                hits > 0,
+                "{NAME}: tile_hits delta was {hits}, expected >0 (seed {seed})"
+            );
+            assert_eq!(pictures.len(), 1, "{NAME}: expected exactly 1 picture (seed {seed})");
+
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
+            assert_eq!(pictures[0].y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg (seed {seed})");
+            assert_eq!(pictures[0].u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg (seed {seed})");
+            assert_eq!(pictures[0].v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg (seed {seed})");
+            matched += 1;
+        }
+        assert!(
+            matched > 0,
+            "{NAME}: every attempt refused ({named_refusals} refusals); decode_stream never \
+             decoded a non-uniform-tile-spacing stream"
+        );
+        assert!(
+            saw_non_uniform_spacing,
+            "{NAME}: no attempt actually set uniform_spacing_flag == 0 -- this sweep proves \
+             nothing about the non-uniform case"
         );
         eprintln!(
             "{NAME}: {matched} pixel-exact matches, {named_refusals} named refusals out of 20"
