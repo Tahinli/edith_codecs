@@ -12736,19 +12736,25 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         }
         out
     };
-    // lane-superres r10: same real-margin stash as
-    // `decode_key_frame_tile_with_cdfs` (see that function's comment) -- an
-    // inter frame under `use_superres` crops from the same mi-aligned
-    // `width`/`height` down to `fw`/`fh`, and `stream.rs`'s upscale needs
-    // the same real border-extension columns, not a synthetic replicate.
+    // lane-superres r10 (fixed r9): same real-margin stash as
+    // `decode_key_frame_tile_with_cdfs` (see that function's comment) -- the
+    // real reconstructed extent is the mi-aligned `true_width`/`true_height`
+    // (`mi_cols`/`mi_rows` * 4), NOT the superblock-padded `width`/`height`
+    // this branch was reading before: columns `[true_width, width)` were
+    // never actually coded (the last partial superblock stops at
+    // `true_width`), so stashing out to `width` handed the chroma upscale's
+    // right-edge replicate a slice of uninitialized/stale buffer one column
+    // early -- the same shorten-vs-replicate shape as `av1-truesize`. The
+    // key-frame branch above already used `true_width`/`true_height`; this
+    // just matches it.
     LAST_FRAME_WIDE_MARGIN.with(|m| {
-        *m.borrow_mut() = if width > fw || height > fh {
+        *m.borrow_mut() = if true_width > fw || true_height > fh {
             Some(Picture {
-                width,
-                height,
-                y: crop(&y, width, height),
-                u: crop(&u, width.div_ceil(2), height.div_ceil(2)),
-                v: crop(&v, width.div_ceil(2), height.div_ceil(2)),
+                width: true_width,
+                height: true_height,
+                y: crop(&y, true_width, true_height),
+                u: crop(&u, true_width.div_ceil(2), true_height.div_ceil(2)),
+                v: crop(&v, true_width.div_ceil(2), true_height.div_ceil(2)),
             })
         } else {
             None
