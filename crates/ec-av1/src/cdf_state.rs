@@ -431,6 +431,12 @@ pub(crate) struct Cdfs {
     pub palette_uv_mode: [[u16; 3]; 2],
     /// A chroma palette block's own size -- see [`cdf::PALETTE_UV_SIZE`].
     pub palette_uv_size: [[u16; 8]; 7],
+    /// A palette-Y block's per-pixel colour-index symbol -- see
+    /// [`cdf::PALETTE_Y_COLOR_INDEX`].
+    pub palette_y_color_index: [[[u16; 9]; 5]; 7],
+    /// A palette-UV block's per-pixel colour-index symbol -- see
+    /// [`cdf::PALETTE_UV_COLOR_INDEX`].
+    pub palette_uv_color_index: [[[u16; 9]; 5]; 7],
     /// The `use_intrabc` flag -- see [`cdf::INTRABC`].
     pub intrabc: [u16; 3],
     /// `delta_q_abs` (lane-realworld r4, spec 5.11.10) -- see [`cdf::DELTA_Q`].
@@ -663,6 +669,8 @@ impl Cdfs {
         reset2(&mut self.palette_y_size);
         reset2(&mut self.palette_uv_mode);
         reset2(&mut self.palette_uv_size);
+        reset3(&mut self.palette_y_color_index);
+        reset3(&mut self.palette_uv_color_index);
         reset1(&mut self.intrabc);
         reset1(&mut self.delta_q);
         reset1(&mut self.delta_lf);
@@ -1126,6 +1134,8 @@ impl Cdfs {
             palette_y_size: cdf::PALETTE_Y_SIZE,
             palette_uv_mode: cdf::PALETTE_UV_MODE,
             palette_uv_size: cdf::PALETTE_UV_SIZE,
+            palette_y_color_index: cdf::PALETTE_Y_COLOR_INDEX,
+            palette_uv_color_index: cdf::PALETTE_UV_COLOR_INDEX,
             intrabc: cdf::INTRABC,
             delta_q: cdf::DELTA_Q,
             delta_lf: cdf::DELTA_LF,
