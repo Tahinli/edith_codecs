@@ -3536,6 +3536,9 @@ fn decode_leaf_rect(
     tx_select: bool,
 ) -> Result<usize> {
     let _ = base_q_idx;
+    if std::env::var_os("EC_AV1_RECTX_TRACE").is_some() {
+        eprintln!("decode_leaf_rect: leaf_mi={leaf_mi:?} bw={bw} bh={bh} outer_at={outer_at:?}");
+    }
     let (r, c) = outer_at;
     let mut above_mode = neighbours.above_mode[c];
     let mut left_mode = neighbours.left_mode[r];
@@ -3567,6 +3570,9 @@ fn decode_leaf_rect(
             leaf_mi.0,
             leaf_mi.1,
         )?;
+    if std::env::var_os("EC_AV1_RECTX_TRACE").is_some() {
+        eprintln!("  skip={skip} mode={mode} angle_delta_y={angle_delta_y} uv_mode={uv_mode}");
+    }
     if filter_intra.is_some() {
         return Err(unsupported(
             "filter intra on a HORZ/VERT strip (this decoder predicts square-only)",
@@ -3624,6 +3630,10 @@ fn decode_leaf_rect(
         let (l_levels, luma_tx_type) = read_coeffs_rect(
             dec, &mut luma_coding, luma_scan, bw, bh, 0, dc_sign_ctx(around[0].2), TxType::DctDct,
         )?;
+        if std::env::var_os("EC_AV1_RECTX_TRACE").is_some() {
+            let nz: Vec<(usize, i32)> = l_levels.iter().copied().enumerate().filter(|(_, v)| *v != 0).collect();
+            eprintln!("  luma_tx_type={luma_tx_type:?} nz_levels={nz:?}");
+        }
         luma_levels = l_levels;
         let luma_residual = dequant_and_inverse_typed_wh(
             &luma_levels, bw, bh, crate::decode::bit_depth(),
