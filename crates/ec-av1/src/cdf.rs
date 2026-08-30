@@ -770,22 +770,39 @@ pub const NZ_MAP_CTX_OFFSET_32: [[u8; 5]; 5] = [
 /// indexes this position table by the raw, un-adjusted `tx_size` -- lane-sbpart
 /// r8 root cause) is genuinely rectangular, not square. Distinct from
 /// [`NZ_MAP_CTX_OFFSET_32`] starting at `(row=1, col=0)`.
+// lane-part32 r3: this table was TRANSPOSED (row/col swapped) as landed by
+// lane-sbpart r8 -- caught by tracing a real aomenc pin against a patched
+// aomdec (added per-symbol `EC_TRACE_COEFF` ctx prints to
+// `read_coeffs_reverse{,_2d}` in `~/.cache/aom-oracle`), which showed our own
+// `(row=2, col=0)` reading ctx-offset 11 where the real decoder's equivalent
+// position read 6. Re-derived straight from libaom's own generating
+// comment in `get_nz_map_ctx_from_stats` (`txb_common.h:199-210`): for
+// `width < height` (this table, `TX_32X64`), ctx is `11 +` for `row < 2`
+// *regardless of col* -- the old table instead special-cased `col < 2`,
+// which is the `width > height` (`TX_64X32`) branch. Confirmed against the
+// real `av1_nz_map_ctx_offset_32x64`/`_64x32` C arrays in
+// `av1/common/txb_common.c`, decoded through libaom's own col-major
+// `pos = col*32+row` raster (same convention [`SCAN_32X16`]'s doc comment
+// already documents this decoder transcribes out of).
 pub const NZ_MAP_CTX_OFFSET_32X64: [[u8; 5]; 5] = [
-    [0, 11, 6, 6, 21],
-    [11, 11, 6, 21, 21],
-    [11, 11, 21, 21, 21],
-    [11, 11, 21, 21, 21],
-    [11, 11, 21, 21, 21],
+    [0, 11, 11, 11, 11],
+    [11, 11, 11, 11, 11],
+    [6, 6, 21, 21, 21],
+    [6, 21, 21, 21, 21],
+    [21, 21, 21, 21, 21],
 ];
 
 /// [`NZ_MAP_CTX_OFFSET_32X64`]'s `TX_64X32` counterpart (libaom
 /// `av1_nz_map_ctx_offset_64x32`): a `PARTITION_HORZ` strip's luma corner.
+/// `width > height` here, so the `col < 2` branch (offset 16) fires
+/// regardless of row -- transpose of [`NZ_MAP_CTX_OFFSET_32X64`]'s `row < 2`
+/// branch, same r3 fix (see that table's doc comment).
 pub const NZ_MAP_CTX_OFFSET_64X32: [[u8; 5]; 5] = [
-    [0, 16, 16, 16, 16],
-    [16, 16, 16, 16, 16],
-    [6, 6, 21, 21, 21],
-    [6, 21, 21, 21, 21],
-    [21, 21, 21, 21, 21],
+    [0, 16, 6, 6, 21],
+    [16, 16, 6, 21, 21],
+    [16, 16, 21, 21, 21],
+    [16, 16, 21, 21, 21],
+    [16, 16, 21, 21, 21],
 ];
 
 /// `Default_Txb_Skip_Cdf[2][2][7..10]` (spec 9.4): the all-zero flag of a
