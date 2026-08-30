@@ -18,8 +18,16 @@
 //! feature's gate, which shrinks the derived set and fails this test until the
 //! list is updated -- the point being that the shrink is noticed.
 
-/// aomenc coding tools that no real-`aomenc` gate exercises: switched off in
-/// every gate that names them, on in none, defaulted in none.
+/// aomenc coding tools that no real-`aomenc` gate is proven to exercise:
+/// switched off in every gate that names them, and on in none.
+///
+/// A gate that simply leaves the flag off its command line does NOT close the
+/// hole. aomenc's default for these is content-dependent -- palette and
+/// intrabc only come on for screen content -- so "defaulted" means "unknown",
+/// not "exercised", and treating it as coverage would retire the entry
+/// without a single stream proving the decoder ever saw the tool. Only an
+/// explicit `--enable-<tool>=1` in a gate that then asserts the feature fired
+/// closes one.
 ///
 /// Each entry is `(flag, why)`. Removing an entry is how a lane records that
 /// its tool is now covered by a real stream.
@@ -72,9 +80,21 @@ mod tests {
     #[test]
     fn every_gate_disabling_a_tool_is_a_listed_coverage_hole() {
         let (gate_count, per_tool) = tool_settings();
+        // A hole OPENS when every gate names the flag and every one of them
+        // says 0 -- then no real stream can exercise the tool.
         let derived: BTreeSet<&str> = per_tool
             .iter()
             .filter(|&(_, &(off, on, defaulted))| off == gate_count && on == 0 && defaulted == 0)
+            .map(|(name, _)| name.as_str())
+            .collect();
+        // A hole CLOSES only on positive evidence: some gate passes `=1`.
+        // A gate that merely leaves the flag off its command line proves
+        // nothing -- aomenc's default for palette and intrabc is content-
+        // dependent -- so "defaulted" must not retire an entry, or a listing
+        // would disappear the moment an unrelated gate is added.
+        let exercised: BTreeSet<&str> = per_tool
+            .iter()
+            .filter(|&(_, &(_, on, _))| on > 0)
             .map(|(name, _)| name.as_str())
             .collect();
         let listed: BTreeSet<&str> = NEVER_EXERCISED.iter().map(|&(flag, _)| flag).collect();
@@ -84,13 +104,13 @@ mod tests {
             unlisted.is_empty(),
             "these aomenc tools are switched off in all {gate_count} real-aomenc gates and on in \
              none, so no real stream exercises them, and they are not listed in NEVER_EXERCISED: \
-             {unlisted:?} -- either enable the tool in its own gate or add it to the list with a \
-             reason"
+             {unlisted:?} -- either enable the tool with `=1` in its own gate or add it to the \
+             list with a reason"
         );
-        let stale: Vec<&&str> = listed.difference(&derived).collect();
+        let stale: Vec<&&str> = listed.intersection(&exercised).collect();
         assert!(
             stale.is_empty(),
-            "NEVER_EXERCISED lists {stale:?}, but a gate now enables or defaults them -- delete \
+            "NEVER_EXERCISED lists {stale:?}, but a gate now passes `=1` for them -- delete \
              those entries, the coverage hole is closed"
         );
     }
