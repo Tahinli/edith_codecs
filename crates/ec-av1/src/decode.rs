@@ -341,6 +341,24 @@ pub(crate) fn tx_depth_hits() -> usize {
     TX_DEPTH_HITS.with(|c| c.get())
 }
 
+// How many `partition_w16` reads (a 16x16 block's own partition symbol, key
+// intra-frame path) resolved to `PARTITION_VERT_B` -- lane-rect16 r1: a
+// plain default-settings aomenc run over lavfi mandelbrot hits this arm on
+// frame 0's very first non-NONE/SPLIT `partition_w16` symbol (mi=(3,2)), not
+// the plain HORZ/VERT this lane's charter assumed. Left rect (8x16, real
+// `decode_block_rect`) + two 8x8 leaves stacked on the right (`decode_leaf8`,
+// chained via `prev_leaf` exactly like the existing 16x16-SPLIT-into-4x8x8
+// path above).
+thread_local! {
+    static VERT_B_INTRA_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`VERT_B_INTRA_HITS`].
+pub(crate) fn vert_b_intra_hits() -> usize {
+    VERT_B_INTRA_HITS.with(|c| c.get())
+}
+
 // How many [`read_coeffs`] reads resolved a `tx_type` outside `TX_CLASS_2D`
 // (`V_DCT`/`H_DCT`, spec 5.11.39's `TxClass::Horiz`/`Vert`), across every
 // call on the current thread -- the same before/after counter pattern as
@@ -2854,6 +2872,21 @@ fn decode_block_rect(
                 vec![0i32; chroma_w * chroma_h],
             ],
         );
+    } else if (bw, bh) != (32, 16) && (bw, bh) != (16, 32) {
+        // lane-rect16 r1: a real (non-skip) coefficient read at this size
+        // (8x16/16x32 VERT_B's own left strip) is not ported -- it needs its
+        // own `TxbSet`/`eob_pt` tables (a true 128-position luma group has no
+        // `EOB_PT_128_LUMA` in this decoder yet, only the *chroma* one
+        // `lane-rectwire` built for `ChromaRect16x8`) and, unlike the 32x32
+        // sqr-up case `LumaRect32x16` safely skips, `get_ext_tx_set_type`
+        // does NOT return `EXT_TX_SET_DCTONLY` at a 16x16 sqr-up under this
+        // encoder's reduced_tx_set -- a real `tx_type` symbol may be coded
+        // that no table here reads. Refused by name rather than guess-decoded
+        // or silently desynced.
+        return Err(unsupported(
+            "a coded (non-skip) HORZ_B/VERT_B rect strip below 16x16 (this decoder ports only \
+             the skip case at this size)",
+        ));
     } else {
         // lane-rectwire r2: real coefficients. `get_txsize_entropy_ctx`
         // reduces both size pairs to their square-up CDF sets
@@ -5829,9 +5862,97 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                             )?;
                                             continue;
                                         }
+                                        if part16 == PARTITION_VERT_B {
+                                            VERT_B_INTRA_HITS.with(|c| c.set(c.get() + 1));
+                                            // Left rect: 8x16, real
+                                            // `decode_block_rect`, sat at the
+                                            // 16x16 parent's own origin (no
+                                            // fractional-SUB-grid pixel
+                                            // offset needed -- the plain
+                                            // HORZ/VERT arms this lane's
+                                            // charter named DO need one,
+                                            // since their second half is
+                                            // offset by half the parent;
+                                            // unported, see decode_block_rect's
+                                            // own doc comment).
+                                            decode_block_rect(
+                                                &mut dec,
+                                                &mut cdfs,
+                                                &mut neighbours,
+                                                at16,
+                                                8,
+                                                16,
+                                                &mut y,
+                                                &mut u,
+                                                &mut v,
+                                                enable_filter_intra,
+                                                allow_screen_content_tools,
+                                                base_q_idx,
+                                                tx_select,
+                                            )?;
+                                            // Two 8x8 squares stacked on the
+                                            // right, chained through
+                                            // `prev_leaf` exactly like the
+                                            // real (non-straddle) SPLIT path
+                                            // below: the bottom leaf's ABOVE
+                                            // context is the top leaf, not
+                                            // the coarse SUB-grid array (a
+                                            // real block never sat there).
+                                            let (mi_row0, mi_col0) =
+                                                (sr as u32 * SUB_MI, sc as u32 * SUB_MI);
+                                            let top_right =
+                                                (mi_row0 as usize, mi_col0 as usize + 2);
+                                            let bot_right =
+                                                (mi_row0 as usize + 2, mi_col0 as usize + 2);
+                                            let mode_tr = decode_leaf8(
+                                                &mut dec,
+                                                &mut cdfs,
+                                                &mut neighbours,
+                                                at16,
+                                                top_right,
+                                                (&scan8, &scan4),
+                                                None,
+                                                &mut y,
+                                                &mut u,
+                                                &mut v,
+                                                base_q_idx,
+                                                enable_filter_intra,
+                                                allow_screen_content_tools,
+                                                allow_intrabc,
+                                                tx_select,
+                                                reduced_tx_set,
+                                            )?;
+                                            let mode_br = decode_leaf8(
+                                                &mut dec,
+                                                &mut cdfs,
+                                                &mut neighbours,
+                                                at16,
+                                                bot_right,
+                                                (&scan8, &scan4),
+                                                Some((top_right, mode_tr)),
+                                                &mut y,
+                                                &mut u,
+                                                &mut v,
+                                                base_q_idx,
+                                                enable_filter_intra,
+                                                allow_screen_content_tools,
+                                                allow_intrabc,
+                                                tx_select,
+                                                reduced_tx_set,
+                                            )?;
+                                            // `record()`'s above_mode/left_mode
+                                            // write is a no-op at an 8x8
+                                            // leaf's own side (same gap the
+                                            // real-SPLIT path above patches):
+                                            // force it from the last-decoded
+                                            // (bottom-right) leaf.
+                                            neighbours.above_mode[sc] = mode_br;
+                                            neighbours.left_mode[sr] = mode_br;
+                                            continue;
+                                        }
                                         if part16 != PARTITION_SPLIT {
                                             return Err(unsupported(
-                                                "a partition below 16x16 other than a clean split (this decoder codes only the square arms below 16x16)",
+                                                "a partition below 16x16 other than a clean split or a VERT_B (this decoder codes only the square arms, VERT_B, and a clean split below 16x16)",
                                             ));
                                         }
                                         // A real (non-straddle) SPLIT of a
