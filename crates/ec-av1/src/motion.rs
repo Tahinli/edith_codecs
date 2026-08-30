@@ -263,16 +263,22 @@ fn search_traced_from_step(
     assert_eq!(source.len(), block_w * block_h, "source is one block");
     assert!(!reference.is_empty(), "a reference plane has samples");
 
-    let mut dst = vec![0u8; block_w * block_h];
+    // lane-hbd r2: this encoder-side search stays `u8` (see
+    // `encode::intra_predict_u8`'s doc comment) -- `reference` is converted
+    // once here, outside the per-candidate closure, since `mc::predict` now
+    // takes `u16`.
+    let reference16: Vec<u16> = reference.iter().map(|&v| u16::from(v)).collect();
+    let mut dst16 = vec![0u16; block_w * block_h];
     let mut cost_of = |mv: (i32, i32)| -> f64 {
         let x_q4 = (block_x as i32) * 16 + mv.1 * Q4_PER_Q3;
         let y_q4 = (block_y as i32) * 16 + mv.0 * Q4_PER_Q3;
         predict(
-            reference, stride, ref_width, ref_height, x_q4, y_q4, block_w, block_h, &mut dst,
+            &reference16, stride, ref_width, ref_height, x_q4, y_q4, block_w, block_h,
+            &mut dst16,
         );
         let sad: f64 = source
             .iter()
-            .zip(dst.iter())
+            .zip(dst16.iter())
             .map(|(&a, &b)| f64::from((i32::from(a) - i32::from(b)).unsigned_abs()))
             .sum();
         let diff = (mv.0 - pred_mv.0, mv.1 - pred_mv.1);
