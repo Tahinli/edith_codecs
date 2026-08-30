@@ -4979,6 +4979,23 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     } else {
         PREFILT_PICTURE_IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
+    if let Ok(path) = std::env::var("EC_AV1_PREFILT_WIDE_DUMP") {
+        use std::io::Write;
+        static IDX2: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let idx = IDX2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let crop_wide = |plane: &PlaneBuf| -> Vec<u8> {
+            let mut out = Vec::with_capacity(plane.true_width * plane.true_height);
+            for row in 0..plane.true_height {
+                out.extend_from_slice(&plane.data[row * plane.width..][..plane.true_width]);
+            }
+            out
+        };
+        if let Ok(mut f) = std::fs::File::create(format!("{path}.f{idx}")) {
+            let _ = f.write_all(&crop_wide(&y));
+            let _ = f.write_all(&crop_wide(&u));
+            let _ = f.write_all(&crop_wide(&v));
+        }
+    }
     apply_deblock(&mut y, &mut u, &mut v, loop_filter, &neighbours);
     apply_cdef(&mut y, &mut u, &mut v, cdef, &neighbours);
 
@@ -5019,10 +5036,19 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     // non-superres frame whose width just isn't 32-block aligned).
     LAST_KEY_FRAME_WIDE_MARGIN.with(|m| {
         *m.borrow_mut() = if true_width > fw || true_height > fh {
+            let yc = crop(&y, true_width, true_height);
+            if let Ok(path) = std::env::var("EC_AV1_MARGIN_DUMP") {
+                use std::io::Write;
+                static IDX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                let idx = IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if let Ok(mut f) = std::fs::File::create(format!("{path}.f{idx}")) {
+                    let _ = f.write_all(&yc);
+                }
+            }
             Some(Picture {
                 width: true_width,
                 height: true_height,
-                y: crop(&y, true_width, true_height),
+                y: yc,
                 u: crop(&u, true_width.div_ceil(2), true_height.div_ceil(2)),
                 v: crop(&v, true_width.div_ceil(2), true_height.div_ceil(2)),
             })
