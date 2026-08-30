@@ -5692,6 +5692,13 @@ fn filter_edge(
     sharpness: u8,
 ) {
     let (blimit, limit, hev_thr) = deblock_thresholds(level, sharpness);
+    // libaom `highbd_filter_mask*`/`highbd_flat_mask4`/`highbd_hev_mask`:
+    // every 8-bit threshold (including the flat masks' fixed `1`) is
+    // compared against a raw pixel difference on the stream's own bit-depth
+    // scale, so each is shifted left by `bit_depth - 8` before use.
+    let shift = bit_depth() - 8;
+    let (blimit, limit, hev_thr) = (blimit << shift, limit << shift, hev_thr << shift);
+    let flat_thresh = 1i32 << shift;
     for i in 0..4isize {
         let center = (base as isize + i * outer_stride) as usize;
         let idx = |k: isize| -> usize { (center as isize + k * tap_stride) as usize };
@@ -5715,10 +5722,10 @@ fn filter_edge(
                     && (q1 - q0).abs() <= limit
                     && (q2 - q1).abs() <= limit
                     && (p0 - q0).abs() * 2 + (p1 - q1).abs() / 2 <= blimit;
-                let flat = (p1 - p0).abs() <= 1
-                    && (q1 - q0).abs() <= 1
-                    && (p2 - p0).abs() <= 1
-                    && (q2 - q0).abs() <= 1;
+                let flat = (p1 - p0).abs() <= flat_thresh
+                    && (q1 - q0).abs() <= flat_thresh
+                    && (p2 - p0).abs() <= flat_thresh
+                    && (q2 - q0).abs() <= flat_thresh;
                 let [op1, op0, oq0, oq1] = filter6(mask, hev_thr, flat, p2, p1, p0, q0, q1, q2);
                 data[idx(-2)] = op1.clamp(0, sample_max()) as u16;
                 data[idx(-1)] = op0.clamp(0, sample_max()) as u16;
@@ -5735,12 +5742,12 @@ fn filter_edge(
                     && (q2 - q1).abs() <= limit
                     && (q3 - q2).abs() <= limit
                     && (p0 - q0).abs() * 2 + (p1 - q1).abs() / 2 <= blimit;
-                let flat = (p1 - p0).abs() <= 1
-                    && (q1 - q0).abs() <= 1
-                    && (p2 - p0).abs() <= 1
-                    && (q2 - q0).abs() <= 1
-                    && (p3 - p0).abs() <= 1
-                    && (q3 - q0).abs() <= 1;
+                let flat = (p1 - p0).abs() <= flat_thresh
+                    && (q1 - q0).abs() <= flat_thresh
+                    && (p2 - p0).abs() <= flat_thresh
+                    && (q2 - q0).abs() <= flat_thresh
+                    && (p3 - p0).abs() <= flat_thresh
+                    && (q3 - q0).abs() <= flat_thresh;
                 let [op2, op1, op0, oq0, oq1, oq2] =
                     filter8(mask, hev_thr, flat, p3, p2, p1, p0, q0, q1, q2, q3);
                 data[idx(-3)] = op2.clamp(0, sample_max()) as u16;
@@ -5762,18 +5769,18 @@ fn filter_edge(
                     && (q2 - q1).abs() <= limit
                     && (q3 - q2).abs() <= limit
                     && (p0 - q0).abs() * 2 + (p1 - q1).abs() / 2 <= blimit;
-                let flat = (p1 - p0).abs() <= 1
-                    && (q1 - q0).abs() <= 1
-                    && (p2 - p0).abs() <= 1
-                    && (q2 - q0).abs() <= 1
-                    && (p3 - p0).abs() <= 1
-                    && (q3 - q0).abs() <= 1;
-                let flat2 = (p4 - p0).abs() <= 1
-                    && (q4 - q0).abs() <= 1
-                    && (p5 - p0).abs() <= 1
-                    && (q5 - q0).abs() <= 1
-                    && (p6 - p0).abs() <= 1
-                    && (q6 - q0).abs() <= 1;
+                let flat = (p1 - p0).abs() <= flat_thresh
+                    && (q1 - q0).abs() <= flat_thresh
+                    && (p2 - p0).abs() <= flat_thresh
+                    && (q2 - q0).abs() <= flat_thresh
+                    && (p3 - p0).abs() <= flat_thresh
+                    && (q3 - q0).abs() <= flat_thresh;
+                let flat2 = (p4 - p0).abs() <= flat_thresh
+                    && (q4 - q0).abs() <= flat_thresh
+                    && (p5 - p0).abs() <= flat_thresh
+                    && (q5 - q0).abs() <= flat_thresh
+                    && (p6 - p0).abs() <= flat_thresh
+                    && (q6 - q0).abs() <= flat_thresh;
                 let out = filter14(
                     mask, hev_thr, flat, flat2, p6, p5, p4, p3, p2, p1, p0, q0, q1, q2, q3, q4, q5,
                     q6,
