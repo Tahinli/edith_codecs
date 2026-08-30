@@ -7200,6 +7200,23 @@ mod tests {
             eprintln!("SKIP a_real_aomenc_stream_with_a_sub8_split_decodes_pixel_exact: {msg}");
             return;
         }
+        // round 2: `--enable-rect-partitions=0` was added below to keep
+        // aomenc off HORZ/VERT-below-8x8 elsewhere in the same tile, but it
+        // is NOT sufficient alone -- see the round-2 report
+        // (lanes/sub8-r1.report.md) for the live finding: 0/160 attempts
+        // across both 64x64 and a spatially-isolated single-16x16-leaf
+        // fixture passed, and every SPLIT that fires is immediately
+        // followed by a spurious HORZ/VERT read on the very next sibling
+        // 8x8 leaf, which reads as a real desync left behind by
+        // `decode_leaf_split4`/`read_intra_mode_sub8`, not an encoder
+        // choice this recipe can dodge. Tried and rejected: shrinking the
+        // frame to 16x16 (single 16x16 leaf, at most 4 candidate 8x8s) --
+        // that surfaces an UNRELATED pre-existing tiny-frame edge-straddle
+        // defect (reproduces with zero sub8 code involved, `--min-partition
+        // -size`/`--max-partition-size` absent entirely), so it is not a
+        // safe way to isolate the leaf count. Left red; do not "fix" this
+        // gate by picking fixture parameters that dodge the desync without
+        // finding it.
         let (width, height) = (64usize, 64usize);
         let mut refusals = Vec::new();
         let mut fired_runs = 0u32;
@@ -7244,6 +7261,13 @@ mod tests {
                     "--sb-size=64",
                     "--min-partition-size=4",
                     "--max-partition-size=8",
+                    // Below 8x8 only PARTITION_NONE/SPLIT are decodable (HORZ/VERT
+                    // need a real rectangular transform, see the module doc above);
+                    // disabling rect partitions entirely -- not just AB -- keeps
+                    // aomenc from picking the still-refused HORZ/VERT arms almost
+                    // every attempt (round 2 measured ~90% HORZ/VERT-below-8x8
+                    // refusals with --enable-ab-partitions=0 alone).
+                    "--enable-rect-partitions=0",
                     "--enable-ab-partitions=0",
                     "--enable-1to4-partitions=1",
                     "--enable-palette=0",
