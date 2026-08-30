@@ -2601,26 +2601,44 @@ fn read_intra_mode_rect(
              is consumed for square blocks only)",
         ));
     }
+    let ec_istep = std::env::var_os("EC_TRACE_MODE_STEP").is_some();
+    macro_rules! istep {
+        ($name:literal, $val:expr) => {
+            if ec_istep {
+                let (rng, _) = dec.debug_state();
+                eprintln!(
+                    "EC_ISTEP mi_row={mi_r} mi_col={mi_c} name={} val={} rng={rng}",
+                    $name, $val
+                );
+            }
+        };
+    }
     let skip = dec.symbol(&mut cdfs.skip[skip_ctx]) != 0;
+    istep!("skip", skip as i32);
     maybe_read_cdef_idx(dec, mi_r, mi_c, skip);
+    istep!("cdef", 0);
     // A HORZ/VERT rect strip is never the whole superblock (`bw`/`bh` never
     // both 64 here -- see this fn's own doc), so `is_whole_sb` is always
     // `false`.
     maybe_read_delta_q(dec, cdfs, mi_r, mi_c, false, skip);
     maybe_read_delta_lf(dec, cdfs, mi_r, mi_c, false, skip);
+    istep!("dq", 0);
     let above_ctx = INTRA_MODE_CTX[above_mode];
     let left_ctx = INTRA_MODE_CTX[left_mode];
     let mode = dec.symbol(&mut cdfs.kf_y_mode[above_ctx][left_ctx]);
+    istep!("mode", mode as i32);
     let angle_delta_y = if (V_PRED..=D67_PRED).contains(&mode) {
         read_angle_delta(dec, &mut cdfs.angle_delta[mode - V_PRED])
     } else {
         0
     };
+    istep!("angle_y", angle_delta_y);
     let uv_mode = if cfl {
         dec.symbol(&mut cdfs.uv_mode_cfl[mode])
     } else {
         dec.symbol(&mut cdfs.uv_mode_no_cfl[mode])
     };
+    istep!("uv_mode", uv_mode as i32);
     let alpha = if cfl && uv_mode == UV_CFL_PRED {
         Some(read_cfl_alphas(dec, cdfs))
     } else {
@@ -2635,6 +2653,7 @@ fn read_intra_mode_rect(
     } else {
         0
     };
+    istep!("angle_uv", angle_delta_uv);
     let mut filter_intra = None;
     if std::env::var_os("EC_AV1_TRACE").is_some() {
         let (rng, _) = dec.debug_state();
