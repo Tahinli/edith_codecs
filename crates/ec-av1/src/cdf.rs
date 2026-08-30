@@ -224,6 +224,48 @@ pub const EOB_PT_1024_LUMA: [u16; 12] = [
 /// coefficient is the DC.
 pub const COEFF_BASE_EOB_LUMA_64_DC: [u16; 4] = [935, 3382, 32768, 0];
 
+/// `av1_default_eob_multi512_cdfs[2][0][0]` (`token_cdfs.h:829-906`,
+/// lane-rectwire): the end-of-block group of a luma transform with 512 coded
+/// positions -- what a true 32x16/16x32 rectangular transform has
+/// (`txsize_log2_minus4` = 5, `common_data.h:346`), distinct from
+/// [`EOB_PT_1024_LUMA`]'s 1024-position group a *square* 32x32 reads.
+pub const EOB_PT_512_LUMA: [u16; 11] = [
+    2624, 3936, 6480, 9686, 13979, 17726, 23267, 28410, 31078, 32768, 0,
+];
+/// [`EOB_PT_512_LUMA`], q-context 0 (`base_q_idx` 0..=20).
+pub const EOB_PT_512_LUMA_Q0: [u16; 11] = [
+    641, 983, 3707, 5430, 10234, 14958, 18788, 23412, 26061, 32768, 0,
+];
+/// [`EOB_PT_512_LUMA`], q-context 1 (`base_q_idx` 21..=60).
+pub const EOB_PT_512_LUMA_Q1: [u16; 11] = [
+    1230, 2278, 5035, 7776, 11871, 15346, 19590, 24584, 28749, 32768, 0,
+];
+/// [`EOB_PT_512_LUMA`], q-context 3 (`base_q_idx` 121..=255).
+pub const EOB_PT_512_LUMA_Q3: [u16; 11] = [
+    5927, 7809, 10923, 14597, 19439, 24135, 28456, 31142, 32060, 32768, 0,
+];
+
+/// `av1_default_eob_multi128_cdfs[2][1][0]` (`token_cdfs.h:829-906`,
+/// lane-rectwire): the end-of-block group of a chroma transform with 128
+/// coded positions -- what a true 16x8/8x16 rectangular transform has
+/// (`txsize_log2_minus4` = 3), distinct from [`EOB_PT_256_CHROMA`]'s
+/// 256-position group a *square* 16x16 reads.
+pub const EOB_PT_128_CHROMA: [u16; 9] = [
+    13627, 16246, 20173, 24429, 27948, 30415, 31863, 32768, 0,
+];
+/// [`EOB_PT_128_CHROMA`], q-context 0.
+pub const EOB_PT_128_CHROMA_Q0: [u16; 9] = [
+    5245, 7456, 12880, 15852, 20033, 23932, 27608, 32768, 0,
+];
+/// [`EOB_PT_128_CHROMA`], q-context 1.
+pub const EOB_PT_128_CHROMA_Q1: [u16; 9] = [
+    8045, 11200, 15497, 19595, 23948, 27408, 30938, 32768, 0,
+];
+/// [`EOB_PT_128_CHROMA`], q-context 3.
+pub const EOB_PT_128_CHROMA_Q3: [u16; 9] = [
+    24313, 26062, 28385, 30107, 31217, 31898, 32345, 32768, 0,
+];
+
 /// `Default_Dc_Sign_Cdf[2][0]` (spec 9.4): the sign of a luma DC coefficient,
 /// indexed by whether the neighbouring blocks' DC signs lean negative (1),
 /// positive (2) or neither (0).
