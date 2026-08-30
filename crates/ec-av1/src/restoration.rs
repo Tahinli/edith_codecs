@@ -560,19 +560,32 @@ fn apply_wiener_stripe(
 /// `[0,255]`, saturating the `z==0` case to `1` instead of `0` (see the
 /// libaom source comment this ports -- keeps `256-A[k]` inside a `u8` and
 /// avoids a later overflow, without visibly affecting a near-flat block).
+// r8: this table was transcribed with two errors -- index 101 (253 written
+// as 254) and indices 165..=169 (254 written as 255) -- traced by comparing
+// a call-unique dump (gated on the pinned stream's `xqd == [-16,-32]`, not a
+// reused coordinate) against libaom's real `av1_x_by_xplus1` at the same
+// `z=101`; both tables now generated straight from
+// `~/.cache/aom-oracle/src/av1/common/restoration.c` to rule out any other
+// transcription slip.
 const SGR_X_BY_XPLUS1: [i32; 256] = [
-    1, 128, 171, 192, 205, 213, 219, 224, 228, 230, 233, 235, 236, 238, 239, 240, 241, 242, 243, 243, 244, 244, 245,
-    245, 246, 246, 247, 247, 247, 247, 248, 248, 248, 248, 249, 249, 249, 249, 249, 250, 250, 250, 250, 250, 250,
-    250, 251, 251, 251, 251, 251, 251, 251, 251, 251, 251, 252, 252, 252, 252, 252, 252, 252, 252, 252, 252, 252,
-    252, 252, 252, 252, 252, 252, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253,
-    253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254,
-    254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254,
-    254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254,
-    254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 256,
+    1, 128, 171, 192, 205, 213, 219, 224, 228, 230, 233, 235, 236, 238, 239,
+    240, 241, 242, 243, 243, 244, 244, 245, 245, 246, 246, 247, 247, 247, 247,
+    248, 248, 248, 248, 249, 249, 249, 249, 249, 250, 250, 250, 250, 250, 250,
+    250, 251, 251, 251, 251, 251, 251, 251, 251, 251, 251, 252, 252, 252, 252,
+    252, 252, 252, 252, 252, 252, 252, 252, 252, 252, 252, 252, 252, 253, 253,
+    253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253,
+    253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 254, 254, 254,
+    254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254,
+    254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254,
+    254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254,
+    254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254,
+    254, 254, 254, 254, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    256,
 ];
 
 /// `av1_one_by_x` (`restoration.c`): `round(4096/n)` for `n` in `1..=25`
@@ -640,6 +653,16 @@ fn compute_ab(
                 (256 - a_val) as i64 * b * SGR_ONE_BY_X[(n - 1) as usize] as i64,
                 SGRPROJ_RECIP_BITS,
             );
+            if std::env::var("EC_LR_CALL_DUMP").is_ok()
+                && v_start as i64 + i == 60
+                && h_start as i64 + j == 6
+                && r == 1
+            {
+                eprintln!(
+                    "EC_LR_CALL_DUMP compute_ab u_tap: r={r} s={s} n={n} box_a={a} box_b={b} \
+                     p={p} z={z} a_val={a_val} b_val={b_val}"
+                );
+            }
             ab[gi * gw + gj] = (a_val, b_val);
         }
     }
@@ -676,6 +699,28 @@ fn apply_sgrproj_stripe(
 
     let ab0 = (r0 > 0).then(|| compute_ab(cdef, deblocked, stride, plane_w, plane_h, h_start, v_start, v_end, w, h, r0, s0));
     let ab1 = (r1 > 0).then(|| compute_ab(cdef, deblocked, stride, plane_w, plane_h, h_start, v_start, v_end, w, h, r1, s1));
+
+    // r8: call-unique debug dump -- r6's coordinate-only gate (`v_start==60`)
+    // matched several unrelated calls across the gate's attempt sweep, so its
+    // captured bytes were never provably from the failing call. `info.xqd`
+    // is this restoration unit's own decoded weights, unique to the one call
+    // r7 traced (`[-16,-32]`); dump the real 9-byte dense-arm (r1) "u"-tap
+    // window (physical rows 59..=61, cols 5..=7 -- r7's traced tap) straight
+    // from `lr_sample` for this exact call, no coordinate matching involved.
+    if std::env::var("EC_LR_CALL_DUMP").is_ok() && r1 > 0 && info.xqd == [-16, -32] {
+        let bytes: Vec<i32> = (59..=61)
+            .flat_map(|row| {
+                (5..=7).map(move |col| {
+                    lr_sample(cdef, deblocked, stride, plane_w, plane_h, v_start, v_end, row, col)
+                })
+            })
+            .collect();
+        eprintln!(
+            "EC_LR_CALL_DUMP: xqd={:?} v_start={v_start} v_end={v_end} h_start={h_start} \
+             u-tap 9-byte window (rows 59..=61, cols 5..=7) = {bytes:?}",
+            info.xqd
+        );
+    }
 
     let mut xq = [0i32; 2];
     if r0 == 0 {
@@ -747,6 +792,20 @@ fn apply_sgrproj_stripe(
                 let b = (b_c + b_u + b_d + b_l + b_r) * 4 + (b_ul + b_ur + b_dl + b_dr) * 3;
                 let flt1 = round2(a * dgd + b, SGRPROJ_SGR_BITS + 5 - SGRPROJ_RST_BITS);
                 v += xq[1] as i64 * (flt1 - u);
+                if std::env::var("EC_LR_CALL_DUMP").is_ok()
+                    && info.xqd == [-16, -32]
+                    && v_start as i64 + i == 61
+                    && h_start as i64 + j == 6
+                {
+                    eprintln!(
+                        "EC_LR_CALL_DUMP combine: c={:?} u_tap(row60)={:?} d={:?} l={:?} r={:?} \
+                         ul={:?} ur={:?} dl={:?} dr={:?} dense a={a} b={b} dgd={dgd} \
+                         u={u} flt1={flt1} xq={xq:?} v_before_final_round={v}",
+                        ab[idx(i, j)], ab[idx(i - 1, j)], ab[idx(i + 1, j)], ab[idx(i, j - 1)],
+                        ab[idx(i, j + 1)], ab[idx(i - 1, j - 1)], ab[idx(i - 1, j + 1)],
+                        ab[idx(i + 1, j - 1)], ab[idx(i + 1, j + 1)]
+                    );
+                }
             }
             let out_v = round2(v, SGRPROJ_PRJ_BITS as u32 + SGRPROJ_RST_BITS).clamp(0, 255) as u8;
             out[(v_start as i64 + i) as usize * stride + (h_start as i64 + j) as usize] = out_v;
