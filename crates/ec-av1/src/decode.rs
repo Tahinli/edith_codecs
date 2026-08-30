@@ -1140,6 +1140,16 @@ impl Neighbours {
             .unwrap_or(false)
     }
 
+    /// The `skip_txfm` context of a block whose top-left mi cell is
+    /// `(mi_r, mi_c)`: libaom `av1_get_skip_txfm_context`
+    /// (`pred_common.h:175-181`) is `above_mi->skip_txfm + left_mi->skip_txfm`,
+    /// with an absent neighbour contributing 0. The mi grid is per tile, so
+    /// row/column 0 is a tile edge and has no neighbour on that axis.
+    fn skip_txfm_ctx(&self, mi_r: usize, mi_c: usize) -> usize {
+        usize::from(mi_r > 0 && self.skip_at(mi_r - 1, mi_c))
+            + usize::from(mi_c > 0 && self.skip_at(mi_r, mi_c - 1))
+    }
+
     fn is_skip_txfm(&self, mi_r: usize, mi_c: usize) -> bool {
         (0..2).all(|rr| {
             (0..2).all(|cc| {
@@ -1562,6 +1572,7 @@ fn read_intra_mode_rect(
     bw: usize,
     bh: usize,
     enable_filter_intra: bool,
+    skip_ctx: usize,
 ) -> Result<(
     bool,
     usize,
@@ -1571,7 +1582,7 @@ fn read_intra_mode_rect(
     Option<(i32, i32)>,
     Option<usize>,
 )> {
-    let skip = dec.symbol(&mut cdfs.skip[0]) != 0;
+    let skip = dec.symbol(&mut cdfs.skip[skip_ctx]) != 0;
     let above_ctx = INTRA_MODE_CTX[above_mode];
     let left_ctx = INTRA_MODE_CTX[left_mode];
     let mode = dec.symbol(&mut cdfs.kf_y_mode[above_ctx][left_ctx]);
@@ -1696,6 +1707,7 @@ fn decode_block_rect(
             bw,
             bh,
             enable_filter_intra,
+            neighbours.skip_txfm_ctx(r * (SUB / MI), c * (SUB / MI)),
         )?;
     if filter_intra.is_some() {
         // `predict_filter_intra` (spec 7.11.2.3) is square-only in this
@@ -1717,12 +1729,17 @@ fn decode_block_rect(
     let depth = dec.symbol(&mut cdfs.tx_size_cat2[ctx]);
     if depth != 0 {
         TX_DEPTH_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // A split transform is predicted per transform unit, each taking its
+        // edges from the previous unit's reconstruction (the square path's own
+        // per-TU loop does exactly that). Predicting the whole strip in one
+        // shot would silently produce different pixels, so refuse by name
+        // until that loop is ported for rect strips.
+        return Err(unsupported(
+            "a HORZ/VERT intra strip with a split transform (per-unit rect \
+             prediction is not ported)",
+        ));
     }
-    let (tx_w, tx_h) = match depth {
-        0 => (bw, bh),
-        1 => (16, 16),
-        _ => (8, 8),
-    };
+    let (tx_w, tx_h) = (bw, bh);
     if !skip {
         return Err(unsupported(
             "a non-skip HORZ/VERT intra strip needs a rectangular transform \
@@ -1806,6 +1823,7 @@ fn read_intra_mode(
     cfl: bool,
     side: usize,
     enable_filter_intra: bool,
+    skip_ctx: usize,
 ) -> Result<(
     bool,
     usize,
@@ -1816,7 +1834,7 @@ fn read_intra_mode(
     Option<usize>,
 )> {
     let trace = std::env::var_os("EC_AV1_TRACE").is_some();
-    let skip = dec.symbol(&mut cdfs.skip[0]) != 0;
+    let skip = dec.symbol(&mut cdfs.skip[skip_ctx]) != 0;
     if trace {
         eprintln!("TRACE skip value={}", skip as i32);
     }
@@ -2354,6 +2372,7 @@ fn decode_block(
             cfl,
             side,
             enable_filter_intra,
+            neighbours.skip_txfm_ctx(r * (SUB / MI), c * (SUB / MI)),
         )?;
     // `predict` panics outside `DC_PRED..=PAETH_PRED` (0..=12); `UV_CFL_PRED`
     // (13) predicts as `DC_PRED` with the [`cfl_scaled`] nudge carrying the
@@ -2667,6 +2686,7 @@ fn decode_leaf8(
             true,
             8,
             enable_filter_intra,
+            neighbours.skip_txfm_ctx(leaf_mi.0, leaf_mi.1),
         )?;
     let uv_predict_mode = if uv_mode == UV_CFL_PRED {
         DC_PRED
