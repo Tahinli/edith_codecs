@@ -5106,12 +5106,14 @@ fn cdef_constrain(diff: i32, threshold: i32, damping: i32) -> i32 {
 /// Spec 7.15.3's direction search (libaom `cdef_find_dir_c`): the dominant
 /// direction of an 8x8 luma window and the variance gap between it and its
 /// orthogonal, `sample(row, col)` reading that window's own pixels.
-fn cdef_find_dir(sample: impl Fn(usize, usize) -> i32) -> (usize, i32) {
+fn cdef_find_dir(coeff_shift: i32, sample: impl Fn(usize, usize) -> i32) -> (usize, i32) {
     const DIV_TABLE: [i64; 9] = [0, 840, 420, 280, 210, 168, 140, 120, 105];
     let mut partial = [[0i64; 15]; 8];
     for i in 0..8i64 {
         for j in 0..8i64 {
-            let x = i64::from(sample(i as usize, j as usize)) - 128;
+            // libaom `cdef_find_dir_c`: normalise to an 8-bit sample before
+            // accumulating, same as `constrain`'s threshold shift below.
+            let x = i64::from(sample(i as usize, j as usize) >> coeff_shift) - 128;
             partial[0][(i + j) as usize] += x;
             partial[1][(i + j / 2) as usize] += x;
             partial[2][i as usize] += x;
@@ -5907,7 +5909,10 @@ fn apply_cdef(
     let src_y = y.data.clone();
     let src_u = u.data.clone();
     let src_v = v.data.clone();
-    let damping = i32::from(cdef.damping);
+    // libaom `av1_cdef_filter_fb`: `pri_strength = level << coeff_shift`,
+    // `sec_strength <<= coeff_shift`, `damping += coeff_shift - (pli != 0)`.
+    let coeff_shift = i32::from(bit_depth()) - 8;
+    let damping = i32::from(cdef.damping) + coeff_shift;
     let damping_uv = (damping - 1).max(0);
     let mut mi_r = 0usize;
     while mi_r < skip_grid.mi_rows {
@@ -5925,7 +5930,7 @@ fn apply_cdef(
                         i32::from(src_y[ny as usize * y_stride + nx as usize])
                     }
                 };
-                let (dir, var) = cdef_find_dir(|r, c| {
+                let (dir, var) = cdef_find_dir(coeff_shift, |r, c| {
                     let (ny, nx) = ((oy + r).min(y_true_h - 1), (ox + c).min(y_true_w - 1));
                     i32::from(src_y[ny * y_stride + nx])
                 });
@@ -5934,10 +5939,12 @@ fn apply_cdef(
                 // -- each plane zeroes the shared direction when *its own*
                 // frame-level primary strength is 0, independent of the
                 // per-block adjusted `t` and of the other plane's strength.
-                let y_dir = if cdef.y_pri_strength[sidx] != 0 { dir } else { 0 };
-                let t = cdef_adjust_strength(i32::from(cdef.y_pri_strength[sidx]), var);
+                let y_pri_strength = i32::from(cdef.y_pri_strength[sidx]) << coeff_shift;
+                let y_sec_strength = i32::from(cdef.y_sec_strength[sidx]) << coeff_shift;
+                let y_dir = if y_pri_strength != 0 { dir } else { 0 };
+                let t = cdef_adjust_strength(y_pri_strength, var);
                 let enable_primary = t != 0;
-                let enable_secondary = cdef.y_sec_strength[sidx] != 0;
+                let enable_secondary = y_sec_strength != 0;
                 if enable_primary || enable_secondary {
                     cdef_filter_block(
                         sample_y,
@@ -5947,7 +5954,7 @@ fn apply_cdef(
                         8,
                         8,
                         t,
-                        i32::from(cdef.y_sec_strength[sidx]),
+                        y_sec_strength,
                         y_dir,
                         damping,
                         damping,
@@ -5956,10 +5963,11 @@ fn apply_cdef(
                     );
                 }
 
-                let t_uv = i32::from(cdef.uv_pri_strength[sidx]);
+                let t_uv = i32::from(cdef.uv_pri_strength[sidx]) << coeff_shift;
+                let uv_sec_strength = i32::from(cdef.uv_sec_strength[sidx]) << coeff_shift;
                 let uv_dir = if t_uv != 0 { dir } else { 0 };
                 let enable_primary_uv = t_uv != 0;
-                let enable_secondary_uv = cdef.uv_sec_strength[sidx] != 0;
+                let enable_secondary_uv = uv_sec_strength != 0;
                 if enable_primary_uv || enable_secondary_uv {
                     let (cox, coy) = (ox / 2, oy / 2);
                     for (plane, src_p) in [(&mut *u, &src_u), (&mut *v, &src_v)] {
@@ -5981,7 +5989,7 @@ fn apply_cdef(
                             4,
                             4,
                             t_uv,
-                            i32::from(cdef.uv_sec_strength[sidx]),
+                            uv_sec_strength,
                             uv_dir,
                             damping_uv,
                             damping_uv,
