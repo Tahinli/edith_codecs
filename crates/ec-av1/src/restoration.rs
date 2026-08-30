@@ -354,6 +354,33 @@ pub(crate) fn read_lr(
     }
 }
 
+/// r3 gate self-pin: how many units decoded a real (non-`None`) filter, by
+/// kind -- proves a real `--enable-restoration=1` aomenc stream actually
+/// exercises `read_lr_unit`'s Wiener/SGR/switchable arms, not just that the
+/// symbol-count/refusal-string wiring compiles. Never reset -- summed across
+/// a gate's whole attempt loop, matching `MASKED_COMPOUND_HITS`/`WEDGE_HITS`
+/// (decode.rs) which this mirrors.
+thread_local! {
+    static WIENER_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SGRPROJ_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SWITCHABLE_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`WIENER_HITS`].
+pub(crate) fn wiener_hits() -> usize {
+    WIENER_HITS.with(|c| c.get())
+}
+/// Current value of [`SGRPROJ_HITS`].
+pub(crate) fn sgrproj_hits() -> usize {
+    SGRPROJ_HITS.with(|c| c.get())
+}
+/// Current value of [`SWITCHABLE_HITS`] -- bumped once per unit whose frame
+/// `restoration_type` is `Switchable`, regardless of which `RestoreType`
+/// (`None`/Wiener/Sgrproj) that unit's own symbol resolved to.
+pub(crate) fn switchable_hits() -> usize {
+    SWITCHABLE_HITS.with(|c| c.get())
+}
+
 fn read_lr_unit(
     dec: &mut SymbolDecoder,
     cdfs: &mut crate::cdf_state::Cdfs,
@@ -363,22 +390,32 @@ fn read_lr_unit(
 ) -> UnitFilter {
     match ftype {
         RestorationType::Switchable => {
+            SWITCHABLE_HITS.with(|c| c.set(c.get() + 1));
             let t = dec.symbol(&mut cdfs.restore_switchable);
             match t {
                 0 => UnitFilter::None,
-                1 => UnitFilter::Wiener(read_wiener_filter(dec, chroma, &mut reference.0)),
-                _ => UnitFilter::Sgrproj(read_sgrproj_filter(dec, &mut reference.1)),
+                1 => {
+                    WIENER_HITS.with(|c| c.set(c.get() + 1));
+                    UnitFilter::Wiener(read_wiener_filter(dec, chroma, &mut reference.0))
+                }
+                _ => {
+                    SGRPROJ_HITS.with(|c| c.set(c.get() + 1));
+                    UnitFilter::Sgrproj(read_sgrproj_filter(dec, &mut reference.1))
+                }
             }
         }
         RestorationType::Wiener => {
             if dec.symbol(&mut cdfs.restore_wiener) != 0 {
+                WIENER_HITS.with(|c| c.set(c.get() + 1));
                 UnitFilter::Wiener(read_wiener_filter(dec, chroma, &mut reference.0))
             } else {
                 UnitFilter::None
             }
         }
         RestorationType::Sgrproj => {
-            if dec.symbol(&mut cdfs.restore_sgrproj) != 0 {
+            let bit = dec.symbol(&mut cdfs.restore_sgrproj);
+            if bit != 0 {
+                SGRPROJ_HITS.with(|c| c.set(c.get() + 1));
                 UnitFilter::Sgrproj(read_sgrproj_filter(dec, &mut reference.1))
             } else {
                 UnitFilter::None
