@@ -3918,6 +3918,9 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         let stream = out.stdout;
+        if let Ok(path) = std::env::var("EC_SUPERRES_STREAM_DUMP") {
+            std::fs::write(path, &stream).expect("dump stream");
+        }
         let frames =
             decode_stream(&stream).unwrap_or_else(|e| panic!("{NAME} refused: {e}"));
         assert_eq!(frames.len(), frame_count);
