@@ -400,6 +400,21 @@ pub fn find_projection(
     })
 }
 
+/// lane-gm r4: `allow_warp`'s `global_warp_allowed` branch
+/// (`reconinter.c:50`) -- reuses the SAME shear decomposition
+/// [`find_projection`]'s local-warp path calls (`get_shear_params`), just
+/// keyed on the frame's already-coded `global_motion[ref]` model instead of
+/// a per-block least-squares fit. Caller gates this on `is_global_mv_block
+/// && !global_motion[ref].invalid` (matching `allow_warp` exactly); `None`
+/// here means the model's own shear is not filter-representable even though
+/// the frame header's `warpValid` bit said otherwise for a `mat[2] <= 0`
+/// edge `get_shear_params` additionally rejects -- caller keeps its
+/// translational fallback in that rare case.
+pub fn global_warp_params(wmmat: [i32; 6]) -> Option<WarpParams> {
+    let (alpha, beta, gamma, delta) = get_shear_params(wmmat)?;
+    Some(WarpParams { wmmat, alpha, beta, gamma, delta })
+}
+
 fn clip_pixel(v: i32) -> u8 {
     v.clamp(0, 255) as u8
 }
