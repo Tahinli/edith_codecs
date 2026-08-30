@@ -465,6 +465,20 @@ pub(crate) fn rect_coeff_hits() -> usize {
     RECT_COEFF_HITS.with(|c| c.get())
 }
 
+// lane-sbpart r2: how many superblock-level `PARTITION_HORZ`/`PARTITION_VERT`
+// blocks (two true 64x32/32x64 strips, [`decode_block_rect64`]) fired -- the
+// gate's proof this round's arms actually reached a real block, not just
+// that `partition_w64` read one of those two symbol values.
+thread_local! {
+    static SB_RECT_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`SB_RECT_HITS`].
+pub(crate) fn sb_rect_hits() -> usize {
+    SB_RECT_HITS.with(|c| c.get())
+}
+
 // lane-partab r1: how many 32x32 quadrants decoded an AB partition
 // (PARTITION_HORZ_A / VERT_A / VERT_B -- two 16x16 squares plus one
 // 16x32/32x16 strip). Like [`RECT_PARTITION_HITS`], this is the
@@ -2566,6 +2580,267 @@ fn decode_block_rect(
     neighbours.fill_skip_grid_rect((mi_r, mi_c), bw / MI, bh / MI, skip);
     neighbours.fill_lf_grid_rect((mi_r, mi_c), bw / MI, bh / MI, tx_w as u8, tx_h as u8, 0);
     RECT_PARTITION_HITS.with(|c| c.set(c.get() + 1));
+    Ok(())
+}
+
+/// Decodes one true `bw`x`bh` superblock-level `PARTITION_HORZ`/
+/// `PARTITION_VERT` strip (lane-sbpart r2, `bw, bh` one of `(64, 32)` /
+/// `(32, 64)` -- [`decode_block_rect`]'s own sibling one level up). Unlike
+/// that 32x16/16x32 strip, both dimensions here exceed the 32-coefficient
+/// cap, so LUMA needs the same corner truncation [`decode_block`] already
+/// does for a plain 64x64 square (spec 5.11.40): `get_txsize_entropy_ctx`
+/// resolves TX_64X32/TX_32X64 to TX_64X64 regardless of orientation (see
+/// this function's own charter/report), so both strips read a real 32x32
+/// corner through [`read_coeffs`] with [`TxbSet::Luma64`]/[`SCAN_32`] and
+/// embed it top-left of a zeroed `bw`x`bh` grid, mirroring
+/// [`read_plane`]'s `tx_side != side` branch generalized to non-square.
+/// CHROMA (TX_32X16/TX_16X32) resolves to TX_32X32 -- a real, *untruncated*
+/// `bw/2`x`bh/2` transform via [`read_coeffs_rect`] with
+/// [`TxbSet::ChromaRect32x16`] and the matching [`SCAN_32X16`]/
+/// [`SCAN_16X32`], same as [`decode_block_rect`]'s own chroma path. Like
+/// that function, only the single-transform-unit (`tx_depth == 0`) case is
+/// supported: a split transform refuses by name rather than guess-decode.
+#[allow(clippy::too_many_arguments)]
+fn decode_block_rect64(
+    dec: &mut SymbolDecoder,
+    cdfs: &mut Cdfs,
+    neighbours: &mut Neighbours,
+    at: (usize, usize),
+    bw: usize,
+    bh: usize,
+    y: &mut PlaneBuf,
+    u: &mut PlaneBuf,
+    v: &mut PlaneBuf,
+    enable_filter_intra: bool,
+    allow_screen_content_tools: bool,
+    base_q_idx: u8,
+    tx_select: bool,
+) -> Result<()> {
+    let (r, c) = at;
+    let (px, py) = (c * SUB, r * SUB);
+    let (skip, mode, angle_delta_y, uv_mode, angle_delta_uv, alpha, filter_intra) =
+        read_intra_mode_rect(
+            dec,
+            cdfs,
+            neighbours.above_mode[c],
+            neighbours.left_mode[r],
+            true,
+            bw,
+            bh,
+            enable_filter_intra,
+            neighbours.skip_txfm_ctx(r * (SUB / MI), c * (SUB / MI)),
+            allow_screen_content_tools,
+            r * (SUB / MI),
+            c * (SUB / MI),
+        )?;
+    let smooth_neighbor =
+        is_smooth_mode(neighbours.above_mode[c]) || is_smooth_mode(neighbours.left_mode[r]);
+    if smooth_neighbor {
+        SMOOTH_LUMA_HITS.with(|c| c.set(c.get() + 1));
+    }
+    let smooth_neighbor_uv =
+        is_smooth_mode(neighbours.above_uv_mode[c]) || is_smooth_mode(neighbours.left_uv_mode[r]);
+    if filter_intra.is_some() {
+        // `filter_intra_size_class_rect` already returns `None` for both
+        // `(64, 32)` and `(32, 64)` (`av1_filter_intra_allowed_bsize` caps at
+        // 32 on both axes), so this symbol is never read at this level --
+        // kept only as the same defensive refusal [`decode_block_rect`] has.
+        return Err(unsupported(
+            "filter intra on a superblock-level HORZ/VERT strip (never expected -- \
+             av1_filter_intra_allowed_bsize caps at 32x32)",
+        ));
+    }
+    let uv_predict_mode = if uv_mode == UV_CFL_PRED {
+        DC_PRED
+    } else {
+        uv_mode
+    };
+    let (mi_r, mi_c) = (r * (SUB / MI), c * (SUB / MI));
+    let depth = if tx_select {
+        let ctx = tx_size_context_rect(neighbours, (mi_r, mi_c), bw, bh);
+        dec.symbol(&mut cdfs.tx_size_cat2[ctx])
+    } else {
+        0
+    };
+    if depth != 0 {
+        TX_DEPTH_HITS.with(|c| c.set(c.get() + 1));
+        return Err(unsupported(
+            "a superblock-level HORZ/VERT strip with a split transform (per-unit rect \
+             prediction is not ported)",
+        ));
+    }
+    let (tx_w, tx_h) = (bw, bh);
+    let (cpx, cpy) = (px / 2, py / 2);
+    let (chroma_w, chroma_h) = (bw / 2, bh / 2);
+    let reach = Reach::of_rect(bw, bh, px, py, y.width, y.height);
+    if skip {
+        y.reconstruct_rect(
+            px,
+            py,
+            bw,
+            bh,
+            mode,
+            angle_delta_y,
+            reach,
+            &vec![0i32; bw * bh],
+            None,
+            filter_intra,
+            smooth_neighbor,
+        );
+        let ac = alpha.map(|_| cfl_ac_q3_rect(y, px, py, bw, bh));
+        u.reconstruct_rect(
+            cpx,
+            cpy,
+            chroma_w,
+            chroma_h,
+            uv_predict_mode,
+            angle_delta_uv,
+            reach,
+            &vec![0i32; chroma_w * chroma_h],
+            alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
+            None,
+            smooth_neighbor_uv,
+        );
+        v.reconstruct_rect(
+            cpx,
+            cpy,
+            chroma_w,
+            chroma_h,
+            uv_predict_mode,
+            angle_delta_uv,
+            reach,
+            &vec![0i32; chroma_w * chroma_h],
+            alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
+            None,
+            smooth_neighbor_uv,
+        );
+        neighbours.record_rect(
+            at,
+            bw,
+            bh,
+            mode,
+            uv_predict_mode,
+            &[
+                vec![0i32; bw * bh],
+                vec![0i32; chroma_w * chroma_h],
+                vec![0i32; chroma_w * chroma_h],
+            ],
+        );
+    } else {
+        let around = neighbours.around_rect(at, bw, bh);
+        // LUMA: a real 32x32 corner, embedded top-left of the true bw x bh
+        // grid (see this function's own doc comment).
+        let scan32 = default_scan(TX32);
+        let mut luma_coding = cdfs.txb(TxbSet::Luma64, mode);
+        let (luma_corner, luma_tx_type) = read_coeffs(
+            dec,
+            &mut luma_coding,
+            &scan32,
+            0,
+            dc_sign_ctx(around[0].2),
+            TxType::DctDct,
+        )?;
+        let mut luma_levels = vec![0i32; bw * bh];
+        for row in 0..32 {
+            luma_levels[row * bw..][..32].copy_from_slice(&luma_corner[row * 32..][..32]);
+        }
+        let luma_residual = dequant_and_inverse_typed_wh(
+            &luma_levels,
+            bw,
+            bh,
+            8,
+            i32::from(base_q_idx),
+            luma_tx_type,
+        );
+        y.reconstruct_rect(
+            px,
+            py,
+            bw,
+            bh,
+            mode,
+            angle_delta_y,
+            reach,
+            &luma_residual,
+            None,
+            filter_intra,
+            smooth_neighbor,
+        );
+        // CHROMA: a real, untruncated chroma_w x chroma_h transform -- no
+        // corner crop needed (see doc comment).
+        let ac = alpha.map(|_| cfl_ac_q3_rect(y, px, py, bw, bh));
+        let chroma_scan: &[u16] = if bw == 64 { &SCAN_32X16 } else { &SCAN_16X32 };
+        let u_skip_ctx = usize::from(around[1].0) + usize::from(around[1].1);
+        let mut u_coding = cdfs.txb(TxbSet::ChromaRect32x16, uv_predict_mode);
+        let (u_levels, u_tx_type) = read_coeffs_rect(
+            dec,
+            &mut u_coding,
+            chroma_scan,
+            chroma_w,
+            chroma_h,
+            u_skip_ctx,
+            dc_sign_ctx(around[1].2),
+            TxType::DctDct,
+        )?;
+        let u_residual = dequant_and_inverse_typed_wh(
+            &u_levels,
+            chroma_w,
+            chroma_h,
+            8,
+            i32::from(base_q_idx),
+            u_tx_type,
+        );
+        u.reconstruct_rect(
+            cpx,
+            cpy,
+            chroma_w,
+            chroma_h,
+            uv_predict_mode,
+            angle_delta_uv,
+            reach,
+            &u_residual,
+            alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
+            None,
+            smooth_neighbor_uv,
+        );
+        let v_skip_ctx = usize::from(around[2].0) + usize::from(around[2].1);
+        let mut v_coding = cdfs.txb(TxbSet::ChromaRect32x16, uv_predict_mode);
+        let (v_levels, v_tx_type) = read_coeffs_rect(
+            dec,
+            &mut v_coding,
+            chroma_scan,
+            chroma_w,
+            chroma_h,
+            v_skip_ctx,
+            dc_sign_ctx(around[2].2),
+            TxType::DctDct,
+        )?;
+        let v_residual = dequant_and_inverse_typed_wh(
+            &v_levels,
+            chroma_w,
+            chroma_h,
+            8,
+            i32::from(base_q_idx),
+            v_tx_type,
+        );
+        v.reconstruct_rect(
+            cpx,
+            cpy,
+            chroma_w,
+            chroma_h,
+            uv_predict_mode,
+            angle_delta_uv,
+            reach,
+            &v_residual,
+            alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
+            None,
+            smooth_neighbor_uv,
+        );
+        neighbours.record_rect(at, bw, bh, mode, uv_predict_mode, &[luma_levels, u_levels, v_levels]);
+        RECT_COEFF_HITS.with(|c| c.set(c.get() + 1));
+    }
+    neighbours.fill_skip_grid_rect((mi_r, mi_c), bw / MI, bh / MI, skip);
+    neighbours.fill_lf_grid_rect((mi_r, mi_c), bw / MI, bh / MI, tx_w as u8, tx_h as u8, 0);
+    SB_RECT_HITS.with(|c| c.set(c.get() + 1));
     Ok(())
 }
 
@@ -5288,6 +5563,73 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                             }
                         }
                     }
+                }
+                PARTITION_HORZ => {
+                    // lane-sbpart r2: two true 64x32 strips.
+                    decode_block_rect64(
+                        &mut dec,
+                        &mut cdfs,
+                        &mut neighbours,
+                        at,
+                        64,
+                        32,
+                        &mut y,
+                        &mut u,
+                        &mut v,
+                        enable_filter_intra,
+                        allow_screen_content_tools,
+                        base_q_idx,
+                        tx_select,
+                    )?;
+                    decode_block_rect64(
+                        &mut dec,
+                        &mut cdfs,
+                        &mut neighbours,
+                        (at.0 + 2, at.1),
+                        64,
+                        32,
+                        &mut y,
+                        &mut u,
+                        &mut v,
+                        enable_filter_intra,
+                        allow_screen_content_tools,
+                        base_q_idx,
+                        tx_select,
+                    )?;
+                }
+                PARTITION_VERT => {
+                    // lane-sbpart r2: mirror of PARTITION_HORZ above with
+                    // width/height swapped.
+                    decode_block_rect64(
+                        &mut dec,
+                        &mut cdfs,
+                        &mut neighbours,
+                        at,
+                        32,
+                        64,
+                        &mut y,
+                        &mut u,
+                        &mut v,
+                        enable_filter_intra,
+                        allow_screen_content_tools,
+                        base_q_idx,
+                        tx_select,
+                    )?;
+                    decode_block_rect64(
+                        &mut dec,
+                        &mut cdfs,
+                        &mut neighbours,
+                        (at.0, at.1 + 2),
+                        32,
+                        64,
+                        &mut y,
+                        &mut u,
+                        &mut v,
+                        enable_filter_intra,
+                        allow_screen_content_tools,
+                        base_q_idx,
+                        tx_select,
+                    )?;
                 }
                 _ => {
                     return Err(unsupported(
