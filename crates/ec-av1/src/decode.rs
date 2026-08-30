@@ -2792,7 +2792,25 @@ fn read_intra_mode(
             if trace {
                 eprintln!("TRACE palette_y size={n} colors={:?}", &colors[..n]);
             }
-            palette_y = Some(PaletteY { size: n, colors, map });
+            // lane-palette r3/r4: `read_palette_colors_y`, `read_uniform`,
+            // `palette_color_index_context` and the `PALETTE_Y_COLOR_INDEX`
+            // CDF table all match the oracle line-for-line (r3), and the
+            // wavefront's decoded base colours are independently correct
+            // (`[112, 131, 162, 180]`, real SMPTE-bar levels) -- but the
+            // reconstructed pixels this index map produces still do not
+            // match ffmpeg's decode of the same bytes (r3's
+            // `a_real_aomenc_stream_with_palette_y_refuses_by_name`).
+            // Refuse by name rather than hand back wrong pixels: every
+            // symbol above is still consumed exactly as read (so
+            // `palette_hits()` keeps proving this path is reached), the
+            // reconstruction code below stays in place for when the
+            // desync is found, and the caller sees a named refusal instead
+            // of silently-wrong output.
+            let _ = PaletteY { size: n, colors, map };
+            return Err(unsupported(
+                "a block that actually uses a palette (Y) -- the index map decodes but the \
+                 reconstructed pixels do not match libaom yet (lane-palette r3/r4)",
+            ));
         }
         let palette_uv_mode_ctx = usize::from(palette_y.is_some());
         if uv_mode == DC_PRED && dec.symbol(&mut cdfs.palette_uv_mode[palette_uv_mode_ctx]) != 0 {
