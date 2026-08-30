@@ -13459,6 +13459,42 @@ mod tests {
     // this decoder's one target, and the round-trip test below is against
     // that path with real quantised residual, not a synthetic all-DC frame.
 
+    /// [`SCAN_8X4`]/[`SCAN_4X8`] (lane-rectx r2): a bijection check alone
+    /// cannot catch a transposed pair -- a swap of two orientation tables is
+    /// still a bijection over the same 32 positions. This pins BOTH arrays
+    /// at once, element-for-element, against literal transcriptions of
+    /// libaom's real `default_scan_4x8`/`default_scan_8x4` in
+    /// `av1/common/scan.c` (`~/.cache/aom-oracle/src`, read directly for
+    /// this test, not re-derived from the zigzag formula). The two source
+    /// sequences are themselves different in their own right (not equal to
+    /// each other), so this is asymmetric in the two axes: if the repo's
+    /// `SCAN_8X4`/`SCAN_4X8` were swapped with each other, one side of this
+    /// assert pair would fail even though each individual array would still
+    /// pass a same-orientation bijection test.
+    #[test]
+    fn scan_8x4_and_4x8_are_not_transposed_against_each_other() {
+        // libaom `default_scan_4x8` verbatim (scan.c:29-32) -- this repo
+        // names it `SCAN_8X4` under the established w/h axis swap (see
+        // `SCAN_8X4`'s own doc comment).
+        const LIBAOM_DEFAULT_SCAN_4X8: [u16; 32] = [
+            0, 8, 1, 16, 9, 2, 24, 17, 10, 3, 25, 18, 11, 4, 26, 19, 12, 5, 27, 20, 13, 6, 28, 21,
+            14, 7, 29, 22, 15, 30, 23, 31,
+        ];
+        // libaom `default_scan_8x4` verbatim (scan.c:44-47) -- this repo's
+        // `SCAN_4X8`.
+        const LIBAOM_DEFAULT_SCAN_8X4: [u16; 32] = [
+            0, 1, 4, 2, 5, 8, 3, 6, 9, 12, 7, 10, 13, 16, 11, 14, 17, 20, 15, 18, 21, 24, 19, 22,
+            25, 28, 23, 26, 29, 27, 30, 31,
+        ];
+        assert_ne!(
+            LIBAOM_DEFAULT_SCAN_4X8, LIBAOM_DEFAULT_SCAN_8X4,
+            "the two libaom source sequences must differ, or this pin would \
+             pass regardless of a swap"
+        );
+        assert_eq!(SCAN_8X4, LIBAOM_DEFAULT_SCAN_4X8, "SCAN_8X4 vs libaom default_scan_4x8");
+        assert_eq!(SCAN_4X8, LIBAOM_DEFAULT_SCAN_8X4, "SCAN_4X8 vs libaom default_scan_8x4");
+    }
+
     /// `is_uni_comp_ref` (lane-av1comp): a pair is unidirectional exactly
     /// when both references sit on the same temporal side -- the three
     /// `uni_comp_ref` bitstream pairs (LAST/LAST2, LAST/LAST3, LAST/GOLDEN)
