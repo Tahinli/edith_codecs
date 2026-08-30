@@ -5681,6 +5681,11 @@ fn apply_deblock(
     frame_width: usize,
     frame_height: usize,
 ) {
+    // lane-part32 r2 debug rung, env-gated: bisecting a widespread pixel
+    // mismatch between the raw reconstruction and post-filter output.
+    if std::env::var_os("EC_AV1_DEBUG_SKIP_DEBLOCK").is_some() {
+        return;
+    }
     if lf.level[0] != 0 || lf.level[1] != 0 {
         deblock_plane(y, 0, lf, n, frame_width, frame_height);
     }
@@ -6298,6 +6303,10 @@ fn apply_cdef(
     cdef: &CdefParams,
     skip_grid: &Neighbours,
 ) {
+    // lane-part32 r2 debug rung, env-gated: see `apply_deblock`'s sibling.
+    if std::env::var_os("EC_AV1_DEBUG_SKIP_CDEF").is_some() {
+        return;
+    }
     // `cdef.bits == 0` still means "no filtering at all" whenever the single
     // (index 0) strength pair is all-zero -- the fast path every existing
     // gate stream takes. A `bits > 0` frame can still be all-zero-strength
