@@ -332,6 +332,52 @@ pub const FILTER_INTRA: [[u16; 3]; 6] = [
 /// `FILTER_INTRA_MODES` a `use_filter_intra` block picks.
 pub const FILTER_INTRA_MODE: [u16; 6] = [8949, 12776, 17211, 29558, 32768, 0];
 
+/// `default_palette_y_size_cdf` (entropymode.c): `PALETTE_SIZES` (2..=8),
+/// indexed by `av1_get_palette_bsize_ctx` (0..=6, `PALATTE_BSIZE_CTXS`).
+pub const PALETTE_Y_SIZE: [[u16; 8]; 7] = [
+    [7952, 13000, 18149, 21478, 25527, 29241, 32768, 0],
+    [7139, 11421, 16195, 19544, 23666, 28073, 32768, 0],
+    [7788, 12741, 17325, 20500, 24315, 28530, 32768, 0],
+    [8271, 14064, 18246, 21564, 25071, 28533, 32768, 0],
+    [12725, 19180, 21863, 24839, 27535, 30120, 32768, 0],
+    [9711, 14888, 16923, 21052, 25661, 27875, 32768, 0],
+    [14940, 20797, 21678, 24186, 27033, 28999, 32768, 0],
+];
+/// `default_palette_uv_size_cdf` (entropymode.c): as [`PALETTE_Y_SIZE`], for
+/// the chroma plane's own palette size.
+pub const PALETTE_UV_SIZE: [[u16; 8]; 7] = [
+    [8713, 19979, 27128, 29609, 31331, 32272, 32768, 0],
+    [5839, 15573, 23581, 26947, 29848, 31700, 32768, 0],
+    [4426, 11260, 17999, 21483, 25863, 29430, 32768, 0],
+    [3228, 9464, 14993, 18089, 22523, 27420, 32768, 0],
+    [3768, 8886, 13091, 17852, 22495, 27207, 32768, 0],
+    [2464, 8451, 12861, 21632, 25525, 28555, 32768, 0],
+    [1269, 5435, 10433, 18963, 21700, 25865, 32768, 0],
+];
+/// `default_palette_y_mode_cdf` (entropymode.c): whether a `DC_PRED` block
+/// uses a palette, indexed `[bsize_ctx][palette_mode_ctx]`
+/// (`palette_mode_ctx` from `av1_get_palette_mode_ctx` -- this decoder never
+/// completes a decode with a nonzero neighbour `palette_size`, so only row
+/// `[.][0]` is ever read, but the whole table is here to match libaom's
+/// adaptation shape exactly).
+pub const PALETTE_Y_MODE: [[[u16; 3]; 3]; 7] = [
+    [[31676, 32768, 0], [3419, 32768, 0], [1261, 32768, 0]],
+    [[31912, 32768, 0], [2859, 32768, 0], [980, 32768, 0]],
+    [[31823, 32768, 0], [3400, 32768, 0], [781, 32768, 0]],
+    [[32030, 32768, 0], [3561, 32768, 0], [904, 32768, 0]],
+    [[32309, 32768, 0], [7337, 32768, 0], [1462, 32768, 0]],
+    [[32265, 32768, 0], [4015, 32768, 0], [1521, 32768, 0]],
+    [[32450, 32768, 0], [7946, 32768, 0], [129, 32768, 0]],
+];
+/// `default_palette_uv_mode_cdf` (entropymode.c): whether a `UV_DC_PRED`
+/// block uses a chroma palette, indexed by `palette_uv_mode_ctx` (whether
+/// this block's own luma palette was used -- always 0 here, see
+/// [`PALETTE_Y_MODE`]'s doc).
+pub const PALETTE_UV_MODE: [[u16; 3]; 2] = [[32461, 32768, 0], [21488, 32768, 0]];
+/// `default_intrabc_cdf` (entropymode.c): the `use_intrabc` flag on an
+/// intra frame with `allow_intrabc` set.
+pub const INTRABC: [u16; 3] = [30531, 32768, 0];
+
 /// `default_tx_size_cdf[0]` (entropymode.c): an 8x8 block's `tx_depth` flag
 /// (`TX8` vs `TX4`), indexed by `tx_size_context` (0..=2).
 pub const TX_SIZE_CAT0: [[u16; 3]; 3] = [[19968, 32768, 0], [19968, 32768, 0], [24320, 32768, 0]];

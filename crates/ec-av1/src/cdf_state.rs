@@ -402,6 +402,17 @@ pub(crate) struct Cdfs {
     /// A `SWITCHABLE`-filter inter block's own `interp_filter[dir]` -- see
     /// [`cdf::SWITCHABLE_INTERP`].
     pub switchable_interp: [[u16; 4]; 16],
+    /// A `DC_PRED` block's own palette-use flag -- see [`cdf::PALETTE_Y_MODE`].
+    pub palette_y_mode: [[[u16; 3]; 3]; 7],
+    /// A palette block's own size (2..=8) -- see [`cdf::PALETTE_Y_SIZE`].
+    pub palette_y_size: [[u16; 8]; 7],
+    /// A `UV_DC_PRED` block's own chroma palette-use flag -- see
+    /// [`cdf::PALETTE_UV_MODE`].
+    pub palette_uv_mode: [[u16; 3]; 2],
+    /// A chroma palette block's own size -- see [`cdf::PALETTE_UV_SIZE`].
+    pub palette_uv_size: [[u16; 8]; 7],
+    /// The `use_intrabc` flag -- see [`cdf::INTRABC`].
+    pub intrabc: [u16; 3],
 }
 
 /// One motion vector component's adapting state (spec 9.4's `Default_Mv_*`,
@@ -616,6 +627,11 @@ impl Cdfs {
         reset2(&mut self.tx_size_cat1);
         reset2(&mut self.tx_size_cat2);
         reset2(&mut self.tx_size_cat3);
+        reset3(&mut self.palette_y_mode);
+        reset2(&mut self.palette_y_size);
+        reset2(&mut self.palette_uv_mode);
+        reset2(&mut self.palette_uv_size);
+        reset1(&mut self.intrabc);
     }
 
     /// The defaults a key frame starts from (spec 8.4, `init_coeff_cdfs` and
@@ -1057,6 +1073,11 @@ impl Cdfs {
             tx_size_cat2: cdf::TX_SIZE_CAT2,
             tx_size_cat3: cdf::TX_SIZE_CAT3,
             switchable_interp: cdf::SWITCHABLE_INTERP,
+            palette_y_mode: cdf::PALETTE_Y_MODE,
+            palette_y_size: cdf::PALETTE_Y_SIZE,
+            palette_uv_mode: cdf::PALETTE_UV_MODE,
+            palette_uv_size: cdf::PALETTE_UV_SIZE,
+            intrabc: cdf::INTRABC,
         }
     }
 
