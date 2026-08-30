@@ -222,16 +222,15 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         }
         // Loop restoration carries per-restoration-unit symbols in the tile
         // (spec 5.11.57 `read_lr`, one group per LR unit reached from the
-        // superblock walk) that this decoder never reads -- same
-        // silent-desync shape as the refusals above. Traced live 2026-08-27:
-        // an aomenc inter frame with `Sgrproj` on the V plane desynced the
-        // partition walk into out-of-alphabet garbage.
-        if header.loop_restoration.uses_lr {
-            return Err(Error::unsupported(
-                "AV1 decode_stream",
-                "a frame with loop restoration enabled (this decoder never reads the per-unit lr symbols)",
-            ));
-        }
+        // superblock walk) -- lane-lr r2 ported the reader
+        // (`crate::restoration`), r3 moved this refusal check to AFTER the
+        // tile decode call below (was here, before it, in r2 -- meaning
+        // `read_lr` was NEVER actually reached through `decode_stream`, the
+        // gap the r3 gate caught live: 40/40 attempts hit this refusal with
+        // zero `read_lr_unit` hits). Checking post-decode instead proves the
+        // superblock walk actually survived `read_lr` (no desync) before
+        // refusing on the true remaining gap: decoded Wiener/SGR filters are
+        // stored per unit but never applied to pixels.
         // `decode_inter_block`/`decode_inter_block8`'s `GLOBALMV` arm (spec
         // 5.11.26's `read_inter_intra`... really `assign_mv`'s `GLOBALMV`
         // case, spec 7.10.2.1) uses `gm_get_motion_vector`, which is the
@@ -429,6 +428,7 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 enable_edge_filter,
                 &header.cdef,
                 &header.loop_filter,
+                &header.loop_restoration,
                 initial_cdfs,
                 header.tx_mode == TxMode::Select,
                 header.reduced_tx_set,
@@ -516,6 +516,7 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 other_refs,
                 &header.cdef,
                 &header.loop_filter,
+                &header.loop_restoration,
                 initial_cdfs,
                 header.allow_high_precision_mv,
                 header.force_integer_mv,
@@ -540,6 +541,9 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 header.delta,
             )?
         };
+        // lane-lr r4: the Wiener/self-guided pixel filters are wired
+        // (`decode.rs::apply_loop_restoration`) -- no more refusal here,
+        // `uses_lr` frames now decode all the way to pixels.
         // Spec 7.20: `disable_frame_end_update_cdf` stores the frame's
         // *initial* table into the slots it refreshes, not the adapted
         // end-of-tile one.
@@ -5373,6 +5377,218 @@ mod tests {
         );
     }
 
+
+    /// lane-lr r3: proves stage 1/2's exit criterion -- a real
+    /// `--enable-restoration=1` aomenc stream must survive the whole
+    /// partition walk (every symbol read entropy-exact) and land on the
+    /// NEW, narrowed refusal ("read but not applied"), never desync into
+    /// some other named refusal or an outright decode panic. Multi-superblock
+    /// fixture (192x128 = 3x2 SBs of 64px) per the charter's own trap
+    /// warning -- a single-SB fixture can never re-enter `read_lr` a second
+    /// time and would leave `SWITCHABLE_HITS`/etc. proving only one call
+    /// site, not the per-SB loop.
+    #[test]
+    fn a_real_aomenc_stream_with_restoration_reads_lr_symbols_correctly() {
+        const NAME: &str = "a_real_aomenc_stream_with_restoration_reads_lr_symbols_correctly";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height) = (192usize, 128usize);
+        let n_attempts: u32 = std::env::var("EC_LR_GATE_ATTEMPTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(40);
+        let mut lr_refusals = 0u32;
+        let mut other_refusals = Vec::new();
+        for attempt in 0..n_attempts {
+            let seed = 42 + attempt;
+            let source = gradients_source(seed, width, height, "duration=0.04:rate=25");
+            let y4m = Command::new("ffmpeg")
+                .args(["-v", "error", "-f", "lavfi", "-i"])
+                .arg(&source)
+                .args(["-pix_fmt", "yuv420p", "-f", "yuv4mpegpipe", "-"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let mut child = Command::new(aomenc_path())
+                .args([
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    // r3: a low cq-level (high quality/bitrate) is load-bearing --
+                    // sampled live (2026-08-30) that aomenc's RD only ever picks a
+                    // non-`RESTORE_NONE` frame_restoration_type at cq-level<=20 for
+                    // this fixture; cq-level=45 (this gate's sibling gates' usual
+                    // value) landed `uses_lr=false` on every attempt.
+                    "--cq-level=15",
+                    "--cpu-used=0",
+                    "--threads=1",
+                    "--row-mt=0",
+                    // r3: this decoder always assumes 64px superblocks
+                    // (`decode.rs` hardcodes `SB_MI=16`, ledger `lane-sb128`
+                    // dead-ends) -- force aomenc to match rather than risk
+                    // the unrelated sb128 gap eating this gate's own window.
+                    "--sb-size=64",
+                    "--enable-restoration=1",
+                    "--enable-cdef=0",
+                    "--enable-rect-partitions=0",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    "--enable-filter-intra=0",
+                    "--enable-smooth-intra=0",
+                    "--enable-paeth-intra=0",
+                    "--enable-tx-size-search=0",
+                    "--max-partition-size=32",
+                    "--min-partition-size=16",
+                    "--enable-palette=0",
+                    "--enable-intrabc=0",
+                    "--enable-cfl-intra=0",
+                    "--enable-ref-frame-mvs=0",
+                    "--enable-warped-motion=0",
+                    "--enable-global-motion=0",
+                    "--enable-masked-comp=0",
+                    "--enable-interintra-comp=0",
+                    "--enable-obmc=0",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            match decode_stream(&stream) {
+                Ok(pics) => {
+                    // r4: the pixel filters are wired -- every `uses_lr`
+                    // frame must now decode Ok AND match an independent
+                    // decoder pixel-exact, not just refuse cleanly.
+                    let reference = ffmpeg_decode_sequence(&stream, width, height, pics.len());
+                    let mismatched = pics
+                        .iter()
+                        .zip(&reference)
+                        .any(|(got, want)| got.y != want.y || got.u != want.u || got.v != want.v);
+                    // r7: pin a mismatching stream the same way the
+                    // masked-compound gate does -- lets a follow-up round
+                    // decode this exact seed's bytes directly instead of
+                    // re-deriving them from a live 40-attempt sweep.
+                    if mismatched && let Ok(path) = std::env::var("EC_AV1_GATE_DUMP") {
+                        std::fs::write(&path, &stream).expect("writing pinned stream");
+                        eprintln!(
+                            "EC_AV1_GATE_DUMP: wrote mismatching LR stream (seed {seed}) to {path}"
+                        );
+                    }
+                    for (i, (pic, refpic)) in pics.iter().zip(reference.iter()).enumerate() {
+                        assert_eq!(pic.y, refpic.y, "{NAME}: luma mismatch (seed {seed} frame {i})");
+                        assert_eq!(pic.u, refpic.u, "{NAME}: U mismatch (seed {seed} frame {i})");
+                        assert_eq!(pic.v, refpic.v, "{NAME}: V mismatch (seed {seed} frame {i})");
+                    }
+                    lr_refusals += 1; // reused below as "attempts that actually exercised LR pixels"
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    other_refusals.push(format!("seed {seed}: {msg}"));
+                }
+            }
+        }
+        assert!(
+            other_refusals.is_empty(),
+            "{NAME}: {} attempts failed outright instead of decoding:\n{}",
+            other_refusals.len(),
+            other_refusals.join("\n")
+        );
+        assert!(
+            lr_refusals > 0,
+            "{NAME}: no attempt ever decoded pixel-exact ({n_attempts} attempts)"
+        );
+        // Any real (non-`RESTORE_NONE`) filter kind is acceptable proof --
+        // aomenc's RD picks the frame-level `restoration_type` itself (not
+        // always `Switchable`; observed `Sgrproj` live at cq-level=15 for
+        // this fixture), so hard-requiring one specific arm would be the
+        // gate-recipe-confound class (ledger).
+        let total_hits = crate::restoration::wiener_hits()
+            + crate::restoration::sgrproj_hits()
+            + crate::restoration::switchable_hits();
+        assert!(
+            total_hits > 0,
+            "{NAME}: {lr_refusals} LR refusals fired but read_lr_unit never decoded a real \
+             (non-None) filter -- gate proved nothing about the symbol path"
+        );
+        eprintln!(
+            "{NAME}: {lr_refusals} LR refusals, {} other refusals out of {n_attempts}, \
+             wiener_hits={} sgrproj_hits={} switchable_hits={}",
+            other_refusals.len(),
+            crate::restoration::wiener_hits(),
+            crate::restoration::sgrproj_hits(),
+            crate::restoration::switchable_hits()
+        );
+    }
+
+    /// r8: decode the ONE pinned stream `EC_AV1_GATE_DUMP` captured in r7
+    /// (`fixtures/lr-sgr-r7.obu`, seed 46) directly -- not the live
+    /// 40-attempt sweep, which reuses `v_start` coordinates across unrelated
+    /// seeds/frames and made r6's captured 9 bytes unprovable. Run with
+    /// `EC_LR_CALL_DUMP=1` set (see `restoration.rs`'s `apply_sgrproj_stripe`)
+    /// to get the real window on stderr, call-uniquely keyed to `xqd ==
+    /// [-16,-32]` rather than any coordinate.
+    #[test]
+    #[ignore = "reads a pinned fixture under the gitignored fixtures dir; run manually with EC_LR_CALL_DUMP=1"]
+    fn pinned_lr_sgr_stream_call_unique_dump() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/lr-sgr-r7.obu");
+        let stream = std::fs::read(path).expect("reading pinned lr-sgr-r7.obu");
+        let pics = decode_stream(&stream).expect("pinned lr-sgr-r7.obu must decode");
+        if have_ffmpeg() {
+            let reference = ffmpeg_decode_sequence(&stream, 192, 128, pics.len());
+            for (i, (got, want)) in pics.iter().zip(&reference).enumerate() {
+                let y_mismatch = got.y != want.y;
+                let u_mismatch = got.u != want.u;
+                let v_mismatch = got.v != want.v;
+                eprintln!(
+                    "frame {i}: y_mismatch={y_mismatch} u_mismatch={u_mismatch} v_mismatch={v_mismatch}"
+                );
+                if y_mismatch {
+                    let n = got.y.iter().zip(&want.y).filter(|(a, b)| a != b).count();
+                    eprintln!("  {n} luma bytes differ / {}", got.y.len());
+                }
+                if v_mismatch {
+                    let w = 96usize; // chroma plane width (192/2)
+                    for (idx, (a, b)) in got.v.iter().zip(&want.v).enumerate() {
+                        if a != b {
+                            eprintln!("  V[{},{}] got={a} want={b}", idx / w, idx % w);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// lane-realworld r2: `read_cdef` (spec 5.11.56) ported -- per-superblock
     /// `cdef_idx`, wired at all five `skip`-decode sites, `apply_cdef` looks
     /// up strength through the grid instead of a hardcoded `[0]`. Structure
@@ -5569,7 +5785,6 @@ mod tests {
             crate::decode::cdef_idx_hits()
         );
     }
-
     /// Pinned streams captured by `EC_AV1_GATE_DUMP` off
     /// `a_real_aomenc_stream_with_warped_motion_refuses_or_matches` -- each
     /// one is a former mismatch, kept as a regression pin (warp-mismatch:
@@ -6584,6 +6799,7 @@ mod tests {
                 enable_edge_filter,
                 &header.cdef,
                 &header.loop_filter,
+                &header.loop_restoration,
                 None,
                 header.tx_mode == TxMode::Select,
                 header.reduced_tx_set,
@@ -6790,6 +7006,7 @@ mod tests {
                 enable_edge_filter,
                 &header.cdef,
                 &header.loop_filter,
+                &header.loop_restoration,
                 None,
                 header.tx_mode == TxMode::Select,
                 header.reduced_tx_set,
@@ -7104,6 +7321,7 @@ mod tests {
                 enable_edge_filter,
                 &header.cdef,
                 &header.loop_filter,
+                &header.loop_restoration,
                 None,
                 header.tx_mode == TxMode::Select,
                 header.reduced_tx_set,
