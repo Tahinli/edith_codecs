@@ -5317,14 +5317,17 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                             }
                             _ => {
                                 return Err(unsupported(format!(
-                                    "a partition type this encoder never writes (value={part32})"
+                                    "a 32x32 partition type this decoder does not code (value={part32})"
                                 )));
                             }
                         }
                     }
                 }
                 _ => {
-                    return Err(unsupported("a partition type this encoder never writes"));
+                    return Err(unsupported(
+                        "a superblock-level partition type other than NONE or SPLIT (this \
+                         decoder's intra tile path codes only those two at 64x64)",
+                    ));
                 }
             }
         }
@@ -10998,7 +11001,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                     }
                     _ => {
                         return Err(unsupported(format!(
-                            "an INTER 32x32 partition type this encoder never writes (value={part32})"
+                            "an INTER 32x32 partition type this decoder does not code (value={part32})"
                         )));
                     }
                 }
