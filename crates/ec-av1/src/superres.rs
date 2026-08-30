@@ -103,7 +103,7 @@ pub(crate) fn upscale_row(row: &[u8], real_right_margin: &[u8], out_width: usize
     // mi-aligned `true_width` (the coding block straddling the frame edge)
     // -- libaom's border extension replicates from THAT last real column,
     // not from `frame_width - 1`. `real_right_margin` (from
-    // `decode::take_last_key_frame_wide_margin`) supplies those real
+    // `decode::take_last_frame_wide_margin`) supplies those real
     // pixels first; only once it runs out (or is empty, e.g. `fw` was
     // already mi-aligned) does this fall back to r1's replicate. Pinned
     // column-by-column against real libaom via `scripts/superres-pin-
@@ -178,7 +178,7 @@ pub(crate) fn superres_hits() -> usize {
 /// `frame_width`/`frame_height` (4:2:0 chroma) to `upscaled_width` at the
 /// same height -- spec 7.16 is horizontal-only. Increments
 /// [`SUPERRES_HITS`] once per call. `margin`, when set (r3, from
-/// `decode::take_last_key_frame_wide_margin`), is the real decoded pixels
+/// `decode::take_last_frame_wide_margin`), is the real decoded pixels
 /// beyond `picture`'s own width out to the mi-aligned `true_width` -- see
 /// [`upscale_row`]'s doc for why the right-edge padding needs it.
 pub(crate) fn upscale_picture(
