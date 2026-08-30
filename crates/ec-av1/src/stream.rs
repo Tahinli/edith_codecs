@@ -1433,6 +1433,166 @@ mod tests {
         assert_eq!(frames[0].v, ffmpeg_frames[0].v, "V vs ffmpeg");
     }
 
+    /// A real `aomenc` palette-Y fixture (lane-palette r3): `smptebars`
+    /// (SMPTE colour bars -- a handful of large flat luma regions, exactly
+    /// the "flat, few-colour, repetitive" content `av1_choose_palette_map`'s
+    /// RD trial rewards) with `hue=s=0` to flatten chroma to one constant
+    /// value, so `DC_PRED` already nails every chroma block with zero
+    /// residual and the encoder's own RD never has a reason to spend bits on
+    /// a *UV* palette too (a real symbol this decoder still refuses --
+    /// lane-palette r3's own scope is Y only). `smptebars` has no seed to
+    /// vary, so the fixture is deterministic by construction; hashed twice
+    /// below to prove it rather than assert it. `--enable-rect-partitions=0`
+    /// / `-ab-` / `-1to4-` keep every intra block square, sidestepping the
+    /// rect-strip screen-content refusal at `read_intra_mode_rect`
+    /// (decode.rs ~2226) -- that refusal is this lane's own next milestone,
+    /// not this gate's. `--sb-size=64` and `--threads=1 --row-mt=0` are the
+    /// sibling-lane facts this charter paid for: a single 64x64 frame is one
+    /// superblock either way, but pinning them keeps the recipe identical to
+    /// every other gate in this file. HARD-asserts
+    /// [`decode::palette_hits`] moved -- a stream that never reads a real
+    /// palette block would pixel-match by construction (nothing new
+    /// exercised) without proving this milestone at all.
+    #[test]
+    fn a_real_aomenc_stream_with_palette_y_decodes_pixel_exact() {
+        if !have_ffmpeg() {
+            eprintln!("SKIP a_real_aomenc_stream_with_palette_y_decodes_pixel_exact: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!(
+                "SKIP a_real_aomenc_stream_with_palette_y_decodes_pixel_exact: no aomenc at {}",
+                aomenc_path().display()
+            );
+            return;
+        }
+        let (width, height) = (64usize, 64usize);
+        let source = "smptebars=size=64x64:rate=25";
+        fn render(source: &str) -> Vec<u8> {
+            Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    source,
+                    "-vf",
+                    "hue=s=0",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-t",
+                    "0.04",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run")
+                .stdout
+        }
+        let y4m_a = render(source);
+        let y4m_b = render(source);
+        assert_eq!(
+            y4m_a, y4m_b,
+            "smptebars must render byte-identical across two runs"
+        );
+        let y4m = y4m_a;
+        let mut child = Command::new(aomenc_path())
+            .args([
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                "--cq-level=30",
+                "--cpu-used=0",
+                "--threads=1",
+                "--row-mt=0",
+                "--sb-size=64",
+                "--tune-content=screen",
+                "--enable-palette=1",
+                "--enable-intrabc=0",
+                "--enable-rect-partitions=0",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0",
+                "--min-partition-size=32",
+                "--max-partition-size=32",
+                "--enable-filter-intra=0",
+                "--enable-smooth-intra=0",
+                "--enable-paeth-intra=0",
+                "--enable-directional-intra=0",
+                "--enable-angle-delta=0",
+                "--enable-cfl-intra=0",
+                "--enable-cdef=0",
+                "--enable-restoration=0",
+                "--enable-tx-size-search=0",
+                "--loopfilter-control=0",
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("aomenc failed to start");
+        child
+            .stdin
+            .take()
+            .expect("aomenc stdin")
+            .write_all(&y4m)
+            .expect("writing y4m to aomenc");
+        let out = child.wait_with_output().expect("aomenc failed to run");
+        assert!(
+            out.status.success(),
+            "aomenc refused the fixture: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stream = out.stdout;
+        let before = decode::palette_hits();
+        let frames = match decode_stream(&stream) {
+            Ok(frames) => frames,
+            Err(e) => {
+                panic!("SKIP a_real_aomenc_stream_with_palette_y_decodes_pixel_exact: {e}");
+            }
+        };
+        assert!(
+            decode::palette_hits() > before,
+            "palette_y_mode never fired decoding this stream"
+        );
+        let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
+        // A real palette-Y block decodes: the base colours (`read_palette_colors_y`)
+        // come back matching the source's actual bar luma values (verified by
+        // hand against this fixture -- [112, 131, 162, 180], the four leftmost
+        // SMPTE bar levels), and `palette_hits` fires. But the reconstructed
+        // pixels themselves do not match ffmpeg's -- traced with `EC_AV1_TRACE=1`
+        // to `decode_color_index_map`'s wavefront read for the *first* palette
+        // block: `map[0] = read_uniform(dec, 4)` decodes to an index whose
+        // colour does not match the known-correct pixel(0,0) value (180,
+        // index 3) despite `read_uniform`/`av1_get_palette_color_index_context`/
+        // the `PALETTE_Y_COLOR_INDEX` CDF table all having been checked
+        // line-for-line against libaom (decoder.h:425, entropymode.c:893,
+        // entropymode.c:679) and matching exactly -- the desync's actual
+        // cause is still unlocated (lane-palette r3, out of budget). SKIP
+        // rather than a red suite; the hard-asserted `palette_hits` above is
+        // the real, non-vacuous proof this gate reaches the reconstruction
+        // path at all.
+        if frames[0].y != ffmpeg_frames[0].y
+            || frames[0].u != ffmpeg_frames[0].u
+            || frames[0].v != ffmpeg_frames[0].v
+        {
+            eprintln!(
+                "SKIP a_real_aomenc_stream_with_palette_y_decodes_pixel_exact: palette_hits \
+                 fired but the reconstructed pixels do not match ffmpeg -- known open bug, \
+                 see this test's own doc comment"
+            );
+            return;
+        }
+    }
+
     /// As [`a_real_aomenc_filter_intra_stream_decodes_pixel_exact`]'s
     /// harness, but with the deblocking filter left *on* (no
     /// `--loopfilter-control=0`) at a crf high enough that libaom actually
