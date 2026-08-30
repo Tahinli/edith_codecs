@@ -146,6 +146,21 @@ thread_local! {
 thread_local! {
     static CURRENT_Q_IDX: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
 }
+// This frame's own per-plane DC/AC quantizer-index deltas (lane-sbpart r11,
+// spec 5.9.12/7.12.2, [`crate::quant::QuantDeltas`]) -- frame-constant (not
+// per-superblock like [`CURRENT_Q_IDX`]), set once per frame decode and read
+// back at every dequantization call site keyed on which plane it is doing.
+thread_local! {
+    static QUANT_DELTAS: std::cell::Cell<crate::quant::QuantDeltas> = const {
+        std::cell::Cell::new(crate::quant::QuantDeltas {
+            y_dc: 0,
+            u_dc: 0,
+            u_ac: 0,
+            v_dc: 0,
+            v_ac: 0,
+        })
+    };
+}
 // How many real `delta_q_present` symbol groups [`maybe_read_delta_q`] has
 // read, across every call on the current thread -- the gate's proof that a
 // `delta_q_present` stream actually reached the new reader.
@@ -156,6 +171,18 @@ thread_local! {
 /// Current value of [`DELTA_Q_HITS`].
 pub(crate) fn delta_q_hits() -> usize {
     DELTA_Q_HITS.with(|c| c.get())
+}
+
+/// This frame's [`QUANT_DELTAS`] `(dc, ac)` pair for plane `plane_idx` (0 =
+/// Y, 1 = U, 2 = V) -- luma has no coded `ac` delta (spec 5.9.12 never reads
+/// one), so it is always `0` here.
+fn plane_q_delta(plane_idx: usize) -> (i32, i32) {
+    let d = QUANT_DELTAS.with(|c| c.get());
+    match plane_idx {
+        0 => (d.y_dc, 0),
+        1 => (d.u_dc, d.u_ac),
+        _ => (d.v_dc, d.v_ac),
+    }
 }
 
 /// `read_delta_qindex`/`read_delta_q_params` (spec 5.11.10, libaom
@@ -3212,6 +3239,8 @@ fn decode_block_rect(
             bh,
             8,
             CURRENT_Q_IDX.with(|c| c.get()),
+            plane_q_delta(0).0,
+            plane_q_delta(0).1,
             luma_tx_type,
         );
         y.reconstruct_rect(
@@ -3251,6 +3280,8 @@ fn decode_block_rect(
             chroma_h,
             8,
             CURRENT_Q_IDX.with(|c| c.get()),
+            plane_q_delta(1).0,
+            plane_q_delta(1).1,
             u_tx_type,
         );
         u.reconstruct_rect(
@@ -3289,6 +3320,8 @@ fn decode_block_rect(
             chroma_h,
             8,
             CURRENT_Q_IDX.with(|c| c.get()),
+            plane_q_delta(2).0,
+            plane_q_delta(2).1,
             v_tx_type,
         );
         v.reconstruct_rect(
@@ -3500,6 +3533,8 @@ fn decode_block_rect64(
             bh,
             8,
             i32::from(base_q_idx),
+            plane_q_delta(0).0,
+            plane_q_delta(0).1,
             luma_tx_type,
         );
         y.reconstruct_rect(
@@ -3515,6 +3550,20 @@ fn decode_block_rect64(
             filter_intra,
             smooth_neighbor,
         );
+        if std::env::var_os("EC_SBPART_DUMP64").is_some() {
+            let leftcol: Vec<u16> = if px > 0 {
+                (py..py + bh).map(|row| y.data[row * y.width + px - 1]).collect()
+            } else {
+                vec![]
+            };
+            eprintln!(
+                "DUMP64 mi_r={mi_r} mi_c={mi_c} px={px} py={py} bw={bw} bh={bh} mode={mode} \
+                 skip={skip} eob_nonzero={} row0={:?} leftcol={:?}",
+                luma_corner.iter().any(|&v| v != 0),
+                &y.data[py * y.width + px..][..bw],
+                leftcol,
+            );
+        }
         // CHROMA: a real, untruncated chroma_w x chroma_h transform -- no
         // corner crop needed (see doc comment).
         let ac = alpha.map(|_| cfl_ac_q3_rect(y, px, py, bw, bh));
@@ -3545,6 +3594,8 @@ fn decode_block_rect64(
             chroma_h,
             8,
             i32::from(base_q_idx),
+            plane_q_delta(1).0,
+            plane_q_delta(1).1,
             u_tx_type,
         );
         u.reconstruct_rect(
@@ -3586,6 +3637,8 @@ fn decode_block_rect64(
             chroma_h,
             8,
             i32::from(base_q_idx),
+            plane_q_delta(2).0,
+            plane_q_delta(2).1,
             v_tx_type,
         );
         v.reconstruct_rect(
@@ -4305,7 +4358,8 @@ fn read_plane(
         }
         full
     };
-    let residual = dequant_and_inverse_typed(&levels, side, 8, CURRENT_Q_IDX.with(|c| c.get()), tx_type);
+    let (dc_delta, ac_delta) = plane_q_delta(plane_idx);
+    let residual = dequant_and_inverse_typed(&levels, side, 8, CURRENT_Q_IDX.with(|c| c.get()), dc_delta, ac_delta, tx_type);
     if std::env::var_os("EC_AV1_TRACE").is_some() {
         eprintln!(
             "TRACE dequant plane={plane_idx} base_q_idx={base_q_idx} tx_type={tx_type:?} side={side} levels={levels:?} residual={residual:?}",
@@ -6082,6 +6136,7 @@ pub fn decode_key_frame_tile(
         mi_cols,
         mi_rows,
         base_q_idx,
+        crate::quant::QuantDeltas::default(),
         frame_width,
         frame_height,
         enable_filter_intra,
@@ -6130,6 +6185,10 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     mi_cols: u32,
     mi_rows: u32,
     base_q_idx: u8,
+    // lane-sbpart r11: this frame header's own per-plane DC/AC quantizer
+    // deltas (spec 5.9.12), threaded to [`QUANT_DELTAS`] at the top of every
+    // tile alongside [`CURRENT_Q_IDX`].
+    deltas: crate::quant::QuantDeltas,
     frame_width: u32,
     frame_height: u32,
     enable_filter_intra: bool,
@@ -6248,6 +6307,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         // spec `decode_tile`: `CurrentQIndex` resets to the frame's own
         // `base_q_idx` at the top of every tile, not once per frame.
         CURRENT_Q_IDX.with(|c| c.set(i32::from(base_q_idx)));
+        QUANT_DELTAS.with(|c| c.set(deltas));
         CURRENT_DELTA_LF.with(|c| c.set([0; 4]));
         if std::env::var_os("EC_AV1_TRACE").is_some() {
             eprintln!(
@@ -7178,7 +7238,8 @@ fn read_inter_plane(
         default_tx_type,
         None,
     )?;
-    let residual = dequant_and_inverse_typed(&grid, side, 8, CURRENT_Q_IDX.with(|c| c.get()), tx_type);
+    let (dc_delta, ac_delta) = plane_q_delta(plane_idx);
+    let residual = dequant_and_inverse_typed(&grid, side, 8, CURRENT_Q_IDX.with(|c| c.get()), dc_delta, ac_delta, tx_type);
     plane.reconstruct_mc(x, y, side, prediction, &residual);
     Ok((grid, tx_type))
 }
@@ -11003,6 +11064,7 @@ pub fn decode_inter_frame_tile(
         mi_cols,
         mi_rows,
         base_q_idx,
+        crate::quant::QuantDeltas::default(),
         frame_width,
         frame_height,
         reference,
@@ -11047,6 +11109,8 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     mi_cols: u32,
     mi_rows: u32,
     base_q_idx: u8,
+    // lane-sbpart r11: see [`decode_key_frame_tile_with_cdfs`]'s own `deltas`.
+    deltas: crate::quant::QuantDeltas,
     frame_width: u32,
     frame_height: u32,
     reference: &Picture,
@@ -11300,6 +11364,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         );
         let mut cdfs = base_cdfs.clone();
         CURRENT_Q_IDX.with(|c| c.set(i32::from(base_q_idx)));
+        QUANT_DELTAS.with(|c| c.set(deltas));
         CURRENT_DELTA_LF.with(|c| c.set([0; 4]));
         let mut dec = SymbolDecoder::new(data);
         // lane-comppin r9: tile-entry range, the earliest point comparable

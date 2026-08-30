@@ -1426,6 +1426,12 @@ fn read_quantization_params(
         };
     }
     h.quantization = q;
+    if std::env::var_os("EC_AV1_TRACE").is_some() {
+        eprintln!(
+            "TRACE quant_deltas base_q_idx={} y_dc={} u_dc={} u_ac={} v_dc={} v_ac={}",
+            q.base_q_idx, q.delta_q_y_dc, q.delta_q_u_dc, q.delta_q_u_ac, q.delta_q_v_dc, q.delta_q_v_ac
+        );
+    }
     Ok(())
 }
 
