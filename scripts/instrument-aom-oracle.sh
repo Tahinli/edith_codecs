@@ -263,3 +263,85 @@ s = s.replace(old, new, 1)
 open(path, "w").write(s)
 print("intra mode-info instrumented")
 PYI
+
+# --- rung 6: palette colour-index map range ladder (detokenize.c) -------
+# EC_TRACE_PALETTE=1 -> "EC_PAL row=.. col=.. ctx=.. n=.. rng=.." before every
+# colour-index symbol in decode_color_map_tokens's wavefront, "EC_PAL_VAL
+# row=.. col=.. color_idx=.. rng=.." after. lane-palette r4: r3 already
+# cleared every table/context function against this same source line-for-line
+# by hand; this rung is what lets a real per-symbol range compare (class
+# compare-range-not-tell / equal-range-means-unread) replace that by-hand
+# check instead of re-reading the tables again.
+I="$SRC/av1/decoder/detokenize.c"
+[ -f "$I" ] || { echo "no oracle source at $I" >&2; exit 1; }
+
+python3 - "$I" <<'PYP'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+if "EC_INSTRUMENTED_PALETTE" in s:
+    print("palette map already instrumented (no-op)")
+    sys.exit(0)
+
+old = """      const int color_ctx = av1_get_palette_color_index_context(
+          color_map, plane_block_width, (i - j), j, n, color_order, NULL);
+      const int color_idx = aom_read_symbol(
+          r, color_map_cdf[n - PALETTE_MIN_SIZE][color_ctx], n, ACCT_STR);
+      assert(color_idx >= 0 && color_idx < n);
+      color_map[(i - j) * plane_block_width + j] = color_order[color_idx];"""
+new = """/* EC_INSTRUMENTED_PALETTE */
+      const int color_ctx = av1_get_palette_color_index_context(
+          color_map, plane_block_width, (i - j), j, n, color_order, NULL);
+      const int ec_pal_trace = getenv("EC_TRACE_PALETTE") != NULL;
+      if (ec_pal_trace) {
+        fprintf(stderr, "EC_PAL row=%d col=%d ctx=%d n=%d rng=%u\\n", (i - j),
+                j, color_ctx, n, (unsigned)r->ec.rng);
+      }
+      const int color_idx = aom_read_symbol(
+          r, color_map_cdf[n - PALETTE_MIN_SIZE][color_ctx], n, ACCT_STR);
+      assert(color_idx >= 0 && color_idx < n);
+      color_map[(i - j) * plane_block_width + j] = color_order[color_idx];
+      if (ec_pal_trace) {
+        fprintf(stderr, "EC_PAL_VAL row=%d col=%d color_idx=%d rng=%u\\n",
+                (i - j), j, color_idx, (unsigned)r->ec.rng);
+      }"""
+assert old in s, "decode_color_map_tokens loop body moved"
+s = s.replace(old, new, 1)
+s = s.replace(
+    "static void decode_color_map_tokens(Av1ColorMapParam *param, aom_reader *r) {",
+    "/* EC_INSTRUMENTED_PALETTE */\nstatic void decode_color_map_tokens(Av1ColorMapParam *param, aom_reader *r) {",
+    1,
+)
+open(path, "w").write(s)
+print("palette map instrumented")
+PYP
+
+# --- rung 6b: palette map[0] (av1_read_uniform) range ladder ------------
+python3 - "$I" <<'PYP0'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+if "EC_INSTRUMENTED_PALETTE_UNIFORM" in s:
+    print("palette map[0] already instrumented (no-op)")
+    sys.exit(0)
+
+old = """  // The first color index.
+  color_map[0] = av1_read_uniform(r, n);
+  assert(color_map[0] < n);"""
+new = """  // The first color index.
+  /* EC_INSTRUMENTED_PALETTE_UNIFORM */
+  if (getenv("EC_TRACE_PALETTE") != NULL) {
+    fprintf(stderr, "EC_PAL row=0 col=0 ctx=-1 n=%d rng=%u\\n", n,
+            (unsigned)r->ec.rng);
+  }
+  color_map[0] = av1_read_uniform(r, n);
+  assert(color_map[0] < n);
+  if (getenv("EC_TRACE_PALETTE") != NULL) {
+    fprintf(stderr, "EC_PAL_VAL row=0 col=0 color_idx=%d rng=%u\\n",
+            color_map[0], (unsigned)r->ec.rng);
+  }"""
+assert old in s, "color_map[0] uniform read moved"
+s = s.replace(old, new, 1)
+open(path, "w").write(s)
+print("palette map[0] instrumented")
+PYP0

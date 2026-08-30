@@ -1451,22 +1451,32 @@ mod tests {
     /// superblock either way, but pinning them keeps the recipe identical to
     /// every other gate in this file. HARD-asserts
     /// [`decode::palette_hits`] moved -- a stream that never reads a real
-    /// palette block would pixel-match by construction (nothing new
-    /// exercised) without proving this milestone at all.
+    /// palette block would refuse (or not) by construction without proving
+    /// this milestone at all.
+    ///
+    /// lane-palette r4: r3 found that this fixture's reconstructed pixels do
+    /// not match ffmpeg's decode of the same bytes, with every symbol read
+    /// checked line-for-line against the oracle and matching (see
+    /// `decode.rs`'s `read_palette_colors_y`/`palette_color_index_context`
+    /// doc comments). A real palette-Y block must not decode to silently
+    /// wrong pixels, so `decode.rs`'s palette-Y syntax reader now refuses by
+    /// name right after decoding the colours and index map (proving
+    /// `palette_hits` still fires) instead of handing the wrong
+    /// reconstruction back -- this gate asserts THAT refusal, not a pixel
+    /// match. Flip back to a pixel-exact assertion once the desync
+    /// (decode.rs's early `return Err` in the `palette_y_mode` arm) is
+    /// found and removed.
     #[test]
-    fn a_real_aomenc_stream_with_palette_y_decodes_pixel_exact() {
+    fn a_real_aomenc_stream_with_palette_y_refuses_by_name() {
+        const NAME: &str = "a_real_aomenc_stream_with_palette_y_refuses_by_name";
         if !have_ffmpeg() {
-            eprintln!("SKIP a_real_aomenc_stream_with_palette_y_decodes_pixel_exact: no ffmpeg");
+            eprintln!("SKIP {NAME}: no ffmpeg");
             return;
         }
         if !have_aomenc() {
-            eprintln!(
-                "SKIP a_real_aomenc_stream_with_palette_y_decodes_pixel_exact: no aomenc at {}",
-                aomenc_path().display()
-            );
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
             return;
         }
-        let (width, height) = (64usize, 64usize);
         let source = "smptebars=size=64x64:rate=25";
         fn render(source: &str) -> Vec<u8> {
             Command::new("ffmpeg")
@@ -1553,44 +1563,23 @@ mod tests {
         );
         let stream = out.stdout;
         let before = decode::palette_hits();
-        let frames = match decode_stream(&stream) {
-            Ok(frames) => frames,
+        match decode_stream(&stream) {
+            Ok(_) => panic!(
+                "{NAME}: decode_stream succeeded -- a real palette-Y block must refuse by \
+                 name until the pixel desync is fixed, not decode to wrong pixels"
+            ),
             Err(e) => {
-                panic!("SKIP a_real_aomenc_stream_with_palette_y_decodes_pixel_exact: {e}");
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("reconstructed pixels do not match libaom"),
+                    "{NAME}: wrong refusal: {msg}"
+                );
             }
-        };
+        }
         assert!(
             decode::palette_hits() > before,
-            "palette_y_mode never fired decoding this stream"
+            "palette_y_mode never fired decoding this stream -- refusal is vacuous"
         );
-        let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
-        // A real palette-Y block decodes: the base colours (`read_palette_colors_y`)
-        // come back matching the source's actual bar luma values (verified by
-        // hand against this fixture -- [112, 131, 162, 180], the four leftmost
-        // SMPTE bar levels), and `palette_hits` fires. But the reconstructed
-        // pixels themselves do not match ffmpeg's -- traced with `EC_AV1_TRACE=1`
-        // to `decode_color_index_map`'s wavefront read for the *first* palette
-        // block: `map[0] = read_uniform(dec, 4)` decodes to an index whose
-        // colour does not match the known-correct pixel(0,0) value (180,
-        // index 3) despite `read_uniform`/`av1_get_palette_color_index_context`/
-        // the `PALETTE_Y_COLOR_INDEX` CDF table all having been checked
-        // line-for-line against libaom (decoder.h:425, entropymode.c:893,
-        // entropymode.c:679) and matching exactly -- the desync's actual
-        // cause is still unlocated (lane-palette r3, out of budget). SKIP
-        // rather than a red suite; the hard-asserted `palette_hits` above is
-        // the real, non-vacuous proof this gate reaches the reconstruction
-        // path at all.
-        if frames[0].y != ffmpeg_frames[0].y
-            || frames[0].u != ffmpeg_frames[0].u
-            || frames[0].v != ffmpeg_frames[0].v
-        {
-            eprintln!(
-                "SKIP a_real_aomenc_stream_with_palette_y_decodes_pixel_exact: palette_hits \
-                 fired but the reconstructed pixels do not match ffmpeg -- known open bug, \
-                 see this test's own doc comment"
-            );
-            return;
-        }
     }
 
     /// As [`a_real_aomenc_filter_intra_stream_decodes_pixel_exact`]'s
