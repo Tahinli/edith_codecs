@@ -29,7 +29,6 @@ const CAPABILITY_CLAIMS: &[&str] = &[
     "a nonzero angle delta (this encoder never writes one)",
     "a partition below 16x16 other than a clean split (this encoder never writes one)",
     "a partition below 8x8 (this encoder never writes one)",
-    "a partition type this encoder never writes",
     "a tx_type symbol on a rectangular transform (never expected at this size)",
 ];
 
@@ -38,7 +37,12 @@ const REFUSALS: &[&str] = &[
     "GLOBALMV (round 3)",
     "a 16x16 block whose true edge cuts through both axes needs a rectangular transform this decoder does not code yet",
     "a 16x16 inter block whose true edge cuts through both axes needs a rectangular transform this decoder does not code yet",
+    "a 32x32 partition type this decoder does not code (value={part32})",
     "a Golomb tail longer than this decoder reads",
+    "a stream whose bit depth is not 8 (this decoder reconstructs into 8-bit planes)",
+    "a tx_type symbol outside its CDF's own set: {t}",
+    "an INTER 32x32 partition type this decoder does not code (value={part32})",
+    "a superblock-level partition type other than NONE or SPLIT (this decoder's intra tile path codes only those two at 64x64)",
     "a HORZ/VERT intra strip in a screen-content frame (palette syntax is consumed for square blocks only)",
     "a HORZ/VERT intra strip with a split transform (per-unit rect prediction is not ported)",
     "a block that actually uses a palette (UV) -- reconstruction is out of scope",
@@ -67,9 +71,27 @@ const REFUSALS: &[&str] = &[
     "filter intra on a HORZ/VERT strip (this decoder predicts square-only)",
 ];
 
+/// Gates whose `Err` arm turns a decode failure into a printed SKIP rather than
+/// a test failure.
+///
+/// A gate named `..._decodes_pixel_exact` that cannot decode has failed, and
+/// swallowing the error keeps the suite green while the gate proves nothing --
+/// the same vacuum as a gate whose feature never fires, arrived at from the
+/// other side. These four predate the attempt-loop pattern the newer gates use
+/// (encode several fixtures, require at least one to decode, hard-assert the
+/// firing count). They are pinned here so the set cannot grow while they are
+/// converted one at a time.
+#[cfg(test)]
+const GATES_THAT_SKIP_ON_A_DECODE_ERROR: &[&str] = &[
+    "a_real_aomenc_filter_intra_stream_decodes_pixel_exact",
+    "a_real_aomenc_inter_sequence_with_deblocking_decodes_pixel_exact",
+    "a_real_aomenc_intra_stream_with_deblocking_decodes_pixel_exact",
+    "a_real_libaom_gradients_stream_with_cdef_decodes_pixel_exact",
+];
+
 #[cfg(test)]
 mod tests {
-    use super::{CAPABILITY_CLAIMS, REFUSALS};
+    use super::{CAPABILITY_CLAIMS, GATES_THAT_SKIP_ON_A_DECODE_ERROR, REFUSALS};
     use std::collections::BTreeSet;
 
     /// Every distinct `unsupported(...)` reason on the decode path.
@@ -86,6 +108,10 @@ mod tests {
             for (start, _) in src.match_indices("unsupported(") {
                 // `Error::unsupported(` and the bare helper both end here.
                 let mut i = start + "unsupported(".len();
+                // `unsupported(format!("..."))` is the same refusal, one layer in.
+                if src[i..].starts_with("format!(") {
+                    i += "format!(".len();
+                }
                 let mut last: Option<String> = None;
                 loop {
                     while i < bytes.len() && (bytes[i] as char).is_whitespace() {
@@ -183,5 +209,42 @@ mod tests {
                  does not decode."
             );
         }
+    }
+
+    /// No NEW gate may quietly turn a decode error into a skip.
+    #[test]
+    fn gates_that_swallow_a_decode_error_are_declared() {
+        let src = include_str!("stream.rs");
+        let mut found: BTreeSet<String> = BTreeSet::new();
+        for (i, _) in src.match_indices("\"SKIP ") {
+            let rest = &src[i + "\"SKIP ".len()..];
+            let Some(colon) = rest.find(':') else { continue };
+            let name = &rest[..colon];
+            if !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') {
+                continue;
+            }
+            // The tail of the message says what was skipped. Only "{e}" -- the
+            // decode error itself -- is the shape this test is about; "no
+            // ffmpeg"/"no aomenc" are tool absence, governed by
+            // EC_AV1_REQUIRE_AOMENC instead.
+            let Some(end) = rest.find("\"") else { continue };
+            if rest[colon..end].contains("{e}") {
+                found.insert(name.to_owned());
+            }
+        }
+        let listed: BTreeSet<&str> = GATES_THAT_SKIP_ON_A_DECODE_ERROR.iter().copied().collect();
+        let added: Vec<&String> = found.iter().filter(|n| !listed.contains(n.as_str())).collect();
+        assert!(
+            added.is_empty(),
+            "these gates turn a decode error into a printed SKIP and are not declared: \
+             {added:#?}\nA gate that cannot decode has failed -- assert on the error, or use \
+             the attempt-loop pattern (several fixtures, at least one must decode, firing count \
+             hard-asserted)."
+        );
+        let stale: Vec<&&str> = listed.iter().filter(|n| !found.contains(**n)).collect();
+        assert!(
+            stale.is_empty(),
+            "{stale:#?} no longer swallow a decode error -- delete them from the list."
+        );
     }
 }
