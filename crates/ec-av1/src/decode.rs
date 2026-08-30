@@ -1900,11 +1900,23 @@ fn read_intra_mode_rect(
         0
     };
     let mut filter_intra = None;
+    if std::env::var_os("EC_AV1_TRACE").is_some() {
+        let (rng, _) = dec.debug_state();
+        eprintln!(
+            "TRACE_RECT_PREFI mode={mode} uv_mode={uv_mode} enable_filter_intra={} \
+             class={:?} rng={rng}",
+            enable_filter_intra as i32,
+            filter_intra_size_class_rect(bw, bh)
+        );
+    }
     if mode == DC_PRED
         && enable_filter_intra
         && let Some(class) = filter_intra_size_class_rect(bw, bh)
     {
         let use_filter_intra = dec.symbol(&mut cdfs.filter_intra[class]) != 0;
+        if std::env::var_os("EC_AV1_TRACE").is_some() {
+            eprintln!("TRACE_RECT_USEFI value={}", use_filter_intra as i32);
+        }
         if use_filter_intra {
             FILTER_INTRA_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let fi_mode = dec.symbol(&mut cdfs.filter_intra_mode);
@@ -2035,6 +2047,14 @@ fn decode_block_rect(
     let (cpx, cpy) = (px / 2, py / 2);
     let (chroma_w, chroma_h) = (bw / 2, bh / 2);
     let reach = Reach::of_rect(bw, bh, px, py, y.width, y.height);
+    if std::env::var_os("EC_AV1_TRACE").is_some() {
+        let (rng, _) = dec.debug_state();
+        eprintln!(
+            "TRACE_RECT_IMODE mi_row={mi_r} mi_col={mi_c} mode={mode} uv_mode={uv_mode} \
+             skip={} tx={depth} rng={rng}",
+            skip as i32
+        );
+    }
     if skip {
         y.reconstruct_rect(
             px,
@@ -2109,11 +2129,27 @@ fn decode_block_rect(
         // lanes/rectwire-r3.report.md for what was ruled out (base_ctx_rect's
         // 5-neighbour offsets, u/v_skip_ctx's above+left formula, and
         // dc_sign_ctx's around-index all cross-checked byte-for-byte against
-        // libaom and match). Refusing by name again (r1 behavior) rather than
-        // risk landing the desync.
+        // libaom and match). lane-rectwire r4: range-ladder against the
+        // now-instrumented oracle (EC_TRACE_MODE's intra EC_IMODE/EC_IMODE_VAL)
+        // narrowed the divergence past skip/y_mode/uv_mode (values AND range
+        // both confirmed in sync -- rng=58692 on both sides right after
+        // uv_mode, with `enable_filter_intra=0` on this frame so neither side
+        // reads a filter_intra symbol) to the `tx_size_cat2` depth read
+        // immediately after: ours moves rng 58692 -> 43570, which cannot be
+        // reconciled with oracle's own EC_IMODE_VAL (rng=58692, taken *after*
+        // its own tx_size read) unless oracle's tx symbol is a near-certainty
+        // CDF that barely narrows the range -- i.e. this decoder's
+        // `tx_size_context_rect` ctx or `cdfs.tx_size_cat2` CDF selection for
+        // a 32x16/16x32 strip is the first diverging symbol, not the
+        // coefficient-context math r3 already cleared. Not confirmed byte-
+        // exact (would need a decodemv.c EC_TRACE_MODE patch specifically on
+        // `read_tx_size`'s own rng, not attempted this round -- budget), so
+        // still refusing by name rather than risk landing a partial fix on a
+        // named-but-unconfirmed suspect.
         return Err(unsupported(
             "a HORZ/VERT intra strip with real (non-skip) coefficients \
-             (lane-rectwire r3: confirmed desync, not yet isolated)",
+             (lane-rectwire r4: divergence narrowed to the tx_size_cat2 depth \
+             read, not yet byte-confirmed)",
         ));
         #[allow(unreachable_code)]
         {
@@ -2129,6 +2165,10 @@ fn decode_block_rect(
             dc_sign_ctx(around[0].2),
             TxType::DctDct,
         )?;
+        if std::env::var_os("EC_AV1_TRACE").is_some() {
+            let (rng, _) = dec.debug_state();
+            eprintln!("TRACE_RECT_COEFF plane=0 mi_row={mi_r} mi_col={mi_c} rng={rng}");
+        }
         let luma_residual = dequant_and_inverse_typed_wh(
             &luma_levels,
             bw,
@@ -2163,6 +2203,10 @@ fn decode_block_rect(
             dc_sign_ctx(around[1].2),
             u_default_tx,
         )?;
+        if std::env::var_os("EC_AV1_TRACE").is_some() {
+            let (rng, _) = dec.debug_state();
+            eprintln!("TRACE_RECT_COEFF plane=1 mi_row={mi_r} mi_col={mi_c} rng={rng}");
+        }
         let u_residual = dequant_and_inverse_typed_wh(
             &u_levels,
             chroma_w,
@@ -2196,6 +2240,10 @@ fn decode_block_rect(
             dc_sign_ctx(around[2].2),
             v_default_tx,
         )?;
+        if std::env::var_os("EC_AV1_TRACE").is_some() {
+            let (rng, _) = dec.debug_state();
+            eprintln!("TRACE_RECT_COEFF plane=2 mi_row={mi_r} mi_col={mi_c} rng={rng}");
+        }
         let v_residual = dequant_and_inverse_typed_wh(
             &v_levels,
             chroma_w,
@@ -4489,8 +4537,9 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                         let part32 = if has_cols32 && has_rows32 {
                             let p = dec.symbol(&mut cdfs.partition_w32[ctx32]);
                             if std::env::var_os("EC_AV1_TRACE").is_some() {
+                                let (rng, _) = dec.debug_state();
                                 eprintln!(
-                                    "TRACE partition_w32 mi=({},{}) ctx={ctx32} value={p}",
+                                    "TRACE partition_w32 mi=({},{}) ctx={ctx32} value={p} rng={rng}",
                                     r32 * BLOCK_MI,
                                     c32 * BLOCK_MI
                                 );
