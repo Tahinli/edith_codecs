@@ -3723,15 +3723,34 @@ fn read_intra_mode(
     Option<PaletteUv>,
 )> {
     let trace = std::env::var_os("EC_AV1_TRACE").is_some();
+    // lane-tiny r2: EC_ISTEP-format trace (same "name=... val=... rng=..."
+    // shape the oracle's own `ec_read_intra_frame_mode_info_impl` prints
+    // under `EC_TRACE_MODE_STEP`) so a range ladder can be diffed line for
+    // line against the instrumented aomdec, not just `tell()`.
+    let ec_istep = std::env::var_os("EC_TRACE_MODE_STEP").is_some();
+    macro_rules! istep {
+        ($name:literal, $val:expr) => {
+            if ec_istep {
+                let (rng, _) = dec.debug_state();
+                eprintln!(
+                    "EC_ISTEP mi_row={mi_r} mi_col={mi_c} name={} val={} rng={rng}",
+                    $name, $val
+                );
+            }
+        };
+    }
     let skip = dec.symbol(&mut cdfs.skip[skip_ctx]) != 0;
     if trace {
         eprintln!("TRACE skip value={}", skip as i32);
     }
+    istep!("skip", skip as i32);
     // spec order (see the comment below on `read_intrabc_info`): `skip`,
     // `segment_id`, `cdef`, `delta_q` -- `cdef` lands right here.
     maybe_read_cdef_idx(dec, mi_r, mi_c, skip);
+    istep!("cdef", 0);
     maybe_read_delta_q(dec, cdfs, mi_r, mi_c, side == 64, skip);
     maybe_read_delta_lf(dec, cdfs, mi_r, mi_c, side == 64, skip);
+    istep!("dq", 0);
     // `read_intrabc_info` (spec 5.11.13, libaom decodemv.c:693, called at
     // :811 right after `skip_txfm`/`segment_id`/`cdef`/`delta_q` and before
     // `mbmi->mode` is ever read): a `use_intrabc` symbol only present on an
@@ -3758,6 +3777,7 @@ fn read_intra_mode(
     if trace {
         eprintln!("TRACE y_mode ctx=({above_ctx},{left_ctx}) value={mode}");
     }
+    istep!("mode", mode as i32);
     let angle_delta_y = if (V_PRED..=D67_PRED).contains(&mode) {
         let delta = read_angle_delta(dec, &mut cdfs.angle_delta[mode - V_PRED]);
         if trace {
@@ -3770,6 +3790,7 @@ fn read_intra_mode(
     } else {
         0
     };
+    istep!("angle_y", angle_delta_y);
     let uv_mode = if cfl {
         dec.symbol(&mut cdfs.uv_mode_cfl[mode])
     } else {
@@ -3778,6 +3799,7 @@ fn read_intra_mode(
     if trace {
         eprintln!("TRACE uv_mode cfl={cfl} y_mode={mode} value={uv_mode}");
     }
+    istep!("uv_mode", uv_mode as i32);
     let alpha = if cfl && uv_mode == UV_CFL_PRED {
         Some(read_cfl_alphas(dec, cdfs))
     } else {
@@ -3804,6 +3826,7 @@ fn read_intra_mode(
     } else {
         0
     };
+    istep!("angle_uv", angle_delta_uv);
     // `read_palette_mode_info` (spec 5.11.13, libaom decodemv.c:567, called
     // at :840 right after `xd->cfl.store_y` and before `read_filter_intra_mode_info`):
     // gated by `av1_allow_palette` (blockd.h -- size bound only,
@@ -3897,12 +3920,14 @@ fn read_intra_mode(
                 use_filter_intra as i32
             );
         }
+        istep!("use_filter_intra", use_filter_intra as i32);
         if use_filter_intra {
             FILTER_INTRA_HITS.with(|c| c.set(c.get() + 1));
             let fi_mode = dec.symbol(&mut cdfs.filter_intra_mode);
             if trace {
                 eprintln!("TRACE filter_intra_mode value={fi_mode}");
             }
+            istep!("filter_intra_mode", fi_mode as i32);
             filter_intra = Some(fi_mode);
         }
     }
@@ -5414,6 +5439,13 @@ fn read_tx_size(
         }
         _ => unreachable!("decode_block/decode_leaf8 only call this at 8/16/32/64"),
     };
+    if std::env::var_os("EC_TRACE_MODE_STEP").is_some() {
+        let (rng, _) = dec.debug_state();
+        let (mi_r, mi_c) = at_mi;
+        eprintln!(
+            "EC_ISTEP mi_row={mi_r} mi_col={mi_c} name=tx_depth val={depth} ctx={ctx} rng={rng}"
+        );
+    }
     if depth != 0 {
         TX_DEPTH_HITS.with(|c| c.set(c.get() + 1));
     }
