@@ -29,7 +29,6 @@ const CAPABILITY_CLAIMS: &[&str] = &[
     "a nonzero angle delta (this encoder never writes one)",
     "a partition below 16x16 other than a clean split (this encoder never writes one)",
     "a partition below 8x8 (this encoder never writes one)",
-    "a partition type this encoder never writes",
     "a tx_type symbol on a rectangular transform (never expected at this size)",
 ];
 
@@ -38,7 +37,11 @@ const REFUSALS: &[&str] = &[
     "GLOBALMV (round 3)",
     "a 16x16 block whose true edge cuts through both axes needs a rectangular transform this decoder does not code yet",
     "a 16x16 inter block whose true edge cuts through both axes needs a rectangular transform this decoder does not code yet",
+    "a 32x32 partition type this decoder does not code (value={part32})",
     "a Golomb tail longer than this decoder reads",
+    "a tx_type symbol outside its CDF's own set: {t}",
+    "an INTER 32x32 partition type this decoder does not code (value={part32})",
+    "a superblock-level partition type other than NONE or SPLIT (this decoder's intra tile path codes only those two at 64x64)",
     "a HORZ/VERT intra strip in a screen-content frame (palette syntax is consumed for square blocks only)",
     "a HORZ/VERT intra strip with a split transform (per-unit rect prediction is not ported)",
     "a block that actually uses a palette (UV) -- reconstruction is out of scope",
@@ -107,6 +110,10 @@ mod tests {
             for (start, _) in src.match_indices("unsupported(") {
                 // `Error::unsupported(` and the bare helper both end here.
                 let mut i = start + "unsupported(".len();
+                // `unsupported(format!("..."))` is the same refusal, one layer in.
+                if src[i..].starts_with("format!(") {
+                    i += "format!(".len();
+                }
                 let mut last: Option<String> = None;
                 loop {
                     while i < bytes.len() && (bytes[i] as char).is_whitespace() {
