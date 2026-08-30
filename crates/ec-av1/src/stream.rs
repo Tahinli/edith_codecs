@@ -418,6 +418,15 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         // inter frames are decoded on a thread that previously decoded a
         // different sequence would inherit that sequence's bit.
         crate::decode::set_enable_edge_filter(enable_edge_filter);
+        // lane-hbd r5: `BIT_DEPTH` (decode.rs) drives `crate::decode::sample_max`,
+        // which every dequant/inverse-transform clamp reads -- set per frame,
+        // not once per process, for the same cross-sequence-on-one-thread
+        // reason as `set_enable_edge_filter` above. Defaults to 8 when no
+        // sequence header has been seen yet, matching every existing fixture.
+        let bit_depth = parser
+            .sequence_header()
+            .map_or(8, |seq| seq.color_config.bit_depth);
+        crate::decode::set_bit_depth(bit_depth);
         // lane-av1comp: `comp_group_idx`/`compound_idx`'s own gating bits.
         let enable_masked_compound = parser
             .sequence_header()
