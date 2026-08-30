@@ -2216,6 +2216,159 @@ mod tests {
         );
     }
 
+    /// The BROAD case (lane-palette2 r6, per its charter): a HORZ/VERT intra
+    /// strip in a screen-content-tools frame that does NOT necessarily use a
+    /// palette. This is what the refusal r4 removed actually guarded --
+    /// [`a_real_aomenc_stream_with_rect_palette_decodes_pixel_exact`] above
+    /// gates the rarer "and picks a palette" case, which r5 measured RD
+    /// almost never chooses -- 39/70 of that same sweep DID land here (a
+    /// clean rect-strip decode with `palette_rect_hits` unchanged), just
+    /// uncounted by r5's narrower assertion. Same `--min/max-partition-size=64`
+    /// recipe r5 measured live to dodge the 32x32-level AB-partition quirk
+    /// ([[lane-sbpart-r2]]), single key frame, size/cq sweep. HARD-asserts
+    /// [`decode::rect_screen_content_hits`] moved -- proof this stream
+    /// actually ran [`read_intra_mode_rect`]'s screen-content-tools branch --
+    /// before comparing pixels.
+    #[test]
+    fn a_real_aomenc_stream_with_rect_screen_content_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_stream_with_rect_screen_content_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let mut matched = 0u32;
+        let mut named_refusals = 0u32;
+        let mut attempts = 0u32;
+        let sizes = [(64, 128), (128, 64), (128, 128), (128, 192), (192, 192)];
+        let cqs = [5u32, 15, 25, 35, 45, 55, 63];
+        for src_name in ["smptebars", "rgbtestsrc"] {
+            for (width, height) in sizes {
+                for cq in cqs {
+                    attempts += 1;
+                    let source = format!("{src_name}=size={width}x{height}:rate=25");
+                    let y4m = Command::new("ffmpeg")
+                        .args([
+                            "-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", "yuv420p",
+                            "-t", "0.04", "-f", "yuv4mpegpipe", "-",
+                        ])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .output()
+                        .expect("ffmpeg failed to run");
+                    assert!(
+                        y4m.status.success(),
+                        "ffmpeg fixture: {}",
+                        String::from_utf8_lossy(&y4m.stderr)
+                    );
+                    let cq_arg = format!("--cq-level={cq}");
+                    let mut child = Command::new(aomenc_path())
+                        .args([
+                            "--codec=av1",
+                            "--passes=1",
+                            "--end-usage=q",
+                            &cq_arg,
+                            "--cpu-used=4",
+                            "--threads=1",
+                            "--row-mt=0",
+                            "--sb-size=64",
+                            "--enable-palette=1",
+                            "--min-partition-size=64",
+                            "--max-partition-size=64",
+                            "--obu",
+                            "-o",
+                            "-",
+                            "-",
+                        ])
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .spawn()
+                        .expect("aomenc failed to start");
+                    child
+                        .stdin
+                        .take()
+                        .expect("aomenc stdin")
+                        .write_all(&y4m.stdout)
+                        .expect("writing y4m to aomenc");
+                    let out = child.wait_with_output().expect("aomenc failed to run");
+                    assert!(
+                        out.status.success(),
+                        "aomenc refused the fixture ({source} cq={cq}): {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                    let stream = out.stdout;
+                    let before = crate::decode::rect_screen_content_hits();
+                    let frames = match decode_stream(&stream) {
+                        Err(e) => {
+                            let msg = e.to_string();
+                            assert!(
+                                msg.contains("unsupported"),
+                                "{NAME} failed outright, not a named refusal \
+                                 ({source} cq={cq}): {msg}"
+                            );
+                            named_refusals += 1;
+                            eprintln!("{source} cq={cq}: refusal: {msg}");
+                            continue;
+                        }
+                        Ok(frames) => frames,
+                    };
+                    let after = crate::decode::rect_screen_content_hits();
+                    if after == before {
+                        eprintln!(
+                            "{NAME}: {source} cq={cq} decoded without ever running the rect \
+                             screen-content path (rect_screen_content_hits unchanged) -- not \
+                             counted"
+                        );
+                        continue;
+                    }
+                    let frame_count = frames.len();
+                    let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
+                    if frames.iter().zip(&ffmpeg_frames).any(|(got, want)| {
+                        got.y != want.y || got.u != want.u || got.v != want.v
+                    }) && let Ok(path) = std::env::var("EC_AV1_GATE_DUMP")
+                    {
+                        std::fs::write(&path, &stream).expect("writing pinned stream");
+                        eprintln!(
+                            "EC_AV1_GATE_DUMP: wrote mismatching stream ({source} cq={cq}) to {path}"
+                        );
+                    }
+                    for i in 0..frame_count {
+                        assert_eq!(
+                            frames[i].y, ffmpeg_frames[i].y,
+                            "{NAME}: {source} cq={cq} frame {i} luma vs ffmpeg"
+                        );
+                        assert_eq!(
+                            frames[i].u, ffmpeg_frames[i].u,
+                            "{NAME}: {source} cq={cq} frame {i} U vs ffmpeg"
+                        );
+                        assert_eq!(
+                            frames[i].v, ffmpeg_frames[i].v,
+                            "{NAME}: {source} cq={cq} frame {i} V vs ffmpeg"
+                        );
+                    }
+                    matched += 1;
+                }
+            }
+        }
+        assert!(
+            matched > 0,
+            "{NAME}: no attempt out of {attempts} ever landed a matching rect \
+             screen-content block ({named_refusals} named refusals) -- \
+             rect_screen_content_hits never proven pixel-exact"
+        );
+        eprintln!(
+            "{NAME}: {matched}/{attempts} attempts matched pixel-exact, {named_refusals} \
+             named refusals, rect_screen_content_hits={}",
+            crate::decode::rect_screen_content_hits()
+        );
+    }
+
     /// As [`a_real_aomenc_filter_intra_stream_decodes_pixel_exact`]'s
     /// harness, but with the deblocking filter left *on* (no
     /// `--loopfilter-control=0`) at a crf high enough that libaom actually
