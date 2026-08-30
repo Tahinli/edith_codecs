@@ -724,6 +724,21 @@ pub(crate) fn sb_rect_hits() -> usize {
     SB_RECT_HITS.with(|c| c.get())
 }
 
+// lane-rect64q r1: how many of [`decode_block_rect64`]'s three per-plane
+// dequant calls actually observed `CURRENT_Q_IDX != base_q_idx` -- proof the
+// running-vs-stale-snapshot bug this round fixed is exercised by a gate, not
+// just inert-compiled. Zero forever on a passing gate means that gate's
+// stream never carries `delta_q_present=1` through a rect64 block.
+thread_local! {
+    static RECT64_QIDX_DRIFT_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`RECT64_QIDX_DRIFT_HITS`].
+pub(crate) fn rect64_qidx_drift_hits() -> usize {
+    RECT64_QIDX_DRIFT_HITS.with(|c| c.get())
+}
+
 // lane-partab r1: how many 32x32 quadrants decoded an AB partition
 // (PARTITION_HORZ_A / VERT_A / VERT_B -- two 16x16 squares plus one
 // 16x32/32x16 strip). Like [`RECT_PARTITION_HITS`], this is the
@@ -3532,12 +3547,23 @@ fn decode_block_rect64(
         for row in 0..32 {
             luma_levels[row * bw..][..32].copy_from_slice(&luma_corner[row * 32..][..32]);
         }
+        {
+            let cur = CURRENT_Q_IDX.with(|c| c.get());
+            if cur != i32::from(base_q_idx) {
+                RECT64_QIDX_DRIFT_HITS.with(|c| c.set(c.get() + 1));
+            }
+            if std::env::var_os("EC_AV1_TRACE").is_some() {
+                eprintln!(
+                    "TRACE rect64_dequant plane=0 base_q_idx={base_q_idx} current_q_idx={cur}"
+                );
+            }
+        }
         let luma_residual = dequant_and_inverse_typed_wh(
             &luma_levels,
             bw,
             bh,
             crate::decode::bit_depth(),
-            i32::from(base_q_idx),
+            CURRENT_Q_IDX.with(|c| c.get()),
             plane_q_delta(0).0,
             plane_q_delta(0).1,
             luma_tx_type,
@@ -3593,12 +3619,23 @@ fn decode_block_rect64(
             let (rng, _) = dec.debug_state();
             eprintln!("EC_COEFF_VAL plane=1 row={mi_r} col={mi_c} rng={rng}");
         }
+        {
+            let cur = CURRENT_Q_IDX.with(|c| c.get());
+            if cur != i32::from(base_q_idx) {
+                RECT64_QIDX_DRIFT_HITS.with(|c| c.set(c.get() + 1));
+            }
+            if std::env::var_os("EC_AV1_TRACE").is_some() {
+                eprintln!(
+                    "TRACE rect64_dequant plane=1 base_q_idx={base_q_idx} current_q_idx={cur}"
+                );
+            }
+        }
         let u_residual = dequant_and_inverse_typed_wh(
             &u_levels,
             chroma_w,
             chroma_h,
             crate::decode::bit_depth(),
-            i32::from(base_q_idx),
+            CURRENT_Q_IDX.with(|c| c.get()),
             plane_q_delta(1).0,
             plane_q_delta(1).1,
             u_tx_type,
@@ -3636,12 +3673,23 @@ fn decode_block_rect64(
             let (rng, _) = dec.debug_state();
             eprintln!("EC_COEFF_VAL plane=2 row={mi_r} col={mi_c} rng={rng}");
         }
+        {
+            let cur = CURRENT_Q_IDX.with(|c| c.get());
+            if cur != i32::from(base_q_idx) {
+                RECT64_QIDX_DRIFT_HITS.with(|c| c.set(c.get() + 1));
+            }
+            if std::env::var_os("EC_AV1_TRACE").is_some() {
+                eprintln!(
+                    "TRACE rect64_dequant plane=2 base_q_idx={base_q_idx} current_q_idx={cur}"
+                );
+            }
+        }
         let v_residual = dequant_and_inverse_typed_wh(
             &v_levels,
             chroma_w,
             chroma_h,
             crate::decode::bit_depth(),
-            i32::from(base_q_idx),
+            CURRENT_Q_IDX.with(|c| c.get()),
             plane_q_delta(2).0,
             plane_q_delta(2).1,
             v_tx_type,
