@@ -197,6 +197,33 @@ pub(crate) fn comp_mode_hits() -> usize {
     COMP_MODE_HITS.with(|c| c.get())
 }
 
+// How many blocks [`read_intra_mode`] decoded a real (nonzero-size) palette-Y
+// use for, across every call on the current thread -- the same before/after
+// counter pattern as [`FILTER_INTRA_HITS`], proving a stream actually
+// exercised palette reconstruction rather than only reading and refusing the
+// `palette_y_mode` symbol.
+thread_local! {
+    static PALETTE_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`PALETTE_HITS`].
+pub(crate) fn palette_hits() -> usize {
+    PALETTE_HITS.with(|c| c.get())
+}
+
+thread_local! {
+    /// A just-decoded palette-Y block's own predicted pixels
+    /// (`side*side`, row-major, `colors[map[i]]`), consumed by
+    /// [`PlaneBuf::reconstruct`]'s next call in place of `predict()` -- the
+    /// same off-the-call-stack idiom as [`ENABLE_EDGE_FILTER`] (threading a
+    /// per-block override through `read_plane`'s two dozen call sites is the
+    /// alternative this avoids). Always empty again once that call consumes
+    /// it (`.take()`), so a non-palette block's own `reconstruct` call never
+    /// sees stale state.
+    static PALETTE_PRED: std::cell::RefCell<Option<Vec<u8>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 // How many blocks decoded `skip_mode == 1` (lane-av1comp round 14) --
 // proves a real `skip_mode_present` stream actually reached a block that
 // picked it, not just that the frame header bit was set.
@@ -1329,6 +1356,14 @@ struct Neighbours {
     /// widened from a bare `is_inter` bool, which collapsed every non-`LAST`
     /// reference onto `LAST_FRAME`'s own delta).
     ref_grid: Vec<i8>,
+    /// The block above/left's own palette-Y size (0 = not a palette block)
+    /// and its base colours -- `av1_get_palette_mode_ctx`/
+    /// `av1_get_palette_cache` (pred_common.c)'s neighbour lookup, lane-palette
+    /// r2. UV has no equivalent yet (stage 2, unreconstructed).
+    above_palette_size: Vec<usize>,
+    left_palette_size: Vec<usize>,
+    above_palette_colors: Vec<[u16; 8]>,
+    left_palette_colors: Vec<[u16; 8]>,
 }
 
 impl Neighbours {
@@ -1367,7 +1402,79 @@ impl Neighbours {
             tx_grid: vec![0u8; cols * (SUB / MI) * rows * (SUB / MI)],
             tx_h_grid: vec![0u8; cols * (SUB / MI) * rows * (SUB / MI)],
             ref_grid: vec![0i8; cols * (SUB / MI) * rows * (SUB / MI)],
+            above_palette_size: vec![0; cols],
+            left_palette_size: vec![0; rows],
+            above_palette_colors: vec![[0u16; 8]; cols],
+            left_palette_colors: vec![[0u16; 8]; rows],
         }
+    }
+
+    /// Writes a just-decoded block's own palette-Y size/colours (`size == 0`
+    /// for a non-palette block, clearing any stale neighbour state) into every
+    /// [`SUB`]-grid cell it covers on both the above and left edges --
+    /// mirrors [`Self::record_rect`]'s loop shape, square-only (this lane's
+    /// call sites are all square blocks).
+    fn record_palette_y(&mut self, at: (usize, usize), side: usize, size: usize, colors: [u16; 8]) {
+        let (r, c) = at;
+        for cell in 0..side / SUB {
+            self.above_palette_size[c + cell] = size;
+            self.above_palette_colors[c + cell] = colors;
+        }
+        for cell in 0..side / SUB {
+            self.left_palette_size[r + cell] = size;
+            self.left_palette_colors[r + cell] = colors;
+        }
+    }
+
+    /// `av1_get_palette_mode_ctx` (pred_common.h:197): count of the above/left
+    /// neighbours that are themselves a palette-Y block, plus
+    /// `av1_get_palette_cache`'s own merged, ascending, deduplicated colour
+    /// cache (pred_common.c:73) -- the above neighbour is excluded at a
+    /// superblock's own top row (`r % 4 == 0` in [`SUB`]-grid units, 4 cells
+    /// per 64px SB, `MIN_SB_SIZE_LOG2`), the left neighbour never is.
+    fn palette_ctx_and_cache(&self, at: (usize, usize)) -> (usize, Vec<u16>) {
+        let (r, c) = at;
+        let above_ok = r % 4 != 0;
+        let (above_n, above_colors) = if above_ok && self.above_palette_size[c] > 0 {
+            (self.above_palette_size[c], self.above_palette_colors[c])
+        } else {
+            (0, [0u16; 8])
+        };
+        let (left_n, left_colors) = if self.left_palette_size[r] > 0 {
+            (self.left_palette_size[r], self.left_palette_colors[r])
+        } else {
+            (0, [0u16; 8])
+        };
+        let ctx = usize::from(above_n > 0) + usize::from(left_n > 0);
+        let mut cache = Vec::with_capacity(16);
+        let push_dedup = |cache: &mut Vec<u16>, v: u16| {
+            if cache.last() != Some(&v) {
+                cache.push(v);
+            }
+        };
+        let (mut ai, mut li) = (0usize, 0usize);
+        while ai < above_n && li < left_n {
+            let (va, vl) = (above_colors[ai], left_colors[li]);
+            if vl < va {
+                push_dedup(&mut cache, vl);
+                li += 1;
+            } else {
+                push_dedup(&mut cache, va);
+                ai += 1;
+                if vl == va {
+                    li += 1;
+                }
+            }
+        }
+        while ai < above_n {
+            push_dedup(&mut cache, above_colors[ai]);
+            ai += 1;
+        }
+        while li < left_n {
+            push_dedup(&mut cache, left_colors[li]);
+            li += 1;
+        }
+        (ctx, cache)
     }
 
     /// Marks every 4x4 mi cell a just-decoded coded block covers with its own
@@ -1910,6 +2017,185 @@ fn palette_bsize_ctx(side: usize) -> Option<usize> {
     }
 }
 
+/// A just-decoded palette-Y block's own size, base colours (only the first
+/// `size` entries are real), and per-pixel colour-index map (`side*side`,
+/// row-major, each entry `< size`).
+struct PaletteY {
+    size: usize,
+    colors: [u16; 8],
+    map: Vec<u8>,
+}
+
+/// `aom_ceil_log2` (aom_dsp/bitwriter_buffer.h-adjacent helper, used both by
+/// `read_palette_colors_y`'s shrinking `bits` and `av1_read_uniform`'s
+/// `get_unsigned_bits`, which is the same formula): smallest `n` with
+/// `2^n >= x`, `0` for `x <= 1`.
+fn ceil_log2(x: u32) -> u32 {
+    if x < 2 { 0 } else { 32 - (x - 1).leading_zeros() }
+}
+
+/// `av1_read_uniform` (decoder.h:425): a uniform `0..n` value coded as
+/// `l-1` raw bits plus a conditional extra bit, `l = get_unsigned_bits(n)`.
+fn read_uniform(dec: &mut SymbolDecoder, n: usize) -> usize {
+    let l = ceil_log2(n as u32);
+    let m = (1usize << l) - n;
+    let v = dec.literal(l - 1) as usize;
+    if v < m {
+        v
+    } else {
+        (v << 1) - m + dec.literal(1) as usize
+    }
+}
+
+/// `merge_colors` (decodemv.c:462): interleaves the ascending `cached`
+/// colours (already-known, from the above/left neighbours) with the
+/// ascending `transmitted` ones (delta-coded off the wire) back into one
+/// ascending list of `cached.len() + transmitted.len()` colours -- a tied
+/// value picks the cached copy first, matching the C `<=`.
+fn merge_colors(transmitted: &[u16], cached: &[u16]) -> Vec<u16> {
+    let mut out = Vec::with_capacity(transmitted.len() + cached.len());
+    let (mut ci, mut ti) = (0, 0);
+    while ci < cached.len() && ti < transmitted.len() {
+        if cached[ci] <= transmitted[ti] {
+            out.push(cached[ci]);
+            ci += 1;
+        } else {
+            out.push(transmitted[ti]);
+            ti += 1;
+        }
+    }
+    out.extend_from_slice(&cached[ci..]);
+    out.extend_from_slice(&transmitted[ti..]);
+    out
+}
+
+/// `read_palette_colors_y` (decodemv.c:478), bit_depth fixed at 8 (this
+/// decoder is 8-bit only): accepts up to `n` colours straight from `cache`
+/// (one flag bit each, in cache order), then delta-codes the remainder
+/// (first value raw, each following delta `>= 1` off a shrinking bit width),
+/// and merges the two ascending lists back together.
+fn read_palette_colors_y(dec: &mut SymbolDecoder, n: usize, cache: &[u16]) -> [u16; 8] {
+    let mut cached = Vec::with_capacity(n);
+    for &c in cache {
+        if cached.len() >= n {
+            break;
+        }
+        if dec.literal(1) == 1 {
+            cached.push(c);
+        }
+    }
+    let mut colors = [0u16; 8];
+    let n_cached = cached.len();
+    if n_cached < n {
+        let mut transmitted = Vec::with_capacity(n - n_cached);
+        let first = dec.literal(8) as u16;
+        transmitted.push(first);
+        if n_cached + 1 < n {
+            let min_bits = 8u32 - 3;
+            let mut bits = min_bits + dec.literal(2);
+            let mut range = 255i32 - i32::from(first) - 1;
+            for _ in (n_cached + 1)..n {
+                let delta = dec.literal(bits) as i32 + 1;
+                let prev = *transmitted.last().unwrap();
+                let val = (i32::from(prev) + delta).clamp(0, 255) as u16;
+                range -= i32::from(val) - i32::from(prev);
+                bits = bits.min(ceil_log2(range.max(0) as u32));
+                transmitted.push(val);
+            }
+        }
+        let merged = merge_colors(&transmitted, &cached);
+        colors[..n].copy_from_slice(&merged);
+    } else {
+        colors[..n].copy_from_slice(&cached[..n]);
+    }
+    colors
+}
+
+/// `av1_palette_color_index_context_lookup` (entropymode.c:889): maps a
+/// `NUM_PALETTE_NEIGHBORS`-weighted score hash (`0..=8`) to the real
+/// `0..=4` context, `-1` for hashes no real neighbour configuration produces.
+const PALETTE_COLOR_INDEX_CONTEXT_LOOKUP: [i32; 9] = [-1, -1, 0, -1, -1, 4, 3, 2, 1];
+
+/// `av1_get_palette_color_index_context` (entropymode.c:893): the colour-index
+/// map's own per-pixel context and colour-order permutation, from the
+/// left/up-left/up already-decoded neighbours (weights `[2, 1, 2]`, top-3
+/// selection sort). `map`'s stride is `side` (this decoder never crops a
+/// palette block's map to a narrower plane edge, [`decode_color_index_map`]'s
+/// own doc). Returns `(ctx, color_order)`; `color_order[symbol]` is the
+/// actual colour index to store.
+fn palette_color_index_context(
+    map: &[u8],
+    side: usize,
+    row: usize,
+    col: usize,
+    n: usize,
+) -> (usize, [u8; 8]) {
+    let left = if col >= 1 { Some(map[row * side + col - 1]) } else { None };
+    let up_left = if col >= 1 && row >= 1 {
+        Some(map[(row - 1) * side + col - 1])
+    } else {
+        None
+    };
+    let up = if row >= 1 { Some(map[(row - 1) * side + col]) } else { None };
+    let mut scores = [0i32; 8];
+    for (neighbour, weight) in [(left, 2), (up_left, 1), (up, 2)] {
+        if let Some(v) = neighbour {
+            scores[v as usize] += weight;
+        }
+    }
+    let mut color_order = [0u8; 8];
+    for i in 0..8 {
+        color_order[i] = i as u8;
+    }
+    for i in 0..3 {
+        let mut max = scores[i];
+        let mut max_idx = i;
+        for j in (i + 1)..n {
+            if scores[j] > max {
+                max = scores[j];
+                max_idx = j;
+            }
+        }
+        if max_idx != i {
+            let max_score = scores[max_idx];
+            let max_color = color_order[max_idx];
+            for k in (i + 1..=max_idx).rev() {
+                scores[k] = scores[k - 1];
+                color_order[k] = color_order[k - 1];
+            }
+            scores[i] = max_score;
+            color_order[i] = max_color;
+        }
+    }
+    let hash = scores[0] + scores[1] * 2 + scores[2] * 2;
+    let ctx = PALETTE_COLOR_INDEX_CONTEXT_LOOKUP[hash as usize];
+    (ctx as usize, color_order)
+}
+
+/// `decode_color_map_tokens` (detokenize.c:25): the palette-Y colour-index
+/// map's wavefront decode over a `side x side` grid -- this decoder's
+/// palette blocks are always square and never straddle the frame's true
+/// (possibly odd) edge without already allocating the full `side*side`
+/// region (every other skip/residual path here does the same), so no
+/// rows/cols-vs-plane_width/height cropping special case is needed, unlike
+/// libaom's own non-block-aligned split.
+fn decode_color_index_map(dec: &mut SymbolDecoder, cdfs: &mut Cdfs, n: usize, side: usize) -> Vec<u8> {
+    let mut map = vec![0u8; side * side];
+    map[0] = read_uniform(dec, n) as u8;
+    for i in 1..(2 * side - 1) {
+        let j_hi = i.min(side - 1);
+        let j_lo = i.saturating_sub(side - 1);
+        for j in (j_lo..=j_hi).rev() {
+            let row = i - j;
+            let col = j;
+            let (ctx, color_order) = palette_color_index_context(&map, side, row, col, n);
+            let symbol = dec.symbol(&mut cdfs.palette_y_color_index[n - 2][ctx][..=n]);
+            map[row * side + col] = color_order[symbol];
+        }
+    }
+    map
+}
+
 /// [`read_intra_mode`] for a true `bw`x`bh` rect strip (lane-intradisp r1):
 /// identical except the `use_filter_intra` size class comes from
 /// [`filter_intra_size_class_rect`] instead of the square-only
@@ -2382,6 +2668,14 @@ fn read_intra_mode(
     skip_ctx: usize,
     allow_screen_content_tools: bool,
     allow_intrabc: bool,
+    // `Some((palette_mode_ctx, color_cache))` at the call sites this lane's
+    // scope actually reconstructs a palette-Y block for (`av1_get_palette_mode_ctx`
+    // and `av1_get_palette_cache`'s neighbour lookup, [`Neighbours::palette_ctx_and_cache`]);
+    // `None` at the excluded call sites (the 8x8-leaf path), which still read
+    // the `palette_y_mode` symbol at ctx 0 -- matching the bits a real
+    // decoder reads either way -- but refuse by name the moment it fires,
+    // exactly the old behaviour.
+    palette: Option<(usize, &[u16])>,
 ) -> Result<(
     bool,
     usize,
@@ -2390,6 +2684,7 @@ fn read_intra_mode(
     i32,
     Option<(i32, i32)>,
     Option<usize>,
+    Option<PaletteY>,
 )> {
     let trace = std::env::var_os("EC_AV1_TRACE").is_some();
     let skip = dec.symbol(&mut cdfs.skip[skip_ctx]) != 0;
@@ -2471,24 +2766,36 @@ fn read_intra_mode(
     // `read_palette_mode_info` (spec 5.11.13, libaom decodemv.c:567, called
     // at :840 right after `xd->cfl.store_y` and before `read_filter_intra_mode_info`):
     // gated by `av1_allow_palette` (blockd.h -- size bound only,
-    // [`palette_bsize_ctx`]). `palette_mode_ctx`/`palette_uv_mode_ctx`
-    // (`av1_get_palette_mode_ctx`, pred_common.h) read the neighbours' own
-    // `palette_size[0] > 0` -- always 0 here since a nonzero size refuses
-    // the whole decode below, so no successfully-completed decode ever has
-    // such a neighbour (corner-cut: hardcoded ctx 0 instead of tracking it,
-    // ceiling = real palette reconstruction, out of this lane's scope).
-    // A nonzero `palette_size` needs the color-cache/delta-coded-colors
-    // syntax this decoder does not reconstruct -- refuse by name rather
-    // than silently drop pixels.
+    // [`palette_bsize_ctx`]). `palette_mode_ctx` comes from the caller
+    // (`palette` param, `None` refuses unconditionally at ctx 0 -- the old
+    // behaviour, bit-identical since a hardcoded ctx-0 read and a real one
+    // read the same CDF row whenever every neighbour really is non-palette).
+    // `palette_uv_mode_ctx` is this block's own just-decided Y palette use,
+    // per `read_palette_mode_info`'s own `pmi->palette_size[0] > 0` (not a
+    // neighbour lookup at all), so it is exact even at the excluded call
+    // sites once Y decodes real syntax there too.
+    let mut palette_y = None;
     if allow_screen_content_tools
         && let Some(bsize_ctx) = palette_bsize_ctx(side)
     {
-        if mode == DC_PRED && dec.symbol(&mut cdfs.palette_y_mode[bsize_ctx][0]) != 0 {
-            return Err(unsupported(
-                "a block that actually uses a palette (Y) -- reconstruction is out of scope",
-            ));
+        let (mode_ctx, cache) = palette.unwrap_or((0, &[]));
+        if mode == DC_PRED && dec.symbol(&mut cdfs.palette_y_mode[bsize_ctx][mode_ctx]) != 0 {
+            if palette.is_none() {
+                return Err(unsupported(
+                    "a block that actually uses a palette (Y) -- reconstruction is out of scope",
+                ));
+            }
+            let n = 2 + dec.symbol(&mut cdfs.palette_y_size[bsize_ctx]);
+            let colors = read_palette_colors_y(dec, n, cache);
+            let map = decode_color_index_map(dec, cdfs, n, side);
+            PALETTE_HITS.with(|c| c.set(c.get() + 1));
+            if trace {
+                eprintln!("TRACE palette_y size={n} colors={:?}", &colors[..n]);
+            }
+            palette_y = Some(PaletteY { size: n, colors, map });
         }
-        if uv_mode == DC_PRED && dec.symbol(&mut cdfs.palette_uv_mode[0]) != 0 {
+        let palette_uv_mode_ctx = usize::from(palette_y.is_some());
+        if uv_mode == DC_PRED && dec.symbol(&mut cdfs.palette_uv_mode[palette_uv_mode_ctx]) != 0 {
             return Err(unsupported(
                 "a block that actually uses a palette (UV) -- reconstruction is out of scope",
             ));
@@ -2530,6 +2837,7 @@ fn read_intra_mode(
         angle_delta_uv,
         alpha,
         filter_intra,
+        palette_y,
     ))
 }
 
@@ -2771,45 +3079,53 @@ impl PlaneBuf {
         cfl: Option<(i32, &[i32])>,
         filter_intra: Option<usize>,
     ) {
-        let (above, left, corner) = self.edges(x, y, side, reach);
-        let mut prediction = vec![0u8; side * side];
-        if let Some(fi_mode) = filter_intra {
-            crate::intra::predict_filter_intra(
-                fi_mode,
-                above.as_deref(),
-                left.as_deref(),
-                corner,
-                side,
-                &mut prediction,
-            );
+        // A palette block's own [`PALETTE_PRED`] override (lane-palette r2)
+        // takes priority over `predict()`/`predict_filter_intra` entirely --
+        // palette prediction needs no edge pixels at all.
+        let prediction = if let Some(buf) = PALETTE_PRED.with(|c| c.borrow_mut().take()) {
+            buf
         } else {
-            // `enable_intra_edge_filter` is the sequence header's own flag
-            // (`ENABLE_EDGE_FILTER`, set once per `decode_key_frame_tile_with_cdfs`
-            // call, never per-block) -- threading it through every
-            // `read_plane`/`decode_block`/`decode_leaf8` call would touch two
-            // dozen sites for a value that never changes mid-decode, so it
-            // rides a thread-local instead (this decoder is single-threaded
-            // per stream). `smooth_neighbor` (spec `get_intra_edge_filter_type`)
-            // is left `false`: exact for chroma here (a smooth `uv_mode` is
-            // refused before decode reaches this call) and a corner-cut for
-            // luma -- ceiling is one wrong filter-strength bucket on a block
-            // whose real neighbour predicted smooth; upgrade path is
-            // threading `Neighbours::above_mode`/`left_mode`'s
-            // `SMOOTH_PRED..=SMOOTH_H_PRED` membership down instead of `false`.
-            let enable_edge_filter = ENABLE_EDGE_FILTER.with(std::cell::Cell::get);
-            predict(
-                mode as u8,
-                angle_delta,
-                above.as_deref(),
-                left.as_deref(),
-                corner,
-                side,
-                side,
-                enable_edge_filter,
-                false,
-                &mut prediction,
-            );
-        }
+            let (above, left, corner) = self.edges(x, y, side, reach);
+            let mut prediction = vec![0u8; side * side];
+            if let Some(fi_mode) = filter_intra {
+                crate::intra::predict_filter_intra(
+                    fi_mode,
+                    above.as_deref(),
+                    left.as_deref(),
+                    corner,
+                    side,
+                    &mut prediction,
+                );
+            } else {
+                // `enable_intra_edge_filter` is the sequence header's own flag
+                // (`ENABLE_EDGE_FILTER`, set once per `decode_key_frame_tile_with_cdfs`
+                // call, never per-block) -- threading it through every
+                // `read_plane`/`decode_block`/`decode_leaf8` call would touch two
+                // dozen sites for a value that never changes mid-decode, so it
+                // rides a thread-local instead (this decoder is single-threaded
+                // per stream). `smooth_neighbor` (spec `get_intra_edge_filter_type`)
+                // is left `false`: exact for chroma here (a smooth `uv_mode` is
+                // refused before decode reaches this call) and a corner-cut for
+                // luma -- ceiling is one wrong filter-strength bucket on a block
+                // whose real neighbour predicted smooth; upgrade path is
+                // threading `Neighbours::above_mode`/`left_mode`'s
+                // `SMOOTH_PRED..=SMOOTH_H_PRED` membership down instead of `false`.
+                let enable_edge_filter = ENABLE_EDGE_FILTER.with(std::cell::Cell::get);
+                predict(
+                    mode as u8,
+                    angle_delta,
+                    above.as_deref(),
+                    left.as_deref(),
+                    corner,
+                    side,
+                    side,
+                    enable_edge_filter,
+                    false,
+                    &mut prediction,
+                );
+            }
+            prediction
+        };
         for row in 0..side {
             for col in 0..side {
                 let idx = row * side + col;
@@ -2969,7 +3285,8 @@ fn decode_block(
 ) -> Result<()> {
     let (r, c) = at;
     let (px, py) = (c * SUB, r * SUB);
-    let (skip, mode, angle_delta_y, uv_mode, angle_delta_uv, alpha, filter_intra) =
+    let (palette_ctx, palette_cache) = neighbours.palette_ctx_and_cache(at);
+    let (skip, mode, angle_delta_y, uv_mode, angle_delta_uv, alpha, filter_intra, palette_y) =
         read_intra_mode(
             dec,
             cdfs,
@@ -2981,6 +3298,7 @@ fn decode_block(
             neighbours.skip_txfm_ctx(r * (SUB / MI), c * (SUB / MI)),
             allow_screen_content_tools,
             allow_intrabc,
+            Some((palette_ctx, &palette_cache)),
         )?;
     // `predict` panics outside `DC_PRED..=PAETH_PRED` (0..=12); `UV_CFL_PRED`
     // (13) predicts as `DC_PRED` with the [`cfl_scaled`] nudge carrying the
@@ -3018,6 +3336,23 @@ fn decode_block(
     let reach = Reach::of(side, px, py, y.width, y.height);
     let (cpx, cpy) = (px / 2, py / 2);
     let chroma_side = side / 2;
+    // A palette-Y block's own prediction is the reconstructed colour-index
+    // map, not `predict()`'s edge-based one -- [`PALETTE_PRED`] carries it
+    // to [`PlaneBuf::reconstruct`]'s next call rather than threading a
+    // parameter through this function's dozen `y.reconstruct`/`read_plane`
+    // sites. A split luma transform (`tx_select && logical_tx != side`)
+    // would need the map sliced per-TU -- untested against a real
+    // `--enable-palette=1` stream this round, so refuse by name rather than
+    // guess at the slicing (charter's own named-acceptable fallback).
+    if let Some(ref py) = palette_y {
+        if tx_select && logical_tx != side {
+            return Err(unsupported(
+                "a palette block with a split luma transform (round 1)",
+            ));
+        }
+        let buf: Vec<u8> = py.map.iter().map(|&idx| py.colors[idx as usize] as u8).collect();
+        PALETTE_PRED.with(|c| *c.borrow_mut() = Some(buf));
+    }
     if skip {
         // A skipped block codes no residual syntax at all (spec 5.11.34):
         // straight prediction, on every plane.
@@ -3236,6 +3571,15 @@ fn decode_block(
         )?;
         neighbours.record_split_luma(at, side, mode, [&u_grid, &v_grid]);
     }
+    // Unconditional, `size == 0` for a non-palette block: clears any stale
+    // neighbour palette state the same way [`Neighbours::record`] always
+    // overwrites `above_mode`/`left_mode` regardless of this block's own mode
+    // (the split-luma-TU branch above always refuses before reaching here
+    // when `palette_y` is `Some`, so it is never live for that branch).
+    let (py_size, py_colors) = palette_y
+        .as_ref()
+        .map_or((0, [0u16; 8]), |p| (p.size, p.colors));
+    neighbours.record_palette_y(at, side, py_size, py_colors);
     neighbours.fill_skip_grid((r * (SUB / MI), c * (SUB / MI)), side / MI, skip);
     neighbours.fill_lf_grid(
         (r * (SUB / MI), c * (SUB / MI)),
@@ -3287,7 +3631,7 @@ fn decode_leaf8(
     // An 8x8 leaf is well within `is_cfl_allowed`'s <=32x32 bound (spec
     // 5.11.5), so it reads the CFL-allowed `uv_mode_cfl` CDF, like every other
     // `decode_block` caller at 16x16 and up.
-    let (skip, mode, angle_delta_y, uv_mode, angle_delta_uv, alpha, filter_intra) =
+    let (skip, mode, angle_delta_y, uv_mode, angle_delta_uv, alpha, filter_intra, _palette_y) =
         read_intra_mode(
             dec,
             cdfs,
@@ -3299,6 +3643,7 @@ fn decode_leaf8(
             neighbours.skip_txfm_ctx(leaf_mi.0, leaf_mi.1),
             allow_screen_content_tools,
             allow_intrabc,
+            None,
         )?;
     let uv_predict_mode = if uv_mode == UV_CFL_PRED {
         DC_PRED
