@@ -76,6 +76,27 @@ pub(crate) fn filter_intra_hits() -> usize {
 thread_local! {
     static CDEF_BITS: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
 }
+// lane-realworld r8: the sequence header's `color_config.bit_depth`, set
+// once per `decode_key_frame_tile_with_cdfs`/`decode_inter_frame_tile_with_cdfs`
+// call the same way `CDEF_BITS` is above. `stream.rs`'s own refusal still
+// blocks every non-8-bit stream from reaching a decode call, so this is `8`
+// on every path that runs today -- threading it now (rather than the literal
+// `8`) is stage 1 of widening past that refusal without re-deriving every
+// clamp bound later. `PlaneBuf`'s sample storage stays `u16` regardless of
+// depth (this decoder's own internal choice, matches dav1d/libaom).
+thread_local! {
+    static BIT_DEPTH: std::cell::Cell<u8> = const { std::cell::Cell::new(8) };
+}
+/// `(1 << bit_depth) - 1` — the reconstruction clamp bound for the current
+/// stream's [`BIT_DEPTH`], replacing the crate-wide literal `255`.
+pub(crate) fn sample_max() -> i32 {
+    (1i32 << BIT_DEPTH.with(std::cell::Cell::get)) - 1
+}
+/// Sets [`BIT_DEPTH`] for the current thread, called once per frame from
+/// [`crate::stream`]'s decode loop.
+pub(crate) fn set_bit_depth(bit_depth: u8) {
+    BIT_DEPTH.with(|c| c.set(bit_depth));
+}
 // Whether this superblock's single CDEF unit (this decoder has no 128x128
 // SB, so the SB IS the CDEF unit) has already had its `cdef_idx` literal
 // read -- reset to `false` at the top of each superblock in the two tile
@@ -451,6 +472,42 @@ pub(crate) fn palette_hits() -> usize {
     PALETTE_HITS.with(|c| c.get())
 }
 
+// lane-palette2 r1: as [`PALETTE_HITS`], for a real (nonzero-size) chroma
+// palette use -- proves a stream actually reconstructed UV palette pixels,
+// not just read and refused the `palette_uv_mode` symbol.
+thread_local! {
+    static PALETTE_UV_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`PALETTE_UV_HITS`].
+pub(crate) fn palette_uv_hits() -> usize {
+    PALETTE_UV_HITS.with(|c| c.get())
+}
+
+// lane-palette2 r1: how many HORZ/VERT rect intra strips ([`read_intra_mode_rect`])
+// decoded a real palette-Y use -- proves the rect strip's own palette syntax
+// (not just the square path's) actually fired.
+thread_local! {
+    static PALETTE_RECT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`PALETTE_RECT_HITS`].
+pub(crate) fn palette_rect_hits() -> usize {
+    PALETTE_RECT_HITS.with(|c| c.get())
+}
+
+// lane-palette2 r1: how many palette-Y blocks decoded with a split luma
+// transform (`tx_select && logical_tx != side`) -- proves the per-TU index-map
+// slicing actually ran, not just that the whole-block path stayed exact.
+thread_local! {
+    static PALETTE_SPLIT_TX_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`PALETTE_SPLIT_TX_HITS`].
+pub(crate) fn palette_split_tx_hits() -> usize {
+    PALETTE_SPLIT_TX_HITS.with(|c| c.get())
+}
+
 thread_local! {
     /// A just-decoded palette-Y block's own predicted pixels
     /// (`side*side`, row-major, `colors[map[i]]`), consumed by
@@ -460,7 +517,7 @@ thread_local! {
     /// alternative this avoids). Always empty again once that call consumes
     /// it (`.take()`), so a non-palette block's own `reconstruct` call never
     /// sees stale state.
-    static PALETTE_PRED: std::cell::RefCell<Option<Vec<u8>>> =
+    static PALETTE_PRED: std::cell::RefCell<Option<Vec<u16>>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -619,6 +676,20 @@ thread_local! {
 /// Current value of [`RECT_COEFF_HITS`].
 pub(crate) fn rect_coeff_hits() -> usize {
     RECT_COEFF_HITS.with(|c| c.get())
+}
+
+// lane-sbpart r2: how many superblock-level `PARTITION_HORZ`/`PARTITION_VERT`
+// blocks (two true 64x32/32x64 strips, [`decode_block_rect64`]) fired -- the
+// gate's proof this round's arms actually reached a real block, not just
+// that `partition_w64` read one of those two symbol values.
+thread_local! {
+    static SB_RECT_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`SB_RECT_HITS`].
+pub(crate) fn sb_rect_hits() -> usize {
+    SB_RECT_HITS.with(|c| c.get())
 }
 
 // lane-partab r1: how many 32x32 quadrants decoded an AB partition
@@ -920,7 +991,14 @@ fn nz_map_ctx_offset_1d(i: usize) -> usize {
     }
 }
 
-fn base_ctx(grid: &[i32], side: usize, row: usize, col: usize, class: TxClass) -> usize {
+fn base_ctx(
+    grid: &[i32],
+    side: usize,
+    row: usize,
+    col: usize,
+    class: TxClass,
+    rect_shape: Option<(usize, usize)>,
+) -> usize {
     // libaom's `get_nz_map_ctx_from_stats` only special-cases the DC
     // coefficient to ctx 0 for `TX_CLASS_2D` (`(tx_class | coeff_idx) == 0`,
     // txb_common.h) -- `V_DCT`/`H_DCT` (class `Horiz`/`Vert`) still run the DC
@@ -943,7 +1021,22 @@ fn base_ctx(grid: &[i32], side: usize, row: usize, col: usize, class: TxClass) -
         .sum();
     let ctx = ((mag + 1) >> 1).min(4) as usize;
     match class {
-        TxClass::TwoD => ctx + cdf::NZ_MAP_CTX_OFFSET_32[row.min(4)][col.min(4)] as usize,
+        // libaom's CDF *set* for a truncated 64-wide/tall corner resolves
+        // through `get_txsize_entropy_ctx` to the square `TX_64X64` (this
+        // decoder's `TxbSet::Luma64`), but `get_nz_map_ctx_from_stats`
+        // separately indexes `av1_nz_map_ctx_offset` by the raw, un-adjusted
+        // `tx_size` -- `TX_32X64`/`TX_64X32` for a superblock-level HORZ/VERT
+        // strip, which own a genuinely different table from the square one
+        // (lane-sbpart r8 root cause: `(row=1, col=0)` reads ctx 2 under the
+        // square table vs the real ctx 13 the rect table gives).
+        TxClass::TwoD => {
+            let table = match rect_shape {
+                Some((w, h)) if w < h => &cdf::NZ_MAP_CTX_OFFSET_32X64,
+                Some((w, h)) if w > h => &cdf::NZ_MAP_CTX_OFFSET_64X32,
+                _ => &cdf::NZ_MAP_CTX_OFFSET_32,
+            };
+            ctx + table[row.min(4)][col.min(4)] as usize
+        }
         TxClass::Horiz => ctx + nz_map_ctx_offset_1d(col.min(31)),
         TxClass::Vert => ctx + nz_map_ctx_offset_1d(row.min(31)),
     }
@@ -1166,7 +1259,7 @@ fn read_eob(dec: &mut SymbolDecoder, coding: &mut TxbTables, class: TxClass) -> 
     }
     let group = dec.symbol(eob_pt) + 1;
     if trace {
-        eprintln!("TRACE eob_pt value={group}");
+        eprintln!("TRACE eob_pt value={group} rng={}", dec.debug_state().0);
     }
     let bits = OFFSET_BITS[group];
     let mut offset = 0u32;
@@ -1236,6 +1329,13 @@ fn read_coeffs(
     // a size the spec forces to `DCT_DCT` regardless of mode (32-point and
     // up, `EXT_TX_SET_DCTONLY`) -- the caller already folds that in.
     default_tx_type: TxType,
+    // `Some((w, h))` with `w != h` when this read is a superblock-level
+    // HORZ/VERT strip's truncated luma corner: the CDF *set* resolves square
+    // (`side`/`coding` above), but `av1_nz_map_ctx_offset`'s position table
+    // is indexed by the real, un-adjusted rectangular shape (lane-sbpart r8
+    // root cause, see [`base_ctx`]). `None` everywhere else -- every other
+    // caller's block genuinely is `side` x `side`.
+    rect_shape: Option<(usize, usize)>,
 ) -> Result<(Vec<i32>, TxType)> {
     let trace = std::env::var_os("EC_AV1_TRACE").is_some();
     let side = coding.side;
@@ -1321,7 +1421,7 @@ fn read_coeffs(
             }
             v
         } else {
-            let ctx = base_ctx(&levels, side, row, col, class);
+            let ctx = base_ctx(&levels, side, row, col, class, rect_shape);
             let v = dec.symbol(&mut coding.base[ctx]) as i32;
             if trace {
                 eprintln!(
@@ -1630,6 +1730,13 @@ struct Neighbours {
     left_palette_size: Vec<usize>,
     above_palette_colors: Vec<[u16; 8]>,
     left_palette_colors: Vec<[u16; 8]>,
+    /// As the four fields above, for the neighbour's own chroma (U-channel
+    /// only -- `av1_get_palette_cache`'s plane-1 lookup, [`Self::palette_uv_cache`])
+    /// palette size/colours (lane-palette2 r1).
+    above_palette_uv_size: Vec<usize>,
+    left_palette_uv_size: Vec<usize>,
+    above_palette_uv_colors: Vec<[u16; 8]>,
+    left_palette_uv_colors: Vec<[u16; 8]>,
     /// This tile's own top-left corner, in 4x4 mode-info units (spec
     /// `MiRowStart`/`MiColStart`) -- lane-tiles: every "is there really a
     /// neighbour" check compares against this instead of literal `0`, since a
@@ -1684,6 +1791,10 @@ impl Neighbours {
             left_palette_size: vec![0; rows],
             above_palette_colors: vec![[0u16; 8]; cols],
             left_palette_colors: vec![[0u16; 8]; rows],
+            above_palette_uv_size: vec![0; cols],
+            left_palette_uv_size: vec![0; rows],
+            above_palette_uv_colors: vec![[0u16; 8]; cols],
+            left_palette_uv_colors: vec![[0u16; 8]; rows],
             tile_row0_mi: 0,
             tile_col0_mi: 0,
         }
@@ -1787,6 +1898,70 @@ impl Neighbours {
             li += 1;
         }
         (ctx, cache)
+    }
+
+    /// As [`Self::record_palette_y`], for a just-decoded block's own chroma
+    /// (U-channel) palette size/colours -- `size == 0` clears stale state the
+    /// same way (lane-palette2 r1).
+    fn record_palette_uv(&mut self, at: (usize, usize), side: usize, size: usize, colors: [u16; 8]) {
+        let (r, c) = at;
+        for cell in 0..side / SUB {
+            self.above_palette_uv_size[c + cell] = size;
+            self.above_palette_uv_colors[c + cell] = colors;
+        }
+        for cell in 0..side / SUB {
+            self.left_palette_uv_size[r + cell] = size;
+            self.left_palette_uv_colors[r + cell] = colors;
+        }
+    }
+
+    /// [`Self::palette_ctx_and_cache`]'s cache half, for the U channel
+    /// (`av1_get_palette_cache(xd, 1, cache)`) -- `palette_uv_mode_ctx` needs
+    /// no neighbour lookup at all (it is this block's own just-decided Y
+    /// palette use, `read_palette_mode_info`'s `pmi->palette_size[0] > 0`),
+    /// so only the cache is wanted here.
+    fn palette_uv_cache(&self, at: (usize, usize)) -> Vec<u16> {
+        let (r, c) = at;
+        let above_ok = r % 4 != 0;
+        let (above_n, above_colors) = if above_ok && self.above_palette_uv_size[c] > 0 {
+            (self.above_palette_uv_size[c], self.above_palette_uv_colors[c])
+        } else {
+            (0, [0u16; 8])
+        };
+        let (left_n, left_colors) = if self.left_palette_uv_size[r] > 0 {
+            (self.left_palette_uv_size[r], self.left_palette_uv_colors[r])
+        } else {
+            (0, [0u16; 8])
+        };
+        let mut cache = Vec::with_capacity(16);
+        let push_dedup = |cache: &mut Vec<u16>, v: u16| {
+            if cache.last() != Some(&v) {
+                cache.push(v);
+            }
+        };
+        let (mut ai, mut li) = (0usize, 0usize);
+        while ai < above_n && li < left_n {
+            let (va, vl) = (above_colors[ai], left_colors[li]);
+            if vl < va {
+                push_dedup(&mut cache, vl);
+                li += 1;
+            } else {
+                push_dedup(&mut cache, va);
+                ai += 1;
+                if vl == va {
+                    li += 1;
+                }
+            }
+        }
+        while ai < above_n {
+            push_dedup(&mut cache, above_colors[ai]);
+            ai += 1;
+        }
+        while li < left_n {
+            push_dedup(&mut cache, left_colors[li]);
+            li += 1;
+        }
+        cache
     }
 
     /// Marks every 4x4 mi cell a just-decoded coded block covers with its own
@@ -2339,15 +2514,22 @@ fn filter_intra_size_class_rect(bw: usize, bh: usize) -> Option<usize> {
 /// `av1_allow_palette`'s size bound (blockd.h: `block_size_wide/high <=
 /// MAX_PALETTE_BLOCK_WIDTH/HEIGHT` (64) and `sb_type >= BLOCK_8X8`) plus
 /// `av1_get_palette_bsize_ctx` (pred_common.h: `num_pels_log2_lookup[bsize]
-/// - num_pels_log2_lookup[BLOCK_8X8]`, i.e. `2*log2(side) - 6` for this
-/// decoder's square-only blocks) -- `None` past the bound (never gates a
-/// palette read), `Some(bsize_ctx)` otherwise.
+/// - num_pels_log2_lookup[BLOCK_8X8]`, i.e. `log2(bw*bh) - 6`) -- `None` past
+/// the bound (never gates a palette read), `Some(bsize_ctx)` otherwise.
 fn palette_bsize_ctx(side: usize) -> Option<usize> {
-    match side {
-        8 => Some(0),
-        16 => Some(2),
-        32 => Some(4),
-        64 => Some(6),
+    palette_bsize_ctx_wh(side, side)
+}
+
+/// [`palette_bsize_ctx`], generalised to a true `bw`x`bh` rect strip
+/// (lane-palette2 r1) -- the same `log2(bw*bh) - 6` formula, this decoder's
+/// square call sites are just `bw == bh`.
+fn palette_bsize_ctx_wh(bw: usize, bh: usize) -> Option<usize> {
+    match (bw, bh) {
+        (8, 8) => Some(0),
+        (16, 16) => Some(2),
+        (32, 16) | (16, 32) => Some(3),
+        (32, 32) => Some(4),
+        (64, 64) => Some(6),
         _ => None,
     }
 }
@@ -2358,6 +2540,17 @@ fn palette_bsize_ctx(side: usize) -> Option<usize> {
 struct PaletteY {
     size: usize,
     colors: [u16; 8],
+    map: Vec<u8>,
+}
+
+/// As [`PaletteY`], for a just-decoded chroma palette block: one shared
+/// per-pixel colour-index map (spec `av1_visit_palette`'s plane-1 pass is
+/// shared between U and V, both co-located after 4:2:0 subsampling) plus
+/// each plane's own base colours.
+struct PaletteUv {
+    size: usize,
+    u_colors: [u16; 8],
+    v_colors: [u16; 8],
     map: Vec<u8>,
 }
 
@@ -2446,6 +2639,74 @@ fn read_palette_colors_y(dec: &mut SymbolDecoder, n: usize, cache: &[u16]) -> [u
     colors
 }
 
+/// `read_palette_colors_uv` (decodemv.c:509), bit_depth fixed at 8: U reads
+/// exactly [`read_palette_colors_y`]'s cache/delta scheme (against the U-only
+/// cache, `range` starting at `255 - prev` with no `-1`, and each raw `delta`
+/// unbiased by `+1` -- both differences from Y's own reader, matching the C
+/// side by side). V never uses a cache: a leading bit picks either `n` raw
+/// literals, or a first raw value plus `n-1` signed deltas that wrap mod 256
+/// rather than clamp.
+fn read_palette_colors_uv(dec: &mut SymbolDecoder, n: usize, cache: &[u16]) -> ([u16; 8], [u16; 8]) {
+    let mut cached = Vec::with_capacity(n);
+    for &c in cache {
+        if cached.len() >= n {
+            break;
+        }
+        if dec.literal(1) == 1 {
+            cached.push(c);
+        }
+    }
+    let mut u_colors = [0u16; 8];
+    let n_cached = cached.len();
+    if n_cached < n {
+        let mut transmitted = Vec::with_capacity(n - n_cached);
+        let first = dec.literal(8) as u16;
+        transmitted.push(first);
+        if n_cached + 1 < n {
+            let min_bits = 8u32 - 3;
+            let mut bits = min_bits + dec.literal(2);
+            let mut range = 255i32 - i32::from(first);
+            for _ in (n_cached + 1)..n {
+                let delta = dec.literal(bits) as i32;
+                let prev = *transmitted.last().unwrap();
+                let val = (i32::from(prev) + delta).clamp(0, 255) as u16;
+                range -= i32::from(val) - i32::from(prev);
+                bits = bits.min(ceil_log2(range.max(0) as u32));
+                transmitted.push(val);
+            }
+        }
+        let merged = merge_colors(&transmitted, &cached);
+        u_colors[..n].copy_from_slice(&merged);
+    } else {
+        u_colors[..n].copy_from_slice(&cached[..n]);
+    }
+    let mut v_colors = [0u16; 8];
+    if dec.literal(1) == 1 {
+        let min_bits_v = 8u32 - 4;
+        let bits = min_bits_v + dec.literal(2);
+        v_colors[0] = dec.literal(8) as u16;
+        for i in 1..n {
+            let mut delta = dec.literal(bits) as i32;
+            if delta != 0 && dec.literal(1) == 1 {
+                delta = -delta;
+            }
+            let mut val = i32::from(v_colors[i - 1]) + delta;
+            if val < 0 {
+                val += 256;
+            }
+            if val >= 256 {
+                val -= 256;
+            }
+            v_colors[i] = val as u16;
+        }
+    } else {
+        for i in 0..n {
+            v_colors[i] = dec.literal(8) as u16;
+        }
+    }
+    (u_colors, v_colors)
+}
+
 /// `av1_palette_color_index_context_lookup` (entropymode.c:889): maps a
 /// `NUM_PALETTE_NEIGHBORS`-weighted score hash (`0..=8`) to the real
 /// `0..=4` context, `-1` for hashes no real neighbour configuration produces.
@@ -2514,7 +2775,13 @@ fn palette_color_index_context(
 /// region (every other skip/residual path here does the same), so no
 /// rows/cols-vs-plane_width/height cropping special case is needed, unlike
 /// libaom's own non-block-aligned split.
-fn decode_color_index_map(dec: &mut SymbolDecoder, cdfs: &mut Cdfs, n: usize, side: usize) -> Vec<u8> {
+fn decode_color_index_map(
+    dec: &mut SymbolDecoder,
+    cdfs: &mut Cdfs,
+    n: usize,
+    side: usize,
+    uv: bool,
+) -> Vec<u8> {
     let trace = std::env::var_os("EC_AV1_TRACE").is_some();
     let mut map = vec![0u8; side * side];
     if trace {
@@ -2537,7 +2804,11 @@ fn decode_color_index_map(dec: &mut SymbolDecoder, cdfs: &mut Cdfs, n: usize, si
                 let (rng, _) = dec.debug_state();
                 eprintln!("EC_PAL row={row} col={col} ctx={ctx} n={n} rng={rng}");
             }
-            let symbol = dec.symbol(&mut cdfs.palette_y_color_index[n - 2][ctx][..=n]);
+            let symbol = if uv {
+                dec.symbol(&mut cdfs.palette_uv_color_index[n - 2][ctx][..=n])
+            } else {
+                dec.symbol(&mut cdfs.palette_y_color_index[n - 2][ctx][..=n])
+            };
             map[row * side + col] = color_order[symbol];
             if trace {
                 let (rng, _) = dec.debug_state();
@@ -2587,26 +2858,44 @@ fn read_intra_mode_rect(
              is consumed for square blocks only)",
         ));
     }
+    let ec_istep = std::env::var_os("EC_TRACE_MODE_STEP").is_some();
+    macro_rules! istep {
+        ($name:literal, $val:expr) => {
+            if ec_istep {
+                let (rng, _) = dec.debug_state();
+                eprintln!(
+                    "EC_ISTEP mi_row={mi_r} mi_col={mi_c} name={} val={} rng={rng}",
+                    $name, $val
+                );
+            }
+        };
+    }
     let skip = dec.symbol(&mut cdfs.skip[skip_ctx]) != 0;
+    istep!("skip", skip as i32);
     maybe_read_cdef_idx(dec, mi_r, mi_c, skip);
+    istep!("cdef", 0);
     // A HORZ/VERT rect strip is never the whole superblock (`bw`/`bh` never
     // both 64 here -- see this fn's own doc), so `is_whole_sb` is always
     // `false`.
     maybe_read_delta_q(dec, cdfs, mi_r, mi_c, false, skip);
     maybe_read_delta_lf(dec, cdfs, mi_r, mi_c, false, skip);
+    istep!("dq", 0);
     let above_ctx = INTRA_MODE_CTX[above_mode];
     let left_ctx = INTRA_MODE_CTX[left_mode];
     let mode = dec.symbol(&mut cdfs.kf_y_mode[above_ctx][left_ctx]);
+    istep!("mode", mode as i32);
     let angle_delta_y = if (V_PRED..=D67_PRED).contains(&mode) {
         read_angle_delta(dec, &mut cdfs.angle_delta[mode - V_PRED])
     } else {
         0
     };
+    istep!("angle_y", angle_delta_y);
     let uv_mode = if cfl {
         dec.symbol(&mut cdfs.uv_mode_cfl[mode])
     } else {
         dec.symbol(&mut cdfs.uv_mode_no_cfl[mode])
     };
+    istep!("uv_mode", uv_mode as i32);
     let alpha = if cfl && uv_mode == UV_CFL_PRED {
         Some(read_cfl_alphas(dec, cdfs))
     } else {
@@ -2621,6 +2910,7 @@ fn read_intra_mode_rect(
     } else {
         0
     };
+    istep!("angle_uv", angle_delta_uv);
     let mut filter_intra = None;
     if std::env::var_os("EC_AV1_TRACE").is_some() {
         let (rng, _) = dec.debug_state();
@@ -3021,6 +3311,306 @@ fn decode_block_rect(
     neighbours.fill_skip_grid_rect((mi_r, mi_c), bw / MI, bh / MI, skip);
     neighbours.fill_lf_grid_rect((mi_r, mi_c), bw / MI, bh / MI, tx_w as u8, tx_h as u8, 0);
     RECT_PARTITION_HITS.with(|c| c.set(c.get() + 1));
+    if std::env::var_os("EC_AV1_TRACE").is_some() {
+        eprintln!("TRACE_RECT32_END mi_row={mi_r} mi_col={mi_c} bw={bw} bh={bh}");
+    }
+    Ok(())
+}
+
+/// Decodes one true `bw`x`bh` superblock-level `PARTITION_HORZ`/
+/// `PARTITION_VERT` strip (lane-sbpart r2, `bw, bh` one of `(64, 32)` /
+/// `(32, 64)` -- [`decode_block_rect`]'s own sibling one level up). Unlike
+/// that 32x16/16x32 strip, both dimensions here exceed the 32-coefficient
+/// cap, so LUMA needs the same corner truncation [`decode_block`] already
+/// does for a plain 64x64 square (spec 5.11.40): `get_txsize_entropy_ctx`
+/// resolves TX_64X32/TX_32X64 to TX_64X64 regardless of orientation (see
+/// this function's own charter/report), so both strips read a real 32x32
+/// corner through [`read_coeffs`] with [`TxbSet::Luma64`]/[`SCAN_32`] and
+/// embed it top-left of a zeroed `bw`x`bh` grid, mirroring
+/// [`read_plane`]'s `tx_side != side` branch generalized to non-square.
+/// CHROMA (TX_32X16/TX_16X32) resolves to TX_32X32 -- a real, *untruncated*
+/// `bw/2`x`bh/2` transform via [`read_coeffs_rect`] with
+/// [`TxbSet::ChromaRect32x16`] and the matching [`SCAN_32X16`]/
+/// [`SCAN_16X32`], same as [`decode_block_rect`]'s own chroma path. Like
+/// that function, only the single-transform-unit (`tx_depth == 0`) case is
+/// supported: a split transform refuses by name rather than guess-decode.
+#[allow(clippy::too_many_arguments)]
+fn decode_block_rect64(
+    dec: &mut SymbolDecoder,
+    cdfs: &mut Cdfs,
+    neighbours: &mut Neighbours,
+    at: (usize, usize),
+    bw: usize,
+    bh: usize,
+    y: &mut PlaneBuf,
+    u: &mut PlaneBuf,
+    v: &mut PlaneBuf,
+    enable_filter_intra: bool,
+    allow_screen_content_tools: bool,
+    base_q_idx: u8,
+    tx_select: bool,
+) -> Result<()> {
+    let (r, c) = at;
+    let (px, py) = (c * SUB, r * SUB);
+    let (skip, mode, angle_delta_y, uv_mode, angle_delta_uv, alpha, filter_intra) =
+        read_intra_mode_rect(
+            dec,
+            cdfs,
+            neighbours.above_mode[c],
+            neighbours.left_mode[r],
+            // `is_cfl_allowed` (spec 5.11.5) caps CFL at <=32x32; these
+            // superblock-level HORZ/VERT strips are 64x32/32x64, so unlike
+            // `decode_block_rect`'s own 32x16/16x32 strips (where `true` is
+            // correct), CFL must never be offered here -- passing `true`
+            // read `uv_mode` off the 14-symbol `uv_mode_cfl` CDF instead of
+            // the real 13-symbol `uv_mode_no_cfl` one and desynced the tile
+            // from this block's very first symbol (lane-sbpart r3 bisect).
+            false,
+            bw,
+            bh,
+            enable_filter_intra,
+            neighbours.skip_txfm_ctx(r * (SUB / MI), c * (SUB / MI)),
+            allow_screen_content_tools,
+            r * (SUB / MI),
+            c * (SUB / MI),
+        )?;
+    let smooth_neighbor =
+        is_smooth_mode(neighbours.above_mode[c]) || is_smooth_mode(neighbours.left_mode[r]);
+    if smooth_neighbor {
+        SMOOTH_LUMA_HITS.with(|c| c.set(c.get() + 1));
+    }
+    let smooth_neighbor_uv =
+        is_smooth_mode(neighbours.above_uv_mode[c]) || is_smooth_mode(neighbours.left_uv_mode[r]);
+    if filter_intra.is_some() {
+        // `filter_intra_size_class_rect` already returns `None` for both
+        // `(64, 32)` and `(32, 64)` (`av1_filter_intra_allowed_bsize` caps at
+        // 32 on both axes), so this symbol is never read at this level --
+        // kept only as the same defensive refusal [`decode_block_rect`] has.
+        return Err(unsupported(
+            "filter intra on a superblock-level HORZ/VERT strip (never expected -- \
+             av1_filter_intra_allowed_bsize caps at 32x32)",
+        ));
+    }
+    let uv_predict_mode = if uv_mode == UV_CFL_PRED {
+        DC_PRED
+    } else {
+        uv_mode
+    };
+    let (mi_r, mi_c) = (r * (SUB / MI), c * (SUB / MI));
+    let depth = if tx_select {
+        let ctx = tx_size_context_rect(neighbours, (mi_r, mi_c), bw, bh);
+        dec.symbol(&mut cdfs.tx_size_cat2[ctx])
+    } else {
+        0
+    };
+    if depth != 0 {
+        TX_DEPTH_HITS.with(|c| c.set(c.get() + 1));
+        return Err(unsupported(
+            "a superblock-level HORZ/VERT strip with a split transform (per-unit rect \
+             prediction is not ported)",
+        ));
+    }
+    let (tx_w, tx_h) = (bw, bh);
+    let (cpx, cpy) = (px / 2, py / 2);
+    let (chroma_w, chroma_h) = (bw / 2, bh / 2);
+    let reach = Reach::of_rect(bw, bh, px, py, y.width, y.height);
+    if skip {
+        y.reconstruct_rect(
+            px,
+            py,
+            bw,
+            bh,
+            mode,
+            angle_delta_y,
+            reach,
+            &vec![0i32; bw * bh],
+            None,
+            filter_intra,
+            smooth_neighbor,
+        );
+        let ac = alpha.map(|_| cfl_ac_q3_rect(y, px, py, bw, bh));
+        u.reconstruct_rect(
+            cpx,
+            cpy,
+            chroma_w,
+            chroma_h,
+            uv_predict_mode,
+            angle_delta_uv,
+            reach,
+            &vec![0i32; chroma_w * chroma_h],
+            alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
+            None,
+            smooth_neighbor_uv,
+        );
+        v.reconstruct_rect(
+            cpx,
+            cpy,
+            chroma_w,
+            chroma_h,
+            uv_predict_mode,
+            angle_delta_uv,
+            reach,
+            &vec![0i32; chroma_w * chroma_h],
+            alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
+            None,
+            smooth_neighbor_uv,
+        );
+        neighbours.record_rect(
+            at,
+            bw,
+            bh,
+            mode,
+            uv_predict_mode,
+            &[
+                vec![0i32; bw * bh],
+                vec![0i32; chroma_w * chroma_h],
+                vec![0i32; chroma_w * chroma_h],
+            ],
+        );
+    } else {
+        let around = neighbours.around_rect(at, bw, bh);
+        // LUMA: a real 32x32 corner, embedded top-left of the true bw x bh
+        // grid (see this function's own doc comment).
+        let scan32 = default_scan(TX32);
+        let mut luma_coding = cdfs.txb(TxbSet::Luma64, mode);
+        if std::env::var_os("EC_TRACE_COEFF").is_some() {
+            let (rng, _) = dec.debug_state();
+            eprintln!("EC_COEFF plane=0 row={mi_r} col={mi_c} tx_size=64corner rng={rng}");
+        }
+        let (luma_corner, luma_tx_type) = read_coeffs(
+            dec,
+            &mut luma_coding,
+            &scan32,
+            0,
+            dc_sign_ctx(around[0].2),
+            TxType::DctDct,
+            Some((bw, bh)),
+        )?;
+        if std::env::var_os("EC_TRACE_COEFF").is_some() {
+            let (rng, _) = dec.debug_state();
+            eprintln!("EC_COEFF_VAL plane=0 row={mi_r} col={mi_c} rng={rng}");
+        }
+        let mut luma_levels = vec![0i32; bw * bh];
+        for row in 0..32 {
+            luma_levels[row * bw..][..32].copy_from_slice(&luma_corner[row * 32..][..32]);
+        }
+        let luma_residual = dequant_and_inverse_typed_wh(
+            &luma_levels,
+            bw,
+            bh,
+            8,
+            i32::from(base_q_idx),
+            luma_tx_type,
+        );
+        y.reconstruct_rect(
+            px,
+            py,
+            bw,
+            bh,
+            mode,
+            angle_delta_y,
+            reach,
+            &luma_residual,
+            None,
+            filter_intra,
+            smooth_neighbor,
+        );
+        // CHROMA: a real, untruncated chroma_w x chroma_h transform -- no
+        // corner crop needed (see doc comment).
+        let ac = alpha.map(|_| cfl_ac_q3_rect(y, px, py, bw, bh));
+        let chroma_scan: &[u16] = if bw == 64 { &SCAN_32X16 } else { &SCAN_16X32 };
+        let u_skip_ctx = usize::from(around[1].0) + usize::from(around[1].1);
+        let mut u_coding = cdfs.txb(TxbSet::ChromaRect32x16, uv_predict_mode);
+        if std::env::var_os("EC_TRACE_COEFF").is_some() {
+            let (rng, _) = dec.debug_state();
+            eprintln!("EC_COEFF plane=1 row={mi_r} col={mi_c} tx_size=rect32x16 rng={rng}");
+        }
+        let (u_levels, u_tx_type) = read_coeffs_rect(
+            dec,
+            &mut u_coding,
+            chroma_scan,
+            chroma_w,
+            chroma_h,
+            u_skip_ctx,
+            dc_sign_ctx(around[1].2),
+            TxType::DctDct,
+        )?;
+        if std::env::var_os("EC_TRACE_COEFF").is_some() {
+            let (rng, _) = dec.debug_state();
+            eprintln!("EC_COEFF_VAL plane=1 row={mi_r} col={mi_c} rng={rng}");
+        }
+        let u_residual = dequant_and_inverse_typed_wh(
+            &u_levels,
+            chroma_w,
+            chroma_h,
+            8,
+            i32::from(base_q_idx),
+            u_tx_type,
+        );
+        u.reconstruct_rect(
+            cpx,
+            cpy,
+            chroma_w,
+            chroma_h,
+            uv_predict_mode,
+            angle_delta_uv,
+            reach,
+            &u_residual,
+            alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
+            None,
+            smooth_neighbor_uv,
+        );
+        let v_skip_ctx = usize::from(around[2].0) + usize::from(around[2].1);
+        let mut v_coding = cdfs.txb(TxbSet::ChromaRect32x16, uv_predict_mode);
+        if std::env::var_os("EC_TRACE_COEFF").is_some() {
+            let (rng, _) = dec.debug_state();
+            eprintln!("EC_COEFF plane=2 row={mi_r} col={mi_c} tx_size=rect32x16 rng={rng}");
+        }
+        let (v_levels, v_tx_type) = read_coeffs_rect(
+            dec,
+            &mut v_coding,
+            chroma_scan,
+            chroma_w,
+            chroma_h,
+            v_skip_ctx,
+            dc_sign_ctx(around[2].2),
+            TxType::DctDct,
+        )?;
+        if std::env::var_os("EC_TRACE_COEFF").is_some() {
+            let (rng, _) = dec.debug_state();
+            eprintln!("EC_COEFF_VAL plane=2 row={mi_r} col={mi_c} rng={rng}");
+        }
+        let v_residual = dequant_and_inverse_typed_wh(
+            &v_levels,
+            chroma_w,
+            chroma_h,
+            8,
+            i32::from(base_q_idx),
+            v_tx_type,
+        );
+        v.reconstruct_rect(
+            cpx,
+            cpy,
+            chroma_w,
+            chroma_h,
+            uv_predict_mode,
+            angle_delta_uv,
+            reach,
+            &v_residual,
+            alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
+            None,
+            smooth_neighbor_uv,
+        );
+        neighbours.record_rect(at, bw, bh, mode, uv_predict_mode, &[luma_levels, u_levels, v_levels]);
+        RECT_COEFF_HITS.with(|c| c.set(c.get() + 1));
+    }
+    neighbours.fill_skip_grid_rect((mi_r, mi_c), bw / MI, bh / MI, skip);
+    neighbours.fill_lf_grid_rect((mi_r, mi_c), bw / MI, bh / MI, tx_w as u8, tx_h as u8, 0);
+    SB_RECT_HITS.with(|c| c.set(c.get() + 1));
+    if std::env::var_os("EC_AV1_TRACE").is_some() {
+        let (rng, _) = dec.debug_state();
+        eprintln!("TRACE_RECT64_END mi_row={mi_r} mi_col={mi_c} bw={bw} bh={bh} rng={rng}");
+    }
     Ok(())
 }
 
@@ -3056,6 +3646,11 @@ fn read_intra_mode(
     // decoder reads either way -- but refuse by name the moment it fires,
     // exactly the old behaviour.
     palette: Option<(usize, &[u16])>,
+    // The U-channel colour cache for a chroma palette read ([`Neighbours::palette_uv_cache`]),
+    // `&[]` at the excluded call sites -- same corner-cut as `palette` above,
+    // no `mode_ctx` needed (`palette_uv_mode_ctx` is this block's own just-read
+    // `use_palette_y`, not a neighbour lookup).
+    palette_uv_cache: &[u16],
     mi_r: usize,
     mi_c: usize,
 ) -> Result<(
@@ -3067,6 +3662,7 @@ fn read_intra_mode(
     Option<(i32, i32)>,
     Option<usize>,
     Option<PaletteY>,
+    Option<PaletteUv>,
 )> {
     let trace = std::env::var_os("EC_AV1_TRACE").is_some();
     let skip = dec.symbol(&mut cdfs.skip[skip_ctx]) != 0;
@@ -3174,6 +3770,7 @@ fn read_intra_mode(
     // bit-for-bit through the Y colours, diverged only at the old inline
     // `decode_color_index_map` call).
     let mut palette_y_pending: Option<(usize, [u16; 8])> = None;
+    let mut palette_uv_pending: Option<(usize, [u16; 8], [u16; 8])> = None;
     if allow_screen_content_tools
         && let Some(bsize_ctx) = palette_bsize_ctx(side)
     {
@@ -3215,15 +3812,12 @@ fn read_intra_mode(
         // UV_DC_PRED`, regardless of whether Y just fired -- this decoder's
         // scope always reconstructs chroma alongside luma (`decode_block`
         // always calls `u.reconstruct`/`v.reconstruct`), so `is_chroma_ref`
-        // is always true here and does not need threading in. UV palette
-        // reconstruction stays out of scope: refusing the moment the mode
-        // symbol fires needs no further reads (the whole decode aborts),
-        // so `palette_uv_size`/`read_palette_colors_uv` are never reached.
+        // is always true here and does not need threading in.
         let palette_uv_mode_ctx = usize::from(use_palette_y);
         if uv_mode == DC_PRED && dec.symbol(&mut cdfs.palette_uv_mode[palette_uv_mode_ctx]) != 0 {
-            return Err(unsupported(
-                "a block that actually uses a palette (UV) -- reconstruction is out of scope",
-            ));
+            let n = 2 + dec.symbol(&mut cdfs.palette_uv_size[bsize_ctx]);
+            let (u_colors, v_colors) = read_palette_colors_uv(dec, n, palette_uv_cache);
+            palette_uv_pending = Some((n, u_colors, v_colors));
         }
     }
     // `read_filter_intra_mode_info` (spec 5.11.14, libaom decodemv.c): a
@@ -3254,18 +3848,27 @@ fn read_intra_mode(
             filter_intra = Some(fi_mode);
         }
     }
-    // `av1_visit_palette` (decoder.c:234): the colour-index-map decode runs
-    // here, after every mode-info symbol for the block (including UV
-    // palette and filter_intra above) -- plane 0 (Y) only in this decoder's
-    // scope, since UV palette already refused by name above and never left
-    // a pending map to decode.
+    // `av1_visit_palette` (decoder.c:234): plane 0 (Y) then plane 1 (chroma,
+    // shared U/V map) -- the same order libaom's own loop visits them in.
     let palette_y = palette_y_pending.map(|(n, colors)| {
-        let map = decode_color_index_map(dec, cdfs, n, side);
+        let map = decode_color_index_map(dec, cdfs, n, side, false);
         PALETTE_HITS.with(|c| c.set(c.get() + 1));
         if trace {
             eprintln!("TRACE palette_y size={n} colors={:?}", &colors[..n]);
         }
         PaletteY { size: n, colors, map }
+    });
+    let palette_uv = palette_uv_pending.map(|(n, u_colors, v_colors)| {
+        let map = decode_color_index_map(dec, cdfs, n, side / 2, true);
+        PALETTE_UV_HITS.with(|c| c.set(c.get() + 1));
+        if trace {
+            eprintln!(
+                "TRACE palette_uv size={n} u_colors={:?} v_colors={:?}",
+                &u_colors[..n],
+                &v_colors[..n]
+            );
+        }
+        PaletteUv { size: n, u_colors, v_colors, map }
     });
     Ok((
         skip,
@@ -3276,6 +3879,7 @@ fn read_intra_mode(
         alpha,
         filter_intra,
         palette_y,
+        palette_uv,
     ))
 }
 
@@ -3357,7 +3961,7 @@ fn cfl_scaled(alpha_q3: i32, ac_q3: i32) -> i32 {
 /// [`crate::intra::predict`] instead of hand-rolling `DC_PRED` alone.
 #[derive(Clone)]
 struct PlaneBuf {
-    data: Vec<u8>,
+    data: Vec<u16>,
     width: usize,
     height: usize,
     /// The frame's true, decodable extent in this plane's own units — past
@@ -3410,7 +4014,7 @@ impl PlaneBuf {
         y: usize,
         side: usize,
         reach: Reach,
-    ) -> (Option<Vec<u8>>, Option<Vec<u8>>, Option<u8>) {
+    ) -> (Option<Vec<u16>>, Option<Vec<u16>>, Option<u16>) {
         let own_across = x + side.min(self.true_width.saturating_sub(x));
         let across = if reach.above_right {
             own_across + side.min(self.true_width.saturating_sub(own_across))
@@ -3449,7 +4053,7 @@ impl PlaneBuf {
         bw: usize,
         bh: usize,
         reach: Reach,
-    ) -> (Option<Vec<u8>>, Option<Vec<u8>>, Option<u8>) {
+    ) -> (Option<Vec<u16>>, Option<Vec<u16>>, Option<u16>) {
         let own_across = x + bw.min(self.true_width.saturating_sub(x));
         let across = if reach.above_right {
             own_across + bw.min(self.true_width.saturating_sub(own_across))
@@ -3497,7 +4101,7 @@ impl PlaneBuf {
         smooth_neighbor: bool,
     ) {
         let (above, left, corner) = self.edges_rect(x, y, bw, bh, reach);
-        let mut prediction = vec![0u8; bw * bh];
+        let mut prediction = vec![0u16; bw * bh];
         if let Some(fi_mode) = filter_intra {
             crate::intra::predict_filter_intra(
                 fi_mode,
@@ -3527,9 +4131,9 @@ impl PlaneBuf {
                 let idx = row * bw + col;
                 let mut base = i32::from(prediction[idx]);
                 if let Some((alpha_q3, ac_q3)) = cfl {
-                    base = (base + cfl_scaled(alpha_q3, ac_q3[idx])).clamp(0, 255);
+                    base = (base + cfl_scaled(alpha_q3, ac_q3[idx])).clamp(0, sample_max());
                 }
-                let sample = (base + residual[idx]).clamp(0, 255) as u8;
+                let sample = (base + residual[idx]).clamp(0, sample_max()) as u16;
                 self.data[(y + row) * self.width + x + col] = sample;
             }
         }
@@ -3569,7 +4173,7 @@ impl PlaneBuf {
             buf
         } else {
             let (above, left, corner) = self.edges(x, y, side, reach);
-            let mut prediction = vec![0u8; side * side];
+            let mut prediction = vec![0u16; side * side];
             if let Some(fi_mode) = filter_intra {
                 crate::intra::predict_filter_intra(
                     fi_mode,
@@ -3608,9 +4212,9 @@ impl PlaneBuf {
                 let idx = row * side + col;
                 let mut base = i32::from(prediction[idx]);
                 if let Some((alpha_q3, ac_q3)) = cfl {
-                    base = (base + cfl_scaled(alpha_q3, ac_q3[idx])).clamp(0, 255);
+                    base = (base + cfl_scaled(alpha_q3, ac_q3[idx])).clamp(0, sample_max());
                 }
-                let sample = (base + residual[idx]).clamp(0, 255) as u8;
+                let sample = (base + residual[idx]).clamp(0, sample_max()) as u16;
                 self.data[(y + row) * self.width + x + col] = sample;
             }
         }
@@ -3682,6 +4286,7 @@ fn read_plane(
         skip_ctx,
         dc_sign_ctx(around.2),
         default_tx_type,
+        None,
     )?;
     // A 64x64 luma block's transform covers the whole 64x64 area, but only its
     // top-left 32x32 of frequencies are coded (spec 5.11.40); the rest of the
@@ -3766,7 +4371,8 @@ fn decode_block(
     let (r, c) = at;
     let (px, py) = (c * SUB, r * SUB);
     let (palette_ctx, palette_cache) = neighbours.palette_ctx_and_cache(at);
-    let (skip, mode, angle_delta_y, uv_mode, angle_delta_uv, alpha, filter_intra, palette_y) =
+    let palette_uv_cache = neighbours.palette_uv_cache(at);
+    let (skip, mode, angle_delta_y, uv_mode, angle_delta_uv, alpha, filter_intra, palette_y, palette_uv) =
         read_intra_mode(
             dec,
             cdfs,
@@ -3779,6 +4385,7 @@ fn decode_block(
             allow_screen_content_tools,
             allow_intrabc,
             Some((palette_ctx, &palette_cache)),
+            &palette_uv_cache,
             r * (SUB / MI),
             c * (SUB / MI),
         )?;
@@ -3839,9 +4446,24 @@ fn decode_block(
                 "a palette block with a split luma transform (round 1)",
             ));
         }
-        let buf: Vec<u8> = py.map.iter().map(|&idx| py.colors[idx as usize] as u8).collect();
+        let buf: Vec<u16> = py
+            .map
+            .iter()
+            .map(|&idx| py.colors[idx as usize])
+            .collect();
         PALETTE_PRED.with(|c| *c.borrow_mut() = Some(buf));
     }
+    // A UV-palette block's own chroma prediction override (lane-palette2 r1),
+    // same [`PALETTE_PRED`] slot as Y above -- set fresh right before each
+    // plane's own `reconstruct`/`read_plane` call below (never both planes at
+    // once), since Y's own set-then-take already emptied the slot by the time
+    // either of these run.
+    let palette_uv_bufs: Option<(Vec<u16>, Vec<u16>)> = palette_uv.as_ref().map(|puv| {
+        (
+            puv.map.iter().map(|&idx| puv.u_colors[idx as usize]).collect(),
+            puv.map.iter().map(|&idx| puv.v_colors[idx as usize]).collect(),
+        )
+    });
     if skip {
         // A skipped block codes no residual syntax at all (spec 5.11.34):
         // straight prediction, on every plane.
@@ -3858,6 +4480,9 @@ fn decode_block(
             smooth_neighbor,
         );
         let ac = alpha.map(|_| cfl_ac_q3(y, px, py, side));
+        if let Some((ub, _)) = &palette_uv_bufs {
+            PALETTE_PRED.with(|c| *c.borrow_mut() = Some(ub.clone()));
+        }
         u.reconstruct(
             cpx,
             cpy,
@@ -3870,6 +4495,9 @@ fn decode_block(
             None,
             smooth_neighbor_uv,
         );
+        if let Some((_, vb)) = &palette_uv_bufs {
+            PALETTE_PRED.with(|c| *c.borrow_mut() = Some(vb.clone()));
+        }
         v.reconstruct(
             cpx,
             cpy,
@@ -3914,6 +4542,9 @@ fn decode_block(
             smooth_neighbor,
         )?;
         let ac = alpha.map(|_| cfl_ac_q3(y, px, py, side));
+        if let Some((ub, _)) = &palette_uv_bufs {
+            PALETTE_PRED.with(|c| *c.borrow_mut() = Some(ub.clone()));
+        }
         let u_grid = read_plane(
             dec,
             cdfs,
@@ -3941,6 +4572,9 @@ fn decode_block(
                 "TRACE u-write cpx={cpx} cpy={cpy} chroma_side={chroma_side} row0={:?}",
                 &u.data[cpy * u.width + cpx..][..chroma_side]
             );
+        }
+        if let Some((_, vb)) = &palette_uv_bufs {
+            PALETTE_PRED.with(|c| *c.borrow_mut() = Some(vb.clone()));
         }
         let v_grid = read_plane(
             dec,
@@ -4023,6 +4657,9 @@ fn decode_block(
         }
         let ac = alpha.map(|_| cfl_ac_q3(y, px, py, side));
         let chroma_around = neighbours.around(at, side);
+        if let Some((ub, _)) = &palette_uv_bufs {
+            PALETTE_PRED.with(|c| *c.borrow_mut() = Some(ub.clone()));
+        }
         let u_grid = read_plane(
             dec,
             cdfs,
@@ -4045,6 +4682,9 @@ fn decode_block(
             None,
             smooth_neighbor_uv,
         )?;
+        if let Some((_, vb)) = &palette_uv_bufs {
+            PALETTE_PRED.with(|c| *c.borrow_mut() = Some(vb.clone()));
+        }
         let v_grid = read_plane(
             dec,
             cdfs,
@@ -4078,6 +4718,10 @@ fn decode_block(
         .as_ref()
         .map_or((0, [0u16; 8]), |p| (p.size, p.colors));
     neighbours.record_palette_y(at, side, py_size, py_colors);
+    let (puv_size, puv_colors) = palette_uv
+        .as_ref()
+        .map_or((0, [0u16; 8]), |p| (p.size, p.u_colors));
+    neighbours.record_palette_uv(at, side, puv_size, puv_colors);
     neighbours.fill_skip_grid((r * (SUB / MI), c * (SUB / MI)), side / MI, skip);
     neighbours.fill_lf_grid(
         (r * (SUB / MI), c * (SUB / MI)),
@@ -4135,7 +4779,7 @@ fn decode_leaf8(
     // An 8x8 leaf is well within `is_cfl_allowed`'s <=32x32 bound (spec
     // 5.11.5), so it reads the CFL-allowed `uv_mode_cfl` CDF, like every other
     // `decode_block` caller at 16x16 and up.
-    let (skip, mode, angle_delta_y, uv_mode, angle_delta_uv, alpha, filter_intra, _palette_y) =
+    let (skip, mode, angle_delta_y, uv_mode, angle_delta_uv, alpha, filter_intra, _palette_y, _palette_uv) =
         read_intra_mode(
             dec,
             cdfs,
@@ -4148,6 +4792,7 @@ fn decode_leaf8(
             allow_screen_content_tools,
             allow_intrabc,
             None,
+            &[],
             leaf_mi.0,
             leaf_mi.1,
         )?;
@@ -4594,7 +5239,7 @@ fn cdef_filter_block(
             if clipping_required {
                 y = y.clamp(min, max);
             }
-            dst.data[(oy + i) * dst.width + (ox + j)] = y.clamp(0, 255) as u8;
+            dst.data[(oy + i) * dst.width + (ox + j)] = y.clamp(0, sample_max()) as u16;
         }
     }
 }
@@ -5029,7 +5674,7 @@ fn filter14(
 /// the next along the edge's own filtering direction.
 #[allow(clippy::too_many_arguments)]
 fn filter_edge(
-    data: &mut [u8],
+    data: &mut [u16],
     base: usize,
     outer_stride: isize,
     tap_stride: isize,
@@ -5049,10 +5694,10 @@ fn filter_edge(
                     && (q1 - q0).abs() <= limit
                     && (p0 - q0).abs() * 2 + (p1 - q1).abs() / 2 <= blimit;
                 let [op1, op0, oq0, oq1] = filter4(mask, hev_thr, p1, p0, q0, q1);
-                data[idx(-2)] = op1.clamp(0, 255) as u8;
-                data[idx(-1)] = op0.clamp(0, 255) as u8;
-                data[idx(0)] = oq0.clamp(0, 255) as u8;
-                data[idx(1)] = oq1.clamp(0, 255) as u8;
+                data[idx(-2)] = op1.clamp(0, sample_max()) as u16;
+                data[idx(-1)] = op0.clamp(0, sample_max()) as u16;
+                data[idx(0)] = oq0.clamp(0, sample_max()) as u16;
+                data[idx(1)] = oq1.clamp(0, sample_max()) as u16;
             }
             6 => {
                 let (p2, p1, p0, q0, q1, q2) = (px(-3), px(-2), px(-1), px(0), px(1), px(2));
@@ -5066,10 +5711,10 @@ fn filter_edge(
                     && (p2 - p0).abs() <= 1
                     && (q2 - q0).abs() <= 1;
                 let [op1, op0, oq0, oq1] = filter6(mask, hev_thr, flat, p2, p1, p0, q0, q1, q2);
-                data[idx(-2)] = op1.clamp(0, 255) as u8;
-                data[idx(-1)] = op0.clamp(0, 255) as u8;
-                data[idx(0)] = oq0.clamp(0, 255) as u8;
-                data[idx(1)] = oq1.clamp(0, 255) as u8;
+                data[idx(-2)] = op1.clamp(0, sample_max()) as u16;
+                data[idx(-1)] = op0.clamp(0, sample_max()) as u16;
+                data[idx(0)] = oq0.clamp(0, sample_max()) as u16;
+                data[idx(1)] = oq1.clamp(0, sample_max()) as u16;
             }
             8 => {
                 let (p3, p2, p1, p0, q0, q1, q2, q3) =
@@ -5089,12 +5734,12 @@ fn filter_edge(
                     && (q3 - q0).abs() <= 1;
                 let [op2, op1, op0, oq0, oq1, oq2] =
                     filter8(mask, hev_thr, flat, p3, p2, p1, p0, q0, q1, q2, q3);
-                data[idx(-3)] = op2.clamp(0, 255) as u8;
-                data[idx(-2)] = op1.clamp(0, 255) as u8;
-                data[idx(-1)] = op0.clamp(0, 255) as u8;
-                data[idx(0)] = oq0.clamp(0, 255) as u8;
-                data[idx(1)] = oq1.clamp(0, 255) as u8;
-                data[idx(2)] = oq2.clamp(0, 255) as u8;
+                data[idx(-3)] = op2.clamp(0, sample_max()) as u16;
+                data[idx(-2)] = op1.clamp(0, sample_max()) as u16;
+                data[idx(-1)] = op0.clamp(0, sample_max()) as u16;
+                data[idx(0)] = oq0.clamp(0, sample_max()) as u16;
+                data[idx(1)] = oq1.clamp(0, sample_max()) as u16;
+                data[idx(2)] = oq2.clamp(0, sample_max()) as u16;
             }
             _ => {
                 let (p6, p5, p4, p3, p2, p1, p0) =
@@ -5125,7 +5770,7 @@ fn filter_edge(
                     q6,
                 );
                 for (k, v) in (-6..=5isize).zip(out) {
-                    data[idx(k)] = v.clamp(0, 255) as u8;
+                    data[idx(k)] = v.clamp(0, sample_max()) as u16;
                 }
             }
         }
@@ -5524,7 +6169,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     let (width, height) = (cols32 as usize * BLOCK, rows32 as usize * BLOCK);
 
     let mut y = PlaneBuf {
-        data: vec![0u8; width * height],
+        data: vec![0u16; width * height],
         width,
         height,
         true_width,
@@ -5535,7 +6180,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         tile_y1: height,
     };
     let mut u = PlaneBuf {
-        data: vec![0u8; width * height / 4],
+        data: vec![0u16; width * height / 4],
         width: width / 2,
         height: height / 2,
         true_width: true_width / 2,
@@ -5546,7 +6191,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         tile_y1: height / 2,
     };
     let mut v = PlaneBuf {
-        data: vec![0u8; width * height / 4],
+        data: vec![0u16; width * height / 4],
         width: width / 2,
         height: height / 2,
         true_width: true_width / 2,
@@ -6042,6 +6687,73 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                         }
                     }
                 }
+                PARTITION_HORZ => {
+                    // lane-sbpart r2: two true 64x32 strips.
+                    decode_block_rect64(
+                        &mut dec,
+                        &mut cdfs,
+                        &mut neighbours,
+                        at,
+                        64,
+                        32,
+                        &mut y,
+                        &mut u,
+                        &mut v,
+                        enable_filter_intra,
+                        allow_screen_content_tools,
+                        base_q_idx,
+                        tx_select,
+                    )?;
+                    decode_block_rect64(
+                        &mut dec,
+                        &mut cdfs,
+                        &mut neighbours,
+                        (at.0 + 2, at.1),
+                        64,
+                        32,
+                        &mut y,
+                        &mut u,
+                        &mut v,
+                        enable_filter_intra,
+                        allow_screen_content_tools,
+                        base_q_idx,
+                        tx_select,
+                    )?;
+                }
+                PARTITION_VERT => {
+                    // lane-sbpart r2: mirror of PARTITION_HORZ above with
+                    // width/height swapped.
+                    decode_block_rect64(
+                        &mut dec,
+                        &mut cdfs,
+                        &mut neighbours,
+                        at,
+                        32,
+                        64,
+                        &mut y,
+                        &mut u,
+                        &mut v,
+                        enable_filter_intra,
+                        allow_screen_content_tools,
+                        base_q_idx,
+                        tx_select,
+                    )?;
+                    decode_block_rect64(
+                        &mut dec,
+                        &mut cdfs,
+                        &mut neighbours,
+                        (at.0, at.1 + 2),
+                        32,
+                        64,
+                        &mut y,
+                        &mut u,
+                        &mut v,
+                        enable_filter_intra,
+                        allow_screen_content_tools,
+                        base_q_idx,
+                        tx_select,
+                    )?;
+                }
                 _ => {
                     return Err(unsupported(
                         "a superblock-level partition type other than NONE or SPLIT (this \
@@ -6066,9 +6778,10 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         use std::io::Write;
         let idx = PREFILT_PICTURE_IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if let Ok(mut f) = std::fs::File::create(format!("{path}.f{idx}")) {
-            let _ = f.write_all(&y.data);
-            let _ = f.write_all(&u.data);
-            let _ = f.write_all(&v.data);
+            let narrow = |p: &PlaneBuf| -> Vec<u8> { p.data.iter().map(|&s| s as u8).collect() };
+            let _ = f.write_all(&narrow(&y));
+            let _ = f.write_all(&narrow(&u));
+            let _ = f.write_all(&narrow(&v));
         }
     } else {
         PREFILT_PICTURE_IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -6080,7 +6793,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         let crop_wide = |plane: &PlaneBuf| -> Vec<u8> {
             let mut out = Vec::with_capacity(plane.true_width * plane.true_height);
             for row in 0..plane.true_height {
-                out.extend_from_slice(&plane.data[row * plane.width..][..plane.true_width]);
+                out.extend(plane.data[row * plane.width..][..plane.true_width].iter().map(|&s| s as u8));
             }
             out
         };
@@ -6117,10 +6830,10 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
             result_cdfs,
         ));
     }
-    let crop = |plane: &PlaneBuf, w: usize, h: usize| -> Vec<u8> {
+    let crop = |plane: &PlaneBuf, w: usize, h: usize| -> Vec<u16> {
         let mut out = Vec::with_capacity(w * h);
         for row in 0..h {
-            out.extend_from_slice(&plane.data[row * plane.width..][..w]);
+            out.extend(plane.data[row * plane.width..][..w].iter().copied());
         }
         out
     };
@@ -6146,7 +6859,11 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                 static IDX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
                 let idx = IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 if let Ok(mut f) = std::fs::File::create(format!("{path}.f{idx}")) {
-                    let _ = f.write_all(&yc);
+                    // corner-cut: this diagnostic dump stays 8-bit-narrowed
+                    // regardless of the stream's real bit depth (debug-only,
+                    // never read by a gate); widen if a >8-bit margin dump
+                    // is ever needed.
+                    let _ = f.write_all(&yc.iter().map(|&s| s as u8).collect::<Vec<u8>>());
                 }
             }
             Some(Picture {
@@ -6379,7 +7096,7 @@ impl PlaneBuf {
         x: usize,
         y: usize,
         side: usize,
-        prediction: &[u8],
+        prediction: &[u16],
         residual: &[i32],
     ) {
         self.reconstruct_mc_rect(x, y, side, side, side, prediction, residual);
@@ -6400,13 +7117,13 @@ impl PlaneBuf {
         side: usize,
         w: usize,
         h: usize,
-        prediction: &[u8],
+        prediction: &[u16],
         residual: &[i32],
     ) {
         for row in 0..h {
             for col in 0..w {
                 let sample = (i32::from(prediction[row * side + col]) + residual[row * side + col])
-                    .clamp(0, 255) as u8;
+                    .clamp(0, crate::decode::sample_max()) as u16;
                 self.data[(y + row) * self.width + x + col] = sample;
             }
         }
@@ -6432,7 +7149,7 @@ fn read_inter_plane(
     y: usize,
     side: usize,
     base_q_idx: u8,
-    prediction: &[u8],
+    prediction: &[u16],
     // lane-chromau: this block's own luma transform's *actual coded*
     // `tx_type` -- `av1_get_tx_type` (libaom `blockd.h`): an inter block's
     // chroma plane never codes its own `tx_type` symbol, but (unlike an
@@ -6462,6 +7179,7 @@ fn read_inter_plane(
         skip_ctx,
         dc_sign_ctx(around.2),
         default_tx_type,
+        None,
     )?;
     let residual = dequant_and_inverse_typed(&grid, side, 8, CURRENT_Q_IDX.with(|c| c.get()), tx_type);
     plane.reconstruct_mc(x, y, side, prediction, &residual);
@@ -6863,8 +7581,8 @@ fn obmc_neighbour_pred(
     luma: bool,
     h_kind: mc::InterpFilterKind,
     v_kind: mc::InterpFilterKind,
-) -> Vec<u8> {
-    let mut out = vec![0u8; w * h];
+) -> Vec<u16> {
+    let mut out = vec![0u16; w * h];
     mc::predict_with_filters(
         &refplane.data,
         refplane.width,
@@ -6911,7 +7629,7 @@ fn interintra_blend(
     side: usize,
     ii_mode: u8,
     wedge: Option<(&'static [u8], usize)>,
-    pred: &mut [u8],
+    pred: &mut [u16],
 ) {
     // `interintra_to_intra_mode`: II_DC/II_V/II_H/II_SMOOTH.
     let intra_mode = match ii_mode {
@@ -6929,7 +7647,7 @@ fn interintra_blend(
             below_left: false,
         },
     );
-    let mut intra = vec![0u8; side * side];
+    let mut intra = vec![0u16; side * side];
     // Edge filtering never applies here: V/H at delta 0 are plain edge
     // copies (angle 90/180 skip the directional walk), DC/SMOOTH carry no
     // angle at all.
@@ -6973,33 +7691,33 @@ fn interintra_blend(
             });
             let idx = i * side + j;
             pred[idx] =
-                ((m * u32::from(intra[idx]) + (64 - m) * u32::from(pred[idx]) + 32) >> 6) as u8;
+                ((m * u32::from(intra[idx]) + (64 - m) * u32::from(pred[idx]) + 32) >> 6) as u16;
         }
     }
 }
 
-fn obmc_blend_v(dst: &mut [u8], stride: usize, ox: usize, oy: usize, w: usize, h: usize, tmp: &[u8]) {
+fn obmc_blend_v(dst: &mut [u16], stride: usize, ox: usize, oy: usize, w: usize, h: usize, tmp: &[u16]) {
     let mask = obmc_mask(h);
     for row in 0..h {
         let m = u32::from(mask[row]);
         for col in 0..w {
             let d = &mut dst[(oy + row) * stride + ox + col];
             let t = u32::from(tmp[row * w + col]);
-            *d = ((m * u32::from(*d) + (64 - m) * t + 32) >> 6) as u8;
+            *d = ((m * u32::from(*d) + (64 - m) * t + 32) >> 6) as u16;
         }
     }
 }
 
 /// Blends `tmp` into `dst` at `(ox, oy)`, mask varying by column (the
 /// left-neighbour pass, `aom_blend_a64_hmask`).
-fn obmc_blend_h(dst: &mut [u8], stride: usize, ox: usize, oy: usize, w: usize, h: usize, tmp: &[u8]) {
+fn obmc_blend_h(dst: &mut [u16], stride: usize, ox: usize, oy: usize, w: usize, h: usize, tmp: &[u16]) {
     let mask = obmc_mask(w);
     for row in 0..h {
         for col in 0..w {
             let m = u32::from(mask[col]);
             let d = &mut dst[(oy + row) * stride + ox + col];
             let t = u32::from(tmp[row * w + col]);
-            *d = ((m * u32::from(*d) + (64 - m) * t + 32) >> 6) as u8;
+            *d = ((m * u32::from(*d) + (64 - m) * t + 32) >> 6) as u16;
         }
     }
 }
@@ -7038,9 +7756,9 @@ fn obmc_blend(
     ref_v: &PlaneBuf,
     other_refs: &RefSlots,
     interp_fixed: Option<mc::InterpFilterKind>,
-    pred_y: &mut [u8],
-    pred_u: &mut [u8],
-    pred_v: &mut [u8],
+    pred_y: &mut [u16],
+    pred_u: &mut [u16],
+    pred_v: &mut [u16],
 ) -> Result<()> {
     // lane-rect r2 (libaom av1_build_obmc_inter_prediction): each pass has
     // its OWN neighbour cap (width-log2 for above, height-log2 for left) and
@@ -8119,7 +8837,7 @@ fn decode_inter_block(
                 v_filter,
                 &mut inter1_y,
             );
-            let mut pred_y = vec![0u8; side * side];
+            let mut pred_y = vec![0u16; side * side];
             let mut diffwtd_mask_y = Vec::new();
             // lane-wedge r3: `mask_y` is the DIFFWTD buffer just computed OR
             // the wedge codebook lookup (comp_group_idx==1's two mutually
@@ -8168,7 +8886,7 @@ fn decode_inter_block(
                 v_filter,
                 &mut inter1_u,
             );
-            let mut pred_u = vec![0u8; chroma_side * chroma_side];
+            let mut pred_u = vec![0u16; chroma_side * chroma_side];
             if let Some(mask_y) = mask_y {
                 mc::blend_masked_compound(
                     &inter0_u,
@@ -8212,7 +8930,7 @@ fn decode_inter_block(
                 v_filter,
                 &mut inter1_v,
             );
-            let mut pred_v = vec![0u8; chroma_side * chroma_side];
+            let mut pred_v = vec![0u16; chroma_side * chroma_side];
             if let Some(mask_y) = mask_y {
                 mc::blend_masked_compound(
                     &inter0_v,
@@ -8782,9 +9500,9 @@ fn decode_inter_block(
                 ));
             }
 
-            let mut pred_y = vec![0u8; side * side];
-            let mut pred_u = vec![0u8; chroma_side * chroma_side];
-            let mut pred_v = vec![0u8; chroma_side * chroma_side];
+            let mut pred_y = vec![0u16; side * side];
+            let mut pred_u = vec![0u16; chroma_side * chroma_side];
+            let mut pred_v = vec![0u16; chroma_side * chroma_side];
             if luma_scale == mc::REF_NO_SCALE {
                 mc::predict_with_filters(
                     &py_ref.data,
@@ -9642,7 +10360,7 @@ fn decode_inter_block8(
                     Regular,
                     &mut inter1_y,
                 );
-                let mut pred_y = vec![0u8; SIDE * SIDE];
+                let mut pred_y = vec![0u16; SIDE * SIDE];
                 let mut diffwtd_mask_y = Vec::new();
                 let mask_y: Option<&[u8]> = if let Some(mask_type) = diffwtd_mask_type {
                     diffwtd_mask_y = vec![0u8; SIDE * SIDE];
@@ -9687,7 +10405,7 @@ fn decode_inter_block8(
                     Regular,
                     &mut inter1_u,
                 );
-                let mut pred_u = vec![0u8; CHROMA_SIDE * CHROMA_SIDE];
+                let mut pred_u = vec![0u16; CHROMA_SIDE * CHROMA_SIDE];
                 if let Some(mask_y) = mask_y {
                     mc::blend_masked_compound(
                         &inter0_u,
@@ -9731,7 +10449,7 @@ fn decode_inter_block8(
                     Regular,
                     &mut inter1_v,
                 );
-                let mut pred_v = vec![0u8; CHROMA_SIDE * CHROMA_SIDE];
+                let mut pred_v = vec![0u16; CHROMA_SIDE * CHROMA_SIDE];
                 if let Some(mask_y) = mask_y {
                     mc::blend_masked_compound(
                         &inter0_v,
@@ -9998,7 +10716,7 @@ fn decode_inter_block8(
         }
         mode_for_tx = 0;
 
-        let mut pred_y = vec![0u8; SIDE * SIDE];
+        let mut pred_y = vec![0u16; SIDE * SIDE];
         mc::predict(
             &ref_y.data,
             ref_y.width,
@@ -10010,7 +10728,7 @@ fn decode_inter_block8(
             SIDE,
             &mut pred_y,
         );
-        let mut pred_u = vec![0u8; CHROMA_SIDE * CHROMA_SIDE];
+        let mut pred_u = vec![0u16; CHROMA_SIDE * CHROMA_SIDE];
         mc::predict(
             &ref_u.data,
             ref_u.width,
@@ -10022,7 +10740,7 @@ fn decode_inter_block8(
             CHROMA_SIDE,
             &mut pred_u,
         );
-        let mut pred_v = vec![0u8; CHROMA_SIDE * CHROMA_SIDE];
+        let mut pred_v = vec![0u16; CHROMA_SIDE * CHROMA_SIDE];
         mc::predict(
             &ref_v.data,
             ref_v.width,
@@ -10502,7 +11220,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     let (width, height) = (cols as usize * BLOCK, rows as usize * BLOCK);
 
     let ref_y = PlaneBuf {
-        data: reference.y.clone(),
+        data: reference.y.iter().map(|&s| s as u16).collect(),
         width: reference.width,
         height: reference.height,
         true_width: reference.width,
@@ -10513,7 +11231,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         tile_y1: reference.height,
     };
     let ref_u = PlaneBuf {
-        data: reference.u.clone(),
+        data: reference.u.iter().map(|&s| s as u16).collect(),
         width: reference.width / 2,
         height: reference.height / 2,
         true_width: reference.width / 2,
@@ -10524,7 +11242,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         tile_y1: reference.height / 2,
     };
     let ref_v = PlaneBuf {
-        data: reference.v.clone(),
+        data: reference.v.iter().map(|&s| s as u16).collect(),
         width: reference.width / 2,
         height: reference.height / 2,
         true_width: reference.width / 2,
@@ -10547,7 +11265,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
             .map(|g| {
                 (
                     PlaneBuf {
-                        data: g.y.clone(),
+                        data: g.y.iter().map(|&s| s as u16).collect(),
                         width: g.width,
                         height: g.height,
                         true_width: g.width,
@@ -10558,7 +11276,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                         tile_y1: g.height,
                     },
                     PlaneBuf {
-                        data: g.u.clone(),
+                        data: g.u.iter().map(|&s| s as u16).collect(),
                         width: g.width / 2,
                         height: g.height / 2,
                         true_width: g.width / 2,
@@ -10569,7 +11287,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                         tile_y1: g.height / 2,
                     },
                     PlaneBuf {
-                        data: g.v.clone(),
+                        data: g.v.iter().map(|&s| s as u16).collect(),
                         width: g.width / 2,
                         height: g.height / 2,
                         true_width: g.width / 2,
@@ -10586,7 +11304,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         std::array::from_fn(|i| owned_refs[i].as_ref().map(|(a, b, c)| (a, b, c)));
 
     let mut y = PlaneBuf {
-        data: vec![0u8; width * height],
+        data: vec![0u16; width * height],
         width,
         height,
         true_width,
@@ -10597,7 +11315,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         tile_y1: height,
     };
     let mut u = PlaneBuf {
-        data: vec![0u8; width * height / 4],
+        data: vec![0u16; width * height / 4],
         width: width / 2,
         height: height / 2,
         true_width: true_width / 2,
@@ -10608,7 +11326,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         tile_y1: height / 2,
     };
     let mut v = PlaneBuf {
-        data: vec![0u8; width * height / 4],
+        data: vec![0u16; width * height / 4],
         width: width / 2,
         height: height / 2,
         true_width: true_width / 2,
@@ -11967,9 +12685,10 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         use std::io::Write;
         let idx = PREFILT_PICTURE_IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if let Ok(mut f) = std::fs::File::create(format!("{path}.f{idx}")) {
-            let _ = f.write_all(&y.data);
-            let _ = f.write_all(&u.data);
-            let _ = f.write_all(&v.data);
+            let narrow = |p: &PlaneBuf| -> Vec<u8> { p.data.iter().map(|&s| s as u8).collect() };
+            let _ = f.write_all(&narrow(&y));
+            let _ = f.write_all(&narrow(&u));
+            let _ = f.write_all(&narrow(&v));
         }
     } else {
         PREFILT_PICTURE_IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -12010,10 +12729,10 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
             motion_field,
         ));
     }
-    let crop = |plane: &PlaneBuf, w: usize, h: usize| -> Vec<u8> {
+    let crop = |plane: &PlaneBuf, w: usize, h: usize| -> Vec<u16> {
         let mut out = Vec::with_capacity(w * h);
         for row in 0..h {
-            out.extend_from_slice(&plane.data[row * plane.width..][..w]);
+            out.extend(plane.data[row * plane.width..][..w].iter().copied());
         }
         out
     };
@@ -12139,10 +12858,10 @@ mod tests {
     /// planes are byte-exact against the encoder's own reconstruction.
     fn round_trips(w: usize, h: usize, modes: &[u8]) {
         use crate::encode::{Encoded, Picture as Pic};
-        let mut source = vec![0u8; w * h];
+        let mut source = vec![0u16; w * h];
         for row in 0..h {
             for col in 0..w {
-                source[row * w + col] = ((row * 3 + col * 5) % 251) as u8;
+                source[row * w + col] = ((row * 3 + col * 5) % 251) as u16;
             }
         }
         let picture = Pic {
@@ -12357,9 +13076,9 @@ mod tests {
         Picture {
             width,
             height,
-            y: out.stdout[..luma].to_vec(),
-            u: out.stdout[luma..luma + chroma].to_vec(),
-            v: out.stdout[luma + chroma..].to_vec(),
+            y: out.stdout[..luma].iter().map(|&v| u16::from(v)).collect(),
+            u: out.stdout[luma..luma + chroma].iter().map(|&v| u16::from(v)).collect(),
+            v: out.stdout[luma + chroma..].iter().map(|&v| u16::from(v)).collect(),
         }
     }
 
@@ -12405,9 +13124,9 @@ mod tests {
                 Picture {
                     width,
                     height,
-                    y: out.stdout[base..base + luma].to_vec(),
-                    u: out.stdout[base + luma..base + luma + chroma].to_vec(),
-                    v: out.stdout[base + luma + chroma..base + frame_bytes].to_vec(),
+                    y: out.stdout[base..base + luma].iter().map(|&v| u16::from(v)).collect(),
+                    u: out.stdout[base + luma..base + luma + chroma].iter().map(|&v| u16::from(v)).collect(),
+                    v: out.stdout[base + luma + chroma..base + frame_bytes].iter().map(|&v| u16::from(v)).collect(),
                 }
             })
             .collect()
@@ -12498,14 +13217,14 @@ mod tests {
         let mut picture = crate::encode::Picture::grey(width, height);
         for row in 0..height {
             for col in 0..width {
-                picture.y[row * width + col] = ((row * 7 + col * 11) % 251) as u8;
+                picture.y[row * width + col] = ((row * 7 + col * 11) % 251) as u16;
             }
         }
         for row in 0..height / 2 {
             for col in 0..width / 2 {
                 let i = row * width / 2 + col;
-                picture.u[i] = (100 + (col * 60 / (width / 2).max(1))) as u8;
-                picture.v[i] = (200 - (row * 80 / (height / 2).max(1))) as u8;
+                picture.u[i] = (100 + (col * 60 / (width / 2).max(1))) as u16;
+                picture.v[i] = (200 - (row * 80 / (height / 2).max(1))) as u16;
             }
         }
         picture
@@ -12517,15 +13236,15 @@ mod tests {
             for x in 0..width {
                 let sx = (x as i64 - shift).rem_euclid(width as i64) as f64;
                 let gradient = sx * 200.0 / width as f64;
-                picture.y[y * width + x] = (20.0 + gradient).clamp(0.0, 255.0) as u8;
+                picture.y[y * width + x] = (20.0 + gradient).clamp(0.0, 255.0) as u16;
             }
         }
         for y in 0..height / 2 {
             for x in 0..width / 2 {
                 let sx = (x as i64 - shift / 2).rem_euclid((width / 2) as i64) as usize;
                 let i = y * width / 2 + x;
-                picture.u[i] = (100 + (sx * 60 / (width / 2))) as u8;
-                picture.v[i] = (200 - (y * 80 / (height / 2))) as u8;
+                picture.u[i] = (100 + (sx * 60 / (width / 2))) as u16;
+                picture.v[i] = (200 - (y * 80 / (height / 2))) as u16;
             }
         }
         picture
@@ -12698,7 +13417,7 @@ mod tests {
         let data = enc.finish();
 
         let (width, height) = (64usize, 64usize);
-        let ref_pattern: Vec<u8> = (0..width * height).map(|i| (i % 251) as u8).collect();
+        let ref_pattern: Vec<u16> = (0..width * height).map(|i| (i % 251) as u16).collect();
         let ref_plane = |scale: usize| PlaneBuf {
             data: ref_pattern
                 .iter()
@@ -12730,7 +13449,7 @@ mod tests {
         let ref_v = ref_plane(2);
 
         let mut y = PlaneBuf {
-            data: vec![0u8; width * height],
+            data: vec![0u16; width * height],
             width,
             height,
             true_width: width,
@@ -12741,7 +13460,7 @@ mod tests {
             tile_y1: height,
         };
         let mut u = PlaneBuf {
-            data: vec![0u8; (width / 2) * (height / 2)],
+            data: vec![0u16; (width / 2) * (height / 2)],
             width: width / 2,
             height: height / 2,
             true_width: width / 2,
@@ -12752,7 +13471,7 @@ mod tests {
             tile_y1: height / 2,
         };
         let mut v = PlaneBuf {
-            data: vec![0u8; (width / 2) * (height / 2)],
+            data: vec![0u16; (width / 2) * (height / 2)],
             width: width / 2,
             height: height / 2,
             true_width: width / 2,
@@ -12818,7 +13537,7 @@ mod tests {
         .unwrap();
 
         let (px, py) = (c * SUB, r * SUB);
-        let mut want_near = vec![0u8; side * side];
+        let mut want_near = vec![0u16; side * side];
         crate::mc::predict(
             &ref_y.data,
             ref_y.width,
@@ -12830,7 +13549,7 @@ mod tests {
             side,
             &mut want_near,
         );
-        let mut want_nearest = vec![0u8; side * side];
+        let mut want_nearest = vec![0u16; side * side];
         crate::mc::predict(
             &ref_y.data,
             ref_y.width,
@@ -12847,7 +13566,7 @@ mod tests {
             "test setup: the two candidate MVs must predict differently"
         );
 
-        let mut got = vec![0u8; side * side];
+        let mut got = vec![0u16; side * side];
         for row in 0..side {
             got[row * side..(row + 1) * side].copy_from_slice(
                 &y.data[(py + row) * y.width + px..(py + row) * y.width + px + side],

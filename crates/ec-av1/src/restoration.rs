@@ -454,8 +454,8 @@ fn round2(value: i64, shift: u32) -> i64 {
 /// boundaries do.
 #[allow(clippy::too_many_arguments)]
 fn lr_sample(
-    cdef: &[u8],
-    deblocked: &[u8],
+    cdef: &[u16],
+    deblocked: &[u16],
     stride: usize,
     plane_w: usize,
     plane_h: usize,
@@ -512,9 +512,9 @@ fn lr_sample(
 /// reproduces the same output byte-for-byte.
 #[allow(clippy::too_many_arguments)]
 fn apply_wiener_stripe(
-    out: &mut [u8],
-    cdef: &[u8],
-    deblocked: &[u8],
+    out: &mut [u16],
+    cdef: &[u16],
+    deblocked: &[u16],
     stride: usize,
     plane_w: usize,
     plane_h: usize,
@@ -551,7 +551,7 @@ fn apply_wiener_stripe(
             for (t, &tap) in info.vfilter.iter().enumerate() {
                 sum += tap as i64 * inter[(r + t) * w + c] as i64;
             }
-            out[(v_start + r) * stride + h_start + c] = round2(sum, 11).clamp(0, 255) as u8;
+            out[(v_start + r) * stride + h_start + c] = round2(sum, 11).clamp(0, crate::decode::sample_max() as i64) as u16;
         }
     }
 }
@@ -613,8 +613,8 @@ const SGRPROJ_RST_BITS: u32 = 4;
 /// reproduces the same values without porting the sliding-window trick.
 #[allow(clippy::too_many_arguments)]
 fn compute_ab(
-    cdef: &[u8],
-    deblocked: &[u8],
+    cdef: &[u16],
+    deblocked: &[u16],
     stride: usize,
     plane_w: usize,
     plane_h: usize,
@@ -676,9 +676,9 @@ fn compute_ab(
 /// combined with the decoded `xqd` weights via `av1_decode_xq`.
 #[allow(clippy::too_many_arguments)]
 fn apply_sgrproj_stripe(
-    out: &mut [u8],
-    cdef: &[u8],
-    deblocked: &[u8],
+    out: &mut [u16],
+    cdef: &[u16],
+    deblocked: &[u16],
     stride: usize,
     plane_w: usize,
     plane_h: usize,
@@ -807,7 +807,7 @@ fn apply_sgrproj_stripe(
                     );
                 }
             }
-            let out_v = round2(v, SGRPROJ_PRJ_BITS as u32 + SGRPROJ_RST_BITS).clamp(0, 255) as u8;
+            let out_v = round2(v, SGRPROJ_PRJ_BITS as u32 + SGRPROJ_RST_BITS).clamp(0, crate::decode::sample_max() as i64) as u16;
             out[(v_start as i64 + i) as usize * stride + (h_start as i64 + j) as usize] = out_v;
         }
     }
@@ -822,9 +822,9 @@ fn apply_sgrproj_stripe(
 /// [`lr_sample`].
 #[allow(clippy::too_many_arguments)]
 fn filter_restoration_unit(
-    out: &mut [u8],
-    cdef: &[u8],
-    deblocked: &[u8],
+    out: &mut [u16],
+    cdef: &[u16],
+    deblocked: &[u16],
     stride: usize,
     plane_w: usize,
     plane_h: usize,
@@ -872,8 +872,8 @@ fn filter_restoration_unit(
 /// place.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_loop_restoration_plane(
-    cdef: &[u8],
-    deblocked: &[u8],
+    cdef: &[u16],
+    deblocked: &[u16],
     stride: usize,
     plane_w: usize,
     plane_h: usize,
@@ -882,7 +882,7 @@ pub(crate) fn apply_loop_restoration_plane(
     unit_size: u32,
     grid: &RestorationGrid,
     plane: usize,
-) -> Vec<u8> {
+) -> Vec<u16> {
     let mut out = cdef.to_vec();
     if ftype == RestorationType::None || unit_size == 0 {
         return out;

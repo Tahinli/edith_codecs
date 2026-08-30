@@ -266,6 +266,20 @@ pub const EOB_PT_128_CHROMA_Q3: [u16; 9] = [
     24313, 26062, 28385, 30107, 31217, 31898, 32345, 32768, 0,
 ];
 
+/// `av1_default_eob_multi512_cdfs[*][1][*]` (`token_cdfs.h:874-901`,
+/// lane-sbpart): the end-of-block group of a CHROMA transform with 512 coded
+/// positions -- what a 32x16/16x32 chroma transform has (the chroma plane of
+/// an intra `PARTITION_HORZ`/`VERT` 64x32/32x64 superblock strip, whose luma
+/// coefficients truncate to the 64x64-superblock's own 32x32 corner-scan
+/// (`TxbSet::Luma64`) but whose *chroma* plane, at 32x16, is small enough
+/// that no truncation applies). Unlike every other `EOB_PT_*` table here,
+/// libaom's default is the exact same flat distribution at all four
+/// q-contexts and both `eob_multi_size` selectors (`token_cdfs.h` rows), so
+/// one constant covers every q-context -- no `_Q0`/`_Q1`/`_Q3` siblings.
+pub const EOB_PT_512_CHROMA: [u16; 11] = [
+    3277, 6554, 9830, 13107, 16384, 19661, 22938, 26214, 29491, 32768, 0,
+];
+
 /// `Default_Dc_Sign_Cdf[2][0]` (spec 9.4): the sign of a luma DC coefficient,
 /// indexed by whether the neighbouring blocks' DC signs lean negative (1),
 /// positive (2) or neither (0).
@@ -742,6 +756,33 @@ pub const EOB_EXTRA_LUMA_32: [[u16; 3]; 9] = [
 pub const NZ_MAP_CTX_OFFSET_32: [[u8; 5]; 5] = [
     [0, 1, 6, 6, 21],
     [1, 6, 6, 21, 21],
+    [6, 6, 21, 21, 21],
+    [6, 21, 21, 21, 21],
+    [21, 21, 21, 21, 21],
+];
+
+/// `Av1_Nz_Map_Ctx_Offset[TX_32X64]` (libaom `txb_common.c`
+/// `av1_nz_map_ctx_offset_32x64`, row and column clamped to four): the real
+/// 32-wide/64-tall transform's own table, used when a superblock-level
+/// `PARTITION_VERT` strip's luma corner is read through [`NZ_MAP_CTX_OFFSET_32`]'s
+/// scan/CDF-set but the *un-adjusted* block shape (spec `get_txsize_entropy_ctx`
+/// resolves the CDF *set* to `TX_64X64`, but `get_nz_map_ctx_from_stats` still
+/// indexes this position table by the raw, un-adjusted `tx_size` -- lane-sbpart
+/// r8 root cause) is genuinely rectangular, not square. Distinct from
+/// [`NZ_MAP_CTX_OFFSET_32`] starting at `(row=1, col=0)`.
+pub const NZ_MAP_CTX_OFFSET_32X64: [[u8; 5]; 5] = [
+    [0, 11, 6, 6, 21],
+    [11, 11, 6, 21, 21],
+    [11, 11, 21, 21, 21],
+    [11, 11, 21, 21, 21],
+    [11, 11, 21, 21, 21],
+];
+
+/// [`NZ_MAP_CTX_OFFSET_32X64`]'s `TX_64X32` counterpart (libaom
+/// `av1_nz_map_ctx_offset_64x32`): a `PARTITION_HORZ` strip's luma corner.
+pub const NZ_MAP_CTX_OFFSET_64X32: [[u8; 5]; 5] = [
+    [0, 16, 16, 16, 16],
+    [16, 16, 16, 16, 16],
     [6, 6, 21, 21, 21],
     [6, 21, 21, 21, 21],
     [21, 21, 21, 21, 21],
