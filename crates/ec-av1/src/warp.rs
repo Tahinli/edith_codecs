@@ -104,8 +104,13 @@ pub fn gm_get_motion_vector(
             params[1] >> GM_TRANS_ONLY_PREC_DIFF,
         ),
         WarpModel::Rotzoom | WarpModel::Affine => {
-            let x = (mi_col * MI_SIZE as usize + (bw4 * MI_SIZE as usize) / 2) as i64;
-            let y = (mi_row * MI_SIZE as usize + (bh4 * MI_SIZE as usize) / 2) as i64;
+            // `block_center_x`/`block_center_y` (mv.h:183-191): `- 1`, not
+            // just the halved block size -- lane-gm r3's root cause, missing
+            // here made every ROTZOOM/AFFINE GLOBALMV prediction off by a
+            // sub-pel fraction (small luma delta growing across P-frames as
+            // it propagates through the reference chain).
+            let x = (mi_col * MI_SIZE as usize + (bw4 * MI_SIZE as usize) / 2) as i64 - 1;
+            let y = (mi_row * MI_SIZE as usize + (bh4 * MI_SIZE as usize) / 2) as i64 - 1;
             let xc = (params[2] as i64 - (1i64 << WARPEDMODEL_PREC_BITS)) * x
                 + params[3] as i64 * y
                 + params[0] as i64;
