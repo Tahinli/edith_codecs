@@ -92,6 +92,11 @@ thread_local! {
 pub(crate) fn sample_max() -> i32 {
     (1i32 << BIT_DEPTH.with(std::cell::Cell::get)) - 1
 }
+/// The current stream's bit depth, for callers (e.g. dequant) that need the
+/// raw value rather than the derived clamp bound.
+pub(crate) fn bit_depth() -> u8 {
+    BIT_DEPTH.with(std::cell::Cell::get)
+}
 /// Sets [`BIT_DEPTH`] for the current thread, called once per frame from
 /// [`crate::stream`]'s decode loop.
 pub(crate) fn set_bit_depth(bit_depth: u8) {
@@ -3210,7 +3215,7 @@ fn decode_block_rect(
             &luma_levels,
             bw,
             bh,
-            8,
+            crate::decode::bit_depth(),
             CURRENT_Q_IDX.with(|c| c.get()),
             luma_tx_type,
         );
@@ -3249,7 +3254,7 @@ fn decode_block_rect(
             &u_levels,
             chroma_w,
             chroma_h,
-            8,
+            crate::decode::bit_depth(),
             CURRENT_Q_IDX.with(|c| c.get()),
             u_tx_type,
         );
@@ -3287,7 +3292,7 @@ fn decode_block_rect(
             &v_levels,
             chroma_w,
             chroma_h,
-            8,
+            crate::decode::bit_depth(),
             CURRENT_Q_IDX.with(|c| c.get()),
             v_tx_type,
         );
@@ -3498,7 +3503,7 @@ fn decode_block_rect64(
             &luma_levels,
             bw,
             bh,
-            8,
+            crate::decode::bit_depth(),
             i32::from(base_q_idx),
             luma_tx_type,
         );
@@ -3543,7 +3548,7 @@ fn decode_block_rect64(
             &u_levels,
             chroma_w,
             chroma_h,
-            8,
+            crate::decode::bit_depth(),
             i32::from(base_q_idx),
             u_tx_type,
         );
@@ -3584,7 +3589,7 @@ fn decode_block_rect64(
             &v_levels,
             chroma_w,
             chroma_h,
-            8,
+            crate::decode::bit_depth(),
             i32::from(base_q_idx),
             v_tx_type,
         );
@@ -4305,7 +4310,7 @@ fn read_plane(
         }
         full
     };
-    let residual = dequant_and_inverse_typed(&levels, side, 8, CURRENT_Q_IDX.with(|c| c.get()), tx_type);
+    let residual = dequant_and_inverse_typed(&levels, side, bit_depth(), CURRENT_Q_IDX.with(|c| c.get()), tx_type);
     if std::env::var_os("EC_AV1_TRACE").is_some() {
         eprintln!(
             "TRACE dequant plane={plane_idx} base_q_idx={base_q_idx} tx_type={tx_type:?} side={side} levels={levels:?} residual={residual:?}",
@@ -5509,7 +5514,10 @@ fn deblock_thresholds(level: i32, sharpness: u8) -> (i32, i32, i32) {
 }
 
 fn sclamp(v: i32) -> i32 {
-    v.clamp(-128, 127)
+    // libaom's `signed_char_clamp_high`: the clamp range scales with
+    // `128 << (bit_depth - 8)` alongside the centering constant below.
+    let scale = 1i32 << (bit_depth() - 8);
+    v.clamp(-128 * scale, 128 * scale - 1)
 }
 
 fn round_pow2(v: i32, n: u32) -> i32 {
@@ -5523,16 +5531,17 @@ fn filter4(mask: bool, thresh: i32, p1: i32, p0: i32, q0: i32, q1: i32) -> [i32;
         return [p1, p0, q0, q1];
     }
     let hev = (p1 - p0).abs() > thresh || (q1 - q0).abs() > thresh;
-    let (ps1, ps0, qs0, qs1) = (p1 - 128, p0 - 128, q0 - 128, q1 - 128);
+    let centre = 128i32 << (bit_depth() - 8);
+    let (ps1, ps0, qs0, qs1) = (p1 - centre, p0 - centre, q0 - centre, q1 - centre);
     let outer = if hev { sclamp(ps1 - qs1) } else { 0 };
     let filter = sclamp(outer + 3 * (qs0 - ps0));
     let filter1 = sclamp(filter + 4) >> 3;
     let filter2 = sclamp(filter + 3) >> 3;
-    let oq0 = sclamp(qs0 - filter1) + 128;
-    let op0 = sclamp(ps0 + filter2) + 128;
+    let oq0 = sclamp(qs0 - filter1) + centre;
+    let op0 = sclamp(ps0 + filter2) + centre;
     let tap = if hev { 0 } else { round_pow2(filter1, 1) };
-    let oq1 = sclamp(qs1 - tap) + 128;
-    let op1 = sclamp(ps1 + tap) + 128;
+    let oq1 = sclamp(qs1 - tap) + centre;
+    let op1 = sclamp(ps1 + tap) + centre;
     [op1, op0, oq0, oq1]
 }
 
@@ -7178,7 +7187,7 @@ fn read_inter_plane(
         default_tx_type,
         None,
     )?;
-    let residual = dequant_and_inverse_typed(&grid, side, 8, CURRENT_Q_IDX.with(|c| c.get()), tx_type);
+    let residual = dequant_and_inverse_typed(&grid, side, bit_depth(), CURRENT_Q_IDX.with(|c| c.get()), tx_type);
     plane.reconstruct_mc(x, y, side, prediction, &residual);
     Ok((grid, tx_type))
 }
