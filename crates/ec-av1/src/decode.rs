@@ -5580,6 +5580,9 @@ fn assign_compound_mv(
     mode: u8,
     allow_high_precision_mv: bool,
     force_integer_mv: bool,
+    // lane-gm r2: `gm_get_motion_vector(ref0)`/`(ref1)` at this block's own
+    // position, spec 7.10.2.10's `GLOBAL_GLOBALMV` assignment.
+    global_mv: ((i32, i32), (i32, i32)),
 ) -> ((i32, i32), (i32, i32)) {
     const NEAREST_NEARESTMV: u8 = 0;
     const NEAR_NEARMV: u8 = 1;
@@ -5643,12 +5646,41 @@ fn assign_compound_mv(
         NEW_NEARESTMV => (read_new(dec, cdfs, new_pred.0), comp_stack.nearest_mv.1),
         NEAR_NEWMV => (near.0, read_new(dec, cdfs, new_pred.1)),
         NEW_NEARMV => (read_new(dec, cdfs, new_pred.0), near.1),
-        GLOBAL_GLOBALMV => ((0, 0), (0, 0)),
+        GLOBAL_GLOBALMV => global_mv,
         _ => (
             read_new(dec, cdfs, new_pred.0),
             read_new(dec, cdfs, new_pred.1),
         ),
     }
+}
+
+/// Derives this query block's own [`crate::mvstack::GmMvTable`] -- one
+/// `gm_get_motion_vector` (spec 7.10.2.1) result per reference frame, at
+/// THIS block's own `(mi_row, mi_col, bw4, bh4)` (mvstack.rs's own doc: the
+/// table is always computed at the *querying* block's position, never a
+/// donating neighbour's).
+fn build_gm_mv_table(
+    global_motion: &[ec_av1_syntax::WarpParams; 7],
+    mi_row: usize,
+    mi_col: usize,
+    bw4: usize,
+    bh4: usize,
+    allow_high_precision_mv: bool,
+    force_integer_mv: bool,
+) -> crate::mvstack::GmMvTable {
+    std::array::from_fn(|i| {
+        let gm = &global_motion[i];
+        crate::warp::gm_get_motion_vector(
+            gm.model,
+            &gm.params,
+            mi_row,
+            mi_col,
+            bw4,
+            bh4,
+            allow_high_precision_mv,
+            force_integer_mv,
+        )
+    })
 }
 
 /// Decodes one square inter-frame block (32x32 whole or 16x16 leaf): skip,
@@ -5690,6 +5722,11 @@ fn decode_inter_block(
     // GOP), matching `GOLDEN_FRAME`'s existing empty-slot refusal below.
     other_refs: &RefSlots,
     sign_bias_table: &SignBiasTable,
+    // lane-gm r2: this frame header's own `global_motion` table (spec
+    // 5.9.24), indexed `[ref_frame - LAST_FRAME]` same as `sign_bias_table`
+    // -- feeds `warp::gm_get_motion_vector` for `GLOBALMV`/`GLOBAL_GLOBALMV`
+    // assignment and the mv-stack's neighbour substitution.
+    global_motion: &[ec_av1_syntax::WarpParams; 7],
     base_q_idx: u8,
     luma_set_intra: TxbSet,
     luma_set_inter: TxbSet,
@@ -5891,6 +5928,15 @@ fn decode_inter_block(
                 ),
                 allow_high_precision_mv,
             });
+            let gm_table = build_gm_mv_table(
+                global_motion,
+                mi_row,
+                mi_col,
+                bw4,
+                bh4,
+                allow_high_precision_mv,
+                force_integer_mv,
+            );
             let comp_stack = crate::mvstack::find_mv_stack_compound(
                 grid,
                 mi_row,
@@ -5901,6 +5947,7 @@ fn decode_inter_block(
                 mi_cols as usize,
                 mi_rows as usize,
                 sign_bias_table,
+                &gm_table,
                 comp_tpl,
             );
             let compound_mode = if skip_mode {
@@ -5915,8 +5962,15 @@ fn decode_inter_block(
                 compound_mode,
                 allow_high_precision_mv,
                 force_integer_mv,
+                (gm_table[(ref0 - LAST_FRAME) as usize], gm_table[(ref1 - LAST_FRAME) as usize]),
             );
             let is_globalmv = compound_mode == 6; // GLOBAL_GLOBALMV
+            // spec `is_nontrans_global_motion`: ALL active refs' models must
+            // be non-TRANSLATION (IDENTITY counts) for the compound block's
+            // interp-filter read to be suppressed.
+            let gm_nontrans = is_globalmv
+                && global_motion[(ref0 - LAST_FRAME) as usize].model != ec_av1_syntax::WarpModel::Translation
+                && global_motion[(ref1 - LAST_FRAME) as usize].model != ec_av1_syntax::WarpModel::Translation;
             let (py0, pu0, pv0) = ref_planes(ref0, ref_y, ref_u, ref_v, other_refs)?;
             let (py1, pu1, pv1) = ref_planes(ref1, ref_y, ref_u, ref_v, other_refs)?;
             // spec `get_ref_filter_type`: matches when EITHER of the
@@ -5963,6 +6017,17 @@ fn decode_inter_block(
                             is_new_mv: matches!(compound_mode, 2 | 3 | 4 | 5 | 7),
                             size: bw4,
                             size_h: bh4,
+                            // libaom `is_global_mv_block`: per-ref-slot, mode
+                            // GLOBAL_GLOBALMV, block >= 8x8, and THAT slot's
+                            // own gm model > TRANSLATION (IDENTITY excluded
+                            // too -- the two-predicate trap, distinct from
+                            // `gm_nontrans` above which allows IDENTITY).
+                            is_global_mv0: is_globalmv
+                                && bw4.min(bh4) >= 2
+                                && global_motion[(ref0 - LAST_FRAME) as usize].model as u8 > 1,
+                            is_global_mv1: is_globalmv
+                                && bw4.min(bh4) >= 2
+                                && global_motion[(ref1 - LAST_FRAME) as usize].model as u8 > 1,
                         },
                     );
                 }
@@ -6274,7 +6339,7 @@ fn decode_inter_block(
                 cdfs,
                 interp_fixed,
                 enable_dual_filter,
-                is_globalmv || skip_mode,
+                gm_nontrans || skip_mode,
                 above_filter_ctx,
                 left_filter_ctx,
                 true,
@@ -6566,6 +6631,15 @@ fn decode_inter_block(
                 ),
                 allow_high_precision_mv,
             });
+            let gm_table = build_gm_mv_table(
+                global_motion,
+                mi_row,
+                mi_col,
+                bw4,
+                bh4,
+                allow_high_precision_mv,
+                force_integer_mv,
+            );
             let stack = find_mv_stack_with_sign_bias(
                 grid,
                 mi_row,
@@ -6576,6 +6650,7 @@ fn decode_inter_block(
                 mi_cols as usize,
                 mi_rows as usize,
                 sign_bias_table,
+                &gm_table,
                 tpl,
             );
             let not_new = dec.symbol(&mut cdfs.new_mv[stack.new_mv_ctx]) == 1;
@@ -6610,11 +6685,9 @@ fn decode_inter_block(
                 let not_zero = dec.symbol(&mut cdfs.zero_mv[stack.zero_mv_ctx]) == 1;
                 is_globalmv = !not_zero;
                 let mv = if !not_zero {
-                    // GLOBALMV: `gm_get_motion_vector` (spec 7.10.2.1) under the
-                    // `GmType::IDENTITY` this crate's `decode_stream` requires of
-                    // every inter frame's `LAST_FRAME` entry (any other warp
-                    // model is refused before the tile decoder is ever called).
-                    (0, 0)
+                    // GLOBALMV: `gm_get_motion_vector` (spec 7.10.2.1), already
+                    // computed at this block's own position in `gm_table`.
+                    gm_table[(ref_frame - LAST_FRAME) as usize]
                 } else {
                     let nearest = dec.symbol(&mut cdfs.ref_mv[stack.ref_mv_ctx]) == 0;
                     if nearest {
@@ -6638,6 +6711,18 @@ fn decode_inter_block(
                 };
                 (mv, false)
             };
+            // lane-gm r2: the two libaom predicates single-ref GLOBALMV
+            // blocks need -- `is_global_mv_block` (blockd.h:421-429, mode
+            // GLOBAL* AND model > TRANSLATION AND min(bw,bh) >= 8px, gating
+            // `motion_mode_eligible`/`MiInfo::is_global_mv0` below) and
+            // `is_nontrans_global_motion` (reconinter.h:420-425, model !=
+            // TRANSLATION -- IDENTITY counts here -- gating the interp
+            // filter suppress below). Do NOT unify these.
+            let gm_model = global_motion[(ref_frame - LAST_FRAME) as usize].model;
+            let min_bw_bh4 = bw4.min(bh4);
+            let is_global_mv_block = is_globalmv && gm_model as u8 > 1 && min_bw_bh4 >= 2;
+            let gm_nontrans =
+                is_globalmv && gm_model != ec_av1_syntax::WarpModel::Translation && min_bw_bh4 >= 2;
             if std::env::var_os("EC_AV1_TELL").is_some() {
                 eprintln!(
                     "TELL mi_row={mi_row} mi_col={mi_col} label=post_assign_mv tell={} range={}",
@@ -6722,7 +6807,12 @@ fn decode_inter_block(
                 && interintra_mode.is_none()
                 && (!overlappable_above(grid, mi_row, mi_col, bw4, mi_cols as usize, 1).is_empty()
                     || !overlappable_left(grid, mi_row, mi_col, bh4, mi_rows as usize, 1)
-                        .is_empty());
+                        .is_empty())
+                // libaom `motion_mode_allowed`: a GLOBALMV block whose model
+                // is non-IDENTITY-non-TRANSLATION under free (non-integer)
+                // mv reads no motion_mode/obmc symbol at all -- implicit
+                // SIMPLE_TRANSLATION.
+                && !(is_global_mv_block && !force_integer_mv);
             let mut obmc_selected = false;
             // lane-warp round 2: `Some` when motion_mode == WARPED_CAUSAL
             // *and* the local warp estimate is valid (`!wm_params.invalid`,
@@ -6823,6 +6913,26 @@ fn decode_inter_block(
                     }
                 }
             }
+            // lane-gm r4: `allow_warp`'s `global_warp_allowed` branch
+            // (`reconinter.c:33-55`), gated INDEPENDENTLY of `motion_mode` --
+            // libaom's `av1_init_warp_params` runs for every inter
+            // predictor build, not just a `WARPED_CAUSAL`-selected one. Only
+            // reachable when `warp_params` is still `None` here: a block
+            // that read (and got) local `WARPED_CAUSAL` above already has
+            // `local_warp_allowed && !wm_params.invalid`, which `allow_warp`
+            // checks FIRST and short-circuits on -- the global branch is an
+            // `else if`, never layered on top. `is_global_mv_block` already
+            // encodes `allow_warp`'s size bound (`min(bw4,bh4) >= 2`, i.e.
+            // >=8px both dims, matching `av1_init_warp_params`'s
+            // `block_height < 8 || block_width < 8` early return) and, via
+            // `motion_mode_eligible`'s own suppression above, the
+            // `force_integer_mv` case never reads a motion_mode symbol at
+            // all -- checked again here directly since this branch fires
+            // independent of `motion_mode_eligible`.
+            let gm_ref = &global_motion[(ref_frame - LAST_FRAME) as usize];
+            if warp_params.is_none() && is_global_mv_block && !force_integer_mv && !gm_ref.invalid {
+                warp_params = crate::warp::global_warp_params(gm_ref.params);
+            }
             if std::env::var_os("EC_AV1_TELL").is_some() {
                 eprintln!(
                     "TELL mi_row={mi_row} mi_col={mi_col} label=post_motion_mode eligible={} tell={} range={}",
@@ -6859,7 +6969,7 @@ fn decode_inter_block(
                 cdfs,
                 interp_fixed,
                 enable_dual_filter,
-                is_globalmv || warped_selected,
+                gm_nontrans || warped_selected,
                 above_filter_ctx,
                 left_filter_ctx,
                 false,
@@ -6901,6 +7011,8 @@ fn decode_inter_block(
                             is_new_mv,
                             size: bw4,
                             size_h: bh4,
+                            is_global_mv0: is_global_mv_block,
+                            is_global_mv1: false,
                         },
                     );
                 }
@@ -7147,6 +7259,8 @@ fn decode_inter_block(
                         is_new_mv: false,
                         size: side / 4,
                         size_h: side / 4,
+                        is_global_mv0: false,
+                        is_global_mv1: false,
                     },
                 );
             }
@@ -7482,6 +7596,7 @@ fn decode_inter_block8(
                     mi_cols as usize,
                     mi_rows as usize,
                     &NO_SIGN_BIAS,
+                    &crate::mvstack::NO_GM_MV,
                     None,
                 );
                 let compound_mode = if skip_mode {
@@ -7501,6 +7616,9 @@ fn decode_inter_block8(
                     compound_mode,
                     allow_high_precision_mv,
                     force_integer_mv,
+                    // leaf8 stays gm-inert (sanctioned partial landing, see
+                    // this fn's own GLOBALMV refusal below).
+                    ((0, 0), (0, 0)),
                 );
 
                 // spec 5.11.25: same gating [`decode_inter_block`]'s own
@@ -7608,6 +7726,8 @@ fn decode_inter_block8(
                                 is_new_mv: matches!(compound_mode, 2 | 3 | 4 | 5 | 7),
                                 size: 2,
                                 size_h: 2,
+                                is_global_mv0: false,
+                                is_global_mv1: false,
                             },
                         );
                     }
@@ -7995,6 +8115,8 @@ fn decode_inter_block8(
                         is_new_mv,
                         size: 2,
                         size_h: 2,
+                        is_global_mv0: false,
+                        is_global_mv1: false,
                     },
                 );
             }
@@ -8189,6 +8311,8 @@ fn decode_inter_block8(
                         is_new_mv: false,
                         size: 2,
                         size_h: 2,
+                        is_global_mv0: false,
+                        is_global_mv1: false,
                     },
                 );
             }
@@ -8349,6 +8473,7 @@ pub fn decode_inter_frame_tile(
         allow_high_precision_mv,
         force_integer_mv,
         NO_SIGN_BIAS,
+        [ec_av1_syntax::WarpParams::default(); 7],
         interp_fixed,
         enable_dual_filter,
         0,
@@ -8388,6 +8513,9 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     allow_high_precision_mv: bool,
     force_integer_mv: bool,
     sign_bias_table: SignBiasTable,
+    // lane-gm r2: this frame header's own `global_motion` table (spec
+    // 5.9.24), threaded to every `decode_inter_block` call below.
+    global_motion: [ec_av1_syntax::WarpParams; 7],
     interp_fixed: Option<mc::InterpFilterKind>,
     enable_dual_filter: bool,
     // lane-av1tmvp: `order_hint`/`order_hint_bits`/`ref_order_hints` are
@@ -8641,6 +8769,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &ref_v,
                             &ref_slots,
                             &sign_bias_table,
+                            &global_motion,
                             base_q_idx,
                             TxbSet::Luma32,
                             TxbSet::Luma32Inter,
@@ -8714,6 +8843,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     &ref_v,
                                     &ref_slots,
                                     &sign_bias_table,
+                            &global_motion,
                                     base_q_idx,
                                     TxbSet::Luma16,
                                     if reduced_tx_set {
@@ -8890,6 +9020,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &ref_v,
                             &ref_slots,
                             &sign_bias_table,
+                            &global_motion,
                             base_q_idx,
                             TxbSet::Luma32,
                             TxbSet::Luma32Inter,
@@ -8940,6 +9071,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                 &ref_v,
                                 &ref_slots,
                                 &sign_bias_table,
+                            &global_motion,
                                 base_q_idx,
                                 TxbSet::Luma16,
                                 if reduced_tx_set {
@@ -8991,6 +9123,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     &ref_v,
                                     &ref_slots,
                                     &sign_bias_table,
+                            &global_motion,
                                     base_q_idx,
                                     TxbSet::Luma16,
                                     if reduced_tx_set {
@@ -9052,6 +9185,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &ref_v,
                             &ref_slots,
                             &sign_bias_table,
+                            &global_motion,
                             base_q_idx,
                             TxbSet::Luma32,
                             TxbSet::Luma32Inter,
@@ -9098,6 +9232,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &ref_v,
                             &ref_slots,
                             &sign_bias_table,
+                            &global_motion,
                             base_q_idx,
                             TxbSet::Luma32,
                             TxbSet::Luma32Inter,
@@ -9149,6 +9284,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &ref_v,
                             &ref_slots,
                             &sign_bias_table,
+                            &global_motion,
                             base_q_idx,
                             TxbSet::Luma32,
                             TxbSet::Luma32Inter,
@@ -9195,6 +9331,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &ref_v,
                             &ref_slots,
                             &sign_bias_table,
+                            &global_motion,
                             base_q_idx,
                             TxbSet::Luma32,
                             TxbSet::Luma32Inter,
@@ -9247,6 +9384,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &ref_v,
                             &ref_slots,
                             &sign_bias_table,
+                            &global_motion,
                             base_q_idx,
                             TxbSet::Luma16,
                             if reduced_tx_set {
@@ -9297,6 +9435,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &ref_v,
                             &ref_slots,
                             &sign_bias_table,
+                            &global_motion,
                             base_q_idx,
                             TxbSet::Luma16,
                             if reduced_tx_set {
@@ -9347,6 +9486,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &ref_v,
                             &ref_slots,
                             &sign_bias_table,
+                            &global_motion,
                             base_q_idx,
                             TxbSet::Luma32,
                             TxbSet::Luma32Inter,
@@ -9398,6 +9538,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &ref_v,
                             &ref_slots,
                             &sign_bias_table,
+                            &global_motion,
                             base_q_idx,
                             TxbSet::Luma16,
                             if reduced_tx_set {
@@ -9448,6 +9589,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &ref_v,
                             &ref_slots,
                             &sign_bias_table,
+                            &global_motion,
                             base_q_idx,
                             TxbSet::Luma16,
                             if reduced_tx_set {
@@ -9498,6 +9640,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &ref_v,
                             &ref_slots,
                             &sign_bias_table,
+                            &global_motion,
                             base_q_idx,
                             TxbSet::Luma32,
                             TxbSet::Luma32Inter,
@@ -9550,6 +9693,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &ref_v,
                             &ref_slots,
                             &sign_bias_table,
+                            &global_motion,
                             base_q_idx,
                             TxbSet::Luma32,
                             TxbSet::Luma32Inter,
@@ -9596,6 +9740,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &ref_v,
                             &ref_slots,
                             &sign_bias_table,
+                            &global_motion,
                             base_q_idx,
                             TxbSet::Luma16,
                             if reduced_tx_set {
@@ -9646,6 +9791,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             &ref_v,
                             &ref_slots,
                             &sign_bias_table,
+                            &global_motion,
                             base_q_idx,
                             TxbSet::Luma16,
                             if reduced_tx_set {
@@ -10316,6 +10462,8 @@ mod tests {
             is_new_mv: false,
             size: 1,
             size_h: 1,
+            is_global_mv0: false,
+            is_global_mv1: false,
         };
         for col in mi_col..mi_col + bw4 {
             grid.set(mi_row - 1, col, neighbour(above_mv));
@@ -10424,6 +10572,7 @@ mod tests {
             &ref_v,
             &[None; 8],
             &NO_SIGN_BIAS,
+            &[ec_av1_syntax::WarpParams::default(); 7],
             100,
             TxbSet::Luma16,
             TxbSet::Luma16Inter,
