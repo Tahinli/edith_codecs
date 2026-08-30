@@ -3203,6 +3203,11 @@ mod tests {
             let source = std::env::var("EC_AV1_OBMC8_SOURCE").unwrap_or_else(|_| {
                 format!("gradients=size={width}x{height}:seed={seed}:duration={duration}:rate=25")
             });
+            // A source supplied through EC_AV1_OBMC8_SOURCE need not carry its
+            // own `duration=`; `-t` is the bound that always holds. Without it
+            // an endless source (`testsrc2`) fills the pipe forever and the
+            // gate hangs to its 300 s timeout.
+            let duration_arg = format!("{duration}");
             let y4m = Command::new("ffmpeg")
                 .args([
                     "-v",
@@ -3211,6 +3216,8 @@ mod tests {
                     "lavfi",
                     "-i",
                     &source,
+                    "-t",
+                    &duration_arg,
                     "-pix_fmt",
                     "yuv420p",
                     "-f",
