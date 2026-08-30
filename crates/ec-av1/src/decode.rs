@@ -6820,17 +6820,17 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
             Picture {
                 width,
                 height,
-                y: y.data.into_iter().map(|s| s as u8).collect(),
-                u: u.data.into_iter().map(|s| s as u8).collect(),
-                v: v.data.into_iter().map(|s| s as u8).collect(),
+                y: y.data,
+                u: u.data,
+                v: v.data,
             },
             result_cdfs,
         ));
     }
-    let crop = |plane: &PlaneBuf, w: usize, h: usize| -> Vec<u8> {
+    let crop = |plane: &PlaneBuf, w: usize, h: usize| -> Vec<u16> {
         let mut out = Vec::with_capacity(w * h);
         for row in 0..h {
-            out.extend(plane.data[row * plane.width..][..w].iter().map(|&s| s as u8));
+            out.extend(plane.data[row * plane.width..][..w].iter().copied());
         }
         out
     };
@@ -6856,7 +6856,11 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                 static IDX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
                 let idx = IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 if let Ok(mut f) = std::fs::File::create(format!("{path}.f{idx}")) {
-                    let _ = f.write_all(&yc);
+                    // corner-cut: this diagnostic dump stays 8-bit-narrowed
+                    // regardless of the stream's real bit depth (debug-only,
+                    // never read by a gate); widen if a >8-bit margin dump
+                    // is ever needed.
+                    let _ = f.write_all(&yc.iter().map(|&s| s as u8).collect::<Vec<u8>>());
                 }
             }
             Some(Picture {
@@ -12591,18 +12595,18 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
             Picture {
                 width,
                 height,
-                y: y.data.into_iter().map(|s| s as u8).collect(),
-                u: u.data.into_iter().map(|s| s as u8).collect(),
-                v: v.data.into_iter().map(|s| s as u8).collect(),
+                y: y.data,
+                u: u.data,
+                v: v.data,
             },
             result_cdfs,
             motion_field,
         ));
     }
-    let crop = |plane: &PlaneBuf, w: usize, h: usize| -> Vec<u8> {
+    let crop = |plane: &PlaneBuf, w: usize, h: usize| -> Vec<u16> {
         let mut out = Vec::with_capacity(w * h);
         for row in 0..h {
-            out.extend(plane.data[row * plane.width..][..w].iter().map(|&s| s as u8));
+            out.extend(plane.data[row * plane.width..][..w].iter().copied());
         }
         out
     };
@@ -12710,10 +12714,10 @@ mod tests {
     /// planes are byte-exact against the encoder's own reconstruction.
     fn round_trips(w: usize, h: usize, modes: &[u8]) {
         use crate::encode::{Encoded, Picture as Pic};
-        let mut source = vec![0u8; w * h];
+        let mut source = vec![0u16; w * h];
         for row in 0..h {
             for col in 0..w {
-                source[row * w + col] = ((row * 3 + col * 5) % 251) as u8;
+                source[row * w + col] = ((row * 3 + col * 5) % 251) as u16;
             }
         }
         let picture = Pic {
@@ -12928,9 +12932,9 @@ mod tests {
         Picture {
             width,
             height,
-            y: out.stdout[..luma].to_vec(),
-            u: out.stdout[luma..luma + chroma].to_vec(),
-            v: out.stdout[luma + chroma..].to_vec(),
+            y: out.stdout[..luma].iter().map(|&v| u16::from(v)).collect(),
+            u: out.stdout[luma..luma + chroma].iter().map(|&v| u16::from(v)).collect(),
+            v: out.stdout[luma + chroma..].iter().map(|&v| u16::from(v)).collect(),
         }
     }
 
@@ -12976,9 +12980,9 @@ mod tests {
                 Picture {
                     width,
                     height,
-                    y: out.stdout[base..base + luma].to_vec(),
-                    u: out.stdout[base + luma..base + luma + chroma].to_vec(),
-                    v: out.stdout[base + luma + chroma..base + frame_bytes].to_vec(),
+                    y: out.stdout[base..base + luma].iter().map(|&v| u16::from(v)).collect(),
+                    u: out.stdout[base + luma..base + luma + chroma].iter().map(|&v| u16::from(v)).collect(),
+                    v: out.stdout[base + luma + chroma..base + frame_bytes].iter().map(|&v| u16::from(v)).collect(),
                 }
             })
             .collect()
@@ -13069,14 +13073,14 @@ mod tests {
         let mut picture = crate::encode::Picture::grey(width, height);
         for row in 0..height {
             for col in 0..width {
-                picture.y[row * width + col] = ((row * 7 + col * 11) % 251) as u8;
+                picture.y[row * width + col] = ((row * 7 + col * 11) % 251) as u16;
             }
         }
         for row in 0..height / 2 {
             for col in 0..width / 2 {
                 let i = row * width / 2 + col;
-                picture.u[i] = (100 + (col * 60 / (width / 2).max(1))) as u8;
-                picture.v[i] = (200 - (row * 80 / (height / 2).max(1))) as u8;
+                picture.u[i] = (100 + (col * 60 / (width / 2).max(1))) as u16;
+                picture.v[i] = (200 - (row * 80 / (height / 2).max(1))) as u16;
             }
         }
         picture
@@ -13088,15 +13092,15 @@ mod tests {
             for x in 0..width {
                 let sx = (x as i64 - shift).rem_euclid(width as i64) as f64;
                 let gradient = sx * 200.0 / width as f64;
-                picture.y[y * width + x] = (20.0 + gradient).clamp(0.0, 255.0) as u8;
+                picture.y[y * width + x] = (20.0 + gradient).clamp(0.0, 255.0) as u16;
             }
         }
         for y in 0..height / 2 {
             for x in 0..width / 2 {
                 let sx = (x as i64 - shift / 2).rem_euclid((width / 2) as i64) as usize;
                 let i = y * width / 2 + x;
-                picture.u[i] = (100 + (sx * 60 / (width / 2))) as u8;
-                picture.v[i] = (200 - (y * 80 / (height / 2))) as u8;
+                picture.u[i] = (100 + (sx * 60 / (width / 2))) as u16;
+                picture.v[i] = (200 - (y * 80 / (height / 2))) as u16;
             }
         }
         picture
