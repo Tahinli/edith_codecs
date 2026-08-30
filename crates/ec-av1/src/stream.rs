@@ -166,10 +166,15 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         // (spec 5.11.10/5.11.11, one symbol group per superblock). Refuse
         // before desyncing rather than silently miscode, the same pattern as
         // the CDEF/TxMode::Select refusals above.
-        if header.allow_screen_content_tools {
+        // Key frames now consume (not reconstruct) palette/intrabc syntax
+        // via read_intra_mode, so the arithmetic decoder stays in sync;
+        // decode_inter_block/decode_inter_block8's intra-sub-block branches
+        // still have no such wiring, so a non-key frame with the bit set
+        // still desyncs and must refuse.
+        if header.frame_type != FrameType::Key && header.allow_screen_content_tools {
             return Err(Error::unsupported(
                 "AV1 decode_stream",
-                "a frame with allow_screen_content_tools set (this decoder never reads intrabc/palette_mode_info)",
+                "a non-key frame with allow_screen_content_tools set (this decoder's inter path never reads intrabc/palette_mode_info)",
             ));
         }
         if header.delta.q_present || header.delta.lf_present {
@@ -313,6 +318,8 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 initial_cdfs,
                 header.tx_mode == TxMode::Select,
                 header.reduced_tx_set,
+                header.allow_screen_content_tools,
+                header.allow_intrabc,
             )?;
             // A key frame codes no inter blocks -- its own saved motion
             // field has no cells set, matching libaom's own "intra frame
@@ -535,6 +542,8 @@ mod tests {
                 false,
                 // Our own encoder always writes `reduced_tx_set: true`.
                 true,
+                false,
+                false,
             )
             .unwrap();
             let via_stream = decode_stream(&encoded.stream).unwrap();
@@ -1192,6 +1201,16 @@ mod tests {
             return;
         }
         let (width, height) = (64usize, 64usize);
+        // Recipe-search hooks: with the encoder pinned to one thread the
+        // stream is a deterministic function of (seed, cq), so a firing recipe
+        // can be searched for without a rebuild.
+        let fi_seed: u32 = std::env::var("EC_FI_SEED")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(42);
+        let fi_source = format!("gradients=size=64x64:seed={fi_seed}:duration=0.04:rate=25");
+        let fi_cq = std::env::var("EC_FI_CQ").unwrap_or_else(|_| "40".to_string());
+        let fi_cq_arg = format!("--cq-level={fi_cq}");
         let y4m = Command::new("ffmpeg")
             .args([
                 "-v",
@@ -1199,7 +1218,7 @@ mod tests {
                 "-f",
                 "lavfi",
                 "-i",
-                "gradients=size=64x64:seed=42:duration=0.04:rate=25",
+                &fi_source,
                 "-pix_fmt",
                 "yuv420p",
                 "-f",
@@ -1221,8 +1240,16 @@ mod tests {
                 "--codec=av1",
                 "--passes=1",
                 "--end-usage=q",
-                "--cq-level=40",
+                &fi_cq_arg,
                 "--cpu-used=0",
+                // Every sibling gate pins these; this one did not, and a
+                // multi-threaded aomenc is not deterministic, so each run
+                // encoded a slightly different stream and the gate flaked
+                // against whichever features that run happened to pick.
+                // Pinning them makes seed 42 mean one stream (class
+                // `parallel-flake-is-attempt-selection`).
+                "--threads=1",
+                "--row-mt=0",
                 "--enable-filter-intra=1",
                 "--enable-smooth-intra=0",
                 "--enable-paeth-intra=0",
