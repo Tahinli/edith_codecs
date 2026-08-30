@@ -47,7 +47,6 @@ const REFUSALS: &[&str] = &[
     "a directional chroma mode (round 2)",
     "a frame OBU with no tile group",
     "a frame naming primary_ref_frame at a reference slot with no saved CDF state",
-    "a frame with cdef_bits > 0 (this decoder never reads the per-64x64 cdef_idx symbol)",
     "a frame with delta_q_present or delta_lf_present set (this decoder never reads the per-superblock delta symbols)",
     "a frame with loop restoration enabled (this decoder never reads the per-unit lr symbols)",
     "a frame with more than one tile (this decoder only ever decodes tile 0)",
