@@ -787,6 +787,38 @@ pub(crate) fn partab_hits() -> usize {
     PARTAB_HITS.with(|c| c.get())
 }
 
+// lane-part32 r1: how many 32x32 quadrants decoded each INTRA AB/4-way arm,
+// one counter per arm rather than one shared total -- the gate hard-asserts
+// each of these individually nonzero so a recipe that only ever fires
+// HORZ_A can't silently stand in for the whole set.
+thread_local! {
+    static INTRA_HORZ_A_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    static INTRA_HORZ_B_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    static INTRA_VERT_A_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    static INTRA_VERT_B_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`INTRA_HORZ_A_HITS`].
+pub(crate) fn intra_horz_a_hits() -> usize {
+    INTRA_HORZ_A_HITS.with(|c| c.get())
+}
+/// Current value of [`INTRA_HORZ_B_HITS`].
+pub(crate) fn intra_horz_b_hits() -> usize {
+    INTRA_HORZ_B_HITS.with(|c| c.get())
+}
+/// Current value of [`INTRA_VERT_A_HITS`].
+pub(crate) fn intra_vert_a_hits() -> usize {
+    INTRA_VERT_A_HITS.with(|c| c.get())
+}
+/// Current value of [`INTRA_VERT_B_HITS`].
+pub(crate) fn intra_vert_b_hits() -> usize {
+    INTRA_VERT_B_HITS.with(|c| c.get())
+}
+
 // How many [`read_inter_compound_mode`] reads actually happened
 // (lane-av1comp) -- proves a `COMPOUND_REFERENCE` block reached its own
 // `compound_mode` symbol (past `comp_mode`/`comp_ref` and the compound
@@ -7275,6 +7307,301 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                     allow_screen_content_tools,
                                     base_q_idx,
                                     tx_select,
+                                )?;
+                            }
+                            PARTITION_HORZ_A => {
+                                // lane-part32 r1: two 16x16 squares on top +
+                                // a true 32x16 strip below (mirrors
+                                // decode_inter_block's cd6cb6d HORZ_A: TL,
+                                // TR, bottom strip).
+                                INTRA_HORZ_A_HITS.with(|c| c.set(c.get() + 1));
+                                decode_block(
+                                    &mut dec,
+                                    &mut cdfs,
+                                    &mut neighbours,
+                                    at32,
+                                    SUB,
+                                    TxbSet::Luma16,
+                                    TxbSet::Chroma8,
+                                    TX16,
+                                    TX8,
+                                    (&scan16, &scan8),
+                                    true,
+                                    &mut y,
+                                    &mut u,
+                                    &mut v,
+                                    base_q_idx,
+                                    enable_filter_intra,
+                                    allow_screen_content_tools,
+                                    allow_intrabc,
+                                    &scan32,
+                                    &scan16,
+                                    &scan8,
+                                    &scan4,
+                                    tx_select,
+                                    reduced_tx_set,
+                                )?;
+                                decode_block(
+                                    &mut dec,
+                                    &mut cdfs,
+                                    &mut neighbours,
+                                    (at32.0, at32.1 + 1),
+                                    SUB,
+                                    TxbSet::Luma16,
+                                    TxbSet::Chroma8,
+                                    TX16,
+                                    TX8,
+                                    (&scan16, &scan8),
+                                    true,
+                                    &mut y,
+                                    &mut u,
+                                    &mut v,
+                                    base_q_idx,
+                                    enable_filter_intra,
+                                    allow_screen_content_tools,
+                                    allow_intrabc,
+                                    &scan32,
+                                    &scan16,
+                                    &scan8,
+                                    &scan4,
+                                    tx_select,
+                                    reduced_tx_set,
+                                )?;
+                                decode_block_rect(
+                                    &mut dec,
+                                    &mut cdfs,
+                                    &mut neighbours,
+                                    (at32.0 + 1, at32.1),
+                                    32,
+                                    16,
+                                    &mut y,
+                                    &mut u,
+                                    &mut v,
+                                    enable_filter_intra,
+                                    allow_screen_content_tools,
+                                    base_q_idx,
+                                    tx_select,
+                                )?;
+                            }
+                            PARTITION_HORZ_B => {
+                                // lane-part32 r1: a true 32x16 strip on top +
+                                // two 16x16 squares below (mirrors HORZ_A
+                                // with the strip/squares order flipped, same
+                                // shape as libaom decode_partition's HORZ_B).
+                                INTRA_HORZ_B_HITS.with(|c| c.set(c.get() + 1));
+                                decode_block_rect(
+                                    &mut dec,
+                                    &mut cdfs,
+                                    &mut neighbours,
+                                    at32,
+                                    32,
+                                    16,
+                                    &mut y,
+                                    &mut u,
+                                    &mut v,
+                                    enable_filter_intra,
+                                    allow_screen_content_tools,
+                                    base_q_idx,
+                                    tx_select,
+                                )?;
+                                decode_block(
+                                    &mut dec,
+                                    &mut cdfs,
+                                    &mut neighbours,
+                                    (at32.0 + 1, at32.1),
+                                    SUB,
+                                    TxbSet::Luma16,
+                                    TxbSet::Chroma8,
+                                    TX16,
+                                    TX8,
+                                    (&scan16, &scan8),
+                                    true,
+                                    &mut y,
+                                    &mut u,
+                                    &mut v,
+                                    base_q_idx,
+                                    enable_filter_intra,
+                                    allow_screen_content_tools,
+                                    allow_intrabc,
+                                    &scan32,
+                                    &scan16,
+                                    &scan8,
+                                    &scan4,
+                                    tx_select,
+                                    reduced_tx_set,
+                                )?;
+                                decode_block(
+                                    &mut dec,
+                                    &mut cdfs,
+                                    &mut neighbours,
+                                    (at32.0 + 1, at32.1 + 1),
+                                    SUB,
+                                    TxbSet::Luma16,
+                                    TxbSet::Chroma8,
+                                    TX16,
+                                    TX8,
+                                    (&scan16, &scan8),
+                                    true,
+                                    &mut y,
+                                    &mut u,
+                                    &mut v,
+                                    base_q_idx,
+                                    enable_filter_intra,
+                                    allow_screen_content_tools,
+                                    allow_intrabc,
+                                    &scan32,
+                                    &scan16,
+                                    &scan8,
+                                    &scan4,
+                                    tx_select,
+                                    reduced_tx_set,
+                                )?;
+                            }
+                            PARTITION_VERT_A => {
+                                // lane-part32 r1: mirror of HORZ_A with
+                                // width/height swapped (TL, BL, right 16x32
+                                // strip).
+                                INTRA_VERT_A_HITS.with(|c| c.set(c.get() + 1));
+                                decode_block(
+                                    &mut dec,
+                                    &mut cdfs,
+                                    &mut neighbours,
+                                    at32,
+                                    SUB,
+                                    TxbSet::Luma16,
+                                    TxbSet::Chroma8,
+                                    TX16,
+                                    TX8,
+                                    (&scan16, &scan8),
+                                    true,
+                                    &mut y,
+                                    &mut u,
+                                    &mut v,
+                                    base_q_idx,
+                                    enable_filter_intra,
+                                    allow_screen_content_tools,
+                                    allow_intrabc,
+                                    &scan32,
+                                    &scan16,
+                                    &scan8,
+                                    &scan4,
+                                    tx_select,
+                                    reduced_tx_set,
+                                )?;
+                                decode_block(
+                                    &mut dec,
+                                    &mut cdfs,
+                                    &mut neighbours,
+                                    (at32.0 + 1, at32.1),
+                                    SUB,
+                                    TxbSet::Luma16,
+                                    TxbSet::Chroma8,
+                                    TX16,
+                                    TX8,
+                                    (&scan16, &scan8),
+                                    true,
+                                    &mut y,
+                                    &mut u,
+                                    &mut v,
+                                    base_q_idx,
+                                    enable_filter_intra,
+                                    allow_screen_content_tools,
+                                    allow_intrabc,
+                                    &scan32,
+                                    &scan16,
+                                    &scan8,
+                                    &scan4,
+                                    tx_select,
+                                    reduced_tx_set,
+                                )?;
+                                decode_block_rect(
+                                    &mut dec,
+                                    &mut cdfs,
+                                    &mut neighbours,
+                                    (at32.0, at32.1 + 1),
+                                    16,
+                                    32,
+                                    &mut y,
+                                    &mut u,
+                                    &mut v,
+                                    enable_filter_intra,
+                                    allow_screen_content_tools,
+                                    base_q_idx,
+                                    tx_select,
+                                )?;
+                            }
+                            PARTITION_VERT_B => {
+                                // lane-part32 r1: a true 16x32 strip on the
+                                // left + two 16x16 squares on the right
+                                // (libaom decode_partition VERT_B: left
+                                // strip, TR, BR).
+                                INTRA_VERT_B_HITS.with(|c| c.set(c.get() + 1));
+                                decode_block_rect(
+                                    &mut dec,
+                                    &mut cdfs,
+                                    &mut neighbours,
+                                    at32,
+                                    16,
+                                    32,
+                                    &mut y,
+                                    &mut u,
+                                    &mut v,
+                                    enable_filter_intra,
+                                    allow_screen_content_tools,
+                                    base_q_idx,
+                                    tx_select,
+                                )?;
+                                decode_block(
+                                    &mut dec,
+                                    &mut cdfs,
+                                    &mut neighbours,
+                                    (at32.0, at32.1 + 1),
+                                    SUB,
+                                    TxbSet::Luma16,
+                                    TxbSet::Chroma8,
+                                    TX16,
+                                    TX8,
+                                    (&scan16, &scan8),
+                                    true,
+                                    &mut y,
+                                    &mut u,
+                                    &mut v,
+                                    base_q_idx,
+                                    enable_filter_intra,
+                                    allow_screen_content_tools,
+                                    allow_intrabc,
+                                    &scan32,
+                                    &scan16,
+                                    &scan8,
+                                    &scan4,
+                                    tx_select,
+                                    reduced_tx_set,
+                                )?;
+                                decode_block(
+                                    &mut dec,
+                                    &mut cdfs,
+                                    &mut neighbours,
+                                    (at32.0 + 1, at32.1 + 1),
+                                    SUB,
+                                    TxbSet::Luma16,
+                                    TxbSet::Chroma8,
+                                    TX16,
+                                    TX8,
+                                    (&scan16, &scan8),
+                                    true,
+                                    &mut y,
+                                    &mut u,
+                                    &mut v,
+                                    base_q_idx,
+                                    enable_filter_intra,
+                                    allow_screen_content_tools,
+                                    allow_intrabc,
+                                    &scan32,
+                                    &scan16,
+                                    &scan8,
+                                    &scan4,
+                                    tx_select,
+                                    reduced_tx_set,
                                 )?;
                             }
                             _ => {
