@@ -4199,15 +4199,17 @@ fn apply_deblock(
     v: &mut PlaneBuf,
     lf: &LoopFilterParams,
     n: &Neighbours,
+    frame_width: usize,
+    frame_height: usize,
 ) {
     if lf.level[0] != 0 || lf.level[1] != 0 {
-        deblock_plane(y, 0, lf, n);
+        deblock_plane(y, 0, lf, n, frame_width, frame_height);
     }
     if lf.level[2] != 0 {
-        deblock_plane(u, 1, lf, n);
+        deblock_plane(u, 1, lf, n, frame_width, frame_height);
     }
     if lf.level[3] != 0 {
-        deblock_plane(v, 2, lf, n);
+        deblock_plane(v, 2, lf, n, frame_width, frame_height);
     }
 }
 
@@ -4716,9 +4718,33 @@ fn filter_edge(
 
 /// One plane's worth of spec 7.14: every vertical edge across the plane,
 /// then every horizontal edge (the order the spec and libaom both use).
-fn deblock_plane(plane: &mut PlaneBuf, plane_idx: usize, lf: &LoopFilterParams, n: &Neighbours) {
+fn deblock_plane(
+    plane: &mut PlaneBuf,
+    plane_idx: usize,
+    lf: &LoopFilterParams,
+    n: &Neighbours,
+    frame_width: usize,
+    frame_height: usize,
+) {
     let chroma = plane_idx != 0;
-    let (tw, th, stride) = (plane.true_width, plane.true_height, plane.width);
+    // r7: libaom clips the deblock loop to the CODED frame's own
+    // width/height, not the mi-aligned `true_width`/`true_height` margin
+    // (the padding up to the next 8-pixel/superblock boundary that
+    // reconstruction still fills in but the loop filter never visits).
+    // Confirmed against the superres gate: with the margin included, the
+    // last coded mi column's horizontal edges were filtered when libaom's
+    // real output leaves them untouched (r6's post-deblock diff, 37 px, all
+    // in columns 44-47); clipping here closes it (3/3 frames pixel-exact).
+    let (cw, ch) = if chroma {
+        (frame_width.div_ceil(2), frame_height.div_ceil(2))
+    } else {
+        (frame_width, frame_height)
+    };
+    let (tw, th, stride) = (
+        plane.true_width.min(cw),
+        plane.true_height.min(ch),
+        plane.width,
+    );
     let mut y0 = 0usize;
     while y0 < th {
         let mut x0 = 4usize;
@@ -4743,6 +4769,15 @@ fn deblock_plane(plane: &mut PlaneBuf, plane_idx: usize, lf: &LoopFilterParams, 
         let mut y0 = 4usize;
         while y0 < th {
             if let Some((len, level)) = edge_params(lf, n, plane_idx, 1, chroma, x0, y0) {
+                if std::env::var_os("EC_AV1_DEBLOCK_TRACE").is_some()
+                    && plane_idx == 0
+                    && x0 == 44
+                {
+                    eprintln!(
+                        "HEDGE x0={x0} y0={y0} len={len} level={level} sharpness={}",
+                        lf.sharpness
+                    );
+                }
                 filter_edge(
                     &mut plane.data,
                     y0 * stride + x0,
@@ -4944,6 +4979,23 @@ pub fn decode_key_frame_tile(
         delta,
     )
     .map(|(picture, _)| picture)
+}
+
+thread_local! {
+    /// lane-superres r3: the real decoded margin beyond `frame_width` up to
+    /// the mi-aligned `true_width`, set by the most recent
+    /// [`decode_key_frame_tile_with_cdfs`] call. See that function's own
+    /// comment at the write site. `None` when there was no margin to save.
+    static LAST_KEY_FRAME_WIDE_MARGIN: std::cell::RefCell<Option<Picture>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The margin [`decode_key_frame_tile_with_cdfs`] most recently stashed
+/// (see [`LAST_KEY_FRAME_WIDE_MARGIN`]) -- `stream.rs`'s superres path
+/// reads this immediately after the call, before any other key frame
+/// decode can overwrite it.
+pub(crate) fn take_last_key_frame_wide_margin() -> Option<Picture> {
+    LAST_KEY_FRAME_WIDE_MARGIN.with(|m| m.borrow_mut().take())
 }
 
 /// [`decode_key_frame_tile`], threading a cross-frame CDF forward (spec
@@ -5529,11 +5581,37 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     } else {
         PREFILT_PICTURE_IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
-    apply_deblock(&mut y, &mut u, &mut v, loop_filter, &neighbours);
+    if let Ok(path) = std::env::var("EC_AV1_PREFILT_WIDE_DUMP") {
+        use std::io::Write;
+        static IDX2: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let idx = IDX2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let crop_wide = |plane: &PlaneBuf| -> Vec<u8> {
+            let mut out = Vec::with_capacity(plane.true_width * plane.true_height);
+            for row in 0..plane.true_height {
+                out.extend_from_slice(&plane.data[row * plane.width..][..plane.true_width]);
+            }
+            out
+        };
+        if let Ok(mut f) = std::fs::File::create(format!("{path}.f{idx}")) {
+            let _ = f.write_all(&crop_wide(&y));
+            let _ = f.write_all(&crop_wide(&u));
+            let _ = f.write_all(&crop_wide(&v));
+        }
+    }
+    apply_deblock(
+        &mut y,
+        &mut u,
+        &mut v,
+        loop_filter,
+        &neighbours,
+        frame_width as usize,
+        frame_height as usize,
+    );
     apply_cdef(&mut y, &mut u, &mut v, cdef, &neighbours);
 
     let (fw, fh) = (frame_width as usize, frame_height as usize);
     if fw == width && fh == height {
+        LAST_KEY_FRAME_WIDE_MARGIN.with(|m| *m.borrow_mut() = None);
         return Ok((
             Picture {
                 width,
@@ -5552,13 +5630,49 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         }
         out
     };
+    // lane-superres r3: `true_width`/`true_height` (`mi_cols`/`mi_rows` * 4)
+    // is the real reconstructed extent -- columns `[fw, true_width)` hold
+    // genuine decoded samples (the last coding block straddles the frame
+    // edge whenever `frame_width` isn't 8-sample aligned), not padding.
+    // libaom's superres upscale runs on that buffer's own border-extended
+    // margin, so it reads those real columns, not a synthetic replicate of
+    // column `fw - 1`. Stash them for `stream.rs`'s superres path (a real
+    // aomenc 43->64 stream pinned column-by-column against libaom's own
+    // `av1_convolve_horiz_rs_c` via `scripts/superres-pin-harness.c` --
+    // `row6-realedgeval` proved the replicate-of-`fw-1` padding this
+    // decoder used before was off by 1 at the columns the tap window
+    // reaches into that real margin; `None` when there is no margin (this
+    // frame's `true_width`/`true_height` already equal `fw`/`fh`, e.g. a
+    // non-superres frame whose width just isn't 32-block aligned).
+    LAST_KEY_FRAME_WIDE_MARGIN.with(|m| {
+        *m.borrow_mut() = if true_width > fw || true_height > fh {
+            let yc = crop(&y, true_width, true_height);
+            if let Ok(path) = std::env::var("EC_AV1_MARGIN_DUMP") {
+                use std::io::Write;
+                static IDX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                let idx = IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if let Ok(mut f) = std::fs::File::create(format!("{path}.f{idx}")) {
+                    let _ = f.write_all(&yc);
+                }
+            }
+            Some(Picture {
+                width: true_width,
+                height: true_height,
+                y: yc,
+                u: crop(&u, true_width.div_ceil(2), true_height.div_ceil(2)),
+                v: crop(&v, true_width.div_ceil(2), true_height.div_ceil(2)),
+            })
+        } else {
+            None
+        }
+    });
     Ok((
         Picture {
             width: fw,
             height: fh,
             y: crop(&y, fw, fh),
-            u: crop(&u, fw / 2, fh / 2),
-            v: crop(&v, fw / 2, fh / 2),
+            u: crop(&u, fw.div_ceil(2), fh.div_ceil(2)),
+            v: crop(&v, fw.div_ceil(2), fh.div_ceil(2)),
         },
         result_cdfs,
     ))
@@ -11227,7 +11341,15 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     } else {
         PREFILT_PICTURE_IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
-    apply_deblock(&mut y, &mut u, &mut v, loop_filter, &neighbours);
+    apply_deblock(
+        &mut y,
+        &mut u,
+        &mut v,
+        loop_filter,
+        &neighbours,
+        frame_width as usize,
+        frame_height as usize,
+    );
     apply_cdef(&mut y, &mut u, &mut v, cdef, &neighbours);
 
     let motion_field = build_motion_field(
@@ -11264,8 +11386,8 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
             width: fw,
             height: fh,
             y: crop(&y, fw, fh),
-            u: crop(&u, fw / 2, fh / 2),
-            v: crop(&v, fw / 2, fh / 2),
+            u: crop(&u, fw.div_ceil(2), fh.div_ceil(2)),
+            v: crop(&v, fw.div_ceil(2), fh.div_ceil(2)),
         },
         result_cdfs,
         motion_field,

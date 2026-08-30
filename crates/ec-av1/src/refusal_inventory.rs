@@ -42,6 +42,7 @@ const REFUSALS: &[&str] = &[
     "a stream whose bit depth is not 8 (this decoder reconstructs into 8-bit planes)",
     "a tx_type symbol outside its CDF's own set: {t}",
     "an INTER 32x32 partition type this decoder does not code (value={part32})",
+    "an inter frame with use_superres set (this decoder never scales its motion-compensated reference to match the current frame's downscaled size, spec 7.11.3.3)",
     "a superblock-level partition type other than NONE or SPLIT (this decoder's intra tile path codes only those two at 64x64)",
     "a HORZ/VERT intra strip in a screen-content frame (palette syntax is consumed for square blocks only)",
     "a HORZ/VERT intra strip with a split transform (per-unit rect prediction is not ported)",
