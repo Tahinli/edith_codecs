@@ -4656,6 +4656,203 @@ mod tests {
         );
     }
 
+    /// lane-realworld r2: `read_cdef` (spec 5.11.56) ported -- per-superblock
+    /// `cdef_idx`, wired at all five `skip`-decode sites, `apply_cdef` looks
+    /// up strength through the grid instead of a hardcoded `[0]`. Structure
+    /// copied from `a_real_aomenc_stream_with_masked_compound_decodes_pixel_exact`
+    /// but `--enable-cdef=1` (the one thing that gate turns off) and every
+    /// *other* filter/mode feature this lane doesn't touch disabled, so a
+    /// mismatch here can only be attributed to CDEF. `cdef_idx_hits()` is a
+    /// hard assert -- a run that never reads a real cdef_idx symbol proves
+    /// nothing (class `gate-blind-to-feature`).
+    #[test]
+    fn a_real_aomenc_stream_with_cdef_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_stream_with_cdef_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        // cdef_bits selects among PER-SUPERBLOCK strengths -- a single-SB
+        // 64x64 frame (the other gates' size) gives aomenc nothing to
+        // differentiate, so it always writes bits=0 and cdef_idx is never
+        // read. 128x64 = 2 SBs is the minimum that lets aomenc's RD ever
+        // pick bits > 0. Multi-SB content at --cpu-used=0 (every other
+        // gate's setting) makes aomenc pick PARTITION_HORZ_4/VERT_B etc.
+        // at the top SB level regardless of the ab/1to4-partitions=0
+        // flags below (a real gap: this decoder's intra part64 match only
+        // covers NONE/SPLIT, and the inter path blindly assumes SPLIT --
+        // both pre-existing, out of this lane's scope); --cpu-used=4
+        // avoids that RD path entirely and needs --aq-mode=0
+        // --deltaq-mode=0 to keep delta_q/delta_lf (next lane step) off.
+        let (width, height, frame_count) = (128usize, 64usize, 24usize);
+        let mut named_refusals = 0u32;
+        let mut matched = 0u32;
+        let n_attempts: u32 = std::env::var("EC_CDEF_GATE_ATTEMPTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(40);
+        for attempt in 0..n_attempts {
+            let seed = 42 + attempt;
+            let duration = frame_count as f64 / 25.0;
+            // mandelbrot's ringing-prone hard edges are what CDEF's RD
+            // search targets; flat gradients (charter's first guess) may
+            // never make aomenc choose cdef_bits > 0.
+            let source = format!(
+                "mandelbrot=size={width}x{height}:rate=25:start_x={sx}:start_y={sy}",
+                sx = -0.6 + 0.005 * (attempt as f64),
+                sy = -0.4 + 0.005 * (attempt as f64)
+            );
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-t",
+                    &duration.to_string(),
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let args: Vec<&str> = vec![
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                "--cq-level=45",
+                "--cpu-used=4",
+                "--aq-mode=0",
+                "--deltaq-mode=0",
+                "--kf-max-dist=1000",
+                "--threads=1",
+                "--row-mt=0",
+                "--auto-alt-ref=1",
+                "--lag-in-frames=16",
+                "--enable-fwd-kf=0",
+                "--enable-order-hint=1",
+                // r2: a starved inter toolset (everything below off) pushes
+                // aomenc's RD toward exotic partition shapes (HORZ_4/VERT_B
+                // etc.) at the SB(64) level even with those partition
+                // flags off -- this decoder's part64 8/9/10-way arms and
+                // the inter path's blind SPLIT assumption don't cover that;
+                // keeping the same rich toolset the (working, ab/1to4-off)
+                // masked-compound gate uses avoids it.
+                "--enable-warped-motion=1",
+                "--enable-global-motion=0",
+                "--enable-obmc=1",
+                "--tune-content=default",
+                "--enable-masked-comp=1",
+                "--enable-dist-wtd-comp=0",
+                "--enable-interintra-comp=1",
+                "--enable-onesided-comp=0",
+                "--enable-interintra-wedge=0",
+                "--enable-smooth-interintra=1",
+                "--enable-rect-partitions=0",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0",
+                "--enable-filter-intra=0",
+                "--enable-smooth-intra=0",
+                "--enable-paeth-intra=0",
+                "--enable-directional-intra=0",
+                "--enable-angle-delta=0",
+                "--enable-tx-size-search=0",
+                "--enable-cdef=1",
+                "--enable-restoration=0",
+                "--max-partition-size=32",
+                "--min-partition-size=32",
+                "--enable-palette=0",
+                "--enable-intrabc=0",
+                "--enable-cfl-intra=0",
+                "--enable-ref-frame-mvs=0",
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ];
+            let mut child = Command::new(aomenc_path())
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let frames = match decode_stream(&stream) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME} failed outright, not a named refusal (seed {seed}): {msg}"
+                    );
+                    assert!(
+                        !msg.contains("cdef"),
+                        "{NAME} refused on cdef (seed {seed}) -- cdef_idx decode is ported: {msg}"
+                    );
+                    named_refusals += 1;
+                    eprintln!("seed {seed} refusal: {msg}");
+                    continue;
+                }
+                Ok(frames) => frames,
+            };
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
+            assert_eq!(frames.len(), frame_count);
+            let mismatched = frames
+                .iter()
+                .zip(&ffmpeg_frames)
+                .any(|(got, want)| got.y != want.y || got.u != want.u || got.v != want.v);
+            if mismatched && let Ok(path) = std::env::var("EC_AV1_GATE_DUMP") {
+                std::fs::write(&path, &stream).expect("writing pinned stream");
+                eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
+            }
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
+                assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
+            }
+            matched += 1;
+        }
+        assert!(
+            crate::decode::cdef_idx_hits() > 0,
+            "{NAME}: zero cdef_idx blocks fired ({matched} matches, {named_refusals} other \
+             refusals out of {n_attempts}) -- gate proved nothing this run"
+        );
+        eprintln!(
+            "{NAME}: {named_refusals} other-capability refusals, {matched} pixel-exact matches \
+             out of {n_attempts}, cdef_idx_hits={}",
+            crate::decode::cdef_idx_hits()
+        );
+    }
+
     /// Pinned streams captured by `EC_AV1_GATE_DUMP` off
     /// `a_real_aomenc_stream_with_warped_motion_refuses_or_matches` -- each
     /// one is a former mismatch, kept as a regression pin (warp-mismatch:
