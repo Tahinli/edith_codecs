@@ -2609,6 +2609,7 @@ fn cfl_scaled(alpha_q3: i32, ac_q3: i32) -> i32 {
 /// [`crate::encode`]'s private `Plane`, whose `edges` this mirrors exactly
 /// (own-edge and reach clamps both), passing what it gathers straight to
 /// [`crate::intra::predict`] instead of hand-rolling `DC_PRED` alone.
+#[derive(Clone)]
 struct PlaneBuf {
     data: Vec<u8>,
     width: usize,
@@ -4414,6 +4415,62 @@ fn apply_cdef(
     }
 }
 
+/// Spec 7.17: loop restoration, run after [`apply_cdef`] (a sibling lane's
+/// ordering note: libaom also runs `superres_post_decode` between the two,
+/// but this decoder never implements super-resolution, so there is nothing
+/// to interleave). `deblocked_*` is each plane's post-deblock, pre-CDEF
+/// buffer (the caller clones it before calling [`apply_cdef`]) -- loop
+/// restoration's stripe-boundary rows read from it instead of the
+/// CDEF-filtered plane, per `restoration.rs`'s own `lr_sample` doc comment.
+#[allow(clippy::too_many_arguments)]
+fn apply_loop_restoration(
+    y: &mut PlaneBuf,
+    u: &mut PlaneBuf,
+    v: &mut PlaneBuf,
+    deblocked_y: &PlaneBuf,
+    deblocked_u: &PlaneBuf,
+    deblocked_v: &PlaneBuf,
+    lr: &LoopRestorationParams,
+    grid: &crate::restoration::RestorationGrid,
+) {
+    y.data = crate::restoration::apply_loop_restoration_plane(
+        &y.data,
+        &deblocked_y.data,
+        y.width,
+        y.true_width,
+        y.true_height,
+        0,
+        lr.frame_restoration_type[0],
+        lr.loop_restoration_size[0],
+        grid,
+        0,
+    );
+    u.data = crate::restoration::apply_loop_restoration_plane(
+        &u.data,
+        &deblocked_u.data,
+        u.width,
+        u.true_width,
+        u.true_height,
+        1,
+        lr.frame_restoration_type[1],
+        lr.loop_restoration_size[1],
+        grid,
+        1,
+    );
+    v.data = crate::restoration::apply_loop_restoration_plane(
+        &v.data,
+        &deblocked_v.data,
+        v.width,
+        v.true_width,
+        v.true_height,
+        1,
+        lr.frame_restoration_type[2],
+        lr.loop_restoration_size[2],
+        grid,
+        2,
+    );
+}
+
 /// Decodes the payload [`crate::tile::sb_coeff_key_frame_tile`] writes,
 /// returning the picture it reconstructs to.
 ///
@@ -4980,7 +5037,9 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         PREFILT_PICTURE_IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
     apply_deblock(&mut y, &mut u, &mut v, loop_filter, &neighbours);
+    let (deblocked_y, deblocked_u, deblocked_v) = (y.clone(), u.clone(), v.clone());
     apply_cdef(&mut y, &mut u, &mut v, cdef, &neighbours);
+    apply_loop_restoration(&mut y, &mut u, &mut v, &deblocked_y, &deblocked_u, &deblocked_v, lr, &lr_grid);
 
     let (fw, fh) = (frame_width as usize, frame_height as usize);
     if fw == width && fh == height {
@@ -10499,7 +10558,9 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         PREFILT_PICTURE_IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
     apply_deblock(&mut y, &mut u, &mut v, loop_filter, &neighbours);
+    let (deblocked_y, deblocked_u, deblocked_v) = (y.clone(), u.clone(), v.clone());
     apply_cdef(&mut y, &mut u, &mut v, cdef, &neighbours);
+    apply_loop_restoration(&mut y, &mut u, &mut v, &deblocked_y, &deblocked_u, &deblocked_v, lr, &lr_grid);
 
     let motion_field = build_motion_field(
         &grid,

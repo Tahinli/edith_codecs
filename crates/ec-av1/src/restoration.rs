@@ -425,6 +425,454 @@ fn read_lr_unit(
     }
 }
 
+// ---------------------------------------------------------------------
+// Spec 7.17: the two pixel filters (Wiener, self-guided) plus the
+// restoration-unit/stripe walk that drives them.
+// ---------------------------------------------------------------------
+
+/// `Round2` (spec 4.7): halves round up, arithmetic shift for negative sums
+/// -- same primitive as `mc.rs`/`warp.rs`'s own `round2`, here at `i64`
+/// since the self-guided filter's intermediate products don't fit `i32`.
+fn round2(value: i64, shift: u32) -> i64 {
+    if shift == 0 {
+        value
+    } else {
+        (value + (1i64 << (shift - 1))) >> shift
+    }
+}
+
+/// One plane's sample fetch for the pixel filters (spec 7.17.2's stripe
+/// boundary substitution, libaom `setup_processing_stripe_boundary`/
+/// `get_stripe_boundary_info`): within the stripe `[stripe_v_start,
+/// stripe_v_end)` currently being filtered, read the post-CDEF plane;
+/// outside it (the 3-row border both filters' kernels reach into), read the
+/// post-deblock, pre-CDEF plane instead -- UNLESS the stripe is the very
+/// first/last stripe in the whole plane, where the frame's own top/bottom
+/// edge replicates (`av1_extend_frame`) rather than crossing into deblocked
+/// data. Columns always clamp to the plane's own true width -- restoration
+/// unit COLUMN boundaries have no such substitution, only stripe (row)
+/// boundaries do.
+#[allow(clippy::too_many_arguments)]
+fn lr_sample(
+    cdef: &[u8],
+    deblocked: &[u8],
+    stride: usize,
+    plane_w: usize,
+    plane_h: usize,
+    stripe_v_start: usize,
+    stripe_v_end: usize,
+    row: i64,
+    col: i64,
+) -> i32 {
+    let col_c = col.clamp(0, plane_w as i64 - 1) as usize;
+    if row >= stripe_v_start as i64 && row < stripe_v_end as i64 {
+        i32::from(cdef[row as usize * stride + col_c])
+    } else if row < stripe_v_start as i64 {
+        if stripe_v_start == 0 {
+            i32::from(cdef[col_c])
+        } else {
+            // libaom saves 2 deblocked context lines and duplicates the
+            // outer one to fill a 3-row border (`RESTORATION_BORDER`):
+            // row `stripe_v_start-1` reads deblocked row `stripe_v_start-1`,
+            // rows `stripe_v_start-2`/`-3` both read deblocked row
+            // `stripe_v_start-2`.
+            let dist = stripe_v_start as i64 - 1 - row;
+            let src_row = if dist == 0 {
+                stripe_v_start - 1
+            } else {
+                stripe_v_start.saturating_sub(2)
+            };
+            i32::from(deblocked[src_row * stride + col_c])
+        }
+    } else if stripe_v_end == plane_h {
+        i32::from(cdef[(plane_h - 1) * stride + col_c])
+    } else {
+        // Mirror image of the above: rows `stripe_v_end`/`stripe_v_end+1`
+        // read their own deblocked row, row `stripe_v_end+2` duplicates
+        // `stripe_v_end+1`.
+        let dist = (row - stripe_v_end as i64).min(1) as usize;
+        let src_row = (stripe_v_end + dist).min(plane_h - 1);
+        i32::from(deblocked[src_row * stride + col_c])
+    }
+}
+
+/// Wiener pixel filter (spec 7.17.4, libaom `wiener_filter_stripe` ->
+/// `av1_wiener_convolve_add_src_c`), one stripe-height chunk of one
+/// restoration unit: a separable 7-tap horizontal pass (rounded by
+/// `WIENER_ROUND0_BITS==3`, clipped to spec's intermediate range) feeding a
+/// 7-tap vertical pass (rounded by `2*FILTER_BITS-3==11`) -- the same
+/// `INTER_ROUND_0`/`INTER_ROUND_1` shifts `mc.rs`'s motion compensation
+/// uses, since AV1 reuses that same separable-filter machinery here with a
+/// custom 7-tap kernel instead of the fixed subpel tables. libaom's C
+/// folds an extra `+/- (1 << ...)` bias into each pass to compensate for a
+/// pointer-alignment trick that borrows the interpolation filter's 8-tap
+/// convolution loop for a 7-tap kernel; that bias cancels algebraically
+/// against `WienerInfo`'s own derived centre tap (`128 - 2*sum(taps)`), so
+/// plugging the real taps straight into `sum(tap * sample)` (no bias term)
+/// reproduces the same output byte-for-byte.
+#[allow(clippy::too_many_arguments)]
+fn apply_wiener_stripe(
+    out: &mut [u8],
+    cdef: &[u8],
+    deblocked: &[u8],
+    stride: usize,
+    plane_w: usize,
+    plane_h: usize,
+    h_start: usize,
+    h_end: usize,
+    v_start: usize,
+    v_end: usize,
+    info: &WienerInfo,
+) {
+    let w = h_end - h_start;
+    let h = v_end - v_start;
+    if w == 0 || h == 0 {
+        return;
+    }
+    let rows = h + 6;
+    let mut inter = vec![0i32; rows * w];
+    for r in 0..rows {
+        let row = v_start as i64 - 3 + r as i64;
+        for c in 0..w {
+            let col = h_start as i64 + c as i64;
+            let mut sum = 0i64;
+            for (t, &tap) in info.hfilter.iter().enumerate() {
+                let x = col - 3 + t as i64;
+                sum += tap as i64
+                    * lr_sample(cdef, deblocked, stride, plane_w, plane_h, v_start, v_end, row, x) as i64;
+            }
+            // `WIENER_CLAMP_LIMIT(round0=3, bd=8) - 1`.
+            inter[r * w + c] = round2(sum, 3).clamp(0, 8191) as i32;
+        }
+    }
+    for r in 0..h {
+        for c in 0..w {
+            let mut sum = 0i64;
+            for (t, &tap) in info.vfilter.iter().enumerate() {
+                sum += tap as i64 * inter[(r + t) * w + c] as i64;
+            }
+            out[(v_start + r) * stride + h_start + c] = round2(sum, 11).clamp(0, 255) as u8;
+        }
+    }
+}
+
+/// `av1_x_by_xplus1` (`restoration.c`): `round(256*z/(z+1))` for `z` in
+/// `[0,255]`, saturating the `z==0` case to `1` instead of `0` (see the
+/// libaom source comment this ports -- keeps `256-A[k]` inside a `u8` and
+/// avoids a later overflow, without visibly affecting a near-flat block).
+const SGR_X_BY_XPLUS1: [i32; 256] = [
+    1, 128, 171, 192, 205, 213, 219, 224, 228, 230, 233, 235, 236, 238, 239, 240, 241, 242, 243, 243, 244, 244, 245,
+    245, 246, 246, 247, 247, 247, 247, 248, 248, 248, 248, 249, 249, 249, 249, 249, 250, 250, 250, 250, 250, 250,
+    250, 251, 251, 251, 251, 251, 251, 251, 251, 251, 251, 252, 252, 252, 252, 252, 252, 252, 252, 252, 252, 252,
+    252, 252, 252, 252, 252, 252, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253,
+    253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254,
+    254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254,
+    254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254,
+    254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 256,
+];
+
+/// `av1_one_by_x` (`restoration.c`): `round(4096/n)` for `n` in `1..=25`
+/// (`MAX_NELEM`, `(2*MAX_RADIUS+1)^2`), indexed `[n-1]`.
+const SGR_ONE_BY_X: [i32; 25] = [
+    4096, 2048, 1365, 1024, 819, 683, 585, 512, 455, 410, 372, 341, 315, 293, 273, 256, 241, 228, 216, 205, 195, 186,
+    178, 171, 164,
+];
+
+const SGRPROJ_MTABLE_BITS: u32 = 20;
+const SGRPROJ_RECIP_BITS: u32 = 12;
+const SGRPROJ_SGR_BITS: u32 = 8;
+const SGRPROJ_RST_BITS: u32 = 4;
+
+/// `calculate_intermediate_result` (`restoration.c`): the blend-factor pair
+/// `(A[k], B[k])` at every position in `-1..=h` x `-1..=w` relative to a
+/// restoration unit (a 1-pixel border around the unit, spec 7.17.3's
+/// `BoxFilter`), for one of the two SGR radii. `r`/`s` are `SGR_PARAMS[ep]`'s
+/// `(r0,s0)` or `(r1,s1)`; libaom computes this only at odd rows for the
+/// `r==2` ("fast") radius as a running-sum speed optimisation -- the box
+/// sum itself is identical at every row regardless, so computing it
+/// everywhere (this function does, via a plain windowed sum through
+/// [`lr_sample`] rather than libaom's O(1)-per-step sliding sum) and only
+/// *reading* the odd rows back in [`apply_sgrproj_stripe`]'s fast branch
+/// reproduces the same values without porting the sliding-window trick.
+#[allow(clippy::too_many_arguments)]
+fn compute_ab(
+    cdef: &[u8],
+    deblocked: &[u8],
+    stride: usize,
+    plane_w: usize,
+    plane_h: usize,
+    h_start: usize,
+    v_start: usize,
+    v_end: usize,
+    w: usize,
+    h: usize,
+    r: i32,
+    s: i32,
+) -> Vec<(i32, i64)> {
+    let gw = w + 2;
+    let gh = h + 2;
+    let mut ab = vec![(0i32, 0i64); gw * gh];
+    let n = ((2 * r + 1) * (2 * r + 1)) as i64;
+    for gi in 0..gh {
+        let i = gi as i64 - 1;
+        for gj in 0..gw {
+            let j = gj as i64 - 1;
+            let mut a = 0i64;
+            let mut b = 0i64;
+            for dr in -r..=r {
+                let row = v_start as i64 + i + dr as i64;
+                for dc in -r..=r {
+                    let col = h_start as i64 + j + dc as i64;
+                    let px =
+                        lr_sample(cdef, deblocked, stride, plane_w, plane_h, v_start, v_end, row, col) as i64;
+                    a += px * px;
+                    b += px;
+                }
+            }
+            let p = if a * n < b * b { 0 } else { a * n - b * b };
+            let z = round2(p * s as i64, SGRPROJ_MTABLE_BITS).clamp(0, 255) as usize;
+            let a_val = SGR_X_BY_XPLUS1[z];
+            let b_val = round2(
+                (256 - a_val) as i64 * b * SGR_ONE_BY_X[(n - 1) as usize] as i64,
+                SGRPROJ_RECIP_BITS,
+            );
+            ab[gi * gw + gj] = (a_val, b_val);
+        }
+    }
+    ab
+}
+
+/// Self-guided pixel filter (spec 7.17.3, libaom `sgrproj_filter_stripe` ->
+/// `av1_apply_selfguided_restoration_c`), one stripe-height chunk of one
+/// restoration unit: up to two box-filtered blends (`SGR_PARAMS[ep]`'s `r0`
+/// "fast"/even-odd-row and `r1` dense radii, either may be `0` and skipped)
+/// combined with the decoded `xqd` weights via `av1_decode_xq`.
+#[allow(clippy::too_many_arguments)]
+fn apply_sgrproj_stripe(
+    out: &mut [u8],
+    cdef: &[u8],
+    deblocked: &[u8],
+    stride: usize,
+    plane_w: usize,
+    plane_h: usize,
+    h_start: usize,
+    h_end: usize,
+    v_start: usize,
+    v_end: usize,
+    info: &SgrprojInfo,
+) {
+    let w = h_end - h_start;
+    let h = v_end - v_start;
+    if w == 0 || h == 0 {
+        return;
+    }
+    let (r0, r1, s0, s1) = SGR_PARAMS[info.ep];
+    let gw = w + 2;
+    let idx = |gi: i64, gj: i64| -> usize { (gi + 1) as usize * gw + (gj + 1) as usize };
+
+    let ab0 = (r0 > 0).then(|| compute_ab(cdef, deblocked, stride, plane_w, plane_h, h_start, v_start, v_end, w, h, r0, s0));
+    let ab1 = (r1 > 0).then(|| compute_ab(cdef, deblocked, stride, plane_w, plane_h, h_start, v_start, v_end, w, h, r1, s1));
+
+    let mut xq = [0i32; 2];
+    if r0 == 0 {
+        xq[0] = 0;
+        xq[1] = (1 << SGRPROJ_PRJ_BITS) - info.xqd[1];
+    } else if r1 == 0 {
+        xq[0] = info.xqd[0];
+        xq[1] = 0;
+    } else {
+        xq[0] = info.xqd[0];
+        xq[1] = (1 << SGRPROJ_PRJ_BITS) - xq[0] - info.xqd[1];
+    }
+
+    for i in 0..h as i64 {
+        for j in 0..w as i64 {
+            let dgd = lr_sample(
+                cdef,
+                deblocked,
+                stride,
+                plane_w,
+                plane_h,
+                v_start,
+                v_end,
+                v_start as i64 + i,
+                h_start as i64 + j,
+            ) as i64;
+            let u = dgd << SGRPROJ_RST_BITS;
+            let mut v = u << SGRPROJ_PRJ_BITS;
+            if let Some(ab) = &ab0 {
+                // "Fast" radius (`r0==2`): A/B were only ever meaningfully
+                // computed at odd rows (see `compute_ab`'s doc comment) --
+                // an even output row blends its two odd neighbour rows
+                // (weight 6/5, `nb=5`), an odd output row reuses its own
+                // row's A/B plus column neighbours (weight 6/5, `nb=4`).
+                let (a, b, nb) = if i & 1 == 0 {
+                    let (a_um1, b_um1) = ab[idx(i - 1, j)];
+                    let (a_up1, b_up1) = ab[idx(i + 1, j)];
+                    let (a_uml, b_uml) = ab[idx(i - 1, j - 1)];
+                    let (a_umr, b_umr) = ab[idx(i - 1, j + 1)];
+                    let (a_upl, b_upl) = ab[idx(i + 1, j - 1)];
+                    let (a_upr, b_upr) = ab[idx(i + 1, j + 1)];
+                    let a = (a_um1 + a_up1) as i64 * 6 + (a_uml + a_umr + a_upl + a_upr) as i64 * 5;
+                    let b = (b_um1 + b_up1) * 6 + (b_uml + b_umr + b_upl + b_upr) * 5;
+                    (a, b, 5u32)
+                } else {
+                    let (a_c, b_c) = ab[idx(i, j)];
+                    let (a_l, b_l) = ab[idx(i, j - 1)];
+                    let (a_r, b_r) = ab[idx(i, j + 1)];
+                    let a = a_c as i64 * 6 + (a_l + a_r) as i64 * 5;
+                    let b = b_c * 6 + (b_l + b_r) * 5;
+                    (a, b, 4u32)
+                };
+                let flt0 = round2(a * dgd + b, SGRPROJ_SGR_BITS + nb - SGRPROJ_RST_BITS);
+                v += xq[0] as i64 * (flt0 - u);
+            }
+            if let Some(ab) = &ab1 {
+                // Dense radius (`r1==1`): every row was computed, so the
+                // combine is the full 3x3 neighbourhood (weight 4/3).
+                let (a_c, b_c) = ab[idx(i, j)];
+                let (a_u, b_u) = ab[idx(i - 1, j)];
+                let (a_d, b_d) = ab[idx(i + 1, j)];
+                let (a_l, b_l) = ab[idx(i, j - 1)];
+                let (a_r, b_r) = ab[idx(i, j + 1)];
+                let (a_ul, b_ul) = ab[idx(i - 1, j - 1)];
+                let (a_ur, b_ur) = ab[idx(i - 1, j + 1)];
+                let (a_dl, b_dl) = ab[idx(i + 1, j - 1)];
+                let (a_dr, b_dr) = ab[idx(i + 1, j + 1)];
+                let a = (a_c + a_u + a_d + a_l + a_r) as i64 * 4 + (a_ul + a_ur + a_dl + a_dr) as i64 * 3;
+                let b = (b_c + b_u + b_d + b_l + b_r) * 4 + (b_ul + b_ur + b_dl + b_dr) * 3;
+                let flt1 = round2(a * dgd + b, SGRPROJ_SGR_BITS + 5 - SGRPROJ_RST_BITS);
+                v += xq[1] as i64 * (flt1 - u);
+            }
+            let out_v = round2(v, SGRPROJ_PRJ_BITS as u32 + SGRPROJ_RST_BITS).clamp(0, 255) as u8;
+            out[(v_start as i64 + i) as usize * stride + (h_start as i64 + j) as usize] = out_v;
+        }
+    }
+}
+
+/// Chunks one restoration unit's `[v_start, v_end)` extent into 64-row
+/// (56 for the plane's very first stripe -- `RESTORATION_UNIT_OFFSET==8`)
+/// processing stripes and filters each (libaom
+/// `av1_loop_restoration_filter_unit`'s own `while (i < unit_h)` loop) --
+/// a restoration unit can be up to `256*1.5` px tall, spanning several
+/// stripes, each of which needs its own boundary-source decision from
+/// [`lr_sample`].
+#[allow(clippy::too_many_arguments)]
+fn filter_restoration_unit(
+    out: &mut [u8],
+    cdef: &[u8],
+    deblocked: &[u8],
+    stride: usize,
+    plane_w: usize,
+    plane_h: usize,
+    h_start: usize,
+    h_end: usize,
+    v_start: usize,
+    v_end: usize,
+    ss_y: u32,
+    filter: UnitFilter,
+) {
+    let full_stripe_height = 64usize >> ss_y;
+    let runit_offset = 8usize >> ss_y;
+    let unit_h = v_end - v_start;
+    let mut i = 0usize;
+    while i < unit_h {
+        let stripe_v_start = v_start + i;
+        let frame_stripe = (stripe_v_start + runit_offset) / full_stripe_height;
+        let nominal_h = full_stripe_height - if frame_stripe == 0 { runit_offset } else { 0 };
+        let h = nominal_h.min(unit_h - i);
+        let stripe_v_end = stripe_v_start + h;
+        match filter {
+            UnitFilter::Wiener(info) => apply_wiener_stripe(
+                out, cdef, deblocked, stride, plane_w, plane_h, h_start, h_end, stripe_v_start, stripe_v_end, &info,
+            ),
+            UnitFilter::Sgrproj(info) => apply_sgrproj_stripe(
+                out, cdef, deblocked, stride, plane_w, plane_h, h_start, h_end, stripe_v_start, stripe_v_end, &info,
+            ),
+            UnitFilter::None => {}
+        }
+        i += h;
+    }
+}
+
+/// Applies loop restoration to one whole plane's post-CDEF samples (spec
+/// 7.17). Walks restoration units exactly as libaom's
+/// `foreach_rest_unit_in_plane` (`unit_size` steps, the tail folded into
+/// the previous unit when the remainder is under `1.5*unit_size` -- the
+/// same round-to-nearest [`count_units`] already used to size
+/// [`RestorationGrid`]), then re-offsets internal row boundaries by
+/// `RESTORATION_UNIT_OFFSET==8` (the first/last row of the plane keeps its
+/// full extent). Returns a fresh copy of `cdef` with only this plane's
+/// restoration-unit pixels replaced -- a restoration unit must never read
+/// another, already-filtered unit's output (spec keeps a separate
+/// destination buffer for exactly this reason), so this never filters in
+/// place.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_loop_restoration_plane(
+    cdef: &[u8],
+    deblocked: &[u8],
+    stride: usize,
+    plane_w: usize,
+    plane_h: usize,
+    ss_y: u32,
+    ftype: RestorationType,
+    unit_size: u32,
+    grid: &RestorationGrid,
+    plane: usize,
+) -> Vec<u8> {
+    let mut out = cdef.to_vec();
+    if ftype == RestorationType::None || unit_size == 0 {
+        return out;
+    }
+    let voffset = 8u32 >> ss_y;
+    let ext_size = (unit_size * 3) / 2;
+    let mut y0 = 0u32;
+    let mut rrow = 0usize;
+    while y0 < plane_h as u32 {
+        let remaining_h = plane_h as u32 - y0;
+        let uh = if remaining_h < ext_size { remaining_h } else { unit_size };
+        let v_start = (y0 as i64 - voffset as i64).max(0) as u32;
+        let mut v_end = y0 + uh;
+        if v_end < plane_h as u32 {
+            v_end -= voffset;
+        }
+
+        let mut x0 = 0u32;
+        let mut rcol = 0usize;
+        while x0 < plane_w as u32 {
+            let remaining_w = plane_w as u32 - x0;
+            let uw = if remaining_w < ext_size { remaining_w } else { unit_size };
+            let filter = grid.get(plane, rrow, rcol);
+            if filter != UnitFilter::None {
+                filter_restoration_unit(
+                    &mut out,
+                    cdef,
+                    deblocked,
+                    stride,
+                    plane_w,
+                    plane_h,
+                    x0 as usize,
+                    (x0 + uw) as usize,
+                    v_start as usize,
+                    v_end as usize,
+                    ss_y,
+                    filter,
+                );
+            }
+            x0 += uw;
+            rcol += 1;
+        }
+        y0 += uh;
+        rrow += 1;
+    }
+    debug_assert_eq!(rrow, grid.vert_units[plane], "RU row walk must match RestorationGrid::new's count_units");
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
