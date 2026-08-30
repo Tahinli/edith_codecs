@@ -185,20 +185,24 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 "a frame with segmentation enabled (this decoder never reads a per-block segment_id symbol)",
             ));
         }
-        // lane-superres Step 0: `use_superres` adds/removes no per-block
-        // symbol (spec 7.16's upscaling is a pixel-domain post-process run
-        // after loop restoration, `av1_upscale_normative_*` in libaom's
-        // `resize.c`), so this crate's tile readers stay bit-exact-in-sync
-        // even without support. But every decode path below reads and
-        // stores the frame at `header.frame_width` (the downscaled coded
-        // width) and never runs the upscaler, so a superres stream would
-        // silently produce a `Picture` sized `frame_width` instead of the
-        // spec's `upscaled_width` -- SILENT WRONGNESS, not a desync. Refuse
-        // by name until the upscaler (lane-superres) lands.
-        if header.use_superres {
+        // lane-superres stage 2/3: `use_superres` adds/removes no per-block
+        // symbol (spec 7.16's upscaling is a pixel-domain post-process
+        // libaom's `decodeframe.c` runs between CDEF and loop restoration,
+        // `av1_upscale_normative_*` in `resize.c`), so a key frame's tile
+        // reads stay bit-exact in sync and `crate::superres::upscale_picture`
+        // (below, after decode) makes its `Picture` the spec-correct
+        // `upscaled_width` instead of silently staying at `frame_width`.
+        // An INTER frame under `use_superres` still refuses: its reference
+        // is stored upscaled while the current frame decodes at the
+        // downscaled `frame_width`, so `decode_inter_frame_tile_with_cdfs`'s
+        // motion compensation would sample a reference at the wrong scale
+        // (spec 7.11.3.3's scaled-reference path is not ported) --
+        // SILENT WRONGNESS, not a desync, same as the key-frame case used
+        // to be. Left for a later stage of this lane.
+        if header.use_superres && header.frame_type != FrameType::Key {
             return Err(Error::unsupported(
                 "AV1 decode_stream",
-                "a frame with use_superres set (this decoder never runs the spec 7.16 upscaler; it would silently output the frame at the downscaled frame_width instead of upscaled_width)",
+                "an inter frame with use_superres set (this decoder never scales its motion-compensated reference to match the current frame's downscaled size, spec 7.11.3.3)",
             ));
         }
         // Loop restoration carries per-restoration-unit symbols in the tile
@@ -392,6 +396,16 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 header.allow_screen_content_tools,
                 header.allow_intrabc,
             )?;
+            // lane-superres stage 3, spec 7.16: upscale AFTER deblock+CDEF
+            // (both already applied inside `decode_key_frame_tile_with_cdfs`)
+            // and BEFORE this picture is stored as a reference or handed to
+            // the caller -- loop restoration is not yet ported, so there is
+            // no LR step here for the upscale to precede.
+            let picture = if header.use_superres {
+                crate::superres::upscale_picture(&picture, header.upscaled_width as usize)
+            } else {
+                picture
+            };
             // A key frame codes no inter blocks -- its own saved motion
             // field has no cells set, matching libaom's own "intra frame
             // contributes nothing to a later projection" behaviour, but
@@ -3794,6 +3808,109 @@ mod tests {
              different refusal instead: {msg}"
         );
         eprintln!("{NAME}: refused by name: {msg}");
+    }
+
+    /// lane-superres stage 3: a real aomenc `--superres-mode=1` key-frame
+    /// sequence must decode pixel-exact vs ffmpeg/dav1d's own upscaled
+    /// output, and must actually run [`crate::superres::upscale_picture`]
+    /// (`superres_hits > 0`) -- a decoder that silently stopped upscaling
+    /// would otherwise pass vacuously (class `gate-blind-to-feature`).
+    /// `--kf-max-dist` set to the frame count keeps every frame a key
+    /// frame: inter-frame superres (a differently-scaled reference) is a
+    /// later stage of this lane, refused by name today.
+    #[test]
+    fn a_real_aomenc_superres_key_frame_sequence_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_superres_key_frame_sequence_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height, frame_count) = (64usize, 64usize, 3usize);
+        let duration = frame_count as f64 / 25.0;
+        let source = gradients_source(7, width, height, &format!("duration={duration}:rate=25"));
+        let y4m = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                &source,
+                "-pix_fmt",
+                "yuv420p",
+                "-f",
+                "yuv4mpegpipe",
+                "-",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ffmpeg failed to run");
+        assert!(
+            y4m.status.success(),
+            "ffmpeg fixture: {}",
+            String::from_utf8_lossy(&y4m.stderr)
+        );
+        let args: Vec<&str> = vec![
+            "--codec=av1",
+            "--passes=1",
+            "--end-usage=q",
+            "--cq-level=32",
+            "--cpu-used=0",
+            "--kf-max-dist=0",
+            "--threads=1",
+            "--row-mt=0",
+            "--superres-mode=1",
+            "--superres-denominator=12",
+            "--obu",
+            "-o",
+            "-",
+            "-",
+        ];
+        let mut child = Command::new(aomenc_path())
+            .args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("aomenc failed to start");
+        child
+            .stdin
+            .take()
+            .expect("aomenc stdin")
+            .write_all(&y4m.stdout)
+            .expect("writing y4m to aomenc");
+        let out = child.wait_with_output().expect("aomenc failed to run");
+        assert!(
+            out.status.success(),
+            "aomenc refused the fixture: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stream = out.stdout;
+        let frames =
+            decode_stream(&stream).unwrap_or_else(|e| panic!("{NAME} refused: {e}"));
+        assert_eq!(frames.len(), frame_count);
+        let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
+        for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+            assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg");
+            assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg");
+            assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg");
+        }
+        assert!(
+            crate::superres::superres_hits() > 0,
+            "{NAME}: matched but zero superres_hits -- the gate never actually exercised the \
+             upscaler, it proves nothing"
+        );
+        eprintln!(
+            "{NAME}: {frame_count} frames pixel-exact, superres_hits={}",
+            crate::superres::superres_hits()
+        );
     }
 
     /// lane-interintra r1: `--enable-interintra-comp=1` streams must DECODE
