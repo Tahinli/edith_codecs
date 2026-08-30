@@ -166,17 +166,13 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         // (spec 5.11.10/5.11.11, one symbol group per superblock). Refuse
         // before desyncing rather than silently miscode, the same pattern as
         // the CDEF/TxMode::Select refusals above.
-        // Key frames now consume (not reconstruct) palette/intrabc syntax
-        // via read_intra_mode, so the arithmetic decoder stays in sync;
-        // decode_inter_block/decode_inter_block8's intra-sub-block branches
-        // still have no such wiring, so a non-key frame with the bit set
-        // still desyncs and must refuse.
-        if header.frame_type != FrameType::Key && header.allow_screen_content_tools {
-            return Err(Error::unsupported(
-                "AV1 decode_stream",
-                "a non-key frame with allow_screen_content_tools set (this decoder's inter path never reads intrabc/palette_mode_info)",
-            ));
-        }
+        // lane-screen r2: key frames consume (not reconstruct) palette/
+        // intrabc syntax via read_intra_mode, and decode_inter_block/
+        // decode_inter_block8's own intra-sub-block branches now consume
+        // palette the same way (libaom's read_intra_block_mode_info has no
+        // intrabc call at all -- that symbol is intra-frame-only). A
+        // genuine palette/intrabc use still refuses by name deeper in the
+        // block readers, so no whole-frame refusal is needed here anymore.
         if header.delta.q_present || header.delta.lf_present {
             return Err(Error::unsupported(
                 "AV1 decode_stream",
@@ -464,6 +460,7 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 header.reduced_tx_set,
                 header.is_motion_mode_switchable,
                 header.allow_warped_motion,
+                header.allow_screen_content_tools,
             )?
         };
         // Spec 7.20: `disable_frame_end_update_cdf` stores the frame's
