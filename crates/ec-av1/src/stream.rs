@@ -259,30 +259,27 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 "an inter frame whose global motion for a single-reference frame is AFFINE (unverified this round; ROTZOOM/TRANSLATION/IDENTITY are proven)",
             ));
         }
-        // lane-gm r4: a NEW mismatch, distinct from the one this round
-        // fixed and NOT explained by `reference_select`/compound (traced
-        // live: the mismatched frame of the seed-43 pin has
-        // `reference_select == false`) -- localized instead to the one
-        // property that DOES distinguish it from every frame that already
-        // matches: TWO different ref slots (`GOLDEN_FRAME`, `BWDREF_FRAME`)
-        // carry a non-translation model AT THE SAME TIME. The pin-verified
-        // fix (frame 1) only ever exercised a single active non-identity
-        // slot (`LAST_FRAME` alone). Root cause not yet found within this
-        // round's budget (do not guess-fix): refuse the untested shape by
-        // name -- more than one concurrently active ROTZOOM/AFFINE ref --
-        // rather than ship it silently wrong.
-        if header.frame_type != FrameType::Key
-            && header.global_motion[..7]
-                .iter()
-                .filter(|gm| gm.model != WarpModel::Identity && gm.model != WarpModel::Translation)
-                .count()
-                > 1
-        {
-            return Err(Error::unsupported(
-                "AV1 decode_stream",
-                "an inter frame with more than one concurrently active ROTZOOM/AFFINE global-motion ref slot (single-active-slot ROTZOOM is pin-verified; this shape is not)",
-            ));
-        }
+        // lane-gm r4/r5/r6: r4 found a NEW mismatch on frames with two
+        // concurrently active ROTZOOM/AFFINE ref slots (GOLDEN + BWDREF) and
+        // refused the shape by name rather than guess-fix it. r5 localized
+        // the mismatch to an ordinary NEWMV/GOLDEN block, not the new
+        // global-warp branch at all -- proving "two active slots" was a
+        // correlated symptom, not the cause. r6 range-laddered that block
+        // against aomdec's `EC_TRACE_MODE` (identical `rng` before/after
+        // mode info -- symbol consumption bit-exact) and found the real
+        // defect in `mvstack.rs`'s single-reference predictor fallback:
+        // libaom's `setup_ref_mv_list` fills any `mv_ref_list` slot the real
+        // neighbour scan left short with this block's OWN global motion
+        // vector for its ref (`gm_get_motion_vector`), not zero -- invisible
+        // whenever the live ref's global motion is itself
+        // identity/translation, wrong the moment it's a real ROTZOOM/AFFINE
+        // and the querying block's own stack comes up short (frame 14's
+        // mi=(0,0), the very first block decoded, has no neighbours at
+        // all). Fixed at the predictor fallback; the refusal above (single
+        // untested shape: AFFINE on a single-ref frame) stays, but the
+        // *multi-slot* refusal this comment used to guard is lifted -- the
+        // r5/r6 pin (seed-43 wedge-gate mismatch) now decodes all 24 frames
+        // byte-exact with it gone.
         // lane-av1comp: `decode_inter_block`/`decode_inter_block8` now read
         // `comp_mode` per block whenever this frame's own `reference_select`
         // header bit is set (spec 5.11.25), and refuse by name the blocks

@@ -1000,13 +1000,26 @@ pub fn find_mv_stack_with_sign_bias(
     for e in candidates.iter_mut() {
         e.mv = clamp(e.mv);
     }
-    let nearest_mv = candidates.first().map_or((0, 0), |e| clamp(e.mv));
-    let near_mv = candidates.get(1).map_or((0, 0), |e| clamp(e.mv));
-    let pred_mv = if candidates.is_empty() {
-        (0, 0)
-    } else {
-        nearest_mv
-    };
+    // libaom `setup_ref_mv_list`'s single-reference-extension tail
+    // (mvref_common.c ~778-780): once the real scan/extension passes are
+    // done, every `mv_ref_list` slot still empty (`idx >= refmv_count`, up
+    // to `MAX_MV_REF_CANDIDATES`=2) is filled with `gm_mv_candidates[0]` --
+    // this query block's OWN global motion vector for `ref_frame`, not a
+    // zero fallback -- and that fill is UNclamped (only the real
+    // `ref_mv_stack` entries go through `clamp_mv_ref` above). r6: this was
+    // `(0, 0)` here, invisible whenever a live ref's global motion is
+    // itself translation/identity (an unclamped gm mv of exactly (0,0)),
+    // and wrong the moment a ref carries a real ROTZOOM/AFFINE model and a
+    // query block's stack comes up short -- e.g. the very first block of a
+    // frame (mi=(0,0), no neighbours at all, `nearest_match`/`ref_match_count`
+    // both 0) coded NEWMV against a ROTZOOM-global ref: range-ladder against
+    // aomdec's `EC_TRACE_MODE` confirmed identical symbol consumption (same
+    // `rng` before/after mode info) with a different final mv purely from
+    // this predictor gap.
+    let gm_fallback = gm_mv(gm, ref_frame);
+    let nearest_mv = candidates.first().map_or(gm_fallback, |e| clamp(e.mv));
+    let near_mv = candidates.get(1).map_or(gm_fallback, |e| clamp(e.mv));
+    let pred_mv = nearest_mv;
 
     // Exact port of the `mode_context[ref_frame]` switch (mvref_common.c
     // ~line 619-643). `new_mv_ctx` depends on `nearest_match` and the real
