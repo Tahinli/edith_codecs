@@ -6157,18 +6157,21 @@ pub fn decode_key_frame_tile(
 thread_local! {
     /// lane-superres r3: the real decoded margin beyond `frame_width` up to
     /// the mi-aligned `true_width`, set by the most recent
-    /// [`decode_key_frame_tile_with_cdfs`] call. See that function's own
-    /// comment at the write site. `None` when there was no margin to save.
-    static LAST_KEY_FRAME_WIDE_MARGIN: std::cell::RefCell<Option<Picture>> =
+    /// [`decode_key_frame_tile_with_cdfs`] OR (lane-superres r10)
+    /// [`decode_inter_frame_tile_with_cdfs`] call -- both frame kinds crop
+    /// their reconstructed buffer down from the same mi-aligned extent, so
+    /// they share this one slot. See each function's own comment at its
+    /// write site. `None` when there was no margin to save.
+    static LAST_FRAME_WIDE_MARGIN: std::cell::RefCell<Option<Picture>> =
         const { std::cell::RefCell::new(None) };
 }
 
-/// The margin [`decode_key_frame_tile_with_cdfs`] most recently stashed
-/// (see [`LAST_KEY_FRAME_WIDE_MARGIN`]) -- `stream.rs`'s superres path
-/// reads this immediately after the call, before any other key frame
+/// The margin the most recent key- or inter-frame tile decode stashed
+/// (see [`LAST_FRAME_WIDE_MARGIN`]) -- `stream.rs`'s superres path
+/// reads this immediately after the call, before any other frame
 /// decode can overwrite it.
-pub(crate) fn take_last_key_frame_wide_margin() -> Option<Picture> {
-    LAST_KEY_FRAME_WIDE_MARGIN.with(|m| m.borrow_mut().take())
+pub(crate) fn take_last_frame_wide_margin() -> Option<Picture> {
+    LAST_FRAME_WIDE_MARGIN.with(|m| m.borrow_mut().take())
 }
 
 /// [`decode_key_frame_tile`], threading a cross-frame CDF forward (spec
@@ -6875,7 +6878,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
 
     let (fw, fh) = (frame_width as usize, frame_height as usize);
     if fw == width && fh == height {
-        LAST_KEY_FRAME_WIDE_MARGIN.with(|m| *m.borrow_mut() = None);
+        LAST_FRAME_WIDE_MARGIN.with(|m| *m.borrow_mut() = None);
         return Ok((
             Picture {
                 width,
@@ -6908,7 +6911,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     // reaches into that real margin; `None` when there is no margin (this
     // frame's `true_width`/`true_height` already equal `fw`/`fh`, e.g. a
     // non-superres frame whose width just isn't 32-block aligned).
-    LAST_KEY_FRAME_WIDE_MARGIN.with(|m| {
+    LAST_FRAME_WIDE_MARGIN.with(|m| {
         *m.borrow_mut() = if true_width > fw || true_height > fh {
             let yc = crop(&y, true_width, true_height);
             if let Ok(path) = std::env::var("EC_AV1_MARGIN_DUMP") {
@@ -8292,6 +8295,13 @@ fn decode_inter_block(
     // `frame_is_intra_only`), but it still calls `read_palette_mode_info`
     // under the same `av1_allow_palette` gate as the key-frame path.
     allow_screen_content_tools: bool,
+    // lane-superres r9: this frame's own coded luma width (spec 7.11.3.3) --
+    // compared against each reference's stored picture width to decide
+    // whether a scaled-MC path (`mc::predict_scaled`) or the ordinary
+    // stride-1 one (`mc::predict_with_filters`) applies per reference, and to
+    // refuse (rather than mis-decode) the warp/OBMC/interintra/compound
+    // combinations that don't implement scaled MC yet.
+    frame_width: usize,
 ) -> Result<()> {
     let (r, c) = at;
     let (px, py) = (c * SUB, r * SUB);
@@ -8849,6 +8859,16 @@ fn decode_inter_block(
                 true,
             );
             block_filter = resolved_filter;
+
+            // lane-superres r9: a scaled reference in a COMPOUND_REFERENCE
+            // block (either tap) is not wired -- mc::predict_compound_intermediate
+            // has no scaled counterpart yet -- refuse by name rather than
+            // silently sample it unscaled.
+            if py0.width != frame_width || py1.width != frame_width {
+                return Err(unsupported(
+                    "a compound-reference block with a scaled reference (superres, unimplemented)",
+                ));
+            }
 
             let mut inter0_y = vec![0i32; side * side];
             mc::predict_compound_intermediate(
@@ -9524,48 +9544,110 @@ fn decode_inter_block(
             mode_for_tx = 0;
             uv_predict_mode = DC_PRED;
 
+            // lane-superres r9: spec 7.11.3.3's x_scale_fp comes from LUMA
+            // widths only (r8's derivation) and applies unchanged to the
+            // chroma calls below (their x_q4 is already in the chroma
+            // plane's own pixel units). `mc::predict_scaled` has no warp/OBMC
+            // /interintra counterpart -- those three combinations are refused
+            // by name instead of silently sampling a scaled reference wrong
+            // (warp_params/obmc_selected/interintra_mode are all resolved by
+            // this point, every symbol for this block already read).
+            let luma_scale = mc::scale_factor(py_ref.width, frame_width);
+            if luma_scale != mc::REF_NO_SCALE
+                && (warp_params.is_some() || obmc_selected || interintra_mode.is_some())
+            {
+                return Err(unsupported(
+                    "warp/OBMC/interintra prediction with a scaled reference (superres, unimplemented)",
+                ));
+            }
+
             let mut pred_y = vec![0u16; side * side];
-            mc::predict_with_filters(
-                &py_ref.data,
-                py_ref.width,
-                py_ref.true_width,
-                py_ref.true_height,
-                mv_to_q4(px, mv.1, true),
-                mv_to_q4(py, mv.0, true),
-                side,
-                side,
-                h_filter,
-                v_filter,
-                &mut pred_y,
-            );
             let mut pred_u = vec![0u16; chroma_side * chroma_side];
-            mc::predict_with_filters(
-                &pu_ref.data,
-                pu_ref.width,
-                pu_ref.true_width,
-                pu_ref.true_height,
-                mv_to_q4(cpx, mv.1, false),
-                mv_to_q4(cpy, mv.0, false),
-                chroma_side,
-                chroma_side,
-                h_filter,
-                v_filter,
-                &mut pred_u,
-            );
             let mut pred_v = vec![0u16; chroma_side * chroma_side];
-            mc::predict_with_filters(
-                &pv_ref.data,
-                pv_ref.width,
-                pv_ref.true_width,
-                pv_ref.true_height,
-                mv_to_q4(cpx, mv.1, false),
-                mv_to_q4(cpy, mv.0, false),
-                chroma_side,
-                chroma_side,
-                h_filter,
-                v_filter,
-                &mut pred_v,
-            );
+            if luma_scale == mc::REF_NO_SCALE {
+                mc::predict_with_filters(
+                    &py_ref.data,
+                    py_ref.width,
+                    py_ref.true_width,
+                    py_ref.true_height,
+                    mv_to_q4(px, mv.1, true),
+                    mv_to_q4(py, mv.0, true),
+                    side,
+                    side,
+                    h_filter,
+                    v_filter,
+                    &mut pred_y,
+                );
+                mc::predict_with_filters(
+                    &pu_ref.data,
+                    pu_ref.width,
+                    pu_ref.true_width,
+                    pu_ref.true_height,
+                    mv_to_q4(cpx, mv.1, false),
+                    mv_to_q4(cpy, mv.0, false),
+                    chroma_side,
+                    chroma_side,
+                    h_filter,
+                    v_filter,
+                    &mut pred_u,
+                );
+                mc::predict_with_filters(
+                    &pv_ref.data,
+                    pv_ref.width,
+                    pv_ref.true_width,
+                    pv_ref.true_height,
+                    mv_to_q4(cpx, mv.1, false),
+                    mv_to_q4(cpy, mv.0, false),
+                    chroma_side,
+                    chroma_side,
+                    h_filter,
+                    v_filter,
+                    &mut pred_v,
+                );
+            } else {
+                mc::predict_scaled(
+                    &py_ref.data,
+                    py_ref.width,
+                    py_ref.true_width,
+                    py_ref.true_height,
+                    mv_to_q4(px, mv.1, true),
+                    mv_to_q4(py, mv.0, true),
+                    luma_scale,
+                    side,
+                    side,
+                    h_filter,
+                    v_filter,
+                    &mut pred_y,
+                );
+                mc::predict_scaled(
+                    &pu_ref.data,
+                    pu_ref.width,
+                    pu_ref.true_width,
+                    pu_ref.true_height,
+                    mv_to_q4(cpx, mv.1, false),
+                    mv_to_q4(cpy, mv.0, false),
+                    luma_scale,
+                    chroma_side,
+                    chroma_side,
+                    h_filter,
+                    v_filter,
+                    &mut pred_u,
+                );
+                mc::predict_scaled(
+                    &pv_ref.data,
+                    pv_ref.width,
+                    pv_ref.true_width,
+                    pv_ref.true_height,
+                    mv_to_q4(cpx, mv.1, false),
+                    mv_to_q4(cpy, mv.0, false),
+                    luma_scale,
+                    chroma_side,
+                    chroma_side,
+                    h_filter,
+                    v_filter,
+                    &mut pred_v,
+                );
+            }
 
             if let Some(params) = &warp_params {
                 crate::warp::warp_affine(
@@ -11182,9 +11264,16 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         return Err(unsupported("a frame with no mode-info grid"));
     }
     let (true_width, true_height) = ((mi_cols * 4) as usize, (mi_rows * 4) as usize);
-    if reference.width != true_width || reference.height != true_height {
+    // lane-superres r10: a width mismatch alone is no longer refused here --
+    // `mc::predict_scaled` (spec 7.11.3.3, threaded through
+    // `decode_inter_block`'s single-ref branch) exists precisely for a
+    // `use_superres` reference at a different width than this frame's own
+    // true size. Height must still match: AV1 superres never scales height
+    // (r8's derivation, `mc.rs`'s own doc), and nothing in this decode path
+    // has a vertical scaling pass.
+    if reference.height != true_height {
         return Err(unsupported(
-            "a reference picture that is not this frame's own true size",
+            "a reference picture whose height does not match this frame's own true size",
         ));
     }
     let (cols, rows) = block_grid(mi_cols, mi_rows);
@@ -11555,6 +11644,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             BLOCK,
                             BLOCK,
                             allow_screen_content_tools,
+                            frame_width as usize,
                         )?;
                     }
                     PARTITION_SPLIT => {
@@ -11634,6 +11724,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     SUB,
                                     SUB,
                                     allow_screen_content_tools,
+                                    frame_width as usize,
                                 )?;
                             } else {
                                 let ctx16 = neighbours.partition_ctx(at16, SUB);
@@ -11653,6 +11744,24 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     .map(|i| (mi_row0 + (i / 2) * 2, mi_col0 + (i % 2) * 2))
                                     .filter(|&(mr, mc)| mr < mi_rows && mc < mi_cols)
                                     .collect();
+                                // lane-superres r9: decode_inter_block8's own
+                                // MC (below) is not threaded for a scaled
+                                // reference (unlike decode_inter_block's 19
+                                // sites) -- refuse the whole 8x8-leaf split
+                                // up front when ANY live reference this leaf
+                                // could pick has a different width than this
+                                // frame, rather than thread frame_width
+                                // through its own single-ref/compound MC
+                                // calls to reach the same block this round.
+                                if ref_y.width != frame_width as usize
+                                    || ref_slots.iter().flatten().any(|(py, _, _)| {
+                                        py.width != frame_width as usize
+                                    })
+                                {
+                                    return Err(unsupported(
+                                        "an 8x8 partition leaf under a scaled reference (superres, unimplemented)",
+                                    ));
+                                }
                                 let mut prev_leaf: Option<((usize, usize), bool, bool)> = None;
                                 let mut last_compound_ctx: Option<(i8, i8, u8, u8)> = None;
                                 let mut last_skip_mode = false;
@@ -11812,6 +11921,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             BLOCK,
                             SUB,
                             allow_screen_content_tools,
+                            frame_width as usize,
                         )?;
                         if (r32 * 2 + 1) as u32 * SUB_MI < mi_rows {
                             decode_inter_block(
@@ -11865,6 +11975,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                 SUB,
                                 SUB,
                                 allow_screen_content_tools,
+                                frame_width as usize,
                             )?;
                             if (c32 * 2 + 1) as u32 * SUB_MI < mi_cols {
                                 decode_inter_block(
@@ -11918,6 +12029,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     SUB,
                                     SUB,
                                     allow_screen_content_tools,
+                                    frame_width as usize,
                                 )?;
                             }
                         }
@@ -11977,6 +12089,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             BLOCK,
                             SUB,
                             allow_screen_content_tools,
+                            frame_width as usize,
                         )?;
                         decode_inter_block(
                             &mut dec,
@@ -12025,6 +12138,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             BLOCK,
                             SUB,
                             allow_screen_content_tools,
+                            frame_width as usize,
                         )?;
                     }
                     PARTITION_VERT => {
@@ -12078,6 +12192,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             SUB,
                             BLOCK,
                             allow_screen_content_tools,
+                            frame_width as usize,
                         )?;
                         decode_inter_block(
                             &mut dec,
@@ -12126,6 +12241,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             SUB,
                             BLOCK,
                             allow_screen_content_tools,
+                            frame_width as usize,
                         )?;
                     }
                     PARTITION_HORZ_A => {
@@ -12184,6 +12300,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             SUB,
                             SUB,
                             allow_screen_content_tools,
+                            frame_width as usize,
                         )?;
                         decode_inter_block(
                             &mut dec,
@@ -12236,6 +12353,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             SUB,
                             SUB,
                             allow_screen_content_tools,
+                            frame_width as usize,
                         )?;
                         decode_inter_block(
                             &mut dec,
@@ -12284,6 +12402,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             BLOCK,
                             SUB,
                             allow_screen_content_tools,
+                            frame_width as usize,
                         )?;
                     }
                     PARTITION_VERT_A => {
@@ -12341,6 +12460,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             SUB,
                             SUB,
                             allow_screen_content_tools,
+                            frame_width as usize,
                         )?;
                         decode_inter_block(
                             &mut dec,
@@ -12393,6 +12513,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             SUB,
                             SUB,
                             allow_screen_content_tools,
+                            frame_width as usize,
                         )?;
                         decode_inter_block(
                             &mut dec,
@@ -12441,6 +12562,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             SUB,
                             BLOCK,
                             allow_screen_content_tools,
+                            frame_width as usize,
                         )?;
                     }
                     PARTITION_VERT_B => {
@@ -12495,6 +12617,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             SUB,
                             BLOCK,
                             allow_screen_content_tools,
+                            frame_width as usize,
                         )?;
                         decode_inter_block(
                             &mut dec,
@@ -12547,6 +12670,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             SUB,
                             SUB,
                             allow_screen_content_tools,
+                            frame_width as usize,
                         )?;
                         decode_inter_block(
                             &mut dec,
@@ -12599,6 +12723,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             SUB,
                             SUB,
                             allow_screen_content_tools,
+                            frame_width as usize,
                         )?;
                     }
                     _ => {
@@ -12656,6 +12781,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
 
     let (fw, fh) = (frame_width as usize, frame_height as usize);
     if fw == width && fh == height {
+        LAST_FRAME_WIDE_MARGIN.with(|m| *m.borrow_mut() = None);
         return Ok((
             Picture {
                 width,
@@ -12675,6 +12801,30 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         }
         out
     };
+    // lane-superres r10 (fixed r9): same real-margin stash as
+    // `decode_key_frame_tile_with_cdfs` (see that function's comment) -- the
+    // real reconstructed extent is the mi-aligned `true_width`/`true_height`
+    // (`mi_cols`/`mi_rows` * 4), NOT the superblock-padded `width`/`height`
+    // this branch was reading before: columns `[true_width, width)` were
+    // never actually coded (the last partial superblock stops at
+    // `true_width`), so stashing out to `width` handed the chroma upscale's
+    // right-edge replicate a slice of uninitialized/stale buffer one column
+    // early -- the same shorten-vs-replicate shape as `av1-truesize`. The
+    // key-frame branch above already used `true_width`/`true_height`; this
+    // just matches it.
+    LAST_FRAME_WIDE_MARGIN.with(|m| {
+        *m.borrow_mut() = if true_width > fw || true_height > fh {
+            Some(Picture {
+                width: true_width,
+                height: true_height,
+                y: crop(&y, true_width, true_height),
+                u: crop(&u, true_width.div_ceil(2), true_height.div_ceil(2)),
+                v: crop(&v, true_width.div_ceil(2), true_height.div_ceil(2)),
+            })
+        } else {
+            None
+        }
+    });
     Ok((
         Picture {
             width: fw,
@@ -13453,6 +13603,7 @@ mod tests {
             side,
             side,
             false,
+            width,
         )
         .unwrap();
 

@@ -44,7 +44,6 @@ const REFUSALS: &[&str] = &[
     "a superblock-level HORZ/VERT strip with a split transform (per-unit rect prediction is not ported)",
     "a tx_type symbol outside its CDF's own set: {t}",
     "an INTER 32x32 partition type this decoder does not code (value={part32})",
-    "an inter frame with use_superres set (this decoder never scales its motion-compensated reference to match the current frame's downscaled size, spec 7.11.3.3)",
     "a superblock-level partition type other than NONE or SPLIT (this decoder's intra tile path codes only those two at 64x64)",
     "a HORZ/VERT intra strip in a screen-content frame (palette syntax is consumed for square blocks only)",
     "a HORZ/VERT intra strip with a split transform (per-unit rect prediction is not ported)",
@@ -59,7 +58,7 @@ const REFUSALS: &[&str] = &[
     "a palette block with a split luma transform (round 1)",
     "a reference frame other than LAST_FRAME (round 2)",
     "a reference frame selected with no picture at this frame's own ref_frame_idx slot for it",
-    "a reference picture that is not this frame's own true size",
+    "a reference picture whose height does not match this frame's own true size",
     "a show_existing_frame header naming an empty reference slot",
     "an 8x8 leaf that coded WARPED_CAUSAL (motion_mode == 2): av1_find_projection/the affine warp filter are not ported, only motion_mode_allowed's alphabet choice is",
     "an inter frame using TxMode::Select (this decoder's inter path never reads a tx_depth symbol, so it desyncs after the first block's mode)",
@@ -70,6 +69,9 @@ const REFUSALS: &[&str] = &[
     "an intra mode this decoder does not code (round 2)",
     "an intra-coded HORZ/VERT strip needs rectangular intra prediction this decoder does not code yet",
     "filter intra on a HORZ/VERT strip (this decoder predicts square-only)",
+    "a compound-reference block with a scaled reference (superres, unimplemented)",
+    "warp/OBMC/interintra prediction with a scaled reference (superres, unimplemented)",
+    "an 8x8 partition leaf under a scaled reference (superres, unimplemented)",
 ];
 
 /// Gates whose `Err` arm turns a decode failure into a printed SKIP rather than
