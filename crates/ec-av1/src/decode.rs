@@ -6518,6 +6518,7 @@ fn decode_inter_block(
     }
 
     let mode_for_tx;
+    let uv_predict_mode;
     let (luma_grid, u_grid, v_grid);
     let block_filter;
     let ref_frame_for_lf;
@@ -6662,6 +6663,7 @@ fn decode_inter_block(
             globalmv_for_lf = is_globalmv;
             ref_frame_for_lf = ref0;
             mode_for_tx = 0;
+            uv_predict_mode = DC_PRED;
             // lane-rect r2: `grid` (mvstack.rs's own MiGrid, distinct from
             // `neighbours`) must be stamped with the block's true footprint
             // too -- a square `bw4`x`bw4` stamp here claims a rect strip's
@@ -7682,6 +7684,7 @@ fn decode_inter_block(
                 }
             }
             mode_for_tx = 0;
+            uv_predict_mode = DC_PRED;
 
             let mut pred_y = vec![0u8; side * side];
             mc::predict_with_filters(
@@ -7897,13 +7900,36 @@ fn decode_inter_block(
             }
         }
         let uv_mode = dec.symbol(&mut cdfs.uv_mode_cfl[mode]);
+        if (9..=12).contains(&uv_mode) {
+            SMOOTH_UV_HITS.with(|c| c.set(c.get() + 1));
+        }
         let alpha = if uv_mode == DC_PRED {
             None
         } else if uv_mode == UV_CFL_PRED {
             Some(read_cfl_alphas(dec, cdfs))
         } else {
-            return Err(unsupported("a directional chroma mode (round 2)"));
+            None
         };
+        // `get_uv_mode` (spec 9.3): `UV_CFL_PRED` predicts as `DC_PRED` for
+        // the angle-delta question, same as [`read_intra_mode`]'s own copy
+        // -- `uv_mode` (13) already falls outside `V_PRED..=D67_PRED` so the
+        // `else` branch below is exact for it either way.
+        let angle_delta_uv = if (V_PRED..=D67_PRED).contains(&uv_mode) {
+            DIRECTIONAL_UV_HITS.with(|c| c.set(c.get() + 1));
+            read_angle_delta(dec, &mut cdfs.angle_delta[uv_mode - V_PRED])
+        } else {
+            0
+        };
+        uv_predict_mode = if uv_mode == UV_CFL_PRED {
+            DC_PRED
+        } else {
+            uv_mode
+        };
+        // lane-chroma r4: same chroma edge-filter-strength neighbour check
+        // as [`read_intra_mode`]/[`read_intra_mode_rect`] -- the CHROMA
+        // neighbour's own `uv_mode`, not the luma one.
+        let smooth_neighbor_uv =
+            is_smooth_mode(neighbours.above_uv_mode[c]) || is_smooth_mode(neighbours.left_uv_mode[r]);
         // `read_palette_mode_info` (decodemv.c:567, called from
         // `read_intra_block_mode_info` right after `xd->cfl.store_y`, same
         // gating and same corner-cut as `read_intra_mode`'s own copy above
@@ -7969,25 +7995,25 @@ fn decode_inter_block(
                 cpx,
                 cpy,
                 chroma_side,
-                DC_PRED,
-                0,
+                uv_predict_mode,
+                angle_delta_uv,
                 reach,
                 &vec![0i32; chroma_side * chroma_side],
                 alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
                 None,
-                false,
+                smooth_neighbor_uv,
             );
             v.reconstruct(
                 cpx,
                 cpy,
                 chroma_side,
-                DC_PRED,
-                0,
+                uv_predict_mode,
+                angle_delta_uv,
                 reach,
                 &vec![0i32; chroma_side * chroma_side],
                 alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
                 None,
-                false,
+                smooth_neighbor_uv,
             );
             luma_grid = vec![0i32; side * side];
             u_grid = vec![0i32; chroma_side * chroma_side];
@@ -8025,8 +8051,8 @@ fn decode_inter_block(
                 1,
                 around[1],
                 mode,
-                DC_PRED,
-                0,
+                uv_predict_mode,
+                angle_delta_uv,
                 reach,
                 u,
                 cpx,
@@ -8037,7 +8063,7 @@ fn decode_inter_block(
                 alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
                 None,
                 None,
-                false,
+                smooth_neighbor_uv,
             )?;
             v_grid = read_plane(
                 dec,
@@ -8047,8 +8073,8 @@ fn decode_inter_block(
                 2,
                 around[2],
                 mode,
-                DC_PRED,
-                0,
+                uv_predict_mode,
+                angle_delta_uv,
                 reach,
                 v,
                 cpx,
@@ -8059,7 +8085,7 @@ fn decode_inter_block(
                 alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
                 None,
                 None,
-                false,
+                smooth_neighbor_uv,
             )?;
         }
     }
@@ -8080,7 +8106,7 @@ fn decode_inter_block(
         write_w,
         write_h,
         mode_for_tx,
-        DC_PRED,
+        uv_predict_mode,
         &[luma_grid, u_grid, v_grid],
     );
     neighbours.record_inter_rect(
