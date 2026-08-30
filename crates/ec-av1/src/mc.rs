@@ -228,7 +228,7 @@ impl InterpFilterKind {
 /// whatever this encoder's own uncoded padding columns/rows hold.
 #[allow(clippy::too_many_arguments)]
 fn sample(
-    reference: &[u8],
+    reference: &[u16],
     stride: usize,
     true_width: usize,
     true_height: usize,
@@ -258,7 +258,7 @@ fn sample(
 /// empty.
 #[allow(clippy::too_many_arguments)] // one reference plane, one position, one block shape
 pub fn predict(
-    reference: &[u8],
+    reference: &[u16],
     stride: usize,
     true_width: usize,
     true_height: usize,
@@ -266,7 +266,7 @@ pub fn predict(
     y_q4: i32,
     block_w: usize,
     block_h: usize,
-    dst: &mut [u8],
+    dst: &mut [u16],
 ) {
     predict_with_filter(
         reference,
@@ -287,7 +287,7 @@ pub fn predict(
 /// kernel both directions.
 #[allow(clippy::too_many_arguments)]
 pub fn predict_with_filter(
-    reference: &[u8],
+    reference: &[u16],
     stride: usize,
     true_width: usize,
     true_height: usize,
@@ -296,7 +296,7 @@ pub fn predict_with_filter(
     block_w: usize,
     block_h: usize,
     filter_kind: InterpFilterKind,
-    dst: &mut [u8],
+    dst: &mut [u16],
 ) {
     predict_with_filters(
         reference,
@@ -319,7 +319,7 @@ pub fn predict_with_filter(
 /// so the two passes can genuinely differ.
 #[allow(clippy::too_many_arguments)]
 pub fn predict_with_filters(
-    reference: &[u8],
+    reference: &[u16],
     stride: usize,
     true_width: usize,
     true_height: usize,
@@ -329,7 +329,7 @@ pub fn predict_with_filters(
     block_h: usize,
     h_kind: InterpFilterKind,
     v_kind: InterpFilterKind,
-    dst: &mut [u8],
+    dst: &mut [u16],
 ) {
     assert_eq!(dst.len(), block_w * block_h, "the destination is the block");
     assert!(!reference.is_empty(), "a reference plane has samples");
@@ -360,7 +360,7 @@ pub fn predict_with_filters(
             for col in 0..block_w {
                 let x = x0 + col as i32;
                 dst[row * block_w + col] =
-                    sample(reference, stride, true_width, true_height, x, y) as u8;
+                    sample(reference, stride, true_width, true_height, x, y) as u16;
             }
         }
         #[cfg(test)]
@@ -403,12 +403,147 @@ pub fn predict_with_filters(
             for (t, &tap) in v_filter.iter().enumerate() {
                 sum += tap * intermediate[(row + t) * block_w + col];
             }
-            dst[row * block_w + col] = round2(sum, INTER_ROUND_1).clamp(0, 255) as u8;
+            dst[row * block_w + col] = round2(sum, INTER_ROUND_1).clamp(0, crate::decode::sample_max()) as u16;
         }
     }
 
     #[cfg(test)]
     crate::encode::stage_add(1, stage_t.elapsed());
+}
+
+/// `REF_SCALE_SHIFT`'s "no scaling" value (spec 7.11.3.3, libaom `scale.h`
+/// `REF_NO_SCALE`): `x_scale_fp == REF_NO_SCALE` means the stored reference's
+/// luma width equals the current frame's, so [`predict_scaled`] reduces
+/// exactly to [`predict_with_filters`] (verified in
+/// `predict_scaled_at_no_scale_matches_predict_with_filters` below).
+pub const REF_NO_SCALE: i64 = 1 << 14;
+
+/// The horizontal scale ratio spec 7.11.3.3 derives from luma widths only
+/// (libaom `av1_setup_scale_factors_for_frame`, luma widths, `REF_SCALE_SHIFT
+/// == 14`): `other_width` is the stored reference picture's own luma width,
+/// `this_width` the current frame's coded luma width. AV1 superres never
+/// scales height (r8's derivation), so there is no vertical counterpart.
+pub fn scale_factor(other_width: usize, this_width: usize) -> i64 {
+    (((other_width as i64) << 14) + this_width as i64 / 2) / this_width as i64
+}
+
+thread_local! {
+    /// lane-superres r10: firing count for the bypass gate (class
+    /// `gate-blind-to-feature`) -- how many times [`predict_scaled`] itself
+    /// ran, so the gate can hard-assert the scaled MC path actually fired
+    /// rather than trust a pixel match alone (an unscaled reference would
+    /// pass the pixels and prove nothing).
+    static PREDICT_SCALED_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`PREDICT_SCALED_HITS`].
+pub fn predict_scaled_hits() -> usize {
+    PREDICT_SCALED_HITS.with(|c| c.get())
+}
+
+fn round_pow2_64(value: i64, shift: u32) -> i64 {
+    if shift == 0 {
+        value
+    } else {
+        (value + (1i64 << (shift - 1))) >> shift
+    }
+}
+
+/// `ROUND_POWER_OF_TWO_SIGNED` (libaom `common/common.h`): halves round away
+/// from zero's *magnitude* -- negative inputs are rounded like their
+/// negation, not truncated toward zero the way a plain arithmetic shift
+/// would.
+fn round_pow2_signed_64(value: i64, shift: u32) -> i64 {
+    if value < 0 {
+        -round_pow2_64(-value, shift)
+    } else {
+        round_pow2_64(value, shift)
+    }
+}
+
+/// [`predict_with_filters`]'s scaled-reference counterpart (spec 7.11.3.3):
+/// used only when the stored reference's luma width differs from the current
+/// frame's (`use_superres` on a non-key frame). `x_scale_fp` is
+/// [`scale_factor`]'s ratio ([`REF_NO_SCALE`] reproduces
+/// `predict_with_filters` bit-exact, pinned by
+/// `predict_scaled_at_no_scale_matches_predict_with_filters`). Per r8's
+/// derivation AV1 superres never scales height, so `y_q4`'s whole-sample /
+/// fraction split and the vertical pass are untouched -- only the horizontal
+/// pass's per-column integer position and filter phase come from a scaled
+/// walk (`x_qn`) instead of a fixed stride-1 one.
+///
+/// # Panics
+/// Panics when `dst` is not `block_w * block_h` long, or the reference is
+/// empty.
+#[allow(clippy::too_many_arguments)]
+pub fn predict_scaled(
+    reference: &[u16],
+    stride: usize,
+    true_width: usize,
+    true_height: usize,
+    x_q4: i32,
+    y_q4: i32,
+    x_scale_fp: i64,
+    block_w: usize,
+    block_h: usize,
+    h_kind: InterpFilterKind,
+    v_kind: InterpFilterKind,
+    dst: &mut [u16],
+) {
+    assert_eq!(dst.len(), block_w * block_h, "the destination is the block");
+    assert!(!reference.is_empty(), "a reference plane has samples");
+    PREDICT_SCALED_HITS.with(|c| c.set(c.get() + 1));
+
+    let y0 = y_q4.div_euclid(16);
+    let yfrac = y_q4.rem_euclid(16) as usize;
+
+    // SCALE_SUBPEL_BITS == 10: x_step_qn is x_scale_fp (Q14) rounded down to
+    // Q10; off/pos_x_q10 fold the block's own x_q4 (Q4) into that same Q10
+    // grid (spec 7.11.3.3's `dec_calc_subpel_params`).
+    let x_step_qn = round_pow2_64(x_scale_fp, 4);
+    let off = (x_scale_fp - REF_NO_SCALE) * 8;
+    let pos_x_q10 = round_pow2_signed_64(x_q4 as i64 * x_scale_fp + off, 8) + 32;
+
+    let (h_wide, h_narrow) = h_kind.tables();
+    let (v_wide, v_narrow) = v_kind.tables();
+    let v_filter = if block_h <= 4 {
+        &v_narrow[yfrac]
+    } else {
+        &v_wide[yfrac]
+    };
+
+    let rows = block_h + 7;
+    let mut intermediate = vec![0i32; rows * block_w];
+    for c in 0..block_w {
+        let x_qn = pos_x_q10 + c as i64 * x_step_qn;
+        let int_pel = (x_qn >> 10) as i32;
+        let filter_idx = ((x_qn & 1023) >> 6) as usize;
+        let h_filter = if block_w <= 4 {
+            &h_narrow[filter_idx]
+        } else {
+            &h_wide[filter_idx]
+        };
+        for r in 0..rows {
+            let y = y0 - 3 + r as i32;
+            let mut sum = 0;
+            for (t, &tap) in h_filter.iter().enumerate() {
+                let x = int_pel + t as i32 - 3;
+                sum += tap * sample(reference, stride, true_width, true_height, x, y);
+            }
+            intermediate[r * block_w + c] = round2(sum, INTER_ROUND_0);
+        }
+    }
+
+    for row in 0..block_h {
+        for col in 0..block_w {
+            let mut sum = 0;
+            for (t, &tap) in v_filter.iter().enumerate() {
+                sum += tap * intermediate[(row + t) * block_w + col];
+            }
+            dst[row * block_w + col] =
+                round2(sum, INTER_ROUND_1).clamp(0, crate::decode::sample_max()) as u16;
+        }
+    }
 }
 
 /// `InterRound1` for a compound ref (spec 7.11.3.2's `isCompound` branch,
@@ -445,7 +580,7 @@ const DIST_PRECISION_BITS: u32 = 4;
 /// empty.
 #[allow(clippy::too_many_arguments)]
 pub fn predict_compound_intermediate(
-    reference: &[u8],
+    reference: &[u16],
     stride: usize,
     true_width: usize,
     true_height: usize,
@@ -515,13 +650,13 @@ pub fn combine_compound(
     pred1: &[i32],
     fwd_weight: i32,
     bck_weight: i32,
-    dst: &mut [u8],
+    dst: &mut [u16],
 ) {
     assert_eq!(pred0.len(), pred1.len(), "both refs predict the same block");
     assert_eq!(dst.len(), pred0.len(), "the destination is the block");
     for i in 0..dst.len() {
         let sum = pred0[i] * fwd_weight + pred1[i] * bck_weight;
-        dst[i] = round2(sum, INTER_POST_ROUND + DIST_PRECISION_BITS).clamp(0, 255) as u8;
+        dst[i] = round2(sum, INTER_POST_ROUND + DIST_PRECISION_BITS).clamp(0, crate::decode::sample_max()) as u16;
     }
 }
 
@@ -564,7 +699,7 @@ pub fn blend_masked_compound(
     w: usize,
     h: usize,
     subsampled: bool,
-    dst: &mut [u8],
+    dst: &mut [u16],
 ) {
     assert_eq!(pred0.len(), w * h, "pred0 is the destination-sized block");
     assert_eq!(pred1.len(), w * h, "pred1 is the destination-sized block");
@@ -584,7 +719,7 @@ pub fn blend_masked_compound(
                 i32::from(mask[i * mask_stride + j])
             };
             let res = (m * pred0[i * w + j] + (64 - m) * pred1[i * w + j]) >> 6;
-            dst[i * w + j] = round2(res, INTER_POST_ROUND).clamp(0, 255) as u8;
+            dst[i * w + j] = round2(res, INTER_POST_ROUND).clamp(0, crate::decode::sample_max()) as u16;
         }
     }
 }
@@ -600,7 +735,7 @@ pub fn blend_masked_compound(
 /// off-by-one from double rounding.
 #[test]
 fn compound_intermediate_whole_pel_identity_round_trips_through_combine() {
-    let reference = vec![100u8; 16 * 16];
+    let reference = vec![100u16; 16 * 16];
     let mut pred0 = vec![0i32; 16];
     predict_compound_intermediate(
         &reference,
@@ -618,14 +753,17 @@ fn compound_intermediate_whole_pel_identity_round_trips_through_combine() {
     assert!(pred0.iter().all(|&v| v == 1600), "{pred0:?}");
 
     let pred1 = pred0.clone();
-    let mut dst = vec![0u8; 16];
+    let mut dst = vec![0u16; 16];
     combine_compound(&pred0, &pred1, 8, 8, &mut dst);
     assert!(dst.iter().all(|&v| v == 100), "{dst:?}");
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{InterpFilterKind, predict, predict_with_filter};
+    use super::{
+        InterpFilterKind, REF_NO_SCALE, predict, predict_scaled, predict_with_filter,
+        predict_with_filters,
+    };
 
     /// Regression pin for the lane-av1flake ±1 defect: a real aomenc chroma
     /// inter block at the frame's top-left corner (mv q4 = (row 7, col 15),
@@ -670,9 +808,11 @@ mod tests {
         // real (0, 0) coordinates -- clamping then reproduces the identical
         // extended border the dump already captured.
         let stride = 24;
-        let mut reference = vec![0u8; stride * 24];
+        let mut reference = vec![0u16; stride * 24];
         for (r, row) in window.iter().enumerate() {
-            reference[r * stride..r * stride + stride].copy_from_slice(row);
+            for (c, &v) in row.iter().enumerate() {
+                reference[r * stride + c] = u16::from(v);
+            }
         }
         // predict()'s own edge clamp starts at true (0,0); shift so the
         // dumped window's row/col 4 lands there by biasing x_q4/y_q4's
@@ -682,7 +822,7 @@ mod tests {
         // whole-pel part of x_q4/y_q4 by +4 to land on real (0,0).
         let x_q4 = (4 + 0) * 16 + 15; // real block x0=0, xfrac=15
         let y_q4 = (4 + 0) * 16 + 7; // real block y0=0, yfrac=7
-        let mut dst = vec![0u8; 16 * 16];
+        let mut dst = vec![0u16; 16 * 16];
         predict_with_filter(
             &reference,
             stride,
@@ -696,7 +836,7 @@ mod tests {
             &mut dst,
         );
         #[rustfmt::skip]
-        let expected_row0: [u8; 16] =
+        let expected_row0: [u16; 16] =
             [114,114,114,114,115,115,115,116,116,116,116,116,117,117,116,116];
         assert_eq!(
             &dst[0..16],
@@ -704,7 +844,7 @@ mod tests {
             "row0 vs aomdec's real av1_convolve_2d_sr_c output"
         );
         #[rustfmt::skip]
-        let expected_row15: [u8; 16] =
+        let expected_row15: [u16; 16] =
             [103,103,104,104,104,105,105,106,106,106,107,107,107,107,107,107];
         assert_eq!(
             &dst[15 * 16..15 * 16 + 16],
@@ -717,8 +857,8 @@ mod tests {
     fn integer_mv_is_identity() {
         let width = 12;
         let height = 12;
-        let reference: Vec<u8> = (0..width * height).map(|i| (i * 7 % 251) as u8).collect();
-        let mut dst = vec![0u8; 6 * 6];
+        let reference: Vec<u16> = (0..width * height).map(|i| (i * 7 % 251) as u16).collect();
+        let mut dst = vec![0u16; 6 * 6];
         predict(
             &reference,
             width,
@@ -746,10 +886,10 @@ mod tests {
         // Step 2 so every half-pel position lands on an exact integer.
         let width = 16;
         let height = 16;
-        let reference: Vec<u8> = (0..width * height)
-            .map(|i| (2 * (i % width)) as u8)
+        let reference: Vec<u16> = (0..width * height)
+            .map(|i| (2 * (i % width)) as u16)
             .collect();
-        let mut dst = vec![0u8; 4 * 4];
+        let mut dst = vec![0u16; 4 * 4];
         // Half-pel in x only: fraction 8/16, integer part at column 5.
         predict(
             &reference,
@@ -778,10 +918,10 @@ mod tests {
     fn constant_plane_has_unit_dc_gain_at_every_subpel_position() {
         let width = 20;
         let height = 20;
-        let reference = vec![142u8; width * height];
+        let reference = vec![142u16; width * height];
         for yfrac in 0..16 {
             for xfrac in 0..16 {
-                let mut dst = vec![0u8; 5 * 5];
+                let mut dst = vec![0u16; 5 * 5];
                 predict(
                     &reference,
                     width,
@@ -810,11 +950,11 @@ mod tests {
         // it happened to produce two merely-different numbers.
         let width = 10;
         let height = 10;
-        let reference: Vec<u8> = (0..height)
-            .flat_map(|y| (0..width).map(move |x| (20 * x + 4 * y) as u8))
+        let reference: Vec<u16> = (0..height)
+            .flat_map(|y| (0..width).map(move |x| (20 * x + 4 * y) as u16))
             .collect();
 
-        let mut horiz = vec![0u8; 4 * 4];
+        let mut horiz = vec![0u16; 4 * 4];
         predict(
             &reference,
             width,
@@ -826,7 +966,7 @@ mod tests {
             4,
             &mut horiz,
         );
-        let mut vert = vec![0u8; 4 * 4];
+        let mut vert = vec![0u16; 4 * 4];
         predict(
             &reference,
             width,
@@ -865,8 +1005,8 @@ mod tests {
     fn mv_past_the_edge_clamps_instead_of_panicking() {
         let width = 8;
         let height = 8;
-        let reference: Vec<u8> = (0..width * height).map(|i| (i * 3 % 200) as u8).collect();
-        let mut dst = vec![0u8; 4 * 4];
+        let reference: Vec<u16> = (0..width * height).map(|i| (i * 3 % 200) as u16).collect();
+        let mut dst = vec![0u16; 4 * 4];
         // Whole-sample position far above and to the left of the plane, with
         // an odd fraction so both filter passes exercise the clamp.
         predict(
@@ -886,7 +1026,7 @@ mod tests {
             "an MV past the top-left edge must clamp to the corner sample, got {dst:?}"
         );
 
-        let mut dst2 = vec![0u8; 4 * 4];
+        let mut dst2 = vec![0u16; 4 * 4];
         predict(
             &reference,
             width,
@@ -903,5 +1043,55 @@ mod tests {
             dst2.iter().all(|&v| v == expected2),
             "an MV past the bottom-right edge must clamp to the corner sample, got {dst2:?}"
         );
+    }
+
+    #[test]
+    fn predict_scaled_at_no_scale_matches_predict_with_filters() {
+        // Algebraic pin from the r8/r9 derivation: x_scale_fp == REF_NO_SCALE
+        // must reduce predict_scaled's per-column scaled walk to the exact
+        // same int_pel/filter_idx sequence predict_with_filters computes from
+        // a fixed stride-1 walk -- every subpel fraction, every block width.
+        let width = 24;
+        let height = 24;
+        let reference: Vec<u16> = (0..width * height).map(|i| (i * 7 % 251) as u16).collect();
+        for block_w in [4usize, 8, 16] {
+            for x_frac in 0..16i32 {
+                let x_q4 = 3 * 16 + x_frac;
+                let y_q4 = 2 * 16 + 5;
+                let mut expected = vec![0u16; block_w * 8];
+                predict_with_filters(
+                    &reference,
+                    width,
+                    width,
+                    height,
+                    x_q4,
+                    y_q4,
+                    block_w,
+                    8,
+                    InterpFilterKind::Regular,
+                    InterpFilterKind::Regular,
+                    &mut expected,
+                );
+                let mut got = vec![0u16; block_w * 8];
+                predict_scaled(
+                    &reference,
+                    width,
+                    width,
+                    height,
+                    x_q4,
+                    y_q4,
+                    REF_NO_SCALE,
+                    block_w,
+                    8,
+                    InterpFilterKind::Regular,
+                    InterpFilterKind::Regular,
+                    &mut got,
+                );
+                assert_eq!(
+                    got, expected,
+                    "block_w={block_w} x_frac={x_frac}: REF_NO_SCALE must reproduce predict_with_filters exactly"
+                );
+            }
+        }
     }
 }

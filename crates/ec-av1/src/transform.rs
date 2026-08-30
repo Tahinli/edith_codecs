@@ -888,32 +888,41 @@ pub fn inverse_transform_2d(dequant: &[i32], side: usize, bit_depth: u8) -> Vec<
 /// This is the encoder's model of what the decoder will add to its prediction,
 /// so it follows the spec's dequantization exactly, truncation toward zero and
 /// all.
+#[allow(clippy::too_many_arguments)]
 pub fn dequant_and_inverse_typed(
     levels: &[i32],
     side: usize,
     bit_depth: u8,
     q_idx: i32,
+    dc_delta: i32,
+    ac_delta: i32,
     tx_type: TxType,
 ) -> Vec<i32> {
-    dequant_and_inverse_typed_wh(levels, side, side, bit_depth, q_idx, tx_type)
+    dequant_and_inverse_typed_wh(levels, side, side, bit_depth, q_idx, dc_delta, ac_delta, tx_type)
 }
 
-/// [`dequant_and_inverse_typed`] widened to `(w, h)` (lane-recttx).
+/// [`dequant_and_inverse_typed`] widened to `(w, h)` (lane-recttx). `dc_delta`/
+/// `ac_delta` are the per-plane quantizer-index offsets (lane-sbpart r11,
+/// spec 5.9.12/7.12.2, [`crate::quant::QuantDeltas`]) -- `0`/`0` for the
+/// unaffected callers below.
+#[allow(clippy::too_many_arguments)]
 pub fn dequant_and_inverse_typed_wh(
     levels: &[i32],
     w: usize,
     h: usize,
     bit_depth: u8,
     q_idx: i32,
+    dc_delta: i32,
+    ac_delta: i32,
     tx_type: TxType,
 ) -> Vec<i32> {
-    let dq = crate::quant::dequant_wh(levels, w, h, bit_depth, q_idx);
+    let dq = crate::quant::dequant_wh(levels, w, h, bit_depth, q_idx, dc_delta, ac_delta);
     inverse_transform_2d_typed_wh(&dq, w, h, bit_depth, tx_type)
 }
 
-/// [`dequant_and_inverse_typed`] at `DCT_DCT`.
+/// [`dequant_and_inverse_typed`] at `DCT_DCT`, no per-plane quantizer delta.
 pub fn dequant_and_inverse(levels: &[i32], side: usize, bit_depth: u8, q_idx: i32) -> Vec<i32> {
-    dequant_and_inverse_typed(levels, side, bit_depth, q_idx, TxType::DctDct)
+    dequant_and_inverse_typed(levels, side, bit_depth, q_idx, 0, 0, TxType::DctDct)
 }
 
 /// The orthonormal DCT-II basis row for output `u` of an `n`-point transform.
