@@ -4185,18 +4185,18 @@ mod tests {
                 "{NAME}: SOFT-NOTE -- zero HORZ/VERT strips fired this run \
                  ({matched} matches, {named_refusals} refusals); sampling, not a regression"
             );
-        } else if crate::decode::rect_coeff_hits() == 0 {
-            // lane-rectwire r3: r2's real (non-skip) coefficient decode
-            // desyncs (rectwire-flake-1.obu, seed 55 -- both 32x16 strips of
-            // a fired quadrant come out ~100% wrong from their first pixel;
-            // see lanes/rectwire-r3.report.md). Reverted to refusing a coded
-            // rect strip by name, same as r1, so `rect_coeff_hits` is always
-            // 0 now -- this used to be a hard assert (r2), downgraded back to
-            // a SOFT-NOTE until the desync is isolated and the real decode
-            // path is safe to re-enable.
-            eprintln!(
-                "{NAME}: SOFT-NOTE -- {} HORZ/VERT strips fired but rect_coeff_hits==0 \
-                 (r3: non-skip rect strips refuse by name pending the desync fix)",
+        } else {
+            // r5: the desync was the tx-depth symbol being read
+            // unconditionally where both square paths gate it on `tx_select`
+            // -- with --enable-tx-size-search=0 the encoder writes no such
+            // symbol and the decoder consumed one that was never there. With
+            // that fixed the real coefficient decode is pixel-exact, so this
+            // is a HARD assert again: strips fired but no coefficients read
+            // would mean the coded path silently stopped being exercised.
+            assert!(
+                crate::decode::rect_coeff_hits() > 0,
+                "{NAME}: {} HORZ/VERT strips fired but rect_coeff_hits==0 -- the \
+                 coded rect path is no longer exercised",
                 crate::decode::rect_partition_hits()
             );
         }
