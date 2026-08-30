@@ -903,6 +903,74 @@ mod tests {
         }
     }
 
+    /// Builds a `gradients` lavfi source string with colours derived from
+    /// `seed`, not left to the filter's own default.
+    ///
+    /// Measured (lane-fixdet r1): ffmpeg's `gradients` source IGNORES its
+    /// `seed=` parameter for colour selection -- five encodes of an
+    /// identical command line (same `seed=`, same everything) produced five
+    /// different fixtures, because the unset `c0..c9` stops are randomized
+    /// from something other than that seed. Every one of this file's ~20
+    /// gate fixtures built a `gradients` source this way, so none of them
+    /// had a reproducible input: a pin captured from one run could not be
+    /// regenerated, and "attempt N failed" was as likely to be a different
+    /// fixture as a different decode outcome.
+    ///
+    /// Freezing the colours outright (as the earliest four gates below do,
+    /// hand-picking `c0=red:c1=blue:c2=green`) fixes reproducibility but
+    /// throws away the per-attempt content variety the sweep gates need to
+    /// make features (OBMC, warp, wedge, ...) fire at all -- this repo's own
+    /// `sampler-decorrelated-gate` class. So: derive `c0..c3` deterministically
+    /// FROM the seed with a plain integer hash, and keep passing `seed=`
+    /// itself too, so a future ffmpeg that actually honours it only adds
+    /// more variety, never removes the determinism this buys.
+    fn gradients_source(seed: u32, width: usize, height: usize, tail: &str) -> String {
+        fn hash_color(seed: u32, salt: u32) -> String {
+            let h = seed
+                .wrapping_mul(2_654_435_761)
+                .wrapping_add(salt.wrapping_mul(0x9E37_79B9))
+                ^ (seed.rotate_left(13));
+            format!("0x{:06x}", h & 0x00ff_ffff)
+        }
+        let (c0, c1, c2, c3) = (
+            hash_color(seed, 0),
+            hash_color(seed, 1),
+            hash_color(seed, 2),
+            hash_color(seed, 3),
+        );
+        format!("gradients=size={width}x{height}:c0={c0}:c1={c1}:c2={c2}:c3={c3}:seed={seed}:{tail}")
+    }
+
+    /// The determinism guard: same seed twice must byte-match ffmpeg's own
+    /// output; different seeds must not. Regresses this fix if it ever
+    /// breaks.
+    #[test]
+    fn gradients_source_is_reproducible_per_seed() {
+        if !have_ffmpeg() {
+            eprintln!("SKIP gradients_source_is_reproducible_per_seed: no ffmpeg");
+            return;
+        }
+        fn render_hash(lavfi: &str) -> Vec<u8> {
+            let out = Command::new("ffmpeg")
+                .args([
+                    "-v", "error", "-f", "lavfi", "-i", lavfi, "-frames:v", "1", "-f", "rawvideo",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(out.status.success(), "ffmpeg refused {lavfi}");
+            out.stdout
+        }
+        let a1 = render_hash(&gradients_source(42, 64, 64, "duration=0.04:rate=25"));
+        let a2 = render_hash(&gradients_source(43, 64, 64, "duration=0.04:rate=25"));
+        let a3 = render_hash(&gradients_source(42, 64, 64, "duration=0.04:rate=25"));
+        assert_eq!(a1, a3, "same seed must reproduce byte-identical output");
+        assert_ne!(a1, a2, "different seeds must not collide");
+    }
+
     /// Encodes a real libaom-av1 stream (via ffmpeg's own encoder, not this
     /// crate's) with the same reduced-partition flags lane-av1adst's r6
     /// probe found still select `ADST_ADST`/`ADST_DCT`/`DCT_ADST` on
@@ -988,17 +1056,13 @@ mod tests {
             eprintln!("SKIP a_real_libaom_stream_with_adst_decodes_end_to_end: no ffmpeg");
             return;
         }
-        let configs: [(&str, usize, usize, u32); 2] = [
-            ("testsrc2=size=64x64:rate=1", 64, 64, 15),
-            (
-                "gradients=size=64x64:c0=red:c1=blue:c2=green:rate=1",
-                64,
-                64,
-                15,
-            ),
+        let configs: [(String, usize, usize, u32); 2] = [
+            ("testsrc2=size=64x64:rate=1".to_string(), 64, 64, 15),
+            (gradients_source(42, 64, 64, "rate=1"), 64, 64, 15),
         ];
         let mut verdicts = Vec::new();
         for (lavfi, width, height, crf) in configs {
+            let lavfi = lavfi.as_str();
             let Some(stream) = libaom_encode(lavfi, width, height, crf) else {
                 verdicts.push(format!("{lavfi}: ffmpeg itself refused to encode"));
                 continue;
@@ -1052,7 +1116,7 @@ mod tests {
         }
         let (width, height) = (64, 64);
         let stream = libaom_encode_with(
-            "gradients=size=64x64:c0=red:c1=blue:c2=green:rate=1:seed=42",
+            &gradients_source(42, width, height, "rate=1"),
             width,
             height,
             15,
@@ -1098,7 +1162,7 @@ mod tests {
         }
         let (width, height) = (32, 32);
         let stream = libaom_encode_with(
-            "gradients=size=32x32:c0=red:c1=blue:c2=green:rate=1:seed=42",
+            &gradients_source(42, width, height, "rate=1"),
             width,
             height,
             15,
@@ -1142,7 +1206,7 @@ mod tests {
         }
         let (width, height) = (64, 64);
         let stream = libaom_encode_with(
-            "gradients=size=64x64:c0=red:c1=blue:c2=green:rate=1:seed=42",
+            &gradients_source(42, width, height, "rate=1"),
             width,
             height,
             30,
@@ -1265,7 +1329,7 @@ mod tests {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(42);
-        let fi_source = format!("gradients=size=64x64:seed={fi_seed}:duration=0.04:rate=25");
+        let fi_source = gradients_source(fi_seed, 64, 64, "duration=0.04:rate=25");
         let fi_cq = std::env::var("EC_FI_CQ").unwrap_or_else(|_| "40".to_string());
         let fi_cq_arg = format!("--cq-level={fi_cq}");
         let y4m = Command::new("ffmpeg")
@@ -1391,20 +1455,11 @@ mod tests {
             return;
         }
         let (width, height) = (64usize, 64usize);
+        let source = gradients_source(42, width, height, "duration=0.04:rate=25");
         let y4m = Command::new("ffmpeg")
-            .args([
-                "-v",
-                "error",
-                "-f",
-                "lavfi",
-                "-i",
-                "gradients=size=64x64:seed=42:duration=0.04:rate=25",
-                "-pix_fmt",
-                "yuv420p",
-                "-f",
-                "yuv4mpegpipe",
-                "-",
-            ])
+            .args(["-v", "error", "-f", "lavfi", "-i"])
+            .arg(&source)
+            .args(["-pix_fmt", "yuv420p", "-f", "yuv4mpegpipe", "-"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1827,14 +1882,11 @@ mod tests {
             return;
         }
         let (width, height, frame_count) = (64usize, 64usize, 4usize);
+        let source = gradients_source(42, width, height, "duration=0.16:rate=25");
         let y4m = Command::new("ffmpeg")
+            .args(["-v", "error", "-f", "lavfi", "-i"])
+            .arg(&source)
             .args([
-                "-v",
-                "error",
-                "-f",
-                "lavfi",
-                "-i",
-                "gradients=size=64x64:seed=42:duration=0.16:rate=25",
                 "-pix_fmt",
                 "yuv420p",
                 "-f",
@@ -1991,7 +2043,7 @@ mod tests {
         let mut refusals = Vec::new();
         for attempt in 0..8u32 {
             let seed = 42 + attempt;
-            let source = format!("gradients=size=64x64:seed={seed}:duration=0.16:rate=25");
+            let source = gradients_source(seed, 64, 64, "duration=0.16:rate=25");
             let y4m = Command::new("ffmpeg")
                 .args([
                     "-v",
@@ -2349,7 +2401,7 @@ mod tests {
         // this recipe's own choosing, not a decoder bug.
         for attempt in 0..120u32 {
             let seed = 42 + attempt % 40;
-            let source = format!("gradients=size=64x64:seed={seed}:duration=0.32:rate=25");
+            let source = gradients_source(seed, 64, 64, "duration=0.32:rate=25");
             let y4m = Command::new("ffmpeg")
                 .args([
                     "-v",
@@ -2561,7 +2613,7 @@ mod tests {
             let seed = 42 + attempt % 40;
             let duration = frame_count as f64 / 25.0;
             let source =
-                format!("gradients=size={width}x{height}:seed={seed}:duration={duration}:rate=25");
+                gradients_source(seed, width, height, &format!("duration={duration}:rate=25"));
             let y4m = Command::new("ffmpeg")
                 .args([
                     "-v",
@@ -2745,7 +2797,7 @@ mod tests {
             let seed = 42 + attempt % 40;
             let duration = frame_count as f64 / 25.0;
             let source =
-                format!("gradients=size={width}x{height}:seed={seed}:duration={duration}:rate=25");
+                gradients_source(seed, width, height, &format!("duration={duration}:rate=25"));
             let y4m = Command::new("ffmpeg")
                 .args([
                     "-v",
@@ -2960,7 +3012,7 @@ mod tests {
             let seed = 42 + attempt % 40;
             let duration = frame_count as f64 / 25.0;
             let source =
-                format!("gradients=size={width}x{height}:seed={seed}:duration={duration}:rate=25");
+                gradients_source(seed, width, height, &format!("duration={duration}:rate=25"));
             let y4m = Command::new("ffmpeg")
                 .args([
                     "-v",
@@ -3136,7 +3188,7 @@ mod tests {
             let seed = 42 + attempt % 40;
             let duration = frame_count as f64 / 25.0;
             let source =
-                format!("gradients=size={width}x{height}:seed={seed}:duration={duration}:rate=25");
+                gradients_source(seed, width, height, &format!("duration={duration}:rate=25"));
             let y4m = Command::new("ffmpeg")
                 .args([
                     "-v",
@@ -3317,7 +3369,7 @@ mod tests {
             // EC_AV1_OBMC8_SOURCE overrides the lavfi source so a firing recipe
             // can be searched for without a rebuild.
             let source = std::env::var("EC_AV1_OBMC8_SOURCE").unwrap_or_else(|_| {
-                format!("gradients=size={width}x{height}:seed={seed}:duration={duration}:rate=25")
+                gradients_source(seed, width, height, &format!("duration={duration}:rate=25"))
             });
             // A source supplied through EC_AV1_OBMC8_SOURCE need not carry its
             // own `duration=`; `-t` is the bound that always holds. Without it
@@ -3493,7 +3545,7 @@ mod tests {
             let seed = 42 + attempt;
             let duration = frame_count as f64 / 25.0;
             let source =
-                format!("gradients=size={width}x{height}:seed={seed}:duration={duration}:rate=25");
+                gradients_source(seed, width, height, &format!("duration={duration}:rate=25"));
             let y4m = Command::new("ffmpeg")
                 .args([
                     "-v",
@@ -3662,7 +3714,7 @@ mod tests {
             let seed = 42 + attempt;
             let duration = frame_count as f64 / 25.0;
             let source =
-                format!("gradients=size={width}x{height}:seed={seed}:duration={duration}:rate=25");
+                gradients_source(seed, width, height, &format!("duration={duration}:rate=25"));
             let y4m = Command::new("ffmpeg")
                 .args([
                     "-v",
@@ -3838,7 +3890,7 @@ mod tests {
             let seed = 42 + attempt;
             let duration = frame_count as f64 / 25.0;
             let source = if attempt % 2 == 0 {
-                format!("gradients=size={width}x{height}:seed={seed}:duration={duration}:rate=25")
+                gradients_source(seed, width, height, &format!("duration={duration}:rate=25"))
             } else {
                 // `end_pts` does NOT bound mandelbrot (it generated 300+
                 // frames and hung the gate for an hour); `-t` below is the
@@ -4041,7 +4093,7 @@ mod tests {
             let seed = 42 + attempt;
             let duration = frame_count as f64 / 25.0;
             let source =
-                format!("gradients=size={width}x{height}:seed={seed}:duration={duration}:rate=25");
+                gradients_source(seed, width, height, &format!("duration={duration}:rate=25"));
             let y4m = Command::new("ffmpeg")
                 .args([
                     "-v",
@@ -4242,7 +4294,7 @@ mod tests {
             let seed = 42 + attempt;
             let duration = frame_count as f64 / 25.0;
             let source =
-                format!("gradients=size={width}x{height}:seed={seed}:duration={duration}:rate=25");
+                gradients_source(seed, width, height, &format!("duration={duration}:rate=25"));
             let y4m = Command::new("ffmpeg")
                 .args([
                     "-v",
@@ -4841,7 +4893,7 @@ mod tests {
             let seed = seed_base + attempt;
             let duration = frame_count as f64 / 25.0;
             let source =
-                format!("gradients=size={width}x{height}:seed={seed}:duration={duration}:rate=25");
+                gradients_source(seed, width, height, &format!("duration={duration}:rate=25"));
             let y4m = Command::new("ffmpeg")
                 .args([
                     "-v",
