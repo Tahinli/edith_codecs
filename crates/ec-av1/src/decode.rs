@@ -81,6 +81,21 @@ pub(crate) fn smooth_luma_hits() -> usize {
     SMOOTH_LUMA_HITS.with(|c| c.get())
 }
 
+/// How many `uv_mode` reads resolved to `SMOOTH_PRED..=PAETH_PRED` (9..=12),
+/// across every call in the process -- lane-chroma r3's own before/after
+/// counter, proving a stream actually exercised chroma's smooth/paeth
+/// predictor (the previously-refused round-2 gap) rather than every block
+/// landing on DC/CFL/directional.
+thread_local! {
+    static SMOOTH_UV_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`SMOOTH_UV_HITS`].
+pub(crate) fn smooth_uv_hits() -> usize {
+    SMOOTH_UV_HITS.with(|c| c.get())
+}
+
 /// How many 4-pixel deblocking edge groups [`edge_params`] has actually
 /// selected for filtering, across every call in the process -- the same
 /// before/after counter pattern as [`FILTER_INTRA_HITS`], proving a stream
@@ -1263,6 +1278,17 @@ struct Neighbours {
     left: Vec<[Neighbour; 3]>,
     above_mode: Vec<usize>,
     left_mode: Vec<usize>,
+    /// Chroma's own `uv_mode` companion to `above_mode`/`left_mode` (lane-chroma
+    /// r3): a smooth/paeth `uv_mode`'s edge-filter strength (spec
+    /// `get_intra_edge_filter_type`) reads the CHROMA neighbour's mode, not the
+    /// luma one -- the same block can (and often does) code a different
+    /// `uv_mode` than its own `mode`. Coarse [`SUB`]-grid like `above_mode`;
+    /// [`Self::decode_leaf8`]'s per-leaf `prev_leaf` override (a real
+    /// within-block neighbour finer than this grid) is luma-only -- a known,
+    /// unexercised-by-gate corner-cut (every real-encoder gate in `stream.rs`
+    /// uses `--min-partition-size=16`, so no leaf8 8x8 split ever reaches this).
+    above_uv_mode: Vec<usize>,
+    left_uv_mode: Vec<usize>,
     above_side: Vec<usize>,
     left_side: Vec<usize>,
     /// The same as `above_side`/`left_side`, but kept at the finer mi (4x4)
@@ -1362,6 +1388,8 @@ impl Neighbours {
             left: vec![[Neighbour::default(); 3]; rows * (SUB / MI)],
             above_mode: vec![DC_PRED; cols],
             left_mode: vec![DC_PRED; rows],
+            above_uv_mode: vec![DC_PRED; cols],
+            left_uv_mode: vec![DC_PRED; rows],
             above_side: vec![SB; cols],
             left_side: vec![SB; rows],
             above_side_mi: vec![SB; cols * (SUB / MI)],
@@ -1495,6 +1523,7 @@ impl Neighbours {
     fn start_row(&mut self) {
         self.left.iter_mut().for_each(|l| *l = Default::default());
         self.left_mode.iter_mut().for_each(|m| *m = DC_PRED);
+        self.left_uv_mode.iter_mut().for_each(|m| *m = DC_PRED);
         self.left_side.iter_mut().for_each(|s| *s = SB);
         self.left_side_mi.iter_mut().for_each(|s| *s = SB);
         self.left_skip.iter_mut().for_each(|s| *s = false);
@@ -1726,8 +1755,15 @@ impl Neighbours {
     /// `record` leaves them (spec `av1_set_entropy_contexts`, which clamps to
     /// `blocks_wide`/`blocks_high` derived from the true `mi_cols`/`mi_rows`,
     /// not from this block's own side).
-    fn record(&mut self, at: (usize, usize), side: usize, mode: usize, grids: &[Vec<i32>; 3]) {
-        self.record_rect(at, side, side, mode, grids);
+    fn record(
+        &mut self,
+        at: (usize, usize),
+        side: usize,
+        mode: usize,
+        uv_mode: usize,
+        grids: &[Vec<i32>; 3],
+    ) {
+        self.record_rect(at, side, side, mode, uv_mode, grids);
     }
 
     /// [`Self::record`] with independent above (`w`)/left (`h`) extents, in
@@ -1741,15 +1777,18 @@ impl Neighbours {
         w: usize,
         h: usize,
         mode: usize,
+        uv_mode: usize,
         grids: &[Vec<i32>; 3],
     ) {
         let (r, c) = at;
         for cell in 0..w / SUB {
             self.above_mode[c + cell] = mode;
+            self.above_uv_mode[c + cell] = uv_mode;
             self.above_side[c + cell] = w;
         }
         for cell in 0..h / SUB {
             self.left_mode[r + cell] = mode;
+            self.left_uv_mode[r + cell] = uv_mode;
             self.left_side[r + cell] = h;
         }
         self.record_mi_rect((r * (SUB / MI), c * (SUB / MI)), w, h, grids);
@@ -1848,12 +1887,15 @@ impl Neighbours {
         at: (usize, usize),
         side: usize,
         mode: usize,
+        uv_mode: usize,
         chroma_grids: [&[i32]; 2],
     ) {
         let (r, c) = at;
         for cell in 0..side / SUB {
             self.above_mode[c + cell] = mode;
             self.left_mode[r + cell] = mode;
+            self.above_uv_mode[c + cell] = uv_mode;
+            self.left_uv_mode[r + cell] = uv_mode;
             self.above_side[c + cell] = side;
             self.left_side[r + cell] = side;
         }
@@ -1989,7 +2031,7 @@ fn read_intra_mode_rect(
         None
     };
     if (9..=12).contains(&uv_mode) {
-        return Err(unsupported("a smooth or paeth chroma mode (round 2)"));
+        SMOOTH_UV_HITS.with(|c| c.set(c.get() + 1));
     }
     let angle_delta_uv = if (V_PRED..=D67_PRED).contains(&uv_mode) {
         DIRECTIONAL_UV_HITS.with(|c| c.set(c.get() + 1));
@@ -2112,13 +2154,16 @@ fn decode_block_rect(
             neighbours.skip_txfm_ctx(r * (SUB / MI), c * (SUB / MI)),
             allow_screen_content_tools,
         )?;
-    // See [`PlaneBuf::reconstruct`]'s doc: chroma stays `false` (exact) until
-    // a smooth/paeth `uv_mode` can reach decode at all.
     let smooth_neighbor =
         is_smooth_mode(neighbours.above_mode[c]) || is_smooth_mode(neighbours.left_mode[r]);
     if smooth_neighbor {
         SMOOTH_LUMA_HITS.with(|c| c.set(c.get() + 1));
     }
+    // lane-chroma r3: chroma's own edge-filter-strength neighbour check
+    // (spec `get_intra_edge_filter_type`) reads the CHROMA neighbour's
+    // `uv_mode`, not the luma one.
+    let smooth_neighbor_uv =
+        is_smooth_mode(neighbours.above_uv_mode[c]) || is_smooth_mode(neighbours.left_uv_mode[r]);
     if filter_intra.is_some() {
         // `predict_filter_intra` (spec 7.11.2.3) is square-only in this
         // decoder (`assert_eq!(dst.len(), side*side)`) -- a real symbol was
@@ -2198,7 +2243,7 @@ fn decode_block_rect(
             &vec![0i32; chroma_w * chroma_h],
             alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
             None,
-            false,
+            smooth_neighbor_uv,
         );
         v.reconstruct_rect(
             cpx,
@@ -2211,13 +2256,14 @@ fn decode_block_rect(
             &vec![0i32; chroma_w * chroma_h],
             alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
             None,
-            false,
+            smooth_neighbor_uv,
         );
         neighbours.record_rect(
             at,
             bw,
             bh,
             mode,
+            uv_predict_mode,
             &[
                 vec![0i32; bw * bh],
                 vec![0i32; chroma_w * chroma_h],
@@ -2344,7 +2390,7 @@ fn decode_block_rect(
             &u_residual,
             alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
             None,
-            false,
+            smooth_neighbor_uv,
         );
         let v_default_tx = default_intra_tx_type(uv_predict_mode as u8);
         let v_skip_ctx = usize::from(around[2].0) + usize::from(around[2].1);
@@ -2382,9 +2428,9 @@ fn decode_block_rect(
             &v_residual,
             alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
             None,
-            false,
+            smooth_neighbor_uv,
         );
-        neighbours.record_rect(at, bw, bh, mode, &[luma_levels, u_levels, v_levels]);
+        neighbours.record_rect(at, bw, bh, mode, uv_predict_mode, &[luma_levels, u_levels, v_levels]);
         RECT_COEFF_HITS.with(|c| c.set(c.get() + 1));
         }
     }
@@ -2490,7 +2536,7 @@ fn read_intra_mode(
     // bug in that fallback this lane's own scope does not cover. Keep it
     // refused here rather than ship a silently-wrong decode.
     if (9..=12).contains(&uv_mode) {
-        return Err(unsupported("a smooth or paeth chroma mode (round 2)"));
+        SMOOTH_UV_HITS.with(|c| c.set(c.get() + 1));
     }
     // `get_uv_mode` (spec 9.3): `UV_CFL_PRED` predicts as `DC_PRED` for the
     // angle-delta question -- libaom's own `read_intra_frame_mode_info` reads
@@ -3032,13 +3078,13 @@ fn decode_block(
     } else {
         uv_mode
     };
-    // See [`PlaneBuf::reconstruct`]'s doc: chroma stays `false` (exact) until
-    // a smooth/paeth `uv_mode` can reach decode at all.
     let smooth_neighbor =
         is_smooth_mode(neighbours.above_mode[c]) || is_smooth_mode(neighbours.left_mode[r]);
     if smooth_neighbor {
         SMOOTH_LUMA_HITS.with(|c| c.set(c.get() + 1));
     }
+    let smooth_neighbor_uv =
+        is_smooth_mode(neighbours.above_uv_mode[c]) || is_smooth_mode(neighbours.left_uv_mode[r]);
     if std::env::var_os("EC_AV1_TRACE").is_some() {
         eprintln!(
             "TRACE block px={px} py={py} side={side} mode={mode} uv_mode={uv_mode} \
@@ -3093,7 +3139,7 @@ fn decode_block(
             &vec![0i32; chroma_side * chroma_side],
             alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
             None,
-            false,
+            smooth_neighbor_uv,
         );
         v.reconstruct(
             cpx,
@@ -3105,12 +3151,12 @@ fn decode_block(
             &vec![0i32; chroma_side * chroma_side],
             alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
             None,
-            false,
+            smooth_neighbor_uv,
         );
         let luma_grid = vec![0i32; side * side];
         let u_grid = vec![0i32; chroma_side * chroma_side];
         let v_grid = vec![0i32; chroma_side * chroma_side];
-        neighbours.record(at, side, mode, &[luma_grid, u_grid, v_grid]);
+        neighbours.record(at, side, mode, uv_predict_mode, &[luma_grid, u_grid, v_grid]);
     } else if !tx_select || logical_tx == side {
         // A single luma transform unit -- the old path, unchanged (including
         // the 64x64 corner case, `logical_tx == side == 64` with
@@ -3159,7 +3205,7 @@ fn decode_block(
             alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
             None,
             None,
-            false,
+            smooth_neighbor_uv,
         )?;
         if std::env::var_os("EC_AV1_TRACE").is_some() {
             eprintln!(
@@ -3187,9 +3233,9 @@ fn decode_block(
             alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
             None,
             None,
-            false,
+            smooth_neighbor_uv,
         )?;
-        neighbours.record(at, side, mode, &[luma_grid, u_grid, v_grid]);
+        neighbours.record(at, side, mode, uv_predict_mode, &[luma_grid, u_grid, v_grid]);
     } else {
         // Several luma transform units, raster order (spec
         // `transform_block`'s loop): the block's resolved transform is
@@ -3268,7 +3314,7 @@ fn decode_block(
             alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
             None,
             None,
-            false,
+            smooth_neighbor_uv,
         )?;
         let v_grid = read_plane(
             dec,
@@ -3290,9 +3336,9 @@ fn decode_block(
             alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
             None,
             None,
-            false,
+            smooth_neighbor_uv,
         )?;
-        neighbours.record_split_luma(at, side, mode, [&u_grid, &v_grid]);
+        neighbours.record_split_luma(at, side, mode, uv_predict_mode, [&u_grid, &v_grid]);
     }
     neighbours.fill_skip_grid((r * (SUB / MI), c * (SUB / MI)), side / MI, skip);
     neighbours.fill_lf_grid(
@@ -8029,7 +8075,14 @@ fn decode_inter_block(
             r * SUB_MI as usize, c * SUB_MI as usize, dec.debug_bitpos(), dec.debug_state().0
         );
     }
-    neighbours.record_rect(at, write_w, write_h, mode_for_tx, &[luma_grid, u_grid, v_grid]);
+    neighbours.record_rect(
+        at,
+        write_w,
+        write_h,
+        mode_for_tx,
+        DC_PRED,
+        &[luma_grid, u_grid, v_grid],
+    );
     neighbours.record_inter_rect(
         at,
         write_w,
