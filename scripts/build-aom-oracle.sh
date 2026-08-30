@@ -22,6 +22,19 @@ if [ ! -d "$SRC/.git" ]; then
   git clone --depth 1 --branch "$VERSION" https://aomedia.googlesource.com/aom "$SRC"
 fi
 
+# A cmake build tree bakes in its own absolute path and its source's, so a
+# build dir that was produced elsewhere and then moved cannot regenerate
+# (`ninja: error: rebuilding build.ninja`) -- which silently costs you the
+# ability to re-instrument aomdec later. Never stage a build under one name
+# and rename it; configure it where it will live. If the cache disagrees with
+# where we are now, drop it and reconfigure in place.
+if [ -f "$BUILD/CMakeCache.txt" ] &&
+   ! grep -q "^CMAKE_HOME_DIRECTORY:INTERNAL=$SRC$" "$BUILD/CMakeCache.txt"; then
+  echo "build tree was configured for a different path -- reconfiguring in place" >&2
+  rm -f "$BUILD/CMakeCache.txt"
+  rm -rf "$BUILD/CMakeFiles"
+fi
+
 CPU_ARGS=()
 if [ -n "${AOM_TARGET_CPU:-}" ]; then
   CPU_ARGS=(-DAOM_TARGET_CPU="$AOM_TARGET_CPU")
