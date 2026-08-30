@@ -46,7 +46,6 @@ const REFUSALS: &[&str] = &[
     "a block that actually uses intrabc (this decoder never reconstructs one)",
     "a frame OBU with no tile group",
     "a frame naming primary_ref_frame at a reference slot with no saved CDF state",
-    "a frame with delta_lf_present set (this decoder never applies per-superblock loop-filter deltas)",
     "a frame with loop restoration enabled (this decoder never reads the per-unit lr symbols)",
     "a frame with more than one tile row (only tile columns are proven pixel-exact so far)",
     "a frame with more than two tile columns (a non-last column's right-edge reach bound past column 0 is unimplemented)",
