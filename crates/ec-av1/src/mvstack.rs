@@ -177,6 +177,15 @@ pub struct MiGrid {
     cols: usize,
     rows: usize,
     cells: Vec<Option<MiInfo>>,
+    /// lane-tiles r6: the current tile's own mi-unit bounds (spec: an MV
+    /// candidate scan never reaches across a tile boundary, mirroring
+    /// `PlaneBuf`'s `tile_x0`/`tile_x1` reach clamp for intra prediction).
+    /// Defaults to the whole grid (the single-tile case, unchanged old
+    /// behaviour) and is narrowed per tile via [`Self::set_tile_bounds`].
+    tile_row0: usize,
+    tile_col0: usize,
+    tile_row1: usize,
+    tile_col1: usize,
 }
 
 impl MiGrid {
@@ -186,7 +195,22 @@ impl MiGrid {
             cols,
             rows,
             cells: vec![None; cols * rows],
+            tile_row0: 0,
+            tile_col0: 0,
+            tile_row1: rows,
+            tile_col1: cols,
         }
+    }
+
+    /// Narrows [`Self::get`]'s own read window to one tile's mi-unit span
+    /// (`row1`/`col1` exclusive) -- called once per tile, before that
+    /// tile's own superblock walk, the same way `Neighbours::start_tile`
+    /// and `PlaneBuf::set_tile_origin` are.
+    pub fn set_tile_bounds(&mut self, row0: usize, col0: usize, row1: usize, col1: usize) {
+        self.tile_row0 = row0;
+        self.tile_col0 = col0;
+        self.tile_row1 = row1;
+        self.tile_col1 = col1;
     }
 
     /// Records the unit at `(row, col)`. Out-of-range coordinates are a
@@ -197,10 +221,16 @@ impl MiGrid {
         }
     }
 
-    /// The unit at `(row, col)`, or `None` when it is outside the grid (the
-    /// tile) or hasn't been coded.
+    /// The unit at `(row, col)`, or `None` when it is outside the grid, hasn't
+    /// been coded, or sits outside the current tile's own bounds ([`Self::set_tile_bounds`]).
     pub fn get(&self, row: usize, col: usize) -> Option<&MiInfo> {
-        if row < self.rows && col < self.cols {
+        if row < self.rows
+            && col < self.cols
+            && row >= self.tile_row0
+            && row < self.tile_row1
+            && col >= self.tile_col0
+            && col < self.tile_col1
+        {
             self.cells[row * self.cols + col].as_ref()
         } else {
             None
