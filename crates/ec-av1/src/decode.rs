@@ -9557,25 +9557,40 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                 sb_c * SB_MI + SB_MI / 2 < mi_cols,
                 sb_r * SB_MI + SB_MI / 2 < mi_rows,
             );
-            match (has_cols, has_rows) {
+            // The straddle cases (one or both halves outside the true
+            // frame) never carry a real alphabet symbol -- spec forces
+            // SPLIT there (mirrors the intra key-frame tile's own
+            // three-way write above). Only the (true, true) case can name
+            // a non-SPLIT value, and this loop below only ever recurses as
+            // SPLIT -- so a real non-SPLIT part64 here must refuse by name
+            // instead of silently decoding as SPLIT and desyncing.
+            let part64 = match (has_cols, has_rows) {
                 (true, true) => {
-                    let part64 = dec.symbol(&mut cdfs.partition_w64[sb_ctx]);
+                    let p = dec.symbol(&mut cdfs.partition_w64[sb_ctx]);
                     if std::env::var_os("EC_AV1_TRACE").is_some() {
                         eprintln!(
-                            "TRACE partition_w64 mi=({},{}) ctx={sb_ctx} value={part64}",
+                            "TRACE partition_w64 mi=({},{}) ctx={sb_ctx} value={p}",
                             sb_r * SB_MI,
                             sb_c * SB_MI
                         );
                     }
-                    let _ = part64;
+                    p
                 }
                 (true, false) => {
                     dec.symbol_fixed(&gather(&cdfs.partition_w64[sb_ctx], VERT_ALIKE));
+                    PARTITION_SPLIT
                 }
                 (false, true) => {
                     dec.symbol_fixed(&gather(&cdfs.partition_w64[sb_ctx], HORZ_ALIKE));
+                    PARTITION_SPLIT
                 }
-                (false, false) => {}
+                (false, false) => PARTITION_SPLIT,
+            };
+            if part64 != PARTITION_SPLIT {
+                return Err(unsupported(
+                    "an inter SB-level partition type other than SPLIT (this decoder's \
+                     inter tile path only recurses a superblock as SPLIT)",
+                ));
             }
 
             for quadrant in 0..4 {
@@ -11001,6 +11016,46 @@ mod tests {
         assert!(
             decoded.y.iter().all(|&s| s == 128),
             "a skipped DC_PRED block with no neighbours predicts flat mid-grey"
+        );
+    }
+
+    /// An inter tile's SB-level `part64` used to be read and thrown away
+    /// (`let _ = part64;`), recursing as SPLIT unconditionally -- a real
+    /// non-SPLIT value there silently desynced the whole tile instead of
+    /// refusing. Hand-writes a single whole superblock's `part64 = HORZ`
+    /// symbol (never produced by this crate's own encoder, which only ever
+    /// writes NONE/SPLIT at this level, but a real aomenc-class encoder can)
+    /// and asserts this decoder refuses by name rather than decoding garbage.
+    #[test]
+    fn a_non_split_inter_sb_partition_refuses_by_name_instead_of_desyncing() {
+        use crate::msac::SymbolEncoder;
+        let mut cdfs = Cdfs::new(q_ctx_of(40));
+        let mut enc = SymbolEncoder::new();
+        enc.symbol(PARTITION_HORZ, &mut cdfs.partition_w64[0]);
+        let data = enc.finish();
+        let reference = crate::encode::Picture::grey(64, 64);
+        let err = decode_inter_frame_tile(
+            &data,
+            16,
+            16,
+            40,
+            64,
+            64,
+            &reference,
+            [None; 8],
+            &CdefParams::default(),
+            &LoopFilterParams::default(),
+            false,
+            false,
+            Some(mc::InterpFilterKind::Regular),
+            false,
+            false,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SPLIT"),
+            "expected the named inter-SB-partition refusal, got: {msg}"
         );
     }
 
