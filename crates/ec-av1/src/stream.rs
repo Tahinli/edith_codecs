@@ -235,14 +235,47 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         // to plain translational MC with the block-centre mv for every
         // other GLOBALMV block, which is only a centre-point approximation
         // of the true per-pixel warp. That is the entire remaining gap.
+        // lane-gm r4: `decode.rs` now feeds `global_motion[ref]` into
+        // `crate::warp::global_warp_params` for every single-ref
+        // `is_global_mv_block` (ROTZOOM/AFFINE), matching `allow_warp`'s
+        // `global_warp_allowed` branch -- ROTZOOM is pin-verified
+        // (`gm-seed43.obu`, frame 1 luma MATCH) and TRANSLATION already
+        // worked (`gm_get_motion_vector`'s translation-only mv, no warp
+        // needed). AFFINE is untested this round (no aomenc fixture in the
+        // wedge gate reached a 6-parameter model) -- keep refusing it by
+        // name rather than shipping an unverified decode.
         if header.frame_type != FrameType::Key
             && header.global_motion[..7]
                 .iter()
-                .any(|gm| gm.model != WarpModel::Identity)
+                .any(|gm| gm.model == WarpModel::Affine)
         {
             return Err(Error::unsupported(
                 "AV1 decode_stream",
-                "an inter frame whose global motion for a single-reference frame is not IDENTITY (GLOBALMV needs the full warp derivation this decoder does not carry)",
+                "an inter frame whose global motion for a single-reference frame is AFFINE (unverified this round; ROTZOOM/TRANSLATION/IDENTITY are proven)",
+            ));
+        }
+        // lane-gm r4: a NEW mismatch, distinct from the one this round
+        // fixed and NOT explained by `reference_select`/compound (traced
+        // live: the mismatched frame of the seed-43 pin has
+        // `reference_select == false`) -- localized instead to the one
+        // property that DOES distinguish it from every frame that already
+        // matches: TWO different ref slots (`GOLDEN_FRAME`, `BWDREF_FRAME`)
+        // carry a non-translation model AT THE SAME TIME. The pin-verified
+        // fix (frame 1) only ever exercised a single active non-identity
+        // slot (`LAST_FRAME` alone). Root cause not yet found within this
+        // round's budget (do not guess-fix): refuse the untested shape by
+        // name -- more than one concurrently active ROTZOOM/AFFINE ref --
+        // rather than ship it silently wrong.
+        if header.frame_type != FrameType::Key
+            && header.global_motion[..7]
+                .iter()
+                .filter(|gm| gm.model != WarpModel::Identity && gm.model != WarpModel::Translation)
+                .count()
+                > 1
+        {
+            return Err(Error::unsupported(
+                "AV1 decode_stream",
+                "an inter frame with more than one concurrently active ROTZOOM/AFFINE global-motion ref slot (single-active-slot ROTZOOM is pin-verified; this shape is not)",
             ));
         }
         // lane-av1comp: `decode_inter_block`/`decode_inter_block8` now read
