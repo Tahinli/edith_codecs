@@ -2681,6 +2681,8 @@ pub(crate) fn encode_inter_frame(
                                         is_new_mv: matches!(info.mode, InterMode::NewMv),
                                         size: 8,
                                         size_h: 8,
+                                        is_global_mv0: false,
+                                        is_global_mv1: false,
                                     },
                                     // Intra: no vote, but still a coded cell
                                     // -- mvstack's extended-scan coverage
@@ -2695,6 +2697,8 @@ pub(crate) fn encode_inter_frame(
                                         is_new_mv: false,
                                         size: 8,
                                         size_h: 8,
+                                        is_global_mv0: false,
+                                        is_global_mv1: false,
                                     },
                                 },
                             );
@@ -2775,6 +2779,8 @@ pub(crate) fn encode_inter_frame(
                                                 is_new_mv: matches!(info.mode, InterMode::NewMv),
                                                 size: 4,
                                                 size_h: 4,
+                                                is_global_mv0: false,
+                                                is_global_mv1: false,
                                             },
                                             None => MiInfo {
                                                 is_inter: false,
@@ -2785,6 +2791,8 @@ pub(crate) fn encode_inter_frame(
                                                 is_new_mv: false,
                                                 size: 4,
                                                 size_h: 4,
+                                                is_global_mv0: false,
+                                                is_global_mv1: false,
                                             },
                                         },
                                     );
@@ -2834,6 +2842,8 @@ pub(crate) fn encode_inter_frame(
                                                     ),
                                                     size: 2,
                                                     size_h: 2,
+                                                    is_global_mv0: false,
+                                                    is_global_mv1: false,
                                                 },
                                                 None => MiInfo {
                                                     is_inter: false,
@@ -2844,6 +2854,8 @@ pub(crate) fn encode_inter_frame(
                                                     is_new_mv: false,
                                                     size: 2,
                                                     size_h: 2,
+                                                    is_global_mv0: false,
+                                                    is_global_mv1: false,
                                                 },
                                             },
                                         );

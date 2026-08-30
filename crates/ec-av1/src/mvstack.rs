@@ -141,6 +141,16 @@ pub struct MiInfo {
     /// has no compound candidates). Feeds `NewMvContext` (7.10.2.8): a
     /// neighbour's own coded-with-NEWMV state, not this block's.
     pub is_new_mv: bool,
+    /// Whether this unit's own coded mode was `GLOBALMV`/`GLOBAL_GLOBALMV`
+    /// *and* the frame's global-motion model for its `ref_frame` is more
+    /// than `TRANSLATION` (libaom's `is_global_mv_block`, checked per
+    /// reference slot at donation time, mvref_common.c:88-92): when true,
+    /// a scan that matches this unit on its first ref slot donates the
+    /// *querying* block's own `gm_mv` there, not `mv`.
+    pub is_global_mv0: bool,
+    /// `is_global_mv0`, for the second ref slot (`ref_frame1`/`mv1`,
+    /// mvref_common.c:116-117).
+    pub is_global_mv1: bool,
     /// The side, in 4x4 units, of the square block this unit belongs to (8
     /// for a whole 32x32 block, 4 for a 16x16 leaf -- every block this crate
     /// ever codes is square, so one dimension is enough). Feeds the extended
@@ -302,6 +312,26 @@ pub type SignBiasTable = [bool; 7];
 /// hardcoded `sign_bias` stub.
 pub const NO_SIGN_BIAS: SignBiasTable = [false; 7];
 
+/// One derived global-motion `(row, col)` mv per reference frame
+/// (`table[ref_frame - LAST_FRAME]`, same shape/indexing as
+/// [`SignBiasTable`]), all computed at the *querying* block's own position
+/// -- lane-gm: a neighbour donating a candidate under `MiInfo::is_global_mv0`/
+/// `MiInfo::is_global_mv1` contributes this table's entry for the matched
+/// ref frame, not its own stored `mv`/`mv1` (mvref_common.c:88-92/116-117).
+pub type GmMvTable = [(i32, i32); 7];
+
+/// The all-zero table every IDENTITY/no-gm caller passes: exact whenever no
+/// unit in the grid is ever `is_global_mv0`/`is_global_mv1` (the 14-pin
+/// list's own streams), since a substitution that never triggers reads as
+/// this reduction's old hardcoded-zero behaviour.
+pub const NO_GM_MV: GmMvTable = [(0, 0); 7];
+
+/// `table[ref_frame - LAST_FRAME]`, [`sign_bias`]'s shape for a
+/// [`GmMvTable`].
+fn gm_mv(table: &GmMvTable, ref_frame: i8) -> (i32, i32) {
+    table[(ref_frame - LAST_FRAME) as usize]
+}
+
 /// libaom's `process_single_ref_mv_candidate` (mvref_common.c): folds one
 /// already-coded neighbour into the stack as a low-weight (`2`, unboosted)
 /// filler entry, used only by the single-reference extension pass below.
@@ -326,6 +356,10 @@ fn process_single_ref_mv_candidate(
     if !candidate.is_inter {
         return;
     }
+    // libaom's `process_single_ref_mv_candidate` (mvref_common.c ~440-475)
+    // reads `candidate->mv[rf_idx]` unconditionally here -- unlike
+    // `add_ref_mv_candidate`'s row/col/corner scans, this extension pass
+    // never checks `is_global_mv_block`/substitutes `gm_mv_candidates`.
     let mut slots = [(candidate.ref_frame, candidate.mv); 2];
     let mut n_slots = 1;
     if let (Some(rf1), Some(mv1)) = (candidate.ref_frame1, candidate.mv1) {
@@ -386,6 +420,7 @@ fn scan_row(
     row_offset: isize,
     max_row_offset: isize,
     ref_frame: i8,
+    gm: &GmMvTable,
     candidates: &mut Vec<StackEntry>,
     newmv_count: &mut u32,
     processed_rows: &mut usize,
@@ -416,7 +451,7 @@ fn scan_row(
             weight = weight.max(inc as u32);
             *processed_rows = (inc as isize - row_offset - 1).max(0) as usize;
         }
-        if let Some(mv) = single_ref_match(info, ref_frame) {
+        if let Some(mv) = single_ref_match(info, ref_frame, gm) {
             found = true;
             add_candidate(candidates, mv, len as u32 * weight);
             *newmv_count += u32::from(info.is_new_mv);
@@ -435,14 +470,22 @@ fn scan_row(
 /// compound neighbour's vote whenever the match sat in its *second* slot
 /// (the class this crate's own compound-stack scan already had to close for
 /// [`find_mv_stack_compound`] -- see the module doc).
-fn single_ref_match(info: &MiInfo, ref_frame: i8) -> Option<(i32, i32)> {
+fn single_ref_match(info: &MiInfo, ref_frame: i8, gm: &GmMvTable) -> Option<(i32, i32)> {
     if !info.is_inter {
         return None;
     }
     if info.ref_frame == ref_frame {
-        Some(info.mv)
+        Some(if info.is_global_mv0 {
+            gm_mv(gm, ref_frame)
+        } else {
+            info.mv
+        })
     } else if info.ref_frame1 == Some(ref_frame) {
-        info.mv1
+        if info.is_global_mv1 {
+            Some(gm_mv(gm, ref_frame))
+        } else {
+            info.mv1
+        }
     } else {
         None
     }
@@ -459,6 +502,7 @@ fn scan_col(
     col_offset: isize,
     max_col_offset: isize,
     ref_frame: i8,
+    gm: &GmMvTable,
     candidates: &mut Vec<StackEntry>,
     newmv_count: &mut u32,
     processed_cols: &mut usize,
@@ -489,7 +533,7 @@ fn scan_col(
             weight = weight.max(inc as u32);
             *processed_cols = (inc as isize - col_offset - 1).max(0) as usize;
         }
-        if let Some(mv) = single_ref_match(info, ref_frame) {
+        if let Some(mv) = single_ref_match(info, ref_frame, gm) {
             found = true;
             add_candidate(candidates, mv, len as u32 * weight);
             *newmv_count += u32::from(info.is_new_mv);
@@ -511,6 +555,7 @@ fn scan_top_right(
     mi_col: usize,
     bw4: usize,
     ref_frame: i8,
+    gm: &GmMvTable,
     candidates: &mut Vec<StackEntry>,
     newmv_count: &mut u32,
 ) -> bool {
@@ -519,7 +564,7 @@ fn scan_top_right(
     };
     let col = mi_col + bw4;
     if let Some(info) = grid.get(row, col)
-        && let Some(mv) = single_ref_match(info, ref_frame)
+        && let Some(mv) = single_ref_match(info, ref_frame, gm)
     {
         add_candidate(candidates, mv, CORNER_WEIGHT);
         *newmv_count += u32::from(info.is_new_mv);
@@ -539,6 +584,7 @@ fn scan_corner(
     mi_row: usize,
     mi_col: usize,
     ref_frame: i8,
+    gm: &GmMvTable,
     candidates: &mut Vec<StackEntry>,
     newmv_count: &mut u32,
 ) -> bool {
@@ -546,7 +592,7 @@ fn scan_corner(
         return false;
     };
     if let Some(info) = grid.get(row, col)
-        && let Some(mv) = single_ref_match(info, ref_frame)
+        && let Some(mv) = single_ref_match(info, ref_frame, gm)
     {
         add_candidate(candidates, mv, CORNER_WEIGHT);
         *newmv_count += u32::from(info.is_new_mv);
@@ -613,6 +659,7 @@ pub fn find_mv_stack(
         mi_cols,
         mi_rows,
         &NO_SIGN_BIAS,
+        &NO_GM_MV,
         None,
     )
 }
@@ -633,6 +680,7 @@ pub fn find_mv_stack_with_sign_bias(
     mi_cols: usize,
     mi_rows: usize,
     sign_bias_table: &SignBiasTable,
+    gm: &GmMvTable,
     tpl: Option<TplArgs>,
 ) -> MvStack {
     let mut candidates = Vec::new();
@@ -670,6 +718,7 @@ pub fn find_mv_stack_with_sign_bias(
             -1,
             max_row_offset,
             ref_frame,
+            gm,
             &mut candidates,
             &mut newmv_count,
             &mut processed_rows,
@@ -683,6 +732,7 @@ pub fn find_mv_stack_with_sign_bias(
             -1,
             max_col_offset,
             ref_frame,
+            gm,
             &mut candidates,
             &mut newmv_count,
             &mut processed_cols,
@@ -693,6 +743,7 @@ pub fn find_mv_stack_with_sign_bias(
         mi_col,
         bw4,
         ref_frame,
+        gm,
         &mut candidates,
         &mut newmv_count,
     );
@@ -756,7 +807,9 @@ pub fn find_mv_stack_with_sign_bias(
                     any_hit = true;
                     if blk_row == 0 && blk_col == 0 {
                         first_sample_missing = false;
-                        first_sample_far = cand.mv.0.abs() >= 16 || cand.mv.1.abs() >= 16;
+                        let this_gm_mv = gm_mv(gm, ref_frame);
+                        first_sample_far = (cand.mv.0 - this_gm_mv.0).abs() >= 16
+                            || (cand.mv.1 - this_gm_mv.1).abs() >= 16;
                     }
                     add_candidate(&mut candidates, cand.mv, 2);
                 }
@@ -811,6 +864,7 @@ pub fn find_mv_stack_with_sign_bias(
         mi_row,
         mi_col,
         ref_frame,
+        gm,
         &mut candidates,
         &mut dummy_newmv_count,
     );
@@ -841,6 +895,7 @@ pub fn find_mv_stack_with_sign_bias(
                 row_offset,
                 max_row_offset,
                 ref_frame,
+                gm,
                 &mut candidates,
                 &mut dummy_newmv_count,
                 &mut processed_rows,
@@ -858,6 +913,7 @@ pub fn find_mv_stack_with_sign_bias(
                 col_offset,
                 max_col_offset,
                 ref_frame,
+                gm,
                 &mut candidates,
                 &mut dummy_newmv_count,
                 &mut processed_cols,
@@ -1101,6 +1157,7 @@ fn scan_row_compound(
     row_offset: isize,
     max_row_offset: isize,
     ref_frame: (i8, i8),
+    gm: &GmMvTable,
     candidates: &mut Vec<CompoundStackEntry>,
     newmv_count: &mut u32,
     processed_rows: &mut usize,
@@ -1135,8 +1192,8 @@ fn scan_row_compound(
             found = true;
             add_compound_candidate(
                 candidates,
-                info.mv,
-                info.mv1.unwrap_or((0, 0)),
+                if info.is_global_mv0 { gm_mv(gm, ref_frame.0) } else { info.mv },
+                if info.is_global_mv1 { gm_mv(gm, ref_frame.1) } else { info.mv1.unwrap_or((0, 0)) },
                 len as u32 * weight,
             );
             *newmv_count += u32::from(info.is_new_mv);
@@ -1157,6 +1214,7 @@ fn scan_col_compound(
     col_offset: isize,
     max_col_offset: isize,
     ref_frame: (i8, i8),
+    gm: &GmMvTable,
     candidates: &mut Vec<CompoundStackEntry>,
     newmv_count: &mut u32,
     processed_cols: &mut usize,
@@ -1191,8 +1249,8 @@ fn scan_col_compound(
             found = true;
             add_compound_candidate(
                 candidates,
-                info.mv,
-                info.mv1.unwrap_or((0, 0)),
+                if info.is_global_mv0 { gm_mv(gm, ref_frame.0) } else { info.mv },
+                if info.is_global_mv1 { gm_mv(gm, ref_frame.1) } else { info.mv1.unwrap_or((0, 0)) },
                 len as u32 * weight,
             );
             *newmv_count += u32::from(info.is_new_mv);
@@ -1203,12 +1261,14 @@ fn scan_col_compound(
 }
 
 /// The compound top-right probe ([`scan_top_right`]'s pair-matched twin).
+#[allow(clippy::too_many_arguments)]
 fn scan_top_right_compound(
     grid: &MiGrid,
     mi_row: usize,
     mi_col: usize,
     bw4: usize,
     ref_frame: (i8, i8),
+    gm: &GmMvTable,
     candidates: &mut Vec<CompoundStackEntry>,
     newmv_count: &mut u32,
 ) -> bool {
@@ -1223,8 +1283,8 @@ fn scan_top_right_compound(
     {
         add_compound_candidate(
             candidates,
-            info.mv,
-            info.mv1.unwrap_or((0, 0)),
+            if info.is_global_mv0 { gm_mv(gm, ref_frame.0) } else { info.mv },
+            if info.is_global_mv1 { gm_mv(gm, ref_frame.1) } else { info.mv1.unwrap_or((0, 0)) },
             CORNER_WEIGHT,
         );
         *newmv_count += u32::from(info.is_new_mv);
@@ -1239,6 +1299,7 @@ fn scan_corner_compound(
     mi_row: usize,
     mi_col: usize,
     ref_frame: (i8, i8),
+    gm: &GmMvTable,
     candidates: &mut Vec<CompoundStackEntry>,
     newmv_count: &mut u32,
 ) -> bool {
@@ -1252,8 +1313,8 @@ fn scan_corner_compound(
     {
         add_compound_candidate(
             candidates,
-            info.mv,
-            info.mv1.unwrap_or((0, 0)),
+            if info.is_global_mv0 { gm_mv(gm, ref_frame.0) } else { info.mv },
+            if info.is_global_mv1 { gm_mv(gm, ref_frame.1) } else { info.mv1.unwrap_or((0, 0)) },
             CORNER_WEIGHT,
         );
         *newmv_count += u32::from(info.is_new_mv);
@@ -1360,6 +1421,7 @@ fn combine_compound_candidates(lists: &CompoundRefLists) -> [((i32, i32), (i32, 
 /// ports of libaom's real behaviour as of r5 — see the inline comments at
 /// each site.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn find_mv_stack_compound(
     grid: &MiGrid,
     mi_row: usize,
@@ -1370,6 +1432,7 @@ pub fn find_mv_stack_compound(
     mi_cols: usize,
     mi_rows: usize,
     sign_bias_table: &SignBiasTable,
+    gm: &GmMvTable,
     tpl: Option<CompoundTplArgs>,
 ) -> CompoundMvStack {
     let mut candidates: Vec<CompoundStackEntry> = Vec::new();
@@ -1401,6 +1464,7 @@ pub fn find_mv_stack_compound(
             -1,
             max_row_offset,
             ref_frame,
+            gm,
             &mut candidates,
             &mut newmv_count,
             &mut processed_rows,
@@ -1414,6 +1478,7 @@ pub fn find_mv_stack_compound(
             -1,
             max_col_offset,
             ref_frame,
+            gm,
             &mut candidates,
             &mut newmv_count,
             &mut processed_cols,
@@ -1424,6 +1489,7 @@ pub fn find_mv_stack_compound(
         mi_col,
         bw4,
         ref_frame,
+        gm,
         &mut candidates,
         &mut newmv_count,
     );
@@ -1489,10 +1555,12 @@ pub fn find_mv_stack_compound(
                     let mv1 = cand1.map_or((0, 0), |c| c.mv);
                     if blk_row == 0 && blk_col == 0 {
                         first_sample_missing = false;
-                        first_sample_far = mv0.0.abs() >= 16
-                            || mv0.1.abs() >= 16
-                            || mv1.0.abs() >= 16
-                            || mv1.1.abs() >= 16;
+                        let this_gm0 = gm_mv(gm, ref_frame.0);
+                        let this_gm1 = gm_mv(gm, ref_frame.1);
+                        first_sample_far = (mv0.0 - this_gm0.0).abs() >= 16
+                            || (mv0.1 - this_gm0.1).abs() >= 16
+                            || (mv1.0 - this_gm1.0).abs() >= 16
+                            || (mv1.1 - this_gm1.1).abs() >= 16;
                     }
                     add_compound_candidate(&mut candidates, mv0, mv1, 2);
                 }
@@ -1512,6 +1580,7 @@ pub fn find_mv_stack_compound(
         mi_row,
         mi_col,
         ref_frame,
+        gm,
         &mut candidates,
         &mut dummy_newmv_count,
     );
@@ -1530,6 +1599,7 @@ pub fn find_mv_stack_compound(
                 row_offset,
                 max_row_offset,
                 ref_frame,
+                gm,
                 &mut candidates,
                 &mut dummy_newmv_count,
                 &mut processed_rows,
@@ -1547,6 +1617,7 @@ pub fn find_mv_stack_compound(
                 col_offset,
                 max_col_offset,
                 ref_frame,
+                gm,
                 &mut candidates,
                 &mut dummy_newmv_count,
                 &mut processed_cols,
@@ -1983,6 +2054,8 @@ mod tests {
             // tests only exercise the immediate/corner/top-right scans.
             size: 1,
             size_h: 1,
+            is_global_mv0: false,
+            is_global_mv1: false,
         }
     }
 
@@ -2137,6 +2210,8 @@ mod tests {
                 is_new_mv: true,
                 size: 1,
                 size_h: 1,
+                is_global_mv0: false,
+                is_global_mv1: false,
             },
         );
         // Only the row matches (nearest_match == 1): newmv_count > 0 picks
@@ -2218,6 +2293,8 @@ mod tests {
                 is_new_mv: false,
                 size: 8,
                 size_h: 8,
+                is_global_mv0: false,
+                is_global_mv1: false,
             },
         );
 
@@ -2248,6 +2325,8 @@ mod tests {
             is_new_mv: false,
             size: 8,
             size_h: 8,
+            is_global_mv0: false,
+            is_global_mv1: false,
         }
     }
 
@@ -2265,6 +2344,8 @@ mod tests {
             is_new_mv: false,
             size: 8,
             size_h: 8,
+            is_global_mv0: false,
+            is_global_mv1: false,
         }
     }
 
@@ -2503,6 +2584,8 @@ mod tests {
             is_new_mv: false,
             size: 1,
             size_h: 1,
+            is_global_mv0: false,
+            is_global_mv1: false,
         }
     }
 
@@ -2524,13 +2607,15 @@ mod tests {
                 is_new_mv: false,
                 size: 1,
                 size_h: 1,
+                is_global_mv0: false,
+                is_global_mv1: false,
             },
         );
         // Exact pair match.
         let (mv0, mv1) = ((2, 2), (-6, 3));
         grid.set(2, 1, comp_inter(mv0, mv1));
 
-        let stack = find_mv_stack_compound(&grid, 2, 2, 2, 2, COMP_PAIR, 8, 8, &NO_SIGN_BIAS, None);
+        let stack = find_mv_stack_compound(&grid, 2, 2, 2, 2, COMP_PAIR, 8, 8, &NO_SIGN_BIAS, &NO_GM_MV, None);
 
         // The exact-pair immediate scan lands one boosted entry; the
         // compound extension pass (short stack, len < MAX_MV_REF_CANDIDATES)
@@ -2554,7 +2639,7 @@ mod tests {
         grid.set(2, 1, comp_inter(mv0, mv1));
         grid.set(3, 1, comp_inter(mv0, mv1));
 
-        let stack = find_mv_stack_compound(&grid, 2, 2, 2, 2, COMP_PAIR, 8, 8, &NO_SIGN_BIAS, None);
+        let stack = find_mv_stack_compound(&grid, 2, 2, 2, 2, COMP_PAIR, 8, 8, &NO_SIGN_BIAS, &NO_GM_MV, None);
 
         // Exact libaom `is_dup` port: with exactly one entry already in the
         // stack (the four identical-pair neighbours deduped by the
@@ -2586,7 +2671,7 @@ mod tests {
         grid.set(4, 2, comp_inter(left.0, left.1));
         grid.set(5, 2, comp_inter(left.0, left.1));
 
-        let stack = find_mv_stack_compound(&grid, 3, 3, 2, 3, COMP_PAIR, 8, 8, &NO_SIGN_BIAS, None);
+        let stack = find_mv_stack_compound(&grid, 3, 3, 2, 3, COMP_PAIR, 8, 8, &NO_SIGN_BIAS, &NO_GM_MV, None);
 
         assert_eq!(stack.entries.len(), 2);
         assert_eq!(stack.entries[0].mv0, left.0);
@@ -2625,6 +2710,8 @@ mod tests {
             is_new_mv: false,
             size: 1,
             size_h: 1,
+            is_global_mv0: false,
+            is_global_mv1: false,
         };
         process_compound_ref_mv_candidate(&candidate, COMP_PAIR, &NO_SIGN_BIAS, &mut lists);
         assert_eq!(lists.ref_id[0], vec![(5, 5)]);
@@ -2652,6 +2739,8 @@ mod tests {
                 is_new_mv: false,
                 size: 8,
                 size_h: 8,
+                is_global_mv0: false,
+                is_global_mv1: false,
             },
         );
         grid.set(
@@ -2666,10 +2755,12 @@ mod tests {
                 is_new_mv: false,
                 size: 8,
                 size_h: 8,
+                is_global_mv0: false,
+                is_global_mv1: false,
             },
         );
 
-        let stack = find_mv_stack_compound(&grid, 2, 2, 2, 2, COMP_PAIR, 8, 8, &NO_SIGN_BIAS, None);
+        let stack = find_mv_stack_compound(&grid, 2, 2, 2, 2, COMP_PAIR, 8, 8, &NO_SIGN_BIAS, &NO_GM_MV, None);
 
         // The combine step (libaom's real "Handle compound reference frame
         // extension") zips each side's ref_id-then-ref_diff lists
