@@ -75,12 +75,49 @@ Temporary diff-dump instrumentation reverted from `stream.rs` before commit
 
 ## Step 3: full suite
 
-(filled in below once run)
+`cargo test -j4 -p ec-av1 --lib` (with `EC_AV1_REQUIRE_AOMENC=1`):
+**265 passed, 0 failed, 19 ignored, 0 filtered out, 203.66s.** 8-bit gates
+unaffected (they run at `coeff_shift == 0`, where the fix is a no-op).
+
+EVIDENCE: /tmp/suite_r7.log | cargo test -j4 -p ec-av1 --lib | test result: ok. 265 passed; 0 failed; 19 ignored; finished in 203.66s
 
 ## Step 4: workspace check
 
-(filled in below once run)
+`cargo check --workspace --all-targets` -> exit 0, warnings only (doc-lint
+noise, one unused-fn/unused-var, pre-existing), no errors.
+
+EVIDENCE: /tmp/wscheck_r7.log | cargo check --workspace --all-targets | EXIT 0
 
 ## Step 5: decode_probe on real films
 
-(filled in below once run)
+Not run: this worktree has no `Hunger Games`/`Troy` extracts in
+`fixtures/`. Per ledger `dead-end|lane-realworld r8`, those came from the
+`lane-realworld` worktree, which was destroyed by an external process
+mid-session (its commit `bd91ad0` is unreachable in any ref/reflog). round
+6's report never mentions leaving copies in *this* worktree either.
+`crates/ec-av1/examples/decode_probe.rs` exists and is unmodified this
+round -- nothing to re-run against.
+
+deferred: real-film decode_probe sweep — no fixture present in this
+worktree, source extracts lost with lane-realworld's worktree — needs the
+orchestrator to either re-extract from the originals or hand this worktree
+a copy.
+
+## Summary
+
+- Diff count after the CDEF commit (`d6bd69a`): 1/4096 luma pixels, off by
+  exactly 1, chroma exact.
+- Geometry: single pixel at (x=1, y=34), inside CDEF 8x8 block row 4 near
+  the left frame edge; not a block/LR-unit boundary artifact.
+- Root cause (closed): `cdef_filter_block`'s primary-tap-set index used
+  `pri_strength & 1` instead of `(pri_strength >> coeff_shift) & 1`
+  (libaom `cdef_block.c:147`); at `coeff_shift=2` (10-bit) this always
+  selected tap set `{4,2}`, silently dropping tap set `{3,3}` for odd
+  strength levels. Fixed in `7e007da`; gate now 0/4096 diffs.
+- Full suite: 265 passed, 0 failed, 19 ignored.
+- `cargo check --workspace --all-targets`: clean (exit 0).
+- HEAD: `7e007da` (report commit follows at HEAD after this write).
+- Open: real-film `decode_probe` sweep deferred (fixture missing from this
+  worktree, see above). Everything else in the charter is closed and
+  green -- this lane is ready for merge from a correctness standpoint,
+  modulo that one deferred non-blocking sweep.
