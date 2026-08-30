@@ -6820,17 +6820,17 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
             Picture {
                 width,
                 height,
-                y: y.data.into_iter().map(|s| s as u8).collect(),
-                u: u.data.into_iter().map(|s| s as u8).collect(),
-                v: v.data.into_iter().map(|s| s as u8).collect(),
+                y: y.data,
+                u: u.data,
+                v: v.data,
             },
             result_cdfs,
         ));
     }
-    let crop = |plane: &PlaneBuf, w: usize, h: usize| -> Vec<u8> {
+    let crop = |plane: &PlaneBuf, w: usize, h: usize| -> Vec<u16> {
         let mut out = Vec::with_capacity(w * h);
         for row in 0..h {
-            out.extend(plane.data[row * plane.width..][..w].iter().map(|&s| s as u8));
+            out.extend(plane.data[row * plane.width..][..w].iter().copied());
         }
         out
     };
@@ -6856,7 +6856,11 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                 static IDX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
                 let idx = IDX.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 if let Ok(mut f) = std::fs::File::create(format!("{path}.f{idx}")) {
-                    let _ = f.write_all(&yc);
+                    // corner-cut: this diagnostic dump stays 8-bit-narrowed
+                    // regardless of the stream's real bit depth (debug-only,
+                    // never read by a gate); widen if a >8-bit margin dump
+                    // is ever needed.
+                    let _ = f.write_all(&yc.iter().map(|&s| s as u8).collect::<Vec<u8>>());
                 }
             }
             Some(Picture {
@@ -12591,18 +12595,18 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
             Picture {
                 width,
                 height,
-                y: y.data.into_iter().map(|s| s as u8).collect(),
-                u: u.data.into_iter().map(|s| s as u8).collect(),
-                v: v.data.into_iter().map(|s| s as u8).collect(),
+                y: y.data,
+                u: u.data,
+                v: v.data,
             },
             result_cdfs,
             motion_field,
         ));
     }
-    let crop = |plane: &PlaneBuf, w: usize, h: usize| -> Vec<u8> {
+    let crop = |plane: &PlaneBuf, w: usize, h: usize| -> Vec<u16> {
         let mut out = Vec::with_capacity(w * h);
         for row in 0..h {
-            out.extend(plane.data[row * plane.width..][..w].iter().map(|&s| s as u8));
+            out.extend(plane.data[row * plane.width..][..w].iter().copied());
         }
         out
     };

@@ -191,30 +191,45 @@ pub(crate) fn upscale_picture(
     let chroma_in_w = picture.width.div_ceil(2);
     let chroma_out_w = upscaled_width.div_ceil(2);
     let chroma_h = height.div_ceil(2);
+    // lane-hbd r4: superres is 8-bit by construction (`upscale_row` clamps
+    // to 255) -- narrow at this boundary; callers refuse `bit_depth != 8`
+    // before ever reaching here (see `stream.rs`).
+    let narrow = |v: &[u16]| -> Vec<u8> { v.iter().map(|&s| s as u8).collect() };
+    let picture_y8 = narrow(&picture.y);
+    let picture_u8 = narrow(&picture.u);
+    let picture_v8 = narrow(&picture.v);
+    let margin_y8 = margin.map(|m| narrow(&m.y));
+    let margin_u8 = margin.map(|m| narrow(&m.u));
+    let margin_v8 = margin.map(|m| narrow(&m.v));
+    let widen = |v: Vec<u8>| -> Vec<u16> { v.into_iter().map(u16::from).collect() };
     crate::encode::Picture {
         width: upscaled_width,
         height,
-        y: upscale_plane(
-            &picture.y,
+        y: widen(upscale_plane(
+            &picture_y8,
             height,
             picture.width,
             upscaled_width,
-            margin.map(|m| (m.y.as_slice(), m.width)),
-        ),
-        u: upscale_plane(
-            &picture.u,
+            margin_y8.as_deref().map(|m| (m, margin.unwrap().width)),
+        )),
+        u: widen(upscale_plane(
+            &picture_u8,
             chroma_h,
             chroma_in_w,
             chroma_out_w,
-            margin.map(|m| (m.u.as_slice(), m.width.div_ceil(2))),
-        ),
-        v: upscale_plane(
-            &picture.v,
+            margin_u8
+                .as_deref()
+                .map(|m| (m, margin.unwrap().width.div_ceil(2))),
+        )),
+        v: widen(upscale_plane(
+            &picture_v8,
             chroma_h,
             chroma_in_w,
             chroma_out_w,
-            margin.map(|m| (m.v.as_slice(), m.width.div_ceil(2))),
-        ),
+            margin_v8
+                .as_deref()
+                .map(|m| (m, margin.unwrap().width.div_ceil(2))),
+        )),
     }
 }
 
