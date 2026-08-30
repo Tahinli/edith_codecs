@@ -532,6 +532,16 @@ pub const PALETTE_UV_COLOR_INDEX: [[[u16; 9]; 5]; 7] = [
 /// `default_intrabc_cdf` (entropymode.c): the `use_intrabc` flag on an
 /// intra frame with `allow_intrabc` set.
 pub const INTRABC: [u16; 3] = [30531, 32768, 0];
+/// `default_wiener_restore_cdf` (entropymode.c): a `RESTORE_WIENER`-plane
+/// LR unit's own `use_wiener` flag (spec 5.11.57 `read_lr_unit`).
+pub const RESTORE_WIENER: [u16; 3] = [11570, 32768, 0];
+/// `default_sgrproj_restore_cdf`: a `RESTORE_SGRPROJ`-plane LR unit's own
+/// `use_sgrproj` flag.
+pub const RESTORE_SGRPROJ: [u16; 3] = [16855, 32768, 0];
+/// `default_switchable_restore_cdf`: a `RESTORE_SWITCHABLE`-plane LR unit's
+/// own `restoration_type` (3-way: `RESTORE_NONE`/`RESTORE_WIENER`/
+/// `RESTORE_SGRPROJ`).
+pub const RESTORE_SWITCHABLE: [u16; 4] = [9413, 22581, 32768, 0];
 
 /// `default_delta_q_cdf` (entropymode.c:840-852, lane-realworld r4): the
 /// 4-symbol `delta_q_abs` alphabet read once per superblock when
