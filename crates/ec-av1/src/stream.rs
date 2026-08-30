@@ -191,10 +191,15 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         // silent-desync shape as the refusals above. Traced live 2026-08-27:
         // an aomenc inter frame with `Sgrproj` on the V plane desynced the
         // partition walk into out-of-alphabet garbage.
+        // lane-lr r2: the per-superblock `read_lr`/`read_lr_unit` symbols are
+        // now read (`crate::restoration`) and no longer desync the partition
+        // walk -- the refusal narrows to its true remaining gap: decoded
+        // Wiener/SGR filters are stored per unit but never applied to
+        // pixels.
         if header.loop_restoration.uses_lr {
             return Err(Error::unsupported(
                 "AV1 decode_stream",
-                "a frame with loop restoration enabled (this decoder never reads the per-unit lr symbols)",
+                "a frame with loop restoration enabled (the per-unit lr symbols are read but the Wiener/self-guided filters are not yet applied to pixels)",
             ));
         }
         // `decode_inter_block`/`decode_inter_block8`'s `GLOBALMV` arm (spec
@@ -370,6 +375,7 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 enable_edge_filter,
                 &header.cdef,
                 &header.loop_filter,
+                &header.loop_restoration,
                 initial_cdfs,
                 header.tx_mode == TxMode::Select,
                 header.reduced_tx_set,
@@ -437,6 +443,7 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 other_refs,
                 &header.cdef,
                 &header.loop_filter,
+                &header.loop_restoration,
                 initial_cdfs,
                 header.allow_high_precision_mv,
                 header.force_integer_mv,
