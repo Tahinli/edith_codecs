@@ -160,20 +160,54 @@ pub fn dq_denom_area(pels: usize) -> i64 {
     }
 }
 
+/// Spec 5.9.12's per-plane DC/AC quantizer index offsets, added to the
+/// running `q_idx` (spec `CurrentQIndex`, already segmentation/delta-q
+/// adjusted) before the table lookup (spec 7.12.2's `get_dc_quant`/
+/// `get_ac_quant`) -- lane-sbpart r11: these were parsed by
+/// `ec-av1-syntax::frame` and, until this round, used for nothing but the
+/// `lossless[]` determination. Luma has no `ac` delta (the spec never codes
+/// one); `v_*` already falls back to `u_*` at parse time when
+/// `separate_uv_delta_q` is unset, so callers never need to know that flag.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct QuantDeltas {
+    /// `delta_q_y_dc`: luma's DC-only offset (luma has no coded AC delta).
+    pub y_dc: i32,
+    /// `delta_q_u_dc`.
+    pub u_dc: i32,
+    /// `delta_q_u_ac`.
+    pub u_ac: i32,
+    /// `delta_q_v_dc` (falls back to `delta_q_u_dc` when
+    /// `separate_uv_delta_q` is unset, already resolved at parse time).
+    pub v_dc: i32,
+    /// `delta_q_v_ac` (same `separate_uv_delta_q` fallback).
+    pub v_ac: i32,
+}
+
 /// Dequantize one coefficient (spec 7.12.3 steps a-f): scale by the DC or AC
 /// quantizer, mask to 24 bits, divide by the transform's denominator toward
 /// zero, and clip to the coefficient range.
 pub fn dequant_coeff(level: i32, is_dc: bool, bit_depth: u8, q_idx: i32, side: usize) -> i32 {
-    dequant_coeff_wh(level, is_dc, bit_depth, q_idx, side, side)
+    dequant_coeff_wh(level, is_dc, bit_depth, q_idx, 0, 0, side, side)
 }
 
-/// [`dequant_coeff`] widened to `(w, h)` (lane-recttx): only the denominator
-/// (an area threshold, [`dq_denom_area`]) depends on the transform's shape.
-pub fn dequant_coeff_wh(level: i32, is_dc: bool, bit_depth: u8, q_idx: i32, w: usize, h: usize) -> i32 {
+/// [`dequant_coeff`] widened to `(w, h)` (lane-recttx), with the DC/AC
+/// quantizer-index deltas (lane-sbpart r11, spec 7.12.2) added before the
+/// table lookup and clamped the same way the plain index already is.
+#[allow(clippy::too_many_arguments)]
+pub fn dequant_coeff_wh(
+    level: i32,
+    is_dc: bool,
+    bit_depth: u8,
+    q_idx: i32,
+    dc_delta: i32,
+    ac_delta: i32,
+    w: usize,
+    h: usize,
+) -> i32 {
     let q = i64::from(if is_dc {
-        dc_q(bit_depth, q_idx)
+        dc_q(bit_depth, q_idx + dc_delta)
     } else {
-        ac_q(bit_depth, q_idx)
+        ac_q(bit_depth, q_idx + ac_delta)
     });
     let dq = i64::from(level) * q;
     let sign = if dq < 0 { -1 } else { 1 };
@@ -185,15 +219,17 @@ pub fn dequant_coeff_wh(level: i32, is_dc: bool, bit_depth: u8, q_idx: i32, w: u
 /// Dequantize a whole raster-order coefficient grid of a `side` x `side`
 /// transform.
 pub fn dequant(levels: &[i32], side: usize, bit_depth: u8, q_idx: i32) -> Vec<i32> {
-    dequant_wh(levels, side, side, bit_depth, q_idx)
+    dequant_wh(levels, side, side, bit_depth, q_idx, 0, 0)
 }
 
-/// [`dequant`] widened to `(w, h)` (lane-recttx).
-pub fn dequant_wh(levels: &[i32], w: usize, h: usize, bit_depth: u8, q_idx: i32) -> Vec<i32> {
+/// [`dequant`] widened to `(w, h)` (lane-recttx), threading the same
+/// [`QuantDeltas`]-shaped `dc_delta`/`ac_delta` pair as [`dequant_coeff_wh`].
+#[allow(clippy::too_many_arguments)]
+pub fn dequant_wh(levels: &[i32], w: usize, h: usize, bit_depth: u8, q_idx: i32, dc_delta: i32, ac_delta: i32) -> Vec<i32> {
     levels
         .iter()
         .enumerate()
-        .map(|(i, &l)| dequant_coeff_wh(l, i == 0, bit_depth, q_idx, w, h))
+        .map(|(i, &l)| dequant_coeff_wh(l, i == 0, bit_depth, q_idx, dc_delta, ac_delta, w, h))
         .collect()
 }
 
