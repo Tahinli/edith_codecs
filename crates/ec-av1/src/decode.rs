@@ -8078,6 +8078,16 @@ fn decode_inter_block(
             );
             block_filter = resolved_filter;
 
+            // lane-superres r9: a scaled reference in a COMPOUND_REFERENCE
+            // block (either tap) is not wired -- mc::predict_compound_intermediate
+            // has no scaled counterpart yet -- refuse by name rather than
+            // silently sample it unscaled.
+            if py0.width != frame_width || py1.width != frame_width {
+                return Err(unsupported(
+                    "a compound-reference block with a scaled reference (superres, unimplemented)",
+                ));
+            }
+
             let mut inter0_y = vec![0i32; side * side];
             mc::predict_compound_intermediate(
                 &py0.data,
@@ -8752,48 +8762,110 @@ fn decode_inter_block(
             mode_for_tx = 0;
             uv_predict_mode = DC_PRED;
 
+            // lane-superres r9: spec 7.11.3.3's x_scale_fp comes from LUMA
+            // widths only (r8's derivation) and applies unchanged to the
+            // chroma calls below (their x_q4 is already in the chroma
+            // plane's own pixel units). `mc::predict_scaled` has no warp/OBMC
+            // /interintra counterpart -- those three combinations are refused
+            // by name instead of silently sampling a scaled reference wrong
+            // (warp_params/obmc_selected/interintra_mode are all resolved by
+            // this point, every symbol for this block already read).
+            let luma_scale = mc::scale_factor(py_ref.width, frame_width);
+            if luma_scale != mc::REF_NO_SCALE
+                && (warp_params.is_some() || obmc_selected || interintra_mode.is_some())
+            {
+                return Err(unsupported(
+                    "warp/OBMC/interintra prediction with a scaled reference (superres, unimplemented)",
+                ));
+            }
+
             let mut pred_y = vec![0u8; side * side];
-            mc::predict_with_filters(
-                &py_ref.data,
-                py_ref.width,
-                py_ref.true_width,
-                py_ref.true_height,
-                mv_to_q4(px, mv.1, true),
-                mv_to_q4(py, mv.0, true),
-                side,
-                side,
-                h_filter,
-                v_filter,
-                &mut pred_y,
-            );
             let mut pred_u = vec![0u8; chroma_side * chroma_side];
-            mc::predict_with_filters(
-                &pu_ref.data,
-                pu_ref.width,
-                pu_ref.true_width,
-                pu_ref.true_height,
-                mv_to_q4(cpx, mv.1, false),
-                mv_to_q4(cpy, mv.0, false),
-                chroma_side,
-                chroma_side,
-                h_filter,
-                v_filter,
-                &mut pred_u,
-            );
             let mut pred_v = vec![0u8; chroma_side * chroma_side];
-            mc::predict_with_filters(
-                &pv_ref.data,
-                pv_ref.width,
-                pv_ref.true_width,
-                pv_ref.true_height,
-                mv_to_q4(cpx, mv.1, false),
-                mv_to_q4(cpy, mv.0, false),
-                chroma_side,
-                chroma_side,
-                h_filter,
-                v_filter,
-                &mut pred_v,
-            );
+            if luma_scale == mc::REF_NO_SCALE {
+                mc::predict_with_filters(
+                    &py_ref.data,
+                    py_ref.width,
+                    py_ref.true_width,
+                    py_ref.true_height,
+                    mv_to_q4(px, mv.1, true),
+                    mv_to_q4(py, mv.0, true),
+                    side,
+                    side,
+                    h_filter,
+                    v_filter,
+                    &mut pred_y,
+                );
+                mc::predict_with_filters(
+                    &pu_ref.data,
+                    pu_ref.width,
+                    pu_ref.true_width,
+                    pu_ref.true_height,
+                    mv_to_q4(cpx, mv.1, false),
+                    mv_to_q4(cpy, mv.0, false),
+                    chroma_side,
+                    chroma_side,
+                    h_filter,
+                    v_filter,
+                    &mut pred_u,
+                );
+                mc::predict_with_filters(
+                    &pv_ref.data,
+                    pv_ref.width,
+                    pv_ref.true_width,
+                    pv_ref.true_height,
+                    mv_to_q4(cpx, mv.1, false),
+                    mv_to_q4(cpy, mv.0, false),
+                    chroma_side,
+                    chroma_side,
+                    h_filter,
+                    v_filter,
+                    &mut pred_v,
+                );
+            } else {
+                mc::predict_scaled(
+                    &py_ref.data,
+                    py_ref.width,
+                    py_ref.true_width,
+                    py_ref.true_height,
+                    mv_to_q4(px, mv.1, true),
+                    mv_to_q4(py, mv.0, true),
+                    luma_scale,
+                    side,
+                    side,
+                    h_filter,
+                    v_filter,
+                    &mut pred_y,
+                );
+                mc::predict_scaled(
+                    &pu_ref.data,
+                    pu_ref.width,
+                    pu_ref.true_width,
+                    pu_ref.true_height,
+                    mv_to_q4(cpx, mv.1, false),
+                    mv_to_q4(cpy, mv.0, false),
+                    luma_scale,
+                    chroma_side,
+                    chroma_side,
+                    h_filter,
+                    v_filter,
+                    &mut pred_u,
+                );
+                mc::predict_scaled(
+                    &pv_ref.data,
+                    pv_ref.width,
+                    pv_ref.true_width,
+                    pv_ref.true_height,
+                    mv_to_q4(cpx, mv.1, false),
+                    mv_to_q4(cpy, mv.0, false),
+                    luma_scale,
+                    chroma_side,
+                    chroma_side,
+                    h_filter,
+                    v_filter,
+                    &mut pred_v,
+                );
+            }
 
             if let Some(params) = &warp_params {
                 crate::warp::warp_affine(
@@ -10879,6 +10951,24 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     .map(|i| (mi_row0 + (i / 2) * 2, mi_col0 + (i % 2) * 2))
                                     .filter(|&(mr, mc)| mr < mi_rows && mc < mi_cols)
                                     .collect();
+                                // lane-superres r9: decode_inter_block8's own
+                                // MC (below) is not threaded for a scaled
+                                // reference (unlike decode_inter_block's 19
+                                // sites) -- refuse the whole 8x8-leaf split
+                                // up front when ANY live reference this leaf
+                                // could pick has a different width than this
+                                // frame, rather than thread frame_width
+                                // through its own single-ref/compound MC
+                                // calls to reach the same block this round.
+                                if ref_y.width != frame_width as usize
+                                    || ref_slots.iter().flatten().any(|(py, _, _)| {
+                                        py.width != frame_width as usize
+                                    })
+                                {
+                                    return Err(unsupported(
+                                        "an 8x8 partition leaf under a scaled reference (superres, unimplemented)",
+                                    ));
+                                }
                                 let mut prev_leaf: Option<((usize, usize), bool, bool)> = None;
                                 let mut last_compound_ctx: Option<(i8, i8, u8, u8)> = None;
                                 let mut last_skip_mode = false;
