@@ -21,7 +21,7 @@
 //! too). Anything outside that refuses with [`Error::unsupported`] rather than
 //! silently miscoding.
 
-use ec_av1_syntax::{CdefParams, LoopFilterParams, TileInfo};
+use ec_av1_syntax::{CdefParams, DeltaParams, LoopFilterParams, TileInfo};
 use ec_core::{Error, Result};
 
 use crate::cdf;
@@ -104,6 +104,68 @@ thread_local! {
 /// Current value of [`CDEF_IDX_HITS`].
 pub(crate) fn cdef_idx_hits() -> usize {
     CDEF_IDX_HITS.with(|c| c.get())
+}
+
+// lane-realworld r4: this frame's `delta.q_present` (spec 5.9.17) and its
+// actual step (`1 << delta.q_res`, already the real multiplier, not the raw
+// 2-bit field). `false`/`1` (the defaults) make [`maybe_read_delta_q`] a
+// true no-op, matching every existing gate stream's `delta_q_present == 0`
+// behaviour exactly, the same corner-cut [`CDEF_BITS`] takes above.
+thread_local! {
+    static DELTA_Q_PRESENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static DELTA_Q_RES: std::cell::Cell<i32> = const { std::cell::Cell::new(1) };
+}
+// The running quantizer index (spec `CurrentQIndex`, libaom
+// `xd->current_base_qindex`) -- reset to the frame's own `base_q_idx` at the
+// top of every tile (spec `decode_tile`), carried across superblocks within
+// that tile, and mutated only by [`maybe_read_delta_q`]. Read back at the
+// dequantization call sites instead of the frame-constant `base_q_idx`.
+thread_local! {
+    static CURRENT_Q_IDX: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+}
+// How many real `delta_q_present` symbol groups [`maybe_read_delta_q`] has
+// read, across every call on the current thread -- the gate's proof that a
+// `delta_q_present` stream actually reached the new reader.
+thread_local! {
+    static DELTA_Q_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`DELTA_Q_HITS`].
+pub(crate) fn delta_q_hits() -> usize {
+    DELTA_Q_HITS.with(|c| c.get())
+}
+
+/// `read_delta_qindex`/`read_delta_q_params` (spec 5.11.10, libaom
+/// `decodemv.c:85-146,735-770`), called right after [`maybe_read_cdef_idx`]
+/// at every block-decode call site (spec order `skip -> cdef -> delta_q`).
+/// A no-op when `delta_q_present` is unset, or when this block is not at the
+/// superblock's own top-left MI position (`b_row == 0 && b_col == 0` in
+/// libaom, collapsed here to a position check since a partition tree's
+/// top-left leaf is the only block that can ever land there), or when that
+/// leaf both *is* the whole superblock and is `skip` (the one case libaom
+/// itself skips the read, state carrying over unchanged).
+fn maybe_read_delta_q(dec: &mut SymbolDecoder, cdfs: &mut Cdfs, mi_r: usize, mi_c: usize, is_whole_sb: bool, skip: bool) {
+    if !DELTA_Q_PRESENT.with(|c| c.get()) {
+        return;
+    }
+    if mi_r % SB_MI as usize != 0 || mi_c % SB_MI as usize != 0 {
+        return;
+    }
+    if is_whole_sb && skip {
+        return;
+    }
+    let mut abs = dec.symbol(&mut cdfs.delta_q) as i32;
+    const DELTA_Q_SMALL: i32 = 3;
+    if abs >= DELTA_Q_SMALL {
+        let rem_bits = dec.literal(3) + 1;
+        let thr = (1i32 << rem_bits) + 1;
+        abs = dec.literal(rem_bits) as i32 + thr;
+    }
+    let sign_negative = if abs != 0 { dec.literal(1) != 0 } else { true };
+    let reduced = if sign_negative { -abs } else { abs };
+    DELTA_Q_HITS.with(|c| c.set(c.get() + 1));
+    let res = DELTA_Q_RES.with(|c| c.get());
+    CURRENT_Q_IDX.with(|c| c.set((c.get() + reduced * res).clamp(1, 255)));
 }
 
 /// `read_cdef` (spec 5.11.56, libaom `decodemv.c:read_cdef`), called right
@@ -2139,6 +2201,10 @@ fn read_intra_mode_rect(
     }
     let skip = dec.symbol(&mut cdfs.skip[skip_ctx]) != 0;
     maybe_read_cdef_idx(dec, mi_r, mi_c, skip);
+    // A HORZ/VERT rect strip is never the whole superblock (`bw`/`bh` never
+    // both 64 here -- see this fn's own doc), so `is_whole_sb` is always
+    // `false`.
+    maybe_read_delta_q(dec, cdfs, mi_r, mi_c, false, skip);
     let above_ctx = INTRA_MODE_CTX[above_mode];
     let left_ctx = INTRA_MODE_CTX[left_mode];
     let mode = dec.symbol(&mut cdfs.kf_y_mode[above_ctx][left_ctx]);
@@ -2466,7 +2532,7 @@ fn decode_block_rect(
             bw,
             bh,
             8,
-            i32::from(base_q_idx),
+            CURRENT_Q_IDX.with(|c| c.get()),
             luma_tx_type,
         );
         y.reconstruct_rect(
@@ -2505,7 +2571,7 @@ fn decode_block_rect(
             chroma_w,
             chroma_h,
             8,
-            i32::from(base_q_idx),
+            CURRENT_Q_IDX.with(|c| c.get()),
             u_tx_type,
         );
         u.reconstruct_rect(
@@ -2543,7 +2609,7 @@ fn decode_block_rect(
             chroma_w,
             chroma_h,
             8,
-            i32::from(base_q_idx),
+            CURRENT_Q_IDX.with(|c| c.get()),
             v_tx_type,
         );
         v.reconstruct_rect(
@@ -2612,6 +2678,7 @@ fn read_intra_mode(
     // spec order (see the comment below on `read_intrabc_info`): `skip`,
     // `segment_id`, `cdef`, `delta_q` -- `cdef` lands right here.
     maybe_read_cdef_idx(dec, mi_r, mi_c, skip);
+    maybe_read_delta_q(dec, cdfs, mi_r, mi_c, side == 64, skip);
     // `read_intrabc_info` (spec 5.11.13, libaom decodemv.c:693, called at
     // :811 right after `skip_txfm`/`segment_id`/`cdef`/`delta_q` and before
     // `mbmi->mode` is ever read): a `use_intrabc` symbol only present on an
@@ -3148,7 +3215,7 @@ fn read_plane(
         }
         full
     };
-    let residual = dequant_and_inverse_typed(&levels, side, 8, i32::from(base_q_idx), tx_type);
+    let residual = dequant_and_inverse_typed(&levels, side, 8, CURRENT_Q_IDX.with(|c| c.get()), tx_type);
     if std::env::var_os("EC_AV1_TRACE").is_some() {
         eprintln!(
             "TRACE dequant plane={plane_idx} base_q_idx={base_q_idx} tx_type={tx_type:?} side={side} levels={levels:?} residual={residual:?}",
@@ -4746,6 +4813,7 @@ pub fn decode_key_frame_tile(
     allow_screen_content_tools: bool,
     allow_intrabc: bool,
 ) -> Result<Picture> {
+    let delta = DeltaParams::default();
     let single_tile = TileInfo {
         mi_col_starts: vec![0, mi_cols],
         mi_row_starts: vec![0, mi_rows],
@@ -4768,6 +4836,7 @@ pub fn decode_key_frame_tile(
         reduced_tx_set,
         allow_screen_content_tools,
         allow_intrabc,
+        delta,
     )
     .map(|(picture, _)| picture)
 }
@@ -4797,6 +4866,11 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     reduced_tx_set: bool,
     allow_screen_content_tools: bool,
     allow_intrabc: bool,
+    // lane-realworld r4: this frame header's own `delta` (spec 5.9.17/5.9.18)
+    // -- only `q_present`/`q_res` are actually read ([`maybe_read_delta_q`]);
+    // `stream.rs` still refuses a frame with `lf_present` set before this
+    // function is ever called.
+    delta: DeltaParams,
 ) -> Result<(Picture, Cdfs)> {
     if mi_cols == 0 || mi_rows == 0 {
         return Err(unsupported("a frame with no mode-info grid"));
@@ -4806,6 +4880,8 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     CDEF_BITS.with(|c| c.set(cdef.bits));
     CDEF_SB_COLS.with(|c| c.set(sb_cols as usize));
     CDEF_IDX_GRID.with(|g| *g.borrow_mut() = vec![0u8; sb_cols as usize * sb_rows as usize]);
+    DELTA_Q_PRESENT.with(|c| c.set(delta.q_present));
+    DELTA_Q_RES.with(|c| c.set(1i32 << delta.q_res));
     let (cols32, rows32) = block_grid(mi_cols, mi_rows);
     let (true_width, true_height) = ((mi_cols * 4) as usize, (mi_rows * 4) as usize);
     let (width, height) = (cols32 as usize * BLOCK, rows32 as usize * BLOCK);
@@ -4879,6 +4955,9 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         let (sb_c0, sb_c1) = ((mi_col0 / SB_MI).min(sb_cols), mi_col1.div_ceil(SB_MI).min(sb_cols));
 
         let mut cdfs = base_cdfs.clone();
+        // spec `decode_tile`: `CurrentQIndex` resets to the frame's own
+        // `base_q_idx` at the top of every tile, not once per frame.
+        CURRENT_Q_IDX.with(|c| c.set(i32::from(base_q_idx)));
         if std::env::var_os("EC_AV1_TRACE").is_some() {
             eprintln!(
                 "TRACE key_tile_bytes tile={tile_num} len={} first8={:02x?} base_q_idx={base_q_idx} mi_cols={mi_cols} mi_rows={mi_rows}",
@@ -5643,7 +5722,7 @@ fn read_inter_plane(
         dc_sign_ctx(around.2),
         default_tx_type,
     )?;
-    let residual = dequant_and_inverse_typed(&grid, side, 8, i32::from(base_q_idx), tx_type);
+    let residual = dequant_and_inverse_typed(&grid, side, 8, CURRENT_Q_IDX.with(|c| c.get()), tx_type);
     plane.reconstruct_mc(x, y, side, prediction, &residual);
     Ok((grid, tx_type))
 }
@@ -6734,6 +6813,7 @@ fn decode_inter_block(
     let skip_ctx = usize::from(neighbours.above_skip[c]) + usize::from(neighbours.left_skip[r]);
     let skip = skip_mode || dec.symbol(&mut cdfs.skip[skip_ctx]) == 1;
     maybe_read_cdef_idx(dec, r * SUB_MI as usize, c * SUB_MI as usize, skip);
+    maybe_read_delta_q(dec, cdfs, r * SUB_MI as usize, c * SUB_MI as usize, side == 64, skip);
     // lane-warp r5: see `reject_residual` -- a square-block decode of a
     // HORZ_B strip is symbol-exact only for `skip` (no residual, no
     // motion_mode/warp symbol), so gate here before any further read.
@@ -8504,6 +8584,8 @@ fn decode_inter_block8(
     let skip_ctx = usize::from(above_skip) + usize::from(left_skip);
     let skip = skip_mode || dec.symbol(&mut cdfs.skip[skip_ctx]) == 1;
     maybe_read_cdef_idx(dec, leaf_mi.0, leaf_mi.1, skip);
+    // Always a `BLOCK_8X8` leaf here, never the whole superblock.
+    maybe_read_delta_q(dec, cdfs, leaf_mi.0, leaf_mi.1, false, skip);
 
     let (has_above, has_left) = (
         leaf_mi.0 > neighbours.tile_row0_mi,
@@ -9484,6 +9566,7 @@ pub fn decode_inter_frame_tile(
         false,
         false,
         false,
+        DeltaParams::default(),
     )
     .map(|(picture, _, _)| picture)
 }
