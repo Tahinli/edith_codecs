@@ -1533,6 +1533,259 @@ fn filter_intra_size_class(side: usize) -> Option<usize> {
     }
 }
 
+/// [`filter_intra_size_class`] for a true `bw`x`bh` rect strip
+/// (lane-intradisp r1): `av1_filter_intra_allowed_bsize` permits any bsize
+/// with both dims <= 32, which includes `BLOCK_32X16`/`BLOCK_16X32` -- their
+/// own distinct `cdf::FILTER_INTRA` rows, classes 4/5.
+fn filter_intra_size_class_rect(bw: usize, bh: usize) -> Option<usize> {
+    match (bw, bh) {
+        (32, 16) => Some(4),
+        (16, 32) => Some(5),
+        _ if bw == bh => filter_intra_size_class(bw),
+        _ => None,
+    }
+}
+
+/// [`read_intra_mode`] for a true `bw`x`bh` rect strip (lane-intradisp r1):
+/// identical except the `use_filter_intra` size class comes from
+/// [`filter_intra_size_class_rect`] instead of the square-only
+/// [`filter_intra_size_class`] -- every other symbol this reads (`skip`,
+/// `y_mode`, `angle_delta`, `uv_mode`, `cfl_alphas`) is indexed by mode or
+/// neighbour state, never by block size.
+#[allow(clippy::too_many_arguments)]
+fn read_intra_mode_rect(
+    dec: &mut SymbolDecoder,
+    cdfs: &mut Cdfs,
+    above_mode: usize,
+    left_mode: usize,
+    cfl: bool,
+    bw: usize,
+    bh: usize,
+    enable_filter_intra: bool,
+) -> Result<(
+    bool,
+    usize,
+    i32,
+    usize,
+    i32,
+    Option<(i32, i32)>,
+    Option<usize>,
+)> {
+    let skip = dec.symbol(&mut cdfs.skip[0]) != 0;
+    let above_ctx = INTRA_MODE_CTX[above_mode];
+    let left_ctx = INTRA_MODE_CTX[left_mode];
+    let mode = dec.symbol(&mut cdfs.kf_y_mode[above_ctx][left_ctx]);
+    let angle_delta_y = if (V_PRED..=D67_PRED).contains(&mode) {
+        read_angle_delta(dec, &mut cdfs.angle_delta[mode - V_PRED])
+    } else {
+        0
+    };
+    let uv_mode = if cfl {
+        dec.symbol(&mut cdfs.uv_mode_cfl[mode])
+    } else {
+        dec.symbol(&mut cdfs.uv_mode_no_cfl[mode])
+    };
+    let alpha = if cfl && uv_mode == UV_CFL_PRED {
+        Some(read_cfl_alphas(dec, cdfs))
+    } else {
+        None
+    };
+    if (9..=12).contains(&uv_mode) {
+        return Err(unsupported("a smooth or paeth chroma mode (round 2)"));
+    }
+    let angle_delta_uv = if (V_PRED..=D67_PRED).contains(&uv_mode) {
+        DIRECTIONAL_UV_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        read_angle_delta(dec, &mut cdfs.angle_delta[uv_mode - V_PRED])
+    } else {
+        0
+    };
+    let mut filter_intra = None;
+    if mode == DC_PRED
+        && enable_filter_intra
+        && let Some(class) = filter_intra_size_class_rect(bw, bh)
+    {
+        let use_filter_intra = dec.symbol(&mut cdfs.filter_intra[class]) != 0;
+        if use_filter_intra {
+            FILTER_INTRA_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let fi_mode = dec.symbol(&mut cdfs.filter_intra_mode);
+            filter_intra = Some(fi_mode);
+        }
+    }
+    Ok((
+        skip,
+        mode,
+        angle_delta_y,
+        uv_mode,
+        angle_delta_uv,
+        alpha,
+        filter_intra,
+    ))
+}
+
+/// [`tx_size_context`] for a true `bw`x`bh` rect strip (lane-intradisp r1):
+/// `get_tx_size_context` (libaom `pred_common.h`) compares the neighbour
+/// above against this block's own *width* and the neighbour to the left
+/// against its own *height* -- for a square block those are the same value,
+/// which is why the square-only version can get away with one `own_side`.
+fn tx_size_context_rect(
+    n: &Neighbours,
+    (mi_r, mi_c): (usize, usize),
+    own_w: usize,
+    own_h: usize,
+) -> usize {
+    let above = mi_r > 0 && tx_px_at(n, false, mi_r - 1, mi_c) as usize >= own_w;
+    let left = mi_c > 0 && tx_h_px_at(n, false, mi_r, mi_c - 1) as usize >= own_h;
+    usize::from(above) + usize::from(left)
+}
+
+/// [`cfl_ac_q3`] for a true `bw`x`bh` rect strip (lane-intradisp r1).
+fn cfl_ac_q3_rect(y: &PlaneBuf, px: usize, py: usize, bw: usize, bh: usize) -> Vec<i32> {
+    let (cw, ch) = (bw / 2, bh / 2);
+    let mut ac = vec![0i32; cw * ch];
+    let mut sum = 0i32;
+    for cy in 0..ch {
+        for cx in 0..cw {
+            let (lx, ly) = (px + cx * 2, py + cy * 2);
+            let q3 = (i32::from(y.data[ly * y.width + lx])
+                + i32::from(y.data[ly * y.width + lx + 1])
+                + i32::from(y.data[(ly + 1) * y.width + lx])
+                + i32::from(y.data[(ly + 1) * y.width + lx + 1]))
+                << 1;
+            ac[cy * cw + cx] = q3;
+            sum += q3;
+        }
+    }
+    let num_pel = (cw * ch) as i32;
+    let avg = (sum + num_pel / 2) >> num_pel.trailing_zeros();
+    ac.iter_mut().for_each(|v| *v -= avg);
+    ac
+}
+
+/// Decodes one true `bw`x`bh` `PARTITION_HORZ`/`PARTITION_VERT` intra strip
+/// (lane-intradisp r1, spec `decode_block` restricted to a 32x32 quadrant's
+/// two rect children). Only the `skip` case is supported: `skip`/`y_mode`/
+/// `uv_mode`/`filter_intra`/`tx_depth` are read exactly per spec either way
+/// (so a skip strip elsewhere in the tile stays in sync), but this decoder
+/// has no rectangular-transform coefficient reader, and a chroma plane here
+/// is genuinely `TX_16X8`/`TX_8X16` (`av1_get_max_uv_txsize`, spec 5.11.16)
+/// with no depth-based square-tiling escape the way luma's own resolved
+/// `tx_depth` has (`sub_tx_size_map[TX_32X16]` == `TX_16X16`, square) --
+/// so a coded (non-skip) strip is refused by name instead of guess-decoded.
+#[allow(clippy::too_many_arguments)]
+fn decode_block_rect(
+    dec: &mut SymbolDecoder,
+    cdfs: &mut Cdfs,
+    neighbours: &mut Neighbours,
+    at: (usize, usize),
+    bw: usize,
+    bh: usize,
+    y: &mut PlaneBuf,
+    u: &mut PlaneBuf,
+    v: &mut PlaneBuf,
+    enable_filter_intra: bool,
+) -> Result<()> {
+    let (r, c) = at;
+    let (px, py) = (c * SUB, r * SUB);
+    let (skip, mode, angle_delta_y, uv_mode, angle_delta_uv, alpha, filter_intra) =
+        read_intra_mode_rect(
+            dec,
+            cdfs,
+            neighbours.above_mode[c],
+            neighbours.left_mode[r],
+            true,
+            bw,
+            bh,
+            enable_filter_intra,
+        )?;
+    if filter_intra.is_some() {
+        // `predict_filter_intra` (spec 7.11.2.3) is square-only in this
+        // decoder (`assert_eq!(dst.len(), side*side)`) -- a real symbol was
+        // already read above so the stream stays in sync, this only refuses
+        // the *pixel* decode of a rare case (`use_filter_intra` on a rect
+        // strip).
+        return Err(unsupported(
+            "filter intra on a HORZ/VERT strip (this decoder predicts square-only)",
+        ));
+    }
+    let uv_predict_mode = if uv_mode == UV_CFL_PRED {
+        DC_PRED
+    } else {
+        uv_mode
+    };
+    let (mi_r, mi_c) = (r * (SUB / MI), c * (SUB / MI));
+    let ctx = tx_size_context_rect(neighbours, (mi_r, mi_c), bw, bh);
+    let depth = dec.symbol(&mut cdfs.tx_size_cat2[ctx]);
+    if depth != 0 {
+        TX_DEPTH_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    let (tx_w, tx_h) = match depth {
+        0 => (bw, bh),
+        1 => (16, 16),
+        _ => (8, 8),
+    };
+    if !skip {
+        return Err(unsupported(
+            "a non-skip HORZ/VERT intra strip needs a rectangular transform \
+             this decoder does not code yet",
+        ));
+    }
+    let (cpx, cpy) = (px / 2, py / 2);
+    let (chroma_w, chroma_h) = (bw / 2, bh / 2);
+    let reach = Reach::of_rect(bw, bh, px, py, y.width, y.height);
+    y.reconstruct_rect(
+        px,
+        py,
+        bw,
+        bh,
+        mode,
+        angle_delta_y,
+        reach,
+        &vec![0i32; bw * bh],
+        None,
+        filter_intra,
+    );
+    let ac = alpha.map(|_| cfl_ac_q3_rect(y, px, py, bw, bh));
+    u.reconstruct_rect(
+        cpx,
+        cpy,
+        chroma_w,
+        chroma_h,
+        uv_predict_mode,
+        angle_delta_uv,
+        reach,
+        &vec![0i32; chroma_w * chroma_h],
+        alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
+        None,
+    );
+    v.reconstruct_rect(
+        cpx,
+        cpy,
+        chroma_w,
+        chroma_h,
+        uv_predict_mode,
+        angle_delta_uv,
+        reach,
+        &vec![0i32; chroma_w * chroma_h],
+        alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
+        None,
+    );
+    neighbours.record_rect(
+        at,
+        bw,
+        bh,
+        mode,
+        &[
+            vec![0i32; bw * bh],
+            vec![0i32; chroma_w * chroma_h],
+            vec![0i32; chroma_w * chroma_h],
+        ],
+    );
+    neighbours.fill_skip_grid_rect((mi_r, mi_c), bw / MI, bh / MI, true);
+    neighbours.fill_lf_grid_rect((mi_r, mi_c), bw / MI, bh / MI, tx_w as u8, tx_h as u8, 0);
+    RECT_PARTITION_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
 /// `read_angle_delta`/`Angle_Delta` (spec 5.11.42 + 9.3): the symbol minus
 /// [`ANGLE_DELTA_ZERO`] gives the signed `-MAX_ANGLE_DELTA..=MAX_ANGLE_DELTA`
 /// delta [`crate::intra::predict`] wants; bumps [`ANGLE_DELTA_HITS`] whenever
@@ -1784,6 +2037,98 @@ impl PlaneBuf {
         });
         let corner = (x > 0 && y > 0).then(|| self.data[(y - 1) * self.width + x - 1]);
         (above, left, corner)
+    }
+
+    /// [`Self::edges`] for a true `bw`x`bh` block (lane-intradisp r1):
+    /// the above/left reach each extend by their OWN axis (`bw` across,
+    /// `bh` down), not one shared `side`.
+    fn edges_rect(
+        &self,
+        x: usize,
+        y: usize,
+        bw: usize,
+        bh: usize,
+        reach: Reach,
+    ) -> (Option<Vec<u8>>, Option<Vec<u8>>, Option<u8>) {
+        let own_across = x + bw.min(self.true_width.saturating_sub(x));
+        let across = if reach.above_right {
+            own_across + bw.min(self.true_width.saturating_sub(own_across))
+        } else {
+            own_across
+        }
+        .min(self.width);
+        let own_down = y + bh.min(self.true_height.saturating_sub(y));
+        let down = if reach.below_left {
+            own_down + bh.min(self.true_height.saturating_sub(own_down))
+        } else {
+            own_down
+        }
+        .min(self.height);
+        let above = (y > 0 && across > x)
+            .then(|| self.data[(y - 1) * self.width + x..][..across - x].to_vec());
+        let left = (x > 0 && down > y).then(|| {
+            (y..down)
+                .map(|row| self.data[row * self.width + x - 1])
+                .collect::<Vec<_>>()
+        });
+        let corner = (x > 0 && y > 0).then(|| self.data[(y - 1) * self.width + x - 1]);
+        (above, left, corner)
+    }
+
+    /// [`Self::reconstruct`] for a true `bw`x`bh` block (lane-intradisp r1),
+    /// via [`Self::edges_rect`] and [`crate::intra::predict`]'s own
+    /// already-rect-capable `(bw, bh)` pair.
+    #[allow(clippy::too_many_arguments)]
+    fn reconstruct_rect(
+        &mut self,
+        x: usize,
+        y: usize,
+        bw: usize,
+        bh: usize,
+        mode: usize,
+        angle_delta: i32,
+        reach: Reach,
+        residual: &[i32],
+        cfl: Option<(i32, &[i32])>,
+        filter_intra: Option<usize>,
+    ) {
+        let (above, left, corner) = self.edges_rect(x, y, bw, bh, reach);
+        let mut prediction = vec![0u8; bw * bh];
+        if let Some(fi_mode) = filter_intra {
+            crate::intra::predict_filter_intra(
+                fi_mode,
+                above.as_deref(),
+                left.as_deref(),
+                corner,
+                bw,
+                &mut prediction,
+            );
+        } else {
+            let enable_edge_filter = ENABLE_EDGE_FILTER.with(std::cell::Cell::get);
+            predict(
+                mode as u8,
+                angle_delta,
+                above.as_deref(),
+                left.as_deref(),
+                corner,
+                bw,
+                bh,
+                enable_edge_filter,
+                false,
+                &mut prediction,
+            );
+        }
+        for row in 0..bh {
+            for col in 0..bw {
+                let idx = row * bw + col;
+                let mut base = i32::from(prediction[idx]);
+                if let Some((alpha_q3, ac_q3)) = cfl {
+                    base = (base + cfl_scaled(alpha_q3, ac_q3[idx])).clamp(0, 255);
+                }
+                let sample = (base + residual[idx]).clamp(0, 255) as u8;
+                self.data[(y + row) * self.width + x + col] = sample;
+            }
+        }
     }
 
     /// Predicts under `mode` then adds `residual` (side*side, raster),
@@ -3869,6 +4214,61 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                         neighbours.left_mode[sr] = mode;
                                     }
                                 }
+                            }
+                            PARTITION_HORZ => {
+                                // lane-intradisp r1: two true 32x16 strips.
+                                decode_block_rect(
+                                    &mut dec,
+                                    &mut cdfs,
+                                    &mut neighbours,
+                                    at32,
+                                    32,
+                                    16,
+                                    &mut y,
+                                    &mut u,
+                                    &mut v,
+                                    enable_filter_intra,
+                                )?;
+                                decode_block_rect(
+                                    &mut dec,
+                                    &mut cdfs,
+                                    &mut neighbours,
+                                    (at32.0 + 1, at32.1),
+                                    32,
+                                    16,
+                                    &mut y,
+                                    &mut u,
+                                    &mut v,
+                                    enable_filter_intra,
+                                )?;
+                            }
+                            PARTITION_VERT => {
+                                // lane-intradisp r1: mirror of PARTITION_HORZ
+                                // above with width/height swapped.
+                                decode_block_rect(
+                                    &mut dec,
+                                    &mut cdfs,
+                                    &mut neighbours,
+                                    at32,
+                                    16,
+                                    32,
+                                    &mut y,
+                                    &mut u,
+                                    &mut v,
+                                    enable_filter_intra,
+                                )?;
+                                decode_block_rect(
+                                    &mut dec,
+                                    &mut cdfs,
+                                    &mut neighbours,
+                                    (at32.0, at32.1 + 1),
+                                    16,
+                                    32,
+                                    &mut y,
+                                    &mut u,
+                                    &mut v,
+                                    enable_filter_intra,
+                                )?;
                             }
                             _ => {
                                 return Err(unsupported(format!(

@@ -316,11 +316,17 @@ pub const CFL_SIGN: [u16; 9] = [1418, 2123, 13340, 18405, 26972, 28343, 32294, 3
 /// prior, indexed by block-size class: `[0]`=4x4, `[1]`=8x8, `[2]`=16x16,
 /// `[3]`=32x32 -- the only square sizes `av1_filter_intra_allowed_bsize`
 /// (width and height both <=32) ever offers this decoder's square blocks.
-pub const FILTER_INTRA: [[u16; 3]; 4] = [
+/// `[4]`/`[5]` (lane-intradisp r1) add `BLOCK_32X16`/`BLOCK_16X32`'s own rows
+/// (12756/14301, `default_filter_intra_cdfs` index 8/7) -- the two rect
+/// strips `PARTITION_HORZ`/`PARTITION_VERT` decode, each with its own
+/// distinct default probability from every square class above.
+pub const FILTER_INTRA: [[u16; 3]; 6] = [
     [4621, 32768, 0],
     [7866, 32768, 0],
     [12408, 32768, 0],
     [22343, 32768, 0],
+    [12756, 32768, 0],
+    [14301, 32768, 0],
 ];
 /// `default_filter_intra_mode_cdf` (entropymode.c): which of the five
 /// `FILTER_INTRA_MODES` a `use_filter_intra` block picks.
