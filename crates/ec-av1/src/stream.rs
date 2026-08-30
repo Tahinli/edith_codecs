@@ -187,21 +187,15 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         }
         // Loop restoration carries per-restoration-unit symbols in the tile
         // (spec 5.11.57 `read_lr`, one group per LR unit reached from the
-        // superblock walk) that this decoder never reads -- same
-        // silent-desync shape as the refusals above. Traced live 2026-08-27:
-        // an aomenc inter frame with `Sgrproj` on the V plane desynced the
-        // partition walk into out-of-alphabet garbage.
-        // lane-lr r2: the per-superblock `read_lr`/`read_lr_unit` symbols are
-        // now read (`crate::restoration`) and no longer desync the partition
-        // walk -- the refusal narrows to its true remaining gap: decoded
-        // Wiener/SGR filters are stored per unit but never applied to
-        // pixels.
-        if header.loop_restoration.uses_lr {
-            return Err(Error::unsupported(
-                "AV1 decode_stream",
-                "a frame with loop restoration enabled (the per-unit lr symbols are read but the Wiener/self-guided filters are not yet applied to pixels)",
-            ));
-        }
+        // superblock walk) -- lane-lr r2 ported the reader
+        // (`crate::restoration`), r3 moved this refusal check to AFTER the
+        // tile decode call below (was here, before it, in r2 -- meaning
+        // `read_lr` was NEVER actually reached through `decode_stream`, the
+        // gap the r3 gate caught live: 40/40 attempts hit this refusal with
+        // zero `read_lr_unit` hits). Checking post-decode instead proves the
+        // superblock walk actually survived `read_lr` (no desync) before
+        // refusing on the true remaining gap: decoded Wiener/SGR filters are
+        // stored per unit but never applied to pixels.
         // `decode_inter_block`/`decode_inter_block8`'s `GLOBALMV` arm (spec
         // 5.11.26's `read_inter_intra`... really `assign_mv`'s `GLOBALMV`
         // case, spec 7.10.2.1) uses `gm_get_motion_vector`, which is the
@@ -467,6 +461,15 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 header.allow_screen_content_tools,
             )?
         };
+        // lane-lr r3: the tile decode above just ran `read_lr` for real (see
+        // this refusal's own doc comment further up) -- refuse now, after a
+        // successful structural decode, rather than before it.
+        if header.loop_restoration.uses_lr {
+            return Err(Error::unsupported(
+                "AV1 decode_stream",
+                "a frame with loop restoration enabled (the per-unit lr symbols are read but the Wiener/self-guided filters are not yet applied to pixels)",
+            ));
+        }
         // Spec 7.20: `disable_frame_end_update_cdf` stores the frame's
         // *initial* table into the slots it refreshes, not the adapted
         // end-of-tile one.
@@ -4668,6 +4671,164 @@ mod tests {
              out of {n_attempts}, masked_compound_hits={} wedge_hits={}",
             crate::decode::masked_compound_hits(),
             crate::decode::wedge_hits()
+        );
+    }
+
+    /// lane-lr r3: proves stage 1/2's exit criterion -- a real
+    /// `--enable-restoration=1` aomenc stream must survive the whole
+    /// partition walk (every symbol read entropy-exact) and land on the
+    /// NEW, narrowed refusal ("read but not applied"), never desync into
+    /// some other named refusal or an outright decode panic. Multi-superblock
+    /// fixture (192x128 = 3x2 SBs of 64px) per the charter's own trap
+    /// warning -- a single-SB fixture can never re-enter `read_lr` a second
+    /// time and would leave `SWITCHABLE_HITS`/etc. proving only one call
+    /// site, not the per-SB loop.
+    #[test]
+    fn a_real_aomenc_stream_with_restoration_reads_lr_symbols_correctly() {
+        const NAME: &str = "a_real_aomenc_stream_with_restoration_reads_lr_symbols_correctly";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height) = (192usize, 128usize);
+        let n_attempts: u32 = std::env::var("EC_LR_GATE_ATTEMPTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(40);
+        let mut lr_refusals = 0u32;
+        let mut other_refusals = Vec::new();
+        for attempt in 0..n_attempts {
+            let seed = 42 + attempt;
+            let source = gradients_source(seed, width, height, "duration=0.04:rate=25");
+            let y4m = Command::new("ffmpeg")
+                .args(["-v", "error", "-f", "lavfi", "-i"])
+                .arg(&source)
+                .args(["-pix_fmt", "yuv420p", "-f", "yuv4mpegpipe", "-"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let mut child = Command::new(aomenc_path())
+                .args([
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    // r3: a low cq-level (high quality/bitrate) is load-bearing --
+                    // sampled live (2026-08-30) that aomenc's RD only ever picks a
+                    // non-`RESTORE_NONE` frame_restoration_type at cq-level<=20 for
+                    // this fixture; cq-level=45 (this gate's sibling gates' usual
+                    // value) landed `uses_lr=false` on every attempt.
+                    "--cq-level=15",
+                    "--cpu-used=0",
+                    "--threads=1",
+                    "--row-mt=0",
+                    // r3: this decoder always assumes 64px superblocks
+                    // (`decode.rs` hardcodes `SB_MI=16`, ledger `lane-sb128`
+                    // dead-ends) -- force aomenc to match rather than risk
+                    // the unrelated sb128 gap eating this gate's own window.
+                    "--sb-size=64",
+                    "--enable-restoration=1",
+                    "--enable-cdef=0",
+                    "--enable-rect-partitions=0",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    "--enable-filter-intra=0",
+                    "--enable-smooth-intra=0",
+                    "--enable-paeth-intra=0",
+                    "--enable-tx-size-search=0",
+                    "--max-partition-size=32",
+                    "--min-partition-size=16",
+                    "--enable-palette=0",
+                    "--enable-intrabc=0",
+                    "--enable-cfl-intra=0",
+                    "--enable-ref-frame-mvs=0",
+                    "--enable-warped-motion=0",
+                    "--enable-global-motion=0",
+                    "--enable-masked-comp=0",
+                    "--enable-interintra-comp=0",
+                    "--enable-obmc=0",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            match decode_stream(&stream) {
+                Ok(_) => {
+                    // aomenc's own RD chose `RESTORE_NONE` on every plane this
+                    // attempt -- a legitimately LR-free frame, not a gate
+                    // failure (see the cq-level comment above: not every
+                    // attempt lands `uses_lr=true`).
+                    continue;
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME} failed outright, not a named refusal (seed {seed}): {msg}"
+                    );
+                    if msg.contains("loop restoration enabled") {
+                        lr_refusals += 1;
+                    } else {
+                        other_refusals.push(format!("seed {seed}: {msg}"));
+                    }
+                }
+            }
+        }
+        assert!(
+            lr_refusals > 0,
+            "{NAME}: the LR refusal never fired ({} attempts, other refusals:\n{})",
+            n_attempts,
+            other_refusals.join("\n")
+        );
+        // Any real (non-`RESTORE_NONE`) filter kind is acceptable proof --
+        // aomenc's RD picks the frame-level `restoration_type` itself (not
+        // always `Switchable`; observed `Sgrproj` live at cq-level=15 for
+        // this fixture), so hard-requiring one specific arm would be the
+        // gate-recipe-confound class (ledger).
+        let total_hits = crate::restoration::wiener_hits()
+            + crate::restoration::sgrproj_hits()
+            + crate::restoration::switchable_hits();
+        assert!(
+            total_hits > 0,
+            "{NAME}: {lr_refusals} LR refusals fired but read_lr_unit never decoded a real \
+             (non-None) filter -- gate proved nothing about the symbol path"
+        );
+        eprintln!(
+            "{NAME}: {lr_refusals} LR refusals, {} other refusals out of {n_attempts}, \
+             wiener_hits={} sgrproj_hits={} switchable_hits={}",
+            other_refusals.len(),
+            crate::restoration::wiener_hits(),
+            crate::restoration::sgrproj_hits(),
+            crate::restoration::switchable_hits()
         );
     }
 
