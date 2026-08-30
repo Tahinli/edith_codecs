@@ -4292,6 +4292,15 @@ fn deblock_plane(plane: &mut PlaneBuf, plane_idx: usize, lf: &LoopFilterParams, 
         let mut y0 = 4usize;
         while y0 < th {
             if let Some((len, level)) = edge_params(lf, n, plane_idx, 1, chroma, x0, y0) {
+                if std::env::var_os("EC_AV1_DEBLOCK_TRACE").is_some()
+                    && plane_idx == 0
+                    && x0 == 44
+                {
+                    eprintln!(
+                        "HEDGE x0={x0} y0={y0} len={len} level={level} sharpness={}",
+                        lf.sharpness
+                    );
+                }
                 filter_edge(
                     &mut plane.data,
                     y0 * stride + x0,
