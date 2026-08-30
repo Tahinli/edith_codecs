@@ -120,24 +120,21 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         let ObuKind::Frame(header, tiles) = obu.kind else {
             continue;
         };
-        let tile = tiles.first().ok_or_else(|| {
-            Error::unsupported("AV1 decode_stream", "a frame OBU with no tile group")
-        })?;
-        // `read_cdef` (spec `decodeframe.c`, called at the first non-skip
-        // block of each 64x64) only reads a literal `cdef_idx` when
-        // `cdef_bits > 0`; at `cdef_bits == 0` there is nothing to read (this
-        // crate's own writer's only case, and both `lane-av1cdef` gate
-        // streams'), so the per-block symbol this crate's tile readers never
-        // consume is a true no-op there. A `cdef_bits > 0` stream would
-        // desync the moment it hit a real strength selector this decoder
-        // never reads — refuse that by name rather than silently miscode,
-        // the same pattern as the other round-2 refusals below.
-        if header.cdef.bits != 0 {
+        // Every tile is decoded below through `tile_bufs`; this only rejects a
+        // frame OBU that carries no tile group at all.
+        if tiles.is_empty() {
             return Err(Error::unsupported(
                 "AV1 decode_stream",
-                "a frame with cdef_bits > 0 (this decoder never reads the per-64x64 cdef_idx symbol)",
+                "a frame OBU with no tile group",
             ));
         }
+        // `read_cdef` (spec `decodeframe.c`, called at the first non-skip
+        // block of each 64x64) only reads a literal `cdef_idx` when
+        // `cdef_bits > 0`; at `cdef_bits == 0` there is nothing to read (a
+        // true no-op). lane-realworld r1: the per-64x64 `cdef_idx` literal is
+        // now read (`maybe_read_cdef_idx` in decode.rs) and threaded into
+        // [`crate::decode::apply_cdef`]'s per-superblock strength lookup, so
+        // a `cdef_bits > 0` stream no longer needs this refusal.
         // An intra frame's `decode_key_frame_tile*` now reads `tx_depth`
         // under `TxMode::Select` (lane-av1txsel, spec 5.11.16): the key-frame
         // decode path threads `tx_select` through `decode_block`/
@@ -173,10 +170,28 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         // intrabc call at all -- that symbol is intra-frame-only). A
         // genuine palette/intrabc use still refuses by name deeper in the
         // block readers, so no whole-frame refusal is needed here anymore.
-        if header.delta.q_present || header.delta.lf_present {
+        // lane-realworld r5: both delta_q (maybe_read_delta_q, CURRENT_Q_IDX)
+        // and delta_lf (maybe_read_delta_lf, CURRENT_DELTA_LF ->
+        // Neighbours::delta_lf_grid -> lf_level) are now read and applied;
+        // no whole-frame refusal needed here anymore.
+        //
+        // Both AV1 files in this box's own library (a 2160p HDR10 encode and a
+        // 1080p one, probed 2026-08-30 through `examples/decode_probe`) are
+        // `yuv420p10le`, and every buffer this decoder reconstructs into --
+        // `Picture`'s `y`/`u`/`v` -- is `Vec<u8>`. A 10- or 12-bit stream would
+        // therefore be reconstructed into 8-bit samples and compared against a
+        // 10-bit reference, which is silent wrongness rather than a desync: no
+        // symbol goes unread, the pixels are just quietly truncated. Refuse it
+        // by name until the planes are widened. `bit_depth` defaults to 8 when
+        // no sequence header has been seen, which is the existing behaviour for
+        // every fixture in this crate.
+        if parser
+            .sequence_header()
+            .is_some_and(|seq| seq.color_config.bit_depth != 8)
+        {
             return Err(Error::unsupported(
                 "AV1 decode_stream",
-                "a frame with delta_q_present or delta_lf_present set (this decoder never reads the per-superblock delta symbols)",
+                "a stream whose bit depth is not 8 (this decoder reconstructs into 8-bit planes)",
             ));
         }
         if header.segmentation.enabled {
@@ -305,21 +320,44 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         // of `skip_mode_frame`, plain average blend), so the old blanket
         // `skip_mode_present` refusal is gone.
         // `context_update_tile_id` (spec `decode_tile`/`exit_symbol`) names
-        // which tile's end-of-tile adapted CDFs become the frame's own; this
-        // decoder only ever decodes tile 0 (`tiles.first()` above), so a
-        // multi-tile frame is refused rather than silently forwarding the
-        // wrong tile's table (or leaving the rest of the picture undecoded).
-        if header.tile_info.cols > 1 || header.tile_info.rows > 1 {
-            return Err(Error::unsupported(
-                "AV1 decode_stream",
-                "a frame with more than one tile (this decoder only ever decodes tile 0)",
-            ));
-        }
+        // which tile's end-of-tile adapted CDFs become the frame's own.
+        // lane-tiles r8: this comment used to claim a `!= 0` refusal existed
+        // "further down" -- it did not (`decode.rs` reads
+        // `tile_info.context_update_tile_id` generically at both the
+        // key-frame and inter-frame tile loops' `result_cdfs = cdfs` sites,
+        // never hardcoded to tile 0); stale documentation, not a real gap.
+        // `a_real_aomenc_stream_with_four_tile_rows_decodes_pixel_exact`
+        // hard-asserts a live aomenc stream naming tile 1/2/3 decodes
+        // pixel-exact, so the capability is now proven as well as described
+        // correctly.
+        //
+        // lane-tiles r4/r6/r7/r8: the multi-tile refusal itself is scoped,
+        // not blanket. `decode_key_frame_tile_with_cdfs` and (r6)
+        // `decode_inter_frame_tile_with_cdfs` both genuinely loop every
+        // tile, `mvstack.rs`'s `MiGrid` is bounded per tile
+        // (`MiGrid::set_tile_bounds`), and `PlaneBuf`'s `tile_x0/y0/x1/y1`
+        // origin receives real values at every call site (r6's
+        // `set_tile_origin` sweep). r7 proved the two remaining
+        // tile-*column* gaps closed (inter frames, >2 columns with loop
+        // filtering on). r8 proved tile *rows* the same way: the per-tile
+        // loop's row math (`tile_num / tile_info.cols`,
+        // `mi_row_starts`/`set_tile_origin`'s `y0`/`y1`) is exactly
+        // symmetric with the column path already proven, and
+        // `a_real_aomenc_stream_with_two_tile_rows_decodes_pixel_exact`
+        // (bypass gate, loop filter ON) confirmed it: 20/20 pixel-exact.
+        // `a_real_aomenc_stream_with_two_tile_rows_decodes_through_decode_
+        // stream` below re-proves it through this entry point. Tile columns
+        // and tile rows (any count, loop filter on) are no longer capped.
         // `Tile::offset` is relative to the buffer `parse_obu` was handed
         // (`&data[pos..]` at the time this OBU was parsed), so it is relative
         // to `obu_offset`, not to `data` as a whole.
-        let start = obu_offset + tile.offset;
-        let tile_bytes = data.get(start..start + tile.size).ok_or(Error::NeedMore)?;
+        let tile_bufs: Vec<&[u8]> = tiles
+            .iter()
+            .map(|t| {
+                data.get(obu_offset + t.offset..obu_offset + t.offset + t.size)
+                    .ok_or(Error::NeedMore)
+            })
+            .collect::<Result<_>>()?;
         let enable_filter_intra = parser
             .sequence_header()
             .is_some_and(|seq| seq.enable_filter_intra);
@@ -380,7 +418,8 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
 
         let (picture, end_cdfs, motion_field) = if header.frame_type == FrameType::Key {
             let (picture, end_cdfs) = decode_key_frame_tile_with_cdfs(
-                tile_bytes,
+                &tile_bufs,
+                &header.tile_info,
                 header.mi_cols,
                 header.mi_rows,
                 header.quantization.base_q_idx,
@@ -395,6 +434,7 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 header.reduced_tx_set,
                 header.allow_screen_content_tools,
                 header.allow_intrabc,
+                header.delta,
             )?;
             // lane-superres stage 3, spec 7.16: upscale AFTER deblock+CDEF
             // (both already applied inside `decode_key_frame_tile_with_cdfs`)
@@ -465,7 +505,8 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 )
             });
             decode_inter_frame_tile_with_cdfs(
-                tile_bytes,
+                &tile_bufs,
+                &header.tile_info,
                 header.mi_cols,
                 header.mi_rows,
                 header.quantization.base_q_idx,
@@ -496,6 +537,7 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 header.is_motion_mode_switchable,
                 header.allow_warped_motion,
                 header.allow_screen_content_tools,
+                header.delta,
             )?
         };
         // Spec 7.20: `disable_frame_end_update_cdf` stores the frame's
@@ -1471,6 +1513,149 @@ mod tests {
         assert_eq!(frames[0].v, ffmpeg_frames[0].v, "V vs ffmpeg");
     }
 
+    /// A real `aomenc` palette-Y fixture (lane-palette r3): `smptebars`
+    /// (SMPTE colour bars -- a handful of large flat luma regions, exactly
+    /// the "flat, few-colour, repetitive" content `av1_choose_palette_map`'s
+    /// RD trial rewards) with `hue=s=0` to flatten chroma to one constant
+    /// value, so `DC_PRED` already nails every chroma block with zero
+    /// residual and the encoder's own RD never has a reason to spend bits on
+    /// a *UV* palette too (a real symbol this decoder still refuses --
+    /// lane-palette r3's own scope is Y only). `smptebars` has no seed to
+    /// vary, so the fixture is deterministic by construction; hashed twice
+    /// below to prove it rather than assert it. `--enable-rect-partitions=0`
+    /// / `-ab-` / `-1to4-` keep every intra block square, sidestepping the
+    /// rect-strip screen-content refusal at `read_intra_mode_rect`
+    /// (decode.rs ~2226) -- that refusal is this lane's own next milestone,
+    /// not this gate's. `--sb-size=64` and `--threads=1 --row-mt=0` are the
+    /// sibling-lane facts this charter paid for: a single 64x64 frame is one
+    /// superblock either way, but pinning them keeps the recipe identical to
+    /// every other gate in this file. HARD-asserts
+    /// [`decode::palette_hits`] moved -- a stream that never reads a real
+    /// palette block would refuse (or not) by construction without proving
+    /// this milestone at all.
+    ///
+    /// lane-palette r4/r6/r7: r3/r4 found that this fixture's reconstructed
+    /// pixels did not match ffmpeg's decode of the same bytes even though
+    /// every symbol read by `decode_color_index_map` checked line-for-line
+    /// against the oracle and matched. r6's range trace (`compare-range-not-tell`)
+    /// pinned the real cause: `decode_color_index_map` was called from the
+    /// wrong syntax position -- inline right after the Y colours, instead of
+    /// after the whole mode-info read (UV palette mode_info + `filter_intra`,
+    /// `av1_visit_palette`'s real call order). r7 ported the UV palette
+    /// mode_info read and moved the colour-index-map decode after
+    /// `filter_intra`; this gate now asserts a real pixel match instead of
+    /// the old named refusal.
+    #[test]
+    fn a_real_aomenc_stream_with_palette_y_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_stream_with_palette_y_decodes_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let source = "smptebars=size=64x64:rate=25";
+        fn render(source: &str) -> Vec<u8> {
+            Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    source,
+                    "-vf",
+                    "hue=s=0",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-t",
+                    "0.04",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run")
+                .stdout
+        }
+        let y4m_a = render(source);
+        let y4m_b = render(source);
+        assert_eq!(
+            y4m_a, y4m_b,
+            "smptebars must render byte-identical across two runs"
+        );
+        let y4m = y4m_a;
+        let mut child = Command::new(aomenc_path())
+            .args([
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                "--cq-level=30",
+                "--cpu-used=0",
+                "--threads=1",
+                "--row-mt=0",
+                "--sb-size=64",
+                "--tune-content=screen",
+                "--enable-palette=1",
+                "--enable-intrabc=0",
+                "--enable-rect-partitions=0",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0",
+                "--min-partition-size=32",
+                "--max-partition-size=32",
+                "--enable-filter-intra=0",
+                "--enable-smooth-intra=0",
+                "--enable-paeth-intra=0",
+                "--enable-directional-intra=0",
+                "--enable-angle-delta=0",
+                "--enable-cfl-intra=0",
+                "--enable-cdef=0",
+                "--enable-restoration=0",
+                "--enable-tx-size-search=0",
+                "--loopfilter-control=0",
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("aomenc failed to start");
+        child
+            .stdin
+            .take()
+            .expect("aomenc stdin")
+            .write_all(&y4m)
+            .expect("writing y4m to aomenc");
+        let out = child.wait_with_output().expect("aomenc failed to run");
+        assert!(
+            out.status.success(),
+            "aomenc refused the fixture: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stream = out.stdout;
+        let before = decode::palette_hits();
+        let frames = match decode_stream(&stream) {
+            Ok(frames) => frames,
+            Err(e) => panic!("{NAME}: decode_stream refused: {e}"),
+        };
+        assert!(
+            decode::palette_hits() > before,
+            "palette_y_mode never fired decoding this stream -- gate is vacuous"
+        );
+        let ffmpeg_frames = ffmpeg_decode_sequence(&stream, 64, 64, 1);
+        assert_eq!(frames[0].y, ffmpeg_frames[0].y, "luma vs ffmpeg");
+        assert_eq!(frames[0].u, ffmpeg_frames[0].u, "U vs ffmpeg");
+        assert_eq!(frames[0].v, ffmpeg_frames[0].v, "V vs ffmpeg");
+    }
+
     /// As [`a_real_aomenc_filter_intra_stream_decodes_pixel_exact`]'s
     /// harness, but with the deblocking filter left *on* (no
     /// `--loopfilter-control=0`) at a crf high enough that libaom actually
@@ -1740,6 +1925,272 @@ mod tests {
         eprintln!(
             "SKIP a_real_aomenc_intra_stream_with_tx_select_decodes_pixel_exact: every attempt \
              hit a named refusal or never split a transform:\n{}",
+            refusals.join("\n")
+        );
+    }
+
+    /// lane-chroma r2 stage 1: a real aomenc key frame with
+    /// `--enable-smooth-intra=1` (opposite of every sibling recipe's `=0`)
+    /// and `--enable-paeth-intra=0` -- paeth chroma stays off so the still-
+    /// refused smooth/paeth `uv_mode` (round-2, unrelated to this gate) never
+    /// fires; smooth *luma* neighbours are exactly what this gate wants to
+    /// exercise, proving [`decode::smooth_luma_hits`] actually landed a
+    /// directional block next to a smooth-predicted one and decoded
+    /// pixel-exact (the [`PlaneBuf::reconstruct`] `smooth_neighbor` fix).
+    #[test]
+    fn a_real_aomenc_stream_with_smooth_luma_neighbour_decodes_pixel_exact() {
+        if !have_ffmpeg() {
+            eprintln!(
+                "SKIP a_real_aomenc_stream_with_smooth_luma_neighbour_decodes_pixel_exact: no ffmpeg"
+            );
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!(
+                "SKIP a_real_aomenc_stream_with_smooth_luma_neighbour_decodes_pixel_exact: no aomenc at {}",
+                aomenc_path().display()
+            );
+            return;
+        }
+        let (width, height) = (64usize, 64usize);
+        let mut refusals = Vec::new();
+        let mut fired_runs = 0u32;
+        for attempt in 0..40u32 {
+            let seed = 42 + attempt;
+            let source = format!(
+                "mandelbrot=size=64x64:start_scale={}:rate=25",
+                5.0 - f64::from(attempt) * 0.06
+            );
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-t",
+                    "0.04",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let mut child = Command::new(aomenc_path())
+                .args([
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    "--cq-level=45",
+                    "--cpu-used=0",
+                    "--enable-rect-partitions=0",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    "--enable-filter-intra=0",
+                    "--enable-smooth-intra=1",
+                    // Smooth/paeth chroma is a still-refused, separate
+                    // round-2 gap -- off so no attempt trips it while this
+                    // gate is purely about luma's edge-filter fix.
+                    "--enable-paeth-intra=0",
+                    "--enable-tx-size-search=0",
+                    "--enable-cdef=0",
+                    "--enable-restoration=0",
+                    "--enable-intra-edge-filter=1",
+                    "--max-partition-size=32",
+                    "--min-partition-size=16",
+                    "--enable-palette=0",
+                    "--enable-intrabc=0",
+                    "--enable-cfl-intra=0",
+                    "--enable-ref-frame-mvs=0",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let smooth_before = decode::smooth_luma_hits();
+            let frames = match decode_stream(&stream) {
+                Ok(frames) => frames,
+                Err(e) => {
+                    refusals.push(format!("seed {seed}: {e}"));
+                    continue;
+                }
+            };
+            if decode::smooth_luma_hits() == smooth_before {
+                refusals.push(format!(
+                    "seed {seed}: decoded, but no smooth-luma-neighbour block fired"
+                ));
+                continue;
+            }
+            fired_runs += 1;
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
+            assert_eq!(
+                frames[0].y, ffmpeg_frames[0].y,
+                "luma vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(frames[0].u, ffmpeg_frames[0].u, "U vs ffmpeg (seed {seed})");
+            assert_eq!(frames[0].v, ffmpeg_frames[0].v, "V vs ffmpeg (seed {seed})");
+            if fired_runs >= 4 {
+                return;
+            }
+        }
+        assert!(
+            fired_runs > 0,
+            "every attempt hit a named refusal or never exercised a smooth luma neighbour:\n{}",
+            refusals.join("\n")
+        );
+    }
+
+    /// The smooth/paeth-chroma gate (lane-chroma r1/r3): a real aomenc key
+    /// frame with `--enable-smooth-intra=1 --enable-paeth-intra=1` (the
+    /// opposite of the directional-chroma gate below, which turns these OFF
+    /// to keep this gap from firing while directional chroma is under test).
+    /// Some seeds won't pick smooth/paeth for chroma at all -- retry like
+    /// every other real-encoder gate here, but the first attempt that
+    /// actually fires [`decode::smooth_uv_hits`] must decode pixel-exact.
+    #[test]
+    fn a_real_aomenc_stream_with_smooth_paeth_chroma_decodes_pixel_exact() {
+        if !have_ffmpeg() {
+            eprintln!(
+                "SKIP a_real_aomenc_stream_with_smooth_paeth_chroma_decodes_pixel_exact: no ffmpeg"
+            );
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!(
+                "SKIP a_real_aomenc_stream_with_smooth_paeth_chroma_decodes_pixel_exact: no aomenc at {}",
+                aomenc_path().display()
+            );
+            return;
+        }
+        let (width, height) = (64usize, 64usize);
+        let mut refusals = Vec::new();
+        let mut fired_runs = 0u32;
+        for attempt in 0..40u32 {
+            let seed = 42 + attempt;
+            let source = format!(
+                "mandelbrot=size=64x64:start_scale={}:rate=25",
+                5.0 - f64::from(attempt) * 0.06
+            );
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", "yuv420p", "-t",
+                    "0.04", "-f", "yuv4mpegpipe", "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let mut child = Command::new(aomenc_path())
+                .args([
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    "--cq-level=45",
+                    "--cpu-used=0",
+                    "--enable-rect-partitions=0",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    "--enable-filter-intra=0",
+                    "--enable-smooth-intra=1",
+                    "--enable-paeth-intra=1",
+                    "--enable-tx-size-search=0",
+                    "--enable-cdef=0",
+                    "--enable-restoration=0",
+                    "--enable-intra-edge-filter=1",
+                    "--max-partition-size=32",
+                    // 8x8/leaf8 splits are a separate, already-named refusal.
+                    "--min-partition-size=16",
+                    "--enable-palette=0",
+                    "--enable-intrabc=0",
+                    "--enable-cfl-intra=0",
+                    "--enable-ref-frame-mvs=0",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let smooth_before = decode::smooth_uv_hits();
+            let frames = match decode_stream(&stream) {
+                Ok(frames) => frames,
+                Err(e) => {
+                    refusals.push(format!("seed {seed}: {e}"));
+                    continue;
+                }
+            };
+            if decode::smooth_uv_hits() == smooth_before {
+                refusals.push(format!(
+                    "seed {seed}: decoded, but no smooth/paeth uv_mode fired"
+                ));
+                continue;
+            }
+            fired_runs += 1;
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
+            assert_eq!(
+                frames[0].y, ffmpeg_frames[0].y,
+                "luma vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(frames[0].u, ffmpeg_frames[0].u, "U vs ffmpeg (seed {seed})");
+            assert_eq!(frames[0].v, ffmpeg_frames[0].v, "V vs ffmpeg (seed {seed})");
+            if fired_runs >= 4 {
+                return;
+            }
+        }
+        assert!(
+            fired_runs > 0,
+            "every attempt hit a named refusal or never exercised smooth/paeth chroma:\n{}",
             refusals.join("\n")
         );
     }
@@ -4922,6 +5373,203 @@ mod tests {
         );
     }
 
+    /// lane-realworld r2: `read_cdef` (spec 5.11.56) ported -- per-superblock
+    /// `cdef_idx`, wired at all five `skip`-decode sites, `apply_cdef` looks
+    /// up strength through the grid instead of a hardcoded `[0]`. Structure
+    /// copied from `a_real_aomenc_stream_with_masked_compound_decodes_pixel_exact`
+    /// but `--enable-cdef=1` (the one thing that gate turns off) and every
+    /// *other* filter/mode feature this lane doesn't touch disabled, so a
+    /// mismatch here can only be attributed to CDEF. `cdef_idx_hits()` is a
+    /// hard assert -- a run that never reads a real cdef_idx symbol proves
+    /// nothing (class `gate-blind-to-feature`).
+    #[test]
+    fn a_real_aomenc_stream_with_cdef_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_stream_with_cdef_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        // cdef_bits selects among PER-SUPERBLOCK strengths -- a single-SB
+        // 64x64 frame (the other gates' size) gives aomenc nothing to
+        // differentiate, so it always writes bits=0 and cdef_idx is never
+        // read. 128x64 = 2 SBs is the minimum that lets aomenc's RD ever
+        // pick bits > 0. Multi-SB content at --cpu-used=0 (every other
+        // gate's setting) makes aomenc pick PARTITION_HORZ_4/VERT_B etc.
+        // at the top SB level regardless of the ab/1to4-partitions=0
+        // flags below (a real gap: this decoder's intra part64 match only
+        // covers NONE/SPLIT, and the inter path blindly assumes SPLIT --
+        // both pre-existing, out of this lane's scope); --cpu-used=4
+        // avoids that RD path entirely and needs --aq-mode=0
+        // --deltaq-mode=0 to keep delta_q/delta_lf (next lane step) off.
+        let (width, height, frame_count) = (128usize, 64usize, 24usize);
+        let mut named_refusals = 0u32;
+        let mut matched = 0u32;
+        let n_attempts: u32 = std::env::var("EC_CDEF_GATE_ATTEMPTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(40);
+        for attempt in 0..n_attempts {
+            let seed = 42 + attempt;
+            let duration = frame_count as f64 / 25.0;
+            // mandelbrot's ringing-prone hard edges are what CDEF's RD
+            // search targets; flat gradients (charter's first guess) may
+            // never make aomenc choose cdef_bits > 0.
+            let source = format!(
+                "mandelbrot=size={width}x{height}:rate=25:start_x={sx}:start_y={sy}",
+                sx = -0.6 + 0.005 * (attempt as f64),
+                sy = -0.4 + 0.005 * (attempt as f64)
+            );
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-t",
+                    &duration.to_string(),
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let args: Vec<&str> = vec![
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                "--cq-level=45",
+                "--cpu-used=4",
+                "--aq-mode=0",
+                "--deltaq-mode=0",
+                "--kf-max-dist=1000",
+                "--threads=1",
+                "--row-mt=0",
+                "--auto-alt-ref=1",
+                "--lag-in-frames=16",
+                "--enable-fwd-kf=0",
+                "--enable-order-hint=1",
+                // r2: a starved inter toolset (everything below off) pushes
+                // aomenc's RD toward exotic partition shapes (HORZ_4/VERT_B
+                // etc.) at the SB(64) level even with those partition
+                // flags off -- this decoder's part64 8/9/10-way arms and
+                // the inter path's blind SPLIT assumption don't cover that;
+                // keeping the same rich toolset the (working, ab/1to4-off)
+                // masked-compound gate uses avoids it.
+                "--enable-warped-motion=1",
+                "--enable-global-motion=0",
+                "--enable-obmc=1",
+                "--tune-content=default",
+                "--enable-masked-comp=1",
+                "--enable-dist-wtd-comp=0",
+                "--enable-interintra-comp=1",
+                "--enable-onesided-comp=0",
+                "--enable-interintra-wedge=0",
+                "--enable-smooth-interintra=1",
+                "--enable-rect-partitions=0",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0",
+                "--enable-filter-intra=0",
+                "--enable-smooth-intra=0",
+                "--enable-paeth-intra=0",
+                "--enable-directional-intra=0",
+                "--enable-angle-delta=0",
+                "--enable-tx-size-search=0",
+                "--enable-cdef=1",
+                "--enable-restoration=0",
+                "--max-partition-size=32",
+                "--min-partition-size=32",
+                "--enable-palette=0",
+                "--enable-intrabc=0",
+                "--enable-cfl-intra=0",
+                "--enable-ref-frame-mvs=0",
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ];
+            let mut child = Command::new(aomenc_path())
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let frames = match decode_stream(&stream) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME} failed outright, not a named refusal (seed {seed}): {msg}"
+                    );
+                    assert!(
+                        !msg.contains("cdef"),
+                        "{NAME} refused on cdef (seed {seed}) -- cdef_idx decode is ported: {msg}"
+                    );
+                    named_refusals += 1;
+                    eprintln!("seed {seed} refusal: {msg}");
+                    continue;
+                }
+                Ok(frames) => frames,
+            };
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
+            assert_eq!(frames.len(), frame_count);
+            let mismatched = frames
+                .iter()
+                .zip(&ffmpeg_frames)
+                .any(|(got, want)| got.y != want.y || got.u != want.u || got.v != want.v);
+            if mismatched && let Ok(path) = std::env::var("EC_AV1_GATE_DUMP") {
+                std::fs::write(&path, &stream).expect("writing pinned stream");
+                eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
+            }
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
+                assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
+            }
+            matched += 1;
+        }
+        assert!(
+            crate::decode::cdef_idx_hits() > 0,
+            "{NAME}: zero cdef_idx blocks fired ({matched} matches, {named_refusals} other \
+             refusals out of {n_attempts}) -- gate proved nothing this run"
+        );
+        eprintln!(
+            "{NAME}: {named_refusals} other-capability refusals, {matched} pixel-exact matches \
+             out of {n_attempts}, cdef_idx_hits={}",
+            crate::decode::cdef_idx_hits()
+        );
+    }
+
     /// Pinned streams captured by `EC_AV1_GATE_DUMP` off
     /// `a_real_aomenc_stream_with_warped_motion_refuses_or_matches` -- each
     /// one is a former mismatch, kept as a regression pin (warp-mismatch:
@@ -5737,5 +6385,1449 @@ mod tests {
                 assert_eq!(got.v, want.v, "seed {seed} frame {i} V vs ffmpeg");
             }
         }
+    }
+
+    /// lane-tiles r3/r7: a real two-tile-column aomenc key frame, decoded
+    /// through [`decode_key_frame_tile_with_cdfs`] directly with the whole
+    /// `tiles: &[&[u8]]` list -- `decode_stream`'s `cols > 1 || rows > 1`
+    /// refusal (this file, ~line 292) still fires for any stream this wide,
+    /// so this gate bypasses it on purpose to prove the per-tile loop r2
+    /// landed (fresh `SymbolDecoder`/CDF copy per tile, `Neighbours::start_tile`,
+    /// `PlaneBuf::set_tile_origin`) actually decodes both tiles pixel-exact
+    /// before that refusal is lifted. 128x64 is exactly two 64x64
+    /// superblocks wide with `--tile-columns=1` (`TileCols=2`), so tile 1 is
+    /// also the frame's own right edge -- the known gap (`PlaneBuf`'s
+    /// tile_x0/tile_y0 only clip left/top reach, not a non-last column's
+    /// right-edge reach) does not apply to this fixture; it would to a
+    /// 3+-column one, proven separately by the four-tile-column gate below.
+    /// r7: `--loopfilter-control=0` REMOVED per the charter -- `PlaneBuf`'s
+    /// `tile_x1`/`tile_y1` clamps now receive real values at every call site
+    /// (r6's `set_tile_origin` sweep), so this gate now proves real
+    /// deblocking across the tile boundary too, not just decode with it off.
+    /// Tile count itself is a structural aomenc param, not
+    /// RD-dependent content, but this decoder's chroma smooth/paeth gap
+    /// (`decode.rs` "a smooth or paeth chroma mode (round 2)", unrelated to
+    /// tiles, pre-dating this lane) is content-dependent -- no aomenc flag
+    /// disables UV-only smooth/paeth search, so a small seed sweep is
+    /// needed the same way the sibling `a_real_aomenc_stream_with_*` gates
+    /// retry past unrelated named refusals (every refusal in this crate is
+    /// prefixed `"AV1 tile"` regardless of category, so unlike the sibling
+    /// gates' `warp`/`obmc`/`interintra` banned lists there is no
+    /// tile-specific substring to forbid here -- `matched > 0` plus the
+    /// hard `tile_hits > 1`/pixel-exact asserts on any actual decode are
+    /// the real proof).
+    #[test]
+    fn a_real_aomenc_stream_with_two_tile_columns_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_stream_with_two_tile_columns_decodes_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height) = (128usize, 64usize);
+        let mut matched = 0u32;
+        let mut named_refusals = 0u32;
+        for attempt in 0..20u32 {
+            let seed = 42 + attempt;
+            let source = gradients_source(seed, width, height, "duration=0.04:rate=25");
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let mut child = Command::new(aomenc_path())
+                .args([
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    "--cq-level=45",
+                    "--cpu-used=0",
+                    "--limit=1",
+                    "--kf-max-dist=1000",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--tile-columns=1",
+                    "--tile-rows=0",
+                    // This decoder hardcodes SB_MI=16 (64px) superblocks
+                    // everywhere (`decode.rs`'s sb128 dead-end, ledger
+                    // `av1-superblock-contexts`) -- without this, aomenc's
+                    // own default 128x128 superblock makes 128x64 exactly
+                    // ONE superblock wide, so `--tile-columns=1` has nothing
+                    // to split and `cols` comes back 1.
+                    "--sb-size=64",
+                    // Deblocking crosses tile boundaries by default (spec
+                    // `loop_filter_across_tiles_enabled`); `PlaneBuf`'s
+                    // tile_x0/tile_y0 origin only ever clips a tile's own
+                    // left/top reach (r2/r3's documented known gap), so a
+                    // non-last tile column's right-edge deblock would read
+                    // into the next tile's still-undecoded/differently-
+                    // origined samples. Off here since deblocking itself is
+                    // not what this gate is proving.
+                    "--enable-rect-partitions=0",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    "--enable-filter-intra=0",
+                    "--enable-smooth-intra=0",
+                    "--enable-paeth-intra=0",
+                    "--enable-directional-intra=0",
+                    "--enable-angle-delta=0",
+                    "--enable-tx-size-search=0",
+                    "--enable-cdef=0",
+                    "--enable-restoration=0",
+                    "--max-partition-size=32",
+                    "--min-partition-size=32",
+                    "--enable-palette=0",
+                    "--enable-intrabc=0",
+                    "--enable-cfl-intra=0",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+
+            // Parse the stream ourselves (rather than `decode_stream`, whose
+            // multi-tile refusal is exactly what this gate exists to run
+            // ahead of) to reach the real `Frame` OBU's `tile_info` and its
+            // full `Vec<Tile>` -- `Av1Parser::parse_obu` already locates
+            // every tile in a multi-tile tile group (`parse_tile_group`), it
+            // is only `decode_stream` that ever narrows this to
+            // `tiles.first()`.
+            let mut parser = Av1Parser::new();
+            let mut pos = 0usize;
+            let mut frame = None;
+            while pos < stream.len() {
+                let obu_offset = pos;
+                let obu = parser.parse_obu(&stream[pos..]).unwrap();
+                pos += obu.total_size;
+                if let ObuKind::Frame(header, tiles) = obu.kind {
+                    frame = Some((header, tiles, obu_offset));
+                    break;
+                }
+            }
+            let (header, tiles, obu_offset) = frame.expect("stream has a Frame OBU");
+            assert!(
+                header.tile_info.cols > 1,
+                "{NAME}: aomenc did not actually split into >1 tile column (cols={}, seed {seed})",
+                header.tile_info.cols
+            );
+            assert_eq!(
+                tiles.len(),
+                header.tile_info.cols as usize,
+                "{NAME}: expected one tile per column (seed {seed})"
+            );
+            // `Tile::offset` is relative to the buffer `parse_obu` was
+            // handed (`&stream[pos..]` at the time this OBU was parsed), so
+            // it needs `obu_offset` added back -- the same adjustment
+            // `decode_stream` makes for its own single-tile slice above.
+            let tile_bufs: Vec<&[u8]> = tiles
+                .iter()
+                .map(|t| &stream[obu_offset + t.offset..obu_offset + t.offset + t.size])
+                .collect();
+
+            let enable_filter_intra = parser
+                .sequence_header()
+                .is_some_and(|seq| seq.enable_filter_intra);
+            let enable_edge_filter = parser
+                .sequence_header()
+                .is_some_and(|seq| seq.enable_intra_edge_filter);
+
+            let before = crate::decode::tile_hits();
+            let picture = match decode_key_frame_tile_with_cdfs(
+                &tile_bufs,
+                &header.tile_info,
+                header.mi_cols,
+                header.mi_rows,
+                header.quantization.base_q_idx,
+                header.frame_width,
+                header.frame_height,
+                enable_filter_intra,
+                enable_edge_filter,
+                &header.cdef,
+                &header.loop_filter,
+                None,
+                header.tx_mode == TxMode::Select,
+                header.reduced_tx_set,
+                header.allow_screen_content_tools,
+                header.allow_intrabc,
+                header.delta,
+            ) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME} failed outright, not a named refusal (seed {seed}): {msg}"
+                    );
+                    named_refusals += 1;
+                    eprintln!("seed {seed} refusal: {msg}");
+                    continue;
+                }
+                Ok((picture, _end_cdfs)) => picture,
+            };
+            let hits = crate::decode::tile_hits() - before;
+            assert!(
+                hits > 1,
+                "{NAME}: tile_hits delta was {hits}, expected >1 -- both tiles must actually \
+                 decode, not just tile 0 (seed {seed})"
+            );
+
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
+            assert_eq!(picture.y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg (seed {seed})");
+            assert_eq!(picture.u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg (seed {seed})");
+            assert_eq!(picture.v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg (seed {seed})");
+            matched += 1;
+        }
+        assert!(
+            matched > 0,
+            "{NAME}: every attempt refused ({named_refusals} refusals); the gate never decoded \
+             a two-tile-column stream"
+        );
+        eprintln!(
+            "{NAME}: {matched} pixel-exact matches, {named_refusals} named refusals out of 20"
+        );
+    }
+
+    /// lane-tiles r8 stage 1: the same bypass-the-refusal pattern as the
+    /// two-tile-column gate above, this time for tile ROWS -- `decode_stream`
+    /// still refuses any `tile_info.rows > 1` stream, so this gate calls
+    /// [`decode_key_frame_tile_with_cdfs`] directly to prove the underlying
+    /// per-tile loop (already row/col-generic: `tile_num / tile_info.cols`
+    /// gives the row, `mi_row_starts`/`set_tile_origin`'s `y0`/`y1` are
+    /// exactly symmetric with the column gate's `x0`/`x1`) actually decodes
+    /// both tile rows pixel-exact before the refusal is lifted. 64x128 is
+    /// one 64px superblock wide and two tall with `--tile-rows=1`
+    /// (`TileRows=2`, `--tile-columns=0` keeps `cols=1` so only the row axis
+    /// is under test). Loop filter is left ON (no
+    /// `--loopfilter-control=0`) per the charter -- deblocking crosses tile
+    /// row boundaries by spec default exactly as it crosses column ones, and
+    /// `deblock_plane` runs once over the whole decoded picture after every
+    /// tile is in, with no tile-axis distinction, so there is no reason to
+    /// expect the row boundary to behave differently from the column one r7
+    /// already proved -- this gate is what actually proves it either way.
+    #[test]
+    fn a_real_aomenc_stream_with_two_tile_rows_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_stream_with_two_tile_rows_decodes_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height) = (64usize, 128usize);
+        let mut matched = 0u32;
+        let mut named_refusals = 0u32;
+        for attempt in 0..20u32 {
+            let seed = 42 + attempt;
+            let source = gradients_source(seed, width, height, "duration=0.04:rate=25");
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let mut child = Command::new(aomenc_path())
+                .args([
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    "--cq-level=45",
+                    "--cpu-used=0",
+                    "--limit=1",
+                    "--kf-max-dist=1000",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--tile-columns=0",
+                    "--tile-rows=1",
+                    // This decoder hardcodes SB_MI=16 (64px) superblocks
+                    // everywhere; without this aomenc's own default 128x128
+                    // superblock makes 64x128 exactly ONE superblock tall,
+                    // so `--tile-rows=1` has nothing to split.
+                    "--sb-size=64",
+                    "--enable-rect-partitions=0",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    "--enable-filter-intra=0",
+                    "--enable-smooth-intra=0",
+                    "--enable-paeth-intra=0",
+                    "--enable-directional-intra=0",
+                    "--enable-angle-delta=0",
+                    "--enable-tx-size-search=0",
+                    "--enable-cdef=0",
+                    "--enable-restoration=0",
+                    "--max-partition-size=32",
+                    "--min-partition-size=32",
+                    "--enable-palette=0",
+                    "--enable-intrabc=0",
+                    "--enable-cfl-intra=0",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+
+            let mut parser = Av1Parser::new();
+            let mut pos = 0usize;
+            let mut frame = None;
+            while pos < stream.len() {
+                let obu_offset = pos;
+                let obu = parser.parse_obu(&stream[pos..]).unwrap();
+                pos += obu.total_size;
+                if let ObuKind::Frame(header, tiles) = obu.kind {
+                    frame = Some((header, tiles, obu_offset));
+                    break;
+                }
+            }
+            let (header, tiles, obu_offset) = frame.expect("stream has a Frame OBU");
+            assert!(
+                header.tile_info.rows > 1,
+                "{NAME}: aomenc did not actually split into >1 tile row (rows={}, seed {seed})",
+                header.tile_info.rows
+            );
+            assert_eq!(
+                tiles.len(),
+                header.tile_info.rows as usize,
+                "{NAME}: expected one tile per row (cols=1, seed {seed})"
+            );
+            let tile_bufs: Vec<&[u8]> = tiles
+                .iter()
+                .map(|t| &stream[obu_offset + t.offset..obu_offset + t.offset + t.size])
+                .collect();
+
+            let enable_filter_intra = parser
+                .sequence_header()
+                .is_some_and(|seq| seq.enable_filter_intra);
+            let enable_edge_filter = parser
+                .sequence_header()
+                .is_some_and(|seq| seq.enable_intra_edge_filter);
+
+            let before = crate::decode::tile_hits();
+            let picture = match decode_key_frame_tile_with_cdfs(
+                &tile_bufs,
+                &header.tile_info,
+                header.mi_cols,
+                header.mi_rows,
+                header.quantization.base_q_idx,
+                header.frame_width,
+                header.frame_height,
+                enable_filter_intra,
+                enable_edge_filter,
+                &header.cdef,
+                &header.loop_filter,
+                None,
+                header.tx_mode == TxMode::Select,
+                header.reduced_tx_set,
+                header.allow_screen_content_tools,
+                header.allow_intrabc,
+                header.delta,
+            ) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME} failed outright, not a named refusal (seed {seed}): {msg}"
+                    );
+                    named_refusals += 1;
+                    eprintln!("seed {seed} refusal: {msg}");
+                    continue;
+                }
+                Ok((picture, _end_cdfs)) => picture,
+            };
+            let hits = crate::decode::tile_hits() - before;
+            assert!(
+                hits > 1,
+                "{NAME}: tile_hits delta was {hits}, expected >1 -- both tile rows must actually \
+                 decode, not just tile 0 (seed {seed})"
+            );
+
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
+            assert_eq!(picture.y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg (seed {seed})");
+            assert_eq!(picture.u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg (seed {seed})");
+            assert_eq!(picture.v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg (seed {seed})");
+            matched += 1;
+        }
+        assert!(
+            matched > 0,
+            "{NAME}: every attempt refused ({named_refusals} refusals); the gate never decoded \
+             a two-tile-row stream"
+        );
+        eprintln!(
+            "{NAME}: {matched} pixel-exact matches, {named_refusals} named refusals out of 20"
+        );
+    }
+
+    /// lane-tiles r8 stage 2/3: the same two-tile-row stream as the bypass
+    /// gate above, this time through `decode_stream` itself -- the entry
+    /// point real callers use, with the `rows > 1` refusal lifted (same
+    /// commit) so this actually reaches the tile decode instead of
+    /// refusing by name. Loop filter ON, no `--loopfilter-control=0`.
+    #[test]
+    fn a_real_aomenc_stream_with_two_tile_rows_decodes_through_decode_stream() {
+        const NAME: &str = "a_real_aomenc_stream_with_two_tile_rows_decodes_through_decode_stream";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height) = (64usize, 128usize);
+        let mut matched = 0u32;
+        let mut named_refusals = 0u32;
+        for attempt in 0..20u32 {
+            let seed = 42 + attempt;
+            let source = gradients_source(seed, width, height, "duration=0.04:rate=25");
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", "yuv420p", "-f",
+                    "yuv4mpegpipe", "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let mut child = Command::new(aomenc_path())
+                .args([
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    "--cq-level=45",
+                    "--cpu-used=0",
+                    "--limit=1",
+                    "--kf-max-dist=1000",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--tile-columns=0",
+                    "--tile-rows=1",
+                    "--sb-size=64",
+                    "--enable-rect-partitions=0",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    "--enable-filter-intra=0",
+                    "--enable-smooth-intra=0",
+                    "--enable-paeth-intra=0",
+                    "--enable-directional-intra=0",
+                    "--enable-angle-delta=0",
+                    "--enable-tx-size-search=0",
+                    "--enable-cdef=0",
+                    "--enable-restoration=0",
+                    "--max-partition-size=32",
+                    "--min-partition-size=32",
+                    "--enable-palette=0",
+                    "--enable-intrabc=0",
+                    "--enable-cfl-intra=0",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+
+            let before = crate::decode::tile_hits();
+            let pictures = match decode_stream(&stream) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME} failed outright, not a named refusal (seed {seed}): {msg}"
+                    );
+                    named_refusals += 1;
+                    eprintln!("seed {seed} refusal: {msg}");
+                    continue;
+                }
+                Ok(pictures) => pictures,
+            };
+            let hits = crate::decode::tile_hits() - before;
+            assert!(
+                hits > 1,
+                "{NAME}: tile_hits delta was {hits}, expected >1 -- both tile rows must actually \
+                 decode, not just tile 0 (seed {seed})"
+            );
+            assert_eq!(pictures.len(), 1, "{NAME}: expected exactly 1 picture (seed {seed})");
+
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
+            assert_eq!(pictures[0].y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg (seed {seed})");
+            assert_eq!(pictures[0].u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg (seed {seed})");
+            assert_eq!(pictures[0].v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg (seed {seed})");
+            matched += 1;
+        }
+        assert!(
+            matched > 0,
+            "{NAME}: every attempt refused ({named_refusals} refusals); decode_stream never \
+             decoded a two-tile-row stream"
+        );
+        eprintln!(
+            "{NAME}: {matched} pixel-exact matches, {named_refusals} named refusals out of 20"
+        );
+    }
+
+    /// lane-tiles r7: the `>2 tile columns` refusal's own capability, proven
+    /// separately from the 2-column gate above -- `--tile-columns=2` gives
+    /// aomenc `TileCols=4` (log2), a real non-last-column right-edge case the
+    /// 2-column fixture cannot exercise (there tile 1 IS the frame's right
+    /// edge). 256x64 is four 64x64 superblocks wide with `--sb-size=64`, so
+    /// each tile column is exactly one superblock. Loop filtering stays ON
+    /// (no `--loopfilter-control=0`) to prove the same reach-bound fix also
+    /// covers deblocking across an *interior* tile boundary, not just the
+    /// 2-column case's boundary-that-is-also-the-frame-edge.
+    #[test]
+    fn a_real_aomenc_stream_with_four_tile_columns_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_stream_with_four_tile_columns_decodes_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height) = (256usize, 64usize);
+        let mut matched = 0u32;
+        let mut named_refusals = 0u32;
+        for attempt in 0..20u32 {
+            let seed = 42 + attempt;
+            let source = gradients_source(seed, width, height, "duration=0.04:rate=25");
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", "yuv420p", "-f",
+                    "yuv4mpegpipe", "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let mut child = Command::new(aomenc_path())
+                .args([
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    "--cq-level=45",
+                    "--cpu-used=0",
+                    "--limit=1",
+                    "--kf-max-dist=1000",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--tile-columns=2",
+                    "--tile-rows=0",
+                    "--sb-size=64",
+                    "--enable-rect-partitions=0",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    "--enable-filter-intra=0",
+                    "--enable-smooth-intra=0",
+                    "--enable-paeth-intra=0",
+                    "--enable-directional-intra=0",
+                    "--enable-angle-delta=0",
+                    "--enable-tx-size-search=0",
+                    "--enable-cdef=0",
+                    "--enable-restoration=0",
+                    "--max-partition-size=32",
+                    "--min-partition-size=32",
+                    "--enable-palette=0",
+                    "--enable-intrabc=0",
+                    "--enable-cfl-intra=0",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+
+            let mut parser = Av1Parser::new();
+            let mut pos = 0usize;
+            let mut frame = None;
+            while pos < stream.len() {
+                let obu_offset = pos;
+                let obu = parser.parse_obu(&stream[pos..]).unwrap();
+                pos += obu.total_size;
+                if let ObuKind::Frame(header, tiles) = obu.kind {
+                    frame = Some((header, tiles, obu_offset));
+                    break;
+                }
+            }
+            let (header, tiles, obu_offset) = frame.expect("stream has a Frame OBU");
+            assert!(
+                header.tile_info.cols > 2,
+                "{NAME}: aomenc did not actually split into >2 tile columns (cols={}, seed {seed})",
+                header.tile_info.cols
+            );
+            assert_eq!(
+                tiles.len(),
+                header.tile_info.cols as usize,
+                "{NAME}: expected one tile per column (seed {seed})"
+            );
+            let tile_bufs: Vec<&[u8]> = tiles
+                .iter()
+                .map(|t| &stream[obu_offset + t.offset..obu_offset + t.offset + t.size])
+                .collect();
+
+            let enable_filter_intra = parser
+                .sequence_header()
+                .is_some_and(|seq| seq.enable_filter_intra);
+            let enable_edge_filter = parser
+                .sequence_header()
+                .is_some_and(|seq| seq.enable_intra_edge_filter);
+
+            let before = crate::decode::tile_hits();
+            let picture = match decode_key_frame_tile_with_cdfs(
+                &tile_bufs,
+                &header.tile_info,
+                header.mi_cols,
+                header.mi_rows,
+                header.quantization.base_q_idx,
+                header.frame_width,
+                header.frame_height,
+                enable_filter_intra,
+                enable_edge_filter,
+                &header.cdef,
+                &header.loop_filter,
+                None,
+                header.tx_mode == TxMode::Select,
+                header.reduced_tx_set,
+                header.allow_screen_content_tools,
+                header.allow_intrabc,
+                header.delta,
+            ) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME} failed outright, not a named refusal (seed {seed}): {msg}"
+                    );
+                    named_refusals += 1;
+                    eprintln!("seed {seed} refusal: {msg}");
+                    continue;
+                }
+                Ok((picture, _end_cdfs)) => picture,
+            };
+            let hits = crate::decode::tile_hits() - before;
+            assert!(
+                hits > 2,
+                "{NAME}: tile_hits delta was {hits}, expected >2 -- all four tiles must actually \
+                 decode, not just a subset (seed {seed})"
+            );
+
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
+            assert_eq!(picture.y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg (seed {seed})");
+            assert_eq!(picture.u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg (seed {seed})");
+            assert_eq!(picture.v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg (seed {seed})");
+            matched += 1;
+        }
+        assert!(
+            matched > 0,
+            "{NAME}: every attempt refused ({named_refusals} refusals); the gate never decoded \
+             a four-tile-column stream"
+        );
+        eprintln!(
+            "{NAME}: {matched} pixel-exact matches, {named_refusals} named refusals out of 20"
+        );
+    }
+
+    /// lane-tiles r8: the tile-*row* analogue of the four-tile-column gate
+    /// above -- `--tile-rows=2` gives aomenc `TileRows=4` (log2; uniform
+    /// tile spacing is always a power of two, so this is the smallest count
+    /// that has an interior row neither the top nor bottom frame edge,
+    /// mirroring why the column gate needed 4 columns rather than 3). 64x256
+    /// is four 64x64 superblocks tall with `--sb-size=64`, one per tile row.
+    /// Loop filter ON, run through `decode_stream` itself since the
+    /// `rows > 1` refusal is already lifted by this commit. Also settles a
+    /// stale documentation claim found while writing this gate: the old
+    /// comment above `decode_stream`'s multi-tile block said
+    /// `context_update_tile_id != 0` was refused "further down" -- no such
+    /// refusal exists (`decode.rs` reads `tile_info.context_update_tile_id`
+    /// generically, never hardcoded to tile 0), and this fixture's own
+    /// aomenc runs pick 1/2/3 as often as 0 (RD-driven tile-size heuristic),
+    /// all 20/20 pixel-exact -- so the capability was already there,
+    /// undocumented and unproven; hard-asserted here so the proof can't go
+    /// unnoticed if it stops firing.
+    #[test]
+    fn a_real_aomenc_stream_with_four_tile_rows_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_stream_with_four_tile_rows_decodes_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height) = (64usize, 256usize);
+        let mut matched = 0u32;
+        let mut named_refusals = 0u32;
+        let mut saw_nonzero_context_update_tile_id = false;
+        for attempt in 0..20u32 {
+            let seed = 42 + attempt;
+            let source = gradients_source(seed, width, height, "duration=0.04:rate=25");
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", "yuv420p", "-f",
+                    "yuv4mpegpipe", "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let mut child = Command::new(aomenc_path())
+                .args([
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    "--cq-level=45",
+                    "--cpu-used=0",
+                    "--limit=1",
+                    "--kf-max-dist=1000",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--tile-columns=0",
+                    "--tile-rows=2",
+                    "--sb-size=64",
+                    "--enable-rect-partitions=0",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    "--enable-filter-intra=0",
+                    "--enable-smooth-intra=0",
+                    "--enable-paeth-intra=0",
+                    "--enable-directional-intra=0",
+                    "--enable-angle-delta=0",
+                    "--enable-tx-size-search=0",
+                    "--enable-cdef=0",
+                    "--enable-restoration=0",
+                    "--max-partition-size=32",
+                    "--min-partition-size=32",
+                    "--enable-palette=0",
+                    "--enable-intrabc=0",
+                    "--enable-cfl-intra=0",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+
+            let mut parser = Av1Parser::new();
+            let mut pos = 0usize;
+            let mut rows_seen = 0u32;
+            while pos < stream.len() {
+                let obu = parser.parse_obu(&stream[pos..]).unwrap();
+                pos += obu.total_size;
+                if let ObuKind::Frame(header, _) = &obu.kind {
+                    rows_seen = header.tile_info.rows;
+                    if header.tile_info.context_update_tile_id != 0 {
+                        saw_nonzero_context_update_tile_id = true;
+                    }
+                }
+            }
+            assert!(
+                rows_seen > 2,
+                "{NAME}: aomenc did not actually split into >2 tile rows (rows={rows_seen}, seed {seed})"
+            );
+
+            let before = crate::decode::tile_hits();
+            let pictures = match decode_stream(&stream) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME} failed outright, not a named refusal (seed {seed}): {msg}"
+                    );
+                    named_refusals += 1;
+                    eprintln!("seed {seed} refusal: {msg}");
+                    continue;
+                }
+                Ok(pictures) => pictures,
+            };
+            let hits = crate::decode::tile_hits() - before;
+            assert!(
+                hits > 2,
+                "{NAME}: tile_hits delta was {hits}, expected >2 -- all four tile rows must \
+                 actually decode, not just a subset (seed {seed})"
+            );
+            assert_eq!(pictures.len(), 1, "{NAME}: expected exactly 1 picture (seed {seed})");
+
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
+            assert_eq!(pictures[0].y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg (seed {seed})");
+            assert_eq!(pictures[0].u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg (seed {seed})");
+            assert_eq!(pictures[0].v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg (seed {seed})");
+            matched += 1;
+        }
+        assert!(
+            matched > 0,
+            "{NAME}: every attempt refused ({named_refusals} refusals); the gate never decoded \
+             a four-tile-row stream"
+        );
+        assert!(
+            saw_nonzero_context_update_tile_id,
+            "{NAME}: every attempt named context_update_tile_id=0 -- this sweep proves nothing \
+             about the != 0 case (see the stale-refusal note above `decode_stream`'s multi-tile \
+             comment: aomenc's own tile-size heuristic picks it, seen 1/2/3 live in a prior probe \
+             run of this exact fixture, so a 20-attempt window not seeing it is the gate's own bug)"
+        );
+        eprintln!(
+            "{NAME}: {matched} pixel-exact matches, {named_refusals} named refusals out of 20"
+        );
+    }
+
+    /// lane-tiles r4/r7: the same real two-tile-column stream as the
+    /// bypass gate above, this time run through `decode_stream` itself --
+    /// the entry point real callers use. Proves the `cols > 1` refusal is
+    /// actually lifted (not just that the underlying per-tile loop works)
+    /// for a key frame; `--loopfilter-control=0` stays here for its own
+    /// sake (isolating the entry-point wiring from deblocking), but r7's
+    /// `a_real_aomenc_stream_with_four_tile_columns_decodes_pixel_exact`
+    /// bypass gate now proves loop filtering ON across a tile boundary too,
+    /// and the `cols > 1 && loop_filter_on` / `cols > 2` refusals this
+    /// comment used to describe are gone from `decode_stream`.
+    #[test]
+    fn a_real_aomenc_stream_with_two_tile_columns_decodes_through_decode_stream() {
+        const NAME: &str = "a_real_aomenc_stream_with_two_tile_columns_decodes_through_decode_stream";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height) = (128usize, 64usize);
+        let mut matched = 0u32;
+        let mut named_refusals = 0u32;
+        for attempt in 0..20u32 {
+            let seed = 42 + attempt;
+            let source = gradients_source(seed, width, height, "duration=0.04:rate=25");
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", "yuv420p", "-f",
+                    "yuv4mpegpipe", "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let mut child = Command::new(aomenc_path())
+                .args([
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    "--cq-level=45",
+                    "--cpu-used=0",
+                    "--limit=1",
+                    "--kf-max-dist=1000",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--tile-columns=1",
+                    "--tile-rows=0",
+                    "--sb-size=64",
+                    "--loopfilter-control=0",
+                    "--enable-rect-partitions=0",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    "--enable-filter-intra=0",
+                    "--enable-smooth-intra=0",
+                    "--enable-paeth-intra=0",
+                    "--enable-directional-intra=0",
+                    "--enable-angle-delta=0",
+                    "--enable-tx-size-search=0",
+                    "--enable-cdef=0",
+                    "--enable-restoration=0",
+                    "--max-partition-size=32",
+                    "--min-partition-size=32",
+                    "--enable-palette=0",
+                    "--enable-intrabc=0",
+                    "--enable-cfl-intra=0",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+
+            let before = crate::decode::tile_hits();
+            let pictures = match decode_stream(&stream) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME} failed outright, not a named refusal (seed {seed}): {msg}"
+                    );
+                    named_refusals += 1;
+                    eprintln!("seed {seed} refusal: {msg}");
+                    continue;
+                }
+                Ok(pictures) => pictures,
+            };
+            let hits = crate::decode::tile_hits() - before;
+            assert!(
+                hits > 1,
+                "{NAME}: tile_hits delta was {hits}, expected >1 -- both tiles must actually \
+                 decode, not just tile 0 (seed {seed})"
+            );
+            assert_eq!(pictures.len(), 1, "{NAME}: expected exactly 1 picture (seed {seed})");
+
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
+            assert_eq!(pictures[0].y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg (seed {seed})");
+            assert_eq!(pictures[0].u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg (seed {seed})");
+            assert_eq!(pictures[0].v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg (seed {seed})");
+            matched += 1;
+        }
+        assert!(
+            matched > 0,
+            "{NAME}: every attempt refused ({named_refusals} refusals); decode_stream never \
+             decoded a two-tile-column stream"
+        );
+        eprintln!(
+            "{NAME}: {matched} pixel-exact matches, {named_refusals} named refusals out of 20"
+        );
+    }
+    /// lane-realworld r6: r5 ported `maybe_read_delta_q`/`maybe_read_delta_lf`
+    /// and removed the whole-frame refusal, but no fixture anywhere set
+    /// `delta_lf_present` -- the removal was unproven. `--deltaq-mode=2`
+    /// (`DELTA_Q_PERCEPTUAL`, checked against libaom's own
+    /// `encodeframe.c:2192-2225`) sets `delta_q_present_flag` unconditionally
+    /// once `base_qindex > 0` (unlike the default `--deltaq-mode=1`
+    /// `DELTA_Q_OBJECTIVE`, which additionally requires an alt-ref-eligible
+    /// frame and `allow_deltaq_mode`'s own RD search); `--delta-lf-mode=1`
+    /// then ANDs `delta_lf_present_flag` on top
+    /// (`tool_cfg->enable_deltalf_mode`, `av1_cx_iface.c:1269-1270`). 128x64
+    /// (2 SBs; this decoder hardcodes 64px SBs) is the charter's minimum for
+    /// a per-superblock symbol to have somewhere to differ; `--cpu-used=4`
+    /// (not the other gates' `=0`) sidesteps the multi-SB
+    /// HORZ_4/VERT_B-at-part64 gap the cdef gate's own comment documents
+    /// (lane-realworld r2 dead-end, part64 only covers NONE/SPLIT). Note:
+    /// libaom hardcodes `delta_lf_multi = DEFAULT_DELTA_LF_MULTI == 0`
+    /// (`enums.h:73`) with no CLI flag to set it -- this gate cannot and
+    /// does not claim to exercise this decoder's `delta_lf_multi` branch;
+    /// only the single-plane path is gate-proven.
+    #[test]
+    fn a_real_aomenc_stream_with_delta_q_and_delta_lf_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_stream_with_delta_q_and_delta_lf_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height, frame_count) = (128usize, 64usize, 24usize);
+        let mut named_refusals = 0u32;
+        let mut matched = 0u32;
+        let n_attempts: u32 = std::env::var("EC_DELTAQ_GATE_ATTEMPTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(40);
+        for attempt in 0..n_attempts {
+            let seed = 42 + attempt;
+            let duration = frame_count as f64 / 25.0;
+            // Mandelbrot's varying local contrast is what gives
+            // DELTA_Q_PERCEPTUAL's per-superblock RD something to
+            // differentiate; flat gradients risk every superblock
+            // resolving the same delta.
+            let source = format!(
+                "mandelbrot=size={width}x{height}:rate=25:start_x={sx}:start_y={sy}",
+                sx = -0.6 + 0.005 * (attempt as f64),
+                sy = -0.4 + 0.005 * (attempt as f64)
+            );
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-t",
+                    &duration.to_string(),
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let args: Vec<&str> = vec![
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                "--cq-level=45",
+                "--cpu-used=4",
+                "--aq-mode=0",
+                "--deltaq-mode=2",
+                "--delta-lf-mode=1",
+                "--kf-max-dist=1000",
+                "--threads=1",
+                "--row-mt=0",
+                "--sb-size=64",
+                "--auto-alt-ref=1",
+                "--lag-in-frames=16",
+                "--enable-fwd-kf=0",
+                "--enable-order-hint=1",
+                "--enable-warped-motion=1",
+                "--enable-global-motion=0",
+                "--enable-obmc=1",
+                "--tune-content=default",
+                "--enable-masked-comp=1",
+                "--enable-dist-wtd-comp=0",
+                "--enable-interintra-comp=1",
+                "--enable-onesided-comp=0",
+                "--enable-interintra-wedge=0",
+                "--enable-smooth-interintra=1",
+                "--enable-rect-partitions=0",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0",
+                "--enable-filter-intra=0",
+                "--enable-smooth-intra=0",
+                "--enable-paeth-intra=0",
+                "--enable-directional-intra=0",
+                "--enable-angle-delta=0",
+                "--enable-tx-size-search=0",
+                "--enable-cdef=1",
+                "--enable-restoration=0",
+                "--max-partition-size=32",
+                "--min-partition-size=32",
+                "--enable-palette=0",
+                "--enable-intrabc=0",
+                "--enable-cfl-intra=0",
+                "--enable-ref-frame-mvs=0",
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ];
+            let mut child = Command::new(aomenc_path())
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let frames = match decode_stream(&stream) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME} failed outright, not a named refusal (seed {seed}): {msg}"
+                    );
+                    assert!(
+                        !msg.contains("delta_q") && !msg.contains("delta_lf"),
+                        "{NAME} refused on delta_q/delta_lf (seed {seed}) -- that read is ported: {msg}"
+                    );
+                    named_refusals += 1;
+                    eprintln!("seed {seed} refusal: {msg}");
+                    continue;
+                }
+                Ok(frames) => frames,
+            };
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
+            assert_eq!(frames.len(), frame_count);
+            let mismatched = frames
+                .iter()
+                .zip(&ffmpeg_frames)
+                .any(|(got, want)| got.y != want.y || got.u != want.u || got.v != want.v);
+            if mismatched && let Ok(path) = std::env::var("EC_AV1_GATE_DUMP") {
+                std::fs::write(&path, &stream).expect("writing pinned stream");
+                eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
+            }
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
+                assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
+            }
+            matched += 1;
+        }
+        assert!(
+            matched > 0,
+            "{NAME}: every attempt refused on other capabilities ({named_refusals} refusals); \
+             the gate never exercised delta_q/delta_lf"
+        );
+        assert!(
+            crate::decode::delta_q_hits() > 0,
+            "{NAME}: {matched} pixel-exact matches but zero delta_q symbol groups fired -- \
+             the reader is unexercised"
+        );
+        assert!(
+            crate::decode::delta_lf_hits() > 0,
+            "{NAME}: {matched} pixel-exact matches but zero delta_lf symbol groups fired -- \
+             the reader is unexercised"
+        );
+        eprintln!(
+            "{NAME}: {named_refusals} other-capability refusals, {matched} pixel-exact matches \
+             out of {n_attempts}, delta_q_hits={}, delta_lf_hits={}",
+            crate::decode::delta_q_hits(),
+            crate::decode::delta_lf_hits()
+        );
+    }
+
+    /// lane-tiles r7: the gate stage 2 (r6, commit 8899fc1) shipped without
+    /// -- a real >1-tile-column stream with a genuine INTER frame (not just
+    /// the key-frame-only two-column gate above), decoded through
+    /// `decode_stream` itself. Same recipe as the key-frame gate
+    /// (`--sb-size=64`, `--tile-columns=1`, `--loopfilter-control=0`, the
+    /// same feature-disable envelope so the gate isolates the tile loop, not
+    /// an unrelated unimplemented mode) plus `--limit=2 --kf-max-dist=1000`
+    /// so frame 1 is a real inter frame, and `gradients_source`'s default
+    /// `speed=0.01` rotation (undisturbed -- not overridden by the tail)
+    /// gives it genuine motion against frame 0, so `decode_inter_frame_tile_
+    /// with_cdfs`'s new per-tile loop and `MiGrid`'s per-tile bound actually
+    /// have to walk a live MV stack across the tile-column boundary, not
+    /// just replay skip/zero-mv blocks. Bounded with `duration=0.08` (2
+    /// frames at rate=25) per the class in ledger
+    /// `refusal-claim-disproved-by-its-own-gate`/`gate-loader-slurps-whole-
+    /// file` (never leave an ffmpeg/lavfi generate unbounded).
+    #[test]
+    fn a_real_aomenc_stream_with_two_tile_columns_and_an_inter_frame_decodes_pixel_exact() {
+        const NAME: &str =
+            "a_real_aomenc_stream_with_two_tile_columns_and_an_inter_frame_decodes_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height) = (128usize, 64usize);
+        let frames = 2usize;
+        let mut matched = 0u32;
+        let mut named_refusals = 0u32;
+        for attempt in 0..20u32 {
+            let seed = 42 + attempt;
+            let source = gradients_source(seed, width, height, "duration=0.08:rate=25");
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", "yuv420p", "-f",
+                    "yuv4mpegpipe", "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let mut child = Command::new(aomenc_path())
+                .args([
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    "--cq-level=45",
+                    "--cpu-used=0",
+                    &format!("--limit={frames}"),
+                    "--kf-max-dist=1000",
+                    "--lag-in-frames=0",
+                    "--auto-alt-ref=0",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--tile-columns=1",
+                    "--tile-rows=0",
+                    "--sb-size=64",
+                    "--loopfilter-control=0",
+                    "--max-reference-frames=3",
+                    "--reduced-reference-set=1",
+                    "--enable-warped-motion=0",
+                    "--enable-obmc=0",
+                    "--enable-masked-comp=0",
+                    "--enable-interintra-comp=0",
+                    "--enable-dist-wtd-comp=0",
+                    "--enable-diff-wtd-comp=0",
+                    "--enable-onesided-comp=0",
+                    "--enable-interintra-wedge=0",
+                    "--enable-smooth-interintra=0",
+                    "--enable-ref-frame-mvs=0",
+                    "--enable-rect-partitions=0",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    "--enable-filter-intra=0",
+                    "--enable-smooth-intra=0",
+                    "--enable-paeth-intra=0",
+                    "--enable-directional-intra=0",
+                    "--enable-angle-delta=0",
+                    "--enable-tx-size-search=0",
+                    "--enable-cdef=0",
+                    "--enable-restoration=0",
+                    "--max-partition-size=32",
+                    "--min-partition-size=32",
+                    "--enable-palette=0",
+                    "--enable-intrabc=0",
+                    "--enable-cfl-intra=0",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+
+            // Confirm aomenc actually split into >1 tile column and that
+            // frame 1 is a real inter frame before trusting a pixel match --
+            // otherwise a match could mean "tiles collapsed to 1" or "frame
+            // 1 fell back to key", not "the inter tile loop ran".
+            let mut parser = Av1Parser::new();
+            let mut pos = 0usize;
+            let mut saw_multi_tile_inter = false;
+            while pos < stream.len() {
+                let obu = parser.parse_obu(&stream[pos..]).unwrap();
+                pos += obu.total_size;
+                if let ObuKind::Frame(header, _) = obu.kind
+                    && header.frame_type != FrameType::Key
+                    && header.tile_info.cols > 1
+                {
+                    saw_multi_tile_inter = true;
+                }
+            }
+            assert!(
+                saw_multi_tile_inter,
+                "{NAME}: seed {seed} never produced a >1-tile-column inter frame (aomenc \
+                 collapsed tiling or coded frame 1 as key)"
+            );
+
+            let before = crate::decode::tile_hits();
+            let pictures = match decode_stream(&stream) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME} failed outright, not a named refusal (seed {seed}): {msg}"
+                    );
+                    named_refusals += 1;
+                    eprintln!("seed {seed} refusal: {msg}");
+                    continue;
+                }
+                Ok(pictures) => pictures,
+            };
+            let hits = crate::decode::tile_hits() - before;
+            assert!(
+                hits > frames,
+                "{NAME}: tile_hits delta was {hits}, expected > {frames} -- both tiles of both \
+                 frames must actually decode (seed {seed})"
+            );
+            assert_eq!(pictures.len(), frames, "{NAME}: expected {frames} pictures (seed {seed})");
+
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frames);
+            for (i, (got, want)) in pictures.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(got.y, want.y, "{NAME}: seed {seed} frame {i} luma vs ffmpeg");
+                assert_eq!(got.u, want.u, "{NAME}: seed {seed} frame {i} U vs ffmpeg");
+                assert_eq!(got.v, want.v, "{NAME}: seed {seed} frame {i} V vs ffmpeg");
+            }
+            matched += 1;
+        }
+        assert!(
+            matched > 0,
+            "{NAME}: every attempt refused ({named_refusals} refusals); decode_stream never \
+             decoded a two-tile-column inter frame"
+        );
+        eprintln!(
+            "{NAME}: {matched} pixel-exact matches, {named_refusals} named refusals out of 20"
+        );
     }
 }
