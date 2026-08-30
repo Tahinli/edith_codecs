@@ -2368,8 +2368,17 @@ fn palette_color_index_context(
 /// rows/cols-vs-plane_width/height cropping special case is needed, unlike
 /// libaom's own non-block-aligned split.
 fn decode_color_index_map(dec: &mut SymbolDecoder, cdfs: &mut Cdfs, n: usize, side: usize) -> Vec<u8> {
+    let trace = std::env::var_os("EC_AV1_TRACE").is_some();
     let mut map = vec![0u8; side * side];
+    if trace {
+        let (rng, _) = dec.debug_state();
+        eprintln!("EC_PAL row=0 col=0 ctx=-1 n={n} rng={rng}");
+    }
     map[0] = read_uniform(dec, n) as u8;
+    if trace {
+        let (rng, _) = dec.debug_state();
+        eprintln!("EC_PAL_VAL row=0 col=0 color_idx={} rng={rng}", map[0]);
+    }
     for i in 1..(2 * side - 1) {
         let j_hi = i.min(side - 1);
         let j_lo = i.saturating_sub(side - 1);
@@ -2377,8 +2386,16 @@ fn decode_color_index_map(dec: &mut SymbolDecoder, cdfs: &mut Cdfs, n: usize, si
             let row = i - j;
             let col = j;
             let (ctx, color_order) = palette_color_index_context(&map, side, row, col, n);
+            if trace {
+                let (rng, _) = dec.debug_state();
+                eprintln!("EC_PAL row={row} col={col} ctx={ctx} n={n} rng={rng}");
+            }
             let symbol = dec.symbol(&mut cdfs.palette_y_color_index[n - 2][ctx][..=n]);
             map[row * side + col] = color_order[symbol];
+            if trace {
+                let (rng, _) = dec.debug_state();
+                eprintln!("EC_PAL_VAL row={row} col={col} color_idx={symbol} rng={rng}");
+            }
         }
     }
     map
@@ -2995,14 +3012,36 @@ fn read_intra_mode(
         && let Some(bsize_ctx) = palette_bsize_ctx(side)
     {
         let (mode_ctx, cache) = palette.unwrap_or((0, &[]));
-        if mode == DC_PRED && dec.symbol(&mut cdfs.palette_y_mode[bsize_ctx][mode_ctx]) != 0 {
+        if mode == DC_PRED {
+            if trace {
+                let (rng, _) = dec.debug_state();
+                eprintln!(
+                    "TRACE pre_palette_y_mode bsize_ctx={bsize_ctx} mode_ctx={mode_ctx} rng={rng}"
+                );
+            }
+        }
+        let use_palette_y =
+            mode == DC_PRED && dec.symbol(&mut cdfs.palette_y_mode[bsize_ctx][mode_ctx]) != 0;
+        if mode == DC_PRED && trace {
+            let (rng, _) = dec.debug_state();
+            eprintln!("TRACE palette_y_mode value={} rng={rng}", use_palette_y as i32);
+        }
+        if use_palette_y {
             if palette.is_none() {
                 return Err(unsupported(
                     "a block that actually uses a palette (Y) -- reconstruction is out of scope",
                 ));
             }
             let n = 2 + dec.symbol(&mut cdfs.palette_y_size[bsize_ctx]);
+            if trace {
+                let (rng, _) = dec.debug_state();
+                eprintln!("TRACE palette_y_size n={n} rng={rng}");
+            }
             let colors = read_palette_colors_y(dec, n, cache);
+            if trace {
+                let (rng, _) = dec.debug_state();
+                eprintln!("TRACE palette_y_colors colors={:?} rng={rng}", &colors[..n]);
+            }
             let map = decode_color_index_map(dec, cdfs, n, side);
             PALETTE_HITS.with(|c| c.set(c.get() + 1));
             if trace {
