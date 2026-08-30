@@ -196,6 +196,45 @@ impl Picture {
     }
 }
 
+/// lane-hbd r2: the encoder's own reconstruction/source buffers stay `u8`
+/// (8-bit only, unchanged this round -- widening the encoder is out of this
+/// round's scope, see `lanes/hbd-r2.report.md`); this is the local box that
+/// lets it keep calling [`crate::intra::predict`] now that shape is `u16`
+/// in and out. A block-sized round-trip through `u16` is exact for 8-bit
+/// content (every value fits both ways), so this changes no encoder output.
+#[allow(clippy::too_many_arguments)]
+fn intra_predict_u8(
+    mode: u8,
+    angle_delta: i32,
+    above: Option<&[u8]>,
+    left: Option<&[u8]>,
+    corner: Option<u8>,
+    bw: usize,
+    bh: usize,
+    enable_edge_filter: bool,
+    smooth_neighbor: bool,
+    dst: &mut [u8],
+) {
+    let above16: Option<Vec<u16>> = above.map(|s| s.iter().map(|&v| u16::from(v)).collect());
+    let left16: Option<Vec<u16>> = left.map(|s| s.iter().map(|&v| u16::from(v)).collect());
+    let mut dst16 = vec![0u16; dst.len()];
+    crate::intra::predict(
+        mode,
+        angle_delta,
+        above16.as_deref(),
+        left16.as_deref(),
+        corner.map(u16::from),
+        bw,
+        bh,
+        enable_edge_filter,
+        smooth_neighbor,
+        &mut dst16,
+    );
+    for (d, &s) in dst.iter_mut().zip(dst16.iter()) {
+        *d = s as u8;
+    }
+}
+
 /// Pads one plane to `(padded_width, padded_height)` by repeating its last
 /// row and column, so the block coder always sees a whole number of blocks.
 /// [`crop_plane`] undoes this on the way back out.
@@ -597,7 +636,7 @@ impl Plane<'_> {
         } = at;
         let (above, left, corner) = self.edges(x, y, side, reach);
         let mut prediction = vec![0u8; side * side];
-        crate::intra::predict(
+        intra_predict_u8(
             mode,
             0,
             above.as_deref(),
@@ -817,7 +856,7 @@ impl Plane<'_> {
             .iter()
             .map(|&mode| {
                 let mut prediction = vec![0u8; side * side];
-                crate::intra::predict(
+                intra_predict_u8(
                     mode,
                     0,
                     above.as_deref(),
@@ -869,7 +908,7 @@ impl Plane<'_> {
             .iter()
             .map(|&mode| {
                 let mut prediction = vec![0u8; side * side];
-                crate::intra::predict(
+                intra_predict_u8(
                     mode,
                     0,
                     above.as_deref(),
@@ -2136,9 +2175,13 @@ fn mc_trial(
 ) -> Trial {
     let x_q4 = mv_to_q4(x, mv.1, luma);
     let y_q4 = mv_to_q4(y, mv.0, luma);
-    let mut prediction = vec![0u8; side * side];
+    // lane-hbd r2: `reference`/`prediction` stay `u8` here (encoder is
+    // 8-bit only this round, see `intra_predict_u8`'s doc comment) --
+    // round-trip through `u16` locally to call the now-widened `mc::predict`.
+    let reference16: Vec<u16> = reference.iter().map(|&v| u16::from(v)).collect();
+    let mut prediction16 = vec![0u16; side * side];
     mc::predict(
-        reference,
+        &reference16,
         stride,
         ref_width,
         ref_height,
@@ -2146,8 +2189,9 @@ fn mc_trial(
         y_q4,
         side,
         side,
-        &mut prediction,
+        &mut prediction16,
     );
+    let prediction: Vec<u8> = prediction16.iter().map(|&v| v as u8).collect();
     plane.code_from_prediction(x, y, side, &prediction, skip, base_q_idx, deadzone, set)
 }
 
@@ -4518,7 +4562,7 @@ mod tests {
             let mut prediction = vec![0u8; side * side];
             let t = Instant::now();
             for _ in 0..N {
-                crate::intra::predict(
+                intra_predict_u8(
                     D45_PRED,
                     0,
                     Some(&above),
