@@ -562,6 +562,25 @@ pub(crate) fn palette_rect_hits() -> usize {
     PALETTE_RECT_HITS.with(|c| c.get())
 }
 
+// lane-palette2 r6: how many HORZ/VERT rect intra strips ran the
+// [`palette_bsize_ctx_wh`]-gated code path in [`read_intra_mode_rect`] --
+// i.e. `allow_screen_content_tools` was set and the strip's `bw`x`bh` was in
+// range, so `palette_y_mode`/`palette_uv_mode` were actually read (and, per
+// RD, almost always refused-on-use because the block doesn't end up USING a
+// palette -- see r5's report). This is the site the removed refusal
+// ("a HORZ/VERT intra strip in a screen-content frame") used to guard: it
+// fired here whether or not the block picked a palette, so this is the
+// counter that proves the case r5's narrower [`PALETTE_RECT_HITS`] almost
+// never observes.
+thread_local! {
+    static RECT_SCREEN_CONTENT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`RECT_SCREEN_CONTENT_HITS`].
+pub(crate) fn rect_screen_content_hits() -> usize {
+    RECT_SCREEN_CONTENT_HITS.with(|c| c.get())
+}
+
 // lane-palette2 r1: how many palette-Y blocks decoded with a split luma
 // transform (`tx_select && logical_tx != side`) -- proves the per-TU index-map
 // slicing actually ran, not just that the whole-block path stayed exact.
@@ -3088,6 +3107,10 @@ fn read_intra_mode_rect(
     if allow_screen_content_tools
         && let Some(bsize_ctx) = palette_bsize_ctx_wh(bw, bh)
     {
+        // r6: this is the exact site the removed blanket refusal used to
+        // guard -- reached for EVERY rect strip in a screen-content frame,
+        // independent of whether the block ends up using a palette.
+        RECT_SCREEN_CONTENT_HITS.with(|c| c.set(c.get() + 1));
         let (mode_ctx, cache) = palette.unwrap_or((0, &[]));
         let use_palette_y =
             mode == DC_PRED && dec.symbol(&mut cdfs.palette_y_mode[bsize_ctx][mode_ctx]) != 0;
