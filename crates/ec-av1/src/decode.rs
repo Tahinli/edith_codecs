@@ -8169,7 +8169,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                 let part16 = dec.symbol(&mut cdfs.partition_w16[ctx16]);
                                 if part16 != PARTITION_NONE {
                                     return Err(unsupported(
-                                        "a partition below 16x16 (this encoder never writes one)",
+                                        "an inter partition below 16x16 (8x8 and smaller inter blocks are not coded yet)",
                                     ));
                                 }
                                 decode_inter_block(
