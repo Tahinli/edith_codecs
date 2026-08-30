@@ -461,15 +461,9 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 header.allow_screen_content_tools,
             )?
         };
-        // lane-lr r3: the tile decode above just ran `read_lr` for real (see
-        // this refusal's own doc comment further up) -- refuse now, after a
-        // successful structural decode, rather than before it.
-        if header.loop_restoration.uses_lr {
-            return Err(Error::unsupported(
-                "AV1 decode_stream",
-                "a frame with loop restoration enabled (the per-unit lr symbols are read but the Wiener/self-guided filters are not yet applied to pixels)",
-            ));
-        }
+        // lane-lr r4: the Wiener/self-guided pixel filters are wired
+        // (`decode.rs::apply_loop_restoration`) -- no more refusal here,
+        // `uses_lr` frames now decode all the way to pixels.
         // Spec 7.20: `disable_frame_end_update_cdf` stores the frame's
         // *initial* table into the slots it refreshes, not the adapted
         // end-of-tile one.
@@ -4782,32 +4776,33 @@ mod tests {
             );
             let stream = out.stdout;
             match decode_stream(&stream) {
-                Ok(_) => {
-                    // aomenc's own RD chose `RESTORE_NONE` on every plane this
-                    // attempt -- a legitimately LR-free frame, not a gate
-                    // failure (see the cq-level comment above: not every
-                    // attempt lands `uses_lr=true`).
-                    continue;
+                Ok(pics) => {
+                    // r4: the pixel filters are wired -- every `uses_lr`
+                    // frame must now decode Ok AND match an independent
+                    // decoder pixel-exact, not just refuse cleanly.
+                    let reference = ffmpeg_decode_sequence(&stream, width, height, pics.len());
+                    for (i, (pic, refpic)) in pics.iter().zip(reference.iter()).enumerate() {
+                        assert_eq!(pic.y, refpic.y, "{NAME}: luma mismatch (seed {seed} frame {i})");
+                        assert_eq!(pic.u, refpic.u, "{NAME}: U mismatch (seed {seed} frame {i})");
+                        assert_eq!(pic.v, refpic.v, "{NAME}: V mismatch (seed {seed} frame {i})");
+                    }
+                    lr_refusals += 1; // reused below as "attempts that actually exercised LR pixels"
                 }
                 Err(e) => {
                     let msg = e.to_string();
-                    assert!(
-                        msg.contains("unsupported"),
-                        "{NAME} failed outright, not a named refusal (seed {seed}): {msg}"
-                    );
-                    if msg.contains("loop restoration enabled") {
-                        lr_refusals += 1;
-                    } else {
-                        other_refusals.push(format!("seed {seed}: {msg}"));
-                    }
+                    other_refusals.push(format!("seed {seed}: {msg}"));
                 }
             }
         }
         assert!(
-            lr_refusals > 0,
-            "{NAME}: the LR refusal never fired ({} attempts, other refusals:\n{})",
-            n_attempts,
+            other_refusals.is_empty(),
+            "{NAME}: {} attempts failed outright instead of decoding:\n{}",
+            other_refusals.len(),
             other_refusals.join("\n")
+        );
+        assert!(
+            lr_refusals > 0,
+            "{NAME}: no attempt ever decoded pixel-exact ({n_attempts} attempts)"
         );
         // Any real (non-`RESTORE_NONE`) filter kind is acceptable proof --
         // aomenc's RD picks the frame-level `restoration_type` itself (not
