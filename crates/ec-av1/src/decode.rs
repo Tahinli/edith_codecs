@@ -4391,7 +4391,7 @@ fn decode_leaf8(
     // An 8x8 leaf is well within `is_cfl_allowed`'s <=32x32 bound (spec
     // 5.11.5), so it reads the CFL-allowed `uv_mode_cfl` CDF, like every other
     // `decode_block` caller at 16x16 and up.
-    let (skip, mode, angle_delta_y, uv_mode, angle_delta_uv, alpha, filter_intra, _palette_y) =
+    let (skip, mode, angle_delta_y, uv_mode, angle_delta_uv, alpha, filter_intra, _palette_y, _palette_uv) =
         read_intra_mode(
             dec,
             cdfs,
@@ -4404,6 +4404,7 @@ fn decode_leaf8(
             allow_screen_content_tools,
             allow_intrabc,
             None,
+            &[],
             leaf_mi.0,
             leaf_mi.1,
         )?;

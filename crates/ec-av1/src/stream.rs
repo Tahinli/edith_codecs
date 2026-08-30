@@ -1707,6 +1707,124 @@ mod tests {
         assert_eq!(frames[0].v, ffmpeg_frames[0].v, "V vs ffmpeg");
     }
 
+    /// A real `aomenc` palette-**UV** fixture (lane-palette2 r2): `testsrc2`
+    /// (the multicoloured AV1 test pattern -- flat, few-colour, repetitive
+    /// per-region colour *and* chroma, unlike `smptebars=hue=s=0` above,
+    /// which flattened chroma to a single value specifically to avoid
+    /// exercising this path). Same square-only recipe as the palette-Y gate
+    /// (`--enable-rect-partitions=0`/`-ab-`/`-1to4-`, fixed 32x32 partition)
+    /// so a UV palette block never lands inside the still-refused HORZ/VERT
+    /// screen-content strip. HARD-asserts [`decode::palette_uv_hits`] moved
+    /// -- a stream that never reads a real UV palette block would decode (or
+    /// not) by construction without proving this milestone at all
+    /// ([[gate-blind-to-feature]]).
+    #[test]
+    fn a_real_aomenc_stream_with_palette_uv_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_stream_with_palette_uv_decodes_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let source = "testsrc2=size=64x64:rate=25";
+        fn render(source: &str) -> Vec<u8> {
+            Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    source,
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-t",
+                    "0.16",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run")
+                .stdout
+        }
+        let y4m_a = render(source);
+        let y4m_b = render(source);
+        assert_eq!(
+            y4m_a, y4m_b,
+            "testsrc2 must render byte-identical across two runs"
+        );
+        let y4m = y4m_a;
+        let mut child = Command::new(aomenc_path())
+            .args([
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                "--cq-level=30",
+                "--cpu-used=0",
+                "--threads=1",
+                "--row-mt=0",
+                "--sb-size=64",
+                "--tune-content=screen",
+                "--enable-palette=1",
+                "--enable-intrabc=0",
+                "--enable-rect-partitions=0",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0",
+                "--min-partition-size=32",
+                "--max-partition-size=32",
+                "--enable-filter-intra=0",
+                "--enable-cdef=0",
+                "--enable-restoration=0",
+                "--enable-tx-size-search=0",
+                "--loopfilter-control=0",
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("aomenc failed to start");
+        child
+            .stdin
+            .take()
+            .expect("aomenc stdin")
+            .write_all(&y4m)
+            .expect("writing y4m to aomenc");
+        let out = child.wait_with_output().expect("aomenc failed to run");
+        assert!(
+            out.status.success(),
+            "aomenc refused the fixture: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stream = out.stdout;
+        let before = decode::palette_uv_hits();
+        let frames = match decode_stream(&stream) {
+            Ok(frames) => frames,
+            Err(e) => panic!("{NAME}: decode_stream refused: {e}"),
+        };
+        assert!(
+            decode::palette_uv_hits() > before,
+            "palette_uv_mode never fired decoding this stream -- gate is vacuous"
+        );
+        let frame_count = frames.len();
+        let ffmpeg_frames = ffmpeg_decode_sequence(&stream, 64, 64, frame_count);
+        for i in 0..frame_count {
+            assert_eq!(frames[i].y, ffmpeg_frames[i].y, "luma vs ffmpeg, frame {i}");
+            assert_eq!(frames[i].u, ffmpeg_frames[i].u, "U vs ffmpeg, frame {i}");
+            assert_eq!(frames[i].v, ffmpeg_frames[i].v, "V vs ffmpeg, frame {i}");
+        }
+    }
+
     /// As [`a_real_aomenc_filter_intra_stream_decodes_pixel_exact`]'s
     /// harness, but with the deblocking filter left *on* (no
     /// `--loopfilter-control=0`) at a crf high enough that libaom actually
