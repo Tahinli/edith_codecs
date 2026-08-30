@@ -3539,6 +3539,8 @@ pub fn decode_key_frame_tile(
     loop_filter: &LoopFilterParams,
     tx_select: bool,
     reduced_tx_set: bool,
+    allow_screen_content_tools: bool,
+    allow_intrabc: bool,
 ) -> Result<Picture> {
     decode_key_frame_tile_with_cdfs(
         data,
@@ -3554,6 +3556,8 @@ pub fn decode_key_frame_tile(
         None,
         tx_select,
         reduced_tx_set,
+        allow_screen_content_tools,
+        allow_intrabc,
     )
     .map(|(picture, _)| picture)
 }
@@ -3580,6 +3584,8 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     initial_cdfs: Option<Cdfs>,
     tx_select: bool,
     reduced_tx_set: bool,
+    allow_screen_content_tools: bool,
+    allow_intrabc: bool,
 ) -> Result<(Picture, Cdfs)> {
     if mi_cols == 0 || mi_rows == 0 {
         return Err(unsupported("a frame with no mode-info grid"));
@@ -9388,6 +9394,8 @@ mod tests {
                 &LoopFilterParams::default(),
                 false,
                 true,
+                false,
+                false,
             )
             .is_err()
         );
@@ -9430,6 +9438,8 @@ mod tests {
             &LoopFilterParams::default(),
             false,
             true,
+            false,
+            false,
         )
         .unwrap();
         assert_eq!(decoded.width, w, "{w}x{h}: decoded width");
@@ -9513,6 +9523,8 @@ mod tests {
             &LoopFilterParams::default(),
             false,
             true,
+            false,
+            false,
         )
         .unwrap();
         assert!(
@@ -9698,6 +9710,8 @@ mod tests {
                 &LoopFilterParams::default(),
                 false,
                 true,
+                false,
+                false,
             )
             .unwrap();
             assert_eq!(ours.y, ffmpeg_decoded.y, "{width}x{height}: luma vs ffmpeg");
@@ -9770,6 +9784,8 @@ mod tests {
             &LoopFilterParams::default(),
             false,
             true,
+            false,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -10073,6 +10089,8 @@ mod tests {
             &LoopFilterParams::default(),
             false,
             true,
+            false,
+            false,
         )
         .unwrap();
         assert_eq!(reference.y, ffmpeg_frames[0].y, "frame 0 luma vs ffmpeg");
