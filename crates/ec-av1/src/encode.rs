@@ -996,6 +996,14 @@ const HAS_BOTTOM_LEFT: [&[u8]; 3] = [
     ],
 ];
 
+/// `has_tr_32x16`/`has_tr_16x32` (libaom `reconintra.c`) -- lane-intradisp
+/// r1: the two rect strips PARTITION_HORZ/VERT ever produce at the 32x32
+/// level, transcribed verbatim (not derived): `[0]` is 32-wide, `[1]` is
+/// 16-wide.
+const HAS_TOP_RIGHT_RECT: [&[u8]; 2] = [&[15, 5, 7, 5], &[255, 119, 127, 119]];
+/// `has_bl_32x16`/`has_bl_16x32`, same source, same order.
+const HAS_BOTTOM_LEFT_RECT: [&[u8]; 2] = [&[78, 14, 78, 14], &[16, 0, 16, 0]];
+
 impl Reach {
     /// What a block of `side` samples at `(x, y)` may read past its own edges,
     /// in a frame of `width` by `height`.
@@ -1004,6 +1012,58 @@ impl Reach {
             above_right: y > 0 && x + side < width && Self::top_right(side, x, y),
             below_left: x > 0 && y + side < height && Self::bottom_left(side, x, y),
         }
+    }
+
+    /// [`Self::of`] for a true `bw`x`bh` rectangular block (lane-intradisp
+    /// r1) -- `libaom`'s `has_top_right`/`has_bottom_left` index by the
+    /// block's own width for the row stride and by its own height for the
+    /// row/column position (`reconintra.c`'s `bw_in_mi_log2`/`bh_in_mi_log2`),
+    /// unlike the square [`Self::of`] which uses one `side` for everything.
+    pub(crate) fn of_rect(
+        bw: usize,
+        bh: usize,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+    ) -> Self {
+        Self {
+            above_right: y > 0 && x + bw < width && Self::top_right_rect(bw, bh, x, y),
+            below_left: x > 0 && y + bh < height && Self::bottom_left_rect(bw, bh, x, y),
+        }
+    }
+
+    fn position_rect(bw: usize, bh: usize, x: usize, y: usize) -> (usize, usize, usize, usize) {
+        (
+            (y % SUPERBLOCK) / bh,
+            (x % SUPERBLOCK) / bw,
+            SUPERBLOCK / bh,
+            SUPERBLOCK / bw,
+        )
+    }
+
+    fn top_right_rect(bw: usize, bh: usize, x: usize, y: usize) -> bool {
+        let (row, col, _per_row, per_col) = Self::position_rect(bw, bh, x, y);
+        if row == 0 {
+            return true;
+        }
+        if col + 1 == per_col {
+            return false;
+        }
+        let table = HAS_TOP_RIGHT_RECT[usize::from(bw == 16)];
+        Self::bit(table, (row * Self::table_stride(bw) + col) % (table.len() * 8))
+    }
+
+    fn bottom_left_rect(bw: usize, bh: usize, x: usize, y: usize) -> bool {
+        let (row, col, per_row, _per_col) = Self::position_rect(bw, bh, x, y);
+        if col == 0 {
+            return row * bh + bh < SUPERBLOCK;
+        }
+        if row + 1 == per_row {
+            return false;
+        }
+        let table = HAS_BOTTOM_LEFT_RECT[usize::from(bw == 16)];
+        Self::bit(table, (row * Self::table_stride(bw) + col) % (table.len() * 8))
     }
 
     /// Neither, which is all a mode that reads no further than its own edges
