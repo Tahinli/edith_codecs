@@ -301,11 +301,16 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         // of `skip_mode_frame`, plain average blend), so the old blanket
         // `skip_mode_present` refusal is gone.
         // `context_update_tile_id` (spec `decode_tile`/`exit_symbol`) names
-        // which tile's end-of-tile adapted CDFs become the frame's own; this
-        // decoder still only ever *keeps* tile 0's adapted table (see the
-        // `context_update_tile_id != 0` refusal further down), so any frame
-        // naming a different tile there is refused rather than silently
-        // forwarding the wrong tile's table.
+        // which tile's end-of-tile adapted CDFs become the frame's own.
+        // lane-tiles r8: this comment used to claim a `!= 0` refusal existed
+        // "further down" -- it did not (`decode.rs` reads
+        // `tile_info.context_update_tile_id` generically at both the
+        // key-frame and inter-frame tile loops' `result_cdfs = cdfs` sites,
+        // never hardcoded to tile 0); stale documentation, not a real gap.
+        // `a_real_aomenc_stream_with_four_tile_rows_decodes_pixel_exact`
+        // hard-asserts a live aomenc stream naming tile 1/2/3 decodes
+        // pixel-exact, so the capability is now proven as well as described
+        // correctly.
         //
         // lane-tiles r4/r6/r7/r8: the multi-tile refusal itself is scoped,
         // not blanket. `decode_key_frame_tile_with_cdfs` and (r6)
@@ -6743,7 +6748,16 @@ mod tests {
     /// mirroring why the column gate needed 4 columns rather than 3). 64x256
     /// is four 64x64 superblocks tall with `--sb-size=64`, one per tile row.
     /// Loop filter ON, run through `decode_stream` itself since the
-    /// `rows > 1` refusal is already lifted by this commit.
+    /// `rows > 1` refusal is already lifted by this commit. Also settles a
+    /// stale documentation claim found while writing this gate: the old
+    /// comment above `decode_stream`'s multi-tile block said
+    /// `context_update_tile_id != 0` was refused "further down" -- no such
+    /// refusal exists (`decode.rs` reads `tile_info.context_update_tile_id`
+    /// generically, never hardcoded to tile 0), and this fixture's own
+    /// aomenc runs pick 1/2/3 as often as 0 (RD-driven tile-size heuristic),
+    /// all 20/20 pixel-exact -- so the capability was already there,
+    /// undocumented and unproven; hard-asserted here so the proof can't go
+    /// unnoticed if it stops firing.
     #[test]
     fn a_real_aomenc_stream_with_four_tile_rows_decodes_pixel_exact() {
         const NAME: &str = "a_real_aomenc_stream_with_four_tile_rows_decodes_pixel_exact";
@@ -6758,6 +6772,7 @@ mod tests {
         let (width, height) = (64usize, 256usize);
         let mut matched = 0u32;
         let mut named_refusals = 0u32;
+        let mut saw_nonzero_context_update_tile_id = false;
         for attempt in 0..20u32 {
             let seed = 42 + attempt;
             let source = gradients_source(seed, width, height, "duration=0.04:rate=25");
@@ -6838,6 +6853,9 @@ mod tests {
                 pos += obu.total_size;
                 if let ObuKind::Frame(header, _) = &obu.kind {
                     rows_seen = header.tile_info.rows;
+                    if header.tile_info.context_update_tile_id != 0 {
+                        saw_nonzero_context_update_tile_id = true;
+                    }
                 }
             }
             assert!(
@@ -6877,6 +6895,13 @@ mod tests {
             matched > 0,
             "{NAME}: every attempt refused ({named_refusals} refusals); the gate never decoded \
              a four-tile-row stream"
+        );
+        assert!(
+            saw_nonzero_context_update_tile_id,
+            "{NAME}: every attempt named context_update_tile_id=0 -- this sweep proves nothing \
+             about the != 0 case (see the stale-refusal note above `decode_stream`'s multi-tile \
+             comment: aomenc's own tile-size heuristic picks it, seen 1/2/3 live in a prior probe \
+             run of this exact fixture, so a 20-attempt window not seeing it is the gate's own bug)"
         );
         eprintln!(
             "{NAME}: {matched} pixel-exact matches, {named_refusals} named refusals out of 20"
