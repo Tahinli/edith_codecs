@@ -228,7 +228,7 @@ impl InterpFilterKind {
 /// whatever this encoder's own uncoded padding columns/rows hold.
 #[allow(clippy::too_many_arguments)]
 fn sample(
-    reference: &[u8],
+    reference: &[u16],
     stride: usize,
     true_width: usize,
     true_height: usize,
@@ -258,7 +258,7 @@ fn sample(
 /// empty.
 #[allow(clippy::too_many_arguments)] // one reference plane, one position, one block shape
 pub fn predict(
-    reference: &[u8],
+    reference: &[u16],
     stride: usize,
     true_width: usize,
     true_height: usize,
@@ -266,7 +266,7 @@ pub fn predict(
     y_q4: i32,
     block_w: usize,
     block_h: usize,
-    dst: &mut [u8],
+    dst: &mut [u16],
 ) {
     predict_with_filter(
         reference,
@@ -287,7 +287,7 @@ pub fn predict(
 /// kernel both directions.
 #[allow(clippy::too_many_arguments)]
 pub fn predict_with_filter(
-    reference: &[u8],
+    reference: &[u16],
     stride: usize,
     true_width: usize,
     true_height: usize,
@@ -296,7 +296,7 @@ pub fn predict_with_filter(
     block_w: usize,
     block_h: usize,
     filter_kind: InterpFilterKind,
-    dst: &mut [u8],
+    dst: &mut [u16],
 ) {
     predict_with_filters(
         reference,
@@ -319,7 +319,7 @@ pub fn predict_with_filter(
 /// so the two passes can genuinely differ.
 #[allow(clippy::too_many_arguments)]
 pub fn predict_with_filters(
-    reference: &[u8],
+    reference: &[u16],
     stride: usize,
     true_width: usize,
     true_height: usize,
@@ -329,7 +329,7 @@ pub fn predict_with_filters(
     block_h: usize,
     h_kind: InterpFilterKind,
     v_kind: InterpFilterKind,
-    dst: &mut [u8],
+    dst: &mut [u16],
 ) {
     assert_eq!(dst.len(), block_w * block_h, "the destination is the block");
     assert!(!reference.is_empty(), "a reference plane has samples");
@@ -360,7 +360,7 @@ pub fn predict_with_filters(
             for col in 0..block_w {
                 let x = x0 + col as i32;
                 dst[row * block_w + col] =
-                    sample(reference, stride, true_width, true_height, x, y) as u8;
+                    sample(reference, stride, true_width, true_height, x, y) as u16;
             }
         }
         #[cfg(test)]
@@ -403,7 +403,7 @@ pub fn predict_with_filters(
             for (t, &tap) in v_filter.iter().enumerate() {
                 sum += tap * intermediate[(row + t) * block_w + col];
             }
-            dst[row * block_w + col] = round2(sum, INTER_ROUND_1).clamp(0, 255) as u8;
+            dst[row * block_w + col] = round2(sum, INTER_ROUND_1).clamp(0, crate::decode::sample_max()) as u16;
         }
     }
 
@@ -445,7 +445,7 @@ const DIST_PRECISION_BITS: u32 = 4;
 /// empty.
 #[allow(clippy::too_many_arguments)]
 pub fn predict_compound_intermediate(
-    reference: &[u8],
+    reference: &[u16],
     stride: usize,
     true_width: usize,
     true_height: usize,
@@ -515,13 +515,13 @@ pub fn combine_compound(
     pred1: &[i32],
     fwd_weight: i32,
     bck_weight: i32,
-    dst: &mut [u8],
+    dst: &mut [u16],
 ) {
     assert_eq!(pred0.len(), pred1.len(), "both refs predict the same block");
     assert_eq!(dst.len(), pred0.len(), "the destination is the block");
     for i in 0..dst.len() {
         let sum = pred0[i] * fwd_weight + pred1[i] * bck_weight;
-        dst[i] = round2(sum, INTER_POST_ROUND + DIST_PRECISION_BITS).clamp(0, 255) as u8;
+        dst[i] = round2(sum, INTER_POST_ROUND + DIST_PRECISION_BITS).clamp(0, crate::decode::sample_max()) as u16;
     }
 }
 
@@ -564,7 +564,7 @@ pub fn blend_masked_compound(
     w: usize,
     h: usize,
     subsampled: bool,
-    dst: &mut [u8],
+    dst: &mut [u16],
 ) {
     assert_eq!(pred0.len(), w * h, "pred0 is the destination-sized block");
     assert_eq!(pred1.len(), w * h, "pred1 is the destination-sized block");
@@ -584,7 +584,7 @@ pub fn blend_masked_compound(
                 i32::from(mask[i * mask_stride + j])
             };
             let res = (m * pred0[i * w + j] + (64 - m) * pred1[i * w + j]) >> 6;
-            dst[i * w + j] = round2(res, INTER_POST_ROUND).clamp(0, 255) as u8;
+            dst[i * w + j] = round2(res, INTER_POST_ROUND).clamp(0, crate::decode::sample_max()) as u16;
         }
     }
 }
