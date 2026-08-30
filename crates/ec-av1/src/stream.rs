@@ -166,10 +166,15 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         // (spec 5.11.10/5.11.11, one symbol group per superblock). Refuse
         // before desyncing rather than silently miscode, the same pattern as
         // the CDEF/TxMode::Select refusals above.
-        if header.allow_screen_content_tools {
+        // Key frames now consume (not reconstruct) palette/intrabc syntax
+        // via read_intra_mode, so the arithmetic decoder stays in sync;
+        // decode_inter_block/decode_inter_block8's intra-sub-block branches
+        // still have no such wiring, so a non-key frame with the bit set
+        // still desyncs and must refuse.
+        if header.frame_type != FrameType::Key && header.allow_screen_content_tools {
             return Err(Error::unsupported(
                 "AV1 decode_stream",
-                "a frame with allow_screen_content_tools set (this decoder never reads intrabc/palette_mode_info)",
+                "a non-key frame with allow_screen_content_tools set (this decoder's inter path never reads intrabc/palette_mode_info)",
             ));
         }
         if header.delta.q_present || header.delta.lf_present {
@@ -313,6 +318,8 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 initial_cdfs,
                 header.tx_mode == TxMode::Select,
                 header.reduced_tx_set,
+                header.allow_screen_content_tools,
+                header.allow_intrabc,
             )?;
             // A key frame codes no inter blocks -- its own saved motion
             // field has no cells set, matching libaom's own "intra frame
@@ -535,6 +542,8 @@ mod tests {
                 false,
                 // Our own encoder always writes `reduced_tx_set: true`.
                 true,
+                false,
+                false,
             )
             .unwrap();
             let via_stream = decode_stream(&encoded.stream).unwrap();
