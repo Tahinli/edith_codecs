@@ -46,6 +46,85 @@ fn round2(value: i64, n: u32) -> i64 {
     (value + (1i64 << n >> 1)) >> n
 }
 
+/// `GM_TRANS_ONLY_PREC_DIFF` (`av1/common/mv.h`): `WARPEDMODEL_PREC_BITS
+/// (16) - 3`, the extra precision a `TRANSLATION` global-motion param has
+/// over a 1/8-pel mv.
+const GM_TRANS_ONLY_PREC_DIFF: u32 = WARPEDMODEL_PREC_BITS - 3;
+
+/// `convert_to_trans_prec` (`av1/common/mv.h`): projects a
+/// `WARPEDMODEL_PREC_BITS`-fixed-point coordinate down to 1/8-pel
+/// (`allow_high_precision_mv`) or 1/4-pel-then-doubled (not high precision).
+fn convert_to_trans_prec(allow_high_precision_mv: bool, x: i64) -> i32 {
+    if allow_high_precision_mv {
+        round2_signed(x, WARPEDMODEL_PREC_BITS - 3) as i32
+    } else {
+        (round2_signed(x, WARPEDMODEL_PREC_BITS - 2) as i32) * 2
+    }
+}
+
+/// `lower_mv_precision`'s `force_integer_mv` half, applied per component
+/// (spec 7.10.2.1's `integer_mv_precision`): rounds a 1/8-pel value to the
+/// nearest full pel (multiple of 8), ties biased away from zero.
+fn integer_mv_precision(v: i32) -> i32 {
+    let md = v % 8;
+    if md != 0 {
+        let mut v = v - md;
+        if md.abs() > 4 {
+            v += if md > 0 { 8 } else { -8 };
+        }
+        v
+    } else {
+        v
+    }
+}
+
+/// `gm_get_motion_vector` (`av1/common/mv.h:231`): the motion vector a
+/// `GLOBALMV`/`GLOBAL_GLOBALMV` block predicts with, derived from the
+/// frame's own global-motion model for `ref_frame` at this block's centre
+/// -- spec 7.10.2.1. `bw4`/`bh4` are the block's size in 4x4 units.
+/// `IDENTITY` returns `(0, 0)`; `TRANSLATION` keeps the spec's own
+/// swapped-axis bug (`row` reads `wmmat[0]`, `col` reads `wmmat[1]`) rather
+/// than "fixing" it -- that is what real encoders/decoders exchange.
+#[allow(clippy::too_many_arguments)]
+pub fn gm_get_motion_vector(
+    model: ec_av1_syntax::WarpModel,
+    params: &[i32; 6],
+    mi_row: usize,
+    mi_col: usize,
+    bw4: usize,
+    bh4: usize,
+    allow_high_precision_mv: bool,
+    force_integer_mv: bool,
+) -> (i32, i32) {
+    use ec_av1_syntax::WarpModel;
+    let (row, col) = match model {
+        WarpModel::Identity => (0, 0),
+        WarpModel::Translation => (
+            params[0] >> GM_TRANS_ONLY_PREC_DIFF,
+            params[1] >> GM_TRANS_ONLY_PREC_DIFF,
+        ),
+        WarpModel::Rotzoom | WarpModel::Affine => {
+            let x = (mi_col * MI_SIZE as usize + (bw4 * MI_SIZE as usize) / 2) as i64;
+            let y = (mi_row * MI_SIZE as usize + (bh4 * MI_SIZE as usize) / 2) as i64;
+            let xc = (params[2] as i64 - (1i64 << WARPEDMODEL_PREC_BITS)) * x
+                + params[3] as i64 * y
+                + params[0] as i64;
+            let yc = params[4] as i64 * x
+                + (params[5] as i64 - (1i64 << WARPEDMODEL_PREC_BITS)) * y
+                + params[1] as i64;
+            (
+                convert_to_trans_prec(allow_high_precision_mv, yc),
+                convert_to_trans_prec(allow_high_precision_mv, xc),
+            )
+        }
+    };
+    if force_integer_mv {
+        (integer_mv_precision(row), integer_mv_precision(col))
+    } else {
+        (row, col)
+    }
+}
+
 /// `get_msb` (`aom_ports/bitops.h`): index of the highest set bit.
 fn get_msb64(n: u64) -> i32 {
     debug_assert!(n != 0);
@@ -653,3 +732,69 @@ const DIV_LUT: [u16; 257] = [
     8422, 8405, 8389, 8372, 8355, 8339, 8322, 8306, 8289, 8273, 8257,
     8240, 8224, 8208, 8192,
 ];
+
+#[cfg(test)]
+mod gm_mv_tests {
+    use super::gm_get_motion_vector;
+    use ec_av1_syntax::WarpModel;
+
+    /// `TRANSLATION`: `row = wmmat[0] >> 13`, `col = wmmat[1] >> 13` (spec's
+    /// own swapped-axis bug, kept). `100000 >> 13 = 12` (`100000 / 8192 =
+    /// 12.207`, floor 12); `-50000 >> 13 = -7` (`-50000 / 8192 = -6.1035`,
+    /// floor -7, arithmetic shift rounds toward -inf).
+    #[test]
+    fn translation_shifts_params_by_13() {
+        let params = [100_000, -50_000, 1 << 16, 0, 0, 1 << 16];
+        let mv = gm_get_motion_vector(WarpModel::Translation, &params, 0, 0, 2, 2, true, false);
+        assert_eq!(mv, (12, -7));
+    }
+
+    /// `ROTZOOM`, block centre `x = mi_col*4 + bw4*4/2 = 2*4 + 4*4/2 = 16`,
+    /// `y = mi_row*4 + bh4*4/2 = 1*4 + 4*4/2 = 12`.
+    /// `xc = (params[2]-2^16)*x + params[3]*y + params[0]`
+    ///    `= 500*16 + 100*12 + 1000 = 8000 + 1200 + 1000 = 10200`.
+    /// `yc = params[4]*x + (params[5]-2^16)*y + params[1]`
+    ///    `= -50*16 + (-300)*12 + 2000 = -800 - 3600 + 2000 = -2400`.
+    /// `hp`: `row = Round2Signed(yc,13) = -Round2(2400,13) = -((2400+4096)>>13)
+    ///    = -(6496>>13) = -0 = 0`; `col = Round2Signed(xc,13) =
+    ///    (10200+4096)>>13 = 14296>>13 = 1`.
+    #[test]
+    fn rotzoom_projects_block_centre_hp() {
+        let params = [1000, 2000, (1 << 16) + 500, 100, -50, (1 << 16) - 300];
+        let mv = gm_get_motion_vector(WarpModel::Rotzoom, &params, 1, 2, 4, 4, true, false);
+        assert_eq!(mv, (0, 1));
+    }
+
+    /// Same model/geometry as [`rotzoom_projects_block_centre_hp`], not high
+    /// precision: `convert_to_trans_prec` shifts by 14 instead of 13 then
+    /// doubles. `row = -Round2(2400,14)*2 = -((2400+8192)>>14)*2 =
+    /// -(10592>>14)*2 = 0`; `col = Round2(10200,14)*2 = ((10200+8192)>>14)*2
+    /// = (18392>>14)*2 = 1*2 = 2`.
+    #[test]
+    fn rotzoom_projects_block_centre_no_hp() {
+        let params = [1000, 2000, (1 << 16) + 500, 100, -50, (1 << 16) - 300];
+        let mv = gm_get_motion_vector(WarpModel::Rotzoom, &params, 1, 2, 4, 4, false, false);
+        assert_eq!(mv, (0, 2));
+    }
+
+    /// `force_integer_mv`'s `integer_mv_precision`, applied to
+    /// [`translation_shifts_params_by_13`]'s raw `(12, -7)`: `12 % 8 = 4`,
+    /// `abs(4) > 4` false, so `12 -> 12-4 = 8`. `-7 % 8 = -7` (Rust's
+    /// truncating `%`), `abs(-7) > 4` true and `-7 < 0`, so
+    /// `-7 -> (-7 - (-7)) - 8 = -8`.
+    #[test]
+    fn translation_force_integer_mv_rounds_to_full_pel() {
+        let params = [100_000, -50_000, 1 << 16, 0, 0, 1 << 16];
+        let mv = gm_get_motion_vector(WarpModel::Translation, &params, 0, 0, 2, 2, true, true);
+        assert_eq!(mv, (8, -8));
+    }
+
+    #[test]
+    fn identity_is_always_zero() {
+        let params = [999, -999, (1 << 16) + 1, 5, 5, (1 << 16) - 1];
+        assert_eq!(
+            gm_get_motion_vector(WarpModel::Identity, &params, 3, 4, 4, 4, true, false),
+            (0, 0)
+        );
+    }
+}
