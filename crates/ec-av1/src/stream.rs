@@ -3183,11 +3183,21 @@ mod tests {
         let mut refusals = Vec::new();
         let mut never_fired = 0u32;
         let mut total_obmc8 = 0usize;
-        for attempt in 0..80u32 {
+        let n_attempts: u32 = std::env::var("EC_OBMC8_ATTEMPTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(80);
+        for attempt in 0..n_attempts {
             let seed = 42 + attempt % 40;
             let duration = frame_count as f64 / 25.0;
-            let source =
-                format!("gradients=size={width}x{height}:seed={seed}:duration={duration}:rate=25");
+            // Recipe search hook: `gradients` is smooth, so aomenc's RD never
+            // splits below 16x16 and this gate never fired one 8x8 OBMC block
+            // in 45 attempts -- it "passed" by skipping (gate-blind-to-feature).
+            // EC_AV1_OBMC8_SOURCE overrides the lavfi source so a firing recipe
+            // can be searched for without a rebuild.
+            let source = std::env::var("EC_AV1_OBMC8_SOURCE").unwrap_or_else(|_| {
+                format!("gradients=size={width}x{height}:seed={seed}:duration={duration}:rate=25")
+            });
             let y4m = Command::new("ffmpeg")
                 .args([
                     "-v",
