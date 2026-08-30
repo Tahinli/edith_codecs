@@ -5979,7 +5979,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                             }
                                             if part8 != PARTITION_NONE {
                                                 return Err(unsupported(
-                                                    "a partition below 8x8 (this encoder never writes one)",
+                                                    "a partition below 8x8 (this decoder codes no leaf smaller than 8x8)",
                                                 ));
                                             }
                                             let leaf_mode = decode_leaf8(
@@ -6050,7 +6050,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                         }
                                         if part8 != PARTITION_NONE {
                                             return Err(unsupported(
-                                                "a partition below 8x8 (this encoder never writes one)",
+                                                "a partition below 8x8 (this decoder codes no leaf smaller than 8x8)",
                                             ));
                                         }
                                         let leaf_mode = decode_leaf8(
@@ -11000,7 +11000,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     let part8 = dec.symbol(&mut cdfs.partition_w8[leaf_ctx]);
                                     if part8 != PARTITION_NONE {
                                         return Err(unsupported(
-                                            "a partition below 8x8 (this encoder never writes one)",
+                                            "a partition below 8x8 (this decoder codes no leaf smaller than 8x8)",
                                         ));
                                     }
                                     let (skip, is_inter, skip_mode_leaf, compound_ctx8) =
