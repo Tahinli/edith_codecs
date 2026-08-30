@@ -34,7 +34,6 @@
 #[cfg(test)]
 const NEVER_EXERCISED: &[(&str, &str)] = &[
     ("enable-intrabc", "intra block copy syntax is consumed but no block is reconstructed from it"),
-    ("enable-palette", "palette syntax is consumed but no block is reconstructed from a palette"),
 ];
 
 #[cfg(test)]

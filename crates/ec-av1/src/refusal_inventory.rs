@@ -55,6 +55,7 @@ const REFUSALS: &[&str] = &[
     "a frame with no mode-info grid",
     "a frame with segmentation enabled (this decoder never reads a per-block segment_id symbol)",
     "a non-skip rectangular (HORZ/VERT/HORZ_B) strip needs rectangular residual coding",
+    "a palette block with a split luma transform (round 1)",
     "a reference frame other than LAST_FRAME (round 2)",
     "a reference frame selected with no picture at this frame's own ref_frame_idx slot for it",
     "a reference picture that is not this frame's own true size",
