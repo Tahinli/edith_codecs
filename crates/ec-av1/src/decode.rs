@@ -3007,7 +3007,19 @@ fn read_intra_mode(
     // per `read_palette_mode_info`'s own `pmi->palette_size[0] > 0` (not a
     // neighbour lookup at all), so it is exact even at the excluded call
     // sites once Y decodes real syntax there too.
-    let mut palette_y = None;
+    //
+    // lane-palette r7: libaom's `decode_color_map_tokens` is NOT called
+    // inline from `read_palette_mode_info` -- it runs later, from
+    // `parse_decode_block` (`decodeframe.c:1135`, `av1_visit_palette`),
+    // after the WHOLE mode-info read for the block, including UV palette
+    // mode_info (`read_palette_mode_info`'s own second half, right below)
+    // and `read_filter_intra_mode_info`. So this branch now only reads
+    // mode/size/colours for both planes (deferring the two colour-index-map
+    // decodes to after `filter_intra`, below) -- r6's range trace pinned
+    // this exact ordering bug (`compare-range-not-tell`: ranges matched
+    // bit-for-bit through the Y colours, diverged only at the old inline
+    // `decode_color_index_map` call).
+    let mut palette_y_pending: Option<(usize, [u16; 8])> = None;
     if allow_screen_content_tools
         && let Some(bsize_ctx) = palette_bsize_ctx(side)
     {
@@ -3042,32 +3054,18 @@ fn read_intra_mode(
                 let (rng, _) = dec.debug_state();
                 eprintln!("TRACE palette_y_colors colors={:?} rng={rng}", &colors[..n]);
             }
-            let map = decode_color_index_map(dec, cdfs, n, side);
-            PALETTE_HITS.with(|c| c.set(c.get() + 1));
-            if trace {
-                eprintln!("TRACE palette_y size={n} colors={:?}", &colors[..n]);
-            }
-            // lane-palette r3/r4: `read_palette_colors_y`, `read_uniform`,
-            // `palette_color_index_context` and the `PALETTE_Y_COLOR_INDEX`
-            // CDF table all match the oracle line-for-line (r3), and the
-            // wavefront's decoded base colours are independently correct
-            // (`[112, 131, 162, 180]`, real SMPTE-bar levels) -- but the
-            // reconstructed pixels this index map produces still do not
-            // match ffmpeg's decode of the same bytes (r3's
-            // `a_real_aomenc_stream_with_palette_y_refuses_by_name`).
-            // Refuse by name rather than hand back wrong pixels: every
-            // symbol above is still consumed exactly as read (so
-            // `palette_hits()` keeps proving this path is reached), the
-            // reconstruction code below stays in place for when the
-            // desync is found, and the caller sees a named refusal instead
-            // of silently-wrong output.
-            let _ = PaletteY { size: n, colors, map };
-            return Err(unsupported(
-                "a block that actually uses a palette (Y) -- the index map decodes but the \
-                 reconstructed pixels do not match libaom yet (lane-palette r3/r4)",
-            ));
+            palette_y_pending = Some((n, colors));
         }
-        let palette_uv_mode_ctx = usize::from(palette_y.is_some());
+        // `read_palette_mode_info`'s UV half (decodemv.c:588): read
+        // unconditionally at this bit position whenever `uv_mode ==
+        // UV_DC_PRED`, regardless of whether Y just fired -- this decoder's
+        // scope always reconstructs chroma alongside luma (`decode_block`
+        // always calls `u.reconstruct`/`v.reconstruct`), so `is_chroma_ref`
+        // is always true here and does not need threading in. UV palette
+        // reconstruction stays out of scope: refusing the moment the mode
+        // symbol fires needs no further reads (the whole decode aborts),
+        // so `palette_uv_size`/`read_palette_colors_uv` are never reached.
+        let palette_uv_mode_ctx = usize::from(use_palette_y);
         if uv_mode == DC_PRED && dec.symbol(&mut cdfs.palette_uv_mode[palette_uv_mode_ctx]) != 0 {
             return Err(unsupported(
                 "a block that actually uses a palette (UV) -- reconstruction is out of scope",
@@ -3102,6 +3100,19 @@ fn read_intra_mode(
             filter_intra = Some(fi_mode);
         }
     }
+    // `av1_visit_palette` (decoder.c:234): the colour-index-map decode runs
+    // here, after every mode-info symbol for the block (including UV
+    // palette and filter_intra above) -- plane 0 (Y) only in this decoder's
+    // scope, since UV palette already refused by name above and never left
+    // a pending map to decode.
+    let palette_y = palette_y_pending.map(|(n, colors)| {
+        let map = decode_color_index_map(dec, cdfs, n, side);
+        PALETTE_HITS.with(|c| c.set(c.get() + 1));
+        if trace {
+            eprintln!("TRACE palette_y size={n} colors={:?}", &colors[..n]);
+        }
+        PaletteY { size: n, colors, map }
+    });
     Ok((
         skip,
         mode,
