@@ -6522,4 +6522,35 @@ mod tests {
             crate::decode::sb_rect_hits()
         );
     }
+
+    /// lane-sbpart r4: replays a pinned mismatch byte-for-byte off disk (no
+    /// aomenc/ffmpeg re-encode), same pattern as `pinned_golden3/4_stream_
+    /// decodes_pixel_exact` -- fast red/green loop for the bisect, and lets
+    /// `EC_AV1_TRACE=1` be set for one run without re-driving the encoder.
+    #[test]
+    #[ignore = "reads a pinned fixture path outside the repo; run manually"]
+    fn pinned_sbpart_stream_decodes_pixel_exact() {
+        let path = std::env::var("EC_AV1_GATE_DUMP_PIN")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| pin_dir().join("sbpart-pin.obu"));
+        let Ok(stream) = std::fs::read(&path) else {
+            eprintln!(
+                "SKIP pinned_sbpart_stream_decodes_pixel_exact: no pinned bytes at {} \
+                 -- re-capture with EC_AV1_GATE_DUMP off the sbpart gate",
+                path.display()
+            );
+            return;
+        };
+        if !have_ffmpeg() {
+            eprintln!("SKIP pinned_sbpart_stream_decodes_pixel_exact: no ffmpeg");
+            return;
+        }
+        let frames = decode_stream(&stream).expect("pinned stream must decode");
+        let ffmpeg_frames = ffmpeg_decode_sequence(&stream, 192, 128, 1);
+        for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+            assert_eq!(got.y, want.y, "frame {i} luma vs ffmpeg (pinned sbpart)");
+            assert_eq!(got.u, want.u, "frame {i} U vs ffmpeg (pinned sbpart)");
+            assert_eq!(got.v, want.v, "frame {i} V vs ffmpeg (pinned sbpart)");
+        }
+    }
 }
