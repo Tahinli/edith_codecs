@@ -168,6 +168,71 @@ fn maybe_read_delta_q(dec: &mut SymbolDecoder, cdfs: &mut Cdfs, mi_r: usize, mi_
     CURRENT_Q_IDX.with(|c| c.set((c.get() + reduced * res).clamp(1, 255)));
 }
 
+// lane-realworld r5: this frame's `delta.lf_present`/`lf_res`/`lf_multi`
+// (spec 5.9.18) -- same no-op-by-default corner-cut as `DELTA_Q_PRESENT`.
+thread_local! {
+    static DELTA_LF_PRESENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static DELTA_LF_RES: std::cell::Cell<i32> = const { std::cell::Cell::new(1) };
+    static DELTA_LF_MULTI: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+// The running per-plane/direction loop-filter delta (spec `DeltaLF[i]`,
+// `i` in `0..FRAME_LF_COUNT`) -- reset to `[0; 4]` at the top of every tile,
+// mutated only by [`maybe_read_delta_lf`]. `!delta_lf_multi` mode only ever
+// updates index 0 and every reader treats that as the value for all 4
+// indices (spec `read_delta_lf_params`'s own single-cdf branch).
+thread_local! {
+    static CURRENT_DELTA_LF: std::cell::Cell<[i32; 4]> = const { std::cell::Cell::new([0; 4]) };
+}
+// How many real `delta_lf_present` symbol groups [`maybe_read_delta_lf`] has
+// read -- the gate's proof the reader fired, mirroring [`DELTA_Q_HITS`].
+thread_local! {
+    static DELTA_LF_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`DELTA_LF_HITS`].
+pub(crate) fn delta_lf_hits() -> usize {
+    DELTA_LF_HITS.with(|c| c.get())
+}
+
+/// `read_delta_lflevel`/`read_delta_lf_params` (spec 5.11.11, libaom
+/// `decodemv.c:99-146,735-770`) -- same shape and same call-site gating as
+/// [`maybe_read_delta_q`] (spec order `delta_q -> delta_lf`), looped over
+/// `FRAME_LF_COUNT = 4` planes/directions when `delta_lf_multi` is set, or
+/// read once into index 0 otherwise.
+fn maybe_read_delta_lf(dec: &mut SymbolDecoder, cdfs: &mut Cdfs, mi_r: usize, mi_c: usize, is_whole_sb: bool, skip: bool) {
+    if !DELTA_LF_PRESENT.with(|c| c.get()) {
+        return;
+    }
+    if mi_r % SB_MI as usize != 0 || mi_c % SB_MI as usize != 0 {
+        return;
+    }
+    if is_whole_sb && skip {
+        return;
+    }
+    let multi = DELTA_LF_MULTI.with(|c| c.get());
+    let res = DELTA_LF_RES.with(|c| c.get());
+    let count = if multi { 4 } else { 1 };
+    let mut cur = CURRENT_DELTA_LF.with(|c| c.get());
+    for i in 0..count {
+        let mut abs = if multi {
+            dec.symbol(&mut cdfs.delta_lf_multi[i]) as i32
+        } else {
+            dec.symbol(&mut cdfs.delta_lf) as i32
+        };
+        const DELTA_LF_SMALL: i32 = 3;
+        if abs >= DELTA_LF_SMALL {
+            let rem_bits = dec.literal(3) + 1;
+            let thr = (1i32 << rem_bits) + 1;
+            abs = dec.literal(rem_bits) as i32 + thr;
+        }
+        let sign_negative = if abs != 0 { dec.literal(1) != 0 } else { true };
+        let reduced = if sign_negative { -abs } else { abs };
+        cur[i] = (cur[i] + reduced * res).clamp(-63, 63);
+        DELTA_LF_HITS.with(|c| c.set(c.get() + 1));
+    }
+    CURRENT_DELTA_LF.with(|c| c.set(cur));
+}
+
 /// `read_cdef` (spec 5.11.56, libaom `decodemv.c:read_cdef`), called right
 /// after `skip` is known at every block-decode call site. A no-op at
 /// `cdef.bits == 0` (0-bit literal, nothing to consume) -- and
@@ -1520,6 +1585,14 @@ struct Neighbours {
     /// widened from a bare `is_inter` bool, which collapsed every non-`LAST`
     /// reference onto `LAST_FRAME`'s own delta).
     ref_grid: Vec<i8>,
+    /// Per-4x4-mi snapshot of [`CURRENT_DELTA_LF`] at the moment this cell's
+    /// block was decoded (spec `DeltaLF[i]`, `i` in `0..FRAME_LF_COUNT`,
+    /// Y-vertical/Y-horizontal/U/V) -- lane-realworld r5: `lf_level`'s
+    /// per-block additive term, mirroring [`Self::ref_grid`]'s own snapshot
+    /// pattern. `!delta_lf_multi` mode broadcasts index 0 into all 4 slots
+    /// at write time ([`Self::fill_lf_grid_rect`]) so a reader never needs
+    /// to know which mode produced the value.
+    delta_lf_grid: Vec<[i8; 4]>,
     /// This tile's own top-left corner, in 4x4 mode-info units (spec
     /// `MiRowStart`/`MiColStart`) -- lane-tiles: every "is there really a
     /// neighbour" check compares against this instead of literal `0`, since a
@@ -1569,6 +1642,7 @@ impl Neighbours {
             tx_grid: vec![0u8; cols * (SUB / MI) * rows * (SUB / MI)],
             tx_h_grid: vec![0u8; cols * (SUB / MI) * rows * (SUB / MI)],
             ref_grid: vec![0i8; cols * (SUB / MI) * rows * (SUB / MI)],
+            delta_lf_grid: vec![[0i8; 4]; cols * (SUB / MI) * rows * (SUB / MI)],
             tile_row0_mi: 0,
             tile_col0_mi: 0,
         }
@@ -1630,6 +1704,12 @@ impl Neighbours {
         ref_frame: i8,
     ) {
         let (mi_r, mi_c) = at_mi;
+        let cur = CURRENT_DELTA_LF.with(|c| c.get());
+        let snapshot: [i8; 4] = if DELTA_LF_MULTI.with(|c| c.get()) {
+            std::array::from_fn(|i| cur[i].clamp(-63, 63) as i8)
+        } else {
+            [cur[0].clamp(-63, 63) as i8; 4]
+        };
         for rr in 0..h_mi {
             for cc in 0..w_mi {
                 let idx = (mi_r + rr) * self.skip_grid_cols_mi + (mi_c + cc);
@@ -1641,6 +1721,9 @@ impl Neighbours {
                 }
                 if let Some(cell) = self.ref_grid.get_mut(idx) {
                     *cell = ref_frame;
+                }
+                if let Some(cell) = self.delta_lf_grid.get_mut(idx) {
+                    *cell = snapshot;
                 }
             }
         }
@@ -2205,6 +2288,7 @@ fn read_intra_mode_rect(
     // both 64 here -- see this fn's own doc), so `is_whole_sb` is always
     // `false`.
     maybe_read_delta_q(dec, cdfs, mi_r, mi_c, false, skip);
+    maybe_read_delta_lf(dec, cdfs, mi_r, mi_c, false, skip);
     let above_ctx = INTRA_MODE_CTX[above_mode];
     let left_ctx = INTRA_MODE_CTX[left_mode];
     let mode = dec.symbol(&mut cdfs.kf_y_mode[above_ctx][left_ctx]);
@@ -2679,6 +2763,7 @@ fn read_intra_mode(
     // `segment_id`, `cdef`, `delta_q` -- `cdef` lands right here.
     maybe_read_cdef_idx(dec, mi_r, mi_c, skip);
     maybe_read_delta_q(dec, cdfs, mi_r, mi_c, side == 64, skip);
+    maybe_read_delta_lf(dec, cdfs, mi_r, mi_c, side == 64, skip);
     // `read_intrabc_info` (spec 5.11.13, libaom decodemv.c:693, called at
     // :811 right after `skip_txfm`/`segment_id`/`cdef`/`delta_q` and before
     // `mbmi->mode` is ever read): a `use_intrabc` symbol only present on an
@@ -4252,7 +4337,7 @@ fn unit_log2(px: u32) -> i32 {
 /// the flat `mode_deltas[1]` this used before was a `LAST_FRAME`-reachable
 /// wrong delta on every `GLOBALMV` block, masked while any `GOLDEN_FRAME`
 /// block anywhere aborted the whole stream's decode before comparison).
-fn lf_level(lf: &LoopFilterParams, plane_idx: usize, dir: usize, ref_frame: i8) -> i32 {
+fn lf_level(lf: &LoopFilterParams, plane_idx: usize, dir: usize, ref_frame: i8, delta_lf: i32) -> i32 {
     let base = i32::from(if plane_idx == 0 {
         lf.level[dir]
     } else if plane_idx == 1 {
@@ -4260,6 +4345,10 @@ fn lf_level(lf: &LoopFilterParams, plane_idx: usize, dir: usize, ref_frame: i8) 
     } else {
         lf.level[3]
     });
+    // spec 7.14.4: the per-superblock `DeltaLF` term applies before the
+    // ref/mode delta scaling below, and regardless of `delta_enabled`
+    // (that flag only gates `ref_deltas`/`mode_deltas`).
+    let base = (base + delta_lf).clamp(0, 63);
     if !lf.delta_enabled {
         return base;
     }
@@ -4311,9 +4400,12 @@ fn edge_params(
         tx_h_px_at(n, chroma, pv_mi_r, pv_mi_c)
     };
     let pv_ref = n.ref_grid[pv_mi_r * n.skip_grid_cols_mi + pv_mi_c];
+    let delta_idx = if plane_idx == 0 { dir } else { plane_idx + 1 };
+    let cur_delta_lf = i32::from(n.delta_lf_grid[mi_r * n.skip_grid_cols_mi + mi_c][delta_idx]);
+    let pv_delta_lf = i32::from(n.delta_lf_grid[pv_mi_r * n.skip_grid_cols_mi + pv_mi_c][delta_idx]);
 
-    let cur_level = lf_level(lf, plane_idx, dir, cur_ref);
-    let pv_level = lf_level(lf, plane_idx, dir, pv_ref);
+    let cur_level = lf_level(lf, plane_idx, dir, cur_ref, cur_delta_lf);
+    let pv_level = lf_level(lf, plane_idx, dir, pv_ref, pv_delta_lf);
     if cur_level == 0 && pv_level == 0 {
         return None;
     }
@@ -4882,6 +4974,9 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     CDEF_IDX_GRID.with(|g| *g.borrow_mut() = vec![0u8; sb_cols as usize * sb_rows as usize]);
     DELTA_Q_PRESENT.with(|c| c.set(delta.q_present));
     DELTA_Q_RES.with(|c| c.set(1i32 << delta.q_res));
+    DELTA_LF_PRESENT.with(|c| c.set(delta.lf_present));
+    DELTA_LF_RES.with(|c| c.set(1i32 << delta.lf_res));
+    DELTA_LF_MULTI.with(|c| c.set(delta.lf_multi));
     let (cols32, rows32) = block_grid(mi_cols, mi_rows);
     let (true_width, true_height) = ((mi_cols * 4) as usize, (mi_rows * 4) as usize);
     let (width, height) = (cols32 as usize * BLOCK, rows32 as usize * BLOCK);
@@ -4958,6 +5053,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         // spec `decode_tile`: `CurrentQIndex` resets to the frame's own
         // `base_q_idx` at the top of every tile, not once per frame.
         CURRENT_Q_IDX.with(|c| c.set(i32::from(base_q_idx)));
+        CURRENT_DELTA_LF.with(|c| c.set([0; 4]));
         if std::env::var_os("EC_AV1_TRACE").is_some() {
             eprintln!(
                 "TRACE key_tile_bytes tile={tile_num} len={} first8={:02x?} base_q_idx={base_q_idx} mi_cols={mi_cols} mi_rows={mi_rows}",
@@ -6814,6 +6910,7 @@ fn decode_inter_block(
     let skip = skip_mode || dec.symbol(&mut cdfs.skip[skip_ctx]) == 1;
     maybe_read_cdef_idx(dec, r * SUB_MI as usize, c * SUB_MI as usize, skip);
     maybe_read_delta_q(dec, cdfs, r * SUB_MI as usize, c * SUB_MI as usize, side == 64, skip);
+    maybe_read_delta_lf(dec, cdfs, r * SUB_MI as usize, c * SUB_MI as usize, side == 64, skip);
     // lane-warp r5: see `reject_residual` -- a square-block decode of a
     // HORZ_B strip is symbol-exact only for `skip` (no residual, no
     // motion_mode/warp symbol), so gate here before any further read.
@@ -8586,6 +8683,7 @@ fn decode_inter_block8(
     maybe_read_cdef_idx(dec, leaf_mi.0, leaf_mi.1, skip);
     // Always a `BLOCK_8X8` leaf here, never the whole superblock.
     maybe_read_delta_q(dec, cdfs, leaf_mi.0, leaf_mi.1, false, skip);
+    maybe_read_delta_lf(dec, cdfs, leaf_mi.0, leaf_mi.1, false, skip);
 
     let (has_above, has_left) = (
         leaf_mi.0 > neighbours.tile_row0_mi,
@@ -9774,7 +9872,11 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     // `decode_key_frame_tile_with_cdfs`'s per-tile reset).
     DELTA_Q_PRESENT.with(|c| c.set(delta.q_present));
     DELTA_Q_RES.with(|c| c.set(1i32 << delta.q_res));
+    DELTA_LF_PRESENT.with(|c| c.set(delta.lf_present));
+    DELTA_LF_RES.with(|c| c.set(1i32 << delta.lf_res));
+    DELTA_LF_MULTI.with(|c| c.set(delta.lf_multi));
     CURRENT_Q_IDX.with(|c| c.set(i32::from(base_q_idx)));
+    CURRENT_DELTA_LF.with(|c| c.set([0; 4]));
     let mut dec = SymbolDecoder::new(data);
     // lane-comppin r9: tile-entry range, the earliest point comparable
     // against aomdec's own `r->ec.rng` right after `aom_reader_init` -- the

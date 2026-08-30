@@ -165,16 +165,10 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         // intrabc call at all -- that symbol is intra-frame-only). A
         // genuine palette/intrabc use still refuses by name deeper in the
         // block readers, so no whole-frame refusal is needed here anymore.
-        // lane-realworld r5: delta_q is now read (maybe_read_delta_q,
-        // CURRENT_Q_IDX) -- only delta_lf still lacks a deblocker consumer
-        // (MiGrid/fill_lf_grid needs a new per-block field), so only that
-        // half still refuses by name.
-        if header.delta.lf_present {
-            return Err(Error::unsupported(
-                "AV1 decode_stream",
-                "a frame with delta_lf_present set (this decoder never applies per-superblock loop-filter deltas)",
-            ));
-        }
+        // lane-realworld r5: both delta_q (maybe_read_delta_q, CURRENT_Q_IDX)
+        // and delta_lf (maybe_read_delta_lf, CURRENT_DELTA_LF ->
+        // Neighbours::delta_lf_grid -> lf_level) are now read and applied;
+        // no whole-frame refusal needed here anymore.
         if header.segmentation.enabled {
             return Err(Error::unsupported(
                 "AV1 decode_stream",
