@@ -266,6 +266,42 @@ pub const EOB_PT_128_CHROMA_Q3: [u16; 9] = [
     24313, 26062, 28385, 30107, 31217, 31898, 32345, 32768, 0,
 ];
 
+/// `av1_default_eob_multi128_cdfs[2][0][0]` (`token_cdfs.h:830-849`,
+/// lane-rectx): the end-of-block group of a LUMA transform with 128 coded
+/// positions -- what a true 16x8/8x16 rectangular transform has
+/// (`decode_leaf_rect`'s own leaf, one level below [`EOB_PT_512_LUMA`]'s
+/// 32x16/16x32), distinct from [`EOB_PT_256_LUMA`]'s 256-position group a
+/// *square* 16x16 reads. Read straight from the plane-0 half of the same
+/// `token_cdfs.h` table [`EOB_PT_128_CHROMA`] reads its plane-1 half from.
+pub const EOB_PT_128_LUMA: [u16; 9] = [
+    1366, 1738, 2527, 5016, 9355, 15797, 24643, 32768, 0,
+];
+/// [`EOB_PT_128_LUMA`], q-context 0.
+pub const EOB_PT_128_LUMA_Q0: [u16; 9] = [
+    219, 482, 1140, 2091, 3680, 6028, 12586, 32768, 0,
+];
+/// [`EOB_PT_128_LUMA`], q-context 1.
+pub const EOB_PT_128_LUMA_Q1: [u16; 9] = [
+    685, 933, 1488, 2714, 4766, 8562, 19254, 32768, 0,
+];
+/// [`EOB_PT_128_LUMA`], q-context 3.
+pub const EOB_PT_128_LUMA_Q3: [u16; 9] = [
+    3472, 4885, 7489, 12481, 18517, 24536, 29635, 32768, 0,
+];
+
+/// `av1_default_eob_multi32_cdfs[2][1][0]` (`token_cdfs.h:792-808`,
+/// lane-rectx): the end-of-block group of a CHROMA transform with 32 coded
+/// positions -- what a true 8x4/4x8 rectangular transform has (the chroma
+/// plane of a [`decode_leaf_rect`] 16x8/8x16 luma strip), distinct from
+/// [`EOB_PT_16_CHROMA`]'s 16-position group a *square* 4x4 reads.
+pub const EOB_PT_32_CHROMA: [u16; 7] = [13468, 16303, 20361, 25105, 29281, 32768, 0];
+/// [`EOB_PT_32_CHROMA`], q-context 0.
+pub const EOB_PT_32_CHROMA_Q0: [u16; 7] = [2636, 4273, 7588, 11794, 20401, 32768, 0];
+/// [`EOB_PT_32_CHROMA`], q-context 1.
+pub const EOB_PT_32_CHROMA_Q1: [u16; 7] = [8394, 10352, 13932, 18855, 26014, 32768, 0];
+/// [`EOB_PT_32_CHROMA`], q-context 3.
+pub const EOB_PT_32_CHROMA_Q3: [u16; 7] = [22086, 24282, 27010, 29770, 31743, 32768, 0];
+
 /// `av1_default_eob_multi512_cdfs[*][1][*]` (`token_cdfs.h:874-901`,
 /// lane-sbpart): the end-of-block group of a CHROMA transform with 512 coded
 /// positions -- what a 32x16/16x32 chroma transform has (the chroma plane of
