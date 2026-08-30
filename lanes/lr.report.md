@@ -185,6 +185,70 @@ EC_AV1_REQUIRE_AOMENC=1, `232` baseline + 3 new tests)
 4. Once both filters are wired, drop the `stream.rs` refusal entirely
    (stage 5) -- gate should then assert `Ok`, never `Err`.
 
+## r3 (committed on `lane-lr`, 0cfe9d6; 236 passed / 0 failed, 17
+ignored, EC_AV1_REQUIRE_AOMENC=1) -- VERDICT: step 1 (the gate) landed
+and, in the process of landing it, found and fixed a real gap r2's own
+report had flagged as unverified. Steps 2-4 (Wiener/SGR pixel filters,
+dropping the refusal) NOT started -- out of turn budget.
+
+- New gate `a_real_aomenc_stream_with_restoration_reads_lr_symbols_correctly`
+  (`crates/ec-av1/src/stream.rs`): real aomenc `--enable-restoration=1
+  --sb-size=64` stream, multi-superblock fixture (192x128 = 3x2 SBs of
+  64px -- charter's own trap warning), 40 attempts, `cq-level=15` (r2's
+  sibling gates' usual `cq-level=45` never landed `uses_lr=true` for
+  this content -- sampled live before picking 15). Self-pinned
+  `WIENER_HITS`/`SGRPROJ_HITS`/`SWITCHABLE_HITS` thread-local counters
+  added to `restoration.rs`'s `read_lr_unit`, hard-asserted `sum > 0`.
+- **The gate found a real bug**: `stream.rs`'s `header.loop_restoration.uses_lr`
+  refusal check ran BEFORE the `decode_key_frame_tile_with_cdfs`/
+  `decode_inter_frame_tile_with_cdfs` call, so `read_lr` was NEVER
+  actually invoked through `decode_stream` -- despite r2's report
+  describing "the symbols are read", no real stream had ever exercised
+  that claim end to end. First gate run: 40/40 attempts hit the refusal
+  with `wiener_hits=sgrproj_hits=switchable_hits=0`. Fixed by moving the
+  check to run AFTER the tile-decode call succeeds (same refusal string,
+  new position) -- this both proves the superblock walk survives
+  `read_lr` without desyncing (the charter's actual step-1 ask) and now
+  genuinely exercises the reader. Also needed `--sb-size=64` in the gate
+  recipe (without it, aomenc's default sb128 choice hit the unrelated,
+  already-dead-ended `lane-sb128` partition-desync gap and ate the whole
+  attempt window with "a partition type this encoder never writes").
+- Final gate result: 39 LR refusals / 0 other refusals out of 40
+  attempts, `wiener_hits=19 sgrproj_hits=72 switchable_hits=0` (this
+  fixture's RD only ever picked a fixed frame-level `Wiener`/`Sgrproj`
+  type, never `Switchable` -- both non-switchable arms proven live; the
+  switchable arm is still symbol-code-reviewed only, unexercised by any
+  gate this round).
+- Refusal string: UNCHANGED text ("a frame with loop restoration enabled
+  (the per-unit lr symbols are read but the Wiener/self-guided filters
+  are not yet applied to pixels)"), only its position in `decode_stream`
+  moved (was before the tile-decode call, now after) -- `refusal_inventory.rs`
+  on main should not need updating for this move since the string itself
+  didn't change; report this in case main's guard checks call-site order
+  too.
+
+## Next lever (r3 -> r4)
+1. Wiener pixel filter (charter step 2): `apply_loop_restoration` after
+   `apply_cdef` in `decode.rs` (two call sites, ~4983/10502), driven by
+   the `RestorationGrid`/`(WienerInfo, SgrprojInfo)` this round's gate
+   proved decode correctly. Watch the 3-pixel stripe boundary save/
+   restore (`rlbs`) -- not investigated this round.
+2. Self-guided (SGR) filter (charter step 3): box-sum radii from
+   `SGR_PARAMS`.
+3. Once both are wired and this gate's LR frames start decoding
+   pixel-exact, widen the gate to assert `Ok` + pixel match instead of
+   the named refusal, then drop the `stream.rs` refusal (charter step 4).
+
+## Turn budget (r3)
+Spent on: reading the charter + r2 section, writing the gate, and
+(unplanned but necessary) diagnosing + fixing the check-before-decode
+bug the gate exposed -- confirming it via a scratch `EC_AV1_PIN` decode
+of a hand-built fixture (`loop_restoration.uses_lr=true`, `frame_restoration_type`
+`Sgrproj`) before touching `stream.rs`. Did not reach either pixel
+filter; r4 should start directly at Wiener (`decode.rs`'s two
+`apply_cdef` call sites), no further libaom recon needed this report
+plus `restoration.rs`'s own doc comments don't already cover.
+
 ## Turn budget (r2)
 Spent the full 75-turn allowance on: recon of libaom's exact `k`-per-tap
 subexp/SGR-table/read_lr_unit shape (not fully covered by r1's report --
