@@ -24,6 +24,7 @@
 
 #[cfg(test)]
 const CAPABILITY_CLAIMS: &[&str] = &[
+    "filter intra on a superblock-level HORZ/VERT strip (never expected -- av1_filter_intra_allowed_bsize caps at 32x32)",
     "a non-2D tx class on a rectangular transform (never expected at this size)",
     "a non-DC chroma mode on an 8x8 inter-frame leaf (this encoder never writes one)",
     "a nonzero angle delta (this encoder never writes one)",
@@ -40,6 +41,7 @@ const REFUSALS: &[&str] = &[
     "a 32x32 partition type this decoder does not code (value={part32})",
     "a Golomb tail longer than this decoder reads",
     "a stream whose bit depth is not 8 (this decoder reconstructs into 8-bit planes)",
+    "a superblock-level HORZ/VERT strip with a split transform (per-unit rect prediction is not ported)",
     "a tx_type symbol outside its CDF's own set: {t}",
     "an INTER 32x32 partition type this decoder does not code (value={part32})",
     "an inter frame with use_superres set (this decoder never scales its motion-compensated reference to match the current frame's downscaled size, spec 7.11.3.3)",
