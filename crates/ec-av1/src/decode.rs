@@ -1556,6 +1556,22 @@ fn filter_intra_size_class_rect(bw: usize, bh: usize) -> Option<usize> {
     }
 }
 
+/// `av1_allow_palette`'s size bound (blockd.h: `block_size_wide/high <=
+/// MAX_PALETTE_BLOCK_WIDTH/HEIGHT` (64) and `sb_type >= BLOCK_8X8`) plus
+/// `av1_get_palette_bsize_ctx` (pred_common.h: `num_pels_log2_lookup[bsize]
+/// - num_pels_log2_lookup[BLOCK_8X8]`, i.e. `2*log2(side) - 6` for this
+/// decoder's square-only blocks) -- `None` past the bound (never gates a
+/// palette read), `Some(bsize_ctx)` otherwise.
+fn palette_bsize_ctx(side: usize) -> Option<usize> {
+    match side {
+        8 => Some(0),
+        16 => Some(2),
+        32 => Some(4),
+        64 => Some(6),
+        _ => None,
+    }
+}
+
 /// [`read_intra_mode`] for a true `bw`x`bh` rect strip (lane-intradisp r1):
 /// identical except the `use_filter_intra` size class comes from
 /// [`filter_intra_size_class_rect`] instead of the square-only
@@ -1573,6 +1589,7 @@ fn read_intra_mode_rect(
     bh: usize,
     enable_filter_intra: bool,
     skip_ctx: usize,
+    allow_screen_content_tools: bool,
 ) -> Result<(
     bool,
     usize,
@@ -1582,6 +1599,16 @@ fn read_intra_mode_rect(
     Option<(i32, i32)>,
     Option<usize>,
 )> {
+    // lane-screen consumes palette/intrabc syntax in the SQUARE reader only
+    // (`palette_bsize_ctx` is keyed on a single side). A rect strip in a
+    // screen-content frame would therefore skip symbols the encoder wrote and
+    // desync the tile, so refuse it by name rather than decode it wrong.
+    if allow_screen_content_tools {
+        return Err(unsupported(
+            "a HORZ/VERT intra strip in a screen-content frame (palette syntax \
+             is consumed for square blocks only)",
+        ));
+    }
     let skip = dec.symbol(&mut cdfs.skip[skip_ctx]) != 0;
     let above_ctx = INTRA_MODE_CTX[above_mode];
     let left_ctx = INTRA_MODE_CTX[left_mode];
@@ -1694,6 +1721,7 @@ fn decode_block_rect(
     u: &mut PlaneBuf,
     v: &mut PlaneBuf,
     enable_filter_intra: bool,
+    allow_screen_content_tools: bool,
 ) -> Result<()> {
     let (r, c) = at;
     let (px, py) = (c * SUB, r * SUB);
@@ -1708,6 +1736,7 @@ fn decode_block_rect(
             bh,
             enable_filter_intra,
             neighbours.skip_txfm_ctx(r * (SUB / MI), c * (SUB / MI)),
+            allow_screen_content_tools,
         )?;
     if filter_intra.is_some() {
         // `predict_filter_intra` (spec 7.11.2.3) is square-only in this
@@ -1824,6 +1853,8 @@ fn read_intra_mode(
     side: usize,
     enable_filter_intra: bool,
     skip_ctx: usize,
+    allow_screen_content_tools: bool,
+    allow_intrabc: bool,
 ) -> Result<(
     bool,
     usize,
@@ -1837,6 +1868,26 @@ fn read_intra_mode(
     let skip = dec.symbol(&mut cdfs.skip[skip_ctx]) != 0;
     if trace {
         eprintln!("TRACE skip value={}", skip as i32);
+    }
+    // `read_intrabc_info` (spec 5.11.13, libaom decodemv.c:693, called at
+    // :811 right after `skip_txfm`/`segment_id`/`cdef`/`delta_q` and before
+    // `mbmi->mode` is ever read): a `use_intrabc` symbol only present on an
+    // intra frame whose header set `allow_intrabc`. Actual intra block copy
+    // needs `assign_dv`'s own motion-vector-prediction machinery (`av1_find_mv_refs`,
+    // `av1_find_ref_dv`) this decoder does not carry -- lane-screen scope
+    // draws the line at consuming this one flag symbol and refusing by name
+    // when it fires, so the arithmetic decoder still resyncs for a stream
+    // that merely allows (but never uses) intrabc.
+    if allow_intrabc {
+        let use_intrabc = dec.symbol(&mut cdfs.intrabc) != 0;
+        if trace {
+            eprintln!("TRACE use_intrabc value={}", use_intrabc as i32);
+        }
+        if use_intrabc {
+            return Err(unsupported(
+                "a block that actually uses intrabc (this decoder never reconstructs one)",
+            ));
+        }
     }
     let above_ctx = INTRA_MODE_CTX[above_mode];
     let left_ctx = INTRA_MODE_CTX[left_mode];
@@ -1890,6 +1941,32 @@ fn read_intra_mode(
     } else {
         0
     };
+    // `read_palette_mode_info` (spec 5.11.13, libaom decodemv.c:567, called
+    // at :840 right after `xd->cfl.store_y` and before `read_filter_intra_mode_info`):
+    // gated by `av1_allow_palette` (blockd.h -- size bound only,
+    // [`palette_bsize_ctx`]). `palette_mode_ctx`/`palette_uv_mode_ctx`
+    // (`av1_get_palette_mode_ctx`, pred_common.h) read the neighbours' own
+    // `palette_size[0] > 0` -- always 0 here since a nonzero size refuses
+    // the whole decode below, so no successfully-completed decode ever has
+    // such a neighbour (corner-cut: hardcoded ctx 0 instead of tracking it,
+    // ceiling = real palette reconstruction, out of this lane's scope).
+    // A nonzero `palette_size` needs the color-cache/delta-coded-colors
+    // syntax this decoder does not reconstruct -- refuse by name rather
+    // than silently drop pixels.
+    if allow_screen_content_tools
+        && let Some(bsize_ctx) = palette_bsize_ctx(side)
+    {
+        if mode == DC_PRED && dec.symbol(&mut cdfs.palette_y_mode[bsize_ctx][0]) != 0 {
+            return Err(unsupported(
+                "a block that actually uses a palette (Y) -- reconstruction is out of scope",
+            ));
+        }
+        if uv_mode == DC_PRED && dec.symbol(&mut cdfs.palette_uv_mode[0]) != 0 {
+            return Err(unsupported(
+                "a block that actually uses a palette (UV) -- reconstruction is out of scope",
+            ));
+        }
+    }
     // `read_filter_intra_mode_info` (spec 5.11.14, libaom decodemv.c): a
     // `use_filter_intra` symbol this decoder never read at all until
     // lane-av1real r10 -- silently skipping it left every bit past a
@@ -2354,6 +2431,8 @@ fn decode_block(
     v: &mut PlaneBuf,
     base_q_idx: u8,
     enable_filter_intra: bool,
+    allow_screen_content_tools: bool,
+    allow_intrabc: bool,
     scan32: &[u16],
     scan16: &[u16],
     scan8: &[u16],
@@ -2373,6 +2452,8 @@ fn decode_block(
             side,
             enable_filter_intra,
             neighbours.skip_txfm_ctx(r * (SUB / MI), c * (SUB / MI)),
+            allow_screen_content_tools,
+            allow_intrabc,
         )?;
     // `predict` panics outside `DC_PRED..=PAETH_PRED` (0..=12); `UV_CFL_PRED`
     // (13) predicts as `DC_PRED` with the [`cfl_scaled`] nudge carrying the
@@ -2661,6 +2742,8 @@ fn decode_leaf8(
     v: &mut PlaneBuf,
     base_q_idx: u8,
     enable_filter_intra: bool,
+    allow_screen_content_tools: bool,
+    allow_intrabc: bool,
     tx_select: bool,
     reduced_tx_set: bool,
 ) -> Result<usize> {
@@ -2687,6 +2770,8 @@ fn decode_leaf8(
             8,
             enable_filter_intra,
             neighbours.skip_txfm_ctx(leaf_mi.0, leaf_mi.1),
+            allow_screen_content_tools,
+            allow_intrabc,
         )?;
     let uv_predict_mode = if uv_mode == UV_CFL_PRED {
         DC_PRED
@@ -3832,6 +3917,8 @@ pub fn decode_key_frame_tile(
     loop_filter: &LoopFilterParams,
     tx_select: bool,
     reduced_tx_set: bool,
+    allow_screen_content_tools: bool,
+    allow_intrabc: bool,
 ) -> Result<Picture> {
     decode_key_frame_tile_with_cdfs(
         data,
@@ -3847,6 +3934,8 @@ pub fn decode_key_frame_tile(
         None,
         tx_select,
         reduced_tx_set,
+        allow_screen_content_tools,
+        allow_intrabc,
     )
     .map(|(picture, _)| picture)
 }
@@ -3873,6 +3962,8 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     initial_cdfs: Option<Cdfs>,
     tx_select: bool,
     reduced_tx_set: bool,
+    allow_screen_content_tools: bool,
+    allow_intrabc: bool,
 ) -> Result<(Picture, Cdfs)> {
     if mi_cols == 0 || mi_rows == 0 {
         return Err(unsupported("a frame with no mode-info grid"));
@@ -3979,6 +4070,8 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                         &mut v,
                         base_q_idx,
                         enable_filter_intra,
+                        allow_screen_content_tools,
+                        allow_intrabc,
                         &scan32,
                         &scan16,
                         &scan8,
@@ -4046,6 +4139,8 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                     &mut v,
                                     base_q_idx,
                                     enable_filter_intra,
+                                    allow_screen_content_tools,
+                                    allow_intrabc,
                                     &scan32,
                                     &scan16,
                                     &scan8,
@@ -4095,6 +4190,8 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                                 &mut v,
                                                 base_q_idx,
                                                 enable_filter_intra,
+                                                allow_screen_content_tools,
+                                                allow_intrabc,
                                                 &scan32,
                                                 &scan16,
                                                 &scan8,
@@ -4149,6 +4246,8 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                                 &mut v,
                                                 base_q_idx,
                                                 enable_filter_intra,
+                                                allow_screen_content_tools,
+                                                allow_intrabc,
                                                 tx_select,
                                                 reduced_tx_set,
                                             )?;
@@ -4218,6 +4317,8 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                             &mut v,
                                             base_q_idx,
                                             enable_filter_intra,
+                                            allow_screen_content_tools,
+                                            allow_intrabc,
                                             tx_select,
                                             reduced_tx_set,
                                         )?;
@@ -4248,6 +4349,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                     &mut u,
                                     &mut v,
                                     enable_filter_intra,
+                                    allow_screen_content_tools,
                                 )?;
                                 decode_block_rect(
                                     &mut dec,
@@ -4260,6 +4362,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                     &mut u,
                                     &mut v,
                                     enable_filter_intra,
+                                    allow_screen_content_tools,
                                 )?;
                             }
                             PARTITION_VERT => {
@@ -4276,6 +4379,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                     &mut u,
                                     &mut v,
                                     enable_filter_intra,
+                                    allow_screen_content_tools,
                                 )?;
                                 decode_block_rect(
                                     &mut dec,
@@ -4288,6 +4392,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                     &mut u,
                                     &mut v,
                                     enable_filter_intra,
+                                    allow_screen_content_tools,
                                 )?;
                             }
                             _ => {
@@ -9726,6 +9831,8 @@ mod tests {
                 &LoopFilterParams::default(),
                 false,
                 true,
+                false,
+                false,
             )
             .is_err()
         );
@@ -9768,6 +9875,8 @@ mod tests {
             &LoopFilterParams::default(),
             false,
             true,
+            false,
+            false,
         )
         .unwrap();
         assert_eq!(decoded.width, w, "{w}x{h}: decoded width");
@@ -9851,6 +9960,8 @@ mod tests {
             &LoopFilterParams::default(),
             false,
             true,
+            false,
+            false,
         )
         .unwrap();
         assert!(
@@ -10036,6 +10147,8 @@ mod tests {
                 &LoopFilterParams::default(),
                 false,
                 true,
+                false,
+                false,
             )
             .unwrap();
             assert_eq!(ours.y, ffmpeg_decoded.y, "{width}x{height}: luma vs ffmpeg");
@@ -10108,6 +10221,8 @@ mod tests {
             &LoopFilterParams::default(),
             false,
             true,
+            false,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -10411,6 +10526,8 @@ mod tests {
             &LoopFilterParams::default(),
             false,
             true,
+            false,
+            false,
         )
         .unwrap();
         assert_eq!(reference.y, ffmpeg_frames[0].y, "frame 0 luma vs ffmpeg");
