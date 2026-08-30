@@ -215,6 +215,26 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         // is not yet provably correct end to end; keeping the refusal
         // until that seed is captured (EC_AV1_GATE_DUMP), self-pinned, and
         // root-caused rather than shipping a wrong decode.
+        //
+        // lane-gm r3 ROOT CAUSE (pinned, range-ladder-confirmed, still not
+        // fixed): the mismatch is NOT an mv/mvstack/entropy bug -- msac
+        // RANGE at the first divergent block (mi=(8,0), frame 1) matches
+        // aomdec's own `EC_PART` trace bit-for-bit (rng=38664 both sides),
+        // and this decoder's own `gm_get_motion_vector` for that block
+        // (ROTZOOM, seed 43's own header) computes the spec-correct
+        // mv=(-8,8) (hand-verified against mv.h's `block_center_x`/`_y`,
+        // which found and fixed a real `- 1` omission in `warp.rs` --
+        // harmless for THIS block's rounding but a genuine spec bug fixed
+        // regardless). The actual gap: `reconinter.c`'s `allow_warp` has a
+        // `global_warp_allowed` branch (`warp_types.global_warp_allowed =
+        // is_global_mv_block(...)`, `reconinter_enc.c:281`) that predicts
+        // an `is_global_mv_block` block (ROTZOOM/AFFINE GLOBALMV, >=8x8)
+        // with the FULL per-pixel affine global-motion warp, independent
+        // of `motion_mode` -- this decoder only ever builds a warp
+        // prediction for local `WARPED_CAUSAL` motion mode and falls back
+        // to plain translational MC with the block-centre mv for every
+        // other GLOBALMV block, which is only a centre-point approximation
+        // of the true per-pixel warp. That is the entire remaining gap.
         if header.frame_type != FrameType::Key
             && header.global_motion[..7]
                 .iter()
