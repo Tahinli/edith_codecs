@@ -1997,6 +1997,7 @@ fn decode_block_rect(
     enable_filter_intra: bool,
     allow_screen_content_tools: bool,
     base_q_idx: u8,
+    tx_select: bool,
 ) -> Result<()> {
     let (r, c) = at;
     let (px, py) = (c * SUB, r * SUB);
@@ -2029,8 +2030,19 @@ fn decode_block_rect(
         uv_mode
     };
     let (mi_r, mi_c) = (r * (SUB / MI), c * (SUB / MI));
-    let ctx = tx_size_context_rect(neighbours, (mi_r, mi_c), bw, bh);
-    let depth = dec.symbol(&mut cdfs.tx_size_cat2[ctx]);
+    // The tx-depth symbol EXISTS only under TX_MODE_SELECT. Both square paths
+    // gate their `read_tx_size` on `tx_select` for exactly this reason; this
+    // one did not, so with `--enable-tx-size-search=0` -- which several gate
+    // recipes use -- the decoder consumed a symbol the encoder never wrote and
+    // desynced the tile from that point on. That is why both strips of the
+    // pinned HORZ quadrant were wrong from their very first pixel, and why our
+    // range after the read equalled the oracle's range for the whole block.
+    let depth = if tx_select {
+        let ctx = tx_size_context_rect(neighbours, (mi_r, mi_c), bw, bh);
+        dec.symbol(&mut cdfs.tx_size_cat2[ctx])
+    } else {
+        0
+    };
     if depth != 0 {
         TX_DEPTH_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // A split transform is predicted per transform unit, each taking its
@@ -2144,14 +2156,11 @@ fn decode_block_rect(
         // coefficient-context math r3 already cleared. Not confirmed byte-
         // exact (would need a decodemv.c EC_TRACE_MODE patch specifically on
         // `read_tx_size`'s own rng, not attempted this round -- budget), so
-        // still refusing by name rather than risk landing a partial fix on a
-        // named-but-unconfirmed suspect.
-        return Err(unsupported(
-            "a HORZ/VERT intra strip with real (non-skip) coefficients \
-             (lane-rectwire r4: divergence narrowed to the tx_size_cat2 depth \
-             read, not yet byte-confirmed)",
-        ));
-        #[allow(unreachable_code)]
+        // r5 CONFIRMED the suspect and it was simpler than the CDF row: the
+        // tx-depth symbol exists only under TX_MODE_SELECT, and this path read
+        // it unconditionally where both square paths gate on `tx_select`. With
+        // --enable-tx-size-search=0 the encoder writes no such symbol, so the
+        // decoder consumed one that was never there.
         {
         let around = neighbours.around_rect(at, bw, bh);
         let mut luma_coding = cdfs.txb(TxbSet::LumaRect32x16, mode);
@@ -4794,6 +4803,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                     enable_filter_intra,
                                     allow_screen_content_tools,
                                     base_q_idx,
+                                    tx_select,
                                 )?;
                                 decode_block_rect(
                                     &mut dec,
@@ -4808,6 +4818,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                     enable_filter_intra,
                                     allow_screen_content_tools,
                                     base_q_idx,
+                                    tx_select,
                                 )?;
                             }
                             PARTITION_VERT => {
@@ -4826,6 +4837,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                     enable_filter_intra,
                                     allow_screen_content_tools,
                                     base_q_idx,
+                                    tx_select,
                                 )?;
                                 decode_block_rect(
                                     &mut dec,
@@ -4840,6 +4852,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                     enable_filter_intra,
                                     allow_screen_content_tools,
                                     base_q_idx,
+                                    tx_select,
                                 )?;
                             }
                             _ => {
