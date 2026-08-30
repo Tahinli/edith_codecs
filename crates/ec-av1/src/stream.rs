@@ -6358,4 +6358,187 @@ mod tests {
             "{NAME}: {matched} pixel-exact matches, {named_refusals} named refusals out of 20"
         );
     }
+
+    /// lane-tiles r7: the gate stage 2 (r6, commit 8899fc1) shipped without
+    /// -- a real >1-tile-column stream with a genuine INTER frame (not just
+    /// the key-frame-only two-column gate above), decoded through
+    /// `decode_stream` itself. Same recipe as the key-frame gate
+    /// (`--sb-size=64`, `--tile-columns=1`, `--loopfilter-control=0`, the
+    /// same feature-disable envelope so the gate isolates the tile loop, not
+    /// an unrelated unimplemented mode) plus `--limit=2 --kf-max-dist=1000`
+    /// so frame 1 is a real inter frame, and `gradients_source`'s default
+    /// `speed=0.01` rotation (undisturbed -- not overridden by the tail)
+    /// gives it genuine motion against frame 0, so `decode_inter_frame_tile_
+    /// with_cdfs`'s new per-tile loop and `MiGrid`'s per-tile bound actually
+    /// have to walk a live MV stack across the tile-column boundary, not
+    /// just replay skip/zero-mv blocks. Bounded with `duration=0.08` (2
+    /// frames at rate=25) per the class in ledger
+    /// `refusal-claim-disproved-by-its-own-gate`/`gate-loader-slurps-whole-
+    /// file` (never leave an ffmpeg/lavfi generate unbounded).
+    #[test]
+    fn a_real_aomenc_stream_with_two_tile_columns_and_an_inter_frame_decodes_pixel_exact() {
+        const NAME: &str =
+            "a_real_aomenc_stream_with_two_tile_columns_and_an_inter_frame_decodes_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height) = (128usize, 64usize);
+        let frames = 2usize;
+        let mut matched = 0u32;
+        let mut named_refusals = 0u32;
+        for attempt in 0..20u32 {
+            let seed = 42 + attempt;
+            let source = gradients_source(seed, width, height, "duration=0.08:rate=25");
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", "yuv420p", "-f",
+                    "yuv4mpegpipe", "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let mut child = Command::new(aomenc_path())
+                .args([
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    "--cq-level=45",
+                    "--cpu-used=0",
+                    &format!("--limit={frames}"),
+                    "--kf-max-dist=1000",
+                    "--lag-in-frames=0",
+                    "--auto-alt-ref=0",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--tile-columns=1",
+                    "--tile-rows=0",
+                    "--sb-size=64",
+                    "--loopfilter-control=0",
+                    "--max-reference-frames=3",
+                    "--reduced-reference-set=1",
+                    "--enable-warped-motion=0",
+                    "--enable-obmc=0",
+                    "--enable-masked-comp=0",
+                    "--enable-interintra-comp=0",
+                    "--enable-dist-wtd-comp=0",
+                    "--enable-diff-wtd-comp=0",
+                    "--enable-onesided-comp=0",
+                    "--enable-interintra-wedge=0",
+                    "--enable-smooth-interintra=0",
+                    "--enable-ref-frame-mvs=0",
+                    "--enable-rect-partitions=0",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    "--enable-filter-intra=0",
+                    "--enable-smooth-intra=0",
+                    "--enable-paeth-intra=0",
+                    "--enable-directional-intra=0",
+                    "--enable-angle-delta=0",
+                    "--enable-tx-size-search=0",
+                    "--enable-cdef=0",
+                    "--enable-restoration=0",
+                    "--max-partition-size=32",
+                    "--min-partition-size=32",
+                    "--enable-palette=0",
+                    "--enable-intrabc=0",
+                    "--enable-cfl-intra=0",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+
+            // Confirm aomenc actually split into >1 tile column and that
+            // frame 1 is a real inter frame before trusting a pixel match --
+            // otherwise a match could mean "tiles collapsed to 1" or "frame
+            // 1 fell back to key", not "the inter tile loop ran".
+            let mut parser = Av1Parser::new();
+            let mut pos = 0usize;
+            let mut saw_multi_tile_inter = false;
+            while pos < stream.len() {
+                let obu_offset = pos;
+                let obu = parser.parse_obu(&stream[pos..]).unwrap();
+                pos += obu.total_size;
+                if let ObuKind::Frame(header, _) = obu.kind
+                    && header.frame_type != FrameType::Key
+                    && header.tile_info.cols > 1
+                {
+                    saw_multi_tile_inter = true;
+                }
+            }
+            assert!(
+                saw_multi_tile_inter,
+                "{NAME}: seed {seed} never produced a >1-tile-column inter frame (aomenc \
+                 collapsed tiling or coded frame 1 as key)"
+            );
+
+            let before = crate::decode::tile_hits();
+            let pictures = match decode_stream(&stream) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME} failed outright, not a named refusal (seed {seed}): {msg}"
+                    );
+                    named_refusals += 1;
+                    eprintln!("seed {seed} refusal: {msg}");
+                    continue;
+                }
+                Ok(pictures) => pictures,
+            };
+            let hits = crate::decode::tile_hits() - before;
+            assert!(
+                hits > frames,
+                "{NAME}: tile_hits delta was {hits}, expected > {frames} -- both tiles of both \
+                 frames must actually decode (seed {seed})"
+            );
+            assert_eq!(pictures.len(), frames, "{NAME}: expected {frames} pictures (seed {seed})");
+
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frames);
+            for (i, (got, want)) in pictures.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(got.y, want.y, "{NAME}: seed {seed} frame {i} luma vs ffmpeg");
+                assert_eq!(got.u, want.u, "{NAME}: seed {seed} frame {i} U vs ffmpeg");
+                assert_eq!(got.v, want.v, "{NAME}: seed {seed} frame {i} V vs ffmpeg");
+            }
+            matched += 1;
+        }
+        assert!(
+            matched > 0,
+            "{NAME}: every attempt refused ({named_refusals} refusals); decode_stream never \
+             decoded a two-tile-column inter frame"
+        );
+        eprintln!(
+            "{NAME}: {matched} pixel-exact matches, {named_refusals} named refusals out of 20"
+        );
+    }
 }

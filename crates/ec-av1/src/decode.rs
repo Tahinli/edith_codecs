@@ -9812,6 +9812,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
             mi_row1 as usize,
             mi_col1 as usize,
         );
+        TILE_HITS.with(|c| c.set(c.get() + 1));
 
     for sb_r in sb_r0..sb_r1 {
         neighbours.start_row();
