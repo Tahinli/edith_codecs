@@ -5328,6 +5328,81 @@ mod tests {
             result.as_ref().map(|f| f.len()).map_err(|e| e.to_string())
         );
     }
+    #[test]
+    fn scratch_probe_rectx_mandelbrot() {
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() || !have_aomenc() {
+            eprintln!("SKIP: no tools");
+            return;
+        }
+        let cases = vec![(64usize, 64usize, 24u32, 0.4f64)];
+        let mut found = false;
+        for (width, height, cq, seed_off) in cases {
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v", "error", "-f", "lavfi", "-i",
+                    &format!("mandelbrot=size={width}x{height}:start_x={seed_off}"),
+                    "-pix_fmt", "yuv420p", "-t", "1", "-vframes", "1", "-f", "yuv4mpegpipe", "-",
+                ])
+                .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped())
+                .output().expect("ffmpeg failed to run");
+            assert!(y4m.status.success());
+            let mut child = Command::new(aomenc_path())
+                .args([
+                    "--threads=1", "--row-mt=0", "--sb-size=64", "--cpu-used=4", "--end-usage=q",
+                    &format!("--cq-level={cq}"), "--passes=1",
+                    "--enable-ab-partitions=0", "--enable-1to4-partitions=0",
+                    "--enable-tx-size-search=0", "--min-partition-size=8",
+                    "--max-partition-size=32", "--kf-max-dist=0",
+                    "--obu", "-o", "-", "-",
+                ])
+                .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+                .spawn().expect("aomenc failed to start");
+            child.stdin.take().unwrap().write_all(&y4m.stdout).unwrap();
+            let out = child.wait_with_output().unwrap();
+            assert!(out.status.success());
+            let stream = out.stdout;
+            let before = crate::decode::rect_leaf_coeff_hits();
+            let result = decode_stream(&stream);
+            let delta = crate::decode::rect_leaf_coeff_hits() - before;
+            if delta > 0 {
+                if let Ok(frames) = &result {
+                    let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frames.len());
+                    let mismatched = frames.iter().zip(&ffmpeg_frames).filter(|(g, w)| g.y != w.y || g.u != w.u || g.v != w.v).count();
+                    eprintln!(
+                        "HIT {width}x{height} cq={cq} off={seed_off}: rect_leaf_coeff_hits+={delta} mismatched={mismatched}/{}",
+                        frames.len()
+                    );
+                    // debug: locate first y mismatch
+                    if let (Some(got), Some(want)) = (frames.first(), ffmpeg_frames.first()) {
+                        'outer: for row in 0..height {
+                            for col in 0..width {
+                                let gi = row * width + col;
+                                if got.y[gi] != want.y[gi] {
+                                    eprintln!(
+                                        "first Y mismatch at ({col},{row}): got={} want={}",
+                                        got.y[gi], want.y[gi]
+                                    );
+                                    break 'outer;
+                                }
+                            }
+                        }
+                    }
+                    if mismatched == 0 {
+                        found = true;
+                        break;
+                    }
+                } else {
+                    eprintln!(
+                        "{width}x{height} cq={cq} off={seed_off}: rect_leaf_coeff_hits+={delta} result={:?}",
+                        result.as_ref().map(|f| f.len()).map_err(|e| e.to_string())
+                    );
+                }
+            }
+        }
+        eprintln!("found pixel-exact firing case: {found}");
+    }
+
     /// lane-rectgate r1: every prior gate pins `--enable-rect-partitions=0
     /// --enable-ab-partitions=0 --min/max-partition-size=32` so aomenc never
     /// gets to choose a real rect/ab split. This charter's premise ("rect
