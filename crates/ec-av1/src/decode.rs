@@ -9636,6 +9636,10 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     // palette syntax libaom's `read_intra_block_mode_info` reads under the
     // same `av1_allow_palette` gate as the key-frame path.
     allow_screen_content_tools: bool,
+    // lane-realworld r5: this frame header's own `delta` (spec 5.9.17/5.9.18),
+    // same contract as [`decode_key_frame_tile_with_cdfs`]'s own `delta`
+    // param -- only `q_present`/`q_res` are read.
+    delta: DeltaParams,
 ) -> Result<(Picture, Cdfs, crate::motion_field::MotionField)> {
     let tpl_frame = tpl_field.map(|field| TplFrameArgs {
         field,
@@ -9765,6 +9769,12 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     let scan4 = default_scan(TX4);
 
     let mut cdfs = initial_cdfs.unwrap_or_else(|| Cdfs::new(q_ctx_of(base_q_idx)));
+    // spec `decode_tile`: `CurrentQIndex` resets to the frame's own
+    // `base_q_idx` at the top of every tile (single tile here, same as
+    // `decode_key_frame_tile_with_cdfs`'s per-tile reset).
+    DELTA_Q_PRESENT.with(|c| c.set(delta.q_present));
+    DELTA_Q_RES.with(|c| c.set(1i32 << delta.q_res));
+    CURRENT_Q_IDX.with(|c| c.set(i32::from(base_q_idx)));
     let mut dec = SymbolDecoder::new(data);
     // lane-comppin r9: tile-entry range, the earliest point comparable
     // against aomdec's own `r->ec.rng` right after `aom_reader_init` -- the
