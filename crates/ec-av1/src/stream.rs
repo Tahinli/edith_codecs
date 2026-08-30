@@ -206,6 +206,15 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         // lane-av1refs widens this from `[0, 3]` (LAST_FRAME/GOLDEN_FRAME)
         // to every one of the 7 single-reference slots `decode_inter_block`
         // can now select.
+        //
+        // lane-gm r2 STEP-8 ATTEMPT (reverted): removing this refusal
+        // exposed a real pixel mismatch --
+        // a_real_aomenc_stream_with_interintra_wedge_decodes_pixel_exact
+        // seed 43, frame 1 luma, with EC_WEDGE_GATE_ATTEMPTS=20
+        // EC_AV1_REQUIRE_AOMENC=1 -- so the single-ref/compound MV wiring
+        // is not yet provably correct end to end; keeping the refusal
+        // until that seed is captured (EC_AV1_GATE_DUMP), self-pinned, and
+        // root-caused rather than shipping a wrong decode.
         if header.frame_type != FrameType::Key
             && header.global_motion[..7]
                 .iter()
