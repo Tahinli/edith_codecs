@@ -32,6 +32,7 @@ pub mod obu;
 pub mod quant;
 mod refusal_inventory;
 pub mod sequence;
+mod superres;
 pub mod stream;
 pub mod tile;
 pub mod transform;

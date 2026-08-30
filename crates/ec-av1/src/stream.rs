@@ -170,6 +170,11 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         // intrabc call at all -- that symbol is intra-frame-only). A
         // genuine palette/intrabc use still refuses by name deeper in the
         // block readers, so no whole-frame refusal is needed here anymore.
+        // lane-realworld r5: both delta_q (maybe_read_delta_q, CURRENT_Q_IDX)
+        // and delta_lf (maybe_read_delta_lf, CURRENT_DELTA_LF ->
+        // Neighbours::delta_lf_grid -> lf_level) are now read and applied;
+        // no whole-frame refusal needed here anymore.
+        //
         // Both AV1 files in this box's own library (a 2160p HDR10 encode and a
         // 1080p one, probed 2026-08-30 through `examples/decode_probe`) are
         // `yuv420p10le`, and every buffer this decoder reconstructs into --
@@ -189,16 +194,30 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 "a stream whose bit depth is not 8 (this decoder reconstructs into 8-bit planes)",
             ));
         }
-        if header.delta.q_present || header.delta.lf_present {
-            return Err(Error::unsupported(
-                "AV1 decode_stream",
-                "a frame with delta_q_present or delta_lf_present set (this decoder never reads the per-superblock delta symbols)",
-            ));
-        }
         if header.segmentation.enabled {
             return Err(Error::unsupported(
                 "AV1 decode_stream",
                 "a frame with segmentation enabled (this decoder never reads a per-block segment_id symbol)",
+            ));
+        }
+        // lane-superres stage 2/3: `use_superres` adds/removes no per-block
+        // symbol (spec 7.16's upscaling is a pixel-domain post-process
+        // libaom's `decodeframe.c` runs between CDEF and loop restoration,
+        // `av1_upscale_normative_*` in `resize.c`), so a key frame's tile
+        // reads stay bit-exact in sync and `crate::superres::upscale_picture`
+        // (below, after decode) makes its `Picture` the spec-correct
+        // `upscaled_width` instead of silently staying at `frame_width`.
+        // An INTER frame under `use_superres` still refuses: its reference
+        // is stored upscaled while the current frame decodes at the
+        // downscaled `frame_width`, so `decode_inter_frame_tile_with_cdfs`'s
+        // motion compensation would sample a reference at the wrong scale
+        // (spec 7.11.3.3's scaled-reference path is not ported) --
+        // SILENT WRONGNESS, not a desync, same as the key-frame case used
+        // to be. Left for a later stage of this lane.
+        if header.use_superres && header.frame_type != FrameType::Key {
+            return Err(Error::unsupported(
+                "AV1 decode_stream",
+                "an inter frame with use_superres set (this decoder never scales its motion-compensated reference to match the current frame's downscaled size, spec 7.11.3.3)",
             ));
         }
         // Loop restoration carries per-restoration-unit symbols in the tile
@@ -415,7 +434,26 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 header.reduced_tx_set,
                 header.allow_screen_content_tools,
                 header.allow_intrabc,
+                header.delta,
             )?;
+            // lane-superres stage 3, spec 7.16: upscale AFTER deblock+CDEF
+            // (both already applied inside `decode_key_frame_tile_with_cdfs`)
+            // and BEFORE this picture is stored as a reference or handed to
+            // the caller -- loop restoration is not yet ported, so there is
+            // no LR step here for the upscale to precede.
+            // r3: the real decoded margin beyond `frame_width` (set by the
+            // call above, right before anything else can overwrite it) --
+            // see `decode::take_last_key_frame_wide_margin`'s doc.
+            let wide_margin = crate::decode::take_last_key_frame_wide_margin();
+            let picture = if header.use_superres {
+                crate::superres::upscale_picture(
+                    &picture,
+                    header.upscaled_width as usize,
+                    wide_margin.as_ref(),
+                )
+            } else {
+                picture
+            };
             // A key frame codes no inter blocks -- its own saved motion
             // field has no cells set, matching libaom's own "intra frame
             // contributes nothing to a later projection" behaviour, but
@@ -499,6 +537,7 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 header.is_motion_mode_switchable,
                 header.allow_warped_motion,
                 header.allow_screen_content_tools,
+                header.delta,
             )?
         };
         // Spec 7.20: `disable_frame_end_update_cdf` stores the frame's
@@ -1469,6 +1508,149 @@ mod tests {
             "use_filter_intra never fired decoding this stream"
         );
         let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
+        assert_eq!(frames[0].y, ffmpeg_frames[0].y, "luma vs ffmpeg");
+        assert_eq!(frames[0].u, ffmpeg_frames[0].u, "U vs ffmpeg");
+        assert_eq!(frames[0].v, ffmpeg_frames[0].v, "V vs ffmpeg");
+    }
+
+    /// A real `aomenc` palette-Y fixture (lane-palette r3): `smptebars`
+    /// (SMPTE colour bars -- a handful of large flat luma regions, exactly
+    /// the "flat, few-colour, repetitive" content `av1_choose_palette_map`'s
+    /// RD trial rewards) with `hue=s=0` to flatten chroma to one constant
+    /// value, so `DC_PRED` already nails every chroma block with zero
+    /// residual and the encoder's own RD never has a reason to spend bits on
+    /// a *UV* palette too (a real symbol this decoder still refuses --
+    /// lane-palette r3's own scope is Y only). `smptebars` has no seed to
+    /// vary, so the fixture is deterministic by construction; hashed twice
+    /// below to prove it rather than assert it. `--enable-rect-partitions=0`
+    /// / `-ab-` / `-1to4-` keep every intra block square, sidestepping the
+    /// rect-strip screen-content refusal at `read_intra_mode_rect`
+    /// (decode.rs ~2226) -- that refusal is this lane's own next milestone,
+    /// not this gate's. `--sb-size=64` and `--threads=1 --row-mt=0` are the
+    /// sibling-lane facts this charter paid for: a single 64x64 frame is one
+    /// superblock either way, but pinning them keeps the recipe identical to
+    /// every other gate in this file. HARD-asserts
+    /// [`decode::palette_hits`] moved -- a stream that never reads a real
+    /// palette block would refuse (or not) by construction without proving
+    /// this milestone at all.
+    ///
+    /// lane-palette r4/r6/r7: r3/r4 found that this fixture's reconstructed
+    /// pixels did not match ffmpeg's decode of the same bytes even though
+    /// every symbol read by `decode_color_index_map` checked line-for-line
+    /// against the oracle and matched. r6's range trace (`compare-range-not-tell`)
+    /// pinned the real cause: `decode_color_index_map` was called from the
+    /// wrong syntax position -- inline right after the Y colours, instead of
+    /// after the whole mode-info read (UV palette mode_info + `filter_intra`,
+    /// `av1_visit_palette`'s real call order). r7 ported the UV palette
+    /// mode_info read and moved the colour-index-map decode after
+    /// `filter_intra`; this gate now asserts a real pixel match instead of
+    /// the old named refusal.
+    #[test]
+    fn a_real_aomenc_stream_with_palette_y_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_stream_with_palette_y_decodes_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let source = "smptebars=size=64x64:rate=25";
+        fn render(source: &str) -> Vec<u8> {
+            Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    source,
+                    "-vf",
+                    "hue=s=0",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-t",
+                    "0.04",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run")
+                .stdout
+        }
+        let y4m_a = render(source);
+        let y4m_b = render(source);
+        assert_eq!(
+            y4m_a, y4m_b,
+            "smptebars must render byte-identical across two runs"
+        );
+        let y4m = y4m_a;
+        let mut child = Command::new(aomenc_path())
+            .args([
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                "--cq-level=30",
+                "--cpu-used=0",
+                "--threads=1",
+                "--row-mt=0",
+                "--sb-size=64",
+                "--tune-content=screen",
+                "--enable-palette=1",
+                "--enable-intrabc=0",
+                "--enable-rect-partitions=0",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0",
+                "--min-partition-size=32",
+                "--max-partition-size=32",
+                "--enable-filter-intra=0",
+                "--enable-smooth-intra=0",
+                "--enable-paeth-intra=0",
+                "--enable-directional-intra=0",
+                "--enable-angle-delta=0",
+                "--enable-cfl-intra=0",
+                "--enable-cdef=0",
+                "--enable-restoration=0",
+                "--enable-tx-size-search=0",
+                "--loopfilter-control=0",
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("aomenc failed to start");
+        child
+            .stdin
+            .take()
+            .expect("aomenc stdin")
+            .write_all(&y4m)
+            .expect("writing y4m to aomenc");
+        let out = child.wait_with_output().expect("aomenc failed to run");
+        assert!(
+            out.status.success(),
+            "aomenc refused the fixture: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stream = out.stdout;
+        let before = decode::palette_hits();
+        let frames = match decode_stream(&stream) {
+            Ok(frames) => frames,
+            Err(e) => panic!("{NAME}: decode_stream refused: {e}"),
+        };
+        assert!(
+            decode::palette_hits() > before,
+            "palette_y_mode never fired decoding this stream -- gate is vacuous"
+        );
+        let ffmpeg_frames = ffmpeg_decode_sequence(&stream, 64, 64, 1);
         assert_eq!(frames[0].y, ffmpeg_frames[0].y, "luma vs ffmpeg");
         assert_eq!(frames[0].u, ffmpeg_frames[0].u, "U vs ffmpeg");
         assert_eq!(frames[0].v, ffmpeg_frames[0].v, "V vs ffmpeg");
@@ -3990,6 +4172,226 @@ mod tests {
         );
     }
 
+    /// lane-superres Step 0/stage 1: a real aomenc `--superres-mode=1`
+    /// stream must refuse BY NAME (`use_superres`), never desync into a
+    /// different error and never silently decode a wrong-sized picture.
+    /// `use_superres` adds no per-block symbol (spec 7.16's upscaler is a
+    /// pixel-domain post-process), so before the stream.rs refusal landed
+    /// this crate's tile readers stayed bit-exact in sync but stored the
+    /// `Picture` at the downscaled `frame_width` instead of
+    /// `upscaled_width` -- exactly the SILENT WRONGNESS the charter's Step 0
+    /// called for turning into an explicit refusal first.
+    #[test]
+    fn a_real_aomenc_stream_with_superres_refuses_by_name() {
+        const NAME: &str = "a_real_aomenc_stream_with_superres_refuses_by_name";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height, frame_count) = (64usize, 64usize, 4usize);
+        let duration = frame_count as f64 / 25.0;
+        let source = gradients_source(42, width, height, &format!("duration={duration}:rate=25"));
+        let y4m = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                &source,
+                "-pix_fmt",
+                "yuv420p",
+                "-f",
+                "yuv4mpegpipe",
+                "-",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ffmpeg failed to run");
+        assert!(
+            y4m.status.success(),
+            "ffmpeg fixture: {}",
+            String::from_utf8_lossy(&y4m.stderr)
+        );
+        let args: Vec<&str> = vec![
+            "--codec=av1",
+            "--passes=1",
+            "--end-usage=q",
+            "--cq-level=32",
+            "--cpu-used=0",
+            "--kf-max-dist=1000",
+            "--threads=1",
+            "--row-mt=0",
+            "--superres-mode=1",
+            "--superres-denominator=12",
+            "--obu",
+            "-o",
+            "-",
+            "-",
+        ];
+        let mut child = Command::new(aomenc_path())
+            .args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("aomenc failed to start");
+        child
+            .stdin
+            .take()
+            .expect("aomenc stdin")
+            .write_all(&y4m.stdout)
+            .expect("writing y4m to aomenc");
+        let out = child.wait_with_output().expect("aomenc failed to run");
+        assert!(
+            out.status.success(),
+            "aomenc refused the fixture: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stream = out.stdout;
+        let err = decode_stream(&stream).expect_err(
+            "a real --superres-mode=1 stream must refuse -- superres decode is not implemented \
+             and silently produces a wrong-sized picture otherwise",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("use_superres"),
+            "{NAME}: refused, but not by the superres name -- this stream desynced into a \
+             different refusal instead: {msg}"
+        );
+        eprintln!("{NAME}: refused by name: {msg}");
+    }
+
+    /// lane-superres stage 3: a real aomenc `--superres-mode=1` key-frame
+    /// sequence must decode pixel-exact vs ffmpeg/dav1d's own upscaled
+    /// output, and must actually run [`crate::superres::upscale_picture`]
+    /// (`superres_hits > 0`) -- a decoder that silently stopped upscaling
+    /// would otherwise pass vacuously (class `gate-blind-to-feature`).
+    /// `--kf-max-dist` set to the frame count keeps every frame a key
+    /// frame: inter-frame superres (a differently-scaled reference) is a
+    /// later stage of this lane, refused by name today.
+    #[test]
+    fn a_real_aomenc_superres_key_frame_sequence_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_superres_key_frame_sequence_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height, frame_count) = (64usize, 64usize, 3usize);
+        let duration = frame_count as f64 / 25.0;
+        let source = gradients_source(7, width, height, &format!("duration={duration}:rate=25"));
+        let y4m = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                &source,
+                "-pix_fmt",
+                "yuv420p",
+                "-f",
+                "yuv4mpegpipe",
+                "-",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ffmpeg failed to run");
+        assert!(
+            y4m.status.success(),
+            "ffmpeg fixture: {}",
+            String::from_utf8_lossy(&y4m.stderr)
+        );
+        let args: Vec<&str> = vec![
+            "--codec=av1",
+            "--passes=1",
+            "--end-usage=q",
+            "--cq-level=32",
+            "--cpu-used=0",
+            "--kf-max-dist=0",
+            "--threads=1",
+            "--row-mt=0",
+            "--superres-mode=1",
+            "--superres-denominator=12",
+            "--superres-kf-denominator=12",
+            "--enable-rect-partitions=0",
+            "--enable-ab-partitions=0",
+            "--enable-1to4-partitions=0",
+            "--enable-filter-intra=0",
+            "--enable-smooth-intra=0",
+            "--enable-paeth-intra=0",
+            "--enable-directional-intra=0",
+            "--enable-angle-delta=0",
+            "--enable-tx-size-search=0",
+            "--enable-cdef=0",
+            "--enable-restoration=0",
+            "--max-partition-size=32",
+            "--min-partition-size=32",
+            "--enable-palette=0",
+            "--enable-intrabc=0",
+            "--enable-cfl-intra=0",
+            "--obu",
+            "-o",
+            "-",
+            "-",
+        ];
+        let mut child = Command::new(aomenc_path())
+            .args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("aomenc failed to start");
+        child
+            .stdin
+            .take()
+            .expect("aomenc stdin")
+            .write_all(&y4m.stdout)
+            .expect("writing y4m to aomenc");
+        let out = child.wait_with_output().expect("aomenc failed to run");
+        assert!(
+            out.status.success(),
+            "aomenc refused the fixture: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stream = out.stdout;
+        if let Ok(path) = std::env::var("EC_SUPERRES_STREAM_DUMP") {
+            std::fs::write(path, &stream).expect("dump stream");
+        }
+        let frames =
+            decode_stream(&stream).unwrap_or_else(|e| panic!("{NAME} refused: {e}"));
+        assert_eq!(frames.len(), frame_count);
+        let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
+        for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+            assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg");
+            assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg");
+            assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg");
+        }
+        assert!(
+            crate::superres::superres_hits() > 0,
+            "{NAME}: matched but zero superres_hits -- the gate never actually exercised the \
+             upscaler, it proves nothing"
+        );
+        eprintln!(
+            "{NAME}: {frame_count} frames pixel-exact, superres_hits={}",
+            crate::superres::superres_hits()
+        );
+    }
+
     /// lane-interintra r1: `--enable-interintra-comp=1` streams must DECODE
     /// pixel-exact -- the interintra flag/mode/wedge-flag syntax and the
     /// non-wedge smooth blend are ported. A refusal naming interintra fails
@@ -6187,6 +6589,7 @@ mod tests {
                 header.reduced_tx_set,
                 header.allow_screen_content_tools,
                 header.allow_intrabc,
+                header.delta,
             ) {
                 Err(e) => {
                     let msg = e.to_string();
@@ -6392,6 +6795,7 @@ mod tests {
                 header.reduced_tx_set,
                 header.allow_screen_content_tools,
                 header.allow_intrabc,
+                header.delta,
             ) {
                 Err(e) => {
                     let msg = e.to_string();
@@ -6705,6 +7109,7 @@ mod tests {
                 header.reduced_tx_set,
                 header.allow_screen_content_tools,
                 header.allow_intrabc,
+                header.delta,
             ) {
                 Err(e) => {
                     let msg = e.to_string();
@@ -7040,6 +7445,207 @@ mod tests {
         );
         eprintln!(
             "{NAME}: {matched} pixel-exact matches, {named_refusals} named refusals out of 20"
+        );
+    }
+    /// lane-realworld r6: r5 ported `maybe_read_delta_q`/`maybe_read_delta_lf`
+    /// and removed the whole-frame refusal, but no fixture anywhere set
+    /// `delta_lf_present` -- the removal was unproven. `--deltaq-mode=2`
+    /// (`DELTA_Q_PERCEPTUAL`, checked against libaom's own
+    /// `encodeframe.c:2192-2225`) sets `delta_q_present_flag` unconditionally
+    /// once `base_qindex > 0` (unlike the default `--deltaq-mode=1`
+    /// `DELTA_Q_OBJECTIVE`, which additionally requires an alt-ref-eligible
+    /// frame and `allow_deltaq_mode`'s own RD search); `--delta-lf-mode=1`
+    /// then ANDs `delta_lf_present_flag` on top
+    /// (`tool_cfg->enable_deltalf_mode`, `av1_cx_iface.c:1269-1270`). 128x64
+    /// (2 SBs; this decoder hardcodes 64px SBs) is the charter's minimum for
+    /// a per-superblock symbol to have somewhere to differ; `--cpu-used=4`
+    /// (not the other gates' `=0`) sidesteps the multi-SB
+    /// HORZ_4/VERT_B-at-part64 gap the cdef gate's own comment documents
+    /// (lane-realworld r2 dead-end, part64 only covers NONE/SPLIT). Note:
+    /// libaom hardcodes `delta_lf_multi = DEFAULT_DELTA_LF_MULTI == 0`
+    /// (`enums.h:73`) with no CLI flag to set it -- this gate cannot and
+    /// does not claim to exercise this decoder's `delta_lf_multi` branch;
+    /// only the single-plane path is gate-proven.
+    #[test]
+    fn a_real_aomenc_stream_with_delta_q_and_delta_lf_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_stream_with_delta_q_and_delta_lf_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height, frame_count) = (128usize, 64usize, 24usize);
+        let mut named_refusals = 0u32;
+        let mut matched = 0u32;
+        let n_attempts: u32 = std::env::var("EC_DELTAQ_GATE_ATTEMPTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(40);
+        for attempt in 0..n_attempts {
+            let seed = 42 + attempt;
+            let duration = frame_count as f64 / 25.0;
+            // Mandelbrot's varying local contrast is what gives
+            // DELTA_Q_PERCEPTUAL's per-superblock RD something to
+            // differentiate; flat gradients risk every superblock
+            // resolving the same delta.
+            let source = format!(
+                "mandelbrot=size={width}x{height}:rate=25:start_x={sx}:start_y={sy}",
+                sx = -0.6 + 0.005 * (attempt as f64),
+                sy = -0.4 + 0.005 * (attempt as f64)
+            );
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-t",
+                    &duration.to_string(),
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let args: Vec<&str> = vec![
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                "--cq-level=45",
+                "--cpu-used=4",
+                "--aq-mode=0",
+                "--deltaq-mode=2",
+                "--delta-lf-mode=1",
+                "--kf-max-dist=1000",
+                "--threads=1",
+                "--row-mt=0",
+                "--sb-size=64",
+                "--auto-alt-ref=1",
+                "--lag-in-frames=16",
+                "--enable-fwd-kf=0",
+                "--enable-order-hint=1",
+                "--enable-warped-motion=1",
+                "--enable-global-motion=0",
+                "--enable-obmc=1",
+                "--tune-content=default",
+                "--enable-masked-comp=1",
+                "--enable-dist-wtd-comp=0",
+                "--enable-interintra-comp=1",
+                "--enable-onesided-comp=0",
+                "--enable-interintra-wedge=0",
+                "--enable-smooth-interintra=1",
+                "--enable-rect-partitions=0",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0",
+                "--enable-filter-intra=0",
+                "--enable-smooth-intra=0",
+                "--enable-paeth-intra=0",
+                "--enable-directional-intra=0",
+                "--enable-angle-delta=0",
+                "--enable-tx-size-search=0",
+                "--enable-cdef=1",
+                "--enable-restoration=0",
+                "--max-partition-size=32",
+                "--min-partition-size=32",
+                "--enable-palette=0",
+                "--enable-intrabc=0",
+                "--enable-cfl-intra=0",
+                "--enable-ref-frame-mvs=0",
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ];
+            let mut child = Command::new(aomenc_path())
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let frames = match decode_stream(&stream) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME} failed outright, not a named refusal (seed {seed}): {msg}"
+                    );
+                    assert!(
+                        !msg.contains("delta_q") && !msg.contains("delta_lf"),
+                        "{NAME} refused on delta_q/delta_lf (seed {seed}) -- that read is ported: {msg}"
+                    );
+                    named_refusals += 1;
+                    eprintln!("seed {seed} refusal: {msg}");
+                    continue;
+                }
+                Ok(frames) => frames,
+            };
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
+            assert_eq!(frames.len(), frame_count);
+            let mismatched = frames
+                .iter()
+                .zip(&ffmpeg_frames)
+                .any(|(got, want)| got.y != want.y || got.u != want.u || got.v != want.v);
+            if mismatched && let Ok(path) = std::env::var("EC_AV1_GATE_DUMP") {
+                std::fs::write(&path, &stream).expect("writing pinned stream");
+                eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
+            }
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
+                assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
+            }
+            matched += 1;
+        }
+        assert!(
+            matched > 0,
+            "{NAME}: every attempt refused on other capabilities ({named_refusals} refusals); \
+             the gate never exercised delta_q/delta_lf"
+        );
+        assert!(
+            crate::decode::delta_q_hits() > 0,
+            "{NAME}: {matched} pixel-exact matches but zero delta_q symbol groups fired -- \
+             the reader is unexercised"
+        );
+        assert!(
+            crate::decode::delta_lf_hits() > 0,
+            "{NAME}: {matched} pixel-exact matches but zero delta_lf symbol groups fired -- \
+             the reader is unexercised"
+        );
+        eprintln!(
+            "{NAME}: {named_refusals} other-capability refusals, {matched} pixel-exact matches \
+             out of {n_attempts}, delta_q_hits={}, delta_lf_hits={}",
+            crate::decode::delta_q_hits(),
+            crate::decode::delta_lf_hits()
         );
     }
 
