@@ -563,3 +563,81 @@ s = s.replace(marker_old, "/* EC_INSTRUMENTED_INTRA_STEP */\n" + marker_old, 1)
 open(path, "w").write(s)
 print("intra mode-info per-symbol ladder instrumented")
 PYS
+
+# --- rung 11: per-symbol range ladder inside read_coeffs_txb (decodetxb.c) --
+# lane-sbpart r7: rung 3's EC_TRACE_COEFF only bracketed a whole coefficient
+# block (entry/exit rng) -- too coarse to find WHICH symbol inside a Luma64
+# corner-scan block diverges. This adds EC_COEFF_STEP tag=eob/base_eob/
+# after_bases/sign/post_golomb lines, rng after each, under the same
+# EC_TRACE_COEFF flag (no new env var). Localized r7's own bisect to the
+# `base` symbol at scan position (row=1,col=0) inside block2's luma corner:
+# entry rng and eob/base_eob both match ours byte-for-byte, then our `base`
+# read at that position decodes value=3 (triggering an extra `br` read)
+# where the oracle's equivalent position decodes level=1 -- see
+# lanes/sbpart-r7.report.md.
+G="$SRC/av1/decoder/decodetxb.c"
+[ -f "$G" ] || { echo "no oracle source at $G" >&2; exit 1; }
+
+python3 - "$G" <<'PYC11'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+if "EC_COEFF_STEP" in s:
+    print("decodetxb rung 11 already applied (no-op)")
+    sys.exit(0)
+
+old1 = "  *eob = rec_eob_pos(eob_pt, eob_extra);\n"
+new1 = old1 + """  {
+    const int ec_trace2 = getenv("EC_TRACE_COEFF") != NULL;
+    if (ec_trace2) {
+      fprintf(stderr, "EC_COEFF_STEP tag=eob eob=%d rng=%u\\n", *eob, (unsigned)r->ec.rng);
+    }
+  }
+"""
+assert old1 in s, "eob assign not found"
+s = s.replace(old1, new1, 1)
+
+old2 = "    levels[get_padded_idx(pos, bhl)] = level;\n  }\n  if (*eob > 1) {"
+new2 = """    levels[get_padded_idx(pos, bhl)] = level;
+    if (getenv("EC_TRACE_COEFF") != NULL) {
+      fprintf(stderr, "EC_COEFF_STEP tag=base_eob level=%d rng=%u\\n", level, (unsigned)r->ec.rng);
+    }
+  }
+  if (*eob > 1) {"""
+assert old2 in s, "base_eob block not found"
+s = s.replace(old2, new2, 1)
+
+old3 = """      read_coeffs_reverse(r, tx_size, tx_class, 0, *eob - 1 - 1, scan, bhl,
+                          levels, base_cdf, br_cdf);
+    }
+  }
+"""
+new3 = old3 + """  if (getenv("EC_TRACE_COEFF") != NULL) {
+    fprintf(stderr, "EC_COEFF_STEP tag=after_bases rng=%u\\n", (unsigned)r->ec.rng);
+  }
+"""
+assert old3 in s, "after_bases site not found"
+s = s.replace(old3, new3, 1)
+
+old4 = """      if (level >= MAX_BASE_BR_RANGE) {
+        level += read_golomb(xd, r);
+      }
+
+      if (c == 0) dc_val = sign ? -level : level;"""
+new4 = """      if (getenv("EC_TRACE_COEFF") != NULL) {
+        fprintf(stderr, "EC_COEFF_STEP tag=sign c=%d sign=%d rng=%u\\n", c, sign, (unsigned)r->ec.rng);
+      }
+      if (level >= MAX_BASE_BR_RANGE) {
+        level += read_golomb(xd, r);
+      }
+      if (getenv("EC_TRACE_COEFF") != NULL) {
+        fprintf(stderr, "EC_COEFF_STEP tag=post_golomb c=%d level=%d rng=%u\\n", c, level, (unsigned)r->ec.rng);
+      }
+
+      if (c == 0) dc_val = sign ? -level : level;"""
+assert old4 in s, "sign/golomb site not found"
+s = s.replace(old4, new4, 1)
+
+open(path, "w").write(s)
+print("decodetxb rung 11 (per-symbol coeff ladder) instrumented")
+PYC11
