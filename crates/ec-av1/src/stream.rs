@@ -8039,4 +8039,184 @@ mod tests {
             "{NAME}: {matched} pixel-exact matches, {named_refusals} named refusals out of 20"
         );
     }
+
+    /// lane-tiles r10: non-uniform tile spacing (`uniform_spacing_flag == 0`,
+    /// spec 5.9.15). aomenc never sets this from `--tile-columns`/
+    /// `--tile-rows` (those always take the `uniform_spacing = 1` branch in
+    /// `set_tile_info`, libaom `encoder.c`), and `--auto-tiles` only takes
+    /// the non-uniform balancing path when `g_threads >= 2` -- this charter's
+    /// `--threads=1` rules that out. The only CLI surface that reaches
+    /// libaom's `else { tiles->uniform_spacing = 0; ... }` arm is the
+    /// explicit per-tile size lists `--tile-width=<sb-list>`/
+    /// `--tile-height=<sb-list>` (`av1_cx_iface.c` `set_tile_info`, argument
+    /// parsing at `arg_defs.c`'s `.tile_width`/`.tile_height` -- present in
+    /// the binary, just not printed by `--help`). Probed live with
+    /// `aomenc --tile-width=1,3 --tile-height=1 --sb-size=64` on a 256x64
+    /// source (4 SB columns, 1 SB row): confirmed by hand this round to
+    /// produce a real OBU stream aomdec/ffmpeg both decode.
+    ///
+    /// `decode.rs`'s tile loop was already generic over spacing before this
+    /// gate existed -- it walks `tile_info.mi_col_starts`/`mi_row_starts`
+    /// (populated identically by `read_tile_info` for both the uniform and
+    /// non-uniform branches, spec 5.9.15) and never recomputes tile bounds
+    /// from `cols_log2`/`rows_log2`. The only place in this crate that ever
+    /// refused non-uniform spacing is `frame.rs`'s OBU *writer*
+    /// (`"non-uniform tile spacing is not written"`), an unrelated encode
+    /// path this gate does not touch. So this is a staleness check, not new
+    /// machinery: prove the already-generic decode path live and pin it.
+    #[test]
+    fn a_real_aomenc_stream_with_non_uniform_tile_spacing_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_stream_with_non_uniform_tile_spacing_decodes_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height) = (256usize, 64usize);
+        let mut matched = 0u32;
+        let mut named_refusals = 0u32;
+        let mut saw_non_uniform_spacing = false;
+        for attempt in 0..20u32 {
+            let seed = 42 + attempt;
+            let source = gradients_source(seed, width, height, "duration=0.04:rate=25");
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", "yuv420p", "-f",
+                    "yuv4mpegpipe", "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let mut child = Command::new(aomenc_path())
+                .args([
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    "--cq-level=45",
+                    "--cpu-used=0",
+                    "--limit=1",
+                    "--kf-max-dist=1000",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--sb-size=64",
+                    "--tile-width=1,3",
+                    "--tile-height=1",
+                    "--loopfilter-control=0",
+                    "--enable-rect-partitions=0",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    "--enable-filter-intra=0",
+                    "--enable-smooth-intra=0",
+                    "--enable-paeth-intra=0",
+                    "--enable-directional-intra=0",
+                    "--enable-angle-delta=0",
+                    "--enable-tx-size-search=0",
+                    "--enable-cdef=0",
+                    "--enable-restoration=0",
+                    "--max-partition-size=32",
+                    "--min-partition-size=32",
+                    "--enable-palette=0",
+                    "--enable-intrabc=0",
+                    "--enable-cfl-intra=0",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+
+            let mut probe = Av1Parser::new();
+            let mut pos = 0usize;
+            while pos < stream.len() {
+                let obu = probe.parse_obu(&stream[pos..]).unwrap();
+                pos += obu.total_size;
+                let tile_info = match &obu.kind {
+                    ObuKind::Frame(header, _) => Some(&header.tile_info),
+                    ObuKind::FrameHeader(header) if !header.show_existing_frame => {
+                        Some(&header.tile_info)
+                    }
+                    _ => None,
+                };
+                if let Some(info) = tile_info {
+                    if !info.uniform_spacing {
+                        saw_non_uniform_spacing = true;
+                    }
+                    assert!(
+                        info.cols > 1 || info.rows > 1,
+                        "{NAME}: --tile-width=1,3 --tile-height=1 produced only 1 tile \
+                         (cols={} rows={}, seed {seed}) -- fixture stopped exercising the case",
+                        info.cols,
+                        info.rows
+                    );
+                }
+            }
+
+            let before = crate::decode::tile_hits();
+            let pictures = match decode_stream(&stream) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME} failed outright, not a named refusal (seed {seed}): {msg}"
+                    );
+                    named_refusals += 1;
+                    eprintln!("seed {seed} refusal: {msg}");
+                    continue;
+                }
+                Ok(pictures) => pictures,
+            };
+            let hits = crate::decode::tile_hits() - before;
+            assert!(
+                hits > 0,
+                "{NAME}: tile_hits delta was {hits}, expected >0 (seed {seed})"
+            );
+            assert_eq!(pictures.len(), 1, "{NAME}: expected exactly 1 picture (seed {seed})");
+
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
+            assert_eq!(pictures[0].y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg (seed {seed})");
+            assert_eq!(pictures[0].u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg (seed {seed})");
+            assert_eq!(pictures[0].v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg (seed {seed})");
+            matched += 1;
+        }
+        assert!(
+            matched > 0,
+            "{NAME}: every attempt refused ({named_refusals} refusals); decode_stream never \
+             decoded a non-uniform-tile-spacing stream"
+        );
+        assert!(
+            saw_non_uniform_spacing,
+            "{NAME}: no attempt actually set uniform_spacing_flag == 0 -- this sweep proves \
+             nothing about the non-uniform case"
+        );
+        eprintln!(
+            "{NAME}: {matched} pixel-exact matches, {named_refusals} named refusals out of 20"
+        );
+    }
 }
