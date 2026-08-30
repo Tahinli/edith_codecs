@@ -6712,7 +6712,7 @@ fn read_inter_plane(
     y: usize,
     side: usize,
     base_q_idx: u8,
-    prediction: &[u8],
+    prediction: &[u16],
     // lane-chromau: this block's own luma transform's *actual coded*
     // `tx_type` -- `av1_get_tx_type` (libaom `blockd.h`): an inter block's
     // chroma plane never codes its own `tx_type` symbol, but (unlike an
@@ -7143,8 +7143,8 @@ fn obmc_neighbour_pred(
     luma: bool,
     h_kind: mc::InterpFilterKind,
     v_kind: mc::InterpFilterKind,
-) -> Vec<u8> {
-    let mut out = vec![0u8; w * h];
+) -> Vec<u16> {
+    let mut out = vec![0u16; w * h];
     mc::predict_with_filters(
         &refplane.data,
         refplane.width,
@@ -7191,7 +7191,7 @@ fn interintra_blend(
     side: usize,
     ii_mode: u8,
     wedge: Option<(&'static [u8], usize)>,
-    pred: &mut [u8],
+    pred: &mut [u16],
 ) {
     // `interintra_to_intra_mode`: II_DC/II_V/II_H/II_SMOOTH.
     let intra_mode = match ii_mode {
@@ -7209,7 +7209,7 @@ fn interintra_blend(
             below_left: false,
         },
     );
-    let mut intra = vec![0u8; side * side];
+    let mut intra = vec![0u16; side * side];
     // Edge filtering never applies here: V/H at delta 0 are plain edge
     // copies (angle 90/180 skip the directional walk), DC/SMOOTH carry no
     // angle at all.
@@ -7253,33 +7253,33 @@ fn interintra_blend(
             });
             let idx = i * side + j;
             pred[idx] =
-                ((m * u32::from(intra[idx]) + (64 - m) * u32::from(pred[idx]) + 32) >> 6) as u8;
+                ((m * u32::from(intra[idx]) + (64 - m) * u32::from(pred[idx]) + 32) >> 6) as u16;
         }
     }
 }
 
-fn obmc_blend_v(dst: &mut [u8], stride: usize, ox: usize, oy: usize, w: usize, h: usize, tmp: &[u8]) {
+fn obmc_blend_v(dst: &mut [u16], stride: usize, ox: usize, oy: usize, w: usize, h: usize, tmp: &[u16]) {
     let mask = obmc_mask(h);
     for row in 0..h {
         let m = u32::from(mask[row]);
         for col in 0..w {
             let d = &mut dst[(oy + row) * stride + ox + col];
             let t = u32::from(tmp[row * w + col]);
-            *d = ((m * u32::from(*d) + (64 - m) * t + 32) >> 6) as u8;
+            *d = ((m * u32::from(*d) + (64 - m) * t + 32) >> 6) as u16;
         }
     }
 }
 
 /// Blends `tmp` into `dst` at `(ox, oy)`, mask varying by column (the
 /// left-neighbour pass, `aom_blend_a64_hmask`).
-fn obmc_blend_h(dst: &mut [u8], stride: usize, ox: usize, oy: usize, w: usize, h: usize, tmp: &[u8]) {
+fn obmc_blend_h(dst: &mut [u16], stride: usize, ox: usize, oy: usize, w: usize, h: usize, tmp: &[u16]) {
     let mask = obmc_mask(w);
     for row in 0..h {
         for col in 0..w {
             let m = u32::from(mask[col]);
             let d = &mut dst[(oy + row) * stride + ox + col];
             let t = u32::from(tmp[row * w + col]);
-            *d = ((m * u32::from(*d) + (64 - m) * t + 32) >> 6) as u8;
+            *d = ((m * u32::from(*d) + (64 - m) * t + 32) >> 6) as u16;
         }
     }
 }
@@ -7318,9 +7318,9 @@ fn obmc_blend(
     ref_v: &PlaneBuf,
     other_refs: &RefSlots,
     interp_fixed: Option<mc::InterpFilterKind>,
-    pred_y: &mut [u8],
-    pred_u: &mut [u8],
-    pred_v: &mut [u8],
+    pred_y: &mut [u16],
+    pred_u: &mut [u16],
+    pred_v: &mut [u16],
 ) -> Result<()> {
     // lane-rect r2 (libaom av1_build_obmc_inter_prediction): each pass has
     // its OWN neighbour cap (width-log2 for above, height-log2 for left) and
@@ -8382,7 +8382,7 @@ fn decode_inter_block(
                 v_filter,
                 &mut inter1_y,
             );
-            let mut pred_y = vec![0u8; side * side];
+            let mut pred_y = vec![0u16; side * side];
             let mut diffwtd_mask_y = Vec::new();
             // lane-wedge r3: `mask_y` is the DIFFWTD buffer just computed OR
             // the wedge codebook lookup (comp_group_idx==1's two mutually
@@ -8431,7 +8431,7 @@ fn decode_inter_block(
                 v_filter,
                 &mut inter1_u,
             );
-            let mut pred_u = vec![0u8; chroma_side * chroma_side];
+            let mut pred_u = vec![0u16; chroma_side * chroma_side];
             if let Some(mask_y) = mask_y {
                 mc::blend_masked_compound(
                     &inter0_u,
@@ -8475,7 +8475,7 @@ fn decode_inter_block(
                 v_filter,
                 &mut inter1_v,
             );
-            let mut pred_v = vec![0u8; chroma_side * chroma_side];
+            let mut pred_v = vec![0u16; chroma_side * chroma_side];
             if let Some(mask_y) = mask_y {
                 mc::blend_masked_compound(
                     &inter0_v,
@@ -9028,7 +9028,7 @@ fn decode_inter_block(
             mode_for_tx = 0;
             uv_predict_mode = DC_PRED;
 
-            let mut pred_y = vec![0u8; side * side];
+            let mut pred_y = vec![0u16; side * side];
             mc::predict_with_filters(
                 &py_ref.data,
                 py_ref.width,
@@ -9042,7 +9042,7 @@ fn decode_inter_block(
                 v_filter,
                 &mut pred_y,
             );
-            let mut pred_u = vec![0u8; chroma_side * chroma_side];
+            let mut pred_u = vec![0u16; chroma_side * chroma_side];
             mc::predict_with_filters(
                 &pu_ref.data,
                 pu_ref.width,
@@ -9056,7 +9056,7 @@ fn decode_inter_block(
                 v_filter,
                 &mut pred_u,
             );
-            let mut pred_v = vec![0u8; chroma_side * chroma_side];
+            let mut pred_v = vec![0u16; chroma_side * chroma_side];
             mc::predict_with_filters(
                 &pv_ref.data,
                 pv_ref.width,
@@ -9843,7 +9843,7 @@ fn decode_inter_block8(
                     Regular,
                     &mut inter1_y,
                 );
-                let mut pred_y = vec![0u8; SIDE * SIDE];
+                let mut pred_y = vec![0u16; SIDE * SIDE];
                 let mut diffwtd_mask_y = Vec::new();
                 let mask_y: Option<&[u8]> = if let Some(mask_type) = diffwtd_mask_type {
                     diffwtd_mask_y = vec![0u8; SIDE * SIDE];
@@ -9888,7 +9888,7 @@ fn decode_inter_block8(
                     Regular,
                     &mut inter1_u,
                 );
-                let mut pred_u = vec![0u8; CHROMA_SIDE * CHROMA_SIDE];
+                let mut pred_u = vec![0u16; CHROMA_SIDE * CHROMA_SIDE];
                 if let Some(mask_y) = mask_y {
                     mc::blend_masked_compound(
                         &inter0_u,
@@ -9932,7 +9932,7 @@ fn decode_inter_block8(
                     Regular,
                     &mut inter1_v,
                 );
-                let mut pred_v = vec![0u8; CHROMA_SIDE * CHROMA_SIDE];
+                let mut pred_v = vec![0u16; CHROMA_SIDE * CHROMA_SIDE];
                 if let Some(mask_y) = mask_y {
                     mc::blend_masked_compound(
                         &inter0_v,
@@ -10199,7 +10199,7 @@ fn decode_inter_block8(
         }
         mode_for_tx = 0;
 
-        let mut pred_y = vec![0u8; SIDE * SIDE];
+        let mut pred_y = vec![0u16; SIDE * SIDE];
         mc::predict(
             &ref_y.data,
             ref_y.width,
@@ -10211,7 +10211,7 @@ fn decode_inter_block8(
             SIDE,
             &mut pred_y,
         );
-        let mut pred_u = vec![0u8; CHROMA_SIDE * CHROMA_SIDE];
+        let mut pred_u = vec![0u16; CHROMA_SIDE * CHROMA_SIDE];
         mc::predict(
             &ref_u.data,
             ref_u.width,
@@ -10223,7 +10223,7 @@ fn decode_inter_block8(
             CHROMA_SIDE,
             &mut pred_u,
         );
-        let mut pred_v = vec![0u8; CHROMA_SIDE * CHROMA_SIDE];
+        let mut pred_v = vec![0u16; CHROMA_SIDE * CHROMA_SIDE];
         mc::predict(
             &ref_v.data,
             ref_v.width,

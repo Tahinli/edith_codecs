@@ -427,11 +427,11 @@ fn clip_pixel(v: i32) -> u16 {
 #[allow(clippy::too_many_arguments)]
 pub fn warp_affine(
     params: &WarpParams,
-    reference: &[u8],
+    reference: &[u16],
     width: i32,
     height: i32,
     stride: i32,
-    dst: &mut [u8],
+    dst: &mut [u16],
     p_col: i32,
     p_row: i32,
     p_width: i32,
