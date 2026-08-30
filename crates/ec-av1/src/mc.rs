@@ -411,6 +411,141 @@ pub fn predict_with_filters(
     crate::encode::stage_add(1, stage_t.elapsed());
 }
 
+/// `REF_SCALE_SHIFT`'s "no scaling" value (spec 7.11.3.3, libaom `scale.h`
+/// `REF_NO_SCALE`): `x_scale_fp == REF_NO_SCALE` means the stored reference's
+/// luma width equals the current frame's, so [`predict_scaled`] reduces
+/// exactly to [`predict_with_filters`] (verified in
+/// `predict_scaled_at_no_scale_matches_predict_with_filters` below).
+pub const REF_NO_SCALE: i64 = 1 << 14;
+
+/// The horizontal scale ratio spec 7.11.3.3 derives from luma widths only
+/// (libaom `av1_setup_scale_factors_for_frame`, luma widths, `REF_SCALE_SHIFT
+/// == 14`): `other_width` is the stored reference picture's own luma width,
+/// `this_width` the current frame's coded luma width. AV1 superres never
+/// scales height (r8's derivation), so there is no vertical counterpart.
+pub fn scale_factor(other_width: usize, this_width: usize) -> i64 {
+    (((other_width as i64) << 14) + this_width as i64 / 2) / this_width as i64
+}
+
+thread_local! {
+    /// lane-superres r10: firing count for the bypass gate (class
+    /// `gate-blind-to-feature`) -- how many times [`predict_scaled`] itself
+    /// ran, so the gate can hard-assert the scaled MC path actually fired
+    /// rather than trust a pixel match alone (an unscaled reference would
+    /// pass the pixels and prove nothing).
+    static PREDICT_SCALED_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`PREDICT_SCALED_HITS`].
+pub fn predict_scaled_hits() -> usize {
+    PREDICT_SCALED_HITS.with(|c| c.get())
+}
+
+fn round_pow2_64(value: i64, shift: u32) -> i64 {
+    if shift == 0 {
+        value
+    } else {
+        (value + (1i64 << (shift - 1))) >> shift
+    }
+}
+
+/// `ROUND_POWER_OF_TWO_SIGNED` (libaom `common/common.h`): halves round away
+/// from zero's *magnitude* -- negative inputs are rounded like their
+/// negation, not truncated toward zero the way a plain arithmetic shift
+/// would.
+fn round_pow2_signed_64(value: i64, shift: u32) -> i64 {
+    if value < 0 {
+        -round_pow2_64(-value, shift)
+    } else {
+        round_pow2_64(value, shift)
+    }
+}
+
+/// [`predict_with_filters`]'s scaled-reference counterpart (spec 7.11.3.3):
+/// used only when the stored reference's luma width differs from the current
+/// frame's (`use_superres` on a non-key frame). `x_scale_fp` is
+/// [`scale_factor`]'s ratio ([`REF_NO_SCALE`] reproduces
+/// `predict_with_filters` bit-exact, pinned by
+/// `predict_scaled_at_no_scale_matches_predict_with_filters`). Per r8's
+/// derivation AV1 superres never scales height, so `y_q4`'s whole-sample /
+/// fraction split and the vertical pass are untouched -- only the horizontal
+/// pass's per-column integer position and filter phase come from a scaled
+/// walk (`x_qn`) instead of a fixed stride-1 one.
+///
+/// # Panics
+/// Panics when `dst` is not `block_w * block_h` long, or the reference is
+/// empty.
+#[allow(clippy::too_many_arguments)]
+pub fn predict_scaled(
+    reference: &[u16],
+    stride: usize,
+    true_width: usize,
+    true_height: usize,
+    x_q4: i32,
+    y_q4: i32,
+    x_scale_fp: i64,
+    block_w: usize,
+    block_h: usize,
+    h_kind: InterpFilterKind,
+    v_kind: InterpFilterKind,
+    dst: &mut [u16],
+) {
+    assert_eq!(dst.len(), block_w * block_h, "the destination is the block");
+    assert!(!reference.is_empty(), "a reference plane has samples");
+    PREDICT_SCALED_HITS.with(|c| c.set(c.get() + 1));
+
+    let y0 = y_q4.div_euclid(16);
+    let yfrac = y_q4.rem_euclid(16) as usize;
+
+    // SCALE_SUBPEL_BITS == 10: x_step_qn is x_scale_fp (Q14) rounded down to
+    // Q10; off/pos_x_q10 fold the block's own x_q4 (Q4) into that same Q10
+    // grid (spec 7.11.3.3's `dec_calc_subpel_params`).
+    let x_step_qn = round_pow2_64(x_scale_fp, 4);
+    let off = (x_scale_fp - REF_NO_SCALE) * 8;
+    let pos_x_q10 = round_pow2_signed_64(x_q4 as i64 * x_scale_fp + off, 8) + 32;
+
+    let (h_wide, h_narrow) = h_kind.tables();
+    let (v_wide, v_narrow) = v_kind.tables();
+    let v_filter = if block_h <= 4 {
+        &v_narrow[yfrac]
+    } else {
+        &v_wide[yfrac]
+    };
+
+    let rows = block_h + 7;
+    let mut intermediate = vec![0i32; rows * block_w];
+    for c in 0..block_w {
+        let x_qn = pos_x_q10 + c as i64 * x_step_qn;
+        let int_pel = (x_qn >> 10) as i32;
+        let filter_idx = ((x_qn & 1023) >> 6) as usize;
+        let h_filter = if block_w <= 4 {
+            &h_narrow[filter_idx]
+        } else {
+            &h_wide[filter_idx]
+        };
+        for r in 0..rows {
+            let y = y0 - 3 + r as i32;
+            let mut sum = 0;
+            for (t, &tap) in h_filter.iter().enumerate() {
+                let x = int_pel + t as i32 - 3;
+                sum += tap * sample(reference, stride, true_width, true_height, x, y);
+            }
+            intermediate[r * block_w + c] = round2(sum, INTER_ROUND_0);
+        }
+    }
+
+    for row in 0..block_h {
+        for col in 0..block_w {
+            let mut sum = 0;
+            for (t, &tap) in v_filter.iter().enumerate() {
+                sum += tap * intermediate[(row + t) * block_w + col];
+            }
+            dst[row * block_w + col] =
+                round2(sum, INTER_ROUND_1).clamp(0, crate::decode::sample_max()) as u16;
+        }
+    }
+}
+
 /// `InterRound1` for a compound ref (spec 7.11.3.2's `isCompound` branch,
 /// `COMPOUND_ROUND1_BITS` in libaom's `convolve.h`): 4 bits shallower than
 /// [`INTER_ROUND_1`] so the vertical pass lands in the `CONV_BUF` domain
@@ -625,7 +760,10 @@ fn compound_intermediate_whole_pel_identity_round_trips_through_combine() {
 
 #[cfg(test)]
 mod tests {
-    use super::{InterpFilterKind, predict, predict_with_filter};
+    use super::{
+        InterpFilterKind, REF_NO_SCALE, predict, predict_scaled, predict_with_filter,
+        predict_with_filters,
+    };
 
     /// Regression pin for the lane-av1flake ±1 defect: a real aomenc chroma
     /// inter block at the frame's top-left corner (mv q4 = (row 7, col 15),
@@ -905,5 +1043,55 @@ mod tests {
             dst2.iter().all(|&v| v == expected2),
             "an MV past the bottom-right edge must clamp to the corner sample, got {dst2:?}"
         );
+    }
+
+    #[test]
+    fn predict_scaled_at_no_scale_matches_predict_with_filters() {
+        // Algebraic pin from the r8/r9 derivation: x_scale_fp == REF_NO_SCALE
+        // must reduce predict_scaled's per-column scaled walk to the exact
+        // same int_pel/filter_idx sequence predict_with_filters computes from
+        // a fixed stride-1 walk -- every subpel fraction, every block width.
+        let width = 24;
+        let height = 24;
+        let reference: Vec<u16> = (0..width * height).map(|i| (i * 7 % 251) as u16).collect();
+        for block_w in [4usize, 8, 16] {
+            for x_frac in 0..16i32 {
+                let x_q4 = 3 * 16 + x_frac;
+                let y_q4 = 2 * 16 + 5;
+                let mut expected = vec![0u16; block_w * 8];
+                predict_with_filters(
+                    &reference,
+                    width,
+                    width,
+                    height,
+                    x_q4,
+                    y_q4,
+                    block_w,
+                    8,
+                    InterpFilterKind::Regular,
+                    InterpFilterKind::Regular,
+                    &mut expected,
+                );
+                let mut got = vec![0u16; block_w * 8];
+                predict_scaled(
+                    &reference,
+                    width,
+                    width,
+                    height,
+                    x_q4,
+                    y_q4,
+                    REF_NO_SCALE,
+                    block_w,
+                    8,
+                    InterpFilterKind::Regular,
+                    InterpFilterKind::Regular,
+                    &mut got,
+                );
+                assert_eq!(
+                    got, expected,
+                    "block_w={block_w} x_frac={x_frac}: REF_NO_SCALE must reproduce predict_with_filters exactly"
+                );
+            }
+        }
     }
 }
