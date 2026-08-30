@@ -21,6 +21,7 @@ pub mod encode;
 pub mod encoder;
 mod film_grain;
 pub mod frame;
+mod gate_coverage;
 pub mod intra;
 pub mod mc;
 pub mod motion;
