@@ -8555,4 +8555,245 @@ mod tests {
             "{NAME}: {matched} pixel-exact matches, {named_refusals} named refusals out of 20"
         );
     }
+
+    /// lane-sbpart r2: a real `aomenc` stream whose superblock-level
+    /// partition decision is genuinely HORZ/VERT (not NONE/SPLIT) must
+    /// decode pixel-exact through [`crate::decode::decode_block_rect64`] --
+    /// `sb_rect_hits() > 0` is a HARD assert (this round's rule: a removed
+    /// refusal needs a firing gate in the same commit, not a green suite
+    /// that never took the new path). Recipe = the charter's own, verified
+    /// live by r1: `--min/max-partition-size=32/64` keeps the RD search
+    /// from ever recursing below 32x32, so every SB-level decision is
+    /// genuinely NONE/SPLIT/HORZ/VERT; a `gradients` source blended with
+    /// `testsrc2` (lavfi `blend=all_mode=average`) keeps the content from
+    /// being flat enough that the search stops at NONE every time.
+    #[test]
+    fn a_real_aomenc_stream_with_a_superblock_level_horz_vert_partition_decodes_pixel_exact() {
+        const NAME: &str =
+            "a_real_aomenc_stream_with_a_superblock_level_horz_vert_partition_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height, frame_count) = (192usize, 128usize, 1usize);
+        let mut named_refusals = 0u32;
+        let mut matched = 0u32;
+        let n_attempts: u32 = std::env::var("EC_SBPART_GATE_ATTEMPTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(40);
+        for attempt in 0..n_attempts {
+            let seed = 42 + attempt;
+            let duration = frame_count as f64 / 25.0;
+            let source =
+                gradients_source(seed, width, height, &format!("duration={duration}:rate=25"));
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let args: Vec<&str> = vec![
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                "--cq-level=45",
+                "--cpu-used=0",
+                "--threads=1",
+                "--row-mt=0",
+                "--sb-size=64",
+                "--enable-rect-partitions=1",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0",
+                "--min-partition-size=32",
+                "--max-partition-size=64",
+                "--enable-restoration=0",
+                "--enable-palette=0",
+                "--deltaq-mode=0",
+                "--enable-filter-intra=0",
+                "--enable-cfl-intra=0",
+                "--enable-intrabc=0",
+                "--enable-tx-size-search=0",
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ];
+            let mut child = Command::new(aomenc_path())
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let frames = match decode_stream(&stream) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME} failed outright, not a named refusal (seed {seed}): {msg}"
+                    );
+                    // r2: `--enable-ab-partitions=0` does NOT stop aomenc
+                    // choosing an SB-level HORZ_A/HORZ_B/VERT_A/VERT_B
+                    // (`partition_w64` value 4-7) even with
+                    // `--min/max-partition-size=32/64` -- a real, separate
+                    // encoder quirk (AB-at-64 is a different, unlanded
+                    // capability, lane-partab's territory is 32x32 and
+                    // below only) discovered live this round, not this
+                    // lane's HORZ/VERT gap. Only NONE/SPLIT/HORZ/VERT
+                    // (values 0-3) are this gate's territory; a real
+                    // HORZ/VERT (1/2) must still decode pixel-exact, which
+                    // `sb_rect_hits() > 0` below hard-proves.
+                    named_refusals += 1;
+                    eprintln!("seed {seed} refusal: {msg}");
+                    continue;
+                }
+                Ok(frames) => frames,
+            };
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
+            assert_eq!(frames.len(), frame_count);
+            let mismatched = frames
+                .iter()
+                .zip(&ffmpeg_frames)
+                .any(|(got, want)| got.y != want.y || got.u != want.u || got.v != want.v);
+            if mismatched {
+                if let Ok(path) = std::env::var("EC_AV1_GATE_DUMP") {
+                    std::fs::write(&path, &stream).expect("writing pinned stream");
+                    eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
+                }
+            }
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
+                assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
+            }
+            matched += 1;
+        }
+        assert!(
+            matched > 0,
+            "{NAME}: every attempt refused; the gate never decoded a stream"
+        );
+        assert!(
+            crate::decode::sb_rect_hits() > 0,
+            "{NAME}: zero superblock-level HORZ/VERT blocks fired ({matched} matches, \
+             {named_refusals} refusals out of {n_attempts}) -- gate proved nothing this run"
+        );
+        eprintln!(
+            "{NAME}: {named_refusals} named refusals, {matched} pixel-exact matches out of \
+             {n_attempts}, sb_rect_hits={}",
+            crate::decode::sb_rect_hits()
+        );
+    }
+
+    /// lane-sbpart r4: replays a pinned mismatch byte-for-byte off disk (no
+    /// aomenc/ffmpeg re-encode), same pattern as `pinned_golden3/4_stream_
+    /// decodes_pixel_exact` -- fast red/green loop for the bisect, and lets
+    /// `EC_AV1_TRACE=1` be set for one run without re-driving the encoder.
+    #[test]
+    #[ignore = "reads a pinned fixture path outside the repo; run manually"]
+    fn pinned_sbpart_stream_decodes_pixel_exact() {
+        let path = std::env::var("EC_AV1_GATE_DUMP_PIN")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| pin_dir().join("sbpart-pin.obu"));
+        let Ok(stream) = std::fs::read(&path) else {
+            eprintln!(
+                "SKIP pinned_sbpart_stream_decodes_pixel_exact: no pinned bytes at {} \
+                 -- re-capture with EC_AV1_GATE_DUMP off the sbpart gate",
+                path.display()
+            );
+            return;
+        };
+        if !have_ffmpeg() {
+            eprintln!("SKIP pinned_sbpart_stream_decodes_pixel_exact: no ffmpeg");
+            return;
+        }
+        let frames = decode_stream(&stream).expect("pinned stream must decode");
+        let ffmpeg_frames = ffmpeg_decode_sequence(&stream, 192, 128, 1);
+        let (width, height) = (192usize, 128usize);
+        for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+            if std::env::var_os("EC_SBPART_DIAG").is_some() {
+                let (mut min_r, mut max_r, mut min_c, mut max_c, mut n) =
+                    (usize::MAX, 0usize, usize::MAX, 0usize, 0usize);
+                for r in 0..height {
+                    for c in 0..width {
+                        let idx = r * width + c;
+                        if got.y[idx] != want.y[idx] {
+                            min_r = min_r.min(r);
+                            max_r = max_r.max(r);
+                            min_c = min_c.min(c);
+                            max_c = max_c.max(c);
+                            n += 1;
+                        }
+                    }
+                }
+                eprintln!(
+                    "DIAG frame {i}: {n} luma mismatches, bbox rows [{min_r}..{max_r}] cols \
+                     [{min_c}..{max_c}] of {width}x{height}"
+                );
+                // Per-64px-superblock-column mismatch counts, to see whether
+                // corruption starts exactly at the rect64 SB or bleeds into
+                // SBs decoded earlier (raster order).
+                for sb_col in 0..(width + 63) / 64 {
+                    let c0 = sb_col * 64;
+                    let c1 = (c0 + 64).min(width);
+                    let mut cnt = 0usize;
+                    let mut first = None;
+                    for r in 0..height {
+                        for c in c0..c1 {
+                            let idx = r * width + c;
+                            if got.y[idx] != want.y[idx] {
+                                cnt += 1;
+                                if first.is_none() {
+                                    first = Some((r, c));
+                                }
+                            }
+                        }
+                    }
+                    eprintln!(
+                        "DIAG frame {i} sb_col {sb_col} (cols {c0}..{c1}): {cnt} mismatches, \
+                         first={first:?}"
+                    );
+                }
+            }
+            assert_eq!(got.y, want.y, "frame {i} luma vs ffmpeg (pinned sbpart)");
+            assert_eq!(got.u, want.u, "frame {i} U vs ffmpeg (pinned sbpart)");
+            assert_eq!(got.v, want.v, "frame {i} V vs ffmpeg (pinned sbpart)");
+        }
+    }
 }
