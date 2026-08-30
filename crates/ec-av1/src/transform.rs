@@ -280,12 +280,24 @@ pub fn inverse_dct(t: &mut [i32], n: u32, r: usize) {
     }
 }
 
-/// `Transform_Row_Shift` (spec 7.13.3) for the square transforms.
-fn row_shift(log2: u32) -> usize {
-    match log2 {
-        2 => 0,
-        3 => 1,
-        _ => 2,
+/// `Transform_Row_Shift` (spec 7.13.3) / `av1_inv_txfm_shift_ls`
+/// (`av1_inv_txfm2d.c:132-158`): `shift[0]`, keyed on the full `(w, h)` TX
+/// size, not a single log2 -- the five square values (unchanged from the
+/// pre-lane `row_shift(log2)`) plus the fourteen rectangular ones the lane
+/// charter transcribed from the same table.
+fn row_shift_wh(w: usize, h: usize) -> usize {
+    match (w, h) {
+        (4, 4) => 0,
+        (8, 8) => 1,
+        (16, 16) | (32, 32) | (64, 64) => 2,
+        (4, 8) | (8, 4) => 0,
+        (8, 16) | (16, 8) => 1,
+        (16, 32) | (32, 16) => 1,
+        (32, 64) | (64, 32) => 1,
+        (4, 16) | (16, 4) => 1,
+        (8, 32) | (32, 8) => 2,
+        (16, 64) | (64, 16) => 2,
+        _ => unreachable!("unsupported transform size {w}x{h}"),
     }
 }
 
@@ -790,29 +802,55 @@ pub fn inverse_transform_2d_typed(
     bit_depth: u8,
     tx_type: TxType,
 ) -> Vec<i32> {
-    let log2 = side.trailing_zeros();
-    assert_eq!(1usize << log2, side, "the transform is square");
-    assert_eq!(dequant.len(), side * side, "one coefficient per position");
+    inverse_transform_2d_typed_wh(dequant, side, side, bit_depth, tx_type)
+}
+
+/// [`inverse_transform_2d_typed`] widened to `(w, h)` (lane-recttx): the row
+/// pass transforms `w`-point vectors (`log2(w)`), the column pass
+/// `h`-point vectors (`log2(h)`), and a rect-only pre-row-transform scale
+/// is applied when the two axes are exactly one power-of-two apart (spec
+/// 7.13.3; `av1_inv_txfm2d.c:272-276`, `abs(rect_type) == 1`). `dequant` is
+/// still raster order (`dequant[i * w + j]`, row `i` of `h`, column `j` of
+/// `w`) -- libaom's own buffer for the same math is column-major, an
+/// unrelated fact about ITS storage, not the spec's arithmetic (class
+/// `reference-layout-not-spec`).
+pub fn inverse_transform_2d_typed_wh(
+    dequant: &[i32],
+    w: usize,
+    h: usize,
+    bit_depth: u8,
+    tx_type: TxType,
+) -> Vec<i32> {
+    let log2w = w.trailing_zeros();
+    let log2h = h.trailing_zeros();
+    assert_eq!(1usize << log2w, w, "width must be a power of two");
+    assert_eq!(1usize << log2h, h, "height must be a power of two");
+    assert_eq!(dequant.len(), w * h, "one coefficient per position");
     let row_clamp = usize::from(bit_depth) + 8;
     let col_clamp = (usize::from(bit_depth) + 6).max(16);
-    let mut residual = vec![0i32; side * side];
+    let mut residual = vec![0i32; w * h];
     let (row_kind, col_kind) = tx_type.axes();
     let (ud_flip, lr_flip) = tx_type.flip();
+    // `get_rect_tx_log_ratio` (`av1_inv_txfm2d.c:248`): the scale fires only
+    // at ratio exactly 1, never 0 (square) or 2 (e.g. 4x16/16x4/8x32/32x8/
+    // 16x64/64x16).
+    let rect_scale = (log2w as i32 - log2h as i32).abs() == 1;
 
     let mut t = [0i32; 64];
-    for i in 0..side {
-        for j in 0..side {
-            t[j] = if i < 32 && j < 32 {
-                dequant[i * side + j]
+    for i in 0..h {
+        for j in 0..w {
+            let c = if i < 32 && j < 32 { dequant[i * w + j] } else { 0 };
+            t[j] = if rect_scale {
+                round2(c * 2896, 12)
             } else {
-                0
+                c
             };
         }
-        inverse_1d(&mut t, log2, row_clamp, row_kind);
-        for j in 0..side {
+        inverse_1d(&mut t, log2w, row_clamp, row_kind);
+        for j in 0..w {
             // The row's output is shifted, then clamped before the column
             // transform reads it back.
-            residual[i * side + j] = clamp_range(round2(t[j], row_shift(log2)), col_clamp);
+            residual[i * w + j] = clamp_range(round2(t[j], row_shift_wh(w, h)), col_clamp);
         }
     }
 
@@ -822,16 +860,17 @@ pub fn inverse_transform_2d_typed(
     // place, because a flipped read/write pair aliases a column this same
     // loop has not visited yet (column `j`'s write target under `lr_flip`
     // is a column an unflipped loop would still need to read from later).
-    let mut out = vec![0i32; side * side];
-    for j in 0..side {
-        let src_col = if lr_flip { side - 1 - j } else { j };
-        for i in 0..side {
-            t[i] = residual[i * side + src_col];
+    // `lr_flip` mirrors over `w` (the row axis), `ud_flip` over `h`.
+    let mut out = vec![0i32; w * h];
+    for j in 0..w {
+        let src_col = if lr_flip { w - 1 - j } else { j };
+        for i in 0..h {
+            t[i] = residual[i * w + src_col];
         }
-        inverse_1d(&mut t, log2, col_clamp, col_kind);
-        for i in 0..side {
-            let dst_row = if ud_flip { side - 1 - i } else { i };
-            out[dst_row * side + j] = round2(t[i], 4);
+        inverse_1d(&mut t, log2h, col_clamp, col_kind);
+        for i in 0..h {
+            let dst_row = if ud_flip { h - 1 - i } else { i };
+            out[dst_row * w + j] = round2(t[i], 4);
         }
     }
     out
@@ -856,8 +895,20 @@ pub fn dequant_and_inverse_typed(
     q_idx: i32,
     tx_type: TxType,
 ) -> Vec<i32> {
-    let dq = crate::quant::dequant(levels, side, bit_depth, q_idx);
-    inverse_transform_2d_typed(&dq, side, bit_depth, tx_type)
+    dequant_and_inverse_typed_wh(levels, side, side, bit_depth, q_idx, tx_type)
+}
+
+/// [`dequant_and_inverse_typed`] widened to `(w, h)` (lane-recttx).
+pub fn dequant_and_inverse_typed_wh(
+    levels: &[i32],
+    w: usize,
+    h: usize,
+    bit_depth: u8,
+    q_idx: i32,
+    tx_type: TxType,
+) -> Vec<i32> {
+    let dq = crate::quant::dequant_wh(levels, w, h, bit_depth, q_idx);
+    inverse_transform_2d_typed_wh(&dq, w, h, bit_depth, tx_type)
 }
 
 /// [`dequant_and_inverse_typed`] at `DCT_DCT`.
@@ -1571,5 +1622,84 @@ mod tests {
         assert_ne!(adst_dct, dct_dct);
         assert_ne!(dct_adst, dct_dct);
         assert_ne!(adst_adst, dct_dct);
+    }
+
+    /// The lane-recttx charter's asymmetric coefficient block (`coeff` in
+    /// `lanes/recttx_dump.c`, which this pin was transcribed alongside): a
+    /// DC of 640 plus a distinct row-weighted/col-weighted 4x4 corner, zero
+    /// elsewhere, so a transposed axis produces a genuinely different
+    /// checksum rather than a coincidentally equal one.
+    fn recttx_coeff(w: usize, h: usize) -> Vec<i32> {
+        let mut d = vec![0i32; w * h];
+        for i in 0..h {
+            for j in 0..w {
+                d[i * w + j] = if i == 0 && j == 0 {
+                    640
+                } else if i < 4 && j < 4 {
+                    (i as i32 + 1) * 24 - (j as i32 + 1) * 17
+                } else {
+                    0
+                };
+            }
+        }
+        d
+    }
+
+    fn weighted_checksum(residual: &[i32]) -> i64 {
+        residual
+            .iter()
+            .enumerate()
+            .map(|(idx, &v)| i64::from(v) * (idx as i64 + 1))
+            .sum()
+    }
+
+    /// Every one of the 14 rectangular sizes, DCT_DCT, `bit_depth = 8`,
+    /// pinned against `lanes/recttx_dump.c` / `.expected.txt` -- a real
+    /// libaom 1D-kernel-linked C harness, not a from-scratch reimplement.
+    /// The transposed HxW twin runs in the SAME test (class
+    /// `scan-weights-cross-axis`): a swapped-axis bug in
+    /// `inverse_transform_2d_typed_wh` would either fail its own pin or
+    /// accidentally match its twin's pin, and the two expected values here
+    /// are deliberately different, so neither escape is possible.
+    #[test]
+    fn rect_sizes_pinned_against_libaom() {
+        let cases: &[(usize, usize, i64)] = &[
+            (4, 8, 7290),
+            (8, 4, 7223),
+            (8, 16, 56211),
+            (16, 8, 56161),
+            (16, 32, 893635),
+            (32, 16, 893210),
+            (32, 64, 14260693),
+            (64, 32, 14265125),
+            (4, 16, 20091),
+            (16, 4, 20156),
+            (8, 32, 159207),
+            (32, 8, 159430),
+            (16, 64, 2537255),
+            (64, 16, 2548119),
+        ];
+        for &(w, h, expected) in cases {
+            let dequant = recttx_coeff(w, h);
+            let residual = inverse_transform_2d_typed_wh(&dequant, w, h, 8, TxType::DctDct);
+            assert_eq!(
+                weighted_checksum(&residual),
+                expected,
+                "{w}x{h} checksum mismatch"
+            );
+        }
+    }
+
+    /// The square path must not move: `row_shift_wh(side, side)` reduces to
+    /// the pre-lane `row_shift(log2)` table, and the `side`-taking wrapper
+    /// must still equal the `(w, h)` core called with `w == h == side`.
+    #[test]
+    fn square_wrapper_matches_wh_core() {
+        for side in [4, 8, 16, 32, 64] {
+            let dequant = recttx_coeff(side, side);
+            let via_wrapper = inverse_transform_2d_typed(&dequant, side, 8, TxType::DctDct);
+            let via_wh = inverse_transform_2d_typed_wh(&dequant, side, side, 8, TxType::DctDct);
+            assert_eq!(via_wrapper, via_wh, "side {side}");
+        }
     }
 }
