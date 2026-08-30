@@ -885,6 +885,10 @@ const DC_PRED: usize = 0;
 /// carries an angle delta — [`crate::tile`]'s own private copy of the same
 /// constant.
 const V_PRED: usize = 1;
+const H_PRED: usize = 2;
+/// `D157_PRED`: `fimode_to_intradir`'s target for `FILTER_D157_PRED` (spec
+/// `Fimode_To_Intradir`, libaom `blockd.h`).
+const D157_PRED: usize = 6;
 /// The last directional mode, `D67_PRED`.
 const D67_PRED: usize = 8;
 /// The symbol an angle delta of zero codes as (spec 9.3): the alphabet runs
@@ -1377,6 +1381,13 @@ fn read_coeffs(
         eprintln!("EC_AV1_STATE_BEFORE_TXBSKIP range={range} value={value}");
     }
     let all_zero = dec.symbol(&mut coding.txb_skip[skip_ctx]) == 1;
+    if std::env::var_os("EC_TRACE_COEFF").is_some() {
+        let (rng, _) = dec.debug_state();
+        eprintln!(
+            "EC_COEFF_STEP tag=all_zero ctx={skip_ctx} all_zero={} rng={rng}",
+            all_zero as i32
+        );
+    }
     if std::env::var_os("EC_AV1_TELL").is_some() {
         eprintln!(
             "TELL label=post_txb_skip ctx={skip_ctx} all_zero={} tell={} range={}",
@@ -1408,6 +1419,10 @@ fn read_coeffs(
             eprintln!("EC_AV1_TXTYPE32_CDF {tx_type_cdf:?}");
         }
         let t = dec.symbol(tx_type_cdf);
+        if std::env::var_os("EC_TRACE_COEFF").is_some() {
+            let (rng, _) = dec.debug_state();
+            eprintln!("EC_COEFF_STEP tag=tx_type rng={rng}");
+        }
         if std::env::var_os("EC_AV1_EOBPT_CDF").is_some() {
             let (range, value) = dec.debug_state();
             eprintln!("EC_AV1_STATE_AFTER_TXTYPE range={range} value={value}");
@@ -1431,6 +1446,11 @@ fn read_coeffs(
     let eob = read_eob(dec, coding, class);
     if trace {
         eprintln!("TRACE eob value={eob}");
+    }
+    let ec_trace_coeff = std::env::var_os("EC_TRACE_COEFF").is_some();
+    if ec_trace_coeff {
+        let (rng, _) = dec.debug_state();
+        eprintln!("EC_COEFF_STEP tag=eob eob={eob} rng={rng}");
     }
     let class_scan;
     let scan: &[u16] = if class == TxClass::TwoD {
@@ -1483,10 +1503,18 @@ fn read_coeffs(
         } else {
             level
         };
+        if ec_trace_coeff && scan_idx == eob - 1 {
+            let (rng, _) = dec.debug_state();
+            eprintln!("EC_COEFF_STEP tag=base_eob level={level} rng={rng}");
+        }
         levels[pos] = level;
     }
+    if ec_trace_coeff {
+        let (rng, _) = dec.debug_state();
+        eprintln!("EC_COEFF_STEP tag=after_bases rng={rng}");
+    }
 
-    for &pos in &scan[..eob] {
+    for (c, &pos) in scan[..eob].iter().enumerate() {
         let level = levels[pos as usize];
         if level == 0 {
             continue;
@@ -1500,6 +1528,10 @@ fn read_coeffs(
         } else {
             dec.literal(1) == 1
         };
+        if ec_trace_coeff {
+            let (rng, _) = dec.debug_state();
+            eprintln!("EC_COEFF_STEP tag=sign c={c} sign={} rng={rng}", negative as i32);
+        }
         let level = if level.abs_diff(0) as i32 > MAX_BR_LEVEL {
             let g = read_golomb(dec)?;
             if trace {
@@ -1509,6 +1541,10 @@ fn read_coeffs(
         } else {
             level
         };
+        if ec_trace_coeff {
+            let (rng, _) = dec.debug_state();
+            eprintln!("EC_COEFF_STEP tag=post_golomb c={c} level={level} rng={rng}");
+        }
         grid[pos as usize] = if negative { -level } else { level };
     }
     Ok((grid, tx_type))
@@ -4343,6 +4379,18 @@ fn read_plane(
         luma_skip_ctx.unwrap_or(0)
     } else {
         usize::from(around.0) + usize::from(around.1)
+    };
+    // spec 5.11.47/libaom `av1_read_tx_type`: a filter-intra luma block's
+    // `intra_ext_tx_cdf` row is indexed by `fimode_to_intradir[filter_intra_mode]`,
+    // not by the block's ordinary `mode` (which is always DC_PRED whenever
+    // filter-intra is on) -- caller passes the raw filter-intra mode 0..4 in
+    // `filter_intra`, only meaningful for `plane_idx == 0` (chroma has no
+    // filter-intra in AV1).
+    const FIMODE_TO_INTRADIR: [usize; 5] = [DC_PRED, V_PRED, H_PRED, D157_PRED, DC_PRED];
+    let tx_mode = if plane_idx == 0 {
+        filter_intra.map_or(tx_mode, |fi| FIMODE_TO_INTRADIR[fi])
+    } else {
+        tx_mode
     };
     let mut coding = cdfs.txb(set, tx_mode);
     // Luma's `default_tx_type` is only a fallback for the sizes whose
