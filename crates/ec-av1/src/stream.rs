@@ -4841,6 +4841,44 @@ mod tests {
         );
     }
 
+    /// r8: decode the ONE pinned stream `EC_AV1_GATE_DUMP` captured in r7
+    /// (`fixtures/lr-sgr-r7.obu`, seed 46) directly -- not the live
+    /// 40-attempt sweep, which reuses `v_start` coordinates across unrelated
+    /// seeds/frames and made r6's captured 9 bytes unprovable. Run with
+    /// `EC_LR_CALL_DUMP=1` set (see `restoration.rs`'s `apply_sgrproj_stripe`)
+    /// to get the real window on stderr, call-uniquely keyed to `xqd ==
+    /// [-16,-32]` rather than any coordinate.
+    #[test]
+    #[ignore = "reads a pinned fixture under the gitignored fixtures dir; run manually with EC_LR_CALL_DUMP=1"]
+    fn pinned_lr_sgr_stream_call_unique_dump() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/lr-sgr-r7.obu");
+        let stream = std::fs::read(path).expect("reading pinned lr-sgr-r7.obu");
+        let pics = decode_stream(&stream).expect("pinned lr-sgr-r7.obu must decode");
+        if have_ffmpeg() {
+            let reference = ffmpeg_decode_sequence(&stream, 192, 128, pics.len());
+            for (i, (got, want)) in pics.iter().zip(&reference).enumerate() {
+                let y_mismatch = got.y != want.y;
+                let u_mismatch = got.u != want.u;
+                let v_mismatch = got.v != want.v;
+                eprintln!(
+                    "frame {i}: y_mismatch={y_mismatch} u_mismatch={u_mismatch} v_mismatch={v_mismatch}"
+                );
+                if y_mismatch {
+                    let n = got.y.iter().zip(&want.y).filter(|(a, b)| a != b).count();
+                    eprintln!("  {n} luma bytes differ / {}", got.y.len());
+                }
+                if v_mismatch {
+                    let w = 96usize; // chroma plane width (192/2)
+                    for (idx, (a, b)) in got.v.iter().zip(&want.v).enumerate() {
+                        if a != b {
+                            eprintln!("  V[{},{}] got={a} want={b}", idx / w, idx % w);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Pinned streams captured by `EC_AV1_GATE_DUMP` off
     /// `a_real_aomenc_stream_with_warped_motion_refuses_or_matches` -- each
     /// one is a former mismatch, kept as a regression pin (warp-mismatch:
