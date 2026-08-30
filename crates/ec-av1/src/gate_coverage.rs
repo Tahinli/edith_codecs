@@ -26,9 +26,7 @@
 #[cfg(test)]
 const NEVER_EXERCISED: &[(&str, &str)] = &[
     ("enable-intrabc", "intra block copy syntax is consumed but no block is reconstructed from it"),
-    ("enable-paeth-intra", "chroma PAETH_PRED is refused; luma is unexercised against a real stream"),
     ("enable-palette", "palette syntax is consumed but no block is reconstructed from a palette"),
-    ("enable-smooth-intra", "chroma SMOOTH_PRED is refused, and the intra edge filter's smooth-neighbour bucket is a known corner-cut"),
 ];
 
 #[cfg(test)]
