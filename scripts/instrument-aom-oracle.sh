@@ -15,6 +15,13 @@
 #       before every partition symbol, "EC_PART_VAL .. value=.." after. The
 #       range ladder: compare rng element-by-element against our own
 #       `TRACE part32_pre` (class compare-range-not-tell -- ranges, never tell).
+#   EC_TRACE_COEFF=1 -> "EC_COEFF plane=.. row=.. col=.. tx_size=.. rng=.."
+#       before every coefficient block, "EC_COEFF_VAL .. rng=.." after.
+#       Partition granularity is too coarse to localize a coefficient desync;
+#       two lanes stalled on 2026-08-30 because this rung did not exist.
+#   EC_TRACE_MODE=1 -> "EC_MODE mi_row=.. mi_col=.. rng=.." before every inter
+#       block's mode info, "EC_MODE_VAL .. mode=.. ref0/1=.. mv0=.. rng=.."
+#       after -- the mv-stack/DRL/mv reads EC_PART cannot see.
 #
 # Idempotent: re-running is a no-op. Rebuild afterwards with
 #   ninja -C ~/.cache/aom-oracle/build aomdec
@@ -103,3 +110,105 @@ open(path, "w").write(s)
 print("instrumented")
 PY
 echo "now: ninja -C ${AOM_ORACLE_BUILD:-$HOME/.cache/aom-oracle/build} aomdec"
+
+# --- rung 3: coefficient range ladder (decodetxb.c) ---------------------
+G="$SRC/av1/decoder/decodetxb.c"
+[ -f "$G" ] || { echo "no oracle source at $G" >&2; exit 1; }
+
+python3 - "$G" <<'PYC'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+if "EC_INSTRUMENTED" in s:
+    print("decodetxb already instrumented (no-op)")
+    sys.exit(0)
+
+old = """void av1_read_coeffs_txb(const AV1_COMMON *const cm, DecoderCodingBlock *dcb,
+                         aom_reader *const r, const int plane, const int row,
+                         const int col, const TX_SIZE tx_size) {"""
+new = """/* EC_INSTRUMENTED */
+static void ec_read_coeffs_txb_impl(const AV1_COMMON *const cm,
+                                    DecoderCodingBlock *dcb,
+                                    aom_reader *const r, const int plane,
+                                    const int row, const int col,
+                                    const TX_SIZE tx_size);
+
+void av1_read_coeffs_txb(const AV1_COMMON *const cm, DecoderCodingBlock *dcb,
+                         aom_reader *const r, const int plane, const int row,
+                         const int col, const TX_SIZE tx_size) {
+  const int ec_trace = getenv("EC_TRACE_COEFF") != NULL;
+  if (ec_trace) {
+    fprintf(stderr, "EC_COEFF plane=%d row=%d col=%d tx_size=%d rng=%u\\n",
+            plane, row, col, (int)tx_size, (unsigned)r->ec.rng);
+  }
+  ec_read_coeffs_txb_impl(cm, dcb, r, plane, row, col, tx_size);
+  if (ec_trace) {
+    fprintf(stderr, "EC_COEFF_VAL plane=%d row=%d col=%d rng=%u\\n", plane, row,
+            col, (unsigned)r->ec.rng);
+  }
+}
+
+static void ec_read_coeffs_txb_impl(const AV1_COMMON *const cm,
+                                    DecoderCodingBlock *dcb,
+                                    aom_reader *const r, const int plane,
+                                    const int row, const int col,
+                                    const TX_SIZE tx_size) {"""
+assert old in s, "av1_read_coeffs_txb signature moved"
+s = s.replace(old, new, 1)
+open(path, "w").write(s)
+print("decodetxb instrumented")
+PYC
+
+# --- rung 4: mode-info range ladder (decodemv.c) ------------------------
+H="$SRC/av1/decoder/decodemv.c"
+[ -f "$H" ] || { echo "no oracle source at $H" >&2; exit 1; }
+
+python3 - "$H" <<'PYM'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+if "EC_INSTRUMENTED" in s:
+    print("decodemv already instrumented (no-op)")
+    sys.exit(0)
+
+old = """static void read_inter_block_mode_info(AV1Decoder *const pbi,
+                                       DecoderCodingBlock *dcb,
+                                       MB_MODE_INFO *const mbmi,
+                                       aom_reader *r) {"""
+new = """/* EC_INSTRUMENTED */
+static void ec_read_inter_block_mode_info_impl(AV1Decoder *const pbi,
+                                               DecoderCodingBlock *dcb,
+                                               MB_MODE_INFO *const mbmi,
+                                               aom_reader *r);
+
+static void read_inter_block_mode_info(AV1Decoder *const pbi,
+                                       DecoderCodingBlock *dcb,
+                                       MB_MODE_INFO *const mbmi,
+                                       aom_reader *r) {
+  const int ec_trace = getenv("EC_TRACE_MODE") != NULL;
+  const MACROBLOCKD *const ec_xd = &dcb->xd;
+  if (ec_trace) {
+    fprintf(stderr, "EC_MODE mi_row=%d mi_col=%d rng=%u\\n", ec_xd->mi_row,
+            ec_xd->mi_col, (unsigned)r->ec.rng);
+  }
+  ec_read_inter_block_mode_info_impl(pbi, dcb, mbmi, r);
+  if (ec_trace) {
+    fprintf(stderr,
+            "EC_MODE_VAL mi_row=%d mi_col=%d mode=%d ref0=%d ref1=%d "
+            "mv0=(%d,%d) rng=%u\\n",
+            ec_xd->mi_row, ec_xd->mi_col, (int)mbmi->mode,
+            (int)mbmi->ref_frame[0], (int)mbmi->ref_frame[1],
+            mbmi->mv[0].as_mv.row, mbmi->mv[0].as_mv.col,
+            (unsigned)r->ec.rng);
+  }
+}
+
+static void ec_read_inter_block_mode_info_impl(AV1Decoder *const pbi,
+                                               DecoderCodingBlock *dcb,
+                                               MB_MODE_INFO *const mbmi,
+                                               aom_reader *r) {"""
+assert old in s, "read_inter_block_mode_info signature moved"
+s = s.replace(old, new, 1)
+open(path, "w").write(s)
+print("decodemv instrumented")
+PYM
