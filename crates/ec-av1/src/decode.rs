@@ -51,11 +51,11 @@ const PARTITION_VERT_B: usize = 7;
 const SB_MI: u32 = 16;
 const BLOCK_MI: u32 = 8;
 
-/// How many `use_filter_intra` symbols this decoder has read as `1`, across
-/// every call in the process -- the cheap counter [`filter_intra_hits`] gate
-/// tests read (before/after, not the absolute value) to prove a stream
-/// actually exercised the filter-intra predictor rather than silently
-/// skipping it.
+// How many `use_filter_intra` symbols this decoder has read as `1`, across
+// every call on the current thread -- the cheap counter [`filter_intra_hits`] gate
+// tests read (before/after, not the absolute value) to prove a stream
+// actually exercised the filter-intra predictor rather than silently
+// skipping it.
 thread_local! {
     static FILTER_INTRA_HITS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
@@ -66,10 +66,10 @@ pub(crate) fn filter_intra_hits() -> usize {
     FILTER_INTRA_HITS.with(|c| c.get())
 }
 
-/// How many 4-pixel deblocking edge groups [`edge_params`] has actually
-/// selected for filtering, across every call in the process -- the same
-/// before/after counter pattern as [`FILTER_INTRA_HITS`], proving a stream
-/// exercised `apply_deblock` rather than every edge landing on level 0.
+// How many 4-pixel deblocking edge groups [`edge_params`] has actually
+// selected for filtering, across every call on the current thread -- the same
+// before/after counter pattern as [`FILTER_INTRA_HITS`], proving a stream
+// exercised `apply_deblock` rather than every edge landing on level 0.
 thread_local! {
     static DEBLOCK_HITS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
@@ -85,12 +85,12 @@ pub(crate) fn deblock_hits() -> usize {
     DEBLOCK_HITS.with(|c| c.get())
 }
 
-/// How many [`read_tx_size`] reads resolved a `tx_depth` strictly less than
-/// the block's own side, across every call in the process -- the same
-/// before/after counter pattern as [`FILTER_INTRA_HITS`], proving a stream
-/// actually exercised a *split* transform under `TxMode::Select` rather than
-/// every block coincidentally resolving `depth=0` (indistinguishable from
-/// `TxMode::Largest` pixel-wise).
+// How many [`read_tx_size`] reads resolved a `tx_depth` strictly less than
+// the block's own side, across every call on the current thread -- the same
+// before/after counter pattern as [`FILTER_INTRA_HITS`], proving a stream
+// actually exercised a *split* transform under `TxMode::Select` rather than
+// every block coincidentally resolving `depth=0` (indistinguishable from
+// `TxMode::Largest` pixel-wise).
 thread_local! {
     static TX_DEPTH_HITS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
@@ -101,21 +101,21 @@ pub(crate) fn tx_depth_hits() -> usize {
     TX_DEPTH_HITS.with(|c| c.get())
 }
 
-/// How many [`read_coeffs`] reads resolved a `tx_type` outside `TX_CLASS_2D`
-/// (`V_DCT`/`H_DCT`, spec 5.11.39's `TxClass::Horiz`/`Vert`), across every
-/// call in the process -- the same before/after counter pattern as
-/// [`TX_DEPTH_HITS`], proving a stream actually exercised the class-split
-/// `eob_pt`/1D-neighbour context path rather than every block coincidentally
-/// landing on `DCT_DCT`.
+// How many [`read_coeffs`] reads resolved a `tx_type` outside `TX_CLASS_2D`
+// (`V_DCT`/`H_DCT`, spec 5.11.39's `TxClass::Horiz`/`Vert`), across every
+// call in the process -- the same before/after counter pattern as
+// [`TX_DEPTH_HITS`], proving a stream actually exercised the class-split
+// `eob_pt`/1D-neighbour context path rather than every block coincidentally
+// landing on `DCT_DCT`.
 thread_local! {
     static TX_CLASS1_HITS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
 }
 
-/// How many `uv_mode` reads resolved to a directional chroma mode (neither
-/// `DC_PRED` nor `UV_CFL_PRED`), across every call in the process -- the same
-/// before/after counter pattern as [`FILTER_INTRA_HITS`], proving a stream
-/// actually exercised chroma's own directional predictor.
+// How many `uv_mode` reads resolved to a directional chroma mode (neither
+// `DC_PRED` nor `UV_CFL_PRED`), across every call on the current thread -- the same
+// before/after counter pattern as [`FILTER_INTRA_HITS`], proving a stream
+// actually exercised chroma's own directional predictor.
 thread_local! {
     static DIRECTIONAL_UV_HITS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
@@ -126,21 +126,21 @@ pub(crate) fn directional_uv_hits() -> usize {
     DIRECTIONAL_UV_HITS.with(|c| c.get())
 }
 
-/// How many `angle_delta`/`angle_delta_uv` symbols this decoder has read as
-/// something other than [`ANGLE_DELTA_ZERO`], across every call in the
-/// process -- the same before/after counter pattern as [`FILTER_INTRA_HITS`],
-/// proving a stream actually exercised a nonzero angle delta.
+// How many `angle_delta`/`angle_delta_uv` symbols this decoder has read as
+// something other than [`ANGLE_DELTA_ZERO`], across every call in the
+// process -- the same before/after counter pattern as [`FILTER_INTRA_HITS`],
+// proving a stream actually exercised a nonzero angle delta.
 thread_local! {
     static ANGLE_DELTA_HITS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
 }
 
-/// How many [`read_single_ref`] reads resolved to a reference other than
-/// `LAST_FRAME`, across every call in the process -- the same before/after
-/// counter pattern as [`FILTER_INTRA_HITS`], proving a stream actually
-/// exercised a non-`LAST_FRAME` reference (`GOLDEN_FRAME`, this decoder's
-/// only other supported one so far) rather than every block coincidentally
-/// resolving `LAST_FRAME`.
+// How many [`read_single_ref`] reads resolved to a reference other than
+// `LAST_FRAME`, across every call on the current thread -- the same before/after
+// counter pattern as [`FILTER_INTRA_HITS`], proving a stream actually
+// exercised a non-`LAST_FRAME` reference (`GOLDEN_FRAME`, this decoder's
+// only other supported one so far) rather than every block coincidentally
+// resolving `LAST_FRAME`.
 thread_local! {
     static NON_LAST_REF_HITS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
@@ -151,12 +151,12 @@ pub(crate) fn non_last_ref_hits() -> usize {
     NON_LAST_REF_HITS.with(|c| c.get())
 }
 
-/// Per-reference [`NON_LAST_REF_HITS`] breakdown (lane-av1refs): one counter
-/// per `MV_REFERENCE_FRAME` past `LAST_FRAME`, so a gate targeting one
-/// specific reference (`LAST2`/`LAST3`/`GOLDEN`/`BWDREF`/`ALTREF2`/`ALTREF`)
-/// can prove THAT reference fired rather than any non-`LAST_FRAME` one --
-/// `NON_LAST_REF_HITS` alone cannot tell a `LAST2_FRAME` gate from a
-/// `GOLDEN_FRAME` draw it did not ask for.
+// Per-reference [`NON_LAST_REF_HITS`] breakdown (lane-av1refs): one counter
+// per `MV_REFERENCE_FRAME` past `LAST_FRAME`, so a gate targeting one
+// specific reference (`LAST2`/`LAST3`/`GOLDEN`/`BWDREF`/`ALTREF2`/`ALTREF`)
+// can prove THAT reference fired rather than any non-`LAST_FRAME` one --
+// `NON_LAST_REF_HITS` alone cannot tell a `LAST2_FRAME` gate from a
+// `GOLDEN_FRAME` draw it did not ask for.
 thread_local! {
     static LAST2_HITS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
@@ -182,11 +182,11 @@ thread_local! {
         const { std::cell::Cell::new(0) };
 }
 
-/// How many [`read_comp_mode`] reads resolved `COMPOUND_REFERENCE` (lane-av1comp)
-/// -- proves a `reference_select` stream actually reached a block that picked
-/// compound, not just that the header bit was set. Every such block is
-/// refused after this fires ([`decode_inter_block`]/[`decode_inter_block8`]),
-/// so this only ever counts attempted reads, never a completed decode.
+// How many [`read_comp_mode`] reads resolved `COMPOUND_REFERENCE` (lane-av1comp)
+// -- proves a `reference_select` stream actually reached a block that picked
+// compound, not just that the header bit was set. Every such block is
+// refused after this fires ([`decode_inter_block`]/[`decode_inter_block8`]),
+// so this only ever counts attempted reads, never a completed decode.
 thread_local! {
     static COMP_MODE_HITS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
@@ -197,9 +197,9 @@ pub(crate) fn comp_mode_hits() -> usize {
     COMP_MODE_HITS.with(|c| c.get())
 }
 
-/// How many blocks decoded `skip_mode == 1` (lane-av1comp round 14) --
-/// proves a real `skip_mode_present` stream actually reached a block that
-/// picked it, not just that the frame header bit was set.
+// How many blocks decoded `skip_mode == 1` (lane-av1comp round 14) --
+// proves a real `skip_mode_present` stream actually reached a block that
+// picked it, not just that the frame header bit was set.
 thread_local! {
     static SKIP_MODE_HITS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
@@ -210,10 +210,10 @@ pub(crate) fn skip_mode_hits() -> usize {
     SKIP_MODE_HITS.with(|c| c.get())
 }
 
-/// lane-motionmode: how many blocks actually decoded `obmc_selected == true`
-/// (as opposed to just reaching an eligible `read_motion_mode` symbol read)
-/// -- the gate's own proof that a real aomenc `--enable-obmc=1` stream
-/// reached [`obmc_blend`], not just the header bit.
+// lane-motionmode: how many blocks actually decoded `obmc_selected == true`
+// (as opposed to just reaching an eligible `read_motion_mode` symbol read)
+// -- the gate's own proof that a real aomenc `--enable-obmc=1` stream
+// reached [`obmc_blend`], not just the header bit.
 thread_local! {
     static OBMC_HITS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
@@ -224,20 +224,20 @@ pub(crate) fn obmc_hits() -> usize {
     OBMC_HITS.with(|c| c.get())
 }
 
-/// lane-motionmode round 3: same proof as [`OBMC_HITS`], narrowed to
-/// `decode_inter_block8`'s own 8x8-leaf `read_motion_mode` -- a subset of
-/// [`OBMC_HITS`] (both fire together on an 8x8 hit), lets the gate tell an
-/// 8x8-leaf OBMC block apart from a 16x16+ one.
+// lane-motionmode round 3: same proof as [`OBMC_HITS`], narrowed to
+// `decode_inter_block8`'s own 8x8-leaf `read_motion_mode` -- a subset of
+// [`OBMC_HITS`] (both fire together on an 8x8 hit), lets the gate tell an
+// 8x8-leaf OBMC block apart from a 16x16+ one.
 thread_local! {
     static OBMC_HITS_8: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// lane-warp round 1: how many blocks resolved `motion_mode_allowed` to
-/// `WARPED_CAUSAL`-eligible (3-symbol read, `num_proj_ref >= 1` under
-/// `allow_warped_motion`) AND the symbol actually decoded to `WARPED_CAUSAL`
-/// -- the gate's proof that a fixture really exercises the alphabet this
-/// round changed, even though the block itself still refuses (warp
-/// estimation/filter not ported).
+// lane-warp round 1: how many blocks resolved `motion_mode_allowed` to
+// `WARPED_CAUSAL`-eligible (3-symbol read, `num_proj_ref >= 1` under
+// `allow_warped_motion`) AND the symbol actually decoded to `WARPED_CAUSAL`
+// -- the gate's proof that a fixture really exercises the alphabet this
+// round changed, even though the block itself still refuses (warp
+// estimation/filter not ported).
 thread_local! {
     static WARP_SELECTED_HITS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
@@ -248,9 +248,9 @@ pub(crate) fn warp_selected_hits() -> usize {
     WARP_SELECTED_HITS.with(|c| c.get())
 }
 
-/// How many blocks decoded `interintra == 1` with the non-wedge blended
-/// prediction applied (lane-interintra r1) -- the gate's proof that a
-/// stream actually exercised interintra.
+// How many blocks decoded `interintra == 1` with the non-wedge blended
+// prediction applied (lane-interintra r1) -- the gate's proof that a
+// stream actually exercised interintra.
 thread_local! {
     static INTERINTRA_HITS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
@@ -261,11 +261,11 @@ pub(crate) fn interintra_hits() -> usize {
     INTERINTRA_HITS.with(|c| c.get())
 }
 
-/// How many blocks decoded `comp_group_idx == 1` (masked COMPOUND_REFERENCE,
-/// wedge or diffwtd) and had `compound_type`/`wedge_idx`/`wedge_sign`/
-/// `mask_type` consumed entropy-exact -- lane-maskcomp r1's proof that a
-/// gate fixture actually exercises this alphabet, even though the block
-/// still refuses (the mask blend itself is unported).
+// How many blocks decoded `comp_group_idx == 1` (masked COMPOUND_REFERENCE,
+// wedge or diffwtd) and had `compound_type`/`wedge_idx`/`wedge_sign`/
+// `mask_type` consumed entropy-exact -- lane-maskcomp r1's proof that a
+// gate fixture actually exercises this alphabet, even though the block
+// still refuses (the mask blend itself is unported).
 thread_local! {
     static MASKED_COMPOUND_HITS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
@@ -276,10 +276,10 @@ pub(crate) fn masked_compound_hits() -> usize {
     MASKED_COMPOUND_HITS.with(|c| c.get())
 }
 
-/// How many blocks decoded a real `COMPOUND_WEDGE` block (`comp_group_idx ==
-/// 1`, `compound_type == 0`) -- lane-wedge r3's proof a gate fixture
-/// actually exercised the wedge blend, not just the DIFFWTD half of
-/// `MASKED_COMPOUND_HITS`.
+// How many blocks decoded a real `COMPOUND_WEDGE` block (`comp_group_idx ==
+// 1`, `compound_type == 0`) -- lane-wedge r3's proof a gate fixture
+// actually exercised the wedge blend, not just the DIFFWTD half of
+// `MASKED_COMPOUND_HITS`.
 thread_local! {
     static WEDGE_HITS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
@@ -290,10 +290,10 @@ pub(crate) fn wedge_hits() -> usize {
     WEDGE_HITS.with(|c| c.get())
 }
 
-/// How many blocks decoded a real wedge-INTERINTRA block
-/// (`interintra == 1 && use_wedge_interintra == 1`) -- lane-wii r2's proof
-/// a gate fixture exercised the wedge blend (fixed sign 0), not just the
-/// smooth arm counted by `INTERINTRA_HITS`.
+// How many blocks decoded a real wedge-INTERINTRA block
+// (`interintra == 1 && use_wedge_interintra == 1`) -- lane-wii r2's proof
+// a gate fixture exercised the wedge blend (fixed sign 0), not just the
+// smooth arm counted by `INTERINTRA_HITS`.
 thread_local! {
     static WII_HITS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
@@ -309,13 +309,13 @@ pub(crate) fn obmc_hits_8() -> usize {
     OBMC_HITS_8.with(|c| c.get())
 }
 
-/// lane-rectgate r1: how many 32x32 quadrants actually decoded a
-/// `PARTITION_HORZ_B` split (the one extended/ab partition this decoder's
-/// inter-frame tile loop decodes -- `PARTITION_HORZ`/`VERT`/`HORZ_A`/`VERT_A`/
-/// `VERT_B` all still fall into the generic "a partition type this encoder
-/// never writes" refusal below) -- the gate's proof that a free-partition
-/// aomenc stream actually exercised a non-`NONE`/`SPLIT` partition rather than
-/// coincidentally never selecting one.
+// lane-rectgate r1: how many 32x32 quadrants actually decoded a
+// `PARTITION_HORZ_B` split (the one extended/ab partition this decoder's
+// inter-frame tile loop decodes -- `PARTITION_HORZ`/`VERT`/`HORZ_A`/`VERT_A`/
+// `VERT_B` all still fall into the generic "a partition type this encoder
+// never writes" refusal below) -- the gate's proof that a free-partition
+// aomenc stream actually exercised a non-`NONE`/`SPLIT` partition rather than
+// coincidentally never selecting one.
 thread_local! {
     static EXTENDED_PARTITION_HITS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
@@ -326,10 +326,10 @@ pub(crate) fn extended_partition_hits() -> usize {
     EXTENDED_PARTITION_HITS.with(|c| c.get())
 }
 
-/// lane-partitions r1: how many 32x32 quadrants decoded a real
-/// `PARTITION_HORZ`/`PARTITION_VERT` (two true rectangular strips, unlike
-/// `PARTITION_HORZ_B`'s square-context stand-in) -- the free-partition
-/// gate's proof this round's arms actually fired.
+// lane-partitions r1: how many 32x32 quadrants decoded a real
+// `PARTITION_HORZ`/`PARTITION_VERT` (two true rectangular strips, unlike
+// `PARTITION_HORZ_B`'s square-context stand-in) -- the free-partition
+// gate's proof this round's arms actually fired.
 thread_local! {
     static RECT_PARTITION_HITS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
@@ -340,10 +340,10 @@ pub(crate) fn rect_partition_hits() -> usize {
     RECT_PARTITION_HITS.with(|c| c.get())
 }
 
-/// lane-rectwire r2: how many `PARTITION_HORZ`/`VERT` strips actually decoded
-/// real (non-skip) coefficients through [`read_coeffs_rect`] -- proves the
-/// rect coefficient reader itself fired, not just the strip-level partition
-/// symbol [`RECT_PARTITION_HITS`] already counts.
+// lane-rectwire r2: how many `PARTITION_HORZ`/`VERT` strips actually decoded
+// real (non-skip) coefficients through [`read_coeffs_rect`] -- proves the
+// rect coefficient reader itself fired, not just the strip-level partition
+// symbol [`RECT_PARTITION_HITS`] already counts.
 thread_local! {
     static RECT_COEFF_HITS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
@@ -354,10 +354,10 @@ pub(crate) fn rect_coeff_hits() -> usize {
     RECT_COEFF_HITS.with(|c| c.get())
 }
 
-/// lane-partab r1: how many 32x32 quadrants decoded an AB partition
-/// (PARTITION_HORZ_A / VERT_A / VERT_B -- two 16x16 squares plus one
-/// 16x32/32x16 strip). Like [`RECT_PARTITION_HITS`], this is the
-/// free-partition gate's proof this round's arms actually fired.
+// lane-partab r1: how many 32x32 quadrants decoded an AB partition
+// (PARTITION_HORZ_A / VERT_A / VERT_B -- two 16x16 squares plus one
+// 16x32/32x16 strip). Like [`RECT_PARTITION_HITS`], this is the
+// free-partition gate's proof this round's arms actually fired.
 thread_local! {
     static PARTAB_HITS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
@@ -368,12 +368,12 @@ pub(crate) fn partab_hits() -> usize {
     PARTAB_HITS.with(|c| c.get())
 }
 
-/// How many [`read_inter_compound_mode`] reads actually happened
-/// (lane-av1comp) -- proves a `COMPOUND_REFERENCE` block reached its own
-/// `compound_mode` symbol (past `comp_mode`/`comp_ref` and the compound
-/// mvstack build), not just that `comp_mode` fired. Still refused right
-/// after (no MV assignment or MC wired), so this only counts attempted
-/// reads.
+// How many [`read_inter_compound_mode`] reads actually happened
+// (lane-av1comp) -- proves a `COMPOUND_REFERENCE` block reached its own
+// `compound_mode` symbol (past `comp_mode`/`comp_ref` and the compound
+// mvstack build), not just that `comp_mode` fired. Still refused right
+// after (no MV assignment or MC wired), so this only counts attempted
+// reads.
 thread_local! {
     static COMPOUND_MODE_HITS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
