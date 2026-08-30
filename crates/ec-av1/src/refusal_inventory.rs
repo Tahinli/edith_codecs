@@ -28,7 +28,6 @@ const CAPABILITY_CLAIMS: &[&str] = &[
     "a non-2D tx class on a rectangular transform (never expected at this size)",
     "a non-DC chroma mode on an 8x8 inter-frame leaf (this encoder never writes one)",
     "a nonzero angle delta (this encoder never writes one)",
-    "a partition below 16x16 other than a clean split (this decoder codes only the square arms below 16x16)",
     "a partition below 8x8 (this decoder codes no leaf smaller than 8x8)",
     "a tx_type symbol on a rectangular transform (never expected at this size)",
 ];
@@ -36,6 +35,9 @@ const CAPABILITY_CLAIMS: &[&str] = &[
 #[cfg(test)]
 const REFUSALS: &[&str] = &[
     "GLOBALMV (round 3)",
+    "a coded (non-skip) HORZ_B/VERT_B rect strip below 16x16 (this decoder ports only the skip case at this size)",
+    "a coded (non-skip) HORZ/VERT rect strip below 16x16 (this decoder ports only the skip case at this size)",
+    "a HORZ_A/HORZ_B/VERT_A partition below 16x16 (this decoder codes only the square arms, HORZ, VERT, VERT_B, and a clean split below 16x16)",
     "a 16x16 block whose true edge cuts through both axes needs a rectangular transform this decoder does not code yet",
     "a 16x16 inter block whose true edge cuts through both axes needs a rectangular transform this decoder does not code yet",
     "a 32x32 partition type this decoder does not code (value={part32})",
