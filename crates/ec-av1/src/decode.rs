@@ -7513,6 +7513,13 @@ fn decode_inter_block(
     // `frame_is_intra_only`), but it still calls `read_palette_mode_info`
     // under the same `av1_allow_palette` gate as the key-frame path.
     allow_screen_content_tools: bool,
+    // lane-superres r9: this frame's own coded luma width (spec 7.11.3.3) --
+    // compared against each reference's stored picture width to decide
+    // whether a scaled-MC path (`mc::predict_scaled`) or the ordinary
+    // stride-1 one (`mc::predict_with_filters`) applies per reference, and to
+    // refuse (rather than mis-decode) the warp/OBMC/interintra/compound
+    // combinations that don't implement scaled MC yet.
+    frame_width: usize,
 ) -> Result<()> {
     let (r, c) = at;
     let (px, py) = (c * SUB, r * SUB);
@@ -10772,6 +10779,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             BLOCK,
                             BLOCK,
                             allow_screen_content_tools,
+                            frame_width as usize,
                         )?;
                     }
                     PARTITION_SPLIT => {
@@ -10851,6 +10859,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     SUB,
                                     SUB,
                                     allow_screen_content_tools,
+                                    frame_width as usize,
                                 )?;
                             } else {
                                 let ctx16 = neighbours.partition_ctx(at16, SUB);
@@ -11029,6 +11038,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             BLOCK,
                             SUB,
                             allow_screen_content_tools,
+                            frame_width as usize,
                         )?;
                         if (r32 * 2 + 1) as u32 * SUB_MI < mi_rows {
                             decode_inter_block(
@@ -11082,6 +11092,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                 SUB,
                                 SUB,
                                 allow_screen_content_tools,
+                                frame_width as usize,
                             )?;
                             if (c32 * 2 + 1) as u32 * SUB_MI < mi_cols {
                                 decode_inter_block(
@@ -11135,6 +11146,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     SUB,
                                     SUB,
                                     allow_screen_content_tools,
+                                    frame_width as usize,
                                 )?;
                             }
                         }
@@ -11194,6 +11206,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             BLOCK,
                             SUB,
                             allow_screen_content_tools,
+                            frame_width as usize,
                         )?;
                         decode_inter_block(
                             &mut dec,
@@ -11242,6 +11255,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             BLOCK,
                             SUB,
                             allow_screen_content_tools,
+                            frame_width as usize,
                         )?;
                     }
                     PARTITION_VERT => {
@@ -11295,6 +11309,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             SUB,
                             BLOCK,
                             allow_screen_content_tools,
+                            frame_width as usize,
                         )?;
                         decode_inter_block(
                             &mut dec,
@@ -11343,6 +11358,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             SUB,
                             BLOCK,
                             allow_screen_content_tools,
+                            frame_width as usize,
                         )?;
                     }
                     PARTITION_HORZ_A => {
@@ -11401,6 +11417,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             SUB,
                             SUB,
                             allow_screen_content_tools,
+                            frame_width as usize,
                         )?;
                         decode_inter_block(
                             &mut dec,
@@ -11453,6 +11470,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             SUB,
                             SUB,
                             allow_screen_content_tools,
+                            frame_width as usize,
                         )?;
                         decode_inter_block(
                             &mut dec,
@@ -11501,6 +11519,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             BLOCK,
                             SUB,
                             allow_screen_content_tools,
+                            frame_width as usize,
                         )?;
                     }
                     PARTITION_VERT_A => {
@@ -11558,6 +11577,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             SUB,
                             SUB,
                             allow_screen_content_tools,
+                            frame_width as usize,
                         )?;
                         decode_inter_block(
                             &mut dec,
@@ -11610,6 +11630,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             SUB,
                             SUB,
                             allow_screen_content_tools,
+                            frame_width as usize,
                         )?;
                         decode_inter_block(
                             &mut dec,
@@ -11658,6 +11679,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             SUB,
                             BLOCK,
                             allow_screen_content_tools,
+                            frame_width as usize,
                         )?;
                     }
                     PARTITION_VERT_B => {
@@ -11712,6 +11734,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             SUB,
                             BLOCK,
                             allow_screen_content_tools,
+                            frame_width as usize,
                         )?;
                         decode_inter_block(
                             &mut dec,
@@ -11764,6 +11787,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             SUB,
                             SUB,
                             allow_screen_content_tools,
+                            frame_width as usize,
                         )?;
                         decode_inter_block(
                             &mut dec,
@@ -11816,6 +11840,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             SUB,
                             SUB,
                             allow_screen_content_tools,
+                            frame_width as usize,
                         )?;
                     }
                     _ => {
@@ -12669,6 +12694,7 @@ mod tests {
             side,
             side,
             false,
+            width,
         )
         .unwrap();
 
