@@ -98,3 +98,28 @@ all inside that same full-suite run (test names visible in the tail output:
 Flip the KEY-frame tile dispatch (`decode.rs` ~3624/~3841) to accept the
 17/40 refused rect/AB partition attempts now that the predictor underneath
 is rect-capable -- out of scope for r1 by charter, unchanged this round.
+
+## Cross-provider verification (opus, 2026-08-30) — PASS, with two corrections
+
+All 6 claims CONFIRMED against pinned libaom v3.13.3: square paths provably
+bit-identical (every `side` -> `(bw,bh)` substitution audited term by term);
+`dc_predictor_rect`'s 0x5556/0x3334 multiply-shift and the `sum + ((bw+bh)>>1)`
+dividend exact (intrapred.c:236-279); smooth weight rows not transposed
+(intrapred.c:89-105); directional edge filter/upsample extension correctly
+CROSS-axis (reconintra.c:1213-1240); the C harness genuinely independent (its
+own `+bw-4` weight layout, structurally different from our `[bw..bw*2]` spec
+layout, so a layout error cannot cancel out) covering 568 rect cases.
+
+CORRECTIONS to this report's earlier claims:
+1. "Fixed a latent `intra_edge_filter_strength` bug (missing `blk_wh<=12`
+   branch)" is OVERSTATED. The branch does exist in reconintra.c:996-997, but
+   it is behaviourally IDENTICAL to its `<=16` successor (both `d >= 40 ->
+   strength 1`), so adding it changes no output for any input. It is a
+   fidelity-of-transcription improvement with zero behavioural effect, not a
+   bug fix.
+2. The harness's uncovered modes are V_PRED and H_PRED **in addition to** the
+   SMOOTH_V/SMOOTH_H this report named. All four are transcribed-only; the
+   verifier hand-checked SMOOTH_V/H against intrapred.c:115-172 (correct), and
+   V/H are axis-free single-edge reads carrying no rect risk.
+Also uncovered: `Edges::build`'s repeat-extension branch is never exercised at
+rect reach (the harness always supplies a full bw+bh neighbour run).
