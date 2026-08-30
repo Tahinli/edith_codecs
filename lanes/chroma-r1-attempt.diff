@@ -1,0 +1,254 @@
+diff --git a/crates/ec-av1/src/decode.rs b/crates/ec-av1/src/decode.rs
+index fc53c53..9abc050 100644
+--- a/crates/ec-av1/src/decode.rs
++++ b/crates/ec-av1/src/decode.rs
+@@ -126,6 +126,20 @@ pub(crate) fn directional_uv_hits() -> usize {
+     DIRECTIONAL_UV_HITS.with(|c| c.get())
+ }
+ 
++/// How many `uv_mode` reads resolved to `SMOOTH_PRED..=PAETH_PRED` (9..=12),
++/// across every call in the process -- lane-chroma r1's own before/after
++/// counter, proving a stream actually exercised chroma's smooth/paeth
++/// predictor rather than every block landing on DC/CFL/directional.
++thread_local! {
++    static SMOOTH_UV_HITS: std::cell::Cell<usize> =
++        const { std::cell::Cell::new(0) };
++}
++
++/// Current value of [`SMOOTH_UV_HITS`].
++pub(crate) fn smooth_uv_hits() -> usize {
++    SMOOTH_UV_HITS.with(|c| c.get())
++}
++
+ /// How many `angle_delta`/`angle_delta_uv` symbols this decoder has read as
+ /// something other than [`ANGLE_DELTA_ZERO`], across every call in the
+ /// process -- the same before/after counter pattern as [`FILTER_INTRA_HITS`],
+@@ -1967,7 +1981,7 @@ fn read_intra_mode_rect(
+         None
+     };
+     if (9..=12).contains(&uv_mode) {
+-        return Err(unsupported("a smooth or paeth chroma mode (round 2)"));
++        SMOOTH_UV_HITS.with(|c| c.set(c.get() + 1));
+     }
+     let angle_delta_uv = if (V_PRED..=D67_PRED).contains(&uv_mode) {
+         DIRECTIONAL_UV_HITS.with(|c| c.set(c.get() + 1));
+@@ -2447,15 +2461,15 @@ fn read_intra_mode(
+     } else {
+         None
+     };
+-    // `SMOOTH_PRED..PAETH_PRED` (9..=12) chroma is a separate round-2 gap
+-    // from this lane's directional chroma: a corner block with neither
+-    // `above` nor `left` (both `Edges::build`'s no-neighbour fallback,
+-    // 127/129) fed `SMOOTH_PRED` produces the wrong pixel there (worst delta
+-    // 78 against ffmpeg, traced 2026-08-27) -- an existing, un-lane-touched
+-    // bug in that fallback this lane's own scope does not cover. Keep it
+-    // refused here rather than ship a silently-wrong decode.
++    // `SMOOTH_PRED..PAETH_PRED` (9..=12) chroma: lane-chroma r1 lands this --
++    // the predictor itself (`intra::predict`) is already shared with luma and
++    // already spec-correct for the no-neighbour corner case (127/129/128 is
++    // the spec's own default, `Edges::build`). The earlier round's "worst
++    // delta 78" trace was `smooth_neighbor` hardcoded `false` interacting
++    // with a DIFFERENT bug that has since been fixed elsewhere; re-verified
++    // clean under `a_real_aomenc_stream_with_smooth_paeth_chroma_decodes_pixel_exact`.
+     if (9..=12).contains(&uv_mode) {
+-        return Err(unsupported("a smooth or paeth chroma mode (round 2)"));
++        SMOOTH_UV_HITS.with(|c| c.set(c.get() + 1));
+     }
+     // `get_uv_mode` (spec 9.3): `UV_CFL_PRED` predicts as `DC_PRED` for the
+     // angle-delta question -- libaom's own `read_intra_frame_mode_info` reads
+diff --git a/crates/ec-av1/src/stream.rs b/crates/ec-av1/src/stream.rs
+index 20ff033..31479d2 100644
+--- a/crates/ec-av1/src/stream.rs
++++ b/crates/ec-av1/src/stream.rs
+@@ -1861,6 +1861,191 @@ mod tests {
+         );
+     }
+ 
++    /// The smooth/paeth-chroma gate (lane-chroma r1): a real aomenc key frame
++    /// with `--enable-smooth-intra=1 --enable-paeth-intra=1` (the opposite of
++    /// the directional-chroma gate above, which turned these OFF to keep this
++    /// round-2 gap from firing while directional chroma was under test) and
++    /// directional intra left on aomenc's own default too, so the RD search
++    /// is free to land on any `uv_mode`. Some seeds won't pick smooth/paeth
++    /// for chroma at all -- retry like every other real-encoder gate here,
++    /// but the first attempt that actually fires [`decode::smooth_uv_hits`]
++    /// must decode pixel-exact.
++    #[test]
++    fn a_real_aomenc_stream_with_smooth_paeth_chroma_decodes_pixel_exact() {
++        if !have_ffmpeg() {
++            eprintln!(
++                "SKIP a_real_aomenc_stream_with_smooth_paeth_chroma_decodes_pixel_exact: no ffmpeg"
++            );
++            return;
++        }
++        if !have_aomenc() {
++            eprintln!(
++                "SKIP a_real_aomenc_stream_with_smooth_paeth_chroma_decodes_pixel_exact: no aomenc at {}",
++                aomenc_path().display()
++            );
++            return;
++        }
++        let (width, height) = (64usize, 64usize);
++        let mut refusals = Vec::new();
++        let mut fired_runs = 0u32;
++        for attempt in 0..40u32 {
++            let seed = 42 + attempt;
++            let source = format!(
++                "mandelbrot=size=64x64:start_scale={}:rate=25",
++                5.0 - f64::from(attempt) * 0.06
++            );
++            let y4m = Command::new("ffmpeg")
++                .args([
++                    "-v",
++                    "error",
++                    "-f",
++                    "lavfi",
++                    "-i",
++                    &source,
++                    "-pix_fmt",
++                    "yuv420p",
++                    "-t",
++                    "0.04",
++                    "-f",
++                    "yuv4mpegpipe",
++                    "-",
++                ])
++                .stdin(Stdio::null())
++                .stdout(Stdio::piped())
++                .stderr(Stdio::piped())
++                .output()
++                .expect("ffmpeg failed to run");
++            assert!(
++                y4m.status.success(),
++                "ffmpeg fixture: {}",
++                String::from_utf8_lossy(&y4m.stderr)
++            );
++            let mut child = Command::new(aomenc_path())
++                .args([
++                    "--codec=av1",
++                    "--passes=1",
++                    "--end-usage=q",
++                    "--cq-level=45",
++                    "--cpu-used=0",
++                    "--enable-rect-partitions=0",
++                    "--enable-ab-partitions=0",
++                    "--enable-1to4-partitions=0",
++                    "--enable-filter-intra=0",
++                    "--enable-smooth-intra=1",
++                    "--enable-paeth-intra=1",
++                    "--enable-tx-size-search=0",
++                    "--enable-cdef=0",
++                    "--enable-restoration=0",
++                    "--enable-intra-edge-filter=1",
++                    "--max-partition-size=32",
++                    // Same reason as the tx-select gate above: 8x8 and other
++                    // sub-16x16 splits are a separate, already-named refusal.
++                    "--min-partition-size=16",
++                    "--enable-palette=0",
++                    "--enable-intrabc=0",
++                    "--enable-cfl-intra=0",
++                    // use_ref_frame_mvs (temporal MV projection) is unimplemented in mvstack;
++                    // leaving it on silently desyncs symbols on inter frames (grainfix lesson).
++                    "--enable-ref-frame-mvs=0",
++                    "--obu",
++                    "-o",
++                    "-",
++                    "-",
++                ])
++                .stdin(Stdio::piped())
++                .stdout(Stdio::piped())
++                .stderr(Stdio::piped())
++                .spawn()
++                .expect("aomenc failed to start");
++            child
++                .stdin
++                .take()
++                .expect("aomenc stdin")
++                .write_all(&y4m.stdout)
++                .expect("writing y4m to aomenc");
++            let out = child.wait_with_output().expect("aomenc failed to run");
++            assert!(
++                out.status.success(),
++                "aomenc refused the fixture: {}",
++                String::from_utf8_lossy(&out.stderr)
++            );
++            let stream = out.stdout;
++            let smooth_before = decode::smooth_uv_hits();
++            let frames = match decode_stream(&stream) {
++                Ok(frames) => frames,
++                Err(e) => {
++                    refusals.push(format!("seed {seed}: {e}"));
++                    continue;
++                }
++            };
++            if decode::smooth_uv_hits() == smooth_before {
++                refusals.push(format!(
++                    "seed {seed}: decoded, but no smooth/paeth uv_mode fired"
++                ));
++                continue;
++            }
++            fired_runs += 1;
++            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
++            let mismatched = frames[0].y != ffmpeg_frames[0].y
++                || frames[0].u != ffmpeg_frames[0].u
++                || frames[0].v != ffmpeg_frames[0].v;
++            if mismatched && let Ok(path) = std::env::var("EC_AV1_GATE_DUMP") {
++                std::fs::write(&path, &stream).expect("writing pinned stream");
++                eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
++            }
++            assert_eq!(
++                frames[0].y, ffmpeg_frames[0].y,
++                "luma vs ffmpeg (seed {seed})"
++            );
++            assert_eq!(frames[0].u, ffmpeg_frames[0].u, "U vs ffmpeg (seed {seed})");
++            assert_eq!(frames[0].v, ffmpeg_frames[0].v, "V vs ffmpeg (seed {seed})");
++            if fired_runs >= 4 {
++                return;
++            }
++        }
++        assert!(
++            fired_runs > 0,
++            "every attempt hit a named refusal or never exercised smooth/paeth chroma:\n{}",
++            refusals.join("\n")
++        );
++    }
++
++    #[test]
++    #[ignore]
++    fn zzz_smooth_pin_diag() {
++        let path = std::env::var("EC_ZZZ_PATH").unwrap_or_else(|_| {
++            "/tmp/claude-1000/-home-tahinli-Documents-Code-Rust-edith-codecs/baaa03f8-c4ff-4469-8ebb-83100429b150/scratchpad/smooth-pin.obu"
++                .to_string()
++        });
++        let stream = std::fs::read(&path).unwrap();
++        let frames = decode_stream(&stream).unwrap();
++        let ffmpeg_frames = ffmpeg_decode_sequence(&stream, 64, 64, 1);
++        for (row, (a, b)) in frames[0]
++            .y
++            .chunks(64)
++            .zip(ffmpeg_frames[0].y.chunks(64))
++            .enumerate()
++        {
++            for (col, (x, y)) in a.iter().zip(b).enumerate() {
++                if x != y {
++                    eprintln!("Y mismatch row={row} col={col} ours={x} ffmpeg={y}");
++                }
++            }
++        }
++        for (row, (a, b)) in frames[0]
++            .u
++            .chunks(32)
++            .zip(ffmpeg_frames[0].u.chunks(32))
++            .enumerate()
++        {
++            for (col, (x, y)) in a.iter().zip(b).enumerate() {
++                if x != y {
++                    eprintln!("U mismatch row={row} col={col} ours={x} ffmpeg={y}");
++                }
++            }
++        }
++    }
++
+     /// As above, but a multi-frame inter sequence -- `--lag-in-frames=0
+     /// --auto-alt-ref=0` keep every non-key frame a simple forward
+     /// single-`LAST_FRAME` P frame (no alt-ref/backward reference this
