@@ -141,9 +141,17 @@ struct Edges {
 }
 
 impl Edges {
-    fn build(above: Option<&[u8]>, left: Option<&[u8]>, corner: Option<u8>, side: usize) -> Self {
-        // A directional mode reads out to w + h - 1 either way.
-        let want = side * 2;
+    /// `bw + bh` is the reach both `av1_dr_prediction_z1_c`'s `max_base_x`
+    /// and `z3_c`'s `max_base_y` use (libaom `reconintra.c`) -- above and
+    /// left both extend that far regardless of which of `bw`/`bh` is larger.
+    fn build(
+        above: Option<&[u8]>,
+        left: Option<&[u8]>,
+        corner: Option<u8>,
+        bw: usize,
+        bh: usize,
+    ) -> Self {
+        let want = bw + bh;
         let extend = |samples: &[u8]| {
             let mut row: Vec<i32> = samples.iter().map(|&s| i32::from(s)).collect();
             let last = *row.last().expect("an edge that exists has samples");
@@ -189,15 +197,18 @@ impl Edges {
     }
 }
 
-/// Predicts one square block into `dst`, row-major and `side * side` long.
+/// Predicts one `bw`-wide, `bh`-tall block into `dst`, row-major and
+/// `bw * bh` long; `bw == bh` for a square block, the only shape every
+/// caller outside this lane's own tests passes.
 ///
 /// `above` is the reconstructed row above the block and `left` its
-/// reconstructed left column, each at least `side` samples long, and `corner`
-/// the sample diagonally above-left; `None` where the block sits against an
-/// edge of the frame. A directional mode reads out to `2 * side`: pass the
-/// samples above-right and below-left where the decoder has them decoded, and
-/// the edge is extended by repetition where it does not, which is what the
-/// decoder's own clamp to `aboveLimit` and `leftLimit` comes to.
+/// reconstructed left column, each at least `bw`/`bh` samples long
+/// respectively, and `corner` the sample diagonally above-left; `None` where
+/// the block sits against an edge of the frame. A directional mode reads out
+/// to `bw + bh`: pass the samples above-right and below-left where the
+/// decoder has them decoded, and the edge is extended by repetition where it
+/// does not, which is what the decoder's own clamp to `aboveLimit` and
+/// `leftLimit` comes to.
 ///
 /// `angle_delta` (spec `AngleDeltaY`/`AngleDeltaUV`, `-MAX_ANGLE_DELTA` to
 /// `MAX_ANGLE_DELTA`) steers every one of `V_PRED`, `H_PRED` and the six
@@ -214,7 +225,7 @@ impl Edges {
 ///
 /// # Panics
 /// Panics on a mode this module does not predict, or when `dst` is not
-/// `side * side` long.
+/// `bw * bh` long.
 #[allow(clippy::too_many_arguments)]
 pub fn predict(
     mode: u8,
@@ -222,13 +233,14 @@ pub fn predict(
     above: Option<&[u8]>,
     left: Option<&[u8]>,
     corner: Option<u8>,
-    side: usize,
+    bw: usize,
+    bh: usize,
     enable_edge_filter: bool,
     smooth_neighbor: bool,
     dst: &mut [u8],
 ) {
-    assert_eq!(dst.len(), side * side, "the destination is the block");
-    let edges = Edges::build(above, left, corner, side);
+    assert_eq!(dst.len(), bw * bh, "the destination is the block");
+    let edges = Edges::build(above, left, corner, bw, bh);
     let is_directional = matches!(
         mode,
         V_PRED | H_PRED | D45_PRED | D67_PRED | D113_PRED | D135_PRED | D157_PRED | D203_PRED
@@ -241,12 +253,13 @@ pub fn predict(
         // way (`av1_is_directional_mode`'s callers never call the z1/z2/z3
         // walk there either).
         if angle != 90 && angle != 180 {
-            let n_top = above.map_or(0, |a| a.len().min(side));
-            let n_left = left.map_or(0, |a| a.len().min(side));
+            let n_top = above.map_or(0, |a| a.len().min(bw));
+            let n_left = left.map_or(0, |a| a.len().min(bh));
             directional(
                 angle as u16,
                 &edges,
-                side,
+                bw,
+                bh,
                 enable_edge_filter,
                 smooth_neighbor,
                 n_top,
@@ -256,36 +269,42 @@ pub fn predict(
             return;
         }
     }
-    let weights = &SM_WEIGHTS[side..side * 2];
-    for row in 0..side {
-        for col in 0..side {
+    // `smooth_predictor` (libaom `intrapred.c`) indexes its width and height
+    // weight rows separately (`smooth_weights + bw - 4` / `+ bh - 4`) -- a
+    // square block reads the same row for both, which is why this collapsed
+    // to one `weights` slice before.
+    let weights_w = &SM_WEIGHTS[bw..bw * 2];
+    let weights_h = &SM_WEIGHTS[bh..bh * 2];
+    for row in 0..bh {
+        for col in 0..bw {
             let (r, c) = (row as i32, col as i32);
-            let last = side as i32 - 1;
+            let last_w = bw as i32 - 1;
+            let last_h = bh as i32 - 1;
             let value = match mode {
-                DC_PRED => dc(above, left, side),
+                DC_PRED => dc(above, left, bw, bh),
                 V_PRED => edges.above(c),
                 H_PRED => edges.left(r),
                 SMOOTH_PRED => round2(
-                    i32::from(weights[row]) * edges.above(c)
-                        + (256 - i32::from(weights[row])) * edges.left(last)
-                        + i32::from(weights[col]) * edges.left(r)
-                        + (256 - i32::from(weights[col])) * edges.above(last),
+                    i32::from(weights_h[row]) * edges.above(c)
+                        + (256 - i32::from(weights_h[row])) * edges.left(last_h)
+                        + i32::from(weights_w[col]) * edges.left(r)
+                        + (256 - i32::from(weights_w[col])) * edges.above(last_w),
                     9,
                 ),
                 SMOOTH_V_PRED => round2(
-                    i32::from(weights[row]) * edges.above(c)
-                        + (256 - i32::from(weights[row])) * edges.left(last),
+                    i32::from(weights_h[row]) * edges.above(c)
+                        + (256 - i32::from(weights_h[row])) * edges.left(last_h),
                     8,
                 ),
                 SMOOTH_H_PRED => round2(
-                    i32::from(weights[col]) * edges.left(r)
-                        + (256 - i32::from(weights[col])) * edges.above(last),
+                    i32::from(weights_w[col]) * edges.left(r)
+                        + (256 - i32::from(weights_w[col])) * edges.above(last_w),
                     8,
                 ),
                 PAETH_PRED => paeth(edges.above(c), edges.left(r), edges.above(-1)),
                 other => panic!("intra mode {other} is not one this module predicts"),
             };
-            dst[row * side + col] = value.clamp(0, 255) as u8;
+            dst[row * bw + col] = value.clamp(0, 255) as u8;
         }
     }
 }
@@ -300,6 +319,13 @@ fn intra_edge_filter_strength(bs0: i32, bs1: i32, delta: i32, smooth_neighbor: b
     if !smooth_neighbor {
         if blk_wh <= 8 {
             if d >= 56 {
+                strength = 1;
+            }
+        } else if blk_wh <= 12 {
+            // Only reachable by a rect block (e.g. 4x8's blk_wh == 12): no
+            // square side sum ever lands in 9..=12, which is why this branch
+            // was silently absent before this lane.
+            if d >= 40 {
                 strength = 1;
             }
         } else if blk_wh <= 16 {
@@ -420,50 +446,58 @@ fn upsample_intra_edge(buf: &[i32]) -> Vec<i32> {
 fn directional(
     angle: u16,
     edges: &Edges,
-    side: usize,
+    bw: usize,
+    bh: usize,
     enable_edge_filter: bool,
     smooth_neighbor: bool,
     n_top: usize,
     n_left: usize,
     dst: &mut [u8],
 ) {
-    let n = side as i32;
+    let (w, h) = (bw as i32, bh as i32);
+    let reach = w + h; // `av1_dr_prediction_z{1,3}_c`'s `max_base_{x,y}` reach.
     let need_above = angle < 180;
     let need_left = angle > 90;
     let need_right = angle < 90;
     let need_bottom = angle > 180;
 
-    // Spec position `-1..=2n - 1`, `above[0]`/`left[0]` the shared corner.
-    let mut above: Vec<i32> = (-1..2 * n).map(|p| edges.above(p)).collect();
-    let mut left: Vec<i32> = (-1..2 * n).map(|p| edges.left(p)).collect();
+    // Spec position `-1..=w + h - 1`, `above[0]`/`left[0]` the shared corner.
+    let mut above: Vec<i32> = (-1..reach).map(|p| edges.above(p)).collect();
+    let mut left: Vec<i32> = (-1..reach).map(|p| edges.left(p)).collect();
 
     if enable_edge_filter && angle != 90 && angle != 180 {
-        if need_above && need_left && 2 * n >= 24 {
+        if need_above && need_left && reach >= 24 {
             let s = round2(left[1] * 5 + above[0] * 6 + above[1] * 5, 4);
             above[0] = s;
             left[0] = s;
         }
+        // `intra_edge_filter_strength(txwpx, txhpx, ...)` for above and
+        // `(txhpx, txwpx, ...)` for left (`reconintra.c`) -- the strength
+        // itself is symmetric in its first two args (only their sum
+        // matters), but the pixel counts filtered below are NOT: above's
+        // run-past-`n_top` extension is `txhpx` (the CROSS axis), left's is
+        // `txwpx`.
         if need_above && n_top > 0 {
-            let strength = intra_edge_filter_strength(n, n, i32::from(angle) - 90, smooth_neighbor);
-            let n_px = n_top as i32 + 1 + if need_right { n } else { 0 };
+            let strength = intra_edge_filter_strength(w, h, i32::from(angle) - 90, smooth_neighbor);
+            let n_px = n_top as i32 + 1 + if need_right { h } else { 0 };
             filter_intra_edge(&mut above[..n_px as usize], strength);
         }
         if need_left && n_left > 0 {
             let strength =
-                intra_edge_filter_strength(n, n, i32::from(angle) - 180, smooth_neighbor);
-            let n_px = n_left as i32 + 1 + if need_bottom { n } else { 0 };
+                intra_edge_filter_strength(h, w, i32::from(angle) - 180, smooth_neighbor);
+            let n_px = n_left as i32 + 1 + if need_bottom { w } else { 0 };
             filter_intra_edge(&mut left[..n_px as usize], strength);
         }
     }
 
     let upsample_above =
-        enable_edge_filter && use_intra_edge_upsample(n, n, i32::from(angle) - 90, smooth_neighbor);
+        enable_edge_filter && use_intra_edge_upsample(w, h, i32::from(angle) - 90, smooth_neighbor);
     let upsample_left = enable_edge_filter
-        && use_intra_edge_upsample(n, n, i32::from(angle) - 180, smooth_neighbor);
+        && use_intra_edge_upsample(h, w, i32::from(angle) - 180, smooth_neighbor);
 
     let above_up;
     let (above_buf, above_off): (&[i32], i32) = if need_above && upsample_above {
-        let n_px = (n + if need_right { n } else { 0 }) as usize;
+        let n_px = (w + if need_right { h } else { 0 }) as usize;
         above_up = upsample_intra_edge(&above[..=n_px]);
         (&above_up, 2)
     } else {
@@ -471,7 +505,7 @@ fn directional(
     };
     let left_up;
     let (left_buf, left_off): (&[i32], i32) = if need_left && upsample_left {
-        let n_px = (n + if need_bottom { n } else { 0 }) as usize;
+        let n_px = (h + if need_bottom { w } else { 0 }) as usize;
         left_up = upsample_intra_edge(&left[..=n_px]);
         (&left_up, 2)
     } else {
@@ -485,11 +519,11 @@ fn directional(
         round2(edge(base) * (32 - shift) + edge(base + 1) * shift, 5)
     };
 
-    for row in 0..n {
-        for col in 0..n {
+    for row in 0..h {
+        for col in 0..w {
             let value = if angle < 90 {
                 let dx = dr_intra_derivative(angle);
-                let max_base = (2 * n - 1) << up_a;
+                let max_base = (reach - 1) << up_a;
                 let frac_bits = 6 - up_a;
                 let x = dx * (row + 1);
                 let base = (x >> frac_bits) + (col << up_a);
@@ -501,7 +535,7 @@ fn directional(
                 }
             } else if angle > 180 {
                 let dy = dr_intra_derivative(270 - angle);
-                let max_base = (2 * n - 1) << up_l;
+                let max_base = (reach - 1) << up_l;
                 let frac_bits = 6 - up_l;
                 let y = dy * (col + 1);
                 let base = (y >> frac_bits) + (row << up_l);
@@ -531,7 +565,7 @@ fn directional(
                     blend(&left_at, y2 >> frac_bits_y, ((y2 << up_l) & 0x3F) >> 1)
                 }
             };
-            dst[(row * n + col) as usize] = value.clamp(0, 255) as u8;
+            dst[(row * w + col) as usize] = value.clamp(0, 255) as u8;
         }
     }
 }
@@ -545,19 +579,19 @@ fn directional(
 /// before `dc_predictor` averages, so a slice truncated short by the true
 /// frame edge must be extended by repetition here too, not averaged over its
 /// own shorter length.
-fn dc(above: Option<&[u8]>, left: Option<&[u8]>, side: usize) -> i32 {
-    let extend = |samples: &[u8]| -> Vec<u8> {
-        if samples.len() >= side {
-            samples[..side].to_vec()
+fn dc(above: Option<&[u8]>, left: Option<&[u8]>, bw: usize, bh: usize) -> i32 {
+    let extend = |samples: &[u8], want: usize| -> Vec<u8> {
+        if samples.len() >= want {
+            samples[..want].to_vec()
         } else {
             let last = *samples.last().expect("an edge that exists has samples");
             let mut v = samples.to_vec();
-            v.resize(side, last);
+            v.resize(want, last);
             v
         }
     };
-    let above = above.map(extend);
-    let left = left.map(extend);
+    let above = above.map(|a| extend(a, bw));
+    let left = left.map(|l| extend(l, bh));
     let average = |samples: &[u8]| {
         let sum: u32 = samples.iter().map(|&s| u32::from(s)).sum();
         ((sum + (samples.len() as u32 >> 1)) / samples.len() as u32) as i32
@@ -566,12 +600,45 @@ fn dc(above: Option<&[u8]>, left: Option<&[u8]>, side: usize) -> i32 {
         (None, None) => 128,
         (Some(a), None) => average(a),
         (None, Some(l)) => average(l),
-        (Some(a), Some(l)) => {
+        (Some(a), Some(l)) if bw == bh => {
+            // `dc_predictor` (libaom `intrapred.c`): exact division, the
+            // square path this whole lane must leave bit-identical.
             let sum: u32 = a.iter().chain(l).map(|&s| u32::from(s)).sum();
             let count = (a.len() + l.len()) as u32;
             ((sum + (count >> 1)) / count) as i32
         }
+        (Some(a), Some(l)) => {
+            // `dc_predictor_rect`: AV1 never divides by `bw + bh` exactly for
+            // a rect block -- it approximates with a multiply-shift whose
+            // constants are derived from `bw + bh`'s odd factor (`d == 3` for
+            // every 1:2 ratio, `d == 5` for every 1:4 one; libaom comments
+            // this exact derivation in `intrapred.c` rather than tabulating
+            // it, so this ports the derivation, not a lookup).
+            let sum: u32 = a.iter().chain(l).map(|&s| u32::from(s)).sum();
+            let (shift1, multiplier) = dc_rect_multiplier(bw, bh);
+            let num = u64::from(sum + ((bw + bh) as u32 >> 1));
+            (((num >> shift1) * multiplier) >> 16) as i32
+        }
     }
+}
+
+/// `dc_predictor_rect`'s per-call `(shift1, multiplier)` (libaom
+/// `intrapred.c`, `DC_MULTIPLIER_1X2`/`DC_MULTIPLIER_1X4`): shift `bw + bh`
+/// right until it is odd; AV1's only rect ratios (1:2, 1:4) leave that odd
+/// remainder at exactly 3 or 5.
+fn dc_rect_multiplier(bw: usize, bh: usize) -> (u32, u64) {
+    let mut d = (bw + bh) as u32;
+    let mut shift1 = 0;
+    while d & 1 == 0 {
+        d >>= 1;
+        shift1 += 1;
+    }
+    let multiplier = match d {
+        3 => 0x5556,
+        5 => 0x3334,
+        _ => panic!("AV1 rect blocks are only 1:2 or 1:4 (bw={bw} bh={bh})"),
+    };
+    (shift1, multiplier)
 }
 
 /// `Intra_Filter_Taps` (spec 7.11.2.3 / libaom `av1_filter_intra_taps`,
@@ -664,7 +731,7 @@ pub fn predict_filter_intra(
 ) {
     assert_eq!(dst.len(), side * side, "the destination is the block");
     assert_eq!(side % 4, 0, "filter intra only offers 4/8/16/32");
-    let edges = Edges::build(above, left, corner, side);
+    let edges = Edges::build(above, left, corner, side, side);
     let taps = &FILTER_INTRA_TAPS[mode];
     // A (side+1)-square buffer: row 0 / column 0 hold the corner and the
     // above/left edges, `buffer[r+1][c+1]` the block's own sample at (r, c).
@@ -722,5 +789,176 @@ fn paeth(above: i32, left: i32, corner: i32) -> i32 {
         above
     } else {
         corner
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Same deterministic synthetic ramp `lanes/intrarect_dump.c`'s `fill`
+    /// generates.
+    fn fill(n: usize, seed: i32) -> Vec<u8> {
+        (0..n)
+            .map(|i| ((i as i32 * 7 + seed * 13 + (i as i32 % 5) * 3).rem_euclid(256)) as u8)
+            .collect()
+    }
+
+    /// `lanes/intrarect_dump.c`'s `checksum`: a position-weighted sum so a
+    /// wrong value anywhere in the block, not just at index 0, moves it.
+    fn checksum(dst: &[u8]) -> u64 {
+        dst.iter()
+            .enumerate()
+            .map(|(i, &v)| u64::from(v) * (i as u64 + 1))
+            .sum()
+    }
+
+    /// lane-intrarect r1: checksum-verify DC/SMOOTH/PAETH and a directional
+    /// sweep across all three zones, `enable_edge_filter`/`smooth_neighbor`
+    /// on and off, for eight rect shapes (both 1:2 and 1:4, both
+    /// orientations), against `lanes/intrarect_dump.c`'s independent C
+    /// transcription (`lanes/intrarect_dump.expected.txt`, generated by
+    /// `gcc -O2 lanes/intrarect_dump.c -o /tmp/intrarect_dump &&
+    /// /tmp/intrarect_dump > lanes/intrarect_dump.expected.txt`).
+    #[test]
+    fn rect_predictors_match_c_dump() {
+        let expected_txt = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../lanes/intrarect_dump.expected.txt"
+        ))
+        .expect(
+            "run gcc -O2 lanes/intrarect_dump.c -o /tmp/intrarect_dump && \
+             /tmp/intrarect_dump > lanes/intrarect_dump.expected.txt first",
+        );
+        // Keys: ("DC"|"SMOOTH"|"PAETH", bw, bh, angle, ef, sn) -> value.
+        // Non-directional entries use angle=0, ef=2, sn=2 (never matched by
+        // the directional lookups below, which always pass 0 or 1).
+        let mut expected: HashMap<(&str, usize, usize, i32, i32, i32), u64> = HashMap::new();
+        for line in expected_txt.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            let (bw, bh) = parts[0].split_once('x').unwrap();
+            let (bw, bh): (usize, usize) = (bw.parse().unwrap(), bh.parse().unwrap());
+            match parts[1] {
+                "DC" => {
+                    let v: u64 = parts[2]["value=".len()..].parse().unwrap();
+                    expected.insert(("DC", bw, bh, 0, 2, 2), v);
+                }
+                "SMOOTH" | "PAETH" => {
+                    let cs: u64 = parts[2]["checksum=".len()..].parse().unwrap();
+                    expected.insert((parts[1], bw, bh, 0, 2, 2), cs);
+                }
+                "DR" => {
+                    let angle: i32 = parts[2]["angle=".len()..].parse().unwrap();
+                    let ef: i32 = parts[3]["ef=".len()..].parse().unwrap();
+                    let sn: i32 = parts[4]["sn=".len()..].parse().unwrap();
+                    let cs: u64 = parts[5]["checksum=".len()..].parse().unwrap();
+                    expected.insert(("DR", bw, bh, angle, ef, sn), cs);
+                }
+                other => panic!("unrecognised dump line kind {other}"),
+            }
+        }
+
+        let shapes = [
+            (8, 4),
+            (4, 8),
+            (16, 8),
+            (8, 16),
+            (4, 16),
+            (16, 4),
+            (32, 16),
+            (16, 32),
+        ];
+        // (angle, mode, angle_delta) for every angle `intrarect_dump.c`
+        // sweeps -- the same reachable `Mode_To_Angle + delta * ANGLE_STEP`
+        // combinations the dump had to stay inside of.
+        let directional_cases: [(i32, u8, i32); 17] = [
+            (45, D45_PRED, 0),
+            (48, D45_PRED, 1),
+            (64, D67_PRED, -1),
+            (67, D67_PRED, 0),
+            (84, V_PRED, -2),
+            (87, V_PRED, -1),
+            (113, D113_PRED, 0),
+            (116, D113_PRED, 1),
+            (135, D135_PRED, 0),
+            (138, D135_PRED, 1),
+            (157, D157_PRED, 0),
+            (160, D157_PRED, 1),
+            (171, H_PRED, -3),
+            (183, H_PRED, 1),
+            (186, H_PRED, 2),
+            (203, D203_PRED, 0),
+            (206, D203_PRED, 1),
+        ];
+
+        let mut checked = 0;
+        for &(bw, bh) in &shapes {
+            let reach = bw + bh;
+            let above = fill(reach, 1);
+            let left = fill(reach, 2);
+            let corner = ((bw * 3 + bh * 5) % 256) as u8;
+
+            for (name, mode) in [("DC", DC_PRED), ("SMOOTH", SMOOTH_PRED), ("PAETH", PAETH_PRED)] {
+                let mut dst = vec![0u8; bw * bh];
+                predict(
+                    mode,
+                    0,
+                    Some(&above),
+                    Some(&left),
+                    Some(corner),
+                    bw,
+                    bh,
+                    false,
+                    false,
+                    &mut dst,
+                );
+                let got = if name == "DC" {
+                    u64::from(dst[0])
+                } else {
+                    checksum(&dst)
+                };
+                let want = *expected
+                    .get(&(name, bw, bh, 0, 2, 2))
+                    .unwrap_or_else(|| panic!("missing {name} {bw}x{bh} in the C dump"));
+                assert_eq!(got, want, "{name} {bw}x{bh}: rust {got} != C dump {want}");
+                checked += 1;
+            }
+
+            for &(angle, mode, delta) in &directional_cases {
+                for ef in [false, true] {
+                    for sn in [false, true] {
+                        let mut dst = vec![0u8; bw * bh];
+                        predict(
+                            mode,
+                            delta,
+                            Some(&above),
+                            Some(&left),
+                            Some(corner),
+                            bw,
+                            bh,
+                            ef,
+                            sn,
+                            &mut dst,
+                        );
+                        let got = checksum(&dst);
+                        let key = ("DR", bw, bh, angle, i32::from(ef), i32::from(sn));
+                        let want = *expected.get(&key).unwrap_or_else(|| {
+                            panic!("missing DR {bw}x{bh} angle={angle} ef={ef} sn={sn} in the C dump")
+                        });
+                        assert_eq!(
+                            got, want,
+                            "DR {bw}x{bh} angle={angle} ef={ef} sn={sn}: rust {got} != C dump {want}"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            checked,
+            shapes.len() * (3 + directional_cases.len() * 4),
+            "checked every (shape, mode/angle, ef, sn) combination"
+        );
     }
 }
