@@ -27,6 +27,14 @@
 #       the key-frame path has no traced symbol at all between the partition
 #       read and the first coefficient block, which is precisely the gap a
 #       rect-strip desync hides in.
+#   EC_AV1_POSTDEBLOCK_DUMP=<prefix> -> <prefix>.f<N> per frame, Y then U then
+#       V, full coded-width rows (cm->cur_frame->buf at this point is still
+#       the pre-superres, frame_width-wide buffer). Written right after
+#       av1_loop_filter_frame_mt returns and before CDEF/superres run --
+#       ground truth for the post-deblock, pre-superres row content over
+#       frame_width..true_width that decode.rs stashes as its superres
+#       margin (lane-superres r5: hand-tracing the arithmetic could only
+#       prove our own self-consistency, not correctness against libaom).
 #
 # Idempotent: re-running is a no-op. Rebuild afterwards with
 #   ninja -C ~/.cache/aom-oracle/build aomdec
@@ -263,3 +271,52 @@ s = s.replace(old, new, 1)
 open(path, "w").write(s)
 print("intra mode-info instrumented")
 PYI
+
+# --- rung 6: post-deblock, pre-superres row dump ------------------------
+python3 - "$F" <<'PYD'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+if "EC_INSTRUMENTED_POSTDEBLOCK" in s:
+    print("postdeblock dump already instrumented (no-op)")
+    sys.exit(0)
+
+anchor = """    if (cm->lf.filter_level[0] || cm->lf.filter_level[1]) {
+      av1_loop_filter_frame_mt(&cm->cur_frame->buf, cm, &pbi->dcb.xd, 0,
+                               num_planes, 0, pbi->tile_workers,
+                               pbi->num_workers, &pbi->lf_row_sync, 0);
+    }
+"""
+dump = """
+    /* EC_INSTRUMENTED_POSTDEBLOCK */
+    {
+      const char *ec_dump = getenv("EC_AV1_POSTDEBLOCK_DUMP");
+      if (ec_dump) {
+        static int ec_postdeblock_idx = 0;
+        char ec_path[1024];
+        snprintf(ec_path, sizeof(ec_path), "%s.f%d", ec_dump,
+                 ec_postdeblock_idx++);
+        FILE *ec_f = fopen(ec_path, "wb");
+        if (ec_f) {
+          const YV12_BUFFER_CONFIG *ec_b = &cm->cur_frame->buf;
+          for (int ec_r = 0; ec_r < ec_b->y_crop_height; ++ec_r)
+            fwrite(ec_b->y_buffer + ec_r * ec_b->y_stride, 1,
+                   ec_b->y_crop_width, ec_f);
+          if (num_planes > 1) {
+            for (int ec_r = 0; ec_r < ec_b->uv_crop_height; ++ec_r)
+              fwrite(ec_b->u_buffer + ec_r * ec_b->uv_stride, 1,
+                     ec_b->uv_crop_width, ec_f);
+            for (int ec_r = 0; ec_r < ec_b->uv_crop_height; ++ec_r)
+              fwrite(ec_b->v_buffer + ec_r * ec_b->uv_stride, 1,
+                     ec_b->uv_crop_width, ec_f);
+          }
+          fclose(ec_f);
+        }
+      }
+    }
+"""
+assert anchor in s, "loop filter call anchor moved"
+s = s.replace(anchor, anchor + dump, 1)
+open(path, "w").write(s)
+print("postdeblock dump instrumented")
+PYD
