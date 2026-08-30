@@ -4467,6 +4467,23 @@ pub fn decode_key_frame_tile(
     .map(|(picture, _)| picture)
 }
 
+thread_local! {
+    /// lane-superres r3: the real decoded margin beyond `frame_width` up to
+    /// the mi-aligned `true_width`, set by the most recent
+    /// [`decode_key_frame_tile_with_cdfs`] call. See that function's own
+    /// comment at the write site. `None` when there was no margin to save.
+    static LAST_KEY_FRAME_WIDE_MARGIN: std::cell::RefCell<Option<Picture>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The margin [`decode_key_frame_tile_with_cdfs`] most recently stashed
+/// (see [`LAST_KEY_FRAME_WIDE_MARGIN`]) -- `stream.rs`'s superres path
+/// reads this immediately after the call, before any other key frame
+/// decode can overwrite it.
+pub(crate) fn take_last_key_frame_wide_margin() -> Option<Picture> {
+    LAST_KEY_FRAME_WIDE_MARGIN.with(|m| m.borrow_mut().take())
+}
+
 /// [`decode_key_frame_tile`], threading a cross-frame CDF forward (spec
 /// 7.20's `load_cdfs`): `initial_cdfs` is the caller's forwarded state (from
 /// a prior frame's saved reference slot) when set, or the spec 8.4 defaults
@@ -4967,6 +4984,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
 
     let (fw, fh) = (frame_width as usize, frame_height as usize);
     if fw == width && fh == height {
+        LAST_KEY_FRAME_WIDE_MARGIN.with(|m| *m.borrow_mut() = None);
         return Ok((
             Picture {
                 width,
@@ -4985,6 +5003,33 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         }
         out
     };
+    // lane-superres r3: `true_width`/`true_height` (`mi_cols`/`mi_rows` * 4)
+    // is the real reconstructed extent -- columns `[fw, true_width)` hold
+    // genuine decoded samples (the last coding block straddles the frame
+    // edge whenever `frame_width` isn't 8-sample aligned), not padding.
+    // libaom's superres upscale runs on that buffer's own border-extended
+    // margin, so it reads those real columns, not a synthetic replicate of
+    // column `fw - 1`. Stash them for `stream.rs`'s superres path (a real
+    // aomenc 43->64 stream pinned column-by-column against libaom's own
+    // `av1_convolve_horiz_rs_c` via `scripts/superres-pin-harness.c` --
+    // `row6-realedgeval` proved the replicate-of-`fw-1` padding this
+    // decoder used before was off by 1 at the columns the tap window
+    // reaches into that real margin; `None` when there is no margin (this
+    // frame's `true_width`/`true_height` already equal `fw`/`fh`, e.g. a
+    // non-superres frame whose width just isn't 32-block aligned).
+    LAST_KEY_FRAME_WIDE_MARGIN.with(|m| {
+        *m.borrow_mut() = if true_width > fw || true_height > fh {
+            Some(Picture {
+                width: true_width,
+                height: true_height,
+                y: crop(&y, true_width, true_height),
+                u: crop(&u, true_width.div_ceil(2), true_height.div_ceil(2)),
+                v: crop(&v, true_width.div_ceil(2), true_height.div_ceil(2)),
+            })
+        } else {
+            None
+        }
+    });
     Ok((
         Picture {
             width: fw,
