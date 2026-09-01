@@ -333,6 +333,7 @@ pub fn predict_with_filters(
 ) {
     assert_eq!(dst.len(), block_w * block_h, "the destination is the block");
     assert!(!reference.is_empty(), "a reference plane has samples");
+    INTER_PRED_HITS.with(|c| c.set(c.get() + 1));
 
     #[cfg(test)]
     let stage_t = std::time::Instant::now();
@@ -441,6 +442,20 @@ pub fn predict_scaled_hits() -> usize {
     PREDICT_SCALED_HITS.with(|c| c.get())
 }
 
+thread_local! {
+    /// lane-hbdinter: how many inter predictions this thread has produced
+    /// (single-reference, scaled, and the compound intermediate entry). The
+    /// 10-bit inter gate hard-asserts this moved, so a stream that coded
+    /// only intra blocks cannot pass it by construction (class
+    /// `gate-blind-to-feature`).
+    static INTER_PRED_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`INTER_PRED_HITS`].
+pub fn inter_pred_hits() -> usize {
+    INTER_PRED_HITS.with(|c| c.get())
+}
+
 fn round_pow2_64(value: i64, shift: u32) -> i64 {
     if shift == 0 {
         value
@@ -492,6 +507,7 @@ pub fn predict_scaled(
 ) {
     assert_eq!(dst.len(), block_w * block_h, "the destination is the block");
     assert!(!reference.is_empty(), "a reference plane has samples");
+    INTER_PRED_HITS.with(|c| c.set(c.get() + 1));
     PREDICT_SCALED_HITS.with(|c| c.set(c.get() + 1));
 
     let y0 = y_q4.div_euclid(16);
@@ -594,6 +610,7 @@ pub fn predict_compound_intermediate(
 ) {
     assert_eq!(dst.len(), block_w * block_h, "the destination is the block");
     assert!(!reference.is_empty(), "a reference plane has samples");
+    INTER_PRED_HITS.with(|c| c.set(c.get() + 1));
 
     let x0 = x_q4.div_euclid(16);
     let xfrac = x_q4.rem_euclid(16) as usize;
@@ -673,8 +690,14 @@ pub fn combine_compound(
 pub fn diffwtd_mask(pred0: &[i32], pred1: &[i32], inv: bool, mask: &mut [u8]) {
     assert_eq!(pred0.len(), pred1.len(), "both refs predict the same block");
     assert_eq!(mask.len(), pred0.len(), "one mask byte per pixel");
+    // libaom `diffwtd_mask_d16` (`reconinter.c:307`): `round = 2*FILTER_BITS
+    // - round_0 - round_1 + (bd - 8)`, i.e. INTER_POST_ROUND plus the
+    // bit-depth headroom the CONV_BUF domain carries at 10/12-bit. `round_0`
+    // and `round_1` themselves only move at 12-bit (`convolve.h:83`'s
+    // `intbufrange > 16`), so the whole bit-depth dependence here is `bd - 8`.
+    let round = INTER_POST_ROUND + u32::from(crate::decode::bit_depth()).saturating_sub(8);
     for i in 0..mask.len() {
-        let diff = round2((pred0[i] - pred1[i]).abs(), INTER_POST_ROUND);
+        let diff = round2((pred0[i] - pred1[i]).abs(), round);
         let m = (38 + diff / 16).clamp(0, 64);
         mask[i] = if inv { (64 - m) as u8 } else { m as u8 };
     }
