@@ -214,6 +214,17 @@ pub(crate) struct Cdfs {
     pub eob_pt_16_luma_class1: [u16; 6],
     /// `eob_pt_64_luma`'s class-1 sibling (r5), see `eob_pt_16_luma_class1`.
     pub eob_pt_64_luma_class1: [u16; 8],
+    /// `eob_pt_256_luma`'s class-1 sibling (lane-txselect r2): a 16x16 luma
+    /// TU reaches `V_DCT`/`H_DCT` through the inter tx set
+    /// `EXT_TX_SET_DTT9_IDTX_1DDCT`, and libaom keeps the eob class
+    /// dimension at every size.
+    pub eob_pt_256_luma_class1: [u16; 10],
+    /// The chroma class-1 siblings (lane-txselect r2): an *inter* block's
+    /// chroma TU inherits its luma unit's `tx_type`, so 1D classes reach
+    /// chroma too.
+    pub eob_pt_256_chroma_class1: [u16; 10],
+    pub eob_pt_64_chroma_class1: [u16; 8],
+    pub eob_pt_16_chroma_class1: [u16; 6],
     /// The end-of-block offset bit of a 16x16 luma transform.
     pub eob_extra_luma_16: [[u16; 3]; 9],
     /// The same, for an 8x8 luma transform.
@@ -612,6 +623,10 @@ impl Cdfs {
         reset1(&mut self.eob_pt_16_luma);
         reset1(&mut self.eob_pt_16_luma_class1);
         reset1(&mut self.eob_pt_64_luma_class1);
+        reset1(&mut self.eob_pt_256_luma_class1);
+        reset1(&mut self.eob_pt_256_chroma_class1);
+        reset1(&mut self.eob_pt_64_chroma_class1);
+        reset1(&mut self.eob_pt_16_chroma_class1);
         reset2(&mut self.eob_extra_luma_16);
         reset2(&mut self.eob_extra_luma_8);
         reset2(&mut self.eob_extra_luma_4);
@@ -826,6 +841,34 @@ impl Cdfs {
                 cdf::EOB_PT_64_LUMA_CLASS1_Q1,
                 cdf::EOB_PT_64_LUMA_CLASS1,
                 cdf::EOB_PT_64_LUMA_CLASS1_Q3,
+            ),
+            eob_pt_256_luma_class1: pick(
+                q_ctx,
+                cdf::EOB_PT_256_LUMA_CLASS1_Q0,
+                cdf::EOB_PT_256_LUMA_CLASS1_Q1,
+                cdf::EOB_PT_256_LUMA_CLASS1,
+                cdf::EOB_PT_256_LUMA_CLASS1_Q3,
+            ),
+            eob_pt_256_chroma_class1: pick(
+                q_ctx,
+                cdf::EOB_PT_256_CHROMA_CLASS1_Q0,
+                cdf::EOB_PT_256_CHROMA_CLASS1_Q1,
+                cdf::EOB_PT_256_CHROMA_CLASS1,
+                cdf::EOB_PT_256_CHROMA_CLASS1_Q3,
+            ),
+            eob_pt_64_chroma_class1: pick(
+                q_ctx,
+                cdf::EOB_PT_64_CHROMA_CLASS1_Q0,
+                cdf::EOB_PT_64_CHROMA_CLASS1_Q1,
+                cdf::EOB_PT_64_CHROMA_CLASS1,
+                cdf::EOB_PT_64_CHROMA_CLASS1_Q3,
+            ),
+            eob_pt_16_chroma_class1: pick(
+                q_ctx,
+                cdf::EOB_PT_16_CHROMA_CLASS1_Q0,
+                cdf::EOB_PT_16_CHROMA_CLASS1_Q1,
+                cdf::EOB_PT_16_CHROMA_CLASS1,
+                cdf::EOB_PT_16_CHROMA_CLASS1_Q3,
             ),
             eob_extra_luma_16: pick(
                 q_ctx,
@@ -1264,7 +1307,7 @@ impl Cdfs {
                 br: &mut self.br_luma_16,
                 dc_sign: &mut self.dc_sign_luma,
                 tx_type: Some(self.intra_tx_type_16[mode].as_mut_slice()),
-                eob_pt_class1: None,
+                eob_pt_class1: Some(&mut self.eob_pt_256_luma_class1),
             },
             TxbSet::Luma16Inter => TxbTables {
                 side: 16,
@@ -1276,7 +1319,7 @@ impl Cdfs {
                 br: &mut self.br_luma_16,
                 dc_sign: &mut self.dc_sign_luma,
                 tx_type: Some(self.inter_tx_type_16.as_mut_slice()),
-                eob_pt_class1: None,
+                eob_pt_class1: Some(&mut self.eob_pt_256_luma_class1),
             },
             TxbSet::Luma16InterSet1 => TxbTables {
                 side: 16,
@@ -1288,7 +1331,7 @@ impl Cdfs {
                 br: &mut self.br_luma_16,
                 dc_sign: &mut self.dc_sign_luma,
                 tx_type: Some(self.inter_tx_type_16_set2.as_mut_slice()),
-                eob_pt_class1: None,
+                eob_pt_class1: Some(&mut self.eob_pt_256_luma_class1),
             },
             TxbSet::Luma8 => TxbTables {
                 side: 8,
@@ -1396,7 +1439,7 @@ impl Cdfs {
                 br: &mut self.br_chroma_8,
                 dc_sign: &mut self.dc_sign_chroma,
                 tx_type: None,
-                eob_pt_class1: None,
+                eob_pt_class1: Some(&mut self.eob_pt_64_chroma_class1),
             },
             TxbSet::Chroma4 => TxbTables {
                 side: 4,
@@ -1408,7 +1451,7 @@ impl Cdfs {
                 br: &mut self.br_chroma_4,
                 dc_sign: &mut self.dc_sign_chroma,
                 tx_type: None,
-                eob_pt_class1: None,
+                eob_pt_class1: Some(&mut self.eob_pt_16_chroma_class1),
             },
             TxbSet::Chroma16 => TxbTables {
                 side: 16,
@@ -1420,7 +1463,7 @@ impl Cdfs {
                 br: &mut self.br_chroma_16,
                 dc_sign: &mut self.dc_sign_chroma,
                 tx_type: None,
-                eob_pt_class1: None,
+                eob_pt_class1: Some(&mut self.eob_pt_256_chroma_class1),
             },
             TxbSet::Chroma32 => TxbTables {
                 side: 32,

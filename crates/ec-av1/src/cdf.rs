@@ -5032,3 +5032,44 @@ pub const INTRA_TX_TYPE_SET1_4: [[u16; 8]; 13] = [
     [277, 4369, 5255, 8905, 16465, 22271, 32768, 0],
     [3409, 5436, 10599, 15599, 19687, 24040, 32768, 0],
 ];
+
+/// The `TX_CLASS_HORIZ`/`TX_CLASS_VERT` siblings of [`EOB_PT_256_LUMA`],
+/// [`EOB_PT_256_CHROMA`], [`EOB_PT_64_CHROMA`] and [`EOB_PT_16_CHROMA`]
+/// (`av1_default_eob_multi{256,64,16}_cdfs[q][plane][1]`, `token_cdfs.h`) --
+/// lane-txselect r2: the class dimension libaom keeps on *every* eob_pt
+/// table. Only 4x4/8x8 luma carried it here, so the first `V_DCT`/`H_DCT`
+/// 16x16 luma TU (a var-tx leaf of a 32x32 inter block, `EXT_TX_SET_
+/// DTT9_IDTX_1DDCT`) read the 2D table and desynced at its `eob`. 32-point
+/// and larger transforms need no sibling: their tx sets (`DCT_IDTX`,
+/// `DCTONLY`) hold no 1D type.
+pub const EOB_PT_256_LUMA_CLASS1_Q0: [u16; 10] =
+    [998, 1850, 2998, 5604, 17341, 19888, 22899, 25583, 32768, 0];
+pub const EOB_PT_256_LUMA_CLASS1_Q1: [u16; 10] =
+    [399, 1019, 1749, 3038, 10444, 15546, 22739, 27294, 32768, 0];
+pub const EOB_PT_256_LUMA_CLASS1: [u16; 10] =
+    [1084, 2358, 3488, 5122, 11483, 18103, 26023, 29799, 32768, 0];
+pub const EOB_PT_256_LUMA_CLASS1_Q3: [u16; 10] =
+    [2453, 4474, 6307, 8777, 16474, 22975, 29000, 31547, 32768, 0];
+
+pub const EOB_PT_256_CHROMA_CLASS1_Q0: [u16; 10] =
+    [2203, 4130, 7435, 10739, 20652, 23681, 25609, 27261, 32768, 0];
+pub const EOB_PT_256_CHROMA_CLASS1_Q1: [u16; 10] =
+    [1674, 3252, 5734, 10159, 22397, 23802, 24821, 30940, 32768, 0];
+pub const EOB_PT_256_CHROMA_CLASS1: [u16; 10] =
+    [6571, 9610, 15516, 21826, 29092, 30829, 31842, 32708, 32768, 0];
+pub const EOB_PT_256_CHROMA_CLASS1_Q3: [u16; 10] =
+    [9998, 17661, 25178, 28097, 31308, 32038, 32403, 32695, 32768, 0];
+
+pub const EOB_PT_64_CHROMA_CLASS1_Q0: [u16; 8] =
+    [1563, 2700, 4876, 10911, 14706, 22480, 32768, 0];
+pub const EOB_PT_64_CHROMA_CLASS1_Q1: [u16; 8] =
+    [1923, 3127, 5867, 9703, 14277, 27100, 32768, 0];
+pub const EOB_PT_64_CHROMA_CLASS1: [u16; 8] =
+    [4034, 6290, 10235, 14982, 21214, 28491, 32768, 0];
+pub const EOB_PT_64_CHROMA_CLASS1_Q3: [u16; 8] =
+    [8726, 12378, 19409, 26450, 30038, 32462, 32768, 0];
+
+pub const EOB_PT_16_CHROMA_CLASS1_Q0: [u16; 6] = [1904, 3354, 7763, 14647, 32768, 0];
+pub const EOB_PT_16_CHROMA_CLASS1_Q1: [u16; 6] = [2497, 4096, 8866, 16993, 32768, 0];
+pub const EOB_PT_16_CHROMA_CLASS1: [u16; 6] = [3192, 5032, 10297, 19755, 32768, 0];
+pub const EOB_PT_16_CHROMA_CLASS1_Q3: [u16; 6] = [7297, 10767, 19273, 28194, 32768, 0];
