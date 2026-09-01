@@ -743,6 +743,20 @@ pub(crate) fn inter_sb_none_hits() -> usize {
     INTER_SB_NONE_HITS.with(|c| c.get())
 }
 
+// lane-inter8 r1: how many INTERIOR (not frame-edge-straddling) 16x16 inter
+// blocks coded a real `PARTITION_SPLIT` into four 8x8 leaves -- the straddle
+// path has always run that loop, so only this counter proves the newly-lifted
+// alphabet value fired.
+thread_local! {
+    static INTER_SUB16_SPLIT_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`INTER_SUB16_SPLIT_HITS`].
+pub(crate) fn inter_sub16_split_hits() -> usize {
+    INTER_SUB16_SPLIT_HITS.with(|c| c.get())
+}
+
 // lane-rectwire r2: how many `PARTITION_HORZ`/`VERT` strips actually decoded
 // real (non-skip) coefficients through [`read_coeffs_rect`] -- proves the
 // rect coefficient reader itself fired, not just the strip-level partition
@@ -8157,6 +8171,11 @@ fn num_proj_ref(
 /// decoder's own overlap sizes ever produce (luma 8/16/32, chroma 4/8/16)
 /// are transcribed.
 fn obmc_mask(len: usize) -> &'static [u8] {
+    // lane-inter8 r1: `obmc_mask_2` (`reconinter.c` 753) -- reached by the
+    // LEFT pass of an 8x8 block's chroma plane (overlap 4 luma columns, 2
+    // chroma), which only became live once 8x8 inter leaves stopped being
+    // refused.
+    const M2: [u8; 2] = [45, 64];
     const M4: [u8; 4] = [39, 50, 59, 64];
     const M8: [u8; 8] = [36, 42, 48, 53, 57, 61, 64, 64];
     const M16: [u8; 16] = [
@@ -8167,6 +8186,7 @@ fn obmc_mask(len: usize) -> &'static [u8] {
         61, 62, 64, 64, 64, 64, 64, 64, 64, 64,
     ];
     match len {
+        2 => &M2,
         4 => &M4,
         8 => &M8,
         16 => &M16,
@@ -8400,6 +8420,7 @@ fn obmc_blend(
     };
     let overlap_above = write_h / 2;
     let overlap_left = write_w / 2;
+    let skip_chroma_above = matches!((write_w, write_h), (8, 8) | (16, 8) | (8, 16));
 
     for (off4, span4, nb) in overlappable_above(grid, mi_row, mi_col, bw4, mi_cols, max_nb(bw4))
     {
@@ -8415,11 +8436,19 @@ fn obmc_blend(
         let (bw, bh, ox) = (span4 * 4, overlap_above, off4 * 4);
         let tmp_y = obmc_neighbour_pred(ny, px + ox, py, nb.mv, bw, bh, true, h_kind, v_kind);
         obmc_blend_v(pred_y, side, ox, 0, bw, bh, &tmp_y);
-        let (cbw, cbh, cox) = (bw / 2, overlap_above / 2, ox / 2);
-        let tmp_u = obmc_neighbour_pred(nu, cpx + cox, cpy, nb.mv, cbw, cbh, false, h_kind, v_kind);
-        obmc_blend_v(pred_u, chroma_side, cox, 0, cbw, cbh, &tmp_u);
-        let tmp_v = obmc_neighbour_pred(nv, cpx + cox, cpy, nb.mv, cbw, cbh, false, h_kind, v_kind);
-        obmc_blend_v(pred_v, chroma_side, cox, 0, cbw, cbh, &tmp_v);
+        // lane-inter8 r1: `av1_skip_u4x4_pred_in_obmc` (`reconinter.c` 820,
+        // `DISABLE_CHROMA_U8X8_OBMC == 0` -- "one-sided obmc"): when the
+        // chroma plane's own block size is BLOCK_4X4/8X4/4X8 (a 8x8, 16x8 or
+        // 8x16 luma block at 4:2:0), the ABOVE pass skips chroma entirely
+        // while the LEFT pass still blends it. Blending chroma here as well
+        // would both mis-predict every 8x8 leaf and ask for an overlap of 2.
+        if !skip_chroma_above {
+            let (cbw, cbh, cox) = (bw / 2, overlap_above / 2, ox / 2);
+            let tmp_u = obmc_neighbour_pred(nu, cpx + cox, cpy, nb.mv, cbw, cbh, false, h_kind, v_kind);
+            obmc_blend_v(pred_u, chroma_side, cox, 0, cbw, cbh, &tmp_u);
+            let tmp_v = obmc_neighbour_pred(nv, cpx + cox, cpy, nb.mv, cbw, cbh, false, h_kind, v_kind);
+            obmc_blend_v(pred_v, chroma_side, cox, 0, cbw, cbh, &tmp_v);
+        }
     }
 
     for (off4, span4, nb) in overlappable_left(grid, mi_row, mi_col, bh4, mi_rows, max_nb(bh4)) {
@@ -12305,14 +12334,30 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                 ));
                             }
                             let at16 = (sr, sc);
-                            if has_cols16 && has_rows16 {
-                                let ctx16 = neighbours.partition_ctx(at16, SUB);
-                                let part16 = dec.symbol(&mut cdfs.partition_w16[ctx16]);
-                                if part16 != PARTITION_NONE {
-                                    return Err(unsupported(
-                                        "an inter partition below 16x16 (8x8 and smaller inter blocks are not coded yet)",
+                            let ctx16 = neighbours.partition_ctx(at16, SUB);
+                            // lane-inter8 r1: a straddling 16x16 cannot name a
+                            // value (spec forces SPLIT, one gathered bit); an
+                            // interior one reads the real alphabet, and
+                            // `PARTITION_SPLIT` now recurses into four 8x8
+                            // inter leaves through the very same loop the
+                            // straddling case has always used.
+                            let part16 = if has_cols16 && has_rows16 {
+                                dec.symbol(&mut cdfs.partition_w16[ctx16])
+                            } else {
+                                if has_cols16 {
+                                    dec.symbol_fixed(&gather(
+                                        &cdfs.partition_w16[ctx16],
+                                        VERT_ALIKE,
+                                    ));
+                                } else {
+                                    dec.symbol_fixed(&gather(
+                                        &cdfs.partition_w16[ctx16],
+                                        HORZ_ALIKE,
                                     ));
                                 }
+                                PARTITION_SPLIT
+                            };
+                            if part16 == PARTITION_NONE {
                                 decode_inter_block(
                                     &mut dec,
                                     &mut cdfs,
@@ -12366,18 +12411,13 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     allow_screen_content_tools,
                                     frame_width as usize,
                                 )?;
+                            } else if part16 != PARTITION_SPLIT {
+                                return Err(unsupported(
+                                    "an inter partition below 16x16 other than SPLIT (16x8/8x16 rect inter leaves are not coded yet)",
+                                ));
                             } else {
-                                let ctx16 = neighbours.partition_ctx(at16, SUB);
-                                if has_cols16 {
-                                    dec.symbol_fixed(&gather(
-                                        &cdfs.partition_w16[ctx16],
-                                        VERT_ALIKE,
-                                    ));
-                                } else {
-                                    dec.symbol_fixed(&gather(
-                                        &cdfs.partition_w16[ctx16],
-                                        HORZ_ALIKE,
-                                    ));
+                                if has_cols16 && has_rows16 {
+                                    INTER_SUB16_SPLIT_HITS.with(|c| c.set(c.get() + 1));
                                 }
                                 let (mi_row0, mi_col0) = (sr as u32 * SUB_MI, sc as u32 * SUB_MI);
                                 let leaf_positions: Vec<(u32, u32)> = (0..4)
