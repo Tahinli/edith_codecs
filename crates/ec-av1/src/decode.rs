@@ -35,7 +35,7 @@ use crate::msac::SymbolDecoder;
 use crate::mvstack::{
     ALTREF_FRAME, ALTREF2_FRAME, BWDREF_FRAME, GOLDEN_FRAME, LAST_FRAME, LAST2_FRAME, LAST3_FRAME,
     MiGrid, MiInfo, NO_SIGN_BIAS, NeighbourRef, SignBiasTable, comp_reference_type_ctx,
-    find_mv_stack, find_mv_stack_with_sign_bias, reference_mode_ctx, single_ref_ctx,
+    find_mv_stack_with_sign_bias, reference_mode_ctx, single_ref_ctx,
     single_ref_p1_ctx, single_ref_p2_ctx, single_ref_p3_ctx, single_ref_p4_ctx, single_ref_p5_ctx,
     single_ref_p6_ctx, uni_comp_ref_p1_ctx,
 };
@@ -651,6 +651,27 @@ thread_local! {
 /// Current value of [`AFFINE_GM_HITS`].
 pub(crate) fn affine_gm_hits() -> usize {
     AFFINE_GM_HITS.with(|c| c.get())
+}
+
+// lane-gmaffine r1: 8x8-leaf-only counters -- how many `BLOCK_8X8` leaves
+// coded `GLOBALMV` (`GLOBALMV_HITS_8`) and how many built a real
+// `WARPED_CAUSAL` local-warp prediction there (`WARP_HITS_8`, incremented
+// only once `find_projection` returned a usable model, unlike
+// `WARP_SELECTED_HITS` which counts the symbol). Both are the 8x8 gates'
+// proof that the leaf path itself fired, not the 16x16+ one.
+thread_local! {
+    static GLOBALMV_HITS_8: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static WARP_HITS_8: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`GLOBALMV_HITS_8`].
+pub(crate) fn globalmv_hits_8() -> usize {
+    GLOBALMV_HITS_8.with(|c| c.get())
+}
+
+/// Current value of [`WARP_HITS_8`].
+pub(crate) fn warp_hits_8() -> usize {
+    WARP_HITS_8.with(|c| c.get())
 }
 
 // How many blocks decoded `interintra == 1` with the non-wedge blended
@@ -8142,6 +8163,13 @@ fn num_proj_ref(
 /// decoder's own overlap sizes ever produce (luma 8/16/32, chroma 4/8/16)
 /// are transcribed.
 fn obmc_mask(len: usize) -> &'static [u8] {
+    // lane-gmaffine r1: the two SHORT masks (libaom `reconinter.c`
+    // `obmc_mask_1`/`obmc_mask_2`) -- an 8x8 leaf's chroma plane is 4x4, so
+    // its overlap is 2 (and 1 at a half-block edge). Unreachable until this
+    // round wired interior 16x16 splits down to real 8x8 leaves, where the
+    // old `unreachable!()` below fired as a hard panic.
+    const M1: [u8; 1] = [64];
+    const M2: [u8; 2] = [45, 64];
     const M4: [u8; 4] = [39, 50, 59, 64];
     const M8: [u8; 8] = [36, 42, 48, 53, 57, 61, 64, 64];
     const M16: [u8; 16] = [
@@ -8152,6 +8180,8 @@ fn obmc_mask(len: usize) -> &'static [u8] {
         61, 62, 64, 64, 64, 64, 64, 64, 64, 64,
     ];
     match len {
+        1 => &M1,
+        2 => &M2,
         4 => &M4,
         8 => &M8,
         16 => &M16,
@@ -10661,6 +10691,16 @@ fn decode_inter_block8(
     prev_leaf: Option<((usize, usize), bool, bool)>,
     allow_high_precision_mv: bool,
     force_integer_mv: bool,
+    // lane-gmaffine r1: this frame header's own `global_motion` table (spec
+    // 5.9.24), indexed `[ref_frame - LAST_FRAME]` -- same table
+    // [`decode_inter_block`] takes, threaded here so the 8x8 leaf can code
+    // `GLOBALMV` (`gm_get_motion_vector`), fill its mv stack's missing
+    // candidates with the gm mv (gm r6's root cause) and build a global
+    // warp prediction.
+    global_motion: &[ec_av1_syntax::WarpParams; 7],
+    // lane-gmaffine r1: this sequence header's own `enable_dual_filter` bit,
+    // for the leaf's own `read_mb_interp_filter` below.
+    enable_dual_filter: bool,
     // lane-av1comp: see [`decode_inter_block`]'s own doc -- this leaf path
     // only ever tracks a coarse `LAST_FRAME`-or-intra neighbour shape (no
     // per-leaf `above_ref`/`left_ref` array exists here), so `comp_mode`'s
@@ -11162,29 +11202,53 @@ fn decode_inter_block8(
                 return Ok((skip, is_inter, skip_mode, compound_ctx8));
             }
         }
-        let sr_ctx = single_ref_ctx(above_inter || left_inter);
-        let p1 = dec.symbol(&mut cdfs.single_ref[sr_ctx][0]);
-        let p3 = dec.symbol(&mut cdfs.single_ref[sr_ctx][2]);
-        let p4 = dec.symbol(&mut cdfs.single_ref[sr_ctx][3]);
-        if (p1, p3, p4) != (0, 0, 0) {
-            return Err(unsupported(
-                "a reference frame other than LAST_FRAME (round 2)",
-            ));
-        }
+        // lane-gmaffine r1: the leaf reads the FULL `single_ref` tree
+        // ([`read_single_ref`], the same one the 16x16+ leaf uses, with the
+        // real per-neighbour p1..p6 contexts) instead of the old three-symbol
+        // LAST-only probe plus a refusal -- aomenc picks GOLDEN/ALTREF for
+        // 8x8 leaves constantly, so that refusal was what every 8x8 gate
+        // actually stopped at.
+        let ref_frame = read_single_ref(
+            dec,
+            cdfs,
+            neighbours.above_ref[c],
+            neighbours.above_ref1[c],
+            neighbours.left_ref[r],
+            neighbours.left_ref1[r],
+        );
+        let (sref_y, sref_u, sref_v) = ref_planes(ref_frame, ref_y, ref_u, ref_v, other_refs)?;
 
         let (mi_row, mi_col) = leaf_mi;
-        let stack = find_mv_stack(
+        // lane-gmaffine r1: this leaf's GLOBALMV vector AND the mv stack's
+        // missing-candidate fallback both come from the frame's global
+        // motion evaluated at THIS block's centre (gm r6's root cause) --
+        // the 8x8 leaf used to build its stack with the zero fallback, which
+        // is right only while every model is IDENTITY.
+        let gm_table = build_gm_mv_table(
+            global_motion,
+            mi_row,
+            mi_col,
+            2,
+            2,
+            allow_high_precision_mv,
+            force_integer_mv,
+        );
+        let stack = crate::mvstack::find_mv_stack_with_sign_bias(
             grid,
             mi_row,
             mi_col,
             2,
             2,
-            LAST_FRAME,
+            ref_frame,
             mi_cols as usize,
             mi_rows as usize,
+            &crate::mvstack::NO_SIGN_BIAS,
+            &gm_table,
+            None,
         );
 
         let not_new = dec.symbol(&mut cdfs.new_mv[stack.new_mv_ctx]) == 1;
+        let mut is_globalmv = false;
         let (mv, is_new_mv) = if !not_new {
             // NEWMV (spec 5.11.24's `read_drl_idx`, `RefMvIdx` starting at 0):
             // read at most two `drl_mode` bits, one per stack entry past the
@@ -11213,21 +11277,27 @@ fn decode_inter_block8(
             )
         } else {
             let not_zero = dec.symbol(&mut cdfs.zero_mv[stack.zero_mv_ctx]) == 1;
-            if !not_zero {
-                return Err(unsupported("GLOBALMV (round 3)"));
-            }
-            let nearest = dec.symbol(&mut cdfs.ref_mv[stack.ref_mv_ctx]) == 0;
-            let mv = if nearest {
-                stack.nearest_mv
+            is_globalmv = !not_zero;
+            let mv = if !not_zero {
+                // lane-gmaffine r1: GLOBALMV (spec 7.10.2.1) -- the same
+                // `gm_get_motion_vector` value the 16x16+ leaf reads out of
+                // its own `gm_table`, computed at this block's centre.
+                GLOBALMV_HITS_8.with(|c| c.set(c.get() + 1));
+                gm_table[(ref_frame - LAST_FRAME) as usize]
             } else {
-                let mut idx = 1usize;
-                while idx < 3 && stack.entries.len() > idx + 1 {
-                    if dec.symbol(&mut cdfs.drl_mode[stack.drl_ctx[idx]]) == 0 {
-                        break;
+                let nearest = dec.symbol(&mut cdfs.ref_mv[stack.ref_mv_ctx]) == 0;
+                if nearest {
+                    stack.nearest_mv
+                } else {
+                    let mut idx = 1usize;
+                    while idx < 3 && stack.entries.len() > idx + 1 {
+                        if dec.symbol(&mut cdfs.drl_mode[stack.drl_ctx[idx]]) == 0 {
+                            break;
+                        }
+                        idx += 1;
                     }
-                    idx += 1;
+                    stack.entries.get(idx).map_or(stack.near_mv, |e| e.mv)
                 }
-                stack.entries.get(idx).map_or(stack.near_mv, |e| e.mv)
             };
             (mv, false)
         };
@@ -11270,18 +11340,29 @@ fn decode_inter_block8(
         // 16x16 leaf's own `decode_inter_block` read (see its doc above) --
         // same 2-symbol `obmc_cdf` alphabet, same `allow_warped_motion=1`
         // refusal (warp needs `av1_findSamples`, not ported at either leaf).
+        // lane-gmaffine r1: the two libaom predicates, exactly as the
+        // 16x16+ leaf resolves them (see [`decode_inter_block`]'s own doc):
+        // `is_global_mv_block` (mode GLOBAL*, model > TRANSLATION, block
+        // >= 8x8 -- BLOCK_8X8 IS the 8px minimum, so the size predicate is
+        // always true here) suppresses the motion_mode read entirely and
+        // turns on the global warp below.
+        let gm_ref = &global_motion[(ref_frame - LAST_FRAME) as usize];
+        let is_global_mv_block = is_globalmv && gm_ref.model as u8 > 1;
         let motion_mode_eligible = switchable_motion_mode
             && !skip_mode
             && interintra_mode.is_none()
+            && !(is_global_mv_block && !force_integer_mv)
             && (!overlappable_above(grid, mi_row, mi_col, 2, mi_cols as usize, 1).is_empty()
                 || !overlappable_left(grid, mi_row, mi_col, 2, mi_rows as usize, 1).is_empty());
+        let mut warp_params: Option<crate::warp::WarpParams> = None;
+        let mut warped_selected = false;
         let mut obmc_selected = false;
         if motion_mode_eligible {
             // lane-warp round 1: same 3-vs-2-symbol split as the 16x16+ leaf
             // (see its own doc) -- this leaf is always `LAST_FRAME`-only
             // (grid.set below hardcodes it).
             let warp_eligible = allow_warped_motion
-                && num_proj_ref(grid, mi_row, mi_col, 2, 2, mi_cols as usize, mi_rows as usize, LAST_FRAME) >= 1;
+                && num_proj_ref(grid, mi_row, mi_col, 2, 2, mi_cols as usize, mi_rows as usize, ref_frame) >= 1;
             if warp_eligible {
                 let mode = dec.symbol(&mut cdfs.motion_mode[0]);
                 match mode {
@@ -11292,12 +11373,41 @@ fn decode_inter_block8(
                         OBMC_HITS_8.with(|c| c.set(c.get() + 1));
                     }
                     _ => {
+                        // lane-gmaffine r1: WARPED_CAUSAL at the 8x8 leaf --
+                        // the same findSamples -> select_samples ->
+                        // av1_find_projection chain the 16x16+ leaf runs,
+                        // with BLOCK_8X8's own 8x8 model centre; an
+                        // unusable projection falls back to the block's
+                        // translational mv (libaom `av1_find_projection`
+                        // returning 1 leaves `wm_params` invalid and
+                        // `build_inter_predictors` skips the warp).
                         WARP_SELECTED_HITS.with(|c| c.set(c.get() + 1));
-                        return Err(unsupported(
-                            "an 8x8 leaf that coded WARPED_CAUSAL (motion_mode == 2): \
-                             av1_find_projection/the affine warp filter are not \
-                             ported, only motion_mode_allowed's alphabet choice is",
-                        ));
+                        let mut samples = find_samples(
+                            grid,
+                            mi_row,
+                            mi_col,
+                            2,
+                            2,
+                            mi_cols as usize,
+                            mi_rows as usize,
+                            ref_frame,
+                        );
+                        if samples.len() > 1 {
+                            crate::warp::select_samples(mv, &mut samples, SIDE as i32, SIDE as i32);
+                        }
+                        warp_params = crate::warp::find_projection(
+                            &samples,
+                            SIDE as i32,
+                            SIDE as i32,
+                            mv.1,
+                            mv.0,
+                            mi_row as i32,
+                            mi_col as i32,
+                        );
+                        warped_selected = true;
+                        if warp_params.is_some() {
+                            WARP_HITS_8.with(|c| c.set(c.get() + 1));
+                        }
                     }
                 }
             } else {
@@ -11309,6 +11419,59 @@ fn decode_inter_block8(
                 }
             }
         }
+        // lane-gmaffine r1: `read_mb_interp_filter` (spec 5.11.26) at the 8x8
+        // leaf, in libaom's own order (interintra, motion_mode, THEN the
+        // filter). Until this round the leaf read no filter symbol at all and
+        // predicted Regular unconditionally -- correct only for a frame with a
+        // fixed `interp_filter`, and a silent entropy DESYNC for every
+        // SWITCHABLE-filter stream that reaches an 8x8 leaf (which is what
+        // made the interior-split wiring above unusable at first).
+        // corner-cut: the neighbour filter context is the enclosing 16x16
+        // block's own coarse `above_filter`/`left_filter` entry (this leaf
+        // path keeps no per-leaf neighbour array), so all four siblings read
+        // the same context row. Ceiling: a stream whose 8x8 siblings pick
+        // DIFFERENT filters decodes the second..fourth leaf's symbol from the
+        // wrong CDF row. Upgrade: give `Neighbours` a real 8x8-granular
+        // filter array, same shape as the `[3, 3]` approximation the caller
+        // records after the leaf loop.
+        let above_filter_ctx = if neighbours.above_ref[c] == ref_frame
+            || neighbours.above_ref1[c] == Some(ref_frame)
+        {
+            neighbours.above_filter[c]
+        } else {
+            [3, 3]
+        };
+        let left_filter_ctx = if neighbours.left_ref[r] == ref_frame
+            || neighbours.left_ref1[r] == Some(ref_frame)
+        {
+            neighbours.left_filter[r]
+        } else {
+            [3, 3]
+        };
+        let gm_nontrans =
+            is_globalmv && gm_ref.model != ec_av1_syntax::WarpModel::Translation;
+        let (h_filter, v_filter, _resolved_filter) = resolve_interp_filter(
+            dec,
+            cdfs,
+            interp_fixed,
+            enable_dual_filter,
+            gm_nontrans || warped_selected || skip_mode,
+            above_filter_ctx,
+            left_filter_ctx,
+            false,
+        );
+
+        // lane-gmaffine r1: `allow_warp`'s `global_warp_allowed` branch
+        // (`reconinter.c:33-55`), gated INDEPENDENTLY of `motion_mode` --
+        // see [`decode_inter_block`]'s own copy. A local WARPED_CAUSAL model
+        // wins (`is_none()` guard); BLOCK_8X8 already satisfies the >=8px
+        // size predicate baked into `is_global_mv_block`.
+        if warp_params.is_none() && is_global_mv_block && !force_integer_mv && !gm_ref.invalid {
+            warp_params = crate::warp::global_warp_params(gm_ref.params);
+            if warp_params.is_some() && gm_ref.model == ec_av1_syntax::WarpModel::Affine {
+                AFFINE_GM_HITS.with(|c| c.set(c.get() + 1));
+            }
+        }
         for dr in 0..2 {
             for dc in 0..2 {
                 grid.set(
@@ -11316,7 +11479,7 @@ fn decode_inter_block8(
                     mi_col + dc,
                     MiInfo {
                         is_inter: true,
-                        ref_frame: LAST_FRAME,
+                        ref_frame,
                         // INTRA_FRAME marker for interintra blocks -- keeps
                         // them out of warp-sample gathering (see 16/32 site).
                         ref_frame1: interintra_mode.map(|_| 0),
@@ -11325,7 +11488,7 @@ fn decode_inter_block8(
                         is_new_mv,
                         size: 2,
                         size_h: 2,
-                        is_global_mv0: false,
+                        is_global_mv0: is_global_mv_block,
                         is_global_mv1: false,
                     },
                 );
@@ -11334,41 +11497,68 @@ fn decode_inter_block8(
         mode_for_tx = 0;
 
         let mut pred_y = vec![0u16; SIDE * SIDE];
-        mc::predict(
-            &ref_y.data,
-            ref_y.width,
-            ref_y.true_width,
-            ref_y.true_height,
+        mc::predict_with_filters(
+            &sref_y.data,
+            sref_y.width,
+            sref_y.true_width,
+            sref_y.true_height,
             mv_to_q4(px, mv.1, true),
             mv_to_q4(py, mv.0, true),
             SIDE,
             SIDE,
+            h_filter,
+            v_filter,
             &mut pred_y,
         );
         let mut pred_u = vec![0u16; CHROMA_SIDE * CHROMA_SIDE];
-        mc::predict(
-            &ref_u.data,
-            ref_u.width,
-            ref_u.true_width,
-            ref_u.true_height,
+        mc::predict_with_filters(
+            &sref_u.data,
+            sref_u.width,
+            sref_u.true_width,
+            sref_u.true_height,
             mv_to_q4(cpx, mv.1, false),
             mv_to_q4(cpy, mv.0, false),
             CHROMA_SIDE,
             CHROMA_SIDE,
+            h_filter,
+            v_filter,
             &mut pred_u,
         );
         let mut pred_v = vec![0u16; CHROMA_SIDE * CHROMA_SIDE];
-        mc::predict(
-            &ref_v.data,
-            ref_v.width,
-            ref_v.true_width,
-            ref_v.true_height,
+        mc::predict_with_filters(
+            &sref_v.data,
+            sref_v.width,
+            sref_v.true_width,
+            sref_v.true_height,
             mv_to_q4(cpx, mv.1, false),
             mv_to_q4(cpy, mv.0, false),
             CHROMA_SIDE,
             CHROMA_SIDE,
+            h_filter,
+            v_filter,
             &mut pred_v,
         );
+
+        // lane-gmaffine r1: the warp filter REPLACES the translational
+        // prediction just built (libaom builds one or the other), same as
+        // the 16x16+ leaf's own call trio.
+        if let Some(params) = &warp_params {
+            crate::warp::warp_affine(
+                params, &sref_y.data, sref_y.true_width as i32, sref_y.true_height as i32,
+                sref_y.width as i32, &mut pred_y, px as i32, py as i32, SIDE as i32,
+                SIDE as i32, SIDE as i32, 0, 0,
+            );
+            crate::warp::warp_affine(
+                params, &sref_u.data, sref_u.true_width as i32, sref_u.true_height as i32,
+                sref_u.width as i32, &mut pred_u, cpx as i32, cpy as i32, CHROMA_SIDE as i32,
+                CHROMA_SIDE as i32, CHROMA_SIDE as i32, 1, 1,
+            );
+            crate::warp::warp_affine(
+                params, &sref_v.data, sref_v.true_width as i32, sref_v.true_height as i32,
+                sref_v.width as i32, &mut pred_v, cpx as i32, cpy as i32, CHROMA_SIDE as i32,
+                CHROMA_SIDE as i32, CHROMA_SIDE as i32, 1, 1,
+            );
+        }
 
         if obmc_selected {
             obmc_blend(
@@ -12224,9 +12414,138 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                             if has_cols16 && has_rows16 {
                                 let ctx16 = neighbours.partition_ctx(at16, SUB);
                                 let part16 = dec.symbol(&mut cdfs.partition_w16[ctx16]);
+                                if part16 == PARTITION_SPLIT {
+                                    // lane-gmaffine r1: an INTERIOR 16x16
+                                    // PARTITION_SPLIT -- four 8x8 leaves,
+                                    // the same `partition_w8`-per-leaf loop
+                                    // the true-edge-straddling branch below
+                                    // already ran (that branch only ever
+                                    // reached it for frame-edge blocks, so
+                                    // `decode_inter_block8` was unreachable
+                                    // for every whole-superblock stream and
+                                    // its own GLOBALMV/WARPED_CAUSAL gates
+                                    // could not fire at all).
+                                let (mi_row0, mi_col0) = (sr as u32 * SUB_MI, sc as u32 * SUB_MI);
+                                let leaf_positions: Vec<(u32, u32)> = (0..4)
+                                    .map(|i| (mi_row0 + (i / 2) * 2, mi_col0 + (i % 2) * 2))
+                                    .filter(|&(mr, mc)| mr < mi_rows && mc < mi_cols)
+                                    .collect();
+                                // lane-superres r9: decode_inter_block8's own
+                                // MC (below) is not threaded for a scaled
+                                // reference (unlike decode_inter_block's 19
+                                // sites) -- refuse the whole 8x8-leaf split
+                                // up front when ANY live reference this leaf
+                                // could pick has a different width than this
+                                // frame, rather than thread frame_width
+                                // through its own single-ref/compound MC
+                                // calls to reach the same block this round.
+                                if ref_y.width != frame_width as usize
+                                    || ref_slots.iter().flatten().any(|(py, _, _)| {
+                                        py.width != frame_width as usize
+                                    })
+                                {
+                                    return Err(unsupported(
+                                        "an 8x8 partition leaf under a scaled reference (superres, unimplemented)",
+                                    ));
+                                }
+                                let mut prev_leaf: Option<((usize, usize), bool, bool)> = None;
+                                let mut last_compound_ctx: Option<(i8, i8, u8, u8)> = None;
+                                let mut last_skip_mode = false;
+                                for (mr, mc) in leaf_positions {
+                                    let leaf_mi = (mr as usize, mc as usize);
+                                    let leaf_ctx = neighbours.partition_ctx_mi(leaf_mi, 8);
+                                    let part8 = dec.symbol(&mut cdfs.partition_w8[leaf_ctx]);
+                                    if part8 != PARTITION_NONE {
+                                        return Err(unsupported(
+                                            "a partition below 8x8 (this decoder codes no leaf smaller than 8x8)",
+                                        ));
+                                    }
+                                    let (skip, is_inter, skip_mode_leaf, compound_ctx8) =
+                                        decode_inter_block8(
+                                            &mut dec,
+                                            &mut cdfs,
+                                            &mut neighbours,
+                                            &mut grid,
+                                            mi_cols,
+                                            mi_rows,
+                                            at16,
+                                            leaf_mi,
+                                            &mut y,
+                                            &mut u,
+                                            &mut v,
+                                            &ref_y,
+                                            &ref_u,
+                                            &ref_v,
+                                            &ref_slots,
+                                            base_q_idx,
+                                            &scan8,
+                                            &scan4,
+                                            prev_leaf,
+                                            allow_high_precision_mv,
+                                            force_integer_mv,
+                                            &global_motion,
+                                            enable_dual_filter,
+                                            reference_select,
+                                            enable_masked_compound,
+                                            enable_interintra_compound,
+                                            enable_jnt_comp,
+                                            order_hint_bits,
+                                            order_hint,
+                                            ref_order_hints,
+                                            skip_mode_present,
+                                            skip_mode_frame,
+                                            reduced_tx_set,
+                                            interp_fixed,
+                                            switchable_motion_mode,
+                                            allow_warped_motion,
+                                            allow_screen_content_tools,
+                                        )?;
+                                    prev_leaf = Some((leaf_mi, skip, is_inter));
+                                    last_skip_mode = skip_mode_leaf;
+                                    if compound_ctx8.is_some() {
+                                        last_compound_ctx = compound_ctx8;
+                                    }
+                                }
+                                if let Some((_, skip, is_inter)) = prev_leaf {
+                                    // corner-cut: `decode_inter_block8`'s
+                                    // leaves never read a switchable filter
+                                    // (round-3 GLOBALMV refusal already
+                                    // bounds them away from the Regular-only
+                                    // gap this round closes elsewhere); `[3,
+                                    // 3]` is "no info", the same value an
+                                    // intra neighbour records. Upgrade:
+                                    // thread `interp_fixed`/`enable_dual_filter`
+                                    // into `decode_inter_block8` once a
+                                    // straddling 8x8 SWITCHABLE stream is on
+                                    // hand to pin against.
+                                    neighbours.record_inter(
+                                        at16,
+                                        SUB,
+                                        skip,
+                                        is_inter,
+                                        if is_inter { LAST_FRAME } else { -1 },
+                                        [3, 3],
+                                        last_skip_mode,
+                                    );
+                                    if let Some((ref0, ref1, group_idx, idx)) = last_compound_ctx {
+                                        neighbours.record_inter(
+                                            at16,
+                                            SUB,
+                                            skip,
+                                            is_inter,
+                                            ref0,
+                                            [3, 3],
+                                            last_skip_mode,
+                                        );
+                                        neighbours
+                                            .record_compound_ctx(at16, SUB, ref1, group_idx, idx);
+                                    }
+                                }
+                                    continue;
+                                }
                                 if part16 != PARTITION_NONE {
                                     return Err(unsupported(
-                                        "an inter partition below 16x16 (8x8 and smaller inter blocks are not coded yet)",
+                                        "an inter partition below 16x16 other than a clean split into four 8x8 leaves",
                                     ));
                                 }
                                 decode_inter_block(
@@ -12353,6 +12672,8 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                             prev_leaf,
                                             allow_high_precision_mv,
                                             force_integer_mv,
+                                            &global_motion,
+                                            enable_dual_filter,
                                             reference_select,
                                             enable_masked_compound,
                                             enable_interintra_compound,

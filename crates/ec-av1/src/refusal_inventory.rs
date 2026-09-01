@@ -34,7 +34,6 @@ const CAPABILITY_CLAIMS: &[&str] = &[
 
 #[cfg(test)]
 const REFUSALS: &[&str] = &[
-    "GLOBALMV (round 3)",
     "a coded (non-skip) HORZ_B/VERT_B rect strip below 16x16 (this decoder ports only the skip case at this size)",
     "a coded (non-skip) HORZ/VERT rect strip below 16x16 (this decoder ports only the skip case at this size)",
     "a HORZ_A/HORZ_B/VERT_A partition below 16x16 (this decoder codes only the square arms, HORZ, VERT, VERT_B, and a clean split below 16x16)",
@@ -59,15 +58,13 @@ const REFUSALS: &[&str] = &[
     "a frame with segmentation enabled (this decoder never reads a per-block segment_id symbol)",
     "a non-skip rectangular (HORZ/VERT/HORZ_B) strip needs rectangular residual coding",
     "a palette block with a split luma transform (round 1)",
-    "a reference frame other than LAST_FRAME (round 2)",
     "a reference frame selected with no picture at this frame's own ref_frame_idx slot for it",
     "a reference picture whose height does not match this frame's own true size",
     "a show_existing_frame header naming an empty reference slot",
-    "an 8x8 leaf that coded WARPED_CAUSAL (motion_mode == 2): av1_find_projection/the affine warp filter are not ported, only motion_mode_allowed's alphabet choice is",
     "an inter frame using TxMode::Select (this decoder's inter path never reads a tx_depth symbol, so it desyncs after the first block's mode)",
     "an inter frame with no key frame before it",
     "an inter SB-level partition type other than SPLIT (this decoder's inter tile path only recurses a superblock as SPLIT)",
-    "an inter partition below 16x16 (8x8 and smaller inter blocks are not coded yet)",
+    "an inter partition below 16x16 other than a clean split into four 8x8 leaves",
     "an intra mode this decoder does not code (round 2)",
     "an intra-coded HORZ/VERT strip needs rectangular intra prediction this decoder does not code yet",
     "filter intra on a HORZ/VERT strip (this decoder predicts square-only)",
