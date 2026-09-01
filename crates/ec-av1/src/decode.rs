@@ -1562,7 +1562,8 @@ fn read_coeffs(
     let ec_trace_coeff = std::env::var_os("EC_TRACE_COEFF").is_some();
     if ec_trace_coeff {
         let (rng, _) = dec.debug_state();
-        eprintln!("EC_COEFF_STEP tag=eob eob={eob} rng={rng}");
+        let cls = match class { TxClass::TwoD => "2d", TxClass::Horiz => "horiz", TxClass::Vert => "vert" };
+        eprintln!("EC_COEFF_STEP tag=eob eob={eob} tx={tx_type:?} class={cls} rng={rng}");
     }
     let class_scan;
     let scan: &[u16] = if class == TxClass::TwoD {
@@ -10393,16 +10394,25 @@ fn decode_inter_block(
                     py_ref.width as i32, &mut pred_y, px as i32, py as i32, side as i32,
                     side as i32, side as i32, 0, 0,
                 );
-                crate::warp::warp_affine(
-                    params, &pu_ref.data, pu_ref.true_width as i32, pu_ref.true_height as i32,
-                    pu_ref.width as i32, &mut pred_u, cpx as i32, cpy as i32, chroma_side as i32,
-                    chroma_side as i32, chroma_side as i32, 1, 1,
-                );
-                crate::warp::warp_affine(
-                    params, &pv_ref.data, pv_ref.true_width as i32, pv_ref.true_height as i32,
-                    pv_ref.width as i32, &mut pred_v, cpx as i32, cpy as i32, chroma_side as i32,
-                    chroma_side as i32, chroma_side as i32, 1, 1,
-                );
+                // libaom `av1_init_warp_params` (reconinter.c): warp is
+                // per PLANE and bails out at `block_width < 8 ||
+                // block_height < 8`, so a plane whose own block is under
+                // 8x8 keeps the translational prediction built above --
+                // in 420 that is every chroma plane of a luma block below
+                // 16x16 (lane-gmaffine r4: chroma-only mismatch of a few
+                // levels on both 8x8-leaf motion gates).
+                if chroma_side >= 8 {
+                    crate::warp::warp_affine(
+                        params, &pu_ref.data, pu_ref.true_width as i32, pu_ref.true_height as i32,
+                        pu_ref.width as i32, &mut pred_u, cpx as i32, cpy as i32, chroma_side as i32,
+                        chroma_side as i32, chroma_side as i32, 1, 1,
+                    );
+                    crate::warp::warp_affine(
+                        params, &pv_ref.data, pv_ref.true_width as i32, pv_ref.true_height as i32,
+                        pv_ref.width as i32, &mut pred_v, cpx as i32, cpy as i32, chroma_side as i32,
+                        chroma_side as i32, chroma_side as i32, 1, 1,
+                    );
+                }
             }
 
             if obmc_selected {
@@ -11750,6 +11760,14 @@ fn decode_inter_block8(
                 AFFINE_GM_HITS.with(|c| c.set(c.get() + 1));
             }
         }
+        if std::env::var_os("EC_TRACE_MODE").is_some() {
+            eprintln!(
+                "EC_WARP8 mi_row={} mi_col={} warp={} globalblk={is_global_mv_block}",
+                leaf_mi.0,
+                leaf_mi.1,
+                warp_params.is_some(),
+            );
+        }
         for dr in 0..2 {
             for dc in 0..2 {
                 grid.set(
@@ -11826,16 +11844,22 @@ fn decode_inter_block8(
                 sref_y.width as i32, &mut pred_y, px as i32, py as i32, SIDE as i32,
                 SIDE as i32, SIDE as i32, 0, 0,
             );
-            crate::warp::warp_affine(
-                params, &sref_u.data, sref_u.true_width as i32, sref_u.true_height as i32,
-                sref_u.width as i32, &mut pred_u, cpx as i32, cpy as i32, CHROMA_SIDE as i32,
-                CHROMA_SIDE as i32, CHROMA_SIDE as i32, 1, 1,
-            );
-            crate::warp::warp_affine(
-                params, &sref_v.data, sref_v.true_width as i32, sref_v.true_height as i32,
-                sref_v.width as i32, &mut pred_v, cpx as i32, cpy as i32, CHROMA_SIDE as i32,
-                CHROMA_SIDE as i32, CHROMA_SIDE as i32, 1, 1,
-            );
+            // `av1_init_warp_params`'s per-plane `block_width/height < 8`
+            // bail-out: an 8x8 leaf's chroma plane is 4x4 in 420, so it is
+            // predicted translationally even when the luma warps.
+            #[allow(clippy::absurd_extreme_comparisons)]
+            if CHROMA_SIDE >= 8 {
+                crate::warp::warp_affine(
+                    params, &sref_u.data, sref_u.true_width as i32, sref_u.true_height as i32,
+                    sref_u.width as i32, &mut pred_u, cpx as i32, cpy as i32, CHROMA_SIDE as i32,
+                    CHROMA_SIDE as i32, CHROMA_SIDE as i32, 1, 1,
+                );
+                crate::warp::warp_affine(
+                    params, &sref_v.data, sref_v.true_width as i32, sref_v.true_height as i32,
+                    sref_v.width as i32, &mut pred_v, cpx as i32, cpy as i32, CHROMA_SIDE as i32,
+                    CHROMA_SIDE as i32, CHROMA_SIDE as i32, 1, 1,
+                );
+            }
         }
 
         if obmc_selected {
