@@ -1070,6 +1070,59 @@ const HAS_BOTTOM_LEFT: [&[u8]; 4] = [
     ],
 ];
 
+/// `has_tr_vert_*` (libaom `reconintra.c`, `has_tr_vert_tables`), indexed by
+/// [`Reach::table`] exactly like [`HAS_TOP_RIGHT`]: inside a
+/// `PARTITION_VERT_A`/`_B` the square sub-blocks are visited TL, BL, TR, BR
+/// rather than in raster order, so the bottom-left square's top-right
+/// neighbour is the partition's own right-hand rectangle -- not yet decoded.
+/// libaom switches tables on the partition type (`get_has_tr_table`); the
+/// ordinary table says 1 where this one says 0 (32x32 at row 1 col 0:
+/// `95` bit 4 = 1 vs `15` bit 4 = 0), which is exactly the case
+/// lane-part32 r5 caught reading undecoded samples.
+const HAS_TOP_RIGHT_VERT: [&[u8]; 3] = [
+    // has_tr_vert_16x16
+    &[255, 0, 119, 0, 127, 0, 119, 0],
+    // has_tr_vert_32x32
+    &[15, 7],
+    // has_tr_vert_8x8
+    &[
+        255, 255, 0, 0, 119, 119, 0, 0, 127, 127, 0, 0, 119, 119, 0, 0, 255, 127, 0, 0, 119, 119,
+        0, 0, 127, 127, 0, 0, 119, 119, 0, 0,
+    ],
+];
+
+/// [`HAS_TOP_RIGHT_VERT`]'s sibling, `has_bl_vert_tables`.
+const HAS_BOTTOM_LEFT_VERT: [&[u8]; 3] = [
+    // has_bl_vert_16x16
+    &[254, 16, 254, 0, 254, 16, 254, 0],
+    // has_bl_vert_32x32
+    &[14, 14],
+    // has_bl_vert_8x8
+    &[
+        254, 255, 16, 17, 254, 255, 0, 1, 254, 255, 16, 17, 254, 255, 0, 0, 254, 255, 16, 17, 254,
+        255, 0, 1, 254, 255, 16, 17, 254, 255, 0, 0,
+    ],
+];
+
+thread_local! {
+    /// Set for the duration of a `PARTITION_VERT_A`/`_B`'s own sub-blocks
+    /// (see [`Reach::vert_ab_partition`]) -- libaom carries the partition
+    /// type down into `has_top_right`/`has_bottom_left` as an argument, and
+    /// threading one bool through this crate's already twenty-argument
+    /// `decode_block` would touch every call site instead of the two arms
+    /// that need it.
+    static VERT_AB_PARTITION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Restores [`VERT_AB_PARTITION`] to what it was when the guard was made.
+pub(crate) struct VertAbGuard(bool);
+
+impl Drop for VertAbGuard {
+    fn drop(&mut self) {
+        VERT_AB_PARTITION.with(|c| c.set(self.0));
+    }
+}
+
 /// `has_tr_32x16`/`has_tr_16x32` (libaom `reconintra.c`) -- lane-intradisp
 /// r1: the two rect strips PARTITION_HORZ/VERT ever produce at the 32x32
 /// level, transcribed verbatim (not derived): `[0]` is 32-wide, `[1]` is
@@ -1158,8 +1211,10 @@ impl Reach {
         if ((blk_col + 1) << bw_log2) >= SB_MI {
             return false;
         }
+        // libaom indexes with MAX_MIB_SIZE_LOG2 (5), not 4 (coordinator-
+        // reported, lane-rectx r5 fixes the same two lines on its branch).
         let table = has_tr_rect_table(bw, bh);
-        Self::bit(table, (blk_row << (4 - bw_log2)) + blk_col)
+        Self::bit(table, (blk_row << (5 - bw_log2)) + blk_col)
     }
 
     /// libaom `has_bottom_left`, same granularity as [`Self::top_right_rect`].
@@ -1180,8 +1235,18 @@ impl Reach {
         if ((blk_row + 1) << bh_log2) >= SB_MI {
             return false;
         }
+        // Same MAX_MIB_SIZE_LOG2 fix as `top_right_rect`.
         let table = has_bl_rect_table(bw, bh);
-        Self::bit(table, (blk_row << (4 - bw_log2)) + blk_col)
+        Self::bit(table, (blk_row << (5 - bw_log2)) + blk_col)
+    }
+
+    /// Marks every [`Reach::of`] made until the returned guard drops as being
+    /// inside a `PARTITION_VERT_A`/`_B` (libaom's `get_has_tr_table` /
+    /// `get_has_bl_table` partition argument). Rectangular sub-blocks are
+    /// unaffected: libaom's own comment says vertical rectangles keep their
+    /// non-vert table, which is what [`Reach::of_rect`] already reads.
+    pub(crate) fn vert_ab_partition() -> VertAbGuard {
+        VertAbGuard(VERT_AB_PARTITION.with(|c| c.replace(true)))
     }
 
     /// Neither, which is all a mode that reads no further than its own edges
@@ -1205,10 +1270,16 @@ impl Reach {
         if col + 1 == per_side {
             return false;
         }
-        // lane-sub8 r4: side 4 now has its own `has_tr_4x4`/`has_bl_4x4`
-        // row (the corner-cut this comment used to describe); sides 16/32/64
-        // share row 0 exactly as libaom's tables repeat.
-        let table = HAS_TOP_RIGHT[Self::table(side)];
+        // lane-sub8 r4: side 4 now has its own `has_tr_4x4`/`has_bl_4x4` row;
+        // sides 16/32/64 share row 0 exactly as libaom's tables repeat. Under
+        // a VERT_A/VERT_B partition the square sub-blocks are visited
+        // TL,BL,TR,BR, so libaom switches onto the `_vert_` tables
+        // (lane-part32 r5, `reconintra.c` `get_has_tr_table`).
+        let table = if VERT_AB_PARTITION.with(std::cell::Cell::get) {
+            HAS_TOP_RIGHT_VERT[Self::table(side)]
+        } else {
+            HAS_TOP_RIGHT[Self::table(side)]
+        };
         Self::bit(
             table,
             (row * Self::table_stride(side) + col) % (table.len() * 8),
@@ -1228,7 +1299,11 @@ impl Reach {
             return false;
         }
         // See `top_right`'s note.
-        let table = HAS_BOTTOM_LEFT[Self::table(side)];
+        let table = if VERT_AB_PARTITION.with(std::cell::Cell::get) {
+            HAS_BOTTOM_LEFT_VERT[Self::table(side)]
+        } else {
+            HAS_BOTTOM_LEFT[Self::table(side)]
+        };
         Self::bit(
             table,
             (row * Self::table_stride(side) + col) % (table.len() * 8),
