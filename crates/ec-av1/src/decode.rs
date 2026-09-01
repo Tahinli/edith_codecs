@@ -1992,11 +1992,20 @@ impl Neighbours {
         colors: [u16; 8],
     ) {
         let (r, c) = at;
-        for cell in 0..w / SUB {
+        // `.max(1)`: a below-16px span covers no whole SUB cell, so the plain
+        // `w / SUB` loop was a NO-OP for every 16x8/8x16/8x8/4x4 leaf and the
+        // next block read a long-dead palette out of the above/left arrays
+        // (class [[cdf-row-held-constant]], lane-palette2 r8). libaom keeps
+        // `palette_size` per 4px mi cell; corner-cut: our grid is 16px, so a
+        // sub-16 leaf stamps its whole containing cell -- safe today because
+        // every sub-16 leaf path refuses palette outright (so it can only
+        // ever stamp `size == 0`, and its cell holds no palette sibling).
+        // Upgrade path: widen the palette arrays to mi granularity.
+        for cell in 0..(w / SUB).max(1) {
             self.above_palette_size[c + cell] = size;
             self.above_palette_colors[c + cell] = colors;
         }
-        for cell in 0..h / SUB {
+        for cell in 0..(h / SUB).max(1) {
             self.left_palette_size[r + cell] = size;
             self.left_palette_colors[r + cell] = colors;
         }
@@ -2083,11 +2092,12 @@ impl Neighbours {
         colors: [u16; 8],
     ) {
         let (r, c) = at;
-        for cell in 0..w / SUB {
+        // See [`Self::record_palette_y_rect`] for the `.max(1)`.
+        for cell in 0..(w / SUB).max(1) {
             self.above_palette_uv_size[c + cell] = size;
             self.above_palette_uv_colors[c + cell] = colors;
         }
-        for cell in 0..h / SUB {
+        for cell in 0..(h / SUB).max(1) {
             self.left_palette_uv_size[r + cell] = size;
             self.left_palette_uv_colors[r + cell] = colors;
         }
@@ -3788,6 +3798,12 @@ fn decode_leaf_rect(
     );
     neighbours.fill_skip_grid_rect(leaf_mi, mi_w, mi_h, skip);
     neighbours.fill_lf_grid_rect(leaf_mi, mi_w, mi_h, bw as u8, bh as u8, 0);
+    // This leaf is necessarily non-palette (a palette one refused above), so
+    // it must CLEAR the above/left palette state over its own span -- without
+    // this the next block's `palette_y_mode` ctx and colour cache were read
+    // off whatever block last covered the cell (lane-palette2 r8).
+    neighbours.record_palette_y_rect(pal_at, bw, bh, 0, [0u16; 8]);
+    neighbours.record_palette_uv_rect(pal_at, bw, bh, 0, [0u16; 8]);
     Ok(mode)
 }
 
@@ -5684,11 +5700,27 @@ fn decode_leaf8(
                 neighbours.above[leaf_mi.1 + cell][2] = v_state;
             }
         }
+    // Non-palette 8x8 leaf (this path never reads a palette): clear the
+    // above/left palette state over its own cell so the next block's ctx and
+    // colour cache do not read a previous block's palette (lane-palette2 r8).
+    {
+        let pal_at = (leaf_mi.0 / (SUB / MI), leaf_mi.1 / (SUB / MI));
+        neighbours.record_palette_y_rect(pal_at, 8, 8, 0, [0u16; 8]);
+        neighbours.record_palette_uv_rect(pal_at, 8, 8, 0, [0u16; 8]);
+    }
         neighbours.fill_skip_grid(leaf_mi, 2, skip);
         neighbours.fill_lf_grid(leaf_mi, 2, 4, 0);
         return Ok(mode);
     }
     neighbours.record_mi(leaf_mi, 8, &[luma_grid, u_grid, v_grid]);
+    // Non-palette 8x8 leaf (this path never reads a palette): clear the
+    // above/left palette state over its own cell so the next block's ctx and
+    // colour cache do not read a previous block's palette (lane-palette2 r8).
+    {
+        let pal_at = (leaf_mi.0 / (SUB / MI), leaf_mi.1 / (SUB / MI));
+        neighbours.record_palette_y_rect(pal_at, 8, 8, 0, [0u16; 8]);
+        neighbours.record_palette_uv_rect(pal_at, 8, 8, 0, [0u16; 8]);
+    }
     neighbours.fill_skip_grid(leaf_mi, 2, skip);
     neighbours.fill_lf_grid(leaf_mi, 2, 8, 0);
     Ok(mode)
@@ -13671,6 +13703,33 @@ mod tests {
         assert_eq!(n.above_ref1[0], Some(ALTREF_FRAME));
         assert_eq!(n.left_ref1[0], Some(ALTREF_FRAME));
         assert!(!is_uni_comp_ref(LAST_FRAME, n.above_ref1[0].unwrap()));
+    }
+
+    /// A below-16px leaf must clear the palette neighbour state over its own
+    /// cell: before lane-palette2 r8 `record_palette_y_rect`'s `w / SUB` loops
+    /// ran zero times for any sub-16 span, so `decode_leaf_rect` /
+    /// `decode_leaf8` left a previous block's palette size and colours in the
+    /// above/left arrays and the NEXT block read `palette_y_mode` off the
+    /// wrong CDF row with a stale colour cache (class
+    /// [[cdf-row-held-constant]]).
+    #[test]
+    fn a_sub16_leaf_after_a_palette_block_yields_palette_ctx_zero() {
+        let mut n = Neighbours::new(4, 4, 16, 16);
+        // A real 16x16 palette block covering SUB cell (1, 1).
+        n.record_palette_y_rect((1, 1), 16, 16, 2, [7, 9, 0, 0, 0, 0, 0, 0]);
+        let (ctx, cache) = n.palette_ctx_and_cache((1, 1));
+        assert_eq!(ctx, 2, "the palette block itself must be visible");
+        assert_eq!(cache, vec![7, 9]);
+        // An 8x8 non-palette leaf in that same cell.
+        n.record_palette_y_rect((1, 1), 8, 8, 0, [0u16; 8]);
+        let (ctx, cache) = n.palette_ctx_and_cache((1, 1));
+        assert_eq!(ctx, 0, "a sub-16 non-palette leaf must clear its own cell");
+        assert!(cache.is_empty(), "and its stale colour cache with it");
+        // Same for the chroma half.
+        n.record_palette_uv_rect((1, 1), 16, 16, 2, [1, 2, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(n.palette_uv_cache((1, 1)), vec![1, 2]);
+        n.record_palette_uv_rect((1, 1), 8, 8, 0, [0u16; 8]);
+        assert!(n.palette_uv_cache((1, 1)).is_empty());
     }
 
     /// [`cdf::COMPOUND_MODE_CTX_MAP`] folded by hand against libaom's
