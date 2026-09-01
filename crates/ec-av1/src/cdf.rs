@@ -266,18 +266,36 @@ pub const EOB_PT_128_CHROMA_Q3: [u16; 9] = [
     24313, 26062, 28385, 30107, 31217, 31898, 32345, 32768, 0,
 ];
 
-/// `av1_default_eob_multi512_cdfs[*][1][*]` (`token_cdfs.h:874-901`,
-/// lane-sbpart): the end-of-block group of a CHROMA transform with 512 coded
-/// positions -- what a 32x16/16x32 chroma transform has (the chroma plane of
-/// an intra `PARTITION_HORZ`/`VERT` 64x32/32x64 superblock strip, whose luma
-/// coefficients truncate to the 64x64-superblock's own 32x32 corner-scan
-/// (`TxbSet::Luma64`) but whose *chroma* plane, at 32x16, is small enough
-/// that no truncation applies). Unlike every other `EOB_PT_*` table here,
-/// libaom's default is the exact same flat distribution at all four
-/// q-contexts and both `eob_multi_size` selectors (`token_cdfs.h` rows), so
-/// one constant covers every q-context -- no `_Q0`/`_Q1`/`_Q3` siblings.
+/// `av1_default_eob_multi512_cdfs[2][1][0]` (`token_cdfs.h:874-901`,
+/// lane-part32 r4): the end-of-block group of a CHROMA transform with 512
+/// coded positions -- what a 32x16/16x32 chroma transform has (the chroma
+/// plane of an intra `PARTITION_HORZ`/`VERT` 64x32/32x64 superblock strip,
+/// whose luma coefficients truncate to the 64x64-superblock's own 32x32
+/// corner-scan (`TxbSet::Luma64`) but whose *chroma* plane, at 32x16, is
+/// small enough that no truncation applies).
+///
+/// lane-sbpart originally transcribed the `[1][1]` row -- the
+/// `TX_CLASS_HORIZ`/`VERT` (1D) sibling, whose default IS the flat
+/// `3277, 6554, ...` ramp at every q-context -- and wrote that flatness into
+/// this comment as a property of the whole table. The 2D row this decoder
+/// actually reads is q-dependent like every other `EOB_PT_*` family, so a
+/// real `--cq-level=45` stream (q-context 3) read the wrong CDF and desynced
+/// the tile at the first 32x16 chroma transform of the first SB-level
+/// HORZ/VERT strip.
 pub const EOB_PT_512_CHROMA: [u16; 11] = [
-    3277, 6554, 9830, 13107, 16384, 19661, 22938, 26214, 29491, 32768, 0,
+    12015, 14769, 19588, 22052, 24222, 25812, 27300, 29219, 32114, 32768, 0,
+];
+/// [`EOB_PT_512_CHROMA`], q-context 0 (`base_q_idx` 0..=20).
+pub const EOB_PT_512_CHROMA_Q0: [u16; 11] = [
+    5095, 6446, 9996, 13354, 16017, 17986, 20919, 26129, 29140, 32768, 0,
+];
+/// [`EOB_PT_512_CHROMA`], q-context 1 (`base_q_idx` 21..=60).
+pub const EOB_PT_512_CHROMA_Q1: [u16; 11] = [
+    7265, 9979, 15819, 19250, 21780, 23846, 26478, 28396, 31811, 32768, 0,
+];
+/// [`EOB_PT_512_CHROMA`], q-context 3 (`base_q_idx` 121..=255).
+pub const EOB_PT_512_CHROMA_Q3: [u16; 11] = [
+    21093, 23043, 25742, 27658, 29097, 29716, 30073, 30820, 31956, 32768, 0,
 ];
 
 /// `Default_Dc_Sign_Cdf[2][0]` (spec 9.4): the sign of a luma DC coefficient,
@@ -783,22 +801,39 @@ pub const NZ_MAP_CTX_OFFSET_32: [[u8; 5]; 5] = [
 /// indexes this position table by the raw, un-adjusted `tx_size` -- lane-sbpart
 /// r8 root cause) is genuinely rectangular, not square. Distinct from
 /// [`NZ_MAP_CTX_OFFSET_32`] starting at `(row=1, col=0)`.
+// lane-part32 r3: this table was TRANSPOSED (row/col swapped) as landed by
+// lane-sbpart r8 -- caught by tracing a real aomenc pin against a patched
+// aomdec (added per-symbol `EC_TRACE_COEFF` ctx prints to
+// `read_coeffs_reverse{,_2d}` in `~/.cache/aom-oracle`), which showed our own
+// `(row=2, col=0)` reading ctx-offset 11 where the real decoder's equivalent
+// position read 6. Re-derived straight from libaom's own generating
+// comment in `get_nz_map_ctx_from_stats` (`txb_common.h:199-210`): for
+// `width < height` (this table, `TX_32X64`), ctx is `11 +` for `row < 2`
+// *regardless of col* -- the old table instead special-cased `col < 2`,
+// which is the `width > height` (`TX_64X32`) branch. Confirmed against the
+// real `av1_nz_map_ctx_offset_32x64`/`_64x32` C arrays in
+// `av1/common/txb_common.c`, decoded through libaom's own col-major
+// `pos = col*32+row` raster (same convention [`SCAN_32X16`]'s doc comment
+// already documents this decoder transcribes out of).
 pub const NZ_MAP_CTX_OFFSET_32X64: [[u8; 5]; 5] = [
-    [0, 11, 6, 6, 21],
-    [11, 11, 6, 21, 21],
-    [11, 11, 21, 21, 21],
-    [11, 11, 21, 21, 21],
-    [11, 11, 21, 21, 21],
+    [0, 11, 11, 11, 11],
+    [11, 11, 11, 11, 11],
+    [6, 6, 21, 21, 21],
+    [6, 21, 21, 21, 21],
+    [21, 21, 21, 21, 21],
 ];
 
 /// [`NZ_MAP_CTX_OFFSET_32X64`]'s `TX_64X32` counterpart (libaom
 /// `av1_nz_map_ctx_offset_64x32`): a `PARTITION_HORZ` strip's luma corner.
+/// `width > height` here, so the `col < 2` branch (offset 16) fires
+/// regardless of row -- transpose of [`NZ_MAP_CTX_OFFSET_32X64`]'s `row < 2`
+/// branch, same r3 fix (see that table's doc comment).
 pub const NZ_MAP_CTX_OFFSET_64X32: [[u8; 5]; 5] = [
-    [0, 16, 16, 16, 16],
-    [16, 16, 16, 16, 16],
-    [6, 6, 21, 21, 21],
-    [6, 21, 21, 21, 21],
-    [21, 21, 21, 21, 21],
+    [0, 16, 6, 6, 21],
+    [16, 16, 6, 21, 21],
+    [16, 16, 21, 21, 21],
+    [16, 16, 21, 21, 21],
+    [16, 16, 21, 21, 21],
 ];
 
 /// `Default_Txb_Skip_Cdf[2][2][7..10]` (spec 9.4): the all-zero flag of a
