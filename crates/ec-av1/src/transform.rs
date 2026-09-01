@@ -839,12 +839,12 @@ pub fn inverse_transform_2d_typed_wh(
     let mut t = [0i32; 64];
     for i in 0..h {
         for j in 0..w {
-            let c = if i < 32 && j < 32 { dequant[i * w + j] } else { 0 };
-            t[j] = if rect_scale {
-                round2(c * 2896, 12)
+            let c = if i < 32 && j < 32 {
+                dequant[i * w + j]
             } else {
-                c
+                0
             };
+            t[j] = if rect_scale { round2(c * 2896, 12) } else { c };
         }
         inverse_1d(&mut t, log2w, row_clamp, row_kind);
         for j in 0..w {
@@ -898,7 +898,9 @@ pub fn dequant_and_inverse_typed(
     ac_delta: i32,
     tx_type: TxType,
 ) -> Vec<i32> {
-    dequant_and_inverse_typed_wh(levels, side, side, bit_depth, q_idx, dc_delta, ac_delta, tx_type)
+    dequant_and_inverse_typed_wh(
+        levels, side, side, bit_depth, q_idx, dc_delta, ac_delta, tx_type,
+    )
 }
 
 /// [`dequant_and_inverse_typed`] widened to `(w, h)` (lane-recttx). `dc_delta`/

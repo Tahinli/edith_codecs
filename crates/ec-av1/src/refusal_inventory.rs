@@ -64,7 +64,8 @@ const REFUSALS: &[&str] = &[
     "a reference picture whose height does not match this frame's own true size",
     "a show_existing_frame header naming an empty reference slot",
     "an 8x8 leaf that coded WARPED_CAUSAL (motion_mode == 2): av1_find_projection/the affine warp filter are not ported, only motion_mode_allowed's alphabet choice is",
-    "an inter frame using TxMode::Select (this decoder's inter path never reads a tx_depth symbol, so it desyncs after the first block's mode)",
+    "an inter var-tx tree with a leaf transform larger than 32x32",
+    "an intra block in an inter frame whose tx_depth splits its luma transform (round 1)",
     "an inter frame whose global motion for a single-reference frame is AFFINE (unverified this round; ROTZOOM/TRANSLATION/IDENTITY are proven)",
     "an inter frame with no key frame before it",
     "an inter SB-level partition type other than SPLIT (this decoder's inter tile path only recurses a superblock as SPLIT)",
@@ -178,7 +179,11 @@ mod tests {
             .chain(REFUSALS)
             .map(|&s| s.to_owned())
             .collect();
-        assert!(found.len() >= 30, "the refusal scan found only {} reasons -- it is broken, not the decoder", found.len());
+        assert!(
+            found.len() >= 30,
+            "the refusal scan found only {} reasons -- it is broken, not the decoder",
+            found.len()
+        );
 
         let added: Vec<&String> = found.difference(&listed).collect();
         assert!(
@@ -224,9 +229,14 @@ mod tests {
         let mut found: BTreeSet<String> = BTreeSet::new();
         for (i, _) in src.match_indices("\"SKIP ") {
             let rest = &src[i + "\"SKIP ".len()..];
-            let Some(colon) = rest.find(':') else { continue };
+            let Some(colon) = rest.find(':') else {
+                continue;
+            };
             let name = &rest[..colon];
-            if !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') {
+            if !name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+            {
                 continue;
             }
             // The tail of the message says what was skipped. Only "{e}" -- the
@@ -239,7 +249,10 @@ mod tests {
             }
         }
         let listed: BTreeSet<&str> = GATES_THAT_SKIP_ON_A_DECODE_ERROR.iter().copied().collect();
-        let added: Vec<&String> = found.iter().filter(|n| !listed.contains(n.as_str())).collect();
+        let added: Vec<&String> = found
+            .iter()
+            .filter(|n| !listed.contains(n.as_str()))
+            .collect();
         assert!(
             added.is_empty(),
             "these gates turn a decode error into a printed SKIP and are not declared: \

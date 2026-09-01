@@ -33,18 +33,18 @@ const N_DIR: usize = 6;
 
 const WEDGE_MASTER_OBLIQUE_ODD: [u8; MASK_MASTER_SIZE] = [
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 6,
-    18, 37, 53, 60, 63, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
-    64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+    18, 37, 53, 60, 63, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+    64, 64, 64, 64, 64, 64, 64, 64, 64,
 ];
 const WEDGE_MASTER_OBLIQUE_EVEN: [u8; MASK_MASTER_SIZE] = [
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 4, 11,
-    27, 46, 58, 62, 63, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
-    64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+    27, 46, 58, 62, 63, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+    64, 64, 64, 64, 64, 64, 64, 64, 64,
 ];
 const WEDGE_MASTER_VERTICAL: [u8; MASK_MASTER_SIZE] = [
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 7,
-    21, 43, 57, 62, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
-    64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+    21, 43, 57, 62, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+    64, 64, 64, 64, 64, 64, 64, 64, 64,
 ];
 
 /// `wedge_codebook_16_heqw` (reconinter.c) -- (direction, x_offset, y_offset).
@@ -149,7 +149,13 @@ fn init_wedge_master_masks() -> MasterMasks {
 /// `get_wedge_mask_inplace` (reconinter.c): the `bw x bh` window of the
 /// master plane for this `(wedge_index, neg, bw, bh)`, still in
 /// `MASK_MASTER_SIZE`-stride coordinates (caller extracts the window).
-fn wedge_window(master: &MasterMasks, wedge_index: usize, neg: usize, bw: usize, bh: usize) -> (usize, usize, usize) {
+fn wedge_window(
+    master: &MasterMasks,
+    wedge_index: usize,
+    neg: usize,
+    bw: usize,
+    bh: usize,
+) -> (usize, usize, usize) {
     let (dir, xo, yo) = HEQW[wedge_index];
     let wsignflip = SIGNFLIP[wedge_index] as usize;
     let woff = (xo as usize * bw) >> 3;
@@ -157,7 +163,11 @@ fn wedge_window(master: &MasterMasks, wedge_index: usize, neg: usize, bw: usize,
     let _ = &master.obl[neg ^ wsignflip][dir as usize];
     let row0 = MASK_MASTER_SIZE / 2 - hoff;
     let col0 = MASK_MASTER_SIZE / 2 - woff;
-    (neg ^ wsignflip, dir as usize, row0 * MASK_MASTER_SIZE + col0)
+    (
+        neg ^ wsignflip,
+        dir as usize,
+        row0 * MASK_MASTER_SIZE + col0,
+    )
 }
 
 /// Per-`(sign, wedge_index)` `bw x bh` mask, contiguous stride `bw`.
@@ -282,6 +292,10 @@ mod tests {
                 }
             }
         }
-        assert_eq!(checked, 3 * 2 * MAX_WEDGE_TYPES, "checked every (bsize,sign,index) triple");
+        assert_eq!(
+            checked,
+            3 * 2 * MAX_WEDGE_TYPES,
+            "checked every (bsize,sign,index) triple"
+        );
     }
 }

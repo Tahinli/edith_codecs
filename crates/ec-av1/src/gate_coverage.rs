@@ -32,9 +32,10 @@
 /// Each entry is `(flag, why)`. Removing an entry is how a lane records that
 /// its tool is now covered by a real stream.
 #[cfg(test)]
-const NEVER_EXERCISED: &[(&str, &str)] = &[
-    ("enable-intrabc", "intra block copy syntax is consumed but no block is reconstructed from it"),
-];
+const NEVER_EXERCISED: &[(&str, &str)] = &[(
+    "enable-intrabc",
+    "intra block copy syntax is consumed but no block is reconstructed from it",
+)];
 
 #[cfg(test)]
 mod tests {
@@ -51,7 +52,11 @@ mod tests {
             .split("\n    #[")
             .filter(|body| body.contains("\"--passes=1\""))
             .collect();
-        assert!(gates.len() >= 20, "expected the real-aomenc gates, found {}", gates.len());
+        assert!(
+            gates.len() >= 20,
+            "expected the real-aomenc gates, found {}",
+            gates.len()
+        );
 
         let mut per_tool: BTreeMap<String, (usize, usize, usize)> = BTreeMap::new();
         let mut names: BTreeSet<String> = BTreeSet::new();
@@ -61,8 +66,12 @@ mod tests {
             for (i, _) in gate.match_indices("\"--enable-") {
                 let rest = &gate[i + 3..];
                 let Some(end) = rest.find('"') else { continue };
-                let Some((flag, value)) = rest[..end].split_once('=') else { continue };
-                let Some(value) = value.chars().next() else { continue };
+                let Some((flag, value)) = rest[..end].split_once('=') else {
+                    continue;
+                };
+                let Some(value) = value.chars().next() else {
+                    continue;
+                };
                 names.insert(flag.to_owned());
                 here.insert(flag.to_owned(), value);
             }
@@ -120,10 +129,20 @@ mod tests {
     #[test]
     fn tool_settings_reads_whole_flags() {
         let (gate_count, per_tool) = tool_settings();
-        assert!(per_tool.contains_key("enable-cdef"), "expected --enable-cdef among the gate flags");
+        assert!(
+            per_tool.contains_key("enable-cdef"),
+            "expected --enable-cdef among the gate flags"
+        );
         for (name, &(off, on, defaulted)) in &per_tool {
-            assert!(!name.is_empty() && !name.contains(['"', '=']), "malformed flag {name:?}");
-            assert_eq!(off + on + defaulted, gate_count, "{name} counts do not cover every gate");
+            assert!(
+                !name.is_empty() && !name.contains(['"', '=']),
+                "malformed flag {name:?}"
+            );
+            assert_eq!(
+                off + on + defaulted,
+                gate_count,
+                "{name} counts do not cover every gate"
+            );
         }
     }
 }

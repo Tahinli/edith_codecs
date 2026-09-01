@@ -21,9 +21,7 @@
 //! too). Anything outside that refuses with [`Error::unsupported`] rather than
 //! silently miscoding.
 
-use ec_av1_syntax::{
-    CdefParams, DeltaParams, LoopFilterParams, LoopRestorationParams, TileInfo,
-};
+use ec_av1_syntax::{CdefParams, DeltaParams, LoopFilterParams, LoopRestorationParams, TileInfo};
 use ec_core::{Error, Result};
 
 use crate::cdf;
@@ -199,7 +197,14 @@ fn plane_q_delta(plane_idx: usize) -> (i32, i32) {
 /// top-left leaf is the only block that can ever land there), or when that
 /// leaf both *is* the whole superblock and is `skip` (the one case libaom
 /// itself skips the read, state carrying over unchanged).
-fn maybe_read_delta_q(dec: &mut SymbolDecoder, cdfs: &mut Cdfs, mi_r: usize, mi_c: usize, is_whole_sb: bool, skip: bool) {
+fn maybe_read_delta_q(
+    dec: &mut SymbolDecoder,
+    cdfs: &mut Cdfs,
+    mi_r: usize,
+    mi_c: usize,
+    is_whole_sb: bool,
+    skip: bool,
+) {
     if !DELTA_Q_PRESENT.with(|c| c.get()) {
         return;
     }
@@ -254,7 +259,14 @@ pub(crate) fn delta_lf_hits() -> usize {
 /// [`maybe_read_delta_q`] (spec order `delta_q -> delta_lf`), looped over
 /// `FRAME_LF_COUNT = 4` planes/directions when `delta_lf_multi` is set, or
 /// read once into index 0 otherwise.
-fn maybe_read_delta_lf(dec: &mut SymbolDecoder, cdfs: &mut Cdfs, mi_r: usize, mi_c: usize, is_whole_sb: bool, skip: bool) {
+fn maybe_read_delta_lf(
+    dec: &mut SymbolDecoder,
+    cdfs: &mut Cdfs,
+    mi_r: usize,
+    mi_c: usize,
+    is_whole_sb: bool,
+    skip: bool,
+) {
     if !DELTA_LF_PRESENT.with(|c| c.get()) {
         return;
     }
@@ -370,8 +382,7 @@ thread_local! {
 /// lane-comppin r4: decode-order picture counter for `EC_AV1_PREFILT_DUMP`,
 /// mirroring stream.rs's `pictures_decoded` so the two dumps index
 /// identically against aomdec's own `ec_frame_idx` in decodeframe.c.
-static PREFILT_PICTURE_IDX: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static PREFILT_PICTURE_IDX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Current value of [`DEBLOCK_HITS`].
 pub(crate) fn deblock_hits() -> usize {
@@ -1186,33 +1197,33 @@ fn br_ctx(grid: &[i32], side: usize, row: usize, col: usize, class: TxClass) -> 
 /// against the real table). Not the square zigzag formula generalized to
 /// unequal `w`/`h` -- checked and that does NOT reproduce this table.
 const SCAN_32X16: [u16; 512] = [
-    0, 32, 1, 64, 33, 2, 96, 65, 34, 3, 128, 97, 66, 35, 4, 160, 129, 98, 67, 36, 5, 192, 161,
-    130, 99, 68, 37, 6, 224, 193, 162, 131, 100, 69, 38, 7, 256, 225, 194, 163, 132, 101, 70, 39,
-    8, 288, 257, 226, 195, 164, 133, 102, 71, 40, 9, 320, 289, 258, 227, 196, 165, 134, 103, 72,
-    41, 10, 352, 321, 290, 259, 228, 197, 166, 135, 104, 73, 42, 11, 384, 353, 322, 291, 260, 229,
-    198, 167, 136, 105, 74, 43, 12, 416, 385, 354, 323, 292, 261, 230, 199, 168, 137, 106, 75, 44,
-    13, 448, 417, 386, 355, 324, 293, 262, 231, 200, 169, 138, 107, 76, 45, 14, 480, 449, 418,
-    387, 356, 325, 294, 263, 232, 201, 170, 139, 108, 77, 46, 15, 481, 450, 419, 388, 357, 326,
-    295, 264, 233, 202, 171, 140, 109, 78, 47, 16, 482, 451, 420, 389, 358, 327, 296, 265, 234,
-    203, 172, 141, 110, 79, 48, 17, 483, 452, 421, 390, 359, 328, 297, 266, 235, 204, 173, 142,
-    111, 80, 49, 18, 484, 453, 422, 391, 360, 329, 298, 267, 236, 205, 174, 143, 112, 81, 50, 19,
-    485, 454, 423, 392, 361, 330, 299, 268, 237, 206, 175, 144, 113, 82, 51, 20, 486, 455, 424,
-    393, 362, 331, 300, 269, 238, 207, 176, 145, 114, 83, 52, 21, 487, 456, 425, 394, 363, 332,
-    301, 270, 239, 208, 177, 146, 115, 84, 53, 22, 488, 457, 426, 395, 364, 333, 302, 271, 240,
-    209, 178, 147, 116, 85, 54, 23, 489, 458, 427, 396, 365, 334, 303, 272, 241, 210, 179, 148,
-    117, 86, 55, 24, 490, 459, 428, 397, 366, 335, 304, 273, 242, 211, 180, 149, 118, 87, 56, 25,
-    491, 460, 429, 398, 367, 336, 305, 274, 243, 212, 181, 150, 119, 88, 57, 26, 492, 461, 430,
-    399, 368, 337, 306, 275, 244, 213, 182, 151, 120, 89, 58, 27, 493, 462, 431, 400, 369, 338,
-    307, 276, 245, 214, 183, 152, 121, 90, 59, 28, 494, 463, 432, 401, 370, 339, 308, 277, 246,
-    215, 184, 153, 122, 91, 60, 29, 495, 464, 433, 402, 371, 340, 309, 278, 247, 216, 185, 154,
-    123, 92, 61, 30, 496, 465, 434, 403, 372, 341, 310, 279, 248, 217, 186, 155, 124, 93, 62, 31,
-    497, 466, 435, 404, 373, 342, 311, 280, 249, 218, 187, 156, 125, 94, 63, 498, 467, 436, 405,
-    374, 343, 312, 281, 250, 219, 188, 157, 126, 95, 499, 468, 437, 406, 375, 344, 313, 282, 251,
-    220, 189, 158, 127, 500, 469, 438, 407, 376, 345, 314, 283, 252, 221, 190, 159, 501, 470, 439,
-    408, 377, 346, 315, 284, 253, 222, 191, 502, 471, 440, 409, 378, 347, 316, 285, 254, 223, 503,
-    472, 441, 410, 379, 348, 317, 286, 255, 504, 473, 442, 411, 380, 349, 318, 287, 505, 474, 443,
-    412, 381, 350, 319, 506, 475, 444, 413, 382, 351, 507, 476, 445, 414, 383, 508, 477, 446, 415,
-    509, 478, 447, 510, 479, 511,
+    0, 32, 1, 64, 33, 2, 96, 65, 34, 3, 128, 97, 66, 35, 4, 160, 129, 98, 67, 36, 5, 192, 161, 130,
+    99, 68, 37, 6, 224, 193, 162, 131, 100, 69, 38, 7, 256, 225, 194, 163, 132, 101, 70, 39, 8,
+    288, 257, 226, 195, 164, 133, 102, 71, 40, 9, 320, 289, 258, 227, 196, 165, 134, 103, 72, 41,
+    10, 352, 321, 290, 259, 228, 197, 166, 135, 104, 73, 42, 11, 384, 353, 322, 291, 260, 229, 198,
+    167, 136, 105, 74, 43, 12, 416, 385, 354, 323, 292, 261, 230, 199, 168, 137, 106, 75, 44, 13,
+    448, 417, 386, 355, 324, 293, 262, 231, 200, 169, 138, 107, 76, 45, 14, 480, 449, 418, 387,
+    356, 325, 294, 263, 232, 201, 170, 139, 108, 77, 46, 15, 481, 450, 419, 388, 357, 326, 295,
+    264, 233, 202, 171, 140, 109, 78, 47, 16, 482, 451, 420, 389, 358, 327, 296, 265, 234, 203,
+    172, 141, 110, 79, 48, 17, 483, 452, 421, 390, 359, 328, 297, 266, 235, 204, 173, 142, 111, 80,
+    49, 18, 484, 453, 422, 391, 360, 329, 298, 267, 236, 205, 174, 143, 112, 81, 50, 19, 485, 454,
+    423, 392, 361, 330, 299, 268, 237, 206, 175, 144, 113, 82, 51, 20, 486, 455, 424, 393, 362,
+    331, 300, 269, 238, 207, 176, 145, 114, 83, 52, 21, 487, 456, 425, 394, 363, 332, 301, 270,
+    239, 208, 177, 146, 115, 84, 53, 22, 488, 457, 426, 395, 364, 333, 302, 271, 240, 209, 178,
+    147, 116, 85, 54, 23, 489, 458, 427, 396, 365, 334, 303, 272, 241, 210, 179, 148, 117, 86, 55,
+    24, 490, 459, 428, 397, 366, 335, 304, 273, 242, 211, 180, 149, 118, 87, 56, 25, 491, 460, 429,
+    398, 367, 336, 305, 274, 243, 212, 181, 150, 119, 88, 57, 26, 492, 461, 430, 399, 368, 337,
+    306, 275, 244, 213, 182, 151, 120, 89, 58, 27, 493, 462, 431, 400, 369, 338, 307, 276, 245,
+    214, 183, 152, 121, 90, 59, 28, 494, 463, 432, 401, 370, 339, 308, 277, 246, 215, 184, 153,
+    122, 91, 60, 29, 495, 464, 433, 402, 371, 340, 309, 278, 247, 216, 185, 154, 123, 92, 61, 30,
+    496, 465, 434, 403, 372, 341, 310, 279, 248, 217, 186, 155, 124, 93, 62, 31, 497, 466, 435,
+    404, 373, 342, 311, 280, 249, 218, 187, 156, 125, 94, 63, 498, 467, 436, 405, 374, 343, 312,
+    281, 250, 219, 188, 157, 126, 95, 499, 468, 437, 406, 375, 344, 313, 282, 251, 220, 189, 158,
+    127, 500, 469, 438, 407, 376, 345, 314, 283, 252, 221, 190, 159, 501, 470, 439, 408, 377, 346,
+    315, 284, 253, 222, 191, 502, 471, 440, 409, 378, 347, 316, 285, 254, 223, 503, 472, 441, 410,
+    379, 348, 317, 286, 255, 504, 473, 442, 411, 380, 349, 318, 287, 505, 474, 443, 412, 381, 350,
+    319, 506, 475, 444, 413, 382, 351, 507, 476, 445, 414, 383, 508, 477, 446, 415, 509, 478, 447,
+    510, 479, 511,
 ];
 
 /// `Default_Scan_16x32`, this decoder's own row-major transcription (see
@@ -1316,7 +1327,11 @@ fn br_ctx_rect(grid: &[i32], w: usize, h: usize, row: usize, col: usize) -> usiz
     if row == 0 && col == 0 {
         return mag;
     }
-    if row < 2 && col < 2 { mag + 7 } else { mag + 14 }
+    if row < 2 && col < 2 {
+        mag + 7
+    } else {
+        mag + 14
+    }
 }
 
 fn dc_vote(dc: Option<bool>) -> i32 {
@@ -1472,7 +1487,9 @@ fn read_coeffs(
     if std::env::var_os("EC_AV1_TELL").is_some() {
         eprintln!(
             "TELL label=post_txb_skip ctx={skip_ctx} all_zero={} tell={} range={}",
-            all_zero as u8, dec.debug_bitpos(), dec.debug_state().0
+            all_zero as u8,
+            dec.debug_bitpos(),
+            dec.debug_state().0
         );
     }
     if trace {
@@ -1611,7 +1628,10 @@ fn read_coeffs(
         };
         if ec_trace_coeff {
             let (rng, _) = dec.debug_state();
-            eprintln!("EC_COEFF_STEP tag=sign c={c} sign={} rng={rng}", negative as i32);
+            eprintln!(
+                "EC_COEFF_STEP tag=sign c={c} sign={} rng={rng}",
+                negative as i32
+            );
         }
         let level = if level.abs_diff(0) as i32 > MAX_BR_LEVEL {
             let g = read_golomb(dec)?;
@@ -1796,10 +1816,10 @@ struct Neighbours {
     /// 4x4 mi granularity: the transform *width* (above) / *height* (left) in
     /// pixels last written over each unit by `set_txfm_ctxs`/
     /// `txfm_partition_update`, which is what an inter block's `txfm_split`
-    /// symbol reads its context from (lane-txselect, spec 5.11.17). Zero
-    /// (libaom's own tile-start value) until a block writes one; a fresh
-    /// full-height `left` array is exactly libaom's per-superblock-row reset,
-    /// since each mi row is only ever visited inside one superblock row.
+    /// symbol reads its context from (lane-txselect, spec 5.11.17).
+    /// [`TXFM_CTX_INIT`] until a block writes one; a fresh full-height `left`
+    /// array is exactly libaom's per-superblock-row reset, since each mi row
+    /// is only ever visited inside one superblock row.
     above_txfm: Vec<u8>,
     left_txfm: Vec<u8>,
     /// Whether the block above/left of this column/row coded `skip_mode`
@@ -1924,8 +1944,8 @@ impl Neighbours {
             left_side_mi: vec![SB; rows * (SUB / MI)],
             above_skip: vec![false; cols],
             left_skip: vec![false; rows],
-            above_txfm: vec![0u8; cols * (SUB / MI)],
-            left_txfm: vec![0u8; rows * (SUB / MI)],
+            above_txfm: vec![TXFM_CTX_INIT; cols * (SUB / MI)],
+            left_txfm: vec![TXFM_CTX_INIT; rows * (SUB / MI)],
             above_skip_mode: vec![false; cols],
             left_skip_mode: vec![false; rows],
             above_inter: vec![false; cols],
@@ -2064,7 +2084,13 @@ impl Neighbours {
     /// As [`Self::record_palette_y`], for a just-decoded block's own chroma
     /// (U-channel) palette size/colours -- `size == 0` clears stale state the
     /// same way (lane-palette2 r1).
-    fn record_palette_uv(&mut self, at: (usize, usize), side: usize, size: usize, colors: [u16; 8]) {
+    fn record_palette_uv(
+        &mut self,
+        at: (usize, usize),
+        side: usize,
+        size: usize,
+        colors: [u16; 8],
+    ) {
         let (r, c) = at;
         for cell in 0..side / SUB {
             self.above_palette_uv_size[c + cell] = size;
@@ -2085,7 +2111,10 @@ impl Neighbours {
         let (r, c) = at;
         let above_ok = r % 4 != 0;
         let (above_n, above_colors) = if above_ok && self.above_palette_uv_size[c] > 0 {
-            (self.above_palette_uv_size[c], self.above_palette_uv_colors[c])
+            (
+                self.above_palette_uv_size[c],
+                self.above_palette_uv_colors[c],
+            )
         } else {
             (0, [0u16; 8])
         };
@@ -2419,7 +2448,12 @@ impl Neighbours {
 
     /// [`Self::around_rect`] taking the block's position directly in 4x4
     /// mode-info units, mirroring [`Self::around_mi`].
-    fn around_mi_rect(&self, (mi_r, mi_c): (usize, usize), w: usize, h: usize) -> [(bool, bool, i32); 3] {
+    fn around_mi_rect(
+        &self,
+        (mi_r, mi_c): (usize, usize),
+        w: usize,
+        h: usize,
+    ) -> [(bool, bool, i32); 3] {
         let (w_mi, h_mi) = (w / MI, h / MI);
         std::array::from_fn(|plane| {
             let mut above_coded = false;
@@ -2518,13 +2552,7 @@ impl Neighbours {
 
     /// [`Self::record_mi`] with independent above (`w`)/left (`h`) extents,
     /// in pixels (lane-partitions r1, mirroring [`Self::record_rect`]).
-    fn record_mi_rect(
-        &mut self,
-        at_mi: (usize, usize),
-        w: usize,
-        h: usize,
-        grids: &[Vec<i32>; 3],
-    ) {
+    fn record_mi_rect(&mut self, at_mi: (usize, usize), w: usize, h: usize, grids: &[Vec<i32>; 3]) {
         let (mi_r, mi_c) = at_mi;
         let states: [Neighbour; 3] = std::array::from_fn(|plane| neighbour_state(&grids[plane]));
         let (w_mi, h_mi) = (w / MI, h / MI);
@@ -2720,7 +2748,11 @@ struct PaletteUv {
 /// `get_unsigned_bits`, which is the same formula): smallest `n` with
 /// `2^n >= x`, `0` for `x <= 1`.
 fn ceil_log2(x: u32) -> u32 {
-    if x < 2 { 0 } else { 32 - (x - 1).leading_zeros() }
+    if x < 2 {
+        0
+    } else {
+        32 - (x - 1).leading_zeros()
+    }
 }
 
 /// `av1_read_uniform` (decoder.h:425): a uniform `0..n` value coded as
@@ -2807,7 +2839,11 @@ fn read_palette_colors_y(dec: &mut SymbolDecoder, n: usize, cache: &[u16]) -> [u
 /// side by side). V never uses a cache: a leading bit picks either `n` raw
 /// literals, or a first raw value plus `n-1` signed deltas that wrap mod 256
 /// rather than clamp.
-fn read_palette_colors_uv(dec: &mut SymbolDecoder, n: usize, cache: &[u16]) -> ([u16; 8], [u16; 8]) {
+fn read_palette_colors_uv(
+    dec: &mut SymbolDecoder,
+    n: usize,
+    cache: &[u16],
+) -> ([u16; 8], [u16; 8]) {
     let mut cached = Vec::with_capacity(n);
     for &c in cache {
         if cached.len() >= n {
@@ -2887,13 +2923,21 @@ fn palette_color_index_context(
     col: usize,
     n: usize,
 ) -> (usize, [u8; 8]) {
-    let left = if col >= 1 { Some(map[row * side + col - 1]) } else { None };
+    let left = if col >= 1 {
+        Some(map[row * side + col - 1])
+    } else {
+        None
+    };
     let up_left = if col >= 1 && row >= 1 {
         Some(map[(row - 1) * side + col - 1])
     } else {
         None
     };
-    let up = if row >= 1 { Some(map[(row - 1) * side + col]) } else { None };
+    let up = if row >= 1 {
+        Some(map[(row - 1) * side + col])
+    } else {
+        None
+    };
     let mut scores = [0i32; 8];
     for (neighbour, weight) in [(left, 2), (up_left, 1), (up, 2)] {
         if let Some(v) = neighbour {
@@ -3366,128 +3410,135 @@ fn decode_block_rect(
         // --enable-tx-size-search=0 the encoder writes no such symbol, so the
         // decoder consumed one that was never there.
         {
-        let around = neighbours.around_rect(at, bw, bh);
-        let mut luma_coding = cdfs.txb(TxbSet::LumaRect32x16, mode);
-        let (luma_levels, luma_tx_type) = read_coeffs_rect(
-            dec,
-            &mut luma_coding,
-            luma_scan,
-            bw,
-            bh,
-            0,
-            dc_sign_ctx(around[0].2),
-            TxType::DctDct,
-        )?;
-        if std::env::var_os("EC_AV1_TRACE").is_some() {
-            let (rng, _) = dec.debug_state();
-            eprintln!("TRACE_RECT_COEFF plane=0 mi_row={mi_r} mi_col={mi_c} rng={rng}");
-        }
-        let luma_residual = dequant_and_inverse_typed_wh(
-            &luma_levels,
-            bw,
-            bh,
-            crate::decode::bit_depth(),
-            CURRENT_Q_IDX.with(|c| c.get()),
-            plane_q_delta(0).0,
-            plane_q_delta(0).1,
-            luma_tx_type,
-        );
-        y.reconstruct_rect(
-            px,
-            py,
-            bw,
-            bh,
-            mode,
-            angle_delta_y,
-            reach,
-            &luma_residual,
-            None,
-            filter_intra,
-            smooth_neighbor,
-        );
-        let ac = alpha.map(|_| cfl_ac_q3_rect(y, px, py, bw, bh));
-        let u_default_tx = default_intra_tx_type(uv_predict_mode as u8);
-        let u_skip_ctx = usize::from(around[1].0) + usize::from(around[1].1);
-        let mut u_coding = cdfs.txb(TxbSet::ChromaRect16x8, uv_predict_mode);
-        let (u_levels, u_tx_type) = read_coeffs_rect(
-            dec,
-            &mut u_coding,
-            chroma_scan,
-            chroma_w,
-            chroma_h,
-            u_skip_ctx,
-            dc_sign_ctx(around[1].2),
-            u_default_tx,
-        )?;
-        if std::env::var_os("EC_AV1_TRACE").is_some() {
-            let (rng, _) = dec.debug_state();
-            eprintln!("TRACE_RECT_COEFF plane=1 mi_row={mi_r} mi_col={mi_c} rng={rng}");
-        }
-        let u_residual = dequant_and_inverse_typed_wh(
-            &u_levels,
-            chroma_w,
-            chroma_h,
-            crate::decode::bit_depth(),
-            CURRENT_Q_IDX.with(|c| c.get()),
-            plane_q_delta(1).0,
-            plane_q_delta(1).1,
-            u_tx_type,
-        );
-        u.reconstruct_rect(
-            cpx,
-            cpy,
-            chroma_w,
-            chroma_h,
-            uv_predict_mode,
-            angle_delta_uv,
-            reach,
-            &u_residual,
-            alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
-            None,
-            smooth_neighbor_uv,
-        );
-        let v_default_tx = default_intra_tx_type(uv_predict_mode as u8);
-        let v_skip_ctx = usize::from(around[2].0) + usize::from(around[2].1);
-        let mut v_coding = cdfs.txb(TxbSet::ChromaRect16x8, uv_predict_mode);
-        let (v_levels, v_tx_type) = read_coeffs_rect(
-            dec,
-            &mut v_coding,
-            chroma_scan,
-            chroma_w,
-            chroma_h,
-            v_skip_ctx,
-            dc_sign_ctx(around[2].2),
-            v_default_tx,
-        )?;
-        if std::env::var_os("EC_AV1_TRACE").is_some() {
-            let (rng, _) = dec.debug_state();
-            eprintln!("TRACE_RECT_COEFF plane=2 mi_row={mi_r} mi_col={mi_c} rng={rng}");
-        }
-        let v_residual = dequant_and_inverse_typed_wh(
-            &v_levels,
-            chroma_w,
-            chroma_h,
-            crate::decode::bit_depth(),
-            CURRENT_Q_IDX.with(|c| c.get()),
-            plane_q_delta(2).0,
-            plane_q_delta(2).1,
-            v_tx_type,
-        );
-        v.reconstruct_rect(
-            cpx,
-            cpy,
-            chroma_w,
-            chroma_h,
-            uv_predict_mode,
-            angle_delta_uv,
-            reach,
-            &v_residual,
-            alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
-            None,
-            smooth_neighbor_uv,
-        );
-        neighbours.record_rect(at, bw, bh, mode, uv_predict_mode, &[luma_levels, u_levels, v_levels]);
-        RECT_COEFF_HITS.with(|c| c.set(c.get() + 1));
+            let around = neighbours.around_rect(at, bw, bh);
+            let mut luma_coding = cdfs.txb(TxbSet::LumaRect32x16, mode);
+            let (luma_levels, luma_tx_type) = read_coeffs_rect(
+                dec,
+                &mut luma_coding,
+                luma_scan,
+                bw,
+                bh,
+                0,
+                dc_sign_ctx(around[0].2),
+                TxType::DctDct,
+            )?;
+            if std::env::var_os("EC_AV1_TRACE").is_some() {
+                let (rng, _) = dec.debug_state();
+                eprintln!("TRACE_RECT_COEFF plane=0 mi_row={mi_r} mi_col={mi_c} rng={rng}");
+            }
+            let luma_residual = dequant_and_inverse_typed_wh(
+                &luma_levels,
+                bw,
+                bh,
+                crate::decode::bit_depth(),
+                CURRENT_Q_IDX.with(|c| c.get()),
+                plane_q_delta(0).0,
+                plane_q_delta(0).1,
+                luma_tx_type,
+            );
+            y.reconstruct_rect(
+                px,
+                py,
+                bw,
+                bh,
+                mode,
+                angle_delta_y,
+                reach,
+                &luma_residual,
+                None,
+                filter_intra,
+                smooth_neighbor,
+            );
+            let ac = alpha.map(|_| cfl_ac_q3_rect(y, px, py, bw, bh));
+            let u_default_tx = default_intra_tx_type(uv_predict_mode as u8);
+            let u_skip_ctx = usize::from(around[1].0) + usize::from(around[1].1);
+            let mut u_coding = cdfs.txb(TxbSet::ChromaRect16x8, uv_predict_mode);
+            let (u_levels, u_tx_type) = read_coeffs_rect(
+                dec,
+                &mut u_coding,
+                chroma_scan,
+                chroma_w,
+                chroma_h,
+                u_skip_ctx,
+                dc_sign_ctx(around[1].2),
+                u_default_tx,
+            )?;
+            if std::env::var_os("EC_AV1_TRACE").is_some() {
+                let (rng, _) = dec.debug_state();
+                eprintln!("TRACE_RECT_COEFF plane=1 mi_row={mi_r} mi_col={mi_c} rng={rng}");
+            }
+            let u_residual = dequant_and_inverse_typed_wh(
+                &u_levels,
+                chroma_w,
+                chroma_h,
+                crate::decode::bit_depth(),
+                CURRENT_Q_IDX.with(|c| c.get()),
+                plane_q_delta(1).0,
+                plane_q_delta(1).1,
+                u_tx_type,
+            );
+            u.reconstruct_rect(
+                cpx,
+                cpy,
+                chroma_w,
+                chroma_h,
+                uv_predict_mode,
+                angle_delta_uv,
+                reach,
+                &u_residual,
+                alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
+                None,
+                smooth_neighbor_uv,
+            );
+            let v_default_tx = default_intra_tx_type(uv_predict_mode as u8);
+            let v_skip_ctx = usize::from(around[2].0) + usize::from(around[2].1);
+            let mut v_coding = cdfs.txb(TxbSet::ChromaRect16x8, uv_predict_mode);
+            let (v_levels, v_tx_type) = read_coeffs_rect(
+                dec,
+                &mut v_coding,
+                chroma_scan,
+                chroma_w,
+                chroma_h,
+                v_skip_ctx,
+                dc_sign_ctx(around[2].2),
+                v_default_tx,
+            )?;
+            if std::env::var_os("EC_AV1_TRACE").is_some() {
+                let (rng, _) = dec.debug_state();
+                eprintln!("TRACE_RECT_COEFF plane=2 mi_row={mi_r} mi_col={mi_c} rng={rng}");
+            }
+            let v_residual = dequant_and_inverse_typed_wh(
+                &v_levels,
+                chroma_w,
+                chroma_h,
+                crate::decode::bit_depth(),
+                CURRENT_Q_IDX.with(|c| c.get()),
+                plane_q_delta(2).0,
+                plane_q_delta(2).1,
+                v_tx_type,
+            );
+            v.reconstruct_rect(
+                cpx,
+                cpy,
+                chroma_w,
+                chroma_h,
+                uv_predict_mode,
+                angle_delta_uv,
+                reach,
+                &v_residual,
+                alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
+                None,
+                smooth_neighbor_uv,
+            );
+            neighbours.record_rect(
+                at,
+                bw,
+                bh,
+                mode,
+                uv_predict_mode,
+                &[luma_levels, u_levels, v_levels],
+            );
+            RECT_COEFF_HITS.with(|c| c.set(c.get() + 1));
         }
     }
     neighbours.fill_skip_grid_rect((mi_r, mi_c), bw / MI, bh / MI, skip);
@@ -3546,8 +3597,7 @@ fn decode_leaf_rect(
             left_mode = pmode;
         }
     }
-    let smooth_neighbor =
-        is_smooth_mode(above_mode) || is_smooth_mode(left_mode);
+    let smooth_neighbor = is_smooth_mode(above_mode) || is_smooth_mode(left_mode);
     if smooth_neighbor {
         SMOOTH_LUMA_HITS.with(|c| c.set(c.get() + 1));
     }
@@ -3571,7 +3621,11 @@ fn decode_leaf_rect(
             "filter intra on a HORZ/VERT strip (this decoder predicts square-only)",
         ));
     }
-    let uv_predict_mode = if uv_mode == UV_CFL_PRED { DC_PRED } else { uv_mode };
+    let uv_predict_mode = if uv_mode == UV_CFL_PRED {
+        DC_PRED
+    } else {
+        uv_mode
+    };
     let depth = if tx_select {
         let ctx = tx_size_context_rect(neighbours, leaf_mi, bw, bh);
         dec.symbol(&mut cdfs.tx_size_cat2[ctx])
@@ -3862,7 +3916,9 @@ fn decode_block_rect64(
         );
         if std::env::var_os("EC_SBPART_DUMP64").is_some() {
             let leftcol: Vec<u16> = if px > 0 {
-                (py..py + bh).map(|row| y.data[row * y.width + px - 1]).collect()
+                (py..py + bh)
+                    .map(|row| y.data[row * y.width + px - 1])
+                    .collect()
             } else {
                 vec![]
             };
@@ -3986,7 +4042,14 @@ fn decode_block_rect64(
             None,
             smooth_neighbor_uv,
         );
-        neighbours.record_rect(at, bw, bh, mode, uv_predict_mode, &[luma_levels, u_levels, v_levels]);
+        neighbours.record_rect(
+            at,
+            bw,
+            bh,
+            mode,
+            uv_predict_mode,
+            &[luma_levels, u_levels, v_levels],
+        );
         RECT_COEFF_HITS.with(|c| c.set(c.get() + 1));
     }
     neighbours.fill_skip_grid_rect((mi_r, mi_c), bw / MI, bh / MI, skip);
@@ -4179,9 +4242,7 @@ fn read_intra_mode(
     // `decode_color_index_map` call).
     let mut palette_y_pending: Option<(usize, [u16; 8])> = None;
     let mut palette_uv_pending: Option<(usize, [u16; 8], [u16; 8])> = None;
-    if allow_screen_content_tools
-        && let Some(bsize_ctx) = palette_bsize_ctx(side)
-    {
+    if allow_screen_content_tools && let Some(bsize_ctx) = palette_bsize_ctx(side) {
         let (mode_ctx, cache) = palette.unwrap_or((0, &[]));
         if mode == DC_PRED {
             if trace {
@@ -4195,7 +4256,10 @@ fn read_intra_mode(
             mode == DC_PRED && dec.symbol(&mut cdfs.palette_y_mode[bsize_ctx][mode_ctx]) != 0;
         if mode == DC_PRED && trace {
             let (rng, _) = dec.debug_state();
-            eprintln!("TRACE palette_y_mode value={} rng={rng}", use_palette_y as i32);
+            eprintln!(
+                "TRACE palette_y_mode value={} rng={rng}",
+                use_palette_y as i32
+            );
         }
         if use_palette_y {
             if palette.is_none() {
@@ -4266,7 +4330,11 @@ fn read_intra_mode(
         if trace {
             eprintln!("TRACE palette_y size={n} colors={:?}", &colors[..n]);
         }
-        PaletteY { size: n, colors, map }
+        PaletteY {
+            size: n,
+            colors,
+            map,
+        }
     });
     let palette_uv = palette_uv_pending.map(|(n, u_colors, v_colors)| {
         let map = decode_color_index_map(dec, cdfs, n, side / 2, true);
@@ -4278,7 +4346,12 @@ fn read_intra_mode(
                 &v_colors[..n]
             );
         }
-        PaletteUv { size: n, u_colors, v_colors, map }
+        PaletteUv {
+            size: n,
+            u_colors,
+            v_colors,
+            map,
+        }
     });
     Ok((
         skip,
@@ -4728,7 +4801,15 @@ fn read_plane(
         full
     };
     let (dc_delta, ac_delta) = plane_q_delta(plane_idx);
-    let residual = dequant_and_inverse_typed(&levels, side, bit_depth(), CURRENT_Q_IDX.with(|c| c.get()), dc_delta, ac_delta, tx_type);
+    let residual = dequant_and_inverse_typed(
+        &levels,
+        side,
+        bit_depth(),
+        CURRENT_Q_IDX.with(|c| c.get()),
+        dc_delta,
+        ac_delta,
+        tx_type,
+    );
     if std::env::var_os("EC_AV1_TRACE").is_some() {
         eprintln!(
             "TRACE dequant plane={plane_idx} base_q_idx={base_q_idx} tx_type={tx_type:?} side={side} levels={levels:?} residual={residual:?}",
@@ -4795,23 +4876,32 @@ fn decode_block(
     let (px, py) = (c * SUB, r * SUB);
     let (palette_ctx, palette_cache) = neighbours.palette_ctx_and_cache(at);
     let palette_uv_cache = neighbours.palette_uv_cache(at);
-    let (skip, mode, angle_delta_y, uv_mode, angle_delta_uv, alpha, filter_intra, palette_y, palette_uv) =
-        read_intra_mode(
-            dec,
-            cdfs,
-            neighbours.above_mode[c],
-            neighbours.left_mode[r],
-            cfl,
-            side,
-            enable_filter_intra,
-            neighbours.skip_txfm_ctx(r * (SUB / MI), c * (SUB / MI)),
-            allow_screen_content_tools,
-            allow_intrabc,
-            Some((palette_ctx, &palette_cache)),
-            &palette_uv_cache,
-            r * (SUB / MI),
-            c * (SUB / MI),
-        )?;
+    let (
+        skip,
+        mode,
+        angle_delta_y,
+        uv_mode,
+        angle_delta_uv,
+        alpha,
+        filter_intra,
+        palette_y,
+        palette_uv,
+    ) = read_intra_mode(
+        dec,
+        cdfs,
+        neighbours.above_mode[c],
+        neighbours.left_mode[r],
+        cfl,
+        side,
+        enable_filter_intra,
+        neighbours.skip_txfm_ctx(r * (SUB / MI), c * (SUB / MI)),
+        allow_screen_content_tools,
+        allow_intrabc,
+        Some((palette_ctx, &palette_cache)),
+        &palette_uv_cache,
+        r * (SUB / MI),
+        c * (SUB / MI),
+    )?;
     // `predict` panics outside `DC_PRED..=PAETH_PRED` (0..=12); `UV_CFL_PRED`
     // (13) predicts as `DC_PRED` with the [`cfl_scaled`] nudge carrying the
     // actual chroma-from-luma correlation, same as this decoder always did.
@@ -4869,11 +4959,7 @@ fn decode_block(
                 "a palette block with a split luma transform (round 1)",
             ));
         }
-        let buf: Vec<u16> = py
-            .map
-            .iter()
-            .map(|&idx| py.colors[idx as usize])
-            .collect();
+        let buf: Vec<u16> = py.map.iter().map(|&idx| py.colors[idx as usize]).collect();
         PALETTE_PRED.with(|c| *c.borrow_mut() = Some(buf));
     }
     // A UV-palette block's own chroma prediction override (lane-palette2 r1),
@@ -4883,8 +4969,14 @@ fn decode_block(
     // either of these run.
     let palette_uv_bufs: Option<(Vec<u16>, Vec<u16>)> = palette_uv.as_ref().map(|puv| {
         (
-            puv.map.iter().map(|&idx| puv.u_colors[idx as usize]).collect(),
-            puv.map.iter().map(|&idx| puv.v_colors[idx as usize]).collect(),
+            puv.map
+                .iter()
+                .map(|&idx| puv.u_colors[idx as usize])
+                .collect(),
+            puv.map
+                .iter()
+                .map(|&idx| puv.v_colors[idx as usize])
+                .collect(),
         )
     });
     if skip {
@@ -4936,7 +5028,13 @@ fn decode_block(
         let luma_grid = vec![0i32; side * side];
         let u_grid = vec![0i32; chroma_side * chroma_side];
         let v_grid = vec![0i32; chroma_side * chroma_side];
-        neighbours.record(at, side, mode, uv_predict_mode, &[luma_grid, u_grid, v_grid]);
+        neighbours.record(
+            at,
+            side,
+            mode,
+            uv_predict_mode,
+            &[luma_grid, u_grid, v_grid],
+        );
     } else if !tx_select || logical_tx == side {
         // A single luma transform unit -- the old path, unchanged (including
         // the 64x64 corner case, `logical_tx == side == 64` with
@@ -5021,7 +5119,13 @@ fn decode_block(
             None,
             smooth_neighbor_uv,
         )?;
-        neighbours.record(at, side, mode, uv_predict_mode, &[luma_grid, u_grid, v_grid]);
+        neighbours.record(
+            at,
+            side,
+            mode,
+            uv_predict_mode,
+            &[luma_grid, u_grid, v_grid],
+        );
     } else {
         // Several luma transform units, raster order (spec
         // `transform_block`'s loop): the block's resolved transform is
@@ -5202,23 +5306,32 @@ fn decode_leaf8(
     // An 8x8 leaf is well within `is_cfl_allowed`'s <=32x32 bound (spec
     // 5.11.5), so it reads the CFL-allowed `uv_mode_cfl` CDF, like every other
     // `decode_block` caller at 16x16 and up.
-    let (skip, mode, angle_delta_y, uv_mode, angle_delta_uv, alpha, filter_intra, _palette_y, _palette_uv) =
-        read_intra_mode(
-            dec,
-            cdfs,
-            above_mode,
-            left_mode,
-            true,
-            8,
-            enable_filter_intra,
-            neighbours.skip_txfm_ctx(leaf_mi.0, leaf_mi.1),
-            allow_screen_content_tools,
-            allow_intrabc,
-            None,
-            &[],
-            leaf_mi.0,
-            leaf_mi.1,
-        )?;
+    let (
+        skip,
+        mode,
+        angle_delta_y,
+        uv_mode,
+        angle_delta_uv,
+        alpha,
+        filter_intra,
+        _palette_y,
+        _palette_uv,
+    ) = read_intra_mode(
+        dec,
+        cdfs,
+        above_mode,
+        left_mode,
+        true,
+        8,
+        enable_filter_intra,
+        neighbours.skip_txfm_ctx(leaf_mi.0, leaf_mi.1),
+        allow_screen_content_tools,
+        allow_intrabc,
+        None,
+        &[],
+        leaf_mi.0,
+        leaf_mi.1,
+    )?;
     let uv_predict_mode = if uv_mode == UV_CFL_PRED {
         DC_PRED
     } else {
@@ -5764,18 +5877,10 @@ fn read_tx_size(
 ) -> usize {
     let ctx = tx_size_context(n, at_mi, side);
     let depth = match side {
-        8 => {
-            dec.symbol(&mut cdfs.tx_size_cat0[ctx])
-        }
-        16 => {
-            dec.symbol(&mut cdfs.tx_size_cat1[ctx])
-        }
-        32 => {
-            dec.symbol(&mut cdfs.tx_size_cat2[ctx])
-        }
-        64 => {
-            dec.symbol(&mut cdfs.tx_size_cat3[ctx])
-        }
+        8 => dec.symbol(&mut cdfs.tx_size_cat0[ctx]),
+        16 => dec.symbol(&mut cdfs.tx_size_cat1[ctx]),
+        32 => dec.symbol(&mut cdfs.tx_size_cat2[ctx]),
+        64 => dec.symbol(&mut cdfs.tx_size_cat3[ctx]),
         _ => unreachable!("decode_block/decode_leaf8 only call this at 8/16/32/64"),
     };
     if std::env::var_os("EC_TRACE_MODE_STEP").is_some() {
@@ -5851,6 +5956,14 @@ fn set_txfm_ctxs(
         }
     }
 }
+
+/// The value libaom initialises both transform contexts to -- NOT zero:
+/// `av1_zero_above_context` memsets the txfm row to
+/// `tx_size_wide[TX_SIZES_LARGEST]` and `av1_zero_left_context` does the same
+/// with `tx_size_high[TX_SIZES_LARGEST]` (`av1_common_int.h`), i.e. 64
+/// pixels, so an unwritten neighbour reads as the *widest* possible
+/// transform, not the narrowest.
+const TXFM_CTX_INIT: u8 = 64;
 
 /// libaom's `MAX_VARTX_DEPTH`: an inter block's transform tree halves at most
 /// twice below its own largest transform.
@@ -5985,6 +6098,14 @@ fn read_block_tx_size(
             }
         }
         let single = leaves.len() == 1 && leaves[0].2 == side;
+        if !single && leaves.iter().any(|leaf| leaf.2 > 32) {
+            // Only a block wider than a superblock's own 64x64 max transform
+            // reaches here; this crate has no 64-point *inter* coefficient
+            // table set ([`inter_txbset_for`] stops at 32).
+            return Err(unsupported(
+                "an inter var-tx tree with a leaf transform larger than 32x32",
+            ));
+        }
         let resolved = leaves.last().map_or(side, |l| l.2);
         return Ok((resolved, (!single).then_some(leaves)));
     }
@@ -6006,6 +6127,94 @@ fn read_block_tx_size(
     };
     set_txfm_ctxs(n, at_mi, tx, side_mi, side_mi, skip && is_inter);
     Ok((tx, None))
+}
+
+/// One 8x8 inter leaf's luma residual (lane-txselect): either the whole-8x8
+/// transform, or -- when [`read_block_tx_size`]'s var-tx tree took the single
+/// split a `BLOCK_8X8` can take (`split`) -- the four 4x4 transform units in
+/// raster order, each reading its own coefficient context off the units
+/// already decoded before it. Returns the block's luma grid (all-zero in the
+/// split case, whose reconstruction has already happened unit by unit) and
+/// the `tx_type` chroma inherits: `av1_get_tx_type`'s colocated luma lookup,
+/// which for a split block lands on the top-left unit.
+#[allow(clippy::too_many_arguments)]
+fn read_inter_luma8(
+    dec: &mut SymbolDecoder,
+    cdfs: &mut Cdfs,
+    neighbours: &mut Neighbours,
+    leaf_mi: (usize, usize),
+    y: &mut PlaneBuf,
+    px: usize,
+    py: usize,
+    pred_y: &[u16],
+    mode_for_tx: usize,
+    base_q_idx: u8,
+    scan8: &[u16],
+    scan4: &[u16],
+    reduced_tx_set: bool,
+    split: bool,
+) -> Result<(Vec<i32>, TxType)> {
+    if !split {
+        return read_inter_plane(
+            dec,
+            cdfs,
+            if reduced_tx_set {
+                TxbSet::Luma8Inter
+            } else {
+                TxbSet::Luma8InterSet1
+            },
+            scan8,
+            0,
+            neighbours.around_mi(leaf_mi, 8)[0],
+            mode_for_tx,
+            y,
+            px,
+            py,
+            8,
+            base_q_idx,
+            pred_y,
+            None,
+            None,
+        );
+    }
+    let mut first = TxType::DctDct;
+    for tu_row in 0..2 {
+        for tu_col in 0..2 {
+            let tu_mi = (leaf_mi.0 + tu_row, leaf_mi.1 + tu_col);
+            let mut tu_pred = Vec::with_capacity(16);
+            for rr in 0..4 {
+                let start = (tu_row * 4 + rr) * 8 + tu_col * 4;
+                tu_pred.extend_from_slice(&pred_y[start..start + 4]);
+            }
+            let tu_skip_ctx = neighbours.luma_skip_ctx(tu_mi, 1);
+            let (tu_grid, tu_tx_type) = read_inter_plane(
+                dec,
+                cdfs,
+                if reduced_tx_set {
+                    TxbSet::Luma4Inter
+                } else {
+                    TxbSet::Luma4InterSet1
+                },
+                scan4,
+                0,
+                neighbours.around_mi(tu_mi, 4)[0],
+                mode_for_tx,
+                y,
+                px + tu_col * 4,
+                py + tu_row * 4,
+                4,
+                base_q_idx,
+                &tu_pred,
+                None,
+                Some(tu_skip_ctx),
+            )?;
+            if tu_row == 0 && tu_col == 0 {
+                first = tu_tx_type;
+            }
+            neighbours.record_mi_luma(tu_mi, 4, &tu_grid);
+        }
+    }
+    Ok((vec![0i32; 64], first))
 }
 
 /// The [`TxbSet`] one leaf of an inter block's var-tx tree reads its
@@ -6082,7 +6291,13 @@ fn unit_log2(px: u32) -> i32 {
 /// the flat `mode_deltas[1]` this used before was a `LAST_FRAME`-reachable
 /// wrong delta on every `GLOBALMV` block, masked while any `GOLDEN_FRAME`
 /// block anywhere aborted the whole stream's decode before comparison).
-fn lf_level(lf: &LoopFilterParams, plane_idx: usize, dir: usize, ref_frame: i8, delta_lf: i32) -> i32 {
+fn lf_level(
+    lf: &LoopFilterParams,
+    plane_idx: usize,
+    dir: usize,
+    ref_frame: i8,
+    delta_lf: i32,
+) -> i32 {
     let base = i32::from(if plane_idx == 0 {
         lf.level[dir]
     } else if plane_idx == 1 {
@@ -6147,7 +6362,8 @@ fn edge_params(
     let pv_ref = n.ref_grid[pv_mi_r * n.skip_grid_cols_mi + pv_mi_c];
     let delta_idx = if plane_idx == 0 { dir } else { plane_idx + 1 };
     let cur_delta_lf = i32::from(n.delta_lf_grid[mi_r * n.skip_grid_cols_mi + mi_c][delta_idx]);
-    let pv_delta_lf = i32::from(n.delta_lf_grid[pv_mi_r * n.skip_grid_cols_mi + pv_mi_c][delta_idx]);
+    let pv_delta_lf =
+        i32::from(n.delta_lf_grid[pv_mi_r * n.skip_grid_cols_mi + pv_mi_c][delta_idx]);
 
     let cur_level = lf_level(lf, plane_idx, dir, cur_ref, cur_delta_lf);
     let pv_level = lf_level(lf, plane_idx, dir, pv_ref, pv_delta_lf);
@@ -6510,9 +6726,7 @@ fn deblock_plane(
         let mut y0 = 4usize;
         while y0 < th {
             if let Some((len, level)) = edge_params(lf, n, plane_idx, 1, chroma, x0, y0) {
-                if std::env::var_os("EC_AV1_DEBLOCK_TRACE").is_some()
-                    && plane_idx == 0
-                    && x0 == 44
+                if std::env::var_os("EC_AV1_DEBLOCK_TRACE").is_some() && plane_idx == 0 && x0 == 44
                 {
                     eprintln!(
                         "HEDGE x0={x0} y0={y0} len={len} level={level} sharpness={}",
@@ -6563,10 +6777,7 @@ fn apply_cdef(
             return 0;
         }
         let (sb_r, sb_c) = (mi_r / SB_MI as usize, mi_c / SB_MI as usize);
-        idx_grid
-            .get(sb_r * sb_cols + sb_c)
-            .copied()
-            .unwrap_or(0) as usize
+        idx_grid.get(sb_r * sb_cols + sb_c).copied().unwrap_or(0) as usize
     };
     let src_y = y.data.clone();
     let src_u = u.data.clone();
@@ -6937,8 +7148,14 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         // last entry) is not, so the upper bound needs `div_ceil` the same
         // way the whole-frame `sb_rows`/`sb_cols` above does, to keep the
         // trailing partial superblock row/column in scope.
-        let (sb_r0, sb_r1) = ((mi_row0 / SB_MI).min(sb_rows), mi_row1.div_ceil(SB_MI).min(sb_rows));
-        let (sb_c0, sb_c1) = ((mi_col0 / SB_MI).min(sb_cols), mi_col1.div_ceil(SB_MI).min(sb_cols));
+        let (sb_r0, sb_r1) = (
+            (mi_row0 / SB_MI).min(sb_rows),
+            mi_row1.div_ceil(SB_MI).min(sb_rows),
+        );
+        let (sb_c0, sb_c1) = (
+            (mi_col0 / SB_MI).min(sb_cols),
+            mi_col1.div_ceil(SB_MI).min(sb_cols),
+        );
 
         let mut cdfs = base_cdfs.clone();
         // spec `decode_tile`: `CurrentQIndex` resets to the frame's own
@@ -6975,400 +7192,473 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         );
         TILE_HITS.with(|c| c.set(c.get() + 1));
 
-    for sb_r in sb_r0..sb_r1 {
-        neighbours.start_row();
-        for sb_c in sb_c0..sb_c1 {
-            crate::restoration::read_lr(
-                &mut dec,
-                &mut cdfs,
-                lr,
-                &mut lr_grid,
-                &mut lr_reference,
-                sb_r * SB_MI,
-                sb_c * SB_MI,
-                SB_MI,
-            );
-            CDEF_TRANSMITTED.with(|c| c.set(false));
-            let at = (sb_r as usize * 4, sb_c as usize * 4);
-            let ctx = neighbours.partition_ctx(at, SB);
-            let (has_cols, has_rows) = (
-                sb_c * SB_MI + SB_MI / 2 < mi_cols,
-                sb_r * SB_MI + SB_MI / 2 < mi_rows,
-            );
-            // Recomputed at this superblock's own half (spec
-            // `decode_partition`): a full alphabet symbol when both halves are
-            // inside the true frame, a single gathered bit when just one is
-            // (the superblock cannot be left whole, so this is forced split),
-            // and nothing at all (SPLIT inferred, no bits) when neither is —
-            // mirroring [`crate::tile::sb_coeff_key_frame_tile`]'s own
-            // three-way write exactly.
-            let part = if has_cols && has_rows {
-                let p = dec.symbol(&mut cdfs.partition_w64[ctx]);
-                if std::env::var_os("EC_AV1_TRACE").is_some() {
-                    eprintln!("TRACE partition_w64 ctx={ctx} value={p}");
-                }
-                p
-            } else {
-                match (has_cols, has_rows) {
-                    (true, false) => {
-                        dec.symbol_fixed(&gather(&cdfs.partition_w64[ctx], VERT_ALIKE));
+        for sb_r in sb_r0..sb_r1 {
+            neighbours.start_row();
+            for sb_c in sb_c0..sb_c1 {
+                crate::restoration::read_lr(
+                    &mut dec,
+                    &mut cdfs,
+                    lr,
+                    &mut lr_grid,
+                    &mut lr_reference,
+                    sb_r * SB_MI,
+                    sb_c * SB_MI,
+                    SB_MI,
+                );
+                CDEF_TRANSMITTED.with(|c| c.set(false));
+                let at = (sb_r as usize * 4, sb_c as usize * 4);
+                let ctx = neighbours.partition_ctx(at, SB);
+                let (has_cols, has_rows) = (
+                    sb_c * SB_MI + SB_MI / 2 < mi_cols,
+                    sb_r * SB_MI + SB_MI / 2 < mi_rows,
+                );
+                // Recomputed at this superblock's own half (spec
+                // `decode_partition`): a full alphabet symbol when both halves are
+                // inside the true frame, a single gathered bit when just one is
+                // (the superblock cannot be left whole, so this is forced split),
+                // and nothing at all (SPLIT inferred, no bits) when neither is —
+                // mirroring [`crate::tile::sb_coeff_key_frame_tile`]'s own
+                // three-way write exactly.
+                let part = if has_cols && has_rows {
+                    let p = dec.symbol(&mut cdfs.partition_w64[ctx]);
+                    if std::env::var_os("EC_AV1_TRACE").is_some() {
+                        eprintln!("TRACE partition_w64 ctx={ctx} value={p}");
                     }
-                    (false, true) => {
-                        dec.symbol_fixed(&gather(&cdfs.partition_w64[ctx], HORZ_ALIKE));
-                    }
-                    _ => {}
-                }
-                PARTITION_SPLIT
-            };
-            match part {
-                PARTITION_NONE => {
-                    decode_block(
-                        &mut dec,
-                        &mut cdfs,
-                        &mut neighbours,
-                        at,
-                        SB,
-                        TxbSet::Luma64,
-                        TxbSet::Chroma32,
-                        TX32,
-                        TX32,
-                        (&scan32, &scan32),
-                        false,
-                        &mut y,
-                        &mut u,
-                        &mut v,
-                        base_q_idx,
-                        enable_filter_intra,
-                        allow_screen_content_tools,
-                        allow_intrabc,
-                        &scan32,
-                        &scan16,
-                        &scan8,
-                        &scan4,
-                        tx_select,
-                        reduced_tx_set,
-                    )?;
-                }
-                PARTITION_SPLIT => {
-                    for q in 0..4 {
-                        let (r32, c32) = (sb_r * 2 + q / 2, sb_c * 2 + q % 2);
-                        if r32 >= rows32 || c32 >= cols32 {
-                            continue;
+                    p
+                } else {
+                    match (has_cols, has_rows) {
+                        (true, false) => {
+                            dec.symbol_fixed(&gather(&cdfs.partition_w64[ctx], VERT_ALIKE));
                         }
-                        let at32 = (r32 as usize * 2, c32 as usize * 2);
-                        let ctx32 = neighbours.partition_ctx(at32, BLOCK);
-                        let (has_cols32, has_rows32) = (
-                            has_half(c32 * BLOCK_MI, BLOCK_MI, mi_cols),
-                            has_half(r32 * BLOCK_MI, BLOCK_MI, mi_rows),
-                        );
-                        let part32 = if has_cols32 && has_rows32 {
-                            let p = dec.symbol(&mut cdfs.partition_w32[ctx32]);
-                            if std::env::var_os("EC_AV1_TRACE").is_some() {
-                                let (rng, _) = dec.debug_state();
-                                eprintln!(
-                                    "TRACE partition_w32 mi=({},{}) ctx={ctx32} value={p} rng={rng}",
-                                    r32 * BLOCK_MI,
-                                    c32 * BLOCK_MI
-                                );
+                        (false, true) => {
+                            dec.symbol_fixed(&gather(&cdfs.partition_w64[ctx], HORZ_ALIKE));
+                        }
+                        _ => {}
+                    }
+                    PARTITION_SPLIT
+                };
+                match part {
+                    PARTITION_NONE => {
+                        decode_block(
+                            &mut dec,
+                            &mut cdfs,
+                            &mut neighbours,
+                            at,
+                            SB,
+                            TxbSet::Luma64,
+                            TxbSet::Chroma32,
+                            TX32,
+                            TX32,
+                            (&scan32, &scan32),
+                            false,
+                            &mut y,
+                            &mut u,
+                            &mut v,
+                            base_q_idx,
+                            enable_filter_intra,
+                            allow_screen_content_tools,
+                            allow_intrabc,
+                            &scan32,
+                            &scan16,
+                            &scan8,
+                            &scan4,
+                            tx_select,
+                            reduced_tx_set,
+                        )?;
+                    }
+                    PARTITION_SPLIT => {
+                        for q in 0..4 {
+                            let (r32, c32) = (sb_r * 2 + q / 2, sb_c * 2 + q % 2);
+                            if r32 >= rows32 || c32 >= cols32 {
+                                continue;
                             }
-                            p
-                        } else {
-                            match (has_cols32, has_rows32) {
-                                (true, false) => {
-                                    dec.symbol_fixed(&gather(
-                                        &cdfs.partition_w32[ctx32],
-                                        VERT_ALIKE,
-                                    ));
-                                }
-                                (false, true) => {
-                                    dec.symbol_fixed(&gather(
-                                        &cdfs.partition_w32[ctx32],
-                                        HORZ_ALIKE,
-                                    ));
-                                }
-                                _ => {}
-                            }
-                            PARTITION_SPLIT
-                        };
-                        match part32 {
-                            PARTITION_NONE => {
-                                decode_block(
-                                    &mut dec,
-                                    &mut cdfs,
-                                    &mut neighbours,
-                                    at32,
-                                    BLOCK,
-                                    TxbSet::Luma32,
-                                    TxbSet::Chroma16,
-                                    TX32,
-                                    TX16,
-                                    (&scan32, &scan16),
-                                    true,
-                                    &mut y,
-                                    &mut u,
-                                    &mut v,
-                                    base_q_idx,
-                                    enable_filter_intra,
-                                    allow_screen_content_tools,
-                                    allow_intrabc,
-                                    &scan32,
-                                    &scan16,
-                                    &scan8,
-                                    &scan4,
-                                    tx_select,
-                                    reduced_tx_set,
-                                )?;
-                            }
-                            PARTITION_SPLIT => {
-                                for sub in 0..4 {
-                                    let (sr, sc) =
-                                        (r32 as usize * 2 + sub / 2, c32 as usize * 2 + sub % 2);
-                                    if (sr as u32) * SUB_MI >= mi_rows
-                                        || (sc as u32) * SUB_MI >= mi_cols
-                                    {
-                                        continue;
-                                    }
-                                    let (has_cols16, has_rows16) = (
-                                        has_half(sc as u32 * SUB_MI, SUB_MI, mi_cols),
-                                        has_half(sr as u32 * SUB_MI, SUB_MI, mi_rows),
+                            let at32 = (r32 as usize * 2, c32 as usize * 2);
+                            let ctx32 = neighbours.partition_ctx(at32, BLOCK);
+                            let (has_cols32, has_rows32) = (
+                                has_half(c32 * BLOCK_MI, BLOCK_MI, mi_cols),
+                                has_half(r32 * BLOCK_MI, BLOCK_MI, mi_rows),
+                            );
+                            let part32 = if has_cols32 && has_rows32 {
+                                let p = dec.symbol(&mut cdfs.partition_w32[ctx32]);
+                                if std::env::var_os("EC_AV1_TRACE").is_some() {
+                                    let (rng, _) = dec.debug_state();
+                                    eprintln!(
+                                        "TRACE partition_w32 mi=({},{}) ctx={ctx32} value={p} rng={rng}",
+                                        r32 * BLOCK_MI,
+                                        c32 * BLOCK_MI
                                     );
-                                    let at16 = (sr, sc);
-                                    let ctx16 = neighbours.partition_ctx(at16, SUB);
-                                    if has_cols16 && has_rows16 {
-                                        let part16 = dec.symbol(&mut cdfs.partition_w16[ctx16]);
-                                        if std::env::var_os("EC_AV1_TRACE").is_some() {
-                                            eprintln!(
-                                                "TRACE partition_w16 mi=({},{}) ctx={ctx16} value={part16}",
-                                                at16.0, at16.1
-                                            );
-                                        }
-                                        if part16 == PARTITION_NONE {
-                                            decode_block(
-                                                &mut dec,
-                                                &mut cdfs,
-                                                &mut neighbours,
-                                                at16,
-                                                SUB,
-                                                TxbSet::Luma16,
-                                                TxbSet::Chroma8,
-                                                TX16,
-                                                TX8,
-                                                (&scan16, &scan8),
-                                                true,
-                                                &mut y,
-                                                &mut u,
-                                                &mut v,
-                                                base_q_idx,
-                                                enable_filter_intra,
-                                                allow_screen_content_tools,
-                                                allow_intrabc,
-                                                &scan32,
-                                                &scan16,
-                                                &scan8,
-                                                &scan4,
-                                                tx_select,
-                                                reduced_tx_set,
-                                            )?;
+                                }
+                                p
+                            } else {
+                                match (has_cols32, has_rows32) {
+                                    (true, false) => {
+                                        dec.symbol_fixed(&gather(
+                                            &cdfs.partition_w32[ctx32],
+                                            VERT_ALIKE,
+                                        ));
+                                    }
+                                    (false, true) => {
+                                        dec.symbol_fixed(&gather(
+                                            &cdfs.partition_w32[ctx32],
+                                            HORZ_ALIKE,
+                                        ));
+                                    }
+                                    _ => {}
+                                }
+                                PARTITION_SPLIT
+                            };
+                            match part32 {
+                                PARTITION_NONE => {
+                                    decode_block(
+                                        &mut dec,
+                                        &mut cdfs,
+                                        &mut neighbours,
+                                        at32,
+                                        BLOCK,
+                                        TxbSet::Luma32,
+                                        TxbSet::Chroma16,
+                                        TX32,
+                                        TX16,
+                                        (&scan32, &scan16),
+                                        true,
+                                        &mut y,
+                                        &mut u,
+                                        &mut v,
+                                        base_q_idx,
+                                        enable_filter_intra,
+                                        allow_screen_content_tools,
+                                        allow_intrabc,
+                                        &scan32,
+                                        &scan16,
+                                        &scan8,
+                                        &scan4,
+                                        tx_select,
+                                        reduced_tx_set,
+                                    )?;
+                                }
+                                PARTITION_SPLIT => {
+                                    for sub in 0..4 {
+                                        let (sr, sc) = (
+                                            r32 as usize * 2 + sub / 2,
+                                            c32 as usize * 2 + sub % 2,
+                                        );
+                                        if (sr as u32) * SUB_MI >= mi_rows
+                                            || (sc as u32) * SUB_MI >= mi_cols
+                                        {
                                             continue;
                                         }
-                                        if part16 == PARTITION_VERT_B {
-                                            VERT_B_INTRA_HITS.with(|c| c.set(c.get() + 1));
-                                            // Left rect: 8x16, real
-                                            // `decode_block_rect`, sat at the
-                                            // 16x16 parent's own origin (no
-                                            // fractional-SUB-grid pixel
-                                            // offset needed -- the plain
-                                            // HORZ/VERT arms this lane's
-                                            // charter named DO need one,
-                                            // since their second half is
-                                            // offset by half the parent;
-                                            // unported, see decode_block_rect's
-                                            // own doc comment).
-                                            decode_block_rect(
-                                                &mut dec,
-                                                &mut cdfs,
-                                                &mut neighbours,
-                                                at16,
-                                                8,
-                                                16,
-                                                &mut y,
-                                                &mut u,
-                                                &mut v,
-                                                enable_filter_intra,
-                                                allow_screen_content_tools,
-                                                base_q_idx,
-                                                tx_select,
-                                            )?;
-                                            // Two 8x8 squares stacked on the
-                                            // right, chained through
-                                            // `prev_leaf` exactly like the
-                                            // real (non-straddle) SPLIT path
-                                            // below: the bottom leaf's ABOVE
-                                            // context is the top leaf, not
-                                            // the coarse SUB-grid array (a
-                                            // real block never sat there).
+                                        let (has_cols16, has_rows16) = (
+                                            has_half(sc as u32 * SUB_MI, SUB_MI, mi_cols),
+                                            has_half(sr as u32 * SUB_MI, SUB_MI, mi_rows),
+                                        );
+                                        let at16 = (sr, sc);
+                                        let ctx16 = neighbours.partition_ctx(at16, SUB);
+                                        if has_cols16 && has_rows16 {
+                                            let part16 = dec.symbol(&mut cdfs.partition_w16[ctx16]);
+                                            if std::env::var_os("EC_AV1_TRACE").is_some() {
+                                                eprintln!(
+                                                    "TRACE partition_w16 mi=({},{}) ctx={ctx16} value={part16}",
+                                                    at16.0, at16.1
+                                                );
+                                            }
+                                            if part16 == PARTITION_NONE {
+                                                decode_block(
+                                                    &mut dec,
+                                                    &mut cdfs,
+                                                    &mut neighbours,
+                                                    at16,
+                                                    SUB,
+                                                    TxbSet::Luma16,
+                                                    TxbSet::Chroma8,
+                                                    TX16,
+                                                    TX8,
+                                                    (&scan16, &scan8),
+                                                    true,
+                                                    &mut y,
+                                                    &mut u,
+                                                    &mut v,
+                                                    base_q_idx,
+                                                    enable_filter_intra,
+                                                    allow_screen_content_tools,
+                                                    allow_intrabc,
+                                                    &scan32,
+                                                    &scan16,
+                                                    &scan8,
+                                                    &scan4,
+                                                    tx_select,
+                                                    reduced_tx_set,
+                                                )?;
+                                                continue;
+                                            }
+                                            if part16 == PARTITION_VERT_B {
+                                                VERT_B_INTRA_HITS.with(|c| c.set(c.get() + 1));
+                                                // Left rect: 8x16, real
+                                                // `decode_block_rect`, sat at the
+                                                // 16x16 parent's own origin (no
+                                                // fractional-SUB-grid pixel
+                                                // offset needed -- the plain
+                                                // HORZ/VERT arms this lane's
+                                                // charter named DO need one,
+                                                // since their second half is
+                                                // offset by half the parent;
+                                                // unported, see decode_block_rect's
+                                                // own doc comment).
+                                                decode_block_rect(
+                                                    &mut dec,
+                                                    &mut cdfs,
+                                                    &mut neighbours,
+                                                    at16,
+                                                    8,
+                                                    16,
+                                                    &mut y,
+                                                    &mut u,
+                                                    &mut v,
+                                                    enable_filter_intra,
+                                                    allow_screen_content_tools,
+                                                    base_q_idx,
+                                                    tx_select,
+                                                )?;
+                                                // Two 8x8 squares stacked on the
+                                                // right, chained through
+                                                // `prev_leaf` exactly like the
+                                                // real (non-straddle) SPLIT path
+                                                // below: the bottom leaf's ABOVE
+                                                // context is the top leaf, not
+                                                // the coarse SUB-grid array (a
+                                                // real block never sat there).
+                                                let (mi_row0, mi_col0) =
+                                                    (sr as u32 * SUB_MI, sc as u32 * SUB_MI);
+                                                let top_right =
+                                                    (mi_row0 as usize, mi_col0 as usize + 2);
+                                                let bot_right =
+                                                    (mi_row0 as usize + 2, mi_col0 as usize + 2);
+                                                let mode_tr = decode_leaf8(
+                                                    &mut dec,
+                                                    &mut cdfs,
+                                                    &mut neighbours,
+                                                    at16,
+                                                    top_right,
+                                                    (&scan8, &scan4),
+                                                    None,
+                                                    &mut y,
+                                                    &mut u,
+                                                    &mut v,
+                                                    base_q_idx,
+                                                    enable_filter_intra,
+                                                    allow_screen_content_tools,
+                                                    allow_intrabc,
+                                                    tx_select,
+                                                    reduced_tx_set,
+                                                )?;
+                                                let mode_br = decode_leaf8(
+                                                    &mut dec,
+                                                    &mut cdfs,
+                                                    &mut neighbours,
+                                                    at16,
+                                                    bot_right,
+                                                    (&scan8, &scan4),
+                                                    Some((top_right, mode_tr)),
+                                                    &mut y,
+                                                    &mut u,
+                                                    &mut v,
+                                                    base_q_idx,
+                                                    enable_filter_intra,
+                                                    allow_screen_content_tools,
+                                                    allow_intrabc,
+                                                    tx_select,
+                                                    reduced_tx_set,
+                                                )?;
+                                                // `record()`'s above_mode/left_mode
+                                                // write is a no-op at an 8x8
+                                                // leaf's own side (same gap the
+                                                // real-SPLIT path above patches):
+                                                // force it from the last-decoded
+                                                // (bottom-right) leaf.
+                                                neighbours.above_mode[sc] = mode_br;
+                                                neighbours.left_mode[sr] = mode_br;
+                                                continue;
+                                            }
+                                            if part16 == PARTITION_HORZ {
+                                                HORZ_VERT_INTRA_HITS.with(|c| c.set(c.get() + 1));
+                                                let (mi_row0, mi_col0) =
+                                                    (sr as u32 * SUB_MI, sc as u32 * SUB_MI);
+                                                let top = (mi_row0 as usize, mi_col0 as usize);
+                                                let bot = (mi_row0 as usize + 2, mi_col0 as usize);
+                                                let mode_top = decode_leaf_rect(
+                                                    &mut dec,
+                                                    &mut cdfs,
+                                                    &mut neighbours,
+                                                    at16,
+                                                    top,
+                                                    16,
+                                                    8,
+                                                    None,
+                                                    &mut y,
+                                                    &mut u,
+                                                    &mut v,
+                                                    enable_filter_intra,
+                                                    allow_screen_content_tools,
+                                                    base_q_idx,
+                                                    tx_select,
+                                                )?;
+                                                let mode_bot = decode_leaf_rect(
+                                                    &mut dec,
+                                                    &mut cdfs,
+                                                    &mut neighbours,
+                                                    at16,
+                                                    bot,
+                                                    16,
+                                                    8,
+                                                    Some((top, mode_top)),
+                                                    &mut y,
+                                                    &mut u,
+                                                    &mut v,
+                                                    enable_filter_intra,
+                                                    allow_screen_content_tools,
+                                                    base_q_idx,
+                                                    tx_select,
+                                                )?;
+                                                neighbours.above_mode[sc] = mode_bot;
+                                                neighbours.left_mode[sr] = mode_bot;
+                                                continue;
+                                            }
+                                            if part16 == PARTITION_VERT {
+                                                HORZ_VERT_INTRA_HITS.with(|c| c.set(c.get() + 1));
+                                                let (mi_row0, mi_col0) =
+                                                    (sr as u32 * SUB_MI, sc as u32 * SUB_MI);
+                                                let left = (mi_row0 as usize, mi_col0 as usize);
+                                                let right =
+                                                    (mi_row0 as usize, mi_col0 as usize + 2);
+                                                let mode_left = decode_leaf_rect(
+                                                    &mut dec,
+                                                    &mut cdfs,
+                                                    &mut neighbours,
+                                                    at16,
+                                                    left,
+                                                    8,
+                                                    16,
+                                                    None,
+                                                    &mut y,
+                                                    &mut u,
+                                                    &mut v,
+                                                    enable_filter_intra,
+                                                    allow_screen_content_tools,
+                                                    base_q_idx,
+                                                    tx_select,
+                                                )?;
+                                                let mode_right = decode_leaf_rect(
+                                                    &mut dec,
+                                                    &mut cdfs,
+                                                    &mut neighbours,
+                                                    at16,
+                                                    right,
+                                                    8,
+                                                    16,
+                                                    Some((left, mode_left)),
+                                                    &mut y,
+                                                    &mut u,
+                                                    &mut v,
+                                                    enable_filter_intra,
+                                                    allow_screen_content_tools,
+                                                    base_q_idx,
+                                                    tx_select,
+                                                )?;
+                                                neighbours.above_mode[sc] = mode_right;
+                                                neighbours.left_mode[sr] = mode_right;
+                                                continue;
+                                            }
+                                            if part16 != PARTITION_SPLIT {
+                                                return Err(unsupported(
+                                                    "a HORZ_A/HORZ_B/VERT_A partition below 16x16 (this decoder codes only the square arms, HORZ, VERT, VERT_B, and a clean split below 16x16)",
+                                                ));
+                                            }
+                                            // A real (non-straddle) SPLIT of a
+                                            // whole 16x16 into four 8x8 leaves --
+                                            // the same recursion the straddle
+                                            // path below already runs when the
+                                            // true frame edge forces it, just
+                                            // over all four positions instead of
+                                            // the one or two the edge leaves.
                                             let (mi_row0, mi_col0) =
                                                 (sr as u32 * SUB_MI, sc as u32 * SUB_MI);
-                                            let top_right =
-                                                (mi_row0 as usize, mi_col0 as usize + 2);
-                                            let bot_right =
-                                                (mi_row0 as usize + 2, mi_col0 as usize + 2);
-                                            let mode_tr = decode_leaf8(
-                                                &mut dec,
-                                                &mut cdfs,
-                                                &mut neighbours,
-                                                at16,
-                                                top_right,
-                                                (&scan8, &scan4),
-                                                None,
-                                                &mut y,
-                                                &mut u,
-                                                &mut v,
-                                                base_q_idx,
-                                                enable_filter_intra,
-                                                allow_screen_content_tools,
-                                                allow_intrabc,
-                                                tx_select,
-                                                reduced_tx_set,
-                                            )?;
-                                            let mode_br = decode_leaf8(
-                                                &mut dec,
-                                                &mut cdfs,
-                                                &mut neighbours,
-                                                at16,
-                                                bot_right,
-                                                (&scan8, &scan4),
-                                                Some((top_right, mode_tr)),
-                                                &mut y,
-                                                &mut u,
-                                                &mut v,
-                                                base_q_idx,
-                                                enable_filter_intra,
-                                                allow_screen_content_tools,
-                                                allow_intrabc,
-                                                tx_select,
-                                                reduced_tx_set,
-                                            )?;
-                                            // `record()`'s above_mode/left_mode
-                                            // write is a no-op at an 8x8
-                                            // leaf's own side (same gap the
-                                            // real-SPLIT path above patches):
-                                            // force it from the last-decoded
-                                            // (bottom-right) leaf.
-                                            neighbours.above_mode[sc] = mode_br;
-                                            neighbours.left_mode[sr] = mode_br;
+                                            let mut prev_leaf: Option<((usize, usize), usize)> =
+                                                None;
+                                            for i in 0..4 {
+                                                let (mr, mc) =
+                                                    (mi_row0 + (i / 2) * 2, mi_col0 + (i % 2) * 2);
+                                                let leaf_mi = (mr as usize, mc as usize);
+                                                let leaf_ctx =
+                                                    neighbours.partition_ctx_mi(leaf_mi, 8);
+                                                let part8 =
+                                                    dec.symbol(&mut cdfs.partition_w8[leaf_ctx]);
+                                                if std::env::var_os("EC_AV1_TRACE").is_some() {
+                                                    eprintln!(
+                                                        "TRACE partition_w8 mi=({mr},{mc}) ctx={leaf_ctx} value={part8}"
+                                                    );
+                                                }
+                                                if part8 != PARTITION_NONE {
+                                                    return Err(unsupported(
+                                                        "a partition below 8x8 (this decoder codes no leaf smaller than 8x8)",
+                                                    ));
+                                                }
+                                                let leaf_mode = decode_leaf8(
+                                                    &mut dec,
+                                                    &mut cdfs,
+                                                    &mut neighbours,
+                                                    at16,
+                                                    leaf_mi,
+                                                    (&scan8, &scan4),
+                                                    prev_leaf,
+                                                    &mut y,
+                                                    &mut u,
+                                                    &mut v,
+                                                    base_q_idx,
+                                                    enable_filter_intra,
+                                                    allow_screen_content_tools,
+                                                    allow_intrabc,
+                                                    tx_select,
+                                                    reduced_tx_set,
+                                                )?;
+                                                prev_leaf = Some((leaf_mi, leaf_mode));
+                                            }
+                                            if let Some((_, mode)) = prev_leaf {
+                                                neighbours.above_mode[sc] = mode;
+                                                neighbours.left_mode[sr] = mode;
+                                            }
                                             continue;
                                         }
-                                        if part16 == PARTITION_HORZ {
-                                            HORZ_VERT_INTRA_HITS.with(|c| c.set(c.get() + 1));
-                                            let (mi_row0, mi_col0) = (
-                                                sr as u32 * SUB_MI,
-                                                sc as u32 * SUB_MI,
-                                            );
-                                            let top = (mi_row0 as usize, mi_col0 as usize);
-                                            let bot = (mi_row0 as usize + 2, mi_col0 as usize);
-                                            let mode_top = decode_leaf_rect(
-                                                &mut dec,
-                                                &mut cdfs,
-                                                &mut neighbours,
-                                                at16,
-                                                top,
-                                                16,
-                                                8,
-                                                None,
-                                                &mut y,
-                                                &mut u,
-                                                &mut v,
-                                                enable_filter_intra,
-                                                allow_screen_content_tools,
-                                                base_q_idx,
-                                                tx_select,
-                                            )?;
-                                            let mode_bot = decode_leaf_rect(
-                                                &mut dec,
-                                                &mut cdfs,
-                                                &mut neighbours,
-                                                at16,
-                                                bot,
-                                                16,
-                                                8,
-                                                Some((top, mode_top)),
-                                                &mut y,
-                                                &mut u,
-                                                &mut v,
-                                                enable_filter_intra,
-                                                allow_screen_content_tools,
-                                                base_q_idx,
-                                                tx_select,
-                                            )?;
-                                            neighbours.above_mode[sc] = mode_bot;
-                                            neighbours.left_mode[sr] = mode_bot;
-                                            continue;
-                                        }
-                                        if part16 == PARTITION_VERT {
-                                            HORZ_VERT_INTRA_HITS.with(|c| c.set(c.get() + 1));
-                                            let (mi_row0, mi_col0) = (
-                                                sr as u32 * SUB_MI,
-                                                sc as u32 * SUB_MI,
-                                            );
-                                            let left = (mi_row0 as usize, mi_col0 as usize);
-                                            let right = (mi_row0 as usize, mi_col0 as usize + 2);
-                                            let mode_left = decode_leaf_rect(
-                                                &mut dec,
-                                                &mut cdfs,
-                                                &mut neighbours,
-                                                at16,
-                                                left,
-                                                8,
-                                                16,
-                                                None,
-                                                &mut y,
-                                                &mut u,
-                                                &mut v,
-                                                enable_filter_intra,
-                                                allow_screen_content_tools,
-                                                base_q_idx,
-                                                tx_select,
-                                            )?;
-                                            let mode_right = decode_leaf_rect(
-                                                &mut dec,
-                                                &mut cdfs,
-                                                &mut neighbours,
-                                                at16,
-                                                right,
-                                                8,
-                                                16,
-                                                Some((left, mode_left)),
-                                                &mut y,
-                                                &mut u,
-                                                &mut v,
-                                                enable_filter_intra,
-                                                allow_screen_content_tools,
-                                                base_q_idx,
-                                                tx_select,
-                                            )?;
-                                            neighbours.above_mode[sc] = mode_right;
-                                            neighbours.left_mode[sr] = mode_right;
-                                            continue;
-                                        }
-                                        if part16 != PARTITION_SPLIT {
+                                        // The true edge falls inside this 16x16
+                                        // leaf itself (mod-32==8 target sizes,
+                                        // lane-av1-rect): one axis only -- an 8x8
+                                        // leaf never itself straddles, so the
+                                        // block splits cleanly along whichever
+                                        // axis is short.
+                                        if !has_cols16 && !has_rows16 {
                                             return Err(unsupported(
-                                                "a HORZ_A/HORZ_B/VERT_A partition below 16x16 (this decoder codes only the square arms, HORZ, VERT, VERT_B, and a clean split below 16x16)",
+                                                "a 16x16 block whose true edge cuts through both \
+                                             axes needs a rectangular transform this decoder \
+                                             does not code yet",
                                             ));
                                         }
-                                        // A real (non-straddle) SPLIT of a
-                                        // whole 16x16 into four 8x8 leaves --
-                                        // the same recursion the straddle
-                                        // path below already runs when the
-                                        // true frame edge forces it, just
-                                        // over all four positions instead of
-                                        // the one or two the edge leaves.
+                                        if has_cols16 {
+                                            dec.symbol_fixed(&gather(
+                                                &cdfs.partition_w16[ctx16],
+                                                VERT_ALIKE,
+                                            ));
+                                        } else {
+                                            dec.symbol_fixed(&gather(
+                                                &cdfs.partition_w16[ctx16],
+                                                HORZ_ALIKE,
+                                            ));
+                                        }
                                         let (mi_row0, mi_col0) =
                                             (sr as u32 * SUB_MI, sc as u32 * SUB_MI);
+                                        let leaf_positions: Vec<(u32, u32)> = (0..4)
+                                            .map(|i| (mi_row0 + (i / 2) * 2, mi_col0 + (i % 2) * 2))
+                                            .filter(|&(mr, mc)| mr < mi_rows && mc < mi_cols)
+                                            .collect();
                                         let mut prev_leaf: Option<((usize, usize), usize)> = None;
-                                        for i in 0..4 {
-                                            let (mr, mc) =
-                                                (mi_row0 + (i / 2) * 2, mi_col0 + (i % 2) * 2);
+                                        for (mr, mc) in leaf_positions {
                                             let leaf_mi = (mr as usize, mc as usize);
                                             let leaf_ctx = neighbours.partition_ctx_mi(leaf_mi, 8);
                                             let part8 =
@@ -7403,240 +7693,169 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                             )?;
                                             prev_leaf = Some((leaf_mi, leaf_mode));
                                         }
+                                        // `record()`'s `above_mode`/`left_mode`
+                                        // write is a no-op at an 8x8 leaf's own
+                                        // side, so force the write once the whole
+                                        // 16x16 slot's leaves are done, from the
+                                        // last leaf (mirrors the writer's r15
+                                        // fix).
                                         if let Some((_, mode)) = prev_leaf {
                                             neighbours.above_mode[sc] = mode;
                                             neighbours.left_mode[sr] = mode;
                                         }
-                                        continue;
-                                    }
-                                    // The true edge falls inside this 16x16
-                                    // leaf itself (mod-32==8 target sizes,
-                                    // lane-av1-rect): one axis only -- an 8x8
-                                    // leaf never itself straddles, so the
-                                    // block splits cleanly along whichever
-                                    // axis is short.
-                                    if !has_cols16 && !has_rows16 {
-                                        return Err(unsupported(
-                                            "a 16x16 block whose true edge cuts through both \
-                                             axes needs a rectangular transform this decoder \
-                                             does not code yet",
-                                        ));
-                                    }
-                                    if has_cols16 {
-                                        dec.symbol_fixed(&gather(
-                                            &cdfs.partition_w16[ctx16],
-                                            VERT_ALIKE,
-                                        ));
-                                    } else {
-                                        dec.symbol_fixed(&gather(
-                                            &cdfs.partition_w16[ctx16],
-                                            HORZ_ALIKE,
-                                        ));
-                                    }
-                                    let (mi_row0, mi_col0) =
-                                        (sr as u32 * SUB_MI, sc as u32 * SUB_MI);
-                                    let leaf_positions: Vec<(u32, u32)> = (0..4)
-                                        .map(|i| (mi_row0 + (i / 2) * 2, mi_col0 + (i % 2) * 2))
-                                        .filter(|&(mr, mc)| mr < mi_rows && mc < mi_cols)
-                                        .collect();
-                                    let mut prev_leaf: Option<((usize, usize), usize)> = None;
-                                    for (mr, mc) in leaf_positions {
-                                        let leaf_mi = (mr as usize, mc as usize);
-                                        let leaf_ctx = neighbours.partition_ctx_mi(leaf_mi, 8);
-                                        let part8 = dec.symbol(&mut cdfs.partition_w8[leaf_ctx]);
-                                        if std::env::var_os("EC_AV1_TRACE").is_some() {
-                                            eprintln!(
-                                                "TRACE partition_w8 mi=({mr},{mc}) ctx={leaf_ctx} value={part8}"
-                                            );
-                                        }
-                                        if part8 != PARTITION_NONE {
-                                            return Err(unsupported(
-                                                "a partition below 8x8 (this decoder codes no leaf smaller than 8x8)",
-                                            ));
-                                        }
-                                        let leaf_mode = decode_leaf8(
-                                            &mut dec,
-                                            &mut cdfs,
-                                            &mut neighbours,
-                                            at16,
-                                            leaf_mi,
-                                            (&scan8, &scan4),
-                                            prev_leaf,
-                                            &mut y,
-                                            &mut u,
-                                            &mut v,
-                                            base_q_idx,
-                                            enable_filter_intra,
-                                            allow_screen_content_tools,
-                                            allow_intrabc,
-                                            tx_select,
-                                            reduced_tx_set,
-                                        )?;
-                                        prev_leaf = Some((leaf_mi, leaf_mode));
-                                    }
-                                    // `record()`'s `above_mode`/`left_mode`
-                                    // write is a no-op at an 8x8 leaf's own
-                                    // side, so force the write once the whole
-                                    // 16x16 slot's leaves are done, from the
-                                    // last leaf (mirrors the writer's r15
-                                    // fix).
-                                    if let Some((_, mode)) = prev_leaf {
-                                        neighbours.above_mode[sc] = mode;
-                                        neighbours.left_mode[sr] = mode;
                                     }
                                 }
-                            }
-                            PARTITION_HORZ => {
-                                // lane-intradisp r1: two true 32x16 strips.
-                                decode_block_rect(
-                                    &mut dec,
-                                    &mut cdfs,
-                                    &mut neighbours,
-                                    at32,
-                                    32,
-                                    16,
-                                    &mut y,
-                                    &mut u,
-                                    &mut v,
-                                    enable_filter_intra,
-                                    allow_screen_content_tools,
-                                    base_q_idx,
-                                    tx_select,
-                                )?;
-                                decode_block_rect(
-                                    &mut dec,
-                                    &mut cdfs,
-                                    &mut neighbours,
-                                    (at32.0 + 1, at32.1),
-                                    32,
-                                    16,
-                                    &mut y,
-                                    &mut u,
-                                    &mut v,
-                                    enable_filter_intra,
-                                    allow_screen_content_tools,
-                                    base_q_idx,
-                                    tx_select,
-                                )?;
-                            }
-                            PARTITION_VERT => {
-                                // lane-intradisp r1: mirror of PARTITION_HORZ
-                                // above with width/height swapped.
-                                decode_block_rect(
-                                    &mut dec,
-                                    &mut cdfs,
-                                    &mut neighbours,
-                                    at32,
-                                    16,
-                                    32,
-                                    &mut y,
-                                    &mut u,
-                                    &mut v,
-                                    enable_filter_intra,
-                                    allow_screen_content_tools,
-                                    base_q_idx,
-                                    tx_select,
-                                )?;
-                                decode_block_rect(
-                                    &mut dec,
-                                    &mut cdfs,
-                                    &mut neighbours,
-                                    (at32.0, at32.1 + 1),
-                                    16,
-                                    32,
-                                    &mut y,
-                                    &mut u,
-                                    &mut v,
-                                    enable_filter_intra,
-                                    allow_screen_content_tools,
-                                    base_q_idx,
-                                    tx_select,
-                                )?;
-                            }
-                            _ => {
-                                return Err(unsupported(format!(
-                                    "a 32x32 partition type this decoder does not code (value={part32})"
-                                )));
+                                PARTITION_HORZ => {
+                                    // lane-intradisp r1: two true 32x16 strips.
+                                    decode_block_rect(
+                                        &mut dec,
+                                        &mut cdfs,
+                                        &mut neighbours,
+                                        at32,
+                                        32,
+                                        16,
+                                        &mut y,
+                                        &mut u,
+                                        &mut v,
+                                        enable_filter_intra,
+                                        allow_screen_content_tools,
+                                        base_q_idx,
+                                        tx_select,
+                                    )?;
+                                    decode_block_rect(
+                                        &mut dec,
+                                        &mut cdfs,
+                                        &mut neighbours,
+                                        (at32.0 + 1, at32.1),
+                                        32,
+                                        16,
+                                        &mut y,
+                                        &mut u,
+                                        &mut v,
+                                        enable_filter_intra,
+                                        allow_screen_content_tools,
+                                        base_q_idx,
+                                        tx_select,
+                                    )?;
+                                }
+                                PARTITION_VERT => {
+                                    // lane-intradisp r1: mirror of PARTITION_HORZ
+                                    // above with width/height swapped.
+                                    decode_block_rect(
+                                        &mut dec,
+                                        &mut cdfs,
+                                        &mut neighbours,
+                                        at32,
+                                        16,
+                                        32,
+                                        &mut y,
+                                        &mut u,
+                                        &mut v,
+                                        enable_filter_intra,
+                                        allow_screen_content_tools,
+                                        base_q_idx,
+                                        tx_select,
+                                    )?;
+                                    decode_block_rect(
+                                        &mut dec,
+                                        &mut cdfs,
+                                        &mut neighbours,
+                                        (at32.0, at32.1 + 1),
+                                        16,
+                                        32,
+                                        &mut y,
+                                        &mut u,
+                                        &mut v,
+                                        enable_filter_intra,
+                                        allow_screen_content_tools,
+                                        base_q_idx,
+                                        tx_select,
+                                    )?;
+                                }
+                                _ => {
+                                    return Err(unsupported(format!(
+                                        "a 32x32 partition type this decoder does not code (value={part32})"
+                                    )));
+                                }
                             }
                         }
                     }
-                }
-                PARTITION_HORZ => {
-                    // lane-sbpart r2: two true 64x32 strips.
-                    decode_block_rect64(
-                        &mut dec,
-                        &mut cdfs,
-                        &mut neighbours,
-                        at,
-                        64,
-                        32,
-                        &mut y,
-                        &mut u,
-                        &mut v,
-                        enable_filter_intra,
-                        allow_screen_content_tools,
-                        base_q_idx,
-                        tx_select,
-                    )?;
-                    decode_block_rect64(
-                        &mut dec,
-                        &mut cdfs,
-                        &mut neighbours,
-                        (at.0 + 2, at.1),
-                        64,
-                        32,
-                        &mut y,
-                        &mut u,
-                        &mut v,
-                        enable_filter_intra,
-                        allow_screen_content_tools,
-                        base_q_idx,
-                        tx_select,
-                    )?;
-                }
-                PARTITION_VERT => {
-                    // lane-sbpart r2: mirror of PARTITION_HORZ above with
-                    // width/height swapped.
-                    decode_block_rect64(
-                        &mut dec,
-                        &mut cdfs,
-                        &mut neighbours,
-                        at,
-                        32,
-                        64,
-                        &mut y,
-                        &mut u,
-                        &mut v,
-                        enable_filter_intra,
-                        allow_screen_content_tools,
-                        base_q_idx,
-                        tx_select,
-                    )?;
-                    decode_block_rect64(
-                        &mut dec,
-                        &mut cdfs,
-                        &mut neighbours,
-                        (at.0, at.1 + 2),
-                        32,
-                        64,
-                        &mut y,
-                        &mut u,
-                        &mut v,
-                        enable_filter_intra,
-                        allow_screen_content_tools,
-                        base_q_idx,
-                        tx_select,
-                    )?;
-                }
-                _ => {
-                    return Err(unsupported(
-                        "a superblock-level partition type other than NONE or SPLIT (this \
+                    PARTITION_HORZ => {
+                        // lane-sbpart r2: two true 64x32 strips.
+                        decode_block_rect64(
+                            &mut dec,
+                            &mut cdfs,
+                            &mut neighbours,
+                            at,
+                            64,
+                            32,
+                            &mut y,
+                            &mut u,
+                            &mut v,
+                            enable_filter_intra,
+                            allow_screen_content_tools,
+                            base_q_idx,
+                            tx_select,
+                        )?;
+                        decode_block_rect64(
+                            &mut dec,
+                            &mut cdfs,
+                            &mut neighbours,
+                            (at.0 + 2, at.1),
+                            64,
+                            32,
+                            &mut y,
+                            &mut u,
+                            &mut v,
+                            enable_filter_intra,
+                            allow_screen_content_tools,
+                            base_q_idx,
+                            tx_select,
+                        )?;
+                    }
+                    PARTITION_VERT => {
+                        // lane-sbpart r2: mirror of PARTITION_HORZ above with
+                        // width/height swapped.
+                        decode_block_rect64(
+                            &mut dec,
+                            &mut cdfs,
+                            &mut neighbours,
+                            at,
+                            32,
+                            64,
+                            &mut y,
+                            &mut u,
+                            &mut v,
+                            enable_filter_intra,
+                            allow_screen_content_tools,
+                            base_q_idx,
+                            tx_select,
+                        )?;
+                        decode_block_rect64(
+                            &mut dec,
+                            &mut cdfs,
+                            &mut neighbours,
+                            (at.0, at.1 + 2),
+                            32,
+                            64,
+                            &mut y,
+                            &mut u,
+                            &mut v,
+                            enable_filter_intra,
+                            allow_screen_content_tools,
+                            base_q_idx,
+                            tx_select,
+                        )?;
+                    }
+                    _ => {
+                        return Err(unsupported(
+                            "a superblock-level partition type other than NONE or SPLIT (this \
                          decoder's intra tile path codes only those two at 64x64)",
-                    ));
+                        ));
+                    }
                 }
             }
         }
-    }
 
         if tile_num == tile_info.context_update_tile_id {
             result_cdfs = cdfs;
@@ -7667,7 +7886,11 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         let crop_wide = |plane: &PlaneBuf| -> Vec<u8> {
             let mut out = Vec::with_capacity(plane.true_width * plane.true_height);
             for row in 0..plane.true_height {
-                out.extend(plane.data[row * plane.width..][..plane.true_width].iter().map(|&s| s as u8));
+                out.extend(
+                    plane.data[row * plane.width..][..plane.true_width]
+                        .iter()
+                        .map(|&s| s as u8),
+                );
             }
             out
         };
@@ -7688,7 +7911,16 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     );
     let (deblocked_y, deblocked_u, deblocked_v) = (y.clone(), u.clone(), v.clone());
     apply_cdef(&mut y, &mut u, &mut v, cdef, &neighbours);
-    apply_loop_restoration(&mut y, &mut u, &mut v, &deblocked_y, &deblocked_u, &deblocked_v, lr, &lr_grid);
+    apply_loop_restoration(
+        &mut y,
+        &mut u,
+        &mut v,
+        &deblocked_y,
+        &deblocked_u,
+        &deblocked_v,
+        lr,
+        &lr_grid,
+    );
 
     let (fw, fh) = (frame_width as usize, frame_height as usize);
     if fw == width && fh == height {
@@ -7920,7 +8152,11 @@ fn read_mv_component(
         }
         // spec 5.11.32 `mv_fr`: same force_integer_mv carve-out as
         // `mv_class0_fr` above.
-        let fr = if force_integer_mv { 3 } else { dec.symbol(&mut c.fr) };
+        let fr = if force_integer_mv {
+            3
+        } else {
+            dec.symbol(&mut c.fr)
+        };
         let hp = if allow_high_precision_mv {
             dec.symbol(&mut c.hp)
         } else {
@@ -7945,10 +8181,20 @@ fn read_mv(
     let joint = dec.symbol(mv_joint);
     let mut diff = (0, 0);
     if joint == 2 || joint == 3 {
-        diff.0 = read_mv_component(dec, &mut mv_comp[0], allow_high_precision_mv, force_integer_mv);
+        diff.0 = read_mv_component(
+            dec,
+            &mut mv_comp[0],
+            allow_high_precision_mv,
+            force_integer_mv,
+        );
     }
     if joint == 1 || joint == 3 {
-        diff.1 = read_mv_component(dec, &mut mv_comp[1], allow_high_precision_mv, force_integer_mv);
+        diff.1 = read_mv_component(
+            dec,
+            &mut mv_comp[1],
+            allow_high_precision_mv,
+            force_integer_mv,
+        );
     }
     (pred.0 + diff.0, pred.1 + diff.1)
 }
@@ -8062,7 +8308,15 @@ fn read_inter_plane(
         None,
     )?;
     let (dc_delta, ac_delta) = plane_q_delta(plane_idx);
-    let residual = dequant_and_inverse_typed(&grid, side, bit_depth(), CURRENT_Q_IDX.with(|c| c.get()), dc_delta, ac_delta, tx_type);
+    let residual = dequant_and_inverse_typed(
+        &grid,
+        side,
+        bit_depth(),
+        CURRENT_Q_IDX.with(|c| c.get()),
+        dc_delta,
+        ac_delta,
+        tx_type,
+    );
     plane.reconstruct_mc(x, y, side, prediction, &residual);
     Ok((grid, tx_type))
 }
@@ -8082,22 +8336,31 @@ fn read_single_ref(
 ) -> i8 {
     let above = (above_ref > 0).then_some(above_ref);
     let left = (left_ref > 0).then_some(left_ref);
-    let p1 = dec.symbol(&mut cdfs.single_ref[single_ref_p1_ctx(above, above_ref1, left, left_ref1)][0]);
+    let p1 =
+        dec.symbol(&mut cdfs.single_ref[single_ref_p1_ctx(above, above_ref1, left, left_ref1)][0]);
     let ref_frame = if p1 == 1 {
-        let p2 = dec.symbol(&mut cdfs.single_ref[single_ref_p2_ctx(above, above_ref1, left, left_ref1)][1]);
+        let p2 = dec
+            .symbol(&mut cdfs.single_ref[single_ref_p2_ctx(above, above_ref1, left, left_ref1)][1]);
         if p2 == 1 {
             ALTREF_FRAME
         } else {
-            let p6 = dec.symbol(&mut cdfs.single_ref[single_ref_p6_ctx(above, above_ref1, left, left_ref1)][5]);
+            let p6 = dec.symbol(
+                &mut cdfs.single_ref[single_ref_p6_ctx(above, above_ref1, left, left_ref1)][5],
+            );
             if p6 == 1 { ALTREF2_FRAME } else { BWDREF_FRAME }
         }
     } else {
-        let p3 = dec.symbol(&mut cdfs.single_ref[single_ref_p3_ctx(above, above_ref1, left, left_ref1)][2]);
+        let p3 = dec
+            .symbol(&mut cdfs.single_ref[single_ref_p3_ctx(above, above_ref1, left, left_ref1)][2]);
         if p3 == 1 {
-            let p5 = dec.symbol(&mut cdfs.single_ref[single_ref_p5_ctx(above, above_ref1, left, left_ref1)][4]);
+            let p5 = dec.symbol(
+                &mut cdfs.single_ref[single_ref_p5_ctx(above, above_ref1, left, left_ref1)][4],
+            );
             if p5 == 1 { GOLDEN_FRAME } else { LAST3_FRAME }
         } else {
-            let p4 = dec.symbol(&mut cdfs.single_ref[single_ref_p4_ctx(above, above_ref1, left, left_ref1)][3]);
+            let p4 = dec.symbol(
+                &mut cdfs.single_ref[single_ref_p4_ctx(above, above_ref1, left, left_ref1)][3],
+            );
             if p4 == 1 { LAST2_FRAME } else { LAST_FRAME }
         }
     };
@@ -8282,7 +8545,9 @@ fn find_samples(
         // neighbour donates its sample at ITS center (aom pts y=-72 for a
         // 32x16 above strip; the square assumption put it at -136).
         let nb_bh = (info.size_h * 4) as i32;
-        crate::warp::record_sample(nb_bw, nb_bh, info.mv, row_offset, sign_r, col_offset, sign_c)
+        crate::warp::record_sample(
+            nb_bw, nb_bh, info.mv, row_offset, sign_r, col_offset, sign_c,
+        )
     };
 
     'outer: {
@@ -8415,8 +8680,8 @@ fn obmc_mask(len: usize) -> &'static [u8] {
         34, 37, 40, 43, 46, 49, 52, 54, 56, 58, 60, 61, 64, 64, 64, 64,
     ];
     const M32: [u8; 32] = [
-        33, 35, 36, 38, 40, 41, 43, 44, 45, 47, 48, 50, 51, 52, 53, 55, 56, 57, 58, 59, 60, 60,
-        61, 62, 64, 64, 64, 64, 64, 64, 64, 64,
+        33, 35, 36, 38, 40, 41, 43, 44, 45, 47, 48, 50, 51, 52, 53, 55, 56, 57, 58, 59, 60, 60, 61,
+        62, 64, 64, 64, 64, 64, 64, 64, 64,
     ];
     match len {
         4 => &M4,
@@ -8484,13 +8749,11 @@ fn obmc_neighbour_pred(
 /// row (the above-neighbour pass, `aom_blend_a64_vmask`).
 /// `ii_weights1d` (reconinter.c:524): the interintra smooth-mask falloff.
 const II_WEIGHTS_1D: [u8; 128] = [
-    60, 58, 56, 54, 52, 50, 48, 47, 45, 44, 42, 41, 39, 38, 37, 35, 34, 33, 32,
-    31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 22, 21, 20, 19, 19, 18, 18, 17, 16,
-    16, 15, 15, 14, 14, 13, 13, 12, 12, 12, 11, 11, 10, 10, 10, 9, 9, 9, 8,
-    8, 8, 8, 7, 7, 7, 7, 6, 6, 6, 6, 6, 5, 5, 5, 5, 5, 4, 4,
-    4, 4, 4, 4, 4, 4, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2,
-    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1,
-    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    60, 58, 56, 54, 52, 50, 48, 47, 45, 44, 42, 41, 39, 38, 37, 35, 34, 33, 32, 31, 30, 29, 28, 27,
+    26, 25, 24, 23, 22, 22, 21, 20, 19, 19, 18, 18, 17, 16, 16, 15, 15, 14, 14, 13, 13, 12, 12, 12,
+    11, 11, 10, 10, 10, 9, 9, 9, 8, 8, 8, 8, 7, 7, 7, 7, 6, 6, 6, 6, 6, 5, 5, 5, 5, 5, 4, 4, 4, 4,
+    4, 4, 4, 4, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
 ];
 
 /// lane-interintra r1: non-wedge interintra prediction for one plane
@@ -8577,7 +8840,15 @@ fn interintra_blend(
     }
 }
 
-fn obmc_blend_v(dst: &mut [u16], stride: usize, ox: usize, oy: usize, w: usize, h: usize, tmp: &[u16]) {
+fn obmc_blend_v(
+    dst: &mut [u16],
+    stride: usize,
+    ox: usize,
+    oy: usize,
+    w: usize,
+    h: usize,
+    tmp: &[u16],
+) {
     let mask = obmc_mask(h);
     for row in 0..h {
         let m = u32::from(mask[row]);
@@ -8591,7 +8862,15 @@ fn obmc_blend_v(dst: &mut [u16], stride: usize, ox: usize, oy: usize, w: usize, 
 
 /// Blends `tmp` into `dst` at `(ox, oy)`, mask varying by column (the
 /// left-neighbour pass, `aom_blend_a64_hmask`).
-fn obmc_blend_h(dst: &mut [u16], stride: usize, ox: usize, oy: usize, w: usize, h: usize, tmp: &[u16]) {
+fn obmc_blend_h(
+    dst: &mut [u16],
+    stride: usize,
+    ox: usize,
+    oy: usize,
+    w: usize,
+    h: usize,
+    tmp: &[u16],
+) {
     let mask = obmc_mask(w);
     for row in 0..h {
         for col in 0..w {
@@ -8653,8 +8932,7 @@ fn obmc_blend(
     let overlap_above = write_h / 2;
     let overlap_left = write_w / 2;
 
-    for (off4, span4, nb) in overlappable_above(grid, mi_row, mi_col, bw4, mi_cols, max_nb(bw4))
-    {
+    for (off4, span4, nb) in overlappable_above(grid, mi_row, mi_col, bw4, mi_cols, max_nb(bw4)) {
         // `Neighbours::above_filter` is indexed in `SUB`(16px)-wide columns
         // (this decoder's own outer block-loop granularity), one step
         // coarser than the mi(4px) units `overlappable_above` walks in --
@@ -9132,7 +9410,10 @@ fn decode_inter_block(
     if std::env::var_os("EC_AV1_TELL").is_some() {
         eprintln!(
             "TELL mi_row={} mi_col={} label=block_entry side={side} tell={} range={}",
-            r * SUB_MI as usize, c * SUB_MI as usize, dec.debug_bitpos(), dec.debug_state().0
+            r * SUB_MI as usize,
+            c * SUB_MI as usize,
+            dec.debug_bitpos(),
+            dec.debug_state().0
         );
     }
     let skip_mode_ctx =
@@ -9160,8 +9441,22 @@ fn decode_inter_block(
     let skip_ctx = usize::from(neighbours.above_skip[c]) + usize::from(neighbours.left_skip[r]);
     let skip = skip_mode || dec.symbol(&mut cdfs.skip[skip_ctx]) == 1;
     maybe_read_cdef_idx(dec, r * SUB_MI as usize, c * SUB_MI as usize, skip);
-    maybe_read_delta_q(dec, cdfs, r * SUB_MI as usize, c * SUB_MI as usize, side == 64, skip);
-    maybe_read_delta_lf(dec, cdfs, r * SUB_MI as usize, c * SUB_MI as usize, side == 64, skip);
+    maybe_read_delta_q(
+        dec,
+        cdfs,
+        r * SUB_MI as usize,
+        c * SUB_MI as usize,
+        side == 64,
+        skip,
+    );
+    maybe_read_delta_lf(
+        dec,
+        cdfs,
+        r * SUB_MI as usize,
+        c * SUB_MI as usize,
+        side == 64,
+        skip,
+    );
     // lane-warp r5: see `reject_residual` -- a square-block decode of a
     // HORZ_B strip is symbol-exact only for `skip` (no residual, no
     // motion_mode/warp symbol), so gate here before any further read.
@@ -9181,7 +9476,10 @@ fn decode_inter_block(
     if std::env::var_os("EC_AV1_TELL").is_some() {
         eprintln!(
             "TELL mi_row={} mi_col={} label=post_is_inter skip_mode={skip_mode} skip={skip} is_inter={is_inter} tell={} range={}",
-            r * SUB_MI as usize, c * SUB_MI as usize, dec.debug_bitpos(), dec.debug_state().0
+            r * SUB_MI as usize,
+            c * SUB_MI as usize,
+            dec.debug_bitpos(),
+            dec.debug_state().0
         );
     }
 
@@ -9301,15 +9599,20 @@ fn decode_inter_block(
                 compound_mode,
                 allow_high_precision_mv,
                 force_integer_mv,
-                (gm_table[(ref0 - LAST_FRAME) as usize], gm_table[(ref1 - LAST_FRAME) as usize]),
+                (
+                    gm_table[(ref0 - LAST_FRAME) as usize],
+                    gm_table[(ref1 - LAST_FRAME) as usize],
+                ),
             );
             let is_globalmv = compound_mode == 6; // GLOBAL_GLOBALMV
             // spec `is_nontrans_global_motion`: ALL active refs' models must
             // be non-TRANSLATION (IDENTITY counts) for the compound block's
             // interp-filter read to be suppressed.
             let gm_nontrans = is_globalmv
-                && global_motion[(ref0 - LAST_FRAME) as usize].model != ec_av1_syntax::WarpModel::Translation
-                && global_motion[(ref1 - LAST_FRAME) as usize].model != ec_av1_syntax::WarpModel::Translation;
+                && global_motion[(ref0 - LAST_FRAME) as usize].model
+                    != ec_av1_syntax::WarpModel::Translation
+                && global_motion[(ref1 - LAST_FRAME) as usize].model
+                    != ec_av1_syntax::WarpModel::Translation;
             let (py0, pu0, pv0) = ref_planes(ref0, ref_y, ref_u, ref_v, other_refs)?;
             let (py1, pu1, pv1) = ref_planes(ref1, ref_y, ref_u, ref_v, other_refs)?;
             // spec `get_ref_filter_type`: matches when EITHER of the
@@ -9320,20 +9623,18 @@ fn decode_inter_block(
             // real filter match down to the "no neighbour" sentinel
             // whenever the shared reference sits in the neighbour's SECOND
             // slot (lane-av1idx r2).
-            let above_filter_ctx = if neighbours.above_ref[c] == ref0
-                || neighbours.above_ref1[c] == Some(ref0)
-            {
-                neighbours.above_filter[c]
-            } else {
-                [3, 3]
-            };
-            let left_filter_ctx = if neighbours.left_ref[r] == ref0
-                || neighbours.left_ref1[r] == Some(ref0)
-            {
-                neighbours.left_filter[r]
-            } else {
-                [3, 3]
-            };
+            let above_filter_ctx =
+                if neighbours.above_ref[c] == ref0 || neighbours.above_ref1[c] == Some(ref0) {
+                    neighbours.above_filter[c]
+                } else {
+                    [3, 3]
+                };
+            let left_filter_ctx =
+                if neighbours.left_ref[r] == ref0 || neighbours.left_ref1[r] == Some(ref0) {
+                    neighbours.left_filter[r]
+                } else {
+                    [3, 3]
+                };
             globalmv_for_lf = is_globalmv;
             ref_frame_for_lf = ref0;
             mode_for_tx = 0;
@@ -9381,14 +9682,12 @@ fn decode_inter_block(
             // as an explicit call so a future smaller block size is not
             // silently wrong (libaom `reconinter.h::is_any_masked_compound_used`).
             let group_ctx = get_comp_group_idx_context(neighbours, at, side);
-            let comp_group_idx = if !skip_mode
-                && enable_masked_compound
-                && is_any_masked_compound_used_here(side)
-            {
-                dec.symbol(&mut cdfs.comp_group_idx[group_ctx])
-            } else {
-                0
-            };
+            let comp_group_idx =
+                if !skip_mode && enable_masked_compound && is_any_masked_compound_used_here(side) {
+                    dec.symbol(&mut cdfs.comp_group_idx[group_ctx])
+                } else {
+                    0
+                };
             // lane-maskcomp r2 / lane-wedge r3: `Some(mask_type)` for a
             // `COMPOUND_DIFFWTD` block, `Some(mask)` (wedge codebook lookup)
             // for a `COMPOUND_WEDGE` block -- exactly one of the two is set
@@ -9628,39 +9927,41 @@ fn decode_inter_block(
             // split. This gate was missing before r2 (dead code: the masked
             // path always refused earlier, so it never executed with
             // `comp_group_idx == 1` in practice).
-            let (fwd_offset, bck_offset, compound_idx) = if comp_group_idx == 0
-                && !skip_mode
-                && enable_jnt_comp
-            {
-                let idx_ctx = get_comp_index_context(
-                    neighbours,
-                    at,
-                    side,
-                    order_hint_bits,
-                    order_hint,
-                    ref_order_hints[(ref0 - LAST_FRAME) as usize],
-                    ref_order_hints[(ref1 - LAST_FRAME) as usize],
-                );
-                let idx = dec.symbol(&mut cdfs.compound_idx[idx_ctx]);
-                if idx == 1 {
-                    (8, 8, 1u8)
-                } else {
-                    let (fwd, bck) = crate::compound::dist_wtd_comp_weight_assign(
+            let (fwd_offset, bck_offset, compound_idx) =
+                if comp_group_idx == 0 && !skip_mode && enable_jnt_comp {
+                    let idx_ctx = get_comp_index_context(
+                        neighbours,
+                        at,
+                        side,
                         order_hint_bits,
                         order_hint,
                         ref_order_hints[(ref0 - LAST_FRAME) as usize],
                         ref_order_hints[(ref1 - LAST_FRAME) as usize],
                     );
-                    (fwd, bck, 0u8)
-                }
-            } else {
-                (8, 8, 1u8)
-            };
+                    let idx = dec.symbol(&mut cdfs.compound_idx[idx_ctx]);
+                    if idx == 1 {
+                        (8, 8, 1u8)
+                    } else {
+                        let (fwd, bck) = crate::compound::dist_wtd_comp_weight_assign(
+                            order_hint_bits,
+                            order_hint,
+                            ref_order_hints[(ref0 - LAST_FRAME) as usize],
+                            ref_order_hints[(ref1 - LAST_FRAME) as usize],
+                        );
+                        (fwd, bck, 0u8)
+                    }
+                } else {
+                    (8, 8, 1u8)
+                };
             compound_ctx = Some((ref1, comp_group_idx as u8, compound_idx));
             if std::env::var_os("EC_AV1_COMPIDX_DUMP").is_some() {
                 eprintln!(
                     "EC_COMPIDX mi_row={mi_row} mi_col={mi_col} bsize={side} mode={compound_mode} mv0=({},{}) mv1=({},{}) ref0={ref0} ref1={ref1} comp_group_idx={comp_group_idx} compound_idx={compound_idx} tell={}",
-                    mv0.0, mv0.1, mv1.0, mv1.1, dec.debug_bitpos()
+                    mv0.0,
+                    mv0.1,
+                    mv1.0,
+                    mv1.1,
+                    dec.debug_bitpos()
                 );
             }
 
@@ -9739,7 +10040,14 @@ fn decode_inter_block(
             };
             if let Some(mask_y) = mask_y {
                 mc::blend_masked_compound(
-                    &inter0_y, &inter1_y, mask_y, side, side, side, false, &mut pred_y,
+                    &inter0_y,
+                    &inter1_y,
+                    mask_y,
+                    side,
+                    side,
+                    side,
+                    false,
+                    &mut pred_y,
                 );
             } else {
                 mc::combine_compound(&inter0_y, &inter1_y, fwd_offset, bck_offset, &mut pred_y);
@@ -9980,21 +10288,21 @@ fn decode_inter_block(
                 .0;
             }
         } else {
-            let ref_frame =
-                read_single_ref(
-                    dec,
-                    cdfs,
-                    neighbours.above_ref[c],
-                    neighbours.above_ref1[c],
-                    neighbours.left_ref[r],
-                    neighbours.left_ref1[r],
-                );
+            let ref_frame = read_single_ref(
+                dec,
+                cdfs,
+                neighbours.above_ref[c],
+                neighbours.above_ref1[c],
+                neighbours.left_ref[r],
+                neighbours.left_ref1[r],
+            );
             ref_frame_for_lf = ref_frame;
             if std::env::var_os("EC_AV1_TELL").is_some() {
                 let (mi_row, mi_col) = (r * SUB_MI as usize, c * SUB_MI as usize);
                 eprintln!(
                     "TELL mi_row={mi_row} mi_col={mi_col} label=post_ref_frame ref={ref_frame} tell={} range={}",
-                    dec.debug_bitpos(), dec.debug_state().0
+                    dec.debug_bitpos(),
+                    dec.debug_state().0
                 );
             }
             // round 4-9 (lane-av1golden..lane-av1golden7): GOLDEN_FRAME's own
@@ -10137,7 +10445,8 @@ fn decode_inter_block(
             if std::env::var_os("EC_AV1_TELL").is_some() {
                 eprintln!(
                     "TELL mi_row={mi_row} mi_col={mi_col} label=post_assign_mv tell={} range={}",
-                    dec.debug_bitpos(), dec.debug_state().0
+                    dec.debug_bitpos(),
+                    dec.debug_state().0
                 );
             }
             // lane-sb128 r4: `interintra` (spec 5.11.24; libaom
@@ -10186,7 +10495,8 @@ fn decode_inter_block(
             if std::env::var_os("EC_AV1_TELL").is_some() {
                 eprintln!(
                     "TELL mi_row={mi_row} mi_col={mi_col} label=post_interintra tell={} range={}",
-                    dec.debug_bitpos(), dec.debug_state().0
+                    dec.debug_bitpos(),
+                    dec.debug_state().0
                 );
             }
             // lane-motionmode round 1: `read_motion_mode` (spec 5.11.24;
@@ -10260,7 +10570,16 @@ fn decode_inter_block(
                 // instead of the 2-symbol `obmc_cdf` exactly when
                 // `num_proj_ref >= 1` under `allow_warped_motion`.
                 let warp_eligible = allow_warped_motion
-                    && num_proj_ref(grid, mi_row, mi_col, bw4, bh4, mi_cols as usize, mi_rows as usize, ref_frame) >= 1;
+                    && num_proj_ref(
+                        grid,
+                        mi_row,
+                        mi_col,
+                        bw4,
+                        bh4,
+                        mi_cols as usize,
+                        mi_rows as usize,
+                        ref_frame,
+                    ) >= 1;
                 if warp_eligible {
                     let mode = dec.symbol(&mut cdfs.motion_mode[bsize_idx]);
                     match mode {
@@ -10288,11 +10607,19 @@ fn decode_inter_block(
                                     samples.len()
                                 );
                                 for (i, s) in samples.iter().enumerate() {
-                                    eprintln!("EC_WARP_DEBUG sample[{i}] pts={:?} pts_inref={:?}", s.pts1, s.pts2);
+                                    eprintln!(
+                                        "EC_WARP_DEBUG sample[{i}] pts={:?} pts_inref={:?}",
+                                        s.pts1, s.pts2
+                                    );
                                 }
                             }
                             if samples.len() > 1 {
-                                crate::warp::select_samples(mv, &mut samples, side as i32, side as i32);
+                                crate::warp::select_samples(
+                                    mv,
+                                    &mut samples,
+                                    side as i32,
+                                    side as i32,
+                                );
                             }
                             warp_params = crate::warp::find_projection(
                                 &samples,
@@ -10309,10 +10636,16 @@ fn decode_inter_block(
                             if std::env::var_os("EC_WARP_DEBUG").is_some() {
                                 eprintln!(
                                     "EC_WARP_DEBUG projection mi_row={mi_row} mi_col={mi_col} num_proj_ref(final)={} mv=({},{}) params={:?}",
-                                    samples.len(), mv.0, mv.1, warp_params
+                                    samples.len(),
+                                    mv.0,
+                                    mv.1,
+                                    warp_params
                                 );
                                 for (i, s) in samples.iter().enumerate() {
-                                    eprintln!("EC_WARP_DEBUG sample_used[{i}] pts={:?} pts_inref={:?}", s.pts1, s.pts2);
+                                    eprintln!(
+                                        "EC_WARP_DEBUG sample_used[{i}] pts={:?} pts_inref={:?}",
+                                        s.pts1, s.pts2
+                                    );
                                 }
                             }
                         }
@@ -10347,7 +10680,9 @@ fn decode_inter_block(
             if std::env::var_os("EC_AV1_TELL").is_some() {
                 eprintln!(
                     "TELL mi_row={mi_row} mi_col={mi_col} label=post_motion_mode eligible={} tell={} range={}",
-                    motion_mode_eligible as u8, dec.debug_bitpos(), dec.debug_state().0
+                    motion_mode_eligible as u8,
+                    dec.debug_bitpos(),
+                    dec.debug_state().0
                 );
             }
             // spec `get_ref_filter_type`: a neighbour's own filter only feeds
@@ -10390,13 +10725,21 @@ fn decode_inter_block(
             if std::env::var_os("EC_AV1_TELL").is_some() {
                 eprintln!(
                     "TELL mi_row={mi_row} mi_col={mi_col} label=post_interp_filter tell={} range={}",
-                    dec.debug_bitpos(), dec.debug_state().0
+                    dec.debug_bitpos(),
+                    dec.debug_state().0
                 );
             }
             if std::env::var_os("EC_AV1_TRACE").is_some() {
                 eprintln!(
                     "EC_TRACE mi_row={mi_row} mi_col={mi_col} skip={} is_inter=1 mv=({},{}) is_new_mv={is_new_mv} bsize={side} ref={ref_frame} filter={:?} motion_mode_eligible={} obmc_selected={} warped={} tell={}",
-                    skip as u8, mv.0, mv.1, block_filter, motion_mode_eligible as u8, obmc_selected as u8, warp_params.is_some() as u8, dec.debug_bitpos()
+                    skip as u8,
+                    mv.0,
+                    mv.1,
+                    block_filter,
+                    motion_mode_eligible as u8,
+                    obmc_selected as u8,
+                    warp_params.is_some() as u8,
+                    dec.debug_bitpos()
                 );
             }
             // lane-rect r2: see the compound path's matching comment above --
@@ -10538,19 +10881,49 @@ fn decode_inter_block(
 
             if let Some(params) = &warp_params {
                 crate::warp::warp_affine(
-                    params, &py_ref.data, py_ref.true_width as i32, py_ref.true_height as i32,
-                    py_ref.width as i32, &mut pred_y, px as i32, py as i32, side as i32,
-                    side as i32, side as i32, 0, 0,
+                    params,
+                    &py_ref.data,
+                    py_ref.true_width as i32,
+                    py_ref.true_height as i32,
+                    py_ref.width as i32,
+                    &mut pred_y,
+                    px as i32,
+                    py as i32,
+                    side as i32,
+                    side as i32,
+                    side as i32,
+                    0,
+                    0,
                 );
                 crate::warp::warp_affine(
-                    params, &pu_ref.data, pu_ref.true_width as i32, pu_ref.true_height as i32,
-                    pu_ref.width as i32, &mut pred_u, cpx as i32, cpy as i32, chroma_side as i32,
-                    chroma_side as i32, chroma_side as i32, 1, 1,
+                    params,
+                    &pu_ref.data,
+                    pu_ref.true_width as i32,
+                    pu_ref.true_height as i32,
+                    pu_ref.width as i32,
+                    &mut pred_u,
+                    cpx as i32,
+                    cpy as i32,
+                    chroma_side as i32,
+                    chroma_side as i32,
+                    chroma_side as i32,
+                    1,
+                    1,
                 );
                 crate::warp::warp_affine(
-                    params, &pv_ref.data, pv_ref.true_width as i32, pv_ref.true_height as i32,
-                    pv_ref.width as i32, &mut pred_v, cpx as i32, cpy as i32, chroma_side as i32,
-                    chroma_side as i32, chroma_side as i32, 1, 1,
+                    params,
+                    &pv_ref.data,
+                    pv_ref.true_width as i32,
+                    pv_ref.true_height as i32,
+                    pv_ref.width as i32,
+                    &mut pred_v,
+                    cpx as i32,
+                    cpy as i32,
+                    chroma_side as i32,
+                    chroma_side as i32,
+                    chroma_side as i32,
+                    1,
+                    1,
                 );
             }
 
@@ -10796,17 +11169,15 @@ fn decode_inter_block(
         // lane-chroma r4: same chroma edge-filter-strength neighbour check
         // as [`read_intra_mode`]/[`read_intra_mode_rect`] -- the CHROMA
         // neighbour's own `uv_mode`, not the luma one.
-        let smooth_neighbor_uv =
-            is_smooth_mode(neighbours.above_uv_mode[c]) || is_smooth_mode(neighbours.left_uv_mode[r]);
+        let smooth_neighbor_uv = is_smooth_mode(neighbours.above_uv_mode[c])
+            || is_smooth_mode(neighbours.left_uv_mode[r]);
         // `read_palette_mode_info` (decodemv.c:567, called from
         // `read_intra_block_mode_info` right after `xd->cfl.store_y`, same
         // gating and same corner-cut as `read_intra_mode`'s own copy above
         // -- `palette_mode_ctx`/`palette_uv_mode_ctx` hardcoded 0, provably
         // safe since a nonzero neighbour `palette_size` would already have
         // refused the decode that produced it.
-        if allow_screen_content_tools
-            && let Some(bsize_ctx) = palette_bsize_ctx(side)
-        {
+        if allow_screen_content_tools && let Some(bsize_ctx) = palette_bsize_ctx(side) {
             if mode == DC_PRED && dec.symbol(&mut cdfs.palette_y_mode[bsize_ctx][0]) != 0 {
                 return Err(unsupported(
                     "a block that actually uses a palette (Y) -- reconstruction is out of scope",
@@ -10976,7 +11347,10 @@ fn decode_inter_block(
     if std::env::var_os("EC_AV1_TELL").is_some() {
         eprintln!(
             "TELL mi_row={} mi_col={} label=block_end tell={} range={}",
-            r * SUB_MI as usize, c * SUB_MI as usize, dec.debug_bitpos(), dec.debug_state().0
+            r * SUB_MI as usize,
+            c * SUB_MI as usize,
+            dec.debug_bitpos(),
+            dec.debug_state().0
         );
     }
     if vartx_leaves.is_some() {
@@ -11142,6 +11516,11 @@ fn decode_inter_block8(
 
     let (px, py) = (leaf_mi.1 * MI, leaf_mi.0 * MI);
     let (cpx, cpy) = (px / 2, py / 2);
+    // lane-txselect: whether this leaf's `TxMode::Select` var-tx tree took
+    // the one split a `BLOCK_8X8` can take (`read_block_tx_size` below) --
+    // read back by the luma residual read and the tail's neighbour/loop-filter
+    // bookkeeping. Always `false` outside a `TxMode::Select` inter frame.
+    let mut split8 = false;
     const SIDE: usize = 8;
     const CHROMA_SIDE: usize = 4;
 
@@ -11312,39 +11691,41 @@ fn decode_inter_block8(
                 // compound_idx defect surfaces on the wide gate sweep.
                 // lane-av1idx r1: same re-mask as the 16x16 leaf above --
                 // see that comment.
-                let (fwd_offset, bck_offset, compound_idx) = if comp_group_idx == 0
-                    && !skip_mode
-                    && enable_jnt_comp
-                {
-                    let idx_ctx = get_comp_index_context(
-                        neighbours,
-                        outer_at,
-                        SIDE,
-                        order_hint_bits,
-                        order_hint,
-                        ref_order_hints[(ref0 - LAST_FRAME) as usize],
-                        ref_order_hints[(ref1 - LAST_FRAME) as usize],
-                    );
-                    let idx = dec.symbol(&mut cdfs.compound_idx[idx_ctx]);
-                    if idx == 1 {
-                        (8, 8, 1u8)
-                    } else {
-                        let (fwd, bck) = crate::compound::dist_wtd_comp_weight_assign(
+                let (fwd_offset, bck_offset, compound_idx) =
+                    if comp_group_idx == 0 && !skip_mode && enable_jnt_comp {
+                        let idx_ctx = get_comp_index_context(
+                            neighbours,
+                            outer_at,
+                            SIDE,
                             order_hint_bits,
                             order_hint,
                             ref_order_hints[(ref0 - LAST_FRAME) as usize],
                             ref_order_hints[(ref1 - LAST_FRAME) as usize],
                         );
-                        (fwd, bck, 0u8)
-                    }
-                } else {
-                    (8, 8, 1u8)
-                };
+                        let idx = dec.symbol(&mut cdfs.compound_idx[idx_ctx]);
+                        if idx == 1 {
+                            (8, 8, 1u8)
+                        } else {
+                            let (fwd, bck) = crate::compound::dist_wtd_comp_weight_assign(
+                                order_hint_bits,
+                                order_hint,
+                                ref_order_hints[(ref0 - LAST_FRAME) as usize],
+                                ref_order_hints[(ref1 - LAST_FRAME) as usize],
+                            );
+                            (fwd, bck, 0u8)
+                        }
+                    } else {
+                        (8, 8, 1u8)
+                    };
                 compound_ctx8 = Some((ref0, ref1, comp_group_idx as u8, compound_idx));
                 if std::env::var_os("EC_AV1_COMPIDX_DUMP").is_some() {
                     eprintln!(
                         "EC_COMPIDX mi_row={mi_row} mi_col={mi_col} bsize=8 mode={compound_mode} mv0=({},{}) mv1=({},{}) ref0={ref0} ref1={ref1} comp_group_idx={comp_group_idx} compound_idx={compound_idx} tell={}",
-                        mv0.0, mv0.1, mv1.0, mv1.1, dec.debug_bitpos()
+                        mv0.0,
+                        mv0.1,
+                        mv1.0,
+                        mv1.1,
+                        dec.debug_bitpos()
                     );
                 }
 
@@ -11417,7 +11798,14 @@ fn decode_inter_block8(
                 };
                 if let Some(mask_y) = mask_y {
                     mc::blend_masked_compound(
-                        &inter0_y, &inter1_y, mask_y, SIDE, SIDE, SIDE, false, &mut pred_y,
+                        &inter0_y,
+                        &inter1_y,
+                        mask_y,
+                        SIDE,
+                        SIDE,
+                        SIDE,
+                        false,
+                        &mut pred_y,
                     );
                 } else {
                     mc::combine_compound(&inter0_y, &inter1_y, fwd_offset, bck_offset, &mut pred_y);
@@ -11511,6 +11899,18 @@ fn decode_inter_block8(
                     mc::combine_compound(&inter0_v, &inter1_v, fwd_offset, bck_offset, &mut pred_v);
                 }
 
+                split8 = read_block_tx_size(
+                    dec,
+                    cdfs,
+                    neighbours,
+                    leaf_mi,
+                    SIDE,
+                    (mi_cols as usize, mi_rows as usize),
+                    true,
+                    skip,
+                )?
+                .1
+                .is_some();
                 if skip {
                     y.reconstruct_mc(px, py, SIDE, &pred_y, &vec![0i32; SIDE * SIDE]);
                     u.reconstruct_mc(
@@ -11532,28 +11932,23 @@ fn decode_inter_block8(
                     v_grid = vec![0i32; CHROMA_SIDE * CHROMA_SIDE];
                 } else {
                     let around = neighbours.around_mi(leaf_mi, 8);
-                    let luma_tx_type;
-                    (luma_grid, luma_tx_type) = read_inter_plane(
+                    let (grid8, luma_tx_type) = read_inter_luma8(
                         dec,
                         cdfs,
-                        if reduced_tx_set {
-                            TxbSet::Luma8Inter
-                        } else {
-                            TxbSet::Luma8InterSet1
-                        },
-                        scan8,
-                        0,
-                        around[0],
-                        mode_for_tx,
+                        neighbours,
+                        leaf_mi,
                         y,
                         px,
                         py,
-                        SIDE,
-                        base_q_idx,
                         &pred_y,
-                        None,
-                        None,
+                        mode_for_tx,
+                        base_q_idx,
+                        scan8,
+                        scan4,
+                        reduced_tx_set,
+                        split8,
                     )?;
+                    luma_grid = grid8;
                     u_grid = read_inter_plane(
                         dec,
                         cdfs,
@@ -11713,7 +12108,16 @@ fn decode_inter_block8(
             // (see its own doc) -- this leaf is always `LAST_FRAME`-only
             // (grid.set below hardcodes it).
             let warp_eligible = allow_warped_motion
-                && num_proj_ref(grid, mi_row, mi_col, 2, 2, mi_cols as usize, mi_rows as usize, LAST_FRAME) >= 1;
+                && num_proj_ref(
+                    grid,
+                    mi_row,
+                    mi_col,
+                    2,
+                    2,
+                    mi_cols as usize,
+                    mi_rows as usize,
+                    LAST_FRAME,
+                ) >= 1;
             if warp_eligible {
                 let mode = dec.symbol(&mut cdfs.motion_mode[0]);
                 match mode {
@@ -11839,6 +12243,18 @@ fn decode_inter_block8(
             interintra_blend(v, cpx, cpy, CHROMA_SIDE, ii, wedge_mask, &mut pred_v);
         }
 
+        split8 = read_block_tx_size(
+            dec,
+            cdfs,
+            neighbours,
+            leaf_mi,
+            SIDE,
+            (mi_cols as usize, mi_rows as usize),
+            true,
+            skip,
+        )?
+        .1
+        .is_some();
         if skip {
             y.reconstruct_mc(px, py, SIDE, &pred_y, &vec![0i32; SIDE * SIDE]);
             u.reconstruct_mc(
@@ -11860,28 +12276,23 @@ fn decode_inter_block8(
             v_grid = vec![0i32; CHROMA_SIDE * CHROMA_SIDE];
         } else {
             let around = neighbours.around_mi(leaf_mi, 8);
-            let luma_tx_type;
-            (luma_grid, luma_tx_type) = read_inter_plane(
+            let (grid8, luma_tx_type) = read_inter_luma8(
                 dec,
                 cdfs,
-                if reduced_tx_set {
-                    TxbSet::Luma8Inter
-                } else {
-                    TxbSet::Luma8InterSet1
-                },
-                scan8,
-                0,
-                around[0],
-                mode_for_tx,
+                neighbours,
+                leaf_mi,
                 y,
                 px,
                 py,
-                SIDE,
-                base_q_idx,
                 &pred_y,
-                None,
-                None,
+                mode_for_tx,
+                base_q_idx,
+                scan8,
+                scan4,
+                reduced_tx_set,
+                split8,
             )?;
+            luma_grid = grid8;
             u_grid = read_inter_plane(
                 dec,
                 cdfs,
@@ -11980,6 +12391,16 @@ fn decode_inter_block8(
             }
         }
 
+        read_block_tx_size(
+            dec,
+            cdfs,
+            neighbours,
+            leaf_mi,
+            SIDE,
+            (mi_cols as usize, mi_rows as usize),
+            false,
+            skip,
+        )?;
         let reach = Reach::of(SIDE, px, py, y.width, y.height);
         if skip {
             y.reconstruct(
@@ -12091,8 +12512,38 @@ fn decode_inter_block8(
             )?;
         }
     }
+    // lane-txselect: a split leaf's plane-0 neighbour context is per 4x4
+    // transform unit (written by `record_mi_luma` inside `read_inter_luma8`),
+    // but `record_mi` rewrites all three planes of these cells at once -- so
+    // save plane 0 across it, exactly as `record_split_luma` leaves plane 0
+    // alone at the bigger block sizes.
+    let saved_luma_ctx = split8.then(|| {
+        (
+            [
+                neighbours.left[leaf_mi.0][0],
+                neighbours.left[leaf_mi.0 + 1][0],
+            ],
+            [
+                neighbours.above[leaf_mi.1][0],
+                neighbours.above[leaf_mi.1 + 1][0],
+            ],
+        )
+    });
     neighbours.record_mi(leaf_mi, 8, &[luma_grid, u_grid, v_grid]);
-    neighbours.fill_lf_grid(leaf_mi, 2, 8, if is_inter { LAST_FRAME } else { 0 });
+    if let Some((left, above)) = saved_luma_ctx {
+        for (cell, state) in left.into_iter().enumerate() {
+            neighbours.left[leaf_mi.0 + cell][0] = state;
+        }
+        for (cell, state) in above.into_iter().enumerate() {
+            neighbours.above[leaf_mi.1 + cell][0] = state;
+        }
+    }
+    neighbours.fill_lf_grid(
+        leaf_mi,
+        2,
+        if split8 { 4 } else { 8 },
+        if is_inter { LAST_FRAME } else { 0 },
+    );
     Ok((skip, is_inter, skip_mode, compound_ctx8))
 }
 
@@ -12163,6 +12614,9 @@ pub fn decode_inter_frame_tile(
         false,
         [0; 2],
         true,
+        // `tx_select`: this raw entry point decodes this crate's own encoder's
+        // streams, which always write `TxMode::Largest`.
+        false,
         false,
         false,
         false,
@@ -12229,6 +12683,12 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     // `Set1` coefficient tables at 16x16/8x8 rather than the reduced
     // 2-symbol ones -- see [`TxbSet::Luma16InterSet1`]/[`TxbSet::Luma8InterSet1`]).
     reduced_tx_set: bool,
+    // lane-txselect: this frame header's own `tx_mode == TxMode::Select`
+    // bit (spec 5.9.14). Together with `reduced_tx_set` it is stashed in a
+    // thread-local by [`set_inter_tx_mode`] rather than threaded through
+    // `decode_inter_block`'s forty parameters -- both are frame-constant, and
+    // only [`read_block_tx_size`]/the var-tx residual loop read them.
+    tx_select: bool,
     // lane-motionmode round 1/3: this frame header's own `is_motion_mode_switchable`/
     // `allow_warped_motion` bits, threaded to every `decode_inter_block`/
     // `decode_inter_block8` call below (spec 5.11.24's `read_motion_mode`).
@@ -12245,6 +12705,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     // param -- only `q_present`/`q_res` are read.
     delta: DeltaParams,
 ) -> Result<(Picture, Cdfs, crate::motion_field::MotionField)> {
+    set_inter_tx_mode(tx_select, reduced_tx_set);
     let tpl_frame = tpl_field.map(|field| TplFrameArgs {
         field,
         order_hint_bits,
@@ -12489,187 +12950,446 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         );
         TILE_HITS.with(|c| c.set(c.get() + 1));
 
-    for sb_r in sb_r0..sb_r1 {
-        neighbours.start_row();
-        for sb_c in sb_c0..sb_c1 {
-            crate::restoration::read_lr(
-                &mut dec,
-                &mut cdfs,
-                lr,
-                &mut lr_grid,
-                &mut lr_reference,
-                sb_r * SB_MI,
-                sb_c * SB_MI,
-                SB_MI,
-            );
-            CDEF_TRANSMITTED.with(|c| c.set(false));
-            let sb_at = (sb_r as usize * 4, sb_c as usize * 4);
-            let sb_ctx = neighbours.partition_ctx(sb_at, SB);
-            let (has_cols, has_rows) = (
-                sb_c * SB_MI + SB_MI / 2 < mi_cols,
-                sb_r * SB_MI + SB_MI / 2 < mi_rows,
-            );
-            // The straddle cases (one or both halves outside the true
-            // frame) never carry a real alphabet symbol -- spec forces
-            // SPLIT there (mirrors the intra key-frame tile's own
-            // three-way write above). Only the (true, true) case can name
-            // a non-SPLIT value, and this loop below only ever recurses as
-            // SPLIT -- so a real non-SPLIT part64 here must refuse by name
-            // instead of silently decoding as SPLIT and desyncing.
-            let part64 = match (has_cols, has_rows) {
-                (true, true) => {
-                    let p = dec.symbol(&mut cdfs.partition_w64[sb_ctx]);
-                    if std::env::var_os("EC_AV1_TRACE").is_some() {
-                        eprintln!(
-                            "TRACE partition_w64 mi=({},{}) ctx={sb_ctx} value={p}",
-                            sb_r * SB_MI,
-                            sb_c * SB_MI
-                        );
-                    }
-                    p
-                }
-                (true, false) => {
-                    dec.symbol_fixed(&gather(&cdfs.partition_w64[sb_ctx], VERT_ALIKE));
-                    PARTITION_SPLIT
-                }
-                (false, true) => {
-                    dec.symbol_fixed(&gather(&cdfs.partition_w64[sb_ctx], HORZ_ALIKE));
-                    PARTITION_SPLIT
-                }
-                (false, false) => PARTITION_SPLIT,
-            };
-            if part64 != PARTITION_SPLIT {
-                return Err(unsupported(
-                    "an inter SB-level partition type other than SPLIT (this decoder's \
-                     inter tile path only recurses a superblock as SPLIT)",
-                ));
-            }
-
-            for quadrant in 0..4 {
-                let (r32, c32) = (sb_r * 2 + quadrant / 2, sb_c * 2 + quadrant % 2);
-                if r32 >= rows || c32 >= cols {
-                    continue;
-                }
-                let at = (r32 as usize * 2, c32 as usize * 2);
-                let ctx32 = neighbours.partition_ctx(at, BLOCK);
-                let (has_cols32, has_rows32) = (
-                    has_half(c32 * BLOCK_MI, BLOCK_MI, mi_cols),
-                    has_half(r32 * BLOCK_MI, BLOCK_MI, mi_rows),
+        for sb_r in sb_r0..sb_r1 {
+            neighbours.start_row();
+            for sb_c in sb_c0..sb_c1 {
+                crate::restoration::read_lr(
+                    &mut dec,
+                    &mut cdfs,
+                    lr,
+                    &mut lr_grid,
+                    &mut lr_reference,
+                    sb_r * SB_MI,
+                    sb_c * SB_MI,
+                    SB_MI,
                 );
-                let part32 = if has_cols32 && has_rows32 {
-                    if std::env::var_os("EC_AV1_TRACE").is_some() {
-                        eprintln!(
-                            "TRACE part32_pre mi=({},{}) rng={}",
-                            r32 * BLOCK_MI,
-                            c32 * BLOCK_MI,
-                            dec.debug_state().0
-                        );
-                    }
-                    let p = dec.symbol(&mut cdfs.partition_w32[ctx32]);
-                    if std::env::var_os("EC_AV1_TRACE").is_some() {
-                        eprintln!(
-                            "TRACE partition_w32 mi=({},{}) ctx={ctx32} value={p}",
-                            r32 * BLOCK_MI,
-                            c32 * BLOCK_MI
-                        );
-                    }
-                    p
-                } else {
-                    match (has_cols32, has_rows32) {
-                        (true, false) => {
-                            dec.symbol_fixed(&gather(&cdfs.partition_w32[ctx32], VERT_ALIKE));
-                        }
-                        (false, true) => {
-                            dec.symbol_fixed(&gather(&cdfs.partition_w32[ctx32], HORZ_ALIKE));
-                        }
-                        _ => {}
-                    }
-                    PARTITION_SPLIT
-                };
-                match part32 {
-                    PARTITION_NONE => {
-                        decode_inter_block(
-                            &mut dec,
-                            &mut cdfs,
-                            &mut neighbours,
-                            &mut grid,
-                            at,
-                            BLOCK,
-                            mi_cols,
-                            mi_rows,
-                            &mut y,
-                            &mut u,
-                            &mut v,
-                            &ref_y,
-                            &ref_u,
-                            &ref_v,
-                            &ref_slots,
-                            &sign_bias_table,
-                            &global_motion,
-                            base_q_idx,
-                            TxbSet::Luma32,
-                            TxbSet::Luma32Inter,
-                            TxbSet::Chroma16,
-                            TX32,
-                            TX16,
-                            &scan32,
-                            &scan16,
-                            3,
-                            allow_high_precision_mv,
-                            force_integer_mv,
-                            interp_fixed,
-                            enable_dual_filter,
-                            tpl_frame.as_ref(),
-                            reference_select,
-                            enable_masked_compound,
-                            enable_interintra_compound,
-                            enable_jnt_comp,
-                            order_hint_bits,
-                            order_hint,
-                            ref_order_hints,
-                            skip_mode_present,
-                            skip_mode_frame,
-                            switchable_motion_mode,
-                            allow_warped_motion,
-                            false,
-                            BLOCK,
-                            BLOCK,
-                            allow_screen_content_tools,
-                            frame_width as usize,
-                        )?;
-                    }
-                    PARTITION_SPLIT => {
-                        for sub in 0..4 {
-                            let (sr, sc) = (r32 as usize * 2 + sub / 2, c32 as usize * 2 + sub % 2);
-                            if (sr as u32) * SUB_MI >= mi_rows || (sc as u32) * SUB_MI >= mi_cols {
-                                continue;
-                            }
-                            let (has_cols16, has_rows16) = (
-                                has_half(sc as u32 * SUB_MI, SUB_MI, mi_cols),
-                                has_half(sr as u32 * SUB_MI, SUB_MI, mi_rows),
+                CDEF_TRANSMITTED.with(|c| c.set(false));
+                let sb_at = (sb_r as usize * 4, sb_c as usize * 4);
+                let sb_ctx = neighbours.partition_ctx(sb_at, SB);
+                let (has_cols, has_rows) = (
+                    sb_c * SB_MI + SB_MI / 2 < mi_cols,
+                    sb_r * SB_MI + SB_MI / 2 < mi_rows,
+                );
+                // The straddle cases (one or both halves outside the true
+                // frame) never carry a real alphabet symbol -- spec forces
+                // SPLIT there (mirrors the intra key-frame tile's own
+                // three-way write above). Only the (true, true) case can name
+                // a non-SPLIT value, and this loop below only ever recurses as
+                // SPLIT -- so a real non-SPLIT part64 here must refuse by name
+                // instead of silently decoding as SPLIT and desyncing.
+                let part64 = match (has_cols, has_rows) {
+                    (true, true) => {
+                        let p = dec.symbol(&mut cdfs.partition_w64[sb_ctx]);
+                        if std::env::var_os("EC_AV1_TRACE").is_some() {
+                            eprintln!(
+                                "TRACE partition_w64 mi=({},{}) ctx={sb_ctx} value={p}",
+                                sb_r * SB_MI,
+                                sb_c * SB_MI
                             );
-                            if !has_cols16 && !has_rows16 {
-                                return Err(unsupported(
-                                    "a 16x16 inter block whose true edge cuts through both \
+                        }
+                        p
+                    }
+                    (true, false) => {
+                        dec.symbol_fixed(&gather(&cdfs.partition_w64[sb_ctx], VERT_ALIKE));
+                        PARTITION_SPLIT
+                    }
+                    (false, true) => {
+                        dec.symbol_fixed(&gather(&cdfs.partition_w64[sb_ctx], HORZ_ALIKE));
+                        PARTITION_SPLIT
+                    }
+                    (false, false) => PARTITION_SPLIT,
+                };
+                if part64 != PARTITION_SPLIT {
+                    return Err(unsupported(
+                        "an inter SB-level partition type other than SPLIT (this decoder's \
+                     inter tile path only recurses a superblock as SPLIT)",
+                    ));
+                }
+
+                for quadrant in 0..4 {
+                    let (r32, c32) = (sb_r * 2 + quadrant / 2, sb_c * 2 + quadrant % 2);
+                    if r32 >= rows || c32 >= cols {
+                        continue;
+                    }
+                    let at = (r32 as usize * 2, c32 as usize * 2);
+                    let ctx32 = neighbours.partition_ctx(at, BLOCK);
+                    let (has_cols32, has_rows32) = (
+                        has_half(c32 * BLOCK_MI, BLOCK_MI, mi_cols),
+                        has_half(r32 * BLOCK_MI, BLOCK_MI, mi_rows),
+                    );
+                    let part32 = if has_cols32 && has_rows32 {
+                        if std::env::var_os("EC_AV1_TRACE").is_some() {
+                            eprintln!(
+                                "TRACE part32_pre mi=({},{}) rng={}",
+                                r32 * BLOCK_MI,
+                                c32 * BLOCK_MI,
+                                dec.debug_state().0
+                            );
+                        }
+                        let p = dec.symbol(&mut cdfs.partition_w32[ctx32]);
+                        if std::env::var_os("EC_AV1_TRACE").is_some() {
+                            eprintln!(
+                                "TRACE partition_w32 mi=({},{}) ctx={ctx32} value={p}",
+                                r32 * BLOCK_MI,
+                                c32 * BLOCK_MI
+                            );
+                        }
+                        p
+                    } else {
+                        match (has_cols32, has_rows32) {
+                            (true, false) => {
+                                dec.symbol_fixed(&gather(&cdfs.partition_w32[ctx32], VERT_ALIKE));
+                            }
+                            (false, true) => {
+                                dec.symbol_fixed(&gather(&cdfs.partition_w32[ctx32], HORZ_ALIKE));
+                            }
+                            _ => {}
+                        }
+                        PARTITION_SPLIT
+                    };
+                    match part32 {
+                        PARTITION_NONE => {
+                            decode_inter_block(
+                                &mut dec,
+                                &mut cdfs,
+                                &mut neighbours,
+                                &mut grid,
+                                at,
+                                BLOCK,
+                                mi_cols,
+                                mi_rows,
+                                &mut y,
+                                &mut u,
+                                &mut v,
+                                &ref_y,
+                                &ref_u,
+                                &ref_v,
+                                &ref_slots,
+                                &sign_bias_table,
+                                &global_motion,
+                                base_q_idx,
+                                TxbSet::Luma32,
+                                TxbSet::Luma32Inter,
+                                TxbSet::Chroma16,
+                                TX32,
+                                TX16,
+                                &scan32,
+                                &scan16,
+                                3,
+                                allow_high_precision_mv,
+                                force_integer_mv,
+                                interp_fixed,
+                                enable_dual_filter,
+                                tpl_frame.as_ref(),
+                                reference_select,
+                                enable_masked_compound,
+                                enable_interintra_compound,
+                                enable_jnt_comp,
+                                order_hint_bits,
+                                order_hint,
+                                ref_order_hints,
+                                skip_mode_present,
+                                skip_mode_frame,
+                                switchable_motion_mode,
+                                allow_warped_motion,
+                                false,
+                                BLOCK,
+                                BLOCK,
+                                allow_screen_content_tools,
+                                frame_width as usize,
+                            )?;
+                        }
+                        PARTITION_SPLIT => {
+                            for sub in 0..4 {
+                                let (sr, sc) =
+                                    (r32 as usize * 2 + sub / 2, c32 as usize * 2 + sub % 2);
+                                if (sr as u32) * SUB_MI >= mi_rows
+                                    || (sc as u32) * SUB_MI >= mi_cols
+                                {
+                                    continue;
+                                }
+                                let (has_cols16, has_rows16) = (
+                                    has_half(sc as u32 * SUB_MI, SUB_MI, mi_cols),
+                                    has_half(sr as u32 * SUB_MI, SUB_MI, mi_rows),
+                                );
+                                if !has_cols16 && !has_rows16 {
+                                    return Err(unsupported(
+                                        "a 16x16 inter block whose true edge cuts through both \
                                      axes needs a rectangular transform this decoder does \
                                      not code yet",
-                                ));
-                            }
-                            let at16 = (sr, sc);
-                            if has_cols16 && has_rows16 {
-                                let ctx16 = neighbours.partition_ctx(at16, SUB);
-                                let part16 = dec.symbol(&mut cdfs.partition_w16[ctx16]);
-                                if part16 != PARTITION_NONE {
-                                    return Err(unsupported(
-                                        "an inter partition below 16x16 (8x8 and smaller inter blocks are not coded yet)",
                                     ));
                                 }
+                                let at16 = (sr, sc);
+                                if has_cols16 && has_rows16 {
+                                    let ctx16 = neighbours.partition_ctx(at16, SUB);
+                                    let part16 = dec.symbol(&mut cdfs.partition_w16[ctx16]);
+                                    if part16 != PARTITION_NONE {
+                                        return Err(unsupported(
+                                            "an inter partition below 16x16 (8x8 and smaller inter blocks are not coded yet)",
+                                        ));
+                                    }
+                                    decode_inter_block(
+                                        &mut dec,
+                                        &mut cdfs,
+                                        &mut neighbours,
+                                        &mut grid,
+                                        at16,
+                                        SUB,
+                                        mi_cols,
+                                        mi_rows,
+                                        &mut y,
+                                        &mut u,
+                                        &mut v,
+                                        &ref_y,
+                                        &ref_u,
+                                        &ref_v,
+                                        &ref_slots,
+                                        &sign_bias_table,
+                                        &global_motion,
+                                        base_q_idx,
+                                        TxbSet::Luma16,
+                                        if reduced_tx_set {
+                                            TxbSet::Luma16Inter
+                                        } else {
+                                            TxbSet::Luma16InterSet1
+                                        },
+                                        TxbSet::Chroma8,
+                                        TX16,
+                                        TX8,
+                                        &scan16,
+                                        &scan8,
+                                        2,
+                                        allow_high_precision_mv,
+                                        force_integer_mv,
+                                        interp_fixed,
+                                        enable_dual_filter,
+                                        tpl_frame.as_ref(),
+                                        reference_select,
+                                        enable_masked_compound,
+                                        enable_interintra_compound,
+                                        enable_jnt_comp,
+                                        order_hint_bits,
+                                        order_hint,
+                                        ref_order_hints,
+                                        skip_mode_present,
+                                        skip_mode_frame,
+                                        switchable_motion_mode,
+                                        allow_warped_motion,
+                                        false,
+                                        SUB,
+                                        SUB,
+                                        allow_screen_content_tools,
+                                        frame_width as usize,
+                                    )?;
+                                } else {
+                                    let ctx16 = neighbours.partition_ctx(at16, SUB);
+                                    if has_cols16 {
+                                        dec.symbol_fixed(&gather(
+                                            &cdfs.partition_w16[ctx16],
+                                            VERT_ALIKE,
+                                        ));
+                                    } else {
+                                        dec.symbol_fixed(&gather(
+                                            &cdfs.partition_w16[ctx16],
+                                            HORZ_ALIKE,
+                                        ));
+                                    }
+                                    let (mi_row0, mi_col0) =
+                                        (sr as u32 * SUB_MI, sc as u32 * SUB_MI);
+                                    let leaf_positions: Vec<(u32, u32)> = (0..4)
+                                        .map(|i| (mi_row0 + (i / 2) * 2, mi_col0 + (i % 2) * 2))
+                                        .filter(|&(mr, mc)| mr < mi_rows && mc < mi_cols)
+                                        .collect();
+                                    // lane-superres r9: decode_inter_block8's own
+                                    // MC (below) is not threaded for a scaled
+                                    // reference (unlike decode_inter_block's 19
+                                    // sites) -- refuse the whole 8x8-leaf split
+                                    // up front when ANY live reference this leaf
+                                    // could pick has a different width than this
+                                    // frame, rather than thread frame_width
+                                    // through its own single-ref/compound MC
+                                    // calls to reach the same block this round.
+                                    if ref_y.width != frame_width as usize
+                                        || ref_slots
+                                            .iter()
+                                            .flatten()
+                                            .any(|(py, _, _)| py.width != frame_width as usize)
+                                    {
+                                        return Err(unsupported(
+                                            "an 8x8 partition leaf under a scaled reference (superres, unimplemented)",
+                                        ));
+                                    }
+                                    let mut prev_leaf: Option<((usize, usize), bool, bool)> = None;
+                                    let mut last_compound_ctx: Option<(i8, i8, u8, u8)> = None;
+                                    let mut last_skip_mode = false;
+                                    for (mr, mc) in leaf_positions {
+                                        let leaf_mi = (mr as usize, mc as usize);
+                                        let leaf_ctx = neighbours.partition_ctx_mi(leaf_mi, 8);
+                                        let part8 = dec.symbol(&mut cdfs.partition_w8[leaf_ctx]);
+                                        if part8 != PARTITION_NONE {
+                                            return Err(unsupported(
+                                                "a partition below 8x8 (this decoder codes no leaf smaller than 8x8)",
+                                            ));
+                                        }
+                                        let (skip, is_inter, skip_mode_leaf, compound_ctx8) =
+                                            decode_inter_block8(
+                                                &mut dec,
+                                                &mut cdfs,
+                                                &mut neighbours,
+                                                &mut grid,
+                                                mi_cols,
+                                                mi_rows,
+                                                at16,
+                                                leaf_mi,
+                                                &mut y,
+                                                &mut u,
+                                                &mut v,
+                                                &ref_y,
+                                                &ref_u,
+                                                &ref_v,
+                                                &ref_slots,
+                                                base_q_idx,
+                                                &scan8,
+                                                &scan4,
+                                                prev_leaf,
+                                                allow_high_precision_mv,
+                                                force_integer_mv,
+                                                reference_select,
+                                                enable_masked_compound,
+                                                enable_interintra_compound,
+                                                enable_jnt_comp,
+                                                order_hint_bits,
+                                                order_hint,
+                                                ref_order_hints,
+                                                skip_mode_present,
+                                                skip_mode_frame,
+                                                reduced_tx_set,
+                                                interp_fixed,
+                                                switchable_motion_mode,
+                                                allow_warped_motion,
+                                                allow_screen_content_tools,
+                                            )?;
+                                        prev_leaf = Some((leaf_mi, skip, is_inter));
+                                        last_skip_mode = skip_mode_leaf;
+                                        if compound_ctx8.is_some() {
+                                            last_compound_ctx = compound_ctx8;
+                                        }
+                                    }
+                                    if let Some((_, skip, is_inter)) = prev_leaf {
+                                        // corner-cut: `decode_inter_block8`'s
+                                        // leaves never read a switchable filter
+                                        // (round-3 GLOBALMV refusal already
+                                        // bounds them away from the Regular-only
+                                        // gap this round closes elsewhere); `[3,
+                                        // 3]` is "no info", the same value an
+                                        // intra neighbour records. Upgrade:
+                                        // thread `interp_fixed`/`enable_dual_filter`
+                                        // into `decode_inter_block8` once a
+                                        // straddling 8x8 SWITCHABLE stream is on
+                                        // hand to pin against.
+                                        neighbours.record_inter(
+                                            at16,
+                                            SUB,
+                                            skip,
+                                            is_inter,
+                                            if is_inter { LAST_FRAME } else { -1 },
+                                            [3, 3],
+                                            last_skip_mode,
+                                        );
+                                        if let Some((ref0, ref1, group_idx, idx)) =
+                                            last_compound_ctx
+                                        {
+                                            neighbours.record_inter(
+                                                at16,
+                                                SUB,
+                                                skip,
+                                                is_inter,
+                                                ref0,
+                                                [3, 3],
+                                                last_skip_mode,
+                                            );
+                                            neighbours.record_compound_ctx(
+                                                at16, SUB, ref1, group_idx, idx,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        PARTITION_HORZ_B => {
+                            // lane-warp r5: PARTITION_HORZ_B = 32x32 top strip +
+                            // 16x16 bottom-left + 16x16 bottom-right. aomenc
+                            // carves static regions into it; the strip is
+                            // decoded as a square 32x32 block: for a `skip`
+                            // block the symbol stream is identical to the true
+                            // 32x16 coding (no residual, no motion_mode/warp
+                            // symbol), and the square stamps it leaves over the
+                            // bottom half (neighbour arrays, skip/lf grids) are
+                            // re-stamped by the C/D leaves right after. The
+                            // mi-granular `left_side_mi` rows of a last-block-in-
+                            // tile strip leak 32-vs-16 only until the per-tile
+                            // `Neighbours::new` reset.
+                            EXTENDED_PARTITION_HITS.with(|c| c.set(c.get() + 1));
+                            let at32 = at;
+                            decode_inter_block(
+                                &mut dec,
+                                &mut cdfs,
+                                &mut neighbours,
+                                &mut grid,
+                                at32,
+                                BLOCK,
+                                mi_cols,
+                                mi_rows,
+                                &mut y,
+                                &mut u,
+                                &mut v,
+                                &ref_y,
+                                &ref_u,
+                                &ref_v,
+                                &ref_slots,
+                                &sign_bias_table,
+                                &global_motion,
+                                base_q_idx,
+                                TxbSet::Luma32,
+                                TxbSet::Luma32Inter,
+                                TxbSet::Chroma16,
+                                TX32,
+                                TX16,
+                                &scan32,
+                                &scan16,
+                                3,
+                                allow_high_precision_mv,
+                                force_integer_mv,
+                                interp_fixed,
+                                enable_dual_filter,
+                                tpl_frame.as_ref(),
+                                reference_select,
+                                enable_masked_compound,
+                                enable_interintra_compound,
+                                enable_jnt_comp,
+                                order_hint_bits,
+                                order_hint,
+                                ref_order_hints,
+                                skip_mode_present,
+                                skip_mode_frame,
+                                switchable_motion_mode,
+                                allow_warped_motion,
+                                true,
+                                // lane-rect r2: the top strip's TRUE 32x16
+                                // footprint (was BLOCK,BLOCK -- the same square
+                                // corner-cut rect-flake-1 exposed on HORZ).
+                                BLOCK,
+                                SUB,
+                                allow_screen_content_tools,
+                                frame_width as usize,
+                            )?;
+                            if (r32 * 2 + 1) as u32 * SUB_MI < mi_rows {
                                 decode_inter_block(
                                     &mut dec,
                                     &mut cdfs,
                                     &mut neighbours,
                                     &mut grid,
-                                    at16,
+                                    (r32 as usize * 2 + 1, c32 as usize * 2),
                                     SUB,
                                     mi_cols,
                                     mi_rows,
@@ -12681,7 +13401,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     &ref_v,
                                     &ref_slots,
                                     &sign_bias_table,
-                            &global_motion,
+                                    &global_motion,
                                     base_q_idx,
                                     TxbSet::Luma16,
                                     if reduced_tx_set {
@@ -12717,210 +13437,284 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     allow_screen_content_tools,
                                     frame_width as usize,
                                 )?;
-                            } else {
-                                let ctx16 = neighbours.partition_ctx(at16, SUB);
-                                if has_cols16 {
-                                    dec.symbol_fixed(&gather(
-                                        &cdfs.partition_w16[ctx16],
-                                        VERT_ALIKE,
-                                    ));
-                                } else {
-                                    dec.symbol_fixed(&gather(
-                                        &cdfs.partition_w16[ctx16],
-                                        HORZ_ALIKE,
-                                    ));
-                                }
-                                let (mi_row0, mi_col0) = (sr as u32 * SUB_MI, sc as u32 * SUB_MI);
-                                let leaf_positions: Vec<(u32, u32)> = (0..4)
-                                    .map(|i| (mi_row0 + (i / 2) * 2, mi_col0 + (i % 2) * 2))
-                                    .filter(|&(mr, mc)| mr < mi_rows && mc < mi_cols)
-                                    .collect();
-                                // lane-superres r9: decode_inter_block8's own
-                                // MC (below) is not threaded for a scaled
-                                // reference (unlike decode_inter_block's 19
-                                // sites) -- refuse the whole 8x8-leaf split
-                                // up front when ANY live reference this leaf
-                                // could pick has a different width than this
-                                // frame, rather than thread frame_width
-                                // through its own single-ref/compound MC
-                                // calls to reach the same block this round.
-                                if ref_y.width != frame_width as usize
-                                    || ref_slots.iter().flatten().any(|(py, _, _)| {
-                                        py.width != frame_width as usize
-                                    })
-                                {
-                                    return Err(unsupported(
-                                        "an 8x8 partition leaf under a scaled reference (superres, unimplemented)",
-                                    ));
-                                }
-                                let mut prev_leaf: Option<((usize, usize), bool, bool)> = None;
-                                let mut last_compound_ctx: Option<(i8, i8, u8, u8)> = None;
-                                let mut last_skip_mode = false;
-                                for (mr, mc) in leaf_positions {
-                                    let leaf_mi = (mr as usize, mc as usize);
-                                    let leaf_ctx = neighbours.partition_ctx_mi(leaf_mi, 8);
-                                    let part8 = dec.symbol(&mut cdfs.partition_w8[leaf_ctx]);
-                                    if part8 != PARTITION_NONE {
-                                        return Err(unsupported(
-                                            "a partition below 8x8 (this decoder codes no leaf smaller than 8x8)",
-                                        ));
-                                    }
-                                    let (skip, is_inter, skip_mode_leaf, compound_ctx8) =
-                                        decode_inter_block8(
-                                            &mut dec,
-                                            &mut cdfs,
-                                            &mut neighbours,
-                                            &mut grid,
-                                            mi_cols,
-                                            mi_rows,
-                                            at16,
-                                            leaf_mi,
-                                            &mut y,
-                                            &mut u,
-                                            &mut v,
-                                            &ref_y,
-                                            &ref_u,
-                                            &ref_v,
-                                            &ref_slots,
-                                            base_q_idx,
-                                            &scan8,
-                                            &scan4,
-                                            prev_leaf,
-                                            allow_high_precision_mv,
-                                            force_integer_mv,
-                                            reference_select,
-                                            enable_masked_compound,
-                                            enable_interintra_compound,
-                                            enable_jnt_comp,
-                                            order_hint_bits,
-                                            order_hint,
-                                            ref_order_hints,
-                                            skip_mode_present,
-                                            skip_mode_frame,
-                                            reduced_tx_set,
-                                            interp_fixed,
-                                            switchable_motion_mode,
-                                            allow_warped_motion,
-                                            allow_screen_content_tools,
-                                        )?;
-                                    prev_leaf = Some((leaf_mi, skip, is_inter));
-                                    last_skip_mode = skip_mode_leaf;
-                                    if compound_ctx8.is_some() {
-                                        last_compound_ctx = compound_ctx8;
-                                    }
-                                }
-                                if let Some((_, skip, is_inter)) = prev_leaf {
-                                    // corner-cut: `decode_inter_block8`'s
-                                    // leaves never read a switchable filter
-                                    // (round-3 GLOBALMV refusal already
-                                    // bounds them away from the Regular-only
-                                    // gap this round closes elsewhere); `[3,
-                                    // 3]` is "no info", the same value an
-                                    // intra neighbour records. Upgrade:
-                                    // thread `interp_fixed`/`enable_dual_filter`
-                                    // into `decode_inter_block8` once a
-                                    // straddling 8x8 SWITCHABLE stream is on
-                                    // hand to pin against.
-                                    neighbours.record_inter(
-                                        at16,
+                                if (c32 * 2 + 1) as u32 * SUB_MI < mi_cols {
+                                    decode_inter_block(
+                                        &mut dec,
+                                        &mut cdfs,
+                                        &mut neighbours,
+                                        &mut grid,
+                                        (r32 as usize * 2 + 1, c32 as usize * 2 + 1),
                                         SUB,
-                                        skip,
-                                        is_inter,
-                                        if is_inter { LAST_FRAME } else { -1 },
-                                        [3, 3],
-                                        last_skip_mode,
-                                    );
-                                    if let Some((ref0, ref1, group_idx, idx)) = last_compound_ctx {
-                                        neighbours.record_inter(
-                                            at16,
-                                            SUB,
-                                            skip,
-                                            is_inter,
-                                            ref0,
-                                            [3, 3],
-                                            last_skip_mode,
-                                        );
-                                        neighbours
-                                            .record_compound_ctx(at16, SUB, ref1, group_idx, idx);
-                                    }
+                                        mi_cols,
+                                        mi_rows,
+                                        &mut y,
+                                        &mut u,
+                                        &mut v,
+                                        &ref_y,
+                                        &ref_u,
+                                        &ref_v,
+                                        &ref_slots,
+                                        &sign_bias_table,
+                                        &global_motion,
+                                        base_q_idx,
+                                        TxbSet::Luma16,
+                                        if reduced_tx_set {
+                                            TxbSet::Luma16Inter
+                                        } else {
+                                            TxbSet::Luma16InterSet1
+                                        },
+                                        TxbSet::Chroma8,
+                                        TX16,
+                                        TX8,
+                                        &scan16,
+                                        &scan8,
+                                        2,
+                                        allow_high_precision_mv,
+                                        force_integer_mv,
+                                        interp_fixed,
+                                        enable_dual_filter,
+                                        tpl_frame.as_ref(),
+                                        reference_select,
+                                        enable_masked_compound,
+                                        enable_interintra_compound,
+                                        enable_jnt_comp,
+                                        order_hint_bits,
+                                        order_hint,
+                                        ref_order_hints,
+                                        skip_mode_present,
+                                        skip_mode_frame,
+                                        switchable_motion_mode,
+                                        allow_warped_motion,
+                                        false,
+                                        SUB,
+                                        SUB,
+                                        allow_screen_content_tools,
+                                        frame_width as usize,
+                                    )?;
                                 }
                             }
                         }
-                    }
-                    PARTITION_HORZ_B => {
-                        // lane-warp r5: PARTITION_HORZ_B = 32x32 top strip +
-                        // 16x16 bottom-left + 16x16 bottom-right. aomenc
-                        // carves static regions into it; the strip is
-                        // decoded as a square 32x32 block: for a `skip`
-                        // block the symbol stream is identical to the true
-                        // 32x16 coding (no residual, no motion_mode/warp
-                        // symbol), and the square stamps it leaves over the
-                        // bottom half (neighbour arrays, skip/lf grids) are
-                        // re-stamped by the C/D leaves right after. The
-                        // mi-granular `left_side_mi` rows of a last-block-in-
-                        // tile strip leak 32-vs-16 only until the per-tile
-                        // `Neighbours::new` reset.
-                        EXTENDED_PARTITION_HITS.with(|c| c.set(c.get() + 1));
-                        let at32 = at;
-                        decode_inter_block(
-                            &mut dec,
-                            &mut cdfs,
-                            &mut neighbours,
-                            &mut grid,
-                            at32,
-                            BLOCK,
-                            mi_cols,
-                            mi_rows,
-                            &mut y,
-                            &mut u,
-                            &mut v,
-                            &ref_y,
-                            &ref_u,
-                            &ref_v,
-                            &ref_slots,
-                            &sign_bias_table,
-                            &global_motion,
-                            base_q_idx,
-                            TxbSet::Luma32,
-                            TxbSet::Luma32Inter,
-                            TxbSet::Chroma16,
-                            TX32,
-                            TX16,
-                            &scan32,
-                            &scan16,
-                            3,
-                            allow_high_precision_mv,
-                            force_integer_mv,
-                            interp_fixed,
-                            enable_dual_filter,
-                            tpl_frame.as_ref(),
-                            reference_select,
-                            enable_masked_compound,
-                            enable_interintra_compound,
-                            enable_jnt_comp,
-                            order_hint_bits,
-                            order_hint,
-                            ref_order_hints,
-                            skip_mode_present,
-                            skip_mode_frame,
-                            switchable_motion_mode,
-                            allow_warped_motion,
-                            true,
-                            // lane-rect r2: the top strip's TRUE 32x16
-                            // footprint (was BLOCK,BLOCK -- the same square
-                            // corner-cut rect-flake-1 exposed on HORZ).
-                            BLOCK,
-                            SUB,
-                            allow_screen_content_tools,
-                            frame_width as usize,
-                        )?;
-                        if (r32 * 2 + 1) as u32 * SUB_MI < mi_rows {
+                        PARTITION_HORZ => {
+                            // lane-rect r2: two true 32x16 strips. Both read at
+                            // `side=BLOCK` (CDF/size-class selection stays square,
+                            // matching HORZ_B's accepted corner-cut) but bw4/bh4
+                            // (mvstack.rs, `motion_mode_eligible`) now derive from
+                            // `write_w`/`write_h`'s true 32x16 footprint -- the
+                            // pin's fix (r1's finding).
+                            RECT_PARTITION_HITS.with(|c| c.set(c.get() + 1));
                             decode_inter_block(
                                 &mut dec,
                                 &mut cdfs,
                                 &mut neighbours,
                                 &mut grid,
-                            (r32 as usize * 2 + 1, c32 as usize * 2),
+                                at,
+                                BLOCK,
+                                mi_cols,
+                                mi_rows,
+                                &mut y,
+                                &mut u,
+                                &mut v,
+                                &ref_y,
+                                &ref_u,
+                                &ref_v,
+                                &ref_slots,
+                                &sign_bias_table,
+                                &global_motion,
+                                base_q_idx,
+                                TxbSet::Luma32,
+                                TxbSet::Luma32Inter,
+                                TxbSet::Chroma16,
+                                TX32,
+                                TX16,
+                                &scan32,
+                                &scan16,
+                                3,
+                                allow_high_precision_mv,
+                                force_integer_mv,
+                                interp_fixed,
+                                enable_dual_filter,
+                                tpl_frame.as_ref(),
+                                reference_select,
+                                enable_masked_compound,
+                                enable_interintra_compound,
+                                enable_jnt_comp,
+                                order_hint_bits,
+                                order_hint,
+                                ref_order_hints,
+                                skip_mode_present,
+                                skip_mode_frame,
+                                switchable_motion_mode,
+                                allow_warped_motion,
+                                true,
+                                BLOCK,
+                                SUB,
+                                allow_screen_content_tools,
+                                frame_width as usize,
+                            )?;
+                            decode_inter_block(
+                                &mut dec,
+                                &mut cdfs,
+                                &mut neighbours,
+                                &mut grid,
+                                (r32 as usize * 2 + 1, c32 as usize * 2),
+                                BLOCK,
+                                mi_cols,
+                                mi_rows,
+                                &mut y,
+                                &mut u,
+                                &mut v,
+                                &ref_y,
+                                &ref_u,
+                                &ref_v,
+                                &ref_slots,
+                                &sign_bias_table,
+                                &global_motion,
+                                base_q_idx,
+                                TxbSet::Luma32,
+                                TxbSet::Luma32Inter,
+                                TxbSet::Chroma16,
+                                TX32,
+                                TX16,
+                                &scan32,
+                                &scan16,
+                                3,
+                                allow_high_precision_mv,
+                                force_integer_mv,
+                                interp_fixed,
+                                enable_dual_filter,
+                                tpl_frame.as_ref(),
+                                reference_select,
+                                enable_masked_compound,
+                                enable_interintra_compound,
+                                enable_jnt_comp,
+                                order_hint_bits,
+                                order_hint,
+                                ref_order_hints,
+                                skip_mode_present,
+                                skip_mode_frame,
+                                switchable_motion_mode,
+                                allow_warped_motion,
+                                true,
+                                BLOCK,
+                                SUB,
+                                allow_screen_content_tools,
+                                frame_width as usize,
+                            )?;
+                        }
+                        PARTITION_VERT => {
+                            // lane-rect r2: mirror of PARTITION_HORZ above with
+                            // width/height swapped.
+                            RECT_PARTITION_HITS.with(|c| c.set(c.get() + 1));
+                            decode_inter_block(
+                                &mut dec,
+                                &mut cdfs,
+                                &mut neighbours,
+                                &mut grid,
+                                at,
+                                BLOCK,
+                                mi_cols,
+                                mi_rows,
+                                &mut y,
+                                &mut u,
+                                &mut v,
+                                &ref_y,
+                                &ref_u,
+                                &ref_v,
+                                &ref_slots,
+                                &sign_bias_table,
+                                &global_motion,
+                                base_q_idx,
+                                TxbSet::Luma32,
+                                TxbSet::Luma32Inter,
+                                TxbSet::Chroma16,
+                                TX32,
+                                TX16,
+                                &scan32,
+                                &scan16,
+                                3,
+                                allow_high_precision_mv,
+                                force_integer_mv,
+                                interp_fixed,
+                                enable_dual_filter,
+                                tpl_frame.as_ref(),
+                                reference_select,
+                                enable_masked_compound,
+                                enable_interintra_compound,
+                                enable_jnt_comp,
+                                order_hint_bits,
+                                order_hint,
+                                ref_order_hints,
+                                skip_mode_present,
+                                skip_mode_frame,
+                                switchable_motion_mode,
+                                allow_warped_motion,
+                                true,
+                                SUB,
+                                BLOCK,
+                                allow_screen_content_tools,
+                                frame_width as usize,
+                            )?;
+                            decode_inter_block(
+                                &mut dec,
+                                &mut cdfs,
+                                &mut neighbours,
+                                &mut grid,
+                                (r32 as usize * 2, c32 as usize * 2 + 1),
+                                BLOCK,
+                                mi_cols,
+                                mi_rows,
+                                &mut y,
+                                &mut u,
+                                &mut v,
+                                &ref_y,
+                                &ref_u,
+                                &ref_v,
+                                &ref_slots,
+                                &sign_bias_table,
+                                &global_motion,
+                                base_q_idx,
+                                TxbSet::Luma32,
+                                TxbSet::Luma32Inter,
+                                TxbSet::Chroma16,
+                                TX32,
+                                TX16,
+                                &scan32,
+                                &scan16,
+                                3,
+                                allow_high_precision_mv,
+                                force_integer_mv,
+                                interp_fixed,
+                                enable_dual_filter,
+                                tpl_frame.as_ref(),
+                                reference_select,
+                                enable_masked_compound,
+                                enable_interintra_compound,
+                                enable_jnt_comp,
+                                order_hint_bits,
+                                order_hint,
+                                ref_order_hints,
+                                skip_mode_present,
+                                skip_mode_frame,
+                                switchable_motion_mode,
+                                allow_warped_motion,
+                                true,
+                                SUB,
+                                BLOCK,
+                                allow_screen_content_tools,
+                                frame_width as usize,
+                            )?;
+                        }
+                        PARTITION_HORZ_A => {
+                            // lane-partab r1: two 16x16 squares on top + a true
+                            // 32x16 strip below (libaom decode_partition
+                            // PARTITION_HORZ_A: TL, TR, bottom strip).
+                            PARTAB_HITS.with(|c| c.set(c.get() + 1));
+                            decode_inter_block(
+                                &mut dec,
+                                &mut cdfs,
+                                &mut neighbours,
+                                &mut grid,
+                                at,
                                 SUB,
                                 mi_cols,
                                 mi_rows,
@@ -12932,7 +13726,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                 &ref_v,
                                 &ref_slots,
                                 &sign_bias_table,
-                            &global_motion,
+                                &global_motion,
                                 base_q_idx,
                                 TxbSet::Luma16,
                                 if reduced_tx_set {
@@ -12968,764 +13762,439 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                 allow_screen_content_tools,
                                 frame_width as usize,
                             )?;
-                            if (c32 * 2 + 1) as u32 * SUB_MI < mi_cols {
-                                decode_inter_block(
-                                    &mut dec,
-                                    &mut cdfs,
-                                    &mut neighbours,
-                                    &mut grid,
-                                    (r32 as usize * 2 + 1, c32 as usize * 2 + 1),
-                                    SUB,
-                                    mi_cols,
-                                    mi_rows,
-                                    &mut y,
-                                    &mut u,
-                                    &mut v,
-                                    &ref_y,
-                                    &ref_u,
-                                    &ref_v,
-                                    &ref_slots,
-                                    &sign_bias_table,
-                            &global_motion,
-                                    base_q_idx,
-                                    TxbSet::Luma16,
-                                    if reduced_tx_set {
-                                        TxbSet::Luma16Inter
-                                    } else {
-                                        TxbSet::Luma16InterSet1
-                                    },
-                                    TxbSet::Chroma8,
-                                    TX16,
-                                    TX8,
-                                    &scan16,
-                                    &scan8,
-                                    2,
-                                    allow_high_precision_mv,
-                                    force_integer_mv,
-                                    interp_fixed,
-                                    enable_dual_filter,
-                                    tpl_frame.as_ref(),
-                                    reference_select,
-                                    enable_masked_compound,
-                                    enable_interintra_compound,
-                                    enable_jnt_comp,
-                                    order_hint_bits,
-                                    order_hint,
-                                    ref_order_hints,
-                                    skip_mode_present,
-                                    skip_mode_frame,
-                                    switchable_motion_mode,
-                                    allow_warped_motion,
-                                    false,
-                                    SUB,
-                                    SUB,
-                                    allow_screen_content_tools,
-                                    frame_width as usize,
-                                )?;
-                            }
+                            decode_inter_block(
+                                &mut dec,
+                                &mut cdfs,
+                                &mut neighbours,
+                                &mut grid,
+                                (r32 as usize * 2, c32 as usize * 2 + 1),
+                                SUB,
+                                mi_cols,
+                                mi_rows,
+                                &mut y,
+                                &mut u,
+                                &mut v,
+                                &ref_y,
+                                &ref_u,
+                                &ref_v,
+                                &ref_slots,
+                                &sign_bias_table,
+                                &global_motion,
+                                base_q_idx,
+                                TxbSet::Luma16,
+                                if reduced_tx_set {
+                                    TxbSet::Luma16Inter
+                                } else {
+                                    TxbSet::Luma16InterSet1
+                                },
+                                TxbSet::Chroma8,
+                                TX16,
+                                TX8,
+                                &scan16,
+                                &scan8,
+                                2,
+                                allow_high_precision_mv,
+                                force_integer_mv,
+                                interp_fixed,
+                                enable_dual_filter,
+                                tpl_frame.as_ref(),
+                                reference_select,
+                                enable_masked_compound,
+                                enable_interintra_compound,
+                                enable_jnt_comp,
+                                order_hint_bits,
+                                order_hint,
+                                ref_order_hints,
+                                skip_mode_present,
+                                skip_mode_frame,
+                                switchable_motion_mode,
+                                allow_warped_motion,
+                                false,
+                                SUB,
+                                SUB,
+                                allow_screen_content_tools,
+                                frame_width as usize,
+                            )?;
+                            decode_inter_block(
+                                &mut dec,
+                                &mut cdfs,
+                                &mut neighbours,
+                                &mut grid,
+                                (r32 as usize * 2 + 1, c32 as usize * 2),
+                                BLOCK,
+                                mi_cols,
+                                mi_rows,
+                                &mut y,
+                                &mut u,
+                                &mut v,
+                                &ref_y,
+                                &ref_u,
+                                &ref_v,
+                                &ref_slots,
+                                &sign_bias_table,
+                                &global_motion,
+                                base_q_idx,
+                                TxbSet::Luma32,
+                                TxbSet::Luma32Inter,
+                                TxbSet::Chroma16,
+                                TX32,
+                                TX16,
+                                &scan32,
+                                &scan16,
+                                3,
+                                allow_high_precision_mv,
+                                force_integer_mv,
+                                interp_fixed,
+                                enable_dual_filter,
+                                tpl_frame.as_ref(),
+                                reference_select,
+                                enable_masked_compound,
+                                enable_interintra_compound,
+                                enable_jnt_comp,
+                                order_hint_bits,
+                                order_hint,
+                                ref_order_hints,
+                                skip_mode_present,
+                                skip_mode_frame,
+                                switchable_motion_mode,
+                                allow_warped_motion,
+                                true,
+                                BLOCK,
+                                SUB,
+                                allow_screen_content_tools,
+                                frame_width as usize,
+                            )?;
                         }
-                    }
-                    PARTITION_HORZ => {
-                        // lane-rect r2: two true 32x16 strips. Both read at
-                        // `side=BLOCK` (CDF/size-class selection stays square,
-                        // matching HORZ_B's accepted corner-cut) but bw4/bh4
-                        // (mvstack.rs, `motion_mode_eligible`) now derive from
-                        // `write_w`/`write_h`'s true 32x16 footprint -- the
-                        // pin's fix (r1's finding).
-                        RECT_PARTITION_HITS.with(|c| c.set(c.get() + 1));
-                        decode_inter_block(
-                            &mut dec,
-                            &mut cdfs,
-                            &mut neighbours,
-                            &mut grid,
-                            at,
-                            BLOCK,
-                            mi_cols,
-                            mi_rows,
-                            &mut y,
-                            &mut u,
-                            &mut v,
-                            &ref_y,
-                            &ref_u,
-                            &ref_v,
-                            &ref_slots,
-                            &sign_bias_table,
-                            &global_motion,
-                            base_q_idx,
-                            TxbSet::Luma32,
-                            TxbSet::Luma32Inter,
-                            TxbSet::Chroma16,
-                            TX32,
-                            TX16,
-                            &scan32,
-                            &scan16,
-                            3,
-                            allow_high_precision_mv,
-                            force_integer_mv,
-                            interp_fixed,
-                            enable_dual_filter,
-                            tpl_frame.as_ref(),
-                            reference_select,
-                            enable_masked_compound,
-                            enable_interintra_compound,
-                            enable_jnt_comp,
-                            order_hint_bits,
-                            order_hint,
-                            ref_order_hints,
-                            skip_mode_present,
-                            skip_mode_frame,
-                            switchable_motion_mode,
-                            allow_warped_motion,
-                            true,
-                            BLOCK,
-                            SUB,
-                            allow_screen_content_tools,
-                            frame_width as usize,
-                        )?;
-                        decode_inter_block(
-                            &mut dec,
-                            &mut cdfs,
-                            &mut neighbours,
-                            &mut grid,
-                            (r32 as usize * 2 + 1, c32 as usize * 2),
-                            BLOCK,
-                            mi_cols,
-                            mi_rows,
-                            &mut y,
-                            &mut u,
-                            &mut v,
-                            &ref_y,
-                            &ref_u,
-                            &ref_v,
-                            &ref_slots,
-                            &sign_bias_table,
-                            &global_motion,
-                            base_q_idx,
-                            TxbSet::Luma32,
-                            TxbSet::Luma32Inter,
-                            TxbSet::Chroma16,
-                            TX32,
-                            TX16,
-                            &scan32,
-                            &scan16,
-                            3,
-                            allow_high_precision_mv,
-                            force_integer_mv,
-                            interp_fixed,
-                            enable_dual_filter,
-                            tpl_frame.as_ref(),
-                            reference_select,
-                            enable_masked_compound,
-                            enable_interintra_compound,
-                            enable_jnt_comp,
-                            order_hint_bits,
-                            order_hint,
-                            ref_order_hints,
-                            skip_mode_present,
-                            skip_mode_frame,
-                            switchable_motion_mode,
-                            allow_warped_motion,
-                            true,
-                            BLOCK,
-                            SUB,
-                            allow_screen_content_tools,
-                            frame_width as usize,
-                        )?;
-                    }
-                    PARTITION_VERT => {
-                        // lane-rect r2: mirror of PARTITION_HORZ above with
-                        // width/height swapped.
-                        RECT_PARTITION_HITS.with(|c| c.set(c.get() + 1));
-                        decode_inter_block(
-                            &mut dec,
-                            &mut cdfs,
-                            &mut neighbours,
-                            &mut grid,
-                            at,
-                            BLOCK,
-                            mi_cols,
-                            mi_rows,
-                            &mut y,
-                            &mut u,
-                            &mut v,
-                            &ref_y,
-                            &ref_u,
-                            &ref_v,
-                            &ref_slots,
-                            &sign_bias_table,
-                            &global_motion,
-                            base_q_idx,
-                            TxbSet::Luma32,
-                            TxbSet::Luma32Inter,
-                            TxbSet::Chroma16,
-                            TX32,
-                            TX16,
-                            &scan32,
-                            &scan16,
-                            3,
-                            allow_high_precision_mv,
-                            force_integer_mv,
-                            interp_fixed,
-                            enable_dual_filter,
-                            tpl_frame.as_ref(),
-                            reference_select,
-                            enable_masked_compound,
-                            enable_interintra_compound,
-                            enable_jnt_comp,
-                            order_hint_bits,
-                            order_hint,
-                            ref_order_hints,
-                            skip_mode_present,
-                            skip_mode_frame,
-                            switchable_motion_mode,
-                            allow_warped_motion,
-                            true,
-                            SUB,
-                            BLOCK,
-                            allow_screen_content_tools,
-                            frame_width as usize,
-                        )?;
-                        decode_inter_block(
-                            &mut dec,
-                            &mut cdfs,
-                            &mut neighbours,
-                            &mut grid,
-                            (r32 as usize * 2, c32 as usize * 2 + 1),
-                            BLOCK,
-                            mi_cols,
-                            mi_rows,
-                            &mut y,
-                            &mut u,
-                            &mut v,
-                            &ref_y,
-                            &ref_u,
-                            &ref_v,
-                            &ref_slots,
-                            &sign_bias_table,
-                            &global_motion,
-                            base_q_idx,
-                            TxbSet::Luma32,
-                            TxbSet::Luma32Inter,
-                            TxbSet::Chroma16,
-                            TX32,
-                            TX16,
-                            &scan32,
-                            &scan16,
-                            3,
-                            allow_high_precision_mv,
-                            force_integer_mv,
-                            interp_fixed,
-                            enable_dual_filter,
-                            tpl_frame.as_ref(),
-                            reference_select,
-                            enable_masked_compound,
-                            enable_interintra_compound,
-                            enable_jnt_comp,
-                            order_hint_bits,
-                            order_hint,
-                            ref_order_hints,
-                            skip_mode_present,
-                            skip_mode_frame,
-                            switchable_motion_mode,
-                            allow_warped_motion,
-                            true,
-                            SUB,
-                            BLOCK,
-                            allow_screen_content_tools,
-                            frame_width as usize,
-                        )?;
-                    }
-                    PARTITION_HORZ_A => {
-                        // lane-partab r1: two 16x16 squares on top + a true
-                        // 32x16 strip below (libaom decode_partition
-                        // PARTITION_HORZ_A: TL, TR, bottom strip).
-                        PARTAB_HITS.with(|c| c.set(c.get() + 1));
-                        decode_inter_block(
-                            &mut dec,
-                            &mut cdfs,
-                            &mut neighbours,
-                            &mut grid,
-                            at,
-                            SUB,
-                            mi_cols,
-                            mi_rows,
-                            &mut y,
-                            &mut u,
-                            &mut v,
-                            &ref_y,
-                            &ref_u,
-                            &ref_v,
-                            &ref_slots,
-                            &sign_bias_table,
-                            &global_motion,
-                            base_q_idx,
-                            TxbSet::Luma16,
-                            if reduced_tx_set {
-                                TxbSet::Luma16Inter
-                            } else {
-                                TxbSet::Luma16InterSet1
-                            },
-                            TxbSet::Chroma8,
-                            TX16,
-                            TX8,
-                            &scan16,
-                            &scan8,
-                            2,
-                            allow_high_precision_mv,
-                            force_integer_mv,
-                            interp_fixed,
-                            enable_dual_filter,
-                            tpl_frame.as_ref(),
-                            reference_select,
-                            enable_masked_compound,
-                            enable_interintra_compound,
-                            enable_jnt_comp,
-                            order_hint_bits,
-                            order_hint,
-                            ref_order_hints,
-                            skip_mode_present,
-                            skip_mode_frame,
-                            switchable_motion_mode,
-                            allow_warped_motion,
-                            false,
-                            SUB,
-                            SUB,
-                            allow_screen_content_tools,
-                            frame_width as usize,
-                        )?;
-                        decode_inter_block(
-                            &mut dec,
-                            &mut cdfs,
-                            &mut neighbours,
-                            &mut grid,
-                            (r32 as usize * 2, c32 as usize * 2 + 1),
-                            SUB,
-                            mi_cols,
-                            mi_rows,
-                            &mut y,
-                            &mut u,
-                            &mut v,
-                            &ref_y,
-                            &ref_u,
-                            &ref_v,
-                            &ref_slots,
-                            &sign_bias_table,
-                            &global_motion,
-                            base_q_idx,
-                            TxbSet::Luma16,
-                            if reduced_tx_set {
-                                TxbSet::Luma16Inter
-                            } else {
-                                TxbSet::Luma16InterSet1
-                            },
-                            TxbSet::Chroma8,
-                            TX16,
-                            TX8,
-                            &scan16,
-                            &scan8,
-                            2,
-                            allow_high_precision_mv,
-                            force_integer_mv,
-                            interp_fixed,
-                            enable_dual_filter,
-                            tpl_frame.as_ref(),
-                            reference_select,
-                            enable_masked_compound,
-                            enable_interintra_compound,
-                            enable_jnt_comp,
-                            order_hint_bits,
-                            order_hint,
-                            ref_order_hints,
-                            skip_mode_present,
-                            skip_mode_frame,
-                            switchable_motion_mode,
-                            allow_warped_motion,
-                            false,
-                            SUB,
-                            SUB,
-                            allow_screen_content_tools,
-                            frame_width as usize,
-                        )?;
-                        decode_inter_block(
-                            &mut dec,
-                            &mut cdfs,
-                            &mut neighbours,
-                            &mut grid,
-                            (r32 as usize * 2 + 1, c32 as usize * 2),
-                            BLOCK,
-                            mi_cols,
-                            mi_rows,
-                            &mut y,
-                            &mut u,
-                            &mut v,
-                            &ref_y,
-                            &ref_u,
-                            &ref_v,
-                            &ref_slots,
-                            &sign_bias_table,
-                            &global_motion,
-                            base_q_idx,
-                            TxbSet::Luma32,
-                            TxbSet::Luma32Inter,
-                            TxbSet::Chroma16,
-                            TX32,
-                            TX16,
-                            &scan32,
-                            &scan16,
-                            3,
-                            allow_high_precision_mv,
-                            force_integer_mv,
-                            interp_fixed,
-                            enable_dual_filter,
-                            tpl_frame.as_ref(),
-                            reference_select,
-                            enable_masked_compound,
-                            enable_interintra_compound,
-                            enable_jnt_comp,
-                            order_hint_bits,
-                            order_hint,
-                            ref_order_hints,
-                            skip_mode_present,
-                            skip_mode_frame,
-                            switchable_motion_mode,
-                            allow_warped_motion,
-                            true,
-                            BLOCK,
-                            SUB,
-                            allow_screen_content_tools,
-                            frame_width as usize,
-                        )?;
-                    }
-                    PARTITION_VERT_A => {
-                        // lane-partab r1: mirror of PARTITION_HORZ_A with
-                        // width/height swapped (TL, BL, right 16x32 strip).
-                        PARTAB_HITS.with(|c| c.set(c.get() + 1));
-                        decode_inter_block(
-                            &mut dec,
-                            &mut cdfs,
-                            &mut neighbours,
-                            &mut grid,
-                            at,
-                            SUB,
-                            mi_cols,
-                            mi_rows,
-                            &mut y,
-                            &mut u,
-                            &mut v,
-                            &ref_y,
-                            &ref_u,
-                            &ref_v,
-                            &ref_slots,
-                            &sign_bias_table,
-                            &global_motion,
-                            base_q_idx,
-                            TxbSet::Luma16,
-                            if reduced_tx_set {
-                                TxbSet::Luma16Inter
-                            } else {
-                                TxbSet::Luma16InterSet1
-                            },
-                            TxbSet::Chroma8,
-                            TX16,
-                            TX8,
-                            &scan16,
-                            &scan8,
-                            2,
-                            allow_high_precision_mv,
-                            force_integer_mv,
-                            interp_fixed,
-                            enable_dual_filter,
-                            tpl_frame.as_ref(),
-                            reference_select,
-                            enable_masked_compound,
-                            enable_interintra_compound,
-                            enable_jnt_comp,
-                            order_hint_bits,
-                            order_hint,
-                            ref_order_hints,
-                            skip_mode_present,
-                            skip_mode_frame,
-                            switchable_motion_mode,
-                            allow_warped_motion,
-                            false,
-                            SUB,
-                            SUB,
-                            allow_screen_content_tools,
-                            frame_width as usize,
-                        )?;
-                        decode_inter_block(
-                            &mut dec,
-                            &mut cdfs,
-                            &mut neighbours,
-                            &mut grid,
-                            (r32 as usize * 2 + 1, c32 as usize * 2),
-                            SUB,
-                            mi_cols,
-                            mi_rows,
-                            &mut y,
-                            &mut u,
-                            &mut v,
-                            &ref_y,
-                            &ref_u,
-                            &ref_v,
-                            &ref_slots,
-                            &sign_bias_table,
-                            &global_motion,
-                            base_q_idx,
-                            TxbSet::Luma16,
-                            if reduced_tx_set {
-                                TxbSet::Luma16Inter
-                            } else {
-                                TxbSet::Luma16InterSet1
-                            },
-                            TxbSet::Chroma8,
-                            TX16,
-                            TX8,
-                            &scan16,
-                            &scan8,
-                            2,
-                            allow_high_precision_mv,
-                            force_integer_mv,
-                            interp_fixed,
-                            enable_dual_filter,
-                            tpl_frame.as_ref(),
-                            reference_select,
-                            enable_masked_compound,
-                            enable_interintra_compound,
-                            enable_jnt_comp,
-                            order_hint_bits,
-                            order_hint,
-                            ref_order_hints,
-                            skip_mode_present,
-                            skip_mode_frame,
-                            switchable_motion_mode,
-                            allow_warped_motion,
-                            false,
-                            SUB,
-                            SUB,
-                            allow_screen_content_tools,
-                            frame_width as usize,
-                        )?;
-                        decode_inter_block(
-                            &mut dec,
-                            &mut cdfs,
-                            &mut neighbours,
-                            &mut grid,
-                            (r32 as usize * 2, c32 as usize * 2 + 1),
-                            BLOCK,
-                            mi_cols,
-                            mi_rows,
-                            &mut y,
-                            &mut u,
-                            &mut v,
-                            &ref_y,
-                            &ref_u,
-                            &ref_v,
-                            &ref_slots,
-                            &sign_bias_table,
-                            &global_motion,
-                            base_q_idx,
-                            TxbSet::Luma32,
-                            TxbSet::Luma32Inter,
-                            TxbSet::Chroma16,
-                            TX32,
-                            TX16,
-                            &scan32,
-                            &scan16,
-                            3,
-                            allow_high_precision_mv,
-                            force_integer_mv,
-                            interp_fixed,
-                            enable_dual_filter,
-                            tpl_frame.as_ref(),
-                            reference_select,
-                            enable_masked_compound,
-                            enable_interintra_compound,
-                            enable_jnt_comp,
-                            order_hint_bits,
-                            order_hint,
-                            ref_order_hints,
-                            skip_mode_present,
-                            skip_mode_frame,
-                            switchable_motion_mode,
-                            allow_warped_motion,
-                            true,
-                            SUB,
-                            BLOCK,
-                            allow_screen_content_tools,
-                            frame_width as usize,
-                        )?;
-                    }
-                    PARTITION_VERT_B => {
-                        // lane-partab r1: true 16x32 strip on the left + two
-                        // 16x16 squares on the right (libaom decode_partition
-                        // PARTITION_VERT_B: left strip, TR, BR).
-                        PARTAB_HITS.with(|c| c.set(c.get() + 1));
-                        decode_inter_block(
-                            &mut dec,
-                            &mut cdfs,
-                            &mut neighbours,
-                            &mut grid,
-                            at,
-                            BLOCK,
-                            mi_cols,
-                            mi_rows,
-                            &mut y,
-                            &mut u,
-                            &mut v,
-                            &ref_y,
-                            &ref_u,
-                            &ref_v,
-                            &ref_slots,
-                            &sign_bias_table,
-                            &global_motion,
-                            base_q_idx,
-                            TxbSet::Luma32,
-                            TxbSet::Luma32Inter,
-                            TxbSet::Chroma16,
-                            TX32,
-                            TX16,
-                            &scan32,
-                            &scan16,
-                            3,
-                            allow_high_precision_mv,
-                            force_integer_mv,
-                            interp_fixed,
-                            enable_dual_filter,
-                            tpl_frame.as_ref(),
-                            reference_select,
-                            enable_masked_compound,
-                            enable_interintra_compound,
-                            enable_jnt_comp,
-                            order_hint_bits,
-                            order_hint,
-                            ref_order_hints,
-                            skip_mode_present,
-                            skip_mode_frame,
-                            switchable_motion_mode,
-                            allow_warped_motion,
-                            true,
-                            SUB,
-                            BLOCK,
-                            allow_screen_content_tools,
-                            frame_width as usize,
-                        )?;
-                        decode_inter_block(
-                            &mut dec,
-                            &mut cdfs,
-                            &mut neighbours,
-                            &mut grid,
-                            (r32 as usize * 2, c32 as usize * 2 + 1),
-                            SUB,
-                            mi_cols,
-                            mi_rows,
-                            &mut y,
-                            &mut u,
-                            &mut v,
-                            &ref_y,
-                            &ref_u,
-                            &ref_v,
-                            &ref_slots,
-                            &sign_bias_table,
-                            &global_motion,
-                            base_q_idx,
-                            TxbSet::Luma16,
-                            if reduced_tx_set {
-                                TxbSet::Luma16Inter
-                            } else {
-                                TxbSet::Luma16InterSet1
-                            },
-                            TxbSet::Chroma8,
-                            TX16,
-                            TX8,
-                            &scan16,
-                            &scan8,
-                            2,
-                            allow_high_precision_mv,
-                            force_integer_mv,
-                            interp_fixed,
-                            enable_dual_filter,
-                            tpl_frame.as_ref(),
-                            reference_select,
-                            enable_masked_compound,
-                            enable_interintra_compound,
-                            enable_jnt_comp,
-                            order_hint_bits,
-                            order_hint,
-                            ref_order_hints,
-                            skip_mode_present,
-                            skip_mode_frame,
-                            switchable_motion_mode,
-                            allow_warped_motion,
-                            false,
-                            SUB,
-                            SUB,
-                            allow_screen_content_tools,
-                            frame_width as usize,
-                        )?;
-                        decode_inter_block(
-                            &mut dec,
-                            &mut cdfs,
-                            &mut neighbours,
-                            &mut grid,
-                            (r32 as usize * 2 + 1, c32 as usize * 2 + 1),
-                            SUB,
-                            mi_cols,
-                            mi_rows,
-                            &mut y,
-                            &mut u,
-                            &mut v,
-                            &ref_y,
-                            &ref_u,
-                            &ref_v,
-                            &ref_slots,
-                            &sign_bias_table,
-                            &global_motion,
-                            base_q_idx,
-                            TxbSet::Luma16,
-                            if reduced_tx_set {
-                                TxbSet::Luma16Inter
-                            } else {
-                                TxbSet::Luma16InterSet1
-                            },
-                            TxbSet::Chroma8,
-                            TX16,
-                            TX8,
-                            &scan16,
-                            &scan8,
-                            2,
-                            allow_high_precision_mv,
-                            force_integer_mv,
-                            interp_fixed,
-                            enable_dual_filter,
-                            tpl_frame.as_ref(),
-                            reference_select,
-                            enable_masked_compound,
-                            enable_interintra_compound,
-                            enable_jnt_comp,
-                            order_hint_bits,
-                            order_hint,
-                            ref_order_hints,
-                            skip_mode_present,
-                            skip_mode_frame,
-                            switchable_motion_mode,
-                            allow_warped_motion,
-                            false,
-                            SUB,
-                            SUB,
-                            allow_screen_content_tools,
-                            frame_width as usize,
-                        )?;
-                    }
-                    _ => {
-                        return Err(unsupported(format!(
-                            "an INTER 32x32 partition type this decoder does not code (value={part32})"
-                        )));
+                        PARTITION_VERT_A => {
+                            // lane-partab r1: mirror of PARTITION_HORZ_A with
+                            // width/height swapped (TL, BL, right 16x32 strip).
+                            PARTAB_HITS.with(|c| c.set(c.get() + 1));
+                            decode_inter_block(
+                                &mut dec,
+                                &mut cdfs,
+                                &mut neighbours,
+                                &mut grid,
+                                at,
+                                SUB,
+                                mi_cols,
+                                mi_rows,
+                                &mut y,
+                                &mut u,
+                                &mut v,
+                                &ref_y,
+                                &ref_u,
+                                &ref_v,
+                                &ref_slots,
+                                &sign_bias_table,
+                                &global_motion,
+                                base_q_idx,
+                                TxbSet::Luma16,
+                                if reduced_tx_set {
+                                    TxbSet::Luma16Inter
+                                } else {
+                                    TxbSet::Luma16InterSet1
+                                },
+                                TxbSet::Chroma8,
+                                TX16,
+                                TX8,
+                                &scan16,
+                                &scan8,
+                                2,
+                                allow_high_precision_mv,
+                                force_integer_mv,
+                                interp_fixed,
+                                enable_dual_filter,
+                                tpl_frame.as_ref(),
+                                reference_select,
+                                enable_masked_compound,
+                                enable_interintra_compound,
+                                enable_jnt_comp,
+                                order_hint_bits,
+                                order_hint,
+                                ref_order_hints,
+                                skip_mode_present,
+                                skip_mode_frame,
+                                switchable_motion_mode,
+                                allow_warped_motion,
+                                false,
+                                SUB,
+                                SUB,
+                                allow_screen_content_tools,
+                                frame_width as usize,
+                            )?;
+                            decode_inter_block(
+                                &mut dec,
+                                &mut cdfs,
+                                &mut neighbours,
+                                &mut grid,
+                                (r32 as usize * 2 + 1, c32 as usize * 2),
+                                SUB,
+                                mi_cols,
+                                mi_rows,
+                                &mut y,
+                                &mut u,
+                                &mut v,
+                                &ref_y,
+                                &ref_u,
+                                &ref_v,
+                                &ref_slots,
+                                &sign_bias_table,
+                                &global_motion,
+                                base_q_idx,
+                                TxbSet::Luma16,
+                                if reduced_tx_set {
+                                    TxbSet::Luma16Inter
+                                } else {
+                                    TxbSet::Luma16InterSet1
+                                },
+                                TxbSet::Chroma8,
+                                TX16,
+                                TX8,
+                                &scan16,
+                                &scan8,
+                                2,
+                                allow_high_precision_mv,
+                                force_integer_mv,
+                                interp_fixed,
+                                enable_dual_filter,
+                                tpl_frame.as_ref(),
+                                reference_select,
+                                enable_masked_compound,
+                                enable_interintra_compound,
+                                enable_jnt_comp,
+                                order_hint_bits,
+                                order_hint,
+                                ref_order_hints,
+                                skip_mode_present,
+                                skip_mode_frame,
+                                switchable_motion_mode,
+                                allow_warped_motion,
+                                false,
+                                SUB,
+                                SUB,
+                                allow_screen_content_tools,
+                                frame_width as usize,
+                            )?;
+                            decode_inter_block(
+                                &mut dec,
+                                &mut cdfs,
+                                &mut neighbours,
+                                &mut grid,
+                                (r32 as usize * 2, c32 as usize * 2 + 1),
+                                BLOCK,
+                                mi_cols,
+                                mi_rows,
+                                &mut y,
+                                &mut u,
+                                &mut v,
+                                &ref_y,
+                                &ref_u,
+                                &ref_v,
+                                &ref_slots,
+                                &sign_bias_table,
+                                &global_motion,
+                                base_q_idx,
+                                TxbSet::Luma32,
+                                TxbSet::Luma32Inter,
+                                TxbSet::Chroma16,
+                                TX32,
+                                TX16,
+                                &scan32,
+                                &scan16,
+                                3,
+                                allow_high_precision_mv,
+                                force_integer_mv,
+                                interp_fixed,
+                                enable_dual_filter,
+                                tpl_frame.as_ref(),
+                                reference_select,
+                                enable_masked_compound,
+                                enable_interintra_compound,
+                                enable_jnt_comp,
+                                order_hint_bits,
+                                order_hint,
+                                ref_order_hints,
+                                skip_mode_present,
+                                skip_mode_frame,
+                                switchable_motion_mode,
+                                allow_warped_motion,
+                                true,
+                                SUB,
+                                BLOCK,
+                                allow_screen_content_tools,
+                                frame_width as usize,
+                            )?;
+                        }
+                        PARTITION_VERT_B => {
+                            // lane-partab r1: true 16x32 strip on the left + two
+                            // 16x16 squares on the right (libaom decode_partition
+                            // PARTITION_VERT_B: left strip, TR, BR).
+                            PARTAB_HITS.with(|c| c.set(c.get() + 1));
+                            decode_inter_block(
+                                &mut dec,
+                                &mut cdfs,
+                                &mut neighbours,
+                                &mut grid,
+                                at,
+                                BLOCK,
+                                mi_cols,
+                                mi_rows,
+                                &mut y,
+                                &mut u,
+                                &mut v,
+                                &ref_y,
+                                &ref_u,
+                                &ref_v,
+                                &ref_slots,
+                                &sign_bias_table,
+                                &global_motion,
+                                base_q_idx,
+                                TxbSet::Luma32,
+                                TxbSet::Luma32Inter,
+                                TxbSet::Chroma16,
+                                TX32,
+                                TX16,
+                                &scan32,
+                                &scan16,
+                                3,
+                                allow_high_precision_mv,
+                                force_integer_mv,
+                                interp_fixed,
+                                enable_dual_filter,
+                                tpl_frame.as_ref(),
+                                reference_select,
+                                enable_masked_compound,
+                                enable_interintra_compound,
+                                enable_jnt_comp,
+                                order_hint_bits,
+                                order_hint,
+                                ref_order_hints,
+                                skip_mode_present,
+                                skip_mode_frame,
+                                switchable_motion_mode,
+                                allow_warped_motion,
+                                true,
+                                SUB,
+                                BLOCK,
+                                allow_screen_content_tools,
+                                frame_width as usize,
+                            )?;
+                            decode_inter_block(
+                                &mut dec,
+                                &mut cdfs,
+                                &mut neighbours,
+                                &mut grid,
+                                (r32 as usize * 2, c32 as usize * 2 + 1),
+                                SUB,
+                                mi_cols,
+                                mi_rows,
+                                &mut y,
+                                &mut u,
+                                &mut v,
+                                &ref_y,
+                                &ref_u,
+                                &ref_v,
+                                &ref_slots,
+                                &sign_bias_table,
+                                &global_motion,
+                                base_q_idx,
+                                TxbSet::Luma16,
+                                if reduced_tx_set {
+                                    TxbSet::Luma16Inter
+                                } else {
+                                    TxbSet::Luma16InterSet1
+                                },
+                                TxbSet::Chroma8,
+                                TX16,
+                                TX8,
+                                &scan16,
+                                &scan8,
+                                2,
+                                allow_high_precision_mv,
+                                force_integer_mv,
+                                interp_fixed,
+                                enable_dual_filter,
+                                tpl_frame.as_ref(),
+                                reference_select,
+                                enable_masked_compound,
+                                enable_interintra_compound,
+                                enable_jnt_comp,
+                                order_hint_bits,
+                                order_hint,
+                                ref_order_hints,
+                                skip_mode_present,
+                                skip_mode_frame,
+                                switchable_motion_mode,
+                                allow_warped_motion,
+                                false,
+                                SUB,
+                                SUB,
+                                allow_screen_content_tools,
+                                frame_width as usize,
+                            )?;
+                            decode_inter_block(
+                                &mut dec,
+                                &mut cdfs,
+                                &mut neighbours,
+                                &mut grid,
+                                (r32 as usize * 2 + 1, c32 as usize * 2 + 1),
+                                SUB,
+                                mi_cols,
+                                mi_rows,
+                                &mut y,
+                                &mut u,
+                                &mut v,
+                                &ref_y,
+                                &ref_u,
+                                &ref_v,
+                                &ref_slots,
+                                &sign_bias_table,
+                                &global_motion,
+                                base_q_idx,
+                                TxbSet::Luma16,
+                                if reduced_tx_set {
+                                    TxbSet::Luma16Inter
+                                } else {
+                                    TxbSet::Luma16InterSet1
+                                },
+                                TxbSet::Chroma8,
+                                TX16,
+                                TX8,
+                                &scan16,
+                                &scan8,
+                                2,
+                                allow_high_precision_mv,
+                                force_integer_mv,
+                                interp_fixed,
+                                enable_dual_filter,
+                                tpl_frame.as_ref(),
+                                reference_select,
+                                enable_masked_compound,
+                                enable_interintra_compound,
+                                enable_jnt_comp,
+                                order_hint_bits,
+                                order_hint,
+                                ref_order_hints,
+                                skip_mode_present,
+                                skip_mode_frame,
+                                switchable_motion_mode,
+                                allow_warped_motion,
+                                false,
+                                SUB,
+                                SUB,
+                                allow_screen_content_tools,
+                                frame_width as usize,
+                            )?;
+                        }
+                        _ => {
+                            return Err(unsupported(format!(
+                                "an INTER 32x32 partition type this decoder does not code (value={part32})"
+                            )));
+                        }
                     }
                 }
             }
         }
-    }
 
         if tile_num == tile_info.context_update_tile_id {
             result_cdfs = cdfs;
@@ -13760,7 +14229,16 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     );
     let (deblocked_y, deblocked_u, deblocked_v) = (y.clone(), u.clone(), v.clone());
     apply_cdef(&mut y, &mut u, &mut v, cdef, &neighbours);
-    apply_loop_restoration(&mut y, &mut u, &mut v, &deblocked_y, &deblocked_u, &deblocked_v, lr, &lr_grid);
+    apply_loop_restoration(
+        &mut y,
+        &mut u,
+        &mut v,
+        &deblocked_y,
+        &deblocked_u,
+        &deblocked_v,
+        lr,
+        &lr_grid,
+    );
 
     let motion_field = build_motion_field(
         &grid,
@@ -14139,8 +14617,14 @@ mod tests {
             width,
             height,
             y: out.stdout[..luma].iter().map(|&v| u16::from(v)).collect(),
-            u: out.stdout[luma..luma + chroma].iter().map(|&v| u16::from(v)).collect(),
-            v: out.stdout[luma + chroma..].iter().map(|&v| u16::from(v)).collect(),
+            u: out.stdout[luma..luma + chroma]
+                .iter()
+                .map(|&v| u16::from(v))
+                .collect(),
+            v: out.stdout[luma + chroma..]
+                .iter()
+                .map(|&v| u16::from(v))
+                .collect(),
         }
     }
 
@@ -14186,9 +14670,18 @@ mod tests {
                 Picture {
                     width,
                     height,
-                    y: out.stdout[base..base + luma].iter().map(|&v| u16::from(v)).collect(),
-                    u: out.stdout[base + luma..base + luma + chroma].iter().map(|&v| u16::from(v)).collect(),
-                    v: out.stdout[base + luma + chroma..base + frame_bytes].iter().map(|&v| u16::from(v)).collect(),
+                    y: out.stdout[base..base + luma]
+                        .iter()
+                        .map(|&v| u16::from(v))
+                        .collect(),
+                    u: out.stdout[base + luma..base + luma + chroma]
+                        .iter()
+                        .map(|&v| u16::from(v))
+                        .collect(),
+                    v: out.stdout[base + luma + chroma..base + frame_bytes]
+                        .iter()
+                        .map(|&v| u16::from(v))
+                        .collect(),
                 }
             })
             .collect()

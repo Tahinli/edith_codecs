@@ -273,7 +273,14 @@ fn search_traced_from_step(
         let x_q4 = (block_x as i32) * 16 + mv.1 * Q4_PER_Q3;
         let y_q4 = (block_y as i32) * 16 + mv.0 * Q4_PER_Q3;
         predict(
-            &reference16, stride, ref_width, ref_height, x_q4, y_q4, block_w, block_h,
+            &reference16,
+            stride,
+            ref_width,
+            ref_height,
+            x_q4,
+            y_q4,
+            block_w,
+            block_h,
             &mut dst16,
         );
         let sad: f64 = source

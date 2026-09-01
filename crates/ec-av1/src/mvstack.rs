@@ -1235,8 +1235,16 @@ fn scan_row_compound(
             found = true;
             add_compound_candidate(
                 candidates,
-                if info.is_global_mv0 { gm_mv(gm, ref_frame.0) } else { info.mv },
-                if info.is_global_mv1 { gm_mv(gm, ref_frame.1) } else { info.mv1.unwrap_or((0, 0)) },
+                if info.is_global_mv0 {
+                    gm_mv(gm, ref_frame.0)
+                } else {
+                    info.mv
+                },
+                if info.is_global_mv1 {
+                    gm_mv(gm, ref_frame.1)
+                } else {
+                    info.mv1.unwrap_or((0, 0))
+                },
                 len as u32 * weight,
             );
             *newmv_count += u32::from(info.is_new_mv);
@@ -1292,8 +1300,16 @@ fn scan_col_compound(
             found = true;
             add_compound_candidate(
                 candidates,
-                if info.is_global_mv0 { gm_mv(gm, ref_frame.0) } else { info.mv },
-                if info.is_global_mv1 { gm_mv(gm, ref_frame.1) } else { info.mv1.unwrap_or((0, 0)) },
+                if info.is_global_mv0 {
+                    gm_mv(gm, ref_frame.0)
+                } else {
+                    info.mv
+                },
+                if info.is_global_mv1 {
+                    gm_mv(gm, ref_frame.1)
+                } else {
+                    info.mv1.unwrap_or((0, 0))
+                },
                 len as u32 * weight,
             );
             *newmv_count += u32::from(info.is_new_mv);
@@ -1326,8 +1342,16 @@ fn scan_top_right_compound(
     {
         add_compound_candidate(
             candidates,
-            if info.is_global_mv0 { gm_mv(gm, ref_frame.0) } else { info.mv },
-            if info.is_global_mv1 { gm_mv(gm, ref_frame.1) } else { info.mv1.unwrap_or((0, 0)) },
+            if info.is_global_mv0 {
+                gm_mv(gm, ref_frame.0)
+            } else {
+                info.mv
+            },
+            if info.is_global_mv1 {
+                gm_mv(gm, ref_frame.1)
+            } else {
+                info.mv1.unwrap_or((0, 0))
+            },
             CORNER_WEIGHT,
         );
         *newmv_count += u32::from(info.is_new_mv);
@@ -1356,8 +1380,16 @@ fn scan_corner_compound(
     {
         add_compound_candidate(
             candidates,
-            if info.is_global_mv0 { gm_mv(gm, ref_frame.0) } else { info.mv },
-            if info.is_global_mv1 { gm_mv(gm, ref_frame.1) } else { info.mv1.unwrap_or((0, 0)) },
+            if info.is_global_mv0 {
+                gm_mv(gm, ref_frame.0)
+            } else {
+                info.mv
+            },
+            if info.is_global_mv1 {
+                gm_mv(gm, ref_frame.1)
+            } else {
+                info.mv1.unwrap_or((0, 0))
+            },
             CORNER_WEIGHT,
         );
         *newmv_count += u32::from(info.is_new_mv);
@@ -1876,8 +1908,16 @@ fn ref_ctx(
     b_set: &[i8],
 ) -> usize {
     let refs = [above0, above1, left0, left1];
-    let a = refs.into_iter().flatten().filter(|r| a_set.contains(r)).count();
-    let b = refs.into_iter().flatten().filter(|r| b_set.contains(r)).count();
+    let a = refs
+        .into_iter()
+        .flatten()
+        .filter(|r| a_set.contains(r))
+        .count();
+    let b = refs
+        .into_iter()
+        .flatten()
+        .filter(|r| b_set.contains(r))
+        .count();
     match a.cmp(&b) {
         std::cmp::Ordering::Less => 0,
         std::cmp::Ordering::Equal => 1,
@@ -1953,7 +1993,14 @@ pub(crate) fn single_ref_p5_ctx(
     left0: Option<i8>,
     left1: Option<i8>,
 ) -> usize {
-    ref_ctx(above0, above1, left0, left1, &[LAST3_FRAME], &[GOLDEN_FRAME])
+    ref_ctx(
+        above0,
+        above1,
+        left0,
+        left1,
+        &[LAST3_FRAME],
+        &[GOLDEN_FRAME],
+    )
 }
 
 /// `av1_get_pred_context_single_ref_p6`
@@ -1964,7 +2011,14 @@ pub(crate) fn single_ref_p6_ctx(
     left0: Option<i8>,
     left1: Option<i8>,
 ) -> usize {
-    ref_ctx(above0, above1, left0, left1, &[BWDREF_FRAME], &[ALTREF2_FRAME])
+    ref_ctx(
+        above0,
+        above1,
+        left0,
+        left1,
+        &[BWDREF_FRAME],
+        &[ALTREF2_FRAME],
+    )
 }
 
 /// `av1_get_pred_context_uni_comp_ref_p1`: `LAST2` vs. `LAST3`/`GOLDEN`,
@@ -2658,7 +2712,19 @@ mod tests {
         let (mv0, mv1) = ((2, 2), (-6, 3));
         grid.set(2, 1, comp_inter(mv0, mv1));
 
-        let stack = find_mv_stack_compound(&grid, 2, 2, 2, 2, COMP_PAIR, 8, 8, &NO_SIGN_BIAS, &NO_GM_MV, None);
+        let stack = find_mv_stack_compound(
+            &grid,
+            2,
+            2,
+            2,
+            2,
+            COMP_PAIR,
+            8,
+            8,
+            &NO_SIGN_BIAS,
+            &NO_GM_MV,
+            None,
+        );
 
         // The exact-pair immediate scan lands one boosted entry; the
         // compound extension pass (short stack, len < MAX_MV_REF_CANDIDATES)
@@ -2682,7 +2748,19 @@ mod tests {
         grid.set(2, 1, comp_inter(mv0, mv1));
         grid.set(3, 1, comp_inter(mv0, mv1));
 
-        let stack = find_mv_stack_compound(&grid, 2, 2, 2, 2, COMP_PAIR, 8, 8, &NO_SIGN_BIAS, &NO_GM_MV, None);
+        let stack = find_mv_stack_compound(
+            &grid,
+            2,
+            2,
+            2,
+            2,
+            COMP_PAIR,
+            8,
+            8,
+            &NO_SIGN_BIAS,
+            &NO_GM_MV,
+            None,
+        );
 
         // Exact libaom `is_dup` port: with exactly one entry already in the
         // stack (the four identical-pair neighbours deduped by the
@@ -2714,7 +2792,19 @@ mod tests {
         grid.set(4, 2, comp_inter(left.0, left.1));
         grid.set(5, 2, comp_inter(left.0, left.1));
 
-        let stack = find_mv_stack_compound(&grid, 3, 3, 2, 3, COMP_PAIR, 8, 8, &NO_SIGN_BIAS, &NO_GM_MV, None);
+        let stack = find_mv_stack_compound(
+            &grid,
+            3,
+            3,
+            2,
+            3,
+            COMP_PAIR,
+            8,
+            8,
+            &NO_SIGN_BIAS,
+            &NO_GM_MV,
+            None,
+        );
 
         assert_eq!(stack.entries.len(), 2);
         assert_eq!(stack.entries[0].mv0, left.0);
@@ -2803,7 +2893,19 @@ mod tests {
             },
         );
 
-        let stack = find_mv_stack_compound(&grid, 2, 2, 2, 2, COMP_PAIR, 8, 8, &NO_SIGN_BIAS, &NO_GM_MV, None);
+        let stack = find_mv_stack_compound(
+            &grid,
+            2,
+            2,
+            2,
+            2,
+            COMP_PAIR,
+            8,
+            8,
+            &NO_SIGN_BIAS,
+            &NO_GM_MV,
+            None,
+        );
 
         // The combine step (libaom's real "Handle compound reference frame
         // extension") zips each side's ref_id-then-ref_diff lists
