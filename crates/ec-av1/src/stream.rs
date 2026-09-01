@@ -1982,6 +1982,189 @@ mod tests {
         assert_eq!(frames[0].v, ffmpeg_frames[0].v, "V vs ffmpeg (10-bit)");
     }
 
+    /// The 10-bit *inter* counterpart of the gate above: a real `aomenc`
+    /// `yuv420p10le` sequence whose non-key frames are plain forward
+    /// single-`LAST_FRAME` P frames (same `--lag-in-frames=0
+    /// --auto-alt-ref=0 --error-resilient=1` shape as the 8-bit inter gate),
+    /// decoded pixel-exact on every frame. 10-bit intra was proven exact by
+    /// lane-hbd; inter reconstruction at `bit_depth == 10` was never gated.
+    #[test]
+    fn a_real_aomenc_10bit_inter_sequence_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_10bit_inter_sequence_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height, frame_count) = (128usize, 64usize, 16usize);
+        let y4m = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                &gradients_source(42, width, height, "duration=0.64:rate=25"),
+                "-pix_fmt",
+                "yuv420p10le",
+                "-strict",
+                "-1",
+                "-t",
+                "0.64",
+                "-f",
+                "yuv4mpegpipe",
+                "-",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ffmpeg failed to run");
+        assert!(
+            y4m.status.success(),
+            "ffmpeg failed to render the 10-bit fixture: {}",
+            String::from_utf8_lossy(&y4m.stderr)
+        );
+        let mut child = Command::new(aomenc_path())
+            .args([
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                "--cq-level=15",
+                "--cpu-used=0",
+                "--threads=1",
+                "--row-mt=0",
+                "--sb-size=64",
+                "--input-bit-depth=10",
+                "--bit-depth=10",
+                "--lag-in-frames=0",
+                "--auto-alt-ref=0",
+                "--kf-max-dist=1000",
+                "--error-resilient=1",
+                "--aq-mode=0",
+                "--deltaq-mode=0",
+                "--enable-rect-partitions=0",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0",
+                "--enable-filter-intra=0",
+                "--enable-smooth-intra=0",
+                "--enable-paeth-intra=0",
+                "--enable-directional-intra=0",
+                "--enable-angle-delta=0",
+                "--enable-tx-size-search=0",
+                "--enable-cdef=1",
+                "--enable-restoration=1",
+                "--min-partition-size=16",
+                "--max-partition-size=32",
+                "--enable-palette=0",
+                "--enable-intrabc=0",
+                "--enable-cfl-intra=0",
+                "--enable-ref-frame-mvs=0",
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("aomenc failed to start");
+        child
+            .stdin
+            .take()
+            .expect("aomenc stdin")
+            .write_all(&y4m.stdout)
+            .expect("writing y4m to aomenc");
+        let out = child.wait_with_output().expect("aomenc failed to run");
+        assert!(
+            out.status.success(),
+            "aomenc refused the 10-bit fixture: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stream = out.stdout;
+        if let Ok(dump) = std::env::var("EC_AV1_GATE_DUMP") {
+            std::fs::write(dump, &stream).expect("dump stream");
+        }
+        let mut probe = Av1Parser::new();
+        let mut pos = 0usize;
+        while pos < stream.len() && probe.sequence_header().is_none() {
+            let obu = probe.parse_obu(&stream[pos..]).unwrap();
+            pos += obu.total_size;
+        }
+        assert_eq!(
+            probe
+                .sequence_header()
+                .expect("stream has a sequence header OBU")
+                .color_config
+                .bit_depth,
+            10,
+            "{NAME}: aomenc did not actually write a 10-bit sequence header"
+        );
+        let before_deblock = decode::deblock_hits();
+        let before_inter = decode::inter_pred_hits();
+        let before_lr = crate::restoration::wiener_hits()
+            + crate::restoration::sgrproj_hits()
+            + crate::restoration::switchable_hits();
+        let frames = match decode_stream(&stream) {
+            Ok(frames) => frames,
+            Err(e) => panic!("{NAME}: decode_stream refused a real 10-bit inter stream: {e}"),
+        };
+        assert!(
+            decode::inter_pred_hits() > before_inter,
+            "{NAME}: no inter-predicted block decoded -- the gate proves nothing"
+        );
+        assert!(
+            decode::deblock_hits() > before_deblock,
+            "{NAME}: no deblocking edge fired -- raise cq-level"
+        );
+        // Loop restoration is where the 10-bit inter/intra defect lived
+        // (lane-hbdinter r1: the self-guided box sums were never brought back
+        // to the 8-bit scale, `restoration.c:660`); a recipe whose RD happened
+        // to pick RESTORE_NONE would pass while proving nothing.
+        assert!(
+            crate::restoration::wiener_hits()
+                + crate::restoration::sgrproj_hits()
+                + crate::restoration::switchable_hits()
+                > before_lr,
+            "{NAME}: no loop-restoration unit decoded a real filter -- lower cq-level"
+        );
+        eprintln!(
+            "{NAME}: inter_pred {} deblock {} cdef_idx {} wiener {} sgrproj {}",
+            decode::inter_pred_hits() - before_inter,
+            decode::deblock_hits() - before_deblock,
+            decode::cdef_idx_hits(),
+            crate::restoration::wiener_hits(),
+            crate::restoration::sgrproj_hits(),
+        );
+        assert_eq!(frames.len(), frame_count);
+        let ffmpeg_frames = ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count);
+        for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+            if got.y != want.y || got.u != want.u || got.v != want.v {
+                let pin = std::env::temp_dir().join("ec-av1-10bit-inter-gate-fail.obu");
+                let _ = std::fs::write(&pin, &stream);
+                let first = |a: &Vec<u16>, b: &Vec<u16>| {
+                    a.iter()
+                        .zip(b)
+                        .enumerate()
+                        .find(|(_, (x, y))| x != y)
+                        .map(|(k, (x, y))| (k, *x, *y))
+                };
+                panic!(
+                    "{NAME}: frame {i} mismatch vs ffmpeg -- Y {:?} U {:?} V {:?}; stream pinned at {}",
+                    first(&got.y, &want.y),
+                    first(&got.u, &want.u),
+                    first(&got.v, &want.v),
+                    pin.display()
+                );
+            }
+        }
+    }
+
     /// lane-hbd10 r1: a real `aomenc --bit-depth=10 --film-grain-test=1`
     /// stream, decoded pixel-exact against ffmpeg's own 10-bit decode of the
     /// identical bytes (ffmpeg synthesizes grain by default -- no
