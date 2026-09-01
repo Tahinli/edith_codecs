@@ -47,7 +47,7 @@ const REFUSALS: &[&str] = &[
     "a superblock-level HORZ/VERT strip with a split transform (per-unit rect prediction is not ported)",
     "a tx_type symbol outside its CDF's own set: {t}",
     "an INTER 32x32 partition type this decoder does not code (value={part32})",
-    "a superblock-level 1:4 partition (PARTITION_HORZ_4/VERT_4 at 64x64, four 64x16/16x64 strips)",
+    "a superblock-level partition value outside PARTITION_NONE..PARTITION_VERT_4",
     "a HORZ/VERT intra strip in a screen-content frame (palette syntax is consumed for square blocks only)",
     "a block that actually uses a palette (UV) -- reconstruction is out of scope",
     "a block that actually uses a palette (Y) -- reconstruction is out of scope",
