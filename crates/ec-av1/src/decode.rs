@@ -730,6 +730,19 @@ pub(crate) fn rect_partition_hits() -> usize {
     RECT_PARTITION_HITS.with(|c| c.get())
 }
 
+// lane-inter8 r1: how many superblocks an inter tile coded as a single
+// whole-SB `PARTITION_NONE` 64x64 inter block (the case aomenc picks for
+// static content, previously a named refusal).
+thread_local! {
+    static INTER_SB_NONE_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`INTER_SB_NONE_HITS`].
+pub(crate) fn inter_sb_none_hits() -> usize {
+    INTER_SB_NONE_HITS.with(|c| c.get())
+}
+
 // lane-rectwire r2: how many `PARTITION_HORZ`/`VERT` strips actually decoded
 // real (non-skip) coefficients through [`read_coeffs_rect`] -- proves the
 // rect coefficient reader itself fired, not just the strip-level partition
@@ -7779,6 +7792,23 @@ fn read_inter_plane(
         default_tx_type,
         None,
     )?;
+    // lane-inter8 r1: a 64-point transform covers the whole 64x64 area but
+    // codes only its top-left 32x32 of frequencies (spec 5.11.40) -- the
+    // caller hands the 32-point `scan` there, and the coded corner goes into
+    // the top-left of the true `side`-sized grid before dequantization
+    // (dqDenom is keyed by the true size, not the corner's), mirroring
+    // [`read_plane`]'s own `tx_side != side` branch. Every other transform
+    // this decoder codes has `tx_side == side`, so this is inert below 64.
+    let tx_side = side.min(32);
+    let grid = if tx_side == side {
+        grid
+    } else {
+        let mut full = vec![0i32; side * side];
+        for row in 0..tx_side {
+            full[row * side..][..tx_side].copy_from_slice(&grid[row * tx_side..][..tx_side]);
+        }
+        full
+    };
     let (dc_delta, ac_delta) = plane_q_delta(plane_idx);
     let residual = dequant_and_inverse_typed(&grid, side, bit_depth(), CURRENT_Q_IDX.with(|c| c.get()), dc_delta, ac_delta, tx_type);
     plane.reconstruct_mc(x, y, side, prediction, &residual);
@@ -9120,7 +9150,17 @@ fn decode_inter_block(
                     8 => 3,
                     16 => 6,
                     32 => 9,
-                    _ => unreachable!("decode_inter_block leaf side is 8/16/32"),
+                    // lane-inter8 r1: `av1_is_wedge_used` is false at 64x64
+                    // (`av1_wedge_params_lookup[BLOCK_64X64].wedge_types ==
+                    // 0`), so a real encoder writes NO `compound_type` symbol
+                    // there -- COMPOUND_DIFFWTD is inferred. Reading one
+                    // would desync, so refuse by name rather than guess the
+                    // inferred-DIFFWTD blend this round.
+                    _ => {
+                        return Err(unsupported(
+                            "a masked compound 64x64 inter block (compound_type is inferred, not coded, at this size)",
+                        ))
+                    }
                 };
                 let compound_type = dec.symbol(&mut cdfs.compound_type[wedge_bsize]);
                 if compound_type == 0 {
@@ -12085,10 +12125,72 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                 }
                 (false, false) => PARTITION_SPLIT,
             };
+            if part64 == PARTITION_NONE {
+                // lane-inter8 r1: the whole superblock as one 64x64 inter
+                // block. `SB`-sized syntax throughout (size_group 3, same as
+                // 32x32 -- `size_group_lookup[BLOCK_64X64] == 3`), luma
+                // coefficients through `TxbSet::Luma64` with the 32-point
+                // scan (TX_64X64 codes only its top-left corner, spec
+                // 5.11.40 -- `read_inter_plane` widens the corner back to
+                // 64x64 before the inverse transform), chroma as a plain
+                // 32x32 `TxbSet::Chroma32`. TX_64X64 carries no `tx_type`
+                // symbol at all, so the intra/inter luma sets coincide.
+                INTER_SB_NONE_HITS.with(|c| c.set(c.get() + 1));
+                decode_inter_block(
+                    &mut dec,
+                    &mut cdfs,
+                    &mut neighbours,
+                    &mut grid,
+                    sb_at,
+                    SB,
+                    mi_cols,
+                    mi_rows,
+                    &mut y,
+                    &mut u,
+                    &mut v,
+                    &ref_y,
+                    &ref_u,
+                    &ref_v,
+                    &ref_slots,
+                    &sign_bias_table,
+                    &global_motion,
+                    base_q_idx,
+                    TxbSet::Luma64,
+                    TxbSet::Luma64,
+                    TxbSet::Chroma32,
+                    TX32,
+                    TX32,
+                    &scan32,
+                    &scan32,
+                    3,
+                    allow_high_precision_mv,
+                    force_integer_mv,
+                    interp_fixed,
+                    enable_dual_filter,
+                    tpl_frame.as_ref(),
+                    reference_select,
+                    enable_masked_compound,
+                    enable_interintra_compound,
+                    enable_jnt_comp,
+                    order_hint_bits,
+                    order_hint,
+                    ref_order_hints,
+                    skip_mode_present,
+                    skip_mode_frame,
+                    switchable_motion_mode,
+                    allow_warped_motion,
+                    false,
+                    SB,
+                    SB,
+                    allow_screen_content_tools,
+                    frame_width as usize,
+                )?;
+                continue;
+            }
             if part64 != PARTITION_SPLIT {
                 return Err(unsupported(
-                    "an inter SB-level partition type other than SPLIT (this decoder's \
-                     inter tile path only recurses a superblock as SPLIT)",
+                    "an inter SB-level partition type other than NONE or SPLIT (this decoder's \
+                     inter tile path recurses a superblock only as SPLIT)",
                 ));
             }
 
