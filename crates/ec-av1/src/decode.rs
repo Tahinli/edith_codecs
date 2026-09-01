@@ -8198,6 +8198,16 @@ fn obmc_mask(len: usize) -> &'static [u8] {
 /// excluded by [`overlappable_above`]/[`overlappable_left`]'s `is_inter`
 /// gate) or when `interp_fixed` is `Some` for the whole frame, handled here
 /// first.
+/// lane-gmaffine r2: prefer the mi-granular filter record, fall back to the
+/// coarse 16px `Neighbours` slot when this block's path never recorded one.
+fn grid_or_slot(mi_filter: [u8; 2], slot: [u8; 2]) -> [u8; 2] {
+    if mi_filter[0] <= 2 && mi_filter[1] <= 2 {
+        mi_filter
+    } else {
+        slot
+    }
+}
+
 fn neighbour_filter(
     interp_fixed: Option<mc::InterpFilterKind>,
     sym: [u8; 2],
@@ -8415,6 +8425,14 @@ fn obmc_blend(
     };
     let overlap_above = write_h / 2;
     let overlap_left = write_w / 2;
+    // lane-gmaffine r2 (libaom `av1_skip_u4x4_pred_in_obmc`, reconinter.c:820,
+    // `DISABLE_CHROMA_U8X8_OBMC 0`): when the block's CHROMA plane size is
+    // BLOCK_4X4/4X8/8X4 -- i.e. a luma dimension below 16 under 4:2:0 -- obmc
+    // is ONE-SIDED on chroma: the above pass (dir==0) skips U/V entirely, the
+    // left pass (dir==1) still blends them. Blending chroma on both passes is
+    // exactly the residual that left the 8x8-leaf obmc gate's V plane off by
+    // ~2 (r1); luma is unaffected at every size.
+    let chroma_above = write_w >= 16 && write_h >= 16;
 
     for (off4, span4, nb) in overlappable_above(grid, mi_row, mi_col, bw4, mi_cols, max_nb(bw4))
     {
@@ -8422,25 +8440,40 @@ fn obmc_blend(
         // (this decoder's own outer block-loop granularity), one step
         // coarser than the mi(4px) units `overlappable_above` walks in --
         // divide back down to that column.
+        // lane-gmaffine r2: the neighbour's OWN mi-granular filter
+        // (libaom `av1_setup_build_prediction_by_above_pred` reads
+        // `above_mbmi->interp_filters`); the 16px-granular `Neighbours` slot
+        // stays as the fallback for paths that do not record one yet
+        // (compound), which is what every earlier round used.
         let (h_kind, v_kind) = neighbour_filter(
             interp_fixed,
-            neighbours.above_filter[(mi_col + off4) / SUB_MI as usize],
+            grid_or_slot(
+                grid.filter(mi_row.wrapping_sub(1), mi_col + off4),
+                neighbours.above_filter[(mi_col + off4) / SUB_MI as usize],
+            ),
         );
         let (ny, nu, nv) = ref_planes(nb.ref_frame, ref_y, ref_u, ref_v, other_refs)?;
         let (bw, bh, ox) = (span4 * 4, overlap_above, off4 * 4);
         let tmp_y = obmc_neighbour_pred(ny, px + ox, py, nb.mv, bw, bh, true, h_kind, v_kind);
         obmc_blend_v(pred_y, side, ox, 0, bw, bh, &tmp_y);
-        let (cbw, cbh, cox) = (bw / 2, overlap_above / 2, ox / 2);
-        let tmp_u = obmc_neighbour_pred(nu, cpx + cox, cpy, nb.mv, cbw, cbh, false, h_kind, v_kind);
-        obmc_blend_v(pred_u, chroma_side, cox, 0, cbw, cbh, &tmp_u);
-        let tmp_v = obmc_neighbour_pred(nv, cpx + cox, cpy, nb.mv, cbw, cbh, false, h_kind, v_kind);
-        obmc_blend_v(pred_v, chroma_side, cox, 0, cbw, cbh, &tmp_v);
+        if chroma_above {
+            let (cbw, cbh, cox) = (bw / 2, overlap_above / 2, ox / 2);
+            let tmp_u =
+                obmc_neighbour_pred(nu, cpx + cox, cpy, nb.mv, cbw, cbh, false, h_kind, v_kind);
+            obmc_blend_v(pred_u, chroma_side, cox, 0, cbw, cbh, &tmp_u);
+            let tmp_v =
+                obmc_neighbour_pred(nv, cpx + cox, cpy, nb.mv, cbw, cbh, false, h_kind, v_kind);
+            obmc_blend_v(pred_v, chroma_side, cox, 0, cbw, cbh, &tmp_v);
+        }
     }
 
     for (off4, span4, nb) in overlappable_left(grid, mi_row, mi_col, bh4, mi_rows, max_nb(bh4)) {
         let (h_kind, v_kind) = neighbour_filter(
             interp_fixed,
-            neighbours.left_filter[(mi_row + off4) / SUB_MI as usize],
+            grid_or_slot(
+                grid.filter(mi_row + off4, mi_col.wrapping_sub(1)),
+                neighbours.left_filter[(mi_row + off4) / SUB_MI as usize],
+            ),
         );
         let (ny, nu, nv) = ref_planes(nb.ref_frame, ref_y, ref_u, ref_v, other_refs)?;
         let (bw, bh, oy) = (overlap_left, span4 * 4, off4 * 4);
@@ -10103,6 +10136,9 @@ fn decode_inter_block(
             // a square `bw4`x`bw4` guess.
             for dr in 0..bh4 {
                 for dc in 0..bw4 {
+                    // lane-gmaffine r2: mi-granular filter record for OBMC
+                    // neighbour prediction (see `MiGrid::filters`).
+                    grid.set_filter(mi_row + dr, mi_col + dc, block_filter);
                     grid.set(
                         mi_row + dr,
                         mi_col + dc,
@@ -10746,8 +10782,18 @@ fn decode_inter_block8(
     // `BLOCK_8X8` (this leaf's fixed size) is always `av1_allow_palette`-
     // eligible (`bsize >= BLOCK_8X8`).
     allow_screen_content_tools: bool,
-) -> Result<(bool, bool, bool, Option<(i8, i8, u8, u8)>)> {
+) -> Result<(bool, bool, bool, Option<(i8, i8, u8, u8)>, [u8; 2], i8)> {
     const LAST_FRAME: i8 = 1;
+    // lane-gmaffine r2: the leaf's OWN switchable-filter symbols and reference,
+    // handed back so the caller records them in `Neighbours` instead of the
+    // `[3, 3]` / hardcoded-LAST_FRAME placeholders r1 left there. `[3, 3]` is
+    // the "intra neighbour, no filter" sentinel: an OBMC blend that picks such
+    // a neighbour up feeds it to `neighbour_filter`, which PANICS on it
+    // (`from_switchable_symbol`) -- that was the warp gate's crash, not an
+    // entropy desync. Stays `[3, 3]`/-1 on the intra and compound paths, which
+    // is what the caller already recorded for them.
+    let mut leaf_filter_syms = [3u8; 2];
+    let mut leaf_ref: i8 = -1;
     /// `Y_MODE`'s size group (`common_data.h`'s `size_group_lookup[BLOCK_8X8]`).
     const SIZE_GROUP_8: usize = 1;
 
@@ -11199,7 +11245,7 @@ fn decode_inter_block8(
                     )?
                     .0;
                 }
-                return Ok((skip, is_inter, skip_mode, compound_ctx8));
+                return Ok((skip, is_inter, skip_mode, compound_ctx8, leaf_filter_syms, leaf_ref));
             }
         }
         // lane-gmaffine r1: the leaf reads the FULL `single_ref` tree
@@ -11450,7 +11496,7 @@ fn decode_inter_block8(
         };
         let gm_nontrans =
             is_globalmv && gm_ref.model != ec_av1_syntax::WarpModel::Translation;
-        let (h_filter, v_filter, _resolved_filter) = resolve_interp_filter(
+        let (h_filter, v_filter, resolved_filter) = resolve_interp_filter(
             dec,
             cdfs,
             interp_fixed,
@@ -11460,6 +11506,16 @@ fn decode_inter_block8(
             left_filter_ctx,
             false,
         );
+        leaf_filter_syms = resolved_filter;
+        leaf_ref = ref_frame;
+        // lane-gmaffine r2: mi-granular filter record -- a sibling 8x8 leaf
+        // OBMC-blends this one before the enclosing 16x16's coarse
+        // `Neighbours` slot is ever written.
+        for dr in 0..2 {
+            for dc in 0..2 {
+                grid.set_filter(leaf_mi.0 + dr, leaf_mi.1 + dc, resolved_filter);
+            }
+        }
 
         // lane-gmaffine r1: `allow_warp`'s `global_warp_allowed` branch
         // (`reconinter.c:33-55`), gated INDEPENDENTLY of `motion_mode` --
@@ -11847,8 +11903,20 @@ fn decode_inter_block8(
         }
     }
     neighbours.record_mi(leaf_mi, 8, &[luma_grid, u_grid, v_grid]);
-    neighbours.fill_lf_grid(leaf_mi, 2, 8, if is_inter { LAST_FRAME } else { 0 });
-    Ok((skip, is_inter, skip_mode, compound_ctx8))
+    // lane-gmaffine r2: the deblock grid's ref id is the leaf's OWN reference
+    // (r1 taught this leaf non-LAST refs; the hardcoded LAST_FRAME made every
+    // GOLDEN/ALTREF leaf read as LAST at the loop-filter's ref/mv edge test).
+    neighbours.fill_lf_grid(
+        leaf_mi,
+        2,
+        8,
+        if is_inter {
+            if leaf_ref > 0 { leaf_ref } else { LAST_FRAME }
+        } else {
+            0
+        },
+    );
+    Ok((skip, is_inter, skip_mode, compound_ctx8, leaf_filter_syms, leaf_ref))
 }
 
 /// Decodes the payload [`crate::tile::sb_coeff_inter_frame_tile`] writes,
@@ -12451,6 +12519,8 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                 let mut prev_leaf: Option<((usize, usize), bool, bool)> = None;
                                 let mut last_compound_ctx: Option<(i8, i8, u8, u8)> = None;
                                 let mut last_skip_mode = false;
+                                let mut last_filter = [3u8; 2];
+                                let mut last_ref: i8 = -1;
                                 for (mr, mc) in leaf_positions {
                                     let leaf_mi = (mr as usize, mc as usize);
                                     let leaf_ctx = neighbours.partition_ctx_mi(leaf_mi, 8);
@@ -12460,8 +12530,14 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                             "a partition below 8x8 (this decoder codes no leaf smaller than 8x8)",
                                         ));
                                     }
-                                    let (skip, is_inter, skip_mode_leaf, compound_ctx8) =
-                                        decode_inter_block8(
+                                    let (
+                                        skip,
+                                        is_inter,
+                                        skip_mode_leaf,
+                                        compound_ctx8,
+                                        leaf_filter,
+                                        leaf_ref,
+                                    ) = decode_inter_block8(
                                             &mut dec,
                                             &mut cdfs,
                                             &mut neighbours,
@@ -12502,29 +12578,53 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                         )?;
                                     prev_leaf = Some((leaf_mi, skip, is_inter));
                                     last_skip_mode = skip_mode_leaf;
+                                    // lane-gmaffine r2: keep the last INTER
+                                    // leaf's own filter/ref for the coarse
+                                    // 16px-wide `Neighbours` slot (see below).
+                                    // Intra leaves must not overwrite it: the
+                                    // slot is shared by all four, and an OBMC
+                                    // neighbour is chosen at mi granularity, so
+                                    // an intra LAST leaf would hand `[3, 3]` to
+                                    // `neighbour_filter` for an inter sibling.
+                                    if leaf_ref > 0 {
+                                        last_filter = leaf_filter;
+                                        last_ref = leaf_ref;
+                                    }
                                     if compound_ctx8.is_some() {
                                         last_compound_ctx = compound_ctx8;
                                     }
                                 }
                                 if let Some((_, skip, is_inter)) = prev_leaf {
-                                    // corner-cut: `decode_inter_block8`'s
-                                    // leaves never read a switchable filter
-                                    // (round-3 GLOBALMV refusal already
-                                    // bounds them away from the Regular-only
-                                    // gap this round closes elsewhere); `[3,
-                                    // 3]` is "no info", the same value an
-                                    // intra neighbour records. Upgrade:
-                                    // thread `interp_fixed`/`enable_dual_filter`
-                                    // into `decode_inter_block8` once a
-                                    // straddling 8x8 SWITCHABLE stream is on
-                                    // hand to pin against.
+                                    // lane-gmaffine r2: record the LAST leaf's
+                                    // real switchable-filter symbols and its
+                                    // real reference. r1 recorded `[3, 3]` (the
+                                    // "intra neighbour" sentinel) and a
+                                    // hardcoded LAST_FRAME here; `[3, 3]` made
+                                    // `obmc_blend`'s `neighbour_filter` PANIC
+                                    // the moment a later block OBMC-blended one
+                                    // of these leaves, and the fake ref
+                                    // corrupted the next block's
+                                    // switchable_interp / ref contexts.
+                                    // corner-cut: `Neighbours` is 16px-granular,
+                                    // so all four leaves collapse into one slot
+                                    // (the last one wins). Ceiling: siblings
+                                    // that choose DIFFERENT filters or refs give
+                                    // the next block one leaf's context instead
+                                    // of the bordering one's. Upgrade: mi-
+                                    // granular above_filter/above_ref arrays.
                                     neighbours.record_inter(
                                         at16,
                                         SUB,
                                         skip,
                                         is_inter,
-                                        if is_inter { LAST_FRAME } else { -1 },
-                                        [3, 3],
+                                        if !is_inter {
+                                            -1
+                                        } else if last_ref > 0 {
+                                            last_ref
+                                        } else {
+                                            LAST_FRAME
+                                        },
+                                        last_filter,
                                         last_skip_mode,
                                     );
                                     if let Some((ref0, ref1, group_idx, idx)) = last_compound_ctx {
@@ -12640,6 +12740,8 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                 let mut prev_leaf: Option<((usize, usize), bool, bool)> = None;
                                 let mut last_compound_ctx: Option<(i8, i8, u8, u8)> = None;
                                 let mut last_skip_mode = false;
+                                let mut last_filter = [3u8; 2];
+                                let mut last_ref: i8 = -1;
                                 for (mr, mc) in leaf_positions {
                                     let leaf_mi = (mr as usize, mc as usize);
                                     let leaf_ctx = neighbours.partition_ctx_mi(leaf_mi, 8);
@@ -12649,8 +12751,14 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                             "a partition below 8x8 (this decoder codes no leaf smaller than 8x8)",
                                         ));
                                     }
-                                    let (skip, is_inter, skip_mode_leaf, compound_ctx8) =
-                                        decode_inter_block8(
+                                    let (
+                                        skip,
+                                        is_inter,
+                                        skip_mode_leaf,
+                                        compound_ctx8,
+                                        leaf_filter,
+                                        leaf_ref,
+                                    ) = decode_inter_block8(
                                             &mut dec,
                                             &mut cdfs,
                                             &mut neighbours,
@@ -12691,29 +12799,53 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                         )?;
                                     prev_leaf = Some((leaf_mi, skip, is_inter));
                                     last_skip_mode = skip_mode_leaf;
+                                    // lane-gmaffine r2: keep the last INTER
+                                    // leaf's own filter/ref for the coarse
+                                    // 16px-wide `Neighbours` slot (see below).
+                                    // Intra leaves must not overwrite it: the
+                                    // slot is shared by all four, and an OBMC
+                                    // neighbour is chosen at mi granularity, so
+                                    // an intra LAST leaf would hand `[3, 3]` to
+                                    // `neighbour_filter` for an inter sibling.
+                                    if leaf_ref > 0 {
+                                        last_filter = leaf_filter;
+                                        last_ref = leaf_ref;
+                                    }
                                     if compound_ctx8.is_some() {
                                         last_compound_ctx = compound_ctx8;
                                     }
                                 }
                                 if let Some((_, skip, is_inter)) = prev_leaf {
-                                    // corner-cut: `decode_inter_block8`'s
-                                    // leaves never read a switchable filter
-                                    // (round-3 GLOBALMV refusal already
-                                    // bounds them away from the Regular-only
-                                    // gap this round closes elsewhere); `[3,
-                                    // 3]` is "no info", the same value an
-                                    // intra neighbour records. Upgrade:
-                                    // thread `interp_fixed`/`enable_dual_filter`
-                                    // into `decode_inter_block8` once a
-                                    // straddling 8x8 SWITCHABLE stream is on
-                                    // hand to pin against.
+                                    // lane-gmaffine r2: record the LAST leaf's
+                                    // real switchable-filter symbols and its
+                                    // real reference. r1 recorded `[3, 3]` (the
+                                    // "intra neighbour" sentinel) and a
+                                    // hardcoded LAST_FRAME here; `[3, 3]` made
+                                    // `obmc_blend`'s `neighbour_filter` PANIC
+                                    // the moment a later block OBMC-blended one
+                                    // of these leaves, and the fake ref
+                                    // corrupted the next block's
+                                    // switchable_interp / ref contexts.
+                                    // corner-cut: `Neighbours` is 16px-granular,
+                                    // so all four leaves collapse into one slot
+                                    // (the last one wins). Ceiling: siblings
+                                    // that choose DIFFERENT filters or refs give
+                                    // the next block one leaf's context instead
+                                    // of the bordering one's. Upgrade: mi-
+                                    // granular above_filter/above_ref arrays.
                                     neighbours.record_inter(
                                         at16,
                                         SUB,
                                         skip,
                                         is_inter,
-                                        if is_inter { LAST_FRAME } else { -1 },
-                                        [3, 3],
+                                        if !is_inter {
+                                            -1
+                                        } else if last_ref > 0 {
+                                            last_ref
+                                        } else {
+                                            LAST_FRAME
+                                        },
+                                        last_filter,
                                         last_skip_mode,
                                     );
                                     if let Some((ref0, ref1, group_idx, idx)) = last_compound_ctx {
