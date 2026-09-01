@@ -18,6 +18,15 @@
 //! feature's gate, which shrinks the derived set and fails this test until the
 //! list is updated -- the point being that the shrink is noticed.
 
+// TILING is deliberately NOT in this derivation (lane-tiles r11): the check
+// keys on `--enable-<tool>=0/1`, and `--tile-columns=<log2>` has no such
+// shape -- a `--tile-columns=` presence check would also read `=0` (one tile)
+// as coverage, which is the opposite of what it would claim. It needs no
+// entry either: 13 gates spell `--tile-columns`/`--tile-rows` with a nonzero
+// log2 and assert the parsed `tile_info` really carries the grid, and
+// `run_multi_tile_gate` covers a 2D grid with the coding tools ON at both
+// bit depths.
+
 /// aomenc coding tools that no real-`aomenc` gate is proven to exercise:
 /// switched off in every gate that names them, and on in none.
 ///
@@ -144,7 +153,13 @@ const NEVER_EXERCISED_8BIT: &[(&str, &str)] = &[
 ];
 
 #[cfg(test)]
-const NEVER_EXERCISED_10BIT: &[(&str, &str)] = &[
+const NEVER_EXERCISED_10BIT: &[(&str, &str)] = &[    // lane-cwarp's 10-bit compound-global-warp gate closed `enable-global-motion`
+    // and `enable-dist-wtd-comp` at 10 bits without deleting their entries here,
+    // so this list was already stale (and this test already red) at main 9c35ecc;
+    // lane-tiles r11's multi-tile 10-bit gates then closed `enable-ab-partitions`,
+    // `enable-rect-partitions` and `enable-restoration` at 10 bits. All five
+    // deleted together.
+
     // Only 4 of the 45 real-aomenc gates encode at 10 bits, and they pin the
     // pixel filters and the intra tool set off. Every entry the 8-bit list
     // carries is a hole here too; the seven extra ones below are tools an
@@ -155,19 +170,11 @@ const NEVER_EXERCISED_10BIT: &[(&str, &str)] = &[
         "hole at both depths, see the 8-bit list",
     ),
     (
-        "enable-ab-partitions",
-        "8-bit only: no 10-bit gate enables AB partitions",
-    ),
-    (
         "enable-angle-delta",
         "hole at both depths, see the 8-bit list",
     ),
     (
         "enable-cfl-intra",
-        "hole at both depths, see the 8-bit list",
-    ),
-    (
-        "enable-dist-wtd-comp",
         "hole at both depths, see the 8-bit list",
     ),
     (
@@ -183,10 +190,6 @@ const NEVER_EXERCISED_10BIT: &[(&str, &str)] = &[
         "hole at both depths, see the 8-bit list",
     ),
     (
-        "enable-global-motion",
-        "hole at both depths, see the 8-bit list",
-    ),
-    (
         "enable-intra-edge-filter",
         "8-bit only: the 10-bit intra path never runs the edge filter",
     ),
@@ -195,18 +198,10 @@ const NEVER_EXERCISED_10BIT: &[(&str, &str)] = &[
         "enable-paeth-intra",
         "8-bit only: no 10-bit gate enables Paeth",
     ),
-    (
-        "enable-rect-partitions",
-        "8-bit only: no 10-bit gate enables rect partitions",
-    ),
     ("enable-rect-tx", "hole at both depths, see the 8-bit list"),
     (
         "enable-ref-frame-mvs",
         "hole at both depths, see the 8-bit list",
-    ),
-    (
-        "enable-restoration",
-        "8-bit only -- THE instance this split was built for: every 10-bit gate passed `--enable-restoration=0`, so the SGR box sums and the Wiener clamp were never run at 10 bits and both were wrong (lane-hbdinter, 2026-09-01)",
     ),
     (
         "enable-smooth-intra",
