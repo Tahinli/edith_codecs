@@ -1740,6 +1740,68 @@ mod tests {
         (oracle_frames, hidden)
     }
 
+    /// lane-hidden r2: the `--arnr-maxframes=0` SECOND ARM of an existing
+    /// gate -- the gate's own recipe is never changed, this re-encodes the
+    /// same fixture with libaom's temporal alt-ref filter switched off and
+    /// runs [`decode_all_frames_vs_oracle`] on the result. Measured: with
+    /// the filter at its default EVERY alt-ref recipe in this file emits
+    /// ZERO hidden frames (the candidates are filtered away), so the
+    /// hidden-frame compare on the gate's own stream is vacuous; this arm
+    /// is what actually puts `show_frame == 0` frames on the wire.
+    ///
+    /// Runs at most once per gate name per process (the loop gates sweep
+    /// dozens of attempts and each arm costs a full encode + two decodes).
+    /// A stream this decoder refuses BY NAME skips the arm -- the arm is
+    /// about hidden frames, not about that capability gap -- while a pixel
+    /// mismatch is a hard failure raised inside the compare.
+    fn hidden_arnr_arm(name: &str, y4m: &[u8], args: &[&str]) -> Option<(usize, usize)> {
+        static ARMED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+            std::sync::OnceLock::new();
+        if !ARMED
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .insert(name.to_string())
+        {
+            return None;
+        }
+        let mut arm: Vec<&str> = vec!["--arnr-maxframes=0"];
+        arm.extend_from_slice(args);
+        let mut child = Command::new(aomenc_path())
+            .args(&arm)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("aomenc failed to start");
+        child
+            .stdin
+            .take()
+            .expect("aomenc stdin")
+            .write_all(y4m)
+            .expect("writing y4m to aomenc");
+        let out = child.wait_with_output().expect("aomenc failed to run");
+        assert!(
+            out.status.success(),
+            "{name} HIDDEN-ARM: aomenc refused its own recipe plus --arnr-maxframes=0: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stream = out.stdout;
+        match decode_stream(&stream) {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("unsupported"),
+                    "{name} HIDDEN-ARM failed outright: {msg}"
+                );
+                eprintln!("{name} HIDDEN-ARM: skipped on a named refusal: {msg}");
+                None
+            }
+            Ok(_) => Some(decode_all_frames_vs_oracle(&stream, &format!("{name}-arnr0"))),
+        }
+    }
+
+
     /// The repo's first hidden-frame pixel gate. Every other aomenc gate
     /// here compares `decode_stream`'s output against `ffmpeg -f obu`, and
     /// both sides emit SHOWN frames only -- so an alt-ref frame that is
@@ -4191,6 +4253,25 @@ mod tests {
                     "{gate_name} frame {i} V vs ffmpeg (seed {seed})"
                 );
             }
+            // lane-hidden r2 (class gate-blind-to-hidden-frames): the same
+            // stream again, comparing EVERY decode-order frame -- the hidden
+            // (show_frame == 0) alt-ref frames the ffmpeg compare above
+            // cannot see, because both sides of it emit shown frames only.
+            let (hidden_total, hidden_n) = decode_all_frames_vs_oracle(&stream, gate_name);
+            eprintln!(
+                "{gate_name} HIDDEN: seed {seed}: {hidden_total} decode-order frames, \
+                 {hidden_n} hidden, all pixel-exact vs the oracle"
+            );
+            // lane-hidden r2 SECOND ARM (the recipe above is untouched):
+            // libaom's temporal alt-ref filter absorbs this recipe's hidden
+            // frames, so the compare above is vacuous -- re-encode the same
+            // fixture with --arnr-maxframes=0 and compare THOSE.
+            if let Some((arm_total, arm_hidden)) = hidden_arnr_arm(gate_name, &y4m.stdout, &args) {
+                eprintln!(
+                    "{gate_name} HIDDEN-ARM(--arnr-maxframes=0): seed {seed}: {arm_total} \
+                     decode-order frames, {arm_hidden} hidden, all pixel-exact vs the oracle"
+                );
+            }
             eprintln!(
                 "{gate_name} FIRING seed {seed}: {target_ref_name} hits advanced by {}",
                 decode::ref_hits(target_ref) - before
@@ -4409,6 +4490,25 @@ mod tests {
                             assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
                         }
                     }
+                    // lane-hidden r2 (class gate-blind-to-hidden-frames): the same
+                    // stream again, comparing EVERY decode-order frame -- the hidden
+                    // (show_frame == 0) alt-ref frames the ffmpeg compare above
+                    // cannot see, because both sides of it emit shown frames only.
+                    let (hidden_total, hidden_n) = decode_all_frames_vs_oracle(&stream, NAME);
+                    eprintln!(
+                        "{NAME} HIDDEN: seed {seed}: {hidden_total} decode-order frames, \
+                         {hidden_n} hidden, all pixel-exact vs the oracle"
+                    );
+                    // lane-hidden r2 SECOND ARM (the recipe above is untouched):
+                    // libaom's temporal alt-ref filter absorbs this recipe's hidden
+                    // frames, so the compare above is vacuous -- re-encode the same
+                    // fixture with --arnr-maxframes=0 and compare THOSE.
+                    if let Some((arm_total, arm_hidden)) = hidden_arnr_arm(NAME, &y4m.stdout, &args) {
+                        eprintln!(
+                            "{NAME} HIDDEN-ARM(--arnr-maxframes=0): seed {seed}: {arm_total} \
+                             decode-order frames, {arm_hidden} hidden, all pixel-exact vs the oracle"
+                        );
+                    }
                     eprintln!(
                         "{NAME} FIRING seed {seed}: comp_mode hits advanced by {}, decoded \
                          fully and pixel-exact",
@@ -4591,6 +4691,25 @@ mod tests {
                     );
                 }
             }
+            // lane-hidden r2 (class gate-blind-to-hidden-frames): the same
+            // stream again, comparing EVERY decode-order frame -- the hidden
+            // (show_frame == 0) alt-ref frames the ffmpeg compare above
+            // cannot see, because both sides of it emit shown frames only.
+            let (hidden_total, hidden_n) = decode_all_frames_vs_oracle(&stream, NAME);
+            eprintln!(
+                "{NAME} HIDDEN: seed {seed}: {hidden_total} decode-order frames, \
+                 {hidden_n} hidden, all pixel-exact vs the oracle"
+            );
+            // lane-hidden r2 SECOND ARM (the recipe above is untouched):
+            // libaom's temporal alt-ref filter absorbs this recipe's hidden
+            // frames, so the compare above is vacuous -- re-encode the same
+            // fixture with --arnr-maxframes=0 and compare THOSE.
+            if let Some((arm_total, arm_hidden)) = hidden_arnr_arm(NAME, &y4m.stdout, &args) {
+                eprintln!(
+                    "{NAME} HIDDEN-ARM(--arnr-maxframes=0): seed {seed}: {arm_total} \
+                     decode-order frames, {arm_hidden} hidden, all pixel-exact vs the oracle"
+                );
+            }
             eprintln!(
                 "{NAME} FIRING seed {seed}: skip_mode hits advanced by {}",
                 decode::skip_mode_hits() - before
@@ -4752,6 +4871,25 @@ mod tests {
                 assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
+            }
+            // lane-hidden r2 (class gate-blind-to-hidden-frames): the same
+            // stream again, comparing EVERY decode-order frame -- the hidden
+            // (show_frame == 0) alt-ref frames the ffmpeg compare above
+            // cannot see, because both sides of it emit shown frames only.
+            let (hidden_total, hidden_n) = decode_all_frames_vs_oracle(&stream, NAME);
+            eprintln!(
+                "{NAME} HIDDEN: seed {seed}: {hidden_total} decode-order frames, \
+                 {hidden_n} hidden, all pixel-exact vs the oracle"
+            );
+            // lane-hidden r2 SECOND ARM (the recipe above is untouched):
+            // libaom's temporal alt-ref filter absorbs this recipe's hidden
+            // frames, so the compare above is vacuous -- re-encode the same
+            // fixture with --arnr-maxframes=0 and compare THOSE.
+            if let Some((arm_total, arm_hidden)) = hidden_arnr_arm(NAME, &y4m.stdout, &args) {
+                eprintln!(
+                    "{NAME} HIDDEN-ARM(--arnr-maxframes=0): seed {seed}: {arm_total} \
+                     decode-order frames, {arm_hidden} hidden, all pixel-exact vs the oracle"
+                );
             }
             eprintln!(
                 "{NAME} FIRING seed {seed}: obmc hits advanced by {}",
@@ -4944,6 +5082,25 @@ mod tests {
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
             }
+            // lane-hidden r2 (class gate-blind-to-hidden-frames): the same
+            // stream again, comparing EVERY decode-order frame -- the hidden
+            // (show_frame == 0) alt-ref frames the ffmpeg compare above
+            // cannot see, because both sides of it emit shown frames only.
+            let (hidden_total, hidden_n) = decode_all_frames_vs_oracle(&stream, NAME);
+            eprintln!(
+                "{NAME} HIDDEN: seed {seed}: {hidden_total} decode-order frames, \
+                 {hidden_n} hidden, all pixel-exact vs the oracle"
+            );
+            // lane-hidden r2 SECOND ARM (the recipe above is untouched):
+            // libaom's temporal alt-ref filter absorbs this recipe's hidden
+            // frames, so the compare above is vacuous -- re-encode the same
+            // fixture with --arnr-maxframes=0 and compare THOSE.
+            if let Some((arm_total, arm_hidden)) = hidden_arnr_arm(NAME, &y4m.stdout, &args) {
+                eprintln!(
+                    "{NAME} HIDDEN-ARM(--arnr-maxframes=0): seed {seed}: {arm_total} \
+                     decode-order frames, {arm_hidden} hidden, all pixel-exact vs the oracle"
+                );
+            }
             eprintln!(
                 "{NAME} FIRING seed {seed}: 8x8 obmc hits {fired8} (total across attempts so far {total_obmc8})"
             );
@@ -5109,6 +5266,25 @@ mod tests {
                 assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
+            }
+            // lane-hidden r2 (class gate-blind-to-hidden-frames): the same
+            // stream again, comparing EVERY decode-order frame -- the hidden
+            // (show_frame == 0) alt-ref frames the ffmpeg compare above
+            // cannot see, because both sides of it emit shown frames only.
+            let (hidden_total, hidden_n) = decode_all_frames_vs_oracle(&stream, NAME);
+            eprintln!(
+                "{NAME} HIDDEN: seed {seed}: {hidden_total} decode-order frames, \
+                 {hidden_n} hidden, all pixel-exact vs the oracle"
+            );
+            // lane-hidden r2 SECOND ARM (the recipe above is untouched):
+            // libaom's temporal alt-ref filter absorbs this recipe's hidden
+            // frames, so the compare above is vacuous -- re-encode the same
+            // fixture with --arnr-maxframes=0 and compare THOSE.
+            if let Some((arm_total, arm_hidden)) = hidden_arnr_arm(NAME, &y4m.stdout, &args) {
+                eprintln!(
+                    "{NAME} HIDDEN-ARM(--arnr-maxframes=0): seed {seed}: {arm_total} \
+                     decode-order frames, {arm_hidden} hidden, all pixel-exact vs the oracle"
+                );
             }
             matched += 1;
         }
@@ -5559,6 +5735,25 @@ mod tests {
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
             }
+            // lane-hidden r2 (class gate-blind-to-hidden-frames): the same
+            // stream again, comparing EVERY decode-order frame -- the hidden
+            // (show_frame == 0) alt-ref frames the ffmpeg compare above
+            // cannot see, because both sides of it emit shown frames only.
+            let (hidden_total, hidden_n) = decode_all_frames_vs_oracle(&stream, NAME);
+            eprintln!(
+                "{NAME} HIDDEN: seed {seed}: {hidden_total} decode-order frames, \
+                 {hidden_n} hidden, all pixel-exact vs the oracle"
+            );
+            // lane-hidden r2 SECOND ARM (the recipe above is untouched):
+            // libaom's temporal alt-ref filter absorbs this recipe's hidden
+            // frames, so the compare above is vacuous -- re-encode the same
+            // fixture with --arnr-maxframes=0 and compare THOSE.
+            if let Some((arm_total, arm_hidden)) = hidden_arnr_arm(NAME, &y4m.stdout, &args) {
+                eprintln!(
+                    "{NAME} HIDDEN-ARM(--arnr-maxframes=0): seed {seed}: {arm_total} \
+                     decode-order frames, {arm_hidden} hidden, all pixel-exact vs the oracle"
+                );
+            }
             matched += 1;
         }
         assert!(
@@ -5738,6 +5933,25 @@ mod tests {
                 assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
+            }
+            // lane-hidden r2 (class gate-blind-to-hidden-frames): the same
+            // stream again, comparing EVERY decode-order frame -- the hidden
+            // (show_frame == 0) alt-ref frames the ffmpeg compare above
+            // cannot see, because both sides of it emit shown frames only.
+            let (hidden_total, hidden_n) = decode_all_frames_vs_oracle(&stream, NAME);
+            eprintln!(
+                "{NAME} HIDDEN: seed {seed}: {hidden_total} decode-order frames, \
+                 {hidden_n} hidden, all pixel-exact vs the oracle"
+            );
+            // lane-hidden r2 SECOND ARM (the recipe above is untouched):
+            // libaom's temporal alt-ref filter absorbs this recipe's hidden
+            // frames, so the compare above is vacuous -- re-encode the same
+            // fixture with --arnr-maxframes=0 and compare THOSE.
+            if let Some((arm_total, arm_hidden)) = hidden_arnr_arm(NAME, &y4m.stdout, &args) {
+                eprintln!(
+                    "{NAME} HIDDEN-ARM(--arnr-maxframes=0): seed {seed}: {arm_total} \
+                     decode-order frames, {arm_hidden} hidden, all pixel-exact vs the oracle"
+                );
             }
             matched += 1;
         }
@@ -6060,6 +6274,25 @@ mod tests {
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
             }
+            // lane-hidden r2 (class gate-blind-to-hidden-frames): the same
+            // stream again, comparing EVERY decode-order frame -- the hidden
+            // (show_frame == 0) alt-ref frames the ffmpeg compare above
+            // cannot see, because both sides of it emit shown frames only.
+            let (hidden_total, hidden_n) = decode_all_frames_vs_oracle(&stream, NAME);
+            eprintln!(
+                "{NAME} HIDDEN: seed {seed}: {hidden_total} decode-order frames, \
+                 {hidden_n} hidden, all pixel-exact vs the oracle"
+            );
+            // lane-hidden r2 SECOND ARM (the recipe above is untouched):
+            // libaom's temporal alt-ref filter absorbs this recipe's hidden
+            // frames, so the compare above is vacuous -- re-encode the same
+            // fixture with --arnr-maxframes=0 and compare THOSE.
+            if let Some((arm_total, arm_hidden)) = hidden_arnr_arm(NAME, &y4m.stdout, &args) {
+                eprintln!(
+                    "{NAME} HIDDEN-ARM(--arnr-maxframes=0): seed {seed}: {arm_total} \
+                     decode-order frames, {arm_hidden} hidden, all pixel-exact vs the oracle"
+                );
+            }
             matched += 1;
         }
         assert!(
@@ -6260,6 +6493,25 @@ mod tests {
                 assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
+            }
+            // lane-hidden r2 (class gate-blind-to-hidden-frames): the same
+            // stream again, comparing EVERY decode-order frame -- the hidden
+            // (show_frame == 0) alt-ref frames the ffmpeg compare above
+            // cannot see, because both sides of it emit shown frames only.
+            let (hidden_total, hidden_n) = decode_all_frames_vs_oracle(&stream, NAME);
+            eprintln!(
+                "{NAME} HIDDEN: seed {seed}: {hidden_total} decode-order frames, \
+                 {hidden_n} hidden, all pixel-exact vs the oracle"
+            );
+            // lane-hidden r2 SECOND ARM (the recipe above is untouched):
+            // libaom's temporal alt-ref filter absorbs this recipe's hidden
+            // frames, so the compare above is vacuous -- re-encode the same
+            // fixture with --arnr-maxframes=0 and compare THOSE.
+            if let Some((arm_total, arm_hidden)) = hidden_arnr_arm(NAME, &y4m.stdout, &args) {
+                eprintln!(
+                    "{NAME} HIDDEN-ARM(--arnr-maxframes=0): seed {seed}: {arm_total} \
+                     decode-order frames, {arm_hidden} hidden, all pixel-exact vs the oracle"
+                );
             }
             matched += 1;
         }
@@ -6466,6 +6718,25 @@ mod tests {
                 assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
+            }
+            // lane-hidden r2 (class gate-blind-to-hidden-frames): the same
+            // stream again, comparing EVERY decode-order frame -- the hidden
+            // (show_frame == 0) alt-ref frames the ffmpeg compare above
+            // cannot see, because both sides of it emit shown frames only.
+            let (hidden_total, hidden_n) = decode_all_frames_vs_oracle(&stream, NAME);
+            eprintln!(
+                "{NAME} HIDDEN: seed {seed}: {hidden_total} decode-order frames, \
+                 {hidden_n} hidden, all pixel-exact vs the oracle"
+            );
+            // lane-hidden r2 SECOND ARM (the recipe above is untouched):
+            // libaom's temporal alt-ref filter absorbs this recipe's hidden
+            // frames, so the compare above is vacuous -- re-encode the same
+            // fixture with --arnr-maxframes=0 and compare THOSE.
+            if let Some((arm_total, arm_hidden)) = hidden_arnr_arm(NAME, &y4m.stdout, &args) {
+                eprintln!(
+                    "{NAME} HIDDEN-ARM(--arnr-maxframes=0): seed {seed}: {arm_total} \
+                     decode-order frames, {arm_hidden} hidden, all pixel-exact vs the oracle"
+                );
             }
             matched += 1;
         }
@@ -6898,6 +7169,25 @@ mod tests {
                 assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
+            }
+            // lane-hidden r2 (class gate-blind-to-hidden-frames): the same
+            // stream again, comparing EVERY decode-order frame -- the hidden
+            // (show_frame == 0) alt-ref frames the ffmpeg compare above
+            // cannot see, because both sides of it emit shown frames only.
+            let (hidden_total, hidden_n) = decode_all_frames_vs_oracle(&stream, NAME);
+            eprintln!(
+                "{NAME} HIDDEN: seed {seed}: {hidden_total} decode-order frames, \
+                 {hidden_n} hidden, all pixel-exact vs the oracle"
+            );
+            // lane-hidden r2 SECOND ARM (the recipe above is untouched):
+            // libaom's temporal alt-ref filter absorbs this recipe's hidden
+            // frames, so the compare above is vacuous -- re-encode the same
+            // fixture with --arnr-maxframes=0 and compare THOSE.
+            if let Some((arm_total, arm_hidden)) = hidden_arnr_arm(NAME, &y4m.stdout, &args) {
+                eprintln!(
+                    "{NAME} HIDDEN-ARM(--arnr-maxframes=0): seed {seed}: {arm_total} \
+                     decode-order frames, {arm_hidden} hidden, all pixel-exact vs the oracle"
+                );
             }
             matched += 1;
         }
@@ -9208,6 +9498,25 @@ mod tests {
                 assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
+            }
+            // lane-hidden r2 (class gate-blind-to-hidden-frames): the same
+            // stream again, comparing EVERY decode-order frame -- the hidden
+            // (show_frame == 0) alt-ref frames the ffmpeg compare above
+            // cannot see, because both sides of it emit shown frames only.
+            let (hidden_total, hidden_n) = decode_all_frames_vs_oracle(&stream, NAME);
+            eprintln!(
+                "{NAME} HIDDEN: seed {seed}: {hidden_total} decode-order frames, \
+                 {hidden_n} hidden, all pixel-exact vs the oracle"
+            );
+            // lane-hidden r2 SECOND ARM (the recipe above is untouched):
+            // libaom's temporal alt-ref filter absorbs this recipe's hidden
+            // frames, so the compare above is vacuous -- re-encode the same
+            // fixture with --arnr-maxframes=0 and compare THOSE.
+            if let Some((arm_total, arm_hidden)) = hidden_arnr_arm(NAME, &y4m.stdout, &args) {
+                eprintln!(
+                    "{NAME} HIDDEN-ARM(--arnr-maxframes=0): seed {seed}: {arm_total} \
+                     decode-order frames, {arm_hidden} hidden, all pixel-exact vs the oracle"
+                );
             }
             matched += 1;
         }
