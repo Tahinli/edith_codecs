@@ -16440,11 +16440,15 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
 mod tests {
     use super::*;
 
-    /// lane-rectsplit r2: `av1_nz_map_ctx_offset` is packed COLUMN-major, so
-    /// the two rect transcriptions in [`cdf`] must be read `[col][row]`.
-    /// [`base_ctx_rect`] states libaom's generating rule
-    /// (`txb_common.h:199-209`) in display coordinates; this pins the tables
-    /// against it, which is what a transposed read would break.
+    /// libaom's generating rule (`txb_common.h:199-209`) in DISPLAY
+    /// coordinates, pinned against the two rect transcriptions in [`cdf`].
+    /// lane-tx64x16 r2: this test read the tables `[col][row]` (lane-rectsplit
+    /// r2's column-major premise) while r3 reverted the tables themselves to
+    /// display-major `[row][col]` -- the order [`base_ctx`] itself reads them
+    /// at `decode.rs`'s `TxClass::TwoD` arm, and the order every merged rect
+    /// gate is green under. The test was left pinning the abandoned half, so
+    /// it failed on `main` (32x64 display (row 0, col 2): table says 6 read
+    /// transposed, the rule says 11). Read in the consumer's order.
     #[test]
     fn nz_map_ctx_offset_tables_match_the_rect_rule() {
         for (w, h, table) in [
@@ -16463,7 +16467,7 @@ mod tests {
                         cdf::NZ_MAP_CTX_OFFSET_32[row][col]
                     };
                     assert_eq!(
-                        table[col][row],
+                        table[row][col],
                         want,
                         "{w}x{h} nz_map offset at display (row {row}, col {col})"
                     );
