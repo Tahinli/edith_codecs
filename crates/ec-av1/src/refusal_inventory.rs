@@ -72,8 +72,7 @@ const REFUSALS: &[&str] = &[
     "an intra mode this decoder does not code (round 2)",
     "an intra-coded HORZ/VERT strip needs rectangular intra prediction this decoder does not code yet",
     "filter intra on a HORZ/VERT strip (this decoder predicts square-only)",
-    "a compound-reference block with a scaled reference (superres, unimplemented)",
-    "warp/OBMC/interintra prediction with a scaled reference (superres, unimplemented)",
+    "warp prediction with a scaled reference (superres, unimplemented)",
     "an 8x8 partition leaf under a scaled reference (superres, unimplemented)",
 ];
 

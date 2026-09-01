@@ -614,6 +614,46 @@ pub(crate) fn obmc_hits() -> usize {
     OBMC_HITS.with(|c| c.get())
 }
 
+// lane-scaledref r1: per-case firing counts for the scaled-reference gate
+// (class `gate-blind-to-feature`) -- a pixel match under an UNSCALED
+// reference would pass just as well and prove nothing, so the gate
+// hard-asserts each combination this round lifts actually occurred:
+// a compound block with a scaled tap, a warp block whose warp libaom
+// suppresses because the reference is scaled, an OBMC block, an interintra
+// block, and an 8x8 leaf.
+thread_local! {
+    static SCALED_COMPOUND_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SCALED_WARP_FALLBACK_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SCALED_OBMC_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SCALED_INTERINTRA_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SCALED_BLOCK8_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`SCALED_COMPOUND_HITS`].
+pub(crate) fn scaled_compound_hits() -> usize {
+    SCALED_COMPOUND_HITS.with(|c| c.get())
+}
+
+/// Current value of [`SCALED_WARP_FALLBACK_HITS`].
+pub(crate) fn scaled_warp_fallback_hits() -> usize {
+    SCALED_WARP_FALLBACK_HITS.with(|c| c.get())
+}
+
+/// Current value of [`SCALED_OBMC_HITS`].
+pub(crate) fn scaled_obmc_hits() -> usize {
+    SCALED_OBMC_HITS.with(|c| c.get())
+}
+
+/// Current value of [`SCALED_INTERINTRA_HITS`].
+pub(crate) fn scaled_interintra_hits() -> usize {
+    SCALED_INTERINTRA_HITS.with(|c| c.get())
+}
+
+/// Current value of [`SCALED_BLOCK8_HITS`].
+pub(crate) fn scaled_block8_hits() -> usize {
+    SCALED_BLOCK8_HITS.with(|c| c.get())
+}
+
 // lane-motionmode round 3: same proof as [`OBMC_HITS`], narrowed to
 // `decode_inter_block8`'s own 8x8-leaf `read_motion_mode` -- a subset of
 // [`OBMC_HITS`] (both fire together on an 8x8 hit), lets the gate tell an
@@ -8180,21 +8220,43 @@ fn obmc_neighbour_pred(
     luma: bool,
     h_kind: mc::InterpFilterKind,
     v_kind: mc::InterpFilterKind,
+    // lane-scaledref r1: spec 7.11.3.3's x_scale_fp for THIS neighbour's own
+    // reference (derived from luma widths, applied unchanged to chroma whose
+    // x_q4 is already in its own plane's pixel units). `REF_NO_SCALE` takes
+    // the ordinary stride-1 path bit-exact.
+    x_scale_fp: i64,
 ) -> Vec<u16> {
     let mut out = vec![0u16; w * h];
-    mc::predict_with_filters(
-        &refplane.data,
-        refplane.width,
-        refplane.true_width,
-        refplane.true_height,
-        mv_to_q4(x, mv.1, luma),
-        mv_to_q4(y, mv.0, luma),
-        w,
-        h,
-        h_kind,
-        v_kind,
-        &mut out,
-    );
+    if x_scale_fp == mc::REF_NO_SCALE {
+        mc::predict_with_filters(
+            &refplane.data,
+            refplane.width,
+            refplane.true_width,
+            refplane.true_height,
+            mv_to_q4(x, mv.1, luma),
+            mv_to_q4(y, mv.0, luma),
+            w,
+            h,
+            h_kind,
+            v_kind,
+            &mut out,
+        );
+    } else {
+        mc::predict_scaled(
+            &refplane.data,
+            refplane.width,
+            refplane.true_width,
+            refplane.true_height,
+            mv_to_q4(x, mv.1, luma),
+            mv_to_q4(y, mv.0, luma),
+            x_scale_fp,
+            w,
+            h,
+            h_kind,
+            v_kind,
+            &mut out,
+        );
+    }
     out
 }
 
@@ -8355,6 +8417,12 @@ fn obmc_blend(
     ref_v: &PlaneBuf,
     other_refs: &RefSlots,
     interp_fixed: Option<mc::InterpFilterKind>,
+    // lane-scaledref r1: this frame's own coded luma width -- each OBMC
+    // neighbour is re-predicted against ITS OWN reference, which may be
+    // scaled differently from this block's (spec 7.11.3.3 / libaom
+    // `av1_setup_build_prediction_by_above_pred` passing that ref's own
+    // `scale_factors`).
+    frame_width: usize,
     pred_y: &mut [u16],
     pred_u: &mut [u16],
     pred_v: &mut [u16],
@@ -8382,13 +8450,14 @@ fn obmc_blend(
             neighbours.above_filter[(mi_col + off4) / SUB_MI as usize],
         );
         let (ny, nu, nv) = ref_planes(nb.ref_frame, ref_y, ref_u, ref_v, other_refs)?;
+        let nb_scale = mc::scale_factor(ny.width, frame_width);
         let (bw, bh, ox) = (span4 * 4, overlap_above, off4 * 4);
-        let tmp_y = obmc_neighbour_pred(ny, px + ox, py, nb.mv, bw, bh, true, h_kind, v_kind);
+        let tmp_y = obmc_neighbour_pred(ny, px + ox, py, nb.mv, bw, bh, true, h_kind, v_kind, nb_scale);
         obmc_blend_v(pred_y, side, ox, 0, bw, bh, &tmp_y);
         let (cbw, cbh, cox) = (bw / 2, overlap_above / 2, ox / 2);
-        let tmp_u = obmc_neighbour_pred(nu, cpx + cox, cpy, nb.mv, cbw, cbh, false, h_kind, v_kind);
+        let tmp_u = obmc_neighbour_pred(nu, cpx + cox, cpy, nb.mv, cbw, cbh, false, h_kind, v_kind, nb_scale);
         obmc_blend_v(pred_u, chroma_side, cox, 0, cbw, cbh, &tmp_u);
-        let tmp_v = obmc_neighbour_pred(nv, cpx + cox, cpy, nb.mv, cbw, cbh, false, h_kind, v_kind);
+        let tmp_v = obmc_neighbour_pred(nv, cpx + cox, cpy, nb.mv, cbw, cbh, false, h_kind, v_kind, nb_scale);
         obmc_blend_v(pred_v, chroma_side, cox, 0, cbw, cbh, &tmp_v);
     }
 
@@ -8398,13 +8467,14 @@ fn obmc_blend(
             neighbours.left_filter[(mi_row + off4) / SUB_MI as usize],
         );
         let (ny, nu, nv) = ref_planes(nb.ref_frame, ref_y, ref_u, ref_v, other_refs)?;
+        let nb_scale = mc::scale_factor(ny.width, frame_width);
         let (bw, bh, oy) = (overlap_left, span4 * 4, off4 * 4);
-        let tmp_y = obmc_neighbour_pred(ny, px, py + oy, nb.mv, bw, bh, true, h_kind, v_kind);
+        let tmp_y = obmc_neighbour_pred(ny, px, py + oy, nb.mv, bw, bh, true, h_kind, v_kind, nb_scale);
         obmc_blend_h(pred_y, side, 0, oy, bw, bh, &tmp_y);
         let (cbw, cbh, coy) = (overlap_left / 2, bh / 2, oy / 2);
-        let tmp_u = obmc_neighbour_pred(nu, cpx, cpy + coy, nb.mv, cbw, cbh, false, h_kind, v_kind);
+        let tmp_u = obmc_neighbour_pred(nu, cpx, cpy + coy, nb.mv, cbw, cbh, false, h_kind, v_kind, nb_scale);
         obmc_blend_h(pred_u, chroma_side, 0, coy, cbw, cbh, &tmp_u);
-        let tmp_v = obmc_neighbour_pred(nv, cpx, cpy + coy, nb.mv, cbw, cbh, false, h_kind, v_kind);
+        let tmp_v = obmc_neighbour_pred(nv, cpx, cpy + coy, nb.mv, cbw, cbh, false, h_kind, v_kind, nb_scale);
         obmc_blend_h(pred_v, chroma_side, 0, coy, cbw, cbh, &tmp_v);
     }
     Ok(())
@@ -9398,14 +9468,17 @@ fn decode_inter_block(
             );
             block_filter = resolved_filter;
 
-            // lane-superres r9: a scaled reference in a COMPOUND_REFERENCE
-            // block (either tap) is not wired -- mc::predict_compound_intermediate
-            // has no scaled counterpart yet -- refuse by name rather than
-            // silently sample it unscaled.
-            if py0.width != frame_width || py1.width != frame_width {
-                return Err(unsupported(
-                    "a compound-reference block with a scaled reference (superres, unimplemented)",
-                ));
+            // lane-scaledref r1: each compound tap scales INDEPENDENTLY off
+            // its own stored reference's luma width (spec 7.11.3.3 derives
+            // x_scale_fp per reference; libaom `av1_setup_pre_planes` builds
+            // one `scale_factors` per `ref_frame`), so the two taps can carry
+            // different ratios in the same block. `REF_NO_SCALE` reduces
+            // `predict_compound_intermediate`'s walk to the ordinary
+            // stride-1 one, so the unscaled case is unchanged.
+            let scale0 = mc::scale_factor(py0.width, frame_width);
+            let scale1 = mc::scale_factor(py1.width, frame_width);
+            if scale0 != mc::REF_NO_SCALE || scale1 != mc::REF_NO_SCALE {
+                SCALED_COMPOUND_HITS.with(|c| c.set(c.get() + 1));
             }
 
             let mut inter0_y = vec![0i32; side * side];
@@ -9416,6 +9489,7 @@ fn decode_inter_block(
                 py0.true_height,
                 mv_to_q4(px, mv0.1, true),
                 mv_to_q4(py, mv0.0, true),
+                scale0,
                 side,
                 side,
                 h_filter,
@@ -9430,6 +9504,7 @@ fn decode_inter_block(
                 py1.true_height,
                 mv_to_q4(px, mv1.1, true),
                 mv_to_q4(py, mv1.0, true),
+                scale1,
                 side,
                 side,
                 h_filter,
@@ -9465,6 +9540,7 @@ fn decode_inter_block(
                 pu0.true_height,
                 mv_to_q4(cpx, mv0.1, false),
                 mv_to_q4(cpy, mv0.0, false),
+                scale0,
                 chroma_side,
                 chroma_side,
                 h_filter,
@@ -9479,6 +9555,7 @@ fn decode_inter_block(
                 pu1.true_height,
                 mv_to_q4(cpx, mv1.1, false),
                 mv_to_q4(cpy, mv1.0, false),
+                scale1,
                 chroma_side,
                 chroma_side,
                 h_filter,
@@ -9509,6 +9586,7 @@ fn decode_inter_block(
                 pv0.true_height,
                 mv_to_q4(cpx, mv0.1, false),
                 mv_to_q4(cpy, mv0.0, false),
+                scale0,
                 chroma_side,
                 chroma_side,
                 h_filter,
@@ -9523,6 +9601,7 @@ fn decode_inter_block(
                 pv1.true_height,
                 mv_to_q4(cpx, mv1.1, false),
                 mv_to_q4(cpy, mv1.0, false),
+                scale1,
                 chroma_side,
                 chroma_side,
                 h_filter,
@@ -10091,12 +10170,29 @@ fn decode_inter_block(
             // (warp_params/obmc_selected/interintra_mode are all resolved by
             // this point, every symbol for this block already read).
             let luma_scale = mc::scale_factor(py_ref.width, frame_width);
-            if luma_scale != mc::REF_NO_SCALE
-                && (warp_params.is_some() || obmc_selected || interintra_mode.is_some())
-            {
-                return Err(unsupported(
-                    "warp/OBMC/interintra prediction with a scaled reference (superres, unimplemented)",
-                ));
+            if luma_scale != mc::REF_NO_SCALE {
+                // lane-scaledref r1: libaom `allow_warp`
+                // (av1/common/reconinter.c:41) suppresses BOTH local and
+                // global warp under a scaled reference and predicts
+                // translationally instead -- that fallback is implemented
+                // below, but the one real aomenc stream this round found
+                // that reaches it (`--enable-warped-motion=1`,
+                // `--superres-denominator=16`, seed 47) still mismatches
+                // ffmpeg at frame 2 luma, so the case stays refused by name
+                // until it has a green gate rather than shipping wrong
+                // pixels behind a lifted refusal.
+                if warp_params.is_some() {
+                    SCALED_WARP_FALLBACK_HITS.with(|c| c.set(c.get() + 1));
+                    return Err(unsupported(
+                        "warp prediction with a scaled reference (superres, unimplemented)",
+                    ));
+                }
+                if obmc_selected {
+                    SCALED_OBMC_HITS.with(|c| c.set(c.get() + 1));
+                }
+                if interintra_mode.is_some() {
+                    SCALED_INTERINTRA_HITS.with(|c| c.set(c.get() + 1));
+                }
             }
 
             let mut pred_y = vec![0u16; side * side];
@@ -10187,7 +10283,13 @@ fn decode_inter_block(
                 );
             }
 
-            if let Some(params) = &warp_params {
+            // lane-scaledref r1: libaom `allow_warp` (av1/common/reconinter.c:41)
+            // opens with `if (av1_is_scaled(sf)) return 0;` -- BOTH local
+            // (`wm_params`) and global warp fall back to the translational
+            // prediction above when the reference is scaled, even though the
+            // motion_mode symbol was still read and warp_params still
+            // resolved. Suppress the warp, keep every symbol read.
+            if let Some(params) = warp_params.as_ref().filter(|_| luma_scale == mc::REF_NO_SCALE) {
                 crate::warp::warp_affine(
                     params, &py_ref.data, py_ref.true_width as i32, py_ref.true_height as i32,
                     py_ref.width as i32, &mut pred_y, px as i32, py as i32, side as i32,
@@ -10228,6 +10330,7 @@ fn decode_inter_block(
                     ref_v,
                     other_refs,
                     interp_fixed,
+                    frame_width,
                     &mut pred_y,
                     &mut pred_u,
                     &mut pred_v,
@@ -10688,6 +10791,11 @@ fn decode_inter_block8(
     // `BLOCK_8X8` (this leaf's fixed size) is always `av1_allow_palette`-
     // eligible (`bsize >= BLOCK_8X8`).
     allow_screen_content_tools: bool,
+    // lane-scaledref r1: this frame's own coded luma width (spec 7.11.3.3),
+    // for the scaled-reference MC this leaf's own single-ref/compound/OBMC
+    // predictions take when a stored reference was coded at another width
+    // (`use_superres`) -- mirrors [`decode_inter_block`]'s own param.
+    frame_width: usize,
 ) -> Result<(bool, bool, bool, Option<(i8, i8, u8, u8)>)> {
     const LAST_FRAME: i8 = 1;
     /// `Y_MODE`'s size group (`common_data.h`'s `size_group_lookup[BLOCK_8X8]`).
@@ -10903,6 +11011,12 @@ fn decode_inter_block8(
 
                 let (py0, pu0, pv0) = ref_planes(ref0, ref_y, ref_u, ref_v, other_refs)?;
                 let (py1, pu1, pv1) = ref_planes(ref1, ref_y, ref_u, ref_v, other_refs)?;
+                let scale0 = mc::scale_factor(py0.width, frame_width);
+                let scale1 = mc::scale_factor(py1.width, frame_width);
+                if scale0 != mc::REF_NO_SCALE || scale1 != mc::REF_NO_SCALE {
+                    SCALED_COMPOUND_HITS.with(|c| c.set(c.get() + 1));
+                    SCALED_BLOCK8_HITS.with(|c| c.set(c.get() + 1));
+                }
 
                 for dr in 0..2 {
                     for dc in 0..2 {
@@ -10939,6 +11053,7 @@ fn decode_inter_block8(
                     py0.true_height,
                     mv_to_q4(px, mv0.1, true),
                     mv_to_q4(py, mv0.0, true),
+                    scale0,
                     SIDE,
                     SIDE,
                     Regular,
@@ -10953,6 +11068,7 @@ fn decode_inter_block8(
                     py1.true_height,
                     mv_to_q4(px, mv1.1, true),
                     mv_to_q4(py, mv1.0, true),
+                    scale1,
                     SIDE,
                     SIDE,
                     Regular,
@@ -10984,6 +11100,7 @@ fn decode_inter_block8(
                     pu0.true_height,
                     mv_to_q4(cpx, mv0.1, false),
                     mv_to_q4(cpy, mv0.0, false),
+                    scale0,
                     CHROMA_SIDE,
                     CHROMA_SIDE,
                     Regular,
@@ -10998,6 +11115,7 @@ fn decode_inter_block8(
                     pu1.true_height,
                     mv_to_q4(cpx, mv1.1, false),
                     mv_to_q4(cpy, mv1.0, false),
+                    scale1,
                     CHROMA_SIDE,
                     CHROMA_SIDE,
                     Regular,
@@ -11028,6 +11146,7 @@ fn decode_inter_block8(
                     pv0.true_height,
                     mv_to_q4(cpx, mv0.1, false),
                     mv_to_q4(cpy, mv0.0, false),
+                    scale0,
                     CHROMA_SIDE,
                     CHROMA_SIDE,
                     Regular,
@@ -11042,6 +11161,7 @@ fn decode_inter_block8(
                     pv1.true_height,
                     mv_to_q4(cpx, mv1.1, false),
                     mv_to_q4(cpy, mv1.0, false),
+                    scale1,
                     CHROMA_SIDE,
                     CHROMA_SIDE,
                     Regular,
@@ -11315,42 +11435,51 @@ fn decode_inter_block8(
         }
         mode_for_tx = 0;
 
+        // lane-scaledref r1: this leaf's own prediction is always `Regular`
+        // (documented corner-cut above); under a scaled reference the same
+        // fixed kernel runs through spec 7.11.3.3's scaled walk instead.
+        let luma_scale = mc::scale_factor(ref_y.width, frame_width);
+        if luma_scale != mc::REF_NO_SCALE {
+            SCALED_BLOCK8_HITS.with(|c| c.set(c.get() + 1));
+        }
         let mut pred_y = vec![0u16; SIDE * SIDE];
-        mc::predict(
-            &ref_y.data,
-            ref_y.width,
-            ref_y.true_width,
-            ref_y.true_height,
-            mv_to_q4(px, mv.1, true),
-            mv_to_q4(py, mv.0, true),
-            SIDE,
-            SIDE,
-            &mut pred_y,
-        );
         let mut pred_u = vec![0u16; CHROMA_SIDE * CHROMA_SIDE];
-        mc::predict(
-            &ref_u.data,
-            ref_u.width,
-            ref_u.true_width,
-            ref_u.true_height,
-            mv_to_q4(cpx, mv.1, false),
-            mv_to_q4(cpy, mv.0, false),
-            CHROMA_SIDE,
-            CHROMA_SIDE,
-            &mut pred_u,
-        );
         let mut pred_v = vec![0u16; CHROMA_SIDE * CHROMA_SIDE];
-        mc::predict(
-            &ref_v.data,
-            ref_v.width,
-            ref_v.true_width,
-            ref_v.true_height,
-            mv_to_q4(cpx, mv.1, false),
-            mv_to_q4(cpy, mv.0, false),
-            CHROMA_SIDE,
-            CHROMA_SIDE,
-            &mut pred_v,
-        );
+        for (plane, x, y, dim, dst) in [
+            (ref_y, px, py, SIDE, &mut pred_y),
+            (ref_u, cpx, cpy, CHROMA_SIDE, &mut pred_u),
+            (ref_v, cpx, cpy, CHROMA_SIDE, &mut pred_v),
+        ] {
+            let luma = std::ptr::eq(plane, ref_y);
+            if luma_scale == mc::REF_NO_SCALE {
+                mc::predict(
+                    &plane.data,
+                    plane.width,
+                    plane.true_width,
+                    plane.true_height,
+                    mv_to_q4(x, mv.1, luma),
+                    mv_to_q4(y, mv.0, luma),
+                    dim,
+                    dim,
+                    dst,
+                );
+            } else {
+                mc::predict_scaled(
+                    &plane.data,
+                    plane.width,
+                    plane.true_width,
+                    plane.true_height,
+                    mv_to_q4(x, mv.1, luma),
+                    mv_to_q4(y, mv.0, luma),
+                    luma_scale,
+                    dim,
+                    dim,
+                    mc::InterpFilterKind::Regular,
+                    mc::InterpFilterKind::Regular,
+                    dst,
+                );
+            }
+        }
 
         if obmc_selected {
             obmc_blend(
@@ -11375,6 +11504,7 @@ fn decode_inter_block8(
                 ref_v,
                 other_refs,
                 interp_fixed,
+                frame_width,
                 &mut pred_y,
                 &mut pred_u,
                 &mut pred_v,
@@ -12282,15 +12412,18 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     .map(|i| (mi_row0 + (i / 2) * 2, mi_col0 + (i % 2) * 2))
                                     .filter(|&(mr, mc)| mr < mi_rows && mc < mi_cols)
                                     .collect();
-                                // lane-superres r9: decode_inter_block8's own
-                                // MC (below) is not threaded for a scaled
-                                // reference (unlike decode_inter_block's 19
-                                // sites) -- refuse the whole 8x8-leaf split
-                                // up front when ANY live reference this leaf
-                                // could pick has a different width than this
-                                // frame, rather than thread frame_width
-                                // through its own single-ref/compound MC
-                                // calls to reach the same block this round.
+                                // lane-scaledref r1: `decode_inter_block8` IS
+                                // threaded for a scaled reference now (its
+                                // single-ref, compound and OBMC MC all take
+                                // spec 7.11.3.3's scaled walk), but no aomenc
+                                // recipe this round produced a single 8x8
+                                // inter leaf -- gradients never splits below
+                                // 16x16 (same wall as
+                                // `a_real_aomenc_stream_with_obmc_8x8_decodes_pixel_exact`).
+                                // An ungated lift is a capability claim
+                                // nothing exercises, so the refusal stays
+                                // until a firing fixture exists; deleting
+                                // these six lines is then the whole change.
                                 if ref_y.width != frame_width as usize
                                     || ref_slots.iter().flatten().any(|(py, _, _)| {
                                         py.width != frame_width as usize
@@ -12349,6 +12482,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                             switchable_motion_mode,
                                             allow_warped_motion,
                                             allow_screen_content_tools,
+                                            frame_width as usize,
                                         )?;
                                     prev_leaf = Some((leaf_mi, skip, is_inter));
                                     last_skip_mode = skip_mode_leaf;

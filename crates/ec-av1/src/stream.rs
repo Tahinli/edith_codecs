@@ -5025,6 +5025,222 @@ mod tests {
         );
     }
 
+    /// lane-scaledref r1: a real aomenc `--superres-mode=1` sequence with
+    /// compound, OBMC, interintra and 8x8 leaves ALL enabled must decode
+    /// pixel-exact -- these are the combinations the three
+    /// "... with a scaled reference (superres, unimplemented)" refusals used
+    /// to cover. Each combination gets its OWN hard-asserted hit counter
+    /// (`crate::decode::scaled_*_hits`), because an unscaled reference would
+    /// pass the pixels and prove nothing (class `gate-blind-to-feature`), and
+    /// a stream that scales but never takes compound/OBMC/interintra/8x8
+    /// would prove nothing about the code this round adds either. A refusal
+    /// naming a scaled reference is a hard failure: those are exactly the
+    /// strings this round lifts. Other named capabilities skip that seed.
+    #[test]
+    fn a_real_aomenc_superres_stream_with_compound_obmc_and_interintra_decodes_pixel_exact()
+    {
+        const NAME: &str = "a_real_aomenc_superres_stream_with_compound_obmc_and_interintra_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height, frame_count) = (64usize, 64usize, 24usize);
+        let mut named_refusals = 0u32;
+        let mut matched = 0u32;
+        let n_attempts: u32 = std::env::var("EC_SCALEDREF_GATE_ATTEMPTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(12);
+        for attempt in 0..n_attempts {
+            let seed = 42 + attempt;
+            let duration = frame_count as f64 / 25.0;
+            let source =
+                gradients_source(seed, width, height, &format!("duration={duration}:rate=25"));
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", "yuv420p", "-f",
+                    "yuv4mpegpipe", "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let on = |name: &str| {
+                if std::env::var(name).as_deref() == Ok("0") { "0" } else { "1" }
+            };
+            // warp stays OFF: warp under a scaled reference is still refused
+            // (its own fallback mismatches, see decode.rs) -- set
+            // EC_SCALEDREF_WARP=1 to reproduce that residue.
+            let warp = format!(
+                "--enable-warped-motion={}",
+                if std::env::var("EC_SCALEDREF_WARP").as_deref() == Ok("1") { "1" } else { "0" }
+            );
+            let obmc = format!("--enable-obmc={}", on("EC_SCALEDREF_OBMC"));
+            let interintra = format!("--enable-interintra-comp={}", on("EC_SCALEDREF_II"));
+            let lag = format!(
+                "--lag-in-frames={}",
+                if on("EC_SCALEDREF_COMP") == "0" { "0" } else { "25" }
+            );
+            let alt_ref = format!("--auto-alt-ref={}", on("EC_SCALEDREF_COMP"));
+            let args: Vec<&str> = vec![
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                "--cq-level=45",
+                "--cpu-used=0",
+                "--kf-max-dist=1000",
+                "--threads=1",
+                "--row-mt=0",
+                "--sb-size=64",
+                // superres on every frame, key and inter alike -- the scaled
+                // reference this gate is about.
+                // denominator 16 (the maximum) keeps the CODED frame
+                // 32x64 -- a multiple of 16 both ways, so no frame-edge
+                // 16x16 straddle forces a sub-16x16 partition this decoder
+                // still refuses on the aligned path ("an inter partition
+                // below 16x16"). Denominator 12 codes 43 columns and every
+                // seed refused there.
+                "--superres-mode=1",
+                "--superres-denominator=16",
+                "--superres-kf-denominator=16",
+                // the four combinations this round lifts (each switchable
+                // by env for bisecting a mismatch without a rebuild)
+                &alt_ref,
+                &lag,
+                "--enable-order-hint=1",
+                &warp,
+                &obmc,
+                &interintra,
+                "--enable-smooth-interintra=1",
+                "--enable-interintra-wedge=0",
+                "--enable-masked-comp=0",
+                "--enable-onesided-comp=0",
+                "--enable-fwd-kf=0",
+                "--tune-content=default",
+                "--max-partition-size=32",
+                "--min-partition-size=32",
+                // everything this decoder still refuses under any reference
+                "--enable-rect-partitions=0",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0",
+                "--enable-filter-intra=0",
+                "--enable-smooth-intra=0",
+                "--enable-paeth-intra=0",
+                "--enable-directional-intra=0",
+                "--enable-angle-delta=0",
+                "--enable-tx-size-search=0",
+                "--enable-cdef=0",
+                "--enable-restoration=0",
+                "--enable-palette=0",
+                "--enable-intrabc=0",
+                "--enable-cfl-intra=0",
+                "--enable-ref-frame-mvs=0",
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ];
+            let mut child = Command::new(aomenc_path())
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let frames = match decode_stream(&stream) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME} failed outright, not a named refusal (seed {seed}): {msg}"
+                    );
+                    assert!(
+                        !msg.contains("scaled reference"),
+                        "{NAME} refused on a scaled reference (seed {seed}) -- those refusals \
+                         are exactly what this round lifts: {msg}"
+                    );
+                    named_refusals += 1;
+                    eprintln!("seed {seed} refusal (other capability): {msg}");
+                    continue;
+                }
+                Ok(frames) => frames,
+            };
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
+            assert_eq!(frames.len(), frame_count);
+            if let Ok(path) = std::env::var("EC_AV1_GATE_DUMP") {
+                let mismatched = frames
+                    .iter()
+                    .zip(&ffmpeg_frames)
+                    .any(|(got, want)| got.y != want.y || got.u != want.u || got.v != want.v);
+                if mismatched {
+                    std::fs::write(&path, &stream).expect("writing pinned stream");
+                    eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
+                }
+            }
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
+                assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
+            }
+            matched += 1;
+        }
+        eprintln!(
+            "{NAME}: {named_refusals} other-capability refusals, {matched}/{n_attempts} pixel-exact, \
+             superres_hits={} predict_scaled_hits={} scaled_compound={} scaled_warp_fallback={} \
+             scaled_obmc={} scaled_interintra={} scaled_block8={}",
+            crate::superres::superres_hits(),
+            crate::mc::predict_scaled_hits(),
+            crate::decode::scaled_compound_hits(),
+            crate::decode::scaled_warp_fallback_hits(),
+            crate::decode::scaled_obmc_hits(),
+            crate::decode::scaled_interintra_hits(),
+            crate::decode::scaled_block8_hits(),
+        );
+        assert!(
+            matched > 0,
+            "{NAME}: every attempt refused on other capabilities; the gate proves nothing"
+        );
+        assert!(
+            crate::mc::predict_scaled_hits() > 0,
+            "{NAME}: matched but zero predict_scaled_hits -- no block took the scaled MC path"
+        );
+        // Warp and the 8x8 leaf are NOT asserted here: both stay refused this
+        // round (warp's own fallback mismatches at seed 47, and no recipe
+        // produced an 8x8 inter leaf at all), so their counters are
+        // diagnostics only -- see this gate's own doc and decode.rs.
+        for (hits, what) in [
+            (crate::decode::scaled_compound_hits(), "compound with a scaled reference"),
+            (crate::decode::scaled_obmc_hits(), "OBMC with a scaled reference"),
+            (crate::decode::scaled_interintra_hits(), "interintra with a scaled reference"),
+        ] {
+            assert!(hits > 0, "{NAME}: {matched} matches but zero blocks took {what}");
+        }
+    }
+
     /// lane-wii r2: `--enable-interintra-wedge=1` streams must DECODE
     /// pixel-exact -- the wedge-interintra syntax (adapting `wedge_index`
     /// CDF symbol, fixed sign 0) and the wedge mask blend are ported over

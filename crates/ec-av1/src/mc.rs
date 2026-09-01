@@ -461,6 +461,54 @@ fn round_pow2_signed_64(value: i64, shift: u32) -> i64 {
     }
 }
 
+/// Spec 7.11.3.3's horizontal pass on a (possibly) scaled reference, shared
+/// by [`predict_scaled`] and [`predict_compound_intermediate`] -- the two
+/// differ only in their VERTICAL rounding ([`INTER_ROUND_1`] vs
+/// [`INTER_ROUND_1_COMPOUND`]), never here. Each output column walks the
+/// reference by `x_step_qn` (the Q14 scale rounded down to the Q10
+/// `SCALE_SUBPEL_BITS` grid) and picks its own filter phase from the low
+/// bits, so `x_scale_fp == REF_NO_SCALE` reduces to the ordinary stride-1
+/// whole-pel walk with one fixed phase (pinned by
+/// `predict_scaled_at_no_scale_matches_predict_with_filters`).
+#[allow(clippy::too_many_arguments)]
+fn horizontal_scaled_pass(
+    reference: &[u16],
+    stride: usize,
+    true_width: usize,
+    true_height: usize,
+    x_q4: i32,
+    y0: i32,
+    x_scale_fp: i64,
+    block_w: usize,
+    rows: usize,
+    h_kind: InterpFilterKind,
+    intermediate: &mut [i32],
+) {
+    let x_step_qn = round_pow2_64(x_scale_fp, 4);
+    let off = (x_scale_fp - REF_NO_SCALE) * 8;
+    let pos_x_q10 = round_pow2_signed_64(x_q4 as i64 * x_scale_fp + off, 8) + 32;
+    let (h_wide, h_narrow) = h_kind.tables();
+    for c in 0..block_w {
+        let x_qn = pos_x_q10 + c as i64 * x_step_qn;
+        let int_pel = (x_qn >> 10) as i32;
+        let filter_idx = ((x_qn & 1023) >> 6) as usize;
+        let h_filter = if block_w <= 4 {
+            &h_narrow[filter_idx]
+        } else {
+            &h_wide[filter_idx]
+        };
+        for r in 0..rows {
+            let y = y0 - 3 + r as i32;
+            let mut sum = 0;
+            for (t, &tap) in h_filter.iter().enumerate() {
+                let x = int_pel + t as i32 - 3;
+                sum += tap * sample(reference, stride, true_width, true_height, x, y);
+            }
+            intermediate[r * block_w + c] = round2(sum, INTER_ROUND_0);
+        }
+    }
+}
+
 /// [`predict_with_filters`]'s scaled-reference counterpart (spec 7.11.3.3):
 /// used only when the stored reference's luma width differs from the current
 /// frame's (`use_superres` on a non-key frame). `x_scale_fp` is
@@ -500,11 +548,6 @@ pub fn predict_scaled(
     // SCALE_SUBPEL_BITS == 10: x_step_qn is x_scale_fp (Q14) rounded down to
     // Q10; off/pos_x_q10 fold the block's own x_q4 (Q4) into that same Q10
     // grid (spec 7.11.3.3's `dec_calc_subpel_params`).
-    let x_step_qn = round_pow2_64(x_scale_fp, 4);
-    let off = (x_scale_fp - REF_NO_SCALE) * 8;
-    let pos_x_q10 = round_pow2_signed_64(x_q4 as i64 * x_scale_fp + off, 8) + 32;
-
-    let (h_wide, h_narrow) = h_kind.tables();
     let (v_wide, v_narrow) = v_kind.tables();
     let v_filter = if block_h <= 4 {
         &v_narrow[yfrac]
@@ -514,25 +557,19 @@ pub fn predict_scaled(
 
     let rows = block_h + 7;
     let mut intermediate = vec![0i32; rows * block_w];
-    for c in 0..block_w {
-        let x_qn = pos_x_q10 + c as i64 * x_step_qn;
-        let int_pel = (x_qn >> 10) as i32;
-        let filter_idx = ((x_qn & 1023) >> 6) as usize;
-        let h_filter = if block_w <= 4 {
-            &h_narrow[filter_idx]
-        } else {
-            &h_wide[filter_idx]
-        };
-        for r in 0..rows {
-            let y = y0 - 3 + r as i32;
-            let mut sum = 0;
-            for (t, &tap) in h_filter.iter().enumerate() {
-                let x = int_pel + t as i32 - 3;
-                sum += tap * sample(reference, stride, true_width, true_height, x, y);
-            }
-            intermediate[r * block_w + c] = round2(sum, INTER_ROUND_0);
-        }
-    }
+    horizontal_scaled_pass(
+        reference,
+        stride,
+        true_width,
+        true_height,
+        x_q4,
+        y0,
+        x_scale_fp,
+        block_w,
+        rows,
+        h_kind,
+        &mut intermediate,
+    );
 
     for row in 0..block_h {
         for col in 0..block_w {
@@ -586,6 +623,7 @@ pub fn predict_compound_intermediate(
     true_height: usize,
     x_q4: i32,
     y_q4: i32,
+    x_scale_fp: i64,
     block_w: usize,
     block_h: usize,
     h_kind: InterpFilterKind,
@@ -595,18 +633,14 @@ pub fn predict_compound_intermediate(
     assert_eq!(dst.len(), block_w * block_h, "the destination is the block");
     assert!(!reference.is_empty(), "a reference plane has samples");
 
-    let x0 = x_q4.div_euclid(16);
-    let xfrac = x_q4.rem_euclid(16) as usize;
+    if x_scale_fp != REF_NO_SCALE {
+        PREDICT_SCALED_HITS.with(|c| c.set(c.get() + 1));
+    }
+
     let y0 = y_q4.div_euclid(16);
     let yfrac = y_q4.rem_euclid(16) as usize;
 
-    let (h_wide, h_narrow) = h_kind.tables();
     let (v_wide, v_narrow) = v_kind.tables();
-    let h_filter = if block_w <= 4 {
-        &h_narrow[xfrac]
-    } else {
-        &h_wide[xfrac]
-    };
     let v_filter = if block_h <= 4 {
         &v_narrow[yfrac]
     } else {
@@ -615,17 +649,19 @@ pub fn predict_compound_intermediate(
 
     let rows = block_h + 7;
     let mut intermediate = vec![0i32; rows * block_w];
-    for r in 0..rows {
-        let y = y0 - 3 + r as i32;
-        for c in 0..block_w {
-            let mut sum = 0;
-            for (t, &tap) in h_filter.iter().enumerate() {
-                let x = x0 + c as i32 + t as i32 - 3;
-                sum += tap * sample(reference, stride, true_width, true_height, x, y);
-            }
-            intermediate[r * block_w + c] = round2(sum, INTER_ROUND_0);
-        }
-    }
+    horizontal_scaled_pass(
+        reference,
+        stride,
+        true_width,
+        true_height,
+        x_q4,
+        y0,
+        x_scale_fp,
+        block_w,
+        rows,
+        h_kind,
+        &mut intermediate,
+    );
 
     for row in 0..block_h {
         for col in 0..block_w {
@@ -744,6 +780,7 @@ fn compound_intermediate_whole_pel_identity_round_trips_through_combine() {
         16,
         0,
         0,
+        REF_NO_SCALE,
         4,
         4,
         InterpFilterKind::Regular,
