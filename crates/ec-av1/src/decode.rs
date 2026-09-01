@@ -350,6 +350,8 @@ thread_local! {
     /// ids any block ended up with -- the gate's proof the feature fired.
     static SEG_ID_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static SEG_IDS_SEEN: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    /// How many `seg_id_predicted` symbols were read (temporal update).
+    static SEG_PRED_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Installs this frame's segmentation parameters and allocates its map, with
@@ -395,10 +397,16 @@ pub(crate) fn segment_ids_seen() -> usize {
     SEG_IDS_SEEN.with(|c| c.get().count_ones() as usize)
 }
 
-/// Resets both segmentation hit counters (gate setup).
+/// How many `seg_id_predicted` symbols have been read (temporal update).
+pub(crate) fn segment_pred_hits() -> usize {
+    SEG_PRED_HITS.with(|c| c.get())
+}
+
+/// Resets the segmentation hit counters (gate setup).
 pub(crate) fn reset_segment_hits() {
     SEG_ID_HITS.with(|c| c.set(0));
     SEG_IDS_SEEN.with(|c| c.set(0));
+    SEG_PRED_HITS.with(|c| c.set(0));
 }
 
 /// `seg_feature_active_idx(segment_id, feature)` for the frame currently
@@ -603,6 +611,7 @@ fn inter_segment_id(
     let id = if temporal_update {
         let ctx = seg_pred_ctx(mi_r, mi_c);
         let predicted = dec.symbol(&mut cdfs.segment_pred[ctx]) != 0;
+        SEG_PRED_HITS.with(|c| c.set(c.get() + 1));
         stamp_seg_pred(mi_r, mi_c, w_mi, h_mi, u8::from(predicted));
         if predicted {
             predicted_segment_id(mi_r, mi_c, w_mi, h_mi)
