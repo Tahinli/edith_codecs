@@ -8171,6 +8171,13 @@ mod tests {
         for cq in [32u32, 45, 55] {
             for step in [4u32, 8] {
                 attempts += 1;
+                // lane-fimv r1: per-attempt snapshots. The aggregate
+                // assertions below are satisfied by a single lucky cq/step
+                // cell; these prove EVERY attempt that decoded and
+                // pixel-compared really carried the header state and the
+                // forced alphabet under test (class gate-blind-to-feature).
+                let attempt_fimv_before = crate::decode::fimv_frame_hits();
+                let attempt_alphabet_before = crate::decode::fimv_alphabet_hits();
                 let duration = frame_count as f64 / 25.0;
                 // Flat screen-content tiles with hard edges, translating by a
                 // whole number of pixels per frame: static enough for
@@ -8306,6 +8313,19 @@ mod tests {
                     assert_eq!(got.u, want.u, "{name} frame {i} U vs ffmpeg (cq {cq} step {step})");
                     assert_eq!(got.v, want.v, "{name} frame {i} V vs ffmpeg (cq {cq} step {step})");
                 }
+                assert!(
+                    crate::decode::fimv_frame_hits() > attempt_fimv_before,
+                    "{name} (cq {cq} step {step}): decoded and compared all \
+                     frames but no frame header had force_integer_mv=1 -- \
+                     this attempt is vacuous"
+                );
+                assert!(
+                    crate::decode::fimv_alphabet_hits() > attempt_alphabet_before,
+                    "{name} (cq {cq} step {step}): no block was forced onto the \
+                     2-symbol obmc alphabet by force_integer_mv while \
+                     allow_warped_motion=1 and num_proj_ref>=1 -- this attempt \
+                     is vacuous"
+                );
                 matched += 1;
             }
         }
