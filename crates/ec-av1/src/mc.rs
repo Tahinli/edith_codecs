@@ -674,7 +674,15 @@ pub fn diffwtd_mask(pred0: &[i32], pred1: &[i32], inv: bool, mask: &mut [u8]) {
     assert_eq!(pred0.len(), pred1.len(), "both refs predict the same block");
     assert_eq!(mask.len(), pred0.len(), "one mask byte per pixel");
     for i in 0..mask.len() {
-        let diff = round2((pred0[i] - pred1[i]).abs(), INTER_POST_ROUND);
+        // lane-cwarp r1: libaom's `round` is `2*FILTER_BITS - round_0 -
+        // round_1 + (bd - 8)` (`diffwtd_mask_d16`, reconinter.c:306) -- the
+        // `(bd - 8)` term (which this function's own doc comment already
+        // named) was missing, so every 10-bit DIFFWTD mask was computed 4x
+        // too coarse. Caught by lane-cwarp's 10-bit gate arm: a 10-bit
+        // compound stream with global motion AND warp disabled still
+        // mismatched at frame 1.
+        let round = INTER_POST_ROUND + u32::from(crate::decode::bit_depth() - 8);
+        let diff = round2((pred0[i] - pred1[i]).abs(), round);
         let m = (38 + diff / 16).clamp(0, 64);
         mask[i] = if inv { (64 - m) as u8 } else { m as u8 };
     }
