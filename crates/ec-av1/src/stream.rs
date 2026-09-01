@@ -2126,7 +2126,7 @@ mod tests {
                             "--row-mt=0",
                             "--sb-size=64",
                             "--enable-palette=1",
-                            "--min-partition-size=64",
+                            "--min-partition-size=16",
                             "--max-partition-size=64",
                             "--obu",
                             "-o",
@@ -2242,6 +2242,10 @@ mod tests {
             return;
         }
         let mut matched = 0u32;
+        // Blocks that reconstructed a palette-Y prediction through a SPLIT
+        // luma transform (lane-palette2 r7's lifted refusal): the same
+        // screen-content streams exercise it, so this gate proves both.
+        let mut split_palette_matched = 0u32;
         let mut named_refusals = 0u32;
         let mut attempts = 0u32;
         let sizes = [(64, 128), (128, 64), (128, 128), (128, 192), (192, 192)];
@@ -2278,7 +2282,7 @@ mod tests {
                             "--row-mt=0",
                             "--sb-size=64",
                             "--enable-palette=1",
-                            "--min-partition-size=64",
+                            "--min-partition-size=16",
                             "--max-partition-size=64",
                             "--obu",
                             "-o",
@@ -2304,6 +2308,7 @@ mod tests {
                     );
                     let stream = out.stdout;
                     let before = crate::decode::rect_screen_content_hits();
+                    let split_before = crate::decode::palette_split_tx_hits();
                     let frames = match decode_stream(&stream) {
                         Err(e) => {
                             let msg = e.to_string();
@@ -2353,9 +2358,17 @@ mod tests {
                         );
                     }
                     matched += 1;
+                    if crate::decode::palette_split_tx_hits() > split_before {
+                        split_palette_matched += 1;
+                    }
                 }
             }
         }
+        assert!(
+            split_palette_matched > 0,
+            "{NAME}: no pixel-exact attempt ever reconstructed a palette block with a \
+             split luma transform -- the lifted refusal is ungated"
+        );
         assert!(
             matched > 0,
             "{NAME}: no attempt out of {attempts} ever landed a matching rect \
@@ -2363,9 +2376,12 @@ mod tests {
              rect_screen_content_hits never proven pixel-exact"
         );
         eprintln!(
-            "{NAME}: {matched}/{attempts} attempts matched pixel-exact, {named_refusals} \
-             named refusals, rect_screen_content_hits={}",
-            crate::decode::rect_screen_content_hits()
+            "{NAME}: {matched}/{attempts} attempts matched pixel-exact \
+             ({split_palette_matched} of them through a split-transform palette block), \
+             {named_refusals} named refusals, rect_screen_content_hits={}, \
+             palette_split_tx_hits={}",
+            crate::decode::rect_screen_content_hits(),
+            crate::decode::palette_split_tx_hits()
         );
     }
 
