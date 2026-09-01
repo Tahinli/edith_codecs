@@ -13697,6 +13697,99 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
 
 #[cfg(test)]
 mod tests {
+
+    /// The rect `av1_nz_map_ctx_offset` tables, against libaom's own
+    /// generating rule (`txb_common.h`'s comment in
+    /// `get_nz_map_ctx_from_stats`) AND against [`base_ctx_rect`], which
+    /// spells that rule out instead of reading a table. libaom's array is
+    /// indexed by `coeff_idx = (col << bhl) | row` -- COLUMN-major, `bhl` =
+    /// log2 of the transform's height -- so a straight transcription of it
+    /// is `[col][row]`; ours is read `[row][col]`, and both tables were
+    /// carrying the transposed values. Invisible on the square table (it is
+    /// symmetric) and at `row, col < 2` (both halves agree there), which is
+    /// every position the gate that introduced them reached: it desynced the
+    /// first 64x32 strip of the merged superblock gate's seed 43
+    /// (lane-ab16 r2).
+    #[test]
+    fn rect_nz_map_ctx_offset_tables_are_row_major() {
+        // libaom, for a 2D class at (row, col) with ctx == 0.
+        fn libaom_offset(w: usize, h: usize, row: usize, col: usize) -> usize {
+            if row == 0 && col == 0 {
+                return 0;
+            }
+            if w < h && row < 2 {
+                return 11;
+            }
+            if w > h && col < 2 {
+                return 16;
+            }
+            if row + col < 2 {
+                1
+            } else if row + col < 4 {
+                6
+            } else {
+                21
+            }
+        }
+        for row in 0..5 {
+            for col in 0..5 {
+                assert_eq!(
+                    usize::from(crate::cdf::NZ_MAP_CTX_OFFSET_32X64[row][col]),
+                    libaom_offset(32, 64, row, col),
+                    "NZ_MAP_CTX_OFFSET_32X64[{row}][{col}]"
+                );
+                assert_eq!(
+                    usize::from(crate::cdf::NZ_MAP_CTX_OFFSET_64X32[row][col]),
+                    libaom_offset(64, 32, row, col),
+                    "NZ_MAP_CTX_OFFSET_64X32[{row}][{col}]"
+                );
+                assert_eq!(
+                    usize::from(crate::cdf::NZ_MAP_CTX_OFFSET_32[row][col]),
+                    libaom_offset(32, 32, row, col),
+                    "NZ_MAP_CTX_OFFSET_32[{row}][{col}]"
+                );
+                // The table path and the spelled-out path must agree: an
+                // empty grid gives ctx 0, so what is left is the offset.
+                for (w, h) in [(64usize, 32usize), (32, 64)] {
+                    let grid = vec![0i32; w * h];
+                    assert_eq!(
+                        base_ctx(
+                            &grid,
+                            32,
+                            row,
+                            col,
+                            TxClass::TwoD,
+                            Some((w, h)),
+                        ),
+                        base_ctx_rect(&grid, w, h, row, col),
+                        "{w}x{h} at ({row}, {col}): table vs rule"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The 512-position chroma end-of-block CDF is the CHROMA 2D row, not
+    /// the flat 1D one. `av1_default_eob_multi512_cdfs` is
+    /// `[q][plane][eob_multi_ctx]`; taking the second inner index for the
+    /// plane picks a distribution that is flat for both planes, which is
+    /// what made every 32x16/16x32 chroma transform read a wrong
+    /// end-of-block group (lane-ab16 r2).
+    #[test]
+    fn the_chroma_512_eob_cdf_is_not_the_flat_one_dimensional_row() {
+        for table in [
+            crate::cdf::EOB_PT_512_CHROMA_Q0,
+            crate::cdf::EOB_PT_512_CHROMA_Q1,
+            crate::cdf::EOB_PT_512_CHROMA,
+            crate::cdf::EOB_PT_512_CHROMA_Q3,
+        ] {
+            assert_ne!(
+                table,
+                [3277, 6554, 9830, 13107, 16384, 19661, 22938, 26214, 29491, 32768, 0],
+                "the flat eob_multi_ctx == 1 row is not any q-context's chroma 2D row"
+            );
+        }
+    }
     use super::*;
 
     // `crate::tile`'s `flat_key_frame_tile`/`dc_key_frame_tile_levels`/
