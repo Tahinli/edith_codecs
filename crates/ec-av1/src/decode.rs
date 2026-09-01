@@ -442,6 +442,20 @@ pub(crate) fn rect_split_tx_hits() -> usize {
     RECT_SPLIT_TX_HITS.with(|c| c.get())
 }
 
+// How many HORZ/VERT intra strips actually predicted with filter intra
+// (lane-rectsplit r1) -- the case `decode_block_rect` refused by name
+// ("this decoder predicts square-only") until `predict_filter_intra` took
+// `bw`x`bh`.
+thread_local! {
+    static FILTER_INTRA_RECT_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`FILTER_INTRA_RECT_HITS`].
+pub(crate) fn filter_intra_rect_hits() -> usize {
+    FILTER_INTRA_RECT_HITS.with(|c| c.get())
+}
+
 // How many [`read_coeffs`] reads resolved a `tx_type` outside `TX_CLASS_2D`
 // (`V_DCT`/`H_DCT`, spec 5.11.39's `TxClass::Horiz`/`Vert`), across every
 // call on the current thread -- the same before/after counter pattern as
@@ -3436,15 +3450,13 @@ fn decode_block_rect(
     // `uv_mode`, not the luma one.
     let smooth_neighbor_uv =
         is_smooth_mode(neighbours.above_uv_mode[c]) || is_smooth_mode(neighbours.left_uv_mode[r]);
+    // lane-rectsplit r1: `predict_filter_intra` now takes the block's own
+    // `bw`x`bh` (`av1_filter_intra_predictor_c` walks its 4x2 patches over a
+    // rectangle just as happily), so a `use_filter_intra` strip at this level
+    // predicts instead of refusing. The below-16x16 leaf arm
+    // (`decode_leaf_rect`) keeps the refusal: it has no gate of its own.
     if filter_intra.is_some() {
-        // `predict_filter_intra` (spec 7.11.2.3) is square-only in this
-        // decoder (`assert_eq!(dst.len(), side*side)`) -- a real symbol was
-        // already read above so the stream stays in sync, this only refuses
-        // the *pixel* decode of a rare case (`use_filter_intra` on a rect
-        // strip).
-        return Err(unsupported(
-            "filter intra on a HORZ/VERT strip (this decoder predicts square-only)",
-        ));
+        FILTER_INTRA_RECT_HITS.with(|c| c.set(c.get() + 1));
     }
     let uv_predict_mode = if uv_mode == UV_CFL_PRED {
         DC_PRED
@@ -3830,7 +3842,7 @@ fn decode_leaf_rect(
     };
     if depth != 0 {
         return Err(unsupported(
-            "a HORZ/VERT intra strip with a split transform (per-unit rect \
+            "a HORZ/VERT intra strip below 16x16 with a split transform (per-unit rect \
              prediction is not ported)",
         ));
     }
@@ -4789,6 +4801,7 @@ impl PlaneBuf {
                 left.as_deref(),
                 corner,
                 bw,
+                bh,
                 &mut prediction,
             );
         } else {
@@ -4860,6 +4873,7 @@ impl PlaneBuf {
                     above.as_deref(),
                     left.as_deref(),
                     corner,
+                    side,
                     side,
                     &mut prediction,
                 );
