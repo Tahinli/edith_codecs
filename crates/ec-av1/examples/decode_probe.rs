@@ -33,10 +33,11 @@ fn main() {
             println!("OK but EMPTY: no frames -- is {path} an IVF rather than a raw OBU stream?");
         }
         Ok(frames) => {
-            println!("OK: {} frames decoded", frames.len());
-            // Optional second arg: dump the decoded planes as raw yuv420p so a
-            // pixel diff against `ffmpeg -i s.obu -f rawvideo` needs no test harness.
-            if let Some(out) = std::env::args().nth(2) {
+            // Optional second arg, or EC_PROBE_OUT=<path>: dump the decoded
+            // planes as raw yuv420p so a pixel diff against `ffmpeg -i s.obu
+            // -f rawvideo` needs no test harness.
+            let out = std::env::args().nth(2).or_else(|| std::env::var("EC_PROBE_OUT").ok());
+            if let Some(out) = out {
                 // 8-bit only: planes are u16, take the low byte.
                 let mut buf: Vec<u8> = Vec::new();
                 for f in &frames {
@@ -47,6 +48,7 @@ fn main() {
                 std::fs::write(&out, &buf).expect("writing raw planes");
                 println!("wrote {} bytes of yuv420p to {out}", buf.len());
             }
+            println!("OK: {} frames decoded, {}x{}", frames.len(), frames[0].width, frames[0].height);
         }
         Err(e) => println!("REFUSED: {e}"),
     }

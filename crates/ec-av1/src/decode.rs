@@ -1118,6 +1118,62 @@ pub(crate) fn obmc_hits() -> usize {
     OBMC_HITS.with(|c| c.get())
 }
 
+// lane-scaledref r1: per-case firing counts for the scaled-reference gate
+// (class `gate-blind-to-feature`) -- a pixel match under an UNSCALED
+// reference would pass just as well and prove nothing, so the gate
+// hard-asserts each combination this round lifts actually occurred:
+// a compound block with a scaled tap, a warp block whose warp libaom
+// suppresses because the reference is scaled, an OBMC block, an interintra
+// block, and an 8x8 leaf.
+thread_local! {
+    static SCALED_COMPOUND_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SCALED_WARP_FALLBACK_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SCALED_OBMC_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SCALED_INTERINTRA_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SCALED_BLOCK8_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SCALED_WARP_SUPPRESSED_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static MIXED_SCALE_COMPOUND_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`MIXED_SCALE_COMPOUND_HITS`]: compound blocks with one
+/// scaled and one unscaled tap.
+pub(crate) fn mixed_scale_compound_hits() -> usize {
+    MIXED_SCALE_COMPOUND_HITS.with(|c| c.get())
+}
+
+/// Current value of [`SCALED_WARP_SUPPRESSED_HITS`]: blocks that would have
+/// read the 3-symbol `motion_mode_cdf` but read the 2-symbol `obmc_cdf`
+/// instead because their reference is scaled (libaom `motion_mode_allowed`,
+/// `blockd.h:1484`).
+pub(crate) fn scaled_warp_suppressed_hits() -> usize {
+    SCALED_WARP_SUPPRESSED_HITS.with(|c| c.get())
+}
+
+/// Current value of [`SCALED_COMPOUND_HITS`].
+pub(crate) fn scaled_compound_hits() -> usize {
+    SCALED_COMPOUND_HITS.with(|c| c.get())
+}
+
+/// Current value of [`SCALED_WARP_FALLBACK_HITS`].
+pub(crate) fn scaled_warp_fallback_hits() -> usize {
+    SCALED_WARP_FALLBACK_HITS.with(|c| c.get())
+}
+
+/// Current value of [`SCALED_OBMC_HITS`].
+pub(crate) fn scaled_obmc_hits() -> usize {
+    SCALED_OBMC_HITS.with(|c| c.get())
+}
+
+/// Current value of [`SCALED_INTERINTRA_HITS`].
+pub(crate) fn scaled_interintra_hits() -> usize {
+    SCALED_INTERINTRA_HITS.with(|c| c.get())
+}
+
+/// Current value of [`SCALED_BLOCK8_HITS`].
+pub(crate) fn scaled_block8_hits() -> usize {
+    SCALED_BLOCK8_HITS.with(|c| c.get())
+}
+
 // lane-motionmode round 3: same proof as [`OBMC_HITS`], narrowed to
 // `decode_inter_block8`'s own 8x8-leaf `read_motion_mode` -- a subset of
 // [`OBMC_HITS`] (both fire together on an 8x8 hit), lets the gate tell an
@@ -1935,6 +1991,18 @@ fn dc_sign_ctx(vote: i32) -> usize {
 /// (spec 5.11.40): its bit length in unary, then that many of its own bits,
 /// most significant first — the exact inverse of [`crate::tile::write_golomb`].
 fn read_golomb(dec: &mut SymbolDecoder) -> Result<u32> {
+    // lane-scaledref r1: this cap MASKS A REAL DEFECT and must not be lifted
+    // on its own. Reading up to 32 leading zeros (dav1d's `len < 32`; libaom
+    // itself calls a 21st bit a corrupt frame, decodetxb.c:30) is bit-identical
+    // for every tail any encoder writes -- our own writer tops out at 19 zeros
+    // (`tile::MAX_LEVEL == MAX_BR_LEVEL + (1 << 19)`) -- and was implemented
+    // and round-trip tested here (commit ee1f980, reverted in 314ee08). It
+    // turned `a_real_aomenc_stream_with_a_superblock_level_horz_vert_partition_decodes_pixel_exact`
+    // RED: seed 67 stops here today, and with the cap raised it decodes to a
+    // frame-0 LUMA MISMATCH instead. A key frame cannot legitimately carry a
+    // level above 1<<19, so the long tail is the SYMPTOM of an earlier desync
+    // in that intra rect64 stream -- class `refusal-hides-a-defect`. Lift this
+    // together with that defect's fix, not before.
     let mut length = 1u32;
     while dec.literal(1) == 0 {
         length += 1;
@@ -10288,21 +10356,43 @@ fn obmc_neighbour_pred(
     luma: bool,
     h_kind: mc::InterpFilterKind,
     v_kind: mc::InterpFilterKind,
+    // lane-scaledref r1: spec 7.11.3.3's x_scale_fp for THIS neighbour's own
+    // reference (derived from luma widths, applied unchanged to chroma whose
+    // x_q4 is already in its own plane's pixel units). `REF_NO_SCALE` takes
+    // the ordinary stride-1 path bit-exact.
+    x_scale_fp: i64,
 ) -> Vec<u16> {
     let mut out = vec![0u16; w * h];
-    mc::predict_with_filters(
-        &refplane.data,
-        refplane.width,
-        refplane.true_width,
-        refplane.true_height,
-        mv_to_q4(x, mv.1, luma),
-        mv_to_q4(y, mv.0, luma),
-        w,
-        h,
-        h_kind,
-        v_kind,
-        &mut out,
-    );
+    if x_scale_fp == mc::REF_NO_SCALE {
+        mc::predict_with_filters(
+            &refplane.data,
+            refplane.width,
+            refplane.true_width,
+            refplane.true_height,
+            mv_to_q4(x, mv.1, luma),
+            mv_to_q4(y, mv.0, luma),
+            w,
+            h,
+            h_kind,
+            v_kind,
+            &mut out,
+        );
+    } else {
+        mc::predict_scaled(
+            &refplane.data,
+            refplane.width,
+            refplane.true_width,
+            refplane.true_height,
+            mv_to_q4(x, mv.1, luma),
+            mv_to_q4(y, mv.0, luma),
+            x_scale_fp,
+            w,
+            h,
+            h_kind,
+            v_kind,
+            &mut out,
+        );
+    }
     out
 }
 
@@ -10463,6 +10553,12 @@ fn obmc_blend(
     ref_v: &PlaneBuf,
     other_refs: &RefSlots,
     interp_fixed: Option<mc::InterpFilterKind>,
+    // lane-scaledref r1: this frame's own coded luma width -- each OBMC
+    // neighbour is re-predicted against ITS OWN reference, which may be
+    // scaled differently from this block's (spec 7.11.3.3 / libaom
+    // `av1_setup_build_prediction_by_above_pred` passing that ref's own
+    // `scale_factors`).
+    frame_width: usize,
     pred_y: &mut [u16],
     pred_u: &mut [u16],
     pred_v: &mut [u16],
@@ -10478,6 +10574,11 @@ fn obmc_blend(
     };
     let overlap_above = write_h / 2;
     let overlap_left = write_w / 2;
+    // lane-inter8 r1 / lane-scaledref r1: `av1_skip_u4x4_pred_in_obmc`
+    // (`reconinter.c` 820, `DISABLE_CHROMA_U8X8_OBMC == 0` -- "one-sided
+    // obmc") returns `dir == 0` when the chroma plane's own block is
+    // BLOCK_4X4/8X4/4X8 (an 8x8, 16x8 or 8x16 luma block at 4:2:0): the
+    // ABOVE pass skips chroma entirely, the LEFT pass still blends it.
     let skip_chroma_above = matches!((write_w, write_h), (8, 8) | (16, 8) | (8, 16));
 
     for (off4, span4, nb) in overlappable_above(grid, mi_row, mi_col, bw4, mi_cols, max_nb(bw4))
@@ -10491,20 +10592,15 @@ fn obmc_blend(
             neighbours.above_filter[mi_col + off4],
         );
         let (ny, nu, nv) = ref_planes(nb.ref_frame, ref_y, ref_u, ref_v, other_refs)?;
+        let nb_scale = mc::scale_factor(ny.width, frame_width);
         let (bw, bh, ox) = (span4 * 4, overlap_above, off4 * 4);
-        let tmp_y = obmc_neighbour_pred(ny, px + ox, py, nb.mv, bw, bh, true, h_kind, v_kind);
+        let tmp_y = obmc_neighbour_pred(ny, px + ox, py, nb.mv, bw, bh, true, h_kind, v_kind, nb_scale);
         obmc_blend_v(pred_y, side, ox, 0, bw, bh, &tmp_y);
-        // lane-inter8 r1: `av1_skip_u4x4_pred_in_obmc` (`reconinter.c` 820,
-        // `DISABLE_CHROMA_U8X8_OBMC == 0` -- "one-sided obmc"): when the
-        // chroma plane's own block size is BLOCK_4X4/8X4/4X8 (a 8x8, 16x8 or
-        // 8x16 luma block at 4:2:0), the ABOVE pass skips chroma entirely
-        // while the LEFT pass still blends it. Blending chroma here as well
-        // would both mis-predict every 8x8 leaf and ask for an overlap of 2.
         if !skip_chroma_above {
             let (cbw, cbh, cox) = (bw / 2, overlap_above / 2, ox / 2);
-            let tmp_u = obmc_neighbour_pred(nu, cpx + cox, cpy, nb.mv, cbw, cbh, false, h_kind, v_kind);
+            let tmp_u = obmc_neighbour_pred(nu, cpx + cox, cpy, nb.mv, cbw, cbh, false, h_kind, v_kind, nb_scale);
             obmc_blend_v(pred_u, chroma_side, cox, 0, cbw, cbh, &tmp_u);
-            let tmp_v = obmc_neighbour_pred(nv, cpx + cox, cpy, nb.mv, cbw, cbh, false, h_kind, v_kind);
+            let tmp_v = obmc_neighbour_pred(nv, cpx + cox, cpy, nb.mv, cbw, cbh, false, h_kind, v_kind, nb_scale);
             obmc_blend_v(pred_v, chroma_side, cox, 0, cbw, cbh, &tmp_v);
         }
     }
@@ -10515,13 +10611,14 @@ fn obmc_blend(
             neighbours.left_filter[mi_row + off4],
         );
         let (ny, nu, nv) = ref_planes(nb.ref_frame, ref_y, ref_u, ref_v, other_refs)?;
+        let nb_scale = mc::scale_factor(ny.width, frame_width);
         let (bw, bh, oy) = (overlap_left, span4 * 4, off4 * 4);
-        let tmp_y = obmc_neighbour_pred(ny, px, py + oy, nb.mv, bw, bh, true, h_kind, v_kind);
+        let tmp_y = obmc_neighbour_pred(ny, px, py + oy, nb.mv, bw, bh, true, h_kind, v_kind, nb_scale);
         obmc_blend_h(pred_y, side, 0, oy, bw, bh, &tmp_y);
         let (cbw, cbh, coy) = (overlap_left / 2, bh / 2, oy / 2);
-        let tmp_u = obmc_neighbour_pred(nu, cpx, cpy + coy, nb.mv, cbw, cbh, false, h_kind, v_kind);
+        let tmp_u = obmc_neighbour_pred(nu, cpx, cpy + coy, nb.mv, cbw, cbh, false, h_kind, v_kind, nb_scale);
         obmc_blend_h(pred_u, chroma_side, 0, coy, cbw, cbh, &tmp_u);
-        let tmp_v = obmc_neighbour_pred(nv, cpx, cpy + coy, nb.mv, cbw, cbh, false, h_kind, v_kind);
+        let tmp_v = obmc_neighbour_pred(nv, cpx, cpy + coy, nb.mv, cbw, cbh, false, h_kind, v_kind, nb_scale);
         obmc_blend_h(pred_v, chroma_side, 0, coy, cbw, cbh, &tmp_v);
     }
     Ok(())
@@ -11592,14 +11689,23 @@ fn decode_inter_block(
             );
             block_filter = resolved_filter;
 
-            // lane-superres r9: a scaled reference in a COMPOUND_REFERENCE
-            // block (either tap) is not wired -- mc::predict_compound_intermediate
-            // has no scaled counterpart yet -- refuse by name rather than
-            // silently sample it unscaled.
-            if py0.width != frame_width || py1.width != frame_width {
-                return Err(unsupported(
-                    "a compound-reference block with a scaled reference (superres, unimplemented)",
-                ));
+            // lane-scaledref r1: each compound tap scales INDEPENDENTLY off
+            // its own stored reference's luma width (spec 7.11.3.3 derives
+            // x_scale_fp per reference; libaom `av1_setup_pre_planes` builds
+            // one `scale_factors` per `ref_frame`), so the two taps can carry
+            // different ratios in the same block. `REF_NO_SCALE` reduces
+            // `predict_compound_intermediate`'s walk to the ordinary
+            // stride-1 one, so the unscaled case is unchanged.
+            let scale0 = mc::scale_factor(py0.width, frame_width);
+            let scale1 = mc::scale_factor(py1.width, frame_width);
+            if scale0 != mc::REF_NO_SCALE || scale1 != mc::REF_NO_SCALE {
+                SCALED_COMPOUND_HITS.with(|c| c.set(c.get() + 1));
+            }
+            // lane-scaledref r2: the MIXED case -- one tap scaled, the other
+            // not -- is the one an all-frames-scaled recipe never produces,
+            // and the one a single shared scale factor would get wrong.
+            if (scale0 == mc::REF_NO_SCALE) != (scale1 == mc::REF_NO_SCALE) {
+                MIXED_SCALE_COMPOUND_HITS.with(|c| c.set(c.get() + 1));
             }
 
             let mut inter0_y = vec![0i32; side * side];
@@ -11610,6 +11716,7 @@ fn decode_inter_block(
                 py0.true_height,
                 mv_to_q4(px, mv0.1, true),
                 mv_to_q4(py, mv0.0, true),
+                scale0,
                 side,
                 side,
                 h_filter,
@@ -11634,6 +11741,7 @@ fn decode_inter_block(
                 py1.true_height,
                 mv_to_q4(px, mv1.1, true),
                 mv_to_q4(py, mv1.0, true),
+                scale1,
                 side,
                 side,
                 h_filter,
@@ -11679,6 +11787,7 @@ fn decode_inter_block(
                 pu0.true_height,
                 mv_to_q4(cpx, mv0.1, false),
                 mv_to_q4(cpy, mv0.0, false),
+                scale0,
                 chroma_side,
                 chroma_side,
                 h_filter,
@@ -11705,6 +11814,7 @@ fn decode_inter_block(
                 pu1.true_height,
                 mv_to_q4(cpx, mv1.1, false),
                 mv_to_q4(cpy, mv1.0, false),
+                scale1,
                 chroma_side,
                 chroma_side,
                 h_filter,
@@ -11747,6 +11857,7 @@ fn decode_inter_block(
                 pv0.true_height,
                 mv_to_q4(cpx, mv0.1, false),
                 mv_to_q4(cpy, mv0.0, false),
+                scale0,
                 chroma_side,
                 chroma_side,
                 h_filter,
@@ -11773,6 +11884,7 @@ fn decode_inter_block(
                 pv1.true_height,
                 mv_to_q4(cpx, mv1.1, false),
                 mv_to_q4(cpy, mv1.0, false),
+                scale1,
                 chroma_side,
                 chroma_side,
                 h_filter,
@@ -12233,8 +12345,27 @@ fn decode_inter_block(
                 // `motion_mode_allowed` reads the 3-symbol `motion_mode_cdf`
                 // instead of the 2-symbol `obmc_cdf` exactly when
                 // `num_proj_ref >= 1` under `allow_warped_motion`.
+                // lane-scaledref r2: libaom `motion_mode_allowed`
+                // (`blockd.h:1484`) requires
+                // `!av1_is_scaled(block_ref_scale_factors[0])` for
+                // WARPED_CAUSAL -- under a scaled reference (superres) the
+                // block reads the 2-symbol `obmc_cdf`, never the 3-symbol
+                // `motion_mode_cdf`. Reading the wrong alphabet here narrows
+                // the arithmetic coder by the wrong amount and predicts the
+                // rest of the tile off a diverged state: it was silently
+                // wrong pixels (r1's `--enable-warped-motion=1` superres
+                // mismatch), not a desync error.
+                let ref_is_scaled =
+                    mc::scale_factor(py_ref.width, frame_width) != mc::REF_NO_SCALE;
                 let warp_eligible = allow_warped_motion
+                    && !ref_is_scaled
                     && num_proj_ref(grid, mi_row, mi_col, bw4, bh4, mi_cols as usize, mi_rows as usize, ref_frame) >= 1;
+                if allow_warped_motion
+                    && ref_is_scaled
+                    && num_proj_ref(grid, mi_row, mi_col, bw4, bh4, mi_cols as usize, mi_rows as usize, ref_frame) >= 1
+                {
+                    SCALED_WARP_SUPPRESSED_HITS.with(|c| c.set(c.get() + 1));
+                }
                 if warp_eligible {
                     let mode = dec.symbol(&mut cdfs.motion_mode[bsize_idx]);
                     match mode {
@@ -12414,12 +12545,29 @@ fn decode_inter_block(
             // (warp_params/obmc_selected/interintra_mode are all resolved by
             // this point, every symbol for this block already read).
             let luma_scale = mc::scale_factor(py_ref.width, frame_width);
-            if luma_scale != mc::REF_NO_SCALE
-                && (warp_params.is_some() || obmc_selected || interintra_mode.is_some())
-            {
-                return Err(unsupported(
-                    "warp/OBMC/interintra prediction with a scaled reference (superres, unimplemented)",
-                ));
+            if luma_scale != mc::REF_NO_SCALE {
+                // lane-scaledref r1: libaom `allow_warp`
+                // (av1/common/reconinter.c:41) suppresses BOTH local and
+                // global warp under a scaled reference and predicts
+                // translationally instead -- that fallback is implemented
+                // below, but the one real aomenc stream this round found
+                // that reaches it (`--enable-warped-motion=1`,
+                // `--superres-denominator=16`, seed 47) still mismatches
+                // ffmpeg at frame 2 luma, so the case stays refused by name
+                // until it has a green gate rather than shipping wrong
+                // pixels behind a lifted refusal.
+                if warp_params.is_some() {
+                    SCALED_WARP_FALLBACK_HITS.with(|c| c.set(c.get() + 1));
+                    return Err(unsupported(
+                        "warp prediction with a scaled reference (superres, unimplemented)",
+                    ));
+                }
+                if obmc_selected {
+                    SCALED_OBMC_HITS.with(|c| c.set(c.get() + 1));
+                }
+                if interintra_mode.is_some() {
+                    SCALED_INTERINTRA_HITS.with(|c| c.set(c.get() + 1));
+                }
             }
 
             let mut pred_y = vec![0u16; side * side];
@@ -12510,7 +12658,13 @@ fn decode_inter_block(
                 );
             }
 
-            if let Some(params) = &warp_params {
+            // lane-scaledref r1: libaom `allow_warp` (av1/common/reconinter.c:41)
+            // opens with `if (av1_is_scaled(sf)) return 0;` -- BOTH local
+            // (`wm_params`) and global warp fall back to the translational
+            // prediction above when the reference is scaled, even though the
+            // motion_mode symbol was still read and warp_params still
+            // resolved. Suppress the warp, keep every symbol read.
+            if let Some(params) = warp_params.as_ref().filter(|_| luma_scale == mc::REF_NO_SCALE) {
                 crate::warp::warp_affine(
                     params, &py_ref.data, py_ref.true_width as i32, py_ref.true_height as i32,
                     py_ref.width as i32, &mut pred_y, px as i32, py as i32, side as i32,
@@ -12551,6 +12705,7 @@ fn decode_inter_block(
                     ref_v,
                     other_refs,
                     interp_fixed,
+                    frame_width,
                     &mut pred_y,
                     &mut pred_u,
                     &mut pred_v,
@@ -13125,6 +13280,11 @@ fn decode_inter_block8(
     // mode contexts AND the number of `drl_mode` bits read (class parsed
     // then discarded).
     tpl_frame: Option<&TplFrameArgs>,
+    // lane-scaledref r1: this frame's own coded luma width (spec 7.11.3.3),
+    // for the scaled-reference MC this leaf's own single-ref/compound/OBMC
+    // predictions take when a stored reference was coded at another width
+    // (`use_superres`) -- mirrors [`decode_inter_block`]'s own param.
+    frame_width: usize,
 ) -> Result<(bool, bool, bool, Option<(i8, i8, u8, u8)>, (i8, Option<i8>))> {
     const LAST_FRAME: i8 = 1;
     let gm_table = build_gm_mv_table(
@@ -13434,6 +13594,12 @@ fn decode_inter_block8(
 
                 let (py0, pu0, pv0) = ref_planes(ref0, ref_y, ref_u, ref_v, other_refs)?;
                 let (py1, pu1, pv1) = ref_planes(ref1, ref_y, ref_u, ref_v, other_refs)?;
+                let scale0 = mc::scale_factor(py0.width, frame_width);
+                let scale1 = mc::scale_factor(py1.width, frame_width);
+                if scale0 != mc::REF_NO_SCALE || scale1 != mc::REF_NO_SCALE {
+                    SCALED_COMPOUND_HITS.with(|c| c.set(c.get() + 1));
+                    SCALED_BLOCK8_HITS.with(|c| c.set(c.get() + 1));
+                }
 
                 for dr in 0..2 {
                     for dc in 0..2 {
@@ -13470,6 +13636,7 @@ fn decode_inter_block8(
                     py0.true_height,
                     mv_to_q4(px, mv0.1, true),
                     mv_to_q4(py, mv0.0, true),
+                    scale0,
                     SIDE,
                     SIDE,
                     Regular,
@@ -13484,6 +13651,7 @@ fn decode_inter_block8(
                     py1.true_height,
                     mv_to_q4(px, mv1.1, true),
                     mv_to_q4(py, mv1.0, true),
+                    scale1,
                     SIDE,
                     SIDE,
                     Regular,
@@ -13515,6 +13683,7 @@ fn decode_inter_block8(
                     pu0.true_height,
                     mv_to_q4(cpx, mv0.1, false),
                     mv_to_q4(cpy, mv0.0, false),
+                    scale0,
                     CHROMA_SIDE,
                     CHROMA_SIDE,
                     Regular,
@@ -13529,6 +13698,7 @@ fn decode_inter_block8(
                     pu1.true_height,
                     mv_to_q4(cpx, mv1.1, false),
                     mv_to_q4(cpy, mv1.0, false),
+                    scale1,
                     CHROMA_SIDE,
                     CHROMA_SIDE,
                     Regular,
@@ -13559,6 +13729,7 @@ fn decode_inter_block8(
                     pv0.true_height,
                     mv_to_q4(cpx, mv0.1, false),
                     mv_to_q4(cpy, mv0.0, false),
+                    scale0,
                     CHROMA_SIDE,
                     CHROMA_SIDE,
                     Regular,
@@ -13573,6 +13744,7 @@ fn decode_inter_block8(
                     pv1.true_height,
                     mv_to_q4(cpx, mv1.1, false),
                     mv_to_q4(cpy, mv1.0, false),
+                    scale1,
                     CHROMA_SIDE,
                     CHROMA_SIDE,
                     Regular,
@@ -13827,6 +13999,12 @@ fn decode_inter_block8(
             // lane-warp round 1: same 3-vs-2-symbol split as the 16x16+ leaf
             // (see its own doc) -- this leaf is always `LAST_FRAME`-only
             // (grid.set below hardcodes it).
+            // lane-scaledref r2 sibling of the 16x16+ leaf's fix: libaom
+            // drops WARPED_CAUSAL eligibility (so this reads `obmc_cdf`)
+            // when the reference is scaled. Not gated here because an 8x8
+            // leaf under a scaled reference is refused before this function
+            // runs (see the block8 refusal below, ~12500) -- whoever lifts
+            // that refusal must add `&& !ref_is_scaled` here too.
             let warp_eligible = allow_warped_motion
                 && num_proj_ref(grid, mi_row, mi_col, 2, 2, mi_cols as usize, mi_rows as usize, LAST_FRAME) >= 1;
             if warp_eligible {
@@ -13880,42 +14058,51 @@ fn decode_inter_block8(
         }
         mode_for_tx = 0;
 
+        // lane-scaledref r1: this leaf's own prediction is always `Regular`
+        // (documented corner-cut above); under a scaled reference the same
+        // fixed kernel runs through spec 7.11.3.3's scaled walk instead.
+        let luma_scale = mc::scale_factor(ref_y.width, frame_width);
+        if luma_scale != mc::REF_NO_SCALE {
+            SCALED_BLOCK8_HITS.with(|c| c.set(c.get() + 1));
+        }
         let mut pred_y = vec![0u16; SIDE * SIDE];
-        mc::predict(
-            &ref_y.data,
-            ref_y.width,
-            ref_y.true_width,
-            ref_y.true_height,
-            mv_to_q4(px, mv.1, true),
-            mv_to_q4(py, mv.0, true),
-            SIDE,
-            SIDE,
-            &mut pred_y,
-        );
         let mut pred_u = vec![0u16; CHROMA_SIDE * CHROMA_SIDE];
-        mc::predict(
-            &ref_u.data,
-            ref_u.width,
-            ref_u.true_width,
-            ref_u.true_height,
-            mv_to_q4(cpx, mv.1, false),
-            mv_to_q4(cpy, mv.0, false),
-            CHROMA_SIDE,
-            CHROMA_SIDE,
-            &mut pred_u,
-        );
         let mut pred_v = vec![0u16; CHROMA_SIDE * CHROMA_SIDE];
-        mc::predict(
-            &ref_v.data,
-            ref_v.width,
-            ref_v.true_width,
-            ref_v.true_height,
-            mv_to_q4(cpx, mv.1, false),
-            mv_to_q4(cpy, mv.0, false),
-            CHROMA_SIDE,
-            CHROMA_SIDE,
-            &mut pred_v,
-        );
+        for (plane, x, y, dim, dst) in [
+            (ref_y, px, py, SIDE, &mut pred_y),
+            (ref_u, cpx, cpy, CHROMA_SIDE, &mut pred_u),
+            (ref_v, cpx, cpy, CHROMA_SIDE, &mut pred_v),
+        ] {
+            let luma = std::ptr::eq(plane, ref_y);
+            if luma_scale == mc::REF_NO_SCALE {
+                mc::predict(
+                    &plane.data,
+                    plane.width,
+                    plane.true_width,
+                    plane.true_height,
+                    mv_to_q4(x, mv.1, luma),
+                    mv_to_q4(y, mv.0, luma),
+                    dim,
+                    dim,
+                    dst,
+                );
+            } else {
+                mc::predict_scaled(
+                    &plane.data,
+                    plane.width,
+                    plane.true_width,
+                    plane.true_height,
+                    mv_to_q4(x, mv.1, luma),
+                    mv_to_q4(y, mv.0, luma),
+                    luma_scale,
+                    dim,
+                    dim,
+                    mc::InterpFilterKind::Regular,
+                    mc::InterpFilterKind::Regular,
+                    dst,
+                );
+            }
+        }
 
         if obmc_selected {
             obmc_blend(
@@ -13940,6 +14127,7 @@ fn decode_inter_block8(
                 ref_v,
                 other_refs,
                 interp_fixed,
+                frame_width,
                 &mut pred_y,
                 &mut pred_u,
                 &mut pred_v,
@@ -14989,15 +15177,23 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     .map(|i| (mi_row0 + (i / 2) * 2, mi_col0 + (i % 2) * 2))
                                     .filter(|&(mr, mc)| mr < mi_rows && mc < mi_cols)
                                     .collect();
-                                // lane-superres r9: decode_inter_block8's own
-                                // MC (below) is not threaded for a scaled
-                                // reference (unlike decode_inter_block's 19
-                                // sites) -- refuse the whole 8x8-leaf split
-                                // up front when ANY live reference this leaf
-                                // could pick has a different width than this
-                                // frame, rather than thread frame_width
-                                // through its own single-ref/compound MC
-                                // calls to reach the same block this round.
+                                // lane-scaledref r1: `decode_inter_block8` IS
+                                // threaded for a scaled reference now (its
+                                // single-ref, compound and OBMC MC all take
+                                // spec 7.11.3.3's scaled walk), but the one
+                                // recipe that reaches this path at all -- a
+                                // 64x72 superres fixture whose bottom 16-row
+                                // band straddles the true edge, so the
+                                // gathered split bit lands on 8x8 leaves --
+                                // DESYNCS inside the leaf itself
+                                // (`from_switchable_symbol` handed a 4th
+                                // symbol, mc.rs:200), the same
+                                // below-8x8 desync lane-sub8 r2 left open and
+                                // unrelated to scaling. So the scaled MC here
+                                // is unproven: refuse by name rather than
+                                // ship a capability claim no gate exercises.
+                                // Deleting these six lines is the whole lift
+                                // once the leaf8 desync is fixed.
                                 if ref_y.width != frame_width as usize
                                     || ref_slots.iter().flatten().any(|(py, _, _)| {
                                         py.width != frame_width as usize
@@ -15058,6 +15254,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                             &sign_bias_table,
                                             &global_motion,
                                             tpl_frame.as_ref(),
+                                            frame_width as usize,
                                         )?;
                                     prev_leaves.push((leaf_mi, skip, is_inter, leaf_refs.0, leaf_refs.1));
                                     last_skip_mode = skip_mode_leaf;
