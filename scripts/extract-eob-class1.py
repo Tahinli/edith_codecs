@@ -5,7 +5,9 @@
 `[TOKEN_CDF_Q_CTXS][PLANE_TYPES][2][CDF_SIZE(n)]`; the third index is
 `eob_multi_ctx = (tx_class == TX_CLASS_2D) ? 0 : 1`.  This prints the
 class-1 (index 1) rows as `EOB_PT_<n>_<PLANE>_CLASS1[_Qk]` consts and, with
-`--check <cdf.rs>`, diffs every const that file already defines.
+`--check <cdf.rs>`, diffs every const that file already defines -- BOTH classes,
+so a 2D const accidentally transcribed from the class-1 row is caught too
+(rectsplit r4 suspected exactly that of `EOB_PT_512_CHROMA`).
 
 Usage: extract-eob-class1.py <token_cdfs.h> [--check <cdf.rs>]
 """
@@ -37,8 +39,9 @@ def consts(src):
         rows = parse(src, size)
         for q in range(4):
             for p, plane in enumerate(("LUMA", "CHROMA")):
-                row = rows[q * 4 + p * 2 + 1]
-                out[f"EOB_PT_{size}_{plane}_CLASS1{QSUF[q]}"] = row + [32768, 0]
+                for cls, suf in ((0, ""), (1, "_CLASS1")):
+                    row = rows[q * 4 + p * 2 + cls]
+                    out[f"EOB_PT_{size}_{plane}{suf}{QSUF[q]}"] = row + [32768, 0]
     return out
 
 
