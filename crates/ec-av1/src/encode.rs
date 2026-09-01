@@ -1020,7 +1020,7 @@ pub(crate) struct Reach {
 /// it. Indexed by the block's position in the superblock, in blocks of its own
 /// size, as `row * (128 / side) + col` (`Reach::table_stride`) -- libaom's
 /// 128, not this crate's 64 superblock -- bit by bit from the low end.
-const HAS_TOP_RIGHT: [&[u8]; 3] = [
+const HAS_TOP_RIGHT: [&[u8]; 4] = [
     &[255, 85, 119, 85, 127, 85, 119, 85],
     &[95, 87],
     // has_tr_8x8 (libaom av1/common/reconintra.c) -- table_stride(8) == 16
@@ -1029,17 +1029,44 @@ const HAS_TOP_RIGHT: [&[u8]; 3] = [
         255, 255, 85, 85, 119, 119, 85, 85, 127, 127, 85, 85, 119, 119, 85, 85, 255, 127, 85, 85,
         119, 119, 85, 85, 127, 127, 85, 85, 119, 119, 85, 85,
     ],
+
+    // has_tr_4x4 (libaom av1/common/reconintra.c, transcribed verbatim) --
+    // table_stride(4) == 32 (128 / 4), so 32 bits per row, 32 rows, 128
+    // bytes. Sub-8x8 leaves (lane-sub8) are the only blocks that reach here
+    // with side 4 outside a TX4 split; without their own row they clamped
+    // into the 8x8 table and read above-right samples the decoder has not
+    // written yet (all-zero pixels in the bottom-right triangle of a
+    // directional 4x4 leaf).
+    &[
+        255, 255, 255, 255, 85, 85, 85, 85, 119, 119, 119, 119, 85, 85, 85, 85, 127, 127, 127, 127,
+        85, 85, 85, 85, 119, 119, 119, 119, 85, 85, 85, 85, 255, 127, 255, 127, 85, 85, 85, 85,
+        119, 119, 119, 119, 85, 85, 85, 85, 127, 127, 127, 127, 85, 85, 85, 85, 119, 119, 119, 119,
+        85, 85, 85, 85, 255, 255, 255, 127, 85, 85, 85, 85, 119, 119, 119, 119, 85, 85, 85, 85,
+        127, 127, 127, 127, 85, 85, 85, 85, 119, 119, 119, 119, 85, 85, 85, 85, 255, 127, 255, 127,
+        85, 85, 85, 85, 119, 119, 119, 119, 85, 85, 85, 85, 127, 127, 127, 127, 85, 85, 85, 85,
+        119, 119, 119, 119, 85, 85, 85, 85,
+    ],
 ];
 
 /// `has_bl_16x16` / `has_bl_32x32`: the same, for the block below and to the
 /// left.
-const HAS_BOTTOM_LEFT: [&[u8]; 3] = [
+const HAS_BOTTOM_LEFT: [&[u8]; 4] = [
     &[84, 16, 84, 0, 84, 16, 84, 0],
     &[4, 4],
     // has_bl_8x8 (libaom av1/common/reconintra.c)
     &[
         84, 85, 16, 17, 84, 85, 0, 1, 84, 85, 16, 17, 84, 85, 0, 0, 84, 85, 16, 17, 84, 85, 0, 1,
         84, 85, 16, 17, 84, 85, 0, 0,
+    ],
+
+    // has_bl_4x4 (same source, same order).
+    &[
+        84, 85, 85, 85, 16, 17, 17, 17, 84, 85, 85, 85, 0, 1, 1, 1, 84, 85, 85, 85, 16, 17, 17, 17,
+        84, 85, 85, 85, 0, 0, 1, 0, 84, 85, 85, 85, 16, 17, 17, 17, 84, 85, 85, 85, 0, 1, 1, 1, 84,
+        85, 85, 85, 16, 17, 17, 17, 84, 85, 85, 85, 0, 0, 0, 0, 84, 85, 85, 85, 16, 17, 17, 17, 84,
+        85, 85, 85, 0, 1, 1, 1, 84, 85, 85, 85, 16, 17, 17, 17, 84, 85, 85, 85, 0, 0, 1, 0, 84, 85,
+        85, 85, 16, 17, 17, 17, 84, 85, 85, 85, 0, 1, 1, 1, 84, 85, 85, 85, 16, 17, 17, 17, 84, 85,
+        85, 85, 0, 0, 0, 0,
     ],
 ];
 
@@ -1134,17 +1161,9 @@ impl Reach {
         if col + 1 == per_side {
             return false;
         }
-        // corner-cut: `HAS_TOP_RIGHT`/`HAS_BOTTOM_LEFT` only carry dedicated
-        // rows for side 8/16/32/64 (libaom's own `has_tr_8x8`/`has_tr_16x16`
-        // families); a `TxMode::Select` TX4 transform unit reaches here with
-        // side 4, whose real table (`has_tr_4x4`, 128 bytes) was never
-        // transcribed. Clamping into the 16/32 table's own bit range keeps
-        // this in-bounds and correct at every position that table already
-        // covers periodically -- wrong only at the small remainder past its
-        // length, a reach over-/under-estimate (extra or missing above-right
-        // reference pixels), never a stream desync (Reach never gates a
-        // symbol read). Ceiling: transcribe `has_tr_4x4`/`has_bl_4x4`
-        // verbatim and give TX4 its own `HAS_TOP_RIGHT`/`HAS_BOTTOM_LEFT` row.
+        // lane-sub8 r4: side 4 now has its own `has_tr_4x4`/`has_bl_4x4`
+        // row (the corner-cut this comment used to describe); sides 16/32/64
+        // share row 0 exactly as libaom's tables repeat.
         let table = HAS_TOP_RIGHT[Self::table(side)];
         Self::bit(
             table,
@@ -1164,7 +1183,7 @@ impl Reach {
         if row + 1 == per_side {
             return false;
         }
-        // corner-cut: see `top_right`'s note -- same clamp, same ceiling.
+        // See `top_right`'s note.
         let table = HAS_BOTTOM_LEFT[Self::table(side)];
         Self::bit(
             table,
@@ -1200,6 +1219,8 @@ impl Reach {
             1
         } else if side == 8 {
             2
+        } else if side == 4 {
+            3
         } else {
             0
         }
