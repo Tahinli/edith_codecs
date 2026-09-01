@@ -641,3 +641,67 @@ s = s.replace(old4, new4, 1)
 open(path, "w").write(s)
 print("decodetxb rung 11 (per-symbol coeff ladder) instrumented")
 PYC11
+
+# --- rung 12: FINAL reconstruction dump (lane-hidden r1) ----------------
+# EC_AV1_FINAL_DUMP=<prefix> -> <prefix>.f<N> per DECODED frame (decode order,
+# hidden alt-ref frames included), written after CDEF + superres + loop
+# restoration have all run, i.e. exactly the frame as it is stored into the
+# reference buffer. Y then U then V, crop-sized rows (post-superres
+# y_crop_width), 8-bit as u8 and high bitdepth as u16 LE -- bit-depth
+# correct, unlike the u8-narrowing debug dumps.
+#
+# Rungs 1/6 (pre-filter / post-deblock) stop before CDEF+LR+superres, and
+# every ffmpeg/aomdec pixel gate in this repo compares SHOWN frames only
+# (class gate-blind-to-hidden-frames), so before this rung no instrument in
+# the repo could compare a hidden frame's final pixels at all.
+python3 - "$F" <<'PYF'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+if "EC_INSTRUMENTED_FINAL" in s:
+    print("final dump already instrumented (no-op)")
+    sys.exit(0)
+
+anchor = """  if (!pbi->dcb.corrupted) {
+    if (cm->features.refresh_frame_context == REFRESH_FRAME_CONTEXT_BACKWARD) {"""
+dump = """  /* EC_INSTRUMENTED_FINAL */
+  {
+    const char *ec_dump = getenv("EC_AV1_FINAL_DUMP");
+    if (ec_dump) {
+      static int ec_final_idx = 0;
+      char ec_path[1024];
+      snprintf(ec_path, sizeof(ec_path), "%s.f%d", ec_dump, ec_final_idx++);
+      FILE *ec_f = fopen(ec_path, "wb");
+      if (ec_f) {
+        const YV12_BUFFER_CONFIG *ec_b = &cm->cur_frame->buf;
+        const int ec_hbd = (ec_b->flags & YV12_FLAG_HIGHBITDEPTH) != 0;
+        const uint8_t *const ec_p8[3] = { ec_b->y_buffer, ec_b->u_buffer,
+                                          ec_b->v_buffer };
+        const int ec_st[3] = { ec_b->y_stride, ec_b->uv_stride,
+                               ec_b->uv_stride };
+        const int ec_w[3] = { ec_b->y_crop_width, ec_b->uv_crop_width,
+                              ec_b->uv_crop_width };
+        const int ec_h[3] = { ec_b->y_crop_height, ec_b->uv_crop_height,
+                              ec_b->uv_crop_height };
+        for (int ec_pl = 0; ec_pl < (num_planes > 1 ? 3 : 1); ++ec_pl) {
+          for (int ec_r = 0; ec_r < ec_h[ec_pl]; ++ec_r) {
+            if (ec_hbd) {
+              const uint16_t *ec_s = CONVERT_TO_SHORTPTR(ec_p8[ec_pl]);
+              fwrite(ec_s + (size_t)ec_r * ec_st[ec_pl], 2, ec_w[ec_pl], ec_f);
+            } else {
+              fwrite(ec_p8[ec_pl] + (size_t)ec_r * ec_st[ec_pl], 1,
+                     ec_w[ec_pl], ec_f);
+            }
+          }
+        }
+        fclose(ec_f);
+      }
+    }
+  }
+
+"""
+assert anchor in s, "final dump anchor moved"
+s = s.replace(anchor, dump + anchor, 1)
+open(path, "w").write(s)
+print("final dump instrumented")
+PYF

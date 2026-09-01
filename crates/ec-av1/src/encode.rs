@@ -1043,6 +1043,59 @@ const HAS_BOTTOM_LEFT: [&[u8]; 3] = [
     ],
 ];
 
+/// `has_tr_vert_*` (libaom `reconintra.c`, `has_tr_vert_tables`), indexed by
+/// [`Reach::table`] exactly like [`HAS_TOP_RIGHT`]: inside a
+/// `PARTITION_VERT_A`/`_B` the square sub-blocks are visited TL, BL, TR, BR
+/// rather than in raster order, so the bottom-left square's top-right
+/// neighbour is the partition's own right-hand rectangle -- not yet decoded.
+/// libaom switches tables on the partition type (`get_has_tr_table`); the
+/// ordinary table says 1 where this one says 0 (32x32 at row 1 col 0:
+/// `95` bit 4 = 1 vs `15` bit 4 = 0), which is exactly the case
+/// lane-part32 r5 caught reading undecoded samples.
+const HAS_TOP_RIGHT_VERT: [&[u8]; 3] = [
+    // has_tr_vert_16x16
+    &[255, 0, 119, 0, 127, 0, 119, 0],
+    // has_tr_vert_32x32
+    &[15, 7],
+    // has_tr_vert_8x8
+    &[
+        255, 255, 0, 0, 119, 119, 0, 0, 127, 127, 0, 0, 119, 119, 0, 0, 255, 127, 0, 0, 119, 119,
+        0, 0, 127, 127, 0, 0, 119, 119, 0, 0,
+    ],
+];
+
+/// [`HAS_TOP_RIGHT_VERT`]'s sibling, `has_bl_vert_tables`.
+const HAS_BOTTOM_LEFT_VERT: [&[u8]; 3] = [
+    // has_bl_vert_16x16
+    &[254, 16, 254, 0, 254, 16, 254, 0],
+    // has_bl_vert_32x32
+    &[14, 14],
+    // has_bl_vert_8x8
+    &[
+        254, 255, 16, 17, 254, 255, 0, 1, 254, 255, 16, 17, 254, 255, 0, 0, 254, 255, 16, 17, 254,
+        255, 0, 1, 254, 255, 16, 17, 254, 255, 0, 0,
+    ],
+];
+
+thread_local! {
+    /// Set for the duration of a `PARTITION_VERT_A`/`_B`'s own sub-blocks
+    /// (see [`Reach::vert_ab_partition`]) -- libaom carries the partition
+    /// type down into `has_top_right`/`has_bottom_left` as an argument, and
+    /// threading one bool through this crate's already twenty-argument
+    /// `decode_block` would touch every call site instead of the two arms
+    /// that need it.
+    static VERT_AB_PARTITION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Restores [`VERT_AB_PARTITION`] to what it was when the guard was made.
+pub(crate) struct VertAbGuard(bool);
+
+impl Drop for VertAbGuard {
+    fn drop(&mut self) {
+        VERT_AB_PARTITION.with(|c| c.set(self.0));
+    }
+}
+
 /// `has_tr_32x16`/`has_tr_16x32` (libaom `reconintra.c`) -- lane-intradisp
 /// r1: the two rect strips PARTITION_HORZ/VERT ever produce at the 32x32
 /// level, transcribed verbatim (not derived): `[0]` is 32-wide, `[1]` is
@@ -1113,6 +1166,15 @@ impl Reach {
         Self::bit(table, (row * Self::table_stride(bw) + col) % (table.len() * 8))
     }
 
+    /// Marks every [`Reach::of`] made until the returned guard drops as being
+    /// inside a `PARTITION_VERT_A`/`_B` (libaom's `get_has_tr_table` /
+    /// `get_has_bl_table` partition argument). Rectangular sub-blocks are
+    /// unaffected: libaom's own comment says vertical rectangles keep their
+    /// non-vert table, which is what [`Reach::of_rect`] already reads.
+    pub(crate) fn vert_ab_partition() -> VertAbGuard {
+        VertAbGuard(VERT_AB_PARTITION.with(|c| c.replace(true)))
+    }
+
     /// Neither, which is all a mode that reads no further than its own edges
     /// needs.
     pub(crate) fn none() -> Self {
@@ -1145,7 +1207,11 @@ impl Reach {
         // reference pixels), never a stream desync (Reach never gates a
         // symbol read). Ceiling: transcribe `has_tr_4x4`/`has_bl_4x4`
         // verbatim and give TX4 its own `HAS_TOP_RIGHT`/`HAS_BOTTOM_LEFT` row.
-        let table = HAS_TOP_RIGHT[Self::table(side)];
+        let table = if VERT_AB_PARTITION.with(std::cell::Cell::get) {
+            HAS_TOP_RIGHT_VERT[Self::table(side)]
+        } else {
+            HAS_TOP_RIGHT[Self::table(side)]
+        };
         Self::bit(
             table,
             (row * Self::table_stride(side) + col) % (table.len() * 8),
@@ -1165,7 +1231,11 @@ impl Reach {
             return false;
         }
         // corner-cut: see `top_right`'s note -- same clamp, same ceiling.
-        let table = HAS_BOTTOM_LEFT[Self::table(side)];
+        let table = if VERT_AB_PARTITION.with(std::cell::Cell::get) {
+            HAS_BOTTOM_LEFT_VERT[Self::table(side)]
+        } else {
+            HAS_BOTTOM_LEFT[Self::table(side)]
+        };
         Self::bit(
             table,
             (row * Self::table_stride(side) + col) % (table.len() * 8),
@@ -3492,6 +3562,45 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// lane-part32 r6: inside a `PARTITION_VERT_A`/`_B` the 8x8 squares are
+    /// visited TL, BL, TR, BR, so the TR square (even 8x8 row, odd 8x8
+    /// column inside the superblock) may read the below-left samples the
+    /// raster table forbids: `has_bl_8x8` is 0 at exactly those 16 slots
+    /// where `has_bl_vert_8x8` is 1. Pinned here because no aomenc recipe
+    /// swept in r6 produced a decodable 16x16-level VERT_B stream (every
+    /// stream that partitions that small first hits the still-refused
+    /// HORZ_A/HORZ_B/VERT_A-below-16 or coded-rect-strip-below-16 arms).
+    #[test]
+    fn vert_ab_partition_flips_below_left_for_the_top_right_8x8() {
+        let (width, height) = (SUPERBLOCK * 3, SUPERBLOCK * 3);
+        // Interior superblock, so neither the frame edge nor the col == 0 /
+        // last-row early returns answer instead of the table.
+        let (sb_x, sb_y) = (SUPERBLOCK, SUPERBLOCK);
+        let mut flipped = 0;
+        for row in 0..8 {
+            for col in 1..8 {
+                let (x, y) = (sb_x + col * 8, sb_y + row * 8);
+                let raster = Reach::of(8, x, y, width, height).below_left;
+                let vert = {
+                    let _guard = Reach::vert_ab_partition();
+                    Reach::of(8, x, y, width, height).below_left
+                };
+                // The TR square of a VERT_A/_B sits at an even row, odd
+                // column; every other slot must be untouched by the guard.
+                if row % 2 == 0 && col % 2 == 1 {
+                    assert!(!raster, "raster below_left at row={row} col={col}");
+                    assert!(vert, "vert below_left at row={row} col={col}");
+                    flipped += 1;
+                } else {
+                    assert_eq!(raster, vert, "guard moved row={row} col={col}");
+                }
+            }
+        }
+        assert_eq!(flipped, 4 * 4, "expected the 16 8x8 TR slots to flip");
+        // The guard is scoped: it must not leak past its own block.
+        assert!(!Reach::of(8, sb_x + 8, sb_y, width, height).below_left);
     }
 
     /// An odd width or height is refused by name, not by however the padder
