@@ -737,6 +737,23 @@ thread_local! {
         const { std::cell::Cell::new(0) };
 }
 
+// How many plain SQUARE intra blocks (lane-sqchroma r1) resolved a luma
+// transform smaller than their own side (`tx_depth != 0`) while coding a
+// chroma prediction other than `DC_PRED` -- the pair the square path's chroma
+// only exercises with aomenc's tx-size search left ON (its default), which
+// every older recipe in this file pins off. Counted at the block, so a stream
+// where RD happened to give every split-transform block a DC chroma mode
+// reads as zero rather than silently passing for free.
+thread_local! {
+    static SQ_CHROMA_TX_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`SQ_CHROMA_TX_HITS`].
+pub(crate) fn sq_chroma_tx_hits() -> usize {
+    SQ_CHROMA_TX_HITS.with(|c| c.get())
+}
+
 /// Current value of [`TX_DEPTH_HITS`].
 pub(crate) fn tx_depth_hits() -> usize {
     TX_DEPTH_HITS.with(|c| c.get())
@@ -5617,6 +5634,9 @@ fn decode_block(
     } else {
         (side, luma_tx)
     };
+    if tx_select && logical_tx < side && uv_mode != DC_PRED {
+        SQ_CHROMA_TX_HITS.with(|c| c.set(c.get() + 1));
+    }
     let luma_set = if tx_select {
         txbset_for(logical_tx, reduced_tx_set)
     } else {
