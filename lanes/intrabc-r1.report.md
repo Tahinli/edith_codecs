@@ -106,3 +106,9 @@ EVIDENCE: same streams | sweep cpu-used 0,1,2,3,5,6,8 x cq 20,40,55 | intrabc on
   `DCT_DCT` for chroma — no symbol difference, but a suspected pixel difference
   the moment luma picks a non-DCT type. Both are prime suspects for the first
   pixel mismatch once var-tx lands.
+
+## Test totals
+
+`EC_AV1_REQUIRE_AOMENC=1 cargo test -p ec-av1 --lib` (worktree, commit 09d6ff9):
+**267 passed, 0 failed, 23 ignored**, 1125 s. `refusal_inventory` and
+`gate_coverage` are green with the rewritten entries.
