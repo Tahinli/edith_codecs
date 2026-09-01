@@ -6975,7 +6975,6 @@ fn decode_leaf_split4(
     // one a neighbour to its RIGHT sees (its top-right 4x4, mi(row, col-1)).
 ) -> Result<(usize, usize)> {
     SUB8_SPLIT_HITS.with(|c| c.set(c.get() + 1));
-    if std::env::var_os("EC_ABLATE_SUB8").is_some() { return Err(unsupported("ablate: sub8 split")); }
     let (r, c) = outer_at;
     let mut above_mode = neighbours.above_mode[c];
     let mut left_mode = neighbours.left_mode[r];
