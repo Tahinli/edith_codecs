@@ -9951,7 +9951,8 @@ mod tests {
         );
         eprintln!(
             "{NAME}: {matched} pixel-exact matches, {named_refusals} named refusals, \
-             rect_split_tx_hits delta={split_hits} out of {n_attempts} attempts"
+             rect_split_sb_interior_tu_hits delta={split_hits} (over COMPARED streams only) \
+             out of {n_attempts} attempts"
         );
     }
 
