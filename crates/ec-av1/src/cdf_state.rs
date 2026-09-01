@@ -1010,9 +1010,13 @@ impl Cdfs {
                 cdf::EOB_PT_128_CHROMA,
                 cdf::EOB_PT_128_CHROMA_Q3,
             ),
-            // Flat default at every q-context (see the constant's own doc
-            // comment) -- no `pick()` needed.
-            eob_pt_512_chroma: cdf::EOB_PT_512_CHROMA,
+            eob_pt_512_chroma: pick(
+                q_ctx,
+                cdf::EOB_PT_512_CHROMA_Q0,
+                cdf::EOB_PT_512_CHROMA_Q1,
+                cdf::EOB_PT_512_CHROMA,
+                cdf::EOB_PT_512_CHROMA_Q3,
+            ),
             eob_extra_luma_32: pick(
                 q_ctx,
                 cdf::EOB_EXTRA_LUMA_32_Q0,
