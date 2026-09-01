@@ -423,6 +423,18 @@ thread_local! {
 }
 
 /// [`AB16_HITS`] per arm (HORZ_A, HORZ_B, VERT_A, VERT_B at 16x16).
+thread_local! {
+    /// 4x4 transform units decoded inside an 8x8 square of a
+    /// `PARTITION_VERT_A`/`_B` -- the exact call that panicked before
+    /// [`crate::encode::Reach::of_tu`] (lane-ab16 r2), so the gate can prove
+    /// a real `--enable-tx-size-search=1` stream reaches it.
+    static VERT_AB_TX4_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+pub(crate) fn vert_ab_tx4_hits() -> usize {
+    VERT_AB_TX4_HITS.with(std::cell::Cell::get)
+}
+
 pub(crate) fn ab16_hits_by_arm() -> [usize; 4] {
     AB16_HITS.with(std::cell::Cell::get)
 }
@@ -5209,7 +5221,7 @@ fn decode_block(
                 let tu_px = px + tu_col * logical_tx;
                 let tu_py = py + tu_row * logical_tx;
                 let tu_around = neighbours.around_mi(tu_mi, logical_tx)[0];
-                let tu_reach = Reach::of(logical_tx, tu_px, tu_py, y.width, y.height);
+                let tu_reach = Reach::of_tu(side, logical_tx, tu_px, tu_py, y.width, y.height);
                 // This transform unit's own bsize (`logical_tx`) is smaller
                 // than the block it sits in (`side`), so `txb_skip_ctx` is
                 // the neighbour-magnitude table, not the lone-TU 0 (spec
@@ -5581,7 +5593,10 @@ fn decode_leaf8(
                 let tu_px = px + tu_col * 4;
                 let tu_py = py + tu_row * 4;
                 let tu_around = neighbours.around_mi(tu_mi, 4)[0];
-                let tu_reach = Reach::of(4, tu_px, tu_py, y.width, y.height);
+                if crate::encode::Reach::in_vert_ab() {
+                    VERT_AB_TX4_HITS.with(|c| c.set(c.get() + 1));
+                }
+                let tu_reach = Reach::of_tu(8, 4, tu_px, tu_py, y.width, y.height);
                 let tu_skip_ctx = neighbours.luma_skip_ctx(tu_mi, 1);
                 let tu_grid = read_plane(
                     dec,
