@@ -33,7 +33,13 @@
 /// its tool is now covered by a real stream.
 #[cfg(test)]
 const NEVER_EXERCISED: &[(&str, &str)] = &[
-    ("enable-intrabc", "intra block copy syntax is consumed but no block is reconstructed from it"),
+    // lane-intrabc r1: the DV itself (mv stack against INTRA_FRAME, `ndvc`
+    // full-pel read, `av1_find_ref_dv` fallback) and the block-copy
+    // prediction are now decoded, but every real aomenc intrabc block this
+    // lane could produce sits under TX_MODE_SELECT, whose inter var-tx
+    // partition tree is unread -- so no stream reconstructs one end to end
+    // yet and this entry stays.
+    ("enable-intrabc", "the block vector is decoded and predicted from, but every real stream's intrabc block needs the unread inter var-tx transform tree"),
 ];
 
 #[cfg(test)]

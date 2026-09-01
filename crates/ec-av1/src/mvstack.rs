@@ -327,6 +327,13 @@ fn add_candidate(candidates: &mut Vec<StackEntry>, mv: (i32, i32), weight: u32) 
 /// `LAST_FRAME`) pass an all-`false` table, matching this stub's old
 /// always-`false` behaviour exactly.
 fn sign_bias(table: &SignBiasTable, ref_frame: i8) -> bool {
+    // lane-intrabc: `INTRA_FRAME` (0) and `NONE` (-1) sit *below* the table's
+    // own `LAST_FRAME` base and have no sign bias at all -- an intrabc block
+    // queries the stack with `ref_frame == INTRA_FRAME`, which indexed this
+    // table at `usize::MAX` before.
+    if ref_frame < LAST_FRAME {
+        return false;
+    }
     table[(ref_frame - LAST_FRAME) as usize]
 }
 
@@ -359,6 +366,11 @@ pub const NO_GM_MV: GmMvTable = [(0, 0); 7];
 /// `table[ref_frame - LAST_FRAME]`, [`sign_bias`]'s shape for a
 /// [`GmMvTable`].
 fn gm_mv(table: &GmMvTable, ref_frame: i8) -> (i32, i32) {
+    // Same below-`LAST_FRAME` guard as [`sign_bias`]: `INTRA_FRAME` (the
+    // intrabc query's own ref) has no global motion model.
+    if ref_frame < LAST_FRAME {
+        return (0, 0);
+    }
     table[(ref_frame - LAST_FRAME) as usize]
 }
 
