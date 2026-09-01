@@ -461,6 +461,19 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         let bit_depth = parser
             .sequence_header()
             .map_or(8, |seq| seq.color_config.bit_depth);
+        // lane-bd12: the sequence-header parser accepts `twelve_bit`, but every
+        // rounding shift below is written for 8/10-bit only -- `warp.rs`'s
+        // `REDUCE_BITS_HORIZ` is a hard 3 where libaom uses
+        // `round_0 + max(bd + FILTER_BITS - round_0 - 14, 0)` (5 at bd 12), the
+        // MC `round_0`/`round_1` change at 12-bit (libaom convolve.h:83), the
+        // Wiener rounding bits change, and neither CDEF nor film grain has a
+        // 12-bit path. Refuse by name rather than decode silently wrong pixels.
+        if bit_depth == 12 {
+            return Err(Error::unsupported(
+                "AV1 decode_stream",
+                "a bit depth of 12 (this decoder is gated at 8 and 10 only: warp/MC/wiener rounding shifts change at 12-bit and no 12-bit gate exists)",
+            ));
+        }
         crate::decode::set_bit_depth(bit_depth);
         // lane-av1comp: `comp_group_idx`/`compound_idx`'s own gating bits.
         let enable_masked_compound = parser
@@ -797,6 +810,38 @@ mod tests {
             }
         }
         picture
+    }
+
+    /// A stream whose sequence header says `twelve_bit` is refused by name
+    /// rather than decoded with the 8/10-bit rounding shifts (`warp.rs`'s
+    /// hard `REDUCE_BITS_HORIZ = 3`, MC/Wiener round bits, ungated CDEF and
+    /// film grain). Reachability, not a pixel claim: the header is written at
+    /// `seq_profile = 2` so `twelve_bit` is actually coded, and the frame's
+    /// tile payload is never reached.
+    #[test]
+    fn a_twelve_bit_sequence_header_is_refused_by_name() {
+        let picture = test_card(64, 64);
+        let encoded = encode_key_frame(&picture, 100, 0.5).unwrap();
+        let mut color = ec_av1_syntax::ColorConfig {
+            bit_depth: 12,
+            ..Default::default()
+        };
+        color.num_planes = 3;
+        // Only seq_profile 2 codes the `twelve_bit` bit (spec 5.5.2).
+        let (mut seq, header) =
+            crate::encode::key_frame_headers_colour(64, 64, 100, color).unwrap();
+        seq.seq_profile = 2;
+        let mut stream = crate::sequence::sequence_header_obu(&seq).unwrap();
+        stream.extend_from_slice(&crate::frame::frame_obu(&seq, &header, &encoded.tile).unwrap());
+
+        let err = decode_stream(&stream).unwrap_err().to_string();
+        assert!(
+            err.contains(
+                "a bit depth of 12 (this decoder is gated at 8 and 10 only: \
+                 warp/MC/wiener rounding shifts change at 12-bit and no 12-bit gate exists)"
+            ),
+            "expected the 12-bit refusal, got: {err}"
+        );
     }
 
     /// `decode_stream` on a lone key frame's stream matches both the tile
