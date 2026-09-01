@@ -1020,7 +1020,7 @@ pub(crate) struct Reach {
 /// it. Indexed by the block's position in the superblock, in blocks of its own
 /// size, as `row * (128 / side) + col` (`Reach::table_stride`) -- libaom's
 /// 128, not this crate's 64 superblock -- bit by bit from the low end.
-const HAS_TOP_RIGHT: [&[u8]; 3] = [
+const HAS_TOP_RIGHT: [&[u8]; 4] = [
     &[255, 85, 119, 85, 127, 85, 119, 85],
     &[95, 87],
     // has_tr_8x8 (libaom av1/common/reconintra.c) -- table_stride(8) == 16
@@ -1029,17 +1029,44 @@ const HAS_TOP_RIGHT: [&[u8]; 3] = [
         255, 255, 85, 85, 119, 119, 85, 85, 127, 127, 85, 85, 119, 119, 85, 85, 255, 127, 85, 85,
         119, 119, 85, 85, 127, 127, 85, 85, 119, 119, 85, 85,
     ],
+
+    // has_tr_4x4 (libaom av1/common/reconintra.c, transcribed verbatim) --
+    // table_stride(4) == 32 (128 / 4), so 32 bits per row, 32 rows, 128
+    // bytes. Sub-8x8 leaves (lane-sub8) are the only blocks that reach here
+    // with side 4 outside a TX4 split; without their own row they clamped
+    // into the 8x8 table and read above-right samples the decoder has not
+    // written yet (all-zero pixels in the bottom-right triangle of a
+    // directional 4x4 leaf).
+    &[
+        255, 255, 255, 255, 85, 85, 85, 85, 119, 119, 119, 119, 85, 85, 85, 85, 127, 127, 127, 127,
+        85, 85, 85, 85, 119, 119, 119, 119, 85, 85, 85, 85, 255, 127, 255, 127, 85, 85, 85, 85,
+        119, 119, 119, 119, 85, 85, 85, 85, 127, 127, 127, 127, 85, 85, 85, 85, 119, 119, 119, 119,
+        85, 85, 85, 85, 255, 255, 255, 127, 85, 85, 85, 85, 119, 119, 119, 119, 85, 85, 85, 85,
+        127, 127, 127, 127, 85, 85, 85, 85, 119, 119, 119, 119, 85, 85, 85, 85, 255, 127, 255, 127,
+        85, 85, 85, 85, 119, 119, 119, 119, 85, 85, 85, 85, 127, 127, 127, 127, 85, 85, 85, 85,
+        119, 119, 119, 119, 85, 85, 85, 85,
+    ],
 ];
 
 /// `has_bl_16x16` / `has_bl_32x32`: the same, for the block below and to the
 /// left.
-const HAS_BOTTOM_LEFT: [&[u8]; 3] = [
+const HAS_BOTTOM_LEFT: [&[u8]; 4] = [
     &[84, 16, 84, 0, 84, 16, 84, 0],
     &[4, 4],
     // has_bl_8x8 (libaom av1/common/reconintra.c)
     &[
         84, 85, 16, 17, 84, 85, 0, 1, 84, 85, 16, 17, 84, 85, 0, 0, 84, 85, 16, 17, 84, 85, 0, 1,
         84, 85, 16, 17, 84, 85, 0, 0,
+    ],
+
+    // has_bl_4x4 (same source, same order).
+    &[
+        84, 85, 85, 85, 16, 17, 17, 17, 84, 85, 85, 85, 0, 1, 1, 1, 84, 85, 85, 85, 16, 17, 17, 17,
+        84, 85, 85, 85, 0, 0, 1, 0, 84, 85, 85, 85, 16, 17, 17, 17, 84, 85, 85, 85, 0, 1, 1, 1, 84,
+        85, 85, 85, 16, 17, 17, 17, 84, 85, 85, 85, 0, 0, 0, 0, 84, 85, 85, 85, 16, 17, 17, 17, 84,
+        85, 85, 85, 0, 1, 1, 1, 84, 85, 85, 85, 16, 17, 17, 17, 84, 85, 85, 85, 0, 0, 1, 0, 84, 85,
+        85, 85, 16, 17, 17, 17, 84, 85, 85, 85, 0, 1, 1, 1, 84, 85, 85, 85, 16, 17, 17, 17, 84, 85,
+        85, 85, 0, 0, 0, 0,
     ],
 ];
 
@@ -1050,6 +1077,34 @@ const HAS_BOTTOM_LEFT: [&[u8]; 3] = [
 const HAS_TOP_RIGHT_RECT: [&[u8]; 2] = [&[15, 5, 7, 5], &[255, 119, 127, 119]];
 /// `has_bl_32x16`/`has_bl_16x32`, same source, same order.
 const HAS_BOTTOM_LEFT_RECT: [&[u8]; 2] = [&[78, 14, 78, 14], &[16, 0, 16, 0]];
+
+/// libaom `reconintra.c`'s `has_tr_*`/`has_bl_*` for the four rectangular
+/// block sizes this decoder codes, transcribed verbatim (lane-rectx r4).
+/// The 16x8/8x16 rows are what the 32x16/16x32 pair above cannot stand in
+/// for: they are 16 bytes, not 4, and their bit pattern is a different
+/// coding order entirely -- reading the 16x32 table for a 16x8 block gave
+/// the wrong bottom-left availability and a directional (D203) strip whose
+/// prediction diverged exactly where it starts reading below its own height.
+/// `has_tr_vert_tables`/`has_bl_vert_tables` hold the SAME pointers as these
+/// for every W<H entry, and are NULL for W>H (no VERT_A/B ever produces one),
+/// so the partition type does not select a different table at these sizes.
+fn has_tr_rect_table(bw: usize, bh: usize) -> &'static [u8] {
+    match (bw, bh) {
+        (16, 8) => &[255, 0, 85, 0, 119, 0, 85, 0, 127, 0, 85, 0, 119, 0, 85, 0],
+        (8, 16) => &[255, 255, 119, 119, 127, 127, 119, 119, 255, 127, 119, 119, 127, 127, 119, 119],
+        (32, 16) => &[15, 5, 7, 5],
+        _ => &[255, 119, 127, 119],
+    }
+}
+
+fn has_bl_rect_table(bw: usize, bh: usize) -> &'static [u8] {
+    match (bw, bh) {
+        (16, 8) => &[254, 84, 254, 16, 254, 84, 254, 0, 254, 84, 254, 16, 254, 84, 254, 0],
+        (8, 16) => &[16, 17, 0, 1, 16, 17, 0, 0, 16, 17, 0, 1, 16, 17, 0, 0],
+        (32, 16) => &[78, 14, 78, 14],
+        _ => &[16, 0, 16, 0],
+    }
+}
 
 impl Reach {
     /// What a block of `side` samples at `(x, y)` may read past its own edges,
@@ -1080,37 +1135,49 @@ impl Reach {
         }
     }
 
-    fn position_rect(bw: usize, bh: usize, x: usize, y: usize) -> (usize, usize, usize, usize) {
-        (
-            (y % SUPERBLOCK) / bh,
-            (x % SUPERBLOCK) / bw,
-            SUPERBLOCK / bh,
-            SUPERBLOCK / bw,
-        )
-    }
-
+    /// libaom `has_top_right` at block granularity (`row_off`/`col_off` 0,
+    /// the transform covering the whole block, luma): everything before the
+    /// table lookup is that function's own early-exit ladder.
     fn top_right_rect(bw: usize, bh: usize, x: usize, y: usize) -> bool {
-        let (row, col, _per_row, per_col) = Self::position_rect(bw, bh, x, y);
-        if row == 0 {
+        const SB_MI: usize = SUPERBLOCK / 4;
+        let (mi_row, mi_col) = (y / 4, x / 4);
+        let bw_log2 = (bw / 4).trailing_zeros() as usize;
+        let bh_log2 = (bh / 4).trailing_zeros() as usize;
+        let blk_row = (mi_row & (SB_MI - 1)) >> bh_log2;
+        let blk_col = (mi_col & (SB_MI - 1)) >> bw_log2;
+        // Top row of the superblock: the top-right pixels are in the (already
+        // decoded) superblock above.
+        if blk_row == 0 {
             return true;
         }
-        if col + 1 == per_col {
+        // Rightmost column: they fall in the superblock to the right.
+        if ((blk_col + 1) << bw_log2) >= SB_MI {
             return false;
         }
-        let table = HAS_TOP_RIGHT_RECT[usize::from(bw == 16)];
-        Self::bit(table, (row * Self::table_stride(bw) + col) % (table.len() * 8))
+        let table = has_tr_rect_table(bw, bh);
+        Self::bit(table, (blk_row << (4 - bw_log2)) + blk_col)
     }
 
+    /// libaom `has_bottom_left`, same granularity as [`Self::top_right_rect`].
     fn bottom_left_rect(bw: usize, bh: usize, x: usize, y: usize) -> bool {
-        let (row, col, per_row, _per_col) = Self::position_rect(bw, bh, x, y);
-        if col == 0 {
-            return row * bh + bh < SUPERBLOCK;
+        const SB_MI: usize = SUPERBLOCK / 4;
+        let (mi_row, mi_col) = (y / 4, x / 4);
+        let bw_log2 = (bw / 4).trailing_zeros() as usize;
+        let bh_log2 = (bh / 4).trailing_zeros() as usize;
+        let blk_row = (mi_row & (SB_MI - 1)) >> bh_log2;
+        let blk_col = (mi_col & (SB_MI - 1)) >> bw_log2;
+        // Leftmost column of the superblock: the bottom-left pixels are in
+        // the left superblock iff they stay inside its height.
+        if blk_col == 0 {
+            return (blk_row << bh_log2) + (bh / 4) < SB_MI;
         }
-        if row + 1 == per_row {
+        // Bottom row (and not the leftmost column): they fall in the
+        // superblock below, which is not decoded yet.
+        if ((blk_row + 1) << bh_log2) >= SB_MI {
             return false;
         }
-        let table = HAS_BOTTOM_LEFT_RECT[usize::from(bw == 16)];
-        Self::bit(table, (row * Self::table_stride(bw) + col) % (table.len() * 8))
+        let table = has_bl_rect_table(bw, bh);
+        Self::bit(table, (blk_row << (4 - bw_log2)) + blk_col)
     }
 
     /// Neither, which is all a mode that reads no further than its own edges
@@ -1134,17 +1201,9 @@ impl Reach {
         if col + 1 == per_side {
             return false;
         }
-        // corner-cut: `HAS_TOP_RIGHT`/`HAS_BOTTOM_LEFT` only carry dedicated
-        // rows for side 8/16/32/64 (libaom's own `has_tr_8x8`/`has_tr_16x16`
-        // families); a `TxMode::Select` TX4 transform unit reaches here with
-        // side 4, whose real table (`has_tr_4x4`, 128 bytes) was never
-        // transcribed. Clamping into the 16/32 table's own bit range keeps
-        // this in-bounds and correct at every position that table already
-        // covers periodically -- wrong only at the small remainder past its
-        // length, a reach over-/under-estimate (extra or missing above-right
-        // reference pixels), never a stream desync (Reach never gates a
-        // symbol read). Ceiling: transcribe `has_tr_4x4`/`has_bl_4x4`
-        // verbatim and give TX4 its own `HAS_TOP_RIGHT`/`HAS_BOTTOM_LEFT` row.
+        // lane-sub8 r4: side 4 now has its own `has_tr_4x4`/`has_bl_4x4`
+        // row (the corner-cut this comment used to describe); sides 16/32/64
+        // share row 0 exactly as libaom's tables repeat.
         let table = HAS_TOP_RIGHT[Self::table(side)];
         Self::bit(
             table,
@@ -1164,7 +1223,7 @@ impl Reach {
         if row + 1 == per_side {
             return false;
         }
-        // corner-cut: see `top_right`'s note -- same clamp, same ceiling.
+        // See `top_right`'s note.
         let table = HAS_BOTTOM_LEFT[Self::table(side)];
         Self::bit(
             table,
@@ -1200,6 +1259,8 @@ impl Reach {
             1
         } else if side == 8 {
             2
+        } else if side == 4 {
+            3
         } else {
             0
         }

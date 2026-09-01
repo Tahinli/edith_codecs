@@ -5370,7 +5370,7 @@ mod tests {
                 "-f",
                 "lavfi",
                 "-i",
-                &format!("mandelbrot=size={width}x{height}:start_x=0.4"),
+                &format!("mandelbrot=size={width}x{height}:start_x=-0.6"),
                 "-pix_fmt",
                 "yuv420p",
                 "-t",
@@ -5393,7 +5393,7 @@ mod tests {
                     "--codec=av1",
                     "--passes=1",
                     "--end-usage=q",
-                    "--cq-level=24",
+                    "--cq-level=16",
                     "--cpu-used=4",
                     "--threads=1",
                     "--row-mt=0",
@@ -5403,6 +5403,11 @@ mod tests {
                     "--enable-ab-partitions=0",
                     "--enable-1to4-partitions=0",
                     "--enable-tx-size-search=0",
+                    // Filter intra on a strip is a separate, still-refused
+                    // predictor (`filter intra on a HORZ/VERT strip`); this
+                    // gate is about the rect RESIDUAL path, so it is off here
+                    // and covered by the square filter-intra gate instead.
+                    "--enable-filter-intra=0",
                     "--reduced-tx-type-set=1",
                     "--min-partition-size=8",
                     "--max-partition-size=32",

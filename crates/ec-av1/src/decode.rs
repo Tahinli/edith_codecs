@@ -1826,6 +1826,19 @@ struct Neighbours {
     /// one was coded at 8x8.
     above_side_mi: Vec<usize>,
     left_side_mi: Vec<usize>,
+    /// The luma `mode` of the last `BLOCK_4X4` leaf decoded at each mi column
+    /// / row, with the mi position it was written at
+    /// (`(usize::MAX, _)` = never written). `above_mode`/`left_mode` are on
+    /// the coarse 16x16 grid, which cannot distinguish the two 4x4 leaves an
+    /// 8x8 `PARTITION_SPLIT` puts in one mi column; libaom's intra-mode
+    /// context reads `mi(row, col-1)`/`mi(row-1, col)` exactly, so a sub-8x8
+    /// leaf whose neighbour is another split group needs that group's leaf 3
+    /// (bottom-right), not the leaf the coarse slot happens to hold. Written
+    /// and read only by [`decode_leaf_split4`]; the position guard makes it
+    /// fall back to the coarse slot whenever the real neighbour was a block
+    /// of 8x8 or larger (whose one mode is correct for every row it spans).
+    sub8_mode_col: Vec<(usize, usize)>,
+    sub8_mode_row: Vec<(usize, usize)>,
     /// Whether the block above/left of this column/row was coded `skip` --
     /// an inter frame's own `skip` context (spec `SkipContext`), which the
     /// key-frame writer never tracks (its skip context is always zero); a
@@ -1953,6 +1966,8 @@ impl Neighbours {
             left_side: vec![SB; rows],
             above_side_mi: vec![SB; cols * (SUB / MI)],
             left_side_mi: vec![SB; rows * (SUB / MI)],
+            sub8_mode_col: vec![(usize::MAX, 0); cols * (SUB / MI)],
+            sub8_mode_row: vec![(usize::MAX, 0); rows * (SUB / MI)],
             above_skip: vec![false; cols],
             left_skip: vec![false; rows],
             above_skip_mode: vec![false; cols],
@@ -2514,6 +2529,46 @@ impl Neighbours {
     /// [`Self::partition_ctx`]) are the neighbour's own width/height per the
     /// spec's per-edge partition-context rule, so a true rectangular block
     /// naturally wants two different values here rather than one.
+    /// Writes this block's luma `mode` into the mi-granular
+    /// [`Self::sub8_mode_col`]/[`Self::sub8_mode_row`] maps, keyed by the mi
+    /// position a *later* neighbour would read it from: the block's LAST mi
+    /// row for every column it spans (what the block below reads via
+    /// `mi(row-1, col)`) and its LAST mi column for every row (what the
+    /// block to the right reads via `mi(row, col-1)`). Only sub-8x8 leaves
+    /// read these back, and only when the recorded position is exactly their
+    /// own neighbour -- see [`Self::sub8_mode_col`]'s doc.
+    fn record_mode_mi(&mut self, mi_r: usize, mi_c: usize, mi_w: usize, mi_h: usize, mode: usize) {
+        let (last_r, last_c) = (mi_r + mi_h - 1, mi_c + mi_w - 1);
+        for cell in 0..mi_w {
+            if let Some(slot) = self.sub8_mode_col.get_mut(mi_c + cell) {
+                *slot = (last_r, mode);
+            }
+        }
+        for cell in 0..mi_h {
+            if let Some(slot) = self.sub8_mode_row.get_mut(mi_r + cell) {
+                *slot = (last_c, mode);
+            }
+        }
+    }
+
+    /// The mi-exact above/left neighbour luma mode for a block whose top-left
+    /// mi is `(mi_r, mi_c)`, or `None` when no block has recorded that exact
+    /// mi position (then the coarse [`SUB`]-grid slot is right by
+    /// construction). See [`Self::record_mode_mi`].
+    fn mode_above_mi(&self, mi_r: usize, mi_c: usize) -> Option<usize> {
+        match self.sub8_mode_col.get(mi_c) {
+            Some(&(row, m)) if mi_r > 0 && row == mi_r - 1 => Some(m),
+            _ => None,
+        }
+    }
+
+    fn mode_left_mi(&self, mi_r: usize, mi_c: usize) -> Option<usize> {
+        match self.sub8_mode_row.get(mi_r) {
+            Some(&(col, m)) if mi_c > 0 && col == mi_c - 1 => Some(m),
+            _ => None,
+        }
+    }
+
     fn record_rect(
         &mut self,
         at: (usize, usize),
@@ -2534,6 +2589,7 @@ impl Neighbours {
             self.left_uv_mode[r + cell] = uv_mode;
             self.left_side[r + cell] = h;
         }
+        self.record_mode_mi(r * (SUB / MI), c * (SUB / MI), w / MI, h / MI, mode);
         self.record_mi_rect((r * (SUB / MI), c * (SUB / MI)), w, h, grids);
     }
 
@@ -2644,6 +2700,7 @@ impl Neighbours {
         }
         let (mi_r, mi_c) = (r * (SUB / MI), c * (SUB / MI));
         let side_mi = side / MI;
+        self.record_mode_mi(mi_r, mi_c, side_mi, side_mi, mode);
         for cell in 0..side_mi {
             self.left_side_mi[mi_r + cell] = side;
             self.above_side_mi[mi_c + cell] = side;
@@ -3590,6 +3647,16 @@ fn decode_leaf_rect(
             left_mode = pmode;
         }
     }
+    // Same mi-exact override [`decode_leaf8`] takes: one coarse 16x16 slot
+    // cannot hold the modes a split (or a pair of strips) leaves behind, so
+    // when the map holds the block at exactly this strip's above/left mi it
+    // is the neighbour libaom's `above_mi`/`left_mi` reads.
+    if let Some(m) = neighbours.mode_above_mi(leaf_mi.0, leaf_mi.1) {
+        above_mode = m;
+    }
+    if let Some(m) = neighbours.mode_left_mi(leaf_mi.0, leaf_mi.1) {
+        left_mode = m;
+    }
     let smooth_neighbor =
         is_smooth_mode(above_mode) || is_smooth_mode(left_mode);
     if smooth_neighbor {
@@ -3726,6 +3793,9 @@ fn decode_leaf_rect(
     neighbours.record_mi_rect(leaf_mi, bw, bh, &[luma_levels, u_levels, v_levels]);
     neighbours.fill_skip_grid_rect(leaf_mi, mi_w, mi_h, skip);
     neighbours.fill_lf_grid_rect(leaf_mi, mi_w, mi_h, bw as u8, bh as u8, 0);
+    // A rect leaf spans mi_w x mi_h, so its mode reaches several columns and
+    // rows -- record the whole span, not one cell.
+    neighbours.record_mode_mi(leaf_mi.0, leaf_mi.1, mi_w, mi_h, mode);
     Ok(mode)
 }
 
@@ -5309,6 +5379,16 @@ fn decode_leaf8(
             left_mode = pmode;
         }
     }
+    // The mi-exact neighbour wins over both the coarse 16x16 slot and
+    // `prev_leaf`: one 16x16 slot cannot hold the two different modes its
+    // two 8x8 (or four 4x4) columns leave behind, so a leaf whose above/left
+    // neighbour sits in a split cell read the wrong `kf_y_mode` row.
+    if let Some(m) = neighbours.mode_above_mi(leaf_mi.0, leaf_mi.1) {
+        above_mode = m;
+    }
+    if let Some(m) = neighbours.mode_left_mi(leaf_mi.0, leaf_mi.1) {
+        left_mode = m;
+    }
     // See [`PlaneBuf::reconstruct`]'s doc: chroma stays `false` (exact) until
     // a smooth/paeth `uv_mode` can reach decode at all.
     let smooth_neighbor = is_smooth_mode(above_mode) || is_smooth_mode(left_mode);
@@ -5596,11 +5676,13 @@ fn decode_leaf8(
         }
         neighbours.fill_skip_grid(leaf_mi, 2, skip);
         neighbours.fill_lf_grid(leaf_mi, 2, 4, 0);
+        neighbours.record_mode_mi(leaf_mi.0, leaf_mi.1, 2, 2, mode);
         return Ok(mode);
     }
     neighbours.record_mi(leaf_mi, 8, &[luma_grid, u_grid, v_grid]);
     neighbours.fill_skip_grid(leaf_mi, 2, skip);
     neighbours.fill_lf_grid(leaf_mi, 2, 8, 0);
+    neighbours.record_mode_mi(leaf_mi.0, leaf_mi.1, 2, 2, mode);
     Ok(mode)
 }
 
