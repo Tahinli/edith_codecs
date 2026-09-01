@@ -52,7 +52,7 @@ const REFUSALS: &[&str] = &[
     "a HORZ/VERT intra strip with a split transform (per-unit rect prediction is not ported)",
     "a block that actually uses a palette (UV) -- reconstruction is out of scope",
     "a block that actually uses a palette (Y) -- reconstruction is out of scope",
-    "a block that actually uses intrabc (this decoder never reconstructs one)",
+    "an intrabc block under TxMode::Select (its transform size is coded by the inter var-tx partition tree, which this decoder never reads)",
     "a frame OBU with no tile group",
     "a frame naming primary_ref_frame at a reference slot with no saved CDF state",
     "a frame with no mode-info grid",
