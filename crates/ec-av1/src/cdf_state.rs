@@ -464,6 +464,10 @@ pub(crate) struct Cdfs {
     /// A `RESTORE_SWITCHABLE`-plane LR unit's `restoration_type` -- see
     /// [`cdf::RESTORE_SWITCHABLE`].
     pub restore_switchable: [u16; 4],
+    /// `segment_id` (lane-seg, spec 5.11.8) -- see [`cdf::SEGMENT_ID`].
+    pub segment_id: [[u16; 9]; 3],
+    /// `seg_id_predicted` (lane-seg, spec 5.11.9) -- see [`cdf::SEGMENT_PRED`].
+    pub segment_pred: [[u16; 3]; 3],
     /// `delta_q_abs` (lane-realworld r4, spec 5.11.10) -- see [`cdf::DELTA_Q`].
     pub delta_q: [u16; 5],
     /// `delta_lf_abs`, the single-value form (spec 5.11.11) -- see
@@ -701,6 +705,8 @@ impl Cdfs {
         reset1(&mut self.restore_wiener);
         reset1(&mut self.restore_sgrproj);
         reset1(&mut self.restore_switchable);
+        reset2(&mut self.segment_id);
+        reset2(&mut self.segment_pred);
         reset1(&mut self.delta_q);
         reset1(&mut self.delta_lf);
         reset2(&mut self.delta_lf_multi);
@@ -1172,6 +1178,8 @@ impl Cdfs {
             restore_wiener: cdf::RESTORE_WIENER,
             restore_sgrproj: cdf::RESTORE_SGRPROJ,
             restore_switchable: cdf::RESTORE_SWITCHABLE,
+            segment_id: cdf::SEGMENT_ID,
+            segment_pred: cdf::SEGMENT_PRED,
             delta_q: cdf::DELTA_Q,
             delta_lf: cdf::DELTA_LF,
             delta_lf_multi: [cdf::DELTA_LF; 4],

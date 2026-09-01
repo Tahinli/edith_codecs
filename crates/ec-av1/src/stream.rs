@@ -16,7 +16,8 @@
 //! an implementation detail of how this crate happens to build it).
 
 use ec_av1_syntax::{
-    Av1Parser, FrameHeader, FrameType, NUM_REF_FRAMES, ObuKind, PRIMARY_REF_NONE, Tile, TxMode,
+    Av1Parser, FrameHeader, FrameType, MAX_SEGMENTS, NUM_REF_FRAMES, ObuKind, PRIMARY_REF_NONE,
+    SEG_LVL_GLOBALMV, SEG_LVL_REF_FRAME, SEG_LVL_SKIP, Tile, TxMode,
     WarpModel,
 };
 use ec_core::{Error, Result};
@@ -74,6 +75,12 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
     // own end-of-tile adapted table, or (when the frame set
     // `disable_frame_end_update_cdf`) the table it started from, unchanged.
     let mut cdf_slots: [Option<Cdfs>; NUM_REF_FRAMES] = std::array::from_fn(|_| None);
+    // lane-seg, spec 7.20's `SavedSegmentIds`: each reference slot also
+    // remembers the segment map the frame stored there decoded, which is what
+    // a later frame's `primary_ref_frame` reads back as `PrevSegmentIds`
+    // (spec `load_previous_segment_ids`) for temporal segment-id prediction
+    // and for a `segmentation_update_map == 0` frame's inherited map.
+    let mut seg_map_slots: [Option<Vec<u8>>; NUM_REF_FRAMES] = std::array::from_fn(|_| None);
 
     let mut pos = 0usize;
     // A frame whose tiles are split across several `OBU_TILE_GROUP`s (spec
@@ -124,6 +131,7 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                     cdf_slots[i] = cdf_slots[slot].clone();
                     ref_slots[i] = Some(picture.clone());
                     motion_field_slots[i] = motion_field_slots[slot].clone();
+                    seg_map_slots[i] = seg_map_slots[slot].clone();
                     order_hint_slots[i] = order_hint_slots[slot];
                 }
             }
@@ -245,12 +253,41 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         // 8-bit LUT/clamp, above), and any other rounding gap 10-bit exposes
         // will show up as a real pixel mismatch, not a silent truncation --
         // the whole reason the widen (and this wiring) happened.
+        // lane-seg: `segment_id` is read per block now (spec 5.11.7-5.11.9,
+        // `decode::intra_segment_id`/`inter_segment_id`) and consumed by the
+        // per-segment quantizer (spec 7.12.2) and loop-filter level
+        // (spec 7.14.4). The three features that instead REWRITE a block's
+        // mode/reference decisions -- `SEG_LVL_REF_FRAME` (forces the
+        // reference), `SEG_LVL_SKIP` and `SEG_LVL_GLOBALMV` (both suppress
+        // symbols `decode_inter_block` unconditionally reads) -- have no
+        // reader on the inter path, so they still refuse by name rather than
+        // desyncing. aomenc's `--aq-mode` segmentation only ever sets
+        // `SEG_LVL_ALT_Q`.
         if header.segmentation.enabled {
-            return Err(Error::unsupported(
-                "AV1 decode_stream",
-                "a frame with segmentation enabled (this decoder never reads a per-block segment_id symbol)",
-            ));
+            for segment in 0..MAX_SEGMENTS {
+                for feature in [SEG_LVL_REF_FRAME, SEG_LVL_SKIP, SEG_LVL_GLOBALMV] {
+                    if header.segmentation.feature_enabled[segment][feature] {
+                        return Err(Error::unsupported(
+                            "AV1 decode_stream",
+                            "a frame whose segmentation enables SEG_LVL_REF_FRAME/SKIP/GLOBALMV (this decoder reads segment_id but never lets a segment override a block's reference, skip or mode)",
+                        ));
+                    }
+                }
+            }
         }
+        // spec `load_previous_segment_ids`: `PrevSegmentIds` comes from the
+        // primary reference frame's slot, and is all-zero without one.
+        let prev_seg_map = if header.primary_ref_frame == PRIMARY_REF_NONE {
+            None
+        } else {
+            seg_map_slots[header.ref_frame_idx[header.primary_ref_frame as usize] as usize].clone()
+        };
+        decode::set_segmentation(
+            header.segmentation,
+            header.mi_rows as usize,
+            header.mi_cols as usize,
+            prev_seg_map.as_deref(),
+        );
         // lane-superres stage 2/3: `use_superres` adds/removes no per-block
         // symbol (spec 7.16's upscaling is a pixel-domain post-process
         // libaom's `decodeframe.c` runs between CDEF and loop restoration,
@@ -696,6 +733,7 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
             }
         }
         pictures_decoded += 1;
+        let decoded_seg_map = decode::take_segment_ids();
         for i in 0..NUM_REF_FRAMES {
             if header.refresh_frame_flags & (1 << i) != 0 {
                 cdf_slots[i] = Some(stored_cdfs.clone());
@@ -705,6 +743,7 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 // caller's output below carries the grained picture.
                 ref_slots[i] = Some(picture.clone());
                 motion_field_slots[i] = Some(motion_field.clone());
+                seg_map_slots[i] = Some(decoded_seg_map.clone());
                 order_hint_slots[i] = header.order_hint;
             }
         }
@@ -8641,6 +8680,271 @@ mod tests {
              out of {n_attempts}, delta_q_hits={}, delta_lf_hits={}",
             crate::decode::delta_q_hits(),
             crate::decode::delta_lf_hits()
+        );
+    }
+
+    /// lane-seg: a real `aomenc` stream with SEGMENTATION genuinely active.
+    /// `--aq-mode=1` (variance AQ) / `--aq-mode=2` (complexity AQ) are the two
+    /// paths libaom uses to switch `segmentation_enabled` on by itself
+    /// (`av1_vaq_frame_setup`/`av1_setup_in_frame_q_adj`, both of which only
+    /// ever set `SEG_LVL_ALT_Q`); `--deltaq-mode=0` keeps the per-superblock
+    /// delta-q reader out of the picture so a mismatch points at the segment
+    /// map, not at `CurrentQIndex`. Mandelbrot's varying local contrast is
+    /// what gives variance/complexity AQ different segments to assign --
+    /// a flat gradient collapses every block onto one segment, which the
+    /// `segment_ids_seen() >= 2` assert below would catch as a vacuous run.
+    /// The rest of the recipe is the delta-q gate's own feature-disable
+    /// envelope, so this gate isolates the segmentation reader.
+    fn run_segmentation_gate(
+        name: &str,
+        aq_mode: &str,
+        bit_depth: usize,
+        frame_count: usize,
+        rate_args: &[&str],
+    ) {
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {name}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {name}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        crate::decode::reset_segment_hits();
+        let (width, height) = (128usize, 64usize);
+        let mut named_refusals = 0u32;
+        let mut matched = 0u32;
+        let n_attempts: u32 = std::env::var("EC_SEG_GATE_ATTEMPTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10);
+        for attempt in 0..n_attempts {
+            let seed = 42 + attempt;
+            let duration = frame_count as f64 / 25.0;
+            let source = format!(
+                "mandelbrot=size={width}x{height}:rate=25:start_x={sx}:start_y={sy}",
+                sx = -0.6 + 0.005 * (attempt as f64),
+                sy = -0.4 + 0.005 * (attempt as f64)
+            );
+            let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v", "error", "-f", "lavfi", "-i", &source, "-t", &duration.to_string(),
+                    "-pix_fmt", pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let depth_args: Vec<String> = if bit_depth == 10 {
+                vec!["--input-bit-depth=10".to_owned(), "--bit-depth=10".to_owned()]
+            } else {
+                Vec::new()
+            };
+            let aq = format!("--aq-mode={aq_mode}");
+            let mut args: Vec<&str> = vec![
+                "--codec=av1",
+                "--passes=1",
+                "--cpu-used=4",
+                &aq,
+                "--deltaq-mode=0",
+                "--kf-max-dist=1000",
+                "--threads=1",
+                "--row-mt=0",
+                "--sb-size=64",
+                "--auto-alt-ref=1",
+                "--lag-in-frames=16",
+                "--enable-fwd-kf=0",
+                "--enable-order-hint=1",
+                "--enable-warped-motion=1",
+                "--enable-global-motion=0",
+                "--enable-obmc=1",
+                "--tune-content=default",
+                "--enable-masked-comp=1",
+                "--enable-dist-wtd-comp=0",
+                "--enable-interintra-comp=1",
+                "--enable-onesided-comp=0",
+                "--enable-interintra-wedge=0",
+                "--enable-smooth-interintra=1",
+                "--enable-rect-partitions=0",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0",
+                "--enable-filter-intra=0",
+                "--enable-smooth-intra=0",
+                "--enable-paeth-intra=0",
+                "--enable-directional-intra=0",
+                "--enable-angle-delta=0",
+                "--enable-tx-size-search=0",
+                "--enable-cdef=1",
+                "--enable-restoration=0",
+                "--max-partition-size=32",
+                "--min-partition-size=32",
+                "--enable-palette=0",
+                "--enable-intrabc=0",
+                "--enable-cfl-intra=0",
+                "--enable-ref-frame-mvs=0",
+            ];
+            args.extend(rate_args.iter().copied());
+            args.extend(depth_args.iter().map(String::as_str));
+            args.extend(["--obu", "-o", "-", "-"]);
+            let mut child = Command::new(aomenc_path())
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            // The stream must really carry `segmentation_enabled`, or the
+            // gate proves nothing about the reader.
+            let mut seg_frames = 0u32;
+            {
+                let mut probe = Av1Parser::new();
+                let mut pos = 0usize;
+                while pos < stream.len() {
+                    let obu = probe.parse_obu(&stream[pos..]).expect("parsing the gate stream");
+                    pos += obu.total_size;
+                    match &obu.kind {
+                        ObuKind::Frame(h, _) => {
+                            if h.segmentation.enabled {
+                                seg_frames += 1;
+                            }
+                        }
+                        ObuKind::FrameHeader(h) => {
+                            if h.segmentation.enabled {
+                                seg_frames += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if seg_frames == 0 {
+                eprintln!("seed {seed}: aomenc wrote no segmentation-enabled frame, skipping attempt");
+                continue;
+            }
+            let frames = match decode_stream(&stream) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{name} failed outright, not a named refusal (seed {seed}): {msg}"
+                    );
+                    assert!(
+                        !msg.contains("segment_id symbol"),
+                        "{name} refused on the segmentation reader itself (seed {seed}): {msg}"
+                    );
+                    named_refusals += 1;
+                    eprintln!("seed {seed} refusal: {msg}");
+                    continue;
+                }
+                Ok(frames) => frames,
+            };
+            let ffmpeg_frames = if bit_depth == 10 {
+                ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count)
+            } else {
+                ffmpeg_decode_sequence(&stream, width, height, frame_count)
+            };
+            assert_eq!(frames.len(), frame_count);
+            let mismatched = frames
+                .iter()
+                .zip(&ffmpeg_frames)
+                .any(|(got, want)| got.y != want.y || got.u != want.u || got.v != want.v);
+            if mismatched && let Ok(path) = std::env::var("EC_AV1_GATE_DUMP") {
+                std::fs::write(&path, &stream).expect("writing pinned stream");
+                eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
+            }
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(got.y, want.y, "{name} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(got.u, want.u, "{name} frame {i} U vs ffmpeg (seed {seed})");
+                assert_eq!(got.v, want.v, "{name} frame {i} V vs ffmpeg (seed {seed})");
+            }
+            matched += 1;
+        }
+        assert!(
+            matched > 0,
+            "{name}: every attempt refused on other capabilities ({named_refusals} refusals); \
+             the gate never exercised segmentation"
+        );
+        assert!(
+            crate::decode::segment_id_hits() > 0,
+            "{name}: {matched} pixel-exact matches but zero segment_id symbols fired -- \
+             the reader is unexercised"
+        );
+        assert!(
+            crate::decode::segment_ids_seen() >= 2,
+            "{name}: {matched} pixel-exact matches but only {} distinct segment id(s) -- \
+             every block landed in one segment, so nothing was actually segmented",
+            crate::decode::segment_ids_seen()
+        );
+        eprintln!(
+            "{name}: {named_refusals} other-capability refusals, {matched} pixel-exact matches \
+             out of {n_attempts}, segment_id_hits={}, distinct segment ids={}",
+            crate::decode::segment_id_hits(),
+            crate::decode::segment_ids_seen()
+        );
+    }
+
+    #[test]
+    fn a_real_aomenc_stream_with_variance_aq_segmentation_decodes_pixel_exact() {
+        run_segmentation_gate(
+            "a_real_aomenc_stream_with_variance_aq_segmentation_decodes_pixel_exact",
+            "1",
+            8,
+            16,
+            &["--end-usage=q", "--cq-level=45"],
+        );
+    }
+
+    // lane-seg r1 DEFERRED: an `--aq-mode=2` (complexity AQ) twin of the gate
+    // above. libaom only switches segmentation on for complexity AQ once the
+    // target bits per 64x64 superblock clear `sb64_target_rate >= 256`
+    // (`aq_complexity.c:is_sb_aq_enabled`), which needs `--end-usage=vbr`;
+    // every VBR recipe tried (cpu-used 0 and 4, 32x32 and 64x64 fixed
+    // partitions) makes aomenc pick partition shapes OTHER lanes still refuse
+    // (AB below 16x16, SB-level HORZ/VERT, part32 values 4/6), so 10/10
+    // attempts refuse before a pixel is compared. The syntax exercised would
+    // be identical to variance AQ's (both features only ever set
+    // `SEG_LVL_ALT_Q` via `update_map`), so this is coverage, not capability.
+    // Unblocked by the sub-16x16 rect/AB partition lanes.
+
+    /// His two AV1 films are both `yuv420p10le`, so every capability lands
+    /// with a 10-bit twin (memory `his-av1-library-is-10-bit`). KEY FRAME
+    /// ONLY (`frame_count = 1`): a 10-bit INTER frame does not decode
+    /// pixel-exact in this crate yet, segmentation or not -- lane-seg r1 ran
+    /// this same recipe with `--aq-mode=0` (segmentation off entirely) and it
+    /// still mismatched at frame 2, so the 16-frame 10-bit variant would be
+    /// gating an unrelated pre-existing gap. Variance AQ segments the key
+    /// frame too (`aq_variance.c`, `is_frame_aq_enabled` includes
+    /// `frame_is_intra_only`), so this still proves the 10-bit segment-id
+    /// read and the per-segment 10-bit dequant.
+    #[test]
+    fn a_real_aomenc_10bit_stream_with_aq_segmentation_decodes_pixel_exact() {
+        run_segmentation_gate(
+            "a_real_aomenc_10bit_stream_with_aq_segmentation_decodes_pixel_exact",
+            "1",
+            10,
+            1,
+            &["--end-usage=q", "--cq-level=45"],
         );
     }
 
