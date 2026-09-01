@@ -2090,6 +2090,7 @@ mod tests {
             return;
         }
         let mut matched = 0u32;
+        let mut uncounted_exact = 0u32;
         let mut named_refusals = 0u32;
         let mut attempts = 0u32;
         let sizes = [(64, 128), (128, 64), (128, 128), (128, 192), (192, 192)];
@@ -2166,13 +2167,19 @@ mod tests {
                         }
                         Ok(frames) => frames,
                     };
-                    let after = crate::decode::palette_rect_hits();
-                    if after == before {
+                    // A successful decode is ALWAYS pixel-compared; the hit
+                    // counter only decides whether the attempt counts toward
+                    // the hit-asserting total (class
+                    // [[gate-skips-on-its-own-failure]]: the old `continue`
+                    // here let 16/70 decoded attempts past without any pixel
+                    // check at all).
+                    let counted = crate::decode::palette_rect_hits() != before;
+                    if !counted {
                         eprintln!(
                             "{NAME}: {source} cq={cq} decoded without ever landing a rect \
-                             palette block (palette_rect_hits unchanged) -- not counted"
+                             palette block (palette_rect_hits unchanged) -- pixel-compared, \
+                             not counted toward the hit assertion"
                         );
-                        continue;
                     }
                     let frame_count = frames.len();
                     let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
@@ -2199,7 +2206,11 @@ mod tests {
                             "{NAME}: {source} cq={cq} frame {i} V vs ffmpeg"
                         );
                     }
-                    matched += 1;
+                    if counted {
+                        matched += 1;
+                    } else {
+                        uncounted_exact += 1;
+                    }
                 }
             }
         }
@@ -2210,7 +2221,8 @@ mod tests {
              pixel-exact"
         );
         eprintln!(
-            "{NAME}: {matched}/{attempts} attempts matched pixel-exact, {named_refusals} \
+            "{NAME}: {matched}/{attempts} attempts matched pixel-exact, \
+             {uncounted_exact} decoded-and-pixel-exact but uncounted, {named_refusals} \
              named refusals, palette_rect_hits={}",
             crate::decode::palette_rect_hits()
         );
@@ -2246,6 +2258,7 @@ mod tests {
         // luma transform (lane-palette2 r7's lifted refusal): the same
         // screen-content streams exercise it, so this gate proves both.
         let mut split_palette_matched = 0u32;
+        let mut uncounted_exact = 0u32;
         let mut named_refusals = 0u32;
         let mut attempts = 0u32;
         let sizes = [(64, 128), (128, 64), (128, 128), (128, 192), (192, 192)];
@@ -2323,14 +2336,15 @@ mod tests {
                         }
                         Ok(frames) => frames,
                     };
-                    let after = crate::decode::rect_screen_content_hits();
-                    if after == before {
+                    // Same integrity rule as the palette gate above: decoded
+                    // means pixel-compared, counter or no counter.
+                    let counted = crate::decode::rect_screen_content_hits() != before;
+                    if !counted {
                         eprintln!(
                             "{NAME}: {source} cq={cq} decoded without ever running the rect \
-                             screen-content path (rect_screen_content_hits unchanged) -- not \
-                             counted"
+                             screen-content path (rect_screen_content_hits unchanged) -- \
+                             pixel-compared, not counted toward the hit assertion"
                         );
-                        continue;
                     }
                     let frame_count = frames.len();
                     let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
@@ -2357,8 +2371,12 @@ mod tests {
                             "{NAME}: {source} cq={cq} frame {i} V vs ffmpeg"
                         );
                     }
-                    matched += 1;
-                    if crate::decode::palette_split_tx_hits() > split_before {
+                    if counted {
+                        matched += 1;
+                    } else {
+                        uncounted_exact += 1;
+                    }
+                    if counted && crate::decode::palette_split_tx_hits() > split_before {
                         split_palette_matched += 1;
                     }
                 }
@@ -2378,6 +2396,7 @@ mod tests {
         eprintln!(
             "{NAME}: {matched}/{attempts} attempts matched pixel-exact \
              ({split_palette_matched} of them through a split-transform palette block), \
+             {uncounted_exact} decoded-and-pixel-exact but uncounted, \
              {named_refusals} named refusals, rect_screen_content_hits={}, \
              palette_split_tx_hits={}",
             crate::decode::rect_screen_content_hits(),

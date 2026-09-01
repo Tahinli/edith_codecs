@@ -47,8 +47,11 @@ Command (worktree, `CARGO_TARGET_DIR=$HOME/.cache/cargo-target-palette2`, `EC_AV
       refusal_inventory gate_coverage
     # test result: ok. 7 passed; 0 failed; 0 ignored
 
-aomenc line in both: `--tune-content=screen --enable-palette=1 --enable-rect-partitions=1
---min-partition-size=16 --max-partition-size=64 --sb-size=64 --passes=1 --threads=1 --row-mt=0`,
+aomenc line in both (CORRECTED r8 -- r7 wrote `--tune-content=screen
+--enable-rect-partitions=1`, which the code at stream.rs ~2118-2135 / ~2274-2291 passes
+NEITHER of; the actual argv is): `--codec=av1 --passes=1 --end-usage=q --cq-level=<cq>
+--cpu-used=4 --threads=1 --row-mt=0 --sb-size=64 --enable-palette=1 --min-partition-size=16
+--max-partition-size=64 --obu -o - -`,
 70 attempts (5 sizes x 7 cq x smptebars/rgbtestsrc), pixel-compared against ffmpeg's decode.
 
 EVIDENCE: /tmp/claude-1000/-home-tahinli-Documents-Code-Rust-edith-codecs/b6d8a07f-96a4-4bbb-b378-af9ae25cf7c9/scratchpad/palette2-r7-gates.txt | 70 real-aomenc screen-content encodes decoded and pixel-compared vs ffmpeg | a_real_aomenc_stream_with_rect_screen_content: 14/70 pixel-exact, 13 of them through a split-transform palette block, rect_screen_content_hits=169, palette_split_tx_hits=356
