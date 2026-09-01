@@ -2123,6 +2123,300 @@ mod tests {
         );
     }
 
+    /// lane-hbdgates r1: drive one 10-bit aomenc recipe over `seeds`, decode
+    /// every attempt and pixel-compare every SHOWN frame against ffmpeg's own
+    /// 10-bit decode of the identical bytes. Per-tool firing counters are
+    /// sampled PER ATTEMPT and summed only over attempts that decoded *and*
+    /// compared -- a stream that hit a named refusal contributes nothing
+    /// (class `counter-from-refused-stream`). Named refusals are tolerated
+    /// and reported; a pixel mismatch is a hard failure, never a SKIP.
+    fn ten_bit_tool_gate(
+        name: &str,
+        width: usize,
+        height: usize,
+        frames: usize,
+        extra: &[&str],
+        seeds: &[u32],
+        counters: &[(&str, fn() -> usize)],
+    ) {
+        fn first_diff(ours: &[u16], theirs: &[u16], width: usize) -> Option<String> {
+            ours.iter()
+                .zip(theirs.iter())
+                .position(|(a, b)| a != b)
+                .map(|i| {
+                    format!(
+                        "first diff at index {i} (row {}, col {}): ours {} vs ffmpeg {}",
+                        i / width,
+                        i % width,
+                        ours[i],
+                        theirs[i]
+                    )
+                })
+        }
+        let mut totals = vec![0usize; counters.len()];
+        let mut refusals: Vec<String> = Vec::new();
+        let mut compared = 0usize;
+        for &seed in seeds {
+            let stream = encode_10bit_gradients_seed(name, seed, width, height, frames, extra);
+            assert_eq!(
+                parsed_bit_depth(&stream),
+                10,
+                "{name}: aomenc did not write a 10-bit sequence header (seed {seed})"
+            );
+            let before: Vec<usize> = counters.iter().map(|(_, f)| f()).collect();
+            let decoded = match decode_stream(&stream) {
+                Ok(frames) => frames,
+                Err(e) => {
+                    refusals.push(format!("seed {seed}: {e}"));
+                    continue;
+                }
+            };
+            // Deltas are read BEFORE the pixel compare so a mismatch report
+            // says whether the tool under test actually fired on the failing
+            // stream (a mismatch with a zero delta is some other defect).
+            let deltas: Vec<usize> = counters
+                .iter()
+                .zip(before.iter())
+                .map(|((_, f), b)| f() - b)
+                .collect();
+            let fired: Vec<String> = counters
+                .iter()
+                .zip(deltas.iter())
+                .map(|((label, _), d)| format!("{label}={d}"))
+                .collect();
+            let fired = fired.join(" ");
+            let reference = ffmpeg_decode_sequence_10bit(&stream, width, height, decoded.len());
+            assert_eq!(
+                decoded.len(),
+                reference.len(),
+                "{name}: seed {seed}: shown-frame count vs ffmpeg"
+            );
+            for (i, (ours, theirs)) in decoded.iter().zip(reference.iter()).enumerate() {
+                for (plane, (a, b), w) in [
+                    ("Y", (&ours.y, &theirs.y), width),
+                    ("U", (&ours.u, &theirs.u), width / 2),
+                    ("V", (&ours.v, &theirs.v), width / 2),
+                ] {
+                    if let Some(d) = first_diff(a, b, w) {
+                        panic!("{name}: seed {seed} frame {i} plane {plane}: {d} [{fired}]");
+                    }
+                }
+            }
+            compared += 1;
+            for (i, d) in deltas.iter().enumerate() {
+                totals[i] += d;
+            }
+        }
+        assert!(
+            compared > 0,
+            "{name}: every attempt hit a named refusal:\n{}",
+            refusals.join("\n")
+        );
+        for (i, (label, _)) in counters.iter().enumerate() {
+            assert!(
+                totals[i] > 0,
+                "{name}: {compared} attempt(s) decoded pixel-exact but {label} never fired -- \
+                 the gate would prove nothing about that tool. refusals:\n{}",
+                refusals.join("\n")
+            );
+        }
+        let summary: Vec<String> = counters
+            .iter()
+            .zip(totals.iter())
+            .map(|((label, _), t)| format!("{label}={t}"))
+            .collect();
+        eprintln!(
+            "{name}: {compared}/{} attempts pixel-exact, {}",
+            seeds.len(),
+            summary.join(" ")
+        );
+    }
+
+    /// lane-hbdgates r1: the four intra tools that had an 8-bit gate and no
+    /// 10-bit one (`filter-intra`, `smooth-intra`, `paeth-intra`,
+    /// `intra-edge-filter`) on ONE real 10-bit `aomenc` key frame, each with
+    /// its own hard-asserted counter. His two films are yuv420p10le, so an
+    /// 8-bit-only gate for these tools proves nothing about the streams that
+    /// matter (lane-covbd r1).
+    #[test]
+    fn a_real_aomenc_10bit_intra_tools_stream_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_10bit_intra_tools_stream_decodes_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        ten_bit_tool_gate(
+            NAME,
+            64,
+            64,
+            1,
+            &[
+                "--limit=1",
+                "--kf-max-dist=0",
+                "--enable-filter-intra=1",
+                "--enable-smooth-intra=1",
+                "--enable-paeth-intra=1",
+                "--enable-intra-edge-filter=1",
+                "--enable-directional-intra=1",
+                "--enable-angle-delta=0",
+                "--enable-rect-partitions=0",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0",
+                "--enable-tx-size-search=0",
+                "--enable-cdef=0",
+                "--enable-restoration=0",
+                "--max-partition-size=32",
+                "--min-partition-size=16",
+                "--enable-palette=0",
+                "--enable-intrabc=0",
+                "--enable-cfl-intra=0",
+                "--enable-ref-frame-mvs=0",
+            ],
+            &[42, 7, 11, 23, 31, 57],
+            &[
+                ("filter_intra_hits", decode::filter_intra_hits),
+                ("smooth_pred_hits", crate::intra::smooth_pred_hits),
+                ("paeth_pred_hits", crate::intra::paeth_pred_hits),
+                ("intra_edge_filter_hits", crate::intra::intra_edge_filter_hits),
+            ],
+        );
+    }
+
+    /// lane-hbdgates r1: `--enable-restoration=1` at 10 bits. Every earlier
+    /// bit-depth gate ran `--enable-restoration=0`, which is exactly why two
+    /// high-bit-depth loop-restoration defects survived to 2026-09-01
+    /// (SGR box sums unscaled, Wiener clamp at the 8-bit bound). Same recipe
+    /// as the 8-bit LR gate, at 10 bits.
+    #[test]
+    #[ignore = "lane-hbdgates r1: REAL 10-bit loop-restoration defect. seed 42, frame 0, \
+                plane Y, first diff at index 122 (row 0, col 122): ours 351 vs ffmpeg 350, \
+                on a stream where lr_hits=2 (the LR filters did run). 8-bit LR is exact and \
+                every earlier 10-bit gate ran --enable-restoration=0, which is why this \
+                survived. Un-ignore with the fix; do NOT weaken the gate."]
+    fn a_real_aomenc_10bit_restoration_stream_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_10bit_restoration_stream_decodes_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        // 192x128 = 3x2 superblocks, so `read_lr` is re-entered per SB
+        // (the 8-bit LR gate's own trap warning); cq-level=15 because
+        // aomenc's RD only picks a non-RESTORE_NONE frame type at low cq.
+        ten_bit_tool_gate(
+            NAME,
+            192,
+            128,
+            1,
+            &[
+                "--limit=1",
+                "--kf-max-dist=0",
+                "--cq-level=15",
+                "--enable-restoration=1",
+                "--enable-cdef=0",
+                "--enable-rect-partitions=0",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0",
+                "--enable-filter-intra=0",
+                "--enable-smooth-intra=0",
+                "--enable-paeth-intra=0",
+                "--enable-tx-size-search=0",
+                "--max-partition-size=32",
+                "--min-partition-size=16",
+                "--enable-palette=0",
+                "--enable-intrabc=0",
+                "--enable-cfl-intra=0",
+                "--enable-ref-frame-mvs=0",
+            ],
+            &LR_SEEDS,
+            &[("lr_hits", ten_bit_lr_hits)],
+        );
+    }
+
+    /// Seeds swept by the 10-bit LR gate (the 8-bit gate needs ~40 attempts
+    /// to land a non-RESTORE_NONE frame; every attempt here still has to
+    /// decode pixel-exact).
+    const LR_SEEDS: [u32; 16] = [42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57];
+
+    /// Wiener + SGR + switchable loop-restoration firings, summed.
+    fn ten_bit_lr_hits() -> usize {
+        crate::restoration::wiener_hits()
+            + crate::restoration::sgrproj_hits()
+            + crate::restoration::switchable_hits()
+    }
+
+    /// lane-hbdgates r1: `--enable-rect-partitions=1 --enable-ab-partitions=1`
+    /// at 10 bits, one intra stream, one counter per tool
+    /// (`rect_partition_hits`, `partab_hits`) so a stream that only fired the
+    /// rect arms cannot stand in for AB.
+    #[test]
+    fn a_real_aomenc_10bit_rect_and_ab_partitions_decode_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_10bit_rect_and_ab_partitions_decode_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        // The 8-bit free-partition/AB recipe, verbatim, at 10 bits: AB
+        // splits are an INTER dispatch here (intra-frame AB is still a named
+        // refusal), so the stream needs alt-refs and 24 frames, not one key
+        // frame.
+        ten_bit_tool_gate(
+            NAME,
+            64,
+            64,
+            24,
+            &[
+                "--cq-level=45",
+                "--kf-max-dist=1000",
+                "--auto-alt-ref=1",
+                "--lag-in-frames=16",
+                "--enable-fwd-kf=0",
+                "--enable-order-hint=1",
+                "--enable-warped-motion=1",
+                "--enable-obmc=1",
+                "--tune-content=default",
+                "--enable-masked-comp=0",
+                "--enable-interintra-comp=0",
+                "--enable-onesided-comp=0",
+                "--enable-interintra-wedge=0",
+                "--enable-smooth-interintra=0",
+                "--enable-rect-partitions=1",
+                "--enable-ab-partitions=1",
+                "--enable-1to4-partitions=0",
+                "--enable-filter-intra=0",
+                "--enable-smooth-intra=0",
+                "--enable-paeth-intra=0",
+                "--enable-directional-intra=0",
+                "--enable-angle-delta=0",
+                "--enable-tx-size-search=0",
+                "--enable-cdef=0",
+                "--enable-restoration=0",
+                "--max-partition-size=32",
+                "--min-partition-size=16",
+                "--enable-palette=0",
+                "--enable-intrabc=0",
+                "--enable-cfl-intra=0",
+                "--enable-ref-frame-mvs=0",
+            ],
+            &LR_SEEDS,
+            &[
+                ("rect_partition_hits", decode::rect_partition_hits),
+                ("partab_hits", decode::partab_hits),
+            ],
+        );
+    }
+
     /// `bit_depth` of the first sequence header in `stream`.
     fn parsed_bit_depth(stream: &[u8]) -> u8 {
         let mut probe = Av1Parser::new();
@@ -2148,6 +2442,20 @@ mod tests {
         frames: usize,
         extra: &[&str],
     ) -> Vec<u8> {
+        encode_10bit_gradients_seed(name, 42, width, height, frames, extra)
+    }
+
+    /// As [`encode_10bit_gradients`], but with the fixture seed exposed --
+    /// lane-hbdgates r1 sweeps seeds so a tool that aomenc's RD declines on
+    /// one fixture still gets a firing stream.
+    fn encode_10bit_gradients_seed(
+        name: &str,
+        seed: u32,
+        width: usize,
+        height: usize,
+        frames: usize,
+        extra: &[&str],
+    ) -> Vec<u8> {
         let duration = frames as f64 / 25.0;
         let y4m = Command::new("ffmpeg")
             .args([
@@ -2156,7 +2464,7 @@ mod tests {
                 "-f",
                 "lavfi",
                 "-i",
-                &gradients_source(42, width, height, &format!("duration={duration}:rate=25")),
+                &gradients_source(seed, width, height, &format!("duration={duration}:rate=25")),
                 "-pix_fmt",
                 "yuv420p10le",
                 "-strict",
@@ -2177,18 +2485,21 @@ mod tests {
             "{name}: ffmpeg failed to render the 10-bit fixture: {}",
             String::from_utf8_lossy(&y4m.stderr)
         );
-        let mut args: Vec<&str> = vec![
-            "--codec=av1",
-            "--passes=1",
-            "--end-usage=q",
-            "--cq-level=30",
+        let mut args: Vec<&str> = vec!["--codec=av1", "--passes=1", "--end-usage=q"];
+        // lane-hbdgates r1: a caller-supplied `--cq-level` REPLACES the
+        // default rather than being appended after it -- two `--cq-level`
+        // flags on one aomenc line is a coin flip on which one lands.
+        if !extra.iter().any(|a| a.starts_with("--cq-level=")) {
+            args.push("--cq-level=30");
+        }
+        args.extend_from_slice(&[
             "--cpu-used=0",
             "--threads=1",
             "--row-mt=0",
             "--sb-size=64",
             "--input-bit-depth=10",
             "--bit-depth=10",
-        ];
+        ]);
         args.extend_from_slice(extra);
         args.extend_from_slice(&["--obu", "-o", "-", "-"]);
         let mut child = Command::new(aomenc_path())

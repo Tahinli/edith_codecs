@@ -147,16 +147,14 @@ const NEVER_EXERCISED_8BIT: &[(&str, &str)] = &[
 const NEVER_EXERCISED_10BIT: &[(&str, &str)] = &[
     // Only 4 of the 45 real-aomenc gates encode at 10 bits, and they pin the
     // pixel filters and the intra tool set off. Every entry the 8-bit list
-    // carries is a hole here too; the seven extra ones below are tools an
-    // 8-bit gate DOES enable, whose high-bit-depth path no stream has ever
-    // touched -- exactly the shape that hid the two lane-hbdinter defects.
+    // carries is a hole here too. lane-hbdgates r1 closed six of the seven
+    // 8-bit-only entries with real 10-bit gates (filter-intra, smooth-intra,
+    // paeth-intra, intra-edge-filter, rect-partitions, ab-partitions); the
+    // seventh, `enable-restoration`, has a 10-bit gate that FAILS and is
+    // therefore `#[ignore]`d, so its hole stays open.
     (
         "enable-1to4-partitions",
         "hole at both depths, see the 8-bit list",
-    ),
-    (
-        "enable-ab-partitions",
-        "8-bit only: no 10-bit gate enables AB partitions",
     ),
     (
         "enable-angle-delta",
@@ -175,10 +173,6 @@ const NEVER_EXERCISED_10BIT: &[(&str, &str)] = &[
         "hole at both depths, see the 8-bit list",
     ),
     (
-        "enable-filter-intra",
-        "8-bit only: no 10-bit gate enables filter intra",
-    ),
-    (
         "enable-flip-idtx",
         "hole at both depths, see the 8-bit list",
     ),
@@ -186,19 +180,7 @@ const NEVER_EXERCISED_10BIT: &[(&str, &str)] = &[
         "enable-global-motion",
         "hole at both depths, see the 8-bit list",
     ),
-    (
-        "enable-intra-edge-filter",
-        "8-bit only: the 10-bit intra path never runs the edge filter",
-    ),
     ("enable-intrabc", "hole at both depths, see the 8-bit list"),
-    (
-        "enable-paeth-intra",
-        "8-bit only: no 10-bit gate enables Paeth",
-    ),
-    (
-        "enable-rect-partitions",
-        "8-bit only: no 10-bit gate enables rect partitions",
-    ),
     ("enable-rect-tx", "hole at both depths, see the 8-bit list"),
     (
         "enable-ref-frame-mvs",
@@ -206,11 +188,7 @@ const NEVER_EXERCISED_10BIT: &[(&str, &str)] = &[
     ),
     (
         "enable-restoration",
-        "8-bit only -- THE instance this split was built for: every 10-bit gate passed `--enable-restoration=0`, so the SGR box sums and the Wiener clamp were never run at 10 bits and both were wrong (lane-hbdinter, 2026-09-01)",
-    ),
-    (
-        "enable-smooth-intra",
-        "8-bit only: no 10-bit gate enables smooth intra",
+        "8-bit only -- THE instance this split was built for: every 10-bit gate passed `--enable-restoration=0`, so the SGR box sums and the Wiener clamp were never run at 10 bits and both were wrong (lane-hbdinter, 2026-09-01). lane-hbdgates r1 WROTE the 10-bit LR gate (`a_real_aomenc_10bit_restoration_stream_decodes_pixel_exact`) and it FAILS pixel-exact on a stream where the LR filters demonstrably ran (lr_hits=2, seed 42, frame 0, Y index 122: ours 351 vs ffmpeg 350), so it is `#[ignore]`d and the hole stays open until that defect is fixed",
     ),
     (
         "enable-superres",
@@ -231,7 +209,17 @@ mod tests {
         let src = include_str!("stream.rs");
         let gates: Vec<&str> = src
             .split("\n    #[")
-            .filter(|body| body.contains("\"--passes=1\""))
+            // lane-hbdgates r1: an `#[ignore]`d gate exercises nothing, so it
+            // must not close a hole. Its body is the segment that opens with
+            // the ignore attribute.
+            .filter(|body| !body.starts_with("ignore"))
+            // lane-hbdgates r1: gates that build their stream through the
+            // shared 10-bit helpers spell `--passes=1` there, not inline.
+            .filter(|body| {
+                body.contains("\"--passes=1\"")
+                    || body.contains("ten_bit_tool_gate(")
+                    || body.contains("encode_10bit_gradients")
+            })
             .collect();
         assert!(
             gates.len() >= 20,
@@ -346,6 +334,7 @@ mod tests {
     /// 8-bit default.
     fn is_ten_bit(body: &str) -> bool {
         body.contains("encode_10bit_gradients")
+            || body.contains("ten_bit_tool_gate(")
             || body.contains("--bit-depth=10")
             || body.contains("--input-bit-depth=10")
             || body.contains("yuv420p10le")
