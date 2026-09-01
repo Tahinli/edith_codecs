@@ -4616,6 +4616,30 @@ pub const EOB_PT_16_LUMA_Q3: [u16; 6] = [6708, 8958, 14746, 22133, 32768, 0];
 /// `V_DCT`/`H_DCT` (lane-av1tx4 r5: the class dimension libaom always keeps,
 /// this crate never carried at all until a real aomdec trace showed the
 /// desync starting exactly at this read).
+/// `av1_default_eob_multi32_cdfs` (libaom `token_cdfs.h`), luma plane, 2D tx
+/// class: the end-of-block group of a 32-position transform -- the
+/// `TX_4X8`/`TX_8X4` pair this decoder reaches through
+/// [`crate::cdf_state::TxbSet::LumaRect4x8`] (lane-tx4x8). Q-context 2
+/// (`base_q_idx` 61..=120) is the unsuffixed name, as everywhere else here.
+pub const EOB_PT_32_LUMA_Q0: [u16; 7] = [400, 520, 977, 2102, 6542, 32768, 0];
+/// [`EOB_PT_32_LUMA_Q0`]'s q-context 1 (`base_q_idx` 21..=60) sibling.
+pub const EOB_PT_32_LUMA_Q1: [u16; 7] = [989, 1249, 2019, 4151, 10785, 32768, 0];
+/// [`EOB_PT_32_LUMA_Q0`]'s q-context 2 (`base_q_idx` 61..=120) sibling.
+pub const EOB_PT_32_LUMA: [u16; 7] = [2515, 3003, 4452, 8162, 16041, 32768, 0];
+/// [`EOB_PT_32_LUMA_Q0`]'s q-context 3 (`base_q_idx` 121..=255) sibling.
+pub const EOB_PT_32_LUMA_Q3: [u16; 7] = [4617, 5709, 8446, 13584, 23135, 32768, 0];
+/// [`EOB_PT_32_LUMA`]'s `TX_CLASS_HORIZ`/`TX_CLASS_VERT` sibling (the `[1]`
+/// row of the same libaom table), read instead whenever the TU's `tx_type`
+/// is `V_DCT`/`H_DCT` -- reachable at 4x8/8x4 because that size's intra
+/// `tx_type` set is `EXT_TX_SET_DTT4_IDTX_1DDCT`, which carries both.
+pub const EOB_PT_32_LUMA_CLASS1_Q0: [u16; 7] = [210, 405, 1315, 3326, 7537, 32768, 0];
+/// [`EOB_PT_32_LUMA_CLASS1_Q0`]'s q-context 1 sibling.
+pub const EOB_PT_32_LUMA_CLASS1_Q1: [u16; 7] = [313, 441, 1099, 2917, 8562, 32768, 0];
+/// [`EOB_PT_32_LUMA_CLASS1_Q0`]'s q-context 2 sibling.
+pub const EOB_PT_32_LUMA_CLASS1: [u16; 7] = [574, 821, 1836, 5089, 13128, 32768, 0];
+/// [`EOB_PT_32_LUMA_CLASS1_Q0`]'s q-context 3 sibling.
+pub const EOB_PT_32_LUMA_CLASS1_Q3: [u16; 7] = [1156, 1702, 3675, 9274, 20539, 32768, 0];
+
 pub const EOB_PT_16_LUMA_CLASS1_Q0: [u16; 6] = [370, 671, 1883, 4471, 32768, 0];
 pub const EOB_PT_16_LUMA_CLASS1_Q1: [u16; 6] = [513, 765, 1859, 6339, 32768, 0];
 pub const EOB_PT_16_LUMA_CLASS1: [u16; 6] = [716, 1105, 2646, 10056, 32768, 0];

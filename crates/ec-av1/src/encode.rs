@@ -1078,6 +1078,45 @@ const HAS_TOP_RIGHT_RECT: [&[u8]; 2] = [&[15, 5, 7, 5], &[255, 119, 127, 119]];
 /// `has_bl_32x16`/`has_bl_16x32`, same source, same order.
 const HAS_BOTTOM_LEFT_RECT: [&[u8]; 2] = [&[78, 14, 78, 14], &[16, 0, 16, 0]];
 
+/// `has_tr_4x8` (libaom `reconintra.c`), transcribed verbatim -- lane-tx4x8's
+/// `PARTITION_VERT` leaf of an 8x8 block. Row stride is
+/// [`Reach::table_stride`]`(4)` = 32 bits, as for every other entry of
+/// libaom's own `has_tr_tables`.
+const HAS_TR_4X8: [u8; 64] = [
+    255, 255, 255, 255, 119, 119, 119, 119, 127, 127, 127, 127, 119, 119, 119, 119, 255, 127, 255,
+    127, 119, 119, 119, 119, 127, 127, 127, 127, 119, 119, 119, 119, 255, 255, 255, 127, 119, 119,
+    119, 119, 127, 127, 127, 127, 119, 119, 119, 119, 255, 127, 255, 127, 119, 119, 119, 119, 127,
+    127, 127, 127, 119, 119, 119, 119,
+];
+/// `has_tr_8x4`, same source -- the `PARTITION_HORZ` leaf.
+const HAS_TR_8X4: [u8; 64] = [
+    255, 255, 0, 0, 85, 85, 0, 0, 119, 119, 0, 0, 85, 85, 0, 0, 127, 127, 0, 0, 85, 85, 0, 0, 119,
+    119, 0, 0, 85, 85, 0, 0, 255, 127, 0, 0, 85, 85, 0, 0, 119, 119, 0, 0, 85, 85, 0, 0, 127, 127,
+    0, 0, 85, 85, 0, 0, 119, 119, 0, 0, 85, 85, 0, 0,
+];
+/// `has_bl_4x8`, same source.
+const HAS_BL_4X8: [u8; 64] = [
+    16, 17, 17, 17, 0, 1, 1, 1, 16, 17, 17, 17, 0, 0, 1, 0, 16, 17, 17, 17, 0, 1, 1, 1, 16, 17, 17,
+    17, 0, 0, 0, 0, 16, 17, 17, 17, 0, 1, 1, 1, 16, 17, 17, 17, 0, 0, 1, 0, 16, 17, 17, 17, 0, 1,
+    1, 1, 16, 17, 17, 17, 0, 0, 0, 0,
+];
+/// `has_bl_8x4`, same source.
+const HAS_BL_8X4: [u8; 64] = [
+    254, 255, 84, 85, 254, 255, 16, 17, 254, 255, 84, 85, 254, 255, 0, 1, 254, 255, 84, 85, 254,
+    255, 16, 17, 254, 255, 84, 85, 254, 255, 0, 0, 254, 255, 84, 85, 254, 255, 16, 17, 254, 255,
+    84, 85, 254, 255, 0, 1, 254, 255, 84, 85, 254, 255, 16, 17, 254, 255, 84, 85, 254, 255, 0, 0,
+];
+
+/// The `has_tr_*`/`has_bl_*` row for one rectangular block shape.
+fn rect_reach_tables(bw: usize, bh: usize) -> (&'static [u8], &'static [u8]) {
+    match (bw, bh) {
+        (4, 8) => (&HAS_TR_4X8, &HAS_BL_4X8),
+        (8, 4) => (&HAS_TR_8X4, &HAS_BL_8X4),
+        (16, 32) => (HAS_TOP_RIGHT_RECT[1], HAS_BOTTOM_LEFT_RECT[1]),
+        _ => (HAS_TOP_RIGHT_RECT[0], HAS_BOTTOM_LEFT_RECT[0]),
+    }
+}
+
 impl Reach {
     /// What a block of `side` samples at `(x, y)` may read past its own edges,
     /// in a frame of `width` by `height`.
@@ -1124,7 +1163,7 @@ impl Reach {
         if col + 1 == per_col {
             return false;
         }
-        let table = HAS_TOP_RIGHT_RECT[usize::from(bw == 16)];
+        let table = rect_reach_tables(bw, bh).0;
         Self::bit(table, (row * Self::table_stride(bw) + col) % (table.len() * 8))
     }
 
@@ -1136,7 +1175,7 @@ impl Reach {
         if row + 1 == per_row {
             return false;
         }
-        let table = HAS_BOTTOM_LEFT_RECT[usize::from(bw == 16)];
+        let table = rect_reach_tables(bw, bh).1;
         Self::bit(table, (row * Self::table_stride(bw) + col) % (table.len() * 8))
     }
 
