@@ -128,23 +128,20 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 }
             }
             let output = if header.film_grain.apply_grain {
-                // lane-hbd r5: `film_grain.rs`'s grain LUT and blend are
-                // hardcoded 8-bit (`[i32; 256]`, clamps at 255) -- narrowed
-                // from the old blanket bit-depth refusal to only the case
-                // that actually reaches unported code.
+                // lane-hbd10 r1: grain synthesis is bit-depth generic
+                // (`film_grain.rs`'s `grain_range`/`scale_lut`, spec 7.18.3).
                 let bit_depth = parser
                     .sequence_header()
                     .map_or(8, |seq| seq.color_config.bit_depth);
-                if bit_depth != 8 {
-                    return Err(Error::unsupported(
-                        "AV1 decode_stream",
-                        "a bit depth other than 8 with film grain applied (film_grain.rs's LUT and blend are hardcoded 8-bit)",
-                    ));
-                }
                 let mc_identity = parser
                     .sequence_header()
                     .is_some_and(|seq| seq.color_config.matrix_coefficients == 0);
-                crate::film_grain::apply_grain(&picture, &header.film_grain, mc_identity)
+                crate::film_grain::apply_grain(
+                    &picture,
+                    &header.film_grain,
+                    mc_identity,
+                    bit_depth as u32,
+                )
             } else {
                 picture
             };
@@ -509,20 +506,12 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
             // call above, right before anything else can overwrite it) --
             // see `decode::take_last_frame_wide_margin`'s doc.
             let wide_margin = crate::decode::take_last_frame_wide_margin();
-            // lane-hbd r5: `upscale_row` (superres.rs) is `&[u8]`, clamping at
-            // 255 -- narrowed from the old blanket bit-depth refusal to only
-            // the case that actually reaches unported code.
-            if header.use_superres && bit_depth != 8 {
-                return Err(Error::unsupported(
-                    "AV1 decode_stream",
-                    "a bit depth other than 8 with use_superres set (superres.rs's upscale_row is hardcoded 8-bit)",
-                ));
-            }
             let picture = if header.use_superres {
                 crate::superres::upscale_picture(
                     &picture,
                     header.upscaled_width as usize,
                     wide_margin.as_ref(),
+                    bit_depth as u32,
                 )
             } else {
                 picture
@@ -634,6 +623,7 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                     &picture,
                     header.upscaled_width as usize,
                     wide_margin.as_ref(),
+                    bit_depth as u32,
                 )
             } else {
                 picture
@@ -710,18 +700,15 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         }
         if header.show_frame {
             let output = if header.film_grain.apply_grain {
-                // lane-hbd r5: same 8-bit-only LUT/blend as the
-                // show_existing_frame arm above.
-                if bit_depth != 8 {
-                    return Err(Error::unsupported(
-                        "AV1 decode_stream",
-                        "a bit depth other than 8 with film grain applied (film_grain.rs's LUT and blend are hardcoded 8-bit)",
-                    ));
-                }
                 let mc_identity = parser
                     .sequence_header()
                     .is_some_and(|seq| seq.color_config.matrix_coefficients == 0);
-                crate::film_grain::apply_grain(&picture, &header.film_grain, mc_identity)
+                crate::film_grain::apply_grain(
+                    &picture,
+                    &header.film_grain,
+                    mc_identity,
+                    bit_depth as u32,
+                )
             } else {
                 picture
             };
@@ -1940,6 +1927,237 @@ mod tests {
         assert_eq!(frames[0].y, ffmpeg_frames[0].y, "luma vs ffmpeg (10-bit)");
         assert_eq!(frames[0].u, ffmpeg_frames[0].u, "U vs ffmpeg (10-bit)");
         assert_eq!(frames[0].v, ffmpeg_frames[0].v, "V vs ffmpeg (10-bit)");
+    }
+
+    /// lane-hbd10 r1: a real `aomenc --bit-depth=10 --film-grain-test=1`
+    /// stream, decoded pixel-exact against ffmpeg's own 10-bit decode of the
+    /// identical bytes (ffmpeg synthesizes grain by default -- no
+    /// grain-disable flag is passed anywhere in this file). Proves the
+    /// bit-depth-generic grain path (`film_grain.rs`'s `grain_range`,
+    /// `scale_lut`, the `<< (bit_depth - 8)` offsets/legal ranges) rather
+    /// than the old `bit_depth != 8` refusal. HARD-asserts both the parsed
+    /// `bit_depth == 10` and `film_grain::grain_hits() > 0`, so neither a
+    /// silent 8-bit fallback nor a stream aomenc emitted without
+    /// `apply_grain` can make it pass vacuously.
+    #[test]
+    fn a_real_aomenc_10bit_film_grain_stream_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_10bit_film_grain_stream_decodes_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height) = (64usize, 64usize);
+        let stream = encode_10bit_gradients(
+            NAME,
+            width,
+            height,
+            1,
+            &["--film-grain-test=1", "--limit=1"],
+        );
+        assert_eq!(
+            parsed_bit_depth(&stream),
+            10,
+            "{NAME}: aomenc did not actually write a 10-bit sequence header"
+        );
+        let mut probe = Av1Parser::new();
+        let mut pos = 0usize;
+        let mut saw_grain = false;
+        while pos < stream.len() {
+            let obu = probe.parse_obu(&stream[pos..]).unwrap();
+            pos += obu.total_size;
+            if let ObuKind::Frame(header, _) = obu.kind
+                && header.film_grain.apply_grain
+            {
+                // A grain block whose scaling LUT is empty would blend a
+                // zero delta into every pixel and let this gate pass without
+                // the bit-depth math mattering at all.
+                assert!(
+                    header.film_grain.num_y_points > 0,
+                    "{NAME}: apply_grain with no luma scaling points -- grain would be a no-op"
+                );
+                saw_grain = true;
+            }
+        }
+        assert!(saw_grain, "{NAME}: aomenc did not turn on apply_grain");
+        let before = crate::film_grain::grain_hits();
+        let frames = match decode_stream(&stream) {
+            Ok(frames) => frames,
+            Err(e) => panic!("{NAME}: decode_stream refused: {e}"),
+        };
+        assert!(
+            crate::film_grain::grain_hits() > before,
+            "{NAME}: matched but zero grain_hits -- grain synthesis never ran"
+        );
+        let ffmpeg_frames = ffmpeg_decode_sequence_10bit(&stream, width, height, 1);
+        assert_eq!(frames[0].y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg");
+        assert_eq!(frames[0].u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg");
+        assert_eq!(frames[0].v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg");
+        eprintln!("{NAME}: pixel-exact, grain_hits={}", crate::film_grain::grain_hits());
+    }
+
+    /// lane-hbd10 r1: a real `aomenc --bit-depth=10 --superres-mode=1
+    /// --superres-denominator=12` key frame, decoded pixel-exact against
+    /// ffmpeg's own 10-bit decode. Proves `superres::upscale_row`'s
+    /// `clip_pixel_highbd` clamp (`(1 << bit_depth) - 1`) on real 10-bit
+    /// planes rather than the old `bit_depth != 8` refusal. HARD-asserts
+    /// `bit_depth == 10` and `superres_hits > 0`.
+    #[test]
+    fn a_real_aomenc_10bit_superres_stream_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_10bit_superres_stream_decodes_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height) = (64usize, 64usize);
+        let stream = encode_10bit_gradients(
+            NAME,
+            width,
+            height,
+            1,
+            &[
+                "--limit=1",
+                "--kf-max-dist=0",
+                "--superres-mode=1",
+                "--superres-denominator=12",
+                "--superres-kf-denominator=12",
+                "--enable-rect-partitions=0",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0",
+                "--enable-filter-intra=0",
+                "--enable-smooth-intra=0",
+                "--enable-paeth-intra=0",
+                "--enable-directional-intra=0",
+                "--enable-angle-delta=0",
+                "--enable-tx-size-search=0",
+                "--enable-cdef=0",
+                "--enable-restoration=0",
+                "--max-partition-size=32",
+                "--min-partition-size=32",
+                "--enable-palette=0",
+                "--enable-intrabc=0",
+                "--enable-cfl-intra=0",
+            ],
+        );
+        assert_eq!(
+            parsed_bit_depth(&stream),
+            10,
+            "{NAME}: aomenc did not actually write a 10-bit sequence header"
+        );
+        let before = crate::superres::superres_hits();
+        let frames = match decode_stream(&stream) {
+            Ok(frames) => frames,
+            Err(e) => panic!("{NAME}: decode_stream refused: {e}"),
+        };
+        assert!(
+            crate::superres::superres_hits() > before,
+            "{NAME}: matched but zero superres_hits -- the upscaler never ran"
+        );
+        let ffmpeg_frames = ffmpeg_decode_sequence_10bit(&stream, width, height, 1);
+        assert_eq!(frames[0].y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg");
+        assert_eq!(frames[0].u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg");
+        assert_eq!(frames[0].v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg");
+        eprintln!(
+            "{NAME}: pixel-exact, superres_hits={}",
+            crate::superres::superres_hits()
+        );
+    }
+
+    /// `bit_depth` of the first sequence header in `stream`.
+    fn parsed_bit_depth(stream: &[u8]) -> u8 {
+        let mut probe = Av1Parser::new();
+        let mut pos = 0usize;
+        while pos < stream.len() && probe.sequence_header().is_none() {
+            let obu = probe.parse_obu(&stream[pos..]).unwrap();
+            pos += obu.total_size;
+        }
+        probe
+            .sequence_header()
+            .expect("stream has a sequence header OBU")
+            .color_config
+            .bit_depth
+    }
+
+    /// Render `frames` of the shared `gradients_source` as `yuv420p10le` and
+    /// encode it with a real 10-bit `aomenc`, returning the OBU stream.
+    /// `extra` carries the tool flags under test.
+    fn encode_10bit_gradients(
+        name: &str,
+        width: usize,
+        height: usize,
+        frames: usize,
+        extra: &[&str],
+    ) -> Vec<u8> {
+        let duration = frames as f64 / 25.0;
+        let y4m = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                &gradients_source(42, width, height, &format!("duration={duration}:rate=25")),
+                "-pix_fmt",
+                "yuv420p10le",
+                "-strict",
+                "-1",
+                "-t",
+                &format!("{duration}"),
+                "-f",
+                "yuv4mpegpipe",
+                "-",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ffmpeg failed to run");
+        assert!(
+            y4m.status.success(),
+            "{name}: ffmpeg failed to render the 10-bit fixture: {}",
+            String::from_utf8_lossy(&y4m.stderr)
+        );
+        let mut args: Vec<&str> = vec![
+            "--codec=av1",
+            "--passes=1",
+            "--end-usage=q",
+            "--cq-level=30",
+            "--cpu-used=0",
+            "--threads=1",
+            "--row-mt=0",
+            "--sb-size=64",
+            "--input-bit-depth=10",
+            "--bit-depth=10",
+        ];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&["--obu", "-o", "-", "-"]);
+        let mut child = Command::new(aomenc_path())
+            .args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("aomenc failed to start");
+        child
+            .stdin
+            .take()
+            .expect("aomenc stdin")
+            .write_all(&y4m.stdout)
+            .expect("writing y4m to aomenc");
+        let out = child.wait_with_output().expect("aomenc failed to run");
+        assert!(
+            out.status.success(),
+            "{name}: aomenc refused the 10-bit fixture: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out.stdout
     }
 
     /// A real `aomenc` palette-**UV** fixture (lane-palette2 r2): `testsrc2`
