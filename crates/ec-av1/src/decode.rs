@@ -1049,6 +1049,38 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+
+/// Arms the pending [`PALETTE_PRED`] override for the next `reconstruct`
+/// (`set`) / consumes it (`take`). Set and take MUST pair: a buffer armed at a
+/// site whose reconstruct never runs would be picked up by the NEXT block's
+/// reconstruct (class [[refusal-hides-a-defect]] / stale thread-local), so
+/// `EC_DEBUG_PAL=1` traces every arm and every consumption with its call site.
+#[track_caller]
+fn set_palette_pred(buf: Vec<u16>) {
+    if std::env::var_os("EC_DEBUG_PAL").is_some() {
+        let stale = PALETTE_PRED.with(|c| c.borrow().is_some());
+        eprintln!(
+            "PALSET len={} stale={stale} at {}",
+            buf.len(),
+            std::panic::Location::caller()
+        );
+    }
+    PALETTE_PRED.with(|c| *c.borrow_mut() = Some(buf));
+}
+
+#[track_caller]
+fn take_palette_pred() -> Option<Vec<u16>> {
+    let got = PALETTE_PRED.with(|c| c.borrow_mut().take());
+    if std::env::var_os("EC_DEBUG_PAL").is_some() {
+        eprintln!(
+            "PALTAKE len={:?} at {}",
+            got.as_ref().map(Vec::len),
+            std::panic::Location::caller()
+        );
+    }
+    got
+}
+
 thread_local! {
     /// The current frame's `mi` grid, kept only while a frame header set
     /// `allow_intrabc` -- an intrabc block's DV predictor is the ordinary
@@ -4178,7 +4210,7 @@ fn decode_rect_split(
                         buf[base..base + tx].iter().copied()
                     })
                     .collect();
-                PALETTE_PRED.with(|c| *c.borrow_mut() = Some(tu_buf));
+                set_palette_pred(tu_buf);
             }
             if m.skip {
                 y.reconstruct(
@@ -4232,14 +4264,14 @@ fn decode_rect_split(
     let (u_grid, v_grid) = if m.skip {
         let zero = vec![0i32; chroma_w * chroma_h];
         if let Some((ub, _)) = &m.palette_uv {
-            PALETTE_PRED.with(|c| *c.borrow_mut() = Some(ub.clone()));
+            set_palette_pred(ub.clone());
         }
         u.reconstruct_rect(
             cpx, cpy, chroma_w, chroma_h, m.uv_predict_mode, m.angle_delta_uv, reach, &zero,
             m.alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)), None, m.smooth_neighbor_uv,
         );
         if let Some((_, vb)) = &m.palette_uv {
-            PALETTE_PRED.with(|c| *c.borrow_mut() = Some(vb.clone()));
+            set_palette_pred(vb.clone());
         }
         v.reconstruct_rect(
             cpx, cpy, chroma_w, chroma_h, m.uv_predict_mode, m.angle_delta_uv, reach, &zero,
@@ -4289,7 +4321,7 @@ fn decode_rect_split(
             let plane = if plane_idx == 1 { &mut *u } else { &mut *v };
             if let Some((ub, vb)) = &m.palette_uv {
                 let buf = if plane_idx == 1 { ub } else { vb };
-                PALETTE_PRED.with(|c| *c.borrow_mut() = Some(buf.clone()));
+                set_palette_pred(buf.clone());
             }
             plane.reconstruct_rect(
                 cpx,
@@ -4447,6 +4479,18 @@ fn decode_block_rect(
         decode_rect_split(
             dec, cdfs, neighbours, at, bw, bh, tx, &modes, y, u, v, base_q_idx, reduced_tx_set,
         )?;
+        // This early return skips this fn's own tail, so the palette
+        // neighbour state has to be stamped HERE too: without it a split-tx
+        // strip left the above/left palette arrays holding a DEAD block's
+        // colours, and the next block's colour cache
+        // ([`Neighbours::palette_uv_cache`]) then hit a cached entry with the
+        // wrong VALUE -- same bit count, so the entropy stream stayed in sync
+        // and only those pixels were wrong (lane-palette2 r10).
+        let (py_size, py_colors) = palette_y.as_ref().map_or((0, [0u16; 8]), |p| (p.size, p.colors));
+        neighbours.record_palette_y_rect(at, bw, bh, py_size, py_colors);
+        let (puv_size, puv_colors) =
+            palette_uv.as_ref().map_or((0, [0u16; 8]), |p| (p.size, p.u_colors));
+        neighbours.record_palette_uv_rect(at, bw, bh, puv_size, puv_colors);
         RECT_PARTITION_HITS.with(|c| c.set(c.get() + 1));
         return Ok(());
     }
@@ -4467,7 +4511,7 @@ fn decode_block_rect(
     // right before each `reconstruct_rect` call below (lane-palette2 r4).
     if let Some(ref pyv) = palette_y {
         let buf: Vec<u16> = pyv.map.iter().map(|&idx| pyv.colors[idx as usize]).collect();
-        PALETTE_PRED.with(|c| *c.borrow_mut() = Some(buf));
+        set_palette_pred(buf);
     }
     let palette_uv_bufs: Option<(Vec<u16>, Vec<u16>)> = palette_uv.as_ref().map(|puv| {
         (
@@ -4491,7 +4535,7 @@ fn decode_block_rect(
         );
         let ac = alpha.map(|_| cfl_ac_q3_rect(y, px, py, bw, bh));
         if let Some((ub, _)) = &palette_uv_bufs {
-            PALETTE_PRED.with(|c| *c.borrow_mut() = Some(ub.clone()));
+            set_palette_pred(ub.clone());
         }
         u.reconstruct_rect(
             cpx,
@@ -4507,7 +4551,7 @@ fn decode_block_rect(
             smooth_neighbor_uv,
         );
         if let Some((_, vb)) = &palette_uv_bufs {
-            PALETTE_PRED.with(|c| *c.borrow_mut() = Some(vb.clone()));
+            set_palette_pred(vb.clone());
         }
         v.reconstruct_rect(
             cpx,
@@ -4636,7 +4680,7 @@ fn decode_block_rect(
         );
         let ac = alpha.map(|_| cfl_ac_q3_rect(y, px, py, bw, bh));
         if let Some((ub, _)) = &palette_uv_bufs {
-            PALETTE_PRED.with(|c| *c.borrow_mut() = Some(ub.clone()));
+            set_palette_pred(ub.clone());
         }
         let u_default_tx = default_intra_tx_type(uv_predict_mode as u8);
         let u_skip_ctx = usize::from(around[1].0) + usize::from(around[1].1);
@@ -4679,7 +4723,7 @@ fn decode_block_rect(
             smooth_neighbor_uv,
         );
         if let Some((_, vb)) = &palette_uv_bufs {
-            PALETTE_PRED.with(|c| *c.borrow_mut() = Some(vb.clone()));
+            set_palette_pred(vb.clone());
         }
         let v_default_tx = default_intra_tx_type(uv_predict_mode as u8);
         let v_skip_ctx = usize::from(around[2].0) + usize::from(around[2].1);
@@ -5047,7 +5091,7 @@ fn decode_block_rect64(
     let reach = Reach::of_rect(bw, bh, px, py, y.width, y.height);
     if let Some(ref pyv) = palette_y {
         let buf: Vec<u16> = pyv.map.iter().map(|&idx| pyv.colors[idx as usize]).collect();
-        PALETTE_PRED.with(|c| *c.borrow_mut() = Some(buf));
+        set_palette_pred(buf);
     }
     let palette_uv_bufs: Option<(Vec<u16>, Vec<u16>)> = palette_uv.as_ref().map(|puv| {
         (
@@ -5071,7 +5115,7 @@ fn decode_block_rect64(
         );
         let ac = alpha.map(|_| cfl_ac_q3_rect(y, px, py, bw, bh));
         if let Some((ub, _)) = &palette_uv_bufs {
-            PALETTE_PRED.with(|c| *c.borrow_mut() = Some(ub.clone()));
+            set_palette_pred(ub.clone());
         }
         u.reconstruct_rect(
             cpx,
@@ -5087,7 +5131,7 @@ fn decode_block_rect64(
             smooth_neighbor_uv,
         );
         if let Some((_, vb)) = &palette_uv_bufs {
-            PALETTE_PRED.with(|c| *c.borrow_mut() = Some(vb.clone()));
+            set_palette_pred(vb.clone());
         }
         v.reconstruct_rect(
             cpx,
@@ -5871,7 +5915,7 @@ impl PlaneBuf {
         // As [`Self::reconstruct`]'s own [`PALETTE_PRED`] override
         // (lane-palette2 r4): a palette block's prediction is the
         // reconstructed colour-index map, needing no edge pixels at all.
-        let prediction = if let Some(buf) = PALETTE_PRED.with(|c| c.borrow_mut().take()) {
+        let prediction = if let Some(buf) = take_palette_pred() {
             buf
         } else {
             let (above, left, corner) = self.edges_rect(x, y, bw, bh, reach);
@@ -5955,7 +5999,7 @@ impl PlaneBuf {
         // A palette block's own [`PALETTE_PRED`] override (lane-palette r2)
         // takes priority over `predict()`/`predict_filter_intra` entirely --
         // palette prediction needs no edge pixels at all.
-        let prediction = if let Some(buf) = PALETTE_PRED.with(|c| c.borrow_mut().take()) {
+        let prediction = if let Some(buf) = take_palette_pred() {
             buf
         } else {
             let (above, left, corner) = self.edges(x, y, side, reach);
@@ -6278,7 +6322,7 @@ fn decode_block(
         (yb, ub, vb)
     });
     if let Some((yb, _, _)) = &intrabc_bufs {
-        PALETTE_PRED.with(|c| *c.borrow_mut() = Some(yb.clone()));
+        set_palette_pred(yb.clone());
     }
     // A palette-Y block's own prediction is the reconstructed colour-index
     // map, not `predict()`'s edge-based one -- [`PALETTE_PRED`] carries it
@@ -6302,7 +6346,7 @@ fn decode_block(
     if let Some(buf) = &palette_y_buf
         && logical_tx == side
     {
-        PALETTE_PRED.with(|c| *c.borrow_mut() = Some(buf.clone()));
+        set_palette_pred(buf.clone());
     }
     // A UV-palette block's own chroma prediction override (lane-palette2 r1),
     // same [`PALETTE_PRED`] slot as Y above -- set fresh right before each
@@ -6339,7 +6383,7 @@ fn decode_block(
         );
         let ac = alpha.map(|_| cfl_ac_q3(y, px, py, side));
         if let Some((ub, _)) = &palette_uv_bufs {
-            PALETTE_PRED.with(|c| *c.borrow_mut() = Some(ub.clone()));
+            set_palette_pred(ub.clone());
         }
         u.reconstruct(
             cpx,
@@ -6354,7 +6398,7 @@ fn decode_block(
             smooth_neighbor_uv,
         );
         if let Some((_, vb)) = &palette_uv_bufs {
-            PALETTE_PRED.with(|c| *c.borrow_mut() = Some(vb.clone()));
+            set_palette_pred(vb.clone());
         }
         v.reconstruct(
             cpx,
@@ -6401,7 +6445,7 @@ fn decode_block(
         )?;
         let ac = alpha.map(|_| cfl_ac_q3(y, px, py, side));
         if let Some((ub, _)) = &palette_uv_bufs {
-            PALETTE_PRED.with(|c| *c.borrow_mut() = Some(ub.clone()));
+            set_palette_pred(ub.clone());
         }
         let u_grid = read_plane(
             dec,
@@ -6432,7 +6476,7 @@ fn decode_block(
             );
         }
         if let Some((_, vb)) = &palette_uv_bufs {
-            PALETTE_PRED.with(|c| *c.borrow_mut() = Some(vb.clone()));
+            set_palette_pred(vb.clone());
         }
         let v_grid = read_plane(
             dec,
@@ -6488,7 +6532,7 @@ fn decode_block(
                         window[row * logical_tx..][..logical_tx]
                             .copy_from_slice(&buf[src..][..logical_tx]);
                     }
-                    PALETTE_PRED.with(|c| *c.borrow_mut() = Some(window));
+                    set_palette_pred(window);
                 }
                 let tu_grid = read_plane(
                     dec,
@@ -6526,7 +6570,7 @@ fn decode_block(
         let ac = alpha.map(|_| cfl_ac_q3(y, px, py, side));
         let chroma_around = neighbours.around(at, side);
         if let Some((ub, _)) = &palette_uv_bufs {
-            PALETTE_PRED.with(|c| *c.borrow_mut() = Some(ub.clone()));
+            set_palette_pred(ub.clone());
         }
         let u_grid = read_plane(
             dec,
@@ -6551,7 +6595,7 @@ fn decode_block(
             smooth_neighbor_uv,
         )?;
         if let Some((_, vb)) = &palette_uv_bufs {
-            PALETTE_PRED.with(|c| *c.borrow_mut() = Some(vb.clone()));
+            set_palette_pred(vb.clone());
         }
         let v_grid = read_plane(
             dec,
