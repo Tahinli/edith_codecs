@@ -758,6 +758,21 @@ pub(crate) fn sb_rect_hits() -> usize {
     SB_RECT_HITS.with(|c| c.get())
 }
 
+// lane-part32 r4: how many superblock-level AB blocks (`PARTITION_HORZ_A`/
+// `_B`/`VERT_A`/`_B` at 64x64 -- two 32x32 squares plus one 64x32/32x64
+// strip) fired. Real aomenc picks these at 64 even with
+// `--enable-ab-partitions=0` (lane-sbpart r2's own measurement), so this is
+// the counter the gate hard-asserts.
+thread_local! {
+    static SB_AB_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`SB_AB_HITS`].
+pub(crate) fn sb_ab_hits() -> usize {
+    SB_AB_HITS.with(|c| c.get())
+}
+
 // lane-rect64q r1: how many of [`decode_block_rect64`]'s three per-plane
 // dequant calls actually observed `CURRENT_Q_IDX != base_q_idx` -- proof the
 // running-vs-stale-snapshot bug this round fixed is exercised by a gate, not
@@ -1370,7 +1385,7 @@ fn read_eob(dec: &mut SymbolDecoder, coding: &mut TxbTables, class: TxClass) -> 
         (TxClass::TwoD, _) | (_, None) => coding.eob_pt,
         (_, Some(class1)) => class1,
     };
-    if std::env::var_os("EC_AV1_EOBPT_CDF").is_some() && eob_pt.len() == 12 {
+    if std::env::var_os("EC_AV1_EOBPT_CDF").is_some() {
         let (range, value) = dec.debug_state();
         eprintln!("EC_AV1_EOBPT_CDF {eob_pt:?} range={range} value={value}");
     }
@@ -1647,8 +1662,16 @@ fn read_coeffs_rect(
     sign_ctx: usize,
     default_tx_type: TxType,
 ) -> Result<(Vec<i32>, TxType)> {
+    let ec_trace_coeff = std::env::var_os("EC_TRACE_COEFF").is_some();
     let mut grid = vec![0i32; w * h];
     let all_zero = dec.symbol(&mut coding.txb_skip[skip_ctx]) == 1;
+    if ec_trace_coeff {
+        let (rng, _) = dec.debug_state();
+        eprintln!(
+            "EC_COEFF_STEP tag=all_zero ctx={skip_ctx} all_zero={} rng={rng}",
+            all_zero as i32
+        );
+    }
     if all_zero {
         return Ok((grid, TxType::DctDct));
     }
@@ -1664,16 +1687,35 @@ fn read_coeffs_rect(
         ));
     }
     let eob = read_eob(dec, coding, TxClass::TwoD);
+    if ec_trace_coeff {
+        let (rng, _) = dec.debug_state();
+        eprintln!("EC_COEFF_STEP tag=eob eob={eob} rng={rng}");
+    }
     let mut levels = vec![0i32; w * h];
     for scan_idx in (0..eob).rev() {
         let pos = scan[scan_idx] as usize;
         let (row, col) = (pos / w, pos % w);
         let level = if scan_idx == eob - 1 {
             let ctx = eob_coeff_ctx(scan_idx, w * h);
-            dec.symbol(&mut coding.base_eob[ctx]) as i32 + 1
+            let l = dec.symbol(&mut coding.base_eob[ctx]) as i32 + 1;
+            if ec_trace_coeff {
+                let (rng, _) = dec.debug_state();
+                eprintln!(
+                    "EC_COEFF_STEP tag=base_eob c={scan_idx} pos={pos} ctx={ctx} level={} rng={rng}",
+                    l - 1
+                );
+            }
+            l
         } else {
             let ctx = base_ctx_rect(&levels, w, h, row, col);
-            dec.symbol(&mut coding.base[ctx]) as i32
+            let l = dec.symbol(&mut coding.base[ctx]) as i32;
+            if ec_trace_coeff {
+                let (rng, _) = dec.debug_state();
+                eprintln!(
+                    "EC_COEFF_STEP tag=base c={scan_idx} pos={pos} ctx={ctx} level={l} rng={rng}"
+                );
+            }
+            l
         };
         let level = if level > NUM_BASE_LEVELS {
             let ctx = br_ctx_rect(&levels, w, h, row, col);
@@ -1681,6 +1723,12 @@ fn read_coeffs_rect(
             let mut sent = 0;
             loop {
                 let k = dec.symbol(&mut coding.br[ctx]) as i32;
+                if ec_trace_coeff {
+                    let (rng, _) = dec.debug_state();
+                    eprintln!(
+                        "EC_COEFF_STEP tag=br c={scan_idx} pos={pos} ctx={ctx} k={k} rng={rng}"
+                    );
+                }
                 level += k;
                 sent += BR_STEP;
                 if k < BR_STEP || sent >= COEFF_BASE_RANGE {
@@ -1692,6 +1740,10 @@ fn read_coeffs_rect(
             level
         };
         levels[pos] = level;
+    }
+    if ec_trace_coeff {
+        let (rng, _) = dec.debug_state();
+        eprintln!("EC_COEFF_STEP tag=after_bases rng={rng}");
     }
     for &pos in &scan[..eob] {
         let level = levels[pos as usize];
@@ -4499,6 +4551,15 @@ impl PlaneBuf {
         smooth_neighbor: bool,
     ) {
         let (above, left, corner) = self.edges_rect(x, y, bw, bh, reach);
+        if std::env::var_os("EC_DEBUG_EDGES").is_some() {
+            eprintln!(
+                "EDGES x={x} y={y} bw={bw} bh={bh} mode={mode} above={:?} left_len={:?} left0={:?} corner={corner:?} tx0={} ty0={} truew={} trueh={}",
+                above.as_ref().map(|a| (a.len(), a[0])),
+                left.as_ref().map(|l| l.len()),
+                left.as_ref().map(|l| l[0]),
+                self.tile_x0, self.tile_y0, self.true_width, self.true_height
+            );
+        }
         let mut prediction = vec![0u16; bw * bh];
         if let Some(fi_mode) = filter_intra {
             crate::intra::predict_filter_intra(
@@ -7688,10 +7749,93 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                         tx_select,
                     )?;
                 }
+                PARTITION_HORZ_A | PARTITION_HORZ_B | PARTITION_VERT_A | PARTITION_VERT_B => {
+                    // lane-part32 r4: the four superblock-level AB arms, each
+                    // two 32x32 squares plus one 64x32/32x64 strip, in
+                    // libaom's own `decode_partition` order (decodeframe.c:
+                    // HORZ_A = TL, TR, bottom strip; HORZ_B = top strip, BL,
+                    // BR; VERT_A = TL, BL, right strip; VERT_B = left strip,
+                    // TR, BR). The pieces are exactly the ones already proven
+                    // by the `PARTITION_NONE`-under-SPLIT (32x32 square) and
+                    // `PARTITION_HORZ`/`VERT` (rect64 strip) arms above.
+                    SB_AB_HITS.with(|c| c.set(c.get() + 1));
+                    macro_rules! square32 {
+                        ($at:expr) => {
+                            decode_block(
+                                &mut dec,
+                                &mut cdfs,
+                                &mut neighbours,
+                                $at,
+                                BLOCK,
+                                TxbSet::Luma32,
+                                TxbSet::Chroma16,
+                                TX32,
+                                TX16,
+                                (&scan32, &scan16),
+                                true,
+                                &mut y,
+                                &mut u,
+                                &mut v,
+                                base_q_idx,
+                                enable_filter_intra,
+                                allow_screen_content_tools,
+                                allow_intrabc,
+                                &scan32,
+                                &scan16,
+                                &scan8,
+                                &scan4,
+                                tx_select,
+                                reduced_tx_set,
+                            )?
+                        };
+                    }
+                    macro_rules! strip64 {
+                        ($at:expr, $bw:expr, $bh:expr) => {
+                            decode_block_rect64(
+                                &mut dec,
+                                &mut cdfs,
+                                &mut neighbours,
+                                $at,
+                                $bw,
+                                $bh,
+                                &mut y,
+                                &mut u,
+                                &mut v,
+                                enable_filter_intra,
+                                allow_screen_content_tools,
+                                base_q_idx,
+                                tx_select,
+                            )?
+                        };
+                    }
+                    let (br, bc) = (at.0 + 2, at.1 + 2);
+                    match part {
+                        PARTITION_HORZ_A => {
+                            square32!(at);
+                            square32!((at.0, bc));
+                            strip64!((br, at.1), 64, 32);
+                        }
+                        PARTITION_HORZ_B => {
+                            strip64!(at, 64, 32);
+                            square32!((br, at.1));
+                            square32!((br, bc));
+                        }
+                        PARTITION_VERT_A => {
+                            square32!(at);
+                            square32!((br, at.1));
+                            strip64!((at.0, bc), 32, 64);
+                        }
+                        _ => {
+                            strip64!(at, 32, 64);
+                            square32!((at.0, bc));
+                            square32!((br, bc));
+                        }
+                    }
+                }
                 _ => {
                     return Err(unsupported(
-                        "a superblock-level partition type other than NONE or SPLIT (this \
-                         decoder's intra tile path codes only those two at 64x64)",
+                        "a superblock-level 1:4 partition (PARTITION_HORZ_4/VERT_4 at 64x64, \
+                         four 64x16/16x64 strips)",
                     ));
                 }
             }
