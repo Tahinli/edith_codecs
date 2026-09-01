@@ -2778,6 +2778,11 @@ mod tests {
         max_part: &str,
         hits: fn() -> usize,
         what: &str,
+        // lane-inter8 r3: extra aomenc flags + the frame width they need.
+        // `--tile-columns=1` needs a frame at least two superblocks wide or
+        // aomenc silently codes one tile column and the arm is vacuous.
+        extra: &[&str],
+        width: usize,
     ) {
         if !have_ffmpeg() {
             eprintln!("SKIP {name}: no ffmpeg");
@@ -2787,7 +2792,7 @@ mod tests {
             eprintln!("SKIP {name}: no aomenc at {}", aomenc_path().display());
             return;
         }
-        let (width, height, frame_count) = (64usize, 64usize, 4usize);
+        let (height, frame_count) = (64usize, 4usize);
         // A deterministic synthetic source with real motion (a static source
         // codes every inter frame as skip and never exercises the residual
         // path); bounded with `-t` (class gate-loader-slurps-whole-file).
@@ -2798,7 +2803,7 @@ mod tests {
                 "-f",
                 "lavfi",
                 "-i",
-                "mandelbrot=size=64x64:rate=25",
+                &format!("mandelbrot=size={width}x{height}:rate=25"),
                 "-t",
                 "0.16",
                 "-pix_fmt",
@@ -2859,6 +2864,9 @@ mod tests {
         .iter()
         .map(|s| (*s).to_string())
         .collect();
+        for e in extra {
+            args.insert(1, (*e).to_string());
+        }
         args.insert(1, format!("--min-partition-size={min_part}"));
         args.insert(1, format!("--max-partition-size={max_part}"));
         if ten_bit {
@@ -2922,6 +2930,8 @@ mod tests {
             "64",
             decode::inter_sb_none_hits,
             "whole-superblock inter PARTITION_NONE",
+            &[],
+            64,
         );
     }
 
@@ -2934,6 +2944,8 @@ mod tests {
             "64",
             decode::inter_sb_none_hits,
             "whole-superblock inter PARTITION_NONE",
+            &[],
+            64,
         );
     }
 
@@ -2947,6 +2959,38 @@ mod tests {
     // leaf stamps its own 2x2-mi span (including the compound-return path
     // that used to skip `record_mi` entirely) and the compound
     // group/index contexts read the LEAF's mi cell, not its 16x16's corner.
+    /// lane-inter8 r3, from lane-sub8's verifier finding: the mi-granular
+    /// inter neighbour bands added in r2 must reset per TILE (above) and per
+    /// SB row (left) and guard availability tile-relative, so the same recipe
+    /// runs again at 128x64 with two tile columns -- a leaf on the second
+    /// tile's first column has no left neighbour and must not read the first
+    /// tile's band.
+    // lane-inter8 r3: RED for a reason OUTSIDE this lane -- at 128x64 (the
+    // narrowest frame two tile columns can exist in) aomenc codes an
+    // SB-level rect partition on the KEY frame despite
+    // --enable-rect-partitions=0, so the stream stops at "a superblock-level
+    // partition type other than NONE or SPLIT" (lane-sbpart's arm) before a
+    // single 8x8 leaf is reached. The tile-relative audit it was written for
+    // was done by inspection instead: every reader of the mi bands guards on
+    // `tile_row0_mi`/`tile_col0_mi` (no `> 0` guard exists in decode.rs),
+    // `start_tile` resets the above mi bands over the tile's own mi column
+    // span and `start_row` resets every left mi band.
+    #[ignore = "lane-inter8 r3: blocked by the SB-level rect-partition refusal at 128x64 (lane-sbpart's arm), not by tile context"]
+    #[test]
+    fn a_real_aomenc_inter_sequence_with_an_8x8_leaf_split_across_tile_columns_decodes_pixel_exact()
+    {
+        inter_sb_none_gate(
+            "a_real_aomenc_inter_sequence_with_an_8x8_leaf_split_across_tile_columns_decodes_pixel_exact",
+            false,
+            "8",
+            "16",
+            decode::inter_sub16_split_hits,
+            "interior 16x16 inter PARTITION_SPLIT into 8x8 leaves",
+            &["--tile-columns=1"],
+            128,
+        );
+    }
+
     #[test]
     fn a_real_aomenc_inter_sequence_with_an_8x8_leaf_split_decodes_pixel_exact() {
         inter_sb_none_gate(
@@ -2956,6 +3000,8 @@ mod tests {
             "16",
             decode::inter_sub16_split_hits,
             "interior 16x16 inter PARTITION_SPLIT into 8x8 leaves",
+            &[],
+            64,
         );
     }
 
@@ -2977,6 +3023,8 @@ mod tests {
             "16",
             decode::inter_sub16_split_hits,
             "interior 16x16 inter PARTITION_SPLIT into 8x8 leaves",
+            &[],
+            64,
         );
     }
 
