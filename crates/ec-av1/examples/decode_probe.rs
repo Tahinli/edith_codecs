@@ -32,7 +32,21 @@ fn main() {
         Ok(frames) if frames.is_empty() => {
             println!("OK but EMPTY: no frames -- is {path} an IVF rather than a raw OBU stream?");
         }
-        Ok(frames) => println!("OK: {} frames decoded", frames.len()),
+        Ok(frames) => {
+            // lane-gmaffine r4: `EC_PROBE_DUMP=<path>` writes the decoded
+            // planes as raw 8-bit I420 so a pixel diff against ffmpeg can
+            // name the mismatching block without a test harness.
+            if let Ok(dump) = std::env::var("EC_PROBE_DUMP") {
+                let mut out = Vec::new();
+                for f in &frames {
+                    for p in [&f.y, &f.u, &f.v] {
+                        out.extend(p.iter().map(|&v| v as u8));
+                    }
+                }
+                std::fs::write(&dump, out).expect("writing EC_PROBE_DUMP");
+            }
+            println!("OK: {} frames decoded", frames.len())
+        }
         Err(e) => println!("REFUSED: {e}"),
     }
 }
