@@ -121,19 +121,30 @@ pub(crate) enum TxbSet {
     /// below 16x16 (lane-rectx, `decode_leaf_rect`'s own leaf, one level
     /// under [`LumaRect32x16`](TxbSet::LumaRect32x16)): `get_txsize_entropy_ctx`
     /// reduces this 2:1 rect size to `TX_16X16` too, so this shares every
-    /// table [`Luma16`](TxbSet::Luma16) does -- INCLUDING its mode-indexed
-    /// `tx_type` CDF, the same adapted table object -- except `eob_pt`, which
+    /// table [`Luma16`](TxbSet::Luma16) does except two: its mode-indexed
+    /// `tx_type` CDF, which is the *8x8* row's (see
+    /// [`LumaRect16x8Set1`](TxbSet::LumaRect16x8Set1)), and `eob_pt`, which
     /// reads the true 128-position [`crate::cdf::EOB_PT_128_LUMA`] rather
     /// than `Luma16`'s 256-position one. Unlike
     /// [`LumaRect32x16`](TxbSet::LumaRect32x16), this size DOES carry a
-    /// `tx_type` symbol: `av1_get_ext_tx_set_type`'s `use_reduced_set` branch
-    /// returns `EXT_TX_SET_DTT4_IDTX` for every `tx_size_sqr_up == TX_16X16`
-    /// regardless of the real (non-square) `tx_size`, the same set
-    /// `Luma16`'s own read already uses -- confirmed against
-    /// `av1/common/blockd.h`'s `av1_get_ext_tx_set_type` before landing,
-    /// see `decode_block_rect`'s own doc comment for the desync this gap
-    /// left when it was still unhandled.
+    /// `tx_type` symbol: `av1_get_ext_tx_set_type` (`av1/common/blockd.h`)
+    /// sees `tx_size_sqr_up == TX_16X16`, so intra reads
+    /// `EXT_TX_SET_DTT4_IDTX` under `reduced_tx_set` and
+    /// `EXT_TX_SET_DTT4_IDTX_1DDCT` without it (`tx_size_sqr` is `TX_8X8`
+    /// here, not `TX_16X16`) -- this variant is the reduced arm, its
+    /// `Set1` sibling the other.
     LumaRect16x8,
+    /// [`LumaRect16x8`](TxbSet::LumaRect16x8)'s `reduced_tx_set: false`
+    /// counterpart (lane-rectx r3), the same split
+    /// [`Luma8Set1`](TxbSet::Luma8Set1) has to [`Luma8`](TxbSet::Luma8) --
+    /// and it is deliberately those two tables, not the 16x16 row: libaom's
+    /// `read_tx_type` indexes `intra_ext_tx_cdf[eset][square_tx_size]` with
+    /// `square_tx_size = txsize_sqr_map[tx_size]`, which for `TX_16X8`/
+    /// `TX_8X16` is `TX_8X8`, NOT the `txsize_sqr_up_map` `TX_16X16` the
+    /// txb-skip/base/br tables use (`get_txsize_entropy_ctx`). r2 read the
+    /// 16x16 row's five-symbol reduced CDF here and desynced on the very
+    /// first coded rect leaf.
+    LumaRect16x8Set1,
     /// The chroma 8x4/4x8 transform under the same leaf (lane-rectx):
     /// [`Chroma8`](TxbSet::Chroma8)'s tables except `eob_pt`, which reads the
     /// true 32-position [`crate::cdf::EOB_PT_32_CHROMA`] instead of
@@ -1476,7 +1487,19 @@ impl Cdfs {
                 base_eob: &mut self.base_eob_luma_16,
                 br: &mut self.br_luma_16,
                 dc_sign: &mut self.dc_sign_luma,
-                tx_type: Some(self.intra_tx_type_16[mode].as_mut_slice()),
+                tx_type: Some(self.intra_tx_type_8[mode].as_mut_slice()),
+                eob_pt_class1: None,
+            },
+            TxbSet::LumaRect16x8Set1 => TxbTables {
+                side: 16,
+                txb_skip: &mut self.txb_skip_luma_16,
+                eob_pt: &mut self.eob_pt_128_luma,
+                eob_extra: &mut self.eob_extra_luma_16,
+                base: &mut self.base_luma_16,
+                base_eob: &mut self.base_eob_luma_16,
+                br: &mut self.br_luma_16,
+                dc_sign: &mut self.dc_sign_luma,
+                tx_type: Some(self.intra_tx_type_8_set1[mode].as_mut_slice()),
                 eob_pt_class1: None,
             },
             TxbSet::ChromaRect8x4 => TxbTables {

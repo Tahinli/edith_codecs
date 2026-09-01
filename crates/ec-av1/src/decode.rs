@@ -1655,6 +1655,11 @@ fn read_coeffs_rect(
     if all_zero {
         return Ok((grid, TxType::DctDct));
     }
+    let trace = std::env::var_os("EC_TRACE_COEFF").is_some();
+    if trace {
+        let (rng, _) = dec.debug_state();
+        eprintln!("EC_COEFF_STEP tag=all_zero ctx={skip_ctx} all_zero=0 rng={rng}");
+    }
     let mut tx_type = default_tx_type;
     if let Some(tx_type_cdf) = coding.tx_type.as_deref_mut() {
         // Mirrors [`read_coeffs`]'s own `tx_type` read: the CDF row's width
@@ -1675,7 +1680,15 @@ fn read_coeffs_rect(
             "a non-2D tx class on a rectangular transform (never expected at this size)",
         ));
     }
+    if trace {
+        let (rng, _) = dec.debug_state();
+        eprintln!("EC_COEFF_STEP tag=tx_type rng={rng}");
+    }
     let eob = read_eob(dec, coding, TxClass::TwoD);
+    if trace {
+        let (rng, _) = dec.debug_state();
+        eprintln!("EC_COEFF_STEP tag=eob eob={eob} rng={rng}");
+    }
     let mut levels = vec![0i32; w * h];
     for scan_idx in (0..eob).rev() {
         let pos = scan[scan_idx] as usize;
@@ -1704,6 +1717,10 @@ fn read_coeffs_rect(
             level
         };
         levels[pos] = level;
+        if trace {
+            let (rng, _) = dec.debug_state();
+            eprintln!("EC_COEFF_STEP tag=base c={scan_idx} pos={pos} level={level} rng={rng}");
+        }
     }
     for &pos in &scan[..eob] {
         let level = levels[pos as usize];
@@ -3534,6 +3551,7 @@ fn decode_leaf_rect(
     allow_screen_content_tools: bool,
     base_q_idx: u8,
     tx_select: bool,
+    reduced_tx_set: bool,
 ) -> Result<usize> {
     let _ = base_q_idx;
     if std::env::var_os("EC_AV1_RECTX_TRACE").is_some() {
@@ -3626,7 +3644,12 @@ fn decode_leaf_rect(
             (&SCAN_8X16, &SCAN_4X8)
         };
         let around = neighbours.around_mi_rect(leaf_mi, bw, bh);
-        let mut luma_coding = cdfs.txb(TxbSet::LumaRect16x8, mode);
+        let luma_set = if reduced_tx_set {
+            TxbSet::LumaRect16x8
+        } else {
+            TxbSet::LumaRect16x8Set1
+        };
+        let mut luma_coding = cdfs.txb(luma_set, mode);
         let (l_levels, luma_tx_type) = read_coeffs_rect(
             dec, &mut luma_coding, luma_scan, bw, bh, 0, dc_sign_ctx(around[0].2), TxType::DctDct,
         )?;
@@ -5200,6 +5223,31 @@ fn decode_block(
 /// at. Returns the mode this leaf decoded, for the caller's own
 /// `prev_leaf`/final mode-writeback bookkeeping.
 #[allow(clippy::too_many_arguments)]
+/// The coarse 16x16 `above_mode`/`left_mode` cells a four-way SPLIT of one
+/// 16x16 parent leaves behind (lane-rectx r3). The next block DOWN reads
+/// `above_mode[col]`, and its true above neighbour is the mi directly above
+/// its own top-left corner -- the parent's BOTTOM-LEFT leaf, not the last one
+/// decoded; the next block RIGHT reads `left_mode[row]`, whose true left
+/// neighbour is the parent's TOP-RIGHT leaf. Writing the z-order last leaf
+/// (bottom-right) into both, as this path did, is right only when all four
+/// leaves happen to share a mode. `done` may be short at the true frame edge
+/// (the straddle caller filters positions off the frame), so each side falls
+/// back to the last leaf actually decoded.
+fn write_back_split_modes(
+    neighbours: &mut Neighbours,
+    done: &[((usize, usize), usize)],
+    parent_mi: (usize, usize),
+    slot: (usize, usize),
+) {
+    let (sr, sc) = slot;
+    let Some(&(_, last)) = done.last() else {
+        return;
+    };
+    let find = |mi: (usize, usize)| done.iter().find(|&&(at, _)| at == mi).map(|&(_, m)| m);
+    neighbours.above_mode[sc] = find((parent_mi.0 + 2, parent_mi.1)).unwrap_or(last);
+    neighbours.left_mode[sr] = find((parent_mi.0, parent_mi.1 + 2)).unwrap_or(last);
+}
+
 fn decode_leaf8(
     dec: &mut SymbolDecoder,
     cdfs: &mut Cdfs,
@@ -5207,7 +5255,7 @@ fn decode_leaf8(
     outer_at: (usize, usize),
     leaf_mi: (usize, usize),
     scans: (&[u16], &[u16]),
-    prev_leaf: Option<((usize, usize), usize)>,
+    prev_leaves: &[((usize, usize), usize)],
     y: &mut PlaneBuf,
     u: &mut PlaneBuf,
     v: &mut PlaneBuf,
@@ -5221,7 +5269,18 @@ fn decode_leaf8(
     let (r, c) = outer_at;
     let mut above_mode = neighbours.above_mode[c];
     let mut left_mode = neighbours.left_mode[r];
-    if let Some(((pr, pc), pmode)) = prev_leaf {
+    // lane-rectx r3: EVERY sibling leaf already decoded inside this 16x16
+    // parent, not just the previous one in z-order. A four-way SPLIT's
+    // bottom-left leaf has the TOP-LEFT leaf directly above it (the previous
+    // leaf is the top-right one, which is neither above nor left of it), and
+    // the bottom-right leaf has two live siblings at once -- top-right above,
+    // bottom-left to the left. Passing only the z-order predecessor left both
+    // reading the coarse 16x16 `above_mode`/`left_mode` cell, i.e. a mode
+    // from the block ABOVE THE PARENT, and the `kf_y_mode` CDF row that
+    // indexes desynced the tile at the third leaf of every real SPLIT
+    // (measured against the instrumented aomdec: same decoded value, wrong
+    // range -- `EC_ISTEP mi_row=6 mi_col=0 name=mode` rng 46476 vs 37546).
+    for &((pr, pc), pmode) in prev_leaves {
         if pc == leaf_mi.1 && leaf_mi.0 == pr + 2 {
             above_mode = pmode;
         } else if pr == leaf_mi.0 && leaf_mi.1 == pc + 2 {
@@ -7023,7 +7082,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                                 at16,
                                                 top_right,
                                                 (&scan8, &scan4),
-                                                None,
+                                                &[],
                                                 &mut y,
                                                 &mut u,
                                                 &mut v,
@@ -7041,7 +7100,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                                 at16,
                                                 bot_right,
                                                 (&scan8, &scan4),
-                                                Some((top_right, mode_tr)),
+                                                &[(top_right, mode_tr)],
                                                 &mut y,
                                                 &mut u,
                                                 &mut v,
@@ -7086,6 +7145,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                                 allow_screen_content_tools,
                                                 base_q_idx,
                                                 tx_select,
+                                                reduced_tx_set,
                                             )?;
                                             let mode_bot = decode_leaf_rect(
                                                 &mut dec,
@@ -7103,6 +7163,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                                 allow_screen_content_tools,
                                                 base_q_idx,
                                                 tx_select,
+                                                reduced_tx_set,
                                             )?;
                                             neighbours.above_mode[sc] = mode_bot;
                                             neighbours.left_mode[sr] = mode_bot;
@@ -7132,6 +7193,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                                 allow_screen_content_tools,
                                                 base_q_idx,
                                                 tx_select,
+                                                reduced_tx_set,
                                             )?;
                                             let mode_right = decode_leaf_rect(
                                                 &mut dec,
@@ -7149,6 +7211,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                                 allow_screen_content_tools,
                                                 base_q_idx,
                                                 tx_select,
+                                                reduced_tx_set,
                                             )?;
                                             neighbours.above_mode[sc] = mode_right;
                                             neighbours.left_mode[sr] = mode_right;
@@ -7168,7 +7231,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                         // the one or two the edge leaves.
                                         let (mi_row0, mi_col0) =
                                             (sr as u32 * SUB_MI, sc as u32 * SUB_MI);
-                                        let mut prev_leaf: Option<((usize, usize), usize)> = None;
+                                        let mut done: Vec<((usize, usize), usize)> = Vec::new();
                                         for i in 0..4 {
                                             let (mr, mc) =
                                                 (mi_row0 + (i / 2) * 2, mi_col0 + (i % 2) * 2);
@@ -7193,7 +7256,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                                 at16,
                                                 leaf_mi,
                                                 (&scan8, &scan4),
-                                                prev_leaf,
+                                                &done,
                                                 &mut y,
                                                 &mut u,
                                                 &mut v,
@@ -7204,12 +7267,14 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                                 tx_select,
                                                 reduced_tx_set,
                                             )?;
-                                            prev_leaf = Some((leaf_mi, leaf_mode));
+                                            done.push((leaf_mi, leaf_mode));
                                         }
-                                        if let Some((_, mode)) = prev_leaf {
-                                            neighbours.above_mode[sc] = mode;
-                                            neighbours.left_mode[sr] = mode;
-                                        }
+                                        write_back_split_modes(
+                                            &mut neighbours,
+                                            &done,
+                                            (mi_row0 as usize, mi_col0 as usize),
+                                            (sr, sc),
+                                        );
                                         continue;
                                     }
                                     // The true edge falls inside this 16x16
@@ -7242,7 +7307,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                         .map(|i| (mi_row0 + (i / 2) * 2, mi_col0 + (i % 2) * 2))
                                         .filter(|&(mr, mc)| mr < mi_rows && mc < mi_cols)
                                         .collect();
-                                    let mut prev_leaf: Option<((usize, usize), usize)> = None;
+                                    let mut done: Vec<((usize, usize), usize)> = Vec::new();
                                     for (mr, mc) in leaf_positions {
                                         let leaf_mi = (mr as usize, mc as usize);
                                         let leaf_ctx = neighbours.partition_ctx_mi(leaf_mi, 8);
@@ -7264,7 +7329,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                             at16,
                                             leaf_mi,
                                             (&scan8, &scan4),
-                                            prev_leaf,
+                                            &done,
                                             &mut y,
                                             &mut u,
                                             &mut v,
@@ -7275,7 +7340,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                             tx_select,
                                             reduced_tx_set,
                                         )?;
-                                        prev_leaf = Some((leaf_mi, leaf_mode));
+                                        done.push((leaf_mi, leaf_mode));
                                     }
                                     // `record()`'s `above_mode`/`left_mode`
                                     // write is a no-op at an 8x8 leaf's own
@@ -7283,10 +7348,12 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                     // 16x16 slot's leaves are done, from the
                                     // last leaf (mirrors the writer's r15
                                     // fix).
-                                    if let Some((_, mode)) = prev_leaf {
-                                        neighbours.above_mode[sc] = mode;
-                                        neighbours.left_mode[sr] = mode;
-                                    }
+                                    write_back_split_modes(
+                                        &mut neighbours,
+                                        &done,
+                                        (mi_row0 as usize, mi_col0 as usize),
+                                        (sr, sc),
+                                    );
                                 }
                             }
                             PARTITION_HORZ => {
