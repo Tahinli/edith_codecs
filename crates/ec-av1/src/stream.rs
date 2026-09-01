@@ -5480,7 +5480,7 @@ mod tests {
             assert!(y4m.status.success());
             let (width, height) = if start_x.contains("128x128") { (128usize, 128usize) } else { (64usize, 64usize) };
             for cq in [16u32, 20, 24, 28, 32, 40, 50] {
-                for rtx in ["0"] {
+                for rtx in ["0", "1"] {
                     let mut child = Command::new(aomenc_path())
                         .args([
                             "--codec=av1", "--passes=1", "--end-usage=q",
@@ -5509,6 +5509,7 @@ mod tests {
                             let bad = frames.iter().zip(&want)
                                 .filter(|(g, w)| g.y != w.y || g.u != w.u || g.v != w.v).count();
                             eprintln!("x={start_x} cq={cq} rtx={rtx} fired={fired} frames={} mismatched={bad}", frames.len());
+                            if bad == 0 { continue; }
                             let (g, w) = (&frames[0], &want[0]);
                             for br in 0..height / 8 {
                                 let mut line = String::new();
