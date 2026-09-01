@@ -2366,6 +2366,19 @@ mod tests {
     /// FAILURE, not a SKIP -- an unfired gate is a vacuous gate.
     #[test]
     fn a_real_aomenc_inter_sequence_with_tx_select_decodes_pixel_exact() {
+        tx_select_inter_gate(8);
+    }
+
+    /// The 10-bit arm of the gate above (lane-txselect r2): both of the
+    /// user's films are `yuv420p10le` and var-tx is exactly the tool they
+    /// use, so an 8-bit-only proof would not reach them. Same recipe plus
+    /// `-b 10 --input-bit-depth=10`.
+    #[test]
+    fn a_real_aomenc_inter_sequence_with_tx_select_decodes_pixel_exact_10bit() {
+        tx_select_inter_gate(10);
+    }
+
+    fn tx_select_inter_gate(bit_depth: u32) {
         if !have_ffmpeg() {
             eprintln!(
                 "SKIP a_real_aomenc_inter_sequence_with_tx_select_decodes_pixel_exact: no ffmpeg"
@@ -2405,11 +2418,17 @@ mod tests {
                     "-vf",
                     "hue=s=0",
                     "-pix_fmt",
-                    "yuv420p",
+                    if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" },
+                    // y4m carries no official 10-bit tag; ffmpeg writes one
+                    // only under `-strict -1` (a no-op at 8 bit).
+                    "-strict",
+                    "-1",
                     "-t",
                     "0.16",
                     "-f",
                     "yuv4mpegpipe",
+                    "-strict",
+                    "-1",
                     "-",
                 ])
                 .stdin(Stdio::null())
@@ -2422,7 +2441,13 @@ mod tests {
                 "ffmpeg fixture: {}",
                 String::from_utf8_lossy(&y4m.stderr)
             );
+            let depth_args: &[&str] = if bit_depth == 10 {
+                &["-b", "10", "--input-bit-depth=10"]
+            } else {
+                &[]
+            };
             let mut child = Command::new(aomenc_path())
+                .args(depth_args)
                 .args([
                     "--codec=av1",
                     "--passes=1",
@@ -2512,9 +2537,15 @@ mod tests {
                 ));
                 continue;
             }
-            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
+            let ffmpeg_frames = if bit_depth == 10 {
+                ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count)
+            } else {
+                ffmpeg_decode_sequence(&stream, width, height, frame_count)
+            };
             assert_eq!(frames.len(), frame_count);
-            eprintln!("txselect gate seed={seed}: txfm_split reads={reads} splits taken={hits}");
+            eprintln!(
+                "txselect gate {bit_depth}-bit seed={seed}: txfm_split reads={reads} splits taken={hits}"
+            );
             // Name the first differing sample before the assert fires: a
             // 64x64 plane's `assert_eq!` output is 4096 numbers, useless for
             // locating a desync.
@@ -2555,8 +2586,7 @@ mod tests {
             return;
         }
         panic!(
-            "a_real_aomenc_inter_sequence_with_tx_select_decodes_pixel_exact never observed a \
-             taken txfm_split:\n{}",
+            "tx_select_inter_gate({bit_depth}) never observed a taken txfm_split:\n{}",
             refusals.join("\n")
         );
     }
