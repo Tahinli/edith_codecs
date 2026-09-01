@@ -4931,7 +4931,7 @@ fn decode_block(
     // 5.11.40); `coeff_tx_side` is the actual coded coefficient grid's side,
     // which only differs from it at that one corner case.
     let (logical_tx, coeff_tx_side) = if tx_select {
-        let resolved = read_tx_size(dec, cdfs, neighbours, (mi_r, mi_c), side);
+        let resolved = read_tx_size(dec, cdfs, neighbours, (mi_r, mi_c), side, None);
         (resolved, if resolved == 64 { 32 } else { resolved })
     } else {
         (side, luma_tx)
@@ -5343,7 +5343,7 @@ fn decode_leaf8(
     // transform units, same raster-order per-TU pattern `decode_block`'s
     // multi-TU branch runs).
     let resolved = if tx_select {
-        read_tx_size(dec, cdfs, neighbours, leaf_mi, 8)
+        read_tx_size(dec, cdfs, neighbours, leaf_mi, 8, None)
     } else {
         8
     };
@@ -5863,6 +5863,33 @@ fn tx_size_context(n: &Neighbours, (mi_r, mi_c): (usize, usize), own_side: usize
     usize::from(above) + usize::from(left)
 }
 
+/// `get_tx_size_context` as libaom actually writes it (`pred_common.h:342`),
+/// for a block inside an INTER frame: the two `TXFM_CONTEXT` arrays
+/// ([`Neighbours::above_txfm`]/[`Neighbours::left_txfm`], which only the
+/// inter path maintains), except that an *inter* neighbour contributes its
+/// own BLOCK size rather than its transform size -- the two differ the moment
+/// a neighbour's var-tx tree splits. [`tx_size_context`]'s deblock-grid
+/// approximation coincides with this only while every neighbour codes one
+/// whole-block transform, which is exactly what `TxMode::Select` ends.
+fn tx_size_context_txfm(n: &Neighbours, (mi_r, mi_c): (usize, usize), side: usize) -> usize {
+    let has_above = mi_r > n.tile_row0_mi;
+    let has_left = mi_c > n.tile_col0_mi;
+    let mut above = usize::from(n.above_txfm[mi_c]) >= side;
+    let mut left = usize::from(n.left_txfm[mi_r]) >= side;
+    if has_above && n.above_inter[mi_c / (SUB / MI)] {
+        above = n.above_side_mi[mi_c] >= side;
+    }
+    if has_left && n.left_inter[mi_r / (SUB / MI)] {
+        left = n.left_side_mi[mi_r] >= side;
+    }
+    match (has_above, has_left) {
+        (true, true) => usize::from(above) + usize::from(left),
+        (true, false) => usize::from(above),
+        (false, true) => usize::from(left),
+        (false, false) => 0,
+    }
+}
+
 /// `read_tx_size`/`read_selected_tx_size` (spec 5.11.16): under
 /// `TxMode::Select`, an intra block's `tx_depth` symbol, resolved straight to
 /// the transform's own side in pixels (`side >> depth`) -- this decoder's
@@ -5874,8 +5901,12 @@ fn read_tx_size(
     n: &Neighbours,
     at_mi: (usize, usize),
     side: usize,
+    // lane-txselect: `get_tx_size_context`'s real context, for the callers
+    // that have one -- see [`tx_size_context_txfm`]. `None` keeps the
+    // key-frame path's own deblock-grid approximation.
+    ctx_override: Option<usize>,
 ) -> usize {
-    let ctx = tx_size_context(n, at_mi, side);
+    let ctx = ctx_override.unwrap_or_else(|| tx_size_context(n, at_mi, side));
     let depth = match side {
         8 => dec.symbol(&mut cdfs.tx_size_cat0[ctx]),
         16 => dec.symbol(&mut cdfs.tx_size_cat1[ctx]),
@@ -6112,7 +6143,14 @@ fn read_block_tx_size(
     let tx = if is_inter {
         side.min(64)
     } else {
-        let resolved = read_tx_size(dec, cdfs, n, at_mi, side);
+        let resolved = read_tx_size(
+            dec,
+            cdfs,
+            n,
+            at_mi,
+            side,
+            Some(tx_size_context_txfm(n, at_mi, side)),
+        );
         if resolved != side {
             // An intra block inside an inter frame whose `tx_depth` splits its
             // luma transform needs the per-transform-unit intra prediction
