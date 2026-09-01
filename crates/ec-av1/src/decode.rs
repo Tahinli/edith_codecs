@@ -1781,6 +1781,13 @@ struct Neighbours {
     /// of 8x8 or larger (whose one mode is correct for every row it spans).
     sub8_mode_col: Vec<(usize, usize)>,
     sub8_mode_row: Vec<(usize, usize)>,
+    /// The `uv_mode` twin of `sub8_mode_col`/`sub8_mode_row` (lane-sub8 r5):
+    /// chroma's edge-filter type reads the CHROMA neighbour's `uv_mode`
+    /// (`get_intra_edge_filter_type`, reconintra.c:974), and the coarse
+    /// [`SUB`] slots cannot name it once a 16x16 is split into 8x8 leaves --
+    /// the leaf above writes the same row slot the block to the left owns.
+    uv_mode_col: Vec<(usize, usize)>,
+    uv_mode_row: Vec<(usize, usize)>,
     /// Whether the block above/left of this column/row was coded `skip` --
     /// an inter frame's own `skip` context (spec `SkipContext`), which the
     /// key-frame writer never tracks (its skip context is always zero); a
@@ -1920,6 +1927,8 @@ impl Neighbours {
             left_side_mi: vec![SB; rows * (SUB / MI)],
             sub8_mode_col: vec![(usize::MAX, 0); cols * (SUB / MI)],
             sub8_mode_row: vec![(usize::MAX, 0); rows * (SUB / MI)],
+            uv_mode_col: vec![(usize::MAX, 0); cols * (SUB / MI)],
+            uv_mode_row: vec![(usize::MAX, 0); rows * (SUB / MI)],
             above_skip: vec![false; cols],
             left_skip: vec![false; rows],
             above_skip_mode: vec![false; cols],
@@ -2534,6 +2543,45 @@ impl Neighbours {
         }
     }
 
+    /// [`Self::record_mode_mi`] for the block's `uv_mode`, into
+    /// [`Self::uv_mode_col`]/[`Self::uv_mode_row`].
+    fn record_uv_mode_mi(
+        &mut self,
+        mi_r: usize,
+        mi_c: usize,
+        mi_w: usize,
+        mi_h: usize,
+        uv_mode: usize,
+    ) {
+        let (last_r, last_c) = (mi_r + mi_h - 1, mi_c + mi_w - 1);
+        for cell in 0..mi_w {
+            if let Some(slot) = self.uv_mode_col.get_mut(mi_c + cell) {
+                *slot = (last_r, uv_mode);
+            }
+        }
+        for cell in 0..mi_h {
+            if let Some(slot) = self.uv_mode_row.get_mut(mi_r + cell) {
+                *slot = (last_c, uv_mode);
+            }
+        }
+    }
+
+    /// Whether either mi-exact chroma neighbour of the block at `(mi_r, mi_c)`
+    /// coded a smooth `uv_mode` -- libaom's `intra_edge_filter_type` for
+    /// planes 1/2. Falls back to the coarse [`SUB`] slot on whichever axis no
+    /// block has recorded the exact neighbouring mi.
+    fn smooth_uv_neighbour(&self, mi_r: usize, mi_c: usize, r: usize, c: usize) -> bool {
+        let above = match self.uv_mode_col.get(mi_c) {
+            Some(&(row, m)) if mi_r > 0 && row == mi_r - 1 => m,
+            _ => self.above_uv_mode[c],
+        };
+        let left = match self.uv_mode_row.get(mi_r) {
+            Some(&(col, m)) if mi_c > 0 && col == mi_c - 1 => m,
+            _ => self.left_uv_mode[r],
+        };
+        is_smooth_mode(above) || is_smooth_mode(left)
+    }
+
     fn record_rect(
         &mut self,
         at: (usize, usize),
@@ -2555,6 +2603,7 @@ impl Neighbours {
             self.left_side[r + cell] = h;
         }
         self.record_mode_mi(r * (SUB / MI), c * (SUB / MI), w / MI, h / MI, mode);
+        self.record_uv_mode_mi(r * (SUB / MI), c * (SUB / MI), w / MI, h / MI, uv_mode);
         self.record_mi_rect((r * (SUB / MI), c * (SUB / MI)), w, h, grids);
     }
 
@@ -2666,6 +2715,7 @@ impl Neighbours {
         let (mi_r, mi_c) = (r * (SUB / MI), c * (SUB / MI));
         let side_mi = side / MI;
         self.record_mode_mi(mi_r, mi_c, side_mi, side_mi, mode);
+        self.record_uv_mode_mi(mi_r, mi_c, side_mi, side_mi, uv_mode);
         for cell in 0..side_mi {
             self.left_side_mi[mi_r + cell] = side;
             self.above_side_mi[mi_c + cell] = side;
@@ -5268,9 +5318,17 @@ fn decode_leaf8(
     if let Some(m) = neighbours.mode_left_mi(leaf_mi.0, leaf_mi.1) {
         left_mode = m;
     }
-    // See [`PlaneBuf::reconstruct`]'s doc: chroma stays `false` (exact) until
-    // a smooth/paeth `uv_mode` can reach decode at all.
     let smooth_neighbor = is_smooth_mode(above_mode) || is_smooth_mode(left_mode);
+    // Chroma's edge-filter type reads the CHROMA neighbour's `uv_mode`
+    // (`get_intra_edge_filter_type`, reconintra.c:974), never the luma mode
+    // this leaf's `smooth_neighbor` is built from -- passing `false` here
+    // filtered a directional chroma block's edge at the wrong strength
+    // (lane-sub8 r5: 4 pixels of one 8x8 leaf's chroma, deltas 1..3).
+    // corner-cut: the `uv_mode` neighbours are the coarse [`SUB`] slots, so
+    // two 8x8 leaves of one 16x16 see the slot the previous leaf wrote
+    // (updated below) rather than a real mi-exact neighbour; upgrade path is
+    // an mi-granular map like `sub8_mode_col`.
+    let smooth_neighbor_uv = neighbours.smooth_uv_neighbour(leaf_mi.0, leaf_mi.1, r, c);
     if smooth_neighbor {
         SMOOTH_LUMA_HITS.with(|c| c.set(c.get() + 1));
     }
@@ -5299,6 +5357,9 @@ fn decode_leaf8(
     } else {
         uv_mode
     };
+    neighbours.above_uv_mode[c] = uv_predict_mode;
+    neighbours.left_uv_mode[r] = uv_predict_mode;
+    neighbours.record_uv_mode_mi(leaf_mi.0, leaf_mi.1, 2, 2, uv_predict_mode);
     // `TxMode::Select`'s `tx_depth` at an 8x8 leaf (spec 5.11.16): the only
     // depths an 8x8 block offers are `TX8` (depth 0) and `TX4` (depth 1,
     // which splits the leaf's own 8x8 prediction into a 2x2 grid of 4x4
@@ -5337,7 +5398,7 @@ fn decode_leaf8(
             &vec![0i32; 16],
             alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
             None,
-            false,
+            smooth_neighbor_uv,
         );
         v.reconstruct(
             cpx,
@@ -5349,7 +5410,7 @@ fn decode_leaf8(
             &vec![0i32; 16],
             alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
             None,
-            false,
+            smooth_neighbor_uv,
         );
         luma_grid = vec![0i32; 64];
         u_grid = vec![0i32; 16];
@@ -5403,7 +5464,7 @@ fn decode_leaf8(
             alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
             None,
             None,
-            false,
+            smooth_neighbor_uv,
         )?;
         v_grid = read_plane(
             dec,
@@ -5425,7 +5486,7 @@ fn decode_leaf8(
             alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
             None,
             None,
-            false,
+            smooth_neighbor_uv,
         )?;
     } else {
         // `tx_depth` resolved this leaf's luma to `TX4`: a 2x2 raster-order
@@ -5501,7 +5562,7 @@ fn decode_leaf8(
             alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
             None,
             None,
-            false,
+            smooth_neighbor_uv,
         )?;
         v_grid = read_plane(
             dec,
@@ -5523,7 +5584,7 @@ fn decode_leaf8(
             alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
             None,
             None,
-            false,
+            smooth_neighbor_uv,
         )?;
         // `record_split_luma` expects a `record`-style `(r, c)` position in
         // `SUB`-grid units and rescales it by `SUB / MI`; `leaf_mi` is
@@ -5694,6 +5755,9 @@ fn decode_leaf_split4(
             left_mode = pmode;
         }
     }
+    // See `decode_leaf8`'s own `smooth_neighbor_uv`: the chroma edge-filter
+    // type is the chroma neighbours' `uv_mode`, mi-exact where recorded.
+    let smooth_neighbor_uv = neighbours.smooth_uv_neighbour(leaf_mi.0, leaf_mi.1, r, c);
     let mut leaf_modes = [0usize; 4];
     let mut leaf_skips = [false; 4];
     let mut last_uv: Option<(usize, i32, Option<(i32, i32)>)> = None;
@@ -5775,9 +5839,12 @@ fn decode_leaf_split4(
     let (uv_mode, angle_delta_uv, alpha) =
         last_uv.expect("i==3 always sets has_chroma, so chroma is always Some");
     let uv_predict_mode = if uv_mode == UV_CFL_PRED { DC_PRED } else { uv_mode };
+    neighbours.above_uv_mode[c] = uv_predict_mode;
+    neighbours.left_uv_mode[r] = uv_predict_mode;
+    neighbours.record_uv_mode_mi(leaf_mi.0, leaf_mi.1, 2, 2, uv_predict_mode);
     let (u_grid, v_grid): (Vec<i32>, Vec<i32>) = if leaf_skips[3] {
-        u.reconstruct(cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], None, None, false);
-        v.reconstruct(cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], None, None, false);
+        u.reconstruct(cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], None, None, smooth_neighbor_uv);
+        v.reconstruct(cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], None, None, smooth_neighbor_uv);
         (vec![0i32; 16], vec![0i32; 16])
     } else {
         let ac = alpha.map(|_| cfl_ac_q3(y, gpx, gpy, 8));
@@ -5785,12 +5852,12 @@ fn decode_leaf_split4(
         let ug = read_plane(
             dec, cdfs, TxbSet::Chroma4, scan4, 1, chroma_around[1], uv_mode, uv_predict_mode,
             angle_delta_uv, group_reach, u, cpx, cpy, 4, TX4, base_q_idx,
-            alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)), None, None, false,
+            alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)), None, None, smooth_neighbor_uv,
         )?;
         let vg = read_plane(
             dec, cdfs, TxbSet::Chroma4, scan4, 2, chroma_around[2], uv_mode, uv_predict_mode,
             angle_delta_uv, group_reach, v, cpx, cpy, 4, TX4, base_q_idx,
-            alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)), None, None, false,
+            alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)), None, None, smooth_neighbor_uv,
         )?;
         (ug, vg)
     };
