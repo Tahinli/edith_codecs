@@ -9767,14 +9767,20 @@ mod tests {
     /// which is the per-unit availability rule this port exists for, and no
     /// gate fired one before this round.
     ///
-    /// This gate was `#[ignore]`d RED through r1 (seed 50 luma (171,56)).
-    /// Root cause, r2: not availability at all -- `av1_nz_map_ctx_offset` is
-    /// packed COLUMN-major, so [`crate::decode::base_ctx`] read the
-    /// `TX_32X64`/`TX_64X32` offset tables transposed and desynced the first
-    /// SB-level strip whose luma corner held a coefficient below row 1 (see
-    /// that function's comment). The strip's own per-unit prediction was
-    /// already exact.
-    #[ignore = "lane-rectsplit r3: RED at seed 50; the nz_map transposition r2 blamed turns the merged SB HORZ/VERT partition gate RED at seed 43, cause still open"]
+    /// This gate was `#[ignore]`d RED through r3 (seed 50 luma (171,56)).
+    /// Root cause, r4, TWO defects, neither of them availability -- the
+    /// strip's own per-unit prediction was exact all along:
+    /// 1. `av1_nz_map_ctx_offset` is indexed by libaom's COLUMN-major
+    ///    `coeff_idx = col * 32 + row`, so [`crate::decode::base_ctx`] read
+    ///    the `TX_32X64`/`TX_64X32` offset tables transposed (r2 saw this and
+    ///    r3 reverted it, because "fixing" it turned the merged SB HORZ/VERT
+    ///    gate RED at seed 43);
+    /// 2. that seed-43 RED was a SECOND defect the first one had been hiding
+    ///    behind a refusal: `EOB_PT_512_CHROMA` was transcribed from
+    ///    `av1_default_eob_multi512_cdfs`'s `eob_multi_ctx = 1` row (the flat
+    ///    `V_DCT`/`H_DCT` distribution), so the first real 32x16 chroma
+    ///    transform read `eob_pt` 7 where aomdec read 2. With both fixed,
+    ///    seeds 43 and 50 are pixel-exact.
     #[test]
     fn a_real_aomenc_stream_with_a_split_transform_superblock_strip_decodes_pixel_exact() {
         const NAME: &str = "a_real_aomenc_stream_with_a_split_transform_superblock_strip_decodes_pixel_exact";

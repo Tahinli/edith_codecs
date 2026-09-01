@@ -266,18 +266,35 @@ pub const EOB_PT_128_CHROMA_Q3: [u16; 9] = [
     24313, 26062, 28385, 30107, 31217, 31898, 32345, 32768, 0,
 ];
 
-/// `av1_default_eob_multi512_cdfs[*][1][*]` (`token_cdfs.h:874-901`,
+/// `av1_default_eob_multi512_cdfs[*][1][0]` (`token_cdfs.h:874-906`,
 /// lane-sbpart): the end-of-block group of a CHROMA transform with 512 coded
 /// positions -- what a 32x16/16x32 chroma transform has (the chroma plane of
 /// an intra `PARTITION_HORZ`/`VERT` 64x32/32x64 superblock strip, whose luma
 /// coefficients truncate to the 64x64-superblock's own 32x32 corner-scan
 /// (`TxbSet::Luma64`) but whose *chroma* plane, at 32x16, is small enough
-/// that no truncation applies). Unlike every other `EOB_PT_*` table here,
-/// libaom's default is the exact same flat distribution at all four
-/// q-contexts and both `eob_multi_size` selectors (`token_cdfs.h` rows), so
-/// one constant covers every q-context -- no `_Q0`/`_Q1`/`_Q3` siblings.
+/// that no truncation applies).
+///
+/// lane-rectsplit r4: this used to be ONE flat `3277, 6554, ...` constant at
+/// every q-context, transcribed from the wrong row -- the last index of
+/// `[q][plane][2]` is `eob_multi_ctx` (0 = `TX_CLASS_2D`, 1 = `V_DCT`/
+/// `H_DCT`), and the flat distribution is libaom's 1D-class row, identical
+/// for both planes at every q. The first real 32x16 chroma transform then
+/// read `eob_pt` 7 where aomdec read 2 (seed 43 of the superblock HORZ/VERT
+/// gate).
 pub const EOB_PT_512_CHROMA: [u16; 11] = [
-    3277, 6554, 9830, 13107, 16384, 19661, 22938, 26214, 29491, 32768, 0,
+    12015, 14769, 19588, 22052, 24222, 25812, 27300, 29219, 32114, 32768, 0,
+];
+/// [`EOB_PT_512_CHROMA`], q-context 0 (`base_q_idx` 0..=20).
+pub const EOB_PT_512_CHROMA_Q0: [u16; 11] = [
+    5095, 6446, 9996, 13354, 16017, 17986, 20919, 26129, 29140, 32768, 0,
+];
+/// [`EOB_PT_512_CHROMA`], q-context 1 (`base_q_idx` 21..=60).
+pub const EOB_PT_512_CHROMA_Q1: [u16; 11] = [
+    7265, 9979, 15819, 19250, 21780, 23846, 26478, 28396, 31811, 32768, 0,
+];
+/// [`EOB_PT_512_CHROMA`], q-context 3 (`base_q_idx` 121..=255).
+pub const EOB_PT_512_CHROMA_Q3: [u16; 11] = [
+    21093, 23043, 25742, 27658, 29097, 29716, 30073, 30820, 31956, 32768, 0,
 ];
 
 /// `Default_Dc_Sign_Cdf[2][0]` (spec 9.4): the sign of a luma DC coefficient,
