@@ -28,6 +28,10 @@ fn main() {
             std::process::exit(2);
         }
     };
+    let report = || {
+        let (h, v, c) = ec_av1::stream::rect4_32_counters();
+        println!("rect4_32: horz={h} vert={v} coded={c}");
+    };
     match ec_av1::stream::decode_stream(&data) {
         Ok(frames) if frames.is_empty() => {
             println!("OK but EMPTY: no frames -- is {path} an IVF rather than a raw OBU stream?");
@@ -52,4 +56,5 @@ fn main() {
         }
         Err(e) => println!("REFUSED: {e}"),
     }
+    report();
 }
