@@ -757,6 +757,20 @@ pub(crate) fn rect_leaf_coeff_hits() -> usize {
     RECT_LEAF_COEFF_HITS.with(|c| c.get())
 }
 
+// lane-rectx r5: how many times a NON-strip `kf_y_mode` reader
+// ([`decode_block`], [`decode_block_rect`], [`decode_block_rect64`]) took an
+// above/left mode from the mi-exact map that DIFFERS from its coarse 16x16
+// slot -- i.e. how often the r5 defect would have picked the wrong CDF row.
+thread_local! {
+    static MODE_MI_OVERRIDE_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`MODE_MI_OVERRIDE_HITS`].
+pub(crate) fn mode_mi_override_hits() -> usize {
+    MODE_MI_OVERRIDE_HITS.with(|c| c.get())
+}
+
 // lane-sbpart r2: how many superblock-level `PARTITION_HORZ`/`PARTITION_VERT`
 // blocks (two true 64x32/32x64 strips, [`decode_block_rect64`]) fired -- the
 // gate's proof this round's arms actually reached a real block, not just
@@ -2589,10 +2603,12 @@ impl Neighbours {
     /// a different CDF for the same mode value).
     fn modes_above_left(&self, r: usize, c: usize) -> (usize, usize) {
         let (mi_r, mi_c) = (r * (SUB / MI), c * (SUB / MI));
-        (
-            self.mode_above_mi(mi_r, mi_c).unwrap_or(self.above_mode[c]),
-            self.mode_left_mi(mi_r, mi_c).unwrap_or(self.left_mode[r]),
-        )
+        let above = self.mode_above_mi(mi_r, mi_c).unwrap_or(self.above_mode[c]);
+        let left = self.mode_left_mi(mi_r, mi_c).unwrap_or(self.left_mode[r]);
+        if above != self.above_mode[c] || left != self.left_mode[r] {
+            MODE_MI_OVERRIDE_HITS.with(|h| h.set(h.get() + 1));
+        }
+        (above, left)
     }
 
     fn record_rect(
