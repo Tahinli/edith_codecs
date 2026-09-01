@@ -789,6 +789,13 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 order_hint_slots[i] = header.order_hint;
             }
         }
+        // lane-defon r1: a forward keyframe (aomenc `--enable-fwd-kf`) is a
+        // KEY frame coded with `show_frame == 0`, output later by a
+        // `show_existing_frame` header -- counted only once its tiles have
+        // decoded, so the gate's assert covers decoded-and-compared frames.
+        if header.frame_type == FrameType::Key && !header.show_frame {
+            decode::note_fwd_kf();
+        }
         if header.show_frame {
             let output = if header.film_grain.apply_grain {
                 let mc_identity = parser
@@ -1888,6 +1895,14 @@ mod tests {
             let input_depth_arg = format!("--input-bit-depth={bit_depth}");
             let mut child = Command::new(aomenc_path())
                 .args([
+                    // lane-defon r1: the repo's only gate that decodes hidden
+                    // frames is also the only place a FORWARD KEYFRAME can be
+                    // proven -- a KEY frame with `show_frame == 0`, which is
+                    // exactly the shape this gate already compares in decode
+                    // order. On-values go before the base list (aomenc keeps
+                    // the FIRST occurrence of a repeated flag).
+                    "--enable-fwd-kf=1",
+                    "--fwd-kf-dist=8",
                     "--codec=av1",
                     "--passes=1",
                     "--end-usage=q",
@@ -1953,17 +1968,28 @@ mod tests {
                 String::from_utf8_lossy(&out.stderr)
             );
             let stream = out.stdout;
+            let fwd_kf_before = crate::decode::fwd_kf_hits();
             let (total, hidden) =
                 decode_all_frames_vs_oracle(&stream, &format!("altref-hidden-{bit_depth}bit"));
+            let fwd_kf = crate::decode::fwd_kf_hits() - fwd_kf_before;
             assert!(
                 hidden >= 2,
                 "{NAME}: the {bit_depth}-bit recipe produced only {hidden} hidden frame(s) of \
                  {total} decoded -- the gate would be vacuous (class \
                  gate-blind-to-hidden-frames)"
             );
+            // lane-defon r1: `--enable-fwd-kf=1` is spelled on this recipe, so
+            // a KEY frame with `show_frame == 0` must actually have been
+            // decoded -- otherwise the on-value proves nothing.
+            assert!(
+                fwd_kf > 0,
+                "{NAME}: the {bit_depth}-bit recipe decoded {total} frames ({hidden} hidden) but \
+                 zero forward keyframes -- --enable-fwd-kf=1 --fwd-kf-dist=8 never reached the \
+                 bitstream"
+            );
             eprintln!(
-                "{NAME} {bit_depth}-bit: {total} frames decoded, {hidden} hidden, all \
-                 pixel-exact vs the oracle in decode order"
+                "{NAME} {bit_depth}-bit: {total} frames decoded, {hidden} hidden, {fwd_kf} \
+                 forward keyframes, all pixel-exact vs the oracle in decode order"
             );
         }
     }
@@ -7067,6 +7093,143 @@ mod tests {
         ] {
             assert!(hits > 0, "{NAME}: {matched} matches but zero blocks took {what}");
         }
+    }
+
+    /// lane-defon r1: the 10-bit one-sided-compound hole --
+    /// `--enable-onesided-comp` was spelled on in no 10-bit gate (5 of the 15
+    /// pin it off, the rest default), so the UNIDIR_COMP_REFERENCE alphabet
+    /// was proven at 8 bits only while both of his films are 10-bit 4:2:0.
+    /// `--enable-diff-wtd-comp=1` is deliberately NOT spelled here (a flag a
+    /// gate turns on without asserting it fired is coverage theatre, class
+    /// gate-blind-to-feature): measured this round, the 10-bit `gradients`
+    /// fixture decodes 8/8 pixel-exact with `diffwtd_hits == 0` -- smooth
+    /// gradients never win
+    /// a difference-weighted mask (the 8-bit gate needs `mandelbrot`'s hard
+    /// diagonal edge, and [`ten_bit_tool_gate`] has no mandelbrot source), so
+    /// hard-asserting it here would fail on encoder choice, not on a decoder
+    /// defect.
+    #[test]
+    fn a_real_aomenc_10bit_stream_with_onesided_compound_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_10bit_stream_with_onesided_compound_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        ten_bit_tool_gate(
+            NAME,
+            64,
+            64,
+            24,
+            &[
+                "--enable-onesided-comp=1",
+                "--enable-masked-comp=1",
+                "--enable-dist-wtd-comp=0",
+                "--cq-level=45",
+                "--kf-max-dist=1000",
+                "--auto-alt-ref=1",
+                "--lag-in-frames=16",
+                "--enable-fwd-kf=0",
+                "--enable-order-hint=1",
+                "--enable-global-motion=0",
+                "--enable-warped-motion=1",
+                "--enable-obmc=1",
+                "--tune-content=default",
+                "--enable-interintra-comp=0",
+                "--enable-interintra-wedge=0",
+                "--enable-smooth-interintra=0",
+                "--enable-rect-partitions=0",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0",
+                "--enable-filter-intra=0",
+                "--enable-smooth-intra=0",
+                "--enable-paeth-intra=0",
+                "--enable-directional-intra=0",
+                "--enable-angle-delta=0",
+                "--enable-tx-size-search=0",
+                "--enable-cdef=0",
+                "--enable-restoration=0",
+                "--max-partition-size=32",
+                "--min-partition-size=32",
+                "--enable-palette=0",
+                "--enable-intrabc=0",
+                "--enable-cfl-intra=0",
+                "--enable-ref-frame-mvs=0",
+            ],
+            &[42, 43, 44, 45, 46, 47, 48, 49],
+            &[("uni_comp_hits", crate::decode::uni_comp_hits as fn() -> usize)],
+        );
+    }
+
+    /// lane-defon r1: the 10-bit sibling of
+    /// [`a_real_aomenc_stream_with_interintra_wedge_decodes_pixel_exact`] --
+    /// `--enable-interintra-wedge=1` was spelled on in no 10-bit gate (5 of
+    /// the 15 pin it off), and his two films are 10-bit, so the 8-bit
+    /// gate alone proves nothing about the streams that matter. Same tool
+    /// set as the 8-bit recipe (`--enable-masked-comp=0` keeps inter blocks
+    /// off the COMPOUND_WEDGE path, fixed 32x32 partitions), driven through
+    /// [`ten_bit_tool_gate`], which hard-asserts `wii_hits` moved and
+    /// compares every plane against ffmpeg's own 10-bit decode.
+    #[test]
+    fn a_real_aomenc_10bit_stream_with_interintra_wedge_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_10bit_stream_with_interintra_wedge_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        ten_bit_tool_gate(
+            NAME,
+            64,
+            64,
+            24,
+            &[
+                "--enable-interintra-wedge=1",
+                "--enable-interintra-comp=1",
+                "--enable-smooth-interintra=1",
+                "--cq-level=45",
+                "--kf-max-dist=1000",
+                "--auto-alt-ref=1",
+                "--lag-in-frames=16",
+                "--enable-fwd-kf=0",
+                "--enable-order-hint=1",
+                "--enable-warped-motion=1",
+                "--enable-obmc=1",
+                "--tune-content=default",
+                "--enable-masked-comp=0",
+                "--enable-onesided-comp=0",
+                "--enable-rect-partitions=0",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0",
+                "--enable-filter-intra=0",
+                "--enable-smooth-intra=0",
+                "--enable-paeth-intra=0",
+                "--enable-directional-intra=0",
+                "--enable-angle-delta=0",
+                "--enable-tx-size-search=0",
+                "--enable-cdef=0",
+                "--enable-restoration=0",
+                "--max-partition-size=32",
+                "--min-partition-size=32",
+                "--enable-palette=0",
+                "--enable-intrabc=0",
+                "--enable-cfl-intra=0",
+                "--enable-ref-frame-mvs=0",
+            ],
+            &[42, 43, 44, 45, 46, 47, 48, 49],
+            &[
+                ("wii_hits", crate::decode::wii_hits as fn() -> usize),
+                ("interintra_hits", crate::decode::interintra_hits as fn() -> usize),
+            ],
+        );
     }
 
     /// lane-wii r2: `--enable-interintra-wedge=1` streams must DECODE
