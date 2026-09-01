@@ -420,6 +420,12 @@ pub(crate) struct Cdfs {
     /// The two motion vector components' own tables: separate owned state,
     /// since spec 8.3.2 adapts one component without touching the other.
     pub mv_comp: [MvComponentCdfs; 2],
+    /// libaom's `ndvc` (`av1_init_mv_probs`): the block-vector MV context an
+    /// intrabc block reads (spec's `MV_INTRABC_CONTEXT`). Same spec-8.4
+    /// defaults as [`Self::mv_joint`]/[`Self::mv_comp`], separate adaptation.
+    pub dv_joint: [u16; 5],
+    /// [`Self::dv_joint`]'s per-component half.
+    pub dv_comp: [MvComponentCdfs; 2],
     /// The `use_filter_intra` flag, indexed by block-size class (`[0]`=4x4,
     /// `[1]`=8x8, `[2]`=16x16, `[3]`=32x32, `[4]`=32x16, `[5]`=16x32) --
     /// see [`cdf::FILTER_INTRA`].
@@ -464,6 +470,10 @@ pub(crate) struct Cdfs {
     /// A `RESTORE_SWITCHABLE`-plane LR unit's `restoration_type` -- see
     /// [`cdf::RESTORE_SWITCHABLE`].
     pub restore_switchable: [u16; 4],
+    /// `segment_id` (lane-seg, spec 5.11.8) -- see [`cdf::SEGMENT_ID`].
+    pub segment_id: [[u16; 9]; 3],
+    /// `seg_id_predicted` (lane-seg, spec 5.11.9) -- see [`cdf::SEGMENT_PRED`].
+    pub segment_pred: [[u16; 3]; 3],
     /// `delta_q_abs` (lane-realworld r4, spec 5.11.10) -- see [`cdf::DELTA_Q`].
     pub delta_q: [u16; 5],
     /// `delta_lf_abs`, the single-value form (spec 5.11.11) -- see
@@ -682,6 +692,10 @@ impl Cdfs {
         reset2(&mut self.ref_mv);
         reset2(&mut self.drl_mode);
         reset1(&mut self.mv_joint);
+        reset1(&mut self.dv_joint);
+        self.dv_comp
+            .iter_mut()
+            .for_each(MvComponentCdfs::reset_counts);
         self.mv_comp
             .iter_mut()
             .for_each(MvComponentCdfs::reset_counts);
@@ -701,6 +715,8 @@ impl Cdfs {
         reset1(&mut self.restore_wiener);
         reset1(&mut self.restore_sgrproj);
         reset1(&mut self.restore_switchable);
+        reset2(&mut self.segment_id);
+        reset2(&mut self.segment_pred);
         reset1(&mut self.delta_q);
         reset1(&mut self.delta_lf);
         reset2(&mut self.delta_lf_multi);
@@ -1155,6 +1171,8 @@ impl Cdfs {
             drl_mode: cdf::DRL_MODE,
             mv_joint: cdf::MV_JOINT,
             mv_comp: [MvComponentCdfs::new(), MvComponentCdfs::new()],
+            dv_joint: cdf::MV_JOINT,
+            dv_comp: [MvComponentCdfs::new(), MvComponentCdfs::new()],
             filter_intra: cdf::FILTER_INTRA,
             filter_intra_mode: cdf::FILTER_INTRA_MODE,
             tx_size_cat0: cdf::TX_SIZE_CAT0,
@@ -1172,6 +1190,8 @@ impl Cdfs {
             restore_wiener: cdf::RESTORE_WIENER,
             restore_sgrproj: cdf::RESTORE_SGRPROJ,
             restore_switchable: cdf::RESTORE_SWITCHABLE,
+            segment_id: cdf::SEGMENT_ID,
+            segment_pred: cdf::SEGMENT_PRED,
             delta_q: cdf::DELTA_Q,
             delta_lf: cdf::DELTA_LF,
             delta_lf_multi: [cdf::DELTA_LF; 4],
