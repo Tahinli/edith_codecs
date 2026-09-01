@@ -4401,8 +4401,11 @@ mod tests {
             );
             return;
         }
-        eprintln!(
-            "SKIP {NAME}: {never_fired} attempts decoded but never fired an 8x8 obmc block \
+        // lane-gmaffine r2: this gate fired for three rounds only as a SKIP
+        // (gate-skips-on-its-own-failure); the 8x8 leaf is reachable now, so a
+        // sweep that never lands one firing pixel-exact attempt is a FAILURE.
+        panic!(
+            "{NAME}: {never_fired} attempts decoded but never fired an 8x8 obmc block \
              ({total_obmc8} total 8x8 obmc hits across all attempts), and every other attempt \
              hit a named refusal:\n{}",
             refusals.join("\n")
@@ -5431,6 +5434,10 @@ mod tests {
         for (di, depth) in [8u32, 10u32].into_iter().enumerate() {
           for cq in [32u32, 45, 55] {
             let cq_arg = format!("--cq-level={cq}");
+            let max_part_arg = format!(
+                "--max-partition-size={}",
+                std::env::var("EC_8X8_MAXPART").unwrap_or_else(|_| "8".into())
+            );
             let source = format!(
                 "mandelbrot=size=96x96:rate=25,rotate=a=0.12*t:c=black,\
                  scale=w='ceil(96*(1+0.03*n)/2)*2':h=96:eval=frame,crop={width}:{height}"
@@ -5490,7 +5497,7 @@ mod tests {
                 "--enable-tx-size-search=0",
                 "--enable-cdef=0",
                 "--enable-restoration=0",
-                "--max-partition-size=8",
+                &max_part_arg,
                 "--min-partition-size=8",
                 "--enable-palette=0",
                 "--enable-intrabc=0",
