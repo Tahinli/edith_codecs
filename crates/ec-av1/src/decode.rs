@@ -11480,10 +11480,10 @@ fn decode_inter_block8(
         let ref_frame = read_single_ref(
             dec,
             cdfs,
-            neighbours.above_ref[c],
-            neighbours.above_ref1[c],
-            neighbours.left_ref[r],
-            neighbours.left_ref1[r],
+            neighbours.above_ref[cmi],
+            neighbours.above_ref1[cmi],
+            neighbours.left_ref[rmi],
+            neighbours.left_ref1[rmi],
         );
         leaf_refs = (ref_frame, None);
         let (sref_y, sref_u, sref_v) = ref_planes(ref_frame, ref_y, ref_u, ref_v, other_refs)?;
@@ -11701,17 +11701,17 @@ fn decode_inter_block8(
         // wrong CDF row. Upgrade: give `Neighbours` a real 8x8-granular
         // filter array, same shape as the `[3, 3]` approximation the caller
         // records after the leaf loop.
-        let above_filter_ctx = if neighbours.above_ref[c] == ref_frame
-            || neighbours.above_ref1[c] == Some(ref_frame)
+        let above_filter_ctx = if neighbours.above_ref[cmi] == ref_frame
+            || neighbours.above_ref1[cmi] == Some(ref_frame)
         {
-            neighbours.above_filter[c]
+            neighbours.above_filter[cmi]
         } else {
             [3, 3]
         };
-        let left_filter_ctx = if neighbours.left_ref[r] == ref_frame
-            || neighbours.left_ref1[r] == Some(ref_frame)
+        let left_filter_ctx = if neighbours.left_ref[rmi] == ref_frame
+            || neighbours.left_ref1[rmi] == Some(ref_frame)
         {
-            neighbours.left_filter[r]
+            neighbours.left_filter[rmi]
         } else {
             [3, 3]
         };
@@ -11728,6 +11728,17 @@ fn decode_inter_block8(
             false,
         );
         leaf_filter_syms = resolved_filter;
+        if std::env::var_os("EC_TRACE_MODE").is_some() {
+            eprintln!(
+                "EC_MODE_VAL8 mi_row={} mi_col={} newmv={is_new_mv} globalmv={is_globalmv} ref0={ref_frame} mv0=({},{}) stack={} rng={}",
+                leaf_mi.0,
+                leaf_mi.1,
+                mv.0,
+                mv.1,
+                stack.entries.len(),
+                dec.debug_state().0
+            );
+        }
         // lane-gmaffine r1: `allow_warp`'s `global_warp_allowed` branch
         // (`reconinter.c:33-55`), gated INDEPENDENTLY of `motion_mode` --
         // see [`decode_inter_block`]'s own copy. A local WARPED_CAUSAL model
