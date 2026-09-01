@@ -9259,7 +9259,7 @@ fn decode_inter_block(
     // spec 5.11.5 `inter_frame_mode_info`: `inter_segment_id(1)` before
     // `skip_mode`/`skip`, `inter_segment_id(0)` after them.
     let (seg_mi_r, seg_mi_c) = (r * SUB_MI as usize, c * SUB_MI as usize);
-    let (seg_w_mi, seg_h_mi) = (side / 4, side / 4);
+    let (seg_w_mi, seg_h_mi) = (write_w / 4, write_h / 4);
     inter_segment_id(dec, cdfs, seg_mi_r, seg_mi_c, seg_w_mi, seg_h_mi, false, true);
     let skip_mode = skip_mode_present && dec.symbol(&mut cdfs.skip_mode[skip_mode_ctx]) == 1;
     if std::env::var_os("EC_AV1_SKIPMODE_DUMP").is_some() {
