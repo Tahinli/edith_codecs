@@ -74,3 +74,16 @@ chroma halves.
 - fix-now(next round): two swept cells decode to completion but are NOT pixel-exact
   (rgbtestsrc cq24 3540 bytes, cq32 1714; mandelbrot start_x=-0.6 cq16 with
   `--enable-filter-intra=1` 126). Same ladder applies; the gate's own cell is exact.
+
+## Totals
+
+`EC_AV1_REQUIRE_AOMENC=1 cargo test -p ec-av1 --lib` (CARGO_TARGET_DIR=~/.cache/cargo-target-rectx):
+**270 passed, 0 failed, 24 ignored** (738.88s) — r3's single failure (this lane's own gate) is
+gone and nothing regressed (269 -> 270 passed is exactly this gate).
+
+That full run was built BEFORE the last hunk (the explicit 64x32/32x64 rows in
+`has_tr_rect_table`/`has_bl_rect_table`, which previously fell through to the 16x32 row).
+On the final build the four gates that can see those sizes were re-run:
+`a_real_aomenc_stream_with_a_superblock_level_horz_vert_partition_decodes_pixel_exact`,
+`..._with_mandelbrot_fires_the_vert_b_partition_arm`, `..._with_directional_chroma_...` and
+this lane's own gate — 4 passed, 0 failed, 1 ignored (21.26s).
