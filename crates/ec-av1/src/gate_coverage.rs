@@ -217,10 +217,11 @@ const NEVER_EXERCISED_10BIT: &[(&str, &str)] = &[
         "enable-dual-filter",
         "hole at both depths, see the 8-bit list",
     ),
-    (
-        "enable-flip-idtx",
-        "hole at both depths, see the 8-bit list",
-    ),
+    // `enable-flip-idtx` LEFT this list on 2026-09-02 (lane-rectclass r1):
+    // `a_real_aomenc_stream_with_a_1d_tx_class_on_a_rect_transform_decodes_pixel_exact`
+    // passes `=1` at both depths and pixel-compares four 10-bit decodes, so
+    // the flip/identity/1D transform types are proven to reach a real 10-bit
+    // stream this decoder reconstructs exactly.
     ("enable-intrabc", "hole at both depths, see the 8-bit list"),
     ("enable-rect-tx", "hole at both depths, see the 8-bit list"),
     (
@@ -286,10 +287,8 @@ const NEVER_ON_10BIT: &[(&str, &str)] = &[
         "enable-onesided-comp",
         "hole at both depths, see the 8-bit list (5 pinned off, 10 defaulted)",
     ),
-    (
-        "enable-tx-size-search",
-        "hole at both depths, see the 8-bit list (11 of 15 pin =0)",
-    ),
+    // `enable-tx-size-search` LEFT this list on 2026-09-02 (lane-rectclass r1):
+    // the same gate pins `--enable-tx-size-search=1` at 10 bits.
     (
         "multi-tile",
         "on in no 10-bit gate: all 15 leave --tile-columns/--tile-rows defaulted at 0, so every 10-bit stream is single-tile and no tile edge or per-tile CDF reset is checked at high bit depth",
