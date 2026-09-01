@@ -5458,6 +5458,120 @@ mod tests {
         eprintln!("{NAME}: pixel-exact, rect_leaf_coeff_hits={fired}");
     }
 
+    /// lane-rectx r5: the same 16x8/8x16 rect leaves, but this time proving
+    /// what a LATER, non-strip block reads from them. `decode_leaf_rect` took
+    /// the mi-exact intra mode map in r4; `decode_block`/`decode_block_rect`/
+    /// `decode_block_rect64` did not, so a 32x16 strip whose left neighbour was
+    /// a 16x8 leaf still read the coarse per-16x16 `left_mode` slot -- which no
+    /// sub-16x16 block ever writes -- and picked a DIFFERENT `kf_y_mode` CDF row
+    /// for the same decoded mode value. The stream stayed in sync through mode
+    /// info (`EC_TRACE_MODE_STEP` ranges match up to that symbol) and then
+    /// diverged inside the block's own coefficients: the whole bottom-right
+    /// 32x32 quadrant of this fixture decoded wrong (1650 bytes) while the
+    /// three earlier quadrants were exact -- wrong pixels returned as success.
+    /// `mode_mi_override_hits` counts exactly the reads where the mi-exact
+    /// neighbour disagrees with the coarse slot, so a regression that drops the
+    /// override again fails the counter as well as the pixels.
+    #[test]
+    fn a_real_aomenc_stream_whose_square_block_reads_a_sub16_neighbours_mode_decodes_pixel_exact() {
+        const NAME: &str =
+            "a_real_aomenc_stream_whose_square_block_reads_a_sub16_neighbours_mode_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height) = (64usize, 64usize);
+        let y4m = Command::new("ffmpeg")
+            .args([
+                "-v", "error", "-f", "lavfi", "-i",
+                &format!("rgbtestsrc=size={width}x{height}"),
+                "-pix_fmt", "yuv420p", "-t", "1", "-vframes", "1", "-f", "yuv4mpegpipe", "-",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ffmpeg failed to run");
+        assert!(y4m.status.success(), "ffmpeg fixture: {}", String::from_utf8_lossy(&y4m.stderr));
+        // Two swept cells of the r4 sweep that decoded to completion with
+        // WRONG pixels (1714 and 1650 bytes): `--reduced-tx-type-set` and
+        // `--enable-filter-intra` are the two axes that move which block sizes
+        // aomenc reaches for here; both arms are pinned.
+        let mut total_overrides = 0usize;
+        for (rtx, filter_intra) in [("1", "0"), ("0", "1")] {
+            let encode = || {
+                let mut child = Command::new(aomenc_path())
+                    .args([
+                        "--codec=av1", "--passes=1", "--end-usage=q", "--cq-level=32",
+                        "--cpu-used=4", "--threads=1", "--row-mt=0", "--sb-size=64",
+                        "--kf-max-dist=0", "--enable-rect-partitions=1",
+                        "--enable-ab-partitions=0", "--enable-1to4-partitions=0",
+                        "--enable-tx-size-search=0", "--enable-cdef=0",
+                        "--enable-restoration=0",
+                        &format!("--enable-filter-intra={filter_intra}"),
+                        &format!("--reduced-tx-type-set={rtx}"),
+                        "--min-partition-size=8", "--max-partition-size=32",
+                        "--obu", "-o", "-", "-",
+                    ])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("aomenc failed to start");
+                child
+                    .stdin
+                    .take()
+                    .expect("aomenc stdin")
+                    .write_all(&y4m.stdout)
+                    .expect("writing y4m to aomenc");
+                let out = child.wait_with_output().expect("aomenc failed to run");
+                assert!(
+                    out.status.success(),
+                    "aomenc refused the fixture: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                out.stdout
+            };
+            let stream = encode();
+            assert_eq!(
+                stream,
+                encode(),
+                "{NAME}: aomenc output is not reproducible (rtx={rtx} filter_intra={filter_intra})"
+            );
+            let before = crate::decode::mode_mi_override_hits();
+            let frames = decode_stream(&stream).unwrap_or_else(|e| {
+                panic!("{NAME}: decode failed (rtx={rtx} filter_intra={filter_intra}): {e}")
+            });
+            // Counted only on an attempt that actually decoded AND is compared
+            // below -- a refusal never contributes to the firing assert.
+            let overrides = crate::decode::mode_mi_override_hits() - before;
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frames.len());
+            assert_eq!(frames.len(), 1, "{NAME}: expected one key frame");
+            assert_eq!(ffmpeg_frames.len(), frames.len(), "{NAME}: ffmpeg frame count");
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(
+                    got.y, want.y,
+                    "{NAME} frame {i} luma vs ffmpeg (rtx={rtx} filter_intra={filter_intra}, \
+                     {overrides} mi-exact mode overrides)"
+                );
+                assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (rtx={rtx})");
+                assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (rtx={rtx})");
+            }
+            total_overrides += overrides;
+        }
+        assert!(
+            total_overrides > 0,
+            "{NAME}: no non-strip block ever read a mi-exact neighbour that disagreed with its \
+             coarse slot -- the gate proves nothing"
+        );
+        eprintln!("{NAME}: pixel-exact, mode_mi_override_hits={total_overrides}");
+    }
+
     #[test]
     #[ignore = "lane-rectx r3 scratch sweep"]
     fn sweep_rectx_recipes() {
