@@ -25,10 +25,8 @@
 #[cfg(test)]
 const CAPABILITY_CLAIMS: &[&str] = &[
     "filter intra on a superblock-level HORZ/VERT strip (never expected -- av1_filter_intra_allowed_bsize caps at 32x32)",
-    "a non-2D tx class on a rectangular transform (never expected at this size)",
     "a non-DC chroma mode on an 8x8 inter-frame leaf (this encoder never writes one)",
     "a nonzero angle delta (this encoder never writes one)",
-    "a tx_type symbol on a rectangular transform (never expected at this size)",
 ];
 
 #[cfg(test)]
@@ -37,7 +35,6 @@ const REFUSALS: &[&str] = &[
     "a coded (non-skip) HORZ_B/VERT_B rect strip below 16x16 (this decoder ports only the skip case at this size)",
     "a coded (non-skip) HORZ/VERT rect strip below 16x16 (this decoder ports only the skip case at this size)",
     "a HORZ_A/HORZ_B/VERT_A partition below 16x16 (this decoder codes only the square arms, HORZ, VERT, VERT_B, and a clean split below 16x16)",
-    "a HORZ/VERT partition below 8x8 (this decoder's transform primitive is square-only; 4x8/8x4 need a real rectangular transform)",
     "an inter partition below 8x8 (this decoder codes no inter leaf smaller than 8x8; lane-sub8 scoped to intra)",
     "a 16x16 block whose true edge cuts through both axes needs a rectangular transform this decoder does not code yet",
     "a 16x16 inter block whose true edge cuts through both axes needs a rectangular transform this decoder does not code yet",
