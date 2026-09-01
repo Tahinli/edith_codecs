@@ -2943,16 +2943,11 @@ mod tests {
     /// was refused by name until this round; the straddle path always ran the
     /// same loop, so only [`decode::inter_sub16_split_hits`] -- which counts
     /// interior splits only -- proves the newly-lifted alphabet value fired.
+    // lane-inter8 r2: GREEN. The neighbour side bands are mi-granular, every
+    // leaf stamps its own 2x2-mi span (including the compound-return path
+    // that used to skip `record_mi` entirely) and the compound
+    // group/index contexts read the LEAF's mi cell, not its 16x16's corner.
     #[test]
-    // lane-inter8 r1: RED, and ignored rather than deleted. The 16x16-level
-    // interior `PARTITION_SPLIT` and its four 8x8 leaves now decode without a
-    // refusal, and the mode-info range ladder matches aomdec's `EC_MODE` for
-    // 42 blocks, but block mi=(6,12) still diverges: `Neighbours`' above_*/
-    // left_* arrays are 16x16-granular, so the LEFT neighbour of leaf (6,12)
-    // resolves to whatever the previous 16x16 recorded rather than to that
-    // block's own bottom-right leaf (6,10). Un-ignore when the arrays are
-    // mi-granular (see lanes/inter8-r1.report.md).
-    #[ignore = "lane-inter8 r1: 8x8 leaf neighbour arrays are still 16x16-granular"]
     fn a_real_aomenc_inter_sequence_with_an_8x8_leaf_split_decodes_pixel_exact() {
         inter_sb_none_gate(
             "a_real_aomenc_inter_sequence_with_an_8x8_leaf_split_decodes_pixel_exact",
@@ -2965,15 +2960,15 @@ mod tests {
     }
 
     #[test]
-    // lane-inter8 r1: RED, and ignored rather than deleted. The 16x16-level
-    // interior `PARTITION_SPLIT` and its four 8x8 leaves now decode without a
-    // refusal, and the mode-info range ladder matches aomdec's `EC_MODE` for
-    // 42 blocks, but block mi=(6,12) still diverges: `Neighbours`' above_*/
-    // left_* arrays are 16x16-granular, so the LEFT neighbour of leaf (6,12)
-    // resolves to whatever the previous 16x16 recorded rather than to that
-    // block's own bottom-right leaf (6,10). Un-ignore when the arrays are
-    // mi-granular (see lanes/inter8-r1.report.md).
-    #[ignore = "lane-inter8 r1: 8x8 leaf neighbour arrays are still 16x16-granular"]
+    // lane-inter8 r2: still RED, and ignored rather than deleted -- the 8-bit
+    // twin above is green, this 10-bit recipe stops at "an INTER 32x32
+    // partition type this decoder does not code (value=9)". That is OUR
+    // desync, proven: `EC_TRACE=1 aomdec` on the pinned stream reads
+    // 16 `bsize=9 value=3` (SPLIT) partitions and never a single value=9
+    // anywhere (class refusal-from-own-desync; the r1 ledger line claiming
+    // aomenc emits PARTITION_VERT_4 despite --enable-1to4-partitions=0 is
+    // hereby disproven). The divergence itself is not yet bisected.
+    #[ignore = "lane-inter8 r2: 10-bit twin still desyncs (surfaces as a bogus 32x32 value=9 refusal); 8-bit gate is green"]
     fn a_real_aomenc_10bit_inter_sequence_with_an_8x8_leaf_split_decodes_pixel_exact() {
         inter_sb_none_gate(
             "a_real_aomenc_10bit_inter_sequence_with_an_8x8_leaf_split_decodes_pixel_exact",
