@@ -1583,6 +1583,21 @@ pub(crate) fn angle_delta_hits() -> usize {
 pub(crate) fn tx_class1_hits() -> usize {
     TX_CLASS1_HITS.with(|c| c.get())
 }
+
+// How many `PARTITION_SPLIT` decisions below an 8x8 block (four independent
+// `BLOCK_4X4` leaves, spec `decode_partition`'s `bSize < BLOCK_8X8` recursion
+// bottom) this thread's decode actually reconstructed -- the same
+// before/after counter pattern as [`TX_CLASS1_HITS`], proving a stream
+// genuinely exercised the sub-8x8 leaf path rather than every attempt
+// coincidentally landing on `PARTITION_NONE`.
+thread_local! {
+    static SUB8_SPLIT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`SUB8_SPLIT_HITS`].
+pub(crate) fn sub8_split_hits() -> usize {
+    SUB8_SPLIT_HITS.with(|c| c.get())
+}
 const SUB_MI: u32 = 4;
 const MI: usize = 4;
 const SB: usize = 64;
@@ -2486,6 +2501,26 @@ struct Neighbours {
     /// one was coded at 8x8.
     above_side_mi: Vec<usize>,
     left_side_mi: Vec<usize>,
+    /// The luma `mode` of the last `BLOCK_4X4` leaf decoded at each mi column
+    /// / row, with the mi position it was written at
+    /// (`(usize::MAX, _)` = never written). `above_mode`/`left_mode` are on
+    /// the coarse 16x16 grid, which cannot distinguish the two 4x4 leaves an
+    /// 8x8 `PARTITION_SPLIT` puts in one mi column; libaom's intra-mode
+    /// context reads `mi(row, col-1)`/`mi(row-1, col)` exactly, so a sub-8x8
+    /// leaf whose neighbour is another split group needs that group's leaf 3
+    /// (bottom-right), not the leaf the coarse slot happens to hold. Written
+    /// and read only by [`decode_leaf_split4`]; the position guard makes it
+    /// fall back to the coarse slot whenever the real neighbour was a block
+    /// of 8x8 or larger (whose one mode is correct for every row it spans).
+    sub8_mode_col: Vec<(usize, usize)>,
+    sub8_mode_row: Vec<(usize, usize)>,
+    /// The `uv_mode` twin of `sub8_mode_col`/`sub8_mode_row` (lane-sub8 r5):
+    /// chroma's edge-filter type reads the CHROMA neighbour's `uv_mode`
+    /// (`get_intra_edge_filter_type`, reconintra.c:974), and the coarse
+    /// [`SUB`] slots cannot name it once a 16x16 is split into 8x8 leaves --
+    /// the leaf above writes the same row slot the block to the left owns.
+    uv_mode_col: Vec<(usize, usize)>,
+    uv_mode_row: Vec<(usize, usize)>,
     /// Whether the block above/left of this column/row was coded `skip` --
     /// an inter frame's own `skip` context (spec `SkipContext`), which the
     /// key-frame writer never tracks (its skip context is always zero); a
@@ -2633,6 +2668,10 @@ impl Neighbours {
             left_side: vec![SB; rows],
             above_side_mi: vec![SB; cols * (SUB / MI)],
             left_side_mi: vec![SB; rows * (SUB / MI)],
+            sub8_mode_col: vec![(usize::MAX, 0); cols * (SUB / MI)],
+            sub8_mode_row: vec![(usize::MAX, 0); rows * (SUB / MI)],
+            uv_mode_col: vec![(usize::MAX, 0); cols * (SUB / MI)],
+            uv_mode_row: vec![(usize::MAX, 0); rows * (SUB / MI)],
             above_txfm: vec![TXFM_CTX_INIT; cols * (SUB / MI)],
             left_txfm: vec![TXFM_CTX_INIT; rows * (SUB / MI)],
             // lane-inter8 r2: mi(4px)-granular, not [`SUB`]-granular -- an
@@ -2715,6 +2754,14 @@ impl Neighbours {
             self.above_comp_group_idx[i] = 0;
             self.above_compound_idx[i] = 0;
             self.above_filter[i] = [3u8; 2];
+        }
+        // lane-sub8 r6: the mi-granular column maps are per tile too -- a
+        // stale `(row, mode)` from the tile to the LEFT names an mi row this
+        // tile's first block would read as its own above neighbour.
+        let mcol_end = col1_mi.min(self.sub8_mode_col.len());
+        for i in col0_mi.min(mcol_end)..mcol_end {
+            self.sub8_mode_col[i] = (usize::MAX, 0);
+            self.uv_mode_col[i] = (usize::MAX, 0);
         }
     }
 
@@ -2984,6 +3031,10 @@ impl Neighbours {
         self.left_comp_group_idx.iter_mut().for_each(|r| *r = 0);
         self.left_compound_idx.iter_mut().for_each(|r| *r = 0);
         self.left_filter.iter_mut().for_each(|f| *f = [3u8; 2]);
+        // lane-sub8 r6: mi-granular row maps reset with the rest of the left
+        // context (a tile/SB-row boundary has no left neighbour).
+        self.sub8_mode_row.iter_mut().for_each(|s| *s = (usize::MAX, 0));
+        self.uv_mode_row.iter_mut().for_each(|s| *s = (usize::MAX, 0));
     }
 
     /// Records a block's `skip`/`is_inter`/`interp_filter` state for the next
@@ -3272,6 +3323,85 @@ impl Neighbours {
     /// [`Self::partition_ctx`]) are the neighbour's own width/height per the
     /// spec's per-edge partition-context rule, so a true rectangular block
     /// naturally wants two different values here rather than one.
+    /// Writes this block's luma `mode` into the mi-granular
+    /// [`Self::sub8_mode_col`]/[`Self::sub8_mode_row`] maps, keyed by the mi
+    /// position a *later* neighbour would read it from: the block's LAST mi
+    /// row for every column it spans (what the block below reads via
+    /// `mi(row-1, col)`) and its LAST mi column for every row (what the
+    /// block to the right reads via `mi(row, col-1)`). Only sub-8x8 leaves
+    /// read these back, and only when the recorded position is exactly their
+    /// own neighbour -- see [`Self::sub8_mode_col`]'s doc.
+    fn record_mode_mi(&mut self, mi_r: usize, mi_c: usize, mi_w: usize, mi_h: usize, mode: usize) {
+        let (last_r, last_c) = (mi_r + mi_h - 1, mi_c + mi_w - 1);
+        for cell in 0..mi_w {
+            if let Some(slot) = self.sub8_mode_col.get_mut(mi_c + cell) {
+                *slot = (last_r, mode);
+            }
+        }
+        for cell in 0..mi_h {
+            if let Some(slot) = self.sub8_mode_row.get_mut(mi_r + cell) {
+                *slot = (last_c, mode);
+            }
+        }
+    }
+
+    /// The mi-exact above/left neighbour luma mode for a block whose top-left
+    /// mi is `(mi_r, mi_c)`, or `None` when no block has recorded that exact
+    /// mi position (then the coarse [`SUB`]-grid slot is right by
+    /// construction). See [`Self::record_mode_mi`].
+    fn mode_above_mi(&self, mi_r: usize, mi_c: usize) -> Option<usize> {
+        match self.sub8_mode_col.get(mi_c) {
+            Some(&(row, m)) if mi_r > self.tile_row0_mi && row == mi_r - 1 => Some(m),
+            _ => None,
+        }
+    }
+
+    fn mode_left_mi(&self, mi_r: usize, mi_c: usize) -> Option<usize> {
+        match self.sub8_mode_row.get(mi_r) {
+            Some(&(col, m)) if mi_c > self.tile_col0_mi && col == mi_c - 1 => Some(m),
+            _ => None,
+        }
+    }
+
+    /// [`Self::record_mode_mi`] for the block's `uv_mode`, into
+    /// [`Self::uv_mode_col`]/[`Self::uv_mode_row`].
+    fn record_uv_mode_mi(
+        &mut self,
+        mi_r: usize,
+        mi_c: usize,
+        mi_w: usize,
+        mi_h: usize,
+        uv_mode: usize,
+    ) {
+        let (last_r, last_c) = (mi_r + mi_h - 1, mi_c + mi_w - 1);
+        for cell in 0..mi_w {
+            if let Some(slot) = self.uv_mode_col.get_mut(mi_c + cell) {
+                *slot = (last_r, uv_mode);
+            }
+        }
+        for cell in 0..mi_h {
+            if let Some(slot) = self.uv_mode_row.get_mut(mi_r + cell) {
+                *slot = (last_c, uv_mode);
+            }
+        }
+    }
+
+    /// Whether either mi-exact chroma neighbour of the block at `(mi_r, mi_c)`
+    /// coded a smooth `uv_mode` -- libaom's `intra_edge_filter_type` for
+    /// planes 1/2. Falls back to the coarse [`SUB`] slot on whichever axis no
+    /// block has recorded the exact neighbouring mi.
+    fn smooth_uv_neighbour(&self, mi_r: usize, mi_c: usize, r: usize, c: usize) -> bool {
+        let above = match self.uv_mode_col.get(mi_c) {
+            Some(&(row, m)) if mi_r > self.tile_row0_mi && row == mi_r - 1 => m,
+            _ => self.above_uv_mode[c],
+        };
+        let left = match self.uv_mode_row.get(mi_r) {
+            Some(&(col, m)) if mi_c > self.tile_col0_mi && col == mi_c - 1 => m,
+            _ => self.left_uv_mode[r],
+        };
+        is_smooth_mode(above) || is_smooth_mode(left)
+    }
+
     fn record_rect(
         &mut self,
         at: (usize, usize),
@@ -3292,6 +3422,8 @@ impl Neighbours {
             self.left_uv_mode[r + cell] = uv_mode;
             self.left_side[r + cell] = h;
         }
+        self.record_mode_mi(r * (SUB / MI), c * (SUB / MI), w / MI, h / MI, mode);
+        self.record_uv_mode_mi(r * (SUB / MI), c * (SUB / MI), w / MI, h / MI, uv_mode);
         self.record_mi_rect((r * (SUB / MI), c * (SUB / MI)), w, h, grids);
     }
 
@@ -3421,6 +3553,8 @@ impl Neighbours {
         }
         let (mi_r, mi_c) = (r * (SUB / MI), c * (SUB / MI));
         let (w_mi, h_mi) = (w / MI, h / MI);
+        self.record_mode_mi(mi_r, mi_c, w_mi, h_mi, mode);
+        self.record_uv_mode_mi(mi_r, mi_c, w_mi, h_mi, uv_mode);
         for cell in 0..h_mi {
             self.left_side_mi[mi_r + cell] = h;
         }
@@ -4734,6 +4868,11 @@ fn decode_leaf_rect(
             vec![0i32; chroma_w * chroma_h],
         ],
     );
+    // lane-sub8 r6: the caller patches only the coarse `above_mode`/
+    // `left_mode` slot (one value for the whole 16x16), so record this
+    // strip's own span mi-exactly like every square leaf does.
+    neighbours.record_mode_mi(leaf_mi.0, leaf_mi.1, mi_w, mi_h, mode);
+    neighbours.record_uv_mode_mi(leaf_mi.0, leaf_mi.1, mi_w, mi_h, uv_predict_mode);
     neighbours.fill_skip_grid_rect(leaf_mi, mi_w, mi_h, skip);
     neighbours.fill_lf_grid_rect(leaf_mi, mi_w, mi_h, bw as u8, bh as u8, 0);
     Ok(mode)
@@ -5182,7 +5321,7 @@ fn read_intra_mode(
     }
     let skip = dec.symbol(&mut cdfs.skip[skip_ctx]) != 0;
     if trace {
-        eprintln!("TRACE skip value={}", skip as i32);
+        eprintln!("TRACE skip value={} rng={}", skip as i32, dec.debug_state().0);
     }
     istep!("skip", skip as i32);
     if !seg_id_pre_skip() {
@@ -5228,7 +5367,7 @@ fn read_intra_mode(
     let left_ctx = INTRA_MODE_CTX[left_mode];
     let mode = dec.symbol(&mut cdfs.kf_y_mode[above_ctx][left_ctx]);
     if trace {
-        eprintln!("TRACE y_mode ctx=({above_ctx},{left_ctx}) value={mode}");
+        eprintln!("TRACE y_mode ctx=({above_ctx},{left_ctx}) value={mode} rng={}", dec.debug_state().0);
     }
     istep!("mode", mode as i32);
     let angle_delta_y = if (V_PRED..=D67_PRED).contains(&mode) {
@@ -5250,7 +5389,7 @@ fn read_intra_mode(
         dec.symbol(&mut cdfs.uv_mode_no_cfl[mode])
     };
     if trace {
-        eprintln!("TRACE uv_mode cfl={cfl} y_mode={mode} value={uv_mode}");
+        eprintln!("TRACE uv_mode cfl={cfl} y_mode={mode} value={uv_mode} rng={}", dec.debug_state().0);
     }
     istep!("uv_mode", uv_mode as i32);
     let alpha = if cfl && uv_mode == UV_CFL_PRED {
@@ -5369,7 +5508,7 @@ fn read_intra_mode(
         let use_filter_intra = dec.symbol(&mut cdfs.filter_intra[class]) != 0;
         if trace {
             eprintln!(
-                "TRACE use_filter_intra side={side} value={}",
+                "TRACE use_filter_intra side={side} rng={} value={}", dec.debug_state().0,
                 use_filter_intra as i32
             );
         }
@@ -6400,9 +6539,26 @@ fn decode_leaf8(
             left_mode = pmode;
         }
     }
-    // See [`PlaneBuf::reconstruct`]'s doc: chroma stays `false` (exact) until
-    // a smooth/paeth `uv_mode` can reach decode at all.
+    // The mi-exact neighbour wins over both the coarse 16x16 slot and
+    // `prev_leaf`: one 16x16 slot cannot hold the two different modes its
+    // two 8x8 (or four 4x4) columns leave behind, so a leaf whose above/left
+    // neighbour sits in a split cell read the wrong `kf_y_mode` row.
+    if let Some(m) = neighbours.mode_above_mi(leaf_mi.0, leaf_mi.1) {
+        above_mode = m;
+    }
+    if let Some(m) = neighbours.mode_left_mi(leaf_mi.0, leaf_mi.1) {
+        left_mode = m;
+    }
     let smooth_neighbor = is_smooth_mode(above_mode) || is_smooth_mode(left_mode);
+    // Chroma's edge-filter type reads the CHROMA neighbour's `uv_mode`
+    // (`get_intra_edge_filter_type`, reconintra.c:974), never the luma mode
+    // this leaf's `smooth_neighbor` is built from -- passing `false` here
+    // filtered a directional chroma block's edge at the wrong strength
+    // (lane-sub8 r5: 4 pixels of one 8x8 leaf's chroma, deltas 1..3).
+    // The `uv_mode` neighbours are mi-exact (`uv_mode_col`/`uv_mode_row`),
+    // with the coarse [`SUB`] slot as the fallback when no block recorded
+    // that exact mi cell.
+    let smooth_neighbor_uv = neighbours.smooth_uv_neighbour(leaf_mi.0, leaf_mi.1, r, c);
     if smooth_neighbor {
         SMOOTH_LUMA_HITS.with(|c| c.set(c.get() + 1));
     }
@@ -6431,6 +6587,9 @@ fn decode_leaf8(
     } else {
         uv_mode
     };
+    neighbours.above_uv_mode[c] = uv_predict_mode;
+    neighbours.left_uv_mode[r] = uv_predict_mode;
+    neighbours.record_uv_mode_mi(leaf_mi.0, leaf_mi.1, 2, 2, uv_predict_mode);
     // `TxMode::Select`'s `tx_depth` at an 8x8 leaf (spec 5.11.16): the only
     // depths an 8x8 block offers are `TX8` (depth 0) and `TX4` (depth 1,
     // which splits the leaf's own 8x8 prediction into a 2x2 grid of 4x4
@@ -6469,7 +6628,7 @@ fn decode_leaf8(
             &vec![0i32; 16],
             alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
             None,
-            false,
+            smooth_neighbor_uv,
         );
         v.reconstruct(
             cpx,
@@ -6481,7 +6640,7 @@ fn decode_leaf8(
             &vec![0i32; 16],
             alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
             None,
-            false,
+            smooth_neighbor_uv,
         );
         luma_grid = vec![0i32; 64];
         u_grid = vec![0i32; 16];
@@ -6535,7 +6694,7 @@ fn decode_leaf8(
             alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
             None,
             None,
-            false,
+            smooth_neighbor_uv,
         )?;
         v_grid = read_plane(
             dec,
@@ -6557,7 +6716,7 @@ fn decode_leaf8(
             alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
             None,
             None,
-            false,
+            smooth_neighbor_uv,
         )?;
     } else {
         // `tx_depth` resolved this leaf's luma to `TX4`: a 2x2 raster-order
@@ -6633,7 +6792,7 @@ fn decode_leaf8(
             alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)),
             None,
             None,
-            false,
+            smooth_neighbor_uv,
         )?;
         v_grid = read_plane(
             dec,
@@ -6655,7 +6814,7 @@ fn decode_leaf8(
             alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)),
             None,
             None,
-            false,
+            smooth_neighbor_uv,
         )?;
         // `record_split_luma` expects a `record`-style `(r, c)` position in
         // `SUB`-grid units and rescales it by `SUB / MI`; `leaf_mi` is
@@ -6687,12 +6846,288 @@ fn decode_leaf8(
         }
         neighbours.fill_skip_grid(leaf_mi, 2, skip);
         neighbours.fill_lf_grid(leaf_mi, 2, 4, 0);
+        neighbours.record_mode_mi(leaf_mi.0, leaf_mi.1, 2, 2, mode);
         return Ok(mode);
     }
     neighbours.record_mi(leaf_mi, 8, &[luma_grid, u_grid, v_grid]);
     neighbours.fill_skip_grid(leaf_mi, 2, skip);
     neighbours.fill_lf_grid(leaf_mi, 2, 8, 0);
+    neighbours.record_mode_mi(leaf_mi.0, leaf_mi.1, 2, 2, mode);
     Ok(mode)
+}
+
+/// `read_intra_frame_mode_info`'s mode-info read for one `BLOCK_4X4` leaf
+/// below an 8x8 partition (spec `decode_partition`'s `bSize < BLOCK_8X8`
+/// bottom, where no partition symbol is read at all -- `decode_block` runs
+/// directly). No palette (`av1_allow_palette` needs both dims >= 8, spec
+/// blockd.h) and no `read_tx_size` (a sub-8x8 block's transform is always
+/// its own bsize, spec 5.11.16). `has_chroma` follows `is_chroma_reference`
+/// (spec/libaom `av1_common_int.h`): for 4:2:0, only the bottom-right leaf
+/// of the 2x2 4x4 group carries chroma syntax at all.
+#[allow(clippy::too_many_arguments)]
+fn read_intra_mode_sub8(
+    dec: &mut SymbolDecoder,
+    cdfs: &mut Cdfs,
+    above_mode: usize,
+    left_mode: usize,
+    has_chroma: bool,
+    enable_filter_intra: bool,
+    skip_ctx: usize,
+    allow_intrabc: bool,
+    mi_r: usize,
+    mi_c: usize,
+) -> Result<(bool, usize, i32, Option<(usize, i32, Option<(i32, i32)>)>, Option<usize>)> {
+    let trace = std::env::var_os("EC_AV1_TRACE").is_some();
+    let skip = dec.symbol(&mut cdfs.skip[skip_ctx]) != 0;
+    if trace {
+        eprintln!("TRACE sub8 skip mi=({mi_r},{mi_c}) ctx={skip_ctx} value={} rng={}", skip as i32, dec.debug_state().0);
+    }
+    maybe_read_cdef_idx(dec, mi_r, mi_c, skip);
+    maybe_read_delta_q(dec, cdfs, mi_r, mi_c, false, skip);
+    maybe_read_delta_lf(dec, cdfs, mi_r, mi_c, false, skip);
+    if allow_intrabc {
+        let use_intrabc = dec.symbol(&mut cdfs.intrabc) != 0;
+        if use_intrabc {
+            return Err(unsupported(
+                "a sub-8x8 leaf that uses intrabc (this reader has no block-vector path; the 8x8-and-up reader reconstructs one)",
+            ));
+        }
+    }
+    let above_ctx = INTRA_MODE_CTX[above_mode];
+    let left_ctx = INTRA_MODE_CTX[left_mode];
+    let mode = dec.symbol(&mut cdfs.kf_y_mode[above_ctx][left_ctx]);
+    if trace {
+        eprintln!("TRACE sub8 y_mode mi=({mi_r},{mi_c}) ctx=({above_ctx},{left_ctx}) value={mode} rng={}", dec.debug_state().0);
+    }
+    // No `angle_delta` at all below 8x8: spec 5.11.6's `intra_angle_info_y`/
+    // `_uv` are gated on `MiSize >= BLOCK_8X8` (libaom `av1_use_angle_delta`,
+    // blockd.h), so a directional mode on a `BLOCK_4X4` leaf carries no delta
+    // symbol. Reading one consumed a symbol the encoder never wrote and
+    // desynced the tile at the very next element.
+    let angle_delta_y = 0;
+    let chroma = if has_chroma {
+        let uv_mode = dec.symbol(&mut cdfs.uv_mode_cfl[mode]);
+        if trace {
+            eprintln!("TRACE sub8 uv_mode value={uv_mode} rng={}", dec.debug_state().0);
+        }
+        if (9..=12).contains(&uv_mode) {
+            SMOOTH_UV_HITS.with(|c| c.set(c.get() + 1));
+        }
+        let alpha = if uv_mode == UV_CFL_PRED {
+            Some(read_cfl_alphas(dec, cdfs))
+        } else {
+            None
+        };
+        if (V_PRED..=D67_PRED).contains(&uv_mode) {
+            DIRECTIONAL_UV_HITS.with(|c| c.set(c.get() + 1));
+        }
+        // See the luma comment above: no angle delta below 8x8.
+        let angle_delta_uv = 0;
+        Some((uv_mode, angle_delta_uv, alpha))
+    } else {
+        None
+    };
+    let mut filter_intra = None;
+    if mode == DC_PRED && enable_filter_intra {
+        // `BLOCK_4X4`'s own row (class 0, `filter_intra_size_class(4)`) --
+        // every sub-8x8 leaf here is a `BLOCK_4X4`.
+        let use_filter_intra = dec.symbol(&mut cdfs.filter_intra[0]) != 0;
+        if trace {
+            eprintln!("TRACE sub8 use_filter_intra value={}", use_filter_intra as i32);
+        }
+        if use_filter_intra {
+            FILTER_INTRA_HITS.with(|c| c.set(c.get() + 1));
+            let fi_mode = dec.symbol(&mut cdfs.filter_intra_mode);
+            filter_intra = Some(fi_mode);
+        }
+    }
+    Ok((skip, mode, angle_delta_y, chroma, filter_intra))
+}
+
+/// Decodes a `PARTITION_SPLIT` of one 8x8 block into four `BLOCK_4X4` leaves
+/// (spec `decode_partition`'s recursion bottom), sharing [`decode_leaf8`]'s
+/// own signature so its caller's `prev_leaf`/`above_mode`/`left_mode`
+/// bookkeeping needs no change. Each leaf reads its own luma mode info,
+/// neighboured off the *previously decoded leaf in this same group* on
+/// whichever axis is adjacent (mirroring [`decode_leaf8`]'s own `prev_leaf`
+/// pattern, one level deeper); chroma is read and reconstructed exactly
+/// once, on the last (bottom-right) leaf, at the whole 8x8 group's own 4x4
+/// chroma unit -- [`read_intra_mode_sub8`]'s doc has the `is_chroma_reference`
+/// derivation.
+#[allow(clippy::too_many_arguments)]
+fn decode_leaf_split4(
+    dec: &mut SymbolDecoder,
+    cdfs: &mut Cdfs,
+    neighbours: &mut Neighbours,
+    outer_at: (usize, usize),
+    leaf_mi: (usize, usize),
+    scan4: &[u16],
+    prev_leaf: Option<((usize, usize), usize)>,
+    y: &mut PlaneBuf,
+    u: &mut PlaneBuf,
+    v: &mut PlaneBuf,
+    base_q_idx: u8,
+    enable_filter_intra: bool,
+    allow_intrabc: bool,
+    reduced_tx_set: bool,
+    // Returns `(below_mode, right_mode)`: the mode a neighbour BELOW this 8x8
+    // group sees (its bottom-left 4x4, libaom reads mi(row-1, col)) and the
+    // one a neighbour to its RIGHT sees (its top-right 4x4, mi(row, col-1)).
+) -> Result<(usize, usize)> {
+    SUB8_SPLIT_HITS.with(|c| c.set(c.get() + 1));
+    let (r, c) = outer_at;
+    let mut above_mode = neighbours.above_mode[c];
+    let mut left_mode = neighbours.left_mode[r];
+    if let Some(((pr, pc), pmode)) = prev_leaf {
+        if pc == leaf_mi.1 && leaf_mi.0 == pr + 2 {
+            above_mode = pmode;
+        } else if pr == leaf_mi.0 && leaf_mi.1 == pc + 2 {
+            left_mode = pmode;
+        }
+    }
+    // See `decode_leaf8`'s own `smooth_neighbor_uv`: the chroma edge-filter
+    // type is the chroma neighbours' `uv_mode`, mi-exact where recorded.
+    let smooth_neighbor_uv = neighbours.smooth_uv_neighbour(leaf_mi.0, leaf_mi.1, r, c);
+    let mut leaf_modes = [0usize; 4];
+    let mut leaf_skips = [false; 4];
+    let mut last_uv: Option<(usize, i32, Option<(i32, i32)>)> = None;
+    for i in 0..4usize {
+        let (dr, dc) = (i / 2, i % 2);
+        let lmi = (leaf_mi.0 + dr, leaf_mi.1 + dc);
+        // Neighbour modes at real mi granularity: inside the group the
+        // sibling leaf, outside it the split-leaf map when the adjacent mi
+        // was itself a 4x4 leaf, else the coarse 16x16 slot (see
+        // `sub8_mode_col`'s doc).
+        let leaf_above = if dr == 0 {
+            neighbours.mode_above_mi(lmi.0, lmi.1).unwrap_or(above_mode)
+        } else {
+            leaf_modes[i - 2]
+        };
+        let leaf_left = if dc == 0 {
+            neighbours.mode_left_mi(lmi.0, lmi.1).unwrap_or(left_mode)
+        } else {
+            leaf_modes[i - 1]
+        };
+        let has_chroma = i == 3;
+        let skip_ctx = neighbours.skip_txfm_ctx(lmi.0, lmi.1);
+        let (skip, mode, angle_delta_y, chroma, filter_intra) = read_intra_mode_sub8(
+            dec, cdfs, leaf_above, leaf_left, has_chroma, enable_filter_intra, skip_ctx,
+            allow_intrabc, lmi.0, lmi.1,
+        )?;
+        leaf_modes[i] = mode;
+        leaf_skips[i] = skip;
+        neighbours.record_mode_mi(lmi.0, lmi.1, 1, 1, mode);
+        let smooth_neighbor = is_smooth_mode(leaf_above) || is_smooth_mode(leaf_left);
+        if smooth_neighbor {
+            SMOOTH_LUMA_HITS.with(|c| c.set(c.get() + 1));
+        }
+        let (px, py) = (lmi.1 * MI, lmi.0 * MI);
+        let reach = Reach::of(4, px, py, y.width, y.height);
+        if skip {
+            y.reconstruct(px, py, 4, mode, angle_delta_y, reach, &vec![0i32; 16], None, filter_intra, smooth_neighbor);
+            neighbours.record_mi_luma(lmi, 4, &vec![0i32; 16]);
+        } else {
+            let tu_around = neighbours.around_mi(lmi, 4)[0];
+            // A `BLOCK_4X4` leaf's luma TU *is* the whole block, so libaom's
+            // `get_txb_ctx` takes its `plane_bsize == txsize_to_bsize[tx_size]`
+            // branch: `txb_skip_ctx = 0`, never the neighbour-magnitude table
+            // (`txb_common.h:400`). Reading the table here decoded `all_zero`
+            // off the wrong CDF on the very first leaf and desynced the tile.
+            let tu_grid = read_plane(
+                dec,
+                cdfs,
+                if reduced_tx_set { TxbSet::Luma4 } else { TxbSet::Luma4Set1 },
+                scan4,
+                0,
+                tu_around,
+                mode,
+                mode,
+                angle_delta_y,
+                reach,
+                y,
+                px,
+                py,
+                4,
+                4,
+                base_q_idx,
+                None,
+                filter_intra,
+                None,
+                smooth_neighbor,
+            )?;
+            neighbours.record_mi_luma(lmi, 4, &tu_grid);
+        }
+        neighbours.fill_skip_grid(lmi, 1, skip);
+        neighbours.fill_lf_grid(lmi, 1, 4, 0);
+        if has_chroma {
+            last_uv = chroma;
+        }
+    }
+    let (gpx, gpy) = (leaf_mi.1 * MI, leaf_mi.0 * MI);
+    let (cpx, cpy) = (gpx / 2, gpy / 2);
+    let group_reach = Reach::of(8, gpx, gpy, y.width, y.height);
+    let (uv_mode, angle_delta_uv, alpha) =
+        last_uv.expect("i==3 always sets has_chroma, so chroma is always Some");
+    let uv_predict_mode = if uv_mode == UV_CFL_PRED { DC_PRED } else { uv_mode };
+    neighbours.above_uv_mode[c] = uv_predict_mode;
+    neighbours.left_uv_mode[r] = uv_predict_mode;
+    neighbours.record_uv_mode_mi(leaf_mi.0, leaf_mi.1, 2, 2, uv_predict_mode);
+    let (u_grid, v_grid): (Vec<i32>, Vec<i32>) = if leaf_skips[3] {
+        u.reconstruct(cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], None, None, smooth_neighbor_uv);
+        v.reconstruct(cpx, cpy, 4, uv_predict_mode, angle_delta_uv, group_reach, &vec![0i32; 16], None, None, smooth_neighbor_uv);
+        (vec![0i32; 16], vec![0i32; 16])
+    } else {
+        let ac = alpha.map(|_| cfl_ac_q3(y, gpx, gpy, 8));
+        let chroma_around = neighbours.around_mi(leaf_mi, 8);
+        let ug = read_plane(
+            dec, cdfs, TxbSet::Chroma4, scan4, 1, chroma_around[1], uv_mode, uv_predict_mode,
+            angle_delta_uv, group_reach, u, cpx, cpy, 4, TX4, base_q_idx,
+            alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)), None, None, smooth_neighbor_uv,
+        )?;
+        let vg = read_plane(
+            dec, cdfs, TxbSet::Chroma4, scan4, 2, chroma_around[2], uv_mode, uv_predict_mode,
+            angle_delta_uv, group_reach, v, cpx, cpy, 4, TX4, base_q_idx,
+            alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)), None, None, smooth_neighbor_uv,
+        )?;
+        (ug, vg)
+    };
+    // Chroma neighbour bookkeeping for the whole 8x8 group -- mirrors
+    // [`decode_leaf8`]'s own tx4-chroma section (`record_split_luma`'s
+    // rescaling is wrong for an already-mi-unit position, so this inlines
+    // its tail directly at `leaf_mi`, side_mi=2), EXCEPT for the partition
+    // context value itself. Unlike `decode_leaf8`'s TX4 branch (still one
+    // `BLOCK_8X8`, `PARTITION_NONE`, transform depth only), this group is
+    // genuinely four `BLOCK_4X4` blocks (`PARTITION_SPLIT` at the 8x8
+    // level, libaom `decode_partition`'s `bsize2`/`subsize` recursion
+    // bottom). libaom's `update_ext_partition_context` writes
+    // `partition_context_lookup[subsize]` at the 8x8 slot -- `{30,30}` for
+    // `BLOCK_8X8` (bit0=0, what `decode_leaf8` already reproduces via
+    // side_mi=8) but `{31,31}` for `BLOCK_4X4` (bit0=1) here, and
+    // `partition_ctx_mi`'s `left_side_mi[mi_r]*2 <= side` needs
+    // `left_side_mi <= 4` to read that bit as 1. Leaving this at 8 (this
+    // round's bug) makes the very next sibling 8x8's `partition_w8` read
+    // with the wrong context and desync immediately.
+    let side_mi = 2;
+    for cell in 0..side_mi {
+        neighbours.left_side_mi[leaf_mi.0 + cell] = 4;
+        neighbours.above_side_mi[leaf_mi.1 + cell] = 4;
+    }
+    let round_up_even = |n: usize| n.div_ceil(2) * 2;
+    let bound_h = round_up_even(neighbours.mi_rows);
+    let bound_w = round_up_even(neighbours.mi_cols);
+    let u_state = neighbour_state(&u_grid);
+    let v_state = neighbour_state(&v_grid);
+    for cell in 0..side_mi {
+        if cell < side_mi.min(bound_h.saturating_sub(leaf_mi.0)) {
+            neighbours.left[leaf_mi.0 + cell][1] = u_state;
+            neighbours.left[leaf_mi.0 + cell][2] = v_state;
+        }
+        if cell < side_mi.min(bound_w.saturating_sub(leaf_mi.1)) {
+            neighbours.above[leaf_mi.1 + cell][1] = u_state;
+            neighbours.above[leaf_mi.1 + cell][2] = v_state;
+        }
+    }
+    Ok((leaf_modes[2], leaf_modes[1]))
 }
 
 /// Spec 7.15.3's `Cdef_Directions`: `(row, col)` offsets for the two primary
@@ -8777,11 +9212,38 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                         // the one or two the edge leaves.
                                         let (mi_row0, mi_col0) =
                                             (sr as u32 * SUB_MI, sc as u32 * SUB_MI);
-                                        let mut prev_leaf: Option<((usize, usize), usize)> = None;
+                                        // Each 8x8 leaf's intra-mode context
+                                        // must see its own siblings: the
+                                        // bottom-left leaf's ABOVE neighbour
+                                        // is leaf 0, not the previously
+                                        // decoded leaf 1 (and the bottom-right
+                                        // leaf's above is leaf 1, while
+                                        // `prev_leaf` only ever carried the
+                                        // immediately preceding one). The
+                                        // coarse `above_mode`/`left_mode`
+                                        // arrays hold one slot per 16x16, so
+                                        // the sibling modes are swapped in
+                                        // around each leaf call and restored
+                                        // after; the loop tail writes the last
+                                        // leaf's mode as before.
+                                                                                let mut sib_modes: [Option<(usize, usize)>; 4] = [None; 4];
                                         for i in 0..4 {
                                             let (mr, mc) =
                                                 (mi_row0 + (i / 2) * 2, mi_col0 + (i % 2) * 2);
                                             let leaf_mi = (mr as usize, mc as usize);
+                                            let li = i as usize;
+                                            let saved_modes =
+                                                (neighbours.above_mode[sc], neighbours.left_mode[sr]);
+                                            if li >= 2 {
+                                                if let Some((below, _)) = sib_modes[li - 2] {
+                                                    neighbours.above_mode[sc] = below;
+                                                }
+                                            }
+                                            if li % 2 == 1 {
+                                                if let Some((_, right)) = sib_modes[li - 1] {
+                                                    neighbours.left_mode[sr] = right;
+                                                }
+                                            }
                                             let leaf_ctx = neighbours.partition_ctx_mi(leaf_mi, 8);
                                             let part8 =
                                                 dec.symbol(&mut cdfs.partition_w8[leaf_ctx]);
@@ -8790,34 +9252,56 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                                     "TRACE partition_w8 mi=({mr},{mc}) ctx={leaf_ctx} value={part8}"
                                                 );
                                             }
-                                            if part8 != PARTITION_NONE {
+                                            let leaf_mode = if part8 == PARTITION_NONE {
+                                                decode_leaf8(
+                                                    &mut dec,
+                                                    &mut cdfs,
+                                                    &mut neighbours,
+                                                    at16,
+                                                    leaf_mi,
+                                                    (&scan8, &scan4),
+                                                    None,
+                                                    &mut y,
+                                                    &mut u,
+                                                    &mut v,
+                                                    base_q_idx,
+                                                    enable_filter_intra,
+                                                    allow_screen_content_tools,
+                                                    allow_intrabc,
+                                                    tx_select,
+                                                    reduced_tx_set,
+                                                ).map(|m| (m, m))?
+                                            } else if part8 == PARTITION_SPLIT {
+                                                decode_leaf_split4(
+                                                    &mut dec,
+                                                    &mut cdfs,
+                                                    &mut neighbours,
+                                                    at16,
+                                                    leaf_mi,
+                                                    &scan4,
+                                                    None,
+                                                    &mut y,
+                                                    &mut u,
+                                                    &mut v,
+                                                    base_q_idx,
+                                                    enable_filter_intra,
+                                                    allow_intrabc,
+                                                    reduced_tx_set,
+                                                )?
+                                            } else {
                                                 return Err(unsupported(
-                                                    "a partition below 8x8 (this decoder codes no leaf smaller than 8x8)",
+                                                    "a HORZ/VERT partition below 8x8 (this decoder's transform primitive is square-only; 4x8/8x4 need a real rectangular transform)",
                                                 ));
-                                            }
-                                            let leaf_mode = decode_leaf8(
-                                                &mut dec,
-                                                &mut cdfs,
-                                                &mut neighbours,
-                                                at16,
-                                                leaf_mi,
-                                                (&scan8, &scan4),
-                                                prev_leaf,
-                                                &mut y,
-                                                &mut u,
-                                                &mut v,
-                                                base_q_idx,
-                                                enable_filter_intra,
-                                                allow_screen_content_tools,
-                                                allow_intrabc,
-                                                tx_select,
-                                                reduced_tx_set,
-                                            )?;
-                                            prev_leaf = Some((leaf_mi, leaf_mode));
+                                            };
+                                            neighbours.above_mode[sc] = saved_modes.0;
+                                            neighbours.left_mode[sr] = saved_modes.1;
+                                            sib_modes[li] = Some(leaf_mode);
                                         }
-                                        if let Some((_, mode)) = prev_leaf {
-                                            neighbours.above_mode[sc] = mode;
-                                            neighbours.left_mode[sr] = mode;
+                                        if let Some((below, _)) = sib_modes[2].or(sib_modes[3]).or(sib_modes[0]) {
+                                            neighbours.above_mode[sc] = below;
+                                        }
+                                        if let Some((_, right)) = sib_modes[1].or(sib_modes[3]).or(sib_modes[0]) {
+                                            neighbours.left_mode[sr] = right;
                                         }
                                         continue;
                                     }
@@ -8851,9 +9335,25 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                         .map(|i| (mi_row0 + (i / 2) * 2, mi_col0 + (i % 2) * 2))
                                         .filter(|&(mr, mc)| mr < mi_rows && mc < mi_cols)
                                         .collect();
-                                    let mut prev_leaf: Option<((usize, usize), usize)> = None;
+                                    // See the sibling-mode note in the clean
+                                    // SPLIT path above.
+                                                                        let mut sib_modes: [Option<(usize, usize)>; 4] = [None; 4];
                                     for (mr, mc) in leaf_positions {
                                         let leaf_mi = (mr as usize, mc as usize);
+                                        let li = (((mr - mi_row0) / 2) * 2 + (mc - mi_col0) / 2)
+                                            as usize;
+                                        let saved_modes =
+                                            (neighbours.above_mode[sc], neighbours.left_mode[sr]);
+                                        if li >= 2 {
+                                            if let Some((below, _)) = sib_modes[li - 2] {
+                                                neighbours.above_mode[sc] = below;
+                                            }
+                                        }
+                                        if li % 2 == 1 {
+                                            if let Some((_, right)) = sib_modes[li - 1] {
+                                                neighbours.left_mode[sr] = right;
+                                            }
+                                        }
                                         let leaf_ctx = neighbours.partition_ctx_mi(leaf_mi, 8);
                                         let part8 = dec.symbol(&mut cdfs.partition_w8[leaf_ctx]);
                                         if std::env::var_os("EC_AV1_TRACE").is_some() {
@@ -8861,30 +9361,50 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                                 "TRACE partition_w8 mi=({mr},{mc}) ctx={leaf_ctx} value={part8}"
                                             );
                                         }
-                                        if part8 != PARTITION_NONE {
+                                        let leaf_mode = if part8 == PARTITION_NONE {
+                                            decode_leaf8(
+                                                &mut dec,
+                                                &mut cdfs,
+                                                &mut neighbours,
+                                                at16,
+                                                leaf_mi,
+                                                (&scan8, &scan4),
+                                                None,
+                                                &mut y,
+                                                &mut u,
+                                                &mut v,
+                                                base_q_idx,
+                                                enable_filter_intra,
+                                                allow_screen_content_tools,
+                                                allow_intrabc,
+                                                tx_select,
+                                                reduced_tx_set,
+                                            ).map(|m| (m, m))?
+                                        } else if part8 == PARTITION_SPLIT {
+                                            decode_leaf_split4(
+                                                &mut dec,
+                                                &mut cdfs,
+                                                &mut neighbours,
+                                                at16,
+                                                leaf_mi,
+                                                &scan4,
+                                                None,
+                                                &mut y,
+                                                &mut u,
+                                                &mut v,
+                                                base_q_idx,
+                                                enable_filter_intra,
+                                                allow_intrabc,
+                                                reduced_tx_set,
+                                            )?
+                                        } else {
                                             return Err(unsupported(
-                                                "a partition below 8x8 (this decoder codes no leaf smaller than 8x8)",
+                                                "a HORZ/VERT partition below 8x8 (this decoder's transform primitive is square-only; 4x8/8x4 need a real rectangular transform)",
                                             ));
-                                        }
-                                        let leaf_mode = decode_leaf8(
-                                            &mut dec,
-                                            &mut cdfs,
-                                            &mut neighbours,
-                                            at16,
-                                            leaf_mi,
-                                            (&scan8, &scan4),
-                                            prev_leaf,
-                                            &mut y,
-                                            &mut u,
-                                            &mut v,
-                                            base_q_idx,
-                                            enable_filter_intra,
-                                            allow_screen_content_tools,
-                                            allow_intrabc,
-                                            tx_select,
-                                            reduced_tx_set,
-                                        )?;
-                                        prev_leaf = Some((leaf_mi, leaf_mode));
+                                        };
+                                        neighbours.above_mode[sc] = saved_modes.0;
+                                        neighbours.left_mode[sr] = saved_modes.1;
+                                        sib_modes[li] = Some(leaf_mode);
                                     }
                                     // `record()`'s `above_mode`/`left_mode`
                                     // write is a no-op at an 8x8 leaf's own
@@ -8892,9 +9412,11 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                     // 16x16 slot's leaves are done, from the
                                     // last leaf (mirrors the writer's r15
                                     // fix).
-                                    if let Some((_, mode)) = prev_leaf {
-                                        neighbours.above_mode[sc] = mode;
-                                        neighbours.left_mode[sr] = mode;
+                                    if let Some((below, _)) = sib_modes[2].or(sib_modes[3]).or(sib_modes[0]) {
+                                        neighbours.above_mode[sc] = below;
+                                    }
+                                    if let Some((_, right)) = sib_modes[1].or(sib_modes[3]).or(sib_modes[0]) {
+                                        neighbours.left_mode[sr] = right;
                                     }
                                 }
                             }
@@ -15212,7 +15734,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     let part8 = dec.symbol(&mut cdfs.partition_w8[leaf_ctx]);
                                     if part8 != PARTITION_NONE {
                                         return Err(unsupported(
-                                            "a partition below 8x8 (this decoder codes no leaf smaller than 8x8)",
+                                            "an inter partition below 8x8 (this decoder codes no inter leaf smaller than 8x8; lane-sub8 scoped to intra)",
                                         ));
                                     }
                                     let (skip, is_inter, skip_mode_leaf, compound_ctx8, leaf_refs) =
