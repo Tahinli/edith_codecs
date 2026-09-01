@@ -869,6 +869,29 @@ pub(crate) fn filter_intra_rect_hits() -> usize {
     FILTER_INTRA_RECT_HITS.with(|c| c.get())
 }
 
+// How many rectangular transform units actually coded coefficients through
+// [`read_coeffs_rect`] (`all_zero == 0`), and how many of those reads hit one
+// of that reader's two 2D-only refusals (lane-rectclass r1). The pair is what
+// makes the class claim measurable: `read_coeffs_rect` handles
+// `TxClass::TwoD` only, so a stream that puts a `V_DCT`/`H_DCT` (or any
+// coded `tx_type` symbol) on a rect TU must show up as a refusal here rather
+// than as a silent desync -- the gate sweeps real aomenc streams and pins
+// both numbers.
+thread_local! {
+    static RECT_COEFF_TU_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static RECT_CLASS1_REFUSALS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`RECT_COEFF_TU_HITS`].
+pub(crate) fn rect_coeff_tu_hits() -> usize {
+    RECT_COEFF_TU_HITS.with(|c| c.get())
+}
+
+/// Current value of [`RECT_CLASS1_REFUSALS`].
+pub(crate) fn rect_class1_refusals() -> usize {
+    RECT_CLASS1_REFUSALS.with(|c| c.get())
+}
+
 // How many [`read_coeffs`] reads resolved a `tx_type` outside `TX_CLASS_2D`
 // (`V_DCT`/`H_DCT`, spec 5.11.39's `TxClass::Horiz`/`Vert`), across every
 // call on the current thread -- the same before/after counter pattern as
@@ -2324,13 +2347,16 @@ fn read_coeffs_rect(
     if all_zero {
         return Ok((grid, TxType::DctDct));
     }
+    RECT_COEFF_TU_HITS.with(|c| c.set(c.get() + 1));
     if coding.tx_type.is_some() {
+        RECT_CLASS1_REFUSALS.with(|c| c.set(c.get() + 1));
         return Err(unsupported(
             "a tx_type symbol on a rectangular transform (never expected at this size)",
         ));
     }
     let tx_type = default_tx_type;
     if TxClass::of(tx_type) != TxClass::TwoD {
+        RECT_CLASS1_REFUSALS.with(|c| c.set(c.get() + 1));
         return Err(unsupported(
             "a non-2D tx class on a rectangular transform (never expected at this size)",
         ));

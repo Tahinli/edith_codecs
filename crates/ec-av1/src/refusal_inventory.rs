@@ -25,6 +25,18 @@
 #[cfg(test)]
 const CAPABILITY_CLAIMS: &[&str] = &[
     "filter intra on a superblock-level HORZ/VERT strip (never expected -- av1_filter_intra_allowed_bsize caps at 32x32)",
+    // lane-rectclass r1 evidence for both rect-transform claims below: the gate
+    // `a_real_aomenc_stream_with_a_1d_tx_class_on_a_rect_transform_decodes_pixel_exact`
+    // sweeps real aomenc streams with `--enable-flip-idtx=1
+    // --enable-tx-size-search=1 --enable-rect-partitions=1` at 8 and 10 bits,
+    // counts every rect transform unit that coded coefficients on a
+    // pixel-compared attempt, and hard-asserts that neither claim ever fired.
+    // The claims hold BY CONSTRUCTION on this tree: the only rect TUs any
+    // reader sees are the intra 32x16/16x32 luma strip (square-up TX_32X32 =>
+    // EXT_TX_SET_DCTONLY, so no tx_type symbol exists) and its intra chroma
+    // siblings (Intra_Mode_To_Tx_Type, all 2D). Every rect shape whose
+    // square-up is <= 16, and every inter rect leaf -- the sets that do carry
+    // V_DCT/H_DCT -- is refused earlier by one of the REFUSALS below.
     "a non-2D tx class on a rectangular transform (never expected at this size)",
     "a non-DC chroma mode on an 8x8 inter-frame leaf (this encoder never writes one)",
     "a nonzero angle delta (this encoder never writes one)",
