@@ -86,3 +86,8 @@ first 0.4s: the blocker there is the below-8x8 partition refusal (lane-sub8's, s
 `memory/`). "Before" was not re-measured on main — the refusal reached is upstream of every
 line this lane touched, so the branch cannot have moved it.
 disposition: deferred(lane-sub8's below-8x8 leaf) — nothing this lane can do about it.
+
+## Suite
+
+`EC_AV1_REQUIRE_AOMENC=1 cargo test -p ec-av1 --lib -j3` (crate lib only, never the workspace):
+**269 passed, 0 failed, 24 ignored**, 1062s. `refusal_inventory` and `gate_coverage` green.
