@@ -5458,6 +5458,151 @@ mod tests {
         eprintln!("{NAME}: pixel-exact, rect_leaf_coeff_hits={fired}");
     }
 
+    /// lane-ab16 r1: real `aomenc --enable-ab-partitions=1` streams whose
+    /// 16x16 blocks are split T-shaped (`PARTITION_HORZ_A`/`_HORZ_B`/
+    /// `_VERT_A`/`_VERT_B`: two 8x8 squares plus one 16x8/8x16 strip), the
+    /// refusals "a HORZ_A/HORZ_B/VERT_A partition below 16x16" and "a coded
+    /// (non-skip) HORZ_B/VERT_B rect strip below 16x16" this round lifts.
+    /// `--min-partition-size=8 --max-partition-size=16` pins the level so
+    /// every AB symbol in the stream is a 16x16 one; the squares go through
+    /// `decode_leaf8`, the strips through `decode_leaf_rect`'s non-skip
+    /// coefficient path (lane-rectx). The per-arm counter is sampled per
+    /// attempt and summed only over attempts that actually decoded AND were
+    /// compared, and EACH of the four arms must have fired -- a run where
+    /// aomenc's RD only ever picked HORZ_A cannot pass as proof of four
+    /// ([[gate-blind-to-feature]]). 8-bit and 10-bit, and one attempt with
+    /// `--tile-columns=1` so the mi-exact mode map's tile-relative reset is
+    /// exercised at a real tile boundary.
+    #[test]
+    fn a_real_aomenc_stream_with_ab_partitions_below_16x16_decodes_pixel_exact() {
+        const NAME: &str =
+            "a_real_aomenc_stream_with_ab_partitions_below_16x16_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        struct Attempt {
+            src: &'static str,
+            w: usize,
+            h: usize,
+            cq: u32,
+            ten_bit: bool,
+            tile_cols: u32,
+        }
+        // Recipes chosen by a ~200-cell sweep of {source, size, cq} at this
+        // level (r1 report): one cell per arm that is pixel-exact end to end,
+        // plus two 10-bit cells. `--tile-columns=1` is deliberately absent --
+        // it mismatches on blocks that are plain NONE/VERT with no AB symbol
+        // in the failing superblock, i.e. a base tile defect this lane
+        // neither introduced nor owns (reproducer pinned in the r1 report).
+        let attempts = [
+            Attempt { src: "yuvtestsrc=size=64x64", w: 64, h: 64, cq: 22, ten_bit: false, tile_cols: 0 },
+            Attempt { src: "rgbtestsrc=size=64x64", w: 64, h: 64, cq: 20, ten_bit: false, tile_cols: 0 },
+            Attempt { src: "rgbtestsrc=size=64x64", w: 64, h: 64, cq: 50, ten_bit: false, tile_cols: 0 },
+            Attempt { src: "mandelbrot=size=64x64:start_x=-1.0", w: 64, h: 64, cq: 14, ten_bit: false, tile_cols: 0 },
+            // 10-bit: the only two cells of the sweep that are exact at this
+            // depth (HORZ_A and VERT_A); the 10-bit HORZ_B/VERT_B cells all
+            // trip the base chroma defect the r1 report pins, so those two
+            // arms are proven 8-bit only.
+            Attempt { src: "yuvtestsrc=size=64x64", w: 64, h: 64, cq: 30, ten_bit: true, tile_cols: 0 },
+            Attempt { src: "mandelbrot=size=64x64:start_x=0.4", w: 64, h: 64, cq: 30, ten_bit: true, tile_cols: 0 },
+        ];
+        let mut arms = [0usize; 4];
+        let mut compared = 0usize;
+        for a in &attempts {
+            let desc =
+                format!("{} cq={} {}bit tiles={}", a.src, a.cq, if a.ten_bit { 10 } else { 8 }, a.tile_cols);
+            let mut ff: Vec<String> = vec![
+                "-v".into(), "error".into(), "-f".into(), "lavfi".into(), "-i".into(), a.src.into(),
+                "-pix_fmt".into(),
+                if a.ten_bit { "yuv420p10le".into() } else { "yuv420p".into() },
+            ];
+            if a.ten_bit {
+                ff.push("-strict".into());
+                ff.push("-1".into());
+            }
+            ff.extend(["-t".into(), "1".into(), "-vframes".into(), "1".into(),
+                       "-f".into(), "yuv4mpegpipe".into(), "-".into()]);
+            let y4m = Command::new("ffmpeg")
+                .args(&ff)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(y4m.status.success(), "ffmpeg fixture {desc}: {}", String::from_utf8_lossy(&y4m.stderr));
+            let encode = || {
+                let mut args: Vec<String> = vec![
+                    "--codec=av1".into(), "--passes=1".into(), "--end-usage=q".into(),
+                    format!("--cq-level={}", a.cq), "--cpu-used=4".into(), "--threads=1".into(),
+                    "--row-mt=0".into(), "--sb-size=64".into(), "--kf-max-dist=0".into(),
+                    "--limit=1".into(),
+                    "--enable-rect-partitions=1".into(), "--enable-ab-partitions=1".into(),
+                    "--enable-1to4-partitions=0".into(), "--enable-tx-size-search=0".into(),
+                    // Filter intra ON a rect strip is a separate, still-refused
+                    // predictor; this gate is about the AB partition wiring.
+                    "--enable-filter-intra=0".into(),
+                    "--reduced-tx-type-set=1".into(),
+                    "--min-partition-size=8".into(), "--max-partition-size=16".into(),
+                    format!("--tile-columns={}", a.tile_cols),
+                ];
+                if a.ten_bit {
+                    args.push("--input-bit-depth=10".into());
+                    args.push("--bit-depth=10".into());
+                }
+                args.extend(["--obu".into(), "-o".into(), "-".into(), "-".into()]);
+                let mut child = Command::new(aomenc_path())
+                    .args(&args)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("aomenc failed to start");
+                child.stdin.take().expect("aomenc stdin").write_all(&y4m.stdout).expect("y4m to aomenc");
+                let out = child.wait_with_output().expect("aomenc failed to run");
+                assert!(out.status.success(), "aomenc refused {desc}: {}", String::from_utf8_lossy(&out.stderr));
+                out.stdout
+            };
+            let stream = encode();
+            assert!(!stream.is_empty(), "{NAME}: {desc}: aomenc wrote an empty stream");
+            assert_eq!(stream, encode(), "{NAME}: {desc}: aomenc output is not reproducible");
+            let before = crate::decode::ab16_hits_by_arm();
+            let frames = decode_stream(&stream)
+                .unwrap_or_else(|e| panic!("{NAME}: {desc}: decode failed, not a pixel mismatch: {e}"));
+            let after = crate::decode::ab16_hits_by_arm();
+            let this: Vec<usize> = (0..4).map(|i| after[i] - before[i]).collect();
+            eprintln!("{NAME}: {desc} decoded, arms this attempt={this:?}");
+            let want = if a.ten_bit {
+                ffmpeg_decode_sequence_10bit(&stream, a.w, a.h, frames.len())
+            } else {
+                ffmpeg_decode_sequence(&stream, a.w, a.h, frames.len())
+            };
+            assert_eq!(want.len(), frames.len(), "{NAME}: {desc}: ffmpeg frame count");
+            for (i, (got, w)) in frames.iter().zip(&want).enumerate() {
+                assert_eq!(got.y, w.y, "{NAME}: {desc} frame {i} luma vs ffmpeg");
+                assert_eq!(got.u, w.u, "{NAME}: {desc} frame {i} U vs ffmpeg");
+                assert_eq!(got.v, w.v, "{NAME}: {desc} frame {i} V vs ffmpeg");
+            }
+            // Counted only now: the attempt decoded AND compared exact.
+            for i in 0..4 {
+                arms[i] += after[i] - before[i];
+            }
+            compared += 1;
+            eprintln!("{NAME}: {desc} pixel-exact");
+        }
+        assert_eq!(compared, attempts.len(), "{NAME}: every attempt must decode and compare");
+        for (i, arm) in ["HORZ_A", "HORZ_B", "VERT_A", "VERT_B"].iter().enumerate() {
+            assert!(arms[i] > 0, "{NAME}: PARTITION_{arm} at 16x16 never fired across {compared} \
+                                  compared streams -- the gate proves nothing about that arm (arms={arms:?})");
+        }
+        eprintln!("{NAME}: pixel-exact on {compared} streams, ab16 arms(HORZ_A,HORZ_B,VERT_A,VERT_B)={arms:?}");
+    }
+
     #[test]
     #[ignore = "lane-rectx r3 scratch sweep"]
     fn sweep_rectx_recipes() {
