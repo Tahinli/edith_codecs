@@ -7413,6 +7413,207 @@ mod tests {
         }
     }
 
+    /// lane-tx4x8: `--enable-rect-partitions=1` with `--min-partition-size=4
+    /// --max-partition-size=8` on fine-detail noisy gradients makes aomenc
+    /// pick `PARTITION_VERT`/`PARTITION_HORZ` at the 8x8 level -- two
+    /// `BLOCK_4X8`/`BLOCK_8X4` leaves, the last sub-8x8 shape this decoder
+    /// refused (it needed a real `TX_4X8`/`TX_8X4`: rect scan, 32-position
+    /// `eob_pt`, `TX_4X4` `tx_type` row over `TX_8X8` coefficient tables).
+    /// Both [`decode::tx4x8_coded_hits`] and [`decode::tx8x4_coded_hits`] are
+    /// hard-asserted per firing attempt so neither orientation can ride along
+    /// on the other ([[gate-blind-to-feature]]), and only leaves that coded
+    /// REAL coefficients count -- a skipped leaf never runs the transform.
+    /// Arms: 8-bit 64x64, an 8-bit `--tile-columns=1` 128x64 (the mi-granular
+    /// mode maps are per tile), and a 10-bit 64x64.
+    #[test]
+    fn a_real_aomenc_stream_with_a_sub8_rect_leaf_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_stream_with_a_sub8_rect_leaf_decodes_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            let msg = format!("no aomenc at {}", aomenc_path().display());
+            assert!(
+                std::env::var_os("EC_AV1_REQUIRE_AOMENC").is_none(),
+                "EC_AV1_REQUIRE_AOMENC is set but {msg}"
+            );
+            eprintln!("SKIP {NAME}: {msg}");
+            return;
+        }
+        // 16-pixel-tall/wide fixtures on purpose: at 64x64 EVERY attempt
+        // dies on a 16x16-LEVEL rect refusal belonging to other lanes
+        // ("a HORZ/VERT intra strip with a split transform", "a coded
+        // (non-skip) HORZ/VERT rect strip below 16x16", "a HORZ_A/HORZ_B/
+        // VERT_A partition below 16x16") -- `--max-partition-size=8` does
+        // NOT stop aomenc coding a 16x16 as two 16x8 strips, measured
+        // 39/40 attempts refused. A 16x16 frame is one 16x16 block, so the
+        // encoder either splits it to 8x8s (this lane's path) or codes it
+        // whole; measured 12/12 attempts decoding, 3/12 with BOTH
+        // orientations coded.
+        for (width, height, tile_args, bit_depth) in [
+            (16usize, 16usize, &[][..], 8u8),
+            (128usize, 16usize, &["--tile-columns=1"][..], 8u8),
+            (16usize, 16usize, &[][..], 10u8),
+        ] {
+            let mut refusals = Vec::new();
+            let mut fired_runs = 0u32;
+            for attempt in 0..40u32 {
+                let seed = 300 + attempt;
+                let cq = 6 + (attempt % 4) * 2;
+                let pix_fmt = if bit_depth == 10 {
+                    "yuv420p10le"
+                } else {
+                    "yuv420p"
+                };
+                let y4m = Command::new("ffmpeg")
+                    .args([
+                        "-v",
+                        "error",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        &format!("testsrc2=size={width}x{height}:rate=25"),
+                        "-vf",
+                        &format!("noise=alls=40:allf=t:all_seed={seed},format={pix_fmt}"),
+                        "-strict",
+                        "-1",
+                        "-t",
+                        "0.04",
+                        "-f",
+                        "yuv4mpegpipe",
+                        "-",
+                    ])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .expect("ffmpeg failed to run");
+                assert!(
+                    y4m.status.success(),
+                    "ffmpeg fixture: {}",
+                    String::from_utf8_lossy(&y4m.stderr)
+                );
+                let mut child = Command::new(aomenc_path())
+                    .args([
+                        "--codec=av1",
+                        "--passes=1",
+                        "--end-usage=q",
+                        &format!("--cq-level={cq}"),
+                        "--cpu-used=0",
+                        "--threads=1",
+                        "--row-mt=0",
+                        "--sb-size=64",
+                        "--min-partition-size=4",
+                        "--max-partition-size=8",
+                        // The tool under test: rect partitions ON, at a size
+                        // where the only rect shapes are 4x8 and 8x4.
+                        "--enable-rect-partitions=1",
+                        "--enable-ab-partitions=0",
+                        "--enable-1to4-partitions=0",
+                        "--enable-palette=0",
+                        "--enable-intrabc=0",
+                        "--enable-restoration=0",
+                        "--enable-cdef=0",
+                        "--loopfilter-control=0",
+                        "--enable-ref-frame-mvs=0",
+                        // Filter intra on a 4x8/8x4 leaf is refused by name
+                        // (`predict_filter_intra` is square-only in this
+                        // decoder, the same refusal the 16x16-level strips
+                        // carry); with it on, that refusal -- not this
+                        // lane's path -- is what most attempts hit.
+                        "--enable-filter-intra=0",
+                        "--limit=1",
+                        "--obu",
+                        "-o",
+                        "-",
+                        "-",
+                    ])
+                    .args(if bit_depth == 10 {
+                        &["--input-bit-depth=10", "--bit-depth=10"][..]
+                    } else {
+                        &[][..]
+                    })
+                    .args(tile_args)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("aomenc failed to start");
+                child
+                    .stdin
+                    .take()
+                    .expect("aomenc stdin")
+                    .write_all(&y4m.stdout)
+                    .expect("writing y4m to aomenc");
+                let out = child.wait_with_output().expect("aomenc failed to run");
+                if !out.status.success() {
+                    refusals.push(format!(
+                        "seed={seed} cq={cq}: aomenc itself refused the fixture"
+                    ));
+                    continue;
+                }
+                let stream = out.stdout;
+                let vert_before = decode::tx4x8_coded_hits();
+                let horz_before = decode::tx8x4_coded_hits();
+                let tiles_before = decode::tile_hits();
+                let frames = match decode_stream(&stream) {
+                    Ok(frames) => frames,
+                    Err(e) => {
+                        let msg = e.to_string();
+                        assert!(
+                            msg.starts_with("unsupported: "),
+                            "decode error that is not a named refusal \
+                             (seed={seed} cq={cq} depth={bit_depth} tiles={tile_args:?}): {msg}"
+                        );
+                        refusals.push(format!("seed={seed} cq={cq}: {msg}"));
+                        continue;
+                    }
+                };
+                assert!(
+                    tile_args.is_empty() || decode::tile_hits() - tiles_before >= 2,
+                    "tiles={tile_args:?} decoded only {} tile(s) (seed={seed} cq={cq})",
+                    decode::tile_hits() - tiles_before
+                );
+                let vert = decode::tx4x8_coded_hits() - vert_before;
+                let horz = decode::tx8x4_coded_hits() - horz_before;
+                if vert == 0 || horz == 0 {
+                    refusals.push(format!(
+                        "seed={seed} cq={cq}: decoded, but coded 4x8={vert} 8x4={horz} leaves"
+                    ));
+                    continue;
+                }
+                let ffmpeg_frames = if bit_depth == 10 {
+                    ffmpeg_decode_sequence_10bit(&stream, width, height, 1)
+                } else {
+                    ffmpeg_decode_sequence(&stream, width, height, 1)
+                };
+                assert_eq!(
+                    frames[0].y, ffmpeg_frames[0].y,
+                    "luma vs ffmpeg (seed={seed} cq={cq} depth={bit_depth} tiles={tile_args:?})"
+                );
+                assert_eq!(
+                    frames[0].u, ffmpeg_frames[0].u,
+                    "U vs ffmpeg (seed={seed} cq={cq} depth={bit_depth})"
+                );
+                assert_eq!(
+                    frames[0].v, ffmpeg_frames[0].v,
+                    "V vs ffmpeg (seed={seed} cq={cq} depth={bit_depth})"
+                );
+                fired_runs += 1;
+                if fired_runs >= 4 {
+                    break;
+                }
+            }
+            assert!(
+                fired_runs >= 4,
+                "fewer than 4 firing+pixel-exact runs out of 40 attempts \
+                 ({width}x{height} depth={bit_depth} tiles={tile_args:?}):\n{}",
+                refusals.join("\n")
+            );
+        }
+    }
+
     /// lane-av1golden7 r9's decisive fixture: a real aomenc stream (seed 59,
     /// `--tune-content=film`, GOLDEN_FRAME firing downstream) whose frame-0
     /// *intra keyframe* mismatched ffmpeg on 3855/4096 luma pixels -- traced
