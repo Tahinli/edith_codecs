@@ -55,7 +55,13 @@ None lifted, none added this round; `refusal_inventory` and `gate_coverage`
 stay green (totals below).
 
 ## Suite
-`EC_AV1_REQUIRE_AOMENC=1 cargo test -p ec-av1 --lib`: SUITE_TOTALS
+`EC_AV1_REQUIRE_AOMENC=1 cargo test -p ec-av1 --lib`: **269 passed, 0 failed, 22 ignored**, 933 s (r5: 269/0/22).
+
+An earlier run of the same command on the same tree reported `error: test
+failed` with the failing test's name swallowed by my own grep filter; the
+full rerun above (log `<scratchpad>/suite_r6.log`) is clean. Flagged as a
+possible flake under 10 concurrent lanes rather than claimed benign --
+open, unblocked by a rerun that captures the whole log.
 
 ## Open / disposition
 - deferred(an inter lane) -- `decode.rs:8547-8548` (`up_available`/
