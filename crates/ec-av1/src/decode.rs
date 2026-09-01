@@ -8178,6 +8178,11 @@ fn num_proj_ref(
 /// decoder's own overlap sizes ever produce (luma 8/16/32, chroma 4/8/16)
 /// are transcribed.
 fn obmc_mask(len: usize) -> &'static [u8] {
+    // lane-scaledref r1: `obmc_mask_2` (libaom reconinter.c:753) is reached
+    // the moment an 8x8 leaf takes OBMC -- its chroma plane block is 4x4, so
+    // the LEFT pass blends a two-column strip. Missing it panicked
+    // `unreachable!` on the first real 8x8 OBMC stream this repo produced.
+    const M2: [u8; 2] = [45, 64];
     const M4: [u8; 4] = [39, 50, 59, 64];
     const M8: [u8; 8] = [36, 42, 48, 53, 57, 61, 64, 64];
     const M16: [u8; 16] = [
@@ -8188,6 +8193,7 @@ fn obmc_mask(len: usize) -> &'static [u8] {
         61, 62, 64, 64, 64, 64, 64, 64, 64, 64,
     ];
     match len {
+        2 => &M2,
         4 => &M4,
         8 => &M8,
         16 => &M16,
@@ -8449,6 +8455,13 @@ fn obmc_blend(
     };
     let overlap_above = write_h / 2;
     let overlap_left = write_w / 2;
+    // lane-scaledref r1: `av1_skip_u4x4_pred_in_obmc` (libaom reconinter.c:820,
+    // `DISABLE_CHROMA_U8X8_OBMC == 0`) returns `dir == 0` when the PLANE block
+    // is 4x4/4x8/8x4 -- i.e. an 8x8 luma block in 4:2:0 gets ONE-SIDED chroma
+    // OBMC: the above pass skips U/V entirely, the left pass still blends its
+    // two-column chroma strip. Every larger block this decoder codes has a
+    // chroma plane of at least 8x8 and is unaffected.
+    let chroma_is_4x4 = bw4 == 2 && bh4 == 2;
 
     for (off4, span4, nb) in overlappable_above(grid, mi_row, mi_col, bw4, mi_cols, max_nb(bw4))
     {
@@ -8465,11 +8478,13 @@ fn obmc_blend(
         let (bw, bh, ox) = (span4 * 4, overlap_above, off4 * 4);
         let tmp_y = obmc_neighbour_pred(ny, px + ox, py, nb.mv, bw, bh, true, h_kind, v_kind, nb_scale);
         obmc_blend_v(pred_y, side, ox, 0, bw, bh, &tmp_y);
-        let (cbw, cbh, cox) = (bw / 2, overlap_above / 2, ox / 2);
-        let tmp_u = obmc_neighbour_pred(nu, cpx + cox, cpy, nb.mv, cbw, cbh, false, h_kind, v_kind, nb_scale);
-        obmc_blend_v(pred_u, chroma_side, cox, 0, cbw, cbh, &tmp_u);
-        let tmp_v = obmc_neighbour_pred(nv, cpx + cox, cpy, nb.mv, cbw, cbh, false, h_kind, v_kind, nb_scale);
-        obmc_blend_v(pred_v, chroma_side, cox, 0, cbw, cbh, &tmp_v);
+        if !chroma_is_4x4 {
+            let (cbw, cbh, cox) = (bw / 2, overlap_above / 2, ox / 2);
+            let tmp_u = obmc_neighbour_pred(nu, cpx + cox, cpy, nb.mv, cbw, cbh, false, h_kind, v_kind, nb_scale);
+            obmc_blend_v(pred_u, chroma_side, cox, 0, cbw, cbh, &tmp_u);
+            let tmp_v = obmc_neighbour_pred(nv, cpx + cox, cpy, nb.mv, cbw, cbh, false, h_kind, v_kind, nb_scale);
+            obmc_blend_v(pred_v, chroma_side, cox, 0, cbw, cbh, &tmp_v);
+        }
     }
 
     for (off4, span4, nb) in overlappable_left(grid, mi_row, mi_col, bh4, mi_rows, max_nb(bh4)) {
@@ -12426,15 +12441,20 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                 // lane-scaledref r1: `decode_inter_block8` IS
                                 // threaded for a scaled reference now (its
                                 // single-ref, compound and OBMC MC all take
-                                // spec 7.11.3.3's scaled walk), but no aomenc
-                                // recipe this round produced a single 8x8
-                                // inter leaf -- gradients never splits below
-                                // 16x16 (same wall as
-                                // `a_real_aomenc_stream_with_obmc_8x8_decodes_pixel_exact`).
-                                // An ungated lift is a capability claim
-                                // nothing exercises, so the refusal stays
-                                // until a firing fixture exists; deleting
-                                // these six lines is then the whole change.
+                                // spec 7.11.3.3's scaled walk), but the one
+                                // recipe that reaches this path at all -- a
+                                // 64x72 superres fixture whose bottom 16-row
+                                // band straddles the true edge, so the
+                                // gathered split bit lands on 8x8 leaves --
+                                // DESYNCS inside the leaf itself
+                                // (`from_switchable_symbol` handed a 4th
+                                // symbol, mc.rs:200), the same
+                                // below-8x8 desync lane-sub8 r2 left open and
+                                // unrelated to scaling. So the scaled MC here
+                                // is unproven: refuse by name rather than
+                                // ship a capability claim no gate exercises.
+                                // Deleting these six lines is the whole lift
+                                // once the leaf8 desync is fixed.
                                 if ref_y.width != frame_width as usize
                                     || ref_slots.iter().flatten().any(|(py, _, _)| {
                                         py.width != frame_width as usize
