@@ -3550,6 +3550,45 @@ mod tests {
         }
     }
 
+    /// lane-part32 r6: inside a `PARTITION_VERT_A`/`_B` the 8x8 squares are
+    /// visited TL, BL, TR, BR, so the TR square (even 8x8 row, odd 8x8
+    /// column inside the superblock) may read the below-left samples the
+    /// raster table forbids: `has_bl_8x8` is 0 at exactly those 16 slots
+    /// where `has_bl_vert_8x8` is 1. Pinned here because no aomenc recipe
+    /// swept in r6 produced a decodable 16x16-level VERT_B stream (every
+    /// stream that partitions that small first hits the still-refused
+    /// HORZ_A/HORZ_B/VERT_A-below-16 or coded-rect-strip-below-16 arms).
+    #[test]
+    fn vert_ab_partition_flips_below_left_for_the_top_right_8x8() {
+        let (width, height) = (SUPERBLOCK * 3, SUPERBLOCK * 3);
+        // Interior superblock, so neither the frame edge nor the col == 0 /
+        // last-row early returns answer instead of the table.
+        let (sb_x, sb_y) = (SUPERBLOCK, SUPERBLOCK);
+        let mut flipped = 0;
+        for row in 0..8 {
+            for col in 1..8 {
+                let (x, y) = (sb_x + col * 8, sb_y + row * 8);
+                let raster = Reach::of(8, x, y, width, height).below_left;
+                let vert = {
+                    let _guard = Reach::vert_ab_partition();
+                    Reach::of(8, x, y, width, height).below_left
+                };
+                // The TR square of a VERT_A/_B sits at an even row, odd
+                // column; every other slot must be untouched by the guard.
+                if row % 2 == 0 && col % 2 == 1 {
+                    assert!(!raster, "raster below_left at row={row} col={col}");
+                    assert!(vert, "vert below_left at row={row} col={col}");
+                    flipped += 1;
+                } else {
+                    assert_eq!(raster, vert, "guard moved row={row} col={col}");
+                }
+            }
+        }
+        assert_eq!(flipped, 4 * 4, "expected the 16 8x8 TR slots to flip");
+        // The guard is scoped: it must not leak past its own block.
+        assert!(!Reach::of(8, sb_x + 8, sb_y, width, height).below_left);
+    }
+
     /// An odd width or height is refused by name, not by however the padder
     /// or the block coder would happen to fail on it.
     #[test]

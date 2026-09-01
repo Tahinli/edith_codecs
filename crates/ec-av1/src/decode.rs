@@ -7007,6 +7007,18 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                         }
                                         if part16 == PARTITION_VERT_B {
                                             VERT_B_INTRA_HITS.with(|c| c.set(c.get() + 1));
+                                            // lane-part32 r6: same availability
+                                            // defect r5 fixed one level up --
+                                            // the TR/BR 8x8 squares below are
+                                            // visited out of raster order, so
+                                            // they need libaom's
+                                            // `has_tr_vert_*`/`has_bl_vert_*`
+                                            // tables (the left 8x16 rect goes
+                                            // through `Reach::of_rect`, which
+                                            // the guard deliberately does not
+                                            // affect).
+                                            let _vert_ab =
+                                                crate::encode::Reach::vert_ab_partition();
                                             // Left rect: 8x16, real
                                             // `decode_block_rect`, sat at the
                                             // 16x16 parent's own origin (no
