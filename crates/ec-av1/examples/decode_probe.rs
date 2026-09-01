@@ -32,7 +32,20 @@ fn main() {
         Ok(frames) if frames.is_empty() => {
             println!("OK but EMPTY: no frames -- is {path} an IVF rather than a raw OBU stream?");
         }
-        Ok(frames) => println!("OK: {} frames decoded", frames.len()),
+        Ok(frames) => {
+            // EC_PROBE_OUT=<path>: dump the decoded planes as raw yuv420p so a
+            // stream can be diffed against ffmpeg's own decode pixel by pixel.
+            if let Ok(out) = std::env::var("EC_PROBE_OUT") {
+                let mut buf: Vec<u8> = Vec::new();
+                for f in &frames {
+                    for p in [&f.y, &f.u, &f.v] {
+                        buf.extend(p.iter().map(|&s| s as u8));
+                    }
+                }
+                std::fs::write(&out, &buf).expect("writing EC_PROBE_OUT");
+            }
+            println!("OK: {} frames decoded, {}x{}", frames.len(), frames[0].width, frames[0].height)
+        }
         Err(e) => println!("REFUSED: {e}"),
     }
 }

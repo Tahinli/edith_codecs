@@ -5079,12 +5079,21 @@ mod tests {
             let on = |name: &str| {
                 if std::env::var(name).as_deref() == Ok("0") { "0" } else { "1" }
             };
-            // warp stays OFF: warp under a scaled reference is still refused
-            // (its own fallback mismatches, see decode.rs) -- set
-            // EC_SCALEDREF_WARP=1 to reproduce that residue.
-            let warp = format!(
-                "--enable-warped-motion={}",
-                if std::env::var("EC_SCALEDREF_WARP").as_deref() == Ok("1") { "1" } else { "0" }
+            // lane-scaledref r2: warp is ON. A warp-capable frame header
+            // under a scaled reference is exactly the case r1 got wrong
+            // (the block must read the 2-symbol `obmc_cdf`, not the
+            // 3-symbol `motion_mode_cdf` -- libaom `motion_mode_allowed`,
+            // blockd.h:1484), and it decoded silently wrong pixels rather
+            // than refusing. `EC_SCALEDREF_WARP=0` turns it off for
+            // bisecting only.
+            let warp = format!("--enable-warped-motion={}", on("EC_SCALEDREF_WARP"));
+            // lane-scaledref r2: `EC_SCALEDREF_MODE=3` (qthresh) lets
+            // superres switch on and off per frame, so a compound block can
+            // reference one scaled and one unscaled reference -- the mixed
+            // case mode 1 (every frame scaled) never produces.
+            let superres_mode = format!(
+                "--superres-mode={}",
+                std::env::var("EC_SCALEDREF_MODE").unwrap_or_else(|_| "1".into())
             );
             let obmc = format!("--enable-obmc={}", on("EC_SCALEDREF_OBMC"));
             let interintra = format!("--enable-interintra-comp={}", on("EC_SCALEDREF_II"));
@@ -5111,7 +5120,7 @@ mod tests {
                 // still refuses on the aligned path ("an inter partition
                 // below 16x16"). Denominator 12 codes 43 columns and every
                 // seed refused there.
-                "--superres-mode=1",
+                &superres_mode,
                 "--superres-denominator=16",
                 "--superres-kf-denominator=16",
                 // the four combinations this round lifts (each switchable
@@ -5211,7 +5220,7 @@ mod tests {
         eprintln!(
             "{NAME}: {named_refusals} other-capability refusals, {matched}/{n_attempts} pixel-exact, \
              superres_hits={} predict_scaled_hits={} scaled_compound={} scaled_warp_fallback={} \
-             scaled_obmc={} scaled_interintra={} scaled_block8={}",
+             scaled_obmc={} scaled_interintra={} scaled_block8={} scaled_warp_suppressed={} mixed_scale_compound={}",
             crate::superres::superres_hits(),
             crate::mc::predict_scaled_hits(),
             crate::decode::scaled_compound_hits(),
@@ -5219,6 +5228,8 @@ mod tests {
             crate::decode::scaled_obmc_hits(),
             crate::decode::scaled_interintra_hits(),
             crate::decode::scaled_block8_hits(),
+            crate::decode::scaled_warp_suppressed_hits(),
+            crate::decode::mixed_scale_compound_hits(),
         );
         assert!(
             matched > 0,
@@ -5228,10 +5239,19 @@ mod tests {
             crate::mc::predict_scaled_hits() > 0,
             "{NAME}: matched but zero predict_scaled_hits -- no block took the scaled MC path"
         );
-        // Warp and the 8x8 leaf are NOT asserted here: both stay refused this
-        // round (warp's own fallback mismatches at seed 47, and no recipe
-        // produced an 8x8 inter leaf at all), so their counters are
-        // diagnostics only -- see this gate's own doc and decode.rs.
+        // The 8x8 leaf is NOT asserted here: it stays refused (no recipe
+        // produced an 8x8 inter leaf at all), so its counter is a
+        // diagnostic only -- see this gate's own doc and decode.rs.
+        // `scaled_warp_suppressed` IS asserted: it counts the blocks whose
+        // WARPED_CAUSAL eligibility libaom drops because the reference is
+        // scaled, i.e. the blocks that must read `obmc_cdf`. Zero of them
+        // would mean this gate's `--enable-warped-motion=1` never reached a
+        // warp-eligible block and proves nothing about r2's fix.
+        assert!(
+            crate::decode::scaled_warp_suppressed_hits() > 0,
+            "{NAME}: {matched} matches but no block had its warp eligibility \
+             suppressed by a scaled reference -- the warp arm proves nothing"
+        );
         for (hits, what) in [
             (crate::decode::scaled_compound_hits(), "compound with a scaled reference"),
             (crate::decode::scaled_obmc_hits(), "OBMC with a scaled reference"),
