@@ -65,7 +65,6 @@ const REFUSALS: &[&str] = &[
     "a show_existing_frame header naming an empty reference slot",
     "an 8x8 leaf that coded WARPED_CAUSAL (motion_mode == 2): av1_find_projection/the affine warp filter are not ported, only motion_mode_allowed's alphabet choice is",
     "an inter frame using TxMode::Select (this decoder's inter path never reads a tx_depth symbol, so it desyncs after the first block's mode)",
-    "an inter frame whose global motion for a single-reference frame is AFFINE (unverified this round; ROTZOOM/TRANSLATION/IDENTITY are proven)",
     "an inter frame with no key frame before it",
     "an inter SB-level partition type other than SPLIT (this decoder's inter tile path only recurses a superblock as SPLIT)",
     "an inter partition below 16x16 (8x8 and smaller inter blocks are not coded yet)",
