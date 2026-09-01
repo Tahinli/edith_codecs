@@ -638,6 +638,21 @@ pub(crate) fn warp_selected_hits() -> usize {
     WARP_SELECTED_HITS.with(|c| c.get())
 }
 
+// lane-gmaffine r1: how many blocks built their prediction from a
+// SIX-parameter (`AFFINE`) global-motion model through
+// `crate::warp::global_warp_params` -- the gate's proof that a stream really
+// carried an AFFINE `global_motion_params` AND that a block was predicted
+// with it, not merely that the header parsed one.
+thread_local! {
+    static AFFINE_GM_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`AFFINE_GM_HITS`].
+pub(crate) fn affine_gm_hits() -> usize {
+    AFFINE_GM_HITS.with(|c| c.get())
+}
+
 // How many blocks decoded `interintra == 1` with the non-wedge blended
 // prediction applied (lane-interintra r1) -- the gate's proof that a
 // stream actually exercised interintra.
@@ -9994,6 +10009,9 @@ fn decode_inter_block(
             let gm_ref = &global_motion[(ref_frame - LAST_FRAME) as usize];
             if warp_params.is_none() && is_global_mv_block && !force_integer_mv && !gm_ref.invalid {
                 warp_params = crate::warp::global_warp_params(gm_ref.params);
+                if warp_params.is_some() && gm_ref.model == ec_av1_syntax::WarpModel::Affine {
+                    AFFINE_GM_HITS.with(|c| c.set(c.get() + 1));
+                }
             }
             if std::env::var_os("EC_AV1_TELL").is_some() {
                 eprintln!(
