@@ -447,11 +447,17 @@ pub fn warp_affine(
         params.gamma as i64,
         params.delta as i64,
     );
-    const BD: i32 = 8;
-    let reduce_bits_horiz = 3; // conv_params->round_0, non-compound 8-bit (InterRound0)
+    // lane-hbdinter r1: libaom's `av1_warp_affine_c` takes `bd` and every
+    // offset/clip term below scales with it; this was `const BD: i32 = 8`,
+    // so a 10-bit warped or global-motion block came out of the vertical
+    // pass biased by `(1 << 9) + (1 << 8) - (1 << 11) - (1 << 10)` and then
+    // clipped. `reduce_bits_horiz` is `conv_params->round_0`, which stays 3
+    // for `bd < 12` (`convolve.h:83`'s `intbufrange > 16` threshold).
+    let bd = i32::from(crate::decode::bit_depth());
+    let reduce_bits_horiz = 3; // conv_params->round_0 (InterRound0), bd < 12
     let reduce_bits_vert = 2 * FILTER_BITS - reduce_bits_horiz; // InterRound1
-    let offset_bits_horiz = BD + FILTER_BITS - 1;
-    let offset_bits_vert = BD + 2 * FILTER_BITS - reduce_bits_horiz;
+    let offset_bits_horiz = bd + FILTER_BITS - 1;
+    let offset_bits_vert = bd + 2 * FILTER_BITS - reduce_bits_horiz;
 
     let mut i = p_row;
     while i < p_row + p_height {
@@ -512,7 +518,7 @@ pub fn warp_affine(
                     let out_row = (i - p_row + k + 4) as usize;
                     let out_col = (j - p_col + l + 4) as usize;
                     dst[out_row * p_stride as usize + out_col] =
-                        clip_pixel(sum - (1 << (BD - 1)) - (1 << BD));
+                        clip_pixel(sum - (1 << (bd - 1)) - (1 << bd));
                     sy += gamma;
                     l += 1;
                 }

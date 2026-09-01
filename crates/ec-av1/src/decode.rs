@@ -820,6 +820,12 @@ pub(crate) fn tmv_hits() -> usize {
     crate::mvstack::tmv_hits()
 }
 
+/// Current value of [`crate::mc::inter_pred_hits`] -- inter predictions
+/// produced on this thread, the 10-bit inter gate's firing proof.
+pub(crate) fn inter_pred_hits() -> usize {
+    crate::mc::inter_pred_hits()
+}
+
 /// Everything [`decode_inter_block`] needs to fold temporal MV candidates
 /// (spec 7.10.2.8), threaded down from [`decode_inter_frame_tile_with_cdfs`]:
 /// the current frame's own projected field ([`crate::motion_field::setup_motion_field`]'s
