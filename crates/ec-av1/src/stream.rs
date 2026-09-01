@@ -9333,6 +9333,351 @@ mod tests {
         );
     }
 
+    /// lane-rectsplit r1 gate (a): a real `aomenc` key frame whose 32x32
+    /// quadrants split HORZ/VERT into true 32x16/16x32 strips, with the
+    /// tx-size search left at aomenc's own default (ON) -- every sibling
+    /// recipe in this file pins `--enable-tx-size-search=0`, which is exactly
+    /// why the split-transform strip was never exercised. RD is then free to
+    /// give a strip a transform smaller than its own size, the case
+    /// [`crate::decode::decode_block_rect`] refused by name ("a HORZ/VERT
+    /// intra strip with a split transform (per-unit rect prediction is not
+    /// ported)") until this round ported the per-transform-unit predict-and-
+    /// reconstruct loop. Hard-asserts a nonzero `rect_split_tx_hits()` delta:
+    /// without it a stream that resolved every `tx_depth` to 0 would
+    /// pixel-match by construction and prove nothing. A decode error that is
+    /// not a named refusal, and any pixel mismatch, FAIL -- only a missing
+    /// tool skips.
+    #[test]
+    fn a_real_aomenc_stream_with_a_split_transform_horz_vert_strip_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_stream_with_a_split_transform_horz_vert_strip_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height) = (192usize, 128usize);
+        let before = crate::decode::rect_split_tx_hits();
+        let mut named_refusals = 0u32;
+        let mut matched = 0u32;
+        let mut split_so_far = 0usize;
+        // Bounded sweep: see this gate's own doc for the seed-77 residue and
+        // why extending it is a diagnosis knob, not a pass/fail one.
+        let n_attempts: u32 = std::env::var("EC_RECTSPLIT_GATE_ATTEMPTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(20);
+        for attempt in 0..n_attempts {
+            let seed = 42 + attempt;
+            let source = gradients_source(seed, width, height, "duration=0.04:rate=25");
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v", "error", "-f", "lavfi", "-i", &source,
+                    // Desaturated (`hue=s=0`, the same guard
+                    // `a_real_aomenc_intra_stream_with_tx_select_decodes_pixel_exact`
+                    // uses): with the tx-size search ON, a real chroma
+                    // gradient hits a PRE-EXISTING chroma defect on the plain
+                    // SQUARE path -- measured this round with
+                    // `--enable-rect-partitions=0` on this very recipe, seed
+                    // 42, U plane, i.e. with no rect strip in the stream at
+                    // all. Flat chroma keeps that unrelated defect out of
+                    // this gate (gate-recipe-confound class); it is open
+                    // residue in lanes/rectsplit-r1.report.md, not fixed here.
+                    "-vf", "hue=s=0",
+                    "-pix_fmt", "yuv420p", "-f",
+                    "yuv4mpegpipe", "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            // NOTE: no `--enable-tx-size-search=0` here -- leaving aomenc's
+            // own default (search ON) is the entire point of this gate.
+            let args: Vec<&str> = vec![
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                "--cq-level=45",
+                "--cpu-used=0",
+                "--threads=1",
+                "--row-mt=0",
+                "--sb-size=64",
+                "--enable-rect-partitions=1",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0",
+                "--min-partition-size=16",
+                "--max-partition-size=32",
+                "--enable-restoration=0",
+                "--enable-palette=0",
+                "--deltaq-mode=0",
+                "--enable-filter-intra=0",
+                "--enable-cfl-intra=0",
+                "--enable-intrabc=0",
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ];
+            let mut child = Command::new(aomenc_path())
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            assert!(!stream.is_empty(), "{NAME}: aomenc wrote an empty stream (seed {seed})");
+            let frames = match decode_stream(&stream) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME} failed outright, not a named refusal (seed {seed}): {msg}"
+                    );
+                    named_refusals += 1;
+                    continue;
+                }
+                Ok(frames) => frames,
+            };
+            let after = crate::decode::rect_split_tx_hits();
+            eprintln!(
+                "{NAME}: seed {seed} decoded, split-tx strips this stream: {}",
+                after - before - split_so_far
+            );
+            split_so_far = after - before;
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
+            assert_eq!(frames.len(), 1, "{NAME}: expected one frame (seed {seed})");
+            if let Some(i) = frames[0]
+                .y
+                .iter()
+                .zip(&ffmpeg_frames[0].y)
+                .position(|(a, b)| a != b)
+            {
+                eprintln!(
+                    "{NAME}: seed {seed} first luma mismatch at ({}, {}) ours={} ffmpeg={}",
+                    i % width,
+                    i / width,
+                    frames[0].y[i],
+                    ffmpeg_frames[0].y[i]
+                );
+            }
+            assert_eq!(frames[0].y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg (seed {seed})");
+            assert_eq!(frames[0].u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg (seed {seed})");
+            assert_eq!(frames[0].v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg (seed {seed})");
+            matched += 1;
+        }
+        let split_hits = crate::decode::rect_split_tx_hits() - before;
+        assert!(
+            matched > 0,
+            "{NAME}: every attempt refused ({named_refusals} named refusals) -- gate decoded nothing"
+        );
+        assert!(
+            split_hits > 0,
+            "{NAME}: zero HORZ/VERT strips resolved a split transform ({matched} pixel-exact \
+             matches, {named_refusals} refusals out of {n_attempts}) -- gate proved nothing \
+             this run"
+        );
+        eprintln!(
+            "{NAME}: {matched} pixel-exact matches, {named_refusals} named refusals, \
+             rect_split_tx_hits delta={split_hits} out of {n_attempts} attempts"
+        );
+    }
+
+    /// lane-rectsplit r1 gate (b): [`a_real_aomenc_stream_with_a_superblock_level_horz_vert_partition_decodes_pixel_exact`]'s
+    /// own recipe (`--sb-size=64`, `--min/max-partition-size=32/64`, so every
+    /// SB-level decision is genuinely NONE/SPLIT/HORZ/VERT) with its
+    /// `--enable-tx-size-search=0` DROPPED: the 64x32/32x64 strips may then
+    /// carry a split transform, which [`crate::decode::decode_block_rect64`]
+    /// refused by name ("a superblock-level HORZ/VERT strip with a split
+    /// transform") until this round. Same hard `rect_split_tx_hits()` delta
+    /// assert as gate (a).
+    /// lane-rectsplit r1 MEASURED RED, `#[ignore]`d with its number (the
+    /// `rect64q` gate's own precedent): with the per-transform-unit port
+    /// wired at the superblock level, seed 50 decodes one sample off --
+    /// luma (171, 56), ours 147 vs ffmpeg 148, inside the 64x32 strip at
+    /// mi=(8,32) whose transform resolved to depth 2 (TX_16X16). Seeds 42-49
+    /// with depth-1 (TX_32X32) units were pixel-exact. The refusal in
+    /// `decode_block_rect64` was therefore RESTORED rather than lifted; run
+    /// this gate (`--ignored`) after any fix to that arm.
+    #[ignore = "lane-rectsplit r1: measured RED, seed 50 luma (171,56) off by one; refusal kept"]
+    #[test]
+    fn a_real_aomenc_stream_with_a_split_transform_superblock_strip_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_stream_with_a_split_transform_superblock_strip_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height) = (192usize, 128usize);
+        let before = crate::decode::rect_split_tx_hits();
+        let mut named_refusals = 0u32;
+        let mut matched = 0u32;
+        let mut split_so_far = 0usize;
+        // Bounded sweep: see this gate's own doc for the seed-77 residue and
+        // why extending it is a diagnosis knob, not a pass/fail one.
+        let n_attempts: u32 = std::env::var("EC_RECTSPLIT_GATE_ATTEMPTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(20);
+        for attempt in 0..n_attempts {
+            let seed = 42 + attempt;
+            let source = gradients_source(seed, width, height, "duration=0.04:rate=25");
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v", "error", "-f", "lavfi", "-i", &source,
+                    // Desaturated (`hue=s=0`, the same guard
+                    // `a_real_aomenc_intra_stream_with_tx_select_decodes_pixel_exact`
+                    // uses): with the tx-size search ON, a real chroma
+                    // gradient hits a PRE-EXISTING chroma defect on the plain
+                    // SQUARE path -- measured this round with
+                    // `--enable-rect-partitions=0` on this very recipe, seed
+                    // 42, U plane, i.e. with no rect strip in the stream at
+                    // all. Flat chroma keeps that unrelated defect out of
+                    // this gate (gate-recipe-confound class); it is open
+                    // residue in lanes/rectsplit-r1.report.md, not fixed here.
+                    "-vf", "hue=s=0",
+                    "-pix_fmt", "yuv420p", "-f",
+                    "yuv4mpegpipe", "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            // NOTE: no `--enable-tx-size-search=0` here -- leaving aomenc's
+            // own default (search ON) is the entire point of this gate.
+            let args: Vec<&str> = vec![
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                "--cq-level=45",
+                "--cpu-used=0",
+                "--threads=1",
+                "--row-mt=0",
+                "--sb-size=64",
+                "--enable-rect-partitions=1",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0",
+                "--min-partition-size=32",
+                "--max-partition-size=64",
+                "--enable-restoration=0",
+                "--enable-palette=0",
+                "--deltaq-mode=0",
+                "--enable-filter-intra=0",
+                "--enable-cfl-intra=0",
+                "--enable-intrabc=0",
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ];
+            let mut child = Command::new(aomenc_path())
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            assert!(!stream.is_empty(), "{NAME}: aomenc wrote an empty stream (seed {seed})");
+            let frames = match decode_stream(&stream) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME} failed outright, not a named refusal (seed {seed}): {msg}"
+                    );
+                    named_refusals += 1;
+                    continue;
+                }
+                Ok(frames) => frames,
+            };
+            let after = crate::decode::rect_split_tx_hits();
+            eprintln!(
+                "{NAME}: seed {seed} decoded, split-tx strips this stream: {}",
+                after - before - split_so_far
+            );
+            split_so_far = after - before;
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
+            assert_eq!(frames.len(), 1, "{NAME}: expected one frame (seed {seed})");
+            if let Some(i) = frames[0]
+                .y
+                .iter()
+                .zip(&ffmpeg_frames[0].y)
+                .position(|(a, b)| a != b)
+            {
+                eprintln!(
+                    "{NAME}: seed {seed} first luma mismatch at ({}, {}) ours={} ffmpeg={}",
+                    i % width,
+                    i / width,
+                    frames[0].y[i],
+                    ffmpeg_frames[0].y[i]
+                );
+            }
+            assert_eq!(frames[0].y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg (seed {seed})");
+            assert_eq!(frames[0].u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg (seed {seed})");
+            assert_eq!(frames[0].v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg (seed {seed})");
+            matched += 1;
+        }
+        let split_hits = crate::decode::rect_split_tx_hits() - before;
+        assert!(
+            matched > 0,
+            "{NAME}: every attempt refused ({named_refusals} named refusals) -- gate decoded nothing"
+        );
+        assert!(
+            split_hits > 0,
+            "{NAME}: zero HORZ/VERT strips resolved a split transform ({matched} pixel-exact \
+             matches, {named_refusals} refusals out of {n_attempts}) -- gate proved nothing \
+             this run"
+        );
+        eprintln!(
+            "{NAME}: {matched} pixel-exact matches, {named_refusals} named refusals, \
+             rect_split_tx_hits delta={split_hits} out of {n_attempts} attempts"
+        );
+    }
+
     /// lane-rect64q r1: same recipe as
     /// [`a_real_aomenc_stream_with_a_superblock_level_horz_vert_partition_decodes_pixel_exact`]
     /// minus `--deltaq-mode=0` -- real aomenc's non-realtime default is
