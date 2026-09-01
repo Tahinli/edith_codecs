@@ -80,6 +80,52 @@ const TOOL_UNIVERSE: &[&str] = &[
     "enable-warped-motion",
 ];
 
+/// How a non-boolean aomenc knob reads as "the tool is on".
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq)]
+enum On {
+    /// Any non-zero value enables the tool (`--tile-columns=1`, `--loopfilter-control=1`).
+    NonZero,
+    /// The tool's search only runs at or below this speed (`--cpu-used`).
+    AtMost(u32),
+}
+
+/// Coding tools aomenc drives through a spelling [`TOOL_UNIVERSE`] does not
+/// cover, listed with their aomenc default.
+///
+/// lane-covbd's derivation read `--enable-*` flags only, so a tool a gate pins
+/// off through another spelling was invisible: all 49 gates that name it pass
+/// `--enable-tx-size-search=0`, and the real-stream PANIC hiding behind that
+/// pin was found by lane-ab16, not by this guard. `--loopfilter-control=0`,
+/// `--tile-columns=0` and a `--cpu-used` high enough to switch a search off are
+/// the same shape.
+///
+/// Each entry is `(tool, spellings, aomenc default, what counts as on)`. The
+/// "defaulted means unknown" rule of [`NEVER_EXERCISED`] applies unchanged: a
+/// default of `1` does not prove the encoder picked the tool for any stream, so
+/// only a gate that spells an on-value at that bit depth retires an entry.
+#[cfg(test)]
+const DEFAULT_ON_TOOLS: &[(&str, &[&str], &str, On)] = &[
+    ("enable-tx-size-search", &["enable-tx-size-search"], "1", On::NonZero),
+    ("enable-directional-intra", &["enable-directional-intra"], "1", On::NonZero),
+    ("enable-smooth-interintra", &["enable-smooth-interintra"], "1", On::NonZero),
+    ("enable-interintra-wedge", &["enable-interintra-wedge"], "1", On::NonZero),
+    ("enable-diff-wtd-comp", &["enable-diff-wtd-comp"], "1", On::NonZero),
+    ("enable-onesided-comp", &["enable-onesided-comp"], "1", On::NonZero),
+    ("enable-fwd-kf", &["enable-fwd-kf"], "0", On::NonZero),
+    ("deblocking", &["loopfilter-control"], "1", On::NonZero),
+    ("multi-tile", &["tile-columns", "tile-rows"], "0", On::NonZero),
+    ("intrabc-search", &["cpu-used"], "0", On::AtMost(2)),
+];
+
+/// Non-`--enable-*` spellings that drive a [`TOOL_UNIVERSE`] tool.
+///
+/// `--superres-mode=1` is how all three superres gates switch superres on;
+/// without this map they read as an `enable-superres` hole while a real stream
+/// exercises the tool (lane-covbd deferred exactly this).
+#[cfg(test)]
+const ALIASES: &[(&str, &str)] = &[("superres-mode", "enable-superres")];
+
 /// Coverage is per (tool x bit depth), not per tool.
 ///
 /// lane-hbdinter found two 10-bit-only defects (SGR box sums unscaled, Wiener
@@ -134,10 +180,6 @@ const NEVER_EXERCISED_8BIT: &[(&str, &str)] = &[
         "off in 27 gates, on in none: temporal MV projection is unimplemented",
     ),
     (
-        "enable-superres",
-        "never spelled: the three superres gates drive `--superres-mode=1` instead, so the tool IS exercised but not under this flag -- retire this entry only by renaming the check, not by assuming coverage",
-    ),
-    (
         "enable-tx64",
         "never spelled; TX_64X64 appears only where aomenc's default picks it, which is unknown per stream",
     ),
@@ -185,16 +227,81 @@ const NEVER_EXERCISED_10BIT: &[(&str, &str)] = &[
         "enable-ref-frame-mvs",
         "hole at both depths, see the 8-bit list",
     ),
-    (
-        "enable-superres",
-        "the 10-bit superres gate drives `--superres-mode=1`, not this flag; see the 8-bit entry",
-    ),
     ("enable-tx64", "hole at both depths, see the 8-bit list"),
+];
+
+/// [`DEFAULT_ON_TOOLS`] entries no 8-bit gate spells on, with the reason.
+///
+/// Each entry is `(tool, why)`; the reason states whether the tool is pinned
+/// OFF in every gate that names it (a hard hole -- no stream can carry it) or
+/// merely defaulted (unknown, and unknown is not coverage).
+#[cfg(test)]
+const NEVER_ON_8BIT: &[(&str, &str)] = &[
+    (
+        "deblocking",
+        "on in no 8-bit gate: 7 pin --loopfilter-control=0, the other 34 default (on) -- and defaulted is unknown, so no stream is proven to run the loop filter",
+    ),
+    (
+        "enable-diff-wtd-comp",
+        "on in no 8-bit gate: 6 pin =0, 35 default; difference-weighted compound masks are unproven",
+    ),
+    (
+        "enable-directional-intra",
+        "on in no 8-bit gate: pinned =0 in 32 of 41, defaulted in 9 -- the directional gates drive the modes through other flags, never this one",
+    ),
+    (
+        "enable-fwd-kf",
+        "on in no 8-bit gate: 11 pin =0, 30 default (aomenc's default is off), so forward keyframes are never coded",
+    ),
+    (
+        "enable-onesided-comp",
+        "on in no 8-bit gate: 17 pin =0, 24 default; one-sided compound prediction is unproven",
+    ),
+    (
+        "enable-tx-size-search",
+        "on in no 8-bit gate: pinned =0 in 34 of 41 -- the pin that hid a real-stream PANIC from lane-ab16 until TX_MODE_SELECT was landed by lane-txselect; its gates spell the tool through the recipe, not this flag",
+    ),
+];
+
+/// [`DEFAULT_ON_TOOLS`] entries no 10-bit gate spells on, with the reason.
+#[cfg(test)]
+const NEVER_ON_10BIT: &[(&str, &str)] = &[
+    (
+        "deblocking",
+        "hole at both depths, see the 8-bit list (1 of the 15 10-bit gates pins =0, 14 default)",
+    ),
+    (
+        "enable-diff-wtd-comp",
+        "hole at both depths, see the 8-bit list (1 pinned off, 14 defaulted)",
+    ),
+    (
+        "enable-fwd-kf",
+        "hole at both depths, see the 8-bit list (3 pinned off, 12 defaulted)",
+    ),
+    (
+        "enable-interintra-wedge",
+        "on in no 10-bit gate: 5 pin =0, 10 default -- wedge interintra masks are exercised at 8 bits only, the shape that cost lane-hbdinter two 10-bit-only defects",
+    ),
+    (
+        "enable-onesided-comp",
+        "hole at both depths, see the 8-bit list (5 pinned off, 10 defaulted)",
+    ),
+    (
+        "enable-tx-size-search",
+        "hole at both depths, see the 8-bit list (11 of 15 pin =0)",
+    ),
+    (
+        "multi-tile",
+        "on in no 10-bit gate: all 15 leave --tile-columns/--tile-rows defaulted at 0, so every 10-bit stream is single-tile and no tile edge or per-tile CDF reset is checked at high bit depth",
+    ),
 ];
 
 #[cfg(test)]
 mod tests {
-    use super::{NEVER_EXERCISED, NEVER_EXERCISED_8BIT, NEVER_EXERCISED_10BIT, TOOL_UNIVERSE};
+    use super::{
+        ALIASES, DEFAULT_ON_TOOLS, NEVER_EXERCISED, NEVER_EXERCISED_8BIT, NEVER_EXERCISED_10BIT,
+        NEVER_ON_10BIT, NEVER_ON_8BIT, On, TOOL_UNIVERSE,
+    };
     use std::collections::{BTreeMap, BTreeSet};
 
     /// Bodies of the real-aomenc gates: a `fn` body carrying the shared
@@ -239,6 +346,43 @@ mod tests {
             here.insert(flag.to_owned(), value);
         }
         here
+    }
+
+    /// Every `--flag=value` spelled inside one gate body, values kept whole
+    /// (`--cpu-used=4`, `--tile-columns=2`), not just their first character.
+    fn settings_in(gate: &str) -> BTreeMap<String, String> {
+        let mut here = BTreeMap::new();
+        for (i, _) in gate.match_indices("\"--") {
+            let rest = &gate[i + 3..];
+            let Some(end) = rest.find('"') else { continue };
+            let Some((flag, value)) = rest[..end].split_once('=') else {
+                continue;
+            };
+            here.insert(flag.to_owned(), value.to_owned());
+        }
+        here
+    }
+
+    /// Whether a gate body spells one [`DEFAULT_ON_TOOLS`] entry on / off.
+    fn default_on_state(gate: &str, spellings: &[&str], on: On) -> Option<bool> {
+        let here = settings_in(gate);
+        let mut state = None;
+        for spelling in spellings {
+            let Some(value) = here.get(*spelling) else {
+                continue;
+            };
+            let Ok(value) = value.parse::<u32>() else {
+                continue;
+            };
+            let is_on = match on {
+                On::NonZero => value != 0,
+                On::AtMost(limit) => value <= limit,
+            };
+            // Any spelling that says "on" wins: --tile-columns=0 --tile-rows=1
+            // is a multi-tile stream.
+            state = Some(state.unwrap_or(false) || is_on);
+        }
+        state
     }
 
     /// `--enable-*` settings per real-aomenc gate, derived from the gate
@@ -347,6 +491,13 @@ mod tests {
                     on.insert(flag);
                 }
             }
+            // A tool driven by its own spelling counts as exercised.
+            let here = settings_in(gate);
+            for (alias, tool) in ALIASES {
+                if here.get(*alias).is_some_and(|v| v != "0") {
+                    on.insert((*tool).to_owned());
+                }
+            }
         }
         on
     }
@@ -412,6 +563,112 @@ mod tests {
             );
             for flag in &holes {
                 println!("    --{flag}");
+            }
+        }
+    }
+
+    /// [`DEFAULT_ON_TOOLS`] per depth: `tool -> (off in N gates, on in N, defaulted in N)`.
+    fn default_on_settings(ten_bit: bool) -> (usize, BTreeMap<&'static str, (usize, usize, usize)>) {
+        let gates: Vec<&str> = gate_bodies()
+            .into_iter()
+            .filter(|b| is_ten_bit(b) == ten_bit)
+            .collect();
+        let mut per_tool = BTreeMap::new();
+        for &(tool, spellings, _, on) in DEFAULT_ON_TOOLS {
+            let states: Vec<Option<bool>> = gates
+                .iter()
+                .map(|g| default_on_state(g, spellings, on))
+                .collect();
+            let turned_on = states.iter().filter(|s| **s == Some(true)).count();
+            let turned_off = states.iter().filter(|s| **s == Some(false)).count();
+            per_tool.insert(
+                tool,
+                (turned_off, turned_on, gates.len() - turned_off - turned_on),
+            );
+        }
+        (gates.len(), per_tool)
+    }
+
+    /// The [`DEFAULT_ON_TOOLS`] no gate of this depth positively enables.
+    fn never_on_at(ten_bit: bool) -> BTreeSet<&'static str> {
+        default_on_settings(ten_bit)
+            .1
+            .into_iter()
+            .filter(|&(_, (_, on, _))| on == 0)
+            .map(|(tool, _)| tool)
+            .collect()
+    }
+
+    fn check_default_on(ten_bit: bool, listed: &[(&str, &str)]) {
+        let derived = never_on_at(ten_bit);
+        let listed: BTreeSet<&str> = listed.iter().map(|&(tool, _)| tool).collect();
+        let depth = if ten_bit { "10-bit" } else { "8-bit" };
+        let unlisted: Vec<&&str> = derived.difference(&listed).collect();
+        assert!(
+            unlisted.is_empty(),
+            "no {depth} gate spells an on-value for {unlisted:?}, so no real {depth} stream is \
+             proven to carry them -- switch the tool on in a {depth} gate that asserts it fired, \
+             or list it with a reason"
+        );
+        let stale: Vec<&&str> = listed.difference(&derived).collect();
+        assert!(
+            stale.is_empty(),
+            "the {depth} default-on list still names {stale:?}, but a {depth} gate now switches \
+             them on -- delete those entries, the coverage hole is closed"
+        );
+    }
+
+    #[test]
+    fn never_on_8bit_matches_the_gate_recipes() {
+        check_default_on(false, NEVER_ON_8BIT);
+    }
+
+    #[test]
+    fn never_on_10bit_matches_the_gate_recipes() {
+        check_default_on(true, NEVER_ON_10BIT);
+    }
+
+    /// A tool must not be pinned twice: [`TOOL_UNIVERSE`] already derives the
+    /// `--enable-*` spellings under the `=1` rule.
+    #[test]
+    fn default_on_tools_do_not_duplicate_the_universe() {
+        for &(tool, spellings, _, _) in DEFAULT_ON_TOOLS {
+            assert!(
+                !TOOL_UNIVERSE.contains(&tool),
+                "{tool} is already covered by TOOL_UNIVERSE"
+            );
+            assert!(!spellings.is_empty(), "{tool} has no aomenc spelling");
+        }
+        for (alias, tool) in ALIASES {
+            assert!(
+                TOOL_UNIVERSE.contains(tool),
+                "alias --{alias} names {tool}, which is not a TOOL_UNIVERSE tool"
+            );
+        }
+    }
+
+    /// `cargo test -p ec-av1 --lib gate_coverage -- --nocapture` prints the
+    /// default-on holes with their off/defaulted split.
+    #[test]
+    fn print_never_on_per_bit_depth() {
+        for (label, ten_bit) in [("8BIT", false), ("10BIT", true)] {
+            let (gate_count, per_tool) = default_on_settings(ten_bit);
+            let holes = never_on_at(ten_bit);
+            println!(
+                "NEVER_ON_{label} ({} of {}, over {gate_count} {label} gates):",
+                holes.len(),
+                DEFAULT_ON_TOOLS.len()
+            );
+            for tool in &holes {
+                let (off, _, defaulted) = per_tool[tool];
+                let spellings = DEFAULT_ON_TOOLS
+                    .iter()
+                    .find(|e| e.0 == *tool)
+                    .map(|e| e.1.join(","))
+                    .unwrap_or_default();
+                println!(
+                    "    {tool} (--{spellings}): off in {off}, defaulted in {defaulted}, on in 0"
+                );
             }
         }
     }
