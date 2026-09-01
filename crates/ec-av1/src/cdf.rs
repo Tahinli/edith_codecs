@@ -25,6 +25,33 @@ pub const PARTITION_W64: [[u16; 11]; 4] = [
 
 /// `Default_Skip_Cdf` (spec 9.4): indexed by how many of the blocks above
 /// and left were skipped.
+/// `default_txfm_partition_cdf` (entropymode.c): an inter block's
+/// `txfm_split` flag (spec 5.11.17 `read_var_tx_size`), indexed by
+/// `txfm_partition_context` -- `category * 3 + above + left`, 21 contexts.
+pub const TXFM_PARTITION: [[u16; 3]; 21] = [
+    [28581, 32768, 0],
+    [23846, 32768, 0],
+    [20847, 32768, 0],
+    [24315, 32768, 0],
+    [18196, 32768, 0],
+    [12133, 32768, 0],
+    [18791, 32768, 0],
+    [10887, 32768, 0],
+    [11005, 32768, 0],
+    [27179, 32768, 0],
+    [20004, 32768, 0],
+    [11281, 32768, 0],
+    [26549, 32768, 0],
+    [19308, 32768, 0],
+    [14224, 32768, 0],
+    [28015, 32768, 0],
+    [21546, 32768, 0],
+    [14400, 32768, 0],
+    [28165, 32768, 0],
+    [22401, 32768, 0],
+    [16088, 32768, 0],
+];
+
 pub const SKIP: [[u16; 3]; 3] = [[31671, 32768, 0], [16515, 32768, 0], [4576, 32768, 0]];
 
 /// `Default_Intra_Frame_Y_Mode_Cdf` (spec 9.4): the thirteen luma intra
@@ -1380,6 +1407,20 @@ pub const INTER_TX_TYPE_SET3_8: [u16; 3] = [4167, 32768, 0];
 pub const INTER_TX_TYPE_SET2_16: [u16; 13] = [
     770, 2421, 5225, 12907, 15819, 18927, 21561, 24089, 26595, 28526, 30529, 32768, 0,
 ];
+
+/// `Default_Inter_Ext_Tx_Cdf`'s `TX_SET_INTER_1` (`EXT_TX_SET_ALL16`) row for
+/// `TX_4X4` (lane-txselect): the sixteen-symbol transform type of an
+/// `is_inter` 4x4 luma transform when `reduced_tx_set == 0` (libaom
+/// `entropymode.c` `default_inter_ext_tx_cdf[1][TX_4X4]`).
+pub const INTER_TX_TYPE_SET1_4: [u16; 17] = [
+    4458, 5560, 7695, 9709, 13330, 14789, 17537, 20266, 21504, 22848, 23934, 25474, 27727, 28915,
+    30631, 32768, 0,
+];
+
+/// `Default_Inter_Ext_Tx_Cdf`'s `TX_SET_INTER_3` (`EXT_TX_SET_DCT_IDTX`) row
+/// for `TX_4X4` (lane-txselect), the reduced two-symbol counterpart of
+/// [`INTER_TX_TYPE_SET1_4`] (`default_inter_ext_tx_cdf[3][TX_4X4]`).
+pub const INTER_TX_TYPE_SET3_4: [u16; 3] = [16384, 32768, 0];
 
 /// `Default_Inter_Ext_Tx_Cdf`'s `TX_SET_INTER_1` (`EXT_TX_SET_ALL16`) row for
 /// `TX_8X8` (lane-cdffwd2): the full sixteen-symbol transform type of an
