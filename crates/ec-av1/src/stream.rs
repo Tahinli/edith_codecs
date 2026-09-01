@@ -30,6 +30,30 @@ use crate::decode::{
 };
 use crate::encode::Picture;
 
+/// lane-hidden r1: where `EC_AV1_FINAL_DUMP`'s per-frame dump goes for the
+/// current thread, overriding the environment variable. Every ffmpeg/aomdec
+/// pixel gate in this repo compares SHOWN frames only (class
+/// gate-blind-to-hidden-frames), so the hidden alt-ref frames a real aomenc
+/// stream carries were never compared at all; the gate that does compare
+/// them needs a dump path that cannot race a sibling test's decode on
+/// another thread, which a process-global env var cannot give.
+thread_local! {
+    static FINAL_DUMP_PREFIX: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Sets (or with `None` clears) this thread's `EC_AV1_FINAL_DUMP` prefix.
+#[allow(dead_code)]
+pub(crate) fn set_final_dump_prefix(prefix: Option<String>) {
+    FINAL_DUMP_PREFIX.with(|c| *c.borrow_mut() = prefix);
+}
+
+fn final_dump_prefix() -> Option<String> {
+    FINAL_DUMP_PREFIX
+        .with(|c| c.borrow().clone())
+        .or_else(|| std::env::var("EC_AV1_FINAL_DUMP").ok())
+}
+
 /// Decode every frame in a raw AV1 OBU stream, in coding order.
 ///
 /// A key frame becomes the reference for the inter frames that follow it,
@@ -46,6 +70,7 @@ use crate::encode::Picture;
 /// crate's tile decoders do not reconstruct (see their own docs), or when an
 /// inter frame appears before any key frame has supplied a reference.
 pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
+    let final_dump = final_dump_prefix();
     let mut parser = Av1Parser::new();
     let mut pictures = Vec::new();
     let mut pictures_decoded: usize = 0;
@@ -720,6 +745,30 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 let _ = f.write_all(&narrow(&picture.y));
                 let _ = f.write_all(&narrow(&picture.u));
                 let _ = f.write_all(&narrow(&picture.v));
+            }
+        }
+        // lane-hidden r1: the frame exactly as it is about to be stored into
+        // the reference slots -- after deblock/CDEF/LR/superres, in DECODE
+        // order, hidden (`show_frame == 0`) alt-ref frames included, and
+        // bit-depth correct (8-bit as u8, 10/12-bit as u16 LE) unlike the
+        // u8-narrowing diagnostic dumps above. Matches the instrumented
+        // aomdec's own `EC_AV1_FINAL_DUMP` rung byte for byte
+        // (scripts/instrument-aom-oracle.sh rung 12), which is what makes a
+        // hidden frame's pixels comparable at all.
+        if let Some(prefix) = &final_dump {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::File::create(format!("{prefix}.f{pictures_decoded}")) {
+                let mut buf = Vec::new();
+                for plane in [&picture.y, &picture.u, &picture.v] {
+                    if bit_depth == 8 {
+                        buf.extend(plane.iter().map(|&s| s as u8));
+                    } else {
+                        for &s in plane {
+                            buf.extend_from_slice(&s.to_le_bytes());
+                        }
+                    }
+                }
+                let _ = f.write_all(&buf);
             }
         }
         pictures_decoded += 1;
@@ -1589,6 +1638,237 @@ mod tests {
             aomenc_path().display()
         );
         present
+    }
+
+    /// The instrumented `aomdec` beside the `aomenc` oracle
+    /// (`scripts/build-aom-oracle.sh` + `scripts/instrument-aom-oracle.sh`).
+    fn aomdec_path() -> std::path::PathBuf {
+        if let Some(p) = std::env::var_os("EC_AV1_AOMDEC") {
+            return std::path::PathBuf::from(p);
+        }
+        aomenc_path().with_file_name("aomdec")
+    }
+
+    /// Decodes `stream` with both this decoder and the instrumented oracle
+    /// `aomdec`, and compares EVERY decoded frame in DECODE order --
+    /// including the hidden (`show_frame == 0`) alt-ref frames no other gate
+    /// in this repo can see, because `decode_stream` only pushes shown
+    /// frames and `ffmpeg -f obu ... rawvideo` only emits shown frames
+    /// (class gate-blind-to-hidden-frames: a hidden frame's defect surfaces
+    /// only as drift on some later shown frame, if at all).
+    ///
+    /// Both sides write the final, post-deblock/CDEF/LR/superres frame as it
+    /// is stored into the reference buffer (`EC_AV1_FINAL_DUMP`, ours in
+    /// `decode_stream`, the oracle's in rung 12 of
+    /// `scripts/instrument-aom-oracle.sh`), 8-bit as u8 / high bitdepth as
+    /// u16 LE. Returns `(frames_decoded, hidden_frames)`.
+    fn decode_all_frames_vs_oracle(stream: &[u8], name: &str) -> (usize, usize) {
+        let dir = std::env::temp_dir().join(format!("ec-av1-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let obu = dir.join("in.obu");
+        std::fs::write(&obu, stream).expect("writing the stream");
+        let aom_prefix = dir.join("aom");
+        let out = Command::new(aomdec_path())
+            .args(["--codec=av1", "-o"])
+            .arg(dir.join("out.y4m"))
+            .arg(&obu)
+            .env("EC_AV1_FINAL_DUMP", &aom_prefix)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("aomdec failed to run");
+        assert!(
+            out.status.success(),
+            "{name}: the oracle aomdec refused the stream: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let count_dumps = |prefix: &std::path::Path| -> usize {
+            let mut n = 0usize;
+            while std::path::PathBuf::from(format!("{}.f{n}", prefix.display())).is_file() {
+                n += 1;
+            }
+            n
+        };
+        let oracle_frames = count_dumps(&aom_prefix);
+        assert!(
+            oracle_frames > 0,
+            "{name}: the oracle wrote no EC_AV1_FINAL_DUMP frames -- rung 12 of \
+             scripts/instrument-aom-oracle.sh is missing from {}",
+            aomdec_path().display()
+        );
+        let ours_prefix = dir.join("ours");
+        set_final_dump_prefix(Some(ours_prefix.display().to_string()));
+        let decoded = decode_stream(stream);
+        set_final_dump_prefix(None);
+        let shown = decoded
+            .unwrap_or_else(|e| panic!("{name}: this decoder refused the stream: {e}"))
+            .len();
+        let our_frames = count_dumps(&ours_prefix);
+        assert_eq!(
+            our_frames, oracle_frames,
+            "{name}: decoded {our_frames} frames in decode order, the oracle decoded \
+             {oracle_frames}"
+        );
+        for i in 0..oracle_frames {
+            let want =
+                std::fs::read(format!("{}.f{i}", aom_prefix.display())).expect("oracle dump");
+            let got = std::fs::read(format!("{}.f{i}", ours_prefix.display())).expect("our dump");
+            assert_eq!(
+                got.len(),
+                want.len(),
+                "{name}: decode-order frame {i} is {} bytes, the oracle's is {}",
+                got.len(),
+                want.len()
+            );
+            if let Some(at) = got.iter().zip(&want).position(|(a, b)| a != b) {
+                let differing = got.iter().zip(&want).filter(|(a, b)| a != b).count();
+                panic!(
+                    "{name}: decode-order frame {i} of {oracle_frames} ({shown} shown, {} \
+                     hidden) differs from the oracle at byte {at} (ours {} vs {}), {differing} \
+                     bytes differ -- stream pinned at {}",
+                    oracle_frames - shown,
+                    got[at],
+                    want[at],
+                    obu.display()
+                );
+            }
+        }
+        let hidden = oracle_frames - shown;
+        let _ = std::fs::remove_dir_all(&dir);
+        (oracle_frames, hidden)
+    }
+
+    /// The repo's first hidden-frame pixel gate. Every other aomenc gate
+    /// here compares `decode_stream`'s output against `ffmpeg -f obu`, and
+    /// both sides emit SHOWN frames only -- so an alt-ref frame that is
+    /// decoded, stored into a reference slot and never displayed was, until
+    /// this gate, never compared to anything (class
+    /// gate-blind-to-hidden-frames). His films are aomenc-encoded with the
+    /// default `--lag-in-frames`, so they are full of exactly these frames.
+    ///
+    /// `--auto-alt-ref=1 --lag-in-frames=25` on moving content makes aomenc
+    /// build alt-refs; `--arnr-maxframes=0` is load-bearing -- with libaom's
+    /// temporal filter on, this fixture's alt-ref candidates get filtered
+    /// away and the encoder emits ZERO hidden frames (measured: 0 hidden
+    /// with the filter on, 3 with it off), which would have made the gate
+    /// vacuous. The `hidden >= 2` assertion is hard, on both bit depths, so
+    /// a recipe that stops producing hidden frames fails rather than skips.
+    #[test]
+    fn a_real_aomenc_altref_sequence_hidden_frames_decode_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_altref_sequence_hidden_frames_decode_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        for bit_depth in [8u32, 10u32] {
+            let (width, height, frames) = (64usize, 64usize, 40usize);
+            let duration = frames as f64 / 25.0;
+            let source = format!("testsrc2=size={width}x{height}:duration={duration}:rate=25");
+            let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v", "error", "-f", "lavfi", "-i", &source, "-t", &duration.to_string(),
+                    "-pix_fmt", pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "{NAME}: ffmpeg refused the {bit_depth}-bit fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let depth_arg = format!("--bit-depth={bit_depth}");
+            let input_depth_arg = format!("--input-bit-depth={bit_depth}");
+            let mut child = Command::new(aomenc_path())
+                .args([
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    "--cq-level=45",
+                    "--cpu-used=0",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--kf-max-dist=1000",
+                    "--enable-order-hint=1",
+                    "--auto-alt-ref=1",
+                    "--lag-in-frames=25",
+                    "--arnr-maxframes=0",
+                    &depth_arg,
+                    &input_depth_arg,
+                    // The same tool set every sibling inter gate pins -- the
+                    // open capability gaps (rect/AB partitions, warped/OBMC,
+                    // masked compound, palette, ...) are other lanes' work;
+                    // this gate is about hidden frames, not about them.
+                    "--enable-warped-motion=0",
+                    "--enable-obmc=0",
+                    "--enable-masked-comp=0",
+                    "--enable-interintra-comp=0",
+                    "--enable-onesided-comp=0",
+                    "--enable-interintra-wedge=0",
+                    "--enable-smooth-interintra=0",
+                    "--enable-rect-partitions=0",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    "--enable-filter-intra=0",
+                    "--enable-smooth-intra=0",
+                    "--enable-paeth-intra=0",
+                    "--enable-directional-intra=0",
+                    "--enable-angle-delta=0",
+                    "--enable-tx-size-search=0",
+                    "--enable-cdef=0",
+                    "--enable-restoration=0",
+                    "--max-partition-size=32",
+                    "--min-partition-size=32",
+                    "--enable-palette=0",
+                    "--enable-intrabc=0",
+                    "--enable-cfl-intra=0",
+                    "--enable-ref-frame-mvs=0",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "{NAME}: aomenc refused the {bit_depth}-bit fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let (total, hidden) =
+                decode_all_frames_vs_oracle(&stream, &format!("altref-hidden-{bit_depth}bit"));
+            assert!(
+                hidden >= 2,
+                "{NAME}: the {bit_depth}-bit recipe produced only {hidden} hidden frame(s) of \
+                 {total} decoded -- the gate would be vacuous (class \
+                 gate-blind-to-hidden-frames)"
+            );
+            eprintln!(
+                "{NAME} {bit_depth}-bit: {total} frames decoded, {hidden} hidden, all \
+                 pixel-exact vs the oracle in decode order"
+            );
+        }
     }
 
     /// A real `aomenc` filter-intra fixture: every other intra mode disabled
