@@ -807,6 +807,22 @@ pub(crate) fn rect_split_tx_hits() -> usize {
     RECT_SPLIT_TX_HITS.with(|c| c.get())
 }
 
+// The subset of [`RECT_SPLIT_TX_HITS`] that is BOTH superblock-level (one
+// side 64) AND split past the first depth, i.e. tiled more than one unit in
+// each axis -- the only shape with a transform unit that has neighbours on
+// two sides inside its own strip (`row_off > 0 && col_off > 0`), and the one
+// no gate fired before lane-rectsplit r2 (the shared counter above also
+// counts 32x32-level and depth-1 strips, so it cannot prove this case).
+thread_local! {
+    static RECT_SPLIT_SB_INTERIOR_TU_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`RECT_SPLIT_SB_INTERIOR_TU_HITS`].
+pub(crate) fn rect_split_sb_interior_tu_hits() -> usize {
+    RECT_SPLIT_SB_INTERIOR_TU_HITS.with(|c| c.get())
+}
+
 // How many HORZ/VERT intra strips actually predicted with filter intra
 // (lane-rectsplit r1) -- the case `decode_block_rect` refused by name
 // ("this decoder predicts square-only") until `predict_filter_intra` took
@@ -1674,11 +1690,32 @@ fn base_ctx(
         // (lane-sbpart r8 root cause: `(row=1, col=0)` reads ctx 2 under the
         // square table vs the real ctx 13 the rect table gives).
         TxClass::TwoD => {
+            // OPEN (lane-rectsplit r3, measured): the two rect
+            // transcriptions in [`cdf`] are packed `[col][row]` -- libaom's
+            // `av1_nz_map_ctx_offset_32x64` is a FLAT 1024-entry array whose
+            // `coeff_idx` is COLUMN-major with stride 32 (`TX_CLASS_HORIZ`
+            // reads its column back as `coeff_idx >> bhl`), and entries
+            // 0..5 / 32..35 match the generating rule (txb_common.h:199-209)
+            // only under `flat[col * 32 + row]`;
+            // `nz_map_ctx_offset_tables_match_the_rect_rule` pins that.
+            // Yet reading `[col][row]` here BREAKS
+            // `a_real_aomenc_stream_with_a_superblock_level_horz_vert_partition_decodes_pixel_exact`
+            // (seed 43) while `[row][col]` breaks the split-transform SB gate
+            // (seed 50); swapping the shape test as well fails BOTH ways. So
+            // this read is not the defect -- our (row, col) here come from a
+            // square 32x32-corner scan whose orientation relative to libaom's
+            // column-major `coeff_idx` is what is really unproven, and each
+            // "fix" only moves which rare corner position desyncs. Left at
+            // the r1 reading, the one every merged gate is green under.
+            // `EC_NZOFF_DUMP=1` prints every rect-shaped read.
             let table = match rect_shape {
                 Some((w, h)) if w < h => &cdf::NZ_MAP_CTX_OFFSET_32X64,
                 Some((w, h)) if w > h => &cdf::NZ_MAP_CTX_OFFSET_64X32,
                 _ => &cdf::NZ_MAP_CTX_OFFSET_32,
             };
+            if std::env::var_os("EC_NZOFF_DUMP").is_some() {
+                eprintln!("NZOFF side={side} shape={rect_shape:?} row={row} col={col}");
+            }
             ctx + table[row.min(4)][col.min(4)] as usize
         }
         TxClass::Horiz => ctx + nz_map_ctx_offset_1d(col.min(31)),
@@ -3880,12 +3917,22 @@ fn decode_rect_split(
         (16, 32) => Some((TxbSet::ChromaRect32x16, &SCAN_16X32[..])),
         _ => None,
     };
+    // lane-rectsplit r2 (verifier finding): with both callers wired
+    // (`decode_block_rect`'s 32x16/16x32 and `decode_block_rect64`'s
+    // 64x32/32x64) every shape that reaches here has a table above, so this
+    // arm is UNREACHABLE today. It stays as the shape guard for the next
+    // caller -- a new strip size would otherwise hit the `expect` below and
+    // panic instead of refusing by name -- and so stays in
+    // `refusal_inventory::REFUSALS`.
     if !m.skip && chroma.is_none() {
         return Err(unsupported(
             "a coded HORZ/VERT strip whose chroma transform has no rect coefficient tables here",
         ));
     }
     RECT_SPLIT_TX_HITS.with(|c| c.set(c.get() + 1));
+    if bw.max(bh) == 64 && bw / tx > 1 && bh / tx > 1 {
+        RECT_SPLIT_SB_INTERIOR_TU_HITS.with(|c| c.set(c.get() + 1));
+    }
     // LUMA: `bw/tx` x `bh/tx` square transform units, raster order.
     let luma_set = txbset_for(tx, reduced_tx_set);
     let luma_scan = default_scan(tx);
@@ -4147,6 +4194,13 @@ fn decode_block_rect(
         // [`decode_rect_split`]. `depth_to_tx_size` of a 2:1 strip is square
         // from the first step on, so `bw.min(bh) >> (depth - 1)` names it.
         let tx = bw.min(bh) >> (depth - 1);
+        if std::env::var_os("EC_SBPART_DUMP64").is_some() {
+            eprintln!(
+                "DUMP64SPLIT mi_r={mi_r} mi_c={mi_c} px={px} py={py} bw={bw} bh={bh} \
+                 depth={depth} tx={tx} mode={mode} uv={uv_predict_mode} skip={skip} \
+                 angle_y={angle_delta_y}"
+            );
+        }
         let modes = RectStripModes {
             skip,
             mode,
@@ -4669,18 +4723,16 @@ fn decode_block_rect64(
     };
     if depth != 0 {
         TX_DEPTH_HITS.with(|c| c.set(c.get() + 1));
-        // lane-rectsplit r1: [`decode_rect_split`] handles this shape too
-        // (`sub_tx_size_map[TX_64X32]` is `TX_32X32`, so a depth-1 unit here
-        // is a plain square 32x32) and its 32x32-level sibling arm in
-        // [`decode_block_rect`] is gated pixel-exact -- but at the SUPERBLOCK
-        // level the gate
+        // lane-rectsplit r1/r3: [`decode_rect_split`] handles this shape too
+        // and the per-unit port is wired here, but the gate
         // (`a_real_aomenc_stream_with_a_split_transform_superblock_strip_decodes_pixel_exact`,
-        // `#[ignore]`d with its measurement) still comes out ONE sample off
-        // (seed 50, luma (171,56) ours 147 vs ffmpeg 148, inside a 64x32
-        // strip whose transform resolved to depth 2 / TX_16X16). A refusal
-        // this lane could not lift is not a refusal it may silently ship
-        // wrong pixels past, so the named refusal stays until that gate is
-        // green.
+        // `#[ignore]`d with its measurement) is still RED at seed 50 (luma
+        // (171,56), ours 147 vs ffmpeg 148). r2 believed the cause was a
+        // transposed `av1_nz_map_ctx_offset` read; r3 measured that
+        // transposing it turns THIS gate green and the merged SB-level
+        // HORZ/VERT partition gate RED (seed 43), so the cause is still
+        // open. A refusal this lane cannot lift is not one it may ship wrong
+        // pixels past.
         return Err(unsupported(
             "a superblock-level HORZ/VERT strip with a split transform (per-unit rect \
              prediction is not ported)",
@@ -15376,6 +15428,38 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// lane-rectsplit r2: `av1_nz_map_ctx_offset` is packed COLUMN-major, so
+    /// the two rect transcriptions in [`cdf`] must be read `[col][row]`.
+    /// [`base_ctx_rect`] states libaom's generating rule
+    /// (`txb_common.h:199-209`) in display coordinates; this pins the tables
+    /// against it, which is what a transposed read would break.
+    #[test]
+    fn nz_map_ctx_offset_tables_match_the_rect_rule() {
+        for (w, h, table) in [
+            (32usize, 64usize, &cdf::NZ_MAP_CTX_OFFSET_32X64),
+            (64, 32, &cdf::NZ_MAP_CTX_OFFSET_64X32),
+        ] {
+            for row in 0..5usize {
+                for col in 0..5usize {
+                    let want = if row == 0 && col == 0 {
+                        0
+                    } else if w < h && row < 2 {
+                        11
+                    } else if w > h && col < 2 {
+                        16
+                    } else {
+                        cdf::NZ_MAP_CTX_OFFSET_32[row][col]
+                    };
+                    assert_eq!(
+                        table[col][row],
+                        want,
+                        "{w}x{h} nz_map offset at display (row {row}, col {col})"
+                    );
+                }
+            }
+        }
+    }
 
     // `crate::tile`'s `flat_key_frame_tile`/`dc_key_frame_tile_levels`/
     // `split_dc_key_frame_tile` are not exercised here: they are synthetic
