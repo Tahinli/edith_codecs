@@ -12597,6 +12597,9 @@ mod tests {
         let mut matched = 0u32;
         let mut matched_10bit = 0u32;
         let mut compared_rect_tus = 0usize;
+        let mut compared_rect_parts = 0usize;
+        let mut compared_tx_depths = 0usize;
+        let mut compared_class1 = 0usize;
         let refusals_before = crate::decode::rect_class1_refusals();
         let n_attempts: u32 = std::env::var("EC_RECTCLASS_GATE_ATTEMPTS")
             .ok()
@@ -12608,14 +12611,26 @@ mod tests {
             let seed = 42 + attempt / 2;
             let ten_bit = attempt % 2 == 1;
             let pix_fmt = if ten_bit { "yuv420p10le" } else { "yuv420p" };
-            let source = gradients_source(seed, width, height, "duration=0.04:rate=25");
+            // Content + quantiser sweep: the 1D (`V_DCT`/`H_DCT`) types RD can
+            // only pick on strongly one-directional detail, and only when the
+            // quantiser leaves that detail in the residual -- smooth gradients
+            // at cq 45 produced exactly zero of them (measured this round),
+            // which would have made the `--enable-flip-idtx=1` arrival assert
+            // fail rather than the gate pass vacuously.
+            let period = [4u32, 6, 8, 12, 16][(attempt as usize / 2) % 5];
+            let source = format!("testsrc2=size={width}x{height}:rate=25");
+            let filter = format!(
+                "geq=lum='128+80*sin(2*PI*Y/{period})':cb='128+60*sin(2*PI*X/{period})':cr=128,\
+                 noise=alls=6:allf=t"
+            );
+            let cq = if attempt % 4 < 2 { "--cq-level=20" } else { "--cq-level=40" };
             let y4m = Command::new("ffmpeg")
                 .args([
                     // `-strict -1`: y4m calls 10-bit an unofficial pixel
                     // format and refuses to write the header otherwise (no-op
                     // at 8 bit).
-                    "-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", pix_fmt, "-strict",
-                    "-1", "-f", "yuv4mpegpipe", "-",
+                    "-v", "error", "-f", "lavfi", "-i", &source, "-vf", &filter, "-t", "0.04",
+                    "-pix_fmt", pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-",
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -12627,23 +12642,17 @@ mod tests {
                 "ffmpeg fixture: {}",
                 String::from_utf8_lossy(&y4m.stderr)
             );
-            // Class `aomenc-first-flag-wins`: this lane's overrides come
-            // BEFORE the base recipe, or they are silently inert.
+            // aomenc keeps the LAST occurrence of a repeated `--enable-*`
+            // flag (measured 2026-09-02 by md5 of four orderings), so this
+            // lane's overrides come AFTER the base recipe. They are also
+            // proven to have ARRIVED rather than assumed: the asserts below
+            // pin a nonzero rect-partition, tx-depth and 1D-tx-class counter
+            // on pixel-compared attempts, one per override.
             let mut args: Vec<&str> = vec![
-                "--enable-rect-partitions=1",
-                "--enable-tx-size-search=1",
-                "--enable-flip-idtx=1",
-                "--min-partition-size=8",
-                "--max-partition-size=32",
-            ];
-            if ten_bit {
-                args.extend_from_slice(&["--input-bit-depth=10", "--bit-depth=10"]);
-            }
-            args.extend_from_slice(&[
                 "--codec=av1",
                 "--passes=1",
                 "--end-usage=q",
-                "--cq-level=45",
+                cq,
                 "--cpu-used=0",
                 "--threads=1",
                 "--row-mt=0",
@@ -12656,6 +12665,21 @@ mod tests {
                 "--enable-filter-intra=0",
                 "--enable-cfl-intra=0",
                 "--enable-intrabc=0",
+            ];
+            if ten_bit {
+                args.extend_from_slice(&["--input-bit-depth=10", "--bit-depth=10"]);
+            }
+            args.extend_from_slice(&[
+                "--enable-rect-partitions=1",
+                "--enable-tx-size-search=1",
+                "--enable-flip-idtx=1",
+                // Without this aomenc's reduced tx set narrows every block to
+                // DCT_DCT/IDTX and no 1D type can be coded at all -- the flag
+                // that actually gates the class, as the arrival assert below
+                // proved by staying at 0 without it.
+                "--reduced-tx-type-set=0",
+                "--min-partition-size=8",
+                "--max-partition-size=32",
                 "--obu",
                 "-o",
                 "-",
@@ -12700,6 +12724,9 @@ mod tests {
                 );
             }
             let attempt_before = crate::decode::rect_coeff_tu_hits();
+            let rect_before = crate::decode::rect_partition_hits();
+            let depth_before = crate::decode::tx_depth_hits();
+            let class1_before = crate::decode::tx_class1_hits();
             let frames = match decode_stream(&stream) {
                 Err(e) => {
                     let msg = e.to_string();
@@ -12732,6 +12759,9 @@ mod tests {
                 "{NAME}: V vs ffmpeg (seed {seed}, 10bit {ten_bit})"
             );
             compared_rect_tus += crate::decode::rect_coeff_tu_hits() - attempt_before;
+            compared_rect_parts += crate::decode::rect_partition_hits() - rect_before;
+            compared_tx_depths += crate::decode::tx_depth_hits() - depth_before;
+            compared_class1 += crate::decode::tx_class1_hits() - class1_before;
             matched += 1;
             matched_10bit += u32::from(ten_bit);
         }
@@ -12752,6 +12782,24 @@ mod tests {
              ({matched} matches, {named_refusals} refusals out of {n_attempts}) -- the gate \
              measured nothing about rect coefficient reading"
         );
+        // FLAG ARRIVAL, one assert per override (a flag whose counter stays
+        // at 0 is an inert flag, not a passing gate).
+        assert!(
+            compared_rect_parts > 0,
+            "{NAME}: --enable-rect-partitions=1 never produced a rect partition on a compared \
+             attempt ({matched} matches) -- the flag did not arrive"
+        );
+        assert!(
+            compared_tx_depths > 0,
+            "{NAME}: --enable-tx-size-search=1 never produced a nonzero tx depth on a compared \
+             attempt ({matched} matches) -- the flag did not arrive"
+        );
+        assert!(
+            compared_class1 > 0,
+            "{NAME}: --enable-flip-idtx=1 never produced a V_DCT/H_DCT transform on a compared \
+             attempt ({matched} matches) -- the 1D types live only in the extended ext-tx sets \
+             this flag enables, so the flag did not arrive"
+        );
         assert_eq!(
             class1_refusals, 0,
             "{NAME}: a rect transform unit reached read_coeffs_rect with a coded tx_type \
@@ -12762,7 +12810,8 @@ mod tests {
             "{NAME}: {matched} pixel-exact decodes ({named_refusals} named refusals out of \
              {n_attempts} attempts, {matched_10bit} of the matches 10-bit), rect coefficient \
              TUs on compared attempts: {compared_rect_tus}, 1D-class-on-rect refusals: \
-             {class1_refusals}"
+             {class1_refusals}; flag arrival: rect partitions {compared_rect_parts}, tx \
+             depths {compared_tx_depths}, 1D-class (square) transforms {compared_class1}"
         );
     }
 
