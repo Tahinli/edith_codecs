@@ -114,7 +114,10 @@ pub(crate) fn upscale_row(row: &[u8], real_right_margin: &[u8], out_width: usize
     padded[pad..pad + in_width].copy_from_slice(row);
     let real_n = real_right_margin.len().min(pad);
     padded[pad + in_width..pad + in_width + real_n].copy_from_slice(&real_right_margin[..real_n]);
-    let replicate_from = real_right_margin.last().copied().unwrap_or(row[in_width - 1]);
+    let replicate_from = real_right_margin
+        .last()
+        .copied()
+        .unwrap_or(row[in_width - 1]);
     padded[pad + in_width + real_n..].fill(replicate_from);
 
     // `av1_convolve_horiz_rs_c` is called with `input - 1` and itself
@@ -262,7 +265,9 @@ mod tests {
         upscale_row(&row, &[], 16, &mut out);
         assert_eq!(
             out,
-            [9, 12, 17, 23, 28, 32, 37, 43, 48, 53, 58, 62, 67, 73, 78, 81]
+            [
+                9, 12, 17, 23, 28, 32, 37, 43, 48, 53, 58, 62, 67, 73, 78, 81
+            ]
         );
     }
 
@@ -295,6 +300,9 @@ mod tests {
         let real_margin = [140u8];
         let mut out = [0u8; 64];
         upscale_row(&row, &real_margin, 64, &mut out);
-        assert_eq!(out[62], 141, "column 62 must match libaom, not the old replicate-padded 140");
+        assert_eq!(
+            out[62], 141,
+            "column 62 must match libaom, not the old replicate-padded 140"
+        );
     }
 }

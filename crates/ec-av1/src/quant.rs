@@ -225,7 +225,15 @@ pub fn dequant(levels: &[i32], side: usize, bit_depth: u8, q_idx: i32) -> Vec<i3
 /// [`dequant`] widened to `(w, h)` (lane-recttx), threading the same
 /// [`QuantDeltas`]-shaped `dc_delta`/`ac_delta` pair as [`dequant_coeff_wh`].
 #[allow(clippy::too_many_arguments)]
-pub fn dequant_wh(levels: &[i32], w: usize, h: usize, bit_depth: u8, q_idx: i32, dc_delta: i32, ac_delta: i32) -> Vec<i32> {
+pub fn dequant_wh(
+    levels: &[i32],
+    w: usize,
+    h: usize,
+    bit_depth: u8,
+    q_idx: i32,
+    dc_delta: i32,
+    ac_delta: i32,
+) -> Vec<i32> {
     levels
         .iter()
         .enumerate()

@@ -680,8 +680,14 @@ mod tests {
                         width,
                         height,
                         y: bytes[..luma].iter().map(|&v| u16::from(v)).collect(),
-                        u: bytes[luma..luma + chroma].iter().map(|&v| u16::from(v)).collect(),
-                        v: bytes[luma + chroma..].iter().map(|&v| u16::from(v)).collect(),
+                        u: bytes[luma..luma + chroma]
+                            .iter()
+                            .map(|&v| u16::from(v))
+                            .collect(),
+                        v: bytes[luma + chroma..]
+                            .iter()
+                            .map(|&v| u16::from(v))
+                            .collect(),
                     }
                 })
                 .collect(),

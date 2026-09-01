@@ -62,7 +62,12 @@ fn inverse_recenter(r: u32, v: u32) -> u32 {
 /// `aom_read_primitive_refsubexpfin` (`inv_recenter_finite_nonneg` composed
 /// with `read_primitive_subexpfin`): a value in `[0, n)` recentred around
 /// `reference`.
-fn decode_unsigned_subexp_with_ref_msac(dec: &mut SymbolDecoder, n: u32, k: u32, reference: u32) -> u32 {
+fn decode_unsigned_subexp_with_ref_msac(
+    dec: &mut SymbolDecoder,
+    n: u32,
+    k: u32,
+    reference: u32,
+) -> u32 {
     let v = decode_subexp_msac(dec, n, k);
     if (reference << 1) <= n {
         inverse_recenter(reference, v)
@@ -73,7 +78,13 @@ fn decode_unsigned_subexp_with_ref_msac(dec: &mut SymbolDecoder, n: u32, k: u32,
 
 /// Signed wrapper, matching the way `read_wiener_filter`/`read_sgrproj_filter`
 /// call `aom_read_primitive_refsubexpfin(rb, max-min+1, k, ref-min)+min`.
-fn decode_signed_subexp_with_ref_msac(dec: &mut SymbolDecoder, low: i32, high: i32, k: u32, reference: i32) -> i32 {
+fn decode_signed_subexp_with_ref_msac(
+    dec: &mut SymbolDecoder,
+    low: i32,
+    high: i32,
+    k: u32,
+    reference: i32,
+) -> i32 {
     let n = (high - low) as u32;
     let r = (reference - low).clamp(0, n as i32) as u32;
     decode_unsigned_subexp_with_ref_msac(dec, n, k, r) as i32 + low
@@ -138,7 +149,11 @@ fn read_wiener_direction(dec: &mut SymbolDecoder, chroma: bool, reference: &[i32
 
 /// `read_wiener_filter` (decodeframe.c ~1595): both directions, updating
 /// `reference` in place (the running per-plane, per-tile reference state).
-fn read_wiener_filter(dec: &mut SymbolDecoder, chroma: bool, reference: &mut WienerInfo) -> WienerInfo {
+fn read_wiener_filter(
+    dec: &mut SymbolDecoder,
+    chroma: bool,
+    reference: &mut WienerInfo,
+) -> WienerInfo {
     let vfilter = read_wiener_direction(dec, chroma, &reference.vfilter);
     let hfilter = read_wiener_direction(dec, chroma, &reference.hfilter);
     let info = WienerInfo { vfilter, hfilter };
@@ -539,7 +554,9 @@ fn apply_wiener_stripe(
             for (t, &tap) in info.hfilter.iter().enumerate() {
                 let x = col - 3 + t as i64;
                 sum += tap as i64
-                    * lr_sample(cdef, deblocked, stride, plane_w, plane_h, v_start, v_end, row, x) as i64;
+                    * lr_sample(
+                        cdef, deblocked, stride, plane_w, plane_h, v_start, v_end, row, x,
+                    ) as i64;
             }
             // `WIENER_CLAMP_LIMIT(round0=3, bd=8) - 1`.
             inter[r * w + c] = round2(sum, 3).clamp(0, 8191) as i32;
@@ -551,7 +568,8 @@ fn apply_wiener_stripe(
             for (t, &tap) in info.vfilter.iter().enumerate() {
                 sum += tap as i64 * inter[(r + t) * w + c] as i64;
             }
-            out[(v_start + r) * stride + h_start + c] = round2(sum, 11).clamp(0, crate::decode::sample_max() as i64) as u16;
+            out[(v_start + r) * stride + h_start + c] =
+                round2(sum, 11).clamp(0, crate::decode::sample_max() as i64) as u16;
         }
     }
 }
@@ -568,31 +586,27 @@ fn apply_wiener_stripe(
 // `~/.cache/aom-oracle/src/av1/common/restoration.c` to rule out any other
 // transcription slip.
 const SGR_X_BY_XPLUS1: [i32; 256] = [
-    1, 128, 171, 192, 205, 213, 219, 224, 228, 230, 233, 235, 236, 238, 239,
-    240, 241, 242, 243, 243, 244, 244, 245, 245, 246, 246, 247, 247, 247, 247,
-    248, 248, 248, 248, 249, 249, 249, 249, 249, 250, 250, 250, 250, 250, 250,
-    250, 251, 251, 251, 251, 251, 251, 251, 251, 251, 251, 252, 252, 252, 252,
-    252, 252, 252, 252, 252, 252, 252, 252, 252, 252, 252, 252, 252, 253, 253,
-    253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253,
-    253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 254, 254, 254,
-    254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254,
-    254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254,
-    254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254,
-    254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254,
-    254, 254, 254, 254, 254, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
-    256,
+    1, 128, 171, 192, 205, 213, 219, 224, 228, 230, 233, 235, 236, 238, 239, 240, 241, 242, 243,
+    243, 244, 244, 245, 245, 246, 246, 247, 247, 247, 247, 248, 248, 248, 248, 249, 249, 249, 249,
+    249, 250, 250, 250, 250, 250, 250, 250, 251, 251, 251, 251, 251, 251, 251, 251, 251, 251, 252,
+    252, 252, 252, 252, 252, 252, 252, 252, 252, 252, 252, 252, 252, 252, 252, 252, 253, 253, 253,
+    253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253, 253,
+    253, 253, 253, 253, 253, 253, 253, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254,
+    254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254,
+    254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254,
+    254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 254, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255, 256,
 ];
 
 /// `av1_one_by_x` (`restoration.c`): `round(4096/n)` for `n` in `1..=25`
 /// (`MAX_NELEM`, `(2*MAX_RADIUS+1)^2`), indexed `[n-1]`.
 const SGR_ONE_BY_X: [i32; 25] = [
-    4096, 2048, 1365, 1024, 819, 683, 585, 512, 455, 410, 372, 341, 315, 293, 273, 256, 241, 228, 216, 205, 195, 186,
-    178, 171, 164,
+    4096, 2048, 1365, 1024, 819, 683, 585, 512, 455, 410, 372, 341, 315, 293, 273, 256, 241, 228,
+    216, 205, 195, 186, 178, 171, 164,
 ];
 
 const SGRPROJ_MTABLE_BITS: u32 = 20;
@@ -640,8 +654,9 @@ fn compute_ab(
                 let row = v_start as i64 + i + dr as i64;
                 for dc in -r..=r {
                     let col = h_start as i64 + j + dc as i64;
-                    let px =
-                        lr_sample(cdef, deblocked, stride, plane_w, plane_h, v_start, v_end, row, col) as i64;
+                    let px = lr_sample(
+                        cdef, deblocked, stride, plane_w, plane_h, v_start, v_end, row, col,
+                    ) as i64;
                     a += px * px;
                     b += px;
                 }
@@ -697,8 +712,16 @@ fn apply_sgrproj_stripe(
     let gw = w + 2;
     let idx = |gi: i64, gj: i64| -> usize { (gi + 1) as usize * gw + (gj + 1) as usize };
 
-    let ab0 = (r0 > 0).then(|| compute_ab(cdef, deblocked, stride, plane_w, plane_h, h_start, v_start, v_end, w, h, r0, s0));
-    let ab1 = (r1 > 0).then(|| compute_ab(cdef, deblocked, stride, plane_w, plane_h, h_start, v_start, v_end, w, h, r1, s1));
+    let ab0 = (r0 > 0).then(|| {
+        compute_ab(
+            cdef, deblocked, stride, plane_w, plane_h, h_start, v_start, v_end, w, h, r0, s0,
+        )
+    });
+    let ab1 = (r1 > 0).then(|| {
+        compute_ab(
+            cdef, deblocked, stride, plane_w, plane_h, h_start, v_start, v_end, w, h, r1, s1,
+        )
+    });
 
     // r8: call-unique debug dump -- r6's coordinate-only gate (`v_start==60`)
     // matched several unrelated calls across the gate's attempt sweep, so its
@@ -711,7 +734,9 @@ fn apply_sgrproj_stripe(
         let bytes: Vec<i32> = (59..=61)
             .flat_map(|row| {
                 (5..=7).map(move |col| {
-                    lr_sample(cdef, deblocked, stride, plane_w, plane_h, v_start, v_end, row, col)
+                    lr_sample(
+                        cdef, deblocked, stride, plane_w, plane_h, v_start, v_end, row, col,
+                    )
                 })
             })
             .collect();
@@ -788,7 +813,8 @@ fn apply_sgrproj_stripe(
                 let (a_ur, b_ur) = ab[idx(i - 1, j + 1)];
                 let (a_dl, b_dl) = ab[idx(i + 1, j - 1)];
                 let (a_dr, b_dr) = ab[idx(i + 1, j + 1)];
-                let a = (a_c + a_u + a_d + a_l + a_r) as i64 * 4 + (a_ul + a_ur + a_dl + a_dr) as i64 * 3;
+                let a = (a_c + a_u + a_d + a_l + a_r) as i64 * 4
+                    + (a_ul + a_ur + a_dl + a_dr) as i64 * 3;
                 let b = (b_c + b_u + b_d + b_l + b_r) * 4 + (b_ul + b_ur + b_dl + b_dr) * 3;
                 let flt1 = round2(a * dgd + b, SGRPROJ_SGR_BITS + 5 - SGRPROJ_RST_BITS);
                 v += xq[1] as i64 * (flt1 - u);
@@ -801,13 +827,20 @@ fn apply_sgrproj_stripe(
                         "EC_LR_CALL_DUMP combine: c={:?} u_tap(row60)={:?} d={:?} l={:?} r={:?} \
                          ul={:?} ur={:?} dl={:?} dr={:?} dense a={a} b={b} dgd={dgd} \
                          u={u} flt1={flt1} xq={xq:?} v_before_final_round={v}",
-                        ab[idx(i, j)], ab[idx(i - 1, j)], ab[idx(i + 1, j)], ab[idx(i, j - 1)],
-                        ab[idx(i, j + 1)], ab[idx(i - 1, j - 1)], ab[idx(i - 1, j + 1)],
-                        ab[idx(i + 1, j - 1)], ab[idx(i + 1, j + 1)]
+                        ab[idx(i, j)],
+                        ab[idx(i - 1, j)],
+                        ab[idx(i + 1, j)],
+                        ab[idx(i, j - 1)],
+                        ab[idx(i, j + 1)],
+                        ab[idx(i - 1, j - 1)],
+                        ab[idx(i - 1, j + 1)],
+                        ab[idx(i + 1, j - 1)],
+                        ab[idx(i + 1, j + 1)]
                     );
                 }
             }
-            let out_v = round2(v, SGRPROJ_PRJ_BITS as u32 + SGRPROJ_RST_BITS).clamp(0, crate::decode::sample_max() as i64) as u16;
+            let out_v = round2(v, SGRPROJ_PRJ_BITS as u32 + SGRPROJ_RST_BITS)
+                .clamp(0, crate::decode::sample_max() as i64) as u16;
             out[(v_start as i64 + i) as usize * stride + (h_start as i64 + j) as usize] = out_v;
         }
     }
@@ -847,10 +880,30 @@ fn filter_restoration_unit(
         let stripe_v_end = stripe_v_start + h;
         match filter {
             UnitFilter::Wiener(info) => apply_wiener_stripe(
-                out, cdef, deblocked, stride, plane_w, plane_h, h_start, h_end, stripe_v_start, stripe_v_end, &info,
+                out,
+                cdef,
+                deblocked,
+                stride,
+                plane_w,
+                plane_h,
+                h_start,
+                h_end,
+                stripe_v_start,
+                stripe_v_end,
+                &info,
             ),
             UnitFilter::Sgrproj(info) => apply_sgrproj_stripe(
-                out, cdef, deblocked, stride, plane_w, plane_h, h_start, h_end, stripe_v_start, stripe_v_end, &info,
+                out,
+                cdef,
+                deblocked,
+                stride,
+                plane_w,
+                plane_h,
+                h_start,
+                h_end,
+                stripe_v_start,
+                stripe_v_end,
+                &info,
             ),
             UnitFilter::None => {}
         }
@@ -893,7 +946,11 @@ pub(crate) fn apply_loop_restoration_plane(
     let mut rrow = 0usize;
     while y0 < plane_h as u32 {
         let remaining_h = plane_h as u32 - y0;
-        let uh = if remaining_h < ext_size { remaining_h } else { unit_size };
+        let uh = if remaining_h < ext_size {
+            remaining_h
+        } else {
+            unit_size
+        };
         let v_start = (y0 as i64 - voffset as i64).max(0) as u32;
         let mut v_end = y0 + uh;
         if v_end < plane_h as u32 {
@@ -904,7 +961,11 @@ pub(crate) fn apply_loop_restoration_plane(
         let mut rcol = 0usize;
         while x0 < plane_w as u32 {
             let remaining_w = plane_w as u32 - x0;
-            let uw = if remaining_w < ext_size { remaining_w } else { unit_size };
+            let uw = if remaining_w < ext_size {
+                remaining_w
+            } else {
+                unit_size
+            };
             let filter = grid.get(plane, rrow, rcol);
             if filter != UnitFilter::None {
                 filter_restoration_unit(
@@ -928,7 +989,10 @@ pub(crate) fn apply_loop_restoration_plane(
         y0 += uh;
         rrow += 1;
     }
-    debug_assert_eq!(rrow, grid.vert_units[plane], "RU row walk must match RestorationGrid::new's count_units");
+    debug_assert_eq!(
+        rrow, grid.vert_units[plane],
+        "RU row walk must match RestorationGrid::new's count_units"
+    );
     out
 }
 
@@ -985,7 +1049,13 @@ mod tests {
         }
     }
 
-    fn write_unsigned_subexp_with_ref(enc: &mut SymbolEncoder, n: u32, k: u32, reference: u32, v: u32) {
+    fn write_unsigned_subexp_with_ref(
+        enc: &mut SymbolEncoder,
+        n: u32,
+        k: u32,
+        reference: u32,
+        v: u32,
+    ) {
         let r = reference.clamp(0, n.saturating_sub(1));
         let coded = if (r << 1) <= n {
             recenter(r, v)
@@ -1001,7 +1071,15 @@ mod tests {
     /// `SGRPROJ_PRJ_MAX-MIN+1`.
     #[test]
     fn subexp_roundtrips_every_value() {
-        for &(num_syms, k) in &[(16u32, 1u32), (32, 2), (64, 3), (96, 4), (128, 4), (3, 1), (1, 3)] {
+        for &(num_syms, k) in &[
+            (16u32, 1u32),
+            (32, 2),
+            (64, 3),
+            (96, 4),
+            (128, 4),
+            (3, 1),
+            (1, 3),
+        ] {
             for v in 0..num_syms {
                 let mut enc = SymbolEncoder::new();
                 write_subexp(&mut enc, num_syms, k, v);
@@ -1039,10 +1117,10 @@ mod tests {
     #[test]
     fn signed_subexp_with_ref_roundtrips() {
         let cases: [(i32, i32, u32); 4] = [
-            (-5, 11, 1),   // Wiener tap0
-            (-23, 9, 2),   // Wiener tap1
-            (-17, 47, 3),  // Wiener tap2
-            (-96, 32, 4),  // SGR xqd0
+            (-5, 11, 1),  // Wiener tap0
+            (-23, 9, 2),  // Wiener tap1
+            (-17, 47, 3), // Wiener tap2
+            (-96, 32, 4), // SGR xqd0
         ];
         for (low, high, k) in cases {
             let n = (high - low) as u32;
@@ -1054,8 +1132,12 @@ mod tests {
                     write_unsigned_subexp_with_ref(&mut enc, n, k, r, coded_v);
                     let payload = enc.finish();
                     let mut dec = SymbolDecoder::new(&payload);
-                    let got = decode_signed_subexp_with_ref_msac(&mut dec, low, high, k, reference_v);
-                    assert_eq!(got, v, "low={low} high={high} k={k} reference={reference_v} v={v}");
+                    let got =
+                        decode_signed_subexp_with_ref_msac(&mut dec, low, high, k, reference_v);
+                    assert_eq!(
+                        got, v,
+                        "low={low} high={high} k={k} reference={reference_v} v={v}"
+                    );
                 }
             }
         }

@@ -195,24 +195,13 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         // now read (`maybe_read_cdef_idx` in decode.rs) and threaded into
         // [`crate::decode::apply_cdef`]'s per-superblock strength lookup, so
         // a `cdef_bits > 0` stream no longer needs this refusal.
-        // An intra frame's `decode_key_frame_tile*` now reads `tx_depth`
-        // under `TxMode::Select` (lane-av1txsel, spec 5.11.16): the key-frame
-        // decode path threads `tx_select` through `decode_block`/
-        // `decode_leaf8`, and refuses on its own (a named `unsupported`, not
-        // a silent desync) the one case it still cannot code -- a resolved
-        // 4x4 luma transform, which has no coefficient tables here. This
-        // refusal is narrowed to what genuinely still has no reader at all:
-        // `decode_inter_frame`'s inter path never threads `tx_select`
-        // through its own block loop, so an inter frame under
-        // `TxMode::Select` still desyncs the same way the comment above used
-        // to describe for every frame -- lane-av1real r3's
-        // luma-near-flat-vs-ffmpeg-gradient bug.
-        if header.tx_mode == TxMode::Select && header.frame_type != FrameType::Key {
-            return Err(Error::unsupported(
-                "AV1 decode_stream",
-                "an inter frame using TxMode::Select (this decoder's inter path never reads a tx_depth symbol, so it desyncs after the first block's mode)",
-            ));
-        }
+        // Both frame types now read their transform size under
+        // `TxMode::Select`: an intra frame's `decode_key_frame_tile*` reads
+        // `tx_depth` (lane-av1txsel, spec 5.11.16), and an inter frame's
+        // `decode_inter_block`/`decode_inter_block8` read the recursive
+        // `txfm_split` var-tx tree (lane-txselect, spec 5.11.17) -- so the
+        // blanket inter-frame refusal that used to stand here is gone. What
+        // remains refused is named at its own site in `read_block_tx_size`.
         // lane-av1real r11's blindness-audit sweep (`read_intra_frame_mode_info`,
         // libaom decodemv.c): three more per-block/per-SB symbols this crate
         // never reads at all, each gated by a header field this decoder
@@ -615,6 +604,7 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 header.skip_mode_present,
                 header.skip_mode_frame,
                 header.reduced_tx_set,
+                header.tx_mode == TxMode::Select,
                 header.is_motion_mode_switchable,
                 header.allow_warped_motion,
                 header.allow_screen_content_tools,
@@ -931,9 +921,18 @@ mod tests {
                 Pic {
                     width,
                     height,
-                    y: out.stdout[base..base + luma].iter().map(|&v| u16::from(v)).collect(),
-                    u: out.stdout[base + luma..base + luma + chroma].iter().map(|&v| u16::from(v)).collect(),
-                    v: out.stdout[base + luma + chroma..base + frame_bytes].iter().map(|&v| u16::from(v)).collect(),
+                    y: out.stdout[base..base + luma]
+                        .iter()
+                        .map(|&v| u16::from(v))
+                        .collect(),
+                    u: out.stdout[base + luma..base + luma + chroma]
+                        .iter()
+                        .map(|&v| u16::from(v))
+                        .collect(),
+                    v: out.stdout[base + luma + chroma..base + frame_bytes]
+                        .iter()
+                        .map(|&v| u16::from(v))
+                        .collect(),
                 }
             })
             .collect()
@@ -952,8 +951,17 @@ mod tests {
     ) -> Vec<Pic> {
         let mut child = Command::new("ffmpeg")
             .args([
-                "-v", "error", "-f", "obu", "-i", "-", "-f", "rawvideo", "-pix_fmt",
-                "yuv420p10le", "-",
+                "-v",
+                "error",
+                "-f",
+                "obu",
+                "-i",
+                "-",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuv420p10le",
+                "-",
             ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1195,7 +1203,9 @@ mod tests {
             hash_color(seed, 2),
             hash_color(seed, 3),
         );
-        format!("gradients=size={width}x{height}:c0={c0}:c1={c1}:c2={c2}:c3={c3}:seed={seed}:{tail}")
+        format!(
+            "gradients=size={width}x{height}:c0={c0}:c1={c1}:c2={c2}:c3={c3}:seed={seed}:{tail}"
+        )
     }
 
     /// The determinism guard: same seed twice must byte-match ffmpeg's own
@@ -1210,7 +1220,16 @@ mod tests {
         fn render_hash(lavfi: &str) -> Vec<u8> {
             let out = Command::new("ffmpeg")
                 .args([
-                    "-v", "error", "-f", "lavfi", "-i", lavfi, "-frames:v", "1", "-f", "rawvideo",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    lavfi,
+                    "-frames:v",
+                    "1",
+                    "-f",
+                    "rawvideo",
                     "-",
                 ])
                 .stdin(Stdio::null())
@@ -2333,6 +2352,215 @@ mod tests {
         );
     }
 
+    /// lane-txselect's decisive gate: a real aomenc INTER sequence WITHOUT
+    /// `--enable-tx-size-search=0`, the flag every other inter recipe in this
+    /// file pins off precisely to keep the stream on `TxMode::Largest`.
+    /// Dropped, aomenc takes its own default (`TX_MODE_SELECT` -- which is
+    /// what both of the user's real films use), and an inter block's
+    /// transform size is then the recursive `txfm_split` tree of spec
+    /// 5.11.17 rather than one whole-block transform. A stream that decoded
+    /// pixel-exact while every `txfm_split` symbol resolved to "no split"
+    /// would prove nothing (it is `TxMode::Largest` by another name), so this
+    /// gate hard-asserts BOTH counters: at least one `txfm_split` symbol read
+    /// AND at least one split actually taken. Exhausting every attempt is a
+    /// FAILURE, not a SKIP -- an unfired gate is a vacuous gate.
+    #[test]
+    fn a_real_aomenc_inter_sequence_with_tx_select_decodes_pixel_exact() {
+        if !have_ffmpeg() {
+            eprintln!(
+                "SKIP a_real_aomenc_inter_sequence_with_tx_select_decodes_pixel_exact: no ffmpeg"
+            );
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!(
+                "SKIP a_real_aomenc_inter_sequence_with_tx_select_decodes_pixel_exact: no aomenc at {}",
+                aomenc_path().display()
+            );
+            return;
+        }
+        let (width, height, frame_count) = (64usize, 64usize, 4usize);
+        let mut refusals = Vec::new();
+        for attempt in 0..40u32 {
+            let seed = 42 + attempt;
+            // Detail is what makes aomenc's RD prefer a split transform; a
+            // flat gradient resolves every `txfm_split` to 0. `mandelbrot`'s
+            // fractal boundary is the same source the sibling intra tx-select
+            // gate uses, at a different `start_scale` per attempt.
+            let source = format!(
+                "mandelbrot=size=64x64:start_scale={}:rate=25",
+                5.0 - f64::from(attempt) * 0.06
+            );
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    // Desaturated chroma: `uv_mode` stays DC_PRED, so the
+                    // still-refused directional-chroma gap never fires and
+                    // luma detail alone drives the transform split.
+                    "-vf",
+                    "hue=s=0",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-t",
+                    "0.16",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let mut child = Command::new(aomenc_path())
+                .args([
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    "--cq-level=55",
+                    "--cpu-used=0",
+                    "--lag-in-frames=0",
+                    "--auto-alt-ref=0",
+                    "--kf-max-dist=1000",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--enable-order-hint=0",
+                    "--enable-warped-motion=0",
+                    "--enable-obmc=0",
+                    "--enable-masked-comp=0",
+                    "--enable-interintra-comp=0",
+                    "--enable-dist-wtd-comp=0",
+                    "--enable-diff-wtd-comp=0",
+                    "--enable-onesided-comp=0",
+                    "--enable-interintra-wedge=0",
+                    "--enable-smooth-interintra=0",
+                    "--enable-rect-partitions=0",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    "--enable-filter-intra=0",
+                    "--enable-smooth-intra=0",
+                    "--enable-paeth-intra=0",
+                    "--enable-directional-intra=0",
+                    "--enable-angle-delta=0",
+                    // DELIBERATELY ABSENT: --enable-tx-size-search=0.
+                    "--enable-cdef=0",
+                    "--enable-restoration=0",
+                    "--max-partition-size=32",
+                    // Sub-16 inter partitions are a separate named refusal
+                    // (this decoder codes no inter block below 16x16 through
+                    // the square path this gate drives), and detailed content
+                    // makes aomenc's RD reach for them on nearly every seed.
+                    "--min-partition-size=16",
+                    "--enable-palette=0",
+                    "--enable-intrabc=0",
+                    "--enable-cfl-intra=0",
+                    "--enable-ref-frame-mvs=0",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let (reads_before, hits_before) =
+                (decode::txfm_split_reads(), decode::txfm_split_hits());
+            let frames = match decode_stream(&stream) {
+                Ok(frames) => frames,
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "tx-select inter decode failed outright (seed {seed}): {msg}"
+                    );
+                    refusals.push(format!("seed {seed}: {msg}"));
+                    continue;
+                }
+            };
+            let (reads, hits) = (
+                decode::txfm_split_reads() - reads_before,
+                decode::txfm_split_hits() - hits_before,
+            );
+            if hits == 0 {
+                refusals.push(format!(
+                    "seed {seed}: decoded, but no block took a txfm_split ({reads} symbols read)"
+                ));
+                continue;
+            }
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
+            assert_eq!(frames.len(), frame_count);
+            eprintln!("txselect gate seed={seed}: txfm_split reads={reads} splits taken={hits}");
+            // Name the first differing sample before the assert fires: a
+            // 64x64 plane's `assert_eq!` output is 4096 numbers, useless for
+            // locating a desync.
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                for (plane, (g, w)) in [
+                    ("Y", (&got.y, &want.y)),
+                    ("U", (&got.u, &want.u)),
+                    ("V", (&got.v, &want.v)),
+                ] {
+                    let stride = if plane == "Y" { width } else { width / 2 };
+                    if let Some(at) = g.iter().zip(w.iter()).position(|(a, b)| a != b) {
+                        eprintln!(
+                            "txselect gate seed={seed}: frame {i} {plane} first diff at \
+                             ({}, {}) got {} want {} ({} samples differ)",
+                            at % stride,
+                            at / stride,
+                            g[at],
+                            w[at],
+                            g.iter().zip(w.iter()).filter(|(a, b)| a != b).count(),
+                        );
+                        let coords: Vec<String> = g
+                            .iter()
+                            .zip(w.iter())
+                            .enumerate()
+                            .filter(|(_, (a, b))| a != b)
+                            .take(12)
+                            .map(|(k, (a, b))| format!("({},{})={a}/{b}", k % stride, k / stride))
+                            .collect();
+                        eprintln!("txselect gate seed={seed}: frame {i} {plane} diffs {coords:?}");
+                    }
+                }
+            }
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(got.y, want.y, "frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(got.u, want.u, "frame {i} U vs ffmpeg (seed {seed})");
+                assert_eq!(got.v, want.v, "frame {i} V vs ffmpeg (seed {seed})");
+            }
+            return;
+        }
+        panic!(
+            "a_real_aomenc_inter_sequence_with_tx_select_decodes_pixel_exact never observed a \
+             taken txfm_split:\n{}",
+            refusals.join("\n")
+        );
+    }
+
     /// lane-chroma r2 stage 1: a real aomenc key frame with
     /// `--enable-smooth-intra=1` (opposite of every sibling recipe's `=0`)
     /// and `--enable-paeth-intra=0` -- paeth chroma stays off so the still-
@@ -2506,8 +2734,19 @@ mod tests {
             );
             let y4m = Command::new("ffmpeg")
                 .args([
-                    "-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", "yuv420p", "-t",
-                    "0.04", "-f", "yuv4mpegpipe", "-",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-t",
+                    "0.04",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -2779,13 +3018,7 @@ mod tests {
         let y4m = Command::new("ffmpeg")
             .args(["-v", "error", "-f", "lavfi", "-i"])
             .arg(&source)
-            .args([
-                "-pix_fmt",
-                "yuv420p",
-                "-f",
-                "yuv4mpegpipe",
-                "-",
-            ])
+            .args(["-pix_fmt", "yuv420p", "-f", "yuv4mpegpipe", "-"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -2893,7 +3126,10 @@ mod tests {
             if !ok {
                 let pin = std::env::temp_dir().join("ec-av1-deblocking-gate-fail.obu");
                 let _ = std::fs::write(&pin, &stream);
-                panic!("frame {i} mismatch vs ffmpeg -- stream pinned at {}", pin.display());
+                panic!(
+                    "frame {i} mismatch vs ffmpeg -- stream pinned at {}",
+                    pin.display()
+                );
             }
         }
     }
@@ -3828,32 +4064,41 @@ mod tests {
                         .zip(&ffmpeg_frames)
                         .any(|(got, want)| got.y != want.y || got.u != want.u || got.v != want.v);
                     if mismatched {
-                        let pin = std::env::temp_dir().join("ec-av1-reference-select-gate-fail.obu");
+                        let pin =
+                            std::env::temp_dir().join("ec-av1-reference-select-gate-fail.obu");
                         let _ = std::fs::write(&pin, &stream);
                         if let Ok(path) = std::env::var("EC_AV1_GATE_DUMP") {
                             std::fs::write(&path, &stream).expect("writing pinned stream");
-                            eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
+                            eprintln!(
+                                "EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}"
+                            );
                         }
                         for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
                             assert_eq!(
-                                got.y, want.y,
+                                got.y,
+                                want.y,
                                 "{NAME} frame {i} luma vs ffmpeg (seed {seed}) -- stream pinned at {}",
                                 pin.display()
                             );
                             assert_eq!(
-                                got.u, want.u,
+                                got.u,
+                                want.u,
                                 "{NAME} frame {i} U vs ffmpeg (seed {seed}) -- stream pinned at {}",
                                 pin.display()
                             );
                             assert_eq!(
-                                got.v, want.v,
+                                got.v,
+                                want.v,
                                 "{NAME} frame {i} V vs ffmpeg (seed {seed}) -- stream pinned at {}",
                                 pin.display()
                             );
                         }
                     } else {
                         for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                            assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                            assert_eq!(
+                                got.y, want.y,
+                                "{NAME} frame {i} luma vs ffmpeg (seed {seed})"
+                            );
                             assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                             assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
                         }
@@ -4024,17 +4269,20 @@ mod tests {
                 }
                 for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
                     assert_eq!(
-                        got.y, want.y,
+                        got.y,
+                        want.y,
                         "{NAME} frame {i} luma vs ffmpeg (seed {seed}) -- stream pinned at {}",
                         pin.display()
                     );
                     assert_eq!(
-                        got.u, want.u,
+                        got.u,
+                        want.u,
                         "{NAME} frame {i} U vs ffmpeg (seed {seed}) -- stream pinned at {}",
                         pin.display()
                     );
                     assert_eq!(
-                        got.v, want.v,
+                        got.v,
+                        want.v,
                         "{NAME} frame {i} V vs ffmpeg (seed {seed}) -- stream pinned at {}",
                         pin.display()
                     );
@@ -4198,7 +4446,10 @@ mod tests {
                 }
             }
             for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(
+                    got.y, want.y,
+                    "{NAME} frame {i} luma vs ffmpeg (seed {seed})"
+                );
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
             }
@@ -4389,7 +4640,10 @@ mod tests {
                 }
             }
             for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(
+                    got.y, want.y,
+                    "{NAME} frame {i} luma vs ffmpeg (seed {seed})"
+                );
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
             }
@@ -4555,7 +4809,10 @@ mod tests {
                 eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
             }
             for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(
+                    got.y, want.y,
+                    "{NAME} frame {i} luma vs ffmpeg (seed {seed})"
+                );
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
             }
@@ -4679,8 +4936,7 @@ mod tests {
         if let Ok(path) = std::env::var("EC_SUPERRES_STREAM_DUMP") {
             std::fs::write(path, &stream).expect("dump stream");
         }
-        let frames =
-            decode_stream(&stream).unwrap_or_else(|e| panic!("{NAME} refused: {e}"));
+        let frames = decode_stream(&stream).unwrap_or_else(|e| panic!("{NAME} refused: {e}"));
         assert_eq!(frames.len(), frame_count);
         let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
         for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
@@ -4825,8 +5081,7 @@ mod tests {
         if let Ok(path) = std::env::var("EC_SUPERRES_INTER_STREAM_DUMP") {
             std::fs::write(&path, &stream).expect("dump stream");
         }
-        let frames =
-            decode_stream(&stream).unwrap_or_else(|e| panic!("{NAME} refused: {e}"));
+        let frames = decode_stream(&stream).unwrap_or_else(|e| panic!("{NAME} refused: {e}"));
         assert_eq!(frames.len(), frame_count);
         let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
         for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
@@ -5004,7 +5259,10 @@ mod tests {
                 eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
             }
             for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(
+                    got.y, want.y,
+                    "{NAME} frame {i} luma vs ffmpeg (seed {seed})"
+                );
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
             }
@@ -5184,7 +5442,10 @@ mod tests {
                 eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
             }
             for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(
+                    got.y, want.y,
+                    "{NAME} frame {i} luma vs ffmpeg (seed {seed})"
+                );
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
             }
@@ -5505,7 +5766,10 @@ mod tests {
                 eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
             }
             for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(
+                    got.y, want.y,
+                    "{NAME} frame {i} luma vs ffmpeg (seed {seed})"
+                );
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
             }
@@ -5706,7 +5970,10 @@ mod tests {
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
             assert_eq!(frames.len(), frame_count);
             for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(
+                    got.y, want.y,
+                    "{NAME} frame {i} luma vs ffmpeg (seed {seed})"
+                );
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
             }
@@ -5912,7 +6179,10 @@ mod tests {
                 eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
             }
             for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(
+                    got.y, want.y,
+                    "{NAME} frame {i} luma vs ffmpeg (seed {seed})"
+                );
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
             }
@@ -5952,7 +6222,6 @@ mod tests {
             crate::decode::wedge_hits()
         );
     }
-
 
     /// lane-lr r3: proves stage 1/2's exit criterion -- a real
     /// `--enable-restoration=1` aomenc stream must survive the whole
@@ -6082,9 +6351,18 @@ mod tests {
                         );
                     }
                     for (i, (pic, refpic)) in pics.iter().zip(reference.iter()).enumerate() {
-                        assert_eq!(pic.y, refpic.y, "{NAME}: luma mismatch (seed {seed} frame {i})");
-                        assert_eq!(pic.u, refpic.u, "{NAME}: U mismatch (seed {seed} frame {i})");
-                        assert_eq!(pic.v, refpic.v, "{NAME}: V mismatch (seed {seed} frame {i})");
+                        assert_eq!(
+                            pic.y, refpic.y,
+                            "{NAME}: luma mismatch (seed {seed} frame {i})"
+                        );
+                        assert_eq!(
+                            pic.u, refpic.u,
+                            "{NAME}: U mismatch (seed {seed} frame {i})"
+                        );
+                        assert_eq!(
+                            pic.v, refpic.v,
+                            "{NAME}: V mismatch (seed {seed} frame {i})"
+                        );
                     }
                     lr_refusals += 1; // reused below as "attempts that actually exercised LR pixels"
                 }
@@ -6344,7 +6622,10 @@ mod tests {
                 eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
             }
             for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(
+                    got.y, want.y,
+                    "{NAME} frame {i} luma vs ffmpeg (seed {seed})"
+                );
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
             }
@@ -6373,8 +6654,16 @@ mod tests {
             eprintln!("SKIP: no ffmpeg/aomenc");
             return;
         }
-        let sizes: &[(usize, usize)] =
-            &[(8, 8), (16, 16), (32, 32), (16, 32), (32, 16), (64, 64), (48, 48), (24, 24)];
+        let sizes: &[(usize, usize)] = &[
+            (8, 8),
+            (16, 16),
+            (32, 32),
+            (16, 32),
+            (32, 16),
+            (64, 64),
+            (48, 48),
+            (24, 24),
+        ];
         for &(width, height) in sizes {
             let mut ok = 0u32;
             let mut bad = 0u32;
@@ -6389,26 +6678,53 @@ mod tests {
                 );
                 let y4m = Command::new("ffmpeg")
                     .args([
-                        "-v", "error", "-f", "lavfi", "-i", &source, "-t", "0.04", "-pix_fmt",
-                        "yuv420p", "-f", "yuv4mpegpipe", "-",
+                        "-v",
+                        "error",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        &source,
+                        "-t",
+                        "0.04",
+                        "-pix_fmt",
+                        "yuv420p",
+                        "-f",
+                        "yuv4mpegpipe",
+                        "-",
                     ])
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
                     .output()
                     .expect("ffmpeg failed to run");
-                assert!(y4m.status.success(), "ffmpeg fixture: {}", String::from_utf8_lossy(&y4m.stderr));
+                assert!(
+                    y4m.status.success(),
+                    "ffmpeg fixture: {}",
+                    String::from_utf8_lossy(&y4m.stderr)
+                );
                 let max_part = width.max(height).min(64).next_power_of_two();
                 let min_part = width.min(height).next_power_of_two().max(8).min(max_part);
                 let max_part_arg = format!("--max-partition-size={max_part}");
                 let min_part_arg = format!("--min-partition-size={min_part}");
                 let args: Vec<&str> = vec![
-                    "--codec=av1", "--passes=1", "--end-usage=q", "--cq-level=32",
-                    "--cpu-used=4", "--kf-max-dist=0", "--limit=1", "--threads=1",
-                    "--row-mt=0", "--enable-rect-partitions=0", "--enable-ab-partitions=0",
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    "--cq-level=32",
+                    "--cpu-used=4",
+                    "--kf-max-dist=0",
+                    "--limit=1",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--enable-rect-partitions=0",
+                    "--enable-ab-partitions=0",
                     "--enable-1to4-partitions=0",
-                    &max_part_arg, &min_part_arg,
-                    "--obu", "-o", "-", "-",
+                    &max_part_arg,
+                    &min_part_arg,
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
                 ];
                 let mut child = Command::new(aomenc_path())
                     .args(&args)
@@ -6417,9 +6733,18 @@ mod tests {
                     .stderr(Stdio::piped())
                     .spawn()
                     .expect("aomenc failed to start");
-                child.stdin.take().expect("aomenc stdin").write_all(&y4m.stdout).expect("write y4m");
+                child
+                    .stdin
+                    .take()
+                    .expect("aomenc stdin")
+                    .write_all(&y4m.stdout)
+                    .expect("write y4m");
                 let out = child.wait_with_output().expect("aomenc failed to run");
-                assert!(out.status.success(), "aomenc refused: {}", String::from_utf8_lossy(&out.stderr));
+                assert!(
+                    out.status.success(),
+                    "aomenc refused: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
                 let stream = out.stdout;
                 let frames = match decode_stream(&stream) {
                     Err(e) => {
@@ -6486,8 +6811,19 @@ mod tests {
         );
         let y4m = Command::new("ffmpeg")
             .args([
-                "-v", "error", "-f", "lavfi", "-i", &source, "-t", "0.04", "-pix_fmt", "yuv420p",
-                "-f", "yuv4mpegpipe", "-",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                &source,
+                "-t",
+                "0.04",
+                "-pix_fmt",
+                "yuv420p",
+                "-f",
+                "yuv4mpegpipe",
+                "-",
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -6496,12 +6832,25 @@ mod tests {
             .expect("ffmpeg failed to run");
         assert!(y4m.status.success());
         let args: Vec<&str> = vec![
-            "--codec=av1", "--passes=1", "--end-usage=q", "--cq-level=32", "--cpu-used=4",
-            "--kf-max-dist=0", "--limit=1", "--threads=1", "--row-mt=0",
-            "--enable-rect-partitions=0", "--enable-ab-partitions=0",
-            "--enable-1to4-partitions=0", "--max-partition-size=32", "--min-partition-size=32",
+            "--codec=av1",
+            "--passes=1",
+            "--end-usage=q",
+            "--cq-level=32",
+            "--cpu-used=4",
+            "--kf-max-dist=0",
+            "--limit=1",
+            "--threads=1",
+            "--row-mt=0",
+            "--enable-rect-partitions=0",
+            "--enable-ab-partitions=0",
+            "--enable-1to4-partitions=0",
+            "--max-partition-size=32",
+            "--min-partition-size=32",
             "--enable-filter-intra=0",
-            "--obu", "-o", "-", "-",
+            "--obu",
+            "-o",
+            "-",
+            "-",
         ];
         let mut child = Command::new(aomenc_path())
             .args(&args)
@@ -6589,9 +6938,9 @@ mod tests {
                 // below it, blending the wrong OBMC prediction there.
                 "rect-flake-3",
             ]
-                .iter()
-                .map(|n| format!("{fixtures}/{n}.obu"))
-                .collect(),
+            .iter()
+            .map(|n| format!("{fixtures}/{n}.obu"))
+            .collect(),
         };
         for path in paths {
             eprintln!("pin: {path}");
@@ -7590,9 +7939,18 @@ mod tests {
             );
 
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
-            assert_eq!(picture.y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg (seed {seed})");
-            assert_eq!(picture.u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg (seed {seed})");
-            assert_eq!(picture.v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg (seed {seed})");
+            assert_eq!(
+                picture.y, ffmpeg_frames[0].y,
+                "{NAME}: luma vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(
+                picture.u, ffmpeg_frames[0].u,
+                "{NAME}: U vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(
+                picture.v, ffmpeg_frames[0].v,
+                "{NAME}: V vs ffmpeg (seed {seed})"
+            );
             matched += 1;
         }
         assert!(
@@ -7804,9 +8162,18 @@ mod tests {
             );
 
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
-            assert_eq!(picture.y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg (seed {seed})");
-            assert_eq!(picture.u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg (seed {seed})");
-            assert_eq!(picture.v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg (seed {seed})");
+            assert_eq!(
+                picture.y, ffmpeg_frames[0].y,
+                "{NAME}: luma vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(
+                picture.u, ffmpeg_frames[0].u,
+                "{NAME}: U vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(
+                picture.v, ffmpeg_frames[0].v,
+                "{NAME}: V vs ffmpeg (seed {seed})"
+            );
             matched += 1;
         }
         assert!(
@@ -7843,8 +8210,17 @@ mod tests {
             let source = gradients_source(seed, width, height, "duration=0.04:rate=25");
             let y4m = Command::new("ffmpeg")
                 .args([
-                    "-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", "yuv420p", "-f",
-                    "yuv4mpegpipe", "-",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -7930,12 +8306,25 @@ mod tests {
                 "{NAME}: tile_hits delta was {hits}, expected >1 -- both tile rows must actually \
                  decode, not just tile 0 (seed {seed})"
             );
-            assert_eq!(pictures.len(), 1, "{NAME}: expected exactly 1 picture (seed {seed})");
+            assert_eq!(
+                pictures.len(),
+                1,
+                "{NAME}: expected exactly 1 picture (seed {seed})"
+            );
 
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
-            assert_eq!(pictures[0].y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg (seed {seed})");
-            assert_eq!(pictures[0].u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg (seed {seed})");
-            assert_eq!(pictures[0].v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg (seed {seed})");
+            assert_eq!(
+                pictures[0].y, ffmpeg_frames[0].y,
+                "{NAME}: luma vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(
+                pictures[0].u, ffmpeg_frames[0].u,
+                "{NAME}: U vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(
+                pictures[0].v, ffmpeg_frames[0].v,
+                "{NAME}: V vs ffmpeg (seed {seed})"
+            );
             matched += 1;
         }
         assert!(
@@ -7976,8 +8365,17 @@ mod tests {
             let source = gradients_source(seed, width, height, "duration=0.04:rate=25");
             let y4m = Command::new("ffmpeg")
                 .args([
-                    "-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", "yuv420p", "-f",
-                    "yuv4mpegpipe", "-",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -8126,9 +8524,18 @@ mod tests {
             );
 
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
-            assert_eq!(picture.y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg (seed {seed})");
-            assert_eq!(picture.u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg (seed {seed})");
-            assert_eq!(picture.v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg (seed {seed})");
+            assert_eq!(
+                picture.y, ffmpeg_frames[0].y,
+                "{NAME}: luma vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(
+                picture.u, ffmpeg_frames[0].u,
+                "{NAME}: U vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(
+                picture.v, ffmpeg_frames[0].v,
+                "{NAME}: V vs ffmpeg (seed {seed})"
+            );
             matched += 1;
         }
         assert!(
@@ -8178,8 +8585,17 @@ mod tests {
             let source = gradients_source(seed, width, height, "duration=0.04:rate=25");
             let y4m = Command::new("ffmpeg")
                 .args([
-                    "-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", "yuv420p", "-f",
-                    "yuv4mpegpipe", "-",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -8283,12 +8699,25 @@ mod tests {
                 "{NAME}: tile_hits delta was {hits}, expected >2 -- all four tile rows must \
                  actually decode, not just a subset (seed {seed})"
             );
-            assert_eq!(pictures.len(), 1, "{NAME}: expected exactly 1 picture (seed {seed})");
+            assert_eq!(
+                pictures.len(),
+                1,
+                "{NAME}: expected exactly 1 picture (seed {seed})"
+            );
 
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
-            assert_eq!(pictures[0].y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg (seed {seed})");
-            assert_eq!(pictures[0].u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg (seed {seed})");
-            assert_eq!(pictures[0].v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg (seed {seed})");
+            assert_eq!(
+                pictures[0].y, ffmpeg_frames[0].y,
+                "{NAME}: luma vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(
+                pictures[0].u, ffmpeg_frames[0].u,
+                "{NAME}: U vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(
+                pictures[0].v, ffmpeg_frames[0].v,
+                "{NAME}: V vs ffmpeg (seed {seed})"
+            );
             matched += 1;
         }
         assert!(
@@ -8320,7 +8749,8 @@ mod tests {
     /// comment used to describe are gone from `decode_stream`.
     #[test]
     fn a_real_aomenc_stream_with_two_tile_columns_decodes_through_decode_stream() {
-        const NAME: &str = "a_real_aomenc_stream_with_two_tile_columns_decodes_through_decode_stream";
+        const NAME: &str =
+            "a_real_aomenc_stream_with_two_tile_columns_decodes_through_decode_stream";
         if !have_ffmpeg() {
             eprintln!("SKIP {NAME}: no ffmpeg");
             return;
@@ -8337,8 +8767,17 @@ mod tests {
             let source = gradients_source(seed, width, height, "duration=0.04:rate=25");
             let y4m = Command::new("ffmpeg")
                 .args([
-                    "-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", "yuv420p", "-f",
-                    "yuv4mpegpipe", "-",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -8425,12 +8864,25 @@ mod tests {
                 "{NAME}: tile_hits delta was {hits}, expected >1 -- both tiles must actually \
                  decode, not just tile 0 (seed {seed})"
             );
-            assert_eq!(pictures.len(), 1, "{NAME}: expected exactly 1 picture (seed {seed})");
+            assert_eq!(
+                pictures.len(),
+                1,
+                "{NAME}: expected exactly 1 picture (seed {seed})"
+            );
 
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
-            assert_eq!(pictures[0].y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg (seed {seed})");
-            assert_eq!(pictures[0].u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg (seed {seed})");
-            assert_eq!(pictures[0].v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg (seed {seed})");
+            assert_eq!(
+                pictures[0].y, ffmpeg_frames[0].y,
+                "{NAME}: luma vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(
+                pictures[0].u, ffmpeg_frames[0].u,
+                "{NAME}: U vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(
+                pictures[0].v, ffmpeg_frames[0].v,
+                "{NAME}: V vs ffmpeg (seed {seed})"
+            );
             matched += 1;
         }
         assert!(
@@ -8615,7 +9067,10 @@ mod tests {
                 eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
             }
             for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(
+                    got.y, want.y,
+                    "{NAME} frame {i} luma vs ffmpeg (seed {seed})"
+                );
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
             }
@@ -8681,8 +9136,17 @@ mod tests {
             let source = gradients_source(seed, width, height, "duration=0.08:rate=25");
             let y4m = Command::new("ffmpeg")
                 .args([
-                    "-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", "yuv420p", "-f",
-                    "yuv4mpegpipe", "-",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -8806,11 +9270,18 @@ mod tests {
                 "{NAME}: tile_hits delta was {hits}, expected > {frames} -- both tiles of both \
                  frames must actually decode (seed {seed})"
             );
-            assert_eq!(pictures.len(), frames, "{NAME}: expected {frames} pictures (seed {seed})");
+            assert_eq!(
+                pictures.len(),
+                frames,
+                "{NAME}: expected {frames} pictures (seed {seed})"
+            );
 
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frames);
             for (i, (got, want)) in pictures.iter().zip(&ffmpeg_frames).enumerate() {
-                assert_eq!(got.y, want.y, "{NAME}: seed {seed} frame {i} luma vs ffmpeg");
+                assert_eq!(
+                    got.y, want.y,
+                    "{NAME}: seed {seed} frame {i} luma vs ffmpeg"
+                );
                 assert_eq!(got.u, want.u, "{NAME}: seed {seed} frame {i} U vs ffmpeg");
                 assert_eq!(got.v, want.v, "{NAME}: seed {seed} frame {i} V vs ffmpeg");
             }
@@ -8862,8 +9333,17 @@ mod tests {
             let source = gradients_source(seed, width, height, "duration=0.04:rate=25");
             let y4m = Command::new("ffmpeg")
                 .args([
-                    "-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", "yuv420p", "-f",
-                    "yuv4mpegpipe", "-",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -8964,12 +9444,25 @@ mod tests {
                 hits > 0,
                 "{NAME}: tile_hits delta was {hits}, expected >0 (seed {seed})"
             );
-            assert_eq!(pictures.len(), 1, "{NAME}: expected exactly 1 picture (seed {seed})");
+            assert_eq!(
+                pictures.len(),
+                1,
+                "{NAME}: expected exactly 1 picture (seed {seed})"
+            );
 
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
-            assert_eq!(pictures[0].y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg (seed {seed})");
-            assert_eq!(pictures[0].u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg (seed {seed})");
-            assert_eq!(pictures[0].v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg (seed {seed})");
+            assert_eq!(
+                pictures[0].y, ffmpeg_frames[0].y,
+                "{NAME}: luma vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(
+                pictures[0].u, ffmpeg_frames[0].u,
+                "{NAME}: U vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(
+                pictures[0].v, ffmpeg_frames[0].v,
+                "{NAME}: V vs ffmpeg (seed {seed})"
+            );
             matched += 1;
         }
         assert!(
@@ -9032,8 +9525,17 @@ mod tests {
             let source = gradients_source(seed, width, height, "duration=0.04:rate=25");
             let y4m = Command::new("ffmpeg")
                 .args([
-                    "-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", "yuv420p", "-f",
-                    "yuv4mpegpipe", "-",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -9145,12 +9647,25 @@ mod tests {
                 hits > 0,
                 "{NAME}: tile_hits delta was {hits}, expected >0 (seed {seed})"
             );
-            assert_eq!(pictures.len(), 1, "{NAME}: expected exactly 1 picture (seed {seed})");
+            assert_eq!(
+                pictures.len(),
+                1,
+                "{NAME}: expected exactly 1 picture (seed {seed})"
+            );
 
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
-            assert_eq!(pictures[0].y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg (seed {seed})");
-            assert_eq!(pictures[0].u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg (seed {seed})");
-            assert_eq!(pictures[0].v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg (seed {seed})");
+            assert_eq!(
+                pictures[0].y, ffmpeg_frames[0].y,
+                "{NAME}: luma vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(
+                pictures[0].u, ffmpeg_frames[0].u,
+                "{NAME}: U vs ffmpeg (seed {seed})"
+            );
+            assert_eq!(
+                pictures[0].v, ffmpeg_frames[0].v,
+                "{NAME}: V vs ffmpeg (seed {seed})"
+            );
             matched += 1;
         }
         assert!(
@@ -9311,7 +9826,10 @@ mod tests {
                 }
             }
             for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(
+                    got.y, want.y,
+                    "{NAME} frame {i} luma vs ffmpeg (seed {seed})"
+                );
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
             }
@@ -9353,9 +9871,8 @@ mod tests {
     #[test]
     #[ignore = "drift never observed this round -- see lanes/rect64q-r1.report.md"]
     fn a_real_aomenc_stream_with_a_superblock_level_horz_vert_partition_and_delta_q_decodes_pixel_exact()
-    {
-        const NAME: &str =
-            "a_real_aomenc_stream_with_a_superblock_level_horz_vert_partition_and_delta_q_decodes_pixel_exact";
+     {
+        const NAME: &str = "a_real_aomenc_stream_with_a_superblock_level_horz_vert_partition_and_delta_q_decodes_pixel_exact";
         let _gate_lock = lock_gate_counters();
         if !have_ffmpeg() {
             eprintln!("SKIP {NAME}: no ffmpeg");
@@ -9472,7 +9989,10 @@ mod tests {
                 }
             }
             for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
-                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(
+                    got.y, want.y,
+                    "{NAME} frame {i} luma vs ffmpeg (seed {seed})"
+                );
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
             }

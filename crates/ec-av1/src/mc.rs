@@ -403,7 +403,8 @@ pub fn predict_with_filters(
             for (t, &tap) in v_filter.iter().enumerate() {
                 sum += tap * intermediate[(row + t) * block_w + col];
             }
-            dst[row * block_w + col] = round2(sum, INTER_ROUND_1).clamp(0, crate::decode::sample_max()) as u16;
+            dst[row * block_w + col] =
+                round2(sum, INTER_ROUND_1).clamp(0, crate::decode::sample_max()) as u16;
         }
     }
 
@@ -656,7 +657,8 @@ pub fn combine_compound(
     assert_eq!(dst.len(), pred0.len(), "the destination is the block");
     for i in 0..dst.len() {
         let sum = pred0[i] * fwd_weight + pred1[i] * bck_weight;
-        dst[i] = round2(sum, INTER_POST_ROUND + DIST_PRECISION_BITS).clamp(0, crate::decode::sample_max()) as u16;
+        dst[i] = round2(sum, INTER_POST_ROUND + DIST_PRECISION_BITS)
+            .clamp(0, crate::decode::sample_max()) as u16;
     }
 }
 
@@ -719,7 +721,8 @@ pub fn blend_masked_compound(
                 i32::from(mask[i * mask_stride + j])
             };
             let res = (m * pred0[i * w + j] + (64 - m) * pred1[i * w + j]) >> 6;
-            dst[i * w + j] = round2(res, INTER_POST_ROUND).clamp(0, crate::decode::sample_max()) as u16;
+            dst[i * w + j] =
+                round2(res, INTER_POST_ROUND).clamp(0, crate::decode::sample_max()) as u16;
         }
     }
 }
