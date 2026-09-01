@@ -117,8 +117,27 @@ after those two lanes land.
   against `convolve.h:43` but not attributed by a failing-then-passing
   pixel — unblocked by a fixture whose LR RD picks `RESTORE_WIENER` at
   10-bit (higher-detail content than `gradients`).
-- accepted: `combine_compound` folds libaom's `>> DIST_PRECISION_BITS`
-  then `Round2(.., round_bits)` into one `Round2(.., 8)`. Bit-depth
-  independent, so out of this lane's scope, but the two are not
-  algebraically identical for odd intermediates -- flagged for whoever owns
-  compound.
+- FIXED after the first commit (`mc.rs` `combine_compound`, commit below):
+  it folded libaom's truncating `>> DIST_PRECISION_BITS` and the following
+  `Round2(.., INTER_POST_ROUND)` into one `Round2(.., 8)`. Those are not the
+  same function -- the folded form rounds one LSB up whenever
+  `(sum >> 4) + 8` sits one below a multiple of 16 with non-zero dropped
+  low bits. Bit-depth independent (the CONV_BUF `round_offset` cancels
+  exactly in this crate's unbiased domain, derived from
+  `av1_highbd_dist_wtd_convolve_2d_c`), so it is a rare off-by-one at ANY
+  depth. Flagged by lane-cwarp's measurement that 10-bit *compound* still
+  mismatches frame 1 luma while single-ref is 6/6 exact -- this is my best
+  candidate for that, but I did not have lane-cwarp's fixture, so it is
+  UNVERIFIED against their mismatch. All 16 compound tests (incl. the two
+  real-aomenc 8-bit compound/masked-compound gates) stay green with it:
+  `cargo test -p ec-av1 --lib -j3 compound` -> 16 passed, 0 failed, 73.58s.
+
+## Overlap with lane-cwarp
+
+lane-cwarp commit `04fc3ce` (worktree `edith_codecs-cwarp`) carries the same
+two fixes I derived independently here: `mc.rs` `diffwtd_mask`'s missing
+`(bd - 8)` and `warp.rs`'s `const BD = 8`. Semantically identical, textually
+different (my hunks carry different comments) -- **expect a conflict in
+`mc.rs` and `warp.rs` when both branches merge; either side's hunk is
+correct, keep one.** The LR (`compute_ab`, Wiener clamp) and
+`combine_compound` fixes are unique to this branch.
