@@ -44,7 +44,6 @@ const REFUSALS: &[&str] = &[
     "a 16x16 inter block whose true edge cuts through both axes needs a rectangular transform this decoder does not code yet",
     "a 32x32 partition type this decoder does not code (value={part32})",
     "a Golomb tail longer than this decoder reads",
-    "a superblock-level HORZ/VERT strip with a split transform (per-unit rect prediction is not ported)",
     "a tx_type symbol outside its CDF's own set: {t}",
     "an INTER 32x32 partition type this decoder does not code (value={part32})",
     "a superblock-level partition value outside PARTITION_NONE..PARTITION_VERT_4",
