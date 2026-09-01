@@ -71,6 +71,10 @@ EVIDENCE: gate stderr | 10 8-bit aomenc streams + 1 10-bit, decoded and diffed v
 EVIDENCE: scratchpad sweep.sh/src2.sh output | 40 gradient streams (seeds 42..61 at cq 45 and cq 20) + 12 testsrc2/mandelbrot/smptebars/rgbtestsrc streams, square-only recipe, decode_probe vs ffmpeg rawvideo | every plane Y=0 U=0 V=0 mismatching bytes
 EVIDENCE: rectsplit gates with the hue filter removed | `cargo test -p ec-av1 --lib split_transform_horz_vert filter_intra_on_a_horz_vert_strip` | both ok (16 decoded seeds, split-tx delta 3; 30 matches, filter_intra_rect delta 9)
 
+## Suite
+
+`EC_AV1_REQUIRE_AOMENC=1 cargo test -p ec-av1 --lib` (worktree, target-sqchroma): **275 passed, 0 failed, 23 ignored** in 1647s.
+
 ## Refusals
 
 None lifted (none were in the way -- the path already decodes). `refusal_inventory` and
