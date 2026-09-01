@@ -581,9 +581,11 @@ pub(crate) fn rect_screen_content_hits() -> usize {
     RECT_SCREEN_CONTENT_HITS.with(|c| c.get())
 }
 
-// lane-palette2 r1: how many palette-Y blocks decoded with a split luma
-// transform (`tx_select && logical_tx != side`) -- proves the per-TU index-map
-// slicing actually ran, not just that the whole-block path stayed exact.
+// lane-palette2 r1: how many palette-Y luma transform UNITS decoded under a
+// split luma transform (`logical_tx != side`) -- proves the per-TU index-map
+// windowing actually ran, not just that the whole-block path stayed exact.
+// Counts units, not blocks (a 64x64 palette block split to 16x16 TUs adds 16);
+// first actually incremented in r7, when the refusal it guarded was lifted.
 thread_local! {
     static PALETTE_SPLIT_TX_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -2003,12 +2005,22 @@ impl Neighbours {
     /// `av1_get_palette_mode_ctx` (pred_common.h:197): count of the above/left
     /// neighbours that are themselves a palette-Y block, plus
     /// `av1_get_palette_cache`'s own merged, ascending, deduplicated colour
-    /// cache (pred_common.c:73) -- the above neighbour is excluded at a
-    /// superblock's own top row (`r % 4 == 0` in [`SUB`]-grid units, 4 cells
-    /// per 64px SB, `MIN_SB_SIZE_LOG2`), the left neighbour never is.
+    /// cache (pred_common.c:73).
+    ///
+    /// The SB-top-row exclusion of the above neighbour (`row % 64` in
+    /// pred_common.c:76, `r % 4 == 0` here in [`SUB`]-grid units) belongs to
+    /// the CACHE ALONE -- `av1_get_palette_mode_ctx` reads plain
+    /// `xd->above_mbmi` with no such guard (lane-palette2 r7). Applying it to
+    /// the ctx too made every superblock in the frame's second SB row read
+    /// `palette_y_mode` off CDF row 0 while libaom used row 1, so a real
+    /// palette block decoded as "no palette" and the tile desynced from
+    /// there (class [[cdf-row-held-constant]]).
     fn palette_ctx_and_cache(&self, at: (usize, usize)) -> (usize, Vec<u16>) {
         let (r, c) = at;
         let above_ok = r % 4 != 0;
+        // `xd->above_mbmi` exists for every row but the tile's own first.
+        let above_is_palette =
+            r * (SUB / MI) > self.tile_row0_mi && self.above_palette_size[c] > 0;
         let (above_n, above_colors) = if above_ok && self.above_palette_size[c] > 0 {
             (self.above_palette_size[c], self.above_palette_colors[c])
         } else {
@@ -2019,7 +2031,7 @@ impl Neighbours {
         } else {
             (0, [0u16; 8])
         };
-        let ctx = usize::from(above_n > 0) + usize::from(left_n > 0);
+        let ctx = usize::from(above_is_palette) + usize::from(left_n > 0);
         let mut cache = Vec::with_capacity(16);
         let push_dedup = |cache: &mut Vec<u16>, v: u16| {
             if cache.last() != Some(&v) {
@@ -3141,8 +3153,11 @@ fn read_intra_mode_rect(
             filter_intra_size_class_rect(bw, bh)
         );
     }
+    // As the square path: `av1_filter_intra_allowed` excludes a palette-Y
+    // block (reconintra.h:77), so no `use_filter_intra` symbol exists there.
     if mode == DC_PRED
         && enable_filter_intra
+        && palette_y_pending.is_none()
         && let Some(class) = filter_intra_size_class_rect(bw, bh)
     {
         let use_filter_intra = dec.symbol(&mut cdfs.filter_intra[class]) != 0;
@@ -3659,7 +3674,16 @@ fn decode_leaf_rect(
     if smooth_neighbor {
         SMOOTH_LUMA_HITS.with(|c| c.set(c.get() + 1));
     }
-    let (skip, mode, angle_delta_y, uv_mode, angle_delta_uv, alpha, filter_intra) =
+    // The palette-Y mode CDF row is picked by the neighbours' palette use
+    // (`palette_ctx_and_cache`), so this sub-16x16 leaf must pass its own real
+    // ctx/cache -- reading `palette_y_mode` off row 0 when a neighbour did use
+    // a palette narrows the wrong interval and desyncs the tile even when the
+    // decoded bit is the same. The cell is the 16px-SUB cell containing the
+    // leaf (the palette neighbour arrays have no finer granularity).
+    let pal_at = (leaf_mi.0 / (SUB / MI), leaf_mi.1 / (SUB / MI));
+    let (palette_ctx, palette_cache) = neighbours.palette_ctx_and_cache(pal_at);
+    let palette_uv_cache = neighbours.palette_uv_cache(pal_at);
+    let (skip, mode, angle_delta_y, uv_mode, angle_delta_uv, alpha, filter_intra, palette_y, palette_uv) =
         read_intra_mode_rect(
             dec,
             cdfs,
@@ -3671,9 +3695,19 @@ fn decode_leaf_rect(
             enable_filter_intra,
             neighbours.skip_txfm_ctx(leaf_mi.0, leaf_mi.1),
             allow_screen_content_tools,
+            Some((palette_ctx, &palette_cache)),
+            &palette_uv_cache,
             leaf_mi.0,
             leaf_mi.1,
         )?;
+    if palette_y.is_some() || palette_uv.is_some() {
+        // Symbols (mode/size/colours/index map) are all read above, so the
+        // tile stays in sync; only the *pixel* reconstruction of a palette on
+        // a below-16x16 strip is unported and ungated (lane-palette2 r7).
+        return Err(unsupported(
+            "a palette block on a HORZ/VERT intra strip below 16x16 (reconstruction not ported)",
+        ));
+    }
     if filter_intra.is_some() {
         return Err(unsupported(
             "filter intra on a HORZ/VERT strip (this decoder predicts square-only)",
@@ -4381,8 +4415,14 @@ fn read_intra_mode(
     // matched bit-exact, then `eob_pt` read 5 instead of 6, because this
     // symbol's bits were never consumed).
     let mut filter_intra = None;
+    // `av1_filter_intra_allowed` (reconintra.h:77) also requires
+    // `palette_mode_info.palette_size[0] == 0`: a palette-Y block never gets a
+    // `use_filter_intra` symbol, so reading one here consumed a bit the
+    // encoder never wrote and desynced the tile from a palette block at
+    // <=32x32 onward (lane-palette2 r7, class [[symbol-consumption-gap]]).
     if mode == DC_PRED
         && enable_filter_intra
+        && palette_y_pending.is_none()
         && let Some(class) = filter_intra_size_class(side)
     {
         let use_filter_intra = dec.symbol(&mut cdfs.filter_intra[class]) != 0;
@@ -5016,18 +5056,21 @@ fn decode_block(
     // would need the map sliced per-TU -- untested against a real
     // `--enable-palette=1` stream this round, so refuse by name rather than
     // guess at the slicing (charter's own named-acceptable fallback).
-    if let Some(ref py) = palette_y {
-        if tx_select && logical_tx != side {
-            return Err(unsupported(
-                "a palette block with a split luma transform (round 1)",
-            ));
-        }
-        let buf: Vec<u16> = py
-            .map
+    let palette_y_buf: Option<Vec<u16>> = palette_y.as_ref().map(|py| {
+        py.map
             .iter()
             .map(|&idx| py.colors[idx as usize])
-            .collect();
-        PALETTE_PRED.with(|c| *c.borrow_mut() = Some(buf));
+            .collect()
+    });
+    // With one luma transform unit the whole `side`x`side` map is the
+    // prediction; with several (`logical_tx != side`) each unit takes its own
+    // `logical_tx`-sized window of that same map, set fresh inside the TU loop
+    // below (lane-palette2 r7) -- setting the full-block buffer here would be
+    // taken by the FIRST unit and indexed at the wrong stride.
+    if let Some(buf) = &palette_y_buf
+        && logical_tx == side
+    {
+        PALETTE_PRED.with(|c| *c.borrow_mut() = Some(buf.clone()));
     }
     // A UV-palette block's own chroma prediction override (lane-palette2 r1),
     // same [`PALETTE_PRED`] slot as Y above -- set fresh right before each
@@ -5198,6 +5241,16 @@ fn decode_block(
                 // the neighbour-magnitude table, not the lone-TU 0 (spec
                 // `get_txb_ctx_general`'s `plane_bsize != tx_size` branch).
                 let tu_skip_ctx = neighbours.luma_skip_ctx(tu_mi, logical_tx / MI);
+                if let Some(buf) = &palette_y_buf {
+                    PALETTE_SPLIT_TX_HITS.with(|c| c.set(c.get() + 1));
+                    let mut window = vec![0u16; logical_tx * logical_tx];
+                    for row in 0..logical_tx {
+                        let src = (tu_row * logical_tx + row) * side + tu_col * logical_tx;
+                        window[row * logical_tx..][..logical_tx]
+                            .copy_from_slice(&buf[src..][..logical_tx]);
+                    }
+                    PALETTE_PRED.with(|c| *c.borrow_mut() = Some(window));
+                }
                 let tu_grid = read_plane(
                     dec,
                     cdfs,
