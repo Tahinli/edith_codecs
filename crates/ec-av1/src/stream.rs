@@ -225,24 +225,13 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         // now read (`maybe_read_cdef_idx` in decode.rs) and threaded into
         // [`crate::decode::apply_cdef`]'s per-superblock strength lookup, so
         // a `cdef_bits > 0` stream no longer needs this refusal.
-        // An intra frame's `decode_key_frame_tile*` now reads `tx_depth`
-        // under `TxMode::Select` (lane-av1txsel, spec 5.11.16): the key-frame
-        // decode path threads `tx_select` through `decode_block`/
-        // `decode_leaf8`, and refuses on its own (a named `unsupported`, not
-        // a silent desync) the one case it still cannot code -- a resolved
-        // 4x4 luma transform, which has no coefficient tables here. This
-        // refusal is narrowed to what genuinely still has no reader at all:
-        // `decode_inter_frame`'s inter path never threads `tx_select`
-        // through its own block loop, so an inter frame under
-        // `TxMode::Select` still desyncs the same way the comment above used
-        // to describe for every frame -- lane-av1real r3's
-        // luma-near-flat-vs-ffmpeg-gradient bug.
-        if header.tx_mode == TxMode::Select && header.frame_type != FrameType::Key {
-            return Err(Error::unsupported(
-                "AV1 decode_stream",
-                "an inter frame using TxMode::Select (this decoder's inter path never reads a tx_depth symbol, so it desyncs after the first block's mode)",
-            ));
-        }
+        // Both frame types now read their transform size under
+        // `TxMode::Select`: an intra frame's `decode_key_frame_tile*` reads
+        // `tx_depth` (lane-av1txsel, spec 5.11.16), and an inter frame's
+        // `decode_inter_block`/`decode_inter_block8` read the recursive
+        // `txfm_split` var-tx tree (lane-txselect, spec 5.11.17) -- so the
+        // blanket inter-frame refusal that used to stand here is gone. What
+        // remains refused is named at its own site in `read_block_tx_size`.
         // lane-av1real r11's blindness-audit sweep (`read_intra_frame_mode_info`,
         // libaom decodemv.c): three more per-block/per-SB symbols this crate
         // never reads at all, each gated by a header field this decoder
@@ -679,6 +668,7 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 header.skip_mode_present,
                 header.skip_mode_frame,
                 header.reduced_tx_set,
+                header.tx_mode == TxMode::Select,
                 header.is_motion_mode_switchable,
                 header.allow_warped_motion,
                 header.allow_screen_content_tools,
@@ -3419,6 +3409,245 @@ mod tests {
         eprintln!(
             "SKIP a_real_aomenc_intra_stream_with_tx_select_decodes_pixel_exact: every attempt \
              hit a named refusal or never split a transform:\n{}",
+            refusals.join("\n")
+        );
+    }
+
+    /// lane-txselect's decisive gate: a real aomenc INTER sequence WITHOUT
+    /// `--enable-tx-size-search=0`, the flag every other inter recipe in this
+    /// file pins off precisely to keep the stream on `TxMode::Largest`.
+    /// Dropped, aomenc takes its own default (`TX_MODE_SELECT` -- which is
+    /// what both of the user's real films use), and an inter block's
+    /// transform size is then the recursive `txfm_split` tree of spec
+    /// 5.11.17 rather than one whole-block transform. A stream that decoded
+    /// pixel-exact while every `txfm_split` symbol resolved to "no split"
+    /// would prove nothing (it is `TxMode::Largest` by another name), so this
+    /// gate hard-asserts BOTH counters: at least one `txfm_split` symbol read
+    /// AND at least one split actually taken. Exhausting every attempt is a
+    /// FAILURE, not a SKIP -- an unfired gate is a vacuous gate.
+    #[test]
+    fn a_real_aomenc_inter_sequence_with_tx_select_decodes_pixel_exact() {
+        tx_select_inter_gate(8);
+    }
+
+    /// The 10-bit arm of the gate above (lane-txselect r2): both of the
+    /// user's films are `yuv420p10le` and var-tx is exactly the tool they
+    /// use, so an 8-bit-only proof would not reach them. Same recipe plus
+    /// `-b 10 --input-bit-depth=10`.
+    #[test]
+    fn a_real_aomenc_inter_sequence_with_tx_select_decodes_pixel_exact_10bit() {
+        tx_select_inter_gate(10);
+    }
+
+    fn tx_select_inter_gate(bit_depth: u32) {
+        if !have_ffmpeg() {
+            eprintln!(
+                "SKIP a_real_aomenc_inter_sequence_with_tx_select_decodes_pixel_exact: no ffmpeg"
+            );
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!(
+                "SKIP a_real_aomenc_inter_sequence_with_tx_select_decodes_pixel_exact: no aomenc at {}",
+                aomenc_path().display()
+            );
+            return;
+        }
+        let (width, height, frame_count) = (64usize, 64usize, 4usize);
+        let mut refusals = Vec::new();
+        for attempt in 0..40u32 {
+            let seed = 42 + attempt;
+            // Detail is what makes aomenc's RD prefer a split transform; a
+            // flat gradient resolves every `txfm_split` to 0. `mandelbrot`'s
+            // fractal boundary is the same source the sibling intra tx-select
+            // gate uses, at a different `start_scale` per attempt.
+            let source = format!(
+                "mandelbrot=size=64x64:start_scale={}:rate=25",
+                5.0 - f64::from(attempt) * 0.06
+            );
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    // Desaturated chroma: `uv_mode` stays DC_PRED, so the
+                    // still-refused directional-chroma gap never fires and
+                    // luma detail alone drives the transform split.
+                    "-vf",
+                    "hue=s=0",
+                    "-pix_fmt",
+                    if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" },
+                    // y4m carries no official 10-bit tag; ffmpeg writes one
+                    // only under `-strict -1` (a no-op at 8 bit).
+                    "-strict",
+                    "-1",
+                    "-t",
+                    "0.16",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-strict",
+                    "-1",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let depth_args: &[&str] = if bit_depth == 10 {
+                &["-b", "10", "--input-bit-depth=10"]
+            } else {
+                &[]
+            };
+            let mut child = Command::new(aomenc_path())
+                .args(depth_args)
+                .args([
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    "--cq-level=55",
+                    "--cpu-used=0",
+                    "--lag-in-frames=0",
+                    "--auto-alt-ref=0",
+                    "--kf-max-dist=1000",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--enable-order-hint=0",
+                    "--enable-warped-motion=0",
+                    "--enable-obmc=0",
+                    "--enable-masked-comp=0",
+                    "--enable-interintra-comp=0",
+                    "--enable-dist-wtd-comp=0",
+                    "--enable-diff-wtd-comp=0",
+                    "--enable-onesided-comp=0",
+                    "--enable-interintra-wedge=0",
+                    "--enable-smooth-interintra=0",
+                    "--enable-rect-partitions=0",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    "--enable-filter-intra=0",
+                    "--enable-smooth-intra=0",
+                    "--enable-paeth-intra=0",
+                    "--enable-directional-intra=0",
+                    "--enable-angle-delta=0",
+                    // DELIBERATELY ABSENT: --enable-tx-size-search=0.
+                    "--enable-cdef=0",
+                    "--enable-restoration=0",
+                    "--max-partition-size=32",
+                    // Sub-16 inter partitions are a separate named refusal
+                    // (this decoder codes no inter block below 16x16 through
+                    // the square path this gate drives), and detailed content
+                    // makes aomenc's RD reach for them on nearly every seed.
+                    "--min-partition-size=16",
+                    "--enable-palette=0",
+                    "--enable-intrabc=0",
+                    "--enable-cfl-intra=0",
+                    "--enable-ref-frame-mvs=0",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let (reads_before, hits_before) =
+                (decode::txfm_split_reads(), decode::txfm_split_hits());
+            let frames = match decode_stream(&stream) {
+                Ok(frames) => frames,
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "tx-select inter decode failed outright (seed {seed}): {msg}"
+                    );
+                    refusals.push(format!("seed {seed}: {msg}"));
+                    continue;
+                }
+            };
+            let (reads, hits) = (
+                decode::txfm_split_reads() - reads_before,
+                decode::txfm_split_hits() - hits_before,
+            );
+            if hits == 0 {
+                refusals.push(format!(
+                    "seed {seed}: decoded, but no block took a txfm_split ({reads} symbols read)"
+                ));
+                continue;
+            }
+            let ffmpeg_frames = if bit_depth == 10 {
+                ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count)
+            } else {
+                ffmpeg_decode_sequence(&stream, width, height, frame_count)
+            };
+            assert_eq!(frames.len(), frame_count);
+            eprintln!(
+                "txselect gate {bit_depth}-bit seed={seed}: txfm_split reads={reads} splits taken={hits}"
+            );
+            // Name the first differing sample before the assert fires: a
+            // 64x64 plane's `assert_eq!` output is 4096 numbers, useless for
+            // locating a desync.
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                for (plane, (g, w)) in [
+                    ("Y", (&got.y, &want.y)),
+                    ("U", (&got.u, &want.u)),
+                    ("V", (&got.v, &want.v)),
+                ] {
+                    let stride = if plane == "Y" { width } else { width / 2 };
+                    if let Some(at) = g.iter().zip(w.iter()).position(|(a, b)| a != b) {
+                        eprintln!(
+                            "txselect gate seed={seed}: frame {i} {plane} first diff at \
+                             ({}, {}) got {} want {} ({} samples differ)",
+                            at % stride,
+                            at / stride,
+                            g[at],
+                            w[at],
+                            g.iter().zip(w.iter()).filter(|(a, b)| a != b).count(),
+                        );
+                        let coords: Vec<String> = g
+                            .iter()
+                            .zip(w.iter())
+                            .enumerate()
+                            .filter(|(_, (a, b))| a != b)
+                            .take(12)
+                            .map(|(k, (a, b))| format!("({},{})={a}/{b}", k % stride, k / stride))
+                            .collect();
+                        eprintln!("txselect gate seed={seed}: frame {i} {plane} diffs {coords:?}");
+                    }
+                }
+            }
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(got.y, want.y, "frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(got.u, want.u, "frame {i} U vs ffmpeg (seed {seed})");
+                assert_eq!(got.v, want.v, "frame {i} V vs ffmpeg (seed {seed})");
+            }
+            return;
+        }
+        panic!(
+            "tx_select_inter_gate({bit_depth}) never observed a taken txfm_split:\n{}",
             refusals.join("\n")
         );
     }
