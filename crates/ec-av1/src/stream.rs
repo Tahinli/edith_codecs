@@ -8896,11 +8896,23 @@ mod tests {
              every block landed in one segment, so nothing was actually segmented",
             crate::decode::segment_ids_seen()
         );
+        // An inter-frame run must also have exercised the TEMPORAL path
+        // (`seg_id_predicted` against the primary reference's saved map);
+        // the key-frame-only run has no previous map by construction.
+        if frame_count > 1 {
+            assert!(
+                crate::decode::segment_pred_hits() > 0,
+                "{name}: {matched} pixel-exact matches over {frame_count} frames but zero \
+                 seg_id_predicted symbols -- the temporal_update path is unexercised"
+            );
+        }
         eprintln!(
             "{name}: {named_refusals} other-capability refusals, {matched} pixel-exact matches \
-             out of {n_attempts}, segment_id_hits={}, distinct segment ids={}",
+             out of {n_attempts}, segment_id_hits={}, distinct segment ids={}, \
+             seg_id_predicted symbols={}",
             crate::decode::segment_id_hits(),
-            crate::decode::segment_ids_seen()
+            crate::decode::segment_ids_seen(),
+            crate::decode::segment_pred_hits()
         );
     }
 
