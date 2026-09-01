@@ -1347,6 +1347,18 @@ fn dc_sign_ctx(vote: i32) -> usize {
 /// (spec 5.11.40): its bit length in unary, then that many of its own bits,
 /// most significant first — the exact inverse of [`crate::tile::write_golomb`].
 fn read_golomb(dec: &mut SymbolDecoder) -> Result<u32> {
+    // lane-scaledref r1: this cap MASKS A REAL DEFECT and must not be lifted
+    // on its own. Reading up to 32 leading zeros (dav1d's `len < 32`; libaom
+    // itself calls a 21st bit a corrupt frame, decodetxb.c:30) is bit-identical
+    // for every tail any encoder writes -- our own writer tops out at 19 zeros
+    // (`tile::MAX_LEVEL == MAX_BR_LEVEL + (1 << 19)`) -- and was implemented
+    // and round-trip tested here (commit ee1f980, reverted in 314ee08). It
+    // turned `a_real_aomenc_stream_with_a_superblock_level_horz_vert_partition_decodes_pixel_exact`
+    // RED: seed 67 stops here today, and with the cap raised it decodes to a
+    // frame-0 LUMA MISMATCH instead. A key frame cannot legitimately carry a
+    // level above 1<<19, so the long tail is the SYMPTOM of an earlier desync
+    // in that intra rect64 stream -- class `refusal-hides-a-defect`. Lift this
+    // together with that defect's fix, not before.
     let mut length = 1u32;
     while dec.literal(1) == 0 {
         length += 1;
