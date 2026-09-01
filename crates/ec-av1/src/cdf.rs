@@ -3600,6 +3600,53 @@ mod tests {
         }
     }
 
+    /// Every `eob_pt` table libaom keeps as `[q][plane][2]` has its class-1
+    /// (`tx_class != TX_CLASS_2D`) row here, and it is the *other* row.
+    ///
+    /// libaom only ever trained the class-1 row where a 1D tx type can occur:
+    /// `av1_get_ext_tx_set_type` returns `DCT_IDTX`/`DCTONLY` once
+    /// `tx_size_sqr_up >= TX_32X32`, so the 512- and 1024-point rows are the
+    /// untouched uniform initialiser. Pinned so a future table edit cannot
+    /// quietly narrow the domain back to 2D-only (lane-eobc1 r1; values
+    /// diffed against `token_cdfs.h` by `scripts/extract-eob-class1.py`).
+    #[test]
+    fn eob_pt_class1_rows_cover_every_size() {
+        fn uniform(row: &[u16]) -> bool {
+            let n = row.len() - 1;
+            row[..n].iter().enumerate().all(|(i, &v)| {
+                let n = n as u32;
+                v == (((i as u32 + 1) * 32768 + n / 2) / n) as u16
+            })
+        }
+        let trained: [(&[u16], &[u16]); 8] = [
+            (&EOB_PT_16_LUMA, &EOB_PT_16_LUMA_CLASS1),
+            (&EOB_PT_16_CHROMA, &EOB_PT_16_CHROMA_CLASS1),
+            (&EOB_PT_64_LUMA, &EOB_PT_64_LUMA_CLASS1),
+            (&EOB_PT_64_CHROMA, &EOB_PT_64_CHROMA_CLASS1),
+            (&EOB_PT_128_CHROMA, &EOB_PT_128_CHROMA_CLASS1),
+            (&EOB_PT_256_LUMA, &EOB_PT_256_LUMA_CLASS1),
+            (&EOB_PT_256_CHROMA, &EOB_PT_256_CHROMA_CLASS1),
+            (&EOB_PT_512_LUMA, &EOB_PT_512_LUMA_CLASS1),
+        ];
+        for (two_d, class1) in trained {
+            assert_row_shape(class1);
+            assert_eq!(two_d.len(), class1.len());
+        }
+        for (two_d, class1) in &trained[..7] {
+            assert_ne!(two_d, class1, "class-1 row is a copy of the 2D row");
+            assert!(!uniform(class1), "class-1 row was never trained");
+        }
+        for row in [
+            &EOB_PT_512_LUMA_CLASS1[..],
+            &EOB_PT_512_CHROMA_CLASS1[..],
+            &EOB_PT_1024_LUMA_CLASS1[..],
+            &EOB_PT_1024_CHROMA_CLASS1[..],
+        ] {
+            assert_row_shape(row);
+            assert!(uniform(row), "libaom trained a 32-point class-1 row");
+        }
+    }
+
     #[test]
     fn inter_frame_tables_are_well_formed_cdfs() {
         for row in INTRA_INTER {
@@ -5126,3 +5173,70 @@ pub const EOB_PT_16_CHROMA_CLASS1_Q0: [u16; 6] = [1904, 3354, 7763, 14647, 32768
 pub const EOB_PT_16_CHROMA_CLASS1_Q1: [u16; 6] = [2497, 4096, 8866, 16993, 32768, 0];
 pub const EOB_PT_16_CHROMA_CLASS1: [u16; 6] = [3192, 5032, 10297, 19755, 32768, 0];
 pub const EOB_PT_16_CHROMA_CLASS1_Q3: [u16; 6] = [7297, 10767, 19273, 28194, 32768, 0];
+
+/// The class-1 (`TX_CLASS_HORIZ`/`VERT`) sibling of [`EOB_PT_128_CHROMA`]
+/// (lane-eobc1 r1, machine-extracted from libaom `token_cdfs.h`).
+pub const EOB_PT_128_CHROMA_CLASS1_Q0: [u16; 9] =
+    [2054, 3472, 5869, 14232, 18242, 20590, 26752, 32768, 0];
+pub const EOB_PT_128_CHROMA_CLASS1_Q1: [u16; 9] =
+    [2310, 4160, 7471, 14997, 17931, 20768, 30240, 32768, 0];
+pub const EOB_PT_128_CHROMA_CLASS1: [u16; 9] =
+    [6275, 9889, 14769, 23164, 27988, 30493, 32272, 32768, 0];
+pub const EOB_PT_128_CHROMA_CLASS1_Q3: [u16; 9] =
+    [9165, 13282, 21150, 30286, 31894, 32571, 32712, 32768, 0];
+/// The class-1 (`TX_CLASS_HORIZ`/`VERT`) sibling of [`EOB_PT_512_LUMA`]
+/// (lane-eobc1 r1, machine-extracted from libaom `token_cdfs.h`).
+pub const EOB_PT_512_LUMA_CLASS1_Q0: [u16; 11] = [
+    3277, 6554, 9830, 13107, 16384, 19661, 22938, 26214, 29491, 32768, 0,
+];
+pub const EOB_PT_512_LUMA_CLASS1_Q1: [u16; 11] = [
+    3277, 6554, 9830, 13107, 16384, 19661, 22938, 26214, 29491, 32768, 0,
+];
+pub const EOB_PT_512_LUMA_CLASS1: [u16; 11] = [
+    3277, 6554, 9830, 13107, 16384, 19661, 22938, 26214, 29491, 32768, 0,
+];
+pub const EOB_PT_512_LUMA_CLASS1_Q3: [u16; 11] = [
+    3277, 6554, 9830, 13107, 16384, 19661, 22938, 26214, 29491, 32768, 0,
+];
+/// The class-1 (`TX_CLASS_HORIZ`/`VERT`) sibling of [`EOB_PT_512_CHROMA`]
+/// (lane-eobc1 r1, machine-extracted from libaom `token_cdfs.h`).
+pub const EOB_PT_512_CHROMA_CLASS1_Q0: [u16; 11] = [
+    3277, 6554, 9830, 13107, 16384, 19661, 22938, 26214, 29491, 32768, 0,
+];
+pub const EOB_PT_512_CHROMA_CLASS1_Q1: [u16; 11] = [
+    3277, 6554, 9830, 13107, 16384, 19661, 22938, 26214, 29491, 32768, 0,
+];
+pub const EOB_PT_512_CHROMA_CLASS1: [u16; 11] = [
+    3277, 6554, 9830, 13107, 16384, 19661, 22938, 26214, 29491, 32768, 0,
+];
+pub const EOB_PT_512_CHROMA_CLASS1_Q3: [u16; 11] = [
+    3277, 6554, 9830, 13107, 16384, 19661, 22938, 26214, 29491, 32768, 0,
+];
+/// The class-1 (`TX_CLASS_HORIZ`/`VERT`) sibling of [`EOB_PT_1024_LUMA`]
+/// (lane-eobc1 r1, machine-extracted from libaom `token_cdfs.h`).
+pub const EOB_PT_1024_LUMA_CLASS1_Q0: [u16; 12] = [
+    2979, 5958, 8937, 11916, 14895, 17873, 20852, 23831, 26810, 29789, 32768, 0,
+];
+pub const EOB_PT_1024_LUMA_CLASS1_Q1: [u16; 12] = [
+    2979, 5958, 8937, 11916, 14895, 17873, 20852, 23831, 26810, 29789, 32768, 0,
+];
+pub const EOB_PT_1024_LUMA_CLASS1: [u16; 12] = [
+    2979, 5958, 8937, 11916, 14895, 17873, 20852, 23831, 26810, 29789, 32768, 0,
+];
+pub const EOB_PT_1024_LUMA_CLASS1_Q3: [u16; 12] = [
+    2979, 5958, 8937, 11916, 14895, 17873, 20852, 23831, 26810, 29789, 32768, 0,
+];
+/// The class-1 (`TX_CLASS_HORIZ`/`VERT`) sibling of [`EOB_PT_1024_CHROMA`]
+/// (lane-eobc1 r1, machine-extracted from libaom `token_cdfs.h`).
+pub const EOB_PT_1024_CHROMA_CLASS1_Q0: [u16; 12] = [
+    2979, 5958, 8937, 11916, 14895, 17873, 20852, 23831, 26810, 29789, 32768, 0,
+];
+pub const EOB_PT_1024_CHROMA_CLASS1_Q1: [u16; 12] = [
+    2979, 5958, 8937, 11916, 14895, 17873, 20852, 23831, 26810, 29789, 32768, 0,
+];
+pub const EOB_PT_1024_CHROMA_CLASS1: [u16; 12] = [
+    2979, 5958, 8937, 11916, 14895, 17873, 20852, 23831, 26810, 29789, 32768, 0,
+];
+pub const EOB_PT_1024_CHROMA_CLASS1_Q3: [u16; 12] = [
+    2979, 5958, 8937, 11916, 14895, 17873, 20852, 23831, 26810, 29789, 32768, 0,
+];
