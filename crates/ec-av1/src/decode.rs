@@ -2035,6 +2035,14 @@ impl Neighbours {
             self.above_compound_idx[i] = 0;
             self.above_filter[i] = [3u8; 2];
         }
+        // lane-rectx r5 (defect found by lane-sub8's verifier): the mi-exact
+        // mode map is neighbour state like every array above it -- left
+        // unreset, a tile read its LEFT tile's modes across the boundary.
+        for i in col0_mi.min(end)..end {
+            if let Some(slot) = self.sub8_mode_col.get_mut(i) {
+                *slot = (usize::MAX, 0);
+            }
+        }
     }
 
     /// Writes a just-decoded block's own palette-Y size/colours (`size == 0`
@@ -2292,6 +2300,7 @@ impl Neighbours {
         self.left_comp_group_idx.iter_mut().for_each(|r| *r = 0);
         self.left_compound_idx.iter_mut().for_each(|r| *r = 0);
         self.left_filter.iter_mut().for_each(|f| *f = [3u8; 2]);
+        self.sub8_mode_row.iter_mut().for_each(|e| *e = (usize::MAX, 0));
     }
 
     /// Records a block's `skip`/`is_inter`/`interp_filter` state for the next
@@ -2557,16 +2566,33 @@ impl Neighbours {
     /// construction). See [`Self::record_mode_mi`].
     fn mode_above_mi(&self, mi_r: usize, mi_c: usize) -> Option<usize> {
         match self.sub8_mode_col.get(mi_c) {
-            Some(&(row, m)) if mi_r > 0 && row == mi_r - 1 => Some(m),
+            Some(&(row, m)) if mi_r > self.tile_row0_mi && row == mi_r - 1 => Some(m),
             _ => None,
         }
     }
 
     fn mode_left_mi(&self, mi_r: usize, mi_c: usize) -> Option<usize> {
         match self.sub8_mode_row.get(mi_r) {
-            Some(&(col, m)) if mi_c > 0 && col == mi_c - 1 => Some(m),
+            Some(&(col, m)) if mi_c > self.tile_col0_mi && col == mi_c - 1 => Some(m),
             _ => None,
         }
+    }
+
+    /// The above/left luma modes libaom's `above_mi`/`left_mi` really see for a
+    /// block at coarse [`SUB`]-grid `(r, c)`. lane-rectx r5: the coarse
+    /// `above_mode`/`left_mode` slots are written in 16x16 cells, so a
+    /// sub-16x16 neighbour (a 16x8 rect leaf, an 8x8 split cell) leaves them
+    /// holding an OLDER, larger block's mode -- it only ever recorded into the
+    /// mi-exact map. Every `kf_y_mode` reader goes through here, not just the
+    /// strip path ([`decode_leaf_rect`] took this override in r4; a 32x16 strip
+    /// whose left neighbour was a 16x8 leaf still read the stale row and picked
+    /// a different CDF for the same mode value).
+    fn modes_above_left(&self, r: usize, c: usize) -> (usize, usize) {
+        let (mi_r, mi_c) = (r * (SUB / MI), c * (SUB / MI));
+        (
+            self.mode_above_mi(mi_r, mi_c).unwrap_or(self.above_mode[c]),
+            self.mode_left_mi(mi_r, mi_c).unwrap_or(self.left_mode[r]),
+        )
     }
 
     fn record_rect(
@@ -3267,12 +3293,13 @@ fn decode_block_rect(
 ) -> Result<()> {
     let (r, c) = at;
     let (px, py) = (c * SUB, r * SUB);
+    let (nb_above_mode, nb_left_mode) = neighbours.modes_above_left(r, c);
     let (skip, mode, angle_delta_y, uv_mode, angle_delta_uv, alpha, filter_intra) =
         read_intra_mode_rect(
             dec,
             cdfs,
-            neighbours.above_mode[c],
-            neighbours.left_mode[r],
+            nb_above_mode,
+            nb_left_mode,
             true,
             bw,
             bh,
@@ -3282,8 +3309,7 @@ fn decode_block_rect(
             r * (SUB / MI),
             c * (SUB / MI),
         )?;
-    let smooth_neighbor =
-        is_smooth_mode(neighbours.above_mode[c]) || is_smooth_mode(neighbours.left_mode[r]);
+    let smooth_neighbor = is_smooth_mode(nb_above_mode) || is_smooth_mode(nb_left_mode);
     if smooth_neighbor {
         SMOOTH_LUMA_HITS.with(|c| c.set(c.get() + 1));
     }
@@ -3834,12 +3860,13 @@ fn decode_block_rect64(
 ) -> Result<()> {
     let (r, c) = at;
     let (px, py) = (c * SUB, r * SUB);
+    let (nb_above_mode, nb_left_mode) = neighbours.modes_above_left(r, c);
     let (skip, mode, angle_delta_y, uv_mode, angle_delta_uv, alpha, filter_intra) =
         read_intra_mode_rect(
             dec,
             cdfs,
-            neighbours.above_mode[c],
-            neighbours.left_mode[r],
+            nb_above_mode,
+            nb_left_mode,
             // `is_cfl_allowed` (spec 5.11.5) caps CFL at <=32x32; these
             // superblock-level HORZ/VERT strips are 64x32/32x64, so unlike
             // `decode_block_rect`'s own 32x16/16x32 strips (where `true` is
@@ -3856,8 +3883,7 @@ fn decode_block_rect64(
             r * (SUB / MI),
             c * (SUB / MI),
         )?;
-    let smooth_neighbor =
-        is_smooth_mode(neighbours.above_mode[c]) || is_smooth_mode(neighbours.left_mode[r]);
+    let smooth_neighbor = is_smooth_mode(nb_above_mode) || is_smooth_mode(nb_left_mode);
     if smooth_neighbor {
         SMOOTH_LUMA_HITS.with(|c| c.set(c.get() + 1));
     }
@@ -4945,12 +4971,13 @@ fn decode_block(
     let (px, py) = (c * SUB, r * SUB);
     let (palette_ctx, palette_cache) = neighbours.palette_ctx_and_cache(at);
     let palette_uv_cache = neighbours.palette_uv_cache(at);
+    let (nb_above_mode, nb_left_mode) = neighbours.modes_above_left(r, c);
     let (skip, mode, angle_delta_y, uv_mode, angle_delta_uv, alpha, filter_intra, palette_y, palette_uv) =
         read_intra_mode(
             dec,
             cdfs,
-            neighbours.above_mode[c],
-            neighbours.left_mode[r],
+            nb_above_mode,
+            nb_left_mode,
             cfl,
             side,
             enable_filter_intra,
@@ -4970,8 +4997,7 @@ fn decode_block(
     } else {
         uv_mode
     };
-    let smooth_neighbor =
-        is_smooth_mode(neighbours.above_mode[c]) || is_smooth_mode(neighbours.left_mode[r]);
+    let smooth_neighbor = is_smooth_mode(nb_above_mode) || is_smooth_mode(nb_left_mode);
     if smooth_neighbor {
         SMOOTH_LUMA_HITS.with(|c| c.set(c.get() + 1));
     }
