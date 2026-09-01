@@ -1231,11 +1231,14 @@ impl Reach {
         // -- a reach over-estimate (extra above-right reference pixels),
         // never a stream desync. Ceiling: transcribe `has_tr_vert_4x4` /
         // `has_bl_vert_4x4` and extend the VERT tables to four rows.
-        let row = Self::table(side);
-        let table = if VERT_AB_PARTITION.with(std::cell::Cell::get) && row < HAS_TOP_RIGHT_VERT.len() {
-            HAS_TOP_RIGHT_VERT[row]
+        // NB: named `table_row`, not `row` -- `row` above is the block's
+        // position inside the superblock and is what the bit index below
+        // steps by (a merge that shadowed it desynced every block size).
+        let table_row = Self::table(side);
+        let table = if VERT_AB_PARTITION.with(std::cell::Cell::get) && table_row < HAS_TOP_RIGHT_VERT.len() {
+            HAS_TOP_RIGHT_VERT[table_row]
         } else {
-            HAS_TOP_RIGHT[row]
+            HAS_TOP_RIGHT[table_row]
         };
         Self::bit(
             table,
@@ -1263,11 +1266,14 @@ impl Reach {
         // -- a reach over-estimate (extra above-right reference pixels),
         // never a stream desync. Ceiling: transcribe `has_tr_vert_4x4` /
         // `has_bl_vert_4x4` and extend the VERT tables to four rows.
-        let row = Self::table(side);
-        let table = if VERT_AB_PARTITION.with(std::cell::Cell::get) && row < HAS_BOTTOM_LEFT_VERT.len() {
-            HAS_BOTTOM_LEFT_VERT[row]
+        // NB: named `table_row`, not `row` -- `row` above is the block's
+        // position inside the superblock and is what the bit index below
+        // steps by (a merge that shadowed it desynced every block size).
+        let table_row = Self::table(side);
+        let table = if VERT_AB_PARTITION.with(std::cell::Cell::get) && table_row < HAS_BOTTOM_LEFT_VERT.len() {
+            HAS_BOTTOM_LEFT_VERT[table_row]
         } else {
-            HAS_BOTTOM_LEFT[row]
+            HAS_BOTTOM_LEFT[table_row]
         };
         Self::bit(
             table,
