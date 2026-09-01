@@ -69,4 +69,4 @@ way to size it.
   than `gradients_source` (whose seed lavfi ignores — memory `seeded-fixture-not-reproducible`).
 
 ## Suite
-`EC_AV1_REQUIRE_AOMENC=1 cargo test -p ec-av1 --lib` (scoped, per charter): TOTALS_PLACEHOLDER
+`EC_AV1_REQUIRE_AOMENC=1 cargo test -p ec-av1 --lib` (scoped, per charter): **273 passed, 0 failed, 22 ignored, 0 filtered**, 1060.84s (branch lane-hidden @ 25b7222).
