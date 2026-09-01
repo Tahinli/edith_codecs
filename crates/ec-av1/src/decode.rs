@@ -1159,26 +1159,33 @@ fn base_ctx(
         // (lane-sbpart r8 root cause: `(row=1, col=0)` reads ctx 2 under the
         // square table vs the real ctx 13 the rect table gives).
         TxClass::TwoD => {
-            // lane-rectsplit r2: libaom's `av1_nz_map_ctx_offset[tx_size]`
-            // is a FLAT array indexed by its own `coeff_idx`, which is
-            // COLUMN-major (`coeff_idx = col * height + row`, the same
-            // packing `TX_CLASS_HORIZ` reads back as `coeff_idx >> bhl`) --
-            // so a `[a][b]` transcription of 32 consecutive entries per row
-            // holds `[col][row]`, not `[row][col]`. The square table is
-            // symmetric and never noticed; the two rect ones are not, and
-            // reading `NZ_MAP_CTX_OFFSET_32X64[2][0]` (11) where libaom
-            // reads offset 6 desynced the FIRST superblock-level 32x64
-            // strip whose corner had a coefficient below row 1 (seed 50 of
-            // gate (b), coefficient (row 2, col 0): ctx 11 vs the oracle's
-            // 6). [`base_ctx_rect`] states the same rule in display
-            // coordinates directly; `nz_map_ctx_offset_tables_match_the_rect_rule`
-            // pins the two against each other.
+            // OPEN (lane-rectsplit r3, measured): the two rect
+            // transcriptions in [`cdf`] are packed `[col][row]` -- libaom's
+            // `av1_nz_map_ctx_offset_32x64` is a FLAT 1024-entry array whose
+            // `coeff_idx` is COLUMN-major with stride 32 (`TX_CLASS_HORIZ`
+            // reads its column back as `coeff_idx >> bhl`), and entries
+            // 0..5 / 32..35 match the generating rule (txb_common.h:199-209)
+            // only under `flat[col * 32 + row]`;
+            // `nz_map_ctx_offset_tables_match_the_rect_rule` pins that.
+            // Yet reading `[col][row]` here BREAKS
+            // `a_real_aomenc_stream_with_a_superblock_level_horz_vert_partition_decodes_pixel_exact`
+            // (seed 43) while `[row][col]` breaks the split-transform SB gate
+            // (seed 50); swapping the shape test as well fails BOTH ways. So
+            // this read is not the defect -- our (row, col) here come from a
+            // square 32x32-corner scan whose orientation relative to libaom's
+            // column-major `coeff_idx` is what is really unproven, and each
+            // "fix" only moves which rare corner position desyncs. Left at
+            // the r1 reading, the one every merged gate is green under.
+            // `EC_NZOFF_DUMP=1` prints every rect-shaped read.
             let table = match rect_shape {
                 Some((w, h)) if w < h => &cdf::NZ_MAP_CTX_OFFSET_32X64,
                 Some((w, h)) if w > h => &cdf::NZ_MAP_CTX_OFFSET_64X32,
                 _ => &cdf::NZ_MAP_CTX_OFFSET_32,
             };
-            ctx + table[col.min(4)][row.min(4)] as usize
+            if std::env::var_os("EC_NZOFF_DUMP").is_some() {
+                eprintln!("NZOFF side={side} shape={rect_shape:?} row={row} col={col}");
+            }
+            ctx + table[row.min(4)][col.min(4)] as usize
         }
         TxClass::Horiz => ctx + nz_map_ctx_offset_1d(col.min(31)),
         TxClass::Vert => ctx + nz_map_ctx_offset_1d(row.min(31)),
@@ -4054,34 +4061,20 @@ fn decode_block_rect64(
     };
     if depth != 0 {
         TX_DEPTH_HITS.with(|c| c.set(c.get() + 1));
-        // lane-rectsplit r2: the superblock-level strip splits its transform
-        // through the very same per-unit path as its 32x32-level sibling
-        // (`sub_tx_size_map[TX_64X32] == TX_32X32`, square from the first
-        // step on, so `bw.min(bh) >> (depth - 1)` names the unit).
-        let tx = bw.min(bh) >> (depth - 1);
-        if std::env::var_os("EC_SBPART_DUMP64").is_some() {
-            eprintln!(
-                "DUMP64SPLIT mi_r={mi_r} mi_c={mi_c} px={px} py={py} bw={bw} bh={bh} \
-                 depth={depth} tx={tx} mode={mode} uv={uv_predict_mode} skip={skip} \
-                 angle_y={angle_delta_y}"
-            );
-        }
-        let modes = RectStripModes {
-            skip,
-            mode,
-            angle_delta_y,
-            uv_predict_mode,
-            angle_delta_uv,
-            alpha,
-            filter_intra,
-            smooth_neighbor,
-            smooth_neighbor_uv,
-        };
-        decode_rect_split(
-            dec, cdfs, neighbours, at, bw, bh, tx, &modes, y, u, v, base_q_idx, reduced_tx_set,
-        )?;
-        RECT_PARTITION_HITS.with(|c| c.set(c.get() + 1));
-        return Ok(());
+        // lane-rectsplit r1/r3: [`decode_rect_split`] handles this shape too
+        // and the per-unit port is wired here, but the gate
+        // (`a_real_aomenc_stream_with_a_split_transform_superblock_strip_decodes_pixel_exact`,
+        // `#[ignore]`d with its measurement) is still RED at seed 50 (luma
+        // (171,56), ours 147 vs ffmpeg 148). r2 believed the cause was a
+        // transposed `av1_nz_map_ctx_offset` read; r3 measured that
+        // transposing it turns THIS gate green and the merged SB-level
+        // HORZ/VERT partition gate RED (seed 43), so the cause is still
+        // open. A refusal this lane cannot lift is not one it may ship wrong
+        // pixels past.
+        return Err(unsupported(
+            "a superblock-level HORZ/VERT strip with a split transform (per-unit rect \
+             prediction is not ported)",
+        ));
     }
     let (tx_w, tx_h) = (bw, bh);
     let (cpx, cpy) = (px / 2, py / 2);
