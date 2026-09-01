@@ -2983,13 +2983,27 @@ mod tests {
         }
     }
 
+    /// Whether ffmpeg is on PATH. Absence normally SKIPs, but
+    /// `EC_AV1_REQUIRE_FFMPEG=1` -- or `EC_AV1_REQUIRE_AOMENC=1`, since every
+    /// aomenc gate decodes its stream through ffmpeg and is meaningless
+    /// without it -- turns it into a hard failure. Without this the require
+    /// flag was silently short-circuited: `!have_ffmpeg()` is evaluated first
+    /// in `if !have_ffmpeg() || !have_aomenc()`, so a machine with no ffmpeg
+    /// printed SKIP and reported green (class gate-skips-on-its-own-failure).
     fn have_ffmpeg() -> bool {
-        Command::new("ffmpeg")
+        let present = Command::new("ffmpeg")
             .arg("-version")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .is_ok_and(|s| s.success())
+            .is_ok_and(|s| s.success());
+        assert!(
+            present
+                || (std::env::var_os("EC_AV1_REQUIRE_FFMPEG").is_none()
+                    && std::env::var_os("EC_AV1_REQUIRE_AOMENC").is_none()),
+            "EC_AV1_REQUIRE_FFMPEG/EC_AV1_REQUIRE_AOMENC is set but no working ffmpeg on PATH"
+        );
+        present
     }
 
     /// Decodes an AV1 OBU stream with ffmpeg and hands back the planes.

@@ -561,6 +561,19 @@ pub const RESTORE_SWITCHABLE: [u16; 4] = [9413, 22581, 32768, 0];
 /// 4-symbol `delta_q_abs` alphabet read once per superblock when
 /// `delta_q_present` is set. `default_delta_lf_cdf`/`default_delta_lf_multi_cdf`
 /// share this same value (verified against libaom's real source).
+/// `Default_Segment_Id_Cdf` (spec 9.4, libaom
+/// `default_spatial_pred_seg_tree_cdf`): the `segment_id` symbol's eight
+/// segments, indexed by the spec 5.11.8 neighbour-agreement context.
+pub const SEGMENT_ID: [[u16; 9]; 3] = [
+    [5622, 7893, 16093, 18233, 27809, 28373, 32533, 32768, 0],
+    [14274, 18230, 22557, 24935, 29980, 30851, 32344, 32768, 0],
+    [27527, 28487, 28723, 28890, 32397, 32647, 32679, 32768, 0],
+];
+
+/// `Default_Segment_Pred_Cdf` (spec 9.4, libaom `default_segment_pred_cdf`):
+/// `seg_id_predicted`, indexed by `AboveSegPredContext + LeftSegPredContext`.
+pub const SEGMENT_PRED: [[u16; 3]; 3] = [[16384, 32768, 0]; 3];
+
 pub const DELTA_Q: [u16; 5] = [28160, 32120, 32677, 32768, 0];
 /// `default_delta_lf_cdf` -- see [`DELTA_Q`]'s doc.
 pub const DELTA_LF: [u16; 5] = DELTA_Q;

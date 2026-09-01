@@ -1,6 +1,6 @@
 //! AV1 film grain synthesis (spec 7.18.3), ported bit-exact from libaom's
 //! `av1/decoder/grain_synthesis.c` (`add_film_grain_run` and its helpers),
-//! specialized to this crate's only picture shape: 8-bit, 4:2:0 planar
+//! specialized to this crate's only picture shape: 4:2:0 planar
 //! (`chroma_subsamp_x = chroma_subsamp_y = 1` throughout, which is why every
 //! `<< (1 - subsamp)` in the reference collapses to a no-op and every
 //! `>> subsamp` collapses to `>> 1` below).
@@ -43,9 +43,25 @@ const LUMA_BLOCK_W: i32 =
 const CHROMA_BLOCK_H: i32 = TOP_PAD + AR_PADDING + CHROMA_SUBBLOCK * 2 + BOTTOM_PAD;
 const CHROMA_BLOCK_W: i32 = LEFT_PAD + AR_PADDING + CHROMA_SUBBLOCK * 2 + AR_PADDING + RIGHT_PAD;
 
-// bit_depth is always 8 in this crate: grain_center = 128 << (8 - 8) = 128.
-const GRAIN_MIN: i32 = -128;
-const GRAIN_MAX: i32 = 127;
+thread_local! {
+    /// `params->bit_depth` of the picture currently being grained. libaom
+    /// keeps `grain_min`/`grain_max` as file statics set once per
+    /// `av1_add_film_grain_run` (`grain_synthesis.c:1041-1045`); this mirrors
+    /// that rather than threading a parameter through every helper.
+    static GRAIN_BIT_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(8) };
+}
+
+/// `params->bit_depth` for the [`apply_grain`] call in progress.
+fn grain_bit_depth() -> u32 {
+    GRAIN_BIT_DEPTH.with(|c| c.get())
+}
+
+/// `grain_min`/`grain_max` (`grain_synthesis.c:1043-1045`):
+/// `grain_center = 128 << (bit_depth - 8)`.
+fn grain_range() -> (i32, i32) {
+    let center = 128i32 << (grain_bit_depth() - 8);
+    (-center, center - 1)
+}
 
 const MIN_LUMA_LEGAL: i32 = 16;
 const MAX_LUMA_LEGAL: i32 = 235;
@@ -121,11 +137,12 @@ fn generate_luma_grain_block(
     pred_pos: &[(i32, i32, i32)],
     rng: &mut Rng,
 ) -> Vec<i32> {
+    let (grain_min, grain_max) = grain_range();
     let mut block = vec![0i32; (LUMA_BLOCK_H * LUMA_BLOCK_W) as usize];
     if fg.num_y_points == 0 {
         return block;
     }
-    let gauss_sec_shift = 4 + fg.grain_scale_shift as i32; // 12 - 8 + grain_scale_shift
+    let gauss_sec_shift = 12 - grain_bit_depth() as i32 + fg.grain_scale_shift as i32;
     let ar_coeff_shift = fg.ar_coeff_shift_minus_6 as i32 + 6;
     let rounding_offset = 1i32 << (ar_coeff_shift - 1);
 
@@ -143,7 +160,7 @@ fn generate_luma_grain_block(
                 wsum += fg.ar_coeffs_y[idx] as i32 * at(&block, LUMA_BLOCK_W, i + dy, j + dx);
             }
             let v = (at(&block, LUMA_BLOCK_W, i, j) + ((wsum + rounding_offset) >> ar_coeff_shift))
-                .clamp(GRAIN_MIN, GRAIN_MAX);
+                .clamp(grain_min, grain_max);
             set_at(&mut block, LUMA_BLOCK_W, i, j, v);
         }
     }
@@ -157,9 +174,10 @@ fn generate_chroma_grain_blocks(
     luma_block: &[i32],
     seed: u16,
 ) -> (Vec<i32>, Vec<i32>) {
+    let (grain_min, grain_max) = grain_range();
     let mut cb = vec![0i32; (CHROMA_BLOCK_H * CHROMA_BLOCK_W) as usize];
     let mut cr = vec![0i32; (CHROMA_BLOCK_H * CHROMA_BLOCK_W) as usize];
-    let gauss_sec_shift = 4 + fg.grain_scale_shift as i32;
+    let gauss_sec_shift = 12 - grain_bit_depth() as i32 + fg.grain_scale_shift as i32;
     let ar_coeff_shift = fg.ar_coeff_shift_minus_6 as i32 + 6;
     let rounding_offset = 1i32 << (ar_coeff_shift - 1);
 
@@ -226,13 +244,13 @@ fn generate_chroma_grain_blocks(
             if apply_cb {
                 let v = (at(&cb, CHROMA_BLOCK_W, i, j)
                     + ((wsum_cb + rounding_offset) >> ar_coeff_shift))
-                    .clamp(GRAIN_MIN, GRAIN_MAX);
+                    .clamp(grain_min, grain_max);
                 set_at(&mut cb, CHROMA_BLOCK_W, i, j, v);
             }
             if apply_cr {
                 let v = (at(&cr, CHROMA_BLOCK_W, i, j)
                     + ((wsum_cr + rounding_offset) >> ar_coeff_shift))
-                    .clamp(GRAIN_MIN, GRAIN_MAX);
+                    .clamp(grain_min, grain_max);
                 set_at(&mut cr, CHROMA_BLOCK_W, i, j, v);
             }
         }
@@ -265,7 +283,21 @@ fn build_scaling_lut(values: &[u8], scaling: &[u8], num_points: usize) -> [i32; 
     lut
 }
 
-/// `add_noise_to_block` (spec 7.18.3.5), 8-bit / 4:2:0 only. `(py0, px0)` is
+/// `scale_LUT` (`grain_synthesis.c:616`): the scaling LUT has 256 entries
+/// regardless of bit depth, so at 10/12 bit the index is shifted down and the
+/// two neighbouring entries are interpolated with the dropped low bits.
+fn scale_lut(lut: &[i32; 256], index: i32, bit_depth: u32) -> i32 {
+    let shift = bit_depth - 8;
+    let x = (index >> shift) as usize;
+    if shift == 0 || x == 255 {
+        lut[x]
+    } else {
+        lut[x] + (((lut[x + 1] - lut[x]) * (index & ((1 << shift) - 1)) + (1 << (shift - 1)))
+            >> shift)
+    }
+}
+
+/// `add_noise_to_block` (spec 7.18.3.5), 4:2:0 only. `(py0, px0)` is
 /// the luma-plane pixel origin; the matching chroma origin is `(py0/2,
 /// px0/2)`. Grain is read from `(grain, stride, row0, col0)` triples so the
 /// same function serves both the raw 82x73/44x38 templates and the small
@@ -295,13 +327,17 @@ fn add_noise_to_block(
     let y_stride = picture.width as i32;
     let c_stride = (picture.width / 2) as i32;
     let scaling_shift = fg.grain_scaling_minus_8 as i32 + 8;
+    let bit_depth = grain_bit_depth();
+    let bd_shift = bit_depth - 8;
+    // `(256 << (bit_depth - 8)) - 1`, the scaling-LUT index clamp.
+    let index_max = (256i32 << bd_shift) - 1;
 
     let mut cb_mult = fg.cb_mult as i32 - 128;
     let mut cb_luma_mult = fg.cb_luma_mult as i32 - 128;
-    let mut cb_offset = fg.cb_offset as i32 - 256;
+    let mut cb_offset = ((fg.cb_offset as i32) << bd_shift) - (1 << bit_depth);
     let mut cr_mult = fg.cr_mult as i32 - 128;
     let mut cr_luma_mult = fg.cr_luma_mult as i32 - 128;
-    let mut cr_offset = fg.cr_offset as i32 - 256;
+    let mut cr_offset = ((fg.cr_offset as i32) << bd_shift) - (1 << bit_depth);
     if fg.chroma_scaling_from_luma {
         cb_mult = 0;
         cb_luma_mult = 64;
@@ -318,21 +354,21 @@ fn add_noise_to_block(
     let (min_luma, max_luma, min_chroma, max_chroma) = if fg.clip_to_restricted_range {
         if mc_identity {
             (
-                MIN_LUMA_LEGAL,
-                MAX_LUMA_LEGAL,
-                MIN_LUMA_LEGAL,
-                MAX_LUMA_LEGAL,
+                MIN_LUMA_LEGAL << bd_shift,
+                MAX_LUMA_LEGAL << bd_shift,
+                MIN_LUMA_LEGAL << bd_shift,
+                MAX_LUMA_LEGAL << bd_shift,
             )
         } else {
             (
-                MIN_LUMA_LEGAL,
-                MAX_LUMA_LEGAL,
-                MIN_CHROMA_LEGAL,
-                MAX_CHROMA_LEGAL,
+                MIN_LUMA_LEGAL << bd_shift,
+                MAX_LUMA_LEGAL << bd_shift,
+                MIN_CHROMA_LEGAL << bd_shift,
+                MAX_CHROMA_LEGAL << bd_shift,
             )
         }
     } else {
-        (0, 255, 0, 255)
+        (0, index_max, 0, index_max)
     };
 
     let cy0 = py0 / 2;
@@ -349,8 +385,9 @@ fn add_noise_to_block(
                 let scaled = (((average_luma * cb_luma_mult + cb_mult * picture.u[cidx] as i32)
                     >> 6)
                     + cb_offset)
-                    .clamp(0, 255);
-                let delta = (scaling_cb[scaled as usize] * cb_grain[gidx] + rounding_offset)
+                    .clamp(0, index_max);
+                let delta = (scale_lut(scaling_cb, scaled, bit_depth) * cb_grain[gidx]
+                    + rounding_offset)
                     >> scaling_shift;
                 picture.u[cidx] =
                     ((picture.u[cidx] as i32 + delta).clamp(min_chroma, max_chroma)) as u16;
@@ -359,8 +396,9 @@ fn add_noise_to_block(
                 let scaled = (((average_luma * cr_luma_mult + cr_mult * picture.v[cidx] as i32)
                     >> 6)
                     + cr_offset)
-                    .clamp(0, 255);
-                let delta = (scaling_cr[scaled as usize] * cr_grain[gidx] + rounding_offset)
+                    .clamp(0, index_max);
+                let delta = (scale_lut(scaling_cr, scaled, bit_depth) * cr_grain[gidx]
+                    + rounding_offset)
                     >> scaling_shift;
                 picture.v[cidx] =
                     ((picture.v[cidx] as i32 + delta).clamp(min_chroma, max_chroma)) as u16;
@@ -372,7 +410,8 @@ fn add_noise_to_block(
             for j in 0..half_w * 2 {
                 let pidx = ((py0 + i) * y_stride + (px0 + j)) as usize;
                 let gidx = ((lg_row0 + i) * lg_stride + (lg_col0 + j)) as usize;
-                let delta = (scaling_y[picture.y[pidx] as usize] * luma_grain[gidx]
+                let delta = (scale_lut(scaling_y, picture.y[pidx] as i32, bit_depth)
+                    * luma_grain[gidx]
                     + rounding_offset)
                     >> scaling_shift;
                 picture.y[pidx] =
@@ -398,6 +437,7 @@ fn ver_overlap_inplace(
     width: i32,
     height: i32,
 ) {
+    let (grain_min, grain_max) = grain_range();
     for h in 0..height {
         if width == 1 {
             let l = at(dst, dst_stride, dst_row0 + h, dst_col0);
@@ -407,7 +447,7 @@ fn ver_overlap_inplace(
                 dst_stride,
                 dst_row0 + h,
                 dst_col0,
-                ((l * 23 + r * 22 + 16) >> 5).clamp(GRAIN_MIN, GRAIN_MAX),
+                ((l * 23 + r * 22 + 16) >> 5).clamp(grain_min, grain_max),
             );
         } else {
             let l0 = at(dst, dst_stride, dst_row0 + h, dst_col0);
@@ -419,14 +459,14 @@ fn ver_overlap_inplace(
                 dst_stride,
                 dst_row0 + h,
                 dst_col0,
-                ((27 * l0 + 17 * r0 + 16) >> 5).clamp(GRAIN_MIN, GRAIN_MAX),
+                ((27 * l0 + 17 * r0 + 16) >> 5).clamp(grain_min, grain_max),
             );
             set_at(
                 dst,
                 dst_stride,
                 dst_row0 + h,
                 dst_col0 + 1,
-                ((17 * l1 + 27 * r1 + 16) >> 5).clamp(GRAIN_MIN, GRAIN_MAX),
+                ((17 * l1 + 27 * r1 + 16) >> 5).clamp(grain_min, grain_max),
             );
         }
     }
@@ -447,6 +487,7 @@ fn hor_overlap_inplace(
     width: i32,
     height: i32,
 ) {
+    let (grain_min, grain_max) = grain_range();
     if height == 1 {
         for w in 0..width {
             let t = at(dst, dst_stride, dst_row0, dst_col0 + w);
@@ -456,7 +497,7 @@ fn hor_overlap_inplace(
                 dst_stride,
                 dst_row0,
                 dst_col0 + w,
-                ((t * 23 + b * 22 + 16) >> 5).clamp(GRAIN_MIN, GRAIN_MAX),
+                ((t * 23 + b * 22 + 16) >> 5).clamp(grain_min, grain_max),
             );
         }
     } else {
@@ -470,14 +511,14 @@ fn hor_overlap_inplace(
                 dst_stride,
                 dst_row0,
                 dst_col0 + w,
-                ((27 * t0 + 17 * b0 + 16) >> 5).clamp(GRAIN_MIN, GRAIN_MAX),
+                ((27 * t0 + 17 * b0 + 16) >> 5).clamp(grain_min, grain_max),
             );
             set_at(
                 dst,
                 dst_stride,
                 dst_row0 + 1,
                 dst_col0 + w,
-                ((17 * t1 + 27 * b1 + 16) >> 5).clamp(GRAIN_MIN, GRAIN_MAX),
+                ((17 * t1 + 27 * b1 + 16) >> 5).clamp(grain_min, grain_max),
             );
         }
     }
@@ -496,6 +537,7 @@ fn copy_area(
     width: i32,
     height: i32,
 ) {
+    let (grain_min, grain_max) = grain_range();
     for h in 0..height {
         for w in 0..width {
             let v = at(src, src_stride, src_row0 + h, src_col0 + w);
@@ -504,15 +546,33 @@ fn copy_area(
     }
 }
 
+thread_local! {
+    /// Firing count for the film-grain gates (class `gate-blind-to-feature`):
+    /// how many pictures actually ran through grain synthesis.
+    static GRAIN_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`GRAIN_HITS`].
+pub(crate) fn grain_hits() -> usize {
+    GRAIN_HITS.with(|c| c.get())
+}
+
 /// `av1_add_film_grain`/`add_film_grain_run` (spec 7.18.3.5): synthesize and
 /// apply film grain to `picture`, returning a new grained picture. `picture`
 /// itself is unchanged -- it stays the clean reference-frame-bank copy.
 /// Returns `picture.clone()` untouched when `apply_grain` is unset.
-pub(crate) fn apply_grain(picture: &Picture, fg: &FilmGrainParams, mc_identity: bool) -> Picture {
+pub(crate) fn apply_grain(
+    picture: &Picture,
+    fg: &FilmGrainParams,
+    mc_identity: bool,
+    bit_depth: u32,
+) -> Picture {
     let mut out = picture.clone();
     if !fg.apply_grain {
         return out;
     }
+    GRAIN_BIT_DEPTH.with(|c| c.set(bit_depth));
+    GRAIN_HITS.with(|c| c.set(c.get() + 1));
     let width = out.width as i32;
     let height = out.height as i32;
     let y_stride = width;
