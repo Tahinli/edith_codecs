@@ -1998,6 +1998,14 @@ impl Neighbours {
             self.above_compound_idx[i] = 0;
             self.above_filter[i] = [3u8; 2];
         }
+        // lane-sub8 r6: the mi-granular column maps are per tile too -- a
+        // stale `(row, mode)` from the tile to the LEFT names an mi row this
+        // tile's first block would read as its own above neighbour.
+        let mcol_end = col1_mi.min(self.sub8_mode_col.len());
+        for i in col0_mi.min(mcol_end)..mcol_end {
+            self.sub8_mode_col[i] = (usize::MAX, 0);
+            self.uv_mode_col[i] = (usize::MAX, 0);
+        }
     }
 
     /// Writes a just-decoded block's own palette-Y size/colours (`size == 0`
@@ -2266,6 +2274,10 @@ impl Neighbours {
         self.left_comp_group_idx.iter_mut().for_each(|r| *r = 0);
         self.left_compound_idx.iter_mut().for_each(|r| *r = 0);
         self.left_filter.iter_mut().for_each(|f| *f = [3u8; 2]);
+        // lane-sub8 r6: mi-granular row maps reset with the rest of the left
+        // context (a tile/SB-row boundary has no left neighbour).
+        self.sub8_mode_row.iter_mut().for_each(|s| *s = (usize::MAX, 0));
+        self.uv_mode_row.iter_mut().for_each(|s| *s = (usize::MAX, 0));
     }
 
     /// Records a block's `skip`/`is_inter`/`interp_filter` state for the next
@@ -2531,14 +2543,14 @@ impl Neighbours {
     /// construction). See [`Self::record_mode_mi`].
     fn mode_above_mi(&self, mi_r: usize, mi_c: usize) -> Option<usize> {
         match self.sub8_mode_col.get(mi_c) {
-            Some(&(row, m)) if mi_r > 0 && row == mi_r - 1 => Some(m),
+            Some(&(row, m)) if mi_r > self.tile_row0_mi && row == mi_r - 1 => Some(m),
             _ => None,
         }
     }
 
     fn mode_left_mi(&self, mi_r: usize, mi_c: usize) -> Option<usize> {
         match self.sub8_mode_row.get(mi_r) {
-            Some(&(col, m)) if mi_c > 0 && col == mi_c - 1 => Some(m),
+            Some(&(col, m)) if mi_c > self.tile_col0_mi && col == mi_c - 1 => Some(m),
             _ => None,
         }
     }
@@ -2572,11 +2584,11 @@ impl Neighbours {
     /// block has recorded the exact neighbouring mi.
     fn smooth_uv_neighbour(&self, mi_r: usize, mi_c: usize, r: usize, c: usize) -> bool {
         let above = match self.uv_mode_col.get(mi_c) {
-            Some(&(row, m)) if mi_r > 0 && row == mi_r - 1 => m,
+            Some(&(row, m)) if mi_r > self.tile_row0_mi && row == mi_r - 1 => m,
             _ => self.above_uv_mode[c],
         };
         let left = match self.uv_mode_row.get(mi_r) {
-            Some(&(col, m)) if mi_c > 0 && col == mi_c - 1 => m,
+            Some(&(col, m)) if mi_c > self.tile_col0_mi && col == mi_c - 1 => m,
             _ => self.left_uv_mode[r],
         };
         is_smooth_mode(above) || is_smooth_mode(left)
@@ -3745,6 +3757,11 @@ fn decode_leaf_rect(
             vec![0i32; chroma_w * chroma_h],
         ],
     );
+    // lane-sub8 r6: the caller patches only the coarse `above_mode`/
+    // `left_mode` slot (one value for the whole 16x16), so record this
+    // strip's own span mi-exactly like every square leaf does.
+    neighbours.record_mode_mi(leaf_mi.0, leaf_mi.1, mi_w, mi_h, mode);
+    neighbours.record_uv_mode_mi(leaf_mi.0, leaf_mi.1, mi_w, mi_h, uv_predict_mode);
     neighbours.fill_skip_grid_rect(leaf_mi, mi_w, mi_h, skip);
     neighbours.fill_lf_grid_rect(leaf_mi, mi_w, mi_h, bw as u8, bh as u8, 0);
     Ok(mode)
@@ -5324,10 +5341,9 @@ fn decode_leaf8(
     // this leaf's `smooth_neighbor` is built from -- passing `false` here
     // filtered a directional chroma block's edge at the wrong strength
     // (lane-sub8 r5: 4 pixels of one 8x8 leaf's chroma, deltas 1..3).
-    // corner-cut: the `uv_mode` neighbours are the coarse [`SUB`] slots, so
-    // two 8x8 leaves of one 16x16 see the slot the previous leaf wrote
-    // (updated below) rather than a real mi-exact neighbour; upgrade path is
-    // an mi-granular map like `sub8_mode_col`.
+    // The `uv_mode` neighbours are mi-exact (`uv_mode_col`/`uv_mode_row`),
+    // with the coarse [`SUB`] slot as the fallback when no block recorded
+    // that exact mi cell.
     let smooth_neighbor_uv = neighbours.smooth_uv_neighbour(leaf_mi.0, leaf_mi.1, r, c);
     if smooth_neighbor {
         SMOOTH_LUMA_HITS.with(|c| c.set(c.get() + 1));

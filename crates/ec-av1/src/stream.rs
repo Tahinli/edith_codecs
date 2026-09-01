@@ -7256,7 +7256,16 @@ mod tests {
         // safe way to isolate the leaf count. Left red; do not "fix" this
         // gate by picking fixture parameters that dodge the desync without
         // finding it.
-        let (width, height) = (64usize, 64usize);
+        // lane-sub8 r6: three arms. The mi-granular mode maps
+        // (`sub8_mode_col`/`uv_mode_col` and their row twins) are per TILE --
+        // the verifier's repro was a 128x64 `--tile-columns=1` stream (seeds
+        // 207/228) whose every mismatching luma pixel sat at x>=64, the tile
+        // boundary -- so one arm per tile axis is part of this gate.
+        for (width, height, tile_args) in [
+            (64usize, 64usize, &[][..]),
+            (128usize, 64usize, &["--tile-columns=1"][..]),
+            (64usize, 128usize, &["--tile-rows=1"][..]),
+        ] {
         let mut refusals = Vec::new();
         let mut fired_runs = 0u32;
         for attempt in 0..40u32 {
@@ -7271,7 +7280,10 @@ mod tests {
                     "-i",
                     &gradients_source(seed, width, height, "rate=25"),
                     "-vf",
-                    "noise=alls=40:allf=t,format=yuv420p",
+                    // `noise` without `all_seed` re-renders differently on
+                    // every run (seeded-fixture-not-reproducible); pinning it
+                    // makes (seed, cq) name one exact stream.
+                    &format!("noise=alls=40:allf=t:all_seed={seed},format=yuv420p"),
                     "-t",
                     "0.04",
                     "-f",
@@ -7324,6 +7336,7 @@ mod tests {
                     "-",
                     "-",
                 ])
+                .args(tile_args)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -7344,13 +7357,29 @@ mod tests {
             }
             let stream = out.stdout;
             let before = decode::sub8_split_hits();
+            let tiles_before = decode::tile_hits();
             let frames = match decode_stream(&stream) {
                 Ok(frames) => frames,
                 Err(e) => {
-                    refusals.push(format!("seed={seed} cq={cq}: {e}"));
+                    // Only a named refusal ("unsupported: ...") is a skip
+                    // reason; any other decode error is this decoder failing.
+                    let msg = e.to_string();
+                    assert!(
+                        msg.starts_with("unsupported: "),
+                        "decode error that is not a named refusal \
+                         (seed={seed} cq={cq} tiles={tile_args:?}): {msg}"
+                    );
+                    refusals.push(format!("seed={seed} cq={cq}: {msg}"));
                     continue;
                 }
             };
+            // gate-blind-to-feature: a tile arm must actually decode more
+            // than one tile, not merely carry `tile_info.cols > 1`.
+            assert!(
+                tile_args.is_empty() || decode::tile_hits() - tiles_before >= 2,
+                "tiles={tile_args:?} decoded only {} tile(s) (seed={seed} cq={cq})",
+                decode::tile_hits() - tiles_before
+            );
             if decode::sub8_split_hits() == before {
                 refusals.push(format!(
                     "seed={seed} cq={cq}: decoded, but no block read a real PARTITION_SPLIT below 8x8"
@@ -7372,13 +7401,16 @@ mod tests {
             );
             fired_runs += 1;
             if fired_runs >= 4 {
-                return;
+                break;
             }
         }
-        panic!(
-            "fewer than 4 firing+pixel-exact runs out of 40 attempts:\n{}",
+        assert!(
+            fired_runs >= 4,
+            "fewer than 4 firing+pixel-exact runs out of 40 attempts \
+             ({width}x{height} tiles={tile_args:?}):\n{}",
             refusals.join("\n")
         );
+        }
     }
 
     /// lane-av1golden7 r9's decisive fixture: a real aomenc stream (seed 59,

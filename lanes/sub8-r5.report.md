@@ -43,7 +43,8 @@ existing mi-granular `sub8_mode_col`/`sub8_mode_row` machinery.
   hardcoded `false` at all 10 chroma reconstruct/read_plane arguments in those
   two functions.
 - `crates/ec-av1/src/refusal_inventory.rs:31` -- deleted the stale capability
-  claim `"a partition below 16x16 other than a clean split ..."`; r4's fixes
+  claim `"a partition below 8x8 (this decoder codes no leaf smaller than
+  8x8)"` (corrected in r6: the string named here originally was wrong); r4's fixes
   removed that string from the decode path, which is exactly what made
   `the_decode_path_refuses_exactly_the_listed_cases` RED (charter step 2).
   It was the only entry the test named.
