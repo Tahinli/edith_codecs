@@ -39,39 +39,219 @@ const NEVER_EXERCISED: &[(&str, &str)] = &[
     // lane could produce sits under TX_MODE_SELECT, whose inter var-tx
     // partition tree is unread -- so no stream reconstructs one end to end
     // yet and this entry stays.
-    ("enable-intrabc", "the block vector is decoded and predicted from, but every real stream's intrabc block needs the unread inter var-tx transform tree"),
+    (
+        "enable-intrabc",
+        "the block vector is decoded and predicted from, but every real stream's intrabc block needs the unread inter var-tx transform tree",
+    ),
+];
+
+/// The `--enable-*` tools this decoder cares about, whether or not any gate
+/// names one. A flag no gate mentions is *defaulted*, i.e. unknown, and by the
+/// rule above unknown is not coverage -- so the universe is fixed here rather
+/// than derived from the gate source, which would silently shrink to whatever
+/// the gates happen to spell.
+#[cfg(test)]
+const TOOL_UNIVERSE: &[&str] = &[
+    "enable-1to4-partitions",
+    "enable-ab-partitions",
+    "enable-angle-delta",
+    "enable-cdef",
+    "enable-cfl-intra",
+    "enable-dist-wtd-comp",
+    "enable-dual-filter",
+    "enable-filter-intra",
+    "enable-flip-idtx",
+    "enable-global-motion",
+    "enable-interintra-comp",
+    "enable-intra-edge-filter",
+    "enable-intrabc",
+    "enable-masked-comp",
+    "enable-obmc",
+    "enable-order-hint",
+    "enable-paeth-intra",
+    "enable-palette",
+    "enable-rect-partitions",
+    "enable-rect-tx",
+    "enable-ref-frame-mvs",
+    "enable-restoration",
+    "enable-smooth-intra",
+    "enable-superres",
+    "enable-tx64",
+    "enable-warped-motion",
+];
+
+/// Coverage is per (tool x bit depth), not per tool.
+///
+/// lane-hbdinter found two 10-bit-only defects (SGR box sums unscaled, Wiener
+/// clamp pinned at the 8-bit bound) that survived the "10-bit bit-exact"
+/// milestone because every 10-bit gate passed `--enable-restoration=0`:
+/// `enable-restoration` is positively exercised -- at 8 bits only. A tool the
+/// 8-bit gates cover says nothing about the high-bit-depth path through the
+/// same code, so the two lists below are pinned separately.
+///
+/// Each entry is `(flag, why)`. A gate that passes `--enable-<tool>=1` at that
+/// depth retires the entry, and this test fails until it is deleted.
+#[cfg(test)]
+const NEVER_EXERCISED_8BIT: &[(&str, &str)] = &[
+    (
+        "enable-1to4-partitions",
+        "off in 42 gates, on in none: PARTITION_HORZ_4/VERT_4 at 64x64 needs TX_64X16 luma plus 32x8 chroma scans (lane-part32 r5)",
+    ),
+    (
+        "enable-angle-delta",
+        "off in 36 gates, on in none: the directional-intra gates pin it off to isolate the base modes",
+    ),
+    (
+        "enable-cfl-intra",
+        "off in 41 gates, on in none: chroma-from-luma prediction is unimplemented",
+    ),
+    (
+        "enable-dist-wtd-comp",
+        "off in 11 gates, on in none: distance-weighted compound is unimplemented",
+    ),
+    (
+        "enable-dual-filter",
+        "never spelled by any gate, so defaulted = unknown; no stream is proven to carry per-direction interp filters",
+    ),
+    (
+        "enable-flip-idtx",
+        "never spelled; the flip/identity transform types are unproven by a real stream",
+    ),
+    (
+        "enable-global-motion",
+        "off in 5 gates, on in none at 8 bits; lane-gm owns the global-warp prediction that is still missing",
+    ),
+    (
+        "enable-intrabc",
+        "the block vector is decoded and predicted from, but every real stream's intrabc block needs the unread inter var-tx transform tree",
+    ),
+    (
+        "enable-rect-tx",
+        "never spelled; rect transforms reach the decoder only through partition shape, never through a gate that names the tool",
+    ),
+    (
+        "enable-ref-frame-mvs",
+        "off in 27 gates, on in none: temporal MV projection is unimplemented",
+    ),
+    (
+        "enable-superres",
+        "never spelled: the three superres gates drive `--superres-mode=1` instead, so the tool IS exercised but not under this flag -- retire this entry only by renaming the check, not by assuming coverage",
+    ),
+    (
+        "enable-tx64",
+        "never spelled; TX_64X64 appears only where aomenc's default picks it, which is unknown per stream",
+    ),
+];
+
+#[cfg(test)]
+const NEVER_EXERCISED_10BIT: &[(&str, &str)] = &[
+    // Only 4 of the 45 real-aomenc gates encode at 10 bits, and they pin the
+    // pixel filters and the intra tool set off. Every entry the 8-bit list
+    // carries is a hole here too. lane-hbdgates r1 closed six of the seven
+    // 8-bit-only entries with real 10-bit gates (filter-intra, smooth-intra,
+    // paeth-intra, intra-edge-filter, rect-partitions, ab-partitions); its
+    // seventh, the 10-bit LR gate, was `#[ignore]`d on that branch and passes
+    // un-ignored on main, which carries the fix.
+    // `enable-restoration` LEFT this list on 2026-09-01: lane-hbdinter's
+    // 10-bit inter gate passes `--enable-restoration=1` and asserts a real
+    // Wiener/SGR unit fired, which is what caught the two defects (SGR box
+    // sums never brought back to the 8-bit scale, Wiener clamp at the wrong
+    // bound). `enable-dist-wtd-comp` and `enable-global-motion` left it the
+    // same day for the same reason: lane-cwarp's 10-bit compound global-warp
+    // gate passes `=1` for both.
+    (
+        "enable-1to4-partitions",
+        "hole at both depths, see the 8-bit list",
+    ),
+    (
+        "enable-angle-delta",
+        "hole at both depths, see the 8-bit list",
+    ),
+    (
+        "enable-cfl-intra",
+        "hole at both depths, see the 8-bit list",
+    ),
+    (
+        "enable-dual-filter",
+        "hole at both depths, see the 8-bit list",
+    ),
+    (
+        "enable-flip-idtx",
+        "hole at both depths, see the 8-bit list",
+    ),
+    ("enable-intrabc", "hole at both depths, see the 8-bit list"),
+    ("enable-rect-tx", "hole at both depths, see the 8-bit list"),
+    (
+        "enable-ref-frame-mvs",
+        "hole at both depths, see the 8-bit list",
+    ),
+    (
+        "enable-superres",
+        "the 10-bit superres gate drives `--superres-mode=1`, not this flag; see the 8-bit entry",
+    ),
+    ("enable-tx64", "hole at both depths, see the 8-bit list"),
 ];
 
 #[cfg(test)]
 mod tests {
-    use super::NEVER_EXERCISED;
+    use super::{NEVER_EXERCISED, NEVER_EXERCISED_8BIT, NEVER_EXERCISED_10BIT, TOOL_UNIVERSE};
     use std::collections::{BTreeMap, BTreeSet};
+
+    /// Bodies of the real-aomenc gates: a `fn` body carrying the shared
+    /// `--passes=1` every one of them passes. Split on the attribute that
+    /// opens a test.
+    fn gate_bodies() -> Vec<&'static str> {
+        let src = include_str!("stream.rs");
+        let gates: Vec<&str> = src
+            .split("\n    #[")
+            // lane-hbdgates r1: an `#[ignore]`d gate exercises nothing, so it
+            // must not close a hole. Its body is the segment that opens with
+            // the ignore attribute.
+            .filter(|body| !body.starts_with("ignore"))
+            // lane-hbdgates r1: gates that build their stream through the
+            // shared 10-bit helpers spell `--passes=1` there, not inline.
+            .filter(|body| {
+                body.contains("\"--passes=1\"")
+                    || body.contains("ten_bit_tool_gate(")
+                    || body.contains("encode_10bit_gradients")
+            })
+            .collect();
+        assert!(
+            gates.len() >= 20,
+            "expected the real-aomenc gates, found {}",
+            gates.len()
+        );
+        gates
+    }
+
+    /// `--enable-<flag>=<value>` settings spelled inside one gate body.
+    fn flags_in(gate: &str) -> BTreeMap<String, char> {
+        let mut here = BTreeMap::new();
+        for (i, _) in gate.match_indices("\"--enable-") {
+            let rest = &gate[i + 3..];
+            let Some(end) = rest.find('"') else { continue };
+            let Some((flag, value)) = rest[..end].split_once('=') else {
+                continue;
+            };
+            let Some(value) = value.chars().next() else {
+                continue;
+            };
+            here.insert(flag.to_owned(), value);
+        }
+        here
+    }
 
     /// `--enable-*` settings per real-aomenc gate, derived from the gate
     /// source: `flag -> (turned off in N gates, turned on in N, defaulted in N)`.
     fn tool_settings() -> (usize, BTreeMap<String, (usize, usize, usize)>) {
-        let src = include_str!("stream.rs");
-        // A real-aomenc gate is a `fn` body carrying the shared `--passes=1`
-        // every one of them passes. Split on the attribute that opens a test.
-        let gates: Vec<&str> = src
-            .split("\n    #[")
-            .filter(|body| body.contains("\"--passes=1\""))
-            .collect();
-        assert!(gates.len() >= 20, "expected the real-aomenc gates, found {}", gates.len());
+        let gates = gate_bodies();
 
         let mut per_tool: BTreeMap<String, (usize, usize, usize)> = BTreeMap::new();
         let mut names: BTreeSet<String> = BTreeSet::new();
         let mut seen: Vec<BTreeMap<String, char>> = Vec::new();
         for gate in &gates {
-            let mut here = BTreeMap::new();
-            for (i, _) in gate.match_indices("\"--enable-") {
-                let rest = &gate[i + 3..];
-                let Some(end) = rest.find('"') else { continue };
-                let Some((flag, value)) = rest[..end].split_once('=') else { continue };
-                let Some(value) = value.chars().next() else { continue };
-                names.insert(flag.to_owned());
-                here.insert(flag.to_owned(), value);
-            }
+            let here = flags_in(gate);
+            names.extend(here.keys().cloned());
             seen.push(here);
         }
         for name in names {
@@ -126,10 +306,113 @@ mod tests {
     #[test]
     fn tool_settings_reads_whole_flags() {
         let (gate_count, per_tool) = tool_settings();
-        assert!(per_tool.contains_key("enable-cdef"), "expected --enable-cdef among the gate flags");
+        assert!(
+            per_tool.contains_key("enable-cdef"),
+            "expected --enable-cdef among the gate flags"
+        );
         for (name, &(off, on, defaulted)) in &per_tool {
-            assert!(!name.is_empty() && !name.contains(['"', '=']), "malformed flag {name:?}");
-            assert_eq!(off + on + defaulted, gate_count, "{name} counts do not cover every gate");
+            assert!(
+                !name.is_empty() && !name.contains(['"', '=']),
+                "malformed flag {name:?}"
+            );
+            assert_eq!(
+                off + on + defaulted,
+                gate_count,
+                "{name} counts do not cover every gate"
+            );
+        }
+    }
+
+    /// A gate encodes at 10 bits when its recipe says so: the shared 10-bit
+    /// helper, an explicit `--bit-depth=10`/`--input-bit-depth=10`, or a
+    /// `yuv420p10le` fixture handed to aomenc. Everything else is aomenc's
+    /// 8-bit default.
+    fn is_ten_bit(body: &str) -> bool {
+        body.contains("encode_10bit_gradients")
+            || body.contains("ten_bit_tool_gate(")
+            || body.contains("--bit-depth=10")
+            || body.contains("--input-bit-depth=10")
+            || body.contains("yuv420p10le")
+    }
+
+    /// Flags a gate positively enables (`=1`), at gates of the given depth.
+    fn enabled_at(ten_bit: bool) -> BTreeSet<String> {
+        let mut on = BTreeSet::new();
+        for gate in gate_bodies() {
+            if is_ten_bit(gate) != ten_bit {
+                continue;
+            }
+            for (flag, value) in flags_in(gate) {
+                if value == '1' {
+                    on.insert(flag);
+                }
+            }
+        }
+        on
+    }
+
+    /// The tools of [`TOOL_UNIVERSE`] that no gate of this depth enables.
+    fn never_exercised_at(ten_bit: bool) -> BTreeSet<&'static str> {
+        let on = enabled_at(ten_bit);
+        TOOL_UNIVERSE
+            .iter()
+            .copied()
+            .filter(|t| !on.contains(*t))
+            .collect()
+    }
+
+    fn check_depth(ten_bit: bool, listed: &[(&str, &str)]) {
+        let derived = never_exercised_at(ten_bit);
+        let listed: BTreeSet<&str> = listed.iter().map(|&(flag, _)| flag).collect();
+        let depth = if ten_bit { "10-bit" } else { "8-bit" };
+        let unlisted: Vec<&&str> = derived.difference(&listed).collect();
+        assert!(
+            unlisted.is_empty(),
+            "no {depth} gate passes `=1` for {unlisted:?}, so no real {depth} stream exercises \
+             them -- enable the tool in a {depth} gate that asserts it fired, or list it"
+        );
+        let stale: Vec<&&str> = listed.difference(&derived).collect();
+        assert!(
+            stale.is_empty(),
+            "the {depth} list still names {stale:?}, but a {depth} gate now passes `=1` for them \
+             -- delete those entries, the coverage hole is closed"
+        );
+    }
+
+    #[test]
+    fn never_exercised_8bit_matches_the_gate_recipes() {
+        check_depth(false, NEVER_EXERCISED_8BIT);
+    }
+
+    #[test]
+    fn never_exercised_10bit_matches_the_gate_recipes() {
+        check_depth(true, NEVER_EXERCISED_10BIT);
+    }
+
+    /// `cargo test -p ec-av1 --lib gate_coverage -- --nocapture` prints both
+    /// lists, so the per-depth holes can be read without opening this file.
+    #[test]
+    fn print_never_exercised_per_bit_depth() {
+        let ten: Vec<&str> = gate_bodies()
+            .into_iter()
+            .filter(|b| is_ten_bit(b))
+            .collect();
+        let total = gate_bodies().len();
+        println!(
+            "gate_coverage: {} real-aomenc gates, {} of them 10-bit",
+            total,
+            ten.len()
+        );
+        for (label, ten_bit) in [("8BIT", false), ("10BIT", true)] {
+            let holes = never_exercised_at(ten_bit);
+            println!(
+                "NEVER_EXERCISED_{label} ({} of {}):",
+                holes.len(),
+                TOOL_UNIVERSE.len()
+            );
+            for flag in &holes {
+                println!("    --{flag}");
+            }
         }
     }
 }
