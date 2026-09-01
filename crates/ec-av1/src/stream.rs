@@ -69,6 +69,16 @@ fn final_dump_prefix() -> Option<String> {
 /// [`Av1Parser`] reports it), when a frame header names anything this
 /// crate's tile decoders do not reconstruct (see their own docs), or when an
 /// inter frame appears before any key frame has supplied a reference.
+/// 32x32-level 1:4 strip counters, for `decode_probe`'s fixture search:
+/// (HORZ_4 strips, VERT_4 strips, strips that read coefficients).
+pub fn rect4_32_counters() -> (usize, usize, usize) {
+    (
+        crate::decode::rect4_32_horz_hits(),
+        crate::decode::rect4_32_vert_hits(),
+        crate::decode::rect4_coeff_hits(),
+    )
+}
+
 pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
     let final_dump = final_dump_prefix();
     let mut parser = Av1Parser::new();
@@ -13149,18 +13159,11 @@ mod tests {
     /// gate-skips-on-its-own-failure); the 10-bit arm is what retires
     /// `enable-1to4-partitions` from `NEVER_EXERCISED_10BIT`.
     #[test]
-    // lane-tx64x16 r3, MEASURED, not a hunch: no recipe tried this round makes
-    // aomenc's RD emit a 32x32-level 1:4 partition on synthetic fixtures --
-    // 20/20 attempts of the recipe below (min-partition-size=8,
-    // max-partition-size=32) carried ZERO 32-level 1:4 blocks, as did a
-    // vertically-squeezed variant and a horizontally-blurred one (the latter
-    // additionally tripped the screen-content refusal). The wiring IS
-    // exercised by real content -- see this round's report for the film probe
-    // -- but until a fixture recipe is found this gate can prove nothing, and
-    // a gate that passes by never seeing its feature is worse than an ignored
-    // one (class gate-blind-to-feature). Un-ignore with the recipe, never with
-    // a weakened assert.
-    #[ignore = "no fixture recipe yet emits a 32-level 1:4 partition (lanes/tx64x16-r3.report.md)"]
+    // lane-tx64x16 r4: the fixture r3 could not find. `gradients` never wins
+    // a 32-level 1:4 shape; 8-pixel BANDS do -- each 32x8 strip is flat, so
+    // HORZ_4 beats both HORZ (two bands per 32x16) and SPLIT, while the noise
+    // layer keeps aomenc out of screen-content mode. Measured 16 HORZ_4 / 24
+    // VERT_4 strips per frame, both bit depths (lanes/tx64x16-r4.report.md).
     fn a_real_aomenc_stream_with_a_32x32_level_1to4_partition_decodes_pixel_exact() {
         const NAME: &str =
             "a_real_aomenc_stream_with_a_32x32_level_1to4_partition_decodes_pixel_exact";
@@ -13177,7 +13180,7 @@ mod tests {
         let n_attempts: u32 = std::env::var("EC_TX64X16_GATE32_ATTEMPTS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(20);
+            .unwrap_or(8);
         for bit_depth in [8u32, 10u32] {
             let mut named_refusals = 0u32;
             let mut matched = 0u32;
@@ -13186,22 +13189,23 @@ mod tests {
             for attempt in 0..n_attempts {
                 let seed = 42 + attempt;
                 let duration = frame_count as f64 / 25.0;
-                // Odd attempts render the SAME generator rotated 90 degrees,
-                // the transposed-pair discipline the superblock-level 1:4
-                // gate above documents.
-                let source = if attempt % 2 == 0 {
-                    gradients_source(seed, width, height, &format!("duration={duration}:rate=25"))
-                } else {
-                    format!(
-                        "{},transpose=1",
-                        gradients_source(
-                            seed,
-                            height,
-                            width,
-                            &format!("duration={duration}:rate=25")
-                        )
-                    )
-                };
+                // 8-pixel bands: a 32x8 strip is flat, a 32x16 one is not, so
+                // aomenc's RD picks HORZ_4 (bands across Y) / VERT_4 (bands
+                // across X). Odd attempts are the transposed source -- the
+                // transposed-pair discipline the superblock-level 1:4 gate
+                // above documents, and the only way a transposed scan table is
+                // caught (class scan-weights-cross-axis). The noise layer is
+                // what keeps the flat bands out of screen-content mode; its
+                // seed is explicit, never lavfi's ignored default.
+                let axis = if attempt % 2 == 0 { "Y" } else { "X" };
+                let step = 67 + (attempt / 2) * 12;
+                let noise = 6 + (attempt % 4) * 3;
+                let source = format!(
+                    "color=c=gray:s={width}x{height}:d={duration}:r=25,format=gray,\
+                     geq=lum='mod(floor({axis}/8)*{step},256)',\
+                     noise=alls={noise}:all_seed={seed},format=yuv420p"
+                );
+                let cq_level = format!("--cq-level={}", if attempt % 4 < 2 { 32 } else { 45 });
                 let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
                 let y4m = Command::new("ffmpeg")
                     .args([
@@ -13224,7 +13228,7 @@ mod tests {
                     "--codec=av1",
                     "--passes=1",
                     "--end-usage=q",
-                    "--cq-level=45",
+                    &cq_level,
                     "--cpu-used=0",
                     "--threads=1",
                     "--row-mt=0",
