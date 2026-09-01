@@ -326,12 +326,20 @@ fn get_shear_params(wmmat: [i32; 6]) -> Option<(i16, i16, i16, i16)> {
         return None;
     }
     let mat = wmmat.map(|v| v as i64);
-    let mut alpha = clamp(mat[2] - (1 << WARPEDMODEL_PREC_BITS), i16::MIN as i64, i16::MAX as i64);
+    let mut alpha = clamp(
+        mat[2] - (1 << WARPEDMODEL_PREC_BITS),
+        i16::MIN as i64,
+        i16::MAX as i64,
+    );
     let beta = clamp(mat[3], i16::MIN as i64, i16::MAX as i64);
     let (y_mag, shift) = resolve_divisor_32(mat[2].unsigned_abs() as u32);
     let y = if mat[2] < 0 { -y_mag } else { y_mag };
     let v = (mat[4] * (1 << WARPEDMODEL_PREC_BITS)) * y;
-    let mut gamma = clamp(round2_signed(v, shift as u32), i16::MIN as i64, i16::MAX as i64);
+    let mut gamma = clamp(
+        round2_signed(v, shift as u32),
+        i16::MIN as i64,
+        i16::MAX as i64,
+    );
     let v = (mat[3] * mat[4]) * y;
     let mut delta = clamp(
         mat[5] - round2_signed(v, shift as u32) - (1 << WARPEDMODEL_PREC_BITS),
@@ -412,7 +420,13 @@ pub fn find_projection(
 /// translational fallback in that rare case.
 pub fn global_warp_params(wmmat: [i32; 6]) -> Option<WarpParams> {
     let (alpha, beta, gamma, delta) = get_shear_params(wmmat)?;
-    Some(WarpParams { wmmat, alpha, beta, gamma, delta })
+    Some(WarpParams {
+        wmmat,
+        alpha,
+        beta,
+        gamma,
+        delta,
+    })
 }
 
 fn clip_pixel(v: i32) -> u16 {
@@ -480,8 +494,8 @@ pub fn warp_affine(
                 let mut sx = sx4 + beta * (k as i64 + 4);
                 for l in -4..4i32 {
                     let ix = ix4 + l - 3;
-                    let offs =
-                        (round2(sx, WARPEDDIFF_PREC_BITS) as i32 + WARPEDPIXEL_PREC_SHIFTS) as usize;
+                    let offs = (round2(sx, WARPEDDIFF_PREC_BITS) as i32 + WARPEDPIXEL_PREC_SHIFTS)
+                        as usize;
                     let coeffs = &AV1_WARPED_FILTER[offs];
                     let mut sum: i32 = 1 << offset_bits_horiz;
                     for (m, &c) in coeffs.iter().enumerate() {
@@ -501,12 +515,13 @@ pub fn warp_affine(
                 let l_hi = (4i32).min(p_col + p_width - j - 4);
                 let mut l = -4i32;
                 while l < l_hi {
-                    let offs =
-                        (round2(sy, WARPEDDIFF_PREC_BITS) as i32 + WARPEDPIXEL_PREC_SHIFTS) as usize;
+                    let offs = (round2(sy, WARPEDDIFF_PREC_BITS) as i32 + WARPEDPIXEL_PREC_SHIFTS)
+                        as usize;
                     let coeffs = &AV1_WARPED_FILTER[offs];
                     let mut sum: i32 = 1 << offset_bits_vert;
                     for m in 0..8i32 {
-                        sum += tmp[(k + m + 4) as usize][(l + 4) as usize] * coeffs[m as usize] as i32;
+                        sum +=
+                            tmp[(k + m + 4) as usize][(l + 4) as usize] * coeffs[m as usize] as i32;
                     }
                     sum = round2(sum as i64, reduce_bits_vert as u32) as i32;
                     let out_row = (i - p_row + k + 4) as usize;

@@ -768,7 +768,8 @@ pub fn predict_filter_intra(
             for k in 0..8 {
                 let (r_off, c_off) = (k >> 2, k & 3);
                 let pr: i32 = taps[k].iter().zip(&p).map(|(t, s)| t * s).sum();
-                let value = round2(pr, FILTER_INTRA_SCALE_BITS).clamp(0, crate::decode::sample_max());
+                let value =
+                    round2(pr, FILTER_INTRA_SCALE_BITS).clamp(0, crate::decode::sample_max());
                 let idx = (r + r_off) * (side + 1) + c + c_off;
                 buffer[idx] = value;
             }
@@ -908,7 +909,11 @@ mod tests {
             let left = fill(reach, 2);
             let corner = ((bw * 3 + bh * 5) % 256) as u16;
 
-            for (name, mode) in [("DC", DC_PRED), ("SMOOTH", SMOOTH_PRED), ("PAETH", PAETH_PRED)] {
+            for (name, mode) in [
+                ("DC", DC_PRED),
+                ("SMOOTH", SMOOTH_PRED),
+                ("PAETH", PAETH_PRED),
+            ] {
                 let mut dst = vec![0u16; bw * bh];
                 predict(
                     mode,
@@ -953,7 +958,9 @@ mod tests {
                         let got = checksum(&dst);
                         let key = ("DR", bw, bh, angle, i32::from(ef), i32::from(sn));
                         let want = *expected.get(&key).unwrap_or_else(|| {
-                            panic!("missing DR {bw}x{bh} angle={angle} ef={ef} sn={sn} in the C dump")
+                            panic!(
+                                "missing DR {bw}x{bh} angle={angle} ef={ef} sn={sn} in the C dump"
+                            )
                         });
                         assert_eq!(
                             got, want,

@@ -1098,7 +1098,10 @@ impl Reach {
             return false;
         }
         let table = HAS_TOP_RIGHT_RECT[usize::from(bw == 16)];
-        Self::bit(table, (row * Self::table_stride(bw) + col) % (table.len() * 8))
+        Self::bit(
+            table,
+            (row * Self::table_stride(bw) + col) % (table.len() * 8),
+        )
     }
 
     fn bottom_left_rect(bw: usize, bh: usize, x: usize, y: usize) -> bool {
@@ -1110,7 +1113,10 @@ impl Reach {
             return false;
         }
         let table = HAS_BOTTOM_LEFT_RECT[usize::from(bw == 16)];
-        Self::bit(table, (row * Self::table_stride(bw) + col) % (table.len() * 8))
+        Self::bit(
+            table,
+            (row * Self::table_stride(bw) + col) % (table.len() * 8),
+        )
     }
 
     /// Neither, which is all a mode that reads no further than its own edges
@@ -3105,8 +3111,14 @@ mod tests {
             width,
             height,
             y: out.stdout[..luma].iter().map(|&v| u16::from(v)).collect(),
-            u: out.stdout[luma..luma + chroma].iter().map(|&v| u16::from(v)).collect(),
-            v: out.stdout[luma + chroma..].iter().map(|&v| u16::from(v)).collect(),
+            u: out.stdout[luma..luma + chroma]
+                .iter()
+                .map(|&v| u16::from(v))
+                .collect(),
+            v: out.stdout[luma + chroma..]
+                .iter()
+                .map(|&v| u16::from(v))
+                .collect(),
         }
     }
 
@@ -3676,8 +3688,14 @@ mod tests {
             width,
             height,
             y: out.stdout[..luma].iter().map(|&v| u16::from(v)).collect(),
-            u: out.stdout[luma..luma + chroma].iter().map(|&v| u16::from(v)).collect(),
-            v: out.stdout[luma + chroma..].iter().map(|&v| u16::from(v)).collect(),
+            u: out.stdout[luma..luma + chroma]
+                .iter()
+                .map(|&v| u16::from(v))
+                .collect(),
+            v: out.stdout[luma + chroma..]
+                .iter()
+                .map(|&v| u16::from(v))
+                .collect(),
         }
     }
 
@@ -4409,9 +4427,18 @@ mod tests {
                 Picture {
                     width,
                     height,
-                    y: out.stdout[base..base + luma].iter().map(|&v| u16::from(v)).collect(),
-                    u: out.stdout[base + luma..base + luma + chroma].iter().map(|&v| u16::from(v)).collect(),
-                    v: out.stdout[base + luma + chroma..base + frame_bytes].iter().map(|&v| u16::from(v)).collect(),
+                    y: out.stdout[base..base + luma]
+                        .iter()
+                        .map(|&v| u16::from(v))
+                        .collect(),
+                    u: out.stdout[base + luma..base + luma + chroma]
+                        .iter()
+                        .map(|&v| u16::from(v))
+                        .collect(),
+                    v: out.stdout[base + luma + chroma..base + frame_bytes]
+                        .iter()
+                        .map(|&v| u16::from(v))
+                        .collect(),
                 }
             })
             .collect()
@@ -4751,8 +4778,14 @@ mod tests {
                 width,
                 height,
                 y: bytes[..luma].iter().map(|&v| u16::from(v)).collect(),
-                u: bytes[luma..luma + chroma].iter().map(|&v| u16::from(v)).collect(),
-                v: bytes[luma + chroma..].iter().map(|&v| u16::from(v)).collect(),
+                u: bytes[luma..luma + chroma]
+                    .iter()
+                    .map(|&v| u16::from(v))
+                    .collect(),
+                v: bytes[luma + chroma..]
+                    .iter()
+                    .map(|&v| u16::from(v))
+                    .collect(),
             }
         })
     }
@@ -4878,8 +4911,14 @@ mod tests {
                     width,
                     height,
                     y: bytes[..luma].iter().map(|&v| u16::from(v)).collect(),
-                    u: bytes[luma..luma + chroma].iter().map(|&v| u16::from(v)).collect(),
-                    v: bytes[luma + chroma..].iter().map(|&v| u16::from(v)).collect(),
+                    u: bytes[luma..luma + chroma]
+                        .iter()
+                        .map(|&v| u16::from(v))
+                        .collect(),
+                    v: bytes[luma + chroma..]
+                        .iter()
+                        .map(|&v| u16::from(v))
+                        .collect(),
                 }
             })
             .collect()
