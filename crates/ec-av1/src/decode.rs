@@ -2541,7 +2541,13 @@ impl Neighbours {
         } else {
             (0, [0u16; 8])
         };
-        let (left_n, left_colors) = if self.left_palette_size[r] > 0 {
+        // lane-tiles r11: `av1_get_palette_cache` takes `xd->left_mbmi`, which
+        // is NULL whenever the block sits at its TILE's own left column
+        // (`left_available`), not the frame's -- without this guard a second
+        // tile column reads the previous tile's palette colours into its cache
+        // and its `palette_y_mode` ctx.
+        let left_ok = c > self.tile_col0_mi / (SUB / MI);
+        let (left_n, left_colors) = if left_ok && self.left_palette_size[r] > 0 {
             (self.left_palette_size[r], self.left_palette_colors[r])
         } else {
             (0, [0u16; 8])
@@ -2606,7 +2612,9 @@ impl Neighbours {
         } else {
             (0, [0u16; 8])
         };
-        let (left_n, left_colors) = if self.left_palette_uv_size[r] > 0 {
+        // Same tile-relative left availability as the luma cache above.
+        let left_ok = c > self.tile_col0_mi / (SUB / MI);
+        let (left_n, left_colors) = if left_ok && self.left_palette_uv_size[r] > 0 {
             (self.left_palette_uv_size[r], self.left_palette_uv_colors[r])
         } else {
             (0, [0u16; 8])
@@ -2776,6 +2784,14 @@ impl Neighbours {
         self.left_comp_group_idx.iter_mut().for_each(|r| *r = 0);
         self.left_compound_idx.iter_mut().for_each(|r| *r = 0);
         self.left_filter.iter_mut().for_each(|f| *f = [3u8; 2]);
+        // lane-tiles r11 (COMMON's NEIGHBOUR MAPS rule): the palette side bands
+        // are per-mi maps like every other one here, so they reset with the
+        // row too -- the left guard above is what actually stops a cross-tile
+        // read, this keeps a stale colour out of the arrays at all.
+        self.left_palette_size.iter_mut().for_each(|s| *s = 0);
+        self.left_palette_colors.iter_mut().for_each(|c| *c = [0u16; 8]);
+        self.left_palette_uv_size.iter_mut().for_each(|s| *s = 0);
+        self.left_palette_uv_colors.iter_mut().for_each(|c| *c = [0u16; 8]);
     }
 
     /// Records a block's `skip`/`is_inter`/`interp_filter` state for the next
