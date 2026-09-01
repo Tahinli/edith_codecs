@@ -5328,79 +5328,208 @@ mod tests {
             result.as_ref().map(|f| f.len()).map_err(|e| e.to_string())
         );
     }
+    /// lane-rectx r3: a real `aomenc` stream whose 16x16-level
+    /// `PARTITION_HORZ`/`PARTITION_VERT` strips are CODED (non-skip), i.e.
+    /// carry genuine `TX_16X8`/`TX_8X16` luma coefficients and their
+    /// `TX_8X4`/`TX_4X8` chroma halves through [`decode_leaf_rect`]'s
+    /// lane-rectx arm -- the refusal "a coded (non-skip) HORZ/VERT rect strip
+    /// below 16x16" this round lifts. `--min-partition-size=8
+    /// --max-partition-size=32 --enable-rect-partitions=1` is what makes
+    /// aomenc reach for a 16x8 leaf at all; mandelbrot at `cq-level=24` is
+    /// what makes those leaves non-skip (a gradient fixture codes them all
+    /// away). `--reduced-tx-type-set=1` pins the five-symbol
+    /// `EXT_TX_SET_DTT4_IDTX` alphabet: without it aomenc also writes
+    /// `V_DCT`/`H_DCT`, whose 1D tx classes [`read_coeffs_rect`] still
+    /// refuses by name (see the r3 report's open residue), so a `=0` run
+    /// would prove nothing about the 2D path it does support.
+    ///
+    /// r2 shipped this path unproven; it was wrong. `TxbSet::LumaRect16x8`
+    /// read its `tx_type` symbol from the 16x16 row, but libaom's
+    /// `read_tx_type` indexes `intra_ext_tx_cdf[eset][txsize_sqr_map[tx_size]]`
+    /// and `txsize_sqr_map[TX_16X8] == TX_8X8` -- a five-symbol CDF where a
+    /// seven-symbol one belonged, desyncing at the FIRST coded rect leaf
+    /// (whole frame wrong from pixel (0,0)).
     #[test]
-    fn scratch_probe_rectx_mandelbrot() {
+    fn a_real_aomenc_stream_with_a_coded_rect_strip_below_16x16_decodes_pixel_exact() {
+        const NAME: &str =
+            "a_real_aomenc_stream_with_a_coded_rect_strip_below_16x16_decodes_pixel_exact";
         let _gate_lock = lock_gate_counters();
-        if !have_ffmpeg() || !have_aomenc() {
-            eprintln!("SKIP: no tools");
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
             return;
         }
-        let cases = vec![(64usize, 64usize, 24u32, 0.4f64)];
-        let mut found = false;
-        for (width, height, cq, seed_off) in cases {
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height) = (64usize, 64usize);
+        let y4m = Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("mandelbrot=size={width}x{height}:start_x=0.4"),
+                "-pix_fmt",
+                "yuv420p",
+                "-t",
+                "1",
+                "-vframes",
+                "1",
+                "-f",
+                "yuv4mpegpipe",
+                "-",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ffmpeg failed to run");
+        assert!(y4m.status.success(), "ffmpeg fixture: {}", String::from_utf8_lossy(&y4m.stderr));
+        let encode = || {
+            let mut child = Command::new(aomenc_path())
+                .args([
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    "--cq-level=24",
+                    "--cpu-used=4",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--sb-size=64",
+                    "--kf-max-dist=0",
+                    "--enable-rect-partitions=1",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    "--enable-tx-size-search=0",
+                    "--reduced-tx-type-set=1",
+                    "--min-partition-size=8",
+                    "--max-partition-size=32",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out.stdout
+        };
+        // The fixture rule: an encoder output is only a pin if it reproduces.
+        let stream = encode();
+        assert_eq!(stream, encode(), "{NAME}: aomenc output is not reproducible for this recipe");
+        let before = crate::decode::rect_leaf_coeff_hits();
+        let frames = decode_stream(&stream)
+            .unwrap_or_else(|e| panic!("{NAME}: decode failed, not a pixel mismatch: {e}"));
+        let fired = crate::decode::rect_leaf_coeff_hits() - before;
+        assert!(
+            fired > 0,
+            "{NAME}: the stream decoded but no coded (non-skip) rect leaf fired -- \
+             the gate proves nothing"
+        );
+        let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frames.len());
+        assert_eq!(frames.len(), 1, "{NAME}: expected one key frame");
+        assert_eq!(ffmpeg_frames.len(), frames.len(), "{NAME}: ffmpeg frame count");
+        for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+            assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg ({fired} coded rect leaves)");
+            assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg");
+            assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg");
+        }
+        eprintln!("{NAME}: pixel-exact, rect_leaf_coeff_hits={fired}");
+    }
+
+    #[test]
+    #[ignore = "lane-rectx r3 scratch sweep"]
+    fn sweep_rectx_recipes() {
+        let _gate_lock = lock_gate_counters();
+        let srcs: Vec<String> = vec![
+            "mandelbrot=size=64x64:start_x=0.4".into(),
+            "mandelbrot=size=64x64:start_x=-0.6".into(),
+            "mandelbrot=size=64x64:start_x=0.1".into(),
+            "mandelbrot=size=128x128:start_x=0.4".into(),
+            "mandelbrot=size=128x128:start_x=-0.6".into(),
+            "testsrc2=size=64x64".into(),
+            "testsrc2=size=128x128".into(),
+            "rgbtestsrc=size=64x64".into(),
+            "smptebars=size=128x128".into(),
+        ];
+        for start_x in srcs {
             let y4m = Command::new("ffmpeg")
                 .args([
                     "-v", "error", "-f", "lavfi", "-i",
-                    &format!("mandelbrot=size={width}x{height}:start_x={seed_off}"),
+                    &start_x,
                     "-pix_fmt", "yuv420p", "-t", "1", "-vframes", "1", "-f", "yuv4mpegpipe", "-",
                 ])
                 .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped())
-                .output().expect("ffmpeg failed to run");
+                .output().expect("ffmpeg");
             assert!(y4m.status.success());
-            let mut child = Command::new(aomenc_path())
-                .args([
-                    "--threads=1", "--row-mt=0", "--sb-size=64", "--cpu-used=4", "--end-usage=q",
-                    &format!("--cq-level={cq}"), "--passes=1",
-                    "--enable-ab-partitions=0", "--enable-1to4-partitions=0",
-                    "--enable-tx-size-search=0", "--min-partition-size=8",
-                    "--max-partition-size=32", "--kf-max-dist=0",
-                    "--obu", "-o", "-", "-",
-                ])
-                .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
-                .spawn().expect("aomenc failed to start");
-            child.stdin.take().unwrap().write_all(&y4m.stdout).unwrap();
-            let out = child.wait_with_output().unwrap();
-            assert!(out.status.success());
-            let stream = out.stdout;
-            let before = crate::decode::rect_leaf_coeff_hits();
-            let result = decode_stream(&stream);
-            let delta = crate::decode::rect_leaf_coeff_hits() - before;
-            if delta > 0 {
-                if let Ok(frames) = &result {
-                    let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frames.len());
-                    let mismatched = frames.iter().zip(&ffmpeg_frames).filter(|(g, w)| g.y != w.y || g.u != w.u || g.v != w.v).count();
-                    eprintln!(
-                        "HIT {width}x{height} cq={cq} off={seed_off}: rect_leaf_coeff_hits+={delta} mismatched={mismatched}/{}",
-                        frames.len()
-                    );
-                    // debug: locate first y mismatch
-                    if let (Some(got), Some(want)) = (frames.first(), ffmpeg_frames.first()) {
-                        'outer: for row in 0..height {
-                            for col in 0..width {
-                                let gi = row * width + col;
-                                if got.y[gi] != want.y[gi] {
-                                    eprintln!(
-                                        "first Y mismatch at ({col},{row}): got={} want={}",
-                                        got.y[gi], want.y[gi]
-                                    );
-                                    break 'outer;
+            let (width, height) = if start_x.contains("128x128") { (128usize, 128usize) } else { (64usize, 64usize) };
+            for cq in [16u32, 20, 24, 28, 32, 40, 50] {
+                for rtx in ["0"] {
+                    let mut child = Command::new(aomenc_path())
+                        .args([
+                            "--codec=av1", "--passes=1", "--end-usage=q",
+                            &format!("--cq-level={cq}"), "--cpu-used=4", "--threads=1",
+                            "--row-mt=0", "--sb-size=64", "--kf-max-dist=0",
+                            "--enable-rect-partitions=1", "--enable-ab-partitions=0",
+                            "--enable-1to4-partitions=0", "--enable-tx-size-search=0",
+                            "--enable-cdef=0", "--enable-restoration=0",
+                            &format!("--reduced-tx-type-set={rtx}"),
+                            "--min-partition-size=8", "--max-partition-size=32",
+                            "--obu", "-o", "-", "-",
+                        ])
+                        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+                        .spawn().expect("aomenc");
+                    child.stdin.take().unwrap().write_all(&y4m.stdout).unwrap();
+                    let out = child.wait_with_output().unwrap();
+                    assert!(out.status.success());
+                    let stream = out.stdout;
+                    let before = crate::decode::rect_leaf_coeff_hits();
+                    let res = decode_stream(&stream);
+                    let fired = crate::decode::rect_leaf_coeff_hits() - before;
+                    match res {
+                        Err(e) => eprintln!("x={start_x} cq={cq} rtx={rtx} fired={fired} REFUSED {e}"),
+                        Ok(frames) => {
+                            let want = ffmpeg_decode_sequence(&stream, width, height, frames.len());
+                            let bad = frames.iter().zip(&want)
+                                .filter(|(g, w)| g.y != w.y || g.u != w.u || g.v != w.v).count();
+                            eprintln!("x={start_x} cq={cq} rtx={rtx} fired={fired} frames={} mismatched={bad}", frames.len());
+                            let (g, w) = (&frames[0], &want[0]);
+                            for br in 0..height / 8 {
+                                let mut line = String::new();
+                                for bc in 0..width / 8 {
+                                    let mut n = 0;
+                                    for row in br * 8..br * 8 + 8 {
+                                        for col in bc * 8..bc * 8 + 8 {
+                                            if g.y[row * width + col] != w.y[row * width + col] {
+                                                n += 1;
+                                            }
+                                        }
+                                    }
+                                    line.push_str(&format!("{n:4}"));
                                 }
+                                eprintln!("  blk8 row{br}: {line}");
                             }
                         }
                     }
-                    if mismatched == 0 {
-                        found = true;
-                        break;
-                    }
-                } else {
-                    eprintln!(
-                        "{width}x{height} cq={cq} off={seed_off}: rect_leaf_coeff_hits+={delta} result={:?}",
-                        result.as_ref().map(|f| f.len()).map_err(|e| e.to_string())
-                    );
                 }
             }
         }
-        eprintln!("found pixel-exact firing case: {found}");
     }
 
     /// lane-rectgate r1: every prior gate pins `--enable-rect-partitions=0
