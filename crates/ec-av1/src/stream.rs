@@ -6361,20 +6361,23 @@ mod tests {
             crate::decode::cdef_idx_hits()
         );
     }
-    /// lane-tiny r1 diagnostic (not a gate): sweeps tiny key-frame sizes
-    /// against real aomenc + ffmpeg to find the exact size boundary of the
-    /// silent-wrong-pixels defect the sub8 lane's r2 dead-end flagged (a
-    /// plain 16x16 stream, no exotic tools). `#[ignore]`d -- prints a
-    /// pass/fail table, asserts nothing; run manually with `--nocapture`.
+    /// lane-tiny r4 GATE (was r1's `#[ignore]`d probe): every tiny key-frame
+    /// size real aomenc will encode, decoded pixel-exact against ffmpeg.
+    /// Tiny frames are where every edge/partial-superblock corner case is
+    /// forced, and this sweep is what found both r3's filter-intra tx_type
+    /// CDF row and r4's chroma-transform-size deblock defect -- so it
+    /// hard-asserts now: a decode error, a refusal, or one differing sample
+    /// at any size/seed fails. Only a genuinely absent oracle skips, and
+    /// `EC_AV1_REQUIRE_AOMENC=1` turns that into a failure too.
     #[test]
-    #[ignore = "diagnostic sweep, run manually with --nocapture"]
-    fn probe_tiny_frame_size_boundary() {
+    fn a_real_aomenc_tiny_frame_size_sweep_decodes_pixel_exact() {
         if !have_ffmpeg() || !have_aomenc() {
             eprintln!("SKIP: no ffmpeg/aomenc");
             return;
         }
         let sizes: &[(usize, usize)] =
             &[(8, 8), (16, 16), (32, 32), (16, 32), (32, 16), (64, 64), (48, 48), (24, 24)];
+        let mut total_exact = 0u32;
         for &(width, height) in sizes {
             let mut ok = 0u32;
             let mut bad = 0u32;
@@ -6423,7 +6426,18 @@ mod tests {
                 let stream = out.stdout;
                 let frames = match decode_stream(&stream) {
                     Err(e) => {
-                        eprintln!("  {width}x{height} seed {seed}: REFUSED {e}");
+                        // A NAMED refusal is the only non-exact outcome this
+                        // gate tolerates (8x8 still needs a rectangular
+                        // transform); anything else is a hard failure, and
+                        // the floor assert below keeps that from going
+                        // vacuous.
+                        let msg = e.to_string();
+                        assert!(
+                            msg.contains("unsupported"),
+                            "{width}x{height} seed {seed}: failed outright, not a named \
+                             refusal: {msg}"
+                        );
+                        eprintln!("  {width}x{height} seed {seed}: REFUSED {msg}");
                         refused += 1;
                         continue;
                     }
@@ -6438,6 +6452,12 @@ mod tests {
                     ok += 1;
                 } else {
                     bad += 1;
+                    let nd = |a: &[u16], b: &[u16]| a.iter().zip(b).filter(|(x, y)| x != y).count();
+                    let (ndy, ndu, ndv) = (
+                        nd(&frames[0].y, &ffmpeg_frames[0].y),
+                        nd(&frames[0].u, &ffmpeg_frames[0].u),
+                        nd(&frames[0].v, &ffmpeg_frames[0].v),
+                    );
                     let mut first = None;
                     for row in 0..height {
                         for col in 0..width {
@@ -6458,13 +6478,32 @@ mod tests {
                         .filter(|(a, b)| a != b)
                         .count();
                     eprintln!(
-                        "  {width}x{height} seed {seed}: MISMATCH luma first_diff={first:?} ndiff_luma={ndiff}/{}",
+                        "  {width}x{height} seed {seed}: MISMATCH first_diff={first:?} \
+                         ndiff_luma={ndiff}/{} ndiff y/u/v={ndy}/{ndu}/{ndv}",
                         width * height
                     );
                 }
             }
-            eprintln!("{width}x{height}: {ok} ok / {bad} mismatch / {refused} refused (of {n})");
+            assert_eq!(
+                bad, 0,
+                "{width}x{height}: {bad} of {n} seeds decoded to WRONG PIXELS ({ok} exact, \
+                 {refused} named refusals)"
+            );
+            eprintln!("{width}x{height}: {ok}/{n} pixel-exact, {refused} named refusals");
+            total_exact += ok;
         }
+        // Hit counter: the sweep proved nothing unless every size x seed
+        // attempt really ran end to end (aomenc -> us -> ffmpeg compare).
+        // Floor (hit counter): 7 of the 8 sizes must decode all 10 seeds
+        // pixel-exact -- only 8x8 is allowed to refuse outright today. If a
+        // future change makes sizes refuse instead of decode, this fails
+        // rather than passing on refusals alone.
+        assert!(
+            total_exact >= 70,
+            "tiny sweep only reached {total_exact} pixel-exact attempts (floor 70) -- \
+             refusals cannot substitute for decodes"
+        );
+        eprintln!("tiny frame sweep: {total_exact} pixel-exact attempts");
     }
 
     /// lane-tiny r1: re-decodes the known-failing 32x32 seed 45 fixture with
