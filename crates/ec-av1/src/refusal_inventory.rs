@@ -46,7 +46,6 @@ const REFUSALS: &[&str] = &[
     "a Golomb tail longer than this decoder reads",
     "a bit depth other than 8 with film grain applied (film_grain.rs's LUT and blend are hardcoded 8-bit)",
     "a bit depth other than 8 with use_superres set (superres.rs's upscale_row is hardcoded 8-bit)",
-    "a superblock-level HORZ/VERT strip with a split transform (per-unit rect prediction is not ported)",
     "a tx_type symbol outside its CDF's own set: {t}",
     "an INTER 32x32 partition type this decoder does not code (value={part32})",
     "a superblock-level partition type other than NONE or SPLIT (this decoder's intra tile path codes only those two at 64x64)",
