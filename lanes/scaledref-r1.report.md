@@ -73,9 +73,9 @@ bisect the first mismatching block — the long tail is a downstream symptom, no
   → 1 passed, 0 failed (this is the gate the Golomb lift turned red; green again after the revert).
 - `cargo test -p ec-av1 --lib refusal_inventory` → 3 passed; `... gate_coverage` → 2 passed.
 - `cargo test -p ec-av1 --lib golomb` → 3 passed (at ee1f980, before the revert).
-- A whole `cargo test -p ec-av1 --lib` run was started twice: the first completed and showed exactly
-  one failure (the seed-67 one above, since fixed by the revert); the second was killed mid-run by
-  the environment, so no full-suite total is claimed here. The verifier owns the full suite.
+- `cargo test -p ec-av1 --lib` (whole crate lib suite, at the final tree): **268 passed, 0 failed,
+  23 ignored**, 928s. An earlier run of the same suite, taken with the Golomb cap raised, failed
+  exactly one test -- the seed-67 rect64 gate above -- which is what put that finding on the board.
 
 ## Residue
 
