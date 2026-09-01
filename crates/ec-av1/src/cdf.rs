@@ -25,6 +25,33 @@ pub const PARTITION_W64: [[u16; 11]; 4] = [
 
 /// `Default_Skip_Cdf` (spec 9.4): indexed by how many of the blocks above
 /// and left were skipped.
+/// `default_txfm_partition_cdf` (entropymode.c): an inter block's
+/// `txfm_split` flag (spec 5.11.17 `read_var_tx_size`), indexed by
+/// `txfm_partition_context` -- `category * 3 + above + left`, 21 contexts.
+pub const TXFM_PARTITION: [[u16; 3]; 21] = [
+    [28581, 32768, 0],
+    [23846, 32768, 0],
+    [20847, 32768, 0],
+    [24315, 32768, 0],
+    [18196, 32768, 0],
+    [12133, 32768, 0],
+    [18791, 32768, 0],
+    [10887, 32768, 0],
+    [11005, 32768, 0],
+    [27179, 32768, 0],
+    [20004, 32768, 0],
+    [11281, 32768, 0],
+    [26549, 32768, 0],
+    [19308, 32768, 0],
+    [14224, 32768, 0],
+    [28015, 32768, 0],
+    [21546, 32768, 0],
+    [14400, 32768, 0],
+    [28165, 32768, 0],
+    [22401, 32768, 0],
+    [16088, 32768, 0],
+];
+
 pub const SKIP: [[u16; 3]; 3] = [[31671, 32768, 0], [16515, 32768, 0], [4576, 32768, 0]];
 
 /// `Default_Intra_Frame_Y_Mode_Cdf` (spec 9.4): the thirteen luma intra
@@ -266,18 +293,36 @@ pub const EOB_PT_128_CHROMA_Q3: [u16; 9] = [
     24313, 26062, 28385, 30107, 31217, 31898, 32345, 32768, 0,
 ];
 
-/// `av1_default_eob_multi512_cdfs[*][1][*]` (`token_cdfs.h:874-901`,
-/// lane-sbpart): the end-of-block group of a CHROMA transform with 512 coded
-/// positions -- what a 32x16/16x32 chroma transform has (the chroma plane of
-/// an intra `PARTITION_HORZ`/`VERT` 64x32/32x64 superblock strip, whose luma
-/// coefficients truncate to the 64x64-superblock's own 32x32 corner-scan
-/// (`TxbSet::Luma64`) but whose *chroma* plane, at 32x16, is small enough
-/// that no truncation applies). Unlike every other `EOB_PT_*` table here,
-/// libaom's default is the exact same flat distribution at all four
-/// q-contexts and both `eob_multi_size` selectors (`token_cdfs.h` rows), so
-/// one constant covers every q-context -- no `_Q0`/`_Q1`/`_Q3` siblings.
+/// `av1_default_eob_multi512_cdfs[2][1][0]` (`token_cdfs.h:874-901`,
+/// lane-part32 r4): the end-of-block group of a CHROMA transform with 512
+/// coded positions -- what a 32x16/16x32 chroma transform has (the chroma
+/// plane of an intra `PARTITION_HORZ`/`VERT` 64x32/32x64 superblock strip,
+/// whose luma coefficients truncate to the 64x64-superblock's own 32x32
+/// corner-scan (`TxbSet::Luma64`) but whose *chroma* plane, at 32x16, is
+/// small enough that no truncation applies).
+///
+/// lane-sbpart originally transcribed the `[1][1]` row -- the
+/// `TX_CLASS_HORIZ`/`VERT` (1D) sibling, whose default IS the flat
+/// `3277, 6554, ...` ramp at every q-context -- and wrote that flatness into
+/// this comment as a property of the whole table. The 2D row this decoder
+/// actually reads is q-dependent like every other `EOB_PT_*` family, so a
+/// real `--cq-level=45` stream (q-context 3) read the wrong CDF and desynced
+/// the tile at the first 32x16 chroma transform of the first SB-level
+/// HORZ/VERT strip.
 pub const EOB_PT_512_CHROMA: [u16; 11] = [
-    3277, 6554, 9830, 13107, 16384, 19661, 22938, 26214, 29491, 32768, 0,
+    12015, 14769, 19588, 22052, 24222, 25812, 27300, 29219, 32114, 32768, 0,
+];
+/// [`EOB_PT_512_CHROMA`], q-context 0 (`base_q_idx` 0..=20).
+pub const EOB_PT_512_CHROMA_Q0: [u16; 11] = [
+    5095, 6446, 9996, 13354, 16017, 17986, 20919, 26129, 29140, 32768, 0,
+];
+/// [`EOB_PT_512_CHROMA`], q-context 1 (`base_q_idx` 21..=60).
+pub const EOB_PT_512_CHROMA_Q1: [u16; 11] = [
+    7265, 9979, 15819, 19250, 21780, 23846, 26478, 28396, 31811, 32768, 0,
+];
+/// [`EOB_PT_512_CHROMA`], q-context 3 (`base_q_idx` 121..=255).
+pub const EOB_PT_512_CHROMA_Q3: [u16; 11] = [
+    21093, 23043, 25742, 27658, 29097, 29716, 30073, 30820, 31956, 32768, 0,
 ];
 
 /// `Default_Dc_Sign_Cdf[2][0]` (spec 9.4): the sign of a luma DC coefficient,
@@ -783,22 +828,39 @@ pub const NZ_MAP_CTX_OFFSET_32: [[u8; 5]; 5] = [
 /// indexes this position table by the raw, un-adjusted `tx_size` -- lane-sbpart
 /// r8 root cause) is genuinely rectangular, not square. Distinct from
 /// [`NZ_MAP_CTX_OFFSET_32`] starting at `(row=1, col=0)`.
+// lane-part32 r3: this table was TRANSPOSED (row/col swapped) as landed by
+// lane-sbpart r8 -- caught by tracing a real aomenc pin against a patched
+// aomdec (added per-symbol `EC_TRACE_COEFF` ctx prints to
+// `read_coeffs_reverse{,_2d}` in `~/.cache/aom-oracle`), which showed our own
+// `(row=2, col=0)` reading ctx-offset 11 where the real decoder's equivalent
+// position read 6. Re-derived straight from libaom's own generating
+// comment in `get_nz_map_ctx_from_stats` (`txb_common.h:199-210`): for
+// `width < height` (this table, `TX_32X64`), ctx is `11 +` for `row < 2`
+// *regardless of col* -- the old table instead special-cased `col < 2`,
+// which is the `width > height` (`TX_64X32`) branch. Confirmed against the
+// real `av1_nz_map_ctx_offset_32x64`/`_64x32` C arrays in
+// `av1/common/txb_common.c`, decoded through libaom's own col-major
+// `pos = col*32+row` raster (same convention [`SCAN_32X16`]'s doc comment
+// already documents this decoder transcribes out of).
 pub const NZ_MAP_CTX_OFFSET_32X64: [[u8; 5]; 5] = [
-    [0, 11, 6, 6, 21],
-    [11, 11, 6, 21, 21],
-    [11, 11, 21, 21, 21],
-    [11, 11, 21, 21, 21],
-    [11, 11, 21, 21, 21],
+    [0, 11, 11, 11, 11],
+    [11, 11, 11, 11, 11],
+    [6, 6, 21, 21, 21],
+    [6, 21, 21, 21, 21],
+    [21, 21, 21, 21, 21],
 ];
 
 /// [`NZ_MAP_CTX_OFFSET_32X64`]'s `TX_64X32` counterpart (libaom
 /// `av1_nz_map_ctx_offset_64x32`): a `PARTITION_HORZ` strip's luma corner.
+/// `width > height` here, so the `col < 2` branch (offset 16) fires
+/// regardless of row -- transpose of [`NZ_MAP_CTX_OFFSET_32X64`]'s `row < 2`
+/// branch, same r3 fix (see that table's doc comment).
 pub const NZ_MAP_CTX_OFFSET_64X32: [[u8; 5]; 5] = [
-    [0, 16, 16, 16, 16],
-    [16, 16, 16, 16, 16],
-    [6, 6, 21, 21, 21],
-    [6, 21, 21, 21, 21],
-    [21, 21, 21, 21, 21],
+    [0, 16, 6, 6, 21],
+    [16, 16, 6, 21, 21],
+    [16, 16, 21, 21, 21],
+    [16, 16, 21, 21, 21],
+    [16, 16, 21, 21, 21],
 ];
 
 /// `Default_Txb_Skip_Cdf[2][2][7..10]` (spec 9.4): the all-zero flag of a
@@ -1393,6 +1455,20 @@ pub const INTER_TX_TYPE_SET3_8: [u16; 3] = [4167, 32768, 0];
 pub const INTER_TX_TYPE_SET2_16: [u16; 13] = [
     770, 2421, 5225, 12907, 15819, 18927, 21561, 24089, 26595, 28526, 30529, 32768, 0,
 ];
+
+/// `Default_Inter_Ext_Tx_Cdf`'s `TX_SET_INTER_1` (`EXT_TX_SET_ALL16`) row for
+/// `TX_4X4` (lane-txselect): the sixteen-symbol transform type of an
+/// `is_inter` 4x4 luma transform when `reduced_tx_set == 0` (libaom
+/// `entropymode.c` `default_inter_ext_tx_cdf[1][TX_4X4]`).
+pub const INTER_TX_TYPE_SET1_4: [u16; 17] = [
+    4458, 5560, 7695, 9709, 13330, 14789, 17537, 20266, 21504, 22848, 23934, 25474, 27727, 28915,
+    30631, 32768, 0,
+];
+
+/// `Default_Inter_Ext_Tx_Cdf`'s `TX_SET_INTER_3` (`EXT_TX_SET_DCT_IDTX`) row
+/// for `TX_4X4` (lane-txselect), the reduced two-symbol counterpart of
+/// [`INTER_TX_TYPE_SET1_4`] (`default_inter_ext_tx_cdf[3][TX_4X4]`).
+pub const INTER_TX_TYPE_SET3_4: [u16; 3] = [16384, 32768, 0];
 
 /// `Default_Inter_Ext_Tx_Cdf`'s `TX_SET_INTER_1` (`EXT_TX_SET_ALL16`) row for
 /// `TX_8X8` (lane-cdffwd2): the full sixteen-symbol transform type of an
@@ -5009,3 +5085,44 @@ pub const INTRA_TX_TYPE_SET1_4: [[u16; 8]; 13] = [
     [277, 4369, 5255, 8905, 16465, 22271, 32768, 0],
     [3409, 5436, 10599, 15599, 19687, 24040, 32768, 0],
 ];
+
+/// The `TX_CLASS_HORIZ`/`TX_CLASS_VERT` siblings of [`EOB_PT_256_LUMA`],
+/// [`EOB_PT_256_CHROMA`], [`EOB_PT_64_CHROMA`] and [`EOB_PT_16_CHROMA`]
+/// (`av1_default_eob_multi{256,64,16}_cdfs[q][plane][1]`, `token_cdfs.h`) --
+/// lane-txselect r2: the class dimension libaom keeps on *every* eob_pt
+/// table. Only 4x4/8x8 luma carried it here, so the first `V_DCT`/`H_DCT`
+/// 16x16 luma TU (a var-tx leaf of a 32x32 inter block, `EXT_TX_SET_
+/// DTT9_IDTX_1DDCT`) read the 2D table and desynced at its `eob`. 32-point
+/// and larger transforms need no sibling: their tx sets (`DCT_IDTX`,
+/// `DCTONLY`) hold no 1D type.
+pub const EOB_PT_256_LUMA_CLASS1_Q0: [u16; 10] =
+    [998, 1850, 2998, 5604, 17341, 19888, 22899, 25583, 32768, 0];
+pub const EOB_PT_256_LUMA_CLASS1_Q1: [u16; 10] =
+    [399, 1019, 1749, 3038, 10444, 15546, 22739, 27294, 32768, 0];
+pub const EOB_PT_256_LUMA_CLASS1: [u16; 10] =
+    [1084, 2358, 3488, 5122, 11483, 18103, 26023, 29799, 32768, 0];
+pub const EOB_PT_256_LUMA_CLASS1_Q3: [u16; 10] =
+    [2453, 4474, 6307, 8777, 16474, 22975, 29000, 31547, 32768, 0];
+
+pub const EOB_PT_256_CHROMA_CLASS1_Q0: [u16; 10] =
+    [2203, 4130, 7435, 10739, 20652, 23681, 25609, 27261, 32768, 0];
+pub const EOB_PT_256_CHROMA_CLASS1_Q1: [u16; 10] =
+    [1674, 3252, 5734, 10159, 22397, 23802, 24821, 30940, 32768, 0];
+pub const EOB_PT_256_CHROMA_CLASS1: [u16; 10] =
+    [6571, 9610, 15516, 21826, 29092, 30829, 31842, 32708, 32768, 0];
+pub const EOB_PT_256_CHROMA_CLASS1_Q3: [u16; 10] =
+    [9998, 17661, 25178, 28097, 31308, 32038, 32403, 32695, 32768, 0];
+
+pub const EOB_PT_64_CHROMA_CLASS1_Q0: [u16; 8] =
+    [1563, 2700, 4876, 10911, 14706, 22480, 32768, 0];
+pub const EOB_PT_64_CHROMA_CLASS1_Q1: [u16; 8] =
+    [1923, 3127, 5867, 9703, 14277, 27100, 32768, 0];
+pub const EOB_PT_64_CHROMA_CLASS1: [u16; 8] =
+    [4034, 6290, 10235, 14982, 21214, 28491, 32768, 0];
+pub const EOB_PT_64_CHROMA_CLASS1_Q3: [u16; 8] =
+    [8726, 12378, 19409, 26450, 30038, 32462, 32768, 0];
+
+pub const EOB_PT_16_CHROMA_CLASS1_Q0: [u16; 6] = [1904, 3354, 7763, 14647, 32768, 0];
+pub const EOB_PT_16_CHROMA_CLASS1_Q1: [u16; 6] = [2497, 4096, 8866, 16993, 32768, 0];
+pub const EOB_PT_16_CHROMA_CLASS1: [u16; 6] = [3192, 5032, 10297, 19755, 32768, 0];
+pub const EOB_PT_16_CHROMA_CLASS1_Q3: [u16; 6] = [7297, 10767, 19273, 28194, 32768, 0];

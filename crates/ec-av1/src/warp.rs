@@ -2,11 +2,13 @@
 //! `av1/common/warped_motion.c`: estimate a 2x3 affine model from up to
 //! `LEAST_SQUARES_SAMPLES_MAX` neighbour-block motion samples
 //! ([`find_projection`]), then filter the reference through it with an 8x8
-//! tiled, two-pass 8-tap warped filter ([`warp_affine`]). 8-bit,
-//! non-compound only (this decoder's warp arm only ever reaches a
-//! single-ref, non-skip-mode block, spec `is_motion_variation_allowed_bsize`
-//! -- `conv_params->is_compound` is always false on that path, so libaom's
-//! compound/highbd branches are dropped).
+//! tiled, two-pass 8-tap warped filter ([`warp_affine`]). Bit-depth generic
+//! (lane-cwarp: `bd` is `crate::decode::bit_depth()`, was a hardcoded 8).
+//! `WARPED_CAUSAL` is single-ref by construction (spec 5.11.27:
+//! `motion_mode` is only read when `RefFrame[1] <= INTRA_FRAME`), but GLOBAL
+//! warp applies per reference on a compound block too --
+//! [`warp_affine_compound`] is that path (libaom `av1_warp_plane` with
+//! `conv_params->is_compound`).
 
 /// `WARPEDMODEL_PREC_BITS` (`av1/common/mv.h`).
 const WARPEDMODEL_PREC_BITS: u32 = 16;
@@ -419,11 +421,13 @@ fn clip_pixel(v: i32) -> u16 {
     v.clamp(0, crate::decode::sample_max()) as u16
 }
 
-/// `av1_warp_affine_c` (`warped_motion.c`), 8-bit, non-compound only:
+/// `av1_highbd_warp_affine_c` (`warped_motion.c`)'s non-compound branch:
 /// filters `reference` (row-major, `stride`, true extent `width`x`height`)
 /// through `params`' affine model into `dst` (row-major, `p_stride`), an
 /// `p_width`x`p_height` block whose top-left sits at `(p_col, p_row)` in the
-/// (possibly chroma-subsampled) plane `dst` belongs to.
+/// (possibly chroma-subsampled) plane `dst` belongs to. Bit depth comes from
+/// the stream (`crate::decode::bit_depth`), the same thread-local
+/// [`clip_pixel`] already clamps against -- libaom's `bd` parameter.
 #[allow(clippy::too_many_arguments)]
 pub fn warp_affine(
     params: &WarpParams,
@@ -440,6 +444,91 @@ pub fn warp_affine(
     subsampling_x: i32,
     subsampling_y: i32,
 ) {
+    let bd = i32::from(crate::decode::bit_depth());
+    // `reduce_bits_vert`, non-compound: `2 * FILTER_BITS - round_0`.
+    let reduce_bits_vert = 2 * FILTER_BITS - REDUCE_BITS_HORIZ;
+    warp_inner(
+        params, reference, width, height, stride, p_col, p_row, p_width, p_height,
+        subsampling_x, subsampling_y, bd, reduce_bits_vert,
+        |row, col, sum| {
+            dst[row * p_stride as usize + col] =
+                clip_pixel(sum - (1 << (bd - 1)) - (1 << bd));
+        },
+    );
+}
+
+/// lane-cwarp: `av1_highbd_warp_affine_c`'s `conv_params->is_compound`
+/// branch (`do_average == 0`, i.e. "write the CONV_BUF entry"): identical
+/// filter, but the vertical pass rounds by `conv_params->round_1`
+/// (`COMPOUND_ROUND1_BITS == 7`, [`mc::predict_compound_intermediate`]'s
+/// `INTER_ROUND_1_COMPOUND`) instead of `2*FILTER_BITS - round_0`, and the
+/// result stays in the compound intermediate domain rather than becoming a
+/// pixel. libaom keeps a constant bias in its CONV_BUF (the
+/// `1 << offset_bits_horiz` / `1 << offset_bits_vert` terms, which survive
+/// both roundings exactly because both exceed their shift) and subtracts
+/// `(1 << (offset_bits - round_1)) + (1 << (offset_bits - round_1 - 1))`
+/// at the blend; this crate's intermediates are UNBIASED (see
+/// [`mc::diffwtd_mask`]'s derivation), so the identical constant --
+/// `(1 << (bd + 4)) + (1 << (bd + 3))` -- is removed here instead, making
+/// the output directly interchangeable with
+/// [`mc::predict_compound_intermediate`]'s for
+/// [`mc::combine_compound`]/[`mc::blend_masked_compound`].
+#[allow(clippy::too_many_arguments)]
+pub fn warp_affine_compound(
+    params: &WarpParams,
+    reference: &[u16],
+    width: i32,
+    height: i32,
+    stride: i32,
+    dst: &mut [i32],
+    p_col: i32,
+    p_row: i32,
+    p_width: i32,
+    p_height: i32,
+    p_stride: i32,
+    subsampling_x: i32,
+    subsampling_y: i32,
+) {
+    let bd = i32::from(crate::decode::bit_depth());
+    let bias = (1 << (bd + 4)) + (1 << (bd + 3));
+    warp_inner(
+        params, reference, width, height, stride, p_col, p_row, p_width, p_height,
+        subsampling_x, subsampling_y, bd, COMPOUND_ROUND1_BITS,
+        |row, col, sum| {
+            dst[row * p_stride as usize + col] = sum - bias;
+        },
+    );
+}
+
+/// `conv_params->round_0` (`ROUND0_BITS`), the warp filter's horizontal
+/// rounding -- `InterRound0`, bit-depth independent for 8/10-bit content
+/// (libaom only raises it at `bd == 12`, which this decoder refuses).
+const REDUCE_BITS_HORIZ: i32 = 3;
+/// `COMPOUND_ROUND1_BITS` (`convolve.h`): `conv_params->round_1` when
+/// `is_compound`.
+const COMPOUND_ROUND1_BITS: i32 = 7;
+
+/// The shared body of [`warp_affine`]/[`warp_affine_compound`]
+/// (`av1_highbd_warp_affine_c`): everything up to and including the
+/// vertical `ROUND_POWER_OF_TWO(sum, reduce_bits_vert)`, with `store`
+/// receiving `(row, col, sum)` in block-local coordinates.
+#[allow(clippy::too_many_arguments)]
+fn warp_inner(
+    params: &WarpParams,
+    reference: &[u16],
+    width: i32,
+    height: i32,
+    stride: i32,
+    p_col: i32,
+    p_row: i32,
+    p_width: i32,
+    p_height: i32,
+    subsampling_x: i32,
+    subsampling_y: i32,
+    bd: i32,
+    reduce_bits_vert: i32,
+    mut store: impl FnMut(usize, usize, i32),
+) {
     let mat = &params.wmmat;
     let (alpha, beta, gamma, delta) = (
         params.alpha as i64,
@@ -447,11 +536,9 @@ pub fn warp_affine(
         params.gamma as i64,
         params.delta as i64,
     );
-    const BD: i32 = 8;
-    let reduce_bits_horiz = 3; // conv_params->round_0, non-compound 8-bit (InterRound0)
-    let reduce_bits_vert = 2 * FILTER_BITS - reduce_bits_horiz; // InterRound1
-    let offset_bits_horiz = BD + FILTER_BITS - 1;
-    let offset_bits_vert = BD + 2 * FILTER_BITS - reduce_bits_horiz;
+    let reduce_bits_horiz = REDUCE_BITS_HORIZ;
+    let offset_bits_horiz = bd + FILTER_BITS - 1;
+    let offset_bits_vert = bd + 2 * FILTER_BITS - reduce_bits_horiz;
 
     let mut i = p_row;
     while i < p_row + p_height {
@@ -509,10 +596,11 @@ pub fn warp_affine(
                         sum += tmp[(k + m + 4) as usize][(l + 4) as usize] * coeffs[m as usize] as i32;
                     }
                     sum = round2(sum as i64, reduce_bits_vert as u32) as i32;
-                    let out_row = (i - p_row + k + 4) as usize;
-                    let out_col = (j - p_col + l + 4) as usize;
-                    dst[out_row * p_stride as usize + out_col] =
-                        clip_pixel(sum - (1 << (BD - 1)) - (1 << BD));
+                    store(
+                        (i - p_row + k + 4) as usize,
+                        (j - p_col + l + 4) as usize,
+                        sum,
+                    );
                     sy += gamma;
                     l += 1;
                 }
