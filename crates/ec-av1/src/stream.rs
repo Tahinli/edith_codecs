@@ -2408,6 +2408,9 @@ mod tests {
         );
         let mut child = Command::new(aomenc_path())
             .args([
+                // lane-defon r1: explicit on-value (aomenc keeps the FIRST
+                // occurrence, so overrides go before the base list).
+                "--loopfilter-control=1",
                 "--codec=av1",
                 "--passes=1",
                 "--end-usage=q",
@@ -3241,6 +3244,9 @@ mod tests {
         );
         let mut child = Command::new(aomenc_path())
             .args([
+                // lane-defon r1: explicit on-value (aomenc keeps the FIRST
+                // occurrence, so overrides go before the base list).
+                "--loopfilter-control=1",
                 "--codec=av1",
                 "--passes=1",
                 "--end-usage=q",
@@ -3572,6 +3578,9 @@ mod tests {
             let mut child = Command::new(aomenc_path())
                 .args(depth_args)
                 .args([
+                    // lane-defon r1: explicit on-value (aomenc keeps the FIRST
+                    // occurrence, so overrides go before the base list).
+                    "--enable-tx-size-search=1",
                     "--codec=av1",
                     "--passes=1",
                     "--end-usage=q",
@@ -4041,6 +4050,9 @@ mod tests {
             );
             let mut child = Command::new(aomenc_path())
                 .args([
+                    // lane-defon r1: explicit on-value (aomenc keeps the FIRST
+                    // occurrence, so overrides go before the base list).
+                    "--enable-directional-intra=1",
                     "--codec=av1",
                     "--passes=1",
                     "--end-usage=q",
@@ -4152,6 +4164,7 @@ mod tests {
     /// level of the inter partition tree -- `min_part` is aomenc's
     /// `--min-partition-size`, and `hits`/`what` name the counter that proves
     /// the arm under test really fired.
+    #[track_caller]
     fn inter_sb_none_gate(
         name: &str,
         ten_bit: bool,
@@ -4448,6 +4461,9 @@ mod tests {
         );
         let mut child = Command::new(aomenc_path())
             .args([
+                // lane-defon r1: explicit on-value (aomenc keeps the FIRST
+                // occurrence, so overrides go before the base list).
+                "--loopfilter-control=1",
                 "--codec=av1",
                 "--passes=1",
                 "--end-usage=q",
@@ -6689,7 +6705,7 @@ mod tests {
                 "--tune-content=default",
                 "--enable-masked-comp=0",
                 "--enable-interintra-comp=1",
-                "--enable-onesided-comp=0",
+                "--enable-onesided-comp=1",
                 "--enable-interintra-wedge=0",
                 "--enable-smooth-interintra=1",
                 "--enable-rect-partitions=0",
@@ -6802,9 +6818,18 @@ mod tests {
             "{NAME}: {matched} matches but zero interintra blocks fired -- the gate decodes \
              these streams without ever taking interintra, so it proves nothing"
         );
+        // lane-defon r1: `--enable-onesided-comp=1` is spelled on this
+        // recipe, so a UNIDIR_COMP_REFERENCE pair must actually have been
+        // read -- otherwise the on-value proves nothing.
+        assert!(
+            crate::decode::uni_comp_hits() > 0,
+            "{NAME}: {matched} matches but zero UNIDIR_COMP_REFERENCE pairs read -- \
+             --enable-onesided-comp=1 never reached the uni_comp_ref alphabet"
+        );
         eprintln!(
-            "{NAME}: {named_refusals} other-capability refusals, {matched} pixel-exact matches out of {n_attempts}, interintra_hits={}",
-            crate::decode::interintra_hits()
+            "{NAME}: {named_refusals} other-capability refusals, {matched} pixel-exact matches out of {n_attempts}, interintra_hits={} uni_comp_hits={}",
+            crate::decode::interintra_hits(),
+            crate::decode::uni_comp_hits()
         );
     }
 
@@ -8075,6 +8100,9 @@ mod tests {
                 String::from_utf8_lossy(&y4m.stderr)
             );
             let args: Vec<&str> = vec![
+                // lane-defon r1: explicit on-value (aomenc keeps the FIRST
+                // occurrence, so overrides go before the base list).
+                "--enable-diff-wtd-comp=1",
                 "--codec=av1",
                 "--passes=1",
                 "--end-usage=q",
@@ -8229,6 +8257,13 @@ mod tests {
             crate::decode::masked_compound_hits() > 0,
             "{NAME}: zero masked-compound blocks fired ({matched} matches, {named_refusals} \
              other refusals out of {n_attempts}) -- gate proved nothing this run"
+        );
+        // lane-defon r1: `--enable-diff-wtd-comp=1` is now spelled on this
+        // recipe, so the DIFFWTD half of MASKED_COMPOUND_HITS must fire.
+        assert!(
+            crate::decode::diffwtd_hits() > 0,
+            "{NAME}: zero COMPOUND_DIFFWTD blends ({matched} matches, {named_refusals} \
+             other refusals out of {n_attempts}) -- --enable-diff-wtd-comp=1 proved nothing"
         );
         // r3: wedge_hits() is soft-skipped, not hard-asserted -- the recipe
         // search (dist-wtd-comp=0 + diagonal mandelbrot content) is not
