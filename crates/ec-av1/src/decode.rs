@@ -22,7 +22,8 @@
 //! silently miscoding.
 
 use ec_av1_syntax::{
-    CdefParams, DeltaParams, LoopFilterParams, LoopRestorationParams, TileInfo,
+    CdefParams, DeltaParams, LoopFilterParams, LoopRestorationParams,
+    SEG_LVL_ALT_LF_Y_V, SEG_LVL_ALT_Q, SegmentationParams, TileInfo,
 };
 use ec_core::{Error, Result};
 
@@ -313,6 +314,344 @@ fn maybe_read_cdef_idx(dec: &mut SymbolDecoder, mi_r: usize, mi_c: usize, skip: 
             }
         });
     }
+}
+
+// ---------------------------------------------------------------------------
+// lane-seg: segmentation. Header (spec 5.9.14) is parsed by `ec-av1-syntax`;
+// this block is the per-block `segment_id` reader (spec 5.11.7-5.11.9) plus
+// the two consumers a real stream exercises: the per-segment quantizer index
+// (spec 7.12.2 `get_qindex`) and the per-segment loop-filter level
+// (spec 7.14.4). Shapes follow libaom `decodemv.c:read_segment_id`/
+// `read_intra_segment_id`/`read_inter_segment_id` and
+// `pred_common.h:av1_get_spatial_seg_pred` -- note libaom returns the SPATIAL
+// PREDICTION (not 0) from `read_segment_id` when the block is `skip`, which
+// is what the oracle every gate here compares against actually does.
+thread_local! {
+    static SEG: std::cell::RefCell<SegmentationParams> =
+        std::cell::RefCell::new(SegmentationParams::default());
+    /// `CurrentSegmentIds`: this frame's own map, `mi_rows * mi_cols` entries
+    /// with stride `mi_cols` (NOT the padded `Neighbours` grid stride).
+    static SEG_IDS: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// `PrevSegmentIds`: the primary reference frame's saved map, empty when
+    /// this frame has no primary reference (spec `load_previous_segment_ids`).
+    static PREV_SEG_IDS: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// `(mi_rows, mi_cols)` for both maps above.
+    static SEG_MI_DIMS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+    /// `AboveSegPredContext` (per mi column) / `LeftSegPredContext` (per mi
+    /// row) -- spec 5.11.9's own `seg_id_predicted` neighbour state, which
+    /// libaom keeps on the neighbouring `mbmi->seg_id_predicted` instead.
+    static ABOVE_SEG_PRED: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    static LEFT_SEG_PRED: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// The block currently being decoded -- read back by [`block_q_idx`].
+    static CUR_SEGMENT_ID: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    /// The tile's own top-left mi position, for `AvailU`/`AvailL`.
+    static SEG_TILE_ORIGIN: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+    /// How many real `segment_id` symbols were read, and the set of segment
+    /// ids any block ended up with -- the gate's proof the feature fired.
+    static SEG_ID_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SEG_IDS_SEEN: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+/// Installs this frame's segmentation parameters and allocates its map, with
+/// `prev` the primary reference frame's saved map (spec
+/// `load_previous_segment_ids`; `None` for `PRIMARY_REF_NONE` or an empty
+/// slot). Called once per frame, whether or not segmentation is enabled.
+pub(crate) fn set_segmentation(
+    seg: SegmentationParams,
+    mi_rows: usize,
+    mi_cols: usize,
+    prev: Option<&[u8]>,
+) {
+    SEG.with(|s| *s.borrow_mut() = seg);
+    SEG_MI_DIMS.with(|c| c.set((mi_rows, mi_cols)));
+    SEG_IDS.with(|m| *m.borrow_mut() = vec![0u8; mi_rows * mi_cols]);
+    PREV_SEG_IDS.with(|m| {
+        let mut m = m.borrow_mut();
+        m.clear();
+        if let Some(p) = prev {
+            if p.len() == mi_rows * mi_cols {
+                m.extend_from_slice(p);
+            }
+        }
+    });
+    ABOVE_SEG_PRED.with(|m| *m.borrow_mut() = vec![0u8; mi_cols]);
+    LEFT_SEG_PRED.with(|m| *m.borrow_mut() = vec![0u8; mi_rows]);
+    CUR_SEGMENT_ID.with(|c| c.set(0));
+}
+
+/// This frame's decoded segment map, to be stored into whichever reference
+/// slots `refresh_frame_flags` names (spec 7.20's `SavedSegmentIds`).
+pub(crate) fn take_segment_ids() -> Vec<u8> {
+    SEG_IDS.with(|m| m.borrow().clone())
+}
+
+/// How many `segment_id` symbols have been read (never reset per frame).
+pub(crate) fn segment_id_hits() -> usize {
+    SEG_ID_HITS.with(|c| c.get())
+}
+
+/// How many distinct segment ids any decoded block has carried.
+pub(crate) fn segment_ids_seen() -> usize {
+    SEG_IDS_SEEN.with(|c| c.get().count_ones() as usize)
+}
+
+/// Resets both segmentation hit counters (gate setup).
+pub(crate) fn reset_segment_hits() {
+    SEG_ID_HITS.with(|c| c.set(0));
+    SEG_IDS_SEEN.with(|c| c.set(0));
+}
+
+/// `seg_feature_active_idx(segment_id, feature)` for the frame currently
+/// being decoded, with its `FeatureData` value.
+fn seg_feature(segment_id: usize, feature: usize) -> Option<i32> {
+    SEG.with(|s| {
+        let s = s.borrow();
+        s.feature_active(segment_id, feature)
+            .then(|| i32::from(s.feature_data[segment_id][feature]))
+    })
+}
+
+/// `get_qindex(ignoreDeltaQ = 0, segment_id)` (spec 7.12.2, libaom
+/// `av1_get_qindex`) for the block currently being decoded: the running
+/// `CurrentQIndex` shifted by this block's segment's `SEG_LVL_ALT_Q` data.
+/// Every dequant call site reads the block's quantizer through here.
+fn block_q_idx() -> i32 {
+    let base = CURRENT_Q_IDX.with(|c| c.get());
+    let seg_id = CUR_SEGMENT_ID.with(|c| c.get()) as usize;
+    match seg_feature(seg_id, SEG_LVL_ALT_Q) {
+        Some(data) => (base + data).clamp(0, 255),
+        None => base,
+    }
+}
+
+/// The segment id recorded for one mi cell of the current frame's map.
+fn segment_id_at(mi_r: usize, mi_c: usize) -> u8 {
+    let (mi_rows, mi_cols) = SEG_MI_DIMS.with(|c| c.get());
+    if mi_r >= mi_rows || mi_c >= mi_cols {
+        return 0;
+    }
+    SEG_IDS.with(|m| m.borrow()[mi_r * mi_cols + mi_c])
+}
+
+/// `set_segment_id`: stamps `id` over every mi cell this block covers.
+fn write_segment_id(mi_r: usize, mi_c: usize, w_mi: usize, h_mi: usize, id: u8) {
+    let (mi_rows, mi_cols) = SEG_MI_DIMS.with(|c| c.get());
+    let (x_mis, y_mis) = (w_mi.min(mi_cols.saturating_sub(mi_c)), h_mi.min(mi_rows.saturating_sub(mi_r)));
+    SEG_IDS.with(|m| {
+        let mut m = m.borrow_mut();
+        for y in 0..y_mis {
+            for x in 0..x_mis {
+                m[(mi_r + y) * mi_cols + mi_c + x] = id;
+            }
+        }
+    });
+    CUR_SEGMENT_ID.with(|c| c.set(id));
+    SEG_IDS_SEEN.with(|c| c.set(c.get() | 1 << id));
+}
+
+/// `get_predicted_segment_id` (libaom `dec_get_segment_id` over
+/// `last_frame_seg_map`): the minimum previous-frame segment id over the
+/// block's own mi footprint. `0` when there is no previous map.
+fn predicted_segment_id(mi_r: usize, mi_c: usize, w_mi: usize, h_mi: usize) -> u8 {
+    let (mi_rows, mi_cols) = SEG_MI_DIMS.with(|c| c.get());
+    PREV_SEG_IDS.with(|m| {
+        let m = m.borrow();
+        if m.is_empty() {
+            return 0;
+        }
+        let (x_mis, y_mis) = (w_mi.min(mi_cols.saturating_sub(mi_c)), h_mi.min(mi_rows.saturating_sub(mi_r)));
+        let mut id = u8::MAX;
+        for y in 0..y_mis {
+            for x in 0..x_mis {
+                id = id.min(m[(mi_r + y) * mi_cols + mi_c + x]);
+            }
+        }
+        if id == u8::MAX { 0 } else { id }
+    })
+}
+
+/// `av1_neg_deinterleave` (libaom `decodemv.c:258`).
+fn neg_deinterleave(diff: i32, reference: i32, max: i32) -> i32 {
+    if reference == 0 {
+        return diff;
+    }
+    if reference >= max - 1 {
+        return max - diff - 1;
+    }
+    let half = if 2 * reference < max {
+        diff <= 2 * reference
+    } else {
+        diff <= 2 * (max - reference - 1)
+    };
+    if half {
+        return if diff & 1 != 0 {
+            reference + ((diff + 1) >> 1)
+        } else {
+            reference - (diff >> 1)
+        };
+    }
+    if 2 * reference < max { diff } else { max - (diff + 1) }
+}
+
+/// `av1_get_spatial_seg_pred`: `(prediction, cdf_index)` from the current
+/// frame's already-decoded above/left/above-left neighbours.
+fn spatial_seg_pred(mi_r: usize, mi_c: usize) -> (i32, usize) {
+    let (row0, col0) = SEG_TILE_ORIGIN.with(|c| c.get());
+    let (avail_u, avail_l) = (mi_r > row0, mi_c > col0);
+    let prev_ul = (avail_u && avail_l).then(|| i32::from(segment_id_at(mi_r - 1, mi_c - 1)));
+    let prev_u = avail_u.then(|| i32::from(segment_id_at(mi_r - 1, mi_c)));
+    let prev_l = avail_l.then(|| i32::from(segment_id_at(mi_r, mi_c - 1)));
+    let ctx = match prev_ul {
+        None => 0,
+        Some(ul) if Some(ul) == prev_u && Some(ul) == prev_l => 2,
+        Some(ul) if Some(ul) == prev_u || Some(ul) == prev_l || prev_u == prev_l => 1,
+        Some(_) => 0,
+    };
+    let pred = match (prev_u, prev_l) {
+        (None, l) => l.unwrap_or(0),
+        (Some(u), None) => u,
+        (Some(u), Some(l)) => {
+            if prev_ul == Some(u) {
+                u
+            } else {
+                l
+            }
+        }
+    };
+    (pred, ctx)
+}
+
+/// `read_segment_id` (libaom `decodemv.c:280`): the spatially predicted id
+/// when `skip`, otherwise one `segment_id` symbol de-interleaved against
+/// that prediction. Does NOT write the map -- callers do.
+fn read_segment_id(dec: &mut SymbolDecoder, cdfs: &mut Cdfs, mi_r: usize, mi_c: usize, skip: bool) -> u8 {
+    let (pred, ctx) = spatial_seg_pred(mi_r, mi_c);
+    if skip {
+        return pred as u8;
+    }
+    let coded = dec.symbol(&mut cdfs.segment_id[ctx]) as i32;
+    SEG_ID_HITS.with(|c| c.set(c.get() + 1));
+    let last_active = SEG.with(|s| i32::from(s.borrow().last_active_seg_id));
+    neg_deinterleave(coded, pred, last_active + 1).clamp(0, last_active) as u8
+}
+
+/// `read_intra_segment_id` (spec 5.11.7): called twice per intra-frame block
+/// -- once before `skip` when `SegIdPreSkip`, once after it otherwise (the
+/// caller decides which by passing `pre_skip`).
+fn intra_segment_id(
+    dec: &mut SymbolDecoder,
+    cdfs: &mut Cdfs,
+    mi_r: usize,
+    mi_c: usize,
+    w_mi: usize,
+    h_mi: usize,
+    skip: bool,
+) {
+    if !SEG.with(|s| s.borrow().enabled) {
+        return;
+    }
+    let id = read_segment_id(dec, cdfs, mi_r, mi_c, skip);
+    write_segment_id(mi_r, mi_c, w_mi, h_mi, id);
+}
+
+/// Whether this frame's intra blocks read their `segment_id` before `skip`
+/// (`SegIdPreSkip`); `false` also when segmentation is off.
+fn seg_id_pre_skip() -> bool {
+    SEG.with(|s| {
+        let s = s.borrow();
+        s.enabled && s.seg_id_pre_skip
+    })
+}
+
+/// `read_inter_segment_id(preskip)` (spec 5.11.9, libaom `decodemv.c:352`).
+/// Called at both spec positions of an inter frame's block: `pre_skip = true`
+/// before `skip_mode`/`skip`, and `pre_skip = false` after them.
+fn inter_segment_id(
+    dec: &mut SymbolDecoder,
+    cdfs: &mut Cdfs,
+    mi_r: usize,
+    mi_c: usize,
+    w_mi: usize,
+    h_mi: usize,
+    skip: bool,
+    pre_skip: bool,
+) {
+    let (enabled, update_map, temporal_update, pre_skip_frame) = SEG.with(|s| {
+        let s = s.borrow();
+        (s.enabled, s.update_map, s.temporal_update, s.seg_id_pre_skip)
+    });
+    if !enabled {
+        return;
+    }
+    if !update_map {
+        // The map is inherited wholesale from the previous frame.
+        let id = predicted_segment_id(mi_r, mi_c, w_mi, h_mi);
+        write_segment_id(mi_r, mi_c, w_mi, h_mi, id);
+        return;
+    }
+    if pre_skip && !pre_skip_frame {
+        return;
+    }
+    if !pre_skip && skip {
+        // libaom: a skipped block never codes `seg_id_predicted`, and its
+        // segment id is the spatial prediction.
+        stamp_seg_pred(mi_r, mi_c, w_mi, h_mi, 0);
+        let id = read_segment_id(dec, cdfs, mi_r, mi_c, true);
+        write_segment_id(mi_r, mi_c, w_mi, h_mi, id);
+        return;
+    }
+    let id = if temporal_update {
+        let ctx = seg_pred_ctx(mi_r, mi_c);
+        let predicted = dec.symbol(&mut cdfs.segment_pred[ctx]) != 0;
+        stamp_seg_pred(mi_r, mi_c, w_mi, h_mi, u8::from(predicted));
+        if predicted {
+            predicted_segment_id(mi_r, mi_c, w_mi, h_mi)
+        } else {
+            read_segment_id(dec, cdfs, mi_r, mi_c, false)
+        }
+    } else {
+        read_segment_id(dec, cdfs, mi_r, mi_c, false)
+    };
+    write_segment_id(mi_r, mi_c, w_mi, h_mi, id);
+}
+
+/// `av1_get_pred_context_seg_id`: above + left `seg_id_predicted` flags.
+fn seg_pred_ctx(mi_r: usize, mi_c: usize) -> usize {
+    // libaom reads the flag off `above_mbmi`/`left_mbmi`, which are NULL (and
+    // so contribute 0) outside the tile -- the availability check here is
+    // what keeps a previous tile's stamps out of this tile's context.
+    let (row0, col0) = SEG_TILE_ORIGIN.with(|c| c.get());
+    let above = if mi_r > row0 {
+        ABOVE_SEG_PRED.with(|m| m.borrow().get(mi_c).copied().unwrap_or(0))
+    } else {
+        0
+    };
+    let left = if mi_c > col0 {
+        LEFT_SEG_PRED.with(|m| m.borrow().get(mi_r).copied().unwrap_or(0))
+    } else {
+        0
+    };
+    usize::from(above + left)
+}
+
+/// Spec 5.11.9's `AboveSegPredContext`/`LeftSegPredContext` update.
+fn stamp_seg_pred(mi_r: usize, mi_c: usize, w_mi: usize, h_mi: usize, value: u8) {
+    ABOVE_SEG_PRED.with(|m| {
+        let mut m = m.borrow_mut();
+        for i in 0..w_mi {
+            if let Some(cell) = m.get_mut(mi_c + i) {
+                *cell = value;
+            }
+        }
+    });
+    LEFT_SEG_PRED.with(|m| {
+        let mut m = m.borrow_mut();
+        for i in 0..h_mi {
+            if let Some(cell) = m.get_mut(mi_r + i) {
+                *cell = value;
+            }
+        }
+    });
 }
 
 // How many key-frame luma blocks resolved `smooth_neighbor` (spec
@@ -1924,6 +2263,9 @@ impl Neighbours {
     /// regardless of tile ([`Self::start_row`], already called once per SB
     /// row by every caller) so it needs no tile-specific reset here.
     fn start_tile(&mut self, row0_mi: usize, col0_mi: usize, col1_mi: usize) {
+        // lane-seg: `AvailU`/`AvailL` for the segment-id neighbour prediction
+        // are tile-relative, same as every other neighbour lookup here.
+        SEG_TILE_ORIGIN.with(|c| c.set((row0_mi, col0_mi)));
         self.tile_row0_mi = row0_mi;
         self.tile_col0_mi = col0_mi;
         let end = col1_mi.min(self.above.len());
@@ -2987,8 +3329,16 @@ fn read_intra_mode_rect(
             }
         };
     }
+    // Same `intra_segment_id` placement as the square reader above.
+    let (seg_w_mi, seg_h_mi) = (bw / 4, bh / 4);
+    if seg_id_pre_skip() {
+        intra_segment_id(dec, cdfs, mi_r, mi_c, seg_w_mi, seg_h_mi, false);
+    }
     let skip = dec.symbol(&mut cdfs.skip[skip_ctx]) != 0;
     istep!("skip", skip as i32);
+    if !seg_id_pre_skip() {
+        intra_segment_id(dec, cdfs, mi_r, mi_c, seg_w_mi, seg_h_mi, skip);
+    }
     maybe_read_cdef_idx(dec, mi_r, mi_c, skip);
     istep!("cdef", 0);
     // A HORZ/VERT rect strip is never the whole superblock (`bw`/`bh` never
@@ -3343,7 +3693,7 @@ fn decode_block_rect(
             bw,
             bh,
             crate::decode::bit_depth(),
-            CURRENT_Q_IDX.with(|c| c.get()),
+            block_q_idx(),
             plane_q_delta(0).0,
             plane_q_delta(0).1,
             luma_tx_type,
@@ -3384,7 +3734,7 @@ fn decode_block_rect(
             chroma_w,
             chroma_h,
             crate::decode::bit_depth(),
-            CURRENT_Q_IDX.with(|c| c.get()),
+            block_q_idx(),
             plane_q_delta(1).0,
             plane_q_delta(1).1,
             u_tx_type,
@@ -3424,7 +3774,7 @@ fn decode_block_rect(
             chroma_w,
             chroma_h,
             crate::decode::bit_depth(),
-            CURRENT_Q_IDX.with(|c| c.get()),
+            block_q_idx(),
             plane_q_delta(2).0,
             plane_q_delta(2).1,
             v_tx_type,
@@ -3783,7 +4133,7 @@ fn decode_block_rect64(
             luma_levels[row * bw..][..32].copy_from_slice(&luma_corner[row * 32..][..32]);
         }
         {
-            let cur = CURRENT_Q_IDX.with(|c| c.get());
+            let cur = block_q_idx();
             if cur != i32::from(base_q_idx) {
                 RECT64_QIDX_DRIFT_HITS.with(|c| c.set(c.get() + 1));
             }
@@ -3798,7 +4148,7 @@ fn decode_block_rect64(
             bw,
             bh,
             crate::decode::bit_depth(),
-            CURRENT_Q_IDX.with(|c| c.get()),
+            block_q_idx(),
             plane_q_delta(0).0,
             plane_q_delta(0).1,
             luma_tx_type,
@@ -3855,7 +4205,7 @@ fn decode_block_rect64(
             eprintln!("EC_COEFF_VAL plane=1 row={mi_r} col={mi_c} rng={rng}");
         }
         {
-            let cur = CURRENT_Q_IDX.with(|c| c.get());
+            let cur = block_q_idx();
             if cur != i32::from(base_q_idx) {
                 RECT64_QIDX_DRIFT_HITS.with(|c| c.set(c.get() + 1));
             }
@@ -3870,7 +4220,7 @@ fn decode_block_rect64(
             chroma_w,
             chroma_h,
             crate::decode::bit_depth(),
-            CURRENT_Q_IDX.with(|c| c.get()),
+            block_q_idx(),
             plane_q_delta(1).0,
             plane_q_delta(1).1,
             u_tx_type,
@@ -3909,7 +4259,7 @@ fn decode_block_rect64(
             eprintln!("EC_COEFF_VAL plane=2 row={mi_r} col={mi_c} rng={rng}");
         }
         {
-            let cur = CURRENT_Q_IDX.with(|c| c.get());
+            let cur = block_q_idx();
             if cur != i32::from(base_q_idx) {
                 RECT64_QIDX_DRIFT_HITS.with(|c| c.set(c.get() + 1));
             }
@@ -3924,7 +4274,7 @@ fn decode_block_rect64(
             chroma_w,
             chroma_h,
             crate::decode::bit_depth(),
-            CURRENT_Q_IDX.with(|c| c.get()),
+            block_q_idx(),
             plane_q_delta(2).0,
             plane_q_delta(2).1,
             v_tx_type,
@@ -4022,11 +4372,20 @@ fn read_intra_mode(
             }
         };
     }
+    // spec 5.11.6 `intra_frame_mode_info`: `intra_segment_id` is read BEFORE
+    // `skip` when `SegIdPreSkip`, and after it otherwise.
+    let (seg_w_mi, seg_h_mi) = (side / 4, side / 4);
+    if seg_id_pre_skip() {
+        intra_segment_id(dec, cdfs, mi_r, mi_c, seg_w_mi, seg_h_mi, false);
+    }
     let skip = dec.symbol(&mut cdfs.skip[skip_ctx]) != 0;
     if trace {
         eprintln!("TRACE skip value={}", skip as i32);
     }
     istep!("skip", skip as i32);
+    if !seg_id_pre_skip() {
+        intra_segment_id(dec, cdfs, mi_r, mi_c, seg_w_mi, seg_h_mi, skip);
+    }
     // spec order (see the comment below on `read_intrabc_info`): `skip`,
     // `segment_id`, `cdef`, `delta_q` -- `cdef` lands right here.
     maybe_read_cdef_idx(dec, mi_r, mi_c, skip);
@@ -4684,7 +5043,7 @@ fn read_plane(
         full
     };
     let (dc_delta, ac_delta) = plane_q_delta(plane_idx);
-    let residual = dequant_and_inverse_typed(&levels, side, bit_depth(), CURRENT_Q_IDX.with(|c| c.get()), dc_delta, ac_delta, tx_type);
+    let residual = dequant_and_inverse_typed(&levels, side, bit_depth(), block_q_idx(), dc_delta, ac_delta, tx_type);
     if std::env::var_os("EC_AV1_TRACE").is_some() {
         eprintln!(
             "TRACE dequant plane={plane_idx} base_q_idx={base_q_idx} tx_type={tx_type:?} side={side} levels={levels:?} residual={residual:?}",
@@ -5806,7 +6165,14 @@ fn unit_log2(px: u32) -> i32 {
 /// the flat `mode_deltas[1]` this used before was a `LAST_FRAME`-reachable
 /// wrong delta on every `GLOBALMV` block, masked while any `GOLDEN_FRAME`
 /// block anywhere aborted the whole stream's decode before comparison).
-fn lf_level(lf: &LoopFilterParams, plane_idx: usize, dir: usize, ref_frame: i8, delta_lf: i32) -> i32 {
+fn lf_level(
+    lf: &LoopFilterParams,
+    plane_idx: usize,
+    dir: usize,
+    ref_frame: i8,
+    delta_lf: i32,
+    segment_id: u8,
+) -> i32 {
     let base = i32::from(if plane_idx == 0 {
         lf.level[dir]
     } else if plane_idx == 1 {
@@ -5818,6 +6184,16 @@ fn lf_level(lf: &LoopFilterParams, plane_idx: usize, dir: usize, ref_frame: i8, 
     // ref/mode delta scaling below, and regardless of `delta_enabled`
     // (that flag only gates `ref_deltas`/`mode_deltas`).
     let base = (base + delta_lf).clamp(0, 63);
+    // lane-seg, spec 7.14.4 / libaom `av1_loop_filter_frame_init`: this
+    // block's segment's own `SEG_LVL_ALT_LF_*` delta applies after the
+    // per-superblock `DeltaLF` term and before the ref/mode deltas below.
+    // Feature index: `SEG_LVL_ALT_LF_Y_V + dir` for luma, `_U`/`_V` (3/4)
+    // for chroma.
+    let feature = if plane_idx == 0 { SEG_LVL_ALT_LF_Y_V + dir } else { plane_idx + 2 };
+    let base = match seg_feature(usize::from(segment_id), feature) {
+        Some(data) => (base + data).clamp(0, 63),
+        None => base,
+    };
     if !lf.delta_enabled {
         return base;
     }
@@ -5873,8 +6249,15 @@ fn edge_params(
     let cur_delta_lf = i32::from(n.delta_lf_grid[mi_r * n.skip_grid_cols_mi + mi_c][delta_idx]);
     let pv_delta_lf = i32::from(n.delta_lf_grid[pv_mi_r * n.skip_grid_cols_mi + pv_mi_c][delta_idx]);
 
-    let cur_level = lf_level(lf, plane_idx, dir, cur_ref, cur_delta_lf);
-    let pv_level = lf_level(lf, plane_idx, dir, pv_ref, pv_delta_lf);
+    let cur_level = lf_level(lf, plane_idx, dir, cur_ref, cur_delta_lf, segment_id_at(mi_r, mi_c));
+    let pv_level = lf_level(
+        lf,
+        plane_idx,
+        dir,
+        pv_ref,
+        pv_delta_lf,
+        segment_id_at(pv_mi_r, pv_mi_c),
+    );
     if cur_level == 0 && pv_level == 0 {
         return None;
     }
@@ -7780,7 +8163,7 @@ fn read_inter_plane(
         None,
     )?;
     let (dc_delta, ac_delta) = plane_q_delta(plane_idx);
-    let residual = dequant_and_inverse_typed(&grid, side, bit_depth(), CURRENT_Q_IDX.with(|c| c.get()), dc_delta, ac_delta, tx_type);
+    let residual = dequant_and_inverse_typed(&grid, side, bit_depth(), block_q_idx(), dc_delta, ac_delta, tx_type);
     plane.reconstruct_mc(x, y, side, prediction, &residual);
     Ok((grid, tx_type))
 }
@@ -8864,6 +9247,11 @@ fn decode_inter_block(
             dec.debug_bitpos()
         );
     }
+    // spec 5.11.5 `inter_frame_mode_info`: `inter_segment_id(1)` before
+    // `skip_mode`/`skip`, `inter_segment_id(0)` after them.
+    let (seg_mi_r, seg_mi_c) = (r * SUB_MI as usize, c * SUB_MI as usize);
+    let (seg_w_mi, seg_h_mi) = (side / 4, side / 4);
+    inter_segment_id(dec, cdfs, seg_mi_r, seg_mi_c, seg_w_mi, seg_h_mi, false, true);
     let skip_mode = skip_mode_present && dec.symbol(&mut cdfs.skip_mode[skip_mode_ctx]) == 1;
     if std::env::var_os("EC_AV1_SKIPMODE_DUMP").is_some() {
         eprintln!(
@@ -8877,6 +9265,7 @@ fn decode_inter_block(
 
     let skip_ctx = usize::from(neighbours.above_skip[c]) + usize::from(neighbours.left_skip[r]);
     let skip = skip_mode || dec.symbol(&mut cdfs.skip[skip_ctx]) == 1;
+    inter_segment_id(dec, cdfs, seg_mi_r, seg_mi_c, seg_w_mi, seg_h_mi, skip, false);
     maybe_read_cdef_idx(dec, r * SUB_MI as usize, c * SUB_MI as usize, skip);
     maybe_read_delta_q(dec, cdfs, r * SUB_MI as usize, c * SUB_MI as usize, side == 64, skip);
     maybe_read_delta_lf(dec, cdfs, r * SUB_MI as usize, c * SUB_MI as usize, side == 64, skip);
@@ -10714,6 +11103,9 @@ fn decode_inter_block8(
     }
     let skip_mode_ctx =
         usize::from(neighbours.above_skip_mode[c]) + usize::from(neighbours.left_skip_mode[r]);
+    // Same two `inter_segment_id` positions as [`decode_inter_block`]; this
+    // leaf is always `BLOCK_8X8`, i.e. 2x2 mi.
+    inter_segment_id(dec, cdfs, leaf_mi.0, leaf_mi.1, 2, 2, false, true);
     let skip_mode = skip_mode_present && dec.symbol(&mut cdfs.skip_mode[skip_mode_ctx]) == 1;
     if skip_mode {
         SKIP_MODE_HITS.with(|c| c.set(c.get() + 1));
@@ -10721,6 +11113,7 @@ fn decode_inter_block8(
 
     let skip_ctx = usize::from(above_skip) + usize::from(left_skip);
     let skip = skip_mode || dec.symbol(&mut cdfs.skip[skip_ctx]) == 1;
+    inter_segment_id(dec, cdfs, leaf_mi.0, leaf_mi.1, 2, 2, skip, false);
     maybe_read_cdef_idx(dec, leaf_mi.0, leaf_mi.1, skip);
     // Always a `BLOCK_8X8` leaf here, never the whole superblock.
     maybe_read_delta_q(dec, cdfs, leaf_mi.0, leaf_mi.1, false, skip);
