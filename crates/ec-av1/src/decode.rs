@@ -764,13 +764,21 @@ pub(crate) fn sb_rect_hits() -> usize {
 // `--enable-ab-partitions=0` (lane-sbpart r2's own measurement), so this is
 // the counter the gate hard-asserts.
 thread_local! {
-    static SB_AB_HITS: std::cell::Cell<usize> =
-        const { std::cell::Cell::new(0) };
+    static SB_AB_HITS: std::cell::Cell<[usize; 4]> =
+        const { std::cell::Cell::new([0; 4]) };
 }
 
-/// Current value of [`SB_AB_HITS`].
+/// Current value of [`SB_AB_HITS`], summed over the four arms.
 pub(crate) fn sb_ab_hits() -> usize {
-    SB_AB_HITS.with(|c| c.get())
+    SB_AB_HITS.with(|c| c.get().iter().sum())
+}
+
+/// [`SB_AB_HITS`] split per arm, in `PARTITION_HORZ_A`, `_HORZ_B`,
+/// `_VERT_A`, `_VERT_B` order -- what the gate hard-asserts arm by arm, so a
+/// run where aomenc's RD only ever picked (say) `HORZ_A` cannot pass off as
+/// proof of all four.
+pub(crate) fn sb_ab_hits_by_arm() -> [usize; 4] {
+    SB_AB_HITS.with(std::cell::Cell::get)
 }
 
 // lane-rect64q r1: how many of [`decode_block_rect64`]'s three per-plane
@@ -7532,6 +7540,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                 // width/height swapped (TL, BL, right 16x32
                                 // strip).
                                 INTRA_VERT_A_HITS.with(|c| c.set(c.get() + 1));
+                                let _vert_ab = crate::encode::Reach::vert_ab_partition();
                                 decode_block(
                                     &mut dec,
                                     &mut cdfs,
@@ -7606,6 +7615,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                 // (libaom decode_partition VERT_B: left
                                 // strip, TR, BR).
                                 INTRA_VERT_B_HITS.with(|c| c.set(c.get() + 1));
+                                let _vert_ab = crate::encode::Reach::vert_ab_partition();
                                 decode_block_rect(
                                     &mut dec,
                                     &mut cdfs,
@@ -7758,7 +7768,16 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                     // TR, BR). The pieces are exactly the ones already proven
                     // by the `PARTITION_NONE`-under-SPLIT (32x32 square) and
                     // `PARTITION_HORZ`/`VERT` (rect64 strip) arms above.
-                    SB_AB_HITS.with(|c| c.set(c.get() + 1));
+                    SB_AB_HITS.with(|c| {
+                        let mut h = c.get();
+                        h[part - PARTITION_HORZ_A] += 1;
+                        c.set(h);
+                    });
+                    // lane-part32 r5: only the two VERTICAL arms reorder the
+                    // square sub-blocks (TL, BL, TR, BR), so only they switch
+                    // libaom's `has_tr`/`has_bl` tables.
+                    let _vert_ab = (part == PARTITION_VERT_A || part == PARTITION_VERT_B)
+                        .then(crate::encode::Reach::vert_ab_partition);
                     macro_rules! square32 {
                         ($at:expr) => {
                             decode_block(
@@ -13427,6 +13446,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                         // lane-partab r1: mirror of PARTITION_HORZ_A with
                         // width/height swapped (TL, BL, right 16x32 strip).
                         PARTAB_HITS.with(|c| c.set(c.get() + 1));
+                        let _vert_ab = crate::encode::Reach::vert_ab_partition();
                         decode_inter_block(
                             &mut dec,
                             &mut cdfs,
@@ -13588,6 +13608,7 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                         // 16x16 squares on the right (libaom decode_partition
                         // PARTITION_VERT_B: left strip, TR, BR).
                         PARTAB_HITS.with(|c| c.set(c.get() + 1));
+                        let _vert_ab = crate::encode::Reach::vert_ab_partition();
                         decode_inter_block(
                             &mut dec,
                             &mut cdfs,
