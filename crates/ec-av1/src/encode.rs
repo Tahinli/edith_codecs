@@ -1100,9 +1100,22 @@ impl Drop for VertAbGuard {
 /// r1: the two rect strips PARTITION_HORZ/VERT ever produce at the 32x32
 /// level, transcribed verbatim (not derived): `[0]` is 32-wide, `[1]` is
 /// 16-wide.
-const HAS_TOP_RIGHT_RECT: [&[u8]; 2] = [&[15, 5, 7, 5], &[255, 119, 127, 119]];
+const HAS_TOP_RIGHT_RECT: [&[u8]; 4] = [
+    &[15, 5, 7, 5],
+    &[255, 119, 127, 119],
+    // lane-tx64x16 r3: `has_tr_32x8` / `has_tr_8x32` (`reconintra.c:122-127`),
+    // the 4:1 strips of a 32x32-level `PARTITION_HORZ_4`/`VERT_4`.
+    &[15, 0, 5, 0, 7, 0, 5, 0],
+    &[255, 255, 127, 127, 255, 127, 127, 127],
+];
 /// `has_bl_32x16`/`has_bl_16x32`, same source, same order.
-const HAS_BOTTOM_LEFT_RECT: [&[u8]; 2] = [&[78, 14, 78, 14], &[16, 0, 16, 0]];
+const HAS_BOTTOM_LEFT_RECT: [&[u8]; 4] = [
+    &[78, 14, 78, 14],
+    &[16, 0, 16, 0],
+    // `has_bl_32x8` / `has_bl_8x32` (`reconintra.c:305-310`).
+    &[238, 78, 238, 14, 238, 78, 238, 14],
+    &[0, 1, 0, 0, 0, 1, 0, 0],
+];
 
 impl Reach {
     /// What a block of `side` samples at `(x, y)` may read past its own edges,
@@ -1150,7 +1163,7 @@ impl Reach {
         if col + 1 == per_col {
             return false;
         }
-        let table = HAS_TOP_RIGHT_RECT[usize::from(bw == 16)];
+        let table = HAS_TOP_RIGHT_RECT[Self::rect_table(bw, bh)];
         Self::bit(table, (row * Self::table_stride(bw) + col) % (table.len() * 8))
     }
 
@@ -1162,7 +1175,7 @@ impl Reach {
         if row + 1 == per_row {
             return false;
         }
-        let table = HAS_BOTTOM_LEFT_RECT[usize::from(bw == 16)];
+        let table = HAS_BOTTOM_LEFT_RECT[Self::rect_table(bw, bh)];
         Self::bit(table, (row * Self::table_stride(bw) + col) % (table.len() * 8))
     }
 
@@ -1260,6 +1273,18 @@ impl Reach {
     /// superblock -- using `per_side` (`SUPERBLOCK` / `side`, 64-relative)
     /// here instead indexes the wrong bit for every block size but the one
     /// where 64 and 128 give the same stride.
+    /// Which row of [`HAS_TOP_RIGHT_RECT`]/[`HAS_BOTTOM_LEFT_RECT`] a
+    /// rectangular block reads. The 2:1 pair keeps its historical
+    /// `bw == 16` selector; the 4:1 pair (lane-tx64x16 r3) is named
+    /// explicitly, so no existing shape changes row.
+    fn rect_table(bw: usize, bh: usize) -> usize {
+        match (bw, bh) {
+            (32, 8) => 2,
+            (8, 32) => 3,
+            _ => usize::from(bw == 16),
+        }
+    }
+
     fn table_stride(side: usize) -> usize {
         128 / side
     }

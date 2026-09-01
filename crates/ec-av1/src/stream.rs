@@ -13132,4 +13132,239 @@ mod tests {
              mismatched -- other lanes' shapes)"
         );
     }
+
+    /// lane-tx64x16 r3: the 32x32-LEVEL 1:4 pair -- `PARTITION_HORZ_4` /
+    /// `PARTITION_VERT_4` at 32x32, i.e. four 32x8 / 8x32 strips, the arm the
+    /// Hunger Games mid-film extract stops at ("a 32x32 partition type this
+    /// decoder does not code (value=8)"). `--min-partition-size=8` is what
+    /// lets aomenc's RD reach the 32-level 1:4 shapes; `--max-partition-size=32`
+    /// keeps the superblock-level pair (already gated by its own test above)
+    /// out of the counters. Both orientations HARD-asserted per bit depth --
+    /// the luma scans and the two new chroma scans (`SCAN_16X4`/`SCAN_4X16`)
+    /// are transposed pairs, so a one-sided gate cannot catch a transposition
+    /// (class scan-weights-cross-axis). `rect4_coeff_hits` is asserted too:
+    /// an all-skip stream would exercise none of the new coefficient tables
+    /// (class gate-blind-to-feature). Only hits earned inside an attempt that
+    /// then compared pixel-exact are counted (class
+    /// gate-skips-on-its-own-failure); the 10-bit arm is what retires
+    /// `enable-1to4-partitions` from `NEVER_EXERCISED_10BIT`.
+    #[test]
+    // lane-tx64x16 r3, MEASURED, not a hunch: no recipe tried this round makes
+    // aomenc's RD emit a 32x32-level 1:4 partition on synthetic fixtures --
+    // 20/20 attempts of the recipe below (min-partition-size=8,
+    // max-partition-size=32) carried ZERO 32-level 1:4 blocks, as did a
+    // vertically-squeezed variant and a horizontally-blurred one (the latter
+    // additionally tripped the screen-content refusal). The wiring IS
+    // exercised by real content -- see this round's report for the film probe
+    // -- but until a fixture recipe is found this gate can prove nothing, and
+    // a gate that passes by never seeing its feature is worse than an ignored
+    // one (class gate-blind-to-feature). Un-ignore with the recipe, never with
+    // a weakened assert.
+    #[ignore = "no fixture recipe yet emits a 32-level 1:4 partition (lanes/tx64x16-r3.report.md)"]
+    fn a_real_aomenc_stream_with_a_32x32_level_1to4_partition_decodes_pixel_exact() {
+        const NAME: &str =
+            "a_real_aomenc_stream_with_a_32x32_level_1to4_partition_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height, frame_count) = (192usize, 128usize, 1usize);
+        let n_attempts: u32 = std::env::var("EC_TX64X16_GATE32_ATTEMPTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(20);
+        for bit_depth in [8u32, 10u32] {
+            let mut named_refusals = 0u32;
+            let mut matched = 0u32;
+            let (mut horz_proved, mut vert_proved, mut coeff_proved) = (0usize, 0usize, 0usize);
+            let (mut out_of_scope, mut out_of_scope_mismatch) = (0u32, 0u32);
+            for attempt in 0..n_attempts {
+                let seed = 42 + attempt;
+                let duration = frame_count as f64 / 25.0;
+                // Odd attempts render the SAME generator rotated 90 degrees,
+                // the transposed-pair discipline the superblock-level 1:4
+                // gate above documents.
+                let source = if attempt % 2 == 0 {
+                    gradients_source(seed, width, height, &format!("duration={duration}:rate=25"))
+                } else {
+                    format!(
+                        "{},transpose=1",
+                        gradients_source(
+                            seed,
+                            height,
+                            width,
+                            &format!("duration={duration}:rate=25")
+                        )
+                    )
+                };
+                let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+                let y4m = Command::new("ffmpeg")
+                    .args([
+                        "-v", "error", "-f", "lavfi", "-i", &source, "-t", &duration.to_string(),
+                        "-pix_fmt", pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                    ])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .expect("ffmpeg failed to run");
+                assert!(
+                    y4m.status.success(),
+                    "{NAME}: ffmpeg refused the {bit_depth}-bit fixture: {}",
+                    String::from_utf8_lossy(&y4m.stderr)
+                );
+                let depth_arg = format!("--bit-depth={bit_depth}");
+                let input_depth_arg = format!("--input-bit-depth={bit_depth}");
+                let args: Vec<&str> = vec![
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    "--cq-level=45",
+                    "--cpu-used=0",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--sb-size=64",
+                    &depth_arg,
+                    &input_depth_arg,
+                    "--enable-rect-partitions=1",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=1",
+                    "--min-partition-size=8",
+                    "--max-partition-size=32",
+                    "--enable-restoration=0",
+                    "--enable-palette=0",
+                    "--deltaq-mode=0",
+                    "--enable-filter-intra=0",
+                    "--enable-cfl-intra=0",
+                    "--enable-intrabc=0",
+                    "--enable-tx-size-search=0",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
+                ];
+                let mut child = Command::new(aomenc_path())
+                    .args(&args)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("aomenc failed to start");
+                child
+                    .stdin
+                    .take()
+                    .expect("aomenc stdin")
+                    .write_all(&y4m.stdout)
+                    .expect("writing y4m to aomenc");
+                let out = child.wait_with_output().expect("aomenc failed to run");
+                assert!(
+                    out.status.success(),
+                    "aomenc refused the fixture: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let stream = out.stdout;
+                let before = (
+                    crate::decode::rect4_32_horz_hits(),
+                    crate::decode::rect4_32_vert_hits(),
+                    crate::decode::rect4_coeff_hits(),
+                );
+                let frames = match decode_stream(&stream) {
+                    Err(e) => {
+                        let msg = e.to_string();
+                        assert!(
+                            msg.contains("unsupported"),
+                            "{NAME} failed outright, not a named refusal ({bit_depth}-bit, seed \
+                             {seed}): {msg}"
+                        );
+                        named_refusals += 1;
+                        eprintln!("{bit_depth}-bit seed {seed} refusal: {msg}");
+                        continue;
+                    }
+                    Ok(frames) => frames,
+                };
+                let (horz, vert, coeff) = (
+                    crate::decode::rect4_32_horz_hits() - before.0,
+                    crate::decode::rect4_32_vert_hits() - before.1,
+                    crate::decode::rect4_coeff_hits() - before.2,
+                );
+                let ffmpeg_frames = if bit_depth == 10 {
+                    ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count)
+                } else {
+                    ffmpeg_decode_sequence(&stream, width, height, frame_count)
+                };
+                assert_eq!(frames.len(), frame_count);
+                let mismatched = frames
+                    .iter()
+                    .zip(&ffmpeg_frames)
+                    .any(|(got, want)| got.y != want.y || got.u != want.u || got.v != want.v);
+                if horz + vert == 0 {
+                    // Out of this gate's territory (no 32-level 1:4 block in
+                    // the stream): counted and printed, never silently
+                    // dropped, and a mismatch here is another shape's defect.
+                    out_of_scope += 1;
+                    if mismatched {
+                        out_of_scope_mismatch += 1;
+                        eprintln!(
+                            "{NAME}: {bit_depth}-bit seed {seed} MISMATCHES with zero 32-level \
+                             1:4 blocks -- a pre-existing defect of another shape"
+                        );
+                    }
+                    continue;
+                }
+                if mismatched {
+                    if let Ok(path) = std::env::var("EC_AV1_GATE_DUMP") {
+                        std::fs::write(&path, &stream).expect("writing pinned stream");
+                        eprintln!(
+                            "EC_AV1_GATE_DUMP: wrote mismatching stream ({bit_depth}-bit, seed \
+                             {seed}) to {path}"
+                        );
+                    }
+                }
+                for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                    assert_eq!(
+                        got.y, want.y,
+                        "{NAME} frame {i} luma vs ffmpeg ({bit_depth}-bit, seed {seed})"
+                    );
+                    assert_eq!(
+                        got.u, want.u,
+                        "{NAME} frame {i} U vs ffmpeg ({bit_depth}-bit, seed {seed})"
+                    );
+                    assert_eq!(
+                        got.v, want.v,
+                        "{NAME} frame {i} V vs ffmpeg ({bit_depth}-bit, seed {seed})"
+                    );
+                }
+                horz_proved += horz;
+                vert_proved += vert;
+                coeff_proved += coeff;
+                matched += 1;
+            }
+            assert!(
+                matched > 0,
+                "{NAME}: every {bit_depth}-bit attempt refused; the gate never decoded a stream"
+            );
+            assert!(
+                horz_proved > 0 && vert_proved > 0,
+                "{NAME}: a 32-level 1:4 arm never fired inside a pixel-exact {bit_depth}-bit \
+                 attempt (horz={horz_proved}, vert={vert_proved}, {matched} matches, \
+                 {named_refusals} refusals out of {n_attempts}) -- gate proved nothing this run"
+            );
+            assert!(
+                coeff_proved > 0,
+                "{NAME}: every {bit_depth}-bit 32-level 1:4 strip was skip -- the 32x8/16x4 \
+                 coefficient tables were never read"
+            );
+            eprintln!(
+                "{NAME}: {bit_depth}-bit: {named_refusals} named refusals, {matched} pixel-exact \
+                 matches out of {n_attempts}, horz_4 strips={horz_proved}, vert_4 \
+                 strips={vert_proved}, coded strips={coeff_proved}, {out_of_scope} attempts \
+                 carried no 32-level 1:4 block ({out_of_scope_mismatch} mismatched)"
+            );
+        }
+    }
 }
