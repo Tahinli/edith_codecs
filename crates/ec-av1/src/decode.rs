@@ -944,6 +944,16 @@ pub(crate) fn sub8_split_hits() -> usize {
 thread_local! {
     static TX4X8_CODED_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static TX8X4_CODED_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Sub-8x8 rect leaves whose `tx_depth` symbol resolved to 1 -- the leaf's
+    /// two 4x4 transform units, predicted one after the other. A separate
+    /// counter from [`TX_DEPTH_HITS`] (which every square path also bumps) so
+    /// the gate can prove THIS path fired.
+    static RECT8_SPLIT_TX_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`RECT8_SPLIT_TX_HITS`].
+pub(crate) fn rect8_split_tx_hits() -> usize {
+    RECT8_SPLIT_TX_HITS.with(|c| c.get())
 }
 
 /// Current value of [`TX4X8_CODED_HITS`].
@@ -1713,8 +1723,16 @@ fn read_coeffs_rect(
     sign_ctx: usize,
     default_tx_type: TxType,
 ) -> Result<(Vec<i32>, TxType)> {
+    let rect_trace = std::env::var_os("EC_TRACE_COEFF").is_some();
     let mut grid = vec![0i32; w * h];
     let all_zero = dec.symbol(&mut coding.txb_skip[skip_ctx]) == 1;
+    if rect_trace {
+        eprintln!(
+            "EC_COEFF_STEP tag=all_zero plane=0 ctx={skip_ctx} all_zero={} rng={}",
+            all_zero as i32,
+            dec.debug_state().0
+        );
+    }
     if all_zero {
         return Ok((grid, TxType::DctDct));
     }
@@ -1735,12 +1753,18 @@ fn read_coeffs_rect(
             _ => TxType::from_symbol(t),
         }
         .ok_or_else(|| unsupported(format!("a tx_type symbol outside its CDF's own set: {t}")))?;
+        if rect_trace {
+            eprintln!("EC_COEFF_STEP tag=tx_type plane=0 rng={}", dec.debug_state().0);
+        }
     }
     let class = TxClass::of(tx_type);
     if class != TxClass::TwoD {
         TX_CLASS1_HITS.with(|c| c.set(c.get() + 1));
     }
     let eob = read_eob(dec, coding, class);
+    if rect_trace {
+        eprintln!("EC_COEFF_STEP tag=eob eob={eob} rng={}", dec.debug_state().0);
+    }
     let class_scan;
     let scan: &[u16] = if class == TxClass::TwoD {
         scan
@@ -1754,10 +1778,24 @@ fn read_coeffs_rect(
         let (row, col) = (pos / w, pos % w);
         let level = if scan_idx == eob - 1 {
             let ctx = eob_coeff_ctx(scan_idx, w * h);
-            dec.symbol(&mut coding.base_eob[ctx]) as i32 + 1
+            let v = dec.symbol(&mut coding.base_eob[ctx]) as i32 + 1;
+            if rect_trace {
+                eprintln!(
+                    "EC_COEFF_STEP tag=base_eob c={scan_idx} pos={pos} ctx={ctx} level={v} rng={}",
+                    dec.debug_state().0
+                );
+            }
+            v
         } else {
             let ctx = base_ctx_rect(&levels, w, h, row, col, class);
-            dec.symbol(&mut coding.base[ctx]) as i32
+            let v = dec.symbol(&mut coding.base[ctx]) as i32;
+            if rect_trace {
+                eprintln!(
+                    "EC_COEFF_STEP tag=base c={scan_idx} pos={pos} ctx={ctx} level={v} rng={}",
+                    dec.debug_state().0
+                );
+            }
+            v
         };
         let level = if level > NUM_BASE_LEVELS {
             let ctx = br_ctx_rect(&levels, w, h, row, col, class);
@@ -1765,6 +1803,12 @@ fn read_coeffs_rect(
             let mut sent = 0;
             loop {
                 let k = dec.symbol(&mut coding.br[ctx]) as i32;
+                if rect_trace {
+                    eprintln!(
+                        "EC_COEFF_STEP tag=br c={scan_idx} pos={pos} ctx={ctx} k={k} rng={}",
+                        dec.debug_state().0
+                    );
+                }
                 level += k;
                 sent += BR_STEP;
                 if k < BR_STEP || sent >= COEFF_BASE_RANGE {
@@ -6058,6 +6102,7 @@ fn decode_leaf_rect8(
     base_q_idx: u8,
     enable_filter_intra: bool,
     allow_intrabc: bool,
+    tx_select: bool,
     reduced_tx_set: bool,
 ) -> Result<(usize, usize)> {
     let (r, c) = outer_at;
@@ -6099,6 +6144,26 @@ fn decode_leaf_rect8(
                 "filter intra on a HORZ/VERT strip (this decoder predicts square-only)",
             ));
         }
+        // `TxMode::Select`'s `tx_depth` (spec 5.11.16) exists at a 4x8/8x4
+        // leaf too, and is read for every intra block, skipped or not. Its
+        // category is libaom's `bsize_to_tx_size_cat(BLOCK_4X8) == 0` --
+        // `sub_tx_size_map[TX_4X8] == TX_4X4` is a single step, so it is the
+        // same 2-symbol `tx_size_cat0` an 8x8 uses, not the 3-symbol
+        // `tx_size_cat2` the 32x16 strips read -- with the rect context
+        // (`get_tx_size_context`'s `max_tx_wide`/`max_tx_high` = bw/bh).
+        // Missing this read consumed one symbol fewer than the encoder wrote
+        // and desynced the tile at the very first rect leaf (class
+        // `symbol-consumption-gap`).
+        let depth = if tx_select {
+            let ctx = tx_size_context_rect(neighbours, lmi, bw, bh);
+            dec.symbol(&mut cdfs.tx_size_cat0[ctx])
+        } else {
+            0
+        };
+        if depth != 0 {
+            TX_DEPTH_HITS.with(|c| c.set(c.get() + 1));
+            RECT8_SPLIT_TX_HITS.with(|c| c.set(c.get() + 1));
+        }
         leaf_modes[i] = mode;
         leaf_skips[i] = skip;
         neighbours.record_mode_mi(lmi.0, lmi.1, w_mi, h_mi, mode);
@@ -6108,6 +6173,83 @@ fn decode_leaf_rect8(
         }
         let (px, py) = (lmi.1 * MI, lmi.0 * MI);
         let reach = Reach::of_rect(bw, bh, px, py, y.width, y.height);
+        // `sub_tx_size_map[TX_4X8] == TX_4X4`: depth 1 splits the leaf into
+        // two 4x4 transform units along its long axis, each predicted from
+        // the previous unit's reconstruction and reading its own `txb_skip`
+        // context -- `decode_leaf8`'s own depth-1 loop, two units instead of
+        // four. The per-TU path writes its own neighbour state, so the
+        // block-level write below is skipped for it.
+        let split = depth != 0;
+        if split {
+            let mut done = 0usize;
+            for tu in 0..2usize {
+                let tu_mi = if vert {
+                    (lmi.0 + tu, lmi.1)
+                } else {
+                    (lmi.0, lmi.1 + tu)
+                };
+                let (tu_px, tu_py) = (tu_mi.1 * MI, tu_mi.0 * MI);
+                let tu_around = neighbours.around_mi(tu_mi, 4)[0];
+                let tu_reach = Reach::of(4, tu_px, tu_py, y.width, y.height);
+                let tu_skip_ctx = neighbours.luma_skip_ctx(tu_mi, 1);
+                if skip {
+                    // A skipped leaf still predicts per transform unit: the
+                    // second 4x4 takes its above/left edge from the first
+                    // one's reconstruction, which is NOT what a single 4x8
+                    // prediction of the same mode produces.
+                    let zeros = vec![0i32; 16];
+                    y.reconstruct(
+                        tu_px, tu_py, 4, mode, angle_delta_y, tu_reach, &zeros, None, None,
+                        smooth_neighbor,
+                    );
+                    neighbours.record_mi_luma(tu_mi, 4, &zeros);
+                    continue;
+                }
+                let tu_grid = read_plane(
+                    dec,
+                    cdfs,
+                    if reduced_tx_set {
+                        TxbSet::Luma4
+                    } else {
+                        TxbSet::Luma4Set1
+                    },
+                    scan4,
+                    0,
+                    tu_around,
+                    mode,
+                    mode,
+                    angle_delta_y,
+                    tu_reach,
+                    y,
+                    tu_px,
+                    tu_py,
+                    4,
+                    TX4,
+                    base_q_idx,
+                    None,
+                    None,
+                    Some(tu_skip_ctx),
+                    smooth_neighbor,
+                )?;
+                if tu_grid.iter().any(|&l| l != 0) {
+                    done += 1;
+                }
+                neighbours.record_mi_luma(tu_mi, 4, &tu_grid);
+            }
+            if done > 0 {
+                if vert {
+                    TX4X8_CODED_HITS.with(|h| h.set(h.get() + 1));
+                } else {
+                    TX8X4_CODED_HITS.with(|h| h.set(h.get() + 1));
+                }
+            }
+            neighbours.fill_skip_grid_rect(lmi, w_mi, h_mi, skip);
+            neighbours.fill_lf_grid_rect(lmi, w_mi, h_mi, 4, 4, 0);
+            if has_chroma {
+                last_uv = chroma;
+            }
+            continue;
+        }
         let grid = if skip {
             let zeros = vec![0i32; bw * bh];
             y.reconstruct_rect(
@@ -6172,7 +6314,8 @@ fn decode_leaf_rect8(
             }
         }
         neighbours.fill_skip_grid_rect(lmi, w_mi, h_mi, skip);
-        neighbours.fill_lf_grid_rect(lmi, w_mi, h_mi, bw as u8, bh as u8, 0);
+        let (tx_w, tx_h) = if split { (4, 4) } else { (bw as u8, bh as u8) };
+        neighbours.fill_lf_grid_rect(lmi, w_mi, h_mi, tx_w, tx_h, 0);
         if has_chroma {
             last_uv = chroma;
         }
@@ -7969,6 +8112,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                                     base_q_idx,
                                                     enable_filter_intra,
                                                     allow_intrabc,
+                                                    tx_select,
                                                     reduced_tx_set,
                                                 )?
                                             } else {
@@ -8095,6 +8239,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                                 base_q_idx,
                                                 enable_filter_intra,
                                                 allow_intrabc,
+                                                tx_select,
                                                 reduced_tx_set,
                                             )?
                                         } else {
