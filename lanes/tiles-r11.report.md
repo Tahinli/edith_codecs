@@ -102,3 +102,31 @@ band. Nothing to fix — recorded so the next lane does not re-sweep it.
 
 ## Commit
 - 2e73186 on `lane-tiles`. Never pushed, never merged, main untouched.
+
+## Coordinator items received mid-round (after the r11 commit)
+1. **Palette left neighbour has no tile guard — CONFIRMED and FIXED.**
+   `decode.rs` `palette_ctx_and_cache` and `palette_uv_cache` read
+   `left_palette_size[r]` / `left_palette_uv_size[r]` with **no availability guard at
+   all**, where libaom's `av1_get_palette_cache` takes `xd->left_mbmi`, NULL at the
+   block's own tile left column. Fixed with `let left_ok = c > self.tile_col0_mi / (SUB / MI);`
+   on both (`at` is in SUB units, so the mi-unit tile origin is divided the same way
+   `start_tile` divides `col0_mi` for `above_mode`). `start_row` also never cleared
+   `left_palette_*`/`left_palette_uv_*`; it does now (COMMON's NEIGHBOUR MAPS rule 2).
+   Status: **code-verified** — 54 tile tests + gate_coverage green, no gate yet proves it.
+2. **Palette + screen-content multi-tile arm — written, `#[ignore]`d, NOT yet proof.**
+   `a_real_aomenc_multi_tile_palette_stream_decodes_pixel_exact` (smptebars, 2 tile
+   columns, `--tune-content=screen --enable-palette=1`, asserts `palette_hits` rose).
+   It currently refuses on every seed before a palette block reconstructs, because the
+   per-arm `extra` flags do NOT override the base recipe: **aomenc keeps the FIRST
+   occurrence of a repeated `--enable-*` flag** (measured — appending
+   `--enable-rect-partitions=0` after the base `=1` changed the refusal not at all).
+   Fix next round: move `args.extend(extra)` to precede the base list in
+   `run_multi_tile_gate`. Disposition: **deferred(one edit — extra before base)**.
+3. **lane-ab16's `--tile-columns=1` mismatch (mandelbrot 96x96, x=32..63 y=80..95)** —
+   NOT reproduced this round. Disposition: **deferred(tool-call cap)**.
+4. **Frame-relative `mi_row > 0` / `mi_col > 0` guards at decode.rs ~8547-8548 and
+   mvstack.rs ~727,733,742,756,1486,1492,1501,1515** — NOT swept. mvstack has no tile
+   origin plumbed in at all, so this is a signature change plus a call-site sweep, and
+   it needs a multi-tile INTER gate to show — the arm that is `#[ignore]`d above for an
+   unrelated open defect. Disposition: **deferred(next round; needs tile bounds threaded
+   into mvstack, then the inter multi-tile arm re-enabled to measure)**.

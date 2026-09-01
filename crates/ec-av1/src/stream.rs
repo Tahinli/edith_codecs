@@ -11145,6 +11145,10 @@ mod tests {
         bit_depth: usize,
         frame_count: usize,
         extra: &[&str],
+        // `None` = the shared `gradients_source`. The palette arm overrides it
+        // with `smptebars`, the flat few-colour source the existing palette
+        // gates use -- gradients never make aomenc pick a palette block.
+        source_override: Option<&str>,
     ) {
         let _gate_lock = lock_gate_counters();
         if !have_ffmpeg() {
@@ -11166,7 +11170,10 @@ mod tests {
         for attempt in 0..n_attempts {
             let seed = 42 + attempt;
             let duration = frame_count as f64 / 25.0;
-            let source = gradients_source(seed, width, height, &format!("duration={duration}:rate=25"));
+            let source = match source_override {
+                Some(src) => format!("{src}=size={width}x{height}:duration={duration}:rate=25"),
+                None => gradients_source(seed, width, height, &format!("duration={duration}:rate=25")),
+            };
             let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
             let y4m = Command::new("ffmpeg")
                 .args([
@@ -11217,6 +11224,8 @@ mod tests {
                 // vacuous rather than proving anything about tiles.
                 "--enable-1to4-partitions=0",
                 "--min-partition-size=16",
+                // Overridable by `extra` (aomenc takes the last occurrence of
+                // a repeated flag), which the palette arm below relies on.
                 "--enable-palette=0",
                 "--enable-intrabc=0",
                 "--enable-ref-frame-mvs=0",
@@ -11340,6 +11349,7 @@ mod tests {
             8,
             1,
             &[],
+            None,
         );
     }
 
@@ -11352,6 +11362,7 @@ mod tests {
             10,
             1,
             &[],
+            None,
         );
     }
 
@@ -11387,7 +11398,54 @@ mod tests {
             // `refusal_inventory.rs`; without these two flags every inter
             // attempt refuses before a single tile edge is compared.
             &["--max-partition-size=32", "--enable-tx-size-search=0"],
+            None,
         );
+    }
+
+    /// lane-tiles r11, the defect this arm exists for: `palette_ctx_and_cache`
+    /// / `palette_uv_cache` (`decode.rs`) read the LEFT palette neighbour with
+    /// no availability guard at all, where libaom's `av1_get_palette_cache`
+    /// takes `xd->left_mbmi`, which is NULL at the block's own TILE left
+    /// column. A second tile column therefore inherited the previous tile's
+    /// palette colours and `palette_y_mode` ctx. Screen content is what makes
+    /// aomenc pick palette at all, so this arm drives `--tune-content=screen
+    /// --enable-palette=1` over a 2-column grid and asserts a real palette
+    /// block actually fired.
+    /// `#[ignore]`d at r11 and NOT yet proof of the fix: with the broad tool
+    /// set every seed refuses before a palette block reconstructs
+    /// ("a HORZ_A/HORZ_B/VERT_A partition below 16x16"), and the per-arm
+    /// `extra` overrides do not switch the base recipe's tools off -- aomenc
+    /// keeps the FIRST occurrence of a repeated `--enable-*` flag (measured:
+    /// appending `--enable-rect-partitions=0` after the base `=1` changed the
+    /// refusal not at all). Next round: put `extra` BEFORE the base list in
+    /// `run_multi_tile_gate`'s args, then this arm should reach a palette
+    /// block on smptebars with rect/ab off.
+    #[test]
+    #[ignore = "r11: refuses on AB-below-16x16 before a palette block reconstructs; extra-flag override needs to precede the base recipe"]
+    fn a_real_aomenc_multi_tile_palette_stream_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_multi_tile_palette_stream_decodes_pixel_exact";
+        let before = crate::decode::palette_hits();
+        run_multi_tile_gate(
+            NAME,
+            1,
+            0,
+            8,
+            1,
+            &["--enable-palette=1", "--tune-content=screen", "--cq-level=30", "--enable-tx-size-search=0", "--max-partition-size=32",
+                // Screen content + rect strips is a separate, pre-existing
+                // refusal ("palette syntax is consumed for square blocks
+                // only"); this arm owns the palette CACHE at a tile edge, so
+                // it takes the square-only path the other palette gates take.
+                "--enable-rect-partitions=0", "--enable-ab-partitions=0"],
+            Some("smptebars"),
+        );
+        if have_ffmpeg() && have_aomenc() {
+            assert!(
+                crate::decode::palette_hits() > before,
+                "{NAME}: no palette block fired -- the gate proves nothing about the palette \
+                 cache at a tile edge"
+            );
+        }
     }
 
     #[test]
@@ -11405,6 +11463,7 @@ mod tests {
             // `refusal_inventory.rs`; without these two flags every inter
             // attempt refuses before a single tile edge is compared.
             &["--max-partition-size=32", "--enable-tx-size-search=0"],
+            None,
         );
     }
 }
