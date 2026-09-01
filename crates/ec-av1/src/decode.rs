@@ -1346,19 +1346,30 @@ fn dc_sign_ctx(vote: i32) -> usize {
 /// The remainder of a level the base and base-range syntax could not reach
 /// (spec 5.11.40): its bit length in unary, then that many of its own bits,
 /// most significant first — the exact inverse of [`crate::tile::write_golomb`].
-fn read_golomb(dec: &mut SymbolDecoder) -> Result<u32> {
-    let mut length = 1u32;
-    while dec.literal(1) == 0 {
-        length += 1;
-        if length > 20 {
-            return Err(unsupported("a Golomb tail longer than this decoder reads"));
-        }
+fn read_golomb(dec: &mut SymbolDecoder) -> u32 {
+    // lane-scaledref r1: the length prefix is capped at 32 leading zeros, not
+    // refused. libaom's own `read_golomb` (decodetxb.c:30) calls a 21st bit a
+    // CORRUPT FRAME, which is where this decoder's old
+    // "a Golomb tail longer than this decoder reads" refusal sat; dav1d reads
+    // up to 32 (`len < 32`) and simply stops counting. Reading the longer
+    // prefix costs nothing and refuses nothing, and the short prefixes -- the
+    // only ones any encoder writes, our own included (`tile::MAX_LEVEL` is
+    // `MAX_BR_LEVEL + (1 << 19)`, i.e. 19 leading zeros at most) -- are
+    // bit-identical to before, pinned by
+    // `golomb_tails_read_back_past_the_old_twenty_bit_cap`.
+    let mut zeros = 0u32;
+    while dec.literal(1) == 0 && zeros < 32 {
+        zeros += 1;
     }
-    let mut x = 1u32;
-    for _ in 1..length {
-        x = (x << 1) | dec.literal(1);
+    let mut x = 1u64;
+    for _ in 0..zeros {
+        x = (x << 1) | dec.literal(1) as u64;
     }
-    Ok(x - 1)
+    // corner-cut: a 33-bit prefix (32 zeros) can only come from a corrupt
+    // stream -- libaom errors at 21 bits and dav1d overflows its own `int`
+    // here. Ceiling: such a level saturates instead of wrapping; upgrade path
+    // is a distinct corrupt-stream error kind once this crate has one.
+    u32::try_from(x - 1).unwrap_or(u32::MAX)
 }
 
 /// `decode_symbol`'s end-of-block position (spec 5.11.39): the inverse of
@@ -1622,7 +1633,7 @@ fn read_coeffs(
             eprintln!("EC_COEFF_STEP tag=sign c={c} sign={} rng={rng}", negative as i32);
         }
         let level = if level.abs_diff(0) as i32 > MAX_BR_LEVEL {
-            let g = read_golomb(dec)?;
+            let g = read_golomb(dec);
             if trace {
                 eprintln!("TRACE golomb pos={pos} value={g}");
             }
@@ -1712,7 +1723,7 @@ fn read_coeffs_rect(
             dec.literal(1) == 1
         };
         let level = if level.abs_diff(0) as i32 > MAX_BR_LEVEL {
-            let g = read_golomb(dec)?;
+            let g = read_golomb(dec);
             level + g as i32
         } else {
             level
@@ -13683,6 +13694,35 @@ mod tests {
     fn leaf8_straddle_sizes_round_trip_bit_exact_against_the_encoder_reconstruction() {
         for (w, h) in [(40usize, 32usize), (640, 360)] {
             round_trips(w, h, &crate::intra::KEY_FRAME_MODES);
+        }
+    }
+
+    /// lane-scaledref r1: the gate for lifting
+    /// "a Golomb tail longer than this decoder reads". The old reader refused
+    /// every tail with twenty or more leading zeros (libaom's own
+    /// `read_golomb` calls that a corrupt frame; dav1d reads up to 32), so the
+    /// values above `1 << 19` -- reachable levels at high bit depths -- came
+    /// back as an `unsupported` error rather than as themselves. Written by
+    /// the spec's own writer ([`crate::tile::write_golomb`], the exact inverse
+    /// of the syntax) and read back through the reader that decodes real
+    /// streams: both the smallest and the largest value carrying each prefix
+    /// length, so a cap left one bit either way fails here.
+    #[test]
+    fn golomb_tails_read_back_past_the_old_twenty_bit_cap() {
+        use crate::msac::SymbolEncoder;
+        for zeros in 0u32..=31 {
+            for value in [(1u64 << zeros) - 1, (1u64 << (zeros + 1)) - 2] {
+                let value = u32::try_from(value).expect("the tail's value is a u32");
+                let mut enc = SymbolEncoder::new();
+                crate::tile::write_golomb(&mut enc, value);
+                let data = enc.finish();
+                let mut dec = SymbolDecoder::new(&data);
+                assert_eq!(
+                    read_golomb(&mut dec),
+                    value,
+                    "the tail of value {value} ({zeros} leading zeros)"
+                );
+            }
         }
     }
 
