@@ -420,6 +420,12 @@ pub(crate) struct Cdfs {
     /// The two motion vector components' own tables: separate owned state,
     /// since spec 8.3.2 adapts one component without touching the other.
     pub mv_comp: [MvComponentCdfs; 2],
+    /// libaom's `ndvc` (`av1_init_mv_probs`): the block-vector MV context an
+    /// intrabc block reads (spec's `MV_INTRABC_CONTEXT`). Same spec-8.4
+    /// defaults as [`Self::mv_joint`]/[`Self::mv_comp`], separate adaptation.
+    pub dv_joint: [u16; 5],
+    /// [`Self::dv_joint`]'s per-component half.
+    pub dv_comp: [MvComponentCdfs; 2],
     /// The `use_filter_intra` flag, indexed by block-size class (`[0]`=4x4,
     /// `[1]`=8x8, `[2]`=16x16, `[3]`=32x32, `[4]`=32x16, `[5]`=16x32) --
     /// see [`cdf::FILTER_INTRA`].
@@ -682,6 +688,10 @@ impl Cdfs {
         reset2(&mut self.ref_mv);
         reset2(&mut self.drl_mode);
         reset1(&mut self.mv_joint);
+        reset1(&mut self.dv_joint);
+        self.dv_comp
+            .iter_mut()
+            .for_each(MvComponentCdfs::reset_counts);
         self.mv_comp
             .iter_mut()
             .for_each(MvComponentCdfs::reset_counts);
@@ -1155,6 +1165,8 @@ impl Cdfs {
             drl_mode: cdf::DRL_MODE,
             mv_joint: cdf::MV_JOINT,
             mv_comp: [MvComponentCdfs::new(), MvComponentCdfs::new()],
+            dv_joint: cdf::MV_JOINT,
+            dv_comp: [MvComponentCdfs::new(), MvComponentCdfs::new()],
             filter_intra: cdf::FILTER_INTRA,
             filter_intra_mode: cdf::FILTER_INTRA_MODE,
             tx_size_cat0: cdf::TX_SIZE_CAT0,
