@@ -9460,17 +9460,15 @@ mod tests {
                         msg.contains("unsupported"),
                         "{NAME} failed outright, not a named refusal (seed {seed}): {msg}"
                     );
-                    // r2: `--enable-ab-partitions=0` does NOT stop aomenc
-                    // choosing an SB-level HORZ_A/HORZ_B/VERT_A/VERT_B
-                    // (`partition_w64` value 4-7) even with
-                    // `--min/max-partition-size=32/64` -- a real, separate
-                    // encoder quirk (AB-at-64 is a different, unlanded
-                    // capability, lane-partab's territory is 32x32 and
-                    // below only) discovered live this round, not this
-                    // lane's HORZ/VERT gap. Only NONE/SPLIT/HORZ/VERT
-                    // (values 0-3) are this gate's territory; a real
-                    // HORZ/VERT (1/2) must still decode pixel-exact, which
-                    // `sb_rect_hits() > 0` below hard-proves.
+                    // r5: the four SB-level AB arms (`partition_w64` 4-7)
+                    // decode since this round, so the only partition refusal
+                    // left at 64x64 is the 1:4 pair (values 8/9, four
+                    // 64x16/16x64 strips, whose luma TX_64X16 this decoder
+                    // has no transform for); the refusals this loop actually
+                    // counts on these fixtures are the pre-existing
+                    // screen-content-palette strip one. Every refusal is
+                    // named, so a genuine decode failure still fails the
+                    // assert above rather than skipping.
                     named_refusals += 1;
                     eprintln!("seed {seed} refusal: {msg}");
                     continue;
@@ -9621,17 +9619,15 @@ mod tests {
                         msg.contains("unsupported"),
                         "{NAME} failed outright, not a named refusal (seed {seed}): {msg}"
                     );
-                    // r2: `--enable-ab-partitions=0` does NOT stop aomenc
-                    // choosing an SB-level HORZ_A/HORZ_B/VERT_A/VERT_B
-                    // (`partition_w64` value 4-7) even with
-                    // `--min/max-partition-size=32/64` -- a real, separate
-                    // encoder quirk (AB-at-64 is a different, unlanded
-                    // capability, lane-partab's territory is 32x32 and
-                    // below only) discovered live this round, not this
-                    // lane's HORZ/VERT gap. Only NONE/SPLIT/HORZ/VERT
-                    // (values 0-3) are this gate's territory; a real
-                    // HORZ/VERT (1/2) must still decode pixel-exact, which
-                    // `sb_rect_hits() > 0` below hard-proves.
+                    // r5: the four SB-level AB arms (`partition_w64` 4-7)
+                    // decode since this round, so the only partition refusal
+                    // left at 64x64 is the 1:4 pair (values 8/9, four
+                    // 64x16/16x64 strips, whose luma TX_64X16 this decoder
+                    // has no transform for); the refusals this loop actually
+                    // counts on these fixtures are the pre-existing
+                    // screen-content-palette strip one. Every refusal is
+                    // named, so a genuine decode failure still fails the
+                    // assert above rather than skipping.
                     named_refusals += 1;
                     eprintln!("seed {seed} refusal: {msg}");
                     continue;
@@ -9661,14 +9657,18 @@ mod tests {
             matched > 0,
             "{NAME}: every attempt refused; the gate never decoded a stream"
         );
-        assert!(
-            crate::decode::sb_ab_hits() > 0,
-            "{NAME}: zero superblock-level AB blocks fired ({matched} matches, \
-             {named_refusals} refusals out of {n_attempts}) -- gate proved nothing this run"
-        );
+        let arms = crate::decode::sb_ab_hits_by_arm();
+        for (i, name) in ["HORZ_A", "HORZ_B", "VERT_A", "VERT_B"].iter().enumerate() {
+            assert!(
+                arms[i] > 0,
+                "{NAME}: zero superblock-level PARTITION_{name} blocks fired (arms={arms:?}, \
+                 {matched} matches, {named_refusals} refusals out of {n_attempts}) -- that arm \
+                 proved nothing this run"
+            );
+        }
         eprintln!(
             "{NAME}: {named_refusals} named refusals, {matched} pixel-exact matches out of \
-             {n_attempts}, sb_ab_hits={}",
+             {n_attempts}, sb_ab_hits={} arms(HORZ_A,HORZ_B,VERT_A,VERT_B)={arms:?}",
             crate::decode::sb_ab_hits()
         );
     }
