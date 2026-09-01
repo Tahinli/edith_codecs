@@ -914,6 +914,19 @@ pub(crate) fn palette_hits() -> usize {
     PALETTE_HITS.with(|c| c.get())
 }
 
+// lane-tiles r12: of those, how many sat at their own TILE's left column --
+// exactly the blocks whose palette cache/ctx must NOT see the previous tile's
+// colours (`av1_get_palette_cache`'s `xd->left_mbmi == NULL`). A multi-tile
+// palette gate that never hits one proves nothing about the tile guard.
+thread_local! {
+    static PALETTE_TILE_LEFT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`PALETTE_TILE_LEFT_HITS`].
+pub(crate) fn palette_tile_left_hits() -> usize {
+    PALETTE_TILE_LEFT_HITS.with(|c| c.get())
+}
+
 // lane-palette2 r1: as [`PALETTE_HITS`], for a real (nonzero-size) chroma
 // palette use -- proves a stream actually reconstructed UV palette pixels,
 // not just read and refused the `palette_uv_mode` symbol.
@@ -5104,8 +5117,15 @@ fn read_intra_mode(
     // matched bit-exact, then `eob_pt` read 5 instead of 6, because this
     // symbol's bits were never consumed).
     let mut filter_intra = None;
+    // lane-tiles r12: `av1_filter_intra_allowed` (blockd.h) also requires
+    // `mbmi->palette_mode_info.palette_size[0] == 0` -- libaom writes NO
+    // `use_filter_intra` symbol for a Y-palette block, and reading one here
+    // desynced every screen-content stream from the first palette block on
+    // (it surfaced as a bogus "partition below 8x8" refusal further down the
+    // tile).
     if mode == DC_PRED
         && enable_filter_intra
+        && palette_y_pending.is_none()
         && let Some(class) = filter_intra_size_class(side)
     {
         let use_filter_intra = dec.symbol(&mut cdfs.filter_intra[class]) != 0;
@@ -5688,6 +5708,7 @@ fn decode_block(
     let (px, py) = (c * SUB, r * SUB);
     let (palette_ctx, palette_cache) = neighbours.palette_ctx_and_cache(at);
     let palette_uv_cache = neighbours.palette_uv_cache(at);
+    let at_tile_left = c == neighbours.tile_col0_mi / (SUB / MI);
     let (skip, mode, angle_delta_y, uv_mode, angle_delta_uv, alpha, filter_intra, palette_y, palette_uv) =
         read_intra_mode(
             dec,
@@ -5705,6 +5726,9 @@ fn decode_block(
             r * (SUB / MI),
             c * (SUB / MI),
         )?;
+    if at_tile_left && palette_y.is_some() {
+        PALETTE_TILE_LEFT_HITS.with(|c| c.set(c.get() + 1));
+    }
     let intrabc_dv = INTRABC_DV.with(|c| c.take());
     // libaom `parse_decode_block`: an intrabc block is `inter_block_tx`, so
     // under `TX_MODE_SELECT` its transform size comes from the inter var-tx

@@ -11145,6 +11145,12 @@ mod tests {
         bit_depth: usize,
         frame_count: usize,
         extra: &[&str],
+        // lane-tiles r12: the palette arm's own override proof. `true` asserts,
+        // per attempt, that the arm's `--tune-content=screen --enable-palette=1`
+        // really reached the encoder (frame header `allow_screen_content_tools`)
+        // AND that a palette block fired at a TILE's left column -- the exact
+        // block whose colour cache must not see the previous tile's colours.
+        require_tile_left_palette: bool,
         // `None` = the shared `gradients_source`. The palette arm overrides it
         // with `smptebars`, the flat few-colour source the existing palette
         // gates use -- gradients never make aomenc pick a palette block.
@@ -11268,6 +11274,19 @@ mod tests {
                     let header = match &obu.kind {
                         ObuKind::Frame(h, _) => h,
                         ObuKind::FrameHeader(h) => h,
+                        // lane-tiles r12: prove the base recipe's tools-on
+                        // flags arrived (a repeated aomenc `--enable-*` keeps
+                        // the LAST occurrence -- measured, see the report --
+                        // so a per-arm override must not silently vanish).
+                        ObuKind::SequenceHeader(seq) => {
+                            assert!(
+                                seq.enable_cdef && seq.enable_restoration,
+                                "{name}: --enable-cdef=1 --enable-restoration=1 did not reach                                  aomenc (seq enable_cdef={} enable_restoration={}, seed {seed})",
+                                seq.enable_cdef,
+                                seq.enable_restoration
+                            );
+                            continue;
+                        }
                         _ => continue,
                     };
                     // A `show_existing_frame` header codes no tile info at all
@@ -11277,6 +11296,12 @@ mod tests {
                     // carries no tiling.
                     if header.show_existing_frame {
                         continue;
+                    }
+                    if require_tile_left_palette {
+                        assert!(
+                            header.allow_screen_content_tools,
+                            "{name}: --tune-content=screen/--enable-palette=1 did not reach                              aomenc -- allow_screen_content_tools is 0 (seed {seed})"
+                        );
                     }
                     assert_eq!(
                         (header.tile_info.cols * header.tile_info.rows) as usize,
@@ -11292,6 +11317,7 @@ mod tests {
             }
 
             let before = crate::decode::tile_hits();
+            let pal_before = crate::decode::palette_tile_left_hits();
             let frames = match decode_stream(&stream) {
                 Err(e) => {
                     let msg = e.to_string();
@@ -11330,6 +11356,15 @@ mod tests {
                 assert_eq!(got.u, want.u, "{name} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{name} frame {i} V vs ffmpeg (seed {seed})");
             }
+            if require_tile_left_palette {
+                let pal = crate::decode::palette_tile_left_hits() - pal_before;
+                assert!(
+                    pal >= 1,
+                    "{name}: this attempt decoded and matched but fired {pal} palette blocks at \
+                     a tile's left column -- the tile-relative palette cache guard is untested \
+                     (seed {seed})"
+                );
+            }
             matched += 1;
         }
         assert!(
@@ -11349,6 +11384,7 @@ mod tests {
             8,
             1,
             &[],
+            false,
             None,
         );
     }
@@ -11362,6 +11398,7 @@ mod tests {
             10,
             1,
             &[],
+            false,
             None,
         );
     }
@@ -11398,6 +11435,7 @@ mod tests {
             // `refusal_inventory.rs`; without these two flags every inter
             // attempt refuses before a single tile edge is compared.
             &["--max-partition-size=32", "--enable-tx-size-search=0"],
+            false,
             None,
         );
     }
@@ -11421,7 +11459,6 @@ mod tests {
     /// `run_multi_tile_gate`'s args, then this arm should reach a palette
     /// block on smptebars with rect/ab off.
     #[test]
-    #[ignore = "r11: refuses on AB-below-16x16 before a palette block reconstructs; extra-flag override needs to precede the base recipe"]
     fn a_real_aomenc_multi_tile_palette_stream_decodes_pixel_exact() {
         const NAME: &str = "a_real_aomenc_multi_tile_palette_stream_decodes_pixel_exact";
         let before = crate::decode::palette_hits();
@@ -11437,6 +11474,7 @@ mod tests {
                 // only"); this arm owns the palette CACHE at a tile edge, so
                 // it takes the square-only path the other palette gates take.
                 "--enable-rect-partitions=0", "--enable-ab-partitions=0"],
+            true,
             Some("smptebars"),
         );
         if have_ffmpeg() && have_aomenc() {
@@ -11463,6 +11501,7 @@ mod tests {
             // `refusal_inventory.rs`; without these two flags every inter
             // attempt refuses before a single tile edge is compared.
             &["--max-partition-size=32", "--enable-tx-size-search=0"],
+            false,
             None,
         );
     }
