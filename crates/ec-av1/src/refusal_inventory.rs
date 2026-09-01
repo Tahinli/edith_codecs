@@ -54,7 +54,7 @@ const REFUSALS: &[&str] = &[
     "a frame OBU with no tile group",
     "a frame naming primary_ref_frame at a reference slot with no saved CDF state",
     "a frame with no mode-info grid",
-    "a frame with segmentation enabled (this decoder never reads a per-block segment_id symbol)",
+    "a frame whose segmentation enables SEG_LVL_REF_FRAME/SKIP/GLOBALMV (this decoder reads segment_id but never lets a segment override a block's reference, skip or mode)",
     "a non-skip rectangular (HORZ/VERT/HORZ_B) strip needs rectangular residual coding",
     "a palette block with a split luma transform (round 1)",
     "a reference frame other than LAST_FRAME (round 2)",
