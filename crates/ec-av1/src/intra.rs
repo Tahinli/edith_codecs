@@ -726,37 +726,45 @@ const FILTER_INTRA_SCALE_BITS: u32 = 4;
 /// though this mode itself never reaches past its own `side` samples of
 /// either edge.
 ///
+/// `bw`x`bh` is the block, not necessarily square (lane-rectsplit r1):
+/// `av1_filter_intra_predictor_c` walks the same 4x2 patches over a
+/// rectangular block, and `av1_filter_intra_allowed_bsize` genuinely offers
+/// this mode on every HORZ/VERT strip whose sides are both <= 32 (16x8,
+/// 8x16, 32x16, 16x32, ...), which the square-only assert refused before.
+///
 /// # Panics
-/// Panics when `dst` is not `side * side` long, or `side` is not a multiple
-/// of 4 (spec `av1_filter_intra_allowed_bsize` never offers this mode past
-/// 32x32, and only on square blocks: 4, 8, 16 or 32).
+/// Panics when `dst` is not `bw * bh` long, or `bw` is not a multiple of 4
+/// or `bh` not a multiple of 2 (spec `av1_filter_intra_allowed_bsize` never
+/// offers this mode past 32x32).
 pub fn predict_filter_intra(
     mode: usize,
     above: Option<&[u16]>,
     left: Option<&[u16]>,
     corner: Option<u16>,
-    side: usize,
+    bw: usize,
+    bh: usize,
     dst: &mut [u16],
 ) {
-    assert_eq!(dst.len(), side * side, "the destination is the block");
-    assert_eq!(side % 4, 0, "filter intra only offers 4/8/16/32");
-    let edges = Edges::build(above, left, corner, side, side);
+    assert_eq!(dst.len(), bw * bh, "the destination is the block");
+    assert_eq!(bw % 4, 0, "filter intra patches are 4 wide");
+    assert_eq!(bh % 2, 0, "filter intra patches are 2 high");
+    let edges = Edges::build(above, left, corner, bw, bh);
     let taps = &FILTER_INTRA_TAPS[mode];
     // A (side+1)-square buffer: row 0 / column 0 hold the corner and the
     // above/left edges, `buffer[r+1][c+1]` the block's own sample at (r, c).
-    let mut buffer = vec![0i32; (side + 1) * (side + 1)];
-    let at = |buffer: &[i32], r: usize, c: usize| buffer[r * (side + 1) + c];
+    let mut buffer = vec![0i32; (bh + 1) * (bw + 1)];
+    let at = |buffer: &[i32], r: usize, c: usize| buffer[r * (bw + 1) + c];
     buffer[0] = edges.above(-1);
-    for c in 0..side {
+    for c in 0..bw {
         buffer[c + 1] = edges.above(c as i32);
     }
-    for r in 0..side {
-        buffer[(r + 1) * (side + 1)] = edges.left(r as i32);
+    for r in 0..bh {
+        buffer[(r + 1) * (bw + 1)] = edges.left(r as i32);
     }
     let mut r = 1;
-    while r < side + 1 {
+    while r < bh + 1 {
         let mut c = 1;
-        while c < side + 1 {
+        while c < bw + 1 {
             let p0 = at(&buffer, r - 1, c - 1);
             let p1 = at(&buffer, r - 1, c);
             let p2 = at(&buffer, r - 1, c + 1);
@@ -769,16 +777,16 @@ pub fn predict_filter_intra(
                 let (r_off, c_off) = (k >> 2, k & 3);
                 let pr: i32 = taps[k].iter().zip(&p).map(|(t, s)| t * s).sum();
                 let value = round2(pr, FILTER_INTRA_SCALE_BITS).clamp(0, crate::decode::sample_max());
-                let idx = (r + r_off) * (side + 1) + c + c_off;
+                let idx = (r + r_off) * (bw + 1) + c + c_off;
                 buffer[idx] = value;
             }
             c += 4;
         }
         r += 2;
     }
-    for row in 0..side {
-        for col in 0..side {
-            dst[row * side + col] = at(&buffer, row + 1, col + 1) as u16;
+    for row in 0..bh {
+        for col in 0..bw {
+            dst[row * bw + col] = at(&buffer, row + 1, col + 1) as u16;
         }
     }
 }
