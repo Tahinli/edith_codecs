@@ -672,8 +672,16 @@ pub fn combine_compound(
     assert_eq!(pred0.len(), pred1.len(), "both refs predict the same block");
     assert_eq!(dst.len(), pred0.len(), "the destination is the block");
     for i in 0..dst.len() {
+        // libaom (`av1_highbd_dist_wtd_convolve_2d_c`, and its lowbd twin)
+        // applies the two shifts SEPARATELY: a truncating `>>
+        // DIST_PRECISION_BITS` on the weighted sum, then `ROUND_POWER_OF_TWO`
+        // by `round_bits == INTER_POST_ROUND`. Folding them into one
+        // `Round2(sum, 8)` is NOT the same function -- it rounds up one LSB
+        // whenever `(sum >> 4) + 8` is one below a multiple of 16 and the
+        // dropped low 4 bits are non-zero.
         let sum = pred0[i] * fwd_weight + pred1[i] * bck_weight;
-        dst[i] = round2(sum, INTER_POST_ROUND + DIST_PRECISION_BITS).clamp(0, crate::decode::sample_max()) as u16;
+        dst[i] = round2(sum >> DIST_PRECISION_BITS, INTER_POST_ROUND)
+            .clamp(0, crate::decode::sample_max()) as u16;
     }
 }
 
