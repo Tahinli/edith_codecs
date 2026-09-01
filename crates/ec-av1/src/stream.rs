@@ -9920,6 +9920,196 @@ mod tests {
         );
     }
 
+    /// lane-sqchroma r1 gate: a plain SQUARE-partition intra key frame with
+    /// REAL chroma (no `hue=s=0` guard) and aomenc's tx-size search left at
+    /// its own DEFAULT (on) -- the combination the user's films hit
+    /// everywhere and that no gate in this file covered: every older recipe
+    /// pins `--enable-tx-size-search=0`, and the one that does not
+    /// (`a_real_aomenc_stream_with_a_split_transform_horz_vert_strip_decodes_pixel_exact`)
+    /// desaturates its fixture. With the search on, RD gives a square block a
+    /// luma transform smaller than its own side while chroma keeps the
+    /// block's single `side/2` transform and its own `uv_mode`-derived
+    /// `tx_type` -- the pair [`crate::decode::sq_chroma_tx_hits`] counts and
+    /// this gate hard-asserts, so a stream whose split-transform blocks all
+    /// landed on `DC_PRED` chroma cannot pass for free.
+    ///
+    /// Sweeps seeds 8-bit and finishes with one 10-bit stream of the same
+    /// recipe (his films are `yuv420p10le`), whose sequence header's
+    /// `bit_depth` is asserted before any pixel is compared. Only a missing
+    /// tool SKIPs: a decode error that is not a named refusal, and every
+    /// pixel mismatch, FAIL.
+    #[test]
+    fn a_real_aomenc_intra_stream_with_tx_size_search_and_chroma_decodes_pixel_exact() {
+        const NAME: &str =
+            "a_real_aomenc_intra_stream_with_tx_size_search_and_chroma_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height) = (192usize, 128usize);
+        // NOTE: no `--enable-tx-size-search=0` (the point of this gate), and
+        // no chroma filter on the fixture (the other point). Square
+        // partitions only: rect/AB/1to4 all off.
+        let base_args: Vec<&str> = vec![
+            "--codec=av1",
+            "--passes=1",
+            "--end-usage=q",
+            "--cpu-used=0",
+            "--threads=1",
+            "--row-mt=0",
+            "--sb-size=64",
+            "--enable-rect-partitions=0",
+            "--enable-ab-partitions=0",
+            "--enable-1to4-partitions=0",
+            "--min-partition-size=16",
+            "--max-partition-size=32",
+            "--enable-restoration=0",
+            "--enable-palette=0",
+            "--deltaq-mode=0",
+            "--enable-intrabc=0",
+            "--limit=1",
+        ];
+        let encode = |y4m: &[u8], extra: &[&str]| -> Vec<u8> {
+            let mut args = base_args.clone();
+            args.extend_from_slice(extra);
+            args.extend_from_slice(&["--obu", "-o", "-", "-"]);
+            let mut child = Command::new(aomenc_path())
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(y4m)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(!out.stdout.is_empty(), "{NAME}: aomenc wrote an empty stream");
+            out.stdout
+        };
+        let render = |source: &str, pix_fmt: &str| -> Vec<u8> {
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v", "error", "-f", "lavfi", "-i", source, "-t", "0.04", "-pix_fmt", pix_fmt,
+                    "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            y4m.stdout
+        };
+        let mut named_refusals = 0u32;
+        let mut matched = 0u32;
+        // Hits counted ONLY over attempts that decoded AND pixel-compared:
+        // a stream that later refuses must not lend its firings to the
+        // assertion below (class refusal-hides-a-defect).
+        let mut firing = 0usize;
+        let n_attempts: u32 = std::env::var("EC_SQCHROMA_GATE_ATTEMPTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10);
+        for attempt in 0..n_attempts {
+            let seed = 42 + attempt;
+            // Two quantisers per seed: the coarse one keeps most blocks on
+            // one transform, the fine one is what actually splits them.
+            let cq = if attempt % 2 == 0 { "--cq-level=20" } else { "--cq-level=40" };
+            let y4m = render(
+                &gradients_source(seed, width, height, "duration=0.04:rate=25"),
+                "yuv420p",
+            );
+            let stream = encode(&y4m, &[cq]);
+            let before = crate::decode::sq_chroma_tx_hits();
+            let frames = match decode_stream(&stream) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME} failed outright, not a named refusal (seed {seed}): {msg}"
+                    );
+                    named_refusals += 1;
+                    continue;
+                }
+                Ok(frames) => frames,
+            };
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
+            assert_eq!(frames.len(), 1, "{NAME}: expected one frame (seed {seed})");
+            assert_eq!(frames[0].y, ffmpeg_frames[0].y, "{NAME} luma vs ffmpeg (seed {seed})");
+            assert_eq!(frames[0].u, ffmpeg_frames[0].u, "{NAME} U vs ffmpeg (seed {seed})");
+            assert_eq!(frames[0].v, ffmpeg_frames[0].v, "{NAME} V vs ffmpeg (seed {seed})");
+            firing += crate::decode::sq_chroma_tx_hits() - before;
+            matched += 1;
+        }
+        // Same recipe, 10-bit: his two films are both yuv420p10le, so the
+        // square+tx-search+chroma claim is only worth anything if it holds
+        // at their bit depth too.
+        let y4m10 = render(
+            &gradients_source(42, width, height, "duration=0.04:rate=25"),
+            "yuv420p10le",
+        );
+        let stream10 = encode(&y4m10, &["--cq-level=20", "--input-bit-depth=10", "--bit-depth=10"]);
+        let mut probe = Av1Parser::new();
+        let mut pos = 0usize;
+        while pos < stream10.len() && probe.sequence_header().is_none() {
+            let obu = probe.parse_obu(&stream10[pos..]).unwrap();
+            pos += obu.total_size;
+        }
+        assert_eq!(
+            probe
+                .sequence_header()
+                .expect("stream has a sequence header OBU")
+                .color_config
+                .bit_depth,
+            10,
+            "{NAME}: aomenc did not actually write a 10-bit sequence header"
+        );
+        let before10 = crate::decode::sq_chroma_tx_hits();
+        let frames10 = match decode_stream(&stream10) {
+            Ok(frames) => frames,
+            Err(e) => panic!("{NAME}: decode_stream refused the 10-bit stream: {e}"),
+        };
+        let ffmpeg10 = ffmpeg_decode_sequence_10bit(&stream10, width, height, 1);
+        assert_eq!(frames10[0].y, ffmpeg10[0].y, "{NAME} luma vs ffmpeg (10-bit)");
+        assert_eq!(frames10[0].u, ffmpeg10[0].u, "{NAME} U vs ffmpeg (10-bit)");
+        assert_eq!(frames10[0].v, ffmpeg10[0].v, "{NAME} V vs ffmpeg (10-bit)");
+        let firing10 = crate::decode::sq_chroma_tx_hits() - before10;
+        firing += firing10;
+        matched += 1;
+        assert!(
+            matched > 1,
+            "{NAME}: every 8-bit attempt refused; the gate decoded only the 10-bit stream"
+        );
+        assert!(
+            firing > 0,
+            "{NAME}: zero square blocks split their luma transform under a non-DC chroma mode \
+             ({matched} matches, {named_refusals} refusals) -- gate proved nothing this run"
+        );
+        eprintln!(
+            "{NAME}: {matched} pixel-exact decodes ({named_refusals} named refusals out of \
+             {n_attempts} 8-bit attempts), split-tx-with-chroma blocks: {firing} \
+             (10-bit stream: {firing10})"
+        );
+    }
+
     /// lane-rectsplit r1 gate (a): a real `aomenc` key frame whose 32x32
     /// quadrants split HORZ/VERT into true 32x16/16x32 strips, with the
     /// tx-size search left at aomenc's own default (ON) -- every sibling
@@ -9963,17 +10153,14 @@ mod tests {
             let y4m = Command::new("ffmpeg")
                 .args([
                     "-v", "error", "-f", "lavfi", "-i", &source,
-                    // Desaturated (`hue=s=0`, the same guard
-                    // `a_real_aomenc_intra_stream_with_tx_select_decodes_pixel_exact`
-                    // uses): with the tx-size search ON, a real chroma
-                    // gradient hits a PRE-EXISTING chroma defect on the plain
-                    // SQUARE path -- measured this round with
-                    // `--enable-rect-partitions=0` on this very recipe, seed
-                    // 42, U plane, i.e. with no rect strip in the stream at
-                    // all. Flat chroma keeps that unrelated defect out of
-                    // this gate (gate-recipe-confound class); it is open
-                    // residue in lanes/rectsplit-r1.report.md, not fixed here.
-                    "-vf", "hue=s=0",
+                    // REAL chroma (lane-sqchroma r1 dropped the `hue=s=0`
+                    // guard this recipe carried): the "PRE-EXISTING square-path
+                    // chroma defect" that guard named does not reproduce at
+                    // HEAD -- seeds 42..61, cq 12/20/32/45, plus testsrc2 and
+                    // mandelbrot, all decode pixel-exact with
+                    // `--enable-rect-partitions=0`, and this gate is green with
+                    // the filter gone. Its own gate is
+                    // `a_real_aomenc_intra_stream_with_tx_size_search_and_chroma_decodes_pixel_exact`.
                     "-pix_fmt", "yuv420p", "-f",
                     "yuv4mpegpipe", "-",
                 ])
@@ -10135,10 +10322,9 @@ mod tests {
             let y4m = Command::new("ffmpeg")
                 .args([
                     "-v", "error", "-f", "lavfi", "-i", &source,
-                    // Same `hue=s=0` guard as gate (a): a real chroma gradient
-                    // under the tx-size search hits a PRE-EXISTING square-path
-                    // chroma defect that has nothing to do with this lane.
-                    "-vf", "hue=s=0",
+                    // Real chroma: the `hue=s=0` guard gate (a) carried is
+                    // gone (lane-sqchroma r1 -- the square-path chroma defect
+                    // it named does not reproduce at HEAD).
                     "-pix_fmt", "yuv420p", "-f", "yuv4mpegpipe", "-",
                 ])
                 .stdin(Stdio::null())
@@ -10335,17 +10521,14 @@ mod tests {
             let y4m = Command::new("ffmpeg")
                 .args([
                     "-v", "error", "-f", "lavfi", "-i", &source,
-                    // Desaturated (`hue=s=0`, the same guard
-                    // `a_real_aomenc_intra_stream_with_tx_select_decodes_pixel_exact`
-                    // uses): with the tx-size search ON, a real chroma
-                    // gradient hits a PRE-EXISTING chroma defect on the plain
-                    // SQUARE path -- measured this round with
-                    // `--enable-rect-partitions=0` on this very recipe, seed
-                    // 42, U plane, i.e. with no rect strip in the stream at
-                    // all. Flat chroma keeps that unrelated defect out of
-                    // this gate (gate-recipe-confound class); it is open
-                    // residue in lanes/rectsplit-r1.report.md, not fixed here.
-                    "-vf", "hue=s=0",
+                    // REAL chroma (lane-sqchroma r1 dropped the `hue=s=0`
+                    // guard this recipe carried): the "PRE-EXISTING square-path
+                    // chroma defect" that guard named does not reproduce at
+                    // HEAD -- seeds 42..61, cq 12/20/32/45, plus testsrc2 and
+                    // mandelbrot, all decode pixel-exact with
+                    // `--enable-rect-partitions=0`, and this gate is green with
+                    // the filter gone. Its own gate is
+                    // `a_real_aomenc_intra_stream_with_tx_size_search_and_chroma_decodes_pixel_exact`.
                     "-pix_fmt", "yuv420p", "-f",
                     "yuv4mpegpipe", "-",
                 ])
