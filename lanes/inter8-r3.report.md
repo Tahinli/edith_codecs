@@ -118,3 +118,21 @@ refusal -- stated as inspection-only, not claimed as exercised.
 EVIDENCE: scratchpad s8.obu sha256 344566f8...8802 / s10.obu sha256 f1a53394...20ce | aomenc 64x64 mandelbrot 4f cq40 cpu0 min=8 max=16 (8- and 10-bit), decoded by ours (EC_TRACE_MODE, decode_probe) and by instrumented aomdec (EC_TRACE_MODE) | EC_MODE range ladders: 8-bit 57/57 agree, 10-bit 41/57, first divergence at the block AFTER leaf mi=(4,14)
 EVIDENCE: same two traces | aomdec patched with EC_MODE_MV (post-assign_mv) + stack= on EC_MODE_VAL, rebuilt (cmake --build . --target aomdec) | leaf (4,14): entry 37004==37004, post-mv 57308==57308, mode/refs/mv0/stack all equal -- divergence is strictly after the mv, in the post-mv mode info aomdec ends at rng 58952
 EVIDENCE: cargo test -p ec-av1 --lib -- 8x8_leaf_split (EC_AV1_REQUIRE_AOMENC=1) | 8-bit gate re-run | 1 passed, 10-bit + tile-columns ignored with their reasons
+
+Suite totals, `EC_AV1_REQUIRE_AOMENC=1 cargo test -p ec-av1 --lib` on 889ca3c:
+**270 passed, 0 failed, 25 ignored** (r2 was 270/0/24; the +1 ignored is the new
+`across_tile_columns` arm). `refusal_inventory` and `gate_coverage` are in that
+green set; no refusal was lifted or narrowed this round, so neither needed an
+edit.
+
+## 5. Two candidate causes ABLATED (neither is it)
+
+- lane-gmaffine `f5e1851` (14 TxbSet arms missing the eob_pt class-1 CDF row):
+  applied to this branch's `cdf.rs`/`cdf_state.rs` and re-measured -- the 10-bit
+  ladder stays **41/57**, byte-identical divergence at the same element. Not
+  this stream's cause; the hunks were reverted so they reach main once through
+  lane-gmaffine.
+- lane-gmaffine `0b8cb54` (leaf single_ref / interp-filter neighbour contexts
+  still read at SUB indices) cherry-picks with a conflict in `decode.rs`, so it
+  is left to lane-gmaffine, which already merged `ae69b25`. It touches exactly
+  the post-mv window this round pinned, and is the standing candidate.
