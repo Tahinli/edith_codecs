@@ -1192,6 +1192,39 @@ impl Reach {
         }
     }
 
+    /// [`Self::of`] for one transform unit of a square block whose transform
+    /// is smaller than itself (libaom `has_top_right`/`has_bottom_left` with
+    /// non-zero `row_off`/`col_off`): interior units answer from the block's
+    /// own geometry, and only a unit on the block's top row (resp. left
+    /// column) reaches the table -- which is the BLOCK's table read at the
+    /// BLOCK's position, never a table row for the transform's size. Letting
+    /// the unit stand in for a block of its own size agrees with libaom for
+    /// the ordinary tables, but the `has_tr_vert_*`/`has_bl_vert_*` pair has
+    /// no 4x4 row at all (`has_tr_vert_tables[BLOCK_4X4]` is NULL), so a TX4
+    /// unit inside an 8x8 square of a `PARTITION_VERT_A`/`_B` panicked on a
+    /// real `--enable-tx-size-search=1` stream (lane-ab16 r2).
+    pub(crate) fn of_tu(
+        block: usize,
+        tx: usize,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+    ) -> Self {
+        let (row_off, col_off) = ((y % block) / tx, (x % block) / tx);
+        let n = block / tx;
+        let (bx, by) = (x - col_off * tx, y - row_off * tx);
+        Self {
+            above_right: y > 0
+                && x + tx < width
+                && (col_off + 1 < n || (row_off == 0 && Self::top_right(block, bx, by))),
+            below_left: x > 0
+                && y + tx < height
+                && col_off == 0
+                && (row_off + 1 < n || Self::bottom_left(block, bx, by)),
+        }
+    }
+
     /// libaom `has_top_right` at block granularity (`row_off`/`col_off` 0,
     /// the transform covering the whole block, luma): everything before the
     /// table lookup is that function's own early-exit ladder.
@@ -1247,6 +1280,13 @@ impl Reach {
     /// non-vert table, which is what [`Reach::of_rect`] already reads.
     pub(crate) fn vert_ab_partition() -> VertAbGuard {
         VertAbGuard(VERT_AB_PARTITION.with(|c| c.replace(true)))
+    }
+
+    /// Whether a `PARTITION_VERT_A`/`_B`'s sub-blocks are being decoded
+    /// right now ([`Self::vert_ab_partition`]'s guard is alive), so a caller
+    /// can count the sub-block work that partition creates.
+    pub(crate) fn in_vert_ab() -> bool {
+        VERT_AB_PARTITION.with(std::cell::Cell::get)
     }
 
     /// Neither, which is all a mode that reads no further than its own edges
@@ -3535,6 +3575,54 @@ mod tests {
         assert_eq!(decoded.y, encoded.reconstruction.y, "854x480: luma");
         assert_eq!(decoded.u, encoded.reconstruction.u, "854x480: U");
         assert_eq!(decoded.v, encoded.reconstruction.v, "854x480: V");
+    }
+
+    /// [`Reach::of_tu`] against libaom's `has_top_right`/`has_bottom_left`
+    /// transform-unit path, for every 4x4 unit of every 8x8 block of a
+    /// superblock, both partition tables:
+    ///
+    /// 1. outside a `PARTITION_VERT_A`/`_B` it must answer exactly what the
+    ///    unit-as-its-own-block `Reach::of(4, ..)` answered before r2, so
+    ///    wiring the TU sites onto it changes no existing stream;
+    /// 2. inside one it must not panic -- `has_tr_vert_tables[BLOCK_4X4]` is
+    ///    NULL in libaom because that lookup never happens, and reading a
+    ///    4x4 row out of the three-row vert tables is what crashed a real
+    ///    `--enable-tx-size-search=1` stream (r2);
+    /// 3. and it must be the BLOCK's vert answer where the two tables
+    ///    disagree: the top-right 4x4 unit of the 8x8 block at superblock
+    ///    row 1, column 0 reads its above-right samples from the 8x8 to its
+    ///    upper right, which a vertical AB partition codes AFTER it
+    ///    (`has_tr_vert_8x8` bit 16 = 0, ordinary `has_tr_8x8` bit 16 = 1).
+    #[test]
+    fn of_tu_keeps_the_ordinary_answer_and_uses_the_block_row_under_vert_ab() {
+        let (w, h) = (SUPERBLOCK * 2, SUPERBLOCK * 2);
+        for y in (0..h).step_by(4) {
+            for x in (0..w).step_by(4) {
+                let tu = Reach::of_tu(8, 4, x, y, w, h);
+                let as_block = Reach::of(4, x, y, w, h);
+                assert_eq!(
+                    (tu.above_right, tu.below_left),
+                    (as_block.above_right, as_block.below_left),
+                    "of_tu(8, 4) at ({x}, {y}) differs from the unit-as-block answer"
+                );
+                // (2): under the vert tables the same lookup must answer at
+                // all rather than index a row that does not exist.
+                let _guard = Reach::vert_ab_partition();
+                let _ = Reach::of_tu(8, 4, x, y, w, h);
+            }
+        }
+        // (3): the disagreeing cell, both ways round.
+        let (x, y) = (4, 8);
+        assert!(
+            Reach::of_tu(8, 4, x, y, SUPERBLOCK, SUPERBLOCK).above_right,
+            "ordinary table: the 8x8 above-right of the block at sb row 1 col 0 is coded first"
+        );
+        let guard = Reach::vert_ab_partition();
+        assert!(
+            !Reach::of_tu(8, 4, x, y, SUPERBLOCK, SUPERBLOCK).above_right,
+            "vert AB: that 8x8 is the partition's own later-coded right half"
+        );
+        drop(guard);
     }
 
     /// `Reach::top_right`/`bottom_left` against a from-scratch transcription
