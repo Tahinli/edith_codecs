@@ -973,6 +973,18 @@ mod tests {
     /// mutex makes firing detection honest again (matches the existing
     /// cdf-forwarding-gate flake shape, ledger `omp-liveness-pgrep-self-match`).
     static GATE_COUNTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Three-bucket gate summary (class [[gate-skips-on-its-own-failure]]):
+    /// every attempt lands in exactly one bucket -- decoded pixel-exact WITH
+    /// the feature counter moving, decoded pixel-exact WITHOUT it, or a named
+    /// refusal -- and the three sum to the attempts made.
+    fn gate_buckets(name: &str, counted_exact: u32, uncounted_exact: u32, named_refusals: usize) {
+        eprintln!(
+            "{name}: buckets counted-exact={counted_exact} uncounted-exact={uncounted_exact} \
+             named-refusals={named_refusals} (attempts {})",
+            counted_exact as usize + uncounted_exact as usize + named_refusals
+        );
+    }
+
     fn lock_gate_counters() -> std::sync::MutexGuard<'static, ()> {
         GATE_COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -3339,6 +3351,7 @@ mod tests {
         }
         let (width, height) = (64usize, 64usize);
         let mut refusals = Vec::new();
+        let mut uncounted_exact = 0u32;
         for attempt in 0..40u32 {
             let seed = 42 + attempt;
             // A flat gradient never has enough local detail for the RD
@@ -3453,11 +3466,16 @@ mod tests {
                     continue;
                 }
             };
-            if decode::tx_depth_hits() == before {
+            // class [[gate-skips-on-its-own-failure]]: a decode that succeeded
+            // is ALWAYS pixel-compared below; the hit counter only decides whether
+            // the attempt counts toward the firing total.
+            let counted = decode::tx_depth_hits() != before;
+            if !counted {
+                uncounted_exact += 1;
                 refusals.push(format!(
-                    "seed {seed}: decoded, but no block resolved a split tx_depth"
+                    "seed {seed}: decoded and pixel-compared, but no block resolved a split \
+                     tx_depth"
                 ));
-                continue;
             }
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
             assert_eq!(
@@ -3466,8 +3484,22 @@ mod tests {
             );
             assert_eq!(frames[0].u, ffmpeg_frames[0].u, "U vs ffmpeg (seed {seed})");
             assert_eq!(frames[0].v, ffmpeg_frames[0].v, "V vs ffmpeg (seed {seed})");
-            return;
+            if counted {
+                gate_buckets(
+                    "a_real_aomenc_intra_stream_with_tx_select_decodes_pixel_exact",
+                    1,
+                    uncounted_exact,
+                    refusals.len() - uncounted_exact as usize,
+                );
+                return;
+            }
         }
+        gate_buckets(
+            "a_real_aomenc_intra_stream_with_tx_select_decodes_pixel_exact",
+            0,
+            uncounted_exact,
+            refusals.len() - uncounted_exact as usize,
+        );
         eprintln!(
             "SKIP a_real_aomenc_intra_stream_with_tx_select_decodes_pixel_exact: every attempt \
              hit a named refusal or never split a transform:\n{}",
@@ -3517,6 +3549,7 @@ mod tests {
         }
         let (width, height, frame_count) = (64usize, 64usize, 4usize);
         let mut refusals = Vec::new();
+        let mut uncounted_exact = 0u32;
         for attempt in 0..40u32 {
             let seed = 42 + attempt;
             // Detail is what makes aomenc's RD prefer a split transform; a
@@ -3654,11 +3687,16 @@ mod tests {
                 decode::txfm_split_reads() - reads_before,
                 decode::txfm_split_hits() - hits_before,
             );
-            if hits == 0 {
+            // class [[gate-skips-on-its-own-failure]]: a decode that succeeded
+            // is ALWAYS pixel-compared below; the hit counter only decides whether
+            // the attempt counts toward the firing total.
+            let counted = hits != 0;
+            if !counted {
+                uncounted_exact += 1;
                 refusals.push(format!(
-                    "seed {seed}: decoded, but no block took a txfm_split ({reads} symbols read)"
+                    "seed {seed}: decoded and pixel-compared, but no block took a txfm_split \
+                     ({reads} symbols read)"
                 ));
-                continue;
             }
             let ffmpeg_frames = if bit_depth == 10 {
                 ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count)
@@ -3706,8 +3744,22 @@ mod tests {
                 assert_eq!(got.u, want.u, "frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "frame {i} V vs ffmpeg (seed {seed})");
             }
-            return;
+            if counted {
+                gate_buckets(
+                    &format!("tx_select_inter_gate({bit_depth})"),
+                    1,
+                    uncounted_exact,
+                    refusals.len() - uncounted_exact as usize,
+                );
+                return;
+            }
         }
+        gate_buckets(
+            &format!("tx_select_inter_gate({bit_depth})"),
+            0,
+            uncounted_exact,
+            refusals.len() - uncounted_exact as usize,
+        );
         panic!(
             "tx_select_inter_gate({bit_depth}) never observed a taken txfm_split:\n{}",
             refusals.join("\n")
@@ -3740,6 +3792,7 @@ mod tests {
         let (width, height) = (64usize, 64usize);
         let mut refusals = Vec::new();
         let mut fired_runs = 0u32;
+        let mut uncounted_exact = 0u32;
         for attempt in 0..40u32 {
             let seed = 42 + attempt;
             let source = format!(
@@ -3829,13 +3882,19 @@ mod tests {
                     continue;
                 }
             };
-            if decode::smooth_luma_hits() == smooth_before {
+            // class [[gate-skips-on-its-own-failure]]: a decode that succeeded
+            // is ALWAYS pixel-compared below; the hit counter only decides whether
+            // the attempt counts toward the firing total.
+            let counted = decode::smooth_luma_hits() != smooth_before;
+            if counted {
+                fired_runs += 1;
+            } else {
+                uncounted_exact += 1;
                 refusals.push(format!(
-                    "seed {seed}: decoded, but no smooth-luma-neighbour block fired"
+                    "seed {seed}: decoded and pixel-compared, but no smooth-luma-neighbour block \
+                     fired"
                 ));
-                continue;
             }
-            fired_runs += 1;
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
             assert_eq!(
                 frames[0].y, ffmpeg_frames[0].y,
@@ -3844,9 +3903,21 @@ mod tests {
             assert_eq!(frames[0].u, ffmpeg_frames[0].u, "U vs ffmpeg (seed {seed})");
             assert_eq!(frames[0].v, ffmpeg_frames[0].v, "V vs ffmpeg (seed {seed})");
             if fired_runs >= 4 {
+                gate_buckets(
+                    "a_real_aomenc_stream_with_smooth_luma_neighbour_decodes_pixel_exact",
+                    fired_runs,
+                    uncounted_exact,
+                    refusals.len() - uncounted_exact as usize,
+                );
                 return;
             }
         }
+        gate_buckets(
+            "a_real_aomenc_stream_with_smooth_luma_neighbour_decodes_pixel_exact",
+            fired_runs,
+            uncounted_exact,
+            refusals.len() - uncounted_exact as usize,
+        );
         assert!(
             fired_runs > 0,
             "every attempt hit a named refusal or never exercised a smooth luma neighbour:\n{}",
@@ -3879,6 +3950,7 @@ mod tests {
         let (width, height) = (64usize, 64usize);
         let mut refusals = Vec::new();
         let mut fired_runs = 0u32;
+        let mut uncounted_exact = 0u32;
         for attempt in 0..40u32 {
             let seed = 42 + attempt;
             let source = format!(
@@ -3955,13 +4027,18 @@ mod tests {
                     continue;
                 }
             };
-            if decode::smooth_uv_hits() == smooth_before {
+            // class [[gate-skips-on-its-own-failure]]: a decode that succeeded
+            // is ALWAYS pixel-compared below; the hit counter only decides whether
+            // the attempt counts toward the firing total.
+            let counted = decode::smooth_uv_hits() != smooth_before;
+            if counted {
+                fired_runs += 1;
+            } else {
+                uncounted_exact += 1;
                 refusals.push(format!(
-                    "seed {seed}: decoded, but no smooth/paeth uv_mode fired"
+                    "seed {seed}: decoded and pixel-compared, but no smooth/paeth uv_mode fired"
                 ));
-                continue;
             }
-            fired_runs += 1;
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
             assert_eq!(
                 frames[0].y, ffmpeg_frames[0].y,
@@ -3970,9 +4047,21 @@ mod tests {
             assert_eq!(frames[0].u, ffmpeg_frames[0].u, "U vs ffmpeg (seed {seed})");
             assert_eq!(frames[0].v, ffmpeg_frames[0].v, "V vs ffmpeg (seed {seed})");
             if fired_runs >= 4 {
+                gate_buckets(
+                    "a_real_aomenc_stream_with_smooth_paeth_chroma_decodes_pixel_exact",
+                    fired_runs,
+                    uncounted_exact,
+                    refusals.len() - uncounted_exact as usize,
+                );
                 return;
             }
         }
+        gate_buckets(
+            "a_real_aomenc_stream_with_smooth_paeth_chroma_decodes_pixel_exact",
+            fired_runs,
+            uncounted_exact,
+            refusals.len() - uncounted_exact as usize,
+        );
         assert!(
             fired_runs > 0,
             "every attempt hit a named refusal or never exercised smooth/paeth chroma:\n{}",
@@ -4007,6 +4096,7 @@ mod tests {
         let (width, height) = (64usize, 64usize);
         let mut refusals = Vec::new();
         let mut fired_runs = 0u32;
+        let mut uncounted_exact = 0u32;
         for attempt in 0..40u32 {
             let seed = 42 + attempt;
             let source = format!(
@@ -4107,16 +4197,20 @@ mod tests {
                     continue;
                 }
             };
-            if decode::directional_uv_hits() == uv_before
-                && decode::angle_delta_hits() == angle_before
-            {
+            // class [[gate-skips-on-its-own-failure]]: a decode that succeeded
+            // is ALWAYS pixel-compared below; the hit counter only decides whether
+            // the attempt counts toward the firing total.
+            let counted = decode::directional_uv_hits() != uv_before
+                || decode::angle_delta_hits() != angle_before;
+            if counted {
+                fired_runs += 1;
+            } else {
+                uncounted_exact += 1;
                 refusals.push(format!(
-                    "seed {seed}: decoded, but neither a directional uv_mode nor a \
-                     nonzero angle delta fired"
+                    "seed {seed}: decoded and pixel-compared, but neither a directional uv_mode \
+                     nor a nonzero angle delta fired"
                 ));
-                continue;
             }
-            fired_runs += 1;
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
             assert_eq!(
                 frames[0].y, ffmpeg_frames[0].y,
@@ -4125,9 +4219,21 @@ mod tests {
             assert_eq!(frames[0].u, ffmpeg_frames[0].u, "U vs ffmpeg (seed {seed})");
             assert_eq!(frames[0].v, ffmpeg_frames[0].v, "V vs ffmpeg (seed {seed})");
             if fired_runs >= 4 {
+                gate_buckets(
+                    "a_real_aomenc_stream_with_directional_chroma_decodes_pixel_exact",
+                    fired_runs,
+                    uncounted_exact,
+                    refusals.len() - uncounted_exact as usize,
+                );
                 return;
             }
         }
+        gate_buckets(
+            "a_real_aomenc_stream_with_directional_chroma_decodes_pixel_exact",
+            fired_runs,
+            uncounted_exact,
+            refusals.len() - uncounted_exact as usize,
+        );
         assert!(
             fired_runs > 0,
             "every attempt hit a named refusal or never exercised directional chroma:\n{}",
@@ -5079,12 +5185,14 @@ mod tests {
                 }
                 Ok(frames) => frames,
             };
-            if decode::non_last_ref_hits() == before {
-                // This seed's RD search never actually picked GOLDEN_FRAME --
-                // a genuine miss, not a refusal. Try the next seed rather
-                // than claiming coverage this attempt did not exercise.
+            // class [[gate-skips-on-its-own-failure]]: a decode that succeeded
+            // is ALWAYS pixel-compared below; the hit counter only decides whether
+            // the attempt counts toward the firing total.
+            // This seed's RD search may never have picked GOLDEN_FRAME -- a
+            // genuine miss, not a refusal, and not a reason to skip the pixels.
+            let counted = decode::non_last_ref_hits() != before;
+            if !counted {
                 never_fired += 1;
-                continue;
             }
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
             assert_eq!(frames.len(), frame_count);
@@ -5105,12 +5213,26 @@ mod tests {
                 assert_eq!(got.u, want.u, "frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "frame {i} V vs ffmpeg (seed {seed})");
             }
-            eprintln!(
-                "FIRING seed {seed}: non_last_ref_hits advanced by {}",
-                decode::non_last_ref_hits() - before
-            );
-            return;
+            if counted {
+                eprintln!(
+                    "FIRING seed {seed}: non_last_ref_hits advanced by {}",
+                    decode::non_last_ref_hits() - before
+                );
+                gate_buckets(
+                    "a_real_aomenc_inter_sequence_with_a_golden_reference_decodes_pixel_exact",
+                    1,
+                    never_fired,
+                    refusals.len(),
+                );
+                return;
+            }
         }
+        gate_buckets(
+            "a_real_aomenc_inter_sequence_with_a_golden_reference_decodes_pixel_exact",
+            0,
+            never_fired,
+            refusals.len(),
+        );
         eprintln!(
             "SKIP a_real_aomenc_inter_sequence_with_a_golden_reference_decodes_pixel_exact: \
              {never_fired} attempts decoded but never fired GOLDEN_FRAME, and every other \
@@ -5260,9 +5382,12 @@ mod tests {
                 }
                 Ok(frames) => frames,
             };
-            if decode::ref_hits(target_ref) == before {
+            // class [[gate-skips-on-its-own-failure]]: a decode that succeeded
+            // is ALWAYS pixel-compared below; the hit counter only decides whether
+            // the attempt counts toward the firing total.
+            let counted = decode::ref_hits(target_ref) != before;
+            if !counted {
                 never_fired += 1;
-                continue;
             }
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
             assert_eq!(frames.len(), frame_count);
@@ -5309,12 +5434,16 @@ mod tests {
                      decode-order frames, {arm_hidden} hidden, all pixel-exact vs the oracle"
                 );
             }
-            eprintln!(
-                "{gate_name} FIRING seed {seed}: {target_ref_name} hits advanced by {}",
-                decode::ref_hits(target_ref) - before
-            );
-            return;
+            if counted {
+                eprintln!(
+                    "{gate_name} FIRING seed {seed}: {target_ref_name} hits advanced by {}",
+                    decode::ref_hits(target_ref) - before
+                );
+                gate_buckets(gate_name, 1, never_fired, refusals.len());
+                return;
+            }
         }
+        gate_buckets(gate_name, 0, never_fired, refusals.len());
         eprintln!(
             "SKIP {gate_name}: {never_fired} attempts decoded but never fired {target_ref_name}, \
              and every other attempt hit a named refusal:\n{}",
@@ -5484,9 +5613,12 @@ mod tests {
                     continue;
                 }
                 Ok(frames) => {
-                    if decode::comp_mode_hits() == before {
+                    // class [[gate-skips-on-its-own-failure]]: a decode that
+                    // succeeded is ALWAYS pixel-compared below; the hit counter
+                    // only decides whether the attempt counts as firing.
+                    let counted = decode::comp_mode_hits() != before;
+                    if !counted {
                         never_fired += 1;
-                        continue;
                     }
                     // Outcome (c): plain COMPOUND_AVERAGE decoded fully --
                     // non-negotiable pixel exactness, no tolerance.
@@ -5546,15 +5678,19 @@ mod tests {
                              decode-order frames, {arm_hidden} hidden, all pixel-exact vs the oracle"
                         );
                     }
-                    eprintln!(
-                        "{NAME} FIRING seed {seed}: comp_mode hits advanced by {}, decoded \
-                         fully and pixel-exact",
-                        decode::comp_mode_hits() - before
-                    );
-                    return;
+                    if counted {
+                        eprintln!(
+                            "{NAME} FIRING seed {seed}: comp_mode hits advanced by {}, decoded \
+                             fully and pixel-exact",
+                            decode::comp_mode_hits() - before
+                        );
+                        gate_buckets(NAME, 1, never_fired, refusals.len());
+                        return;
+                    }
                 }
             }
         }
+        gate_buckets(NAME, 0, never_fired, refusals.len());
         eprintln!(
             "SKIP {NAME}: {never_fired} attempts decoded fully (reference_select never drove a \
              block to COMPOUND_REFERENCE) and every other attempt hit a named refusal that never \
@@ -5693,9 +5829,12 @@ mod tests {
                 }
                 Ok(frames) => frames,
             };
-            if decode::skip_mode_hits() == before {
+            // class [[gate-skips-on-its-own-failure]]: a decode that succeeded
+            // is ALWAYS pixel-compared below; the hit counter only decides whether
+            // the attempt counts toward the firing total.
+            let counted = decode::skip_mode_hits() != before;
+            if !counted {
                 never_fired += 1;
-                continue;
             }
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
             assert_eq!(frames.len(), frame_count);
@@ -5747,12 +5886,16 @@ mod tests {
                      decode-order frames, {arm_hidden} hidden, all pixel-exact vs the oracle"
                 );
             }
-            eprintln!(
-                "{NAME} FIRING seed {seed}: skip_mode hits advanced by {}",
-                decode::skip_mode_hits() - before
-            );
-            return;
+            if counted {
+                eprintln!(
+                    "{NAME} FIRING seed {seed}: skip_mode hits advanced by {}",
+                    decode::skip_mode_hits() - before
+                );
+                gate_buckets(NAME, 1, never_fired, refusals.len());
+                return;
+            }
         }
+        gate_buckets(NAME, 0, never_fired, refusals.len());
         eprintln!(
             "SKIP {NAME}: {never_fired} attempts decoded but never fired skip_mode, and every \
              other attempt hit a named refusal:\n{}",
@@ -5888,9 +6031,12 @@ mod tests {
                 }
                 Ok(frames) => frames,
             };
-            if decode::obmc_hits() == before {
+            // class [[gate-skips-on-its-own-failure]]: a decode that succeeded
+            // is ALWAYS pixel-compared below; the hit counter only decides whether
+            // the attempt counts toward the firing total.
+            let counted = decode::obmc_hits() != before;
+            if !counted {
                 never_fired += 1;
-                continue;
             }
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
             assert_eq!(frames.len(), frame_count);
@@ -5928,12 +6074,16 @@ mod tests {
                      decode-order frames, {arm_hidden} hidden, all pixel-exact vs the oracle"
                 );
             }
-            eprintln!(
-                "{NAME} FIRING seed {seed}: obmc hits advanced by {}",
-                decode::obmc_hits() - before
-            );
-            return;
+            if counted {
+                eprintln!(
+                    "{NAME} FIRING seed {seed}: obmc hits advanced by {}",
+                    decode::obmc_hits() - before
+                );
+                gate_buckets(NAME, 1, never_fired, refusals.len());
+                return;
+            }
         }
+        gate_buckets(NAME, 0, never_fired, refusals.len());
         eprintln!(
             "SKIP {NAME}: {never_fired} attempts decoded but never fired obmc, and every \
              other attempt hit a named refusal:\n{}",
@@ -6098,9 +6248,12 @@ mod tests {
             };
             let fired8 = decode::obmc_hits_8() - before8;
             total_obmc8 += fired8;
-            if fired8 == 0 {
+            // class [[gate-skips-on-its-own-failure]]: a decode that succeeded
+            // is ALWAYS pixel-compared below; the hit counter only decides whether
+            // the attempt counts toward the firing total.
+            let counted = fired8 != 0;
+            if !counted {
                 never_fired += 1;
-                continue;
             }
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
             assert_eq!(frames.len(), frame_count);
@@ -6138,11 +6291,15 @@ mod tests {
                      decode-order frames, {arm_hidden} hidden, all pixel-exact vs the oracle"
                 );
             }
-            eprintln!(
-                "{NAME} FIRING seed {seed}: 8x8 obmc hits {fired8} (total across attempts so far {total_obmc8})"
-            );
-            return;
+            if counted {
+                eprintln!(
+                    "{NAME} FIRING seed {seed}: 8x8 obmc hits {fired8} (total across attempts so far {total_obmc8})"
+                );
+                gate_buckets(NAME, 1, never_fired, refusals.len());
+                return;
+            }
         }
+        gate_buckets(NAME, 0, never_fired, refusals.len());
         eprintln!(
             "SKIP {NAME}: {never_fired} attempts decoded but never fired an 8x8 obmc block \
              ({total_obmc8} total 8x8 obmc hits across all attempts), and every other attempt \
@@ -9227,9 +9384,12 @@ mod tests {
                 }
                 Ok(frames) => frames,
             };
-            if decode::tmv_hits() == before {
+            // class [[gate-skips-on-its-own-failure]]: a decode that succeeded
+            // is ALWAYS pixel-compared below; the hit counter only decides whether
+            // the attempt counts toward the firing total.
+            let counted = decode::tmv_hits() != before;
+            if !counted {
                 never_fired += 1;
-                continue;
             }
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
             assert_eq!(frames.len(), frame_count);
@@ -9257,12 +9417,16 @@ mod tests {
                     "{gate_name} frame {i} V vs ffmpeg (seed {seed})"
                 );
             }
-            eprintln!(
-                "{gate_name} FIRING seed {seed}: tmv_hits advanced by {}",
-                decode::tmv_hits() - before
-            );
-            return;
+            if counted {
+                eprintln!(
+                    "{gate_name} FIRING seed {seed}: tmv_hits advanced by {}",
+                    decode::tmv_hits() - before
+                );
+                gate_buckets(gate_name, 1, never_fired, refusals.len());
+                return;
+            }
         }
+        gate_buckets(gate_name, 0, never_fired, refusals.len());
         eprintln!(
             "SKIP {gate_name}: {never_fired} attempts decoded but never fired a temporal MV \
              candidate, and every other attempt hit a named refusal:\n{}",
@@ -9405,6 +9569,7 @@ mod tests {
         let (width, height) = (64usize, 64usize);
         let mut refusals = Vec::new();
         let mut fired_runs = 0u32;
+        let mut uncounted_exact = 0u32;
         for attempt in 0..60u32 {
             let cq = 20 + (attempt % 5) * 10;
             let period = [4u32, 6, 8, 12, 16][(attempt as usize / 5) % 5];
@@ -9498,11 +9663,16 @@ mod tests {
                     continue;
                 }
             };
-            if decode::tx_class1_hits() == before {
+            // class [[gate-skips-on-its-own-failure]]: a decode that succeeded
+            // is ALWAYS pixel-compared below; the hit counter only decides whether
+            // the attempt counts toward the firing total.
+            let counted = decode::tx_class1_hits() != before;
+            if !counted {
+                uncounted_exact += 1;
                 refusals.push(format!(
-                    "cq={cq} period={period}: decoded, but no block read a V_DCT/H_DCT tx_type"
+                    "cq={cq} period={period}: decoded and pixel-compared, but no block read a \
+                     V_DCT/H_DCT tx_type"
                 ));
-                continue;
             }
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
             assert_eq!(
@@ -9517,11 +9687,25 @@ mod tests {
                 frames[0].v, ffmpeg_frames[0].v,
                 "V vs ffmpeg (cq={cq} period={period})"
             );
-            fired_runs += 1;
-            if fired_runs >= 4 {
-                return;
+            if counted {
+                fired_runs += 1;
+                if fired_runs >= 4 {
+                    gate_buckets(
+                        "a_real_aomenc_min8_stream_with_tx_class1_decodes_pixel_exact",
+                        fired_runs,
+                        uncounted_exact,
+                        refusals.len() - uncounted_exact as usize,
+                    );
+                    return;
+                }
             }
         }
+        gate_buckets(
+            "a_real_aomenc_min8_stream_with_tx_class1_decodes_pixel_exact",
+            fired_runs,
+            uncounted_exact,
+            refusals.len() - uncounted_exact as usize,
+        );
         panic!(
             "fewer than 4 firing+pixel-exact runs out of 60 attempts:\n{}",
             refusals.join("\n")
