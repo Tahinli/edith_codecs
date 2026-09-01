@@ -5470,9 +5470,11 @@ mod tests {
     /// attempt and summed only over attempts that actually decoded AND were
     /// compared, and EACH of the four arms must have fired -- a run where
     /// aomenc's RD only ever picked HORZ_A cannot pass as proof of four
-    /// ([[gate-blind-to-feature]]). 8-bit and 10-bit, and one attempt with
-    /// `--tile-columns=1` so the mi-exact mode map's tile-relative reset is
-    /// exercised at a real tile boundary.
+    /// ([[gate-blind-to-feature]]). 8-bit and 10-bit; `--tile-columns=1` is
+    /// NOT among the attempts (base tile defect, reproducer in the r1
+    /// report), and `--enable-tx-size-search` is left at aomenc's default
+    /// (ON) -- pinning it off hid a panic in the TX4 sub-grid of an 8x8
+    /// square inside a `PARTITION_VERT_A`/`_B` (r2).
     #[test]
     fn a_real_aomenc_stream_with_ab_partitions_below_16x16_decodes_pixel_exact() {
         const NAME: &str =
@@ -5493,6 +5495,11 @@ mod tests {
             cq: u32,
             ten_bit: bool,
             tile_cols: u32,
+            /// Left at aomenc's default (ON) instead of pinned off: reaches
+            /// the TX4 sub-grid of an 8x8 square inside a
+            /// `PARTITION_VERT_A`/`_B` (r2's panic), at the cost of the
+            /// strip-level split transform lane-rectx still refuses.
+            tx_size_search: bool,
         }
         // Recipes chosen by a ~200-cell sweep of {source, size, cq} at this
         // level (r1 report): one cell per arm that is pixel-exact end to end,
@@ -5501,19 +5508,33 @@ mod tests {
         // in the failing superblock, i.e. a base tile defect this lane
         // neither introduced nor owns (reproducer pinned in the r1 report).
         let attempts = [
-            Attempt { src: "yuvtestsrc=size=64x64", w: 64, h: 64, cq: 22, ten_bit: false, tile_cols: 0 },
-            Attempt { src: "rgbtestsrc=size=64x64", w: 64, h: 64, cq: 20, ten_bit: false, tile_cols: 0 },
-            Attempt { src: "rgbtestsrc=size=64x64", w: 64, h: 64, cq: 50, ten_bit: false, tile_cols: 0 },
-            Attempt { src: "mandelbrot=size=64x64:start_x=-1.0", w: 64, h: 64, cq: 14, ten_bit: false, tile_cols: 0 },
+            Attempt { src: "yuvtestsrc=size=64x64", w: 64, h: 64, cq: 22, ten_bit: false, tile_cols: 0, tx_size_search: false },
+            Attempt { src: "rgbtestsrc=size=64x64", w: 64, h: 64, cq: 20, ten_bit: false, tile_cols: 0, tx_size_search: false },
+            Attempt { src: "rgbtestsrc=size=64x64", w: 64, h: 64, cq: 50, ten_bit: false, tile_cols: 0, tx_size_search: false },
+            Attempt { src: "mandelbrot=size=64x64:start_x=-1.0", w: 64, h: 64, cq: 14, ten_bit: false, tile_cols: 0, tx_size_search: false },
             // 10-bit: the only two cells of the sweep that are exact at this
             // depth (HORZ_A and VERT_A); the 10-bit HORZ_B/VERT_B cells all
             // trip the base chroma defect the r1 report pins, so those two
             // arms are proven 8-bit only.
-            Attempt { src: "yuvtestsrc=size=64x64", w: 64, h: 64, cq: 30, ten_bit: true, tile_cols: 0 },
-            Attempt { src: "mandelbrot=size=64x64:start_x=0.4", w: 64, h: 64, cq: 30, ten_bit: true, tile_cols: 0 },
+            Attempt { src: "yuvtestsrc=size=64x64", w: 64, h: 64, cq: 30, ten_bit: true, tile_cols: 0, tx_size_search: false },
+            Attempt { src: "mandelbrot=size=64x64:start_x=0.4", w: 64, h: 64, cq: 30, ten_bit: true, tile_cols: 0, tx_size_search: false },
+            // `--enable-tx-size-search` at aomenc's default: an 8x8 square of
+            // a VERT_A/VERT_B resolves to a 2x2 grid of TX4 units, which is
+            // the reach lookup that had no table row and panicked (r2). These
+            // attempts may legitimately stop at lane-rectx's still-standing
+            // "strip with a split transform" refusal -- an `unsupported`
+            // message is tolerated, a panic or a pixel mismatch is not, and
+            // at least one of them must reach a TX4 unit inside a vertical AB
+            // partition.
+            Attempt { src: "yuvtestsrc=size=64x64", w: 64, h: 64, cq: 55, ten_bit: false, tile_cols: 0, tx_size_search: true },
+            Attempt { src: "yuvtestsrc=size=64x64", w: 64, h: 64, cq: 22, ten_bit: false, tile_cols: 0, tx_size_search: true },
+            Attempt { src: "rgbtestsrc=size=64x64", w: 64, h: 64, cq: 20, ten_bit: false, tile_cols: 0, tx_size_search: true },
+            Attempt { src: "mandelbrot=size=64x64:start_x=-1.0", w: 64, h: 64, cq: 14, ten_bit: false, tile_cols: 0, tx_size_search: true },
         ];
         let mut arms = [0usize; 4];
         let mut compared = 0usize;
+        let mut tx4_reached = 0usize;
+        let mut tx4_compared = 0usize;
         for a in &attempts {
             let desc =
                 format!("{} cq={} {}bit tiles={}", a.src, a.cq, if a.ten_bit { 10 } else { 8 }, a.tile_cols);
@@ -5543,7 +5564,8 @@ mod tests {
                     "--row-mt=0".into(), "--sb-size=64".into(), "--kf-max-dist=0".into(),
                     "--limit=1".into(),
                     "--enable-rect-partitions=1".into(), "--enable-ab-partitions=1".into(),
-                    "--enable-1to4-partitions=0".into(), "--enable-tx-size-search=0".into(),
+                    "--enable-1to4-partitions=0".into(),
+                    format!("--enable-tx-size-search={}", u8::from(a.tx_size_search)),
                     // Filter intra ON a rect strip is a separate, still-refused
                     // predictor; this gate is about the AB partition wiring.
                     "--enable-filter-intra=0".into(),
@@ -5572,8 +5594,27 @@ mod tests {
             assert!(!stream.is_empty(), "{NAME}: {desc}: aomenc wrote an empty stream");
             assert_eq!(stream, encode(), "{NAME}: {desc}: aomenc output is not reproducible");
             let before = crate::decode::ab16_hits_by_arm();
-            let frames = decode_stream(&stream)
-                .unwrap_or_else(|e| panic!("{NAME}: {desc}: decode failed, not a pixel mismatch: {e}"));
+            let tx4_before = crate::decode::vert_ab_tx4_hits();
+            let decoded = decode_stream(&stream);
+            let tx4_this = crate::decode::vert_ab_tx4_hits() - tx4_before;
+            // Counted even when the attempt later stops at another lane's
+            // refusal: reaching this lookup at all is what r2 fixed.
+            tx4_reached += tx4_this;
+            let frames = match decoded {
+                Ok(frames) => frames,
+                // Only lane-rectx's split-transform strip refusal may stop a
+                // tx-size-search attempt; a panic never reaches here at all.
+                Err(e) if a.tx_size_search => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME}: {desc}: decode failed with a non-refusal error: {msg}"
+                    );
+                    eprintln!("{NAME}: {desc} refused after {tx4_this} vert-AB TX4 units: {msg}");
+                    continue;
+                }
+                Err(e) => panic!("{NAME}: {desc}: decode failed, not a pixel mismatch: {e}"),
+            };
             let after = crate::decode::ab16_hits_by_arm();
             let this: Vec<usize> = (0..4).map(|i| after[i] - before[i]).collect();
             eprintln!("{NAME}: {desc} decoded, arms this attempt={this:?}");
@@ -5589,13 +5630,39 @@ mod tests {
                 assert_eq!(got.v, w.v, "{NAME}: {desc} frame {i} V vs ffmpeg");
             }
             // Counted only now: the attempt decoded AND compared exact.
+            if a.tx_size_search {
+                tx4_compared += 1;
+                eprintln!("{NAME}: {desc} pixel-exact, vert-AB TX4 units={tx4_this}");
+                continue;
+            }
             for i in 0..4 {
                 arms[i] += after[i] - before[i];
             }
             compared += 1;
             eprintln!("{NAME}: {desc} pixel-exact");
         }
-        assert_eq!(compared, attempts.len(), "{NAME}: every attempt must decode and compare");
+        assert_eq!(
+            compared,
+            attempts.iter().filter(|a| !a.tx_size_search).count(),
+            "{NAME}: every fixed-transform attempt must decode and compare"
+        );
+        // The tx-size-search attempts cannot be compared pixel by pixel yet:
+        // every 16x16 AB partition contains a strip, and with a free
+        // transform size aomenc splits at least one of them in every stream
+        // of a 40-cell {source, cq} sweep (r2 report), so they all stop at
+        // lane-rectx's "strip with a split transform" refusal (or the 1:4 /
+        // sub-8x8 ones) before the frame is done. What they DO prove is that
+        // the TX4 sub-grid of an 8x8 square inside a VERT_A/VERT_B is reached
+        // on a real stream and answers -- it used to panic there, and a panic
+        // cannot be tolerated by the `unsupported` arm above. The values it
+        // answers are pinned separately against libaom in
+        // `of_tu_keeps_the_ordinary_answer_and_uses_the_block_row_under_vert_ab`.
+        let _ = tx4_compared;
+        assert!(
+            tx4_reached > 0,
+            "{NAME}: no --enable-tx-size-search=1 attempt reached a TX4 unit inside a \
+             vertical AB partition -- the r2 panic path is unproven"
+        );
         for (i, arm) in ["HORZ_A", "HORZ_B", "VERT_A", "VERT_B"].iter().enumerate() {
             assert!(arms[i] > 0, "{NAME}: PARTITION_{arm} at 16x16 never fired across {compared} \
                                   compared streams -- the gate proves nothing about that arm (arms={arms:?})");
