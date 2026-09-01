@@ -177,6 +177,15 @@ pub struct MiGrid {
     cols: usize,
     rows: usize,
     cells: Vec<Option<MiInfo>>,
+    /// lane-gmaffine r2: each mi unit's own switchable-filter symbols
+    /// (`[dir0, dir1]`, `3` = unset/intra). libaom's OBMC neighbour
+    /// prediction (`av1_setup_build_prediction_by_{above,left}_pred`) uses the
+    /// NEIGHBOUR mbmi's `interp_filters`, which is mi-granular; the decoder's
+    /// `Neighbours` filter arrays are 16px-granular and are not written until
+    /// a whole 16x16 finishes, so an 8x8 leaf OBMC-blending its own SIBLING
+    /// leaf read the unset `[3, 3]` sentinel (a hard panic in
+    /// `from_switchable_symbol`).
+    filters: Vec<[u8; 2]>,
     /// lane-tiles r6: the current tile's own mi-unit bounds (spec: an MV
     /// candidate scan never reaches across a tile boundary, mirroring
     /// `PlaneBuf`'s `tile_x0`/`tile_x1` reach clamp for intra prediction).
@@ -195,10 +204,30 @@ impl MiGrid {
             cols,
             rows,
             cells: vec![None; cols * rows],
+            filters: vec![[3u8; 2]; cols * rows],
             tile_row0: 0,
             tile_col0: 0,
             tile_row1: rows,
             tile_col1: cols,
+        }
+    }
+
+    /// Records the switchable-filter symbols of the block covering `(row,
+    /// col)`; `[3, 3]` (the initial value) means "no filter here" -- intra, a
+    /// fixed-filter frame, or a path that does not track one.
+    pub fn set_filter(&mut self, row: usize, col: usize, filter: [u8; 2]) {
+        if row < self.rows && col < self.cols {
+            self.filters[row * self.cols + col] = filter;
+        }
+    }
+
+    /// This mi unit's recorded filter symbols, `[3, 3]` when unset.
+    #[must_use]
+    pub fn filter(&self, row: usize, col: usize) -> [u8; 2] {
+        if row < self.rows && col < self.cols {
+            self.filters[row * self.cols + col]
+        } else {
+            [3, 3]
         }
     }
 
