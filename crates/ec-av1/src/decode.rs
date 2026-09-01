@@ -12395,6 +12395,12 @@ fn decode_inter_block(
                 // per-frame value (spec 5.9.2: coded per frame only when
                 // `seq_force_integer_mv == SELECT_INTEGER_MV`, threaded from
                 // `FrameHeader::force_integer_mv`).
+                // libaom `av1_is_scaled` is `x_scale_fp != REF_NO_SCALE ||
+                // y_scale_fp != REF_NO_SCALE`; the y half is unreachable here
+                // because a reference whose height differs from this frame's
+                // true size is refused before any tile decodes ("a reference
+                // picture whose height does not match this frame's own true
+                // size", ~14681). Whoever lifts that refusal adds the y term.
                 let ref_is_scaled =
                     mc::scale_factor(py_ref.width, frame_width) != mc::REF_NO_SCALE;
                 let proj_ok = num_proj_ref(
