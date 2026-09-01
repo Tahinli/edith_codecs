@@ -4039,7 +4039,7 @@ fn read_intra_mode(
     }
     let skip = dec.symbol(&mut cdfs.skip[skip_ctx]) != 0;
     if trace {
-        eprintln!("TRACE skip value={}", skip as i32);
+        eprintln!("TRACE skip value={} rng={}", skip as i32, dec.debug_state().0);
     }
     istep!("skip", skip as i32);
     // spec order (see the comment below on `read_intrabc_info`): `skip`,
@@ -4073,7 +4073,7 @@ fn read_intra_mode(
     let left_ctx = INTRA_MODE_CTX[left_mode];
     let mode = dec.symbol(&mut cdfs.kf_y_mode[above_ctx][left_ctx]);
     if trace {
-        eprintln!("TRACE y_mode ctx=({above_ctx},{left_ctx}) value={mode}");
+        eprintln!("TRACE y_mode ctx=({above_ctx},{left_ctx}) value={mode} rng={}", dec.debug_state().0);
     }
     istep!("mode", mode as i32);
     let angle_delta_y = if (V_PRED..=D67_PRED).contains(&mode) {
@@ -4095,7 +4095,7 @@ fn read_intra_mode(
         dec.symbol(&mut cdfs.uv_mode_no_cfl[mode])
     };
     if trace {
-        eprintln!("TRACE uv_mode cfl={cfl} y_mode={mode} value={uv_mode}");
+        eprintln!("TRACE uv_mode cfl={cfl} y_mode={mode} value={uv_mode} rng={}", dec.debug_state().0);
     }
     istep!("uv_mode", uv_mode as i32);
     let alpha = if cfl && uv_mode == UV_CFL_PRED {
@@ -4214,7 +4214,7 @@ fn read_intra_mode(
         let use_filter_intra = dec.symbol(&mut cdfs.filter_intra[class]) != 0;
         if trace {
             eprintln!(
-                "TRACE use_filter_intra side={side} value={}",
+                "TRACE use_filter_intra side={side} rng={} value={}", dec.debug_state().0,
                 use_filter_intra as i32
             );
         }
@@ -5483,7 +5483,7 @@ fn read_intra_mode_sub8(
     let trace = std::env::var_os("EC_AV1_TRACE").is_some();
     let skip = dec.symbol(&mut cdfs.skip[skip_ctx]) != 0;
     if trace {
-        eprintln!("TRACE sub8 skip mi=({mi_r},{mi_c}) value={}", skip as i32);
+        eprintln!("TRACE sub8 skip mi=({mi_r},{mi_c}) ctx={skip_ctx} value={} rng={}", skip as i32, dec.debug_state().0);
     }
     maybe_read_cdef_idx(dec, mi_r, mi_c, skip);
     maybe_read_delta_q(dec, cdfs, mi_r, mi_c, false, skip);
@@ -5500,17 +5500,18 @@ fn read_intra_mode_sub8(
     let left_ctx = INTRA_MODE_CTX[left_mode];
     let mode = dec.symbol(&mut cdfs.kf_y_mode[above_ctx][left_ctx]);
     if trace {
-        eprintln!("TRACE sub8 y_mode mi=({mi_r},{mi_c}) ctx=({above_ctx},{left_ctx}) value={mode}");
+        eprintln!("TRACE sub8 y_mode mi=({mi_r},{mi_c}) ctx=({above_ctx},{left_ctx}) value={mode} rng={}", dec.debug_state().0);
     }
-    let angle_delta_y = if (V_PRED..=D67_PRED).contains(&mode) {
-        read_angle_delta(dec, &mut cdfs.angle_delta[mode - V_PRED])
-    } else {
-        0
-    };
+    // No `angle_delta` at all below 8x8: spec 5.11.6's `intra_angle_info_y`/
+    // `_uv` are gated on `MiSize >= BLOCK_8X8` (libaom `av1_use_angle_delta`,
+    // blockd.h), so a directional mode on a `BLOCK_4X4` leaf carries no delta
+    // symbol. Reading one consumed a symbol the encoder never wrote and
+    // desynced the tile at the very next element.
+    let angle_delta_y = 0;
     let chroma = if has_chroma {
         let uv_mode = dec.symbol(&mut cdfs.uv_mode_cfl[mode]);
         if trace {
-            eprintln!("TRACE sub8 uv_mode value={uv_mode}");
+            eprintln!("TRACE sub8 uv_mode value={uv_mode} rng={}", dec.debug_state().0);
         }
         if (9..=12).contains(&uv_mode) {
             SMOOTH_UV_HITS.with(|c| c.set(c.get() + 1));
@@ -5520,12 +5521,11 @@ fn read_intra_mode_sub8(
         } else {
             None
         };
-        let angle_delta_uv = if (V_PRED..=D67_PRED).contains(&uv_mode) {
+        if (V_PRED..=D67_PRED).contains(&uv_mode) {
             DIRECTIONAL_UV_HITS.with(|c| c.set(c.get() + 1));
-            read_angle_delta(dec, &mut cdfs.angle_delta[uv_mode - V_PRED])
-        } else {
-            0
-        };
+        }
+        // See the luma comment above: no angle delta below 8x8.
+        let angle_delta_uv = 0;
         Some((uv_mode, angle_delta_uv, alpha))
     } else {
         None
@@ -5573,7 +5573,10 @@ fn decode_leaf_split4(
     enable_filter_intra: bool,
     allow_intrabc: bool,
     reduced_tx_set: bool,
-) -> Result<usize> {
+    // Returns `(below_mode, right_mode)`: the mode a neighbour BELOW this 8x8
+    // group sees (its bottom-left 4x4, libaom reads mi(row-1, col)) and the
+    // one a neighbour to its RIGHT sees (its top-right 4x4, mi(row, col-1)).
+) -> Result<(usize, usize)> {
     SUB8_SPLIT_HITS.with(|c| c.set(c.get() + 1));
     let (r, c) = outer_at;
     let mut above_mode = neighbours.above_mode[c];
@@ -5612,7 +5615,11 @@ fn decode_leaf_split4(
             neighbours.record_mi_luma(lmi, 4, &vec![0i32; 16]);
         } else {
             let tu_around = neighbours.around_mi(lmi, 4)[0];
-            let tu_skip_ctx = neighbours.luma_skip_ctx(lmi, 1);
+            // A `BLOCK_4X4` leaf's luma TU *is* the whole block, so libaom's
+            // `get_txb_ctx` takes its `plane_bsize == txsize_to_bsize[tx_size]`
+            // branch: `txb_skip_ctx = 0`, never the neighbour-magnitude table
+            // (`txb_common.h:400`). Reading the table here decoded `all_zero`
+            // off the wrong CDF on the very first leaf and desynced the tile.
             let tu_grid = read_plane(
                 dec,
                 cdfs,
@@ -5632,7 +5639,7 @@ fn decode_leaf_split4(
                 base_q_idx,
                 None,
                 filter_intra,
-                Some(tu_skip_ctx),
+                None,
                 smooth_neighbor,
             )?;
             neighbours.record_mi_luma(lmi, 4, &tu_grid);
@@ -5704,7 +5711,7 @@ fn decode_leaf_split4(
             neighbours.above[leaf_mi.1 + cell][2] = v_state;
         }
     }
-    Ok(leaf_modes[3])
+    Ok((leaf_modes[2], leaf_modes[1]))
 }
 
 /// Spec 7.15.3's `Cdef_Directions`: `(row, col)` offsets for the two primary
@@ -7352,11 +7359,38 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                         // the one or two the edge leaves.
                                         let (mi_row0, mi_col0) =
                                             (sr as u32 * SUB_MI, sc as u32 * SUB_MI);
-                                        let mut prev_leaf: Option<((usize, usize), usize)> = None;
+                                        // Each 8x8 leaf's intra-mode context
+                                        // must see its own siblings: the
+                                        // bottom-left leaf's ABOVE neighbour
+                                        // is leaf 0, not the previously
+                                        // decoded leaf 1 (and the bottom-right
+                                        // leaf's above is leaf 1, while
+                                        // `prev_leaf` only ever carried the
+                                        // immediately preceding one). The
+                                        // coarse `above_mode`/`left_mode`
+                                        // arrays hold one slot per 16x16, so
+                                        // the sibling modes are swapped in
+                                        // around each leaf call and restored
+                                        // after; the loop tail writes the last
+                                        // leaf's mode as before.
+                                                                                let mut sib_modes: [Option<(usize, usize)>; 4] = [None; 4];
                                         for i in 0..4 {
                                             let (mr, mc) =
                                                 (mi_row0 + (i / 2) * 2, mi_col0 + (i % 2) * 2);
                                             let leaf_mi = (mr as usize, mc as usize);
+                                            let li = i as usize;
+                                            let saved_modes =
+                                                (neighbours.above_mode[sc], neighbours.left_mode[sr]);
+                                            if li >= 2 {
+                                                if let Some((below, _)) = sib_modes[li - 2] {
+                                                    neighbours.above_mode[sc] = below;
+                                                }
+                                            }
+                                            if li % 2 == 1 {
+                                                if let Some((_, right)) = sib_modes[li - 1] {
+                                                    neighbours.left_mode[sr] = right;
+                                                }
+                                            }
                                             let leaf_ctx = neighbours.partition_ctx_mi(leaf_mi, 8);
                                             let part8 =
                                                 dec.symbol(&mut cdfs.partition_w8[leaf_ctx]);
@@ -7373,7 +7407,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                                     at16,
                                                     leaf_mi,
                                                     (&scan8, &scan4),
-                                                    prev_leaf,
+                                                    None,
                                                     &mut y,
                                                     &mut u,
                                                     &mut v,
@@ -7383,7 +7417,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                                     allow_intrabc,
                                                     tx_select,
                                                     reduced_tx_set,
-                                                )?
+                                                ).map(|m| (m, m))?
                                             } else if part8 == PARTITION_SPLIT {
                                                 decode_leaf_split4(
                                                     &mut dec,
@@ -7392,7 +7426,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                                     at16,
                                                     leaf_mi,
                                                     &scan4,
-                                                    prev_leaf,
+                                                    None,
                                                     &mut y,
                                                     &mut u,
                                                     &mut v,
@@ -7406,11 +7440,15 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                                     "a HORZ/VERT partition below 8x8 (this decoder's transform primitive is square-only; 4x8/8x4 need a real rectangular transform)",
                                                 ));
                                             };
-                                            prev_leaf = Some((leaf_mi, leaf_mode));
+                                            neighbours.above_mode[sc] = saved_modes.0;
+                                            neighbours.left_mode[sr] = saved_modes.1;
+                                            sib_modes[li] = Some(leaf_mode);
                                         }
-                                        if let Some((_, mode)) = prev_leaf {
-                                            neighbours.above_mode[sc] = mode;
-                                            neighbours.left_mode[sr] = mode;
+                                        if let Some((below, _)) = sib_modes[2].or(sib_modes[3]).or(sib_modes[0]) {
+                                            neighbours.above_mode[sc] = below;
+                                        }
+                                        if let Some((_, right)) = sib_modes[1].or(sib_modes[3]).or(sib_modes[0]) {
+                                            neighbours.left_mode[sr] = right;
                                         }
                                         continue;
                                     }
@@ -7444,9 +7482,25 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                         .map(|i| (mi_row0 + (i / 2) * 2, mi_col0 + (i % 2) * 2))
                                         .filter(|&(mr, mc)| mr < mi_rows && mc < mi_cols)
                                         .collect();
-                                    let mut prev_leaf: Option<((usize, usize), usize)> = None;
+                                    // See the sibling-mode note in the clean
+                                    // SPLIT path above.
+                                                                        let mut sib_modes: [Option<(usize, usize)>; 4] = [None; 4];
                                     for (mr, mc) in leaf_positions {
                                         let leaf_mi = (mr as usize, mc as usize);
+                                        let li = (((mr - mi_row0) / 2) * 2 + (mc - mi_col0) / 2)
+                                            as usize;
+                                        let saved_modes =
+                                            (neighbours.above_mode[sc], neighbours.left_mode[sr]);
+                                        if li >= 2 {
+                                            if let Some((below, _)) = sib_modes[li - 2] {
+                                                neighbours.above_mode[sc] = below;
+                                            }
+                                        }
+                                        if li % 2 == 1 {
+                                            if let Some((_, right)) = sib_modes[li - 1] {
+                                                neighbours.left_mode[sr] = right;
+                                            }
+                                        }
                                         let leaf_ctx = neighbours.partition_ctx_mi(leaf_mi, 8);
                                         let part8 = dec.symbol(&mut cdfs.partition_w8[leaf_ctx]);
                                         if std::env::var_os("EC_AV1_TRACE").is_some() {
@@ -7462,7 +7516,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                                 at16,
                                                 leaf_mi,
                                                 (&scan8, &scan4),
-                                                prev_leaf,
+                                                None,
                                                 &mut y,
                                                 &mut u,
                                                 &mut v,
@@ -7472,7 +7526,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                                 allow_intrabc,
                                                 tx_select,
                                                 reduced_tx_set,
-                                            )?
+                                            ).map(|m| (m, m))?
                                         } else if part8 == PARTITION_SPLIT {
                                             decode_leaf_split4(
                                                 &mut dec,
@@ -7481,7 +7535,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                                 at16,
                                                 leaf_mi,
                                                 &scan4,
-                                                prev_leaf,
+                                                None,
                                                 &mut y,
                                                 &mut u,
                                                 &mut v,
@@ -7495,7 +7549,9 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                                 "a HORZ/VERT partition below 8x8 (this decoder's transform primitive is square-only; 4x8/8x4 need a real rectangular transform)",
                                             ));
                                         };
-                                        prev_leaf = Some((leaf_mi, leaf_mode));
+                                        neighbours.above_mode[sc] = saved_modes.0;
+                                        neighbours.left_mode[sr] = saved_modes.1;
+                                        sib_modes[li] = Some(leaf_mode);
                                     }
                                     // `record()`'s `above_mode`/`left_mode`
                                     // write is a no-op at an 8x8 leaf's own
@@ -7503,9 +7559,11 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                     // 16x16 slot's leaves are done, from the
                                     // last leaf (mirrors the writer's r15
                                     // fix).
-                                    if let Some((_, mode)) = prev_leaf {
-                                        neighbours.above_mode[sc] = mode;
-                                        neighbours.left_mode[sr] = mode;
+                                    if let Some((below, _)) = sib_modes[2].or(sib_modes[3]).or(sib_modes[0]) {
+                                        neighbours.above_mode[sc] = below;
+                                    }
+                                    if let Some((_, right)) = sib_modes[1].or(sib_modes[3]).or(sib_modes[0]) {
+                                        neighbours.left_mode[sr] = right;
                                     }
                                 }
                             }
