@@ -235,6 +235,32 @@ impl Edges {
 /// # Panics
 /// Panics on a mode this module does not predict, or when `dst` is not
 /// `bw * bh` long.
+// lane-hbdgates r1: per-tool firing counters for the 10-bit gates. Each tool
+// the coverage table tracks needs its OWN counter -- `smooth_uv_hits` lumps
+// SMOOTH..=PAETH together, so a paeth-only stream would have "proved" smooth
+// intra ([[gate-blind-to-feature]]).
+thread_local! {
+    static SMOOTH_PRED_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PAETH_PRED_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static EDGE_FILTER_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many blocks were predicted with SMOOTH/SMOOTH_V/SMOOTH_H on this thread.
+pub(crate) fn smooth_pred_hits() -> usize {
+    SMOOTH_PRED_HITS.with(|c| c.get())
+}
+
+/// How many blocks were predicted with PAETH_PRED on this thread.
+pub(crate) fn paeth_pred_hits() -> usize {
+    PAETH_PRED_HITS.with(|c| c.get())
+}
+
+/// How many directional edges [`filter_intra_edge`] actually smoothed
+/// (strength != 0) on this thread -- the `--enable-intra-edge-filter` proof.
+pub(crate) fn intra_edge_filter_hits() -> usize {
+    EDGE_FILTER_HITS.with(|c| c.get())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn predict(
     mode: u8,
@@ -249,6 +275,13 @@ pub fn predict(
     dst: &mut [u16],
 ) {
     assert_eq!(dst.len(), bw * bh, "the destination is the block");
+    match mode {
+        SMOOTH_PRED | SMOOTH_V_PRED | SMOOTH_H_PRED => {
+            SMOOTH_PRED_HITS.with(|c| c.set(c.get() + 1));
+        }
+        PAETH_PRED => PAETH_PRED_HITS.with(|c| c.set(c.get() + 1)),
+        _ => {}
+    }
     let edges = Edges::build(above, left, corner, bw, bh);
     let is_directional = matches!(
         mode,
@@ -410,6 +443,7 @@ fn filter_intra_edge(buf: &mut [i32], strength: i32) {
     if strength == 0 {
         return;
     }
+    EDGE_FILTER_HITS.with(|c| c.set(c.get() + 1));
     const KERNEL: [[i32; 5]; 3] = [[0, 4, 8, 4, 0], [0, 5, 6, 5, 0], [2, 4, 4, 4, 2]];
     let filt = usize::try_from(strength - 1).expect("a filter strength is never negative");
     let sz = buf.len() as i32;
