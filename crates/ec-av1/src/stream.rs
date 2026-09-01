@@ -7458,6 +7458,7 @@ mod tests {
         ] {
             let mut refusals = Vec::new();
             let mut fired_runs = 0u32;
+            let mut split_tx = 0usize;
             for attempt in 0..40u32 {
                 let seed = 300 + attempt;
                 let cq = 6 + (attempt % 4) * 2;
@@ -7556,6 +7557,7 @@ mod tests {
                 let stream = out.stdout;
                 let vert_before = decode::tx4x8_coded_hits();
                 let horz_before = decode::tx8x4_coded_hits();
+                let split_before = decode::rect8_split_tx_hits();
                 let tiles_before = decode::tile_hits();
                 let frames = match decode_stream(&stream) {
                     Ok(frames) => frames,
@@ -7601,6 +7603,7 @@ mod tests {
                     "V vs ffmpeg (seed={seed} cq={cq} depth={bit_depth})"
                 );
                 fired_runs += 1;
+                split_tx += decode::rect8_split_tx_hits() - split_before;
                 if fired_runs >= 4 {
                     break;
                 }
@@ -7610,6 +7613,16 @@ mod tests {
                 "fewer than 4 firing+pixel-exact runs out of 40 attempts \
                  ({width}x{height} depth={bit_depth} tiles={tile_args:?}):\n{}",
                 refusals.join("\n")
+            );
+            // aomenc's default `--enable-tx-size-search=1` makes TX_MODE_SELECT
+            // the frame's tx mode, so every sub-8x8 rect leaf carries a
+            // `tx_depth` symbol; depth 1 (two 4x4 transform units predicted one
+            // after the other) is the half of that path a whole-leaf transform
+            // would silently get wrong, so the gate proves it fired.
+            assert!(
+                split_tx > 0,
+                "no sub-8x8 rect leaf used a split (depth-1) transform in the \
+                 {fired_runs} pixel-exact runs ({width}x{height} depth={bit_depth})"
             );
         }
     }
