@@ -1651,7 +1651,15 @@ fn read_coeffs_rect(
     default_tx_type: TxType,
 ) -> Result<(Vec<i32>, TxType)> {
     let mut grid = vec![0i32; w * h];
+    let entry_rng = dec.debug_state().0;
     let all_zero = dec.symbol(&mut coding.txb_skip[skip_ctx]) == 1;
+    if std::env::var_os("EC_TRACE_COEFF").is_some() {
+        let (rng, _) = dec.debug_state();
+        eprintln!(
+            "EC_COEFF_STEP tag=all_zero_rect w={w} h={h} ctx={skip_ctx} all_zero={} entry={entry_rng} rng={rng}",
+            u8::from(all_zero)
+        );
+    }
     if all_zero {
         return Ok((grid, TxType::DctDct));
     }
@@ -1732,6 +1740,10 @@ fn read_coeffs_rect(
         } else {
             dec.literal(1) == 1
         };
+        if trace {
+            let (rng, _) = dec.debug_state();
+            eprintln!("EC_COEFF_STEP tag=sign_rect pos={pos} sign={} rng={rng}", u8::from(negative));
+        }
         let level = if level.abs_diff(0) as i32 > MAX_BR_LEVEL {
             let g = read_golomb(dec)?;
             level + g as i32
@@ -2684,6 +2696,13 @@ fn filter_intra_size_class_rect(bw: usize, bh: usize) -> Option<usize> {
     match (bw, bh) {
         (32, 16) => Some(4),
         (16, 32) => Some(5),
+        // lane-rectx r3: `av1_filter_intra_allowed_bsize` is "both sides <=
+        // 32", so a 16x8/8x16 strip reads the flag too -- returning `None`
+        // here dropped that symbol on every DC_PRED strip of that size and
+        // desynced the tile (caught against an aomdec EC_TRACE_COEFF ladder:
+        // identical mode/uv_mode values, range 34808 vs the oracle's 40668).
+        (16, 8) => Some(6),
+        (8, 16) => Some(7),
         _ if bw == bh => filter_intra_size_class(bw),
         _ => None,
     }
@@ -3555,7 +3574,10 @@ fn decode_leaf_rect(
 ) -> Result<usize> {
     let _ = base_q_idx;
     if std::env::var_os("EC_AV1_RECTX_TRACE").is_some() {
-        eprintln!("decode_leaf_rect: leaf_mi={leaf_mi:?} bw={bw} bh={bh} outer_at={outer_at:?}");
+        eprintln!(
+            "decode_leaf_rect: leaf_mi={leaf_mi:?} bw={bw} bh={bh} outer_at={outer_at:?} rng={}",
+            dec.debug_state().0
+        );
     }
     let (r, c) = outer_at;
     let mut above_mode = neighbours.above_mode[c];
@@ -13570,6 +13592,36 @@ mod tests {
         );
         assert_eq!(SCAN_8X4, LIBAOM_DEFAULT_SCAN_4X8, "SCAN_8X4 vs libaom default_scan_4x8");
         assert_eq!(SCAN_4X8, LIBAOM_DEFAULT_SCAN_8X4, "SCAN_4X8 vs libaom default_scan_8x4");
+    }
+
+    /// lane-rectx r3: `av1_filter_intra_allowed_bsize` is "both sides <= 32",
+    /// so a DC_PRED 16x8/8x16 strip reads a `use_filter_intra` flag exactly
+    /// like a square 16x16 does. [`filter_intra_size_class_rect`] returned
+    /// `None` at those two sizes, so the symbol was never read and the tile
+    /// desynced from that block on (root-caused against an instrumented
+    /// aomdec `EC_TRACE_COEFF` ladder on a real stream: identical `mode=0`/
+    /// `uv_mode=9` values, our range 34808 vs the oracle's 40668 at the very
+    /// next transform block).
+    ///
+    /// The two rows are ASYMMETRIC (9394 for 16x8, 12551 for 8x16), so this
+    /// pin fails if the pair is ever transposed -- the shape the repo's
+    /// scan tables already carry (`SCAN_8X4` == libaom `default_scan_4x8`).
+    #[test]
+    fn a_rect_strip_below_16x16_reads_its_own_filter_intra_cdf_row() {
+        // `default_filter_intra_cdfs` (entropymode.c), indexed by BLOCK_SIZES_ALL:
+        // [4] = BLOCK_8X16, [5] = BLOCK_16X8, [7] = BLOCK_16X32, [8] = BLOCK_32X16.
+        const LIBAOM_8X16: u16 = 12551;
+        const LIBAOM_16X8: u16 = 9394;
+        let c16x8 = filter_intra_size_class_rect(16, 8).expect("16x8 reads use_filter_intra");
+        let c8x16 = filter_intra_size_class_rect(8, 16).expect("8x16 reads use_filter_intra");
+        assert_ne!(c16x8, c8x16, "the two orientations must not share a CDF row");
+        assert_eq!(cdf::FILTER_INTRA[c16x8][0], LIBAOM_16X8, "16x8 filter_intra row");
+        assert_eq!(cdf::FILTER_INTRA[c8x16][0], LIBAOM_8X16, "8x16 filter_intra row");
+        // The sizes one class up keep their own distinct rows (lane-intradisp).
+        assert_eq!(cdf::FILTER_INTRA[filter_intra_size_class_rect(32, 16).unwrap()][0], 12756);
+        assert_eq!(cdf::FILTER_INTRA[filter_intra_size_class_rect(16, 32).unwrap()][0], 14301);
+        // A size with a side over 32 is genuinely not allowed the flag.
+        assert_eq!(filter_intra_size_class_rect(64, 32), None);
     }
 
     /// `is_uni_comp_ref` (lane-av1comp): a pair is unidirectional exactly
