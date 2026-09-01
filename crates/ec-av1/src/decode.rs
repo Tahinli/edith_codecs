@@ -638,6 +638,21 @@ pub(crate) fn warp_selected_hits() -> usize {
     WARP_SELECTED_HITS.with(|c| c.get())
 }
 
+// lane-cwarp r1: how many COMPOUND_REFERENCE blocks had at least one
+// reference predicted through the per-ref GLOBAL warp (`av1_warp_plane`
+// into the compound intermediate) rather than translationally -- the
+// gate's proof that a `GLOBAL_GLOBALMV` block under a ROTZOOM/AFFINE model
+// really reached [`crate::warp::warp_affine_compound`].
+thread_local! {
+    static COMPOUND_WARP_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`COMPOUND_WARP_HITS`].
+pub(crate) fn compound_warp_hits() -> usize {
+    COMPOUND_WARP_HITS.with(|c| c.get())
+}
+
 // How many blocks decoded `interintra == 1` with the non-wedge blended
 // prediction applied (lane-interintra r1) -- the gate's proof that a
 // stream actually exercised interintra.
@@ -9058,6 +9073,45 @@ fn decode_inter_block(
                 && global_motion[(ref1 - LAST_FRAME) as usize].model != ec_av1_syntax::WarpModel::Translation;
             let (py0, pu0, pv0) = ref_planes(ref0, ref_y, ref_u, ref_v, other_refs)?;
             let (py1, pu1, pv1) = ref_planes(ref1, ref_y, ref_u, ref_v, other_refs)?;
+            // lane-cwarp r1: `is_global_mv_block` (blockd.h:421-429) is
+            // PER REFERENCE SLOT -- mode GLOBAL_GLOBALMV, block >= 8x8, and
+            // THAT slot's own gm model > TRANSLATION. `bw4`/`bh4` come from
+            // the write extent below, so recompute the size bound from
+            // `side` here (the block's own size, what libaom's `bsize`
+            // is).
+            let is_global_mv0 = is_globalmv
+                && side >= 8
+                && global_motion[(ref0 - LAST_FRAME) as usize].model as u8 > 1;
+            let is_global_mv1 = is_globalmv
+                && side >= 8
+                && global_motion[(ref1 - LAST_FRAME) as usize].model as u8 > 1;
+            // libaom `av1_init_warp_params` + `allow_warp`'s
+            // `global_warp_allowed` branch, run once per reference for a
+            // compound block exactly as for a single-ref one (reconinter.c
+            // `build_inter_predictors_8x8_and_bigger` loops over `ref` and
+            // calls `av1_init_warp_params` inside the loop) -- WARPED_CAUSAL
+            // never reaches here (spec 5.11.27 / libaom `read_motion_mode`:
+            // `has_second_ref` returns SIMPLE_TRANSLATION), so the local-warp
+            // arm of `allow_warp` is dead on this path and only the global
+            // one applies. `force_integer_mv` short-circuits
+            // `av1_init_warp_params` before `allow_warp`.
+            let compound_warp = |ref_frame: i8, eligible: bool| {
+                if eligible
+                    && !force_integer_mv
+                    && !global_motion[(ref_frame - LAST_FRAME) as usize].invalid
+                {
+                    crate::warp::global_warp_params(
+                        global_motion[(ref_frame - LAST_FRAME) as usize].params,
+                    )
+                } else {
+                    None
+                }
+            };
+            let warp0 = compound_warp(ref0, is_global_mv0);
+            let warp1 = compound_warp(ref1, is_global_mv1);
+            if warp0.is_some() || warp1.is_some() {
+                COMPOUND_WARP_HITS.with(|c| c.set(c.get() + 1));
+            }
             // spec `get_ref_filter_type`: matches when EITHER of the
             // neighbour's two references equals this block's own ref0 --
             // `above_ref1`/`left_ref1` is the neighbour's real second
@@ -9108,12 +9162,8 @@ fn decode_inter_block(
                             // own gm model > TRANSLATION (IDENTITY excluded
                             // too -- the two-predicate trap, distinct from
                             // `gm_nontrans` above which allows IDENTITY).
-                            is_global_mv0: is_globalmv
-                                && bw4.min(bh4) >= 2
-                                && global_motion[(ref0 - LAST_FRAME) as usize].model as u8 > 1,
-                            is_global_mv1: is_globalmv
-                                && bw4.min(bh4) >= 2
-                                && global_motion[(ref1 - LAST_FRAME) as usize].model as u8 > 1,
+                            is_global_mv0,
+                            is_global_mv1,
                         },
                     );
                 }
@@ -9456,6 +9506,16 @@ fn decode_inter_block(
                 v_filter,
                 &mut inter0_y,
             );
+            // lane-cwarp r1: this reference's own GLOBAL warp replaces the
+            // translational tap (libaom `av1_warp_plane` with
+            // `conv_params->is_compound`); the blend below is unchanged.
+            if let Some(wp) = &warp0 {
+                crate::warp::warp_affine_compound(
+                    wp, &py0.data, py0.true_width as i32, py0.true_height as i32,
+                    py0.width as i32, &mut inter0_y, px as i32, py as i32, side as i32,
+                    side as i32, side as i32, 0, 0,
+                );
+            }
             let mut inter1_y = vec![0i32; side * side];
             mc::predict_compound_intermediate(
                 &py1.data,
@@ -9470,6 +9530,16 @@ fn decode_inter_block(
                 v_filter,
                 &mut inter1_y,
             );
+            // lane-cwarp r1: this reference's own GLOBAL warp replaces the
+            // translational tap (libaom `av1_warp_plane` with
+            // `conv_params->is_compound`); the blend below is unchanged.
+            if let Some(wp) = &warp1 {
+                crate::warp::warp_affine_compound(
+                    wp, &py1.data, py1.true_width as i32, py1.true_height as i32,
+                    py1.width as i32, &mut inter1_y, px as i32, py as i32, side as i32,
+                    side as i32, side as i32, 0, 0,
+                );
+            }
             let mut pred_y = vec![0u16; side * side];
             let mut diffwtd_mask_y = Vec::new();
             // lane-wedge r3: `mask_y` is the DIFFWTD buffer just computed OR
@@ -9505,6 +9575,18 @@ fn decode_inter_block(
                 v_filter,
                 &mut inter0_u,
             );
+            // `av1_init_warp_params` bails when the PLANE's block is
+            // narrower/shorter than 8 (`block_width < 8`), so a 4x4 chroma
+            // block of an 8x8 luma block stays translational.
+            if let Some(wp) = &warp0 {
+                if chroma_side >= 8 {
+                    crate::warp::warp_affine_compound(
+                        wp, &pu0.data, pu0.true_width as i32, pu0.true_height as i32,
+                        pu0.width as i32, &mut inter0_u, cpx as i32, cpy as i32,
+                        chroma_side as i32, chroma_side as i32, chroma_side as i32, 1, 1,
+                    );
+                }
+            }
             let mut inter1_u = vec![0i32; chroma_side * chroma_side];
             mc::predict_compound_intermediate(
                 &pu1.data,
@@ -9519,6 +9601,18 @@ fn decode_inter_block(
                 v_filter,
                 &mut inter1_u,
             );
+            // `av1_init_warp_params` bails when the PLANE's block is
+            // narrower/shorter than 8 (`block_width < 8`), so a 4x4 chroma
+            // block of an 8x8 luma block stays translational.
+            if let Some(wp) = &warp1 {
+                if chroma_side >= 8 {
+                    crate::warp::warp_affine_compound(
+                        wp, &pu1.data, pu1.true_width as i32, pu1.true_height as i32,
+                        pu1.width as i32, &mut inter1_u, cpx as i32, cpy as i32,
+                        chroma_side as i32, chroma_side as i32, chroma_side as i32, 1, 1,
+                    );
+                }
+            }
             let mut pred_u = vec![0u16; chroma_side * chroma_side];
             if let Some(mask_y) = mask_y {
                 mc::blend_masked_compound(
@@ -9549,6 +9643,18 @@ fn decode_inter_block(
                 v_filter,
                 &mut inter0_v,
             );
+            // `av1_init_warp_params` bails when the PLANE's block is
+            // narrower/shorter than 8 (`block_width < 8`), so a 4x4 chroma
+            // block of an 8x8 luma block stays translational.
+            if let Some(wp) = &warp0 {
+                if chroma_side >= 8 {
+                    crate::warp::warp_affine_compound(
+                        wp, &pv0.data, pv0.true_width as i32, pv0.true_height as i32,
+                        pv0.width as i32, &mut inter0_v, cpx as i32, cpy as i32,
+                        chroma_side as i32, chroma_side as i32, chroma_side as i32, 1, 1,
+                    );
+                }
+            }
             let mut inter1_v = vec![0i32; chroma_side * chroma_side];
             mc::predict_compound_intermediate(
                 &pv1.data,
@@ -9563,6 +9669,18 @@ fn decode_inter_block(
                 v_filter,
                 &mut inter1_v,
             );
+            // `av1_init_warp_params` bails when the PLANE's block is
+            // narrower/shorter than 8 (`block_width < 8`), so a 4x4 chroma
+            // block of an 8x8 luma block stays translational.
+            if let Some(wp) = &warp1 {
+                if chroma_side >= 8 {
+                    crate::warp::warp_affine_compound(
+                        wp, &pv1.data, pv1.true_width as i32, pv1.true_height as i32,
+                        pv1.width as i32, &mut inter1_v, cpx as i32, cpy as i32,
+                        chroma_side as i32, chroma_side as i32, chroma_side as i32, 1, 1,
+                    );
+                }
+            }
             let mut pred_v = vec![0u16; chroma_side * chroma_side];
             if let Some(mask_y) = mask_y {
                 mc::blend_masked_compound(
