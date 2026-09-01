@@ -25,6 +25,33 @@ pub const PARTITION_W64: [[u16; 11]; 4] = [
 
 /// `Default_Skip_Cdf` (spec 9.4): indexed by how many of the blocks above
 /// and left were skipped.
+/// `default_txfm_partition_cdf` (entropymode.c): an inter block's
+/// `txfm_split` flag (spec 5.11.17 `read_var_tx_size`), indexed by
+/// `txfm_partition_context` -- `category * 3 + above + left`, 21 contexts.
+pub const TXFM_PARTITION: [[u16; 3]; 21] = [
+    [28581, 32768, 0],
+    [23846, 32768, 0],
+    [20847, 32768, 0],
+    [24315, 32768, 0],
+    [18196, 32768, 0],
+    [12133, 32768, 0],
+    [18791, 32768, 0],
+    [10887, 32768, 0],
+    [11005, 32768, 0],
+    [27179, 32768, 0],
+    [20004, 32768, 0],
+    [11281, 32768, 0],
+    [26549, 32768, 0],
+    [19308, 32768, 0],
+    [14224, 32768, 0],
+    [28015, 32768, 0],
+    [21546, 32768, 0],
+    [14400, 32768, 0],
+    [28165, 32768, 0],
+    [22401, 32768, 0],
+    [16088, 32768, 0],
+];
+
 pub const SKIP: [[u16; 3]; 3] = [[31671, 32768, 0], [16515, 32768, 0], [4576, 32768, 0]];
 
 /// `Default_Intra_Frame_Y_Mode_Cdf` (spec 9.4): the thirteen luma intra
@@ -1428,6 +1455,20 @@ pub const INTER_TX_TYPE_SET3_8: [u16; 3] = [4167, 32768, 0];
 pub const INTER_TX_TYPE_SET2_16: [u16; 13] = [
     770, 2421, 5225, 12907, 15819, 18927, 21561, 24089, 26595, 28526, 30529, 32768, 0,
 ];
+
+/// `Default_Inter_Ext_Tx_Cdf`'s `TX_SET_INTER_1` (`EXT_TX_SET_ALL16`) row for
+/// `TX_4X4` (lane-txselect): the sixteen-symbol transform type of an
+/// `is_inter` 4x4 luma transform when `reduced_tx_set == 0` (libaom
+/// `entropymode.c` `default_inter_ext_tx_cdf[1][TX_4X4]`).
+pub const INTER_TX_TYPE_SET1_4: [u16; 17] = [
+    4458, 5560, 7695, 9709, 13330, 14789, 17537, 20266, 21504, 22848, 23934, 25474, 27727, 28915,
+    30631, 32768, 0,
+];
+
+/// `Default_Inter_Ext_Tx_Cdf`'s `TX_SET_INTER_3` (`EXT_TX_SET_DCT_IDTX`) row
+/// for `TX_4X4` (lane-txselect), the reduced two-symbol counterpart of
+/// [`INTER_TX_TYPE_SET1_4`] (`default_inter_ext_tx_cdf[3][TX_4X4]`).
+pub const INTER_TX_TYPE_SET3_4: [u16; 3] = [16384, 32768, 0];
 
 /// `Default_Inter_Ext_Tx_Cdf`'s `TX_SET_INTER_1` (`EXT_TX_SET_ALL16`) row for
 /// `TX_8X8` (lane-cdffwd2): the full sixteen-symbol transform type of an
@@ -5044,3 +5085,44 @@ pub const INTRA_TX_TYPE_SET1_4: [[u16; 8]; 13] = [
     [277, 4369, 5255, 8905, 16465, 22271, 32768, 0],
     [3409, 5436, 10599, 15599, 19687, 24040, 32768, 0],
 ];
+
+/// The `TX_CLASS_HORIZ`/`TX_CLASS_VERT` siblings of [`EOB_PT_256_LUMA`],
+/// [`EOB_PT_256_CHROMA`], [`EOB_PT_64_CHROMA`] and [`EOB_PT_16_CHROMA`]
+/// (`av1_default_eob_multi{256,64,16}_cdfs[q][plane][1]`, `token_cdfs.h`) --
+/// lane-txselect r2: the class dimension libaom keeps on *every* eob_pt
+/// table. Only 4x4/8x8 luma carried it here, so the first `V_DCT`/`H_DCT`
+/// 16x16 luma TU (a var-tx leaf of a 32x32 inter block, `EXT_TX_SET_
+/// DTT9_IDTX_1DDCT`) read the 2D table and desynced at its `eob`. 32-point
+/// and larger transforms need no sibling: their tx sets (`DCT_IDTX`,
+/// `DCTONLY`) hold no 1D type.
+pub const EOB_PT_256_LUMA_CLASS1_Q0: [u16; 10] =
+    [998, 1850, 2998, 5604, 17341, 19888, 22899, 25583, 32768, 0];
+pub const EOB_PT_256_LUMA_CLASS1_Q1: [u16; 10] =
+    [399, 1019, 1749, 3038, 10444, 15546, 22739, 27294, 32768, 0];
+pub const EOB_PT_256_LUMA_CLASS1: [u16; 10] =
+    [1084, 2358, 3488, 5122, 11483, 18103, 26023, 29799, 32768, 0];
+pub const EOB_PT_256_LUMA_CLASS1_Q3: [u16; 10] =
+    [2453, 4474, 6307, 8777, 16474, 22975, 29000, 31547, 32768, 0];
+
+pub const EOB_PT_256_CHROMA_CLASS1_Q0: [u16; 10] =
+    [2203, 4130, 7435, 10739, 20652, 23681, 25609, 27261, 32768, 0];
+pub const EOB_PT_256_CHROMA_CLASS1_Q1: [u16; 10] =
+    [1674, 3252, 5734, 10159, 22397, 23802, 24821, 30940, 32768, 0];
+pub const EOB_PT_256_CHROMA_CLASS1: [u16; 10] =
+    [6571, 9610, 15516, 21826, 29092, 30829, 31842, 32708, 32768, 0];
+pub const EOB_PT_256_CHROMA_CLASS1_Q3: [u16; 10] =
+    [9998, 17661, 25178, 28097, 31308, 32038, 32403, 32695, 32768, 0];
+
+pub const EOB_PT_64_CHROMA_CLASS1_Q0: [u16; 8] =
+    [1563, 2700, 4876, 10911, 14706, 22480, 32768, 0];
+pub const EOB_PT_64_CHROMA_CLASS1_Q1: [u16; 8] =
+    [1923, 3127, 5867, 9703, 14277, 27100, 32768, 0];
+pub const EOB_PT_64_CHROMA_CLASS1: [u16; 8] =
+    [4034, 6290, 10235, 14982, 21214, 28491, 32768, 0];
+pub const EOB_PT_64_CHROMA_CLASS1_Q3: [u16; 8] =
+    [8726, 12378, 19409, 26450, 30038, 32462, 32768, 0];
+
+pub const EOB_PT_16_CHROMA_CLASS1_Q0: [u16; 6] = [1904, 3354, 7763, 14647, 32768, 0];
+pub const EOB_PT_16_CHROMA_CLASS1_Q1: [u16; 6] = [2497, 4096, 8866, 16993, 32768, 0];
+pub const EOB_PT_16_CHROMA_CLASS1: [u16; 6] = [3192, 5032, 10297, 19755, 32768, 0];
+pub const EOB_PT_16_CHROMA_CLASS1_Q3: [u16; 6] = [7297, 10767, 19273, 28194, 32768, 0];
