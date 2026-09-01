@@ -755,6 +755,27 @@ pub(crate) fn diffwtd_hits() -> usize {
     DIFFWTD_HITS.with(|c| c.get())
 }
 
+// lane-defon r1: how many FORWARD KEYFRAMES were decoded -- a KEY frame coded
+// with `show_frame == 0`, output later by a `show_existing_frame` header
+// (aomenc `--enable-fwd-kf=1 --fwd-kf-dist=N`). Counted from
+// `stream::decode_stream`, which is where the frame header is consumed; the
+// gate's proof that the on-value really reached the bitstream rather than
+// being dropped by the rate control.
+thread_local! {
+    static FWD_KF_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`FWD_KF_HITS`].
+pub(crate) fn fwd_kf_hits() -> usize {
+    FWD_KF_HITS.with(|c| c.get())
+}
+
+/// Records one decoded forward keyframe (see [`FWD_KF_HITS`]).
+pub(crate) fn note_fwd_kf() {
+    FWD_KF_HITS.with(|c| c.set(c.get() + 1));
+}
+
 // How many [`read_tx_size`] reads resolved a `tx_depth` strictly less than
 // the block's own side, across every call on the current thread -- the same
 // before/after counter pattern as [`FILTER_INTRA_HITS`], proving a stream

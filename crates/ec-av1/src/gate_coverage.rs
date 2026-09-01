@@ -236,31 +236,14 @@ const NEVER_EXERCISED_10BIT: &[(&str, &str)] = &[
 /// OFF in every gate that names it (a hard hole -- no stream can carry it) or
 /// merely defaulted (unknown, and unknown is not coverage).
 #[cfg(test)]
-const NEVER_ON_8BIT: &[(&str, &str)] = &[
-    (
-        "enable-fwd-kf",
-        "on in no 8-bit gate: 12 pin =0, 33 default (aomenc's default is off), so forward keyframes are never coded -- lane-defon r1 left this one open: it needs --fwd-kf-dist plus a decoder counter for a KEY frame with show_frame == 0, neither of which exists yet",
-    ),
-];
+const NEVER_ON_8BIT: &[(&str, &str)] = &[];
 
 /// [`DEFAULT_ON_TOOLS`] entries no 10-bit gate spells on, with the reason.
 #[cfg(test)]
 const NEVER_ON_10BIT: &[(&str, &str)] = &[
     (
         "enable-diff-wtd-comp",
-        "on in no 10-bit gate: 1 pinned off, 14 defaulted -- lane-defon r1 closed the 8-bit hole on the masked-compound gate (diffwtd_hits), but that gate has no 10-bit sibling",
-    ),
-    (
-        "enable-fwd-kf",
-        "hole at both depths, see the 8-bit list (3 pinned off, 12 defaulted)",
-    ),
-    (
-        "enable-interintra-wedge",
-        "on in no 10-bit gate: 5 pin =0, 10 default -- wedge interintra masks are exercised at 8 bits only, the shape that cost lane-hbdinter two 10-bit-only defects",
-    ),
-    (
-        "enable-onesided-comp",
-        "on in no 10-bit gate: 5 pinned off, 10 defaulted -- lane-defon r1 closed the 8-bit hole on the interintra gate (uni_comp_hits); the 10-bit compound gates pin it off",
+        "on in no 10-bit gate: 1 pinned off, 14 defaulted -- lane-defon r1 closed the 8-bit hole on the masked-compound gate (diffwtd_hits) and added a 10-bit one-sided-compound gate, but the 10-bit fixture source is `gradients`, whose smooth content never wins a difference-weighted mask (measured 8/8 pixel-exact, diffwtd_hits == 0); it needs a mandelbrot fixture in ten_bit_tool_gate",
     ),
     (
         "multi-tile",
