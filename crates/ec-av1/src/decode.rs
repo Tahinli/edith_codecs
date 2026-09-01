@@ -935,6 +935,69 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+thread_local! {
+    /// The current frame's `mi` grid, kept only while a frame header set
+    /// `allow_intrabc` -- an intrabc block's DV predictor is the ordinary
+    /// MV stack ([`crate::mvstack::find_mv_stack`]) built against
+    /// `INTRA_FRAME`, which needs the neighbour state a key frame otherwise
+    /// never keeps. `(grid, mi_cols, mi_rows)`; `None` on every frame that
+    /// does not allow intrabc (so nothing is paid for it).
+    ///
+    /// corner-cut: only [`decode_block`] (the square path) records into it,
+    /// so a frame mixing intrabc with rect/sub-8x8 leaves would predict off
+    /// an incomplete grid. Ceiling: the DV *value* (never the parse) would
+    /// be wrong there; upgrade = record from the rect/leaf paths too.
+    static INTRABC_MI_GRID: std::cell::RefCell<Option<(crate::mvstack::MiGrid, usize, usize)>> =
+        const { std::cell::RefCell::new(None) };
+    /// The block vector [`read_intra_mode`] just decoded, handed to
+    /// [`decode_block`] off the call stack (same idiom as [`PALETTE_PRED`],
+    /// which the alternative -- a tenth tuple member through every caller --
+    /// already avoids). Always `.take()`n by the block that reads it.
+    static INTRABC_DV: std::cell::Cell<Option<(i32, i32)>> = const { std::cell::Cell::new(None) };
+    /// How many blocks decoded `use_intrabc == 1` -- the gate's hit counter.
+    static INTRABC_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`INTRABC_HITS`].
+pub(crate) fn intrabc_hits() -> usize {
+    INTRABC_HITS.with(|c| c.get())
+}
+
+/// Zeroes [`INTRABC_HITS`] (gate tests call this before a decode).
+pub(crate) fn reset_intrabc_hits() {
+    INTRABC_HITS.with(|c| c.set(0));
+}
+
+/// Records one coded block into [`INTRABC_MI_GRID`]: every block contributes
+/// its size (libaom's `scan_row_mbmi` advances `processed_rows` off any
+/// candidate's `bsize`, ref-match or not), an intrabc one also its DV as an
+/// `INTRA_FRAME` candidate (libaom treats intrabc as `is_inter_block`).
+fn record_intrabc_mi(mi_r: usize, mi_c: usize, n4: usize, dv: Option<(i32, i32)>) {
+    INTRABC_MI_GRID.with(|g| {
+        let mut g = g.borrow_mut();
+        let Some((grid, _, _)) = g.as_mut() else {
+            return;
+        };
+        let info = crate::mvstack::MiInfo {
+            is_inter: dv.is_some(),
+            ref_frame: 0,
+            ref_frame1: None,
+            mv: dv.unwrap_or((0, 0)),
+            mv1: None,
+            is_new_mv: dv.is_some(),
+            is_global_mv0: false,
+            is_global_mv1: false,
+            size: n4,
+            size_h: n4,
+        };
+        for r in mi_r..mi_r + n4 {
+            for c in mi_c..mi_c + n4 {
+                grid.set(r, c, info);
+            }
+        }
+    });
+}
+
 // How many blocks decoded `skip_mode == 1` (lane-av1comp round 14) --
 // proves a real `skip_mode_present` stream actually reached a block that
 // picked it, not just that the frame header bit was set.
@@ -4440,9 +4503,18 @@ fn read_intra_mode(
             eprintln!("TRACE use_intrabc value={}", use_intrabc as i32);
         }
         if use_intrabc {
-            return Err(unsupported(
-                "a block that actually uses intrabc (this decoder never reconstructs one)",
-            ));
+            let dv = read_intrabc_dv(dec, cdfs, mi_r, mi_c, side);
+            if trace {
+                eprintln!("TRACE intrabc dv={dv:?}");
+            }
+            INTRABC_DV.with(|c| c.set(Some(dv)));
+            INTRABC_HITS.with(|c| c.set(c.get() + 1));
+            // spec 5.11.13 / libaom `read_intra_frame_mode_info` returns the
+            // moment `is_intrabc_block`: no y/uv mode, angle delta, palette,
+            // CFL or filter-intra syntax follows. `YMode`/`UVMode` are forced
+            // `DC_PRED` (which is also what the neighbour mode contexts and
+            // the loop filter then see).
+            return Ok((skip, DC_PRED, 0, DC_PRED, 0, None, None, None, None));
         }
     }
     let above_ctx = INTRA_MODE_CTX[above_mode];
@@ -5173,6 +5245,16 @@ fn decode_block(
             r * (SUB / MI),
             c * (SUB / MI),
         )?;
+    let intrabc_dv = INTRABC_DV.with(|c| c.take());
+    // libaom `parse_decode_block`: an intrabc block is `inter_block_tx`, so
+    // under `TX_MODE_SELECT` its transform size comes from the inter var-tx
+    // partition tree (`read_var_tx_size`), a syntax element this decoder has
+    // nowhere -- reading the intra `tx_depth` symbol instead would desync.
+    if intrabc_dv.is_some() && tx_select && !skip {
+        return Err(unsupported(
+            "an intrabc block under TxMode::Select (its transform size is coded by the inter var-tx partition tree, which this decoder never reads)",
+        ));
+    }
     // `predict` panics outside `DC_PRED..=PAETH_PRED` (0..=12); `UV_CFL_PRED`
     // (13) predicts as `DC_PRED` with the [`cfl_scaled`] nudge carrying the
     // actual chroma-from-luma correlation, same as this decoder always did.
@@ -5212,10 +5294,45 @@ fn decode_block(
     } else {
         luma_set
     };
+    let luma_set = if intrabc_dv.is_some() {
+        txbset_for_inter(logical_tx, reduced_tx_set)
+    } else {
+        luma_set
+    };
     let luma_scan = scan_for(coeff_tx_side, scan32, scan16, scan8, scan4);
     let reach = Reach::of(side, px, py, y.width, y.height);
     let (cpx, cpy) = (px / 2, py / 2);
     let chroma_side = side / 2;
+    // spec 7.11.3.4 with `use_intrabc`: the reference is the *current*
+    // frame's own pre-loop-filter reconstruction (all loop filters are off
+    // whenever `allow_intrabc`, frame.rs:194/210/252/272) at the full-pel
+    // block vector, with the BILINEAR kernel libaom forces for intrabc --
+    // luma is a straight copy, chroma lands half-pel whenever the luma DV is
+    // odd, which is exactly what the bilinear taps then interpolate.
+    let intrabc_bufs = intrabc_dv.map(|(dv_row, dv_col)| {
+        let mut yb = vec![0u16; side * side];
+        mc::predict_with_filter(
+            &y.data, y.width, y.true_width, y.true_height,
+            mv_to_q4(px, dv_col, true), mv_to_q4(py, dv_row, true),
+            side, side, mc::InterpFilterKind::Bilinear, &mut yb,
+        );
+        let mut ub = vec![0u16; chroma_side * chroma_side];
+        mc::predict_with_filter(
+            &u.data, u.width, u.true_width, u.true_height,
+            mv_to_q4(cpx, dv_col, false), mv_to_q4(cpy, dv_row, false),
+            chroma_side, chroma_side, mc::InterpFilterKind::Bilinear, &mut ub,
+        );
+        let mut vb = vec![0u16; chroma_side * chroma_side];
+        mc::predict_with_filter(
+            &v.data, v.width, v.true_width, v.true_height,
+            mv_to_q4(cpx, dv_col, false), mv_to_q4(cpy, dv_row, false),
+            chroma_side, chroma_side, mc::InterpFilterKind::Bilinear, &mut vb,
+        );
+        (yb, ub, vb)
+    });
+    if let Some((yb, _, _)) = &intrabc_bufs {
+        PALETTE_PRED.with(|c| *c.borrow_mut() = Some(yb.clone()));
+    }
     // A palette-Y block's own prediction is the reconstructed colour-index
     // map, not `predict()`'s edge-based one -- [`PALETTE_PRED`] carries it
     // to [`PlaneBuf::reconstruct`]'s next call rather than threading a
@@ -5248,6 +5365,13 @@ fn decode_block(
             puv.map.iter().map(|&idx| puv.v_colors[idx as usize]).collect(),
         )
     });
+    // The chroma half of the intrabc prediction rides the same per-plane
+    // override slot the UV-palette buffers do (set fresh before each plane's
+    // own `reconstruct`/`read_plane` call below).
+    let palette_uv_bufs = match &intrabc_bufs {
+        Some((_, ub, vb)) => Some((ub.clone(), vb.clone())),
+        None => palette_uv_bufs,
+    };
     if skip {
         // A skipped block codes no residual syntax at all (spec 5.11.34):
         // straight prediction, on every plane.
@@ -5513,6 +5637,7 @@ fn decode_block(
         logical_tx as u8,
         0,
     );
+    record_intrabc_mi(mi_r, mi_c, side / MI, intrabc_dv);
     Ok(())
 }
 
@@ -6172,6 +6297,21 @@ fn scan_for<'a>(
 /// `tx_size_sqr == TX_16X16` branch ignores `use_reduced_set` once it is past
 /// the `TX_32X32`/reduced-set checks), so only the 8x8 and 4x4 cases have a
 /// second table ([`TxbSet::Luma8Set1`]/[`TxbSet::Luma4Set1`]).
+/// [`txbset_for`], for a block libaom's `is_inter_block` calls inter -- which
+/// an intrabc block is (`blockd.h:373`), so its `tx_type` comes off the
+/// inter `ext_tx` sets, never the mode-indexed intra ones.
+fn txbset_for_inter(tx_px: usize, reduced_tx_set: bool) -> TxbSet {
+    match tx_px {
+        64 => TxbSet::Luma64,
+        32 => TxbSet::Luma32Inter,
+        16 if reduced_tx_set => TxbSet::Luma16Inter,
+        16 => TxbSet::Luma16InterSet1,
+        8 if reduced_tx_set => TxbSet::Luma8Inter,
+        8 => TxbSet::Luma8InterSet1,
+        _ => TxbSet::Luma64,
+    }
+}
+
 fn txbset_for(tx_px: usize, reduced_tx_set: bool) -> TxbSet {
     match tx_px {
         64 => TxbSet::Luma64,
@@ -6994,6 +7134,16 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     }
     ENABLE_EDGE_FILTER.with(|f| f.set(enable_edge_filter));
     let (sb_cols, sb_rows) = (mi_cols.div_ceil(SB_MI), mi_rows.div_ceil(SB_MI));
+    INTRABC_MI_GRID.with(|g| {
+        *g.borrow_mut() = allow_intrabc.then(|| {
+            (
+                crate::mvstack::MiGrid::new(mi_cols as usize, mi_rows as usize),
+                mi_cols as usize,
+                mi_rows as usize,
+            )
+        });
+    });
+    INTRABC_DV.with(|c| c.set(None));
     CDEF_BITS.with(|c| c.set(cdef.bits));
     CDEF_SB_COLS.with(|c| c.set(sb_cols as usize));
     CDEF_IDX_GRID.with(|g| *g.borrow_mut() = vec![0u8; sb_cols as usize * sb_rows as usize]);
@@ -8101,6 +8251,58 @@ fn read_mv(
         diff.1 = read_mv_component(dec, &mut mv_comp[1], allow_high_precision_mv, force_integer_mv);
     }
     (pred.0 + diff.0, pred.1 + diff.1)
+}
+
+/// One intrabc block's block vector (spec 5.11.13 `read_intrabc_info` ->
+/// `assign_mv` with `use_intrabc`, libaom `assign_dv`/`av1_find_ref_dv`).
+///
+/// The predictor is the ordinary MV stack built against `INTRA_FRAME`
+/// (`av1_find_mv_refs(..., INTRA_FRAME, ...)`): `nearestmv`, or `nearmv`
+/// when that is zero, or -- when both are -- the fixed fallback DV one
+/// superblock up, or `INTRABC_DELAY_PIXELS` (256) plus one superblock to the
+/// left when this is the tile's first superblock row. The predictor is then
+/// rounded to full pel, and the difference reads off the *dv* nmv context
+/// (libaom `ndvc`) at full-pel precision (`MV_SUBPEL_NONE`: no `fr`/`hp`
+/// symbols, exactly this decoder's `force_integer_mv` carve-out). No DRL
+/// symbol is coded for a DV, so none of this can move the bitstream
+/// position -- only the reconstructed vector.
+fn read_intrabc_dv(
+    dec: &mut SymbolDecoder,
+    cdfs: &mut Cdfs,
+    mi_r: usize,
+    mi_c: usize,
+    side: usize,
+) -> (i32, i32) {
+    const INTRABC_DELAY_PIXELS: i32 = 256;
+    let n4 = side / MI;
+    let stack_pred = INTRABC_MI_GRID.with(|g| {
+        let g = g.borrow();
+        g.as_ref().map(|(grid, mi_cols, mi_rows)| {
+            let stack = crate::mvstack::find_mv_stack(
+                grid, mi_r, mi_c, n4, n4, 0, /* INTRA_FRAME */
+                *mi_cols, *mi_rows,
+            );
+            if stack.nearest_mv == (0, 0) {
+                stack.near_mv
+            } else {
+                stack.nearest_mv
+            }
+        })
+    });
+    let mut pred = stack_pred.unwrap_or((0, 0));
+    if pred == (0, 0) {
+        // `av1_find_ref_dv` (mvref_common.c). Tile row start is 0 here (the
+        // single-tile-row case every intrabc gate stream is).
+        let sb_px = SB_MI as i32 * MI as i32;
+        pred = if mi_r < SB_MI as usize {
+            (0, -(sb_px + INTRABC_DELAY_PIXELS) * 8)
+        } else {
+            (-sb_px * 8, 0)
+        };
+    }
+    // "Ref DV should not have sub-pel" (`assign_dv`): floor to full pel.
+    let pred = ((pred.0 >> 3) * 8, (pred.1 >> 3) * 8);
+    read_mv(dec, &mut cdfs.dv_comp, &mut cdfs.dv_joint, pred, false, true)
 }
 
 /// A 1/8-pel motion vector component converted to the 1/16-pel offset
