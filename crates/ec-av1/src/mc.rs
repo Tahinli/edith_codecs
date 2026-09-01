@@ -119,8 +119,11 @@ const SUBPEL_FILTERS_SMOOTH_4: [[i32; 8]; 16] = [
     [0, 0, 2, 34, 62, 30, 0, 0],
 ];
 
-/// `Subpel_Filters[EIGHTTAP_SHARP]` (`av1_sub_pel_filters_8sharp`) -- unlike
-/// REGULAR/SMOOTH, spec 7.11.3.4 never swaps this for a narrow-block table.
+/// `Subpel_Filters[EIGHTTAP_SHARP]` (`av1_sub_pel_filters_8sharp`). A block
+/// whose dimension is 4 or less does NOT read this table: spec 7.11.3.4's
+/// `filterIdx` sends both EIGHTTAP and EIGHTTAP_SHARP to filter index 4, and
+/// libaom agrees -- `av1_interp_4tap[MULTITAP_SHARP]` is `av1_sub_pel_filters_4`,
+/// the REGULAR narrow kernel (`filter.h:243`), not a sharp one (lane-gmaffine r5).
 const SUBPEL_FILTERS_SHARP: [[i32; 8]; 16] = [
     [0, 0, 0, 128, 0, 0, 0, 0],
     [-2, 2, -6, 126, 8, -2, 2, 0],
@@ -181,7 +184,7 @@ impl InterpFilterKind {
         match self {
             InterpFilterKind::Regular => (&SUBPEL_FILTERS, &SUBPEL_FILTERS_4),
             InterpFilterKind::Smooth => (&SUBPEL_FILTERS_SMOOTH, &SUBPEL_FILTERS_SMOOTH_4),
-            InterpFilterKind::Sharp => (&SUBPEL_FILTERS_SHARP, &SUBPEL_FILTERS_SHARP),
+            InterpFilterKind::Sharp => (&SUBPEL_FILTERS_SHARP, &SUBPEL_FILTERS_4),
             InterpFilterKind::Bilinear => (&SUBPEL_FILTERS_BILINEAR, &SUBPEL_FILTERS_BILINEAR),
         }
     }
@@ -919,6 +922,35 @@ mod tests {
             &expected_row15,
             "row15 vs aomdec"
         );
+    }
+
+    /// lane-gmaffine r5 root cause: a block 4 or fewer samples wide reads
+    /// `Subpel_Filters[4]` -- the REGULAR narrow kernel -- for BOTH
+    /// `EIGHTTAP` and `EIGHTTAP_SHARP` (spec 7.11.3.4's `filterIdx`, libaom
+    /// `av1_interp_4tap[MULTITAP_SHARP] == av1_sub_pel_filters_4`,
+    /// `filter.h:243`). We used the 8-tap sharp kernel there, which is
+    /// invisible above 4 samples and so only ever bit the 4x4 chroma of an
+    /// 8x8 (or smaller) luma leaf.
+    #[test]
+    fn a_narrow_block_reads_the_regular_four_tap_kernel_under_every_sharpness() {
+        use crate::mc::{SUBPEL_FILTERS_4, SUBPEL_FILTERS_BILINEAR, SUBPEL_FILTERS_SMOOTH_4};
+        for kind in [
+            InterpFilterKind::Regular,
+            InterpFilterKind::Smooth,
+            InterpFilterKind::Sharp,
+            InterpFilterKind::Bilinear,
+        ] {
+            let (wide, narrow) = kind.tables();
+            let want: &[[i32; 8]; 16] = match kind {
+                InterpFilterKind::Regular | InterpFilterKind::Sharp => &SUBPEL_FILTERS_4,
+                InterpFilterKind::Smooth => &SUBPEL_FILTERS_SMOOTH_4,
+                InterpFilterKind::Bilinear => &SUBPEL_FILTERS_BILINEAR,
+            };
+            assert_eq!(narrow, want, "{kind:?}: wrong narrow-block kernel");
+            if kind == InterpFilterKind::Sharp {
+                assert_ne!(wide, narrow, "sharp's wide kernel is not its narrow one");
+            }
+        }
     }
 
     #[test]
