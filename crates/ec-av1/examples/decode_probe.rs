@@ -32,7 +32,23 @@ fn main() {
         Ok(frames) if frames.is_empty() => {
             println!("OK but EMPTY: no frames -- is {path} an IVF rather than a raw OBU stream?");
         }
-        Ok(frames) => println!("OK: {} frames decoded", frames.len()),
+        Ok(frames) => {
+            println!("OK: {} frames decoded", frames.len());
+            // Optional second argument: write the decoded planes as raw
+            // I420 (`ffmpeg -pix_fmt yuv420p -f rawvideo` order), so a
+            // mismatch against ffmpeg's own decode can be located per pixel
+            // without going through a gate.
+            if let Some(out) = std::env::args().nth(2) {
+                let mut raw = Vec::new();
+                for f in &frames {
+                    for plane in [&f.y, &f.u, &f.v] {
+                        raw.extend(plane.iter().map(|&v| v as u8));
+                    }
+                }
+                std::fs::write(&out, raw).expect("writing the raw dump");
+                println!("wrote {out}");
+            }
+        }
         Err(e) => println!("REFUSED: {e}"),
     }
 }
