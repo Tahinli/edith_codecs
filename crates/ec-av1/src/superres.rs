@@ -89,7 +89,16 @@ fn round_power_of_two(sum: i32, bits: u32) -> i32 {
 /// true, replicating the row's own edge pixels rather than sampling a
 /// neighbour tile). `in_width` and `out_width` must both be positive;
 /// `row.len() == in_width` and `out.len() == out_width`.
-pub(crate) fn upscale_row(row: &[u8], real_right_margin: &[u8], out_width: usize, out: &mut [u8]) {
+/// `bit_depth` only picks the output clamp (`clip_pixel`/`clip_pixel_highbd`
+/// in libaom's `av1_convolve_horiz_rs_c`); the filter, its `Round2` and the
+/// edge padding are bit-depth independent (spec 7.16).
+pub(crate) fn upscale_row(
+    row: &[u16],
+    real_right_margin: &[u16],
+    out_width: usize,
+    out: &mut [u16],
+    bit_depth: u32,
+) {
     let in_width = row.len();
     debug_assert!(in_width > 0 && out_width > 0);
     debug_assert_eq!(out.len(), out_width);
@@ -109,7 +118,7 @@ pub(crate) fn upscale_row(row: &[u8], real_right_margin: &[u8], out_width: usize
     // column-by-column against real libaom via `scripts/superres-pin-
     // harness.c`'s `row6-realedgeval` case (r3).
     let pad = UPSCALE_NORMATIVE_TAPS + 2;
-    let mut padded = vec![0u8; in_width + 2 * pad];
+    let mut padded = vec![0u16; in_width + 2 * pad];
     padded[..pad].fill(row[0]);
     padded[pad..pad + in_width].copy_from_slice(row);
     let real_n = real_right_margin.len().min(pad);
@@ -131,7 +140,7 @@ pub(crate) fn upscale_row(row: &[u8], real_right_margin: &[u8], out_width: usize
             let idx = base + int_pel + k as i64;
             sum += padded[idx as usize] as i32 * c as i32;
         }
-        *out_x = round_power_of_two(sum, FILTER_BITS).clamp(0, 255) as u8;
+        *out_x = round_power_of_two(sum, FILTER_BITS).clamp(0, (1 << bit_depth) - 1) as u16;
         x_qn += x_step_qn;
     }
 }
@@ -141,14 +150,15 @@ pub(crate) fn upscale_row(row: &[u8], real_right_margin: &[u8], out_width: usize
 /// spec only widens columns). `rows` is the plane's row-major byte buffer
 /// at `in_width`; returns a new buffer at `out_width`.
 pub(crate) fn upscale_plane(
-    rows: &[u8],
+    rows: &[u16],
     height: usize,
     in_width: usize,
     out_width: usize,
-    margin: Option<(&[u8], usize)>,
-) -> Vec<u8> {
+    margin: Option<(&[u16], usize)>,
+    bit_depth: u32,
+) -> Vec<u16> {
     debug_assert_eq!(rows.len(), height * in_width);
-    let mut out = vec![0u8; height * out_width];
+    let mut out = vec![0u16; height * out_width];
     for r in 0..height {
         let src = &rows[r * in_width..(r + 1) * in_width];
         let dst = &mut out[r * out_width..(r + 1) * out_width];
@@ -158,7 +168,7 @@ pub(crate) fn upscale_plane(
             }
             _ => &[],
         };
-        upscale_row(src, real_right, out_width, dst);
+        upscale_row(src, real_right, out_width, dst, bit_depth);
     }
     out
 }
@@ -185,51 +195,40 @@ pub(crate) fn upscale_picture(
     picture: &crate::encode::Picture,
     upscaled_width: usize,
     margin: Option<&crate::encode::Picture>,
+    bit_depth: u32,
 ) -> crate::encode::Picture {
     SUPERRES_HITS.with(|c| c.set(c.get() + 1));
     let height = picture.height;
     let chroma_in_w = picture.width.div_ceil(2);
     let chroma_out_w = upscaled_width.div_ceil(2);
     let chroma_h = height.div_ceil(2);
-    // lane-hbd r4: superres is 8-bit by construction (`upscale_row` clamps
-    // to 255) -- narrow at this boundary; callers refuse `bit_depth != 8`
-    // before ever reaching here (see `stream.rs`).
-    let narrow = |v: &[u16]| -> Vec<u8> { v.iter().map(|&s| s as u8).collect() };
-    let picture_y8 = narrow(&picture.y);
-    let picture_u8 = narrow(&picture.u);
-    let picture_v8 = narrow(&picture.v);
-    let margin_y8 = margin.map(|m| narrow(&m.y));
-    let margin_u8 = margin.map(|m| narrow(&m.u));
-    let margin_v8 = margin.map(|m| narrow(&m.v));
-    let widen = |v: Vec<u8>| -> Vec<u16> { v.into_iter().map(u16::from).collect() };
     crate::encode::Picture {
         width: upscaled_width,
         height,
-        y: widen(upscale_plane(
-            &picture_y8,
+        y: upscale_plane(
+            &picture.y,
             height,
             picture.width,
             upscaled_width,
-            margin_y8.as_deref().map(|m| (m, margin.unwrap().width)),
-        )),
-        u: widen(upscale_plane(
-            &picture_u8,
+            margin.map(|m| (m.y.as_slice(), m.width)),
+            bit_depth,
+        ),
+        u: upscale_plane(
+            &picture.u,
             chroma_h,
             chroma_in_w,
             chroma_out_w,
-            margin_u8
-                .as_deref()
-                .map(|m| (m, margin.unwrap().width.div_ceil(2))),
-        )),
-        v: widen(upscale_plane(
-            &picture_v8,
+            margin.map(|m| (m.u.as_slice(), m.width.div_ceil(2))),
+            bit_depth,
+        ),
+        v: upscale_plane(
+            &picture.v,
             chroma_h,
             chroma_in_w,
             chroma_out_w,
-            margin_v8
-                .as_deref()
-                .map(|m| (m, margin.unwrap().width.div_ceil(2))),
-        )),
+            margin.map(|m| (m.v.as_slice(), m.width.div_ceil(2))),
+            bit_depth,
+        ),
     }
 }
 
@@ -249,17 +248,17 @@ mod tests {
     /// here independently of this module's own logic.
     #[test]
     fn upscale_row_matches_libaom_in8_out12() {
-        let row = [10u8, 20, 30, 40, 50, 60, 70, 80];
-        let mut out = [0u8; 12];
-        upscale_row(&row, &[], 12, &mut out);
+        let row = [10u16, 20, 30, 40, 50, 60, 70, 80];
+        let mut out = [0u16; 12];
+        upscale_row(&row, &[], 12, &mut out, 8);
         assert_eq!(out, [9, 14, 22, 29, 35, 42, 48, 55, 61, 68, 76, 81]);
     }
 
     #[test]
     fn upscale_row_matches_libaom_in8_out16() {
-        let row = [10u8, 20, 30, 40, 50, 60, 70, 80];
-        let mut out = [0u8; 16];
-        upscale_row(&row, &[], 16, &mut out);
+        let row = [10u16, 20, 30, 40, 50, 60, 70, 80];
+        let mut out = [0u16; 16];
+        upscale_row(&row, &[], 16, &mut out, 8);
         assert_eq!(
             out,
             [9, 12, 17, 23, 28, 32, 37, 43, 48, 53, 58, 62, 67, 73, 78, 81]
@@ -273,10 +272,10 @@ mod tests {
     /// captured-row pins above.
     #[test]
     fn upscale_row_of_a_flat_input_is_flat() {
-        let row = [200u8; 8];
-        let mut out = [0u8; 12];
-        upscale_row(&row, &[], 12, &mut out);
-        assert_eq!(out, [200u8; 12]);
+        let row = [200u16; 8];
+        let mut out = [0u16; 12];
+        upscale_row(&row, &[], 12, &mut out, 8);
+        assert_eq!(out, [200u16; 12]);
     }
 
     /// r3: the real 43->64 failing case, pinned against real libaom
@@ -287,14 +286,14 @@ mod tests {
     /// margin fix.
     #[test]
     fn upscale_row_with_real_margin_matches_libaom_in43_out64() {
-        let row: [u8; 43] = [
+        let row: [u16; 43] = [
             102, 102, 103, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116,
             117, 118, 119, 120, 121, 122, 123, 125, 126, 127, 127, 128, 129, 130, 130, 131, 131,
             133, 134, 136, 137, 138, 139, 140, 140, 141,
         ];
-        let real_margin = [140u8];
-        let mut out = [0u8; 64];
-        upscale_row(&row, &real_margin, 64, &mut out);
+        let real_margin = [140u16];
+        let mut out = [0u16; 64];
+        upscale_row(&row, &real_margin, 64, &mut out, 8);
         assert_eq!(out[62], 141, "column 62 must match libaom, not the old replicate-padded 140");
     }
 }
