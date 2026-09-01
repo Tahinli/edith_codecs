@@ -103,3 +103,26 @@ with 1774 — the fix is a real advance, not a reshuffle.
 - accepted (documented corner-cut, in the code): a var-tx block's chroma
   deblock edges read `tx_h_grid / 2`, i.e. they follow the luma leaves even
   though the block's uv transform is not split.
+
+## Suite totals
+
+```
+CARGO_TARGET_DIR=$HOME/.cache/cargo-target-txselect cargo test -p ec-av1 --lib
+test result: FAILED. 267 passed; 1 failed; 23 ignored; 0 measured; 0 filtered out;
+finished in 1146.75s
+```
+
+The single failure is this lane's own new gate
+(`a_real_aomenc_inter_sequence_with_tx_select_decodes_pixel_exact`), red for the
+frame-2 reason above. No pre-existing test regressed: the same 267 pass with the
+blanket `TxMode::Select` inter refusal removed.
+
+Measured at `138c558`. Two commits landed after it:
+- `ecc71ec` — this report only, no code.
+- `3c174b6` — `tx_size_context_txfm`, reachable from exactly one call site
+  (`read_block_tx_size`'s intra branch, new code this lane); `read_tx_size`'s
+  new `ctx_override` is `None` at both pre-existing key-frame call sites
+  (`decode.rs:4934`, `:5346`), so it cannot move any of the 267. Re-verified
+  after it: the gate (still red, byte-identical failure), plus
+  `refusal_inventory` + `gate_coverage` (5 passed, 0 failed). The full 1146 s
+  suite was NOT re-run at `3c174b6`.
