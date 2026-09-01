@@ -627,6 +627,22 @@ thread_local! {
     static SCALED_OBMC_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static SCALED_INTERINTRA_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static SCALED_BLOCK8_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SCALED_WARP_SUPPRESSED_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static MIXED_SCALE_COMPOUND_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`MIXED_SCALE_COMPOUND_HITS`]: compound blocks with one
+/// scaled and one unscaled tap.
+pub(crate) fn mixed_scale_compound_hits() -> usize {
+    MIXED_SCALE_COMPOUND_HITS.with(|c| c.get())
+}
+
+/// Current value of [`SCALED_WARP_SUPPRESSED_HITS`]: blocks that would have
+/// read the 3-symbol `motion_mode_cdf` but read the 2-symbol `obmc_cdf`
+/// instead because their reference is scaled (libaom `motion_mode_allowed`,
+/// `blockd.h:1484`).
+pub(crate) fn scaled_warp_suppressed_hits() -> usize {
+    SCALED_WARP_SUPPRESSED_HITS.with(|c| c.get())
 }
 
 /// Current value of [`SCALED_COMPOUND_HITS`].
@@ -9507,6 +9523,12 @@ fn decode_inter_block(
             if scale0 != mc::REF_NO_SCALE || scale1 != mc::REF_NO_SCALE {
                 SCALED_COMPOUND_HITS.with(|c| c.set(c.get() + 1));
             }
+            // lane-scaledref r2: the MIXED case -- one tap scaled, the other
+            // not -- is the one an all-frames-scaled recipe never produces,
+            // and the one a single shared scale factor would get wrong.
+            if (scale0 == mc::REF_NO_SCALE) != (scale1 == mc::REF_NO_SCALE) {
+                MIXED_SCALE_COMPOUND_HITS.with(|c| c.set(c.get() + 1));
+            }
 
             let mut inter0_y = vec![0i32; side * side];
             mc::predict_compound_intermediate(
@@ -10016,8 +10038,27 @@ fn decode_inter_block(
                 // `motion_mode_allowed` reads the 3-symbol `motion_mode_cdf`
                 // instead of the 2-symbol `obmc_cdf` exactly when
                 // `num_proj_ref >= 1` under `allow_warped_motion`.
+                // lane-scaledref r2: libaom `motion_mode_allowed`
+                // (`blockd.h:1484`) requires
+                // `!av1_is_scaled(block_ref_scale_factors[0])` for
+                // WARPED_CAUSAL -- under a scaled reference (superres) the
+                // block reads the 2-symbol `obmc_cdf`, never the 3-symbol
+                // `motion_mode_cdf`. Reading the wrong alphabet here narrows
+                // the arithmetic coder by the wrong amount and predicts the
+                // rest of the tile off a diverged state: it was silently
+                // wrong pixels (r1's `--enable-warped-motion=1` superres
+                // mismatch), not a desync error.
+                let ref_is_scaled =
+                    mc::scale_factor(py_ref.width, frame_width) != mc::REF_NO_SCALE;
                 let warp_eligible = allow_warped_motion
+                    && !ref_is_scaled
                     && num_proj_ref(grid, mi_row, mi_col, bw4, bh4, mi_cols as usize, mi_rows as usize, ref_frame) >= 1;
+                if allow_warped_motion
+                    && ref_is_scaled
+                    && num_proj_ref(grid, mi_row, mi_col, bw4, bh4, mi_cols as usize, mi_rows as usize, ref_frame) >= 1
+                {
+                    SCALED_WARP_SUPPRESSED_HITS.with(|c| c.set(c.get() + 1));
+                }
                 if warp_eligible {
                     let mode = dec.symbol(&mut cdfs.motion_mode[bsize_idx]);
                     match mode {
@@ -11409,6 +11450,12 @@ fn decode_inter_block8(
             // lane-warp round 1: same 3-vs-2-symbol split as the 16x16+ leaf
             // (see its own doc) -- this leaf is always `LAST_FRAME`-only
             // (grid.set below hardcodes it).
+            // lane-scaledref r2 sibling of the 16x16+ leaf's fix: libaom
+            // drops WARPED_CAUSAL eligibility (so this reads `obmc_cdf`)
+            // when the reference is scaled. Not gated here because an 8x8
+            // leaf under a scaled reference is refused before this function
+            // runs (see the block8 refusal below, ~12500) -- whoever lifts
+            // that refusal must add `&& !ref_is_scaled` here too.
             let warp_eligible = allow_warped_motion
                 && num_proj_ref(grid, mi_row, mi_col, 2, 2, mi_cols as usize, mi_rows as usize, LAST_FRAME) >= 1;
             if warp_eligible {

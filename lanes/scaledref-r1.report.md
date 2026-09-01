@@ -23,8 +23,10 @@ verified, gated and kept; everything below r1 adds is on top of it.
 1. `stream::tests::a_real_aomenc_superres_stream_with_compound_obmc_and_interintra_decodes_pixel_exact`
    — real `aomenc --superres-mode=1 --superres-denominator=16 --superres-kf-denominator=16
    --auto-alt-ref=1 --lag-in-frames=25 --enable-obmc=1 --enable-interintra-comp=1
-   --enable-smooth-interintra=1`, 12 seeds x 24 frames of 64x64 moving gradients, every frame
-   (hidden alt-refs included, `decode_stream` decodes the whole OBU sequence) compared to ffmpeg.
+   --enable-smooth-interintra=1`, 12 seeds x 24 frames of 64x64 moving gradients, every SHOWN frame
+   compared to ffmpeg (corrected in r2: `decode_stream` pushes a picture only under
+   `show_frame`, stream.rs:711, and `ffmpeg -f obu` emits shown frames only -- a hidden
+   alt-ref is checked only through propagation into the frames that reference it).
    Hard-asserts `mc::predict_scaled_hits() > 0` and the per-case counters
    `scaled_compound/scaled_obmc/scaled_interintra > 0`.
 
