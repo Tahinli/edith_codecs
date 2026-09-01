@@ -58,6 +58,23 @@ rgbtestsrc cq24 rtx=1 3461 -> 14 (luma 2304 -> 0); rgbtestsrc cq32 rtx=1 1622 ->
 rgbtestsrc cq32 `--enable-filter-intra=1` rtx=0 -> 0; mandelbrot start_x=-0.6 cq16
 `--enable-filter-intra=1` rtx=1 126 -> 123 (luma 0, U 40, V 83).
 
+## Second defect this round (coordinator-reported, verified and fixed)
+
+`Reach::top_right_rect`/`bottom_left_rect` (`encode.rs` ~1162/~1196) indexed the rect
+`has_tr_*`/`has_bl_*` tables with `(blk_row << (4 - bw_log2)) + blk_col`. libaom's
+`has_top_right` uses `MAX_MIB_SIZE_LOG2` = **5** (`enums.h`; its tables are laid out for a
+128x128 = 32-mi superblock), so r4 halved the row stride and every table row but the first
+read the wrong byte -- 16x8 wrong at 80 mi positions in a 64-wide SB, 8x16 at 16, 32x16 at 64
+(a regression against `main`). Fixed via a named `Reach::rect_table_index` used by both.
+
+EVIDENCE: `cargo test -p ec-av1 --lib -- rect_reach_tables_are_indexed --nocapture` |
+new `encode::tests::rect_reach_tables_are_indexed_with_a_32_mi_row_stride` walks every block
+position of a 32-mi superblock for all six rect sizes and asserts the index set is a BIJECTION
+onto the table's bits (plus `len * 8 == rows * cols`) | passes with the shift at 5; with r4's
+`4 - bw_log2` the walk covers a quarter of the 16x8 table and the assert fails. No pixel change
+in the five swept cells (they are all luma-exact either way), so this fix is table-verified,
+not gate-differentiated.
+
 ## Open residue
 
 - fix-now(next round, needs its own lane -- it is a CHROMA PREDICTION defect, not a rect one):
@@ -78,7 +95,22 @@ rgbtestsrc cq32 `--enable-filter-intra=1` rtx=0 -> 0; mandelbrot start_x=-0.6 cq
   (`--reduced-tx-type-set=0` cells can hit it: rgbtestsrc cq32 rtx=0 fi=0 refuses by name).
 - accepted: `filter intra on a HORZ/VERT strip` still refuses (4 of the 6 filter-intra cells
   swept above stop there, non-silently).
+- deferred(the rect `predict_filter_intra` predictor): the coordinator asked for a gate arm
+  asserting a counter of `use_filter_intra` reads on 16x8/8x16 leaves. It cannot exist yet --
+  every recipe where aomenc puts filter intra ON a rect leaf hits exactly that refusal
+  (`filter intra on a HORZ/VERT strip`, 4 of 6 cells), and the two `--enable-filter-intra=1`
+  recipes that DO decode (`rgbtestsrc` cq32 rtx=0, now a pinned arm of the new gate) contain no
+  such leaf, so the counter would assert 0. A gate for those CDF rows unblocks when
+  `predict_filter_intra` grows a rectangular arm; the r4 refusal is what holds the line
+  meanwhile.
 
 ## Refusals
 
 None lifted or added this round; `refusal_inventory` and `gate_coverage` unchanged and green.
+
+## Totals
+
+`EC_AV1_REQUIRE_AOMENC=1 cargo test -p ec-av1 --lib` (CARGO_TARGET_DIR=~/.cache/cargo-target-rectx,
+final commit): **272 passed, 0 failed, 24 ignored** (825.42s) -- r4's 270 plus the two tests
+added this round (`a_real_aomenc_stream_whose_square_block_reads_a_sub16_neighbours_mode_decodes_pixel_exact`,
+`rect_reach_tables_are_indexed_with_a_32_mi_row_stride`); nothing regressed.
