@@ -9363,6 +9363,13 @@ mod tests {
         let before = crate::decode::rect_split_tx_hits();
         let mut named_refusals = 0u32;
         let mut matched = 0u32;
+        // lane-rectsplit r2 (verifier finding): the feature counter is
+        // sampled PER ATTEMPT and folded in only after that attempt was
+        // decoded AND pixel-compared. One delta across the whole sweep
+        // counted strips decoded by attempts that went on to hit a named
+        // refusal, so the gate could pass with every COMPARED stream
+        // containing none of the feature at all.
+        let mut compared_hits = 0usize;
         let mut split_so_far = 0usize;
         // Bounded sweep: see this gate's own doc for the seed-77 residue and
         // why extending it is a diagnosis knob, not a pass/fail one.
@@ -9448,6 +9455,7 @@ mod tests {
             );
             let stream = out.stdout;
             assert!(!stream.is_empty(), "{NAME}: aomenc wrote an empty stream (seed {seed})");
+            let attempt_before = crate::decode::rect_split_tx_hits();
             let frames = match decode_stream(&stream) {
                 Err(e) => {
                     let msg = e.to_string();
@@ -9474,20 +9482,36 @@ mod tests {
                 .zip(&ffmpeg_frames[0].y)
                 .position(|(a, b)| a != b)
             {
+                let diffs: Vec<usize> = frames[0]
+                    .y
+                    .iter()
+                    .zip(&ffmpeg_frames[0].y)
+                    .enumerate()
+                    .filter(|(_, (a, b))| a != b)
+                    .map(|(j, _)| j)
+                    .collect();
+                let (x0, x1) = (
+                    diffs.iter().map(|j| j % width).min().unwrap(),
+                    diffs.iter().map(|j| j % width).max().unwrap(),
+                );
+                let (y0, y1) = (diffs[0] / width, diffs[diffs.len() - 1] / width);
                 eprintln!(
-                    "{NAME}: seed {seed} first luma mismatch at ({}, {}) ours={} ffmpeg={}",
+                    "{NAME}: seed {seed} first luma mismatch at ({}, {}) ours={} ffmpeg={} \
+                     -- {} mismatching samples, bbox x {x0}..={x1} y {y0}..={y1}",
                     i % width,
                     i / width,
                     frames[0].y[i],
-                    ffmpeg_frames[0].y[i]
+                    ffmpeg_frames[0].y[i],
+                    diffs.len(),
                 );
             }
             assert_eq!(frames[0].y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg (seed {seed})");
             assert_eq!(frames[0].u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg (seed {seed})");
             assert_eq!(frames[0].v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg (seed {seed})");
+            compared_hits += crate::decode::rect_split_tx_hits() - attempt_before;
             matched += 1;
         }
-        let split_hits = crate::decode::rect_split_tx_hits() - before;
+        let split_hits = compared_hits;
         assert!(
             matched > 0,
             "{NAME}: every attempt refused ({named_refusals} named refusals) -- gate decoded nothing"
@@ -9527,11 +9551,17 @@ mod tests {
             return;
         }
         let (width, height) = (192usize, 128usize);
-        let before = crate::decode::filter_intra_rect_hits();
         let rect_before = crate::decode::rect_partition_hits();
         let fi_square_before = crate::decode::filter_intra_hits();
         let mut named_refusals = 0u32;
         let mut matched = 0u32;
+        // lane-rectsplit r2 (verifier finding): the feature counter is
+        // sampled PER ATTEMPT and folded in only after that attempt was
+        // decoded AND pixel-compared. One delta across the whole sweep
+        // counted strips decoded by attempts that went on to hit a named
+        // refusal, so the gate could pass with every COMPARED stream
+        // containing none of the feature at all.
+        let mut compared_hits = 0usize;
         let n_attempts: u32 = std::env::var("EC_RECTSPLIT_GATE_ATTEMPTS")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -9596,13 +9626,15 @@ mod tests {
                 "--deltaq-mode=0",
                 // The point of this gate.
                 "--enable-filter-intra=1",
-                // The square filter-intra gate's own way of making RD reach
-                // for filter intra at all: with the directional/smooth/paeth
-                // competitors off, DC_PRED + filter intra is what is left
-                // (recipe borrowed from
-                // `a_real_aomenc_filter_intra_stream_decodes_pixel_exact`;
-                // without them 20/20 streams picked filter intra zero times
-                // on a strip -- measured this round).
+                // NOTE (lane-rectsplit r2, verifier finding): every intra
+                // mode stays ON here. The square filter-intra gate reaches
+                // for filter intra by switching the directional/smooth/paeth
+                // competitors off, and this gate CANNOT: with them off
+                // aomenc stops picking rect partitions at all (rect
+                // strips 0/20 seeds, r1's table). What fires filter intra on
+                // a strip here is the quantiser (`--cq-level=25`), not the
+                // mode set -- `EC_RECTSPLIT_OFF` below is the diagnosis knob
+                // that re-runs the subset search.
                 "--enable-cfl-intra=0",
                 "--enable-intrabc=0",
                 "--obu",
@@ -9648,6 +9680,7 @@ mod tests {
             );
             let stream = out.stdout;
             assert!(!stream.is_empty(), "{NAME}: aomenc wrote an empty stream (seed {seed})");
+            let attempt_before = crate::decode::filter_intra_rect_hits();
             let frames = match decode_stream(&stream) {
                 Err(e) => {
                     let msg = e.to_string();
@@ -9668,20 +9701,36 @@ mod tests {
                 .zip(&ffmpeg_frames[0].y)
                 .position(|(a, b)| a != b)
             {
+                let diffs: Vec<usize> = frames[0]
+                    .y
+                    .iter()
+                    .zip(&ffmpeg_frames[0].y)
+                    .enumerate()
+                    .filter(|(_, (a, b))| a != b)
+                    .map(|(j, _)| j)
+                    .collect();
+                let (x0, x1) = (
+                    diffs.iter().map(|j| j % width).min().unwrap(),
+                    diffs.iter().map(|j| j % width).max().unwrap(),
+                );
+                let (y0, y1) = (diffs[0] / width, diffs[diffs.len() - 1] / width);
                 eprintln!(
-                    "{NAME}: seed {seed} first luma mismatch at ({}, {}) ours={} ffmpeg={}",
+                    "{NAME}: seed {seed} first luma mismatch at ({}, {}) ours={} ffmpeg={} \
+                     -- {} mismatching samples, bbox x {x0}..={x1} y {y0}..={y1}",
                     i % width,
                     i / width,
                     frames[0].y[i],
-                    ffmpeg_frames[0].y[i]
+                    ffmpeg_frames[0].y[i],
+                    diffs.len(),
                 );
             }
             assert_eq!(frames[0].y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg (seed {seed})");
             assert_eq!(frames[0].u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg (seed {seed})");
             assert_eq!(frames[0].v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg (seed {seed})");
+            compared_hits += crate::decode::filter_intra_rect_hits() - attempt_before;
             matched += 1;
         }
-        let fi_hits = crate::decode::filter_intra_rect_hits() - before;
+        let fi_hits = compared_hits;
         eprintln!(
             "{NAME}: rect strips this run={}, filter-intra blocks (any shape)={}",
             crate::decode::rect_partition_hits() - rect_before,
@@ -9708,17 +9757,23 @@ mod tests {
     /// `--enable-tx-size-search=0` DROPPED: the 64x32/32x64 strips may then
     /// carry a split transform, which [`crate::decode::decode_block_rect64`]
     /// refused by name ("a superblock-level HORZ/VERT strip with a split
-    /// transform") until this round. Same hard `rect_split_tx_hits()` delta
-    /// assert as gate (a).
-    /// lane-rectsplit r1 MEASURED RED, `#[ignore]`d with its number (the
-    /// `rect64q` gate's own precedent): with the per-transform-unit port
-    /// wired at the superblock level, seed 50 decodes one sample off --
-    /// luma (171, 56), ours 147 vs ffmpeg 148, inside the 64x32 strip at
-    /// mi=(8,32) whose transform resolved to depth 2 (TX_16X16). Seeds 42-49
-    /// with depth-1 (TX_32X32) units were pixel-exact. The refusal in
-    /// `decode_block_rect64` was therefore RESTORED rather than lifted; run
-    /// this gate (`--ignored`) after any fix to that arm.
-    #[ignore = "lane-rectsplit r1: measured RED, seed 50 luma (171,56) off by one; refusal kept"]
+    /// transform") until lane-rectsplit r2 lifted it.
+    ///
+    /// The hard assert is on [`crate::decode::rect_split_sb_interior_tu_hits`],
+    /// NOT the shared `rect_split_tx_hits()` gate (a) uses: that counter also
+    /// counts 32x32-level and depth-1 strips, whose units are all in the
+    /// first transform-unit row/column. Only a superblock-level strip split
+    /// past depth 1 has an INTERIOR unit (`row_off > 0 && col_off > 0`),
+    /// which is the per-unit availability rule this port exists for, and no
+    /// gate fired one before this round.
+    ///
+    /// This gate was `#[ignore]`d RED through r1 (seed 50 luma (171,56)).
+    /// Root cause, r2: not availability at all -- `av1_nz_map_ctx_offset` is
+    /// packed COLUMN-major, so [`crate::decode::base_ctx`] read the
+    /// `TX_32X64`/`TX_64X32` offset tables transposed and desynced the first
+    /// SB-level strip whose luma corner held a coefficient below row 1 (see
+    /// that function's comment). The strip's own per-unit prediction was
+    /// already exact.
     #[test]
     fn a_real_aomenc_stream_with_a_split_transform_superblock_strip_decodes_pixel_exact() {
         const NAME: &str = "a_real_aomenc_stream_with_a_split_transform_superblock_strip_decodes_pixel_exact";
@@ -9735,6 +9790,13 @@ mod tests {
         let before = crate::decode::rect_split_tx_hits();
         let mut named_refusals = 0u32;
         let mut matched = 0u32;
+        // lane-rectsplit r2 (verifier finding): the feature counter is
+        // sampled PER ATTEMPT and folded in only after that attempt was
+        // decoded AND pixel-compared. One delta across the whole sweep
+        // counted strips decoded by attempts that went on to hit a named
+        // refusal, so the gate could pass with every COMPARED stream
+        // containing none of the feature at all.
+        let mut compared_hits = 0usize;
         let mut split_so_far = 0usize;
         // Bounded sweep: see this gate's own doc for the seed-77 residue and
         // why extending it is a diagnosis knob, not a pass/fail one.
@@ -9820,6 +9882,7 @@ mod tests {
             );
             let stream = out.stdout;
             assert!(!stream.is_empty(), "{NAME}: aomenc wrote an empty stream (seed {seed})");
+            let attempt_before = crate::decode::rect_split_sb_interior_tu_hits();
             let frames = match decode_stream(&stream) {
                 Err(e) => {
                     let msg = e.to_string();
@@ -9846,20 +9909,36 @@ mod tests {
                 .zip(&ffmpeg_frames[0].y)
                 .position(|(a, b)| a != b)
             {
+                let diffs: Vec<usize> = frames[0]
+                    .y
+                    .iter()
+                    .zip(&ffmpeg_frames[0].y)
+                    .enumerate()
+                    .filter(|(_, (a, b))| a != b)
+                    .map(|(j, _)| j)
+                    .collect();
+                let (x0, x1) = (
+                    diffs.iter().map(|j| j % width).min().unwrap(),
+                    diffs.iter().map(|j| j % width).max().unwrap(),
+                );
+                let (y0, y1) = (diffs[0] / width, diffs[diffs.len() - 1] / width);
                 eprintln!(
-                    "{NAME}: seed {seed} first luma mismatch at ({}, {}) ours={} ffmpeg={}",
+                    "{NAME}: seed {seed} first luma mismatch at ({}, {}) ours={} ffmpeg={} \
+                     -- {} mismatching samples, bbox x {x0}..={x1} y {y0}..={y1}",
                     i % width,
                     i / width,
                     frames[0].y[i],
-                    ffmpeg_frames[0].y[i]
+                    ffmpeg_frames[0].y[i],
+                    diffs.len(),
                 );
             }
             assert_eq!(frames[0].y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg (seed {seed})");
             assert_eq!(frames[0].u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg (seed {seed})");
             assert_eq!(frames[0].v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg (seed {seed})");
+            compared_hits += crate::decode::rect_split_sb_interior_tu_hits() - attempt_before;
             matched += 1;
         }
-        let split_hits = crate::decode::rect_split_tx_hits() - before;
+        let split_hits = compared_hits;
         assert!(
             matched > 0,
             "{NAME}: every attempt refused ({named_refusals} named refusals) -- gate decoded nothing"
