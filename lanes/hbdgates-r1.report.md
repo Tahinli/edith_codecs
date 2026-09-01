@@ -74,3 +74,9 @@ non-matching attempts are named refusals reported by the gate, not silenced.
   `enable-intrabc`, `enable-dist-wtd-comp`, `enable-dual-filter`, `enable-ref-frame-mvs`,
   `enable-superres` remain 10-bit holes — they are holes at 8 bits too (or flag-spelling
   aliases), so they belong to the lanes that gate them at all, not to this one.
+
+## Suite totals
+`EC_AV1_REQUIRE_AOMENC=1 cargo test -p ec-av1 --lib` (lane worktree, commit 6adca66 state)
+-> **279 passed; 0 failed; 24 ignored**, 1640s. The 24 ignored include this lane's
+`a_real_aomenc_10bit_restoration_stream_decodes_pixel_exact` (the failing 10-bit LR gate)
+and 23 pre-existing ignores.
