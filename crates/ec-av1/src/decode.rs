@@ -776,6 +776,34 @@ pub(crate) fn horz_vert_intra_hits() -> usize {
     HORZ_VERT_INTRA_HITS.with(|c| c.get())
 }
 
+// How many HORZ/VERT intra strips resolved a SPLIT luma transform
+// (`tx_depth != 0`) and decoded it per transform unit (lane-rectsplit r1) --
+// the case every rect path here refused by name before, and the first
+// refusal the user's Hunger Games extract (600s in) stops at.
+thread_local! {
+    static RECT_SPLIT_TX_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`RECT_SPLIT_TX_HITS`].
+pub(crate) fn rect_split_tx_hits() -> usize {
+    RECT_SPLIT_TX_HITS.with(|c| c.get())
+}
+
+// How many HORZ/VERT intra strips actually predicted with filter intra
+// (lane-rectsplit r1) -- the case `decode_block_rect` refused by name
+// ("this decoder predicts square-only") until `predict_filter_intra` took
+// `bw`x`bh`.
+thread_local! {
+    static FILTER_INTRA_RECT_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`FILTER_INTRA_RECT_HITS`].
+pub(crate) fn filter_intra_rect_hits() -> usize {
+    FILTER_INTRA_RECT_HITS.with(|c| c.get())
+}
+
 // How many [`read_coeffs`] reads resolved a `tx_type` outside `TX_CLASS_2D`
 // (`V_DCT`/`H_DCT`, spec 5.11.39's `TxClass::Horiz`/`Vert`), across every
 // call on the current thread -- the same before/after counter pattern as
@@ -2997,31 +3025,54 @@ impl Neighbours {
         uv_mode: usize,
         chroma_grids: [&[i32]; 2],
     ) {
+        self.record_split_luma_rect(at, side, side, mode, uv_mode, chroma_grids);
+    }
+
+    /// [`Self::record_split_luma`] with independent above (`w`)/left (`h`)
+    /// extents in pixels (lane-rectsplit r1), the same relationship
+    /// [`Self::record_rect`] has to [`Self::record`]: a HORZ/VERT strip whose
+    /// luma transform split into several square units needs exactly this
+    /// bookkeeping, at its own true rectangular extents.
+    fn record_split_luma_rect(
+        &mut self,
+        at: (usize, usize),
+        w: usize,
+        h: usize,
+        mode: usize,
+        uv_mode: usize,
+        chroma_grids: [&[i32]; 2],
+    ) {
         let (r, c) = at;
-        for cell in 0..side / SUB {
+        for cell in 0..w / SUB {
             self.above_mode[c + cell] = mode;
-            self.left_mode[r + cell] = mode;
             self.above_uv_mode[c + cell] = uv_mode;
+            self.above_side[c + cell] = w;
+        }
+        for cell in 0..h / SUB {
+            self.left_mode[r + cell] = mode;
             self.left_uv_mode[r + cell] = uv_mode;
-            self.above_side[c + cell] = side;
-            self.left_side[r + cell] = side;
+            self.left_side[r + cell] = h;
         }
         let (mi_r, mi_c) = (r * (SUB / MI), c * (SUB / MI));
-        let side_mi = side / MI;
-        for cell in 0..side_mi {
-            self.left_side_mi[mi_r + cell] = side;
-            self.above_side_mi[mi_c + cell] = side;
+        let (w_mi, h_mi) = (w / MI, h / MI);
+        for cell in 0..h_mi {
+            self.left_side_mi[mi_r + cell] = h;
+        }
+        for cell in 0..w_mi {
+            self.above_side_mi[mi_c + cell] = w;
         }
         let round_up_even = |n: usize| n.div_ceil(2) * 2;
         let (bound_h, bound_w) = (round_up_even(self.mi_rows), round_up_even(self.mi_cols));
         for (plane_idx, grid) in chroma_grids.into_iter().enumerate() {
             let plane = plane_idx + 1;
             let state = neighbour_state(grid);
-            for cell in 0..side_mi {
-                if cell < side_mi.min(bound_h.saturating_sub(mi_r)) {
+            for cell in 0..h_mi {
+                if cell < h_mi.min(bound_h.saturating_sub(mi_r)) {
                     self.left[mi_r + cell][plane] = state;
                 }
-                if cell < side_mi.min(bound_w.saturating_sub(mi_c)) {
+            }
+            for cell in 0..w_mi {
+                if cell < w_mi.min(bound_w.saturating_sub(mi_c)) {
                     self.above[mi_c + cell][plane] = state;
                 }
             }
@@ -3547,6 +3598,249 @@ fn cfl_ac_q3_rect(y: &PlaneBuf, px: usize, py: usize, bw: usize, bh: usize) -> V
     ac
 }
 
+/// Everything a rect strip already read out of the stream before its luma
+/// transform units are decoded -- [`decode_rect_split`]'s own mode bundle
+/// (nine values that would otherwise be nine more parameters).
+struct RectStripModes {
+    skip: bool,
+    mode: usize,
+    angle_delta_y: i32,
+    uv_predict_mode: usize,
+    angle_delta_uv: i32,
+    alpha: Option<(i32, i32)>,
+    filter_intra: Option<usize>,
+    smooth_neighbor: bool,
+    smooth_neighbor_uv: bool,
+}
+
+/// Decodes the planes of one `bw`x`bh` HORZ/VERT intra strip whose luma
+/// transform is SPLIT (`tx_depth != 0`) -- lane-rectsplit r1, the case every
+/// rect path here refused by name until now ("per-unit rect prediction is not
+/// ported").
+///
+/// `depth_to_tx_size` (libaom `blockd.h`) walks `sub_tx_size_map` `depth`
+/// times from the block's own `max_txsize_rect_lookup` entry, and for a 2:1
+/// strip the very first step already lands on a SQUARE transform
+/// (`sub_tx_size_map[TX_32X16] == TX_16X16`, `[TX_64X32] == TX_32X32`, and
+/// every further step halves a square) -- so each unit is square and reads
+/// through the ordinary square [`read_plane`]. What is genuinely rectangular
+/// here is the *tiling* (`bw/tx` by `bh/tx` units, not `n` by `n` as
+/// [`decode_block`]'s square split loop assumes) and the chroma plane, whose
+/// own transform is `av1_get_max_uv_txsize` of the whole strip and is never
+/// split by luma's depth.
+///
+/// Each unit predicts off whatever the earlier units of this same block
+/// already reconstructed (spec 5.11.36 `predict_and_reconstruct_intra_block`
+/// inside `av1_foreach_transformed_block`, raster order), which is exactly
+/// what predicting the whole strip in one shot got wrong.
+#[allow(clippy::too_many_arguments)]
+fn decode_rect_split(
+    dec: &mut SymbolDecoder,
+    cdfs: &mut Cdfs,
+    neighbours: &mut Neighbours,
+    at: (usize, usize),
+    bw: usize,
+    bh: usize,
+    tx: usize,
+    m: &RectStripModes,
+    y: &mut PlaneBuf,
+    u: &mut PlaneBuf,
+    v: &mut PlaneBuf,
+    base_q_idx: u8,
+    reduced_tx_set: bool,
+) -> Result<()> {
+    let (r, c) = at;
+    let (px, py) = (c * SUB, r * SUB);
+    let (mi_r, mi_c) = (r * (SUB / MI), c * (SUB / MI));
+    let (cpx, cpy) = (px / 2, py / 2);
+    let (chroma_w, chroma_h) = (bw / 2, bh / 2);
+    // The chroma transform is picked before any symbol is read, so an
+    // unsupported chroma shape refuses before this strip desyncs the tile.
+    let chroma: Option<(TxbSet, &[u16])> = match (chroma_w, chroma_h) {
+        (16, 8) => Some((TxbSet::ChromaRect16x8, &SCAN_16X8[..])),
+        (8, 16) => Some((TxbSet::ChromaRect16x8, &SCAN_8X16[..])),
+        (32, 16) => Some((TxbSet::ChromaRect32x16, &SCAN_32X16[..])),
+        (16, 32) => Some((TxbSet::ChromaRect32x16, &SCAN_16X32[..])),
+        _ => None,
+    };
+    if !m.skip && chroma.is_none() {
+        return Err(unsupported(
+            "a coded HORZ/VERT strip whose chroma transform has no rect coefficient tables here",
+        ));
+    }
+    RECT_SPLIT_TX_HITS.with(|c| c.set(c.get() + 1));
+    // LUMA: `bw/tx` x `bh/tx` square transform units, raster order.
+    let luma_set = txbset_for(tx, reduced_tx_set);
+    let luma_scan = default_scan(tx);
+    let zero_tu = vec![0i32; tx * tx];
+    // The strip's OWN edge availability, the fallback for a transform unit
+    // whose top-right/bottom-left pixels fall outside the strip.
+    let block_reach = Reach::of_rect(bw, bh, px, py, y.width, y.height);
+    for tu_row in 0..bh / tx {
+        for tu_col in 0..bw / tx {
+            let tu_mi = (mi_r + tu_row * (tx / MI), mi_c + tu_col * (tx / MI));
+            let (tu_px, tu_py) = (px + tu_col * tx, py + tu_row * tx);
+            let (col_off, row_off) = (tu_col * tx, tu_row * tx);
+            // `has_top_right`/`has_bottom_left` (libaom `reconintra.c`) for a
+            // transform unit INSIDE a block, which is a different rule from
+            // the standalone-block table [`Reach::of`] applies -- and the
+            // reason a depth-2 superblock strip came out one sample off
+            // before this: `Reach::of(tx, ..)` answered as if the unit were
+            // its own block at that superblock position.
+            //  * top-right: if the unit's right neighbour is still inside the
+            //    strip the pixels are already reconstructed (`col_off +
+            //    tx_wide < plane_bw`); otherwise only the strip's own top row
+            //    of units can reach past it, through the block-level answer.
+            //  * bottom-left: a unit that is not in the strip's left column
+            //    has none (`col_off > 0` returns 0); inside the strip
+            //    (`row_off + tx_high < plane_bh`) they are the left
+            //    neighbour's, already reconstructed; the last row falls back
+            //    to the block-level answer.
+            let tu_reach = Reach {
+                above_right: if col_off + tx < bw {
+                    true
+                } else {
+                    row_off == 0 && block_reach.above_right
+                },
+                below_left: if col_off > 0 {
+                    false
+                } else if row_off + tx < bh {
+                    true
+                } else {
+                    block_reach.below_left
+                },
+            };
+            if m.skip {
+                y.reconstruct(
+                    tu_px,
+                    tu_py,
+                    tx,
+                    m.mode,
+                    m.angle_delta_y,
+                    tu_reach,
+                    &zero_tu,
+                    None,
+                    m.filter_intra,
+                    m.smooth_neighbor,
+                );
+                neighbours.record_mi_luma(tu_mi, tx, &zero_tu);
+            } else {
+                let tu_around = neighbours.around_mi(tu_mi, tx)[0];
+                // This unit is smaller than the block it sits in, so
+                // `txb_skip_ctx` is the neighbour-magnitude table, not the
+                // lone-TU 0 (spec `get_txb_ctx_general`).
+                let tu_skip_ctx = neighbours.luma_skip_ctx(tu_mi, tx / MI);
+                let tu_grid = read_plane(
+                    dec,
+                    cdfs,
+                    luma_set,
+                    &luma_scan,
+                    0,
+                    tu_around,
+                    m.mode,
+                    m.mode,
+                    m.angle_delta_y,
+                    tu_reach,
+                    y,
+                    tu_px,
+                    tu_py,
+                    tx,
+                    tx,
+                    base_q_idx,
+                    None,
+                    m.filter_intra,
+                    Some(tu_skip_ctx),
+                    m.smooth_neighbor,
+                )?;
+                neighbours.record_mi_luma(tu_mi, tx, &tu_grid);
+            }
+        }
+    }
+    // CHROMA: one un-split rect transform for the whole strip.
+    let ac = m.alpha.map(|_| cfl_ac_q3_rect(y, px, py, bw, bh));
+    let reach = block_reach;
+    let (u_grid, v_grid) = if m.skip {
+        let zero = vec![0i32; chroma_w * chroma_h];
+        u.reconstruct_rect(
+            cpx, cpy, chroma_w, chroma_h, m.uv_predict_mode, m.angle_delta_uv, reach, &zero,
+            m.alpha.zip(ac.as_deref()).map(|((au, _), ac)| (au, ac)), None, m.smooth_neighbor_uv,
+        );
+        v.reconstruct_rect(
+            cpx, cpy, chroma_w, chroma_h, m.uv_predict_mode, m.angle_delta_uv, reach, &zero,
+            m.alpha.zip(ac.as_deref()).map(|((_, av), ac)| (av, ac)), None, m.smooth_neighbor_uv,
+        );
+        (zero.clone(), zero)
+    } else {
+        let (chroma_set, chroma_scan) = chroma.expect("refused above when None");
+        // `av1_get_ext_tx_set_type`: a chroma transform whose square-up size
+        // is TX_32X32 or bigger resolves to `EXT_TX_SET_DCTONLY` for intra,
+        // so only the 16x8/8x16 pair takes the mode-indexed default.
+        let default_tx = if chroma_w.max(chroma_h) >= 32 {
+            TxType::DctDct
+        } else {
+            default_intra_tx_type(m.uv_predict_mode as u8)
+        };
+        let around = neighbours.around_rect(at, bw, bh);
+        let mut grids: Vec<Vec<i32>> = Vec::with_capacity(2);
+        for plane_idx in 1..=2 {
+            let skip_ctx =
+                usize::from(around[plane_idx].0) + usize::from(around[plane_idx].1);
+            let mut coding = cdfs.txb(chroma_set, m.uv_predict_mode);
+            let (levels, tx_type) = read_coeffs_rect(
+                dec,
+                &mut coding,
+                chroma_scan,
+                chroma_w,
+                chroma_h,
+                skip_ctx,
+                dc_sign_ctx(around[plane_idx].2),
+                default_tx,
+            )?;
+            let residual = dequant_and_inverse_typed_wh(
+                &levels,
+                chroma_w,
+                chroma_h,
+                crate::decode::bit_depth(),
+                CURRENT_Q_IDX.with(|c| c.get()),
+                plane_q_delta(plane_idx).0,
+                plane_q_delta(plane_idx).1,
+                tx_type,
+            );
+            let cfl = m
+                .alpha
+                .zip(ac.as_deref())
+                .map(|((au, av), ac)| (if plane_idx == 1 { au } else { av }, ac));
+            let plane = if plane_idx == 1 { &mut *u } else { &mut *v };
+            plane.reconstruct_rect(
+                cpx,
+                cpy,
+                chroma_w,
+                chroma_h,
+                m.uv_predict_mode,
+                m.angle_delta_uv,
+                reach,
+                &residual,
+                cfl,
+                None,
+                m.smooth_neighbor_uv,
+            );
+            grids.push(levels);
+        }
+        let mut it = grids.into_iter();
+        (it.next().unwrap(), it.next().unwrap())
+    };
+    neighbours.record_split_luma_rect(at, bw, bh, m.mode, m.uv_predict_mode, [&u_grid, &v_grid]);
+    neighbours.fill_skip_grid_rect((mi_r, mi_c), bw / MI, bh / MI, m.skip);
+    neighbours.fill_lf_grid_rect((mi_r, mi_c), bw / MI, bh / MI, tx as u8, tx as u8, 0);
+    if std::env::var_os("EC_AV1_TRACE").is_some() {
+        let (rng, _) = dec.debug_state();
+        eprintln!(
+            "TRACE_RECT_SPLIT mi_row={mi_r} mi_col={mi_c} bw={bw} bh={bh} tx={tx} rng={rng}"
+        );
+    }
+    Ok(())
+}
+
 /// Decodes one true `bw`x`bh` `PARTITION_HORZ`/`PARTITION_VERT` intra strip
 /// (lane-intradisp r1, spec `decode_block` restricted to a 32x32 quadrant's
 /// two rect children). Only the `skip` case is supported: `skip`/`y_mode`/
@@ -3572,6 +3866,7 @@ fn decode_block_rect(
     allow_screen_content_tools: bool,
     base_q_idx: u8,
     tx_select: bool,
+    reduced_tx_set: bool,
 ) -> Result<()> {
     let (r, c) = at;
     let (px, py) = (c * SUB, r * SUB);
@@ -3600,15 +3895,13 @@ fn decode_block_rect(
     // `uv_mode`, not the luma one.
     let smooth_neighbor_uv =
         is_smooth_mode(neighbours.above_uv_mode[c]) || is_smooth_mode(neighbours.left_uv_mode[r]);
+    // lane-rectsplit r1: `predict_filter_intra` now takes the block's own
+    // `bw`x`bh` (`av1_filter_intra_predictor_c` walks its 4x2 patches over a
+    // rectangle just as happily), so a `use_filter_intra` strip at this level
+    // predicts instead of refusing. The below-16x16 leaf arm
+    // (`decode_leaf_rect`) keeps the refusal: it has no gate of its own.
     if filter_intra.is_some() {
-        // `predict_filter_intra` (spec 7.11.2.3) is square-only in this
-        // decoder (`assert_eq!(dst.len(), side*side)`) -- a real symbol was
-        // already read above so the stream stays in sync, this only refuses
-        // the *pixel* decode of a rare case (`use_filter_intra` on a rect
-        // strip).
-        return Err(unsupported(
-            "filter intra on a HORZ/VERT strip (this decoder predicts square-only)",
-        ));
+        FILTER_INTRA_RECT_HITS.with(|c| c.set(c.get() + 1));
     }
     let uv_predict_mode = if uv_mode == UV_CFL_PRED {
         DC_PRED
@@ -3631,15 +3924,28 @@ fn decode_block_rect(
     };
     if depth != 0 {
         TX_DEPTH_HITS.with(|c| c.set(c.get() + 1));
-        // A split transform is predicted per transform unit, each taking its
-        // edges from the previous unit's reconstruction (the square path's own
-        // per-TU loop does exactly that). Predicting the whole strip in one
-        // shot would silently produce different pixels, so refuse by name
-        // until that loop is ported for rect strips.
-        return Err(unsupported(
-            "a HORZ/VERT intra strip with a split transform (per-unit rect \
-             prediction is not ported)",
-        ));
+        // lane-rectsplit r1: a split transform is predicted and reconstructed
+        // per transform unit, each unit taking its edges from the previous
+        // unit's reconstruction inside this same strip (spec 5.11.36) --
+        // [`decode_rect_split`]. `depth_to_tx_size` of a 2:1 strip is square
+        // from the first step on, so `bw.min(bh) >> (depth - 1)` names it.
+        let tx = bw.min(bh) >> (depth - 1);
+        let modes = RectStripModes {
+            skip,
+            mode,
+            angle_delta_y,
+            uv_predict_mode,
+            angle_delta_uv,
+            alpha,
+            filter_intra,
+            smooth_neighbor,
+            smooth_neighbor_uv,
+        };
+        decode_rect_split(
+            dec, cdfs, neighbours, at, bw, bh, tx, &modes, y, u, v, base_q_idx, reduced_tx_set,
+        )?;
+        RECT_PARTITION_HITS.with(|c| c.set(c.get() + 1));
+        return Ok(());
     }
     let (tx_w, tx_h) = (bw, bh);
     let (cpx, cpy) = (px / 2, py / 2);
@@ -3981,7 +4287,7 @@ fn decode_leaf_rect(
     };
     if depth != 0 {
         return Err(unsupported(
-            "a HORZ/VERT intra strip with a split transform (per-unit rect \
+            "a HORZ/VERT intra strip below 16x16 with a split transform (per-unit rect \
              prediction is not ported)",
         ));
     }
@@ -4082,6 +4388,7 @@ fn decode_block_rect64(
     allow_screen_content_tools: bool,
     base_q_idx: u8,
     tx_select: bool,
+    reduced_tx_set: bool,
 ) -> Result<()> {
     let (r, c) = at;
     let (px, py) = (c * SUB, r * SUB);
@@ -4132,12 +4439,31 @@ fn decode_block_rect64(
     let (mi_r, mi_c) = (r * (SUB / MI), c * (SUB / MI));
     let depth = if tx_select {
         let ctx = tx_size_context_rect(neighbours, (mi_r, mi_c), bw, bh);
-        dec.symbol(&mut cdfs.tx_size_cat2[ctx])
+        // lane-rectsplit r1: `bsize_to_tx_size_cat` (libaom `decodemv.c`)
+        // counts `sub_tx_size_map` steps from the block's own max rect
+        // transform down to TX_4X4, minus one -- BLOCK_64X32's chain
+        // (TX_64X32 -> TX_32X32 -> TX_16X16 -> TX_8X8 -> TX_4X4) is four
+        // steps, so this level's category is 3 (the same one a 64x64 square
+        // block uses), not the 2 a 32x16 strip uses. Reading the cat-2 CDF
+        // here was a wrong-table read of a real symbol.
+        dec.symbol(&mut cdfs.tx_size_cat3[ctx])
     } else {
         0
     };
     if depth != 0 {
         TX_DEPTH_HITS.with(|c| c.set(c.get() + 1));
+        // lane-rectsplit r1: [`decode_rect_split`] handles this shape too
+        // (`sub_tx_size_map[TX_64X32]` is `TX_32X32`, so a depth-1 unit here
+        // is a plain square 32x32) and its 32x32-level sibling arm in
+        // [`decode_block_rect`] is gated pixel-exact -- but at the SUPERBLOCK
+        // level the gate
+        // (`a_real_aomenc_stream_with_a_split_transform_superblock_strip_decodes_pixel_exact`,
+        // `#[ignore]`d with its measurement) still comes out ONE sample off
+        // (seed 50, luma (171,56) ours 147 vs ffmpeg 148, inside a 64x32
+        // strip whose transform resolved to depth 2 / TX_16X16). A refusal
+        // this lane could not lift is not a refusal it may silently ship
+        // wrong pixels past, so the named refusal stays until that gate is
+        // green.
         return Err(unsupported(
             "a superblock-level HORZ/VERT strip with a split transform (per-unit rect \
              prediction is not ported)",
@@ -4952,6 +5278,7 @@ impl PlaneBuf {
                 left.as_deref(),
                 corner,
                 bw,
+                bh,
                 &mut prediction,
             );
         } else {
@@ -5023,6 +5350,7 @@ impl PlaneBuf {
                     above.as_deref(),
                     left.as_deref(),
                     corner,
+                    side,
                     side,
                     &mut prediction,
                 );
@@ -7493,6 +7821,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                                 allow_screen_content_tools,
                                                 base_q_idx,
                                                 tx_select,
+                                                reduced_tx_set,
                                             )?;
                                             // Two 8x8 squares stacked on the
                                             // right, chained through
@@ -7797,6 +8126,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                     allow_screen_content_tools,
                                     base_q_idx,
                                     tx_select,
+                                    reduced_tx_set,
                                 )?;
                                 decode_block_rect(
                                     &mut dec,
@@ -7812,6 +8142,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                     allow_screen_content_tools,
                                     base_q_idx,
                                     tx_select,
+                                    reduced_tx_set,
                                 )?;
                             }
                             PARTITION_VERT => {
@@ -7831,6 +8162,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                     allow_screen_content_tools,
                                     base_q_idx,
                                     tx_select,
+                                    reduced_tx_set,
                                 )?;
                                 decode_block_rect(
                                     &mut dec,
@@ -7846,6 +8178,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                     allow_screen_content_tools,
                                     base_q_idx,
                                     tx_select,
+                                    reduced_tx_set,
                                 )?;
                             }
                             _ => {
@@ -7872,6 +8205,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                         allow_screen_content_tools,
                         base_q_idx,
                         tx_select,
+                        reduced_tx_set,
                     )?;
                     decode_block_rect64(
                         &mut dec,
@@ -7887,6 +8221,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                         allow_screen_content_tools,
                         base_q_idx,
                         tx_select,
+                        reduced_tx_set,
                     )?;
                 }
                 PARTITION_VERT => {
@@ -7906,6 +8241,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                         allow_screen_content_tools,
                         base_q_idx,
                         tx_select,
+                        reduced_tx_set,
                     )?;
                     decode_block_rect64(
                         &mut dec,
@@ -7921,6 +8257,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                         allow_screen_content_tools,
                         base_q_idx,
                         tx_select,
+                        reduced_tx_set,
                     )?;
                 }
                 _ => {
