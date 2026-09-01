@@ -1851,6 +1851,16 @@ struct Neighbours {
     /// lane-rect r2: TX_32X16/TX_16X32 strips deblock their horizontal
     /// edges by tx height (spec 7.14.2 `set_lpf_parameters` dir==VERT).
     tx_h_grid: Vec<u8>,
+    /// Per-4x4-mi CHROMA transform width/height in pixels -- lane-tiny r4.
+    /// A block's chroma transform is `av1_get_max_uv_txsize(bsize)`: the
+    /// largest transform covering the subsampled BLOCK, capped at 32x32. It
+    /// does NOT follow luma's `tx_depth` split, so deriving it as
+    /// `tx_grid / 2` invented chroma transform edges the deblocker then
+    /// filtered (32x16 frames, U plane, seeds 42/47). Written from the
+    /// block's own mi span in [`Self::fill_lf_grid_rect`], the one place
+    /// every caller routes through.
+    uv_tx_grid: Vec<u8>,
+    uv_tx_h_grid: Vec<u8>,
     /// Per-4x4-mi reference frame (`0` = intra, magnitude `1..=7` =
     /// `MV_REFERENCE_FRAME`, negative = that reference coded as `GLOBALMV` --
     /// `lf_level`'s `mode_lf_lut` row 0, lane-av1golden2)
@@ -1932,6 +1942,8 @@ impl Neighbours {
             skip_grid_cols_mi: cols * (SUB / MI),
             tx_grid: vec![0u8; cols * (SUB / MI) * rows * (SUB / MI)],
             tx_h_grid: vec![0u8; cols * (SUB / MI) * rows * (SUB / MI)],
+            uv_tx_grid: vec![0u8; cols * (SUB / MI) * rows * (SUB / MI)],
+            uv_tx_h_grid: vec![0u8; cols * (SUB / MI) * rows * (SUB / MI)],
             ref_grid: vec![0i8; cols * (SUB / MI) * rows * (SUB / MI)],
             delta_lf_grid: vec![[0i8; 4]; cols * (SUB / MI) * rows * (SUB / MI)],
             above_palette_size: vec![0; cols],
@@ -2135,6 +2147,11 @@ impl Neighbours {
         ref_frame: i8,
     ) {
         let (mi_r, mi_c) = at_mi;
+        // `av1_get_max_uv_txsize` under 4:2:0: the block's chroma extent is
+        // half its luma one (min 4 px, the smallest transform), capped at
+        // TX_32X32 -- independent of this block's luma `tx_depth`.
+        let uv_tx_w = ((w_mi * MI / 2).max(4).min(32)) as u8;
+        let uv_tx_h = ((h_mi * MI / 2).max(4).min(32)) as u8;
         let cur = CURRENT_DELTA_LF.with(|c| c.get());
         let snapshot: [i8; 4] = if DELTA_LF_MULTI.with(|c| c.get()) {
             std::array::from_fn(|i| cur[i].clamp(-63, 63) as i8)
@@ -2149,6 +2166,12 @@ impl Neighbours {
                 }
                 if let Some(cell) = self.tx_h_grid.get_mut(idx) {
                     *cell = tx_h_px;
+                }
+                if let Some(cell) = self.uv_tx_grid.get_mut(idx) {
+                    *cell = uv_tx_w;
+                }
+                if let Some(cell) = self.uv_tx_h_grid.get_mut(idx) {
+                    *cell = uv_tx_h;
                 }
                 if let Some(cell) = self.ref_grid.get_mut(idx) {
                     *cell = ref_frame;
@@ -4397,6 +4420,20 @@ fn cfl_scaled(alpha_q3: i32, ac_q3: i32) -> i32 {
 /// [`crate::encode`]'s private `Plane`, whose `edges` this mirrors exactly
 /// (own-edge and reach clamps both), passing what it gathers straight to
 /// [`crate::intra::predict`] instead of hand-rolling `DC_PRED` alone.
+/// lane-tiny r4: raw padded-plane dump for filter-stage bisection, written
+/// only when `var` names a path. Same byte shape as `EC_AV1_PREFILT_DUMP`.
+fn dump_stage(var: &str, y: &PlaneBuf, u: &PlaneBuf, v: &PlaneBuf) {
+    use std::io::Write;
+    if let Ok(path) = std::env::var(var)
+        && let Ok(mut f) = std::fs::File::create(format!("{path}.f0"))
+    {
+        for p in [y, u, v] {
+            let narrow: Vec<u8> = p.data.iter().map(|&s| s as u8).collect();
+            let _ = f.write_all(&narrow);
+        }
+    }
+}
+
 #[derive(Clone)]
 struct PlaneBuf {
     data: Vec<u16>,
@@ -6026,24 +6063,16 @@ fn plane_to_mi(chroma: bool, coord: usize) -> usize {
 /// half its coded block's luma transform, spec's `av1_get_max_uv_txsize`
 /// under 4:2:0 and a block that never splits its own transform).
 fn tx_px_at(n: &Neighbours, chroma: bool, mi_r: usize, mi_c: usize) -> u32 {
-    let luma_tx = n
-        .tx_grid
-        .get(mi_r * n.skip_grid_cols_mi + mi_c)
-        .copied()
-        .unwrap_or(0) as u32;
-    if chroma { luma_tx / 2 } else { luma_tx }
+    let grid = if chroma { &n.uv_tx_grid } else { &n.tx_grid };
+    grid.get(mi_r * n.skip_grid_cols_mi + mi_c).copied().unwrap_or(0) as u32
 }
 
 /// [`tx_px_at`]'s HEIGHT twin (lane-rect r2): the deblocker's horizontal
 /// edges step and gate by transform height, which differs from width only
 /// on rect partition strips.
 fn tx_h_px_at(n: &Neighbours, chroma: bool, mi_r: usize, mi_c: usize) -> u32 {
-    let luma_tx = n
-        .tx_h_grid
-        .get(mi_r * n.skip_grid_cols_mi + mi_c)
-        .copied()
-        .unwrap_or(0) as u32;
-    if chroma { luma_tx / 2 } else { luma_tx }
+    let grid = if chroma { &n.uv_tx_h_grid } else { &n.tx_h_grid };
+    grid.get(mi_r * n.skip_grid_cols_mi + mi_c).copied().unwrap_or(0) as u32
 }
 
 /// `get_tx_size_context` (spec 9.3's `TxDepthCtx`, libaom
@@ -7850,7 +7879,12 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         frame_height as usize,
     );
     let (deblocked_y, deblocked_u, deblocked_v) = (y.clone(), u.clone(), v.clone());
+    // lane-tiny r4: post-deblock / post-CDEF dumps mirroring aomdec's own
+    // EC_AV1_POSTDEBLOCK_DUMP (decodeframe.c ~5404) -- with the pre-filter
+    // dump above these bisect WHICH filter stage introduced a mismatch.
+    dump_stage("EC_AV1_POSTDEBLOCK_DUMP", &y, &u, &v);
     apply_cdef(&mut y, &mut u, &mut v, cdef, &neighbours);
+    dump_stage("EC_AV1_POSTCDEF_DUMP", &y, &u, &v);
     apply_loop_restoration(&mut y, &mut u, &mut v, &deblocked_y, &deblocked_u, &deblocked_v, lr, &lr_grid);
 
     let (fw, fh) = (frame_width as usize, frame_height as usize);
@@ -13745,7 +13779,12 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
         frame_height as usize,
     );
     let (deblocked_y, deblocked_u, deblocked_v) = (y.clone(), u.clone(), v.clone());
+    // lane-tiny r4: post-deblock / post-CDEF dumps mirroring aomdec's own
+    // EC_AV1_POSTDEBLOCK_DUMP (decodeframe.c ~5404) -- with the pre-filter
+    // dump above these bisect WHICH filter stage introduced a mismatch.
+    dump_stage("EC_AV1_POSTDEBLOCK_DUMP", &y, &u, &v);
     apply_cdef(&mut y, &mut u, &mut v, cdef, &neighbours);
+    dump_stage("EC_AV1_POSTCDEF_DUMP", &y, &u, &v);
     apply_loop_restoration(&mut y, &mut u, &mut v, &deblocked_y, &deblocked_u, &deblocked_v, lr, &lr_grid);
 
     let motion_field = build_motion_field(
