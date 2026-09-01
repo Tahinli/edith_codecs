@@ -66,6 +66,17 @@ EVIDENCE: cargo test output, this report | ran the rect64 gate at 3808cf8 / 95b3
 fix-now for the intra rect64 owner: encode that gate's seed-67 fixture, raise the cap locally, and
 bisect the first mismatching block — the long tail is a downstream symptom, not the defect.
 
+## Test scope actually run
+
+- `cargo test -p ec-av1 --lib a_real_aomenc_superres_stream_with_compound` → 1 passed, 0 failed.
+- `cargo test -p ec-av1 --lib a_real_aomenc_stream_with_a_superblock_level_horz_vert_partition_decodes`
+  → 1 passed, 0 failed (this is the gate the Golomb lift turned red; green again after the revert).
+- `cargo test -p ec-av1 --lib refusal_inventory` → 3 passed; `... gate_coverage` → 2 passed.
+- `cargo test -p ec-av1 --lib golomb` → 3 passed (at ee1f980, before the revert).
+- A whole `cargo test -p ec-av1 --lib` run was started twice: the first completed and showed exactly
+  one failure (the seed-67 one above, since fixed by the revert); the second was killed mid-run by
+  the environment, so no full-suite total is claimed here. The verifier owns the full suite.
+
 ## Residue
 
 - fix-now → **not** done, deferred: **warp under a scaled reference** stays refused. The libaom
