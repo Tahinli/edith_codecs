@@ -11046,6 +11046,22 @@ fn decode_inter_block8(
                         gm_table[(ref1 - LAST_FRAME) as usize],
                     ),
                 );
+                // lane-inter8 r3: byte-format-identical to the oracle's
+                // rung-4 `EC_MODE_VAL`, so the leaf's mode+mv VALUE ladder
+                // diffs line for line against a real aomdec.
+                if std::env::var_os("EC_TRACE_MODE").is_some() {
+                    eprintln!(
+                        "EC_MODE_VAL mi_row={} mi_col={} mode={} ref0={} ref1={} mv0=({},{}) rng={}",
+                        leaf_mi.0,
+                        leaf_mi.1,
+                        compound_mode + 17,
+                        ref0,
+                        ref1,
+                        mv0.0,
+                        mv0.1,
+                        dec.debug_state().0
+                    );
+                }
 
                 // spec 5.11.25: same gating [`decode_inter_block`]'s own
                 // compound arm uses, keyed off `outer_at`'s [`SUB`]-grid
