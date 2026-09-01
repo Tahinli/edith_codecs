@@ -11281,7 +11281,8 @@ mod tests {
                         ObuKind::SequenceHeader(seq) => {
                             assert!(
                                 seq.enable_cdef && seq.enable_restoration,
-                                "{name}: --enable-cdef=1 --enable-restoration=1 did not reach                                  aomenc (seq enable_cdef={} enable_restoration={}, seed {seed})",
+                                "{name}: --enable-cdef=1 --enable-restoration=1 did not reach \
+                                 aomenc (seq enable_cdef={} enable_restoration={}, seed {seed})",
                                 seq.enable_cdef,
                                 seq.enable_restoration
                             );
@@ -11300,7 +11301,8 @@ mod tests {
                     if require_tile_left_palette {
                         assert!(
                             header.allow_screen_content_tools,
-                            "{name}: --tune-content=screen/--enable-palette=1 did not reach                              aomenc -- allow_screen_content_tools is 0 (seed {seed})"
+                            "{name}: --tune-content=screen/--enable-palette=1 did not reach \
+                             aomenc -- allow_screen_content_tools is 0 (seed {seed})"
                         );
                     }
                     assert_eq!(

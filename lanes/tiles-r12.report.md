@@ -77,7 +77,28 @@ unproven. Disposition: **deferred(a decodable single-tile control of the same co
 unchanged from r11, no budget spent on it this round.
 
 ## Test totals
-See the report footer line appended after the suite run.
+`EC_AV1_REQUIRE_AOMENC=1 cargo test -p ec-av1 --lib -- --test-threads=2`:
+**283 passed, 0 failed, 26 ignored** (1860.6 s), log `$HOME/.cache/tiles-suite.log`.
+Includes `refusal_inventory` (3 tests) and `gate_coverage` (5 tests) green, and all four
+live multi-tile arms (`intra`, `intra_10bit`, `inter_10bit`, `palette`) ok; the 8-bit
+`multi_tile_inter` arm stays `ignored` with its open-defect reason in the ignore string.
+
+EVIDENCE: $HOME/.cache/tiles-suite.log | `EC_AV1_REQUIRE_AOMENC=1 nice -n 10 cargo test -p ec-av1 --lib -j3 -- --test-threads=2` | `test result: ok. 283 passed; 0 failed; 26 ignored ... 1860.64s`
+
+## Charter premise re-measured: main does NOT already carry this fix
+The charter said lane-palette2 had fixed "no `use_filter_intra` read on palette-Y blocks"
+on main since 3808cf8. **False at main df5d630**: `git show main:crates/ec-av1/src/decode.rs`
+has no palette condition on EITHER `use_filter_intra` read (square site ~5367, rect site
+~3903) — the branch's `&& palette_y_pending.is_none()` is not a duplicate and main still
+needs it. The rect site is unreachable for palette content (it refuses
+`allow_screen_content_tools` wholesale at decode.rs:3596), so one guarded site is the whole
+class, as the r12 sweep said.
+
+## r12 restart (the first r12 agent was killed mid-report)
+Its commit 99f0091 was complete and the tree was clean; this round finished the suite run,
+the main-duplication check above, and one cosmetic fix: the two new override asserts had a
+missing `\` line continuation, so their panic messages carried 30 spaces mid-sentence
+(`stream.rs:11284`, `stream.rs:11304`).
 
 ## Files changed
 - `crates/ec-av1/src/decode.rs` — filter-intra/palette gating fix; `PALETTE_TILE_LEFT_HITS`.
