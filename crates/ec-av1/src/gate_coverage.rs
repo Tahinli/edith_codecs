@@ -150,6 +150,13 @@ const NEVER_EXERCISED_10BIT: &[(&str, &str)] = &[
     // carries is a hole here too; the seven extra ones below are tools an
     // 8-bit gate DOES enable, whose high-bit-depth path no stream has ever
     // touched -- exactly the shape that hid the two lane-hbdinter defects.
+    // `enable-restoration` LEFT this list on 2026-09-01: lane-hbdinter's
+    // 10-bit inter gate passes `--enable-restoration=1` and asserts a real
+    // Wiener/SGR unit fired, which is what caught the two defects (SGR box
+    // sums never brought back to the 8-bit scale, Wiener clamp at the wrong
+    // bound). `enable-dist-wtd-comp` and `enable-global-motion` left it the
+    // same day for the same reason: lane-cwarp's 10-bit compound global-warp
+    // gate passes `=1` for both.
     (
         "enable-1to4-partitions",
         "hole at both depths, see the 8-bit list",
@@ -167,10 +174,6 @@ const NEVER_EXERCISED_10BIT: &[(&str, &str)] = &[
         "hole at both depths, see the 8-bit list",
     ),
     (
-        "enable-dist-wtd-comp",
-        "hole at both depths, see the 8-bit list",
-    ),
-    (
         "enable-dual-filter",
         "hole at both depths, see the 8-bit list",
     ),
@@ -180,10 +183,6 @@ const NEVER_EXERCISED_10BIT: &[(&str, &str)] = &[
     ),
     (
         "enable-flip-idtx",
-        "hole at both depths, see the 8-bit list",
-    ),
-    (
-        "enable-global-motion",
         "hole at both depths, see the 8-bit list",
     ),
     (
@@ -203,10 +202,6 @@ const NEVER_EXERCISED_10BIT: &[(&str, &str)] = &[
     (
         "enable-ref-frame-mvs",
         "hole at both depths, see the 8-bit list",
-    ),
-    (
-        "enable-restoration",
-        "8-bit only -- THE instance this split was built for: every 10-bit gate passed `--enable-restoration=0`, so the SGR box sums and the Wiener clamp were never run at 10 bits and both were wrong (lane-hbdinter, 2026-09-01)",
     ),
     (
         "enable-smooth-intra",

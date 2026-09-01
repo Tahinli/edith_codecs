@@ -529,6 +529,9 @@ fn apply_wiener_stripe(
     if w == 0 || h == 0 {
         return;
     }
+    let bd = i64::from(crate::decode::bit_depth());
+    let wiener_bias = 1i64 << (bd + 3);
+    let wiener_limit = 1i64 << (bd + 5);
     let rows = h + 6;
     let mut inter = vec![0i32; rows * w];
     for r in 0..rows {
@@ -541,8 +544,20 @@ fn apply_wiener_stripe(
                 sum += tap as i64
                     * lr_sample(cdef, deblocked, stride, plane_w, plane_h, v_start, v_end, row, x) as i64;
             }
-            // `WIENER_CLAMP_LIMIT(round0=3, bd=8) - 1`.
-            inter[r * w + c] = round2(sum, 3).clamp(0, 8191) as i32;
+            // libaom's `highbd_convolve_add_src_horiz_hip` clamps its
+            // *biased* intermediate to `[0, WIENER_CLAMP_LIMIT(3, bd) - 1]`
+            // (`convolve.h:43`, `(1 << (bd + 1 + FILTER_BITS - round0))`).
+            // Its bias over this crate's unbiased sum is exactly
+            // `(1 << (bd + FILTER_BITS - 1)) >> round0 == 1 << (bd + 3)`
+            // (the `rounding` term of that function, the rest cancelling
+            // against `WienerInfo`'s derived centre tap as the doc comment
+            // above derives), so the same clamp in *this* domain is the
+            // bound shifted down by that bias. At 8-bit neither end is ever
+            // reached by real content, which is why the old fixed `[0, 8191]`
+            // survived every 8-bit gate; at 10-bit the upper end is
+            // `128 * 1023 >> 3 == 16368`, well past `8191`, so a fixed
+            // 8-bit limit silently truncated most 10-bit Wiener pixels.
+            inter[r * w + c] = round2(sum, 3).clamp(-wiener_bias, wiener_limit - 1 - wiener_bias) as i32;
         }
     }
     for r in 0..h {
@@ -646,7 +661,15 @@ fn compute_ab(
                     b += px;
                 }
             }
-            let p = if a * n < b * b { 0 } else { a * n - b * b };
+            // libaom `restoration.c:660` -- the box sums are brought back
+            // to the 8-bit scale before `p` is formed (`a` is a sum of
+            // squares, so it loses twice the shift `b` does); `B[k]` below
+            // keeps the RAW `b`, only `p` uses the scaled pair. At 8-bit
+            // both shifts are 0, which is why this was invisible until now.
+            let bd_shift = u32::from(crate::decode::bit_depth()).saturating_sub(8);
+            let a_s = round2(a, 2 * bd_shift);
+            let b_s = round2(b, bd_shift);
+            let p = if a_s * n < b_s * b_s { 0 } else { a_s * n - b_s * b_s };
             let z = round2(p * s as i64, SGRPROJ_MTABLE_BITS).clamp(0, 255) as usize;
             let a_val = SGR_X_BY_XPLUS1[z];
             let b_val = round2(
