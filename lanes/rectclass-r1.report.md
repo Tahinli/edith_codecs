@@ -66,28 +66,44 @@ be 1D, do carry the class-1 row.
     export CARGO_TARGET_DIR=$HOME/.cache/cargo-target-rectclass EC_NOMEMGUARD=1 EC_AV1_REQUIRE_AOMENC=1
     nice -n 10 cargo test -p ec-av1 --lib -j3 a_real_aomenc_stream_with_a_1d_tx_class -- --nocapture
 
-Recipe: lane overrides FIRST (class `aomenc-first-flag-wins`) —
-`--enable-rect-partitions=1 --enable-tx-size-search=1 --enable-flip-idtx=1
---min-partition-size=8 --max-partition-size=32`, then the base recipe; 12 attempts,
-seeds 42..47, alternating 8-bit / 10-bit (`--input-bit-depth=10 --bit-depth=10`, y4m
-needs `-strict -1`), 192x128 gradients. Every successful decode is pixel-compared against
-ffmpeg (luma+U+V); a decode error is only tolerated if it contains "unsupported"; the
-rect-TU counter is folded in PER ATTEMPT after that attempt compared; the class-1 refusal
-counter is summed over ALL attempts including refused ones (that is exactly where a 1D
-class on a rect TU would surface). Asserts: `matched > 0`, `matched_10bit > 0`,
-`compared_rect_tus > 0`, `class1_refusals == 0`.
+Recipe (corrected mid-round by the coordinator: aomenc keeps the **LAST** occurrence of a
+repeated `--enable-*` flag, measured by md5 of four orderings -- the opposite of the
+`aomenc-first-flag-wins` memory entry, so this lane's overrides go AFTER the base recipe):
+base recipe, then `--enable-rect-partitions=1 --enable-tx-size-search=1 --enable-flip-idtx=1
+--reduced-tx-type-set=0 --min-partition-size=8 --max-partition-size=32`. 12 attempts,
+alternating 8-bit / 10-bit (`--input-bit-depth=10 --bit-depth=10`; y4m needs `-strict -1`),
+cq 20/40 sweep, 192x128 `testsrc2` under a sinusoidal `geq` luma+chroma stripe (period sweep
+4/6/8/12/16) plus `noise` -- the content family the existing
+`a_real_aomenc_min8_stream_with_tx_class1_decodes_pixel_exact` gate proved is what makes RD
+resolve `V_DCT`/`H_DCT` at all.
 
-EVIDENCE: $HOME/.cache/rectclass-suite.log + gate stdout | 12 real aomenc encodes (6 seeds x 8-bit/10-bit) decoded and pixel-compared vs ffmpeg | 8 pixel-exact decodes (4 of them 10-bit), 4 named refusals, 10 rect coefficient TUs on compared attempts, 1D-class-on-rect refusals: 0
+FLAG ARRIVAL is asserted, not assumed -- one decoder-side counter per override:
+`rect_partition_hits` (rect partitions), `tx_depth_hits` (tx-size search),
+`tx_class1_hits` (1D types). The first run of the corrected ordering FAILED on the third:
+smooth gradients at cq 45 produced zero 1D transforms, and `--reduced-tx-type-set=0` was
+missing, so aomenc's reduced set narrowed every block to DCT_DCT/IDTX. Both were fixed in
+the recipe (the gate was NOT weakened).
 
-Measurement recorded per the charter: aomenc at these settings never puts a 1D tx class
-on a rect TU that reaches a reader — not because RD avoids it, but because the shapes
+Every successful decode is pixel-compared against ffmpeg (luma+U+V); a decode error is
+only tolerated if it contains "unsupported"; the rect-TU and arrival counters are folded in
+PER ATTEMPT after that attempt compared; the class-1 refusal counter is summed over ALL
+attempts including refused ones (that is exactly where a 1D class on a rect TU would
+surface). Asserts: `matched > 0`, `matched_10bit > 0`, `compared_rect_tus > 0`,
+`compared_rect_parts > 0`, `compared_tx_depths > 0`, `compared_class1 > 0`,
+`class1_refusals == 0`.
+
+EVIDENCE: $HOME/.cache/rectclass-r1-suite.log + gate stdout | 12 real aomenc encodes (6 period/cq points x 8-bit/10-bit) decoded and pixel-compared vs ffmpeg | 11 pixel-exact decodes (5 of them 10-bit), 1 named refusal, 185 rect coefficient TUs on compared attempts, flag arrival: 104 rect partitions / 48 nonzero tx depths / 10 V_DCT-H_DCT square transforms, 1D-class-on-rect refusals: 0
+
+Measurement recorded per the charter: these streams DO carry V_DCT/H_DCT transforms (10 of
+them on compared attempts) and DO carry rect transform units (185 of them), and not one of
+the 1D types ever landed on a rect TU — not because RD avoids it, but because the shapes
 whose sets contain 1D types are refused earlier. Widening the recipe (`--tune-content=screen`,
 cq sweep) cannot change that while those refusals stand, so it was not run.
 
 ## Test totals
 
 `cargo test -p ec-av1 --lib` (EC_AV1_REQUIRE_AOMENC=1): see
-`$HOME/.cache/rectclass-suite.log` — result line at the tail.
+`$HOME/.cache/rectclass-r1-suite.log` — result line at the tail.
 
 ## Residue
 
