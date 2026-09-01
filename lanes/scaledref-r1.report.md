@@ -13,10 +13,10 @@ verified, gated and kept; everything below r1 adds is on top of it.
 | `crates/ec-av1/src/decode.rs` `obmc_neighbour_pred` / `obmc_blend` | each OBMC neighbour is re-predicted through the scaled walk against **its own** reference's scale (`frame_width` threaded in) |
 | `crates/ec-av1/src/decode.rs` (~10170) | warp under a scaled reference: libaom `allow_warp` (reconinter.c:41) suppresses local AND global warp and predicts translationally; that suppression is implemented, but the case is still refused by name (see residue) |
 | `crates/ec-av1/src/decode.rs` `decode_inter_block8` | single-ref/compound/OBMC MC of the 8x8 leaf threaded for a scaled reference (`frame_width` param) |
-| `crates/ec-av1/src/decode.rs` `read_golomb` (~1349) | **r1**: reads up to 32 leading zeros instead of erroring at 20; refusal string deleted |
+| `crates/ec-av1/src/decode.rs` `read_golomb` (~1349) | **r1**: lift implemented, then REVERTED (`abec872`) -- it exposed a hidden defect, see below. Only a comment recording the finding + repro remains |
 | `crates/ec-av1/src/decode.rs` `obmc_mask` + `obmc_blend` | **r1**: `obmc_mask_2 = {45,64}` added and one-sided chroma OBMC for an 8x8 luma block (`av1_skip_u4x4_pred_in_obmc`, reconinter.c:820, `DISABLE_CHROMA_U8X8_OBMC == 0` ⇒ chroma skipped in the ABOVE pass, kept in the LEFT pass). Before this, the first real 8x8 OBMC block hit `unreachable!` in `obmc_mask` |
 | `crates/ec-av1/src/stream.rs` | the gate below |
-| `crates/ec-av1/src/refusal_inventory.rs` | 3 refusal strings gone (compound-scaled, OBMC/interintra-scaled folded into a warp-only string, Golomb tail); 47 → 44 |
+| `crates/ec-av1/src/refusal_inventory.rs` | 2 refusal strings gone (compound-scaled; OBMC/interintra-scaled folded into a warp-only string); 47 → 45 |
 
 ## Gates
 
@@ -32,22 +32,39 @@ verified, gated and kept; everything below r1 adds is on top of it.
 
    EVIDENCE: /tmp/.../scratchpad/gate1.log | aomenc superres d=16 + compound/OBMC/interintra, 12 seeds x 24 frames decoded and compared to ffmpeg | 12/12 pixel-exact, 0 refusals, superres_hits=291 predict_scaled_hits=3198 scaled_compound=500 scaled_obmc=9 scaled_interintra=1
 
-2. `decode::tests::golomb_tails_read_back_past_the_old_twenty_bit_cap` — every prefix length
-   0..=31, smallest and largest value at each, written by `tile::write_golomb` (the syntax's
-   inverse) and read back by the reader real streams use.
+2. (withdrawn) `decode::tests::golomb_tails_read_back_past_the_old_twenty_bit_cap` — written, passing,
+   and reverted with the change it gated. See "The Golomb tail" below.
 
-   `cargo test -p ec-av1 --lib golomb` → 3 passed (this one plus the two pre-existing tile tests).
-
-   EVIDENCE: cargo test output | write_golomb -> read_golomb round trip, 64 values across 32 prefix lengths | all equal, values ≥ 2^19 that used to return `unsupported` now decode
-
-## Refusals lifted (3)
+## Refusals lifted (2)
 
 - "a compound-reference block with a scaled reference (superres, unimplemented)" — gate 1, 500 hits.
 - "warp/OBMC/interintra prediction with a scaled reference (superres, unimplemented)" — narrowed to
   "warp prediction with a scaled reference"; OBMC (9 hits) and interintra (1 hit) proven by gate 1.
-- "a Golomb tail longer than this decoder reads" — gate 2.
 
 `refusal_inventory` and `gate_coverage` tests green.
+
+## The Golomb tail — a refusal that is masking a real defect (finding, fix-now for its owner)
+
+Implemented as charted (`ee1f980`): read up to 32 leading zeros (dav1d's `len < 32`) instead of
+erroring at 20, u64 accumulator, plus a round-trip gate over every prefix length 0..=31 through
+`tile::write_golomb`. Bit-identical for every tail an encoder writes — our own writer tops out at 19
+leading zeros (`tile::MAX_LEVEL == MAX_BR_LEVEL + (1 << 19)`), and libaom errors long before.
+
+It still turned a green gate RED:
+`a_real_aomenc_stream_with_a_superblock_level_horz_vert_partition_decodes_pixel_exact` failed at
+**seed 67, frame 0 luma**. Bisected against main `3808cf8` and against the lane's own WIP `95b3e70`
+(both pass), and main's run prints, for that very seed:
+`seed 67 refusal: unsupported: AV1 tile (a Golomb tail longer than this decoder reads)`.
+
+So the cap is not a capability limit — it is the point where an intra rect64 stream that has ALREADY
+desynced first asks for something impossible (a key-frame coefficient level above `1 << 19`).
+Class `refusal-hides-a-defect`. Reverted in `abec872`; `d8788fb` records the finding, the repro and
+"lift this together with that defect's fix" at the cap itself.
+
+EVIDENCE: cargo test output, this report | ran the rect64 gate at 3808cf8 / 95b3e70 / lane HEAD with and without the lift | pass / pass / FAIL seed 67 frame 0 luma; main prints the Golomb refusal for seed 67
+
+fix-now for the intra rect64 owner: encode that gate's seed-67 fixture, raise the cap locally, and
+bisect the first mismatching block — the long tail is a downstream symptom, not the defect.
 
 ## Residue
 
@@ -75,7 +92,7 @@ verified, gated and kept; everything below r1 adds is on top of it.
 - accepted: **10-bit not covered.** `Picture` planes are `Vec<u8>`; 10-bit input is refused before
   any of this code runs (see memory `his-av1-library-is-10-bit`, lane-hbd10). The 8/10-bit half of
   the charter's gate line is unreachable from this lane.
-- Reported conflict, not silently resolved: the charter states the spec's `read_golomb` caps at 32
+- Reported conflict, not silently resolved (charter premise): the charter states the spec's `read_golomb` caps at 32
   leading zeros. Locally verifiable sources disagree — libaom `read_golomb` (decodetxb.c:30) calls a
   21st prefix bit a CORRUPT FRAME, which is exactly what the old refusal mirrored; dav1d reads up to
   32. There is no AV1 spec copy on this box and the network is unreachable from the sandbox
