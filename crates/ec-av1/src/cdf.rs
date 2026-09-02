@@ -3644,6 +3644,53 @@ mod tests {
         }
     }
 
+    /// Every `eob_pt` table libaom keeps as `[q][plane][2]` has its class-1
+    /// (`tx_class != TX_CLASS_2D`) row here, and it is the *other* row.
+    ///
+    /// libaom only ever trained the class-1 row where a 1D tx type can occur:
+    /// `av1_get_ext_tx_set_type` returns `DCT_IDTX`/`DCTONLY` once
+    /// `tx_size_sqr_up >= TX_32X32`, so the 512- and 1024-point rows are the
+    /// untouched uniform initialiser. Pinned so a future table edit cannot
+    /// quietly narrow the domain back to 2D-only (lane-eobc1 r1; values
+    /// diffed against `token_cdfs.h` by `scripts/extract-eob-class1.py`).
+    #[test]
+    fn eob_pt_class1_rows_cover_every_size() {
+        fn uniform(row: &[u16]) -> bool {
+            let n = row.len() - 1;
+            row[..n].iter().enumerate().all(|(i, &v)| {
+                let n = n as u32;
+                v == (((i as u32 + 1) * 32768 + n / 2) / n) as u16
+            })
+        }
+        let trained: [(&[u16], &[u16]); 8] = [
+            (&EOB_PT_16_LUMA, &EOB_PT_16_LUMA_CLASS1),
+            (&EOB_PT_16_CHROMA, &EOB_PT_16_CHROMA_CLASS1),
+            (&EOB_PT_64_LUMA, &EOB_PT_64_LUMA_CLASS1),
+            (&EOB_PT_64_CHROMA, &EOB_PT_64_CHROMA_CLASS1),
+            (&EOB_PT_128_CHROMA, &EOB_PT_128_CHROMA_CLASS1),
+            (&EOB_PT_256_LUMA, &EOB_PT_256_LUMA_CLASS1),
+            (&EOB_PT_256_CHROMA, &EOB_PT_256_CHROMA_CLASS1),
+            (&EOB_PT_512_LUMA, &EOB_PT_512_LUMA_CLASS1),
+        ];
+        for (two_d, class1) in trained {
+            assert_row_shape(class1);
+            assert_eq!(two_d.len(), class1.len());
+        }
+        for (two_d, class1) in &trained[..7] {
+            assert_ne!(two_d, class1, "class-1 row is a copy of the 2D row");
+            assert!(!uniform(class1), "class-1 row was never trained");
+        }
+        for row in [
+            &EOB_PT_512_LUMA_CLASS1[..],
+            &EOB_PT_512_CHROMA_CLASS1[..],
+            &EOB_PT_1024_LUMA_CLASS1[..],
+            &EOB_PT_1024_CHROMA_CLASS1[..],
+        ] {
+            assert_row_shape(row);
+            assert!(uniform(row), "libaom trained a 32-point class-1 row");
+        }
+    }
+
     #[test]
     fn inter_frame_tables_are_well_formed_cdfs() {
         for row in INTRA_INTER {
@@ -5194,6 +5241,22 @@ pub const EOB_PT_16_CHROMA_CLASS1_Q0: [u16; 6] = [1904, 3354, 7763, 14647, 32768
 pub const EOB_PT_16_CHROMA_CLASS1_Q1: [u16; 6] = [2497, 4096, 8866, 16993, 32768, 0];
 pub const EOB_PT_16_CHROMA_CLASS1: [u16; 6] = [3192, 5032, 10297, 19755, 32768, 0];
 pub const EOB_PT_16_CHROMA_CLASS1_Q3: [u16; 6] = [7297, 10767, 19273, 28194, 32768, 0];
+
+/// `EOB_PT_128_LUMA`'s class-1 sibling (`av1_default_eob_multi128_cdfs[q][0][1]`),
+/// read by a 16x8/8x16 luma transform whose inherited `tx_type` is 1D
+/// (`TxbSet::LumaRect16x8`) -- machine-extracted, scripts/extract-eob-class1.py.
+pub const EOB_PT_128_LUMA_CLASS1_Q0: [u16; 9] = [371, 699, 1254, 4830, 9479, 12562, 17497, 32768, 0];
+pub const EOB_PT_128_LUMA_CLASS1_Q1: [u16; 9] = [217, 352, 618, 2303, 5261, 9969, 17472, 32768, 0];
+pub const EOB_PT_128_LUMA_CLASS1: [u16; 9] = [354, 558, 944, 2760, 7287, 14037, 21779, 32768, 0];
+pub const EOB_PT_128_LUMA_CLASS1_Q3: [u16; 9] = [886, 1731, 3271, 8469, 15569, 22126, 28383, 32768, 0];
+
+/// `EOB_PT_32_CHROMA`'s class-1 sibling (`av1_default_eob_multi32_cdfs[q][1][1]`),
+/// read by an 8x4/4x8 chroma transform under a 1D luma `tx_type`
+/// (`TxbSet::ChromaRect8x4`) -- machine-extracted, scripts/extract-eob-class1.py.
+pub const EOB_PT_32_CHROMA_CLASS1_Q0: [u16; 7] = [1786, 3179, 6902, 11357, 19054, 32768, 0];
+pub const EOB_PT_32_CHROMA_CLASS1_Q1: [u16; 7] = [2578, 4124, 8181, 13670, 24234, 32768, 0];
+pub const EOB_PT_32_CHROMA_CLASS1: [u16; 7] = [3542, 5502, 10415, 16760, 25644, 32768, 0];
+pub const EOB_PT_32_CHROMA_CLASS1_Q3: [u16; 7] = [7699, 10897, 20891, 26926, 31628, 32768, 0];
 
 /// `EOB_PT_128_CHROMA`'s class-1 sibling (`av1_default_eob_multi128_cdfs[q][1][1]`).
 pub const EOB_PT_128_CHROMA_CLASS1_Q0: [u16; 9] = [2054, 3472, 5869, 14232, 18242, 20590, 26752, 32768, 0];
