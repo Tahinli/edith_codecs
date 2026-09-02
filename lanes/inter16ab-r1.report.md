@@ -68,3 +68,7 @@ before AND after this round the stop is at a 16x16-level 1:4 partition (before: 
 "AB or 1:4" refusal, value=8 = PARTITION_HORZ_4 measured with `EC_AV1_TRACE=1` at mi=(12,44); after:
 the narrowed 1:4 refusal), 1 frame completed (`EC_AV1_FINAL_DUMP` file count). Unchanged, as expected
 for an AB-only lift.
+
+## Suite
+`systemd-run --user --unit=inter16ab-suite-… -p MemoryMax=10G … cargo test -p ec-av1 --lib -j3` →
+`test result: ok. 371 passed; 0 failed; 32 ignored` (log `$HOME/.cache/inter16ab-suite-r1.log`).
