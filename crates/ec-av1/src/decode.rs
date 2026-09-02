@@ -7400,9 +7400,20 @@ fn decode_intra_rect_in_inter(
         (8, 32) => (1, 2),
         (16, 64) => (2, 3),
         _ => {
-            return Err(unsupported(
-                "an intra-coded 16x4/4x16 strip on the inter block path (the 16x16-level 1:4 inter partition is refused before this point)",
-            ))
+            if std::env::var_os("EC_OBMCREC").is_some() {
+                eprintln!(
+                    "OBMCREC intra-in-inter shape bw={bw} bh={bh} mi=({mi_r},{mi_c}) skip={skip}"
+                );
+            }
+            // lane-obmcrec r1: the message used to name a 16x4/4x16 strip
+            // (class refusal-names-a-correlate). Measured with `EC_OBMCREC=1`
+            // on three 2 s cuts of the 10-bit 1920x792 128-superblock stream:
+            // every arrival here is a 128x64 block -- a PARTITION_HORZ half of
+            // a 128 superblock coded INTRA inside an inter frame, at mi
+            // (128,416) / (192,0) / (192,0) -- not a strip at all.
+            return Err(unsupported(format!(
+                "an intra-coded {bw}x{bh} block on the inter block path (no size-group/tx-category row for that shape here)"
+            )));
         }
     };
     // [`read_intra_mode_rect`]'s own refusal: palette/intrabc syntax is
