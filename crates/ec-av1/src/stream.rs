@@ -7519,10 +7519,12 @@ mod tests {
     /// oracle `aomdec`'s `EC_TRACE` prints `EC_PART_VAL ... bsize=3 value=3`
     /// on this recipe's inter frames.
     ///
-    /// `--enable-rect-partitions=0` because the 8x4/4x8 sub-8x8 leaves are
-    /// still refused (a rectangular sub-8x8 inter transform is unimplemented);
-    /// with rect on, aomenc picks HORZ/VERT below 8x8 far more often than
-    /// SPLIT and no attempt reaches a split group.
+    /// Attempts 0..7 run `--enable-rect-partitions=0`, where aomenc can only
+    /// pick SPLIT below 8x8; attempts 8..15 repeat the schedule with rect on,
+    /// where it picks HORZ/VERT below 8x8 far more often than SPLIT -- the VERT
+    /// arm (two `BLOCK_4X8` inter leaves, `decode_inter_sub8_rect2`) is what the
+    /// `rect_fired` assert pins. The HORZ twin decodes but is refused by name
+    /// (lane-intersub8 r3: a measured sweep desyncs the block to its right).
     #[test]
     fn a_real_aomenc_inter_sequence_with_a_sub8x8_inter_split_decodes_pixel_exact() {
         const NAME: &str =
@@ -7538,10 +7540,17 @@ mod tests {
         }
         let (width, height, frame_count) = (192usize, 128usize, 6usize);
         let mut fired = 0u32;
+        // lane-intersub8 r3: attempts 8..15 repeat the same schedule with
+        // `--enable-rect-partitions=1`, where aomenc picks PARTITION_VERT below
+        // 8x8 (two BLOCK_4X8 inter leaves, one shared 4x4 chroma unit predicted
+        // from BOTH sub-blocks' mvs). The HORZ twin is still refused by name.
+        let mut rect_fired = 0u32;
         let mut refusals: Vec<String> = Vec::new();
         let mut out_of_scope_mismatch = 0u32;
         for bit_depth in [8u32, 10u32] {
-            for attempt in 0..8u32 {
+            for attempt in 0..16u32 {
+                let rect = attempt / 8;
+                let rect_arg = format!("--enable-rect-partitions={rect}");
                 // lane-intersub8 r2, measured schedule (sweep of cq
                 // {8,10,12,14,16,18,20} x sp {3,6,9,12} x both depths,
                 // `decode_probe`'s `sub8_inter_split:` counter vs an ffmpeg
@@ -7557,7 +7566,7 @@ mod tests {
                 // is not selecting quantizers that hide a defect of its own
                 // shape.
                 let cq = [12, 14][(attempt % 2) as usize];
-                let sp = 3 + (attempt / 2) * 3;
+                let sp = 3 + ((attempt % 8) / 2) * 3;
                 let duration = frame_count as f64 / 25.0;
                 let source = format!(
                     "color=c=gray:s={width}x{height}:d={duration}:r=25,format=gray,\
@@ -7592,6 +7601,7 @@ mod tests {
                     "--enable-rect-partitions=0", "--enable-ab-partitions=0",
                     "--enable-1to4-partitions=0", "--min-partition-size=4",
                     "--max-partition-size=16",
+                    &rect_arg,
                     "--obu", "-o", "-", "-",
                 ];
                 let mut child = Command::new(aomenc_path())
@@ -7615,6 +7625,7 @@ mod tests {
                 );
                 let stream = out.stdout;
                 let before = decode::sub8_inter_split_hits();
+                let before_rect = decode::sub8_inter_rect_hits();
                 let frames = match decode_stream(&stream) {
                     Err(e) => {
                         let msg = e.to_string();
@@ -7628,7 +7639,10 @@ mod tests {
                     }
                     Ok(frames) => frames,
                 };
-                let groups = decode::sub8_inter_split_hits() - before;
+                let split_groups = decode::sub8_inter_split_hits() - before;
+                let rect_now = decode::sub8_inter_rect_hits();
+                let rect_groups = (rect_now.0 - before_rect.0) + (rect_now.1 - before_rect.1);
+                let groups = split_groups + rect_groups;
                 let ffmpeg_frames = if bit_depth == 10 {
                     ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count)
                 } else {
@@ -7645,7 +7659,7 @@ mod tests {
                         out_of_scope_mismatch += 1;
                         eprintln!(
                             "{NAME}: {bit_depth}-bit attempt {attempt} MISMATCHES with zero \
-                             sub-8x8 inter split group -- another shape's defect"
+                             sub-8x8 inter group -- another shape's defect"
                         );
                     }
                     refusals.push(format!(
@@ -7663,15 +7677,24 @@ mod tests {
                     assert_eq!(got.v, want.v, "V frame {i} ({bit_depth}-bit attempt {attempt})");
                 }
                 fired += 1;
+                if rect_groups > 0 {
+                    rect_fired += 1;
+                }
             }
         }
         assert_eq!(
             out_of_scope_mismatch, 0,
-            "{NAME}: attempts mismatched with no sub-8x8 inter split group"
+            "{NAME}: attempts mismatched with no sub-8x8 inter group"
         );
         assert!(
             fired >= 2,
             "{NAME}: fewer than 2 firing+pixel-exact attempts:\n{}",
+            refusals.join("\n")
+        );
+        assert!(
+            rect_fired >= 2,
+            "{NAME}: fewer than 2 firing+pixel-exact attempts with a RECTANGULAR sub-8x8 \
+             inter leaf (4x8):\n{}",
             refusals.join("\n")
         );
     }
