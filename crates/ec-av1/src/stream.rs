@@ -2671,6 +2671,41 @@ mod tests {
         eprintln!("{NAME}: pixel-exact, grain_hits={}", crate::film_grain::grain_hits());
     }
 
+    /// lane-golomb r1: THE FILM ITSELF. `crates/ec-av1/fixtures/hg_head_key_frame.obu`
+    /// is the first frame of the user's Hunger Games AV1 release (3840x1608
+    /// yuv420p10le, `ffmpeg -i <mkv> -c copy -frames:v 1 -f obu`, 147 bytes) --
+    /// a real 10-bit key frame whose height is NOT a multiple of the 64-pixel
+    /// superblock, so its last superblock row (mi_row=400 of 402) carries the
+    /// edge partition symbol this lane fixed: libaom's `ec_read_partition_impl`
+    /// returns `PARTITION_HORZ` when the gathered `split_or_horz` bit is 0, and
+    /// this decoder used to READ that bit and throw it away, forcing SPLIT
+    /// (class `parsed-then-discarded`). The desync surfaced two rows later as
+    /// "a Golomb tail longer than this decoder reads" -- a refusal naming the
+    /// symptom, never the cause.
+    #[test]
+    fn the_hunger_games_head_key_frame_decodes_pixel_exact() {
+        const NAME: &str = "the_hunger_games_head_key_frame_decodes_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/hg_head_key_frame.obu");
+        let stream = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path.display()));
+        let (width, height) = (3840usize, 1608usize);
+        let frames = match decode_stream(&stream) {
+            Ok(frames) => frames,
+            Err(e) => panic!("{NAME}: decode_stream refused: {e}"),
+        };
+        assert_eq!(frames.len(), 1, "{NAME}: one key frame");
+        assert_eq!((frames[0].width, frames[0].height), (width, height));
+        let ffmpeg_frames = ffmpeg_decode_sequence_10bit(&stream, width, height, 1);
+        assert_eq!(frames[0].y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg");
+        assert_eq!(frames[0].u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg");
+        assert_eq!(frames[0].v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg");
+    }
+
     /// lane-hbd10 r1: a real `aomenc --bit-depth=10 --superres-mode=1
     /// --superres-denominator=12` key frame, decoded pixel-exact against
     /// ffmpeg's own 10-bit decode. Proves `superres::upscale_row`'s

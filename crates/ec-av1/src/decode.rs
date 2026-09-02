@@ -954,6 +954,21 @@ pub(crate) fn horz_vert_intra_hits() -> usize {
     HORZ_VERT_INTRA_HITS.with(|c| c.get())
 }
 
+// How many blocks were decoded as a frame-edge rect strip -- the single
+// coded half of a `PARTITION_HORZ`/`PARTITION_VERT` at the true frame edge
+// (lane-oddh r1), i.e. a block living inside the 8px band of a frame whose
+// height or width is 8 mod 16 (the user's 3840x1608 film). Intra and inter
+// paths share the counter.
+thread_local! {
+    static EDGE_RECT_STRIP_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`EDGE_RECT_STRIP_HITS`].
+pub(crate) fn edge_rect_strip_hits() -> usize {
+    EDGE_RECT_STRIP_HITS.with(|c| c.get())
+}
+
 // How many HORZ/VERT intra strips resolved a SPLIT luma transform
 // (`tx_depth != 0`) and decoded it per transform unit (lane-rectsplit r1) --
 // the case every rect path here refused by name before, and the first
@@ -10809,16 +10824,31 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                 }
                 p
             } else {
+                // lane-golomb r1 (class `parsed-then-discarded`): the gathered
+                // bit is the answer, not a formality -- libaom's
+                // `ec_read_partition_impl` returns `PARTITION_HORZ` (resp.
+                // `PARTITION_VERT`) when it reads 0, and only `PARTITION_SPLIT`
+                // when it reads 1. Forcing SPLIT here desynced the last
+                // superblock row of every frame whose height is not a multiple
+                // of 64 -- the Hunger Games head (3840x1608) diverges at
+                // mi_row=400 mi_col=0, the first block of that row.
                 match (has_cols, has_rows) {
                     (true, false) => {
-                        dec.symbol_fixed(&gather(&cdfs.partition_w64[ctx], VERT_ALIKE));
+                        if dec.symbol_fixed(&gather(&cdfs.partition_w64[ctx], VERT_ALIKE)) == 1 {
+                            PARTITION_SPLIT
+                        } else {
+                            PARTITION_HORZ
+                        }
                     }
                     (false, true) => {
-                        dec.symbol_fixed(&gather(&cdfs.partition_w64[ctx], HORZ_ALIKE));
+                        if dec.symbol_fixed(&gather(&cdfs.partition_w64[ctx], HORZ_ALIKE)) == 1 {
+                            PARTITION_SPLIT
+                        } else {
+                            PARTITION_VERT
+                        }
                     }
-                    _ => {}
+                    _ => PARTITION_SPLIT,
                 }
-                PARTITION_SPLIT
             };
             match part {
                 PARTITION_NONE => {
@@ -10875,20 +10905,27 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                         } else {
                             match (has_cols32, has_rows32) {
                                 (true, false) => {
-                                    dec.symbol_fixed(&gather(
-                                        &cdfs.partition_w32[ctx32],
-                                        VERT_ALIKE,
-                                    ));
+                                    // lane-golomb r1 (class `parsed-then-discarded`): the gathered
+                                    // bit IS the partition -- 0 means PARTITION_HORZ, only 1 means SPLIT
+                                    // (libaom `ec_read_partition_impl`).
+                                    if dec.symbol_fixed(&gather(&cdfs.partition_w32[ctx32], VERT_ALIKE)) == 1 {
+                                        PARTITION_SPLIT
+                                    } else {
+                                        PARTITION_HORZ
+                                    }
                                 }
                                 (false, true) => {
-                                    dec.symbol_fixed(&gather(
-                                        &cdfs.partition_w32[ctx32],
-                                        HORZ_ALIKE,
-                                    ));
+                                    // lane-golomb r1 (class `parsed-then-discarded`): the gathered
+                                    // bit IS the partition -- 0 means PARTITION_VERT, only 1 means SPLIT
+                                    // (libaom `ec_read_partition_impl`).
+                                    if dec.symbol_fixed(&gather(&cdfs.partition_w32[ctx32], HORZ_ALIKE)) == 1 {
+                                        PARTITION_SPLIT
+                                    } else {
+                                        PARTITION_VERT
+                                    }
                                 }
-                                _ => {}
+                                _ => PARTITION_SPLIT,
                             }
-                            PARTITION_SPLIT
                         };
                         match part32 {
                             PARTITION_NONE => {
@@ -11327,16 +11364,63 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                              does not code yet",
                                         ));
                                     }
-                                    if has_cols16 {
+                                    // lane-golomb r1 (class
+                                    // `parsed-then-discarded`): the gathered
+                                    // bit IS the partition -- 0 names
+                                    // PARTITION_HORZ (resp. VERT), only 1 is
+                                    // SPLIT (libaom `ec_read_partition_impl`).
+                                    // This path can only walk the four SPLIT
+                                    // leaves, so a 0 refuses by name instead
+                                    // of desyncing.
+                                    let edge_split = if has_cols16 {
                                         dec.symbol_fixed(&gather(
                                             &cdfs.partition_w16[ctx16],
                                             VERT_ALIKE,
-                                        ));
+                                        ))
                                     } else {
                                         dec.symbol_fixed(&gather(
                                             &cdfs.partition_w16[ctx16],
                                             HORZ_ALIKE,
-                                        ));
+                                        ))
+                                    };
+                                    if edge_split == 0 {
+                                        // lane-oddh r1: the strip IS decodable
+                                        // -- libaom's `decode_partition` codes
+                                        // only the FIRST half of an edge
+                                        // HORZ/VERT (the second call is
+                                        // guarded by the same has_rows/
+                                        // has_cols test that made the
+                                        // partition non-square), so one
+                                        // 16x8 (resp. 8x16) strip covers the
+                                        // whole visible band of a frame whose
+                                        // height (resp. width) is 8 mod 16 --
+                                        // the user's 3840x1608 film.
+                                        HORZ_VERT_INTRA_HITS.with(|c| c.set(c.get() + 1));
+                                        EDGE_RECT_STRIP_HITS.with(|c| c.set(c.get() + 1));
+                                        let (mi_row0, mi_col0) =
+                                            (sr as u32 * SUB_MI, sc as u32 * SUB_MI);
+                                        let (bw, bh) = if has_cols16 { (16, 8) } else { (8, 16) };
+                                        let mode = decode_leaf_rect(
+                                            &mut dec,
+                                            &mut cdfs,
+                                            &mut neighbours,
+                                            at16,
+                                            (mi_row0 as usize, mi_col0 as usize),
+                                            bw,
+                                            bh,
+                                            None,
+                                            &mut y,
+                                            &mut u,
+                                            &mut v,
+                                            enable_filter_intra,
+                                            allow_screen_content_tools,
+                                            base_q_idx,
+                                            tx_select,
+                                            reduced_tx_set,
+                                        )?;
+                                        neighbours.above_mode[sc] = mode;
+                                        neighbours.left_mode[sr] = mode;
+                                        continue;
                                     }
                                     let (mi_row0, mi_col0) =
                                         (sr as u32 * SUB_MI, sc as u32 * SUB_MI);
@@ -11886,22 +11970,27 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                         tx_select,
                         reduced_tx_set,
                     )?;
-                    decode_block_rect64(
-                        &mut dec,
-                        &mut cdfs,
-                        &mut neighbours,
-                        (at.0 + 2, at.1),
-                        64,
-                        32,
-                        &mut y,
-                        &mut u,
-                        &mut v,
-                        enable_filter_intra,
-                        allow_screen_content_tools,
-                        base_q_idx,
-                        tx_select,
-                        reduced_tx_set,
-                    )?;
+                    // lane-golomb r1: at the frame edge only the first half of the
+                    // strip is coded (libaom `decode_partition` guards the second
+                    // with the same has_rows test that made this partition non-square).
+                    if has_rows {
+                        decode_block_rect64(
+                            &mut dec,
+                            &mut cdfs,
+                            &mut neighbours,
+                            (at.0 + 2, at.1),
+                            64,
+                            32,
+                            &mut y,
+                            &mut u,
+                            &mut v,
+                            enable_filter_intra,
+                            allow_screen_content_tools,
+                            base_q_idx,
+                            tx_select,
+                            reduced_tx_set,
+                        )?;
+                    }
                 }
                 PARTITION_VERT => {
                     // lane-sbpart r2: mirror of PARTITION_HORZ above with
@@ -11922,22 +12011,27 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                         tx_select,
                         reduced_tx_set,
                     )?;
-                    decode_block_rect64(
-                        &mut dec,
-                        &mut cdfs,
-                        &mut neighbours,
-                        (at.0, at.1 + 2),
-                        32,
-                        64,
-                        &mut y,
-                        &mut u,
-                        &mut v,
-                        enable_filter_intra,
-                        allow_screen_content_tools,
-                        base_q_idx,
-                        tx_select,
-                        reduced_tx_set,
-                    )?;
+                    // lane-golomb r1: at the frame edge only the first half of the
+                    // strip is coded (libaom `decode_partition` guards the second
+                    // with the same has_cols test that made this partition non-square).
+                    if has_cols {
+                        decode_block_rect64(
+                            &mut dec,
+                            &mut cdfs,
+                            &mut neighbours,
+                            (at.0, at.1 + 2),
+                            32,
+                            64,
+                            &mut y,
+                            &mut u,
+                            &mut v,
+                            enable_filter_intra,
+                            allow_screen_content_tools,
+                            base_q_idx,
+                            tx_select,
+                            reduced_tx_set,
+                        )?;
+                    }
                 }
                 PARTITION_HORZ_A | PARTITION_HORZ_B | PARTITION_VERT_A | PARTITION_VERT_B => {
                     // lane-part32 r4: the four superblock-level AB arms, each
@@ -17776,12 +17870,24 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                     p
                 }
                 (true, false) => {
-                    dec.symbol_fixed(&gather(&cdfs.partition_w64[sb_ctx], VERT_ALIKE));
-                    PARTITION_SPLIT
+                    // lane-golomb r1 (class `parsed-then-discarded`): the gathered
+                    // bit IS the partition -- 0 means PARTITION_HORZ, only 1 means SPLIT
+                    // (libaom `ec_read_partition_impl`).
+                    if dec.symbol_fixed(&gather(&cdfs.partition_w64[sb_ctx], VERT_ALIKE)) == 1 {
+                        PARTITION_SPLIT
+                    } else {
+                        PARTITION_HORZ
+                    }
                 }
                 (false, true) => {
-                    dec.symbol_fixed(&gather(&cdfs.partition_w64[sb_ctx], HORZ_ALIKE));
-                    PARTITION_SPLIT
+                    // lane-golomb r1 (class `parsed-then-discarded`): the gathered
+                    // bit IS the partition -- 0 means PARTITION_VERT, only 1 means SPLIT
+                    // (libaom `ec_read_partition_impl`).
+                    if dec.symbol_fixed(&gather(&cdfs.partition_w64[sb_ctx], HORZ_ALIKE)) == 1 {
+                        PARTITION_SPLIT
+                    } else {
+                        PARTITION_VERT
+                    }
                 }
                 (false, false) => PARTITION_SPLIT,
             };
@@ -17847,6 +17953,68 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                 )?;
                 continue;
             }
+            // lane-oddh r1: a superblock at the TRUE frame edge whose gathered
+            // partition bit read 0 is a `PARTITION_HORZ` (resp. `VERT`) whose
+            // second half lies outside the frame -- libaom `decode_partition`
+            // guards that second call with the same has_rows/has_cols test, so
+            // exactly one 64x32 (resp. 32x64) block is coded. Interior rect
+            // superblocks still refuse below (this arm can only be reached from
+            // the gathered edge bit).
+            if (part64 == PARTITION_HORZ && !has_rows) || (part64 == PARTITION_VERT && !has_cols) {
+                EDGE_RECT_STRIP_HITS.with(|c| c.set(c.get() + 1));
+                let (write_w, write_h) =
+                    if part64 == PARTITION_HORZ { (SB, SB / 2) } else { (SB / 2, SB) };
+                decode_inter_block(
+                    &mut dec,
+                    &mut cdfs,
+                    &mut neighbours,
+                    &mut grid,
+                    sb_at,
+                    SB,
+                    mi_cols,
+                    mi_rows,
+                    &mut y,
+                    &mut u,
+                    &mut v,
+                    &ref_y,
+                    &ref_u,
+                    &ref_v,
+                    &ref_slots,
+                    &sign_bias_table,
+                    &global_motion,
+                    base_q_idx,
+                    TxbSet::Luma64,
+                    TxbSet::Luma64,
+                    TxbSet::Chroma32,
+                    TX32,
+                    TX32,
+                    &scan32,
+                    &scan32,
+                    3,
+                    allow_high_precision_mv,
+                    force_integer_mv,
+                    interp_fixed,
+                    enable_dual_filter,
+                    tpl_frame.as_ref(),
+                    reference_select,
+                    enable_masked_compound,
+                    enable_interintra_compound,
+                    enable_jnt_comp,
+                    order_hint_bits,
+                    order_hint,
+                    ref_order_hints,
+                    skip_mode_present,
+                    skip_mode_frame,
+                    switchable_motion_mode,
+                    allow_warped_motion,
+                    false,
+                    write_w,
+                    write_h,
+                    allow_screen_content_tools,
+                    frame_width as usize,
+                )?;
+                continue;
+            }
             if part64 != PARTITION_SPLIT {
                 return Err(unsupported(
                     "an inter SB-level partition type other than NONE or SPLIT (this decoder's \
@@ -17886,14 +18054,27 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                 } else {
                     match (has_cols32, has_rows32) {
                         (true, false) => {
-                            dec.symbol_fixed(&gather(&cdfs.partition_w32[ctx32], VERT_ALIKE));
+                            // lane-golomb r1 (class `parsed-then-discarded`): the gathered
+                            // bit IS the partition -- 0 means PARTITION_HORZ, only 1 means SPLIT
+                            // (libaom `ec_read_partition_impl`).
+                            if dec.symbol_fixed(&gather(&cdfs.partition_w32[ctx32], VERT_ALIKE)) == 1 {
+                                PARTITION_SPLIT
+                            } else {
+                                PARTITION_HORZ
+                            }
                         }
                         (false, true) => {
-                            dec.symbol_fixed(&gather(&cdfs.partition_w32[ctx32], HORZ_ALIKE));
+                            // lane-golomb r1 (class `parsed-then-discarded`): the gathered
+                            // bit IS the partition -- 0 means PARTITION_VERT, only 1 means SPLIT
+                            // (libaom `ec_read_partition_impl`).
+                            if dec.symbol_fixed(&gather(&cdfs.partition_w32[ctx32], HORZ_ALIKE)) == 1 {
+                                PARTITION_SPLIT
+                            } else {
+                                PARTITION_VERT
+                            }
                         }
-                        _ => {}
+                        _ => PARTITION_SPLIT,
                     }
-                    PARTITION_SPLIT
                 };
                 match part32 {
                     PARTITION_NONE => {
@@ -17985,17 +18166,24 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                 p
                             } else {
                                 if has_cols16 {
-                                    dec.symbol_fixed(&gather(
-                                        &cdfs.partition_w16[ctx16],
-                                        VERT_ALIKE,
-                                    ));
+                                    // lane-golomb r1 (class `parsed-then-discarded`): the gathered
+                                    // bit IS the partition -- 0 means PARTITION_HORZ, only 1 means SPLIT
+                                    // (libaom `ec_read_partition_impl`).
+                                    if dec.symbol_fixed(&gather(&cdfs.partition_w16[ctx16], VERT_ALIKE)) == 1 {
+                                        PARTITION_SPLIT
+                                    } else {
+                                        PARTITION_HORZ
+                                    }
                                 } else {
-                                    dec.symbol_fixed(&gather(
-                                        &cdfs.partition_w16[ctx16],
-                                        HORZ_ALIKE,
-                                    ));
+                                    // lane-golomb r1 (class `parsed-then-discarded`): the gathered
+                                    // bit IS the partition -- 0 means PARTITION_VERT, only 1 means SPLIT
+                                    // (libaom `ec_read_partition_impl`).
+                                    if dec.symbol_fixed(&gather(&cdfs.partition_w16[ctx16], HORZ_ALIKE)) == 1 {
+                                        PARTITION_SPLIT
+                                    } else {
+                                        PARTITION_VERT
+                                    }
                                 }
-                                PARTITION_SPLIT
                             };
                             if part16 == PARTITION_NONE {
                                 decode_inter_block(
@@ -18048,6 +18236,73 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     false,
                                     SUB,
                                     SUB,
+                                    allow_screen_content_tools,
+                                    frame_width as usize,
+                                )?;
+                            } else if (part16 == PARTITION_HORZ && !has_rows16)
+                                || (part16 == PARTITION_VERT && !has_cols16)
+                            {
+                                // lane-oddh r1: the frame-edge half-strip (see the
+                                // superblock-level arm) one level down -- a single
+                                // 16x8 (resp. 8x16) inter block covering the whole
+                                // visible band. Interior 16x8/8x16 inter leaves stay
+                                // refused below.
+                                EDGE_RECT_STRIP_HITS.with(|c| c.set(c.get() + 1));
+                                let (write_w, write_h) = if part16 == PARTITION_HORZ {
+                                    (SUB, SUB / 2)
+                                } else {
+                                    (SUB / 2, SUB)
+                                };
+                                decode_inter_block(
+                                    &mut dec,
+                                    &mut cdfs,
+                                    &mut neighbours,
+                                    &mut grid,
+                                    at16,
+                                    SUB,
+                                    mi_cols,
+                                    mi_rows,
+                                    &mut y,
+                                    &mut u,
+                                    &mut v,
+                                    &ref_y,
+                                    &ref_u,
+                                    &ref_v,
+                                    &ref_slots,
+                                    &sign_bias_table,
+                            &global_motion,
+                                    base_q_idx,
+                                    TxbSet::Luma16,
+                                    if reduced_tx_set {
+                                        TxbSet::Luma16Inter
+                                    } else {
+                                        TxbSet::Luma16InterSet1
+                                    },
+                                    TxbSet::Chroma8,
+                                    TX16,
+                                    TX8,
+                                    &scan16,
+                                    &scan8,
+                                    2,
+                                    allow_high_precision_mv,
+                                    force_integer_mv,
+                                    interp_fixed,
+                                    enable_dual_filter,
+                                    tpl_frame.as_ref(),
+                                    reference_select,
+                                    enable_masked_compound,
+                                    enable_interintra_compound,
+                                    enable_jnt_comp,
+                                    order_hint_bits,
+                                    order_hint,
+                                    ref_order_hints,
+                                    skip_mode_present,
+                                    skip_mode_frame,
+                                    switchable_motion_mode,
+                                    allow_warped_motion,
+                                    false,
+                                    write_w,
+                                    write_h,
                                     allow_screen_content_tools,
                                     frame_width as usize,
                                 )?;
