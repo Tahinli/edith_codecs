@@ -46,7 +46,7 @@ const REFUSALS: &[&str] = &[
     "a superblock-level partition value outside PARTITION_NONE..PARTITION_VERT_4",
     "a 128x128 superblock AB partition (HORZ_A/HORZ_B/VERT_A/VERT_B at the 128 root)",
     "an inter var-tx tree with a leaf transform larger than 64x64",
-    "a 128x128 superblock HORZ/VERT partition on an intra frame (the inter path decodes it; the intra one is square-block only)",
+    "CfL, filter intra or a palette on a 128-root HORZ/VERT intra block (every one of their size gates caps at 64x64 or below, so none of these symbols exists there)",
     "intrabc under a 128x128 superblock (libaom's av1_is_dv_valid derives the block-vector delay from sb_size, which this decoder hardcodes to 64)",
     "a palette block with a real transform on a superblock-level HORZ/VERT strip (corner-cropped luma coefficients not ported for palette)",
     "a block that actually uses a palette (UV) -- reconstruction is out of scope",
