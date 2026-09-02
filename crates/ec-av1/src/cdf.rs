@@ -463,7 +463,14 @@ pub const CFL_SIGN: [u16; 9] = [1418, 2123, 13340, 18405, 26972, 28343, 32294, 3
 /// the flag was never read at that size at all (libaom reads it for every
 /// DC_PRED block whose sides are both <= 32), so every DC_PRED 16x8 strip
 /// dropped one symbol and desynced the tile from that block on.
-pub const FILTER_INTRA: [[u16; 3]; 8] = [
+/// `[8]`/`[9]` (lane-fi8 r1) add `BLOCK_4X8`/`BLOCK_8X4`'s own rows
+/// (6743/5893, `default_filter_intra_cdfs` index 1/2) -- the sub-8 rect
+/// leaves [`crate::decode`]'s `decode_leaf_rect8` codes. Both are inside
+/// `av1_filter_intra_allowed_bsize`, so the flag is written for every DC_PRED
+/// one of them; before this round that read took `BLOCK_4X4`'s row (class 0),
+/// the same value with a different interval (class `wrong-alphabet-same-value`
+/// / `cdf-row-held-constant`).
+pub const FILTER_INTRA: [[u16; 3]; 10] = [
     [4621, 32768, 0],
     [7866, 32768, 0],
     [12408, 32768, 0],
@@ -472,6 +479,8 @@ pub const FILTER_INTRA: [[u16; 3]; 8] = [
     [14301, 32768, 0],
     [9394, 32768, 0],
     [12551, 32768, 0],
+    [6743, 32768, 0],
+    [5893, 32768, 0],
 ];
 /// `default_filter_intra_mode_cdf` (entropymode.c): which of the five
 /// `FILTER_INTRA_MODES` a `use_filter_intra` block picks.
