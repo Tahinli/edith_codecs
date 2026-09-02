@@ -11067,13 +11067,22 @@ mod tests {
         // this shape ever makes aomenc split a 16x4/4x16 strip's transform --
         // an aomdec EC_TRACE_COEFF histogram of those streams carries whole
         // TX_16X4/TX_4X16 units and no sub-transform. The one recipe that DOES
-        // split it (384x256, `128+90*sin((X+N*3)/6)*sin(Y/2)+50*sin((X*Y)/37)`,
-        // cq 10, --min-partition-size=8 --max-partition-size=64
-        // --enable-tx-size-search=1) fires 6 of these leaves and then
-        // MISMATCHES ffmpeg at decode-order frame 2 -- an open DECODE defect
-        // handed off, not something to hide inside a passing gate. So the arm
-        // is reported as unproven here instead of asserted on a stream nobody
-        // has decoded exactly.
+        // split it (384x256 product texture, cq 10, --min-partition-size=8)
+        // was RE-MEASURED by lane-vartxsplit r2 on the merged tree: that
+        // stream now decodes PIXEL-EXACT on all six frames and fires ZERO
+        // rectangular var-tx leaves of any size -- the "6 split-tx 8x4 leaves"
+        // were counted out of an already-desynced decode (the desync is what
+        // lane-sub8x4 fixed). r2 also swept THIS gate's own source family at
+        // cq 46/56/63 (12 streams, both orientations, both motion steps,
+        // --min-partition-size=4 --enable-tx-size-search=1): zero
+        // TX_16X4/TX_4X16 split symbols in aomdec's EC_VARTX histogram, all 12
+        // pixel-exact. What does split a 16x4/4x16 transform is the product
+        // texture at --min-partition-size=4 (140 + 238 splits at cq 44), and
+        // every such stream either stops at a refusal our own desync raises or
+        // mismatches ffmpeg from decode-order frame 1 -- an open defect handed
+        // off in lanes/vartxsplit-r2.report.md. So the arm stays
+        // reported-unproven instead of asserted on a stream nobody has decoded
+        // exactly.
         eprintln!(
             "{NAME}: split-tx-8x4 arm unproven (arms {arms_total:?}) -- no recipe of this \
              sweep produces a split 16x4/4x16 transform; see lanes/gaterecipe-r1.report.md"
