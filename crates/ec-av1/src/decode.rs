@@ -774,6 +774,10 @@ thread_local! {
     // their rect max transform into square sub-transforms.
     static RECT_INTER_TU_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static RECT_INTER_TXSPLIT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // lane-inter4 r3: 16x16-level PARTITION_HORZ / PARTITION_VERT on an inter
+    // frame -- 16x8 and 8x16 inter leaves.
+    static INTER_LEAF16_HORZ_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static INTER_LEAF16_VERT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     // This frame's own `tx_mode == TxMode::Select` and `reduced_tx_set` bits,
     // set once per inter tile by [`decode_inter_frame_tile_with_cdfs`] --
     // `decode_inter_block` already carries forty parameters and both are
@@ -790,6 +794,16 @@ pub(crate) fn txfm_split_reads() -> usize {
 /// Current value of [`TXFM_SPLIT_HITS`].
 pub(crate) fn txfm_split_hits() -> usize {
     TXFM_SPLIT_HITS.with(|c| c.get())
+}
+
+/// Current value of [`INTER_LEAF16_HORZ_HITS`] (lane-inter4 r3).
+pub(crate) fn inter_leaf16_horz_hits() -> usize {
+    INTER_LEAF16_HORZ_HITS.with(|c| c.get())
+}
+
+/// Current value of [`INTER_LEAF16_VERT_HITS`] (lane-inter4 r3).
+pub(crate) fn inter_leaf16_vert_hits() -> usize {
+    INTER_LEAF16_VERT_HITS.with(|c| c.get())
 }
 
 /// Current value of [`RECT_INTER_TU_HITS`] (lane-inter4 r2).
@@ -9018,7 +9032,53 @@ fn read_block_tx_size(
 /// `DTT9_IDTX_1DDCT` row at `tx_size_sqr == TX_8X8`, only reachable through a
 /// rect transform), neither of which exists yet -- both stay refused by name.
 fn rect_inter_residual_supported(w: usize, h: usize) -> bool {
-    matches!((w, h), (32, 16) | (16, 32))
+    matches!((w, h), (32, 16) | (16, 32) | (16, 8) | (8, 16))
+}
+
+/// The luma coefficient/`tx_type` table set of a whole-block rectangular
+/// INTER transform unit (lane-inter4 r3). `av1_get_ext_tx_set_type` splits
+/// the two shapes: a 32x16/16x32 unit has `tx_size_sqr_up == TX_32X32`, so
+/// it reads the 2-symbol `EXT_TX_SET_DCT_IDTX` set regardless of
+/// `reduced_tx_set`; a 16x8/8x16 unit has `tx_size_sqr_up == TX_16X16` and
+/// `tx_size_sqr == TX_8X8`, so it reads `EXT_TX_SET_DCT_IDTX` when reduced
+/// and the 16-symbol `EXT_TX_SET_ALL16` otherwise -- both at the *8x8* CDF
+/// row (`txsize_sqr_map`), never the 16x16 one.
+fn rect_inter_luma_set(w: usize, h: usize) -> TxbSet {
+    match (w, h) {
+        (32, 16) | (16, 32) => TxbSet::LumaRect32x16Inter,
+        (16, 8) | (8, 16) => {
+            if REDUCED_TX_SET_INTER.with(std::cell::Cell::get) {
+                TxbSet::LumaRect16x8Inter
+            } else {
+                TxbSet::LumaRect16x8InterSet1
+            }
+        }
+        _ => unreachable!("rect_inter_residual_supported gates every shape that reaches here"),
+    }
+}
+
+/// The chroma table set of the same block's single rectangular chroma unit
+/// (`av1_get_max_uv_txsize`): 16x8/8x16 under a 32x16/16x32 strip, 8x4/4x8
+/// under a 16x8/8x16 one. Neither codes a `tx_type` symbol -- both inherit
+/// the luma unit's.
+fn rect_inter_chroma_set(w: usize, h: usize) -> TxbSet {
+    match (w, h) {
+        (16, 8) | (8, 16) => TxbSet::ChromaRect16x8,
+        (8, 4) | (4, 8) => TxbSet::ChromaRect8x4,
+        _ => unreachable!("rect_inter_residual_supported gates every shape that reaches here"),
+    }
+}
+
+/// libaom `size_group_lookup[bsize]` for the block shapes this decoder's
+/// inter path reaches, from the block's TRUE footprint rather than the
+/// square `side` corner-cut: 8x8/8x16/16x8 -> 1, 16x16/16x32/32x16 -> 2,
+/// everything 32 and above -> 3.
+fn size_group_wh(w: usize, h: usize) -> usize {
+    match w.min(h) {
+        0..=8 => 1,
+        16 => 2,
+        _ => 3,
+    }
 }
 
 /// The default (2D) coefficient scan of a rectangular transform.
@@ -12715,11 +12775,34 @@ fn obmc_blend(
     // its OWN neighbour cap (width-log2 for above, height-log2 for left) and
     // overlap (bh/2 rows above, bw/2 cols left) -- one square `side` was
     // right only for square blocks.
+    // libaom `max_neighbor_obmc[6] = { 0, 1, 2, 3, 4, 4 }` indexed by
+    // `mi_size_wide_log2[bsize]` (above pass) / `mi_size_high_log2` (left):
+    // 1 mi -> 0, 2 -> 1, 4 -> 2, 8 -> 3, 16+ -> 4. lane-inter4 r3: the old
+    // `1..=4 => 2` row was right only for blocks at least 16 px on that axis
+    // -- a 16x8 leaf's LEFT pass (bh4 = 2) walked up to two neighbours where
+    // libaom walks one, blending an extra 8-px-tall neighbour into every
+    // rect leaf with two of them on its left edge (class table-narrowed-to-
+    // the-reachable-sizes; the square gates could never expose it).
     let max_nb = |n4: usize| match n4 {
-        1..=4 => 2,
+        0..=1 => 0,
+        2 => 1,
+        3..=4 => 2,
         5..=8 => 3,
         _ => 4,
     };
+    // lane-inter4 r3: OBMC on a 16-level rect inter leaf mismatches ffmpeg
+    // (192x128 testsrc-style motion, cq 22, `--enable-obmc=1`: 5302 luma
+    // pixels of frame 5 wrong, max |delta| 84, while the SAME recipe with
+    // `--enable-obmc=0` decodes 5 rect-leaf-carrying attempts pixel-exact).
+    // The blend geometry here matches libaom `build_obmc_inter_pred_*` for
+    // these shapes, so the cause is upstream (neighbour walk or mv stack for
+    // a 2:1 leaf) and unidentified -- refuse by name rather than ship wrong
+    // pixels. Deleting this block is the whole lift once it is found.
+    if matches!((write_w, write_h), (16, 8) | (8, 16)) {
+        return Err(unsupported(
+            "OBMC on a 16x8/8x16 inter leaf (blend mismatches the reference on this shape)",
+        ));
+    }
     let overlap_above = write_h / 2;
     let overlap_left = write_w / 2;
     // lane-inter8 r1 / lane-scaledref r1: `av1_skip_u4x4_pred_in_obmc`
@@ -13143,7 +13226,11 @@ fn decode_inter_block(
     chroma_tx: usize,
     scan_luma: &[u16],
     scan_chroma: &[u16],
-    size_group: usize,
+    // lane-inter4 r3: superseded by `size_group_wh(write_w, write_h)` at the
+    // one site that read it (`y_mode`) -- a rect strip's group comes from its
+    // true footprint, not the caller's square `side`. Kept in the signature
+    // rather than editing twenty call sites.
+    _size_group: usize,
     allow_high_precision_mv: bool,
     force_integer_mv: bool,
     interp_fixed: Option<mc::InterpFilterKind>,
@@ -14205,7 +14292,7 @@ fn decode_inter_block(
                     let (grid, tx_type) = read_inter_plane_rect(
                         dec,
                         cdfs,
-                        TxbSet::LumaRect32x16Inter,
+                        rect_inter_luma_set(write_w, write_h),
                         (write_w, write_h),
                         side,
                         0,
@@ -14248,7 +14335,7 @@ fn decode_inter_block(
                         &read_inter_plane_rect(
                             dec,
                             cdfs,
-                            TxbSet::ChromaRect16x8,
+                            rect_inter_chroma_set(write_chroma_w, write_chroma_h),
                             (uw, uh),
                             chroma_side,
                             1,
@@ -14269,7 +14356,7 @@ fn decode_inter_block(
                         &read_inter_plane_rect(
                             dec,
                             cdfs,
-                            TxbSet::ChromaRect16x8,
+                            rect_inter_chroma_set(write_chroma_w, write_chroma_h),
                             (uw, uh),
                             chroma_side,
                             2,
@@ -14511,7 +14598,10 @@ fn decode_inter_block(
                 && (side == 16 || side == 32)
                 && interintra_shape
             {
-                let bsize_group = if side == 16 { 2 } else { 3 };
+                // lane-inter4 r3: `size_group_lookup` reads the block's
+                // TRUE footprint -- a 16x8 strip is group 1, a 32x16 strip
+                // group 2, not their square `side`'s 2/3.
+                let bsize_group = size_group_wh(write_w, write_h);
                 let interintra = dec.symbol(&mut cdfs.interintra[bsize_group]) == 1;
                 if interintra {
                     // lane-interintra r1 (decodemv.c 1540-1555): interintra_mode,
@@ -14621,6 +14711,9 @@ fn decode_inter_block(
                     (32, 8) => 9,
                     (16, 64) => 10,
                     (64, 16) => 11,
+                    // lane-inter4 r3: the 16x16-level rect inter leaves.
+                    (8, 16) => 12,
+                    (16, 8) => 13,
                     _ => {
                         return Err(unsupported(
                             "a motion_mode symbol for a block shape with no CDF row here",
@@ -15137,7 +15230,7 @@ fn decode_inter_block(
                     let (grid, tx_type) = read_inter_plane_rect(
                         dec,
                         cdfs,
-                        TxbSet::LumaRect32x16Inter,
+                        rect_inter_luma_set(write_w, write_h),
                         (write_w, write_h),
                         side,
                         0,
@@ -15180,7 +15273,7 @@ fn decode_inter_block(
                         &read_inter_plane_rect(
                             dec,
                             cdfs,
-                            TxbSet::ChromaRect16x8,
+                            rect_inter_chroma_set(write_chroma_w, write_chroma_h),
                             (uw, uh),
                             chroma_side,
                             1,
@@ -15201,7 +15294,7 @@ fn decode_inter_block(
                         &read_inter_plane_rect(
                             dec,
                             cdfs,
-                            TxbSet::ChromaRect16x8,
+                            rect_inter_chroma_set(write_chroma_w, write_chroma_h),
                             (uw, uh),
                             chroma_side,
                             2,
@@ -15271,7 +15364,7 @@ fn decode_inter_block(
                  this decoder does not code yet",
             ));
         }
-        let mode = dec.symbol(&mut cdfs.y_mode[size_group]);
+        let mode = dec.symbol(&mut cdfs.y_mode[size_group_wh(write_w, write_h)]);
         if mode >= 13 {
             return Err(unsupported(
                 "an intra mode this decoder does not code (round 2)",
@@ -17877,9 +17970,96 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                                     allow_screen_content_tools,
                                     frame_width as usize,
                                 )?;
+                            } else if part16 == PARTITION_HORZ || part16 == PARTITION_VERT {
+                                // lane-inter4 r3: the 16x16-level rect inter
+                                // leaves -- two true 16x8 (HORZ) or 8x16
+                                // (VERT) inter blocks. Same shape as the
+                                // 32-level HORZ/VERT arm above: `side = SUB`
+                                // keeps every CDF/prediction-buffer decision
+                                // square, `write_w`/`write_h` carry the true
+                                // footprint into the mv stack, the motion-mode
+                                // row, the neighbour stamps and the rectangular
+                                // residual path (`rect_inter_residual_supported`
+                                // covers 16x8/8x16 since this round).
+                                let horz = part16 == PARTITION_HORZ;
+                                if horz {
+                                    INTER_LEAF16_HORZ_HITS.with(|c| c.set(c.get() + 1));
+                                } else {
+                                    INTER_LEAF16_VERT_HITS.with(|c| c.set(c.get() + 1));
+                                }
+                                let base_mi = sub16_to_mi(at16);
+                                let (ww, wh) = if horz { (16, 8) } else { (8, 16) };
+                                for piece in 0..2 {
+                                    let piece_mi = if horz {
+                                        (base_mi.0 + piece * 2, base_mi.1)
+                                    } else {
+                                        (base_mi.0, base_mi.1 + piece * 2)
+                                    };
+                                    // libaom `decode_partition`'s own second-
+                                    // half frame-edge break.
+                                    if piece > 0
+                                        && (piece_mi.0 >= mi_rows as usize
+                                            || piece_mi.1 >= mi_cols as usize)
+                                    {
+                                        break;
+                                    }
+                                    decode_inter_block(
+                                        &mut dec,
+                                        &mut cdfs,
+                                        &mut neighbours,
+                                        &mut grid,
+                                        piece_mi,
+                                        SUB,
+                                        mi_cols,
+                                        mi_rows,
+                                        &mut y,
+                                        &mut u,
+                                        &mut v,
+                                        &ref_y,
+                                        &ref_u,
+                                        &ref_v,
+                                        &ref_slots,
+                                        &sign_bias_table,
+                                        &global_motion,
+                                        base_q_idx,
+                                        TxbSet::Luma16,
+                                        if reduced_tx_set {
+                                            TxbSet::Luma16Inter
+                                        } else {
+                                            TxbSet::Luma16InterSet1
+                                        },
+                                        TxbSet::Chroma8,
+                                        TX16,
+                                        TX8,
+                                        &scan16,
+                                        &scan8,
+                                        1,
+                                        allow_high_precision_mv,
+                                        force_integer_mv,
+                                        interp_fixed,
+                                        enable_dual_filter,
+                                        tpl_frame.as_ref(),
+                                        reference_select,
+                                        enable_masked_compound,
+                                        enable_interintra_compound,
+                                        enable_jnt_comp,
+                                        order_hint_bits,
+                                        order_hint,
+                                        ref_order_hints,
+                                        skip_mode_present,
+                                        skip_mode_frame,
+                                        switchable_motion_mode,
+                                        allow_warped_motion,
+                                        true,
+                                        ww,
+                                        wh,
+                                        allow_screen_content_tools,
+                                        frame_width as usize,
+                                    )?;
+                                }
                             } else if part16 != PARTITION_SPLIT {
                                 return Err(unsupported(
-                                    "an inter partition below 16x16 other than SPLIT (16x8/8x16 rect inter leaves are not coded yet)",
+                                    "an inter 16x16-level AB or 1:4 partition (HORZ_A/HORZ_B/VERT_A/VERT_B/HORZ_4/VERT_4; this decoder's inter path codes a 16x16 as NONE, HORZ, VERT or SPLIT)",
                                 ));
                             } else {
                                 if has_cols16 && has_rows16 {
