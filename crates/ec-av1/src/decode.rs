@@ -19123,9 +19123,19 @@ fn decode_inter_block(
     if vartx_leaves.is_some() {
         // Plane 0 is already correct per transform unit
         // ([`Neighbours::record_mi_luma`] above); this writes everything else
-        // [`Neighbours::record_rect`] would (a var-tx block is always square,
-        // so `write_w == write_h == side`).
-        neighbours.record_split_luma_rect_mi(at, side, side, mode_for_tx, uv_predict_mode, [&u_grid, &v_grid]);
+        // [`Neighbours::record_rect`] would.
+        //
+        // lane-sbab r1: this used to pass `side, side` on the premise that "a
+        // var-tx block is always square". That stopped being true the moment
+        // the SB-level rect strips landed (lane-inter4): a 64x32 / 32x64
+        // strip keeps `side = SB` for syntax but is NOT square, and stamping
+        // its neighbour bands 64x64 wrote `above_side_mi = 64` where libaom's
+        // `update_partition_context` writes `partition_context_lookup[
+        // BLOCK_32X64]`. The next superblock row then read the partition
+        // context one value low (ctx 2 where aomdec says 3) and desynced.
+        // The true footprint is `write_w`/`write_h`, exactly as the
+        // non-var-tx arm below uses.
+        neighbours.record_split_luma_rect_mi(at, write_w, write_h, mode_for_tx, uv_predict_mode, [&u_grid, &v_grid]);
     } else {
         neighbours.record_rect_mi(
             at,
