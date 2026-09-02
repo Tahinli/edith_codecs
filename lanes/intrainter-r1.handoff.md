@@ -50,9 +50,9 @@ No entropy ladder was needed — no divergence was ever observed.
 
 ## Suite
 
-`$HOME/.cache/intrainter-suite.log` (unit `intrainter-suite-1788315424.service`). At turn cap it
-was still running (~250/372 tests, no FAILED line so far, currently inside the aomenc gates).
-(measured after the turn cap; nothing further owed on the suite.)
+`$HOME/.cache/intrainter-suite.log` (unit `intrainter-suite-1788315424.service`), completed after
+the turn cap: `test result: ok. 341 passed; 0 failed; 31 ignored; 0 measured` in 457.31s. Nothing
+further is owed on the suite.
 
 
 ## Film
@@ -64,7 +64,7 @@ these extracts (matches an existing ledger dead-end line).
 
 ## Exact next step
 
-1. Read the suite result line; if green, merge.
+1. Merge (suite already green).
 2. Optional follow-up round: prove 32x32/64x64 split intra-in-inter blocks (raise
    `--max-partition-size` to 64 and lower cq, assert the 32/64 buckets), and lift the 8x8 leaf's
    TX_4X4 2x2 grid in `decode_inter_block8`.
