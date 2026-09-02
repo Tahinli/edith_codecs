@@ -14950,17 +14950,15 @@ mod tests {
     }
 
     /// lane-fistrip r1, the 10-bit arm of the strip gate (his films are
-    /// yuv420p10le). Same ceiling as its 8-bit twin -- kept `#[ignore]`d
-    /// with the measurement rather than weakened: MEASURED over seeds
+    /// yuv420p10le). Same ceiling as its 8-bit twin, lifted in lane-rectsplitx
+    /// r3 (the split arm's `smooth_neighbor_uv`); before that, MEASURED over seeds
     /// 42..61 the 8x16/16x8 strips aomenc writes filter intra on are
     /// `skip=0`, which `decode_leaf_rect` refuses, so
     /// `filter_intra_rect_sub16_hits` never reaches a pixel compare.
     /// lane-fistrip r2 adds seeds 49 and 213 to the window: those are the two
     /// seeds measured to fire the feature on the 8-BIT twin's recipe (this
     /// arm's 10-bit encode is a different stream, so they are a widening, not
-    /// a measured firing set for this recipe -- the round that un-ignores
-    /// this gate must re-measure which 10-bit seeds fire it).
-    #[ignore = "lane-rectsplitx r2 (re-measured after the neighbour-mode fix): still a CHROMA-only defect behind the lifted split refusal -- 10-bit seed 49 frame 0 plane V first diff at row 4 col 60, ours 510 vs ffmpeg 509, filter_intra_rect_sub16_hits=2; sub-16 filter-intra chroma prediction, open"]
+    /// a measured firing set for this recipe). Green since r3.
     #[test]
     fn a_real_aomenc_10bit_filter_intra_on_a_sub16_strip_decodes_pixel_exact() {
         const NAME: &str = "a_real_aomenc_10bit_filter_intra_on_a_sub16_strip_decodes_pixel_exact";
@@ -15092,19 +15090,20 @@ mod tests {
     /// `filter_intra_rect_hits`: a 32x16 strip firing filter intra would
     /// satisfy that one and prove nothing about the new shapes.
     /// MEASURED (lane-fistrip r1, seeds 42..=241; r2 re-ran 50..=241), which
-    /// is why it is `#[ignore]`d rather than green: over those 200 seeds at
+    /// is why the window carries the two firing seeds: over those 200 seeds at
     /// cq 25 aomenc put filter intra on an 8x16/16x8 strip exactly TWICE --
     /// **seed 49 and seed 213** -- and both times that strip was `skip=0`, so
     /// the attempt refused at the coded-rect-strip-below-16x16 ceiling before
     /// any pixel compare (r1: 177 pixel-exact matches, 23 refusals, compared
     /// sub16 delta 0, all-attempt delta 2; r2 seeds 50..=241: 172 matches, 20
     /// refusals, the one all-attempt hit at seed 213). BOTH firing seeds are
-    /// appended to this gate's seed window below, so the un-ignore compares
-    /// two real hits. Un-ignore this the round that ceiling lifts; the symbol
-    /// itself is pinned by
-    /// [`a_pinned_aomenc_16x8_strip_reads_its_use_filter_intra_flag`], whose
-    /// `expect_err` must become a pixel compare in that same round.
-    #[ignore = "lane-rectsplitx r2 (re-measured after the neighbour-mode fix): still a CHROMA-only defect behind the lifted split refusal -- 10-bit seed 49 frame 0 plane V first diff at row 4 col 60, ours 510 vs ffmpeg 509, filter_intra_rect_sub16_hits=2; sub-16 filter-intra chroma prediction, open"]
+    /// appended to this gate's seed window below, so it compares two real
+    /// hits. UN-IGNORED lane-rectsplitx r3: the ceiling lifted with the split
+    /// refusal, and the residual chroma defect was the split arm of
+    /// [`crate::decode::decode_leaf_rect`] passing `smooth_neighbor_uv: false`
+    /// where the unsplit arm passes the neighbour's real answer. The symbol
+    /// itself stays pinned by
+    /// [`a_pinned_aomenc_16x8_strip_reads_its_use_filter_intra_flag`].
     #[test]
     fn a_real_aomenc_stream_with_filter_intra_on_a_sub16_horz_vert_strip_decodes_pixel_exact() {
         const NAME: &str =
