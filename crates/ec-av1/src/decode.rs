@@ -4209,6 +4209,36 @@ impl Neighbours {
         }
     }
 
+    /// One var-tx / split-tx LEAF's own LUMA transform dims over its mi span.
+    /// libaom `get_transform_size` (av1_loopfilter.c:207) applies the split
+    /// override only `if ((plane == AOM_PLANE_Y) && ...)` -- chroma keeps
+    /// `av1_get_max_uv_txsize(mbmi->bsize)`, the whole BLOCK's uv transform.
+    /// Routing a leaf through [`Self::fill_lf_grid_rect`] recomputed the uv
+    /// dims from the LEAF span and so invented chroma transform edges the
+    /// deblocker then filtered (lane-golomb r6). `ref_grid`/`delta_lf_grid`
+    /// are already correct from the block's own fill over the same span.
+    fn fill_lf_grid_leaf_luma(
+        &mut self,
+        at_mi: (usize, usize),
+        w_mi: usize,
+        h_mi: usize,
+        tx_px: u8,
+        tx_h_px: u8,
+    ) {
+        let (mi_r, mi_c) = at_mi;
+        for rr in 0..h_mi {
+            for cc in 0..w_mi {
+                let idx = (mi_r + rr) * self.skip_grid_cols_mi + (mi_c + cc);
+                if let Some(cell) = self.tx_grid.get_mut(idx) {
+                    *cell = tx_px;
+                }
+                if let Some(cell) = self.tx_h_grid.get_mut(idx) {
+                    *cell = tx_h_px;
+                }
+            }
+        }
+    }
+
     /// Marks every 4x4 mi cell a just-decoded coded block covers with its
     /// `skip` flag -- `at_mi`/`side_mi` are the block's own position and
     /// width/height in 4x4 mode-info units (mirroring [`Self::record_mi`]'s
@@ -8775,8 +8805,22 @@ fn dump_stage16(var: &str, y: &PlaneBuf, u: &PlaneBuf, v: &PlaneBuf, fw: usize, 
 
 fn dump_stage(var: &str, y: &PlaneBuf, u: &PlaneBuf, v: &PlaneBuf) {
     use std::io::Write;
+    // lane-golomb r6: one file per DECODE-order picture, like aomdec's own
+    // `ec_dump16` static index -- a single `.f0` overwritten every frame made
+    // the post-deblock stage uncomparable across a sequence.
+    thread_local! {
+        static STAGE_IDX: std::cell::RefCell<std::collections::HashMap<String, usize>> =
+            std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    let idx = STAGE_IDX.with(|m| {
+        let mut m = m.borrow_mut();
+        let e = m.entry(var.to_string()).or_insert(0);
+        let i = *e;
+        *e += 1;
+        i
+    });
     if let Ok(path) = std::env::var(var)
-        && let Ok(mut f) = std::fs::File::create(format!("{path}.f0"))
+        && let Ok(mut f) = std::fs::File::create(format!("{path}.f{idx}"))
     {
         for p in [y, u, v] {
             let narrow: Vec<u8> = p.data.iter().map(|&s| s as u8).collect();
@@ -18689,21 +18733,17 @@ fn decode_inter_block(
         },
     );
     // lane-txselect: a var-tx block's deblock edges follow its own transform
-    // units, not the block. Chroma still reads `tx_h_grid / 2` (the block's
-    // uv transform is not split) -- a known corner-cut of this round.
+    // units, not the block -- for LUMA only (lane-golomb r6): the chroma
+    // grids keep the block's own `av1_get_max_uv_txsize`, which is what
+    // libaom's `get_transform_size` reads for `plane != AOM_PLANE_Y`.
     if let Some(leaves) = &vartx_leaves {
         for &(row, col, tx_px) in leaves {
-            neighbours.fill_lf_grid_rect(
+            neighbours.fill_lf_grid_leaf_luma(
                 (at_mi.0 + row, at_mi.1 + col),
                 tx_px / MI,
                 tx_px / MI,
                 tx_px as u8,
                 tx_px as u8,
-                if globalmv_for_lf {
-                    -ref_frame_for_lf
-                } else {
-                    ref_frame_for_lf
-                },
             );
         }
     }
