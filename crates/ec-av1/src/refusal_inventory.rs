@@ -73,7 +73,6 @@ const REFUSALS: &[&str] = &[
     "an inter partition below 16x16 other than SPLIT (16x8/8x16 rect inter leaves are not coded yet)",
     "an intra mode this decoder does not code (round 2)",
     "an intra-coded HORZ/VERT strip needs rectangular intra prediction this decoder does not code yet",
-    "filter intra on a HORZ/VERT strip (this decoder predicts square-only)",
     "warp prediction with a scaled reference (superres, unimplemented)",
     "an 8x8 partition leaf under a scaled reference (superres, unimplemented)",
 ];
