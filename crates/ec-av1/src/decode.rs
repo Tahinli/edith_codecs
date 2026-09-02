@@ -3933,14 +3933,14 @@ impl Neighbours {
             uv_tx_h_grid: vec![0u8; cols * (SUB / MI) * rows * (SUB / MI)],
             ref_grid: vec![0i8; cols * (SUB / MI) * rows * (SUB / MI)],
             delta_lf_grid: vec![[0i8; 4]; cols * (SUB / MI) * rows * (SUB / MI)],
-            above_palette_size: vec![0; cols],
-            left_palette_size: vec![0; rows],
-            above_palette_colors: vec![[0u16; 8]; cols],
-            left_palette_colors: vec![[0u16; 8]; rows],
-            above_palette_uv_size: vec![0; cols],
-            left_palette_uv_size: vec![0; rows],
-            above_palette_uv_colors: vec![[0u16; 8]; cols],
-            left_palette_uv_colors: vec![[0u16; 8]; rows],
+            above_palette_size: vec![0; cols * (SUB / MI)],
+            left_palette_size: vec![0; rows * (SUB / MI)],
+            above_palette_colors: vec![[0u16; 8]; cols * (SUB / MI)],
+            left_palette_colors: vec![[0u16; 8]; rows * (SUB / MI)],
+            above_palette_uv_size: vec![0; cols * (SUB / MI)],
+            left_palette_uv_size: vec![0; rows * (SUB / MI)],
+            above_palette_uv_colors: vec![[0u16; 8]; cols * (SUB / MI)],
+            left_palette_uv_colors: vec![[0u16; 8]; rows * (SUB / MI)],
             tile_row0_mi: 0,
             tile_col0_mi: 0,
         }
@@ -4000,7 +4000,7 @@ impl Neighbours {
     /// mirrors [`Self::record_rect`]'s loop shape, square-only (this lane's
     /// call sites are all square blocks).
     fn record_palette_y(&mut self, at: (usize, usize), side: usize, size: usize, colors: [u16; 8]) {
-        self.record_palette_y_rect(at, side, side, size, colors);
+        self.record_palette_y_rect((at.0 * (SUB / MI), at.1 * (SUB / MI)), side, side, size, colors);
     }
 
     /// [`Self::record_palette_y`] with independent above (`w`)/left (`h`)
@@ -4009,29 +4009,30 @@ impl Neighbours {
     /// differ.
     fn record_palette_y_rect(
         &mut self,
-        at: (usize, usize),
+        mi: (usize, usize),
         w: usize,
         h: usize,
         size: usize,
         colors: [u16; 8],
     ) {
-        let (r, c) = at;
-        // `.max(1)`: a below-16px span covers no whole SUB cell, so the plain
-        // `w / SUB` loop was a NO-OP for every 16x8/8x16/8x8/4x4 leaf and the
-        // next block read a long-dead palette out of the above/left arrays
-        // (class [[cdf-row-held-constant]], lane-palette2 r8). libaom keeps
-        // `palette_size` per 4px mi cell; corner-cut: our grid is 16px, so a
-        // sub-16 leaf stamps its whole containing cell -- safe today because
-        // every sub-16 leaf path refuses palette outright (so it can only
-        // ever stamp `size == 0`, and its cell holds no palette sibling).
-        // Upgrade path: widen the palette arrays to mi granularity.
-        for cell in 0..(w / SUB).max(1) {
-            self.above_palette_size[c + cell] = size;
-            self.above_palette_colors[c + cell] = colors;
+        let (r, c) = mi;
+        // lane-kf900 r6: mi (4px) granularity, libaom's own -- `palette_size`
+        // lives per mi cell in `MB_MODE_INFO`, and `xd->left_mbmi` is the mi
+        // cell immediately left of the block, not its 16px [`SUB`] cell. The
+        // old SUB grid let a 16x8 strip pair share one slot, so the second
+        // strip of mi(0,8) read the FIRST strip's palette size and the colour
+        // cache came out one entry short (class [[context-read-from-one-cell]]).
+        for cell in 0..(w / MI).max(1) {
+            if let Some(e) = self.above_palette_size.get_mut(c + cell) {
+                *e = size;
+                self.above_palette_colors[c + cell] = colors;
+            }
         }
-        for cell in 0..(h / SUB).max(1) {
-            self.left_palette_size[r + cell] = size;
-            self.left_palette_colors[r + cell] = colors;
+        for cell in 0..(h / MI).max(1) {
+            if let Some(e) = self.left_palette_size.get_mut(r + cell) {
+                *e = size;
+                self.left_palette_colors[r + cell] = colors;
+            }
         }
     }
 
@@ -4049,7 +4050,7 @@ impl Neighbours {
     /// palette block decoded as "no palette" and the tile desynced from
     /// there (class [[cdf-row-held-constant]]).
     fn palette_ctx_and_cache(&self, at: (usize, usize)) -> (usize, Vec<u16>) {
-        self.palette_ctx_and_cache_mi(at, at.0 * (SUB / MI))
+        self.palette_ctx_and_cache_mi((at.0 * (SUB / MI), at.1 * (SUB / MI)))
     }
 
     /// [`Self::palette_ctx_and_cache`] with the block's REAL mi row, which a
@@ -4059,11 +4060,11 @@ impl Neighbours {
     /// block's own PIXEL row), and strip 1 of a HORZ_4 sits 8 px into the
     /// cell -- reading `at.0 % 4` there excludes strip 0 from the cache of
     /// every strip in an SB's top cell row, which libaom does not do.
-    fn palette_ctx_and_cache_mi(&self, at: (usize, usize), mi_r: usize) -> (usize, Vec<u16>) {
-        let (r, c) = at;
-        let above_ok = mi_r % 16 != 0;
+    fn palette_ctx_and_cache_mi(&self, mi: (usize, usize)) -> (usize, Vec<u16>) {
+        let (r, c) = mi;
+        let above_ok = r % 16 != 0;
         // `xd->above_mbmi` exists for every row but the tile's own first.
-        let above_is_palette = mi_r > self.tile_row0_mi && self.above_palette_size[c] > 0;
+        let above_is_palette = r > self.tile_row0_mi && self.above_palette_size[c] > 0;
         let (above_n, above_colors) = if above_ok && self.above_palette_size[c] > 0 {
             (self.above_palette_size[c], self.above_palette_colors[c])
         } else {
@@ -4074,7 +4075,7 @@ impl Neighbours {
         // (`left_available`), not the frame's -- without this guard a second
         // tile column reads the previous tile's palette colours into its cache
         // and its `palette_y_mode` ctx.
-        let left_ok = c > self.tile_col0_mi / (SUB / MI);
+        let left_ok = c > self.tile_col0_mi;
         let (left_n, left_colors) = if left_ok && self.left_palette_size[r] > 0 {
             (self.left_palette_size[r], self.left_palette_colors[r])
         } else {
@@ -4116,7 +4117,13 @@ impl Neighbours {
     /// (U-channel) palette size/colours -- `size == 0` clears stale state the
     /// same way (lane-palette2 r1).
     fn record_palette_uv(&mut self, at: (usize, usize), side: usize, size: usize, colors: [u16; 8]) {
-        self.record_palette_uv_rect(at, side, side, size, colors);
+        self.record_palette_uv_rect(
+            (at.0 * (SUB / MI), at.1 * (SUB / MI)),
+            side,
+            side,
+            size,
+            colors,
+        );
     }
 
     /// [`Self::record_palette_uv`] with independent above (`w`)/left (`h`)
@@ -4125,21 +4132,25 @@ impl Neighbours {
     /// luma resolution regardless of which plane the recorded state is for).
     fn record_palette_uv_rect(
         &mut self,
-        at: (usize, usize),
+        mi: (usize, usize),
         w: usize,
         h: usize,
         size: usize,
         colors: [u16; 8],
     ) {
-        let (r, c) = at;
-        // See [`Self::record_palette_y_rect`] for the `.max(1)`.
-        for cell in 0..(w / SUB).max(1) {
-            self.above_palette_uv_size[c + cell] = size;
-            self.above_palette_uv_colors[c + cell] = colors;
+        let (r, c) = mi;
+        // mi granularity, see [`Self::record_palette_y_rect`].
+        for cell in 0..(w / MI).max(1) {
+            if let Some(e) = self.above_palette_uv_size.get_mut(c + cell) {
+                *e = size;
+                self.above_palette_uv_colors[c + cell] = colors;
+            }
         }
-        for cell in 0..(h / SUB).max(1) {
-            self.left_palette_uv_size[r + cell] = size;
-            self.left_palette_uv_colors[r + cell] = colors;
+        for cell in 0..(h / MI).max(1) {
+            if let Some(e) = self.left_palette_uv_size.get_mut(r + cell) {
+                *e = size;
+                self.left_palette_uv_colors[r + cell] = colors;
+            }
         }
     }
 
@@ -4149,21 +4160,21 @@ impl Neighbours {
     /// palette use, `read_palette_mode_info`'s `pmi->palette_size[0] > 0`),
     /// so only the cache is wanted here.
     fn palette_uv_cache(&self, at: (usize, usize)) -> Vec<u16> {
-        self.palette_uv_cache_mi(at, at.0 * (SUB / MI))
+        self.palette_uv_cache_mi((at.0 * (SUB / MI), at.1 * (SUB / MI)))
     }
 
     /// [`Self::palette_uv_cache`] with the block's real mi row -- see
     /// [`Self::palette_ctx_and_cache_mi`].
-    fn palette_uv_cache_mi(&self, at: (usize, usize), mi_r: usize) -> Vec<u16> {
-        let (r, c) = at;
-        let above_ok = mi_r % 16 != 0;
+    fn palette_uv_cache_mi(&self, mi: (usize, usize)) -> Vec<u16> {
+        let (r, c) = mi;
+        let above_ok = r % 16 != 0;
         let (above_n, above_colors) = if above_ok && self.above_palette_uv_size[c] > 0 {
             (self.above_palette_uv_size[c], self.above_palette_uv_colors[c])
         } else {
             (0, [0u16; 8])
         };
         // Same tile-relative left availability as the luma cache above.
-        let left_ok = c > self.tile_col0_mi / (SUB / MI);
+        let left_ok = c > self.tile_col0_mi;
         let (left_n, left_colors) = if left_ok && self.left_palette_uv_size[r] > 0 {
             (self.left_palette_uv_size[r], self.left_palette_uv_colors[r])
         } else {
@@ -5777,40 +5788,43 @@ fn read_intra_mode_rect(
     ))
 }
 
-/// Stamps a 1:4 strip's palette state into the coarse above/left arrays.
-/// `av1_get_palette_cache` reads `xd->above_mbmi`/`xd->left_mbmi`, and inside
-/// a HORZ_4 (VERT_4) the next strip's ABOVE (LEFT) neighbour is this strip
-/// while its LEFT (ABOVE) neighbour is still the parent block's. The coarse
-/// [`SUB`]-cell arrays alias all four strips onto one entry, so writing BOTH
-/// axes after every strip would hand strip i+1 this strip's colours on the
-/// wrong axis too -- a wrong cache costs the same bits, so the tile stays in
-/// sync and only the pixels are wrong (class [[cdf-row-held-constant]]).
-/// Only the split axis is written until the closing strip, which stamps both
-/// for whatever follows the parent block.
+/// Stamps a 1:4 strip's palette state into the mi-granular above/left arrays,
+/// at the strip's REAL mi position. `av1_get_palette_cache` reads
+/// `xd->above_mbmi`/`xd->left_mbmi`, i.e. the mi cell above/left of the
+/// block, so each strip owns its own rows and columns and no aliasing rule
+/// is needed (lane-kf900 r6).
 #[allow(clippy::too_many_arguments)]
 fn record_strip_palette(
     n: &mut Neighbours,
-    at: (usize, usize),
+    mi: (usize, usize),
     bw: usize,
     bh: usize,
     y_size: usize,
     y_colors: [u16; 8],
     uv_size: usize,
     uv_colors: [u16; 8],
-    last: bool,
 ) {
-    let (r, c) = at;
-    let horz = bw > bh;
-    if horz || last {
-        for cell in 0..(bw / SUB).max(1) {
-            n.above_palette_size[c + cell] = y_size;
-            n.above_palette_colors[c + cell] = y_colors;
-            n.above_palette_uv_size[c + cell] = uv_size;
-            n.above_palette_uv_colors[c + cell] = uv_colors;
+    let (r, c) = mi;
+    // lane-kf900 r6: the palette side bands are mi-granular now, so a strip
+    // writes its OWN span on BOTH axes -- the old `last` split-axis rule only
+    // existed because the 16px [`SUB`] cell held one slot for all the strips
+    // of a HORZ_4/VERT_4 and leaf 0 zeroing the other axis threw away the
+    // real neighbour leaf 1 reads.
+    {
+        for cell in 0..(bw / MI).max(1) {
+            if let Some(e) = n.above_palette_size.get_mut(c + cell) {
+                *e = y_size;
+                n.above_palette_colors[c + cell] = y_colors;
+                n.above_palette_uv_size[c + cell] = uv_size;
+                n.above_palette_uv_colors[c + cell] = uv_colors;
+            }
         }
     }
-    if !horz || last {
-        for cell in 0..(bh / SUB).max(1) {
+    {
+        for cell in 0..(bh / MI).max(1) {
+            if n.left_palette_size.get(r + cell).is_none() {
+                break;
+            }
             n.left_palette_size[r + cell] = y_size;
             n.left_palette_colors[r + cell] = y_colors;
             n.left_palette_uv_size[r + cell] = uv_size;
@@ -6659,10 +6673,10 @@ fn decode_block_rect(
         // wrong VALUE -- same bit count, so the entropy stream stayed in sync
         // and only those pixels were wrong (lane-palette2 r10).
         let (py_size, py_colors) = palette_y.as_ref().map_or((0, [0u16; 8]), |p| (p.size, p.colors));
-        neighbours.record_palette_y_rect(at, bw, bh, py_size, py_colors);
+        neighbours.record_palette_y_rect((mi_r, mi_c), bw, bh, py_size, py_colors);
         let (puv_size, puv_colors) =
             palette_uv.as_ref().map_or((0, [0u16; 8]), |p| (p.size, p.u_colors));
-        neighbours.record_palette_uv_rect(at, bw, bh, puv_size, puv_colors);
+        neighbours.record_palette_uv_rect((mi_r, mi_c), bw, bh, puv_size, puv_colors);
         RECT_PARTITION_HITS.with(|c| c.set(c.get() + 1));
         return Ok(());
     }
@@ -6927,10 +6941,10 @@ fn decode_block_rect(
         }
     }
     let (py_size, py_colors) = palette_y.as_ref().map_or((0, [0u16; 8]), |p| (p.size, p.colors));
-    neighbours.record_palette_y_rect(at, bw, bh, py_size, py_colors);
+    neighbours.record_palette_y_rect((mi_r, mi_c), bw, bh, py_size, py_colors);
     let (puv_size, puv_colors) =
         palette_uv.as_ref().map_or((0, [0u16; 8]), |p| (p.size, p.u_colors));
-    neighbours.record_palette_uv_rect(at, bw, bh, puv_size, puv_colors);
+    neighbours.record_palette_uv_rect((mi_r, mi_c), bw, bh, puv_size, puv_colors);
     neighbours.fill_skip_grid_rect((mi_r, mi_c), bw / MI, bh / MI, skip);
     neighbours.fill_lf_grid_rect((mi_r, mi_c), bw / MI, bh / MI, tx_w as u8, tx_h as u8, 0);
     RECT_PARTITION_HITS.with(|c| c.set(c.get() + 1));
@@ -7016,12 +7030,13 @@ fn decode_leaf_rect(
     // a palette narrows the wrong interval and desyncs the tile even when the
     // decoded bit is the same. The cell is the 16px-SUB cell containing the
     // leaf (the palette neighbour arrays have no finer granularity).
-    let pal_at = (leaf_mi.0 / (SUB / MI), leaf_mi.1 / (SUB / MI));
-    // lane-kf900 r4: the leaf's REAL mi row -- the second leaf of a 16x8 pair
-    // sits 8 px into the cell, so the cache's superblock-top-row exclusion
-    // must not be read off the cell (see [`Neighbours::palette_ctx_and_cache_mi`]).
-    let (palette_ctx, palette_cache) = neighbours.palette_ctx_and_cache_mi(pal_at, leaf_mi.0);
-    let palette_uv_cache = neighbours.palette_uv_cache_mi(pal_at, leaf_mi.0);
+    // lane-kf900 r6: the leaf's REAL mi position -- the second leaf of a 16x8
+    // pair sits 8 px into the 16px cell, and both the cache's superblock-top-row
+    // exclusion and the neighbour palette lookup itself are mi-granular
+    // (see [`Neighbours::palette_ctx_and_cache_mi`]).
+    let pal_at = leaf_mi;
+    let (palette_ctx, palette_cache) = neighbours.palette_ctx_and_cache_mi(pal_at);
+    let palette_uv_cache = neighbours.palette_uv_cache_mi(pal_at);
     let (skip, mode, angle_delta_y, uv_mode, angle_delta_uv, alpha, filter_intra, palette_y, palette_uv) =
         read_intra_mode_rect(
             dec,
@@ -7059,12 +7074,6 @@ fn decode_leaf_rect(
         palette_y.as_ref().map_or((0, [0u16; 8]), |p| (p.size, p.colors));
     let (pal_uv_size, pal_uv_colors) =
         palette_uv.as_ref().map_or((0, [0u16; 8]), |p| (p.size, p.u_colors));
-    // The closing leaf of the pair -- see [`record_strip_palette`].
-    let pal_last = if bw > bh {
-        leaf_mi.0 % 4 == 2
-    } else {
-        leaf_mi.1 % 4 == 2
-    };
     if std::env::var_os("EC_AV1_RECTX_TRACE").is_some() {
         eprintln!("  skip={skip} mode={mode} angle_delta_y={angle_delta_y} uv_mode={uv_mode}");
     }
@@ -7147,7 +7156,6 @@ fn decode_leaf_rect(
         )?;
         record_strip_palette(
             neighbours, pal_at, bw, bh, pal_y_size, pal_y_colors, pal_uv_size, pal_uv_colors,
-            pal_last,
         );
         return Ok(mode);
     }
@@ -7271,7 +7279,6 @@ fn decode_leaf_rect(
     // real left neighbour leaf 1 reads (lane-kf900 r4).
     record_strip_palette(
         neighbours, pal_at, bw, bh, pal_y_size, pal_y_colors, pal_uv_size, pal_uv_colors,
-        pal_last,
     );
     // A rect leaf spans mi_w x mi_h, so its mode reaches several columns and
     // rows -- record the whole span, not one cell.
@@ -7341,9 +7348,9 @@ fn decode_block_rect4(
     // `palette_colors_y` cache hit off an EMPTY cache -- right symbol count,
     // wrong interval, so a screen-content tile desynced at the first strip
     // whose neighbour used a palette (class [[cdf-row-held-constant]]).
-    let pal_at = (mi_r / (SUB / MI), mi_c / (SUB / MI));
-    let (palette_ctx, palette_cache) = neighbours.palette_ctx_and_cache_mi(pal_at, mi_r);
-    let palette_uv_cache = neighbours.palette_uv_cache_mi(pal_at, mi_r);
+    let pal_at = (mi_r, mi_c);
+    let (palette_ctx, palette_cache) = neighbours.palette_ctx_and_cache_mi(pal_at);
+    let palette_uv_cache = neighbours.palette_uv_cache_mi(pal_at);
     let (
         skip,
         mode,
@@ -7387,10 +7394,6 @@ fn decode_block_rect4(
             p.map.iter().map(|&i| p.v_colors[i as usize]).collect(),
         )
     });
-    // `last`: strip 3 of the parent 32x32's HORZ_4 (VERT_4), the only one
-    // whose colours a block outside the parent sees -- see
-    // [`record_strip_palette`].
-    let pal_last = if bw > bh { mi_r % 8 == 6 } else { mi_c % 8 == 6 };
     let (pal_y_size, pal_y_colors) =
         palette_y.as_ref().map_or((0, [0u16; 8]), |p| (p.size, p.colors));
     let (pal_uv_size, pal_uv_colors) =
@@ -7478,7 +7481,7 @@ fn decode_block_rect4(
         )?;
         record_strip_palette(
             neighbours, pal_at, bw, bh, pal_y_size, pal_y_colors, pal_uv_size,
-            pal_uv_colors, pal_last,
+            pal_uv_colors,
         );
         if bw > bh {
             RECT4_32_HORZ_HITS.with(|c| c.set(c.get() + 1));
@@ -7631,7 +7634,7 @@ fn decode_block_rect4(
         neighbours.fill_lf_grid_rect((mi_r, mi_c), mi_w, mi_h, bw as u8, bh as u8, 0);
         record_strip_palette(
             neighbours, pal_at, bw, bh, pal_y_size, pal_y_colors, pal_uv_size,
-            pal_uv_colors, pal_last,
+            pal_uv_colors,
         );
         if bw > bh {
             RECT4_32_HORZ_HITS.with(|c| c.set(c.get() + 1));
@@ -7694,7 +7697,6 @@ fn decode_block_rect4(
     neighbours.fill_lf_grid_rect((mi_r, mi_c), mi_w, mi_h, bw as u8, bh as u8, 0);
     record_strip_palette(
         neighbours, pal_at, bw, bh, pal_y_size, pal_y_colors, pal_uv_size, pal_uv_colors,
-        pal_last,
     );
     if bw > bh {
         RECT4_32_HORZ_HITS.with(|c| c.set(c.get() + 1));
@@ -7778,9 +7780,8 @@ fn decode_rect4_16(
         // lane-kf900 r4: the strip's real palette ctx + colour cache (see
         // [`decode_block_rect4`]); `None`/`&[]` here read `palette_y_mode`
         // off CDF row 0 and every cache hit off an empty cache.
-        let (palette_ctx, palette_cache) =
-            neighbours.palette_ctx_and_cache_mi(at16, lmi.0);
-        let palette_uv_cache = neighbours.palette_uv_cache_mi(at16, lmi.0);
+        let (palette_ctx, palette_cache) = neighbours.palette_ctx_and_cache_mi(lmi);
+        let palette_uv_cache = neighbours.palette_uv_cache_mi(lmi);
         let (
             skip,
             mode,
@@ -8180,8 +8181,7 @@ fn decode_rect4_16(
         let (pal_uv_size, pal_uv_colors) =
             palette_uv.as_ref().map_or((0, [0u16; 8]), |p| (p.size, p.u_colors));
         record_strip_palette(
-            neighbours, at16, bw, bh, pal_y_size, pal_y_colors, pal_uv_size, pal_uv_colors,
-            i == 3,
+            neighbours, lmi, bw, bh, pal_y_size, pal_y_colors, pal_uv_size, pal_uv_colors,
         );
         last_mode = mode;
         prev = Some((lmi, mode));
@@ -8376,10 +8376,10 @@ fn decode_block_rect64(
         // split-tx superblock strip would otherwise leave the above/left
         // palette arrays holding a dead block's colours.
         let (py_size, py_colors) = palette_y.as_ref().map_or((0, [0u16; 8]), |p| (p.size, p.colors));
-        neighbours.record_palette_y_rect(at, bw, bh, py_size, py_colors);
+        neighbours.record_palette_y_rect((mi_r, mi_c), bw, bh, py_size, py_colors);
         let (puv_size, puv_colors) =
             palette_uv.as_ref().map_or((0, [0u16; 8]), |p| (p.size, p.u_colors));
-        neighbours.record_palette_uv_rect(at, bw, bh, puv_size, puv_colors);
+        neighbours.record_palette_uv_rect((mi_r, mi_c), bw, bh, puv_size, puv_colors);
         RECT_PARTITION_HITS.with(|c| c.set(c.get() + 1));
         return Ok(());
     }
@@ -8691,10 +8691,10 @@ fn decode_block_rect64(
         RECT_COEFF_HITS.with(|c| c.set(c.get() + 1));
     }
     let (py_size, py_colors) = palette_y.as_ref().map_or((0, [0u16; 8]), |p| (p.size, p.colors));
-    neighbours.record_palette_y_rect(at, bw, bh, py_size, py_colors);
+    neighbours.record_palette_y_rect((mi_r, mi_c), bw, bh, py_size, py_colors);
     let (puv_size, puv_colors) =
         palette_uv.as_ref().map_or((0, [0u16; 8]), |p| (p.size, p.u_colors));
-    neighbours.record_palette_uv_rect(at, bw, bh, puv_size, puv_colors);
+    neighbours.record_palette_uv_rect((mi_r, mi_c), bw, bh, puv_size, puv_colors);
     neighbours.fill_skip_grid_rect((mi_r, mi_c), bw / MI, bh / MI, skip);
     neighbours.fill_lf_grid_rect((mi_r, mi_c), bw / MI, bh / MI, tx_w as u8, tx_h as u8, 0);
     SB_RECT_HITS.with(|c| c.set(c.get() + 1));
@@ -10657,9 +10657,8 @@ fn decode_leaf8(
     // above/left palette state over its own cell so the next block's ctx and
     // colour cache do not read a previous block's palette (lane-palette2 r8).
     {
-        let pal_at = (leaf_mi.0 / (SUB / MI), leaf_mi.1 / (SUB / MI));
-        neighbours.record_palette_y_rect(pal_at, 8, 8, 0, [0u16; 8]);
-        neighbours.record_palette_uv_rect(pal_at, 8, 8, 0, [0u16; 8]);
+        neighbours.record_palette_y_rect(leaf_mi, 8, 8, 0, [0u16; 8]);
+        neighbours.record_palette_uv_rect(leaf_mi, 8, 8, 0, [0u16; 8]);
     }
         neighbours.fill_skip_grid(leaf_mi, 2, skip);
         neighbours.fill_lf_grid(leaf_mi, 2, 4, 0);
@@ -10671,9 +10670,8 @@ fn decode_leaf8(
     // above/left palette state over its own cell so the next block's ctx and
     // colour cache do not read a previous block's palette (lane-palette2 r8).
     {
-        let pal_at = (leaf_mi.0 / (SUB / MI), leaf_mi.1 / (SUB / MI));
-        neighbours.record_palette_y_rect(pal_at, 8, 8, 0, [0u16; 8]);
-        neighbours.record_palette_uv_rect(pal_at, 8, 8, 0, [0u16; 8]);
+        neighbours.record_palette_y_rect(leaf_mi, 8, 8, 0, [0u16; 8]);
+        neighbours.record_palette_uv_rect(leaf_mi, 8, 8, 0, [0u16; 8]);
     }
     neighbours.fill_skip_grid(leaf_mi, 2, skip);
     // lane-kf900 r1: the leaf's own RESOLVED transform size, never the literal
@@ -23278,19 +23276,19 @@ mod tests {
     fn a_sub16_leaf_after_a_palette_block_yields_palette_ctx_zero() {
         let mut n = Neighbours::new(4, 4, 16, 16);
         // A real 16x16 palette block covering SUB cell (1, 1).
-        n.record_palette_y_rect((1, 1), 16, 16, 2, [7, 9, 0, 0, 0, 0, 0, 0]);
+        n.record_palette_y_rect((4, 4), 16, 16, 2, [7, 9, 0, 0, 0, 0, 0, 0]);
         let (ctx, cache) = n.palette_ctx_and_cache((1, 1));
         assert_eq!(ctx, 2, "the palette block itself must be visible");
         assert_eq!(cache, vec![7, 9]);
         // An 8x8 non-palette leaf in that same cell.
-        n.record_palette_y_rect((1, 1), 8, 8, 0, [0u16; 8]);
+        n.record_palette_y_rect((4, 4), 8, 8, 0, [0u16; 8]);
         let (ctx, cache) = n.palette_ctx_and_cache((1, 1));
         assert_eq!(ctx, 0, "a sub-16 non-palette leaf must clear its own cell");
         assert!(cache.is_empty(), "and its stale colour cache with it");
         // Same for the chroma half.
-        n.record_palette_uv_rect((1, 1), 16, 16, 2, [1, 2, 0, 0, 0, 0, 0, 0]);
+        n.record_palette_uv_rect((4, 4), 16, 16, 2, [1, 2, 0, 0, 0, 0, 0, 0]);
         assert_eq!(n.palette_uv_cache((1, 1)), vec![1, 2]);
-        n.record_palette_uv_rect((1, 1), 8, 8, 0, [0u16; 8]);
+        n.record_palette_uv_rect((4, 4), 8, 8, 0, [0u16; 8]);
         assert!(n.palette_uv_cache((1, 1)).is_empty());
     }
 
