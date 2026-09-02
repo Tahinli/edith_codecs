@@ -53,7 +53,9 @@ arm and not in its fall-through twin. `b64da0d` counts both. The unit had been s
 before that commit, so it measured the pre-fix tree.
 
 Re-run after `b64da0d`: unit `intersub8-suite-r5b-1788345925` -> `$HOME/.cache/intersub8-suite-r5.log`.
-RESULT_R5B
+**`test result: ok. 385 passed; 0 failed; 33 ignored; 0 measured; 0 filtered out` in 1489.80s.**
+
+EVIDENCE: $HOME/.cache/intersub8-suite-r5.log | `cargo test -p ec-av1 --lib -j3` under user unit `intersub8-suite-r5b-1788345925` (MemoryMax=10G, nice 10, EC_AV1_REQUIRE_AOMENC=1), full re-run at b64da0d | 385/0 — the one r5 failure (cdef sub16 counter) is gone, no new red
 
 r4's unit (`intersub8-suite-r4-1788331918`) was stopped as charter-ordered: **187 ok, 0 FAILED,
 no `test result:` line** at stop time — recorded, not a green claim.
