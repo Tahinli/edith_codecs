@@ -88,3 +88,17 @@ See `$HOME/.cache/intrasplit-suite-r2.log` (unit `intrasplit-suite-r2-*`, Memory
   64x32 / 32x64" refusals — now the FIRST blocker on the 2160p film segment.
 - deferred(other lanes): the 8-bit arm cannot fire until the non-skip rect-strip residual,
   inter SB-level AB and sub-8x8 inter refusals are lifted (14+8+4 of 40 attempts).
+
+## Suite result (measured)
+`cargo test -p ec-av1 --lib` under unit `intrasplit-suite-r2-1788330642`, MemoryMax=10G:
+**385 passed, 3 failed, 35 ignored** in 1082 s (log `$HOME/.cache/intrasplit-suite-r2.log`).
+- 2 failures are this lane's own gate arms (see above) — the lift is still UNGATED, so this
+  branch MUST NOT merge as-is.
+- 1 failure is a MERGE CROSS-PRODUCT (class `merge-cross-product-defect`), not this lane's
+  code: `a_real_aomenc_inter_sequence_with_16x16_level_1to4_partitions_decodes_pixel_exact`
+  (lane-inter16ab's gate) fails at `stream.rs:9167` — `frame 4 luma vs ffmpeg (attempt 1,
+  8-bit, arms [0, 4, 2, 2])`. It is green on lane-inter16ab's own tip 4811488 per that
+  lane's report; it goes red once lane-r14 b86eb38 (general `read_var_tx_size`) and/or
+  lane-intra14 f4b5419 are merged with it. `deferred(whoever merges r14+inter16ab into
+  main)`: the same pair must be re-run there — the 8x4 luma set added this round is the
+  first half of that interaction, the pixel mismatch on frame 4 is the second.
