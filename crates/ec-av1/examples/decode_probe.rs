@@ -37,6 +37,11 @@ fn main() {
         println!("rect_inter: tu={rtu} txsplit={rsplit} obmc_leaf={robmc}");
         let leaf = ec_av1::stream::vartx_rect_leaf_hits();
         println!("vartx_rect_leaf: 32x16={} 16x32={}", leaf[0], leaf[1]);
+        let sb = ec_av1::stream::sb128_rect_counters();
+        println!(
+            "sb128_rect: edge_horz={} edge_vert={} inter_128x64={} inter_64x128={}",
+            sb.0, sb.1, sb.2, sb.3
+        );
         let ir = ec_av1::stream::inter_rect_counters();
         println!(
             "inter_rect: 32x8={} 8x32={} 64x32={} 32x64={} 64x16={} 16x64={}",
