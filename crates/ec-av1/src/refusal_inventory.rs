@@ -38,8 +38,6 @@ const REFUSALS: &[&str] = &[
     "an intra 8x4/4x8 block inside an inter frame's sub-8x8 HORZ/VERT partition (this decoder codes only inter sub-blocks there)",
     "a sub-8x8 inter block under a scaled reference (superres, unimplemented)",
     "a COMPOUND_WEDGE mask on a non-square inter block (rect wedge codebook unimplemented)",
-    "a 16x16 block whose true edge cuts through both axes needs a rectangular transform this decoder does not code yet",
-    "a 16x16 inter block whose true edge cuts through both axes needs a rectangular transform this decoder does not code yet",
     "a 32x32 partition type this decoder does not code (value={part32})",
     "a Golomb tail longer than this decoder reads",
     "a tx_type symbol outside its CDF's own set: {t}",
