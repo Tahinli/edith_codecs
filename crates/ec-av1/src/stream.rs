@@ -5962,6 +5962,247 @@ mod tests {
     }
 
 
+    /// lane-leaf8tx r1: the two remaining refusals on an INTRA 8x8 leaf
+    /// inside an INTER frame -- its `tx_depth` splitting the luma transform
+    /// into four TX_4X4 units (`--enable-tx-size-search=1`), and a nonzero
+    /// luma `angle_delta_y` on it (`--enable-angle-delta=1`,
+    /// `av1_use_angle_delta(BLOCK_8X8)`). Both counters are per-attempt
+    /// deltas on an attempt that decoded to the end and is pixel-compared
+    /// (class [[counter-from-refused-stream]]); a decode error or a mismatch
+    /// is a FAILURE, never a SKIP.
+    #[test]
+    fn a_real_aomenc_inter_sequence_with_a_split_tx_8x8_intra_leaf_decodes_pixel_exact() {
+        tx_split_angle_in_inter8_gate(8);
+    }
+
+    /// The 10-bit arm (both of the user's films are `yuv420p10le`).
+    #[test]
+    fn a_real_aomenc_10bit_inter_sequence_with_a_split_tx_8x8_intra_leaf_decodes_pixel_exact() {
+        tx_split_angle_in_inter8_gate(10);
+    }
+
+    fn tx_split_angle_in_inter8_gate(bit_depth: u32) {
+        let name = format!("tx_split_angle_in_inter8_gate({bit_depth})");
+        if !have_ffmpeg() {
+            eprintln!("SKIP {name}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {name}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height, frame_count) = (192usize, 128usize, 6usize);
+        let mut refusals = Vec::new();
+        let mut uncounted_exact = 0u32;
+        let mut totals = (0usize, 0usize);
+        for attempt in 0..30u32 {
+            let seed = 42 + attempt;
+            // Same zoom + hard-cut fractal source the sibling uv_mode gate
+            // uses (a cut is what makes aomenc code INTRA blocks inside an
+            // inter frame); `noise` carries an explicit seed (class
+            // [[seeded-fixture-not-reproducible]]).
+            let source = format!(
+                "mandelbrot=size={width}x{height}:start_scale={}:rate=25[a];\
+                 mandelbrot=size={width}x{height}:start_scale={}:rate=25[b];\
+                 [a][b]overlay=enable='gte(n,3)',noise=alls=12:allf=t+u:all_seed={seed}",
+                5.0 - f64::from(attempt) * 0.06,
+                0.9 + f64::from(attempt) * 0.11
+            );
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-pix_fmt",
+                    if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" },
+                    "-strict",
+                    "-1",
+                    "-t",
+                    "0.24",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-strict",
+                    "-1",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let cq = format!("--cq-level={}", 12 + (attempt % 5) * 7);
+            let depth_args: &[&str] = if bit_depth == 10 {
+                &["-b", "10", "--input-bit-depth=10"]
+            } else {
+                &[]
+            };
+            // The y4m goes through a PID-keyed FILE, never aomenc's stdin
+            // (pipe deadlock, class [[gate-loader-slurps-whole-file]]).
+            let y4m_path = std::env::temp_dir().join(format!(
+                "ec-av1-leaf8tx-{}-{bit_depth}-{seed}.y4m",
+                std::process::id()
+            ));
+            std::fs::write(&y4m_path, &y4m.stdout).expect("writing the y4m fixture");
+            let child = Command::new(aomenc_path())
+                .args(depth_args)
+                .args([
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    &cq,
+                    "--cpu-used=0",
+                    "--lag-in-frames=0",
+                    "--auto-alt-ref=0",
+                    "--kf-max-dist=9999",
+                    "--kf-min-dist=9999",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--tile-columns=0",
+                    "--enable-order-hint=0",
+                    "--enable-warped-motion=0",
+                    "--enable-obmc=0",
+                    "--enable-masked-comp=0",
+                    "--enable-interintra-comp=0",
+                    "--enable-dist-wtd-comp=0",
+                    "--enable-diff-wtd-comp=0",
+                    "--enable-onesided-comp=0",
+                    "--enable-interintra-wedge=0",
+                    "--enable-smooth-interintra=0",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    "--enable-cdef=0",
+                    "--enable-restoration=0",
+                    "--enable-palette=0",
+                    "--enable-intrabc=0",
+                    "--enable-ref-frame-mvs=0",
+                    // Per-arm overrides LAST (aomenc keeps the last
+                    // occurrence of a repeated --enable-* flag). Rect
+                    // partitions stay off so the leaf's unrelated sub-16 rect
+                    // inter refusal never fires.
+                    "--enable-rect-partitions=0",
+                    "--enable-tx-size-search=1",
+                    "--enable-angle-delta=1",
+                    "--enable-directional-intra=1",
+                    "--min-partition-size=8",
+                    "--max-partition-size=32",
+                    "--obu",
+                    "-o",
+                    "-",
+                ])
+                .arg(&y4m_path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            let _ = std::fs::remove_file(&y4m_path);
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let before = (
+                decode::intra_in_inter_split_tx_hits()[0],
+                decode::intra_in_inter8_angle_delta_y_hits(),
+            );
+            let frames = match decode_stream(&stream) {
+                Ok(frames) => frames,
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{name} decode failed outright (seed {seed}): {msg}"
+                    );
+                    refusals.push(format!("seed {seed}: {msg}"));
+                    continue;
+                }
+            };
+            let now = (
+                decode::intra_in_inter_split_tx_hits()[0],
+                decode::intra_in_inter8_angle_delta_y_hits(),
+            );
+            let fired = (now.0 - before.0, now.1 - before.1);
+            totals = (totals.0 + fired.0, totals.1 + fired.1);
+            // Both lifted capabilities must fire on the SAME pixel-compared
+            // attempt.
+            let counted = fired.0 > 0 && fired.1 > 0;
+            if !counted {
+                uncounted_exact += 1;
+                refusals.push(format!(
+                    "seed {seed}: decoded and pixel-compared, but split-tx {} / angle-delta {} \
+                     8x8 intra-in-inter leaves",
+                    fired.0, fired.1
+                ));
+            }
+            let ffmpeg_frames = if bit_depth == 10 {
+                ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count)
+            } else {
+                ffmpeg_decode_sequence(&stream, width, height, frame_count)
+            };
+            assert_eq!(frames.len(), frame_count);
+            eprintln!(
+                "{name} seed={seed} {cq}: 8x8 intra-in-inter leaves with tx_depth=1 {}, with a \
+                 nonzero angle_delta_y {}",
+                fired.0, fired.1
+            );
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                for (plane, (g, w)) in [
+                    ("Y", (&got.y, &want.y)),
+                    ("U", (&got.u, &want.u)),
+                    ("V", (&got.v, &want.v)),
+                ] {
+                    let stride = if plane == "Y" { width } else { width / 2 };
+                    if let Some(at) = g.iter().zip(w.iter()).position(|(a, b)| a != b) {
+                        eprintln!(
+                            "{name} seed={seed}: frame {i} {plane} first diff at ({}, {}) got {} \
+                             want {} ({} samples differ)",
+                            at % stride,
+                            at / stride,
+                            g[at],
+                            w[at],
+                            g.iter().zip(w.iter()).filter(|(a, b)| a != b).count(),
+                        );
+                    }
+                }
+            }
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(got.y, want.y, "frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(got.u, want.u, "frame {i} U vs ffmpeg (seed {seed})");
+                assert_eq!(got.v, want.v, "frame {i} V vs ffmpeg (seed {seed})");
+            }
+            if counted {
+                gate_buckets(
+                    &name,
+                    1,
+                    uncounted_exact,
+                    refusals.len() - uncounted_exact as usize,
+                );
+                return;
+            }
+        }
+        gate_buckets(
+            &name,
+            0,
+            uncounted_exact,
+            refusals.len() - uncounted_exact as usize,
+        );
+        panic!(
+            "{name} never observed BOTH a tx_depth split and a nonzero angle delta on an 8x8 \
+             intra leaf in an inter frame (totals split/angle {totals:?}):\n{}",
+            refusals.join("\n")
+        );
+    }
+
     /// lane-chroma r2 stage 1: a real aomenc key frame with
     /// `--enable-smooth-intra=1` (opposite of every sibling recipe's `=0`)
     /// and `--enable-paeth-intra=0` -- paeth chroma stays off so the still-
