@@ -2759,30 +2759,22 @@ mod tests {
         let (width, height) = (256usize, 192usize);
         // (arm, source, per-arm overrides AFTER the base recipe, expect_refusal,
         //  must_read_use_intrabc)
-        let arms: [(&str, &str, &[&str], bool, bool); 3] = [
-            (
-                "testsrc2-screen-nopalette-cq50",
-                "testsrc2=s=256x192:r=25",
-                &["--cq-level=50", "--enable-palette=0", "--enable-tx-size-search=0"],
-                true,
-                true,
-            ),
-            (
-                "smptebars-screen-nopalette-cq45",
-                "smptebars=size=256x192:rate=25",
-                &["--cq-level=45", "--enable-palette=0", "--enable-tx-size-search=0"],
-                false,
-                true,
-            ),
-            (
-                "testsrc2-screen-nopalette-cq63",
-                "testsrc2=s=256x192:r=25",
-                &["--cq-level=63", "--enable-palette=0", "--enable-tx-size-search=1"],
-                false,
-                false,
-            ),
+        const TS: &str = "testsrc2=s=256x192:r=25";
+        const SB: &str = "smptebars=size=256x192:rate=25";
+        // (arm, source, per-arm overrides AFTER the base recipe, expect_refusal,
+        //  must_read_use_intrabc_on_a_rect_strip)
+        let arms: [(&str, &str, &[&str], bool, bool); 7] = [
+            ("testsrc2-cq50-txs0", TS, &["--cq-level=50", "--enable-palette=0", "--enable-tx-size-search=0"], true, true),
+            ("smptebars-cq40-txs0", SB, &["--cq-level=40", "--enable-palette=0", "--enable-tx-size-search=0"], false, false),
+            ("smptebars-cq45-txs0", SB, &["--cq-level=45", "--enable-palette=0", "--enable-tx-size-search=0"], false, true),
+            ("smptebars-cq45-txs1", SB, &["--cq-level=45", "--enable-palette=0", "--enable-tx-size-search=1"], false, false),
+            ("smptebars-cq50-txs1", SB, &["--cq-level=50", "--enable-palette=0", "--enable-tx-size-search=1"], false, false),
+            ("smptebars-cq55-txs0", SB, &["--cq-level=55", "--enable-palette=0", "--enable-tx-size-search=0"], false, false),
+            ("testsrc2-cq63-txs1", TS, &["--cq-level=63", "--enable-palette=0", "--enable-tx-size-search=1"], false, false),
         ];
         let (mut reads_total, mut refused, mut frames_compared) = (0usize, 0u32, 0usize);
+        let (mut blocks_total, mut fired_arms, mut out_of_scope, mut out_of_scope_mismatch) =
+            (0usize, 0u32, 0u32, 0u32);
         for (arm, src, extra, expect_refusal, must_read) in &arms {
             let render = || {
                 let out = Command::new("ffmpeg")
@@ -2823,6 +2815,9 @@ mod tests {
                     // `allow_screen_content_tools` (and with it the frame
                     // header's `allow_intrabc` bit) comes from here.
                     "--tune-content=screen",
+                    // Spelled so `gate_coverage` counts the tool as exercised
+                    // rather than defaulted (class `tool-disabled-in-every-gate`).
+                    "--enable-intrabc=1",
                 ])
                 // aomenc keeps the LAST occurrence of a repeated flag.
                 .args(*extra)
@@ -2850,9 +2845,15 @@ mod tests {
             );
             let stream = out.stdout;
             decode::reset_rect_intrabc_reads();
+            crate::decode::reset_intrabc_hits();
             let decoded = decode_stream(&stream);
             let reads = decode::rect_intrabc_reads();
+            // Blocks that decoded `use_intrabc == 1` (square path), i.e. that
+            // read a DV and predicted from the current frame -- distinct from
+            // `reads`, which counts rect strips that merely READ the flag.
+            let blocks = crate::decode::intrabc_hits();
             reads_total += reads;
+            blocks_total += blocks;
             if *must_read {
                 assert!(
                     reads > 0,
@@ -2868,19 +2869,38 @@ mod tests {
                          reconstruction is not ported, it must refuse by name"
                     );
                     assert!(!frames.is_empty(), "{NAME}: {arm} decoded no frame");
-                    if *must_read {
-                        // Arm 1: entropy coverage only (see PIXEL RESIDUE above).
-                        eprintln!("{NAME}: {arm} decoded {} frame(s), {reads} rect use_intrabc reads", frames.len());
-                        continue;
-                    }
                     let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frames.len());
                     assert_eq!(frames.len(), ffmpeg_frames.len(), "{NAME}: {arm} frame count");
+                    // EVERY frame is compared; an arm whose decode never hit an
+                    // intrabc block proves nothing about the DV/prediction path,
+                    // so it is counted OUT OF SCOPE -- but a mismatch there is
+                    // still a failure (`out_of_scope_mismatch == 0`), never a skip.
+                    let mut same = true;
                     for (i, (ours, theirs)) in frames.iter().zip(ffmpeg_frames.iter()).enumerate() {
-                        assert_eq!(ours.y, theirs.y, "{NAME}: {arm} luma, frame {i}");
-                        assert_eq!(ours.u, theirs.u, "{NAME}: {arm} U, frame {i}");
-                        assert_eq!(ours.v, theirs.v, "{NAME}: {arm} V, frame {i}");
+                        let ok = ours.y == theirs.y && ours.u == theirs.u && ours.v == theirs.v;
+                        if !ok {
+                            eprintln!("{NAME}: {arm} MISMATCH at frame {i}");
+                        }
+                        same &= ok;
                         frames_compared += 1;
                     }
+                    if blocks > 0 {
+                        fired_arms += 1;
+                        assert!(
+                            same,
+                            "{NAME}: {arm} decoded {blocks} intrabc block(s) and did not match ffmpeg"
+                        );
+                    } else {
+                        out_of_scope += 1;
+                        if !same {
+                            out_of_scope_mismatch += 1;
+                        }
+                    }
+                    eprintln!(
+                        "{NAME}: {arm} {} frame(s), {reads} rect use_intrabc reads, \
+                         {blocks} intrabc block(s), exact={same}",
+                        frames.len()
+                    );
                 }
                 Err(e) => {
                     let msg = e.to_string();
@@ -2900,11 +2920,21 @@ mod tests {
         }
         eprintln!(
             "{NAME}: {reads_total} rect-strip use_intrabc symbol(s) read, \
-             {refused} refused by name, {frames_compared} frames compared pixel-exact"
+             {blocks_total} intrabc block(s) decoded across {fired_arms} arm(s), \
+             {refused} refused by name, {frames_compared} frames compared, \
+             {out_of_scope} out of scope ({out_of_scope_mismatch} mismatched)"
         );
         assert!(reads_total > 0, "{NAME}: gate is vacuous -- no arm read the symbol");
+        assert!(
+            blocks_total > 0 && fired_arms > 0,
+            "{NAME}: gate is vacuous -- no compared arm actually decoded an intrabc block"
+        );
         assert_eq!(refused, 1, "{NAME}: expected exactly one named intrabc refusal");
         assert!(frames_compared > 0, "{NAME}: no frame was compared pixel-exact");
+        assert_eq!(
+            out_of_scope_mismatch, 0,
+            "{NAME}: an arm without an intrabc block still mismatched ffmpeg"
+        );
     }
 
     /// lane-kf900 r4, the gate for the two lifted palette refusals ("a 1:4
