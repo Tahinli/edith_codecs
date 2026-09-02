@@ -4699,56 +4699,38 @@ mod tests {
     /// [[gate-skips-on-its-own-failure]]); exhausting every attempt without a
     /// counted strip is a FAILURE, never a SKIP.
     #[test]
-    // r1 `#[ignore]`d this gate on "every stream with an intra 1:4 strip also
-    // hits the inter rect-strip refusal". r2 merged main 18bf7dc (lane-r14
-    // a2e2e29 lifts exactly that refusal) and re-ran it: 3 of 40 attempts now
-    // decode whole and reach the pixel compare (0 before), one of them firing
-    // 64x16=4 16x64=3. But the compare fails on a defect this lane does not
-    // own -- MEASURED (r2, $HOME/.cache/intra14-r2-*.log):
-    //   * seeds 46 and 54 fire ZERO 1:4 strips (`intra_rect4_strip_in_inter_hits`
-    //     delta 0/0/0/0) and mismatch ffmpeg the same way as the firing seed 52:
-    //     decode-order frame 3/4 luma ~3.7-4.5k samples, max |d| 6..17, then
-    //     frames 5-7 drift to ~24k samples, max |d| ~220 as the references
-    //     carry the error forward.
-    //   * with `--enable-1to4-partitions=0` aomenc emits a BYTE-IDENTICAL
-    //     stream at this recipe (same hits, same per-frame diff counts), so
-    //     the 1:4 shape is not the discriminator either.
-    // i.e. this mandelbrot 192x128 source has a pre-existing INTER-frame
-    // pixel defect on this tree (r1 already recorded it as "open, NOT mine"
-    // with rect partitions off; it is now this gate's blocker). testsrc2 at
-    // 192x128 decodes pixel-exact on the same recipe but fires no 1:4 strip
-    // in 4 of 12 attempts that decode whole. So the gate stays `#[ignore]`d
-    // rather than weakened: a source whose baseline is exact AND that fires
-    // an intra 1:4 strip has not been found yet.
-    #[ignore = "blocked: the mandelbrot gate source has a pre-existing inter-frame pixel defect on this tree (zero-hit streams mismatch identically) -- see the MEASURED note above"]
+    // r3 re-measured this gate on the merged tree (main 48b35ab + lane-sqdrift
+    // 7d498c0). The r2 blocker is GONE: the "pre-existing inter-frame pixel
+    // defect" was lane-sqdrift's -- a 64x64 intra block in an inter frame
+    // reading uv_mode off the CFL alphabet -- and with that fix all 40
+    // mandelbrot attempts now decode PIXEL-EXACT (0 diff samples over
+    // 40 streams x 8 frames x 3 planes, $HOME/.cache/intra14-r3-8bit.log).
+    // The r2 counter reading "seed 52: 64x16=4 16x64=3" was produced by our own
+    // desynced decode of a MISMATCHING stream (class counter-from-refused-
+    // stream): on the correct decode that same stream fires 0/0/0/0.
+    // The remaining blocker is a RECIPE gap, not a decoder gap: no source found
+    // this round makes aomenc code an INTRA block on a 1:4 partition inside an
+    // INTER frame -- see the MEASURED note in `intra_rect4_in_inter_gate`.
+    #[ignore = "blocked on the recipe, not the decoder: no aomenc source found yet codes an INTRA block on a 1:4 partition inside an INTER frame (mandelbrot = intra-in-inter but zero 1:4 partitions; gradients = 1:4 partitions but all inter; blend = neither) -- see the MEASURED note in intra_rect4_in_inter_gate"]
     fn a_real_aomenc_inter_sequence_with_an_intra_1to4_strip_decodes_pixel_exact() {
         intra_rect4_in_inter_gate(8);
     }
 
     /// The 10-bit arm (both of the user's films are `yuv420p10le`).
     #[test]
-    // r1 `#[ignore]`d this gate on "every stream with an intra 1:4 strip also
-    // hits the inter rect-strip refusal". r2 merged main 18bf7dc (lane-r14
-    // a2e2e29 lifts exactly that refusal) and re-ran it: 3 of 40 attempts now
-    // decode whole and reach the pixel compare (0 before), one of them firing
-    // 64x16=4 16x64=3. But the compare fails on a defect this lane does not
-    // own -- MEASURED (r2, $HOME/.cache/intra14-r2-*.log):
-    //   * seeds 46 and 54 fire ZERO 1:4 strips (`intra_rect4_strip_in_inter_hits`
-    //     delta 0/0/0/0) and mismatch ffmpeg the same way as the firing seed 52:
-    //     decode-order frame 3/4 luma ~3.7-4.5k samples, max |d| 6..17, then
-    //     frames 5-7 drift to ~24k samples, max |d| ~220 as the references
-    //     carry the error forward.
-    //   * with `--enable-1to4-partitions=0` aomenc emits a BYTE-IDENTICAL
-    //     stream at this recipe (same hits, same per-frame diff counts), so
-    //     the 1:4 shape is not the discriminator either.
-    // i.e. this mandelbrot 192x128 source has a pre-existing INTER-frame
-    // pixel defect on this tree (r1 already recorded it as "open, NOT mine"
-    // with rect partitions off; it is now this gate's blocker). testsrc2 at
-    // 192x128 decodes pixel-exact on the same recipe but fires no 1:4 strip
-    // in 4 of 12 attempts that decode whole. So the gate stays `#[ignore]`d
-    // rather than weakened: a source whose baseline is exact AND that fires
-    // an intra 1:4 strip has not been found yet.
-    #[ignore = "blocked: the mandelbrot gate source has a pre-existing inter-frame pixel defect on this tree (zero-hit streams mismatch identically) -- see the MEASURED note above"]
+    // r3 re-measured this gate on the merged tree (main 48b35ab + lane-sqdrift
+    // 7d498c0). The r2 blocker is GONE: the "pre-existing inter-frame pixel
+    // defect" was lane-sqdrift's -- a 64x64 intra block in an inter frame
+    // reading uv_mode off the CFL alphabet -- and with that fix all 40
+    // mandelbrot attempts now decode PIXEL-EXACT (0 diff samples over
+    // 40 streams x 8 frames x 3 planes, $HOME/.cache/intra14-r3-8bit.log).
+    // The r2 counter reading "seed 52: 64x16=4 16x64=3" was produced by our own
+    // desynced decode of a MISMATCHING stream (class counter-from-refused-
+    // stream): on the correct decode that same stream fires 0/0/0/0.
+    // The remaining blocker is a RECIPE gap, not a decoder gap: no source found
+    // this round makes aomenc code an INTRA block on a 1:4 partition inside an
+    // INTER frame -- see the MEASURED note in `intra_rect4_in_inter_gate`.
+    #[ignore = "blocked on the recipe, not the decoder: no aomenc source found yet codes an INTRA block on a 1:4 partition inside an INTER frame (mandelbrot = intra-in-inter but zero 1:4 partitions; gradients = 1:4 partitions but all inter; blend = neither) -- see the MEASURED note in intra_rect4_in_inter_gate"]
     fn a_real_aomenc_inter_sequence_with_an_intra_1to4_strip_decodes_pixel_exact_10bit() {
         intra_rect4_in_inter_gate(10);
     }
@@ -4775,10 +4757,31 @@ mod tests {
             // zoom (`end_scale`/`end_pts`) so consecutive frames share almost
             // no content and aomenc's RD codes blocks INTRA inside INTER
             // frames, with `--kf-min-dist=1000` forbidding a new key frame.
-            let source = format!(
-                "mandelbrot=size={width}x{height}:start_scale={}:end_scale=0.004:end_pts=8:rate=25",
-                5.0 - f64::from(attempt) * 0.06
-            );
+            // MEASURED (r3, $HOME/.cache/intra14-r3-*.log; the per-attempt
+            // "intra14 probe" line below prints the raw counters): the two
+            // ingredients this gate needs come from DIFFERENT sources.
+            //   * the mandelbrot zoom this gate used through r2 makes aomenc
+            //     code intra blocks inside inter frames (589 2:1 intra strips
+            //     over 40 streams) but yields ZERO 1:4 partitions of any kind
+            //     (`sb_rect4_*`/`rect4_32_*` all 0, at min-partition-size 32
+            //     AND 16, cpu 0..4, with every intra tool enabled);
+            //   * `gradients` (the source the repo's PROVEN 1:4 gates use)
+            //     yields 1:4 partitions (sb_rect4 h=4 v=16) but aomenc codes
+            //     every one of them INTER;
+            //   * blending the two loses the 1:4 partitions again (0/0) while
+            //     keeping the intra strips (683).
+            // `gradients` is kept here as the closest recipe: it is the only
+            // one of the three that reaches a 1:4 partition at all.
+            // Odd attempts render it transposed so HORZ_4 and VERT_4 are both
+            // sampled (class scan-weights-cross-axis).
+            let source = if attempt % 2 == 0 {
+                gradients_source(seed, width, height, "duration=0.32:rate=25")
+            } else {
+                format!(
+                    "{},transpose=1",
+                    gradients_source(seed, height, width, "duration=0.32:rate=25")
+                )
+            };
             let y4m = Command::new("ffmpeg")
                 .args([
                     "-v", "error", "-f", "lavfi", "-i", &source, "-vf", "hue=s=0", "-pix_fmt",
@@ -4803,7 +4806,7 @@ mod tests {
             // MEASURED (r1, 40 attempts): `--cpu-used=0` makes aomenc pick
             // 128x128 superblocks on this frame size, which decode_stream
             // refuses by name, so the preset sweep starts at 1.
-            let cpu = format!("--cpu-used={}", 1 + attempt % 4);
+            let cpu = format!("--cpu-used={}", attempt % 2);
             // The higher the quantiser the more 1:4 intra strips inside inter
             // frames, so the sweep walks cq 63 first.
             let cq = format!("--cq-level={}", [63u32, 55, 45, 35][(attempt / 4) as usize % 4]);
@@ -4816,6 +4819,7 @@ mod tests {
                     // [[aomenc-last-flag-wins]]). These are what the gate is
                     // about: 1:4 partitions ON, min size 16 so the 16x16-level
                     // 1:4 (refused elsewhere) is out of reach.
+                    "--sb-size=64",
                     "--enable-rect-partitions=1",
                     "--enable-1to4-partitions=1",
                     // MEASURED (r1): at `--min-partition-size=16` aomenc codes
@@ -4824,7 +4828,7 @@ mod tests {
                     // surface) in 12/40 attempts. 32 keeps this gate's two
                     // reachable levels -- the 32-level 32x8/8x32 and the
                     // superblock-level 64x16/16x64 -- and nothing else.
-                    "--min-partition-size=32",
+                    "--min-partition-size=16",
                     "--max-partition-size=64",
                     // MEASURED (r1): with tx-size search ON, 8/40 attempts stop
                     // at the 2:1 strip's own split-tx refusal (merge-cross-product,
@@ -4852,10 +4856,10 @@ mod tests {
                     "--enable-interintra-wedge=0",
                     "--enable-smooth-interintra=0",
                     "--enable-ab-partitions=0",
-                    "--enable-smooth-intra=0",
-                    "--enable-paeth-intra=0",
-                    "--enable-directional-intra=0",
-                    "--enable-angle-delta=0",
+                    "--enable-smooth-intra=1",
+                    "--enable-paeth-intra=1",
+                    "--enable-directional-intra=1",
+                    "--enable-angle-delta=1",
                     "--enable-cdef=0",
                     "--enable-restoration=0",
                     // Ledger dead-end (lane-r14): a NEW gate spelling
@@ -4867,7 +4871,7 @@ mod tests {
                     // would buy no coverage.
                     "--enable-palette=0",
                     "--enable-intrabc=0",
-                    "--enable-cfl-intra=0",
+                    "--enable-cfl-intra=1",
                     "--enable-ref-frame-mvs=0",
                     "--obu",
                     "-o",
@@ -4919,6 +4923,16 @@ mod tests {
                 "intra14 gate {bit_depth}-bit seed={seed} {cpu} {cq}: intra 1:4 strips in inter \
                  frames 64x16={} 16x64={} 32x8={} 8x32={}",
                 delta[0], delta[1], delta[2], delta[3]
+            );
+            eprintln!(
+                "intra14 probe seed={seed}: sb_rect4 h={} v={} | rect4_32 h={} v={} hi={} vi={} | intra_rect h={:?}",
+                crate::decode::sb_rect4_horz_hits(),
+                crate::decode::sb_rect4_vert_hits(),
+                crate::decode::rect4_32_horz_hits(),
+                crate::decode::rect4_32_vert_hits(),
+                crate::decode::rect4_32_horz_inter_hits(),
+                crate::decode::rect4_32_vert_inter_hits(),
+                (0..3).map(crate::decode::intra_rect_strip_in_inter_hits).collect::<Vec<_>>(),
             );
             for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
                 for (plane, (g, w)) in [
