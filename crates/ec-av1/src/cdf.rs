@@ -1634,7 +1634,7 @@ pub const SKIP_MODE: [[u16; 3]; 3] = [[32621, 32768, 0], [20708, 32768, 0], [812
 /// `motion_mode_allowed` (spec 5.11.24's `read_motion_mode`) offers
 /// `OBMC_CAUSAL` rather than `WARPED_CAUSAL` -- lane-motionmode round 1
 /// never reaches the three-way `motion_mode_cdf`, see `decode.rs`.
-pub const OBMC: [[u16; 3]; 6] = [
+pub const OBMC: [[u16; 3]; 14] = [
     [10437, 32768, 0],
     [17432, 32768, 0],
     [25817, 32768, 0],
@@ -1644,6 +1644,20 @@ pub const OBMC: [[u16; 3]; 6] = [
     // (rect-flake-1: the strip's motion_mode read diverged on this).
     [14423, 32768, 0],
     [15142, 32768, 0],
+    // lane-inter4 r1: the rect rows a superblock-level HORZ/VERT/1:4 and a
+    // 32x32-level 1:4 inter strip read -- BLOCK_32X64 (10), BLOCK_64X32 (11),
+    // BLOCK_8X32 (18), BLOCK_32X8 (19), BLOCK_16X64 (20), BLOCK_64X16 (21) of
+    // libaom's `default_obmc_cdf`.
+    [22823, 32768, 0],
+    [22083, 32768, 0],
+    [23664, 32768, 0],
+    [20901, 32768, 0],
+    [24008, 32768, 0],
+    [26879, 32768, 0],
+    // lane-inter4 r3: the 16x16-level rect inter leaves' own rows --
+    // BLOCK_8X16 (4) and BLOCK_16X8 (5) of libaom's `default_obmc_cdf`.
+    [9371, 32768, 0],
+    [9301, 32768, 0],
 ];
 
 /// `default_motion_mode_cdf` (spec 9.4, `entropymode.c`), the square-bsize
@@ -1653,7 +1667,7 @@ pub const OBMC: [[u16; 3]; 6] = [
 /// `read_motion_mode` reads instead of [`OBMC`] whenever `motion_mode_allowed`
 /// (spec 5.11.24) resolves to `WARPED_CAUSAL`-eligible (`num_proj_ref >= 1`
 /// under `allow_warped_motion`) -- lane-warp round 1.
-pub const MOTION_MODE: [[u16; 4]; 6] = [
+pub const MOTION_MODE: [[u16; 4]; 14] = [
     [7651, 24760, 32768, 0],
     [19419, 26810, 32768, 0],
     [26260, 29116, 32768, 0],
@@ -1661,6 +1675,18 @@ pub const MOTION_MODE: [[u16; 4]; 6] = [
     // lane-rect r2: BLOCK_16X32 / BLOCK_32X16 rows (indices 7/8).
     [5123, 23606, 32768, 0],
     [11606, 24308, 32768, 0],
+    // lane-inter4 r1: BLOCK_32X64 / 64X32 / 8X32 / 32X8 / 16X64 / 64X16 rows
+    // (libaom `default_motion_mode_cdf` indices 10, 11, 18, 19, 20, 21).
+    [20360, 28062, 32768, 0],
+    [21679, 26830, 32768, 0],
+    [28799, 31390, 32768, 0],
+    [26431, 30774, 32768, 0],
+    [28973, 31594, 32768, 0],
+    [29742, 31203, 32768, 0],
+    // lane-inter4 r3: BLOCK_8X16 / BLOCK_16X8 rows (libaom
+    // `default_motion_mode_cdf` indices 4 and 5).
+    [4738, 24765, 32768, 0],
+    [5391, 25528, 32768, 0],
 ];
 
 /// `default_interintra_cdf` (spec 9.4): `interintra`, indexed by
