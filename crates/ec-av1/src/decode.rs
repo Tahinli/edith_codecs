@@ -19148,21 +19148,24 @@ fn decode_inter_block8(
                 let (ref0, ref1) = if skip_mode {
                     (skip_mode_frame[0] as i8, skip_mode_frame[1] as i8)
                 } else {
+                    // lane-interp3 r2 (class twin-functions-drift): this leaf
+                    // passed a hard-coded `LAST_FRAME` for every inter
+                    // neighbour -- the old "coarse LAST_FRAME-or-intra"
+                    // approximation -- while the side bands have carried the
+                    // neighbour's REAL reference per mi since lane-inter8 r2.
+                    // Every `av1_collect_neighbors_ref_counts` vote below
+                    // (`uni_comp_ref_p1`, `comp_ref`, `comp_bwdref`, ...) was
+                    // therefore taken off the wrong CDF row. Same two args
+                    // [`decode_inter_block`]'s own compound arm passes
+                    // (`-1` when the band is unavailable is start_tile's /
+                    // start_row's own reset value, so no `has_above` guard).
                     read_compound_ref_frames(
                         dec,
                         cdfs,
                         above_nbr,
                         left_nbr,
-                        if has_above && above_inter {
-                            LAST_FRAME
-                        } else {
-                            -1
-                        },
-                        if has_left && left_inter {
-                            LAST_FRAME
-                        } else {
-                            -1
-                        },
+                        above_ref0,
+                        left_ref0,
                     )
                 };
                 leaf_refs = (ref0, Some(ref1));
