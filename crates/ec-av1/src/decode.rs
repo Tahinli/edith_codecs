@@ -4013,6 +4013,15 @@ impl Neighbours {
             self.above_comp_group_idx[i] = 0;
             self.above_compound_idx[i] = 0;
             self.above_filter[i] = [3u8; 2];
+            // lane-tile2 r1: libaom's `av1_zero_above_context`
+            // (av1_common_int.h:1622) memsets `above_contexts.txfm` to
+            // `tx_size_wide[TX_SIZES_LARGEST]` over the tile's own mi column
+            // span at every tile start; ours never reset it, so the first mi
+            // row of a second TILE ROW read the previous tile row's var-tx
+            // partition context (class new-map-ignores-tile-edge). Inert
+            // while `TxMode` is not `Select`, which is why the tile gates'
+            // `--enable-tx-size-search=0` recipe never saw it.
+            self.above_txfm[i] = TXFM_CTX_INIT;
         }
         // lane-sub8 r6: the mi-granular column maps are per tile too -- a
         // stale `(row, mode)` from the tile to the LEFT names an mi row this
@@ -4348,6 +4357,12 @@ impl Neighbours {
         self.left_comp_group_idx.iter_mut().for_each(|r| *r = 0);
         self.left_compound_idx.iter_mut().for_each(|r| *r = 0);
         self.left_filter.iter_mut().for_each(|f| *f = [3u8; 2]);
+        // lane-tile2 r1: `av1_zero_left_context` (av1_common_int.h:1628)
+        // memsets `left_txfm_context_buffer` to `tx_size_high[TX_SIZES_LARGEST]`
+        // at every superblock row inside a tile; without it a SECOND TILE
+        // COLUMN, which revisits the same mi rows, read the tile to its left's
+        // var-tx partition context.
+        self.left_txfm.iter_mut().for_each(|t| *t = TXFM_CTX_INIT);
         // lane-sub8 r6: mi-granular row maps reset with the rest of the left
         // context (a tile/SB-row boundary has no left neighbour).
         self.sub8_mode_row.iter_mut().for_each(|s| *s = (usize::MAX, 0));
