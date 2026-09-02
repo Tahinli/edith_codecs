@@ -4600,30 +4600,56 @@ mod tests {
     /// [[gate-skips-on-its-own-failure]]); exhausting every attempt without a
     /// counted strip is a FAILURE, never a SKIP.
     #[test]
-    // MEASURED (r1, 40 gate attempts + 150 recipe-sweep attempts, see
-    // lanes/intra14-r1.report.md): on THIS tree every aomenc stream that
-    // carries an intra 1:4 strip inside an inter frame ALSO carries a
-    // non-skip INTER 2:1 rect strip / SB-level AB partition / sub-8 inter
-    // partition, each refused by name by another lane's surface before the
-    // frame completes -- so no attempt can be pixel-compared yet and this
-    // gate cannot pass. It is `#[ignore]`d rather than weakened; un-ignore
-    // it (and re-run) once the inter rect-leaf lane lands.
-    #[ignore = "blocked: every stream with an intra 1:4 strip also hits the inter rect-strip refusal"]
+    // r1 `#[ignore]`d this gate on "every stream with an intra 1:4 strip also
+    // hits the inter rect-strip refusal". r2 merged main 18bf7dc (lane-r14
+    // a2e2e29 lifts exactly that refusal) and re-ran it: 3 of 40 attempts now
+    // decode whole and reach the pixel compare (0 before), one of them firing
+    // 64x16=4 16x64=3. But the compare fails on a defect this lane does not
+    // own -- MEASURED (r2, $HOME/.cache/intra14-r2-*.log):
+    //   * seeds 46 and 54 fire ZERO 1:4 strips (`intra_rect4_strip_in_inter_hits`
+    //     delta 0/0/0/0) and mismatch ffmpeg the same way as the firing seed 52:
+    //     decode-order frame 3/4 luma ~3.7-4.5k samples, max |d| 6..17, then
+    //     frames 5-7 drift to ~24k samples, max |d| ~220 as the references
+    //     carry the error forward.
+    //   * with `--enable-1to4-partitions=0` aomenc emits a BYTE-IDENTICAL
+    //     stream at this recipe (same hits, same per-frame diff counts), so
+    //     the 1:4 shape is not the discriminator either.
+    // i.e. this mandelbrot 192x128 source has a pre-existing INTER-frame
+    // pixel defect on this tree (r1 already recorded it as "open, NOT mine"
+    // with rect partitions off; it is now this gate's blocker). testsrc2 at
+    // 192x128 decodes pixel-exact on the same recipe but fires no 1:4 strip
+    // in 4 of 12 attempts that decode whole. So the gate stays `#[ignore]`d
+    // rather than weakened: a source whose baseline is exact AND that fires
+    // an intra 1:4 strip has not been found yet.
+    #[ignore = "blocked: the mandelbrot gate source has a pre-existing inter-frame pixel defect on this tree (zero-hit streams mismatch identically) -- see the MEASURED note above"]
     fn a_real_aomenc_inter_sequence_with_an_intra_1to4_strip_decodes_pixel_exact() {
         intra_rect4_in_inter_gate(8);
     }
 
     /// The 10-bit arm (both of the user's films are `yuv420p10le`).
     #[test]
-    // MEASURED (r1, 40 gate attempts + 150 recipe-sweep attempts, see
-    // lanes/intra14-r1.report.md): on THIS tree every aomenc stream that
-    // carries an intra 1:4 strip inside an inter frame ALSO carries a
-    // non-skip INTER 2:1 rect strip / SB-level AB partition / sub-8 inter
-    // partition, each refused by name by another lane's surface before the
-    // frame completes -- so no attempt can be pixel-compared yet and this
-    // gate cannot pass. It is `#[ignore]`d rather than weakened; un-ignore
-    // it (and re-run) once the inter rect-leaf lane lands.
-    #[ignore = "blocked: every stream with an intra 1:4 strip also hits the inter rect-strip refusal"]
+    // r1 `#[ignore]`d this gate on "every stream with an intra 1:4 strip also
+    // hits the inter rect-strip refusal". r2 merged main 18bf7dc (lane-r14
+    // a2e2e29 lifts exactly that refusal) and re-ran it: 3 of 40 attempts now
+    // decode whole and reach the pixel compare (0 before), one of them firing
+    // 64x16=4 16x64=3. But the compare fails on a defect this lane does not
+    // own -- MEASURED (r2, $HOME/.cache/intra14-r2-*.log):
+    //   * seeds 46 and 54 fire ZERO 1:4 strips (`intra_rect4_strip_in_inter_hits`
+    //     delta 0/0/0/0) and mismatch ffmpeg the same way as the firing seed 52:
+    //     decode-order frame 3/4 luma ~3.7-4.5k samples, max |d| 6..17, then
+    //     frames 5-7 drift to ~24k samples, max |d| ~220 as the references
+    //     carry the error forward.
+    //   * with `--enable-1to4-partitions=0` aomenc emits a BYTE-IDENTICAL
+    //     stream at this recipe (same hits, same per-frame diff counts), so
+    //     the 1:4 shape is not the discriminator either.
+    // i.e. this mandelbrot 192x128 source has a pre-existing INTER-frame
+    // pixel defect on this tree (r1 already recorded it as "open, NOT mine"
+    // with rect partitions off; it is now this gate's blocker). testsrc2 at
+    // 192x128 decodes pixel-exact on the same recipe but fires no 1:4 strip
+    // in 4 of 12 attempts that decode whole. So the gate stays `#[ignore]`d
+    // rather than weakened: a source whose baseline is exact AND that fires
+    // an intra 1:4 strip has not been found yet.
+    #[ignore = "blocked: the mandelbrot gate source has a pre-existing inter-frame pixel defect on this tree (zero-hit streams mismatch identically) -- see the MEASURED note above"]
     fn a_real_aomenc_inter_sequence_with_an_intra_1to4_strip_decodes_pixel_exact_10bit() {
         intra_rect4_in_inter_gate(10);
     }
