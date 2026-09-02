@@ -64,6 +64,46 @@ const BLOCK_MI: u32 = 8;
 // grid is indexed by (libaom `read_cdef` reads one `cdef_idx` per 64x64
 // inside a 128 superblock).
 thread_local! {
+    /// lane-frame80: `EC_TRACE_COEFF_FRAME=<decode idx>` narrows the
+    /// `EC_TRACE_COEFF` rungs to a single frame in DECODE order (a 4K stream
+    /// prints gigabytes otherwise). Unset = every frame, as before.
+    static COEFF_TRACE_FRAME: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static COEFF_TRACE_CUR: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+}
+
+/// Called by [`crate::stream::decode_stream`] before each frame's tiles with
+/// that frame's DECODE-order index.
+pub fn set_coeff_trace_frame(idx: usize) {
+    COEFF_TRACE_FRAME.with(|c| {
+        if c.get().is_none() {
+            let want = match std::env::var("EC_TRACE_COEFF_FRAME") {
+                Ok(v) => v.parse::<usize>().unwrap_or(usize::MAX),
+                // unset: keep tracing every frame, as before this rung existed
+                Err(_) => usize::MAX - 1,
+            };
+            c.set(Some(want));
+        }
+    });
+    COEFF_TRACE_CUR.with(|c| c.set(idx));
+    if std::env::var_os("EC_TRACE_COEFF").is_some() {
+        eprintln!("EC_COEFF_FRAME decode_idx={idx}");
+    }
+}
+
+pub(crate) fn coeff_trace_on() -> bool {
+    if std::env::var_os("EC_TRACE_COEFF").is_none() {
+        return false;
+    }
+    match COEFF_TRACE_FRAME.with(|c| c.get()) {
+        // no `set_coeff_trace_frame` caller (direct tile-decode tests), or the
+        // env var unset: trace every frame.
+        None => true,
+        Some(w) if w >= usize::MAX - 1 => true,
+        Some(w) => COEFF_TRACE_CUR.with(|c| c.get()) == w,
+    }
+}
+
+thread_local! {
     static SB128: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -4122,13 +4162,13 @@ fn read_coeffs(
         let (range, value) = dec.debug_state();
         eprintln!("EC_AV1_STATE_BEFORE_TXBSKIP range={range} value={value}");
     }
-    let dbg_txbskip = if std::env::var_os("EC_TRACE_COEFF").is_some() {
+    let dbg_txbskip = if coeff_trace_on() {
         coding.txb_skip[skip_ctx]
     } else {
         [0; 3]
     };
     let all_zero = dec.symbol(&mut coding.txb_skip[skip_ctx]) == 1;
-    if std::env::var_os("EC_TRACE_COEFF").is_some() {
+    if coeff_trace_on() {
         let (rng, _) = dec.debug_state();
         eprintln!(
             "EC_COEFF_STEP tag=all_zero side={} ctx={skip_ctx} cdf={dbg_txbskip:?} all_zero={} rng={rng}",
@@ -4167,7 +4207,7 @@ fn read_coeffs(
             eprintln!("EC_AV1_TXTYPE32_CDF {tx_type_cdf:?}");
         }
         let t = dec.symbol(tx_type_cdf);
-        if std::env::var_os("EC_TRACE_COEFF").is_some() {
+        if coeff_trace_on() {
             let (rng, _) = dec.debug_state();
             eprintln!("EC_COEFF_STEP tag=tx_type len={len} rng={rng}");
         }
@@ -4196,7 +4236,7 @@ fn read_coeffs(
     if trace {
         eprintln!("TRACE eob value={eob}");
     }
-    let ec_trace_coeff = std::env::var_os("EC_TRACE_COEFF").is_some();
+    let ec_trace_coeff = coeff_trace_on();
     if ec_trace_coeff {
         let (rng, _) = dec.debug_state();
         let cls = match class { TxClass::TwoD => "2d", TxClass::Horiz => "horiz", TxClass::Vert => "vert" };
@@ -4338,7 +4378,7 @@ fn read_coeffs_rect(
     sign_ctx: usize,
     default_tx_type: TxType,
 ) -> Result<(Vec<i32>, TxType)> {
-    let rect_trace = std::env::var_os("EC_TRACE_COEFF").is_some();
+    let rect_trace = coeff_trace_on();
     let mut grid = vec![0i32; w * h];
     let entry_rng = dec.debug_state().0;
     let all_zero = dec.symbol(&mut coding.txb_skip[skip_ctx]) == 1;
@@ -10067,7 +10107,7 @@ fn decode_block_rect64(
         // 32x16/16x32 under a 64x16/16x64 1:4 strip (lane-tx64x16).
         let (luma_cw, luma_ch) = (bw.min(32), bh.min(32));
         let scan32 = default_scan(TX32);
-        if std::env::var_os("EC_TRACE_COEFF").is_some() {
+        if coeff_trace_on() {
             let (rng, _) = dec.debug_state();
             eprintln!("EC_COEFF plane=0 row={mi_r} col={mi_c} tx_size={luma_cw}x{luma_ch} rng={rng}");
         }
@@ -10109,7 +10149,7 @@ fn decode_block_rect64(
                 TxType::DctDct,
             )?
         };
-        if std::env::var_os("EC_TRACE_COEFF").is_some() {
+        if coeff_trace_on() {
             let (rng, _) = dec.debug_state();
             eprintln!("EC_COEFF_VAL plane=0 row={mi_r} col={mi_c} rng={rng}");
         }
@@ -10183,7 +10223,7 @@ fn decode_block_rect64(
         };
         let u_skip_ctx = usize::from(around[1].0) + usize::from(around[1].1);
         let mut u_coding = cdfs.txb(chroma_set, uv_predict_mode);
-        if std::env::var_os("EC_TRACE_COEFF").is_some() {
+        if coeff_trace_on() {
             let (rng, _) = dec.debug_state();
             eprintln!("EC_COEFF plane=1 row={mi_r} col={mi_c} tx_size=rect32x16 rng={rng}");
         }
@@ -10197,7 +10237,7 @@ fn decode_block_rect64(
             dc_sign_ctx(around[1].2),
             TxType::DctDct,
         )?;
-        if std::env::var_os("EC_TRACE_COEFF").is_some() {
+        if coeff_trace_on() {
             let (rng, _) = dec.debug_state();
             eprintln!("EC_COEFF_VAL plane=1 row={mi_r} col={mi_c} rng={rng}");
         }
@@ -10237,7 +10277,7 @@ fn decode_block_rect64(
         );
         let v_skip_ctx = usize::from(around[2].0) + usize::from(around[2].1);
         let mut v_coding = cdfs.txb(chroma_set, uv_predict_mode);
-        if std::env::var_os("EC_TRACE_COEFF").is_some() {
+        if coeff_trace_on() {
             let (rng, _) = dec.debug_state();
             eprintln!("EC_COEFF plane=2 row={mi_r} col={mi_c} tx_size=rect32x16 rng={rng}");
         }
@@ -10251,7 +10291,7 @@ fn decode_block_rect64(
             dc_sign_ctx(around[2].2),
             TxType::DctDct,
         )?;
-        if std::env::var_os("EC_TRACE_COEFF").is_some() {
+        if coeff_trace_on() {
             let (rng, _) = dec.debug_state();
             eprintln!("EC_COEFF_VAL plane=2 row={mi_r} col={mi_c} rng={rng}");
         }
@@ -16131,6 +16171,11 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     // function is ever called.
     delta: DeltaParams,
 ) -> Result<(Picture, Cdfs)> {
+    // lane-frame80: [`TX_SELECT_INTER`] is set by the INTER tile decoder
+    // only, so a key frame decoded after an inter frame on this thread would
+    // otherwise inherit it and read its `tx_depth` context off the inter
+    // frame's stale `TXFM_CONTEXT` bands.
+    TX_SELECT_INTER.with(|c| c.set(false));
     if mi_cols == 0 || mi_rows == 0 {
         return Err(unsupported("a frame with no mode-info grid"));
     }
