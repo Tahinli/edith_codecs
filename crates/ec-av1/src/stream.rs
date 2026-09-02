@@ -74,6 +74,12 @@ pub fn rect64_inter_tu_hits() -> usize {
     crate::decode::rect64_inter_tu_hits()
 }
 
+/// lane-intra64split r1: coded 64-level INTRA HORZ/VERT strips whose un-split
+/// luma transform is TX_64X32/TX_32X64 (the truncated 32x32 corner).
+pub fn rect64_corner_tu_hits() -> usize {
+    crate::decode::rect64_corner_tu_hits()
+}
+
 pub fn rect4_32_counters() -> (usize, usize, usize) {
     (
         crate::decode::rect4_32_horz_hits(),
@@ -4270,6 +4276,231 @@ mod tests {
     #[test]
     fn a_real_aomenc_inter_sequence_with_an_intra_rect_strip_decodes_pixel_exact_10bit() {
         intra_rect_in_inter_gate(10);
+    }
+
+    /// lane-intra64split r1: the 64-LEVEL arm of the gate above. A 64x32 /
+    /// 32x64 intra strip in an inter frame codes its luma as ONE un-split
+    /// TX_64X32/TX_32X64 -- a transform whose 64-length axis carries no
+    /// coefficients above 32 (`av1_get_adjusted_tx_size`, `blockd.h:1361`),
+    /// so only a 32x32 corner is read (libaom `av1_get_max_eob`). That shape
+    /// was refused by name ("a split intra strip whose transform unit is
+    /// 32x64") and is where BOTH of the user's films stopped (census4:
+    /// Hunger Games segments at start_s 300 and 3000).
+    ///
+    /// Hard-asserts `rect64_corner_tu_hits` over the attempts that were
+    /// actually pixel-compared: a green run cannot come from a stream that
+    /// never coded the shape, and a decode error or a pixel mismatch is a
+    /// FAILURE, never a SKIP.
+    #[test]
+    fn a_real_aomenc_inter_sequence_with_a_64_level_intra_rect_strip_decodes_pixel_exact() {
+        intra_rect64_in_inter_gate(8);
+    }
+
+    /// The 10-bit arm (both of the user's films are `yuv420p10le`).
+    #[test]
+    fn a_real_aomenc_inter_sequence_with_a_64_level_intra_rect_strip_decodes_pixel_exact_10bit() {
+        intra_rect64_in_inter_gate(10);
+    }
+
+    fn intra_rect64_in_inter_gate(bit_depth: u32) {
+        const NAME: &str =
+            "a_real_aomenc_inter_sequence_with_a_64_level_intra_rect_strip_decodes_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        // 256x192 is four by three WHOLE 64x64 superblocks: a 64-level
+        // HORZ/VERT partition is only offered where the superblock is not
+        // cropped by the frame edge (the 96x96 sibling gate above could never
+        // reach the shape for exactly that reason).
+        let (width, height, frame_count) = (256usize, 192usize, 8usize);
+        let mut refusals: Vec<String> = Vec::new();
+        let mut uncounted_exact = 0u32;
+        let mut compared = 0u32;
+        let mut hits = 0usize;
+        for attempt in 0..40u32 {
+            let seed = 42 + attempt;
+            // Same shape of source as the sibling gate: a fast mandelbrot
+            // zoom (consecutive frames share almost no content, so aomenc's
+            // RD codes blocks INTRA inside INTER frames) with `--kf-min-dist`
+            // forbidding a new key frame.
+            let source = format!(
+                "mandelbrot=size={width}x{height}:start_scale={}:end_scale=0.004:end_pts=8:rate=25",
+                5.0 - f64::from(attempt) * 0.06
+            );
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v", "error", "-f", "lavfi", "-i", &source, "-vf", "hue=s=0", "-pix_fmt",
+                    if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" },
+                    "-strict", "-1", "-t", "0.32", "-f", "yuv4mpegpipe", "-strict", "-1", "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let depth_args: &[&str] = if bit_depth == 10 {
+                &["-b", "10", "--input-bit-depth=10"]
+            } else {
+                &[]
+            };
+            let cpu = format!("--cpu-used={}", attempt % 5);
+            let cq = format!("--cq-level={}", [30u32, 20, 12, 45][(attempt / 5) as usize % 4]);
+            let mut child = Command::new(aomenc_path())
+                .args(depth_args)
+                .arg(&cpu)
+                .arg(&cq)
+                .args([
+                    // Every flag spelled ONCE (class [[aomenc-last-flag-wins]]).
+                    "--enable-rect-partitions=1",
+                    // 32 keeps the partition search at the 64/32 levels only:
+                    // the sub-16 shapes belong to other lanes' refusals.
+                    "--min-partition-size=32",
+                    "--max-partition-size=64",
+                    // The split (nonzero tx_depth) intra strip on the inter
+                    // path is refused by name (lane-intrasplit owns it), so
+                    // this gate's shape is the UNSPLIT 64-level transform.
+                    "--enable-tx-size-search=0",
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    "--lag-in-frames=0",
+                    "--auto-alt-ref=0",
+                    "--kf-min-dist=1000",
+                    "--kf-max-dist=1000",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--tile-columns=0",
+                    "--enable-order-hint=0",
+                    "--enable-warped-motion=0",
+                    "--enable-obmc=0",
+                    "--enable-masked-comp=0",
+                    "--enable-interintra-comp=0",
+                    "--enable-dist-wtd-comp=0",
+                    "--enable-diff-wtd-comp=0",
+                    "--enable-onesided-comp=0",
+                    "--enable-interintra-wedge=0",
+                    "--enable-smooth-interintra=0",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    "--enable-filter-intra=0",
+                    "--enable-smooth-intra=0",
+                    "--enable-paeth-intra=0",
+                    "--enable-directional-intra=0",
+                    "--enable-angle-delta=0",
+                    "--enable-cdef=0",
+                    "--enable-restoration=0",
+                    "--enable-palette=0",
+                    "--enable-intrabc=0",
+                    "--enable-cfl-intra=0",
+                    "--enable-ref-frame-mvs=0",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let before = crate::stream::rect64_corner_tu_hits();
+            let frames = match decode_stream(&stream) {
+                Ok(frames) => frames,
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "64-level intra-rect decode failed outright (seed {seed}): {msg}"
+                    );
+                    refusals.push(format!("seed {seed} {cpu} {cq}: {msg}"));
+                    continue;
+                }
+            };
+            let delta = crate::stream::rect64_corner_tu_hits() - before;
+            let ffmpeg_frames = if bit_depth == 10 {
+                ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count)
+            } else {
+                ffmpeg_decode_sequence(&stream, width, height, frame_count)
+            };
+            assert_eq!(frames.len(), frame_count);
+            eprintln!(
+                "intra64split gate {bit_depth}-bit seed={seed} {cpu} {cq}: 64-level unsplit intra \
+                 strip TUs={delta}"
+            );
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                for (plane, (g, w)) in [
+                    ("Y", (&got.y, &want.y)),
+                    ("U", (&got.u, &want.u)),
+                    ("V", (&got.v, &want.v)),
+                ] {
+                    let stride = if plane == "Y" { width } else { width / 2 };
+                    if let Some(at) = g.iter().zip(w.iter()).position(|(a, b)| a != b) {
+                        eprintln!(
+                            "intra64split gate {bit_depth}-bit seed={seed}: frame {i} {plane} first \
+                             diff at ({}, {}) got {} want {} ({} samples differ)",
+                            at % stride,
+                            at / stride,
+                            g[at],
+                            w[at],
+                            g.iter().zip(w.iter()).filter(|(a, b)| a != b).count(),
+                        );
+                    }
+                    assert_eq!(g, w, "{plane} vs ffmpeg (seed {seed}, frame {i})");
+                }
+            }
+            compared += 1;
+            if delta == 0 {
+                uncounted_exact += 1;
+                refusals.push(format!(
+                    "seed {seed} {cpu} {cq}: decoded and pixel-compared, but no 64-level unsplit \
+                     intra strip"
+                ));
+            }
+            hits += delta;
+            if hits > 0 {
+                break;
+            }
+        }
+        gate_buckets(
+            NAME,
+            compared - uncounted_exact,
+            uncounted_exact,
+            refusals.len() - uncounted_exact as usize,
+        );
+        eprintln!(
+            "{NAME} ({bit_depth}-bit): compared {compared} streams, 64-level unsplit intra strip \
+             TUs={hits}; refusals:\n{}",
+            refusals.join("\n")
+        );
+        assert!(
+            hits > 0,
+            "{NAME} ({bit_depth}-bit): no 64-level unsplit intra rect strip fired over {compared} \
+             compared streams:\n{}",
+            refusals.join("\n")
+        );
     }
 
     fn intra_rect_in_inter_gate(bit_depth: u32) {
