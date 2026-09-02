@@ -6736,6 +6736,19 @@ fn tx_size_context_rect(
     // this way, lane-sb128b r1). Without the cap the 64x128 half of a 128-root
     // VERT reads the tx-depth symbol off row 0 where libaom uses row 1.
     let (own_w, own_h) = (own_w.min(64), own_h.min(64));
+    // lane-midcut r2: on an INTER frame `get_tx_size_context` reads the real
+    // `TXFM_CONTEXT` bands and lets an INTER neighbour contribute its BLOCK
+    // size ([`tx_size_context_txfm_rect`]); the deblock-grid approximation
+    // below is the KEY FRAME's, and it is right only where those bands were
+    // never written. The 1:4 intra strip already branched this way at its own
+    // call site -- every other rect intra reader reached from an inter frame
+    // (2:1 strips, the 32-level and 64-level 1:4 bodies) read `tx_size_cat*`
+    // off the wrong row whenever the neighbour above was an inter block whose
+    // var-tx tree had split (measured: a 32x8 intra strip at mi(118,280) of
+    // the 10-bit 3840x1608 stream read ctx 1 where aomdec reads ctx 2).
+    if INTRA_IN_INTER_MODE.with(std::cell::Cell::get).is_some() {
+        return tx_size_context_txfm_rect(n, (mi_r, mi_c), own_w, own_h);
+    }
     let above = mi_r > n.tile_row0_mi && tx_px_at(n, false, mi_r - 1, mi_c) as usize >= own_w;
     let left = mi_c > n.tile_col0_mi && tx_h_px_at(n, false, mi_r, mi_c - 1) as usize >= own_h;
     if std::env::var_os("EC_TRACE_MODE_STEP").is_some() {
