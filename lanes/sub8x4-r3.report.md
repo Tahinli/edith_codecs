@@ -86,7 +86,14 @@ EVIDENCE: ~/.cache/sub8x4-tmp/{o,r}.raw on the intra14 fixture | release decode_
 ## STEP 4 -- full suite
 
 Unit `sub8x4-suite-r3-1788364529.service`, log `$HOME/.cache/sub8x4-suite-r3.log`
-(private path per COMMON). Result line quoted in the reply.
+(private path per COMMON):
+
+`test result: FAILED. 422 passed; 2 failed; 37 ignored; 0 measured; 0 filtered out; finished in 676.59s`
+
+Against r2's `419 passed; 3 failed; 38 ignored`: +3 passed (the straddling gate the merge
+fixed, plus this round's two film gates net of the un-ignore), -1 failed, -1 ignored (the
+intra14 gate). The 2 remaining failures are the same two zero-COUNTER 1:4 recipe defects
+r2 already carried, with the same messages; no new failure, no gate regressed.
 
 ## Open residue
 
