@@ -6749,9 +6749,9 @@ mod tests {
     /// SKIPped), attempts that carried no rectangular var-tx leaf counted
     /// separately and still required pixel-exact.
     #[test]
-    fn a_real_aomenc_inter_1to4_recipe_decodes_pixel_exact_or_refuses_by_name() {
+    fn real_aomenc_1to4_streams_decode_pixel_exact_and_rect_vartx_leaves_fire_before_a_named_refusal() {
         const NAME: &str =
-            "a_real_aomenc_inter_1to4_recipe_decodes_pixel_exact_or_refuses_by_name";
+            "real_aomenc_1to4_streams_decode_pixel_exact_and_rect_vartx_leaves_fire_before_a_named_refusal";
         let _gate_lock = lock_gate_counters();
         if !have_ffmpeg() {
             eprintln!("SKIP {NAME}: no ffmpeg");
@@ -6761,16 +6761,35 @@ mod tests {
             eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
             return;
         }
-        let (width, height, frame_count) = (192usize, 128usize, 6usize);
+        let frame_count = 6usize;
         for bit_depth in [8u32, 10u32] {
             let (mut named_refusals, mut compared, mut out_of_scope, mut oos_mismatch) =
                 (0u32, 0u32, 0u32, 0u32);
             let (mut leaf_32x16, mut leaf_16x32) = (0usize, 0usize);
-            for attempt in 0..16u32 {
+            // Leaves decoded on ANY attempt, including one whose stream hits a
+            // later named refusal: the firing half of this gate, kept apart
+            // from `leaf_32x16`/`leaf_16x32` (pixel-compared attempts only) so
+            // a refused stream is never counted as a pixel proof
+            // (class counter-from-refused-stream).
+            let (mut fired_32x16, mut fired_16x32) = (0usize, 0usize);
+            for attempt in 0..18u32 {
                 // Two orientations (the transposed pair a one-sided gate could
                 // never separate) x four quantisers x two motion steps.
+                // lane-r14 r4 recipe hunt (~70 aomenc runs on the merged
+                // tree: testsrc2 / life / mandelbrot / banded motion, 64x64 up
+                // to 384x256, cq 20..58): attempts 16-17 carry the only recipe
+                // found that makes aomenc code a 64-axis 1:4 strip whose
+                // transform SPLITS -- 384x256, per-16-column band motion,
+                // cq 32 (16x32 leaves) and cq 38 (32x16 leaves).
+                let firing = attempt >= 16;
+                let (width, height) =
+                    if firing { (384usize, 256usize) } else { (192usize, 128usize) };
                 let vertical = attempt % 2 == 1;
-                let cq = [30, 36, 44, 52][(attempt / 2 % 4) as usize];
+                let cq = if firing {
+                    [32, 38][(attempt - 16) as usize]
+                } else {
+                    [30, 36, 44, 52][(attempt / 2 % 4) as usize]
+                };
                 let sp = 3 + (attempt / 8) * 3;
                 // 16-pixel bands, each band translating at its OWN speed
                 // across the other axis: that is what makes aomenc's RD split
@@ -6778,7 +6797,10 @@ mod tests {
                 // / `VERT_4`) with distinct motion vectors, and the texture
                 // inside a band is what keeps the strip non-skip and its
                 // transform split.
-                let geq = if vertical {
+                let geq = if firing {
+                    "128+60*sin((Y-N*(1+0.37*mod(floor(X/16),4)))/3)+45*sin(Y/17+X/23)"
+                        .to_string()
+                } else if vertical {
                     format!(
                         "128+60*sin((Y+N*({sp}+9*mod(floor(X/16),2)))/7)+25*sin(X/11)"
                     )
@@ -6822,7 +6844,7 @@ mod tests {
                     "--enable-tx64=1", "--enable-rect-partitions=1",
                     "--enable-ab-partitions=0", "--enable-1to4-partitions=1",
                     "--enable-dual-filter=0", "--enable-obmc=0",
-                    "--min-partition-size=32", "--max-partition-size=64",
+                    "--min-partition-size=16", "--max-partition-size=64",
                     "--obu", "-o", "-", "-",
                 ];
                 let mut child = Command::new(aomenc_path())
@@ -6854,14 +6876,24 @@ mod tests {
                             "{NAME} failed outright, not a named refusal ({bit_depth}-bit, \
                              attempt {attempt}): {msg}"
                         );
+                        let after = crate::stream::vartx_rect_leaf_hits();
+                        fired_32x16 += after[0] - before[0];
+                        fired_16x32 += after[1] - before[1];
                         named_refusals += 1;
-                        eprintln!("{bit_depth}-bit attempt {attempt} refusal: {msg}");
+                        eprintln!(
+                            "{bit_depth}-bit attempt {attempt} refusal (rect var-tx leaves \
+                             decoded before it: 32x16={}, 16x32={}): {msg}",
+                            after[0] - before[0],
+                            after[1] - before[1]
+                        );
                         continue;
                     }
                     Ok(frames) => frames,
                 };
                 let after = crate::stream::vartx_rect_leaf_hits();
                 let (h32, v32) = (after[0] - before[0], after[1] - before[1]);
+                fired_32x16 += h32;
+                fired_16x32 += v32;
                 let ffmpeg_frames = if bit_depth == 10 {
                     ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count)
                 } else {
@@ -6896,8 +6928,9 @@ mod tests {
             }
             eprintln!(
                 "{NAME} ({bit_depth}-bit): {named_refusals} named refusals, {compared} \
-                 pixel-exact attempts carrying the arm, 32x16 var-tx leaves={leaf_32x16}, \
-                 16x32 var-tx leaves={leaf_16x32}, {out_of_scope} attempts carried none \
+                 pixel-exact attempts carrying the arm, pixel-compared rect var-tx leaves \
+                 32x16={leaf_32x16} 16x32={leaf_16x32}, leaves decoded anywhere in the sweep \
+                 32x16={fired_32x16} 16x32={fired_16x32}, {out_of_scope} attempts carried none \
                  ({oos_mismatch} of them mismatched)"
             );
             assert_eq!(
@@ -6905,29 +6938,30 @@ mod tests {
                 "{NAME}: {oos_mismatch} attempt(s) with no rectangular var-tx leaf decoded \
                  but mismatched ffmpeg -- a defect of another shape, not a pass"
             );
-            // MEASURED, lane-r14 r3 (5 recipe sweeps, 60+ aomenc runs over
-            // lavfi banded-motion / testsrc2 / life / mandelbrot, 192x128 and
-            // 384x256, cq 26..58, both min-partition-size arms): aomenc picks a
-            // superblock-level 1:4 partition ONLY on content rich enough that
-            // the same stream also contains at least one of {an intra HORZ/VERT
-            // strip, a 16x16-level AB/1:4 partition, an SB-level AB partition,
-            // an inter partition below 8x8, a 32x8/8x32 rect residual}, each of
-            // which is ANOTHER lane's live refusal and stops the decode first.
-            // So this gate cannot yet assert the arm FIRED on a pixel-exact
-            // attempt; it asserts what it can (nothing mis-decodes silently),
-            // prints the leaf counters, and the firing proof for this round is
-            // the real film (lanes/r14-r3.report.md: 14 rectangular 16x32
-            // var-tx leaves decoded out of the Hunger Games -ss 4500 segment).
-            // Restore the hard assert below the moment one of those refusals
-            // lifts -- do not weaken it further.
             assert!(
-                compared + u32::from(named_refusals > 0) > 0,
-                "{NAME} ({bit_depth}-bit): no attempt produced anything at all"
+                compared + out_of_scope > 0,
+                "{NAME} ({bit_depth}-bit): every attempt refused -- the gate compared no pixels"
             );
-            eprintln!(
-                "{NAME} ({bit_depth}-bit): arm-firing assert PARKED (see the comment at this \
-                 line): 32x16={leaf_32x16}, 16x32={leaf_16x32}"
-            );
+            // The firing half. MEASURED on the merged tree (lane-r14 r4, ~70
+            // aomenc runs): the 8-bit 384x256 banded recipe codes BOTH
+            // orientations of the split -- cq 38 gives four 32x16 leaves (out
+            // of four 64x16 strips), cq 32 one 16x32 leaf (out of four 16x64
+            // strips). Those two streams stop LATER on another lane's live
+            // refusal ("an inter 16x16-level AB or 1:4 partition", "a non-skip
+            // rectangular (HORZ/VERT/HORZ_B) strip needs rectangular residual
+            // coding"), so the leaves are proved DECODED, not proved
+            // pixel-exact; every attempt that ran to the end is compared
+            // frame by frame above. At 10 bits the same sweep fires nothing
+            // (aomenc picks other shapes), so the firing assert is 8-bit only
+            // -- and it is a hard assert, never a print.
+            if bit_depth == 8 {
+                assert!(
+                    fired_32x16 > 0 && fired_16x32 > 0,
+                    "{NAME}: the rectangular var-tx leaf arm never fired (32x16={fired_32x16}, \
+                     16x32={fired_16x32}, {named_refusals} refusals, {compared} compared) -- \
+                     `sub_tx_size_map[TX_64X16] == TX_32X16` is unproved by this gate"
+                );
+            }
         }
     }
 
