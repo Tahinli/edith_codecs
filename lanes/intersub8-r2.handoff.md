@@ -56,10 +56,9 @@ pixel-exact; `out_of_scope_mismatch == 0`; every decode-order frame compared Y/U
 
 ## Suite
 Unit `intersub8-suite-1788328909.service`, log `$HOME/.cache/intersub8-suite-r2.log`.
-At the turn cap it was still RUNNING: 207 tests ok, **zero FAILED lines**, no `test result:`
-line yet. First thing next round: `grep -E "^test result|FAILED" $HOME/.cache/intersub8-suite-r2.log`.
-Sibling-gate obligation: the interp-filter fix touches EVERY compound 8x8 leaf, so the suite
-result is the sibling sweep — read it before claiming the fix is clean.
+FINISHED GREEN after this handoff was first written:
+`test result: ok. 382 passed; 0 failed; 33 ignored; 0 measured; 0 filtered out; finished in 1018.88s`.
+That run IS the sibling sweep for the interp-filter fix (it touches every compound 8x8 leaf).
 
 ## Exact next step
 1. Read the suite log (above). 2. Build `LumaRect8x4Inter`/`LumaRect4x8Inter` TxbSets and the
