@@ -148,10 +148,9 @@ const ALIASES: &[(&str, &str)] = &[("superres-mode", "enable-superres")];
 /// depth retires the entry, and this test fails until it is deleted.
 #[cfg(test)]
 const NEVER_EXERCISED_8BIT: &[(&str, &str)] = &[
-    (
-        "enable-cfl-intra",
-        "off in 41 gates, on in none: chroma-from-luma prediction is unimplemented",
-    ),
+    // `enable-cfl-intra` LEFT both lists on 2026-09-02 (lane-troykf r1): the
+    // sb128 skipped-CfL / 1:4-chroma gate passes `--enable-cfl-intra=1` at 8
+    // AND 10 bits and pixel-compares both arms.
     (
         "enable-dist-wtd-comp",
         "off in 11 gates, on in none: distance-weighted compound is unimplemented",
@@ -175,10 +174,6 @@ const NEVER_EXERCISED_8BIT: &[(&str, &str)] = &[
     (
         "enable-rect-tx",
         "never spelled; rect transforms reach the decoder only through partition shape, never through a gate that names the tool",
-    ),
-    (
-        "enable-tx64",
-        "never spelled; TX_64X64 appears only where aomenc's default picks it, which is unknown per stream",
     ),
 ];
 
@@ -207,10 +202,6 @@ const NEVER_EXERCISED_10BIT: &[(&str, &str)] = &[    // lane-cwarp's 10-bit comp
     // lane-tx64x16 r4's 32-level 1:4 gate has a 10-bit arm that asserts both
     // orientations and coded strips inside pixel-exact attempts.
     (
-        "enable-cfl-intra",
-        "hole at both depths, see the 8-bit list",
-    ),
-    (
         "enable-dual-filter",
         "hole at both depths, see the 8-bit list",
     ),
@@ -222,7 +213,6 @@ const NEVER_EXERCISED_10BIT: &[(&str, &str)] = &[    // lane-cwarp's 10-bit comp
     // 1D tx class).
     ("enable-intrabc", "hole at both depths, see the 8-bit list"),
     ("enable-rect-tx", "hole at both depths, see the 8-bit list"),
-    ("enable-tx64", "hole at both depths, see the 8-bit list"),
 ];
 
 /// [`DEFAULT_ON_TOOLS`] entries no 8-bit gate spells on, with the reason.
@@ -416,8 +406,12 @@ mod tests {
     /// an 8-bit and a 10-bit stream from one recipe, so its flags cover both
     /// depths -- classifying it by the 10-bit strings inside its conditional
     /// alone hid `--enable-tx-size-search=1` from the 8-bit list.
+    /// lane-troykf r1: the same blind spot with the other spelling -- a gate
+    /// that loops `for depth in [8usize, 10]` builds BOTH streams from one
+    /// recipe, but its `yuv420p10le` arm made `is_ten_bit` classify it as
+    /// 10-bit only, hiding `--enable-cfl-intra=1` from the 8-bit list.
     fn covers_both_depths(body: &str) -> bool {
-        body.contains("if bit_depth == 10")
+        body.contains("if bit_depth == 10") || body.contains("for depth in [8usize, 10]")
     }
 
     /// Whether a gate body drives a stream at this depth.
