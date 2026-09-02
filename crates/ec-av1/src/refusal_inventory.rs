@@ -37,6 +37,7 @@ const REFUSALS: &[&str] = &[
     "a HORZ_A/HORZ_B/VERT_A partition below 16x16 (this decoder codes only the square arms, HORZ, VERT, VERT_B, and a clean split below 16x16)",
     "an inter partition below 8x8 (this decoder codes no inter leaf smaller than 8x8; lane-sub8 scoped to intra)",
     "a 16x16 block whose true edge cuts through both axes needs a rectangular transform this decoder does not code yet",
+    "a 16x16 block at the true frame edge coded as a rect strip rather than SPLIT",
     "a 16x16 inter block whose true edge cuts through both axes needs a rectangular transform this decoder does not code yet",
     "a 32x32 partition type this decoder does not code (value={part32})",
     "a 32x32-level 1:4 strip with a split transform (per-unit 4:1 prediction is not ported, depth={depth})",
