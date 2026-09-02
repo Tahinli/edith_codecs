@@ -2075,6 +2075,20 @@ pub(crate) fn interintra_hits() -> usize {
     INTERINTRA_HITS.with(|c| c.get())
 }
 
+// lane-midcut r1: of those, how many were RECTANGULAR (`write_w != write_h`)
+// -- the shape `interintra_blend` used to build a square `side x side` intra
+// predictor for, with `ii_size_scales`/`edges` taken at the square. Every
+// pre-existing interintra gate passed with that bug, so the rect arm needs
+// its own counter to stop being vacuous.
+thread_local! {
+    static INTERINTRA_RECT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`INTERINTRA_RECT_HITS`].
+pub fn interintra_rect_hits() -> usize {
+    INTERINTRA_RECT_HITS.with(|c| c.get())
+}
+
 // How many blocks decoded `comp_group_idx == 1` (masked COMPOUND_REFERENCE,
 // wedge or diffwtd) and had `compound_type`/`wedge_idx`/`wedge_sign`/
 // `mask_type` consumed entropy-exact -- lane-maskcomp r1's proof that a
@@ -18705,7 +18719,9 @@ fn interintra_blend(
     plane: &PlaneBuf,
     x: usize,
     y: usize,
-    side: usize,
+    bw: usize,
+    bh: usize,
+    stride: usize,
     ii_mode: u8,
     wedge: Option<(&'static [u8], usize)>,
     pred: &mut [u16],
@@ -18717,16 +18733,17 @@ fn interintra_blend(
         2 => crate::intra::H_PRED,
         _ => crate::intra::SMOOTH_PRED,
     };
-    let (above, left, corner) = plane.edges(
+    let (above, left, corner) = plane.edges_rect(
         x,
         y,
-        side,
+        bw,
+        bh,
         crate::encode::Reach {
             above_right: false,
             below_left: false,
         },
     );
-    let mut intra = vec![0u16; side * side];
+    let mut intra = vec![0u16; bw * bh];
     // Edge filtering never applies here: V/H at delta 0 are plain edge
     // copies (angle 90/180 skip the directional walk), DC/SMOOTH carry no
     // angle at all.
@@ -18736,22 +18753,25 @@ fn interintra_blend(
         above.as_deref(),
         left.as_deref(),
         corner,
-        side,
-        side,
+        bw,
+        bh,
         false,
         false,
         &mut intra,
     );
-    let scale = 128 / side;
-    for i in 0..side {
-        for j in 0..side {
+    // `ii_size_scales[bsize]` is keyed on the block's LONGER side
+    // (`MAX_SB_SIZE >> max(bw,bh)` order), not on the square this decoder
+    // builds the predictor buffer at.
+    let scale = 128 / bw.max(bh);
+    for i in 0..bh {
+        for j in 0..bw {
             let m = u32::from(match wedge {
                 // lane-wii r2: wedge-interintra mask (aom_blend_a64_mask
                 // over the wedge codebook, intra as src0, fixed sign 0).
                 // Luma plane: mask rows are luma-resolution, ms == side.
                 // 4:2:0 chroma: 2x2 box average (reconinter.c sub8x8 --
                 // subw == subh == 1).
-                Some((mask, ms)) if ms == side => mask[i * side + j],
+                Some((mask, ms)) if ms == stride => mask[i * stride + j],
                 Some((mask, ms)) => {
                     let t = 2 * i * ms + 2 * j;
                     ((u32::from(mask[t])
@@ -18768,9 +18788,9 @@ fn interintra_blend(
                     _ => II_WEIGHTS_1D[i.min(j) * scale],
                 },
             });
-            let idx = i * side + j;
-            pred[idx] =
-                ((m * u32::from(intra[idx]) + (64 - m) * u32::from(pred[idx]) + 32) >> 6) as u16;
+            let idx = i * stride + j;
+            pred[idx] = ((m * u32::from(intra[i * bw + j]) + (64 - m) * u32::from(pred[idx]) + 32)
+                >> 6) as u16;
         }
     }
 }
@@ -21637,9 +21657,18 @@ fn decode_inter_block(
             // result, all planes (reconinter.c av1_build_interintra_predictor
             // plane loop).
             if let Some(ii) = interintra_mode {
-                interintra_blend(y, px, py, side, ii, wedge_mask, &mut pred_y);
-                interintra_blend(u, cpx, cpy, chroma_side, ii, wedge_mask, &mut pred_u);
-                interintra_blend(v, cpx, cpy, chroma_side, ii, wedge_mask, &mut pred_v);
+                if write_w != write_h {
+                    INTERINTRA_RECT_HITS.with(|c| c.set(c.get() + 1));
+                }
+                interintra_blend(y, px, py, write_w, write_h, side, ii, wedge_mask, &mut pred_y);
+                interintra_blend(
+                    u, cpx, cpy, write_chroma_w, write_chroma_h, chroma_side, ii, wedge_mask,
+                    &mut pred_u,
+                );
+                interintra_blend(
+                    v, cpx, cpy, write_chroma_w, write_chroma_h, chroma_side, ii, wedge_mask,
+                    &mut pred_v,
+                );
             }
 
             // lane-inter16ab r2: libaom `build_inter_predictors_sub8x8`
@@ -25641,9 +25670,13 @@ fn decode_inter_block8(
         // Non-wedge interintra blend, mutually exclusive with OBMC (the
         // motion_mode symbol is not read for an interintra block).
         if let Some(ii) = interintra_mode {
-            interintra_blend(y, px, py, SIDE, ii, wedge_mask, &mut pred_y);
-            interintra_blend(u, cpx, cpy, CHROMA_SIDE, ii, wedge_mask, &mut pred_u);
-            interintra_blend(v, cpx, cpy, CHROMA_SIDE, ii, wedge_mask, &mut pred_v);
+            interintra_blend(y, px, py, SIDE, SIDE, SIDE, ii, wedge_mask, &mut pred_y);
+            interintra_blend(
+                u, cpx, cpy, CHROMA_SIDE, CHROMA_SIDE, CHROMA_SIDE, ii, wedge_mask, &mut pred_u,
+            );
+            interintra_blend(
+                v, cpx, cpy, CHROMA_SIDE, CHROMA_SIDE, CHROMA_SIDE, ii, wedge_mask, &mut pred_v,
+            );
         }
 
         split8 = read_block_tx_size(
