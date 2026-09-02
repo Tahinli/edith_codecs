@@ -65,12 +65,13 @@ const REFUSALS: &[&str] = &[
     // the 8x8 leaf's TX_4X4 2x2 grid is still refused here.
     "an 8x8 intra leaf in an inter frame whose tx_depth splits it into 4x4 transform units",
     "an inter frame with no key frame before it",
-    "an inter SB-level partition type other than NONE or SPLIT (this decoder's inter tile path recurses a superblock only as SPLIT)",
-    "an inter partition below 16x16 other than SPLIT (16x8/8x16 rect inter leaves are not coded yet)",
+    "an inter SB-level AB partition (HORZ_A/HORZ_B/VERT_A/VERT_B; this decoder's inter tile path codes a superblock as NONE, SPLIT, HORZ, VERT, HORZ_4 or VERT_4)",
+    "an inter 16x16-level AB or 1:4 partition (HORZ_A/HORZ_B/VERT_A/VERT_B/HORZ_4/VERT_4; this decoder's inter path codes a 16x16 as NONE, HORZ, VERT or SPLIT)",
     "an intra mode this decoder does not code (round 2)",
     "an intra-coded HORZ/VERT strip needs rectangular intra prediction this decoder does not code yet",
     "warp prediction with a scaled reference (superres, unimplemented)",
     "an 8x8 partition leaf under a scaled reference (superres, unimplemented)",
+    "a motion_mode symbol for a block shape with no CDF row here",
 ];
 
 /// Gates whose `Err` arm turns a decode failure into a printed SKIP rather than
