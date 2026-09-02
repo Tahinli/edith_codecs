@@ -58,6 +58,12 @@ const REFUSALS: &[&str] = &[
     "a frame naming primary_ref_frame at a reference slot with no saved CDF state",
     "a frame with no mode-info grid",
     "a frame whose segmentation enables SEG_LVL_REF_FRAME/SKIP/GLOBALMV (this decoder reads segment_id but never lets a segment override a block's reference, skip or mode)",
+    // Still live, but NARROWED: lane-rectres r1 added the 32x32-level 1:4
+    // strips (32x8 / 8x32) to `rect_inter_residual_supported` -- THE shape both
+    // 10-bit 3840x1608 film cuts and every measured 1080p offset stopped on
+    // (gate `a_real_aomenc_inter_sequence_with_32x32_level_1to4_strips_codes_\
+    // their_rect_residual`). The string stays because the shapes below 8x8 and
+    // the AB-partition footprints still have no rectangular residual path.
     "a non-skip rectangular (HORZ/VERT/HORZ_B) strip needs rectangular residual coding",
     "a reference frame selected with no picture at this frame's own ref_frame_idx slot for it",
     "a reference picture whose height does not match this frame's own true size",
