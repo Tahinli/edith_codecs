@@ -196,11 +196,9 @@ const NEVER_EXERCISED_10BIT: &[(&str, &str)] = &[
     // sums never brought back to the 8-bit scale, Wiener clamp at the wrong
     // bound). `enable-dist-wtd-comp` and `enable-global-motion` left it the
     // same day for the same reason: lane-cwarp's 10-bit compound global-warp
-    // gate passes `=1` for both.
-    (
-        "enable-1to4-partitions",
-        "10-bit hole only: 8-bit gates (lane-tx64x16 SB-level 1:4, lane-sub8) pass `=1` and assert their arms, but no 10-bit gate does",
-    ),
+    // gate passes `=1` for both. `enable-1to4-partitions` left it on 2026-09-02:
+    // lane-tx64x16 r4's 32-level 1:4 gate has a 10-bit arm that asserts both
+    // orientations and coded strips inside pixel-exact attempts.
     (
         "enable-angle-delta",
         "hole at both depths, see the 8-bit list",

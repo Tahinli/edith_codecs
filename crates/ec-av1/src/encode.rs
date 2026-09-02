@@ -1123,14 +1123,6 @@ impl Drop for VertAbGuard {
     }
 }
 
-/// `has_tr_32x16`/`has_tr_16x32` (libaom `reconintra.c`) -- lane-intradisp
-/// r1: the two rect strips PARTITION_HORZ/VERT ever produce at the 32x32
-/// level, transcribed verbatim (not derived): `[0]` is 32-wide, `[1]` is
-/// 16-wide.
-const HAS_TOP_RIGHT_RECT: [&[u8]; 2] = [&[15, 5, 7, 5], &[255, 119, 127, 119]];
-/// `has_bl_32x16`/`has_bl_16x32`, same source, same order.
-const HAS_BOTTOM_LEFT_RECT: [&[u8]; 2] = [&[78, 14, 78, 14], &[16, 0, 16, 0]];
-
 /// libaom `reconintra.c`'s `has_tr_*`/`has_bl_*` for the four rectangular
 /// block sizes this decoder codes, transcribed verbatim (lane-rectx r4).
 /// The 16x8/8x16 rows are what the 32x16/16x32 pair above cannot stand in
@@ -1148,6 +1140,11 @@ fn has_tr_rect_table(bw: usize, bh: usize) -> &'static [u8] {
         (32, 16) => &[15, 5, 7, 5],
         (16, 32) => &[255, 119, 127, 119],
         (64, 32) => &[19],
+        // lane-tx64x16 r3: `has_tr_32x8` / `has_tr_8x32`
+        // (`reconintra.c:122-127`), the 4:1 strips of a 32x32-level
+        // `PARTITION_HORZ_4`/`VERT_4`.
+        (32, 8) => &[15, 0, 5, 0, 7, 0, 5, 0],
+        (8, 32) => &[255, 255, 127, 127, 255, 127, 127, 127],
         _ => &[127],
     }
 }
@@ -1159,6 +1156,9 @@ fn has_bl_rect_table(bw: usize, bh: usize) -> &'static [u8] {
         (32, 16) => &[78, 14, 78, 14],
         (16, 32) => &[16, 0, 16, 0],
         (64, 32) => &[34],
+        // `has_bl_32x8` / `has_bl_8x32` (`reconintra.c:305-310`).
+        (32, 8) => &[238, 78, 238, 14, 238, 78, 238, 14],
+        (8, 32) => &[0, 1, 0, 0, 0, 1, 0, 0],
         _ => &[0],
     }
 }
