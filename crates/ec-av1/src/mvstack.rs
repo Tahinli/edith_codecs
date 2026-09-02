@@ -875,7 +875,12 @@ pub fn find_mv_stack_with_sign_bias(
             &mut newmv_count,
             &mut processed_cols,
         );
-    let found_top_right = scan_top_right(
+    // libaom `setup_ref_mv_list` gates this probe on `has_top_right`
+    // (mvref_common.c:497/546): the diagonally-above-right unit of a 128x128
+    // block sits in decoded memory but is NOT available (bs > 16), so an
+    // ungated grid probe invents a candidate and desyncs the drl symbols.
+    let found_top_right = has_top_right(mi_row, mi_col, bw4, bh4)
+        && scan_top_right(
             grid,
             mi_row,
             mi_col,
@@ -1668,7 +1673,12 @@ pub fn find_mv_stack_compound(
             &mut newmv_count,
             &mut processed_cols,
         );
-    let found_top_right = scan_top_right_compound(
+    // libaom `setup_ref_mv_list` gates this probe on `has_top_right`
+    // (mvref_common.c:497/546): the diagonally-above-right unit of a 128x128
+    // block sits in decoded memory but is NOT available (bs > 16), so an
+    // ungated grid probe invents a candidate and desyncs the drl symbols.
+    let found_top_right = has_top_right(mi_row, mi_col, bw4, bh4)
+        && scan_top_right_compound(
             grid,
             mi_row,
             mi_col,
