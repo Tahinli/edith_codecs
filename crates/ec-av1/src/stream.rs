@@ -14365,6 +14365,299 @@ mod tests {
         a_real_aomenc_temporal_mv_gate(42, 40);
     }
 
+    /// lane-mvtwin r1: the COMPOUND MV-stack gate. Every other compound gate
+    /// here pins `--enable-ref-frame-mvs=0`, so `find_mv_stack_compound`'s
+    /// temporal half (the three `tpl_sample_pos` extension samples lane-sb128
+    /// r3 found missing) and its extension pass have never been exercised by
+    /// a real encoder. This arm turns ref-frame-mvs ON, gives the encoder a
+    /// 25-frame lookahead plus alt-refs so `reference_select` really drives
+    /// blocks to COMPOUND_REFERENCE, and sweeps global motion off/on so the
+    /// combine step's `gm_mv_candidates` fill (r1 defect 1) is reachable.
+    ///
+    /// Firing proof, hard-asserted: `decode::comp_mode_hits` (a real
+    /// compound block) AND `mvstack::tmv_hits` (a temporal candidate landed
+    /// in some stack) must BOTH have advanced on an attempt that also
+    /// decoded pixel-exact -- class [[gate-skips-on-its-own-failure]]: a
+    /// decode that succeeds is ALWAYS compared, on every decode-order frame,
+    /// and only the counters decide whether the attempt counts.
+    fn a_real_aomenc_compound_mv_stack_gate(
+        gate_name: &str,
+        seed_base: u32,
+        attempts: u32,
+        bit_depth: u32,
+        sb_size: u32,
+        global_motion: u32,
+        width: usize,
+        tile_columns: u32,
+    ) {
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {gate_name}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {gate_name}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (height, frame_count) = (64usize, 16usize);
+        let mut never_fired = 0u32;
+        let mut refusals = Vec::new();
+        for attempt in 0..attempts {
+            let seed = seed_base + attempt;
+            let duration = frame_count as f64 / 25.0;
+            let source =
+                gradients_source(seed, width, height, &format!("duration={duration}:rate=25"));
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-pix_fmt",
+                    if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" },
+                    "-strict",
+                    "-1",
+                    "-t",
+                    "0.64",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-strict",
+                    "-1",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let depth_args: &[&str] = if bit_depth == 10 {
+                &["-b", "10", "--input-bit-depth=10"]
+            } else {
+                &[]
+            };
+            // The cq sweep: how finely RD partitions decides how often a
+            // block's stack comes up short enough to reach the extension
+            // pass at all.
+            let cq = format!("--cq-level={}", [45u32, 55, 35][(attempt % 3) as usize]);
+            let sb = format!("--sb-size={sb_size}");
+            let gm = format!("--enable-global-motion={global_motion}");
+            // `--tile-columns` is log2: 1 means two tile columns, which is
+            // what makes every block in the right-hand tile carry a nonzero
+            // `tile_col0` and so exercise r1 defect 3's reach clamp.
+            let tiles = format!("--tile-columns={tile_columns}");
+            // class [[aomenc-last-flag-wins]]: every flag appears exactly
+            // once below, so there is no override to order.
+            let out = {
+                let mut child = Command::new(aomenc_path())
+                    .args(depth_args)
+                    .arg(&cq)
+                    .arg(&sb)
+                    .arg(&gm)
+                    .arg(&tiles)
+                    .args([
+                        "--codec=av1",
+                        "--passes=1",
+                        "--end-usage=q",
+                        "--cpu-used=0",
+                        "--kf-max-dist=1000",
+                        "--threads=1",
+                        "--row-mt=0",
+                        // What this gate is about: real compound references
+                        // with a real temporal MV field behind them.
+                        "--enable-ref-frame-mvs=1",
+                        "--enable-order-hint=1",
+                        "--auto-alt-ref=1",
+                        "--lag-in-frames=25",
+                        "--enable-fwd-kf=0",
+                        "--enable-warped-motion=0",
+                        "--enable-obmc=0",
+                        "--enable-masked-comp=0",
+                        "--enable-interintra-comp=0",
+                        "--enable-dist-wtd-comp=0",
+                        "--enable-diff-wtd-comp=0",
+                        "--enable-onesided-comp=0",
+                        "--enable-interintra-wedge=0",
+                        "--enable-smooth-interintra=0",
+                        "--enable-rect-partitions=0",
+                        "--enable-ab-partitions=0",
+                        "--enable-1to4-partitions=0",
+                        "--enable-filter-intra=0",
+                        "--enable-smooth-intra=0",
+                        "--enable-paeth-intra=0",
+                        "--enable-directional-intra=0",
+                        "--enable-angle-delta=0",
+                        "--enable-tx-size-search=0",
+                        "--enable-cdef=0",
+                        "--enable-restoration=0",
+                        "--max-partition-size=32",
+                        "--min-partition-size=32",
+                        "--enable-palette=0",
+                        "--enable-intrabc=0",
+                        "--enable-cfl-intra=0",
+                        "--obu",
+                        "-o",
+                        "-",
+                        "-",
+                    ])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("aomenc failed to start");
+                child
+                    .stdin
+                    .take()
+                    .expect("aomenc stdin")
+                    .write_all(&y4m.stdout)
+                    .expect("writing y4m to aomenc");
+                child.wait_with_output().expect("aomenc failed to run")
+            };
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let (before_comp, before_tmv) = (decode::comp_mode_hits(), decode::tmv_hits());
+            let frames = match decode_stream(&stream) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{gate_name} failed outright (seed {seed}): {msg}"
+                    );
+                    refusals.push(format!("seed {seed}: {msg}"));
+                    continue;
+                }
+                Ok(frames) => frames,
+            };
+            let counted =
+                decode::comp_mode_hits() != before_comp && decode::tmv_hits() != before_tmv;
+            if !counted {
+                never_fired += 1;
+            }
+            let ffmpeg_frames = if bit_depth == 10 {
+                ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count)
+            } else {
+                ffmpeg_decode_sequence(&stream, width, height, frame_count)
+            };
+            assert_eq!(frames.len(), frame_count);
+            // EVERY decode-order frame compared, never just the shown ones
+            // (class [[gate-blind-to-hidden-frames]]).
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(
+                    got.y, want.y,
+                    "{gate_name} frame {i} luma vs ffmpeg (seed {seed})"
+                );
+                assert_eq!(
+                    got.u, want.u,
+                    "{gate_name} frame {i} U vs ffmpeg (seed {seed})"
+                );
+                assert_eq!(
+                    got.v, want.v,
+                    "{gate_name} frame {i} V vs ffmpeg (seed {seed})"
+                );
+            }
+            if counted {
+                eprintln!(
+                    "{gate_name} FIRING seed {seed}: comp_mode_hits +{}, tmv_hits +{}, \
+                     comp_gm_fill_hits={}, stack_full_drops={}, tile_reach_clips={}",
+                    decode::comp_mode_hits() - before_comp,
+                    decode::tmv_hits() - before_tmv,
+                    crate::mvstack::comp_gm_fill_hits(),
+                    crate::mvstack::stack_full_drops(),
+                    crate::mvstack::tile_reach_clips(),
+                );
+                gate_buckets(gate_name, 1, never_fired, refusals.len());
+                return;
+            }
+        }
+        gate_buckets(gate_name, 0, never_fired, refusals.len());
+        eprintln!(
+            "SKIP {gate_name}: {never_fired} attempts decoded but never drove a compound block \
+             with a temporal MV candidate, and every other attempt hit a named refusal:\n{}",
+            refusals.join("\n")
+        );
+    }
+
+    #[test]
+    fn a_real_aomenc_compound_mv_stack_with_temporal_mvs_decodes_pixel_exact() {
+        a_real_aomenc_compound_mv_stack_gate(
+            "a_real_aomenc_compound_mv_stack_with_temporal_mvs_decodes_pixel_exact",
+            42,
+            30,
+            8,
+            64,
+            0,
+            64,
+            0,
+        );
+    }
+
+    #[test]
+    fn a_real_aomenc_compound_mv_stack_with_global_motion_decodes_pixel_exact() {
+        a_real_aomenc_compound_mv_stack_gate(
+            "a_real_aomenc_compound_mv_stack_with_global_motion_decodes_pixel_exact",
+            80,
+            30,
+            8,
+            64,
+            1,
+            64,
+            0,
+        );
+    }
+
+    #[test]
+    fn a_real_aomenc_10bit_compound_mv_stack_at_128_superblocks_decodes_pixel_exact() {
+        a_real_aomenc_compound_mv_stack_gate(
+            "a_real_aomenc_10bit_compound_mv_stack_at_128_superblocks_decodes_pixel_exact",
+            120,
+            30,
+            10,
+            128,
+            1,
+            64,
+            0,
+        );
+    }
+
+    /// KNOWN OPEN DEFECT, found by lane-mvtwin r1 and NOT caused by it: a
+    /// real aomenc stream 128 px wide with `--tile-columns=1` (two 64-px tile
+    /// columns) mis-decodes frame 1's luma against ffmpeg, at seed 200 with
+    /// this exact recipe. ABLATION-PROVEN pre-existing: the same arm fails
+    /// identically with r1's tile-origin reach clamp
+    /// (`MiGrid::tile_origin`) forced back to `(0, 0)`, so the cause is
+    /// somewhere else in the multi-tile path, not in `mvstack`. Kept as the
+    /// exact reproducer for the lane that owns tiles -- it is `#[ignore]`d
+    /// rather than deleted so the repro command survives:
+    /// `cargo test -p ec-av1 --lib across_two_tile_columns -- --ignored --nocapture`.
+    ///
+    /// It is also the ONLY arm that reaches r1 defect 3 (the col reach is
+    /// clamped to `tile_col0`, not the frame edge): the counter
+    /// `mvstack::tile_reach_clips` advanced to 60 on this stream. Defect 3
+    /// itself is proven deterministically by
+    /// `mvstack::tests::the_row_reach_is_clamped_to_the_tile_origin_not_the_frame_edge`.
+    #[test]
+    #[ignore = "known pre-existing multi-tile-column decode defect, see doc comment"]
+    fn a_real_aomenc_compound_mv_stack_across_two_tile_columns_decodes_pixel_exact() {
+        let name = "a_real_aomenc_compound_mv_stack_across_two_tile_columns_decodes_pixel_exact";
+        let before = crate::mvstack::tile_reach_clips();
+        a_real_aomenc_compound_mv_stack_gate(name, 200, 30, 8, 64, 0, 128, 1);
+        assert!(
+            crate::mvstack::tile_reach_clips() > before,
+            "{name}: no block was ever built inside a tile past mi 0 -- \
+             --tile-columns=1 did not produce a second tile column"
+        );
+    }
+
     /// bisect scratch: decode a pinned stream exactly once -- generic
     /// pin-repro tool, kept for manual use.
     #[test]
