@@ -11192,9 +11192,10 @@ mod tests {
                 mismatched)`; attempts 1..3 mismatch ffmpeg from frame 1 or 2 (max |delta| \
                 up to 248) and attempts 0/4 mismatch while carrying NO 1:4 strip at all -- \
                 another shape's defect, unchanged since r2. The 16x4/4x16-in-inter refusal \
-                is re-added this round, so the shape now refuses by name unless \
-                `EC_INTRA16X4_DECODE` is set: un-ignore only together with a witness \
-                (lanes/wit16x4-r1.report.md)"]
+                was lifted in lane-t900 r6 by a FILM witness (gate \
+                `a_10bit_128sb_film_frames_with_warp_cdef_and_interintra_decode_pixel_exact`), \
+                so what is unproven here is only this aomenc RECIPE: un-ignore once one \
+                of its arms decodes exactly while the arm fires"]
     // lane-intra16x4 r1: an INTRA-coded 16x4 / 4x16 strip inside an INTER
     // frame's 16x16-level 1:4 partition -- the wall all six of his film cuts
     // stopped at once lane-rectres landed. The shape's chroma is the pair's:
@@ -30277,6 +30278,129 @@ mod tests {
         eprintln!(
             "{NAME}: 37 shown frames pixel-exact on every plane, \
              rect64_split_txfm_publish={fired}"
+        );
+    }
+
+    /// lane-t900 r6: the 128-superblock INTER witness.
+    /// `crates/ec-av1/fixtures/troy_sb128_inter_witness.obu`, 166303 bytes,
+    /// sha256 `1191ce80e2c6c5855eaf7a8f5e8cda2cdf809f467b0dbc5e26df96dfa6b2c8bd`:
+    /// the first 19 frame-carrying OBUs of a 2 s cut taken 900 s into a 10-bit
+    /// 1920x792 AV1 stream with `use_128x128_superblock=1`, 14 decode-order
+    /// frames, 12 shown. Cut twice independently from the source (`-ss 900 -t 2
+    /// -c:v copy` then the OBU truncation) -- both cuts hash identically.
+    ///
+    /// It is the first stream in this repository that decodes exactly while
+    /// five separately-found defects' paths all fire, which is why the asserts
+    /// below are on all of them:
+    ///
+    /// * `warp_plane_suppress_hits` (r5) -- `av1_init_warp_params` bails out at
+    ///   `block_width < 8 || block_height < 8` on the PLANE's own block, so the
+    ///   4x8 chroma of an 8x16 luma block is predicted translationally while its
+    ///   luma warps. Gated on the square side before r5.
+    /// * `inter_sb128_vert_hits` + `cdef_idx_hits` (r5) -- the second half of a
+    ///   128-root HORZ/VERT inter block must read its OWN `cdef_idx` literal
+    ///   (libaom `cdef_transmitted[4]`, one flag per 64x64 CDEF unit).
+    /// * `interintra_rect_hits` (r4) -- interintra on a RECTANGULAR block built
+    ///   a square intra predictor before.
+    /// * `non_chroma_ref_ctx_skip_hits` (r3) -- a block that is not the chroma
+    ///   reference of its 4:2:0 pair leaves its neighbours' chroma coefficient
+    ///   contexts untouched (`nplanes = 1 + (num_planes - 1) * is_chroma_ref`).
+    /// * `intra_in_inter_txctx_hits` (r2) -- an intra strip in an INTER frame
+    ///   takes its `tx_depth` row from the real `TXFM_CONTEXT` bands, not the
+    ///   key frame's deblock grid.
+    /// * `edge_filter_mi_fix_hits` (r4) -- both halves of a split intra block
+    ///   read their OWN mi-exact intra-edge-filter neighbours.
+    ///
+    /// It is ALSO the witness that lifts the `EC_INTRA16X4_DECODE` opt-in:
+    /// `intra16x4_in_inter` fires 78x 16x4 + 149x 4x16 (108 chroma-paired)
+    /// inside frames that are decoded AND compared exact -- not counted out of
+    /// a refused or desynced stream the way lane-sub8x4 r3's phantom was
+    /// (class `counter-from-refused-stream`). The 128x64/64x128 intra-in-inter
+    /// arm fires 0 times here, so THAT refusal is untouched.
+    ///
+    /// All 14 decode-order frames (including the 2 no-show frames ffmpeg never
+    /// hands back) were compared byte-exact against instrumented aomdec with
+    /// `EC_AV1_FINAL_DUMP` -- see the lane report's EVIDENCE line; the gate
+    /// itself compares the 12 shown frames on every plane.
+    #[test]
+    fn a_10bit_128sb_film_frames_with_warp_cdef_and_interintra_decode_pixel_exact() {
+        const NAME: &str =
+            "a_10bit_128sb_film_frames_with_warp_cdef_and_interintra_decode_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/troy_sb128_inter_witness.obu");
+        let stream = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path.display()));
+        let (width, height) = (1920usize, 792usize);
+        let before = (
+            crate::decode::warp_plane_suppress_hits(),
+            crate::decode::cdef_idx_hits(),
+            crate::decode::inter_sb128_vert_hits(),
+            crate::decode::interintra_rect_hits(),
+            crate::decode::non_chroma_ref_ctx_skip_hits(),
+            crate::decode::intra_in_inter_txctx_hits(),
+            crate::decode::edge_filter_mi_fix_hits(),
+        );
+        let i16_before = crate::decode::intra16x4_in_inter_hits();
+        let frames = match decode_stream(&stream) {
+            Ok(frames) => frames,
+            Err(e) => panic!("{NAME}: decode_stream refused: {e}"),
+        };
+        let fired = (
+            crate::decode::warp_plane_suppress_hits() - before.0,
+            crate::decode::cdef_idx_hits() - before.1,
+            crate::decode::inter_sb128_vert_hits() - before.2,
+            crate::decode::interintra_rect_hits() - before.3,
+            crate::decode::non_chroma_ref_ctx_skip_hits() - before.4,
+            crate::decode::intra_in_inter_txctx_hits() - before.5,
+            crate::decode::edge_filter_mi_fix_hits() - before.6,
+        );
+        let i16_now = crate::decode::intra16x4_in_inter_hits();
+        let i16 = (
+            i16_now.0 - i16_before.0,
+            i16_now.1 - i16_before.1,
+            i16_now.2 - i16_before.2,
+        );
+        for (what, n) in [
+            ("warp_plane_suppress", fired.0),
+            ("cdef_idx", fired.1),
+            ("inter_sb128_vert", fired.2),
+            ("interintra_rect", fired.3),
+            ("non_chroma_ref_ctx_skip", fired.4),
+            ("intra_in_inter_txctx", fired.5),
+            ("edge_filter_mi_fix", fired.6),
+            ("intra16x4_in_inter 16x4", i16.0),
+            ("intra16x4_in_inter 4x16", i16.1),
+            ("intra16x4_in_inter chroma_ref", i16.2),
+        ] {
+            assert!(
+                n > 0,
+                "{NAME}: {what} never fired on this stream -- the gate would be vacuous for it"
+            );
+        }
+        assert_eq!(frames.len(), 12, "{NAME}: 12 shown frames");
+        assert_eq!((frames[0].width, frames[0].height), (width, height));
+        let ffmpeg_frames = ffmpeg_decode_sequence_10bit(&stream, width, height, frames.len());
+        assert_eq!(
+            ffmpeg_frames.len(),
+            frames.len(),
+            "{NAME}: ffmpeg returned {} frames, we decoded {}",
+            ffmpeg_frames.len(),
+            frames.len()
+        );
+        for (i, (ours, theirs)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+            assert_eq!(ours.y, theirs.y, "{NAME}: frame {i} luma vs ffmpeg");
+            assert_eq!(ours.u, theirs.u, "{NAME}: frame {i} U vs ffmpeg");
+            assert_eq!(ours.v, theirs.v, "{NAME}: frame {i} V vs ffmpeg");
+        }
+        eprintln!(
+            "{NAME}: 12 shown frames pixel-exact on every plane; warp_plane_suppress={} \
+             cdef_idx={} inter_sb128_vert={} interintra_rect={} non_chroma_ref_ctx_skip={} \
+             intra_in_inter_txctx={} edge_filter_mi_fix={} intra16x4_in_inter={:?}",
+            fired.0, fired.1, fired.2, fired.3, fired.4, fired.5, fired.6, i16
         );
     }
 
