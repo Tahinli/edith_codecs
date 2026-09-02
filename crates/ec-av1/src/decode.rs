@@ -7316,6 +7316,16 @@ fn decode_intra_rect_in_inter(
         eprintln!("EC_SPLITSTRIP mi_row={mi_r} mi_col={mi_c} bw={bw} bh={bh} depth={depth}");
     }
     let (tx_w, tx_h) = depth_to_tx_wh(bw, bh, depth);
+    // lane-inter16ab r8: libaom runs `set_txfm_ctxs(tx_size, n4_w, n4_h,
+    // skip && is_inter, xd)` (decodeframe.c `decode_block`) for EVERY block
+    // of an inter frame, intra ones included -- with the skip term 0 it
+    // memsets `above_txfm_context` to `tx_size_wide` over the block's width
+    // and `left_txfm_context` to `tx_size_high` over its height. This strip
+    // wrote neither, so the next block's var-tx `txfm_partition` context read
+    // a stale band: on a 192x128 8-bit stream the 16x8 intra strip at
+    // mi(14,0) left 8 where libaom has 16, giving ctx 13 instead of 12 at
+    // mi(16,0) and desyncing the tile at that symbol.
+    txfm_partition_update_rect(neighbours, (mi_r, mi_c), (tx_w, tx_h), (bw, bh));
     let modes = RectStripModes {
         skip,
         mode,
@@ -13162,6 +13172,9 @@ fn txfm_partition_update_rect(
     (tx_w, tx_h): (usize, usize),
     (txb_w, txb_h): (usize, usize),
 ) {
+    if std::env::var_os("EC_TXUPD").is_some() {
+        eprintln!("EC_TXUPD rect mi=({},{}) tx=({tx_w},{tx_h}) txb=({txb_w},{txb_h})", mi_r, mi_c);
+    }
     for i in 0..txb_h / MI {
         if let Some(cell) = n.left_txfm.get_mut(mi_r + i) {
             *cell = tx_h as u8;
@@ -13185,6 +13198,9 @@ fn set_txfm_ctxs(
     h_mi: usize,
     skip_inter: bool,
 ) {
+    if std::env::var_os("EC_TXUPD").is_some() {
+        eprintln!("EC_TXUPD ctxs mi=({mi_r},{mi_c}) tx={tx_px} wh=({w_mi},{h_mi}) skip_inter={skip_inter}");
+    }
     let bw = if skip_inter { w_mi * MI } else { tx_px };
     let bh = if skip_inter { h_mi * MI } else { tx_px };
     for i in 0..w_mi {
@@ -22314,6 +22330,12 @@ fn decode_inter_sub8_split4(
         }
         neighbours.record_mode_mi(rmi, cmi, 1, 1, DC_PRED);
         neighbours.record_inter_rect_mi(lmi, 1, 1, skip, true, ref_frame, resolved_filter, false);
+        // lane-inter16ab r8 (same-shape sweep of the intra-strip band gap):
+        // a BLOCK_4X4 codes no `txfm_partition` symbol, but libaom still runs
+        // `set_txfm_ctxs(TX_4X4, 1, 1, skip && is_inter, xd)` for it -- both
+        // arms give 4 -- so the sub-block must publish 4 to the next block's
+        // var-tx context instead of leaving whatever the previous block left.
+        set_txfm_ctxs(neighbours, lmi, B4, 1, 1, false);
         neighbours.fill_skip_grid_rect(lmi, 1, 1, skip);
         neighbours.fill_lf_grid_rect(lmi, 1, 1, B4 as u8, B4 as u8, ref_frame.max(LAST_FRAME));
         last_skip = skip;
