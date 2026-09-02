@@ -3167,6 +3167,16 @@ pub const TXB_SKIP_CHROMA_16_Q3: [[u16; 3]; 3] =
 /// TXB_SKIP_CHROMA_32, q-context 3: the same table as [`TXB_SKIP_CHROMA_32`], for `base_q_idx` 121..=255.
 pub const TXB_SKIP_CHROMA_32_Q3: [[u16; 3]; 3] =
     [[4656, 32768, 0], [16074, 32768, 0], [24704, 32768, 0]];
+
+/// `av1_default_txb_skip_cdfs[q][TX_32X32][10..13]` (token_cdfs.h): libaom's
+/// chroma `txb_skip_ctx` offset is 10 instead of 7 when the plane block is
+/// LARGER than the transform (`get_txb_ctx`), which in AV1 happens only for a
+/// 128x128 block's four TX_32X32 chroma units -- the offset-7 rows above are
+/// every other case (lane-sb128b r3).
+pub const TXB_SKIP_CHROMA_32_BIG_Q0: [[u16; 3]; 3] = [[146, 32768, 0], [5132, 32768, 0], [31657, 32768, 0]];
+pub const TXB_SKIP_CHROMA_32_BIG_Q1: [[u16; 3]; 3] = [[641, 32768, 0], [22265, 32768, 0], [31452, 32768, 0]];
+pub const TXB_SKIP_CHROMA_32_BIG: [[u16; 3]; 3] = [[3082, 32768, 0], [20982, 32768, 0], [29443, 32768, 0]];
+pub const TXB_SKIP_CHROMA_32_BIG_Q3: [[u16; 3]; 3] = [[1806, 32768, 0], [14645, 32768, 0], [25336, 32768, 0]];
 /// EOB_EXTRA_LUMA_16, q-context 3: the same table as [`EOB_EXTRA_LUMA_16`], for `base_q_idx` 121..=255.
 pub const EOB_EXTRA_LUMA_16_Q3: [[u16; 3]; 9] = [
     [19941, 32768, 0],
