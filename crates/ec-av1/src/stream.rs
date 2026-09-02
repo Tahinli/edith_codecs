@@ -18888,6 +18888,28 @@ mod tests {
         // The inter arm: >= 4 frames so the 32-level edge path in the INTER
         // tile walk is exercised too.
         arms.push((192, 80, 5, false));
+        // lane-golomb r8 MEASURED, arm STILL NOT added (every cq level is
+        // vacuous, panicking or red -- each measured this round with
+        // `arms.push((192, 68, 5, false))`, log
+        // `$HOME/.cache/golomb-gate-r8{b,e,f,g}.log`):
+        //   * the r7 blocker IS fixed -- no attempt refuses "a reference
+        //     picture whose height does not match this frame's own true
+        //     size" any more (`decode.rs`'s comparison now uses the header's
+        //     frame height, per libaom's crop-dimension reference test).
+        //   * cq35 now refuses LATER, by another lane's name: "an inter
+        //     SB-level AB partition (HORZ_A/HORZ_B/VERT_A/VERT_B)" -- so the
+        //     arm compares nothing (class `counter-from-refused-stream`).
+        //   * cq40 PANICS in `decode_inter_block8`
+        //     (`from_switchable_symbol` handed a 4th symbol, `mc.rs:203`) =
+        //     lane-sub8's own open below-8x8 desync; a panic cannot be
+        //     tolerated as a named refusal.
+        //   * cq59 8-bit is RED: `frame 1 plane Y: 217 pixels differ, first
+        //     at row 60 col 170 (ours 172 vs ffmpeg 173)`, and the cq35
+        //     10-bit twin is RED at `row 56 col 48 (ours 530 vs ffmpeg
+        //     531)`. Both are +-1 bands in rows 56..63, i.e. the deblock/CDEF
+        //     bleed ABOVE the 4-px straddling row band (64..67) -- the same
+        //     shape as the `(68, 192, 5, false)` column defect below, so the
+        //     two are very likely ONE straddling-band reconstruction defect.
         // lane-golomb r7 MEASURED, arm NOT added (it would be vacuous or red):
         // a 68-px axis leaves the last superblock straddling by 4 px, the
         // shape `read_var_tx_size`'s `blk_row >= max_h_mi || blk_col >=
@@ -19010,6 +19032,12 @@ mod tests {
                 }
                 let tag = format!("{width}x{height} cq{cq} frames={frame_count} 10bit={ten_bit}");
                 let before = crate::decode::edge32_hits();
+                // lane-golomb r8: name the attempt BEFORE decoding it -- a
+                // desync surfaces as a panic deep in mc.rs with no arm in the
+                // message, and r8 spent a run bisecting arms by hand.
+                if std::env::var_os("EC_GATE_VERBOSE").is_some() {
+                    eprintln!("{NAME}: attempting {tag}");
+                }
                 let decoded = match decode_stream(&stream) {
                     Ok(frames) => frames,
                     Err(e) => {
