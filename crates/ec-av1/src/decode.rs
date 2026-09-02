@@ -21781,6 +21781,12 @@ fn decode_inter_block8(
     // lane-cdef r1: the fall-through twin of the compound arm's skip-band
     // write above -- `skip` is one flag for the whole 8x8 leaf (read at
     // `decode.rs`'s `skip_ctx` site), `split8` only splits its transform.
+    // lane-intersub8 r5: ... and it counts too. r1 incremented the counter in
+    // the COMPOUND early-return arm only, so the gate's assert really read
+    // "a COMPOUND 8x8 leaf wrote the band"; once main's inter16ab/r14 routing
+    // landed, the 10-bit cq12 arm's leaves come through here instead and the
+    // gate failed on an instrumentation gap, with the band written either way.
+    INTER8_SKIP_BAND_HITS.with(|c| c.set(c.get() + 1));
     neighbours.fill_skip_grid(leaf_mi, 2, skip);
     neighbours.fill_lf_grid(
         leaf_mi,
