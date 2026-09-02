@@ -70,3 +70,21 @@ are correct and untouched.
 ## EVIDENCE
 EVIDENCE: scratchpad/aompred.log (EC_PRED rung added to reconintra.c) | `EC_PRED=1 aomdec s46.obu`, grep `mi_row=16 mi_col=32` | the 16x16 D203 block is four 8x8 luma TUs with n_bl = 8,0,8,0 -- the two `col_off>0` units get NO bottom-left
 EVIDENCE: scratchpad/s46.obu (146 B, sha256 a109adab4397...) | regenerated from the gate recipe, `cargo test -p ec-av1 --lib filter_intra_on_a_horz_vert_strip` before/after the `of_tu` change | 2242 mismatching luma samples -> 0, test FAILED -> ok
+
+## Full suite (merged tree, after the fix)
+`systemd-run --user --unit=palette2-suite-r12-1788311147 ... cargo test -p ec-av1 --lib`
+-> `$HOME/.cache/palette2-suite-r12.log`:
+`test result: ok. 314 passed; 0 failed; 27 ignored; 0 measured; finished in 317.39s`
+(r11 on the pre-merge tree: 306 passed / 1 failed / 26 ignored). Siblings named in
+the charter -- both palette gates, superblock_level_ab, ab_partition,
+split_transform_*, the tiny sweep, refusal_inventory, gate_coverage,
+base_ctx_rect_offsets -- are all inside that run and all pass.
+
+## Residue
+- `deferred: a dedicated directional-mode AB-partition gate arm (D203/D157/D67 at SB
+  column 0, --enable-ab-partitions=1, 8/10-bit) -- the seed-46 stream already pins the
+  exact fixed path (VERT_A + D203 + split-TU at SB column 0) as a real-aomenc pixel gate
+  and the new enumeration test covers the rule over its whole domain, so a second stream
+  would add cost, not coverage -- unblocks by a round with budget for a new gate recipe`.
+- `accepted: the EC_PRED rung now lives in ~/.cache/aom-oracle/src (oracle tree, not this
+  repo); scripts/instrument-aom-oracle.sh does not yet install it`.
