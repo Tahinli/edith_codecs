@@ -7665,7 +7665,14 @@ fn decode_intra_rect_in_inter(
     // The intra-edge filter type is the NEIGHBOUR's mode (libaom
     // `get_filt_type`), luma's off the luma neighbours and chroma's off the
     // chroma ones -- [`decode_block_rect`]'s own pair.
-    let (nb_above_mode, nb_left_mode) = neighbours.modes_above_left(r, c);
+    // lane-t900 r4: the coarse pair is keyed on the 16x16 cell's OWN top-left
+    // mi, so both 8x16 halves of a VERT split read the neighbours of the FIRST
+    // half. libaom's `above_mbmi`/`left_mbmi` are this block's own
+    // (`mi[-mi_stride]` / `mi[-1]`) -- take the mi-exact pair over the coarse
+    // one exactly as [`decode_leaf8`] already does (class
+    // context-read-from-one-cell).
+    let (nb_above_mode, nb_left_mode) =
+        neighbours.modes_above_left_mi(mi_r, mi_c, neighbours.modes_above_left(r, c));
     let smooth_neighbor = is_smooth_mode(nb_above_mode) || is_smooth_mode(nb_left_mode);
     if smooth_neighbor {
         SMOOTH_LUMA_HITS.with(|h| h.set(h.get() + 1));
@@ -10864,7 +10871,7 @@ impl PlaneBuf {
             let row0: Vec<u16> = prediction[..bw.min(8)].to_vec();
             let col0: Vec<u16> = (0..bh.min(8)).map(|r| prediction[r * bw]).collect();
             eprintln!(
-                "@{} OUR_PRED x={x} y={y} bw={bw} bh={bh} mode={mode} ad={angle_delta} sum={sum} row0={row0:?} col0={col0:?}", std::panic::Location::caller()
+                "@{} OUR_PRED x={x} y={y} bw={bw} bh={bh} mode={mode} ad={angle_delta} ft={} sum={sum} row0={row0:?} col0={col0:?}", std::panic::Location::caller(), i32::from(smooth_neighbor)
             );
         }
         for row in 0..bh {
