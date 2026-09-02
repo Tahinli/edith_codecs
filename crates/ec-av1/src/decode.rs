@@ -7842,8 +7842,26 @@ fn decode_block_rect(
     // pinned HORZ quadrant were wrong from their very first pixel, and why our
     // range after the read equalled the oracle's range for the whole block.
     let depth = if tx_select {
-        let ctx = tx_size_context_rect(neighbours, (mi_r, mi_c), bw, bh);
-        dec.symbol(&mut cdfs.tx_size_cat2[ctx])
+        // lane-t900 r2: on an INTER frame `get_tx_size_context` reads the real
+        // `TXFM_CONTEXT` bands ([`tx_size_context_txfm_rect`], what the 2:1 and
+        // the 16x4 intra-in-inter strips already do); the key frame's
+        // deblock-grid approximation is only right where those bands were never
+        // written. Measured on the 10-bit 1920x792 128-superblock stream,
+        // decode-order frame 1: the 32x8 HORZ_4 strip at mi(48,176) read
+        // `tx_size_cat2` row 1 where libaom reads row 2.
+        let ctx = if INTRA_IN_INTER_MODE.with(std::cell::Cell::get).is_some() {
+            tx_size_context_txfm_rect(neighbours, (mi_r, mi_c), bw, bh)
+        } else {
+            tx_size_context_rect(neighbours, (mi_r, mi_c), bw, bh)
+        };
+        let d = dec.symbol(&mut cdfs.tx_size_cat2[ctx]);
+        if std::env::var_os("EC_TRACE_MODE_STEP").is_some() {
+            eprintln!(
+                "EC_ISTEP mi_row={mi_r} mi_col={mi_c} name=tx_depth val={d} ctx={ctx} cat=2 rng={}",
+                dec.debug_state().0
+            );
+        }
+        d
     } else {
         0
     };
@@ -8658,8 +8676,26 @@ fn decode_block_rect4(
         uv_mode
     };
     let depth = if tx_select {
-        let ctx = tx_size_context_rect(neighbours, (mi_r, mi_c), bw, bh);
-        dec.symbol(&mut cdfs.tx_size_cat2[ctx])
+        // lane-t900 r2: on an INTER frame `get_tx_size_context` reads the real
+        // `TXFM_CONTEXT` bands ([`tx_size_context_txfm_rect`], what the 2:1 and
+        // the 16x4 intra-in-inter strips already do); the key frame's
+        // deblock-grid approximation is only right where those bands were never
+        // written. Measured on the 10-bit 1920x792 128-superblock stream,
+        // decode-order frame 1: the 32x8 HORZ_4 strip at mi(48,176) read
+        // `tx_size_cat2` row 1 where libaom reads row 2.
+        let ctx = if INTRA_IN_INTER_MODE.with(std::cell::Cell::get).is_some() {
+            tx_size_context_txfm_rect(neighbours, (mi_r, mi_c), bw, bh)
+        } else {
+            tx_size_context_rect(neighbours, (mi_r, mi_c), bw, bh)
+        };
+        let d = dec.symbol(&mut cdfs.tx_size_cat2[ctx]);
+        if std::env::var_os("EC_TRACE_MODE_STEP").is_some() {
+            eprintln!(
+                "EC_ISTEP mi_row={mi_r} mi_col={mi_c} name=tx_depth val={d} ctx={ctx} cat=2 rng={}",
+                dec.debug_state().0
+            );
+        }
+        d
     } else {
         0
     };
@@ -9176,7 +9212,16 @@ fn decode_rect4_16_strip(
             } else {
                 tx_size_context_rect(neighbours, lmi, bw, bh)
             };
-            dec.symbol(&mut cdfs.tx_size_cat1[ctx])
+            let d = dec.symbol(&mut cdfs.tx_size_cat1[ctx]);
+            if std::env::var_os("EC_TRACE_MODE_STEP").is_some() {
+                eprintln!(
+                    "EC_ISTEP mi_row={} mi_col={} name=tx_depth val={d} ctx={ctx} cat=1 rng={}",
+                    lmi.0,
+                    lmi.1,
+                    dec.debug_state().0
+                );
+            }
+            d
         } else {
             0
         };
@@ -9653,7 +9698,18 @@ fn decode_block_rect64(
     };
     let (mi_r, mi_c) = (r * (SUB / MI), c * (SUB / MI));
     let depth = if tx_select {
-        let ctx = tx_size_context_rect(neighbours, (mi_r, mi_c), bw, bh);
+        // lane-t900 r2: on an INTER frame `get_tx_size_context` reads the real
+        // `TXFM_CONTEXT` bands ([`tx_size_context_txfm_rect`], what the 2:1 and
+        // the 16x4 intra-in-inter strips already do); the key frame's
+        // deblock-grid approximation is only right where those bands were never
+        // written. Measured on the 10-bit 1920x792 128-superblock stream,
+        // decode-order frame 1: the 32x8 HORZ_4 strip at mi(48,176) read
+        // `tx_size_cat2` row 1 where libaom reads row 2.
+        let ctx = if INTRA_IN_INTER_MODE.with(std::cell::Cell::get).is_some() {
+            tx_size_context_txfm_rect(neighbours, (mi_r, mi_c), bw, bh)
+        } else {
+            tx_size_context_rect(neighbours, (mi_r, mi_c), bw, bh)
+        };
         // lane-rectsplit r1: `bsize_to_tx_size_cat` (libaom `decodemv.c`)
         // counts `sub_tx_size_map` steps from the block's own max rect
         // transform down to TX_4X4, minus one -- BLOCK_64X32's chain
@@ -9661,7 +9717,14 @@ fn decode_block_rect64(
         // steps, so this level's category is 3 (the same one a 64x64 square
         // block uses), not the 2 a 32x16 strip uses. Reading the cat-2 CDF
         // here was a wrong-table read of a real symbol.
-        dec.symbol(&mut cdfs.tx_size_cat3[ctx])
+        let d = dec.symbol(&mut cdfs.tx_size_cat3[ctx]);
+        if std::env::var_os("EC_TRACE_MODE_STEP").is_some() {
+            eprintln!(
+                "EC_ISTEP mi_row={mi_r} mi_col={mi_c} name=tx_depth val={d} ctx={ctx} cat=3 rng={}",
+                dec.debug_state().0
+            );
+        }
+        d
     } else {
         0
     };
