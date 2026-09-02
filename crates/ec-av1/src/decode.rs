@@ -21184,10 +21184,11 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
             // instead of silently decoding as SPLIT and desyncing.
             let part64 = match (has_cols, has_rows) {
                 (true, true) => {
+                    let pre_rng = dec.debug_state().0;
                     let p = dec.symbol(&mut cdfs.partition_w64[sb_ctx]);
                     if std::env::var_os("EC_AV1_TRACE").is_some() {
                         eprintln!(
-                            "TRACE partition_w64 mi=({},{}) ctx={sb_ctx} value={p}",
+                            "TRACE partition_w64 mi=({},{}) ctx={sb_ctx} value={p} rng={pre_rng}",
                             sb_r * SB_MI,
                             sb_c * SB_MI
                         );
