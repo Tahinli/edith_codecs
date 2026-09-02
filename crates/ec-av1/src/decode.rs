@@ -294,6 +294,32 @@ pub(crate) fn cdef_idx_hits() -> usize {
     CDEF_IDX_HITS.with(|c| c.get())
 }
 
+// lane-t900 r6: gate proof for the three r2-r4 root causes that shipped with no
+// counter -- the in-inter tx-depth context (`tx_size_context_txfm_rect`), the
+// non-chroma-reference block that must LEAVE its neighbours' chroma coefficient
+// contexts alone, and the intra-edge filter neighbour pair taken mi-exact
+// instead of from the coarse 16x16 cell.
+thread_local! {
+    static INTRA_IN_INTER_TXCTX_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static NON_CHROMA_REF_CTX_SKIP_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static EDGE_FILTER_MI_FIX_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`INTRA_IN_INTER_TXCTX_HITS`].
+pub(crate) fn intra_in_inter_txctx_hits() -> usize {
+    INTRA_IN_INTER_TXCTX_HITS.with(|c| c.get())
+}
+
+/// Current value of [`NON_CHROMA_REF_CTX_SKIP_HITS`].
+pub(crate) fn non_chroma_ref_ctx_skip_hits() -> usize {
+    NON_CHROMA_REF_CTX_SKIP_HITS.with(|c| c.get())
+}
+
+/// Current value of [`EDGE_FILTER_MI_FIX_HITS`].
+pub(crate) fn edge_filter_mi_fix_hits() -> usize {
+    EDGE_FILTER_MI_FIX_HITS.with(|c| c.get())
+}
+
 // lane-realworld r4: this frame's `delta.q_present` (spec 5.9.17) and its
 // actual step (`1 << delta.q_res`, already the real multiplier, not the raw
 // 2-bit field). `false`/`1` (the defaults) make [`maybe_read_delta_q`] a
@@ -7698,8 +7724,11 @@ fn decode_intra_rect_in_inter(
     // (`mi[-mi_stride]` / `mi[-1]`) -- take the mi-exact pair over the coarse
     // one exactly as [`decode_leaf8`] already does (class
     // context-read-from-one-cell).
-    let (nb_above_mode, nb_left_mode) =
-        neighbours.modes_above_left_mi(mi_r, mi_c, neighbours.modes_above_left(r, c));
+    let coarse_pair = neighbours.modes_above_left(r, c);
+    let (nb_above_mode, nb_left_mode) = neighbours.modes_above_left_mi(mi_r, mi_c, coarse_pair);
+    if (nb_above_mode, nb_left_mode) != coarse_pair {
+        EDGE_FILTER_MI_FIX_HITS.with(|c| c.set(c.get() + 1));
+    }
     let smooth_neighbor = is_smooth_mode(nb_above_mode) || is_smooth_mode(nb_left_mode);
     if smooth_neighbor {
         SMOOTH_LUMA_HITS.with(|h| h.set(h.get() + 1));
@@ -13685,6 +13714,7 @@ fn tx_size_context_txfm_rect(
     own_w: usize,
     own_h: usize,
 ) -> usize {
+    INTRA_IN_INTER_TXCTX_HITS.with(|c| c.set(c.get() + 1));
     let has_above = mi_r > n.tile_row0_mi;
     let has_left = mi_c > n.tile_col0_mi;
     let mut above = usize::from(n.above_txfm[mi_c]) >= own_w;
@@ -22418,9 +22448,21 @@ fn decode_inter_block(
         // witness is a capability claim (class `refusal-lifted-without-a-gate`),
         // so the decode path stays behind `EC_INTRA16X4_DECODE` for the round
         // that finds a witness.
+        //
+        // lane-t900 r6: THAT WITNESS EXISTS, so `EC_INTRA16X4_DECODE` is gone
+        // and the refusal is narrowed back to "no chroma-pair record". The
+        // witness is a REAL 10-bit 1920x792 128-superblock film stream, not an
+        // aomenc recipe: `fixtures/troy_sb128_inter_witness.obu` (166303 bytes,
+        // 19 frame-carrying OBUs, 14 decode-order frames) decodes all 14
+        // decode-order frames byte-exact against instrumented aomdec
+        // (`EC_AV1_FINAL_DUMP`) and all 12 shown frames pixel-exact against
+        // ffmpeg, while this arm fires 78x 16x4 + 149x 4x16 (108 of them
+        // chroma-paired). Unlike lane-sub8x4 r3's phantom (class
+        // `counter-from-refused-stream`) every one of those hits lies inside a
+        // frame that was decoded AND compared exact. Gate
+        // `a_10bit_128sb_film_frames_with_warp_cdef_and_interintra_decode_pixel_exact`.
         let strip16 = strip_chroma
             .filter(|_| write_w.min(write_h) == 4 && write_w.max(write_h) == 16)
-            .filter(|_| std::env::var_os("EC_INTRA16X4_DECODE").is_some())
             .map(|s| (s.horz, s.has_chroma));
         if write_w.min(write_h) < 8 && strip16.is_none() {
             if std::env::var_os("EC_INTRA16X4").is_some() {
@@ -23013,6 +23055,7 @@ fn decode_inter_block(
     // equivalent to not writing them, without threading a flag through both
     // recorders.
     let saved_chroma_ctx = (!has_chroma).then(|| {
+        NON_CHROMA_REF_CTX_SKIP_HITS.with(|c| c.set(c.get() + 1));
         let (w_mi, h_mi) = (write_w / MI, write_h / MI);
         let left: Vec<[Neighbour; 2]> = (0..h_mi)
             .filter_map(|k| neighbours.left.get(at.0 + k).map(|s| [s[1], s[2]]))
