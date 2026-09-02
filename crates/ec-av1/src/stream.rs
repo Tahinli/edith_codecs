@@ -5393,6 +5393,67 @@ mod tests {
         intra_rect4_in_inter_gate(10);
     }
 
+    /// lane-intra14 r4: the FILM witness for an intra block on a 1:4 partition
+    /// inside an INTER frame -- `crates/ec-av1/fixtures/hg_intra14_witness.obu`,
+    /// 163057 bytes, sha256
+    /// `0eff603bf1608e47faf5e6729670c4c77cf5c674dbad3a1533ac6660151fd90e`,
+    /// two decode-order frames (key + first inter) cut from two INDEPENDENT
+    /// `ffmpeg -ss 90 -t 2 -i <3840x1608 10-bit AV1 HDR10 mkv> -c:v copy -f obu`
+    /// runs that hashed identically.
+    ///
+    /// MEASURED (r4, 27 two-second segments of that film at ss 0..6000, probe
+    /// logs in the report): no aomenc recipe reaches this shape and only ONE
+    /// class of stream does -- the film's own inter frames. Decode-order frame
+    /// 1 of this fixture codes 3 intra 16x64 strips (`intra_rect4_in_inter`
+    /// 16x64=3, zero when the fixture is truncated to the key frame alone), so
+    /// the counter attribution is pinned to that frame.
+    ///
+    /// It is `#[ignore]`d for exactly ONE reason, and not this lane's shape:
+    /// that same frame stops at a SIBLING refusal, "a split intra strip whose
+    /// transform unit is 64x32 (no luma coefficient tables for that shape
+    /// here)". The moment TX_64X32/TX_32X64 luma coefficient tables land, drop
+    /// the `#[ignore]` -- everything else this gate needs (the reader, the
+    /// counter, the two-frame pixel compare) is in place and runs.
+    #[test]
+    #[ignore = "blocked on a SIBLING refusal, not on this lane: the film frame that carries the intra 1:4 strips (16x64=3) stops at \"a split intra strip whose transform unit is 64x32 (no luma coefficient tables for that shape here)\" -- un-ignore when the 64x32/32x64 luma coefficient tables land"]
+    fn a_10bit_film_inter_frame_with_intra_1to4_strips_decodes_pixel_exact() {
+        const NAME: &str = "a_10bit_film_inter_frame_with_intra_1to4_strips_decodes_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/hg_intra14_witness.obu");
+        let stream = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path.display()));
+        let (width, height) = (3840usize, 1608usize);
+        let before = intra_rect4_in_inter_counters();
+        let frames = match decode_stream(&stream) {
+            Ok(frames) => frames,
+            Err(e) => panic!("{NAME}: decode_stream refused: {e}"),
+        };
+        let now = intra_rect4_in_inter_counters();
+        let fired = (now.0 - before.0) + (now.1 - before.1) + (now.2 - before.2) + (now.3 - before.3);
+        assert!(
+            fired > 0,
+            "{NAME}: zero intra 1:4 strips in an inter frame (64x16/16x64/32x8/8x32 = \
+             {}/{}/{}/{}) -- the fixture stopped carrying the shape this gate exists for",
+            now.0 - before.0,
+            now.1 - before.1,
+            now.2 - before.2,
+            now.3 - before.3
+        );
+        assert_eq!(frames.len(), 2, "{NAME}: key frame + one inter frame");
+        assert_eq!((frames[0].width, frames[0].height), (width, height));
+        let ffmpeg_frames = ffmpeg_decode_sequence_10bit(&stream, width, height, frames.len());
+        for (i, (ours, theirs)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+            assert_eq!(ours.y, theirs.y, "{NAME}: frame {i} luma vs ffmpeg");
+            assert_eq!(ours.u, theirs.u, "{NAME}: frame {i} U vs ffmpeg");
+            assert_eq!(ours.v, theirs.v, "{NAME}: frame {i} V vs ffmpeg");
+        }
+        eprintln!("{NAME}: {fired} intra 1:4 strips in an inter frame, both frames pixel-exact");
+    }
+
     fn intra_rect4_in_inter_gate(bit_depth: u32) {
         const NAME: &str =
             "a_real_aomenc_inter_sequence_with_an_intra_1to4_strip_decodes_pixel_exact";
