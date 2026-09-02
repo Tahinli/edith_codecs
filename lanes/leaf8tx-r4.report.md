@@ -40,3 +40,39 @@ EC_NOMEMGUARD=1 EC_AV1_REQUIRE_AOMENC=1 CARGO_TARGET_DIR=$HOME/.cache/cargo-targ
 
 EVIDENCE: $HOME/.cache/leaf8tx-r4-step23.log | 30 aomenc arms x 2 bit depths, every decode-order frame compared on Y/U/V vs ffmpeg | `tx_split_angle_in_inter8_gate(8): buckets counted-exact=29 uncounted-exact=1 named-refusals=0 (attempts 30)`, `tx_split_angle_in_inter8_gate(10): counted-exact=30 uncounted-exact=0 named-refusals=0 (attempts 30)`, 0 pixel mismatches
 EVIDENCE: $HOME/.cache/leaf8tx-r4-step23.log | same run, split-leaf hit counter per arm | e.g. `(10) seed=43 --cq-level=19: 8x8 intra-in-inter leaves with tx_depth=1 315, nonzero angle_delta_y 124` -- the counter fires in the hundreds on decoded+compared attempts (it was 0 on every arm of the pre-r4 recipe)
+
+## Step 3 (by name, same 16-test run above): ALL OK
+`cdef_and_sub16` (r2's continue-and-sweep conversion, never run before) ok; all 7
+`gate_coverage` tests ok; `refusal_inventory::the_decode_path_refuses_exactly_the_listed_cases`
+ok (after dropping the two stale strings); `an_obmc_neighbour_with_no_recorded_filter_refuses_instead_of_panicking`
+ok (after the test's expected string was aligned with main's refusal text -- it had been failing
+since the r2 merge, i.e. NOT caused by this round's decode change).
+Coordinator's ask: `a_real_aomenc_inter_sequence_with_a_split_transform_intra_block_decodes_pixel_exact`
+and its `10bit_` twin both **ok** on this tree (full-suite log below) -- lane-mergefix's
+independent `tx_size_context_txfm` fix agrees with r3's `d226074`.
+
+## Full suite
+`systemd-run --user --unit=leaf8tx-suite-r4-... -p MemoryMax=10G` ->
+`test result: FAILED. 404 passed; 1 failed; 34 ignored; 0 measured; 0 filtered out; finished in 683.00s`
+(log `$HOME/.cache/leaf8tx-suite-r4.log`). Baseline for comparison, PRE-lift on the same tree
+(`$HOME/.cache/leaf8tx-suite-r3base.log`): `403 passed; 2 failed` -- the two r2-merge failures
+above, both now green.
+
+FAILED: `stream::tests::a_frame_edge_straddling_band_decodes_pixel_exact`
+```
+68x192 cq61 frames=5 10bit=false tile_cols=1 frame 1 plane Y: 2248 pixels differ,
+first at row 56 col 50 (ours 117 vs ffmpeg 118) [edge32=[0, 34, 0, 0, 1, 17, 0, 1]]
+```
+This is the lift's cross-product, class [[refusal-hides-a-defect]] and exactly what that gate's
+own doc comment (stream.rs:21573) predicted: its multi-tile arms were 32/32 refused BY NAME,
+the census listing `6x "an 8x8 intra leaf in an inter frame whose tx_depth splits it into 4x4
+transform units"`. With that refusal gone those arms decode for the first time and one of them
+mismatches -- a defect the refusal was hiding, not a regression of the split-leaf path (the
+leaf8tx gate itself is pixel-exact on 60/60 arms, and the two split-transform-intra-block gates
+are green).
+
+Disposition: deferred(a round scoped to the CDEF frame-edge straddle x multi-tile x 8x8-split-leaf
+cross-product; start by bisecting whether the 2248-pixel luma delta is CDEF filtering or the
+entropy state of the newly decoded split leaves in that arm) -- not fix-now here: found at
+T-30min of a 60-minute round, after the commit that lifts the refusal. It must NOT be closed by
+re-adding the refusal.
