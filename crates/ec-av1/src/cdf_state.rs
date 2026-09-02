@@ -267,6 +267,8 @@ pub(crate) struct TxbTables<'a> {
 #[derive(Clone)]
 pub(crate) struct Cdfs {
     /// The partition symbol of a 64x64 superblock.
+    /// `partition_cdf`'s `BLOCK_128X128` rows (8 symbols).
+    pub partition_w128: [[u16; 9]; 4],
     pub partition_w64: [[u16; 11]; 4],
     /// The partition symbol of a 32x32 block.
     pub partition_w32: [[u16; 11]; 4],
@@ -737,6 +739,7 @@ impl Cdfs {
     /// into a reference slot for cross-frame forwarding; never on a table
     /// still being read within the same tile.
     pub(crate) fn reset_counts(&mut self) {
+        reset2(&mut self.partition_w128);
         reset2(&mut self.partition_w64);
         reset2(&mut self.partition_w32);
         reset2(&mut self.txfm_partition);
@@ -902,6 +905,7 @@ impl Cdfs {
     /// quantizer, so they are the same for every `q_ctx`.
     pub fn new(q_ctx: usize) -> Cdfs {
         Cdfs {
+            partition_w128: cdf::PARTITION_W128,
             partition_w64: cdf::PARTITION_W64,
             partition_w32: cdf::PARTITION_W32,
             skip: cdf::SKIP,
