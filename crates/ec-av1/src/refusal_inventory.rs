@@ -80,8 +80,6 @@ const REFUSALS: &[&str] = &[
     // r2 residue: `vartx_leaves` is a list of SQUARE units, and
     // `sub_tx_size_map[TX_16X4]` is the rectangular TX_8X4 -- the split tree
     // and its per-unit residual reader both need rect leaves.
-    "a COMPOUND_WEDGE mask on a rectangular inter block (the wedge codebook is square-only)",
-    "a wedge interintra mask on a rectangular inter block (the wedge codebook is square-only)",
     // r2 residue: `decode_intra_rect_in_inter` codes chroma at the strip's own
     // halved footprint, which for a 16x4 strip is an 8x2 transform libaom
     // never wrote (its chroma is the PAIR's 8x4, coded by the odd strip).

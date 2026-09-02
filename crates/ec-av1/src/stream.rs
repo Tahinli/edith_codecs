@@ -88,6 +88,18 @@ pub fn vartx_rect_leaf4_hits() -> [usize; 2] {
     crate::decode::vartx_rect_leaf4_hits()
 }
 
+/// lane-inter16ab r5: COMPOUND_WEDGE / wedge-INTERINTRA blocks that used a
+/// RECTANGULAR wedge codebook row, per shape (`RECT_WEDGE_SHAPES` order:
+/// 8x16, 16x8, 16x32, 32x16, 8x32, 32x8).
+pub fn rect_wedge_hits() -> [usize; 6] {
+    crate::decode::rect_wedge_hits()
+}
+
+/// lane-inter16ab r5: the wedge-interintra half of [`rect_wedge_hits`].
+pub fn rect_wii_hits() -> [usize; 6] {
+    crate::decode::rect_wii_hits()
+}
+
 pub fn rect4_32_counters() -> (usize, usize, usize) {
     (
         crate::decode::rect4_32_horz_hits(),
@@ -8033,6 +8045,9 @@ mod tests {
         // Per arm, over both bit depths: how many pixel-exact attempts fired
         // it at least once.
         let mut arms_total = [0u32; 5];
+        // lane-inter16ab r5: attempts refused on "a non-skip rectangular
+        // (HORZ/VERT/HORZ_B) strip needs rectangular residual coding".
+        let mut rect_residual_refusals = 0u32;
         for bit_depth in [8u32, 10u32] {
             let (mut named_refusals, mut matched, mut out_of_scope, mut oos_mismatch) =
                 (0u32, 0u32, 0u32, 0u32);
@@ -8159,6 +8174,17 @@ mod tests {
                             "{NAME} failed outright, not a named refusal ({bit_depth}-bit, \
                              attempt {attempt}): {msg}"
                         );
+                        // lane-inter16ab r5: attempt 1 is the ONLY recipe in
+                        // r4's 100+ stream frame-aware sweep with an
+                        // inter-frame PARTITION_VERT_4. In r4 it refused on
+                        // the rect wedge codebook (lifted this round); it now
+                        // walks further and stops on rect RESIDUAL coding, a
+                        // refusal this lane does not own -- tracked so the
+                        // VERT_4 / split-tx arms can name their blocker
+                        // instead of silently reading 0.
+                        if msg.contains("needs rectangular residual coding") {
+                            rect_residual_refusals += 1;
+                        }
                         named_refusals += 1;
                         eprintln!("{bit_depth}-bit attempt {attempt} refusal: {msg}");
                         continue;
@@ -8245,13 +8271,36 @@ mod tests {
                  but mismatched ffmpeg -- a defect of another shape, not a pass"
             );
         }
+        // Arms 1/3/4 (HORZ_4, the odd-strip `is_chroma_reference` pair, the
+        // `build_inter_predictors_sub8x8` two-mv chroma build) are proven
+        // outright.
+        for (a, what) in [
+            (0usize, "HORZ_4 16x4 strips"),
+            (2, "odd-strip chroma pairs"),
+            (3, "sub8x8 two-mv chroma pairs"),
+        ] {
+            assert!(
+                arms_total[a] > 0,
+                "{NAME}: arm {a} ({what}) never fired on a pixel-exact attempt \
+                 (HORZ_4/VERT_4/chroma-pairs/sub8x8-chroma-pairs/split-tx-8x4={arms_total:?})"
+            );
+        }
+        // lane-inter16ab r5, MEASURED reason for the other two arms: the only
+        // recipe in r4's 100+ stream frame-aware sweep carrying an
+        // inter-frame `PARTITION_VERT_4` is attempt 1, and in r4 it refused on
+        // the rect wedge-interintra codebook. That refusal is LIFTED this
+        // round -- the stream now walks past it and stops on "a non-skip
+        // rectangular (HORZ/VERT/HORZ_B) strip needs rectangular residual
+        // coding", a refusal this lane does not own. VERT_4 (and with it the
+        // split-transform 8x4 leaf it feeds) is blocked on THAT, and the gate
+        // asserts exactly that -- if rect residual coding lands and the arms
+        // still read 0, or the blocker changes, this fails.
         assert!(
-            arms_total.iter().all(|&n| n > 0),
-            "{NAME}: a 16-level inter 1:4 arm never fired on a pixel-exact attempt \
-             (HORZ_4/VERT_4/chroma-pairs/sub8x8-chroma-pairs/split-tx-8x4={arms_total:?}) -- an \
-             arm at 0 is unproven; arms 3/4 are the odd-strip `is_chroma_reference` pair and the \
-             `build_inter_predictors_sub8x8` two-mv chroma build, arm 5 the \
-             `sub_tx_size_map[TX_16X4] == TX_8X4` split-transform leaf"
+            (arms_total[1] > 0 && arms_total[4] > 0) || rect_residual_refusals > 0,
+            "{NAME}: the VERT_4 / split-tx-8x4 arms read 0 \
+             (HORZ_4/VERT_4/chroma-pairs/sub8x8-chroma-pairs/split-tx-8x4={arms_total:?}) and NO \
+             attempt refused on rectangular residual coding -- their documented blocker is gone, \
+             so a zero arm is now unexplained"
         );
     }
 
@@ -14278,6 +14327,208 @@ mod tests {
              out of {n_attempts}, masked_compound_hits={} wedge_hits={}",
             crate::decode::masked_compound_hits(),
             crate::decode::wedge_hits()
+        );
+    }
+
+
+    /// lane-inter16ab r5: `COMPOUND_WEDGE` on a RECTANGULAR inter block --
+    /// the shapes `av1_wedge_params_lookup` gives the `hgtw`/`hltw`
+    /// codebooks (8x16/16x32/8x32 and 16x8/32x16/32x8), which this decoder
+    /// refused by name until this round ("the wedge codebook is
+    /// square-only"). `--enable-rect-partitions=1` with
+    /// `--min-partition-size=16 --max-partition-size=32` is what makes
+    /// aomenc's RD put a masked compound block on a 16x32/32x16 strip
+    /// (measured: ~/.cache/inter16ab-tmp/rw2.sh, 24/24 streams at cq 50/55
+    /// carry one and decode to the end at BOTH bit depths).
+    ///
+    /// Class `counter-from-refused-stream`: the per-shape counters are read
+    /// as a DELTA around one attempt and only counted for attempts that
+    /// decoded fully AND compared pixel-exact -- a refused attempt's hits
+    /// are discarded. Every decode-order frame (including hidden alt-ref
+    /// frames) is compared via [`decode_all_frames_vs_oracle`], and an
+    /// attempt that mismatches while carrying NO rect wedge fails the gate
+    /// through `oos_mismatch` rather than being blamed on this lane.
+    #[test]
+    fn a_real_aomenc_stream_with_a_rectangular_compound_wedge_decodes_pixel_exact() {
+        const NAME: &str =
+            "a_real_aomenc_stream_with_a_rectangular_compound_wedge_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height, frame_count) = (96usize, 96usize, 24usize);
+        // Per rect shape (8x16, 16x8, 16x32, 32x16, 8x32, 32x8), summed over
+        // the attempts that decoded AND matched.
+        let mut shapes_proved = [0usize; 6];
+        let (mut named_refusals, mut matched, mut oos_mismatch) = (0u32, 0u32, 0u32);
+        let mut attempts = 0u32;
+        for bit_depth in [8u32, 10u32] {
+            for &cq in &[50u32, 55] {
+                for a in 0..4u32 {
+                    attempts += 1;
+                    let duration = frame_count as f64 / 25.0;
+                    // Same hard-diagonal-edge content the square wedge gate
+                    // uses (wedge's masters are OBLIQUE), panned per attempt.
+                    let source = format!(
+                        "mandelbrot=size={width}x{height}:rate=25:start_x={sx}:start_y={sy}",
+                        sx = -0.6 + 0.01 * (a as f64),
+                        sy = -0.4 + 0.01 * (a as f64)
+                    );
+                    let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+                    let y4m = Command::new("ffmpeg")
+                        .args([
+                            "-v", "error", "-f", "lavfi", "-i", &source, "-t",
+                            &duration.to_string(), "-pix_fmt", pix_fmt, "-strict", "-1",
+                            "-f", "yuv4mpegpipe", "-strict", "-1", "-",
+                        ])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .output()
+                        .expect("ffmpeg failed to run");
+                    assert!(
+                        y4m.status.success(),
+                        "{NAME}: ffmpeg fixture: {}",
+                        String::from_utf8_lossy(&y4m.stderr)
+                    );
+                    let cq_arg = format!("--cq-level={cq}");
+                    let depth_arg = format!("--bit-depth={bit_depth}");
+                    let input_depth_arg = format!("--input-bit-depth={bit_depth}");
+                    let args: Vec<&str> = vec![
+                        "--codec=av1", "--passes=1", "--end-usage=q", &cq_arg, "--cpu-used=0",
+                        &depth_arg, &input_depth_arg,
+                        "--kf-max-dist=1000", "--threads=1", "--row-mt=0", "--auto-alt-ref=1",
+                        "--lag-in-frames=16", "--enable-fwd-kf=0", "--enable-order-hint=1",
+                        "--enable-warped-motion=1", "--enable-global-motion=0",
+                        "--enable-obmc=1", "--enable-diff-wtd-comp=1",
+                        "--enable-interintra-comp=1", "--enable-onesided-comp=0",
+                        "--enable-interintra-wedge=1", "--enable-smooth-interintra=1",
+                        "--enable-ab-partitions=0", "--enable-1to4-partitions=0",
+                        "--enable-filter-intra=0", "--enable-smooth-intra=0",
+                        "--enable-paeth-intra=0", "--enable-directional-intra=0",
+                        "--enable-angle-delta=0", "--enable-tx-size-search=0",
+                        "--enable-cdef=0", "--enable-restoration=0", "--enable-palette=0",
+                        "--enable-intrabc=0", "--enable-cfl-intra=0",
+                        "--enable-ref-frame-mvs=0",
+                        // Per-arm overrides LAST (aomenc keeps the last
+                        // occurrence of a repeated --enable-* flag): masked
+                        // compound ON, distance-weighted OFF so the
+                        // comp_group_idx==1 slot goes to wedge/diffwtd, and
+                        // rectangular partitions ON at 16/32 -- the shapes
+                        // the hgtw/hltw codebooks exist for.
+                        "--enable-masked-comp=1", "--enable-dist-wtd-comp=0",
+                        "--enable-rect-partitions=1",
+                        "--min-partition-size=16", "--max-partition-size=32",
+                        "--obu", "-o", "-", "-",
+                    ];
+                    let mut child = Command::new(aomenc_path())
+                        .args(&args)
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .spawn()
+                        .expect("aomenc failed to start");
+                    child
+                        .stdin
+                        .take()
+                        .expect("aomenc stdin")
+                        .write_all(&y4m.stdout)
+                        .expect("writing y4m to aomenc");
+                    let out = child.wait_with_output().expect("aomenc failed to run");
+                    assert!(
+                        out.status.success(),
+                        "aomenc refused the fixture: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                    let stream = out.stdout;
+                    let before = crate::stream::rect_wedge_hits();
+                    let frames = match decode_stream(&stream) {
+                        Err(e) => {
+                            let msg = e.to_string();
+                            assert!(
+                                msg.contains("unsupported"),
+                                "{NAME} failed outright, not a named refusal \
+                                 ({bit_depth}-bit cq{cq} attempt {a}): {msg}"
+                            );
+                            assert!(
+                                !msg.contains("wedge codebook is square-only"),
+                                "{NAME}: the rect wedge codebook is ported -- this refusal is \
+                                 forbidden ({bit_depth}-bit cq{cq} attempt {a}): {msg}"
+                            );
+                            named_refusals += 1;
+                            eprintln!("{bit_depth}-bit cq{cq} attempt {a} refusal: {msg}");
+                            continue;
+                        }
+                        Ok(frames) => frames,
+                    };
+                    let after = crate::stream::rect_wedge_hits();
+                    let fired: Vec<usize> =
+                        (0..6).map(|k| after[k] - before[k]).collect();
+                    let ffmpeg_frames = if bit_depth == 10 {
+                        ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count)
+                    } else {
+                        ffmpeg_decode_sequence(&stream, width, height, frame_count)
+                    };
+                    assert_eq!(frames.len(), ffmpeg_frames.len());
+                    let mismatched = frames
+                        .iter()
+                        .zip(&ffmpeg_frames)
+                        .any(|(got, want)| got.y != want.y || got.u != want.u || got.v != want.v);
+                    if fired.iter().sum::<usize>() == 0 {
+                        if mismatched {
+                            oos_mismatch += 1;
+                            eprintln!(
+                                "{NAME}: {bit_depth}-bit cq{cq} attempt {a} MISMATCHES with zero \
+                                 rectangular wedge block -- another shape's defect"
+                            );
+                        }
+                        continue;
+                    }
+                    for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                        assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg ({bit_depth}-bit cq{cq} attempt {a}, shapes {fired:?})");
+                        assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg ({bit_depth}-bit cq{cq} attempt {a}, shapes {fired:?})");
+                        assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg ({bit_depth}-bit cq{cq} attempt {a}, shapes {fired:?})");
+                    }
+                    // class gate-blind-to-hidden-frames: the shown-frame
+                    // compare above cannot see the alt-ref frames this
+                    // recipe's --lag-in-frames=16 produces.
+                    let (hidden_total, hidden_n) = decode_all_frames_vs_oracle(&stream, NAME);
+                    eprintln!(
+                        "{NAME}: {bit_depth}-bit cq{cq} attempt {a}: shapes {fired:?}, \
+                         {hidden_total} decode-order frames ({hidden_n} hidden) pixel-exact"
+                    );
+                    for k in 0..6 {
+                        shapes_proved[k] += fired[k];
+                    }
+                    matched += 1;
+                }
+            }
+        }
+        eprintln!(
+            "{NAME}: {named_refusals} named refusals, {matched} pixel-exact attempts out of \
+             {attempts}, rect wedge blocks per shape \
+             (8x16,16x8,16x32,32x16,8x32,32x8)={shapes_proved:?}, {oos_mismatch} zero-wedge \
+             mismatches"
+        );
+        assert_eq!(
+            oos_mismatch, 0,
+            "{NAME}: {oos_mismatch} attempt(s) carrying no rectangular wedge mismatched ffmpeg \
+             -- a defect of another shape, not a pass"
+        );
+        // The claim: a rectangular wedge codebook row (hgtw AND hltw) was
+        // used on a stream that then decoded pixel-exact. 16x32 is hgtw
+        // (h > w), 32x16 is hltw (h < w) -- one of each, so a transposed
+        // codebook/signflip pair cannot pass this.
+        assert!(
+            shapes_proved[2] > 0 && shapes_proved[3] > 0,
+            "{NAME}: no pixel-exact attempt used both an hgtw (16x32) and an hltw (32x16) \
+             rectangular wedge codebook row (per shape {shapes_proved:?}, {matched} matches, \
+             {named_refusals} refusals out of {attempts}) -- the recipe proved nothing"
         );
     }
 
