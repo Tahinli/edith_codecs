@@ -47,8 +47,8 @@ fn main() {
         println!("sub8_inter_rect: horz8x4={h84} vert4x8={h48}");
         let si = ec_av1::stream::sub8_intra_rect_hits();
         println!(
-            "sub8_intra_rect: horz8x4={} vert4x8={} chroma_ref={} mixed={}",
-            si.0, si.1, si.2, si.3
+            "sub8_intra_rect: horz8x4={} vert4x8={} chroma_ref={} mixed={} split4x4={}",
+            si.0, si.1, si.2, si.3, si.4
         );
         let leaf = ec_av1::stream::vartx_rect_leaf_hits();
         println!("vartx_rect_leaf: 32x16={} 16x32={}", leaf[0], leaf[1]);
