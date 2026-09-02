@@ -27267,6 +27267,15 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                     if i > 0 && (at_mi.0 >= mi_rows as usize || at_mi.1 >= mi_cols as usize) {
                         break;
                     }
+                    // Each half reads its OWN `cdef_idx` literal: libaom keeps
+                    // `cdef_transmitted[4]`, one flag per 64x64 CDEF unit of a
+                    // 128x128 superblock (`read_cdef`, decodemv.c:50-81), and
+                    // the two halves of a 128-root HORZ/VERT sit in different
+                    // units (index `col_in_sb != 0` + 2 * `row_in_sb != 0`).
+                    // The key-frame 128 loop already resets here; without it
+                    // the second half skipped a `cdef_bits`-wide literal that
+                    // libaom reads, desyncing the tile at that block.
+                    CDEF_TRANSMITTED.with(|c| c.set(false));
                     inter_piece!(
                         at_mi, SB * 2,
                         TxbSet::Luma64, TxbSet::Luma64, TxbSet::Chroma32, TX32, TX32,
