@@ -4319,6 +4319,15 @@ impl Neighbours {
             self.sub8_mode_col[i] = (usize::MAX, 0);
             self.uv_mode_col[i] = (usize::MAX, 0);
         }
+        // lane-inter16ab r7: `av1_zero_above_context` memsets the txfm row over
+        // the TILE's own mi column span back to `tx_size_wide[TX_SIZES_LARGEST]`
+        // (av1_common_int.h:1624) -- without this the band kept the previous
+        // frame's transform widths and `txfm_partition_context` read ctx 13
+        // where libaom reads 12.
+        let tend = col1_mi.min(self.above_txfm.len());
+        for i in col0_mi.min(tend)..tend {
+            self.above_txfm[i] = TXFM_CTX_INIT;
+        }
     }
 
     /// Writes a just-decoded block's own palette-Y size/colours (`size == 0`
@@ -4706,6 +4715,11 @@ impl Neighbours {
         self.left_palette_colors.iter_mut().for_each(|c| *c = [0u16; 8]);
         self.left_palette_uv_size.iter_mut().for_each(|s| *s = 0);
         self.left_palette_uv_colors.iter_mut().for_each(|c| *c = [0u16; 8]);
+        // lane-inter16ab r7: `av1_zero_left_context` (decodeframe.c:2788/3230,
+        // once per superblock row) memsets the left txfm band to
+        // `tx_size_high[TX_SIZES_LARGEST]`, not zero and not "whatever the last
+        // frame left there".
+        self.left_txfm.iter_mut().for_each(|t| *t = TXFM_CTX_INIT);
     }
 
     /// Records a block's `skip`/`is_inter`/`interp_filter` state for the next
@@ -12272,10 +12286,12 @@ fn read_var_tx_size(
     if std::env::var_os("EC_TRACE_MODE_STEP").is_some() {
         let (rng, _) = dec.debug_state();
         eprintln!(
-            "EC_ISTEP mi_row={} mi_col={} name=txfm_split val={} ctx={ctx} rng={rng}",
+            "EC_ISTEP mi_row={} mi_col={} name=txfm_split val={} ctx={ctx} above_px={} left_px={} rng={rng}",
             unit.0,
             unit.1,
-            u8::from(split)
+            u8::from(split),
+            n.above_txfm[unit.1],
+            n.left_txfm[unit.0]
         );
     }
     if !split {
@@ -17905,14 +17921,11 @@ fn decode_inter_block(
                 if let Some(wedge_bsize) = wedge_bsize.filter(|_| compound_type == 0) {
                     // COMPOUND_WEDGE: lane-wedge r3, codebook checksum-
                     // verified vs independent C dump (wedge.rs).
-                    if write_w != write_h {
-                        // lane-intersub8 r4: the wedge codebook here is built
-                        // per SQUARE side only; a rect block's own codebook
-                        // (BLOCK_16X8 etc.) is a different mask set.
-                        return Err(unsupported(
-                            "a COMPOUND_WEDGE mask on a non-square inter block (rect wedge codebook unimplemented)",
-                        ));
-                    }
+                    // lane-inter16ab r7 (merge cross-product): lane-intersub8
+                    // r4 refused a rect wedge here because ITS branch had no
+                    // rect codebook; this branch's r5 built one
+                    // (`wedge::codebook(w, h)`, hgtw/hltw rows), so the refusal
+                    // would shadow live code. Removed with the inventory line.
                     let wedge_index = dec.symbol(&mut cdfs.wedge_idx[wedge_bsize]);
                     let wedge_sign = dec.literal(1);
                     WEDGE_HITS.with(|c| c.set(c.get() + 1));
