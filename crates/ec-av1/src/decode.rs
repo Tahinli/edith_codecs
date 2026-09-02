@@ -2193,6 +2193,17 @@ thread_local! {
     static RECT4_16_CHROMA_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static RECT4_16_COEFF_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static RECT4_16_SPLIT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// lane-kf1200: pairs whose chroma edge-filter type read from the PAIR's
+    /// base mi differs from what the strip's own (odd) mi would have said --
+    /// the shape that made 4 chroma samples of the Hunger Games `-ss 1200`
+    /// key frame miss by 1. Zero here means a gate never exercised the fix.
+    static RECT4_16_UV_PAIR_FILT_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many 16x4/4x16 chroma pairs took a different `intra_edge_filter_type`
+/// from the pair's base mi than the strip's own mi would have given.
+pub fn rect4_16_uv_pair_filt_hits() -> usize {
+    RECT4_16_UV_PAIR_FILT_HITS.with(|c| c.get())
 }
 
 /// Current values of the 16x16-level 1:4 counters: `(16x4 strips, 4x16
@@ -7680,7 +7691,22 @@ fn decode_rect4_16(
             let (cw, ch) = (pw / 2, ph / 2);
             let uv_predict_mode = if uv_mode == UV_CFL_PRED { DC_PRED } else { uv_mode };
             let pair_reach = Reach::of_rect(pw, ph, ppx, ppy, y.width, y.height);
-            let smooth_neighbor_uv = neighbours.smooth_uv_neighbour(lmi.0, lmi.1, r, c);
+            // lane-kf1200 r1: the chroma edge-filter type reads the neighbours
+            // of the CHROMA block, which for a 16x4/4x16 pair is `pair_mi`'s
+            // 16x8/8x16 region -- libaom builds `chroma_above_mbmi`/
+            // `chroma_left_mbmi` from `mi[-((mi_row & ss_y) * stride + (mi_col
+            // & ss_x))]` (`set_mi_offsets`, av1/common/blockd.h ~1050), i.e.
+            // the pair's top-left luma mi, never this leaf's odd row/column.
+            // Reading `lmi` here named the leaf directly above (a non-chroma
+            // -reference 4-row block, `uv_mode == UV_DC_PRED`) and so lost a
+            // SMOOTH neighbour: filt_type 0 instead of 1 turned
+            // `av1_use_intra_edge_upsample` on (blk_wh 12 <= 16) for a
+            // directional chroma strip, moving 4 samples by 1.
+            let smooth_neighbor_uv =
+                neighbours.smooth_uv_neighbour(pair_mi.0, pair_mi.1, r, c);
+            if smooth_neighbor_uv != neighbours.smooth_uv_neighbour(lmi.0, lmi.1, r, c) {
+                RECT4_16_UV_PAIR_FILT_HITS.with(|h| h.set(h.get() + 1));
+            }
             let (u_levels, v_levels) = if skip {
                 let zeros = vec![0i32; cw * ch];
                 for (buf, _plane) in [(&mut *u, 1usize), (&mut *v, 2)] {
