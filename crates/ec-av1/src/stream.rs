@@ -2974,10 +2974,30 @@ mod tests {
             "--enable-1to4-partitions=1",
             "--min-partition-size=8",
         ];
-        let arms: [(&str, String, &[&str]); 3] = [
+        // lane-kf900 r6: arms 3-4 are the palette + `--enable-tx-size-search=1`
+        // shape whose neighbour palette lookup was SUB-granular -- a 16x8 strip
+        // pair shares one 16px cell, so strip 1 read strip 0's palette size and
+        // the colour cache came out short. Both were whole-frame wrong before
+        // the mi-granular fix (`$HOME/.cache/kf900-r6/sweep.log`: smptebars
+        // cq40/cq55 txs=1 pal=1 = DIFF).
+        let screen_txs: &[&str] = &[
+            "--tune-content=screen",
+            "--enable-palette=1",
+            "--enable-1to4-partitions=1",
+            "--min-partition-size=8",
+            "--max-partition-size=32",
+            "--sb-size=64",
+            "--enable-intrabc=1",
+            "--enable-tx-size-search=1",
+        ];
+        let cq40: Vec<&str> = screen_txs.iter().copied().chain(["--cq-level=40"]).collect();
+        let cq55: Vec<&str> = screen_txs.iter().copied().chain(["--cq-level=55"]).collect();
+        let arms: [(&str, String, &[&str]); 5] = [
             ("testsrc2-pinned", "testsrc2=s=256x192:r=25".to_string(), &[]),
             ("testsrc2-screen", "testsrc2=s=256x192:r=25".to_string(), screen),
             ("smptebars-screen", "smptebars=size=256x192:rate=25".to_string(), screen),
+            ("smptebars-screen-txs-cq40", "smptebars=size=256x192:rate=25".to_string(), &cq40),
+            ("smptebars-screen-txs-cq55", "smptebars=size=256x192:rate=25".to_string(), &cq55),
         ];
         let (mut fired_arms, mut out_of_scope, mut out_of_scope_mismatch) = (0u32, 0u32, 0u32);
         let mut refused = 0u32;
