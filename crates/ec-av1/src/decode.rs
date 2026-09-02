@@ -2442,6 +2442,19 @@ pub(crate) fn intra_rect_in_inter_split_tx_hits() -> [usize; 3] {
     INTRA_RECT_IN_INTER_SPLIT_TX_HITS.with(std::cell::Cell::get)
 }
 
+// lane-midcut r2: rect intra blocks inside an inter frame whose `tx_depth` CDF
+// ROW moved when libaom's inter-neighbour override was applied -- i.e. exactly
+// the blocks the key frame's deblock-grid approximation used to mis-read.
+thread_local! {
+    static INTRA_RECT_IN_INTER_TXCTX_OVERRIDE_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`INTRA_RECT_IN_INTER_TXCTX_OVERRIDE_HITS`].
+pub(crate) fn intra_rect_in_inter_txctx_override_hits() -> usize {
+    INTRA_RECT_IN_INTER_TXCTX_OVERRIDE_HITS.with(std::cell::Cell::get)
+}
+
 // lane-intra14 r1: how many intra-coded 1:4 strips decoded on the INTER
 // block path, per shape -- [0] 64x16, [1] 16x64, [2] 32x8, [3] 8x32. Every
 // one of them was the named refusal "an intra-coded 1:4 (or other non-2:1)
@@ -13804,12 +13817,26 @@ fn tx_size_context_txfm_rect(
             n.left_side_mi[mi_r],
         );
     }
-    match (has_above, has_left) {
+    let ctx = match (has_above, has_left) {
         (true, true) => usize::from(above) + usize::from(left),
         (true, false) => usize::from(above),
         (false, true) => usize::from(left),
         (false, false) => 0,
+    };
+    // lane-midcut r3: count only the blocks the KEY FRAME deblock-grid
+    // approximation ([`tx_size_context_rect`]) would have read off a DIFFERENT
+    // CDF row, i.e. exactly the blocks this band read fixes -- a plain "rect
+    // intra in an inter frame" tally is green on the buggy code too (class
+    // gate-blind-to-feature).
+    if INTRA_IN_INTER_MODE.with(std::cell::Cell::get).is_some() {
+        let (cw, ch) = (own_w.min(64), own_h.min(64));
+        let stale = usize::from(has_above && tx_px_at(n, false, mi_r - 1, mi_c) as usize >= cw)
+            + usize::from(has_left && tx_h_px_at(n, false, mi_r, mi_c - 1) as usize >= ch);
+        if ctx != stale {
+            INTRA_RECT_IN_INTER_TXCTX_OVERRIDE_HITS.with(|c| c.set(c.get() + 1));
+        }
     }
+    ctx
 }
 
 /// lane-intrasplit r3: `above_inter`/`left_inter` are mi-granular bands (they
@@ -19939,6 +19966,11 @@ fn decode_inter_block(
         }
         _ => (write_w / 2, write_h / 2),
     };
+    // lane-midcut r3 (same rule as lane-t900 r5's `warp_plane_allowed`, one
+    // copy kept at the merge): `av1_init_warp_params` (libaom reconinter.c)
+    // bails per PLANE at `block_width < 8 || block_height < 8` -- on the
+    // block's own dims, never on the square prediction buffer this reader
+    // allocates.
     if std::env::var_os("EC_MC_TRACE").is_some() {
         eprintln!("EC_IB px={px} py={py} side={side} w={write_w} h={write_h}");
     }
