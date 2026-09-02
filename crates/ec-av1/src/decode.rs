@@ -1784,6 +1784,24 @@ pub(crate) fn mode_mi_override_hits() -> usize {
     MODE_MI_OVERRIDE_HITS.with(|c| c.get())
 }
 
+// lane-modectx r1: how many times a `kf_y_mode`/`y_mode` neighbour read at a
+// TILE edge found its coarse fallback band holding a NON-DC mode -- i.e. a
+// mode from the previous tile, where libaom's `up_available`/`left_available`
+// make the neighbour DC_PRED. Measured 0 over 20 two-tile-column streams:
+// `above_mode` is cleared per tile in `Neighbours::start_tile` and `left_mode`
+// per superblock row in `start_row`, so the luma fallback cannot leak the way
+// lane-mtfix's `above_uv_mode` one did. The gate asserts it stays 0 -- this is
+// the invariant that makes the coarse fallback safe.
+thread_local! {
+    static MODE_TILE_EDGE_COARSE_LEAKS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`MODE_TILE_EDGE_COARSE_LEAKS`].
+pub(crate) fn mode_tile_edge_coarse_leaks() -> usize {
+    MODE_TILE_EDGE_COARSE_LEAKS.with(|c| c.get())
+}
+
 // lane-cfl r1: how many times a chroma intra-edge filter-type read
 // (`get_filt_type`, libaom reconintra.c) took an above/left UV mode from the
 // mi-exact map that DIFFERS from its coarse 16x16 slot -- i.e. how often the
@@ -4346,12 +4364,28 @@ impl Neighbours {
         (above, left)
     }
 
+    /// lane-modectx r1: the coarse-[`SUB`]-grid entry point, now availability
+    /// correct. The mi-exact lookups already refuse to cross a tile edge, but
+    /// their FALLBACK (`above_mode`/`left_mode`) did not: `left_mode` is reset
+    /// per superblock row and never per tile, so the first block column of
+    /// tile 2..N read the previous tile's mode as its left neighbour, and the
+    /// above band survives across a tile ROW boundary the same way lane-mtfix's
+    /// `above_uv_mode` did. libaom reads `above_mbmi`/`left_mbmi` only when
+    /// `up_available`/`left_available` and uses DC_PRED otherwise
+    /// ([`Self::modes_above_left_mi`]).
     fn modes_above_left(&self, r: usize, c: usize) -> (usize, usize) {
         let (mi_r, mi_c) = (r * (SUB / MI), c * (SUB / MI));
-        let above = self.mode_above_mi(mi_r, mi_c).unwrap_or(self.above_mode[c]);
-        let left = self.mode_left_mi(mi_r, mi_c).unwrap_or(self.left_mode[r]);
+        let (above, left) =
+            self.modes_above_left_mi(mi_r, mi_c, (self.above_mode[c], self.left_mode[r]));
         if above != self.above_mode[c] || left != self.left_mode[r] {
             MODE_MI_OVERRIDE_HITS.with(|h| h.set(h.get() + 1));
+        }
+        // A neighbour the coarse band offered where the tile edge makes it
+        // unavailable -- must never happen (see `MODE_TILE_EDGE_COARSE_LEAKS`).
+        if (mi_r <= self.tile_row0_mi && self.above_mode[c] != DC_PRED)
+            || (mi_c <= self.tile_col0_mi && self.left_mode[r] != DC_PRED)
+        {
+            MODE_TILE_EDGE_COARSE_LEAKS.with(|h| h.set(h.get() + 1));
         }
         (above, left)
     }
@@ -8581,8 +8615,10 @@ fn decode_leaf8(
     reduced_tx_set: bool,
 ) -> Result<usize> {
     let (r, c) = outer_at;
-    let mut above_mode = neighbours.above_mode[c];
-    let mut left_mode = neighbours.left_mode[r];
+    // lane-modectx r1: the group's own availability-correct fallback pair, not
+    // the raw coarse bands (which leak across a tile edge -- see
+    // `modes_above_left`).
+    let (mut above_mode, mut left_mode) = neighbours.modes_above_left(r, c);
     if let Some(((pr, pc), pmode)) = prev_leaf {
         if pc == leaf_mi.1 && leaf_mi.0 == pr + 2 {
             above_mode = pmode;
@@ -9263,8 +9299,9 @@ fn decode_leaf_rect8(
     reduced_tx_set: bool,
 ) -> Result<(usize, usize)> {
     let (r, c) = outer_at;
-    let above_mode = neighbours.above_mode[c];
-    let left_mode = neighbours.left_mode[r];
+    // lane-modectx r1: availability-correct fallback pair (see
+    // `modes_above_left`), not the raw coarse bands.
+    let (above_mode, left_mode) = neighbours.modes_above_left(r, c);
     let smooth_neighbor_uv = neighbours.smooth_uv_neighbour(leaf_mi.0, leaf_mi.1, r, c);
     let (bw, bh) = if vert { (4, 8) } else { (8, 4) };
     let (w_mi, h_mi) = (bw / MI, bh / MI);
