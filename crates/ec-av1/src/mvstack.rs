@@ -1479,7 +1479,20 @@ fn process_compound_ref_mv_candidate(
 /// sign-flipped) entries, position-wise and independently per side, into up
 /// to two full `(mv0, mv1)` pair candidates — missing slots default to
 /// `(0, 0)`, matching libaom's zero-initialized `combined_mvs`.
-fn combine_compound_candidates(lists: &CompoundRefLists) -> [((i32, i32), (i32, i32)); 2] {
+fn combine_compound_candidates(
+    lists: &CompoundRefLists,
+    gm_mv_candidates: [(i32, i32); 2],
+) -> [((i32, i32), (i32, i32)); 2] {
+    // lane-sbrect10 r2: the tail slots libaom leaves after `ref_id` and
+    // `ref_diff` are filled with that side's GLOBAL MOTION vector, never with
+    // zero (`setup_ref_mv_list`, mvref_common.c:723-729:
+    // `for (; comp_idx < MAX_MV_REF_CANDIDATES; ++comp_idx)
+    //      comp_list[comp_idx][idx] = gm_mv_candidates[idx];`).
+    // Zero-filling was right only under IDENTITY global motion, which the
+    // module doc's original reduction assumed; aomenc turns global motion on
+    // by default, so a compound block with no usable neighbour pair took a
+    // (0, 0) predictor where libaom took the frame's translation -- silently
+    // wrong pixels with the entropy stream still in sync.
     let side_slots = |side: usize| -> [(i32, i32); 2] {
         let merged: Vec<(i32, i32)> = lists.ref_id[side]
             .iter()
@@ -1487,7 +1500,7 @@ fn combine_compound_candidates(lists: &CompoundRefLists) -> [((i32, i32), (i32, 
             .take(2)
             .copied()
             .collect();
-        std::array::from_fn(|i| merged.get(i).copied().unwrap_or((0, 0)))
+        std::array::from_fn(|i| merged.get(i).copied().unwrap_or(gm_mv_candidates[side]))
     };
     let side0 = side_slots(0);
     let side1 = side_slots(1);
@@ -1802,7 +1815,10 @@ pub fn find_mv_stack_compound(
         // bump) — otherwise append `comp_list[0]` as a brand-new entry. When
         // the stack is empty, both `comp_list[0]` and `comp_list[1]` are
         // appended unconditionally, with no dedup check at all.
-        let comp_list = combine_compound_candidates(&lists);
+        let comp_list = combine_compound_candidates(
+            &lists,
+            [gm_mv(gm, ref_frame.0), gm_mv(gm, ref_frame.1)],
+        );
         if candidates.len() == 1 {
             let (mv0, mv1) = if comp_list[0] == (candidates[0].mv0, candidates[0].mv1) {
                 comp_list[1]
@@ -2824,7 +2840,7 @@ mod tests {
         // side 1 has only one entry -> comp_idx 1 falls back to ref_diff.
         lists.ref_diff[1].push((4, 4));
 
-        let combined = combine_compound_candidates(&lists);
+        let combined = combine_compound_candidates(&lists, [(0, 0), (0, 0)]);
         assert_eq!(combined[0], ((1, 1), (3, 3)));
         assert_eq!(combined[1], ((2, 2), (4, 4)));
     }
