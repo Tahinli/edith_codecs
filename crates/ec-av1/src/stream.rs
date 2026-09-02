@@ -22942,22 +22942,36 @@ mod tests {
         // take the arm too, which is still refused by name (square-block
         // intra), so this gate's source is `mandelbrot`: its key frames split
         // and its inter frames keep the 128x64/64x128 edge block.
-        let arms: Vec<(u32, &str, usize, usize, bool, bool)> = vec![
-            (42, "--cq-level=55", 384, 320, false, false),
-            (43, "--cq-level=55", 384, 320, true, false),
-            (44, "--cq-level=32", 192, 256, false, true),
-            (45, "--cq-level=45", 192, 256, true, true),
+        // lane-vert46 r1: the last field picks a SMOOTH deterministic source
+        // (`geq` sinusoids, the sb128c r8 intra arm's own fixture) instead of
+        // `mandelbrot`. Arm 46 is the stream that exposed this round's two
+        // defects: mandelbrot's inter frames never put a 64x128 edge block
+        // next to a neighbour whose partition context or per-mu-chunk chroma
+        // DC sign decides a symbol, so both were invisible to arms 42-45.
+        let arms: Vec<(u32, &str, usize, usize, bool, bool, bool)> = vec![
+            (42, "--cq-level=55", 384, 320, false, false, false),
+            (43, "--cq-level=55", 384, 320, true, false, false),
+            (44, "--cq-level=32", 192, 256, false, true, false),
+            (45, "--cq-level=45", 192, 256, true, true, false),
+            (46, "--cq-level=55", 192, 256, false, true, true),
         ];
         let (mut matched, mut named_refusals) = (0u32, 0u32);
         let (mut edge_arms, mut inter_arms) = (0u32, 0u32);
-        for (seed, cq, width, height, ten_bit, vert) in arms {
+        for (seed, cq, width, height, ten_bit, vert, smooth) in arms {
             let pix = if ten_bit { "yuv420p10le" } else { "yuv420p" };
+            let source = if smooth {
+                format!(
+                    "nullsrc=size={width}x{height}:rate=25,format=yuv420p,\
+                     geq=lum='128+90*sin((X+2*N)/37)+30*sin(Y/29)':\
+                     cb='128+30*sin(X/23)':cr='128+30*sin((Y+N)/19)'"
+                )
+            } else {
+                format!("mandelbrot=size={width}x{height}:rate=25:start_x=-0.6:start_y=-0.4")
+            };
             let y4m = Command::new("ffmpeg")
                 .args([
                     "-v", "error", "-f", "lavfi", "-i",
-                    &format!(
-                        "mandelbrot=size={width}x{height}:rate=25:start_x=-0.6:start_y=-0.4"
-                    ),
+                    &source,
                     "-pix_fmt", pix, "-strict", "-1", "-t", "0.2",
                     "-f", "yuv4mpegpipe", "-",
                 ])

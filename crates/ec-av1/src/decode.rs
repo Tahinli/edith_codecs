@@ -18947,6 +18947,11 @@ fn decode_inter_block(
     // coefficient-context write-back and the loop-filter grid fill below.
     let mut vartx_leaves: Option<Vec<(usize, usize, usize, usize)>> = None;
     let at_mi = at;
+    // lane-vert46 r1: set when this block's chroma was coded as one 32x32 unit
+    // per 64x64 "mu" chunk (any side above 64), so the end-of-block record
+    // below must NOT re-stamp the chroma neighbour context from the assembled
+    // whole-block grid.
+    let mut mu_chroma = false;
     if is_inter {
         let above_nbr = has_above.then(|| NeighbourRef {
             is_inter: above_inter,
@@ -19971,6 +19976,7 @@ fn decode_inter_block(
                                         cu_mi, luma_span, luma_span, plane_idx, &cu_grid,
                                     );
                                     CHROMA_SPLIT_TX_HITS.with(|c| c.set(c.get() + 1));
+                                    mu_chroma = true;
                                     let dst = if plane_idx == 1 {
                                         &mut u_units
                                     } else {
@@ -21162,6 +21168,7 @@ fn decode_inter_block(
                                         cu_mi, luma_span, luma_span, plane_idx, &cu_grid,
                                     );
                                     CHROMA_SPLIT_TX_HITS.with(|c| c.set(c.get() + 1));
+                                    mu_chroma = true;
                                     let dst = if plane_idx == 1 {
                                         &mut u_units
                                     } else {
@@ -21872,6 +21879,35 @@ fn decode_inter_block(
     let pair_chroma = strip_chroma
         .filter(|s| s.has_chroma)
         .map(|s| (s, neighbour_state(&u_grid), neighbour_state(&v_grid)));
+    // lane-vert46 r1: libaom stamps the chroma entropy context PER TRANSFORM
+    // UNIT (`av1_set_entropy_contexts` inside `decode_reconstruct_tx`'s mu-chunk
+    // loop). Above 64 a block's chroma is two or four 32x32 units, so the
+    // whole-block re-stamp in the record below overwrote every unit's own DC
+    // sign and level with the TOP-LEFT unit's -- the next block then read a
+    // stale `dc_sign_ctx` (192x256 --sb-size=128 stream: the 64x128 block at
+    // the partial right superblock read row 1 where libaom reads row 2). The
+    // units are collected here and re-stamped after that record, in mu-chunk
+    // order so a later unit still wins over an earlier one.
+    let mu_chroma_units: Vec<((usize, usize), usize, Vec<i32>)> = if mu_chroma {
+        let cu = 32usize;
+        let mut units = Vec::new();
+        for cr in 0..(write_h / 64).max(1) {
+            for cc in 0..(write_w / 64).max(1) {
+                let cu_mi = (at.0 + cr * 16, at.1 + cc * 16);
+                for (plane, grid) in [(1usize, &u_grid), (2usize, &v_grid)] {
+                    let mut unit = Vec::with_capacity(cu * cu);
+                    for rr in 0..cu {
+                        let start = (cr * cu + rr) * chroma_side + cc * cu;
+                        unit.extend_from_slice(&grid[start..start + cu]);
+                    }
+                    units.push((cu_mi, plane, unit));
+                }
+            }
+        }
+        units
+    } else {
+        Vec::new()
+    };
     if vartx_leaves.is_some() {
         // Plane 0 is already correct per transform unit
         // ([`Neighbours::record_mi_luma`] above); this writes everything else
@@ -21887,6 +21923,13 @@ fn decode_inter_block(
         // context one value low (ctx 2 where aomdec says 3) and desynced.
         // The true footprint is `write_w`/`write_h`, exactly as the
         // non-var-tx arm below uses.
+        // Plane 0 is already correct per transform unit
+        // ([`Neighbours::record_mi_luma`] above); this writes everything else
+        // [`Neighbours::record_rect`] would. lane-vert46 r1: the block's OWN
+        // width/height, not `side` -- var-tx is no longer square-only (the 128
+        // root's HORZ/VERT arm decodes 128x64 / 64x128 var-tx blocks), and
+        // `side` there stamped `above_side`/`left_side` = 128, so the NEXT
+        // superblock's 128-root partition context read 16 where libaom reads 19.
         neighbours.record_split_luma_rect_mi(at, write_w, write_h, mode_for_tx, uv_predict_mode, [&u_grid, &v_grid]);
     } else {
         neighbours.record_rect_mi(
@@ -21923,6 +21966,9 @@ fn decode_inter_block(
         }
         neighbours.record_uv_mode_mi(s.pair_mi.0, s.pair_mi.1, pw / MI, ph / MI, uv_predict_mode);
         INTER16_CHROMA_PAIR_HITS.with(|c| c.set(c.get() + 1));
+    }
+    for (cu_mi, plane, unit) in &mu_chroma_units {
+        neighbours.record_mi_chroma(*cu_mi, 64, 64, *plane, unit);
     }
     neighbours.record_inter_rect_mi(
         at,
