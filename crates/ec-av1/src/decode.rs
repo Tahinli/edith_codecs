@@ -2405,7 +2405,12 @@ pub(crate) fn build_motion_field(
     const REFMVS_LIMIT: i32 = (1 << 12) - 1;
     for row in 0..mi_rows {
         for col in 0..mi_cols {
-            let Some(info) = grid.get(row, col) else {
+            // `get_any`, never `get`: this loop runs AFTER the tile walk, so
+            // the grid still carries the last tile's own bounds and `get`
+            // would return `None` for every cell of every other tile --
+            // leaving their motion field empty and zeroing the next frame's
+            // temporal MV candidates there (lane-tile2 r1 root cause).
+            let Some(info) = grid.get_any(row, col) else {
                 continue;
             };
             // `av1_copy_frame_mvs` runs for EVERY block of an inter frame and
@@ -13117,6 +13122,21 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
         }
         let mut dec = SymbolDecoder::new(tile_bytes);
         neighbours.start_tile(mi_row0 as usize, mi_col0 as usize, mi_col1 as usize);
+        // The intrabc DV candidate grid is a neighbour scan like any other
+        // (libaom runs `av1_find_mv_refs` for an intrabc block too), so it
+        // takes this tile's own bounds -- without them a second tile column's
+        // block vector search reads candidates out of the tile to its left
+        // (class new-map-ignores-tile-edge).
+        INTRABC_MI_GRID.with(|g| {
+            if let Some((grid, _, _)) = g.borrow_mut().as_mut() {
+                grid.set_tile_bounds(
+                    mi_row0 as usize,
+                    mi_col0 as usize,
+                    mi_row1 as usize,
+                    mi_col1 as usize,
+                );
+            }
+        });
         y.set_tile_origin(
             mi_col0 as usize * 4,
             mi_row0 as usize * 4,
@@ -20779,6 +20799,21 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
             );
         }
         neighbours.start_tile(mi_row0 as usize, mi_col0 as usize, mi_col1 as usize);
+        // The intrabc DV candidate grid is a neighbour scan like any other
+        // (libaom runs `av1_find_mv_refs` for an intrabc block too), so it
+        // takes this tile's own bounds -- without them a second tile column's
+        // block vector search reads candidates out of the tile to its left
+        // (class new-map-ignores-tile-edge).
+        INTRABC_MI_GRID.with(|g| {
+            if let Some((grid, _, _)) = g.borrow_mut().as_mut() {
+                grid.set_tile_bounds(
+                    mi_row0 as usize,
+                    mi_col0 as usize,
+                    mi_row1 as usize,
+                    mi_col1 as usize,
+                );
+            }
+        });
         y.set_tile_origin(
             mi_col0 as usize * 4,
             mi_row0 as usize * 4,
