@@ -19173,6 +19173,12 @@ mod tests {
             (44, "--cq-level=8", 256, 192, false, false, true),
             (46, "--cq-level=55", 192, 256, false, true, false),
             (45, "--cq-level=45", 192, 256, true, true, true),
+            // lane-sb128c r10: a SECOND 128 superblock column is what the
+            // arms above never had -- the right 64x128 half of a 128-root
+            // VERT at mi_col 80 read its tx-depth symbol off the wrong CDF
+            // row and every unit column of a 128x64 chunk predicted from the
+            // not-yet-decoded chunk to its right.
+            (47, "--cq-level=45", 512, 512, false, false, true),
         ];
         let (mut matched, mut named_refusals, mut out_of_scope) = (0u32, 0u32, 0u32);
         let (mut horz_arms, mut vert_arms) = (0u32, 0u32);
@@ -19189,7 +19195,17 @@ mod tests {
                     // through `geq` instead -- same effect on the encoder's
                     // partition choice, byte-identical across runs.
                     &format!(
-                        "nullsrc=size={width}x{height}:rate=25,format=yuv420p,                         geq=lum='128+90*sin((X+2*N)/37)+30*sin(Y/29)':                         cb='128+30*sin(X/23)':cr='128+30*sin((Y+N)/19)'"
+                        "nullsrc=size={width}x{height}:rate=25,format=yuv420p,                         geq=lum='{lum}':                         cb='128+30*sin(X/23)':cr='128+30*sin((Y+N)/19)'",
+                        // The 512x512 arm carries the r9 witness's own
+                        // higher-frequency luma: the smooth two-term source
+                        // gives every 128-rect block a whole-block TX_64X64
+                        // and no VERT root at all, which is exactly the
+                        // combination that hid the tx-depth CDF row defect.
+                        lum = if width == 512 {
+                            "128+80*sin((X+3*N)/17)+50*sin(Y/29)+30*sin((X+Y)/13)"
+                        } else {
+                            "128+90*sin((X+2*N)/37)+30*sin(Y/29)"
+                        }
                     ),
                     "-pix_fmt", pix, "-strict", "-1", "-t", "0.2",
                     "-f", "yuv4mpegpipe", "-",
