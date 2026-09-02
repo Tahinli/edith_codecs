@@ -18001,6 +18001,162 @@ mod tests {
         );
     }
 
+    /// lane-sb128b r1 gate: a real `aomenc --sb-size=128` KEY frame whose 128
+    /// roots resolve to `PARTITION_NONE` -- one whole 128x128 intra block,
+    /// four TX_64X64 luma transform units and FOUR TX_32X32 chroma units per
+    /// plane (`av1_get_max_uv_txsize(BLOCK_128X128)` is
+    /// `av1_get_adjusted_tx_size` of its 64x64 uv plane block's TX_64X64, so
+    /// TX_32X32) -- lane-sb128b r2's `chroma_split_tx_hits` asserts them. The r1 gate above pins `--max-partition-size=64`, which
+    /// makes every 128 root a forced SPLIT and leaves this arm unexercised.
+    /// Smooth gradients at a high `--cq-level` are what make the RD search
+    /// keep a whole 128x128 block; `part128_none_hits` HARD-asserts it did.
+    #[test]
+    fn a_real_aomenc_key_frame_with_a_128x128_none_partition_decodes_pixel_exact() {
+        const NAME: &str =
+            "a_real_aomenc_key_frame_with_a_128x128_none_partition_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let render = |seed: u32, width: usize, height: usize, ten_bit: bool| -> Vec<u8> {
+            let pix = if ten_bit { "yuv420p10le" } else { "yuv420p" };
+            let out = Command::new("ffmpeg")
+                .args([
+                    "-v", "error", "-f", "lavfi", "-i",
+                    &gradients_source(seed, width, height, "duration=0.04:rate=25"),
+                    "-pix_fmt", pix, "-strict", "-1", "-t", "0.04",
+                    "-f", "yuv4mpegpipe", "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                out.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            out.stdout
+        };
+        let mut matched = 0u32;
+        let mut named_refusals = 0u32;
+        let mut none_arms = 0u32;
+        // (seed, cq, width, height, 10-bit). 384x384 is a 3x3 grid of whole
+        // 128 superblocks; 256x256 a 2x2.
+        let arms: Vec<(u32, &str, usize, usize, bool)> = vec![
+            (42, "--cq-level=63", 384, 384, false),
+            (43, "--cq-level=55", 384, 384, false),
+            (44, "--cq-level=63", 256, 256, false),
+            (45, "--cq-level=63", 384, 384, true),
+        ];
+        for (seed, cq, width, height, ten_bit) in arms {
+            let y4m = render(seed, width, height, ten_bit);
+            let mut args: Vec<&str> = vec![
+                "--codec=av1", "--passes=1", "--end-usage=q", cq,
+                "--cpu-used=0", "--threads=1", "--row-mt=0",
+                "--sb-size=128",
+                "--enable-rect-partitions=0",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0",
+                "--min-partition-size=16",
+                "--enable-restoration=1",
+                "--enable-palette=0",
+                "--deltaq-mode=0",
+                "--enable-intrabc=0",
+                "--enable-tx-size-search=0",
+                "--limit=1",
+            ];
+            if ten_bit {
+                args.extend_from_slice(&["--input-bit-depth=10", "--bit-depth=10"]);
+            }
+            args.extend_from_slice(&["--obu", "-o", "-", "-"]);
+            let mut child = Command::new(aomenc_path())
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let before = crate::decode::part128_none_hits();
+            let frames = match decode_stream(&stream) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME} failed outright, not a named refusal (seed {seed}): {msg}"
+                    );
+                    named_refusals += 1;
+                    eprintln!("seed {seed} refusal: {msg}");
+                    continue;
+                }
+                Ok(frames) => frames,
+            };
+            let want = if ten_bit {
+                ffmpeg_decode_sequence_10bit(&stream, width, height, 1)
+            } else {
+                ffmpeg_decode_sequence(&stream, width, height, 1)
+            };
+            assert_eq!(frames.len(), 1);
+            for (i, (got, want)) in frames.iter().zip(&want).enumerate() {
+                for (name, a, b, w) in [
+                    ("Y", &got.y, &want.y, width),
+                    ("U", &got.u, &want.u, width / 2),
+                    ("V", &got.v, &want.v, width / 2),
+                ] {
+                    let n = a.iter().zip(b.iter()).filter(|(x, y)| x != y).count();
+                    let first = a.iter().zip(b.iter()).position(|(x, y)| x != y);
+                    assert_eq!(
+                        n, 0,
+                        "{NAME} frame {i} {name} vs ffmpeg (seed {seed}): {n} differ, first row {} col {} ours {:?} ffmpeg {:?}",
+                        first.unwrap_or(0) / w,
+                        first.unwrap_or(0) % w,
+                        first.map(|k| a[k]),
+                        first.map(|k| b[k]),
+                    );
+                }
+            }
+            let hits = crate::decode::part128_none_hits() - before;
+            eprintln!("seed {seed} cq {cq} {width}x{height}: part128_none_hits +{hits}");
+            if hits > 0 {
+                none_arms += 1;
+            }
+            matched += 1;
+        }
+        assert!(
+            matched > 0,
+            "{NAME}: every attempt refused; the gate never decoded a stream"
+        );
+        assert!(
+            none_arms > 0,
+            "{NAME}: {matched} stream(s) decoded pixel-exact but NOT ONE 128 root was \
+             PARTITION_NONE -- the arm this gate exists for never fired"
+        );
+        eprintln!(
+            "{NAME}: {matched} pixel-exact ({none_arms} with a 128 NONE root), \
+             {named_refusals} named refusals, part128_none_hits={}",
+            crate::decode::part128_none_hits()
+        );
+    }
+
     #[test]
     #[ignore = "lane-sb128 r2 diagnostic: is the frame-6 mismatch sb128-specific?"]
     fn sb128_r2_control_sb64() {
