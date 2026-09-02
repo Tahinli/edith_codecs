@@ -12504,6 +12504,187 @@ mod tests {
         }
     }
 
+    /// lane-fi8 r1: the sub8 rect-leaf gate above with the tool under test
+    /// turned ON (`--enable-filter-intra=1`, appended AFTER the base recipe
+    /// -- aomenc takes the FIRST occurrence of a repeated flag, so the base
+    /// recipe below carries no `--enable-filter-intra` at all). A DC_PRED
+    /// `BLOCK_4X8`/`BLOCK_8X4` leaf carries a `use_filter_intra` flag
+    /// (`av1_filter_intra_allowed_bsize` is "both sides <= 32"), which this
+    /// decoder read from `BLOCK_4X4`'s CDF row until this round -- the same
+    /// VALUE, a different interval, so it desynced a block or two later
+    /// ([[wrong-alphabet-same-value]]) -- and then refused the prediction by
+    /// name. Per attempt, only runs whose [`decode::filter_intra_rect_sub8_hits`]
+    /// delta is nonzero AND whose three planes match ffmpeg count; the wider
+    /// `filter_intra_rect_hits` would be satisfied by a 16x8 strip and prove
+    /// nothing about these shapes. Arms cover both transform depths
+    /// (`--enable-tx-size-search=1`, where a leaf may split into two 4x4
+    /// units each predicted from the previous one's reconstruction, and `=0`,
+    /// one whole-leaf transform) and both bit depths.
+    #[test]
+    fn a_real_aomenc_stream_with_filter_intra_on_a_sub8_rect_leaf_decodes_pixel_exact() {
+        const NAME: &str =
+            "a_real_aomenc_stream_with_filter_intra_on_a_sub8_rect_leaf_decodes_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            let msg = format!("no aomenc at {}", aomenc_path().display());
+            assert!(
+                std::env::var_os("EC_AV1_REQUIRE_AOMENC").is_none(),
+                "EC_AV1_REQUIRE_AOMENC is set but {msg}"
+            );
+            eprintln!("SKIP {NAME}: {msg}");
+            return;
+        }
+        let (width, height) = (16usize, 16usize);
+        for (tx_search, bit_depth) in [("1", 8u8), ("0", 8u8), ("1", 10u8)] {
+            let mut refusals = Vec::new();
+            let mut fired_runs = 0u32;
+            let mut fi_leaves = 0usize;
+            let mut split_tx = 0usize;
+            for attempt in 0..80u32 {
+                let seed = 300 + attempt;
+                let cq = 6 + (attempt % 8) * 6;
+                let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+                let y4m = Command::new("ffmpeg")
+                    .args([
+                        "-v", "error", "-f", "lavfi", "-i",
+                        &format!("testsrc2=size={width}x{height}:rate=25"),
+                        "-vf",
+                        &format!("noise=alls=40:allf=t:all_seed={seed},format={pix_fmt}"),
+                        "-strict", "-1", "-t", "0.04", "-f", "yuv4mpegpipe", "-",
+                    ])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .expect("ffmpeg failed to run");
+                assert!(
+                    y4m.status.success(),
+                    "ffmpeg fixture: {}",
+                    String::from_utf8_lossy(&y4m.stderr)
+                );
+                let mut child = Command::new(aomenc_path())
+                    .args([
+                        "--codec=av1",
+                        "--passes=1",
+                        "--end-usage=q",
+                        &format!("--cq-level={cq}"),
+                        "--cpu-used=0",
+                        "--threads=1",
+                        "--row-mt=0",
+                        "--sb-size=64",
+                        "--min-partition-size=4",
+                        "--max-partition-size=8",
+                        "--enable-rect-partitions=1",
+                        "--enable-ab-partitions=0",
+                        "--enable-1to4-partitions=0",
+                        "--enable-palette=0",
+                        "--enable-intrabc=0",
+                        "--enable-restoration=0",
+                        "--enable-cdef=0",
+                        "--loopfilter-control=0",
+                        "--enable-ref-frame-mvs=0",
+                        // The tools under test, first occurrence in the
+                        // command line (aomenc keeps the first).
+                        "--enable-filter-intra=1",
+                        &format!("--enable-tx-size-search={tx_search}"),
+                        "--limit=1",
+                        "--obu",
+                        "-o",
+                        "-",
+                        "-",
+                    ])
+                    .args(if bit_depth == 10 {
+                        &["--input-bit-depth=10", "--bit-depth=10"][..]
+                    } else {
+                        &[][..]
+                    })
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("aomenc failed to start");
+                child
+                    .stdin
+                    .take()
+                    .expect("aomenc stdin")
+                    .write_all(&y4m.stdout)
+                    .expect("writing y4m to aomenc");
+                let out = child.wait_with_output().expect("aomenc failed to run");
+                if !out.status.success() {
+                    refusals.push(format!("seed={seed} cq={cq}: aomenc itself refused"));
+                    continue;
+                }
+                let stream = out.stdout;
+                let fi_before = decode::filter_intra_rect_sub8_hits();
+                let split_before = decode::rect8_split_tx_hits();
+                let frames = match decode_stream(&stream) {
+                    Ok(frames) => frames,
+                    Err(e) => {
+                        let msg = e.to_string();
+                        assert!(
+                            msg.starts_with("unsupported: "),
+                            "decode error that is not a named refusal \
+                             (seed={seed} cq={cq} depth={bit_depth} txs={tx_search}): {msg}"
+                        );
+                        refusals.push(format!("seed={seed} cq={cq}: {msg}"));
+                        continue;
+                    }
+                };
+                let fi = decode::filter_intra_rect_sub8_hits() - fi_before;
+                if fi == 0 {
+                    refusals.push(format!(
+                        "seed={seed} cq={cq}: decoded, but no 4x8/8x4 leaf used filter intra"
+                    ));
+                    continue;
+                }
+                let ffmpeg_frames = if bit_depth == 10 {
+                    ffmpeg_decode_sequence_10bit(&stream, width, height, 1)
+                } else {
+                    ffmpeg_decode_sequence(&stream, width, height, 1)
+                };
+                assert_eq!(
+                    frames[0].y, ffmpeg_frames[0].y,
+                    "luma vs ffmpeg (seed={seed} cq={cq} depth={bit_depth} txs={tx_search})"
+                );
+                assert_eq!(
+                    frames[0].u, ffmpeg_frames[0].u,
+                    "U vs ffmpeg (seed={seed} cq={cq} depth={bit_depth} txs={tx_search})"
+                );
+                assert_eq!(
+                    frames[0].v, ffmpeg_frames[0].v,
+                    "V vs ffmpeg (seed={seed} cq={cq} depth={bit_depth} txs={tx_search})"
+                );
+                fired_runs += 1;
+                fi_leaves += fi;
+                split_tx += decode::rect8_split_tx_hits() - split_before;
+                if fired_runs >= 3 {
+                    break;
+                }
+            }
+            assert!(
+                fired_runs >= 3,
+                "{NAME}: fewer than 3 firing+pixel-exact runs out of 80 attempts \
+                 (depth={bit_depth} txs={tx_search}), {fi_leaves} filter-intra sub8 leaves \
+                 seen:\n{}",
+                refusals.join("\n")
+            );
+            if tx_search == "1" {
+                assert!(
+                    split_tx > 0,
+                    "{NAME}: no sub-8x8 rect leaf used a split (depth-1) transform in the \
+                     {fired_runs} pixel-exact runs (depth={bit_depth})"
+                );
+            }
+            eprintln!(
+                "{NAME}: depth={bit_depth} txs={tx_search} {fired_runs} pixel-exact runs, \
+                 {fi_leaves} filter-intra 4x8/8x4 leaves, split_tx={split_tx}"
+            );
+        }
+    }
+
     /// lane-tx4x8 r3 ([[enumerate-table-domain]], [[tool-disabled-in-every-gate]]):
     /// a 16x8/8x16 intra strip whose DIRECTIONAL mode reads above-right or
     /// below-left samples. Which of those the decoder may read is
