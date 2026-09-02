@@ -1623,6 +1623,47 @@ pub fn find_mv_stack_compound(
             }
             blk_row += step_h;
         }
+        // lane-sb128 r3: libaom's three `tpl_sample_pos` EXTENSION samples
+        // (mvref_common.c:591), which the single-ref twin already ports and
+        // this compound path dropped. `check_sb_border`'s mask is libaom's
+        // hardcoded `mi_size_wide[BLOCK_64X64]` (16), NOT the sequence's
+        // superblock size. Missing them cost one weight-2 vote on a
+        // candidate, which reordered the stack and gave a NEW_NEWMV block a
+        // different predictor -- 957 wrong pixels on one 32x32 block of one
+        // frame with the entropy stream in sync.
+        let allow_extension = (2..16).contains(&bh4) && (2..16).contains(&bw4);
+        if allow_extension {
+            let (voffset, hoffset) = (bh4.max(2) as isize, bw4.max(2) as isize);
+            let sb_mask = 16isize;
+            for (row_off, col_off) in [
+                (voffset, -2isize),
+                (voffset, hoffset),
+                (voffset - 2, hoffset),
+            ] {
+                let row = (mi_row as isize & (sb_mask - 1)) + row_off;
+                let col = (mi_col as isize & (sb_mask - 1)) + col_off;
+                if row < 0 || row >= sb_mask || col < 0 || col >= sb_mask {
+                    continue;
+                }
+                let cand0 = crate::motion_field::add_tpl_ref_mv(
+                    field, mi_row, mi_col, row_off, col_off, cur_offset_0,
+                    allow_high_precision_mv,
+                );
+                let cand1 = crate::motion_field::add_tpl_ref_mv(
+                    field, mi_row, mi_col, row_off, col_off, cur_offset_1,
+                    allow_high_precision_mv,
+                );
+                if cand0.is_some() || cand1.is_some() {
+                    any_hit = true;
+                    add_compound_candidate(
+                        &mut candidates,
+                        cand0.map_or((0, 0), |c| c.mv),
+                        cand1.map_or((0, 0), |c| c.mv),
+                        2,
+                    );
+                }
+            }
+        }
         if any_hit {
             TMV_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
