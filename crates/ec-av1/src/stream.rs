@@ -160,6 +160,12 @@ pub fn intra_sb128_counters() -> (usize, usize, [usize; 3]) {
     crate::decode::intra_sb128_hits()
 }
 
+/// lane-inter128intra r1: the 128 root's HORZ/VERT half coded INTRA inside an
+/// INTER frame -- (128x64 blocks, 64x128 blocks).
+pub fn intra128_in_inter_counters() -> [usize; 2] {
+    crate::decode::intra128_in_inter_hits()
+}
+
 /// lane-sb128c r9: the four AB shapes at the 128 root, in `PARTITION_HORZ_A`,
 /// `_HORZ_B`, `_VERT_A`, `_VERT_B` order (key and inter tile paths share the
 /// counter -- it is bumped where the root symbol resolves).
