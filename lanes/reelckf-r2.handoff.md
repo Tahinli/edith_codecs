@@ -1,8 +1,8 @@
 # lane-reelckf r2 handoff
 
-Tip `f7e0d3d` (branch lane-reelckf). Everything r2 owed is DONE and committed
-except the final full-suite number: the suite unit
-`reelckf-suite-1788326584.service` was still running at my turn cap.
+SUPERSEDED: the suite finished after this file was written --
+`test result: ok. 379 passed; 0 failed; 33 ignored` (1055 s). Nothing is owed.
+Tip `f7e0d3d` at the time of writing; see `lanes/reelckf-r2.report.md`.
 
 * Log: `$HOME/.cache/reelckf-suite-r2.log`. Check with a single
   `grep -E "^test result|FAILED" $HOME/.cache/reelckf-suite-r2.log`.
