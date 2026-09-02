@@ -199,7 +199,7 @@ const NEVER_EXERCISED_10BIT: &[(&str, &str)] = &[
     // gate passes `=1` for both.
     (
         "enable-1to4-partitions",
-        "10-bit hole only: lane-tx64x16's 8-bit SB-level 1:4 gate passes `=1` and asserts both arms, but no 10-bit gate does",
+        "10-bit hole only: 8-bit gates (lane-tx64x16 SB-level 1:4, lane-sub8) pass `=1` and assert their arms, but no 10-bit gate does",
     ),
     (
         "enable-angle-delta",
