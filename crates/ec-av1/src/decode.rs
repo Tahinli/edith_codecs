@@ -2134,6 +2134,22 @@ pub(crate) fn affine_gm_hits() -> usize {
     AFFINE_GM_HITS.with(|c| c.get())
 }
 
+// lane-t900 r9: libaom `is_nontrans_global_motion` (mvref_common.h) returns 0
+// for `AOMMIN(mi_size_wide[bsize], mi_size_high[bsize]) < 2`, i.e. any block
+// with a 4-px side is NEVER "non-translational global" and therefore ALWAYS
+// reads its interp-filter symbol. Counts the blocks where that guard flips
+// our answer -- a GLOBALMV/GLOBAL_GLOBALMV block with a non-TRANSLATION model
+// and a 4-px side, which we used to suppress the interp read on (a pre-mode
+// entropy desync one symbol wide).
+thread_local! {
+    static GM_NONTRANS_SMALL_SIDE_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`GM_NONTRANS_SMALL_SIDE_HITS`].
+pub fn gm_nontrans_small_side_hits() -> usize {
+    GM_NONTRANS_SMALL_SIDE_HITS.with(std::cell::Cell::get)
+}
+
 // lane-gmaffine r1: 8x8-leaf-only counters -- how many `BLOCK_8X8` leaves
 // coded `GLOBALMV` (`GLOBALMV_HITS_8`) and how many built a real
 // `WARPED_CAUSAL` local-warp prediction there (`WARP_HITS_8`, incremented
@@ -20277,9 +20293,16 @@ fn decode_inter_block(
             // spec `is_nontrans_global_motion`: ALL active refs' models must
             // be non-TRANSLATION (IDENTITY counts) for the compound block's
             // interp-filter read to be suppressed.
-            let gm_nontrans = is_globalmv
+            let gm_nontrans_models = is_globalmv
                 && global_motion[(ref0 - LAST_FRAME) as usize].model != ec_av1_syntax::WarpModel::Translation
                 && global_motion[(ref1 - LAST_FRAME) as usize].model != ec_av1_syntax::WarpModel::Translation;
+            // lane-t900 r9: `is_nontrans_global_motion` bails at
+            // `AOMMIN(mi_size_wide, mi_size_high) < 2` before it looks at any
+            // model, so a 4-px-sided block still reads its interp filter.
+            let gm_nontrans = gm_nontrans_models && bw4.min(bh4) >= 2;
+            if gm_nontrans_models && !gm_nontrans {
+                GM_NONTRANS_SMALL_SIDE_HITS.with(|c| c.set(c.get() + 1));
+            }
             let (py0, pu0, pv0) = ref_planes(ref0, ref_y, ref_u, ref_v, other_refs)?;
             let (py1, pu1, pv1) = ref_planes(ref1, ref_y, ref_u, ref_v, other_refs)?;
             // lane-cwarp r1: `is_global_mv_block` (blockd.h:421-429) is
@@ -23646,7 +23669,14 @@ fn decode_inter_sub8_split4(
                 neighbours.left_filter[rmi],
             );
         }
-        let gm_nontrans = is_globalmv && gm_ref.model != ec_av1_syntax::WarpModel::Translation;
+        // lane-t900 r9: this reader's sub-blocks have a 4-px side, and libaom
+        // `is_nontrans_global_motion` returns 0 for
+        // `AOMMIN(mi_size_wide, mi_size_high) < 2` BEFORE testing any model --
+        // so a GLOBALMV sub-block here always reads its interp filter.
+        if is_globalmv && gm_ref.model != ec_av1_syntax::WarpModel::Translation {
+            GM_NONTRANS_SMALL_SIDE_HITS.with(|c| c.set(c.get() + 1));
+        }
+        let gm_nontrans = false;
         let (h_filter, v_filter, resolved_filter) = resolve_interp_filter(
             dec,
             cdfs,
@@ -24572,7 +24602,14 @@ fn decode_inter_sub8_rect2(
         } else {
             [3, 3]
         };
-        let gm_nontrans = is_globalmv && gm_ref.model != ec_av1_syntax::WarpModel::Translation;
+        // lane-t900 r9: this reader's sub-blocks have a 4-px side, and libaom
+        // `is_nontrans_global_motion` returns 0 for
+        // `AOMMIN(mi_size_wide, mi_size_high) < 2` BEFORE testing any model --
+        // so a GLOBALMV sub-block here always reads its interp filter.
+        if is_globalmv && gm_ref.model != ec_av1_syntax::WarpModel::Translation {
+            GM_NONTRANS_SMALL_SIDE_HITS.with(|c| c.set(c.get() + 1));
+        }
+        let gm_nontrans = false;
         let (h_filter, v_filter, resolved_filter) = resolve_interp_filter(
             dec,
             cdfs,
