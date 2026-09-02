@@ -691,6 +691,7 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 header.allow_warped_motion,
                 header.allow_screen_content_tools,
                 header.delta,
+                enable_filter_intra,
             )?;
             // lane-superres r10: mirrors the key-frame branch above --
             // `decode_inter_frame_tile_with_cdfs` decodes at the downscaled
@@ -4430,6 +4431,257 @@ mod tests {
         );
         panic!(
             "{name} never observed a split-transform intra block in an inter frame:\n{}",
+            refusals.join("\n")
+        );
+    }
+
+    /// lane-fiinter r1 (class [[symbol-consumption-gap]] +
+    /// [[tool-disabled-in-every-gate]]): a real aomenc inter sequence with
+    /// `--enable-filter-intra=1` (aomenc's own default -- every inter gate
+    /// recipe before this one pinned it OFF, so nothing ever exercised it) in
+    /// which the RD picks an INTRA block inside an inter frame and gives it
+    /// filter intra. `read_intra_block_mode_info` reads `use_filter_intra`
+    /// there exactly as a key frame does; this decoder read no such symbol at
+    /// all until this round, so such a stream desynced at that symbol and
+    /// decoded silently wrong. Hard-asserts
+    /// [`decode::intra_in_inter_filter_intra_hits`]: an attempt that never
+    /// produced one proves nothing, and exhausting every attempt is a
+    /// FAILURE, not a SKIP.
+    #[test]
+    fn a_real_aomenc_inter_sequence_with_filter_intra_on_an_intra_block_decodes_pixel_exact() {
+        filter_intra_in_inter_gate(8);
+    }
+
+    /// The 10-bit arm (both of the user's films are `yuv420p10le`).
+    #[test]
+    fn a_real_aomenc_10bit_inter_sequence_with_filter_intra_on_an_intra_block_decodes_pixel_exact()
+    {
+        filter_intra_in_inter_gate(10);
+    }
+
+    fn filter_intra_in_inter_gate(bit_depth: u32) {
+        let name = format!("filter_intra_in_inter_gate({bit_depth})");
+        if !have_ffmpeg() {
+            eprintln!("SKIP {name}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {name}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height, frame_count) = (64usize, 64usize, 8usize);
+        let mut refusals = Vec::new();
+        let mut uncounted_exact = 0u32;
+        for attempt in 0..40u32 {
+            let seed = 42 + attempt;
+            // A zooming fractal: every frame moves (so the sequence is
+            // genuinely inter-coded) and keeps sharp new detail entering at
+            // the borders, which is what makes aomenc's RD choose an INTRA
+            // block inside an inter frame -- and then split its transform.
+            // A zooming fractal with a hard CUT halfway (`overlay` switching
+            // a second, unrelated fractal on at frame 4): after the cut every
+            // block is unpredictable from the reference, which is what makes
+            // aomenc code INTRA blocks inside an inter frame -- and at this
+            // cq the RD then splits their transforms.
+            let source = format!(
+                "mandelbrot=size=64x64:start_scale={}:rate=25[a];\
+                 mandelbrot=size=64x64:start_scale={}:rate=25[b];\
+                 [a][b]overlay=enable='gte(n,4)'",
+                5.0 - f64::from(attempt) * 0.06,
+                0.9 + f64::from(attempt) * 0.11
+            );
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    // Desaturated chroma keeps `uv_mode` on DC_PRED, so the
+                    // still-refused directional-chroma gaps never fire and
+                    // luma detail alone drives the transform split.
+                    "-vf",
+                    "hue=s=0",
+                    "-pix_fmt",
+                    if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" },
+                    "-strict",
+                    "-1",
+                    "-t",
+                    "0.32",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-strict",
+                    "-1",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let depth_args: &[&str] = if bit_depth == 10 {
+                &["-b", "10", "--input-bit-depth=10"]
+            } else {
+                &[]
+            };
+            let mut child = Command::new(aomenc_path())
+                .args(depth_args)
+                .args([
+                    "--codec=av1",
+                    "--passes=1",
+                    "--end-usage=q",
+                    "--cq-level=30",
+                    "--cpu-used=0",
+                    "--lag-in-frames=0",
+                    "--auto-alt-ref=0",
+                    // One key frame only: every later frame is an inter frame,
+                    // which is where this gate's intra blocks must sit. The
+                    // MIN distance is what stops aomenc's scene-cut detector
+                    // from inserting a second key frame at the cut this gate's
+                    // source deliberately contains.
+                    "--kf-max-dist=1000",
+                    "--kf-min-dist=1000",
+                    "--threads=1",
+                    "--row-mt=0",
+                    "--enable-order-hint=0",
+                    "--enable-warped-motion=0",
+                    "--enable-obmc=0",
+                    "--enable-masked-comp=0",
+                    "--enable-interintra-comp=0",
+                    "--enable-dist-wtd-comp=0",
+                    "--enable-diff-wtd-comp=0",
+                    "--enable-onesided-comp=0",
+                    "--enable-interintra-wedge=0",
+                    "--enable-smooth-interintra=0",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    "--enable-smooth-intra=0",
+                    "--enable-paeth-intra=0",
+                    "--enable-directional-intra=0",
+                    "--enable-angle-delta=0",
+                    "--enable-cdef=0",
+                    "--enable-restoration=0",
+                    "--enable-palette=0",
+                    "--enable-intrabc=0",
+                    "--enable-cfl-intra=0",
+                    "--enable-ref-frame-mvs=0",
+                    // Per-arm overrides go LAST (aomenc keeps the last
+                    // occurrence of a repeated --enable-* flag): the intra
+                    // tx_depth symbol only exists under TX_MODE_SELECT, and
+                    // rect partitions are a separate named refusal.
+                    "--enable-filter-intra=1",
+                    "--enable-tx-size-search=1",
+                    "--enable-rect-partitions=0",
+                    "--max-partition-size=32",
+                    // Sub-16 inter partitions are a separate named refusal,
+                    // as is the 8x8 intra leaf's own TX_4X4 split.
+                    "--min-partition-size=16",
+                    "--obu",
+                    "-o",
+                    "-",
+                    "-",
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let before = decode::intra_in_inter_filter_intra_hits();
+            let frames = match decode_stream(&stream) {
+                Ok(frames) => frames,
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{name} decode failed outright (seed {seed}): {msg}"
+                    );
+                    refusals.push(format!("seed {seed}: {msg}"));
+                    continue;
+                }
+            };
+            let fired = decode::intra_in_inter_filter_intra_hits() - before;
+            // class [[gate-skips-on-its-own-failure]]: a decode that
+            // succeeded is ALWAYS pixel-compared below; the counter only
+            // decides whether the attempt counts as firing.
+            let counted = fired != 0;
+            if !counted {
+                uncounted_exact += 1;
+                refusals.push(format!(
+                    "seed {seed}: decoded and pixel-compared, but no intra block in an inter \
+                     frame used filter intra"
+                ));
+            }
+            let ffmpeg_frames = if bit_depth == 10 {
+                ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count)
+            } else {
+                ffmpeg_decode_sequence(&stream, width, height, frame_count)
+            };
+            assert_eq!(frames.len(), frame_count);
+            eprintln!(
+                "{name} seed={seed}: filter-intra blocks inside inter frames = {fired}"
+            );
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                for (plane, (g, w)) in [
+                    ("Y", (&got.y, &want.y)),
+                    ("U", (&got.u, &want.u)),
+                    ("V", (&got.v, &want.v)),
+                ] {
+                    let stride = if plane == "Y" { width } else { width / 2 };
+                    if let Some(at) = g.iter().zip(w.iter()).position(|(a, b)| a != b) {
+                        eprintln!(
+                            "{name} seed={seed}: frame {i} {plane} first diff at ({}, {}) got {} \
+                             want {} ({} samples differ)",
+                            at % stride,
+                            at / stride,
+                            g[at],
+                            w[at],
+                            g.iter().zip(w.iter()).filter(|(a, b)| a != b).count(),
+                        );
+                    }
+                }
+            }
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(got.y, want.y, "frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(got.u, want.u, "frame {i} U vs ffmpeg (seed {seed})");
+                assert_eq!(got.v, want.v, "frame {i} V vs ffmpeg (seed {seed})");
+            }
+            if counted {
+                gate_buckets(
+                    &name,
+                    1,
+                    uncounted_exact,
+                    refusals.len() - uncounted_exact as usize,
+                );
+                return;
+            }
+        }
+        gate_buckets(
+            &name,
+            0,
+            uncounted_exact,
+            refusals.len() - uncounted_exact as usize,
+        );
+        panic!(
+            "{name} never observed a filter-intra intra block in an inter frame:\n{}",
             refusals.join("\n")
         );
     }
