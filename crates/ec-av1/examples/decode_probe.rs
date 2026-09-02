@@ -79,6 +79,11 @@ fn main() {
             "inter_ab64: horz_a={} horz_b={} vert_a={} vert_b={}",
             sbab[0], sbab[1], sbab[2], sbab[3]
         );
+        let i4 = ec_av1::stream::intra_rect4_in_inter_counters();
+        println!(
+            "intra_rect4_in_inter: 64x16={} 16x64={} 32x8={} 8x32={}",
+            i4.0, i4.1, i4.2, i4.3
+        );
         let ir = ec_av1::stream::inter_rect_counters();
         println!(
             "inter_rect: 32x8={} 8x32={} 64x32={} 32x64={} 64x16={} 16x64={}",
