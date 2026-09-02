@@ -1604,14 +1604,29 @@ pub(crate) fn sb_rect_hits() -> usize {
 // PARTITION_HORZ decoded with `has_rows32 == false` (only the top 32x16 half
 // is coded), slot 3 = a PARTITION_VERT with `has_cols32 == false`. Both tile
 // paths (intra and inter) feed the same counter.
+//
+// lane-golomb r3: slots 4..7 are the same four facts one level up, at the
+// SUPERBLOCK (64x64) edge -- 4/5 = the gathered 64-level bit read as
+// HORZ/VERT / SPLIT, 6 = a 64x32 bottom-edge strip decoded with
+// `has_rows == false`, 7 = a 32x64 right-edge strip. Real aomenc answers a
+// bottom-edge superblock with the 64-level HORZ (measured: 192x80 flat-band,
+// every SB of the last row), so the 32-level slots stay 0 on that content and
+// only these prove the arm fired.
 thread_local! {
-    static EDGE32_HITS: std::cell::Cell<[usize; 4]> =
-        const { std::cell::Cell::new([0; 4]) };
+    static EDGE32_HITS: std::cell::Cell<[usize; 8]> =
+        const { std::cell::Cell::new([0; 8]) };
 }
 
 /// Current value of [`EDGE32_HITS`].
-pub(crate) fn edge32_hits() -> [usize; 4] {
+pub(crate) fn edge32_hits() -> [usize; 8] {
     EDGE32_HITS.with(|c| c.get())
+}
+
+/// [`bump_edge32`] of `base + bit`, returning the bit -- the gathered edge
+/// reads are `if`-conditions, so the counter has to ride the expression.
+fn bump_edge32_bit(base: usize, bit: usize) -> usize {
+    bump_edge32(base + bit.min(1));
+    bit
 }
 
 fn bump_edge32(slot: usize) {
@@ -4810,6 +4825,18 @@ fn decode_rect_split(
             let tu_mi = (mi_r + tu_row * (tx / MI), mi_c + tu_col * (tx / MI));
             let (tu_px, tu_py) = (px + tu_col * tx, py + tu_row * tx);
             let (col_off, row_off) = (tu_col * tx, tu_row * tx);
+            // lane-golomb r3: a frame-edge HORZ/VERT strip is the one block
+            // shape that hangs off the bottom (or right) of the frame, and
+            // libaom's `av1_foreach_transformed_block_in_plane` clips its
+            // loop bounds to `max_blocks_high/wide` (`mb_to_bottom_edge` /
+            // `mb_to_right_edge`, i.e. `mi_rows * 4` / `mi_cols * 4`): a unit
+            // whose TOP-LEFT sample is outside the frame is never coded. We
+            // read coefficients for those phantom units and desynced the
+            // stream right after -- the next superblock's partition symbol
+            // came out SPLIT instead of HORZ (192x80, mi_col=32).
+            if tu_px >= y.true_width || tu_py >= y.true_height {
+                continue;
+            }
             // `has_top_right`/`has_bottom_left` (libaom `reconintra.c`) for a
             // transform unit INSIDE a block, which is a different rule from
             // the standalone-block table [`Reach::of`] applies -- and the
@@ -7429,6 +7456,15 @@ fn decode_block(
                 );
                 let tu_px = px + tu_col * logical_tx;
                 let tu_py = py + tu_row * logical_tx;
+                // lane-golomb r3, same-shape sweep of the strip fix below:
+                // libaom clips this loop to `max_blocks_wide/high` too. A
+                // square block only hangs off the frame when the frame's mi
+                // dimensions are odd at the block's own level (lane-oddh
+                // territory), so no gate here reaches it -- it is the
+                // identical libaom rule, not a measured fix.
+                if tu_px >= y.true_width || tu_py >= y.true_height {
+                    continue;
+                }
                 let tu_around = neighbours.around_mi(tu_mi, logical_tx)[0];
                 let tu_reach = Reach::of(logical_tx, tu_px, tu_py, y.width, y.height);
                 // This transform unit's own bsize (`logical_tx`) is smaller
@@ -10246,18 +10282,14 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                 // mi_row=400 mi_col=0, the first block of that row.
                 match (has_cols, has_rows) {
                     (true, false) => {
-                        if dec.symbol_fixed(&gather(&cdfs.partition_w64[ctx], VERT_ALIKE)) == 1 {
-                            PARTITION_SPLIT
-                        } else {
-                            PARTITION_HORZ
-                        }
+                        let b = dec.symbol_fixed(&gather(&cdfs.partition_w64[ctx], VERT_ALIKE));
+                        bump_edge32(4 + b.min(1) as usize);
+                        if b == 1 { PARTITION_SPLIT } else { PARTITION_HORZ }
                     }
                     (false, true) => {
-                        if dec.symbol_fixed(&gather(&cdfs.partition_w64[ctx], HORZ_ALIKE)) == 1 {
-                            PARTITION_SPLIT
-                        } else {
-                            PARTITION_VERT
-                        }
+                        let b = dec.symbol_fixed(&gather(&cdfs.partition_w64[ctx], HORZ_ALIKE));
+                        bump_edge32(4 + b.min(1) as usize);
+                        if b == 1 { PARTITION_SPLIT } else { PARTITION_VERT }
                     }
                     _ => PARTITION_SPLIT,
                 }
@@ -11352,6 +11384,9 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                         tx_select,
                         reduced_tx_set,
                     )?;
+                    if !has_rows {
+                        bump_edge32(6);
+                    }
                     // lane-golomb r1: at the frame edge only the first half of the
                     // strip is coded (libaom `decode_partition` guards the second
                     // with the same has_rows test that made this partition non-square).
@@ -11393,6 +11428,9 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                         tx_select,
                         reduced_tx_set,
                     )?;
+                    if !has_cols {
+                        bump_edge32(7);
+                    }
                     // lane-golomb r1: at the frame edge only the first half of the
                     // strip is coded (libaom `decode_partition` guards the second
                     // with the same has_cols test that made this partition non-square).
@@ -17257,7 +17295,10 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                     // lane-golomb r1 (class `parsed-then-discarded`): the gathered
                     // bit IS the partition -- 0 means PARTITION_HORZ, only 1 means SPLIT
                     // (libaom `ec_read_partition_impl`).
-                    if dec.symbol_fixed(&gather(&cdfs.partition_w64[sb_ctx], VERT_ALIKE)) == 1 {
+                    if bump_edge32_bit(
+                        4,
+                        dec.symbol_fixed(&gather(&cdfs.partition_w64[sb_ctx], VERT_ALIKE)),
+                    ) == 1 {
                         PARTITION_SPLIT
                     } else {
                         PARTITION_HORZ
@@ -17267,7 +17308,10 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
                     // lane-golomb r1 (class `parsed-then-discarded`): the gathered
                     // bit IS the partition -- 0 means PARTITION_VERT, only 1 means SPLIT
                     // (libaom `ec_read_partition_impl`).
-                    if dec.symbol_fixed(&gather(&cdfs.partition_w64[sb_ctx], HORZ_ALIKE)) == 1 {
+                    if bump_edge32_bit(
+                        4,
+                        dec.symbol_fixed(&gather(&cdfs.partition_w64[sb_ctx], HORZ_ALIKE)),
+                    ) == 1 {
                         PARTITION_SPLIT
                     } else {
                         PARTITION_VERT
