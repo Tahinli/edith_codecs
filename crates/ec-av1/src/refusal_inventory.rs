@@ -35,7 +35,6 @@ const REFUSALS: &[&str] = &[
     "a split intra strip whose transform unit is {tx_w}x{tx_h} (no luma coefficient tables for that shape here)",
     "an inter partition below 8x8 (this decoder codes no inter leaf smaller than 8x8; lane-sub8 scoped to intra)",
     "a 16x16-level partition value outside PARTITION_NONE..PARTITION_VERT_4",
-    "a 16x4/4x16 strip whose transform is split (sub_tx_size_map[TX_16X4] == TX_8X4; the per-unit walk is not ported at this shape)",
     "a 1:4 rect strip that actually uses a palette (reconstruction is not ported at this shape)",
     "a 16x16 block whose true edge cuts through both axes needs a rectangular transform this decoder does not code yet",
     "a 16x16 inter block whose true edge cuts through both axes needs a rectangular transform this decoder does not code yet",
