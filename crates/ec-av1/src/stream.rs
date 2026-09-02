@@ -18,7 +18,6 @@
 use ec_av1_syntax::{
     Av1Parser, FrameHeader, FrameType, MAX_SEGMENTS, NUM_REF_FRAMES, ObuKind, PRIMARY_REF_NONE,
     SEG_LVL_GLOBALMV, SEG_LVL_REF_FRAME, SEG_LVL_SKIP, Tile, TxMode,
-    WarpModel,
 };
 use ec_core::{Error, Result};
 
@@ -375,16 +374,20 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
         // needed). AFFINE is untested this round (no aomenc fixture in the
         // wedge gate reached a 6-parameter model) -- keep refusing it by
         // name rather than shipping an unverified decode.
-        if header.frame_type != FrameType::Key
-            && header.global_motion[..7]
-                .iter()
-                .any(|gm| gm.model == WarpModel::Affine)
-        {
-            return Err(Error::unsupported(
-                "AV1 decode_stream",
-                "an inter frame whose global motion for a single-reference frame is AFFINE (unverified this round; ROTZOOM/TRANSLATION/IDENTITY are proven)",
-            ));
-        }
+        // lane-gmaffine r1: AFFINE is now GATED, not refused. Stock libaom
+        // can never write a 6-parameter model -- its encoder-side search is
+        // pinned to ROTZOOM (`av1/encoder/global_motion_facade.c:24`,
+        // `FIRST_GLOBAL_TRANS_TYPE == LAST_GLOBAL_TRANS_TYPE == ROTZOOM`) --
+        // which is why four rounds of `--enable-global-motion=1` recipes
+        // never reached the case. `scripts/build-aom-affine-oracle.sh` widens
+        // exactly that search range in a side build, and
+        // `a_real_affine_global_motion_stream_decodes_pixel_exact` below
+        // decodes its output pixel-exact against ffmpeg with
+        // `affine_gm_hits() > 0`, i.e. real blocks predicted through the
+        // 6-parameter warp. Nothing in the decoder needed changing: the
+        // header reader already reads params 4/5 with their own subexp refs
+        // (`ec-av1-syntax` `read_global_motion_params`) and `warp.rs`'s
+        // shear-validity check + `warp_affine` are model-agnostic.
         // lane-gm r4/r5/r6: r4 found a NEW mismatch on frames with two
         // concurrently active ROTZOOM/AFFINE ref slots (GOLDEN + BWDREF) and
         // refused the shape by name rather than guess-fix it. r5 localized
@@ -973,6 +976,18 @@ mod tests {
     /// mutex makes firing detection honest again (matches the existing
     /// cdf-forwarding-gate flake shape, ledger `omp-liveness-pgrep-self-match`).
     static GATE_COUNTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Three-bucket gate summary (class [[gate-skips-on-its-own-failure]]):
+    /// every attempt lands in exactly one bucket -- decoded pixel-exact WITH
+    /// the feature counter moving, decoded pixel-exact WITHOUT it, or a named
+    /// refusal -- and the three sum to the attempts made.
+    fn gate_buckets(name: &str, counted_exact: u32, uncounted_exact: u32, named_refusals: usize) {
+        eprintln!(
+            "{name}: buckets counted-exact={counted_exact} uncounted-exact={uncounted_exact} \
+             named-refusals={named_refusals} (attempts {})",
+            counted_exact as usize + uncounted_exact as usize + named_refusals
+        );
+    }
+
     fn lock_gate_counters() -> std::sync::MutexGuard<'static, ()> {
         GATE_COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -1774,6 +1789,68 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         (oracle_frames, hidden)
     }
+
+    /// lane-hidden r2: the `--arnr-maxframes=0` SECOND ARM of an existing
+    /// gate -- the gate's own recipe is never changed, this re-encodes the
+    /// same fixture with libaom's temporal alt-ref filter switched off and
+    /// runs [`decode_all_frames_vs_oracle`] on the result. Measured: with
+    /// the filter at its default EVERY alt-ref recipe in this file emits
+    /// ZERO hidden frames (the candidates are filtered away), so the
+    /// hidden-frame compare on the gate's own stream is vacuous; this arm
+    /// is what actually puts `show_frame == 0` frames on the wire.
+    ///
+    /// Runs at most once per gate name per process (the loop gates sweep
+    /// dozens of attempts and each arm costs a full encode + two decodes).
+    /// A stream this decoder refuses BY NAME skips the arm -- the arm is
+    /// about hidden frames, not about that capability gap -- while a pixel
+    /// mismatch is a hard failure raised inside the compare.
+    fn hidden_arnr_arm(name: &str, y4m: &[u8], args: &[&str]) -> Option<(usize, usize)> {
+        static ARMED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+            std::sync::OnceLock::new();
+        if !ARMED
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .insert(name.to_string())
+        {
+            return None;
+        }
+        let mut arm: Vec<&str> = vec!["--arnr-maxframes=0"];
+        arm.extend_from_slice(args);
+        let mut child = Command::new(aomenc_path())
+            .args(&arm)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("aomenc failed to start");
+        child
+            .stdin
+            .take()
+            .expect("aomenc stdin")
+            .write_all(y4m)
+            .expect("writing y4m to aomenc");
+        let out = child.wait_with_output().expect("aomenc failed to run");
+        assert!(
+            out.status.success(),
+            "{name} HIDDEN-ARM: aomenc refused its own recipe plus --arnr-maxframes=0: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stream = out.stdout;
+        match decode_stream(&stream) {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("unsupported"),
+                    "{name} HIDDEN-ARM failed outright: {msg}"
+                );
+                eprintln!("{name} HIDDEN-ARM: skipped on a named refusal: {msg}");
+                None
+            }
+            Ok(_) => Some(decode_all_frames_vs_oracle(&stream, &format!("{name}-arnr0"))),
+        }
+    }
+
 
     /// The repo's first hidden-frame pixel gate. Every other aomenc gate
     /// here compares `decode_stream`'s output against `ffmpeg -f obu`, and
@@ -3621,6 +3698,7 @@ mod tests {
         }
         let (width, height) = (64usize, 64usize);
         let mut refusals = Vec::new();
+        let mut uncounted_exact = 0u32;
         for attempt in 0..40u32 {
             let seed = 42 + attempt;
             // A flat gradient never has enough local detail for the RD
@@ -3735,11 +3813,16 @@ mod tests {
                     continue;
                 }
             };
-            if decode::tx_depth_hits() == before {
+            // class [[gate-skips-on-its-own-failure]]: a decode that succeeded
+            // is ALWAYS pixel-compared below; the hit counter only decides whether
+            // the attempt counts toward the firing total.
+            let counted = decode::tx_depth_hits() != before;
+            if !counted {
+                uncounted_exact += 1;
                 refusals.push(format!(
-                    "seed {seed}: decoded, but no block resolved a split tx_depth"
+                    "seed {seed}: decoded and pixel-compared, but no block resolved a split \
+                     tx_depth"
                 ));
-                continue;
             }
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
             assert_eq!(
@@ -3748,8 +3831,22 @@ mod tests {
             );
             assert_eq!(frames[0].u, ffmpeg_frames[0].u, "U vs ffmpeg (seed {seed})");
             assert_eq!(frames[0].v, ffmpeg_frames[0].v, "V vs ffmpeg (seed {seed})");
-            return;
+            if counted {
+                gate_buckets(
+                    "a_real_aomenc_intra_stream_with_tx_select_decodes_pixel_exact",
+                    1,
+                    uncounted_exact,
+                    refusals.len() - uncounted_exact as usize,
+                );
+                return;
+            }
         }
+        gate_buckets(
+            "a_real_aomenc_intra_stream_with_tx_select_decodes_pixel_exact",
+            0,
+            uncounted_exact,
+            refusals.len() - uncounted_exact as usize,
+        );
         eprintln!(
             "SKIP a_real_aomenc_intra_stream_with_tx_select_decodes_pixel_exact: every attempt \
              hit a named refusal or never split a transform:\n{}",
@@ -3799,6 +3896,7 @@ mod tests {
         }
         let (width, height, frame_count) = (64usize, 64usize, 4usize);
         let mut refusals = Vec::new();
+        let mut uncounted_exact = 0u32;
         for attempt in 0..40u32 {
             let seed = 42 + attempt;
             // Detail is what makes aomenc's RD prefer a split transform; a
@@ -3936,11 +4034,16 @@ mod tests {
                 decode::txfm_split_reads() - reads_before,
                 decode::txfm_split_hits() - hits_before,
             );
-            if hits == 0 {
+            // class [[gate-skips-on-its-own-failure]]: a decode that succeeded
+            // is ALWAYS pixel-compared below; the hit counter only decides whether
+            // the attempt counts toward the firing total.
+            let counted = hits != 0;
+            if !counted {
+                uncounted_exact += 1;
                 refusals.push(format!(
-                    "seed {seed}: decoded, but no block took a txfm_split ({reads} symbols read)"
+                    "seed {seed}: decoded and pixel-compared, but no block took a txfm_split \
+                     ({reads} symbols read)"
                 ));
-                continue;
             }
             let ffmpeg_frames = if bit_depth == 10 {
                 ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count)
@@ -3988,8 +4091,22 @@ mod tests {
                 assert_eq!(got.u, want.u, "frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "frame {i} V vs ffmpeg (seed {seed})");
             }
-            return;
+            if counted {
+                gate_buckets(
+                    &format!("tx_select_inter_gate({bit_depth})"),
+                    1,
+                    uncounted_exact,
+                    refusals.len() - uncounted_exact as usize,
+                );
+                return;
+            }
         }
+        gate_buckets(
+            &format!("tx_select_inter_gate({bit_depth})"),
+            0,
+            uncounted_exact,
+            refusals.len() - uncounted_exact as usize,
+        );
         panic!(
             "tx_select_inter_gate({bit_depth}) never observed a taken txfm_split:\n{}",
             refusals.join("\n")
@@ -4022,6 +4139,7 @@ mod tests {
         let (width, height) = (64usize, 64usize);
         let mut refusals = Vec::new();
         let mut fired_runs = 0u32;
+        let mut uncounted_exact = 0u32;
         for attempt in 0..40u32 {
             let seed = 42 + attempt;
             let source = format!(
@@ -4111,13 +4229,19 @@ mod tests {
                     continue;
                 }
             };
-            if decode::smooth_luma_hits() == smooth_before {
+            // class [[gate-skips-on-its-own-failure]]: a decode that succeeded
+            // is ALWAYS pixel-compared below; the hit counter only decides whether
+            // the attempt counts toward the firing total.
+            let counted = decode::smooth_luma_hits() != smooth_before;
+            if counted {
+                fired_runs += 1;
+            } else {
+                uncounted_exact += 1;
                 refusals.push(format!(
-                    "seed {seed}: decoded, but no smooth-luma-neighbour block fired"
+                    "seed {seed}: decoded and pixel-compared, but no smooth-luma-neighbour block \
+                     fired"
                 ));
-                continue;
             }
-            fired_runs += 1;
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
             assert_eq!(
                 frames[0].y, ffmpeg_frames[0].y,
@@ -4126,9 +4250,21 @@ mod tests {
             assert_eq!(frames[0].u, ffmpeg_frames[0].u, "U vs ffmpeg (seed {seed})");
             assert_eq!(frames[0].v, ffmpeg_frames[0].v, "V vs ffmpeg (seed {seed})");
             if fired_runs >= 4 {
+                gate_buckets(
+                    "a_real_aomenc_stream_with_smooth_luma_neighbour_decodes_pixel_exact",
+                    fired_runs,
+                    uncounted_exact,
+                    refusals.len() - uncounted_exact as usize,
+                );
                 return;
             }
         }
+        gate_buckets(
+            "a_real_aomenc_stream_with_smooth_luma_neighbour_decodes_pixel_exact",
+            fired_runs,
+            uncounted_exact,
+            refusals.len() - uncounted_exact as usize,
+        );
         assert!(
             fired_runs > 0,
             "every attempt hit a named refusal or never exercised a smooth luma neighbour:\n{}",
@@ -4161,6 +4297,7 @@ mod tests {
         let (width, height) = (64usize, 64usize);
         let mut refusals = Vec::new();
         let mut fired_runs = 0u32;
+        let mut uncounted_exact = 0u32;
         for attempt in 0..40u32 {
             let seed = 42 + attempt;
             let source = format!(
@@ -4237,13 +4374,18 @@ mod tests {
                     continue;
                 }
             };
-            if decode::smooth_uv_hits() == smooth_before {
+            // class [[gate-skips-on-its-own-failure]]: a decode that succeeded
+            // is ALWAYS pixel-compared below; the hit counter only decides whether
+            // the attempt counts toward the firing total.
+            let counted = decode::smooth_uv_hits() != smooth_before;
+            if counted {
+                fired_runs += 1;
+            } else {
+                uncounted_exact += 1;
                 refusals.push(format!(
-                    "seed {seed}: decoded, but no smooth/paeth uv_mode fired"
+                    "seed {seed}: decoded and pixel-compared, but no smooth/paeth uv_mode fired"
                 ));
-                continue;
             }
-            fired_runs += 1;
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
             assert_eq!(
                 frames[0].y, ffmpeg_frames[0].y,
@@ -4252,9 +4394,21 @@ mod tests {
             assert_eq!(frames[0].u, ffmpeg_frames[0].u, "U vs ffmpeg (seed {seed})");
             assert_eq!(frames[0].v, ffmpeg_frames[0].v, "V vs ffmpeg (seed {seed})");
             if fired_runs >= 4 {
+                gate_buckets(
+                    "a_real_aomenc_stream_with_smooth_paeth_chroma_decodes_pixel_exact",
+                    fired_runs,
+                    uncounted_exact,
+                    refusals.len() - uncounted_exact as usize,
+                );
                 return;
             }
         }
+        gate_buckets(
+            "a_real_aomenc_stream_with_smooth_paeth_chroma_decodes_pixel_exact",
+            fired_runs,
+            uncounted_exact,
+            refusals.len() - uncounted_exact as usize,
+        );
         assert!(
             fired_runs > 0,
             "every attempt hit a named refusal or never exercised smooth/paeth chroma:\n{}",
@@ -4289,6 +4443,7 @@ mod tests {
         let (width, height) = (64usize, 64usize);
         let mut refusals = Vec::new();
         let mut fired_runs = 0u32;
+        let mut uncounted_exact = 0u32;
         for attempt in 0..40u32 {
             let seed = 42 + attempt;
             let source = format!(
@@ -4389,16 +4544,20 @@ mod tests {
                     continue;
                 }
             };
-            if decode::directional_uv_hits() == uv_before
-                && decode::angle_delta_hits() == angle_before
-            {
+            // class [[gate-skips-on-its-own-failure]]: a decode that succeeded
+            // is ALWAYS pixel-compared below; the hit counter only decides whether
+            // the attempt counts toward the firing total.
+            let counted = decode::directional_uv_hits() != uv_before
+                || decode::angle_delta_hits() != angle_before;
+            if counted {
+                fired_runs += 1;
+            } else {
+                uncounted_exact += 1;
                 refusals.push(format!(
-                    "seed {seed}: decoded, but neither a directional uv_mode nor a \
-                     nonzero angle delta fired"
+                    "seed {seed}: decoded and pixel-compared, but neither a directional uv_mode \
+                     nor a nonzero angle delta fired"
                 ));
-                continue;
             }
-            fired_runs += 1;
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
             assert_eq!(
                 frames[0].y, ffmpeg_frames[0].y,
@@ -4407,9 +4566,21 @@ mod tests {
             assert_eq!(frames[0].u, ffmpeg_frames[0].u, "U vs ffmpeg (seed {seed})");
             assert_eq!(frames[0].v, ffmpeg_frames[0].v, "V vs ffmpeg (seed {seed})");
             if fired_runs >= 4 {
+                gate_buckets(
+                    "a_real_aomenc_stream_with_directional_chroma_decodes_pixel_exact",
+                    fired_runs,
+                    uncounted_exact,
+                    refusals.len() - uncounted_exact as usize,
+                );
                 return;
             }
         }
+        gate_buckets(
+            "a_real_aomenc_stream_with_directional_chroma_decodes_pixel_exact",
+            fired_runs,
+            uncounted_exact,
+            refusals.len() - uncounted_exact as usize,
+        );
         assert!(
             fired_runs > 0,
             "every attempt hit a named refusal or never exercised directional chroma:\n{}",
@@ -5361,12 +5532,14 @@ mod tests {
                 }
                 Ok(frames) => frames,
             };
-            if decode::non_last_ref_hits() == before {
-                // This seed's RD search never actually picked GOLDEN_FRAME --
-                // a genuine miss, not a refusal. Try the next seed rather
-                // than claiming coverage this attempt did not exercise.
+            // class [[gate-skips-on-its-own-failure]]: a decode that succeeded
+            // is ALWAYS pixel-compared below; the hit counter only decides whether
+            // the attempt counts toward the firing total.
+            // This seed's RD search may never have picked GOLDEN_FRAME -- a
+            // genuine miss, not a refusal, and not a reason to skip the pixels.
+            let counted = decode::non_last_ref_hits() != before;
+            if !counted {
                 never_fired += 1;
-                continue;
             }
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
             assert_eq!(frames.len(), frame_count);
@@ -5387,12 +5560,26 @@ mod tests {
                 assert_eq!(got.u, want.u, "frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "frame {i} V vs ffmpeg (seed {seed})");
             }
-            eprintln!(
-                "FIRING seed {seed}: non_last_ref_hits advanced by {}",
-                decode::non_last_ref_hits() - before
-            );
-            return;
+            if counted {
+                eprintln!(
+                    "FIRING seed {seed}: non_last_ref_hits advanced by {}",
+                    decode::non_last_ref_hits() - before
+                );
+                gate_buckets(
+                    "a_real_aomenc_inter_sequence_with_a_golden_reference_decodes_pixel_exact",
+                    1,
+                    never_fired,
+                    refusals.len(),
+                );
+                return;
+            }
         }
+        gate_buckets(
+            "a_real_aomenc_inter_sequence_with_a_golden_reference_decodes_pixel_exact",
+            0,
+            never_fired,
+            refusals.len(),
+        );
         eprintln!(
             "SKIP a_real_aomenc_inter_sequence_with_a_golden_reference_decodes_pixel_exact: \
              {never_fired} attempts decoded but never fired GOLDEN_FRAME, and every other \
@@ -5542,9 +5729,12 @@ mod tests {
                 }
                 Ok(frames) => frames,
             };
-            if decode::ref_hits(target_ref) == before {
+            // class [[gate-skips-on-its-own-failure]]: a decode that succeeded
+            // is ALWAYS pixel-compared below; the hit counter only decides whether
+            // the attempt counts toward the firing total.
+            let counted = decode::ref_hits(target_ref) != before;
+            if !counted {
                 never_fired += 1;
-                continue;
             }
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
             assert_eq!(frames.len(), frame_count);
@@ -5572,12 +5762,35 @@ mod tests {
                     "{gate_name} frame {i} V vs ffmpeg (seed {seed})"
                 );
             }
+            // lane-hidden r2 (class gate-blind-to-hidden-frames): the same
+            // stream again, comparing EVERY decode-order frame -- the hidden
+            // (show_frame == 0) alt-ref frames the ffmpeg compare above
+            // cannot see, because both sides of it emit shown frames only.
+            let (hidden_total, hidden_n) = decode_all_frames_vs_oracle(&stream, gate_name);
             eprintln!(
-                "{gate_name} FIRING seed {seed}: {target_ref_name} hits advanced by {}",
-                decode::ref_hits(target_ref) - before
+                "{gate_name} HIDDEN: seed {seed}: {hidden_total} decode-order frames, \
+                 {hidden_n} hidden, all pixel-exact vs the oracle"
             );
-            return;
+            // lane-hidden r2 SECOND ARM (the recipe above is untouched):
+            // libaom's temporal alt-ref filter absorbs this recipe's hidden
+            // frames, so the compare above is vacuous -- re-encode the same
+            // fixture with --arnr-maxframes=0 and compare THOSE.
+            if let Some((arm_total, arm_hidden)) = hidden_arnr_arm(gate_name, &y4m.stdout, &args) {
+                eprintln!(
+                    "{gate_name} HIDDEN-ARM(--arnr-maxframes=0): seed {seed}: {arm_total} \
+                     decode-order frames, {arm_hidden} hidden, all pixel-exact vs the oracle"
+                );
+            }
+            if counted {
+                eprintln!(
+                    "{gate_name} FIRING seed {seed}: {target_ref_name} hits advanced by {}",
+                    decode::ref_hits(target_ref) - before
+                );
+                gate_buckets(gate_name, 1, never_fired, refusals.len());
+                return;
+            }
         }
+        gate_buckets(gate_name, 0, never_fired, refusals.len());
         eprintln!(
             "SKIP {gate_name}: {never_fired} attempts decoded but never fired {target_ref_name}, \
              and every other attempt hit a named refusal:\n{}",
@@ -5747,9 +5960,12 @@ mod tests {
                     continue;
                 }
                 Ok(frames) => {
-                    if decode::comp_mode_hits() == before {
+                    // class [[gate-skips-on-its-own-failure]]: a decode that
+                    // succeeded is ALWAYS pixel-compared below; the hit counter
+                    // only decides whether the attempt counts as firing.
+                    let counted = decode::comp_mode_hits() != before;
+                    if !counted {
                         never_fired += 1;
-                        continue;
                     }
                     // Outcome (c): plain COMPOUND_AVERAGE decoded fully --
                     // non-negotiable pixel exactness, no tolerance.
@@ -5790,15 +6006,38 @@ mod tests {
                             assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
                         }
                     }
+                    // lane-hidden r2 (class gate-blind-to-hidden-frames): the same
+                    // stream again, comparing EVERY decode-order frame -- the hidden
+                    // (show_frame == 0) alt-ref frames the ffmpeg compare above
+                    // cannot see, because both sides of it emit shown frames only.
+                    let (hidden_total, hidden_n) = decode_all_frames_vs_oracle(&stream, NAME);
                     eprintln!(
-                        "{NAME} FIRING seed {seed}: comp_mode hits advanced by {}, decoded \
-                         fully and pixel-exact",
-                        decode::comp_mode_hits() - before
+                        "{NAME} HIDDEN: seed {seed}: {hidden_total} decode-order frames, \
+                         {hidden_n} hidden, all pixel-exact vs the oracle"
                     );
-                    return;
+                    // lane-hidden r2 SECOND ARM (the recipe above is untouched):
+                    // libaom's temporal alt-ref filter absorbs this recipe's hidden
+                    // frames, so the compare above is vacuous -- re-encode the same
+                    // fixture with --arnr-maxframes=0 and compare THOSE.
+                    if let Some((arm_total, arm_hidden)) = hidden_arnr_arm(NAME, &y4m.stdout, &args) {
+                        eprintln!(
+                            "{NAME} HIDDEN-ARM(--arnr-maxframes=0): seed {seed}: {arm_total} \
+                             decode-order frames, {arm_hidden} hidden, all pixel-exact vs the oracle"
+                        );
+                    }
+                    if counted {
+                        eprintln!(
+                            "{NAME} FIRING seed {seed}: comp_mode hits advanced by {}, decoded \
+                             fully and pixel-exact",
+                            decode::comp_mode_hits() - before
+                        );
+                        gate_buckets(NAME, 1, never_fired, refusals.len());
+                        return;
+                    }
                 }
             }
         }
+        gate_buckets(NAME, 0, never_fired, refusals.len());
         eprintln!(
             "SKIP {NAME}: {never_fired} attempts decoded fully (reference_select never drove a \
              block to COMPOUND_REFERENCE) and every other attempt hit a named refusal that never \
@@ -5937,9 +6176,12 @@ mod tests {
                 }
                 Ok(frames) => frames,
             };
-            if decode::skip_mode_hits() == before {
+            // class [[gate-skips-on-its-own-failure]]: a decode that succeeded
+            // is ALWAYS pixel-compared below; the hit counter only decides whether
+            // the attempt counts toward the firing total.
+            let counted = decode::skip_mode_hits() != before;
+            if !counted {
                 never_fired += 1;
-                continue;
             }
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
             assert_eq!(frames.len(), frame_count);
@@ -5972,12 +6214,35 @@ mod tests {
                     );
                 }
             }
+            // lane-hidden r2 (class gate-blind-to-hidden-frames): the same
+            // stream again, comparing EVERY decode-order frame -- the hidden
+            // (show_frame == 0) alt-ref frames the ffmpeg compare above
+            // cannot see, because both sides of it emit shown frames only.
+            let (hidden_total, hidden_n) = decode_all_frames_vs_oracle(&stream, NAME);
             eprintln!(
-                "{NAME} FIRING seed {seed}: skip_mode hits advanced by {}",
-                decode::skip_mode_hits() - before
+                "{NAME} HIDDEN: seed {seed}: {hidden_total} decode-order frames, \
+                 {hidden_n} hidden, all pixel-exact vs the oracle"
             );
-            return;
+            // lane-hidden r2 SECOND ARM (the recipe above is untouched):
+            // libaom's temporal alt-ref filter absorbs this recipe's hidden
+            // frames, so the compare above is vacuous -- re-encode the same
+            // fixture with --arnr-maxframes=0 and compare THOSE.
+            if let Some((arm_total, arm_hidden)) = hidden_arnr_arm(NAME, &y4m.stdout, &args) {
+                eprintln!(
+                    "{NAME} HIDDEN-ARM(--arnr-maxframes=0): seed {seed}: {arm_total} \
+                     decode-order frames, {arm_hidden} hidden, all pixel-exact vs the oracle"
+                );
+            }
+            if counted {
+                eprintln!(
+                    "{NAME} FIRING seed {seed}: skip_mode hits advanced by {}",
+                    decode::skip_mode_hits() - before
+                );
+                gate_buckets(NAME, 1, never_fired, refusals.len());
+                return;
+            }
         }
+        gate_buckets(NAME, 0, never_fired, refusals.len());
         eprintln!(
             "SKIP {NAME}: {never_fired} attempts decoded but never fired skip_mode, and every \
              other attempt hit a named refusal:\n{}",
@@ -6113,9 +6378,12 @@ mod tests {
                 }
                 Ok(frames) => frames,
             };
-            if decode::obmc_hits() == before {
+            // class [[gate-skips-on-its-own-failure]]: a decode that succeeded
+            // is ALWAYS pixel-compared below; the hit counter only decides whether
+            // the attempt counts toward the firing total.
+            let counted = decode::obmc_hits() != before;
+            if !counted {
                 never_fired += 1;
-                continue;
             }
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
             assert_eq!(frames.len(), frame_count);
@@ -6134,12 +6402,35 @@ mod tests {
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
             }
+            // lane-hidden r2 (class gate-blind-to-hidden-frames): the same
+            // stream again, comparing EVERY decode-order frame -- the hidden
+            // (show_frame == 0) alt-ref frames the ffmpeg compare above
+            // cannot see, because both sides of it emit shown frames only.
+            let (hidden_total, hidden_n) = decode_all_frames_vs_oracle(&stream, NAME);
             eprintln!(
-                "{NAME} FIRING seed {seed}: obmc hits advanced by {}",
-                decode::obmc_hits() - before
+                "{NAME} HIDDEN: seed {seed}: {hidden_total} decode-order frames, \
+                 {hidden_n} hidden, all pixel-exact vs the oracle"
             );
-            return;
+            // lane-hidden r2 SECOND ARM (the recipe above is untouched):
+            // libaom's temporal alt-ref filter absorbs this recipe's hidden
+            // frames, so the compare above is vacuous -- re-encode the same
+            // fixture with --arnr-maxframes=0 and compare THOSE.
+            if let Some((arm_total, arm_hidden)) = hidden_arnr_arm(NAME, &y4m.stdout, &args) {
+                eprintln!(
+                    "{NAME} HIDDEN-ARM(--arnr-maxframes=0): seed {seed}: {arm_total} \
+                     decode-order frames, {arm_hidden} hidden, all pixel-exact vs the oracle"
+                );
+            }
+            if counted {
+                eprintln!(
+                    "{NAME} FIRING seed {seed}: obmc hits advanced by {}",
+                    decode::obmc_hits() - before
+                );
+                gate_buckets(NAME, 1, never_fired, refusals.len());
+                return;
+            }
         }
+        gate_buckets(NAME, 0, never_fired, refusals.len());
         eprintln!(
             "SKIP {NAME}: {never_fired} attempts decoded but never fired obmc, and every \
              other attempt hit a named refusal:\n{}",
@@ -6304,9 +6595,12 @@ mod tests {
             };
             let fired8 = decode::obmc_hits_8() - before8;
             total_obmc8 += fired8;
-            if fired8 == 0 {
+            // class [[gate-skips-on-its-own-failure]]: a decode that succeeded
+            // is ALWAYS pixel-compared below; the hit counter only decides whether
+            // the attempt counts toward the firing total.
+            let counted = fired8 != 0;
+            if !counted {
                 never_fired += 1;
-                continue;
             }
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
             assert_eq!(frames.len(), frame_count);
@@ -6325,13 +6619,39 @@ mod tests {
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
             }
+            // lane-hidden r2 (class gate-blind-to-hidden-frames): the same
+            // stream again, comparing EVERY decode-order frame -- the hidden
+            // (show_frame == 0) alt-ref frames the ffmpeg compare above
+            // cannot see, because both sides of it emit shown frames only.
+            let (hidden_total, hidden_n) = decode_all_frames_vs_oracle(&stream, NAME);
             eprintln!(
-                "{NAME} FIRING seed {seed}: 8x8 obmc hits {fired8} (total across attempts so far {total_obmc8})"
+                "{NAME} HIDDEN: seed {seed}: {hidden_total} decode-order frames, \
+                 {hidden_n} hidden, all pixel-exact vs the oracle"
             );
-            return;
+            // lane-hidden r2 SECOND ARM (the recipe above is untouched):
+            // libaom's temporal alt-ref filter absorbs this recipe's hidden
+            // frames, so the compare above is vacuous -- re-encode the same
+            // fixture with --arnr-maxframes=0 and compare THOSE.
+            if let Some((arm_total, arm_hidden)) = hidden_arnr_arm(NAME, &y4m.stdout, &args) {
+                eprintln!(
+                    "{NAME} HIDDEN-ARM(--arnr-maxframes=0): seed {seed}: {arm_total} \
+                     decode-order frames, {arm_hidden} hidden, all pixel-exact vs the oracle"
+                );
+            }
+            if counted {
+                eprintln!(
+                    "{NAME} FIRING seed {seed}: 8x8 obmc hits {fired8} (total across attempts so far {total_obmc8})"
+                );
+                gate_buckets(NAME, 1, never_fired, refusals.len());
+                return;
+            }
         }
-        eprintln!(
-            "SKIP {NAME}: {never_fired} attempts decoded but never fired an 8x8 obmc block \
+        gate_buckets(NAME, 0, never_fired, refusals.len());
+        // lane-gmaffine r2: this gate fired for three rounds only as a SKIP
+        // (gate-skips-on-its-own-failure); the 8x8 leaf is reachable now, so a
+        // sweep that never lands one firing pixel-exact attempt is a FAILURE.
+        panic!(
+            "{NAME}: {never_fired} attempts decoded but never fired an 8x8 obmc block \
              ({total_obmc8} total 8x8 obmc hits across all attempts), and every other attempt \
              hit a named refusal:\n{}",
             refusals.join("\n")
@@ -6490,6 +6810,25 @@ mod tests {
                 assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
+            }
+            // lane-hidden r2 (class gate-blind-to-hidden-frames): the same
+            // stream again, comparing EVERY decode-order frame -- the hidden
+            // (show_frame == 0) alt-ref frames the ffmpeg compare above
+            // cannot see, because both sides of it emit shown frames only.
+            let (hidden_total, hidden_n) = decode_all_frames_vs_oracle(&stream, NAME);
+            eprintln!(
+                "{NAME} HIDDEN: seed {seed}: {hidden_total} decode-order frames, \
+                 {hidden_n} hidden, all pixel-exact vs the oracle"
+            );
+            // lane-hidden r2 SECOND ARM (the recipe above is untouched):
+            // libaom's temporal alt-ref filter absorbs this recipe's hidden
+            // frames, so the compare above is vacuous -- re-encode the same
+            // fixture with --arnr-maxframes=0 and compare THOSE.
+            if let Some((arm_total, arm_hidden)) = hidden_arnr_arm(NAME, &y4m.stdout, &args) {
+                eprintln!(
+                    "{NAME} HIDDEN-ARM(--arnr-maxframes=0): seed {seed}: {arm_total} \
+                     decode-order frames, {arm_hidden} hidden, all pixel-exact vs the oracle"
+                );
             }
             matched += 1;
         }
@@ -6940,6 +7279,25 @@ mod tests {
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
             }
+            // lane-hidden r2 (class gate-blind-to-hidden-frames): the same
+            // stream again, comparing EVERY decode-order frame -- the hidden
+            // (show_frame == 0) alt-ref frames the ffmpeg compare above
+            // cannot see, because both sides of it emit shown frames only.
+            let (hidden_total, hidden_n) = decode_all_frames_vs_oracle(&stream, NAME);
+            eprintln!(
+                "{NAME} HIDDEN: seed {seed}: {hidden_total} decode-order frames, \
+                 {hidden_n} hidden, all pixel-exact vs the oracle"
+            );
+            // lane-hidden r2 SECOND ARM (the recipe above is untouched):
+            // libaom's temporal alt-ref filter absorbs this recipe's hidden
+            // frames, so the compare above is vacuous -- re-encode the same
+            // fixture with --arnr-maxframes=0 and compare THOSE.
+            if let Some((arm_total, arm_hidden)) = hidden_arnr_arm(NAME, &y4m.stdout, &args) {
+                eprintln!(
+                    "{NAME} HIDDEN-ARM(--arnr-maxframes=0): seed {seed}: {arm_total} \
+                     decode-order frames, {arm_hidden} hidden, all pixel-exact vs the oracle"
+                );
+            }
             matched += 1;
         }
         assert!(
@@ -6955,6 +7313,242 @@ mod tests {
             "{NAME}: {named_refusals} other-capability refusals, {matched} pixel-exact matches out of {n_attempts}, interintra_hits={}",
             crate::decode::interintra_hits()
         );
+    }
+
+    /// lane-scaledref r1: a real aomenc `--superres-mode=1` sequence with
+    /// compound, OBMC, interintra and 8x8 leaves ALL enabled must decode
+    /// pixel-exact -- these are the combinations the three
+    /// "... with a scaled reference (superres, unimplemented)" refusals used
+    /// to cover. Each combination gets its OWN hard-asserted hit counter
+    /// (`crate::decode::scaled_*_hits`), because an unscaled reference would
+    /// pass the pixels and prove nothing (class `gate-blind-to-feature`), and
+    /// a stream that scales but never takes compound/OBMC/interintra/8x8
+    /// would prove nothing about the code this round adds either. A refusal
+    /// naming a scaled reference is a hard failure: those are exactly the
+    /// strings this round lifts. Other named capabilities skip that seed.
+    #[test]
+    fn a_real_aomenc_superres_stream_with_compound_obmc_and_interintra_decodes_pixel_exact()
+    {
+        const NAME: &str = "a_real_aomenc_superres_stream_with_compound_obmc_and_interintra_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height, frame_count) = (64usize, 64usize, 24usize);
+        let mut named_refusals = 0u32;
+        let mut matched = 0u32;
+        let n_attempts: u32 = std::env::var("EC_SCALEDREF_GATE_ATTEMPTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(12);
+        for attempt in 0..n_attempts {
+            let seed = 42 + attempt;
+            let duration = frame_count as f64 / 25.0;
+            let source =
+                gradients_source(seed, width, height, &format!("duration={duration}:rate=25"));
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", "yuv420p", "-f",
+                    "yuv4mpegpipe", "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let on = |name: &str| {
+                if std::env::var(name).as_deref() == Ok("0") { "0" } else { "1" }
+            };
+            // lane-scaledref r2: warp is ON. A warp-capable frame header
+            // under a scaled reference is exactly the case r1 got wrong
+            // (the block must read the 2-symbol `obmc_cdf`, not the
+            // 3-symbol `motion_mode_cdf` -- libaom `motion_mode_allowed`,
+            // blockd.h:1484), and it decoded silently wrong pixels rather
+            // than refusing. `EC_SCALEDREF_WARP=0` turns it off for
+            // bisecting only.
+            let warp = format!("--enable-warped-motion={}", on("EC_SCALEDREF_WARP"));
+            // lane-scaledref r2: `EC_SCALEDREF_MODE=3` (qthresh) lets
+            // superres switch on and off per frame, so a compound block can
+            // reference one scaled and one unscaled reference -- the mixed
+            // case mode 1 (every frame scaled) never produces.
+            let superres_mode = format!(
+                "--superres-mode={}",
+                std::env::var("EC_SCALEDREF_MODE").unwrap_or_else(|_| "1".into())
+            );
+            let obmc = format!("--enable-obmc={}", on("EC_SCALEDREF_OBMC"));
+            let interintra = format!("--enable-interintra-comp={}", on("EC_SCALEDREF_II"));
+            let lag = format!(
+                "--lag-in-frames={}",
+                if on("EC_SCALEDREF_COMP") == "0" { "0" } else { "25" }
+            );
+            let alt_ref = format!("--auto-alt-ref={}", on("EC_SCALEDREF_COMP"));
+            let args: Vec<&str> = vec![
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                "--cq-level=45",
+                "--cpu-used=0",
+                "--kf-max-dist=1000",
+                "--threads=1",
+                "--row-mt=0",
+                "--sb-size=64",
+                // superres on every frame, key and inter alike -- the scaled
+                // reference this gate is about.
+                // denominator 16 (the maximum) keeps the CODED frame
+                // 32x64 -- a multiple of 16 both ways, so no frame-edge
+                // 16x16 straddle forces a sub-16x16 partition this decoder
+                // still refuses on the aligned path ("an inter partition
+                // below 16x16"). Denominator 12 codes 43 columns and every
+                // seed refused there.
+                &superres_mode,
+                "--superres-denominator=16",
+                "--superres-kf-denominator=16",
+                // the four combinations this round lifts (each switchable
+                // by env for bisecting a mismatch without a rebuild)
+                &alt_ref,
+                &lag,
+                "--enable-order-hint=1",
+                &warp,
+                &obmc,
+                &interintra,
+                "--enable-smooth-interintra=1",
+                "--enable-interintra-wedge=0",
+                "--enable-masked-comp=0",
+                "--enable-onesided-comp=0",
+                "--enable-fwd-kf=0",
+                "--tune-content=default",
+                "--max-partition-size=32",
+                "--min-partition-size=32",
+                // everything this decoder still refuses under any reference
+                "--enable-rect-partitions=0",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0",
+                "--enable-filter-intra=0",
+                "--enable-smooth-intra=0",
+                "--enable-paeth-intra=0",
+                "--enable-directional-intra=0",
+                "--enable-angle-delta=0",
+                "--enable-tx-size-search=0",
+                "--enable-cdef=0",
+                "--enable-restoration=0",
+                "--enable-palette=0",
+                "--enable-intrabc=0",
+                "--enable-cfl-intra=0",
+                "--enable-ref-frame-mvs=0",
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ];
+            let mut child = Command::new(aomenc_path())
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let frames = match decode_stream(&stream) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME} failed outright, not a named refusal (seed {seed}): {msg}"
+                    );
+                    assert!(
+                        !msg.contains("scaled reference"),
+                        "{NAME} refused on a scaled reference (seed {seed}) -- those refusals \
+                         are exactly what this round lifts: {msg}"
+                    );
+                    named_refusals += 1;
+                    eprintln!("seed {seed} refusal (other capability): {msg}");
+                    continue;
+                }
+                Ok(frames) => frames,
+            };
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
+            assert_eq!(frames.len(), frame_count);
+            if let Ok(path) = std::env::var("EC_AV1_GATE_DUMP") {
+                let mismatched = frames
+                    .iter()
+                    .zip(&ffmpeg_frames)
+                    .any(|(got, want)| got.y != want.y || got.u != want.u || got.v != want.v);
+                if mismatched {
+                    std::fs::write(&path, &stream).expect("writing pinned stream");
+                    eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
+                }
+            }
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
+                assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
+            }
+            matched += 1;
+        }
+        eprintln!(
+            "{NAME}: {named_refusals} other-capability refusals, {matched}/{n_attempts} pixel-exact, \
+             superres_hits={} predict_scaled_hits={} scaled_compound={} scaled_warp_fallback={} \
+             scaled_obmc={} scaled_interintra={} scaled_block8={} scaled_warp_suppressed={} mixed_scale_compound={}",
+            crate::superres::superres_hits(),
+            crate::mc::predict_scaled_hits(),
+            crate::decode::scaled_compound_hits(),
+            crate::decode::scaled_warp_fallback_hits(),
+            crate::decode::scaled_obmc_hits(),
+            crate::decode::scaled_interintra_hits(),
+            crate::decode::scaled_block8_hits(),
+            crate::decode::scaled_warp_suppressed_hits(),
+            crate::decode::mixed_scale_compound_hits(),
+        );
+        assert!(
+            matched > 0,
+            "{NAME}: every attempt refused on other capabilities; the gate proves nothing"
+        );
+        assert!(
+            crate::mc::predict_scaled_hits() > 0,
+            "{NAME}: matched but zero predict_scaled_hits -- no block took the scaled MC path"
+        );
+        // The 8x8 leaf is NOT asserted here: it stays refused (no recipe
+        // produced an 8x8 inter leaf at all), so its counter is a
+        // diagnostic only -- see this gate's own doc and decode.rs.
+        // `scaled_warp_suppressed` IS asserted: it counts the blocks whose
+        // WARPED_CAUSAL eligibility libaom drops because the reference is
+        // scaled, i.e. the blocks that must read `obmc_cdf`. Zero of them
+        // would mean this gate's `--enable-warped-motion=1` never reached a
+        // warp-eligible block and proves nothing about r2's fix.
+        assert!(
+            crate::decode::scaled_warp_suppressed_hits() > 0,
+            "{NAME}: {matched} matches but no block had its warp eligibility \
+             suppressed by a scaled reference -- the warp arm proves nothing"
+        );
+        for (hits, what) in [
+            (crate::decode::scaled_compound_hits(), "compound with a scaled reference"),
+            (crate::decode::scaled_obmc_hits(), "OBMC with a scaled reference"),
+            (crate::decode::scaled_interintra_hits(), "interintra with a scaled reference"),
+        ] {
+            assert!(hits > 0, "{NAME}: {matched} matches but zero blocks took {what}");
+        }
     }
 
     /// lane-wii r2: `--enable-interintra-wedge=1` streams must DECODE
@@ -7120,6 +7714,25 @@ mod tests {
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
             }
+            // lane-hidden r2 (class gate-blind-to-hidden-frames): the same
+            // stream again, comparing EVERY decode-order frame -- the hidden
+            // (show_frame == 0) alt-ref frames the ffmpeg compare above
+            // cannot see, because both sides of it emit shown frames only.
+            let (hidden_total, hidden_n) = decode_all_frames_vs_oracle(&stream, NAME);
+            eprintln!(
+                "{NAME} HIDDEN: seed {seed}: {hidden_total} decode-order frames, \
+                 {hidden_n} hidden, all pixel-exact vs the oracle"
+            );
+            // lane-hidden r2 SECOND ARM (the recipe above is untouched):
+            // libaom's temporal alt-ref filter absorbs this recipe's hidden
+            // frames, so the compare above is vacuous -- re-encode the same
+            // fixture with --arnr-maxframes=0 and compare THOSE.
+            if let Some((arm_total, arm_hidden)) = hidden_arnr_arm(NAME, &y4m.stdout, &args) {
+                eprintln!(
+                    "{NAME} HIDDEN-ARM(--arnr-maxframes=0): seed {seed}: {arm_total} \
+                     decode-order frames, {arm_hidden} hidden, all pixel-exact vs the oracle"
+                );
+            }
             matched += 1;
         }
         assert!(
@@ -7138,6 +7751,401 @@ mod tests {
             "{NAME}: {named_refusals} other-capability refusals, {matched} pixel-exact matches out of {n_attempts}, wii_hits={}",
             crate::decode::wii_hits()
         );
+    }
+
+    /// The affine-capable encoder (`scripts/build-aom-affine-oracle.sh`),
+    /// separate from the shared oracle because stock libaom's global-motion
+    /// model search is pinned to ROTZOOM and can never emit AFFINE.
+    fn affine_aomenc_path() -> std::path::PathBuf {
+        if let Some(p) = std::env::var_os("EC_AV1_AFFINE_AOMENC") {
+            return std::path::PathBuf::from(p);
+        }
+        let home = std::env::var_os("HOME").unwrap_or_default();
+        std::path::PathBuf::from(home).join(".cache/aom-affine/build/aomenc")
+    }
+
+    fn have_affine_aomenc() -> bool {
+        let present = affine_aomenc_path().is_file();
+        assert!(
+            present || std::env::var_os("EC_AV1_REQUIRE_AOMENC").is_none(),
+            "EC_AV1_REQUIRE_AOMENC is set but no affine-capable aomenc at {} -- run \
+             scripts/build-aom-affine-oracle.sh",
+            affine_aomenc_path().display()
+        );
+        present
+    }
+
+    /// lane-gmaffine r1: an inter frame whose `global_motion_params` carries a
+    /// SIX-parameter (`AFFINE`) model for a single-reference frame -- refused
+    /// by name since lane-gm r4 because no aomenc recipe ever reached it.
+    /// The reason it never did is in libaom's own encoder, not in the
+    /// content: `av1/encoder/global_motion_facade.c:24` pins the model search
+    /// to `ROTZOOM` at both ends, so *no* `--enable-global-motion=1` command
+    /// line over any source can produce the case. The decoder must still
+    /// handle it (the bitstream allows it, `read_global_motion_params` reads
+    /// params 4/5 with their own subexp references, and ffmpeg decodes it),
+    /// so this gate widens exactly that one encoder-side search range in a
+    /// side build and encodes with it. Everything downstream is ordinary
+    /// libaom and the pixel oracle is still ffmpeg.
+    ///
+    /// Content: rotation composed with a progressive *anisotropic* stretch --
+    /// a similarity transform plus unequal axis scaling is precisely what a
+    /// 4-parameter ROTZOOM model cannot express, which is what makes the
+    /// encoder's RD pick AFFINE. `affine_gm_hits()` hard-asserts that real
+    /// blocks were predicted through the 6-parameter warp, not merely that a
+    /// header parsed one (class `gate-blind-to-feature`).
+    #[test]
+    fn a_real_affine_global_motion_stream_decodes_pixel_exact() {
+        const NAME: &str = "a_real_affine_global_motion_stream_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_affine_aomenc() {
+            eprintln!(
+                "SKIP {NAME}: no affine-capable aomenc at {} (scripts/build-aom-affine-oracle.sh)",
+                affine_aomenc_path().display()
+            );
+            return;
+        }
+        let (width, height, frame_count) = (64usize, 64usize, 24usize);
+        let duration = frame_count as f64 / 25.0;
+        // Both depths: his own AV1 library is yuv420p10le throughout, and a
+        // 10-bit AFFINE warp runs the same `warp_affine` over wider samples.
+        for depth in [8u32, 10u32] {
+            // `-t` is the real bound on mandelbrot (it ignores `end_pts` and
+            // has hung a gate for an hour); the 96x96 source is rotated and
+            // then stretched horizontally only, and cropped back to 64x64.
+            let source = format!(
+                "mandelbrot=size=96x96:rate=25,rotate=a=0.12*t:c=black,\
+                 scale=w='ceil(96*(1+0.03*n)/2)*2':h=96:eval=frame,crop={width}:{height}"
+            );
+            let pix_fmt = if depth == 10 { "yuv420p10le" } else { "yuv420p" };
+            let mut ff_args: Vec<&str> =
+                vec!["-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", pix_fmt];
+            // y4m has no official 10-bit tag, same as the 10-bit gate above.
+            if depth == 10 {
+                ff_args.extend(["-strict", "-1"]);
+            }
+            let duration_arg = duration.to_string();
+            ff_args.extend(["-t", &duration_arg, "-f", "yuv4mpegpipe", "-"]);
+            let y4m = Command::new("ffmpeg")
+                .args(&ff_args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let bit_depth = format!("--bit-depth={depth}");
+            let input_bit_depth = format!("--input-bit-depth={depth}");
+            let args: Vec<&str> = vec![
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                "--cq-level=45",
+                "--cpu-used=0",
+                "--kf-max-dist=1000",
+                "--threads=1",
+                "--row-mt=0",
+                "--auto-alt-ref=0",
+                "--lag-in-frames=0",
+                "--enable-fwd-kf=0",
+                "--enable-order-hint=1",
+                "--enable-global-motion=1",
+                "--enable-warped-motion=0",
+                "--enable-obmc=0",
+                "--tune-content=default",
+                "--enable-masked-comp=0",
+                "--enable-interintra-comp=0",
+                "--enable-onesided-comp=0",
+                "--enable-rect-partitions=0",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0",
+                "--enable-filter-intra=0",
+                "--enable-smooth-intra=0",
+                "--enable-paeth-intra=0",
+                "--enable-directional-intra=0",
+                "--enable-angle-delta=0",
+                "--enable-tx-size-search=0",
+                "--enable-cdef=0",
+                "--enable-restoration=0",
+                "--max-partition-size=32",
+                "--min-partition-size=32",
+                "--enable-palette=0",
+                "--enable-intrabc=0",
+                "--enable-cfl-intra=0",
+                "--enable-ref-frame-mvs=0",
+                &bit_depth,
+                &input_bit_depth,
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ];
+            let mut child = Command::new(affine_aomenc_path())
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("affine aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let before = crate::decode::affine_gm_hits();
+            let frames =
+                decode_stream(&stream).unwrap_or_else(|e| panic!("{NAME} ({depth}-bit): {e}"));
+            let ffmpeg_frames = if depth == 10 {
+                ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count)
+            } else {
+                ffmpeg_decode_sequence(&stream, width, height, frame_count)
+            };
+            assert_eq!(frames.len(), frame_count);
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(got.y, want.y, "{NAME} {depth}-bit frame {i} luma vs ffmpeg");
+                assert_eq!(got.u, want.u, "{NAME} {depth}-bit frame {i} U vs ffmpeg");
+                assert_eq!(got.v, want.v, "{NAME} {depth}-bit frame {i} V vs ffmpeg");
+            }
+            let hits = crate::decode::affine_gm_hits() - before;
+            assert!(
+                hits > 0,
+                "{NAME} ({depth}-bit): decoded pixel-exact but no block was predicted through a \
+                 6-parameter global-motion warp -- the AFFINE path is unexercised"
+            );
+            eprintln!("{NAME}: {depth}-bit, {frame_count} frames pixel-exact, affine_gm_hits={hits}");
+        }
+    }
+
+    /// lane-gmaffine r1: the two 8x8-LEAF motion gates. `decode_inter_block8`
+    /// is a separate function from [`decode_inter_block`], and until this
+    /// round it refused both `GLOBALMV` ("GLOBALMV (round 3)") and
+    /// `WARPED_CAUSAL` at that size while the 16x16+ leaf had implemented
+    /// both for rounds. The reason no earlier gate caught it: the existing
+    /// 8x8 OBMC gate clamps `--max-partition-size=32` and aomenc's RD then
+    /// never splits down to a clean 8x8 leaf (that gate has never fired in
+    /// 80 attempts). `--min-partition-size=8 --max-partition-size=8` removes
+    /// the choice entirely -- every inter leaf in the stream IS an 8x8 one,
+    /// so the leaf path is exercised by construction rather than by luck.
+    ///
+    /// Content is the affine gate's rotating/zooming mandelbrot (global
+    /// motion the encoder can actually model), and the hit counters
+    /// (`globalmv_hits_8` / `warp_hits_8`) are 8x8-leaf-specific: a
+    /// 16x16-leaf GLOBALMV or warp cannot satisfy them.
+    fn run_8x8_leaf_motion_gate(
+        name: &str,
+        global_motion: bool,
+        counter: fn() -> usize,
+    ) {
+        // 72x64: `decode_inter_block8` is reached ONLY through the
+        // true-edge-straddling 16x16 path (an interior 16x16
+        // PARTITION_SPLIT is still refused by name), so the frame is 8
+        // luma columns wider than its last whole superblock -- every 16x16
+        // block in that right-hand strip is cut on ONE axis and decodes as
+        // four 8x8 leaves by construction. `--min-partition-size=16` keeps
+        // the interior out of the still-refused sub-16x16 case.
+        let (width, height, frame_count) = (64usize, 64usize, 24usize);
+        let duration = frame_count as f64 / 25.0;
+        // The encoder's own RD still chooses WHICH 8x8 leaf codes GLOBALMV /
+        // WARPED_CAUSAL, and at some quantisers it picks a rect partition at
+        // 16x16 (still refused) or a non-LAST reference (still refused at the
+        // 8x8 leaf) before ever reaching one. So sweep a few quantisers and
+        // require at least one attempt, at each depth, that BOTH decodes
+        // pixel-exact AND fires the counter -- a refusing attempt is recorded,
+        // never a pass (class `gate-skips-on-its-own-failure`).
+        let mut fired_any = [false; 2];
+        let mut notes: Vec<String> = Vec::new();
+        for (di, depth) in [8u32, 10u32].into_iter().enumerate() {
+          for cq in [32u32, 45, 55] {
+            let cq_arg = format!("--cq-level={cq}");
+            let max_part_arg = format!(
+                "--max-partition-size={}",
+                std::env::var("EC_8X8_MAXPART").unwrap_or_else(|_| "8".into())
+            );
+            let source = format!(
+                "mandelbrot=size=96x96:rate=25,rotate=a=0.12*t:c=black,\
+                 scale=w='ceil(96*(1+0.03*n)/2)*2':h=96:eval=frame,crop={width}:{height}"
+            );
+            let pix_fmt = if depth == 10 { "yuv420p10le" } else { "yuv420p" };
+            let mut ff_args: Vec<&str> =
+                vec!["-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", pix_fmt];
+            if depth == 10 {
+                ff_args.extend(["-strict", "-1"]);
+            }
+            let duration_arg = duration.to_string();
+            ff_args.extend(["-t", &duration_arg, "-f", "yuv4mpegpipe", "-"]);
+            let y4m = Command::new("ffmpeg")
+                .args(&ff_args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let bit_depth = format!("--bit-depth={depth}");
+            let input_bit_depth = format!("--input-bit-depth={depth}");
+            let gm_arg = format!("--enable-global-motion={}", u8::from(global_motion));
+            let warp_arg = format!("--enable-warped-motion={}", u8::from(!global_motion));
+            let args: Vec<&str> = vec![
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                &cq_arg,
+                "--cpu-used=0",
+                "--kf-max-dist=1000",
+                "--threads=1",
+                "--row-mt=0",
+                "--auto-alt-ref=0",
+                "--lag-in-frames=0",
+                "--enable-fwd-kf=0",
+                "--enable-order-hint=1",
+                &gm_arg,
+                &warp_arg,
+                "--enable-obmc=0",
+                "--tune-content=default",
+                "--enable-masked-comp=0",
+                "--enable-interintra-comp=0",
+                "--enable-onesided-comp=0",
+                "--enable-rect-partitions=0",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=0",
+                "--enable-filter-intra=0",
+                "--enable-smooth-intra=0",
+                "--enable-paeth-intra=0",
+                "--enable-directional-intra=0",
+                "--enable-angle-delta=0",
+                "--enable-tx-size-search=0",
+                "--enable-cdef=0",
+                "--enable-restoration=0",
+                &max_part_arg,
+                "--min-partition-size=8",
+                "--enable-palette=0",
+                "--enable-intrabc=0",
+                "--enable-cfl-intra=0",
+                "--enable-ref-frame-mvs=0",
+                &bit_depth,
+                &input_bit_depth,
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ];
+            let mut child = Command::new(aomenc_path())
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let before = counter();
+            let frames = match decode_stream(&stream) {
+                Ok(f) => f,
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{name} ({depth}-bit, cq {cq}) failed outright: {msg}"
+                    );
+                    notes.push(format!("{depth}-bit cq {cq}: {msg}"));
+                    continue;
+                }
+            };
+            let ffmpeg_frames = if depth == 10 {
+                ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count)
+            } else {
+                ffmpeg_decode_sequence(&stream, width, height, frame_count)
+            };
+            assert_eq!(frames.len(), frame_count);
+            let hits = counter() - before;
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(got.y, want.y, "{name} {depth}-bit frame {i} luma vs ffmpeg");
+                assert_eq!(got.u, want.u, "{name} {depth}-bit frame {i} U vs ffmpeg");
+                assert_eq!(got.v, want.v, "{name} {depth}-bit frame {i} V vs ffmpeg");
+            }
+            if hits == 0 {
+                notes.push(format!(
+                    "{depth}-bit cq {cq}: {frame_count} frames pixel-exact but 0 8x8-leaf hits"
+                ));
+                continue;
+            }
+            fired_any[di] = true;
+            eprintln!(
+                "{name}: {depth}-bit cq {cq}, {frame_count} frames pixel-exact, 8x8 hits={hits}"
+            );
+          }
+        }
+        assert!(
+            fired_any[0] && fired_any[1],
+            "{name}: no attempt both decoded pixel-exact and fired the 8x8 leaf \
+             (8-bit fired {}, 10-bit fired {}):\n{}",
+            fired_any[0], fired_any[1], notes.join("\n")
+        );
+    }
+
+    /// lane-gmaffine r1 item (3): `GLOBALMV` at an 8x8 leaf, ROTZOOM global
+    /// motion, warp built from the frame's own model.
+    #[test]
+    fn a_real_globalmv_8x8_leaf_stream_decodes_pixel_exact() {
+        const NAME: &str = "a_real_globalmv_8x8_leaf_stream_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        run_8x8_leaf_motion_gate(NAME, true, crate::decode::globalmv_hits_8);
+    }
+
+    /// lane-gmaffine r1 item (2): `WARPED_CAUSAL` at an 8x8 leaf --
+    /// findSamples + `av1_find_projection` + the warp filter at BLOCK_8X8.
+    #[test]
+    fn a_real_warped_causal_8x8_leaf_stream_decodes_pixel_exact() {
+        const NAME: &str = "a_real_warped_causal_8x8_leaf_stream_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        run_8x8_leaf_motion_gate(NAME, false, crate::decode::warp_hits_8);
     }
 
     /// lane-rect16 r1/r2: a plain default-settings aomenc run over lavfi
@@ -7441,6 +8449,25 @@ mod tests {
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
             }
+            // lane-hidden r2 (class gate-blind-to-hidden-frames): the same
+            // stream again, comparing EVERY decode-order frame -- the hidden
+            // (show_frame == 0) alt-ref frames the ffmpeg compare above
+            // cannot see, because both sides of it emit shown frames only.
+            let (hidden_total, hidden_n) = decode_all_frames_vs_oracle(&stream, NAME);
+            eprintln!(
+                "{NAME} HIDDEN: seed {seed}: {hidden_total} decode-order frames, \
+                 {hidden_n} hidden, all pixel-exact vs the oracle"
+            );
+            // lane-hidden r2 SECOND ARM (the recipe above is untouched):
+            // libaom's temporal alt-ref filter absorbs this recipe's hidden
+            // frames, so the compare above is vacuous -- re-encode the same
+            // fixture with --arnr-maxframes=0 and compare THOSE.
+            if let Some((arm_total, arm_hidden)) = hidden_arnr_arm(NAME, &y4m.stdout, &args) {
+                eprintln!(
+                    "{NAME} HIDDEN-ARM(--arnr-maxframes=0): seed {seed}: {arm_total} \
+                     decode-order frames, {arm_hidden} hidden, all pixel-exact vs the oracle"
+                );
+            }
             matched += 1;
         }
         assert!(
@@ -7641,6 +8668,25 @@ mod tests {
                 assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
+            }
+            // lane-hidden r2 (class gate-blind-to-hidden-frames): the same
+            // stream again, comparing EVERY decode-order frame -- the hidden
+            // (show_frame == 0) alt-ref frames the ffmpeg compare above
+            // cannot see, because both sides of it emit shown frames only.
+            let (hidden_total, hidden_n) = decode_all_frames_vs_oracle(&stream, NAME);
+            eprintln!(
+                "{NAME} HIDDEN: seed {seed}: {hidden_total} decode-order frames, \
+                 {hidden_n} hidden, all pixel-exact vs the oracle"
+            );
+            // lane-hidden r2 SECOND ARM (the recipe above is untouched):
+            // libaom's temporal alt-ref filter absorbs this recipe's hidden
+            // frames, so the compare above is vacuous -- re-encode the same
+            // fixture with --arnr-maxframes=0 and compare THOSE.
+            if let Some((arm_total, arm_hidden)) = hidden_arnr_arm(NAME, &y4m.stdout, &args) {
+                eprintln!(
+                    "{NAME} HIDDEN-ARM(--arnr-maxframes=0): seed {seed}: {arm_total} \
+                     decode-order frames, {arm_hidden} hidden, all pixel-exact vs the oracle"
+                );
             }
             matched += 1;
         }
@@ -8048,6 +9094,25 @@ mod tests {
                 assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
+            }
+            // lane-hidden r2 (class gate-blind-to-hidden-frames): the same
+            // stream again, comparing EVERY decode-order frame -- the hidden
+            // (show_frame == 0) alt-ref frames the ffmpeg compare above
+            // cannot see, because both sides of it emit shown frames only.
+            let (hidden_total, hidden_n) = decode_all_frames_vs_oracle(&stream, NAME);
+            eprintln!(
+                "{NAME} HIDDEN: seed {seed}: {hidden_total} decode-order frames, \
+                 {hidden_n} hidden, all pixel-exact vs the oracle"
+            );
+            // lane-hidden r2 SECOND ARM (the recipe above is untouched):
+            // libaom's temporal alt-ref filter absorbs this recipe's hidden
+            // frames, so the compare above is vacuous -- re-encode the same
+            // fixture with --arnr-maxframes=0 and compare THOSE.
+            if let Some((arm_total, arm_hidden)) = hidden_arnr_arm(NAME, &y4m.stdout, &args) {
+                eprintln!(
+                    "{NAME} HIDDEN-ARM(--arnr-maxframes=0): seed {seed}: {arm_total} \
+                     decode-order frames, {arm_hidden} hidden, all pixel-exact vs the oracle"
+                );
             }
             matched += 1;
         }
@@ -8480,6 +9545,25 @@ mod tests {
                 assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
+            }
+            // lane-hidden r2 (class gate-blind-to-hidden-frames): the same
+            // stream again, comparing EVERY decode-order frame -- the hidden
+            // (show_frame == 0) alt-ref frames the ffmpeg compare above
+            // cannot see, because both sides of it emit shown frames only.
+            let (hidden_total, hidden_n) = decode_all_frames_vs_oracle(&stream, NAME);
+            eprintln!(
+                "{NAME} HIDDEN: seed {seed}: {hidden_total} decode-order frames, \
+                 {hidden_n} hidden, all pixel-exact vs the oracle"
+            );
+            // lane-hidden r2 SECOND ARM (the recipe above is untouched):
+            // libaom's temporal alt-ref filter absorbs this recipe's hidden
+            // frames, so the compare above is vacuous -- re-encode the same
+            // fixture with --arnr-maxframes=0 and compare THOSE.
+            if let Some((arm_total, arm_hidden)) = hidden_arnr_arm(NAME, &y4m.stdout, &args) {
+                eprintln!(
+                    "{NAME} HIDDEN-ARM(--arnr-maxframes=0): seed {seed}: {arm_total} \
+                     decode-order frames, {arm_hidden} hidden, all pixel-exact vs the oracle"
+                );
             }
             matched += 1;
         }
@@ -9045,9 +10129,12 @@ mod tests {
                 }
                 Ok(frames) => frames,
             };
-            if decode::tmv_hits() == before {
+            // class [[gate-skips-on-its-own-failure]]: a decode that succeeded
+            // is ALWAYS pixel-compared below; the hit counter only decides whether
+            // the attempt counts toward the firing total.
+            let counted = decode::tmv_hits() != before;
+            if !counted {
                 never_fired += 1;
-                continue;
             }
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
             assert_eq!(frames.len(), frame_count);
@@ -9075,12 +10162,16 @@ mod tests {
                     "{gate_name} frame {i} V vs ffmpeg (seed {seed})"
                 );
             }
-            eprintln!(
-                "{gate_name} FIRING seed {seed}: tmv_hits advanced by {}",
-                decode::tmv_hits() - before
-            );
-            return;
+            if counted {
+                eprintln!(
+                    "{gate_name} FIRING seed {seed}: tmv_hits advanced by {}",
+                    decode::tmv_hits() - before
+                );
+                gate_buckets(gate_name, 1, never_fired, refusals.len());
+                return;
+            }
         }
+        gate_buckets(gate_name, 0, never_fired, refusals.len());
         eprintln!(
             "SKIP {gate_name}: {never_fired} attempts decoded but never fired a temporal MV \
              candidate, and every other attempt hit a named refusal:\n{}",
@@ -9223,6 +10314,7 @@ mod tests {
         let (width, height) = (64usize, 64usize);
         let mut refusals = Vec::new();
         let mut fired_runs = 0u32;
+        let mut uncounted_exact = 0u32;
         for attempt in 0..60u32 {
             let cq = 20 + (attempt % 5) * 10;
             let period = [4u32, 6, 8, 12, 16][(attempt as usize / 5) % 5];
@@ -9316,11 +10408,16 @@ mod tests {
                     continue;
                 }
             };
-            if decode::tx_class1_hits() == before {
+            // class [[gate-skips-on-its-own-failure]]: a decode that succeeded
+            // is ALWAYS pixel-compared below; the hit counter only decides whether
+            // the attempt counts toward the firing total.
+            let counted = decode::tx_class1_hits() != before;
+            if !counted {
+                uncounted_exact += 1;
                 refusals.push(format!(
-                    "cq={cq} period={period}: decoded, but no block read a V_DCT/H_DCT tx_type"
+                    "cq={cq} period={period}: decoded and pixel-compared, but no block read a \
+                     V_DCT/H_DCT tx_type"
                 ));
-                continue;
             }
             let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, 1);
             assert_eq!(
@@ -9335,11 +10432,25 @@ mod tests {
                 frames[0].v, ffmpeg_frames[0].v,
                 "V vs ffmpeg (cq={cq} period={period})"
             );
-            fired_runs += 1;
-            if fired_runs >= 4 {
-                return;
+            if counted {
+                fired_runs += 1;
+                if fired_runs >= 4 {
+                    gate_buckets(
+                        "a_real_aomenc_min8_stream_with_tx_class1_decodes_pixel_exact",
+                        fired_runs,
+                        uncounted_exact,
+                        refusals.len() - uncounted_exact as usize,
+                    );
+                    return;
+                }
             }
         }
+        gate_buckets(
+            "a_real_aomenc_min8_stream_with_tx_class1_decodes_pixel_exact",
+            fired_runs,
+            uncounted_exact,
+            refusals.len() - uncounted_exact as usize,
+        );
         panic!(
             "fewer than 4 firing+pixel-exact runs out of 60 attempts:\n{}",
             refusals.join("\n")
@@ -10790,6 +11901,25 @@ mod tests {
                 assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
                 assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
                 assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
+            }
+            // lane-hidden r2 (class gate-blind-to-hidden-frames): the same
+            // stream again, comparing EVERY decode-order frame -- the hidden
+            // (show_frame == 0) alt-ref frames the ffmpeg compare above
+            // cannot see, because both sides of it emit shown frames only.
+            let (hidden_total, hidden_n) = decode_all_frames_vs_oracle(&stream, NAME);
+            eprintln!(
+                "{NAME} HIDDEN: seed {seed}: {hidden_total} decode-order frames, \
+                 {hidden_n} hidden, all pixel-exact vs the oracle"
+            );
+            // lane-hidden r2 SECOND ARM (the recipe above is untouched):
+            // libaom's temporal alt-ref filter absorbs this recipe's hidden
+            // frames, so the compare above is vacuous -- re-encode the same
+            // fixture with --arnr-maxframes=0 and compare THOSE.
+            if let Some((arm_total, arm_hidden)) = hidden_arnr_arm(NAME, &y4m.stdout, &args) {
+                eprintln!(
+                    "{NAME} HIDDEN-ARM(--arnr-maxframes=0): seed {seed}: {arm_total} \
+                     decode-order frames, {arm_hidden} hidden, all pixel-exact vs the oracle"
+                );
             }
             matched += 1;
         }
@@ -12400,14 +13530,20 @@ mod tests {
     /// which is the per-unit availability rule this port exists for, and no
     /// gate fired one before this round.
     ///
-    /// This gate was `#[ignore]`d RED through r1 (seed 50 luma (171,56)).
-    /// Root cause, r2: not availability at all -- `av1_nz_map_ctx_offset` is
-    /// packed COLUMN-major, so [`crate::decode::base_ctx`] read the
-    /// `TX_32X64`/`TX_64X32` offset tables transposed and desynced the first
-    /// SB-level strip whose luma corner held a coefficient below row 1 (see
-    /// that function's comment). The strip's own per-unit prediction was
-    /// already exact.
-    #[ignore = "lane-rectsplit r3: RED at seed 50; the nz_map transposition r2 blamed turns the merged SB HORZ/VERT partition gate RED at seed 43, cause still open"]
+    /// This gate was `#[ignore]`d RED through r3 (seed 50 luma (171,56)).
+    /// Root cause, r4, TWO defects, neither of them availability -- the
+    /// strip's own per-unit prediction was exact all along:
+    /// 1. `av1_nz_map_ctx_offset` is indexed by libaom's COLUMN-major
+    ///    `coeff_idx = col * 32 + row`, so [`crate::decode::base_ctx`] read
+    ///    the `TX_32X64`/`TX_64X32` offset tables transposed (r2 saw this and
+    ///    r3 reverted it, because "fixing" it turned the merged SB HORZ/VERT
+    ///    gate RED at seed 43);
+    /// 2. that seed-43 RED was a SECOND defect the first one had been hiding
+    ///    behind a refusal: `EOB_PT_512_CHROMA` was transcribed from
+    ///    `av1_default_eob_multi512_cdfs`'s `eob_multi_ctx = 1` row (the flat
+    ///    `V_DCT`/`H_DCT` distribution), so the first real 32x16 chroma
+    ///    transform read `eob_pt` 7 where aomdec read 2. With both fixed,
+    ///    seeds 43 and 50 are pixel-exact.
     #[test]
     fn a_real_aomenc_stream_with_a_split_transform_superblock_strip_decodes_pixel_exact() {
         const NAME: &str = "a_real_aomenc_stream_with_a_split_transform_superblock_strip_decodes_pixel_exact";
@@ -13040,5 +14176,198 @@ mod tests {
             assert_eq!(got.u, want.u, "frame {i} U vs ffmpeg (pinned sbpart)");
             assert_eq!(got.v, want.v, "frame {i} V vs ffmpeg (pinned sbpart)");
         }
+    }
+
+    /// lane-tx64x16 r1: a real `aomenc` stream whose superblock-level
+    /// partition decision is `PARTITION_HORZ_4`/`PARTITION_VERT_4` (four
+    /// 64x16 / 16x64 strips) must decode pixel-exact. Both arms are HARD
+    /// asserted, and only hits earned inside an attempt that then compared
+    /// pixel-exact against ffmpeg are counted -- a strip decoded by an
+    /// attempt that later refused proves nothing (class
+    /// gate-skips-on-its-own-failure). `--enable-1to4-partitions=1` is the
+    /// tool switch; `--min-partition-size=16` keeps the RD search from
+    /// recursing below 16x16, where several other unlanded partition shapes
+    /// live.
+    #[test]
+    fn a_real_aomenc_stream_with_a_superblock_level_1to4_partition_decodes_pixel_exact() {
+        const NAME: &str =
+            "a_real_aomenc_stream_with_a_superblock_level_1to4_partition_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height, frame_count) = (192usize, 128usize, 1usize);
+        let mut named_refusals = 0u32;
+        let mut matched = 0u32;
+        let (mut horz_proved, mut vert_proved) = (0usize, 0usize);
+        let (mut out_of_scope, mut out_of_scope_mismatch) = (0u32, 0u32);
+        let n_attempts: u32 = std::env::var("EC_TX64X16_GATE_ATTEMPTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(40);
+        for attempt in 0..n_attempts {
+            let seed = 42 + attempt;
+            let duration = frame_count as f64 / 25.0;
+            // Odd attempts render the SAME generator rotated 90 degrees
+            // (generated at height x width, then `transpose`), because
+            // aomenc's RD picks `PARTITION_VERT_4` on this content and
+            // essentially never `HORZ_4`: the two arms are a transposed
+            // pair, and a gate that only ever sees one of them cannot catch
+            // a transposed scan/context table (class scan-weights-cross-axis).
+            let source = if attempt % 2 == 0 {
+                gradients_source(seed, width, height, &format!("duration={duration}:rate=25"))
+            } else {
+                format!(
+                    "{},transpose=1",
+                    gradients_source(seed, height, width, &format!("duration={duration}:rate=25"))
+                )
+            };
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", "yuv420p", "-f",
+                    "yuv4mpegpipe", "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let args: Vec<&str> = vec![
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                "--cq-level=45",
+                "--cpu-used=0",
+                "--threads=1",
+                "--row-mt=0",
+                "--sb-size=64",
+                "--enable-rect-partitions=1",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=1",
+                "--min-partition-size=16",
+                "--max-partition-size=64",
+                "--enable-restoration=0",
+                "--enable-palette=0",
+                "--deltaq-mode=0",
+                "--enable-filter-intra=0",
+                "--enable-cfl-intra=0",
+                "--enable-intrabc=0",
+                "--enable-tx-size-search=0",
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ];
+            let mut child = Command::new(aomenc_path())
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let before = (
+                crate::decode::sb_rect4_horz_hits(),
+                crate::decode::sb_rect4_vert_hits(),
+            );
+            let frames = match decode_stream(&stream) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME} failed outright, not a named refusal (seed {seed}): {msg}"
+                    );
+                    named_refusals += 1;
+                    eprintln!("seed {seed} refusal: {msg}");
+                    continue;
+                }
+                Ok(frames) => frames,
+            };
+            let (horz, vert) = (
+                crate::decode::sb_rect4_horz_hits() - before.0,
+                crate::decode::sb_rect4_vert_hits() - before.1,
+            );
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
+            assert_eq!(frames.len(), frame_count);
+            let mismatched = frames
+                .iter()
+                .zip(&ffmpeg_frames)
+                .any(|(got, want)| got.y != want.y || got.u != want.u || got.v != want.v);
+            if horz + vert == 0 {
+                // Out of this gate's territory: aomenc's RD picked no 1:4
+                // partition at all for this seed, so the attempt can neither
+                // prove nor disprove the arms under test. NOT silently
+                // dropped -- counted and printed, and a mismatch here is
+                // reported as a defect of another lane's shape (r1 found
+                // one: seed 55 of this very recipe decodes 3944 wrong luma
+                // samples with zero 1:4 blocks in the stream, first at
+                // (154, 59), inside the 64x32 `PARTITION_HORZ` superblock at
+                // (128, 64) -- see lanes/tx64x16-r1.report.md). Selecting on
+                // "the stream contains the feature", never on "the stream
+                // decoded correctly", is what keeps this from being survivor
+                // bias.
+                out_of_scope += 1;
+                if mismatched {
+                    out_of_scope_mismatch += 1;
+                    eprintln!(
+                        "{NAME}: seed {seed} MISMATCHES with zero 1:4 blocks -- a pre-existing \
+                         defect of another shape, not this gate's arms"
+                    );
+                }
+                continue;
+            }
+            if mismatched {
+                if let Ok(path) = std::env::var("EC_AV1_GATE_DUMP") {
+                    std::fs::write(&path, &stream).expect("writing pinned stream");
+                    eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
+                }
+            }
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
+                assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
+            }
+            horz_proved += horz;
+            vert_proved += vert;
+            matched += 1;
+        }
+        assert!(
+            matched > 0,
+            "{NAME}: every attempt refused; the gate never decoded a stream"
+        );
+        assert!(
+            horz_proved > 0 && vert_proved > 0,
+            "{NAME}: a 1:4 arm never fired inside a pixel-exact attempt \
+             (horz={horz_proved}, vert={vert_proved}, {matched} matches, {named_refusals} \
+             refusals out of {n_attempts}) -- gate proved nothing this run"
+        );
+        eprintln!(
+            "{NAME}: {named_refusals} named refusals, {matched} pixel-exact matches out of \
+             {n_attempts}, horz_4 strips={horz_proved}, vert_4 strips={vert_proved}, \
+             {out_of_scope} attempts carried no 1:4 block ({out_of_scope_mismatch} of them \
+             mismatched -- other lanes' shapes)"
+        );
     }
 }
