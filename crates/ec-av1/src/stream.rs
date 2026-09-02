@@ -30615,6 +30615,71 @@ mod tests {
     }
 
 
+    /// lane-t900 r11: the frame-edge MV clamp witness.
+    ///
+    /// `crates/ec-av1/fixtures/hg_head_mvclamp_witness.obu` (72158 bytes,
+    /// sha256 451a9b138995e636f22308847a123b5c8621d4908cd93772cf5bbf2b37df39d7,
+    /// truncated twice independently to identical hashes) is the first 80
+    /// frame-carrying OBUs of a 10-bit 3840x1608 HDR film head -- the SMALLEST
+    /// such prefix that fires the clamp (N=79 fires 0, N=80 fires 5). 55
+    /// decode-order frames, 52 shown, every decode-order frame byte-identical
+    /// to instrumented aomdec (`EC_AV1_FINAL_DUMP`, see the r11 report).
+    ///
+    /// The path it pins: libaom's `mb_to_right_edge` / `mb_to_bottom_edge`
+    /// (`set_mi_row_col`, av1_common_int.h) are SIGNED, and a block that
+    /// overhangs the frame's right/bottom edge keeps its full `bw4`/`bh4`, so
+    /// `mi_cols - bw4 - mi_col` and `mi_rows - bh4 - mi_row` go NEGATIVE there
+    /// and `clamp_mv_ref` (mvref_common.h) narrows the stack window by that
+    /// much. This frame height is 1608 -> `mi_rows == 402`, so every 64x64
+    /// block on the bottom row overhangs by 14 mi units. Computing that
+    /// difference in `usize` saturated it to 0 and left the window 448 subpel
+    /// too wide, so an edge block's predictor was never clamped -- one 64x64
+    /// NEWMV block at mi(400,368) took `mv0=(224,568)` where libaom takes
+    /// `(32,568)`, its MC then read the replicated bottom row instead of real
+    /// reference rows, and the frame missed by 221 bytes.
+    #[test]
+    fn a_10bit_film_frames_with_frame_edge_mv_clamping_decode_pixel_exact() {
+        const NAME: &str = "a_10bit_film_frames_with_frame_edge_mv_clamping_decode_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/hg_head_mvclamp_witness.obu");
+        let stream = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path.display()));
+        let (width, height) = (3840usize, 1608usize);
+        let clamp_before = crate::mvstack::mv_clamp_edge_overhang_hits();
+        let frames = match decode_stream(&stream) {
+            Ok(frames) => frames,
+            Err(e) => panic!("{NAME}: decode_stream refused: {e}"),
+        };
+        let clamped = crate::mvstack::mv_clamp_edge_overhang_hits() - clamp_before;
+        assert!(
+            clamped > 0,
+            "{NAME}: mv_clamp_edge_overhang never fired -- the gate would be vacuous for it"
+        );
+        assert_eq!(frames.len(), 52, "{NAME}: 52 shown frames");
+        assert_eq!((frames[0].width, frames[0].height), (width, height));
+        let ffmpeg_frames = ffmpeg_decode_sequence_10bit(&stream, width, height, frames.len());
+        assert_eq!(
+            ffmpeg_frames.len(),
+            frames.len(),
+            "{NAME}: ffmpeg returned {} frames, we decoded {}",
+            ffmpeg_frames.len(),
+            frames.len()
+        );
+        for (i, (ours, theirs)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+            assert_eq!(ours.y, theirs.y, "{NAME}: frame {i} luma vs ffmpeg");
+            assert_eq!(ours.u, theirs.u, "{NAME}: frame {i} U vs ffmpeg");
+            assert_eq!(ours.v, theirs.v, "{NAME}: frame {i} V vs ffmpeg");
+        }
+        eprintln!(
+            "{NAME}: 52 shown frames pixel-exact on every plane; \
+             mv_clamp_edge_overhang={clamped}"
+        );
+    }
+
     /// lane-sub8x4 r2, the gate that lifts BOTH sub-8x8 intra refusals ("an
     /// intra 4x4 block inside an inter frame's sub-8x8 split" and "an intra
     /// 8x4/4x8 block inside an inter frame's sub-8x8 HORZ/VERT partition").
