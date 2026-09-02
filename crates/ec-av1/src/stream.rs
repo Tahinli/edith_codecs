@@ -19532,10 +19532,36 @@ mod tests {
     ///   `frame_width` clip, is correct.
     /// * The divergence therefore enters in CDEF, at the last 8x8 CDEF block
     ///   column/row, which is the one that straddles the crop edge.
-    /// `#[ignore]` so the suite stays green; run it with
-    /// `cargo test -p ec-av1 --lib -- --ignored a_frame_edge_straddling_band`.
+    /// lane-cdef r2: CLOSED, and un-ignored. r1 rooted the luma half in
+    /// `apply_cdef`'s direction search, which clamped at the CROPPED frame
+    /// edge while libaom runs `cdef_find_dir` over `cdef_prepare_fb`'s buffer
+    /// -- whose columns/rows past the MI-ROUNDED extent (`hsize = nhb <<
+    /// mi_wide_l2`, `cdef.c:164-167`, and the `frame_boundary[RIGHT]`
+    /// CDEF_VERY_LARGE fill at `cdef.c:249-256`) are CDEF_VERY_LARGE, not the
+    /// last real sample. The chroma half was lane-golomb r8's loop-restoration
+    /// plane size (LR is the one post-decode filter sized by the CROP, not the
+    /// mi grid) plus its reference-size fix; merging both branches takes all
+    /// four arms to 0 differing pixels on Y, U and V.
+    ///
+    /// Arms: 192x68 and 68x192 (a 4-px straddling band on one axis), 5 frames,
+    /// 8-bit and 10-bit, plus a `--tile-columns=1` twin of each (COMMON's
+    /// neighbour-map rule -- the skip band CDEF reads is a per-mi side band).
+    /// MEASURED 2026-09-02: all 32 multi-tile attempts refuse BY NAME today,
+    /// so that half of the gate compares nothing yet (class
+    /// `counter-from-refused-stream`); the census is 10x "an inter SB-level AB
+    /// partition", 6x "a non-skip rectangular (HORZ/VERT/HORZ_B) strip needs
+    /// rectangular residual coding", 6x "an 8x8 intra leaf in an inter frame
+    /// whose tx_depth splits it into 4x4 transform units", 5x "an inter
+    /// partition below 8x8", 3x "an inter 16x16-level AB or 1:4 partition",
+    /// 1x "a split intra strip whose transform unit is 32x64", 1x "an
+    /// intra-coded 1:4 (or other non-2:1) rect strip on the inter block path".
+    /// The arms stay so the coverage appears the day those lift; every assert
+    /// below is carried by the single-tile arms.
+    /// Hard-asserts `decode::cdef_straddle_units()` grew: a FILTERED 8x8 CDEF
+    /// unit whose extent crosses the crop edge is the only shape for which
+    /// clamping and padding differ, so a zero delta would make these arms
+    /// vacuous for this defect.
     #[test]
-    #[ignore = "open r9 defect: CDEF at the last straddling 8x8 block column/row"]
     fn a_frame_edge_straddling_band_decodes_pixel_exact() {
         edge32_gate(
             "a_frame_edge_straddling_band_decodes_pixel_exact",
@@ -19554,15 +19580,15 @@ mod tests {
             eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
             return;
         }
-        // (width, height, frames, ten_bit)
-        let mut arms: Vec<(usize, usize, usize, bool)> = Vec::new();
+        // (width, height, frames, ten_bit, tile_columns_log2)
+        let mut arms: Vec<(usize, usize, usize, bool, u32)> = Vec::new();
         for &(w, h) in &[(192usize, 80usize), (80usize, 192usize)] {
-            arms.push((w, h, 1, false));
-            arms.push((w, h, 1, true));
+            arms.push((w, h, 1, false, 0));
+            arms.push((w, h, 1, true, 0));
         }
         // The inter arm: >= 4 frames so the 32-level edge path in the INTER
         // tile walk is exercised too.
-        arms.push((192, 80, 5, false));
+        arms.push((192, 80, 5, false, 0));
         // lane-golomb r9: the straddling-band arms, only under the ignored
         // `a_frame_edge_straddling_band_decodes_pixel_exact` name (they are
         // RED -- see that test's own comment for the stage bisection). Naming
@@ -19570,10 +19596,12 @@ mod tests {
         // recipe, the counters and the refusal handling identical.
         if name == "a_frame_edge_straddling_band_decodes_pixel_exact" {
             arms.clear();
-            arms.push((192, 68, 5, false));
-            arms.push((192, 68, 5, true));
-            arms.push((68, 192, 5, false));
-            arms.push((68, 192, 5, true));
+            for &tile_cols in &[0u32, 1] {
+                arms.push((192, 68, 5, false, tile_cols));
+                arms.push((192, 68, 5, true, tile_cols));
+                arms.push((68, 192, 5, false, tile_cols));
+                arms.push((68, 192, 5, true, tile_cols));
+            }
         }
         // lane-golomb r8 MEASURED, arm STILL NOT added (every cq level is
         // vacuous, panicking or red -- each measured this round with
@@ -19614,7 +19642,9 @@ mod tests {
         let mut totals = [0usize; 8];
         let mut compared = 0usize;
         let mut refusals: Vec<String> = Vec::new();
-        for &(width, height, frame_count, ten_bit) in &arms {
+        let straddle = name == "a_frame_edge_straddling_band_decodes_pixel_exact";
+        let mut straddle_units = 0usize;
+        for &(width, height, frame_count, ten_bit, tile_cols) in &arms {
             for &cq in &cqs {
                 let duration = frame_count as f64 / 25.0;
                 // `noise` (explicit seed) both defeats aomenc's
@@ -19689,6 +19719,10 @@ mod tests {
                 if ten_bit {
                     args.extend_from_slice(&["--input-bit-depth=10", "--bit-depth=10"]);
                 }
+                let tile_arg = format!("--tile-columns={tile_cols}");
+                if tile_cols > 0 {
+                    args.push(&tile_arg);
+                }
                 args.extend_from_slice(&["--obu", "-o", "-", "-"]);
                 let mut child = Command::new(aomenc_path())
                     .args(&args)
@@ -19717,8 +19751,12 @@ mod tests {
                         "{NAME}: aomenc did not write a 10-bit sequence header"
                     );
                 }
-                let tag = format!("{width}x{height} cq{cq} frames={frame_count} 10bit={ten_bit}");
+                let tag = format!(
+                    "{width}x{height} cq{cq} frames={frame_count} 10bit={ten_bit} \
+                     tile_cols={tile_cols}"
+                );
                 let before = crate::decode::edge32_hits();
+                let straddle_before = crate::decode::cdef_straddle_units();
                 // lane-golomb r8: name the attempt BEFORE decoding it -- a
                 // desync surfaces as a panic deep in mc.rs with no arm in the
                 // message, and r8 spent a run bisecting arms by hand.
@@ -19780,6 +19818,7 @@ mod tests {
                     }
                 }
                 compared += 1;
+                straddle_units += crate::decode::cdef_straddle_units() - straddle_before;
                 for i in 0..8 {
                     totals[i] += delta[i];
                 }
@@ -19789,6 +19828,11 @@ mod tests {
             compared > 0,
             "{NAME}: every attempt hit a named refusal:\n{}",
             refusals.join("\n")
+        );
+        assert!(
+            !straddle || straddle_units > 0,
+            "{NAME}: no FILTERED 8x8 CDEF unit crossed the cropped frame edge over \
+             {compared} compared attempts -- the straddling arms proved nothing"
         );
         assert!(
             totals[0] + totals[1] + totals[4] + totals[5] > 0,
@@ -19815,7 +19859,8 @@ mod tests {
         eprintln!(
             "{NAME}: {compared} pixel-exact attempts, 32-level edge bits \
              [horz_or_vert={} split={}] bottom-HORZ={} right-VERT={}, 64-level edge bits \
-             [horz_or_vert={} split={}] bottom-HORZ={} right-VERT={}, {} named refusals",
+             [horz_or_vert={} split={}] bottom-HORZ={} right-VERT={}, \
+             {straddle_units} straddling CDEF units, {} named refusals",
             totals[0],
             totals[1],
             totals[2],
