@@ -8718,8 +8718,18 @@ mod tests {
                 let (width, height) =
                     if firing { (384usize, 256usize) } else { (192usize, 128usize) };
                 let vertical = attempt % 2 == 1;
+                // lane-vartxsplit r2, MEASURED against the oracle
+                // (`EC_VARTX` histogram, ~40 aomenc runs): at cq 10 this
+                // source splits NO rectangular transform at all -- aomdec
+                // reads only TX_8X8/TX_16X16/TX_8X16/TX_16X8 split symbols,
+                // so the leaves gaterecipe r1 counted here came out of a
+                // stream our decoder was already desynced on (class
+                // counter-from-refused-stream). cq 44 and 46 are the two
+                // quantisers of that sweep whose stream really carries
+                // `TX_32X8`/`TX_8X32` splits (16x8 and 8x16 rectangular
+                // var-tx leaves) AND decodes pixel-exact on all six frames.
                 let cq = if firing {
-                    10
+                    if attempt == 16 { 44 } else { 46 }
                 } else {
                     [30, 36, 44, 52][(attempt / 2 % 4) as usize]
                 };
@@ -8744,9 +8754,17 @@ mod tests {
                     // the RD case for `txfm_partition`.
                     "128+90*sin((X+N*3)/6)*sin(Y/2)+50*sin((X*Y)/37)".to_string()
                 } else if firing {
-                    // The transposed twin (a one-sided gate could never
-                    // separate 32x16 from 16x32).
-                    "128+90*sin((Y+N*3)/6)*sin(X/2)+50*sin((X*Y)/37)".to_string()
+                    // lane-vartxsplit r2: BOTH leaf orientations come out of
+                    // this one source (three 16x8 leaves and one 8x16 on
+                    // attempt 16), so the firing pair is the same texture at
+                    // two quantisers. Its transposed twin was measured over
+                    // cq 40..56 and splits no rectangular transform at all;
+                    // at cq 56 it also mismatches ffmpeg from decode-order
+                    // frame 2 with ZERO rect var-tx leaves in it -- an open
+                    // reconstruction defect (8-pixel-wide luma column, see
+                    // lanes/vartxsplit-r2.report.md), not something to hide
+                    // inside this gate's attempt list.
+                    "128+90*sin((X+N*3)/6)*sin(Y/2)+50*sin((X*Y)/37)".to_string()
                 } else if vertical {
                     format!(
                         "128+60*sin((Y+N*({sp}+9*mod(floor(X/16),2)))/7)+25*sin(X/11)"
@@ -8900,24 +8918,27 @@ mod tests {
                 compared + out_of_scope > 0,
                 "{NAME} ({bit_depth}-bit): every attempt refused -- the gate compared no pixels"
             );
-            // The firing half. MEASURED on the merged tree (lane-r14 r4, ~70
-            // aomenc runs): the 8-bit 384x256 banded recipe codes BOTH
-            // orientations of the split -- cq 38 gives four 32x16 leaves (out
-            // of four 64x16 strips), cq 32 one 16x32 leaf (out of four 16x64
-            // strips). Those two streams stop LATER on another lane's live
-            // refusal ("an inter 16x16-level AB or 1:4 partition", "a non-skip
-            // rectangular (HORZ/VERT/HORZ_B) strip needs rectangular residual
-            // coding"), so the leaves are proved DECODED, not proved
-            // pixel-exact; every attempt that ran to the end is compared
-            // frame by frame above. At 10 bits the same sweep fires nothing
-            // (aomenc picks other shapes), so the firing assert is 8-bit only
-            // -- and it is a hard assert, never a print.
+            // The firing half. lane-vartxsplit r2 re-measured it against
+            // the oracle: attempts 16/17 (384x256 product texture, cq 44/46,
+            // `--min-partition-size=8 --enable-tx-size-search=1`) are the only
+            // recipes of a ~40-run sweep whose stream carries `TX_32X8` /
+            // `TX_8X32` split symbols, i.e. RECTANGULAR var-tx leaves (16x8
+            // and 8x16, both orientations out of the same stream). They now
+            // decode PIXEL-EXACT on all six frames, so the assert is on the
+            // pixel-compared tally, not on the "decoded anywhere" one --
+            // `fired_*` stays only to separate a refused stream's leaves from
+            // a proved one (class counter-from-refused-stream). At 10 bits
+            // the same sweep either fires nothing or mismatches on a
+            // reconstruction defect of another shape (report), so the firing
+            // assert stays 8-bit -- and it is a hard assert, never a print.
             if bit_depth == 8 {
                 assert!(
-                    fired_32x16 > 0 && fired_16x32 > 0,
-                    "{NAME}: the rectangular var-tx leaf arm never fired (32x16={fired_32x16}, \
-                     16x32={fired_16x32}, {named_refusals} refusals, {compared} compared) -- \
-                     `sub_tx_size_map[TX_64X16] == TX_32X16` is unproved by this gate"
+                    leaf_32x16 > 0 && leaf_16x32 > 0,
+                    "{NAME}: the rectangular var-tx leaf arm never fired on a pixel-exact \
+                     attempt (pixel-compared 32x16={leaf_32x16}, 16x32={leaf_16x32}, decoded \
+                     anywhere 32x16={fired_32x16} 16x32={fired_16x32}, {named_refusals} \
+                     refusals, {compared} compared) -- the rectangular sub-transform path is \
+                     unproved by this gate"
                 );
             }
         }

@@ -1107,6 +1107,9 @@ pub(crate) fn vartx_rect_leaf4_hits() -> [usize; 2] {
 
 /// Records one rectangular var-tx leaf.
 fn vartx_rect_leaf_hit(tw: usize, th: usize) {
+    if std::env::var_os("EC_VARTXLEAF").is_some() {
+        eprintln!("EC_VARTXLEAF tw={tw} th={th}");
+    }
     let cell = if tw.min(th) == 4 { &VARTX_RECT_LEAF4_HITS } else { &VARTX_RECT_LEAF_HITS };
     cell.with(|c| {
         let mut h = c.get();
