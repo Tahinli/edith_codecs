@@ -3029,6 +3029,23 @@ mod tests {
         extra: &[&str],
     ) -> Vec<u8> {
         let duration = frames as f64 / 25.0;
+        // lane-ab32 r1: `--ec-fixture-noise` is not an aomenc flag -- it is a
+        // fixture request, consumed (and stripped) here: the smooth gradients
+        // source codes as PARTITION_NONE everywhere, so a partition gate needs
+        // seeded noise on top of it to give the RD a reason to split.
+        let noisy = extra.contains(&"--ec-fixture-noise");
+        let stripped: Vec<&str> = extra
+            .iter()
+            .copied()
+            .filter(|a| *a != "--ec-fixture-noise")
+            .collect();
+        let extra: &[&str] = &stripped;
+        let base = gradients_source(seed, width, height, &format!("duration={duration}:rate=25"));
+        let source = if noisy {
+            format!("{base},noise=alls=40:all_seed={seed}")
+        } else {
+            base
+        };
         let y4m = Command::new("ffmpeg")
             .args([
                 "-v",
@@ -3036,7 +3053,7 @@ mod tests {
                 "-f",
                 "lavfi",
                 "-i",
-                &gradients_source(seed, width, height, &format!("duration={duration}:rate=25")),
+                &source,
                 "-pix_fmt",
                 "yuv420p10le",
                 "-strict",
@@ -7958,6 +7975,273 @@ mod tests {
         eprintln!(
             "{NAME}: {named_refusals} named refusals, {matched} pixel-exact matches out of {n_attempts}, partab_hits={}",
             crate::decode::partab_hits()
+        );
+    }
+
+    /// lane-ab32 r1: the 32x32-level AB arms (`PARTITION_HORZ_A`/`_HORZ_B`/
+    /// `_VERT_A`/`_VERT_B` -- two 16x16 squares plus one 32x16/16x32 strip)
+    /// are decoded on the INTRA path (decode.rs `PARTITION_HORZ_A` .. the
+    /// 32x32 refusal) but nothing asserted they fire: the INTER AB gate above
+    /// only SOFT-notes `partab_hits`, and the four per-arm counters
+    /// lane-part32 added had no consumer at all (class
+    /// `refusal-lifted-without-a-gate`). This drives a real key-frame-only
+    /// aomenc at `--enable-ab-partitions=1 --enable-rect-partitions=1
+    /// --sb-size=64 --min-partition-size=16 --max-partition-size=32`, so every
+    /// AB split aomenc picks is a 32-level one, pixel-compares every
+    /// successful decode against ffmpeg's decode of the same bytes, and
+    /// hard-asserts each arm fired at least once over the seed sweep --
+    /// counting deltas only from attempts that decoded AND compared (class
+    /// `counter-from-refused-stream`).
+    #[test]
+    fn a_real_aomenc_stream_with_a_32_level_ab_partition_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_stream_with_a_32_level_ab_partition_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height) = (256usize, 256usize);
+        let arms: [(&str, fn() -> usize); 4] = [
+            ("HORZ_A_32", crate::decode::intra_horz_a_hits),
+            ("HORZ_B_32", crate::decode::intra_horz_b_hits),
+            ("VERT_A_32", crate::decode::intra_vert_a_hits),
+            ("VERT_B_32", crate::decode::intra_vert_b_hits),
+        ];
+        let mut totals = [0usize; 4];
+        let mut refusals: Vec<String> = Vec::new();
+        let mut compared = 0usize;
+        for &seed in &LR_SEEDS {
+            // Smooth gradients code as PARTITION_NONE everywhere (r1: 16/16
+            // attempts decoded pixel-exact with zero AB hits), so the fixture
+            // carries seeded noise to give the intra RD a reason to split.
+            let source = format!(
+                "{},noise=alls=40:all_seed={seed}",
+                gradients_source(seed, width, height, "duration=0.04:rate=25")
+            );
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &source,
+                    "-frames:v",
+                    "1",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-f",
+                    "yuv4mpegpipe",
+                    "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "{NAME}: ffmpeg fixture (seed {seed}): {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            // The flags under test come LAST: aomenc keeps the LAST
+            // occurrence of a repeated flag (measured 2026-09-02 by md5 of
+            // four orderings), so an override appended after the base recipe
+            // is the one that lands. Nothing here is repeated, and each of the
+            // four arm counters below proves the AB flag actually arrived.
+            let args: Vec<&str> = vec![
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                "--cq-level=45",
+                "--cpu-used=0",
+                "--limit=1",
+                "--kf-max-dist=0",
+                "--lag-in-frames=0",
+                "--threads=1",
+                "--row-mt=0",
+                "--enable-1to4-partitions=0",
+                "--enable-filter-intra=0",
+                "--enable-smooth-intra=0",
+                "--enable-paeth-intra=0",
+                "--enable-directional-intra=0",
+                "--enable-angle-delta=0",
+                "--enable-tx-size-search=0",
+                "--enable-cdef=0",
+                "--enable-restoration=0",
+                "--enable-palette=0",
+                "--enable-intrabc=0",
+                "--enable-cfl-intra=0",
+                "--enable-ref-frame-mvs=0",
+                "--sb-size=64",
+                "--enable-rect-partitions=1",
+                "--enable-ab-partitions=1",
+                "--min-partition-size=16",
+                "--max-partition-size=32",
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ];
+            let mut child = Command::new(aomenc_path())
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture (seed {seed}): {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let before: Vec<usize> = arms.iter().map(|(_, f)| f()).collect();
+            let frames = match decode_stream(&stream) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME} failed outright, not a named refusal (seed {seed}): {msg}"
+                    );
+                    for v in [4, 5, 6, 7] {
+                        assert!(
+                            !msg.contains(&format!(
+                                "a 32x32 partition type this decoder does not code (value={v})"
+                            )),
+                            "{NAME} refused a 32-level AB partition (value={v}, seed {seed}) -- \
+                             all four arms are ported, this refusal is forbidden: {msg}"
+                        );
+                    }
+                    refusals.push(format!("seed {seed}: {msg}"));
+                    continue;
+                }
+                Ok(frames) => frames,
+            };
+            let deltas: Vec<usize> = arms
+                .iter()
+                .zip(before.iter())
+                .map(|((_, f), b)| f() - b)
+                .collect();
+            let fired: Vec<String> = arms
+                .iter()
+                .zip(deltas.iter())
+                .map(|((label, _), d)| format!("{label}={d}"))
+                .collect();
+            let fired = fired.join(" ");
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frames.len());
+            assert_eq!(
+                frames.len(),
+                ffmpeg_frames.len(),
+                "{NAME}: seed {seed}: shown-frame count vs ffmpeg"
+            );
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(
+                    got.y, want.y,
+                    "{NAME} frame {i} luma vs ffmpeg (seed {seed}) [{fired}]"
+                );
+                assert_eq!(
+                    got.u, want.u,
+                    "{NAME} frame {i} U vs ffmpeg (seed {seed}) [{fired}]"
+                );
+                assert_eq!(
+                    got.v, want.v,
+                    "{NAME} frame {i} V vs ffmpeg (seed {seed}) [{fired}]"
+                );
+            }
+            compared += 1;
+            for (i, d) in deltas.iter().enumerate() {
+                totals[i] += d;
+            }
+        }
+        assert!(
+            compared > 0,
+            "{NAME}: every attempt hit a named refusal:\n{}",
+            refusals.join("\n")
+        );
+        for (i, (label, _)) in arms.iter().enumerate() {
+            assert!(
+                totals[i] > 0,
+                "{NAME}: {compared} attempt(s) decoded pixel-exact but {label} never fired -- \
+                 the gate would prove nothing about that arm. refusals:\n{}",
+                refusals.join("\n")
+            );
+        }
+        eprintln!(
+            "{NAME}: {compared}/{} attempts pixel-exact, HORZ_A_32={} HORZ_B_32={} \
+             VERT_A_32={} VERT_B_32={}, {} named refusals",
+            LR_SEEDS.len(),
+            totals[0],
+            totals[1],
+            totals[2],
+            totals[3],
+            refusals.len()
+        );
+    }
+
+    /// lane-ab32 r1: the 10-bit twin of the gate above -- his two films are
+    /// yuv420p10le, so an 8-bit-only AB gate proves nothing about the streams
+    /// that matter. Same recipe through [`ten_bit_tool_gate`], which sums the
+    /// per-arm counters only over attempts that decoded and pixel-compared.
+    #[test]
+    fn a_real_aomenc_10bit_stream_with_a_32_level_ab_partition_decodes_pixel_exact() {
+        const NAME: &str =
+            "a_real_aomenc_10bit_stream_with_a_32_level_ab_partition_decodes_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        ten_bit_tool_gate(
+            NAME,
+            256,
+            256,
+            1,
+            &[
+                "--ec-fixture-noise",
+                "--cq-level=45",
+                "--limit=1",
+                "--kf-max-dist=0",
+                "--enable-1to4-partitions=0",
+                "--enable-filter-intra=0",
+                "--enable-smooth-intra=0",
+                "--enable-paeth-intra=0",
+                "--enable-directional-intra=0",
+                "--enable-angle-delta=0",
+                "--enable-tx-size-search=0",
+                "--enable-cdef=0",
+                "--enable-restoration=0",
+                "--enable-palette=0",
+                "--enable-intrabc=0",
+                "--enable-cfl-intra=0",
+                "--enable-ref-frame-mvs=0",
+                // last wins: the flags under test go after the base recipe
+                "--enable-rect-partitions=1",
+                "--enable-ab-partitions=1",
+                "--min-partition-size=16",
+                "--max-partition-size=32",
+            ],
+            &LR_SEEDS,
+            &[
+                ("HORZ_A_32", crate::decode::intra_horz_a_hits),
+                ("HORZ_B_32", crate::decode::intra_horz_b_hits),
+                ("VERT_A_32", crate::decode::intra_vert_a_hits),
+                ("VERT_B_32", crate::decode::intra_vert_b_hits),
+            ],
         );
     }
 
