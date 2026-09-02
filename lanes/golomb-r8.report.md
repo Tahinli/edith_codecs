@@ -86,8 +86,12 @@ The gate now prints each attempt under `EC_GATE_VERBOSE=1` (`stream.rs`), becaus
 otherwise surfaces as a bare panic in `mc.rs` with no arm named.
 
 ## Test totals
-`cargo test -p ec-av1 --lib` -> `$HOME/.cache/golomb-suite-r8.log` (unit `golomb-suite-r8`).
-See the handoff for the result line.
+`cargo test -p ec-av1 --lib` -> `$HOME/.cache/golomb-suite-r8.log` (unit `golomb-suite-r8`):
+`test result: ok. 379 passed; 0 failed; 34 ignored; 0 measured; 0 filtered out; finished in
+917.74s` (413 test lines emitted). GREEN.
+
+EVIDENCE: $HOME/.cache/golomb-suite-r8.log | `cargo test -p ec-av1 --lib` on the merged tree at
+97de75e, unit golomb-suite-r8, MemoryMax=10G | 379 passed / 0 failed / 34 ignored.
 
 ## Residue disposition
 * 68x192 / 192x68 straddling-band +-1 INTER defect -- **fix-now, next round**; it is this
