@@ -18992,7 +18992,7 @@ fn find_samples(
         // `num_proj_ref >= 1` picked the 3-symbol `motion_mode_cdf` where
         // libaom reads the 2-symbol `obmc_cdf` (class
         // wrong-alphabet-same-value).
-        let tr_reach = has_top_right(mi_row, mi_col, bw4.max(bh4));
+        let tr_reach = crate::mvstack::has_top_right(mi_row, mi_col, bw4, bh4);
         if do_tr && bw4 != bh4 && tr_reach != has_top_right(mi_row, mi_col, bw4) {
             TR_REACH_LONGER_SIDE_HITS.with(|c| c.set(c.get() + 1));
         }
