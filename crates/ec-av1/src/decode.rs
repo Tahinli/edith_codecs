@@ -2549,7 +2549,7 @@ pub(crate) fn sub8_split_hits() -> usize {
 }
 
 /// Current value of [`SUB8_INTER_SPLIT_HITS`].
-pub(crate) fn sub8_inter_split_hits() -> usize {
+pub fn sub8_inter_split_hits() -> usize {
     SUB8_INTER_SPLIT_HITS.with(|c| c.get())
 }
 
@@ -19167,6 +19167,15 @@ fn decode_inter_sub8_split4(
                  only inter 4x4 sub-blocks there)",
             ));
         }
+        // Same print point as the oracle's `EC_MODE` (entry of
+        // `read_inter_block_mode_info`, i.e. after skip / is_inter), so the
+        // two range ladders line up element for element.
+        if std::env::var_os("EC_TRACE_MODE").is_some() {
+            eprintln!(
+                "EC_MODE mi_row={rmi} mi_col={cmi} rng={}",
+                dec.debug_state().0
+            );
+        }
         let ref_frame = read_single_ref(
             dec,
             cdfs,
@@ -19256,6 +19265,16 @@ fn decode_inter_sub8_split4(
             };
             (mv, false)
         };
+        // Same print point as the oracle's `EC_MODE_MV` (right after
+        // `assign_mv`), the second rung of the sub-8x8 range ladder.
+        if std::env::var_os("EC_TRACE_MODE").is_some() {
+            eprintln!(
+                "EC_MODE_MV mi_row={rmi} mi_col={cmi} mv0=({},{}) rng={}",
+                mv.0,
+                mv.1,
+                dec.debug_state().0
+            );
+        }
         // No `interintra` and no `motion_mode`/`obmc` symbol below 8x8 (see
         // this function's own doc); `read_mb_interp_filter` still runs.
         let gm_ref = &global_motion[(ref_frame - LAST_FRAME) as usize];
@@ -19273,6 +19292,18 @@ fn decode_inter_sub8_split4(
         } else {
             [3, 3]
         };
+        if std::env::var_os("EC_AV1_IFDBG").is_some() {
+            eprintln!(
+                "IFDBG4 mi=({rmi},{cmi}) ref={ref_frame} above_ref={} above_ref1={:?} \
+                 above_filt={:?} left_ref={} left_ref1={:?} left_filt={:?}",
+                neighbours.above_ref[cmi],
+                neighbours.above_ref1[cmi],
+                neighbours.above_filter[cmi],
+                neighbours.left_ref[rmi],
+                neighbours.left_ref1[rmi],
+                neighbours.left_filter[rmi],
+            );
+        }
         let gm_nontrans = is_globalmv && gm_ref.model != ec_av1_syntax::WarpModel::Translation;
         let (h_filter, v_filter, resolved_filter) = resolve_interp_filter(
             dec,
@@ -19908,11 +19939,43 @@ fn decode_inter_block8(
                 }
                 mode_for_tx = 0;
 
-                // lane-av1comp corner-cut, matching this leaf's single-ref
-                // arm below (`mc::predict`'s own fixed-Regular default):
-                // `decode_inter_block8` never resolves a switchable filter,
-                // so both compound taps use `Regular` too.
-                use mc::InterpFilterKind::Regular;
+                // lane-intersub8 r2: the compound 8x8 leaf used to hard-code
+                // `Regular` and leave `leaf_filter_syms` at the `[3, 3]`
+                // "no filter" sentinel. libaom reads `read_mb_interp_filter`
+                // here for EVERY inter block (`decodemv.c`
+                // `read_inter_block_mode_info`, right after
+                // `read_compound_type`), and when `av1_is_interp_needed` is 0
+                // -- `skip_mode`, or a non-translational GLOBALMV --
+                // `set_default_interp_filters` stores EIGHTTAP_REGULAR (0),
+                // NOT a sentinel. A later block whose ref matches this one
+                // then reads `av1_get_pred_context_switchable_interp` off
+                // that stored 0, so recording `[3, 3]` shifted its
+                // `switchable_interp` context and desynced the tile.
+                let above_filter_ctx = if neighbours.above_ref[cmi] == ref0
+                    || neighbours.above_ref1[cmi] == Some(ref0)
+                {
+                    neighbours.above_filter[cmi]
+                } else {
+                    [3, 3]
+                };
+                let left_filter_ctx = if neighbours.left_ref[rmi] == ref0
+                    || neighbours.left_ref1[rmi] == Some(ref0)
+                {
+                    neighbours.left_filter[rmi]
+                } else {
+                    [3, 3]
+                };
+                let (h_filter, v_filter, resolved_filter) = resolve_interp_filter(
+                    dec,
+                    cdfs,
+                    interp_fixed,
+                    enable_dual_filter,
+                    skip_mode,
+                    above_filter_ctx,
+                    left_filter_ctx,
+                    true,
+                );
+                leaf_filter_syms = resolved_filter;
                 let mut inter0_y = vec![0i32; SIDE * SIDE];
                 mc::predict_compound_intermediate(
                     &py0.data,
@@ -19924,8 +19987,8 @@ fn decode_inter_block8(
                     scale0,
                     SIDE,
                     SIDE,
-                    Regular,
-                    Regular,
+                    h_filter,
+                    v_filter,
                     &mut inter0_y,
                 );
                 let mut inter1_y = vec![0i32; SIDE * SIDE];
@@ -19939,8 +20002,8 @@ fn decode_inter_block8(
                     scale1,
                     SIDE,
                     SIDE,
-                    Regular,
-                    Regular,
+                    h_filter,
+                    v_filter,
                     &mut inter1_y,
                 );
                 let mut pred_y = vec![0u16; SIDE * SIDE];
@@ -19972,8 +20035,8 @@ fn decode_inter_block8(
                     scale0,
                     CHROMA_SIDE,
                     CHROMA_SIDE,
-                    Regular,
-                    Regular,
+                    h_filter,
+                    v_filter,
                     &mut inter0_u,
                 );
                 let mut inter1_u = vec![0i32; CHROMA_SIDE * CHROMA_SIDE];
@@ -19987,8 +20050,8 @@ fn decode_inter_block8(
                     scale1,
                     CHROMA_SIDE,
                     CHROMA_SIDE,
-                    Regular,
-                    Regular,
+                    h_filter,
+                    v_filter,
                     &mut inter1_u,
                 );
                 let mut pred_u = vec![0u16; CHROMA_SIDE * CHROMA_SIDE];
@@ -20018,8 +20081,8 @@ fn decode_inter_block8(
                     scale0,
                     CHROMA_SIDE,
                     CHROMA_SIDE,
-                    Regular,
-                    Regular,
+                    h_filter,
+                    v_filter,
                     &mut inter0_v,
                 );
                 let mut inter1_v = vec![0i32; CHROMA_SIDE * CHROMA_SIDE];
@@ -20033,8 +20096,8 @@ fn decode_inter_block8(
                     scale1,
                     CHROMA_SIDE,
                     CHROMA_SIDE,
-                    Regular,
-                    Regular,
+                    h_filter,
+                    v_filter,
                     &mut inter1_v,
                 );
                 let mut pred_v = vec![0u16; CHROMA_SIDE * CHROMA_SIDE];
