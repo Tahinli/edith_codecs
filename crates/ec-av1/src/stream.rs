@@ -3379,6 +3379,72 @@ mod tests {
             + crate::restoration::switchable_hits()
     }
 
+    /// lane-troykf2 r1: loop restoration on frame sizes whose LAST stripe is
+    /// partial, with 128-sample superblocks -- the two stripe shapes whose
+    /// boundary substitution is special (`filter_restoration_unit`: the first
+    /// stripe is 8 rows short and takes its above boundary from the frame's
+    /// own top rows, the last one is truncated and takes its below boundary
+    /// from the frame's own bottom row) had no gate at all: every earlier LR
+    /// size (192x128, 160x96) is a whole multiple of 64 rows and ran at
+    /// `--sb-size=64`. 152 = 2*64+24 and 216 = 3*64+24 both leave a 32-row
+    /// tail stripe, mirroring the 792-row 10-bit film that made this lane.
+    /// `lr_stripe0_hits`/`lr_last_stripe_hits` are hard-asserted per attempt
+    /// by [`ten_bit_tool_gate`], so an RD that picked RESTORE_NONE on either
+    /// stripe cannot pass.
+    #[test]
+    fn a_real_aomenc_10bit_partial_bottom_stripe_restoration_decodes_pixel_exact() {
+        const NAME: &str =
+            "a_real_aomenc_10bit_partial_bottom_stripe_restoration_decodes_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        // `--sb-size=128` goes in `extra`, which the helper appends AFTER its
+        // own `--sb-size=64` (aomenc keeps the LAST occurrence of a repeated
+        // flag, measured 2026-09-02); `--max-partition-size=32` keeps the 128
+        // root on SPLIT, the only 128-root partition decoded today.
+        for (width, height, cq) in [(256usize, 152usize, "15"), (384, 216, "15"), (256, 152, "25")]
+        {
+            ten_bit_tool_gate(
+                &format!("{NAME} {width}x{height} cq{cq}"),
+                width,
+                height,
+                1,
+                &[
+                    "--limit=1",
+                    "--kf-max-dist=0",
+                    &format!("--cq-level={cq}"),
+                    "--sb-size=128",
+                    "--enable-restoration=1",
+                    "--enable-cdef=0",
+                    "--enable-rect-partitions=0",
+                    "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=0",
+                    "--enable-filter-intra=0",
+                    "--enable-smooth-intra=0",
+                    "--enable-paeth-intra=0",
+                    "--enable-tx-size-search=0",
+                    "--max-partition-size=32",
+                    "--min-partition-size=16",
+                    "--enable-palette=0",
+                    "--enable-intrabc=0",
+                    "--enable-cfl-intra=0",
+                    "--enable-ref-frame-mvs=0",
+                ],
+                &LR_SEEDS,
+                &[
+                    ("lr_hits", ten_bit_lr_hits),
+                    ("lr_stripe0_hits", crate::restoration::lr_stripe0_hits),
+                    ("lr_last_stripe_hits", crate::restoration::lr_last_stripe_hits),
+                ],
+            );
+        }
+    }
+
     /// lane-hbdgates r1: `--enable-rect-partitions=1 --enable-ab-partitions=1`
     /// at 10 bits, one intra stream, one counter per tool
     /// (`rect_partition_hits`, `partab_hits`) so a stream that only fired the
@@ -13859,13 +13925,20 @@ mod tests {
             eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
             return;
         }
-        let (width, height) = (192usize, 128usize);
+        // lane-troykf2 r1: 152 = 2*64+24, not 128 -- the 8-bit twin of the
+        // partial-bottom-stripe LR gate below. Stripe shapes at 128 rows are
+        // a strict subset of those at 152 (56, 64, then the 32-row tail whose
+        // below boundary is the frame's own last row).
+        let (width, height) = (192usize, 152usize);
         let n_attempts: u32 = std::env::var("EC_LR_GATE_ATTEMPTS")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(40);
         let mut lr_refusals = 0u32;
         let mut other_refusals = Vec::new();
+        // lane-troykf2 r1: the two special stripe shapes this size now has.
+        let stripe0_before = crate::restoration::lr_stripe0_hits();
+        let last_stripe_before = crate::restoration::lr_last_stripe_hits();
         for attempt in 0..n_attempts {
             let seed = 42 + attempt;
             // Diagnosis knob: which content makes RD pick an 8x16/16x8 strip
@@ -14009,6 +14082,17 @@ mod tests {
             total_hits > 0,
             "{NAME}: {lr_refusals} LR refusals fired but read_lr_unit never decoded a real \
              (non-None) filter -- gate proved nothing about the symbol path"
+        );
+        // lane-troykf2 r1: a size with a partial bottom stripe proves nothing
+        // about the two frame-edge stripe shapes unless a real filter actually
+        // ran on them (`filter_restoration_unit`).
+        assert!(
+            crate::restoration::lr_stripe0_hits() > stripe0_before
+                && crate::restoration::lr_last_stripe_hits() > last_stripe_before,
+            "{NAME}: no filtered stripe took the frame's own top/bottom row as its boundary \
+             (stripe0 +{}, last +{})",
+            crate::restoration::lr_stripe0_hits() - stripe0_before,
+            crate::restoration::lr_last_stripe_hits() - last_stripe_before
         );
         eprintln!(
             "{NAME}: {lr_refusals} LR refusals, {} other refusals out of {n_attempts}, \

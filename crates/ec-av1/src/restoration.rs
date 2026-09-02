@@ -366,6 +366,26 @@ thread_local! {
     static SWITCHABLE_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// lane-troykf2 r1: how many *stripes* a real filter ran on with the frame's
+/// own top row as their above boundary (`stripe_v_start == 0`, the 56-row
+/// first stripe of `RESTORATION_UNIT_OFFSET == 8`), and how many ran on a
+/// short LAST stripe (`stripe_v_end == plane_h` with a partial height). Those
+/// are the two stripe shapes whose boundary substitution differs from every
+/// interior stripe, and no gate size before this one had either.
+thread_local! {
+    static LR_STRIPE0_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static LR_LAST_STRIPE_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`LR_STRIPE0_HITS`].
+pub(crate) fn lr_stripe0_hits() -> usize {
+    LR_STRIPE0_HITS.with(|c| c.get())
+}
+/// Current value of [`LR_LAST_STRIPE_HITS`].
+pub(crate) fn lr_last_stripe_hits() -> usize {
+    LR_LAST_STRIPE_HITS.with(|c| c.get())
+}
+
 /// Current value of [`WIENER_HITS`].
 pub(crate) fn wiener_hits() -> usize {
     WIENER_HITS.with(|c| c.get())
@@ -868,6 +888,14 @@ fn filter_restoration_unit(
         let nominal_h = full_stripe_height - if frame_stripe == 0 { runit_offset } else { 0 };
         let h = nominal_h.min(unit_h - i);
         let stripe_v_end = stripe_v_start + h;
+        if !matches!(filter, UnitFilter::None) {
+            if stripe_v_start == 0 {
+                LR_STRIPE0_HITS.with(|c| c.set(c.get() + 1));
+            }
+            if stripe_v_end == plane_h && h < nominal_h {
+                LR_LAST_STRIPE_HITS.with(|c| c.set(c.get() + 1));
+            }
+        }
         match filter {
             UnitFilter::Wiener(info) => apply_wiener_stripe(
                 out, cdef, deblocked, stride, plane_w, plane_h, h_start, h_end, stripe_v_start, stripe_v_end, &info,
