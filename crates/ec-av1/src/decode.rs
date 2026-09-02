@@ -2134,6 +2134,19 @@ pub(crate) fn affine_gm_hits() -> usize {
     AFFINE_GM_HITS.with(|c| c.get())
 }
 
+// lane-t900 r9: rect blocks whose warp-sample top-right probe answers
+// differently at the block's WIDTH than at libaom's
+// `AOMMAX(xd->width, xd->height)` -- each one is a `num_proj_ref` that could
+// pick the wrong motion_mode alphabet.
+thread_local! {
+    static TR_REACH_LONGER_SIDE_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`TR_REACH_LONGER_SIDE_HITS`].
+pub fn tr_reach_longer_side_hits() -> usize {
+    TR_REACH_LONGER_SIDE_HITS.with(std::cell::Cell::get)
+}
+
 // lane-t900 r9: libaom `is_nontrans_global_motion` (mvref_common.h) returns 0
 // for `AOMMIN(mi_size_wide[bsize], mi_size_high[bsize]) < 2`, i.e. any block
 // with a 4-px side is NEVER "non-translational global" and therefore ALWAYS
@@ -18860,7 +18873,22 @@ fn find_samples(
     let up_available = mi_row > 0;
     let left_available = mi_col > 0;
     let mut samples = Vec::with_capacity(MAX);
-    let single_ref_match = |info: &MiInfo| info.ref_frame == ref_frame && info.ref_frame1.is_none();
+    // lane-t900 r9: `EC_PROJ_MI=<mi_row>,<mi_col>` lists this block's warp
+    // sample candidates in libaom's own order (above, left, top-left,
+    // top-right) -- `num_proj_ref >= 1` is what picks the 3-symbol
+    // motion_mode alphabet over the 2-symbol obmc one.
+    let proj_dbg = std::env::var("EC_PROJ_MI")
+        .is_ok_and(|v| v == format!("{mi_row},{mi_col}"));
+    let single_ref_match = |info: &MiInfo| {
+        let m = info.ref_frame == ref_frame && info.ref_frame1.is_none();
+        if proj_dbg {
+            eprintln!(
+                "EC_PROJ cand ref={} ref1={:?} size={} size_h={} is_inter={} want={ref_frame} match={m}",
+                info.ref_frame, info.ref_frame1, info.size, info.size_h, info.is_inter
+            );
+        }
+        m
+    };
     let mut do_tl = true;
     let mut do_tr = true;
     let rec = |info: &MiInfo, row_offset: i32, sign_r: i32, col_offset: i32, sign_c: i32| {
@@ -18957,7 +18985,18 @@ fn find_samples(
             }
         }
 
-        if do_tr && has_top_right(mi_row, mi_col, bw4) {
+        // lane-t900 r9: libaom passes `AOMMAX(xd->width, xd->height)` here
+        // (`mvref_common.c:1235`), NOT the block's width -- a rect block's
+        // top-right reach is probed at its LONGER side. With `bw4` a 64x128
+        // block found a top-right sample libaom never sees, so
+        // `num_proj_ref >= 1` picked the 3-symbol `motion_mode_cdf` where
+        // libaom reads the 2-symbol `obmc_cdf` (class
+        // wrong-alphabet-same-value).
+        let tr_reach = has_top_right(mi_row, mi_col, bw4.max(bh4));
+        if do_tr && bw4 != bh4 && tr_reach != has_top_right(mi_row, mi_col, bw4) {
+            TR_REACH_LONGER_SIDE_HITS.with(|c| c.set(c.get() + 1));
+        }
+        if do_tr && tr_reach {
             let tr_col = mi_col + bw4;
             if mi_row > 0 && tr_col < mi_cols {
                 if let Some(info) = grid.get(mi_row - 1, tr_col) {
@@ -21653,6 +21692,24 @@ fn decode_inter_block(
                 // mv reads no motion_mode/obmc symbol at all -- implicit
                 // SIMPLE_TRANSLATION.
                 && !(is_global_mv_block && !force_integer_mv);
+            // lane-t900 r9: the eligibility terms themselves, on the same rung
+            // as aomdec's `EC_ISTEP2 name=motion_mode` -- an eligibility
+            // mismatch is otherwise invisible (a skipped symbol prints
+            // nothing).
+            if std::env::var_os("EC_TRACE_MODE_STEP").is_some() {
+                eprintln!(
+                    "EC_MM mi_row={mi_row} mi_col={mi_col} w={write_w} h={write_h} elig={} \
+                     ab={} lf={} sw={} skipmode={} ii={} gmb={} rng={}",
+                    motion_mode_eligible as u8,
+                    overlappable_above(grid, mi_row, mi_col, bw4, mi_cols as usize, 1).len(),
+                    overlappable_left(grid, mi_row, mi_col, bh4, mi_rows as usize, 1).len(),
+                    switchable_motion_mode as u8,
+                    skip_mode as u8,
+                    interintra_mode.is_some() as u8,
+                    is_global_mv_block as u8,
+                    dec.debug_state().0,
+                );
+            }
             let mut obmc_selected = false;
             // lane-warp round 2: `Some` when motion_mode == WARPED_CAUSAL
             // *and* the local warp estimate is valid (`!wm_params.invalid`,
@@ -21811,6 +21868,22 @@ fn decode_inter_block(
                     if obmc_selected {
                         OBMC_HITS.with(|c| c.set(c.get() + 1));
                     }
+                }
+                // lane-t900 r9: which ALPHABET this block read (3-symbol
+                // motion_mode vs 2-symbol obmc) and the range after -- the
+                // two give the same value with a different narrowing (class
+                // wrong-alphabet-same-value).
+                if std::env::var_os("EC_TRACE_MODE_STEP").is_some() {
+                    eprintln!(
+                        "EC_MM2 mi_row={mi_row} mi_col={mi_col} row={bsize_idx} warp_elig={} \
+                         scaled={} fimv={} obmc={} warped={} rng={}",
+                        warp_eligible as u8,
+                        ref_is_scaled as u8,
+                        force_integer_mv as u8,
+                        obmc_selected as u8,
+                        warped_selected as u8,
+                        dec.debug_state().0,
+                    );
                 }
             }
             // lane-gm r4: `allow_warp`'s `global_warp_allowed` branch
