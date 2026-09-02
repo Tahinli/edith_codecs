@@ -18439,6 +18439,19 @@ mod tests {
         // The inter arm: >= 4 frames so the 32-level edge path in the INTER
         // tile walk is exercised too.
         arms.push((192, 80, 5, false));
+        // lane-golomb r7 MEASURED, arm NOT added (it would be vacuous or red):
+        // a 68-px axis leaves the last superblock straddling by 4 px, the
+        // shape `read_var_tx_size`'s `blk_row >= max_h_mi || blk_col >=
+        // max_w_mi` early return exists for. With
+        // `arms.push((192, 68, 5, false))` all EIGHT cq attempts refuse by
+        // name -- "a reference picture whose height does not match this
+        // frame's own true size" -- so the arm compares nothing (class
+        // `counter-from-refused-stream`). With
+        // `arms.push((68, 192, 5, false))` the gate goes RED on a real,
+        // separate defect: `68x192 cq35 frames=5 10bit=false frame 1 plane Y:
+        // 141 pixels differ, first at row 0 col 64 (ours 167 vs ffmpeg 166)
+        // [edge32=[0,34,0,0,1,17,0,1]]` -- LUMA, inside the 4-px straddling
+        // COLUMN. Both are unrelated to this round's chroma tx_type fix.
         let cqs: [u32; 8] = [35, 40, 45, 50, 55, 57, 59, 61];
         let mut totals = [0usize; 8];
         let mut compared = 0usize;
