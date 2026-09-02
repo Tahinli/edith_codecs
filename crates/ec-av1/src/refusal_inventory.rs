@@ -81,10 +81,6 @@ const REFUSALS: &[&str] = &[
     "warp prediction with a scaled reference (superres, unimplemented)",
     "an 8x8 partition leaf under a scaled reference (superres, unimplemented)",
     "a motion_mode symbol for a block shape with no CDF row here",
-    // lane-r14 r2: the whole-transform case of every 64-axis inter strip is
-    // coded; only the SPLIT of a 1:4 strip with a 64-px axis is left, whose
-    // `sub_tx_size_map` entry is rectangular (TX_64X16 -> TX_32X16).
-    "a split transform on a 1:4 inter strip with a 64-px axis",
 ];
 
 /// Gates whose `Err` arm turns a decode failure into a printed SKIP rather than
