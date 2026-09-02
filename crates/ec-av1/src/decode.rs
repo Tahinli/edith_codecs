@@ -12584,6 +12584,18 @@ fn deblock_plane(
     // last coded mi column's horizontal edges were filtered when libaom's
     // real output leaves them untouched (r6's post-deblock diff, 37 px, all
     // in columns 44-47); clipping here closes it (3/3 frames pixel-exact).
+    // lane-golomb r9: the bound is the MI-ROUNDED frame, not the coded
+    // frame. libaom's `av1_filter_block_plane_vert/horz` walk the superblock
+    // and stop at `cm->mi_params.mi_cols`/`mi_rows`, which
+    // `av1_set_mb_mi` derives from `ALIGN_POWER_OF_TWO(width, 3)` -- the
+    // 8-pixel-aligned frame, i.e. a 68-wide frame is filtered out to column
+    // 72 and the vertical edge AT x=68 is a real edge that rewrites the
+    // in-crop columns 64..67. Clipping at `frame_width` skipped it, which is
+    // the +-1 straddling-band defect (68x192 cq35, frame 1, 141 luma pixels
+    // all in columns 64..67; frame 0 survived because that edge carried no
+    // filter level there). r7's superres measurement is preserved: its frame
+    // was already 8-aligned, so this bound equals `frame_width` there and
+    // still excludes the superblock padding up to `true_width`.
     let (cw, ch) = if chroma {
         (frame_width.div_ceil(2), frame_height.div_ceil(2))
     } else {
@@ -12594,11 +12606,17 @@ fn deblock_plane(
         plane.true_height.min(ch),
         plane.width,
     );
+    if std::env::var_os("EC_AV1_DEBLOCK_TRACE_V").is_some() {
+        eprintln!("DEBLOCK plane={plane_idx} tw={tw} th={th} stride={stride} true={}x{} crop={cw}x{ch}", plane.true_width, plane.true_height);
+    }
     let mut y0 = 0usize;
     while y0 < th {
         let mut x0 = 4usize;
         while x0 < tw {
             if let Some((len, level)) = edge_params(lf, n, plane_idx, 0, chroma, x0, y0) {
+                if std::env::var_os("EC_AV1_DEBLOCK_TRACE_V").is_some() && plane_idx == 0 {
+                    eprintln!("VEDGE x0={x0} y0={y0} len={len} level={level}");
+                }
                 filter_edge(
                     &mut plane.data,
                     y0 * stride + x0,
@@ -15664,22 +15682,33 @@ fn obmc_mask(len: usize) -> &'static [u8] {
 /// A bordering block's own resolved interp filter kernel, `(h, v)` --
 /// mirrors [`resolve_interp_filter`]'s own return order from its stored
 /// `[u8; 2]` (`Neighbours::above_filter`/`left_filter`, `[sym0, sym1]` =
-/// `[v_sym, h_sym]`). Never calls `from_switchable_symbol` on the `[3, 3]`
-/// sentinel: that value is only ever stored for an intra neighbour (already
-/// excluded by [`overlappable_above`]/[`overlappable_left`]'s `is_inter`
-/// gate) or when `interp_fixed` is `Some` for the whole frame, handled here
-/// first.
+/// `[v_sym, h_sym]`). The `[3, 3]` sentinel is only ever stored for an intra
+/// neighbour (excluded by [`overlappable_above`]/[`overlappable_left`]'s
+/// `is_inter` gate) or when `interp_fixed` is `Some` for the whole frame
+/// (handled here first) -- so a sentinel reaching the kernel lookup means the
+/// stream desynced upstream, and this refuses instead of panicking.
 fn neighbour_filter(
     interp_fixed: Option<mc::InterpFilterKind>,
     sym: [u8; 2],
-) -> (mc::InterpFilterKind, mc::InterpFilterKind) {
+) -> Result<(mc::InterpFilterKind, mc::InterpFilterKind)> {
     if let Some(kind) = interp_fixed {
-        return (kind, kind);
+        return Ok((kind, kind));
     }
-    (
+    // lane-golomb r9: this used to hand the sentinel straight to
+    // `from_switchable_symbol`, which PANICS on any value above 2 -- a crash
+    // on stream data (measured on a real 192x68 cq40 aomenc stream, where an
+    // inter leaf below 8x8 desyncs upstream and leaves an unrecorded filter
+    // behind). A decoder must refuse such a stream by name, never abort the
+    // process; the desync that produces the sentinel belongs to lane-intersub8.
+    if sym[0] > 2 || sym[1] > 2 {
+        return Err(unsupported(
+            "an OBMC neighbour whose switchable interp filter was never recorded",
+        ));
+    }
+    Ok((
         mc::InterpFilterKind::from_switchable_symbol(sym[1] as usize),
         mc::InterpFilterKind::from_switchable_symbol(sym[0] as usize),
-    )
+    ))
 }
 
 /// One neighbour's own re-prediction over a `w`x`h` region, MC'd fresh
@@ -15957,7 +15986,7 @@ fn obmc_blend(
         let (h_kind, v_kind) = neighbour_filter(
             interp_fixed,
             neighbours.above_filter[mi_col + off4],
-        );
+        )?;
         let (ny, nu, nv) = ref_planes(nb.ref_frame, ref_y, ref_u, ref_v, other_refs)?;
         let nb_scale = mc::scale_factor(ny.width, frame_width);
         let (bw, bh, ox) = (span4 * 4, overlap_above, off4 * 4);
@@ -15976,7 +16005,7 @@ fn obmc_blend(
         let (h_kind, v_kind) = neighbour_filter(
             interp_fixed,
             neighbours.left_filter[mi_row + off4],
-        );
+        )?;
         let (ny, nu, nv) = ref_planes(nb.ref_frame, ref_y, ref_u, ref_v, other_refs)?;
         let nb_scale = mc::scale_factor(ny.width, frame_width);
         let (bw, bh, oy) = (overlap_left, span4 * 4, off4 * 4);
