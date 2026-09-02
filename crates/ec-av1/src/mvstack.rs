@@ -532,7 +532,10 @@ fn scan_row(
     let Some(row) = mi_row.checked_add_signed(row_offset) else {
         return false;
     };
-    let col_shift: usize = if row_offset.unsigned_abs() > 1 { 1 } else { 0 };
+    // libaom `scan_row_mbmi` (mvref_common.c:157): the shift steps BACK on an odd
+    // mi_col when the block is narrower than 8px (a 4-wide 1:4 strip / sub-8x8 leaf).
+    let col_shift: usize =
+        if row_offset.unsigned_abs() > 1 && !(mi_col & 1 != 0 && bw4 < 2) { 1 } else { 0 };
     let use_step_16 = bw4 >= 16;
     let end_mi = bw4.min(16);
     let mut found = false;
@@ -550,7 +553,10 @@ fn scan_row(
             len = len.max(2);
         }
         let mut weight = ROW_COL_WEIGHT_FLOOR;
-        if bw4 <= n4 {
+        // libaom `scan_row_mbmi` (mvref_common.c:172) gates this on
+        // `xd->width >= mi_size_wide[BLOCK_8X8]` as well: a 4-wide block (a 1:4
+        // strip, a sub-8x8 leaf) keeps weight 2 and leaves `processed_rows` alone.
+        if bw4 >= 2 && bw4 <= n4 {
             let inc = ((-max_row_offset + row_offset + 1) as usize).min(info.size_h);
             weight = weight.max(inc as u32);
             *processed_rows = (inc as isize - row_offset - 1).max(0) as usize;
@@ -614,7 +620,10 @@ fn scan_col(
     let Some(col) = mi_col.checked_add_signed(col_offset) else {
         return false;
     };
-    let row_shift: usize = if col_offset.unsigned_abs() > 1 { 1 } else { 0 };
+    // libaom `scan_col_mbmi` (mvref_common.c:206): same step-back on an odd mi_row
+    // under a 4-high block.
+    let row_shift: usize =
+        if col_offset.unsigned_abs() > 1 && !(mi_row & 1 != 0 && bh4 < 2) { 1 } else { 0 };
     let use_step_16 = bh4 >= 16;
     let end_mi = bh4.min(16);
     let mut found = false;
@@ -632,7 +641,10 @@ fn scan_col(
             len = len.max(2);
         }
         let mut weight = ROW_COL_WEIGHT_FLOOR;
-        if bh4 <= n4 {
+        // libaom `scan_col_mbmi` (mvref_common.c:222): `xd->height >=
+        // mi_size_high[BLOCK_8X8]` gates this branch, so a 4-high block keeps
+        // weight 2 and leaves `processed_cols` alone.
+        if bh4 >= 2 && bh4 <= n4 {
             let inc = ((-max_col_offset + col_offset + 1) as usize).min(info.size);
             weight = weight.max(inc as u32);
             *processed_cols = (inc as isize - col_offset - 1).max(0) as usize;
@@ -1362,7 +1374,10 @@ fn scan_row_compound(
     let Some(row) = mi_row.checked_add_signed(row_offset) else {
         return false;
     };
-    let col_shift: usize = if row_offset.unsigned_abs() > 1 { 1 } else { 0 };
+    // libaom `scan_row_mbmi` (mvref_common.c:157): the shift steps BACK on an odd
+    // mi_col when the block is narrower than 8px (a 4-wide 1:4 strip / sub-8x8 leaf).
+    let col_shift: usize =
+        if row_offset.unsigned_abs() > 1 && !(mi_col & 1 != 0 && bw4 < 2) { 1 } else { 0 };
     let use_step_16 = bw4 >= 16;
     let end_mi = bw4.min(16);
     let mut found = false;
@@ -1380,7 +1395,10 @@ fn scan_row_compound(
             len = len.max(2);
         }
         let mut weight = ROW_COL_WEIGHT_FLOOR;
-        if bw4 <= n4 {
+        // libaom `scan_row_mbmi` (mvref_common.c:172) gates this on
+        // `xd->width >= mi_size_wide[BLOCK_8X8]` as well: a 4-wide block (a 1:4
+        // strip, a sub-8x8 leaf) keeps weight 2 and leaves `processed_rows` alone.
+        if bw4 >= 2 && bw4 <= n4 {
             let inc = ((-max_row_offset + row_offset + 1) as usize).min(info.size_h);
             weight = weight.max(inc as u32);
             *processed_rows = (inc as isize - row_offset - 1).max(0) as usize;
@@ -1419,7 +1437,10 @@ fn scan_col_compound(
     let Some(col) = mi_col.checked_add_signed(col_offset) else {
         return false;
     };
-    let row_shift: usize = if col_offset.unsigned_abs() > 1 { 1 } else { 0 };
+    // libaom `scan_col_mbmi` (mvref_common.c:206): same step-back on an odd mi_row
+    // under a 4-high block.
+    let row_shift: usize =
+        if col_offset.unsigned_abs() > 1 && !(mi_row & 1 != 0 && bh4 < 2) { 1 } else { 0 };
     let use_step_16 = bh4 >= 16;
     let end_mi = bh4.min(16);
     let mut found = false;
@@ -1437,7 +1458,10 @@ fn scan_col_compound(
             len = len.max(2);
         }
         let mut weight = ROW_COL_WEIGHT_FLOOR;
-        if bh4 <= n4 {
+        // libaom `scan_col_mbmi` (mvref_common.c:222): `xd->height >=
+        // mi_size_high[BLOCK_8X8]` gates this branch, so a 4-high block keeps
+        // weight 2 and leaves `processed_cols` alone.
+        if bh4 >= 2 && bh4 <= n4 {
             let inc = ((-max_col_offset + col_offset + 1) as usize).min(info.size);
             weight = weight.max(inc as u32);
             *processed_cols = (inc as isize - col_offset - 1).max(0) as usize;
