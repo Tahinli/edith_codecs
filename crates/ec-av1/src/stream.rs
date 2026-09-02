@@ -13833,4 +13833,197 @@ mod tests {
             assert_eq!(got.v, want.v, "frame {i} V vs ffmpeg (pinned sbpart)");
         }
     }
+
+    /// lane-tx64x16 r1: a real `aomenc` stream whose superblock-level
+    /// partition decision is `PARTITION_HORZ_4`/`PARTITION_VERT_4` (four
+    /// 64x16 / 16x64 strips) must decode pixel-exact. Both arms are HARD
+    /// asserted, and only hits earned inside an attempt that then compared
+    /// pixel-exact against ffmpeg are counted -- a strip decoded by an
+    /// attempt that later refused proves nothing (class
+    /// gate-skips-on-its-own-failure). `--enable-1to4-partitions=1` is the
+    /// tool switch; `--min-partition-size=16` keeps the RD search from
+    /// recursing below 16x16, where several other unlanded partition shapes
+    /// live.
+    #[test]
+    fn a_real_aomenc_stream_with_a_superblock_level_1to4_partition_decodes_pixel_exact() {
+        const NAME: &str =
+            "a_real_aomenc_stream_with_a_superblock_level_1to4_partition_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height, frame_count) = (192usize, 128usize, 1usize);
+        let mut named_refusals = 0u32;
+        let mut matched = 0u32;
+        let (mut horz_proved, mut vert_proved) = (0usize, 0usize);
+        let (mut out_of_scope, mut out_of_scope_mismatch) = (0u32, 0u32);
+        let n_attempts: u32 = std::env::var("EC_TX64X16_GATE_ATTEMPTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(40);
+        for attempt in 0..n_attempts {
+            let seed = 42 + attempt;
+            let duration = frame_count as f64 / 25.0;
+            // Odd attempts render the SAME generator rotated 90 degrees
+            // (generated at height x width, then `transpose`), because
+            // aomenc's RD picks `PARTITION_VERT_4` on this content and
+            // essentially never `HORZ_4`: the two arms are a transposed
+            // pair, and a gate that only ever sees one of them cannot catch
+            // a transposed scan/context table (class scan-weights-cross-axis).
+            let source = if attempt % 2 == 0 {
+                gradients_source(seed, width, height, &format!("duration={duration}:rate=25"))
+            } else {
+                format!(
+                    "{},transpose=1",
+                    gradients_source(seed, height, width, &format!("duration={duration}:rate=25"))
+                )
+            };
+            let y4m = Command::new("ffmpeg")
+                .args([
+                    "-v", "error", "-f", "lavfi", "-i", &source, "-pix_fmt", "yuv420p", "-f",
+                    "yuv4mpegpipe", "-",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .expect("ffmpeg failed to run");
+            assert!(
+                y4m.status.success(),
+                "ffmpeg fixture: {}",
+                String::from_utf8_lossy(&y4m.stderr)
+            );
+            let args: Vec<&str> = vec![
+                "--codec=av1",
+                "--passes=1",
+                "--end-usage=q",
+                "--cq-level=45",
+                "--cpu-used=0",
+                "--threads=1",
+                "--row-mt=0",
+                "--sb-size=64",
+                "--enable-rect-partitions=1",
+                "--enable-ab-partitions=0",
+                "--enable-1to4-partitions=1",
+                "--min-partition-size=16",
+                "--max-partition-size=64",
+                "--enable-restoration=0",
+                "--enable-palette=0",
+                "--deltaq-mode=0",
+                "--enable-filter-intra=0",
+                "--enable-cfl-intra=0",
+                "--enable-intrabc=0",
+                "--enable-tx-size-search=0",
+                "--obu",
+                "-o",
+                "-",
+                "-",
+            ];
+            let mut child = Command::new(aomenc_path())
+                .args(&args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("aomenc failed to start");
+            child
+                .stdin
+                .take()
+                .expect("aomenc stdin")
+                .write_all(&y4m.stdout)
+                .expect("writing y4m to aomenc");
+            let out = child.wait_with_output().expect("aomenc failed to run");
+            assert!(
+                out.status.success(),
+                "aomenc refused the fixture: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stream = out.stdout;
+            let before = (
+                crate::decode::sb_rect4_horz_hits(),
+                crate::decode::sb_rect4_vert_hits(),
+            );
+            let frames = match decode_stream(&stream) {
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("unsupported"),
+                        "{NAME} failed outright, not a named refusal (seed {seed}): {msg}"
+                    );
+                    named_refusals += 1;
+                    eprintln!("seed {seed} refusal: {msg}");
+                    continue;
+                }
+                Ok(frames) => frames,
+            };
+            let (horz, vert) = (
+                crate::decode::sb_rect4_horz_hits() - before.0,
+                crate::decode::sb_rect4_vert_hits() - before.1,
+            );
+            let ffmpeg_frames = ffmpeg_decode_sequence(&stream, width, height, frame_count);
+            assert_eq!(frames.len(), frame_count);
+            let mismatched = frames
+                .iter()
+                .zip(&ffmpeg_frames)
+                .any(|(got, want)| got.y != want.y || got.u != want.u || got.v != want.v);
+            if horz + vert == 0 {
+                // Out of this gate's territory: aomenc's RD picked no 1:4
+                // partition at all for this seed, so the attempt can neither
+                // prove nor disprove the arms under test. NOT silently
+                // dropped -- counted and printed, and a mismatch here is
+                // reported as a defect of another lane's shape (r1 found
+                // one: seed 55 of this very recipe decodes 3944 wrong luma
+                // samples with zero 1:4 blocks in the stream, first at
+                // (154, 59), inside the 64x32 `PARTITION_HORZ` superblock at
+                // (128, 64) -- see lanes/tx64x16-r1.report.md). Selecting on
+                // "the stream contains the feature", never on "the stream
+                // decoded correctly", is what keeps this from being survivor
+                // bias.
+                out_of_scope += 1;
+                if mismatched {
+                    out_of_scope_mismatch += 1;
+                    eprintln!(
+                        "{NAME}: seed {seed} MISMATCHES with zero 1:4 blocks -- a pre-existing \
+                         defect of another shape, not this gate's arms"
+                    );
+                }
+                continue;
+            }
+            if mismatched {
+                if let Ok(path) = std::env::var("EC_AV1_GATE_DUMP") {
+                    std::fs::write(&path, &stream).expect("writing pinned stream");
+                    eprintln!("EC_AV1_GATE_DUMP: wrote mismatching stream (seed {seed}) to {path}");
+                }
+            }
+            for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (seed {seed})");
+                assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (seed {seed})");
+                assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (seed {seed})");
+            }
+            horz_proved += horz;
+            vert_proved += vert;
+            matched += 1;
+        }
+        assert!(
+            matched > 0,
+            "{NAME}: every attempt refused; the gate never decoded a stream"
+        );
+        assert!(
+            horz_proved > 0 && vert_proved > 0,
+            "{NAME}: a 1:4 arm never fired inside a pixel-exact attempt \
+             (horz={horz_proved}, vert={vert_proved}, {matched} matches, {named_refusals} \
+             refusals out of {n_attempts}) -- gate proved nothing this run"
+        );
+        eprintln!(
+            "{NAME}: {named_refusals} named refusals, {matched} pixel-exact matches out of \
+             {n_attempts}, horz_4 strips={horz_proved}, vert_4 strips={vert_proved}, \
+             {out_of_scope} attempts carried no 1:4 block ({out_of_scope_mismatch} of them \
+             mismatched -- other lanes' shapes)"
+        );
+    }
 }
