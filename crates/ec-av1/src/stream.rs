@@ -938,6 +938,16 @@ pub fn decode_stream(data: &[u8]) -> Result<Vec<Picture>> {
                 let _ = f.write_all(&buf);
             }
         }
+        // lane-golomb r1: `EC_FRAMES=1` prints one line per SUCCESSFULLY decoded
+        // frame in DECODE order, so a mid-stream refusal is attributable to a
+        // frame index without a full mode trace (the failing frame is the next
+        // one after the last line printed).
+        if std::env::var_os("EC_FRAMES").is_some() {
+            eprintln!(
+                "EC_FRAME_OK decode_idx={pictures_decoded} show={} type={:?} order_hint={}",
+                header.show_frame, header.frame_type, header.order_hint
+            );
+        }
         pictures_decoded += 1;
         let decoded_seg_map = decode::take_segment_ids();
         for i in 0..NUM_REF_FRAMES {

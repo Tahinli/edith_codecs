@@ -3868,7 +3868,7 @@ fn dc_sign_ctx(vote: i32) -> usize {
 /// The remainder of a level the base and base-range syntax could not reach
 /// (spec 5.11.40): its bit length in unary, then that many of its own bits,
 /// most significant first — the exact inverse of [`crate::tile::write_golomb`].
-fn read_golomb(dec: &mut SymbolDecoder) -> Result<u32> {
+fn read_golomb(dec: &mut SymbolDecoder, w: usize, h: usize, pos: u16, base: i32) -> Result<u32> {
     // lane-scaledref r1: this cap MASKS A REAL DEFECT and must not be lifted
     // on its own. Reading up to 32 leading zeros (dav1d's `len < 32`; libaom
     // itself calls a 21st bit a corrupt frame, decodetxb.c:30) is bit-identical
@@ -3881,10 +3881,31 @@ fn read_golomb(dec: &mut SymbolDecoder) -> Result<u32> {
     // level above 1<<19, so the long tail is the SYMPTOM of an earlier desync
     // in that intra rect64 stream -- class `refusal-hides-a-defect`. Lift this
     // together with that defect's fix, not before.
+    //
+    // lane-golomb r1 re-measured the bound itself and CLOSED the "our bound is
+    // narrower than libaom's" premise: libaom's own `read_golomb`
+    // (av1/decoder/decodetxb.c:22-42) counts `++length` per leading-zero bit
+    // and calls `aom_internal_error(AOM_CODEC_CORRUPT_FRAME, "Invalid length in
+    // read_golomb")` at `length > 20` -- the identical bound to the one below,
+    // for the identical bit (20 zeros then anything). Raising it is therefore
+    // NOT what libaom does, and would turn a clean refusal into silent pixel
+    // corruption. On the 10-bit 3840x1608 stream's 10 s head cut the refusal
+    // fires in DECODE-ORDER FRAME 80 at a 32x32 transform block, coefficient
+    // `pos=674` (high frequency), base level 15 -- i.e. it is asking for a level
+    // above `15 + 2^20`, which no real coefficient carries. `EC_GOLOMB=1` prints
+    // that line; `EC_FRAMES=1` (stream.rs) prints the frame index.
     let mut length = 1u32;
     while dec.literal(1) == 0 {
         length += 1;
         if length > 20 {
+            // lane-golomb r1 measurement rung: block shape, coefficient
+            // position and the base level this tail was extending.
+            if std::env::var_os("EC_GOLOMB").is_some() {
+                let (rng, cnt) = dec.debug_state();
+                eprintln!(
+                    "EC_GOLOMB_LONG w={w} h={h} pos={pos} base={base} length={length} rng={rng} cnt={cnt}"
+                );
+            }
             return Err(unsupported("a Golomb tail longer than this decoder reads"));
         }
     }
@@ -4184,7 +4205,7 @@ fn read_coeffs(
             eprintln!("EC_COEFF_STEP tag=sign c={c} sign={} rng={rng}", negative as i32);
         }
         let level = if level.abs_diff(0) as i32 > MAX_BR_LEVEL {
-            let g = read_golomb(dec)?;
+            let g = read_golomb(dec, side, side, pos, level)?;
             if trace {
                 eprintln!("TRACE golomb pos={pos} value={g}");
             }
@@ -4344,7 +4365,7 @@ fn read_coeffs_rect(
             eprintln!("EC_COEFF_STEP tag=sign_rect pos={pos} sign={} dcctx={sign_ctx} rng={rng}", u8::from(negative));
         }
         let level = if level.abs_diff(0) as i32 > MAX_BR_LEVEL {
-            let g = read_golomb(dec)?;
+            let g = read_golomb(dec, w, h, pos, level)?;
             level + g as i32
         } else {
             level
