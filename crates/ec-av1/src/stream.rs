@@ -55,6 +55,19 @@ fn final_dump_prefix() -> Option<String> {
 
 /// 32x32-level 1:4 strip counters, for `decode_probe`'s fixture search:
 /// (HORZ_4 strips, VERT_4 strips, strips that read coefficients).
+/// lane-inter4 r1: the INTER-frame partition counters this lane's gates
+/// assert -- `(32x8, 8x32, 64x32, 32x64, 64x16, 16x64)` strips decoded.
+pub fn inter_rect_counters() -> (usize, usize, usize, usize, usize, usize) {
+    (
+        crate::decode::rect4_32_horz_inter_hits(),
+        crate::decode::rect4_32_vert_inter_hits(),
+        crate::decode::inter_sb_horz_hits(),
+        crate::decode::inter_sb_vert_hits(),
+        crate::decode::inter_sb_horz4_hits(),
+        crate::decode::inter_sb_vert4_hits(),
+    )
+}
+
 pub fn rect4_32_counters() -> (usize, usize, usize) {
     (
         crate::decode::rect4_32_horz_hits(),
@@ -4526,6 +4539,182 @@ mod tests {
             &[],
             64,
         );
+    }
+
+    /// lane-inter4 r1: the SUPERBLOCK-level inter `PARTITION_HORZ`/
+    /// `PARTITION_VERT` pair -- two 64x32 / 32x64 inter strips, the arm the
+    /// inter tile path refused outright before this lane ("an inter SB-level
+    /// partition type other than NONE or SPLIT"). `--min-partition-size=32`
+    /// keeps every 32x32-level rect shape (already coded, and residual-capable
+    /// only when skip) out of the picture so the counters can only be earned
+    /// at the superblock level; the noiseless split-motion source (one half
+    /// translating, the other static, flat inside each half) is what makes
+    /// aomenc's RD pick a superblock HORZ/VERT whose strips are `skip` --
+    /// the ONLY inter rect shape this decoder can complete, since rectangular
+    /// inter residual coding is not ported (see `reject_residual`).
+    ///
+    /// Every decoded frame is compared to ffmpeg (Y, U and V); an attempt
+    /// that refuses by name is counted, never turned into a SKIP; and an
+    /// attempt that decoded without firing the arm is counted separately and
+    /// still required to be pixel-exact (class gate-skips-on-its-own-failure).
+    #[test]
+    fn a_real_aomenc_inter_sequence_with_a_superblock_level_rect_partition_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_inter_sequence_with_a_superblock_level_rect_partition_decodes_pixel_exact";
+        let _gate_lock = lock_gate_counters();
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height, frame_count) = (192usize, 128usize, 6usize);
+        // lane-inter4 r1: 8-bit ONLY, and the reason is the lane's own open
+        // residue, not a tolerance: across all 16 attempts x both depths, every
+        // 10-bit attempt that reached a superblock-level rect strip found it
+        // NON-skip, so it stops at "a non-skip rectangular (HORZ/VERT/HORZ_B)
+        // strip needs rectangular residual coding". The 10-bit twin below is
+        // `#[ignore]`d with that exact reason rather than deleted or weakened.
+        for bit_depth in [8u32] {
+            let (mut named_refusals, mut matched, mut out_of_scope, mut oos_mismatch) =
+                (0u32, 0u32, 0u32, 0u32);
+            let (mut horz_proved, mut vert_proved) = (0usize, 0usize);
+            for attempt in 0..16u32 {
+                // Two orientations (the transposed pair a one-sided gate could
+                // never separate) x four quantisers x two motion steps: which
+                // superblock the RD hands a skip-able rect strip moves with
+                // the quantiser, and the 10-bit arm needs a different corner
+                // of the grid from the 8-bit one.
+                let vertical_split = attempt % 2 == 1;
+                let cq = [58, 52, 45, 61][(attempt / 2 % 4) as usize];
+                let sp = 8 + (attempt / 8) * 4;
+                let geq = if vertical_split {
+                    format!("if(lt(Y,64), 40+mod(floor((X+N*{sp})/32)*90,200), 200)")
+                } else {
+                    format!("if(lt(X,64), 40+mod(floor((Y+N*{sp})/32)*90,200), 200)")
+                };
+                let duration = frame_count as f64 / 25.0;
+                let source = format!(
+                    "color=c=gray:s={width}x{height}:d={duration}:r=25,format=gray,\
+                     geq=lum='{geq}',format=yuv420p"
+                );
+                let pix_fmt = if bit_depth == 10 { "yuv420p10le" } else { "yuv420p" };
+                let y4m = Command::new("ffmpeg")
+                    .args([
+                        "-v", "error", "-f", "lavfi", "-i", &source, "-t", &duration.to_string(),
+                        "-pix_fmt", pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                    ])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .expect("ffmpeg failed to run");
+                assert!(
+                    y4m.status.success(),
+                    "{NAME}: ffmpeg refused the {bit_depth}-bit fixture: {}",
+                    String::from_utf8_lossy(&y4m.stderr)
+                );
+                let cq_arg = format!("--cq-level={cq}");
+                let depth_arg = format!("--bit-depth={bit_depth}");
+                let input_depth_arg = format!("--input-bit-depth={bit_depth}");
+                let args: Vec<&str> = vec![
+                    "--codec=av1", "--passes=1", "--end-usage=q", &cq_arg, "--cpu-used=0",
+                    "--threads=1", "--row-mt=0", "--sb-size=64", &depth_arg, &input_depth_arg,
+                    "--enable-restoration=0", "--enable-palette=0", "--deltaq-mode=0",
+                    "--enable-filter-intra=0", "--enable-cfl-intra=0", "--enable-intrabc=0",
+                    "--enable-tx-size-search=0", "--lag-in-frames=0",
+                    // Per-arm overrides go LAST: aomenc keeps the last
+                    // occurrence of a repeated --enable-* flag.
+                    "--enable-rect-partitions=1", "--enable-ab-partitions=0",
+                    "--enable-1to4-partitions=1", "--min-partition-size=32",
+                    "--max-partition-size=64",
+                    "--obu", "-o", "-", "-",
+                ];
+                let mut child = Command::new(aomenc_path())
+                    .args(&args)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("aomenc failed to start");
+                child
+                    .stdin
+                    .take()
+                    .expect("aomenc stdin")
+                    .write_all(&y4m.stdout)
+                    .expect("writing y4m to aomenc");
+                let out = child.wait_with_output().expect("aomenc failed to run");
+                assert!(
+                    out.status.success(),
+                    "aomenc refused the fixture: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let stream = out.stdout;
+                let before = crate::stream::inter_rect_counters();
+                let frames = match decode_stream(&stream) {
+                    Err(e) => {
+                        let msg = e.to_string();
+                        assert!(
+                            msg.contains("unsupported"),
+                            "{NAME} failed outright, not a named refusal ({bit_depth}-bit, \
+                             attempt {attempt}): {msg}"
+                        );
+                        named_refusals += 1;
+                        eprintln!("{bit_depth}-bit attempt {attempt} refusal: {msg}");
+                        continue;
+                    }
+                    Ok(frames) => frames,
+                };
+                let after = crate::stream::inter_rect_counters();
+                let (horz, vert) = (after.2 - before.2, after.3 - before.3);
+                let ffmpeg_frames = if bit_depth == 10 {
+                    ffmpeg_decode_sequence_10bit(&stream, width, height, frame_count)
+                } else {
+                    ffmpeg_decode_sequence(&stream, width, height, frame_count)
+                };
+                assert_eq!(frames.len(), frame_count);
+                let mismatched = frames
+                    .iter()
+                    .zip(&ffmpeg_frames)
+                    .any(|(got, want)| got.y != want.y || got.u != want.u || got.v != want.v);
+                if horz + vert == 0 {
+                    out_of_scope += 1;
+                    if mismatched {
+                        oos_mismatch += 1;
+                        eprintln!(
+                            "{NAME}: {bit_depth}-bit attempt {attempt} MISMATCHES with zero \
+                             superblock-level inter rect strips -- another shape's defect"
+                        );
+                    }
+                    continue;
+                }
+                for (i, (got, want)) in frames.iter().zip(&ffmpeg_frames).enumerate() {
+                    assert_eq!(got.y, want.y, "{NAME} frame {i} luma vs ffmpeg (attempt {attempt}, {bit_depth}-bit)");
+                    assert_eq!(got.u, want.u, "{NAME} frame {i} U vs ffmpeg (attempt {attempt}, {bit_depth}-bit)");
+                    assert_eq!(got.v, want.v, "{NAME} frame {i} V vs ffmpeg (attempt {attempt}, {bit_depth}-bit)");
+                }
+                horz_proved += horz;
+                vert_proved += vert;
+                matched += 1;
+            }
+            eprintln!(
+                "{NAME} ({bit_depth}-bit): {named_refusals} named refusals, {matched} pixel-exact \
+                 attempts carrying the arm, 64x32 strips={horz_proved}, 32x64 strips={vert_proved}, \
+                 {out_of_scope} attempts carried none ({oos_mismatch} of them mismatched)"
+            );
+            assert_eq!(
+                oos_mismatch, 0,
+                "{NAME}: {oos_mismatch} attempt(s) with no superblock-level inter rect strip \
+                 decoded but mismatched ffmpeg -- a defect of another shape, not a pass"
+            );
+            assert!(
+                horz_proved + vert_proved > 0,
+                "{NAME} ({bit_depth}-bit): the superblock-level inter rect arm never fired \
+                 inside a pixel-exact attempt (horz={horz_proved}, vert={vert_proved}, \
+                 {named_refusals} refusals, {out_of_scope} out of scope) -- gate proved nothing"
+            );
+        }
     }
 
     #[test]

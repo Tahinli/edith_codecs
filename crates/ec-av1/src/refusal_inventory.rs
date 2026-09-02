@@ -62,7 +62,7 @@ const REFUSALS: &[&str] = &[
     "an inter var-tx tree with a leaf transform larger than 32x32",
     "an intra block in an inter frame whose tx_depth splits its luma transform (round 1)",
     "an inter frame with no key frame before it",
-    "an inter SB-level partition type other than NONE or SPLIT (this decoder's inter tile path recurses a superblock only as SPLIT)",
+    "an inter SB-level AB partition (HORZ_A/HORZ_B/VERT_A/VERT_B; this decoder's inter tile path codes a superblock as NONE, SPLIT, HORZ, VERT, HORZ_4 or VERT_4)",
     "a masked compound 64x64 inter block (compound_type is inferred, not coded, at this size)",
     "an inter partition below 16x16 other than SPLIT (16x8/8x16 rect inter leaves are not coded yet)",
     "an intra mode this decoder does not code (round 2)",
@@ -72,6 +72,7 @@ const REFUSALS: &[&str] = &[
     "filter intra on a HORZ/VERT strip (this decoder predicts square-only)",
     "warp prediction with a scaled reference (superres, unimplemented)",
     "an 8x8 partition leaf under a scaled reference (superres, unimplemented)",
+    "a motion_mode symbol for a block shape this decoder has no CDF row for",
 ];
 
 /// Gates whose `Err` arm turns a decode failure into a printed SKIP rather than

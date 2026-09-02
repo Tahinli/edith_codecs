@@ -31,6 +31,11 @@ fn main() {
     let report = || {
         let (h, v, c) = ec_av1::stream::rect4_32_counters();
         println!("rect4_32: horz={h} vert={v} coded={c}");
+        let ir = ec_av1::stream::inter_rect_counters();
+        println!(
+            "inter_rect: 32x8={} 8x32={} 64x32={} 32x64={} 64x16={} 16x64={}",
+            ir.0, ir.1, ir.2, ir.3, ir.4, ir.5
+        );
     };
     match ec_av1::stream::decode_stream(&data) {
         Ok(frames) if frames.is_empty() => {
