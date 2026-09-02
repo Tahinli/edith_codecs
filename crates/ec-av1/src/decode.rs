@@ -2199,7 +2199,7 @@ pub(crate) fn build_motion_field(
     ref_order_hints: [u32; 7],
 ) -> crate::motion_field::MotionField {
     let mut field =
-        crate::motion_field::MotionField::new(mi_cols, mi_rows, order_hint, ref_order_hints);
+        crate::motion_field::MotionField::new(mi_cols, mi_rows, order_hint, ref_order_hints, false);
     // lane-interbis r1: libaom `av1_calculate_ref_frame_side` -- a reference
     // whose OrderHint is AHEAD of (or equal to) this frame's is "on the other
     // side", and `av1_copy_frame_mvs` skips it entirely, so a compound block
@@ -2222,7 +2222,14 @@ pub(crate) fn build_motion_field(
             let Some(info) = grid.get(row, col) else {
                 continue;
             };
+            // `av1_copy_frame_mvs` runs for EVERY block of an inter frame and
+            // CLEARS the cells it covers first (`mv->ref_frame = NONE_FRAME`),
+            // so an intra block -- or an inter block whose every slot is on the
+            // other side / over the limit -- wipes what an earlier block wrote
+            // into the same 8x8 cell (only reachable from sub-8x8 leaves, which
+            // share a cell).
             if !info.is_inter {
+                field.set(row, col, None);
                 continue;
             }
             // `av1_copy_frame_mvs` walks BOTH reference slots and the LAST
@@ -2248,9 +2255,7 @@ pub(crate) fn build_motion_field(
                 }
                 saved = Some(crate::motion_field::SavedMv { mv, ref_frame: rf });
             }
-            if let Some(saved) = saved {
-                field.set(row, col, saved);
-            }
+            field.set(row, col, saved);
         }
     }
     field
