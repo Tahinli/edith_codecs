@@ -2713,6 +2713,211 @@ mod tests {
         }
     }
 
+    /// lane-kf900 r4, the gate for the two lifted palette refusals ("a 1:4
+    /// rect strip that actually uses a palette (reconstruction is not ported
+    /// at this shape)" and "a palette block on a HORZ/VERT intra strip below
+    /// 16x16 (reconstruction not ported)"): real `aomenc` streams that put a
+    /// palette on a RECT strip, decoded whole-frame pixel-exact against
+    /// ffmpeg's own decode of the identical bytes, at 8 AND 10 bit.
+    ///
+    /// Arm 0 is the stream lane-kf900 r3 pinned and stopped on -- `testsrc2`
+    /// 256x192, `--cq-level=59 --cpu-used=0 --min-partition-size=8
+    /// --enable-rect-partitions=1 --enable-tx-size-search=1`, md5
+    /// `e5f033d8fe34e4418d8cca3ac9d2b595` at 10 bit. Arms 1-2 force the shape
+    /// on screen-like content with `--tune-content=screen --enable-palette=1
+    /// --enable-1to4-partitions=1`.
+    ///
+    /// An attempt whose decode never hit a rect-strip palette block proves
+    /// nothing about the lift, so it is counted OUT OF SCOPE rather than
+    /// silently passing -- but a mismatch on one is still a failure
+    /// (`out_of_scope_mismatch == 0`), and at least one attempt must fire the
+    /// counter or the gate is vacuous.
+    #[test]
+    fn a_real_aomenc_rect_strip_palette_decodes_pixel_exact() {
+        const NAME: &str = "a_real_aomenc_rect_strip_palette_decodes_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        if !have_aomenc() {
+            eprintln!("SKIP {NAME}: no aomenc at {}", aomenc_path().display());
+            return;
+        }
+        let (width, height) = (256usize, 192usize);
+        let screen: &[&str] = &[
+            "--tune-content=screen",
+            "--enable-palette=1",
+            "--enable-1to4-partitions=1",
+            "--min-partition-size=8",
+        ];
+        let arms: [(&str, String, &[&str]); 3] = [
+            ("testsrc2-pinned", "testsrc2=s=256x192:r=25".to_string(), &[]),
+            ("testsrc2-screen", "testsrc2=s=256x192:r=25".to_string(), screen),
+            ("smptebars-screen", "smptebars=size=256x192:rate=25".to_string(), screen),
+        ];
+        let (mut fired_arms, mut out_of_scope, mut out_of_scope_mismatch) = (0u32, 0u32, 0u32);
+        let mut refused = 0u32;
+        let mut fired_at_depth = [0u32; 2];
+        let mut frames_compared = 0usize;
+        for (arm, src, extra) in &arms {
+            for depth in [8usize, 10] {
+                let pix_fmt = if depth == 10 { "yuv420p10le" } else { "yuv420p" };
+                let render = || {
+                    let out = Command::new("ffmpeg")
+                        .args([
+                            "-v", "error", "-f", "lavfi", "-i", src.as_str(), "-t", "0.2",
+                            "-pix_fmt", pix_fmt, "-strict", "-1", "-f", "yuv4mpegpipe", "-",
+                        ])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .output()
+                        .expect("ffmpeg failed to run");
+                    assert!(out.status.success(), "{NAME}: ffmpeg failed for {arm}");
+                    out.stdout
+                };
+                let y4m_a = render();
+                let y4m_b = render();
+                assert_eq!(
+                    y4m_a, y4m_b,
+                    "{NAME}: {arm} must render byte-identical across two runs at {depth}-bit"
+                );
+                let y4m = y4m_a;
+                let depth_arg = format!("--bit-depth={depth}");
+                let in_depth_arg = format!("--input-bit-depth={depth}");
+                let mut child = Command::new(aomenc_path())
+                    .args(["--codec=av1"])
+                    .args([&depth_arg, &in_depth_arg])
+                    .args([
+                        "--passes=1",
+                        "--end-usage=q",
+                        "--cq-level=59",
+                        "--cpu-used=0",
+                        "--lag-in-frames=0",
+                        "--kf-max-dist=1",
+                        "--limit=1",
+                        "--threads=1",
+                        "--tile-columns=0",
+                        "--enable-tx-size-search=1",
+                        "--min-partition-size=8",
+                        "--enable-rect-partitions=1",
+                    ])
+                    // Per-arm overrides go AFTER the base recipe: aomenc keeps
+                    // the LAST occurrence of a repeated flag.
+                    .args(*extra)
+                    // The 8-bit twin of the pinned recipe picks a 128-root
+                    // HORZ partition, which this decoder still refuses by name
+                    // ("a 128x128 superblock HORZ/VERT or AB partition") --
+                    // an open refusal of another lane, unrelated to palette.
+                    // Pinning the superblock to 64 keeps the 8-bit arm on the
+                    // shape this gate is about; the 10-bit arms are the
+                    // untouched pinned recipe.
+                    .args(if depth == 8 { &["--sb-size=64"][..] } else { &[][..] })
+                    .args(["--obu", "-o", "-", "-"])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("aomenc failed to start");
+                child
+                    .stdin
+                    .take()
+                    .expect("aomenc stdin")
+                    .write_all(&y4m)
+                    .or_else(|e| match e.kind() {
+                        // aomenc rejecting the input closes the pipe before we
+                        // finish writing; its own stderr below is the report.
+                        std::io::ErrorKind::BrokenPipe => Ok(()),
+                        _ => Err(e),
+                    })
+                    .expect("writing y4m to aomenc");
+                let out = child.wait_with_output().expect("aomenc failed to run");
+                assert!(
+                    out.status.success(),
+                    "{NAME}: aomenc refused {arm} at {depth}-bit: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let stream = out.stdout;
+                let before = decode::rect4_palette_hits();
+                let frames = match decode_stream(&stream) {
+                    Ok(frames) => frames,
+                    // A NAMED refusal is another lane's open shape (here: a
+                    // palette on an 8x8 SQUARE leaf, still out of scope), never
+                    // a pass -- the attempt is counted out of scope and the
+                    // per-depth firing assert below keeps the gate honest.
+                    Err(e) if e.to_string().contains("unsupported") => {
+                        eprintln!("{NAME}: {arm} {depth}-bit REFUSED: {e}");
+                        refused += 1;
+                        continue;
+                    }
+                    Err(e) => panic!("{NAME}: decode failed on {arm} at {depth}-bit: {e}"),
+                };
+                let fired = decode::rect4_palette_hits() - before;
+                let ffmpeg_frames = if depth == 10 {
+                    ffmpeg_decode_sequence_10bit(&stream, width, height, frames.len())
+                } else {
+                    ffmpeg_decode_sequence(&stream, width, height, frames.len())
+                };
+                assert_eq!(
+                    frames.len(),
+                    ffmpeg_frames.len(),
+                    "{NAME}: {arm} at {depth}-bit -- frame count"
+                );
+                assert!(!frames.is_empty(), "{NAME}: {arm} at {depth}-bit decoded no frame");
+                // EVERY decode-order frame, all three planes.
+                let mut exact = true;
+                for (i, (ours, theirs)) in frames.iter().zip(ffmpeg_frames.iter()).enumerate() {
+                    if ours.y != theirs.y || ours.u != theirs.u || ours.v != theirs.v {
+                        exact = false;
+                        eprintln!("{NAME}: {arm} {depth}-bit frame {i} differs");
+                    }
+                    frames_compared += 1;
+                }
+                if fired > 0 {
+                    fired_arms += 1;
+                    fired_at_depth[usize::from(depth == 10)] += 1;
+                    assert!(
+                        exact,
+                        "{NAME}: {arm} at {depth}-bit has {fired} rect-strip palette block(s) \
+                         and does NOT decode pixel-exact"
+                    );
+                } else {
+                    out_of_scope += 1;
+                    if !exact {
+                        out_of_scope_mismatch += 1;
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "{NAME}: {fired_arms} attempt(s) with a rect-strip palette block, \
+             {out_of_scope} out of scope ({out_of_scope_mismatch} mismatched), \
+             {refused} refused, {frames_compared} frames compared, \
+             fired 8-bit={} 10-bit={}",
+            fired_at_depth[0], fired_at_depth[1]
+        );
+        // MEASURED 2026-09-02, every 8-bit attempt of these recipes: aomenc
+        // puts its palettes on SQUARE blocks at 8 bit and every 8-bit stream
+        // that reaches a rect strip with one lands on a palette shape still
+        // out of scope (8x8 square leaf, or a 64x32/32x64 superblock strip
+        // with a real transform). So the 8-bit arms here prove the DECODE
+        // path, not the lift -- `fired_at_depth[0] == 0` is a known, reported
+        // coverage gap and not a silent pass: the counter is printed.
+        assert!(
+            fired_at_depth[1] > 0,
+            "{NAME}: no attempt put a palette on a rect strip \
+             (8-bit={}, 10-bit={}) -- gate is vacuous",
+            fired_at_depth[0],
+            fired_at_depth[1]
+        );
+        assert!(fired_arms > 0, "{NAME}: gate is vacuous");
+        assert_eq!(
+            out_of_scope_mismatch, 0,
+            "{NAME}: {out_of_scope_mismatch} attempt(s) without a rect-strip palette block \
+             still mismatched -- an unrelated defect, not a SKIP"
+        );
+    }
+
     /// lane-hbd r5: a real `aomenc --bit-depth=10` stream, decoded through
     /// this crate's own 10-bit planes (`Picture` widened to `u16` in an
     /// earlier round) and checked pixel-exact against ffmpeg's own decode of
