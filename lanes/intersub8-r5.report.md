@@ -36,7 +36,8 @@ three red arms exact.
 Command (worktree, `CARGO_TARGET_DIR=$HOME/.cache/cargo-target-intersub8`):
 `EC_AV1_REQUIRE_AOMENC=1 cargo test -p ec-av1 --lib -j3 sub8x8_inter_split -- --nocapture`
 
-EVIDENCE: gate stdout | 48 real-aomenc attempts (2 depths x 24), each decoded and Y/U/V-compared vs ffmpeg | `fired=10 horz=5 vert=3 rect_masked=2`, `test result: ok. 1 passed; 0 failed` in 42.90s
+EVIDENCE: ~/.cache/intersub8-gate-r5.log | re-run at b64da0d: `cargo test -p ec-av1 --lib -j3 -- --nocapture sub8x8_inter_split cdef_and_sub16_inter_leaves refusal_inventory gate_coverage` | `fired=10 horz=5 vert=3 rect_masked=2` (both axes fire, `out_of_scope_mismatch == 0` asserted at stream.rs:7769), cdef sub16 gate now ok, `test result: ok. 14 passed; 0 failed` in 13.39s
+EVIDENCE: gate stdout (r5 first run) | 48 real-aomenc attempts (2 depths x 24), each decoded and Y/U/V-compared vs ffmpeg | `fired=10 horz=5 vert=3 rect_masked=2`, `test result: ok. 1 passed; 0 failed` in 42.90s
 EVIDENCE: ~/.cache/intersub8-sweep-r5.log | 56-arm sweep (cq {8,12,14,16,20,26,32} x sp {3,6,9,12} x {8,10}-bit, transposed source, rect on) re-run after the cdef merge with the HORZ path live | **zero MISMATCH arms**; every `horz8x4>0` arm is EXACT (8-bit cq14 sp3 h=4, cq20 sp3 h=4, cq32 sp9 h=3; 10-bit cq12 sp3 h=5, cq16 sp3 h=2) or stops at another lane's named refusal (8-bit cq12 sp6 h=1 -> the rect COMPOUND_WEDGE refusal, 10-bit cq8 sp12 h=2 -> non-DC chroma on an 8x8 inter leaf). r4 had 3 mismatching arms.
 EVIDENCE: same log, 3 targeted arms re-run individually | `gen_t.sh` + probe under `systemd-run --scope -p MemoryMax=6G`, compared to `ffmpeg -pix_fmt yuv420p{,10le}` | 8-bit cq32 sp9, 10-bit cq12 sp3, 10-bit cq16 sp3: MISMATCH (r4) -> EXACT, with the cdef merge as the only change
 
@@ -44,16 +45,27 @@ EVIDENCE: same log, 3 targeted arms re-run individually | `gen_t.sh` + probe und
 `test result: ok. 12 passed; 0 failed`.
 
 ## Full suite
-Unit `intersub8-suite-r5-1788332492.service` -> `$HOME/.cache/intersub8-suite-r5.log`.
-See RESULT line appended below.
+The first r5 unit (`intersub8-suite-r5-1788332492`) finished **FAILED. 384 passed; 1 failed;
+33 ignored** — the single failure was `a_real_aomenc_stream_with_cdef_and_sub16_inter_leaves`
+panicking `no sub-16x16 inter leaf wrote the CDEF skip band (depth=10 cq=12)`: an
+INSTRUMENTATION gap, the hit counter sat only in `decode_inter_block8`'s compound early-return
+arm and not in its fall-through twin. `b64da0d` counts both. The unit had been started 2 minutes
+before that commit, so it measured the pre-fix tree.
+
+Re-run after `b64da0d`: unit `intersub8-suite-r5b-1788345925` -> `$HOME/.cache/intersub8-suite-r5.log`.
+RESULT_R5B
 
 r4's unit (`intersub8-suite-r4-1788331918`) was stopped as charter-ordered: **187 ok, 0 FAILED,
 no `test result:` line** at stop time — recorded, not a green claim.
 
-## Film probe (charter premise corrected)
-No `census4`/`hunger4.tsv` exists on this box (`find ~/.cache ~/Documents/Code/Rust -name
-'hunger4.tsv'` -> empty), so the keyframe offsets were taken from `~/.cache/kf900/census_r3.tsv`,
-which samples the same 3840x1608 stream every 300 s.
+## Film probe
+CORRECTION to the r5 first draft: `census4/hunger4.tsv` DOES exist, under this session's
+scratchpad (`.../b6d8a07f-.../scratchpad/census4/hunger4.tsv`), not under `~/.cache`. Its row
+that refused below-8x8 is **ss=0** (`nd=30`), and `run4.sh` extracts with `-t 2`, not 0.5.
+
+EVIDENCE: ~/.cache/intersub8-tmp/hg_0b.obu + hg_0b.log | `ffmpeg -ss 0 -t 2 -c:v copy -an -f obu` on the 3840x1608 10-bit AV1 film, then `decode_probe` with `EC_AV1_FINAL_DUMP` under a 6G scope | 30 frames dumped (same count as the census row), counters `sub8_inter_split: groups=1`, `sub8_inter_rect: horz8x4=8 vert4x8=9` -- the below-8x8 partitions are now DECODED, and the segment stops one refusal later, at "a non-DC chroma mode on an 8x8 inter-frame leaf", instead of "an inter partition below 8x8".
+
+### Earlier (mis-sourced) offsets, kept for the record
 
 EVIDENCE: ~/.cache/intersub8-tmp/hg_{300,1200,1800}.obu | `ffmpeg -ss <s> -t 0.5 -c:v copy -an -f obu` then `decode_probe` under a 6G scope | ss=300 stops at "a split intra strip whose transform unit is 32x64"; ss=1200 and ss=1800 both stop at "a split (nonzero tx_depth) transform on an intra HORZ/VERT strip in an inter frame". `sub8_inter_split`/`sub8_inter_rect` counters are 0 at all three — **the below-8x8 refusal is no longer this film's frontier at these offsets**; two intra-strip transform refusals (other lanes) are hit first.
 
