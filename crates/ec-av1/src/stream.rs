@@ -3667,6 +3667,50 @@ mod tests {
         assert_eq!(frames[0].y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg");
     }
 
+    /// lane-kf1200 r3: the same film's `-ss 600` key frame (3840x1608, one
+    /// 8-px partial bottom superblock row), pinned because no aomenc recipe
+    /// reaches its shape -- a SKIPPED 8x8 intra leaf whose `tx_depth` resolved
+    /// to TX_4X4. (80 recipes swept this round: 4 frame shapes x 2 sources x
+    /// cq 32..63 x cpu-used 0/3 x 8/10-bit, all with
+    /// `--enable-tx-size-search=1 --enable-filter-intra=1`; every one came
+    /// back with `skip_split_tx_hits == 0`, `lanes/kf1200-r3.report.md`.)
+    /// An intra block reads `tx_depth` whether or not it is skipped, so the
+    /// leaf must record its resolved 4 -- not its 8x8 side -- in the txfm
+    /// context; recording 8 gave the NEXT block's `tx_depth` symbol the wrong
+    /// `tx_size_cdf` row (ctx 2 where libaom reads 1) and desynced the
+    /// entropy stream at mi (400,46). HARD-asserts `skip_split_tx_hits` moved.
+    #[test]
+    fn the_hunger_games_ss600_key_frame_skipped_split_tx_decodes_pixel_exact() {
+        const NAME: &str = "the_hunger_games_ss600_key_frame_skipped_split_tx_decodes_pixel_exact";
+        if !have_ffmpeg() {
+            eprintln!("SKIP {NAME}: no ffmpeg");
+            return;
+        }
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/hg_ss600_key_frame.obu");
+        let stream = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("{NAME}: reading {}: {e}", path.display()));
+        let (width, height) = (3840usize, 1608usize);
+        crate::decode::reset_skip_split_tx_hits();
+        let frames = match decode_stream(&stream) {
+            Ok(frames) => frames,
+            Err(e) => panic!("{NAME}: decode_stream refused: {e}"),
+        };
+        let skipped_split_tx = crate::decode::skip_split_tx_hits();
+        assert!(
+            skipped_split_tx > 0,
+            "{NAME}: zero skipped 8x8 leaves with a split transform -- the fixture no longer \
+             exercises the arm this test exists for"
+        );
+        assert_eq!(frames.len(), 1, "{NAME}: one key frame");
+        assert_eq!((frames[0].width, frames[0].height), (width, height));
+        let ffmpeg_frames = ffmpeg_decode_sequence_10bit(&stream, width, height, 1);
+        assert_eq!(frames[0].y, ffmpeg_frames[0].y, "{NAME}: luma vs ffmpeg");
+        assert_eq!(frames[0].u, ffmpeg_frames[0].u, "{NAME}: U vs ffmpeg");
+        assert_eq!(frames[0].v, ffmpeg_frames[0].v, "{NAME}: V vs ffmpeg");
+        eprintln!("{NAME}: {skipped_split_tx} skipped 8x8 TX_4X4 leaves, frame pixel-exact");
+    }
+
     /// lane-hbd10 r1: a real `aomenc --bit-depth=10 --superres-mode=1
     /// --superres-denominator=12` key frame, decoded pixel-exact against
     /// ffmpeg's own 10-bit decode. Proves `superres::upscale_row`'s
@@ -24392,16 +24436,29 @@ mod tests {
         let mut compared = 0usize;
         let mut edge_horz_total = 0usize;
         let mut edge_sub_total = 0usize;
+        let mut skip_split_tx_total = 0usize;
         // The last two shapes are the ledger-measured 64-level pair: on a
         // flat band (192x80 / 80x192) real aomenc answers the bottom-edge
         // superblock with the 64-level HORZ/VERT, which the 136 shapes above
         // never produce (their SBs always split down to the 32/16 levels).
+        // lane-kf1200 r3: the 2-/4-/6-mi partial bottom rows (h mod 64 == 8,
+        // 16, 24) with partial RIGHT columns as well (w mod 64 == 8), the
+        // geometry of the film key frames this lane chases.
         for (width, height, flat) in [
             (192usize, 136usize, false),
             (136usize, 192usize, false),
             (192usize, 80usize, true),
             (80usize, 192usize, true),
+            (200usize, 72usize, false),
+            (136usize, 88usize, false),
+            (264usize, 104usize, false),
         ] {
+            // lane-kf1200 r3 (class `tool-disabled-in-every-gate`): the whole
+            // recipe ran with `--enable-tx-size-search=0`, so no block ever
+            // carried a nonzero `tx_depth` and the SKIPPED 8x8 leaf that
+            // resolves to TX_4X4 -- whose txfm context this round fixed --
+            // was unreachable by construction. The second arm turns it on.
+            for tx_search in [0usize, 1] {
             for depth in [8usize, 10] {
                 let pix = if depth == 10 { "yuv420p10le" } else { "yuv420p" };
                 let y4m = Command::new("ffmpeg")
@@ -24432,7 +24489,8 @@ mod tests {
                             "--cpu-used=3", "--threads=1", "--row-mt=0", "--sb-size=64",
                             "--kf-max-dist=0", "--enable-rect-partitions=1",
                             "--enable-ab-partitions=0", "--enable-1to4-partitions=0",
-                            "--enable-tx-size-search=0", "--reduced-tx-type-set=1",
+                            &format!("--enable-tx-size-search={tx_search}"),
+                            "--reduced-tx-type-set=1",
                             "--min-partition-size=8", "--max-partition-size=64",
                             &format!("--input-bit-depth={depth}"),
                             &format!("--bit-depth={depth}"),
@@ -24464,6 +24522,7 @@ mod tests {
                     "{NAME}: aomenc output is not reproducible ({width}x{height}, depth={depth})"
                 );
                 crate::decode::reset_edge_part_hits();
+                crate::decode::reset_skip_split_tx_hits();
                 let frames = match decode_stream(&stream) {
                     Ok(frames) => frames,
                     Err(e) => {
@@ -24479,6 +24538,7 @@ mod tests {
                     }
                 };
                 let hits = crate::decode::edge_part_hits();
+                let skip_split_tx = crate::decode::skip_split_tx_hits();
                 let ffmpeg_frames = if depth == 10 {
                     ffmpeg_decode_sequence_10bit(&stream, width, height, frames.len())
                 } else {
@@ -24504,11 +24564,14 @@ mod tests {
                 compared += 1;
                 edge_horz_total += hits[0];
                 edge_sub_total += hits[2];
+                skip_split_tx_total += skip_split_tx;
                 eprintln!(
-                    "{NAME}: pixel-exact {width}x{height} at {depth}-bit, edge bits \
-                     64-level horz/vert={} split={} sub-level horz/vert={} split={}",
+                    "{NAME}: pixel-exact {width}x{height} at {depth}-bit tx_search={tx_search}, \
+                     edge bits 64-level horz/vert={} split={} sub-level horz/vert={} split={}, \
+                     skipped 8x8 leaves with TX_4X4 {skip_split_tx}",
                     hits[0], hits[1], hits[2], hits[3]
                 );
+            }
             }
         }
         assert!(
@@ -24524,5 +24587,15 @@ mod tests {
             edge_sub_total > 0,
             "{NAME}: no 32/16-level frame-edge bit was ever answered HORZ/VERT"
         );
+        // lane-kf1200 r3: the `--enable-tx-size-search=1` half of the window
+        // exists so a partial-row block can carry a nonzero `tx_depth` at all
+        // (the whole recipe ran with it OFF before -- class
+        // `tool-disabled-in-every-gate`). The SKIPPED 8x8 leaf that resolves
+        // to TX_4X4 -- whose txfm context this round fixed -- is NOT reachable
+        // from any synthetic source measured here (80 recipes, all zero), so
+        // that arm is asserted by the pinned film fixture
+        // `the_hunger_games_ss600_key_frame_skipped_split_tx_decodes_pixel_exact`
+        // instead; this counter is reported, not gated.
+        eprintln!("{NAME}: {skip_split_tx_total} skipped 8x8 TX_4X4 leaves across compared attempts");
     }
 }

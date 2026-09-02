@@ -2762,6 +2762,12 @@ const MAX_BR_LEVEL: i32 = NUM_BASE_LEVELS + COEFF_BASE_RANGE;
 const VERT_ALIKE: [usize; 6] = [2, PARTITION_SPLIT, 4, 6, 7, 9];
 const HORZ_ALIKE: [usize; 6] = [1, PARTITION_SPLIT, 4, 5, 6, 8];
 
+fn trace_edge(mi_r: usize, mi_c: usize, bsize: u32, ctx: usize, rng: u32) {
+    if std::env::var_os("EC_AV1_TRACE").is_some() {
+        eprintln!("OUR_PART mi_row={mi_r} mi_col={mi_c} bsize={bsize} ctx={ctx} rng={rng}");
+    }
+}
+
 fn element_prob(cdf: &[u16], element: usize) -> u16 {
     cdf[element] - if element > 0 { cdf[element - 1] } else { 0 }
 }
@@ -13833,11 +13839,13 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                 // the first block of that row.
                 match (has_cols, has_rows) {
                     (true, false) => {
+                        trace_edge((sb_r * SB_MI) as usize, (sb_c * SB_MI) as usize, 12, ctx, dec.debug_state().0 as u32);
                         let b = dec.symbol_fixed(&gather(&cdfs.partition_w64[ctx], VERT_ALIKE));
                         bump_edge_part(b.min(1) as usize);
                         if b == 1 { PARTITION_SPLIT } else { PARTITION_HORZ }
                     }
                     (false, true) => {
+                        trace_edge((sb_r * SB_MI) as usize, (sb_c * SB_MI) as usize, 12, ctx, dec.debug_state().0 as u32);
                         let b = dec.symbol_fixed(&gather(&cdfs.partition_w64[ctx], HORZ_ALIKE));
                         bump_edge_part(b.min(1) as usize);
                         if b == 1 { PARTITION_SPLIT } else { PARTITION_VERT }
@@ -13903,6 +13911,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                             // superblock level above).
                             match (has_cols32, has_rows32) {
                                 (true, false) => {
+                                    trace_edge((r32 * BLOCK_MI) as usize, (c32 * BLOCK_MI) as usize, 9, ctx32, dec.debug_state().0 as u32);
                                     let b = dec.symbol_fixed(&gather(
                                         &cdfs.partition_w32[ctx32],
                                         VERT_ALIKE,
@@ -13911,6 +13920,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                     if b == 1 { PARTITION_SPLIT } else { PARTITION_HORZ }
                                 }
                                 (false, true) => {
+                                    trace_edge((r32 * BLOCK_MI) as usize, (c32 * BLOCK_MI) as usize, 9, ctx32, dec.debug_state().0 as u32);
                                     let b = dec.symbol_fixed(&gather(
                                         &cdfs.partition_w32[ctx32],
                                         HORZ_ALIKE,
@@ -14389,6 +14399,7 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                     // This path can only walk the four SPLIT
                                     // leaves, so a 0 refuses by name instead
                                     // of desyncing.
+                                    trace_edge(sr * SUB_MI as usize, sc * SUB_MI as usize, 6, ctx16, dec.debug_state().0 as u32);
                                     let edge_split = if has_cols16 {
                                         dec.symbol_fixed(&gather(
                                             &cdfs.partition_w16[ctx16],
@@ -14469,10 +14480,11 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
                                             }
                                         }
                                         let leaf_ctx = neighbours.partition_ctx_mi(leaf_mi, 8);
+                                        let pre8 = dec.debug_state().0;
                                         let part8 = dec.symbol(&mut cdfs.partition_w8[leaf_ctx]);
                                         if std::env::var_os("EC_AV1_TRACE").is_some() {
                                             eprintln!(
-                                                "TRACE partition_w8 mi=({mr},{mc}) ctx={leaf_ctx} value={part8}"
+                                                "TRACE partition_w8 mi=({mr},{mc}) ctx={leaf_ctx} value={part8} pre_rng={pre8}"
                                             );
                                         }
                                         let leaf_mode = if part8 == PARTITION_NONE {
