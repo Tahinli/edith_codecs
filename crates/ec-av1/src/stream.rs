@@ -6319,15 +6319,20 @@ mod tests {
     // `decode_inter_block8`'s compound arm: `read_compound_ref_frames` was
     // passed a hard-coded `LAST_FRAME` for every inter neighbour instead of
     // the real per-mi band, and the grid stamp cleared both per-slot
-    // `is_global_mv_block` flags. This gate stays RED and ignored on a
-    // RECONSTRUCTION residue, not an entropy one: luma-only, |delta| <= 8,
-    // first at decode frame 7 pixel (42,15) -- the 8x8 leaf at mi (10,4),
-    // spilling one pixel across its left/bottom deblock edges -- growing to
-    // 222 Y + 4 U + 1 V samples by frame 15 (pure propagation; chroma stays
-    // exact until frame 14). Next round: the OBMC blend over a compound
-    // neighbour (the oracle's `EC_OBMC` rung prints `filt=` per neighbour;
-    // this decoder has no `EC_OBMC` emitter yet -- build it first).
-    #[ignore = "lane-interp3 r2: entropy is now exact on the whole stream (range ladder 570/570); RED on a luma-only reconstruction residue from decode frame 7 (|delta| <= 8, first at the 8x8 leaf mi (10,4))"]
+    // `is_global_mv_block` flags.
+    // lane-interp3 r3: the luma reconstruction residue r2 left open is CLOSED
+    // and this gate is GREEN. Third instance of the same twin-drift class:
+    // libaom applies `allow_warp`'s GLOBAL branch to every
+    // `is_global_mv_block` reference slot, compound included and independent
+    // of `motion_mode` (`av1_init_warp_params` inside
+    // `build_inter_predictors_8x8_and_bigger`'s per-`ref` loop) -- the 16x16+
+    // compound arm has warped since lane-cwarp r1, the 8x8 leaf's compound arm
+    // predicted BOTH taps translationally, so a GLOBAL_GLOBALMV 8x8 compound
+    // leaf under a non-TRANSLATION model drifted a few luma levels, growing
+    // away from the block origin. It was NOT OBMC: the `EC_OBMC` emitter this
+    // round added to `decode.rs` diffs 325/325 lines against the instrumented
+    // aomdec's own rung (position, span, neighbour mv/ref/bsize/filter) with
+    // zero differences.
     #[test]
     fn a_real_aomenc_dual_filter_obmc_8x8_inter_sequence_decodes_pixel_exact() {
         const NAME: &str =
@@ -6338,6 +6343,7 @@ mod tests {
         }
         let before_dual = decode::dual_filter_diff_hits();
         let before_obmc = decode::obmc_hits_8();
+        let before_cwarp8 = decode::compound_warp_hits_8();
         inter_sb_none_gate(
             NAME,
             false,
@@ -6368,6 +6374,12 @@ mod tests {
         assert!(
             decode::obmc_hits_8() > before_obmc,
             "{NAME}: no 8x8 OBMC blend fired -- --enable-obmc=1 did not arrive"
+        );
+        assert!(
+            decode::compound_warp_hits_8() > before_cwarp8,
+            "{NAME}: no 8x8 COMPOUND leaf was predicted through the per-ref GLOBAL \
+             warp -- the r3 root-cause path never fired, so this stream no longer \
+             proves it"
         );
     }
 
