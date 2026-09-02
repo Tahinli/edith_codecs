@@ -66,7 +66,10 @@ square unit is never the whole block), `7947` (guarded by `else if !tx_select ||
 (var-tx leaves, `Some` only when the tree resolved to MORE than one transform). None can
 reach the unit == block case. One defect, one site.
 
-Suite: see `$HOME/.cache/intrarect-suite-r2.log` (result line quoted in the commit message).
+Suite: `systemd-run --user --unit=intrarect-suite-r2 ... cargo test -p ec-av1 --lib -j3` ->
+`test result: ok. 337 passed; 0 failed; 29 ignored; 0 measured; 0 filtered out; finished in
+257.15s` (`$HOME/.cache/intrarect-suite-r2.log`) -- r1's two RED gates are the two that
+flipped, nothing else moved.
 
 ## Residue
 
