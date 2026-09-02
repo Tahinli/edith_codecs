@@ -28,7 +28,6 @@ const CAPABILITY_CLAIMS: &[&str] = &[
     "a non-2D tx class on a rectangular transform (never expected at this size)",
     "a non-DC chroma mode on an 8x8 inter-frame leaf (this encoder never writes one)",
     "a nonzero angle delta (this encoder never writes one)",
-    "a partition below 8x8 (this decoder codes no leaf smaller than 8x8)",
     "a tx_type symbol on a rectangular transform (never expected at this size)",
 ];
 
@@ -39,6 +38,8 @@ const REFUSALS: &[&str] = &[
     "a coded HORZ/VERT strip whose chroma transform has no rect coefficient tables here",
     "a HORZ/VERT intra strip below 16x16 with a split transform (per-unit rect prediction is not ported)",
     "a HORZ_A/HORZ_B/VERT_A partition below 16x16 (this decoder codes only the square arms, HORZ, VERT, VERT_B, and a clean split below 16x16)",
+    "a HORZ/VERT partition below 8x8 (this decoder's transform primitive is square-only; 4x8/8x4 need a real rectangular transform)",
+    "an inter partition below 8x8 (this decoder codes no inter leaf smaller than 8x8; lane-sub8 scoped to intra)",
     "a 16x16 block whose true edge cuts through both axes needs a rectangular transform this decoder does not code yet",
     "a 16x16 inter block whose true edge cuts through both axes needs a rectangular transform this decoder does not code yet",
     "a 32x32 partition type this decoder does not code (value={part32})",
@@ -49,6 +50,7 @@ const REFUSALS: &[&str] = &[
     "a HORZ/VERT intra strip in a screen-content frame (palette syntax is consumed for square blocks only)",
     "a block that actually uses a palette (UV) -- reconstruction is out of scope",
     "a block that actually uses a palette (Y) -- reconstruction is out of scope",
+    "a sub-8x8 leaf that uses intrabc (this reader has no block-vector path; the 8x8-and-up reader reconstructs one)",
     "an intrabc block under TxMode::Select (its transform size is coded by the inter var-tx partition tree, which this decoder never reads)",
     "a bit depth of 12 (this decoder is gated at 8 and 10 only: warp/MC/wiener rounding shifts change at 12-bit and no 12-bit gate exists)",
     "a frame OBU with no tile group",
