@@ -30579,12 +30579,22 @@ mod tests {
         let (width, height) = (1920usize, 792usize);
         let gm_before = crate::decode::gm_nontrans_small_side_hits();
         let tr_before = crate::decode::tr_reach_longer_side_hits();
+        // lane-t900 r13: this stream is also the witness for r12's mi-granular
+        // uv_mode grid -- the chroma edge-filter neighbour read that the coarse
+        // one-slot-per-column map answered wrongly inside a sub-8x8 pair.
+        let uv_before = crate::decode::uv_mode_grid_override_hits();
         let frames = match decode_stream(&stream) {
             Ok(frames) => frames,
             Err(e) => panic!("{NAME}: decode_stream refused: {e}"),
         };
         let gm = crate::decode::gm_nontrans_small_side_hits() - gm_before;
         let tr = crate::decode::tr_reach_longer_side_hits() - tr_before;
+        let uvg = crate::decode::uv_mode_grid_override_hits() - uv_before;
+        assert!(
+            uvg > 0,
+            "{NAME}: uv_mode_grid_override never fired -- the chroma edge-filter \
+             grid read would be untested"
+        );
         assert!(
             gm > 0,
             "{NAME}: gm_nontrans_small_side never fired -- the gate would be vacuous for it"
@@ -30610,7 +30620,8 @@ mod tests {
         }
         eprintln!(
             "{NAME}: 33 shown frames pixel-exact on every plane; \
-             gm_nontrans_small_side={gm} tr_reach_longer_side={tr}"
+             gm_nontrans_small_side={gm} tr_reach_longer_side={tr} \
+             uv_mode_grid_override={uvg}"
         );
     }
 
