@@ -1351,6 +1351,19 @@ pub(crate) fn wii_hits() -> usize {
     WII_HITS.with(|c| c.get())
 }
 
+// lane-inter4 r4: how many 16x8/8x16 INTER LEAVES actually ran the OBMC
+// blend -- the gate's proof that `--enable-obmc=1` reached this shape (the
+// r3 refusal's replacement: prefilt frames are bit-exact vs an instrumented
+// aomdec, neighbour list included).
+thread_local! {
+    static OBMC_RECT_LEAF_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`OBMC_RECT_LEAF_HITS`].
+pub(crate) fn obmc_rect_leaf_hits() -> usize {
+    OBMC_RECT_LEAF_HITS.with(|c| c.get())
+}
+
 /// Current value of [`OBMC_HITS_8`].
 pub(crate) fn obmc_hits_8() -> usize {
     OBMC_HITS_8.with(|c| c.get())
@@ -12827,18 +12840,17 @@ fn obmc_blend(
         5..=8 => 3,
         _ => 4,
     };
-    // lane-inter4 r3: OBMC on a 16-level rect inter leaf mismatches ffmpeg
-    // (192x128 testsrc-style motion, cq 22, `--enable-obmc=1`: 5302 luma
-    // pixels of frame 5 wrong, max |delta| 84, while the SAME recipe with
-    // `--enable-obmc=0` decodes 5 rect-leaf-carrying attempts pixel-exact).
-    // The blend geometry here matches libaom `build_obmc_inter_pred_*` for
-    // these shapes, so the cause is upstream (neighbour walk or mv stack for
-    // a 2:1 leaf) and unidentified -- refuse by name rather than ship wrong
-    // pixels. Deleting this block is the whole lift once it is found.
+    // lane-inter4 r4: r3 refused OBMC on a 16x8/8x16 leaf (5302 luma pixels
+    // of one frame wrong). Re-measured on this tree with an `EC_OBMC` rung in
+    // both decoders on that exact stream: the neighbour lists agree entry for
+    // entry (position, span, mv, ref, size, filter) and all six pre-filter
+    // frames are byte-identical to the instrumented aomdec's. The refusal is
+    // gone; the counter below is what the gate's `--enable-obmc=1` arm reads.
+    // The only decode-path change between r3's measurement and this one is the
+    // lane-interbis merge (`build_motion_field`'s compound slot walk), which
+    // moves temporal MV candidates -- not bisected further.
     if matches!((write_w, write_h), (16, 8) | (8, 16)) {
-        return Err(unsupported(
-            "OBMC on a 16x8/8x16 inter leaf (blend mismatches the reference on this shape)",
-        ));
+        OBMC_RECT_LEAF_HITS.with(|c| c.set(c.get() + 1));
     }
     let overlap_above = write_h / 2;
     let overlap_left = write_w / 2;
