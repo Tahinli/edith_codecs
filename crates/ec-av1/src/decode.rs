@@ -1783,6 +1783,20 @@ pub(crate) fn compound_warp_hits() -> usize {
     COMPOUND_WARP_HITS.with(|c| c.get())
 }
 
+// lane-interp3 r3: the same proof narrowed to the 8x8 LEAF's own compound
+// arm ([`decode_inter_block8`]) -- that arm predicted both taps
+// translationally until r3, so a gate needs to tell a warped 8x8 compound
+// leaf apart from a warped 16x16+ one (both bump [`COMPOUND_WARP_HITS`]).
+thread_local! {
+    static COMPOUND_WARP_HITS_8: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`COMPOUND_WARP_HITS_8`].
+pub(crate) fn compound_warp_hits_8() -> usize {
+    COMPOUND_WARP_HITS_8.with(|c| c.get())
+}
+
 // lane-gmaffine r1: how many blocks built their prediction from a
 // SIX-parameter (`AFFINE`) global-motion model through
 // `crate::warp::global_warp_params` -- the gate's proof that a stream really
@@ -14679,6 +14693,13 @@ pub(crate) fn decode_key_frame_tile_with_cdfs(
     // that isolate whether a decode-order frame's mismatch already exists
     // in reconstruction (this dump) vs is introduced by the loop filter
     // (EC_AV1_DECODE_ORDER_DUMP's post-filter dump).
+    // Decode-order frame marker for the EC_OBMC / EC_TRACE_MODE ladders.
+    if std::env::var_os("EC_OBMC").is_some() || std::env::var_os("EC_TRACE_MODE").is_some() {
+        eprintln!(
+            "EC_PICT idx={}",
+            PREFILT_PICTURE_IDX.load(std::sync::atomic::Ordering::SeqCst)
+        );
+    }
     dump_stage16("EC_AV1_PREFILT_DUMP16", &y, &u, &v, frame_width as usize, frame_height as usize);
     if let Ok(path) = std::env::var("EC_AV1_PREFILT_DUMP") {
         use std::io::Write;
@@ -15743,6 +15764,71 @@ fn obmc_blend_h(dst: &mut [u16], stride: usize, ox: usize, oy: usize, w: usize, 
     }
 }
 
+/// libaom's own `BLOCK_SIZE` enum index for a `w4`x`h4` (mi-unit) block --
+/// only for the `EC_OBMC` trace rung below, so it reads byte-identical to
+/// the instrumented aomdec's `backup_mbmi.bsize`.
+fn ec_obmc_bsize(w4: usize, h4: usize) -> i32 {
+    match (w4, h4) {
+        (1, 1) => 0,
+        (1, 2) => 1,
+        (2, 1) => 2,
+        (2, 2) => 3,
+        (2, 4) => 4,
+        (4, 2) => 5,
+        (4, 4) => 6,
+        (4, 8) => 7,
+        (8, 4) => 8,
+        (8, 8) => 9,
+        (8, 16) => 10,
+        (16, 8) => 11,
+        (16, 16) => 12,
+        (1, 4) => 16,
+        (4, 1) => 17,
+        (2, 8) => 18,
+        (8, 2) => 19,
+        (4, 16) => 20,
+        (16, 4) => 21,
+        _ => -1,
+    }
+}
+
+/// The `EC_OBMC` rung: one line per blended neighbour, in the instrumented
+/// aomdec's own byte format (`decodeframe.c`
+/// `dec_build_prediction_by_{above,left}_pred`), so the two decoders' OBMC
+/// neighbour lists diff line for line. `filt` is libaom's packed
+/// `interp_filters.as_int` = `y_filter | (x_filter << 16)`.
+#[allow(clippy::too_many_arguments)]
+fn ec_obmc_trace(
+    dir: &str,
+    mi_row: usize,
+    mi_col: usize,
+    write_w: usize,
+    write_h: usize,
+    rel: usize,
+    op: usize,
+    nb: &MiInfo,
+    h_kind: mc::InterpFilterKind,
+    v_kind: mc::InterpFilterKind,
+) {
+    if std::env::var_os("EC_OBMC").is_none() {
+        return;
+    }
+    let sym = |k: mc::InterpFilterKind| match k {
+        mc::InterpFilterKind::Smooth => 1u32,
+        mc::InterpFilterKind::Sharp => 2,
+        _ => 0,
+    };
+    eprintln!(
+        "EC_OBMC {dir} mi=({mi_row},{mi_col}) wh=({write_w}x{write_h}) rel={rel} op={op} \
+nbmv=({},{}) nbref={} nbbsize={} filt={}",
+        nb.mv.0,
+        nb.mv.1,
+        nb.ref_frame,
+        ec_obmc_bsize(nb.size, nb.size_h),
+        sym(v_kind) | (sym(h_kind) << 16),
+    );
+}
+
 /// `av1_build_obmc_inter_prediction` (libaom `reconinter.c`): re-predicts
 /// the overlap strip against each bordering above/left inter neighbour's own
 /// mv/ref/filter and blends it into this block's just-built single-reference
@@ -15842,6 +15928,7 @@ fn obmc_blend(
             interp_fixed,
             neighbours.above_filter[mi_col + off4],
         )?;
+        ec_obmc_trace("above", mi_row, mi_col, write_w, write_h, off4, span4, &nb, h_kind, v_kind);
         let (ny, nu, nv) = ref_planes(nb.ref_frame, ref_y, ref_u, ref_v, other_refs)?;
         let nb_scale = mc::scale_factor(ny.width, frame_width);
         let (bw, bh, ox) = (span4 * 4, overlap_above, off4 * 4);
@@ -15861,6 +15948,7 @@ fn obmc_blend(
             interp_fixed,
             neighbours.left_filter[mi_row + off4],
         )?;
+        ec_obmc_trace("left", mi_row, mi_col, write_w, write_h, off4, span4, &nb, h_kind, v_kind);
         let (ny, nu, nv) = ref_planes(nb.ref_frame, ref_y, ref_u, ref_v, other_refs)?;
         let nb_scale = mc::scale_factor(ny.width, frame_width);
         let (bw, bh, oy) = (overlap_left, span4 * 4, off4 * 4);
@@ -19423,6 +19511,38 @@ fn decode_inter_block8(
                     && global_motion[(ref0 - LAST_FRAME) as usize].model as u8 > 1;
                 let is_global_mv1_c = is_globalmv_c
                     && global_motion[(ref1 - LAST_FRAME) as usize].model as u8 > 1;
+                // lane-interp3 r3 (class twin-functions-drift, second
+                // instance): libaom applies `allow_warp`'s GLOBAL branch
+                // (`reconinter.c:33-55`, reached from `av1_init_warp_params`
+                // inside `build_inter_predictors_8x8_and_bigger`'s per-`ref`
+                // loop) to EVERY `is_global_mv_block` slot, compound
+                // included and independently of `motion_mode` -- the 16x16+
+                // compound arm has done this since lane-cwarp r1, this leaf
+                // predicted both taps translationally, so a GLOBAL_GLOBALMV
+                // 8x8 compound leaf under a non-TRANSLATION model drifted by
+                // a few luma levels, growing away from the block origin.
+                // `force_integer_mv` short-circuits `av1_init_warp_params`
+                // before `allow_warp`; chroma is 4x4 here, below
+                // `av1_init_warp_params`'s own 8px per-plane bound, so only
+                // luma warps (same rule as this leaf's single-ref arm).
+                let leaf_compound_warp = |ref_frame: i8, eligible: bool| {
+                    if eligible
+                        && !force_integer_mv
+                        && !global_motion[(ref_frame - LAST_FRAME) as usize].invalid
+                    {
+                        crate::warp::global_warp_params(
+                            global_motion[(ref_frame - LAST_FRAME) as usize].params,
+                        )
+                    } else {
+                        None
+                    }
+                };
+                let warp0_c = leaf_compound_warp(ref0, is_global_mv0_c);
+                let warp1_c = leaf_compound_warp(ref1, is_global_mv1_c);
+                if warp0_c.is_some() || warp1_c.is_some() {
+                    COMPOUND_WARP_HITS.with(|c| c.set(c.get() + 1));
+                    COMPOUND_WARP_HITS_8.with(|c| c.set(c.get() + 1));
+                }
                 for dr in 0..2 {
                     for dc in 0..2 {
                         grid.set(
@@ -19460,6 +19580,13 @@ fn decode_inter_block8(
                     v_filter,
                     &mut inter0_y,
                 );
+                if let Some(wp) = &warp0_c {
+                    crate::warp::warp_affine_compound(
+                        wp, &py0.data, py0.true_width as i32, py0.true_height as i32,
+                        py0.width as i32, &mut inter0_y, px as i32, py as i32, SIDE as i32,
+                        SIDE as i32, SIDE as i32, 0, 0,
+                    );
+                }
                 let mut inter1_y = vec![0i32; SIDE * SIDE];
                 mc::predict_compound_intermediate(
                     &py1.data,
@@ -19475,6 +19602,13 @@ fn decode_inter_block8(
                     v_filter,
                     &mut inter1_y,
                 );
+                if let Some(wp) = &warp1_c {
+                    crate::warp::warp_affine_compound(
+                        wp, &py1.data, py1.true_width as i32, py1.true_height as i32,
+                        py1.width as i32, &mut inter1_y, px as i32, py as i32, SIDE as i32,
+                        SIDE as i32, SIDE as i32, 0, 0,
+                    );
+                }
                 let mut pred_y = vec![0u16; SIDE * SIDE];
                 let mut diffwtd_mask_y = Vec::new();
                 let mask_y: Option<&[u8]> = if let Some(mask_type) = diffwtd_mask_type {
@@ -22588,6 +22722,13 @@ pub(crate) fn decode_inter_frame_tile_with_cdfs(
     // that isolate whether a decode-order frame's mismatch already exists
     // in reconstruction (this dump) vs is introduced by the loop filter
     // (EC_AV1_DECODE_ORDER_DUMP's post-filter dump).
+    // Decode-order frame marker for the EC_OBMC / EC_TRACE_MODE ladders.
+    if std::env::var_os("EC_OBMC").is_some() || std::env::var_os("EC_TRACE_MODE").is_some() {
+        eprintln!(
+            "EC_PICT idx={}",
+            PREFILT_PICTURE_IDX.load(std::sync::atomic::Ordering::SeqCst)
+        );
+    }
     dump_stage16("EC_AV1_PREFILT_DUMP16", &y, &u, &v, frame_width as usize, frame_height as usize);
     if let Ok(path) = std::env::var("EC_AV1_PREFILT_DUMP") {
         use std::io::Write;
