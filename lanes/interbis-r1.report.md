@@ -116,3 +116,14 @@ EVIDENCE: $HOME/.cache/interbis-tmvgate-neg.log | one-line revert to `if saved.i
   satisfiable on the 8-bit arm.
 - **deferred: film probe** — this diff lifts no refusal; both films still stop at
   lane-rectchroma's intra-rect-strip refusal.
+
+## Suite
+
+    $HOME/.cache/interbis-suite.log (systemd-run unit, MemoryMax=10G)
+    test result: ok. 324 passed; 0 failed; 31 ignored; finished in 443.08s
+
+323 (lane-inter4 r2 baseline) + this round's new gate. Siblings inside that run:
+inter_sequence*, obmc, warp, globalmv, compound_*, altref/hidden-frame,
+tx_select, refusal_inventory, gate_coverage — all green.
+
+EVIDENCE: $HOME/.cache/interbis-suite.log | ec-av1 --lib at 0527911 | 324 passed / 0 failed / 31 ignored
