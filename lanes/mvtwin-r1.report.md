@@ -69,6 +69,11 @@ Arms: 8-bit sb64 gm=0 · 8-bit sb64 gm=1 · 10-bit sb128 gm=1.
 EVIDENCE: $HOME/.cache/mvtwin-suite-r1.log | cargo test -p ec-av1 --lib compound_mv_stack -- --test-threads=1 --nocapture | 3 arms FIRING pixel-exact: seed 44 comp_mode_hits +7 tmv_hits +56; seed 80 comp_mode_hits +1 tmv_hits +56; seed 122 (10-bit, sb128) comp_mode_hits +8 tmv_hits +55
 EVIDENCE: crates/ec-av1/src/mvstack.rs tests | cargo test -p ec-av1 --lib mvstack:: | 32 passed 0 failed, each of the 3 defects asserted on its own values
 
+Full suite (systemd unit, MemoryMax=10G): `cargo test -p ec-av1 --lib -j3` ->
+**375 passed, 0 failed, 33 ignored**, 692 s. Log `$HOME/.cache/mvtwin-suite-r1.log`.
+
+EVIDENCE: $HOME/.cache/mvtwin-suite-r1.log | systemd-run --user --unit=mvtwin-suite-... cargo test -p ec-av1 --lib -j3 | test result: ok. 375 passed; 0 failed; 33 ignored
+
 ## Open residue
 - fix-now-elsewhere (NOT this lane's surface): a real aomenc stream 128 px wide
   with `--tile-columns=1` MIS-DECODES frame 1 luma vs ffmpeg (seed 200, recipe in
