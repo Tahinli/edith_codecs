@@ -1808,6 +1808,31 @@ pub(crate) fn tx4x8_coded_hits() -> usize {
 pub(crate) fn tx8x4_coded_hits() -> usize {
     TX8X4_CODED_HITS.with(|c| c.get())
 }
+
+// How many CHROMA coefficient blocks read their `eob_pt` from the class-1
+// (`TX_CLASS_HORIZ`/`VERT`) row, across every call on the current thread.
+// Chroma never codes a `tx_type` symbol -- it inherits the colocated luma
+// type verbatim (`av1_get_tx_type`, `blockd.h:1291`) -- so this fires only on
+// an inter leaf whose luma picked a 1D type, the path lane-eobc1 wired
+// (`eob_pt_{16,64,128,256}_chroma_class1`).
+thread_local! {
+    static CHROMA_EOB_CLASS1_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current value of [`CHROMA_EOB_CLASS1_HITS`].
+pub(crate) fn chroma_eob_class1_hits() -> usize {
+    CHROMA_EOB_CLASS1_HITS.with(|c| c.get())
+}
+
+/// Counts one [`CHROMA_EOB_CLASS1_HITS`] when `plane_idx`'s inherited
+/// `tx_type` put this block's `eob_pt` on the class-1 row.
+fn note_chroma_class1(plane_idx: usize, tx_type: TxType) {
+    if plane_idx > 0 && TxClass::of(tx_type) != TxClass::TwoD {
+        CHROMA_EOB_CLASS1_HITS.with(|c| c.set(c.get() + 1));
+    }
+}
+
 const SUB_MI: u32 = 4;
 const MI: usize = 4;
 const SB: usize = 64;
@@ -6834,6 +6859,7 @@ fn read_plane(
         default_tx_type,
         None,
     )?;
+    note_chroma_class1(plane_idx, tx_type);
     // A 64x64 luma block's transform covers the whole 64x64 area, but only its
     // top-left 32x32 of frequencies are coded (spec 5.11.40); the rest of the
     // dequantized grid stays zero, which `inverse_transform_2d`'s own `< 32`
@@ -11740,6 +11766,7 @@ fn read_inter_plane(
         default_tx_type,
         None,
     )?;
+    note_chroma_class1(plane_idx, tx_type);
     // lane-inter8 r1: a 64-point transform covers the whole 64x64 area but
     // codes only its top-left 32x32 of frequencies (spec 5.11.40) -- the
     // caller hands the 32-point `scan` there, and the coded corner goes into
