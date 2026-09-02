@@ -516,7 +516,10 @@ fn scan_row(
     let Some(row) = mi_row.checked_add_signed(row_offset) else {
         return false;
     };
-    let col_shift: usize = if row_offset.unsigned_abs() > 1 { 1 } else { 0 };
+    // libaom `scan_row_mbmi`: the transpose of `scan_col_mbmi`'s rule --
+    // `if ((mi_col & 0x01) && xd->width < n8_w_8) --col_offset;`.
+    let col_shift: usize =
+        usize::from(row_offset.unsigned_abs() > 1 && !(mi_col % 2 == 1 && bw4 < 2));
     let use_step_16 = bw4 >= 16;
     let end_mi = bw4.min(16);
     let mut found = false;
@@ -534,7 +537,7 @@ fn scan_row(
             len = len.max(2);
         }
         let mut weight = ROW_COL_WEIGHT_FLOOR;
-        if bw4 <= n4 {
+        if bw4 >= 2 && bw4 <= n4 {
             let inc = ((-max_row_offset + row_offset + 1) as usize).min(info.size_h);
             weight = weight.max(inc as u32);
             *processed_rows = (inc as isize - row_offset - 1).max(0) as usize;
@@ -598,7 +601,14 @@ fn scan_col(
     let Some(col) = mi_col.checked_add_signed(col_offset) else {
         return false;
     };
-    let row_shift: usize = if col_offset.unsigned_abs() > 1 { 1 } else { 0 };
+    // libaom `scan_col_mbmi`: `row_offset = 1` for the outer columns, then
+    // `if ((mi_row & 0x01) && xd->height < n8_h_8) --row_offset;` -- a sub-8x8
+    // block on an odd mi row probes its OWN row, not the one below (which is
+    // not decoded yet). Missing this made the second-outer column scan of an
+    // 8x4 leaf read an undecoded cell, losing `col_match_count` and reading
+    // the `refmv` symbol off ctx 3 instead of 4 (lane-sub8intra r2).
+    let row_shift: usize =
+        usize::from(col_offset.unsigned_abs() > 1 && !(mi_row % 2 == 1 && bh4 < 2));
     let use_step_16 = bh4 >= 16;
     let end_mi = bh4.min(16);
     let mut found = false;
@@ -616,7 +626,7 @@ fn scan_col(
             len = len.max(2);
         }
         let mut weight = ROW_COL_WEIGHT_FLOOR;
-        if bh4 <= n4 {
+        if bh4 >= 2 && bh4 <= n4 {
             let inc = ((-max_col_offset + col_offset + 1) as usize).min(info.size);
             weight = weight.max(inc as u32);
             *processed_cols = (inc as isize - col_offset - 1).max(0) as usize;
@@ -1346,7 +1356,10 @@ fn scan_row_compound(
     let Some(row) = mi_row.checked_add_signed(row_offset) else {
         return false;
     };
-    let col_shift: usize = if row_offset.unsigned_abs() > 1 { 1 } else { 0 };
+    // libaom `scan_row_mbmi`: the transpose of `scan_col_mbmi`'s rule --
+    // `if ((mi_col & 0x01) && xd->width < n8_w_8) --col_offset;`.
+    let col_shift: usize =
+        usize::from(row_offset.unsigned_abs() > 1 && !(mi_col % 2 == 1 && bw4 < 2));
     let use_step_16 = bw4 >= 16;
     let end_mi = bw4.min(16);
     let mut found = false;
@@ -1364,7 +1377,7 @@ fn scan_row_compound(
             len = len.max(2);
         }
         let mut weight = ROW_COL_WEIGHT_FLOOR;
-        if bw4 <= n4 {
+        if bw4 >= 2 && bw4 <= n4 {
             let inc = ((-max_row_offset + row_offset + 1) as usize).min(info.size_h);
             weight = weight.max(inc as u32);
             *processed_rows = (inc as isize - row_offset - 1).max(0) as usize;
@@ -1403,7 +1416,14 @@ fn scan_col_compound(
     let Some(col) = mi_col.checked_add_signed(col_offset) else {
         return false;
     };
-    let row_shift: usize = if col_offset.unsigned_abs() > 1 { 1 } else { 0 };
+    // libaom `scan_col_mbmi`: `row_offset = 1` for the outer columns, then
+    // `if ((mi_row & 0x01) && xd->height < n8_h_8) --row_offset;` -- a sub-8x8
+    // block on an odd mi row probes its OWN row, not the one below (which is
+    // not decoded yet). Missing this made the second-outer column scan of an
+    // 8x4 leaf read an undecoded cell, losing `col_match_count` and reading
+    // the `refmv` symbol off ctx 3 instead of 4 (lane-sub8intra r2).
+    let row_shift: usize =
+        usize::from(col_offset.unsigned_abs() > 1 && !(mi_row % 2 == 1 && bh4 < 2));
     let use_step_16 = bh4 >= 16;
     let end_mi = bh4.min(16);
     let mut found = false;
@@ -1421,7 +1441,7 @@ fn scan_col_compound(
             len = len.max(2);
         }
         let mut weight = ROW_COL_WEIGHT_FLOOR;
-        if bh4 <= n4 {
+        if bh4 >= 2 && bh4 <= n4 {
             let inc = ((-max_col_offset + col_offset + 1) as usize).min(info.size);
             weight = weight.max(inc as u32);
             *processed_cols = (inc as isize - col_offset - 1).max(0) as usize;
