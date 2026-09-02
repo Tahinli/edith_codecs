@@ -39,7 +39,6 @@ const REFUSALS: &[&str] = &[
     "an intra 4x4 block inside an inter frame's sub-8x8 split (this decoder codes only inter 4x4 sub-blocks there)",
     "an intra 8x4/4x8 block inside an inter frame's sub-8x8 HORZ/VERT partition (this decoder codes only inter sub-blocks there)",
     "a sub-8x8 inter block under a scaled reference (superres, unimplemented)",
-    "a COMPOUND_WEDGE mask on a non-square inter block (rect wedge codebook unimplemented)",
     "a 1:4 rect strip that actually uses a palette (reconstruction is not ported at this shape)",
     "an OBMC neighbour whose switchable interp filter was never recorded",
     "a 16x16 block whose true edge cuts through both axes needs a rectangular transform this decoder does not code yet",
