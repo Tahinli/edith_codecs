@@ -539,9 +539,9 @@ pub(crate) struct Cdfs {
     pub dv_comp: [MvComponentCdfs; 2],
     /// The `use_filter_intra` flag, indexed by block-size class (`[0]`=4x4,
     /// `[1]`=8x8, `[2]`=16x16, `[3]`=32x32, `[4]`=32x16, `[5]`=16x32,
-    /// `[6]`=16x8, `[7]`=8x16, `[8]`=4x8, `[9]`=8x4) --
+    /// `[6]`=16x8, `[7]`=8x16, `[8]`=4x8, `[9]`=8x4, `[10]`=32x8, `[11]`=8x32) --
     /// see [`cdf::FILTER_INTRA`].
-    pub filter_intra: [[u16; 3]; 10],
+    pub filter_intra: [[u16; 3]; 12],
     /// Which `FILTER_INTRA_MODES` entry a `use_filter_intra` block picks.
     pub filter_intra_mode: [u16; 6],
     /// `TxMode::Select`'s `tx_depth` flag at an 8x8 block, by `tx_size_context`
