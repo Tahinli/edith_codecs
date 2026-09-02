@@ -585,6 +585,43 @@ fn scan_col(
     found
 }
 
+/// libaom `has_top_right` (mvref_common.c:264): whether the unit diagonally
+/// above-right of this block has been decoded *by the superblock's own
+/// recursion order*. The mask is `sb_size`-relative, so at a 128x128
+/// superblock the `while` loop runs one level further than at 64x64 and
+/// strips the top-right neighbour off blocks that DO sit in already-decoded
+/// memory -- an availability rule a plain "is the grid cell populated" probe
+/// (what this module did before lane-sb128 r2) cannot see. It cost frame 6 of
+/// the 128 inter gate 380 wrong luma bytes with the entropy stream in sync.
+///
+/// corner-cut: libaom's three shape refinements (`is_last_vertical_rect`,
+/// `is_first_horizontal_rect`, the `PARTITION_VERT_A` bottom-left square) are
+/// not ported -- the ceiling is rectangular and AB-partitioned INTER leaves,
+/// which this decoder refuses by name today; port them with the rect inter
+/// leaf.
+pub(crate) fn has_top_right(mi_row: usize, mi_col: usize, bw4: usize, bh4: usize) -> bool {
+    let sb_mi_size = crate::decode::sb_mi_cur() as usize;
+    let bs0 = bw4.max(bh4);
+    if bs0 > 16 {
+        return false;
+    }
+    let (mask_row, mask_col) = (mi_row & (sb_mi_size - 1), mi_col & (sb_mi_size - 1));
+    let mut has_tr = !(mask_row & bs0 != 0 && mask_col & bs0 != 0);
+    let mut bs = bs0;
+    while bs < sb_mi_size {
+        if mask_col & bs != 0 {
+            if mask_col & (2 * bs) != 0 && mask_row & (2 * bs) != 0 {
+                has_tr = false;
+                break;
+            }
+        } else {
+            break;
+        }
+        bs <<= 1;
+    }
+    has_tr
+}
+
 /// The single top-right probe this reduction keeps of spec 7.10.2.4's extra
 /// scan positions, at the unit diagonally above-right of the block. Its
 /// vote is folded into the row scan's candidates (it sits on the same row
@@ -779,16 +816,17 @@ pub fn find_mv_stack_with_sign_bias(
             &mut newmv_count,
             &mut processed_cols,
         );
-    let found_top_right = scan_top_right(
-        grid,
-        mi_row,
-        mi_col,
-        bw4,
-        ref_frame,
-        gm,
-        &mut candidates,
-        &mut newmv_count,
-    );
+    let found_top_right = has_top_right(mi_row, mi_col, bw4, bh4)
+        && scan_top_right(
+            grid,
+            mi_row,
+            mi_col,
+            bw4,
+            ref_frame,
+            gm,
+            &mut candidates,
+            &mut newmv_count,
+        );
 
     // libaom's `row_match_count`/`col_match_count` (mvref_common.c) fold the
     // top-right probe into the row side, so "found above" for context
@@ -1538,16 +1576,17 @@ pub fn find_mv_stack_compound(
             &mut newmv_count,
             &mut processed_cols,
         );
-    let found_top_right = scan_top_right_compound(
-        grid,
-        mi_row,
-        mi_col,
-        bw4,
-        ref_frame,
-        gm,
-        &mut candidates,
-        &mut newmv_count,
-    );
+    let found_top_right = has_top_right(mi_row, mi_col, bw4, bh4)
+        && scan_top_right_compound(
+            grid,
+            mi_row,
+            mi_col,
+            bw4,
+            ref_frame,
+            gm,
+            &mut candidates,
+            &mut newmv_count,
+        );
 
     let row_matched = found_above || found_top_right;
     let nearest_match = usize::from(row_matched) + usize::from(found_left);
